@@ -4,19 +4,19 @@ Kurono OS is a revolutionary hybrid kernel system that seamlessly integrates Lin
 
 ## Features
 
-### 🌐 Multi-Environment Integration
+### Multi-Environment Integration
 - **Linux Subsystem**: Full GNU utilities and POSIX compliance
 - **Windows Subsystem**: Native PE executable support and PowerShell integration
 - **Kurono Native**: Custom command language (KCL) and native tools
 
-### 🔧 Advanced Capabilities
+### Advanced Capabilities
 - **Native PE Execution**: Run Windows .exe files without Wine or translation layers
 - **Command Conflict Resolution**: Intelligent handling when commands exist in multiple environments
 - **Cross-Environment Pipelining**: Pipe commands between different subsystems
 - **Advanced Security**: SUPR (Super User) privilege escalation system
 - **Package Management**: Unified package system for all environments
 
-### 🛡️ Security Features
+### Security Features
 - **SUPR Mode**: Kurono's equivalent of sudo/su with timeout protection
 - **Permission System**: Fine-grained access control across all environments
 - **User Management**: Multi-user support with role-based access
