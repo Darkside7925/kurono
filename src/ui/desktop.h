@@ -1,0 +1,179 @@
+#pragma once
+//  kurono os  -  taskbar & desktop environment
+
+#include "window_manager.h"
+#include "../kernel/types.h"
+#include "../media/mediadecoder.h"
+
+#define TASKBAR_HEIGHT    44
+#define TASKBAR_BTN_W     44
+#define DESKTOP_MAX_ICONS 32
+#define START_MENU_W      320
+#define START_MENU_H      440
+#define START_MAX_ITEMS   16
+#define ICON_SIZE         56
+#define ICON_SPACING_X    96
+#define ICON_SPACING_Y    100
+#define ICON_MARGIN_X     24
+#define ICON_MARGIN_Y     20
+
+struct DesktopIcon {
+    char name[32];
+    char path[64];
+    int  x, y;
+    int  icon_type;       // 0=file, 1=folder, 2=app, 3=system
+    bool selected;
+};
+
+struct StartMenuItem {
+    char label[32];
+    char icon[8];
+    int  action;          // 0=app, 1=command, 2=separator, 3=shutdown
+    void (*handler)();
+};
+
+class Taskbar {
+public:
+    static void Init(int screen_w, int screen_h);
+    static void Render();
+    static bool HandleClick(int mx, int my);
+    static void Update();
+    static void ReloadFromConfig();          // re-read uiconfig colors/sizes
+
+    static int  GetHeight();
+    static int  GetY();
+
+    // notification area
+    static void SetClock(int h, int m);
+    static void SetBattery(int percent);
+    static void SetWiFiConnected(bool connected, int strength);
+    static void SetVolume(int percent);
+
+    // volume popup (public for drag handling in desktopenvironment)
+    static bool volume_popup_open;
+    static int  volume_slider_val;     // 0-100
+    static bool volume_slider_dragging;
+    static int screen_width, screen_height;
+    static int y_pos;
+
+    // search
+    static bool search_active;
+    static char search_buf[64];
+    static int  search_len;
+
+    // these mirror the uiconfig keys and are re-read by reloadfromconfig.
+    // the taskbar_height macro remains the fallback used by external code
+    // that does not route through taskbar::getheight().
+    static int cfg_height;
+    static uint32_t cfg_col_bg;
+    static uint32_t cfg_col_top;
+    static uint32_t cfg_col_text;
+    static uint32_t cfg_col_start_btn;
+    static uint32_t cfg_col_start_hover;
+    static bool cfg_show_clock;
+    static bool cfg_show_battery;
+    static bool cfg_show_wifi;
+    static bool cfg_show_volume;
+    static bool cfg_show_search;
+    static bool cfg_position_top;    // false=bottom, true=top
+
+private:
+    static bool start_menu_open;
+    static int hover_button;
+
+    // system tray
+    static int clock_h, clock_m;
+    static int battery_pct;
+    static bool wifi_connected;
+    static int wifi_strength;
+    static int volume_pct;
+
+    static void RenderStartButton();
+    static void RenderTaskButtons();
+    static void RenderSystemTray();
+    static void RenderStartMenu();
+    static void RenderClock();
+    static void RenderVolumePopup();
+    static void RenderSearchResults();
+};
+
+class Desktop {
+public:
+    static void Init(int screen_w, int screen_h);
+    static void Render();
+    static bool HandleClick(int mx, int my);
+    static void HandleDoubleClick(int mx, int my);
+    static void HandleRightClick(int mx, int my);
+    static void Update(int mx, int my, bool mouse_down, bool clicked);
+
+    static void AddIcon(const char* name, const char* path, int icon_type);
+    static void ArrangeIcons();
+    static void RemoveIcon(int index);            // delete icon + backing file
+    static bool CreateFolderInteractive();        // "new folder n"
+    static bool CreateFileInteractive();          // "new file n.txt"
+    static void ReloadFromConfig();               // reapply uiconfig sizes/colors
+
+    // wallpaper
+    static void SetWallpaper(unsigned int color);
+    static void SetWallpaperImage(const MediaDecoder::Image& img);
+
+private:
+    static int screen_width, screen_height;
+    static unsigned int wallpaper_color;
+    static DesktopIcon icons[DESKTOP_MAX_ICONS];
+    static int icon_count;
+    static int selected_icon;
+    static bool context_menu_open;
+    static int context_menu_x, context_menu_y;
+    static int context_menu_target;         // icon index right-clicked, or -1
+    static int new_folder_counter;
+    static int new_file_counter;
+
+    // runtime-sized copies of the desktop grid constants (driven by uiconfig).
+    static int cfg_icon_size;
+    static int cfg_spacing_x;
+    static int cfg_spacing_y;
+    static int cfg_margin_x;
+    static int cfg_margin_y;
+    static uint32_t cfg_col_desk_bg;
+    static uint32_t cfg_col_icon_text;
+    static uint32_t cfg_col_icon_sel;
+    static uint32_t cfg_col_ctx_bg;
+    static uint32_t cfg_col_ctx_border;
+    static uint32_t cfg_col_ctx_text;
+    static int cfg_ctx_item_h;
+    static int cfg_ctx_width;
+    static bool cfg_allow_edit;
+
+    // cached wallpaper pixels (full screen)
+    static uint32_t* gradient_cache;  // full screen pixel cache
+    static int gradient_cache_h;
+    static size_t gradient_cache_bytes; // for pmm freeing
+    static bool have_image_wallpaper;  // true if we have a real image
+
+    static void RenderWallpaper();
+    static void RenderIcon(DesktopIcon* icon);
+    static void RenderContextMenu();
+    static int  IconAt(int mx, int my);
+};
+
+// combined desktop environment
+class DesktopEnvironment {
+public:
+    static void Init(int screen_w, int screen_h);
+    static void Render();
+    static void HandleInput(int mx, int my, bool mouse_down, bool clicked, char key);
+    static void Update();
+    static void ReloadFromConfig();          // called by `kurono reload`
+
+    // app launchers
+    static void LaunchTerminal();
+    static void LaunchFileBrowser();
+    static void LaunchCalculator();
+    static void LaunchTextEditor();
+    static void LaunchSettings();
+    static void LaunchTaskManager();
+    static void LaunchBrowser();
+    static void LaunchMediaPlayer();
+    static void LaunchConduit();
+};

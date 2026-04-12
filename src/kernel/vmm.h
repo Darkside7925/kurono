@@ -1,0 +1,63 @@
+#pragma once
+#include "types.h"
+#include "pmm.h"
+
+//  virtual memory manager (x86_64 4-level paging)
+//
+//  works with the existing identity-mapped page tables set up by boot asm.
+//  provides mappage / unmappage / querymapping for finer-grained control
+//  when the kernel needs to map new physical memory (e.g., mmio, heap
+//  expansion, framebuffer at different virtual addresses).
+//
+//  currently all physical memory 0..16gb is identity-mapped via 2mb pages
+//  in boot. the vmm can overlay 4kb mappings on top of that for precise
+//  control.
+
+// page table entry flags (common across all levels)
+#define PTE_PRESENT    (1ULL << 0)
+#define PTE_WRITABLE   (1ULL << 1)
+#define PTE_USER       (1ULL << 2)
+#define PTE_PWT        (1ULL << 3)   // page write-through
+#define PTE_PCD        (1ULL << 4)   // page cache disable
+#define PTE_ACCESSED   (1ULL << 5)
+#define PTE_DIRTY      (1ULL << 6)
+#define PTE_HUGE       (1ULL << 7)   // 2mb page (in pd), 1gb page (in pdpt)
+#define PTE_GLOBAL     (1ULL << 8)
+#define PTE_NX         (1ULL << 63)  // no-execute (requires efer.nxe = 1)
+
+// virtual address bit layout for 4-level paging:
+//   [63:48]    sign extension
+//   [47:39]    pml4 index  (9 bits, 512 entries)
+//   [38:30]    pdpt index  (9 bits)
+//   [29:21]    pd   index  (9 bits)
+//   [20:12]    pt   index  (9 bits)
+//   [11:0]     offset      (12 bits)
+
+class KernelVMM {
+public:
+    // initialize: reads current cr3, makes it available for further mapping
+    static void Init();
+
+    // map a single 4kb page: virt_addr → phys_addr with given flags.
+    // allocates intermediate page tables from pmm as needed.
+    // returns true on success.
+    static bool MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
+
+    // unmap a single 4kb page. frees the physical frame if free_frame is true.
+    static void UnmapPage(uint64_t virt_addr, bool free_frame = false);
+
+    // query: returns the physical address mapped at virt_addr, or 0 if not mapped.
+    static uint64_t QueryMapping(uint64_t virt_addr);
+
+    // flush tlb for a single page
+    static void InvalidatePage(uint64_t virt_addr);
+
+    // flush entire tlb (reload cr3)
+    static void FlushTLB();
+
+    // get the current pml4 physical address (from cr3)
+    static uint64_t GetPML4();
+
+private:
+    static uint64_t pml4_phys;  // physical address of pml4 table
+};

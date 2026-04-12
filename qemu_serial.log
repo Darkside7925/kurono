@@ -1,0 +1,251 @@
+Kurono OS Starting...
+Early FB: drew green bar
+Multiboot OK
+[1] HAL::Init
+HAL: IDT loaded (48 NASM stubs), PIC remapped, IRQ 0/1/12 unmasked
+[2] MemoryManager::Init
+Heap: Initialized (16 MB free-list allocator)
+PMM: Initializing physical memory manager...
+PMM: Bitmap at 0x0x02DE9000, 0x00080000 bytes for 0x00400000 frames
+PMM: Total=0x00400000 Used=0x003E2E89 Free=0x0001D177
+VMM: Initialized, PML4 at 0x0x02DD7000
+[3] Scheduler::Init
+[4] VFS::Init
+VFS.1
+VFS.2
+VFS.3
+VFS.4
+VFS: Initialized with RAMDisk support
+[5] TestSuite::Run
+=== Starting System Test Suite ===
+Testing Memory Manager...
+[PASS] AllocPage returned valid pointer
+[PASS] Memory write/read verification
+Testing Scheduler...
+[PASS] PID counter initialized
+[PASS] CreateProcess returned valid pointer
+[PASS] Process has valid PID
+[PASS] Process is in Ready state
+[PASS] Scheduler has processes in queue
+Testing VFS...
+[PASS] VFS Root initialized
+[PASS] Root is a directory
+Testing Input System...
+InputManager: Registered Standard PS/2 Keyboard
+InputManager: Initialized
+InputManager: Registered Virtual Test Keyboard
+[PASS] Registered Virtual Device
+[PASS] Input Log file exists
+Log Content: KEY DEV:0 CHAR:a
+KEY DEV:1 CHAR:b
+
+[PASS] Log contains Device 0 input
+[PASS] Log contains Virtual Device input
+=== Test Suite Completed ===
+ALL TESTS PASSED
+[6] Post-TestSuite
+Initializing display...
+  MB flags=0x0x00001A67
+  fb_addr=0x0x000000000xFD000000
+  fb_w=1024 fb_h=768 bpp=32 type=1 pitch=4096
+  VBE: ctrl=0x0x00010550 mode_info=0x0x00010750 mode=0x0x00004144
+Display: Using MB FB at 0x0x000000000xFD000000
+Graphics: Basic Init 0x00000400x0x00000300 @ 0xFD000000
+Display: Multiboot framebuffer OK
+Graphics: Double buffering enabled
+Display: RenderMode=1 backbuf=0x018DC2E0 activebuf=0x018DC2E0
+Keyboard: Initializing Enhanced Driver...
+Keyboard: Running self-test...
+Keyboard: Controller self-test PASSED
+Keyboard: Interface test PASSED
+Keyboard: Repeat rate set (0x0000002B)
+Keyboard: LEDs updated (0x00000000)
+Keyboard: Enhanced Driver initialized
+Keyboard: USB HID support initialized
+Mouse: Initializing Enhanced Driver...
+Mouse: Reset ACK
+Mouse: Reset Response: 0x000000AA
+Mouse: Reset Response: 0x00000000
+Mouse: Polling rate set to 125Hz
+Mouse: Defaults Set (ACK)
+Mouse: Streaming Enabled (ACK)
+Mouse: IntelliMouse detected (scroll wheel)
+Mouse Device Info:
+  Type: Mouse
+  Capabilities: 0x00000007
+  DPI Profile: 800 (profile 1)
+  Polling Rate: 125Hz
+Mouse: Enhanced Driver initialized
+Mouse: Polling rate set to 1000Hz
+Mouse: High precision enabled
+Mouse: DPI scaling set to 1600x1600
+Boot splash: logo displayed
+Boot splash complete
+System: Initializing Core Components...
+System: Loading GUI Subsystem... [OK]
+System: Loading Graphics Drivers... [OK]
+System: Loading Vulkan Support... [Stubbed]
+System: Loading OpenGL Support... [Stubbed]
+System: All Components Initialized.
+Loading embedded wallpaper...
+Heap: OOM!
+MediaDecoder: stbi_load_from_memory failed outofmem
+Embedded wallpaper decode FAILED
+GUI::UpdateBackbuffer: w=1024 h=768 bpp=32 pitch=4096
+GUI: Gradient wallpaper generated
+[KVFS] Init...
+KVFS: Initializing...
+KVFS: Ready.
+[Shell] Init...
+Shell: Initialized
+[LinuxCmds] Register...
+[WindowsCmds] Register...
+[SUPR] Init...
+SUPR: Security engine initialized
+[PackageManager] Init...
+PkgMgr: Initialized with packages
+[Network] Init...
+[E1000] Scanning PCI bus...
+[E1000] Found at PCI 0:3 device=0x0x0000100E
+[E1000] MMIO base: 0x0xFEB80000
+[E1000] MAC: 0x00000052:0x00000054:0x00000000:0x00000012:0x00000034:0x00000056
+[E1000] Link: UP, Speed: 1000 Mbps, Full Duplex: Yes
+[E1000] Driver initialized successfully
+Network: eth0 backed by real E1000 NIC
+Network: Stack initialized (lo, eth0, wlan0)
+WiFi: Driver initialized (E1000 bridge active)
+[KCL] Init...
+KCL: Interpreter initialized
+[DualBoot] Init...
+[DualBoot] Manager initialized  -  mode: Integrated (Kurono + Linux)
+[DualBoot] Starting integrated boot...
+[DualBoot] === INTEGRATED BOOT ===
+[DualBoot] Both Kurono OS and Linux running simultaneously
+[LinuxKernel] Virtual kernel initialized
+[LinuxKernel] /proc initialized (13 entries)
+[LinuxKernel] /sys initialized (14 entries)
+[LinuxKernel] TTY subsystem initialized
+[LinuxKernel] Virtual Linux 6.8.0-kurono started
+[LinuxSignals] Signal system initialized
+[LinuxSyscall] Initialized
+[KLS] Subsystem initialized (32 packages)
+[KLS] Starting Kurono Linux Subsystem...
+[KLS] Initializing Linux rootfs...
+[KLS] Syncing SUPR users → Linux...
+[KLS] User sync complete (3 users)
+[KLS] Default rootfs populated
+[KLS] Linux rootfs initialized
+[KLS] Mounting shared directories...
+[KLS]   /home → shared
+[KLS]   /tmp → shared
+[KLS]   /var/log → shared
+[KLS] Syncing SUPR users → Linux...
+[KLS] User sync complete (3 users)
+[KLS] Linux Subsystem running
+[LinuxDevBridge] Device bridge initialized (15 devices)
+[LinuxInit] Init system ready (13 services registered)
+
+═══════════════════════════════════════════════════════════
+  Kurono Linux Subsystem  -  Booting...
+═══════════════════════════════════════════════════════════
+[LinuxKernel] /proc initialized (13 entries)
+  [OK] mount-proc
+[LinuxKernel] /sys initialized (14 entries)
+  [OK] mount-sys
+[LinuxDevBridge] Device bridge initialized (15 devices)
+  [OK] mount-dev
+  [OK] mount-tmp
+  [OK] hostname
+[SharedMount] Initialized
+[SharedMount] Setting up default mounts...
+[SharedMount] Mounted /home <-> /home
+[SharedMount] Mounted /tmp <-> /tmp
+[SharedMount] Mounted /var/log <-> /var/log
+[SharedMount] Mounted /proc <-> /proc
+[SharedMount] Mounted /dev <-> /dev
+[SharedMount] Mounted /sys <-> /sys
+[SharedMount] Mounted /etc <-> /etc
+[SharedMount] Mounted /mnt/kurono <-> /
+[SharedMount] Mounted /boot <-> /boot
+[SharedMount] Default mounts ready
+  [OK] shared-mounts
+[UserBridge] Initialized
+[UserBridge] Synced 3 users to Linux
+[UserBridge] Imported from Linux: n
+[UserBridge] Imported from Linux: u
+[UserBridge] Imported from Linux: g
+  [OK] user-sync
+  [OK] networking
+  [OK] rsyslog
+  [OK] cron
+  [OK] sshd
+  [OK] login
+[LinuxInit] Desktop bridge active  -  Linux GUI apps integrated with Kurono WM
+  [OK] desktop-bridge
+[LinuxInit] Boot complete in 0ms
+═══════════════════════════════════════════════════════════
+[SharedMount] Mounted /home/user/Documents <-> /home/user/Documents
+[SharedMount] Mounted /home/user/Downloads <-> /home/user/Downloads
+[SharedMount] Mounted /home/user/Desktop <-> /home/user/Desktop
+[UserBridge] Synced 6 users to Linux
+[DualBoot] Shared data configuration applied
+[DualBoot] GRUB config saved
+[DualBoot] Starting Alpine Linux guest VM...
+Hypervisor: BootAlpineWithExtraction starting
+Hypervisor: Initializing...
+VMM: Initializing...
+VMM: CPU Vendor: AuthenticAMD
+VMM: Running under a hypervisor (nested virt)
+VMM: Hypervisor vendor: 'TCGTCGTCGTCG' (max leaf 0x0x40000001)
+VMM: HV CPUID 0x40000000: EBX=0x0x54474354 ECX=0x0x43544743 EDX=0x0x47435447
+VMM: QEMU/TCG (software) detected
+VMM: CPUID  -  VT-x: no, SVM: YES
+VMM: AMD-V (SVM) bit present in CPUID
+VMM: SVM enabled (VM_CR.SVMDIS=0)
+VMM: AMD-V (SVM) activated
+VMM: Initialization complete  -  type=SVM [nested]
+Hypervisor: Hardware virtualization available (AMD-V, nested)
+VMExit: Handler initialized with default CPUID overrides
+EPT: Manager initialized
+VDevices: All virtual devices initialized
+  PIC: dual 8259A (master + slave)
+  APIC: xAPIC at 0xFEE00000
+  PIT: 8254 (3 channels)
+  HPET: 3 timers at 0xFED00000
+Hypervisor: Init complete
+Hypervisor: Attempting HW-accelerated Alpine boot [nested]
+Hypervisor: Creating VM (RAM=128MB, Disk=16MB)
+GuestMem: Initializing with 128 MB
+Heap: OOM!
+GuestMem: Failed to alloc high RAM (130048 KB), trying smaller...
+Heap: OOM!
+GuestMem: FAILED to allocate guest RAM!
+Hypervisor: Failed to allocate guest memory
+Hypervisor: HW boot produced no output  -  Alpine boot FAILED (no stubs, honest failure)
+Hypervisor: Destroying VM...
+Hypervisor: VM destroyed
+[DualBoot] Alpine VM boot skipped (no HW virt or no kernel)
+[DualBoot] === INTEGRATED BOOT COMPLETE ===
+[DualBoot] Kurono OS + Linux running as one system
+[DualBoot] Same users | Same files | Same desktop
+[LinuxNet] Init...
+[LinuxNet] Network bridge initialized (2 interfaces)
+[LinuxDrivers] Init...
+BGA: Probe ID = 0x0x0000B0C5
+BGA: Probe ID = 0x0x0000B0C5
+BGA: Probe ID = 0x0x0000B0C5
+BGA: Probe ID = 0x0x0000B0C5
+BGA: Probe ID = 0x0x0000B0C5
+[ProcFS] Initialized
+[SysFS] Initialized
+[LinuxDrivers] Framework initialized (35 drivers, 25 active)
+[Linux] Subsystem fully integrated
+[KVFS] Filesystem populated
+[AUDIO] Initializing Sound Blaster 16...
+[AUDIO] DSP reset failed  -  no SB16 detected
+[Desktop] Init...
+WindowManager: Initialized
+LockScreen::Show() called
+InputManager: Registered Standard PS/2 Keyboard
+InputManager: Initialized
+LockScreen: Scale=0.71
