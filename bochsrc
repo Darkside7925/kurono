@@ -1,0 +1,57 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Bochs Configuration  -  Kurono OS Strict Hardware Test
+#  Bochs is much stricter than QEMU and catches real hardware issues.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Memory: 512 MB
+megs: 512
+
+# BIOS and VGA ROMs
+romimage: file=/usr/share/seabios/bios.bin
+vgaromimage: file=/usr/share/bochs/VGABIOS-lgpl-latest
+
+# Boot from CD-ROM (our GRUB ISO)
+boot: cdrom
+
+# ATA channel 0: CD-ROM on master with our ISO
+ata0: enabled=true, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
+ata0-master: type=cdrom, path="build/kurono.iso", status=inserted
+
+# CPU: single core, IPS for reasonable speed
+cpu: count=1, ips=100000000, reset_on_triple_fault=0
+
+# Clock: sync to realtime
+clock: sync=realtime, time0=local
+
+# Display: use RFB (VNC server)  -  no X11 needed, we only care about logs
+display_library: rfb, options="timeout=3000"
+
+# Serial port: COM1 output to file for analysis
+com1: enabled=true, mode=file, dev=bochs_serial.log
+
+# Enable logging  -  this is the key diagnostic output
+log: bochs.log
+debugger_log: -
+
+# Panic action: report (don't kill on first error, log everything)
+panic: action=report
+error: action=report
+info: action=report
+debug: action=ignore
+
+# Port E9 hack: fast console output (writes to port 0xE9 go to console)
+port_e9_hack: enabled=true
+
+# PCI
+pci: enabled=true, chipset=i440fx
+
+# VGA: extension=vbe gives us Bochs VBE (like BGA)
+vga: extension=vbe, update_freq=5
+
+# Keyboard
+keyboard: type=mf, serial_delay=250, paste_delay=100000
+mouse: enabled=true, type=ps2
+
+# Floppy: none
+floppya: type=none
+floppyb: type=none

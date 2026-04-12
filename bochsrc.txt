@@ -1,0 +1,43 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Kurono OS  -  Bochs Configuration
+#  Bochs is much stricter than QEMU and catches real hardware issues.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Memory: 512 MB
+megs: 512
+
+# BIOS ROMs
+romimage: file=/usr/share/seabios/bios.bin
+vgaromimage: file=/usr/share/bochs/VGABIOS-lgpl-latest
+
+# Boot from CD-ROM (ISO)
+boot: cdrom
+
+# CD-ROM drive with our ISO
+ata0-master: type=cdrom, path="/mnt/c/Users/genie/OS/build/kurono.iso", status=inserted
+
+# CPU: 64-bit capable
+cpu: model=corei7_sandy_bridge_2600k, count=1, ips=50000000, reset_on_triple_fault=0
+
+# Display: X11 via WSLg
+display_library: x
+
+# Serial port: log to file for diagnostics
+com1: enabled=1, mode=file, dev="/mnt/c/Users/genie/OS/bochs_serial.log"
+
+# Logging: capture ALL Bochs messages
+log: /mnt/c/Users/genie/OS/bochs.log
+
+# Panic action: report and continue (don't halt on first issue)
+panic: action=report
+error: action=report
+info: action=report
+debug: action=ignore
+
+# Clock
+clock: sync=none, time0=utc
+
+# Mouse
+mouse: enabled=0
+
+# No acceleration  -  pure emulation
