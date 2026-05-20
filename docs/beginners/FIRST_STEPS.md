@@ -6,7 +6,7 @@ This is the shortest practical introduction to the repository.
 
 The live repository is not small.
 
-The current workspace holds **142,242 lines** across the active source and documentation text set, with **136,984 lines** living under `src/`.
+The source tree under `src/` is approximately 137,000 lines of freestanding C++17, NASM assembly, and C.
 
 That means the right strategy is not reading everything in random order. The right strategy is reading the control files first.
 
@@ -71,5 +71,7 @@ A shell command can build a virtual machine, load an embedded guest kernel, and 
 1. How the shell chooses between Linux, Windows, and Kurono commands.
 2. How the desktop search box launches apps.
 3. How the panic screen gets a framebuffer even when the desktop is dead.
-4. How the installer discovers disks and partitions.
-5. How `vm boot-alpine` crosses from shell command into the hypervisor.
+4. How the GPU probe detects hybrid graphics and validates the framebuffer address.
+5. How the Wayland compositor speaks the wire protocol and bridges to the window manager.
+6. How the installer discovers disks and partitions.
+7. How `vm boot-alpine` crosses from shell command into the hypervisor.

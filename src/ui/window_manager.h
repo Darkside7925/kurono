@@ -60,6 +60,19 @@ struct Window {
 
     // dirty tracking
     bool dirty;
+
+    // ── compositor: per-window animation + opacity ────────────────────
+    // anim_kind: 0=none, 1=open, 2=close, 3=minimize, 4=restore.
+    // anim_start_ms is in Timer::GetRealMs() units; phase = clamp01
+    // ((now - start) / duration).  CLOSE / MINIMIZE animations defer
+    // the actual state transition until phase reaches 1.0 so the
+    // window remains visible (with shrinking outline) during the
+    // transition.  alpha is a user-controllable post-pass overlay.
+    unsigned int anim_start_ms;
+    unsigned short anim_duration_ms;
+    unsigned char anim_kind;
+    unsigned char alpha;            // 0..255
+    short anchor_x, anchor_y;       // taskbar target for minimize anim
 };
 
 class WindowManager {
@@ -106,6 +119,8 @@ public:
     static bool HandleMouseDown(int mx, int my);
     static void HandleMouseMove(int mx, int my);
     static void HandleMouseUp(int mx, int my);
+    static void HandlePointerMove(int mx, int my);
+    static void HandlePointerButton(int mx, int my, int button, bool pressed);
     static void RenderAll();
 
     // query drag state for render optimization (skip shadows during drag)
@@ -115,6 +130,25 @@ public:
     // create window with render/input callbacks, returns window id
     static int CreateWindow(const char* title, int x, int y, int w, int h,
         WindowRenderFunc render, WindowInputFunc input);
+
+    // ── compositor configuration / animation ──────────────────────────
+    // Re-read display.* and compositor.* keys from UIConfig and apply
+    // to Graphics frame pacing + animation defaults.  Called by the
+    // shell `kurono reload` command and by Settings.
+    static void ReloadFromConfig();
+
+    // Advance per-window animation phase, retire windows whose CLOSE
+    // animation finished, hide windows whose MINIMIZE animation
+    // finished.  Safe to call every frame; uses Timer::GetRealMs.
+    static void TickAnimations();
+
+    // Set per-window alpha (0..255).  255 = fully opaque.
+    static void SetAlpha(int id, unsigned char a);
+    static unsigned char GetAlpha(int id);
+
+    // Set the taskbar anchor point used as the target of the minimize
+    // animation for a window.  Defaults to the screen-bottom centre.
+    static void SetTaskbarAnchor(int id, int x, int y);
 
 private:
     static Window windows[WM_MAX_WINDOWS];

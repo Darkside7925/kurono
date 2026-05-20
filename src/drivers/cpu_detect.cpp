@@ -228,46 +228,65 @@ void CPUDetect::DetectTopology() {
 
     // try leaf 0xb (x2apic topology) for accurate counts
     if (info.max_cpuid >= 0xB) {
-        int threads = 0, cores = 0;
+        int threads_per_core = 0;
+        int logical_at_core_level = 0;
 
-        CPUID(0xB, 0, &eax, &ebx, &ecx, &edx);
-        if ((ecx >> 8 & 0xFF) == 1)  // smt level
-            threads = ebx & 0xFFFF;
+        for (uint32_t level = 0; level < 8; level++) {
+            CPUID(0xB, level, &eax, &ebx, &ecx, &edx);
+            if ((ebx & 0xFFFF) == 0) break;
 
-        CPUID(0xB, 1, &eax, &ebx, &ecx, &edx);
-        if ((ecx >> 8 & 0xFF) == 2)  // core level
-            cores = ebx & 0xFFFF;
+            uint32_t level_type = (ecx >> 8) & 0xFF;
+            if (level_type == 1) {
+                threads_per_core = ebx & 0xFFFF;
+            } else if (level_type == 2) {
+                logical_at_core_level = ebx & 0xFFFF;
+                break;
+            }
+        }
 
-        if (threads > 0 && cores > 0) {
-            info.topology.logical_cores = cores;
-            info.topology.threads_per_core = (threads > 0 && cores > 0) ? (threads > 1 ? 2 : 1) : 1;
-            info.topology.physical_cores = cores / info.topology.threads_per_core;
+        if (logical_at_core_level > 0) {
+            info.topology.logical_cores = logical_at_core_level;
+            info.topology.threads_per_core = threads_per_core > 0 ? threads_per_core : 1;
+            info.topology.physical_cores = logical_at_core_level / info.topology.threads_per_core;
             if (info.topology.physical_cores < 1) info.topology.physical_cores = 1;
             return;
         }
     }
 
-    // fallback: use htt flag
-    if (info.features_edx & CPU_FEAT_HT) {
-        // try cpuid leaf 4 (intel) for core count
-        if (info.vendor == CPU_VENDOR_INTEL && info.max_cpuid >= 4) {
-            CPUID(4, 0, &eax, &ebx, &ecx, &edx);
-            int cores_per_package = ((eax >> 26) & 0x3F) + 1;
-            info.topology.physical_cores = cores_per_package;
-            info.topology.threads_per_core = logical_per_package / cores_per_package;
-            if (info.topology.threads_per_core < 1) info.topology.threads_per_core = 1;
-        }
-        // amd: use cpuid 0x80000008
-        else if (info.vendor == CPU_VENDOR_AMD && info.max_ext_cpuid >= 0x80000008) {
-            CPUID(0x80000008, 0, &eax, &ebx, &ecx, &edx);
-            int nc = (ecx & 0xFF) + 1;
-            info.topology.physical_cores = nc;
-            info.topology.threads_per_core = logical_per_package / nc;
-            if (info.topology.threads_per_core < 1) info.topology.threads_per_core = 1;
-        }
+    int cores_per_package = 0;
+    if (info.vendor == CPU_VENDOR_INTEL && info.max_cpuid >= 4) {
+        CPUID(4, 0, &eax, &ebx, &ecx, &edx);
+        cores_per_package = ((eax >> 26) & 0x3F) + 1;
+    } else if (info.vendor == CPU_VENDOR_AMD && info.max_ext_cpuid >= 0x80000008) {
+        CPUID(0x80000008, 0, &eax, &ebx, &ecx, &edx);
+        cores_per_package = (ecx & 0xFF) + 1;
     }
 
-    info.topology.logical_cores = info.topology.physical_cores * info.topology.threads_per_core;
+    if (cores_per_package > 0) {
+        info.topology.physical_cores = cores_per_package;
+        info.topology.threads_per_core = logical_per_package / cores_per_package;
+        if (info.topology.threads_per_core < 1) info.topology.threads_per_core = 1;
+        info.topology.logical_cores = info.topology.physical_cores * info.topology.threads_per_core;
+        if (info.topology.logical_cores < logical_per_package)
+            info.topology.logical_cores = logical_per_package;
+        return;
+    }
+
+    if ((info.features_edx & CPU_FEAT_HT) && logical_per_package > 1) {
+        info.topology.physical_cores = logical_per_package / 2;
+        if (info.topology.physical_cores < 1 || (logical_per_package % 2) != 0)
+            info.topology.physical_cores = logical_per_package;
+        info.topology.threads_per_core = logical_per_package / info.topology.physical_cores;
+        if (info.topology.threads_per_core < 1) info.topology.threads_per_core = 1;
+        info.topology.logical_cores = logical_per_package;
+        return;
+    }
+
+    if (logical_per_package > 1) {
+        info.topology.physical_cores = logical_per_package;
+        info.topology.logical_cores = logical_per_package;
+        info.topology.threads_per_core = 1;
+    }
 }
 
 //  frequency detection

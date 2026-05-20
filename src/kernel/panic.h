@@ -80,4 +80,4 @@ namespace KernelPanic {
     KernelPanic::KeBugCheckEx((code), (p1), (p2), (p3), (p4), (reason), __FILE__, (uint32_t)__LINE__)
 
 #define KERNEL_PANIC(msg) KBUGCHECK(StopCode::KERNEL_FATAL, (msg))
-#define KASSERT(cond, msg) do { if (!(cond)) KBUGCHECK(StopCode::ASSERTION_FAILED, (msg)); } while(0)
+#define KASSERT(cond, msg) do { if (!(cond)) KBUGCHECK(StopCode::ASSERTION_FAILED, (msg)); } while(0) 

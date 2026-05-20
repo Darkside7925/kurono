@@ -24,6 +24,7 @@
 #include "../virt/vmm.h"
 #include "../virt/hypervisor.h"
 #include "../net/network.h"
+#include "../system/logging.h"
 
 LinuxDriver LinuxDriverFramework::drivers[LDRV_MAX_DRIVERS];
 int LinuxDriverFramework::driver_count = 0;
@@ -46,6 +47,124 @@ static int lf_ai(char* b, int p, int m, int v) {
     return p;
 }
 
+static const char* lf_category_name(LinuxDriverCategory category) {
+    switch (category) {
+        case LDRV_CAT_CHAR:     return "char";
+        case LDRV_CAT_BLOCK:    return "block";
+        case LDRV_CAT_NET:      return "net";
+        case LDRV_CAT_PLATFORM: return "platform";
+        case LDRV_CAT_FS:       return "filesystem";
+        case LDRV_CAT_GPU:      return "gpu";
+        case LDRV_CAT_SOUND:    return "sound";
+        case LDRV_CAT_INPUT:    return "input";
+        case LDRV_CAT_BUS:      return "bus";
+        case LDRV_CAT_POWER:    return "power";
+        default:                return "other";
+    }
+}
+
+static const char* lf_state_name(LinuxDriverState state) {
+    switch (state) {
+        case LDRV_UNLOADED: return "unloaded";
+        case LDRV_LOADED:   return "loaded";
+        case LDRV_PROBING:  return "probing";
+        case LDRV_BOUND:    return "bound";
+        case LDRV_ACTIVE:   return "active";
+        case LDRV_ERROR:    return "error";
+        default:            return "unknown";
+    }
+}
+
+static void lf_publish_driver_inventory() {
+    KVFS::Mkdirs("/kurono/drivers");
+    LinuxDriver* current_drivers = LinuxDriverFramework::GetDrivers();
+    int current_driver_count = LinuxDriverFramework::GetDriverCount();
+
+    char readme[512];
+    int rp = 0;
+    rp = lf_a(readme, rp, sizeof(readme), "Kurono driver manifests\n");
+    rp = lf_a(readme, rp, sizeof(readme), "Each *.drv file mirrors one kernel driver registered in the LinuxDriverFramework.\n");
+    rp = lf_a(readme, rp, sizeof(readme), "See index.txt for the current summary.\n");
+    KVFS::WriteString("/kurono/drivers/README.txt", readme);
+
+    char index[4096];
+    int ip = 0;
+    ip = lf_a(index, ip, sizeof(index), "Kurono drivers\n\n");
+    for (int i = 0; i < current_driver_count && ip < (int)sizeof(index) - 128; i++) {
+        LinuxDriver* drv = &current_drivers[i];
+        ip = lf_a(index, ip, sizeof(index), drv->name);
+        ip = lf_a(index, ip, sizeof(index), " [");
+        ip = lf_a(index, ip, sizeof(index), lf_state_name(drv->state));
+        ip = lf_a(index, ip, sizeof(index), "] ");
+        ip = lf_a(index, ip, sizeof(index), lf_category_name(drv->category));
+        ip = lf_a(index, ip, sizeof(index), " - ");
+        ip = lf_a(index, ip, sizeof(index), drv->description[0] ? drv->description : "(no description)");
+        ip = lf_ac(index, ip, sizeof(index), '\n');
+
+        char path[128];
+        int pp = 0;
+        pp = lf_a(path, pp, sizeof(path), "/kurono/drivers/");
+        pp = lf_a(path, pp, sizeof(path), drv->name);
+        pp = lf_a(path, pp, sizeof(path), ".drv");
+
+        char info[1024];
+        int p = 0;
+        p = lf_a(info, p, sizeof(info), "name=");
+        p = lf_a(info, p, sizeof(info), drv->name);
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "description=");
+        p = lf_a(info, p, sizeof(info), drv->description[0] ? drv->description : "(none)");
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "category=");
+        p = lf_a(info, p, sizeof(info), lf_category_name(drv->category));
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "state=");
+        p = lf_a(info, p, sizeof(info), lf_state_name(drv->state));
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "bound=");
+        p = lf_a(info, p, sizeof(info), drv->bound ? "true" : "false");
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "version=");
+        p = lf_a(info, p, sizeof(info), drv->version[0] ? drv->version : "unknown");
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "author=");
+        p = lf_a(info, p, sizeof(info), drv->author[0] ? drv->author : "unknown");
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "license=");
+        p = lf_a(info, p, sizeof(info), drv->license[0] ? drv->license : "unknown");
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "major=");
+        p = lf_ai(info, p, sizeof(info), drv->major);
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "minor_start=");
+        p = lf_ai(info, p, sizeof(info), drv->minor_start);
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "minor_count=");
+        p = lf_ai(info, p, sizeof(info), drv->minor_count);
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "ref_count=");
+        p = lf_ai(info, p, sizeof(info), drv->ref_count);
+        p = lf_ac(info, p, sizeof(info), '\n');
+        p = lf_a(info, p, sizeof(info), "pci_ids=");
+        p = lf_ai(info, p, sizeof(info), drv->pci_id_count);
+        p = lf_ac(info, p, sizeof(info), '\n');
+
+        for (int pci = 0; pci < drv->pci_id_count && p < (int)sizeof(info) - 64; pci++) {
+            p = lf_a(info, p, sizeof(info), "pci[");
+            p = lf_ai(info, p, sizeof(info), pci);
+            p = lf_a(info, p, sizeof(info), "] vendor=0x");
+            p = lf_ai(info, p, sizeof(info), drv->pci_ids[pci].vendor);
+            p = lf_a(info, p, sizeof(info), " device=0x");
+            p = lf_ai(info, p, sizeof(info), drv->pci_ids[pci].device);
+            p = lf_ac(info, p, sizeof(info), '\n');
+        }
+
+        KVFS::WriteString(path, info);
+    }
+
+    KVFS::WriteString("/kurono/drivers/index.txt", index);
+}
+
 //  init
 
 void LinuxDriverFramework::Init() {
@@ -58,6 +177,8 @@ void LinuxDriverFramework::Init() {
     // init virtual filesystems
     ProcFS::Init();
     SysFS::Init();
+    lf_publish_driver_inventory();
+    RuntimeLog::LogSystem("drivers", "published driver manifests to /kurono/drivers");
     
     SerialLogger::Log("[LinuxDrivers] Framework initialized (");
     SerialLogger::LogDec(driver_count);
@@ -76,6 +197,7 @@ int LinuxDriverFramework::RegisterDriver(const LinuxDriver* drv) {
     d->state = LDRV_LOADED;
     d->ref_count = 0;
     int idx = driver_count++;
+    lf_publish_driver_inventory();
     return idx;
 }
 
@@ -84,6 +206,8 @@ void LinuxDriverFramework::UnregisterDriver(const char* name) {
         if (lf_seq(drivers[i].name, name)) {
             if (drivers[i].remove) drivers[i].remove(nullptr);
             drivers[i].state = LDRV_UNLOADED;
+            drivers[i].bound = false;
+            lf_publish_driver_inventory();
             return;
         }
     }
@@ -122,13 +246,16 @@ int LinuxDriverFramework::LoadDriver(const char* name) {
         if (ret == 0) {
             d->state = LDRV_ACTIVE;
             d->bound = true;
+            lf_publish_driver_inventory();
             return 0;
         } else {
             d->state = LDRV_ERROR;
+            lf_publish_driver_inventory();
             return ret;
         }
     }
     d->state = LDRV_ACTIVE;
+    lf_publish_driver_inventory();
     return 0;
 }
 
@@ -138,6 +265,7 @@ void LinuxDriverFramework::UnloadDriver(const char* name) {
     if (d->remove) d->remove(nullptr);
     d->state = LDRV_LOADED;
     d->bound = false;
+    lf_publish_driver_inventory();
 }
 
 int LinuxDriverFramework::ProbeAll() {
@@ -155,6 +283,7 @@ int LinuxDriverFramework::ProbeAll() {
             }
         }
     }
+    lf_publish_driver_inventory();
     return activated;
 }
 
@@ -911,40 +1040,38 @@ void ProcFS::UpdateVersion() {
 }
 
 void ProcFS::UpdateCPUInfo() {
-    // read cpuid to get real cpu info
-    uint32_t eax, ebx, ecx, edx;
-    char brand[49] = {0};
-    
-    // get brand string (cpuid 80000002h-80000004h)
-    for (int i = 0; i < 3; i++) {
-        __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                             : "a"(0x80000002 + i));
-        memcpy(brand + i * 16,     &eax, 4);
-        memcpy(brand + i * 16 + 4, &ebx, 4);
-        memcpy(brand + i * 16 + 8, &ecx, 4);
-        memcpy(brand + i * 16 + 12, &edx, 4);
+    CpuInfo cpu = CPUDetect::GetInfo();
+    const char* vendor = cpu.vendor_string[0] ? cpu.vendor_string : "unknown";
+    const char* brand = cpu.brand_string[0] ? cpu.brand_string : vendor;
+    int cpu_mhz = cpu.frequency.base_mhz > 0 ? cpu.frequency.base_mhz : 3600;
+    int siblings = cpu.topology.logical_cores > 0 ? cpu.topology.logical_cores : 1;
+    int cores = cpu.topology.physical_cores > 0 ? cpu.topology.physical_cores : siblings;
+    int cache_kb = 0;
+    for (int i = 0; i < cpu.num_caches; i++) {
+        if (cpu.cache[i].size_kb > cache_kb) cache_kb = cpu.cache[i].size_kb;
     }
-    brand[48] = 0;
-    
+    if (cache_kb <= 0) cache_kb = 8192;
+
     char buf[512];
     int p = 0;
     p = lf_a(buf, p, 512, "processor\t: 0\n");
     p = lf_a(buf, p, 512, "vendor_id\t: ");
-    
-    // get vendor (cpuid 0)
-    char vendor[13] = {0};
-    __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
-    memcpy(vendor, &ebx, 4);
-    memcpy(vendor + 4, &edx, 4);
-    memcpy(vendor + 8, &ecx, 4);
     p = lf_a(buf, p, 512, vendor);
     p = lf_a(buf, p, 512, "\nmodel name\t: ");
     p = lf_a(buf, p, 512, brand);
-    p = lf_a(buf, p, 512, "\ncpu MHz\t\t: 3600.000\n");
-    p = lf_a(buf, p, 512, "cache size\t: 8192 KB\n");
+    p = lf_a(buf, p, 512, "\ncpu MHz\t\t: ");
+    p = lf_ai(buf, p, 512, cpu_mhz);
+    p = lf_a(buf, p, 512, ".000\n");
+    p = lf_a(buf, p, 512, "cache size\t: ");
+    p = lf_ai(buf, p, 512, cache_kb);
+    p = lf_a(buf, p, 512, " KB\n");
     p = lf_a(buf, p, 512, "physical id\t: 0\n");
-    p = lf_a(buf, p, 512, "siblings\t: 4\n");
-    p = lf_a(buf, p, 512, "cpu cores\t: 4\n");
+    p = lf_a(buf, p, 512, "siblings\t: ");
+    p = lf_ai(buf, p, 512, siblings);
+    p = lf_a(buf, p, 512, "\n");
+    p = lf_a(buf, p, 512, "cpu cores\t: ");
+    p = lf_ai(buf, p, 512, cores);
+    p = lf_a(buf, p, 512, "\n");
     p = lf_a(buf, p, 512, "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat "
                           "pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc rep_good nopl "
                           "cpuid tsc_known_freq pni ssse3 cx16 sse4_1 sse4_2 x2apic popcnt aes xsave "

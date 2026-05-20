@@ -59,7 +59,7 @@ struct VMConfig {
         timer_tick_us  = 1000; // 1 ms
         cmdline        = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
                          "root=/dev/sda rw init=/bin/sh nokaslr noapic "
-                         "nosmp noacpi pci=off";
+                         "nosmp noacpi";
     }
 };
 

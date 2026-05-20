@@ -126,6 +126,13 @@ public:
     // text rendering  -  delegates to fontttf w/ bitmap fallback
     static void DrawString(int x, int y, const char* s, uint32_t fg, uint32_t bg);
 
+    // accessibility post-processing applied just before SwapBuffers copies
+    // the back buffer to the framebuffer.  Modes:
+    //   0 = off, 1 = protanopia, 2 = deuteranopia, 3 = tritanopia, 4 = grayscale
+    static void SetColorFilter(int mode);
+    static int  GetColorFilter();
+    static void SetHighContrast(bool on);
+
 private:
     static uint8_t* fb_addr;
     static uint8_t* back_buffer;

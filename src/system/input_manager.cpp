@@ -94,10 +94,18 @@ void InputManager::Init() {
 }
 
 void InputManager::Poll() {
-    Keyboard::Poll();
-    // poll mouse after keyboard so touchpad packet bursts do not delay key
-    // delivery on shared laptop 8042/ec controllers.
-    Mouse::Poll();
+    if (!Mouse::IsOperational()) {
+        // When the auxiliary device never completed init, drain its bytes first
+        // so they cannot keep the shared 8042 output buffer occupied and block
+        // keyboard polling in GUI mode.
+        Mouse::Poll();
+        Keyboard::Poll();
+    } else {
+        Keyboard::Poll();
+        // poll mouse after keyboard so touchpad packet bursts do not delay key
+        // delivery on shared laptop 8042/ec controllers.
+        Mouse::Poll();
+    }
     
     // real usb hid device sync (hotplug-safe)
     SyncUSBHIDDevices();

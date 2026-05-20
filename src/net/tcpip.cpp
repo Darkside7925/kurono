@@ -1,9 +1,42 @@
-//  kurono os  -  tcp/ip network stack implementation
-//  lightweight tcp/ip over e1000 ethernet
 #include "tcpip.h"
+#include "ipv6.h"
 #include "../drivers/e1000.h"
+#include "../drivers/serial.h"
+#include "../drivers/timer.h"
 #include "../kernel/heap.h"
+#include "../kernel/time.h"
+#include "../shell/shell.h"
 
+// tiny helpers for serial diag
+static void slog(const char* s){ SerialLogger::Log(s); }
+
+/* Cooperative ~1ms throttle inside network wait loops. The previous
+   `for (volatile d=0;d<100;d++)` and `pause` spins called Tick + PumpUI
+   thousands of times per millisecond, starving the kernel main loop and
+   the E1000 poll path. PIT-poll once-per-ms keeps the CPU off fire,
+   keeps PumpUI smooth, and still services the NIC fast enough. */
+static inline void net_wait_one_ms() {
+    uint32_t iter_start = Timer::GetTicks();
+    while ((uint32_t)(Timer::GetTicks() - iter_start) < 1u) {
+        __asm__ __volatile__("pause");
+    }
+}
+static void sloghex(uint32_t v){
+    char b[12]; b[0]='0'; b[1]='x';
+    const char* h = "0123456789ABCDEF";
+    for (int i=0;i<8;i++) b[2+i]=h[(v>>((7-i)*4))&0xF];
+    b[10]='\r'; b[11]='\n';
+    char b2[13]; for(int i=0;i<12;i++) b2[i]=b[i]; b2[12]=0;
+    SerialLogger::Log(b2);
+}
+static void slognum(int v){
+    char b[16]; int n=0; if(v<0){ b[n++]='-'; v=-v; }
+    char t[12]; int ti=0; if(v==0) t[ti++]='0';
+    while(v){ t[ti++]=(char)('0'+(v%10)); v/=10; }
+    while(ti) b[n++]=t[--ti];
+    b[n++]='\r'; b[n++]='\n'; b[n]=0;
+    SerialLogger::Log(b);
+}
 bool TCPStack::initialized = false;
 uint32_t TCPStack::local_ip = 0;
 uint32_t TCPStack::subnet_mask = 0;
@@ -14,9 +47,50 @@ uint8_t TCPStack::mac[6] = {};
 ARPEntry TCPStack::arp_cache[ARP_CACHE_SIZE] = {};
 NetSocket TCPStack::sockets[MAX_SOCKETS] = {};
 NetStats TCPStack::stats = {};
+PendingIPv4Frame TCPStack::pending_ipv4[PENDING_IPV4_TX] = {};
 
 uint16_t TCPStack::next_ephemeral_port = 49152;
 uint16_t TCPStack::ip_ident = 1;
+
+namespace {
+bool     g_ping_waiting = false;
+bool     g_ping_reply_ready = false;
+uint16_t g_ping_expect_id = 0;
+uint16_t g_ping_expect_seq = 0;
+uint16_t g_ping_next_id = 0x1234;
+uint16_t g_ping_next_seq = 1;
+uint32_t g_ping_expect_ip = 0;
+uint32_t g_ping_sent_ms = 0;
+uint32_t g_ping_rtt_ms = 0;
+
+bool SeqBefore(uint32_t a, uint32_t b) {
+    return (int32_t)(a - b) < 0;
+}
+
+bool SeqAfter(uint32_t a, uint32_t b) {
+    return (int32_t)(a - b) > 0;
+}
+
+bool BytesEqual(const uint8_t* a, const uint8_t* b, int len) {
+    for (int i = 0; i < len; i++) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+void ApplyAck(NetSocket* sock, uint32_t ack_seq) {
+    if (!sock) return;
+    if (SeqBefore(ack_seq, sock->tx_unacked) || SeqAfter(ack_seq, sock->tcp_seq)) {
+        return;
+    }
+
+    sock->tx_unacked = ack_seq;
+    if (sock->tx_pending && !SeqBefore(ack_seq, sock->tx_seq_end)) {
+        sock->tx_pending = false;
+        sock->tx_retries = 0;
+    }
+}
+}
 
 uint16_t TCPStack::htons(uint16_t val) {
     return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF);
@@ -29,6 +103,24 @@ uint32_t TCPStack::htonl(uint32_t val) {
 
 uint16_t TCPStack::ntohs(uint16_t val) { return htons(val); }
 uint32_t TCPStack::ntohl(uint32_t val) { return htonl(val); }
+
+static uint32_t ChecksumAccumulate(const void* data, int len, uint32_t sum = 0) {
+    const uint8_t* bytes = (const uint8_t*)data;
+    while (len > 1) {
+        sum += ((uint32_t)bytes[0] << 8) | (uint32_t)bytes[1];
+        bytes += 2;
+        len -= 2;
+    }
+    if (len == 1)
+        sum += (uint32_t)bytes[0] << 8;
+    return sum;
+}
+
+static uint16_t ChecksumFinish(uint32_t sum) {
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum);
+}
 
 uint32_t TCPStack::MakeIP(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     return ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | d;
@@ -48,21 +140,7 @@ void TCPStack::FormatIP(uint32_t ip, char* out) {
 }
 
 uint16_t TCPStack::Checksum(const void* data, int len) {
-    const uint16_t* ptr = (const uint16_t*)data;
-    uint32_t sum = 0;
-
-    while (len > 1) {
-        sum += *ptr++;
-        len -= 2;
-    }
-
-    if (len == 1)
-        sum += *(const uint8_t*)ptr;
-
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-
-    return (uint16_t)(~sum);
+    return ChecksumFinish(ChecksumAccumulate(data, len));
 }
 
 uint16_t TCPStack::TCPChecksum(const IPv4Header* ip, const TCPHeader* tcp,
@@ -76,7 +154,10 @@ uint16_t TCPStack::TCPChecksum(const IPv4Header* ip, const TCPHeader* tcp,
         uint16_t tcp_length;
     } __attribute__((packed)) pseudo;
 
-    int tcp_total = sizeof(TCPHeader) + payload_len;
+    int tcp_header_len = ((tcp->data_offset >> 4) & 0xF) * 4;
+    if (tcp_header_len < (int)sizeof(TCPHeader))
+        tcp_header_len = sizeof(TCPHeader);
+    int tcp_total = tcp_header_len + payload_len;
     pseudo.src_ip = ip->src_ip;
     pseudo.dst_ip = ip->dst_ip;
     pseudo.zero = 0;
@@ -84,28 +165,10 @@ uint16_t TCPStack::TCPChecksum(const IPv4Header* ip, const TCPHeader* tcp,
     pseudo.tcp_length = htons(tcp_total);
 
     uint32_t sum = 0;
-    const uint16_t* p;
-
-    // sum pseudo header
-    p = (const uint16_t*)&pseudo;
-    for (int i = 0; i < 6; i++) sum += p[i];
-
-    // sum tcp header
-    p = (const uint16_t*)tcp;
-    for (int i = 0; i < (int)(sizeof(TCPHeader) / 2); i++) sum += p[i];
-
-    // sum payload
-    p = (const uint16_t*)payload;
-    int plen = payload_len;
-    while (plen > 1) { sum += *p++; plen -= 2; }
-    if (plen == 1) sum += *(const uint8_t*)p;
-
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return (uint16_t)(~sum);
-}
-
-static void NetworkPacketHandler(const uint8_t* data, uint16_t length) {
-    TCPStack::ProcessRxPacket(data, (int)length);
+    sum = ChecksumAccumulate(&pseudo, sizeof(pseudo), sum);
+    sum = ChecksumAccumulate(tcp, tcp_header_len, sum);
+    sum = ChecksumAccumulate(payload, payload_len, sum);
+    return ChecksumFinish(sum);
 }
 
 bool TCPStack::Init() {
@@ -113,6 +176,7 @@ bool TCPStack::Init() {
 
     for (int i = 0; i < MAX_SOCKETS; i++) sockets[i].active = false;
     for (int i = 0; i < ARP_CACHE_SIZE; i++) arp_cache[i].valid = false;
+    for (int i = 0; i < PENDING_IPV4_TX; i++) pending_ipv4[i].active = false;
 
     stats = {};
 
@@ -121,9 +185,6 @@ bool TCPStack::Init() {
 
     // get mac address from e1000
     E1000::GetMAC(mac);
-
-    // register packet handler so e1000::poll() delivers packets to our stack
-    E1000::SetPacketHandler(NetworkPacketHandler);
 
     // default ip config (can be changed later via dhcp or static)
     local_ip = MakeIP(10, 0, 2, 15);
@@ -135,7 +196,7 @@ bool TCPStack::Init() {
     return true;
 }
 
-bool TCPStack::IsUp() { return initialized && E1000::IsDetected(); }
+bool TCPStack::IsUp() { return initialized && E1000::IsDetected() && E1000::IsLinkUp(); }
 
 void TCPStack::SetIP(uint32_t ip) { local_ip = ip; }
 void TCPStack::SetSubnetMask(uint32_t mask) { subnet_mask = mask; }
@@ -188,7 +249,10 @@ void TCPStack::ARPRequest(uint32_t ip) {
 }
 
 void TCPStack::ProcessARP(const void* data, int len) {
-    if (len < (int)sizeof(ARPHeader)) return;
+    if (len < (int)sizeof(ARPHeader)) {
+        slog("[ARP] short frame, dropping\r\n");
+        return;
+    }
     const ARPHeader* arp = (const ARPHeader*)data;
 
     uint32_t sender_ip = ((uint32_t)arp->sender_ip[0] << 24) |
@@ -200,11 +264,20 @@ void TCPStack::ProcessARP(const void* data, int len) {
                          ((uint32_t)arp->target_ip[2] << 8) |
                          arp->target_ip[3];
 
+    uint16_t op = ntohs(arp->opcode);
+    slog(op == ARP_OP_REQUEST ? "[ARP] REQUEST sender="
+                              : (op == ARP_OP_REPLY ? "[ARP] REPLY   sender="
+                                                    : "[ARP] op=?    sender="));
+    sloghex(sender_ip);
+    slog("[ARP]   target=");
+    sloghex(target_ip);
+
     // update arp cache with sender info
     bool found = false;
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (arp_cache[i].valid && arp_cache[i].ip == sender_ip) {
             for (int j = 0; j < 6; j++) arp_cache[i].mac[j] = arp->sender_mac[j];
+            arp_cache[i].timestamp = Time::GetTicks();
             found = true;
             break;
         }
@@ -215,6 +288,7 @@ void TCPStack::ProcessARP(const void* data, int len) {
                 arp_cache[i].ip = sender_ip;
                 for (int j = 0; j < 6; j++) arp_cache[i].mac[j] = arp->sender_mac[j];
                 arp_cache[i].valid = true;
+                arp_cache[i].timestamp = Time::GetTicks();
                 break;
             }
         }
@@ -251,7 +325,15 @@ void TCPStack::ProcessARP(const void* data, int len) {
 
 bool TCPStack::SendEthernet(const uint8_t* dst_mac, uint16_t ethertype,
                            const void* payload, int len) {
-    if (len > ETH_MTU) return false;
+    if (len > ETH_MTU) {
+        slog("[ETH:TX] reject: payload > ETH_MTU\r\n");
+        return false;
+    }
+    if (!E1000::IsDetected() || !E1000::IsLinkUp()) {
+        slog("[ETH:TX] reject: link down\r\n");
+        stats.errors_tx++;
+        return false;
+    }
 
     uint8_t frame[ETH_FRAME_MAX];
     EthernetHeader* eth = (EthernetHeader*)frame;
@@ -263,13 +345,32 @@ bool TCPStack::SendEthernet(const uint8_t* dst_mac, uint16_t ethertype,
     const uint8_t* src = (const uint8_t*)payload;
     for (int i = 0; i < len; i++) frame[ETH_HLEN + i] = src[i];
 
-    E1000::Send(frame, ETH_HLEN + len);
+    bool ok = E1000::Send(frame, ETH_HLEN + len);
+    if (!ok) {
+        slog("[ETH:TX] E1000::Send returned FALSE\r\n");
+        stats.errors_tx++;
+        return false;
+    }
     stats.packets_tx++;
     stats.bytes_tx += ETH_HLEN + len;
     return true;
 }
 
 bool TCPStack::SendIPv4(uint32_t dst_ip, uint8_t proto, const void* payload, int len) {
+    if (len < 0 || len > (int)(ETH_MTU - sizeof(IPv4Header))) {
+        slog("[IPv4:TX] reject: payload too large\r\n");
+        stats.errors_tx++;
+        return false;
+    }
+    static int s_send_log = 0;
+    if (s_send_log++ < 10) {
+        slog("[IPv4:TX] dst=");
+        sloghex(dst_ip);
+        slog("[IPv4:TX]   proto=");
+        slognum((int)proto);
+        slog("[IPv4:TX]   plen=");
+        slognum(len);
+    }
     uint8_t pkt[ETH_MTU];
     IPv4Header* ip = (IPv4Header*)pkt;
 
@@ -284,7 +385,7 @@ bool TCPStack::SendIPv4(uint32_t dst_ip, uint8_t proto, const void* payload, int
     ip->src_ip = htonl(local_ip);
     ip->dst_ip = htonl(dst_ip);
 
-    ip->checksum = Checksum(ip, sizeof(IPv4Header));
+    ip->checksum = htons(Checksum(ip, sizeof(IPv4Header)));
 
     // copy payload
     const uint8_t* src = (const uint8_t*)payload;
@@ -296,23 +397,74 @@ bool TCPStack::SendIPv4(uint32_t dst_ip, uint8_t proto, const void* payload, int
     if ((dst_ip & subnet_mask) != (local_ip & subnet_mask))
         next_hop = gateway;
 
-    // arp lookup
+    // arp lookup (with proper RX polling so the reply actually gets processed)
     uint8_t dst_mac[6];
     if (!ARPLookup(next_hop, dst_mac)) {
-        ARPRequest(next_hop);
-        // wait briefly for arp response
-        for (int i = 0; i < 100; i++) {
-            // process pending packets
-            for (volatile int d = 0; d < 10000; d++);
-            if (ARPLookup(next_hop, dst_mac)) break;
-        }
-        if (!ARPLookup(next_hop, dst_mac)) {
-            stats.errors_tx++;
-            return false;
-        }
+        return QueuePendingIPv4(next_hop, pkt, sizeof(IPv4Header) + len);
     }
 
     return SendEthernet(dst_mac, ETH_TYPE_IPV4, pkt, sizeof(IPv4Header) + len);
+}
+
+bool TCPStack::QueuePendingIPv4(uint32_t next_hop, const void* packet, int len) {
+    if (!packet || len <= 0 || len > ETH_MTU) {
+        stats.errors_tx++;
+        return false;
+    }
+
+    const uint8_t* bytes = (const uint8_t*)packet;
+    for (int i = 0; i < PENDING_IPV4_TX; i++) {
+        if (!pending_ipv4[i].active) continue;
+        if (pending_ipv4[i].next_hop != next_hop || pending_ipv4[i].len != (uint16_t)len) continue;
+        if (!BytesEqual(pending_ipv4[i].packet, bytes, len)) continue;
+        return true;
+    }
+
+    for (int i = 0; i < PENDING_IPV4_TX; i++) {
+        if (pending_ipv4[i].active) continue;
+        pending_ipv4[i].active = true;
+        pending_ipv4[i].next_hop = next_hop;
+        pending_ipv4[i].len = (uint16_t)len;
+        pending_ipv4[i].last_arp_ms = Timer::GetTicks();
+        pending_ipv4[i].arp_retries = 1;
+        for (int j = 0; j < len; j++) pending_ipv4[i].packet[j] = bytes[j];
+        ARPRequest(next_hop);
+        return true;
+    }
+
+    slog("[IPv4:TX] pending ARP queue full\r\n");
+    stats.errors_tx++;
+    return false;
+}
+
+void TCPStack::ServicePendingIPv4() {
+    uint8_t dst_mac[6];
+    uint32_t now_ms = Timer::GetTicks();
+    for (int i = 0; i < PENDING_IPV4_TX; i++) {
+        PendingIPv4Frame* entry = &pending_ipv4[i];
+        if (!entry->active) continue;
+
+        if (ARPLookup(entry->next_hop, dst_mac)) {
+            SendEthernet(dst_mac, ETH_TYPE_IPV4, entry->packet, entry->len);
+            entry->active = false;
+            continue;
+        }
+
+        if ((uint32_t)(now_ms - entry->last_arp_ms) < 250u) {
+            continue;
+        }
+
+        if (entry->arp_retries >= 8) {
+            slog("[IPv4:TX] dropping packet after ARP retries\r\n");
+            entry->active = false;
+            stats.errors_tx++;
+            continue;
+        }
+
+        entry->arp_retries++;
+        entry->last_arp_ms = now_ms;
+        ARPRequest(entry->next_hop);
+    }
 }
 
 void TCPStack::ProcessRxPacket(const void* data, int length) {
@@ -334,26 +486,59 @@ void TCPStack::ProcessRxPacket(const void* data, int length) {
         case ETH_TYPE_IPV4:
             ProcessIPv4(payload, payload_len);
             break;
-        default:
+        case ETH_TYPE_IPV6:
+            // Hand off to the IPv6 stack  -  it expects the full ethernet
+            // frame so it can echo MACs back on replies.
+            IPv6::ProcessRx((const unsigned char*)data, length,
+                            eth->dst_mac, eth->src_mac);
+            break;
+        default: {
+            static int s_unk_log = 0;
+            if (s_unk_log++ < 4) {
+                slog("[ETH:RX] unknown ethertype=");
+                sloghex((uint32_t)ethertype);
+            }
             stats.dropped++;
             break;
+        }
     }
 }
 
 void TCPStack::ProcessIPv4(const void* data, int len) {
-    if (len < (int)sizeof(IPv4Header)) return;
+    if (len < (int)sizeof(IPv4Header)) {
+        slog("[IPv4] short frame, dropping\r\n");
+        return;
+    }
 
     const IPv4Header* ip = (const IPv4Header*)data;
     int ihl = (ip->ver_ihl & 0x0F) * 4;
-    if (ihl < 20 || len < ihl) return;
+    if (ihl < 20 || len < ihl) {
+        slog("[IPv4] bad ihl, dropping\r\n");
+        return;
+    }
 
-    // verify checksum
-    // uint16_t cksum = checksum(ip, ihl);
-    // if (cksum != 0) { stats.errors_rx++; return; }
+    if (Checksum(ip, ihl) != 0) {
+        slog("[IPv4] bad checksum, dropping\r\n");
+        stats.errors_rx++;
+        return;
+    }
 
     const uint8_t* payload = (const uint8_t*)data + ihl;
     int payload_len = ntohs(ip->total_length) - ihl;
     if (payload_len < 0 || payload_len > len - ihl) payload_len = len - ihl;
+
+    // verbose: first ~10 IPv4 packets
+    static int s_ipv4_log = 0;
+    if (s_ipv4_log++ < 10) {
+        slog("[IPv4] RX src=");
+        sloghex(ntohl(ip->src_ip));
+        slog("[IPv4]    dst=");
+        sloghex(ntohl(ip->dst_ip));
+        slog("[IPv4]    proto=");
+        slognum((int)ip->protocol);
+        slog("[IPv4]    plen=");
+        slognum(payload_len);
+    }
 
     switch (ip->protocol) {
         case IP_PROTO_ICMP:
@@ -366,6 +551,7 @@ void TCPStack::ProcessIPv4(const void* data, int len) {
             ProcessUDP(ip, payload, payload_len);
             break;
         default:
+            slog("[IPv4] unknown proto, dropping\r\n");
             stats.dropped++;
             break;
     }
@@ -376,6 +562,7 @@ void TCPStack::ProcessICMP(const IPv4Header* ip_hdr, const void* data, int len) 
     stats.icmp_rx++;
 
     const ICMPHeader* icmp = (const ICMPHeader*)data;
+    uint32_t sender_ip = ntohl(ip_hdr->src_ip);
 
     if (icmp->type == ICMP_TYPE_ECHO_REQUEST) {
         // send echo reply
@@ -392,11 +579,20 @@ void TCPStack::ProcessICMP(const IPv4Header* ip_hdr, const void* data, int len) 
         reply_icmp->type = ICMP_TYPE_ECHO_REPLY;
         reply_icmp->code = 0;
         reply_icmp->checksum = 0;
-        reply_icmp->checksum = Checksum(reply_buf, copy_len);
+        reply_icmp->checksum = htons(Checksum(reply_buf, copy_len));
 
-        uint32_t sender_ip = ntohl(ip_hdr->src_ip);
         SendIPv4(sender_ip, IP_PROTO_ICMP, reply_buf, copy_len);
         stats.icmp_tx++;
+    } else if (icmp->type == ICMP_TYPE_ECHO_REPLY) {
+        uint16_t reply_id = ntohs(icmp->identifier);
+        uint16_t reply_seq = ntohs(icmp->sequence);
+        if (g_ping_waiting && sender_ip == g_ping_expect_ip &&
+            reply_id == g_ping_expect_id && reply_seq == g_ping_expect_seq) {
+            uint32_t now_ms = Timer::GetTicks();
+            g_ping_rtt_ms = now_ms - g_ping_sent_ms;
+            g_ping_reply_ready = true;
+            g_ping_waiting = false;
+        }
     }
 }
 
@@ -410,25 +606,54 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
     uint32_t src_ip = ntohl(ip_hdr->src_ip);
 
     int data_offset = ((tcp->data_offset >> 4) & 0xF) * 4;
+    if (data_offset < (int)sizeof(TCPHeader) || data_offset > len) {
+        slog("[TCP] bad header length, dropping\r\n");
+        stats.errors_rx++;
+        return;
+    }
     const uint8_t* tcp_data = (const uint8_t*)data + data_offset;
     int tcp_data_len = len - data_offset;
     if (tcp_data_len < 0) tcp_data_len = 0;
 
-    // find matching socket
+    if (TCPChecksum(ip_hdr, tcp, tcp_data, tcp_data_len) != 0) {
+        slog("[TCP] bad checksum, dropping\r\n");
+        stats.errors_rx++;
+        return;
+    }
+
+    // Prefer an exact 4-tuple match. Only fall back to a listening socket
+    // for a new SYN; otherwise an accepted connection can get misrouted back
+    // into the listener that shares the same local port.
     NetSocket* sock = nullptr;
+    NetSocket* listener = nullptr;
     for (int i = 0; i < MAX_SOCKETS; i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_STREAM) continue;
+        if (sockets[i].local_port != dst_port) continue;
 
-        if (sockets[i].local_port == dst_port) {
-            if (sockets[i].tcp_state == TCP_LISTEN ||
-                (sockets[i].remote_ip == src_ip && sockets[i].remote_port == src_port)) {
-                sock = &sockets[i];
-                break;
-            }
+        if (sockets[i].tcp_state == TCP_LISTEN) {
+            if (!listener) listener = &sockets[i];
+            continue;
+        }
+
+        if (sockets[i].remote_ip == src_ip && sockets[i].remote_port == src_port) {
+            sock = &sockets[i];
+            break;
         }
     }
 
+    if (!sock && listener && (tcp->flags & TCP_FLAG_SYN)) {
+        sock = listener;
+    }
+
     if (!sock) {
+        slog("[TCP] RX no matching socket: src=");
+        sloghex(src_ip);
+        slog("[TCP]   sport=");
+        slognum((int)src_port);
+        slog("[TCP]   dport=");
+        slognum((int)dst_port);
+        slog("[TCP]   flags=");
+        sloghex((uint32_t)tcp->flags);
         // send rst for unknown connection
         return;
     }
@@ -449,11 +674,18 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
             break;
 
         case TCP_SYN_SENT:
+            slog("[TCP] RX in SYN_SENT flags=");
+            sloghex((uint32_t)tcp->flags);
             if ((tcp->flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
+                ApplyAck(sock, their_ack);
                 sock->tcp_ack = their_seq + 1;
                 sock->tcp_seq = their_ack;
                 sock->tcp_state = TCP_ESTABLISHED;
                 SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
+                slog("[TCP] -> ESTABLISHED\r\n");
+            } else if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_CLOSED;
+                slog("[TCP] got RST -> CLOSED\r\n");
             }
             break;
 
@@ -464,33 +696,50 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
             break;
 
         case TCP_ESTABLISHED:
-            if (tcp->flags & TCP_FLAG_FIN) {
-                sock->tcp_ack = their_seq + 1;
-                sock->tcp_state = TCP_CLOSE_WAIT;
-                SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
+            if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_CLOSED;
+                sock->active = false;
+                slog("[TCP] got RST in ESTABLISHED -> CLOSED\r\n");
             } else {
-                // receive data
-                if (tcp_data_len > 0) {
-                    for (int i = 0; i < tcp_data_len && sock->rx_count < TCP_RX_BUFSIZE; i++) {
+                bool ack_needed = false;
+                int accepted_data = 0;
+                if (tcp_data_len > 0 && their_seq == sock->tcp_ack) {
+                    int space = TCP_RX_BUFSIZE - sock->rx_count;
+                    int copy = tcp_data_len < space ? tcp_data_len : space;
+                    for (int i = 0; i < copy; i++) {
                         sock->rx_buf[sock->rx_tail] = tcp_data[i];
                         sock->rx_tail = (sock->rx_tail + 1) % TCP_RX_BUFSIZE;
                         sock->rx_count++;
                     }
-                    sock->tcp_ack = their_seq + tcp_data_len;
-                    SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
+                    sock->tcp_ack = their_seq + copy;
+                    accepted_data = copy;
+                    ack_needed = true;
                 }
                 if (tcp->flags & TCP_FLAG_ACK) {
-                    sock->tx_unacked = their_ack;
+                    ApplyAck(sock, their_ack);
+                }
+                if (tcp->flags & TCP_FLAG_FIN) {
+                    uint32_t fin_seq = their_seq + (uint32_t)tcp_data_len;
+                    if (tcp_data_len == 0 || accepted_data == tcp_data_len) {
+                        if (fin_seq >= sock->tcp_ack) sock->tcp_ack = fin_seq + 1;
+                        sock->tcp_state = TCP_CLOSE_WAIT;
+                        ack_needed = true;
+                    }
+                }
+                if (ack_needed || tcp_data_len > 0) {
+                    SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
                 }
             }
             break;
 
         case TCP_FIN_WAIT_1:
             if ((tcp->flags & TCP_FLAG_ACK) && (tcp->flags & TCP_FLAG_FIN)) {
+                ApplyAck(sock, their_ack);
                 sock->tcp_ack = their_seq + 1;
                 sock->tcp_state = TCP_TIME_WAIT;
                 SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
             } else if (tcp->flags & TCP_FLAG_ACK) {
+                ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_FIN_WAIT_2;
             } else if (tcp->flags & TCP_FLAG_FIN) {
                 sock->tcp_ack = their_seq + 1;
@@ -513,12 +762,14 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
 
         case TCP_CLOSING:
             if (tcp->flags & TCP_FLAG_ACK) {
+                ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_TIME_WAIT;
             }
             break;
 
         case TCP_LAST_ACK:
             if (tcp->flags & TCP_FLAG_ACK) {
+                ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_CLOSED;
                 sock->active = false;
             }
@@ -530,12 +781,26 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
 }
 
 bool TCPStack::SendTCP(NetSocket* sock, uint8_t flags, const void* data, int len) {
+    if (!sock) return false;
+    return SendTCPPacket(sock, flags, data, len, sock->tcp_seq, true);
+}
+
+uint32_t TCPStack::TCPSeqAdvance(uint8_t flags, int len) {
+    uint32_t advance = (len > 0) ? (uint32_t)len : 0u;
+    if (flags & TCP_FLAG_SYN) advance++;
+    if (flags & TCP_FLAG_FIN) advance++;
+    return advance;
+}
+
+bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, int len,
+                             uint32_t seq, bool track_pending) {
+    if (!sock) return false;
     uint8_t buf[sizeof(TCPHeader) + TCP_MSS];
     TCPHeader* tcp = (TCPHeader*)buf;
 
     tcp->src_port = htons(sock->local_port);
     tcp->dst_port = htons(sock->remote_port);
-    tcp->seq_num = htonl(sock->tcp_seq);
+    tcp->seq_num = htonl(seq);
     tcp->ack_num = htonl(sock->tcp_ack);
     tcp->data_offset = (5 << 4); // 20 bytes, no options
     tcp->flags = flags;
@@ -553,10 +818,32 @@ bool TCPStack::SendTCP(NetSocket* sock, uint8_t flags, const void* data, int len
     IPv4Header pseudo_ip;
     pseudo_ip.src_ip = htonl(local_ip);
     pseudo_ip.dst_ip = htonl(sock->remote_ip);
-    tcp->checksum = TCPChecksum(&pseudo_ip, tcp, data, len);
+    // Guard against null data pointer  -  only pass valid payload to checksum
+    uint8_t null_buf[1] = {0};
+    if (!data) { data = null_buf; len = 0; }
+    tcp->checksum = htons(TCPChecksum(&pseudo_ip, tcp, data, len));
 
     stats.tcp_tx++;
-    return SendIPv4(sock->remote_ip, IP_PROTO_TCP, buf, sizeof(TCPHeader) + len);
+    bool ok = SendIPv4(sock->remote_ip, IP_PROTO_TCP, buf, sizeof(TCPHeader) + len);
+    if (!ok) return false;
+
+    if (track_pending) {
+        uint32_t seq_advance = TCPSeqAdvance(flags, len);
+        if (seq_advance > 0) {
+            sock->tx_pending = true;
+            sock->tx_flags = flags;
+            sock->tx_retries = 0;
+            sock->tx_len = len;
+            sock->tx_seq_base = seq;
+            sock->tx_seq_end = seq + seq_advance;
+            sock->tx_last_tx_ms = Timer::GetTicks();
+            if (len > 0) {
+                const uint8_t* src = (const uint8_t*)data;
+                for (int i = 0; i < len; i++) sock->tx_buf[i] = src[i];
+            }
+        }
+    }
+    return true;
 }
 
 void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
@@ -627,20 +914,49 @@ bool TCPStack::Connect(int sock, uint32_t ip, uint16_t port) {
     if (s->local_port == 0) s->local_port = AllocatePort();
 
     if (s->type == SOCK_STREAM) {
-        // tcp: send syn
-        s->tcp_seq = 1000; // initial sequence number (should be random)
+        slog("[TCP] Connect dst=");
+        sloghex(ip);
+        slog("[TCP] Connect dport=");
+        slognum(port);
+        // tcp: send syn (ISN derived from RDTSC for entropy)
+        uint32_t lo, hi;
+        __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+        s->tcp_seq = (lo ^ (hi << 1)) | 1u;
         s->tcp_ack = 0;
+        s->tx_unacked = s->tcp_seq;
         s->tcp_state = TCP_SYN_SENT;
-        SendTCP(s, TCP_FLAG_SYN, nullptr, 0);
+        if (!SendTCP(s, TCP_FLAG_SYN, nullptr, 0)) {
+            slog("[TCP] SendTCP(SYN) returned FALSE (route/ARP)\r\n");
+            s->tcp_state = TCP_CLOSED;
+            return false;
+        }
+        slog("[TCP] SYN sent, waiting for SYN-ACK\r\n");
         s->tcp_seq++;
 
-        // wait for connection (polling)
-        for (int i = 0; i < 300000; i++) {
+        // Wait using real elapsed time. The old spin-count loop could burn
+        // through the entire timeout window before QEMU/SLIRP delivered a
+        // SYN-ACK, so valid replies arrived only after the socket was closed.
+        uint32_t connect_start_ms = Timer::GetTicks();
+        while ((uint32_t)(Timer::GetTicks() - connect_start_ms) < 10000u) {
+            if (KuronoShell::IsCommandCancelRequested()) {
+                s->tcp_state = TCP_CLOSED;
+                return false;
+            }
             Tick();
+            KuronoShell::PumpUI();
             if (s->tcp_state == TCP_ESTABLISHED) return true;
             if (s->tcp_state == TCP_CLOSED) return false;
-            for (volatile int d = 0; d < 100; d++);
+            net_wait_one_ms();
         }
+        s->tcp_state = TCP_CLOSED;
+        slog("[TCP] Connect TIMEOUT (no SYN-ACK in 10s) tcp_rx=");
+        slognum((int)stats.tcp_rx);
+        slog("[TCP]   total packets_rx=");
+        slognum((int)stats.packets_rx);
+        slog("[TCP]   nic tx_pkts=");
+        slognum((int)E1000::GetTxCount());
+        slog("[TCP]   nic rx_pkts=");
+        slognum((int)E1000::GetRxCount());
         return false;
     }
 
@@ -689,9 +1005,30 @@ int TCPStack::Send(int sock, const void* data, int len) {
         while (sent < len) {
             int chunk = len - sent;
             if (chunk > TCP_MSS) chunk = TCP_MSS;
-            SendTCP(s, TCP_FLAG_ACK | TCP_FLAG_PSH, ptr + sent, chunk);
+            s->tx_unacked = s->tcp_seq;
+            if (!SendTCP(s, TCP_FLAG_ACK | TCP_FLAG_PSH, ptr + sent, chunk)) {
+                slog("[TCP] Send failed in established state\r\n");
+                return sent > 0 ? sent : -1;
+            }
             s->tcp_seq += chunk;
             sent += chunk;
+
+            uint32_t wait_start_ms = Timer::GetTicks();
+            while (s->tx_pending && (uint32_t)(Timer::GetTicks() - wait_start_ms) < 4000u) {
+                if (KuronoShell::IsCommandCancelRequested()) {
+                    return sent > 0 ? sent : -1;
+                }
+                Tick();
+                KuronoShell::PumpUI();
+                if (s->tcp_state == TCP_CLOSED) {
+                    return sent > 0 ? sent : -1;
+                }
+                net_wait_one_ms();
+            }
+            if (s->tx_pending) {
+                slog("[TCP] Send ACK timeout\r\n");
+                return sent > 0 ? sent : -1;
+            }
         }
         return sent;
     } else if (s->type == SOCK_DGRAM) {
@@ -716,21 +1053,42 @@ int TCPStack::Recv(int sock, void* buf, int max_len) {
     return count;
 }
 
+bool TCPStack::IsPeerClosed(int sock) {
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return true;
+    TCPState state = sockets[sock].tcp_state;
+    return state == TCP_CLOSE_WAIT || state == TCP_LAST_ACK ||
+           state == TCP_TIME_WAIT || state == TCP_CLOSED;
+}
+
 bool TCPStack::Close(int sock) {
     if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
 
     NetSocket* s = &sockets[sock];
     if (s->type == SOCK_STREAM && s->tcp_state == TCP_ESTABLISHED) {
         s->tcp_state = TCP_FIN_WAIT_1;
-        SendTCP(s, TCP_FLAG_FIN | TCP_FLAG_ACK, nullptr, 0);
+        if (!SendTCP(s, TCP_FLAG_FIN | TCP_FLAG_ACK, nullptr, 0)) {
+            s->tcp_state = TCP_ESTABLISHED;
+            return false;
+        }
         s->tcp_seq++;
+        return true;
     } else if (s->type == SOCK_STREAM && s->tcp_state == TCP_CLOSE_WAIT) {
         s->tcp_state = TCP_LAST_ACK;
-        SendTCP(s, TCP_FLAG_FIN | TCP_FLAG_ACK, nullptr, 0);
+        if (!SendTCP(s, TCP_FLAG_FIN | TCP_FLAG_ACK, nullptr, 0)) {
+            s->tcp_state = TCP_CLOSE_WAIT;
+            return false;
+        }
         s->tcp_seq++;
+        return true;
+    } else if (s->type == SOCK_STREAM &&
+               (s->tcp_state == TCP_FIN_WAIT_1 || s->tcp_state == TCP_FIN_WAIT_2 ||
+                s->tcp_state == TCP_CLOSING || s->tcp_state == TCP_LAST_ACK ||
+                s->tcp_state == TCP_TIME_WAIT)) {
+        return true;
     }
 
     s->active = false;
+    s->tcp_state = TCP_CLOSED;
     return true;
 }
 
@@ -776,26 +1134,56 @@ bool TCPStack::Ping(uint32_t ip, int timeout_ms, int* rtt_ms) {
         uint8_t data[32];
     } __attribute__((packed)) echo;
 
+    uint16_t ping_id = g_ping_next_id++;
+    uint16_t ping_seq = g_ping_next_seq++;
+
     echo.hdr.type = ICMP_TYPE_ECHO_REQUEST;
     echo.hdr.code = 0;
-    echo.hdr.identifier = htons(0x1234);
-    echo.hdr.sequence = htons(1);
+    echo.hdr.identifier = htons(ping_id);
+    echo.hdr.sequence = htons(ping_seq);
     echo.hdr.checksum = 0;
     for (int i = 0; i < 32; i++) echo.data[i] = (uint8_t)(i + 'A');
-    echo.hdr.checksum = Checksum(&echo, sizeof(echo));
+    echo.hdr.checksum = htons(Checksum(&echo, sizeof(echo)));
+
+    g_ping_waiting = true;
+    g_ping_reply_ready = false;
+    g_ping_expect_id = ping_id;
+    g_ping_expect_seq = ping_seq;
+    g_ping_expect_ip = ip;
+    /* Use Timer::GetTicks (PIT-polled real ms). Time::GetTicks reads
+       TimeManager::monotonic_ms which only advances from the kernel main
+       loop, so it freezes during synchronous shell commands and the wait
+       below would never time out. */
+    g_ping_sent_ms = Timer::GetTicks();
+    g_ping_rtt_ms = 0;
 
     stats.icmp_tx++;
-    if (!SendIPv4(ip, IP_PROTO_ICMP, &echo, sizeof(echo)))
+    if (!SendIPv4(ip, IP_PROTO_ICMP, &echo, sizeof(echo))) {
+        g_ping_waiting = false;
         return false;
-
-    // wait for reply
-    for (int i = 0; i < timeout_ms * 100; i++) {
-        Tick();
-        for (volatile int d = 0; d < 100; d++);
     }
 
-    if (rtt_ms) *rtt_ms = timeout_ms; // rough approximation
-    return true; // in a real impl, we'd track the reply properly
+    // wait for a matching echo reply (PIT-polled time so we cannot wedge)
+    uint32_t start_ms = g_ping_sent_ms;
+    while ((uint32_t)(Timer::GetTicks() - start_ms) < (uint32_t)timeout_ms) {
+        if (KuronoShell::IsCommandCancelRequested()) {
+            g_ping_waiting = false;
+            g_ping_reply_ready = false;
+            return false;
+        }
+        Tick();
+        KuronoShell::PumpUI();
+        if (g_ping_reply_ready) {
+            g_ping_reply_ready = false;
+            if (rtt_ms) *rtt_ms = (int)g_ping_rtt_ms;
+            return true;
+        }
+        net_wait_one_ms();
+    }
+
+    g_ping_waiting = false;
+    g_ping_reply_ready = false;
+    return false;
 }
 
 void TCPStack::Tick() {
@@ -803,6 +1191,7 @@ void TCPStack::Tick() {
 
     // poll e1000 for received packets (callback-based)
     E1000::Poll();
+    ServicePendingIPv4();
 
     // tcp timer processing
     TCPTick();
@@ -810,8 +1199,26 @@ void TCPStack::Tick() {
 
 void TCPStack::TCPTick() {
     // handle retransmissions, time_wait cleanup, etc.
+    uint32_t now_ms = Timer::GetTicks();
     for (int i = 0; i < MAX_SOCKETS; i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_STREAM) continue;
+        if (sockets[i].tx_pending) {
+            uint32_t rto_ms = 750u + (uint32_t)sockets[i].tx_retries * 250u;
+            if (rto_ms > 2000u) rto_ms = 2000u;
+            if ((uint32_t)(now_ms - sockets[i].tx_last_tx_ms) >= rto_ms) {
+                if (sockets[i].tx_retries >= 8) {
+                    slog("[TCP] retransmit budget exhausted\r\n");
+                    sockets[i].tx_pending = false;
+                    sockets[i].tcp_state = TCP_CLOSED;
+                    continue;
+                }
+                SendTCPPacket(&sockets[i], sockets[i].tx_flags,
+                              sockets[i].tx_len > 0 ? sockets[i].tx_buf : nullptr,
+                              sockets[i].tx_len, sockets[i].tx_seq_base, false);
+                sockets[i].tx_retries++;
+                sockets[i].tx_last_tx_ms = now_ms;
+            }
+        }
         if (sockets[i].tcp_state == TCP_TIME_WAIT) {
             // eventually clean up
             sockets[i].active = false;

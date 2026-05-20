@@ -1,212 +1,589 @@
-﻿# Kurono OS
+# Kurono OS
 
-A bare-metal x86_64 operating system with a hybrid kernel that unifies Linux, Windows, and native Kurono command environments into a single graphical desktop OS.
+A bare-metal x86_64 operating system with a hybrid kernel that combines a native desktop OS, a Linux-compatible syscall/runtime layer, a Windows command environment, a package/update pipeline, and a Type 1 hypervisor into one bootable image.
 
-Built from scratch in C++ and x86 assembly - no libc, no POSIX runtime, no existing kernel. Runs directly on hardware and QEMU with hardware-accelerated virtualization, standalone EFI boot, emergency recovery boot, and installable disk layouts.
+Built from scratch in freestanding C++17 and x86 assembly - no libc in the kernel, no borrowed POSIX runtime under the kernel, and no existing host kernel reused as the core OS. Kurono boots as a Multiboot2 ELF kernel, also produces standalone EFI loaders, runs in QEMU with WHPX or KVM, supports emergency recovery boot, can deploy onto FAT32/ext4 installer targets, and ships both Alpine and Debian guest paths.
 
-> **19 hardware drivers**  -  TCP/IP stack  -  Type 1 hypervisor (boots Alpine Linux)  -  76+ shell commands  -  emergency EFI boot  -  installer with GPT/MBR + FAT32/ext4 support
+> **19 hardware drivers - 76+ compatibility commands plus Kurono-native commands - full TCP/IP stack - in-kernel ELF64 dynamic linker - in-kernel Wayland compositor - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
 
 ---
 
 ## Quick Start
 
 ```powershell
-# Build and launch (requires WSL + cross-compiler + QEMU)
+# Build ISO and launch with the default QEMU profile
 .\start.ps1
 
-# Build only, no launch
+# Launch the existing ISO without rebuilding
 .\start.ps1 -NoBuild
 
-# Clean build
+# Clean, rebuild, and launch
 .\start.ps1 -Clean
 
-# Without hardware acceleration
-.\start.ps1 -NoAccel
-
-# Debug mode (GDB on localhost:1234)
+# Launch with a GDB stub on localhost:1234
 .\start.ps1 -Debug
+
+# Boot with OVMF UEFI firmware instead of SeaBIOS
+.\start.ps1 -UEFI
+
+# Use KVM on Linux hosts
+.\start.ps1 -KVM
+
+# Bare-metal-style host CPU pass-through path (Linux/KVM hosts)
+.\start.ps1 -BareMetal
+
+# Override guest RAM
+.\start.ps1 -Memory 12G
 ```
+
+```bash
+# Build only from WSL
+wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make'
+
+# Build the bootable ISO only
+wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make iso'
+
+# Fallback run path without hardware acceleration
+wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make run-noaccel'
+```
+
+`start.ps1` currently builds by invoking `make iso` inside WSL from `src/`, then launches the generated `build/kurono.iso`. There is no `-NoAccel` switch in the current PowerShell launcher; the non-accelerated path is the `make run-noaccel` target.
 
 ---
 
-## Features
+## Current Snapshot
 
-### Hybrid Shell with 76 Commands
+- **Architecture:** x86_64 bare metal, Multiboot2 kernel, standalone EFI loader, emergency EFI loader
+- **Implementation:** freestanding C++17 + NASM assembly
+- **Kernel model:** custom kernel, HAL, drivers, filesystem, shell, Linux runtime, hypervisor, and in-kernel Wayland compositor
+- **Primary build artifacts:**
+  - `build/kurono.elf`
+  - `build/kurono_base.elf`
+  - `build/kurono.iso`
+  - `build/boot/kurono_efi.efi`
+  - `build/boot/kurono_emergency.efi`
+  - `iso/kurono.iso`
+- **Default QEMU profile:** 10 GB RAM, 4 vCPUs, `-serial stdio`, Intel E1000 networking, SB16 + AC97 + Intel HDA audio, WHPX on Windows, KVM on Linux
+- **What boots today:** graphical desktop with compositing window manager, lock screen, package manager, updater UI, Linux subsystem, Alpine guest boot, Debian rootfs staging and boot-time setup, installer, in-kernel Wayland compositor accepting real Wayland clients, and emergency recovery paths
 
-- **Linux commands (58)** - `ls`, `cd`, `cat`, `grep`, `find`, `ps`, `kill`, `ifconfig`, `ping`, `lspci`, `lsusb`, `lsblk`, `lscpu`, `top`, `df`, `du`, `dmesg`, `modprobe`, `wget`, `curl`, and more
-- **Windows commands (18)** - `dir`, `copy`, `del`, `type`, `tasklist`, `ipconfig`, `systeminfo`, `tree`, `findstr`, and more
-- **Kurono native** - `help`, `version`, `sysinfo`, `switch`, `clear`, KCL scripting, `kpkg` package manager
-- **Cross-environment piping** - `linux:ls /home | windows:findstr user`
-- **Command conflict resolution** - detects commands in multiple environments, presents a numbered picker
-- **Environment switching** - `switch linux`, `switch windows`, `switch kurono`, `bash`, `cmd`
-- **PS1 prompt** - `User@host:cwd$` (Linux), `C:\>` (Windows)
+---
 
-All commands pull real data from kernel drivers and subsystems - no stubs.
+## Recent Updates
 
-### Graphical Desktop Environment
+### May 2026
 
-- BGA display with double buffering, up to 3840x2160 (4K), VSync support
-- Lock screen with password entry and setup wizard
-- Desktop with wallpaper, icons (double-click launch, right-click context menu)
-- Full window manager: drag, resize, minimize, maximize, close, z-order focus
-- Opaque rendering pipeline - zero alpha blending for maximum framebuffer performance
+- **Runtime stability and diagnostics**
+  - Fixed Internet checksum generation so IPv4/TCP checksums are calculated from network-order bytes instead of host-order 16-bit words.
+  - Added inbound IPv4 and TCP checksum validation with explicit serial drop logs, which is the right fix for the earlier "ARP works but TCP stalls" behavior.
+  - Fixed TCP checksum coverage to include the real TCP header length, including TCP options.
+  - Replaced the hottest 32bpp video render path with direct active-framebuffer writes instead of per-pixel `DrawPixel()` calls.
+  - Added bounded `VideoPlayer` decode and frame-advance logs for Denji/KVID debugging.
+  - Improved CPU topology fallback so multi-vCPU QEMU guests keep reporting multiple cores even when richer topology leaves are missing.
+  - `/proc/cpuinfo` is now synthesized from `CPUDetect::GetInfo()` rather than stale hardcoded placeholders.
+  - The legacy headless QEMU boot helper now also launches with 4 vCPUs to match the main launcher.
 
-### Taskbar
+- **Debian delivery and update pipeline**
+  - The large Debian rootfs is no longer embedded in the default ISO.
+  - `kpkg install debian [nvidia|amd|auto|none]` downloads `debian-minbase.ext4` from the package server, stages it to disk, writes a pending-update marker, and prompts for reboot.
+  - The boot-time `SystemUpdate` screen verifies the staged rootfs, boots Debian inside the hypervisor, updates apt sources, runs `apt-get update`, optionally installs vendor GPU drivers, and then continues to the desktop.
+  - The default build keeps `EMBED_DEBIAN=0`; offline embedding remains available via `make EMBED_DEBIAN=1`.
 
-- **K start button** - left-aligned logo at x = 6
-- **Search bar** - live substring search with blinking cursor, clickable results, Enter to launch
-- **Task icons** - centered in screen, colored circles with app initials
-- **System tray** - dynamically positioned WiFi signal bars, volume icon with arcs, battery indicator
-- **Volume popup** - vertical slider with draggable thumb, mute toggle (SB16)
-- **Clock** - far-right, 12-hour AM/PM time on top, M/D/YYYY date below, driven by RTC
-- **Start menu** - left-aligned launcher with 11 items and accent color bars
+- **Distribution and export changes**
+  - `make iso` now produces both `build/kurono.iso` and the copied export artifact `iso/kurono.iso`.
+  - The default ISO remains much smaller by moving bulky Debian payloads to runtime download/install flow.
 
-### Built-in Applications
+### April 2026
 
-| App | Description |
-|-----|-------------|
-| Terminal v2.0 | ANSI codes 30-97, cwd-aware prompt, Tab completion, Ctrl+A/E/K/U/W, 1024-entry dedup history, 500ms blinking cursor |
-| File Manager | Browse KVFS virtual filesystem with icon/list views |
-| Calculator | Basic arithmetic with GUI keypad |
-| Text Editor | Create/edit/save files on KVFS |
-| ~~Browser~~ | **Removed**  -  No C++ browser on GitHub works bare-metal (NetSurf/Dillo/Ladybird need libc/POSIX). Use `curl` in terminal. |
-| Media Player v2.0 | Video viewport rendering (data visualization + FPS counter), 256KB decode buffer, correct file_size, codec badges, SB16+AC97+HDA |
-| Settings | 10-tab settings: resolution (apps survive switch), wallpaper, display options with deferred apply |
-| Task Manager | Process list, CPU/memory stats, auto-refresh |
+- **In-kernel ELF64 dynamic linker (`ld-kurono`)**
+  - PT_INTERP handoff from the ELF loader
+  - PIE ASLR in the user address range
+  - recursive `DT_NEEDED` resolution with SONAME deduplication
+  - GNU hash and SYSV hash lookup
+  - 23 x86_64 relocation types
+  - `PT_GNU_RELRO` enforcement
+  - static TLS support
+  - vDSO mapping at `0x7FFFF7FFC000`
+  - full SysV auxv construction
+  - constructor trampoline for `DT_INIT` / `DT_INIT_ARRAY`
+  - `dlopen`, `dlsym`, `dlclose`, `dlvsym`, `dladdr`, `dlerror`
+  - `LD_DEBUG`, `LD_PRELOAD`, and `r_debug` rendezvous support
 
-### Kernel and Drivers (19 Drivers)
+- **Linux userspace runtime plumbing**
+  - Runtime layout seeder under `/system`
+  - Wayland compositor socket at `/system/run/user/1000/wayland-0`
+  - PulseAudio-compatible server at `/system/run/user/1000/pulse/native`
+  - D-Bus session bus at `/system/run/user/1000/bus`
+  - AF_UNIX sockets with `SCM_RIGHTS`, abstract namespace, and peer credentials
+  - Firefox launcher path built on top of the Linux exec/syscall/runtime stack
 
-| Driver | Description |
-|--------|-------------|
-| BGA | Bochs Graphics Adapter, multi-resolution up to 4K, 32bpp |
-| Display Manager | 10 predefined modes (640x480 to 3840x2160), VSync, DPI scaling, EDID |
-| NVMe | NVMe 1.4 SSD driver with admin + I/O queues, read/write/flush/identify |
-| USB / xHCI | USB 3.0/2.0/1.1 host controller, port enumeration, control/bulk transfers |
-| Intel HD Audio | HDA codec probing, CORB/RIRB, stream playback (44.1/48/96 kHz, 16/24/32-bit) |
-| VirtIO GPU | 2D/3D virtqueue transport, resource management, scanout, cursor |
-| NVIDIA GPU | PCI detection + BAR mapping for GeForce RTX 30xx/40xx/50xx, VRAM query, passthrough prep |
-| **AMD GPU** | PCI scan (vendor 0x1002), MMIO BAR0 mapping, VRAM detection, arch ID (GCN/RDNA1/2/3), temp/fan/power |
-| SB16 Audio | Sound Blaster 16, ISA DMA, PlayTone/Beep/GenerateBuffer, master volume |
-| **AC97 Audio** | PCI bus master DMA, NAM/NABM register I/O, 48 kHz PCM, volume control, parallel with SB16 |
-| **CPU Detect** | CPUID vendor/brand/family/model, feature flags (SSE4.2/AVX/AVX-512/FMA/AES-NI) |
-| Intel E1000 | 82540EM NIC, PCI MMIO, TX/RX descriptor rings, MAC address |
-| PS/2 Keyboard | Full scancode handling with drain-all-chars-per-frame input loop |
-| PS/2 Mouse | 1000 Hz polling, 1600 DPI scaling, auto-draw gate |
-| PIT Timer | 1000 Hz real-time polling with PIT-based frame pacing |
-| Serial | COM1 UART kernel logging |
-| RTC | Real-time clock for desktop clock and timestamps |
-| Graphics | Optimized DrawPixel fast path (opaque bypass), FillRectRounded corner arcs |
-| Display | Core framebuffer primitives |
+- **Kernel platform services**
+  - cgroups v2 hierarchy
+  - TPM 2.0 support over CRB and FIFO interfaces
+  - netfilter hook pipeline wired into the TCP/IP stack
+  - CPUFreq governors and P-state control
+  - demand paging, copy-on-write, and scheduler-backed process cloning
+  - real `fork`, `waitpid`, and `execve` flow
 
-### Networking (Full TCP/IP Stack)
+- **Recovery and deployment**
+  - Emergency EFI boot flow and GRUB recovery entries
+  - Installer subsystem for GPT/MBR inspection and deployment
+  - FAT32 ESP-safe write path
+  - ext4 target layout generation and payload staging
 
-- **Protocols** - Ethernet II, ARP, IPv4, ICMP, UDP, TCP
-- **Socket API** - `Socket()`, `Bind()`, `Connect()`, `Listen()`, `Accept()`, `Send()`, `Recv()`, `Close()`
-- **Socket types** - `SOCK_STREAM` (TCP), `SOCK_DGRAM` (UDP), `SOCK_RAW`
-- **TCP state machine** - all 11 standard states (CLOSED to TIME_WAIT)
-- **ARP cache** - 32 entries with resolution
-- **ICMP** - `Ping(ip, timeout, &rtt)` with round-trip measurement
-- **UDP** - `SendTo()` / `RecvFrom()` convenience API
-- **Configuration** - `SetIP()`, `SetSubnetMask()`, `SetGateway()`, `SetDNS()`
-- **Statistics** - packets/bytes RX/TX, per-protocol counters, errors, drops
-- **Max 16 sockets**, 8 KB RX/TX buffers, 1460 MSS
+---
 
-### Virtualization (Type 1 Hypervisor)
+## Feature Overview
 
-- **VMM** - Intel VT-x and AMD-V with VMCS/VMCB management
-- **EPT / NPT** - Extended Page Tables (Intel) + Nested Page Tables (AMD), 2 MB / 1 GB large pages
-- **VM lifecycle** - `CreateVM`, `RunVM`, `PauseVM`, `ResumeVM`, `DestroyVM`
-- **VM exit handler** - 56 Intel + 9 AMD exit reasons (CPUID, I/O, MSR, EPT violation, HLT, VMCALL)
-- **Virtual devices** - PIC 8259A, APIC (MMIO), PIT 8254, HPET, serial COM1, IDE disk
-- **Guest memory** - E820 table, MMIO regions, BDA/IVT setup, 4-128 MB RAM
-- **Linux boot protocol** - v2.15 bzImage parser, kernel loader at 0x100000, boot_params + cmdline
-- **IOMMU** - Intel VT-d / AMD-Vi for PCI device passthrough (GPU passthrough support)
-- **Shell command** - `vm create`, `vm run`, `vm pause`, `vm resume`, `vm destroy`, `vm serial`, `vm regs`, `vm info`, `vm boot-alpine`
-- **Alpine Linux VM** - pre-compiled Alpine Linux embedded via objcopy; boots on demand with `vm boot-alpine`
-- **VMCALL hypercalls** - NOP, info, shutdown, reboot
-- **Bare-metal VT-x fixes** - corrected VMCS link pointer, EPT pointer width, host 64-bit exit controls, guest CR0 fixed-bit handling, and aligned VMX allocations for real hardware execution
+### Boot and Kernel Foundation
 
-### Recovery and Installation
+- Multiboot2 boot path with long-mode x86_64 bring-up
+- GDT, IDT, PIC remap, ISR stubs, syscall entry, and userspace return stubs
+- Physical memory manager, virtual memory manager, buddy allocator, slab allocator, and large static kernel heap
+- Round-robin scheduler and kernel task/process tracking
+- PIT-backed timing at 1000 Hz with wait helpers and frame pacing
+- Kernel panic path and boot-time kernel test suite
+- Ring-3 entry support, per-process kernel stacks, saved user interrupt frames, and `int 0x80` syscall dispatch
+- Demand-zero heap and `mmap` regions, page-fault recovery, copy-on-write fork cloning, and `munmap` region splitting
+- User/kernel handoff for built-in user programs and PIE binaries launched through `ld-kurono`
 
-- **Emergency boot mode** - dedicated GRUB entries plus a standalone emergency EFI loader using the same EFI boot path
-- **Emergency shell** - minimal VGA text recovery shell for command access and log inspection when the desktop path is unavailable
-- **Installer command** - `installer` shell workflow for disk scan, partition inspection, ESP detection, planning, and deployment
-- **Partition support** - GPT and MBR detection over NVMe-backed disks
-- **Filesystem targets** - FAT32 ESP detection/write support and ext4 install layout/write support
-- **Install layout** - deploys `/system`, `/etc`, `/boot`, `/apps` plus packaged boot payloads and manifests
-- **Embedded payload deployment** - kernel, normal EFI loader, and emergency EFI loader are embedded into the final kernel for installer-driven disk installs
+### Display, Desktop, and Input
 
-### Linux Subsystem
+- **Display backends:** BGA (QEMU/Bochs), VirtIO GPU (2D resource management, scanout), Intel iGPU, NVIDIA dGPU, AMD GPU  -  selected via GPU probe at boot
+- **GPU probe:** early PCI scan for all display controllers (class 0x03), hybrid topology detection (Optimus muxless/MUX, PowerXpress, dual discrete, virtual), framebuffer address validation via Intel DSPSURF register read
+- **Display manager:** 10 predefined modes from 640x480 through 3840x2160, runtime mode switching, EDID reading, DPI scaling, gamma/brightness, VSync modes (off/on/adaptive)
+- **Graphics driver:** double/triple buffering with SSE2 non-temporal store swap path, write-combining framebuffer remap via PAT, dirty region tracking (16 rectangles), frame pacing with FPS measurement, blend modes (alpha/additive/multiply), accessibility color-blindness filters
+- **Wayland compositor:** in-kernel server listening at `/system/run/user/1000/wayland-0`, speaks the real libwayland wire protocol, advertises `wl_compositor` v5, `xdg_wm_base` v3, `wl_seat` v7, `zwp_linux_dmabuf_v1` v3, and 6 other globals  -  bridges `xdg_toplevel` surfaces into the Kurono window manager
+- **Window manager:** compositing WM with z-ordering, server-side decorations (titlebar, 1px border, 10px corner radius, drop shadows), 8-direction resize, drag, minimize/maximize/close, per-window alpha, smooth-step animation (open/close/minimize/restore with taskbar fly-to effect), configurable shadow and animation settings
+- **Desktop environment:** wallpaper (image or midnight-blue gradient), desktop icons with context menus, taskbar with start button/search/task icons/system tray/audio popup/clock, Alt-Tab window cycling
+- Boot splash with logo and animated loading feedback
+- 7 virtual consoles with the GUI running on `tty7`
+- Lock screen with password flow and first-run setup wizard
+- PS/2 keyboard and PS/2 mouse input paths, including packet resync and VirtualBox-friendly handling improvements
 
-- **67 syscall numbers defined**, 35+ implemented handlers
-- **Real syscalls** - `read`, `write`, `open`, `close`, `lseek`, `brk`, `getpid`, `getuid`, `stat`, `fstat`, `uname`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `access`, `dup`, `dup2`, `ioctl`, `writev`, `mmap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, and more
-- **Process model** - up to 16 Linux processes, 64 file descriptors per process, PID/FD table, brk heap
-- **Signal handling** - 30 POSIX signals (SIGHUP to SIGPWR)
-- **Device nodes** - `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/tty`
-- **Kernel identity** - reports as "Linux 6.8.0-kurono" to userspace
-- **`linux-exec` command** - run programs through real Linux syscalls
-- **`syscall` command** - direct syscall test interface (call any syscall by number)
-- **ext4** - superblock, inode, directory parsing support
+### Built-in Apps and Interactive Tools
 
-### Security and Scripting
+| Component | Surface | Description |
+|-----------|---------|-------------|
+| Terminal v2.0 | GUI app | ANSI colors, cwd-aware prompt, Tab completion, 1024-entry deduplicated history, Ctrl+A/E/K/U/W, blinking cursor, scrollback |
+| File Manager | GUI app | KVFS browser with icon and list views |
+| Calculator | GUI app | Basic arithmetic keypad |
+| Text Editor | GUI app | KVFS file create/load/save |
+| Media Player v2.0 | GUI app | video/audio playback UI, codec badges, metadata caching, decode buffer, FPS overlay, audio routing across SB16/AC97/HDA |
+| Denji | GUI app / shell command | windowed KVID/JPEG playback wrapper around `VideoPlayer` for the bundled Denji media asset |
+| Settings | GUI app | 10-tab settings UI including display, wallpaper, system, accessibility, and a real Updates tab |
+| Task Manager | GUI app | process list, CPU/memory stats, auto-refresh |
+| Firefox Launcher | runtime app path | launches a Linux userspace Firefox-style workload through the syscall/runtime layer and seeded `/system` layout |
+| Conduit | GUI app | event-dialogue viewer backed by `ConduitBridge` telemetry for system, package, GPU, guest, and command events |
+| Mini Python 3 | shell/runtime | built-in `python` / `python3` interpreter with file, `-c`, and `-e` execution |
+| Browser stub | GUI app | intentionally reduced to a removal notice because current freestanding browser candidates still require libc/POSIX stacks Kurono does not provide |
 
-- **SUPR** - Privilege escalation (sudo equivalent) with timeout, audit logging, permission levels (Guest/User/Admin/Root)
-- **User management** - password hashing with salt, multi-user support, groups, home directories
-- **KCL** - Kurono Command Language: variables, functions, if/else/while/for, import, math (`sqrt`, `rand`), `print`, `set`
-- **Package manager (In Development, stub commands)** - `kpkg install`, `kpkg remove`, `kpkg search`, `kpkg list` with dependency support
+### Hybrid Shell and Command Environments
 
-### Filesystem
+KuronoShell is a registry-driven shell that can execute native Kurono commands, Linux-style commands, Windows-style commands, KCL scripts, and guest-management commands from one terminal surface.
 
-- **KVFS** - In-memory virtual filesystem with directories, files, symlinks, devices, pipes, mountpoints
-- **POSIX semantics** - Unix permissions (rwxrwxrwx), 64 KB per-file content
-- **Operations** - `mkdir`, `rmdir`, `touch`, `cat`, `cp`, `mv`, `rm`, `chmod`, `stat`, `find`, `grep`
-- **Pre-populated** - `/home/user`, `/etc`, `/tmp`, `/var/log`, `/usr/bin`, sample KCL scripts
-- **Installer storage path** - ext4 target layout generation/write support plus FAT32 ESP file creation for boot deployment
+- **Environment model**
+  - `switch kurono`
+  - `switch linux`
+  - `switch windows`
+  - `bash`
+  - `cmd`
+
+- **Conflict handling**
+  - When a command exists in more than one environment, the shell presents a numbered resolver instead of silently choosing the wrong implementation.
+
+- **Cross-environment piping**
+  - Example: `linux:ls /home | windows:findstr user`
+
+- **Prompt model**
+  - Linux-style `User@host:cwd$`
+  - Windows-style `C:\>`
+  - Kurono-native interactive prompt
+
+#### Kurono-native commands
+
+- Core shell:
+  - `help`, `version`, `env`, `switch`, `clear`, `echo`, `set`, `alias`, `history`, `exit`
+- System control:
+  - `reboot`, `shutdown`, `restart`, `sysinfo`, `crash`, `kurono`
+- Identity and session:
+  - `whoami`, `uname`, `hostname`, `date`, `uptime`, `pwd`
+- Runtime and advanced:
+  - `usermode`, `gpu`, `vgpu`, `denji`, `codecs`
+- Linux and Windows bridging:
+  - `bash`, `linux`, `cmd`
+- Guest and toolchain bridging:
+  - `alpine`, `ffmpeg`, `ffprobe`, `apk`, `pwsh-setup`, `pwsh`, `powershell`
+- Package and language commands:
+  - `kpkg`, `install`, `remove`, `update`, `search`, `list`, `pkginfo`, `python`, `python3`
+
+#### Linux command surface
+
+The Linux environment exposes a real command set backed by kernel drivers and live runtime data rather than fixed strings.
+
+- Filesystem and text:
+  - `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch`, `cat`, `head`, `tail`, `wc`, `chmod`, `stat`, `df`, `du`, `ln`, `find`, `grep`, `which`, `tee`, `sort`, `uniq`, `tr`
+- System and diagnostics:
+  - `ps`, `kill`, `free`, `mount`, `dmesg`, `lspci`, `lsmod`, `drivers`, `lsblk`, `lsusb`, `lscpu`, `modprobe`, `modinfo`, `insmod`, `rmmod`, `dmidecode`, `hwinfo`, `top`, `iotop`, `uname`, `uptime`, `whoami`, `hostname`, `date`
+- Networking:
+  - `ifconfig`, `ip`, `ss`, `ping`, `wget`, `curl`
+- Linux runtime and guests:
+  - `linux-exec`, `syscall`, `vm`, `alpine`, `apk`, `debian`, `apt`
+
+#### Windows command surface
+
+- `dir`, `copy`, `move`, `del`, `type`, `md`, `rd`, `ren`, `cls`
+- `findstr`, `tasklist`, `taskkill`, `systeminfo`, `ipconfig`, `ver`, `tree`, `attrib`, `chkdsk`
+
+### Package Management and Update Flow
+
+Kurono ships both a native package manager and guest-aware update flows.
+
+- **Native package commands**
+  - `kpkg install <package>`
+  - `kpkg remove <package>`
+  - `kpkg update`
+  - `kpkg search <term>`
+  - `kpkg list`
+  - `pkginfo <package>`
+
+- **Repository sync**
+  - HTTP-backed sync against `kurono.satorut.com`
+  - Settings > Updates can perform real repository fetches and show pending update counts
+
+- **Debian guest provisioning**
+  - `kpkg install debian`
+  - Optional GPU hint: `nvidia`, `amd`, `auto`, or `none`
+  - Download target: `/var/lib/kurono/debian-rootfs.ext4`
+  - Pending marker: `/var/lib/kurono/pending-update`
+  - Boot-time updater verifies the rootfs, boots Debian, refreshes apt sources, runs `apt-get update`, optionally installs guest GPU drivers, then returns to the desktop
+
+- **GPU setup path**
+  - `kpkg setup <target>` hands off to the guest GPU driver installer
+  - Installer UI can kick off Alpine guest driver setup immediately or defer it to Settings > Updates or `kpkg setup alpine-auto`
+
+- **Build-time guest payload policy**
+  - Alpine guest kernel/initramfs are embedded when present
+  - Debian rootfs is external by default and only embedded when `EMBED_DEBIAN=1`
+
+### Media and Codec Stack
+
+- Image decoding via stb-based PNG/JPEG/WebP glue
+- Audio codec registry with WAV, MP3, AAC-LC, FLAC, MP4, and H.264 parse surfaces
+- MP4 demuxing and H.264/AAC parser plumbing
+- KVID container/player path for bundled video playback
+- Cached video metadata to avoid repeated file reads during playback
+- Enlarged decode buffers and faster direct blit path for 32bpp targets
+- Audio routing across SB16, AC97, HDA, and fallback backends
+- `ffmpeg` and `ffprobe` helper commands through Alpine where heavier media tooling is needed
+
+### Hardware Drivers
+
+Kurono currently ships 19 core hardware drivers plus additional kernel services layered on top of them.
+
+| Driver / Subsystem | Details |
+|--------------------|---------|
+| GPU Probe | early PCI scan, hybrid topology (Optimus/PowerXpress), framebuffer address validation |
+| BGA | Bochs Graphics Adapter, PCI BAR0 programming, 32bpp LFB, multi-resolution |
+| VirtIO GPU | 2D resource management, scanout, virtqueue control/cursor queues, B8G8R8X8 format |
+| Display Manager | 10-mode table, multi-backend routing (BGA/VirtIO/Intel/NVIDIA/AMD), EDID, DPI scaling |
+| Graphics | double/triple buffering, NT-store swap, WC remap, dirty rects, blend modes, color filters |
+| Wayland Server | in-kernel compositor, libwayland wire protocol, 9 globals, xdg_toplevel bridge |
+| NVIDIA GPU | PCI detection, BAR mapping, VRAM query, passthrough preparation |
+| AMD GPU | vendor detection, BAR0 MMIO, VRAM, arch ID, CU/clock/temp/fan/power reporting |
+| Intel GPU | iGPU detection, generation identification, display surface register read |
+| NVMe | admin + I/O queues, identify, read/write/flush |
+| USB / xHCI | USB 3/2/1 host control, port enumeration, control/bulk transfers |
+| Intel HD Audio | codec probing, CORB/RIRB, DMA playback |
+| SB16 | ISA DMA audio, tones, buffers, master volume |
+| AC97 | PCI DMA audio, NAM/NABM control, 48 kHz PCM, parallel operation with SB16 |
+| CPU Detect | CPUID vendor/brand/model/family/features/topology reporting |
+| Intel E1000 | PCI NIC init, descriptor rings, MAC readout, link status |
+| PS/2 Keyboard | scancodes, compatibility init, event drain |
+| PS/2 Mouse | polling, DPI scaling, packet re-sync, burst compatibility |
+| PIT Timer | 1000 Hz timing and wait helpers |
+| Serial | COM1 kernel logging |
+| RTC | time/date for shell and taskbar |
+
+Additional kernel platform services wired into the current tree include TPM 2.0, CPUFreq, netfilter, AF_UNIX sockets, PulseAudio server, D-Bus session bus, and the in-kernel Wayland compositor.
+
+### Networking
+
+Kurono includes a real custom TCP/IP stack instead of a guest-host shortcut.
+
+- **Link layer**
+  - Ethernet II framing
+  - ARP request/reply and 32-entry cache
+
+- **Internet layer**
+  - IPv4 header build and parse
+  - Receive-side checksum validation
+  - Routing configuration for IP, subnet, gateway, and DNS
+  - IPv6 stack with echo and neighbor-discovery plumbing
+
+- **Transport layer**
+  - ICMP ping with RTT measurement
+  - UDP send/receive and `SendTo` / `RecvFrom`
+  - TCP with all 11 classic states from `CLOSED` through `TIME_WAIT`
+  - Correct TCP pseudo-header checksum generation and validation
+
+- **Socket API**
+  - `Socket()`, `Bind()`, `Connect()`, `Listen()`, `Accept()`, `Send()`, `Recv()`, `Close()`
+  - Socket types: `SOCK_STREAM`, `SOCK_DGRAM`, `SOCK_RAW`
+
+- **Limits and telemetry**
+  - Up to 16 sockets
+  - 8 KB RX/TX buffers
+  - 1460-byte MSS
+  - Per-protocol RX/TX/error/drop statistics
+
+- **Policy and filtering**
+  - 5-hook netfilter pipeline with `PRE_ROUTING`, `LOCAL_IN`, `FORWARD`, `LOCAL_OUT`, `POST_ROUTING`
+  - Rule matching by IPv4 src/dst, ports, protocol, and interface
+
+- **Guest and bridge support**
+  - E1000-backed `eth0`
+  - Tun/Tap subsystem initialization path
+  - QEMU SLIRP host forwarding from host port 8080 to guest port 80
+
+### Linux Subsystem and Userspace Runtime
+
+This is more than a command shim. Kurono has an in-kernel Linux compatibility/runtime layer with real process, memory, fd, and syscall handling.
+
+- **Syscall layer**
+  - 67 syscall numbers defined
+  - 35+ implemented handlers, including `read`, `write`, `open`, `close`, `lseek`, `brk`, `fork`, `waitpid`, `execve`, `stat`, `fstat`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `dup`, `dup2`, `ioctl`, `writev`, `mmap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, and more
+
+- **Process model**
+  - Up to 16 Linux processes
+  - 64 file descriptors per process
+  - Parent/child tracking
+  - Saved interrupt-frame and user-context state
+  - Scheduler-backed ring-3 tasks
+
+- **Memory model**
+  - Lazy `brk`
+  - Anonymous `mmap`
+  - Copy-on-write address-space cloning
+  - Recoverable user page faults
+  - Mappings currently constrained below 4 GB because the syscall ABI layer still follows a 32-bit-style pointer convention
+
+- **Proc/sys identity**
+  - Reports as `Linux 6.8.0-kurono`
+  - `/proc`, `/sys`, TTY/PTY, and proc-style generated files
+
+- **Runtime layout seeding**
+  - Approximately 120 directories under `/system`
+  - Generated config files under `/system/etc`
+  - Generated proc/sys content under `/system/proc` and `/system/sys`
+  - Per-user runtime directories under `/system/run/user/1000`
+
+- **IPC and session services**
+  - AF_UNIX socket table with `STREAM`, `DGRAM`, and `SEQPACKET`
+  - `SCM_RIGHTS` file descriptor passing
+  - D-Bus session bus
+  - PulseAudio-compatible server
+  - Wayland compositor socket
+
+- **Dynamic linking**
+  - `ld-kurono` interpreter path for PIE userspace binaries
+  - `dlopen` family support
+  - TLS, RELRO, auxv, vDSO, and constructor handling
+
+- **Commands and launchers**
+  - `linux-exec`
+  - `syscall`
+  - `usermode`
+  - Firefox launcher runtime path
+
+### Virtualization
+
+Kurono includes a Type 1 hypervisor stack designed for Linux guest boot and device virtualization.
+
+- **CPU virtualization**
+  - Intel VT-x and AMD-V detection
+  - VMXON / VMXOFF and SVM enable/disable
+  - VMCS and VMCB management
+
+- **Memory virtualization**
+  - EPT on Intel and NPT on AMD
+  - 2 MB and 1 GB large-page support
+  - Guest physical memory layout, E820 tables, BDA/IVT setup, and MMIO regions
+
+- **Device virtualization**
+  - Virtual PIC, APIC, PIT, HPET, serial, IDE disk, and guest memory plumbing
+  - Guest serial bridge into the Kurono shell
+
+- **Guest lifecycle**
+  - `CreateVM`, `RunVM`, `PauseVM`, `ResumeVM`, `DestroyVM`
+  - Per-cycle VM run helpers
+  - VMCALL support for NOP, info, shutdown, and reboot
+
+- **Linux guest boot**
+  - bzImage parser and Linux boot protocol v2.15
+  - boot params, cmdline, and initrd load support
+
+- **Shipped guest profiles**
+  - Alpine Linux guest boot through embedded `vmlinuz-virt` and `initramfs-virt`
+  - Debian rootfs staging and post-install/update boot flow
+
+- **IOMMU and passthrough**
+  - Intel VT-d and AMD-Vi plumbing
+  - PCI passthrough support and GPU passthrough-oriented paths
+
+- **Correctness work already landed**
+  - VMCS link pointer fixes
+  - 64-bit EPT pointer writes
+  - VM-exit control correctness
+  - guest CR0 fixed-bit compliance
+  - aligned allocation cleanup
+  - 64-bit I/O and MSR bitmap addressing
+
+### Recovery, Installation, and Deployment
+
+- GRUB ISO boot with multiple entries, including normal, debug, text-mode, and emergency paths
+- Standalone normal EFI and emergency EFI loaders
+- Emergency shell for minimal recovery when the desktop path is unavailable
+- Installer shell/UI workflow for disk scan, partition inspection, and deployment planning
+- GPT and MBR partition parsing over NVMe-backed targets
+- FAT32 EFI System Partition detection and safe file deployment
+- ext4 target layout generation for `/system`, `/etc`, `/boot`, and `/apps`
+- Embedded deployment payloads:
+  - kernel
+  - normal EFI loader
+  - emergency EFI loader
+  - fallback `BOOTX64.EFI`
+- Two-stage build (`kurono_base.elf` then final `kurono.elf`) so installable payloads can be embedded in the shipping kernel
+
+### Security, Users, Scripting, and Filesystem
+
+- **SUPR privilege system**
+  - privilege escalation with timeout
+  - audit logging
+  - Guest/User/Admin/Root roles
+  - salted password hashing
+
+- **User management**
+  - multiple users
+  - groups
+  - home directories
+  - runtime session tracking
+
+- **KCL**
+  - variables
+  - functions
+  - `if` / `else`
+  - `while` / `for`
+  - imports
+  - math helpers like `sqrt` and `rand`
+  - `print` and `set`
+
+- **KVFS**
+  - in-memory virtual filesystem
+  - directories, files, symlinks, devices, pipes, mountpoints
+  - POSIX-style permissions
+  - common file operations across shell and apps
+  - pre-seeded `/home`, `/etc`, `/tmp`, `/var/log`, `/usr/bin`
+
+- **ext4 and FAT32**
+  - ext4 parsing for the Linux layer and installer targets
+  - FAT32 write path focused on ESP deployment rather than general desktop storage
 
 ---
 
 ## Architecture
 
-```
+```text
 Kurono OS
-+-- Desktop Environment       (GUI, window manager, 8 apps)
-+-- Hybrid Shell               (58 Linux + 18 Windows + Kurono native)
-+-- KCL Interpreter            (native scripting language)
-+-- TCP/IP Stack               (Ethernet/ARP/IPv4/ICMP/UDP/TCP)
-+-- Hypervisor Layer           (VT-x + AMD-V, EPT/NPT, virtual devices)
-|       +-- Alpine Linux VM    (on-demand: vm boot-alpine)
-|       +-- Generic Linux VM   (bzImage boot protocol)
-+-- Linux Subsystem            (35+ real syscalls, 67 defined)
-+-- 19 Hardware Drivers        (NVMe, USB, HDA, VirtIO GPU, E1000, BGA, AMD GPU, AC97, CPU Detect, ...)
-+-- Media Codecs               (WAV, MP3, AAC-LC, FLAC, MP4/H.264 via CodecRegistry)
-+-- Security (SUPR)            (privilege escalation, user management)
-+-- KVFS Filesystem            (in-memory, POSIX semantics)
-+-- Package Manager (kpkg)     (install, remove, search, update)
++-- Boot and Kernel Core
+|   +-- Multiboot2 / EFI loaders
+|   +-- PMM / VMM / scheduler / syscall entry
+|   +-- Ring-3 userspace path
+|   +-- Demand paging + copy-on-write
+|
++-- Desktop and Native UX
+|   +-- GPU probe / display manager / graphics driver
+|   +-- Wayland compositor (in-kernel, wire protocol)
+|   +-- Window manager (compositing, animations, shadows)
+|   +-- Lock screen / desktop / taskbar / settings
+|   +-- Terminal / media / file manager / task manager
+|
++-- Shell and Runtime Surfaces
+|   +-- Kurono-native command set
+|   +-- Linux command environment
+|   +-- Windows command environment
+|   +-- KCL scripting
+|   +-- Mini Python 3
+|
++-- Networking
+|   +-- Ethernet / ARP / IPv4 / IPv6
+|   +-- ICMP / UDP / TCP
+|   +-- Netfilter hooks
+|   +-- AF_UNIX sockets
+|
++-- Linux Compatibility Runtime
+|   +-- Syscall layer
+|   +-- /system runtime layout
+|   +-- Wayland / Pulse / D-Bus
+|   +-- ld-kurono dynamic linker
+|
++-- Virtualization
+|   +-- VT-x / AMD-V
+|   +-- EPT / NPT
+|   +-- Virtual devices
+|   +-- Alpine guest boot
+|   +-- Debian guest staging/update path
+|
++-- Installation and Recovery
+|   +-- Emergency EFI boot
+|   +-- Installer
+|   +-- FAT32 ESP deployment
+|   +-- ext4 target layout generation
+|
++-- Storage and Security
+    +-- KVFS
+    +-- ext4 parser
+    +-- SUPR
+    +-- package manager
 ```
 
 ### Source Layout
 
-```
+```text
 src/
-  boot/         x86_64 Multiboot entry, GDT, IDT, linker script
-  kernel/       Main kernel, heap, time, types, system management
-  hal/          Hardware abstraction layer (IDT, PIC, ISR stubs)
-  drivers/      BGA, NVMe, USB/xHCI, HDA, VirtIO GPU, NVIDIA, E1000, SB16, ...
-  ui/           Desktop, taskbar, window manager, lock screen, fonts, GUI
-  apps/         Terminal, calculator, file manager, editor, media player, settings, ...
-  shell/        Hybrid shell, 58 Linux commands, 18 Windows commands
-  fs/           VFS + KVFS in-memory filesystem
-  net/          TCP/IP stack (ARP, IPv4, ICMP, UDP, TCP, sockets)
-  linux/        Linux subsystem (35+ syscalls, signals, device nodes, ext4)
-  virt/         VMM, EPT/NPT, virtual devices, hypervisor, IOMMU, Linux boot
-  security/     SUPR privilege system, user management
-  kcl/          Kurono Command Language interpreter
+  boot/         x86_64 Multiboot entry, EFI loader, linker scripts, early boot
+  kernel/       heap, PMM, VMM, buddy/slab allocators, ELF loader, panic, time
+  hal/          interrupts, syscall entry, cpufreq hooks, architecture glue
+  drivers/      display, audio, storage, NIC, TPM, GPU, input, runtime daemons
+  ui/           desktop, taskbar, window manager, font, lock screen, Wayland compositor
+  apps/         terminal, media player, file manager, settings, task manager, etc.
+  shell/        KuronoShell plus Linux and Windows command environments
+  fs/           VFS, KVFS, FAT32
+  net/          TCP/IP, netfilter, IPv6, Tun/Tap, AF_UNIX
+  linux/        syscall layer, ext4, init, signals, ld-kurono, dual-boot runtime
+  virt/         VMM, EPT/NPT, guest memory, vdevices, guest boot, passthrough
+  security/     SUPR privilege system
+  kcl/          Kurono Command Language
   packages/     kpkg package manager
-  proc/         Round-robin scheduler
-  media/        Image decoder (PNG, JPEG, WebP via stb_image)
-  system/       Input manager, user management, installer subsystem
-  tests/        Kernel test suite
-  third_party/  stb_image, stb_truetype
+  proc/         scheduler and cgroups
+  media/        codecs, demuxers, parsers, video player
+  system/       installer, update UI, runtime layout, logging, user management
+  tests/        kernel test suite
+  third_party/  stb_image, stb_truetype glue
+```
+
+### Top-Level Layout
+
+```text
+OS/
+  Alpine/       embedded Alpine guest assets
+  build/        kernel, ISO, EFI, and intermediate outputs
+  iso/          copied ISO export artifact
+  src/          full kernel and subsystem source tree
+  tools/        helper scripts and QEMU utilities
+  start.ps1     Windows/WSL build-and-launch entry point
+  STATUS.md     detailed implementation status log
+  README.md     project overview
+  LICENSE       GNU GPL v2
 ```
 
 ---
@@ -215,71 +592,111 @@ src/
 
 ### Prerequisites
 
-- **WSL** with Ubuntu (for cross-compilation)
-- **x86_64-elf cross toolchain** (falls back to native `g++ -m64`)
-- **NASM** assembler
-- **QEMU** for Windows or WSL
+- Windows host with WSL, or a Linux host directly
+- x86_64-elf cross toolchain, or native `g++ -m64` fallback
+- NASM
+- `grub-mkrescue` and `xorriso` for ISO creation
+- `gnu-efi` headers and libraries for EFI loader builds
+- QEMU
 
-### Build Commands (from WSL, inside `src/`)
+### Common Make Targets
+
+Run these from `src/` in an environment that has the required toolchain and matching QEMU backend available:
 
 ```bash
-make              # Build kernel ELF
-make clean        # Clean build artifacts
-make run          # Build + launch with WHPX acceleration
-make run-noaccel  # Build + launch without acceleration
-make run-kvm      # Build + launch with KVM (Linux host)
-make debug        # Build + launch with GDB stub (port 1234)
-make iso          # Build bootable ISO (requires grub-mkrescue)
+make                 # Build the kernel ELF
+make iso             # Build ISO + copy to ../iso/kurono.iso
+make run             # ISO boot under QEMU with the WHPX-oriented profile
+make run-noaccel     # Kernel boot under QEMU without acceleration
+make run-kvm         # Kernel boot under QEMU with KVM
+make run-passthrough GPU_BDF=01:00.0
+make debug           # Kernel boot with GDB stub on :1234
+make clean           # Remove build output
 ```
 
-### Output
+### Build Outputs
 
-- `build/kurono.elf` - final Multiboot ELF kernel with embedded installer payloads
-- `build/kurono_base.elf` - base kernel used to generate EFI installer payloads
-- `build/kurono.iso` - bootable ISO image
-- `build/kurono_efi.efi` - standalone EFI loader
-- `build/kurono_emergency.efi` - emergency EFI loader
+- `build/kurono.elf`
+- `build/kurono_base.elf`
+- `build/kurono.iso`
+- `iso/kurono.iso`
+- `build/boot/kurono_efi.efi`
+- `build/boot/kurono_emergency.efi`
 
-### Project Layout
+### Guest Payload Options
 
+```bash
+# Default: Debian rootfs is NOT embedded
+make iso
+
+# Offline / self-contained ISO with Debian rootfs embedded
+make EMBED_DEBIAN=1 iso
 ```
-OS/
-  src/          Source code (~65 C++ files + assembly)
-  build/        Build output (kurono.elf)
-  tools/        Utility scripts (cleanup.ps1)
-  archive/      Old files from previous iterations
-  start.ps1     One-command build + launch script
-  README.md     This file
-  STATUS.md     Development status
-  LICENSE       MIT License
-```
+
+Alpine guest assets are linked when `Alpine/vmlinuz-virt` and `Alpine/initramfs-virt` are present. Debian rootfs embedding is opt-in because it significantly increases the ISO size.
 
 ---
 
-## QEMU Configuration
+## QEMU Profile
 
-- **RAM:** 10 GB
-- **CPU:** 4 SMP cores
-- **Acceleration:** WHPX (Windows), KVM (Linux)
-- **Audio:** SB16 sound card
-- **Network:** Intel E1000 NIC with port forwarding (8080 to 80)
-- **VirtIO:** Balloon device
-- **GPU passthrough:** Available via `make run-passthrough` (VFIO)
+### Default launcher behavior (`start.ps1`)
+
+- Builds by calling `make iso` in WSL
+- Launches `build/kurono.iso`
+- Allocates 10 GB RAM by default
+- Exposes 4 vCPUs
+- Uses `-serial stdio`
+- Attaches:
+  - SB16
+  - Intel HDA + HDA duplex codec
+  - AC97
+  - Intel E1000
+- Uses SLIRP networking with `hostfwd=tcp::8080-:80`
+- Uses DirectSound on native Windows QEMU or PulseAudio on WSLg-backed QEMU
+- Selects:
+  - `qemu64,+vmx` on Intel WHPX hosts
+  - `qemu64,+svm` on AMD WHPX hosts
+  - `-cpu host` on KVM paths
+- Supports OVMF UEFI via `-UEFI`
+
+### Makefile run targets
+
+- `make run`
+  - ISO boot
+  - WHPX-oriented accelerator profile
+  - 4 vCPUs
+  - VGA std
+  - E1000 + SB16 + virtio-balloon
+- `make run-noaccel`
+  - direct kernel boot
+  - no accelerator
+- `make run-kvm`
+  - direct kernel boot
+  - `-cpu host`
+  - KVM
+  - Q35 machine
+- `make run-passthrough`
+  - direct kernel boot
+  - VFIO GPU passthrough path
+  - `GPU_BDF` override
 
 ---
 
 ## Known Limitations
 
-- Runtime user storage is still KVFS-first and in-memory; the installer can deploy to ext4/FAT32 targets, but the live desktop session is not yet a full persistent root filesystem
-- No real ELF binary loading from disk (Linux subsystem uses built-in programs)
-- USB keyboard discovery is wired to xHCI, but full USB HID interrupt transfer polling is still incomplete
-- NVIDIA GPU detects hardware but does not drive the display (BGA is primary)
-- ext4 write support is partial (sparse block allocation and directory expansion are not fully implemented)
-- FAT32 support is currently focused on ESP-safe installer writes rather than a full general-purpose long-filename desktop filesystem
-- Emergency mode is intentionally minimal and recovery-focused, not a full graphical session
+- The Wayland compositor is functional at the wire-protocol level (registry, globals, surface creation, xdg_toplevel configure) but the surface-to-framebuffer blit bridge and input event forwarding are still stubbed.
+- Live desktop storage is still KVFS-first and RAM-backed; installer deployment exists, but the running desktop is not yet a fully persistent mounted root filesystem.
+- The Linux syscall layer still uses a 32-bit-style pointer ABI constraint, so user mappings and pointers currently need to remain below 4 GB.
+- General ELF loading from disk is still limited; the Linux subsystem primarily executes built-in or staged runtime programs rather than arbitrary disk-resident binaries.
+- USB host-controller work is present, but full USB HID interrupt transfer polling is not complete.
+- NVIDIA GPU detection and passthrough preparation exist, but BGA remains the primary display device and NVIDIA is not yet the default native desktop renderer.
+- ext4 write support is still partial; sparse allocation and full directory-growth handling are not complete.
+- FAT32 support is focused on EFI System Partition deployment rather than full long-filename desktop storage workloads.
+- Nested or hardware-assisted virtualization still depends on host support for VT-x or AMD-V through QEMU, WHPX, or KVM.
+- Browser functionality is intentionally not shipped as a real native browser because current C/C++ browser engines still assume libc, POSIX, X11, SDL, Qt, or similar host stacks that Kurono does not provide inside its freestanding kernel environment.
 
 ---
 
 ## License
 
-GPL V2 License. See [LICENSE](LICENSE) for details.
+Kurono OS is licensed under the GNU General Public License v2. See [LICENSE](LICENSE) for the full text.

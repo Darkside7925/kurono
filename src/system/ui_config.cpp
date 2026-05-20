@@ -89,6 +89,27 @@ const char* UIConfig::DefaultFile(){
     "window.min_btn          = 0xFFFFBD2E\n"
     "window.max_btn          = 0xFF28C840\n"
     "\n"
+    "# ─── display / refresh ───────────────────────────────────────────────\n"
+    "# Frame pacing is locked to display.refresh_hz when display.vsync = 1.\n"
+    "# Supported rates: 30, 60, 75, 120, 144, 165, 240. Any value 24..360 is\n"
+    "# accepted but the renderer can only present what the host can sustain.\n"
+    "display.refresh_hz      = 60\n"
+    "display.vsync           = 1               # 1 paces frames to refresh_hz\n"
+    "display.adaptive_sync   = 1               # 1 = drop to half rate if budget overrun\n"
+    "\n"
+    "# ─── compositor ──────────────────────────────────────────────────────\n"
+    "# Window animations and shadows.  animation_speed_ms is the duration of\n"
+    "# open/close/minimize transitions; set to 0 for instant.\n"
+    "compositor.shadow_enabled       = 1\n"
+    "compositor.shadow_radius        = 8       # 0..16 layers\n"
+    "compositor.shadow_opacity       = 60      # 0..100 percent\n"
+    "compositor.shadow_during_drag   = 0       # 1 keeps shadow visible while dragging\n"
+    "compositor.window_animations    = 1\n"
+    "compositor.animation_speed_ms   = 90      # 0 = instant\n"
+    "compositor.window_alpha         = 255     # default per-window opacity 0..255\n"
+    "compositor.frosted_titlebar     = 1\n"
+    "compositor.reduced_motion       = 0       # 1 disables all animations\n"
+    "\n"
     "# ─── task manager ─────────────────────────────────────────────────────\n"
     "taskmgr.row_h           = 20\n"
     "taskmgr.allow_kill      = 1               # 1 enables Kill/Restart menu\n"
@@ -241,6 +262,51 @@ bool UIConfig::Reload(){
 }
 
 uint32_t UIConfig::Version(){ return version_counter; }
+
+// runtime mutators ----------------------------------------------------------
+void UIConfig::Set(const char* key, const char* value, bool persist){
+    if(!key || !value) return;
+    Put(key, value);
+    version_counter++;
+    if(persist) Save();
+}
+
+void UIConfig::SetColor(const char* key, uint32_t argb, bool persist){
+    char buf[16];
+    static const char* hexd = "0123456789ABCDEF";
+    buf[0]='0'; buf[1]='x';
+    for(int i=0;i<8;i++){
+        buf[2+i] = hexd[(argb >> ((7-i)*4)) & 0xF];
+    }
+    buf[10]=0;
+    Set(key, buf, persist);
+}
+
+void UIConfig::SetInt(const char* key, int v, bool persist){
+    char buf[16]; int p=0; bool neg = v<0; unsigned u = neg?(unsigned)-v:(unsigned)v;
+    char tmp[16]; int t=0; if(u==0) tmp[t++]='0'; while(u){ tmp[t++]='0'+(u%10); u/=10; }
+    if(neg) buf[p++]='-';
+    while(t>0) buf[p++]=tmp[--t];
+    buf[p]=0;
+    Set(key, buf, persist);
+}
+
+bool UIConfig::Save(){
+    // serialize current entries as "key = value\n" lines.
+    static char out[8192];
+    int p = 0;
+    for(int i=0;i<entry_count && p < (int)sizeof(out)-96; i++){
+        if(!entries[i].used) continue;
+        int kl = uic_slen(entries[i].key);
+        int vl = uic_slen(entries[i].val);
+        for(int j=0;j<kl;j++) out[p++] = entries[i].key[j];
+        out[p++] = ' '; out[p++] = '='; out[p++] = ' ';
+        for(int j=0;j<vl;j++) out[p++] = entries[i].val[j];
+        out[p++] = '\n';
+    }
+    out[p] = 0;
+    return KVFS::WriteString(Path(), out) >= 0;
+}
 
 uint32_t UIConfig::Color(const char* key, uint32_t fallback){
     int idx = Find(key);

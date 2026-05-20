@@ -49,6 +49,7 @@ namespace LinuxCmds {
     int cmd_free(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_mount(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_dmesg(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
+    int cmd_journal(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_lspci(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_lsmod(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_drivers(KuronoShell* sh, int argc, const char** argv, char* out, int mx);

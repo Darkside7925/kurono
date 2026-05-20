@@ -2,6 +2,7 @@
 #include "multiboot.h"
 #include "../hal/hal.h"
 #include "../drivers/serial.h"
+#include "../fs/kvfs.h"
 #include "../../logo.h"
 
 namespace {
@@ -721,6 +722,18 @@ namespace KernelPanic {
         SerialLogger::Log(g_fb.valid ? "YES" : "NO");
         SerialLogger::Log(")\r\n");
         render_panic_screen();
+
+        // Persist the dump to /var/crash/last.dmp via KVFS so the next
+        // boot can pick it up and present it to the user.  KVFS lives in
+        // RAM, but the installer wires it through to the real disk on
+        // shutdown  -  and the dump is also visible to the in-RAM
+        // /var/crash/ tree exposed via the /proc-style virtual fs.
+        if (KVFS::GetRoot()) {
+            KVFS::Mkdirs("/var/crash");
+            KVFS::WriteFile("/var/crash/last.dmp", &g_dump, sizeof(g_dump));
+            SerialLogger::Log("KeBugCheckEx: dump written to /var/crash/last.dmp\r\n");
+        }
+
         SerialLogger::Log("KeBugCheckEx: render done, halting\r\n");
         reboot_or_halt();
     }
@@ -781,4 +794,38 @@ namespace KernelPanic {
                      __FILE__,
                      (uint32_t)__LINE__);
     }
+}
+
+// ----- Stack canary support -----
+// Compiled freestanding code uses -fno-stack-protector, but third-party
+// objects (precompiled crt0, llvm runtimes, etc.) may emit canary checks.
+// Provide the symbols so linking succeeds and any actual canary failure
+// routes to the kernel panic path with a real BSOD.
+extern "C" {
+    uintptr_t __stack_chk_guard = 0xDEADC0DE5A5A5A5AULL;
+
+    void __stack_chk_fail(void) {
+        KernelPanic::KeBugCheckEx(StopCode::SECURITY_EXCEPTION,
+                                   0, 0, 0, 0,
+                                   "stack smashing detected (__stack_chk_fail)",
+                                   __FILE__, (uint32_t)__LINE__);
+        for (;;) __asm__ __volatile__("cli; hlt");
+    }
+    void __stack_chk_fail_local(void) { __stack_chk_fail(); }
+}
+
+// ----- KASLR offset bookkeeping -----
+// We don't yet relocate the kernel image at boot (linker script fixes us
+// at -2 GB), but we expose a synthetic random offset so /proc/kallsyms and
+// similar consumers see varying addresses across boots.  Real KASLR will
+// happen in kurono_boot.asm before jumping to kernel_main.
+extern "C" uint64_t kernel_kaslr_offset(void) {
+    static uint64_t off = 0;
+    if (!off) {
+        uint64_t tsc;
+        __asm__ __volatile__("rdtsc" : "=A"(tsc));
+        off = (tsc & 0x1FFFFFu) & ~0xFFFu;
+        if (!off) off = 0x100000;
+    }
+    return off;
 }

@@ -14,6 +14,7 @@ enum CmdEnvironment : uint8_t {
     ENV_LINUX   = 1,
     ENV_WINDOWS = 2,
     ENV_AUTO    = 3,
+    ENV_DEBIAN  = 4,
 };
 
 struct ShellAlias {
@@ -35,6 +36,9 @@ class KuronoShell;
 typedef int (*ShellCmdHandler)(KuronoShell* sh, int argc, const char** argv,
                                 char* output, int max_output);
 
+// Optional GUI / incremental sink: emits command output chunks while Execute runs.
+typedef void (*ShellOutputChunkCallback)(void* udata, const char* data, int len);
+
 struct ShellCommand {
     char name[32];
     char description[64];
@@ -50,6 +54,19 @@ public:
     static void Init();
     static void ProcessLine(const char* line, char* output, int max_output);
     static int Execute(const char* cmdline, char* output, int max_output);
+    static void PumpUI();
+
+    // Incremental output (GUI responsiveness): sinks copy bytes from handlers into the terminal.
+    static void SetOutputChunkCallback(ShellOutputChunkCallback fn, void* udata);
+    static void ClearOutputChunkCallback();
+    static void EmitIncrementalRange(const char* buf, int from, int to_exclusive);
+    /** Returns whether any incremental bytes were sunk this command (then clears the latch). */
+    static bool TakeIncrementalOutputUsed();
+
+    // Cooperative Ctrl+C cancellation during command execution.
+    static void ClearCommandCancel();
+    static void RequestCommandCancel();
+    static bool IsCommandCancelRequested();
 
     // command registration
     static void RegisterCommand(const char* name, const char* desc,
@@ -134,6 +151,8 @@ private:
 
 namespace ShellBuiltins {
     int cmd_help(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
+    int cmd_denji(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
+    int cmd_vgpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
     int cmd_version(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
     int cmd_env(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
     int cmd_switch(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
@@ -157,6 +176,7 @@ namespace ShellBuiltins {
     int cmd_date(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
     int cmd_uptime(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
     int cmd_pwd(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
+    int cmd_usermode(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);
 
     // alpine vm bridge commands
     int cmd_alpine(KuronoShell* sh, int argc, const char** argv, char* out, int maxo);

@@ -151,7 +151,7 @@ public:
     static bool IsValid(int signo);
 
 private:
-    static ProcessSignalState states[16];  // matches linux_max_procs
+    static ProcessSignalState states[64];  // matches LINUX_MAX_PROCS
 
     // alarm tracking
     struct AlarmEntry {
@@ -159,7 +159,7 @@ private:
         uint32_t fire_time;  // ms
         bool     active;
     };
-    static AlarmEntry alarms[16];
+    static AlarmEntry alarms[64];
 
     // helpers
     static void EnqueueSignal(ProcessSignalState* s, int signo, uint32_t sender);

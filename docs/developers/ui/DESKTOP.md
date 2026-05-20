@@ -58,5 +58,6 @@ Call `Taskbar::ReloadFromConfig()` to apply changes at runtime without rebooting
 
 - `src/system/ui_config.cpp`  -  config source for all visual settings
 - `src/ui/window_manager.cpp`  -  window layer rendered above the desktop
+- `src/ui/wayland_server.cpp`  -  in-kernel Wayland compositor that can bridge to the window manager
 - `src/fs/kvfs.cpp`  -  KVFS used for desktop file creation and deletion
 - `src/apps/settings.cpp`  -  launched from the context menu's Settings item

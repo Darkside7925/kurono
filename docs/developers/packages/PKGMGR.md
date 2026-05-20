@@ -4,19 +4,21 @@
 
 ## 1. What it does
 
-The package manager provides a simulated Debian-compatible `apt` interface. It maintains a list of known packages with version, size, and dependency information, and processes install/remove/update requests.
+The package manager maintains a local package catalog and can now sync repository metadata over plain HTTP from `kurono.satorut.com`. It tracks known packages with version, size, dependency, and remote payload path information, and processes install/remove/update requests.
 
 ## 2. Package database
 
-The package database is populated at boot from an embedded list. Each package entry has:
+The package database is populated at boot from an embedded list and can be refreshed from a remote `Packages` index. Each package entry has:
 
 - Name
-- Version (Debian 13 Trixie era)
+- Installed version
+- Latest repository version
 - Installed size (KB)
 - Dependency list
 - Description
+- Repository payload path
 
-The list is representative of a real Trixie system: `libc6`, `bash`, `coreutils`, `apt`, `systemd`, `gcc-14`, `python3.13`, and many others.
+The boot-time list provides sane defaults for Kurono core packages. After a successful sync, repository metadata overwrites `latest_version`, `Filename`, and description fields from the remote index.
 
 ## 3. `apt` interface
 
@@ -34,14 +36,14 @@ The `apt` command in the shell delegates to the package manager:
 
 ## 4. Network interaction
 
-`apt update` can attempt an HTTP fetch from a Trixie mirror URL if the network stack is available. Without network, it uses the embedded package list.
+`update` performs a real HTTP GET against `kurono.satorut.com` and tries a small set of `Packages` index paths. If the sync succeeds, installed packages can be updated when the repository advertises a newer version and a payload `Filename`.
 
 ## 5. Limitations
 
-Package install does not download and extract real binaries  -  it updates the package database state. The package manager demonstrates the interface and metadata handling, not full binary delivery.
+Package install and update fetch the remote payload and store it under `/kurono/packages/<name>/payload.pkg`, but they do not yet unpack archives or apply filesystem-level post-install scripts. The current implementation is a real network-backed package fetch path, not a full archive/extraction pipeline.
 
 ## 6. Related files
 
-- `src/shell/linux_cmds.cpp`  -  `apt` command registration
-- `src/net/tcpip.cpp`  -  HTTP fetch for `apt update`
-- `src/linux/kls.cpp`  -  Trixie package version database
+- `src/packages/pkgmgr.cpp`  -  repository sync, manifest parsing, payload fetch
+- `src/net/tcpip.cpp`  -  TCP transport used by the package HTTP client
+- `src/kernel/kurono_kernel.cpp`  -  boot-time TCP stack initialization and ticking

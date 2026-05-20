@@ -26,7 +26,7 @@ struct EthernetFrame {
     unsigned char payload[NET_PACKET_SIZE - 14];
 };
 
-struct IPv4Header {
+struct NetIPv4Header {
     unsigned char  version_ihl;
     unsigned char  tos;
     unsigned short total_length;
@@ -39,14 +39,14 @@ struct IPv4Header {
     IPv4Address    dst;
 };
 
-struct UDPHeader {
+struct NetUDPHeader {
     unsigned short src_port;
     unsigned short dst_port;
     unsigned short length;
     unsigned short checksum;
 };
 
-struct TCPHeader {
+struct NetTCPHeader {
     unsigned short src_port;
     unsigned short dst_port;
     unsigned int   seq_num;
@@ -57,7 +57,7 @@ struct TCPHeader {
     unsigned short urgent;
 };
 
-struct ARPEntry {
+struct NetARPEntry {
     IPv4Address ip;
     MACAddress  mac;
     bool        valid;
@@ -94,7 +94,11 @@ enum NICType {
     NIC_NONE = 0,
     NIC_ETHERNET,
     NIC_WIFI,
-    NIC_LOOPBACK
+    NIC_LOOPBACK,
+    NIC_TUN,            // L3 (IP) tunnel  -  userspace reads/writes IP packets
+    NIC_TAP,            // L2 (Ethernet) tunnel  -  userspace reads/writes frames
+    NIC_BRIDGE,         // software L2 bridge across multiple NICs
+    NIC_VLAN            // 802.1Q tagged subinterface
 };
 
 enum NICState {
@@ -169,6 +173,12 @@ public:
     static MACAddress* ARPLookup(IPv4Address ip);
     static void ARPAdd(IPv4Address ip, MACAddress mac);
 
+    // /proc-style dumps (used by RuntimeLayout::RefreshProc).
+    // Both write a NUL-terminated, human-readable table into buf and
+    // return the number of bytes written (excluding the NUL).
+    static int DumpARPTable(char* buf, int max);
+    static int DumpRoutes(char* buf, int max);
+
     // sockets
     static int  SocketCreate(SocketType type);
     static bool SocketBind(int fd, unsigned short port);
@@ -185,13 +195,19 @@ public:
 private:
     static NetworkInterface interfaces[NET_MAX_INTERFACES];
     static int interface_count;
-    static ARPEntry arp_table[NET_ARP_TABLE_SIZE];
+    static NetARPEntry arp_table[NET_ARP_TABLE_SIZE];
     static Socket sockets[NET_MAX_SOCKETS];
     static unsigned short next_port;
 };
 
 class WiFi {
 public:
+    enum LinkKind {
+        LINK_NONE = 0,      // no NIC detected
+        LINK_ETHERNET = 1,  // wired (e1000, virtio-net, etc.)
+        LINK_WIFI = 2       // wireless NIC found on PCI bus
+    };
+
     static void Init();
 
     static bool Enable();
@@ -208,6 +224,14 @@ public:
     static int GetSignalStrength();  // current connected signal
     static const char* StateString();
 
+    // Real link inspection (no stubs).  Walks PCI bus once and caches
+    // result.  Used by the taskbar indicator and Settings panel.
+    static LinkKind DetectedLink();
+    static const char* LinkKindString();   // "ethernet", "wifi", "offline"
+    static const char* WirelessChipName(); // e.g. "Intel iwlwifi 8260" or ""
+    static bool        IsLinkUp();         // true if either NIC has carrier
+    static int         SignalBars();       // 0..4 bars for the icon
+
     // shell integration
     static void RegisterCommands(void* shell);
     static int cmd_wifi(void* sh, int argc, const char** argv, char* out, int mx);
@@ -219,5 +243,9 @@ private:
     static WiFiNetwork networks[NET_MAX_WIFI_NETS];
     static int network_count;
     static int connected_index;
+    static LinkKind   detected_link;
+    static char       wireless_chip[64];
+    static bool       link_probed;
     static void SimulateNetworks();
+    static void ProbePCIWireless();
 };

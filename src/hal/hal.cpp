@@ -1,6 +1,8 @@
 #include "hal.h"
 #include "../drivers/serial.h"
+#include "../linux/linux_syscall.h"
 #include "../kernel/panic.h"
+#include "../proc/scheduler.h"
 
 //  x86_64 idt, pic 8259a, and isr implementation
 //  isr stubs live in isr_stubs.asm  -  this file builds the idt from the
@@ -10,8 +12,57 @@ volatile uint64_t HAL::pit_ticks = 0;
 volatile bool     HAL::irq_fired[16] = {};
 HAL::IRQHandler   HAL::irq_handlers[16] = {};
 
+namespace {
+struct GDTDescriptor {
+    uint64_t value;
+} __attribute__((packed));
+
+struct GDTPointer {
+    uint16_t limit;
+    uint64_t base;
+} __attribute__((packed));
+
+struct TSS64 {
+    uint32_t reserved0;
+    uint64_t rsp0;
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist1;
+    uint64_t ist2;
+    uint64_t ist3;
+    uint64_t ist4;
+    uint64_t ist5;
+    uint64_t ist6;
+    uint64_t ist7;
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
+} __attribute__((packed));
+
+constexpr int GDT_ENTRY_COUNT = 7;
+alignas(16) GDTDescriptor gdt_entries[GDT_ENTRY_COUNT] = {};
+GDTPointer gdt_ptr = {};
+TSS64 system_tss = {};
+alignas(16) uint8_t privilege_stack[16384] = {};
+HAL::SystemCallHandler syscall_handler = nullptr;
+
+static void BuildTSSDescriptor(uint64_t base, uint32_t limit) {
+    uint64_t low = 0;
+    low |= (uint64_t)(limit & 0xFFFF);
+    low |= (base & 0xFFFFFFULL) << 16;
+    low |= 0x89ULL << 40;
+    low |= ((uint64_t)((limit >> 16) & 0xF)) << 48;
+    low |= ((base >> 24) & 0xFFULL) << 56;
+
+    gdt_entries[5].value = low;
+    gdt_entries[6].value = base >> 32;
+}
+}
+
 extern "C" {
     extern uint64_t isr_stub_table[48];   // 48 function pointers (vectors 0-47)
+    extern void isr_stub_128();
 }
 
 static const char* exception_names[32] = {
@@ -65,12 +116,49 @@ static IDTPointer idt_ptr;
 
 static void idt_set(int vec, uint64_t handler, uint8_t ist = 0, uint8_t dpl = 0) {
     idt_entries[vec].offset_low  = (uint16_t)(handler & 0xFFFF);
-    idt_entries[vec].selector    = 0x08;    // kernel code segment (gdt entry 1)
+    idt_entries[vec].selector    = GDT_KERNEL_CODE_SELECTOR;
     idt_entries[vec].ist         = ist & 0x07;
     idt_entries[vec].type_attr   = 0x80 | ((dpl & 3) << 5) | 0x0E;  // present + interrupt gate
     idt_entries[vec].offset_mid  = (uint16_t)((handler >> 16) & 0xFFFF);
     idt_entries[vec].offset_high = (uint32_t)((handler >> 32) & 0xFFFFFFFF);
     idt_entries[vec].reserved    = 0;
+}
+
+void HAL::InitGDT() {
+    gdt_entries[0].value = 0;
+    gdt_entries[1].value = 0x00AF9A000000FFFFULL;
+    gdt_entries[2].value = 0x00CF92000000FFFFULL;
+    gdt_entries[3].value = 0x00CFF2000000FFFFULL;
+    gdt_entries[4].value = 0x00AFFA000000FFFFULL;
+
+    for (size_t index = 0; index < sizeof(system_tss); index++) {
+        ((uint8_t*)&system_tss)[index] = 0;
+    }
+    system_tss.rsp0 = (uint64_t)(uintptr_t)(privilege_stack + sizeof(privilege_stack));
+    system_tss.ist1 = system_tss.rsp0;
+    system_tss.iomap_base = sizeof(TSS64);
+    BuildTSSDescriptor((uint64_t)(uintptr_t)&system_tss, sizeof(TSS64) - 1);
+
+    gdt_ptr.limit = sizeof(gdt_entries) - 1;
+    gdt_ptr.base = (uint64_t)(uintptr_t)&gdt_entries[0];
+
+    asm volatile("lgdt %0" : : "m"(gdt_ptr) : "memory");
+
+    uint16_t kernel_data = GDT_KERNEL_DATA_SELECTOR;
+    asm volatile(
+        "mov %0, %%ax\n\t"
+        "mov %%ax, %%ds\n\t"
+        "mov %%ax, %%es\n\t"
+        "mov %%ax, %%ss\n\t"
+        "mov %%ax, %%fs\n\t"
+        "mov %%ax, %%gs\n\t"
+        :
+        : "rm"(kernel_data)
+        : "ax", "memory"
+    );
+
+    uint16_t tss_selector = GDT_TSS_SELECTOR;
+    asm volatile("ltr %0" : : "rm"(tss_selector) : "memory");
 }
 
 //  pic 8259a
@@ -161,7 +249,30 @@ static void log_hex(const char* prefix, uint64_t val) {
 extern "C" void isr_common_handler(InterruptFrame* frame) {
     uint64_t vec = frame->vector;
 
+    if (vec == 0x80) {
+        if (syscall_handler) {
+            syscall_handler(frame);
+        } else {
+            frame->rax = (uint64_t)-1;
+        }
+        return;
+    }
+
     if (vec < 32) {
+        if (vec == 14) {
+            // 1) Adaptive kernel-stack growth: if CR2 falls in any kernel
+            //    process's guard page, allocate a fresh page and resume.
+            //    Runs first so user-mode demand-zero handling never sees
+            //    these faults.
+            if (Scheduler::TryGrowGuardPage(frame->cr2)) {
+                return;
+            }
+            // 2) User-mode page-fault dispatch (demand-zero, COW, etc.).
+            if (LinuxSyscall::HandlePageFault(frame)) {
+                return;
+            }
+        }
+
         SerialLogger::Log("\r\n!!! EXCEPTION: ");
         SerialLogger::Log(exception_names[vec]);
         SerialLogger::Log(" !!!\r\n");
@@ -210,6 +321,13 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         HAL::irq_fired[irq] = true;
         if (irq == 0) {
             HAL::pit_ticks++;
+            // Drive the preemptive scheduler from the timer IRQ.  At
+            // 1 kHz PIT this is one millisecond of charged runtime per
+            // tick.  Scheduler::OnTimerTick() handles vruntime / sleep
+            // wakeups / timeslice expiry; the actual switch happens at
+            // the next voluntary Yield/Sleep so the IRQ stack stays
+            // pristine.
+            Scheduler::OnTimerTick(1);
         }
 
         // call registered handler (if any)
@@ -237,6 +355,9 @@ void HAL::InitIDT() {
         idt_set(i, isr_stub_table[i]);
     }
 
+    // user-mode syscall trap gate (int 0x80).
+    idt_set(0x80, (uint64_t)(uintptr_t)&isr_stub_128, 0, 3);
+
     // vectors 48-255: leave as not-present (type_attr = 0).
     // if hardware triggers one, the cpu will fire a #gp which we handle above.
 
@@ -248,10 +369,13 @@ void HAL::InitIDT() {
 
 //  hal public api
 void HAL::Init() {
+    InitGDT();
     // 1. remap pic: irq 0-15 → vectors 32-47, all masked
     InitPIC();
     // 2. build and load idt from nasm stub table
     InitIDT();
+    // 2.5 program SYSCALL/SYSRET MSRs (depends on GDT being loaded)
+    InitSyscallMSRs();
     // 3. selectively enable interrupts we actually use
     EnableIRQ(0);   // pit timer
     EnableIRQ(1);   // keyboard
@@ -264,7 +388,75 @@ void HAL::Init() {
     OutByte(0x70, cmos & 0x7F);   // clear bit 7 = nmi enable
     InByte(0x71);                  // dummy read completes cmos cycle
 
-    SerialLogger::Log("HAL: IDT loaded (48 NASM stubs), PIC remapped, IRQ 0/1/12 unmasked, NMI enabled\r\n");
+    SerialLogger::Log("HAL: GDT/TSS loaded, IDT ready (IRQs + int 0x80), PIC remapped, IRQ 0/1/12 unmasked, NMI enabled\r\n");
+}
+
+void HAL::RegisterSystemCallHandler(SystemCallHandler handler) {
+    syscall_handler = handler;
+}
+
+extern "C" void syscall_entry_x64();
+extern "C" volatile uint64_t g_kernel_syscall_rsp;
+
+void HAL::SetKernelStack(uint64_t rsp0) {
+    if (!rsp0) return;
+    system_tss.rsp0 = rsp0;
+    system_tss.ist1 = rsp0;
+
+    // Mirror to the global the SYSCALL entry stub reads.
+    g_kernel_syscall_rsp = rsp0;
+}
+
+void HAL::InitSyscallMSRs() {
+    // EFER (0xC0000080): bit 0 = SCE (System Call Extensions).
+    // STAR (0xC0000081):
+    //   bits[31:0]   = legacy 32-bit SYSCALL EIP (unused in long mode)
+    //   bits[47:32]  = SYSCALL CS (kernel CS).  SS = CS+8 (kernel data).
+    //   bits[63:48]  = SYSRET base.  CS = base+16 with RPL=3, SS = base+8.
+    //
+    // Our GDT layout:
+    //   0x08 kernel code, 0x10 kernel data,
+    //   0x18 user data,   0x20 user code.
+    // → SYSCALL base = 0x08 (CS=0x08, SS=0x10) ✓
+    // → SYSRET base  = 0x10 (user SS=0x18|3=0x1B, user CS=0x20|3=0x23) ✓
+    //
+    // LSTAR (0xC0000082): 64-bit syscall handler entry point.
+    // SFMASK (0xC0000084): bits to *clear* from RFLAGS on entry.
+    //   We clear IF (0x200) so syscalls run with interrupts disabled,
+    //   plus DF (0x400) per SysV ABI, plus AC/TF for safety.
+
+    constexpr uint32_t MSR_EFER     = 0xC0000080u;
+    constexpr uint32_t MSR_STAR     = 0xC0000081u;
+    constexpr uint32_t MSR_LSTAR    = 0xC0000082u;
+    constexpr uint32_t MSR_SFMASK   = 0xC0000084u;
+
+    auto rdmsr = [](uint32_t msr) -> uint64_t {
+        uint32_t lo = 0, hi = 0;
+        asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+        return ((uint64_t)hi << 32) | lo;
+    };
+    auto wrmsr = [](uint32_t msr, uint64_t value) {
+        uint32_t lo = (uint32_t)(value & 0xFFFFFFFFu);
+        uint32_t hi = (uint32_t)(value >> 32);
+        asm volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(msr));
+    };
+
+    // Enable SCE.
+    uint64_t efer = rdmsr(MSR_EFER);
+    efer |= 1ULL;
+    wrmsr(MSR_EFER, efer);
+
+    // Program STAR.
+    uint64_t star = ((uint64_t)0x08ULL << 32) | ((uint64_t)0x10ULL << 48);
+    wrmsr(MSR_STAR, star);
+
+    // Program LSTAR with the asm entry point.
+    wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)&syscall_entry_x64);
+
+    // Program SFMASK: clear IF, DF, TF, AC, NT.
+    wrmsr(MSR_SFMASK, 0x47700ULL);
+
+    SerialLogger::Log("HAL: SYSCALL/SYSRET MSRs programmed (EFER.SCE, STAR, LSTAR, SFMASK)\r\n");
 }
 
 void HAL::EnableInterrupts()  { asm volatile("sti"); }
@@ -273,6 +465,36 @@ void HAL::Halt()              { asm volatile("hlt"); }
 
 void HAL::WaitForInterrupt() {
     asm volatile("sti; hlt");   // atomic enable + halt: wakes on any irq
+}
+
+[[noreturn]] void HAL::EnterUserMode(uint64_t rip, uint64_t rsp) {
+    uint64_t rflags;
+    asm volatile("pushfq; pop %0" : "=r"(rflags));
+    rflags |= 0x202ULL;
+    rflags &= ~0x3000ULL;  // keep IOPL at 0 in user mode
+
+    uint16_t user_data = (uint16_t)(GDT_USER_DATA_SELECTOR | 3);
+    uint64_t user_ss = (uint64_t)user_data;
+    uint64_t user_cs = (uint64_t)(GDT_USER_CODE_SELECTOR | 3);
+
+    asm volatile(
+        "mov %0, %%ax\n\t"
+        "mov %%ax, %%ds\n\t"
+        "mov %%ax, %%es\n\t"
+        "mov %%ax, %%fs\n\t"
+        "mov %%ax, %%gs\n\t"
+        "pushq %1\n\t"
+        "pushq %2\n\t"
+        "pushq %3\n\t"
+        "pushq %4\n\t"
+        "pushq %5\n\t"
+        "iretq\n\t"
+        :
+        : "rm"(user_data), "r"(user_ss), "r"(rsp), "r"(rflags), "r"(user_cs), "r"(rip)
+        : "ax", "memory"
+    );
+
+    __builtin_unreachable();
 }
 
 void HAL::Reboot() {

@@ -26,6 +26,10 @@ class TerminalApp {
 public:
     static void Init();
     static int  Open();
+    static void Tick();
+    static bool IsBusy();
+    /** Programmatic command injection (e.g. GUI autorun). */
+    static void EnqueueCommand(const char* cmd);
 
     // window callbacks
     static void Render(void* win, int cx, int cy, int cw, int ch);
@@ -33,6 +37,8 @@ public:
 
     // terminal writing api
     static void Write(const char* text);
+    /** Raw bytes for cooperative shell streaming (no ANSI parse). */
+    static void EmitShellChunk(const char* data, int len);
     static void WriteChar(char c);
     static void WriteLn(const char* text);
     static void Clear();
@@ -71,6 +77,9 @@ private:
     // shell integration
     static bool shell_ready;
     static char prompt[128];
+    static bool command_pending;
+    static bool command_running;
+    static char pending_cmd[TERM_INPUT_MAX];
 
     // aesthetic state
     static unsigned int blink_timer; // milliseconds for cursor blink

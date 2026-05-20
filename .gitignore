@@ -21,3 +21,8 @@ iso/kurono.iso
 kurono.iso
 *.iso
 build/kurono.elf
+
+# Agent memory (Copilot session/repo notes)
+memories/
+/memories
+/sources/

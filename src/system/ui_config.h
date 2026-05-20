@@ -34,6 +34,17 @@ public:
 
     static const char* DefaultFile();
 
+    // live update: write a single key, bump version, optionally persist
+    // value is interpreted as a string ("0xFF112233" for colors, decimal
+    // for ints, "0"/"1" for bools). callers are responsible for triggering
+    // any subsystem ReloadFromConfig() they care about.
+    static void Set(const char* key, const char* value, bool persist = true);
+    static void SetColor(const char* key, uint32_t argb, bool persist = true);
+    static void SetInt  (const char* key, int v, bool persist = true);
+
+    // explicitly write current entries back to /etc/kurono/ui.conf.
+    static bool Save();
+
 private:
     static const int MAX_ENTRIES = 128;
     static const int MAX_KEY_LEN = 48;

@@ -13,9 +13,11 @@ int         Audio::dsp_version     = 0;
 AudioState  Audio::state           = AUDIO_STOPPED;
 
 // dma buffer lives at a fixed low physical address so isa dma can reach it.
-// 0x70000 keeps the 32kb buffer fully inside one 64kb dma page
-// (0x70000-0x77fff), below 1mb, and away from very low bios data areas.
-uint8_t* Audio::dma_buffer = reinterpret_cast<uint8_t*>(0x70000);
+// 0x68000 keeps the 32kb buffer fully inside one 64kb dma page
+// (0x68000-0x6FFFF), below 1mb, and out of the way of the new
+// AudioDMA-managed regions for AC97 (0x70000+) and the new SB16
+// backend (0x60000).  See drivers/audio_dma.h for the full map.
+uint8_t* Audio::dma_buffer = reinterpret_cast<uint8_t*>(0x68000);
 
 const uint8_t* Audio::pcm_source       = nullptr;
 int         Audio::pcm_length      = 0;
@@ -520,7 +522,11 @@ static int fast_sin(int angle_deg) {
 }
 
 void Audio::Beep(int frequency, int duration_ms) {
-    PlayTone(frequency, duration_ms, 80);
+    // Route through the unified mixer so beeps don't fight with active
+    // music streams.  Falls back to the legacy SB16-direct PlayTone if
+    // the AudioServer hasn't been initialised yet (e.g. very early boot).
+    extern void __audio_server_play_tone_proxy(int, int, int);
+    __audio_server_play_tone_proxy(frequency, duration_ms, 80);
 }
 
 void Audio::GenerateBuffer(int frequency, int volume) {

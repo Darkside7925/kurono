@@ -1,15 +1,34 @@
+K0
+FBK1
+K2
+K3
+K4
+K5
 Kurono OS Starting...
-Early FB: drew green bar
+Multiboot2 detected  -  converting to MB1 compat
+Panic::Init OK: fb=0x0x000000000xFD000000 1024x768x32
+Early FB: drew green bar + text
 Multiboot OK
+Boot cmdline: 
 [1] HAL::Init
-HAL: IDT loaded (48 NASM stubs), PIC remapped, IRQ 0/1/12 unmasked
+HAL: SYSCALL/SYSRET MSRs programmed (EFER.SCE, STAR, LSTAR, SFMASK)
+HAL: GDT/TSS loaded, IDT ready (IRQs + int 0x80), PIC remapped, IRQ 0/1/12 unmasked, NMI enabled
+[1.5] CR4 security bits enabled
 [2] MemoryManager::Init
-Heap: Initialized (16 MB free-list allocator)
+Heap: Bootstrap (64 KB BSS)
 PMM: Initializing physical memory manager...
-PMM: Bitmap at 0x0x02DE9000, 0x00080000 bytes for 0x00400000 frames
-PMM: Total=0x00400000 Used=0x003E2E89 Free=0x0001D177
-VMM: Initialized, PML4 at 0x0x02DD7000
+PMM: Bitmap at 0x0x03C0A000, 0x00080000 bytes for 0x00400000 frames
+PMM: Total=0x00400000 Used=0x003844AA Free=0x0007BB56
+PMM: AllocContiguous failed (524288 frames requested)
+Heap: Expanded to 1024 MB (PMM-backed, 16384 MB physical RAM detected)
+VMM: Initialized, PML4 at 0x0x03A08000
+[2a] Buddy::Init
+[Buddy] pool=256 MB ready
+[2b] Slab::Init
+[Slab] generic caches ready (16B..8KB)
 [3] Scheduler::Init
+[3a] HRTimer::Init
+[HRTimer] initialized (64 slots)
 [4] VFS::Init
 VFS.1
 VFS.2
@@ -45,40 +64,43 @@ KEY DEV:1 CHAR:b
 ALL TESTS PASSED
 [6] Post-TestSuite
 Initializing display...
-  MB flags=0x0x00001A67
+[GpuProbe] Starting early GPU probe...
+[GpuProbe] Scanning PCI bus for display controllers...
+[GpuProbe] Found: QEMU/Bochs VGA @ PCI 0:2.0 class=0x0x00000300 VGA=yes BAR0=0x0x000000000xFD000000 BAR2=0x0x000000000xFEBF0000
+[GpuProbe] Total display controllers found: 1
+[GpuProbe] Topology: Virtual
+[GpuProbe] Primary GPU: QEMU/Bochs VGA
+[GpuProbe] === GPU Inventory ===
+  [0] [PRIMARY]   QEMU/Bochs VGA  PCI=0:2.0  VID=0x0x00001234 DID=0x0x00001111 [VGA]
+  Topology: Virtual
+[GpuProbe] === End ===
+  MB flags=0x0x00001045
   fb_addr=0x0x000000000xFD000000
   fb_w=1024 fb_h=768 bpp=32 type=1 pitch=4096
-  VBE: ctrl=0x0x00010550 mode_info=0x0x00010750 mode=0x0x00004144
 Display: Using MB FB at 0x0x000000000xFD000000
+[GpuProbe] Validating FB addr=0x0x000000000xFD000000 against QEMU/Bochs VGA
+[GpuProbe] FB address validated OK (no correction needed)
 Graphics: Basic Init 0x00000400x0x00000300 @ 0xFD000000
+Graphics: WC remap FB phys=0x0x000000000xFD000000 size=0x0x00300000
+Graphics: FB remapped 2 pages to Write-Combining (PAT1=WC)
+Panic::UpdateFB: 0x0x000000000xFD000000 1024x768x32
 Display: Multiboot framebuffer OK
-Graphics: Double buffering enabled
-Display: RenderMode=1 backbuf=0x018DC2E0 activebuf=0x018DC2E0
+Display: Detected refresh rate: 60 Hz
+Graphics: Double buffering enabled (PMM)
+Display: RenderMode=1 backbuf=0x5448B000 activebuf=0x5448B000
 Keyboard: Initializing Enhanced Driver...
-Keyboard: Running self-test...
-Keyboard: Controller self-test PASSED
-Keyboard: Interface test PASSED
-Keyboard: Repeat rate set (0x0000002B)
-Keyboard: LEDs updated (0x00000000)
+Keyboard: Using compatibility init path
+Keyboard: Skipping early typematic/LED programming for compatibility
 Keyboard: Enhanced Driver initialized
 Keyboard: USB HID support initialized
 Mouse: Initializing Enhanced Driver...
-Mouse: Reset ACK
-Mouse: Reset Response: 0x000000AA
-Mouse: Reset Response: 0x00000000
-Mouse: Polling rate set to 125Hz
-Mouse: Defaults Set (ACK)
-Mouse: Streaming Enabled (ACK)
-Mouse: IntelliMouse detected (scroll wheel)
-Mouse Device Info:
-  Type: Mouse
-  Capabilities: 0x00000007
-  DPI Profile: 800 (profile 1)
-  Polling Rate: 125Hz
-Mouse: Enhanced Driver initialized
-Mouse: Polling rate set to 1000Hz
-Mouse: High precision enabled
-Mouse: DPI scaling set to 1600x1600
+Mouse: Defaults Failed (No ACK) - Ignoring
+Mouse: Streaming Failed (No ACK) - Ignoring
+Mouse: Disabled - no acknowledged PS/2 stream or host integration
+Mouse: DPI scaling set to 800x800
+InputManager: Registered Standard PS/2 Keyboard
+InputManager: Initialized
+VConsole: 7 virtual consoles ready (active=tty7/GUI)
 Boot splash: logo displayed
 Boot splash complete
 System: Initializing Core Components...
@@ -88,14 +110,17 @@ System: Loading Vulkan Support... [Stubbed]
 System: Loading OpenGL Support... [Stubbed]
 System: All Components Initialized.
 Loading embedded wallpaper...
-Heap: OOM!
-MediaDecoder: stbi_load_from_memory failed outofmem
-Embedded wallpaper decode FAILED
+MediaDecoder: PNG/JPEG Decoded 0x00000780x0x00000438
+Embedded wallpaper decoded OK
 GUI::UpdateBackbuffer: w=1024 h=768 bpp=32 pitch=4096
-GUI: Gradient wallpaper generated
+GUI: Drawing wallpaper...
+Desktop wallpaper image set
 [KVFS] Init...
 KVFS: Initializing...
 KVFS: Ready.
+[UIConfig] Init...
+[UIConfig] wrote default config to /etc/kurono/ui.conf
+[UIConfig] loaded 48 entries
 [Shell] Init...
 Shell: Initialized
 [LinuxCmds] Register...
@@ -103,17 +128,54 @@ Shell: Initialized
 [SUPR] Init...
 SUPR: Security engine initialized
 [PackageManager] Init...
-PkgMgr: Initialized with packages
+PkgMgr: Initialized
+[GpuDriverInstaller] Init...
+[gpu-drv] Idle
+[Python] Init mini interpreter...
+Python interp ready
+[Userspace] Init ring-3 runtime...
+[LinuxSyscall] Initialized
+[Userspace] /usr/bin/hello registered (4808 bytes)
+[Userspace] /usr/bin/hello_x64 registered (4816 bytes)
+[Userspace] /usr/bin/kpython registered (10504 bytes)
+[Installer] Init...
 [Network] Init...
 [E1000] Scanning PCI bus...
 [E1000] Found at PCI 0:3 device=0x0x0000100E
-[E1000] MMIO base: 0x0xFEB80000
+[E1000] MMIO base: 0x0xFEBC0000
 [E1000] MAC: 0x00000052:0x00000054:0x00000000:0x00000012:0x00000034:0x00000056
 [E1000] Link: UP, Speed: 1000 Mbps, Full Duplex: Yes
 [E1000] Driver initialized successfully
 Network: eth0 backed by real E1000 NIC
 Network: Stack initialized (lo, eth0, wlan0)
+[TCPIP] Init...
+[TCPIP] Real TCP/IP stack ready
+[TunTap] Init...
+TunTap: subsystem initialized
+[IPv6] Init...
+IPv6: stack initialized (echo + ND)
+[Cgroup] Init...
+Cgroup: v2 unified hierarchy initialized (root=/sys/fs/cgroup)
+[TPM] Init...
+TPM: no chip detected at 0xFED40000
+[Netfilter] Init...
+Netfilter: 5 hooks initialized (PRE/IN/FWD/OUT/POST), policy=ACCEPT
+[CPUFreq] Init...
+CPUFreq: AMD BSP, 4 P-states (defaults)
 WiFi: Driver initialized (E1000 bridge active)
+[RuntimeLayout] Seeding /system tree...
+[RuntimeLayout] Seeding kurono fs layout...
+[RuntimeLayout] Done.
+[UnixSocket] Init...
+UnixSocket: AF_UNIX subsystem ready, 64 sd slots
+[DBusServer] Starting session bus...
+DBus: listening on /system/run/user/1000/bus
+[PulseServer] Starting audio daemon...
+Pulse: listening on /system/run/user/1000/pulse/native
+[WaylandServer] Starting compositor...
+Wayland: listening on /system/run/user/1000/wayland-0
+[ld-kurono] Initialising dynamic linker...
+[ldso] ld-kurono dynamic linker initialised
 [KCL] Init...
 KCL: Interpreter initialized
 [DualBoot] Init...
@@ -190,41 +252,7 @@ KCL: Interpreter initialized
 [UserBridge] Synced 6 users to Linux
 [DualBoot] Shared data configuration applied
 [DualBoot] GRUB config saved
-[DualBoot] Starting Alpine Linux guest VM...
-Hypervisor: BootAlpineWithExtraction starting
-Hypervisor: Initializing...
-VMM: Initializing...
-VMM: CPU Vendor: AuthenticAMD
-VMM: Running under a hypervisor (nested virt)
-VMM: Hypervisor vendor: 'TCGTCGTCGTCG' (max leaf 0x0x40000001)
-VMM: HV CPUID 0x40000000: EBX=0x0x54474354 ECX=0x0x43544743 EDX=0x0x47435447
-VMM: QEMU/TCG (software) detected
-VMM: CPUID  -  VT-x: no, SVM: YES
-VMM: AMD-V (SVM) bit present in CPUID
-VMM: SVM enabled (VM_CR.SVMDIS=0)
-VMM: AMD-V (SVM) activated
-VMM: Initialization complete  -  type=SVM [nested]
-Hypervisor: Hardware virtualization available (AMD-V, nested)
-VMExit: Handler initialized with default CPUID overrides
-EPT: Manager initialized
-VDevices: All virtual devices initialized
-  PIC: dual 8259A (master + slave)
-  APIC: xAPIC at 0xFEE00000
-  PIT: 8254 (3 channels)
-  HPET: 3 timers at 0xFED00000
-Hypervisor: Init complete
-Hypervisor: Attempting HW-accelerated Alpine boot [nested]
-Hypervisor: Creating VM (RAM=128MB, Disk=16MB)
-GuestMem: Initializing with 128 MB
-Heap: OOM!
-GuestMem: Failed to alloc high RAM (130048 KB), trying smaller...
-Heap: OOM!
-GuestMem: FAILED to allocate guest RAM!
-Hypervisor: Failed to allocate guest memory
-Hypervisor: HW boot produced no output  -  Alpine boot FAILED (no stubs, honest failure)
-Hypervisor: Destroying VM...
-Hypervisor: VM destroyed
-[DualBoot] Alpine VM boot skipped (no HW virt or no kernel)
+[DualBoot] Alpine VM unavailable for auto-start on this platform
 [DualBoot] === INTEGRATED BOOT COMPLETE ===
 [DualBoot] Kurono OS + Linux running as one system
 [DualBoot] Same users | Same files | Same desktop
@@ -238,14 +266,17 @@ BGA: Probe ID = 0x0x0000B0C5
 BGA: Probe ID = 0x0x0000B0C5
 [ProcFS] Initialized
 [SysFS] Initialized
-[LinuxDrivers] Framework initialized (35 drivers, 25 active)
+[LinuxDrivers] Framework initialized (35 drivers, 22 active)
 [Linux] Subsystem fully integrated
+[KVFS] Embedded denji.mp4: 1811059 bytes
+[KVFS] Embedded denji.kvid: 10356729 bytes
 [KVFS] Filesystem populated
+[AudioDMA] Initialised 4 regions in low memory
+[AudioMixer] Init: 16 stream slots, period=1024 frames, internal=48000 Hz stereo
+[AudioServer] No usable audio backend!
 [AUDIO] Initializing Sound Blaster 16...
 [AUDIO] DSP reset failed  -  no SB16 detected
 [Desktop] Init...
 WindowManager: Initialized
-LockScreen::Show() called
 InputManager: Registered Standard PS/2 Keyboard
 InputManager: Initialized
-LockScreen: Scale=0.71

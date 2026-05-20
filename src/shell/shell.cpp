@@ -5,6 +5,7 @@
 #include "../system/ui_config.h"
 #include "../ui/desktop.h"
 #include "../fs/kvfs.h"
+#include "../kernel/userspace.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
 #include "../drivers/gpu_probe.h"
@@ -14,9 +15,20 @@
 #include "../drivers/display_mgr.h"
 #include "../hal/hal.h"
 #include "../kernel/time.h"
+#include "../drivers/timer.h"
+// Note: PumpUI must advance TimeManager so wallclock-based loops
+// (Time::GetTicks via TimeManager::monotonic_ms) don't freeze while a
+// shell command blocks the kernel main loop.
 #include "../system/user_mgmt.h"
 #include "../virt/hypervisor.h"
 #include "../media/codec.h"
+#include "../apps/denji_app.h"
+#include "../virt/virtio_gpu_host.h"
+#include "../virt/vpci.h"
+#include "../virt/pci_passthrough.h"
+#include "../drivers/mouse.h"
+#include "../drivers/keyboard.h"
+#include "../system/input_manager.h"
 
 //  kurono shell implementation
 
@@ -38,6 +50,11 @@ char KuronoShell::conflict_cmdline[SHELL_MAX_CMD] = {0};
 bool KuronoShell::pwsh_available = false;
 char KuronoShell::alpine_cmd_cache[4096] = {0};
 bool KuronoShell::alpine_cmd_cached = false;
+
+static ShellOutputChunkCallback g_shell_chunk_cb = nullptr;
+static void* g_shell_chunk_udata = nullptr;
+static bool g_shell_incremental_used = false;
+static volatile bool g_shell_cancel_requested = false;
 
 static int slen(const char* s) { int n = 0; while (s[n]) n++; return n; }
 
@@ -218,6 +235,7 @@ const char* KuronoShell::EnvName(CmdEnvironment e) {
         case ENV_KURONO: return "kurono";
         case ENV_LINUX: return "linux";
         case ENV_WINDOWS: return "windows";
+        case ENV_DEBIAN: return "debian";
         default: return "auto";
     }
 }
@@ -340,9 +358,112 @@ void KuronoShell::ProcessLine(const char* line, char* output, int max_output) {
     Execute(line, output, max_output);
 }
 
+void KuronoShell::SetOutputChunkCallback(ShellOutputChunkCallback fn, void* udata) {
+    g_shell_chunk_cb = fn;
+    g_shell_chunk_udata = udata;
+}
+
+void KuronoShell::ClearOutputChunkCallback() {
+    g_shell_chunk_cb = nullptr;
+    g_shell_chunk_udata = nullptr;
+}
+
+void KuronoShell::EmitIncrementalRange(const char* buf, int from, int to_exclusive) {
+    if (!g_shell_chunk_cb || !buf || from >= to_exclusive || to_exclusive < from)
+        return;
+    g_shell_incremental_used = true;
+    constexpr int kChunk = 256;
+    while (from < to_exclusive) {
+        int n = to_exclusive - from;
+        if (n > kChunk) n = kChunk;
+        g_shell_chunk_cb(g_shell_chunk_udata, buf + from, n);
+        from += n;
+    }
+}
+
+bool KuronoShell::TakeIncrementalOutputUsed() {
+    bool used = g_shell_incremental_used;
+    g_shell_incremental_used = false;
+    return used;
+}
+
+void KuronoShell::ClearCommandCancel() { g_shell_cancel_requested = false; }
+void KuronoShell::RequestCommandCancel() { g_shell_cancel_requested = true; }
+bool KuronoShell::IsCommandCancelRequested() {
+    return g_shell_cancel_requested;
+}
+
+void KuronoShell::PumpUI() {
+    static bool reentrant = false;
+    static uint32_t last_pump_ms = 0;
+    if (reentrant) return;
+
+    /* Always advance the wallclock so Time::GetTicks() (consumed by ping/DNS/etc.)
+       keeps moving even while a synchronous shell command blocks the kernel
+       main loop. Throttling only the heavy UI work below. */
+    uint32_t real_elapsed = Timer::ElapsedSinceLast();
+    if (real_elapsed > 0)
+        TimeManager::AdvanceByMs(real_elapsed);
+
+    uint32_t now_ms = Timer::GetRealMs();
+    if ((uint32_t)(now_ms - last_pump_ms) < 16u) return;
+    last_pump_ms = now_ms;
+    reentrant = true;
+
+    InputManager::Poll();
+
+    int scroll_delta = 0;
+    while (Mouse::HasEvent()) {
+        Mouse::Event mevt = Mouse::GetEvent();
+        if (mevt.type == 3) {
+            scroll_delta += mevt.dz;
+            continue;
+        }
+        if (mevt.type == 1 || mevt.type == 2) {
+            WindowManager::HandlePointerButton(mevt.x, mevt.y,
+                                               (int)mevt.button,
+                                               mevt.type == 1);
+        }
+    }
+
+    WindowManager::HandlePointerMove(Mouse::mx, Mouse::my);
+
+    // Drain keyboard chars through the desktop environment  -  mirrors the
+    // kernel main loop's input pattern so keystrokes reach the focused
+    // window even while a shell command blocks the main loop.
+    {
+        char kb = 0;
+        if (Keyboard::HasChar()) kb = Keyboard::GetChar();
+        DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my,
+                                        Mouse::IsLeftDown(),
+                                        Mouse::LeftClicked(), kb);
+        while (Keyboard::HasChar()) {
+            kb = Keyboard::GetChar();
+            DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, false, false, kb);
+        }
+    }
+
+    if (scroll_delta != 0) {
+        Window* fw = WindowManager::GetFocusedWindow();
+        if (fw && fw->input) fw->input(fw, 3, scroll_delta, 0);
+    }
+
+    DesktopEnvironment::Update();
+    if (Graphics::ShouldRender()) {
+        DesktopEnvironment::Render();
+        Mouse::DrawAt(Mouse::mx, Mouse::my);
+        Graphics::SwapBuffers();
+    }
+
+    reentrant = false;
+}
+
 int KuronoShell::Execute(const char* cmdline, char* output, int max_output) {
     if (!cmdline || !cmdline[0]) return 0;
     output[0] = 0;
+
+    ClearCommandCancel();
+    g_shell_incremental_used = false;
 
     // add to history
     AddHistory(cmdline);
@@ -382,6 +503,8 @@ int KuronoShell::Execute(const char* cmdline, char* output, int max_output) {
         current_env = ENV_WINDOWS; actual_cmd = expanded + 8; temp_env = true;
     } else if (sstart(expanded, "kurono:")) {
         current_env = ENV_KURONO; actual_cmd = expanded + 7; temp_env = true;
+    } else if (sstart(expanded, "debian:")) {
+        current_env = ENV_DEBIAN; actual_cmd = expanded + 7; temp_env = true;
     }
 
     // parse args
@@ -779,6 +902,8 @@ namespace ShellBuiltins {
 void KuronoShell::RegisterBuiltins() {
     using namespace ShellBuiltins;
     RegisterCommand("help",     "Show available commands",     ENV_KURONO, "builtin", cmd_help);
+    RegisterCommand("denji",    "Open Denji video player",     ENV_KURONO, "media",   cmd_denji);
+    RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
     RegisterCommand("version",  "Show OS version",             ENV_KURONO, "builtin", cmd_version);
     RegisterCommand("env",      "Show current environment",    ENV_KURONO, "builtin", cmd_env);
     RegisterCommand("switch",   "Switch environment",          ENV_KURONO, "builtin", cmd_switch);
@@ -812,6 +937,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("date",      "Print current date/time",      ENV_KURONO, "system",  cmd_date);
     RegisterCommand("uptime",    "Print system uptime",          ENV_KURONO, "system",  cmd_uptime);
     RegisterCommand("pwd",       "Print working directory",      ENV_KURONO, "filesystem",cmd_pwd);
+    RegisterCommand("usermode",  "Run ring-3 demo process",      ENV_KURONO, "system",  cmd_usermode);
 
     // alpine vm bridge commands  -  embed alpine into shell
     RegisterCommand("alpine",   "Run command in Alpine VM",     ENV_KURONO, "system",  cmd_alpine);
@@ -872,6 +998,65 @@ int cmd_version(KuronoShell* sh, int argc, const char** argv, char* out, int max
     return sappend(out, 0, maxo, "Kurono OS 1.0.0 \"Aurora\"\nHybrid Kernel  -  Linux · Windows · Kurono\n");
 }
 
+int cmd_denji(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    DenjiApp::Open();
+    if (DenjiApp::IsOpen()) {
+        return sappend(out, 0, maxo, "Opened Denji video player.\n");
+    }
+    return sappend(out, 0, maxo,
+        "Denji video asset not embedded in this build.\n");
+}
+
+int cmd_vgpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh;
+    int p = 0;
+
+    // sub-commands: passthrough <nvidia|amd>, reclaim, status (default)
+    if (argc >= 2) {
+        const char* sub = argv[1];
+        if (sub && (sub[0]=='p' && sub[1]=='a')) { // passthrough
+            const char* which = (argc >= 3) ? argv[2] : "";
+            bool ok = false;
+            if (which[0]=='n') ok = PCIPassthrough::HandoffNvidiaGPU();
+            else if (which[0]=='a') ok = PCIPassthrough::HandoffAmdGPU();
+            else return sappend(out, 0, maxo,
+                                 "usage: vgpu passthrough <nvidia|amd>\n");
+            return sappend(out, 0, maxo,
+                            ok ? "passthrough engaged.\n"
+                               : "passthrough failed (see serial log).\n");
+        }
+        if (sub && sub[0]=='r') { // reclaim
+            PCIPassthrough::ReclaimAll();
+            return sappend(out, 0, maxo, "all passthrough devices reclaimed.\n");
+        }
+    }
+
+    // status (default)
+    p = sappend(out, p, maxo, "VirtIO-GPU host (path A: virtio scanout)\n");
+    p = sappend(out, p, maxo, "  registered : ");
+    p = sappend(out, p, maxo, VirtIOGPUHost::IsRegistered() ? "yes\n" : "no\n");
+    p = sappend(out, p, maxo, "  vpci slots : ");
+    p = sappend_int(out, p, maxo, VPCI::DeviceCount());
+    p = sappend_char(out, p, maxo, '\n');
+    p = sappend(out, p, maxo, "  resolution : ");
+    p = sappend_int(out, p, maxo, VirtIOGPUHost::GetWidth());
+    p = sappend(out, p, maxo, "x");
+    p = sappend_int(out, p, maxo, VirtIOGPUHost::GetHeight());
+    p = sappend_char(out, p, maxo, '\n');
+    p = sappend(out, p, maxo, "  resources  : ");
+    p = sappend_int(out, p, maxo, VirtIOGPUHost::ResourceCount());
+    p = sappend_char(out, p, maxo, '\n');
+    p = sappend(out, p, maxo, "  frames     : ");
+    p = sappend_int(out, p, maxo, (int)VirtIOGPUHost::FrameCount());
+    p = sappend_char(out, p, maxo, '\n');
+
+    char buf[1024];
+    PCIPassthrough::DumpStatus(buf, sizeof(buf));
+    p = sappend(out, p, maxo, buf);
+    return p;
+}
+
 int cmd_env(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)argc; (void)argv;
     int p = 0;
@@ -882,7 +1067,7 @@ int cmd_env(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
 }
 
 int cmd_switch(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
-    if (argc < 2) return sappend(out, 0, maxo, "Usage: switch linux|windows|kurono\n");
+    if (argc < 2) return sappend(out, 0, maxo, "Usage: switch linux|windows|kurono|debian\n");
     int p = 0;
     if (seq(argv[1], "linux")) {
         sh->SetEnv(ENV_LINUX);
@@ -893,6 +1078,16 @@ int cmd_switch(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
     } else if (seq(argv[1], "kurono")) {
         sh->SetEnv(ENV_KURONO);
         p = sappend(out, p, maxo, "Switched to Kurono environment.\n");
+    } else if (seq(argv[1], "debian")) {
+        // Debian environment requires the rootfs to be installed via
+        // `kpkg install debian` first.  If /debian/etc/os-release is
+        // present we know the install completed.
+        if (KVFS::Resolve("/debian/etc/os-release")) {
+            sh->SetEnv(ENV_DEBIAN);
+            p = sappend(out, p, maxo, "Switched to Debian environment.\n");
+        } else {
+            p = sappend(out, p, maxo, "Debian rootfs not installed. Run: kpkg install debian\n");
+        }
     } else {
         p = sappend(out, p, maxo, "Unknown environment: ");
         p = sappend(out, p, maxo, argv[1]);
@@ -1344,6 +1539,33 @@ int cmd_uptime(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
     p = sappend_char(out, p, maxo, ':');
     if (minutes < 10) p = sappend_char(out, p, maxo, '0');
     p = sappend_int(out, p, maxo, minutes);
+    p = sappend_char(out, p, maxo, '\n');
+    return p;
+}
+
+int cmd_usermode(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    if (!Userspace::IsReady()) {
+        Userspace::Init();
+    }
+
+    Process* proc = Userspace::CreateDemoProcess();
+    if (!proc) {
+        return sappend(out, 0, maxo, "usermode: failed to create demo process\n");
+    }
+
+    int exit_code = Userspace::RunProcess(proc);
+    int waited_exit = exit_code;
+    if (Scheduler::WaitForProcess(proc, &waited_exit)) {
+        exit_code = waited_exit;
+        Scheduler::ReapProcess(proc);
+    } else {
+        Scheduler::DestroyProcess(proc);
+    }
+
+    int p = 0;
+    p = sappend(out, p, maxo, "usermode: ring-3 demo exited with code ");
+    p = sappend_int(out, p, maxo, exit_code);
     p = sappend_char(out, p, maxo, '\n');
     return p;
 }

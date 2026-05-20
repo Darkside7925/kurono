@@ -53,6 +53,9 @@ int        TextEditorApp::sel_end_col     = 0;
 bool       TextEditorApp::has_selection   = false;
 bool       TextEditorApp::modified        = false;
 bool       TextEditorApp::show_line_numbers = true;
+int        TextEditorApp::menu_open_idx   = -1;
+int        TextEditorApp::menu_x          = 0;
+int        TextEditorApp::menu_y          = 0;
 
 //  init / open
 void TextEditorApp::Init(){
@@ -293,14 +296,19 @@ void TextEditorApp::RenderMenuBar(int x,int y,int w){
     Graphics::FillRect(x,y,w,MENU_H,ED_MENU_BG);
     Graphics::DrawLine(x,y+MENU_H,x+w,y+MENU_H,ED_BORDER);
 
-    // menu items
+    // menu items  -  highlight the open menu
+    unsigned int file_clr = (menu_open_idx == 0) ? ED_SEL_BG : ED_MENU_BG;
+    unsigned int edit_clr = (menu_open_idx == 1) ? ED_SEL_BG : ED_MENU_BG;
+    unsigned int view_clr = (menu_open_idx == 2) ? ED_SEL_BG : ED_MENU_BG;
+    Graphics::FillRect(x+6, y+2, 40, MENU_H-4, file_clr);
+    Graphics::FillRect(x+46, y+2, 40, MENU_H-4, edit_clr);
+    Graphics::FillRect(x+86, y+2, 40, MENU_H-4, view_clr);
     Graphics::DrawString(x+8,  y+4, "File", ED_MENU_TXT, 0xFF000000);
     Graphics::DrawString(x+48, y+4, "Edit", ED_MENU_TXT, 0xFF000000);
     Graphics::DrawString(x+88, y+4, "View", ED_MENU_TXT, 0xFF000000);
 
     // title / filename
     if(file_path[0]){
-        // just show filename
         int last=slen(file_path)-1;
         while(last>0 && file_path[last]!='/') last--;
         const char* fname = &file_path[last ? last+1 : 0];
@@ -312,6 +320,35 @@ void TextEditorApp::RenderMenuBar(int x,int y,int w){
         const char* t = modified ? "Untitled *" : "Untitled";
         int tw=slen(t)*8;
         Graphics::DrawString(x+w/2-tw/2, y+4, t, ED_STATUS_TX, 0xFF000000);
+    }
+}
+
+void TextEditorApp::RenderMenuDropdown(int ox,int oy){
+    if(menu_open_idx < 0 || menu_open_idx > 2) return;
+
+    static const char* file_items[] = {"Save  (Ctrl+S)", "Save As...", "Open...", nullptr};
+    static const char* edit_items[] = {"Toggle Line Numbers  (Ctrl+L)", "Go to Top  (Ctrl+G)", nullptr};
+    static const char* view_items[] = {"Toggle Line Numbers", nullptr};
+    const char** items = nullptr;
+    if(menu_open_idx == 0) items = file_items;
+    else if(menu_open_idx == 1) items = edit_items;
+    else items = view_items;
+
+    int count = 0;
+    while(items[count]) count++;
+    if(count == 0) return;
+
+    int dw = 220;
+    int dh = count * 22 + 4;
+    int dx = ox + menu_x;
+    int dy = oy + menu_y;
+
+    Graphics::FillRoundedRect(dx, dy, dw, dh, 4, 0xFF1E1E32);
+    Graphics::DrawRect(dx, dy, dw, dh, ED_BORDER);
+
+    for(int i=0;i<count;i++){
+        int iy = dy + 2 + i * 22;
+        Graphics::DrawString(dx+8, iy+3, items[i], ED_MENU_TXT, 0xFF000000);
     }
 }
 
@@ -392,6 +429,9 @@ void TextEditorApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     int y=cy;
     RenderMenuBar(cx,y,cw);  y+=MENU_H+1;
 
+    // Draw dropdown on top of everything if open
+    RenderMenuDropdown(cx, cy);
+
     int content_h = ch - MENU_H - 1 - STATUS_H;
     int vis_rows = content_h / CHAR_H;
 
@@ -409,12 +449,47 @@ void TextEditorApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
 bool TextEditorApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     (void)win_ptr;
 
-    // mouse click  -  position cursor
+    // mouse click
     if(clicked){
-        Window* w = (Window*)win_ptr;
-        (void)w;
+        // If menu dropdown is open, check dropdown items first
+        if(menu_open_idx >= 0){
+            int count = 0;
+            if(menu_open_idx == 0) count = 3;  // File: Save, Save As, Open
+            else if(menu_open_idx == 1) count = 2;  // Edit: Line Numbers, Go Top
+            else count = 1;  // View: Toggle Line Numbers
+
+            int dw = 220;
+            int dh = count * 22 + 4;
+            if(mx >= menu_x && mx < menu_x + dw &&
+               my >= menu_y && my < menu_y + dh){
+                int item = (my - menu_y - 2) / 22;
+                if(item >= 0 && item < count){
+                    menu_open_idx = -1;
+                    // Dispatch based on which menu was open
+                    if(count == 3){  // File menu
+                        if(item == 0) SaveFile();
+                        else if(item == 2) { /* Open  -  placeholder */ }
+                    } else if(count == 2){  // Edit menu
+                        if(item == 0) show_line_numbers = !show_line_numbers;
+                    } else {  // View menu
+                        if(item == 0) show_line_numbers = !show_line_numbers;
+                    }
+                    return true;
+                }
+            }
+            menu_open_idx = -1;
+            return true;
+        }
+
+        // Check menu bar clicks (File/Edit/View)
+        if(my >= 0 && my < MENU_H){
+            if(mx >= 6 && mx < 48){ menu_open_idx = 0; menu_x = 6; menu_y = MENU_H; return true; }
+            if(mx >= 46 && mx < 88){ menu_open_idx = 1; menu_x = 46; menu_y = MENU_H; return true; }
+            if(mx >= 86 && mx < 128){ menu_open_idx = 2; menu_x = 86; menu_y = MENU_H; return true; }
+        }
+
         // mx, my are already content-local (0,0 = top-left of content area)
-        int text_y = MENU_H + 1;  // text area starts below menu bar
+        int text_y = MENU_H + 1;
         int text_x = (show_line_numbers ? GUTTER_W : 0);
 
         if(mx >= text_x && my >= text_y){
@@ -426,8 +501,12 @@ bool TextEditorApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
                 if(cursor_col>lines[cursor_row].len)
                     cursor_col=lines[cursor_row].len;
             }
+            menu_open_idx = -1;
             return true;
         }
+
+        menu_open_idx = -1;
+        return true;
     }
 
     if(key==0) return false;

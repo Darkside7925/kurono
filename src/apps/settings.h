@@ -13,7 +13,8 @@ enum SettingsTab {
     STAB_UPDATES      = 8,
     STAB_SYSTEM       = 9,
     STAB_ABOUT        = 10,
-    STAB_COUNT        = 11,
+    STAB_ACCESSIBILITY= 11,
+    STAB_COUNT        = 12,
 };
 
 struct SettingsState {
@@ -61,6 +62,17 @@ struct SettingsState {
     // system / linux guest
     bool linux_guest_enabled;
     int  linux_guest_profile; // 0=alpine, 1=debian
+    // display advanced (slice 1 compositor keys)
+    bool vsync;
+    bool adaptive_sync;
+    // accessibility
+    bool a11y_high_contrast;
+    bool a11y_reduced_motion;
+    bool a11y_sticky_keys;
+    bool a11y_slow_keys;
+    bool a11y_bounce_keys;
+    bool a11y_screen_reader;
+    int  a11y_color_filter;   // 0=off,1=protanopia,2=deuteranopia,3=tritanopia,4=grayscale
 };
 
 class SettingsApp {
@@ -76,6 +88,12 @@ public:
 
     static SettingsState state;
     static int pending_resolution_idx;  // -1 = none pending
+
+    // wifi connect dialog (modal in network tab)
+    static bool wifi_dialog_open;
+    static char wifi_dialog_ssid[64];
+    static char wifi_dialog_pass[64];
+    static int  wifi_dialog_pass_len;
 
 private:
     static SettingsTab current_tab;
@@ -93,6 +111,7 @@ private:
     static void RenderUpdates(int x, int y, int w, int h);
     static void RenderSystem(int x, int y, int w, int h);
     static void RenderAbout(int x, int y, int w, int h);
+    static void RenderAccessibility(int x, int y, int w, int h);
 
     static bool HandleDisplayInput(int rx, int ry, int pw, int ph);
     static bool HandleSoundInput(int rx, int ry, int pw, int ph);
@@ -101,4 +120,5 @@ private:
     static bool HandlePersonalizeInput(int rx, int ry, int pw, int ph);
     static bool HandleUpdatesInput(int rx, int ry, int pw, int ph);
     static bool HandleSystemInput(int rx, int ry, int pw, int ph);
+    static bool HandleAccessibilityInput(int rx, int ry, int pw, int ph);
 };

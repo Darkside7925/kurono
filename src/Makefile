@@ -70,21 +70,45 @@ ALPINE_OBJS       += $(ALPINE_INITRD_OBJ)
 endif
 
 # ─── Debian Linux guest rootfs (embedded via objcopy) ────────────────────
+#
+#  Off by default  -  the rootfs is ~108 MB and bloats the ISO.  Users
+#  obtain it at runtime via `kpkg install debian`, which downloads it
+#  to /var/lib/kurono/debian-rootfs.ext4 and then prompts to reboot
+#  into the system update screen.  To force-embed for offline ISOs:
+#      make EMBED_DEBIAN=1
 DEBIAN_ROOTFS_BIN = $(DEBIAN_DIR)/debian-minbase.ext4
 DEBIAN_ROOTFS_OBJ = $(BUILD)/debian_rootfs.o
 DEBIAN_OBJS       =
+ifeq ($(EMBED_DEBIAN),1)
 ifneq ($(wildcard $(DEBIAN_ROOTFS_BIN)),)
 DEBIAN_OBJS      += $(DEBIAN_ROOTFS_OBJ)
+endif
 endif
 
 # ─── Media assets (embedded via objcopy) ──────────────────────────────────
 MEDIA_DIR     = ../archive/old_misc
 DENJI_MP4_BIN = $(MEDIA_DIR)/denji.mp4
 DENJI_MP4_OBJ = $(BUILD)/denji_mp4.o
+DENJI_KVID_BIN = $(SRC)/media/denji.kvid
+DENJI_KVID_OBJ = $(BUILD)/denji_kvid.o
 MEDIA_OBJS    =
 ifneq ($(wildcard $(DENJI_MP4_BIN)),)
 MEDIA_OBJS   += $(DENJI_MP4_OBJ)
 endif
+ifneq ($(wildcard $(DENJI_KVID_BIN)),)
+MEDIA_OBJS   += $(DENJI_KVID_OBJ)
+endif
+
+# ─── User programs (test ELF64 binaries embedded into the kernel) ───────
+USERPROGS_DIR     = $(SRC)/userprogs
+HELLO_USER_ELF    = $(BUILD)/userprogs/hello.elf
+HELLO_USER_OBJ    = $(BUILD)/userprogs/hello_user_embed.o
+HELLO_X64_ELF     = $(BUILD)/userprogs/hello_x64.elf
+HELLO_X64_OBJ     = $(BUILD)/userprogs/hello_x64_user_embed.o
+KPY_C_SRC         = $(USERPROGS_DIR)/kpython.c
+KPY_ELF           = $(BUILD)/userprogs/kpython.elf
+KPY_OBJ           = $(BUILD)/userprogs/kpython_user_embed.o
+USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(KPY_OBJ)
 
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
@@ -98,17 +122,25 @@ LDFLAGS  = -T $(SRC)/boot/kurono_linker.ld -nostdlib -no-pie -lgcc
 # NOTE: Run 'make' from inside the src/ directory
 # Assembly (boot)
 ASM_SRCS = $(SRC)/boot/kurono_boot.asm \
-           $(SRC)/hal/isr_stubs.asm
+		   $(SRC)/kernel/userspace_entry.asm \
+           $(SRC)/hal/isr_stubs.asm \
+           $(SRC)/hal/syscall_entry.asm \
+           $(SRC)/proc/switch_to.asm
 
 # C++ sources  -  listed in dependency order for clarity
 CXX_SRCS = \
     $(SRC)/kernel/types.cpp \
     $(SRC)/kernel/heap.cpp \
     $(SRC)/kernel/pmm.cpp \
+    $(SRC)/kernel/buddy.cpp \
+    $(SRC)/kernel/slab.cpp \
     $(SRC)/kernel/vmm.cpp \
+	$(SRC)/kernel/userspace.cpp \
+	$(SRC)/kernel/elf_loader.cpp \
     $(SRC)/kernel/time.cpp \
     $(SRC)/kernel/system.cpp \
 	$(SRC)/kernel/panic.cpp \
+    $(SRC)/kernel/hrtimer.cpp \
     $(SRC)/hal/hal.cpp \
     $(SRC)/drivers/serial.cpp \
     $(SRC)/drivers/display.cpp \
@@ -119,6 +151,7 @@ CXX_SRCS = \
     $(SRC)/drivers/mouse.cpp \
     $(SRC)/drivers/rtc.cpp \
     $(SRC)/proc/scheduler.cpp \
+    $(SRC)/proc/kernel_processes.cpp \
     $(SRC)/fs/vfs.cpp \
     $(SRC)/fs/kvfs.cpp \
 	$(SRC)/fs/fat32.cpp \
@@ -137,6 +170,7 @@ CXX_SRCS = \
     $(SRC)/ui/lockscreen.cpp \
     $(SRC)/ui/window_manager.cpp \
     $(SRC)/ui/desktop.cpp \
+    $(SRC)/ui/control_center.cpp \
     $(SRC)/ui/file_browser.cpp \
     $(SRC)/apps/calculator.cpp \
     $(SRC)/apps/terminal.cpp \
@@ -145,17 +179,23 @@ CXX_SRCS = \
     $(SRC)/apps/settings.cpp \
     $(SRC)/apps/task_manager.cpp \
     $(SRC)/apps/browser.cpp \
-	$(SRC)/apps/conduit.cpp \
     $(SRC)/apps/media_player.cpp \
+    $(SRC)/apps/denji_app.cpp \
+    $(SRC)/apps/python_interp.cpp \
     $(SRC)/drivers/audio.cpp \
     $(SRC)/system/input_manager.cpp \
 	$(SRC)/system/conduit.cpp \
 	$(SRC)/system/logging.cpp \
 	$(SRC)/system/installer.cpp \
+	$(SRC)/system/installer_gui.cpp \
+	$(SRC)/system/gpu_driver_installer.cpp \
+	$(SRC)/system/system_update.cpp \
 	$(SRC)/system/ui_config.cpp \
+	$(SRC)/system/vconsole.cpp \
     $(SRC)/tests/test_suite.cpp \
     $(SRC)/linux/kls.cpp \
     $(SRC)/linux/linux_syscall.cpp \
+    $(SRC)/linux/linux_syscall_x64.cpp \
     $(SRC)/linux/ext4.cpp \
     $(SRC)/linux/shared_mount.cpp \
     $(SRC)/linux/user_bridge.cpp \
@@ -179,6 +219,10 @@ CXX_SRCS = \
     $(SRC)/virt/hypervisor.cpp \
     $(SRC)/virt/iommu.cpp \
     $(SRC)/virt/v9fs.cpp \
+    $(SRC)/virt/debian_data.cpp \
+    $(SRC)/virt/vpci.cpp \
+    $(SRC)/virt/virtio_gpu_host.cpp \
+    $(SRC)/virt/pci_passthrough.cpp \
     $(SRC)/drivers/nvidia_gpu.cpp \
     $(SRC)/drivers/intel_gpu.cpp \
     $(SRC)/drivers/e1000.cpp \
@@ -189,11 +233,39 @@ CXX_SRCS = \
     $(SRC)/drivers/display_mgr.cpp \
     $(SRC)/drivers/amd_gpu.cpp \
     $(SRC)/drivers/ac97.cpp \
+    $(SRC)/drivers/audio_dma.cpp \
+    $(SRC)/drivers/audio_format.cpp \
+    $(SRC)/drivers/audio_mixer.cpp \
+    $(SRC)/drivers/audio_server.cpp \
+    $(SRC)/drivers/audio_wav.cpp \
+    $(SRC)/drivers/audio_backend_sb16.cpp \
+    $(SRC)/drivers/audio_backend_ac97.cpp \
+    $(SRC)/drivers/audio_backend_hda.cpp \
+    $(SRC)/drivers/audio_backend_pcspk.cpp \
+    $(SRC)/drivers/audio_backend.cpp \
     $(SRC)/drivers/gpu_probe.cpp \
     $(SRC)/drivers/cpu_detect.cpp \
     $(SRC)/media/mp3_decoder.cpp \
     $(SRC)/media/codec.cpp \
+    $(SRC)/media/mp4_demux.cpp \
+    $(SRC)/media/h264_parse.cpp \
+    $(SRC)/media/aac_parse.cpp \
+    $(SRC)/media/kvid.cpp \
+    $(SRC)/media/video_player.cpp \
     $(SRC)/net/tcpip.cpp \
+    $(SRC)/net/tuntap.cpp \
+    $(SRC)/net/ipv6.cpp \
+    $(SRC)/net/netfilter.cpp \
+    $(SRC)/net/unix_socket.cpp \
+    $(SRC)/proc/cgroup.cpp \
+    $(SRC)/drivers/tpm.cpp \
+    $(SRC)/drivers/pulse_server.cpp \
+    $(SRC)/hal/cpufreq.cpp \
+    $(SRC)/ui/wayland_server.cpp \
+    $(SRC)/system/runtime_layout.cpp \
+    $(SRC)/system/dbus_server.cpp \
+    $(SRC)/apps/firefox_launcher.cpp \
+    $(SRC)/linux/ld_kurono.cpp \
     $(SRC)/linux/linux_drivers.cpp \
     $(SRC)/kernel/kurono_kernel.cpp
 
@@ -214,6 +286,28 @@ INSTALLER_PAYLOAD_OBJS = $(BUILD)/boot/install_kernel_embed.o \
 	$(BUILD)/boot/install_efi_embed.o \
 	$(BUILD)/boot/install_efi_emergency_embed.o
 
+KURONO_BOOT_PROFILE ?= normal
+KURONO_GRUB_TIMEOUT ?= 10
+KURONO_CLI_RUN ?=
+KURONO_CLI_POWEROFF ?= 0
+KURONO_GUI_RUN ?=
+
+ifeq ($(KURONO_BOOT_PROFILE),cli)
+KURONO_BIOS_DEFAULT = 4
+else ifeq ($(KURONO_BOOT_PROFILE),emergency)
+KURONO_BIOS_DEFAULT = 3
+else
+KURONO_BIOS_DEFAULT = 2
+endif
+
+KURONO_CLI_CMDLINE = -cli kurono_mode=cli kurono.text=1
+ifneq ($(strip $(KURONO_CLI_RUN)),)
+KURONO_CLI_CMDLINE += kurono.cli.run="$(KURONO_CLI_RUN)"
+endif
+ifeq ($(KURONO_CLI_POWEROFF),1)
+KURONO_CLI_CMDLINE += kurono.cli.poweroff=1
+endif
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Targets
 # ═══════════════════════════════════════════════════════════════════════════
@@ -226,10 +320,10 @@ all: dirs $(KERNEL)
 
 # ─── Link ─────────────────────────────────────────────────────────────────
 
-$(KERNEL_BASE): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS)
+$(KERNEL_BASE): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS)
 	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld -nostdlib -o $@ $^ -lgcc
 
-$(KERNEL): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(INSTALLER_PAYLOAD_OBJS)
+$(KERNEL): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS) $(INSTALLER_PAYLOAD_OBJS)
 	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld -nostdlib -o $@ $^ -lgcc
 
 # ─── Embed Alpine kernel via objcopy (binary → ELF .rodata) ──────────────
@@ -270,15 +364,126 @@ $(DENJI_MP4_OBJ): $(DENJI_MP4_BIN)
 	  denji.mp4 denji_mp4.o && \
 	rm -f denji.mp4
 
+# ─── Embed denji.kvid via objcopy (binary → ELF .rodata) ─────────────────
+$(DENJI_KVID_OBJ): $(DENJI_KVID_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/denji.kvid && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  --add-section .note.GNU-stack=/dev/null \
+	  --set-section-flags .note.GNU-stack=noload,readonly \
+	  denji.kvid denji_kvid.o && \
+	rm -f denji.kvid
+
 # ─── Compile assembly ─────────────────────────────────────────────────────
 $(BUILD)/%.o: $(SRC)/%.asm
 	@mkdir -p $(dir $@)
 	$(NASM) $(ASFLAGS) $< -o $@
+# ─── User programs: assemble NASM → link with user.ld → embed via objcopy ──────
+$(BUILD)/userprogs/%.elf: $(USERPROGS_DIR)/%.asm $(USERPROGS_DIR)/user.ld
+	@mkdir -p $(dir $@)
+	$(NASM) -f elf64 $< -o $(BUILD)/userprogs/$*.o
+	$(LD) -nostdlib -static -T $(USERPROGS_DIR)/user.ld -o $@ $(BUILD)/userprogs/$*.o
 
+$(HELLO_USER_OBJ): $(HELLO_USER_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/hello.elf.bin
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  hello.elf.bin hello_user_embed.o
+	rm -f $(BUILD)/userprogs/hello.elf.bin
+
+$(HELLO_X64_OBJ): $(HELLO_X64_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/hello_x64.elf.bin
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  hello_x64.elf.bin hello_x64_user_embed.o
+	rm -f $(BUILD)/userprogs/hello_x64.elf.bin
+
+# kpy: compile C with no libc, no PIE, link with user.ld @ 0x40100000
+$(KPY_ELF): $(KPY_C_SRC) $(USERPROGS_DIR)/user.ld
+	@mkdir -p $(dir $@)
+	gcc -m64 -static -nostdlib -nostartfiles -ffreestanding \
+	    -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables \
+	    -mno-red-zone -mno-sse -mno-mmx -O2 -Wall -Wextra \
+	    -T $(USERPROGS_DIR)/user.ld \
+	    $(KPY_C_SRC) -o $@
+
+$(KPY_OBJ): $(KPY_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/kpython.elf.bin
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kpython.elf.bin kpython_user_embed.o
+	rm -f $(BUILD)/userprogs/kpython.elf.bin
 # ─── Compile C++ ──────────────────────────────────────────────────────────
 $(BUILD)/%.o: $(SRC)/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Files exercised from interrupt context  -  disable SSE codegen so the
+# compiler doesn't emit movaps/movdqa that fault on partially-aligned
+# kernel stack/heap when reached via int 0x80. Graphics inline asm
+# uses xmm explicitly, so we can't apply this globally.
+$(BUILD)/fs/kvfs.o: $(SRC)/fs/kvfs.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/proc/scheduler.o: $(SRC)/proc/scheduler.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/proc/kernel_processes.o: $(SRC)/proc/kernel_processes.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/linux/linux_syscall.o: $(SRC)/linux/linux_syscall.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/linux/linux_syscall_x64.o: $(SRC)/linux/linux_syscall_x64.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/kernel/userspace.o: $(SRC)/kernel/userspace.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/kernel/elf_loader.o: $(SRC)/kernel/elf_loader.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/hal/hal.o: $(SRC)/hal/hal.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# Task Manager Refresh runs every 300 frames from GUIProcessEntry (a
+# kernel process). Its SortProcesses bubble-sort vectorises the
+# TMProcess struct swap into movaps which fault when the kernel
+# process stack drifts off 16-byte alignment.  Force scalar codegen.
+$(BUILD)/apps/task_manager.o: $(SRC)/apps/task_manager.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# Video player runs every frame from GUIProcess and decodes JPEGs via
+# stb_image which contains aligned SSE intrinsics.  Same alignment risk
+# as task_manager  -  disable codegen-emitted SSE.
+$(BUILD)/media/video_player.o: $(SRC)/media/video_player.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+$(BUILD)/apps/denji_app.o: $(SRC)/apps/denji_app.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# stb_image decoders contain optional SSE2 paths and emit aligned
+# movdqa when SSE codegen is enabled.  Kernel-context JPEG decode
+# during denji playback hit those instructions with a slightly
+# misaligned stack.  Force scalar build.
+$(BUILD)/third_party/stb_image_glue.o: $(SRC)/third_party/stb_image_glue.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -DSTBI_NO_SIMD -c $< -o $@
 
 # ─── Create build directories ────────────────────────────────────────────
 dirs:
@@ -355,6 +560,7 @@ $(BUILD)/boot/install_efi_emergency_embed.o: $(EFI_APP_EMERGENCY)
 iso: all efi
 	@mkdir -p $(ISO_DIR)/boot/grub
 	cp $(KERNEL) $(ISO_DIR)/boot/kurono.elf
+	cp $(KERNEL_BASE) $(ISO_DIR)/boot/kurono_base.elf
 	cp $(EFI_APP) $(ISO_DIR)/boot/kurono_efi.efi
 	cp $(EFI_APP_EMERGENCY) $(ISO_DIR)/boot/kurono_emergency.efi
 	@echo 'insmod all_video'                                            > $(ISO_DIR)/boot/grub/grub.cfg
@@ -367,13 +573,13 @@ iso: all efi
 	@echo 'insmod chain'                                               >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'set gfxmode=auto'                                           >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'terminal_output gfxterm'                                    >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo 'set timeout=10'                                             >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo 'set timeout=$(KURONO_GRUB_TIMEOUT)'                          >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo ''                                                           >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '# Auto-select EFI Direct on UEFI, Multiboot2 on BIOS'      >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'if [ "$$grub_platform" = "efi" ]; then'                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set default=0'                                          >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'else'                                                       >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    set default=1'                                          >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    set default=$(KURONO_BIOS_DEFAULT)'                      >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'fi'                                                         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo ''                                                           >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'menuentry "Kurono OS (EFI Direct)" {'                       >> $(ISO_DIR)/boot/grub/grub.cfg
@@ -389,7 +595,7 @@ iso: all efi
 	@echo 'menuentry "Kurono OS (Multiboot2)" {'                       >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono OS kernel (multiboot2)..."'         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono.elf'                             >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",)' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded OK. Booting..."'                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
@@ -397,15 +603,23 @@ iso: all efi
 	@echo 'menuentry "Kurono OS (Emergency Multiboot2)" {'             >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono Emergency kernel (multiboot2)..."' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=text'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono.elf kurono_mode=emergency kurono.text=1' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf kurono_mode=emergency kurono.text=1' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Emergency kernel loaded OK. Booting..."'          >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo ''                                                           >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo 'menuentry "Kurono OS (CLI Multiboot2)" {'                   >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    echo "Loading Kurono CLI kernel (multiboot2)..."'       >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    set gfxpayload=text'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf $(KURONO_CLI_CMDLINE)'  >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    echo "CLI kernel loaded OK. Booting..."'                >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo ''                                                           >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'menuentry "Kurono OS (Multiboot1)" {'                       >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono OS kernel (multiboot1)..."'         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot /boot/kurono.elf'                              >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot /boot/kurono_base.elf'                         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded OK. Booting..."'                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
@@ -419,7 +633,7 @@ iso: all efi
 	@echo '    echo "Setting gfxpayload..."'                            >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading kernel ELF..."'                            >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono.elf'                             >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf'                             >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded. Press any key to boot..."'          >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    sleep 5'                                                 >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
@@ -428,14 +642,14 @@ iso: all efi
 	@echo 'menuentry "Kurono OS (Text Mode - no framebuffer)" {'       >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Text mode boot..."'                                >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=text'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono.elf'                             >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf kurono_mode=text kurono.text=1' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo ''                                                           >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'menuentry "Kurono OS (gfxpayload=keep)" {'                  >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Keep mode boot..."'                                >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono.elf'                             >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf'                             >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(ISO_DIR)

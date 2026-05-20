@@ -58,8 +58,13 @@ private:
 
     // render helpers
     static void RenderMenuBar(int x, int y, int w);
+    static void RenderMenuDropdown(int x, int y);
     static void RenderGutter(int x, int y, int h, int vis_rows);
     static void RenderContent(int x, int y, int w, int h);
     static void RenderStatusBar(int x, int y, int w);
     static void RenderCursor(int cx, int cy, int content_x, int content_y);
+
+    // menu state
+    static int  menu_open_idx;       // -1 = none, 0=File, 1=Edit, 2=View
+    static int  menu_x, menu_y;      // dropdown anchor position
 };

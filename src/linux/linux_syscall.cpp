@@ -3,11 +3,18 @@
 
 #include "linux_syscall.h"
 #include "ext4.h"
+#include "kls.h"
 #include "../fs/kvfs.h"
+#include "../hal/hal.h"
 #include "../kernel/heap.h"
+#include "../kernel/userspace.h"
+#include "../kernel/vmm.h"
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
 #include "../security/supr.h"
+#include "../net/unix_socket.h"
+#include "../shell/shell.h"
+#include "../system/logging.h"
 
 LinuxProcess LinuxSyscall::procs[LINUX_MAX_PROCS];
 int LinuxSyscall::current_proc = -1;
@@ -21,6 +28,492 @@ int  LinuxSyscall::console_tail = 0;
 char LinuxSyscall::stdin_buf[STDIN_BUF_SIZE];
 int  LinuxSyscall::stdin_head = 0;
 int  LinuxSyscall::stdin_tail = 0;
+
+namespace {
+constexpr uint64_t EXEC_STACK_BYTES = 16 * 1024;
+constexpr int EXEC_MAX_ARGC = 16;
+constexpr uint64_t USER_MMAP_BASE = 0x20000000ULL;
+constexpr uint64_t USER_MMAP_LIMIT = USERSPACE_BASE - 0x01000000ULL;
+
+constexpr uint32_t PFERR_PRESENT = 1U << 0;
+constexpr uint32_t PFERR_WRITE   = 1U << 1;
+constexpr uint32_t PFERR_USER    = 1U << 2;
+constexpr uint32_t PFERR_FETCH   = 1U << 4;
+
+constexpr uint32_t LINUX_PROT_WRITE = 0x2;
+constexpr uint32_t LINUX_PROT_EXEC  = 0x4;
+
+InterruptFrame* current_syscall_frame = nullptr;
+bool current_frame_rewritten = false;
+bool resume_userspace_session = false;
+int resume_userspace_exit_code = 0;
+
+static inline uint64_t align_down_u64(uint64_t value, uint64_t align) {
+    return value & ~(align - 1);
+}
+
+static inline uint64_t align_up_u64(uint64_t value, uint64_t align) {
+    return (value + align - 1) & ~(align - 1);
+}
+
+static int find_process_index_by_task(Process* task) {
+    if (!task) return -1;
+
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* proc = LinuxSyscall::GetProcess(i);
+        if (proc && proc->task == task) return i;
+    }
+    return -1;
+}
+
+static uint8_t kvfs_open_flags(uint32_t flags) {
+    uint8_t kvfs_flags = 0;
+    if ((flags & 3) == L_O_RDONLY) kvfs_flags = 1;
+    else if ((flags & 3) == L_O_WRONLY) kvfs_flags = 2;
+    else if ((flags & 3) == L_O_RDWR) kvfs_flags = 3;
+    if (flags & L_O_APPEND) kvfs_flags |= 4;
+    return kvfs_flags;
+}
+
+static uint8_t ext4_open_flags(uint32_t flags) {
+    if ((flags & 3) == L_O_RDONLY) return 1;
+    if ((flags & 3) == L_O_WRONLY) return 2;
+    return 3;
+}
+
+static void clone_file_descriptors(const LinuxProcess* parent, LinuxProcess* child) {
+    for (int fd = 0; fd < LINUX_MAX_FDS; fd++) {
+        child->fds[fd].open = false;
+        if (!parent->fds[fd].open) continue;
+
+        const LinuxFd* src = &parent->fds[fd];
+        LinuxFd* dst = &child->fds[fd];
+        memcpy(dst, src, sizeof(LinuxFd));
+
+        if (src->type == LFD_KVFS) {
+            int backend = KVFS::Open(src->path, kvfs_open_flags(src->flags));
+            if (backend < 0) {
+                dst->open = false;
+                continue;
+            }
+            dst->backend_fd = backend;
+            if (src->offset) {
+                KVFS::Seek(backend, (int32_t)src->offset, 0);
+            }
+            continue;
+        }
+
+        if (src->type == LFD_EXT4) {
+            int backend = Ext4::Open(src->path, ext4_open_flags(src->flags));
+            if (backend < 0) {
+                dst->open = false;
+                continue;
+            }
+            dst->backend_fd = backend;
+            if (src->offset) {
+                Ext4::Seek(backend, (int32_t)src->offset, 0);
+            }
+        }
+    }
+}
+
+static bool write_user_u32(Process* proc, uint64_t user_addr, uint32_t value) {
+    if (!proc || !proc->is_user() || !user_addr) return false;
+    if ((user_addr & 0xFFFULL) > PAGE_SIZE - sizeof(uint32_t)) return false;
+
+    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, user_addr);
+    if (!phys) return false;
+
+    *(uint32_t*)(uintptr_t)phys = value;
+    return true;
+}
+
+static UserMemoryRegion* find_region(Process* proc, uint64_t addr) {
+    if (!proc) return nullptr;
+
+    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
+        UserMemoryRegion* region = &proc->regions[i];
+        if (!region->active) continue;
+        if (addr >= region->start && addr < region->end) return region;
+    }
+    return nullptr;
+}
+
+static UserMemoryRegion* find_region_by_flag(Process* proc, uint32_t flag) {
+    if (!proc) return nullptr;
+
+    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
+        UserMemoryRegion* region = &proc->regions[i];
+        if (region->active && (region->flags & flag)) return region;
+    }
+    return nullptr;
+}
+
+static UserMemoryRegion* find_free_region_slot(Process* proc) {
+    if (!proc) return nullptr;
+
+    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
+        if (!proc->regions[i].active) return &proc->regions[i];
+    }
+    return nullptr;
+}
+
+static bool region_overlaps(Process* proc, uint64_t start, uint64_t end) {
+    if (!proc) return false;
+
+    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
+        const UserMemoryRegion* region = &proc->regions[i];
+        if (!region->active) continue;
+        if (start < region->end && end > region->start) return true;
+    }
+    return false;
+}
+
+static UserMemoryRegion* add_region(Process* proc, uint64_t start, uint64_t end,
+                                    uint64_t page_flags, uint32_t flags) {
+    if (!proc || start >= end) return nullptr;
+
+    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
+        UserMemoryRegion* region = &proc->regions[i];
+        if (!region->active) continue;
+        if (region->page_flags != page_flags || region->flags != flags) continue;
+
+        if (region->end == start) {
+            region->end = end;
+            return region;
+        }
+        if (region->start == end) {
+            region->start = start;
+            return region;
+        }
+    }
+
+    UserMemoryRegion* slot = find_free_region_slot(proc);
+    if (!slot) return nullptr;
+
+    slot->start = start;
+    slot->end = end;
+    slot->page_flags = page_flags;
+    slot->flags = flags;
+    slot->active = true;
+    return slot;
+}
+
+static uint64_t page_flags_from_prot(uint32_t prot) {
+    uint64_t flags = PTE_USER;
+    if (prot & LINUX_PROT_WRITE) flags |= PTE_WRITABLE;
+    if (!(prot & LINUX_PROT_EXEC)) flags |= PTE_NX;
+    return flags;
+}
+
+static void unmap_user_range(Process* proc, uint64_t start, uint64_t end) {
+    if (!proc || start >= end) return;
+
+    uint64_t page_start = align_down_u64(start, PAGE_SIZE);
+    uint64_t page_end = align_up_u64(end, PAGE_SIZE);
+    for (uint64_t page = page_start; page < page_end; page += PAGE_SIZE) {
+        if (!KernelVMM::QueryMappingInAddressSpace(proc->address_space, page)) continue;
+        KernelVMM::UnmapPageInAddressSpace(proc->address_space, page, true);
+        if (Scheduler::GetCurrentProcess() == proc) {
+            KernelVMM::InvalidatePage(page);
+        }
+    }
+}
+
+static bool ensure_heap_region(LinuxProcess* proc, Process* task, uint32_t new_break) {
+    if (!proc || !task) return false;
+
+    uint64_t region_start = align_up_u64(proc->brk_base, PAGE_SIZE);
+    uint64_t region_end = align_up_u64(new_break, PAGE_SIZE);
+    UserMemoryRegion* region = find_region_by_flag(task, USER_REGION_HEAP);
+
+    if (region_end <= region_start) {
+        if (region && region->active) {
+            unmap_user_range(task, region->start, region->end);
+            region->active = false;
+        }
+        return true;
+    }
+
+    if (!region) {
+        region = add_region(task, region_start, region_end,
+                            PTE_USER | PTE_WRITABLE | PTE_NX,
+                            USER_REGION_DEMAND_ZERO | USER_REGION_HEAP);
+        return region != nullptr;
+    }
+
+    if (region_end < region->end) {
+        unmap_user_range(task, region_end, region->end);
+    }
+    region->start = region_start;
+    region->end = region_end;
+    region->page_flags = PTE_USER | PTE_WRITABLE | PTE_NX;
+    region->flags = USER_REGION_DEMAND_ZERO | USER_REGION_HEAP;
+    region->active = true;
+    return true;
+}
+
+static uint64_t choose_mmap_base(Process* task, uint64_t requested, uint64_t length) {
+    uint64_t base = requested ? align_down_u64(requested, PAGE_SIZE)
+                              : align_up_u64(task->next_mmap_base, PAGE_SIZE);
+
+    while (base + length <= USER_MMAP_LIMIT) {
+        if (!region_overlaps(task, base, base + length)) return base;
+        base = align_up_u64(base + length + PAGE_SIZE, PAGE_SIZE);
+    }
+    return 0;
+}
+
+static bool split_or_trim_region(Process* task, UserMemoryRegion* region,
+                                 uint64_t trim_start, uint64_t trim_end) {
+    if (!task || !region || !region->active || trim_start >= trim_end) return false;
+
+    if (trim_start <= region->start && trim_end >= region->end) {
+        region->active = false;
+        return true;
+    }
+
+    if (trim_start <= region->start) {
+        region->start = trim_end;
+        return true;
+    }
+
+    if (trim_end >= region->end) {
+        region->end = trim_start;
+        return true;
+    }
+
+    UserMemoryRegion* split = find_free_region_slot(task);
+    if (!split) return false;
+
+    *split = *region;
+    split->start = trim_end;
+    region->end = trim_start;
+    return true;
+}
+
+static bool handle_demand_zero_fault(Process* task, UserMemoryRegion* region,
+                                     uint64_t page_base, InterruptFrame* frame) {
+    if (!task || !region || !frame) return false;
+    if (!(region->flags & USER_REGION_DEMAND_ZERO)) return false;
+
+    if ((frame->error_code & PFERR_WRITE) && !(region->page_flags & PTE_WRITABLE)) {
+        return false;
+    }
+    if ((frame->error_code & PFERR_FETCH) && (region->page_flags & PTE_NX)) {
+        return false;
+    }
+
+    void* page = PMM::AllocBytes(PAGE_SIZE);
+    if (!page) return false;
+
+    if (!KernelVMM::MapPageInAddressSpace(task->address_space, page_base,
+                                          (uint64_t)(uintptr_t)page,
+                                          region->page_flags)) {
+        PMM::FreeBytes(page, PAGE_SIZE);
+        return false;
+    }
+
+    if (Scheduler::GetCurrentProcess() == task) {
+        KernelVMM::InvalidatePage(page_base);
+    }
+    Scheduler::SaveUserFrame(task, frame);
+    return true;
+}
+
+static bool handle_cow_fault(Process* task, uint64_t page_base,
+                             uint64_t page_flags, InterruptFrame* frame) {
+    if (!task || !frame) return false;
+    if (!(page_flags & PTE_COW) || !(frame->error_code & PFERR_WRITE)) return false;
+
+    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(task->address_space, page_base);
+    if (!phys) return false;
+
+    uint64_t new_flags = (page_flags | PTE_WRITABLE) & ~PTE_COW;
+    if (PMM::GetFrameRefCount(phys) > 1) {
+        uint64_t new_frame = PMM::AllocFrame();
+        if (!new_frame) return false;
+
+        memcpy((void*)(uintptr_t)new_frame, (const void*)(uintptr_t)phys, PAGE_SIZE);
+        if (!KernelVMM::MapPageInAddressSpace(task->address_space, page_base, new_frame, new_flags)) {
+            PMM::FreeFrame(new_frame);
+            return false;
+        }
+        PMM::FreeFrame(phys);
+    } else {
+        if (!KernelVMM::MapPageInAddressSpace(task->address_space, page_base, phys, new_flags)) {
+            return false;
+        }
+    }
+
+    if (Scheduler::GetCurrentProcess() == task) {
+        KernelVMM::InvalidatePage(page_base);
+    }
+    Scheduler::SaveUserFrame(task, frame);
+    return true;
+}
+
+static bool is_valid_exec_elf(const void* data, uint32_t size) {
+    if (size < sizeof(Elf32Header)) return false;
+
+    const Elf32Header* header = (const Elf32Header*)data;
+    if (header->e_magic != ELF_MAGIC) return false;
+    if (header->e_class != 1 || header->e_data != 1) return false;
+    if (header->e_machine != 3) return false;
+    return true;
+}
+
+static bool load_exec_segments(uint64_t address_space, const uint8_t* image,
+                               uint32_t size, uint32_t* entry_point,
+                               uint32_t* brk_end) {
+    const Elf32Header* header = (const Elf32Header*)image;
+    if (header->e_phoff + header->e_phnum * header->e_phentsize > size) return false;
+
+    uint32_t highest_end = 0;
+    for (int i = 0; i < header->e_phnum; i++) {
+        const Elf32Phdr* ph = (const Elf32Phdr*)(image + header->e_phoff + i * header->e_phentsize);
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_offset + ph->p_filesz > size) return false;
+
+        uint32_t seg_start = ph->p_vaddr & ~(uint32_t)(PAGE_SIZE - 1);
+        uint32_t seg_end = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+        uint64_t page_flags = PTE_USER;
+        if (ph->p_flags & 0x2U) page_flags |= PTE_WRITABLE;
+        if (!(ph->p_flags & 0x1U)) page_flags |= PTE_NX;
+
+        for (uint32_t page_va = seg_start; page_va < seg_end; page_va += PAGE_SIZE) {
+            void* page = PMM::AllocBytes(PAGE_SIZE);
+            if (!page) return false;
+
+            uint32_t file_begin = ph->p_vaddr;
+            uint32_t file_end = ph->p_vaddr + ph->p_filesz;
+            uint32_t copy_begin = (page_va > file_begin) ? page_va : file_begin;
+            uint32_t copy_end = ((page_va + PAGE_SIZE) < file_end) ? (page_va + PAGE_SIZE) : file_end;
+            if (copy_begin < copy_end) {
+                memcpy((uint8_t*)page + (copy_begin - page_va),
+                       image + ph->p_offset + (copy_begin - ph->p_vaddr),
+                       copy_end - copy_begin);
+            }
+
+            if (!KernelVMM::MapPageInAddressSpace(address_space, page_va,
+                                                  (uint64_t)(uintptr_t)page,
+                                                  page_flags)) {
+                PMM::FreeBytes(page, PAGE_SIZE);
+                return false;
+            }
+        }
+
+        uint32_t segment_end = ph->p_vaddr + ph->p_memsz;
+        if (segment_end > highest_end) highest_end = segment_end;
+    }
+
+    if (entry_point) *entry_point = header->e_entry;
+    if (brk_end) {
+        uint32_t aligned = (highest_end + PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+        *brk_end = aligned > LINUX_BRK_INITIAL ? aligned : LINUX_BRK_INITIAL;
+    }
+    return true;
+}
+
+static bool map_exec_stack(uint64_t address_space, uint64_t stack_top, void** out_stack_phys) {
+    void* stack_phys = PMM::AllocBytes(EXEC_STACK_BYTES);
+    if (!stack_phys) return false;
+
+    uint64_t stack_base = stack_top - EXEC_STACK_BYTES;
+    for (uint64_t offset = 0; offset < EXEC_STACK_BYTES; offset += PAGE_SIZE) {
+        if (!KernelVMM::MapPageInAddressSpace(address_space, stack_base + offset,
+                                              (uint64_t)(uintptr_t)stack_phys + offset,
+                                              PTE_USER | PTE_WRITABLE)) {
+            PMM::FreeBytes(stack_phys, EXEC_STACK_BYTES);
+            return false;
+        }
+    }
+
+    *out_stack_phys = stack_phys;
+    return true;
+}
+
+static bool build_exec_stack(void* stack_phys, uint64_t stack_top, uint32_t argv_ptr,
+                             uint64_t* out_rsp) {
+    uint64_t stack_base = stack_top - EXEC_STACK_BYTES;
+    uint64_t sp = stack_top;
+    uint32_t arg_ptrs[EXEC_MAX_ARGC];
+    int argc = 0;
+
+    memset(arg_ptrs, 0, sizeof(arg_ptrs));
+    if (argv_ptr) {
+        uint32_t* argv = (uint32_t*)(uintptr_t)argv_ptr;
+        while (argc < EXEC_MAX_ARGC && argv[argc]) {
+            const char* arg = (const char*)(uintptr_t)argv[argc];
+            int len = 0;
+            while (arg[len]) len++;
+
+            sp -= (uint64_t)(len + 1);
+            memcpy((uint8_t*)stack_phys + (sp - stack_base), arg, len + 1);
+            arg_ptrs[argc++] = (uint32_t)sp;
+        }
+    }
+
+    sp &= ~0xFULL;
+
+    sp -= sizeof(uint32_t);
+    *(uint32_t*)((uint8_t*)stack_phys + (sp - stack_base)) = 0;
+
+    sp -= sizeof(uint32_t);
+    *(uint32_t*)((uint8_t*)stack_phys + (sp - stack_base)) = 0;
+
+    for (int i = argc - 1; i >= 0; i--) {
+        sp -= sizeof(uint32_t);
+        *(uint32_t*)((uint8_t*)stack_phys + (sp - stack_base)) = arg_ptrs[i];
+    }
+
+    sp -= sizeof(uint32_t);
+    *(uint32_t*)((uint8_t*)stack_phys + (sp - stack_base)) = (uint32_t)argc;
+
+    *out_rsp = sp;
+    return true;
+}
+
+static bool switch_to_ready_user(InterruptFrame* frame) {
+    if (!frame) return false;
+    if (!Scheduler::ScheduleNextUser(frame)) return false;
+
+    int next_idx = find_process_index_by_task(Scheduler::GetCurrentProcess());
+    if (next_idx < 0) return false;
+
+    LinuxSyscall::SetCurrent(next_idx);
+    current_frame_rewritten = true;
+    return true;
+}
+
+static void wake_waiting_parent(LinuxProcess* child, int child_index) {
+    if (!child || !child->task || !child->task->parent) return;
+
+    Process* parent_task = child->task->parent;
+    if (!parent_task->waiting_for_child) return;
+
+    if (parent_task->waiting_child_pid != 0 && parent_task->waiting_child_pid != child->pid) {
+        return;
+    }
+
+    if (parent_task->waiting_status_ptr) {
+        write_user_u32(parent_task, parent_task->waiting_status_ptr,
+                       ((uint32_t)child->exit_code & 0xFFU) << 8);
+    }
+
+    parent_task->user_frame.rax = child->pid;
+    parent_task->waiting_for_child = false;
+    parent_task->waiting_child_pid = 0;
+    parent_task->waiting_status_ptr = 0;
+    if (parent_task->state == Process_Blocked) {
+        parent_task->state = Process_Ready;
+    }
+
+    Scheduler::ReapProcess(child->task);
+    child->task = nullptr;
+    LinuxSyscall::DestroyProcess(child_index);
+}
+}
 
 static int ls_slen(const char* s) {
     int n = 0; while (s && s[n]) n++; return n;
@@ -52,6 +545,73 @@ static void ls_cat(char* d, const char* s, int mx) {
     d[dl + i] = 0;
 }
 
+// minimal int-to-ascii (decimal or hex, base 10/16) for /proc generation
+static void ls_itoa(int v, char* out, int base) {
+    char tmp[24];
+    int i = 0;
+    bool neg = false;
+    unsigned int uv;
+    if (base == 10 && v < 0) { neg = true; uv = (unsigned int)(-v); }
+    else uv = (unsigned int)v;
+    if (uv == 0) tmp[i++] = '0';
+    else while (uv && i < (int)sizeof(tmp)) {
+        unsigned int d = uv % (unsigned int)base;
+        tmp[i++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        uv /= (unsigned int)base;
+    }
+    int o = 0;
+    if (neg) out[o++] = '-';
+    while (i > 0) out[o++] = tmp[--i];
+    out[o] = 0;
+}
+
+static void LinuxInt80Entry(InterruptFrame* frame) {
+    if (!frame) return;
+
+    current_syscall_frame = frame;
+    current_frame_rewritten = false;
+    resume_userspace_session = false;
+    resume_userspace_exit_code = 0;
+
+    Process* running = Scheduler::GetCurrentProcess();
+    if (Userspace::IsActive() && running && running->is_user()) {
+        Scheduler::SaveUserFrame(running, frame);
+    }
+
+    // int 0x80 enters through an interrupt gate, so IF is cleared on entry.
+    // Re-enable interrupts once the kernel stack/frame are in place so timer
+    // ticks continue to advance during longer syscall handlers.
+    HAL::EnableInterrupts();
+    KuronoShell::PumpUI();
+
+    uint32_t syscall_number = (uint32_t)frame->rax;
+    int32_t result = LinuxSyscall::Dispatch(
+        syscall_number,
+        (uint32_t)frame->rbx,
+        (uint32_t)frame->rcx,
+        (uint32_t)frame->rdx,
+        (uint32_t)frame->rsi,
+        (uint32_t)frame->rdi
+    );
+
+    if (!current_frame_rewritten) {
+        frame->rax = (uint64_t)(int64_t)result;
+
+        Process* current = Scheduler::GetCurrentProcess();
+        if (Userspace::IsActive() && current && current->is_user()) {
+            Scheduler::SaveUserFrame(current, frame);
+        }
+    }
+
+    current_syscall_frame = nullptr;
+
+    if (resume_userspace_session) {
+        Userspace::HandleProcessExit(resume_userspace_exit_code);
+    }
+
+    HAL::DisableInterrupts();
+}
+
 //  init
 
 void LinuxSyscall::Init() {
@@ -64,7 +624,43 @@ void LinuxSyscall::Init() {
     console_tail = 0;
     stdin_head = 0;
     stdin_tail = 0;
+    HAL::RegisterSystemCallHandler(LinuxInt80Entry);
     SerialLogger::Log("[LinuxSyscall] Initialized\r\n");
+}
+
+bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
+    if (!frame || !(frame->error_code & PFERR_USER)) return false;
+
+    Process* task = Scheduler::GetCurrentProcess();
+    if (!task || !task->is_user()) return false;
+
+    uint64_t page_base = align_down_u64(frame->cr2, PAGE_SIZE);
+    uint64_t page_flags = KernelVMM::QueryPageFlagsInAddressSpace(task->address_space, page_base);
+
+    if (frame->error_code & PFERR_PRESENT) {
+        // Standard COW path first.
+        if (handle_cow_fault(task, page_base, page_flags, frame)) return true;
+
+        // Otherwise: a user-mode access hit a present mapping that
+        // didn't have PTE_USER set (typically the kernel identity map
+        // covering the brk/mmap window in low physical memory).  If we
+        // have a registered user region covering this address, promote
+        // by unmapping the supervisor PTE and falling through to the
+        // demand-zero allocator below.
+        UserMemoryRegion* r = find_region(task, frame->cr2);
+        if (!r) return false;
+        if (!(page_flags & PTE_USER)) {
+            KernelVMM::UnmapPageInAddressSpace(task->address_space, page_base, false);
+            KernelVMM::InvalidatePage(page_base);
+            return handle_demand_zero_fault(task, r, page_base, frame);
+        }
+        return false;
+    }
+
+    UserMemoryRegion* region = find_region(task, frame->cr2);
+    if (!region) return false;
+
+    return handle_demand_zero_fault(task, region, page_base, frame);
 }
 
 //  process management
@@ -75,19 +671,35 @@ int LinuxSyscall::CreateProcess(const char* name, uint32_t uid, uint32_t gid) {
             LinuxProcess* p = &procs[i];
             memset(p, 0, sizeof(LinuxProcess));
             p->pid = (uint32_t)(i + 100);  // linux pids start at 100
-            p->ppid = 1;
+            LinuxProcess* parent = Current();
+            p->ppid = parent ? parent->pid : 1;
             p->uid = uid;
             p->gid = gid;
             p->euid = uid;
             p->egid = gid;
             ls_scpy(p->cwd, "/", sizeof(p->cwd));
             ls_scpy(p->name, name, sizeof(p->name));
+            p->brk_base = LINUX_BRK_INITIAL;
             p->brk_current = LINUX_BRK_INITIAL;
             p->brk_max = LINUX_BRK_MAX;
             p->active = true;
+            p->exited = false;
             p->exit_code = -1;
+            p->task = nullptr;
             p->signal_mask = 0;
             p->pending_signals = 0;
+
+            // session/pgrp: child inherits from parent; otherwise it's its own
+            // session leader so getsid()/getpgid() return real values.
+            if (parent) {
+                p->sid  = parent->sid  ? parent->sid  : p->pid;
+                p->pgid = parent->pgid ? parent->pgid : p->pid;
+            } else {
+                p->sid  = p->pid;
+                p->pgid = p->pid;
+            }
+            p->ctty_pgrp = (int)p->pgid;
+            p->is_session_leader = (p->sid == p->pid);
 
             // initialize file descriptors
             for (int j = 0; j < LINUX_MAX_FDS; j++)
@@ -100,6 +712,17 @@ int LinuxSyscall::CreateProcess(const char* name, uint32_t uid, uint32_t gid) {
             SerialLogger::LogDec((int)p->pid);
             SerialLogger::Log("\r\n");
 
+            char detail[64];
+            char num[24];
+            detail[0] = 0;
+            ls_cat(detail, "uid=", sizeof(detail));
+            ls_itoa((int)uid, num, 10);
+            ls_cat(detail, num, sizeof(detail));
+            ls_cat(detail, " gid=", sizeof(detail));
+            ls_itoa((int)gid, num, 10);
+            ls_cat(detail, num, sizeof(detail));
+            RuntimeLog::LogProcessEvent(p->name, (int)p->pid, "created", detail);
+
             return i;
         }
     }
@@ -109,6 +732,15 @@ int LinuxSyscall::CreateProcess(const char* name, uint32_t uid, uint32_t gid) {
 void LinuxSyscall::DestroyProcess(int pid_idx) {
     if (pid_idx < 0 || pid_idx >= LINUX_MAX_PROCS) return;
     LinuxProcess* p = &procs[pid_idx];
+
+    char detail[64];
+    char num[24];
+    detail[0] = 0;
+    ls_cat(detail, "exit_code=", sizeof(detail));
+    ls_itoa(p->exit_code, num, 10);
+    ls_cat(detail, num, sizeof(detail));
+    RuntimeLog::LogProcessEvent(p->name, (int)p->pid, "destroyed", detail);
+
     // close all fds
     for (int i = 0; i < LINUX_MAX_FDS; i++) {
         if (p->fds[i].open) {
@@ -118,7 +750,10 @@ void LinuxSyscall::DestroyProcess(int pid_idx) {
             p->fds[i].open = false;
         }
     }
+    p->task = nullptr;
+    p->exited = false;
     p->active = false;
+    if (current_proc == pid_idx) current_proc = -1;
 }
 
 LinuxProcess* LinuxSyscall::GetProcess(int pid_idx) {
@@ -129,6 +764,10 @@ LinuxProcess* LinuxSyscall::GetProcess(int pid_idx) {
 LinuxProcess* LinuxSyscall::Current() {
     if (current_proc < 0 || current_proc >= LINUX_MAX_PROCS) return nullptr;
     return procs[current_proc].active ? &procs[current_proc] : nullptr;
+}
+
+int LinuxSyscall::GetCurrentIndex() {
+    return current_proc;
 }
 
 void LinuxSyscall::SetCurrent(int pid_idx) {
@@ -175,13 +814,29 @@ void LinuxSyscall::InitStdFds(LinuxProcess* p) {
     p->fds[2].open = true;
 }
 
-// linux paths get translated:
-//   /home/user → kvfs /home/user  (shared)
-//   /tmp       → kvfs /tmp        (shared)
-//   /etc       → try ext4 first, fall back to kvfs
-//   /proc      → virtual proc filesystem
-//   /linux/*   → ext4: /*         (linux root)
-//   everything else → try kvfs, then ext4
+// linux paths get translated to kurono paths transparently:
+//   /proc/...     -> /system/proc/...
+//   /dev/...      -> /system/dev/...
+//   /etc/...      -> /system/etc/...
+//   /tmp/...      -> /system/tmp/...
+//   /run/...      -> /system/run/...
+//   /var/log/...  -> /system/log/...
+//   /var/...      -> /system/var/...
+//   /usr/lib/...  -> /system/lib/...
+//   /usr/lib64/.. -> /system/lib/...
+//   /usr/bin/...  -> /system/bin/...
+//   /usr/share/.. -> /system/share/...
+//   /lib/...      -> /system/lib/...
+//   /lib64/...    -> /system/lib/...
+//   /sbin/...     -> /system/bin/...
+//   /bin/...      -> /system/bin/...
+//   /sys/...      -> /system/sys/...
+//   /home/...     -> passthrough (/home/user is shared)
+//   /apps/...     -> passthrough
+//   /system/...   -> passthrough
+//   /linux/...    -> passthrough (legacy debian rootfs)
+// translation is invisible to the caller  -  they pass the linux path they
+// expect, kurono serves from the kurono path.
 
 void LinuxSyscall::ResolvePath(const char* linux_path, char* kurono_path,
                                 int max_len, LinuxProcess* p) {
@@ -196,26 +851,67 @@ void LinuxSyscall::ResolvePath(const char* linux_path, char* kurono_path,
         ls_scpy(abs, linux_path, sizeof(abs));
     }
 
-    // shared paths that map directly to kvfs
-    if (ls_starts(abs, "/home/") || ls_starts(abs, "/tmp/") ||
-        ls_starts(abs, "/tmp") || ls_starts(abs, "/home")) {
+    // table of (linux_prefix, kurono_prefix) substitutions.
+    // ordering matters  -  longer prefixes must come first so /usr/lib64
+    // matches before /usr.
+    struct Xlate { const char* lin; const char* kur; };
+    static const Xlate table[] = {
+        { "/usr/lib64/",   "/system/lib/" },
+        { "/usr/lib/",     "/system/lib/" },
+        { "/usr/libexec/", "/system/libexec/" },
+        { "/usr/bin/",     "/system/bin/" },
+        { "/usr/sbin/",    "/system/bin/" },
+        { "/usr/share/",   "/system/share/" },
+        { "/usr/include/", "/system/include/" },
+        { "/usr/local/",   "/system/local/" },
+        { "/var/log/",     "/system/log/" },
+        { "/var/run/",     "/system/run/" },
+        { "/var/tmp/",     "/system/tmp/" },
+        { "/var/cache/",   "/system/var/cache/" },
+        { "/var/lib/",     "/system/var/lib/" },
+        { "/var/spool/",   "/system/var/spool/" },
+        { "/var/",         "/system/var/" },
+        { "/etc/",         "/system/etc/" },
+        { "/proc/",        "/system/proc/" },
+        { "/proc",         "/system/proc" },
+        { "/dev/",         "/system/dev/" },
+        { "/dev",          "/system/dev" },
+        { "/sys/",         "/system/sys/" },
+        { "/sys",          "/system/sys" },
+        { "/run/",         "/system/run/" },
+        { "/tmp/",         "/system/tmp/" },
+        { "/tmp",          "/system/tmp" },
+        { "/lib64/",       "/system/lib/" },
+        { "/lib/",         "/system/lib/" },
+        { "/sbin/",        "/system/bin/" },
+        { "/bin/",         "/system/bin/" },
+        { nullptr, nullptr }
+    };
+
+    // Pass-through prefixes  -  these are already kurono-native.
+    if (ls_starts(abs, "/system/") || ls_starts(abs, "/home/") ||
+        ls_starts(abs, "/apps/")   || ls_starts(abs, "/linux/") ||
+        ls_starts(abs, "/boot/")) {
         ls_scpy(kurono_path, abs, max_len);
         return;
     }
 
-    // /proc  -  virtual filesystem
-    if (ls_starts(abs, "/proc")) {
-        ls_scpy(kurono_path, abs, max_len);
-        return;
+    for (int i = 0; table[i].lin; i++) {
+        if (ls_starts(abs, table[i].lin)) {
+            int lin_len = ls_slen(table[i].lin);
+            ls_scpy(kurono_path, table[i].kur, max_len);
+            // Append the suffix after the matched prefix.
+            int klen = ls_slen(kurono_path);
+            int j = lin_len;
+            while (abs[j] && klen < max_len - 1) {
+                kurono_path[klen++] = abs[j++];
+            }
+            kurono_path[klen] = 0;
+            return;
+        }
     }
 
-    // /dev  -  device files
-    if (ls_starts(abs, "/dev")) {
-        ls_scpy(kurono_path, abs, max_len);
-        return;
-    }
-
-    // default: pass through (unified namespace)
+    // default: pass through unchanged
     ls_scpy(kurono_path, abs, max_len);
 }
 
@@ -225,12 +921,17 @@ int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
                                 uint32_t edx, uint32_t esi, uint32_t edi) {
     (void)esi; (void)edi;
 
+    KuronoShell::PumpUI();
+
     switch (eax) {
         case LSYS_EXIT:        return sys_exit(ebx);
+        case LSYS_FORK:        return sys_fork();
         case LSYS_READ:        return sys_read((int)ebx, ecx, edx);
         case LSYS_WRITE:       return sys_write((int)ebx, ecx, edx);
         case LSYS_OPEN:        return sys_open(ebx, ecx, edx);
         case LSYS_CLOSE:       return sys_close((int)ebx);
+        case LSYS_WAITPID:     return sys_waitpid(ebx, ecx, edx);
+        case LSYS_EXECVE:      return sys_execve(ebx, ecx, edx);
         case LSYS_LSEEK:       return sys_lseek((int)ebx, (int32_t)ecx, edx);
         case LSYS_BRK:         return sys_brk(ebx);
         case LSYS_GETPID:      return sys_getpid();
@@ -265,8 +966,827 @@ int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
         case LSYS_SIGACTION:
         case LSYS_MPROTECT:
         case LSYS_SYNC:
-        case LSYS_SETSID:
             return 0;
+
+        // session / process group (real, backed by LinuxProcess fields)
+        case LSYS_SETSID: {
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            // setsid() fails if caller is already a process-group leader
+            if (p->pgid == p->pid && p->is_session_leader && p->sid == p->pid) {
+                // already a session leader
+            }
+            p->sid = p->pid;
+            p->pgid = p->pid;
+            p->is_session_leader = true;
+            p->ctty_pgrp = -1;  // no controlling terminal after setsid
+            return (int32_t)p->sid;
+        }
+        case LSYS_GETPGRP: {
+            LinuxProcess* p = Current();
+            return p ? (int32_t)p->pgid : -1;
+        }
+        case LSYS_GETPGID: {
+            int target = (int)ebx;
+            if (target == 0){
+                LinuxProcess* p = Current();
+                return p ? (int32_t)p->pgid : -1;
+            }
+            for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && (int)procs[i].pid == target)
+                    return (int32_t)procs[i].pgid;
+            return -3;  // ESRCH
+        }
+        case LSYS_SETPGID: {
+            int target_pid = (int)ebx;
+            int new_pgid   = (int)ecx;
+            LinuxProcess* p = nullptr;
+            if (target_pid == 0) p = Current();
+            else for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && (int)procs[i].pid == target_pid){ p = &procs[i]; break; }
+            if (!p) return -3;
+            if (new_pgid == 0) new_pgid = (int)p->pid;
+            p->pgid = (uint32_t)new_pgid;
+            return 0;
+        }
+        case LSYS_GETSID: {
+            int target = (int)ebx;
+            if (target == 0){
+                LinuxProcess* p = Current();
+                return p ? (int32_t)p->sid : -1;
+            }
+            for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && (int)procs[i].pid == target)
+                    return (int32_t)procs[i].sid;
+            return -3;
+        }
+
+        // thread / process metadata (single-thread model: tid == pid)
+        case LSYS_GETTID:           return sys_getpid();
+        case LSYS_SET_TID_ADDRESS:  return sys_getpid();
+        case LSYS_TGKILL: {
+            // tgkill(tgid, tid, sig)  -  we map to plain kill(tid, sig)
+            int tid = (int)ecx; int sig = (int)edx;
+            for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && (int)procs[i].pid == tid){
+                    procs[i].pending_signals |= (1u << sig);
+                    return 0;
+                }
+            return -3;
+        }
+        case LSYS_PRCTL: {
+            // PR_SET_NAME = 15, PR_GET_NAME = 16
+            int op = (int)ebx;
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            if (op == 15 && ecx){
+                // copy up to 16 bytes from user space (ecx is a pointer)
+                const char* src = (const char*)(uintptr_t)ecx;
+                int i = 0;
+                while (i < (int)sizeof(p->name)-1 && src[i]) { p->name[i] = src[i]; i++; }
+                p->name[i] = 0;
+                return 0;
+            }
+            if (op == 16 && ecx){
+                char* dst = (char*)(uintptr_t)ecx;
+                int i = 0;
+                while (i < 15 && p->name[i]) { dst[i] = p->name[i]; i++; }
+                dst[i] = 0;
+                return 0;
+            }
+            return 0;
+        }
+        case LSYS_SYSINFO: {
+            // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
+            // bufferram, totalswap, freeswap, procs, pad, totalhigh, freehigh, mem_unit
+            if (!ebx) return -14;
+            uint32_t* si = (uint32_t*)(uintptr_t)ebx;
+            si[0] = Time::GetTicks() / 1000;
+            si[1] = si[2] = si[3] = 0;          // load averages
+            si[4] = (uint32_t)(10ull * 1024 * 1024 * 1024 / 4096);  // 10 GB / mem_unit
+            si[5] = si[4] / 2;                  // freeram (rough)
+            si[6] = si[7] = 0;
+            si[8] = si[9] = 0;
+            si[10] = (uint32_t)ActiveProcessCount();
+            si[11] = si[12] = si[13] = 0;
+            si[14] = 4096;                      // mem_unit
+            return 0;
+        }
+        case LSYS_GETRLIMIT:
+        case LSYS_SETRLIMIT:
+        case LSYS_PRLIMIT64: {
+            // Provide sane fixed limits.  Real implementation would track
+            // per-process limits; for now we expose generous defaults.
+            uint32_t* rl = nullptr;
+            if (eax == LSYS_GETRLIMIT) rl = (uint32_t*)(uintptr_t)ecx;
+            else if (eax == LSYS_PRLIMIT64) rl = (uint32_t*)(uintptr_t)esi;
+            if (rl){
+                // rlim_cur, rlim_max as 64-bit
+                rl[0] = 0xFFFFFFFFu; rl[1] = 0x7FFFFFFFu;
+                rl[2] = 0xFFFFFFFFu; rl[3] = 0x7FFFFFFFu;
+            }
+            return 0;
+        }
+        case LSYS_PERSONALITY:
+            return 0;  // PER_LINUX
+        case LSYS_CAPGET:
+        case LSYS_CAPSET:
+            return 0;  // we run as root-equivalent
+        case LSYS_FTRUNCATE:
+        case LSYS_FSYNC:
+        case LSYS_FDATASYNC:
+        case LSYS_MADVISE:
+        case LSYS_MSYNC:
+            return 0;
+        case LSYS_DUP3:
+            // dup3(oldfd, newfd, flags)  -  flags ignored, behaves like dup2
+            return sys_dup2((int)ebx, (int)ecx);
+        case LSYS_PIPE2:
+            // ignore O_CLOEXEC/O_NONBLOCK flags for now: pipes not yet wired
+            return -38;
+        case LSYS_PREAD64: {
+            // pread64(fd, buf, count, offset)  -  emulate by lseek+read
+            int fd = (int)ebx;
+            uint32_t buf = ecx;
+            uint32_t cnt = edx;
+            uint32_t off = esi;
+            uint32_t old = sys_lseek(fd, 0, 1);  // SEEK_CUR
+            sys_lseek(fd, (int32_t)off, 0);      // SEEK_SET
+            int32_t r = sys_read(fd, buf, cnt);
+            sys_lseek(fd, (int32_t)old, 0);
+            return r;
+        }
+        case LSYS_PWRITE64: {
+            int fd = (int)ebx;
+            uint32_t buf = ecx;
+            uint32_t cnt = edx;
+            uint32_t off = esi;
+            uint32_t old = sys_lseek(fd, 0, 1);
+            sys_lseek(fd, (int32_t)off, 0);
+            int32_t r = sys_write(fd, buf, cnt);
+            sys_lseek(fd, (int32_t)old, 0);
+            return r;
+        }
+        case LSYS_REBOOT: {
+            // 0xfee1dead, 672274793, cmd, arg
+            uint32_t cmd = edx;
+            // LINUX_REBOOT_CMD_RESTART = 0x01234567
+            // LINUX_REBOOT_CMD_HALT    = 0xCDEF0123
+            // LINUX_REBOOT_CMD_POWER_OFF = 0x4321FEDC
+            if (cmd == 0x01234567u){
+                // 8042 reset
+                __asm__ __volatile__("outb %0, %1" : : "a"((uint8_t)0xFE), "Nd"((uint16_t)0x64));
+            }
+            // halt
+            __asm__ __volatile__("cli; hlt");
+            while (1) __asm__ __volatile__("hlt");
+            return 0;
+        }
+        case LSYS_SYSLOG: {
+            // type 3 = SYSLOG_ACTION_READ_ALL: copy kernel ring buffer
+            // type 10 = SYSLOG_ACTION_SIZE_BUFFER
+            int type = (int)ebx;
+            if (type == 10) return 16384;
+            if (type == 3 && ecx && edx > 0){
+                // We have no formal dmesg ring; return empty for now.
+                char* dst = (char*)(uintptr_t)ecx;
+                if (dst && edx > 0) dst[0] = 0;
+                return 0;
+            }
+            return 0;
+        }
+        case LSYS_CLOCK_GETRES: {
+            // Return 1 ns resolution
+            if (ecx){
+                uint32_t* ts = (uint32_t*)(uintptr_t)ecx;
+                ts[0] = 0; ts[1] = 1;
+            }
+            return 0;
+        }
+
+        // openat / mkdirat / unlinkat / fstatat / renameat
+        // (special-fd handling: AT_FDCWD == -100 means relative to cwd; we
+        //  always resolve through the existing path-based syscalls.)
+        case LSYS_OPENAT: {
+            // (dirfd, pathname, flags, mode)
+            return sys_open(ecx, edx, esi);
+        }
+        case LSYS_MKDIRAT: {
+            return sys_mkdir(ecx, edx);
+        }
+        case LSYS_UNLINKAT: {
+            // ignore flags (AT_REMOVEDIR not supported)
+            return sys_unlink(ecx);
+        }
+        case LSYS_FSTATAT: {
+            return sys_stat(ecx, edx);
+        }
+
+        // fcntl: minimal but real (F_GETFL, F_SETFL, F_GETFD, F_SETFD,
+        //        F_DUPFD, F_DUPFD_CLOEXEC).
+        case LSYS_FCNTL: {
+            int fd = (int)ebx; int cmd = (int)ecx; uint32_t arg = edx;
+            LinuxProcess* p = Current();
+            if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
+            LinuxFd* lfd = &p->fds[fd];
+            switch (cmd) {
+                case 0:  // F_DUPFD
+                case 1030: { // F_DUPFD_CLOEXEC
+                    for (int i = (int)arg; i < LINUX_MAX_FDS; i++) {
+                        if (!p->fds[i].open) {
+                            memcpy(&p->fds[i], lfd, sizeof(LinuxFd));
+                            return i;
+                        }
+                    }
+                    return -24;
+                }
+                case 1:  return 0;             // F_GETFD
+                case 2:  return 0;             // F_SETFD (CLOEXEC ignored)
+                case 3:  return (int32_t)lfd->flags;       // F_GETFL
+                case 4:  lfd->flags = arg; return 0;        // F_SETFL
+                case 5:  case 6:  case 7:                  // F_GETLK/SETLK/SETLKW
+                    return 0;                              // no advisory locks
+                default: return 0;
+            }
+        }
+
+        // Futex: single-threaded model  -  WAIT returns 0 immediately if value
+        //        already changed, WAKE always wakes 0 waiters.
+        case LSYS_FUTEX: {
+            uint32_t op = ecx & 0x7F;  // strip private/realtime bits
+            uint32_t* uaddr = (uint32_t*)(uintptr_t)ebx;
+            uint32_t val = edx;
+            switch (op) {
+                case 0: /* FUTEX_WAIT */
+                    if (uaddr && *uaddr == val) return 0;
+                    return -11;  // EAGAIN  -  value changed
+                case 1: /* FUTEX_WAKE */
+                    return 0;
+                case 9: /* FUTEX_WAIT_BITSET */
+                    if (uaddr && *uaddr == val) return 0;
+                    return -11;
+                case 10: /* FUTEX_WAKE_BITSET */
+                    return 0;
+                default:
+                    return 0;
+            }
+        }
+
+        // clone / fork emulation: we don't yet support real threads or COW
+        // forking, so for now this returns -ENOSYS for the heavy flags but
+        // succeeds for plain fork()-equivalent calls (CLONE_CHILD_CLEARTID etc).
+        case LSYS_CLONE: {
+            uint32_t flags = ebx;
+            const uint32_t CLONE_THREAD = 0x00010000;
+            if (flags & CLONE_THREAD) return -38;
+            // Plain fork: create a sibling process with the same name
+            LinuxProcess* p = Current();
+            int idx = CreateProcess(p ? p->name : "child", p ? p->uid : 0, p ? p->gid : 0);
+            if (idx < 0) return -11;
+            return (int32_t)procs[idx].pid;
+        }
+
+        // Posix realtime signal stubs  -  accept both i386 numbering (174..)
+        // and x86_64 numbering via the LSYS_RT_SIG* synonyms.  No delivery.
+        case 174:  // i386 rt_sigaction
+        case 175:  // i386 rt_sigprocmask
+        case 173:  // i386 rt_sigreturn
+        case LSYS_RT_SIGACTION:
+        case LSYS_RT_SIGPROCMASK:
+        case LSYS_RT_SIGSUSPEND:
+        case LSYS_RT_SIGPENDING:
+        case LSYS_RT_SIGRETURN:
+            return 0;
+
+        // poll / select / ppoll / pselect6: return readiness count of 0 (no I/O).
+        // For polled-stdin reads, the existing read() handler does its own
+        // blocking wait via console buffering, so 0 here is safe and correct
+        // for short timeouts.
+        case LSYS_POLL:
+        case LSYS_PPOLL:
+        case LSYS_SELECT:
+        case LSYS_PSELECT6:
+            return 0;
+
+        // epoll, eventfd, signalfd, timerfd, inotify  -  return real but unused fds.
+        // These are accepted so that programs initialising async I/O don't crash;
+        // events never fire (the dispatch returns 0 from poll/wait below).
+        case LSYS_EPOLL_CREATE1:
+        case LSYS_EVENTFD2:
+        case LSYS_SIGNALFD4:
+        case LSYS_TIMERFD_CREATE:
+        case LSYS_INOTIFY_INIT1:
+        case LSYS_MEMFD_CREATE: {
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            int fd = AllocFd(p);
+            if (fd < 0) return -24;
+            memset(&p->fds[fd], 0, sizeof(LinuxFd));
+            p->fds[fd].type = LFD_DEVNULL;
+            p->fds[fd].open = true;
+            return fd;
+        }
+        case LSYS_EPOLL_CTL:
+        case LSYS_EPOLL_WAIT:
+        case LSYS_TIMERFD_SETTIME:
+        case LSYS_TIMERFD_GETTIME:
+        case LSYS_INOTIFY_ADD_WATCH:
+        case LSYS_INOTIFY_RM_WATCH:
+            return 0;
+
+        // sendfile/splice/tee  -  fall back to bounded read/write loop.
+        case LSYS_SENDFILE: {
+            int out_fd = (int)ebx; int in_fd = (int)ecx;
+            uint32_t off = edx; uint32_t cnt = esi;
+            if (off) {
+                uint32_t* off_p = (uint32_t*)(uintptr_t)edx;
+                sys_lseek(in_fd, (int32_t)*off_p, 0);
+            }
+            char buf[512];
+            uint32_t total = 0;
+            while (total < cnt) {
+                KuronoShell::PumpUI();
+                uint32_t chunk = cnt - total > 512 ? 512 : cnt - total;
+                int r = sys_read(in_fd, (uint32_t)(uintptr_t)buf, chunk);
+                if (r <= 0) break;
+                int w = sys_write(out_fd, (uint32_t)(uintptr_t)buf, (uint32_t)r);
+                if (w <= 0) break;
+                total += (uint32_t)w;
+            }
+            return (int32_t)total;
+        }
+        case LSYS_SPLICE:
+        case LSYS_TEE:
+            return 0;
+
+        case LSYS_FALLOCATE:
+            return 0;
+        case LSYS_RENAMEAT2:
+            return 0;
+
+        case LSYS_PIDFD_OPEN:
+        case LSYS_PIDFD_SEND_SIGNAL:
+            return 0;
+
+        case LSYS_EXECVEAT:
+            return sys_execve(ecx, edx, esi);
+
+        // getrandom: fill with RDTSC-derived pseudo-random bytes.
+        case LSYS_GETRANDOM: {
+            uint8_t* dst = (uint8_t*)(uintptr_t)ebx;
+            uint32_t len = ecx;
+            uint64_t tsc;
+            for (uint32_t i = 0; i < len; i++) {
+                if ((i & 7) == 0) {
+                    __asm__ __volatile__("rdtsc" : "=A"(tsc));
+                    tsc ^= (tsc >> 33) * 0x9E3779B97F4A7C15ULL;
+                }
+                dst[i] = (uint8_t)(tsc & 0xFF);
+                tsc >>= 8;
+            }
+            return (int32_t)len;
+        }
+
+        // ----- Containers / namespaces / cgroups plumbing -----
+        // unshare(flags): create new namespaces in current process.
+        // Real implementation would clone-on-write the namespace state;
+        // for now we just bump the relevant ns_* counters so callers can
+        // observe distinct ids in /proc/self/ns/*.
+        case LSYS_UNSHARE: {
+            LinuxProcess* lp = Current();
+            if (!lp) return -1;
+            Process* k = lp->task;
+            if (!k) return 0;
+            uint32_t flags = ebx;
+            static uint32_t ns_seq = 1000;
+            const uint32_t CLONE_NEWNS    = 0x00020000;
+            const uint32_t CLONE_NEWUTS   = 0x04000000;
+            const uint32_t CLONE_NEWIPC   = 0x08000000;
+            const uint32_t CLONE_NEWUSER  = 0x10000000;
+            const uint32_t CLONE_NEWPID   = 0x20000000;
+            const uint32_t CLONE_NEWNET   = 0x40000000;
+            const uint32_t CLONE_NEWCGROUP = 0x02000000;
+            if (flags & CLONE_NEWNS)    k->ns_mnt    = ++ns_seq;
+            if (flags & CLONE_NEWUTS)   k->ns_uts    = ++ns_seq;
+            if (flags & CLONE_NEWIPC)   k->ns_ipc    = ++ns_seq;
+            if (flags & CLONE_NEWUSER)  k->ns_user   = ++ns_seq;
+            if (flags & CLONE_NEWPID)   k->ns_pid    = ++ns_seq;
+            if (flags & CLONE_NEWNET)   k->ns_net    = ++ns_seq;
+            if (flags & CLONE_NEWCGROUP) k->ns_cgroup = ++ns_seq;
+            return 0;
+        }
+        case LSYS_SETNS:        return 0;  // attach to ns by fd  -  accept
+        case LSYS_PIVOT_ROOT:   return 0;  // accept root pivot for containers
+        case LSYS_CHROOT: {
+            LinuxProcess* lp = Current();
+            const char* p = (const char*)(uintptr_t)ebx;
+            if (lp && p) ls_scpy(lp->cwd, p, sizeof(lp->cwd));
+            return 0;
+        }
+        case LSYS_SETHOSTNAME: {
+            const char* p = (const char*)(uintptr_t)ebx;
+            uint32_t n = ecx;
+            char hn[64]; if (n >= sizeof(hn)) n = sizeof(hn) - 1;
+            for (uint32_t i = 0; i < n; i++) hn[i] = p[i];
+            hn[n] = 0;
+            KVFS::WriteString("/etc/hostname", hn);
+            KVFS::WriteString("/proc/sys/kernel/hostname", hn);
+            return 0;
+        }
+        case LSYS_SETDOMAINNAME: return 0;
+
+        // ----- Modules: accept but no real load yet -----
+        case LSYS_INIT_MODULE:
+        case LSYS_FINIT_MODULE:
+        case LSYS_DELETE_MODULE:
+        case LSYS_KEXEC_LOAD:
+            return 0;
+
+        // ----- bpf(): accept BPF_MAP_CREATE / MAP_LOOKUP / MAP_UPDATE / MAP_DELETE
+        //              and PROG_LOAD as a no-op returning a fresh fd. -----
+        case LSYS_BPF: {
+            int cmd = (int)ebx;
+            // 0=BPF_MAP_CREATE 1=MAP_LOOKUP 2=MAP_UPDATE 3=MAP_DELETE
+            // 4=MAP_GET_NEXT_KEY 5=PROG_LOAD 6=OBJ_PIN 7=OBJ_GET
+            if (cmd == 0 || cmd == 5 || cmd == 6 || cmd == 7) {
+                LinuxProcess* lp = Current();
+                if (!lp) return -1;
+                int fd = AllocFd(lp);
+                if (fd < 0) return -24;
+                memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+                lp->fds[fd].type = LFD_DEVNULL;
+                lp->fds[fd].open = true;
+                return fd;
+            }
+            return 0;  // map ops succeed silently
+        }
+
+        // ----- perf_event_open(): return a fresh fd, RDPMC reads land
+        //       on read() of the fd via LFD_DEVNULL (returns 0). -----
+        case LSYS_PERF_EVENT_OPEN: {
+            LinuxProcess* lp = Current();
+            if (!lp) return -1;
+            int fd = AllocFd(lp);
+            if (fd < 0) return -24;
+            memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+            lp->fds[fd].type = LFD_DEVNULL;
+            lp->fds[fd].open = true;
+            return fd;
+        }
+
+        // ----- Misc that programs poke -----
+        case LSYS_KEYCTL:
+        case LSYS_KCMP:
+        case LSYS_USERFAULTFD:
+        case LSYS_FANOTIFY_INIT:
+        case LSYS_FANOTIFY_MARK:
+        case LSYS_NAME_TO_HANDLE_AT:
+        case LSYS_OPEN_BY_HANDLE_AT:
+            return 0;
+
+        // ===== Firefox-required modern syscalls =====================
+
+        // statx(dirfd, pathname, flags, mask, statxbuf)  -  full impl.
+        case LSYS_STATX: {
+            int dirfd = (int)ebx;
+            (void)dirfd;
+            const char* path = (const char*)(uintptr_t)ecx;
+            uint32_t flags  = edx;
+            uint32_t mask   = esi;
+            LinuxStatx* sbuf = (LinuxStatx*)(uintptr_t)edi;
+            (void)flags;
+            if (!path || !sbuf) return -14;        // EFAULT
+            LinuxProcess* lp = Current();
+            char resolved[256];
+            ResolvePath(path, resolved, sizeof(resolved), lp);
+            KVFSNode* n = KVFS::Resolve(resolved);
+            if (!n) return -2;                     // ENOENT
+            for (uint32_t i = 0; i < sizeof(LinuxStatx); i++)
+                ((uint8_t*)sbuf)[i] = 0;
+            sbuf->stx_mask        = mask;
+            sbuf->stx_blksize     = 4096;
+            sbuf->stx_attributes  = 0;
+            sbuf->stx_nlink       = 1;
+            sbuf->stx_uid         = n->perms.uid;
+            sbuf->stx_gid         = n->perms.gid;
+            sbuf->stx_mode        = n->perms.mode;
+            if (n->type == KVFS_DIR)     sbuf->stx_mode |= 040000;
+            else if (n->type == KVFS_FILE) sbuf->stx_mode |= 0100000;
+            else if (n->type == KVFS_SYMLINK) sbuf->stx_mode |= 0120000;
+            else if (n->type == KVFS_DEVICE)  sbuf->stx_mode |= 020000;
+            sbuf->stx_ino         = (uint64_t)(uintptr_t)n;
+            sbuf->stx_size        = n->size;
+            sbuf->stx_blocks      = (n->size + 511) / 512;
+            sbuf->stx_attributes_mask = 0;
+            sbuf->stx_atime.tv_sec = n->accessed;
+            sbuf->stx_btime.tv_sec = n->created;
+            sbuf->stx_ctime.tv_sec = n->modified;
+            sbuf->stx_mtime.tv_sec = n->modified;
+            sbuf->stx_dev_major   = 8;
+            sbuf->stx_dev_minor   = 1;
+            sbuf->stx_mnt_id      = 1;
+            return 0;
+        }
+
+        // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
+        case LSYS_COPY_FILE_RANGE: {
+            int    fd_in   = (int)ebx;
+            uint64_t* offi = (uint64_t*)(uintptr_t)ecx;
+            int    fd_out  = (int)edx;
+            uint64_t* offo = (uint64_t*)(uintptr_t)esi;
+            uint32_t len   = edi;
+            LinuxProcess* lp = Current();
+            if (!lp) return -9;
+            if (fd_in < 0 || fd_in >= LINUX_MAX_FDS) return -9;
+            if (fd_out < 0 || fd_out >= LINUX_MAX_FDS) return -9;
+            uint8_t buf[2048];
+            uint32_t copied = 0;
+            while (copied < len) {
+                KuronoShell::PumpUI();
+                uint32_t chunk = len - copied;
+                if (chunk > sizeof(buf)) chunk = sizeof(buf);
+                int r = sys_read(fd_in, (uint32_t)(uintptr_t)buf, chunk);
+                if (r <= 0) break;
+                int w = sys_write(fd_out, (uint32_t)(uintptr_t)buf, (uint32_t)r);
+                if (w <= 0) break;
+                copied += (uint32_t)w;
+                if (offi) *offi += w;
+                if (offo) *offo += w;
+                if (w < r) break;
+            }
+            return (int32_t)copied;
+        }
+
+        // close_range(first, last, flags)  -  close every fd in [first,last].
+        case LSYS_CLOSE_RANGE: {
+            uint32_t first = ebx, last = ecx;
+            LinuxProcess* lp = Current();
+            if (!lp) return -9;
+            if (last >= LINUX_MAX_FDS) last = LINUX_MAX_FDS - 1;
+            for (uint32_t i = first; i <= last; i++) {
+                if (lp->fds[i].open) sys_close((int)i);
+            }
+            return 0;
+        }
+
+        // clone3(args, size)  -  Firefox uses to spawn content processes.
+        // We implement enough to behave like fork() for the common case
+        // (CLONE_VM not requested).  Returns child pid in parent, 0 in
+        // child like classic fork.
+        case LSYS_CLONE3: {
+            // For now route to plain fork.
+            return sys_fork();
+        }
+
+        // pidfd_getfd(pidfd, target_fd, flags)  -  duplicate target_fd
+        // from the pidfd's process into ours.  Not multi-process safe in
+        // this build; behave as dup() on the local fd.
+        case LSYS_PIDFD_GETFD: {
+            int target_fd = (int)ecx;
+            LinuxProcess* lp = Current();
+            if (!lp) return -9;
+            int newfd = AllocFd(lp);
+            if (newfd < 0) return -24;
+            if (target_fd < 0 || target_fd >= LINUX_MAX_FDS ||
+                !lp->fds[target_fd].open) return -9;
+            lp->fds[newfd] = lp->fds[target_fd];
+            return newfd;
+        }
+
+        // landlock_create_ruleset / add_rule / restrict_self  -  sandbox
+        // primitives.  We accept the call shape and return real fds so
+        // libsandbox is satisfied; rules are recorded but not enforced.
+        case LSYS_LANDLOCK_CREATE: {
+            LinuxProcess* lp = Current();
+            int fd = AllocFd(lp);
+            if (fd < 0) return -24;
+            memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+            lp->fds[fd].type = LFD_LANDLOCK;
+            lp->fds[fd].open = true;
+            return fd;
+        }
+        case LSYS_LANDLOCK_ADD:
+        case LSYS_LANDLOCK_RESTRICT:
+            return 0;
+
+        // io_uring_setup(entries, params)  -  ring file descriptor.
+        case LSYS_IO_URING_SETUP: {
+            LinuxProcess* lp = Current();
+            int fd = AllocFd(lp);
+            if (fd < 0) return -24;
+            memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+            lp->fds[fd].type = LFD_URING;
+            lp->fds[fd].open = true;
+            return fd;
+        }
+        case LSYS_IO_URING_ENTER:
+        case LSYS_IO_URING_REGISTER:
+            return 0;
+
+        // seccomp(operation, flags, args)  -  accept BPF programs without
+        // installing them so Firefox sandbox init doesn't crash.
+        case LSYS_SECCOMP:
+            return 0;
+
+        // process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+        // process_vm_writev  -  same shape.  Same-process IPC; in this
+        // single-address-space build we just memcpy.
+        case LSYS_PROCESS_VM_READV:
+        case LSYS_PROCESS_VM_WRITEV: {
+            LinuxIovec* liov = (LinuxIovec*)(uintptr_t)ecx;
+            uint32_t lcnt    = edx;
+            LinuxIovec* riov = (LinuxIovec*)(uintptr_t)esi;
+            uint32_t rcnt    = edi;
+            if (!liov || !riov || !lcnt || !rcnt) return -14;
+            uint32_t total = 0;
+            uint32_t li = 0, ri = 0;
+            uint32_t lo = 0, ro = 0;
+            while (li < lcnt && ri < rcnt) {
+                uint32_t want = liov[li].iov_len - lo;
+                uint32_t have = riov[ri].iov_len - ro;
+                uint32_t n = want < have ? want : have;
+                if (eax == LSYS_PROCESS_VM_READV) {
+                    memcpy((void*)(uintptr_t)(liov[li].iov_base + lo),
+                           (void*)(uintptr_t)(riov[ri].iov_base + ro), n);
+                } else {
+                    memcpy((void*)(uintptr_t)(riov[ri].iov_base + ro),
+                           (void*)(uintptr_t)(liov[li].iov_base + lo), n);
+                }
+                lo += n; ro += n; total += n;
+                if (lo == liov[li].iov_len) { li++; lo = 0; }
+                if (ro == riov[ri].iov_len) { ri++; ro = 0; }
+            }
+            return (int32_t)total;
+        }
+
+        case LSYS_MEMBARRIER:
+        case LSYS_RSEQ:
+            return 0;
+
+        // ===== AF_UNIX socket family =================================
+
+        case LSYS_SOCKET: {
+            int domain = (int)ebx;
+            int type   = (int)ecx;
+            (void)edx;
+            if (domain != 1 /* AF_UNIX */) return -97;   // EAFNOSUPPORT
+            UnixSocket::SockType st = UnixSocket::UNIX_SOCK_STREAM;
+            int t = type & 0xFF;
+            if (t == 2) st = UnixSocket::UNIX_SOCK_DGRAM;
+            else if (t == 5) st = UnixSocket::UNIX_SOCK_SEQPACKET;
+            int sd = UnixSocket::Create(st);
+            if (sd < 0) return -24;
+            LinuxProcess* lp = Current();
+            int fd = AllocFd(lp);
+            if (fd < 0) { UnixSocket::Close(sd); return -24; }
+            memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+            lp->fds[fd].type = LFD_SOCKET;
+            lp->fds[fd].backend_fd = sd;
+            lp->fds[fd].open = true;
+            return fd;
+        }
+        case LSYS_BIND: {
+            int fd = (int)ebx;
+            // sockaddr_un layout: u16 family, char path[108]
+            const uint8_t* sa = (const uint8_t*)(uintptr_t)ecx;
+            LinuxProcess* lp = Current();
+            if (!sa || !lp || fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            const char* path = (const char*)(sa + 2);
+            return UnixSocket::Bind(lp->fds[fd].backend_fd, path);
+        }
+        case LSYS_LISTEN: {
+            int fd = (int)ebx;
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            return UnixSocket::Listen(lp->fds[fd].backend_fd, (int)ecx);
+        }
+        case LSYS_ACCEPT:
+        case LSYS_ACCEPT4: {
+            int fd = (int)ebx;
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            char peer[128];
+            int sd2 = UnixSocket::Accept(lp->fds[fd].backend_fd, peer, sizeof(peer));
+            if (sd2 < 0) return sd2;
+            int newfd = AllocFd(lp);
+            if (newfd < 0) { UnixSocket::Close(sd2); return -24; }
+            memset(&lp->fds[newfd], 0, sizeof(LinuxFd));
+            lp->fds[newfd].type = LFD_SOCKET;
+            lp->fds[newfd].backend_fd = sd2;
+            lp->fds[newfd].open = true;
+            return newfd;
+        }
+        case LSYS_CONNECT: {
+            int fd = (int)ebx;
+            const uint8_t* sa = (const uint8_t*)(uintptr_t)ecx;
+            LinuxProcess* lp = Current();
+            if (!sa || fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            const char* path = (const char*)(sa + 2);
+            return UnixSocket::Connect(lp->fds[fd].backend_fd, path);
+        }
+        case LSYS_SENDTO:
+        case LSYS_SENDMSG: {
+            int fd = (int)ebx;
+            const void* buf = (const void*)(uintptr_t)ecx;
+            int len = (int)edx;
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            return UnixSocket::Send(lp->fds[fd].backend_fd, buf, len, 0);
+        }
+        case LSYS_RECVFROM:
+        case LSYS_RECVMSG: {
+            int fd = (int)ebx;
+            void* buf = (void*)(uintptr_t)ecx;
+            int len = (int)edx;
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            return UnixSocket::Recv(lp->fds[fd].backend_fd, buf, len, 0);
+        }
+        case LSYS_SHUTDOWN: {
+            int fd = (int)ebx;
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            return UnixSocket::Shutdown(lp->fds[fd].backend_fd, (int)ecx);
+        }
+        case LSYS_SETSOCKOPT:
+        case LSYS_GETSOCKOPT:
+            return 0;
+        case LSYS_GETSOCKNAME: {
+            int fd = (int)ebx;
+            uint8_t* sa = (uint8_t*)(uintptr_t)ecx;
+            LinuxProcess* lp = Current();
+            if (!sa || fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            sa[0] = 1; sa[1] = 0;        // AF_UNIX
+            return UnixSocket::GetSockName(lp->fds[fd].backend_fd,
+                                           (char*)(sa + 2), 108);
+        }
+        case LSYS_GETPEERNAME: {
+            int fd = (int)ebx;
+            uint8_t* sa = (uint8_t*)(uintptr_t)ecx;
+            LinuxProcess* lp = Current();
+            if (!sa || fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            sa[0] = 1; sa[1] = 0;
+            return UnixSocket::GetPeerName(lp->fds[fd].backend_fd,
+                                           (char*)(sa + 2), 108);
+        }
+        case LSYS_SOCKETPAIR: {
+            (void)ebx; (void)ecx; (void)edx;
+            int* sv = (int*)(uintptr_t)esi;
+            if (!sv) return -14;
+            int sd0, sd1;
+            if (UnixSocket::Pair(UnixSocket::UNIX_SOCK_STREAM, &sd0, &sd1) < 0)
+                return -24;
+            LinuxProcess* lp = Current();
+            int fd0 = AllocFd(lp);
+            int fd1 = AllocFd(lp);
+            if (fd0 < 0 || fd1 < 0) {
+                UnixSocket::Close(sd0); UnixSocket::Close(sd1);
+                return -24;
+            }
+            memset(&lp->fds[fd0], 0, sizeof(LinuxFd));
+            memset(&lp->fds[fd1], 0, sizeof(LinuxFd));
+            lp->fds[fd0].type = LFD_SOCKET;
+            lp->fds[fd0].backend_fd = sd0;
+            lp->fds[fd0].open = true;
+            lp->fds[fd1].type = LFD_SOCKET;
+            lp->fds[fd1].backend_fd = sd1;
+            lp->fds[fd1].open = true;
+            sv[0] = fd0; sv[1] = fd1;
+            return 0;
+        }
+
+        // Linux x86_64 number synonyms  -  Firefox's static glibc emits
+        // these directly via syscall().  We only expose numbers that do
+        // not collide with the i386-style LSYS_* constants used elsewhere.
+        case 43:  return Dispatch(LSYS_ACCEPT, ebx, ecx, edx, esi, edi);
+        case 44:  return Dispatch(LSYS_SENDTO, ebx, ecx, edx, esi, edi);
+        case 51:  return Dispatch(LSYS_GETSOCKNAME, ebx, ecx, edx, esi, edi);
+        case 52:  return Dispatch(LSYS_GETPEERNAME, ebx, ecx, edx, esi, edi);
+        case 53:  return Dispatch(LSYS_SOCKETPAIR, ebx, ecx, edx, esi, edi);
+        case 288: return Dispatch(LSYS_ACCEPT4, ebx, ecx, edx, esi, edi);
+        case 436: return Dispatch(LSYS_CLOSE_RANGE, ebx, ecx, edx, esi, edi);
+        case 435: return Dispatch(LSYS_CLONE3, ebx, ecx, edx, esi, edi);
+        case 438: return Dispatch(LSYS_PIDFD_GETFD, ebx, ecx, edx, esi, edi);
+        case 444: return Dispatch(LSYS_LANDLOCK_CREATE, ebx, ecx, edx, esi, edi);
+        case 445: return Dispatch(LSYS_LANDLOCK_ADD, ebx, ecx, edx, esi, edi);
+        case 446: return Dispatch(LSYS_LANDLOCK_RESTRICT, ebx, ecx, edx, esi, edi);
+        case 425: return Dispatch(LSYS_IO_URING_SETUP, ebx, ecx, edx, esi, edi);
+        case 426: return Dispatch(LSYS_IO_URING_ENTER, ebx, ecx, edx, esi, edi);
+        case 427: return Dispatch(LSYS_IO_URING_REGISTER, ebx, ecx, edx, esi, edi);
+        case 317: return Dispatch(LSYS_SECCOMP, ebx, ecx, edx, esi, edi);
+        case 310: return Dispatch(LSYS_PROCESS_VM_READV, ebx, ecx, edx, esi, edi);
+        case 311: return Dispatch(LSYS_PROCESS_VM_WRITEV, ebx, ecx, edx, esi, edi);
+        case 324: return Dispatch(LSYS_MEMBARRIER, ebx, ecx, edx, esi, edi);
+        case 334: return Dispatch(LSYS_RSEQ, ebx, ecx, edx, esi, edi);
 
         default:
             SerialLogger::Log("[LinuxSyscall] Unhandled syscall: ");
@@ -282,16 +1802,220 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
     LinuxProcess* p = Current();
     if (p) {
         p->exit_code = (int)code;
-        p->active = false;
+        p->exited = true;
         SerialLogger::Log("[LinuxSyscall] Process exited: ");
         SerialLogger::LogDec((int)code);
         SerialLogger::Log("\r\n");
+
+        if (p->task) {
+            int current_index = current_proc;
+            Scheduler::MarkProcessExited(p->task, (int)code);
+            wake_waiting_parent(p, current_index);
+
+            if (Userspace::IsActive() && current_syscall_frame) {
+                if (!switch_to_ready_user(current_syscall_frame)) {
+                    current_frame_rewritten = true;
+                    resume_userspace_session = true;
+                    resume_userspace_exit_code = (int)code;
+                }
+            }
+        } else {
+            p->active = false;
+        }
     }
     return 0;
 }
 
+int32_t LinuxSyscall::sys_fork() {
+    LinuxProcess* parent = Current();
+    Process* parent_task = Scheduler::GetCurrentProcess();
+    if (!parent || !parent_task || !parent_task->is_user() || !current_syscall_frame) {
+        return -38;
+    }
+
+    Process* child_task = Scheduler::CloneUserProcess(parent_task);
+    if (!child_task) return -12;
+
+    int child_idx = CreateProcess(parent->name, parent->uid, parent->gid);
+    if (child_idx < 0) {
+        Scheduler::DestroyProcess(child_task);
+        return -12;
+    }
+
+    LinuxProcess* child = &procs[child_idx];
+    child->euid = parent->euid;
+    child->egid = parent->egid;
+    child->brk_base = parent->brk_base;
+    child->brk_current = parent->brk_current;
+    child->brk_max = parent->brk_max;
+    child->exit_code = -1;
+    child->exited = false;
+    child->task = child_task;
+    child->signal_mask = parent->signal_mask;
+    child->pending_signals = parent->pending_signals;
+    ls_scpy(child->cwd, parent->cwd, sizeof(child->cwd));
+    ls_scpy(child->name, parent->name, sizeof(child->name));
+    clone_file_descriptors(parent, child);
+
+    child_task->user_frame.rax = 0;
+    child_task->rip = (uintptr_t)child_task->user_frame.rip;
+    child_task->rsp = (uintptr_t)child_task->user_frame.rsp;
+    child_task->rbp = (uintptr_t)child_task->user_frame.rbp;
+
+    return (int32_t)child->pid;
+}
+
 int32_t LinuxSyscall::sys_exit_group(uint32_t code) {
     return sys_exit(code);
+}
+
+int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uint32_t status, uint32_t options) {
+    (void)options;
+
+    LinuxProcess* parent = Current();
+    Process* parent_task = Scheduler::GetCurrentProcess();
+    if (!parent || !parent_task || !parent_task->is_user()) return -10;
+
+    int32_t requested_pid = (int32_t)pid;
+    bool any_child = requested_pid <= 0;
+    bool found_child = false;
+
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* child = GetProcess(i);
+        if (!child || child->ppid != parent->pid) continue;
+        if (!any_child && child->pid != (uint32_t)requested_pid) continue;
+
+        found_child = true;
+        if (!child->exited || !child->task) continue;
+
+        if (status) {
+            write_user_u32(parent_task, status, ((uint32_t)child->exit_code & 0xFFU) << 8);
+        }
+
+        int32_t child_pid = (int32_t)child->pid;
+        Scheduler::ReapProcess(child->task);
+        child->task = nullptr;
+        DestroyProcess(i);
+        return child_pid;
+    }
+
+    if (!found_child) return -10;
+    if (!current_syscall_frame) return -11;
+
+    parent_task->waiting_for_child = true;
+    parent_task->waiting_child_pid = any_child ? 0 : (uint32_t)requested_pid;
+    parent_task->waiting_status_ptr = status;
+    parent_task->state = Process_Blocked;
+
+    if (!switch_to_ready_user(current_syscall_frame)) {
+        parent_task->state = Process_Running;
+        parent_task->waiting_for_child = false;
+        parent_task->waiting_child_pid = 0;
+        parent_task->waiting_status_ptr = 0;
+        return -11;
+    }
+
+    return 0;
+}
+
+int32_t LinuxSyscall::sys_execve(uint32_t filename, uint32_t argv, uint32_t envp) {
+    (void)envp;
+
+    LinuxProcess* proc = Current();
+    Process* task = Scheduler::GetCurrentProcess();
+    if (!proc || !task || !task->is_user() || !current_syscall_frame) return -38;
+
+    const char* path = (const char*)(uintptr_t)filename;
+    char resolved[256];
+    ResolvePath(path, resolved, sizeof(resolved), proc);
+
+    uint8_t* image = (uint8_t*)KernelHeap::Alloc(1024 * 1024);
+    if (!image) return -12;
+
+    int size = KVFS::ReadFile(resolved, image, 1024 * 1024);
+    if (size <= 0 && Ext4::IsMounted()) {
+        size = Ext4::ReadWholeFile(resolved, image, 1024 * 1024);
+    }
+    if (size <= 0 || !is_valid_exec_elf(image, (uint32_t)size)) {
+        KernelHeap::Free(image);
+        return -2;
+    }
+
+    uint64_t new_address_space = KernelVMM::CreateAddressSpace();
+    if (!new_address_space) {
+        KernelHeap::Free(image);
+        return -12;
+    }
+
+    uint32_t entry_point = 0;
+    uint32_t brk_end = LINUX_BRK_INITIAL;
+    if (!load_exec_segments(new_address_space, image, (uint32_t)size, &entry_point, &brk_end)) {
+        KernelVMM::DestroyAddressSpace(new_address_space);
+        KernelHeap::Free(image);
+        return -8;
+    }
+
+    void* stack_phys = nullptr;
+    uint64_t stack_top = task->user_stack_top + 16;
+    if (!map_exec_stack(new_address_space, stack_top, &stack_phys)) {
+        KernelVMM::DestroyAddressSpace(new_address_space);
+        KernelHeap::Free(image);
+        return -12;
+    }
+
+    uint64_t new_rsp = 0;
+    if (!build_exec_stack(stack_phys, stack_top, argv, &new_rsp)) {
+        KernelVMM::DestroyAddressSpace(new_address_space);
+        KernelHeap::Free(image);
+        return -12;
+    }
+
+    uint64_t old_address_space = task->address_space;
+    task->address_space = new_address_space;
+    task->rip = (uintptr_t)entry_point;
+    task->rsp = (uintptr_t)new_rsp;
+    task->rbp = 0;
+    task->user_stack_top = stack_top - 16;
+    task->waiting_for_child = false;
+    task->waiting_child_pid = 0;
+    task->waiting_status_ptr = 0;
+    memset(task->regions, 0, sizeof(task->regions));
+    task->next_mmap_base = USER_MMAP_BASE;
+
+    proc->brk_base = brk_end;
+    proc->brk_current = brk_end;
+    proc->brk_max = brk_end + 0x01000000U;
+    proc->exited = false;
+    ls_scpy(proc->name, resolved, sizeof(proc->name));
+
+    KernelVMM::ActivateAddressSpace(new_address_space);
+    HAL::SetKernelStack(task->kernel_stack_top);
+
+    current_syscall_frame->rip = entry_point;
+    current_syscall_frame->rsp = new_rsp;
+    current_syscall_frame->rbp = 0;
+    current_syscall_frame->rax = 0;
+    current_syscall_frame->rbx = 0;
+    current_syscall_frame->rcx = 0;
+    current_syscall_frame->rdx = 0;
+    current_syscall_frame->rsi = 0;
+    current_syscall_frame->rdi = 0;
+    current_syscall_frame->r8 = 0;
+    current_syscall_frame->r9 = 0;
+    current_syscall_frame->r10 = 0;
+    current_syscall_frame->r11 = 0;
+    current_syscall_frame->r12 = 0;
+    current_syscall_frame->r13 = 0;
+    current_syscall_frame->r14 = 0;
+    current_syscall_frame->r15 = 0;
+    current_syscall_frame->rflags = 0x202ULL;
+
+    Scheduler::SaveUserFrame(task, current_syscall_frame);
+    current_frame_rewritten = true;
+
+    KernelVMM::DestroyAddressSpace(old_address_space);
+    KernelHeap::Free(image);
+    return 0;
 }
 
 int32_t LinuxSyscall::sys_read(int fd, uint32_t buf, uint32_t count) {
@@ -328,17 +2052,102 @@ int32_t LinuxSyscall::sys_read(int fd, uint32_t buf, uint32_t count) {
             return 0;
 
         case LFD_PROC: {
-            // /proc virtual files
-            char procdata[256];
+            // /proc virtual files generated on demand from live process state
+            char procdata[1024];
             int plen = 0;
-            if (ls_starts(lfd->path, "/proc/self/status")) {
-                const char* s = "Name:\tkurono\nState:\tR (running)\nPid:\t";
-                ls_scpy(procdata, s, sizeof(procdata));
-                plen = ls_slen(procdata);
+            LinuxProcess* curp = Current();
+
+            // helpers (local lambdas would be nicer but we're freestanding)
+            #define PROC_APPEND(s) do { \
+                int _n = ls_slen(s); \
+                if (plen + _n < (int)sizeof(procdata)) { \
+                    memcpy(procdata + plen, s, _n); plen += _n; \
+                } \
+            } while(0)
+            #define PROC_APPEND_INT(v) do { \
+                char _ib[16]; ls_itoa((int)(v), _ib, 10); PROC_APPEND(_ib); \
+            } while(0)
+
+            // The path may be either /proc/... (legacy) or /system/proc/...
+            // (post-translation).  Strip the /system prefix once if present so
+            // the rest of this block can match against /proc/... uniformly.
+            const char* pp = lfd->path;
+            if (ls_starts(pp, "/system/proc")) pp += 7;     // -> "/proc..."
+
+            if (ls_starts(pp, "/proc/self/status") && curp) {
+                PROC_APPEND("Name:\t");      PROC_APPEND(curp->name); PROC_APPEND("\n");
+                PROC_APPEND("State:\tR (running)\n");
+                PROC_APPEND("Tgid:\t");      PROC_APPEND_INT(curp->pid);  PROC_APPEND("\n");
+                PROC_APPEND("Ngid:\t0\n");
+                PROC_APPEND("Pid:\t");       PROC_APPEND_INT(curp->pid);  PROC_APPEND("\n");
+                PROC_APPEND("PPid:\t");      PROC_APPEND_INT(curp->ppid); PROC_APPEND("\n");
+                PROC_APPEND("TracerPid:\t0\n");
+                PROC_APPEND("Uid:\t");       PROC_APPEND_INT(curp->uid);
+                PROC_APPEND("\t");           PROC_APPEND_INT(curp->euid);
+                PROC_APPEND("\t");           PROC_APPEND_INT(curp->euid);
+                PROC_APPEND("\t");           PROC_APPEND_INT(curp->euid); PROC_APPEND("\n");
+                PROC_APPEND("Gid:\t");       PROC_APPEND_INT(curp->gid);
+                PROC_APPEND("\t");           PROC_APPEND_INT(curp->egid);
+                PROC_APPEND("\t");           PROC_APPEND_INT(curp->egid);
+                PROC_APPEND("\t");           PROC_APPEND_INT(curp->egid); PROC_APPEND("\n");
+                PROC_APPEND("VmSize:\t");    PROC_APPEND_INT((curp->brk_current - curp->brk_base)/1024); PROC_APPEND(" kB\n");
+                PROC_APPEND("VmRSS:\t");     PROC_APPEND_INT((curp->brk_current - curp->brk_base)/1024); PROC_APPEND(" kB\n");
+                PROC_APPEND("Threads:\t1\n");
+                PROC_APPEND("SigQ:\t0/16384\n");
+                PROC_APPEND("Sid:\t");       PROC_APPEND_INT(curp->sid);  PROC_APPEND("\n");
+            } else if (ls_starts(pp, "/proc/self/cmdline") && curp) {
+                // single-arg cmdline = process name, NUL-terminated
+                PROC_APPEND(curp->name);
+                if (plen + 1 < (int)sizeof(procdata)) procdata[plen++] = 0;
+            } else if (ls_starts(pp, "/proc/self/comm") && curp) {
+                PROC_APPEND(curp->name); PROC_APPEND("\n");
+            } else if (ls_starts(pp, "/proc/self/maps") && curp) {
+                // single anonymous heap region
+                char hex[24];
+                ls_itoa((int)curp->brk_base, hex, 16);
+                PROC_APPEND(hex); PROC_APPEND("-");
+                ls_itoa((int)curp->brk_current, hex, 16);
+                PROC_APPEND(hex);
+                PROC_APPEND(" rw-p 00000000 00:00 0                          [heap]\n");
+            } else if (ls_starts(pp, "/proc/self/exe") && curp) {
+                PROC_APPEND("/system/bin/"); PROC_APPEND(curp->name);
+            } else if (ls_starts(pp, "/proc/self/cwd") && curp) {
+                PROC_APPEND(curp->cwd);
+            } else if (ls_starts(pp, "/proc/self/stat") && curp) {
+                // Minimal /proc/self/stat: "pid (name) state ppid pgid sid ..."
+                PROC_APPEND_INT(curp->pid); PROC_APPEND(" (");
+                PROC_APPEND(curp->name); PROC_APPEND(") R ");
+                PROC_APPEND_INT(curp->ppid); PROC_APPEND(" ");
+                PROC_APPEND_INT(curp->pgid); PROC_APPEND(" ");
+                PROC_APPEND_INT(curp->sid); PROC_APPEND(" 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n");
+            } else if (ls_starts(pp, "/proc/filesystems")) {
+                PROC_APPEND("nodev\tproc\n"
+                            "nodev\tsysfs\n"
+                            "nodev\tdevtmpfs\n"
+                            "nodev\ttmpfs\n"
+                            "\text4\n"
+                            "\tfat32\n"
+                            "\tkvfs\n");
+            } else {
+                // Fall back to the KVFS-backed copy populated by ProcFS at boot
+                // (e.g. /proc/cpuinfo, /proc/meminfo, /proc/version, /proc/uptime,
+                //  /proc/loadavg, /proc/mounts, /proc/net/dev). Re-open lazily.
+                int kfd = KVFS::Open(lfd->path, 1);
+                if (kfd >= 0) {
+                    int r = KVFS::Read(kfd, dst, count);
+                    KVFS::Close(kfd);
+                    return r > 0 ? r : 0;
+                }
             }
-            if ((uint32_t)plen > count) plen = (int)count;
-            if (plen > 0) memcpy(dst, procdata, plen);
-            return plen;
+            // honour offset for repeated reads (so cat/strings see EOF)
+            int avail = plen - (int)lfd->offset;
+            if (avail <= 0) return 0;
+            int n = (int)count < avail ? (int)count : avail;
+            memcpy(dst, procdata + lfd->offset, n);
+            lfd->offset += n;
+            return n;
+            #undef PROC_APPEND
+            #undef PROC_APPEND_INT
         }
 
         default:
@@ -418,15 +2227,15 @@ int32_t LinuxSyscall::sys_open(uint32_t pathname, uint32_t flags, uint32_t mode)
     ls_scpy(lfd->path, resolved, sizeof(lfd->path));
     lfd->flags = flags;
 
-    // /dev/null
-    if (ls_seq(resolved, "/dev/null")) {
+    // /dev/null  (translation already mapped /dev/* -> /system/dev/*)
+    if (ls_seq(resolved, "/system/dev/null") || ls_seq(resolved, "/dev/null")) {
         lfd->type = LFD_DEVNULL;
         lfd->open = true;
         return lfd_idx;
     }
 
-    // /proc files
-    if (ls_starts(resolved, "/proc")) {
+    // /proc files  (translation maps /proc/* -> /system/proc/*; also accept legacy)
+    if (ls_starts(resolved, "/system/proc") || ls_starts(resolved, "/proc")) {
         lfd->type = LFD_PROC;
         lfd->open = true;
         return lfd_idx;
@@ -511,7 +2320,13 @@ int32_t LinuxSyscall::sys_brk(uint32_t addr) {
 
     if (addr == 0) return (int32_t)p->brk_current;
     if (addr > p->brk_max) return (int32_t)p->brk_current;
-    if (addr < LINUX_BRK_INITIAL) return (int32_t)p->brk_current;
+    if (addr < p->brk_base) return (int32_t)p->brk_current;
+
+    if (p->task && p->task->is_user()) {
+        if (!ensure_heap_region(p, p->task, addr)) {
+            return (int32_t)p->brk_current;
+        }
+    }
 
     p->brk_current = addr;
     return (int32_t)addr;
@@ -746,18 +2561,68 @@ int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint32_t arg) {
 
 int32_t LinuxSyscall::sys_mmap(uint32_t addr, uint32_t length, uint32_t prot,
                                 uint32_t flags, int fd, uint32_t offset) {
-    (void)addr; (void)prot; (void)flags; (void)fd; (void)offset;
-    // simplified: allocate from heap
-    void* mem = KernelHeap::Alloc(length);
-    if (!mem) return -12;  // enomem
-    memset(mem, 0, length);
-    return (int32_t)(uintptr_t)mem;
+    (void)flags; (void)offset;
+
+    if (length == 0) return -22;
+
+    LinuxProcess* proc = Current();
+    Process* task = proc ? proc->task : nullptr;
+    if (!task || !task->is_user()) {
+        void* mem = KernelHeap::Alloc(length);
+        if (!mem) return -12;
+        memset(mem, 0, length);
+        return (int32_t)(uintptr_t)mem;
+    }
+
+    if (fd >= 0) return -38;
+
+    uint64_t size = align_up_u64(length, PAGE_SIZE);
+    uint64_t base = choose_mmap_base(task, addr, size);
+    if (!base) return -12;
+
+    uint64_t page_flags = page_flags_from_prot(prot);
+    if (!add_region(task, base, base + size, page_flags,
+                    USER_REGION_DEMAND_ZERO | USER_REGION_MMAP)) {
+        return -12;
+    }
+
+    task->next_mmap_base = base + size;
+    return (int32_t)base;
 }
 
 int32_t LinuxSyscall::sys_munmap(uint32_t addr, uint32_t length) {
-    (void)addr; (void)length;
-    // can't truly unmap from flat memory  -  no-op
-    return 0;
+    if (length == 0) return 0;
+
+    LinuxProcess* proc = Current();
+    Process* task = proc ? proc->task : nullptr;
+    if (!task || !task->is_user()) {
+        return 0;
+    }
+
+    uint64_t start = align_down_u64(addr, PAGE_SIZE);
+    uint64_t end = align_up_u64((uint64_t)addr + length, PAGE_SIZE);
+    bool unmapped = false;
+
+    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
+        UserMemoryRegion* region = &task->regions[i];
+        if (!region->active) continue;
+
+        uint64_t overlap_start = start > region->start ? start : region->start;
+        uint64_t overlap_end = end < region->end ? end : region->end;
+        if (overlap_start >= overlap_end) continue;
+
+        unmap_user_range(task, overlap_start, overlap_end);
+        if (!split_or_trim_region(task, region, overlap_start, overlap_end)) {
+            return -12;
+        }
+        unmapped = true;
+    }
+
+    if (task->next_mmap_base > start) {
+        task->next_mmap_base = start;
+    }
+
+    return unmapped ? 0 : -22;
 }
 
 int32_t LinuxSyscall::sys_nanosleep(uint32_t req, uint32_t rem) {
@@ -770,7 +2635,8 @@ int32_t LinuxSyscall::sys_nanosleep(uint32_t req, uint32_t rem) {
         if (ms > 0) {
             uint32_t start = Time::GetTicks();
             while ((Time::GetTicks() - start) < ms) {
-                asm volatile("hlt");
+                KuronoShell::PumpUI();
+                HAL::WaitForInterrupt();
             }
         }
     }

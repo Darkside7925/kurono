@@ -4,9 +4,9 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Memory: 512 MB
-megs: 512
+megs: 512 
 
-# BIOS and VGA ROMs
+# BIOS and VGA ROMs 
 romimage: file=/usr/share/seabios/bios.bin
 vgaromimage: file=/usr/share/bochs/VGABIOS-lgpl-latest
 

@@ -5,6 +5,9 @@
 
 #include "../kernel/types.h"
 
+struct InterruptFrame;
+struct Process;
+
 #define LSYS_EXIT            1
 #define LSYS_FORK            2
 #define LSYS_READ            3
@@ -48,6 +51,122 @@
 #define LSYS_SIGACTION       67
 #define LSYS_SETREUID       70
 #define LSYS_SETREGID       71
+#define LSYS_GETPGRP        65
+#define LSYS_SETPGID        57
+#define LSYS_GETPGID       132
+#define LSYS_GETSID        147
+#define LSYS_PRCTL         172
+#define LSYS_GETTID        224
+#define LSYS_TGKILL        234
+#define LSYS_SET_TID_ADDRESS 258
+#define LSYS_SYSINFO       116
+#define LSYS_GETRLIMIT      76
+#define LSYS_SETRLIMIT      75
+#define LSYS_PRLIMIT64     340
+#define LSYS_PERSONALITY   136
+#define LSYS_CAPGET        184
+#define LSYS_CAPSET        185
+#define LSYS_DUP3          330
+#define LSYS_PIPE2         331
+#define LSYS_PREAD64       180
+#define LSYS_PWRITE64      181
+#define LSYS_FTRUNCATE      93
+#define LSYS_FSYNC         118
+#define LSYS_FDATASYNC     148
+#define LSYS_MADVISE       219
+#define LSYS_MSYNC         144
+#define LSYS_REBOOT         88
+#define LSYS_SYSLOG        103
+#define LSYS_CLOCK_GETRES  266
+#define LSYS_FUTEX         240
+#define LSYS_CLONE         120
+#define LSYS_RT_SIGACTION    513   // i386=174, x64=13: dispatcher uses internal ID
+#define LSYS_RT_SIGPROCMASK  514   // i386=175, x64=14
+#define LSYS_RT_SIGRETURN    515   // i386=173, x64=15
+#define LSYS_RT_SIGSUSPEND  130
+#define LSYS_RT_SIGPENDING  127
+#define LSYS_POLL           168
+#define LSYS_PPOLL          271
+#define LSYS_SELECT         142
+#define LSYS_PSELECT6       270
+#define LSYS_EPOLL_CREATE1  329
+#define LSYS_EPOLL_CTL      255
+#define LSYS_EPOLL_WAIT     256
+#define LSYS_EVENTFD2       323
+#define LSYS_SIGNALFD4      327
+#define LSYS_TIMERFD_CREATE 322
+#define LSYS_TIMERFD_SETTIME 325
+#define LSYS_TIMERFD_GETTIME 326
+#define LSYS_INOTIFY_INIT1  332
+#define LSYS_INOTIFY_ADD_WATCH 254
+#define LSYS_INOTIFY_RM_WATCH  253
+#define LSYS_SENDFILE       187
+#define LSYS_SPLICE         313
+#define LSYS_TEE            315
+#define LSYS_MEMFD_CREATE   356
+#define LSYS_PIDFD_OPEN     434
+#define LSYS_PIDFD_SEND_SIGNAL 424
+#define LSYS_EXECVEAT       358
+#define LSYS_FALLOCATE      285
+#define LSYS_RENAMEAT2      316
+#define LSYS_GETRANDOM      355
+#define LSYS_BPF            321
+#define LSYS_PERF_EVENT_OPEN 298
+#define LSYS_UNSHARE        272
+#define LSYS_SETNS          308
+#define LSYS_KEYCTL         250
+#define LSYS_KCMP           312
+#define LSYS_USERFAULTFD    516
+#define LSYS_PIVOT_ROOT     519
+#define LSYS_CHROOT          61
+#define LSYS_SETHOSTNAME     74
+#define LSYS_SETDOMAINNAME  121
+#define LSYS_INIT_MODULE    517
+#define LSYS_DELETE_MODULE  518
+#define LSYS_KEXEC_LOAD     246
+#define LSYS_FANOTIFY_INIT  367
+#define LSYS_FANOTIFY_MARK  368
+#define LSYS_FINIT_MODULE   373
+#define LSYS_NAME_TO_HANDLE_AT 303
+#define LSYS_OPEN_BY_HANDLE_AT 304
+
+// Firefox / modern userspace extras (Kurono-internal IDs to avoid
+// collisions with the i386-style numbers used elsewhere in this header).
+#define LSYS_STATX             542
+#define LSYS_COPY_FILE_RANGE   543
+#define LSYS_CLOSE_RANGE       544
+#define LSYS_CLONE3            545
+#define LSYS_PIDFD_GETFD       546
+#define LSYS_LANDLOCK_CREATE   547
+#define LSYS_LANDLOCK_ADD      548
+#define LSYS_LANDLOCK_RESTRICT 549
+#define LSYS_IO_URING_SETUP    550
+#define LSYS_IO_URING_ENTER    551
+#define LSYS_IO_URING_REGISTER 552
+#define LSYS_SECCOMP           553
+#define LSYS_PROCESS_VM_READV  554
+#define LSYS_PROCESS_VM_WRITEV 555
+#define LSYS_MEMBARRIER        556
+#define LSYS_RSEQ              557
+
+// AF_UNIX socket family  -  internal IDs.  Dispatch also accepts the
+// Linux x86_64 numbers (41..55) where they don't collide.
+#define LSYS_SOCKET            560
+#define LSYS_BIND              561
+#define LSYS_LISTEN            562
+#define LSYS_ACCEPT            563
+#define LSYS_CONNECT           564
+#define LSYS_SENDTO            565
+#define LSYS_RECVFROM          566
+#define LSYS_SENDMSG           567
+#define LSYS_RECVMSG           568
+#define LSYS_SHUTDOWN          569
+#define LSYS_SETSOCKOPT        570
+#define LSYS_GETSOCKOPT        571
+#define LSYS_GETSOCKNAME       572
+#define LSYS_GETPEERNAME       573
+#define LSYS_SOCKETPAIR        574
+#define LSYS_ACCEPT4           575
 #define LSYS_MMAP           90
 #define LSYS_MUNMAP         91
 #define LSYS_FCHMOD         94
@@ -128,7 +247,52 @@ struct LinuxIovec {
     uint32_t iov_len;
 } __attribute__((packed));
 
-#define LINUX_MAX_FDS      64
+// statx() result block  -  Linux 5.x layout.
+struct LinuxStatxTimestamp {
+    int64_t  tv_sec;
+    uint32_t tv_nsec;
+    uint32_t __reserved;
+} __attribute__((packed));
+
+struct LinuxStatx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __spare0[1];
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    LinuxStatxTimestamp stx_atime;
+    LinuxStatxTimestamp stx_btime;
+    LinuxStatxTimestamp stx_ctime;
+    LinuxStatxTimestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint64_t __spare2;
+    uint64_t __spare3[12];
+} __attribute__((packed));
+
+// memfd_create flags + F_ADD_SEALS / F_GET_SEALS for fcntl.
+#define LMFD_CLOEXEC      0x0001
+#define LMFD_ALLOW_SEALING 0x0002
+#define LMFD_HUGETLB      0x0004
+#define LF_ADD_SEALS      1033
+#define LF_GET_SEALS      1034
+#define LF_SEAL_SEAL      0x0001
+#define LF_SEAL_SHRINK    0x0002
+#define LF_SEAL_GROW      0x0004
+#define LF_SEAL_WRITE     0x0008
+#define LF_SEAL_FUTURE_WRITE 0x0010
+
+#define LINUX_MAX_FDS      256
 #define LINUX_FD_STDIN      0
 #define LINUX_FD_STDOUT     1
 #define LINUX_FD_STDERR     2
@@ -144,7 +308,15 @@ enum LinuxFdType {
     LFD_PIPE,
     LFD_DEVNULL,
     LFD_PROC,        // /proc virtual files
+    LFD_SOCKET,      // AF_UNIX socket  -  backend_fd = UnixSocket sd
+    LFD_MEMFD,       // memfd_create  -  backend_fd = kvfs anon file fd
+    LFD_URING,       // io_uring instance  -  backend_fd = ring id (stub)
+    LFD_LANDLOCK,    // landlock ruleset (stub)
+    LFD_FANOTIFY,    // fanotify group (stub)
 };
+
+// memfd seal bits live alongside the LinuxFd so fcntl can interrogate.
+struct LinuxMemfdSeal { uint32_t seals; };
 
 struct LinuxFd {
     LinuxFdType type;
@@ -153,6 +325,7 @@ struct LinuxFd {
     uint32_t flags;
     uint64_t offset;
     bool     open;
+    uint32_t seals;     // memfd seal bits
 };
 
 struct LinuxProcess {
@@ -163,19 +336,28 @@ struct LinuxProcess {
     char     cwd[256];
     char     name[64];
     LinuxFd  fds[LINUX_MAX_FDS];
+    uint32_t brk_base;
     uint32_t brk_current;
     uint32_t brk_max;
     bool     active;
+    bool     exited;
     int      exit_code;
+    Process* task;
 
     // signal state (simplified)
     uint32_t signal_mask;
     uint32_t pending_signals;
+
+    // session / process group / controlling terminal (POSIX session model)
+    uint32_t sid;          // session id (0 = none)
+    uint32_t pgid;         // process group id
+    int      ctty_pgrp;    // foreground process group on the controlling tty
+    bool     is_session_leader;
 };
 
 //  linuxsyscall  -  the syscall handler
 
-#define LINUX_MAX_PROCS  16
+#define LINUX_MAX_PROCS  64
 
 class LinuxSyscall {
 public:
@@ -186,7 +368,9 @@ public:
     static void DestroyProcess(int pid_idx);
     static LinuxProcess* GetProcess(int pid_idx);
     static LinuxProcess* Current();
+    static int  GetCurrentIndex();
     static void SetCurrent(int pid_idx);
+    static bool HandlePageFault(InterruptFrame* frame);
 
     // the main syscall dispatcher
     // called when int 0x80 fires from a linux elf binary
@@ -225,10 +409,13 @@ private:
 
     // individual syscall handlers
     static int32_t sys_exit(uint32_t code);
+    static int32_t sys_fork();
     static int32_t sys_read(int fd, uint32_t buf, uint32_t count);
     static int32_t sys_write(int fd, uint32_t buf, uint32_t count);
     static int32_t sys_open(uint32_t pathname, uint32_t flags, uint32_t mode);
     static int32_t sys_close(int fd);
+    static int32_t sys_waitpid(uint32_t pid, uint32_t status, uint32_t options);
+    static int32_t sys_execve(uint32_t filename, uint32_t argv, uint32_t envp);
     static int32_t sys_lseek(int fd, int32_t offset, uint32_t whence);
     static int32_t sys_brk(uint32_t addr);
     static int32_t sys_getpid();

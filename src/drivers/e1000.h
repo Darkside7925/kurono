@@ -80,6 +80,7 @@
 #define E1000_NUM_RX_DESC  32
 #define E1000_NUM_TX_DESC  32
 #define E1000_RX_BUFFER_SIZE  2048
+#define E1000_TX_BUFFER_SIZE  2048
 
 // rx descriptor (legacy format)
 struct E1000_RXDesc {
@@ -138,6 +139,7 @@ private:
     static E1000_RXDesc rx_descs[E1000_NUM_RX_DESC] __attribute__((aligned(16)));
     static E1000_TXDesc tx_descs[E1000_NUM_TX_DESC] __attribute__((aligned(16)));
     static uint8_t rx_buffers[E1000_NUM_RX_DESC][E1000_RX_BUFFER_SIZE] __attribute__((aligned(16)));
+    static uint8_t tx_buffers[E1000_NUM_TX_DESC][E1000_TX_BUFFER_SIZE] __attribute__((aligned(16)));
     
     static uint16_t rx_cur;        // current rx descriptor index
     static uint16_t tx_cur;        // current tx descriptor index

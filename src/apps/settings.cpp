@@ -11,18 +11,23 @@
 #include "../drivers/amd_gpu.h"
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
+#include "../drivers/keyboard.h"
 #include "../ui/gui.h"
 #include "../ui/desktop.h"
 #include "../linux/linux_drivers.h"
 #include "../net/network.h"
+#include "../net/tcpip.h"
 #include "../security/supr.h"
 #include "../packages/pkgmgr.h"
 #include "../kernel/heap.h"
 #include "../system/logging.h"
+#include "../system/user_mgmt.h"
+#include "../system/ui_config.h"
+#include "../system/gpu_driver_installer.h"
 #include "../virt/hypervisor.h"
 #include "media_player.h"
 #include "browser.h"
-#include "conduit.h"
+#include "file_manager.h"
 
 static const unsigned int S_BG       = 0xFF1A1A2E;
 static const unsigned int S_SIDEBAR  = 0xFF16213E;
@@ -37,7 +42,8 @@ static const unsigned int S_SLIDER_BG  = 0xFF333355;
 static const unsigned int S_SLIDER_FG  = 0xFF00D2FF;
 static const unsigned int S_BORDER   = 0xFF333355;
 static const unsigned int S_WHITE    = 0xFFFFFFFF;
-static const unsigned int S_ACCENT   = 0xFF533483;
+static unsigned int s_accent() { return UIConfig::Color("theme.accent", 0xFF3498DB); }
+#define S_ACCENT s_accent()
 
 static const int SIDEBAR_W = 130;
 
@@ -190,10 +196,19 @@ SettingsState SettingsApp::state = {
     /* icon_size */ 1, /* transparency */ true,
     /* auto_update */ true, /* update_status */ 0, /* update_progress */ 0,
     /* last_check_mins */ 42,
-    /* linux_guest_enabled */ true, /* linux_guest_profile */ 0
+    /* linux_guest_enabled */ true, /* linux_guest_profile */ 0,
+    /* vsync */ true, /* adaptive_sync */ true,
+    /* a11y_high_contrast */ false, /* a11y_reduced_motion */ false,
+    /* a11y_sticky_keys */ false, /* a11y_slow_keys */ false,
+    /* a11y_bounce_keys */ false, /* a11y_screen_reader */ false,
+    /* a11y_color_filter */ 0
 };
 
 int SettingsApp::pending_resolution_idx = -1;
+bool SettingsApp::wifi_dialog_open      = false;
+char SettingsApp::wifi_dialog_ssid[64]  = {0};
+char SettingsApp::wifi_dialog_pass[64]  = {0};
+int  SettingsApp::wifi_dialog_pass_len  = 0;
 
 // schedule resolution change  -  applied between frames by the main loop
 static void RequestResolution(int idx) {
@@ -247,7 +262,7 @@ static void DoApplyResolution(int idx) {
     // without this, apps with win_id guards think they're still open and refuse to launch
     MediaPlayerApp::win_id = -1;
     KBrowse::win_id = -1;
-    ConduitApp::win_id = -1;
+    FileManagerApp::win_id = -1;
 
     // clear the framebuffer immediately so no stale data shows
     uint8_t* fb = (uint8_t*)DisplayManager::GetFramebuffer();
@@ -281,6 +296,37 @@ void SettingsApp::PollDeferredActions() {
 
 static void ApplyRefreshRate(int hz) {
     if (hz > 0) Graphics::SetTargetFPS((uint32_t)hz);
+}
+
+static const unsigned int kAccentPalette[8] = {
+    0xFF3498DB, 0xFF9B59B6, 0xFF1ABC9C, 0xFFE74C3C,
+    0xFFF39C12, 0xFF2ECC71, 0xFFE91E63, 0xFF00BCD4
+};
+
+// Apply currently-selected accent: persist to ui.conf so taskbar/desktop
+// colours reload, and stash on the active user record.
+static void ApplyAccentSelection() {
+    int idx = SettingsApp::state.accent_color;
+    if (idx < 0 || idx > 7) idx = 0;
+    uint32_t argb = kAccentPalette[idx];
+
+    // 1) live UI: bump start button + general accent in ui.conf
+    UIConfig::SetColor("taskbar.start_btn_bg",    argb,             true);
+    // hover = 88% brightness of accent
+    uint8_t r = (argb >> 16) & 0xFF, g = (argb >> 8) & 0xFF, b = argb & 0xFF;
+    uint32_t hov = 0xFF000000u | ((uint32_t)((r*7)/8)<<16) | ((uint32_t)((g*7)/8)<<8) | (b*7)/8;
+    UIConfig::SetColor("taskbar.start_btn_hover", hov,              false);
+    UIConfig::SetColor("theme.accent",            argb,             false);
+    UIConfig::Save();
+    Taskbar::ReloadFromConfig();
+    Desktop::ReloadFromConfig();
+
+    // 2) persist on user record so login restores it
+    int u = UserManager::GetCurrentUserIndex();
+    if (u >= 0 && u < UserManager::GetUserCount()) {
+        UserManager::users[u].accent_color = argb;
+        UserManager::PersistToDisk();
+    }
 }
 
 static void ApplyWallpaperSelection() {
@@ -319,6 +365,34 @@ void SettingsApp::Init(){
     }
     Mouse::SetSensitivity((uint16_t)state.mouse_sensitivity);
     ApplyWallpaperSelection();
+
+    // hydrate accessibility state from UIConfig and apply at runtime
+    state.a11y_high_contrast   = UIConfig::Int("a11y.high_contrast",   0) != 0;
+    state.a11y_reduced_motion  = UIConfig::Int("compositor.reduced_motion", 0) != 0;
+    state.a11y_sticky_keys     = UIConfig::Int("a11y.sticky_keys",     0) != 0;
+    state.a11y_slow_keys       = UIConfig::Int("a11y.slow_keys",       0) != 0;
+    state.a11y_bounce_keys     = UIConfig::Int("a11y.bounce_keys",     0) != 0;
+    state.a11y_screen_reader   = UIConfig::Int("a11y.screen_reader",   0) != 0;
+    state.a11y_color_filter    = UIConfig::Int("a11y.color_filter",    0);
+    int fs = UIConfig::Int("display.font_scale", state.font_scale);
+    if (fs >= 1 && fs <= 3) state.font_scale = fs;
+    Graphics::SetColorFilter(state.a11y_color_filter);
+    Graphics::SetHighContrast(state.a11y_high_contrast);
+    Keyboard::SetStickyKeys(state.a11y_sticky_keys);
+    Keyboard::SetSlowKeys(state.a11y_slow_keys ? 250 : 0);
+    Keyboard::SetBounceKeys(state.a11y_bounce_keys ? 200 : 0);
+    Keyboard::SetScreenReader(state.a11y_screen_reader);
+
+    // pick up persisted accent for the active user
+    int ui = UserManager::GetCurrentUserIndex();
+    if (ui >= 0 && ui < UserManager::GetUserCount()) {
+        uint32_t cur = UserManager::users[ui].accent_color;
+        if (cur != 0) {
+            for (int i = 0; i < 8; i++) {
+                if (kAccentPalette[i] == cur) { state.accent_color = i; break; }
+            }
+        }
+    }
 }
 
 int SettingsApp::Open(){
@@ -345,16 +419,16 @@ void SettingsApp::RenderSidebar(int x,int y,int w,int h){
     static const char* tabs[] = {
         "Display", "Sound", "Network", "Storage",
         "Power", "Personal", "Security", "Packages",
-        "Updates", "System", "About"
+        "Updates", "System", "About", "Accessibility"
     };
 
     for(int i=0;i<STAB_COUNT;i++){
-        int ty = y + i * 36 + 8;
+        int ty = y + i * 32 + 6;
         if(i==(int)current_tab){
-            Graphics::FillRect(x, ty, SIDEBAR_W-1, 32, S_TAB_SEL);
-            Graphics::FillRect(x, ty, 3, 32, S_HEADING);
+            Graphics::FillRect(x, ty, SIDEBAR_W-1, 28, S_TAB_SEL);
+            Graphics::FillRect(x, ty, 3, 28, S_HEADING);
         }
-        Graphics::DrawString(x+16, ty+8, tabs[i], S_TAB_TXT, 0xFF000000);
+        Graphics::DrawString(x+16, ty+6, tabs[i], S_TAB_TXT, 0xFF000000);
     }
 }
 
@@ -632,6 +706,35 @@ void SettingsApp::RenderNetwork(int x,int y,int w,int h){
         Graphics::DrawString(x+100,ly,"---",S_DIM,0xFF000000);
         Graphics::DrawString(x+w-50,ly,"DOWN",0xFFE74C3C,0xFF000000);
     }
+
+    // ── action bar (slice 3) ──────────────────────────────────────
+    int bar_y = y + 12 + 8*22;
+    Graphics::DrawLine(x+12,bar_y-6,x+w-12,bar_y-6,S_BORDER);
+    bool wifi_on = (WiFi::GetState()!=WIFI_OFF);
+    Graphics::FillRoundedRect(x+12,  bar_y, 80, 24, 6, wifi_on?S_TOGGLE_ON:S_ACCENT);
+    Graphics::DrawString(x+22,  bar_y+8, wifi_on?"Disable":"Enable", S_WHITE, 0xFF000000);
+    Graphics::FillRoundedRect(x+100, bar_y, 80, 24, 6, S_ACCENT);
+    Graphics::DrawString(x+128, bar_y+8, "Scan", S_WHITE, 0xFF000000);
+    Graphics::FillRoundedRect(x+188, bar_y, 100, 24, 6, S_ACCENT);
+    Graphics::DrawString(x+200, bar_y+8, "Connect 1st", S_WHITE, 0xFF000000);
+
+    int n = WiFi::GetNetworkCount();
+    char dbg[40] = "Networks: "; append_int(dbg, n, 40);
+    Graphics::DrawString(x+12, bar_y+34, dbg, S_DIM, 0xFF000000);
+    if(n>0){
+        WiFiNetwork* list = WiFi::GetNetworks();
+        if(list){
+            int row_y = bar_y + 52;
+            int max_show = (n<6)?n:6;
+            for(int i=0;i<max_show;i++){
+                Graphics::DrawString(x+12, row_y, list[i].ssid, S_TEXT, 0xFF000000);
+                char rssi[8]; int_to_str(list[i].signal_strength, rssi, 8);
+                Graphics::DrawString(x+w-80, row_y, rssi, S_DIM, 0xFF000000);
+                Graphics::DrawString(x+w-50, row_y, "dBm", S_DIM, 0xFF000000);
+                row_y += 18;
+            }
+        }
+    }
 }
 
 void SettingsApp::RenderSecurity(int x,int y,int w,int h){
@@ -824,20 +927,94 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
         case STAB_UPDATES:     RenderUpdates(px,cy,pw,ch); break;
         case STAB_SYSTEM:      RenderSystem(px,cy,pw,ch); break;
         case STAB_ABOUT:       RenderAbout(px,cy,pw,ch); break;
+        case STAB_ACCESSIBILITY: RenderAccessibility(px,cy,pw,ch); break;
         default: break;
+    }
+
+    // ── modal: WiFi connect dialog ──
+    if (wifi_dialog_open) {
+        int dw = 360, dh = 180;
+        int dx = cx + (cw - dw) / 2;
+        int dy = cy + (ch - dh) / 2;
+        Graphics::FillRectAlpha(cx, cy, cw, ch, 160, 0xFF000000);
+        Graphics::FillRoundedRect(dx, dy, dw, dh, 10, 0xFF1B1B2E);
+        Graphics::DrawRect(dx, dy, dw, dh, S_HEADING);
+        Graphics::DrawString(dx + 16, dy + 14, "Connect to network", S_HEADING, 0xFF000000);
+        Graphics::DrawString(dx + 16, dy + 44, "SSID:", S_TEXT, 0xFF000000);
+        Graphics::DrawString(dx + 80, dy + 44, wifi_dialog_ssid, S_WHITE, 0xFF000000);
+        Graphics::DrawString(dx + 16, dy + 70, "Password:", S_TEXT, 0xFF000000);
+        Graphics::FillRect(dx + 100, dy + 66, dw - 116, 22, 0xFF111122);
+        Graphics::DrawRect(dx + 100, dy + 66, dw - 116, 22, S_BORDER);
+        char masked[64] = {0};
+        for (int i = 0; i < wifi_dialog_pass_len && i < 62; i++) masked[i] = '*';
+        Graphics::DrawString(dx + 106, dy + 70, masked, S_WHITE, 0xFF000000);
+        // buttons
+        Graphics::FillRoundedRect(dx + 30,         dy + dh - 36, 100, 24, 6, S_TOGGLE_OFF);
+        Graphics::DrawString    (dx + 60,         dy + dh - 28, "Cancel", S_WHITE, 0xFF000000);
+        Graphics::FillRoundedRect(dx + dw - 130,  dy + dh - 36, 100, 24, 6, S_TOGGLE_ON);
+        Graphics::DrawString    (dx + dw - 102,  dy + dh - 28, "Connect", S_WHITE, 0xFF000000);
+        Graphics::DrawString(dx + 16, dy + dh - 60, "Enter password, then press Enter or Connect.", S_DIM, 0xFF000000);
     }
 }
 
 bool SettingsApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
-    (void)key;
+    Window* w = (Window*)win_ptr;
+
+    // ── modal: WiFi connect dialog absorbs all input ──
+    if (wifi_dialog_open) {
+        // dialog rect (centered)
+        int dw = 360, dh = 180;
+        int dx = (w->w - dw) / 2;
+        int dy = (w->h - WM_TITLEBAR_H - dh) / 2;
+        if (clicked) {
+            // Cancel button
+            if (mx >= dx + 30 && mx < dx + 130 && my >= dy + dh - 36 && my < dy + dh - 12) {
+                wifi_dialog_open = false;
+                wifi_dialog_pass_len = 0;
+                wifi_dialog_pass[0] = 0;
+                return true;
+            }
+            // Connect button
+            if (mx >= dx + dw - 130 && mx < dx + dw - 30 && my >= dy + dh - 36 && my < dy + dh - 12) {
+                WiFi::Connect(wifi_dialog_ssid, wifi_dialog_pass);
+                wifi_dialog_open = false;
+                wifi_dialog_pass_len = 0;
+                wifi_dialog_pass[0] = 0;
+                return true;
+            }
+            return true; // swallow other clicks while modal
+        }
+        if (key) {
+            if (key == 27) { // ESC
+                wifi_dialog_open = false;
+                wifi_dialog_pass_len = 0;
+                wifi_dialog_pass[0] = 0;
+            } else if (key == '\n' || key == '\r') {
+                WiFi::Connect(wifi_dialog_ssid, wifi_dialog_pass);
+                wifi_dialog_open = false;
+                wifi_dialog_pass_len = 0;
+                wifi_dialog_pass[0] = 0;
+            } else if (key == '\b' || key == 0x7F) {
+                if (wifi_dialog_pass_len > 0) {
+                    wifi_dialog_pass_len--;
+                    wifi_dialog_pass[wifi_dialog_pass_len] = 0;
+                }
+            } else if (key >= 32 && key < 127 && wifi_dialog_pass_len < 62) {
+                wifi_dialog_pass[wifi_dialog_pass_len++] = key;
+                wifi_dialog_pass[wifi_dialog_pass_len] = 0;
+            }
+            return true;
+        }
+        return true;
+    }
+
     if(!clicked) return false;
 
-    Window* w = (Window*)win_ptr;
     // mx, my are already content-local (0,0 = top-left of content area)
 
     // sidebar tab selection
     if(mx >= 0 && mx < SIDEBAR_W){
-        int tab = (my - 8) / 36;
+        int tab = (my - 6) / 32;
         if(tab>=0 && tab<STAB_COUNT){
             current_tab=(SettingsTab)tab;
             return true;
@@ -866,6 +1043,8 @@ bool SettingsApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return HandleUpdatesInput(rx, ry, pw, ph);
     if (current_tab == STAB_SYSTEM)
         return HandleSystemInput(rx, ry, pw, ph);
+    if (current_tab == STAB_ACCESSIBILITY)
+        return HandleAccessibilityInput(rx, ry, pw, ph);
 
     return false;
 }
@@ -1387,7 +1566,11 @@ bool SettingsApp::HandlePersonalizeInput(int rx,int ry,int pw,int ph){
     if(ry>=ly && ry<ly+20){
         for(int i=0;i<8;i++){
             int cx=140+i*24;
-            if(rx>=cx && rx<cx+20){state.accent_color=i;return true;}
+            if(rx>=cx && rx<cx+20){
+                state.accent_color=i;
+                ApplyAccentSelection();
+                return true;
+            }
         }
     }
     ly+=28;
@@ -1435,9 +1618,8 @@ bool SettingsApp::HandlePersonalizeInput(int rx,int ry,int pw,int ph){
     return false;
 }
 
-//  updates  (fetches from server.satorut.com)
+//  updates  (syncs package metadata from kurono.satorut.com)
 void SettingsApp::RenderUpdates(int x,int y,int w,int h){
-    (void)h;
     int ly=y+12;
     Graphics::DrawString(x+12,ly,"System Updates",S_HEADING,0xFF000000);
     ly+=28;
@@ -1452,7 +1634,7 @@ void SettingsApp::RenderUpdates(int x,int y,int w,int h){
 
     // update server info
     Graphics::DrawString(x+12,ly,"Update Server:",S_TEXT,0xFF000000);
-    Graphics::DrawString(x+140,ly,"server.satorut.com",0xFF3498DB,0xFF000000);
+    Graphics::DrawString(x+140,ly,PackageManager::GetRepositoryHost(),0xFF3498DB,0xFF000000);
     ly+=20;
     Graphics::DrawString(x+12,ly,"Channel:",S_TEXT,0xFF000000);
     Graphics::DrawString(x+140,ly,"stable",S_DIM,0xFF000000);
@@ -1464,92 +1646,178 @@ void SettingsApp::RenderUpdates(int x,int y,int w,int h){
 
     switch(state.update_status){
         case 0: { // idle
-            // check real network status
             NetworkInterface* eth = Network::GetInterface("eth0");
             bool net_up = eth && eth->state == NIC_UP;
             if (!net_up) {
                 Graphics::DrawString(x+12,ly,"Network: Disconnected",0xFFE74C3C,0xFF000000);
                 ly+=20;
-                Graphics::DrawString(x+12,ly,"Connect to a network to check for updates.",S_DIM,0xFF000000);
+                Graphics::DrawString(x+12,ly,"Connect an E1000-backed network to check for updates.",S_DIM,0xFF000000);
             } else {
                 Graphics::DrawString(x+12,ly,"Status: Ready to check",S_DIM,0xFF000000);
                 ly+=20;
-                Graphics::DrawString(x+12,ly,"Network: Connected via eth0",S_TOGGLE_ON,0xFF000000);
+                Graphics::DrawString(x+12,ly,TCPStack::IsUp() ? "Network: TCP/IP stack active on eth0" : "Network: eth0 up, TCP/IP stack unavailable",TCPStack::IsUp()?S_TOGGLE_ON:0xFFE67E22,0xFF000000);
             }
-            ly+=28;
-            // check button
-            Graphics::FillRoundedRect(x+12,ly,140,28,8,S_ACCENT);
-            Graphics::DrawString(x+24,ly+6,"Check for Updates",S_WHITE,0xFF000000);
+            ly+=24;
+            Graphics::DrawString(x+12,ly,PackageManager::GetLastSyncMessage(),S_DIM,0xFF000000);
             break;
         }
         case 1: { // checking
-            Graphics::DrawString(x+12,ly,"Resolving server.satorut.com...",0xFFF39C12,0xFF000000);
+            Graphics::DrawString(x+12,ly,"Syncing kurono.satorut.com...",0xFFF39C12,0xFF000000);
             ly+=20;
-            // animated dots
             Graphics::FillCircle(x+24,ly+4,4,S_HEADING);
             Graphics::FillCircle(x+40,ly+4,4,S_SLIDER_BG);
             Graphics::FillCircle(x+56,ly+4,4,S_SLIDER_BG);
             ly+=20;
-            // check if dns resolution works (real attempt)
-            IPv4Address resolved;
-            bool dns_ok = Network::Resolve("server.satorut.com", &resolved);
-            if (dns_ok && (resolved.bytes[0] != 0)) {
-                // dns resolved  -  but we can't actually http fetch
-                state.update_status = 5; // new state: server unreachable
+            Graphics::DrawString(x+12,ly,"Fetching repository index over HTTP.",S_DIM,0xFF000000);
+            state.update_status = PackageManager::SyncRepository() ? 2 : 5;
+            break;
+        }
+        case 2: { // sync success
+            int pending = PackageManager::GetPendingUpdateCount();
+            if (pending > 0) {
+                Graphics::DrawString(x+12,ly,"Updates are available",S_TOGGLE_ON,0xFF000000);
+                ly+=22;
+                Graphics::DrawString(x+24,ly,"Installed packages with newer versions:",S_DIM,0xFF000000);
+                ly+=16;
+                char pending_buf[64];
+                char pending_num[16];
+                scpy(pending_buf,"Pending updates: ",sizeof(pending_buf));
+                int_to_str(pending,pending_num,sizeof(pending_num));
+                sapp(pending_buf,pending_num,sizeof(pending_buf));
+                Graphics::DrawString(x+24,ly,pending_buf,S_HEADING,0xFF000000);
             } else {
-                state.update_status = 5;
+                Graphics::DrawString(x+12,ly,"System is up to date",S_TOGGLE_ON,0xFF000000);
+                ly+=22;
+                Graphics::DrawString(x+24,ly,"No installed package versions changed on the remote index.",S_DIM,0xFF000000);
             }
+            ly+=28;
+            Graphics::DrawString(x+12,ly,PackageManager::GetLastSyncMessage(),S_DIM,0xFF000000);
             break;
         }
         case 5: { // server unreachable (honest state)
-            Graphics::DrawString(x+12,ly,"Could not reach update server",0xFFE74C3C,0xFF000000);
+            Graphics::DrawString(x+12,ly,"Could not sync the package repository",0xFFE74C3C,0xFF000000);
             ly+=22;
-            Graphics::DrawString(x+24,ly,"DNS resolved, but HTTP not",S_DIM,0xFF000000);
+            Graphics::DrawString(x+24,ly,PackageManager::GetLastSyncMessage(),S_DIM,0xFF000000);
             ly+=16;
-            Graphics::DrawString(x+24,ly,"implemented yet. Updates require",S_DIM,0xFF000000);
+            Graphics::DrawString(x+24,ly,"The updater now performs a real HTTP fetch",S_DIM,0xFF000000);
             ly+=16;
-            Graphics::DrawString(x+24,ly,"an HTTP/TLS stack.",S_DIM,0xFF000000);
+            Graphics::DrawString(x+24,ly,"against kurono.satorut.com and surfaces server errors.",S_DIM,0xFF000000);
             ly+=28;
-            // current version info
             Graphics::FillCircle(x+24,ly+7,8,S_TOGGLE_ON);
             Graphics::DrawString(x+40,ly,"Kurono OS v1.0.0 (installed)",S_TOGGLE_ON,0xFF000000);
-            ly+=28;
-            Graphics::FillRoundedRect(x+12,ly,140,28,8,S_ACCENT);
-            Graphics::DrawString(x+24,ly+6,"Check for Updates",S_WHITE,0xFF000000);
             break;
         }
         default: {
-            // fallback: treat as idle
             state.update_status = 0;
             break;
+        }
+    }
+
+    if (state.update_status != 1) {
+        int btn_y = y + h - 44;
+        Graphics::FillRoundedRect(x+12,btn_y,140,28,8,S_ACCENT);
+        Graphics::DrawString(x+24,btn_y+6,state.update_status == 0 ? "Check for Updates" : "Check Again",S_WHITE,0xFF000000);
+
+        // GPU driver install button (right side)
+        DetectedGPU vendor = GpuDriverInstaller::DetectVendor();
+        if (vendor == DGPU_NVIDIA || vendor == DGPU_AMD) {
+            char dlabel[48]; int dp = 0;
+            const char* p1 = "Install "; while (*p1) dlabel[dp++] = *p1++;
+            const char* p2 = GpuDriverInstaller::VendorName(vendor);
+            while (*p2) dlabel[dp++] = *p2++;
+            const char* p3 = " Drivers"; while (*p3) dlabel[dp++] = *p3++;
+            dlabel[dp] = 0;
+            Graphics::FillRoundedRect(x+164,btn_y,180,28,8,0xFF2ECC71);
+            Graphics::DrawString(x+176,btn_y+6,dlabel,S_WHITE,0xFF000000);
         }
     }
 }
 
 bool SettingsApp::HandleUpdatesInput(int rx,int ry,int pw,int ph){
-    (void)pw;(void)ph;
+    (void)pw;
     int ly=12+28;
-    // auto-update toggle
     if(ry>=ly && ry<ly+20 && rx>=140 && rx<180){state.auto_update=!state.auto_update;return true;}
 
-    // check for updates button (appears in states 0 and 5)
-    if(state.update_status==0 || state.update_status==5){
-        // calculate button position based on state
-        int btn_y;
-        if(state.update_status==0){
-            btn_y = 12+28+32+20+20+28+12+20+28;
-        } else {
-            btn_y = 12+28+32+20+20+28+12+22+16+16+16+28+28;
-        }
+    if(state.update_status!=1){
+        int btn_y = ph - 44;
         if(ry>=btn_y && ry<btn_y+28 && rx>=12 && rx<152){
             state.update_status=1;
             return true;
         }
+        // GPU driver install button  -  auto-detect vendor, target Alpine
+        if(ry>=btn_y && ry<btn_y+28 && rx>=164 && rx<344){
+            DetectedGPU v = GpuDriverInstaller::DetectVendor();
+            if (v == DGPU_NVIDIA || v == DGPU_AMD){
+                char log[2048];
+                GpuDriverInstaller::Setup(DRV_DISTRO_ALPINE, v, log, (int)sizeof(log));
+            }
+            return true;
+        }
     }
     return false;
-}bool SettingsApp::HandleNetworkInput(int rx, int ry, int pw, int ph) {
-    (void)rx; (void)ry; (void)pw; (void)ph;
-    // network tab is read-only  -  shows real hardware status
+}
+
+bool SettingsApp::HandleNetworkInput(int rx, int ry, int pw, int ph) {
+    (void)pw; (void)ph;
+    // top-right "Refresh" hotspot inside heading
+    if(ry>=12 && ry<32 && rx>=pw-60 && rx<pw-10){
+        WiFi::Scan();
+        return true;
+    }
+    // action bar near the bottom of the network panel
+    int bar_y = 12 + 8*22;
+    if(ry>=bar_y && ry<bar_y+24){
+        if(rx>=12 && rx<92){      // Enable / Disable WiFi
+            if(WiFi::GetState()==WIFI_OFF) WiFi::Enable();
+            else                            WiFi::Disable();
+            return true;
+        }
+        if(rx>=100 && rx<180){    // Scan
+            WiFi::Scan();
+            return true;
+        }
+        if(rx>=188 && rx<288){    // Connect to first listed network → open dialog
+            int n = WiFi::GetNetworkCount();
+            if(n>0){
+                WiFiNetwork* list = WiFi::GetNetworks();
+                if(list){
+                    int i = 0;
+                    int j = 0;
+                    while (j < 62 && list[i].ssid[j]) {
+                        wifi_dialog_ssid[j] = list[i].ssid[j];
+                        j++;
+                    }
+                    wifi_dialog_ssid[j] = 0;
+                    wifi_dialog_pass[0] = 0;
+                    wifi_dialog_pass_len = 0;
+                    wifi_dialog_open = true;
+                }
+            }
+            return true;
+        }
+    }
+    // per-row clicks on the visible network list (rows below dbg line)
+    int row_y0 = bar_y + 52;
+    if (ry >= row_y0) {
+        int row = (ry - row_y0) / 18;
+        int n = WiFi::GetNetworkCount();
+        int max_show = (n<6)?n:6;
+        if (row >= 0 && row < max_show) {
+            WiFiNetwork* list = WiFi::GetNetworks();
+            if (list) {
+                int j = 0;
+                while (j < 62 && list[row].ssid[j]) {
+                    wifi_dialog_ssid[j] = list[row].ssid[j];
+                    j++;
+                }
+                wifi_dialog_ssid[j] = 0;
+                wifi_dialog_pass[0] = 0;
+                wifi_dialog_pass_len = 0;
+                wifi_dialog_open = true;
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -1575,3 +1843,118 @@ bool SettingsApp::HandleSystemInput(int rx,int ry,int pw,int ph){
     }
     return false;
 }
+
+// ── accessibility section (slice 3) ────────────────────────────────
+static void persist_a11y(){
+    UIConfig::SetInt("a11y.high_contrast",   SettingsApp::state.a11y_high_contrast?1:0,  false);
+    UIConfig::SetInt("compositor.reduced_motion", SettingsApp::state.a11y_reduced_motion?1:0, false);
+    UIConfig::SetInt("a11y.sticky_keys",      SettingsApp::state.a11y_sticky_keys?1:0,   false);
+    UIConfig::SetInt("a11y.slow_keys",        SettingsApp::state.a11y_slow_keys?1:0,     false);
+    UIConfig::SetInt("a11y.bounce_keys",      SettingsApp::state.a11y_bounce_keys?1:0,   false);
+    UIConfig::SetInt("a11y.screen_reader",    SettingsApp::state.a11y_screen_reader?1:0, false);
+    UIConfig::SetInt("a11y.color_filter",     SettingsApp::state.a11y_color_filter,      false);
+    UIConfig::SetInt("display.font_scale",    SettingsApp::state.font_scale,             false);
+    UIConfig::Save();
+    // apply at runtime
+    Graphics::SetColorFilter(SettingsApp::state.a11y_color_filter);
+    Graphics::SetHighContrast(SettingsApp::state.a11y_high_contrast);
+    Keyboard::SetStickyKeys(SettingsApp::state.a11y_sticky_keys);
+    Keyboard::SetSlowKeys(SettingsApp::state.a11y_slow_keys ? 250 : 0);
+    Keyboard::SetBounceKeys(SettingsApp::state.a11y_bounce_keys ? 200 : 0);
+    Keyboard::SetScreenReader(SettingsApp::state.a11y_screen_reader);
+    WindowManager::ReloadFromConfig();
+    Desktop::ReloadFromConfig();
+    Taskbar::ReloadFromConfig();
+}
+
+void SettingsApp::RenderAccessibility(int x,int y,int w,int h){
+    (void)h;
+    int ly = y+12;
+    Graphics::DrawString(x+12,ly,"Accessibility",S_HEADING,0xFF000000);
+    ly+=28;
+
+    struct Row { const char* label; bool* val; };
+    bool* p_hc  = &state.a11y_high_contrast;
+    bool* p_rm  = &state.a11y_reduced_motion;
+    bool* p_sk  = &state.a11y_sticky_keys;
+    bool* p_sl  = &state.a11y_slow_keys;
+    bool* p_bk  = &state.a11y_bounce_keys;
+    bool* p_sr  = &state.a11y_screen_reader;
+    Row rows[] = {
+        {"High Contrast",   p_hc},
+        {"Reduced Motion",  p_rm},
+        {"Sticky Keys",     p_sk},
+        {"Slow Keys",       p_sl},
+        {"Bounce Keys",     p_bk},
+        {"Screen Reader",   p_sr},
+    };
+    for(int i=0;i<6;i++){
+        Graphics::DrawString(x+12,ly,rows[i].label,S_TEXT,0xFF000000);
+        unsigned int tc = *rows[i].val ? S_TOGGLE_ON : S_TOGGLE_OFF;
+        Graphics::FillRoundedRect(x+200,ly,40,20,10,tc);
+        int kx = *rows[i].val ? (x+200+29) : (x+200+11);
+        Graphics::FillCircle(kx,ly+10,8,S_WHITE);
+        ly += 28;
+    }
+
+    // font scale (Large Text)
+    Graphics::DrawString(x+12,ly,"Text Scale:",S_TEXT,0xFF000000);
+    char fs[8]; int_to_str(state.font_scale,fs,8); sapp(fs,"x",8);
+    Graphics::FillRoundedRect(x+200, ly-2, 20, 20, 4, S_ACCENT);
+    Graphics::DrawString(x+204,ly,"<",S_WHITE,0xFF000000);
+    Graphics::DrawString(x+228,ly,fs,S_WHITE,0xFF000000);
+    Graphics::FillRoundedRect(x+w-50, ly-2, 20, 20, 4, S_ACCENT);
+    Graphics::DrawString(x+w-46,ly,">",S_WHITE,0xFF000000);
+    ly += 30;
+
+    // color blindness filter selector
+    Graphics::DrawString(x+12,ly,"Color Filter:",S_TEXT,0xFF000000);
+    static const char* filters[] = {"Off","Protanopia","Deuteranopia","Tritanopia","Grayscale"};
+    Graphics::FillRoundedRect(x+200, ly-2, 20, 20, 4, S_ACCENT);
+    Graphics::DrawString(x+204,ly,"<",S_WHITE,0xFF000000);
+    Graphics::DrawString(x+228,ly,filters[state.a11y_color_filter],S_WHITE,0xFF000000);
+    Graphics::FillRoundedRect(x+w-50, ly-2, 20, 20, 4, S_ACCENT);
+    Graphics::DrawString(x+w-46,ly,">",S_WHITE,0xFF000000);
+    ly += 30;
+
+    Graphics::DrawLine(x+12,ly,x+w-12,ly,S_BORDER); ly+=10;
+    Graphics::DrawString(x+12,ly,"Reduced motion forces compositor animation off,",S_DIM,0xFF000000); ly+=16;
+    Graphics::DrawString(x+12,ly,"matching compositor.reduced_motion in ui.conf.",S_DIM,0xFF000000); ly+=16;
+    Graphics::DrawString(x+12,ly,"All toggles persist immediately to /etc/kurono/ui.conf.",S_DIM,0xFF000000);
+}
+
+bool SettingsApp::HandleAccessibilityInput(int rx,int ry,int pw,int ph){
+    (void)ph;
+    int ly = 12 + 28;  // first toggle row
+    bool* targets[6] = {
+        &state.a11y_high_contrast,
+        &state.a11y_reduced_motion,
+        &state.a11y_sticky_keys,
+        &state.a11y_slow_keys,
+        &state.a11y_bounce_keys,
+        &state.a11y_screen_reader,
+    };
+    for(int i=0;i<6;i++){
+        if(ry>=ly && ry<ly+20 && rx>=200 && rx<240){
+            *targets[i] = !*targets[i];
+            persist_a11y();
+            return true;
+        }
+        ly += 28;
+    }
+    // font scale
+    if(ry>=ly && ry<ly+20){
+        if(rx>=200 && rx<220){ if(state.font_scale>1) state.font_scale--; persist_a11y(); return true; }
+        if(rx>=pw-50 && rx<pw-30){ if(state.font_scale<3) state.font_scale++; persist_a11y(); return true; }
+    }
+    ly += 30;
+    // color filter
+    if(ry>=ly && ry<ly+20){
+        if(rx>=200 && rx<220){ if(state.a11y_color_filter>0) state.a11y_color_filter--; persist_a11y(); return true; }
+        if(rx>=pw-50 && rx<pw-30){ if(state.a11y_color_filter<4) state.a11y_color_filter++; persist_a11y(); return true; }
+    }
+    return false;
+}
+
+// (network handler defined in-class above)
+

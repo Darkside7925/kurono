@@ -16,10 +16,13 @@
 #define ICON_SPACING_Y    100
 #define ICON_MARGIN_X     24
 #define ICON_MARGIN_Y     20
+#define DESKTOP_ICON_PATH_MAX 128
+
+struct KVFSNode;
 
 struct DesktopIcon {
     char name[32];
-    char path[64];
+    char path[DESKTOP_ICON_PATH_MAX];
     int  x, y;
     int  icon_type;       // 0=file, 1=folder, 2=app, 3=system
     bool selected;
@@ -108,6 +111,7 @@ public:
 
     static void AddIcon(const char* name, const char* path, int icon_type);
     static void ArrangeIcons();
+    static void RefreshFiles();
     static void RemoveIcon(int index);            // delete icon + backing file
     static bool CreateFolderInteractive();        // "new folder n"
     static bool CreateFileInteractive();          // "new file n.txt"
@@ -128,6 +132,14 @@ private:
     static int context_menu_target;         // icon index right-clicked, or -1
     static int new_folder_counter;
     static int new_file_counter;
+    static bool icon_dragging;
+    static bool icon_drag_moved;
+    static int drag_icon;
+    static int drag_offset_x;
+    static int drag_offset_y;
+    static int drag_start_x;
+    static int drag_start_y;
+    static uint32_t last_file_sync_ms;
 
     // runtime-sized copies of the desktop grid constants (driven by uiconfig).
     static int cfg_icon_size;
@@ -155,6 +167,11 @@ private:
     static void RenderIcon(DesktopIcon* icon);
     static void RenderContextMenu();
     static int  IconAt(int mx, int my);
+    static int  FindIconByPath(const char* path);
+    static bool IsDesktopFileIcon(const DesktopIcon* icon);
+    static void AddOrUpdateDesktopFile(KVFSNode* node);
+    static void PlaceIcon(int index);
+    static void ClampIcon(int index);
 };
 
 // combined desktop environment
@@ -175,5 +192,8 @@ public:
     static void LaunchTaskManager();
     static void LaunchBrowser();
     static void LaunchMediaPlayer();
-    static void LaunchConduit();
+
+    // session control
+    static void RequestLogout();
+    static bool ConsumeLogoutRequest();
 };

@@ -6,6 +6,7 @@ public:
     static void Init(int x, int y);
     static void Draw();
     static void Update();
+    static bool Input(int mx, int my, bool clicked, char key);
     static bool IsActive();
     static void SetActive(bool active);
     static void SetPosition(int x, int y);
@@ -19,4 +20,9 @@ private:
     static int active_op; // 0: none, 1: +, 2: -, 3: *, 4: /
     static int stored_val;
     static bool new_entry;
+    static int selected_button;
+    static void ClearAll();
+    static void Backspace();
+    static void ApplyButton(int idx);
+    static int FindButtonForKey(char key);
 };

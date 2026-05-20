@@ -5,8 +5,8 @@
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
 
-ProcessSignalState LinuxSignals::states[16];
-LinuxSignals::AlarmEntry LinuxSignals::alarms[16];
+ProcessSignalState LinuxSignals::states[64];
+LinuxSignals::AlarmEntry LinuxSignals::alarms[64];
 
 void LinuxSignals::SetBit(LinuxSigset* set, int signo) {
     if (signo >= 1 && signo < LSIG_MAX)
@@ -40,7 +40,7 @@ void LinuxSignals::Init() {
 }
 
 void LinuxSignals::InitProcess(int pid_idx) {
-    if (pid_idx < 0 || pid_idx >= 16) return;
+    if (pid_idx < 0 || pid_idx >= 64) return;
     ProcessSignalState* s = &states[pid_idx];
     memset(s, 0, sizeof(ProcessSignalState));
 
@@ -54,7 +54,7 @@ void LinuxSignals::InitProcess(int pid_idx) {
 }
 
 ProcessSignalState* LinuxSignals::GetState(int pid_idx) {
-    if (pid_idx < 0 || pid_idx >= 16) return nullptr;
+    if (pid_idx < 0 || pid_idx >= 64) return nullptr;
     return &states[pid_idx];
 }
 
@@ -80,7 +80,7 @@ int LinuxSignals::TKill(int tid, int signo) {
 }
 
 int LinuxSignals::SendSignal(int pid_idx, int signo, uint32_t sender_pid) {
-    if (pid_idx < 0 || pid_idx >= 16) return -1;
+    if (pid_idx < 0 || pid_idx >= 64) return -1;
     ProcessSignalState* s = &states[pid_idx];
 
     // sigkill and sigstop cannot be caught or ignored
@@ -148,7 +148,7 @@ int LinuxSignals::Sigaction(int pid_idx, int signo,
                              LinuxSigaction* oldact) {
     if (!IsValid(signo)) return -1;
     if (signo == LSIG_KILL || signo == LSIG_STOP) return -1;  // can't change
-    if (pid_idx < 0 || pid_idx >= 16) return -1;
+    if (pid_idx < 0 || pid_idx >= 64) return -1;
 
     ProcessSignalState* s = &states[pid_idx];
 
@@ -164,7 +164,7 @@ int LinuxSignals::Sigaction(int pid_idx, int signo,
 int LinuxSignals::Sigprocmask(int pid_idx, int how,
                                 const LinuxSigset* set,
                                 LinuxSigset* oldset) {
-    if (pid_idx < 0 || pid_idx >= 16) return -1;
+    if (pid_idx < 0 || pid_idx >= 64) return -1;
     ProcessSignalState* s = &states[pid_idx];
 
     if (oldset) {
@@ -193,13 +193,13 @@ int LinuxSignals::Sigprocmask(int pid_idx, int how,
 }
 
 int LinuxSignals::SigPending(int pid_idx, LinuxSigset* set) {
-    if (pid_idx < 0 || pid_idx >= 16 || !set) return -1;
+    if (pid_idx < 0 || pid_idx >= 64 || !set) return -1;
     set->bits = states[pid_idx].pending.bits;
     return 0;
 }
 
 int LinuxSignals::SigSuspend(int pid_idx, const LinuxSigset* mask) {
-    if (pid_idx < 0 || pid_idx >= 16 || !mask) return -1;
+    if (pid_idx < 0 || pid_idx >= 64 || !mask) return -1;
     // temporarily replace signal mask and sleep until a signal arrives
     ProcessSignalState* s = &states[pid_idx];
     LinuxSigset old = s->blocked;
@@ -213,7 +213,7 @@ int LinuxSignals::SigSuspend(int pid_idx, const LinuxSigset* mask) {
 }
 
 bool LinuxSignals::HasPendingSignal(int pid_idx) {
-    if (pid_idx < 0 || pid_idx >= 16) return false;
+    if (pid_idx < 0 || pid_idx >= 64) return false;
     ProcessSignalState* s = &states[pid_idx];
 
     // check if any pending signal is not blocked
@@ -222,7 +222,7 @@ bool LinuxSignals::HasPendingSignal(int pid_idx) {
 }
 
 int LinuxSignals::DeliverPending(int pid_idx) {
-    if (pid_idx < 0 || pid_idx >= 16) return 0;
+    if (pid_idx < 0 || pid_idx >= 64) return 0;
     ProcessSignalState* s = &states[pid_idx];
 
     int signo = DequeueSignal(s);
@@ -274,7 +274,7 @@ int LinuxSignals::DeliverPending(int pid_idx) {
 }
 
 void LinuxSignals::Sigreturn(int pid_idx) {
-    if (pid_idx < 0 || pid_idx >= 16) return;
+    if (pid_idx < 0 || pid_idx >= 64) return;
     ProcessSignalState* s = &states[pid_idx];
     s->in_handler = false;
     s->current_signal = 0;
@@ -285,13 +285,13 @@ void LinuxSignals::Sigreturn(int pid_idx) {
 //  alarm
 
 int LinuxSignals::Alarm(int pid_idx, uint32_t seconds) {
-    if (pid_idx < 0 || pid_idx >= 16) return 0;
+    if (pid_idx < 0 || pid_idx >= 64) return 0;
 
     uint32_t now = Time::GetTicks();
     int remaining = 0;
 
     // cancel existing alarm and get remaining time
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 64; i++) {
         if (alarms[i].active && alarms[i].pid_idx == pid_idx) {
             remaining = (int)((alarms[i].fire_time - now) / 1000);
             if (remaining < 0) remaining = 0;
@@ -303,7 +303,7 @@ int LinuxSignals::Alarm(int pid_idx, uint32_t seconds) {
     if (seconds == 0) return remaining;  // just cancel
 
     // set new alarm
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 64; i++) {
         if (!alarms[i].active) {
             alarms[i].pid_idx = pid_idx;
             alarms[i].fire_time = now + seconds * 1000;
@@ -315,7 +315,7 @@ int LinuxSignals::Alarm(int pid_idx, uint32_t seconds) {
 }
 
 void LinuxSignals::TickAlarms(uint32_t now_ms) {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 64; i++) {
         if (alarms[i].active && now_ms >= alarms[i].fire_time) {
             alarms[i].active = false;
             SendSignal(alarms[i].pid_idx, LSIG_ALRM, 0);
