@@ -559,7 +559,7 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
     ext4_mkdirs("/boot/grub");
     ext4_mkdirs("/apps");
 
-    const char* apps[] = {"terminal","files","calculator","editor","settings","tasks","browser","media","conduit",nullptr};
+    const char* apps[] = {"terminal","files","calculator","editor","settings","tasks","browser","media",nullptr};
     for (int i = 0; apps[i]; i++) {
         char path[128];
         path[0] = 0;
@@ -578,7 +578,6 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
     copy_kvfs_to_ext4("/system/logs/serial.log", "/system/logs/serial.log");
     copy_kvfs_to_ext4("/system/logs/system.log", "/system/logs/system.log");
     copy_kvfs_to_ext4("/system/boot/boot.log", "/system/logs/boot.log");
-    copy_kvfs_to_ext4("/system/kurono/secret.kcl", "/system/kurono/secret.kcl");
     copy_kvfs_to_ext4("/boot/kernel.info", "/boot/kernel.info");
     copy_kvfs_to_ext4("/boot/apps.info", "/boot/apps.info");
     copy_kvfs_to_ext4("/etc/hostname", "/etc/hostname");
@@ -599,7 +598,7 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
         "profile=split-package\n"
         "packages=kernel,apps,modules,assets\n"
         "drivers=nvme,e1000,usb,hda,ac97,nvidia,intel,amd,virtio_gpu\n"
-        "apps=terminal,file_manager,text_editor,settings,task_manager,browser,media_player,conduit\n",
+        "apps=terminal,file_manager,text_editor,settings,task_manager,browser,media_player\n",
         sizeof(manifest));
     Ext4::WriteString("/system/kurono/install.manifest", manifest);
 
@@ -608,7 +607,7 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
         "mode=split\n"
         "boot=efi+grub\n");
     write_pkg_manifest("/system/packages/apps.pkginfo", "apps",
-        "files=/apps/terminal,/apps/files,/apps/calculator,/apps/editor,/apps/settings,/apps/tasks,/apps/browser,/apps/media,/apps/conduit\n");
+        "files=/apps/terminal,/apps/files,/apps/calculator,/apps/editor,/apps/settings,/apps/tasks,/apps/browser,/apps/media\n");
     write_pkg_manifest("/system/packages/modules.pkginfo", "modules",
         "drivers=display,input,storage,network,audio,gpu,linux-bridge,virt\n"
         "storage=nvme,ext4\n");
@@ -618,7 +617,7 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
     Ext4::WriteString("/system/modules/storage.list",
         "nvme\next4\npartition-gpt\npartition-mbr\nfat32-esp-detect\n");
     Ext4::WriteString("/system/assets/assets.list",
-        "logo\nwallpaper\ndenji.mp4\nsecret.kcl\n");
+        "logo\nwallpaper\ndenji.mp4\n");
 
     uint32_t kernel_payload_sz = payload_size(_binary_kurono_installer_kernel_elf_start,
                                               _binary_kurono_installer_kernel_elf_end);

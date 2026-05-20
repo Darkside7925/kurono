@@ -31,6 +31,12 @@ public:
     // allocate a single 4 kb physical frame. returns physical address, or 0 on failure.
     static uint64_t AllocFrame();
 
+    // increment the reference count of an allocated frame.
+    static void RetainFrame(uint64_t phys_addr);
+
+    // inspect the current reference count of a frame.
+    static uint32_t GetFrameRefCount(uint64_t phys_addr);
+
     // free a single 4 kb physical frame.
     static void FreeFrame(uint64_t phys_addr);
 
@@ -61,6 +67,7 @@ private:
     static uint64_t FindFreeFrame();
 
     static uint64_t* bitmap;          // bitmap array (1 bit per frame)
+    static uint16_t* refs;            // reference count per frame
     static uint64_t  bitmap_size;     // number of uint64_t entries in bitmap
     static uint64_t  total_frames;
     static uint64_t  used_frames;

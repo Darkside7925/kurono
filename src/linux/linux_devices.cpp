@@ -7,6 +7,8 @@
 #include "../drivers/graphics.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
+#include "../kernel/heap.h"
+#include "../ui/window_manager.h"
 
 LinuxDevice   LinuxDeviceBridge::devices[LDEV_MAX_DEVICES];
 int           LinuxDeviceBridge::device_count = 0;
@@ -26,12 +28,311 @@ static bool ld_seq(const char* a, const char* b) {
     return *a == 0 && *b == 0;
 }
 
+struct LinuxDisplaySurface {
+    int window_id;
+    uint8_t* pixels;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t bpp;
+    uint32_t size;
+    bool has_content;
+    bool popped_up;
+};
+
+static LinuxDisplaySurface g_linux_display = {};
+static int g_linux_guest_x = 0;
+static int g_linux_guest_y = 0;
+static bool g_linux_guest_pos_valid = false;
+static int g_linux_button_mask = 0;
+static int g_linux_emitted_button_mask = 0;
+
+static uint32_t ld_min_u32(uint32_t a, uint32_t b) {
+    return a < b ? a : b;
+}
+
+static uint32_t ld_bytes_per_pixel(uint32_t bpp) {
+    return bpp == 0 ? 4u : ((bpp + 7) / 8);
+}
+
+static int ld_clamp_int(int value, int min_value, int max_value) {
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static int ld_button_index_to_mask(int button) {
+    static const int masks[] = {0x01, 0x02, 0x04, 0x08, 0x10};
+    if (button < 0 || button >= (int)(sizeof(masks) / sizeof(masks[0]))) return 0;
+    return masks[button];
+}
+
+static bool ld_map_local_to_guest(Window* win, int local_x, int local_y,
+                                  int* guest_x, int* guest_y) {
+    if (!win || !guest_x || !guest_y || g_linux_display.width == 0 ||
+        g_linux_display.height == 0) {
+        return false;
+    }
+
+    int draw_w = win->content_w;
+    int draw_h = win->content_h;
+    if ((uint64_t)g_linux_display.width * (uint64_t)win->content_h >
+        (uint64_t)g_linux_display.height * (uint64_t)win->content_w) {
+        draw_h = (int)(((uint64_t)win->content_w * g_linux_display.height) /
+                       g_linux_display.width);
+    } else {
+        draw_w = (int)(((uint64_t)win->content_h * g_linux_display.width) /
+                       g_linux_display.height);
+    }
+
+    if (draw_w <= 0 || draw_h <= 0) return false;
+
+    int draw_x = (win->content_w - draw_w) / 2;
+    int draw_y = (win->content_h - draw_h) / 2;
+    int rel_x = ld_clamp_int(local_x - draw_x, 0, draw_w - 1);
+    int rel_y = ld_clamp_int(local_y - draw_y, 0, draw_h - 1);
+
+    *guest_x = (int)(((uint64_t)rel_x * g_linux_display.width) / (uint32_t)draw_w);
+    *guest_y = (int)(((uint64_t)rel_y * g_linux_display.height) / (uint32_t)draw_h);
+    if (*guest_x >= (int)g_linux_display.width) *guest_x = (int)g_linux_display.width - 1;
+    if (*guest_y >= (int)g_linux_display.height) *guest_y = (int)g_linux_display.height - 1;
+    return true;
+}
+
+static void ld_write_dec(char*& dst, int& remaining, uint32_t value) {
+    char tmp[16];
+    int len = 0;
+    if (value == 0) {
+        if (remaining > 1) {
+            *dst++ = '0';
+            remaining--;
+        }
+        return;
+    }
+    while (value > 0 && len < 15) {
+        tmp[len++] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    while (len > 0 && remaining > 1) {
+        *dst++ = tmp[--len];
+        remaining--;
+    }
+}
+
+static void ld_update_window_title() {
+    if (g_linux_display.window_id <= 0) return;
+
+    char title[64];
+    char* dst = title;
+    int remaining = (int)sizeof(title);
+    const char* prefix = "Linux Guest ";
+    while (*prefix && remaining > 1) {
+        *dst++ = *prefix++;
+        remaining--;
+    }
+    ld_write_dec(dst, remaining, g_linux_display.width);
+    if (remaining > 1) {
+        *dst++ = 'x';
+        remaining--;
+    }
+    ld_write_dec(dst, remaining, g_linux_display.height);
+    *dst = 0;
+
+    WindowManager::SetTitle(g_linux_display.window_id, title);
+}
+
+static bool ld_resize_surface(uint32_t width, uint32_t height, uint32_t bpp) {
+    if (width == 0 || height == 0) return false;
+
+    uint32_t bytes_per_pixel = ld_bytes_per_pixel(bpp);
+    if (bytes_per_pixel != 4) return false;
+
+    uint32_t pitch = width * bytes_per_pixel;
+    uint64_t size64 = (uint64_t)pitch * height;
+    if (size64 == 0 || size64 > 64ULL * 1024ULL * 1024ULL) return false;
+
+    uint32_t size = (uint32_t)size64;
+    if (g_linux_display.pixels && g_linux_display.width == width &&
+        g_linux_display.height == height && g_linux_display.pitch == pitch &&
+        g_linux_display.bpp == bpp) {
+        return true;
+    }
+
+    uint8_t* new_pixels = (uint8_t*)KernelHeap::Alloc(size);
+    if (!new_pixels) return false;
+    memset(new_pixels, 0, size);
+
+    if (g_linux_display.pixels) {
+        uint32_t rows = ld_min_u32(height, g_linux_display.height);
+        uint32_t row_bytes = ld_min_u32(pitch, g_linux_display.pitch);
+        for (uint32_t row = 0; row < rows; row++) {
+            memcpy(new_pixels + row * pitch,
+                   g_linux_display.pixels + row * g_linux_display.pitch,
+                   row_bytes);
+        }
+        KernelHeap::Free(g_linux_display.pixels);
+    }
+
+    g_linux_display.pixels = new_pixels;
+    g_linux_display.width = width;
+    g_linux_display.height = height;
+    g_linux_display.pitch = pitch;
+    g_linux_display.bpp = bpp;
+    g_linux_display.size = size;
+
+    LinuxDeviceBridge::GetFramebufferInfo()->xres = width;
+    LinuxDeviceBridge::GetFramebufferInfo()->yres = height;
+    LinuxDeviceBridge::GetFramebufferInfo()->xres_virtual = width;
+    LinuxDeviceBridge::GetFramebufferInfo()->yres_virtual = height;
+    LinuxDeviceBridge::GetFramebufferInfo()->bits_per_pixel = bpp;
+    LinuxDeviceBridge::GetFramebufferInfo()->line_length = pitch;
+    LinuxDeviceBridge::GetFramebufferInfo()->smem_len = size;
+
+    ld_update_window_title();
+    return true;
+}
+
+static void ld_render_surface(Window* win, int cx, int cy, int cw, int ch) {
+    (void)win;
+
+    Graphics::FillRect(cx, cy, cw, ch, 0xFF0A0A12);
+
+    if (!g_linux_display.pixels || !g_linux_display.has_content ||
+        g_linux_display.width == 0 || g_linux_display.height == 0 ||
+        g_linux_display.bpp != 32) {
+        Graphics::DrawString(cx + 16, cy + 18, "Linux guest display idle", 0xFFE8E8F0, 0x00000000);
+        Graphics::DrawString(cx + 16, cy + 42, "Waiting for framebuffer updates", 0xFF9090A4, 0x00000000);
+        return;
+    }
+
+    int draw_w = cw;
+    int draw_h = ch;
+    if ((uint64_t)g_linux_display.width * (uint64_t)ch >
+        (uint64_t)g_linux_display.height * (uint64_t)cw) {
+        draw_h = (int)(((uint64_t)cw * g_linux_display.height) / g_linux_display.width);
+    } else {
+        draw_w = (int)(((uint64_t)ch * g_linux_display.width) / g_linux_display.height);
+    }
+
+    if (draw_w <= 0 || draw_h <= 0) return;
+
+    int draw_x = cx + (cw - draw_w) / 2;
+    int draw_y = cy + (ch - draw_h) / 2;
+    Graphics::FillRect(draw_x - 1, draw_y - 1, draw_w + 2, draw_h + 2, 0xFF202034);
+
+    uint8_t* dst = Graphics::GetBackBuffer();
+    if (!dst) dst = Graphics::GetBuffer();
+
+    if (dst && Graphics::GetBpp() == 32 && draw_w == (int)g_linux_display.width &&
+        draw_h == (int)g_linux_display.height) {
+        uint32_t dst_pitch = Graphics::GetPitch();
+        for (uint32_t row = 0; row < g_linux_display.height; row++) {
+            memcpy(dst + (uint32_t)(draw_y + (int)row) * dst_pitch + (uint32_t)draw_x * 4,
+                   g_linux_display.pixels + row * g_linux_display.pitch,
+                   g_linux_display.width * 4);
+        }
+        return;
+    }
+
+    for (int y = 0; y < draw_h; y++) {
+        uint32_t src_y = (uint32_t)(((uint64_t)y * g_linux_display.height) / (uint32_t)draw_h);
+        const uint32_t* src_row = (const uint32_t*)(g_linux_display.pixels + src_y * g_linux_display.pitch);
+        for (int x = 0; x < draw_w; x++) {
+            uint32_t src_x = (uint32_t)(((uint64_t)x * g_linux_display.width) / (uint32_t)draw_w);
+            Graphics::DrawPixel(draw_x + x, draw_y + y, src_row[src_x]);
+        }
+    }
+}
+
+static void ld_input_surface(Window* win, int event, int param1, int param2) {
+    if (event == 2) {
+        LinuxDeviceBridge::QueueKeyEvent(param1, true);
+        LinuxDeviceBridge::QueueKeyEvent(param1, false);
+    } else if (event == 5) {
+        int guest_x = 0;
+        int guest_y = 0;
+        if (!ld_map_local_to_guest(win, param1, param2, &guest_x, &guest_y)) return;
+
+        int dx = 0;
+        int dy = 0;
+        if (g_linux_guest_pos_valid) {
+            dx = guest_x - g_linux_guest_x;
+            dy = guest_y - g_linux_guest_y;
+        }
+
+        g_linux_guest_x = guest_x;
+        g_linux_guest_y = guest_y;
+        g_linux_guest_pos_valid = true;
+
+        if (dx != 0 || dy != 0) {
+            LinuxDeviceBridge::QueueMouseEvent(dx, dy, g_linux_button_mask);
+        }
+    } else if (event == 6) {
+        int mask = ld_button_index_to_mask(param1);
+        if (mask == 0) return;
+
+        if (param2) g_linux_button_mask |= mask;
+        else g_linux_button_mask &= ~mask;
+        LinuxDeviceBridge::QueueMouseEvent(0, 0, g_linux_button_mask);
+    }
+}
+
+static void ld_ensure_window() {
+    Window* win = g_linux_display.window_id > 0
+        ? WindowManager::GetWindow(g_linux_display.window_id)
+        : nullptr;
+    if (win) return;
+
+    if (!g_linux_display.pixels) {
+        if (!ld_resize_surface(LinuxDeviceBridge::GetFramebufferInfo()->xres,
+                               LinuxDeviceBridge::GetFramebufferInfo()->yres,
+                               LinuxDeviceBridge::GetFramebufferInfo()->bits_per_pixel)) {
+            return;
+        }
+    }
+
+    g_linux_display.popped_up = false;
+    int window_w = (int)g_linux_display.width + WM_BORDER_W * 2;
+    int window_h = (int)g_linux_display.height + WM_TITLEBAR_H + WM_BORDER_W;
+    int id = WindowManager::CreateWindow("Linux Guest", -1, -1, window_w, window_h,
+                                         ld_render_surface, ld_input_surface);
+    if (id < 0) return;
+
+    g_linux_display.window_id = id;
+    win = WindowManager::GetWindow(id);
+    if (win) {
+        win->user_data = &g_linux_display;
+        win->bg_color = 0xFF080810;
+    }
+    ld_update_window_title();
+    SerialLogger::Log("[LinuxDevBridge] Linux guest display window created\r\n");
+}
+
+static void ld_present_surface() {
+    ld_ensure_window();
+    if (g_linux_display.window_id > 0) {
+        WindowManager::SetVisible(g_linux_display.window_id, true);
+        WindowManager::MarkDirty(g_linux_display.window_id);
+        if (g_linux_display.has_content && !g_linux_display.popped_up) {
+            WindowManager::BringToFront(g_linux_display.window_id);
+            WindowManager::Focus(g_linux_display.window_id);
+            g_linux_display.popped_up = true;
+        }
+    }
+}
+
 //  init
 
 void LinuxDeviceBridge::Init() {
     memset(devices, 0, sizeof(devices));
     device_count = 0;
     input_head = input_tail = 0;
+    memset(&g_linux_display, 0, sizeof(g_linux_display));
+    g_linux_guest_x = 0;
+    g_linux_guest_y = 0;
+    g_linux_guest_pos_valid = false;
+    g_linux_button_mask = 0;
+    g_linux_emitted_button_mask = 0;
 
     // init framebuffer info
     fb_info.xres = 1024;
@@ -206,6 +507,64 @@ LinuxDevice* LinuxDeviceBridge::GetDevices() { return devices; }
 int LinuxDeviceBridge::GetDeviceCount() { return device_count; }
 LinuxFBInfo* LinuxDeviceBridge::GetFramebufferInfo() { return &fb_info; }
 
+bool LinuxDeviceBridge::BlitFramebufferRect(const void* buf, uint32_t src_pitch,
+                                            uint32_t width, uint32_t height,
+                                            int dst_x, int dst_y) {
+    if (!buf || width == 0 || height == 0) return false;
+
+    uint32_t required_w = width;
+    uint32_t required_h = height;
+    if (dst_x > 0) required_w += (uint32_t)dst_x;
+    if (dst_y > 0) required_h += (uint32_t)dst_y;
+
+    uint32_t target_w = fb_info.xres_virtual;
+    uint32_t target_h = fb_info.yres_virtual;
+    if (required_w > target_w) target_w = required_w;
+    if (required_h > target_h) target_h = required_h;
+
+    if (!ld_resize_surface(target_w, target_h, fb_info.bits_per_pixel) ||
+        !g_linux_display.pixels) {
+        return false;
+    }
+
+    uint32_t bytes_per_pixel = ld_bytes_per_pixel(g_linux_display.bpp);
+    for (uint32_t row = 0; row < height; row++) {
+        int target_y = dst_y + (int)row;
+        if (target_y < 0 || (uint32_t)target_y >= g_linux_display.height) continue;
+
+        int target_x = dst_x;
+        uint32_t copy_pixels = width;
+        uint32_t src_offset_pixels = 0;
+
+        if (target_x < 0) {
+            src_offset_pixels = (uint32_t)(-target_x);
+            if (src_offset_pixels >= copy_pixels) continue;
+            copy_pixels -= src_offset_pixels;
+            target_x = 0;
+        }
+        if ((uint32_t)target_x >= g_linux_display.width) continue;
+        if ((uint32_t)target_x + copy_pixels > g_linux_display.width) {
+            copy_pixels = g_linux_display.width - (uint32_t)target_x;
+        }
+        if (copy_pixels == 0) continue;
+
+        uint8_t* dst_row = g_linux_display.pixels + (uint32_t)target_y * g_linux_display.pitch +
+                           (uint32_t)target_x * bytes_per_pixel;
+        const uint8_t* src_row = (const uint8_t*)buf + row * src_pitch +
+                                 src_offset_pixels * bytes_per_pixel;
+        memcpy(dst_row, src_row, copy_pixels * bytes_per_pixel);
+    }
+
+    g_linux_display.has_content = true;
+    ld_present_surface();
+    return true;
+}
+
+void LinuxDeviceBridge::PresentFramebuffer() {
+    if (!g_linux_display.has_content) return;
+    ld_present_surface();
+}
+
 //  built-in device handlers
 
 int LinuxDeviceBridge::ReadNull(void*, uint32_t, uint32_t) {
@@ -231,8 +590,13 @@ int LinuxDeviceBridge::ReadFB(void* buf, uint32_t offset, uint32_t len) {
     if (offset >= fb_size) return 0;
     if (offset + len > fb_size) len = fb_size - offset;
 
-    uint8_t* fb = (uint8_t*)(uintptr_t)fb_info.smem_start;
-    memcpy(buf, fb + offset, len);
+    if (!ld_resize_surface(fb_info.xres_virtual, fb_info.yres_virtual, fb_info.bits_per_pixel) ||
+        !g_linux_display.pixels) {
+        memset(buf, 0, len);
+        return (int)len;
+    }
+
+    memcpy(buf, g_linux_display.pixels + offset, len);
     return (int)len;
 }
 
@@ -241,8 +605,14 @@ int LinuxDeviceBridge::WriteFB(const void* buf, uint32_t offset, uint32_t len) {
     if (offset >= fb_size) return 0;
     if (offset + len > fb_size) len = fb_size - offset;
 
-    uint8_t* fb = (uint8_t*)(uintptr_t)fb_info.smem_start;
-    memcpy(fb + offset, buf, len);
+    if (!ld_resize_surface(fb_info.xres_virtual, fb_info.yres_virtual, fb_info.bits_per_pixel) ||
+        !g_linux_display.pixels) {
+        return -1;
+    }
+
+    memcpy(g_linux_display.pixels + offset, buf, len);
+    g_linux_display.has_content = true;
+    ld_present_surface();
     return (int)len;
 }
 
@@ -277,38 +647,45 @@ int LinuxDeviceBridge::IoctlTTY(uint32_t cmd, uint32_t arg) {
 //  input events
 
 void LinuxDeviceBridge::QueueMouseEvent(int dx, int dy, int buttons) {
-    int next = (input_head + 1) % 64;
-    if (next == input_tail) return;  // full
+    auto enqueue = [&](uint16_t type, uint16_t code, int32_t value) -> bool {
+        int next = (input_head + 1) % 64;
+        if (next == input_tail) return false;
 
-    LinuxInputEvent* ev = &input_queue[input_head];
-    ev->tv_sec = LinuxKernel::GetUptime();
-    ev->tv_usec = 0;
-    ev->type = EV_REL;
-    ev->code = 0;  // rel_x
-    ev->value = dx;
-    input_head = next;
-
-    next = (input_head + 1) % 64;
-    if (next != input_tail) {
-        ev = &input_queue[input_head];
+        LinuxInputEvent* ev = &input_queue[input_head];
         ev->tv_sec = LinuxKernel::GetUptime();
         ev->tv_usec = 0;
-        ev->type = EV_REL;
-        ev->code = 1;  // rel_y
-        ev->value = dy;
+        ev->type = type;
+        ev->code = code;
+        ev->value = value;
         input_head = next;
+        return true;
+    };
+
+    bool queued = false;
+    if (dx != 0) queued = enqueue(EV_REL, 0, dx) || queued;
+    if (dy != 0) queued = enqueue(EV_REL, 1, dy) || queued;
+
+    static const struct {
+        int mask;
+        uint16_t code;
+    } button_map[] = {
+        {0x01, 0x110},
+        {0x02, 0x111},
+        {0x04, 0x112},
+        {0x08, 0x113},
+        {0x10, 0x114},
+    };
+
+    int changed = buttons ^ g_linux_emitted_button_mask;
+    for (int i = 0; i < (int)(sizeof(button_map) / sizeof(button_map[0])); i++) {
+        if (!(changed & button_map[i].mask)) continue;
+        queued = enqueue(EV_KEY, button_map[i].code,
+            (buttons & button_map[i].mask) ? 1 : 0) || queued;
     }
+    g_linux_emitted_button_mask = buttons;
 
-    // button state
-    next = (input_head + 1) % 64;
-    if (next != input_tail) {
-        ev = &input_queue[input_head];
-        ev->tv_sec = LinuxKernel::GetUptime();
-        ev->tv_usec = 0;
-        ev->type = EV_KEY;
-        ev->code = 0x110;  // btn_left
-        ev->value = buttons & 1;
-        input_head = next;
+    if (queued) {
+        enqueue(EV_SYN, 0, 0);
     }
 }
 

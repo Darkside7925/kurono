@@ -83,6 +83,14 @@ public:
     static bool GetControllerStatus(uint8_t& status);
     static void FlushBuffers();
 
+    // accessibility
+    static void SetStickyKeys(bool enabled);
+    static void SetSlowKeys(uint32_t hold_ms);   // 0 = disabled
+    static void SetBounceKeys(uint32_t bounce_ms); // 0 = disabled
+    static void SetScreenReader(bool enabled);
+    static bool GetScreenReader();
+    static void Announce(const char* msg);  // beeps + log; routed by callers
+
 private:
     static uint8_t Status();
     static uint8_t In(uint16_t p);

@@ -81,7 +81,7 @@ mb2_hdr_start:
     ; ── Framebuffer request tag (type 5) ──
     align 8
     dw  5                               ; type  = framebuffer
-    dw  0                               ; flags = required
+    dw  1                               ; flags = optional (don't fail boot if unavailable)
     dd  20                              ; size  = 20 bytes
     dd  1024                            ; preferred width
     dd  768                             ; preferred height
@@ -91,7 +91,7 @@ mb2_hdr_start:
     ;    Ask bootloader to provide memory map + framebuffer tags
     align 8
     dw  1                               ; type  = information request
-    dw  0                               ; flags = required
+    dw  1                               ; flags = optional (don't fail boot if unavailable)
     dd  24                              ; size  = 8 header + 4 per request type
     dd  4                               ; request: basic meminfo (type 4)
     dd  6                               ; request: memory map   (type 6)

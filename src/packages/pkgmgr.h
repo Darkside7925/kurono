@@ -16,10 +16,15 @@ enum PkgState {
 struct Package {
     char name[PKG_MAX_NAME];
     char version[16];
+    char latest_version[16];
     char description[PKG_MAX_DESC];
     char category[16];
+    char repo_path[64];          // legacy: relative tarball path
+    char manifest_url[160];      // /packages/<name>/manifest.json
+    char download_url[160];      // path returned in manifest "url"
+    char sha256[72];             // hex sha256 from manifest
     PkgState state;
-    unsigned int size;        // kb
+    unsigned int size;           // kb
     char deps[PKG_MAX_DEPS][PKG_MAX_NAME];
     int  dep_count;
 };
@@ -29,9 +34,12 @@ public:
     static void Init();
 
     static bool Install(const char* name);
+    static bool InstallKro(const char* path, char* app_name_out, int app_name_max,
+                           char* entry_path_out, int entry_path_max);
     static bool Remove(const char* name);
     static bool Update(const char* name);
     static bool UpdateAll();
+    static bool SyncRepository();
 
     static Package* Find(const char* name);
     static int  Search(const char* pattern, Package** results, int max_results);
@@ -43,6 +51,10 @@ public:
     static Package* GetPackage(int idx);
     static int InstalledCount();
     static int AvailableCount();
+    static const char* GetRepositoryHost();
+    static const char* GetLastSyncMessage();
+    static bool LastSyncSucceeded();
+    static int GetPendingUpdateCount();
 
     // shell integration
     static int cmd_install(void* sh, int argc, const char** argv, char* out, int mx);
@@ -58,4 +70,7 @@ private:
     static Package packages[PKG_MAX_PACKAGES];
     static int package_count;
     static void AddDefaultPackages();
+    static Package* FindOrCreate(const char* name);
+    static int ParseRepositoryManifest(const char* manifest);
+    static int ParseIndexJson(const char* json);
 };

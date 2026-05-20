@@ -18,16 +18,24 @@ struct InterruptFrame {
     uint64_t ss;
 } __attribute__((packed));
 
+constexpr uint16_t GDT_KERNEL_CODE_SELECTOR = 0x08;
+constexpr uint16_t GDT_KERNEL_DATA_SELECTOR = 0x10;
+constexpr uint16_t GDT_USER_DATA_SELECTOR   = 0x18;
+constexpr uint16_t GDT_USER_CODE_SELECTOR   = 0x20;
+constexpr uint16_t GDT_TSS_SELECTOR         = 0x28;
+
 //  hardware abstraction layer
 //  idt (256 entries), pic 8259a remapping, exception handlers, io ports
 class HAL {
 public:
+    typedef void (*SystemCallHandler)(InterruptFrame*);
     static void Init();
 
     static void EnableInterrupts();
     static void DisableInterrupts();
     static void Halt();
     static void WaitForInterrupt();
+    [[noreturn]] static void EnterUserMode(uint64_t rip, uint64_t rsp);
 
     static void EnableIRQ(uint8_t irq);   // unmask a specific irq line (0-15)
     static void DisableIRQ(uint8_t irq);  // mask a specific irq line
@@ -35,6 +43,14 @@ public:
 
     typedef void (*IRQHandler)(InterruptFrame*);
     static void RegisterIRQHandler(uint8_t irq, IRQHandler handler);  // irq 0-15
+    static void RegisterSystemCallHandler(SystemCallHandler handler);
+    static void SetKernelStack(uint64_t rsp0);
+
+    // Configure MSRs for the x86_64 SYSCALL/SYSRET fast path.
+    // Must be called once after GDT is loaded.  Enables EFER.SCE,
+    // programs STAR/LSTAR/SFMASK, and points the LSTAR handler at
+    // syscall_entry_x64 (defined in src/hal/syscall_entry.asm).
+    static void InitSyscallMSRs();
 
     static void Reboot();
 
@@ -53,6 +69,7 @@ public:
     static IRQHandler irq_handlers[16];
 
 private:
+    static void InitGDT();
     static void InitIDT();
     static void InitPIC();
 };

@@ -117,6 +117,16 @@ enum TCPState {
 #define TCP_RX_BUFSIZE 8192
 #define TCP_TX_BUFSIZE 8192
 #define TCP_MSS        1460
+#define PENDING_IPV4_TX 8
+
+struct PendingIPv4Frame {
+    bool     active;
+    uint32_t next_hop;
+    uint16_t len;
+    uint32_t last_arp_ms;
+    uint8_t  arp_retries;
+    uint8_t  packet[ETH_MTU];
+};
 
 struct NetSocket {
     bool     active;
@@ -141,6 +151,14 @@ struct NetSocket {
     // transmit state
     uint32_t tx_unacked;
     uint32_t retransmit_timer;
+    bool     tx_pending;
+    uint8_t  tx_flags;
+    uint8_t  tx_retries;
+    int      tx_len;
+    uint32_t tx_seq_base;
+    uint32_t tx_seq_end;
+    uint32_t tx_last_tx_ms;
+    uint8_t  tx_buf[TCP_MSS];
 };
 
 struct NetStats {
@@ -188,6 +206,7 @@ public:
     static int  Accept(int sock);
     static int  Send(int sock, const void* data, int len);
     static int  Recv(int sock, void* buf, int max_len);
+    static bool IsPeerClosed(int sock);
     static bool Close(int sock);
 
     // udp convenience
@@ -217,6 +236,7 @@ private:
     static ARPEntry arp_cache[ARP_CACHE_SIZE];
     static NetSocket sockets[MAX_SOCKETS];
     static NetStats stats;
+    static PendingIPv4Frame pending_ipv4[PENDING_IPV4_TX];
 
     static uint16_t next_ephemeral_port;
     static uint16_t ip_ident;
@@ -239,6 +259,8 @@ private:
     // ip
     static void ProcessIPv4(const void* data, int len);
     static bool SendIPv4(uint32_t dst_ip, uint8_t proto, const void* payload, int len);
+    static bool QueuePendingIPv4(uint32_t next_hop, const void* packet, int len);
+    static void ServicePendingIPv4();
 
     // icmp
     static void ProcessICMP(const IPv4Header* ip_hdr, const void* data, int len);
@@ -246,6 +268,9 @@ private:
     // tcp
     static void ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len);
     static bool SendTCP(NetSocket* sock, uint8_t flags, const void* data, int len);
+    static bool SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, int len,
+                              uint32_t seq, bool track_pending);
+    static uint32_t TCPSeqAdvance(uint8_t flags, int len);
     static void TCPTick();
 
     // udp

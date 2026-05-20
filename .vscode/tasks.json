@@ -4,28 +4,12 @@
 		{
 			"label": "Build OS",
 			"type": "shell",
-			"command": "make",
-			"args": [],
-			"problemMatcher": [
-				"$gcc"
+			"command": "wsl",
+			"args": [
+				"bash",
+				"-lc",
+				"cd /mnt/c/Users/genie/OS/src && make"
 			],
-			"group": "build"
-		},
-		{
-			"label": "Build OS",
-			"type": "shell",
-			"command": "make",
-			"args": [],
-			"problemMatcher": [
-				"$gcc"
-			],
-			"group": "build"
-		},
-		{
-			"label": "Build OS",
-			"type": "shell",
-			"command": "make",
-			"args": [],
 			"problemMatcher": [
 				"$gcc"
 			],

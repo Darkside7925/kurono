@@ -58,9 +58,15 @@ Kurono tries the display in tiers.
 2. It can fall back to VBE details when available.
 3. It can use BGA in virtual hardware cases.
 
-Once a display path is accepted, the graphics layer takes over framebuffer operations and updates the panic framebuffer metadata so crash rendering tracks the live mode.
+Before accepting any framebuffer, the kernel runs `GpuProbe::ScanAll()` to detect all display controllers on the PCI bus. This is critical for hybrid GPU laptops. The probe identifies Intel iGPU, NVIDIA dGPU, AMD APU/dGPU, and virtual GPUs (QEMU, VMware, VirtIO). It classifies the topology as Optimus (muxless or MUX), PowerXpress, dual discrete, or single GPU.
 
-This is one of the reasons the project can show both an early boot image and a later desktop on the same hardware without a complete modeset implementation.
+On Optimus laptops, the GRUB-reported framebuffer address may point to the wrong GPU. The GPU probe validates the address by reading the Intel DSPSURF (display surface) register from MMIO BAR0. If the address does not match the actual active surface, the kernel corrects it before initializing graphics.
+
+Once a display path is accepted, the display manager selects the backend (BGA, VirtIO GPU, Intel, NVIDIA, or AMD) based on the GPU probe results. The graphics layer takes over framebuffer operations with write-combining remap via PAT to ensure cached writes do not disappear on real hardware. The panic framebuffer metadata is updated so crash rendering tracks the live mode.
+
+The Wayland compositor initializes after the graphics layer is ready. It listens at `/system/run/user/1000/wayland-0` and advertises the standard libwayland globals. The compositor runs in-kernel rather than as a separate user-space process.
+
+This layered approach is why the project can show both an early boot image and a later desktop on the same hardware without a complete modesetting implementation.
 
 ## 6. Input path
 

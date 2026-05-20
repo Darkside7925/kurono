@@ -1,6 +1,9 @@
 #include "keyboard.h"
 #include "serial.h"
+#include "audio.h"
+#include "timer.h"
 #include "../system/input_manager.h" // include inputmanager for layouts
+#include "../system/vconsole.h"
 
 KeyboardState Keyboard::state = {false, false, false, false, false, false, false, {0}};
 bool Keyboard::e0_prefix = false;
@@ -12,6 +15,31 @@ bool Keyboard::keys[256] = {0};
 bool Keyboard::prev_keys[256] = {0};
 static uint8_t usb_prev_reports[16][8] = {{0}};
 static bool set2_break_prefix = false;
+
+// ── accessibility state ──────────────────────────────────────────
+static bool     g_sticky_enabled  = false;
+static uint32_t g_slow_keys_ms    = 0;   // require key held >= ms
+static uint32_t g_bounce_keys_ms  = 0;   // ignore repeat within ms
+static bool     g_screen_reader   = false;
+static uint32_t g_last_press_ms[256] = {0};
+static uint32_t g_press_start_ms[256] = {0};
+// sticky modifier latches: stay "on" until next non-modifier key
+static bool g_latch_shift = false;
+static bool g_latch_ctrl  = false;
+static bool g_latch_alt   = false;
+static bool g_latch_super = false;
+
+void Keyboard::SetStickyKeys(bool enabled){ g_sticky_enabled = enabled;
+    if(!enabled){ g_latch_shift = g_latch_ctrl = g_latch_alt = g_latch_super = false; } }
+void Keyboard::SetSlowKeys(uint32_t hold_ms){ g_slow_keys_ms = hold_ms; }
+void Keyboard::SetBounceKeys(uint32_t bounce_ms){ g_bounce_keys_ms = bounce_ms; }
+void Keyboard::SetScreenReader(bool enabled){ g_screen_reader = enabled; }
+bool Keyboard::GetScreenReader(){ return g_screen_reader; }
+void Keyboard::Announce(const char* msg){
+    if(!g_screen_reader || !msg) return;
+    SerialLogger::Log("[a11y] "); SerialLogger::Log(msg); SerialLogger::Log("\r\n");
+    Audio::Beep(880, 60);
+}
 
 static uint8_t kb_in(uint16_t p) {
     uint8_t r;
@@ -511,17 +539,85 @@ void Keyboard::HandleScancode(uint8_t sc) {
     if (key == KEY_LCTRL || key == KEY_RCTRL) state.ctrl = !release;
     if (key == KEY_LALT || key == KEY_RALT) state.alt = !release;
     if (key == KEY_LSUPER || key == KEY_RSUPER) state.super = !release;
+
+    // ── accessibility filters ────────────────────────────────────
+    bool is_mod = (key == KEY_LSHIFT || key == KEY_RSHIFT ||
+                   key == KEY_LCTRL  || key == KEY_RCTRL  ||
+                   key == KEY_LALT   || key == KEY_RALT   ||
+                   key == KEY_LSUPER || key == KEY_RSUPER);
+
+    uint32_t now = (uint32_t)Timer::GetRealMs();
+    int kidx = (int)key;
+    if (kidx < 0 || kidx >= 256) return;
+
+    if (!release) {
+        // bounce keys: drop press if it follows the same key too closely
+        if (g_bounce_keys_ms > 0 && !is_mod) {
+            uint32_t last = g_last_press_ms[kidx];
+            if (last != 0 && (now - last) < g_bounce_keys_ms) {
+                return; // swallow
+            }
+        }
+        g_press_start_ms[kidx] = now;
+
+        // sticky keys: latch modifiers, consume modifier press
+        if (g_sticky_enabled && is_mod) {
+            if (key == KEY_LSHIFT || key == KEY_RSHIFT) g_latch_shift = !g_latch_shift;
+            if (key == KEY_LCTRL  || key == KEY_RCTRL ) g_latch_ctrl  = !g_latch_ctrl;
+            if (key == KEY_LALT   || key == KEY_RALT  ) g_latch_alt   = !g_latch_alt;
+            if (key == KEY_LSUPER || key == KEY_RSUPER) g_latch_super = !g_latch_super;
+            Audio::Beep(g_latch_shift||g_latch_ctrl||g_latch_alt||g_latch_super ? 1200 : 600, 30);
+            return;
+        }
+        // apply latched modifiers to state for non-modifier press
+        if (g_sticky_enabled && !is_mod) {
+            if (g_latch_shift) state.shift = true;
+            if (g_latch_ctrl ) state.ctrl  = true;
+            if (g_latch_alt  ) state.alt   = true;
+            if (g_latch_super) state.super = true;
+        }
+    } else {
+        // slow keys: only commit a press if the key was held long enough
+        if (g_slow_keys_ms > 0 && !is_mod) {
+            uint32_t held = now - g_press_start_ms[kidx];
+            if (held < g_slow_keys_ms) {
+                // discard this whole press cycle
+                if (callback) callback(key, 0, false);
+                return;
+            }
+        }
+    }
     
     if (!release) {
         if (key == KEY_CAPSLOCK) state.caps_lock = !state.caps_lock;
         if (key == KEY_NUMLOCK) state.num_lock = !state.num_lock;
         if (key == KEY_SCROLLLOCK) state.scroll_lock = !state.scroll_lock;
-        
+
+        // Ctrl+Alt+F1..F6/F7 → switch virtual console (Linux convention).
+        // F7 is the GUI console; F1..F6 are text TTYs.  We swallow the key
+        // so the focused app does not also receive it.
+        if (state.ctrl && state.alt &&
+            key >= KEY_F1 && key <= KEY_F7) {
+            int idx = (int)key - (int)KEY_F1;     // 0..6
+            VConsole::Switch(idx);
+            if (callback) callback(key, 0, true);
+            return;
+        }
+
         char c = KeyToChar(key, state.shift, state.caps_lock);
-        
+
         if (c) Enqueue(c);
-        
+
         if (callback) callback(key, c, true);
+
+        // record press time AFTER bounce check so consecutive valid presses
+        // also honour the cooldown
+        g_last_press_ms[kidx] = now;
+
+        // sticky: clear one-shot latch on real key press
+        if (g_sticky_enabled && !is_mod) {
+            g_latch_shift = g_latch_ctrl = g_latch_alt = g_latch_super = false;
+        }
     } else {
         if (callback) callback(key, 0, false);
     }

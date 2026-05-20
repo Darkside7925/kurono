@@ -28,6 +28,9 @@
 #include "../drivers/serial.h"
 #include "../linux/linux_drivers.h"
 #include "../shell/shell.h"
+#include "vpci.h"
+#include "virtio_gpu_host.h"
+#include "pci_passthrough.h"
 
 // helper: allocate aligned memory from kernel heap
 static void* HVAllocAligned(size_t size, size_t align) {
@@ -454,6 +457,10 @@ bool Hypervisor::SetupEPT() {
         EPTManager::AddRegion({GUEST_HPET_BASE, 0, 0x400, MEM_MMIO,
                                true, true, false});
 
+        // map vpci mmio window  -  virtio device bars live here
+        EPTManager::AddRegion({VPCI_MMIO_BASE, 0, (uint32_t)VPCI_MMIO_SIZE,
+                               MEM_MMIO, true, true, false});
+
         // write eptp to vmcs  -  single 64-bit write, do not split into
         // field / field+1 (field+1 is a different vmcs encoding on 64-bit)
         uint64_t eptp = EPTManager::BuildEPTP(ept_root);
@@ -513,6 +520,13 @@ bool Hypervisor::SetupDevices() {
     }
 
     // pic/apic/pit/hpet already initialized by virtualdevices::init()
+
+    // virtual pci bus + virtio-gpu host device
+    VPCI::Init();
+    if (!VirtIOGPUHost::Init()) {
+        SerialLogger::Log("Hypervisor: VirtIOGPUHost init failed (non-fatal)\r\n");
+    }
+    PCIPassthrough::Init();
 
     return true;
 }
@@ -947,10 +961,9 @@ bool Hypervisor::HandleGuestIO(uint16_t port, bool is_out, uint8_t size,
     // port 0x80  -  post code (ignore)
     if (port == 0x80) return true;
 
-    // port 0xcf8/0xcfc  -  pci configuration (stub: return 0xffffffff)
-    if (port == 0xCF8 || port == 0xCFC) {
-        if (!is_out) value = 0xFFFFFFFF;
-        return true;
+    // ports 0xcf8 / 0xcfc-0xcff  -  virtual pci configuration mechanism #1
+    if (port == 0xCF8 || (port >= 0xCFC && port <= 0xCFF)) {
+        return VPCI::HandlePortIO(port, is_out, size, value);
     }
 
     // port 0x92 (system control port a  -  a20 gate)
@@ -974,6 +987,7 @@ bool Hypervisor::HandleGuestIO(uint16_t port, bool is_out, uint8_t size,
 bool Hypervisor::HandleGuestMMIO(uint64_t phys_addr, bool is_write,
                                    uint8_t size, uint32_t& value) {
     stats.mmio_exits++;
+    if (VPCI::HandleMMIO(phys_addr, is_write, size, value)) return true;
     return VirtualDevices::HandleMMIO(phys_addr, is_write, size, value);
 }
 
@@ -1075,6 +1089,11 @@ void Hypervisor::TickDevices() {
     if (config.enable_serial) {
         serial.Tick(us);
     }
+
+    // virtio-gpu host: pull pending requests off the controlq even if the
+    // guest forgot to ring the doorbell, then present any dirty scanout.
+    VirtIOGPUHost::ProcessQueues();
+    VirtIOGPUHost::PresentIfDirty();
 }
 
 //  pause / resume
@@ -1170,7 +1189,7 @@ bool Hypervisor::BootAlpine() {
     cfg.timer_tick_us = 1000;
     cfg.cmdline       = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
                         "root=/dev/ram0 rw init=/sbin/init nokaslr noapic "
-                        "nosmp noacpi pci=off";
+                        "nosmp noacpi";
 
     if (!CreateVM(cfg)) {
         SerialLogger::Log("Hypervisor: Failed to create VM for Alpine\r\n");
@@ -1239,7 +1258,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
         cfg.timer_tick_us = 10000;
         cfg.cmdline       = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
                             "root=/dev/ram0 rw init=/sbin/init nokaslr noapic "
-                            "nosmp noacpi pci=off";
+                            "nosmp noacpi";
 
         bool hw_ok = false;
         if (CreateVM(cfg)) {
@@ -1432,7 +1451,7 @@ bool Hypervisor::BootDebianWithExtraction(uint32_t max_boot_exits) {
     cfg.cmdline       = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
                         "root=/dev/sda rw rootfstype=ext4 init=/sbin/init "
                         "systemd.unit=multi-user.target nokaslr noapic "
-                        "nosmp noacpi pci=off";
+                        "nosmp noacpi";
 
     if (!CreateVM(cfg)) {
         SerialLogger::Log("Hypervisor: Failed to create VM for Debian\r\n");
@@ -1990,6 +2009,7 @@ int Hypervisor::AlpineExec(const char* cmd, char* out_buf, int out_max) {
         for (uint32_t i = 0; i < 5000 && vm_state == VM_STATE_RUNNING; i++) {
             vm_state = RunOneCycle();
             if (i % 100 == 0) TickDevices();
+            if (i % 128 == 0) KuronoShell::PumpUI();
         }
 
         // read whatever the guest produced
@@ -1997,12 +2017,14 @@ int Hypervisor::AlpineExec(const char* cmd, char* out_buf, int out_max) {
             int n = serial.ReadOutput(out_buf + total_read, out_max - total_read - 1);
             if (n > 0) total_read += n;
         }
+        KuronoShell::PumpUI();
 
         // if we got some output and guest likely finished (no more coming for a cycle)
         if (total_read > 0 && !serial.HasOutput()) {
             // run a few more cycles to see if more output comes
             for (uint32_t i = 0; i < 1000 && vm_state == VM_STATE_RUNNING; i++) {
                 vm_state = RunOneCycle();
+                if ((i & 127u) == 0) KuronoShell::PumpUI();
             }
             if (!serial.HasOutput()) break; // cmd finished
             // still output coming  -  read more
@@ -2036,16 +2058,19 @@ int Hypervisor::DebianExec(const char* cmd, char* out_buf, int out_max) {
         for (uint32_t i = 0; i < 5000 && vm_state == VM_STATE_RUNNING; i++) {
             vm_state = RunOneCycle();
             if (i % 100 == 0) TickDevices();
+            if (i % 128 == 0) KuronoShell::PumpUI();
         }
 
         if (serial.HasOutput()) {
             int n = serial.ReadOutput(out_buf + total_read, out_max - total_read - 1);
             if (n > 0) total_read += n;
         }
+        KuronoShell::PumpUI();
 
         if (total_read > 0 && !serial.HasOutput()) {
             for (uint32_t i = 0; i < 1000 && vm_state == VM_STATE_RUNNING; i++) {
                 vm_state = RunOneCycle();
+                if ((i & 127u) == 0) KuronoShell::PumpUI();
             }
             if (!serial.HasOutput()) break;
             int n = serial.ReadOutput(out_buf + total_read, out_max - total_read - 1);

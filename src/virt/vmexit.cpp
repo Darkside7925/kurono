@@ -10,6 +10,7 @@
 #include "../drivers/audio.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
+#include "../linux/linux_devices.h"
 #include "v9fs.h"
 
 CPUIDOverride VMExitHandler::cpuid_overrides[MAX_CPUID_OVERRIDES];
@@ -724,7 +725,6 @@ VMExitAction VMExitHandler::HandleTripleFault(vCPU* cpu) {
 
 VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
     uint32_t call_num = cpu->regs[0]; // eax = hypercall number
-    uint32_t arg1 = cpu->regs[3];     // ebx = arg1
     uint32_t arg2 = cpu->regs[1];     // ecx = arg2 / sub-function
 
     SerialLogger::Log("VMExit: VMCALL #");
@@ -763,10 +763,11 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
             uint32_t subfn = cpu->regs[1]; // ecx
             switch (subfn) {
                 case 0: { // get display info
-                    cpu->regs[0] = Graphics::GetWidth();
-                    cpu->regs[3] = Graphics::GetHeight();
-                    cpu->regs[1] = Graphics::GetPitch();
-                    cpu->regs[2] = Graphics::GetBpp();
+                    LinuxFBInfo* fb = LinuxDeviceBridge::GetFramebufferInfo();
+                    cpu->regs[0] = fb ? fb->xres_virtual : (uint64_t)Graphics::GetWidth();
+                    cpu->regs[3] = fb ? fb->yres_virtual : (uint64_t)Graphics::GetHeight();
+                    cpu->regs[1] = fb ? fb->line_length : (uint64_t)Graphics::GetPitch();
+                    cpu->regs[2] = fb ? fb->bits_per_pixel : (uint64_t)Graphics::GetBpp();
                     break;
                 }
                 case 1: { // blit rectangle from guest memory to host fb
@@ -785,33 +786,12 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
                         break;
                     }
 
-                    // copy each row of the guest pixel data into the host back buffer
-                    uint8_t* fb = Graphics::GetBackBuffer();
-                    if (!fb) fb = Graphics::GetBuffer();
-                    uint32_t fb_pitch = Graphics::GetPitch();
-                    uint32_t bpp_bytes = Graphics::GetBpp() / 8;
-                    uint32_t fb_w = Graphics::GetWidth();
-                    uint32_t fb_h = Graphics::GetHeight();
-
-                    for (uint32_t row = 0; row < src_h; row++) {
-                        int fy = dst_y + (int)row;
-                        if (fy < 0 || (uint32_t)fy >= fb_h) continue;
-                        uint32_t copy_w = src_w;
-                        int fx = dst_x;
-                        if (fx < 0) { copy_w += fx; fx = 0; }
-                        if (fx + copy_w > fb_w) copy_w = fb_w - fx;
-                        if ((int)copy_w <= 0) continue;
-
-                        uint8_t* dst_row = fb + (uint32_t)fy * fb_pitch + (uint32_t)fx * bpp_bytes;
-                        uint8_t* src_row = src + row * src_pitch;
-                        for (uint32_t b = 0; b < copy_w * bpp_bytes; b++)
-                            dst_row[b] = src_row[b];
-                    }
-                    cpu->regs[0] = 0;
+                    cpu->regs[0] = LinuxDeviceBridge::BlitFramebufferRect(
+                        src, src_pitch, src_w, src_h, dst_x, dst_y) ? 0 : 0xFFFFFFFF;
                     break;
                 }
                 case 2: { // swap / present
-                    Graphics::SwapBuffers();
+                    LinuxDeviceBridge::PresentFramebuffer();
                     cpu->regs[0] = 0;
                     break;
                 }

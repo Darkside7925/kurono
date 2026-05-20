@@ -174,6 +174,10 @@ uint32_t Graphics::frame_count = 0;
 uint32_t Graphics::fps_sample_time = 0;
 Graphics::DrawStats Graphics::draw_stats = {0};
 
+// accessibility post-process state
+static int  g_color_filter   = 0;     // 0=off,1=protan,2=deutan,3=tritan,4=gray
+static bool g_high_contrast  = false;
+
 bool Graphics::fb_wc_active = false;
 uint32_t Graphics::monitor_hz = 0;
 
@@ -442,6 +446,59 @@ void Graphics::SwapBuffers() {
         uint32_t bytes_per_pixel = fb_bpp / 8;
         uint32_t bytes_per_line = fb_width * bytes_per_pixel;
         bool pitch_match = (bytes_per_line == fb_pitch);
+        bool filter_active = ((g_color_filter > 0 || g_high_contrast) && bytes_per_pixel == 4);
+
+        // accessibility post-process: write filtered pixels DIRECTLY into the
+        // framebuffer, leaving back_buffer untouched (idempotent).  Forces a
+        // full-frame swap because a per-pixel transform is needed.
+        if (filter_active) {
+            for (uint32_t y = 0; y < fb_height; y++) {
+                uint32_t* src = (uint32_t*)(back_buffer + y * fb_pitch);
+                uint32_t* dst = (uint32_t*)(fb_addr   + y * fb_pitch);
+                for (uint32_t x = 0; x < fb_width; x++) {
+                    uint32_t c = src[x];
+                    uint32_t a = (c >> 24) & 0xFF;
+                    int r = (c >> 16) & 0xFF;
+                    int g = (c >> 8)  & 0xFF;
+                    int b = (c)       & 0xFF;
+                    int nr = r, ng = g, nb = b;
+                    switch (g_color_filter) {
+                        case 1:
+                            nr = (567*r + 433*g + 0*b) / 1000;
+                            ng = (558*r + 442*g + 0*b) / 1000;
+                            nb = (0*r   + 242*g + 758*b) / 1000;
+                            break;
+                        case 2:
+                            nr = (625*r + 375*g + 0*b)   / 1000;
+                            ng = (700*r + 300*g + 0*b)   / 1000;
+                            nb = (0*r   + 300*g + 700*b) / 1000;
+                            break;
+                        case 3:
+                            nr = (950*r + 50*g  + 0*b)   / 1000;
+                            ng = (0*r   + 433*g + 567*b) / 1000;
+                            nb = (0*r   + 475*g + 525*b) / 1000;
+                            break;
+                        case 4: {
+                            int yy = (299*r + 587*g + 114*b) / 1000;
+                            nr = ng = nb = yy; break;
+                        }
+                        default: break;
+                    }
+                    if (g_high_contrast) {
+                        int yy = (299*nr + 587*ng + 114*nb) / 1000;
+                        if (yy < 96) { nr = 0;   ng = 0;   nb = 0;   }
+                        else         { nr = 255; ng = 255; nb = 255; }
+                    }
+                    if (nr < 0) nr = 0; if (nr > 255) nr = 255;
+                    if (ng < 0) ng = 0; if (ng > 255) ng = 255;
+                    if (nb < 0) nb = 0; if (nb > 255) nb = 255;
+                    dst[x] = (a << 24) | ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
+                }
+            }
+            __asm__ __volatile__("sfence" ::: "memory");
+            ClearDirtyRegions();
+            return;
+        }
 
         // if few dirty regions exist and they cover less than ~60% of the screen,
         // copy only those regions (partial swap). otherwise full-frame copy.
@@ -858,6 +915,14 @@ uint8_t Graphics::GetBpp() { return fb_bpp; }
 uint8_t* Graphics::GetBuffer() { return active_buffer; }
 void Graphics::SetBuffer(uint8_t* addr) { active_buffer = addr; }
 const Graphics::DrawStats& Graphics::GetDrawStats() { return draw_stats; }
+
+void Graphics::SetColorFilter(int mode) {
+    if (mode < 0) mode = 0;
+    if (mode > 4) mode = 4;
+    g_color_filter = mode;
+}
+int  Graphics::GetColorFilter()        { return g_color_filter; }
+void Graphics::SetHighContrast(bool on){ g_high_contrast = on; }
 
 //  drawstring  -  convenience text renderer for desktop/app layers
 //  font size scales with resolution: 16px at 1024x768, 16px at 1080p,

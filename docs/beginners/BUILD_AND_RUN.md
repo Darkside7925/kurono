@@ -52,9 +52,11 @@ The likely places to check are these.
 
 1. `src/kernel/kurono_kernel.cpp`
 2. `src/drivers/display.cpp`
-3. `src/drivers/graphics.cpp`
-4. `src/kernel/panic.cpp`
-5. `docs/HYBRID_GPU_OPTIMUS_GUIDE.md`
+3. `src/drivers/display_mgr.cpp`
+4. `src/drivers/graphics.cpp`
+5. `src/drivers/gpu_probe.cpp`
+6. `src/kernel/panic.cpp`
+7. `docs/HYBRID_GPU_OPTIMUS_GUIDE.md`
 
 ## 7. When the keyboard or touchpad breaks
 

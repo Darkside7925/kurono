@@ -44,6 +44,68 @@ namespace {
         dst[n] = 0;
     }
 
+    static void int_to_str(int value, char* out, int out_len) {
+        if (!out || out_len < 2) return;
+        if (value < 0) {
+            out[0] = '-';
+            int_to_str(-value, out + 1, out_len - 1);
+            return;
+        }
+
+        char tmp[16];
+        int len = 0;
+        do {
+            tmp[len++] = (char)('0' + (value % 10));
+            value /= 10;
+        } while (value && len < (int)sizeof(tmp));
+
+        int i = 0;
+        while (len > 0 && i < out_len - 1) {
+            out[i++] = tmp[--len];
+        }
+        out[i] = 0;
+    }
+
+    static bool is_safe_log_char(char ch) {
+        return (ch >= 'a' && ch <= 'z') ||
+               (ch >= 'A' && ch <= 'Z') ||
+               (ch >= '0' && ch <= '9') ||
+               ch == '_' || ch == '-' || ch == '.';
+    }
+
+    static void sanitize_log_name(char* dst, const char* src, int max_len) {
+        if (!dst || max_len < 2) return;
+
+        int out = 0;
+        if (src) {
+            for (int i = 0; src[i] && out < max_len - 1; i++) {
+                dst[out++] = is_safe_log_char(src[i]) ? src[i] : '_';
+            }
+        }
+
+        if (out == 0) {
+            str_cpy(dst, "process", max_len);
+            return;
+        }
+        dst[out] = 0;
+    }
+
+    static void build_process_log_path(char* out, int out_len, const char* root, const char* process_name, int pid) {
+        char safe_name[64];
+        char pid_text[16];
+
+        sanitize_log_name(safe_name, process_name, sizeof(safe_name));
+        int_to_str(pid, pid_text, sizeof(pid_text));
+
+        out[0] = 0;
+        str_cat(out, root, out_len);
+        str_cat(out, "/", out_len);
+        str_cat(out, pid_text, out_len);
+        str_cat(out, "_", out_len);
+        str_cat(out, safe_name, out_len);
+        str_cat(out, ".log", out_len);
+    }
+
     static void append_buffer(char* buffer, int& len, int cap, const char* text) {
         if (!buffer || cap <= 1 || !text) return;
         for (int i = 0; text[i] && len < cap - 1; i++) {
@@ -56,6 +118,66 @@ namespace {
         if (!KVFS::Exists(path)) {
             KVFS::CreateFile(path);
         }
+    }
+
+    static void ensure_core_layout() {
+        KVFS::Mkdirs("/system/logs");
+        KVFS::Mkdirs("/system/logs/processes");
+        KVFS::Mkdirs("/system/boot");
+        KVFS::Mkdirs("/system/kurono");
+        KVFS::Mkdirs("/kurono/logs");
+        KVFS::Mkdirs("/kurono/logs/apps");
+        KVFS::Mkdirs("/kurono/logs/processes");
+
+        ensure_file("/system/logs/serial.log");
+        ensure_file("/system/logs/system.log");
+        ensure_file("/system/boot/boot.log");
+        ensure_file("/kurono/logs/serial.log");
+        ensure_file("/kurono/logs/system.log");
+        ensure_file("/kurono/logs/boot.log");
+    }
+
+    static void ensure_app_log_paths(const char* app_id) {
+        if (!app_id || !*app_id) return;
+
+        char base[128];
+        char logs[160];
+        char data[160];
+        char runtime[160];
+        char mirror_dir[192];
+        char mirror_runtime[224];
+
+        base[0] = 0;
+        str_cat(base, "/apps/", sizeof(base));
+        str_cat(base, app_id, sizeof(base));
+
+        str_cpy(logs, base, sizeof(logs));
+        str_cat(logs, "/logs", sizeof(logs));
+
+        str_cpy(data, base, sizeof(data));
+        str_cat(data, "/data", sizeof(data));
+
+        str_cpy(runtime, logs, sizeof(runtime));
+        str_cat(runtime, "/runtime.log", sizeof(runtime));
+
+        mirror_dir[0] = 0;
+        str_cat(mirror_dir, "/kurono/logs/apps/", sizeof(mirror_dir));
+        str_cat(mirror_dir, app_id, sizeof(mirror_dir));
+
+        str_cpy(mirror_runtime, mirror_dir, sizeof(mirror_runtime));
+        str_cat(mirror_runtime, "/runtime.log", sizeof(mirror_runtime));
+
+        KVFS::Mkdirs(base);
+        KVFS::Mkdirs(logs);
+        KVFS::Mkdirs(data);
+        KVFS::Mkdirs(mirror_dir);
+        ensure_file(runtime);
+        ensure_file(mirror_runtime);
+    }
+
+    static void ensure_process_log_paths() {
+        KVFS::Mkdirs("/system/logs/processes");
+        KVFS::Mkdirs("/kurono/logs/processes");
     }
 
     static void append_file_text(const char* path, const char* text) {
@@ -153,20 +275,30 @@ namespace {
 void RuntimeLog::InitFilesystem() {
     if (g_fs_ready) return;
 
-    KVFS::Mkdirs("/system/logs");
-    KVFS::Mkdirs("/system/boot");
-    KVFS::Mkdirs("/system/kurono");
-    KVFS::Mkdirs("/kurono/logs");
-    KVFS::Mkdirs("/kurono/logs/apps");
+    ensure_core_layout();
     KVFS::Mkdirs("/boot");
     KVFS::Mkdirs("/apps");
-
-    ensure_file("/system/logs/serial.log");
-    ensure_file("/system/logs/system.log");
-    ensure_file("/system/boot/boot.log");
-    ensure_file("/kurono/logs/serial.log");
-    ensure_file("/kurono/logs/system.log");
-    ensure_file("/kurono/logs/boot.log");
+    KVFS::WriteString("/system/logs/README.txt",
+        "Kurono runtime logs\n"
+        "- serial.log: mirrored serial/driver/kernel output\n"
+        "- system.log: structured runtime events\n"
+        "- processes/: per-process lifecycle logs\n"
+        "- /system/boot/boot.log: boot milestones\n");
+    KVFS::WriteString("/kurono/logs/README.txt",
+        "Kurono in-OS logs\n"
+        "- serial.log: mirrored serial/driver/kernel output\n"
+        "- system.log: structured runtime events\n"
+        "- boot.log: boot milestones\n"
+        "- processes/: mirrored per-process lifecycle logs\n"
+        "- apps/<app>/runtime.log: per-app activity logs\n");
+    KVFS::WriteString("/system/logs/processes/README.txt",
+        "Per-process logs\n"
+        "- One file per native or Linux process\n"
+        "- Filenames are <pid>_<name>.log\n");
+    KVFS::WriteString("/kurono/logs/processes/README.txt",
+        "Mirrored per-process logs\n"
+        "- One file per native or Linux process\n"
+        "- Filenames are <pid>_<name>.log\n");
 
     create_app_layout("terminal", "Terminal");
     create_app_layout("files", "File Manager");
@@ -176,14 +308,6 @@ void RuntimeLog::InitFilesystem() {
     create_app_layout("tasks", "Task Manager");
     create_app_layout("browser", "Browser");
     create_app_layout("media", "Media Player");
-    create_app_layout("conduit", "Conduit");
-
-    if (!KVFS::Exists("/system/kurono/secret.kcl")) {
-        KVFS::WriteString("/system/kurono/secret.kcl",
-            "# kurono secret\n"
-            "# line three unlocks conduit\n"
-            "echo keep listening\n");
-    }
 
     KVFS::WriteString("/boot/kernel.info",
         "Kurono kernel\n"
@@ -203,6 +327,7 @@ void RuntimeLog::InitFilesystem() {
 void RuntimeLog::MirrorSerial(const char* text) {
     if (!text || !*text) return;
     if (g_fs_ready) {
+        ensure_core_layout();
         append_file_text("/system/logs/serial.log", text);
         append_file_text("/kurono/logs/serial.log", text);
         return;
@@ -220,6 +345,7 @@ void RuntimeLog::LogSystem(const char* component, const char* message) {
     format_line(line, sizeof(line), prefix, message, nullptr);
 
     if (g_fs_ready) {
+        ensure_core_layout();
         append_file_text("/system/logs/system.log", line);
         append_file_text("/kurono/logs/system.log", line);
         return;
@@ -232,6 +358,7 @@ void RuntimeLog::LogBoot(const char* message) {
     format_line(line, sizeof(line), "[boot] ", message, nullptr);
 
     if (g_fs_ready) {
+        ensure_core_layout();
         append_file_text("/system/boot/boot.log", line);
         append_file_text("/kurono/logs/boot.log", line);
         return;
@@ -258,6 +385,8 @@ void RuntimeLog::LogAppEvent(const char* app, const char* event, const char* det
     format_line(line, sizeof(line), prefix, event, detail);
 
     if (g_fs_ready) {
+        ensure_core_layout();
+        ensure_app_log_paths(app);
         append_file_text(path, line);
         char kpath[192];
         kpath[0] = 0;
@@ -268,4 +397,36 @@ void RuntimeLog::LogAppEvent(const char* app, const char* event, const char* det
         return;
     }
     RuntimeLog::LogSystem("apps", line);
+}
+
+void RuntimeLog::LogProcessEvent(const char* process_name, int pid, const char* event, const char* detail) {
+    if (!process_name || !*process_name || !event || !*event) return;
+
+    char path[224];
+    char mirror_path[224];
+    char line[512];
+    char prefix[128];
+    char pid_text[16];
+
+    build_process_log_path(path, sizeof(path), "/system/logs/processes", process_name, pid);
+    build_process_log_path(mirror_path, sizeof(mirror_path), "/kurono/logs/processes", process_name, pid);
+
+    int_to_str(pid, pid_text, sizeof(pid_text));
+    prefix[0] = 0;
+    str_cat(prefix, "[pid ", sizeof(prefix));
+    str_cat(prefix, pid_text, sizeof(prefix));
+    str_cat(prefix, " ", sizeof(prefix));
+    str_cat(prefix, process_name, sizeof(prefix));
+    str_cat(prefix, "] ", sizeof(prefix));
+    format_line(line, sizeof(line), prefix, event, detail);
+
+    if (g_fs_ready) {
+        ensure_core_layout();
+        ensure_process_log_paths();
+        append_file_text(path, line);
+        append_file_text(mirror_path, line);
+        return;
+    }
+
+    append_buffer(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line);
 }

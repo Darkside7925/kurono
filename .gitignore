@@ -21,3 +21,8 @@ iso/kurono.iso
 kurono.iso
 *.iso
 build/kurono.elf
+
+# local notes
+memories/
+/memories
+/sources/

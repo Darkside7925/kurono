@@ -2,6 +2,7 @@
 #include "graphics.h"
 #include "serial.h"
 #include "../ui/gui.h"
+#include "../kernel/pci.h"
 #include "../kernel/time.h"
 
 int Mouse::mx, Mouse::my, Mouse::lastx, Mouse::lasty;
@@ -49,7 +50,7 @@ static int smooth_y256 = 0;
 static int target_x256 = 0;
 static int target_y256 = 0;
 static bool smooth_inited = false;
-static const int SMOOTH_ALPHA = 140;   // 0-256, higher = snappier (140 ≈ 55%)
+static const int SMOOTH_ALPHA = 95;    // 0-256, lower = smoother (95 ≈ 37%  -  comfortable desktop feel)
 
 // enhanced variables
 static bool raw_input_enabled = false;
@@ -68,6 +69,311 @@ static uint32_t device_capabilities = 0;
 static uint16_t dpi_profiles[5] = {400, 800, 1600, 3200, 6400};
 static uint8_t current_dpi_profile = 1;
 static Mouse::PerformanceStats perf_stats = {0};
+static bool ps2_poll_enabled = false;
+
+namespace {
+constexpr uint8_t PS2_PACKET_START_BIT = 0x08;
+constexpr uint8_t PS2_RET_BAT = 0xAA;
+constexpr uint8_t PS2_RET_ACK = 0xFA;
+constexpr uint8_t PS2_RET_NAK = 0xFE;
+constexpr uint8_t PS2_RET_ERR = 0xFC;
+constexpr uint8_t PS2_ID_STANDARD = 0x00;
+constexpr uint8_t PS2_ID_INTELLIMOUSE = 0x03;
+constexpr uint8_t PS2_ID_EXPLORER = 0x04;
+constexpr uint8_t PS2_CMD_RESET = 0xFF;
+constexpr uint8_t PS2_CMD_SET_DEFAULTS = 0xF6;
+constexpr uint8_t PS2_CMD_DISABLE_STREAM = 0xF5;
+constexpr uint8_t PS2_CMD_ENABLE_STREAM = 0xF4;
+constexpr uint8_t PS2_CMD_SET_SAMPLE_RATE = 0xF3;
+constexpr uint8_t PS2_CMD_GET_ID = 0xF2;
+constexpr int DEFAULT_MOUSE_POLL_LIMIT = 100;
+constexpr int VBOX_MOUSE_POLL_LIMIT = 256;
+constexpr int VBOX_PACKET_COALESCE_SPINS = 64;
+constexpr uint32_t CPUID_HYPERVISOR_BIT = (1u << 31);
+
+// ===== VirtualBox VMMDev =====
+constexpr uint16_t VBOX_PCI_VENDOR_ID = 0x80EE;
+constexpr uint16_t VBOX_VMMDEV_DEVICE_ID = 0xCAFE;
+constexpr uint32_t VBOX_VMMDEV_REQUEST_VERSION = 0x10001;
+constexpr uint32_t VBOX_VMMDEV_PORT_OFF_REQUEST = 0;
+constexpr uint32_t VBOX_VMMDEV_REQ_REPORT_GUEST_INFO  = 50;
+constexpr uint32_t VBOX_VMMDEV_REQ_REPORT_GUEST_INFO2 = 58;
+constexpr uint32_t VBOX_VMMDEV_REQ_REPORT_GUEST_CAPS  = 55;
+constexpr uint32_t VBOX_VMMDEV_REQ_GET_MOUSE_STATUS_EX = 223;
+constexpr uint32_t VBOX_VMMDEV_REQ_SET_MOUSE_STATUS = 2;
+constexpr uint32_t VBOX_VMMDEV_GUEST_INTERFACE_VERSION = 0x00010004;
+constexpr uint32_t VBOX_VMMDEV_GUEST_OS_TYPE_UNKNOWN = 0;
+constexpr uint32_t VBOX_VMMDEV_MOUSE_GUEST_CAN_ABSOLUTE = (1u << 0);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_NEW_PROTOCOL = (1u << 4);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_GUEST_NEEDS_HOST_CURSOR = (1u << 2);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_HOST_WANTS_ABSOLUTE = (1u << 1);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_HOST_HAS_ABS_DEV = (1u << 6);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_BUTTON_LEFT = (1u << 0);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_BUTTON_RIGHT = (1u << 1);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_BUTTON_MIDDLE = (1u << 2);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_BUTTON_X1 = (1u << 3);
+constexpr uint32_t VBOX_VMMDEV_MOUSE_BUTTON_X2 = (1u << 4);
+constexpr int32_t VBOX_VMMDEV_MOUSE_RANGE_MAX = 0xFFFF;
+
+// ===== VMware backdoor (vmmouse) =====
+constexpr uint32_t VMWARE_BDOOR_MAGIC = 0x564D5868u; // 'VMXh'
+constexpr uint16_t VMWARE_BDOOR_PORT  = 0x5658;
+constexpr uint16_t VMWARE_CMD_GETVERSION         = 10;
+constexpr uint16_t VMWARE_CMD_ABSPOINTER_DATA    = 39;
+constexpr uint16_t VMWARE_CMD_ABSPOINTER_STATUS  = 40;
+constexpr uint16_t VMWARE_CMD_ABSPOINTER_COMMAND = 41;
+constexpr uint16_t VMWARE_CMD_ABSPOINTER_RESTRICT = 86;
+constexpr uint32_t VMWARE_VMMOUSE_CMD_ENABLE = 0x45414552u;
+constexpr uint32_t VMWARE_VMMOUSE_CMD_DISABLE = 0x000000F5u;
+constexpr uint32_t VMWARE_VMMOUSE_CMD_REQUEST_RELATIVE = 0x4C455252u;
+constexpr uint32_t VMWARE_VMMOUSE_CMD_REQUEST_ABSOLUTE = 0x53424152u;
+constexpr uint32_t VMWARE_ABSPOINTER_STATUS_ERROR = 0xFFFF0000u;
+constexpr uint32_t VMWARE_VERSION_ID = 0x3442554Au;
+constexpr uint32_t VMWARE_RELATIVE_PACKET = 0x00010000u;
+constexpr uint32_t VMWARE_RESTRICT_CPL0 = 0x01u;
+constexpr uint32_t VMWARE_BTN_LEFT   = 0x20;
+constexpr uint32_t VMWARE_BTN_RIGHT  = 0x10;
+constexpr uint32_t VMWARE_BTN_MIDDLE = 0x08;
+constexpr int32_t  VMWARE_RANGE_MAX = 0xFFFF;
+
+enum HypervisorKind : uint8_t { HYP_NONE = 0, HYP_VBOX = 1, HYP_VMWARE = 2 };
+
+bool virtualbox_compat_mode = false;          // alias used by PS/2 packet coalescing path
+HypervisorKind detected_hypervisor = HYP_NONE;
+
+// VBox state
+bool vbox_vmmdev_available = false;
+bool vbox_absolute_mode = false;
+uint16_t vbox_vmmdev_port = 0;
+uint32_t vbox_mouse_features = 0;
+bool vbox_guest_info_reported = false;
+// Last raw absolute coordinates the host reported (in 0..0xFFFF VMMDev space).
+// We use 0xFFFFFFFF as "no prior sample" sentinel so we can ignore the host's
+// initial 0,0 read-back before the user has actually moved their pointer into
+// the VM window  -  without this the cursor warps to top-left whenever absolute
+// mode flips active.
+uint32_t vbox_last_raw_x = 0xFFFFFFFFu;
+uint32_t vbox_last_raw_y = 0xFFFFFFFFu;
+uint32_t vbox_last_raw_buttons = 0xFFFFFFFFu;
+bool vbox_waiting_for_live_absolute_sample = true;
+
+// VMware state
+bool vmware_available = false;
+bool vmware_absolute_mode = false;
+uint32_t vmware_version = 0;
+uint32_t vmware_last_raw_x = 0xFFFFFFFFu;
+uint32_t vmware_last_raw_y = 0xFFFFFFFFu;
+uint32_t vmware_last_raw_buttons = 0xFFFFFFFFu;
+
+struct VBoxVMMDevRequestHeader {
+    uint32_t size;
+    uint32_t version;
+    uint32_t request_type;
+    int32_t rc;
+    uint32_t reserved1;
+    uint32_t requestor;
+} __attribute__((packed));
+
+struct VBoxVMMDevMouseStatusRequest {
+    VBoxVMMDevRequestHeader header;
+    uint32_t mouse_features;
+    int32_t pointer_x;
+    int32_t pointer_y;
+} __attribute__((packed));
+
+struct VBoxVMMDevMouseStatusExRequest {
+    VBoxVMMDevRequestHeader header;
+    uint32_t mouse_features;
+    int32_t pointer_x;
+    int32_t pointer_y;
+    int32_t dz;
+    int32_t dw;
+    uint32_t buttons;
+} __attribute__((packed));
+
+struct VBoxVMMDevReportGuestInfoRequest {
+    VBoxVMMDevRequestHeader header;
+    uint32_t interface_version;
+    uint32_t os_type;
+} __attribute__((packed));
+
+struct VBoxVMMDevReportGuestInfo2Request {
+    VBoxVMMDevRequestHeader header;
+    uint32_t additions_major;
+    uint32_t additions_minor;
+    uint32_t additions_build;
+    uint32_t additions_revision;
+    uint32_t additions_features;
+    char     name[128];
+} __attribute__((packed));
+
+struct VBoxVMMDevReportGuestCapsRequest {
+    VBoxVMMDevRequestHeader header;
+    uint32_t caps;
+} __attribute__((packed));
+
+VBoxVMMDevMouseStatusRequest vbox_set_mouse_status_request = {};
+VBoxVMMDevMouseStatusExRequest vbox_get_mouse_status_request = {};
+VBoxVMMDevReportGuestInfoRequest vbox_report_guest_info_request = {};
+VBoxVMMDevReportGuestInfo2Request vbox_report_guest_info2_request = {};
+VBoxVMMDevReportGuestCapsRequest vbox_report_guest_caps_request = {};
+
+struct VMwareBdoorRegs {
+    uint32_t eax;
+    uint32_t ebx;
+    uint32_t ecx;
+    uint32_t edx;
+};
+
+static inline void vmware_bdoor(VMwareBdoorRegs& r) {
+    asm volatile("inl %%dx, %%eax"
+                 : "+a"(r.eax), "+b"(r.ebx), "+c"(r.ecx), "+d"(r.edx));
+}
+
+static uint32_t vmware_send(uint16_t cmd, uint32_t arg, uint32_t* out_ebx = nullptr,
+                            uint32_t* out_ecx = nullptr, uint32_t* out_edx = nullptr) {
+    VMwareBdoorRegs r;
+    r.eax = VMWARE_BDOOR_MAGIC;
+    r.ebx = arg;
+    r.ecx = cmd;
+    r.edx = VMWARE_BDOOR_PORT;
+    vmware_bdoor(r);
+    if (out_ebx) *out_ebx = r.ebx;
+    if (out_ecx) *out_ecx = r.ecx;
+    if (out_edx) *out_edx = r.edx;
+    return r.eax;
+}
+
+static void cpuid_query(uint32_t leaf, uint32_t subleaf,
+                        uint32_t& eax, uint32_t& ebx,
+                        uint32_t& ecx, uint32_t& edx) {
+    asm volatile("cpuid"
+                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                 : "a"(leaf), "c"(subleaf));
+}
+
+static bool starts_with(const char* value, const char* prefix) {
+    while (*prefix) {
+        if (*value++ != *prefix++) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_valid_relative_packet_start(uint8_t value) {
+    return (value & PS2_PACKET_START_BIT) != 0;
+}
+
+static uint8_t recover_relative_packet_sync(uint8_t* packet, uint8_t packet_bytes) {
+    for (uint8_t start = 1; start < packet_bytes; start++) {
+        if (!is_valid_relative_packet_start(packet[start])) {
+            continue;
+        }
+
+        uint8_t carry = (uint8_t)(packet_bytes - start);
+        for (uint8_t index = 0; index < carry; index++) {
+            packet[index] = packet[start + index];
+        }
+        return carry;
+    }
+
+    return 0;
+}
+
+static HypervisorKind detect_hypervisor_kind() {
+    uint32_t eax = 0;
+    uint32_t ebx = 0;
+    uint32_t ecx = 0;
+    uint32_t edx = 0;
+    cpuid_query(1, 0, eax, ebx, ecx, edx);
+    if ((ecx & CPUID_HYPERVISOR_BIT) == 0) {
+        return HYP_NONE;
+    }
+
+    cpuid_query(0x40000000, 0, eax, ebx, ecx, edx);
+    char vendor[13];
+    ((uint32_t*)&vendor[0])[0] = ebx;
+    ((uint32_t*)&vendor[4])[0] = ecx;
+    ((uint32_t*)&vendor[8])[0] = edx;
+    vendor[12] = 0;
+
+    if (starts_with(vendor, "VBoxVBoxVBox")) return HYP_VBOX;
+    if (starts_with(vendor, "VMwareVMware")) return HYP_VMWARE;
+    if (starts_with(vendor, "KVMKVMKVM")) return HYP_VMWARE;
+    // Hyper-V / Xen fall through to none for our purposes.
+    return HYP_NONE;
+}
+
+[[maybe_unused]] static bool is_virtualbox_hypervisor() {
+    return detect_hypervisor_kind() == HYP_VBOX;
+}
+
+static void vbox_init_request(VBoxVMMDevRequestHeader* header, uint32_t request_type, uint32_t size) {
+    header->size = size;
+    header->version = VBOX_VMMDEV_REQUEST_VERSION;
+    header->request_type = request_type;
+    header->rc = -1;
+    header->reserved1 = 0;
+    header->requestor = 0;
+}
+
+static bool vbox_submit_request(VBoxVMMDevRequestHeader* header) {
+    if (!vbox_vmmdev_port) {
+        return false;
+    }
+
+    uintptr_t phys_addr = (uintptr_t)header;
+    if ((phys_addr >> 32) != 0) {
+        SerialLogger::Log("Mouse: VBox request buffer above 4GiB, skipping VMMDev\r\n");
+        return false;
+    }
+
+    asm volatile("" ::: "memory");
+    outl((uint16_t)(vbox_vmmdev_port + VBOX_VMMDEV_PORT_OFF_REQUEST), (uint32_t)phys_addr);
+    asm volatile("" ::: "memory");
+    return header->rc >= 0;
+}
+
+static uint16_t vbox_find_request_port() {
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t dev = 0; dev < 32; dev++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                if (PCI::GetVendor((uint8_t)bus, dev, func) != VBOX_PCI_VENDOR_ID) {
+                    continue;
+                }
+                if (PCI::GetDevice((uint8_t)bus, dev, func) != VBOX_VMMDEV_DEVICE_ID) {
+                    continue;
+                }
+
+                for (int bar = 0; bar < 6; bar++) {
+                    uint32_t bar_value = PCI::GetBAR((uint8_t)bus, dev, func, bar);
+                    if ((bar_value & 0x1u) == 0) {
+                        continue;
+                    }
+                    return (uint16_t)(bar_value & ~0x3u);
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int vbox_scale_pointer_axis(int value, int max_pixels) {
+    if (value < 0) {
+        value = 0;
+    } else if (value > VBOX_VMMDEV_MOUSE_RANGE_MAX) {
+        value = VBOX_VMMDEV_MOUSE_RANGE_MAX;
+    }
+
+    if (max_pixels <= 1) {
+        return 0;
+    }
+
+    return (int)(((uint64_t)(uint32_t)value * (uint64_t)(max_pixels - 1)) / (uint64_t)VBOX_VMMDEV_MOUSE_RANGE_MAX);
+}
+}
 
 void Mouse::Init() {
     mx = Graphics::GetWidth() / 2;
@@ -78,33 +384,45 @@ void Mouse::Init() {
     
     // reset performance stats
     perf_stats = {0};
+    detected_hypervisor = detect_hypervisor_kind();
+    virtualbox_compat_mode = (detected_hypervisor == HYP_VBOX);
+    ps2_poll_enabled = false;
+    has_scroll = false;
+    has_xbuttons = false;
+    packet_len = 3;
 
-    // enable ps/2 auxiliary device
+    FlushOutput();
+
+    // Linux's i8042 path flushes stale controller bytes before probing AUX,
+    // toggles the port, and verifies the controller config. Do the same here
+    // so BAT/ID bytes from power-on do not get mistaken for failed ACKs.
     WriteCmd(0xA8);
-    
-    // get controller configuration byte
-    WriteCmd(0x20);
-    int t_cb = 100000; uint8_t ccb = 0; 
-    while (t_cb-- > 0) { 
-        uint8_t st = In(0x64); 
-        if (st & 0x01) { ccb = In(0x60); break; } 
+    uint8_t ccb = 0;
+    bool have_ccb = ReadControllerConfig(ccb);
+    if (have_ccb) {
+        ccb &= (uint8_t)~0x20; // AUX clock enabled
+        ccb &= (uint8_t)~0x02; // keep IRQ delivery off, we poll
+        if (!WriteControllerConfig(ccb)) {
+            SerialLogger::Log("Mouse: Failed to write controller config\r\n");
+        }
+    } else {
+        SerialLogger::Log("Mouse: Failed to read controller config\r\n");
     }
-    
-    // enable interrupt (bit 1) and disable clock (bit 5)
-    ccb &= (uint8_t)~0x20;
-    // disable interrupt (bit 1) since we use polling
-    ccb &= (uint8_t)~0x02;
-    // enable auxiliary device (bit 5 clear = enabled? no, bit 5 is mouse clock disable. 0=enable)
-    ccb &= (uint8_t)~0x20; 
-    
-    // set controller configuration byte
-    WriteCmd(0x60);
-    while (In(0x64) & 0x02){}
-    Out(0x60, ccb);
-    
+    FlushOutput();
+
+    uint8_t reset_id = 0;
+    bool reset_ok = ResetDevice(reset_id);
+    if (reset_ok) {
+        SerialLogger::Log("Mouse: Reset/BAT OK id=");
+        SerialLogger::LogHex(reset_id);
+        SerialLogger::Log("\r\n");
+    } else {
+        SerialLogger::Log("Mouse: Reset/BAT did not complete cleanly\r\n");
+    }
+
     // defaults
-    WriteMouse(0xF6); // set defaults
-    if (ExpectAck(100000)) {
+    bool defaults_ok = SendMouseByteAwaitAck(PS2_CMD_SET_DEFAULTS, 100000, 2);
+    if (defaults_ok) {
         SerialLogger::Log("Mouse: Defaults Set (ACK)\r\n");
     } else {
         SerialLogger::Log("Mouse: Defaults Failed (No ACK) - Ignoring\r\n");
@@ -112,9 +430,29 @@ void Mouse::Init() {
     
     FlushOutput();
 
+    uint8_t detected_id = ReadID();
+    if (detected_id == PS2_ID_STANDARD) {
+        detected_id = reset_id;
+    }
+    if (detected_id == PS2_ID_INTELLIMOUSE) {
+        has_scroll = true;
+        packet_len = 4;
+        SerialLogger::Log("Mouse: IntelliMouse detected (scroll wheel)\r\n");
+    } else if (detected_id == PS2_ID_EXPLORER) {
+        has_scroll = true;
+        has_xbuttons = true;
+        packet_len = 4;
+        SerialLogger::Log("Mouse: IntelliMouse Explorer detected (5-button)\r\n");
+    } else {
+        has_scroll = false;
+        has_xbuttons = false;
+        packet_len = 3;
+        SerialLogger::Log("Mouse: Standard PS/2 mouse\r\n");
+    }
+
     // enable streaming
-    WriteMouse(0xF4);
-    if (ExpectAck(100000)) {
+    bool streaming_ok = SendMouseByteAwaitAck(PS2_CMD_ENABLE_STREAM, 100000, 3);
+    if (streaming_ok) {
         SerialLogger::Log("Mouse: Streaming Enabled (ACK)\r\n");
     } else {
         SerialLogger::Log("Mouse: Streaming Failed (No ACK) - Ignoring\r\n");
@@ -122,7 +460,6 @@ void Mouse::Init() {
     
     // initialize enhanced settings
     pkt_i = 0;
-    packet_len = 3;
     speed_mul = 1;
     invert_scroll = false;
     cursor_visible = true;
@@ -140,40 +477,451 @@ void Mouse::Init() {
     sensitivity_mul = 1;
     natural_scroll = false;
     map_left = 0x01; map_right = 0x02; map_middle = 0x04; map_x1 = 0x10; map_x2 = 0x20;
-    has_scroll = false;
-    has_xbuttons = false;
-    packet_len = 3;
+    if (!has_scroll && !has_xbuttons) packet_len = 3;
     device_type = DevMouse;
     abs_mode = false;
     abs_proto = 0;
     device_capabilities = 0x01;
     abs_maxx = 0; abs_maxy = 0; scroll_rest = 0;
-    
+
+    InitVirtualBoxIntegration();
+    InitVMwareIntegration();
+
+    ps2_poll_enabled = streaming_ok;
+    bool absolute_fallback_ok = vbox_vmmdev_available || vmware_available;
+    if (!ps2_poll_enabled && !absolute_fallback_ok) {
+        cursor_visible = false;
+        auto_draw = false;
+        device_type = DevUnknown;
+        FlushOutput();
+        SerialLogger::Log("Mouse: Disabled - no acknowledged PS/2 stream or host integration\r\n");
+        return;
+    }
+
+    if (!ps2_poll_enabled) {
+        SerialLogger::Log("Mouse: PS/2 stream unavailable, waiting for host absolute input\r\n");
+    }
+
     DrawAt(mx, my);
-    SerialLogger::Log("Mouse: Compatibility PS/2 mode enabled\r\n");
+    if (detected_hypervisor == HYP_VBOX) {
+        SerialLogger::Log("Mouse: VirtualBox compatibility mode enabled\r\n");
+    } else if (detected_hypervisor == HYP_VMWARE) {
+        SerialLogger::Log("Mouse: VMware compatibility mode enabled\r\n");
+    }
+    if (ps2_poll_enabled) {
+        SerialLogger::Log("Mouse: Compatibility PS/2 mode enabled\r\n");
+    }
     SerialLogger::Log("Mouse: Enhanced Driver initialized\r\n");
 }
 
+void Mouse::InitVirtualBoxIntegration() {
+    vbox_vmmdev_available = false;
+    vbox_absolute_mode = false;
+    vbox_vmmdev_port = 0;
+    vbox_mouse_features = 0;
+    vbox_guest_info_reported = false;
+    vbox_waiting_for_live_absolute_sample = true;
+
+    if (detected_hypervisor != HYP_VBOX) {
+        return;
+    }
+
+    vbox_vmmdev_port = vbox_find_request_port();
+    if (!vbox_vmmdev_port) {
+        SerialLogger::Log("Mouse: VBox VMMDev request port not found\r\n");
+        return;
+    }
+
+    SerialLogger::Log("Mouse: VBox VMMDev request port 0x");
+    SerialLogger::LogHex(vbox_vmmdev_port);
+    SerialLogger::Log("\r\n");
+
+    // Step 1: ReportGuestInfo - REQUIRED to set fu32AdditionsOk so the host honors
+    // any subsequent SetMouseStatus call. Without this VBox returns VERR_VERSION_MISMATCH
+    // for nearly every other VMMDev request.
+    vbox_init_request(&vbox_report_guest_info_request.header,
+                      VBOX_VMMDEV_REQ_REPORT_GUEST_INFO,
+                      (uint32_t)sizeof(vbox_report_guest_info_request));
+    vbox_report_guest_info_request.interface_version = VBOX_VMMDEV_GUEST_INTERFACE_VERSION;
+    vbox_report_guest_info_request.os_type = VBOX_VMMDEV_GUEST_OS_TYPE_UNKNOWN;
+    if (!vbox_submit_request(&vbox_report_guest_info_request.header)) {
+        SerialLogger::Log("Mouse: VBox ReportGuestInfo failed rc=");
+        SerialLogger::LogHex((uint32_t)vbox_report_guest_info_request.header.rc);
+        SerialLogger::Log("\r\n");
+        vbox_vmmdev_port = 0;
+        return;
+    }
+    vbox_guest_info_reported = true;
+    SerialLogger::Log("Mouse: VBox ReportGuestInfo OK (Additions handshake complete)\r\n");
+
+    // Step 2 (best-effort): ReportGuestInfo2 with KuronoOS identity.
+    vbox_init_request(&vbox_report_guest_info2_request.header,
+                      VBOX_VMMDEV_REQ_REPORT_GUEST_INFO2,
+                      (uint32_t)sizeof(vbox_report_guest_info2_request));
+    vbox_report_guest_info2_request.additions_major = 7;
+    vbox_report_guest_info2_request.additions_minor = 0;
+    vbox_report_guest_info2_request.additions_build = 0;
+    vbox_report_guest_info2_request.additions_revision = 0;
+    vbox_report_guest_info2_request.additions_features = 0;
+    const char* nm = "KuronoOS Guest Mouse Integration";
+    for (int i = 0; i < 128; i++) vbox_report_guest_info2_request.name[i] = 0;
+    for (int i = 0; nm[i] && i < 127; i++) vbox_report_guest_info2_request.name[i] = nm[i];
+    (void)vbox_submit_request(&vbox_report_guest_info2_request.header);
+
+    // Step 3 (best-effort): clear guest capabilities.
+    vbox_init_request(&vbox_report_guest_caps_request.header,
+                      VBOX_VMMDEV_REQ_REPORT_GUEST_CAPS,
+                      (uint32_t)sizeof(vbox_report_guest_caps_request));
+    vbox_report_guest_caps_request.caps = 0;
+    (void)vbox_submit_request(&vbox_report_guest_caps_request.header);
+
+    // Step 4: SetMouseStatus - advertise a modern absolute-input guest driver.
+    // Linux's vboxguest input path reports CAN_ABSOLUTE | NEW_PROTOCOL here.
+    // We draw our own cursor, so we should not ask the host to keep ownership
+    // of pointer rendering via GUEST_NEEDS_HOST_CURSOR.
+    vbox_init_request(&vbox_set_mouse_status_request.header,
+                      VBOX_VMMDEV_REQ_SET_MOUSE_STATUS,
+                      (uint32_t)sizeof(vbox_set_mouse_status_request));
+    vbox_set_mouse_status_request.mouse_features =
+        VBOX_VMMDEV_MOUSE_GUEST_CAN_ABSOLUTE | VBOX_VMMDEV_MOUSE_NEW_PROTOCOL;
+    vbox_set_mouse_status_request.pointer_x = 0;
+    vbox_set_mouse_status_request.pointer_y = 0;
+
+    if (!vbox_submit_request(&vbox_set_mouse_status_request.header)) {
+        SerialLogger::Log("Mouse: VBox SetMouseStatus failed rc=");
+        SerialLogger::LogHex((uint32_t)vbox_set_mouse_status_request.header.rc);
+        SerialLogger::Log("\r\n");
+        vbox_vmmdev_port = 0;
+        return;
+    }
+
+    vbox_vmmdev_available = true;
+    vbox_mouse_features = vbox_set_mouse_status_request.mouse_features;
+    SerialLogger::Log("Mouse: VBox absolute pointer integration ENABLED (mouse_features=");
+    SerialLogger::LogHex(vbox_mouse_features);
+    SerialLogger::Log(")\r\n");
+}
+
+void Mouse::InitVMwareIntegration() {
+    vmware_available = false;
+    vmware_absolute_mode = false;
+    vmware_version = 0;
+    vmware_last_raw_x = 0xFFFFFFFFu;
+    vmware_last_raw_y = 0xFFFFFFFFu;
+    vmware_last_raw_buttons = 0xFFFFFFFFu;
+
+    if (detected_hypervisor != HYP_VMWARE) {
+        return;
+    }
+
+    // Linux vmmouse first probes GETVERSION, then does ENABLE -> STATUS ->
+    // DATA(version id) -> RESTRICT -> REQUEST_ABSOLUTE.
+    uint32_t response = ~VMWARE_BDOOR_MAGIC;
+    uint32_t hypervisor_type = 0;
+    uint32_t version = vmware_send(VMWARE_CMD_GETVERSION, 0, &response, &hypervisor_type, nullptr);
+    if (response != VMWARE_BDOOR_MAGIC || version == 0xFFFFFFFFu) {
+        SerialLogger::Log("Mouse: VMware backdoor probe failed\r\n");
+        return;
+    }
+    vmware_version = version;
+    SerialLogger::Log("Mouse: VMware backdoor present, version=");
+    SerialLogger::LogHex(vmware_version);
+    SerialLogger::Log("\r\n");
+
+    vmware_send(VMWARE_CMD_ABSPOINTER_COMMAND, VMWARE_VMMOUSE_CMD_ENABLE);
+    uint32_t status = vmware_send(VMWARE_CMD_ABSPOINTER_STATUS, 0);
+    if ((status & VMWARE_ABSPOINTER_STATUS_ERROR) == VMWARE_ABSPOINTER_STATUS_ERROR ||
+        (status & 0x0000FFFFu) == 0) {
+        SerialLogger::Log("Mouse: VMware vmmouse enable failed\r\n");
+        vmware_send(VMWARE_CMD_ABSPOINTER_COMMAND, VMWARE_VMMOUSE_CMD_DISABLE);
+        return;
+    }
+
+    uint32_t vmmouse_version = vmware_send(VMWARE_CMD_ABSPOINTER_DATA, 1);
+    if (vmmouse_version != VMWARE_VERSION_ID) {
+        SerialLogger::Log("Mouse: VMware vmmouse version mismatch value=");
+        SerialLogger::LogHex(vmmouse_version);
+        SerialLogger::Log("\r\n");
+        vmware_send(VMWARE_CMD_ABSPOINTER_COMMAND, VMWARE_VMMOUSE_CMD_DISABLE);
+        return;
+    }
+
+    vmware_send(VMWARE_CMD_ABSPOINTER_RESTRICT, VMWARE_RESTRICT_CPL0);
+    vmware_send(VMWARE_CMD_ABSPOINTER_COMMAND, VMWARE_VMMOUSE_CMD_REQUEST_ABSOLUTE);
+
+    vmware_available = true;
+    SerialLogger::Log("Mouse: VMware vmmouse absolute integration ENABLED\r\n");
+}
+
+void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int wheel_delta) {
+    perf_stats.packets_processed++;
+
+    int w = Graphics::GetWidth();
+    int h = Graphics::GetHeight();
+    if (w <= 0) w = 1;
+    if (h <= 0) h = 1;
+    if (new_x < 0) new_x = 0; else if (new_x >= w) new_x = w - 1;
+    if (new_y < 0) new_y = 0; else if (new_y >= h) new_y = h - 1;
+
+    int old_x = mx;
+    int old_y = my;
+    int rel_dx = new_x - old_x;
+    int rel_dy = old_y - new_y;
+
+    uint8_t new_buttons = MapButtons(hw_buttons);
+    bool left = (new_buttons & 0x01) != 0;
+    bool right = (new_buttons & 0x02) != 0;
+    if (left && !(prev_buttons & 0x01)) {
+        left_clicked = true;
+        SerialLogger::Log("Mouse: Left Click\r\n");
+    }
+    if (right && !(prev_buttons & 0x02)) {
+        right_clicked = true;
+        SerialLogger::Log("Mouse: Right Click\r\n");
+    }
+    left_down = left;
+    buttons = new_buttons;
+
+    if (rel_dx || rel_dy) {
+        lastx = old_x;
+        lasty = old_y;
+        mx = new_x;
+        my = new_y;
+        if (cursor_visible && auto_draw) {
+            ClearAt(lastx, lasty);
+            DrawAt(mx, my);
+        }
+        uint64_t ts = TimeManager::NowUTC().us;
+        Event e{};
+        e.type = 0; e.x = mx; e.y = my; e.dx = rel_dx; e.dy = rel_dy;
+        e.buttons = new_buttons; e.time_us = ts;
+        events[ev_head++] = e; ev_head &= 255;
+    }
+
+    if (wheel_delta) {
+        if (invert_scroll) wheel_delta = -wheel_delta;
+        uint64_t ts = TimeManager::NowUTC().us;
+        Event e{};
+        e.type = 3; e.x = mx; e.y = my; e.dz = wheel_delta;
+        e.buttons = new_buttons; e.time_us = ts;
+        events[ev_head++] = e; ev_head &= 255;
+    }
+
+    uint8_t changed = (uint8_t)(new_buttons ^ prev_buttons);
+    if (changed) {
+        uint64_t ts = TimeManager::NowUTC().us;
+        for (int i = 0; i < 5; i++) {
+            uint8_t mask = (i == 0 ? 0x01 : i == 1 ? 0x02 : i == 2 ? 0x04 : i == 3 ? 0x08 : 0x10);
+            if (!(changed & mask)) continue;
+            Event e{};
+            e.type = (uint8_t)((new_buttons & mask) ? 1 : 2);
+            e.x = mx; e.y = my; e.button = (uint8_t)i;
+            e.buttons = new_buttons; e.time_us = ts;
+            events[ev_head++] = e; ev_head &= 255;
+        }
+    }
+    prev_buttons = new_buttons;
+}
+
+bool Mouse::PollVirtualBoxAbsolute() {
+    if (!vbox_vmmdev_available) {
+        return false;
+    }
+
+    vbox_init_request(&vbox_get_mouse_status_request.header,
+                      VBOX_VMMDEV_REQ_GET_MOUSE_STATUS_EX,
+                      (uint32_t)sizeof(vbox_get_mouse_status_request));
+    vbox_get_mouse_status_request.mouse_features = 0;
+    vbox_get_mouse_status_request.pointer_x = 0;
+    vbox_get_mouse_status_request.pointer_y = 0;
+    vbox_get_mouse_status_request.dz = 0;
+    vbox_get_mouse_status_request.dw = 0;
+    vbox_get_mouse_status_request.buttons = 0;
+
+    if (!vbox_submit_request(&vbox_get_mouse_status_request.header)) {
+        if (vbox_absolute_mode) {
+            SerialLogger::Log("Mouse: VBox mouse polling failed, falling back to PS/2\r\n");
+        }
+        vbox_absolute_mode = false;
+        smooth_inited = false;
+        return false;
+    }
+
+    vbox_mouse_features = vbox_get_mouse_status_request.mouse_features;
+    bool host_absolute = (vbox_mouse_features & (VBOX_VMMDEV_MOUSE_HOST_WANTS_ABSOLUTE | VBOX_VMMDEV_MOUSE_HOST_HAS_ABS_DEV)) != 0;
+    if (host_absolute != vbox_absolute_mode) {
+        vbox_absolute_mode = host_absolute;
+        smooth_inited = false;
+        // On any active<->inactive transition reset the raw tracker so the next
+        // "real" sample isn't compared against a stale value (which would let a
+        // 0,0 readback through as a valid movement).
+        vbox_last_raw_x = 0xFFFFFFFFu;
+        vbox_last_raw_y = 0xFFFFFFFFu;
+        vbox_last_raw_buttons = 0xFFFFFFFFu;
+        vbox_waiting_for_live_absolute_sample = host_absolute;
+        SerialLogger::Log("Mouse: VBox absolute integration ");
+        SerialLogger::Log(host_absolute ? "active" : "inactive");
+        SerialLogger::Log("\r\n");
+    }
+    if (!host_absolute) {
+        return false;
+    }
+
+    uint32_t raw_x = (uint32_t)vbox_get_mouse_status_request.pointer_x;
+    uint32_t raw_y = (uint32_t)vbox_get_mouse_status_request.pointer_y;
+    uint32_t raw_buttons = vbox_get_mouse_status_request.buttons;
+    int wheel = vbox_get_mouse_status_request.dz;
+
+    // Only emit when the host actually reports a change. This kills the
+    // "snap to (0,0) on capture / first activation" warp: VBox returns the
+    // last-known host pointer (often 0,0) until the user moves into the VM
+    // window, and we'd rather sit still than warp.
+    bool first_sample = (vbox_last_raw_x == 0xFFFFFFFFu);
+    bool changed = (raw_x != vbox_last_raw_x) ||
+                   (raw_y != vbox_last_raw_y) ||
+                   (raw_buttons != vbox_last_raw_buttons) ||
+                   (wheel != 0);
+    vbox_last_raw_x = raw_x;
+    vbox_last_raw_y = raw_y;
+    vbox_last_raw_buttons = raw_buttons;
+    if (first_sample || !changed) {
+        // Swallow the very first reading and any "no-op" polls. Returning true
+        // still claims the input path so PS/2 doesn't double-fire while
+        // absolute integration is active.
+        return true;
+    }
+
+    // VBox commonly reports 0,0 until the host pointer has actually crossed
+    // into the VM window. Keep swallowing those placeholder coordinates until
+    // we observe the first non-zero absolute sample after activation. After
+    // that, real top-left movement remains valid.
+    if (vbox_waiting_for_live_absolute_sample) {
+        if (raw_x == 0 && raw_y == 0) {
+            return true;
+        }
+        vbox_waiting_for_live_absolute_sample = false;
+    }
+
+    int new_x = vbox_scale_pointer_axis((int32_t)raw_x, Graphics::GetWidth());
+    int new_y = vbox_scale_pointer_axis((int32_t)raw_y, Graphics::GetHeight());
+
+    uint8_t hw_buttons = 0;
+    if (raw_buttons & VBOX_VMMDEV_MOUSE_BUTTON_LEFT)   hw_buttons |= 0x01;
+    if (raw_buttons & VBOX_VMMDEV_MOUSE_BUTTON_RIGHT)  hw_buttons |= 0x02;
+    if (raw_buttons & VBOX_VMMDEV_MOUSE_BUTTON_MIDDLE) hw_buttons |= 0x04;
+    if (raw_buttons & VBOX_VMMDEV_MOUSE_BUTTON_X1)     hw_buttons |= 0x10;
+    if (raw_buttons & VBOX_VMMDEV_MOUSE_BUTTON_X2)     hw_buttons |= 0x20;
+
+    EmitHostAbsoluteSample(new_x, new_y, hw_buttons, wheel);
+    return true;
+}
+
+bool Mouse::PollVMwareAbsolute() {
+    if (!vmware_available) return false;
+
+    bool delivered_any = false;
+    // Linux drains the backdoor queue in 4-dword packets: status, x, y, z.
+    for (int guard = 0; guard < 255; guard++) {
+        uint32_t status = vmware_send(VMWARE_CMD_ABSPOINTER_STATUS, 0);
+        if ((status & VMWARE_ABSPOINTER_STATUS_ERROR) == VMWARE_ABSPOINTER_STATUS_ERROR) {
+            SerialLogger::Log("Mouse: VMware ABSPOINTER status error, disabling integration\r\n");
+            vmware_send(VMWARE_CMD_ABSPOINTER_COMMAND, VMWARE_VMMOUSE_CMD_DISABLE);
+            vmware_available = false;
+            vmware_absolute_mode = false;
+            vmware_last_raw_x = 0xFFFFFFFFu;
+            vmware_last_raw_y = 0xFFFFFFFFu;
+            vmware_last_raw_buttons = 0xFFFFFFFFu;
+            return delivered_any;
+        }
+        uint32_t words = status & 0xFFFFu;
+        if (words < 4) break;
+        if ((words & 0x3u) != 0) {
+            SerialLogger::Log("Mouse: VMware ABSPOINTER invalid queue length\r\n");
+            vmware_send(VMWARE_CMD_ABSPOINTER_COMMAND, VMWARE_VMMOUSE_CMD_DISABLE);
+            vmware_available = false;
+            vmware_absolute_mode = false;
+            return delivered_any;
+        }
+
+        uint32_t pkt_x = 0, pkt_y = 0, pkt_z = 0;
+        uint32_t pkt_status = vmware_send(VMWARE_CMD_ABSPOINTER_DATA, 4, &pkt_x, &pkt_y, &pkt_z);
+
+        uint8_t hw_buttons = 0;
+        if (pkt_status & VMWARE_BTN_LEFT)   hw_buttons |= 0x01;
+        if (pkt_status & VMWARE_BTN_RIGHT)  hw_buttons |= 0x02;
+        if (pkt_status & VMWARE_BTN_MIDDLE) hw_buttons |= 0x04;
+
+        // Linux reports wheel as REL_WHEEL, -(s8)((u8)z).
+        int wheel = -(int)(int8_t)(pkt_z & 0xFF);
+
+        if (pkt_status & VMWARE_RELATIVE_PACKET) {
+            int new_x = mx + (int32_t)pkt_x;
+            int new_y = my - (int32_t)pkt_y;
+            EmitHostAbsoluteSample(new_x, new_y, hw_buttons, wheel);
+            delivered_any = true;
+            continue;
+        }
+
+        if (!vmware_absolute_mode) {
+            vmware_absolute_mode = true;
+            smooth_inited = false;
+            vmware_last_raw_x = 0xFFFFFFFFu;
+            vmware_last_raw_y = 0xFFFFFFFFu;
+            vmware_last_raw_buttons = 0xFFFFFFFFu;
+            SerialLogger::Log("Mouse: VMware vmmouse absolute integration active\r\n");
+        }
+
+        // Same anti-warp gate as the VBox path: drop the first reading and any
+        // packet whose raw coordinates+buttons match the previous one.
+        bool first_sample = (vmware_last_raw_x == 0xFFFFFFFFu);
+        bool changed = (pkt_x != vmware_last_raw_x) ||
+                       (pkt_y != vmware_last_raw_y) ||
+                       (pkt_status != vmware_last_raw_buttons) ||
+                       (wheel != 0);
+        vmware_last_raw_x = pkt_x;
+        vmware_last_raw_y = pkt_y;
+        vmware_last_raw_buttons = pkt_status;
+        delivered_any = true;
+        if (first_sample || !changed) {
+            continue;
+        }
+
+        int sw = Graphics::GetWidth();
+        int sh = Graphics::GetHeight();
+        if (sw <= 1) sw = 2;
+        if (sh <= 1) sh = 2;
+        int new_x = (int)(((uint64_t)pkt_x * (uint64_t)(sw - 1)) / (uint64_t)VMWARE_RANGE_MAX);
+        int new_y = (int)(((uint64_t)pkt_y * (uint64_t)(sh - 1)) / (uint64_t)VMWARE_RANGE_MAX);
+
+        EmitHostAbsoluteSample(new_x, new_y, hw_buttons, wheel);
+    }
+    // Once vmmouse is enabled it should own the mouse stream; falling back to
+    // raw PS/2 when the queue is momentarily empty causes duplicate/jittery
+    // motion in VMware because both paths race to update the cursor.
+    return vmware_available || delivered_any;
+}
+
 Mouse::DeviceType Mouse::DetectDeviceType() {
-    // try to detect if we have a gaming mouse, touchpad, or basic mouse
-    // this is a simplified detection
-    
-    // check for intellimouse support
-    WriteMouse(0xF3); ExpectAck(10000); // set sample rate
-    WriteMouse(200); ExpectAck(10000);
-    WriteMouse(0xF3); ExpectAck(10000);
-    WriteMouse(100); ExpectAck(10000);
-    WriteMouse(0xF3); ExpectAck(10000);
-    WriteMouse(80); ExpectAck(10000);
-    
+    // Mirror Linux's psmouse extension probe sequence.
+    if (!CommandArg(PS2_CMD_SET_SAMPLE_RATE, 200)) return DevMouse;
+    if (!CommandArg(PS2_CMD_SET_SAMPLE_RATE, 100)) return DevMouse;
+    if (!CommandArg(PS2_CMD_SET_SAMPLE_RATE, 80)) return DevMouse;
+
     uint8_t device_id = ReadID();
-    
-    if (device_id == 0x03) {
+
+    if (device_id == PS2_ID_INTELLIMOUSE) {
         has_scroll = true;
         packet_len = 4;
         SerialLogger::Log("Mouse: IntelliMouse detected (scroll wheel)\r\n");
         return DevMouse;
-    } else if (device_id == 0x04) {
+    }
+
+    if (!CommandArg(PS2_CMD_SET_SAMPLE_RATE, 200)) return DevMouse;
+    if (!CommandArg(PS2_CMD_SET_SAMPLE_RATE, 200)) return DevMouse;
+    if (!CommandArg(PS2_CMD_SET_SAMPLE_RATE, 80)) return DevMouse;
+
+    device_id = ReadID();
+    if (device_id == PS2_ID_EXPLORER) {
         has_scroll = true;
         has_xbuttons = true;
         packet_len = 4;
@@ -328,30 +1076,105 @@ const Mouse::PerformanceStats& Mouse::GetPerformanceStats() {
 }
 
 void Mouse::Poll() {
+    if (PollVirtualBoxAbsolute()) {
+        FlushOutput();
+        return;
+    }
+    if (PollVMwareAbsolute()) {
+        FlushOutput();
+        return;
+    }
+    if (!ps2_poll_enabled) {
+        // If PS/2 init failed we still need to drain auxiliary bytes so they
+        // do not keep the shared 8042 output buffer permanently occupied and
+        // starve keyboard polling in the GUI loop.
+        FlushOutput();
+        return;
+    }
+
     // limit loop to prevent hanging if controller is spamming status but no data
-    int loop_limit = 100;
+    int loop_limit = virtualbox_compat_mode ? VBOX_MOUSE_POLL_LIMIT : DEFAULT_MOUSE_POLL_LIMIT;
     while (loop_limit-- > 0) {
         uint8_t st = In(0x64);
-        if (!((st & 0x01) && (st & 0x20))) break;
+        if (!((st & 0x01) && (st & 0x20))) {
+            // VirtualBox can split packet bytes across tightly-spaced IRQs.
+            if (!(virtualbox_compat_mode && pkt_i != 0)) break;
+
+            int spins = VBOX_PACKET_COALESCE_SPINS;
+            while (spins-- > 0) {
+                asm volatile("pause");
+                st = In(0x64);
+                if ((st & 0x01) && (st & 0x20)) {
+                    break;
+                }
+            }
+
+            if (!((st & 0x01) && (st & 0x20))) break;
+        }
         uint8_t v = In(0x60);
         
         // synchronization: ensure first byte of packet has bit 3 set (for standard ps/2 and intellimouse)
         if (pkt_i == 0 && !abs_mode && (packet_len == 3 || packet_len == 4)) {
-            if ((v & 0x08) == 0) {
+            if (!is_valid_relative_packet_start(v)) {
+                perf_stats.precision_errors++;
                 continue;
             }
         }
 
         pkt[pkt_i++] = v;
         if (pkt_i >= packet_len) {
+            uint8_t packet_bytes = pkt_i;
             pkt_i = 0;
             uint8_t b = pkt[0];
             if (!abs_mode && packet_len <= 4) {
-                if ((b & 0x08) == 0) { prev_buttons = buttons; continue; }
+                if (!is_valid_relative_packet_start(b)) {
+                    perf_stats.precision_errors++;
+                    pkt_i = recover_relative_packet_sync(pkt, packet_bytes);
+                    prev_buttons = buttons;
+                    continue;
+                }
             }
-            int8_t dx = (int8_t)pkt[1];
-            int8_t dy = (int8_t)pkt[2];
+            perf_stats.packets_processed++;
+            // PS/2 packet format: pkt[0] holds the per-axis SIGN bits and OVERFLOW
+            // bits; pkt[1]/pkt[2] are the low 8 bits of a 9-bit signed delta.
+            //   bit 0: left button
+            //   bit 1: right button
+            //   bit 2: middle button
+            //   bit 3: always 1 (sync marker)
+            //   bit 4: X sign  (1 = negative)
+            //   bit 5: Y sign  (1 = negative)
+            //   bit 6: X overflow
+            //   bit 7: Y overflow
+            // Reconstruct the signed delta as (raw_byte | sign_extension):
+            //   delta = pkt[N] - ((pkt[0] << k) & 0x100)
+            // Without this, fast motion (|delta| > 127) wraps into the opposite
+            // direction and warps the cursor into a corner  -  exactly the bug
+            // we hit when VBox synthesises a big delta on capture.
+            int dx_full = 0;
+            int dy_full = 0;
             int8_t dz = 0;
+            if (!abs_mode && (packet_len == 3 || packet_len == 4)) {
+                if (b & 0x40) {
+                    // X overflow  -  host saw a delta too big to encode. Drop the
+                    // axis rather than guess; otherwise we'd jam the cursor at
+                    // an edge.
+                    dx_full = 0;
+                } else {
+                    dx_full = (int)pkt[1] - (int)((b << 4) & 0x100);
+                }
+                if (b & 0x80) {
+                    dy_full = 0;
+                } else {
+                    dy_full = (int)pkt[2] - (int)((b << 3) & 0x100);
+                }
+            } else {
+                // Absolute / 6-byte protocols re-derive m_dx/m_dy below from
+                // ax/ay diffs, so the legacy int8_t cast is fine as a stub.
+                dx_full = (int)(int8_t)pkt[1];
+                dy_full = (int)(int8_t)pkt[2];
+            }
+            int8_t dx = (int8_t)(dx_full < -128 ? -128 : (dx_full > 127 ? 127 : dx_full));
+            int8_t dy = (int8_t)(dy_full < -128 ? -128 : (dy_full > 127 ? 127 : dy_full));
             uint8_t xbtn = 0;
             if (packet_len == 4) {
                 if (has_xbuttons) { xbtn = (uint8_t)((pkt[3] & 0x10 ? 0x10 : 0) | (pkt[3] & 0x20 ? 0x20 : 0)); }
@@ -403,7 +1226,7 @@ void Mouse::Poll() {
                 bool near_edge = edge_scroll && abs_maxx && (ax > abs_maxx - (abs_maxx / 12));
                 bool do_scroll = near_edge || (two_finger_scroll && ((pkt[2] & 0x01) != 0));
                 if (do_scroll) { int s = m_dy + scroll_rest; int steps = s / 32; scroll_rest = s - steps * 32; if (steps) { int dzv = steps; if (invert_scroll) dzv = -dzv; uint64_t ts = TimeManager::NowUTC().us; Event e; e.type = 3; e.x = mx; e.y = my; e.dx = 0; e.dy = 0; e.dz = dzv; e.button = 0; e.buttons = new_buttons; e.fingers = 0; e.pressure = (uint8_t)pr; e.width = 0; e.gesture = 0; e.time_us = ts; events[ev_head++] = e; ev_head &= 255; } prev_buttons = new_buttons; continue; }
-            } else { m_dx = (int)dx * (int)speed_mul; m_dy = (int)dy * (int)speed_mul; }
+            } else { m_dx = dx_full * (int)speed_mul; m_dy = dy_full * (int)speed_mul; }
             if (deadzone_px) { if (m_dx > -deadzone_px && m_dx < deadzone_px) m_dx = 0; if (m_dy > -deadzone_px && m_dy < deadzone_px) m_dy = 0; }
             if (sensitivity_mul > 1) {
                 m_dx *= (int)sensitivity_mul;
@@ -460,25 +1283,156 @@ void Mouse::Poll() {
 
 void Mouse::Out(uint16_t p, uint8_t v) { __asm__ __volatile__("outb %0, %1" : : "a"(v), "Nd"(p)); }
 uint8_t Mouse::In(uint16_t p) { uint8_t r; __asm__ __volatile__("inb %1, %0" : "=a"(r) : "Nd"(p)); return r; }
-void Mouse::WriteCmd(uint8_t c) { while (In(0x64) & 0x02){} Out(0x64, c); }
-void Mouse::WriteMouse(uint8_t c) { while (In(0x64) & 0x02){} Out(0x64, 0xD4); while (In(0x64) & 0x02){} Out(0x60, c); }
-bool Mouse::ExpectAck(int timeout_us) { 
-    int t = timeout_us; 
-    while (t-- > 0) { 
-        uint8_t st = In(0x64); 
-        if ((st & 0x01) && (st & 0x20)) { 
-            uint8_t a = In(0x60); 
-            if (a == 0xFA) return true;
-            SerialLogger::Log("Mouse: Expected ACK, got "); SerialLogger::LogHex(a); SerialLogger::Log("\r\n");
-            // don't return false immediately, maybe ack is next? 
-            // actually standard ps/2 is strict.
-            return false;
-        } 
-    } 
-    return false; 
+bool Mouse::WaitInputBufferClear(int timeout_us) {
+    int t = timeout_us;
+    while (t-- > 0) {
+        if (!(In(0x64) & 0x02)) return true;
+        __asm__ __volatile__("pause");
+    }
+    return false;
 }
-bool Mouse::CommandArg(uint8_t cmd, uint8_t arg) { WriteMouse(cmd); if (!ExpectAck(100000)) return false; WriteMouse(arg); return ExpectAck(100000); }
-uint8_t Mouse::ReadID() { WriteMouse(0xF2); if (!ExpectAck(100000)) return 0x00; int t = 100000; while (t-- > 0) { uint8_t st = In(0x64); if ((st & 0x01) && (st & 0x20)) { return In(0x60); } } return 0x00; }
+bool Mouse::ReadAuxByte(uint8_t& value, int timeout_us) {
+    int t = timeout_us;
+    while (t-- > 0) {
+        uint8_t st = In(0x64);
+        if (!(st & 0x01)) {
+            __asm__ __volatile__("pause");
+            continue;
+        }
+        uint8_t b = In(0x60);
+        if (st & 0x20) {
+            value = b;
+            return true;
+        }
+    }
+    return false;
+}
+void Mouse::WriteCmd(uint8_t c) {
+    if (WaitInputBufferClear(200000)) Out(0x64, c);
+}
+void Mouse::WriteMouse(uint8_t c) {
+    if (!WaitInputBufferClear(200000)) return;
+    Out(0x64, 0xD4);
+    if (!WaitInputBufferClear(200000)) return;
+    Out(0x60, c);
+}
+bool Mouse::SendMouseByteAwaitAck(uint8_t value, int timeout_us, int max_attempts) {
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        WriteMouse(value);
+        int t = timeout_us;
+        while (t-- > 0) {
+            uint8_t reply = 0;
+            if (!ReadAuxByte(reply, 1)) {
+                __asm__ __volatile__("pause");
+                continue;
+            }
+            if (reply == PS2_RET_ACK) return true;
+            if (reply == PS2_RET_NAK) break;
+            if (reply == PS2_RET_BAT || reply == PS2_ID_STANDARD ||
+                reply == PS2_ID_INTELLIMOUSE || reply == PS2_ID_EXPLORER) {
+                // Linux's libps2 path treats BAT/ID bytes as distinct from ACK
+                // handling. Skip these stale probe/reset bytes instead of
+                // classifying the whole command as failed immediately.
+                continue;
+            }
+            if (reply == PS2_RET_ERR) return false;
+            SerialLogger::Log("Mouse: Expected ACK, got ");
+            SerialLogger::LogHex(reply);
+            SerialLogger::Log("\r\n");
+        }
+    }
+    return false;
+}
+bool Mouse::ExpectAck(int timeout_us) {
+    int t = timeout_us;
+    while (t-- > 0) {
+        uint8_t reply = 0;
+        if (!ReadAuxByte(reply, 1)) {
+            __asm__ __volatile__("pause");
+            continue;
+        }
+        if (reply == PS2_RET_ACK) return true;
+        if (reply == PS2_RET_BAT || reply == PS2_ID_STANDARD ||
+            reply == PS2_ID_INTELLIMOUSE || reply == PS2_ID_EXPLORER) {
+            continue;
+        }
+        if (reply == PS2_RET_NAK || reply == PS2_RET_ERR) return false;
+        SerialLogger::Log("Mouse: Expected ACK, got ");
+        SerialLogger::LogHex(reply);
+        SerialLogger::Log("\r\n");
+    }
+    return false;
+}
+bool Mouse::ReadControllerConfig(uint8_t& cfg) {
+    if (!WaitInputBufferClear(200000)) return false;
+    Out(0x64, 0x20);
+    int t = 200000;
+    while (t-- > 0) {
+        uint8_t st = In(0x64);
+        if (!(st & 0x01)) {
+            __asm__ __volatile__("pause");
+            continue;
+        }
+        uint8_t v = In(0x60);
+        if (st & 0x20) continue;
+        cfg = v;
+        return true;
+    }
+    return false;
+}
+bool Mouse::WriteControllerConfig(uint8_t cfg) {
+    if (!WaitInputBufferClear(200000)) return false;
+    Out(0x64, 0x60);
+    if (!WaitInputBufferClear(200000)) return false;
+    Out(0x60, cfg);
+    return true;
+}
+bool Mouse::ResetDevice(uint8_t& device_id) {
+    device_id = 0;
+    if (!SendMouseByteAwaitAck(PS2_CMD_RESET, 200000, 2)) return false;
+    uint8_t reply = 0;
+    bool saw_bat = false;
+    if (ReadAuxByte(reply, 400000)) {
+        if (reply == PS2_RET_BAT) {
+            saw_bat = true;
+            uint8_t maybe_id = 0;
+            if (ReadAuxByte(maybe_id, 150000)) device_id = maybe_id;
+        } else if (reply == PS2_ID_STANDARD || reply == PS2_ID_INTELLIMOUSE || reply == PS2_ID_EXPLORER) {
+            saw_bat = true;
+            device_id = reply;
+        }
+    }
+    return saw_bat;
+}
+bool Mouse::CommandArg(uint8_t cmd, uint8_t arg) {
+    if (!SendMouseByteAwaitAck(cmd, 100000, 2)) return false;
+    return SendMouseByteAwaitAck(arg, 100000, 2);
+}
+uint8_t Mouse::ReadID() {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        WriteMouse(PS2_CMD_GET_ID);
+        int t = 100000;
+        bool saw_ack = false;
+        while (t-- > 0) {
+            uint8_t reply = 0;
+            if (!ReadAuxByte(reply, 1)) {
+                __asm__ __volatile__("pause");
+                continue;
+            }
+            if (reply == PS2_RET_ACK) {
+                saw_ack = true;
+                continue;
+            }
+            if (reply == PS2_RET_NAK) break;
+            if (reply == PS2_RET_BAT) continue;
+            if (reply == PS2_ID_STANDARD || reply == PS2_ID_INTELLIMOUSE || reply == PS2_ID_EXPLORER) {
+                return reply;
+            }
+            if (saw_ack) return reply;
+        }
+    }
+    return PS2_ID_STANDARD;
+}
 void Mouse::FlushOutput() { for (int i = 0; i < 2048; i++) { uint8_t st = In(0x64); if (!((st & 0x01) && (st & 0x20))) break; (void)In(0x60); } }
 
 uint32_t Mouse::BgAt(int x, int y) { (void)x; (void)y; return 0xFF000000; }
@@ -517,6 +1471,7 @@ void Mouse::DrawAt(int x, int y) {
 bool Mouse::LeftClicked() { bool r = left_clicked; left_clicked = false; return r; }
 bool Mouse::RightClicked() { bool r = right_clicked; right_clicked = false; return r; }
 bool Mouse::IsLeftDown() { return left_down; }
+bool Mouse::IsOperational() { return ps2_poll_enabled || vbox_vmmdev_available || vmware_available; }
 void Mouse::ForceRedraw() { if(auto_draw) DrawAt(mx, my); }
 bool Mouse::HasEvent() { return ev_tail != ev_head; }
 Mouse::Event Mouse::GetEvent() { Event e = events[ev_tail]; ev_tail = (uint16_t)((ev_tail + 1) & 255); return e; }

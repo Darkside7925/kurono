@@ -5,6 +5,7 @@
 
 // static member definitions
 uint64_t* PMM::bitmap       = nullptr;
+uint16_t* PMM::refs         = nullptr;
 uint64_t  PMM::bitmap_size  = 0;
 uint64_t  PMM::total_frames = 0;
 uint64_t  PMM::used_frames  = 0;
@@ -61,8 +62,23 @@ uint64_t PMM::AllocFrame() {
         return 0;
     }
     SetFrame(idx);
+    refs[idx] = 1;
     used_frames++;
     return idx * PAGE_SIZE;
+}
+
+void PMM::RetainFrame(uint64_t phys_addr) {
+    uint64_t idx = phys_addr / PAGE_SIZE;
+    if (idx >= total_frames) return;
+    if (!TestFrame(idx)) return;
+
+    refs[idx]++;
+}
+
+uint32_t PMM::GetFrameRefCount(uint64_t phys_addr) {
+    uint64_t idx = phys_addr / PAGE_SIZE;
+    if (idx >= total_frames) return 0;
+    return refs[idx];
 }
 
 void PMM::FreeFrame(uint64_t phys_addr) {
@@ -70,6 +86,12 @@ void PMM::FreeFrame(uint64_t phys_addr) {
     if (idx >= total_frames) return;
     if (!TestFrame(idx)) return;  // double-free guard
 
+    if (refs[idx] > 1) {
+        refs[idx]--;
+        return;
+    }
+
+    refs[idx] = 0;
     ClearFrame(idx);
     used_frames--;
 
@@ -130,6 +152,7 @@ uint64_t PMM::AllocContiguous(uint64_t count) {
             if (run_len >= count) {
                 // we have enough  -  mark and return
                 bulk_set_frames(run_start, count, bitmap, used_frames);
+                    for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
                 search_hint = run_start + count;
                 return run_start * PAGE_SIZE;
             }
@@ -148,6 +171,7 @@ uint64_t PMM::AllocContiguous(uint64_t count) {
                 run_len++;
                 if (run_len >= count) {
                     bulk_set_frames(run_start, count, bitmap, used_frames);
+                    for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
                     search_hint = run_start + count;
                     return run_start * PAGE_SIZE;
                 }
@@ -229,11 +253,17 @@ void PMM::Init(multiboot_info_t* mbi) {
     uint64_t bitmap_bytes = (total_frames + 63) / 64 * 8;  // round up to qword
     bitmap_size = bitmap_bytes / 8;
     bitmap = (uint64_t*)(uintptr_t)( ((uint64_t)&kernel_end + 4095) & ~4095ULL );
+    refs = (uint16_t*)(uintptr_t)(bitmap + bitmap_size);
+    uint64_t refs_bytes = total_frames * sizeof(uint16_t);
 
     // initialize bitmap: all frames marked as used (all bits = 1)
     uint8_t* bp = (uint8_t*)bitmap;
     for (uint64_t i = 0; i < bitmap_bytes; i++) {
         bp[i] = 0xFF;
+    }
+    uint8_t* rp = (uint8_t*)refs;
+    for (uint64_t i = 0; i < refs_bytes; i++) {
+        rp[i] = 0;
     }
 
     SerialLogger::Log("PMM: Bitmap at 0x");
@@ -303,8 +333,18 @@ void PMM::Init(multiboot_info_t* mbi) {
     // 4c. the bitmap itself
     uint64_t bm_start = (uint64_t)bitmap;
     uint64_t bm_end   = bm_start + bitmap_bytes;
+    uint64_t refs_start = (uint64_t)refs;
+    uint64_t refs_end = refs_start + refs_bytes;
     for (uint64_t addr = bm_start & ~(PAGE_SIZE - 1);
          addr < bm_end; addr += PAGE_SIZE) {
+        uint64_t idx = addr / PAGE_SIZE;
+        if (idx < total_frames && !TestFrame(idx)) {
+            SetFrame(idx);
+            used_frames++;
+        }
+    }
+    for (uint64_t addr = refs_start & ~(PAGE_SIZE - 1);
+         addr < refs_end; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
         if (idx < total_frames && !TestFrame(idx)) {
             SetFrame(idx);
@@ -326,7 +366,12 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
     }
 
-    search_hint = (bm_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t idx = 0; idx < total_frames; idx++) {
+        refs[idx] = TestFrame(idx) ? 1 : 0;
+    }
+
+    uint64_t allocator_end = refs_end > bm_end ? refs_end : bm_end;
+    search_hint = (allocator_end + PAGE_SIZE - 1) / PAGE_SIZE;
 
     SerialLogger::Log("PMM: Total=");
     SerialLogger::LogHex(total_frames);

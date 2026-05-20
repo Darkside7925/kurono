@@ -2,7 +2,11 @@
 #include "../shell/shell.h"
 #include "../fs/kvfs.h"
 #include "../drivers/serial.h"
+#include "../net/network.h"
+#include "../net/tcpip.h"
+#include "../packages/pkgmgr.h"
 #include "../kernel/time.h"  // for timemanager::nowutc
+#include "../kernel/heap.h"
 
 //  kcl interpreter implementation
 
@@ -21,6 +25,11 @@ static void kcpy(char* d, const char* s, int m) {
 }
 static bool keq(const char* a, const char* b) {
     while (*a && *b) { if(*a!=*b) return false; a++; b++; } return *a==*b;
+}
+static bool kends_with(const char* str, const char* suffix) {
+    int sl = klen(str), tl = klen(suffix);
+    if (tl == 0 || sl < tl) return false;
+    return keq(str + sl - tl, suffix);
 }
 static int ka(char* b, int p, int m, const char* s) {
     while (*s && p<m-1) b[p++]=*s++; b[p]=0; return p;
@@ -356,6 +365,24 @@ int KCL::EvalFactor(KCLToken* tokens, int* pos, int count) {
                 return v < lo ? lo : (v > hi ? hi : v);
             }
             if (keq(name, "sign")) return args[0] > 0 ? 1 : (args[0] < 0 ? -1 : 0);
+            // ── sys() builtin: execute a shell command ──
+            if (keq(name, "sys")) {
+                if (argc < 1 || !*pos < count) return 0;
+                // We need the actual string from the token, but args are numeric.
+                // For sys(), use a simplified path: sys("command")
+                // The caller should pass a string. Fallback: look up last string token.
+                return 0; // sys() via ExecCall handles this separately
+            }
+            // ── kcl_read() builtin: read file into variable ──
+            if (keq(name, "kcl_read")) {
+                if (argc < 1) return 0;
+                return 0; // handled in ExecCall
+            }
+            // ── kcl_write() builtin: write string to file ──
+            if (keq(name, "kcl_write")) {
+                if (argc < 2) return 0;
+                return 0;
+            }
             return 0;
         }
 
@@ -459,6 +486,19 @@ int KCL::ExecLine(const char* line, char* output, int max_output) {
 }
 
 int KCL::ExecFile(const char* path, char* output, int max_output) {
+    if (path && kends_with(path, ".kro")) {
+        char app_name[KCL_MAX_NAME];
+        char entry_path[KVFS_MAX_PATH];
+        if (!PackageManager::InstallKro(path, app_name, (int)sizeof(app_name), entry_path, (int)sizeof(entry_path))) {
+            int p = 0;
+            p = ka(output, p, max_output, "kcl: cannot install kro app: ");
+            p = ka(output, p, max_output, PackageManager::GetLastSyncMessage());
+            p = kac(output, p, max_output, '\n');
+            return p;
+        }
+        return ExecFile(entry_path, output, max_output);
+    }
+
     unsigned char buf[KCL_MAX_SCRIPT];
     int sz = KVFS::ReadFile(path, buf, KCL_MAX_SCRIPT);
     if (sz < 0) {

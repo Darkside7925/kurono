@@ -129,6 +129,8 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `ui_elements.h` | UI component declarations |
 | `vga_font.h` | VGA font data |
 | `wallpaper.h` | wallpaper declarations |
+| `wayland_server.cpp` | in-kernel Wayland compositor |
+| `wayland_server.h` | Wayland compositor interface |
 | `window_manager.cpp` | window manager implementation |
 | `window_manager.h` | window manager interface |
 

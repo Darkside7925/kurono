@@ -71,6 +71,9 @@ char         TerminalApp::tab_prefix[TERM_INPUT_MAX];
 
 bool         TerminalApp::shell_ready   = false;
 char         TerminalApp::prompt[128];
+bool         TerminalApp::command_pending = false;
+bool         TerminalApp::command_running = false;
+char         TerminalApp::pending_cmd[TERM_INPUT_MAX];
 unsigned int TerminalApp::blink_timer   = 0;
 
 //  init / open
@@ -83,6 +86,9 @@ void TerminalApp::Init(){
     tab_match_count=0; tab_match_idx=-1; tab_prefix[0]=0;
     blink_timer=0;
     shell_ready=true;
+    command_pending=false;
+    command_running=false;
+    pending_cmd[0]=0;
 
     // clear buffer
     for(int i=0;i<TERM_SCROLL_BK;i++){
@@ -122,9 +128,15 @@ void TerminalApp::Init(){
     WritePrompt();
 }
 
+static void TerminalShellChunkSink(void* /*udata*/, const char* data, int len) {
+    TerminalApp::EmitShellChunk(data, len);
+    KuronoShell::PumpUI();
+}
+
 int TerminalApp::Open(){
     Init();
     RuntimeLog::LogAppEvent("terminal", "open");
+    KuronoShell::SetOutputChunkCallback(TerminalShellChunkSink, nullptr);
     // create window via wm
     int wid = WindowManager::CreateWindow("Terminal", -1, -1, 648, 432,
         (WindowRenderFunc)[](Window* w,int cx,int cy,int cw,int ch){
@@ -188,6 +200,14 @@ void TerminalApp::WriteChar(char c){
     cursor_col++;
     if(cursor_col>buffer[cursor_row].len)
         buffer[cursor_row].len=cursor_col;
+}
+
+void TerminalApp::EmitShellChunk(const char* data, int len) {
+    if (!data || len <= 0) return;
+    SetColor(T_FG, T_BG);
+    for (int i = 0; i < len; i++)
+        WriteChar(data[i]);
+    ScrollToBottom();
 }
 
 void TerminalApp::Write(const char* text){
@@ -305,6 +325,10 @@ void TerminalApp::WritePrompt(){
             SetColor(T_CYAN, T_BG);
             Write("windows");
             break;
+        case ENV_DEBIAN:
+            SetColor(0xFFD70751, T_BG);  // Debian swirl red
+            Write("debian");
+            break;
         default:
             SetColor(0xFF3498DB, T_BG);
             Write("kurono");
@@ -367,6 +391,12 @@ void TerminalApp::TabComplete(){
     for(int i=0;i<partial_len;i++) partial[i]=input_buf[word_start+i];
     partial[partial_len]=0;
 
+    // determine basename insertion point: if partial has '/', we replace
+    // only the substring after the last slash so directory prefix is kept.
+    int last_slash_in_partial=-1;
+    for(int i=0;i<partial_len;i++) if(partial[i]=='/') last_slash_in_partial=i;
+    int insert_pos = word_start + (last_slash_in_partial+1);
+
     // if same prefix: cycle through existing matches
     if(tab_match_count>0 && seq(partial, tab_prefix)){
         tab_match_idx=(tab_match_idx+1)%tab_match_count;
@@ -374,15 +404,15 @@ void TerminalApp::TabComplete(){
         int mlen=slen(m);
         int tail_start=input_cursor, tail_len=input_len-tail_start;
         char nb[TERM_INPUT_MAX];
-        for(int i=0;i<word_start;i++) nb[i]=input_buf[i];
-        for(int i=0;i<mlen&&word_start+i<TERM_INPUT_MAX-1;i++) nb[word_start+i]=m[i];
-        for(int i=0;i<tail_len&&word_start+mlen+i<TERM_INPUT_MAX-1;i++)
-            nb[word_start+mlen+i]=input_buf[tail_start+i];
-        int nl=word_start+mlen+tail_len;
+        for(int i=0;i<insert_pos;i++) nb[i]=input_buf[i];
+        for(int i=0;i<mlen&&insert_pos+i<TERM_INPUT_MAX-1;i++) nb[insert_pos+i]=m[i];
+        for(int i=0;i<tail_len&&insert_pos+mlen+i<TERM_INPUT_MAX-1;i++)
+            nb[insert_pos+mlen+i]=input_buf[tail_start+i];
+        int nl=insert_pos+mlen+tail_len;
         if(nl>=TERM_INPUT_MAX) nl=TERM_INPUT_MAX-1;
         nb[nl]=0;
         scpy(input_buf,nb,TERM_INPUT_MAX);
-        input_len=nl; input_cursor=word_start+mlen;
+        input_len=nl; input_cursor=insert_pos+mlen;
         return;
     }
 
@@ -439,21 +469,21 @@ void TerminalApp::TabComplete(){
     if(tab_match_count==0) return; // no match, silent
 
     if(tab_match_count==1){
-        // auto-insert unique match
+        // auto-insert unique match (preserving directory prefix)
         tab_match_idx=0;
         const char* m=tab_matches[0];
         int mlen=slen(m);
         int tail_start=input_cursor, tail_len=input_len-tail_start;
         char nb[TERM_INPUT_MAX];
-        for(int i=0;i<word_start;i++) nb[i]=input_buf[i];
-        for(int i=0;i<mlen&&word_start+i<TERM_INPUT_MAX-1;i++) nb[word_start+i]=m[i];
-        for(int i=0;i<tail_len&&word_start+mlen+i<TERM_INPUT_MAX-1;i++)
-            nb[word_start+mlen+i]=input_buf[tail_start+i];
-        int nl=word_start+mlen+tail_len;
+        for(int i=0;i<insert_pos;i++) nb[i]=input_buf[i];
+        for(int i=0;i<mlen&&insert_pos+i<TERM_INPUT_MAX-1;i++) nb[insert_pos+i]=m[i];
+        for(int i=0;i<tail_len&&insert_pos+mlen+i<TERM_INPUT_MAX-1;i++)
+            nb[insert_pos+mlen+i]=input_buf[tail_start+i];
+        int nl=insert_pos+mlen+tail_len;
         if(nl>=TERM_INPUT_MAX) nl=TERM_INPUT_MAX-1;
         nb[nl]=0;
         scpy(input_buf,nb,TERM_INPUT_MAX);
-        input_len=nl; input_cursor=word_start+mlen;
+        input_len=nl; input_cursor=insert_pos+mlen;
         tab_match_count=0; // reset so next tab re-scans
     } else {
         // show all matches then cycle on subsequent tabs
@@ -473,6 +503,7 @@ void TerminalApp::TabComplete(){
 
 //  command execution
 void TerminalApp::ExecuteInput(){
+    if(command_pending || command_running) return;
     if(input_len==0){
         NewLine();
         WritePrompt();
@@ -491,25 +522,60 @@ void TerminalApp::ExecuteInput(){
     // reset tab state
     tab_match_count=0; tab_match_idx=-1;
 
-    // echo input already visible; go to new line
+    // echo input already visible; go to new line and queue execution so
+    // the desktop loop can keep cycling outside the raw key callback.
     NewLine();
+    scpy(pending_cmd, input_buf, TERM_INPUT_MAX);
+    command_pending = true;
 
-    // execute through shell
+    // reset input immediately while the command is pending
+    input_buf[0]=0; input_len=0; input_cursor=0;
+    ScrollToBottom();
+}
+
+void TerminalApp::Tick(){
+    if(!command_pending || command_running) return;
+
+    command_running = true;
+    command_pending = false;
+
     char output[SHELL_OUTPUT_BUF];
     output[0]=0;
-    KuronoShell::Execute(input_buf, output, SHELL_OUTPUT_BUF);
+    KuronoShell::Execute(pending_cmd, output, SHELL_OUTPUT_BUF);
+    pending_cmd[0]=0;
 
-    // print output
-    if(output[0]){
+    bool streamed = KuronoShell::TakeIncrementalOutputUsed();
+
+    if(output[0] && !streamed){
         SetColor(T_FG, T_BG);
         Write(output);
         if(output[slen(output)-1]!='\n') NewLine();
     }
 
-    // reset input
-    input_buf[0]=0; input_len=0; input_cursor=0;
+    command_running = false;
     ScrollToBottom();
     WritePrompt();
+}
+
+bool TerminalApp::IsBusy(){
+    return command_pending || command_running;
+}
+
+void TerminalApp::EnqueueCommand(const char* cmd){
+    if(!cmd || !cmd[0]) return;
+    if(command_pending || command_running) return;
+    int i = 0;
+    while(cmd[i] && i < TERM_INPUT_MAX - 1){
+        pending_cmd[i] = cmd[i];
+        i++;
+    }
+    pending_cmd[i] = 0;
+    /* echo the command so users can see what's running, then queue it. */
+    SetColor(T_FG, T_BG);
+    Write(pending_cmd);
+    NewLine();
+    command_pending = true;
+    ScrollToBottom();
 }
 
 void TerminalApp::HistoryUp(){
@@ -634,6 +700,38 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     (void)win_ptr; (void)mx; (void)my; (void)clicked;
 
     if(key==0) return false;
+    if(command_pending || command_running){
+        if(key==3){
+            KuronoShell::RequestCommandCancel();
+            SetColor(T_RED,T_BG);
+            Write("^C");
+            NewLine();
+            SetColor(T_FG,T_BG);
+            ScrollToBottom();
+            KuronoShell::PumpUI();
+            return true;
+        }
+        // Type-ahead: buffer printable chars so they appear after the
+        // running command finishes and the prompt re-draws.
+        if(key>=32 && key<127 && input_len<TERM_INPUT_MAX-1){
+            for(int i=input_len;i>input_cursor;i--)
+                input_buf[i]=input_buf[i-1];
+            input_buf[input_cursor]=key;
+            input_len++;
+            input_cursor++;
+            input_buf[input_len]=0;
+            return true;
+        }
+        if((key==8 || key==127) && input_cursor>0){
+            for(int i=input_cursor-1;i<input_len-1;i++)
+                input_buf[i]=input_buf[i+1];
+            input_len--;
+            input_cursor--;
+            input_buf[input_len]=0;
+            return true;
+        }
+        return true;
+    }
 
     if(scroll_offset < 0) scroll_offset = 0;
 

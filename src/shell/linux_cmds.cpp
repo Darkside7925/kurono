@@ -18,7 +18,9 @@
 #include "../drivers/hda.h"
 #include "../drivers/virtio_gpu.h"
 #include "../drivers/display_mgr.h"
+#include "../net/network.h"
 #include "../net/tcpip.h"
+#include "../system/logging.h"
 #include "../linux/linux_syscall.h"
 #include "../linux/linux_drivers.h"
 #include "../virt/hypervisor.h"
@@ -53,6 +55,18 @@ static int _sau(char* b, int p, int m, unsigned int v) {
     while (v>0) { t[ti++]='0'+(v%10); v/=10; }
     while (ti>0) p=_sac(b,p,m,t[--ti]);
     return p;
+}
+
+static void _log_runtime_event(const char* component, const char* action, const char* detail) {
+    char line[256];
+    int p = 0;
+    line[0] = 0;
+    p = _sa(line, p, sizeof(line), action ? action : "event");
+    if (detail && *detail) {
+        p = _sa(line, p, sizeof(line), ": ");
+        p = _sa(line, p, sizeof(line), detail);
+    }
+    RuntimeLog::LogSystem(component ? component : "system", line);
 }
 
 static int _atoi(const char* s) {
@@ -116,6 +130,297 @@ static bool _guest_is_alpine() {
 }
 static bool _guest_is_debian() {
     return Hypervisor::GetLinuxGuestProfile() == LINUX_GUEST_DEBIAN;
+}
+
+static const int LINUX_HTTP_BUFFER_MAX = 512 * 1024;
+
+static int _http_find_header_end(const char* data, int len) {
+    for (int i = 0; i + 3 < len; i++) {
+        if (data[i] == '\r' && data[i + 1] == '\n' &&
+            data[i + 2] == '\r' && data[i + 3] == '\n') {
+            return i + 4;
+        }
+    }
+    return -1;
+}
+
+static int _http_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool _http_contains_ci(const char* haystack, const char* needle) {
+    int hl = _slen(haystack);
+    int nl = _slen(needle);
+    if (nl == 0 || hl < nl) return false;
+    for (int i = 0; i <= hl - nl; i++) {
+        bool match = true;
+        for (int j = 0; j < nl; j++) {
+            char a = haystack[i + j];
+            char b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+            if (a != b) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+static int _http_decode_chunked(const char* src, int src_len, char* dst, int dst_max) {
+    int sp = 0;
+    int dp = 0;
+    while (sp < src_len) {
+        while (sp < src_len && (src[sp] == '\r' || src[sp] == '\n')) sp++;
+        if (sp >= src_len) break;
+
+        int chunk_size = 0;
+        bool saw_digit = false;
+        while (sp < src_len) {
+            if (src[sp] == ';') {
+                while (sp < src_len && !(src[sp] == '\r' && sp + 1 < src_len && src[sp + 1] == '\n')) sp++;
+                break;
+            }
+            if (src[sp] == '\r' && sp + 1 < src_len && src[sp + 1] == '\n') {
+                sp += 2;
+                break;
+            }
+            int hv = _http_hex(src[sp]);
+            if (hv < 0) return -1;
+            chunk_size = (chunk_size << 4) | hv;
+            saw_digit = true;
+            sp++;
+        }
+        if (!saw_digit) return -1;
+        if (chunk_size == 0) return dp;
+        if (sp + chunk_size > src_len) return -1;
+
+        int copy = chunk_size;
+        if (dp + copy > dst_max - 1) copy = dst_max - 1 - dp;
+        for (int i = 0; i < copy; i++) dst[dp + i] = src[sp + i];
+        dp += copy;
+        sp += chunk_size;
+
+        if (sp + 1 < src_len && src[sp] == '\r' && src[sp + 1] == '\n') sp += 2;
+    }
+    return dp;
+}
+
+static bool _parse_http_url(const char* url, char* host, int host_max,
+                            char* path, int path_max, uint16_t* port,
+                            bool* https) {
+    if (!url || !host || host_max < 2 || !path || path_max < 2 || !port || !https) return false;
+
+    host[0] = 0;
+    path[0] = '/';
+    path[1] = 0;
+    *port = 80;
+    *https = false;
+
+    const char* cursor = url;
+    if (_starts_with(cursor, "http://")) {
+        cursor += 7;
+    } else if (_starts_with(cursor, "https://")) {
+        cursor += 8;
+        *https = true;
+        *port = 443;
+    }
+
+    int hp = 0;
+    while (*cursor && *cursor != '/' && *cursor != ':' && hp < host_max - 1) {
+        host[hp++] = *cursor++;
+    }
+    host[hp] = 0;
+    if (hp == 0) return false;
+
+    if (*cursor == ':') {
+        cursor++;
+        int parsed_port = 0;
+        while (*cursor >= '0' && *cursor <= '9') {
+            parsed_port = parsed_port * 10 + (*cursor - '0');
+            cursor++;
+        }
+        if (parsed_port > 0 && parsed_port <= 65535) *port = (uint16_t)parsed_port;
+    }
+
+    if (*cursor == 0) return true;
+
+    int pp = 0;
+    while (*cursor && pp < path_max - 1) path[pp++] = *cursor++;
+    path[pp] = 0;
+    return path[0] == '/';
+}
+
+static void _filename_from_url_path(const char* path, char* out, int out_max) {
+    if (!out || out_max < 2) return;
+
+    const char* leaf = path;
+    for (const char* p = path; p && *p; p++) {
+        if (*p == '/') leaf = p + 1;
+    }
+    if (!leaf || !*leaf) {
+        _scpy(out, "index.html", out_max);
+        return;
+    }
+
+    int i = 0;
+    while (leaf[i] && leaf[i] != '?' && leaf[i] != '#' && i < out_max - 1) {
+        out[i] = leaf[i];
+        i++;
+    }
+    out[i] = 0;
+    if (i == 0) _scpy(out, "index.html", out_max);
+}
+
+static bool _http_get_plain(const char* url, char* body_out, int body_max,
+                            int* status_out, int* body_len_out,
+                            char* err_out, int err_max) {
+    if (err_out && err_max > 0) err_out[0] = 0;
+    if (body_out && body_max > 0) body_out[0] = 0;
+    if (!url || !body_out || body_max < 2) {
+        if (err_out) _scpy(err_out, "invalid HTTP request buffer", err_max);
+        return false;
+    }
+    if (!TCPStack::IsUp()) {
+        if (err_out) _scpy(err_out, "TCP/IP stack is unavailable on this boot", err_max);
+        return false;
+    }
+
+    char host[128];
+    char path[256];
+    uint16_t port = 80;
+    bool https = false;
+    if (!_parse_http_url(url, host, sizeof(host), path, sizeof(path), &port, &https)) {
+        if (err_out) _scpy(err_out, "unsupported URL format", err_max);
+        return false;
+    }
+    if (https) {
+        if (err_out) _scpy(err_out, "HTTPS is not supported yet; use plain http:// URLs", err_max);
+        return false;
+    }
+
+    RuntimeLog::LogAppEvent("terminal", "http-get", url);
+
+    IPv4Address ip_addr;
+    if (!Network::Resolve(host, &ip_addr)) {
+        _log_runtime_event("http", "resolve failed", host);
+        if (err_out) _scpy(err_out, "hostname resolution failed", err_max);
+        return false;
+    }
+    uint32_t ip = TCPStack::MakeIP(ip_addr.bytes[0], ip_addr.bytes[1], ip_addr.bytes[2], ip_addr.bytes[3]);
+
+    int sock = TCPStack::Socket(SOCK_STREAM);
+    if (sock < 0) {
+        _log_runtime_event("http", "socket unavailable", host);
+        if (err_out) _scpy(err_out, "no free TCP sockets are available", err_max);
+        return false;
+    }
+
+    char* response = (char*)KernelHeap::Alloc(LINUX_HTTP_BUFFER_MAX + 1);
+    if (!response) {
+        TCPStack::Close(sock);
+        if (err_out) _scpy(err_out, "not enough heap for HTTP response buffer", err_max);
+        return false;
+    }
+
+    bool ok = false;
+    do {
+        if (!TCPStack::Connect(sock, ip, port)) {
+            _log_runtime_event("http", "connect failed", host);
+            if (err_out) _scpy(err_out, "TCP connect failed", err_max);
+            break;
+        }
+
+        char request[512];
+        int rp = 0;
+        rp = _sa(request, rp, sizeof(request), "GET ");
+        rp = _sa(request, rp, sizeof(request), path);
+        rp = _sa(request, rp, sizeof(request), " HTTP/1.1\r\nHost: ");
+        rp = _sa(request, rp, sizeof(request), host);
+        rp = _sa(request, rp, sizeof(request), "\r\nUser-Agent: KuronoShell/1.0\r\nConnection: close\r\nAccept: */*\r\n\r\n");
+
+        if (TCPStack::Send(sock, request, rp) != rp) {
+            _log_runtime_event("http", "request send failed", host);
+            if (err_out) _scpy(err_out, "HTTP request send failed", err_max);
+            break;
+        }
+
+        int total = 0;
+        int idle_loops = 0;
+        while (total < LINUX_HTTP_BUFFER_MAX && idle_loops < 40000) {
+            TCPStack::Tick();
+            int got = TCPStack::Recv(sock, response + total, LINUX_HTTP_BUFFER_MAX - total);
+            if (got < 0) {
+                _log_runtime_event("http", "response receive failed", host);
+                if (err_out) _scpy(err_out, "HTTP response receive failed", err_max);
+                total = -1;
+                break;
+            }
+            if (got == 0) {
+                if (TCPStack::IsPeerClosed(sock)) {
+                    break;
+                }
+                idle_loops++;
+                continue;
+            }
+            total += got;
+            idle_loops = 0;
+        }
+
+        if (total <= 0) {
+            _log_runtime_event("http", "no response data", host);
+            if (err_out && err_out[0] == 0) _scpy(err_out, "remote host returned no data", err_max);
+            break;
+        }
+
+        response[total] = 0;
+        int header_end = _http_find_header_end(response, total);
+        if (header_end < 0) {
+            _log_runtime_event("http", "invalid response headers", host);
+            if (err_out) _scpy(err_out, "HTTP headers terminator not found", err_max);
+            break;
+        }
+
+        int status = 0;
+        const char* status_ptr = response;
+        while (*status_ptr && *status_ptr != ' ') status_ptr++;
+        if (*status_ptr == ' ') status = _atoi(status_ptr + 1);
+        if (status_out) *status_out = status;
+
+        char status_line[128];
+        int sp = 0;
+        status_line[0] = 0;
+        sp = _sa(status_line, sp, sizeof(status_line), host);
+        sp = _sa(status_line, sp, sizeof(status_line), " status ");
+        sp = _sai(status_line, sp, sizeof(status_line), status);
+        _log_runtime_event("http", "response", status_line);
+
+        int body_len = total - header_end;
+        if (_http_contains_ci(response, "Transfer-Encoding: chunked")) {
+            body_len = _http_decode_chunked(response + header_end, total - header_end, body_out, body_max);
+            if (body_len < 0) {
+                _log_runtime_event("http", "chunk decode failed", host);
+                if (err_out) _scpy(err_out, "chunked HTTP body decode failed", err_max);
+                break;
+            }
+        } else {
+            if (body_len > body_max - 1) body_len = body_max - 1;
+            for (int i = 0; i < body_len; i++) body_out[i] = response[header_end + i];
+        }
+
+        body_out[body_len] = 0;
+        if (body_len_out) *body_len_out = body_len;
+        ok = true;
+    } while (false);
+
+    TCPStack::Close(sock);
+    KernelHeap::Free(response);
+    return ok;
 }
 
 static int _append_vm_state_name(char* out, int p, int mx, VMState st) {
@@ -242,7 +547,8 @@ void LinuxCmds::RegisterAll(KuronoShell* sh) {
     sh->RegisterCommand("tr",       "Translate chars",         ENV_AUTO, "text",       cmd_tr);
     sh->RegisterCommand("free",     "Memory usage",            ENV_AUTO, "system",     cmd_free);
     sh->RegisterCommand("mount",    "Show mounts",             ENV_AUTO, "system",     cmd_mount);
-    sh->RegisterCommand("dmesg",    "Kernel log",              ENV_AUTO, "system",     cmd_dmesg);
+    sh->RegisterCommand("dmesg",    "Serial log tail (/kurono/logs/serial.log)", ENV_AUTO, "system", cmd_dmesg);
+    sh->RegisterCommand("journal",  "KVFS log tail viewer",                     ENV_AUTO, "system", cmd_journal);
     sh->RegisterCommand("lspci",    "List PCI devices",        ENV_AUTO, "system",     cmd_lspci);
     sh->RegisterCommand("lsmod",    "List loaded drivers",     ENV_AUTO, "system",     cmd_lsmod);
     sh->RegisterCommand("drivers",  "Driver status summary",   ENV_AUTO, "system",     cmd_drivers);
@@ -938,6 +1244,131 @@ int LinuxCmds::cmd_free(KuronoShell* sh, int argc, const char** argv, char* out,
     return p;
 }
 
+static bool lc_arg_is_decimal_pos(const char* s) {
+    if (!s || !s[0]) return false;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return false;
+    }
+    return true;
+}
+
+static int lc_kvfs_tail_into_out(const char* path, char* out, int mx,
+                                 int chars_hint_before,
+                                 const char* banner_line) {
+    if (!path || !out || mx < 96) return 0;
+    int p = 0;
+    if (banner_line && banner_line[0])
+        p = _sa(out, p, mx, banner_line);
+
+    KVFSNode* node = KVFS::Resolve(path);
+    if (!node || !node->is_file()) {
+        p = _sa(out, p, mx, "Log file ");
+        p = _sa(out, p, mx, path);
+        p = _sa(out, p, mx, " is missing (logging uses KVFS after init).\n");
+        return p;
+    }
+    uint32_t fsz = node->size;
+    if (fsz == 0) {
+        p = _sa(out, p, mx, "(empty log file)\n");
+        return p;
+    }
+
+    int space_after_banner = mx - p - 2;
+    if (space_after_banner < 32)
+        return p;
+
+    int slab_cap = space_after_banner;
+    if (slab_cap > 7680)
+        slab_cap = 7680;
+
+    int hint = chars_hint_before;
+    if (hint < 512)
+        hint = 512;
+    if (hint > slab_cap)
+        hint = slab_cap;
+
+    uint32_t start_byte = hint >= (int)fsz ? 0u : (fsz - (uint32_t)hint);
+
+    int fd = KVFS::Open(path, 1);
+    if (fd < 0) {
+        p = _sa(out, p, mx, "Could not open log.\n");
+        return p;
+    }
+    KVFS::Seek(fd, (int32_t)start_byte, 0);
+
+    uint8_t* slab = (uint8_t*)KernelHeap::Alloc((uint32_t)(slab_cap + 8));
+    if (!slab) {
+        KVFS::Close(fd);
+        p = _sa(out, p, mx, "Not enough heap for log tail.\n");
+        return p;
+    }
+
+    int rr = KVFS::Read(fd, slab, (uint32_t)slab_cap);
+    KVFS::Close(fd);
+
+    slab[slab_cap] = 0;
+    int body_off = 0;
+    int body_len = rr;
+    if (start_byte > 0 && rr > 0) {
+        while (body_off < rr && slab[body_off] != '\n')
+            body_off++;
+        if (body_off < rr && slab[body_off] == '\n')
+            body_off++;
+        body_len = rr - body_off;
+    }
+    int copy_budget = mx - p - 1;
+    int copy_len = body_len > copy_budget ? copy_budget : body_len;
+    for (int i = 0; i < copy_len; i++)
+        out[p++] = (char)slab[body_off + i];
+    KernelHeap::Free(slab);
+    if (copy_len <= 0) {
+        p = _sa(out, p, mx, "(no tail lines in window)\n");
+        return p;
+    }
+    if (p <= 0 || out[p - 1] != '\n')
+        p = _sac(out, p, mx, '\n');
+    out[p] = 0;
+    return p;
+}
+
+int LinuxCmds::cmd_journal(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+
+    const char* log_path = "/kurono/logs/system.log";
+    int approx_lines = 120;
+
+    if (argc >= 2 && lc_arg_is_decimal_pos(argv[1]))
+        approx_lines = _atoi(argv[1]);
+    else if (argc >= 2)
+        log_path = argv[1];
+
+    if (argc >= 3) {
+        if (lc_arg_is_decimal_pos(argv[1])) {
+            approx_lines = _atoi(argv[1]);
+            log_path = argv[2];
+        } else if (lc_arg_is_decimal_pos(argv[2])) {
+            log_path = argv[1];
+            approx_lines = _atoi(argv[2]);
+        } else {
+            log_path = argv[2];
+        }
+    }
+
+    if (approx_lines < 8)
+        approx_lines = 8;
+    if (approx_lines > 2000)
+        approx_lines = 2000;
+
+    int hint = approx_lines * 112;
+    if (hint > mx * 48)
+        hint = mx * 48;
+    char banner[192];
+    int bp = _sa(banner, 0, sizeof(banner), "=== tail ");
+    bp = _sa(banner, bp, sizeof(banner), log_path);
+    bp = _sa(banner, bp, sizeof(banner), " ===\n");
+    return lc_kvfs_tail_into_out(log_path, out, mx, hint, banner);
+}
+
 int LinuxCmds::cmd_mount(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh; (void)argc; (void)argv;
     int p = 0;
@@ -949,66 +1380,18 @@ int LinuxCmds::cmd_mount(KuronoShell* sh, int argc, const char** argv, char* out
 }
 
 int LinuxCmds::cmd_dmesg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
-    (void)sh; (void)argc; (void)argv;
-    int p = 0;
-    p = _sa(out, p, mx, "[    0.000] Kurono OS 1.0.0 booting...\n");
-    p = _sa(out, p, mx, "[    0.001] HAL: IDT + PIC initialized\n");
-    p = _sa(out, p, mx, "[    0.002] Heap: 2 GB kernel heap (bump allocator)\n");
-    p = _sa(out, p, mx, "[    0.003] RTC: reading CMOS clock...\n");
-    p = _sa(out, p, mx, "[    0.004] PIT: Timer at 1000 Hz\n");
-    p = _sa(out, p, mx, "[    0.005] VFS: Initialized with RAMDisk support\n");
-    p = _sa(out, p, mx, "[    0.010] BGA: mode ");
-    p = _sau(out, p, mx, BGA::width); p = _sac(out, p, mx, 'x');
-    p = _sau(out, p, mx, BGA::height); p = _sac(out, p, mx, 'x');
-    p = _sau(out, p, mx, BGA::bpp); p = _sac(out, p, mx, '\n');
-    p = _sa(out, p, mx, "[    0.015] PS/2: Keyboard + Mouse initialized\n");
-    p = _sa(out, p, mx, "[    0.020] KVFS: Virtual filesystem mounted\n");
-    if (E1000::IsDetected()) {
-        p = _sa(out, p, mx, "[    0.025] e1000: Intel 82540EM NIC ");
-        p = _sa(out, p, mx, E1000::IsLinkUp() ? "link up\n" : "link down\n");
-    }
-    if (Audio::IsAvailable()) p = _sa(out, p, mx, "[    0.030] sb16: Sound Blaster 16 ready\n");
-    if (HDAudio::IsDetected()) {
-        p = _sa(out, p, mx, "[    0.031] snd_hda_intel: ");
-        p = _sai(out, p, mx, HDAudio::GetCodecCount());
-        p = _sa(out, p, mx, " codec(s) detected\n");
-    }
-    if (NVMe::IsDetected()) {
-        p = _sa(out, p, mx, "[    0.035] nvme: ");
-        p = _sa(out, p, mx, NVMe::GetInfo().model);
-        p = _sa(out, p, mx, " ("); p = _sa64(out, p, mx, NVMe::GetCapacityLBA());
-        p = _sa(out, p, mx, " LBAs)\n");
-    }
-    if (USB::IsDetected()) {
-        p = _sa(out, p, mx, "[    0.040] xhci_hcd: ");
-        p = _sai(out, p, mx, USB::GetPortCount());
-        p = _sa(out, p, mx, " port(s), ");
-        p = _sai(out, p, mx, USB::GetDeviceCount());
-        p = _sa(out, p, mx, " device(s)\n");
-    }
-    if (VirtIOGPU::IsDetected())
-        p = _sa(out, p, mx, "[    0.045] virtio_gpu: VirtIO GPU ready\n");
-    if (TCPStack::IsUp()) {
-        char ipbuf[16]; TCPStack::FormatIP(TCPStack::GetIP(), ipbuf);
-        p = _sa(out, p, mx, "[    0.050] tcpip: stack up, IP ");
-        p = _sa(out, p, mx, ipbuf); p = _sac(out, p, mx, '\n');
-    }
-    if (VMM::IsSupported()) {
-        p = _sa(out, p, mx, "[    0.060] virt: ");
-        p = _sa(out, p, mx, VMM::GetType() == VIRT_INTEL_VTX ? "Intel VT-x" : "AMD-V");
-        p = _sa(out, p, mx, " supported\n");
-    }
-    p = _sa(out, p, mx, "[    0.065] Scheduler: Round-robin ready\n");
-    p = _sa(out, p, mx, "[    0.070] Shell: Kurono Shell v1.0 initialized\n");
-    p = _sa(out, p, mx, "[    0.075] Desktop: GUI environment started\n");
-
-    // show uptime
-    uint32_t ticks = Time::GetTicks();
-    uint32_t sec = ticks / 1000;
-    p = _sa(out, p, mx, "[uptime] ");
-    p = _sau(out, p, mx, sec);
-    p = _sa(out, p, mx, " seconds since boot\n");
-    return p;
+    (void)sh;
+    (void)argc;
+    (void)argv;
+    uint32_t sec = Time::GetTicks() / 1000u;
+    char banner[144];
+    int bp = _sa(banner, 0, sizeof(banner), "=== mirrored serial (/kurono/logs/serial.log)  -  uptime ");
+    bp = _sau(banner, bp, sizeof(banner), sec);
+    bp = _sa(banner, bp, sizeof(banner), " s ===\n");
+    int hint = mx > 384 ? mx - 256 : 512;
+    if (hint > 7800)
+        hint = 7800;
+    return lc_kvfs_tail_into_out("/kurono/logs/serial.log", out, mx, hint, banner);
 }
 
 int LinuxCmds::cmd_lspci(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
@@ -1597,28 +1980,51 @@ int LinuxCmds::cmd_ping(KuronoShell* sh, int argc, const char** argv, char* out,
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: ping <host>\n");
 
-    // parse ip address a.b.c.d
-    uint32_t target_ip = 0;
+    int emit_mark = 0;
+    auto flush_emit = [&](int new_p) {
+        KuronoShell::EmitIncrementalRange(out, emit_mark, new_p);
+        emit_mark = new_p;
+    };
+
     const char* host = argv[1];
-    int octets[4] = {0,0,0,0}; int onum = 0;
-    for (int i = 0; host[i] && onum < 4; i++) {
-        if (host[i] >= '0' && host[i] <= '9') octets[onum] = octets[onum] * 10 + (host[i] - '0');
-        else if (host[i] == '.') onum++;
+    IPv4Address resolved_ip = {{0, 0, 0, 0}};
+    if (!Network::Resolve(host, &resolved_ip)) {
+        int p = 0;
+        p = _sa(out, p, mx, "ping: could not resolve ");
+        p = _sa(out, p, mx, host);
+        p = _sac(out, p, mx, '\n');
+        flush_emit(p);
+        return p;
     }
-    if (onum == 3) target_ip = TCPStack::MakeIP(octets[0], octets[1], octets[2], octets[3]);
+    uint32_t target_ip = TCPStack::MakeIP(resolved_ip.bytes[0], resolved_ip.bytes[1],
+                                          resolved_ip.bytes[2], resolved_ip.bytes[3]);
 
     int p = 0;
     p = _sa(out, p, mx, "PING ");
     p = _sa(out, p, mx, host);
     p = _sa(out, p, mx, " 56(84) bytes of data.\n");
+    flush_emit(p);
+
+    if (!TCPStack::IsUp()) {
+        p = _sa(out, p, mx, "ping: TCP/IP stack unavailable on this boot\n");
+        flush_emit(p);
+        return p;
+    }
 
     int sent = 0, recv = 0;
     for (int i = 0; i < 4; i++) {
+        if (KuronoShell::IsCommandCancelRequested()) {
+            p = _sa(out, p, mx, "\nping: cancelled.\n");
+            flush_emit(p);
+            return p;
+        }
         sent++;
         int rtt_ms = 0;
-        bool ok = false;
-        if (TCPStack::IsUp() && target_ip != 0) {
-            ok = TCPStack::Ping(target_ip, 1000, &rtt_ms);
+        bool ok = TCPStack::Ping(target_ip, 1000, &rtt_ms);
+        if (KuronoShell::IsCommandCancelRequested()) {
+            p = _sa(out, p, mx, "\nping: cancelled.\n");
+            flush_emit(p);
+            return p;
         }
         if (ok) {
             recv++;
@@ -1627,13 +2033,11 @@ int LinuxCmds::cmd_ping(KuronoShell* sh, int argc, const char** argv, char* out,
             p = _sa(out, p, mx, " ttl=64 time="); p = _sai(out, p, mx, rtt_ms);
             p = _sa(out, p, mx, " ms\n");
         } else {
-            // simulated response for loopback / when stack is down
-            recv++;
-            p = _sa(out, p, mx, "64 bytes from "); p = _sa(out, p, mx, host);
-            p = _sa(out, p, mx, ": icmp_seq="); p = _sai(out, p, mx, i + 1);
-            p = _sa(out, p, mx, " ttl=64 time=0."); p = _sai(out, p, mx, 1 + i);
-            p = _sa(out, p, mx, " ms\n");
+            p = _sa(out, p, mx, "Request timeout for icmp_seq ");
+            p = _sai(out, p, mx, i + 1);
+            p = _sac(out, p, mx, '\n');
         }
+        flush_emit(p);
     }
     p = _sa(out, p, mx, "\n--- "); p = _sa(out, p, mx, host);
     p = _sa(out, p, mx, " ping statistics ---\n");
@@ -1641,24 +2045,107 @@ int LinuxCmds::cmd_ping(KuronoShell* sh, int argc, const char** argv, char* out,
     p = _sai(out, p, mx, recv); p = _sa(out, p, mx, " received, ");
     int loss = sent > 0 ? ((sent - recv) * 100 / sent) : 0;
     p = _sai(out, p, mx, loss); p = _sa(out, p, mx, "% packet loss\n");
+    flush_emit(p);
     return p;
 }
 
 int LinuxCmds::cmd_wget(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: wget <url>\n");
-    int p = _sa(out, 0, mx, "Connecting to ");
-    p = _sa(out, p, mx, argv[1]);
-    p = _sa(out, p, mx, "...\nwget: network stack not yet initialized (simulated)\n");
+
+    char* body = (char*)KernelHeap::Alloc(LINUX_HTTP_BUFFER_MAX + 1);
+    if (!body) return _sa(out, 0, mx, "wget: not enough heap for download buffer\n");
+
+    char err[160];
+    int status = 0;
+    int body_len = 0;
+    int p = 0;
+    if (!_http_get_plain(argv[1], body, LINUX_HTTP_BUFFER_MAX + 1, &status, &body_len, err, sizeof(err))) {
+        p = _sa(out, 0, mx, "wget: ");
+        p = _sa(out, p, mx, err[0] ? err : "download failed");
+        p = _sac(out, p, mx, '\n');
+        KernelHeap::Free(body);
+        return p;
+    }
+    if (status < 200 || status >= 300) {
+        p = _sa(out, 0, mx, "wget: HTTP ");
+        p = _sai(out, p, mx, status);
+        p = _sac(out, p, mx, '\n');
+        KernelHeap::Free(body);
+        return p;
+    }
+
+    char host[128];
+    char path[256];
+    uint16_t port = 80;
+    bool https = false;
+    if (!_parse_http_url(argv[1], host, sizeof(host), path, sizeof(path), &port, &https)) {
+        KernelHeap::Free(body);
+        return _sa(out, 0, mx, "wget: unsupported URL format\n");
+    }
+
+    char file_name[64];
+    _filename_from_url_path(path, file_name, sizeof(file_name));
+    char save_path[128];
+    int sp = 0;
+    sp = _sa(save_path, sp, sizeof(save_path), "/home/user/Downloads/");
+    sp = _sa(save_path, sp, sizeof(save_path), file_name);
+    KVFS::Mkdirs("/home/user/Downloads");
+    KVFS::WriteFile(save_path, body, (uint32_t)body_len);
+
+    p = _sa(out, 0, mx, "Saved ");
+    p = _sai(out, p, mx, body_len);
+    p = _sa(out, p, mx, " bytes to ");
+    p = _sa(out, p, mx, save_path);
+    p = _sac(out, p, mx, '\n');
+    KernelHeap::Free(body);
     return p;
 }
 
 int LinuxCmds::cmd_curl(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: curl <url>\n");
-    int p = _sa(out, 0, mx, "curl: ");
-    p = _sa(out, p, mx, argv[1]);
-    p = _sa(out, p, mx, "\ncurl: network stack not yet initialized (simulated)\n");
+
+    char* body = (char*)KernelHeap::Alloc(LINUX_HTTP_BUFFER_MAX + 1);
+    if (!body) return _sa(out, 0, mx, "curl: not enough heap for response buffer\n");
+
+    char err[160];
+    int status = 0;
+    int body_len = 0;
+    if (!_http_get_plain(argv[1], body, LINUX_HTTP_BUFFER_MAX + 1, &status, &body_len, err, sizeof(err))) {
+        int p = _sa(out, 0, mx, "curl: ");
+        p = _sa(out, p, mx, err[0] ? err : "request failed");
+        p = _sac(out, p, mx, '\n');
+        KernelHeap::Free(body);
+        return p;
+    }
+    if (status < 200 || status >= 300) {
+        int p = _sa(out, 0, mx, "curl: HTTP ");
+        p = _sai(out, p, mx, status);
+        if (body_len > 0) {
+            p = _sa(out, p, mx, "\n");
+            int copy = body_len;
+            if (copy > mx - p - 1) copy = mx - p - 1;
+            for (int i = 0; i < copy; i++) out[p++] = body[i];
+            out[p] = 0;
+        } else {
+            p = _sac(out, p, mx, '\n');
+        }
+        KernelHeap::Free(body);
+        return p;
+    }
+
+    int p = 0;
+    int copy = body_len;
+    if (copy > mx - 1) copy = mx - 1;
+    for (int i = 0; i < copy; i++) out[p++] = body[i];
+    if (copy < body_len && p < mx - 1) {
+        out[p++] = '\n';
+        const char* trunc = "[curl output truncated]\n";
+        for (int i = 0; trunc[i] && p < mx - 1; i++) out[p++] = trunc[i];
+    }
+    out[p] = 0;
+    KernelHeap::Free(body);
     return p;
 }
 

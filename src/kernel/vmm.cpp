@@ -14,6 +14,12 @@ static inline uint64_t virt_to_phys(void* virt) {
     return (uint64_t)(uintptr_t)virt;
 }
 
+static uint64_t current_cr3() {
+    uint64_t cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    return cr3 & ~0xFFFULL;
+}
+
 // extract 9-bit index at each paging level from a virtual address
 static inline uint16_t pml4_index(uint64_t vaddr) { return (vaddr >> 39) & 0x1FF; }
 static inline uint16_t pdpt_index(uint64_t vaddr) { return (vaddr >> 30) & 0x1FF; }
@@ -33,65 +39,149 @@ static uint64_t alloc_table_page() {
     return frame;
 }
 
-void KernelVMM::Init() {
-    // read current cr3  -  this is the pml4 set up by kurono_boot.asm
-    asm volatile("mov %%cr3, %0" : "=r"(pml4_phys));
-    pml4_phys &= ~0xFFFULL;  // mask off flags (pcid etc)
-
-    SerialLogger::Log("VMM: Initialized, PML4 at 0x");
-    SerialLogger::LogHex(pml4_phys);
-    SerialLogger::Log("\r\n");
+static inline uint64_t entry_phys(uint64_t entry) {
+    return entry & ~0xFFFULL;
 }
 
-uint64_t KernelVMM::GetPML4() {
-    return pml4_phys;
+static inline uint64_t entry_flags(uint64_t entry) {
+    return entry & (0xFFFULL | PTE_NX);
 }
 
-bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
-    virt_addr &= ~0xFFFULL;  // page-align
+static uint64_t copy_table_page(uint64_t src_phys) {
+    uint64_t new_table = alloc_table_page();
+    if (!new_table) return 0;
+
+    memcpy(phys_to_virt(new_table), phys_to_virt(src_phys), PAGE_SIZE);
+    return new_table;
+}
+
+static void free_user_tree(uint64_t table_phys, int level) {
+    uint64_t* table = phys_to_virt(table_phys);
+    for (int index = 0; index < 512; index++) {
+        uint64_t entry = table[index];
+        if (!(entry & PTE_PRESENT) || !(entry & PTE_USER)) continue;
+
+        uint64_t child_phys = entry & ~0xFFFULL;
+        if (level > 1 && !(entry & PTE_HUGE)) {
+            free_user_tree(child_phys, level - 1);
+        } else if (!(entry & PTE_HUGE)) {
+            PMM::FreeFrame(child_phys);
+        }
+    }
+    PMM::FreeFrame(table_phys);
+}
+
+static uint64_t clone_user_tree(uint64_t table_phys, int level) {
+    uint64_t new_table_phys = copy_table_page(table_phys);
+    if (!new_table_phys) return 0;
+
+    uint64_t* src = phys_to_virt(table_phys);
+    uint64_t* dst = phys_to_virt(new_table_phys);
+    for (int index = 0; index < 512; index++) {
+        uint64_t entry = src[index];
+        if (!(entry & PTE_PRESENT) || !(entry & PTE_USER)) continue;
+
+        if (level > 1) {
+            if (entry & PTE_HUGE) {
+                free_user_tree(new_table_phys, level);
+                return 0;
+            }
+
+            uint64_t cloned_child = clone_user_tree(entry_phys(entry), level - 1);
+            if (!cloned_child) {
+                free_user_tree(new_table_phys, level);
+                return 0;
+            }
+
+            dst[index] = cloned_child | entry_flags(entry);
+            continue;
+        }
+
+        if (entry & PTE_HUGE) {
+            free_user_tree(new_table_phys, level);
+            return 0;
+        }
+
+        uint64_t phys = entry_phys(entry);
+        uint64_t flags = entry_flags(entry);
+        PMM::RetainFrame(phys);
+
+        if (flags & PTE_WRITABLE) {
+            flags &= ~PTE_WRITABLE;
+            flags |= PTE_COW;
+            src[index] = phys | flags;
+        }
+
+        dst[index] = phys | flags;
+    }
+
+    return new_table_phys;
+}
+
+static uint64_t ensure_table_in_root(uint64_t* parent, uint16_t index, uint64_t flags) {
+    uint64_t entry = parent[index];
+    uint64_t required_flags = PTE_PRESENT | PTE_WRITABLE;
+    if (flags & PTE_USER) required_flags |= PTE_USER;
+
+    if (!(entry & PTE_PRESENT)) {
+        uint64_t new_table = alloc_table_page();
+        if (!new_table) return 0;
+        parent[index] = new_table | required_flags;
+        return new_table;
+    }
+
+    if (!(flags & PTE_USER)) {
+        if (!(entry & PTE_WRITABLE)) {
+            parent[index] |= PTE_WRITABLE;
+        }
+        return entry_phys(parent[index]);
+    }
+
+    if (entry & PTE_HUGE) return 0;
+
+    if (!(entry & PTE_USER)) {
+        uint64_t copied_table = copy_table_page(entry_phys(entry));
+        if (!copied_table) return 0;
+
+        parent[index] = copied_table | (entry_flags(entry) | PTE_USER | PTE_WRITABLE);
+        return copied_table;
+    }
+
+    if (!(entry & PTE_WRITABLE)) {
+        parent[index] |= PTE_WRITABLE;
+    }
+
+    return entry_phys(parent[index]);
+}
+
+static bool map_page_in_root(uint64_t root_phys, uint64_t virt_addr,
+                             uint64_t phys_addr, uint64_t flags) {
+    virt_addr &= ~0xFFFULL;
     phys_addr &= ~0xFFFULL;
 
-    uint64_t* pml4 = phys_to_virt(pml4_phys);
+    uint64_t* pml4 = phys_to_virt(root_phys);
 
     uint16_t p4i = pml4_index(virt_addr);
-    if (!(pml4[p4i] & PTE_PRESENT)) {
-        uint64_t new_table = alloc_table_page();
-        if (!new_table) return false;
-        pml4[p4i] = new_table | PTE_PRESENT | PTE_WRITABLE;
-    }
-    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint64_t pdpt_phys = ensure_table_in_root(pml4, p4i, flags);
+    if (!pdpt_phys) return false;
+    uint64_t* pdpt = phys_to_virt(pdpt_phys);
 
     uint16_t p3i = pdpt_index(virt_addr);
     if (pdpt[p3i] & PTE_HUGE) {
-        // 1gb page  -  can't overlay a 4kb mapping without splitting
         SerialLogger::Log("VMM: WARNING - cannot map over 1GB huge page\r\n");
         return false;
     }
-    if (!(pdpt[p3i] & PTE_PRESENT)) {
-        uint64_t new_table = alloc_table_page();
-        if (!new_table) return false;
-        pdpt[p3i] = new_table | PTE_PRESENT | PTE_WRITABLE;
-    }
-    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint64_t pd_phys = ensure_table_in_root(pdpt, p3i, flags);
+    if (!pd_phys) return false;
+    uint64_t* pd = phys_to_virt(pd_phys);
 
     uint16_t p2i = pd_index(virt_addr);
     if (pd[p2i] & PTE_HUGE) {
-        // 2mb page  -  our boot setup uses these. to map a 4kb page inside,
-        // we'd need to split the 2mb page into a page table. for now, we
-        // allow overwriting if the caller explicitly wants to re-map.
-        // a proper implementation would split, but that's complex and not
-        // needed yet (we map into unmapped regions above the identity map).
-
-        // if the 4kb page falls entirely within the 2mb page at the same
-        // physical address, the identity map already covers it  -  success.
         uint64_t huge_base = pd[p2i] & ~0x1FFFFFULL;
         if (phys_addr >= huge_base && phys_addr < huge_base + 0x200000ULL) {
-            // already identity-mapped by the 2mb page  -  no action needed
             return true;
         }
 
-        // otherwise, we need a real split. allocate a pt and populate it
-        // with 512 entries covering the same 2mb range, then replace one.
         uint64_t new_pt_phys = alloc_table_page();
         if (!new_pt_phys) return false;
         uint64_t* new_pt = phys_to_virt(new_pt_phys);
@@ -99,29 +189,21 @@ bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) 
             new_pt[i] = (huge_base + (uint64_t)i * PAGE_SIZE)
                         | PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL;
         }
-        pd[p2i] = new_pt_phys | PTE_PRESENT | PTE_WRITABLE;
-        // fall through to update the specific pt entry below
+        pd[p2i] = new_pt_phys | (PTE_PRESENT | PTE_WRITABLE | ((flags & PTE_USER) ? PTE_USER : 0));
     }
-    if (!(pd[p2i] & PTE_PRESENT)) {
-        uint64_t new_table = alloc_table_page();
-        if (!new_table) return false;
-        pd[p2i] = new_table | PTE_PRESENT | PTE_WRITABLE;
-    }
-    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint64_t pt_phys = ensure_table_in_root(pd, p2i, flags);
+    if (!pt_phys) return false;
+    uint64_t* pt = phys_to_virt(pt_phys);
 
     uint16_t p1i = pt_index(virt_addr);
-    pt[p1i] = phys_addr | (flags & ~0xFFFULL ? flags : (PTE_PRESENT | PTE_WRITABLE | flags));
-    // ensure pte_present is always set
-    pt[p1i] = phys_addr | (flags | PTE_PRESENT);
-
-    InvalidatePage(virt_addr);
+    pt[p1i] = phys_addr | PTE_PRESENT | flags;
     return true;
 }
 
-void KernelVMM::UnmapPage(uint64_t virt_addr, bool free_frame) {
+static void unmap_page_in_root(uint64_t root_phys, uint64_t virt_addr, bool free_frame) {
     virt_addr &= ~0xFFFULL;
 
-    uint64_t* pml4 = phys_to_virt(pml4_phys);
+    uint64_t* pml4 = phys_to_virt(root_phys);
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return;
 
@@ -135,18 +217,16 @@ void KernelVMM::UnmapPage(uint64_t virt_addr, bool free_frame) {
 
     uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
     uint16_t p1i = pt_index(virt_addr);
+    if (!(pt[p1i] & PTE_PRESENT)) return;
 
-    if (pt[p1i] & PTE_PRESENT) {
-        if (free_frame) {
-            PMM::FreeFrame(pt[p1i] & ~0xFFFULL);
-        }
-        pt[p1i] = 0;
-        InvalidatePage(virt_addr);
+    if (free_frame) {
+        PMM::FreeFrame(pt[p1i] & ~0xFFFULL);
     }
+    pt[p1i] = 0;
 }
 
-uint64_t KernelVMM::QueryMapping(uint64_t virt_addr) {
-    uint64_t* pml4 = phys_to_virt(pml4_phys);
+static uint64_t query_mapping_in_root(uint64_t root_phys, uint64_t virt_addr) {
+    uint64_t* pml4 = phys_to_virt(root_phys);
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return 0;
 
@@ -154,7 +234,6 @@ uint64_t KernelVMM::QueryMapping(uint64_t virt_addr) {
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT)) return 0;
     if (pdpt[p3i] & PTE_HUGE) {
-        // 1gb page
         return (pdpt[p3i] & ~0x3FFFFFFFULL) | (virt_addr & 0x3FFFFFFFULL);
     }
 
@@ -162,7 +241,6 @@ uint64_t KernelVMM::QueryMapping(uint64_t virt_addr) {
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT)) return 0;
     if (pd[p2i] & PTE_HUGE) {
-        // 2mb page
         return (pd[p2i] & ~0x1FFFFFULL) | (virt_addr & 0x1FFFFFULL);
     }
 
@@ -171,6 +249,146 @@ uint64_t KernelVMM::QueryMapping(uint64_t virt_addr) {
     if (!(pt[p1i] & PTE_PRESENT)) return 0;
 
     return (pt[p1i] & ~0xFFFULL) | (virt_addr & 0xFFFULL);
+}
+
+static uint64_t query_page_flags_in_root(uint64_t root_phys, uint64_t virt_addr) {
+    uint64_t* pml4 = phys_to_virt(root_phys);
+    uint16_t p4i = pml4_index(virt_addr);
+    if (!(pml4[p4i] & PTE_PRESENT)) return 0;
+
+    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint16_t p3i = pdpt_index(virt_addr);
+    if (!(pdpt[p3i] & PTE_PRESENT)) return 0;
+    if (pdpt[p3i] & PTE_HUGE) {
+        return pdpt[p3i] & (0xFFFULL | PTE_NX);
+    }
+
+    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint16_t p2i = pd_index(virt_addr);
+    if (!(pd[p2i] & PTE_PRESENT)) return 0;
+    if (pd[p2i] & PTE_HUGE) {
+        return pd[p2i] & (0xFFFULL | PTE_NX);
+    }
+
+    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint16_t p1i = pt_index(virt_addr);
+    if (!(pt[p1i] & PTE_PRESENT)) return 0;
+
+    return pt[p1i] & (0xFFFULL | PTE_NX);
+}
+
+void KernelVMM::Init() {
+    // read current cr3  -  this is the pml4 set up by kurono_boot.asm
+    pml4_phys = current_cr3();
+
+    SerialLogger::Log("VMM: Initialized, PML4 at 0x");
+    SerialLogger::LogHex(pml4_phys);
+    SerialLogger::Log("\r\n");
+}
+
+uint64_t KernelVMM::CreateAddressSpace() {
+    uint64_t new_root = alloc_table_page();
+    if (!new_root) return 0;
+
+    uint64_t* src = phys_to_virt(pml4_phys);
+    uint64_t* dst = phys_to_virt(new_root);
+    for (int index = 0; index < 512; index++) {
+        dst[index] = src[index];
+    }
+
+    return new_root;
+}
+
+uint64_t KernelVMM::CloneAddressSpace(uint64_t source_root_pml4) {
+    if (!source_root_pml4) return 0;
+
+    uint64_t new_root = CreateAddressSpace();
+    if (!new_root) return 0;
+
+    uint64_t* src = phys_to_virt(source_root_pml4);
+    uint64_t* dst = phys_to_virt(new_root);
+    for (int index = 0; index < 512; index++) {
+        uint64_t entry = src[index];
+        if (!(entry & PTE_PRESENT) || !(entry & PTE_USER)) continue;
+
+        uint64_t cloned_subtree = clone_user_tree(entry_phys(entry), 3);
+        if (!cloned_subtree) {
+            DestroyAddressSpace(new_root);
+            return 0;
+        }
+
+        dst[index] = cloned_subtree | entry_flags(entry);
+    }
+
+    if (source_root_pml4 == current_cr3()) {
+        FlushTLB();
+    }
+
+    return new_root;
+}
+
+void KernelVMM::DestroyAddressSpace(uint64_t root_pml4) {
+    if (!root_pml4 || root_pml4 == pml4_phys) return;
+
+    uint64_t* pml4 = phys_to_virt(root_pml4);
+    for (int index = 0; index < 512; index++) {
+        uint64_t entry = pml4[index];
+        if (!(entry & PTE_PRESENT) || !(entry & PTE_USER)) continue;
+        free_user_tree(entry & ~0xFFFULL, 3);
+        pml4[index] = 0;
+    }
+
+    PMM::FreeFrame(root_pml4);
+}
+
+uint64_t KernelVMM::GetPML4() {
+    return pml4_phys;
+}
+
+uint64_t KernelVMM::GetCurrentAddressSpace() {
+    return current_cr3();
+}
+
+bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
+    bool mapped = map_page_in_root(pml4_phys, virt_addr, phys_addr, flags);
+    if (mapped) InvalidatePage(virt_addr);
+    return mapped;
+}
+
+bool KernelVMM::MapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
+                                      uint64_t phys_addr, uint64_t flags) {
+    return map_page_in_root(root_pml4, virt_addr, phys_addr, flags);
+}
+
+void KernelVMM::UnmapPage(uint64_t virt_addr, bool free_frame) {
+    unmap_page_in_root(pml4_phys, virt_addr, free_frame);
+    InvalidatePage(virt_addr);
+}
+
+void KernelVMM::UnmapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
+                                        bool free_frame) {
+    unmap_page_in_root(root_pml4, virt_addr, free_frame);
+}
+
+uint64_t KernelVMM::QueryMapping(uint64_t virt_addr) {
+    return query_mapping_in_root(pml4_phys, virt_addr);
+}
+
+uint64_t KernelVMM::QueryMappingInAddressSpace(uint64_t root_pml4, uint64_t virt_addr) {
+    return query_mapping_in_root(root_pml4, virt_addr);
+}
+
+uint64_t KernelVMM::QueryPageFlags(uint64_t virt_addr) {
+    return query_page_flags_in_root(pml4_phys, virt_addr);
+}
+
+uint64_t KernelVMM::QueryPageFlagsInAddressSpace(uint64_t root_pml4, uint64_t virt_addr) {
+    return query_page_flags_in_root(root_pml4, virt_addr);
+}
+
+void KernelVMM::ActivateAddressSpace(uint64_t root_pml4) {
+    if (!root_pml4) return;
+    asm volatile("mov %0, %%cr3" : : "r"(root_pml4) : "memory");
 }
 
 void KernelVMM::InvalidatePage(uint64_t virt_addr) {

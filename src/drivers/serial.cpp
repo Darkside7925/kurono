@@ -1,6 +1,11 @@
 #include "serial.h"
 #include "../system/logging.h"
 
+static bool g_serial_quiet = false;
+
+void SerialLogger::SetQuiet(bool quiet) { g_serial_quiet = quiet; }
+bool SerialLogger::IsQuiet() { return g_serial_quiet; }
+
 // helper: read byte from i/o port
 static inline uint8_t inb(uint16_t port) {
     uint8_t val;
@@ -36,10 +41,13 @@ void SerialLogger::Init() {
 
 void SerialLogger::Log(const char* s) {
     const char* start = s;
-    while (*s) {
-        wait_tx_ready();
-        outb(0x3F8, *s++);
+    if (!g_serial_quiet) {
+        while (*s) {
+            wait_tx_ready();
+            outb(0x3F8, *s++);
+        }
     }
+    // always mirror to runtime log so the in-kernel viewer is complete
     RuntimeLog::MirrorSerial(start);
 }
 

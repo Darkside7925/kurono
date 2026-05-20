@@ -62,11 +62,14 @@ The project is broad, but the actual top level shape is easy to hold in the head
 - `drivers/MOUSE.md`  -  PS/2 mouse and touchpad
 - `drivers/GRAPHICS.md`  -  framebuffer drawing primitives
 - `drivers/DISPLAY.md`  -  display mode selection
+- `drivers/DISPLAY_MGR.md`  -  multi-backend display manager
+- `drivers/BGA.md`  -  Bochs Graphics Adapter
+- `drivers/VIRTIO_GPU.md`  -  VirtIO GPU driver
 - `drivers/SERIAL.md`  -  COM1 debug serial logger
 - `drivers/TIMER.md`  -  PIT timer
 - `drivers/RTC.md`  -  real time clock
 - `drivers/E1000.md`  -  Intel E1000 NIC driver
-- `drivers/GPU_PROBE.md`  -  PCI GPU detection
+- `drivers/GPU_PROBE.md`  -  PCI GPU detection and hybrid topology
 - `drivers/AUDIO.md`  -  audio services (AC97 / HDA)
 - `drivers/NVME.md`  -  NVMe storage driver
 - `drivers/CPU_DETECT.md`  -  CPUID and feature detection
@@ -76,6 +79,7 @@ The project is broad, but the actual top level shape is easy to hold in the head
 - `ui/DESKTOP.md`  -  desktop, taskbar, icons, context menu
 - `ui/WINDOW_MANAGER.md`  -  floating window system
 - `ui/GUI.md`  -  higher-level drawing helpers
+- `ui/WAYLAND_SERVER.md`  -  in-kernel Wayland compositor
 
 ### Apps (`apps/`)
 
@@ -87,6 +91,10 @@ The project is broad, but the actual top level shape is easy to hold in the head
 - `apps/BROWSER.md`  -  HTTP browser
 - `apps/MEDIA_PLAYER.md`  -  MP3 and image media player
 - `apps/CONDUIT.md`  -  Linux guest integration app
+
+### App Development (`apps/`, `kcl/`)
+- `apps/KURONO_APP_DEV_GUIDE.md`  -  **how to create Kurono apps (.kro)**
+- `kcl/KCL_REFERENCE.md`  -  KCL scripting language reference
 
 ### Shell (`shell/`)
 

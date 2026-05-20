@@ -103,6 +103,10 @@ public:
 
     // framebuffer
     static LinuxFBInfo* GetFramebufferInfo();
+    static bool BlitFramebufferRect(const void* buf, uint32_t src_pitch,
+                                     uint32_t width, uint32_t height,
+                                     int dst_x, int dst_y);
+    static void PresentFramebuffer();
 
     // input events
     static void QueueMouseEvent(int dx, int dy, int buttons);

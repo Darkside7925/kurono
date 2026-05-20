@@ -7,6 +7,9 @@ param(
     [switch]$NoBuild,       # Skip build, just run
     [switch]$Clean,         # Clean build first
     [switch]$Debug,         # Enable GDB debug server
+    [switch]$Cli,           # Build/select CLI boot profile
+    [string]$CliCommand = "",# Optional autorun shell command for CLI profile
+    [switch]$CliPowerOff,   # Halt after CLI autorun completes
     [switch]$KVM,           # Use KVM (Linux host)
     [switch]$BareMetal,     # Create bootable ISO for bare-metal boot
     [switch]$UEFI,          # Boot with OVMF UEFI firmware (no SeaBIOS)
@@ -33,12 +36,31 @@ Write-Host ""
 # ── Build ──
 if (-not $NoBuild) {
     $makeCmd = "cd /mnt/c/Users/genie/OS/src && "
+    $makeArgs = @()
     if ($Clean) {
         Write-Status "Cleaning previous build..."
         $makeCmd += "make clean && "
     }
-    Write-Status "Building Kurono OS..."
-    $output = wsl -e bash -c ($makeCmd + "make iso 2>&1")
+    if ($Cli) {
+        Write-Status "Building Kurono OS CLI boot profile..."
+        $makeArgs += "KURONO_BOOT_PROFILE=cli"
+        $makeArgs += "KURONO_GRUB_TIMEOUT=0"
+        if ($CliCommand) {
+            $safeCliCommand = $CliCommand.Replace(" ", "+")
+            $makeArgs += "KURONO_CLI_RUN=$safeCliCommand"
+        }
+        if ($CliPowerOff) {
+            $makeArgs += "KURONO_CLI_POWEROFF=1"
+        }
+    } else {
+        Write-Status "Building Kurono OS..."
+    }
+    $makeCmd += "make "
+    if ($makeArgs.Count -gt 0) {
+        $makeCmd += ($makeArgs -join " ") + " "
+    }
+    $makeCmd += "iso 2>&1"
+    $output = wsl -e bash -c $makeCmd
     $lastLine = ($output | Select-Object -Last 3) -join "`n"
 
     if ($lastLine -match "kurono\.(elf|iso)") {
@@ -48,6 +70,10 @@ if (-not $NoBuild) {
         $output | Select-Object -Last 20 | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
         exit 1
     }
+}
+
+if ($Cli -and $UEFI) {
+    Write-Status "CLI profile defaults the GRUB multiboot path; omit -UEFI for automated CLI boots."
 }
 
 # ── Verify ISO ──
@@ -84,13 +110,30 @@ if (-not $qemu) {
 }
 
 # ── Build QEMU args ──
+# Audio backend: pick a real host audio sink so the emulated SB16/HDA can
+# actually play sound.  Without -audiodev, QEMU emulates the hardware but
+# sends samples to /dev/null.
+#   - WSL: PulseAudio (forward to PulseAudio over WSLg)
+#   - Windows native: DirectSound
+$audioBackend = if ($useWSL) { "pa,id=hostaudio,server=unix:/mnt/wslg/PulseServer" }
+                else         { "dsound,id=hostaudio" }
+
 $qemuArgs = @(
     "-cdrom", $Iso,
     "-m", $Memory,
     "-vga", "std",
     "-serial", "stdio",
-    "-device", "sb16",
+    "-audiodev", $audioBackend,
+    "-machine", "pcspk-audiodev=hostaudio",
+    "-device", "sb16,audiodev=hostaudio",
+    "-device", "intel-hda",
+    "-device", "hda-duplex,audiodev=hostaudio",
+    "-device", "AC97,audiodev=hostaudio",
     "-device", "e1000,netdev=net0",
+    # SLIRP defaults: guest 10.0.2.15 / gw 10.0.2.2 / dns 10.0.2.3  -  matches
+    # the IPs hardcoded in src/net/network.cpp.  Overriding `net=` here used
+    # to put SLIRP on 10.0.0.0/24 while the kernel still claimed 10.0.2.15,
+    # which silently broke every packet after the first ARP reply.
     "-netdev", "user,id=net0,hostfwd=tcp::8080-:80",
     "-no-reboot",
     "-no-shutdown"

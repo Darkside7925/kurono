@@ -1,5 +1,6 @@
 #include "ac97.h"
 #include "../drivers/serial.h"
+#include "audio_dma.h"
 
 //  kurono os  -  ac'97 audio codec driver implementation
 //  real pci scan, mixer programming, bdl dma playback
@@ -162,11 +163,21 @@ void AC97::ResetCodec() {
 
 //  bdl (buffer descriptor list) setup
 void AC97::SetupBDL() {
-    // bdl must be in physical memory accessible to dma
-    // we use the region at 0x70000 (same area as sb16, but ac97 and sb16
-    // won't coexist on the same system)
-    bdl = (AC97BufferDescriptor*)0x70000;
-    dma_buffer = (uint8_t*)0x80000;  // 512kb above bdl
+    // Take ownership of two dedicated DMA regions:
+    //   AC97_BDL  region (32 KB)  -  first 256 bytes hold the BDL itself,
+    //                              the rest is reserved scratch.
+    //   AC97_PCM  region (288 KB)  -  the per-buffer 8 KB PCM chunks.
+    void* bdl_region = AudioDMA::Acquire(AudioDMA::REGION_AC97_BDL, "ac97-bdl");
+    void* pcm_region = AudioDMA::Acquire(AudioDMA::REGION_AC97_PCM, "ac97-pcm");
+    if (!bdl_region || !pcm_region) {
+        // Fall back to legacy hardcoded addresses if the allocator is
+        // unavailable (e.g. AC97 init runs before AudioDMA::Init()).
+        bdl        = (AC97BufferDescriptor*)0x70000;
+        dma_buffer = (uint8_t*)0x80000;
+    } else {
+        bdl        = (AC97BufferDescriptor*)bdl_region;
+        dma_buffer = (uint8_t*)pcm_region;
+    }
 
     // initialize bdl entries  -  each points to a dma buffer chunk
     for (int i = 0; i < AC97_MAX_BDL_ENTRIES; i++) {

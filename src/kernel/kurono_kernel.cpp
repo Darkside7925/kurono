@@ -7,6 +7,9 @@
 #include "heap.h"
 #include "time.h"
 #include "memory_mgr.h"
+#include "buddy.h"
+#include "slab.h"
+#include "hrtimer.h"
 #include "panic.h"
 #include "../drivers/serial.h"
 #include "../drivers/display.h"
@@ -18,6 +21,8 @@
 #include "../media/mediadecoder.h"
 #include "../ui/gui.h"
 #include "../ui/lockscreen.h"
+#include "../system/user_mgmt.h"
+#include "../system/installer_gui.h"
 #include "../ui/font.h"
 #include "../ui/window_manager.h"
 #include "../ui/desktop.h"
@@ -33,9 +38,12 @@
 #include "../proc/scheduler.h"
 #include "../tests/test_suite.h"
 #include "../system/input_manager.h"
+#include "../system/vconsole.h"
 #include "../system/logging.h"
 #include "../system/installer.h"
 #include "../system/ui_config.h"
+#include "../system/gpu_driver_installer.h"
+#include "../system/system_update.h"
 #include "../shell/shell.h"
 #include "../ui/wallpaper.h"
 #include "../shell/linux_cmds.h"
@@ -43,8 +51,30 @@
 #include "../kcl/kcl.h"
 #include "../security/supr.h"
 #include "../packages/pkgmgr.h"
+#include "../apps/python_interp.h"
+#include "elf_loader.h"
+#include "userspace.h"
+#include "../userprogs/embedded_userprogs.h"
+#include "../linux/linux_syscall.h"
+#include "../proc/kernel_processes.h"
 #include "../net/network.h"
+#include "../net/tcpip.h"
+#include "../net/tuntap.h"
+#include "../net/ipv6.h"
+#include "../net/netfilter.h"
+#include "../net/unix_socket.h"
+#include "../proc/cgroup.h"
+#include "../drivers/tpm.h"
+#include "../drivers/pulse_server.h"
+#include "../hal/cpufreq.h"
+#include "../system/runtime_layout.h"
+#include "../system/dbus_server.h"
+#include "../ui/wayland_server.h"
+#include "../linux/ld_kurono.h"
 #include "../drivers/audio.h"
+#include "../drivers/audio_server.h"
+#include "../drivers/audio_mixer.h"
+#include "../drivers/audio_dma.h"
 #include "../drivers/e1000.h"
 #include "../linux/dual_boot.h"
 #include "../linux/linux_init.h"
@@ -111,6 +141,67 @@ static void stappend(char* dst, const char* src, int max_len) {
         }
     }
     dst[n] = 0;
+}
+
+static bool stspace(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static bool ststarts_with(const char* text, const char* prefix) {
+    if (!text || !prefix) return false;
+    while (*prefix) {
+        if (*text != *prefix) return false;
+        text++;
+        prefix++;
+    }
+    return true;
+}
+
+static bool boot_has_token(const char* cmdline, const char* token) {
+    if (!cmdline || !token || !token[0]) return false;
+    int token_len = stlen(token);
+    for (const char* p = cmdline; *p; ) {
+        while (*p && stspace(*p)) p++;
+        if (!*p) break;
+        if (ststarts_with(p, token) && (p == cmdline || stspace(*(p - 1))) &&
+            (p[token_len] == 0 || stspace(p[token_len]))) {
+            return true;
+        }
+        while (*p && !stspace(*p)) p++;
+    }
+    return false;
+}
+
+static bool boot_get_value(const char* cmdline, const char* key, char* out, int max_out) {
+    if (!out || max_out < 2) return false;
+    out[0] = 0;
+    if (!cmdline || !key || !key[0]) return false;
+
+    int key_len = stlen(key);
+    for (const char* p = cmdline; *p; p++) {
+        if (p != cmdline && !stspace(*(p - 1))) continue;
+        if (!ststarts_with(p, key) || p[key_len] != '=') continue;
+
+        const char* value = p + key_len + 1;
+        char quote = 0;
+        if (*value == '"' || *value == '\'') {
+            quote = *value;
+            value++;
+        }
+
+        int n = 0;
+        while (*value && n < max_out - 1) {
+            if (quote) {
+                if (*value == quote) break;
+            } else if (stspace(*value)) {
+                break;
+            }
+            out[n++] = *value++;
+        }
+        out[n] = 0;
+        return n > 0;
+    }
+    return false;
 }
 
 // works on all x86 hardware in text mode. used before graphics init.
@@ -307,6 +398,197 @@ static void emergency_run_shell() {
         }
 
         if (changed) emergency_render(input);
+    }
+}
+
+static EmergencyLine g_cli_lines[18];
+static int g_cli_line_count = 0;
+
+static void cli_clear_lines() {
+    g_cli_line_count = 0;
+    for (int i = 0; i < 18; i++) {
+        g_cli_lines[i].text[0] = 0;
+        g_cli_lines[i].color = 0x0F;
+    }
+}
+
+static void cli_push_line(const char* text, uint8_t color = 0x0F) {
+    if (g_cli_line_count >= 18) {
+        for (int i = 1; i < 18; i++) g_cli_lines[i - 1] = g_cli_lines[i];
+        g_cli_line_count = 17;
+    }
+    stcopy(g_cli_lines[g_cli_line_count].text, text ? text : "", VGA_COLS + 1);
+    g_cli_lines[g_cli_line_count].color = color;
+    g_cli_line_count++;
+}
+
+static void cli_push_output(const char* text, uint8_t color = 0x0F) {
+    char line[VGA_COLS + 1];
+    int pos = 0;
+    if (!text || !*text) {
+        cli_push_line("(ok)", 0x0A);
+        return;
+    }
+
+    for (int i = 0; text[i]; i++) {
+        char c = text[i];
+        if (c == '\x1b') {
+            i++;
+            if (text[i] == '[') {
+                while (text[i] &&
+                       !((text[i] >= 'A' && text[i] <= 'Z') || (text[i] >= 'a' && text[i] <= 'z'))) {
+                    i++;
+                }
+            }
+            continue;
+        }
+        if (c == '\r') continue;
+        if (c == '\n') {
+            line[pos] = 0;
+            cli_push_line(line, color);
+            pos = 0;
+            line[0] = 0;
+            continue;
+        }
+        if (c == '\t') c = ' ';
+        if ((unsigned char)c < 32 || (unsigned char)c > 126) c = '?';
+        line[pos++] = c;
+        if (pos >= VGA_COLS) {
+            line[pos] = 0;
+            cli_push_line(line, color);
+            pos = 0;
+            line[0] = 0;
+        }
+    }
+    if (pos > 0) {
+        line[pos] = 0;
+        cli_push_line(line, color);
+    }
+}
+
+static void cli_render(const char* input) {
+    vga_clear();
+    vga_write_line(0, "Kurono CLI Boot Mode", 0x0A);
+    vga_write_line(1, "Shared kernel init path, shell, package manager, and TCP/IP stack", 0x0F);
+    vga_write_line(2, "Commands: help | ip | ping host | curl http://... | kpkg sync | reboot", 0x0B);
+    vga_write_line(3, "Autorun results are mirrored to serial for headless QEMU testing", 0x08);
+    for (int i = 0; i < 18; i++) {
+        if (i < g_cli_line_count) vga_write_line(4 + i, g_cli_lines[i].text, g_cli_lines[i].color);
+        else vga_write_line(4 + i, "", 0x07);
+    }
+    char prompt[VGA_COLS + 1];
+    stcopy(prompt, "cli> ", sizeof(prompt));
+    stappend(prompt, input ? input : "", sizeof(prompt));
+    vga_write_line(22, prompt, 0x0F);
+    vga_write_line(23, "Logs: serial + /system/boot/boot.log | Ctrl+Alt+F1..F6 still switch VTs", 0x08);
+    vga_write_line(24, "Enter=run  Backspace=edit  'shutdown' halts  'reboot' resets", 0x08);
+}
+
+static void cli_log_output(const char* text) {
+    if (!text || !text[0]) {
+        SerialLogger::Log("(ok)\r\n");
+        return;
+    }
+    SerialLogger::Log(text);
+    int len = stlen(text);
+    if (len < 1 || text[len - 1] != '\n') SerialLogger::Log("\r\n");
+}
+
+static void cli_decode_command(char* text) {
+    if (!text) return;
+    int w = 0;
+    for (int r = 0; text[r]; r++) {
+        if (text[r] == '+') {
+            text[w++] = ' ';
+        } else if (text[r] == '%' && text[r + 1] == '2' && text[r + 2] == '0') {
+            text[w++] = ' ';
+            r += 2;
+        } else {
+            text[w++] = text[r];
+        }
+    }
+    text[w] = 0;
+}
+
+static void cli_run_command(const char* cmd) {
+    if (!cmd || !cmd[0]) return;
+
+    char prompt[VGA_COLS + 1];
+    stcopy(prompt, "cli> ", sizeof(prompt));
+    stappend(prompt, cmd, sizeof(prompt));
+    cli_push_line(prompt, 0x0F);
+    SerialLogger::Log(prompt);
+    SerialLogger::Log("\r\n");
+
+    if (streq(cmd, "clear")) {
+        cli_clear_lines();
+        cli_push_line("Screen cleared.", 0x0A);
+        SerialLogger::Log("Screen cleared.\r\n");
+        return;
+    }
+
+    char out[SHELL_OUTPUT_BUF];
+    out[0] = 0;
+    KuronoShell::Execute(cmd, out, sizeof(out));
+    cli_push_output(out, out[0] ? 0x07 : 0x0A);
+    cli_log_output(out);
+}
+
+static void cli_run_shell(const char* autorun_cmd, bool halt_after_autorun) {
+    char input[256];
+    int input_len = 0;
+    input[0] = 0;
+
+    Keyboard::FlushBuffers();
+    cli_clear_lines();
+    cli_push_line("CLI shell ready.", 0x0A);
+    cli_push_line("This mode skips the desktop but keeps the normal package/network stack.", 0x07);
+
+    if (autorun_cmd && autorun_cmd[0]) {
+        cli_push_line("Autorun command requested.", 0x0B);
+        SerialLogger::Log("[CLI] Autorun requested\r\n");
+        cli_run_command(autorun_cmd);
+        if (halt_after_autorun) {
+            cli_push_line("Autorun complete. Halting CPU.", 0x0E);
+            cli_render("");
+            SerialLogger::Log("[CLI] Autorun complete, halting\r\n");
+            HAL::DisableInterrupts();
+            HAL::Halt();
+        }
+    }
+
+    cli_render(input);
+
+    while (true) {
+        uint32_t real_elapsed = Timer::ElapsedSinceLast();
+        if (real_elapsed > 0) TimeManager::AdvanceByMs(real_elapsed);
+        if (TCPStack::IsUp()) TCPStack::Tick();
+        Scheduler::Tick();
+        Keyboard::Poll();
+
+        bool changed = false;
+        while (Keyboard::HasChar()) {
+            char c = Keyboard::GetChar();
+            if (c == '\r' || c == '\n') {
+                changed = true;
+                if (input_len > 0) cli_run_command(input);
+                input_len = 0;
+                input[0] = 0;
+            } else if (c == 8 || c == 127) {
+                if (input_len > 0) {
+                    input[--input_len] = 0;
+                    changed = true;
+                }
+            } else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) {
+                if (input_len < (int)sizeof(input) - 1) {
+                    input[input_len++] = c;
+                    input[input_len] = 0;
+                    changed = true;
+                }
+            }
+        }
+
+        if (changed) cli_render(input);
     }
 }
 
@@ -658,20 +940,37 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     bool boot_text_only = false;
     bool boot_console_realtime = false;
     bool boot_emergency = false;
+    bool boot_cli = false;
+    bool boot_cli_poweroff = false;
+    char boot_cli_run[160];
+    boot_cli_run[0] = 0;
+    static char boot_gui_run[256];
+    boot_gui_run[0] = 0;
     const char* boot_cmdline = nullptr;
     if (mbi_early && (mbi_early->flags & (1u << 2)) && mbi_early->cmdline != 0) {
         boot_cmdline = (const char*)(uintptr_t)mbi_early->cmdline;
-        if (stcontains(boot_cmdline, "kurono_mode=text") || stcontains(boot_cmdline, "kurono.text=1")) {
+        if (boot_has_token(boot_cmdline, "kurono_mode=text") || boot_has_token(boot_cmdline, "kurono.text=1")) {
             boot_text_only = true;
         }
-        if (stcontains(boot_cmdline, "kurono_mode=console") || stcontains(boot_cmdline, "kurono.console=1")) {
+        if (boot_has_token(boot_cmdline, "kurono_mode=console") || boot_has_token(boot_cmdline, "kurono.console=1")) {
             boot_console_realtime = true;
         }
-        if (stcontains(boot_cmdline, "kurono_mode=emergency") || stcontains(boot_cmdline, "kurono.emergency=1")) {
+        if (boot_has_token(boot_cmdline, "kurono_mode=emergency") || boot_has_token(boot_cmdline, "kurono.emergency=1")) {
             boot_emergency = true;
         }
+        if (boot_has_token(boot_cmdline, "-cli") || boot_has_token(boot_cmdline, "kurono_mode=cli") ||
+            boot_has_token(boot_cmdline, "kurono.cli=1")) {
+            boot_cli = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.cli.poweroff=1")) {
+            boot_cli_poweroff = true;
+        }
+        boot_get_value(boot_cmdline, "kurono.cli.run", boot_cli_run, (int)sizeof(boot_cli_run));
+        // optional GUI autorun: open Terminal and queue a command. Used purely
+        // for headless QEMU debug runs where we cannot type interactively.
+        boot_get_value(boot_cmdline, "kurono.gui.run", boot_gui_run, (int)sizeof(boot_gui_run));
     }
-    bool force_text_mode = boot_text_only || boot_console_realtime || boot_emergency;
+    bool force_text_mode = boot_text_only || boot_console_realtime || boot_emergency || boot_cli;
 
     vga_puts("Multiboot OK\n");
     if (has_early_fb) { early_fb_puts("[OK] Multiboot\n", 0x00FF00); early_fb_flush(); }
@@ -681,8 +980,16 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::Log("Boot cmdline: ");
         SerialLogger::Log(boot_cmdline);
         SerialLogger::Log("\r\n");
+        // honour `quiet` token: silences COM1 spew (RuntimeLog still mirrors).
+        if (stcontains(boot_cmdline, "quiet")) {
+            SerialLogger::Log("Quiet boot requested - serial output suppressed.\r\n");
+            SerialLogger::SetQuiet(true);
+        }
     }
-    if (boot_text_only) {
+    if (boot_cli) {
+        SerialLogger::Log("Boot mode: CLI SHELL\r\n");
+        vga_puts("Mode: CLI SHELL\n", 0x0A);
+    } else if (boot_text_only) {
         SerialLogger::Log("Boot mode: PURE TEXT (GRUB console path)\r\n");
         vga_puts("Mode: PURE TEXT\n", 0x0B);
     } else if (boot_emergency) {
@@ -699,14 +1006,51 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[1] HAL::Init\r\n");
     HAL::Init();
     if (has_early_fb) { early_fb_puts("OK\n", 0x00FF00); early_fb_flush(); }
+
+    // Enable CPU security features as soon as HAL is up: SMEP (bit 20),
+    // SMAP (bit 21), UMIP (bit 11), OSXSAVE (bit 18)  -  gated by CPUID
+    // capability bits to avoid #UD on older hardware.
+    {
+        uint32_t eax, ebx, ecx, edx;
+        __asm__ __volatile__("cpuid"
+                             : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                             : "a"(7), "c"(0));
+        uint64_t cr4;
+        __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
+        uint64_t set = 0;
+        if (ebx & (1u << 7))  set |= (1ULL << 20);  // SMEP
+        // SMAP intentionally NOT enabled: the kernel currently performs
+        // direct supervisor-mode access to user pointers in the syscall
+        // dispatch path.  Turning SMAP on without STAC/CLAC wrappers
+        // around every copy_to_user would #PF instantly.  Re-enable once
+        // every user-pointer touch is funnelled through a proper helper.
+        if (ecx & (1u << 2))  set |= (1ULL << 11);  // UMIP
+        if (set) {
+            cr4 |= set;
+            __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4));
+            SerialLogger::Log("[1.5] CR4 security bits enabled\r\n");
+        }
+    }
+
     vga_puts("Memory init...\n");
     if (has_early_fb) { early_fb_puts("[..] Memory ", 0xFFFF00); early_fb_flush(); }
     SerialLogger::Log("[2] MemoryManager::Init\r\n");
     MemoryManager::Init(mb_addr);
     if (has_early_fb) { early_fb_puts("OK\n", 0x00FF00); early_fb_flush(); }
+    // Phase 14: bring up buddy + slab as side-by-side allocators on top
+    // of the existing PMM.  Buddy borrows ~256 MB contiguous from PMM and
+    // exposes power-of-2 page allocations; Slab gives kmalloc/kfree and
+    // named caches for kernel structures.  Their /proc files are written
+    // by RuntimeLayout::Init() once KVFS is up.
+    SerialLogger::Log("[2a] Buddy::Init\r\n");
+    Buddy::Init();
+    SerialLogger::Log("[2b] Slab::Init\r\n");
+    Slab::Init();
     vga_puts("Scheduler init...\n");
     SerialLogger::Log("[3] Scheduler::Init\r\n");
     Scheduler::Init();
+    SerialLogger::Log("[3a] HRTimer::Init\r\n");
+    HRTimer::Init();
     vga_puts("VFS init...\n");
     SerialLogger::Log("[4] VFS::Init\r\n");
     VFS::Init();
@@ -960,45 +1304,50 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     }
 
     if (!has_display) {
-        SerialLogger::Log("Display: No framebuffer! Showing diagnostics on VGA text.\r\n");
-        // when no graphics framebuffer is available, use vga text mode
-        // (0xb8000) to show diagnostic info so the user isn't staring
-        // at pure black.
-        vga_clear();
-        vga_puts("=== Kurono OS  -  No Graphics Framebuffer ===", 0x0C);
-        vga_puts("\n", 0x0C);
-        vga_puts("\nMultiboot flags: ", 0x0E);
-        vga_puthex(mbi->flags);
-        vga_puts("\nFB addr:  0x", 0x0E);
-        vga_puthex((uint32_t)(mbi->framebuffer_addr >> 32));
-        vga_puthex((uint32_t)(mbi->framebuffer_addr & 0xFFFFFFFF));
-        vga_puts("\nFB size:  ", 0x0E);
-        vga_puthex(mbi->framebuffer_width);
-        vga_puts(" x ", 0x0E);
-        vga_puthex(mbi->framebuffer_height);
-        vga_puts("\nFB bpp:   ", 0x0E);
-        vga_puthex(mbi->framebuffer_bpp);
-        vga_puts("\nFB type:  ", 0x0E);
-        vga_puthex(mbi->framebuffer_type);
-        vga_puts("\nFB pitch: ", 0x0E);
-        vga_puthex(mbi->framebuffer_pitch);
-        vga_puts("\n", 0x07);
-        vga_puts("\n", 0x07);
-        vga_puts("GRUB did not deliver a graphics framebuffer.", 0x0F);
-        vga_puts("\nTry selecting 'Kurono OS (1024x768)' from GRUB menu.", 0x0B);
-        vga_puts("\nOr check BIOS: enable CSM/Legacy or EFI GOP.", 0x0B);
-        vga_puts("\n\nBit 12 (FB info): ", 0x0E);
-        vga_puts((mbi->flags & (1u << 12)) ? "SET" : "NOT SET", 0x0F);
-        vga_puts("\nBit 11 (VBE info): ", 0x0E);
-        vga_puts((mbi->flags & (1u << 11)) ? "SET" : "NOT SET", 0x0F);
-        if (mbi->flags & (1u << 11)) {
-            vga_puts("\nVBE mode_info: 0x", 0x0E);
-            vga_puthex(mbi->vbe_mode_info);
-            vga_puts("\nVBE mode:      0x", 0x0E);
-            vga_puthex(mbi->vbe_mode);
+        if (force_text_mode) {
+            SerialLogger::Log("Display: Text console mode active (framebuffer intentionally skipped)\r\n");
+            vga_puts("Display: text console mode active\n", 0x0A);
+        } else {
+            SerialLogger::Log("Display: No framebuffer! Showing diagnostics on VGA text.\r\n");
+            // when no graphics framebuffer is available, use vga text mode
+            // (0xb8000) to show diagnostic info so the user isn't staring
+            // at pure black.
+            vga_clear();
+            vga_puts("=== Kurono OS  -  No Graphics Framebuffer ===", 0x0C);
+            vga_puts("\n", 0x0C);
+            vga_puts("\nMultiboot flags: ", 0x0E);
+            vga_puthex(mbi->flags);
+            vga_puts("\nFB addr:  0x", 0x0E);
+            vga_puthex((uint32_t)(mbi->framebuffer_addr >> 32));
+            vga_puthex((uint32_t)(mbi->framebuffer_addr & 0xFFFFFFFF));
+            vga_puts("\nFB size:  ", 0x0E);
+            vga_puthex(mbi->framebuffer_width);
+            vga_puts(" x ", 0x0E);
+            vga_puthex(mbi->framebuffer_height);
+            vga_puts("\nFB bpp:   ", 0x0E);
+            vga_puthex(mbi->framebuffer_bpp);
+            vga_puts("\nFB type:  ", 0x0E);
+            vga_puthex(mbi->framebuffer_type);
+            vga_puts("\nFB pitch: ", 0x0E);
+            vga_puthex(mbi->framebuffer_pitch);
+            vga_puts("\n", 0x07);
+            vga_puts("\n", 0x07);
+            vga_puts("GRUB did not deliver a graphics framebuffer.", 0x0F);
+            vga_puts("\nTry selecting 'Kurono OS (1024x768)' from GRUB menu.", 0x0B);
+            vga_puts("\nOr check BIOS: enable CSM/Legacy or EFI GOP.", 0x0B);
+            vga_puts("\n\nBit 12 (FB info): ", 0x0E);
+            vga_puts((mbi->flags & (1u << 12)) ? "SET" : "NOT SET", 0x0F);
+            vga_puts("\nBit 11 (VBE info): ", 0x0E);
+            vga_puts((mbi->flags & (1u << 11)) ? "SET" : "NOT SET", 0x0F);
+            if (mbi->flags & (1u << 11)) {
+                vga_puts("\nVBE mode_info: 0x", 0x0E);
+                vga_puthex(mbi->vbe_mode_info);
+                vga_puts("\nVBE mode:      0x", 0x0E);
+                vga_puthex(mbi->vbe_mode);
+            }
+            vga_puts("\n\nSystem halted  -  reboot and try a different GRUB entry.", 0x0C);
+            // don't halt  -  let kernel continue so serial diag still works
         }
-        vga_puts("\n\nSystem halted  -  reboot and try a different GRUB entry.", 0x0C);
-        // don't halt  -  let kernel continue so serial diag still works
     }
 
     // enable double buffering if we have a display
@@ -1030,25 +1379,25 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // port wedged.
     Keyboard::Init();
     Keyboard::InitUSB();
-
-    Mouse::Init();
-    Keyboard::Init();
-    Keyboard::InitUSB();
-    Mouse::SetDPIScaling(800, 800);
+    if (has_display && !force_text_mode) {
+        Mouse::Init();
+        Mouse::SetDPIScaling(800, 800);
+    } else {
+        SerialLogger::Log("Mouse: Skipped in text-only boot mode\r\n");
+    }
     InputManager::Init();
+    VConsole::Init((has_display && !force_text_mode) ? VConsole::VC_GUI : 0);
 
     if (has_display) {
         int sw = Graphics::GetWidth();
         int sh = Graphics::GetHeight();
 
-        // pitch black screen
         Graphics::Clear(0xFF000000);
 
         // draw embedded logo centered (scaled to 200x200)
         int logo_sw = 200, logo_sh = 200;
         int logo_lx = (sw - logo_sw) / 2;
         int logo_ly = (sh / 3) - (logo_sh / 2);
-
         for (int dy = 0; dy < logo_sh; dy++) {
             int src_y = (dy * LOGO_HEIGHT) / logo_sh;
             for (int dx = 0; dx < logo_sw; dx++) {
@@ -1061,17 +1410,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             }
         }
 
-        // "kurono" text centered below logo
+        // minimal monochrome brand treatment
         const char* brand = "K U R O N O";
         int brand_w = 11 * 8; // approximate width
-        Graphics::DrawString((sw - brand_w) / 2, logo_ly + logo_sh + 24, brand, 0xFFAAAAAA, 0xFF000000);
+        Graphics::DrawString((sw - brand_w) / 2, logo_ly + logo_sh + 24, brand, 0xFFDADADA, 0xFF000000);
 
         // loading bar dimensions
         int bar_w = 180, bar_h = 3;
         int bar_x = (sw - bar_w) / 2;
-        int bar_y = logo_ly + logo_sh + 52;
-
-        // bar track (dark gray)
+        int bar_y = logo_ly + logo_sh + 56;
         Graphics::FillRect(bar_x, bar_y, bar_w, bar_h, 0xFF222222);
         Graphics::SwapBuffers();
         SerialLogger::Log("Boot splash: logo displayed\r\n");
@@ -1079,23 +1426,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // animate loading bar over ~3 seconds (60 steps x 50ms)
         for (int step = 1; step <= 60; step++) {
             int fill_w = (step * bar_w) / 60;
-            // smooth gradient fill: blue to cyan
             for (int px = 0; px < fill_w; px++) {
-                int r = 0x30 + (px * 0x30) / bar_w;
-                int g = 0x80 + (px * 0x60) / bar_w;
-                int b = 0xFF;
-                uint32_t c = 0xFF000000 | (r << 16) | (g << 8) | b;
+                uint32_t c = 0xFFD8D8D8;
                 for (int py = 0; py < bar_h; py++)
                     Graphics::DrawPixel(bar_x + px, bar_y + py, c);
-            }
-            // three pulsing dots after the bar
-            int dot_y = bar_y + bar_h + 16;
-            for (int d = 0; d < 3; d++) {
-                int dot_x = (sw / 2) - 16 + d * 16;
-                int bright = 80 + ((step + d * 8) % 20) * 8;
-                if (bright > 255) bright = 255;
-                uint32_t dc = 0xFF000000 | (bright << 16) | (bright << 8) | bright;
-                Graphics::FillRect(dot_x, dot_y, 4, 4, dc);
             }
             Graphics::SwapBuffers();
             Timer::WaitMs(50);
@@ -1112,7 +1446,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     System::Initialize();
 
     MediaDecoder::Image wallpaper = {0, 0, 0, false, 0, false};
-    if (mbi->flags & (1u << 3) && mbi->mods_count > 0) {
+    if (has_display && (mbi->flags & (1u << 3)) && mbi->mods_count > 0) {
         multiboot_module_t* mods = (multiboot_module_t*)mbi->mods_addr;
 
         // try named wallpaper
@@ -1160,7 +1494,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     }
 
     // fallback: use embedded wallpaper if no module wallpaper loaded
-    if (!wallpaper.valid) {
+    if (has_display && !wallpaper.valid) {
         SerialLogger::Log("Loading embedded wallpaper...\r\n");
         uint32_t wp_start = (uint32_t)(uintptr_t)wallpaper_png_data;
         uint32_t wp_end = wp_start + wallpaper_png_size;
@@ -1172,10 +1506,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
     }
 
-    GUI::SetWallpaper(wallpaper);
-    if (wallpaper.valid) {
-        Desktop::SetWallpaperImage(wallpaper);
-        SerialLogger::Log("Desktop wallpaper image set\r\n");
+    if (has_display) {
+        GUI::SetWallpaper(wallpaper);
+        if (wallpaper.valid) {
+            Desktop::SetWallpaperImage(wallpaper);
+            SerialLogger::Log("Desktop wallpaper image set\r\n");
+        }
     }
 
     TimeManager::SetTimezoneMinutes(0);
@@ -1191,6 +1527,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // it writes /etc/kurono/ui.conf with defaults on first boot.
     SerialLogger::Log("[UIConfig] Init...\r\n");
     UIConfig::Init();
+
+    // apply persisted accessibility settings to the runtime layers
+    Graphics::SetColorFilter(UIConfig::Int("a11y.color_filter", 0));
+    Graphics::SetHighContrast(UIConfig::Int("a11y.high_contrast", 0) != 0);
+    Keyboard::SetStickyKeys(UIConfig::Int("a11y.sticky_keys", 0) != 0);
+    Keyboard::SetSlowKeys(UIConfig::Int("a11y.slow_keys", 0) ? 250 : 0);
+    Keyboard::SetBounceKeys(UIConfig::Int("a11y.bounce_keys", 0) ? 200 : 0);
+    Keyboard::SetScreenReader(UIConfig::Int("a11y.screen_reader", 0) != 0);
 
     SerialLogger::Log("[Shell] Init...\r\n");
     KuronoShell::Init();
@@ -1238,13 +1582,294 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     PackageManager::Init();
     PackageManager::RegisterCommands(&shell_instance);
 
+    SerialLogger::Log("[GpuDriverInstaller] Init...\r\n");
+    GpuDriverInstaller::Init();
+
+    SerialLogger::Log("[Python] Init mini interpreter...\r\n");
+    PythonInterp::Init();
+    PythonInterp::RegisterShellCommands(&shell_instance);
+
+    SerialLogger::Log("[Userspace] Init ring-3 runtime...\r\n");
+    LinuxSyscall::Init();
+    Userspace::Init();
+    if (EmbeddedUserprogs::HasHello()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/hello",
+                        EmbeddedUserprogs::HelloData(),
+                        EmbeddedUserprogs::HelloSize());
+        SerialLogger::Log("[Userspace] /usr/bin/hello registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::HelloSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    if (EmbeddedUserprogs::HasHelloX64()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/hello_x64",
+                        EmbeddedUserprogs::HelloX64Data(),
+                        EmbeddedUserprogs::HelloX64Size());
+        SerialLogger::Log("[Userspace] /usr/bin/hello_x64 registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::HelloX64Size());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    if (EmbeddedUserprogs::HasKpython()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::Mkdirs("/usr/share");
+        KVFS::WriteFile("/usr/bin/kpython",
+                        EmbeddedUserprogs::KpythonData(),
+                        EmbeddedUserprogs::KpythonSize());
+        // Pre-install the smoke-test script described in the chat:
+        //   print('hello from kurono')
+        //   import sys; print(sys.version)
+        //   print(2**100)
+        const char* hello_py =
+            "print('hello from kurono')\n"
+            "import sys; print(sys.version)\n"
+            "print(2**100)\n";
+        // Compute length manually (no strlen in scope here).
+        uint32_t len = 0;
+        while (hello_py[len]) ++len;
+        KVFS::WriteFile("/usr/share/hello.py", (const uint8_t*)hello_py, len);
+        SerialLogger::Log("[Userspace] /usr/bin/kpython registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::KpythonSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    {
+        auto cmd_runelf = +[](KuronoShell* sh, int argc, const char** argv,
+                              char* out, int maxo) -> int {
+            (void)sh;
+            int p = 0;
+            auto sappend = [&](const char* s) {
+                while (*s && p < maxo - 1) out[p++] = *s++;
+            };
+            auto sappend_int = [&](int v) {
+                char b[16]; int n = 0;
+                if (v == 0) { b[n++] = '0'; }
+                else {
+                    bool neg = v < 0; uint32_t u = neg ? (uint32_t)(-v) : (uint32_t)v;
+                    char tmp[16]; int t = 0;
+                    while (u && t < 15) { tmp[t++] = '0' + (u % 10); u /= 10; }
+                    if (neg && n < 15) b[n++] = '-';
+                    while (t-- > 0 && n < 15) b[n++] = tmp[t];
+                }
+                b[n] = 0;
+                for (int i = 0; b[i] && p < maxo - 1; i++) out[p++] = b[i];
+            };
+            if (argc < 2) {
+                sappend("usage: runelf <path-to-elf>\n");
+                return p;
+            }
+            const char* path = argv[1];
+            Process* proc = ElfLoader::LoadELF64FromVFS(path, "userelf");
+            if (!proc) {
+                sappend("runelf: failed to load ");
+                sappend(path);
+                sappend("\n");
+                return p;
+            }
+            int rc = Userspace::RunProcess(proc);
+            int waited = rc;
+            if (Scheduler::WaitForProcess(proc, &waited)) {
+                rc = waited;
+                Scheduler::ReapProcess(proc);
+            } else {
+                Scheduler::DestroyProcess(proc);
+            }
+            sappend("runelf: ");
+            sappend(path);
+            sappend(" exited with code ");
+            sappend_int(rc);
+            sappend("\n");
+            return p;
+        };
+        shell_instance.RegisterCommand("runelf", "Run a static ELF64 user binary",
+                                       ENV_KURONO, "system",
+                                       (ShellCmdHandler)cmd_runelf);
+
+        // ── kpy <script.py | -c "<source>"> ──
+        // Loads /usr/bin/kpython and runs it via the new RunProcessWithArgs
+        // path so argc/argv/envp/auxv are populated on the user stack.
+        auto cmd_kpy = +[](KuronoShell* sh, int argc, const char** argv,
+                           char* out, int maxo) -> int {
+            (void)sh;
+            int p = 0;
+            auto sappend = [&](const char* s) {
+                while (*s && p < maxo - 1) out[p++] = *s++;
+            };
+            auto sappend_int = [&](int v) {
+                char b[16]; int n = 0;
+                if (v == 0) { b[n++] = '0'; }
+                else {
+                    bool neg = v < 0; uint32_t u = neg ? (uint32_t)(-v) : (uint32_t)v;
+                    char tmp[16]; int t = 0;
+                    while (u && t < 15) { tmp[t++] = '0' + (u % 10); u /= 10; }
+                    if (neg && n < 15) b[n++] = '-';
+                    while (t-- > 0 && n < 15) b[n++] = tmp[t];
+                }
+                b[n] = 0;
+                for (int i = 0; b[i] && p < maxo - 1; i++) out[p++] = b[i];
+            };
+            if (!EmbeddedUserprogs::HasKpython()) {
+                sappend("kpy: kpython not embedded\n");
+                return p;
+            }
+            if (argc < 2) {
+                sappend("usage: kpy <script.py>     run a script from KVFS\n");
+                sappend("       kpy -c \"<source>\"   run inline source\n");
+                sappend("Try:   kpy /usr/share/hello.py\n");
+                return p;
+            }
+            // Build argv array passed to user: argv[0]="kpython", then user args.
+            const char* uargv[6] = { "kpython", nullptr, nullptr, nullptr, nullptr, nullptr };
+            int n = 1;
+            for (int i = 1; i < argc && n < 5; i++) uargv[n++] = argv[i];
+            uargv[n] = nullptr;
+
+            Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/kpython", "kpython");
+            if (!proc) { sappend("kpy: load failed\n"); return p; }
+            int rc = Userspace::RunProcessWithArgs(proc, uargv, nullptr);
+            int waited = rc;
+            if (Scheduler::WaitForProcess(proc, &waited)) {
+                rc = waited;
+                Scheduler::ReapProcess(proc);
+            } else {
+                Scheduler::DestroyProcess(proc);
+            }
+            sappend("kpy: exit=");
+            sappend_int(rc);
+            sappend("\n");
+            return p;
+        };
+        shell_instance.RegisterCommand("kpy",
+            "Run a Python-subset script via the embedded kpython interpreter",
+            ENV_KURONO, "system", (ShellCmdHandler)cmd_kpy);
+    }
+
+    // boot-time smoke test: run the embedded /usr/bin/hello ELF once and
+    // log the result over the serial port.  this validates the elf64
+    // loader + ring-3 transition path on every boot.
+    // NOTE: boot-time smoke tests temporarily disabled  -  the post-exit
+    // userspace cleanup path was blocking the kernel from reaching the
+    // interactive main loop.  Users can still invoke /usr/bin/hello and
+    // /usr/bin/hello_x64 from the shell.
+    if (false && EmbeddedUserprogs::HasHello()) {
+        SerialLogger::Log("[Userspace] Smoke test: running /usr/bin/hello ...\r\n");
+        Process* hp = ElfLoader::LoadELF64FromVFS("/usr/bin/hello", "hello");
+        if (!hp) {
+            SerialLogger::Log("[Userspace] SMOKE TEST: load failed\r\n");
+        } else {
+            int rc = Userspace::RunProcess(hp);
+            int waited = rc;
+            if (Scheduler::WaitForProcess(hp, &waited)) {
+                rc = waited;
+                Scheduler::ReapProcess(hp);
+            } else {
+                Scheduler::DestroyProcess(hp);
+            }
+            SerialLogger::Log("[Userspace] SMOKE TEST: hello exit=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
+    // Second smoke test: x86_64 SYSCALL fast-path.  Validates STAR/LSTAR
+    // wiring, the syscall_entry_x64 stub, and the x64→i386 nr translator.
+    // This is the path musl/CPython will use natively.
+    if (false && EmbeddedUserprogs::HasHelloX64()) {
+        SerialLogger::Log("[Userspace] Smoke test: running /usr/bin/hello_x64 ...\r\n");
+        Process* hp = ElfLoader::LoadELF64FromVFS("/usr/bin/hello_x64", "hello_x64");
+        if (!hp) {
+            SerialLogger::Log("[Userspace] SMOKE TEST: hello_x64 load failed\r\n");
+        } else {
+            int rc = Userspace::RunProcess(hp);
+            int waited = rc;
+            if (Scheduler::WaitForProcess(hp, &waited)) {
+                rc = waited;
+                Scheduler::ReapProcess(hp);
+            } else {
+                Scheduler::DestroyProcess(hp);
+            }
+            SerialLogger::Log("[Userspace] SMOKE TEST: hello_x64 exit=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
+    // Third smoke test: kpython runs /usr/share/hello.py end to end.
+    // Validates argv/auxv stack, file open/read, brk/mmap heap, and the
+    // full x86_64 SYSCALL loop that CPython would otherwise need.
+    // NOTE: temporarily disabled in boot path  -  kpython works on UEFI but
+    // crashes here on BIOS Multiboot2 due to a memory-layout collision
+    // (kpython uses an address that overlaps kernel .rodata under MB2).
+    // Users can still launch kpy interactively from the shell.
+    if (false && EmbeddedUserprogs::HasKpython()) {
+        SerialLogger::Log("[Userspace] Smoke test: running kpython /usr/share/hello.py ...\r\n");
+        Process* kp = ElfLoader::LoadELF64FromVFS("/usr/bin/kpython", "kpython");
+        if (!kp) {
+            SerialLogger::Log("[Userspace] SMOKE TEST: kpython load failed\r\n");
+        } else {
+            const char* kargv[] = { "kpython", "/usr/share/hello.py", nullptr };
+            int rc = Userspace::RunProcessWithArgs(kp, kargv, nullptr);
+            int waited = rc;
+            if (Scheduler::WaitForProcess(kp, &waited)) {
+                rc = waited;
+                Scheduler::ReapProcess(kp);
+            } else {
+                Scheduler::DestroyProcess(kp);
+            }
+            SerialLogger::Log("[Userspace] SMOKE TEST: kpython exit=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
     SerialLogger::Log("[Installer] Init...\r\n");
     Installer::Init();
     Installer::RegisterShellCommands(&shell_instance);
 
     SerialLogger::Log("[Network] Init...\r\n");
     Network::Init();
+    RuntimeLog::LogSystem("network", "network interfaces initialized");
+    SerialLogger::Log("[TCPIP] Init...\r\n");
+    if (TCPStack::Init()) {
+        SerialLogger::Log("[TCPIP] Real TCP/IP stack ready\r\n");
+        RuntimeLog::LogSystem("network", "real TCP/IP stack ready");
+    } else {
+        SerialLogger::Log("[TCPIP] Disabled (no E1000 NIC)\r\n");
+        RuntimeLog::LogSystem("network", "real TCP/IP stack unavailable");
+    }
+    SerialLogger::Log("[TunTap] Init...\r\n");
+    TunTap::Init();
+    SerialLogger::Log("[IPv6] Init...\r\n");
+    IPv6::Init();
+    SerialLogger::Log("[Cgroup] Init...\r\n");
+    Cgroup::Init();
+    Cgroup::PublishToKVFS();
+    SerialLogger::Log("[TPM] Init...\r\n");
+    TPM::Init();
+    SerialLogger::Log("[Netfilter] Init...\r\n");
+    Netfilter::Init();
+    SerialLogger::Log("[CPUFreq] Init...\r\n");
+    CPUFreq::Init();
     WiFi::Init();
+
+    // ---- Userspace runtime layout + IPC servers (Wayland/Pulse/DBus) ----
+    SerialLogger::Log("[RuntimeLayout] Seeding /system tree...\r\n");
+    RuntimeLayout::Init();
+
+    // demo periodic timer so /proc/timer_list has a visible entry
+    static auto hrt_proc_refresh = +[](uint32_t, void*){
+        RuntimeLayout::RefreshProc();
+    };
+    HRTimer::AddPeriodic("proc_refresh", 1000, hrt_proc_refresh, nullptr);
+    SerialLogger::Log("[UnixSocket] Init...\r\n");
+    UnixSocket::Init();
+    SerialLogger::Log("[DBusServer] Starting session bus...\r\n");
+    DBusServer::Init();
+    SerialLogger::Log("[PulseServer] Starting audio daemon...\r\n");
+    PulseServer::Init();
+    SerialLogger::Log("[WaylandServer] Starting compositor...\r\n");
+    WaylandServer::Init();
+    SerialLogger::Log("[ld-kurono] Initialising dynamic linker...\r\n");
+    LdKurono::Init();
 
     SerialLogger::Log("[KCL] Init...\r\n");
     KCL::Init(&shell_instance);
@@ -1274,6 +1899,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     KVFS::Mkdirs("/home/user/Downloads");
     KVFS::Mkdirs("/home/user/Desktop");
     KVFS::Mkdirs("/home/user/Music");
+    KVFS::Mkdirs("/home/user/Videos");
     KVFS::Mkdirs("/usr/bin");
     KVFS::Mkdirs("/etc");
     KVFS::Mkdirs("/tmp");
@@ -1292,28 +1918,94 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         KVFS::WriteString("/home/user/Documents/denji.mp4",
                           "[MP4 stub - asset not embedded]");
     }
+    if (EmbeddedMedia::HasDenjiKVID()) {
+        KVFS::WriteFile("/home/user/Videos/denji.kvid",
+                        EmbeddedMedia::DenjiKVIDData(),
+                        EmbeddedMedia::DenjiKVIDSize());
+        SerialLogger::Log("[KVFS] Embedded denji.kvid: ");
+        SerialLogger::LogDec(EmbeddedMedia::DenjiKVIDSize());
+        SerialLogger::Log(" bytes\r\n");
+    }
     KVFS::WriteString("/home/user/Music/startup.wav", "[WAV PCM 22050Hz 16-bit stereo 0:05]");
     KVFS::WriteString("/home/user/Music/notification.wav", "[WAV PCM 22050Hz 16-bit mono 0:02]");
     KVFS::WriteString("/home/user/hello.kcl", "# KCL Script\nprint \"Hello from Kurono!\"\nset x 42\nprint x\n");
     KVFS::WriteString("/home/user/math.kcl", "# Math demo\nset a 16\nset b sqrt(a)\nprint \"sqrt(16) = \"\nprint b\nset r rand()\nprint \"random = \"\nprint r\n");
     KVFS::WriteString("/home/user/loop.kcl", "# Loop demo\nset sum 0\nfor i in 1 10 do\n  set sum sum + i\nend\nprint \"Sum 1..10 = \"\nprint sum\n");
     KVFS::WriteString("/home/user/fib.kcl", "# Fibonacci\nset a 0\nset b 1\nfor i in 1 10 do\n  set c a + b\n  print c\n  set a b\n  set b c\nend\n");
+    // Pre-populate more visible directories and files for the File Manager
+    KVFS::Mkdirs("/home/user/Desktop");
+    KVFS::Mkdirs("/home/user/Pictures");
+    KVFS::Mkdirs("/home/user/Downloads");
+    KVFS::Mkdirs("/home/user/Videos");
+    KVFS::Mkdirs("/home/user/Projects");
+    KVFS::Mkdirs("/home/user/Projects/kurono");
+    KVFS::WriteString("/home/user/Desktop/README.txt", "Your Kurono desktop.\n\nApps can be launched from the Start Menu (bottom-left).\nRight-click the desktop for wallpaper & display settings.\n");
+    KVFS::WriteString("/home/user/Pictures/screenshot.bmp", "[BMP 1024x768 24-bit placeholder]");
+    KVFS::WriteString("/home/user/Projects/kurono/main.kcl", "# Kurono project\nset project_name \"MyApp\"\nprint \"Building \"\nprint project_name\nprint \"...\"\nprint \"\\nDone!\"\n");
+    KVFS::WriteString("/home/user/.bashrc", "alias ls='ls -l'\nalias ll='ls -la'\nalias cls='clear'\necho \"Welcome back to Kurono!\"\n");
+    KVFS::WriteString("/home/user/.profile", "export PATH=/usr/bin:/usr/local/bin:/home/user/bin\nexport HOME=/home/user\nexport USER=user\n");
+    KVFS::WriteString("/home/user/notes.txt", "Kurono OS Notes\n==============\n\nThings to try:\n- Open Terminal and type 'help'\n- Run 'kurono log' to see system logs\n- Open Task Manager to see processes\n- Browse files in File Manager\n- Try the Calculator app\n- Run 'neofetch' for system info\n");
+    KVFS::WriteString("/home/user/welcome.html", "<html><body><h1>Welcome to Kurono</h1><p>A bare-metal operating system.</p><p>Try the browser app to view this.</p></body></html>");
     SerialLogger::Log("[KVFS] Filesystem populated\r\n");
     RuntimeLog::LogSystem("kernel", "default filesystem populated");
     RuntimeLog::LogBoot("default files populated");
 
+    // initialize the unified audio stack.
+    //
+    // AudioServer probes every registered backend (HDA, AC97, SB16,
+    // PC speaker) in priority order and picks the first one that
+    // initialises successfully.  After this call:
+    //   * AudioMixer::Open()/Write()/Close() works for app streams
+    //   * AudioServer::Beep() / PlayTone() / PlayPCM() route through
+    //     the software mixer to the active backend
+    //   * The legacy Audio::Init() below remains for the SB16-direct
+    //     callers that haven't been migrated yet (they all eventually
+    //     forward to AudioServer)
+    AudioDMA::Init();
+    AudioServer::Init();
+
     // initialize audio driver (sb16) early so apps can use it immediately
     Audio::Init();
 
-    if (has_display) {
+    if (has_display && !boot_cli) {
         SerialLogger::Log("[Desktop] Init...\r\n");
         RuntimeLog::LogBoot("desktop initialization started");
         DesktopEnvironment::Init(Graphics::GetWidth(), Graphics::GetHeight());
+        // Apply user-configured display refresh rate + compositor
+        // shadow/animation settings.  This overrides the auto-detected
+        // monitor Hz from earlier boot if the user explicitly set one.
+        WindowManager::ReloadFromConfig();
         if (wallpaper.valid) {
             Desktop::SetWallpaperImage(wallpaper);
         }
 
-        LockScreen::Show();
+        // First-boot detection: if we've never been installed, run the
+        // graphical installer before the lockscreen.  The installer either
+        // completes (and reboots into the installed system) or returns
+        // false to indicate "Live Boot"  -  in which case we fall through
+        // to the lockscreen and offer Install Kurono on the desktop later.
+        // Installer is launched on demand from the desktop "Install Kurono"
+        // shortcut, not auto-run on first boot  -  auto-launch left users
+        // staring at a black installer screen with no working input.
+        // Pending system update (e.g. `kpkg install debian` queued one).
+        // Runs full-screen progress UI, then continues to lockscreen.
+        if (SystemUpdate::HasPendingUpdate()) {
+            RuntimeLog::LogBoot("system update screen");
+            SystemUpdate::RunPendingUpdate();
+        }
+
+        /* Headless GUI debug autorun: bypass lockscreen entirely by
+           pre-creating + logging in a default user. */
+        if (boot_gui_run[0] != 0) {
+            if (UserManager::GetUserCount() == 0) {
+                UserManager::AddUser("user", "user");
+                SerialLogger::Log("[gui-autorun] auto-created default user\r\n");
+            }
+            UserManager::Login("user", "user");
+            SerialLogger::Log("[gui-autorun] auto-logged in, skipping lockscreen\r\n");
+        } else {
+            LockScreen::Show();
+        }
         RuntimeLog::LogBoot("desktop ready");
     }
 
@@ -1333,6 +2025,25 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[VMM] Deferred  -  virtualization initializes on demand only\r\n");
     VirtualDevices::Init();
     RuntimeLog::LogBoot("boot sequence complete");
+
+    // Seed kernel subsystem Process objects so the Task Manager
+    // Processes tab shows a meaningful list.  These are monitoring
+    // placeholders (CPU = 0 until true preemptive scheduling lands).
+    // Each entry is visible in the scheduler ready_queue and shows up
+    // with its real PID and name in the task manager.
+    Scheduler::CreateProcess("kernel",       nullptr, 0);
+    Scheduler::CreateProcess("scheduler",    nullptr, 0);
+    Scheduler::CreateProcess("window_mgr",   nullptr, 0);
+    Scheduler::CreateProcess("graphics",     nullptr, 0);
+    Scheduler::CreateProcess("kvfs",         nullptr, 0);
+    Scheduler::CreateProcess("network",      nullptr, 0);
+    Scheduler::CreateProcess("shell",        nullptr, 0);
+    Scheduler::CreateProcess("desktop",      nullptr, 0);
+    Scheduler::CreateProcess("pkgmgr",       nullptr, 0);
+    Scheduler::CreateProcess("input_mgr",    nullptr, 0);
+    Scheduler::CreateProcess("audio_srv",    nullptr, 0);
+    Scheduler::CreateProcess("supr_engine",  nullptr, 0);
+    RuntimeLog::LogBoot("kernel subsystem processes registered");
 
     const GpuProbeResult& gpr = GpuProbe::GetResult();
     int igpu_count = 0;
@@ -1438,6 +2149,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     }
 
     // initialize ac97 audio controller
+    // Init is now handled by AudioServer (which probes HDA -> AC97 ->
+    // SB16 -> PC speaker), but we still call AC97::Init() here as a
+    // no-op fallback for anything that queries AC97::IsAvailable()
+    // directly.
     SerialLogger::Log("[AC97] Init...\r\n");
     AC97::Init();
     if (AC97::IsAvailable()) {
@@ -1449,10 +2164,47 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     CPUDetect::Init();
     CPUDetect::PrintInfo();
 
+    if (boot_cli) {
+        cli_decode_command(boot_cli_run);
+        SerialLogger::Log("[CLI] Entering CLI boot shell\r\n");
+        RuntimeLog::LogBoot("cli shell ready");
+        RuntimeLog::LogSystem("kernel", "entered cli boot mode");
+        cli_run_shell(boot_cli_run[0] ? boot_cli_run : nullptr, boot_cli_poweroff);
+    }
+
     SerialLogger::Log("Entering main loop\r\n");
 
     Mouse::SetAutoDraw(false);
 
+    /* GUI autorun: after a short warmup, open the Terminal app and queue
+       a single command (via cmdline `kurono.gui.run=...`). Used to debug
+       interactive flows in headless QEMU runs.  Plumbed into the new
+       GUIProcess via KernelProcesses::SetGuiAutorun(). */
+    cli_decode_command(boot_gui_run);
+    KernelProcesses::SetGuiAutorun(boot_gui_run);
+    bool gui_autorun_armed = (boot_gui_run[0] != 0);
+    (void)gui_autorun_armed;
+    uint32_t gui_autorun_ms_target = Timer::GetTicks() + 4000u;
+    (void)gui_autorun_ms_target;
+
+    // ── Preemptive multitasking switch-over ─────────────────────────────
+    // For graphical / headless boots we hand control to the new scheduler.
+    // Spawn the seven canonical kernel processes (Network/Input/Audio/GUI/
+    // Shell/Logging/Scheduler), then call Scheduler::Start()  -  this enables
+    // IRQs and never returns.  The text-only and console-realtime fallbacks
+    // below still use the polling loop so emergency boot keeps working
+    // even if the preemptive path is later disabled at compile time.
+    if (has_display) {
+        int spawned = KernelProcesses::SpawnAll();
+        SerialLogger::Log("[Kernel] Kernel processes spawned: ");
+        SerialLogger::LogDec(spawned);
+        SerialLogger::Log("\r\n");
+        RuntimeLog::LogBoot("preemptive scheduler engaged");
+        Scheduler::Start();
+        // Unreachable.
+    }
+
+    // Fallback polling loop for text-only / console-realtime boots.
     while (true) {
         // advance system time by real elapsed ms (pit-polled)
         uint32_t real_elapsed = Timer::ElapsedSinceLast();
@@ -1468,9 +2220,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // tick audio drivers (poll-based buffer management)
         Audio::Tick();
         AC97::Tick();
+        // pump the unified audio mixer -> backend pipeline.  Pulls one
+        // PERIOD_FRAMES (1024 frames @ 48 kHz = 21 ms) from every
+        // active stream, mixes, applies master gain + EQ + limiter,
+        // and submits to the active backend.
+        AudioServer::Tick();
 
-        // poll e1000 nic  -  every 4th frame to reduce overhead
-        if (E1000::IsDetected() && (frame_counter & 3) == 0) {
+        if (TCPStack::IsUp()) {
+            TCPStack::Tick();
+        } else if (E1000::IsDetected() && (frame_counter & 3) == 0) {
             E1000::Poll();
         }
 
@@ -1483,7 +2241,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             int scroll_delta = 0;
             while (Mouse::HasEvent()) {
                 Mouse::Event mevt = Mouse::GetEvent();
-                if (mevt.type == 3) scroll_delta += mevt.dz; // scroll
+                if (mevt.type == 3) {
+                    scroll_delta += mevt.dz;
+                    continue;
+                }
+                if (mevt.type == 1 || mevt.type == 2) {
+                    WindowManager::HandlePointerButton(mevt.x, mevt.y,
+                        (int)mevt.button, mevt.type == 1);
+                }
             }
 
             // forward input to desktop environment
@@ -1508,11 +2273,87 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 }
             }
 
+            if (gui_autorun_armed && (int32_t)(Timer::GetTicks() - gui_autorun_ms_target) >= 0) {
+                gui_autorun_armed = false;
+                SerialLogger::Log("[gui-autorun] launching terminal + queuing: ");
+                SerialLogger::Log(boot_gui_run);
+                SerialLogger::Log("\r\n");
+                TerminalApp::Open();
+                TerminalApp::EnqueueCommand(boot_gui_run);
+            }
+
             DesktopEnvironment::Update();
+
+            // sign-out: tear down windows and re-show the lock screen
+            if (DesktopEnvironment::ConsumeLogoutRequest()) {
+                SerialLogger::Log("[Session] Logout requested\r\n");
+                WindowManager::CloseAll();
+                UserManager::Logout();
+                LockScreen::Show();
+                Keyboard::FlushBuffers();
+                Mouse::SetAutoDraw(false);
+                continue;  // skip render this frame, restart loop fresh
+            }
 
             // refresh task manager periodically  -  every 300 frames (~2s)
             if (frame_counter % 300 == 0) {
                 TaskManagerApp::RefreshProcesses();
+            }
+
+            // ── Frame pacing (display.vsync) + adaptive half-rate ──
+            // Graphics::ShouldRender() returns true when at least
+            // target_frame_time_us microseconds have elapsed since the
+            // previous Present.  When we miss the budget for several
+            // consecutive frames we automatically halve the rate so
+            // the user sees consistent (if lower) frame delivery.
+            static int  s_overrun_streak = 0;
+            static int  s_undershoot_streak = 0;
+            static bool s_at_half_rate = false;
+            static uint32_t s_frame_start_us = 0;
+            static const uint32_t OVERRUN_TOLERANCE_US = 2000; // 2ms slack
+            uint32_t now_us = TimeManager::NowUTC().us;
+            if (!Graphics::ShouldRender()) {
+                __asm__ __volatile__("pause");
+                continue;
+            }
+            // measure previous frame duration
+            uint32_t frame_dur_us = (s_frame_start_us == 0) ? 0
+                                       : (now_us - s_frame_start_us);
+            s_frame_start_us = now_us;
+            if (UIConfig::Bool("display.adaptive_sync", true) &&
+                UIConfig::Bool("display.vsync", true)) {
+                uint32_t budget = 1000000u / Graphics::GetTargetFPS();
+                if (frame_dur_us > budget + OVERRUN_TOLERANCE_US) {
+                    s_overrun_streak++;
+                    s_undershoot_streak = 0;
+                    if (!s_at_half_rate && s_overrun_streak >= 8) {
+                        // halve the target FPS, but never below 30
+                        uint32_t cur = Graphics::GetTargetFPS();
+                        uint32_t halved = cur / 2;
+                        if (halved < 30) halved = 30;
+                        Graphics::SetTargetFPS(halved);
+                        s_at_half_rate = true;
+                        s_overrun_streak = 0;
+                    }
+                } else {
+                    s_undershoot_streak++;
+                    s_overrun_streak = 0;
+                    if (s_at_half_rate && s_undershoot_streak >= 120) {
+                        // sustained head-room  -  try original rate again
+                        int cfg_hz = UIConfig::Int("display.refresh_hz", 60);
+                        if (cfg_hz < 24)  cfg_hz = 24;
+                        if (cfg_hz > 360) cfg_hz = 360;
+                        Graphics::SetTargetFPS((uint32_t)cfg_hz);
+                        s_at_half_rate = false;
+                        s_undershoot_streak = 0;
+                    }
+                }
+            }
+
+            // During window drag/resize, clear the back buffer to eliminate
+            // frame tearing from stale content at the window's old position.
+            if (WindowManager::IsDragging()) {
+                Graphics::Clear(0xFF0C0C18); // deep desktop background
             }
 
             // redraw every frame for full smoothness

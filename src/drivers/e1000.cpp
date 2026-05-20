@@ -13,6 +13,7 @@ uint8_t E1000::mac[6] = {0};
 E1000_RXDesc E1000::rx_descs[E1000_NUM_RX_DESC] __attribute__((aligned(16)));
 E1000_TXDesc E1000::tx_descs[E1000_NUM_TX_DESC] __attribute__((aligned(16)));
 uint8_t E1000::rx_buffers[E1000_NUM_RX_DESC][E1000_RX_BUFFER_SIZE] __attribute__((aligned(16)));
+uint8_t E1000::tx_buffers[E1000_NUM_TX_DESC][E1000_TX_BUFFER_SIZE] __attribute__((aligned(16)));
 
 uint16_t E1000::rx_cur = 0;
 uint16_t E1000::tx_cur = 0;
@@ -22,6 +23,8 @@ uint32_t E1000::tx_count = 0;
 uint32_t E1000::rx_count = 0;
 uint32_t E1000::tx_bytes = 0;
 uint32_t E1000::rx_bytes = 0;
+
+static const uint16_t E1000_MAX_TX_FRAME = 1518;
 
 static inline void outl(uint16_t port, uint32_t val) {
     __asm__ __volatile__("outl %0, %1" : : "a"(val), "Nd"(port));
@@ -168,9 +171,13 @@ void E1000::InitRX() {
 
     rx_cur = 0;
 
-    // enable receiver
+    // enable receiver  -  also enable UPE/MPE so SLIRP unicast replies
+    // are not silently filtered if the RAR programming raced.  Verbose
+    // for diagnostics; we can tighten later.
     uint32_t rctl = E1000_RCTL_EN |
                     E1000_RCTL_BAM |         // accept broadcast
+                    E1000_RCTL_UPE |         // unicast promiscuous
+                    E1000_RCTL_MPE |         // multicast promiscuous
                     E1000_RCTL_BSIZE_2048 |  // 2k buffers
                     E1000_RCTL_SECRC;        // strip crc
     WriteReg(E1000_RCTL, rctl);
@@ -179,7 +186,8 @@ void E1000::InitRX() {
 void E1000::InitTX() {
     // set up tx descriptor ring
     for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
-        tx_descs[i].addr = 0;
+        tx_descs[i].addr = (uint64_t)(uintptr_t)&tx_buffers[i][0];
+        tx_descs[i].length = 0;
         tx_descs[i].cmd = 0;
         tx_descs[i].status = E1000_TXD_STAT_DD;  // mark as done
     }
@@ -210,10 +218,15 @@ void E1000::InitTX() {
 }
 
 void E1000::EnableInterrupts() {
-    // clear pending interrupts
+    // Driver is poll-only (Scheduler::Tick() drives E1000::Poll()).  We
+    // intentionally MASK every interrupt cause so the NIC never asserts
+    // its INTx line.  Previously we wrote IMS=0x1F6DC which armed the
+    // legacy IRQ; once a real IDT vector gets hooked for that line the
+    // unhandled storm would wedge the box.  IMC=all-ones disables, then
+    // IMS=0 keeps it that way; ICR read clears any latched cause.
+    WriteReg(E1000_IMC, 0xFFFFFFFFu);
+    WriteReg(E1000_IMS, 0x00000000u);
     ReadReg(E1000_ICR);
-    // we're polling-based, but set masks for status awareness
-    WriteReg(E1000_IMS, 0x1F6DC);  // all useful interrupt causes
 }
 
 void E1000::LinkUp() {
@@ -299,7 +312,10 @@ void E1000::GetMAC(uint8_t out[6]) {
 }
 
 bool E1000::Send(const uint8_t* data, uint16_t length) {
-    if (!detected || !data || length == 0 || length > 1500) return false;
+    if (!detected || !data || length == 0 || length > E1000_MAX_TX_FRAME) {
+        SerialLogger::Log("[E1000:TX] reject: bad params or no NIC\r\n");
+        return false;
+    }
 
     // wait for current tx descriptor to be done
     volatile E1000_TXDesc* txd = &tx_descs[tx_cur];
@@ -307,10 +323,19 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
     while (!(txd->status & E1000_TXD_STAT_DD) && --timeout > 0) {
         __asm__ __volatile__("pause");
     }
-    if (timeout == 0) return false;
+    if (timeout == 0) {
+        SerialLogger::Log("[E1000:TX] descriptor never went DD before queue\r\n");
+        return false;
+    }
+
+    // Copy into a driver-owned DMA buffer. Most callers build packets in
+    // stack-local buffers, so descriptor pointers must not alias ephemeral
+    // memory if we want reliable DNS/TCP traffic.
+    for (uint16_t i = 0; i < length; i++) {
+        tx_buffers[tx_cur][i] = data[i];
+    }
 
     // set up the descriptor
-    txd->addr = (uint64_t)(uintptr_t)data;
     txd->length = length;
     txd->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
     txd->status = 0;
@@ -329,8 +354,36 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
     if (tx_descs[old_cur].status & E1000_TXD_STAT_DD) {
         tx_count++;
         tx_bytes += length;
+        // first 6 packets: dump dst MAC + ethertype for diagnostics
+        if (tx_count <= 6) {
+            char b[80]; int n = 0;
+            const char* p = "[E1000:TX] OK len=";
+            while (*p) b[n++] = *p++;
+            // length decimal
+            uint16_t v = length; char t[8]; int ti = 0;
+            if (v == 0) t[ti++] = '0';
+            while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+            while (ti) b[n++] = t[--ti];
+            const char* p2 = " dst=";
+            while (*p2) b[n++] = *p2++;
+            const char* hex = "0123456789abcdef";
+            for (int i = 0; i < 6; i++) {
+                b[n++] = hex[(data[i] >> 4) & 0xF];
+                b[n++] = hex[data[i] & 0xF];
+                if (i < 5) b[n++] = ':';
+            }
+            const char* p3 = " et=";
+            while (*p3) b[n++] = *p3++;
+            uint16_t et = (uint16_t)((data[12] << 8) | data[13]);
+            for (int i = 12; i >= 0; i -= 4) {
+                b[n++] = hex[(et >> i) & 0xF];
+            }
+            b[n++] = '\r'; b[n++] = '\n'; b[n] = 0;
+            SerialLogger::Log(b);
+        }
         return true;
     }
+    SerialLogger::Log("[E1000:TX] descriptor never went DD after queue (link down?)\r\n");
     return false;
 }
 
@@ -345,14 +398,47 @@ void E1000::Poll() {
             rx_count++;
             rx_bytes += len;
 
+            // diagnostic: dump first 6 RX packets
+            if (rx_count <= 6) {
+                char b[100]; int n = 0;
+                const char* p = "[E1000:RX] len=";
+                while (*p) b[n++] = *p++;
+                uint16_t v = len; char t[8]; int ti = 0;
+                if (v == 0) t[ti++] = '0';
+                while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+                while (ti) b[n++] = t[--ti];
+                const char* p2 = " src=";
+                while (*p2) b[n++] = *p2++;
+                const char* hex = "0123456789abcdef";
+                for (int i = 6; i < 12; i++) {
+                    b[n++] = hex[(buf[i] >> 4) & 0xF];
+                    b[n++] = hex[buf[i] & 0xF];
+                    if (i < 11) b[n++] = ':';
+                }
+                const char* p3 = " et=";
+                while (*p3) b[n++] = *p3++;
+                uint16_t et = (uint16_t)((buf[12] << 8) | buf[13]);
+                for (int i = 12; i >= 0; i -= 4) {
+                    b[n++] = hex[(et >> i) & 0xF];
+                }
+                b[n++] = '\r'; b[n++] = '\n'; b[n] = 0;
+                SerialLogger::Log(b);
+            }
+
             // deliver packet to handler
             if (packet_handler) {
                 packet_handler(buf, len);
             }
         }
 
-        // reset descriptor for reuse
+        // reset descriptor for reuse  -  clear status/length/errors so we
+        // never re-deliver a stale frame on ring wrap, then issue a
+        // compiler+memory barrier so the descriptor write is globally
+        // visible before we hand the slot back to the NIC via RDT.
         rx_descs[rx_cur].status = 0;
+        rx_descs[rx_cur].length = 0;
+        rx_descs[rx_cur].errors = 0;
+        __asm__ __volatile__("sfence" ::: "memory");
         WriteReg(E1000_RDT, rx_cur);
 
         rx_cur = (rx_cur + 1) % E1000_NUM_RX_DESC;

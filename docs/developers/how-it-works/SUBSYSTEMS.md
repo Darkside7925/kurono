@@ -69,6 +69,12 @@ The main driver groups are these.
 
 These files own framebuffer primitives, mode handling, display detection, GPU probing, and hardware specific paths.
 
+GPU probe scans the PCI bus for class 0x03 devices, identifies vendors, classifies hybrid topologies (Optimus, PowerXpress), and validates framebuffer addresses on Optimus laptops by reading Intel DSPSURF registers.
+
+Display manager provides a multi-backend abstraction that routes to BGA, VirtIO GPU, Intel, NVIDIA, or AMD based on GPU probe results. It exposes 10 predefined modes, runtime mode switching, EDID reading, DPI scaling, gamma/brightness, and VSync control.
+
+Graphics provides the framebuffer drawing primitives with double/triple buffering, SSE2 non-temporal store swaps, write-combining remap, dirty region tracking, frame pacing, blend modes, and accessibility color filters.
+
 ### 4.2 Input
 
 `keyboard.*`, `mouse.*`, `usb.*`

@@ -58,8 +58,18 @@ public:
         int mx, my; Mouse::GetPosition(mx, my);
         bool hover = Contains(mx, my);
         Graphics::FillRectRounded(x, y, w, h, 8, hover ? hover_color : bg_color);
-        int text_y = y + (h - (int)font_size) / 2;
-        FontTTF::DrawStringCenter(x + w/2, text_y, font_size, text, text_color);
+        // shrink text to fit inside button bounds: cap at min(font_size, h-4)
+        // and also cap so text width fits within w-8 horizontal padding.
+        float fs = font_size;
+        if (fs > (float)(h - 4)) fs = (float)(h - 4);
+        if (fs < 8.0f) fs = 8.0f;
+        int tw = FontTTF::Measure(fs, text);
+        while (tw > w - 8 && fs > 8.0f) {
+            fs -= 1.0f;
+            tw = FontTTF::Measure(fs, text);
+        }
+        int text_y = y + (h - (int)fs) / 2;
+        FontTTF::DrawStringCenter(x + w/2, text_y, fs, text, text_color);
     }
 
     void OnClick(int mx, int my) override {
@@ -103,16 +113,21 @@ public:
         }
         
         int text_y = y + (h - (int)font_size) / 2;
+        // shrink font size if it's taller than the input field
+        float fs = font_size;
+        if (fs > (float)(h - 4)) fs = (float)(h - 4);
+        if (fs < 8.0f) fs = 8.0f;
+        text_y = y + (h - (int)fs) / 2;
         
         if (display[0] == 0 && !focused) {
-            FontTTF::DrawString(x + 10, text_y, font_size, placeholder, 0xFF888888);
+            FontTTF::DrawString(x + 10, text_y, fs, placeholder, 0xFF888888);
         } else {
-            FontTTF::DrawString(x + 10, text_y, font_size, display, 0xFFFFFFFF);
+            FontTTF::DrawString(x + 10, text_y, fs, display, 0xFFFFFFFF);
         }
         
         if (focused) {
             // draw cursor
-            int tw = FontTTF::Measure(font_size, display);
+            int tw = FontTTF::Measure(fs, display);
             Graphics::FillRect(x + 10 + tw, y + 6, 2, h - 12, 0xFFFFFFFF);
         }
     }

@@ -5,6 +5,7 @@
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
 #include "../net/network.h"
+#include "../net/tcpip.h"
 #include "../shell/shell.h"
 
 LinuxSocket       LinuxNetBridge::sockets[LNET_MAX_SOCKETS];
@@ -39,6 +40,13 @@ static void ln_scpy(char* d, const char* s, int mx) {
     int i = 0;
     while (s && s[i] && i < mx - 1) { d[i] = s[i]; i++; }
     d[i] = 0;
+}
+
+static uint32_t ln_ip_to_u32(IPv4Address ip) {
+    return ((uint32_t)ip.bytes[0] << 24) |
+           ((uint32_t)ip.bytes[1] << 16) |
+           ((uint32_t)ip.bytes[2] << 8) |
+           (uint32_t)ip.bytes[3];
 }
 
 //  init
@@ -76,14 +84,27 @@ void LinuxNetBridge::InitInterfaces() {
     // eth0  -  primary interface (shared with kurono)
     LinuxNetInterface* eth = &interfaces[iface_count++];
     ln_scpy(eth->name, "eth0", sizeof(eth->name));
-    eth->ip_addr   = 0xC0A80064;  // 192.168.0.100
-    eth->netmask   = 0xFFFFFF00;  // 255.255.255.0
-    eth->gateway   = 0xC0A80001;  // 192.168.0.1
-    eth->broadcast = 0xC0A800FF;  // 192.168.0.255
-    eth->mac[0] = 0x02; eth->mac[1] = 0x42;
-    eth->mac[2] = 0xAC; eth->mac[3] = 0x11;
-    eth->mac[4] = 0x00; eth->mac[5] = 0x02;
-    eth->up = true;
+    NetworkInterface* kurono_eth = Network::GetInterface("eth0");
+    if (kurono_eth) {
+        eth->ip_addr = ln_ip_to_u32(kurono_eth->ip);
+        eth->netmask = ln_ip_to_u32(kurono_eth->netmask);
+        eth->gateway = ln_ip_to_u32(kurono_eth->gateway);
+        eth->broadcast = eth->ip_addr | ~eth->netmask;
+        for (int i = 0; i < 6; i++) eth->mac[i] = kurono_eth->mac.bytes[i];
+        eth->up = kurono_eth->state == NIC_UP;
+        dns_primary = ln_ip_to_u32(kurono_eth->dns);
+        if (dns_primary == 0) dns_primary = TCPStack::MakeIP(8, 8, 8, 8);
+        dns_secondary = dns_primary;
+    } else {
+        eth->ip_addr   = 0x0A00020F;  // 10.0.2.15
+        eth->netmask   = 0xFFFFFF00;  // 255.255.255.0
+        eth->gateway   = 0x0A000202;  // 10.0.2.2
+        eth->broadcast = 0x0A0002FF;  // 10.0.2.255
+        eth->mac[0] = 0x02; eth->mac[1] = 0x42;
+        eth->mac[2] = 0xAC; eth->mac[3] = 0x11;
+        eth->mac[4] = 0x00; eth->mac[5] = 0x02;
+        eth->up = false;
+    }
     eth->loopback = false;
     eth->mtu = 1500;
     eth->rx_bytes = 1024;

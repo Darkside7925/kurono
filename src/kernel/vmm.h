@@ -13,6 +13,8 @@
 //  in boot. the vmm can overlay 4kb mappings on top of that for precise
 //  control.
 
+constexpr uint64_t USERSPACE_BASE = 0x0000000040000000ULL;  // 1 GB low-half userspace window
+
 // page table entry flags (common across all levels)
 #define PTE_PRESENT    (1ULL << 0)
 #define PTE_WRITABLE   (1ULL << 1)
@@ -23,6 +25,7 @@
 #define PTE_DIRTY      (1ULL << 6)
 #define PTE_HUGE       (1ULL << 7)   // 2mb page (in pd), 1gb page (in pdpt)
 #define PTE_GLOBAL     (1ULL << 8)
+#define PTE_COW        (1ULL << 9)   // software-defined copy-on-write marker
 #define PTE_NX         (1ULL << 63)  // no-execute (requires efer.nxe = 1)
 
 // virtual address bit layout for 4-level paging:
@@ -38,16 +41,38 @@ public:
     // initialize: reads current cr3, makes it available for further mapping
     static void Init();
 
+    // create a fresh address space that shares the kernel mappings but has
+    // an independent user region starting at USERSPACE_BASE.
+    static uint64_t CreateAddressSpace();
+
+    // clone an existing address space, duplicating user-owned pages while
+    // preserving shared kernel mappings.
+    static uint64_t CloneAddressSpace(uint64_t source_root_pml4);
+
+    // destroy an address space created by CreateAddressSpace(), freeing
+    // user-owned page tables and frames.
+    static void DestroyAddressSpace(uint64_t root_pml4);
+
     // map a single 4kb page: virt_addr → phys_addr with given flags.
     // allocates intermediate page tables from pmm as needed.
     // returns true on success.
     static bool MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
+    static bool MapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
+                                      uint64_t phys_addr, uint64_t flags);
 
     // unmap a single 4kb page. frees the physical frame if free_frame is true.
     static void UnmapPage(uint64_t virt_addr, bool free_frame = false);
+    static void UnmapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
+                                        bool free_frame = false);
 
     // query: returns the physical address mapped at virt_addr, or 0 if not mapped.
     static uint64_t QueryMapping(uint64_t virt_addr);
+    static uint64_t QueryMappingInAddressSpace(uint64_t root_pml4, uint64_t virt_addr);
+    static uint64_t QueryPageFlags(uint64_t virt_addr);
+    static uint64_t QueryPageFlagsInAddressSpace(uint64_t root_pml4, uint64_t virt_addr);
+
+    // switch the active CR3 to a different page-table root.
+    static void ActivateAddressSpace(uint64_t root_pml4);
 
     // flush tlb for a single page
     static void InvalidatePage(uint64_t virt_addr);
@@ -57,6 +82,7 @@ public:
 
     // get the current pml4 physical address (from cr3)
     static uint64_t GetPML4();
+    static uint64_t GetCurrentAddressSpace();
 
 private:
     static uint64_t pml4_phys;  // physical address of pml4 table

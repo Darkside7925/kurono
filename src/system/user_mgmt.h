@@ -1,103 +1,58 @@
 #pragma once
 #include "../kernel/types.h"
 
+// Real per-user record.  Hash is hex SHA-256 of (salt || password)
+// (lower-case hex, 64 chars + nul).
 struct User {
     char username[32];
-    char password_hash[32]; // simple hash for demo
-    bool has_profile_pic;
-    // profile pic data would be stored elsewhere or linked
+    char display_name[48];
+    char password_hash[80];   // hex sha256 of salt+pw
+    char salt[24];            // 8 random bytes -> 16 hex chars
+    int  avatar_id;           // 0..7 default avatar (or -1 for custom)
+    char avatar_path[96];     // path inside KVFS to a custom image (optional)
+    uint32_t accent_color;    // 0xAARRGGBB
+    bool has_pin;
+    char pin_hash[80];
+    bool auto_login;
+    char timezone[32];
+    char language[16];
+    bool is_admin;
 };
 
 class UserManager {
 public:
-    static const int MAX_USERS = 8;
+    static const int MAX_USERS = 16;
     static User users[MAX_USERS];
-    static int user_count;
-    static int current_user;
-    
-    static void Init() {
-        user_count = 0;
-        current_user = -1;
-        // mock default user
-        // adduser("admin", "password");
-    }
-    
-    static bool AddUser(const char* username, const char* password) {
-        if (user_count >= MAX_USERS) return false;
-        // basic copy
-        int i = 0;
-        while(username[i] && i < 31) { users[user_count].username[i] = username[i]; i++; }
-        users[user_count].username[i] = 0;
-        
-        // mock hash
-        // in real os, use proper hashing
-        i = 0;
-        while(password[i] && i < 31) { users[user_count].password_hash[i] = password[i]; i++; }
-        users[user_count].password_hash[i] = 0;
-        
-        users[user_count].has_profile_pic = false;
-        user_count++;
-        return true;
-    }
+    static int  user_count;
+    static int  current_user;
 
-    static bool Login(const char* username, const char* password) {
-        for (int i = 0; i < user_count; i++) {
-            bool user_match = true;
-            const char* stored_user = users[i].username;
-            const char* input_user = username;
-            while (*stored_user && *input_user) {
-                if (*stored_user != *input_user) { user_match = false; break; }
-                stored_user++; input_user++;
-            }
-            if (!user_match || *stored_user != 0 || *input_user != 0) continue;
+    static void Init();                  // load from /etc/passwd if present
+    static void PersistToDisk();         // write /etc/passwd, /etc/shadow, /etc/kurono.conf
 
-            bool pass_match = true;
-            const char* stored_pass = users[i].password_hash;
-            const char* input_pass = password;
-            while (*stored_pass && *input_pass) {
-                if (*stored_pass != *input_pass) { pass_match = false; break; }
-                stored_pass++; input_pass++;
-            }
-            if (pass_match && *stored_pass == 0 && *input_pass == 0) {
-                current_user = i;
-                return true;
-            }
-            return false;
-        }
-        return false;
-    }
-    
-    static bool Validate(const char* username, const char* password) {
-        for (int i = 0; i < user_count; i++) {
-            bool match = true;
-            // check username
-            const char* u1 = users[i].username;
-            const char* u2 = username;
-            while(*u1 && *u2) { if (*u1 != *u2) { match = false; break; } u1++; u2++; }
-            if (match && *u1 == 0 && *u2 == 0) {
-                // check password
-                const char* p1 = users[i].password_hash;
-                const char* p2 = password;
-                while(*p1 && *p2) { if (*p1 != *p2) return false; p1++; p2++; }
-                return *p1 == 0 && *p2 == 0;
-            }
-        }
-        return false;
-    }
+    // Authentication
+    static bool Login(const char* username, const char* password);
+    static bool LoginByPin(const char* username, const char* pin);
+    static void Logout();
 
-    static const char* GetCurrentUsername() {
-        if (current_user >= 0 && current_user < user_count)
-            return users[current_user].username;
-        return "user";
-    }
+    // Registration / lifecycle
+    static bool AddUser(const char* username, const char* password); // legacy 2-arg
+    static bool RegisterUser(const User& u, const char* plaintext_password);
+    static bool RemoveUser(const char* username);
+    static User* FindByName(const char* username);
 
-    static int GetCurrentUserIndex() {
-        return current_user;
-    }
+    // Real password hashing (SHA-256 of salt||password, hex)
+    static void HashPassword(const char* salt, const char* plaintext, char* out_hex_64);
+    static void GenerateSalt(char* out_hex_16);
 
-    static void Logout() {
-        current_user = -1;
-    }
-    
-    static int GetUserCount() { return user_count; }
+    // Convenience accessors
+    static const char* GetCurrentUsername();
+    static const char* GetCurrentDisplayName();
+    static int         GetCurrentUserIndex();
+    static int         GetUserCount();
+
+    // Username/password validation rules (used by registration UI)
+    enum PwdStrength { PWD_WEAK = 0, PWD_FAIR = 1, PWD_STRONG = 2, PWD_VERY_STRONG = 3 };
+    static int MeasurePassword(const char* p);
+    static bool IsUsernameValid(const char* u);   // 3-31 chars, [a-z0-9_-], starts with letter
+    static bool IsUsernameTaken(const char* u);
 };

@@ -34,7 +34,7 @@ This folder owns hardware.
 
 ### `src/ui`
 
-This folder owns the desktop shell and window system.
+This folder owns the desktop shell, window system, and the in-kernel Wayland compositor.
 
 ### `src/apps`
 
@@ -87,9 +87,10 @@ Read these first.
 
 1. `src/ui/desktop.cpp`
 2. `src/ui/window_manager.cpp`
-3. `src/apps/terminal.cpp`
-4. `src/apps/settings.cpp`
-5. `src/system/input_manager.cpp`
+3. `src/ui/wayland_server.cpp`
+4. `src/apps/terminal.cpp`
+5. `src/apps/settings.cpp`
+6. `src/system/input_manager.cpp`
 
 ## 5. If the goal is shell work
 

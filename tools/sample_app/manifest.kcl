@@ -1,0 +1,10 @@
+# Sample Kurono App Manifest
+# This is a minimal .kro application  -  a Hello World app for Kurono OS.
+
+set app_name "HelloKurono"
+set app_version "1.0.0"
+set app_author "Developer"
+set app_type "app"
+set app_entry "main.kcl"
+
+print "HelloKurono v1.0.0 loading..."

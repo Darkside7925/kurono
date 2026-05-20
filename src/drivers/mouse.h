@@ -8,6 +8,7 @@ public:
     static bool LeftClicked();
     static bool RightClicked();
     static bool IsLeftDown();
+    static bool IsOperational();
     static void ForceRedraw();
     enum DeviceType { DevUnknown=0, DevMouse=1, DevTouchpad=2 };
     struct Event { uint8_t type; int x; int y; int dx; int dy; int dz; uint8_t button; uint8_t buttons; uint8_t fingers; uint8_t pressure; uint8_t width; uint8_t gesture; uint64_t time_us; };
@@ -80,11 +81,22 @@ private:
     static bool ExpectAck(int timeout_us);
     static bool CommandArg(uint8_t cmd, uint8_t arg);
     static uint8_t ReadID();
+    static bool WaitInputBufferClear(int timeout_us);
+    static bool ReadAuxByte(uint8_t& value, int timeout_us);
+    static bool SendMouseByteAwaitAck(uint8_t value, int timeout_us, int max_attempts);
+    static bool ReadControllerConfig(uint8_t& cfg);
+    static bool WriteControllerConfig(uint8_t cfg);
+    static bool ResetDevice(uint8_t& device_id);
     static void FlushOutput();
     static uint32_t BgAt(int x, int y);
     static void ClearAt(int x, int y);
     static uint8_t MapButtons(uint8_t hw);
     static DeviceType DetectDeviceType();
+    static void InitVirtualBoxIntegration();
+    static bool PollVirtualBoxAbsolute();
+    static void InitVMwareIntegration();
+    static bool PollVMwareAbsolute();
+    static void EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int wheel_delta);
     
     static int lastx, lasty;
     static uint8_t pkt[8];
