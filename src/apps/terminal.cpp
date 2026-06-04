@@ -75,6 +75,9 @@ bool         TerminalApp::command_pending = false;
 bool         TerminalApp::command_running = false;
 char         TerminalApp::pending_cmd[TERM_INPUT_MAX];
 unsigned int TerminalApp::blink_timer   = 0;
+unsigned int TerminalApp::last_keypress_ms = 0;
+int          TerminalApp::smooth_scroll_q16 = 0;
+int          TerminalApp::target_scroll_offset = 0;
 
 //  init / open
 void TerminalApp::Init(){
@@ -85,6 +88,9 @@ void TerminalApp::Init(){
     hist_count=0; hist_pos=-1; hist_saved[0]=0;
     tab_match_count=0; tab_match_idx=-1; tab_prefix[0]=0;
     blink_timer=0;
+    last_keypress_ms=0;
+    smooth_scroll_q16=0;
+    target_scroll_offset=0;
     shell_ready=true;
     command_pending=false;
     command_running=false;
@@ -146,19 +152,14 @@ int TerminalApp::Open(){
             if(ev==1) TerminalApp::Input(w,p1,p2,true,0);
             else if(ev==2) TerminalApp::Input(w,0,0,false,(char)p1);
             else if(ev==3) {
-                // scroll event: p1 = scroll delta (positive = scroll up)
-                if(p1 > 0) {
-                    // scroll up (show earlier content)
-                    TerminalApp::scroll_offset += 3;
-                    int max_scroll = TerminalApp::buf_count > 25 ? TerminalApp::buf_count - 25 : 0;
-                    if(TerminalApp::scroll_offset > max_scroll)
-                        TerminalApp::scroll_offset = max_scroll;
-                } else if(p1 < 0) {
-                    // scroll down (towards latest)
-                    TerminalApp::scroll_offset -= 3;
-                    if(TerminalApp::scroll_offset < 0)
-                        TerminalApp::scroll_offset = 0;
-                }
+                // scroll event: p1 = scroll delta (positive = scroll up).
+                // Stage on target; the next paint eases scroll_offset toward it.
+                int max_scroll = TerminalApp::buf_count > 25 ? TerminalApp::buf_count - 25 : 0;
+                TerminalApp::target_scroll_offset += (p1 > 0) ? 3 : (p1 < 0 ? -3 : 0);
+                if(TerminalApp::target_scroll_offset < 0)
+                    TerminalApp::target_scroll_offset = 0;
+                if(TerminalApp::target_scroll_offset > max_scroll)
+                    TerminalApp::target_scroll_offset = max_scroll;
             }
         }
     );
@@ -305,6 +306,8 @@ void TerminalApp::SetColor(unsigned int fg,unsigned int bg){
 
 void TerminalApp::ScrollToBottom(){
     scroll_offset = 0;
+    target_scroll_offset = 0;
+    smooth_scroll_q16 = 0;
 }
 
 void TerminalApp::WritePrompt(){
@@ -429,11 +432,14 @@ void TerminalApp::TabComplete(){
     for(int i=0;i<partial_len;i++) if(partial[i]=='/') last_slash=i;
 
     if(last_slash>=0){
-        for(int i=0;i<=last_slash&&i<KVFS_MAX_PATH-1;i++) scan_dir[i]=partial[i];
-        scan_dir[last_slash+1]=0;
-        for(int i=last_slash+1;i<partial_len&&i-last_slash-1<(int)sizeof(file_prefix)-1;i++)
-            file_prefix[i-last_slash-1]=partial[i];
-        file_prefix[partial_len-(last_slash+1)]=0;
+        int copy_n = last_slash+1;
+        if(copy_n > KVFS_MAX_PATH-1) copy_n = KVFS_MAX_PATH-1;
+        for(int i=0;i<copy_n;i++) scan_dir[i]=partial[i];
+        scan_dir[copy_n]=0;
+        int fp_i = 0;
+        for(int i=last_slash+1;i<partial_len && fp_i<(int)sizeof(file_prefix)-1;i++)
+            file_prefix[fp_i++]=partial[i];
+        file_prefix[fp_i]=0;
         if(scan_dir[0]!='/'){
             char abs[KVFS_MAX_PATH];
             scpy(abs,cwd?cwd:"/",KVFS_MAX_PATH);
@@ -627,6 +633,14 @@ void TerminalApp::RenderCell(int sx,int sy,TermCell* cell){
 void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     (void)win_ptr;
 
+    // ease scroll_offset toward target_scroll_offset (~3 frames to settle)
+    if(scroll_offset != target_scroll_offset){
+        int diff = target_scroll_offset - scroll_offset;
+        int step = diff / 3;
+        if(step == 0) step = (diff > 0) ? 1 : -1;
+        scroll_offset += step;
+    }
+
     // fill background
     Graphics::FillRect(cx,cy,cw,ch,T_BG);
 
@@ -648,12 +662,48 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     start_line -= scroll_offset;
     if(start_line<0) start_line=0;
 
-    // render buffer lines
+    // render buffer lines  -  batch consecutive same-bg cells into a single FillRect
     int sy=cy;
+    char run_buf[TERM_COLS+1];
     for(int row=start_line; row<total_lines && sy+CELL_H<=cy+ch-CELL_H; row++){
         if(row<0||row>=TERM_SCROLL_BK) continue;
-        for(int col=0;col<vis_cols && col<buffer[row].len;col++){
-            RenderCell(cx+col*CELL_W, sy, &buffer[row].cells[col]);
+        int max_col = buffer[row].len;
+        if(max_col > vis_cols) max_col = vis_cols;
+        // bg pass: batched solid-color background fills
+        int col = 0;
+        while(col < max_col){
+            unsigned int bg = buffer[row].cells[col].bg;
+            if(bg == T_BG){ col++; continue; }
+            int run_start = col;
+            while(col < max_col && buffer[row].cells[col].bg == bg) col++;
+            Graphics::FillRect(cx + run_start*CELL_W, sy,
+                               (col - run_start) * CELL_W, CELL_H, bg);
+        }
+        // fg pass: batched consecutive same-color/bold text
+        col = 0;
+        while(col < max_col){
+            char c0 = buffer[row].cells[col].ch;
+            if(c0 <= ' '){ col++; continue; }
+            unsigned int fg = buffer[row].cells[col].fg;
+            bool bold = buffer[row].cells[col].bold;
+            int run_start = col;
+            int rb = 0;
+            while(col < max_col && rb < TERM_COLS){
+                TermCell* c = &buffer[row].cells[col];
+                if(c->ch <= ' ' || c->fg != fg || c->bold != bold) break;
+                run_buf[rb++] = c->ch;
+                col++;
+            }
+            run_buf[rb] = 0;
+            if(rb > 0){
+                unsigned int draw_fg = fg;
+                if(bold){
+                    unsigned int r=(fg>>16)&0xFF, g=(fg>>8)&0xFF, b=fg&0xFF;
+                    r=r+50>255?255:r+50; g=g+50>255?255:g+50; b=b+50>255?255:b+50;
+                    draw_fg = 0xFF000000|(r<<16)|(g<<8)|b;
+                }
+                Graphics::DrawString(cx + run_start*CELL_W, sy, run_buf, draw_fg, 0xFF000000);
+            }
         }
         sy+=CELL_H;
     }
@@ -668,22 +718,35 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
         }
     }
 
-    // draw live input after the prompt, wrapping to following rows
-    for(int i=0;i<input_len;i++){
-        char s[2]={input_buf[i],0};
-        int abs_col = prompt_end_col + i;
-        int row_off = abs_col / vis_cols;
-        int col = abs_col % vis_cols;
-        int dx=cx+col*CELL_W;
-        int dy=cy+((cursor_row + row_off)-start_line)*CELL_H;
-        if(dy>=cy && dy+CELL_H<=cy+ch){
-            Graphics::DrawString(dx,dy,s,T_FG,0xFF000000);
+    // draw live input after the prompt; batch the longest contiguous run per row
+    {
+        int i = 0;
+        char line_buf[TERM_COLS+1];
+        while(i < input_len){
+            int abs_col = prompt_end_col + i;
+            int row_off = abs_col / vis_cols;
+            int col = abs_col % vis_cols;
+            int dx = cx + col*CELL_W;
+            int dy = cy + ((cursor_row + row_off) - start_line) * CELL_H;
+            int lb = 0;
+            // gather until row wraps or input ends
+            while(i < input_len && col < vis_cols && lb < TERM_COLS){
+                line_buf[lb++] = input_buf[i++];
+                col++;
+            }
+            line_buf[lb] = 0;
+            if(lb > 0 && dy >= cy && dy + CELL_H <= cy + ch){
+                Graphics::DrawString(dx, dy, line_buf, T_FG, 0xFF000000);
+            }
         }
     }
 
-    // blinking cursor using real timer (500ms period)
+    // blinking cursor: pauses (always on) for ~500ms after a keypress, then blinks
     unsigned int now_ms = Timer::GetRealMs();
-    bool cursor_visible = ((now_ms / 500) % 2) == 0;
+    unsigned int since_key = now_ms - last_keypress_ms;
+    bool cursor_visible;
+    if(since_key < 500) cursor_visible = true;
+    else cursor_visible = (((now_ms - last_keypress_ms) / 500) % 2) == 0;
     if(cursor_visible){
         int abs_col = prompt_end_col + input_cursor;
         int cur_x = cx + (abs_col % vis_cols) * CELL_W;
@@ -700,6 +763,7 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     (void)win_ptr; (void)mx; (void)my; (void)clicked;
 
     if(key==0) return false;
+    last_keypress_ms = Timer::GetRealMs();
     if(command_pending || command_running){
         if(key==3){
             KuronoShell::RequestCommandCancel();

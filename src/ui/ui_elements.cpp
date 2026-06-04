@@ -1,2 +1,3 @@
 #include "ui_elements.h"
-// implementation is mostly in header for this simplified framework
+
+bool Widget::high_contrast_mode = false;

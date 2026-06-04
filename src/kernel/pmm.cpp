@@ -32,27 +32,39 @@ bool PMM::IsFrameUsed(uint64_t phys_addr) {
     return TestFrame(idx);
 }
 
+// count trailing zeros (find first set bit). returns 64 for v==0.
+static inline int ctz64(uint64_t v) {
+    if (v == 0) return 64;
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(v);
+#else
+    int n = 0;
+    while (!(v & 1ULL)) { v >>= 1; n++; }
+    return n;
+#endif
+}
+
 uint64_t PMM::FindFreeFrame() {
-    // start from hint, wrap around once
     uint64_t qwords = bitmap_size;
+    if (qwords == 0) return ~0ULL;
+
+    uint64_t start_q = search_hint / 64;
+    if (start_q >= qwords) start_q = 0;
 
     for (uint64_t pass = 0; pass < qwords; pass++) {
-        uint64_t qi = (search_hint / 64 + pass) % qwords;
-        if (bitmap[qi] == ~0ULL) continue;  // all 64 bits set → skip
-
-        // find first zero bit in this qword
+        uint64_t qi = (start_q + pass) % qwords;
         uint64_t val = bitmap[qi];
-        for (int bit = 0; bit < 64; bit++) {
-            if (!(val & (1ULL << bit))) {
-                uint64_t frame = qi * 64 + bit;
-                if (frame < total_frames) {
-                    search_hint = frame + 1;
-                    return frame;
-                }
-            }
-        }
+        if (val == ~0ULL) continue;
+
+        // ~val: 1 = free. find lowest set bit.
+        uint64_t inv = ~val;
+        int bit = ctz64(inv);
+        uint64_t frame = qi * 64 + (uint64_t)bit;
+        if (frame >= total_frames) continue;
+        search_hint = frame + 1;
+        return frame;
     }
-    return ~0ULL;  // out of memory
+    return ~0ULL;
 }
 
 uint64_t PMM::AllocFrame() {
@@ -64,14 +76,18 @@ uint64_t PMM::AllocFrame() {
     SetFrame(idx);
     refs[idx] = 1;
     used_frames++;
-    return idx * PAGE_SIZE;
+    uint64_t phys = idx * PAGE_SIZE;
+    // zero-on-alloc: scrub the frame so we never hand out stale data.
+    uint64_t* p = (uint64_t*)(uintptr_t)phys;
+    for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) p[i] = 0;
+    return phys;
 }
 
 void PMM::RetainFrame(uint64_t phys_addr) {
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return;
     if (!TestFrame(idx)) return;
-
+    if (refs[idx] == 0xFFFF) return;  // saturate to prevent wraparound
     refs[idx]++;
 }
 
@@ -95,28 +111,25 @@ void PMM::FreeFrame(uint64_t phys_addr) {
     ClearFrame(idx);
     used_frames--;
 
-    // move hint backward for better locality
     if (idx < search_hint) search_hint = idx;
 }
 
 static void bulk_set_frames(uint64_t start, uint64_t count,
-                            uint64_t* bmp, uint64_t& used) {
+                            uint64_t* bmp, uint64_t& used, uint64_t total) {
     uint64_t end = start + count;
+    if (end > total) end = total;
     uint64_t i = start;
 
-    // align to qword boundary
     while (i < end && (i % 64) != 0) {
         bmp[i / 64] |= (1ULL << (i % 64));
         used++;
         i++;
     }
-    // set full qwords
     while (i + 64 <= end) {
         bmp[i / 64] = ~0ULL;
         used += 64;
         i += 64;
     }
-    // remaining bits
     while (i < end) {
         bmp[i / 64] |= (1ULL << (i % 64));
         used++;
@@ -124,56 +137,97 @@ static void bulk_set_frames(uint64_t start, uint64_t count,
     }
 }
 
+static void bulk_clear_frames(uint64_t start, uint64_t count,
+                              uint64_t* bmp, uint64_t& used, uint64_t total) {
+    uint64_t end = start + count;
+    if (end > total) end = total;
+    uint64_t i = start;
+
+    while (i < end && (i % 64) != 0) {
+        uint64_t mask = (1ULL << (i % 64));
+        if (bmp[i / 64] & mask) {
+            bmp[i / 64] &= ~mask;
+            used--;
+        }
+        i++;
+    }
+    while (i + 64 <= end) {
+        // count bits set, then clear whole qword
+        uint64_t v = bmp[i / 64];
+#if defined(__GNUC__) || defined(__clang__)
+        used -= (uint64_t)__builtin_popcountll(v);
+#else
+        for (int b = 0; b < 64; b++) if (v & (1ULL << b)) used--;
+#endif
+        bmp[i / 64] = 0;
+        i += 64;
+    }
+    while (i < end) {
+        uint64_t mask = (1ULL << (i % 64));
+        if (bmp[i / 64] & mask) {
+            bmp[i / 64] &= ~mask;
+            used--;
+        }
+        i++;
+    }
+}
+
 uint64_t PMM::AllocContiguous(uint64_t count) {
     if (count == 0) return 0;
     if (count == 1) return AllocFrame();
+    // overflow guard
+    if (count > total_frames) return 0;
 
-    // optimized scan: skip full qwords (64 frames at a time) where possible.
-    // for large requests (>64 frames), first scan qword-at-a-time to find
-    // candidate regions of all-zero qwords, then verify edges bit-by-bit.
-    uint64_t qwords = bitmap_size;  // number of uint64_t entries
+    uint64_t qwords = bitmap_size;
 
-    // scan for runs of free frames
     uint64_t run_start = 0;
     uint64_t run_len   = 0;
 
     for (uint64_t qi = 0; qi < qwords; qi++) {
-        if (bitmap[qi] == ~0ULL) {
-            // all 64 frames used  -  reset run
+        uint64_t val = bitmap[qi];
+        if (val == ~0ULL) {
             run_start = (qi + 1) * 64;
             run_len = 0;
             continue;
         }
-        if (bitmap[qi] == 0ULL) {
-            // all 64 frames free  -  extend run by 64
+        if (val == 0ULL) {
             uint64_t frame_base = qi * 64;
             if (run_len == 0) run_start = frame_base;
-            run_len += 64;
+            // cap the run to total_frames
+            uint64_t add = 64;
+            if (frame_base + add > total_frames) add = total_frames - frame_base;
+            run_len += add;
             if (run_len >= count) {
-                // we have enough  -  mark and return
-                bulk_set_frames(run_start, count, bitmap, used_frames);
-                    for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
+                bulk_set_frames(run_start, count, bitmap, used_frames, total_frames);
+                for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
                 search_hint = run_start + count;
-                return run_start * PAGE_SIZE;
+                uint64_t phys = run_start * PAGE_SIZE;
+                // zero the entire region
+                uint64_t* zp = (uint64_t*)(uintptr_t)phys;
+                uint64_t qcount = (count * PAGE_SIZE) / 8;
+                for (uint64_t z = 0; z < qcount; z++) zp[z] = 0;
+                return phys;
             }
             continue;
         }
-        // partial qword  -  scan bit by bit
         for (int bit = 0; bit < 64; bit++) {
-            uint64_t fi = qi * 64 + bit;
+            uint64_t fi = qi * 64 + (uint64_t)bit;
             if (fi >= total_frames) break;
-            if (bitmap[qi] & (1ULL << bit)) {
-                // used  -  reset run
+            if (val & (1ULL << bit)) {
                 run_start = fi + 1;
                 run_len = 0;
             } else {
                 if (run_len == 0) run_start = fi;
                 run_len++;
                 if (run_len >= count) {
-                    bulk_set_frames(run_start, count, bitmap, used_frames);
+                    bulk_set_frames(run_start, count, bitmap, used_frames, total_frames);
                     for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
                     search_hint = run_start + count;
-                    return run_start * PAGE_SIZE;
+                    uint64_t phys = run_start * PAGE_SIZE;
+                    uint64_t* zp = (uint64_t*)(uintptr_t)phys;
+                    uint64_t qcount = (count * PAGE_SIZE) / 8;
+                    for (uint64_t z = 0; z < qcount; z++) zp[z] = 0;
+                    return phys;
                 }
             }
         }
@@ -184,37 +238,46 @@ uint64_t PMM::AllocContiguous(uint64_t count) {
     return 0;
 }
 
+void PMM::FreeContiguous(uint64_t phys_addr, uint64_t count) {
+    if (!phys_addr || count == 0) return;
+    uint64_t start = phys_addr / PAGE_SIZE;
+    if (start >= total_frames) return;
+    if (count > total_frames - start) count = total_frames - start;
+
+    // fast path: if all frames have refcount == 1, do bulk clear
+    bool fast = true;
+    for (uint64_t j = 0; j < count; j++) {
+        if (refs[start + j] != 1) { fast = false; break; }
+        if (!TestFrame(start + j))  { fast = false; break; }
+    }
+    if (fast) {
+        for (uint64_t j = 0; j < count; j++) refs[start + j] = 0;
+        bulk_clear_frames(start, count, bitmap, used_frames, total_frames);
+        if (start < search_hint) search_hint = start;
+        return;
+    }
+    for (uint64_t j = 0; j < count; j++) {
+        FreeFrame((start + j) * PAGE_SIZE);
+    }
+}
+
 void* PMM::AllocBytes(size_t bytes) {
     if (bytes == 0) return nullptr;
+    // overflow guard on round-up
+    if (bytes > (size_t)-1 - (PAGE_SIZE - 1)) return nullptr;
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t phys = AllocContiguous(pages);
     if (!phys) return nullptr;
-    // zero the allocation (callers expect clean memory)
-    memset((void*)(uintptr_t)phys, 0, pages * PAGE_SIZE);
+    // AllocContiguous already zeroed the region
     return (void*)(uintptr_t)phys;
 }
 
 void PMM::FreeBytes(void* addr, size_t bytes) {
     if (!addr || bytes == 0) return;
     uint64_t phys = (uint64_t)(uintptr_t)addr;
+    if (bytes > (size_t)-1 - (PAGE_SIZE - 1)) return;
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    for (uint64_t i = 0; i < pages; i++) {
-        FreeFrame(phys + i * PAGE_SIZE);
-    }
-}
-
-static void mark_range_used(uint64_t base, uint64_t length) {
-    uint64_t start_frame = base / PAGE_SIZE;
-    uint64_t end_frame   = (base + length + PAGE_SIZE - 1) / PAGE_SIZE;
-    for (uint64_t f = start_frame; f < end_frame; f++) {
-        if (f < PMM::GetTotalFrames() && !PMM::IsFrameUsed(f * PAGE_SIZE)) {
-            // we can't call setframe directly (private), so we use allocframe semantics
-            // actually, let's just inline it  -  we're in the .cpp so we have access
-        }
-    }
-    // direct access since we're in the class impl file:
-    // we'll do it inline below in init()
-    (void)base; (void)length;
+    FreeContiguous(phys, pages);
 }
 
 void PMM::Init(multiboot_info_t* mbi) {
@@ -223,7 +286,6 @@ void PMM::Init(multiboot_info_t* mbi) {
     uint64_t max_addr = 0;
 
     if (mbi->flags & (1 << 6)) {
-        // bit 6: memory map is valid
         uint64_t mmap_end = mbi->mmap_addr + mbi->mmap_length;
         uint64_t offset = mbi->mmap_addr;
 
@@ -231,32 +293,27 @@ void PMM::Init(multiboot_info_t* mbi) {
             MultibootMmapEntry* entry = (MultibootMmapEntry*)(uintptr_t)offset;
             uint64_t region_end = entry->base_addr + entry->length;
             if (region_end > max_addr) max_addr = region_end;
-            offset += entry->size + 4;  // +4 because 'size' doesn't include itself
+            offset += entry->size + 4;
         }
     } else if (mbi->flags & (1 << 0)) {
-        // bit 0: mem_lower + mem_upper (less accurate)
         max_addr = ((uint64_t)mbi->mem_upper + 1024) * 1024;
     } else {
-        // fallback: assume 128 mb
         max_addr = 128ULL * 1024 * 1024;
     }
 
-    // cap at 16 gb (our identity map in boot asm covers this)
     if (max_addr > 16ULL * 1024 * 1024 * 1024) {
         max_addr = 16ULL * 1024 * 1024 * 1024;
     }
 
     total_frames = max_addr / PAGE_SIZE;
-    used_frames  = total_frames;  // start with everything "used"
+    used_frames  = total_frames;
 
-    // each bit = 1 frame. we need total_frames bits = total_frames/8 bytes.
-    uint64_t bitmap_bytes = (total_frames + 63) / 64 * 8;  // round up to qword
+    uint64_t bitmap_bytes = (total_frames + 63) / 64 * 8;
     bitmap_size = bitmap_bytes / 8;
     bitmap = (uint64_t*)(uintptr_t)( ((uint64_t)&kernel_end + 4095) & ~4095ULL );
     refs = (uint16_t*)(uintptr_t)(bitmap + bitmap_size);
     uint64_t refs_bytes = total_frames * sizeof(uint16_t);
 
-    // initialize bitmap: all frames marked as used (all bits = 1)
     uint8_t* bp = (uint8_t*)bitmap;
     for (uint64_t i = 0; i < bitmap_bytes; i++) {
         bp[i] = 0xFF;
@@ -282,9 +339,8 @@ void PMM::Init(multiboot_info_t* mbi) {
             MultibootMmapEntry* entry = (MultibootMmapEntry*)(uintptr_t)offset;
 
             if (entry->type == 1) {
-                // type 1 = available ram  -  mark frames as free
-                uint64_t base = (entry->base_addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1); // align up
-                uint64_t end  = (entry->base_addr + entry->length) & ~(PAGE_SIZE - 1); // align down
+                uint64_t base = (entry->base_addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                uint64_t end  = (entry->base_addr + entry->length) & ~(PAGE_SIZE - 1);
 
                 for (uint64_t addr = base; addr < end; addr += PAGE_SIZE) {
                     uint64_t idx = addr / PAGE_SIZE;
@@ -297,9 +353,6 @@ void PMM::Init(multiboot_info_t* mbi) {
             offset += entry->size + 4;
         }
     } else {
-        // no memory map available (efi boot-services path, or very old bios).
-        // assume all ram from 1 mb to max_addr is usable.  step 4 below will
-        // re-reserve the kernel image, bitmap, first 1 mb, and framebuffer.
         SerialLogger::Log("PMM: No mmap  -  using fallback (1MB..max_addr free)\r\n");
         for (uint64_t addr = 0x100000; addr < max_addr; addr += PAGE_SIZE) {
             uint64_t idx = addr / PAGE_SIZE;
@@ -310,15 +363,13 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
     }
 
-    // 4a. first 1 mb: bios/ivt/vga/rom  -  never allocate
     for (uint64_t f = 0; f < (1024 * 1024) / PAGE_SIZE; f++) {
-        if (!TestFrame(f)) {
+        if (f < total_frames && !TestFrame(f)) {
             SetFrame(f);
             used_frames++;
         }
     }
 
-    // 4b. kernel image: kernel_start..kernel_bss_end
     uint64_t kern_start_phys = (uint64_t)&kernel_start;
     uint64_t kern_end_phys   = (uint64_t)&kernel_end;
     for (uint64_t addr = kern_start_phys & ~(PAGE_SIZE - 1);
@@ -330,7 +381,6 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
     }
 
-    // 4c. the bitmap itself
     uint64_t bm_start = (uint64_t)bitmap;
     uint64_t bm_end   = bm_start + bitmap_bytes;
     uint64_t refs_start = (uint64_t)refs;
@@ -352,7 +402,6 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
     }
 
-    // 4d. framebuffer region (if present)
     if ((mbi->flags & (1 << 12)) && mbi->framebuffer_addr != 0) {
         uint64_t fb_size = (uint64_t)mbi->framebuffer_pitch * mbi->framebuffer_height;
         uint64_t fb_base = mbi->framebuffer_addr & ~(PAGE_SIZE - 1);

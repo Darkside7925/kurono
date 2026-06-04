@@ -39,14 +39,17 @@ public:
     uint32_t Submit(const int16_t* pcm, uint32_t frames) override {
         if (!ready_ || !pcm || frames == 0) return 0;
         // Find peak amplitude (left channel) and zero-crossing count.
+        // Sign change detection uses bit 15 so unsigned widening doesn't
+        // mask the sign bit (the previous `(s ^ prev) < 0` ran on an
+        // implicitly-promoted int and missed crossings).
         int32_t peak = 0;
         uint32_t zc = 0;
-        int16_t prev = 0;
+        int16_t prev = pcm[0];
         for (uint32_t f = 0; f < frames; f++) {
             int16_t s = pcm[f * 2];           // left channel
             int32_t mag = s < 0 ? -s : s;
             if (mag > peak) peak = mag;
-            if ((s ^ prev) < 0) zc++;
+            if ((((uint16_t)s ^ (uint16_t)prev) & 0x8000) != 0) zc++;
             prev = s;
         }
         if (peak < 1500) {

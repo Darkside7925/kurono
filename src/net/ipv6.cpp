@@ -196,40 +196,63 @@ void ProcessRx(const unsigned char* eth_frame,
     if (payload_len > avail) payload_len = avail;
     if (payload_len < (int)sizeof(ICMPv6Header)) return;
 
-    if (ip->next_header != IPPROTO_ICMPV6) return;
+    // Walk extension headers (hop-by-hop, routing, destination, fragment)
+    // to find the actual upper-layer protocol. Fragments are dropped  - 
+    // no reassembly buffer.
+    const unsigned char* hdr_ptr =
+        eth_frame + sizeof(EthernetHeader) + sizeof(IPv6Header);
+    int remaining = payload_len;
+    uint8_t next = ip->next_header;
+    while (next == 0 || next == 43 || next == 60) {
+        if (remaining < 8) return;
+        int ext_len = ((int)hdr_ptr[1] + 1) * 8;
+        if (ext_len > remaining) return;
+        next = hdr_ptr[0];
+        hdr_ptr += ext_len;
+        remaining -= ext_len;
+    }
+    if (next == IPPROTO_FRAGMENT) return;
+    if (next != IPPROTO_ICMPV6) return;
+    if (remaining < (int)sizeof(ICMPv6Header)) return;
 
-    const ICMPv6Header* icmp = (const ICMPv6Header*)
-        (eth_frame + sizeof(EthernetHeader) + sizeof(IPv6Header));
+    const ICMPv6Header* icmp = (const ICMPv6Header*)hdr_ptr;
+    int icmp_len = remaining;
+
+    // Verify ICMPv6 checksum only when there were no extension headers.
+    // Otherwise our pseudo-header would use ip->next_header (e.g. 0 for
+    // hop-by-hop) instead of 58, and the verify would always fail.
+    if (ip->next_header == IPPROTO_ICMPV6) {
+        if (Checksum(ip, icmp, icmp_len) != 0) return;
+    }
 
     NetworkInterface* nif = Network::GetInterface("eth0");
     if (!nif) return;
 
-    // Reuse our own MAC as source on replies.
     unsigned char our_mac[6];
     for (int i = 0; i < 6; i++) our_mac[i] = nif->mac.bytes[i];
 
-    // Reply unicast back to whoever sent it.
     unsigned char reply_dst_mac[6];
     for (int i = 0; i < 6; i++) reply_dst_mac[i] = src_mac ? src_mac[i] : eth->src_mac[i];
 
     switch (icmp->type) {
     case ICMP6_ECHO_REQUEST: {
-        if (payload_len < (int)sizeof(ICMPv6Echo)) return;
+        if (icmp_len < (int)sizeof(ICMPv6Echo)) return;
         const ICMPv6Echo* echo = (const ICMPv6Echo*)icmp;
-        int body = payload_len - (int)sizeof(ICMPv6Echo);
+        int body = icmp_len - (int)sizeof(ICMPv6Echo);
         SendEchoReply(ip, echo, body, our_mac, reply_dst_mac);
         SerialLogger::Log("IPv6: replied to echo request\r\n");
         break;
     }
     case ICMP6_NEIGHBOR_SOLICITATION: {
-        if (payload_len < (int)sizeof(ICMPv6NS)) return;
+        if (icmp_len < (int)sizeof(ICMPv6NS)) return;
+        // RFC 4861: NS hop_limit must be 255 on receipt.
+        if (ip->hop_limit != 255) return;
         const ICMPv6NS* ns = (const ICMPv6NS*)icmp;
         SendNeighborAdvert(ns->target, ip->src, our_mac, reply_dst_mac);
         SerialLogger::Log("IPv6: replied to neighbor solicit\r\n");
         break;
     }
     default:
-        // unhandled ICMPv6 type  -  silently drop
         break;
     }
 }

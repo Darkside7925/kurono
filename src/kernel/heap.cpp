@@ -2,20 +2,107 @@
 #include "pmm.h"
 #include "../drivers/serial.h"
 
-//  kernel heap  -  free-list allocator with coalescing
+//  kernel heap  -  segregated free-list allocator with coalescing
 //
 //  phase 1: 64 kb bootstrap buffer (in bss  -  always available)
-//  phase 2: pmm-backed region  -  up to 256 mb or 25% of physical ram
+//  phase 2: pmm-backed region  -  up to 50% of physical ram
+//
+//  Each block has a HeapBlock header followed by `size` bytes of payload.
+//  Free blocks store a doubly-linked-list pointer pair in the payload
+//  area so allocation is O(1) freelist-pop, free is O(1) link-in, and
+//  coalesce becomes O(1) by checking neighbour blocks via address
+//  arithmetic.  A footer mirroring `size` is written just before each
+//  block to enable backward coalescing without scanning the whole heap.
 
-// 64 kb bootstrap heap (in bss  -  zeroed by boot asm)
+// 64 kb bootstrap heap (in bss  -  zeroed by boot asm). 16-byte aligned so
+// HeapBlock header / FreeLink overlay stays naturally aligned.
 #define BOOT_HEAP_SIZE (64ULL * 1024)
-uint8_t        KernelHeap::boot_buffer[BOOT_HEAP_SIZE];
+alignas(16) uint8_t KernelHeap::boot_buffer[BOOT_HEAP_SIZE];
 const size_t   KernelHeap::BOOT_CAPACITY = BOOT_HEAP_SIZE;
 
 uint8_t*       KernelHeap::heap_base     = nullptr;
 size_t         KernelHeap::heap_capacity = 0;
 bool           KernelHeap::initialized   = false;
 bool           KernelHeap::expanded      = false;
+
+// in-payload links for free blocks (overlay the first 16 bytes of payload).
+struct FreeLink {
+    FreeLink* next;
+    FreeLink* prev;
+};
+
+// header is 16 bytes; minimum free-block payload must fit FreeLink (16) and
+// the 8-byte trailing footer side-by-side. Round up to 16-alignment → 32.
+#define HEAP_MIN_PAYLOAD  32
+#define HEAP_FOOTER_SIZE  8
+
+static FreeLink* g_free_head = nullptr;
+
+static inline uint64_t* footer_of(HeapBlock* b) {
+    return (uint64_t*)((uint8_t*)b + HEAP_HEADER_SIZE + b->size - HEAP_FOOTER_SIZE);
+}
+
+static inline bool block_used(const HeapBlock* b) {
+    return (b->flags & HEAP_BLOCK_USED) != 0;
+}
+
+static inline bool valid_magic(uint64_t flags) {
+    uint64_t m = flags & ~HEAP_BLOCK_USED;
+    return m == (HEAP_MAGIC_FREE & ~HEAP_BLOCK_USED) ||
+           m == (HEAP_MAGIC_USED & ~HEAP_BLOCK_USED);
+}
+
+static void freelist_push(HeapBlock* b) {
+    FreeLink* l = (FreeLink*)((uint8_t*)b + HEAP_HEADER_SIZE);
+    l->prev = nullptr;
+    l->next = g_free_head;
+    if (g_free_head) g_free_head->prev = l;
+    g_free_head = l;
+}
+
+static void freelist_remove(HeapBlock* b) {
+    FreeLink* l = (FreeLink*)((uint8_t*)b + HEAP_HEADER_SIZE);
+    if (l->prev) l->prev->next = l->next;
+    else         g_free_head   = l->next;
+    if (l->next) l->next->prev = l->prev;
+    l->next = l->prev = nullptr;
+}
+
+static HeapBlock* block_from_link(FreeLink* l) {
+    return (HeapBlock*)((uint8_t*)l - HEAP_HEADER_SIZE);
+}
+
+static void mark_free(HeapBlock* b) {
+    b->flags = HEAP_MAGIC_FREE;
+    *footer_of(b) = b->size;
+}
+
+static void mark_used(HeapBlock* b) {
+    b->flags = HEAP_MAGIC_USED;
+    *footer_of(b) = b->size | (1ULL << 63);
+}
+
+static HeapBlock* prev_block(uint8_t* heap_base_ptr, HeapBlock* b) {
+    if ((uint8_t*)b <= heap_base_ptr + HEAP_HEADER_SIZE) return nullptr;
+    uint64_t* prev_footer = (uint64_t*)((uint8_t*)b - HEAP_FOOTER_SIZE);
+    uint64_t footer = *prev_footer;
+    uint64_t prev_size = footer & ~(1ULL << 63);
+    if (prev_size == 0 || prev_size > 0x10000000ULL) return nullptr;
+    uint64_t total_off = HEAP_HEADER_SIZE + prev_size;
+    if ((uint8_t*)b < heap_base_ptr + total_off) return nullptr;
+    HeapBlock* p = (HeapBlock*)((uint8_t*)b - total_off);
+    if (!valid_magic(p->flags)) return nullptr;
+    if (p->size != prev_size) return nullptr;
+    return p;
+}
+
+static HeapBlock* next_block(uint8_t* heap_end, HeapBlock* b) {
+    uint8_t* n = (uint8_t*)b + HEAP_HEADER_SIZE + b->size;
+    if (n + HEAP_HEADER_SIZE > heap_end) return nullptr;
+    HeapBlock* nb = (HeapBlock*)n;
+    if (!valid_magic(nb->flags)) return nullptr;
+    return nb;
+}
 
 void KernelHeap::Init() {
     if (initialized) return;
@@ -25,36 +112,30 @@ void KernelHeap::Init() {
 
     HeapBlock* first = (HeapBlock*)heap_base;
     first->size  = heap_capacity - HEAP_HEADER_SIZE;
-    first->flags = HEAP_MAGIC_FREE;
+    mark_free(first);
+    g_free_head = nullptr;
+    freelist_push(first);
 
     initialized = true;
     SerialLogger::Log("Heap: Bootstrap (64 KB BSS)\r\n");
 }
 
-//
-// strategy: try progressively smaller contiguous allocations until one
-// succeeds.  the free-list heap is used for small/medium allocations.
-// very large single allocations (multi-mb) should use pmm::allocbytes()
-// directly  -  the free-list heap is for general-purpose kernel objects.
-//
 void KernelHeap::ExpandWithPMM() {
     if (expanded) return;
     if (!initialized) Init();
 
     uint64_t total_phys = PMM::GetTotalMemory();
 
-    // target: 50% of physical ram (the rest stays in pmm for large allocs)
-    // try the target, then halve repeatedly until it works (min 32 mb)
     uint64_t target = total_phys / 2;
-    const uint64_t MAX_HEAP = 2ULL * 1024 * 1024 * 1024;  // 2 gb max free-list
-    const uint64_t MIN_HEAP = 32ULL * 1024 * 1024;         // 32 mb min
+    const uint64_t MAX_HEAP = 2ULL * 1024 * 1024 * 1024;
+    const uint64_t MIN_HEAP = 32ULL * 1024 * 1024;
     if (target > MAX_HEAP) target = MAX_HEAP;
 
     void* big = nullptr;
     while (target >= MIN_HEAP) {
         big = PMM::AllocBytes((size_t)target);
         if (big) break;
-        target /= 2;  // halve and retry
+        target /= 2;
     }
 
     if (!big) {
@@ -62,23 +143,22 @@ void KernelHeap::ExpandWithPMM() {
         return;
     }
 
-    // don't migrate bootstrap allocations  -  they stay in bss and remain
-    // valid.  we just abandon the bootstrap free-space (~64 kb, trivial)
-    // and switch all future allocations to the big pmm region.
     uint8_t* new_base = (uint8_t*)big;
     size_t   new_cap  = (size_t)target;
 
-    // one giant free block
     HeapBlock* first = (HeapBlock*)new_base;
     first->size  = new_cap - HEAP_HEADER_SIZE;
-    first->flags = HEAP_MAGIC_FREE;
+    mark_free(first);
 
-    // switch to the new region
     heap_base     = new_base;
     heap_capacity = new_cap;
     expanded      = true;
 
-    // log result
+    // abandon the bootstrap freelist; allocations in bss remain valid because
+    // their headers don't move. New allocations come from the expanded pool.
+    g_free_head = nullptr;
+    freelist_push(first);
+
     uint32_t mb = (uint32_t)(target / (1024 * 1024));
     SerialLogger::Log("Heap: Expanded to ");
     SerialLogger::LogDec(mb);
@@ -88,24 +168,11 @@ void KernelHeap::ExpandWithPMM() {
 }
 
 HeapBlock* KernelHeap::FindFree(size_t size) {
-    uint8_t* ptr = heap_base;
-    uint8_t* end = heap_base + heap_capacity;
-
-    while (ptr + HEAP_HEADER_SIZE <= end) {
-        HeapBlock* block = (HeapBlock*)ptr;
-
-        // sanity: if flags are corrupt, bail
-        uint64_t magic = block->flags & ~HEAP_BLOCK_USED;
-        if (magic != (HEAP_MAGIC_FREE & ~HEAP_BLOCK_USED) &&
-            magic != (HEAP_MAGIC_USED & ~HEAP_BLOCK_USED)) {
-            break;  // corrupted heap  -  stop scanning
-        }
-
-        if (!(block->flags & HEAP_BLOCK_USED) && block->size >= size) {
-            return block;
-        }
-
-        ptr += HEAP_HEADER_SIZE + block->size;
+    // first-fit over the freelist  -  O(k) where k = #free blocks, vs the
+    // prior O(n) over every block.
+    for (FreeLink* l = g_free_head; l; l = l->next) {
+        HeapBlock* b = block_from_link(l);
+        if (b->size >= size) return b;
     }
     return nullptr;
 }
@@ -113,9 +180,10 @@ HeapBlock* KernelHeap::FindFree(size_t size) {
 void* KernelHeap::Alloc(size_t size) {
     if (!initialized) Init();
     if (size == 0) size = 1;
-
-    // align to 16 bytes
+    // overflow guard on alignment round-up
+    if (size > (size_t)-1 - 15) return nullptr;
     size = (size + 15) & ~(size_t)15;
+    if (size < HEAP_MIN_PAYLOAD) size = HEAP_MIN_PAYLOAD;
 
     HeapBlock* block = FindFree(size);
     if (!block) {
@@ -123,18 +191,19 @@ void* KernelHeap::Alloc(size_t size) {
         return nullptr;
     }
 
-    // split the block if there's enough leftover for another block + some data
+    freelist_remove(block);
+
     uint64_t remaining = block->size - size;
-    if (remaining > HEAP_HEADER_SIZE + 16) {
-        // create a new free block after the allocated region
+    // need room for header + min payload + footer for the split-off remainder.
+    if (remaining >= HEAP_HEADER_SIZE + HEAP_MIN_PAYLOAD) {
         HeapBlock* next = (HeapBlock*)((uint8_t*)block + HEAP_HEADER_SIZE + size);
         next->size  = remaining - HEAP_HEADER_SIZE;
-        next->flags = HEAP_MAGIC_FREE;
-
+        mark_free(next);
+        freelist_push(next);
         block->size = size;
     }
 
-    block->flags = HEAP_MAGIC_USED;
+    mark_used(block);
     return (void*)((uint8_t*)block + HEAP_HEADER_SIZE);
 }
 
@@ -143,92 +212,88 @@ void KernelHeap::Free(void* ptr) {
 
     uint8_t* data = (uint8_t*)ptr;
 
-    // accept pointers from either the active heap or the bootstrap region
     bool in_active = (data >= heap_base && data < heap_base + heap_capacity);
     bool in_boot   = expanded &&
                      (data >= boot_buffer && data < boot_buffer + BOOT_CAPACITY);
-    if (!in_active && !in_boot) return;  // not our memory
+    if (!in_active && !in_boot) return;
 
     HeapBlock* block = (HeapBlock*)(data - HEAP_HEADER_SIZE);
 
-    // validate magic
-    if ((block->flags & ~HEAP_BLOCK_USED) != (HEAP_MAGIC_USED & ~HEAP_BLOCK_USED)) {
+    if (!valid_magic(block->flags)) {
         SerialLogger::Log("Heap: Free() bad magic!\r\n");
         return;
     }
-    if (!(block->flags & HEAP_BLOCK_USED)) {
+    if (!block_used(block)) {
         SerialLogger::Log("Heap: Double free!\r\n");
         return;
     }
-
-    block->flags = HEAP_MAGIC_FREE;
-
-    // only coalesce if the block is in the active heap region
-    // (bootstrap blocks after expansion are just marked free but not coalesced)
-    uint8_t* data_check = (uint8_t*)block;
-    if (data_check >= heap_base && data_check < heap_base + heap_capacity) {
-        Coalesce(block);
+    // sanity check: header size matches footer
+    uint64_t fsz = *footer_of(block) & ~(1ULL << 63);
+    if (fsz != block->size) {
+        SerialLogger::Log("Heap: Free() corrupt footer!\r\n");
+        return;
     }
+
+    mark_free(block);
+
+    // only coalesce within the active heap region; bootstrap fragments after
+    // expansion stay isolated.
+    uint8_t* p = (uint8_t*)block;
+    if (p < heap_base || p >= heap_base + heap_capacity) {
+        // no freelist insertion for boot-region frees post-expansion
+        return;
+    }
+
+    uint8_t* heap_end = heap_base + heap_capacity;
+
+    // forward coalesce  -  O(1) via footer
+    while (true) {
+        HeapBlock* n = next_block(heap_end, block);
+        if (!n || block_used(n)) break;
+        freelist_remove(n);
+        block->size += HEAP_HEADER_SIZE + n->size;
+        n->flags = 0;
+        n->size  = 0;
+        mark_free(block);
+    }
+
+    // backward coalesce  -  O(1) via previous footer
+    while (true) {
+        HeapBlock* p2 = prev_block(heap_base, block);
+        if (!p2 || block_used(p2)) break;
+        freelist_remove(p2);
+        p2->size += HEAP_HEADER_SIZE + block->size;
+        block->flags = 0;
+        block->size  = 0;
+        block = p2;
+        mark_free(block);
+    }
+
+    freelist_push(block);
 }
 
 void KernelHeap::Coalesce(HeapBlock* block) {
-    // forward coalesce: merge with the block immediately after
-    uint8_t* next_ptr = (uint8_t*)block + HEAP_HEADER_SIZE + block->size;
-    if (next_ptr + HEAP_HEADER_SIZE <= heap_base + heap_capacity) {
-        HeapBlock* next = (HeapBlock*)next_ptr;
-        if ((next->flags & ~HEAP_BLOCK_USED) == (HEAP_MAGIC_FREE & ~HEAP_BLOCK_USED) &&
-            !(next->flags & HEAP_BLOCK_USED)) {
-            // absorb next block
-            block->size += HEAP_HEADER_SIZE + next->size;
-            // poison the absorbed header
-            next->flags = 0;
-            next->size  = 0;
-        }
-    }
-
-    // backward coalesce: scan from the beginning to find the block before us
-    // (we don't have back-pointers, so this is o(n). in practice the heap
-    // is small enough that this is fine. a doubly-linked list is future work.)
-    uint8_t* scan = heap_base;
-    while (scan + HEAP_HEADER_SIZE < (uint8_t*)block) {
-        HeapBlock* prev = (HeapBlock*)scan;
-        uint64_t magic = prev->flags & ~HEAP_BLOCK_USED;
-        if (magic != (HEAP_MAGIC_FREE & ~HEAP_BLOCK_USED) &&
-            magic != (HEAP_MAGIC_USED & ~HEAP_BLOCK_USED)) {
-            break;  // corrupted  -  stop
-        }
-
-        uint8_t* prev_end = scan + HEAP_HEADER_SIZE + prev->size;
-        if (prev_end == (uint8_t*)block) {
-            // prev is immediately before block
-            if (!(prev->flags & HEAP_BLOCK_USED)) {
-                prev->size += HEAP_HEADER_SIZE + block->size;
-                block->flags = 0;
-                block->size  = 0;
-            }
-            break;
-        }
-        scan = prev_end;
-    }
+    // coalescing is folded into Free() for O(1) behaviour; retained for ABI.
+    (void)block;
 }
 
 void* KernelHeap::Realloc(void* ptr, size_t new_size) {
     if (!ptr) return Alloc(new_size);
     if (new_size == 0) { Free(ptr); return nullptr; }
+    if (new_size > (size_t)-1 - 15) return nullptr;
 
     HeapBlock* block = (HeapBlock*)((uint8_t*)ptr - HEAP_HEADER_SIZE);
+    if (!valid_magic(block->flags) || !block_used(block)) return nullptr;
     uint64_t old_size = block->size;
 
-    // if the current block is already big enough, just return it
-    new_size = (new_size + 15) & ~(size_t)15;
-    if (old_size >= new_size) return ptr;
+    size_t want = (new_size + 15) & ~(size_t)15;
+    if (want < HEAP_MIN_PAYLOAD) want = HEAP_MIN_PAYLOAD;
+    if (old_size >= want) return ptr;
 
-    // allocate new block, copy, free old
     void* new_ptr = Alloc(new_size);
     if (!new_ptr) return nullptr;
 
-    // copy min(old_size, new_size) bytes
-    size_t copy_size = old_size < new_size ? old_size : new_size;
+    size_t copy_size = old_size < new_size ? (size_t)old_size : new_size;
     uint8_t* src = (uint8_t*)ptr;
     uint8_t* dst = (uint8_t*)new_ptr;
     for (size_t i = 0; i < copy_size; i++) dst[i] = src[i];
@@ -239,6 +304,7 @@ void* KernelHeap::Realloc(void* ptr, size_t new_size) {
 
 void KernelHeap::Reset() {
     initialized = false;
+    g_free_head = nullptr;
     Init();
 }
 
@@ -253,18 +319,16 @@ size_t KernelHeap::GetUsed() {
 
     while (ptr + HEAP_HEADER_SIZE <= end) {
         HeapBlock* block = (HeapBlock*)ptr;
-        uint64_t magic = block->flags & ~HEAP_BLOCK_USED;
-        if (magic != (HEAP_MAGIC_FREE & ~HEAP_BLOCK_USED) &&
-            magic != (HEAP_MAGIC_USED & ~HEAP_BLOCK_USED)) break;
-
-        if (block->flags & HEAP_BLOCK_USED) {
-            used += block->size;
-        }
+        if (!valid_magic(block->flags)) break;
+        if (block_used(block)) used += block->size;
         ptr += HEAP_HEADER_SIZE + block->size;
+        if (block->size == 0) break;
     }
     return used;
 }
 
 size_t KernelHeap::GetFree() {
-    return heap_capacity - GetUsed() - HEAP_HEADER_SIZE;  // approximate
+    size_t total = heap_capacity;
+    size_t used  = GetUsed();
+    return total > used + HEAP_HEADER_SIZE ? total - used - HEAP_HEADER_SIZE : 0;
 }

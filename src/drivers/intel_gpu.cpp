@@ -30,12 +30,15 @@ void IntelGPU::PciWrite(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset, 
 }
 
 uint64_t IntelGPU::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_idx) {
+    if (bar_idx > 5) return 0;
     uint8_t offset = 0x10 + bar_idx * 4;
     uint32_t bar_lo = PciRead(bus, dev, func, offset);
-    if (bar_lo & 1) return bar_lo & 0xFFFFFFFC;
+    if (bar_lo == 0 || bar_lo == 0xFFFFFFFF) return 0;
+    // I/O BARs are not useful for GPU MMIO  -  refuse them so callers don't try to dereference them
+    if (bar_lo & 1) return 0;
     uint64_t base = bar_lo & 0xFFFFFFF0;
     uint8_t type = (bar_lo >> 1) & 0x03;
-    if (type == 0x02) {
+    if (type == 0x02 && bar_idx < 5) {
         uint32_t bar_hi = PciRead(bus, dev, func, offset + 4);
         base |= ((uint64_t)bar_hi << 32);
     }
@@ -46,14 +49,20 @@ uint64_t IntelGPU::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_i
 
 uint32_t IntelGPU::ReadReg(uint32_t offset) {
     if (!gpu_info.bar0) return 0;
+    // refuse out-of-bounds reads  -  protects against driver bugs poking past BAR0
+    if (gpu_info.bar0_size && offset + 4 > gpu_info.bar0_size) return 0;
     volatile uint32_t* reg = (volatile uint32_t*)((uintptr_t)gpu_info.bar0 + offset);
-    return *reg;
+    uint32_t v = *reg;
+    __asm__ volatile("" ::: "memory");
+    return v;
 }
 
 void IntelGPU::WriteReg(uint32_t offset, uint32_t value) {
     if (!gpu_info.bar0) return;
+    if (gpu_info.bar0_size && offset + 4 > gpu_info.bar0_size) return;
     volatile uint32_t* reg = (volatile uint32_t*)((uintptr_t)gpu_info.bar0 + offset);
     *reg = value;
+    __asm__ volatile("sfence" ::: "memory");
 }
 
 //  generation classification
@@ -216,11 +225,23 @@ void IntelGPU::Init() {
                 gpu_info.bar0 = ReadBAR(bus, dev, func, 0);  // gttmmaddr
                 gpu_info.bar2 = ReadBAR(bus, dev, func, 2);  // gmadr
 
-                // enable memory space access
-                uint32_t cmd = PciRead(bus, dev, func, 0x04);
-                if (!(cmd & 0x02)) {
-                    PciWrite(bus, dev, func, 0x04, cmd | 0x02);
+                // discover BAR0 size so register access can bounds-check
+                {
+                    uint32_t orig = PciRead(bus, dev, func, 0x10);
+                    PciWrite(bus, dev, func, 0x10, 0xFFFFFFFF);
+                    uint32_t mask = PciRead(bus, dev, func, 0x10) & 0xFFFFFFF0;
+                    PciWrite(bus, dev, func, 0x10, orig);
+                    if (mask) gpu_info.bar0_size = (uint64_t)(~mask) + 1;
                 }
+
+                // enable memory space + bus mastering (igpu needs master for blitter DMA)
+                uint32_t cmd = PciRead(bus, dev, func, 0x04);
+                uint32_t want = cmd | 0x02 | 0x04;
+                if (want != cmd) PciWrite(bus, dev, func, 0x04, want);
+
+                // accel capability: gen6+ has a working blitter; gen8+ has full xe-style 3D
+                gpu_info.has_2d_accel = (gpu_info.gen >= INTEL_GEN_6);
+                gpu_info.has_3d_accel = (gpu_info.gen >= INTEL_GEN_8);
 
                 // get device name
                 const char* name = IdentifyDevice(did);
@@ -317,6 +338,29 @@ bool IntelGPU::IsPowerWellEnabled() {
     if (!gpu_info.bar0) return false;
     uint32_t ctl = ReadReg(0x45400);  // pwr_well_ctl
     return (ctl & 0x02) != 0;  // bit 1 = power well state
+}
+
+bool IntelGPU::HasHardwareAccel() {
+    return gpu_info.detected && gpu_info.bar0 != 0 && gpu_info.has_2d_accel;
+}
+
+bool IntelGPU::BlitFillARGB(uint32_t color, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    // submitting a blitter command stream from a kernel without a ring buffer
+    // setup is unsafe  -  fall back to a CPU fill through the gmadr aperture
+    // when one is exposed. callers detect "no accel" via HasHardwareAccel.
+    if (!gpu_info.detected || !gpu_info.bar2 || !gpu_info.pipe_a.enabled) return false;
+    uint32_t pw = gpu_info.pipe_a.width;
+    uint32_t ph = gpu_info.pipe_a.height;
+    if (x >= pw || y >= ph) return false;
+    if (x + w > pw) w = pw - x;
+    if (y + h > ph) h = ph - y;
+    uint32_t stride_px = gpu_info.pipe_a.stride ? (gpu_info.pipe_a.stride / 4) : pw;
+    volatile uint32_t* fb = (volatile uint32_t*)(uintptr_t)gpu_info.bar2;
+    for (uint32_t row = 0; row < h; row++) {
+        volatile uint32_t* line = fb + (y + row) * stride_px + x;
+        for (uint32_t col = 0; col < w; col++) line[col] = color;
+    }
+    return true;
 }
 
 //  debug dump

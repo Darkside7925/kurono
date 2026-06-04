@@ -523,9 +523,22 @@ void TCPStack::ProcessIPv4(const void* data, int len) {
         return;
     }
 
+    // Fragmentation: drop fragments cleanly (no reassembly window). The
+    // raw bits we care about are the MF flag and any non-zero fragment
+    // offset; the upper 3 flag bits live above the offset.
+    uint16_t flags_frag = ntohs(ip->flags_fragment);
+    uint16_t frag_off   = flags_frag & 0x1FFFu;
+    bool mf             = (flags_frag & 0x2000u) != 0;
+    if (mf || frag_off != 0) {
+        stats.dropped++;
+        return;
+    }
+
     const uint8_t* payload = (const uint8_t*)data + ihl;
-    int payload_len = ntohs(ip->total_length) - ihl;
-    if (payload_len < 0 || payload_len > len - ihl) payload_len = len - ihl;
+    int total_len = (int)ntohs(ip->total_length);
+    if (total_len < ihl || total_len > len) total_len = len;
+    int payload_len = total_len - ihl;
+    if (payload_len < 0) payload_len = 0;
 
     // verbose: first ~10 IPv4 packets
     static int s_ipv4_log = 0;
@@ -690,7 +703,13 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
             break;
 
         case TCP_SYN_RECEIVED:
+            if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_LISTEN;
+                sock->tx_pending = false;
+                break;
+            }
             if (tcp->flags & TCP_FLAG_ACK) {
+                ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_ESTABLISHED;
             }
             break;
@@ -698,69 +717,102 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
         case TCP_ESTABLISHED:
             if (tcp->flags & TCP_FLAG_RST) {
                 sock->tcp_state = TCP_CLOSED;
+                sock->tx_pending = false;
                 sock->active = false;
                 slog("[TCP] got RST in ESTABLISHED -> CLOSED\r\n");
             } else {
                 bool ack_needed = false;
                 int accepted_data = 0;
-                if (tcp_data_len > 0 && their_seq == sock->tcp_ack) {
-                    int space = TCP_RX_BUFSIZE - sock->rx_count;
-                    int copy = tcp_data_len < space ? tcp_data_len : space;
-                    for (int i = 0; i < copy; i++) {
-                        sock->rx_buf[sock->rx_tail] = tcp_data[i];
-                        sock->rx_tail = (sock->rx_tail + 1) % TCP_RX_BUFSIZE;
-                        sock->rx_count++;
+                if (tcp_data_len > 0) {
+                    if (their_seq == sock->tcp_ack) {
+                        int space = TCP_RX_BUFSIZE - sock->rx_count;
+                        int copy = tcp_data_len < space ? tcp_data_len : space;
+                        for (int i = 0; i < copy; i++) {
+                            sock->rx_buf[sock->rx_tail] = tcp_data[i];
+                            sock->rx_tail = (sock->rx_tail + 1) % TCP_RX_BUFSIZE;
+                            sock->rx_count++;
+                        }
+                        sock->tcp_ack = their_seq + (uint32_t)copy;
+                        accepted_data = copy;
+                        ack_needed = true;
+                    } else {
+                        // Out-of-order or duplicate  -  send a duplicate ACK
+                        // so the peer fast-retransmits. Do not advance
+                        // tcp_ack; do not buffer (no reassembly window).
+                        ack_needed = true;
                     }
-                    sock->tcp_ack = their_seq + copy;
-                    accepted_data = copy;
-                    ack_needed = true;
                 }
                 if (tcp->flags & TCP_FLAG_ACK) {
                     ApplyAck(sock, their_ack);
                 }
                 if (tcp->flags & TCP_FLAG_FIN) {
+                    // FIN consumes one sequence number after the data.
                     uint32_t fin_seq = their_seq + (uint32_t)tcp_data_len;
                     if (tcp_data_len == 0 || accepted_data == tcp_data_len) {
-                        if (fin_seq >= sock->tcp_ack) sock->tcp_ack = fin_seq + 1;
+                        // Use seq arithmetic so wraparound is safe.
+                        if (!SeqBefore(fin_seq + 1u, sock->tcp_ack))
+                            sock->tcp_ack = fin_seq + 1u;
                         sock->tcp_state = TCP_CLOSE_WAIT;
                         ack_needed = true;
                     }
                 }
-                if (ack_needed || tcp_data_len > 0) {
-                    SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
+                if (ack_needed) {
+                    SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
                 }
             }
             break;
 
         case TCP_FIN_WAIT_1:
+            if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_CLOSED;
+                sock->tx_pending = false;
+                sock->active = false;
+                break;
+            }
             if ((tcp->flags & TCP_FLAG_ACK) && (tcp->flags & TCP_FLAG_FIN)) {
                 ApplyAck(sock, their_ack);
-                sock->tcp_ack = their_seq + 1;
+                sock->tcp_ack = their_seq + 1u;
                 sock->tcp_state = TCP_TIME_WAIT;
-                SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
+                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
             } else if (tcp->flags & TCP_FLAG_ACK) {
                 ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_FIN_WAIT_2;
             } else if (tcp->flags & TCP_FLAG_FIN) {
-                sock->tcp_ack = their_seq + 1;
+                sock->tcp_ack = their_seq + 1u;
                 sock->tcp_state = TCP_CLOSING;
-                SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
+                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
             }
             break;
 
         case TCP_FIN_WAIT_2:
+            if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_CLOSED;
+                sock->tx_pending = false;
+                sock->active = false;
+                break;
+            }
             if (tcp->flags & TCP_FLAG_FIN) {
-                sock->tcp_ack = their_seq + 1;
+                sock->tcp_ack = their_seq + 1u;
                 sock->tcp_state = TCP_TIME_WAIT;
-                SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
+                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
             }
             break;
 
         case TCP_CLOSE_WAIT:
-            // waiting for application to close
+            if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_CLOSED;
+                sock->tx_pending = false;
+                sock->active = false;
+            }
             break;
 
         case TCP_CLOSING:
+            if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_CLOSED;
+                sock->tx_pending = false;
+                sock->active = false;
+                break;
+            }
             if (tcp->flags & TCP_FLAG_ACK) {
                 ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_TIME_WAIT;
@@ -771,6 +823,7 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
             if (tcp->flags & TCP_FLAG_ACK) {
                 ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_CLOSED;
+                sock->tx_pending = false;
                 sock->active = false;
             }
             break;
@@ -854,23 +907,53 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
     uint16_t dst_port = ntohs(udp->dst_port);
     uint16_t src_port = ntohs(udp->src_port);
     uint32_t src_ip = ntohl(ip_hdr->src_ip);
+    uint16_t udp_len_field = ntohs(udp->length);
+    if (udp_len_field < sizeof(UDPHeader) || (int)udp_len_field > len) {
+        stats.errors_rx++;
+        return;
+    }
+
+    // Optional UDP-over-IPv4 checksum: 0 means "not computed", anything
+    // else must verify or we drop. We reuse TCPChecksum which builds the
+    // same pseudo-header layout  -  but the protocol byte differs, so
+    // compute manually here.
+    if (udp->checksum != 0) {
+        struct {
+            uint32_t src_ip;
+            uint32_t dst_ip;
+            uint8_t  zero;
+            uint8_t  protocol;
+            uint16_t udp_length;
+        } __attribute__((packed)) pseudo;
+        pseudo.src_ip = ip_hdr->src_ip;
+        pseudo.dst_ip = ip_hdr->dst_ip;
+        pseudo.zero = 0;
+        pseudo.protocol = IP_PROTO_UDP;
+        pseudo.udp_length = udp->length;
+        uint32_t sum = 0;
+        sum = ChecksumAccumulate(&pseudo, sizeof(pseudo), sum);
+        sum = ChecksumAccumulate(udp, udp_len_field, sum);
+        if (ChecksumFinish(sum) != 0) {
+            stats.errors_rx++;
+            return;
+        }
+    }
 
     const uint8_t* payload = (const uint8_t*)data + sizeof(UDPHeader);
-    int payload_len = ntohs(udp->length) - sizeof(UDPHeader);
-    if (payload_len < 0) return;
-    if (payload_len > len - (int)sizeof(UDPHeader)) payload_len = len - (int)sizeof(UDPHeader);
+    int payload_len = (int)udp_len_field - (int)sizeof(UDPHeader);
 
     // find matching socket
     for (int i = 0; i < MAX_SOCKETS; i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_DGRAM) continue;
         if (sockets[i].local_port != dst_port) continue;
 
-        // buffer the data
         NetSocket* sock = &sockets[i];
         sock->remote_ip = src_ip;
         sock->remote_port = src_port;
 
-        for (int j = 0; j < payload_len && sock->rx_count < TCP_RX_BUFSIZE; j++) {
+        int space = TCP_RX_BUFSIZE - sock->rx_count;
+        int copy = payload_len < space ? payload_len : space;
+        for (int j = 0; j < copy; j++) {
             sock->rx_buf[sock->rx_tail] = payload[j];
             sock->rx_tail = (sock->rx_tail + 1) % TCP_RX_BUFSIZE;
             sock->rx_count++;
@@ -974,21 +1057,26 @@ int TCPStack::Accept(int sock) {
     if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
     if (sockets[sock].tcp_state != TCP_LISTEN) return -1;
 
-    // poll for incoming syn
-    for (int i = 0; i < 1000000; i++) {
+    // Poll for incoming SYN with a real-time bound (~10s) plus user
+    // cancel, so the shell stays responsive instead of busy-spinning
+    // on a CPU-cycle counter that varies wildly with build / host.
+    uint32_t start_ms = Timer::GetTicks();
+    while ((uint32_t)(Timer::GetTicks() - start_ms) < 10000u) {
+        if (KuronoShell::IsCommandCancelRequested()) return -1;
         Tick();
+        KuronoShell::PumpUI();
         if (sockets[sock].tcp_state == TCP_ESTABLISHED) {
-            // create a new socket for this connection
             int new_sock = Socket(SOCK_STREAM);
             if (new_sock < 0) return -1;
-
             sockets[new_sock] = sockets[sock];
-            sockets[sock].tcp_state = TCP_LISTEN; // reset listener
+            sockets[new_sock].tx_pending = false;
+            sockets[sock].tcp_state = TCP_LISTEN;
             sockets[sock].remote_ip = 0;
             sockets[sock].remote_port = 0;
+            sockets[sock].tx_pending = false;
             return new_sock;
         }
-        for (volatile int d = 0; d < 100; d++);
+        net_wait_one_ms();
     }
     return -1;
 }
@@ -1005,30 +1093,33 @@ int TCPStack::Send(int sock, const void* data, int len) {
         while (sent < len) {
             int chunk = len - sent;
             if (chunk > TCP_MSS) chunk = TCP_MSS;
-            s->tx_unacked = s->tcp_seq;
-            if (!SendTCP(s, TCP_FLAG_ACK | TCP_FLAG_PSH, ptr + sent, chunk)) {
-                slog("[TCP] Send failed in established state\r\n");
-                return sent > 0 ? sent : -1;
-            }
-            s->tcp_seq += chunk;
-            sent += chunk;
-
+            // Wait for the previous segment to be ACKed before sending
+            // the next one. Tracking only one in-flight segment keeps
+            // retransmit simple, but cap the wait at 2s so a stalled
+            // peer surfaces as an error promptly.
             uint32_t wait_start_ms = Timer::GetTicks();
-            while (s->tx_pending && (uint32_t)(Timer::GetTicks() - wait_start_ms) < 4000u) {
-                if (KuronoShell::IsCommandCancelRequested()) {
+            while (s->tx_pending && (uint32_t)(Timer::GetTicks() - wait_start_ms) < 2000u) {
+                if (KuronoShell::IsCommandCancelRequested())
                     return sent > 0 ? sent : -1;
-                }
                 Tick();
                 KuronoShell::PumpUI();
-                if (s->tcp_state == TCP_CLOSED) {
+                if (s->tcp_state == TCP_CLOSED)
                     return sent > 0 ? sent : -1;
-                }
                 net_wait_one_ms();
             }
             if (s->tx_pending) {
                 slog("[TCP] Send ACK timeout\r\n");
                 return sent > 0 ? sent : -1;
             }
+            if (s->tcp_state != TCP_ESTABLISHED)
+                return sent > 0 ? sent : -1;
+            s->tx_unacked = s->tcp_seq;
+            if (!SendTCP(s, TCP_FLAG_ACK | TCP_FLAG_PSH, ptr + sent, chunk)) {
+                slog("[TCP] Send failed in established state\r\n");
+                return sent > 0 ? sent : -1;
+            }
+            s->tcp_seq += (uint32_t)chunk;
+            sent += chunk;
         }
         return sent;
     } else if (s->type == SOCK_DGRAM) {
@@ -1095,6 +1186,9 @@ bool TCPStack::Close(int sock) {
 int TCPStack::SendTo(int sock, const void* data, int len, uint32_t ip, uint16_t port) {
     if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
     if (sockets[sock].type != SOCK_DGRAM) return -1;
+    if (len < 0) return -1;
+    const int max_payload = (int)ETH_MTU - (int)sizeof(IPv4Header) - (int)sizeof(UDPHeader);
+    if (len > max_payload) return -1;
 
     uint8_t buf[sizeof(UDPHeader) + ETH_MTU];
     UDPHeader* udp = (UDPHeader*)buf;
@@ -1104,11 +1198,11 @@ int TCPStack::SendTo(int sock, const void* data, int len, uint32_t ip, uint16_t 
 
     udp->src_port = htons(sockets[sock].local_port);
     udp->dst_port = htons(port);
-    udp->length = htons(sizeof(UDPHeader) + len);
-    udp->checksum = 0; // optional for udp over ipv4
+    udp->length = htons((uint16_t)(sizeof(UDPHeader) + len));
+    udp->checksum = 0;
 
     const uint8_t* src = (const uint8_t*)data;
-    for (int i = 0; i < len && i < (int)ETH_MTU; i++)
+    for (int i = 0; i < len; i++)
         buf[sizeof(UDPHeader) + i] = src[i];
 
     stats.udp_tx++;
@@ -1203,13 +1297,15 @@ void TCPStack::TCPTick() {
     for (int i = 0; i < MAX_SOCKETS; i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_STREAM) continue;
         if (sockets[i].tx_pending) {
-            uint32_t rto_ms = 750u + (uint32_t)sockets[i].tx_retries * 250u;
-            if (rto_ms > 2000u) rto_ms = 2000u;
+            // Exponential backoff: 500ms * 2^retries, capped at 4s.
+            uint32_t rto_ms = 500u << (sockets[i].tx_retries < 4 ? sockets[i].tx_retries : 4);
+            if (rto_ms > 4000u) rto_ms = 4000u;
             if ((uint32_t)(now_ms - sockets[i].tx_last_tx_ms) >= rto_ms) {
-                if (sockets[i].tx_retries >= 8) {
+                if (sockets[i].tx_retries >= 6) {
                     slog("[TCP] retransmit budget exhausted\r\n");
                     sockets[i].tx_pending = false;
                     sockets[i].tcp_state = TCP_CLOSED;
+                    sockets[i].active = false;
                     continue;
                 }
                 SendTCPPacket(&sockets[i], sockets[i].tx_flags,
@@ -1228,9 +1324,18 @@ void TCPStack::TCPTick() {
 }
 
 uint16_t TCPStack::AllocatePort() {
-    uint16_t port = next_ephemeral_port++;
-    if (next_ephemeral_port >= 65535) next_ephemeral_port = 49152;
-    return port;
+    // Walk the ephemeral range and skip any port already in use.
+    for (int tries = 0; tries < (65535 - 49152); tries++) {
+        if (next_ephemeral_port < 49152 || next_ephemeral_port >= 65535)
+            next_ephemeral_port = 49152;
+        uint16_t p = next_ephemeral_port++;
+        bool used = false;
+        for (int i = 0; i < MAX_SOCKETS; i++) {
+            if (sockets[i].active && sockets[i].local_port == p) { used = true; break; }
+        }
+        if (!used) return p;
+    }
+    return next_ephemeral_port++;
 }
 
 const NetStats& TCPStack::GetStats() { return stats; }

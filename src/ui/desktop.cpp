@@ -59,7 +59,33 @@ static void int_to_str(int v,char* b,int mx){
     int i=0;while(n>0&&i<mx-1)b[i++]=t[--n];b[i]=0;
 }
 static void int2(int v,char*b){b[0]='0'+(v/10)%10;b[1]='0'+v%10;b[2]=0;}
-static uint32_t de_frame_counter = 0;
+
+// ──── Frame timing & easing helpers ───────────────────────────────────
+// All animations are driven from Timer::GetRealMs() so they run at a
+// consistent perceived speed regardless of monitor Hz.
+static uint32_t de_last_frame_ms        = 0;
+
+static inline float clamp01(float v){ return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+// Ease-out cubic  -  fast start, gentle landing.  Used for one-shot pops.
+static inline float ease_out_cubic(float t){
+    t = clamp01(t);
+    float inv = 1.0f - t;
+    return 1.0f - inv*inv*inv;
+}
+// Ease-in-out cubic  -  for symmetric open/close transitions.
+static inline float ease_in_out_cubic(float t){
+    t = clamp01(t);
+    if (t < 0.5f) return 4.0f * t*t*t;
+    float p = -2.0f*t + 2.0f;
+    return 1.0f - (p*p*p) * 0.5f;
+}
+// Move x toward target by at most rate*dt_ms, clamped to [0,1].
+static inline float approach(float x, float target, float rate_per_ms, uint32_t dt_ms){
+    float step = rate_per_ms * (float)dt_ms;
+    if (target > x) { x += step; if (x > target) x = target; }
+    else            { x -= step; if (x < target) x = target; }
+    return clamp01(x);
+}
 
 //  taskbar
 int  Taskbar::screen_width    = 0;
@@ -93,6 +119,17 @@ bool     Taskbar::cfg_show_volume    = true;
 bool     Taskbar::cfg_show_search    = true;
 bool     Taskbar::cfg_position_top   = false;
 
+uint32_t Taskbar::start_menu_anim_start_ms  = 0;
+bool     Taskbar::start_menu_anim_opening   = false;
+float    Taskbar::start_menu_phase          = 0.0f;
+uint32_t Taskbar::volume_popup_anim_start_ms= 0;
+bool     Taskbar::volume_popup_anim_opening = false;
+float    Taskbar::volume_popup_phase        = 0.0f;
+float    Taskbar::pinned_hover_phase[8]     = {0,0,0,0,0,0,0,0};
+int      Taskbar::pinned_hover_target       = -1;
+uint32_t Taskbar::pinned_anim_last_ms       = 0;
+uint32_t Taskbar::search_cursor_t0_ms       = 0;
+
 void Taskbar::ReloadFromConfig(){
     cfg_height          = UIConfig::Int  ("taskbar.height",          TASKBAR_HEIGHT);
     cfg_col_bg          = UIConfig::Color("taskbar.bg",              0xFF0C0C14);
@@ -116,6 +153,22 @@ void Taskbar::ReloadFromConfig(){
     }
 }
 
+// Internal helpers: open/close popups with animation kickoff.  Setting
+// the bool directly without these would leave the eased phase stuck.
+void Taskbar::StartMenuSet(bool open){
+    if (start_menu_open == open) return;
+    start_menu_open = open;
+    start_menu_anim_opening = open;
+    start_menu_anim_start_ms = Timer::GetRealMs();
+}
+void Taskbar::VolumePopupSet(bool open){
+    if (volume_popup_open == open) return;
+    volume_popup_open = open;
+    volume_popup_anim_opening = open;
+    volume_popup_anim_start_ms = Timer::GetRealMs();
+    if (!open) volume_slider_dragging = false;
+}
+
 void Taskbar::Init(int sw,int sh){
     screen_width=sw; screen_height=sh;
     // Floating-bar layout: 14 px side margin, 10 px bottom gap.  The
@@ -131,6 +184,17 @@ void Taskbar::Init(int sw,int sh){
     volume_popup_open=false; volume_slider_dragging=false;
     volume_slider_val = Audio::IsAvailable() ? Audio::GetMasterVolume() : 80;
     search_active=false; search_buf[0]=0; search_len=0;
+    search_cursor_t0_ms = Timer::GetRealMs();
+
+    start_menu_anim_start_ms = 0;
+    start_menu_anim_opening = false;
+    start_menu_phase = 0.0f;
+    volume_popup_anim_start_ms = 0;
+    volume_popup_anim_opening = false;
+    volume_popup_phase = 0.0f;
+    pinned_hover_target = -1;
+    pinned_anim_last_ms = 0;
+    for (int i = 0; i < 8; i++) pinned_hover_phase[i] = 0.0f;
 }
 
 int Taskbar::GetHeight(){ return TASKBAR_HEIGHT + 10; }
@@ -215,20 +279,28 @@ void Taskbar::RenderStartButton(){
 static void tb_render_quick_launch(){
     int x = tb_pin_strip_x();
     int y = tb_bar_y() + (TASKBAR_HEIGHT - TB_PIN_SZ) / 2;
+    // Walk the windows array directly (id != index  -  GetWindow(i) was wrong).
+    Window* wlist = WindowManager::GetWindows();
     for (int i = 0; i < TB_PINNED_COUNT; i++) {
-        Graphics::FillRoundedRect(x, y, TB_PIN_SZ, TB_PIN_SZ, 7, tb_pinned[i].colour);
-        // top-edge highlight for a subtle 3D touch
-        Graphics::FillRect(x+1, y+1, TB_PIN_SZ-2, 1, 0x55FFFFFF);
+        // hover lift: scale [0..1] -> shrink rect by up to 2 px so the icon
+        // visually pops without disturbing neighbours.
+        float t = (i < 8) ? Taskbar::pinned_hover_phase[i] : 0.0f;
+        int pop = (int)(t * 2.0f + 0.5f);
+        int ix = x - pop;
+        int iy = y - pop;
+        int iw = TB_PIN_SZ + pop*2;
+        int ih = TB_PIN_SZ + pop*2;
+        Graphics::FillRoundedRect(ix, iy, iw, ih, 7, tb_pinned[i].colour);
+        Graphics::FillRect(ix+1, iy+1, iw-2, 1, 0x55FFFFFF);
         char letter[2] = { tb_pinned[i].glyph, 0 };
-        Graphics::DrawString(x + (TB_PIN_SZ - 8)/2, y + (TB_PIN_SZ - 14)/2 + 1,
+        Graphics::DrawString(ix + (iw - 8)/2, iy + (ih - 14)/2 + 1,
                              letter, 0xFFFFFFFF, 0x00000000);
 
-        // running indicator: any window whose title starts with the
-        // glyph gets a small dot under the icon.
+        // running indicator: any window whose title starts with the glyph.
         bool running = false;
         for (int wi = 0; wi < WM_MAX_WINDOWS && !running; wi++) {
-            Window* w = WindowManager::GetWindow(wi);
-            if (w && w->state != WIN_CLOSED && w->title[0] == tb_pinned[i].glyph)
+            Window* w = &wlist[wi];
+            if (w->state != WIN_CLOSED && w->title[0] == tb_pinned[i].glyph)
                 running = true;
         }
         if (running) {
@@ -261,19 +333,21 @@ void Taskbar::RenderTaskButtons(){
     } else {
         Graphics::DrawString(sb_x + 28, sb_y + 6, "Search apps...", 0xFF606080, 0xFF000000);
     }
-    // blinking cursor when active
+    // blinking cursor when active  -  driven by real time (~500ms period).
     if (search_active) {
         int cx = sb_x + 28 + search_len * 8;
-        if ((de_frame_counter / 30) & 1)
+        uint32_t dt = Timer::GetRealMs() - search_cursor_t0_ms;
+        if (((dt / 500u) & 1u) == 0u)
             Graphics::FillRect(cx, sb_y + 5, 2, sb_h - 10, 0xFF5C8AFF);
     }
 
-    // count visible windows for centering
+    // count visible windows for centering  -  walk array directly.
     int win_ids[WM_MAX_WINDOWS];
     int wcount = 0;
-    for(int i=0;i<WM_MAX_WINDOWS;i++){
-        Window* w = WindowManager::GetWindow(i);
-        if(w && w->state!=WIN_CLOSED){
+    Window* wlist = WindowManager::GetWindows();
+    for(int i=0;i<WM_MAX_WINDOWS && wcount<WM_MAX_WINDOWS;i++){
+        Window* w = &wlist[i];
+        if(w->state!=WIN_CLOSED){
             win_ids[wcount++] = w->id;
         }
     }
@@ -427,18 +501,33 @@ void Taskbar::RenderSystemTray(){
 }
 
 void Taskbar::RenderStartMenu(){
-    if(!start_menu_open) return;
+    // Skip render entirely when fully closed; while closing keep drawing
+    // until the eased phase decays to ~0.
+    if(!start_menu_open && start_menu_phase <= 0.01f) return;
+
+    float t  = ease_in_out_cubic(start_menu_phase);
+
+    // Slide-up + scale: the menu grows from 92% -> 100% of full height
+    // and lifts a few pixels into place.
+    int full_h = START_MENU_H;
+    int draw_h = (int)(full_h * (0.92f + 0.08f * t) + 0.5f);
+    int lift   = (int)((1.0f - t) * 16.0f);
 
     // left-aligned above the k button (which is anchored to the floating bar)
     int mx0 = tb_bar_x() + 6;
-    int my0 = y_pos - START_MENU_H - 8;
+    int my0 = y_pos - draw_h - 8 + lift;
 
     // shadow
-    Graphics::FillRoundedRect(mx0+6, my0+6, START_MENU_W, START_MENU_H, 14, 0xFF040408);
+    Graphics::FillRoundedRect(mx0+6, my0+6, START_MENU_W, draw_h, 14, 0xFF040408);
     // background
-    Graphics::FillRoundedRect(mx0, my0, START_MENU_W, START_MENU_H, 14, COL_START_MENU);
+    Graphics::FillRoundedRect(mx0, my0, START_MENU_W, draw_h, 14, COL_START_MENU);
     // border
-    Graphics::DrawRect(mx0, my0, START_MENU_W, START_MENU_H, 0xFF2A2A48);
+    Graphics::DrawRect(mx0, my0, START_MENU_W, draw_h, 0xFF2A2A48);
+    // Skip drawing the content while still small to avoid jarring text squish.
+    if (t < 0.35f) {
+        Graphics::MarkDirty(mx0-2, my0-2, START_MENU_W+8, draw_h+10);
+        return;
+    }
 
     // header
     Graphics::FillRoundedRect(mx0+1, my0+1, START_MENU_W-2, 52, 14, 0xFF0E0E1C);
@@ -480,6 +569,7 @@ void Taskbar::RenderStartMenu(){
         Graphics::DrawString(mx0+20, iy+4, items[i], COL_ICON_TEXT, 0xFF000000);
         iy += 32;
     }
+    Graphics::MarkDirty(mx0-2, my0-2, START_MENU_W+8, draw_h+10);
 }
 
 void Taskbar::Render(){
@@ -522,7 +612,8 @@ void Taskbar::RenderSearchResults(){
     // substring matching (case-insensitive)
     int matches[8]; int match_count = 0;
     int qlen = slen(search_buf);
-    for(int i=0; i<app_count && match_count < 9; i++){
+    if (qlen <= 0) return;
+    for(int i=0; i<app_count && match_count < 8; i++){
         // check if search_buf is a substring of app_names[i]
         int alen = slen(app_names[i]);
         bool found = false;
@@ -540,11 +631,15 @@ void Taskbar::RenderSearchResults(){
         if(found) matches[match_count++] = i;
     }
     if(match_count == 0){
-        // no matches: show "no results"
-        int sx = 58, sy = y_pos - 48;
-        Graphics::FillRoundedRect(sx, sy, 220, 36, 10, 0xFF141424);
-        Graphics::DrawRect(sx, sy, 220, 36, 0xFF2A2A48);
+        // no matches: show "no results" anchored under the search pill.
+        int sx = tb_search_x();
+        int sw = tb_search_w();
+        int sh_ = 36;
+        int sy = y_pos - sh_ - 4;
+        Graphics::FillRoundedRect(sx, sy, sw, sh_, 10, 0xFF141424);
+        Graphics::DrawRect(sx, sy, sw, sh_, 0xFF2A2A48);
         Graphics::DrawString(sx+12, sy+10, "No results", 0xFF606080, 0xFF000000);
+        Graphics::MarkDirty(sx-2, sy-2, sw+8, sh_+8);
         return;
     }
 
@@ -563,21 +658,26 @@ void Taskbar::RenderSearchResults(){
         Graphics::DrawString(sx+12, iy+6, app_names[matches[i]], 0xFFD0D0E0, 0xFF000000);
         iy += 30;
     }
+    Graphics::MarkDirty(sx-2, sy-2, sw+8, sh+8);
 }
 
 void Taskbar::RenderVolumePopup(){
-    if(!volume_popup_open) return;
+    if(!volume_popup_open && volume_popup_phase <= 0.01f) return;
+    float t = ease_in_out_cubic(volume_popup_phase);
 
     int vol_x = tb_vol_x();
 
-    int pop_w = 52, pop_h = 180;
+    int pop_w = 52, pop_h_full = 180;
+    int pop_h = (int)(pop_h_full * (0.5f + 0.5f * t) + 0.5f);
     int pop_x = vol_x - pop_w/2 + TB_VOL_W/2;
-    int pop_y = y_pos - pop_h - 8;
+    int pop_y = y_pos - pop_h - 8 + (int)((1.0f - t) * 10.0f);
 
     // shadow + background
     Graphics::FillRoundedRect(pop_x+4, pop_y+4, pop_w, pop_h, 8, 0xFF060610);
     Graphics::FillRoundedRect(pop_x, pop_y, pop_w, pop_h, 8, 0xFF181828);
     Graphics::DrawRect(pop_x, pop_y, pop_w, pop_h, 0xFF333355);
+    Graphics::MarkDirty(pop_x-4, pop_y-4, pop_w+12, pop_h_full+16);
+    if (t < 0.55f) return;   // skip content while still squat  -  looks smoother
 
     // mute/unmute icon at top
     int icon_cx = pop_x + pop_w/2;
@@ -619,7 +719,7 @@ void Taskbar::RenderVolumePopup(){
 }
 
 bool Taskbar::HandleClick(int mx,int my){
-    if(volume_popup_open){
+    if(volume_popup_open && volume_popup_phase > 0.5f){
         int pop_w = 52, pop_h = 180;
         int vol_icon_x2 = tb_vol_x();
         int pop_x = vol_icon_x2 - pop_w/2 + TB_VOL_W/2;
@@ -641,8 +741,7 @@ bool Taskbar::HandleClick(int mx,int my){
             }
             return true;
         }
-        volume_popup_open = false;
-        volume_slider_dragging = false;
+        VolumePopupSet(false);
     }
 
     // check if click is in taskbar area
@@ -657,7 +756,7 @@ bool Taskbar::HandleClick(int mx,int my){
                 for(int i=0;i<nit;i++){
                     if(i==8){ iy+=12; continue; }
                     if(my>=iy && my<iy+32){
-                        start_menu_open=false;
+                        StartMenuSet(false);
                         switch(i){
                             case 0: DesktopEnvironment::LaunchTerminal(); break;
                             case 1: DesktopEnvironment::LaunchFileBrowser(); break;
@@ -678,7 +777,7 @@ bool Taskbar::HandleClick(int mx,int my){
                 }
                 return true;
             }
-            start_menu_open=false;
+            StartMenuSet(false);
         }
         // search results click
         if(search_active && search_buf[0]){
@@ -734,7 +833,8 @@ bool Taskbar::HandleClick(int mx,int my){
     {
         int k_x = tb_bar_x() + 6;
         if(mx>=k_x && mx<k_x+44 && my>=y_pos+4 && my<y_pos+TASKBAR_HEIGHT-4){
-            start_menu_open = !start_menu_open;
+            StartMenuSet(!start_menu_open);
+            VolumePopupSet(false);
             search_active = false;
             return true;
         }
@@ -749,7 +849,8 @@ bool Taskbar::HandleClick(int mx,int my){
             if (mx >= ix && mx < ix + TB_PIN_SZ &&
                 my >= strip_y && my < strip_y + TB_PIN_SZ) {
                 if (tb_pinned[i].launch) tb_pinned[i].launch();
-                start_menu_open = false;
+                StartMenuSet(false);
+                VolumePopupSet(false);
                 search_active   = false;
                 return true;
             }
@@ -761,7 +862,9 @@ bool Taskbar::HandleClick(int mx,int my){
         int sb_x = tb_search_x(), sb_w = tb_search_w();
         if(mx>=sb_x && mx<sb_x+sb_w && my>=y_pos+7 && my<y_pos+TASKBAR_HEIGHT-7){
             search_active = true;
-            start_menu_open = false;
+            search_cursor_t0_ms = Timer::GetRealMs();
+            StartMenuSet(false);
+            VolumePopupSet(false);
             return true;
         }
     }
@@ -770,9 +873,10 @@ bool Taskbar::HandleClick(int mx,int my){
     {
         int win_ids[WM_MAX_WINDOWS];
         int wcount = 0;
-        for(int i=0;i<WM_MAX_WINDOWS;i++){
-            Window* w = WindowManager::GetWindow(i);
-            if(w && w->state!=WIN_CLOSED){
+        Window* wlist = WindowManager::GetWindows();
+        for(int i=0;i<WM_MAX_WINDOWS && wcount<WM_MAX_WINDOWS;i++){
+            Window* w = &wlist[i];
+            if(w->state!=WIN_CLOSED){
                 win_ids[wcount++] = w->id;
             }
         }
@@ -802,8 +906,9 @@ bool Taskbar::HandleClick(int mx,int my){
         // Volume icon  -  opens dedicated volume popup
         int vol_x3 = tb_vol_x();
         if(mx>=vol_x3 && mx<vol_x3+TB_VOL_W && my>=y_pos){
-            volume_popup_open = !volume_popup_open;
-            volume_slider_dragging = false;
+            bool was_open = volume_popup_open;
+            VolumePopupSet(!was_open);
+            StartMenuSet(false);
             if(volume_popup_open && Audio::IsAvailable())
                 volume_slider_val = Audio::GetMasterVolume();
             return true;
@@ -815,16 +920,16 @@ bool Taskbar::HandleClick(int mx,int my){
         int cluster_right = tb_bar_x() + tb_bar_w();
         if(mx >= cluster_left && mx < cluster_right && my >= y_pos){
             ControlCenter::ToggleAt(mx, y_pos);
-            volume_popup_open = false;
-            start_menu_open   = false;
+            VolumePopupSet(false);
+            StartMenuSet(false);
             search_active     = false;
             return true;
         }
     }
 
-    start_menu_open=false;
+    StartMenuSet(false);
+    VolumePopupSet(false);
     search_active=false;
-    volume_popup_open=false;
     return true;
 }
 
@@ -833,6 +938,47 @@ void Taskbar::Update(){
     DateTime dt = TimeManager::NowLocalDateTime();
     clock_h = dt.h;
     clock_m = dt.m;
+}
+
+void Taskbar::Tick(uint32_t delta_ms, int mx, int my){
+    if (delta_ms == 0) delta_ms = 1;
+    if (delta_ms > 100) delta_ms = 100;   // ignore huge stalls
+
+    // ── Start menu phase (220 ms open, 160 ms close) ──────────────────
+    {
+        uint32_t now = Timer::GetRealMs();
+        uint32_t dur = start_menu_anim_opening ? 220u : 160u;
+        uint32_t e   = now - start_menu_anim_start_ms;
+        float raw    = (e >= dur) ? 1.0f : (float)e / (float)dur;
+        start_menu_phase = start_menu_anim_opening ? raw : (1.0f - raw);
+    }
+    // ── Volume popup phase (180 ms / 140 ms) ──────────────────────────
+    {
+        uint32_t now = Timer::GetRealMs();
+        uint32_t dur = volume_popup_anim_opening ? 180u : 140u;
+        uint32_t e   = now - volume_popup_anim_start_ms;
+        float raw    = (e >= dur) ? 1.0f : (float)e / (float)dur;
+        volume_popup_phase = volume_popup_anim_opening ? raw : (1.0f - raw);
+    }
+
+    // ── Pinned-icon hover phase  -  ease toward 1 if hovered, 0 if not ─
+    int strip_x = tb_pin_strip_x();
+    int strip_y = tb_bar_y() + (TASKBAR_HEIGHT - TB_PIN_SZ) / 2;
+    int hover = -1;
+    if (my >= strip_y - 4 && my < strip_y + TB_PIN_SZ + 4) {
+        for (int i = 0; i < TB_PINNED_COUNT; i++) {
+            int ix = strip_x + i * (TB_PIN_SZ + TB_PIN_GAP);
+            if (mx >= ix - 2 && mx < ix + TB_PIN_SZ + 2) { hover = i; break; }
+        }
+    }
+    pinned_hover_target = hover;
+    // rate: ~1.0 / 140ms toward target -> approximately 7px per frame
+    // at 60fps.  Ease-out cubic curve applied at render time.
+    for (int i = 0; i < TB_PINNED_COUNT && i < 8; i++) {
+        float target = (i == hover) ? 1.0f : 0.0f;
+        pinned_hover_phase[i] = approach(pinned_hover_phase[i], target,
+                                        1.0f / 140.0f, delta_ms);
+    }
 }
 
 //  desktop (icons + wallpaper)
@@ -876,6 +1022,12 @@ int      Desktop::cfg_ctx_item_h   = 30;
 int      Desktop::cfg_ctx_width    = 180;
 bool     Desktop::cfg_allow_edit   = true;
 
+float    Desktop::icon_hover_phase[DESKTOP_MAX_ICONS] = {0};
+int      Desktop::icon_hover_target  = -1;
+uint32_t Desktop::icon_anim_last_ms  = 0;
+uint32_t Desktop::last_render_ms     = 0;
+int      Desktop::hovered_icon       = -1;
+
 void Desktop::ReloadFromConfig(){
     cfg_icon_size    = UIConfig::Int  ("desktop.icon_size",       ICON_SIZE);
     cfg_spacing_x    = UIConfig::Int  ("desktop.icon_spacing_x",  ICON_SPACING_X);
@@ -900,6 +1052,9 @@ void Desktop::Init(int sw,int sh){
     icon_count=0; selected_icon=-1;
     context_menu_open=false;
     context_menu_target=-1;
+    icon_hover_target = -1;
+    hovered_icon = -1;
+    for (int i = 0; i < DESKTOP_MAX_ICONS; i++) icon_hover_phase[i] = 0.0f;
 
     ReloadFromConfig();
 
@@ -923,7 +1078,9 @@ void Desktop::Init(int sw,int sh){
 
 void Desktop::AddIcon(const char* name,const char* path,int tp){
     if(icon_count>=DESKTOP_MAX_ICONS)return;
-    DesktopIcon* ic=&icons[icon_count++];
+    DesktopIcon* ic=&icons[icon_count];
+    icon_hover_phase[icon_count] = 0.0f;
+    icon_count++;
     scpy(ic->name,name,32);
     scpy(ic->path,path,DESKTOP_ICON_PATH_MAX);
     ic->icon_type=tp;
@@ -1008,12 +1165,21 @@ void Desktop::RefreshFiles(){
 
     for(int icon_index=0;icon_index<icon_count;){
         if(IsDesktopFileIcon(&icons[icon_index]) && !KVFS::Exists(icons[icon_index].path)){
-            for(int shift_index=icon_index;shift_index<icon_count-1;shift_index++) icons[shift_index]=icons[shift_index+1];
+            for(int shift_index=icon_index;shift_index<icon_count-1;shift_index++){
+                icons[shift_index]=icons[shift_index+1];
+                icon_hover_phase[shift_index] = icon_hover_phase[shift_index+1];
+            }
             icon_count--;
+            if (icon_count >= 0 && icon_count < DESKTOP_MAX_ICONS)
+                icon_hover_phase[icon_count] = 0.0f;
             if(selected_icon==icon_index) selected_icon=-1;
             else if(selected_icon>icon_index) selected_icon--;
             if(drag_icon==icon_index) drag_icon=-1;
             else if(drag_icon>icon_index) drag_icon--;
+            if(icon_hover_target==icon_index) icon_hover_target=-1;
+            else if(icon_hover_target>icon_index) icon_hover_target--;
+            if(hovered_icon==icon_index) hovered_icon=-1;
+            else if(hovered_icon>icon_index) hovered_icon--;
             continue;
         }
         icon_index++;
@@ -1054,13 +1220,22 @@ void Desktop::RemoveIcon(int index){
             KVFS::Unlink(p);
         }
     }
-    // shift remaining icons
-    for(int i=index;i<icon_count-1;i++) icons[i]=icons[i+1];
+    // shift remaining icons (and their hover phases) down one slot.
+    for(int i=index;i<icon_count-1;i++){
+        icons[i]=icons[i+1];
+        icon_hover_phase[i] = icon_hover_phase[i+1];
+    }
     icon_count--;
+    if (icon_count >= 0 && icon_count < DESKTOP_MAX_ICONS)
+        icon_hover_phase[icon_count] = 0.0f;
     if(selected_icon==index) selected_icon=-1;
     else if(selected_icon>index) selected_icon--;
     if(drag_icon==index) drag_icon=-1;
     else if(drag_icon>index) drag_icon--;
+    if(icon_hover_target==index) icon_hover_target=-1;
+    else if(icon_hover_target>index) icon_hover_target--;
+    if(hovered_icon==index) hovered_icon=-1;
+    else if(hovered_icon>index) hovered_icon--;
     RefreshFiles();
     FileManagerApp::NotifyFilesystemChanged("/home/user/Desktop");
 }
@@ -1165,6 +1340,16 @@ void Desktop::RenderWallpaper(){
     int h = screen_height;
     if (h <= 0) return;
     int w = screen_width;
+    size_t need_bytes = (size_t)w * (size_t)h * sizeof(uint32_t);
+    // If the screen dimensions changed since the cache was built (rare
+    // mode switch), drop the cache so it gets rebuilt at the new size.
+    if (gradient_cache && (gradient_cache_h != h || gradient_cache_bytes != need_bytes)) {
+        PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
+        gradient_cache = nullptr;
+        gradient_cache_bytes = 0;
+        gradient_cache_h = 0;
+        have_image_wallpaper = false;
+    }
 
     // if we have an image wallpaper, skip procedural generation
     if (have_image_wallpaper && gradient_cache && gradient_cache_h == h) {
@@ -1294,13 +1479,18 @@ void Desktop::RenderWallpaper(){
     Graphics::MarkDirty(0, 0, w, h);
 }
 
-void Desktop::RenderIcon(DesktopIcon* ic){
+void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     int ix=ic->x, iy=ic->y;
-    int icon_sz = ICON_SIZE;
+    int icon_sz = cfg_icon_size;
+
+    // Hover lift  -  eased pop, max 3 px lift.  Drawn before the icon body
+    // by offsetting iy so the label below stays put.
+    int lift = (int)(hover_t * 3.0f + 0.5f);
+    iy -= lift;
 
     // selection highlight  -  glowing aura
     if(ic->selected){
-        Graphics::FillRoundedRect(ix-6, iy-6, icon_sz+12, icon_sz+26, 8, COL_ICON_SEL);
+        Graphics::FillRoundedRect(ix-6, iy-6, icon_sz+12, icon_sz+26, 8, cfg_col_icon_sel);
     }
 
     // determine icon colors from name
@@ -1376,19 +1566,20 @@ void Desktop::RenderIcon(DesktopIcon* ic){
         Graphics::FillRect(ix+16, iy+16, 20, 4, 0xFFE0A050);
     }
 
-    // label  -  centered below icon with background pill for readability
+    // label  -  centered below the un-lifted icon position so it stays put.
     char lbl[14]; scpy(lbl, ic->name, 13);
     int tw=slen(lbl)*8;
     int tx=ix + icon_sz/2 - tw/2;
     if(tx<ix-8)tx=ix-8;
-    // background pill
-    Graphics::FillRoundedRect(tx-4, iy+icon_sz+1, tw+8, 14, 4, 0xFF080812);
-    // text
-    Graphics::DrawString(tx, iy+icon_sz+3, lbl, COL_ICON_TEXT, 0xFF000000);
+    int label_y = ic->y + icon_sz + 1;     // anchor to original y (no lift)
+    Graphics::FillRoundedRect(tx-4, label_y, tw+8, 14, 4, 0xFF080812);
+    Graphics::DrawString(tx, label_y+2, lbl, cfg_col_icon_text, 0xFF000000);
 }
 
-// context menu item lists  -  icon-targeted vs empty-desktop
-static const char* ctx_items_icon[]  = { "Open", "Delete", "Refresh" };
+// context menu item lists  -  icon-targeted vs empty-desktop.
+// Ordered so trimming with nit=2 yields a sensible (Open / Refresh) menu
+// when editing is disabled.  The "Delete" row stays last.
+static const char* ctx_items_icon[]  = { "Open", "Refresh", "Delete" };
 static const int   ctx_icon_count    = 3;
 static const char* ctx_items_empty[] = { "New Folder", "New File", "Refresh", "Settings" };
 static const int   ctx_empty_count   = 4;
@@ -1419,25 +1610,46 @@ void Desktop::RenderContextMenu(){
             Graphics::FillRect(context_menu_x+12, iy-1, mw-24, 1, 0xFF1A1A30);
         }
         uint32_t txt_col = cfg_col_ctx_text;
-        // tint "delete" red
-        if(on_icon && i==1) txt_col = 0xFFFF6666;
+        // tint "Delete" red  -  it's the last icon-menu row.
+        if(on_icon && i==2) txt_col = 0xFFFF6666;
         Graphics::DrawString(context_menu_x+16, iy + (ih-14)/2, items[i], txt_col, 0xFF000000);
         iy += ih;
     }
+    Graphics::MarkDirty(context_menu_x-2, context_menu_y-2, mw+10, mh+10);
 }
 
 void Desktop::Render(){
     RenderWallpaper();
     for(int i=0;i<icon_count;i++){
-        RenderIcon(&icons[i]);
+        float ht = (i < DESKTOP_MAX_ICONS) ? ease_out_cubic(icon_hover_phase[i]) : 0.0f;
+        RenderIcon(&icons[i], ht);
     }
     RenderContextMenu();
+    last_render_ms = Timer::GetRealMs();
+}
+
+void Desktop::Tick(uint32_t delta_ms, int mx, int my){
+    if (delta_ms == 0) delta_ms = 1;
+    if (delta_ms > 100) delta_ms = 100;
+
+    int hover = IconAt(mx, my);
+    if (icon_dragging) hover = -1;            // no hover-pop while dragging
+    icon_hover_target = hover;
+    hovered_icon = hover;
+
+    // Per-icon: ease toward 1 if hovered, 0 otherwise (160 ms full).
+    for (int i = 0; i < icon_count && i < DESKTOP_MAX_ICONS; i++) {
+        float target = (i == hover) ? 1.0f : 0.0f;
+        icon_hover_phase[i] = approach(icon_hover_phase[i], target,
+                                      1.0f / 160.0f, delta_ms);
+    }
 }
 
 int Desktop::IconAt(int mx,int my){
+    int sz = cfg_icon_size;
     for(int i=0;i<icon_count;i++){
-        if(mx>=icons[i].x-8 && mx<icons[i].x+60 &&
-           my>=icons[i].y-8 && my<icons[i].y+80){
+        if(mx>=icons[i].x-8 && mx<icons[i].x+sz+8 &&
+           my>=icons[i].y-8 && my<icons[i].y+sz+22){
             return i;
         }
     }
@@ -1445,8 +1657,7 @@ int Desktop::IconAt(int mx,int my){
 }
 
 bool Desktop::HandleClick(int mx,int my){
-    int tb_h = Taskbar::cfg_height;
-    if(my>=screen_height-tb_h) return false;
+    if(my >= Taskbar::GetY()) return false;
 
     // if context menu is open, check for menu item click first
     if(context_menu_open){
@@ -1466,10 +1677,10 @@ bool Desktop::HandleClick(int mx,int my){
             context_menu_open = false;
 
             if(on_icon){
-                // 0=open, 1=delete, 2=refresh
+                // 0=open, 1=refresh, 2=delete
                 if(row==0){ HandleDoubleClick(icons[context_menu_target].x+4, icons[context_menu_target].y+4); }
-                else if(row==1 && cfg_allow_edit){ RemoveIcon(context_menu_target); }
-                else if(row==2){ RefreshFiles(); }
+                else if(row==1){ RefreshFiles(); }
+                else if(row==2 && cfg_allow_edit){ RemoveIcon(context_menu_target); }
             } else {
                 // 0=new folder, 1=new file, 2=refresh, 3=settings
                 if(row==0 && cfg_allow_edit){ CreateFolderInteractive(); }
@@ -1536,10 +1747,26 @@ void Desktop::HandleDoubleClick(int mx,int my){
 }
 
 void Desktop::HandleRightClick(int mx,int my){
-    context_menu_open = true;
+    context_menu_target = IconAt(mx, my);
+    bool on_icon = (context_menu_target >= 0 && context_menu_target < icon_count);
+    int nit = on_icon ? ctx_icon_count : ctx_empty_count;
+    if(on_icon && !cfg_allow_edit) nit = 2;
+    int mw = cfg_ctx_width;
+    int mh = nit * cfg_ctx_item_h + 12;
+
+    // clamp so the whole menu stays on screen (and above the taskbar).
+    int max_x = screen_width - mw - 4;
+    int max_y = Taskbar::GetY() - mh - 4;
+    if (max_x < 0) max_x = 0;
+    if (max_y < 0) max_y = 0;
+    if (mx > max_x) mx = max_x;
+    if (my > max_y) my = max_y;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+
     context_menu_x = mx;
     context_menu_y = my;
-    context_menu_target = IconAt(mx, my);
+    context_menu_open = true;
 }
 
 void Desktop::Update(int mx,int my,bool mouse_down,bool clicked){
@@ -1592,8 +1819,14 @@ static uint32_t last_click_time_ms = 0;
 static int last_click_x = -1, last_click_y = -1;
 
 void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,char key){
-    // advance frame counter for timing (each frame ~6ms)
-    de_frame_counter++;
+    // Delta-time bookkeeping for all UI animations.
+    uint32_t now_ms  = Timer::GetRealMs();
+    uint32_t delta_ms = (de_last_frame_ms == 0) ? 16 : (now_ms - de_last_frame_ms);
+    if (delta_ms > 100) delta_ms = 100;
+    de_last_frame_ms = now_ms;
+
+    Desktop::Tick(delta_ms, mx, my);
+    Taskbar::Tick(delta_ms, mx, my);
 
     WindowManager::HandlePointerMove(mx, my);
 
@@ -1605,10 +1838,10 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         if (ks.alt && Keyboard::IsKeyPressed(KEY_TAB)) {
             int cur = WindowManager::GetFocusedIndex();
             Window* ws = WindowManager::GetWindows();
-            int n = WindowManager::GetWindowCount();
-            // gather candidate ids
+            // gather candidate ids  -  iterate the full slot array since
+            // closed slots can sit between live windows.
             int cand[WM_MAX_WINDOWS]; int nc = 0;
-            for (int i = 0; i < n; i++) {
+            for (int i = 0; i < WM_MAX_WINDOWS; i++) {
                 Window* w = &ws[i];
                 if (w->state == WIN_CLOSED || !w->visible || w->state == WIN_MINIMIZED)
                     continue;

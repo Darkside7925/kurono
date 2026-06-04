@@ -2,6 +2,9 @@
 #include "../net/unix_socket.h"
 #include "serial.h"
 #include "../fs/kvfs.h"
+#include "audio_mixer.h"
+#include "audio_format.h"
+#include "audio_server.h"
 
 namespace {
 
@@ -11,6 +14,7 @@ struct Stream {
     uint32_t sample_rate;
     uint8_t  channels;
     uint8_t  format;
+    int      mixer_id;     // AudioMixer::StreamID, -1 if not bound
 };
 
 struct Client {
@@ -86,8 +90,30 @@ Client* alloc_client(int sd) {
             c->rx_len = 0;
             for (int j = 0; j < PulseServer::PA_MAX_STREAMS_PER_CLIENT; j++) {
                 c->streams[j].in_use = false;
+                c->streams[j].mixer_id = -1;
             }
             return c;
+        }
+    }
+    return nullptr;
+}
+
+static AudioFormat::SampleFormat pa_to_fmt(uint8_t pa) {
+    switch (pa) {
+        case 0:  return AudioFormat::FMT_U8;
+        case 2:  return AudioFormat::FMT_S16_LE;
+        case 4:  return AudioFormat::FMT_F32_LE;
+        case 6:  return AudioFormat::FMT_S32_LE;
+        default: return AudioFormat::FMT_S16_LE;
+    }
+}
+
+static Stream* find_stream_by_channel(uint32_t channel) {
+    for (int i = 0; i < PulseServer::PA_MAX_CLIENTS; i++) {
+        if (!g_clients[i].in_use) continue;
+        for (int j = 0; j < PulseServer::PA_MAX_STREAMS_PER_CLIENT; j++) {
+            Stream* s = &g_clients[i].streams[j];
+            if (s->in_use && s->channel == channel) return s;
         }
     }
     return nullptr;
@@ -211,6 +237,11 @@ void handle_request(Client* c, uint32_t cmd, uint32_t tag, const uint8_t* args,
             c->streams[slot].sample_rate = 48000;
             c->streams[slot].channels   = 2;
             c->streams[slot].format     = 2;
+            c->streams[slot].mixer_id   =
+                AudioServer::OpenStream("pulse",
+                                        pa_to_fmt(c->streams[slot].format),
+                                        c->streams[slot].sample_rate,
+                                        c->streams[slot].channels);
             // reply: u32 channel, u32 stream_index, u32 missing(prebuf)
             p += put_u32(buf + p, c->streams[slot].channel);
             p += put_u32(buf + p, c->streams[slot].channel);
@@ -228,8 +259,34 @@ void handle_request(Client* c, uint32_t cmd, uint32_t tag, const uint8_t* args,
             send_packet(c->sd, buf, p);
             break;
         }
-        case PA_COMMAND_DELETE_PLAYBACK_STREAM:
-        case PA_COMMAND_DRAIN_PLAYBACK_STREAM:
+        case PA_COMMAND_DELETE_PLAYBACK_STREAM: {
+            // payload starts with [u32 channel] -- close the matching
+            // mixer stream so its slot is reclaimed.
+            if (args_len >= 5 && args[0] == PA_TAG_U32) {
+                uint32_t ch = ((uint32_t)args[1] << 24) | ((uint32_t)args[2] << 16) |
+                              ((uint32_t)args[3] << 8)  |  (uint32_t)args[4];
+                for (int j = 0; j < PulseServer::PA_MAX_STREAMS_PER_CLIENT; j++) {
+                    Stream* s = &c->streams[j];
+                    if (s->in_use && s->channel == ch) {
+                        if (s->mixer_id >= 0) AudioServer::CloseStream(s->mixer_id);
+                        s->in_use = false;
+                        s->mixer_id = -1;
+                    }
+                }
+            }
+            send_packet(c->sd, buf, p);
+            break;
+        }
+        case PA_COMMAND_DRAIN_PLAYBACK_STREAM: {
+            if (args_len >= 5 && args[0] == PA_TAG_U32) {
+                uint32_t ch = ((uint32_t)args[1] << 24) | ((uint32_t)args[2] << 16) |
+                              ((uint32_t)args[3] << 8)  |  (uint32_t)args[4];
+                Stream* s = find_stream_by_channel(ch);
+                if (s && s->mixer_id >= 0) AudioServer::DrainStream(s->mixer_id);
+            }
+            send_packet(c->sd, buf, p);
+            break;
+        }
         case PA_COMMAND_FLUSH_PLAYBACK_STREAM:
         case PA_COMMAND_SUBSCRIBE: {
             send_packet(c->sd, buf, p);
@@ -267,8 +324,20 @@ void on_data(int sd, const uint8_t* data, int len, void* user) {
                 handle_request(c, cmd, tag, payload + 10, (int)plen - 10);
             }
         } else {
-            // Stream audio data  -  would forward to Audio::PlayPCM.
-            // For now we acknowledge by consuming the bytes silently.
+            // Stream audio data  -  forward to the mixer.  Frames count is
+            // payload bytes / frame size.  The mixer takes care of any
+            // resampling and channel remix.
+            Stream* s = find_stream_by_channel(channel);
+            if (s && s->mixer_id >= 0) {
+                AudioFormat::SampleFormat f = pa_to_fmt(s->format);
+                uint32_t frame_bytes = AudioFormat::FrameSize(f, s->channels);
+                if (frame_bytes > 0) {
+                    uint32_t frames = plen / frame_bytes;
+                    if (frames > 0) {
+                        AudioMixer::Write(s->mixer_id, payload, frames);
+                    }
+                }
+            }
         }
         p += 20 + plen;
     }
@@ -295,7 +364,13 @@ void on_connect(int server_sd, int new_sd, void* user) {
 namespace PulseServer {
 
 void Init() {
-    for (int i = 0; i < PA_MAX_CLIENTS; i++) g_clients[i].in_use = false;
+    for (int i = 0; i < PA_MAX_CLIENTS; i++) {
+        g_clients[i].in_use = false;
+        for (int j = 0; j < PA_MAX_STREAMS_PER_CLIENT; j++) {
+            g_clients[i].streams[j].in_use   = false;
+            g_clients[i].streams[j].mixer_id = -1;
+        }
+    }
 
     g_listen_sd = UnixSocket::Create(UnixSocket::UNIX_SOCK_STREAM);
     if (g_listen_sd < 0) return;

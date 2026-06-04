@@ -27,6 +27,11 @@ uint8_t HDAudio::volume = 200;
 HDAStreamFormat HDAudio::current_format = {48000, 16, 2};
 uint32_t HDAudio::stream_base = 0;
 
+// streaming state  -  independent of the legacy one-shot Play() path.
+static bool     g_hda_stream_live  = false;
+static uint32_t g_hda_write_ptr    = 0;     // byte offset into cyclic buffer
+static uint32_t g_hda_last_lpib    = 0;     // last observed read position
+
 uint8_t  HDAudio::Read8(uint32_t offset)  { return *(volatile uint8_t*)(bar0 + offset); }
 uint16_t HDAudio::Read16(uint32_t offset) { return *(volatile uint16_t*)(bar0 + offset); }
 uint32_t HDAudio::Read32(uint32_t offset) { return *(volatile uint32_t*)(bar0 + offset); }
@@ -452,8 +457,75 @@ bool HDAudio::Stop() {
     Write32(stream_base + HDA_SD_CTL, ctl);
 
     playing = false;
+    g_hda_stream_live = false;
+    g_hda_write_ptr = 0;
+    g_hda_last_lpib = 0;
     return true;
 }
+
+bool HDAudio::StartStream() {
+    if (!detected || !dma_buffer) return false;
+    if (g_hda_stream_live) return true;
+
+    // Zero the cyclic buffer so the engine plays silence until the mixer
+    // catches up.
+    uint8_t* b = (uint8_t*)dma_buffer;
+    for (uint32_t i = 0; i < HDA_BUFFER_SIZE; i++) b[i] = 0;
+    g_hda_write_ptr = 0;
+    g_hda_last_lpib = 0;
+
+    // Make sure every BDL entry interrupts on completion so LPIB updates
+    // are reliable -- the controller pre-fetches and we need accurate
+    // wraparound notification.
+    for (int i = 0; i < HDA_BDL_ENTRIES; i++) bdl[i].ioc = 1;
+
+    uint32_t ctl = Read32(stream_base + HDA_SD_CTL);
+    ctl |= HDA_SD_CTL_RUN | HDA_SD_CTL_IOCE;
+    Write32(stream_base + HDA_SD_CTL, ctl);
+
+    playing = true;
+    g_hda_stream_live = true;
+    return true;
+}
+
+uint32_t HDAudio::WriteRing(const void* data, uint32_t bytes) {
+    if (!g_hda_stream_live || !data || bytes == 0) return 0;
+    uint32_t lpib = Read32(stream_base + HDA_SD_LPIB) % HDA_BUFFER_SIZE;
+    g_hda_last_lpib = lpib;
+
+    // Available bytes ahead of the read pointer (leave a 1-frame guard).
+    uint32_t free_bytes;
+    if (g_hda_write_ptr >= lpib) {
+        free_bytes = HDA_BUFFER_SIZE - (g_hda_write_ptr - lpib);
+    } else {
+        free_bytes = lpib - g_hda_write_ptr;
+    }
+    if (free_bytes < 8) return 0;
+    free_bytes -= 4;        // keep one frame headroom
+
+    uint32_t to_write = bytes < free_bytes ? bytes : free_bytes;
+    const uint8_t* src = (const uint8_t*)data;
+    uint8_t* dst_base = (uint8_t*)dma_buffer;
+
+    uint32_t first = HDA_BUFFER_SIZE - g_hda_write_ptr;
+    if (first > to_write) first = to_write;
+    for (uint32_t i = 0; i < first; i++)
+        dst_base[g_hda_write_ptr + i] = src[i];
+    uint32_t second = to_write - first;
+    for (uint32_t i = 0; i < second; i++)
+        dst_base[i] = src[first + i];
+    g_hda_write_ptr = (g_hda_write_ptr + to_write) % HDA_BUFFER_SIZE;
+    return to_write;
+}
+
+uint32_t HDAudio::RingQueuedBytes() {
+    if (!g_hda_stream_live) return 0;
+    uint32_t lpib = Read32(stream_base + HDA_SD_LPIB) % HDA_BUFFER_SIZE;
+    if (g_hda_write_ptr >= lpib) return g_hda_write_ptr - lpib;
+    return HDA_BUFFER_SIZE - (lpib - g_hda_write_ptr);
+}
+
+uint32_t HDAudio::RingChunkBytes() { return 4096; }
 
 bool HDAudio::IsPlaying() { return playing; }
 

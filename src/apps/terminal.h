@@ -82,7 +82,10 @@ private:
     static char pending_cmd[TERM_INPUT_MAX];
 
     // aesthetic state
-    static unsigned int blink_timer; // milliseconds for cursor blink
+    static unsigned int blink_timer;       // milliseconds for cursor blink
+    static unsigned int last_keypress_ms;  // for cursor blink pause-on-type
+    static int          smooth_scroll_q16; // reserved for future sub-line easing
+    static int          target_scroll_offset; // smoothed-toward integer offset
 
     static void ExecuteInput();
     static void HistoryUp();

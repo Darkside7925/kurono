@@ -94,30 +94,50 @@ bool path_eq(const char* a, const char* b) {
     return *a == *b;
 }
 
+inline void block_copy(uint8_t* d, const uint8_t* s, int n) {
+    // Word-aligned copy when possible; falls back to byte for the tail.
+    int i = 0;
+    while (i + 7 < n) {
+        ((uint64_t*)(d + i))[0] = ((const uint64_t*)(s + i))[0];
+        i += 8;
+    }
+    while (i < n) { d[i] = s[i]; i++; }
+}
+
 int ring_write(Ring& r, const uint8_t* data, int len, const ControlMsg* cm,
                SockType type) {
     if (len <= 0) return 0;
+    // Datagram / seqpacket: if no frame slot is available, fail rather
+    // than silently merging into the previous record.
+    if (type != UNIX_SOCK_STREAM) {
+        if (r.frame_head - r.frame_tail >= Ring::FRAME_RING) return 0;
+    }
     int can = r.free();
     if (can <= 0) return 0;
     if (len > can) len = can;
-    for (int i = 0; i < len; i++) {
-        r.data[(r.head + i) % UNIX_RING_BYTES] = data[i];
+    uint32_t off = r.head % UNIX_RING_BYTES;
+    int first = (int)(UNIX_RING_BYTES - off);
+    if (first > len) first = len;
+    block_copy(r.data + off, data, first);
+    if (len > first) {
+        block_copy(r.data, data + first, len - first);
     }
     if (type != UNIX_SOCK_STREAM) {
         uint32_t fi = r.frame_head % Ring::FRAME_RING;
-        r.frames[fi].offset = r.head % UNIX_RING_BYTES;
+        r.frames[fi].offset = off;
         r.frames[fi].length = (uint32_t)len;
         if (cm) r.frames[fi].cmsg = *cm;
         else    r.frames[fi].cmsg = {};
         r.frame_head++;
-    } else if (cm && cm->passed_fd_count > 0) {
-        // Stream: attach cmsg to *first* frame slot anyway so SCM_RIGHTS
-        // arrives with the next read.
-        uint32_t fi = r.frame_head % Ring::FRAME_RING;
-        r.frames[fi].offset = r.head % UNIX_RING_BYTES;
-        r.frames[fi].length = (uint32_t)len;
-        r.frames[fi].cmsg = *cm;
-        r.frame_head++;
+    } else if (cm && (cm->passed_fd_count > 0 || cm->creds_valid)) {
+        // Stream: attach cmsg only when there is something to deliver.
+        if (r.frame_head - r.frame_tail < Ring::FRAME_RING) {
+            uint32_t fi = r.frame_head % Ring::FRAME_RING;
+            r.frames[fi].offset = off;
+            r.frames[fi].length = (uint32_t)len;
+            r.frames[fi].cmsg = *cm;
+            r.frame_head++;
+        }
     }
     r.head += (uint32_t)len;
     return len;
@@ -127,15 +147,18 @@ int ring_read(Ring& r, uint8_t* out, int max, ControlMsg* cm, SockType type) {
     int avail = r.avail();
     if (avail <= 0) return 0;
     int n = avail;
+    int consume = avail;
     if (type == UNIX_SOCK_DGRAM || type == UNIX_SOCK_SEQPACKET) {
         if (r.frame_head == r.frame_tail) return 0;
         uint32_t fi = r.frame_tail % Ring::FRAME_RING;
-        n = (int)r.frames[fi].length;
-        if (n > max) n = max;
+        int frame_len = (int)r.frames[fi].length;
+        n = frame_len < max ? frame_len : max;
+        consume = frame_len;     // datagrams discard the truncated tail
         if (cm) *cm = r.frames[fi].cmsg;
         r.frame_tail++;
     } else {
         if (n > max) n = max;
+        consume = n;
         if (cm && r.frame_head != r.frame_tail) {
             uint32_t fi = r.frame_tail % Ring::FRAME_RING;
             *cm = r.frames[fi].cmsg;
@@ -144,10 +167,14 @@ int ring_read(Ring& r, uint8_t* out, int max, ControlMsg* cm, SockType type) {
             *cm = {};
         }
     }
-    for (int i = 0; i < n; i++) {
-        out[i] = r.data[(r.tail + i) % UNIX_RING_BYTES];
+    uint32_t off = r.tail % UNIX_RING_BYTES;
+    int first = (int)(UNIX_RING_BYTES - off);
+    if (first > n) first = n;
+    block_copy(out, r.data + off, first);
+    if (n > first) {
+        block_copy(out + first, r.data, n - first);
     }
-    r.tail += (uint32_t)n;
+    r.tail += (uint32_t)consume;
     return n;
 }
 
@@ -205,7 +232,10 @@ int Connect(int sd, const char* path) {
     if (srv < 0) return -111;          // ECONNREFUSED
     Socket& server = g_socks[srv];
 
-    // Build the server-side accept slot now.
+    // Reject early if the backlog is full so we don't leak an accept slot.
+    int next = (server.backlog_head + 1) % UNIX_MAX_BACKLOG;
+    if (next == server.backlog_tail) return -11;       // EAGAIN
+
     int accept_sd = alloc_sd();
     if (accept_sd < 0) return -1;
     Socket& as = g_socks[accept_sd];
@@ -219,9 +249,6 @@ int Connect(int sd, const char* path) {
     cs.peer_sd = accept_sd;
     cs.type    = server.type;
 
-    // Push to backlog.
-    int next = (server.backlog_head + 1) % UNIX_MAX_BACKLOG;
-    if (next == server.backlog_tail) return -11;       // EAGAIN, full
     server.backlog[server.backlog_head] = accept_sd;
     server.backlog_head = next;
 
@@ -257,6 +284,8 @@ int Pair(SockType type, int* sd0, int* sd1) {
     g_socks[a].connected = g_socks[b].connected = true;
     g_socks[a].peer_sd = b;
     g_socks[b].peer_sd = a;
+    g_socks[a].creds = {0, 0, 0};
+    g_socks[b].creds = {0, 0, 0};
     *sd0 = a; *sd1 = b;
     return 0;
 }
@@ -270,6 +299,7 @@ int Send(int sd, const void* buf, int len, int flags,
     int peer = s.peer_sd;
     if (!valid(peer)) return -32;
     Socket& ps = g_socks[peer];
+    if (ps.shutdown_rd) return -32;
     ControlMsg cm = {};
     if (pass_fds && n_fds > 0) {
         if (n_fds > UNIX_MAX_PASSED_FD) n_fds = UNIX_MAX_PASSED_FD;
@@ -279,19 +309,28 @@ int Send(int sd, const void* buf, int len, int flags,
     cm.creds_valid = true;
     cm.peer_creds  = s.creds;
     int w = ring_write(ps.rx, (const uint8_t*)buf, len, &cm, s.type);
+    if (w == 0 && len > 0) return -11;  // EAGAIN
     if (ps.is_kernel_server && ps.on_data && w > 0) {
-        // Drain immediately into the kernel-side handler.
-        uint8_t scratch[2048];
-        int total = 0;
-        while (true) {
-            int got = ring_read(ps.rx, scratch, sizeof(scratch), nullptr,
-                                ps.type);
-            if (got <= 0) break;
-            ps.on_data(peer, scratch, got, ps.user);
-            total += got;
-            if (ps.type != UNIX_SOCK_STREAM) break;
+        // Drain into the kernel-side handler with no extra copy where
+        // possible: for streams, walk the ring in contiguous spans and
+        // hand each span directly to the callback. Only fall back to a
+        // bounce buffer when the consumer needs ancillary data merged.
+        if (ps.type == UNIX_SOCK_STREAM) {
+            while (ps.rx.avail() > 0) {
+                uint32_t off = ps.rx.tail % UNIX_RING_BYTES;
+                int span = ps.rx.avail();
+                int contig = (int)(UNIX_RING_BYTES - off);
+                if (span > contig) span = contig;
+                ps.on_data(peer, ps.rx.data + off, span, ps.user);
+                ps.rx.tail += (uint32_t)span;
+            }
+            // Drain stale frame metadata so it doesn't accumulate.
+            ps.rx.frame_tail = ps.rx.frame_head;
+        } else {
+            uint8_t scratch[2048];
+            int got = ring_read(ps.rx, scratch, sizeof(scratch), nullptr, ps.type);
+            if (got > 0) ps.on_data(peer, scratch, got, ps.user);
         }
-        (void)total;
     }
     return w;
 }
@@ -315,8 +354,11 @@ int Close(int sd) {
     if (!valid(sd)) return -1;
     Socket& s = g_socks[sd];
     if (s.peer_sd >= 0 && valid(s.peer_sd)) {
-        g_socks[s.peer_sd].shutdown_rd = true;
-        g_socks[s.peer_sd].peer_sd = -1;
+        Socket& ps = g_socks[s.peer_sd];
+        ps.shutdown_wr = true;     // peer's writes will start failing
+        ps.peer_sd = -1;
+        // Leave any buffered RX data on the peer so it can drain after
+        // our close  -  connection-style EOF semantics.
     }
     s.in_use = false;
     return 0;

@@ -46,6 +46,8 @@ struct NvidiaGPUInfo {
     uint64_t    bar1_size;
     uint32_t    vram_mb;        // estimated vram in mb
     char        name[64];       // human-readable gpu name
+    bool        has_2d_accel;   // PCOPY/host-blit usable
+    bool        has_3d_accel;   // graphics engine usable
 };
 
 enum GpuDriverState {
@@ -88,6 +90,9 @@ public:
 
     static void     DumpInfo(char* out, int maxo);
     static void     DumpRegisters(char* out, int maxo);
+
+    // accel capability  -  compositor calls this to decide whether to issue GPU blits
+    static bool     HasHardwareAccel();
 
 private:
     static NvidiaGPUInfo   gpu_info;

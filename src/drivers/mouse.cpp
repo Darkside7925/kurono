@@ -45,12 +45,43 @@ Mouse::Event Mouse::events[256];
 uint16_t Mouse::ev_head = 0;
 uint16_t Mouse::ev_tail = 0;
 
-static int smooth_x256 = 0;
-static int smooth_y256 = 0;
-static int target_x256 = 0;
-static int target_y256 = 0;
+// Sub-pixel accumulation for slow movements. 8.8 fixed point. Slow physical
+// motion that produces sub-1 pixel deltas after acceleration still moves the
+// cursor over multiple frames instead of dropping to zero.
+static int32_t subpixel_x_q8 = 0;
+static int32_t subpixel_y_q8 = 0;
 static bool smooth_inited = false;
-static const int SMOOTH_ALPHA = 95;    // 0-256, lower = smoother (95 ≈ 37%  -  comfortable desktop feel)
+
+// Pointer acceleration curve. Piecewise linear with a small dead-zone so a
+// resting hand does not jitter the pointer. After the dead-zone, gain ramps
+// from 1.0x up to ACCEL_MAX_GAIN at ACCEL_FAST_THRESHOLD device units / poll.
+static constexpr int32_t ACCEL_DEADZONE = 1;        // device units
+static constexpr int32_t ACCEL_FAST_THRESHOLD = 24; // device units / packet
+static constexpr int32_t ACCEL_MAX_GAIN_Q8 = 640;   // 2.5x in Q8
+static constexpr int32_t ACCEL_BASE_GAIN_Q8 = 256;  // 1.0x
+
+static inline int32_t apply_pointer_accel_q8(int32_t v) {
+    if (v == 0) return 0;
+    int32_t mag = v < 0 ? -v : v;
+    if (mag <= ACCEL_DEADZONE) return 0;
+    int32_t adj = mag - ACCEL_DEADZONE;
+    int32_t gain;
+    if (adj >= ACCEL_FAST_THRESHOLD) {
+        gain = ACCEL_MAX_GAIN_Q8;
+    } else {
+        gain = ACCEL_BASE_GAIN_Q8 +
+               ((ACCEL_MAX_GAIN_Q8 - ACCEL_BASE_GAIN_Q8) * adj) /
+               ACCEL_FAST_THRESHOLD;
+    }
+    int32_t scaled = adj * gain;       // Q8 result, fits comfortably in int32
+    return (v < 0) ? -scaled : scaled; // Q8
+}
+
+// Pending coalesced motion delivered to the event ring at end of Poll().
+static int32_t pending_motion_dx = 0;
+static int32_t pending_motion_dy = 0;
+static int32_t pending_wheel_dz = 0;
+static bool pending_motion_dirty = false;
 
 // enhanced variables
 static bool raw_input_enabled = false;
@@ -502,6 +533,16 @@ void Mouse::Init() {
         SerialLogger::Log("Mouse: PS/2 stream unavailable, waiting for host absolute input\r\n");
     }
 
+    smooth_inited = false;
+    subpixel_x_q8 = 0;
+    subpixel_y_q8 = 0;
+    pending_motion_dx = 0;
+    pending_motion_dy = 0;
+    pending_wheel_dz = 0;
+    pending_motion_dirty = false;
+    ev_head = 0;
+    ev_tail = 0;
+
     DrawAt(mx, my);
     if (detected_hypervisor == HYP_VBOX) {
         SerialLogger::Log("Mouse: VirtualBox compatibility mode enabled\r\n");
@@ -653,6 +694,16 @@ void Mouse::InitVMwareIntegration() {
     SerialLogger::Log("Mouse: VMware vmmouse absolute integration ENABLED\r\n");
 }
 
+// SPSC ring push. Drops on overflow rather than corrupting the reader.
+void Mouse::RingPush(const Mouse::Event& e) {
+    uint16_t h = __atomic_load_n(&ev_head, __ATOMIC_RELAXED);
+    uint16_t t = __atomic_load_n(&ev_tail, __ATOMIC_ACQUIRE);
+    uint16_t next = (uint16_t)((h + 1) & 255);
+    if (next == (t & 255)) return;
+    events[h & 255] = e;
+    __atomic_store_n(&ev_head, next, __ATOMIC_RELEASE);
+}
+
 void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int wheel_delta) {
     perf_stats.packets_processed++;
 
@@ -691,24 +742,32 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
             ClearAt(lastx, lasty);
             DrawAt(mx, my);
         }
-        uint64_t ts = TimeManager::NowUTC().us;
-        Event e{};
-        e.type = 0; e.x = mx; e.y = my; e.dx = rel_dx; e.dy = rel_dy;
-        e.buttons = new_buttons; e.time_us = ts;
-        events[ev_head++] = e; ev_head &= 255;
+        // Coalesce  -  multiple absolute samples per Poll() tick collapse into a
+        // single motion event holding cumulative deltas + the final position.
+        pending_motion_dx += rel_dx;
+        pending_motion_dy += rel_dy;
+        pending_motion_dirty = true;
     }
 
     if (wheel_delta) {
         if (invert_scroll) wheel_delta = -wheel_delta;
-        uint64_t ts = TimeManager::NowUTC().us;
-        Event e{};
-        e.type = 3; e.x = mx; e.y = my; e.dz = wheel_delta;
-        e.buttons = new_buttons; e.time_us = ts;
-        events[ev_head++] = e; ev_head &= 255;
+        pending_wheel_dz += wheel_delta;
     }
 
     uint8_t changed = (uint8_t)(new_buttons ^ prev_buttons);
     if (changed) {
+        // Flush motion before button edges so consumers see "moved to (x,y)
+        // then clicked" in the right order.
+        if (pending_motion_dirty) {
+            uint64_t ts = TimeManager::NowUTC().us;
+            Event me{};
+            me.type = 0; me.x = mx; me.y = my;
+            me.dx = pending_motion_dx; me.dy = pending_motion_dy;
+            me.buttons = new_buttons; me.time_us = ts;
+            RingPush(me);
+            pending_motion_dx = pending_motion_dy = 0;
+            pending_motion_dirty = false;
+        }
         uint64_t ts = TimeManager::NowUTC().us;
         for (int i = 0; i < 5; i++) {
             uint8_t mask = (i == 0 ? 0x01 : i == 1 ? 0x02 : i == 2 ? 0x04 : i == 3 ? 0x08 : 0x10);
@@ -717,7 +776,7 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
             e.type = (uint8_t)((new_buttons & mask) ? 1 : 2);
             e.x = mx; e.y = my; e.button = (uint8_t)i;
             e.buttons = new_buttons; e.time_us = ts;
-            events[ev_head++] = e; ev_head &= 255;
+            RingPush(e);
         }
     }
     prev_buttons = new_buttons;
@@ -1175,6 +1234,7 @@ void Mouse::Poll() {
             }
             int8_t dx = (int8_t)(dx_full < -128 ? -128 : (dx_full > 127 ? 127 : dx_full));
             int8_t dy = (int8_t)(dy_full < -128 ? -128 : (dy_full > 127 ? 127 : dy_full));
+            (void)dx; (void)dy;
             uint8_t xbtn = 0;
             if (packet_len == 4) {
                 if (has_xbuttons) { xbtn = (uint8_t)((pkt[3] & 0x10 ? 0x10 : 0) | (pkt[3] & 0x20 ? 0x20 : 0)); }
@@ -1225,58 +1285,129 @@ void Mouse::Poll() {
                 if (palm_threshold && pr >= (int)palm_threshold) { prev_buttons = new_buttons; continue; }
                 bool near_edge = edge_scroll && abs_maxx && (ax > abs_maxx - (abs_maxx / 12));
                 bool do_scroll = near_edge || (two_finger_scroll && ((pkt[2] & 0x01) != 0));
-                if (do_scroll) { int s = m_dy + scroll_rest; int steps = s / 32; scroll_rest = s - steps * 32; if (steps) { int dzv = steps; if (invert_scroll) dzv = -dzv; uint64_t ts = TimeManager::NowUTC().us; Event e; e.type = 3; e.x = mx; e.y = my; e.dx = 0; e.dy = 0; e.dz = dzv; e.button = 0; e.buttons = new_buttons; e.fingers = 0; e.pressure = (uint8_t)pr; e.width = 0; e.gesture = 0; e.time_us = ts; events[ev_head++] = e; ev_head &= 255; } prev_buttons = new_buttons; continue; }
-            } else { m_dx = dx_full * (int)speed_mul; m_dy = dy_full * (int)speed_mul; }
-            if (deadzone_px) { if (m_dx > -deadzone_px && m_dx < deadzone_px) m_dx = 0; if (m_dy > -deadzone_px && m_dy < deadzone_px) m_dy = 0; }
+                if (do_scroll) {
+                    int s = m_dy + scroll_rest;
+                    int steps = s / 32;
+                    scroll_rest = s - steps * 32;
+                    if (steps) {
+                        int dzv = steps;
+                        if (invert_scroll) dzv = -dzv;
+                        pending_wheel_dz += dzv;
+                    }
+                    prev_buttons = new_buttons;
+                    continue;
+                }
+            } else {
+                // speed_mul is a small linear scaler; keep separate from
+                // pointer-acceleration which is applied below.
+                m_dx = dx_full * (int)speed_mul;
+                m_dy = dy_full * (int)speed_mul;
+            }
+            if (deadzone_px) {
+                int dz_px = (int)deadzone_px;
+                if (m_dx > -dz_px && m_dx < dz_px) m_dx = 0;
+                if (m_dy > -dz_px && m_dy < dz_px) m_dy = 0;
+            }
             if (sensitivity_mul > 1) {
                 m_dx *= (int)sensitivity_mul;
                 m_dy *= (int)sensitivity_mul;
             }
-            if (accel_mul > 1) { int ax = (m_dx >= 0 ? m_dx : -m_dx); int ay = (m_dy >= 0 ? m_dy : -m_dy); int a = ax + ay; if (a > 2) { m_dx = m_dx * (int)accel_mul; m_dy = m_dy * (int)accel_mul; } }
 
-            // update target position (raw) in fixed-point
-            if (!smooth_inited) {
-                smooth_x256 = mx * 256;
-                smooth_y256 = my * 256;
-                smooth_inited = true;
+            // Sub-pixel pointer acceleration in Q8. The legacy accel_mul stays
+            // available as a coarse user multiplier on top of the curve.
+            int32_t ax_q8 = apply_pointer_accel_q8(m_dx);
+            int32_t ay_q8 = apply_pointer_accel_q8(m_dy);
+            if (accel_mul > 1) {
+                ax_q8 *= (int32_t)accel_mul;
+                ay_q8 *= (int32_t)accel_mul;
             }
-            target_x256 = (mx + m_dx) * 256;
-            target_y256 = (my - m_dy) * 256;
 
-            // clamp target
+            // Accumulate sub-pixel residue so slow motion still moves the
+            // cursor over consecutive packets instead of being rounded away.
+            subpixel_x_q8 += ax_q8;
+            subpixel_y_q8 += ay_q8;
+            int32_t step_x = subpixel_x_q8 / 256;
+            int32_t step_y = subpixel_y_q8 / 256;
+            subpixel_x_q8 -= step_x * 256;
+            subpixel_y_q8 -= step_y * 256;
+
             int w = Graphics::GetWidth(); int h = Graphics::GetHeight();
-            if (target_x256 < 0) target_x256 = 0;
-            if (target_y256 < 0) target_y256 = 0;
-            if (target_x256 > (w - 1) * 256) target_x256 = (w - 1) * 256;
-            if (target_y256 > (h - 1) * 256) target_y256 = (h - 1) * 256;
+            if (w < 1) w = 1; if (h < 1) h = 1;
 
-            // exponential smoothing: smooth = smooth + alpha * (target - smooth) / 256
-            smooth_x256 += (SMOOTH_ALPHA * (target_x256 - smooth_x256)) / 256;
-            smooth_y256 += (SMOOTH_ALPHA * (target_y256 - smooth_y256)) / 256;
+            int64_t target_x = (int64_t)mx + (int64_t)step_x;
+            int64_t target_y = (int64_t)my - (int64_t)step_y; // PS/2: +y = up
+            if (target_x < 0) target_x = 0;
+            if (target_y < 0) target_y = 0;
+            if (target_x > w - 1) target_x = w - 1;
+            if (target_y > h - 1) target_y = h - 1;
 
-            // snap to target if very close (avoid perpetual sub-pixel crawl)
-            int diff_x = target_x256 - smooth_x256;
-            int diff_y = target_y256 - smooth_y256;
-            if (diff_x > -64 && diff_x < 64) smooth_x256 = target_x256;
-            if (diff_y > -64 && diff_y < 64) smooth_y256 = target_y256;
+            if (!smooth_inited) smooth_inited = true;
 
-            mx = smooth_x256 / 256;
-            my = smooth_y256 / 256;
-            if (cursor_visible && auto_draw) { ClearAt(lastx, lasty); DrawAt(mx, my); }
+            int new_mx = (int)target_x;
+            int new_my = (int)target_y;
+            int delivered_dx = new_mx - mx;
+            int delivered_dy = my - new_my; // positive = up, mirrors PS/2 convention
+            mx = new_mx;
+            my = new_my;
+            if (cursor_visible && auto_draw && (delivered_dx || delivered_dy)) {
+                ClearAt(lastx, lasty);
+                DrawAt(mx, my);
+            }
             uint64_t ts = TimeManager::NowUTC().us;
-            if (m_dx || m_dy) {
-                Event e; e.type = 0; e.x = mx; e.y = my; e.dx = m_dx; e.dy = m_dy; e.dz = 0; e.button = 0; e.buttons = new_buttons; e.fingers = (uint8_t)((abs_mode && ((abs_proto==1 && (pkt[2]&0x02)) || (abs_proto==2 && (pkt[2]&0x02)))) ? 1 : 0); e.pressure = (uint8_t)(abs_mode ? (pkt[5] & 0x7F) : 0); e.width = 0; e.gesture = (uint8_t)(abs_mode ? (pkt[2] & 0x01) : 0); e.time_us = ts; events[ev_head++] = e; ev_head &= 255; }
-            if (!abs_mode && dz) { Event e; e.type = 3; e.x = mx; e.y = my; e.dx = 0; e.dy = 0; e.dz = dz; e.button = 0; e.buttons = new_buttons; e.fingers = 0; e.pressure = 0; e.width = 0; e.gesture = 0; e.time_us = ts; events[ev_head++] = e; ev_head &= 255; }
+            if (delivered_dx || delivered_dy) {
+                pending_motion_dx += delivered_dx;
+                pending_motion_dy += delivered_dy;
+                pending_motion_dirty = true;
+                perf_stats.events_generated++;
+            }
+            if (!abs_mode && dz) {
+                pending_wheel_dz += dz;
+            }
             uint8_t changed = (uint8_t)(new_buttons ^ prev_buttons);
             if (changed) {
+                if (pending_motion_dirty) {
+                    Event me{};
+                    me.type = 0; me.x = mx; me.y = my;
+                    me.dx = pending_motion_dx; me.dy = pending_motion_dy;
+                    me.buttons = new_buttons; me.time_us = ts;
+                    RingPush(me);
+                    pending_motion_dx = pending_motion_dy = 0;
+                    pending_motion_dirty = false;
+                }
                 for (int i = 0; i < 5; i++) {
                     uint8_t mask = (i == 0 ? 0x01 : i == 1 ? 0x02 : i == 2 ? 0x04 : i == 3 ? 0x08 : 0x10);
                     if (changed & mask) {
-                        Event e; e.type = ((new_buttons & mask) ? 1 : 2); e.x = mx; e.y = my; e.dx = 0; e.dy = 0; e.dz = 0; e.button = (uint8_t)i; e.buttons = new_buttons; e.fingers = 0; e.pressure = 0; e.width = 0; e.gesture = 0; e.time_us = ts; events[ev_head++] = e; ev_head &= 255;
+                        Event e{};
+                        e.type = (uint8_t)((new_buttons & mask) ? 1 : 2);
+                        e.x = mx; e.y = my;
+                        e.button = (uint8_t)i;
+                        e.buttons = new_buttons; e.time_us = ts;
+                        RingPush(e);
                     }
                 }
             }
             prev_buttons = new_buttons;
+        }
+    }
+
+    // Flush the per-tick coalesced motion and wheel deltas.
+    if (pending_motion_dirty || pending_wheel_dz) {
+        uint64_t ts = TimeManager::NowUTC().us;
+        if (pending_motion_dirty) {
+            Event e{};
+            e.type = 0; e.x = mx; e.y = my;
+            e.dx = pending_motion_dx; e.dy = pending_motion_dy;
+            e.buttons = buttons; e.time_us = ts;
+            RingPush(e);
+            pending_motion_dx = pending_motion_dy = 0;
+            pending_motion_dirty = false;
+        }
+        if (pending_wheel_dz) {
+            Event e{};
+            e.type = 3; e.x = mx; e.y = my; e.dz = pending_wheel_dz;
+            e.buttons = buttons; e.time_us = ts;
+            RingPush(e);
+            pending_wheel_dz = 0;
         }
     }
 }
@@ -1473,8 +1604,19 @@ bool Mouse::RightClicked() { bool r = right_clicked; right_clicked = false; retu
 bool Mouse::IsLeftDown() { return left_down; }
 bool Mouse::IsOperational() { return ps2_poll_enabled || vbox_vmmdev_available || vmware_available; }
 void Mouse::ForceRedraw() { if(auto_draw) DrawAt(mx, my); }
-bool Mouse::HasEvent() { return ev_tail != ev_head; }
-Mouse::Event Mouse::GetEvent() { Event e = events[ev_tail]; ev_tail = (uint16_t)((ev_tail + 1) & 255); return e; }
+bool Mouse::HasEvent() {
+    uint16_t h = __atomic_load_n(&ev_head, __ATOMIC_ACQUIRE);
+    uint16_t t = __atomic_load_n(&ev_tail, __ATOMIC_RELAXED);
+    return h != t;
+}
+Mouse::Event Mouse::GetEvent() {
+    uint16_t h = __atomic_load_n(&ev_head, __ATOMIC_ACQUIRE);
+    uint16_t t = __atomic_load_n(&ev_tail, __ATOMIC_RELAXED);
+    if (h == t) { Event empty{}; return empty; }
+    Event e = events[t & 255];
+    __atomic_store_n(&ev_tail, (uint16_t)((t + 1) & 255), __ATOMIC_RELEASE);
+    return e;
+}
 void Mouse::Show() { if (!cursor_visible) { cursor_visible = true; if(auto_draw) DrawAt(mx, my); } }
 void Mouse::Hide() { if (cursor_visible) { cursor_visible = false; if(auto_draw) ClearAt(mx, my); } }
 void Mouse::SetSpeed(uint16_t mul) { speed_mul = mul ? mul : 1; }

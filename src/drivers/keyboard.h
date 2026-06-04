@@ -49,6 +49,11 @@ struct KeyboardState {
     uint8_t key_bitmap[32]; // 256 bits for key states
 };
 
+enum class ScancodeSet : uint8_t {
+    SET1 = 1,
+    SET2 = 2,
+};
+
 class Keyboard {
 public:
     static void Init();

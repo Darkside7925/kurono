@@ -48,6 +48,9 @@ public:
     static void* AllocBytes(size_t bytes);
     static void  FreeBytes(void* addr, size_t bytes);
 
+    // free a contiguous range of frames previously obtained via AllocContiguous.
+    static void  FreeContiguous(uint64_t phys_addr, uint64_t count);
+
     // statistics
     static uint64_t GetTotalFrames()  { return total_frames; }
     static uint64_t GetUsedFrames()   { return used_frames; }

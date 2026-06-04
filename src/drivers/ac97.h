@@ -135,6 +135,14 @@ public:
     // tick  -  refill buffers
     static void Tick();
 
+    // streaming-mode helpers used by audio_backend_ac97.cpp.  The mixer
+    // pushes one period at a time via WriteRingChunk(); EnsureStreaming
+    // boots the DMA ring with silence on first call and never restarts it.
+    static bool     EnsureStreaming(int sample_rate, int bits, int channels);
+    static uint32_t WriteRingChunk(const void* data, uint32_t bytes);
+    static uint32_t RingQueuedBytes();
+    static uint32_t RingChunkBytes();
+
 private:
     static AC97Info info;
     static bool     muted;

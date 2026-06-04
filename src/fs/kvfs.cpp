@@ -2,8 +2,6 @@
 #include "../drivers/serial.h"
 #include "../kernel/time.h"
 
-//  kvfs implementation  -  full hierarchical virtual file system
-
 KVFSNode* KVFS::root = nullptr;
 KVFSNode* KVFS::cwd = nullptr;
 char KVFS::cwd_path[KVFS_MAX_PATH] = "/home/user";
@@ -31,16 +29,6 @@ static bool kstreq(const char* a, const char* b) {
     return *a == 0 && *b == 0;
 }
 
-static bool kstrstart(const char* str, const char* prefix) {
-    while (*prefix) { if (*str != *prefix) return false; str++; prefix++; }
-    return true;
-}
-
-static int kstrchr(const char* s, char c) {
-    for (int i = 0; s[i]; i++) if (s[i] == c) return i;
-    return -1;
-}
-
 static void kmemcpy(void* dst, const void* src, uint32_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
@@ -50,6 +38,42 @@ static void kmemcpy(void* dst, const void* src, uint32_t n) {
 static void kmemset(void* dst, uint8_t v, uint32_t n) {
     uint8_t* d = (uint8_t*)dst;
     for (uint32_t i = 0; i < n; i++) d[i] = v;
+}
+
+// small recently-resolved-path cache so repeated Open of the same path
+// doesn't re-walk the tree
+struct PathCacheEntry { char path[KVFS_MAX_PATH]; KVFSNode* node; uint32_t lru; bool valid; };
+static const int PATH_CACHE_N = 16;
+static PathCacheEntry path_cache[PATH_CACHE_N];
+static uint32_t path_cache_clock = 0;
+
+static KVFSNode* PathCacheGet(const char* p) {
+    for (int i = 0; i < PATH_CACHE_N; i++) {
+        if (path_cache[i].valid && kstreq(path_cache[i].path, p)) {
+            path_cache[i].lru = ++path_cache_clock;
+            return path_cache[i].node;
+        }
+    }
+    return nullptr;
+}
+
+static void PathCachePut(const char* p, KVFSNode* n) {
+    if (!n) return;
+    int victim = 0;
+    uint32_t worst = 0xFFFFFFFFu;
+    for (int i = 0; i < PATH_CACHE_N; i++) {
+        if (!path_cache[i].valid) { victim = i; break; }
+        if (path_cache[i].lru < worst) { victim = i; worst = path_cache[i].lru; }
+    }
+    kstrcpy(path_cache[victim].path, p, KVFS_MAX_PATH);
+    path_cache[victim].node = n;
+    path_cache[victim].valid = true;
+    path_cache[victim].lru = ++path_cache_clock;
+}
+
+static void PathCacheInvalidate() {
+    for (int i = 0; i < PATH_CACHE_N; i++) path_cache[i].valid = false;
+    path_cache_clock = 0;
 }
 
 KVFSNode* KVFS::AllocNode(const char* name, KVFSNodeType type, uint16_t mode) {
@@ -69,8 +93,7 @@ KVFSNode* KVFS::AllocNode(const char* name, KVFSNodeType type, uint16_t mode) {
     n->dev_read = nullptr;
     n->dev_write = nullptr;
     n->link_target[0] = 0;
-    // timestamps: use monotonic ms / 1000
-    // (can't call timemanager easily, use 0 as boot-relative)
+    for (int i = 0; i < KVFSNode::HASH_SIZE; i++) n->hash_table[i] = -1;
     return n;
 }
 
@@ -82,15 +105,25 @@ void KVFS::FreeNode(KVFSNode* node) {
 
 void KVFS::FreeTree(KVFSNode* node) {
     if (!node) return;
-    for (int i = 0; i < node->child_count; i++)
-        FreeTree(node->children[i]);
-    FreeNode(node);
+    // iterative post-order to avoid kernel stack blowouts on deep trees
+    KVFSNode* stack[256];
+    int sp = 0;
+    stack[sp++] = node;
+    KVFSNode* order[1024];
+    int op = 0;
+    while (sp > 0 && op < 1024) {
+        KVFSNode* n = stack[--sp];
+        order[op++] = n;
+        for (int i = 0; i < n->child_count && sp < 256; i++) {
+            if (n->children[i]) stack[sp++] = n->children[i];
+        }
+    }
+    for (int i = op - 1; i >= 0; i--) FreeNode(order[i]);
 }
 
 void KVFS::NormalizePath(const char* input, char* output, int max_len) {
-    // resolve absolute/relative, handle . and ..
     char temp[KVFS_MAX_PATH];
-    kmemset(temp, 0, KVFS_MAX_PATH);
+    temp[0] = 0;
 
     if (input[0] == '/') {
         kstrcpy(temp, input, KVFS_MAX_PATH);
@@ -99,76 +132,61 @@ void KVFS::NormalizePath(const char* input, char* output, int max_len) {
         if (input[1]) kstrcat(temp, input + 1, KVFS_MAX_PATH);
     } else {
         kstrcpy(temp, cwd_path, KVFS_MAX_PATH);
-        if (temp[kstrlen(temp) - 1] != '/') kstrcat(temp, "/", KVFS_MAX_PATH);
+        int tlen = kstrlen(temp);
+        if (tlen == 0 || temp[tlen - 1] != '/') kstrcat(temp, "/", KVFS_MAX_PATH);
         kstrcat(temp, input, KVFS_MAX_PATH);
     }
 
-    // split by / and resolve . and ..
+    // split by /, resolve . and ..
     char parts[32][KVFS_MAX_NAME];
     int part_count = 0;
 
     int i = 0, j = 0;
-    while (temp[i]) {
-        if (temp[i] == '/') {
+    while (true) {
+        char c = temp[i];
+        if (c == '/' || c == 0) {
             if (j > 0) {
-                parts[part_count][j] = 0;
-                if (kstreq(parts[part_count], ".")) {
-                    // skip
-                } else if (kstreq(parts[part_count], "..")) {
-                    if (part_count > 0) part_count--;
-                } else {
-                    part_count++;
+                if (part_count < 32) {
+                    parts[part_count][j] = 0;
+                    if (kstreq(parts[part_count], ".")) {
+                        // skip
+                    } else if (kstreq(parts[part_count], "..")) {
+                        if (part_count > 0) part_count--;
+                    } else {
+                        part_count++;
+                    }
                 }
                 j = 0;
             }
-            i++;
+            if (c == 0) break;
         } else {
-            if (part_count < 32 && j < KVFS_MAX_NAME - 1)
-                parts[part_count][j++] = temp[i];
-            i++;
+            if (j < KVFS_MAX_NAME - 1 && part_count < 32) parts[part_count][j++] = c;
         }
-    }
-    if (j > 0) {
-        parts[part_count][j] = 0;
-        if (kstreq(parts[part_count], "..")) {
-            if (part_count > 0) part_count--;
-        } else if (!kstreq(parts[part_count], ".")) {
-            part_count++;
-        }
+        i++;
     }
 
     // reconstruct
-    output[0] = '/';
-    output[1] = 0;
-    for (int k = 0; k < part_count; k++) {
-        if (k > 0) kstrcat(output, "/", max_len);
-        else output[0] = 0;  // remove leading /
-        if (k == 0) {
-            output[0] = '/';
-            output[1] = 0;
-        }
-        kstrcat(output, parts[k], max_len);
-        if (k < part_count - 1) {
-            // nothing
-        }
-    }
-    // fix: ensure starts with /
-    if (output[0] != '/') {
-        char t2[KVFS_MAX_PATH];
-        t2[0] = '/';
-        kstrcpy(t2 + 1, output, KVFS_MAX_PATH - 1);
-        kstrcpy(output, t2, max_len);
-    }
+    int op = 0;
     if (part_count == 0) {
-        output[0] = '/';
-        output[1] = 0;
+        if (max_len > 1) { output[0] = '/'; output[1] = 0; }
+        else if (max_len > 0) output[0] = 0;
+        return;
     }
+    for (int k = 0; k < part_count; k++) {
+        if (op < max_len - 1) output[op++] = '/';
+        for (int x = 0; parts[k][x] && op < max_len - 1; x++) output[op++] = parts[k][x];
+    }
+    output[op] = 0;
 }
 
 KVFSNode* KVFS::Resolve(const char* path) {
     char norm[KVFS_MAX_PATH];
     NormalizePath(path, norm, KVFS_MAX_PATH);
-    return ResolvePath(norm, nullptr);
+    KVFSNode* cached = PathCacheGet(norm);
+    if (cached) return cached;
+    KVFSNode* n = ResolvePath(norm, nullptr);
+    if (n) PathCachePut(norm, n);
+    return n;
 }
 
 KVFSNode* KVFS::ResolvePath(const char* path, KVFSNode* from) {
@@ -201,11 +219,38 @@ KVFSNode* KVFS::ResolvePath(const char* path, KVFSNode* from) {
                 } else {
                     KVFSNode* child = cur->find_child(component);
                     if (!child) return nullptr;
-                    // follow symlinks
-                    if (child->type == KVFS_SYMLINK) {
-                        child = Resolve(child->link_target);
-                        if (!child) return nullptr;
+                    // iterative symlink follow with hop budget
+                    int hops = 0;
+                    while (child && child->type == KVFS_SYMLINK && hops < 16) {
+                        char ntmp[KVFS_MAX_PATH];
+                        NormalizePath(child->link_target, ntmp, KVFS_MAX_PATH);
+                        // direct walk (don't re-enter Resolve which would re-cache wrong)
+                        KVFSNode* tgt = root;
+                        int ii = 1;
+                        char comp2[KVFS_MAX_NAME];
+                        int cci = 0;
+                        bool fail = false;
+                        if (ntmp[0] != '/' || ntmp[1] == 0) { tgt = ntmp[0] == '/' ? root : nullptr; }
+                        while (tgt && ntmp[ii]) {
+                            if (ntmp[ii] == '/' || ntmp[ii + 1] == 0) {
+                                if (ntmp[ii] != '/') { if (cci < KVFS_MAX_NAME - 1) comp2[cci++] = ntmp[ii]; ii++; }
+                                if (cci > 0) {
+                                    comp2[cci] = 0;
+                                    tgt = tgt->find_child(comp2);
+                                    cci = 0;
+                                    if (!tgt) { fail = true; break; }
+                                }
+                                if (ntmp[ii] == '/') ii++;
+                            } else {
+                                if (cci < KVFS_MAX_NAME - 1) comp2[cci++] = ntmp[ii];
+                                ii++;
+                            }
+                        }
+                        if (fail) return nullptr;
+                        child = tgt;
+                        hops++;
                     }
+                    if (!child) return nullptr;
                     cur = child;
                 }
                 ci = 0;
@@ -225,12 +270,10 @@ int KVFS::Mkdir(const char* path, uint16_t mode) {
     char norm[KVFS_MAX_PATH];
     NormalizePath(path, norm, KVFS_MAX_PATH);
 
-    // find parent
     char parent_path[KVFS_MAX_PATH];
     char name[KVFS_MAX_NAME];
     int len = kstrlen(norm);
 
-    // split last component
     int last_slash = -1;
     for (int i = len - 1; i >= 0; i--) {
         if (norm[i] == '/') { last_slash = i; break; }
@@ -240,7 +283,7 @@ int KVFS::Mkdir(const char* path, uint16_t mode) {
     if (last_slash == 0) {
         parent_path[0] = '/'; parent_path[1] = 0;
     } else {
-        kstrcpy(parent_path, norm, last_slash + 1);
+        for (int i = 0; i < last_slash && i < KVFS_MAX_PATH - 1; i++) parent_path[i] = norm[i];
         parent_path[last_slash] = 0;
     }
     kstrcpy(name, norm + last_slash + 1, KVFS_MAX_NAME);
@@ -254,6 +297,7 @@ int KVFS::Mkdir(const char* path, uint16_t mode) {
     KVFSNode* dir = AllocNode(name, KVFS_DIR, mode);
     if (!dir) return KVFS_ERR_NO_MEM;
     if (!parent->add_child(dir)) { FreeNode(dir); return KVFS_ERR_FULL; }
+    PathCacheInvalidate();
     return KVFS_OK;
 }
 
@@ -262,7 +306,7 @@ int KVFS::Mkdirs(const char* path, uint16_t mode) {
     NormalizePath(path, norm, KVFS_MAX_PATH);
 
     KVFSNode* cur = root;
-    int i = 1;  // skip leading /
+    int i = 1;
     char component[KVFS_MAX_NAME];
     int ci = 0;
 
@@ -287,6 +331,7 @@ int KVFS::Mkdirs(const char* path, uint16_t mode) {
             i++;
         }
     }
+    PathCacheInvalidate();
     return KVFS_OK;
 }
 
@@ -295,9 +340,11 @@ int KVFS::Rmdir(const char* path) {
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (!node->is_dir()) return KVFS_ERR_NOT_DIR;
     if (node->child_count > 0) return KVFS_ERR_NOT_EMPTY;
-    if (!node->parent) return KVFS_ERR_PERM;  // can't remove root
-    node->parent->remove_child(node->name);
+    if (!node->parent) return KVFS_ERR_PERM;
+    KVFSNode* p = node->parent;
+    p->remove_child(node->name);
     FreeNode(node);
+    PathCacheInvalidate();
     return KVFS_OK;
 }
 
@@ -327,7 +374,7 @@ int KVFS::CreateFile(const char* path, uint16_t mode) {
     if (last_slash == 0) {
         parent_path[0] = '/'; parent_path[1] = 0;
     } else {
-        kstrcpy(parent_path, norm, KVFS_MAX_PATH);
+        for (int i = 0; i < last_slash && i < KVFS_MAX_PATH - 1; i++) parent_path[i] = norm[i];
         parent_path[last_slash] = 0;
     }
     kstrcpy(name, norm + last_slash + 1, KVFS_MAX_NAME);
@@ -335,7 +382,6 @@ int KVFS::CreateFile(const char* path, uint16_t mode) {
 
     KVFSNode* parent = ResolvePath(parent_path);
     if (!parent) {
-        // auto-create parents
         Mkdirs(parent_path);
         parent = ResolvePath(parent_path);
         if (!parent) return KVFS_ERR_NOT_FOUND;
@@ -345,12 +391,13 @@ int KVFS::CreateFile(const char* path, uint16_t mode) {
     KVFSNode* existing = parent->find_child(name);
     if (existing) {
         if (existing->is_dir()) return KVFS_ERR_IS_DIR;
-        return KVFS_OK;  // file already exists
+        return KVFS_OK;
     }
 
     KVFSNode* f = AllocNode(name, KVFS_FILE, mode);
     if (!f) return KVFS_ERR_NO_MEM;
     if (!parent->add_child(f)) { FreeNode(f); return KVFS_ERR_FULL; }
+    PathCacheInvalidate();
     return KVFS_OK;
 }
 
@@ -364,35 +411,30 @@ int KVFS::WriteFile(const char* path, const void* data, uint32_t len) {
     }
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
 
-    // allocate/reallocate content buffer
     if (!node->content || node->content_capacity < len) {
         uint32_t new_cap = (len + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
         if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
         uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
-        if (node->content) {
-            // don't copy old data since we're overwriting
-            KernelHeap::Free(node->content);
-        }
+        if (node->content) KernelHeap::Free(node->content);
         node->content = new_buf;
         node->content_capacity = new_cap;
     }
 
-    kmemcpy(node->content, data, len);
+    if (len > 0 && data) kmemcpy(node->content, data, len);
     node->size = len;
     return KVFS_OK;
 }
 
 int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
     KVFSNode* node = Resolve(path);
-    if (!node) {
-        return WriteFile(path, data, len);
-    }
+    if (!node) return WriteFile(path, data, len);
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
 
     uint32_t new_size = node->size + len;
     if (!node->content || node->content_capacity < new_size) {
         uint32_t new_cap = (new_size + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
+        if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
         uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
         if (node->content) {
@@ -403,7 +445,7 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
         node->content_capacity = new_cap;
     }
 
-    kmemcpy(node->content + node->size, data, len);
+    if (len > 0 && data) kmemcpy(node->content + node->size, data, len);
     node->size = new_size;
     return KVFS_OK;
 }
@@ -413,7 +455,7 @@ int KVFS::ReadFile(const char* path, void* buf, uint32_t max_len) {
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
     uint32_t to_read = node->size < max_len ? node->size : max_len;
-    if (node->content && to_read > 0)
+    if (node->content && to_read > 0 && buf)
         kmemcpy(buf, node->content, to_read);
     return (int)to_read;
 }
@@ -423,15 +465,24 @@ int KVFS::Unlink(const char* path) {
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
     if (!node->parent) return KVFS_ERR_PERM;
-    node->parent->remove_child(node->name);
+    // close any fds that reference this node to prevent UAF
+    for (int i = 0; i < KVFS_MAX_FDS; i++) {
+        if (fds[i].open && fds[i].node == node) {
+            fds[i].open = false;
+            fds[i].node = nullptr;
+        }
+    }
+    KVFSNode* p = node->parent;
+    p->remove_child(node->name);
     FreeNode(node);
+    PathCacheInvalidate();
     return KVFS_OK;
 }
 
 int KVFS::Open(const char* path, uint8_t flags) {
     KVFSNode* node = Resolve(path);
     if (!node) {
-        if (flags & 2) {  // write mode → create
+        if (flags & 2) {
             int r = CreateFile(path);
             if (r != KVFS_OK) return r;
             node = Resolve(path);
@@ -440,11 +491,11 @@ int KVFS::Open(const char* path, uint8_t flags) {
             return KVFS_ERR_NOT_FOUND;
         }
     }
-    // find free fd
-    for (int i = 3; i < KVFS_MAX_FDS; i++) {  // skip 0,1,2 (stdin/stdout/stderr)
+    if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    for (int i = 3; i < KVFS_MAX_FDS; i++) {
         if (!fds[i].open) {
             fds[i].node = node;
-            fds[i].offset = (flags & 4) ? node->size : 0;  // append
+            fds[i].offset = (flags & 4) ? node->size : 0;
             fds[i].flags = flags;
             fds[i].open = true;
             return i;
@@ -456,13 +507,18 @@ int KVFS::Open(const char* path, uint8_t flags) {
 int KVFS::Read(int fd, void* buf, uint32_t len) {
     if (fd < 0 || fd >= KVFS_MAX_FDS || !fds[fd].open) return KVFS_ERR_INVALID;
     KVFSNode* node = fds[fd].node;
-    if (!node || !node->content) return 0;
+    if (!node) return KVFS_ERR_INVALID;
 
-    if (node->dev_read) return node->dev_read(node, fds[fd].offset, len, (uint8_t*)buf);
+    if (node->dev_read) {
+        int r = node->dev_read(node, fds[fd].offset, len, (uint8_t*)buf);
+        if (r > 0) fds[fd].offset += (uint32_t)r;
+        return r;
+    }
+    if (!node->content) return 0;
 
     uint32_t avail = node->size > fds[fd].offset ? node->size - fds[fd].offset : 0;
     uint32_t to_read = len < avail ? len : avail;
-    if (to_read > 0) kmemcpy(buf, node->content + fds[fd].offset, to_read);
+    if (to_read > 0 && buf) kmemcpy(buf, node->content + fds[fd].offset, to_read);
     fds[fd].offset += to_read;
     return (int)to_read;
 }
@@ -473,21 +529,28 @@ int KVFS::Write(int fd, const void* buf, uint32_t len) {
     KVFSNode* node = fds[fd].node;
     if (!node) return KVFS_ERR_INVALID;
 
-    if (node->dev_write) return node->dev_write(node, fds[fd].offset, len, (const uint8_t*)buf);
+    if (node->dev_write) {
+        int r = node->dev_write(node, fds[fd].offset, len, (const uint8_t*)buf);
+        if (r > 0) fds[fd].offset += (uint32_t)r;
+        return r;
+    }
 
     uint32_t write_end = fds[fd].offset + len;
     if (!node->content || node->content_capacity < write_end) {
         uint32_t new_cap = (write_end + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
+        if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
         uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
         if (node->content) {
             kmemcpy(new_buf, node->content, node->size);
             KernelHeap::Free(node->content);
+        } else {
+            kmemset(new_buf, 0, new_cap);
         }
         node->content = new_buf;
         node->content_capacity = new_cap;
     }
-    kmemcpy(node->content + fds[fd].offset, buf, len);
+    if (len > 0 && buf) kmemcpy(node->content + fds[fd].offset, buf, len);
     fds[fd].offset += len;
     if (fds[fd].offset > node->size) node->size = fds[fd].offset;
     return (int)len;
@@ -547,7 +610,7 @@ int KVFS::Chown(const char* path, uint16_t uid, uint16_t gid) {
 int KVFS::Stat(const char* path, KVFSNode** out) {
     KVFSNode* n = Resolve(path);
     if (!n) return KVFS_ERR_NOT_FOUND;
-    *out = n;
+    if (out) *out = n;
     return KVFS_OK;
 }
 
@@ -565,36 +628,39 @@ const char* KVFS::GetCwd() { return cwd_path; }
 KVFSNode* KVFS::GetCwdNode() { return cwd; }
 
 bool KVFS::PatternMatch(const char* pattern, const char* str) {
-    // simple wildcard: * = any, ? = single char
-    while (*pattern) {
-        if (*pattern == '*') {
-            pattern++;
-            if (!*pattern) return true;
-            while (*str) {
-                if (PatternMatch(pattern, str)) return true;
-                str++;
-            }
-            return false;
-        } else if (*pattern == '?') {
-            if (!*str) return false;
-            pattern++; str++;
-        } else {
-            if (*str != *pattern) return false;
-            pattern++; str++;
-        }
+    // iterative wildcard match (no recursion): backtracks on '*' star
+    const char* p = pattern;
+    const char* s = str;
+    const char* star_p = nullptr;
+    const char* star_s = nullptr;
+    while (*s) {
+        if (*p == '?') { p++; s++; }
+        else if (*p == '*') { star_p = ++p; star_s = s; }
+        else if (*p == *s) { p++; s++; }
+        else if (star_p) { p = star_p; s = ++star_s; }
+        else return false;
     }
-    return *str == 0;
+    while (*p == '*') p++;
+    return *p == 0;
 }
 
 void KVFS::FindRecursive(KVFSNode* node, const char* pattern,
                           KVFSNode** results, int max_results, int& count) {
     if (!node || count >= max_results) return;
-    for (int i = 0; i < node->child_count; i++) {
-        KVFSNode* c = node->children[i];
-        if (PatternMatch(pattern, c->name)) {
-            if (count < max_results) results[count++] = c;
+    // iterative BFS to avoid blowing the kernel stack on deep trees
+    KVFSNode* stack[256];
+    int sp = 0;
+    stack[sp++] = node;
+    while (sp > 0 && count < max_results) {
+        KVFSNode* n = stack[--sp];
+        for (int i = 0; i < n->child_count; i++) {
+            KVFSNode* c = n->children[i];
+            if (!c) continue;
+            if (PatternMatch(pattern, c->name)) {
+                if (count < max_results) results[count++] = c;
+            }
+            if (c->is_dir() && sp < 256) stack[sp++] = c;
         }
-        if (c->is_dir()) FindRecursive(c, pattern, results, max_results, count);
     }
 }
 
@@ -608,21 +674,18 @@ int KVFS::Find(const char* path, const char* pattern, KVFSNode** results, int ma
 
 int KVFS::Grep(const char* path, const char* pattern, char* output, int max_output) {
     KVFSNode* node = Resolve(path);
-    if (!node || !node->content) return 0;
+    if (!node || !node->content) { if (output && max_output > 0) output[0] = 0; return 0; }
 
     int plen = kstrlen(pattern);
     int out_pos = 0;
     int line_num = 1;
 
-    // scan through content line by line
     const char* content = (const char*)node->content;
     int clen = (int)node->size;
     int line_start = 0;
 
     for (int i = 0; i <= clen; i++) {
         if (i == clen || content[i] == '\n') {
-            // check if pattern appears in this line
-            int line_len = i - line_start;
             bool found = false;
             for (int j = line_start; j <= i - plen; j++) {
                 bool match = true;
@@ -632,8 +695,6 @@ int KVFS::Grep(const char* path, const char* pattern, char* output, int max_outp
                 if (match) { found = true; break; }
             }
             if (found && out_pos < max_output - 64) {
-                // format: "line_num: line_content\n"
-                // number
                 char num[12];
                 int nd = 0;
                 int ln = line_num;
@@ -656,16 +717,29 @@ int KVFS::Grep(const char* path, const char* pattern, char* output, int max_outp
             line_start = i + 1;
         }
     }
-    output[out_pos] = 0;
+    if (out_pos < max_output) output[out_pos] = 0;
+    else if (max_output > 0) output[max_output - 1] = 0;
     return out_pos;
 }
 
 int KVFS::RmTree(const char* path) {
     KVFSNode* node = Resolve(path);
     if (!node) return KVFS_ERR_NOT_FOUND;
-    if (!node->parent) return KVFS_ERR_PERM;  // can't remove root
-    node->parent->remove_child(node->name);
+    if (!node->parent) return KVFS_ERR_PERM;
+    // close any fds that reference nodes in this subtree
+    for (int i = 0; i < KVFS_MAX_FDS; i++) {
+        if (fds[i].open) {
+            KVFSNode* n = fds[i].node;
+            while (n) {
+                if (n == node) { fds[i].open = false; fds[i].node = nullptr; break; }
+                n = n->parent;
+            }
+        }
+    }
+    KVFSNode* p = node->parent;
+    p->remove_child(node->name);
     FreeTree(node);
+    PathCacheInvalidate();
     return KVFS_OK;
 }
 
@@ -674,14 +748,14 @@ uint32_t KVFS::DiskUsage(const char* path) {
     if (!node) return 0;
     if (node->is_file()) return node->size;
     uint32_t total = 0;
-    for (int i = 0; i < node->child_count; i++) {
-        if (node->children[i]->is_file())
-            total += node->children[i]->size;
-        else if (node->children[i]->is_dir()) {
-            // build path and recurse
-            total += node->children[i]->size;
-            for (int j = 0; j < node->children[i]->child_count; j++)
-                total += node->children[i]->children[j]->size;
+    KVFSNode* stack[256];
+    int sp = 0;
+    stack[sp++] = node;
+    while (sp > 0) {
+        KVFSNode* n = stack[--sp];
+        if (n->is_file()) total += n->size;
+        for (int i = 0; i < n->child_count && sp < 256; i++) {
+            if (n->children[i]) stack[sp++] = n->children[i];
         }
     }
     return total;
@@ -704,8 +778,9 @@ int KVFS::WriteString(const char* path, const char* str) {
 }
 
 int KVFS::ReadString(const char* path, char* buf, int max_len) {
+    if (max_len <= 0 || !buf) return KVFS_ERR_INVALID;
     int r = ReadFile(path, buf, (uint32_t)(max_len - 1));
-    if (r < 0) return r;
+    if (r < 0) { buf[0] = 0; return r; }
     buf[r] = 0;
     return r;
 }
@@ -733,7 +808,6 @@ void KVFS::BuildDefaultTree() {
 
     for (int i = 0; dirs[i]; i++) Mkdirs(dirs[i]);
 
-    // default files
     WriteString("/etc/kurono/os-release",
         "NAME=\"Kurono OS\"\nVERSION=\"1.0.0\"\nID=kurono\nPRETTY_NAME=\"Kurono OS 1.0.0\"\n");
     WriteString("/etc/kurono/hostname", "kurono-machine\n");
@@ -764,19 +838,17 @@ void KVFS::BuildDefaultTree() {
 void KVFS::Init() {
     SerialLogger::Log("KVFS: Initializing...\r\n");
 
-    // clear fd table
     for (int i = 0; i < KVFS_MAX_FDS; i++) {
         fds[i].open = false;
         fds[i].node = nullptr;
     }
+    for (int i = 0; i < PATH_CACHE_N; i++) path_cache[i].valid = false;
 
     root = AllocNode("/", KVFS_DIR, 0755);
     cwd = root;
     kstrcpy(cwd_path, "/", KVFS_MAX_PATH);
 
     BuildDefaultTree();
-
-    // set cwd to /home/user
     SetCwd("/home/user");
 
     SerialLogger::Log("KVFS: Ready.\r\n");

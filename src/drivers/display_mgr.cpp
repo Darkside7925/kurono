@@ -169,6 +169,11 @@ bool DisplayManager::SetMode(int mode_index) {
 
 bool DisplayManager::SetResolution(uint32_t width, uint32_t height, uint8_t bpp) {
     if (!initialized) return false;
+    if (width == 0 || height == 0 || bpp < 15 || bpp > 32) return false;
+
+    // snapshot for rollback on failure
+    FramebufferInfo prev = fb_info;
+    int prev_mode = current_mode;
 
     bool result = false;
     switch (backend) {
@@ -182,34 +187,45 @@ bool DisplayManager::SetResolution(uint32_t width, uint32_t height, uint8_t bpp)
             return false;
     }
 
-    if (result) {
-        fb_info.width = width;
-        fb_info.height = height;
-        fb_info.bpp = bpp;
-        fb_info.pitch = width * (bpp / 8);
-        fb_info.size = fb_info.pitch * height;
-
-        // update current mode index
-        current_mode = -1;
-        for (int i = 0; i < num_modes; i++) {
-            if (modes[i].width == width && modes[i].height == height) {
-                current_mode = i;
-                break;
-            }
-        }
-
-        // reallocate back buffer if double buffering is on
-        if (double_buffered) {
-            // free old back buffer (if we had a free function)
-            int pages = (fb_info.size + 4095) / 4096;
-            back_buffer = KernelHeap::Alloc(pages * 4096);
-        }
-
-        // update graphics subsystem
-        Graphics::ReinitForResolution((uintptr_t)fb_info.address, width, height, fb_info.pitch, bpp);
+    if (!result) {
+        // restore snapshot  -  most backends keep state on a failed call
+        fb_info = prev;
+        current_mode = prev_mode;
+        return false;
     }
 
-    return result;
+    fb_info.width = width;
+    fb_info.height = height;
+    fb_info.bpp = bpp;
+    fb_info.pitch = width * (bpp / 8);
+    fb_info.size = fb_info.pitch * height;
+
+    current_mode = -1;
+    for (int i = 0; i < num_modes; i++) {
+        if (modes[i].width == width && modes[i].height == height) {
+            current_mode = i;
+            break;
+        }
+    }
+
+    // free old back buffer first to prevent leaks across mode changes.
+    // KernelHeap exposes Free in this codebase; if it doesn't, we still
+    // null the pointer so we don't keep a dangling reference.
+    if (double_buffered && back_buffer) {
+        KernelHeap::Free(back_buffer);
+        back_buffer = nullptr;
+    }
+    if (double_buffered) {
+        int pages = (fb_info.size + 4095) / 4096;
+        back_buffer = KernelHeap::Alloc(pages * 4096);
+        if (!back_buffer) {
+            double_buffered = false;
+            fb_info.double_buffered = false;
+        }
+    }
+
+    Graphics::ReinitForResolution((uintptr_t)fb_info.address, width, height, fb_info.pitch, bpp);
+    return true;
 }
 
 bool DisplayManager::SetModeBGA(uint32_t w, uint32_t h, uint8_t bpp) {
@@ -221,19 +237,23 @@ bool DisplayManager::SetModeBGA(uint32_t w, uint32_t h, uint8_t bpp) {
 bool DisplayManager::SetModeVirtIOGPU(uint32_t w, uint32_t h, uint8_t bpp) {
     (void)bpp;
 
-    // destroy old resource, create new one
-    // for simplicity, create a new resource
     int pages = (w * h * 4 + 4095) / 4096;
     void* new_fb = KernelHeap::Alloc(pages * 4096);
     if (!new_fb) return false;
 
     uint32_t res = VirtIOGPU::CreateResource2D(w, h, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM);
-    if (res == 0) return false;
+    if (res == 0) {
+        KernelHeap::Free(new_fb);
+        return false;
+    }
 
     VirtIOGPU::AttachBacking(res, new_fb, w * h * 4);
     VirtIOGPU::SetScanout(0, res, 0, 0, w, h);
 
+    // free the previous framebuffer allocation now that scanout is on the new one
+    void* prev = fb_info.address;
     fb_info.address = new_fb;
+    if (prev && prev != new_fb) KernelHeap::Free(prev);
     return true;
 }
 
@@ -261,11 +281,15 @@ bool DisplayManager::GetSupportedModes(DisplayMode* out, int max_count, int* cou
 
 bool DisplayManager::EnableDoubleBuffering() {
     if (!initialized) return false;
+    if (double_buffered && back_buffer) return true;
+
+    if (back_buffer) { KernelHeap::Free(back_buffer); back_buffer = nullptr; }
 
     int pages = (fb_info.size + 4095) / 4096;
-    back_buffer = KernelHeap::Alloc(pages * 4096);
-    if (!back_buffer) return false;
+    void* buf = KernelHeap::Alloc(pages * 4096);
+    if (!buf) return false;
 
+    back_buffer = buf;
     double_buffered = true;
     fb_info.double_buffered = true;
     return true;
@@ -273,20 +297,42 @@ bool DisplayManager::EnableDoubleBuffering() {
 
 void DisplayManager::SwapBuffers() {
     if (!double_buffered || !back_buffer || !fb_info.address) return;
+    if (fb_info.size == 0) return;
 
-    // use non-temporal stores to bypass cpu cache → directly reach gpu vram.
-    // regular stores to write-combining memory can sit in wc buffers and
-    // never become visible on real hardware (permanent black screen).
     uint8_t* dst = (uint8_t*)fb_info.address;
     const uint8_t* src = (const uint8_t*)back_buffer;
-    uint32_t remaining = fb_info.size;
+    size_t remaining = fb_info.size;
 
-    // align destination to 16 bytes
     while (remaining > 0 && ((uintptr_t)dst & 15)) {
         *dst++ = *src++; remaining--;
     }
 
-    // 128-bit non-temporal stores (sse2  -  guaranteed on x86_64)
+    // 256-byte unrolled NT path keeps the WC combine buffers saturated.
+    while (remaining >= 256) {
+        __asm__ __volatile__(
+            "prefetchnta 256(%0)\n\t"
+            "prefetchnta 320(%0)\n\t"
+            "movdqu    (%0), %%xmm0\n\t  movdqu  16(%0), %%xmm1\n\t"
+            "movdqu  32(%0), %%xmm2\n\t  movdqu  48(%0), %%xmm3\n\t"
+            "movdqu  64(%0), %%xmm4\n\t  movdqu  80(%0), %%xmm5\n\t"
+            "movdqu  96(%0), %%xmm6\n\t  movdqu 112(%0), %%xmm7\n\t"
+            "movntdq %%xmm0,    (%1)\n\t movntdq %%xmm1,  16(%1)\n\t"
+            "movntdq %%xmm2,  32(%1)\n\t movntdq %%xmm3,  48(%1)\n\t"
+            "movntdq %%xmm4,  64(%1)\n\t movntdq %%xmm5,  80(%1)\n\t"
+            "movntdq %%xmm6,  96(%1)\n\t movntdq %%xmm7, 112(%1)\n\t"
+            "movdqu 128(%0), %%xmm0\n\t  movdqu 144(%0), %%xmm1\n\t"
+            "movdqu 160(%0), %%xmm2\n\t  movdqu 176(%0), %%xmm3\n\t"
+            "movdqu 192(%0), %%xmm4\n\t  movdqu 208(%0), %%xmm5\n\t"
+            "movdqu 224(%0), %%xmm6\n\t  movdqu 240(%0), %%xmm7\n\t"
+            "movntdq %%xmm0, 128(%1)\n\t movntdq %%xmm1, 144(%1)\n\t"
+            "movntdq %%xmm2, 160(%1)\n\t movntdq %%xmm3, 176(%1)\n\t"
+            "movntdq %%xmm4, 192(%1)\n\t movntdq %%xmm5, 208(%1)\n\t"
+            "movntdq %%xmm6, 224(%1)\n\t movntdq %%xmm7, 240(%1)\n\t"
+            :: "r"(src), "r"(dst)
+            : "xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","memory"
+        );
+        dst += 256; src += 256; remaining -= 256;
+    }
     while (remaining >= 64) {
         __asm__ __volatile__(
             "movdqu   (%0), %%xmm0;  movdqu 16(%0), %%xmm1;"
@@ -306,12 +352,11 @@ void DisplayManager::SwapBuffers() {
         );
         dst += 16; src += 16; remaining -= 16;
     }
+    while (remaining >= 8) { *(uint64_t*)dst = *(const uint64_t*)src; dst+=8; src+=8; remaining-=8; }
     while (remaining > 0) { *dst++ = *src++; remaining--; }
 
-    // fence: ensure all nt stores are globally visible before returning
     __asm__ __volatile__("sfence" ::: "memory");
 
-    // if using virtio gpu, also flush to host
     if (backend == DISPLAY_BACKEND_VIRTIO_GPU) {
         VirtIOGPU::PresentFramebuffer(fb_info.address, fb_info.width, fb_info.height);
     }
@@ -327,15 +372,22 @@ VSyncMode DisplayManager::GetVSync() { return vsync_mode; }
 void DisplayManager::WaitVSync() {
     if (vsync_mode == VSYNC_OFF) return;
 
-    // for bga/qemu, we can approximate vsync by waiting for vga retrace
-    // vga input status register 1 (port 0x3da)
-    // bit 3: vertical retrace
-    if (backend == DISPLAY_BACKEND_BGA) {
-        // wait for retrace to end
-        while (inb(0x3DA) & 0x08);
-        // wait for retrace to start
-        while (!(inb(0x3DA) & 0x08));
-    }
+    // VGA retrace polling  -  bit 3 of port 0x3da. Unbounded reads can hang
+    // forever on EFI/non-VGA hardware (port reads 0xff or 0x00); time them
+    // out so the present path never wedges the kernel.
+    static bool vsync_dead = false;
+    if (vsync_dead) return;
+    if (backend != DISPLAY_BACKEND_BGA) return;
+
+    uint8_t probe = inb(0x3DA);
+    if (probe == 0xFF || probe == 0x00) { vsync_dead = true; return; }
+
+    volatile int timeout = 200000;
+    while ((inb(0x3DA) & 0x08) && --timeout > 0) {}
+    if (timeout <= 0) { vsync_dead = true; return; }
+    timeout = 200000;
+    while (!(inb(0x3DA) & 0x08) && --timeout > 0) {}
+    if (timeout <= 0) { vsync_dead = true; }
 }
 
 uint32_t DisplayManager::GetRefreshRate() {

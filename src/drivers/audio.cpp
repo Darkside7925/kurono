@@ -666,15 +666,64 @@ void Audio::PlayTone(int frequency, int duration_ms, int volume) {
 
 void Audio::HandleIRQ() {
     if (!available) return;
-    
-    // acknowledge the interrupt
+
+    // 1) Acknowledge the IRQ first so the controller is ready to fire
+    //    again the moment the next buffer completes.  Order matters: a
+    //    late ack causes the next half to be lost on auto-init paths.
     if (current_bits == 8) {
         HAL::InByte(SB16_DSP_STATUS);      // 8-bit irq ack: read port 0x22e
     } else {
         HAL::InByte(SB16_DSP_INT_ACK);     // 16-bit irq ack: read port 0x22f
     }
-    
-    // if more data to play, refill and restart
+
+    // 2) If there's more data, refill + relaunch the DMA so the DAC's
+    //    FIFO is fed before we do any bookkeeping.
+    if (pcm_source && pcm_offset < pcm_length) {
+        FillDMABuffer();
+        StartPlayback();
+    } else if (looping && pcm_source) {
+        pcm_offset = 0;
+        FillDMABuffer();
+        StartPlayback();
+    } else {
+        // Stream finished  -  mark stopped and release the source pointer
+        // so a subsequent Play() / Stop() doesn't see stale state.
+        state = AUDIO_STOPPED;
+        pcm_source = nullptr;
+        pcm_offset = 0;
+        pcm_length = 0;
+    }
+}
+
+//  tick  -  polling-based buffer management
+//  call this periodically from the main loop
+
+void Audio::Tick() {
+    if (!available || state != AUDIO_PLAYING) return;
+
+    // Read DMA remaining-count from the relevant controller.  Bytes (8-bit
+    // DMA) or words (16-bit DMA)  -  semantics here are just "did the DMA
+    // reach the end of the buffer?"  Ack the IRQ regardless to avoid
+    // missing the next half on auto-init engines.
+    uint16_t remaining_count;
+    if (current_bits == 8) {
+        HAL::OutByte(0x0C, 0x00);            // flip-flop reset (DMAC 1)
+        uint8_t lo = HAL::InByte(0x03);
+        uint8_t hi = HAL::InByte(0x03);
+        remaining_count = (uint16_t)lo | ((uint16_t)hi << 8);
+    } else {
+        HAL::OutByte(0xD8, 0x00);            // flip-flop reset (DMAC 2)
+        uint8_t lo = HAL::InByte(0xC6);
+        uint8_t hi = HAL::InByte(0xC6);
+        remaining_count = (uint16_t)lo | ((uint16_t)hi << 8);
+    }
+
+    if (remaining_count > 1) return;        // still draining
+
+    // Ack first so the next buffer's completion interrupt won't be missed.
+    if (current_bits == 8) HAL::InByte(SB16_DSP_STATUS);
+    else                   HAL::InByte(SB16_DSP_INT_ACK);
+
     if (pcm_source && pcm_offset < pcm_length) {
         FillDMABuffer();
         StartPlayback();
@@ -684,77 +733,9 @@ void Audio::HandleIRQ() {
         StartPlayback();
     } else {
         state = AUDIO_STOPPED;
-    }
-}
-
-//  tick  -  polling-based buffer management
-//  call this periodically from the main loop
-
-void Audio::Tick() {
-    if (!available || state != AUDIO_PLAYING) return;
-    
-    // in polling mode without irqs, we need to check if the dma transfer completed.
-    // we do this by reading the dma channel 1 current count register.
-    // when count reaches 0, the transfer is done.
-    
-    if (current_bits == 8) {
-        // clear flip-flop for dma controller 1
-        HAL::OutByte(0x0C, 0x00);
-        io_wait();
-        
-        // read current count for channel 1 (port 0x03)
-        uint8_t lo = HAL::InByte(0x03);
-        io_wait();
-        uint8_t hi = HAL::InByte(0x03);
-        uint16_t remaining_count = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
-        
-        // if count is 0 or very low, transfer is complete
-        if (remaining_count <= 1) {
-            // check if more data to play
-            if (pcm_source && pcm_offset < pcm_length) {
-                // acknowledge any pending interrupt
-                HAL::InByte(SB16_DSP_STATUS);
-                
-                FillDMABuffer();
-                StartPlayback();
-            } else if (looping && pcm_source) {
-                pcm_offset = 0;
-                HAL::InByte(SB16_DSP_STATUS);
-                FillDMABuffer();
-                StartPlayback();
-            } else {
-                // playback finished
-                HAL::InByte(SB16_DSP_STATUS);
-                state = AUDIO_STOPPED;
-                SerialLogger::Log("[AUDIO] Playback complete\n");
-            }
-        }
-    } else {
-        // 16-bit dma channel 5  -  clear flip-flop for controller 2
-        HAL::OutByte(0xD8, 0x00);
-        io_wait();
-        
-        // read current count for channel 5 (port 0xc6)
-        uint8_t lo = HAL::InByte(0xC6);
-        io_wait();
-        uint8_t hi = HAL::InByte(0xC6);
-        uint16_t remaining_count = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
-        
-        if (remaining_count <= 1) {
-            if (pcm_source && pcm_offset < pcm_length) {
-                HAL::InByte(SB16_DSP_INT_ACK);
-                FillDMABuffer();
-                StartPlayback();
-            } else if (looping && pcm_source) {
-                pcm_offset = 0;
-                HAL::InByte(SB16_DSP_INT_ACK);
-                FillDMABuffer();
-                StartPlayback();
-            } else {
-                HAL::InByte(SB16_DSP_INT_ACK);
-                state = AUDIO_STOPPED;
-                SerialLogger::Log("[AUDIO] Playback complete\n");
-            }
-        }
+        pcm_source = nullptr;
+        pcm_offset = 0;
+        pcm_length = 0;
+        SerialLogger::Log("[AUDIO] Playback complete\n");
     }
 }

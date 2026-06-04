@@ -91,6 +91,29 @@ private:
     static int wifi_strength;
     static int volume_pct;
 
+    // animation state  -  all phases are time-driven (Timer::GetRealMs).
+    static uint32_t start_menu_anim_start_ms;  // 0 = idle
+    static bool     start_menu_anim_opening;   // true=opening, false=closing
+    static float    start_menu_phase;          // 0..1 eased
+    static uint32_t volume_popup_anim_start_ms;
+    static bool     volume_popup_anim_opening;
+    static float    volume_popup_phase;
+
+    // per-pinned-icon hover scale (time-eased 0..1).
+    static float    pinned_hover_phase[8];     // sized for tb_pinned cap
+    static int      pinned_hover_target;       // index currently hovered, -1 none
+    static uint32_t pinned_anim_last_ms;
+
+    // cursor blink driven by real time.
+    static uint32_t search_cursor_t0_ms;
+
+public:
+    // Called by DesktopEnvironment each frame with delta_ms since last frame.
+    static void Tick(uint32_t delta_ms, int mx, int my);
+
+private:
+    static void StartMenuSet(bool open);
+    static void VolumePopupSet(bool open);
     static void RenderStartButton();
     static void RenderTaskButtons();
     static void RenderSystemTray();
@@ -163,8 +186,16 @@ private:
     static size_t gradient_cache_bytes; // for pmm freeing
     static bool have_image_wallpaper;  // true if we have a real image
 
+    // Per-icon hover-scale phase (0..1)  -  used by RenderIcon for an
+    // ease-out cubic pop on hover.  Updated by Tick().
+    static float    icon_hover_phase[DESKTOP_MAX_ICONS];
+    static int      icon_hover_target;
+    static uint32_t icon_anim_last_ms;
+    static uint32_t last_render_ms;
+    static int      hovered_icon;       // last frame's hovered icon (for damage)
+
     static void RenderWallpaper();
-    static void RenderIcon(DesktopIcon* icon);
+    static void RenderIcon(DesktopIcon* icon, float hover_t);
     static void RenderContextMenu();
     static int  IconAt(int mx, int my);
     static int  FindIconByPath(const char* path);
@@ -172,6 +203,9 @@ private:
     static void AddOrUpdateDesktopFile(KVFSNode* node);
     static void PlaceIcon(int index);
     static void ClampIcon(int index);
+
+public:
+    static void Tick(uint32_t delta_ms, int mx, int my);
 };
 
 // combined desktop environment

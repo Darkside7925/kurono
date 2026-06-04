@@ -53,40 +53,41 @@ char* strncpy(char* dst, const char* src, size_t n) {
 }
 
 bool DisplayController::vbe_available = false;
-DisplayController::VbeInfo DisplayController::vbe_info;
-DisplayController::DisplayMode DisplayController::modes[64];
+DisplayController::VbeInfo DisplayController::vbe_info = {};
+DisplayController::DisplayMode DisplayController::modes[64] = {};
 int DisplayController::mode_count = 0;
-DisplayController::DisplayMode DisplayController::current_mode;
+DisplayController::DisplayMode DisplayController::current_mode = {};
 bool DisplayController::vsync_enabled = true;
 uint32_t DisplayController::backbuffer_addr = 0;
 
 bool DisplayController::Init() {
     SerialLogger::Log("Display: Initializing Enhanced Display Controller...\r\n");
-    
-    // try to get vbe info
+    vbe_available = false;
+    mode_count = 0;
+
     if (!GetVbeInfo()) {
         SerialLogger::Log("Display: VBE not available, fallback to basic mode\r\n");
-        vbe_available = false;
         return false;
     }
-    
+
     vbe_available = true;
     SerialLogger::Log("Display: VBE ");
     SerialLogger::LogHex(vbe_info.version);
     SerialLogger::Log(" detected, ");
     SerialLogger::LogDec(vbe_info.total_memory * 64);
     SerialLogger::Log("KB VRAM\r\n");
-    
-    // enumerate available modes
+
     if (!EnumerateModes()) {
         SerialLogger::Log("Display: Failed to enumerate modes\r\n");
+        vbe_available = false;
+        mode_count = 0;
         return false;
     }
-    
+
     SerialLogger::Log("Display: Found ");
     SerialLogger::LogDec(mode_count);
     SerialLogger::Log(" display modes\r\n");
-    
+
     return true;
 }
 
@@ -311,23 +312,28 @@ bool DisplayController::SetCustomTiming(const GTF_Timing& timing) {
 
 void DisplayController::WaitVSync() {
     if (!vsync_enabled) return;
-    
-    // wait for vsync using vga register polling
-    // read input status register 1 (0x3da for color, 0x3ba for mono)
-    // important: on modern gpus (efi gop, non-vga) port 0x3da may not exist.
-    // add a safety timeout to prevent infinite loops on real hardware.
-    volatile int timeout;
-    
-    // first check if 0x3da responds at all (not 0xff stuck bus)
+
+    // input status register 1 (0x3da/color). bit 3 = vertical retrace.
+    // Modern EFI/non-VGA GPUs do not wire 0x3da; the port reads 0xff or
+    // 0x00 in those cases. We do a quick probe and bail out  -  falling back
+    // to the caller's frame-pacing yield path is far better than burning
+    // a million cycles in a tight loop on real hardware.
+    static bool vsync_dead = false;
+    if (vsync_dead) return;
+
     uint8_t probe = HAL::InByte(0x3DA);
-    if (probe == 0xFF) return; // no vga controller  -  skip vsync
-    
+    if (probe == 0xFF || probe == 0x00) {
+        vsync_dead = true;
+        return;
+    }
+
+    volatile int timeout = 100000;
+    while ((HAL::InByte(0x3DA) & 0x08) && --timeout > 0);
+    if (timeout <= 0) { vsync_dead = true; return; }
+
     timeout = 100000;
-    while ((HAL::InByte(0x3DA) & 0x08) && --timeout > 0); // wait for end of vsync
-    if (timeout <= 0) return;
-    
-    timeout = 100000;
-    while (!(HAL::InByte(0x3DA) & 0x08) && --timeout > 0); // wait for start of vsync
+    while (!(HAL::InByte(0x3DA) & 0x08) && --timeout > 0);
+    if (timeout <= 0) { vsync_dead = true; return; }
 }
 
 uint32_t DisplayController::GetCurrentScanline() {

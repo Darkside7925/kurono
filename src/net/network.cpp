@@ -362,6 +362,7 @@ int Network::SocketCreate(SocketType type) {
             sockets[i].fd = i;
             sockets[i].type = type;
             sockets[i].state = SOCK_CLOSED;
+            if (next_port < 49152 || next_port >= 65535) next_port = 49152;
             sockets[i].local_port = next_port++;
             sockets[i].rx_len = 0;
             return i;

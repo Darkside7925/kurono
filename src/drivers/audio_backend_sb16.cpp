@@ -1,24 +1,4 @@
 //  kurono os  -  Sound Blaster 16 backend (auto-init DMA, double-buffered)
-//
-//  This is an AudioBackend implementation that talks to the SB16 ISA
-//  device QEMU emulates (and real SB16/SBPro/AWE32 cards too).  Unlike
-//  the legacy Audio:: driver it uses *auto-init* DMA on a single 32 KB
-//  buffer split into two 16 KB halves  -  the mixer keeps the inactive
-//  half full while the DSP plays the active half, then swaps.
-//
-//  Layout:
-//    * DSP base port: configurable (0x220 default).  Probed via
-//      successive DSP resets at 0x220, 0x240, 0x260, 0x280.
-//    * IRQ:           polled from the bus  -  we never enable the IRQ.
-//                     The mixer's Tick() drains via Tick() here.
-//    * DMA channel 1 (8-bit) for sample rates the SB16 calls "low".
-//      For our internal stereo 16-bit @ 48 kHz path we use 16-bit
-//      DMA on channel 5.
-//
-//  This file does NOT replace src/drivers/audio.cpp; the legacy class
-//  still exists for the Audio::Beep() / Audio::Play() callers that
-//  haven't been migrated yet.  Eventually those will all forward to
-//  AudioServer and this backend.
 
 #include "audio_backend.h"
 #include "audio_dma.h"
@@ -28,7 +8,6 @@
 
 namespace {
 
-// ---- ISA port I/O ----
 static inline void out8(uint16_t port, uint8_t v) {
     asm volatile("outb %0, %1" : : "a"(v), "Nd"(port));
 }
@@ -36,7 +15,6 @@ static inline uint8_t in8(uint16_t port) {
     uint8_t v; asm volatile("inb %1, %0" : "=a"(v) : "Nd"(port)); return v;
 }
 
-// ---- SB16 register offsets relative to the base port ----
 constexpr uint16_t kDspReset      = 0x6;
 constexpr uint16_t kDspRead       = 0xA;
 constexpr uint16_t kDspWrite      = 0xC;
@@ -45,17 +23,16 @@ constexpr uint16_t kDspIRQ16Ack   = 0xF;
 constexpr uint16_t kMixerAddr     = 0x4;
 constexpr uint16_t kMixerData     = 0x5;
 
-// DMA controller (16-bit half: ch 5/6/7) -- master DMAC2 ports
 constexpr uint16_t kDma2Mask     = 0xD4;
 constexpr uint16_t kDma2Mode     = 0xD6;
 constexpr uint16_t kDma2Clear    = 0xD8;
-constexpr uint16_t kDma2Addr5    = 0xC4;   // ch5 base address (word port)
-constexpr uint16_t kDma2Count5   = 0xC6;   // ch5 word count
-constexpr uint16_t kDma2Page5    = 0x8B;   // ch5 page register
+constexpr uint16_t kDma2Addr5    = 0xC4;
+constexpr uint16_t kDma2Count5   = 0xC6;
+constexpr uint16_t kDma2Page5    = 0x8B;
 
 constexpr uint16_t kProbePorts[] = {0x220, 0x240, 0x260, 0x280};
-constexpr uint8_t  kIrqLine      = 5;       // QEMU default
-constexpr uint8_t  kDmaCh16      = 5;       // QEMU default 16-bit channel
+constexpr uint8_t  kIrqLine      = 5;
+constexpr uint8_t  kDmaCh16      = 5;
 
 class SB16Backend final : public AudioBackend {
 public:
@@ -64,7 +41,6 @@ public:
     const char* Name() const override { return "sb16"; }
 
     bool Init() override {
-        // Probe each candidate base port by attempting a DSP reset.
         for (uint16_t base : kProbePorts) {
             if (ResetDSP(base)) {
                 base_port_ = base;
@@ -76,7 +52,6 @@ public:
             return false;
         }
 
-        // Read DSP version.  SB16 returns 4.xx; SB Pro 3.xx; SB 2.0 2.xx.
         WriteDSP(0xE1);
         uint8_t maj = ReadDSP();
         uint8_t min = ReadDSP();
@@ -94,27 +69,27 @@ public:
             return false;
         }
 
-        // Acquire DMA buffer.  Two 16 KB halves.
         void* p = AudioDMA::Acquire(AudioDMA::REGION_SB16_PRIMARY, "sb16-backend");
         if (!p) return false;
         dma_buf_phys_ = (uint32_t)(uintptr_t)p;
         dma_buf_      = (uint8_t*)p;
+        // 32 KB buffer at the start of a 128 KB DMA-16 page  -  verify.
+        if (!AudioDMA::SplitForDMA16(dma_buf_phys_, kBufBytes).valid) {
+            SerialLogger::Log("[SB16] DMA buffer crosses 128KB page; refusing\r\n");
+            return false;
+        }
         for (int i = 0; i < kBufBytes; i++) dma_buf_[i] = 0;
 
-        // Program mixer: IRQ select (reg 0x80), DMA select (reg 0x81),
-        // master + voice volumes.
         MixerWrite(0x80, 1 << ((kIrqLine == 2) ? 0 :
                               (kIrqLine == 5) ? 1 :
                               (kIrqLine == 7) ? 2 : 3));
-        MixerWrite(0x81, 1 << kDmaCh16);             // 16-bit DMA channel
-        MixerWrite(0x22, 0xFF);                      // master L/R = max
-        MixerWrite(0x32, 0xFF);                      // SB16 master L
-        MixerWrite(0x33, 0xFF);                      // SB16 master R
-        MixerWrite(0x30, 0xFF);                      // voice L
-        MixerWrite(0x31, 0xFF);                      // voice R
+        MixerWrite(0x81, 1 << kDmaCh16);
+        MixerWrite(0x22, 0xFF);
+        MixerWrite(0x32, 0xFF);
+        MixerWrite(0x33, 0xFF);
+        MixerWrite(0x30, 0xFF);
+        MixerWrite(0x31, 0xFF);
 
-        // Set sample rate (DSP 4.x command 0x41/0x42 take a big-endian
-        // 16-bit rate following the command).
         WriteDSP(0x41);
         WriteDSP((uint8_t)(AudioMixer::INTERNAL_RATE >> 8));
         WriteDSP((uint8_t)(AudioMixer::INTERNAL_RATE & 0xFF));
@@ -122,21 +97,22 @@ public:
         WriteDSP((uint8_t)(AudioMixer::INTERNAL_RATE >> 8));
         WriteDSP((uint8_t)(AudioMixer::INTERNAL_RATE & 0xFF));
 
-        // Program 16-bit DMA channel 5 for the full 32 KB auto-init buffer.
         ProgramDMA16(dma_buf_phys_, kBufBytes, /*auto_init=*/true);
 
-        // Issue 16-bit auto-init programmed-transfer command.
-        // 0xB6 = 16-bit, signed, A/I, output, FIFO on
-        // mode byte: stereo (0x20) + signed (0x10)
-        // count = (samples / channel) - 1 measured in *samples* (16-bit)
-        uint16_t samples = (kBufBytes / 2) - 1;       // 16-bit sample count
+        // 0xB6 = 16-bit programmed I/O, A/I, FIFO, DAC.
+        // mode byte: bit 5 stereo | bit 4 signed = 0x30
+        // 16-bit DSP sample count = (bytes / 2) / channels - 1 = frames - 1
+        uint16_t frames = (kBufBytes / 4) - 1;
         WriteDSP(0xB6);
-        WriteDSP(0x30);                               // stereo signed
-        WriteDSP((uint8_t)(samples & 0xFF));
-        WriteDSP((uint8_t)(samples >> 8));
+        WriteDSP(0x30);
+        WriteDSP((uint8_t)(frames & 0xFF));
+        WriteDSP((uint8_t)(frames >> 8));
 
         playing_ = true;
         active_half_ = 0;
+        // Both halves contain silence; DSP starts playing half 0, so the
+        // first Submit() should fill half 1.  Subsequent Submit()s alternate.
+        next_fill_half_ = 1;
         ready_ = true;
         return true;
     }
@@ -145,29 +121,28 @@ public:
 
     uint32_t Submit(const int16_t* pcm, uint32_t frames) override {
         if (!ready_ || !pcm) return 0;
-        // We store stereo 16-bit, so frames count = samples / 2.
-        // Each half holds 4096 frames (8192 samples = 16 KB).
-        constexpr uint32_t kFramesPerHalf = (kBufBytes / 2) / 2;  // 4096
+        constexpr uint32_t kFramesPerHalf = (kBufBytes / 2) / 4;  // 4096
+        constexpr uint32_t kBytesPerHalf  = kBufBytes / 2;        // 16384
 
-        // Wait for the inactive half to actually be inactive  -  i.e. for
-        // the DSP's current position to be in the *other* half.  We
-        // poll the DMA controller's current count register to figure
-        // out which half is being played.
-        // Inactive half is the one *not* being played; we fill it.
-        if (frames > kFramesPerHalf) frames = kFramesPerHalf;
-
-        // Wait for the swap.  Each call to Submit fills exactly one half.
-        WaitForSwap();
-
-        uint8_t* dst = dma_buf_ + (next_fill_half_ * (kBufBytes / 2));
+        // Accumulate periods into the staging buffer for the half we'll
+        // fill next.  When the half is full, wait for the DSP to swap
+        // away from it and DMA-copy it into the SB16 buffer.
         const uint8_t* src = (const uint8_t*)pcm;
-        const uint32_t bytes = frames * 4;            // stereo s16
-        for (uint32_t i = 0; i < bytes; i++) dst[i] = src[i];
-        // zero-pad the rest of the half if we got fewer than expected
-        for (uint32_t i = bytes; i < (kBufBytes / 2); i++) dst[i] = 0;
+        uint32_t bytes_in  = frames * 4;
+        uint32_t bytes_done = 0;
+        while (bytes_done < bytes_in) {
+            uint32_t space = kBytesPerHalf - stage_fill_;
+            uint32_t to_copy = (bytes_in - bytes_done) < space
+                                  ? (bytes_in - bytes_done) : space;
+            for (uint32_t i = 0; i < to_copy; i++)
+                stage_[stage_fill_ + i] = src[bytes_done + i];
+            stage_fill_ += to_copy;
+            bytes_done  += to_copy;
+            if (stage_fill_ == kBytesPerHalf) FlushHalf();
+        }
 
-        next_fill_half_ ^= 1;
-        queued_frames_ += frames;
+        // Update queue estimate from real DMA progress.
+        UpdateQueueEstimate();
         return frames;
     }
 
@@ -176,16 +151,21 @@ public:
 
     void Stop() override {
         if (!ready_) return;
-        WriteDSP(0xD9);              // exit 16-bit auto-init
-        WriteDSP(0xD5);              // pause output
+        WriteDSP(0xD9);
+        WriteDSP(0xD5);
+        // Mask the channel so any in-flight DMA stops cleanly and the
+        // buffer can be re-armed by a subsequent Init().
+        out8(kDma2Mask, 0x04 | (kDmaCh16 & 0x03));
+        AckIRQ();
         playing_ = false;
+        ready_ = false;
+        queued_frames_ = 0;
     }
 
     void SetMasterVolume(int v) override {
         if (!ready_) return;
         if (v < 0) v = 0; if (v > 100) v = 100;
         master_vol_ = v;
-        // SB16 master vol is 5-bit per channel in reg 0x30/0x31:
         uint8_t enc = (uint8_t)((v * 31) / 100) << 3;
         MixerWrite(0x30, enc);
         MixerWrite(0x31, enc);
@@ -193,15 +173,11 @@ public:
     int GetMasterVolume() const override { return master_vol_; }
 
     void Tick() override {
-        // No IRQ wired  -  the mixer pulls Submit() based on QueuedFrames.
-        // Decay queued count based on elapsed time / DMA progress.  The
-        // DMA controller's current-count register tells us how many
-        // *bytes* remain in the current 32 KB transfer.
         UpdateQueueEstimate();
     }
 
 private:
-    static constexpr int kBufBytes = 32 * 1024;     // 32 KB total (two 16 KB halves)
+    static constexpr int kBufBytes = 32 * 1024;
 
     uint16_t base_port_     = 0;
     uint16_t dsp_version_   = 0;
@@ -210,9 +186,23 @@ private:
     bool     ready_         = false;
     bool     playing_       = false;
     int      master_vol_    = 80;
-    int      active_half_   = 0;          // which half DSP is currently playing
-    int      next_fill_half_= 0;          // which half Submit() should fill next
+    int      active_half_   = 0;
+    int      next_fill_half_= 0;
     uint32_t queued_frames_ = 0;
+
+    // Staging buffer for accumulating mixer periods (1024 frames each)
+    // into a full half (4096 frames) before swapping into the DMA buffer.
+    uint8_t  stage_[kBufBytes / 2] = {};
+    uint32_t stage_fill_           = 0;
+
+    void FlushHalf() {
+        WaitForSwap();
+        uint8_t* dst = dma_buf_ + (next_fill_half_ * (kBufBytes / 2));
+        for (int i = 0; i < kBufBytes / 2; i++) dst[i] = stage_[i];
+        AckIRQ();
+        next_fill_half_ ^= 1;
+        stage_fill_ = 0;
+    }
 
     bool ResetDSP(uint16_t base) {
         out8(base + kDspReset, 1);
@@ -246,6 +236,10 @@ private:
         out8(base_port_ + kMixerAddr, reg);
         out8(base_port_ + kMixerData, v);
     }
+    void AckIRQ() {
+        // 16-bit DMA IRQ is acked by reading port 0x22F (offset 0xF from base).
+        (void)in8(base_port_ + kDspIRQ16Ack);
+    }
 
     void ProgramDMA16(uint32_t phys, uint32_t len, bool auto_init) {
         AudioDMA::Dma16Layout l = AudioDMA::SplitForDMA16(phys, len);
@@ -253,64 +247,67 @@ private:
             SerialLogger::Log("[SB16] DMA layout invalid for buffer\r\n");
             return;
         }
-        // Disable channel 5 (channel & 3 = 1, plus 0x04 mask bit)
         out8(kDma2Mask, 0x04 | (kDmaCh16 & 0x03));
-        // Reset flip-flop
         out8(kDma2Clear, 0x00);
-        // Mode: single (0x40) + auto-init (0x10) + read (0x08) + ch 1
-        // For 16-bit master DMAC2, channels 5..7 map to (ch & 3) = 1..3.
+        // mode: single(0x40)|auto-init(0x10)|read(0x08)|ch  -> single+AI+read=0x58
         uint8_t mode = (auto_init ? 0x58 : 0x48) | (kDmaCh16 & 0x03);
         out8(kDma2Mode, mode);
-        // Page register (high byte of 24-bit physical address >> 16)
         out8(kDma2Page5, l.page);
-        // Word offset (low 16 bits of the 17-bit word address)
         out8(kDma2Addr5, (uint8_t)(l.word_offset & 0xFF));
         out8(kDma2Addr5, (uint8_t)(l.word_offset >> 8));
-        // Word count (samples - 1)
         out8(kDma2Count5, (uint8_t)(l.word_count & 0xFF));
         out8(kDma2Count5, (uint8_t)(l.word_count >> 8));
-        // Unmask
         out8(kDma2Mask, kDmaCh16 & 0x03);
     }
 
+    // Read the channel-5 word counter atomically.  The DMA controller
+    // latches the 16-bit value on the first byte read after a flip-flop
+    // reset, then the second byte returns the latched high byte.
+    uint16_t ReadDmaCount() {
+        out8(kDma2Clear, 0x00);
+        uint8_t lo = in8(kDma2Count5);
+        uint8_t hi = in8(kDma2Count5);
+        return (uint16_t)lo | ((uint16_t)hi << 8);
+    }
+
     void WaitForSwap() {
-        // Poll the DMA channel 5 current word counter.  When the
-        // counter falls below half the buffer, the DSP is playing the
-        // second half, so we should fill the first.  When it rises back
-        // above half (auto-init wraps), it's playing the first half so
-        // we fill the second.
+        // total words in the cyclic buffer
+        const uint16_t total_words = (kBufBytes / 2);
+        const uint16_t half_words  = total_words / 2;
+
         for (int spin = 0; spin < 200000; spin++) {
-            // Reset flip-flop before reading word count
-            out8(kDma2Clear, 0x00);
-            uint8_t lo = in8(kDma2Count5);
-            uint8_t hi = in8(kDma2Count5);
-            uint16_t remaining_words = (uint16_t)lo | ((uint16_t)hi << 8);
-            // total buffer is kBufBytes/2 words
-            uint16_t total_words = (kBufBytes / 2);
-            int playing_half = (remaining_words >= total_words / 2) ? 0 : 1;
+            uint16_t remaining = ReadDmaCount();
+            // Auto-init reload sets remaining to total_words at the start
+            // and counts down.  When remaining > half_words the DSP is
+            // still in the first half, so we should fill the second; and
+            // vice-versa.
+            int playing_half = (remaining > half_words) ? 0 : 1;
             if (playing_half != next_fill_half_) {
                 active_half_ = playing_half;
                 return;
             }
-            for (volatile int d = 0; d < 50; d++) {}
+            for (volatile int d = 0; d < 32; d++) {}
         }
+        // Fall through if we ran out of patience  -  the half is still
+        // being played but we have no choice; mixer is starved.
+        active_half_ = next_fill_half_ ^ 1;
     }
 
     void UpdateQueueEstimate() {
-        // The hardware has at most one full half pending = kFramesPerHalf
-        // frames of latency.  Reflect that in queued_frames_ for the
-        // mixer's pacing decisions.
-        constexpr uint32_t kFramesPerHalf = (kBufBytes / 2) / 2;
-        if (queued_frames_ > kFramesPerHalf) {
-            queued_frames_ = kFramesPerHalf;
-        }
+        // Remaining 16-bit words in the *whole* cyclic buffer; falls from
+        // kBufBytes/2 - 1 toward 0 then auto-init reloads.  Convert to
+        // frames-in-flight (stereo s16 -> 4 bytes/frame).
+        uint16_t remaining = ReadDmaCount();
+        // Words remaining -> stereo s16 frames remaining.
+        uint32_t frames_remaining = (uint32_t)remaining / 2;
+        // Plus whatever the next half we filled hasn't been played yet,
+        // which is at most kFramesPerHalf and is implicit in the counter.
+        queued_frames_ = frames_remaining;
     }
 };
 
 static SB16Backend g_sb16;
 
-// Static registration: runs before AudioServer::Init() because the
-// constructor of __register_sb16 fires during C++ static init.
 struct __register_sb16 {
     __register_sb16() { AudioServer::RegisterBackend(&g_sb16); }
 };

@@ -38,6 +38,8 @@ private:
     static bool has_selection;
     static bool modified;
     static bool show_line_numbers;
+    static unsigned int last_keypress_ms;
+    static int  target_scroll_y;
 
     // editing
     static void InsertChar(char c);

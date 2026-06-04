@@ -125,7 +125,24 @@ namespace TunTap {
         Device* d = Get(dev_id);
         if (!d) return;
         if (--d->refcount > 0) return;
-        if (d->persist) return;          // keep alive for next open
+        // Best-effort drain of pending TX so we don't lose in-flight
+        // packets on the last close. Skipped if the device is down or
+        // there's no link below us.
+        if (d->up) {
+            while (d->tx_tail != d->tx_head) {
+                Packet& p = d->tx_ring[d->tx_tail % TUNTAP_RING_SLOTS];
+                if (!Network::SendPacket("eth0", p.data, p.len)) break;
+                d->tx_tail++;
+            }
+        }
+        if (d->persist) {
+            // keep allocation, but reset volatile per-fd state so the next
+            // open starts cleanly.
+            d->refcount = 0;
+            d->rx_head = d->rx_tail = 0;
+            d->tx_head = d->tx_tail = 0;
+            return;
+        }
         mzero(d, sizeof(*d));
     }
 
@@ -176,27 +193,29 @@ namespace TunTap {
     }
 
     void Tick() {
-        // Drain each device's tx_ring.  For TAP devices we forward as
-        // raw ethernet onto eth0; for TUN devices we wrap into ethernet
-        // with our gateway MAC and forward.  In both cases we update
-        // accounting on the matching NetworkInterface entry.
+        // Drain each device's tx_ring with a per-tick budget so a busy
+        // VPN daemon can't starve the rest of the kernel main loop. If
+        // the downstream NIC refuses a packet we leave it queued (head
+        // not advanced) so the next Tick retries  -  this is what gives
+        // Write() real backpressure: tx_ring fills up and Write() then
+        // returns -1 instead of silently dropping.
+        const int kTickBudget = TUNTAP_RING_SLOTS;
         for (int i = 0; i < TUNTAP_MAX_DEVS; i++) {
             Device& d = g_devs[i];
             if (!d.in_use || !d.up) continue;
-            while (d.tx_tail != d.tx_head) {
+            int sent_this_tick = 0;
+            while (d.tx_tail != d.tx_head && sent_this_tick < kTickBudget) {
                 Packet& p = d.tx_ring[d.tx_tail % TUNTAP_RING_SLOTS];
-                if (d.is_tap) {
-                    // Pure L2  -  pass straight through.
-                    Network::SendPacket("eth0", p.data, p.len);
-                } else {
-                    // L3  -  caller wrote raw IP.  Skip ethernet wrap for now;
-                    // a proper VPN routes through the IP stack directly.
-                    Network::SendPacket("eth0", p.data, p.len);
+                if (!Network::SendPacket("eth0", p.data, p.len)) {
+                    // Underlying NIC is congested. Stop draining; the
+                    // queued packet stays in the ring and Write() will
+                    // start failing as the ring fills  -  true backpressure.
+                    break;
                 }
                 d.tx_tail++;
+                sent_this_tick++;
             }
 
-            // Mirror into NetworkInterface so /proc/net/dev sees activity.
             NetworkInterface* nif = Network::GetInterface(d.name);
             if (nif) {
                 nif->rx_packets = d.rx_packets;

@@ -111,12 +111,24 @@ void BGA::EnsureBAR() {
 }
 
 bool BGA::SetMode(uint32_t w, uint32_t h, uint32_t b) {
-    // ensure bar0 is programmed so framebuffer address is valid
+    if (w == 0 || h == 0 || (b != 8 && b != 16 && b != 24 && b != 32)) {
+        SerialLogger::Log("BGA: SetMode rejected invalid args\r\n");
+        return false;
+    }
+
     EnsureBAR();
-    // disable bga first
+
+    // snapshot current mode so a failed switch can roll back rather than
+    // leaving the device disabled (= black screen).
+    uint16_t prev_enable = ReadReg(VBE_DISPI_INDEX_ENABLE);
+    uint16_t prev_w      = ReadReg(VBE_DISPI_INDEX_XRES);
+    uint16_t prev_h      = ReadReg(VBE_DISPI_INDEX_YRES);
+    uint16_t prev_b      = ReadReg(VBE_DISPI_INDEX_BPP);
+    uint16_t prev_vw     = ReadReg(VBE_DISPI_INDEX_VIRT_WIDTH);
+    uint16_t prev_vh     = ReadReg(VBE_DISPI_INDEX_VIRT_HEIGHT);
+
     WriteReg(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
 
-    // set resolution and bit depth
     WriteReg(VBE_DISPI_INDEX_XRES,        (uint16_t)w);
     WriteReg(VBE_DISPI_INDEX_YRES,        (uint16_t)h);
     WriteReg(VBE_DISPI_INDEX_BPP,         (uint16_t)b);
@@ -125,30 +137,40 @@ bool BGA::SetMode(uint32_t w, uint32_t h, uint32_t b) {
     WriteReg(VBE_DISPI_INDEX_X_OFFSET,    0);
     WriteReg(VBE_DISPI_INDEX_Y_OFFSET,    0);
 
-    // enable in linear framebuffer mode (clear video memory for clean transition)
     WriteReg(VBE_DISPI_INDEX_ENABLE,
              (uint16_t)(VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED));
 
-    // verify the set values
     uint16_t xr = ReadReg(VBE_DISPI_INDEX_XRES);
     uint16_t yr = ReadReg(VBE_DISPI_INDEX_YRES);
+    uint16_t br = ReadReg(VBE_DISPI_INDEX_BPP);
 
     SerialLogger::Log("BGA: Mode verify: ");
     SerialLogger::LogDec(xr);
     SerialLogger::Log("x");
     SerialLogger::LogDec(yr);
+    SerialLogger::Log("@");
+    SerialLogger::LogDec(br);
     SerialLogger::Log("\r\n");
 
-    if (xr != (uint16_t)w || yr != (uint16_t)h) {
-        SerialLogger::Log("BGA: Mode set FAILED (verify mismatch)\r\n");
+    if (xr != (uint16_t)w || yr != (uint16_t)h || br != (uint16_t)b) {
+        SerialLogger::Log("BGA: Mode set FAILED  -  restoring previous mode\r\n");
+        // restore previous mode
+        WriteReg(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+        WriteReg(VBE_DISPI_INDEX_XRES,        prev_w);
+        WriteReg(VBE_DISPI_INDEX_YRES,        prev_h);
+        WriteReg(VBE_DISPI_INDEX_BPP,         prev_b);
+        WriteReg(VBE_DISPI_INDEX_VIRT_WIDTH,  prev_vw);
+        WriteReg(VBE_DISPI_INDEX_VIRT_HEIGHT, prev_vh);
+        WriteReg(VBE_DISPI_INDEX_X_OFFSET,    0);
+        WriteReg(VBE_DISPI_INDEX_Y_OFFSET,    0);
+        WriteReg(VBE_DISPI_INDEX_ENABLE,      prev_enable);
         return false;
     }
 
-    width      = w;
-    height     = h;
-    bpp        = b;
-    pitch      = w * (b / 8);
-
+    width       = w;
+    height      = h;
+    bpp         = b;
+    pitch       = w * (b / 8);
     framebuffer = (uint8_t*)BGA_FRAMEBUFFER_ADDR;
 
     SerialLogger::Log("BGA: Framebuffer at 0xE0000000, pitch=");

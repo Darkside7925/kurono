@@ -17,6 +17,20 @@ int   AC97::pcm_length = 0;
 int   AC97::pcm_offset = 0;
 bool  AC97::looping = false;
 
+// Per-entry PCM ring chunk size.  Sized to match the mixer's period
+// (1024 frames × 4 bytes/frame stereo s16 = 4 KB) so each Submit() fills
+// exactly one BDL entry and the controller never plays half-empty
+// chunks.  32 entries × 4 KB = 128 KB, fits in REGION_AC97_PCM (288 KB).
+static constexpr int kAC97RingChunkBytes = 4096;
+static constexpr int kAC97RingChunkSamples = kAC97RingChunkBytes / 2;
+
+// Streaming-mode bookkeeping for the AudioMixer integration.  When the
+// stream is "live" we never call Play()/Stop() per period -- we just keep
+// the next entry filled and advance LVI.
+static bool     g_stream_live = false;
+static int      g_stream_next_fill = 0;   // BDL index we'll write next
+static uint32_t g_stream_queued_bytes = 0;
+
 static inline void _out8(uint16_t port, uint8_t val) {
     asm volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
@@ -179,11 +193,19 @@ void AC97::SetupBDL() {
         dma_buffer = (uint8_t*)pcm_region;
     }
 
-    // initialize bdl entries  -  each points to a dma buffer chunk
+    // initialize bdl entries  -  each points to an 8 KB chunk.  Total ring
+    // is 32 * 8 KB = 256 KB which fits inside the dedicated AC97 PCM
+    // region (288 KB) without overrunning into adjacent allocator areas.
     for (int i = 0; i < AC97_MAX_BDL_ENTRIES; i++) {
-        bdl[i].buffer_addr = (uint32_t)(uintptr_t)(dma_buffer + i * AC97_BUFFER_SIZE);
-        bdl[i].length = AC97_BUFFER_SIZE / 2;  // in samples (16-bit = 2 bytes)
-        bdl[i].flags = AC97_BD_IOC;            // interrupt on completion
+        bdl[i].buffer_addr = (uint32_t)(uintptr_t)(dma_buffer + i * kAC97RingChunkBytes);
+        bdl[i].length = kAC97RingChunkSamples;  // sample (s16) count per entry
+        bdl[i].flags = AC97_BD_IOC;
+    }
+
+    // Pre-zero the entire ring so the first round of playback (which
+    // happens before the mixer has filled anything) doesn't blast garbage.
+    for (int i = 0; i < AC97_MAX_BDL_ENTRIES * kAC97RingChunkBytes; i++) {
+        dma_buffer[i] = 0;
     }
 
     // set pcm out bdl base address
@@ -300,8 +322,8 @@ bool AC97::IsMuted() { return muted; }
 void AC97::FillBuffer(int idx) {
     if (idx < 0 || idx >= AC97_MAX_BDL_ENTRIES) return;
 
-    uint8_t* dest = dma_buffer + idx * AC97_BUFFER_SIZE;
-    int to_copy = AC97_BUFFER_SIZE;
+    uint8_t* dest = dma_buffer + idx * kAC97RingChunkBytes;
+    int to_copy = kAC97RingChunkBytes;
 
     if (pcm_source && pcm_offset < pcm_length) {
         int remaining = pcm_length - pcm_offset;
@@ -310,23 +332,19 @@ void AC97::FillBuffer(int idx) {
         for (int i = 0; i < to_copy; i++)
             dest[i] = pcm_source[pcm_offset + i];
 
-        // zero-pad if less than full buffer
-        for (int i = to_copy; i < AC97_BUFFER_SIZE; i++)
+        for (int i = to_copy; i < kAC97RingChunkBytes; i++)
             dest[i] = 0;
 
         pcm_offset += to_copy;
 
-        // loop handling
         if (pcm_offset >= pcm_length && looping)
             pcm_offset = 0;
     } else {
-        // silence
-        for (int i = 0; i < AC97_BUFFER_SIZE; i++)
+        for (int i = 0; i < kAC97RingChunkBytes; i++)
             dest[i] = 0;
     }
 
-    // update bdl entry
-    bdl[idx].length = AC97_BUFFER_SIZE / 2;  // sample count
+    bdl[idx].length = kAC97RingChunkSamples;
     bdl[idx].flags = AC97_BD_IOC;
 }
 
@@ -392,8 +410,109 @@ void AC97::Stop() {
     pcm_source = nullptr;
     pcm_length = 0;
     pcm_offset = 0;
+    g_stream_live = false;
+    g_stream_next_fill = 0;
+    g_stream_queued_bytes = 0;
     info.state = AC97_STOPPED;
 }
+
+bool AC97::EnsureStreaming(int sample_rate, int bits, int channels) {
+    if (!info.available) return false;
+    if (g_stream_live && info.state == AC97_PLAYING) return true;
+
+    // Drain any previous one-shot playback first.
+    if (info.state != AC97_STOPPED) {
+        StopDMA();
+    }
+    pcm_source = nullptr;
+    pcm_length = 0;
+    pcm_offset = 0;
+    looping = false;
+
+    info.bits     = bits;
+    info.channels = channels;
+    SetSampleRate(sample_rate);
+
+    // Pre-fill the whole ring with silence and arm the DMA engine.
+    for (int i = 0; i < AC97_MAX_BDL_ENTRIES; i++) {
+        uint8_t* dest = dma_buffer + i * kAC97RingChunkBytes;
+        for (int j = 0; j < kAC97RingChunkBytes; j++) dest[j] = 0;
+        bdl[i].length = kAC97RingChunkSamples;
+        bdl[i].flags  = AC97_BD_IOC;
+    }
+    g_stream_next_fill = 0;
+    g_stream_queued_bytes = 0;
+    g_stream_live = true;
+    info.state = AC97_PLAYING;
+    StartDMA();
+    // StartDMA pre-arms LVI to the last entry; for streaming mode we
+    // want LVI to track WriteRingChunk progress instead.  Park it one
+    // entry behind the fill cursor so the controller waits for fresh
+    // data before advancing past the silence ring.
+    BMWrite8(AC97_BM_PCM_OUT + BM_LVI, (uint8_t)0);
+    g_stream_next_fill = 1;     // first chunk we fill goes to entry 1
+    return true;
+}
+
+uint32_t AC97::WriteRingChunk(const void* data, uint32_t bytes) {
+    if (!g_stream_live || !data || bytes == 0) return 0;
+    const uint8_t* src = (const uint8_t*)data;
+    uint32_t written = 0;
+
+    int civ = BMRead8(AC97_BM_PCM_OUT + BM_CIV);
+
+    while (bytes > 0) {
+        // Don't overwrite the entry the controller is currently playing.
+        if (g_stream_next_fill == civ) {
+            // Ring is full from the controller's perspective; bail and
+            // let the caller back off until the next chunk frees up.
+            break;
+        }
+        uint8_t* dst = dma_buffer + g_stream_next_fill * kAC97RingChunkBytes;
+        uint32_t to_copy = bytes < (uint32_t)kAC97RingChunkBytes ? bytes
+                                                                 : (uint32_t)kAC97RingChunkBytes;
+        for (uint32_t i = 0; i < to_copy; i++) dst[i] = src[i];
+        for (uint32_t i = to_copy; i < (uint32_t)kAC97RingChunkBytes; i++) dst[i] = 0;
+        bdl[g_stream_next_fill].length = kAC97RingChunkSamples;
+        bdl[g_stream_next_fill].flags  = AC97_BD_IOC;
+
+        int filled_idx = g_stream_next_fill;
+        g_stream_next_fill = (g_stream_next_fill + 1) % AC97_MAX_BDL_ENTRIES;
+        g_stream_queued_bytes += to_copy;
+
+        // Advance LVI to the entry we just filled so the controller will
+        // play it.  LVI is the *last valid index* the controller may
+        // dispatch  -  the entry one before next_fill works for a 32-entry
+        // ring where civ != next_fill.
+        BMWrite8(AC97_BM_PCM_OUT + BM_LVI, (uint8_t)filled_idx);
+
+        src += to_copy;
+        bytes -= to_copy;
+        written += to_copy;
+    }
+
+    // Clear completion interrupt bits so the controller keeps emitting them.
+    uint16_t status = BMRead16(AC97_BM_PCM_OUT + BM_STATUS);
+    BMWrite16(AC97_BM_PCM_OUT + BM_STATUS,
+              status & (BM_STATUS_LVBCI | BM_STATUS_BCIS | BM_STATUS_FIFOE));
+
+    // If the engine stalled (DCH) but we just gave it data, kick it back.
+    if (status & BM_STATUS_DCH) {
+        StartDMA();
+    }
+
+    return written;
+}
+
+uint32_t AC97::RingQueuedBytes() {
+    if (!g_stream_live) return 0;
+    int civ = BMRead8(AC97_BM_PCM_OUT + BM_CIV);
+    int lvi = BMRead8(AC97_BM_PCM_OUT + BM_LVI);
+    int dist = (lvi - civ + AC97_MAX_BDL_ENTRIES) % AC97_MAX_BDL_ENTRIES;
+    return (uint32_t)dist * (uint32_t)kAC97RingChunkBytes;
+}
+
+uint32_t AC97::RingChunkBytes() { return kAC97RingChunkBytes; }
 
 void AC97::Pause() {
     if (info.state != AC97_PLAYING) return;
@@ -418,42 +537,45 @@ void AC97::HandleIRQ() {
 
     uint16_t status = BMRead16(AC97_BM_PCM_OUT + BM_STATUS);
 
-    if (status & BM_STATUS_BCIS) {
-        // buffer completion  -  refill the completed buffer
-        int civ = BMRead8(AC97_BM_PCM_OUT + BM_CIV);
-        int next = (civ + 1) % AC97_MAX_BDL_ENTRIES;
-        FillBuffer(next);
-
-        // update lvi to keep dma running
-        BMWrite8(AC97_BM_PCM_OUT + BM_LVI,
-                 (uint8_t)((civ + AC97_MAX_BDL_ENTRIES - 1) % AC97_MAX_BDL_ENTRIES));
-    }
-
-    if (status & BM_STATUS_LVBCI) {
-        // last valid buffer reached  -  playback may be ending
-        if (pcm_offset >= pcm_length && !looping) {
-            info.state = AC97_STOPPED;
+    // Streaming mode: the AudioMixer owns ring refills.  We just clear
+    // the W1C bits so the controller keeps interrupting.
+    if (!g_stream_live) {
+        if (status & BM_STATUS_BCIS) {
+            int civ = BMRead8(AC97_BM_PCM_OUT + BM_CIV);
+            int next = (civ + 1) % AC97_MAX_BDL_ENTRIES;
+            FillBuffer(next);
+            BMWrite8(AC97_BM_PCM_OUT + BM_LVI,
+                     (uint8_t)((civ + AC97_MAX_BDL_ENTRIES - 1) % AC97_MAX_BDL_ENTRIES));
+        }
+        if (status & BM_STATUS_LVBCI) {
+            if (pcm_offset >= pcm_length && !looping) {
+                info.state = AC97_STOPPED;
+            }
         }
     }
 
-    // acknowledge interrupt bits
-    BMWrite16(AC97_BM_PCM_OUT + BM_STATUS, status & 0x1C);
+    // W1C: writing 1 to bits 1..4 (CELV, LVBCI, BCIS, FIFOE) clears them.
+    BMWrite16(AC97_BM_PCM_OUT + BM_STATUS,
+              status & (BM_STATUS_CELV | BM_STATUS_LVBCI |
+                        BM_STATUS_BCIS | BM_STATUS_FIFOE));
 }
 
 //  tick  -  poll-based buffer refill
 void AC97::Tick() {
     if (info.state != AC97_PLAYING) return;
 
-    // check if dma has advanced
     uint16_t status = BMRead16(AC97_BM_PCM_OUT + BM_STATUS);
     if (status & BM_STATUS_BCIS) {
         HandleIRQ();
     }
 
-    // check for dma halt (underrun)
     if (status & BM_STATUS_DCH) {
-        if (pcm_offset < pcm_length) {
-            // buffer underrun  -  restart dma
+        if (g_stream_live) {
+            // Streaming mode: the engine stalled because we under-fed.
+            // Don't reset  -  re-kick once new chunks land.  Clear DCH ack.
+            BMWrite16(AC97_BM_PCM_OUT + BM_STATUS,
+                      status & (BM_STATUS_LVBCI | BM_STATUS_BCIS | BM_STATUS_FIFOE));
+        } else if (pcm_offset < pcm_length) {
             int civ = BMRead8(AC97_BM_PCM_OUT + BM_CIV);
             for (int i = 0; i < 4; i++)
                 FillBuffer((civ + i) % AC97_MAX_BDL_ENTRIES);

@@ -40,10 +40,19 @@ void Buddy::PushFree(BuddyBlock* b, int order) {
     b->order  = (uint8_t)order;
     b->in_use = 0;
     b->magic  = BUDDY_MAGIC;
-    b->prev   = nullptr;
-    b->next   = free_lists[order];
-    if (free_lists[order]) free_lists[order]->prev = b;
-    free_lists[order] = b;
+
+    // address-sorted insertion: keeps the freelist ordered so that buddies
+    // are usually adjacent in list order, which makes coalesce-on-free
+    // cache-friendly and helps the higher-order list stay clean.
+    BuddyBlock* cur  = free_lists[order];
+    BuddyBlock* prev = nullptr;
+    while (cur && cur < b) { prev = cur; cur = cur->next; }
+
+    b->prev = prev;
+    b->next = cur;
+    if (cur)  cur->prev = b;
+    if (prev) prev->next = b;
+    else      free_lists[order] = b;
     free_counts[order]++;
 }
 
@@ -129,6 +138,8 @@ bool Buddy::Init() {
 void* Buddy::AllocPages(int order) {
     if (!ready)            return nullptr;
     if (order < 0)         order = 0;
+    // overflow guard: order beyond what fits in uint64_t pages
+    if (order >= 52)       return nullptr;
     if (order > BUDDY_ORDER_MAX) {
         // larger than our pool's max block  -  fall through to PMM contiguous.
         uint64_t pages = 1ull << order;
@@ -137,14 +148,13 @@ void* Buddy::AllocPages(int order) {
         return (void*)(uintptr_t)addr;
     }
 
-    // walk up to find smallest order with a free block
     int o = order;
     while (o <= BUDDY_ORDER_MAX && !free_lists[o]) o++;
     if (o > BUDDY_ORDER_MAX) return nullptr;
 
     BuddyBlock* b = PopFree(o);
+    if (!b) return nullptr;
 
-    // split down to requested order
     while (o > order) {
         o--;
         uint64_t half_size = (uint64_t)BUDDY_PAGE_SIZE << o;
@@ -165,31 +175,36 @@ void Buddy::FreePages(void* ptr, int order) {
     if (!ptr) return;
     uint64_t addr = (uint64_t)(uintptr_t)ptr;
     if (!InPool(addr)) {
-        // fell through to PMM
         if (order >= 0) {
             uint64_t pages = 1ull << order;
-            for (uint64_t i = 0; i < pages; i++)
-                PMM::FreeFrame(addr + i * BUDDY_PAGE_SIZE);
+            PMM::FreeContiguous(addr, pages);
             used_bytes -= pages * BUDDY_PAGE_SIZE;
         }
         return;
     }
     if (order < 0 || order > BUDDY_ORDER_MAX) return;
 
+    BuddyBlock* b = (BuddyBlock*)ptr;
+    // double-free / corruption guard
+    if (b->magic != BUDDY_MAGIC) return;
+    if (!b->in_use)              return;
+    if (b->order != (uint8_t)order) return;
+
     used_bytes -= (uint64_t)BUDDY_PAGE_SIZE << order;
     free_count++;
 
-    BuddyBlock* b = (BuddyBlock*)ptr;
     b->in_use = 0;
-    b->magic  = BUDDY_MAGIC;
 
     // coalesce upward
     while (order < BUDDY_ORDER_MAX) {
         BuddyBlock* buddy = BuddyOf(b, order);
         if (!buddy) break;
+        // buddy must be in pool
+        if ((uint64_t)buddy < pool_base ||
+            (uint64_t)buddy >= pool_base + pool_bytes) break;
         if (buddy->magic != BUDDY_MAGIC) break;
         if (buddy->in_use) break;
-        if (buddy->order != order) break;
+        if (buddy->order != (uint8_t)order) break;
 
         Unlink(buddy, order);
         if (buddy < b) b = buddy;

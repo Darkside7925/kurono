@@ -21,6 +21,10 @@ private:
     static int stored_val;
     static bool new_entry;
     static int selected_button;
+    static int hover_button;        // -1 when none
+    static unsigned int press_ms;   // time of last button press (for flash anim)
+    static int press_button;        // last pressed button index
+    static int error_state;         // 0=ok, 1=div-by-zero flash
     static void ClearAll();
     static void Backspace();
     static void ApplyButton(int idx);

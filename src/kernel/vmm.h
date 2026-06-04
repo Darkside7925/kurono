@@ -60,10 +60,22 @@ public:
     static bool MapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                       uint64_t phys_addr, uint64_t flags);
 
+    // map a contiguous range with a single TLB shootdown at the end. Writes
+    // PTEs back-to-back so the page-walker stays hot in cache, and only
+    // invalidates the touched range when the root is the active CR3.
+    static bool MapRange(uint64_t virt_base, uint64_t phys_base,
+                         uint64_t bytes, uint64_t flags);
+    static bool MapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
+                                       uint64_t phys_base, uint64_t bytes,
+                                       uint64_t flags);
+
     // unmap a single 4kb page. frees the physical frame if free_frame is true.
     static void UnmapPage(uint64_t virt_addr, bool free_frame = false);
     static void UnmapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                         bool free_frame = false);
+    static void UnmapRange(uint64_t virt_base, uint64_t bytes, bool free_frames = false);
+    static void UnmapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
+                                         uint64_t bytes, bool free_frames = false);
 
     // query: returns the physical address mapped at virt_addr, or 0 if not mapped.
     static uint64_t QueryMapping(uint64_t virt_addr);
