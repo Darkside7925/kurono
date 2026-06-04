@@ -97,6 +97,7 @@ private:
     static void InitVMwareIntegration();
     static bool PollVMwareAbsolute();
     static void EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int wheel_delta);
+    static void RingPush(const Event& e);
     
     static int lastx, lasty;
     static uint8_t pkt[8];

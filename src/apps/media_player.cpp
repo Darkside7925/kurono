@@ -109,6 +109,15 @@ void MediaPlayerApp::Open(const char* file_path) {
     Open();
     if (file_path) {
         RuntimeLog::LogAppEvent("media", "queue-file", file_path);
+        // dedupe: jump to existing entry if already in playlist
+        for (int i = 0; i < playlist_count; i++) {
+            int j = 0; bool same = true;
+            while (file_path[j] || playlist[i].path[j]) {
+                if (file_path[j] != playlist[i].path[j]) { same = false; break; }
+                j++;
+            }
+            if (same) { current_track = i; return; }
+        }
         AddToPlaylist(file_path);
         current_track = playlist_count - 1;
     }
@@ -120,6 +129,16 @@ void MediaPlayerApp::Close() {
         WindowManager::CloseWindow(win_id);
         win_id = -1;
     }
+    // reset UI/cache state so reopen starts fresh and doesn't leak stale data
+    hover_button = -1;
+    scroll_offset = 0;
+    dragging_seek = false;
+    dragging_vol = false;
+    cached_track = -1;
+    cached_valid = false;
+    video_frame_len = 0;
+    seek_position = -1;
+    paused = false;
 }
 
 bool MediaPlayerApp::IsOpen() {

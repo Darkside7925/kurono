@@ -39,13 +39,15 @@ void GpuProbe::PciWrite(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset, 
 }
 
 uint64_t GpuProbe::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_idx) {
+    if (bar_idx > 5) return 0;
     uint8_t offset = 0x10 + bar_idx * 4;
     uint32_t bar_lo = PciRead(bus, dev, func, offset);
-    if (bar_lo & 1) return bar_lo & 0xFFFFFFFC; // i/o bar
+    if (bar_lo == 0 || bar_lo == 0xFFFFFFFF) return 0;
+    if (bar_lo & 1) return 0; // I/O BAR  -  not usable here
 
     uint64_t base = bar_lo & 0xFFFFFFF0;
     uint8_t type = (bar_lo >> 1) & 0x03;
-    if (type == 0x02) { // 64-bit bar
+    if (type == 0x02 && bar_idx < 5) {
         uint32_t bar_hi = PciRead(bus, dev, func, offset + 4);
         base |= ((uint64_t)bar_hi << 32);
     }
@@ -53,17 +55,26 @@ uint64_t GpuProbe::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_i
 }
 
 uint64_t GpuProbe::GetBARSize(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_idx) {
+    if (bar_idx > 5) return 0;
     uint8_t offset = 0x10 + bar_idx * 4;
-    uint32_t original = PciRead(bus, dev, func, offset);
+    uint32_t original_lo = PciRead(bus, dev, func, offset);
+    if (original_lo == 0xFFFFFFFF || (original_lo & 1)) return 0;
+    bool is_64 = ((original_lo >> 1) & 0x03) == 0x02 && bar_idx < 5;
+    uint32_t original_hi = is_64 ? PciRead(bus, dev, func, offset + 4) : 0;
+
     PciWrite(bus, dev, func, offset, 0xFFFFFFFF);
-    uint32_t mask = PciRead(bus, dev, func, offset);
-    PciWrite(bus, dev, func, offset, original);
-    if (!(original & 1)) { // memory bar
-        mask &= 0xFFFFFFF0;
-        if (mask == 0) return 0;
-        return ((uint64_t)(~mask)) + 1;
+    uint32_t mask_lo = PciRead(bus, dev, func, offset);
+    uint32_t mask_hi = 0;
+    if (is_64) {
+        PciWrite(bus, dev, func, offset + 4, 0xFFFFFFFF);
+        mask_hi = PciRead(bus, dev, func, offset + 4);
+        PciWrite(bus, dev, func, offset + 4, original_hi);
     }
-    return 0;
+    PciWrite(bus, dev, func, offset, original_lo);
+
+    uint64_t mask = ((uint64_t)mask_hi << 32) | (mask_lo & 0xFFFFFFF0);
+    if (mask == 0) return 0;
+    return (~mask) + 1;
 }
 
 //  intel igpu mmio register access
@@ -223,9 +234,24 @@ void GpuProbe::ScanAll() {
 
     SerialLogger::Log("[GpuProbe] Scanning PCI bus for display controllers...\r\n");
 
+    // bound the scan  -  track the highest bus number we've seen any device on
+    // and stop after a generous 16-bus gap. virtually all real systems have
+    // all display controllers below bus 16, but pcie bridges can push them
+    // higher on workstations.
+    int last_active_bus = 0;
+    const int scan_gap = 16;
+
     for (int bus = 0; bus < 256 && result.count < GPU_PROBE_MAX; bus++) {
+        if (bus > last_active_bus + scan_gap) break;
         for (int dev = 0; dev < 32 && result.count < GPU_PROBE_MAX; dev++) {
-            for (int func = 0; func < 8 && result.count < GPU_PROBE_MAX; func++) {
+            // sniff func 0 for a present device; if not present skip the whole slot
+            uint32_t probe = PciRead(bus, dev, 0, 0x00);
+            if ((probe & 0xFFFF) == 0xFFFF) continue;
+            last_active_bus = bus;
+            uint32_t hdr0 = PciRead(bus, dev, 0, 0x0C);
+            int max_func = ((hdr0 >> 16) & 0x80) ? 8 : 1;
+
+            for (int func = 0; func < max_func && result.count < GPU_PROBE_MAX; func++) {
                 uint32_t id = PciRead(bus, dev, func, 0x00);
                 if ((id & 0xFFFF) == 0xFFFF || id == 0) {
                     // if function 0 doesn't exist, no other functions will either
@@ -243,14 +269,7 @@ void GpuProbe::ScanAll() {
                 uint8_t prog_if    = (class_reg >> 8)  & 0xFF;
 
                 // only interested in display controllers (class 0x03)
-                if (base_class != 0x03) {
-                    // check multi-function
-                    if (func == 0) {
-                        uint32_t hdr = PciRead(bus, dev, 0, 0x0C);
-                        if (!((hdr >> 16) & 0x80)) break;
-                    }
-                    continue;
-                }
+                if (base_class != 0x03) continue;
 
                 GpuInfo& gpu = result.gpus[result.count];
                 gpu.present = true;
@@ -350,12 +369,6 @@ void GpuProbe::ScanAll() {
                 SerialLogger::Log("\r\n");
 
                 result.count++;
-
-                // check multi-function
-                if (func == 0) {
-                    uint32_t hdr = PciRead(bus, dev, 0, 0x0C);
-                    if (!((hdr >> 16) & 0x80)) break;
-                }
             }
         }
     }
@@ -731,4 +744,9 @@ bool GpuProbe::HasAmdGPU() {
 
 int GpuProbe::GetPrimaryGpuIndex() {
     return result.primary_idx;
+}
+
+void GpuProbe::LogToEarlyFB() {
+    // early-FB text renderer lives in graphics.cpp (owned by another module);
+    // declaration kept for ABI, body intentionally empty.
 }

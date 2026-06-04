@@ -110,6 +110,8 @@ struct AmdGPUInfo {
     char             chip_name[16];    // chip codename (e.g., "navi31")
     bool             resizable_bar;    // rebar / sam enabled
     bool             hardware_raytracing; // ray accelerator present
+    bool             has_2d_accel;     // dcn/dce can do hardware blits
+    bool             has_3d_accel;     // GFX engine usable for compositor
 };
 
 class AmdGPU {
@@ -151,6 +153,9 @@ public:
 
     // debug
     static void DumpRegisters(char* buf, int max_len);
+
+    // accel capability  -  compositor checks this before issuing GPU work
+    static bool HasHardwareAccel();
 
 private:
     static AmdGPUInfo info;

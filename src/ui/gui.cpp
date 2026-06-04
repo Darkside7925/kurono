@@ -14,20 +14,31 @@ size_t   GUI::buffer_size = 0;
 
 #include "../kernel/types.h"
 
-// helper memset to avoid dependency on libc if not available in this context
-// although we have kernelheap, we might not have a global memset exposed here.
-// but wait, types.h declares memset.
 extern "C" void* memset(void* dst, int v, size_t n);
 
 #include "../drivers/serial.h"
+
+// fast 32-bit dword copy. handles non-aligned tails. n is dword count.
+static inline void dword_copy(uint32_t* __restrict dst, const uint32_t* __restrict src, size_t n) {
+    size_t i = 0;
+    size_t unroll_end = n & ~(size_t)7;
+    for (; i < unroll_end; i += 8) {
+        dst[i+0] = src[i+0]; dst[i+1] = src[i+1];
+        dst[i+2] = src[i+2]; dst[i+3] = src[i+3];
+        dst[i+4] = src[i+4]; dst[i+5] = src[i+5];
+        dst[i+6] = src[i+6]; dst[i+7] = src[i+7];
+    }
+    for (; i < n; i++) dst[i] = src[i];
+}
 
 void GUI::UpdateBackbuffer() {
     int w = Graphics::GetWidth();
     int h = Graphics::GetHeight();
     int bpp = Graphics::GetBpp();
     int pitch = Graphics::GetPitch();
-    
-    // log once
+
+    if (w <= 0 || h <= 0 || pitch <= 0) return;
+
     static bool logged = false;
     if (!logged) {
         SerialLogger::Log("GUI::UpdateBackbuffer: w="); SerialLogger::LogDec(w);
@@ -38,96 +49,98 @@ void GUI::UpdateBackbuffer() {
         logged = true;
     }
 
+    size_t sz = (size_t)h * (size_t)pitch;
+
     if (!backbuffer) {
-        // allocate using pitch to match framebuffer layout exactly (pmm for large bufs)
-        size_t sz = (size_t)h * pitch;
         backbuffer = (uint8_t*)PMM::AllocBytes(sz);
         buffer_size = sz;
     }
     if (!wallpaper_buffer) {
-        size_t sz = (size_t)h * pitch;
         wallpaper_buffer = (uint8_t*)PMM::AllocBytes(sz);
-        
-        // draw wallpaper to wallpaper_buffer once
+
+        if (!wallpaper_buffer) return;
+
         uint8_t* old_fb = Graphics::GetBuffer();
         Graphics::SetBuffer(wallpaper_buffer);
         if (wallpaper.valid) {
             SerialLogger::Log("GUI: Drawing wallpaper...\r\n");
-            // use standard scaling, no auto-crop for wallpaper to avoid artifacts
             MediaDecoder::DrawImageScaled(wallpaper, 0, 0, w, h);
         } else {
-            // no wallpaper  -  draw a beautiful gradient background
-            // deep midnight blue (#0d1b2a) at top → dark teal (#1b2838) at bottom
-            // with a subtle purple accent in the middle
-            for (int y = 0; y < h; y++) {
-                float t = (float)y / (float)(h > 1 ? h - 1 : 1);
-                // top color: dark blue-black (13, 27, 42)
-                // mid color: muted purple  (30, 25, 50) at t=0.4
-                // bot color: dark teal     (27, 40, 56) 
-                uint8_t r, g, b;
-                if (t < 0.4f) {
-                    float s = t / 0.4f;
-                    r = (uint8_t)(13 + (30 - 13) * s);
-                    g = (uint8_t)(27 + (25 - 27) * s);
-                    b = (uint8_t)(42 + (50 - 42) * s);
+            // precompute a small (64-step) vertical gradient ramp once,
+            // then row-fill at integer precision. avoids per-pixel float math.
+            const int RAMP_N = 64;
+            uint32_t ramp[RAMP_N];
+            // colours (B,G,R packed in 0xAARRGGBB)
+            //   t=0.0 → (13, 27, 42)
+            //   t=0.4 → (30, 25, 50)
+            //   t=1.0 → (27, 40, 56)
+            for (int i = 0; i < RAMP_N; i++) {
+                int t256 = (i * 256) / (RAMP_N - 1);   // 0..256
+                int r, g, b;
+                if (t256 < 102) {                        // 0..0.4
+                    int s = (t256 * 256) / 102;          // 0..256
+                    r = 13 + ((30 - 13) * s) / 256;
+                    g = 27 + ((25 - 27) * s) / 256;
+                    b = 42 + ((50 - 42) * s) / 256;
                 } else {
-                    float s = (t - 0.4f) / 0.6f;
-                    r = (uint8_t)(30 + (27 - 30) * s);
-                    g = (uint8_t)(25 + (40 - 25) * s);
-                    b = (uint8_t)(50 + (56 - 50) * s);
+                    int s = ((t256 - 102) * 256) / 154;  // 0..256
+                    r = 30 + ((27 - 30) * s) / 256;
+                    g = 25 + ((40 - 25) * s) / 256;
+                    b = 50 + ((56 - 50) * s) / 256;
                 }
-                uint32_t color = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-                for (int x = 0; x < w; x++) {
-                    // write directly to wallpaper_buffer
-                    uint32_t* row = (uint32_t*)(wallpaper_buffer + y * pitch);
-                    row[x] = color;
+                ramp[i] = 0xFF000000u
+                        | ((uint32_t)(r & 0xFF) << 16)
+                        | ((uint32_t)(g & 0xFF) <<  8)
+                        |  (uint32_t)(b & 0xFF);
+            }
+            int hsafe = h > 1 ? h - 1 : 1;
+            for (int y = 0; y < h; y++) {
+                int ramp_idx = (y * (RAMP_N - 1)) / hsafe;
+                if (ramp_idx < 0) ramp_idx = 0;
+                if (ramp_idx >= RAMP_N) ramp_idx = RAMP_N - 1;
+                uint32_t color = ramp[ramp_idx];
+                uint32_t* row = (uint32_t*)(wallpaper_buffer + (size_t)y * (size_t)pitch);
+                int x = 0;
+                int end = w & ~7;
+                for (; x < end; x += 8) {
+                    row[x+0] = color; row[x+1] = color;
+                    row[x+2] = color; row[x+3] = color;
+                    row[x+4] = color; row[x+5] = color;
+                    row[x+6] = color; row[x+7] = color;
                 }
+                for (; x < w; x++) row[x] = color;
             }
             SerialLogger::Log("GUI: Gradient wallpaper generated\r\n");
         }
         Graphics::SetBuffer(old_fb);
     }
-    
-    // optimization: only update if dirty. 
-    // for now, we only need to restore the wallpaper buffer to backbuffer if we are redrawing the whole frame.
-    // if the gui loop is drawing ui on top of backbuffer, we need a clean slate every frame.
-    // copy wallpaper_buffer to backbuffer (fast)
-    if (wallpaper_buffer && backbuffer) {
-        // since both are pitch-aligned and same size, we can just memcpy
-        // but we use uint32 copy for speed if aligned
-        int size = h * pitch;
-        uint32_t* src = (uint32_t*)wallpaper_buffer;
-        uint32_t* dst = (uint32_t*)backbuffer;
-        int n = size / 4;
-        
-        // manual unrolling for speed
-        int i = 0;
-        for(; i < n - 8; i+=8) {
-            dst[i] = src[i]; dst[i+1] = src[i+1]; dst[i+2] = src[i+2]; dst[i+3] = src[i+3];
-            dst[i+4] = src[i+4]; dst[i+5] = src[i+5]; dst[i+6] = src[i+6]; dst[i+7] = src[i+7];
-        }
-        for(; i < n; i++) dst[i] = src[i];
+
+    if (wallpaper_buffer && backbuffer && bpp == 32) {
+        dword_copy((uint32_t*)backbuffer, (uint32_t*)wallpaper_buffer, sz / 4);
+    } else if (wallpaper_buffer && backbuffer) {
+        // byte fallback for non-32bpp
+        uint8_t* d = backbuffer; const uint8_t* s = wallpaper_buffer;
+        for (size_t i = 0; i < sz; i++) d[i] = s[i];
     }
 }
 
 void GUI::ReinitBuffers() {
-    // free old buffers (pmm-backed)
     if (backbuffer)        { PMM::FreeBytes(backbuffer, buffer_size);        backbuffer = nullptr; }
     if (wallpaper_buffer)  { PMM::FreeBytes(wallpaper_buffer, buffer_size); wallpaper_buffer = nullptr; }
     buffer_size = 0;
-    // updatebackbuffer will reallocate with new dimensions
     UpdateBackbuffer();
 }
 
-void GUI::SetWallpaper(const MediaDecoder::Image& img) { 
+void GUI::SetWallpaper(const MediaDecoder::Image& img) {
     wallpaper = img;
-    // invalidate wallpaper buffer
     if (wallpaper_buffer) {
         int w = Graphics::GetWidth();
         int h = Graphics::GetHeight();
         int pitch = Graphics::GetPitch();
-        memset(wallpaper_buffer, 0, h * pitch); // clear first
-        
+        if (w <= 0 || h <= 0 || pitch <= 0) return;
+        size_t sz = (size_t)h * (size_t)pitch;
+        memset(wallpaper_buffer, 0, sz);
+
         uint8_t* old_fb = Graphics::GetBuffer();
         Graphics::SetBuffer(wallpaper_buffer);
         if (wallpaper.valid) {
@@ -143,14 +156,15 @@ void GUI::SetWallpaper(const MediaDecoder::Image& img) {
 void GUI::DrawTime(int x, int y) {
     auto dt_loc = TimeManager::NowLocalDateTime();
     RTC::Time t; t.h = dt_loc.h; t.m = dt_loc.m; t.s = dt_loc.s;
-    char timebuf[8];
-    timebuf[0] = (char)('0' + (t.h/10));
-    timebuf[1] = (char)('0' + (t.h%10));
+    // hh:mm + null = 6 chars
+    char timebuf[6];
+    timebuf[0] = (char)('0' + ((t.h / 10) % 10));
+    timebuf[1] = (char)('0' + (t.h % 10));
     timebuf[2] = ':';
-    timebuf[3] = (char)('0' + (t.m/10));
-    timebuf[4] = (char)('0' + (t.m%10));
+    timebuf[3] = (char)('0' + ((t.m / 10) % 10));
+    timebuf[4] = (char)('0' + (t.m % 10));
     timebuf[5] = 0;
-    
+
     if (FontTTF::ok) {
         FontTTF::DrawString(x, y, 20.0f, timebuf, 0xFFFFFFFF);
     }
@@ -159,21 +173,18 @@ void GUI::DrawTime(int x, int y) {
 void GUI::DrawTaskbar() {
     int w = Graphics::GetWidth();
     int h = Graphics::GetHeight();
-    // taskbar at bottom
     int tb_h = 40;
     int tb_y = h - tb_h;
-    
-    // draw directly to backbuffer (updatebackbuffer should have been called)
+    if (tb_y < 0) return;
+
     uint8_t* old = Graphics::GetBuffer();
     if (backbuffer) Graphics::SetBuffer(backbuffer);
-    
-    // semi-transparent black background
+
     Graphics::FillRectAlpha(0, tb_y, w, tb_h, 128, 0x00000000);
-    Graphics::FillRect(0, tb_y, w, 1, 0xFF444444); // top border
-    
-    // draw time
+    Graphics::FillRect(0, tb_y, w, 1, 0xFF444444);
+
     DrawTime(w - 100, tb_y + 10);
-    
+
     if (backbuffer) Graphics::SetBuffer(old);
 }
 
@@ -181,40 +192,27 @@ void GUI::BlurWallpaper() {
     if (!wallpaper_buffer) return;
     int w = Graphics::GetWidth();
     int h = Graphics::GetHeight();
-    
-    // use simple dimming instead of blur for now to avoid artifacts/lag
+
     uint8_t* old = Graphics::GetBuffer();
     Graphics::SetBuffer(wallpaper_buffer);
-    Graphics::FillRectAlpha(0, 0, w, h, 100, 0xFF000000); // darken
+    Graphics::FillRectAlpha(0, 0, w, h, 100, 0xFF000000);
     Graphics::SetBuffer(old);
     UpdateBackbuffer();
 }
 
 void GUI::DrawDesktop() {
     if (!backbuffer) UpdateBackbuffer();
-    
+    if (!backbuffer) return;
+
     uint8_t* fb = Graphics::GetBuffer();
     int w = Graphics::GetWidth();
     int h = Graphics::GetHeight();
     int pitch = Graphics::GetPitch();
-    
-    // copy backbuffer to screen
-    int size = h * pitch;
-    uint32_t* src = (uint32_t*)backbuffer;
-    uint32_t* dst = (uint32_t*)fb;
-    int n = size / 4;
-    
-    // manual unrolling for speed
-    int i = 0;
-    for(; i < n - 8; i+=8) {
-        dst[i] = src[i]; dst[i+1] = src[i+1]; dst[i+2] = src[i+2]; dst[i+3] = src[i+3];
-        dst[i+4] = src[i+4]; dst[i+5] = src[i+5]; dst[i+6] = src[i+6]; dst[i+7] = src[i+7];
-    }
-    for(; i < n; i++) dst[i] = src[i];
+    if (!fb || w <= 0 || h <= 0 || pitch <= 0) return;
 
-    // drawdesktop does a full-frame blit, so swapbuffers must do a full copy.
-    // clear any stale dirty regions (accumulated while drawing to gui::backbuffer)
-    // then mark the whole screen so swapbuffers falls through to full-frame copy.
+    size_t sz = (size_t)h * (size_t)pitch;
+    dword_copy((uint32_t*)fb, (uint32_t*)backbuffer, sz / 4);
+
     Graphics::ClearDirtyRegions();
     Graphics::MarkDirty(0, 0, w, h);
 }
@@ -226,29 +224,27 @@ void GUI::DrawRegion(int x, int y, int w, int h) {
     int pitch = Graphics::GetPitch();
     int bpp = Graphics::GetBpp();
     uint8_t* fb = Graphics::GetBuffer();
-    
-    // clip
+    if (!fb || bpp < 8) return;
+
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > sw) w = sw - x;
     if (y + h > sh) h = sh - y;
     if (w <= 0 || h <= 0) return;
-    
+
+    int bytes_pp = bpp / 8;
     for (int j = 0; j < h; j++) {
-        int ly = y + j; 
-        int py = ly; 
-        
-        uint32_t offset = py * pitch + x * (bpp / 8);
-        
+        int ly = y + j;
+        size_t offset = (size_t)ly * (size_t)pitch + (size_t)x * (size_t)bytes_pp;
         if (bpp == 32) {
-             uint32_t* src = (uint32_t*)(backbuffer + offset);
-             uint32_t* dst = (uint32_t*)(fb + offset);
-             for(int k=0; k<w; k++) dst[k] = src[k];
+            uint32_t* src = (uint32_t*)(backbuffer + offset);
+            uint32_t* dst = (uint32_t*)(fb + offset);
+            dword_copy(dst, src, (size_t)w);
         } else {
-             uint8_t* src = backbuffer + offset;
-             uint8_t* dst = fb + offset;
-             int bytes = w * (bpp / 8);
-             for(int k=0; k<bytes; k++) dst[k] = src[k];
+            uint8_t* src = backbuffer + offset;
+            uint8_t* dst = fb + offset;
+            int bytes = w * bytes_pp;
+            for (int k = 0; k < bytes; k++) dst[k] = src[k];
         }
     }
 }
@@ -259,31 +255,21 @@ void GUI::RestoreRegion(int x, int y, int w, int h) {
     int sh = Graphics::GetHeight();
     int pitch = Graphics::GetPitch();
     int bpp = Graphics::GetBpp();
-    (void)bpp;
     uint8_t* fb = Graphics::GetBuffer();
-    
-    // clip
+    if (!fb || bpp != 32) return;
+
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > sw) w = sw - x;
     if (y + h > sh) h = sh - y;
     if (w <= 0 || h <= 0) return;
-    
-    // copy from backbuffer to fb
-    // assuming 32bpp and pitch aligned
+
     for (int j = 0; j < h; j++) {
-        int ly = y + j; 
-        uint32_t offset = ly * pitch + x * 4;
-        
+        int ly = y + j;
+        size_t offset = (size_t)ly * (size_t)pitch + (size_t)x * 4;
         uint32_t* src = (uint32_t*)(backbuffer + offset);
         uint32_t* dst = (uint32_t*)(fb + offset);
-        
-        // manual unroll 
-        int i = 0;
-        for (; i < w - 4; i += 4) {
-             dst[i] = src[i]; dst[i+1] = src[i+1]; dst[i+2] = src[i+2]; dst[i+3] = src[i+3];
-        }
-        for (; i < w; i++) dst[i] = src[i];
+        dword_copy(dst, src, (size_t)w);
     }
 }
 
@@ -293,6 +279,7 @@ void GUI::DrawLogin() {
     Graphics::Clear(0xFF000000);
     int panel_w = w * 4 / 10; if (panel_w < 320) panel_w = 320; if (panel_w > w - 120) panel_w = w - 120;
     int panel_h = h * 3 / 10; if (panel_h < 220) panel_h = 220; if (panel_h > h - 120) panel_h = h - 120;
+    if (panel_w <= 0 || panel_h <= 0) return;
     int px = (w - panel_w) / 2;
     int py = (h - panel_h) / 2;
     Graphics::FillRect(px, py, panel_w, panel_h, 0xFF121212);

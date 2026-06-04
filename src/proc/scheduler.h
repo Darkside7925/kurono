@@ -118,6 +118,12 @@ struct Process {
     int      nice;              // -20..+19, default 0
     uint8_t  sched_class;       // 0=NORMAL/CFS, 1=FIFO, 2=RR, 3=IDLE
     uint8_t  cpu_affinity;      // bitmask of allowed CPUs (bit n = CPU n)
+    uint8_t  interactive_score; // 0..16; recent I/O wakes bump it, CPU burn decays it
+    uint8_t  reaped;            // 1 once DestroyProcess has freed the struct (double-free guard)
+    uint64_t last_wake_ms;      // wall-time of most recent block->ready transition
+    uint64_t sleep_start_ms;    // wall-time the task entered the most recent sleep
+    uint64_t cgroup_quota_left_us; // remaining bandwidth in current refill window
+    uint64_t cgroup_throttle_until_ms; // 0 if not throttled
     uint32_t cgroup_id;         // cgroup v2 membership
     uint32_t ns_pid;            // pid namespace id
     uint32_t ns_mnt;            // mount namespace id

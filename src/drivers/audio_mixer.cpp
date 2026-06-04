@@ -9,38 +9,32 @@ namespace AudioMixer {
 
 using AudioFormat::MixSample;
 
-// ---- per-stream state ----
-//
-// The ring stores canonical interleaved MixSamples already converted to
-// the mixer's internal rate + channel count.  Write() does the format
-// conversion eagerly so Tick() is just a sum loop.
 struct Stream {
     char     name[24];
     StreamState state;
 
-    // Source format hints.  Used by Write() to know how to convert.
     AudioFormat::SampleFormat src_fmt;
     uint32_t src_rate;
     int      src_channels;
 
-    // Per-stream gain.  Applied on the read-side during mixing.
-    int      volume_pct;       // 0..100
-    int      pan;              // -100..+100
+    int      volume_pct;
+    int      pan;
     bool     muted;
 
-    // Fade ramp.  When `fade_remaining > 0`, every period subtracts
-    // (32768 / fade_total) from `fade_gain` and decrements
-    // fade_remaining by PERIOD_FRAMES; once fade_gain hits 0 the
-    // stream auto-closes (state = FREE).
-    int32_t  fade_gain;        // q15, 32768 == 1.0
-    int32_t  fade_total;       // total frames in the fade
-    int32_t  fade_remaining;   // frames left in the fade
+    // Smoothed gain values in q15  -  updated once per period so per-stream
+    // volume / pan changes don't click.  Target values are derived from
+    // volume_pct + pan; smoothing is a one-pole filter with ~4 ms tau.
+    int32_t  cur_lg_q15;
+    int32_t  cur_rg_q15;
 
-    // Ring buffer (interleaved canonical, INTERNAL_CHANNELS wide).
+    int32_t  fade_gain;        // q15, 32768 == 1.0
+    int32_t  fade_total;
+    int32_t  fade_remaining;
+
     MixSample ring[STREAM_RING_FRAMES * INTERNAL_CHANNELS];
-    uint32_t  rd;              // read frame index (mod STREAM_RING_FRAMES)
-    uint32_t  wr;              // write frame index
-    uint32_t  count;           // valid frames available
+    uint32_t  rd;
+    uint32_t  wr;
+    uint32_t  count;
 
     StreamStats stats;
 };
@@ -48,32 +42,21 @@ struct Stream {
 static Stream g_streams[MAX_STREAMS];
 static int    g_active_count = 0;
 
-// ---- master state ----
-static int     g_master_volume = 80;       // 0..100
+static int     g_master_volume = 80;
 static bool    g_master_mute   = false;
-static int32_t g_eq_bass   = 4096;          // q12 gain (4096 = 1.0 = 0 dB)
+static int32_t g_eq_bass   = 4096;
 static int32_t g_eq_mid    = 4096;
 static int32_t g_eq_treble = 4096;
 static bool    g_limiter_on= true;
 static bool    g_initialised = false;
 
-// ---- EQ filter state (3-band shelving via 1-pole IIR pairs) ----
-//
-// The EQ runs at the internal rate, stereo.  Each band is a single-pole
-// low-pass / high-pass pair with crossover frequencies chosen for 250 Hz
-// and 4 kHz at 48 kHz.  We use q15 fixed-point coefficients.
-//
-// alpha = 1 - exp(-2pi*fc/fs), pre-computed:
-//   fc=250  -> alpha ~= 0.0323 -> q15 = 1058
-//   fc=4000 -> alpha ~= 0.4067 -> q15 = 13327
 constexpr int32_t kAlphaLow_q15  = 1058;
 constexpr int32_t kAlphaHigh_q15 = 13327;
 
-static MixSample g_lp_state_low[INTERNAL_CHANNELS]  = {};   // < 250 Hz residual
-static MixSample g_lp_state_high[INTERNAL_CHANNELS] = {};   // < 4 kHz residual
+static MixSample g_lp_state_low[INTERNAL_CHANNELS]  = {};
+static MixSample g_lp_state_high[INTERNAL_CHANNELS] = {};
 
 static inline MixSample EqProcess(int ch, MixSample s) {
-    // y_lp = y_lp + alpha * (x - y_lp)
     int32_t diff_low  = s - g_lp_state_low[ch];
     g_lp_state_low[ch] += static_cast<MixSample>((diff_low * kAlphaLow_q15) >> 15);
     int32_t bass = g_lp_state_low[ch];
@@ -93,25 +76,16 @@ static inline MixSample EqProcess(int ch, MixSample s) {
     return static_cast<MixSample>(out);
 }
 
-// ---- soft limiter ----
-//
-// Rolling 1024-sample peak in q15 attenuation.  When peak exceeds the
-// threshold (kMixMax), reduce gain by `peak / kMixMax` until peak
-// recovers.  Smoothing factor 0.99 in q15 = 32440.
 static int32_t g_limiter_gain_q15 = 32768;
-constexpr int32_t kLimiterRecover_q15 = 32440;
 
 static inline MixSample LimiterProcess(MixSample s) {
     int32_t mag = s < 0 ? -s : s;
     if (mag > AudioFormat::kMixMax) {
         int32_t need = (static_cast<int64_t>(AudioFormat::kMixMax) << 15) / mag;
         if (need < g_limiter_gain_q15) g_limiter_gain_q15 = need;
-    } else {
-        // exponential recovery toward unity gain
-        if (g_limiter_gain_q15 < 32768) {
-            g_limiter_gain_q15 += (32768 - g_limiter_gain_q15) >> 9;
-            if (g_limiter_gain_q15 > 32768) g_limiter_gain_q15 = 32768;
-        }
+    } else if (g_limiter_gain_q15 < 32768) {
+        g_limiter_gain_q15 += (32768 - g_limiter_gain_q15) >> 9;
+        if (g_limiter_gain_q15 > 32768) g_limiter_gain_q15 = 32768;
     }
     return static_cast<MixSample>((static_cast<int64_t>(s) * g_limiter_gain_q15) >> 15);
 }
@@ -125,6 +99,8 @@ void Init() {
         g_streams[i].volume_pct = 100;
         g_streams[i].pan = 0;
         g_streams[i].muted = false;
+        g_streams[i].cur_lg_q15 = 32768;
+        g_streams[i].cur_rg_q15 = 32768;
         g_streams[i].fade_gain = 32768;
         g_streams[i].fade_total = 0;
         g_streams[i].fade_remaining = 0;
@@ -134,6 +110,7 @@ void Init() {
         g_lp_state_low[c]  = 0;
         g_lp_state_high[c] = 0;
     }
+    g_limiter_gain_q15 = 32768;
     g_active_count = 0;
     g_initialised = true;
     SerialLogger::Log("[AudioMixer] Init: ");
@@ -179,6 +156,14 @@ StreamID Open(const char* name, AudioFormat::SampleFormat fmt,
     s->volume_pct     = 100;
     s->pan            = 0;
     s->muted          = false;
+    // Start gain ramps muted so the first period fades up  -  eliminates
+    // the click some apps get when opening a stream while another is
+    // playing at full scale.
+    // Snap to full gain on Open so transient sounds (taps, beeps) don't
+    // start with an audible fade-in.  Volume changes mid-stream still
+    // smooth via the per-period glide in Tick().
+    s->cur_lg_q15     = 32768;
+    s->cur_rg_q15     = 32768;
     s->fade_gain      = 32768;
     s->fade_total     = 0;
     s->fade_remaining = 0;
@@ -192,7 +177,6 @@ void Close(StreamID id) {
     if (id < 0 || id >= MAX_STREAMS) return;
     Stream* s = &g_streams[id];
     if (s->state == STREAM_FREE) return;
-    // schedule a 5 ms fade-out so we don't click.
     int32_t fade_frames = static_cast<int32_t>((INTERNAL_RATE * 5) / 1000);
     s->state          = STREAM_FADING;
     s->fade_total     = fade_frames;
@@ -210,11 +194,14 @@ void Drain(StreamID id) {
 uint32_t Write(StreamID id, const void* src, uint32_t frames) {
     if (id < 0 || id >= MAX_STREAMS || !src || frames == 0) return 0;
     Stream* s = &g_streams[id];
-    if (s->state == STREAM_FREE || s->state == STREAM_FADING) return 0;
+    if (s->state == STREAM_FREE || s->state == STREAM_FADING ||
+        s->state == STREAM_DRAINING) return 0;
 
-    // Convert source -> canonical stereo @ INTERNAL_RATE in chunks that
-    // fit in our 8 KB scratch (1024 frames * 2 ch * 4 B = 8 KB).
+    // Pool of two scratch buffers reused across all Write() calls.
+    // Single-threaded by design (kernel main loop owns the mixer); the
+    // statics replace per-call heap allocs.
     static MixSample scratch[2048];
+    static MixSample scratch_b[2048];
     constexpr uint32_t SCRATCH_FRAMES = 1024;
 
     const uint8_t* in_p   = static_cast<const uint8_t*>(src);
@@ -223,17 +210,13 @@ uint32_t Write(StreamID id, const void* src, uint32_t frames) {
     uint32_t produced_total = 0;
 
     while (in_left > 0) {
-        // How many input frames we can decode this round?  Bounded by
-        // whatever fits in scratch *as input channels*.
         uint32_t in_chunk = SCRATCH_FRAMES;
         if (in_chunk > in_left) in_chunk = in_left;
         if (in_chunk * static_cast<uint32_t>(s->src_channels) > 2048) {
             in_chunk = 2048 / static_cast<uint32_t>(s->src_channels);
         }
+        if (in_chunk == 0) break;
 
-        // Decode + channel-convert + resample using the format helper.
-        // We do the whole pipeline into scratch, then copy into the ring.
-        static MixSample scratch_b[2048];
         MixSample* cur   = scratch;
         MixSample* other = scratch_b;
         uint32_t   cur_frames = in_chunk;
@@ -247,6 +230,7 @@ uint32_t Write(StreamID id, const void* src, uint32_t frames) {
             MixSample* t = cur; cur = other; other = t;
             cur_ch = INTERNAL_CHANNELS;
         }
+        (void)cur_ch;
         if (s->src_rate != INTERNAL_RATE) {
             uint32_t cap = 2048 / INTERNAL_CHANNELS;
             cur_frames = AudioFormat::ResampleLinear(
@@ -255,24 +239,38 @@ uint32_t Write(StreamID id, const void* src, uint32_t frames) {
             MixSample* t = cur; cur = other; other = t;
         }
 
-        // Copy into the ring (frame at a time, INTERNAL_CHANNELS wide).
-        for (uint32_t f = 0; f < cur_frames; f++) {
-            if (s->count >= STREAM_RING_FRAMES) {
-                s->stats.overflows++;
-                // drop the rest of this batch  -  caller can retry next tick.
-                in_left = 0;
-                goto done_this_chunk;
-            }
-            for (int c = 0; c < INTERNAL_CHANNELS; c++) {
-                s->ring[s->wr * INTERNAL_CHANNELS + c] =
-                    cur[f * INTERNAL_CHANNELS + c];
-            }
-            s->wr = (s->wr + 1) % STREAM_RING_FRAMES;
-            s->count++;
-            s->stats.frames_written++;
-            produced_total++;
+        // Bulk-copy as many contiguous frames as the ring allows in one
+        // go to avoid per-frame modulo.
+        uint32_t writable = STREAM_RING_FRAMES - s->count;
+        if (writable == 0) { s->stats.overflows++; break; }
+        uint32_t to_take = cur_frames < writable ? cur_frames : writable;
+        uint32_t first_chunk = STREAM_RING_FRAMES - s->wr;
+        if (first_chunk > to_take) first_chunk = to_take;
+        // Copy first contiguous segment
+        for (uint32_t f = 0; f < first_chunk; f++) {
+            MixSample* dst = &s->ring[(s->wr + f) * INTERNAL_CHANNELS];
+            dst[0] = cur[f * INTERNAL_CHANNELS + 0];
+            dst[1] = cur[f * INTERNAL_CHANNELS + 1];
         }
-done_this_chunk:
+        // Wrap-around segment
+        uint32_t second_chunk = to_take - first_chunk;
+        for (uint32_t f = 0; f < second_chunk; f++) {
+            MixSample* dst = &s->ring[f * INTERNAL_CHANNELS];
+            dst[0] = cur[(first_chunk + f) * INTERNAL_CHANNELS + 0];
+            dst[1] = cur[(first_chunk + f) * INTERNAL_CHANNELS + 1];
+        }
+        s->wr = (s->wr + to_take) % STREAM_RING_FRAMES;
+        s->count += to_take;
+        s->stats.frames_written += to_take;
+        produced_total += to_take;
+
+        if (to_take < cur_frames) {
+            // Ring is now full; drop the rest of this chunk.
+            s->stats.overflows++;
+            in_left = 0;
+            break;
+        }
+
         in_p     += in_chunk * in_step;
         in_left  -= in_chunk;
     }
@@ -339,81 +337,87 @@ const char* StreamName(StreamID id) {
     return g_streams[id].name;
 }
 
-// ---- the actual mixer pump ----
-
 uint32_t Tick() {
     if (!g_initialised) return 0;
     AudioBackend* be = AudioServer::ActiveBackend();
     if (!be || !be->IsReady()) return 0;
 
-    // Let the backend poll its DMA / refill its hw ring.
     be->Tick();
 
-    // Don't outpace the hardware: if more than ~3 periods are queued,
-    // skip this tick to keep latency bounded but the ring fed.
     if (be->QueuedFrames() > PERIOD_FRAMES * 3) return 0;
 
-    // Mixing accumulator (interleaved stereo, q24 with 8 bits headroom).
     static int64_t  accum[PERIOD_FRAMES * INTERNAL_CHANNELS];
     static int16_t  output[PERIOD_FRAMES * INTERNAL_CHANNELS];
 
     for (uint32_t i = 0; i < PERIOD_FRAMES * INTERNAL_CHANNELS; i++) accum[i] = 0;
 
-    // Pre-compute master gain in q15.
     int32_t master_q15 = g_master_mute ? 0
                        : (int32_t)((g_master_volume * 32768L) / 100);
 
     uint32_t period_peak = 0;
+    const bool eq_active = (g_eq_bass != 4096 || g_eq_mid != 4096 || g_eq_treble != 4096);
 
     for (int i = 0; i < MAX_STREAMS; i++) {
         Stream* s = &g_streams[i];
         if (s->state == STREAM_FREE || s->state == STREAM_PAUSED) continue;
-        if (s->muted) {
-            // still consume the ring so audio doesn't drift on un-mute
-            uint32_t to_drop = s->count < PERIOD_FRAMES ? s->count : PERIOD_FRAMES;
-            s->rd     = (s->rd + to_drop) % STREAM_RING_FRAMES;
-            s->count -= to_drop;
-            s->stats.frames_consumed += to_drop;
-            continue;
-        }
 
-        // Pre-compute pan gains (left/right q15) and stream gain.
-        int32_t stream_q15 = (int32_t)((s->volume_pct * 32768L) / 100);
+        // Compute target per-stream gains.  Muted streams ramp to 0 but
+        // we still consume from the ring (so audio doesn't drift when
+        // un-muted, and so DRAINING streams still free themselves).
+        int32_t stream_q15 = s->muted ? 0
+                                       : (int32_t)((s->volume_pct * 32768L) / 100);
         int32_t pan_l_q15 = 32768, pan_r_q15 = 32768;
-        if (s->pan < 0) pan_r_q15 = 32768 + (s->pan * 32768 / 100); // pan<0 -> reduce R
-        if (s->pan > 0) pan_l_q15 = 32768 - (s->pan * 32768 / 100); // pan>0 -> reduce L
-        int32_t lg_q15 = (int32_t)(((int64_t)stream_q15 * pan_l_q15) >> 15);
-        int32_t rg_q15 = (int32_t)(((int64_t)stream_q15 * pan_r_q15) >> 15);
+        if (s->pan < 0) pan_r_q15 = 32768 + (s->pan * 32768 / 100);
+        if (s->pan > 0) pan_l_q15 = 32768 - (s->pan * 32768 / 100);
+        int32_t tgt_lg = (int32_t)(((int64_t)stream_q15 * pan_l_q15) >> 15);
+        int32_t tgt_rg = (int32_t)(((int64_t)stream_q15 * pan_r_q15) >> 15);
 
-        // How many frames can we pull?
+        // Per-period exponential glide (≈ 4 ms tau @ 48 kHz, period 1024).
+        // Cuts pop/click on volume changes and on stream open/close.
+        s->cur_lg_q15 += (tgt_lg - s->cur_lg_q15) >> 3;
+        s->cur_rg_q15 += (tgt_rg - s->cur_rg_q15) >> 3;
+        int32_t lg_q15 = s->cur_lg_q15;
+        int32_t rg_q15 = s->cur_rg_q15;
+
         uint32_t avail = s->count < PERIOD_FRAMES ? s->count : PERIOD_FRAMES;
         if (avail < PERIOD_FRAMES && s->state == STREAM_PLAYING) {
             s->stats.underruns++;
         }
 
-        for (uint32_t f = 0; f < avail; f++) {
-            MixSample l = s->ring[s->rd * INTERNAL_CHANNELS + 0];
-            MixSample r = s->ring[s->rd * INTERNAL_CHANNELS + 1];
+        const bool is_fading = (s->state == STREAM_FADING && s->fade_total > 0);
+        const int32_t fade_total = s->fade_total;
+        const int32_t fade_rem   = s->fade_remaining;
 
-            // Apply fade ramp if active.
-            if (s->state == STREAM_FADING && s->fade_total > 0) {
-                int32_t g = (int32_t)((int64_t)s->fade_gain *
-                                      (s->fade_total - (s->fade_total - s->fade_remaining + (int32_t)f)) /
-                                      s->fade_total);
-                if (g < 0) g = 0;
-                l = (MixSample)(((int64_t)l * g) >> 15);
-                r = (MixSample)(((int64_t)r * g) >> 15);
+        // Bulk copy with contiguous segments to avoid per-frame modulo
+        // in the hot loop.
+        uint32_t consumed = 0;
+        while (consumed < avail) {
+            uint32_t first_run = STREAM_RING_FRAMES - s->rd;
+            uint32_t run = avail - consumed;
+            if (run > first_run) run = first_run;
+
+            for (uint32_t k = 0; k < run; k++) {
+                uint32_t f = consumed + k;
+                const MixSample* sp = &s->ring[(s->rd + k) * INTERNAL_CHANNELS];
+                MixSample l = sp[0];
+                MixSample r = sp[1];
+                if (is_fading) {
+                    int32_t fade_pos = fade_rem - (int32_t)f;
+                    if (fade_pos < 0) fade_pos = 0;
+                    int32_t g = (int32_t)(((int64_t)fade_pos << 15) / fade_total);
+                    if (g > 32768) g = 32768;
+                    l = (MixSample)(((int64_t)l * g) >> 15);
+                    r = (MixSample)(((int64_t)r * g) >> 15);
+                }
+                accum[f * INTERNAL_CHANNELS + 0] += ((int64_t)l * lg_q15) >> 15;
+                accum[f * INTERNAL_CHANNELS + 1] += ((int64_t)r * rg_q15) >> 15;
             }
-
-            accum[f * INTERNAL_CHANNELS + 0] += ((int64_t)l * lg_q15) >> 15;
-            accum[f * INTERNAL_CHANNELS + 1] += ((int64_t)r * rg_q15) >> 15;
-
-            s->rd = (s->rd + 1) % STREAM_RING_FRAMES;
-            s->count--;
-            s->stats.frames_consumed++;
+            s->rd = (s->rd + run) % STREAM_RING_FRAMES;
+            s->count -= run;
+            s->stats.frames_consumed += run;
+            consumed += run;
         }
 
-        // Update fade.
         if (s->state == STREAM_FADING) {
             s->fade_remaining -= (int32_t)avail;
             if (s->fade_remaining <= 0) {
@@ -422,38 +426,40 @@ uint32_t Tick() {
             }
         }
 
-        // Auto-free drained streams once their ring is empty.
         if (s->state == STREAM_DRAINING && s->count == 0) {
             s->state = STREAM_FREE;
             g_active_count--;
         }
     }
 
-    // Apply master gain + EQ + limiter, encode to s16.
-    for (uint32_t f = 0; f < PERIOD_FRAMES; f++) {
-        for (int c = 0; c < INTERNAL_CHANNELS; c++) {
-            int64_t v = accum[f * INTERNAL_CHANNELS + c];
-            // Master gain
-            v = (v * master_q15) >> 15;
-            // Clamp to MixSample range before EQ
+    // Master gain + optional EQ + optional limiter + s16 encode.
+    // Hot loop is constant-stride to give the auto-vectoriser a chance.
+    if (!eq_active && !g_limiter_on) {
+        const uint32_t total = PERIOD_FRAMES * INTERNAL_CHANNELS;
+        for (uint32_t i = 0; i < total; i++) {
+            int64_t v = (accum[i] * master_q15) >> 15;
             if (v > AudioFormat::kMixMax) v = AudioFormat::kMixMax;
-            if (v < AudioFormat::kMixMin) v = AudioFormat::kMixMin;
-            MixSample sm = (MixSample)v;
-            // EQ
-            if (g_eq_bass != 4096 || g_eq_mid != 4096 || g_eq_treble != 4096) {
-                sm = EqProcess(c, sm);
-            }
-            // Limiter
-            if (g_limiter_on) sm = LimiterProcess(sm);
-            // Track period peak
-            uint32_t mag = (uint32_t)(sm < 0 ? -sm : sm);
+            else if (v < AudioFormat::kMixMin) v = AudioFormat::kMixMin;
+            uint32_t mag = (uint32_t)(v < 0 ? -v : v);
             if (mag > period_peak) period_peak = mag;
-            // Encode to s16 for the backend
-            output[f * INTERNAL_CHANNELS + c] = AudioFormat::ClampToS16(sm);
+            output[i] = AudioFormat::ClampToS16((MixSample)v);
+        }
+    } else {
+        for (uint32_t f = 0; f < PERIOD_FRAMES; f++) {
+            for (int c = 0; c < INTERNAL_CHANNELS; c++) {
+                int64_t v = (accum[f * INTERNAL_CHANNELS + c] * master_q15) >> 15;
+                if (v > AudioFormat::kMixMax) v = AudioFormat::kMixMax;
+                else if (v < AudioFormat::kMixMin) v = AudioFormat::kMixMin;
+                MixSample sm = (MixSample)v;
+                if (eq_active)  sm = EqProcess(c, sm);
+                if (g_limiter_on) sm = LimiterProcess(sm);
+                uint32_t mag = (uint32_t)(sm < 0 ? -sm : sm);
+                if (mag > period_peak) period_peak = mag;
+                output[f * INTERNAL_CHANNELS + c] = AudioFormat::ClampToS16(sm);
+            }
         }
     }
 
-    // Update per-stream peak (cheap  -  same period peak for all).
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (g_streams[i].state != STREAM_FREE) g_streams[i].stats.peak_level = period_peak;
     }

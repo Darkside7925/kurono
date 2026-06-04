@@ -68,21 +68,55 @@ struct KVFSNode {
     int (*dev_read)(KVFSNode* node, uint32_t offset, uint32_t len, uint8_t* buf);
     int (*dev_write)(KVFSNode* node, uint32_t offset, uint32_t len, const uint8_t* buf);
 
+    // small open-addressing hash; size = next power of two >= KVFS_MAX_CHILDREN*2.
+    // 256 buckets, each storing the index into children[] (-1 = empty).
+    static const int HASH_SIZE = 256;
+    int16_t hash_table[HASH_SIZE];
+
     bool is_dir() const { return type == KVFS_DIR || type == KVFS_MOUNTPOINT; }
     bool is_file() const { return type == KVFS_FILE; }
 
+    static uint32_t hash_name(const char* s) {
+        uint32_t h = 2166136261u;
+        while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+        return h;
+    }
+
     KVFSNode* find_child(const char* n) const {
-        for (int i = 0; i < child_count; i++) {
-            if (children[i] && str_eq(children[i]->name, n))
-                return children[i];
+        if (child_count == 0) return nullptr;
+        uint32_t h = hash_name(n) & (HASH_SIZE - 1);
+        for (int probe = 0; probe < HASH_SIZE; probe++) {
+            int slot = (h + probe) & (HASH_SIZE - 1);
+            int16_t idx = hash_table[slot];
+            if (idx < 0) return nullptr;
+            if (idx < child_count && children[idx] && str_eq(children[idx]->name, n))
+                return children[idx];
         }
         return nullptr;
+    }
+
+    void rebuild_hash() {
+        for (int i = 0; i < HASH_SIZE; i++) hash_table[i] = -1;
+        for (int i = 0; i < child_count; i++) {
+            if (!children[i]) continue;
+            uint32_t h = hash_name(children[i]->name) & (HASH_SIZE - 1);
+            for (int probe = 0; probe < HASH_SIZE; probe++) {
+                int slot = (h + probe) & (HASH_SIZE - 1);
+                if (hash_table[slot] < 0) { hash_table[slot] = (int16_t)i; break; }
+            }
+        }
     }
 
     bool add_child(KVFSNode* c) {
         if (child_count >= KVFS_MAX_CHILDREN) return false;
         c->parent = this;
-        children[child_count++] = c;
+        children[child_count] = c;
+        uint32_t h = hash_name(c->name) & (HASH_SIZE - 1);
+        for (int probe = 0; probe < HASH_SIZE; probe++) {
+            int slot = (h + probe) & (HASH_SIZE - 1);
+            if (hash_table[slot] < 0) { hash_table[slot] = (int16_t)child_count; break; }
+        }
+        child_count++;
         return true;
     }
 
@@ -92,6 +126,7 @@ struct KVFSNode {
                 for (int j = i; j < child_count - 1; j++)
                     children[j] = children[j + 1];
                 child_count--;
+                rebuild_hash();
                 return true;
             }
         }

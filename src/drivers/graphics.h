@@ -78,6 +78,9 @@ public:
     
     // buffer management
     static void SwapBuffers();
+    struct Rect { int x, y, w, h; };
+    // atomic present of an explicit damage list (max 32 rects, NULL/0 => full)
+    static void Present(const Rect* rects, int count);
     static uint8_t* GetActiveBuffer();
     static uint8_t* GetBackBuffer();
     static void ClearBackBuffer(uint32_t color);
@@ -146,11 +149,11 @@ private:
     static RenderMode render_mode;
     static BlendMode blend_mode;
     
-    // frame timing
+    // frame timing  -  64-bit μs to avoid wrap (uint32 wraps every ~71 min)
     static uint32_t target_frame_time_us;
-    static uint32_t last_frame_time;
+    static uint64_t last_frame_time;
     static uint32_t frame_count;
-    static uint32_t fps_sample_time;  // timestamp at last fps sample point
+    static uint64_t fps_sample_time;
     static DrawStats draw_stats;
     
     // bare-metal state

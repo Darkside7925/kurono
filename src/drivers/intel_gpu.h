@@ -40,6 +40,8 @@ struct IntelGPUInfo {
     char       name[64];       // human-readable name
     IntelDisplayPipe pipe_a;
     IntelDisplayPipe pipe_b;
+    bool       has_2d_accel;   // hardware 2D blitter / display plane scaling
+    bool       has_3d_accel;   // render/compute engine usable for compositor
 };
 
 //  intelgpu  -  static driver interface
@@ -57,6 +59,12 @@ public:
     static uintptr_t GetActiveSurfaceAddr();
 
     static bool IsPowerWellEnabled();
+
+    // accel capability flags for the compositor
+    static bool HasHardwareAccel();
+    // best-effort hardware fill into the active scanout  -  returns false if unsupported.
+    // the dst rectangle is clamped to the active pipe's resolution.
+    static bool BlitFillARGB(uint32_t color, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
     static void DumpInfo(char* out, int maxo);
 

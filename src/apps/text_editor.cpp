@@ -3,6 +3,7 @@
 #include "../ui/window_manager.h"
 #include "../fs/kvfs.h"
 #include "../drivers/graphics.h"
+#include "../drivers/timer.h"
 #include "../system/logging.h"
 
 static const unsigned int ED_BG        = 0xFF0A0A18;
@@ -53,6 +54,8 @@ int        TextEditorApp::sel_end_col     = 0;
 bool       TextEditorApp::has_selection   = false;
 bool       TextEditorApp::modified        = false;
 bool       TextEditorApp::show_line_numbers = true;
+unsigned int TextEditorApp::last_keypress_ms = 0;
+int        TextEditorApp::target_scroll_y = 0;
 int        TextEditorApp::menu_open_idx   = -1;
 int        TextEditorApp::menu_x          = 0;
 int        TextEditorApp::menu_y          = 0;
@@ -63,6 +66,8 @@ void TextEditorApp::Init(){
     line_count=1;
     cursor_row=0; cursor_col=0;
     scroll_x=0; scroll_y=0;
+    target_scroll_y=0;
+    last_keypress_ms=0;
     has_selection=false;
     modified=false;
     show_line_numbers=true;
@@ -261,6 +266,7 @@ void TextEditorApp::DeleteLine(int row){
 void TextEditorApp::MoveCursorUp(){
     if(cursor_row>0){
         cursor_row--;
+        if(cursor_row<0) cursor_row=0;
         if(cursor_col>lines[cursor_row].len)
             cursor_col=lines[cursor_row].len;
     }
@@ -268,20 +274,28 @@ void TextEditorApp::MoveCursorUp(){
 void TextEditorApp::MoveCursorDown(){
     if(cursor_row<line_count-1){
         cursor_row++;
+        if(cursor_row>=line_count) cursor_row=line_count-1;
         if(cursor_col>lines[cursor_row].len)
             cursor_col=lines[cursor_row].len;
     }
 }
 void TextEditorApp::MoveCursorLeft(){
     if(cursor_col>0) cursor_col--;
-    else if(cursor_row>0){ cursor_row--; cursor_col=lines[cursor_row].len; }
+    else if(cursor_row>0){
+        cursor_row--;
+        cursor_col=lines[cursor_row].len;
+    }
 }
 void TextEditorApp::MoveCursorRight(){
+    if(cursor_row<0||cursor_row>=line_count) return;
     if(cursor_col<lines[cursor_row].len) cursor_col++;
     else if(cursor_row<line_count-1){ cursor_row++; cursor_col=0; }
 }
 void TextEditorApp::MoveCursorHome(){ cursor_col=0; }
-void TextEditorApp::MoveCursorEnd(){ cursor_col=lines[cursor_row].len; }
+void TextEditorApp::MoveCursorEnd(){
+    if(cursor_row<0||cursor_row>=line_count){ cursor_col=0; return; }
+    cursor_col=lines[cursor_row].len;
+}
 void TextEditorApp::PageUp(int vr){
     cursor_row-=vr; if(cursor_row<0) cursor_row=0;
     if(cursor_col>lines[cursor_row].len) cursor_col=lines[cursor_row].len;
@@ -369,14 +383,23 @@ void TextEditorApp::RenderContent(int x,int y,int w,int h){
     int vis_rows = h / CHAR_H;
     int vis_cols = w / CHAR_W;
 
-    // ensure cursor is visible
-    if(cursor_row < scroll_y) scroll_y = cursor_row;
-    if(cursor_row >= scroll_y + vis_rows) scroll_y = cursor_row - vis_rows + 1;
+    // ensure cursor is visible  -  set target, then ease
+    if(cursor_row < target_scroll_y) target_scroll_y = cursor_row;
+    if(cursor_row >= target_scroll_y + vis_rows) target_scroll_y = cursor_row - vis_rows + 1;
+    if(target_scroll_y < 0) target_scroll_y = 0;
+    if(scroll_y != target_scroll_y){
+        int diff = target_scroll_y - scroll_y;
+        int step = diff / 3;
+        if(step == 0) step = (diff > 0) ? 1 : -1;
+        scroll_y += step;
+    }
     if(cursor_col < scroll_x) scroll_x = cursor_col;
     if(cursor_col >= scroll_x + vis_cols) scroll_x = cursor_col - vis_cols + 1;
 
+    // virtualized row loop  -  only visible rows drawn
     for(int i=0;i<vis_rows && (i+scroll_y)<line_count;i++){
         int row_idx = i + scroll_y;
+        if(row_idx < 0) continue;
         int ry = y + i * CHAR_H;
 
         // current line highlight
@@ -385,18 +408,28 @@ void TextEditorApp::RenderContent(int x,int y,int w,int h){
         }
 
         EditorLine* ln = &lines[row_idx];
-        for(int j=scroll_x; j<ln->len && (j-scroll_x)<vis_cols; j++){
-            char s[2]={ln->text[j],0};
-            int dx=x+(j-scroll_x)*CHAR_W;
-            Graphics::DrawString(dx, ry, s, ED_TEXT, 0xFF000000);
+        // pre-sized scratch buffer (no heap)
+        char rowbuf[ED_LINE_MAX+1];
+        int rb = 0;
+        for(int j=scroll_x; j<ln->len && (j-scroll_x)<vis_cols && rb<ED_LINE_MAX; j++){
+            rowbuf[rb++] = ln->text[j];
         }
+        rowbuf[rb] = 0;
+        if(rb > 0) Graphics::DrawString(x, ry, rowbuf, ED_TEXT, 0xFF000000);
     }
 
-    // cursor
-    int cx = x + (cursor_col - scroll_x) * CHAR_W;
-    int cy_c = y + (cursor_row - scroll_y) * CHAR_H;
-    if(cx>=x && cx<x+w && cy_c>=y && cy_c<y+h){
-        Graphics::FillRect(cx, cy_c, 2, CHAR_H, ED_CURSOR);
+    // blinking cursor  -  pause-on-keypress, ms-based 500ms period
+    unsigned int now_ms = Timer::GetRealMs();
+    unsigned int since_key = now_ms - last_keypress_ms;
+    bool cursor_visible;
+    if(since_key < 500) cursor_visible = true;
+    else cursor_visible = ((since_key / 500) % 2) == 0;
+    if(cursor_visible){
+        int cx = x + (cursor_col - scroll_x) * CHAR_W;
+        int cy_c = y + (cursor_row - scroll_y) * CHAR_H;
+        if(cx>=x && cx<x+w && cy_c>=y && cy_c<y+h){
+            Graphics::FillRect(cx, cy_c, 2, CHAR_H, ED_CURSOR);
+        }
     }
 }
 
@@ -497,9 +530,11 @@ bool TextEditorApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
             int row = (my - text_y) / CHAR_H + scroll_y;
             if(row>=0 && row<line_count){
                 cursor_row=row;
+                if(col<0) col=0;
                 cursor_col=col;
                 if(cursor_col>lines[cursor_row].len)
                     cursor_col=lines[cursor_row].len;
+                last_keypress_ms = Timer::GetRealMs();
             }
             menu_open_idx = -1;
             return true;
@@ -510,6 +545,7 @@ bool TextEditorApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     }
 
     if(key==0) return false;
+    last_keypress_ms = Timer::GetRealMs();
 
     // enter
     if(key=='\n'||key=='\r'){ InsertNewline(); return true; }

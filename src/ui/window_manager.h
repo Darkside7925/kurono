@@ -73,6 +73,12 @@ struct Window {
     unsigned char anim_kind;
     unsigned char alpha;            // 0..255
     short anchor_x, anchor_y;       // taskbar target for minimize anim
+
+    // last-rendered geometry: used to damage the previous footprint
+    // when the window moves/resizes/closes so the compositor below
+    // can repaint just what changed.
+    int last_x, last_y, last_w, last_h;
+    bool had_last;
 };
 
 class WindowManager {

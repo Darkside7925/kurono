@@ -50,10 +50,16 @@ int Slab::BitmapClaim(uint32_t* bm, int total){
     for (int w = 0; w < words; w++){
         uint32_t v = ~bm[w];                // 1 = free
         if (!v) continue;
-        // find lowest set bit
-        int b = 0;
+        int b;
+#if defined(__GNUC__) || defined(__clang__)
+        b = __builtin_ctz(v);
+#else
+        b = 0;
         uint32_t t = v;
         while (!(t & 1u)){ t >>= 1; b++; }
+#endif
+        // mask off bits past `total` in the last word so we don't claim slots
+        // that don't exist (the bitmap is rounded up to a whole 32-bit word).
         int idx = w * 32 + b;
         if (idx >= total) continue;
         bm[w] |= (1u << b);
@@ -120,37 +126,56 @@ kmem_cache* Slab::CacheCreate(const char* name, uint32_t object_size, uint32_t a
     if (!Buddy::IsReady())              return nullptr;
     if (cache_count >= SLAB_MAX_CACHES) return nullptr;
     if (object_size == 0)               return nullptr;
+    // overflow guard on object_size + align
+    if (object_size > 0x40000000u)      return nullptr;
     if (align < 8) align = 8;
+    if (align > 4096) align = 4096;
 
     kmem_cache* c = &caches[cache_count++];
     scpy(c->name, name ? name : "anon", SLAB_NAME_MAX);
 
-    // align object size up
     uint32_t osz = object_size;
     osz = (osz + align - 1) & ~(align - 1);
+    if (osz == 0) { cache_count--; return nullptr; }
     c->object_size = osz;
     c->align       = align;
 
-    // pick slab size: 4 KB for small, scale up so we get >= 8 objects.
+    // pick slab size: 4 KB for small, scale up so we get >= 8 objects
+    // (or until we hit our pages_per_slab ceiling).
     uint32_t pages = 1;
     uint32_t bytes = SLAB_PAGE_BYTES;
-    while (((bytes - sizeof(Slab) - 64) / osz) < 8 && pages < 16){
+    while (((bytes - (uint32_t)sizeof(SlabPage) - 64u) / osz) < 8u && pages < 16u){
         pages <<= 1;
         bytes <<= 1;
     }
     c->pages_per_slab = pages;
 
-    // capacity: header + bitmap + objects
-    uint32_t header_min   = sizeof(SlabPage);
-    uint32_t free_bytes   = bytes - header_min;
-    uint32_t guess_objs   = free_bytes / osz;
-    uint32_t bitmap_bytes = ((guess_objs + 31) / 32) * 4;
-    while (header_min - sizeof(uint32_t) + bitmap_bytes + guess_objs * osz > bytes){
-        guess_objs--;
-        bitmap_bytes = ((guess_objs + 31) / 32) * 4;
+    // capacity: header + bitmap + objects. Solve for objs_per_slab using
+    // closed form instead of a while-decrement that can underflow.
+    uint32_t header_min   = (uint32_t)sizeof(SlabPage);
+    uint32_t header_fixed = header_min - (uint32_t)sizeof(uint32_t);
+
+    // guess + clamp. each obj costs osz bytes + 1 bit in the bitmap (~0.125B).
+    // start with a generous estimate then shrink in a saturated loop.
+    uint64_t free_bytes = (bytes > header_fixed) ? (bytes - header_fixed) : 0;
+    uint64_t guess = free_bytes / osz;
+    if (guess == 0) {
+        cache_count--;
+        return nullptr;
     }
-    c->objs_per_slab = guess_objs;
-    c->bitmap_words  = (guess_objs + 31) / 32;
+    for (int safety = 0; safety < 64; safety++) {
+        uint64_t bm_bytes = ((guess + 31) / 32) * 4;
+        uint64_t need = header_fixed + bm_bytes + guess * osz;
+        if (need <= bytes) break;
+        if (guess <= 1) { guess = 0; break; }
+        guess--;
+    }
+    if (guess == 0 || guess > 0x7FFFFFFFu) {
+        cache_count--;
+        return nullptr;
+    }
+    c->objs_per_slab = (uint32_t)guess;
+    c->bitmap_words  = ((uint32_t)guess + 31) / 32;
     c->alloc_count = c->free_count = 0;
     c->slab_count  = c->total_objs = c->in_use_objs = 0;
     return c;
@@ -195,29 +220,50 @@ void Slab::ReleaseSlab(kmem_cache* c, SlabPage* s){
 
 void* Slab::CacheAlloc(kmem_cache* c){
     if (!c) return nullptr;
+    if (c->objs_per_slab == 0) return nullptr;
+
+    // fast path: pull from partial first (best for cache locality, lowest
+    // chance of having to allocate a new slab).
     SlabPage* s = c->partial;
     if (!s) s = c->empty;
     if (!s){
         s = AllocSlabFor(c);
         if (!s) return nullptr;
     }
-    int idx = BitmapClaim(s->bitmap, s->total);
-    if (idx < 0) return nullptr;
+
+    int idx = BitmapClaim(s->bitmap, (int)s->total);
+    if (idx < 0) {
+        // freelist exhausted mid-slab (race / corruption). Try a fresh slab
+        // exactly once so callers never get a spurious null when the cache
+        // is internally consistent.
+        s = AllocSlabFor(c);
+        if (!s) return nullptr;
+        idx = BitmapClaim(s->bitmap, (int)s->total);
+        if (idx < 0) return nullptr;
+    }
 
     int from = s->list;
     s->in_use++;
     c->in_use_objs++;
     c->alloc_count++;
 
-    // recompute residency
     int to = (s->in_use == s->total) ? 2 : 1;
     if (from != to) MoveToList(c, s, from, to);
 
-    // object pointer = end_of_header + bitmap + idx * obj_size
     uint8_t* base = (uint8_t*)s
                   + (sizeof(SlabPage) - sizeof(uint32_t))
                   + c->bitmap_words * 4;
-    return base + (uint32_t)idx * c->object_size;
+    uint8_t* obj = base + (uint32_t)idx * c->object_size;
+    // zero-on-alloc so callers never see freed payload bytes.
+    uint64_t* z = (uint64_t*)obj;
+    uint32_t qwords = c->object_size / 8;
+    for (uint32_t i = 0; i < qwords; i++) z[i] = 0;
+    uint32_t tail = c->object_size & 7;
+    if (tail) {
+        uint8_t* t = obj + qwords * 8;
+        for (uint32_t i = 0; i < tail; i++) t[i] = 0;
+    }
+    return obj;
 }
 
 static SlabPage* slab_of(void* obj, kmem_cache* c){
@@ -238,8 +284,13 @@ void Slab::CacheFree(kmem_cache* c, void* obj){
                   + (sizeof(SlabPage) - sizeof(uint32_t))
                   + c->bitmap_words * 4;
     uint64_t off = (uint64_t)((uint8_t*)obj - base);
+    if (c->object_size == 0) return;
     int idx = (int)(off / c->object_size);
     if (idx < 0 || (uint32_t)idx >= s->total) return;
+
+    // double-free guard: if the slot is already free, ignore.
+    uint32_t word = s->bitmap[idx >> 5];
+    if (!(word & (1u << (idx & 31)))) return;
 
     BitmapRelease(s->bitmap, idx);
     int from = s->list;
@@ -264,6 +315,8 @@ struct kmalloc_hdr {
 
 void* Slab::kmalloc(uint32_t size){
     if (!ready || size == 0) return nullptr;
+    // overflow guard on the +header math
+    if (size > 0x7FFFFFFFu) return nullptr;
     uint32_t need = size + (uint32_t)sizeof(kmalloc_hdr);
     int shift = SLAB_MIN_SHIFT;
     uint32_t bucket = 1u << shift;
@@ -272,16 +325,16 @@ void* Slab::kmalloc(uint32_t size){
         bucket = 1u << shift;
     }
     if (need > bucket){
-        // too big for slab  -  fall through to Buddy directly.
         void* p = Buddy::AllocBytes(need);
         if (!p) return nullptr;
         kmalloc_hdr* h = (kmalloc_hdr*)p;
         h->magic = KMALLOC_MAGIC;
-        h->shift = 0xFFFFFFFFu;          // sentinel = direct buddy
+        h->shift = 0xFFFFFFFFu;
         h->pad   = need;
         return (void*)((uint8_t*)p + sizeof(kmalloc_hdr));
     }
     int gi = shift - SLAB_MIN_SHIFT;
+    if (gi < 0 || gi >= SLAB_NUM_GENERIC || !generic[gi]) return nullptr;
     void* obj = CacheAlloc(generic[gi]);
     if (!obj) return nullptr;
     kmalloc_hdr* h = (kmalloc_hdr*)obj;
@@ -294,13 +347,16 @@ void* Slab::kmalloc(uint32_t size){
 void Slab::kfree(void* ptr){
     if (!ptr) return;
     kmalloc_hdr* h = (kmalloc_hdr*)((uint8_t*)ptr - sizeof(kmalloc_hdr));
-    if (h->magic != KMALLOC_MAGIC) return;     // double free / foreign ptr
+    if (h->magic != KMALLOC_MAGIC) return;     // double-free / foreign ptr
     if (h->shift == 0xFFFFFFFFu){
-        Buddy::FreeBytes(h, h->pad);
+        uint64_t bytes = h->pad;
+        h->magic = 0xDEADBEEFu;
+        Buddy::FreeBytes(h, bytes);
         return;
     }
     if (h->shift < SLAB_MIN_SHIFT || h->shift > SLAB_MAX_SHIFT) return;
     int gi = (int)h->shift - SLAB_MIN_SHIFT;
+    if (gi < 0 || gi >= SLAB_NUM_GENERIC || !generic[gi]) return;
     h->magic = 0xDEADBEEFu;
     CacheFree(generic[gi], h);
 }

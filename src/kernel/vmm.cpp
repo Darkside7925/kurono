@@ -154,10 +154,12 @@ static uint64_t ensure_table_in_root(uint64_t* parent, uint16_t index, uint64_t 
     return entry_phys(parent[index]);
 }
 
-static bool map_page_in_root(uint64_t root_phys, uint64_t virt_addr,
-                             uint64_t phys_addr, uint64_t flags) {
+static bool map_page_in_root_ex(uint64_t root_phys, uint64_t virt_addr,
+                                uint64_t phys_addr, uint64_t flags,
+                                bool* out_demoted) {
     virt_addr &= ~0xFFFULL;
     phys_addr &= ~0xFFFULL;
+    if (out_demoted) *out_demoted = false;
 
     uint64_t* pml4 = phys_to_virt(root_phys);
 
@@ -178,6 +180,7 @@ static bool map_page_in_root(uint64_t root_phys, uint64_t virt_addr,
     uint16_t p2i = pd_index(virt_addr);
     if (pd[p2i] & PTE_HUGE) {
         uint64_t huge_base = pd[p2i] & ~0x1FFFFFULL;
+        uint64_t huge_flags = pd[p2i] & 0xFFFULL;
         if (phys_addr >= huge_base && phys_addr < huge_base + 0x200000ULL) {
             return true;
         }
@@ -185,11 +188,13 @@ static bool map_page_in_root(uint64_t root_phys, uint64_t virt_addr,
         uint64_t new_pt_phys = alloc_table_page();
         if (!new_pt_phys) return false;
         uint64_t* new_pt = phys_to_virt(new_pt_phys);
+        uint64_t leaf_flags = (huge_flags & ~PTE_HUGE) | PTE_PRESENT;
         for (int i = 0; i < 512; i++) {
-            new_pt[i] = (huge_base + (uint64_t)i * PAGE_SIZE)
-                        | PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL;
+            new_pt[i] = (huge_base + (uint64_t)i * PAGE_SIZE) | leaf_flags;
         }
-        pd[p2i] = new_pt_phys | (PTE_PRESENT | PTE_WRITABLE | ((flags & PTE_USER) ? PTE_USER : 0));
+        pd[p2i] = new_pt_phys | PTE_PRESENT | PTE_WRITABLE
+                              | ((flags & PTE_USER) ? PTE_USER : 0);
+        if (out_demoted) *out_demoted = true;
     }
     uint64_t pt_phys = ensure_table_in_root(pd, p2i, flags);
     if (!pt_phys) return false;
@@ -198,6 +203,11 @@ static bool map_page_in_root(uint64_t root_phys, uint64_t virt_addr,
     uint16_t p1i = pt_index(virt_addr);
     pt[p1i] = phys_addr | PTE_PRESENT | flags;
     return true;
+}
+
+static bool map_page_in_root(uint64_t root_phys, uint64_t virt_addr,
+                             uint64_t phys_addr, uint64_t flags) {
+    return map_page_in_root_ex(root_phys, virt_addr, phys_addr, flags, nullptr);
 }
 
 static void unmap_page_in_root(uint64_t root_phys, uint64_t virt_addr, bool free_frame) {
@@ -350,14 +360,26 @@ uint64_t KernelVMM::GetCurrentAddressSpace() {
 }
 
 bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
-    bool mapped = map_page_in_root(pml4_phys, virt_addr, phys_addr, flags);
-    if (mapped) InvalidatePage(virt_addr);
-    return mapped;
+    bool demoted = false;
+    bool mapped = map_page_in_root_ex(pml4_phys, virt_addr, phys_addr, flags, &demoted);
+    if (!mapped) return false;
+    // demoting a 2MB huge page invalidates 512 4KB translations  -  a single
+    // INVLPG can leave stale large-page TLB entries behind on some CPUs.
+    if (demoted) FlushTLB();
+    else         InvalidatePage(virt_addr);
+    return true;
 }
 
 bool KernelVMM::MapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                       uint64_t phys_addr, uint64_t flags) {
-    return map_page_in_root(root_pml4, virt_addr, phys_addr, flags);
+    bool demoted = false;
+    bool mapped = map_page_in_root_ex(root_pml4, virt_addr, phys_addr, flags, &demoted);
+    if (!mapped) return false;
+    if (root_pml4 == current_cr3()) {
+        if (demoted) FlushTLB();
+        else         InvalidatePage(virt_addr);
+    }
+    return true;
 }
 
 void KernelVMM::UnmapPage(uint64_t virt_addr, bool free_frame) {
@@ -368,6 +390,69 @@ void KernelVMM::UnmapPage(uint64_t virt_addr, bool free_frame) {
 void KernelVMM::UnmapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                         bool free_frame) {
     unmap_page_in_root(root_pml4, virt_addr, free_frame);
+    if (root_pml4 == current_cr3()) InvalidatePage(virt_addr);
+}
+
+// invalidate a contiguous virtual range. for small ranges (< 32 pages) we
+// issue per-page INVLPG which is cheaper than a full CR3 reload; otherwise
+// fall back to a full TLB flush which avoids 4096 INVLPG instructions.
+static void invalidate_range_if_current(uint64_t root, uint64_t virt_base,
+                                        uint64_t pages) {
+    if (root != current_cr3()) return;
+    if (pages == 0) return;
+    if (pages > 32) {
+        KernelVMM::FlushTLB();
+        return;
+    }
+    for (uint64_t i = 0; i < pages; i++) {
+        KernelVMM::InvalidatePage(virt_base + i * PAGE_SIZE);
+    }
+}
+
+bool KernelVMM::MapRange(uint64_t virt_base, uint64_t phys_base,
+                         uint64_t bytes, uint64_t flags) {
+    return MapRangeInAddressSpace(pml4_phys, virt_base, phys_base, bytes, flags);
+}
+
+bool KernelVMM::MapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
+                                       uint64_t phys_base, uint64_t bytes,
+                                       uint64_t flags) {
+    if (!bytes) return true;
+    virt_base &= ~0xFFFULL;
+    phys_base &= ~0xFFFULL;
+    uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    // overflow guard
+    if (pages > (1ULL << 40)) return false;
+
+    for (uint64_t i = 0; i < pages; i++) {
+        if (!map_page_in_root(root_pml4, virt_base + i * PAGE_SIZE,
+                              phys_base + i * PAGE_SIZE, flags)) {
+            // rollback prior mappings to avoid leaks
+            for (uint64_t j = 0; j < i; j++) {
+                unmap_page_in_root(root_pml4, virt_base + j * PAGE_SIZE, false);
+            }
+            invalidate_range_if_current(root_pml4, virt_base, i);
+            return false;
+        }
+    }
+    invalidate_range_if_current(root_pml4, virt_base, pages);
+    return true;
+}
+
+void KernelVMM::UnmapRange(uint64_t virt_base, uint64_t bytes, bool free_frames) {
+    UnmapRangeInAddressSpace(pml4_phys, virt_base, bytes, free_frames);
+}
+
+void KernelVMM::UnmapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
+                                         uint64_t bytes, bool free_frames) {
+    if (!bytes) return;
+    virt_base &= ~0xFFFULL;
+    uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages > (1ULL << 40)) return;
+    for (uint64_t i = 0; i < pages; i++) {
+        unmap_page_in_root(root_pml4, virt_base + i * PAGE_SIZE, free_frames);
+    }
+    invalidate_range_if_current(root_pml4, virt_base, pages);
 }
 
 uint64_t KernelVMM::QueryMapping(uint64_t virt_addr) {

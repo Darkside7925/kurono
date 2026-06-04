@@ -12,6 +12,59 @@ Key InputManager::last_key = KEY_UNKNOWN;
 bool InputManager::last_key_pressed = false;
 int InputManager::last_device_id = -1;
 
+namespace {
+constexpr int IM_MAX_SUBSCRIBERS = 16;
+struct Subscriber {
+    SubscriberId id;
+    InputManager::KeyEventCallback cb;
+    void* ctx;
+};
+Subscriber g_subs[IM_MAX_SUBSCRIBERS] = {};
+SubscriberId g_next_sub_id = 1;
+SubscriberId g_focus_sub = 0;
+
+// Tiny ring of (device, key, pressed) events written from the keyboard
+// callback and drained at Poll(). The callback may be invoked from an IRQ
+// or from the polling tick  -  either way the consumer side must never block.
+struct ImEvent { int device_id; Key key; bool pressed; };
+constexpr int IM_EVENT_RING = 128;
+ImEvent g_events[IM_EVENT_RING];
+volatile uint32_t g_ev_head = 0;
+volatile uint32_t g_ev_tail = 0;
+
+bool push_event(int device_id, Key key, bool pressed) {
+    uint32_t h = __atomic_load_n(&g_ev_head, __ATOMIC_RELAXED);
+    uint32_t t = __atomic_load_n(&g_ev_tail, __ATOMIC_ACQUIRE);
+    uint32_t next = (h + 1) % IM_EVENT_RING;
+    if (next == (t % IM_EVENT_RING)) return false;
+    g_events[h % IM_EVENT_RING] = {device_id, key, pressed};
+    __atomic_store_n(&g_ev_head, next, __ATOMIC_RELEASE);
+    return true;
+}
+
+bool pop_event(ImEvent& out) {
+    uint32_t h = __atomic_load_n(&g_ev_head, __ATOMIC_ACQUIRE);
+    uint32_t t = __atomic_load_n(&g_ev_tail, __ATOMIC_RELAXED);
+    if (h == t) return false;
+    out = g_events[t % IM_EVENT_RING];
+    __atomic_store_n(&g_ev_tail, (t + 1) % IM_EVENT_RING, __ATOMIC_RELEASE);
+    return true;
+}
+
+void dispatch_to_focus(int device_id, Key key, bool pressed) {
+    SubscriberId target = __atomic_load_n(&g_focus_sub, __ATOMIC_ACQUIRE);
+    if (target == 0) return;
+    for (int i = 0; i < IM_MAX_SUBSCRIBERS; i++) {
+        if (g_subs[i].id == target && g_subs[i].cb) {
+            g_subs[i].cb(g_subs[i].ctx, device_id, key, pressed);
+            return;
+        }
+    }
+    // Focused subscriber vanished mid-stream  -  drop the event silently rather
+    // than crash. The next Subscribe() / SetFocus() reattaches routing.
+}
+} // namespace
+
 static bool im_streq(const char* a, const char* b) {
     while (*a && *b) {
         if (*a != *b) return false;
@@ -77,38 +130,88 @@ static void SyncUSBHIDDevices() {
 
 void InputManager::Init() {
     device_count = 0;
-    // register standard ps/2 keyboard
+    for (int i = 0; i < IM_MAX_SUBSCRIBERS; i++) g_subs[i] = {};
+    g_next_sub_id = 1;
+    g_focus_sub = 0;
+    g_ev_head = g_ev_tail = 0;
+
     RegisterDevice("Standard PS/2 Keyboard", DeviceType::PS2);
-    
-    // register real usb hid devices if xhci is available
     SyncUSBHIDDevices();
-    
+
     SerialLogger::Log("InputManager: Initialized\r\n");
-    
-    // set callback in low-level driver to route to us
+
+    // Low-level driver callback: enqueue, do not block. The previous
+    // implementation issued a synchronous VFS write inside the keyboard IRQ
+    // path, which stalled input under any FS load.
     Keyboard::SetCallback([](Key k, char c, bool p){
         (void)c;
-        if (p) OnKeyDown(0, k);
-        else OnKeyUp(0, k);
+        push_event(0, k, p);
     });
 }
 
 void InputManager::Poll() {
-    if (!Mouse::IsOperational()) {
-        // When the auxiliary device never completed init, drain its bytes first
-        // so they cannot keep the shared 8042 output buffer occupied and block
-        // keyboard polling in GUI mode.
-        Mouse::Poll();
-        Keyboard::Poll();
-    } else {
-        Keyboard::Poll();
-        // poll mouse after keyboard so touchpad packet bursts do not delay key
-        // delivery on shared laptop 8042/ec controllers.
-        Mouse::Poll();
+    // Always drain both devices each tick so a busy mouse cannot starve the
+    // keyboard, and a busy keyboard cannot starve the mouse. The previous
+    // logic alternated polling order depending on mouse health, which made
+    // input feel jittery on shared 8042 controllers.
+    Keyboard::Poll();
+    Mouse::Poll();
+
+    // Drain pending key events onto the routing fabric.
+    ImEvent ev;
+    while (pop_event(ev)) {
+        last_key = ev.key;
+        last_key_pressed = ev.pressed;
+        last_device_id = ev.device_id;
+        if (ev.pressed) OnKeyDown(ev.device_id, ev.key);
+        else            OnKeyUp(ev.device_id, ev.key);
     }
-    
-    // real usb hid device sync (hotplug-safe)
+
     SyncUSBHIDDevices();
+}
+
+SubscriberId InputManager::Subscribe(KeyEventCallback cb, void* ctx) {
+    if (!cb) return 0;
+    for (int i = 0; i < IM_MAX_SUBSCRIBERS; i++) {
+        if (g_subs[i].id == 0) {
+            SubscriberId id = g_next_sub_id++;
+            if (id == 0) id = g_next_sub_id++; // skip the sentinel
+            g_subs[i].id = id;
+            g_subs[i].cb = cb;
+            g_subs[i].ctx = ctx;
+            return id;
+        }
+    }
+    return 0;
+}
+
+void InputManager::Unsubscribe(SubscriberId id) {
+    if (id == 0) return;
+    for (int i = 0; i < IM_MAX_SUBSCRIBERS; i++) {
+        if (g_subs[i].id == id) {
+            g_subs[i] = {};
+            // Clearing focus on unsubscribe prevents the next routed key
+            // from being delivered to a stale slot.
+            SubscriberId cur = __atomic_load_n(&g_focus_sub, __ATOMIC_RELAXED);
+            if (cur == id) __atomic_store_n(&g_focus_sub, (SubscriberId)0, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
+void InputManager::SetFocus(SubscriberId id) {
+    if (id != 0) {
+        bool exists = false;
+        for (int i = 0; i < IM_MAX_SUBSCRIBERS; i++) {
+            if (g_subs[i].id == id) { exists = true; break; }
+        }
+        if (!exists) return;
+    }
+    __atomic_store_n(&g_focus_sub, id, __ATOMIC_RELEASE);
+}
+
+SubscriberId InputManager::GetFocus() {
+    return __atomic_load_n(&g_focus_sub, __ATOMIC_ACQUIRE);
 }
 
 int InputManager::RegisterDevice(const char* name, DeviceType type) {
@@ -174,31 +277,12 @@ void InputManager::OnKeyDown(int device_id, Key key) {
     last_key = key;
     last_key_pressed = true;
     last_device_id = device_id;
-    
-    char c = MapKey(key);
-    
-    // log to file
-    FileNode* f = VFS::Open("/input.log");
-    if (f) {
-        char msg[64];
-        // manual formatting since no sprintf
-        // "key dev:x char:c\n"
-        char* p = msg;
-        const char* prefix = "KEY DEV:";
-        while(*prefix) *p++ = *prefix++;
-        *p++ = '0' + device_id;
-        const char* mid = " CHAR:";
-        while(*mid) *p++ = *mid++;
-        if (c >= 32 && c <= 126) *p++ = c; else *p++ = '?';
-        *p++ = '\n';
-        *p = 0;
-        
-        VFS::Write(f, f->size, (uint32_t)(p - msg), (uint8_t*)msg);
-    }
+    dispatch_to_focus(device_id, key, true);
 }
 
 void InputManager::OnKeyUp(int device_id, Key key) {
     last_key = key;
     last_key_pressed = false;
     last_device_id = device_id;
+    dispatch_to_focus(device_id, key, false);
 }

@@ -11,13 +11,14 @@ namespace {
     }
 
     inline bool ip_match(uint32_t pkt_ip, uint32_t rule_ip, uint32_t mask) {
-        // mask=0 means "any"
-        if (mask == 0 && rule_ip == 0) return true;
+        // mask=0 means "any" (no constraint), regardless of rule_ip
+        if (mask == 0) return true;
         return ((pkt_ip ^ rule_ip) & mask) == 0;
     }
 
     inline bool port_match(uint16_t pkt_port, uint16_t lo, uint16_t hi) {
         if (lo == 0 && hi == 0) return true;
+        if (hi < lo) return false;
         return pkt_port >= lo && pkt_port <= hi;
     }
 
@@ -25,6 +26,26 @@ namespace {
         if (!rule_if[0]) return true;
         if (!pkt_if)     return false;
         return seq(pkt_if, rule_if);
+    }
+}
+
+namespace {
+    uint32_t g_eval_count[Netfilter::HOOK_COUNT] = {0};
+
+    void resort_chain(Netfilter::Chain& c) {
+        // Insertion sort by descending pkt_count. Keep ordering stable for
+        // equal counters so user-defined precedence is preserved as a
+        // tie-breaker. O(n^2) worst case but n<=64 and this runs ~1/2048
+        // packets, so amortised cost is negligible.
+        for (int i = 1; i < c.rule_count; i++) {
+            Netfilter::Rule r = c.rules[i];
+            int j = i - 1;
+            while (j >= 0 && c.rules[j].pkt_count < r.pkt_count) {
+                c.rules[j + 1] = c.rules[j];
+                j--;
+            }
+            c.rules[j + 1] = r;
+        }
     }
 }
 
@@ -94,16 +115,24 @@ Action Evaluate(Hook h,
 {
     if (h >= HOOK_COUNT) return NF_ACCEPT;
     Chain& c = g_chains[h];
+    // Periodically resort rules by hit count so the most-frequent matches
+    // are checked first  -  turns the hot path into an O(1) lookup.
+    if (((++g_eval_count[h]) & 0x7FF) == 0 && c.rule_count > 1) {
+        resort_chain(c);
+    }
     for (int i = 0; i < c.rule_count; i++) {
         Rule& r = c.rules[i];
         if (!r.active) continue;
+        // Short-circuit: cheapest checks first (proto, then interfaces,
+        // then IPs, then ports). Avoid touching the slow string compares
+        // unless the proto already matches.
         if (r.proto != PROTO_ANY && r.proto != proto) continue;
+        if (!if_match(in_if,  r.in_if))  continue;
+        if (!if_match(out_if, r.out_if)) continue;
         if (!ip_match(src_ip, r.src_ip, r.src_mask)) continue;
         if (!ip_match(dst_ip, r.dst_ip, r.dst_mask)) continue;
         if (!port_match(src_port, r.src_port_min, r.src_port_max)) continue;
         if (!port_match(dst_port, r.dst_port_min, r.dst_port_max)) continue;
-        if (!if_match(in_if,  r.in_if))  continue;
-        if (!if_match(out_if, r.out_if)) continue;
 
         r.pkt_count++;
         r.byte_count += pkt_len;
@@ -114,6 +143,8 @@ Action Evaluate(Hook h,
             SerialLogger::Log("\r\n");
             continue;             // LOG continues evaluation
         }
+        // First non-LOG match wins  -  RETURN falls through to policy.
+        if (r.action == NF_RETURN) break;
         return r.action;
     }
     return c.default_policy;

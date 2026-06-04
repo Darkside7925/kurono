@@ -104,40 +104,47 @@ void NvidiaGPU::PciWrite(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset,
 //  bar reading (supports 64-bit bars)
 
 uint64_t NvidiaGPU::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_index) {
+    if (bar_index > 5) return 0;
     uint8_t offset = PCI_BAR0 + bar_index * 4;
     uint32_t bar_low = PciRead(bus, dev, func, offset);
 
-    // memory bar
-    if (!(bar_low & 1)) {
-        uint8_t type = (bar_low >> 1) & 0x03;
-        uint64_t base = bar_low & 0xFFFFFFF0;
-        if (type == 0x02) {
-            // 64-bit bar: read upper 32 bits from next register
-            uint32_t bar_high = PciRead(bus, dev, func, offset + 4);
-            base |= ((uint64_t)bar_high << 32);
-        }
-        return base;
+    if (bar_low == 0xFFFFFFFF || bar_low == 0) return 0;
+
+    // I/O BARs are not used by NVIDIA for register or framebuffer access  -  reject them
+    if (bar_low & 1) return 0;
+
+    uint8_t type = (bar_low >> 1) & 0x03;
+    uint64_t base = bar_low & 0xFFFFFFF0;
+    if (type == 0x02 && bar_index < 5) {
+        uint32_t bar_high = PciRead(bus, dev, func, offset + 4);
+        base |= ((uint64_t)bar_high << 32);
     }
-    // i/o bar (uncommon for nvidia gpus)
-    return bar_low & 0xFFFFFFFC;
+    return base;
 }
 
 uint64_t NvidiaGPU::GetBARSize(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_index) {
+    if (bar_index > 5) return 0;
     uint8_t offset = PCI_BAR0 + bar_index * 4;
-    uint32_t original = PciRead(bus, dev, func, offset);
+    uint32_t original_lo = PciRead(bus, dev, func, offset);
+    if (original_lo == 0xFFFFFFFF || (original_lo & 1)) return 0;
 
-    // write all 1s and read back to determine size
+    bool is_64 = ((original_lo >> 1) & 0x03) == 0x02 && bar_index < 5;
+    uint32_t original_hi = is_64 ? PciRead(bus, dev, func, offset + 4) : 0;
+
+    // size discovery: write all-1s, read mask, restore
     PciWrite(bus, dev, func, offset, 0xFFFFFFFF);
-    uint32_t mask = PciRead(bus, dev, func, offset);
-    PciWrite(bus, dev, func, offset, original); // restore
-
-    if (!(original & 1)) {
-        // memory bar
-        mask &= 0xFFFFFFF0;
-        if (mask == 0) return 0;
-        return (~mask) + 1;
+    uint32_t mask_lo = PciRead(bus, dev, func, offset);
+    uint32_t mask_hi = 0;
+    if (is_64) {
+        PciWrite(bus, dev, func, offset + 4, 0xFFFFFFFF);
+        mask_hi = PciRead(bus, dev, func, offset + 4);
+        PciWrite(bus, dev, func, offset + 4, original_hi);
     }
-    return 0;
+    PciWrite(bus, dev, func, offset, original_lo);
+
+    uint64_t mask = ((uint64_t)mask_hi << 32) | (mask_lo & 0xFFFFFFF0);
+    if (mask == 0) return 0;
+    return (~mask) + 1;
 }
 
 //  pci bus scan  -  find nvidia gpu
@@ -175,18 +182,18 @@ bool NvidiaGPU::ProbeDevice(uint8_t bus, uint8_t dev, uint8_t func) {
 void NvidiaGPU::ScanPCIBus() {
     for (uint16_t bus = 0; bus < 256; bus++) {
         for (uint8_t dev = 0; dev < 32; dev++) {
-            for (uint8_t func = 0; func < 8; func++) {
-                uint32_t vid = PciRead((uint8_t)bus, dev, func, PCI_VENDOR_ID);
+            // probe func 0 once; only enumerate the rest if multi-function bit is set
+            uint32_t vid0 = PciRead((uint8_t)bus, dev, 0, PCI_VENDOR_ID);
+            if ((vid0 & 0xFFFF) == 0xFFFF) continue;
+            uint32_t hdr0 = PciRead((uint8_t)bus, dev, 0, 0x0C);
+            int max_func = ((hdr0 >> 16) & 0x80) ? 8 : 1;
+
+            for (int func = 0; func < max_func; func++) {
+                uint32_t vid = PciRead((uint8_t)bus, dev, (uint8_t)func, PCI_VENDOR_ID);
                 if ((vid & 0xFFFF) == 0xFFFF) continue;
 
-                if (ProbeDevice((uint8_t)bus, dev, func)) {
-                    return; // found first nvidia gpu, done
-                }
-
-                // check if multi-function device
-                if (func == 0) {
-                    uint32_t hdr = PciRead((uint8_t)bus, dev, 0, 0x0C);
-                    if (!((hdr >> 16) & 0x80)) break; // not multi-function
+                if (ProbeDevice((uint8_t)bus, dev, (uint8_t)func)) {
+                    return; // first nvidia gpu wins
                 }
             }
         }
@@ -259,20 +266,35 @@ void NvidiaGPU::IdentifyGPU() {
         scpy(gpu_info.name, "NVIDIA GPU (Unknown)", 64);
         gpu_info.vram_mb = 0;
     }
+
+    // accel flags: NVIDIA discrete GPUs all expose hardware blit/3D engines
+    // when BAR0 is mapped, but the kernel doesn't ship a command-stream
+    // submitter yet  -  surface a conservative capability for the compositor.
+    gpu_info.has_2d_accel = (gpu_info.arch != ARCH_UNKNOWN);
+    gpu_info.has_3d_accel = (gpu_info.arch != ARCH_UNKNOWN);
+}
+
+bool NvidiaGPU::HasHardwareAccel() {
+    return gpu_info.detected && gpu_info.bar0 != 0 && gpu_info.has_2d_accel;
 }
 
 //  mmio register access (via bar0)
 
 uint32_t NvidiaGPU::ReadReg(uint32_t offset) {
     if (!gpu_info.bar0) return 0;
+    if (gpu_info.bar0_size && offset + 4 > gpu_info.bar0_size) return 0;
     volatile uint32_t* reg = (volatile uint32_t*)(gpu_info.bar0 + offset);
-    return *reg;
+    uint32_t v = *reg;
+    __asm__ volatile("" ::: "memory");
+    return v;
 }
 
 void NvidiaGPU::WriteReg(uint32_t offset, uint32_t value) {
     if (!gpu_info.bar0) return;
+    if (gpu_info.bar0_size && offset + 4 > gpu_info.bar0_size) return;
     volatile uint32_t* reg = (volatile uint32_t*)(gpu_info.bar0 + offset);
     *reg = value;
+    __asm__ volatile("sfence" ::: "memory");
 }
 
 //  gpu operations
@@ -304,11 +326,18 @@ void NvidiaGPU::PollTelemetry() {
     if (!gpu_info.detected || !gpu_info.bar0) return;
 
     uint32_t intr = ReadReg(NV_PMC_INTR_0);
-    if (intr != 0) {
-        last_fault_code = intr & 0xFFFF;
+    // only the top-level "host" / "fault" bits indicate driver-visible faults.
+    // many bits here are routine display/engine events that should not flip the
+    // driver into a permanent ERROR state.
+    constexpr uint32_t FAULT_MASK = 0xFFFF0000u; // upper half = fault classes on Ampere+
+    uint32_t faults = intr & FAULT_MASK;
+    if (faults) {
+        last_fault_code = faults;
         has_fault = true;
         state = GPU_STATE_ERROR;
     }
+    // ack everything we observed so future polls don't re-trigger on stale bits
+    if (intr) WriteReg(NV_PMC_INTR_0, intr);
 }
 
 bool NvidiaGPU::HasFault() {
@@ -325,12 +354,16 @@ void NvidiaGPU::ClearFault() {
 
 bool NvidiaGPU::ResetGPU() {
     if (!gpu_info.bar0) return false;
-    // soft-reset via pmc enable register
+    // soft-reset via pmc enable register: preserve original engine mask, only toggle.
+    // writing 0xFFFFFFFF would enable engines that may not exist on this chip and
+    // hang the GPU on Ampere/Ada.
+    uint32_t saved = ReadReg(NV_PMC_ENABLE);
     WriteReg(NV_PMC_ENABLE, 0);
-    // small delay
     for (volatile int i = 0; i < 100000; i++) {}
-    WriteReg(NV_PMC_ENABLE, 0xFFFFFFFF);
+    WriteReg(NV_PMC_ENABLE, saved);
     for (volatile int i = 0; i < 100000; i++) {}
+    // ack any pending interrupts so the latch doesn't fire immediately after reset
+    WriteReg(NV_PMC_INTR_0, 0);
     last_fault_code = 0;
     has_fault = false;
     if (gpu_info.detected) state = gpu_info.bar0 ? GPU_STATE_INITIALIZED : GPU_STATE_DETECTED;
@@ -342,15 +375,21 @@ bool NvidiaGPU::ResetGPU() {
 bool NvidiaGPU::PrepareForPassthrough() {
     if (!gpu_info.detected) return false;
 
-    // disable gpu interrupts before passthrough
+    // mask interrupts and ack pending state BEFORE we yank MMIO access
     if (gpu_info.bar0) {
-        WriteReg(NV_PMC_INTR_EN_0, 0);  // mask all interrupts
+        WriteReg(NV_PMC_INTR_EN_0, 0);
+        uint32_t pending = ReadReg(NV_PMC_INTR_0);
+        if (pending) WriteReg(NV_PMC_INTR_0, pending);
     }
 
-    // disable bus master on host side (guest will re-enable)
+    // disable bus master + memory space on host side (guest will re-enable)
     uint32_t cmd = PciRead(gpu_info.bus, gpu_info.device, gpu_info.function, PCI_COMMAND);
     cmd &= ~(PCI_CMD_MEMORY | PCI_CMD_MASTER);
     PciWrite(gpu_info.bus, gpu_info.device, gpu_info.function, PCI_COMMAND, cmd);
+
+    // mmio is now disabled  -  clear cached base so any stray ReadReg returns 0 instead
+    // of dereferencing a disabled region (which can fault on real hardware)
+    gpu_info.bar0 = 0;
 
     state = GPU_STATE_PASSTHROUGH;
     return true;

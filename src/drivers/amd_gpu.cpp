@@ -38,65 +38,78 @@ static void _scpy(char* d, const char* s, int m) {
 bool AmdGPU::ScanPCI() {
     for (int bus = 0; bus < 256; bus++) {
         for (int dev = 0; dev < 32; dev++) {
-            for (int func = 0; func < 8; func++) {
+            // probe func 0 first, then decide whether to scan other functions
+            uint32_t id0 = pci_read32(bus, dev, 0, 0x00);
+            if ((id0 & 0xFFFF) == 0xFFFF) continue;
+            uint32_t hdr0 = pci_read32(bus, dev, 0, 0x0C);
+            int max_func = ((hdr0 >> 16) & 0x80) ? 8 : 1;
+
+            for (int func = 0; func < max_func; func++) {
                 uint32_t id = pci_read32(bus, dev, func, 0x00);
-                if (id == 0xFFFFFFFF) continue;
+                if ((id & 0xFFFF) == 0xFFFF) continue;
 
                 uint16_t vid = id & 0xFFFF;
                 uint16_t did = (id >> 16) & 0xFFFF;
                 if (vid != AMD_VENDOR_ID) continue;
 
-                // check class code: 03xx = display controller
+                // class code: 03xx = display controller (sub_class 0x80 = display other)
                 uint32_t class_reg = pci_read32(bus, dev, func, 0x08);
                 uint8_t base_class = (class_reg >> 24) & 0xFF;
                 if (base_class != 0x03) continue;
 
                 info.vendor_id = vid;
                 info.device_id = did;
-                info.bus = bus;
-                info.device = dev;
-                info.function = func;
+                info.bus = (uint8_t)bus;
+                info.device = (uint8_t)dev;
+                info.function = (uint8_t)func;
                 info.revision = class_reg & 0xFF;
 
-                // read bar0  -  mmio registers
+                // BAR0  -  only accept memory BARs. I/O BARs would dereference a port range as memory.
                 uint32_t bar0_lo = pci_read32(bus, dev, func, 0x10);
-                info.bar0 = bar0_lo & 0xFFFFFFF0;
-
-                // check 64-bit bar
-                if ((bar0_lo & 0x06) == 0x04) {
-                    uint32_t bar0_hi = pci_read32(bus, dev, func, 0x14);
-                    info.bar0 = ((uint64_t)bar0_hi << 32) | (bar0_lo & 0xFFFFFFF0);
+                if (bar0_lo & 1) {
+                    info.bar0 = 0;
+                    info.bar0_size = 0;
+                } else {
+                    info.bar0 = bar0_lo & 0xFFFFFFF0;
+                    if ((bar0_lo & 0x06) == 0x04) {
+                        uint32_t bar0_hi = pci_read32(bus, dev, func, 0x14);
+                        info.bar0 = ((uint64_t)bar0_hi << 32) | (bar0_lo & 0xFFFFFFF0);
+                    }
+                    // size probe  -  restore original value before continuing
+                    pci_write32(bus, dev, func, 0x10, 0xFFFFFFFF);
+                    uint32_t bar0_mask = pci_read32(bus, dev, func, 0x10) & 0xFFFFFFF0;
+                    pci_write32(bus, dev, func, 0x10, bar0_lo);
+                    info.bar0_size = bar0_mask ? ((uint64_t)(~bar0_mask) + 1) : 0;
                 }
 
-                // determine bar0 size
-                pci_write32(bus, dev, func, 0x10, 0xFFFFFFFF);
-                uint32_t bar0_mask = pci_read32(bus, dev, func, 0x10);
-                pci_write32(bus, dev, func, 0x10, bar0_lo);  // restore
-                info.bar0_size = ~(bar0_mask & 0xFFFFFFF0) + 1;
-
-                // read bar2  -  vram aperture
+                // BAR2  -  VRAM aperture; same memory/IO check
                 uint32_t bar2_lo = pci_read32(bus, dev, func, 0x18);
-                info.vram_bar = bar2_lo & 0xFFFFFFF0;
-                if ((bar2_lo & 0x06) == 0x04) {
-                    uint32_t bar2_hi = pci_read32(bus, dev, func, 0x1C);
-                    info.vram_bar = ((uint64_t)bar2_hi << 32) | (bar2_lo & 0xFFFFFFF0);
+                if (bar2_lo & 1) {
+                    info.vram_bar = 0;
+                } else {
+                    info.vram_bar = bar2_lo & 0xFFFFFFF0;
+                    if ((bar2_lo & 0x06) == 0x04) {
+                        uint32_t bar2_hi = pci_read32(bus, dev, func, 0x1C);
+                        info.vram_bar = ((uint64_t)bar2_hi << 32) | (bar2_lo & 0xFFFFFFF0);
+                    }
                 }
 
-                // enable bus mastering + memory space
+                // bus mastering + memory space
                 uint32_t cmd = pci_read32(bus, dev, func, 0x04);
-                cmd |= 0x06;  // memory space + bus master
-                pci_write32(bus, dev, func, 0x04, cmd);
+                uint32_t want = cmd | 0x06;
+                if (want != cmd) pci_write32(bus, dev, func, 0x04, want);
 
-                // check for resizable bar capability
+                // resizable bar capability  -  extended config space, mask 0xFC per spec
                 info.resizable_bar = false;
-                uint8_t cap_ptr = pci_read32(bus, dev, func, 0x34) & 0xFF;
-                while (cap_ptr && cap_ptr != 0xFF) {
+                uint8_t cap_ptr = pci_read32(bus, dev, func, 0x34) & 0xFC;
+                int safety = 48;
+                while (cap_ptr && safety-- > 0) {
                     uint32_t cap = pci_read32(bus, dev, func, cap_ptr);
-                    if ((cap & 0xFF) == 0x15) {  // resizable bar
+                    if ((cap & 0xFF) == 0x15) {
                         info.resizable_bar = true;
                         break;
                     }
-                    cap_ptr = (cap >> 8) & 0xFF;
+                    cap_ptr = (cap >> 8) & 0xFC;
                 }
 
                 return true;
@@ -278,12 +291,17 @@ bool AmdGPU::MapBAR() {
 //  register access
 uint32_t AmdGPU::ReadReg(uint32_t offset) {
     if (!mmio_base) return 0xFFFFFFFF;
-    return mmio_base[offset / 4];
+    if (info.bar0_size && offset + 4 > info.bar0_size) return 0xFFFFFFFF;
+    uint32_t v = mmio_base[offset / 4];
+    __asm__ volatile("" ::: "memory");
+    return v;
 }
 
 void AmdGPU::WriteReg(uint32_t offset, uint32_t value) {
     if (!mmio_base) return;
+    if (info.bar0_size && offset + 4 > info.bar0_size) return;
     mmio_base[offset / 4] = value;
+    __asm__ volatile("sfence" ::: "memory");
 }
 
 uint32_t AmdGPU::ReadRegIdx(uint32_t offset) {
@@ -381,6 +399,10 @@ bool AmdGPU::Init() {
     // hardware ray tracing available on rdna 2+
     info.hardware_raytracing = (info.arch >= AMD_ARCH_RDNA2);
 
+    // accel capability: any recognized arch with a working MMIO mapping
+    info.has_2d_accel = (info.arch != AMD_ARCH_UNKNOWN);
+    info.has_3d_accel = (info.arch >= AMD_ARCH_RDNA1);
+
     _scpy(info.name, IdentifyName(info.device_id), 64);
     _scpy(info.chip_name, IdentifyChip(info.device_id), 16);
 
@@ -425,6 +447,7 @@ bool AmdGPU::Init() {
 
 bool AmdGPU::IsAvailable() { return info.detected; }
 const AmdGPUInfo& AmdGPU::GetInfo() { return info; }
+bool AmdGPU::HasHardwareAccel() { return info.detected && mmio_base != nullptr && info.has_2d_accel; }
 
 const char* AmdGPU::GetArchName() {
     switch (info.arch) {

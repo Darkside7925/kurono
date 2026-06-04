@@ -27,9 +27,12 @@ public:
                                             __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
                 return;
             }
-            while (__atomic_load_n(&value_, __ATOMIC_RELAXED) != 0) {
-                __asm__ __volatile__("pause");
-            }
+            // Test-then-test-and-set: cache-friendly spin with pause hint.
+            // Pause throttles the speculative pipeline to reduce memory
+            // traffic and wake-up latency on the unlock side.
+            do {
+                __asm__ __volatile__("pause" ::: "memory");
+            } while (__atomic_load_n(&value_, __ATOMIC_RELAXED) != 0);
         }
     }
 
@@ -40,15 +43,32 @@ public:
     }
 
     inline void Unlock() {
+        __atomic_store_n(&owner_pid_, 0u, __ATOMIC_RELAXED);
         __atomic_store_n(&value_, 0u, __ATOMIC_RELEASE);
     }
 
     // IRQ-save variant: writes the prior IF state into out_flags so the
     // matching UnlockIrqRestore() can correctly restore (or leave clear).
+    // We snapshot rflags, disable IF, then attempt acquire; on contention
+    // we briefly re-enable IF while spinning so the timer IRQ keeps
+    // firing  -  otherwise lock contention spikes scheduler latency.
     inline void LockIrqSave(uint64_t* out_flags) {
         uint64_t flags;
         __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-        Lock();
+        for (;;) {
+            uint32_t expected = 0;
+            if (__atomic_compare_exchange_n(&value_, &expected, 1u, false,
+                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                break;
+            }
+            if (flags & 0x200ULL) {
+                __asm__ __volatile__("sti" ::: "memory");
+            }
+            do {
+                __asm__ __volatile__("pause" ::: "memory");
+            } while (__atomic_load_n(&value_, __ATOMIC_RELAXED) != 0);
+            __asm__ __volatile__("cli" ::: "memory");
+        }
         if (out_flags) *out_flags = flags;
     }
 

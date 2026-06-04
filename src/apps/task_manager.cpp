@@ -381,8 +381,13 @@ void TaskManagerApp::InitServices(){
 }
 
 void TaskManagerApp::Tick(){
+    // Time-based, not frame-based: refresh process list at ~1 Hz so we
+    // don't burn CPU at high frame rates and stay smooth at low ones.
+    static uint32_t last_refresh_ms = 0;
+    uint32_t now = Time::GetTicks();
+    if(last_refresh_ms != 0 && (now - last_refresh_ms) < 1000) return;
+    last_refresh_ms = now;
     tick_counter++;
-    if (tick_counter % 30 != 0) return; // ~every 0.5s at 60fps
     RefreshProcesses();
 }
 

@@ -139,6 +139,15 @@ public:
 
     static void DumpInfo(char* out, int max_len);
 
+    // streaming-mode API used by audio_backend_hda.cpp.  StartStream()
+    // arms the DMA engine on the shared buffer with silence; WriteRing()
+    // copies a period into the next chunk and the controller picks it up
+    // on the next BDL turn.  No per-call DMA restart.
+    static bool     StartStream();
+    static uint32_t WriteRing(const void* data, uint32_t bytes);
+    static uint32_t RingQueuedBytes();
+    static uint32_t RingChunkBytes();
+
 private:
     static bool detected;
     static volatile uint8_t* bar0;

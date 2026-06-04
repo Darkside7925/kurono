@@ -16,6 +16,33 @@ bool Keyboard::prev_keys[256] = {0};
 static uint8_t usb_prev_reports[16][8] = {{0}};
 static bool set2_break_prefix = false;
 
+// Single-byte controller responses that arrive after init commands and must
+// not be re-interpreted as scancodes.
+static constexpr uint8_t KB_RESP_ACK = 0xFA;
+static constexpr uint8_t KB_RESP_NAK = 0xFE;
+static constexpr uint8_t KB_RESP_BAT_OK = 0xAA;
+static constexpr uint8_t KB_RESP_BAT_FAIL = 0xFC;
+static constexpr uint8_t KB_RESP_ECHO = 0xEE;
+// Pause makes 8 bytes E1 1D 45 E1 9D C5. We collapse the entire sequence.
+static constexpr uint8_t KB_PREFIX_PAUSE = 0xE1;
+static uint8_t g_pause_seq_remaining = 0;
+
+// Active scancode set. Set 1 on real hardware via translation; set 2 inside
+// some BIOS configurations / certain laptop ECs. We detect adaptively: a
+// raw 0xF0 break prefix only exists in set 2.
+static ScancodeSet g_active_set = ScancodeSet::SET1;
+
+// Software typematic. Hardware repeat is unreliable across firmware paths
+// (we skip the programming step during init). We synthesize key repeat at
+// Poll-time using a stopwatch per held key.
+static constexpr uint32_t TYPEMATIC_DELAY_MS = 250;
+static constexpr uint32_t TYPEMATIC_PERIOD_MS = 33;  // ~30 Hz
+static bool g_typematic_enabled = true;
+static Key g_repeat_key = KEY_UNKNOWN;
+static char g_repeat_char = 0;
+static uint32_t g_repeat_start_ms = 0;
+static uint32_t g_repeat_next_ms = 0;
+
 // ── accessibility state ──────────────────────────────────────────
 static bool     g_sticky_enabled  = false;
 static uint32_t g_slow_keys_ms    = 0;   // require key held >= ms
@@ -120,6 +147,12 @@ void Keyboard::Init() {
     e0_prefix = false;
     set2_break_prefix = false;
     head = tail = 0;
+    g_pause_seq_remaining = 0;
+    g_repeat_key = KEY_UNKNOWN;
+    g_repeat_char = 0;
+    g_repeat_start_ms = 0;
+    g_repeat_next_ms = 0;
+    g_active_set = ScancodeSet::SET1;
     
     SerialLogger::Log("Keyboard: Initializing Enhanced Driver...\r\n");
     SerialLogger::Log("Keyboard: Using compatibility init path\r\n");
@@ -264,21 +297,10 @@ void Keyboard::SetRepeatRate(uint8_t rate, uint8_t delay) {
 }
 
 void Keyboard::EnableTypematic(bool enable) {
-    int timeout = 50000;
-    while ((Status() & 0x02) && timeout-- > 0) {}
-    
-    if (enable) {
-        Out(0x60, 0xF4); // enable scanning
-    } else {
-        Out(0x60, 0xF5); // disable scanning
-    }
-    
-    // wait for ack
-    timeout = 50000;
-    while (timeout-- > 0) {
-        if (Status() & 0x01) {
-            if (In(0x60) == 0xFA) break;
-        }
+    g_typematic_enabled = enable;
+    if (!enable) {
+        g_repeat_key = KEY_UNKNOWN;
+        g_repeat_char = 0;
     }
 }
 
@@ -332,9 +354,12 @@ bool Keyboard::GetControllerStatus(uint8_t& status) {
 }
 
 void Keyboard::FlushBuffers() {
-    head = tail = 0;
+    __atomic_store_n(&head, (uint8_t)0, __ATOMIC_RELEASE);
+    __atomic_store_n(&tail, (uint8_t)0, __ATOMIC_RELEASE);
+    g_repeat_key = KEY_UNKNOWN;
+    g_repeat_char = 0;
     for (int i = 0; i < 1000 && (Status() & 0x01); i++) {
-        In(0x60); // read and discard
+        In(0x60);
     }
 }
 
@@ -424,10 +449,11 @@ void Keyboard::ProcessUSBReport(uint8_t device_id, const uint8_t* report, size_t
 }
 
 void Keyboard::Poll() {
-    // copy current to prev
+    // copy current to prev BEFORE we mutate keys[] from this drain  -  that way
+    // IsKeyPressed() reflects the edges that landed during this exact tick.
     for(int i=0; i<256; i++) prev_keys[i] = keys[i];
-    
-    int loop_limit = 100;
+
+    int loop_limit = 128;
     while (loop_limit-- > 0) {
         uint8_t st = Status();
         if (!(st & 0x01)) break;
@@ -435,10 +461,46 @@ void Keyboard::Poll() {
         uint8_t sc = In(0x60);
         HandleScancode(sc);
     }
+
+    if (g_typematic_enabled && g_repeat_key != KEY_UNKNOWN) {
+        uint32_t now = (uint32_t)Timer::GetRealMs();
+        // Verify the key is still actually down. If the release scancode was
+        // missed (USB→PS/2 translators occasionally drop one), stop repeating
+        // to avoid a stuck "phantom" key.
+        if (!keys[(int)g_repeat_key]) {
+            g_repeat_key = KEY_UNKNOWN;
+            g_repeat_char = 0;
+        } else if ((int32_t)(now - g_repeat_next_ms) >= 0 &&
+                   (int32_t)(now - g_repeat_start_ms) >= (int32_t)TYPEMATIC_DELAY_MS) {
+            if (g_repeat_char) Enqueue(g_repeat_char);
+            if (callback) callback(g_repeat_key, g_repeat_char, true);
+            // Schedule next tick; if we overshot many periods (e.g. paused),
+            // re-anchor to "now" rather than spamming the queue.
+            uint32_t step = TYPEMATIC_PERIOD_MS;
+            uint32_t next = g_repeat_next_ms + step;
+            if ((int32_t)(now - next) > (int32_t)step) next = now + step;
+            g_repeat_next_ms = next;
+        }
+    }
 }
 
-bool Keyboard::HasChar() { return head != tail; }
-char Keyboard::GetChar() { char c = buf[tail]; tail = (uint8_t)((tail + 1) & 0xFF); return c; }
+// SPSC ring: producer is HandleScancode (always called from Poll on the
+// consumer thread today, but the indices are also touched by GetChar from
+// other code paths). Treat head/tail as atomic to be future-proof and to
+// give the compiler the right barriers.
+bool Keyboard::HasChar() {
+    uint8_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+    uint8_t t = __atomic_load_n(&tail, __ATOMIC_RELAXED);
+    return h != t;
+}
+char Keyboard::GetChar() {
+    uint8_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+    uint8_t t = __atomic_load_n(&tail, __ATOMIC_RELAXED);
+    if (h == t) return 0;
+    char c = buf[t];
+    __atomic_store_n(&tail, (uint8_t)(t + 1), __ATOMIC_RELEASE);
+    return c;
+}
 bool Keyboard::IsKeyDown(Key key) { return keys[(int)key]; }
 bool Keyboard::IsKeyPressed(Key key) { return keys[(int)key] && !prev_keys[(int)key]; }
 const KeyboardState& Keyboard::GetState() { return state; }
@@ -447,7 +509,16 @@ void Keyboard::SetCallback(KeyCallback cb) { callback = cb; }
 uint8_t Keyboard::Status() { return In(0x64); }
 uint8_t Keyboard::In(uint16_t p) { uint8_t r; __asm__ __volatile__("inb %1, %0" : "=a"(r) : "Nd"(p)); return r; }
 void Keyboard::Out(uint16_t p, uint8_t v) { __asm__ __volatile__("outb %0, %1" : : "a"(v), "Nd"(p)); }
-void Keyboard::Enqueue(char c) { buf[head] = c; head = (uint8_t)((head + 1) & 0xFF); }
+void Keyboard::Enqueue(char c) {
+    if (!c) return;
+    uint8_t h = __atomic_load_n(&head, __ATOMIC_RELAXED);
+    uint8_t t = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
+    uint8_t next = (uint8_t)(h + 1);
+    // Drop on overflow rather than overwriting unread data.
+    if (next == t) return;
+    buf[h] = c;
+    __atomic_store_n(&head, next, __ATOMIC_RELEASE);
+}
 
 static Key ScancodeSet2ToKey(uint8_t sc, bool e0) {
     if (!e0) {
@@ -511,115 +582,179 @@ static Key ScancodeSet2ToKey(uint8_t sc, bool e0) {
 }
 
 void Keyboard::HandleScancode(uint8_t sc) {
+    // Drain the Pause/Break multi-byte sequence (E1 1D 45 E1 9D C5). We
+    // already counted the E1 below; just swallow the remainder.
+    if (g_pause_seq_remaining > 0) {
+        g_pause_seq_remaining--;
+        if (g_pause_seq_remaining == 0) {
+            // Emit a synthetic press+release for KEY_PAUSE so the focused app
+            // sees an edge instead of silently dropping every Pause.
+            Key key = KEY_PAUSE;
+            keys[(int)key] = true;
+            if (callback) callback(key, 0, true);
+            keys[(int)key] = false;
+            if (callback) callback(key, 0, false);
+        }
+        return;
+    }
+
+    // Single-byte controller responses  -  swallow without touching state.
+    if (sc == KB_RESP_ACK || sc == KB_RESP_NAK ||
+        sc == KB_RESP_BAT_OK || sc == KB_RESP_BAT_FAIL ||
+        sc == KB_RESP_ECHO) {
+        return;
+    }
+
+    if (sc == KB_PREFIX_PAUSE) {
+        g_pause_seq_remaining = 5;
+        return;
+    }
     if (sc == 0xE0) {
         e0_prefix = true;
         return;
     }
     if (sc == 0xF0) {
+        // Only set 2 emits raw F0 as a break prefix. Latch the set permanently
+        // once we observe it; this avoids misreading bare F0 in a noisy stream.
+        g_active_set = ScancodeSet::SET2;
         set2_break_prefix = true;
         return;
     }
-    
-    bool release = ((sc & 0x80) != 0) || set2_break_prefix;
-    uint8_t code = set2_break_prefix ? sc : (uint8_t)(sc & 0x7F);
-    
-    Key key = ScancodeToKey(code, e0_prefix);
-    if (key == KEY_UNKNOWN) {
+
+    bool release;
+    uint8_t code;
+    Key key;
+    if (g_active_set == ScancodeSet::SET2) {
+        // In set 2 the make/break distinction comes from the F0 prefix, not
+        // the high bit. F7 = 0x83 with no F0 means PRESS of F7, not release.
+        release = set2_break_prefix;
+        code = sc;
         key = ScancodeSet2ToKey(code, e0_prefix);
+    } else {
+        release = (sc & 0x80) != 0;
+        code = (uint8_t)(sc & 0x7F);
+        key = ScancodeToKey(code, e0_prefix);
+        if (key == KEY_UNKNOWN) {
+            // Sticky fallback: some BIOSes pass set 2 through despite our
+            // translation flag  -  try the alternate table.
+            Key alt = ScancodeSet2ToKey(sc, e0_prefix);
+            if (alt != KEY_UNKNOWN) {
+                // Set 2 has no high-bit break; demote and let set 2 path own it.
+                key = alt;
+                release = false;
+            }
+        }
     }
     e0_prefix = false;
     set2_break_prefix = false;
-    
-    if (key == KEY_UNKNOWN) return;
-    
-    // update state
-    keys[(int)key] = !release;
-    
-    if (key == KEY_LSHIFT || key == KEY_RSHIFT) state.shift = !release;
-    if (key == KEY_LCTRL || key == KEY_RCTRL) state.ctrl = !release;
-    if (key == KEY_LALT || key == KEY_RALT) state.alt = !release;
-    if (key == KEY_LSUPER || key == KEY_RSUPER) state.super = !release;
 
-    // ── accessibility filters ────────────────────────────────────
+    if (key == KEY_UNKNOWN) return;
+    int kidx = (int)key;
+    if (kidx < 0 || kidx >= 256) return;
+
     bool is_mod = (key == KEY_LSHIFT || key == KEY_RSHIFT ||
                    key == KEY_LCTRL  || key == KEY_RCTRL  ||
                    key == KEY_LALT   || key == KEY_RALT   ||
                    key == KEY_LSUPER || key == KEY_RSUPER);
 
     uint32_t now = (uint32_t)Timer::GetRealMs();
-    int kidx = (int)key;
-    if (kidx < 0 || kidx >= 256) return;
 
+    // ── accessibility filters (BEFORE state mutation so a swallowed press
+    //    does not poison modifier state). ─────────────────────────────────
     if (!release) {
-        // bounce keys: drop press if it follows the same key too closely
         if (g_bounce_keys_ms > 0 && !is_mod) {
             uint32_t last = g_last_press_ms[kidx];
             if (last != 0 && (now - last) < g_bounce_keys_ms) {
-                return; // swallow
+                return;
             }
         }
-        g_press_start_ms[kidx] = now;
-
-        // sticky keys: latch modifiers, consume modifier press
-        if (g_sticky_enabled && is_mod) {
-            if (key == KEY_LSHIFT || key == KEY_RSHIFT) g_latch_shift = !g_latch_shift;
-            if (key == KEY_LCTRL  || key == KEY_RCTRL ) g_latch_ctrl  = !g_latch_ctrl;
-            if (key == KEY_LALT   || key == KEY_RALT  ) g_latch_alt   = !g_latch_alt;
-            if (key == KEY_LSUPER || key == KEY_RSUPER) g_latch_super = !g_latch_super;
-            Audio::Beep(g_latch_shift||g_latch_ctrl||g_latch_alt||g_latch_super ? 1200 : 600, 30);
+        // Suppress hardware auto-repeat when the same key is reported pressed
+        // without an intervening release. We do our own typematic in software.
+        if (keys[kidx]) {
             return;
         }
-        // apply latched modifiers to state for non-modifier press
-        if (g_sticky_enabled && !is_mod) {
-            if (g_latch_shift) state.shift = true;
-            if (g_latch_ctrl ) state.ctrl  = true;
-            if (g_latch_alt  ) state.alt   = true;
-            if (g_latch_super) state.super = true;
-        }
+        g_press_start_ms[kidx] = now;
     } else {
-        // slow keys: only commit a press if the key was held long enough
-        if (g_slow_keys_ms > 0 && !is_mod) {
+        if (g_slow_keys_ms > 0 && !is_mod && keys[kidx]) {
             uint32_t held = now - g_press_start_ms[kidx];
             if (held < g_slow_keys_ms) {
-                // discard this whole press cycle
-                if (callback) callback(key, 0, false);
+                keys[kidx] = false;
+                // Cancel any pending repeat for this key.
+                if (g_repeat_key == key) {
+                    g_repeat_key = KEY_UNKNOWN;
+                    g_repeat_char = 0;
+                }
                 return;
             }
         }
     }
-    
+
+    keys[kidx] = !release;
+
+    // ── sticky modifier latches ─────────────────────────────────────────
+    if (g_sticky_enabled && is_mod && !release) {
+        // Toggle latch on each fresh modifier press; the actual modifier
+        // state stays as reported by the hardware so chording also works.
+        if (key == KEY_LSHIFT || key == KEY_RSHIFT) g_latch_shift = !g_latch_shift;
+        if (key == KEY_LCTRL  || key == KEY_RCTRL ) g_latch_ctrl  = !g_latch_ctrl;
+        if (key == KEY_LALT   || key == KEY_RALT  ) g_latch_alt   = !g_latch_alt;
+        if (key == KEY_LSUPER || key == KEY_RSUPER) g_latch_super = !g_latch_super;
+        Audio::Beep(g_latch_shift||g_latch_ctrl||g_latch_alt||g_latch_super ? 1200 : 600, 30);
+        // Still update modifier state so the chord works while the user
+        // physically holds the key.
+    }
+
+    // Track hardware-real modifier state. Released hardware modifiers may
+    // remain latched-on via stickys; we apply that below.
+    bool hw_shift = keys[(int)KEY_LSHIFT] || keys[(int)KEY_RSHIFT];
+    bool hw_ctrl  = keys[(int)KEY_LCTRL]  || keys[(int)KEY_RCTRL];
+    bool hw_alt   = keys[(int)KEY_LALT]   || keys[(int)KEY_RALT];
+    bool hw_super = keys[(int)KEY_LSUPER] || keys[(int)KEY_RSUPER];
+
+    state.shift = hw_shift || (g_sticky_enabled && g_latch_shift);
+    state.ctrl  = hw_ctrl  || (g_sticky_enabled && g_latch_ctrl);
+    state.alt   = hw_alt   || (g_sticky_enabled && g_latch_alt);
+    state.super = hw_super || (g_sticky_enabled && g_latch_super);
+
     if (!release) {
-        if (key == KEY_CAPSLOCK) state.caps_lock = !state.caps_lock;
-        if (key == KEY_NUMLOCK) state.num_lock = !state.num_lock;
+        if (key == KEY_CAPSLOCK)   state.caps_lock   = !state.caps_lock;
+        if (key == KEY_NUMLOCK)    state.num_lock    = !state.num_lock;
         if (key == KEY_SCROLLLOCK) state.scroll_lock = !state.scroll_lock;
 
-        // Ctrl+Alt+F1..F6/F7 → switch virtual console (Linux convention).
-        // F7 is the GUI console; F1..F6 are text TTYs.  We swallow the key
-        // so the focused app does not also receive it.
-        if (state.ctrl && state.alt &&
-            key >= KEY_F1 && key <= KEY_F7) {
-            int idx = (int)key - (int)KEY_F1;     // 0..6
+        // Ctrl+Alt+F1..F7 → virtual console switch. We swallow the press so
+        // the focused window does not also see it.
+        if (state.ctrl && state.alt && key >= KEY_F1 && key <= KEY_F7) {
+            int idx = (int)key - (int)KEY_F1;
             VConsole::Switch(idx);
             if (callback) callback(key, 0, true);
             return;
         }
 
         char c = KeyToChar(key, state.shift, state.caps_lock);
-
         if (c) Enqueue(c);
-
         if (callback) callback(key, c, true);
 
-        // record press time AFTER bounce check so consecutive valid presses
-        // also honour the cooldown
         g_last_press_ms[kidx] = now;
 
-        // sticky: clear one-shot latch on real key press
+        // Sticky one-shot consume: after a non-modifier press, drop latches.
         if (g_sticky_enabled && !is_mod) {
             g_latch_shift = g_latch_ctrl = g_latch_alt = g_latch_super = false;
         }
+
+        // Arm software typematic for the most recently pressed key (modifiers
+        // never auto-repeat).
+        if (g_typematic_enabled && !is_mod) {
+            g_repeat_key = key;
+            g_repeat_char = c;
+            g_repeat_start_ms = now;
+            g_repeat_next_ms = now + TYPEMATIC_DELAY_MS;
+        }
     } else {
         if (callback) callback(key, 0, false);
+        if (g_repeat_key == key) {
+            g_repeat_key = KEY_UNKNOWN;
+            g_repeat_char = 0;
+        }
     }
 }
 

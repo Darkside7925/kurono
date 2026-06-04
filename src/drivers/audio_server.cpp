@@ -79,8 +79,17 @@ void Init() {
 
 void Tick() {
     if (!g_active) return;
-    uint32_t produced = AudioMixer::Tick();
-    if (produced > 0) g_periods_submitted++;
+    // Aggressively pump the mixer until the backend has at least two
+    // periods queued.  This deprioritises any pending control RPC (which
+    // happens between Tick() calls) so a busy server doesn't underrun.
+    // Cap to 4 mix passes per tick to bound worst-case latency.
+    for (int i = 0; i < 4; i++) {
+        uint32_t q = g_active->QueuedFrames();
+        if (q >= AudioMixer::PERIOD_FRAMES * 2) break;
+        uint32_t produced = AudioMixer::Tick();
+        if (produced == 0) break;
+        g_periods_submitted++;
+    }
 }
 
 // ---- one-shot tone synthesis ----

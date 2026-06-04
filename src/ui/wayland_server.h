@@ -42,6 +42,14 @@ namespace WaylandServer {
     static const int WL_MAX_OBJECTS  = 256;
     static const int WL_MAX_GLOBALS  = 16;
 
+    // Outbound TX scratch per client.  Sized so that an entire batch of
+    // wl_registry::global events (the worst inline burst) coalesces into
+    // a single KernelInject call.
+    static const int WL_TX_SCRATCH   = 4096;
+
+    // Pending frame callbacks per client  -  drained on vsync.
+    static const int WL_MAX_FRAME_CB = 64;
+
     enum InterfaceId : uint16_t {
         WL_DISPLAY            = 1,
         WL_REGISTRY           = 2,
@@ -61,6 +69,13 @@ namespace WaylandServer {
         WL_TOUCH              = 16,
         XDG_SURFACE           = 17,
         XDG_TOPLEVEL          = 18,
+        WL_CALLBACK           = 19,
+        WL_SHM_POOL           = 20,
+    };
+
+    struct DamageRect {
+        int32_t x, y, w, h;
+        bool    valid;
     };
 
     struct Object {
@@ -72,15 +87,27 @@ namespace WaylandServer {
         // For wl_surface objects: the bound Kurono WMWindow handle.
         void*    wm_window;
         int      width, height;
+        // Accumulated damage bounding box for wl_surface, reset on commit.
+        DamageRect damage;
+        // For wl_surface: id of the pending frame callback (0 if none).
+        uint32_t pending_frame_cb;
     };
 
     struct Client {
         bool     in_use;
         int      sd;
+        uint32_t generation;     // bumped each (re)allocation, detects stale sd reuse
         Object   objects[WL_MAX_OBJECTS];
-        int      object_count;
+        int      object_high;    // highest slot ever used + 1 (lookup bound)
         uint8_t  rx_partial[8192];
         int      rx_partial_len;
+        uint8_t  tx_scratch[WL_TX_SCRATCH];
+        int      tx_len;
+        uint32_t frame_cb[WL_MAX_FRAME_CB];
+        int      frame_cb_head;
+        int      frame_cb_tail;
+        uint32_t serial_next;
+        bool     fatal;          // protocol error  -  drop on next dispatch
     };
 
     void Init();

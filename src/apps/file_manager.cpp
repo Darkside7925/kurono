@@ -275,8 +275,23 @@ void FileManagerApp::NotifyFilesystemChanged(const char* path){
     if(tab_count>0) RefreshBoth();
 }
 
+static bool fm_path_is_safe(const char* path){
+    if(!path || !*path) return false;
+    // reject embedded ".." segments  -  prevents traversal abuse via address bar
+    int n = slen(path);
+    for(int i=0;i<n-1;i++){
+        if(path[i]=='.' && path[i+1]=='.'){
+            bool start_ok = (i==0 || path[i-1]=='/');
+            bool end_ok = (i+2==n || path[i+2]=='/');
+            if(start_ok && end_ok) return false;
+        }
+    }
+    return true;
+}
+
 void FileManagerApp::NavigateToPane(int pane,const char* path,bool record_history){
     FMTab* t = Active(pane);
+    if(!fm_path_is_safe(path)) return;
     if(record_history){
         // truncate forward history then push
         t->history_count = t->history_pos + 1;
@@ -464,6 +479,8 @@ void FileManagerApp::DeleteEntryPane(int pane,int idx,bool permanent){
     } else {
         MoveToTrash(full);
     }
+    // clear selection  -  the index just got invalidated
+    t->selected = -1;
     RefreshBoth();
     notify_desktop_path_changed(full);
 }
@@ -756,7 +773,7 @@ void FileManagerApp::RenderFileList(int pane,int x,int y,int w,int h){
         perm[3]=0;
         Graphics::DrawString(x+w-32,ry+5,perm,FM_DIM,0xFF000000);
     }
-    if(n>visible){
+    if(n>visible && n>0){
         int sb_h = (visible*h)/n; if(sb_h<8) sb_h=8;
         int sb_y = y + (t->scroll*h)/n;
         Graphics::FillRoundedRect(x+w-4,sb_y,3,sb_h,2,FM_BORDER_HI);
@@ -770,11 +787,15 @@ void FileManagerApp::RenderFileGrid(int pane,int x,int y,int w,int h){
     int cols = w/GRID_CELL; if(cols<1) cols=1;
     int vis_rows = h/GRID_CELL;
     bool focused = (pane==focused_pane);
-    for(int i=0;i<n;i++){
+    // virtualize: only iterate the visible cell range
+    int start_i = t->scroll * cols;
+    int end_i   = start_i + vis_rows * cols + cols;
+    if(start_i < 0) start_i = 0;
+    if(end_i > n) end_i = n;
+    for(int i=start_i;i<end_i;i++){
         int r = i/cols, c = i%cols;
-        if(r < t->scroll) continue;
         int dr = r - t->scroll;
-        if(dr >= vis_rows) break;
+        if(dr < 0 || dr >= vis_rows) continue;
         FMEntry* ent = &e[i];
         int gx = x + c*GRID_CELL + 4;
         int gy = y + dr*GRID_CELL + 4;
@@ -1082,6 +1103,16 @@ bool FileManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     // rename inline
     if(rename_mode){
         if(key=='\n'||key=='\r'){
+            // reject invalid names (empty, contains '/' or '..')
+            if(rename_buf[0]==0){ rename_mode=false; return true; }
+            for(int ri=0;rename_buf[ri];ri++){
+                if(rename_buf[ri]=='/'){ rename_mode=false; return true; }
+            }
+            if(rename_buf[0]=='.' && rename_buf[1]=='.' && (rename_buf[2]==0 || rename_buf[2]=='/'))
+                { rename_mode=false; return true; }
+            if(rename_target<0 || rename_target>=EntryCount(rename_pane)){
+                rename_mode=false; return true;
+            }
             FMTab* t = Active(rename_pane);
             FMEntry* e = &EntriesOf(rename_pane)[rename_target];
             char old_p[FM_MAX_PATH], new_p[FM_MAX_PATH];
@@ -1266,8 +1297,10 @@ bool FileManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
                     int cols = pane_w/GRID_CELL; if(cols<1) cols=1;
                     int gc = rel_x/GRID_CELL;
                     int gr = rel_y/GRID_CELL + t->scroll;
-                    int idx = gr*cols+gc;
-                    if(idx>=0 && idx<EntryCount(pane)) row_idx=idx;
+                    if(gc>=0 && gc<cols && gr>=0){
+                        int idx = gr*cols+gc;
+                        if(idx>=0 && idx<EntryCount(pane)) row_idx=idx;
+                    }
                 } else {
                     int row = rel_y/ROW_H + t->scroll;
                     if(row>=0 && row<EntryCount(pane)) row_idx=row;
@@ -1325,8 +1358,10 @@ bool FileManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
                 int cols = pane_w/GRID_CELL; if(cols<1) cols=1;
                 int gc = rel_x/GRID_CELL;
                 int gr = rel_y/GRID_CELL + tt->scroll;
-                int idx = gr*cols+gc;
-                if(idx>=0 && idx<EntryCount(pane)){ context_menu_idx=idx; tt->selected=idx; }
+                if(gc>=0 && gc<cols && gr>=0){
+                    int idx = gr*cols+gc;
+                    if(idx>=0 && idx<EntryCount(pane)){ context_menu_idx=idx; tt->selected=idx; }
+                }
             } else {
                 int row = rel_y/ROW_H + tt->scroll;
                 if(row>=0 && row<EntryCount(pane)){ context_menu_idx=row; tt->selected=row; }
@@ -1378,8 +1413,20 @@ bool FileManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
             if(dual_pane){ focused_pane = focused_pane?0:1; return true; }
         }
         // arrow keys (raw scancodes)
-        if(key==(char)0x48){ if(t->selected>0) t->selected--; if(t->selected<t->scroll) t->scroll=t->selected; return true; }
-        if(key==(char)0x50){ if(t->selected<EntryCount(focused_pane)-1) t->selected++; return true; }
+        if(key==(char)0x48){
+            if(t->selected>0) t->selected--;
+            else if(t->selected<0 && EntryCount(focused_pane)>0) t->selected=0;
+            if(t->selected<t->scroll) t->scroll=t->selected<0?0:t->selected;
+            return true;
+        }
+        if(key==(char)0x50){
+            int n = EntryCount(focused_pane);
+            if(t->selected<n-1) t->selected++;
+            // keep visible: nudge scroll if selection runs past the viewport
+            int approx_rows = 12;
+            if(t->selected - t->scroll >= approx_rows) t->scroll = t->selected - approx_rows + 1;
+            return true;
+        }
         if(key==(char)0x4B){ if(focused_pane==1 && dual_pane) focused_pane=0; return true; }
         if(key==(char)0x4D){ if(focused_pane==0 && dual_pane) focused_pane=1; return true; }
     }

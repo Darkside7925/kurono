@@ -29,6 +29,26 @@ constexpr uint64_t KERNEL_STACK_BYTES = 16 * 1024;
 constexpr uint64_t USER_STACK_TOP = USERSPACE_BASE + 0x00200000ULL;
 constexpr uint64_t USER_MMAP_BASE = 0x20000000ULL;
 
+// Lightweight IRQ-disable RAII guard for short scheduler critical sections.
+// Cheaper than the global spinlocks and safe to nest (each guard snapshots
+// its own caller-IF state, restores it on destruction).
+struct IrqGuard {
+    uint64_t flags;
+    inline IrqGuard() {
+        __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    }
+    inline ~IrqGuard() {
+        if (flags & 0x200ULL) __asm__ __volatile__("sti" ::: "memory");
+    }
+    IrqGuard(const IrqGuard&) = delete;
+    IrqGuard& operator=(const IrqGuard&) = delete;
+};
+
+static inline uint8_t prio_tier_for_safe(Process* p) {
+    if (!p) return (uint8_t)PRIO_NORMAL;
+    return (p->prio_tier < PRIO_TIER_COUNT) ? p->prio_tier : (uint8_t)PRIO_NORMAL;
+}
+
 static void init_user_frame(Process* proc, uint64_t rip, uint64_t rsp) {
     memset(&proc->user_frame, 0, sizeof(proc->user_frame));
     proc->user_frame.rip = rip;
@@ -74,6 +94,12 @@ static void init_process_common(Process* proc, const char* name, uint32_t priori
     proc->saved_rsp         = 0;
     proc->is_kernel_proc    = false;
     proc->kstack            = {};
+    proc->interactive_score = 8;        // start mid-range, decays under CPU
+    proc->reaped            = 0;
+    proc->last_wake_ms      = 0;
+    proc->sleep_start_ms    = 0;
+    proc->cgroup_quota_left_us      = 0;
+    proc->cgroup_throttle_until_ms  = 0;
 }
 
 static uint32_t estimate_process_memory_kb(const Process* proc) {
@@ -93,12 +119,19 @@ static uint32_t estimate_process_memory_kb(const Process* proc) {
 }
 
 static void enqueue_process(Process* proc) {
+    if (!proc) return;
+    IrqGuard g;
+    // Reject duplicate enqueue  -  caused leaked queue cycles on resume races.
+    for (Process* cur = Scheduler::ready_queue; cur; cur = cur->next) {
+        if (cur == proc) return;
+    }
     proc->next = Scheduler::ready_queue;
     Scheduler::ready_queue = proc;
 }
 
 static void remove_from_ready_queue(Process* proc) {
     if (!proc) return;
+    IrqGuard g;
 
     if (Scheduler::ready_queue == proc) {
         Scheduler::ready_queue = proc->next;
@@ -190,6 +223,10 @@ static void sched_log_exit(Process* proc, int exit_code) {
     sched_log_process_event(proc, "exited", detail);
 }
 }
+
+// Forward declaration  -  definition is in the preemptive-internals block
+// further down.  Plain file-scope linkage so both halves of this TU see it.
+extern bool g_preemptive_active;
 
 Process* Scheduler::current_process = nullptr;
 Process* Scheduler::ready_queue = nullptr;
@@ -339,7 +376,7 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
 }
 
 void Scheduler::MarkProcessExited(Process* proc, int exit_code) {
-    if (!proc) return;
+    if (!proc || proc->reaped) return;
 
     proc->exit_code = exit_code;
     proc->state = Process_Terminated;
@@ -446,12 +483,12 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
 }
 
 void Scheduler::ReapProcess(Process* proc) {
-    if (!proc || proc->state != Process_Terminated) return;
+    if (!proc || proc->reaped || proc->state != Process_Terminated) return;
     DestroyProcess(proc);
 }
 
 void Scheduler::DestroyProcess(Process* proc) {
-    if (!proc) return;
+    if (!proc || proc->reaped) return;
 
     sched_log_process_event(proc, "destroyed", proc->is_user() ? "native user task released" : "native kernel task released");
 
@@ -484,43 +521,42 @@ void Scheduler::DestroyProcess(Process* proc) {
         }
     }
 
+    proc->reaped = 1;
+    proc->state  = Process_Terminated;
     KernelHeap::Free(proc);
 }
 
 void Scheduler::Schedule() {
+    IrqGuard g;
     if (!ready_queue) return;
 
-    // CFS pick: scan the run queue for the runnable task with the
-    // smallest vruntime.  Falls back to FIFO if everything is blocked.
     if (current_process && current_process->state == Process_Running) {
         current_process->state = Process_Ready;
     }
 
+    // CFS pick with interactivity bias: tasks recently woken by I/O get
+    // a small effective-vruntime discount so they preempt CPU hogs.
     Process* best = nullptr;
-    uint64_t best_vr = (uint64_t)-1;
-    Process* p = ready_queue;
-    while (p) {
-        if (p->state == Process_Ready) {
-            if (!best || p->vruntime < best_vr) {
-                best = p;
-                best_vr = p->vruntime;
-            }
-        }
-        p = p->next;
-    }
-    if (!best) {
-        // nothing runnable  -  keep current if it was already running
-        current_process = ready_queue;
-    } else {
-        current_process = best;
+    uint64_t best_eff = (uint64_t)-1;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->state != Process_Ready) continue;
+        // Discount up to ~interactive_score * 65536 ticks of vruntime.
+        uint64_t bias = (uint64_t)p->interactive_score << 16;
+        uint64_t eff  = (p->vruntime > bias) ? (p->vruntime - bias) : 0;
+        if (!best || eff < best_eff) { best = p; best_eff = eff; }
     }
 
-    if (current_process) {
+    if (best) {
+        current_process = best;
         current_process->state = Process_Running;
         if (current_process->is_user()) {
             HAL::SetKernelStack(current_process->kernel_stack_top);
         }
-        // context switch would happen here
+    } else if (current_process && current_process->state != Process_Running) {
+        // Nothing else runnable.  If our caller blocked us, leave
+        // current_process pointing at a non-running task  -  the caller
+        // owns the next step (idle loop / HLT).
+        current_process = nullptr;
     }
 }
 
@@ -537,47 +573,61 @@ void Scheduler::Sleep(uint32_t ticks) {
 }
 
 void Scheduler::Tick() {
-    // CFS vruntime accounting: charge the running task one tick weighted
-    // by its `nice`.  Standard Linux weight table for nice 0 = 1024; we
-    // approximate the geometric falloff with a small lookup so positive
-    // nice values accrue vruntime faster (= scheduled less often).
     static const uint32_t nice_weight[40] = {
-        88761, 71755, 56483, 46273, 36291,   // -20..-16
-        29154, 23254, 18705, 14949, 11916,   // -15..-11
-         9548,  7620,  6100,  4904,  3906,   // -10..-6
-         3121,  2501,  1991,  1586,  1277,   // -5..-1
-         1024,   820,   655,   526,   423,   //  0..4
-          335,   272,   215,   172,   137,   //  5..9
-          110,    87,    70,    56,    45,   // 10..14
-           36,    29,    23,    18,    15    // 15..19
+        88761, 71755, 56483, 46273, 36291,
+        29154, 23254, 18705, 14949, 11916,
+         9548,  7620,  6100,  4904,  3906,
+         3121,  2501,  1991,  1586,  1277,
+         1024,   820,   655,   526,   423,
+          335,   272,   215,   172,   137,
+          110,    87,    70,    56,    45,
+           36,    29,    23,    18,    15
     };
-    if (current_process && current_process->state == Process_Running) {
-        current_process->cpu_ticks_total++;
-        int n = current_process->nice;
-        if (n < -20) n = -20;
-        if (n > 19) n = 19;
-        uint32_t w = nice_weight[n + 20];
-        // 1 tick * NICE0_WEIGHT / weight
-        current_process->vruntime += (1024u * 1024u) / (w ? w : 1);
-    }
+    bool need_resched = false;
+    {
+        IrqGuard g;
+        Process* cur = current_process;
+        if (cur && cur->state == Process_Running) {
+            cur->cpu_ticks_total++;
+            int n = cur->nice;
+            if (n < -20) n = -20;
+            if (n > 19) n = 19;
+            uint32_t w = nice_weight[n + 20];
+            cur->vruntime += (1024u * 1024u) / (w ? w : 1);
 
-    // decrement sleep counters
-    Process* p = ready_queue;
-    while (p) {
-        if (p->state == Process_Blocked && p->sleep_ticks > 0) {
-            p->sleep_ticks--;
-            if (p->sleep_ticks == 0) p->state = Process_Ready;
+            // Decay interactivity under sustained CPU burn.
+            if (cur->interactive_score > 0 && (cur->cpu_ticks_total & 0x3) == 0) {
+                cur->interactive_score--;
+            }
+
+            // Preemptive timeslice for the cooperative path too.
+            if (cur->timeslice_ms_left == 0) {
+                cur->timeslice_ms_left = PROCESS_TIMESLICE_MS[prio_tier_for_safe(cur)];
+                need_resched = true;
+            } else if (cur->timeslice_ms_left == 1) {
+                cur->timeslice_ms_left = 0;
+                need_resched = true;
+            } else {
+                cur->timeslice_ms_left--;
+            }
         }
-        p = p->next;
+
+        for (Process* p = ready_queue; p; p = p->next) {
+            if (p->state == Process_Blocked && p->sleep_ticks > 0) {
+                if (--p->sleep_ticks == 0) {
+                    p->state = Process_Ready;
+                    // I/O-wake boost: just-woken tasks get priority.
+                    if (p->interactive_score < 16) p->interactive_score += 2;
+                }
+            }
+        }
     }
 
-    // preemption logic
-    if (current_process) {
-        // if (timeslice_expired) schedule();
-    }
+    // Service hrtimers only when preemptive scheduler isn't already driving
+    // them from the PIT IRQ  -  avoids double dispatch.
+    if (!g_preemptive_active) HRTimer::Tick();
 
-    // fire any pending hrtimers (cheap linear scan, see hrtimer.cpp)
-    HRTimer::Tick();
+    if (need_resched) Schedule();
 
     // ---- Phase 14: load average sampling --------------------------
     // Sample run-queue length once per ~5 seconds (assuming HZ=100 ->
@@ -757,7 +807,7 @@ int Scheduler::GetAffinity(uint32_t pid, uint8_t* out_mask) {
 
 // True once Scheduler::Start() has run.  File scope so SleepMs/YieldNow and
 // other TUs (via Scheduler::IsPreemptiveKernelSchedulerActive) can see it.
-static bool g_preemptive_active = false;
+bool g_preemptive_active = false;
 
 namespace {
 
@@ -904,12 +954,38 @@ static Process* pick_next_kernel(Process* after) {
         }
     }
 
-    // Pass 1: highest-tier-first, exclude `after`.
+    uint64_t t = now_ms();
+
+    // Pass 1: highest-tier first, within tier pick the most-interactive
+    // candidate (highest interactive_score); ties go to round-robin order.
+    // Skip cgroup-throttled tasks unless their bucket has refilled.
+    for (uint8_t tier = 0; tier < PRIO_TIER_COUNT; tier++) {
+        Process* best = nullptr;
+        int best_score = -1;
+        for (int step = 0; step < g_kernel_proc_count; step++) {
+            int idx = (start + step) % g_kernel_proc_count;
+            Process* cand = g_kernel_procs[idx];
+            if (!cand || cand == after || cand->reaped) continue;
+            if (cand->prio_tier != tier) continue;
+            if (cand->state != Process_Ready &&
+                cand->state != Process_Running) continue;
+            if (cand->cgroup_throttle_until_ms > t) continue;
+            int score = (int)cand->interactive_score;
+            if (score > best_score) {
+                best = cand;
+                best_score = score;
+            }
+        }
+        if (best) return best;
+    }
+
+    // Pass 2: relax cgroup throttling  -  would-be-throttled tasks may run
+    // rather than leaving the CPU idle (Linux's CFS bandwidth approach).
     for (uint8_t tier = 0; tier < PRIO_TIER_COUNT; tier++) {
         for (int step = 0; step < g_kernel_proc_count; step++) {
             int idx = (start + step) % g_kernel_proc_count;
             Process* cand = g_kernel_procs[idx];
-            if (!cand || cand == after) continue;
+            if (!cand || cand == after || cand->reaped) continue;
             if (cand->prio_tier != tier) continue;
             if (cand->state != Process_Ready &&
                 cand->state != Process_Running) continue;
@@ -917,36 +993,44 @@ static Process* pick_next_kernel(Process* after) {
         }
     }
 
-    // Pass 2: nothing else runnable  -  return `after` if it's still
-    // runnable so we don't deadlock.
-    if (after && (after->state == Process_Ready ||
-                  after->state == Process_Running)) {
+    if (after && !after->reaped &&
+        (after->state == Process_Ready || after->state == Process_Running)) {
         return after;
     }
     return nullptr;
 }
 
 // Update Process_Sleeping -> Process_Ready when the deadline passes.
+// Apply an I/O-wake interactivity boost proportional to sleep length:
+// short sleeps (typical of interactive event-loops) get the biggest bump.
 static void wake_due_processes() {
     uint64_t t = now_ms();
     for (int i = 0; i < g_kernel_proc_count; i++) {
         Process* p = g_kernel_procs[i];
-        if (!p) continue;
+        if (!p || p->reaped) continue;
         if (p->state == Process_Sleeping && p->sleep_until_ms <= t) {
             p->state = Process_Ready;
+            p->last_wake_ms = t;
+            uint64_t slept = (p->sleep_start_ms && t > p->sleep_start_ms)
+                             ? (t - p->sleep_start_ms) : 0;
+            uint8_t bump = (slept <= 4) ? 4 : (slept <= 16 ? 2 : 1);
+            uint32_t s = (uint32_t)p->interactive_score + bump;
+            p->interactive_score = (uint8_t)(s > 16 ? 16 : s);
         }
     }
 }
 
 // Perform the actual switch.  Saves prev's state, updates TSS.RSP0 to
 // next's stack top (so any subsequent IRQ uses the right stack), and
-// jumps via the asm helper.
+// jumps via the asm helper.  Caller must hold IRQs disabled  -  the asm
+// helper restores IF from the saved rflags slot on the new stack.
 static void perform_switch(Process* prev, Process* next) {
     if (!next || prev == next) return;
 
     Scheduler::current_process = next;
     next->state = Process_Running;
     next->timeslice_ms_left = timeslice_for(next);
+    g_need_resched = false;
     HAL::SetKernelStack(next->kstack.high);
 
     if (prev) {
@@ -1023,8 +1107,7 @@ Process* Scheduler::SpawnKernelProcess(const char* name,
 
 void Scheduler::SleepMs(uint32_t ms) {
     if (!g_preemptive_active || !current_process || !current_process->is_kernel_proc) {
-        // Pre-Start() fallback: spin via HRTimer/PIT polling so callers
-        // that run during boot still get a real delay.
+        // Pre-Start() fallback: HLT until the next IRQ, never busy spin.
         uint64_t target = now_ms() + ms;
         while (now_ms() < target) {
             HAL::WaitForInterrupt();
@@ -1033,12 +1116,19 @@ void Scheduler::SleepMs(uint32_t ms) {
     }
 
     Process* prev = current_process;
-    prev->sleep_until_ms = now_ms() + ms;
-    prev->state = Process_Sleeping;
+    Process* next = nullptr;
+    {
+        IrqGuard g;
+        uint64_t t = now_ms();
+        prev->sleep_start_ms = t;
+        prev->sleep_until_ms = t + ms;
+        prev->state = Process_Sleeping;
+        next = pick_next_kernel(prev);
+    }
 
-    Process* next = pick_next_kernel(prev);
     if (!next) {
-        // Nothing else runnable  -  spin-wait until our own deadline.
+        // Nothing else runnable  -  true HLT idle.  WaitForInterrupt is
+        // atomic `sti; hlt`, so any pending wake is not missed.
         while (prev->state == Process_Sleeping) {
             HAL::WaitForInterrupt();
             wake_due_processes();
@@ -1046,6 +1136,8 @@ void Scheduler::SleepMs(uint32_t ms) {
         prev->state = Process_Running;
         return;
     }
+
+    IrqGuard g;
     perform_switch(prev, next);
 }
 
@@ -1053,6 +1145,7 @@ void Scheduler::YieldNow() {
     if (!g_preemptive_active || !current_process || !current_process->is_kernel_proc) {
         return;
     }
+    IrqGuard g;
     Process* prev = current_process;
     Process* next = pick_next_kernel(prev);
     if (!next || next == prev) return;
@@ -1072,6 +1165,14 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     if (!p || !p->is_kernel_proc) return;
 
     p->cpu_ms_total += ms_elapsed;
+
+    // CPU-burn decay of interactivity.  A long-running compute task
+    // gradually loses its interactive_score, so when an interactive task
+    // wakes, the picker prefers it.
+    if (p->interactive_score > 0 && (p->cpu_ms_total & 0x7) == 0) {
+        p->interactive_score--;
+    }
+
     if (p->timeslice_ms_left <= ms_elapsed) {
         p->timeslice_ms_left = 0;
         g_need_resched = true;
@@ -1079,10 +1180,19 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
         p->timeslice_ms_left -= ms_elapsed;
     }
 
-    // Voluntary preemption: only switch if a strictly-higher tier task is
-    // ready, OR our slice is exhausted.  We do NOT switch from inside
-    // the IRQ handler; instead we set g_need_resched and let the next
-    // SleepMs/YieldNow pick it up.  This keeps the IRQ stack pristine.
+    // Higher-priority preemption: if a strictly higher tier task is now
+    // ready, request a resched at the next safe point.  We can't switch
+    // from inside the IRQ stack, but flagging it means the very next
+    // SleepMs/YieldNow handles the handoff with single-ms latency.
+    for (int i = 0; i < g_kernel_proc_count; i++) {
+        Process* cand = g_kernel_procs[i];
+        if (!cand || cand == p || cand->reaped) continue;
+        if (cand->state != Process_Ready) continue;
+        if (cand->prio_tier < p->prio_tier) {
+            g_need_resched = true;
+            break;
+        }
+    }
 }
 
 bool Scheduler::TryGrowGuardPage(uint64_t cr2) {

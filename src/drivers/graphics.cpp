@@ -23,20 +23,44 @@ static int abs(int x) { return x < 0 ? -x : x; }
 static int max(int a, int b) { return a > b ? a : b; }
 
 // uses movntdq (128-bit non-temporal stores) which bypass all cpu caches.
-// this is critical for bare-metal: regular memcpy at -o2 can become
-// 'rep movsb' (fast-string ops) which bypasses wc buffers on real cpus,
-// causing cached fb writes to never reach gpu vram → permanent black screen.
 // movntdq + sfence works correctly on wc, wb, and uc memory types.
+// the 256-byte unrolled inner loop saturates a single core's wc combine
+// buffers on modern uarchs (4 - 6 buffers × 64 b cache lines).
 static void fb_copy_nt(void* dst, const void* src, size_t size) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
 
-    // align destination to 16 bytes for movntdq
     while (size > 0 && ((uintptr_t)d & 15)) {
         *d++ = *s++; size--;
     }
 
-    // 128-bit non-temporal stores (sse2  -  guaranteed on x86_64)
+    // 256-byte unrolled loop  -  issues 4 wc-combine-buffer worth of stores
+    // per iteration to keep the memory pipeline full.
+    while (size >= 256) {
+        __asm__ __volatile__(
+            "prefetchnta 256(%0)\n\t"
+            "prefetchnta 320(%0)\n\t"
+            "movdqu    (%0), %%xmm0\n\t  movdqu  16(%0), %%xmm1\n\t"
+            "movdqu  32(%0), %%xmm2\n\t  movdqu  48(%0), %%xmm3\n\t"
+            "movdqu  64(%0), %%xmm4\n\t  movdqu  80(%0), %%xmm5\n\t"
+            "movdqu  96(%0), %%xmm6\n\t  movdqu 112(%0), %%xmm7\n\t"
+            "movntdq %%xmm0,    (%1)\n\t movntdq %%xmm1,  16(%1)\n\t"
+            "movntdq %%xmm2,  32(%1)\n\t movntdq %%xmm3,  48(%1)\n\t"
+            "movntdq %%xmm4,  64(%1)\n\t movntdq %%xmm5,  80(%1)\n\t"
+            "movntdq %%xmm6,  96(%1)\n\t movntdq %%xmm7, 112(%1)\n\t"
+            "movdqu 128(%0), %%xmm0\n\t  movdqu 144(%0), %%xmm1\n\t"
+            "movdqu 160(%0), %%xmm2\n\t  movdqu 176(%0), %%xmm3\n\t"
+            "movdqu 192(%0), %%xmm4\n\t  movdqu 208(%0), %%xmm5\n\t"
+            "movdqu 224(%0), %%xmm6\n\t  movdqu 240(%0), %%xmm7\n\t"
+            "movntdq %%xmm0, 128(%1)\n\t movntdq %%xmm1, 144(%1)\n\t"
+            "movntdq %%xmm2, 160(%1)\n\t movntdq %%xmm3, 176(%1)\n\t"
+            "movntdq %%xmm4, 192(%1)\n\t movntdq %%xmm5, 208(%1)\n\t"
+            "movntdq %%xmm6, 224(%1)\n\t movntdq %%xmm7, 240(%1)\n\t"
+            :: "r"(s), "r"(d)
+            : "xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","memory"
+        );
+        d += 256; s += 256; size -= 256;
+    }
     while (size >= 64) {
         __asm__ __volatile__(
             "movdqu   (%0), %%xmm0;  movdqu 16(%0), %%xmm1;"
@@ -57,7 +81,9 @@ static void fb_copy_nt(void* dst, const void* src, size_t size) {
         d += 16; s += 16; size -= 16;
     }
 
-    // remaining bytes (regular stores  -  only a few bytes, harmless)
+    // 8/4/1-byte tail
+    while (size >= 8) { *(uint64_t*)d = *(const uint64_t*)s; d+=8; s+=8; size-=8; }
+    while (size >= 4) { *(uint32_t*)d = *(const uint32_t*)s; d+=4; s+=4; size-=4; }
     while (size > 0) { *d++ = *s++; size--; }
 }
 
@@ -169,9 +195,9 @@ Graphics::RenderMode Graphics::render_mode = SINGLE_BUFFER;
 Graphics::BlendMode Graphics::blend_mode = BLEND_ALPHA;
 
 uint32_t Graphics::target_frame_time_us = 5555; // ~180hz (1000000/180)
-uint32_t Graphics::last_frame_time = 0;
+uint64_t Graphics::last_frame_time = 0;
 uint32_t Graphics::frame_count = 0;
-uint32_t Graphics::fps_sample_time = 0;
+uint64_t Graphics::fps_sample_time = 0;
 Graphics::DrawStats Graphics::draw_stats = {0};
 
 // accessibility post-process state
@@ -191,57 +217,51 @@ Graphics::DirtyRegion Graphics::dirty_regions[16];
 int Graphics::dirty_count = 0;
 
 void Graphics::Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp) {
+    if (addr == 0 || width == 0 || height == 0 || pitch == 0 ||
+        bpp < 15 || bpp > 32) {
+        SerialLogger::Log("Graphics: Init rejected  -  invalid framebuffer args\r\n");
+        return;
+    }
+    // any back_buffer left over from a prior config is now sized wrong; drop it.
+    if (back_buffer) {
+        PMM::FreeBytes(back_buffer, back_buffer_size);
+        back_buffer = 0;
+        back_buffer_size = 0;
+        render_mode = SINGLE_BUFFER;
+    }
+
     fb_addr = (uint8_t*)addr;
     fb_width = width;
     fb_height = height;
     fb_pitch = pitch;
     fb_bpp = bpp;
     active_buffer = fb_addr;
-    
+
     SerialLogger::Log("Graphics: Basic Init ");
     SerialLogger::LogHex(width); SerialLogger::Log("x"); SerialLogger::LogHex(height);
     SerialLogger::Log(" @ "); SerialLogger::LogHex(addr); SerialLogger::Log("\r\n");
-    
-    // initialize stats  -  default to 60 hz until detectrefreshrate() overrides
+
     draw_stats.target_fps = 60;
-    draw_stats.vsync_enabled = false; // disabled  -  vga vsync polling hangs on non-vga gpus
-    
-    // clear dirty regions
+    draw_stats.vsync_enabled = false;
+
     for (int i = 0; i < 16; i++) {
         dirty_regions[i].active = false;
     }
     dirty_count = 0;
 
-    // remap framebuffer pages to write-combining (pat entry 1).
-    // this is essential for bare-metal: wb-cached mmio writes are invisible
-    // on real gpus and cause a permanent black screen.
     fb_wc_active = remap_fb_writecombining(addr, (size_t)pitch * height);
     if (!fb_wc_active) {
         SerialLogger::Log("Graphics: WARNING  -  WC remap FAILED, using wbinvd fallback (slower)\r\n");
     }
-    // keep panic subsystem's framebuffer info in sync
-    KernelPanic::UpdateFramebuffer((uint64_t)addr, pitch, width, height, bpp);}
+    KernelPanic::UpdateFramebuffer((uint64_t)addr, pitch, width, height, bpp);
+}
 
 void Graphics::ReinitForResolution(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp) {
-    // free old back buffer if allocated (pmm-backed)
-    if (back_buffer) {
-        PMM::FreeBytes(back_buffer, back_buffer_size);
-        back_buffer = 0;
-        back_buffer_size = 0;
-    }
-    // re-initialize base state
+    RenderMode wanted = render_mode;
+    // Init() now does the back_buffer free + null itself
     Init(addr, width, height, pitch, bpp);
-    // re-allocate double buffer at new size if needed (via pmm for large bufs)
-    if (render_mode == DOUBLE_BUFFER || render_mode == TRIPLE_BUFFER) {
-        size_t buffer_size = (size_t)fb_pitch * fb_height;
-        back_buffer = (uint8_t*)PMM::AllocBytes(buffer_size);
-        if (back_buffer) {
-            back_buffer_size = buffer_size;
-            active_buffer = back_buffer;
-        } else {
-            render_mode = SINGLE_BUFFER;
-            active_buffer = fb_addr;
-        }
+    if (wanted == DOUBLE_BUFFER || wanted == TRIPLE_BUFFER) {
+        SetRenderMode(wanted);
     }
 }
 
@@ -265,8 +285,9 @@ void Graphics::InitAdvanced() {
     
     if (mode && DisplayController::SetMode(mode)) {
         Init(mode->framebuffer_addr, mode->width, mode->height, mode->pitch, mode->bpp);
-        target_frame_time_us = 1000000 / mode->refresh_rate;
-        draw_stats.target_fps = mode->refresh_rate;
+        uint32_t hz = mode->refresh_rate ? mode->refresh_rate : 60;
+        target_frame_time_us = 1000000 / hz;
+        draw_stats.target_fps = hz;
         
         SerialLogger::Log("Graphics: Advanced mode set - ");
         SerialLogger::Log(mode->description);
@@ -282,15 +303,27 @@ void Graphics::InitAdvanced() {
 }
 
 void Graphics::SetRenderMode(RenderMode mode) {
-    render_mode = mode;
-    
     if (mode == DOUBLE_BUFFER || mode == TRIPLE_BUFFER) {
-        // allocate back buffer via pmm (large allocation)
+        if (fb_pitch == 0 || fb_height == 0 || !fb_addr) {
+            render_mode = SINGLE_BUFFER;
+            return;
+        }
         size_t buffer_size = (size_t)fb_pitch * fb_height;
+        if (back_buffer && back_buffer_size == buffer_size) {
+            render_mode = mode;
+            active_buffer = back_buffer;
+            return;
+        }
+        if (back_buffer) {
+            PMM::FreeBytes(back_buffer, back_buffer_size);
+            back_buffer = 0;
+            back_buffer_size = 0;
+        }
         back_buffer = (uint8_t*)PMM::AllocBytes(buffer_size);
         if (back_buffer) {
             back_buffer_size = buffer_size;
             active_buffer = back_buffer;
+            render_mode = mode;
             SerialLogger::Log("Graphics: Double buffering enabled (PMM)\r\n");
         } else {
             SerialLogger::Log("Graphics: Failed to allocate back buffer\r\n");
@@ -303,6 +336,7 @@ void Graphics::SetRenderMode(RenderMode mode) {
             back_buffer = 0;
             back_buffer_size = 0;
         }
+        render_mode = mode;
         active_buffer = fb_addr;
     }
 }
@@ -312,37 +346,34 @@ Graphics::RenderMode Graphics::GetRenderMode() {
 }
 
 void Graphics::BeginFrame() {
-    uint32_t current_time = TimeManager::NowUTC().us;
-    if (frame_count > 0) {
-        draw_stats.last_frame_time_us = current_time - last_frame_time;
+    uint64_t current_time = TimeManager::NowUTC().us;
+    if (frame_count > 0 && current_time >= last_frame_time) {
+        uint64_t dt = current_time - last_frame_time;
+        draw_stats.last_frame_time_us = (dt > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)dt;
     }
     last_frame_time = current_time;
-    
-    // clear dirty regions from previous frame
     ClearDirtyRegions();
 }
 
 void Graphics::EndFrame() {
     frame_count++;
     draw_stats.frames_rendered++;
-    
+
     if (render_mode == DOUBLE_BUFFER || render_mode == TRIPLE_BUFFER) {
         SwapBuffers();
     }
-    
-    // vsync for frame pacing
+
     if (draw_stats.vsync_enabled) {
         WaitForVSync();
     }
-    
-    // accurate fps calculation every 30 frames using stored sample timestamp
+
     if (frame_count % 30 == 0) {
-        uint32_t current_time = TimeManager::NowUTC().us;
-        if (fps_sample_time != 0) {
-            uint32_t elapsed = current_time - fps_sample_time;
+        uint64_t current_time = TimeManager::NowUTC().us;
+        if (fps_sample_time != 0 && current_time > fps_sample_time) {
+            uint64_t elapsed = current_time - fps_sample_time;
             if (elapsed > 0) {
-                draw_stats.current_fps = 30000000 / elapsed;
-                draw_stats.avg_frame_time_us = elapsed / 30;
+                draw_stats.current_fps = (uint32_t)(30000000ull / elapsed);
+                draw_stats.avg_frame_time_us = (uint32_t)(elapsed / 30);
             }
         }
         fps_sample_time = current_time;
@@ -400,8 +431,7 @@ uint32_t Graphics::DetectRefreshRate() {
     }
     if (timeout <= 0) return 60;
 
-    uint32_t start_ms = TimeManager::NowUTC().us / 1000;
-    if (start_ms == 0) start_ms = 1;
+    uint64_t start_ms = TimeManager::NowUTC().us / 1000;
 
     for (int i = 0; i < cycles; i++) {
         timeout = 300000;
@@ -420,148 +450,229 @@ uint32_t Graphics::DetectRefreshRate() {
         if (timeout <= 0) return 60;
     }
 
-    uint32_t end_ms = TimeManager::NowUTC().us / 1000;
-    uint32_t elapsed_ms = end_ms - start_ms;
+    uint64_t end_ms = TimeManager::NowUTC().us / 1000;
+    uint64_t elapsed_ms = end_ms - start_ms;
     if (elapsed_ms == 0 || elapsed_ms > 500) return 60;
 
-    uint32_t hz = (cycles * 1000 + elapsed_ms / 2) / elapsed_ms;
-    if (hz < 24 || hz > 360) hz = 60;  // sanity clamp
-    monitor_hz = hz;  // store for settings app
+    uint32_t hz = (uint32_t)((cycles * 1000 + elapsed_ms / 2) / elapsed_ms);
+    if (hz < 24 || hz > 360) hz = 60;
+    monitor_hz = hz;
     return hz;
 }
 
 bool Graphics::ShouldRender() {
-    uint32_t current_time = TimeManager::NowUTC().us;
-    return (current_time - last_frame_time) >= target_frame_time_us;
+    uint64_t current_time = TimeManager::NowUTC().us;
+    if (current_time < last_frame_time) return true;  // clock skew  -  render
+    return (current_time - last_frame_time) >= (uint64_t)target_frame_time_us;
 }
 
 void Graphics::WaitForVSync() {
     DisplayController::WaitVSync();
 }
 
+// applies the accessibility color filter to one pixel
+static inline uint32_t apply_a11y_filter(uint32_t c) {
+    uint32_t a = (c >> 24) & 0xFF;
+    int r = (c >> 16) & 0xFF;
+    int g = (c >> 8)  & 0xFF;
+    int b = (c)       & 0xFF;
+    int nr = r, ng = g, nb = b;
+    switch (g_color_filter) {
+        case 1:
+            nr = (567*r + 433*g) / 1000;
+            ng = (558*r + 442*g) / 1000;
+            nb = (242*g + 758*b) / 1000;
+            break;
+        case 2:
+            nr = (625*r + 375*g) / 1000;
+            ng = (700*r + 300*g) / 1000;
+            nb = (300*g + 700*b) / 1000;
+            break;
+        case 3:
+            nr = (950*r +  50*g) / 1000;
+            ng = (433*g + 567*b) / 1000;
+            nb = (475*g + 525*b) / 1000;
+            break;
+        case 4: { int yy = (299*r + 587*g + 114*b) / 1000; nr = ng = nb = yy; break; }
+        default: break;
+    }
+    if (g_high_contrast) {
+        int yy = (299*nr + 587*ng + 114*nb) / 1000;
+        nr = ng = nb = (yy < 96) ? 0 : 255;
+    }
+    if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
+    if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
+    if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
+    return (a << 24) | ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
+}
+
+// internal: copy one row of dirty pixels, applying the a11y filter if active.
+// uses 16-pixel SSE-friendly inner loop with NT stores.
+static void blit_filtered_row(uint8_t* dst_row, const uint8_t* src_row, int x, int w) {
+    uint32_t* d = (uint32_t*)dst_row + x;
+    const uint32_t* s = (const uint32_t*)src_row + x;
+    int i = 0;
+    for (; i + 4 <= w; i += 4) {
+        uint32_t a = apply_a11y_filter(s[i+0]);
+        uint32_t b = apply_a11y_filter(s[i+1]);
+        uint32_t c = apply_a11y_filter(s[i+2]);
+        uint32_t e = apply_a11y_filter(s[i+3]);
+        d[i+0] = a; d[i+1] = b; d[i+2] = c; d[i+3] = e;
+    }
+    for (; i < w; i++) d[i] = apply_a11y_filter(s[i]);
+}
+
 void Graphics::SwapBuffers() {
     if (render_mode == SINGLE_BUFFER) return;
-    
-    if (back_buffer && fb_addr) {
-        uint32_t bytes_per_pixel = fb_bpp / 8;
-        uint32_t bytes_per_line = fb_width * bytes_per_pixel;
-        bool pitch_match = (bytes_per_line == fb_pitch);
-        bool filter_active = ((g_color_filter > 0 || g_high_contrast) && bytes_per_pixel == 4);
+    if (!back_buffer || !fb_addr) return;
 
-        // accessibility post-process: write filtered pixels DIRECTLY into the
-        // framebuffer, leaving back_buffer untouched (idempotent).  Forces a
-        // full-frame swap because a per-pixel transform is needed.
-        if (filter_active) {
+    const uint32_t bytes_per_pixel = fb_bpp / 8;
+    if (bytes_per_pixel == 0) return;
+    const uint32_t bytes_per_line = fb_width * bytes_per_pixel;
+    const bool pitch_match = (bytes_per_line == fb_pitch);
+    const bool filter_active = ((g_color_filter > 0 || g_high_contrast) && bytes_per_pixel == 4);
+
+    // accessibility path: per-pixel transform. We still honour the dirty
+    // region list so a static screen with a moving cursor isn't a full
+    // re-tonemap each frame.
+    if (filter_active) {
+        bool any_dirty = false;
+        for (int i = 0; i < dirty_count && i < 16; i++) {
+            if (dirty_regions[i].active) { any_dirty = true; break; }
+        }
+        if (!any_dirty || dirty_count == 0) {
             for (uint32_t y = 0; y < fb_height; y++) {
-                uint32_t* src = (uint32_t*)(back_buffer + y * fb_pitch);
-                uint32_t* dst = (uint32_t*)(fb_addr   + y * fb_pitch);
-                for (uint32_t x = 0; x < fb_width; x++) {
-                    uint32_t c = src[x];
-                    uint32_t a = (c >> 24) & 0xFF;
-                    int r = (c >> 16) & 0xFF;
-                    int g = (c >> 8)  & 0xFF;
-                    int b = (c)       & 0xFF;
-                    int nr = r, ng = g, nb = b;
-                    switch (g_color_filter) {
-                        case 1:
-                            nr = (567*r + 433*g + 0*b) / 1000;
-                            ng = (558*r + 442*g + 0*b) / 1000;
-                            nb = (0*r   + 242*g + 758*b) / 1000;
-                            break;
-                        case 2:
-                            nr = (625*r + 375*g + 0*b)   / 1000;
-                            ng = (700*r + 300*g + 0*b)   / 1000;
-                            nb = (0*r   + 300*g + 700*b) / 1000;
-                            break;
-                        case 3:
-                            nr = (950*r + 50*g  + 0*b)   / 1000;
-                            ng = (0*r   + 433*g + 567*b) / 1000;
-                            nb = (0*r   + 475*g + 525*b) / 1000;
-                            break;
-                        case 4: {
-                            int yy = (299*r + 587*g + 114*b) / 1000;
-                            nr = ng = nb = yy; break;
-                        }
-                        default: break;
-                    }
-                    if (g_high_contrast) {
-                        int yy = (299*nr + 587*ng + 114*nb) / 1000;
-                        if (yy < 96) { nr = 0;   ng = 0;   nb = 0;   }
-                        else         { nr = 255; ng = 255; nb = 255; }
-                    }
-                    if (nr < 0) nr = 0; if (nr > 255) nr = 255;
-                    if (ng < 0) ng = 0; if (ng > 255) ng = 255;
-                    if (nb < 0) nb = 0; if (nb > 255) nb = 255;
-                    dst[x] = (a << 24) | ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
+                blit_filtered_row(fb_addr + (size_t)y * fb_pitch,
+                                  back_buffer + (size_t)y * fb_pitch,
+                                  0, (int)fb_width);
+            }
+        } else {
+            for (int i = 0; i < dirty_count; i++) {
+                if (!dirty_regions[i].active) continue;
+                int rx = dirty_regions[i].x;
+                int ry = dirty_regions[i].y;
+                int rw = dirty_regions[i].w;
+                int rh = dirty_regions[i].h;
+                if (rx < 0) { rw += rx; rx = 0; }
+                if (ry < 0) { rh += ry; ry = 0; }
+                if (rx >= (int)fb_width || ry >= (int)fb_height) continue;
+                if (rx + rw > (int)fb_width)  rw = (int)fb_width  - rx;
+                if (ry + rh > (int)fb_height) rh = (int)fb_height - ry;
+                if (rw <= 0 || rh <= 0) continue;
+                for (int y = ry; y < ry + rh; y++) {
+                    blit_filtered_row(fb_addr + (size_t)y * fb_pitch,
+                                      back_buffer + (size_t)y * fb_pitch,
+                                      rx, rw);
+                }
+            }
+        }
+        __asm__ __volatile__("sfence" ::: "memory");
+        ClearDirtyRegions();
+        return;
+    }
+
+    // partial swap when dirty area is small enough; otherwise full-frame.
+    // 60 % threshold trades per-rect copy overhead vs cache locality of a
+    // single contiguous blit.
+    if (dirty_count > 0 && dirty_count <= 16) {
+        uint64_t dirty_pixels = 0;
+        int active_rects = 0;
+        for (int i = 0; i < dirty_count; i++) {
+            if (!dirty_regions[i].active) continue;
+            int rw = dirty_regions[i].w, rh = dirty_regions[i].h;
+            if (rw <= 0 || rh <= 0) continue;
+            dirty_pixels += (uint64_t)rw * (uint64_t)rh;
+            active_rects++;
+        }
+        uint64_t total_pixels = (uint64_t)fb_width * (uint64_t)fb_height;
+
+        if (active_rects > 0 && dirty_pixels < (total_pixels * 3 / 5)) {
+            for (int i = 0; i < dirty_count; i++) {
+                if (!dirty_regions[i].active) continue;
+                int rx = dirty_regions[i].x;
+                int ry = dirty_regions[i].y;
+                int rw = dirty_regions[i].w;
+                int rh = dirty_regions[i].h;
+                if (rx < 0) { rw += rx; rx = 0; }
+                if (ry < 0) { rh += ry; ry = 0; }
+                if (rx >= (int)fb_width || ry >= (int)fb_height) continue;
+                if (rx + rw > (int)fb_width)  rw = (int)fb_width  - rx;
+                if (ry + rh > (int)fb_height) rh = (int)fb_height - ry;
+                if (rw <= 0 || rh <= 0) continue;
+
+                size_t region_bytes = (size_t)rw * bytes_per_pixel;
+                size_t col_off = (size_t)rx * bytes_per_pixel;
+                for (int y = ry; y < ry + rh; y++) {
+                    size_t row_off = (size_t)y * fb_pitch + col_off;
+                    fb_copy_nt(fb_addr + row_off, back_buffer + row_off, region_bytes);
                 }
             }
             __asm__ __volatile__("sfence" ::: "memory");
             ClearDirtyRegions();
             return;
         }
+    }
 
-        // if few dirty regions exist and they cover less than ~60% of the screen,
-        // copy only those regions (partial swap). otherwise full-frame copy.
-        // all copies use non-temporal stores (fb_copy_nt) which bypass cpu caches
-        // and write directly to gpu vram  -  essential for bare-metal.
-        if (dirty_count > 0 && dirty_count <= 16) {
-            // compute total dirty area
-            uint32_t dirty_pixels = 0;
-            for (int i = 0; i < dirty_count; i++) {
-                if (!dirty_regions[i].active) continue;
-                dirty_pixels += (uint32_t)dirty_regions[i].w * (uint32_t)dirty_regions[i].h;
-            }
-            uint32_t total_pixels = fb_width * fb_height;
-
-            if (dirty_pixels < (total_pixels * 3 / 5)) {
-                // partial swap  -  copy only dirty regions (non-temporal)
-                for (int i = 0; i < dirty_count; i++) {
-                    if (!dirty_regions[i].active) continue;
-                    int rx = dirty_regions[i].x;
-                    int ry = dirty_regions[i].y;
-                    int rw = dirty_regions[i].w;
-                    int rh = dirty_regions[i].h;
-                    // clamp to screen bounds
-                    if (rx < 0) { rw += rx; rx = 0; }
-                    if (ry < 0) { rh += ry; ry = 0; }
-                    if (rx + rw > (int)fb_width)  rw = (int)fb_width - rx;
-                    if (ry + rh > (int)fb_height) rh = (int)fb_height - ry;
-                    if (rw <= 0 || rh <= 0) continue;
-
-                    uint32_t region_bytes = (uint32_t)rw * bytes_per_pixel;
-                    for (int y = ry; y < ry + rh; y++) {
-                        uint32_t offset = y * fb_pitch + rx * bytes_per_pixel;
-                        fb_copy_nt(fb_addr + offset, back_buffer + offset, region_bytes);
-                    }
-                }
-                // sfence synchronizes non-temporal stores → gpu vram
-                __asm__ __volatile__("sfence" ::: "memory");
-                ClearDirtyRegions();
-                return;
-            }
-        }
-
-        // full-frame copy (non-temporal)
-        if (pitch_match) {
-            fb_copy_nt(fb_addr, back_buffer, fb_pitch * fb_height);
-        } else {
-            uint8_t* src = back_buffer;
-            uint8_t* dst = fb_addr;
-            for (uint32_t y = 0; y < fb_height; y++) {
-                fb_copy_nt(dst, src, bytes_per_line);
-                src += fb_pitch;
-                dst += fb_pitch;
-            }
+    // full-frame copy
+    if (pitch_match) {
+        fb_copy_nt(fb_addr, back_buffer, (size_t)fb_pitch * fb_height);
+    } else {
+        uint8_t* src = back_buffer;
+        uint8_t* dst = fb_addr;
+        for (uint32_t y = 0; y < fb_height; y++) {
+            fb_copy_nt(dst, src, bytes_per_line);
+            src += fb_pitch;
+            dst += fb_pitch;
         }
     }
 
-    // sfence synchronizes all non-temporal writes → gpu vram.
-    // unlike regular memcpy, fb_copy_nt uses movntdq which bypasses cpu caches
-    // entirely, so sfence alone is sufficient regardless of wc/wb/uc memory type.
     __asm__ __volatile__("sfence" ::: "memory");
+    ClearDirtyRegions();
+}
 
-    // clear dirty regions after swap so they don't go stale across frames.
-    // (the main loop never calls beginframe, so we do it here.)
+// Atomic present of an explicit damage list. Each rect is clipped to the
+// framebuffer, then blitted with non-temporal stores. A NULL rect list or
+// count<=0 forces a full-frame present.
+void Graphics::Present(const Rect* rects, int count) {
+    if (render_mode == SINGLE_BUFFER || !back_buffer || !fb_addr) return;
+    const uint32_t bytes_per_pixel = fb_bpp / 8;
+    if (bytes_per_pixel == 0) return;
+    const bool filter_active = ((g_color_filter > 0 || g_high_contrast) && bytes_per_pixel == 4);
+
+    if (!rects || count <= 0) {
+        // hand off to SwapBuffers full-frame path
+        ClearDirtyRegions();
+        SwapBuffers();
+        return;
+    }
+
+    if (count > 32) count = 32;
+    for (int i = 0; i < count; i++) {
+        int rx = rects[i].x, ry = rects[i].y;
+        int rw = rects[i].w, rh = rects[i].h;
+        if (rx < 0) { rw += rx; rx = 0; }
+        if (ry < 0) { rh += ry; ry = 0; }
+        if (rx >= (int)fb_width || ry >= (int)fb_height) continue;
+        if (rx + rw > (int)fb_width)  rw = (int)fb_width  - rx;
+        if (ry + rh > (int)fb_height) rh = (int)fb_height - ry;
+        if (rw <= 0 || rh <= 0) continue;
+
+        size_t region_bytes = (size_t)rw * bytes_per_pixel;
+        size_t col_off = (size_t)rx * bytes_per_pixel;
+        if (filter_active) {
+            for (int y = ry; y < ry + rh; y++) {
+                blit_filtered_row(fb_addr + (size_t)y * fb_pitch,
+                                  back_buffer + (size_t)y * fb_pitch,
+                                  rx, rw);
+            }
+        } else {
+            for (int y = ry; y < ry + rh; y++) {
+                size_t row_off = (size_t)y * fb_pitch + col_off;
+                fb_copy_nt(fb_addr + row_off, back_buffer + row_off, region_bytes);
+            }
+        }
+    }
+    __asm__ __volatile__("sfence" ::: "memory");
     ClearDirtyRegions();
 }
 
@@ -601,8 +712,12 @@ void Graphics::DrawPixel(int x, int y, uint32_t color) {
 
 void Graphics::DrawPixelUnsafe(int x, int y, uint32_t color) {
     if (!active_buffer) return;
-    
-    uint32_t offset = y * fb_pitch + x * (fb_bpp / 8);
+    // bounds check  -  "Unsafe" historically meant unchecked vs clip rect, but
+    // OOB store to a wc-mapped fb can corrupt unrelated mmio (page-aligned
+    // bars sit right after the fb on many gpus).
+    if ((unsigned)x >= fb_width || (unsigned)y >= fb_height) return;
+
+    size_t offset = (size_t)y * fb_pitch + (size_t)x * (fb_bpp / 8);
     if (fb_bpp == 32) {
         *(volatile uint32_t*)(active_buffer + offset) = color;
     } else if (fb_bpp == 24) {
@@ -635,8 +750,9 @@ uint32_t Graphics::ReadPixel(int x, int y) {
 
 uint32_t Graphics::GetPixelUnsafe(int x, int y) {
     if (!active_buffer) return 0xFF000000;
-    
-    uint32_t offset = y * fb_pitch + x * (fb_bpp / 8);
+    if ((unsigned)x >= fb_width || (unsigned)y >= fb_height) return 0xFF000000;
+
+    size_t offset = (size_t)y * fb_pitch + (size_t)x * (fb_bpp / 8);
     if (fb_bpp == 32) {
         return *(volatile uint32_t*)(active_buffer + offset);
     } else if (fb_bpp == 24) {
@@ -657,39 +773,46 @@ uint32_t Graphics::GetPixelUnsafe(int x, int y) {
 
 void Graphics::FillRect(int x, int y, int w, int h, uint32_t color) {
     ClipRect(x, y, w, h);
-    if (w <= 0 || h <= 0) return;
-    
+    if (w <= 0 || h <= 0 || !active_buffer) return;
+
     uint8_t alpha = (color >> 24) & 0xFF;
     if (fb_bpp == 32 && (blend_mode == BLEND_NONE || alpha >= 0xF0)) {
-        // fast path for 32-bit opaque/near-opaque fills
         uint32_t opaque_color = color | 0xFF000000u;
-        // pack two pixels into a 64-bit value for double-wide writes
         uint64_t duo = ((uint64_t)opaque_color << 32) | (uint64_t)opaque_color;
         for (int j = 0; j < h; j++) {
-            uint32_t* row = (uint32_t*)(active_buffer + (y + j) * fb_pitch + x * 4);
+            uint32_t* row = (uint32_t*)(active_buffer + (size_t)(y + j) * fb_pitch + (size_t)x * 4);
             int i = 0;
-            // 64-bit bulk fill: process 2 pixels per iteration
-            uint64_t* row64 = (uint64_t*)row;
-            int pairs = w / 2;
-            for (; i < pairs; i++) {
-                row64[i] = duo;
+            // align row to 8-byte boundary so the 64-bit writes are aligned
+            if (((uintptr_t)row & 7) != 0 && w > 0) {
+                row[0] = opaque_color;
+                i = 1;
             }
-            // handle odd trailing pixel
-            if (w & 1) {
-                row[w - 1] = opaque_color;
+            // 4 pixels per 16 b iteration, fully unrolled
+            uint64_t* row64 = (uint64_t*)(row + i);
+            int remaining = w - i;
+            int quads = remaining >> 2;
+            for (int p = 0; p < quads; p++) {
+                row64[p*2 + 0] = duo;
+                row64[p*2 + 1] = duo;
+            }
+            int written = i + quads * 4;
+            // tail: 0..3 pixels
+            if (written < w) {
+                int tail = w - written;
+                if (tail >= 2) { row64[quads*2] = duo; written += 2; }
+                if (written < w) row[written] = opaque_color;
             }
         }
     } else if (alpha == 0) {
-        return; // fully transparent  -  skip
+        return;
     } else {
-        // general case (blended)
         for (int j = 0; j < h; j++) {
             for (int i = 0; i < w; i++) {
                 DrawPixel(x + i, y + j, color);
             }
         }
     }
-    
+
     MarkDirty(x, y, w, h);
 }
 
@@ -737,14 +860,46 @@ void Graphics::DrawThickLine(int x0, int y0, int x1, int y1, uint32_t color, int
 }
 
 void Graphics::MarkDirty(int x, int y, int w, int h) {
-    if (dirty_count >= 16) return; // max regions reached
-    
-    DirtyRegion& region = dirty_regions[dirty_count++];
-    region.x = x;
-    region.y = y;
-    region.w = w;
-    region.h = h;
-    region.active = true;
+    if (w <= 0 || h <= 0) return;
+    // clip to fb so coalescing math doesn't blow up the union rect
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x >= (int)fb_width || y >= (int)fb_height) return;
+    if (x + w > (int)fb_width)  w = (int)fb_width  - x;
+    if (y + h > (int)fb_height) h = (int)fb_height - y;
+    if (w <= 0 || h <= 0) return;
+
+    if (dirty_count < 16) {
+        DirtyRegion& region = dirty_regions[dirty_count++];
+        region.x = x; region.y = y; region.w = w; region.h = h;
+        region.active = true;
+        return;
+    }
+    // list full  -  coalesce the new rect into the existing region with
+    // smallest growth so we never silently drop damage.
+    int best = 0;
+    int64_t best_growth = -1;
+    for (int i = 0; i < 16; i++) {
+        DirtyRegion& r = dirty_regions[i];
+        int nx0 = r.x < x ? r.x : x;
+        int ny0 = r.y < y ? r.y : y;
+        int nx1 = (r.x + r.w) > (x + w) ? (r.x + r.w) : (x + w);
+        int ny1 = (r.y + r.h) > (y + h) ? (r.y + r.h) : (y + h);
+        int64_t cur = (int64_t)r.w * r.h;
+        int64_t nu  = (int64_t)(nx1 - nx0) * (ny1 - ny0);
+        int64_t growth = nu - cur;
+        if (best_growth < 0 || growth < best_growth) {
+            best_growth = growth;
+            best = i;
+        }
+    }
+    DirtyRegion& r = dirty_regions[best];
+    int nx0 = r.x < x ? r.x : x;
+    int ny0 = r.y < y ? r.y : y;
+    int nx1 = (r.x + r.w) > (x + w) ? (r.x + r.w) : (x + w);
+    int ny1 = (r.y + r.h) > (y + h) ? (r.y + r.h) : (y + h);
+    r.x = nx0; r.y = ny0; r.w = nx1 - nx0; r.h = ny1 - ny0;
+    r.active = true;
 }
 
 void Graphics::ClearDirtyRegions() {
@@ -802,21 +957,13 @@ uint32_t Graphics::RGBA(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 uint32_t Graphics::BlendColors(uint32_t src, uint32_t dst, uint8_t alpha) {
     if (alpha == 0) return dst;
     if (alpha == 255) return src;
-    
-    uint8_t src_r = (src >> 16) & 0xFF;
-    uint8_t src_g = (src >> 8) & 0xFF;
-    uint8_t src_b = src & 0xFF;
-    
-    uint8_t dst_r = (dst >> 16) & 0xFF;
-    uint8_t dst_g = (dst >> 8) & 0xFF;
-    uint8_t dst_b = dst & 0xFF;
-    
-    uint8_t inv_alpha = 255 - alpha;
-    uint8_t out_r = (src_r * alpha + dst_r * inv_alpha) / 255;
-    uint8_t out_g = (src_g * alpha + dst_g * inv_alpha) / 255;
-    uint8_t out_b = (src_b * alpha + dst_b * inv_alpha) / 255;
-    
-    return 0xFF000000u | (out_r << 16) | (out_g << 8) | out_b;
+    uint32_t a = alpha;
+    uint32_t inv = 255u - a;
+    // round-half-up via +127 then /255; gcc lowers /255 to mul-shift
+    uint32_t r = (((src >> 16) & 0xFFu) * a + ((dst >> 16) & 0xFFu) * inv + 127u) / 255u;
+    uint32_t g = (((src >> 8)  & 0xFFu) * a + ((dst >> 8)  & 0xFFu) * inv + 127u) / 255u;
+    uint32_t b = (( src        & 0xFFu) * a + ( dst        & 0xFFu) * inv + 127u) / 255u;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
 // keep the rest of the existing methods for compatibility
@@ -831,23 +978,39 @@ void Graphics::BlendPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t
 
 void Graphics::FillRectRounded(int x, int y, int w, int h, int r, uint32_t color) {
     if (r <= 0 || r > h/2 || r > w/2) { FillRect(x, y, w, h, color); return; }
-    // force opaque for maximum performance in rounded rects
-    uint32_t opaque = color | 0xFF000000u;
-    FillRect(x + r, y, w - 2 * r, h, opaque);           // center column
-    FillRect(x, y + r, r, h - 2 * r, opaque);            // left strip
-    FillRect(x + w - r, y + r, r, h - 2 * r, opaque);    // right strip
-    
-    // draw rounded corners with fast pixel writes
-    for (int dy = 0; dy < r; dy++) {
-        for (int dx = 0; dx < r; dx++) {
-            if ((dx * dx + dy * dy) <= (r * r)) {
-                DrawPixelUnsafe(x + r - 1 - dx, y + r - 1 - dy, opaque); // tl
-                DrawPixelUnsafe(x + w - r + dx, y + r - 1 - dy, opaque); // tr
-                DrawPixelUnsafe(x + r - 1 - dx, y + h - r + dy, opaque); // bl
-                DrawPixelUnsafe(x + w - r + dx, y + h - r + dy, opaque); // br
+    FillRect(x + r, y, w - 2 * r, h, color);
+    FillRect(x, y + r, r, h - 2 * r, color);
+    FillRect(x + w - r, y + r, r, h - 2 * r, color);
+
+    uint8_t alpha = (color >> 24) & 0xFF;
+    int r2 = r * r;
+    if (alpha >= 0xF0) {
+        uint32_t op = color | 0xFF000000u;
+        for (int dy = 0; dy < r; dy++) {
+            int dy2 = dy * dy;
+            for (int dx = 0; dx < r; dx++) {
+                if (dx*dx + dy2 <= r2) {
+                    DrawPixelUnsafe(x + r - 1 - dx, y + r - 1 - dy, op);
+                    DrawPixelUnsafe(x + w - r + dx, y + r - 1 - dy, op);
+                    DrawPixelUnsafe(x + r - 1 - dx, y + h - r + dy, op);
+                    DrawPixelUnsafe(x + w - r + dx, y + h - r + dy, op);
+                }
+            }
+        }
+    } else {
+        for (int dy = 0; dy < r; dy++) {
+            int dy2 = dy * dy;
+            for (int dx = 0; dx < r; dx++) {
+                if (dx*dx + dy2 <= r2) {
+                    DrawPixel(x + r - 1 - dx, y + r - 1 - dy, color);
+                    DrawPixel(x + w - r + dx, y + r - 1 - dy, color);
+                    DrawPixel(x + r - 1 - dx, y + h - r + dy, color);
+                    DrawPixel(x + w - r + dx, y + h - r + dy, color);
+                }
             }
         }
     }
+    MarkDirty(x, y, w, h);
 }
 
 void Graphics::FillRectAlpha(int x, int y, int w, int h, uint8_t a, uint32_t color) {
@@ -947,9 +1110,9 @@ void Graphics::DrawCircle(int cx, int cy, int radius, uint32_t color, bool fille
 
     auto hline = [&](int lx, int rx, int ly) {
         if (ly < 0 || ly >= (int)fb_height) return;
-        if (lx < 0) lx = 0;
-        if (rx >= (int)fb_width) rx = (int)fb_width - 1;
-        for (int i = lx; i <= rx; i++) DrawPixel(i, ly, color);
+        if (rx < lx) return;
+        // FillRect-based span  -  hits the 64-bit bulk path on 32 bpp
+        FillRect(lx, ly, rx - lx + 1, 1, color);
     };
 
     while (x <= y) {

@@ -236,11 +236,12 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             TaskManagerApp::RefreshProcesses();
         }
 
-        // Frame pacing: yield instead of pause-spinning when we still
-        // have budget.  This is the primary place where GUIProcess
-        // releases the CPU to other tiers.
+        // Frame pacing: when the renderer says we still have budget we
+        // sleep briefly so the CPU can HLT instead of busy-yielding.  1 ms
+        // is well below human perception (~16 ms frame budget) and lets
+        // every other tier progress.
         if (!Graphics::ShouldRender()) {
-            Scheduler::YieldNow();
+            Scheduler::SleepMs(1);
             continue;
         }
 

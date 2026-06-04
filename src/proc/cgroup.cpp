@@ -1,11 +1,13 @@
 #include "cgroup.h"
 #include "../fs/kvfs.h"
 #include "../drivers/serial.h"
+#include "spinlock.h"
 
 namespace {
     Cgroup::Node g_nodes[Cgroup::CGROUP_MAX];
     int          g_count = 0;
     uint32_t     g_next_id = 1;
+    Spinlock     g_lock;
 
     inline void mzero(void* p, unsigned n) {
         unsigned char* b = (unsigned char*)p;
@@ -19,7 +21,7 @@ namespace {
     inline bool seq(const char* a, const char* b) {
         if (!a || !b) return false;
         while (*a && *b && *a == *b) { a++; b++; }
-        return *a == *b;
+        return *a == 0 && *b == 0;
     }
     inline int slen(const char* s) {
         int n = 0; while (s && s[n]) n++; return n;
@@ -96,10 +98,8 @@ uint32_t Create(uint32_t parent_id, const char* name) {
     n.parent = parent_id;
     scopy(n.name, name, CGROUP_NAME_MAX);
     scopy(n.path, parent->path, CGROUP_PATH_MAX);
-    if (parent->id != 1) scat(n.path, "/", CGROUP_PATH_MAX);
-    else                 scat(n.path, "/", CGROUP_PATH_MAX);
+    scat(n.path, "/", CGROUP_PATH_MAX);
     scat(n.path, name, CGROUP_PATH_MAX);
-    // Children inherit parent's enabled controllers by default.
     n.enabled_ctrls = parent->enabled_ctrls;
     n.cpu_weight    = 100;
     n.io_weight     = 100;
@@ -127,19 +127,31 @@ uint32_t Create(uint32_t parent_id, const char* name) {
 }
 
 bool Destroy(uint32_t id) {
-    Node* n = Get(id);
+    SpinLockGuard guard(g_lock);
+    Node* n = nullptr;
+    for (int i = 0; i < CGROUP_MAX; i++) {
+        if (g_nodes[i].in_use && g_nodes[i].id == id) { n = &g_nodes[i]; break; }
+    }
     if (!n || n->id == 1) return false;        // refuse root
     if (n->pids_current > 0) return false;     // EBUSY
+    // Refuse if any in-use child still points at us.
+    for (int i = 0; i < CGROUP_MAX; i++) {
+        if (g_nodes[i].in_use && g_nodes[i].parent == id) return false;
+    }
     n->in_use = false;
     g_count--;
     return true;
 }
 
 bool Attach(uint32_t cgroup_id, uint32_t pid) {
-    Node* n = Get(cgroup_id);
-    if (!n) return false;
-    if (n->pids_max && n->pids_current >= n->pids_max) return false;
-    n->pids_current++;
+    SpinLockGuard guard(g_lock);
+    Node* target = nullptr;
+    for (int i = 0; i < CGROUP_MAX; i++) {
+        if (g_nodes[i].in_use && g_nodes[i].id == cgroup_id) { target = &g_nodes[i]; break; }
+    }
+    if (!target) return false;
+    if (target->pids_max && target->pids_current >= target->pids_max) return false;
+    target->pids_current++;
     (void)pid;
     return true;
 }
@@ -193,24 +205,24 @@ bool EnableController(uint32_t id, uint32_t ctrl_bits) {
 }
 
 bool MemoryCharge(uint32_t cgroup_id, uint64_t bytes) {
+    SpinLockGuard guard(g_lock);
     Node* n = Get(cgroup_id);
-    while (n) {
-        if (n->mem_max && (n->mem_current + bytes) > n->mem_max) {
-            n->mem_oom_count++;
+    // Pre-check entire ancestor chain so a partial charge is impossible.
+    for (Node* cur = n; cur; cur = Get(cur->parent)) {
+        if (cur->mem_max && (cur->mem_current + bytes) > cur->mem_max) {
+            cur->mem_oom_count++;
             return false;
         }
-        n = Get(n->parent);
     }
-    n = Get(cgroup_id);
-    while (n) {
-        n->mem_current += bytes;
-        if (n->mem_current > n->mem_high_water) n->mem_high_water = n->mem_current;
-        n = Get(n->parent);
+    for (Node* cur = n; cur; cur = Get(cur->parent)) {
+        cur->mem_current += bytes;
+        if (cur->mem_current > cur->mem_high_water) cur->mem_high_water = cur->mem_current;
     }
     return true;
 }
 
 void MemoryUncharge(uint32_t cgroup_id, uint64_t bytes) {
+    SpinLockGuard guard(g_lock);
     Node* n = Get(cgroup_id);
     while (n) {
         if (n->mem_current >= bytes) n->mem_current -= bytes;

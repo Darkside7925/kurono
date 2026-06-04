@@ -38,8 +38,8 @@ private:
     static void Coalesce(HeapBlock* block);
     static HeapBlock* FindFree(size_t size);
 
-    // bootstrap heap (small, bss-resident)
-    static uint8_t  boot_buffer[];
+    // bootstrap heap (small, bss-resident, 16-byte aligned)
+    alignas(16) static uint8_t  boot_buffer[];
     static const size_t BOOT_CAPACITY;
 
     // active heap region (starts as boot_buffer, switches to pmm region)
