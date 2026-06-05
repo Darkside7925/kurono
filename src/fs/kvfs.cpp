@@ -754,8 +754,13 @@ uint32_t KVFS::DiskUsage(const char* path) {
     while (sp > 0) {
         KVFSNode* n = stack[--sp];
         if (n->is_file()) total += n->size;
-        for (int i = 0; i < n->child_count && sp < 256; i++) {
-            if (n->children[i]) stack[sp++] = n->children[i];
+        // bound the child scan to the real children[] array and skip null or
+        // implausible child pointers (non-canonical / outside the 16gb identity
+        // map). without this, a corrupt child_count or a dangling tree node
+        // pushes a wild pointer that later faults the traversal with a #gp. (satoru)
+        for (int i = 0; i < n->child_count && i < KVFS_MAX_CHILDREN && sp < 256; i++) {
+            KVFSNode* c = n->children[i];
+            if (c && (uintptr_t)c < 0x400000000ULL) stack[sp++] = c;
         }
     }
     return total;
@@ -783,6 +788,232 @@ int KVFS::ReadString(const char* path, char* buf, int max_len) {
     if (r < 0) { buf[0] = 0; return r; }
     buf[r] = 0;
     return r;
+}
+
+//  persistence  -  flat depth-first binary (de)serialization (satoru)
+//
+//  on-disk layout (little-endian):
+//    header { u32 magic=0x4B564653; u32 version; u32 node_count; }
+//    per node (pre-order, parent before children):
+//      u8 type; u16 mode; u16 uid; u16 gid;
+//      u32 created; u32 modified; u32 accessed; u32 size;
+//      u16 name_len; name[name_len];
+//      u16 link_len; link_target[link_len];
+//      u32 content_len; content[content_len];
+//      u32 child_count;  // children follow recursively
+//  pointers, hash_table and dev fn-ptrs are NOT serialized. (satoru)
+
+#define KVFS_SERIAL_MAGIC   0x4B564653u
+#define KVFS_SERIAL_VERSION 1u
+
+// little-endian fixed-width writers; each checks bounds before writing and
+// advances *pos. they no-op once an overflow has been seen. (satoru)
+static bool kput8(uint8_t* b, size_t max, size_t* pos, uint8_t v) {
+    if (*pos + 1 > max) return false;
+    b[*pos] = v; *pos += 1; return true;
+}
+static bool kput16(uint8_t* b, size_t max, size_t* pos, uint16_t v) {
+    if (*pos + 2 > max) return false;
+    b[*pos] = (uint8_t)(v & 0xFF);
+    b[*pos + 1] = (uint8_t)((v >> 8) & 0xFF);
+    *pos += 2; return true;
+}
+static bool kput32(uint8_t* b, size_t max, size_t* pos, uint32_t v) {
+    if (*pos + 4 > max) return false;
+    b[*pos] = (uint8_t)(v & 0xFF);
+    b[*pos + 1] = (uint8_t)((v >> 8) & 0xFF);
+    b[*pos + 2] = (uint8_t)((v >> 16) & 0xFF);
+    b[*pos + 3] = (uint8_t)((v >> 24) & 0xFF);
+    *pos += 4; return true;
+}
+static bool kputbytes(uint8_t* b, size_t max, size_t* pos,
+                      const void* src, uint32_t n) {
+    if (*pos + n > max) return false;
+    if (n) kmemcpy(b + *pos, src, n);
+    *pos += n; return true;
+}
+
+// little-endian fixed-width readers; each checks bounds against the buffer
+// length and advances *pos. return false on underflow. (satoru)
+static bool kget8(const uint8_t* b, size_t size, size_t* pos, uint8_t* out) {
+    if (*pos + 1 > size) return false;
+    *out = b[*pos]; *pos += 1; return true;
+}
+static bool kget16(const uint8_t* b, size_t size, size_t* pos, uint16_t* out) {
+    if (*pos + 2 > size) return false;
+    *out = (uint16_t)(b[*pos] | ((uint16_t)b[*pos + 1] << 8));
+    *pos += 2; return true;
+}
+static bool kget32(const uint8_t* b, size_t size, size_t* pos, uint32_t* out) {
+    if (*pos + 4 > size) return false;
+    *out = (uint32_t)b[*pos] | ((uint32_t)b[*pos + 1] << 8) |
+           ((uint32_t)b[*pos + 2] << 16) | ((uint32_t)b[*pos + 3] << 24);
+    *pos += 4; return true;
+}
+
+bool KVFS::SerializeNode(const KVFSNode* node, uint8_t* buffer,
+                         size_t maxSize, size_t* pos, uint32_t* count) {
+    if (!node) return true;
+
+    uint16_t name_len = (uint16_t)kstrlen(node->name);
+    if (name_len > KVFS_MAX_NAME) name_len = KVFS_MAX_NAME;
+    uint16_t link_len = (node->type == KVFS_SYMLINK)
+                        ? (uint16_t)kstrlen(node->link_target) : 0;
+    if (link_len > KVFS_MAX_PATH) link_len = KVFS_MAX_PATH;
+    // only real files carry content; cap at the declared size (satoru)
+    uint32_t content_len = (node->is_file() && node->content) ? node->size : 0;
+
+    if (!kput8(buffer, maxSize, pos, (uint8_t)node->type)) return false;
+    if (!kput16(buffer, maxSize, pos, node->perms.mode)) return false;
+    if (!kput16(buffer, maxSize, pos, node->perms.uid)) return false;
+    if (!kput16(buffer, maxSize, pos, node->perms.gid)) return false;
+    if (!kput32(buffer, maxSize, pos, node->created)) return false;
+    if (!kput32(buffer, maxSize, pos, node->modified)) return false;
+    if (!kput32(buffer, maxSize, pos, node->accessed)) return false;
+    if (!kput32(buffer, maxSize, pos, node->size)) return false;
+    if (!kput16(buffer, maxSize, pos, name_len)) return false;
+    if (!kputbytes(buffer, maxSize, pos, node->name, name_len)) return false;
+    if (!kput16(buffer, maxSize, pos, link_len)) return false;
+    if (!kputbytes(buffer, maxSize, pos, node->link_target, link_len)) return false;
+    if (!kput32(buffer, maxSize, pos, content_len)) return false;
+    if (content_len &&
+        !kputbytes(buffer, maxSize, pos, node->content, content_len)) return false;
+
+    // count valid children (defensive against holes) (satoru)
+    uint32_t nchild = 0;
+    for (int i = 0; i < node->child_count; i++)
+        if (node->children[i]) nchild++;
+    if (!kput32(buffer, maxSize, pos, nchild)) return false;
+
+    (*count)++;
+
+    for (int i = 0; i < node->child_count; i++) {
+        if (!node->children[i]) continue;
+        if (!SerializeNode(node->children[i], buffer, maxSize, pos, count))
+            return false;
+    }
+    return true;
+}
+
+size_t KVFS::Serialize(uint8_t* buffer, size_t maxSize) {
+    if (!buffer || !root) return 0;
+    if (maxSize < 12) return 0;  // need at least the header (satoru)
+
+    size_t pos = 0;
+    // reserve header; node_count is back-patched after the walk (satoru)
+    if (!kput32(buffer, maxSize, &pos, KVFS_SERIAL_MAGIC)) return 0;
+    if (!kput32(buffer, maxSize, &pos, KVFS_SERIAL_VERSION)) return 0;
+    size_t count_pos = pos;
+    if (!kput32(buffer, maxSize, &pos, 0)) return 0;
+
+    uint32_t count = 0;
+    if (!SerializeNode(root, buffer, maxSize, &pos, &count)) return 0;
+
+    // back-patch node_count (satoru)
+    size_t tmp = count_pos;
+    if (!kput32(buffer, maxSize, &tmp, count)) return 0;
+
+    return pos;
+}
+
+// rebuild one node + its subtree from the buffer at *pos. allocates the node,
+// reattaches children, copies content. returns the new node, or nullptr on
+// malformation (the caller frees the partial temp tree). (satoru)
+static KVFSNode* kvfs_deser_node(const uint8_t* b, size_t size, size_t* pos,
+                                 KVFSNode* (*alloc)(const char*, KVFSNodeType,
+                                                    uint16_t)) {
+    uint8_t type;
+    uint16_t mode, uid, gid;
+    uint32_t created, modified, accessed, sz;
+    uint16_t name_len;
+    if (!kget8(b, size, pos, &type)) return nullptr;
+    if (type > KVFS_MOUNTPOINT) return nullptr;  // unknown node type (satoru)
+    if (!kget16(b, size, pos, &mode)) return nullptr;
+    if (!kget16(b, size, pos, &uid)) return nullptr;
+    if (!kget16(b, size, pos, &gid)) return nullptr;
+    if (!kget32(b, size, pos, &created)) return nullptr;
+    if (!kget32(b, size, pos, &modified)) return nullptr;
+    if (!kget32(b, size, pos, &accessed)) return nullptr;
+    if (!kget32(b, size, pos, &sz)) return nullptr;
+    if (!kget16(b, size, pos, &name_len)) return nullptr;
+    if (name_len >= KVFS_MAX_NAME) return nullptr;
+
+    char name[KVFS_MAX_NAME];
+    if (*pos + name_len > size) return nullptr;
+    for (uint16_t i = 0; i < name_len; i++) name[i] = (char)b[*pos + i];
+    name[name_len] = 0;
+    *pos += name_len;
+
+    KVFSNode* n = alloc(name, (KVFSNodeType)type, mode);
+    if (!n) return nullptr;
+    n->perms.uid = uid;
+    n->perms.gid = gid;
+    n->created = created;
+    n->modified = modified;
+    n->accessed = accessed;
+    n->size = sz;
+
+    uint16_t link_len;
+    if (!kget16(b, size, pos, &link_len)) return nullptr;
+    if (link_len >= KVFS_MAX_PATH) return nullptr;
+    if (*pos + link_len > size) return nullptr;
+    for (uint16_t i = 0; i < link_len; i++) n->link_target[i] = (char)b[*pos + i];
+    n->link_target[link_len] = 0;
+    *pos += link_len;
+
+    uint32_t content_len;
+    if (!kget32(b, size, pos, &content_len)) return nullptr;
+    if (content_len > KVFS_MAX_CONTENT) return nullptr;
+    if (*pos + content_len > size) return nullptr;
+    if (content_len) {
+        uint32_t cap = (content_len + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
+        if (cap < KVFS_BLOCK_SIZE) cap = KVFS_BLOCK_SIZE;
+        n->content = (uint8_t*)KernelHeap::Alloc(cap);
+        if (!n->content) return nullptr;
+        kmemcpy(n->content, b + *pos, content_len);
+        n->content_capacity = cap;
+        n->size = content_len;
+        *pos += content_len;
+    }
+
+    uint32_t nchild;
+    if (!kget32(b, size, pos, &nchild)) return nullptr;
+    if (nchild > KVFS_MAX_CHILDREN) return nullptr;
+    for (uint32_t i = 0; i < nchild; i++) {
+        KVFSNode* c = kvfs_deser_node(b, size, pos, alloc);
+        if (!c) return nullptr;             // child malformed (satoru)
+        if (!n->add_child(c)) return nullptr;  // would overflow children[] (satoru)
+    }
+    return n;
+}
+
+bool KVFS::Deserialize(const uint8_t* buffer, size_t size) {
+    if (!buffer || size < 12) return false;
+
+    size_t pos = 0;
+    uint32_t magic = 0, version = 0, node_count = 0;
+    if (!kget32(buffer, size, &pos, &magic)) return false;
+    if (magic != KVFS_SERIAL_MAGIC) return false;
+    if (!kget32(buffer, size, &pos, &version)) return false;
+    if (version != KVFS_SERIAL_VERSION) return false;
+    if (!kget32(buffer, size, &pos, &node_count)) return false;
+
+    // build the entire tree into a temp root; only swap on full success so a
+    // malformed blob never corrupts the live tree. (satoru)
+    KVFSNode* new_root = kvfs_deser_node(buffer, size, &pos, &KVFS::AllocNode);
+    if (!new_root) return false;
+
+    // swap in the new tree, tear down the old, reset volatile state (satoru)
+    KVFSNode* old_root = root;
+    root = new_root;
+    root->parent = nullptr;
+    cwd = root;
+    kstrcpy(cwd_path, "/", KVFS_MAX_PATH);
+    for (int i = 0; i < KVFS_MAX_FDS; i++) { fds[i].open = false; fds[i].node = nullptr; }
+    PathCacheInvalidate();
+    if (old_root) FreeTree(old_root);
+
+    return true;
 }
 
 void KVFS::BuildDefaultTree() {

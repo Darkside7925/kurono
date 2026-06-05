@@ -48,6 +48,58 @@ namespace StopCode {
     constexpr uint32_t WATCHDOG_TIMEOUT       = 0xDEAD0004;
 }
 
+// persistent crash minidump written to a fixed physical page on panic, then
+// recovered into kvfs on the next boot. laid out as a flat pod so it can be
+// memcpy'd byte-for-byte through a volatile pointer at the reserved physical
+// address  -  no heap, no constructors. (satoru)
+namespace MiniDump {
+    constexpr uint32_t MAGIC        = 0x4B44554Du;  // 'KDUM' (satoru)
+    constexpr uint64_t PHYS_ADDR    = 0x1000000ull; // 16 mb identity-mapped slot (satoru)
+    constexpr uint32_t MAX_BYTES    = 512u * 1024u;  // hard cap on the dump region (satoru)
+    constexpr uint32_t MSG_LEN      = 256u;          // panic message field width (satoru)
+    constexpr uint32_t STACK_FRAMES = 32u;           // rbp-chain frames captured (satoru)
+    constexpr uint32_t SERIAL_BYTES = 4096u;         // recent serial-log tail captured (satoru)
+}
+
+struct KuronoMiniDump {
+    uint32_t magic;            // MiniDump::MAGIC when a dump is present (satoru)
+    uint32_t version;          // layout version for forward compat (satoru)
+    uint32_t size;             // total meaningful bytes in this struct (satoru)
+    uint32_t stop_code;        // bugcheck stop code (satoru)
+
+    // wall-clock from the rtc at panic time (satoru)
+    uint32_t unix_time;        // seconds since 1970 derived from rtc (satoru)
+    uint16_t year;
+    uint8_t  month;
+    uint8_t  day;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  second;
+    uint8_t  time_valid;       // 1 if the rtc read succeeded (satoru)
+
+    // panic message, truncated/zero-padded to MSG_LEN (satoru)
+    char     message[256];
+
+    // all 16 general-purpose registers (satoru)
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rip, rflags;
+
+    // control registers (satoru)
+    uint64_t cr0, cr2, cr3, cr4;
+
+    // rbp-chain stack trace; frame_count valid entries (satoru)
+    uint32_t frame_count;
+    uint32_t _pad0;
+    uint64_t stack_trace[32];
+
+    // tail of the recent serial/runtime log; serial_len valid bytes (satoru)
+    uint32_t serial_len;
+    uint8_t  serial_truncated;  // 1 if older log lines were dropped (satoru)
+    uint8_t  _pad1[3];
+    char     serial_tail[4096];
+};
+
 namespace KernelPanic {
     // call once, very early boot (before graphics::init).
     void Initialize(multiboot_info_t* mbi);
@@ -70,6 +122,14 @@ namespace KernelPanic {
     // called from isr for cpu exceptions.
     [[noreturn]] void BugCheckFromInterrupt(InterruptFrame* frame,
                                             const char* exception_name);
+
+    // boot-time crash recovery. checks the reserved physical dump slot for a
+    // valid KuronoMiniDump; if found, copies it to a timestamped kvfs file
+    // under /var/log, clears the magic so it is recovered exactly once, and
+    // returns true so the caller can surface a "recovered from crash" notice.
+    // returns false when no dump is present. safe to call early in boot once
+    // KVFS::Init has run. (satoru)
+    bool ScanCrashDumpAtBoot();
 }
 
 // convenience macros

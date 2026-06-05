@@ -133,6 +133,12 @@ struct Process {
     uint32_t ns_ipc;            // ipc namespace id
     uint32_t ns_cgroup;         // cgroup namespace id
 
+    // elf program-header info for the sysv auxv (musl uses at_phdr to locate
+    // pt_tls / pt_gnu_relro). zero for non-elf / kernel processes. (satoru)
+    uint64_t user_phdr_va;      // user va of the program headers (0 if unknown)
+    uint16_t user_phnum;        // e_phnum
+    uint16_t user_phent;        // e_phentsize
+
     Process* next;
 
     bool is_user() const { return (flags & PROCESS_FLAG_USER) != 0; }

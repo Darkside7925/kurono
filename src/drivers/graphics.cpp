@@ -1042,6 +1042,18 @@ void Graphics::FillGradientV(int x, int y, int w, int h, uint32_t top, uint32_t 
     }
 }
 
+void Graphics::ApplyShadow(int x, int y, int w, int h, int offset_x, int offset_y, uint8_t alpha) {
+    // soft drop shadow: two stacked translucent black rects offset from the
+    // source rect, the outer one fainter, mirroring the taskbar's look. built
+    // on the existing alpha-fill fast path so it stays cheap. (satoru)
+    if (w <= 0 || h <= 0 || alpha == 0) return;
+    int sx = x + offset_x;
+    int sy = y + offset_y;
+    FillRectAlpha(sx + 2, sy + 2, w, h, alpha, 0xFF000000u);
+    uint8_t faint = (uint8_t)(alpha / 2);
+    if (faint) FillRectAlpha(sx + 4, sy + 4, w, h, faint, 0xFF000000u);
+}
+
 void Graphics::BlurRect(int x, int y, int w, int h, int radius) {
     // simplified box blur - just average neighboring pixels
     if (radius < 1) return;

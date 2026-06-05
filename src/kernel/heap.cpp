@@ -38,6 +38,16 @@ struct FreeLink {
 
 static FreeLink* g_free_head = nullptr;
 
+// rate-limit heap diagnostic warnings. a single bad/double free that gets
+// logged travels serial -> runtimelog -> kvfs, which itself churns the heap
+// and can trigger MORE bad frees: an unbounded feedback loop that floods the
+// log and faults during boot. capping total warnings makes a stray free a
+// harmless no-op instead of a cascade. (satoru)
+static int g_heap_warn_budget = 64;
+static void heap_warn(const char* msg) {
+    if (g_heap_warn_budget > 0) { g_heap_warn_budget--; SerialLogger::Log(msg); }
+}
+
 static inline uint64_t* footer_of(HeapBlock* b) {
     return (uint64_t*)((uint8_t*)b + HEAP_HEADER_SIZE + b->size - HEAP_FOOTER_SIZE);
 }
@@ -127,7 +137,11 @@ void KernelHeap::ExpandWithPMM() {
     uint64_t total_phys = PMM::GetTotalMemory();
 
     uint64_t target = total_phys / 2;
-    const uint64_t MAX_HEAP = 2ULL * 1024 * 1024 * 1024;
+    // cap the eager heap grab at 1 gb. it used to take 2 gb contiguous up
+    // front, which starved the raw pmm frame pool that ring-3 processes need
+    // for demand-paged brk/mmap/stacks (large static binaries like ffmpeg hit
+    // pmm oom). 1 gb is far more than the desktop+kvfs ever use. (satoru)
+    const uint64_t MAX_HEAP = 1ULL * 1024 * 1024 * 1024;
     const uint64_t MIN_HEAP = 32ULL * 1024 * 1024;
     if (target > MAX_HEAP) target = MAX_HEAP;
 
@@ -180,14 +194,21 @@ HeapBlock* KernelHeap::FindFree(size_t size) {
 void* KernelHeap::Alloc(size_t size) {
     if (!initialized) Init();
     if (size == 0) size = 1;
-    // overflow guard on alignment round-up
-    if (size > (size_t)-1 - 15) return nullptr;
-    size = (size + 15) & ~(size_t)15;
+    // reserve the trailing 8-byte boundary-tag footer OUTSIDE the caller's
+    // payload. the footer occupies the last 8 bytes of the block and is read
+    // by prev_block() during backward coalesce; if it overlapped the caller's
+    // usable region (as it did before this fix), a full-size write  -  e.g. a
+    // jpeg decode buffer or a linux-init struct  -  clobbers it, corrupting the
+    // coalesce path and eventually tripping "free() bad magic". round
+    // (size + footer) up to 16-byte alignment so block->size always leaves a
+    // clear 8 bytes for the footer past the caller's data. (satoru)
+    if (size > (size_t)-1 - 15 - HEAP_FOOTER_SIZE) return nullptr;
+    size = (size + HEAP_FOOTER_SIZE + 15) & ~(size_t)15;
     if (size < HEAP_MIN_PAYLOAD) size = HEAP_MIN_PAYLOAD;
 
     HeapBlock* block = FindFree(size);
     if (!block) {
-        SerialLogger::Log("Heap: OOM!\r\n");
+        heap_warn("Heap: OOM!\r\n");
         return nullptr;
     }
 
@@ -220,17 +241,20 @@ void KernelHeap::Free(void* ptr) {
     HeapBlock* block = (HeapBlock*)(data - HEAP_HEADER_SIZE);
 
     if (!valid_magic(block->flags)) {
-        SerialLogger::Log("Heap: Free() bad magic!\r\n");
+        // freeing a pointer whose header isn't a live block (stray/double free
+        // of an already-coalesced region). ignore it safely; rate-limited log
+        // so it can never cascade into a flood. (satoru)
+        heap_warn("Heap: Free() bad magic (ignored)\r\n");
         return;
     }
     if (!block_used(block)) {
-        SerialLogger::Log("Heap: Double free!\r\n");
+        heap_warn("Heap: Double free (ignored)\r\n");
         return;
     }
     // sanity check: header size matches footer
     uint64_t fsz = *footer_of(block) & ~(1ULL << 63);
     if (fsz != block->size) {
-        SerialLogger::Log("Heap: Free() corrupt footer!\r\n");
+        heap_warn("Heap: Free() corrupt footer (ignored)\r\n");
         return;
     }
 
@@ -286,7 +310,10 @@ void* KernelHeap::Realloc(void* ptr, size_t new_size) {
     if (!valid_magic(block->flags) || !block_used(block)) return nullptr;
     uint64_t old_size = block->size;
 
-    size_t want = (new_size + 15) & ~(size_t)15;
+    // match Alloc's footer reservation so the grow threshold is computed
+    // against the same block geometry (last 8 bytes reserved for the
+    // boundary-tag footer, never handed to the caller). (satoru)
+    size_t want = (new_size + HEAP_FOOTER_SIZE + 15) & ~(size_t)15;
     if (want < HEAP_MIN_PAYLOAD) want = HEAP_MIN_PAYLOAD;
     if (old_size >= want) return ptr;
 

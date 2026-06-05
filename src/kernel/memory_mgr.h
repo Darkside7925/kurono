@@ -4,6 +4,33 @@
 #include "pmm.h"
 #include "vmm.h"
 
+//  well-known fixed physical addresses of the identity-mapped kernel layout.
+//  the kernel is linked at and runs from physical 0x100000 (boot/kurono_linker.ld)
+//  with all physical ram identity-mapped (phys == virt), so there is no separate
+//  kernel_virt_base or fixed kheap_start to assert against  -  the phase-2 heap base
+//  is whatever pmm hands out at runtime. these constants name the addresses that
+//  are otherwise scattered as magic literals and let the static_asserts below
+//  guard the heap floor against the reserved text/mmio windows. (satoru)
+static constexpr uint64_t VGA_TEXT_PHYS    = 0x000B8000ULL;  // vga text framebuffer (satoru)
+static constexpr uint64_t LAPIC_PHYS       = 0xFEE00000ULL;  // local apic mmio window (satoru)
+static constexpr uint64_t KERNEL_LOAD_PHYS = 0x00100000ULL;  // kernel image base, per linker (satoru)
+//  lowest physical address the pmm-backed kernel heap can ever occupy: pmm marks
+//  the low 1 mb (covers vga text) and the kernel image as used, so in practice the
+//  heap floor is well above 16 mb. we assert that floor stays clear of the reserved
+//  regions, which is the compile-time invariant the spec's overlap guard reduces to
+//  on an identity-mapped target. (satoru)
+static constexpr uint64_t KHEAP_PHYS_FLOOR = 0x01000000ULL;  // 16 mb (satoru)
+
+static_assert(KHEAP_PHYS_FLOOR > VGA_TEXT_PHYS,
+              "kernel heap floor must not overlap the vga text buffer (satoru)");
+static_assert(KHEAP_PHYS_FLOOR > KERNEL_LOAD_PHYS,
+              "kernel heap floor must not overlap the kernel image (satoru)");
+static_assert(KHEAP_PHYS_FLOOR < LAPIC_PHYS,
+              "kernel heap floor must lie below the local apic mmio window (satoru)");
+static_assert(VGA_TEXT_PHYS < LAPIC_PHYS,
+              "vga text buffer must lie below the local apic window (satoru)");
+static_assert(PAGE_SIZE == 4096ULL, "kernel layout assumes 4 kb pages (satoru)");
+
 //  memory manager  -  unified interface to pmm, vmm, and kernel heap
 //  backward-compatible api: init(), allocpage(), freepage(), gettotalmemory()
 

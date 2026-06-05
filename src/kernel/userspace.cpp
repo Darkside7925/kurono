@@ -137,7 +137,8 @@ static size_t kstrcpy(char* dst, const char* src) {
 // can write through the user VA directly.
 static uint64_t build_initial_stack(uint64_t stack_top,
                                     const char* const* argv,
-                                    const char* const* envp) {
+                                    const char* const* envp,
+                                    const Process* proc) {
     // Default to a minimal "argv[0]=program" if caller passed nullptr.
     static const char* default_argv[] = { "program", nullptr };
     if (!argv) argv = default_argv;
@@ -203,6 +204,11 @@ static uint64_t build_initial_stack(uint64_t stack_top,
     // Aux vector: pairs of (uint64 type, uint64 value).
     struct AuxEntry { uint64_t a_type, a_val; };
     static constexpr uint64_t AT_NULL     = 0;
+    static constexpr uint64_t AT_PHDR     = 3;
+    static constexpr uint64_t AT_PHENT    = 4;
+    static constexpr uint64_t AT_PHNUM    = 5;
+    static constexpr uint64_t AT_BASE     = 7;
+    static constexpr uint64_t AT_ENTRY    = 9;
     static constexpr uint64_t AT_PAGESZ   = 6;
     static constexpr uint64_t AT_PLATFORM = 15;
     static constexpr uint64_t AT_HWCAP    = 16;
@@ -215,7 +221,19 @@ static uint64_t build_initial_stack(uint64_t stack_top,
     static constexpr uint64_t AT_GID      = 13;
     static constexpr uint64_t AT_EGID     = 14;
 
+    // at_phdr/phent/phnum/entry let musl locate pt_tls + pt_gnu_relro and the
+    // program entry. at_base=0 (static, no dynamic loader). a zero at_phdr is
+    // safely ignored by musl (treated as absent). (satoru)
+    uint64_t at_phdr  = proc ? proc->user_phdr_va : 0;
+    uint64_t at_phent = proc ? proc->user_phent  : 0;
+    uint64_t at_phnum = proc ? proc->user_phnum  : 0;
+    uint64_t at_entry = proc ? proc->rip         : 0;
     AuxEntry aux[] = {
+        { AT_PHDR,     at_phdr },
+        { AT_PHENT,    at_phent },
+        { AT_PHNUM,    at_phnum },
+        { AT_BASE,     0 },
+        { AT_ENTRY,    at_entry },
         { AT_PAGESZ,   4096 },
         { AT_CLKTCK,   100 },
         { AT_HWCAP,    0 },
@@ -292,7 +310,7 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     // Build SysV initial stack with argc/argv/envp/auxv.  Must happen
     // *after* address-space activation so writes land in the user's
     // physical pages.
-    uint64_t entry_rsp = build_initial_stack(proc->user_stack_top, argv, envp);
+    uint64_t entry_rsp = build_initial_stack(proc->user_stack_top, argv, envp, proc);
     if (!entry_rsp) entry_rsp = proc->user_stack_top;
 
     int exit_code = UserspaceEnter(proc->rip, entry_rsp, &return_context);

@@ -1,6 +1,7 @@
 //  kurono os  -  slab allocator implementation
 #include "slab.h"
 #include "buddy.h"
+#include "panic.h"
 #include "../drivers/serial.h"
 
 #define SLAB_MAGIC 0x51AB1234u
@@ -113,6 +114,12 @@ bool Slab::Init(){
         while (ti) nm[p++] = t[--ti];
         nm[p] = 0;
         generic[i] = CacheCreate(nm, sz, 8);
+        if (!generic[i]) {
+            // a generic kmalloc cache failed to initialize. the slab allocator
+            // is critical infrastructure (kmalloc depends on it), so a partially
+            // built cache table is fatal rather than something to limp on. (satoru)
+            KERNEL_PANIC("slab: failed to create a generic kmalloc cache (satoru)");
+        }
     }
 
     ready = true;

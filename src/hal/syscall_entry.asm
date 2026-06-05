@@ -44,6 +44,19 @@ syscall_entry_x64:
     push    r14
     push    r15
 
+    ; the linux x86_64 syscall abi requires the kernel to preserve ALL
+    ; gp registers except rax (result), rcx and r11 (clobbered by the
+    ; syscall instruction itself).  musl keeps live values in r8/r10/etc
+    ; across a syscall (e.g. __stdout_write holds the FILE* in r8 across
+    ; its ioctl probe), so we must save+restore the arg registers too,
+    ; not just the sysv callee-saved set (satoru)
+    push    rdi
+    push    rsi
+    push    rdx
+    push    r8
+    push    r9
+    push    r10
+
     ; Build the call: SyscallEntryX64Handler(nr, a0,a1,a2,a3,a4,a5)
     ; SysV ABI passes: rdi, rsi, rdx, rcx, r8, r9 as first 6 args.
     ; Linux x86_64 syscall ABI uses: rdi, rsi, rdx, r10, r8, r9 for args.
@@ -89,6 +102,15 @@ syscall_entry_x64:
     call    SyscallEntryX64Handler
 
     add     rsp, 16           ; pop a5 + alignment
+
+    ; restore the user arg registers (reverse push order) so r8/r10/etc
+    ; survive the syscall as the linux abi guarantees (satoru)
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdx
+    pop     rsi
+    pop     rdi
 
     ; Restore preserved regs.
     pop     r15

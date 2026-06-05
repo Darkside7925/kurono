@@ -40,7 +40,10 @@ uint32_t DurationMs(const File& f) {
 const uint8_t* GetFrameJpeg(const File& f, uint32_t i, uint32_t* sz) {
     if (i >= f.hdr.frame_count) { *sz = 0; return nullptr; }
     const IndexEntry& e = f.index[i];
-    if (e.offset + e.video_size > f.size) { *sz = 0; return nullptr; }
+    // widen the bounds check to 64-bit so a corrupt offset/size cannot wrap
+    // uint32 and pass, handing a wild pointer + huge length to the jpeg
+    // decoder (an out-of-bounds read that crashes the system). (satoru)
+    if ((uint64_t)e.offset + (uint64_t)e.video_size > f.size) { *sz = 0; return nullptr; }
     *sz = e.video_size;
     return f.data + e.offset;
 }
@@ -49,7 +52,8 @@ const uint8_t* GetFrameAudio(const File& f, uint32_t i, uint32_t* sz) {
     if (i >= f.hdr.frame_count) { *sz = 0; return nullptr; }
     const IndexEntry& e = f.index[i];
     if (e.audio_size == 0) { *sz = 0; return nullptr; }
-    if (e.audio_offset + e.audio_size > f.size) { *sz = 0; return nullptr; }
+    // 64-bit bounds check  -  same overflow guard as the video path. (satoru)
+    if ((uint64_t)e.audio_offset + (uint64_t)e.audio_size > f.size) { *sz = 0; return nullptr; }
     *sz = e.audio_size;
     return f.data + e.audio_offset;
 }

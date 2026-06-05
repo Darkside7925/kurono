@@ -159,7 +159,28 @@ struct NetSocket {
     uint32_t tx_seq_end;
     uint32_t tx_last_tx_ms;
     uint8_t  tx_buf[TCP_MSS];
+
+    // non-blocking connect: when set, Connect() returns EINPROGRESS after
+    // sending SYN and the 3-way handshake completes from TCPTick/RX (satoru)
+    bool     nonblocking;
+    // most-recent errno for this socket (EINPROGRESS / ETIMEDOUT etc.) (satoru)
+    int      sock_errno;
+
+    // keepalive: after idle on ESTABLISHED, probe; give up after N probes (satoru)
+    uint32_t last_activity_ms;   // last time we saw rx or tx on this socket (satoru)
+    uint32_t keepalive_last_ms;  // when the last keepalive probe went out (satoru)
+    uint8_t  keepalive_probes;   // count of unanswered probes so far (satoru)
 };
+
+// errno-style codes surfaced via TCPStack::GetSockError (satoru)
+#define TCP_EINPROGRESS 115
+#define TCP_ETIMEDOUT   110
+
+// keepalive tuning (ms): idle before first probe, gap between probes,
+// and probe budget before the connection is declared dead (satoru)
+#define TCP_KEEPALIVE_IDLE_MS    75000u
+#define TCP_KEEPALIVE_INTVL_MS   15000u
+#define TCP_KEEPALIVE_MAX_PROBES 3
 
 struct NetStats {
     uint32_t packets_rx;
@@ -208,6 +229,15 @@ public:
     static int  Recv(int sock, void* buf, int max_len);
     static bool IsPeerClosed(int sock);
     static bool Close(int sock);
+
+    // non-blocking connect support (satoru)
+    static void SetNonblocking(int sock, bool nonblocking);
+    static bool IsNonblocking(int sock);
+    // poll/select helper: true once a stream socket is ESTABLISHED so a
+    // background non-blocking connect can be detected as writable (satoru)
+    static bool IsWritable(int sock);
+    // most-recent errno-style code for this socket (0 if none) (satoru)
+    static int  GetSockError(int sock);
 
     // udp convenience
     static int  SendTo(int sock, const void* data, int len, uint32_t ip, uint16_t port);

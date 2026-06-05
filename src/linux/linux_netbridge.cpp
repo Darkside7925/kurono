@@ -210,7 +210,6 @@ int LinuxNetBridge::Connect(int sockfd, const LinuxSockaddrIn* addr) {
 
     s->remote_addr = Ntohl(addr->sin_addr);
     s->remote_port = Ntohs(addr->sin_port);
-    s->state = LSOCK_CONNECTED;
 
     // if not bound, auto-bind
     if (s->local_port == 0) {
@@ -218,6 +217,15 @@ int LinuxNetBridge::Connect(int sockfd, const LinuxSockaddrIn* addr) {
         s->local_port = 49152 + sockfd;
     }
 
+    // honour O_NONBLOCK: report the handshake as in-progress and return
+    // -EINPROGRESS, matching BSD semantics; blocking connect stays the
+    // default and immediately reports CONNECTED as before (satoru)
+    if (s->nonblocking) {
+        s->state = LSOCK_CONNECTING;
+        return -115;  // -EINPROGRESS
+    }
+
+    s->state = LSOCK_CONNECTED;
     return 0;
 }
 
@@ -329,6 +337,29 @@ int LinuxNetBridge::Getsockopt(int sockfd, int level, int optname,
         *optlen = sizeof(int);
     }
     return 0;
+}
+
+int LinuxNetBridge::Fcntl(int sockfd, int cmd, int arg) {
+    LinuxSocket* s = GetSocket(sockfd);
+    if (!s) return -1;
+    switch (cmd) {
+        case LF_GETFL:
+            return s->nonblocking ? LFD_O_NONBLOCK : 0;
+        case LF_SETFL:
+            // mirror the O_NONBLOCK bit; map the same flag onto the kurono
+            // socket if this bridge socket is backed by one (satoru)
+            s->nonblocking = (arg & LFD_O_NONBLOCK) != 0;
+            if (s->kurono_socket >= 0)
+                TCPStack::SetNonblocking(s->kurono_socket, s->nonblocking);
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+bool LinuxNetBridge::IsNonblocking(int sockfd) {
+    LinuxSocket* s = GetSocket(sockfd);
+    return s && s->nonblocking;
 }
 
 int LinuxNetBridge::Getpeername(int sockfd, LinuxSockaddrIn* addr) {

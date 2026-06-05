@@ -243,8 +243,8 @@ struct LinuxUtsname {
 } __attribute__((packed));
 
 struct LinuxIovec {
-    uint32_t iov_base;
-    uint32_t iov_len;
+    uint64_t iov_base;   // 64-bit user pointer (x86_64 iovec layout) (satoru)
+    uint64_t iov_len;
 } __attribute__((packed));
 
 // statx() result block  -  Linux 5.x layout.
@@ -336,9 +336,9 @@ struct LinuxProcess {
     char     cwd[256];
     char     name[64];
     LinuxFd  fds[LINUX_MAX_FDS];
-    uint32_t brk_base;
-    uint32_t brk_current;
-    uint32_t brk_max;
+    uint64_t brk_base;     // heap addresses are 64-bit so a high pie heap fits (satoru)
+    uint64_t brk_current;
+    uint64_t brk_max;
     bool     active;
     bool     exited;
     int      exit_code;
@@ -373,10 +373,14 @@ public:
     static bool HandlePageFault(InterruptFrame* frame);
 
     // the main syscall dispatcher
-    // called when int 0x80 fires from a linux elf binary
-    // eax=syscall#, ebx/ecx/edx/esi/edi = args
-    static int32_t Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
-                            uint32_t edx, uint32_t esi, uint32_t edi);
+    // called when int 0x80 fires from a linux elf binary, or from the
+    // x86_64 SYSCALL fast path. the syscall number stays small but the
+    // arg registers carry full 64-bit user pointers/addresses (a pie
+    // binary loaded above 4gb must round-trip its pointers intact), and
+    // the return value is widened so a >4gb mmap result is not truncated
+    // or sign-mangled on the way back to userspace (satoru)
+    static int64_t Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
+                            uint64_t edx, uint64_t esi, uint64_t edi);
 
     // stats
     static int  ActiveProcessCount();
@@ -407,43 +411,48 @@ private:
     static int  stdin_head;
     static int  stdin_tail;
 
-    // individual syscall handlers
+    // individual syscall handlers.
+    // user pointers/addresses widened to uintptr_t and the paired
+    // sizes/lengths/offsets to uint64_t so >4gb user memory round-trips;
+    // genuine 32-bit values (fd, mode, flags, prot, whence, exit codes,
+    // pid/status/options) stay 32-bit. mmap/brk/getcwd return an address,
+    // so their return type is widened to int64_t to avoid truncation (satoru)
     static int32_t sys_exit(uint32_t code);
     static int32_t sys_fork();
-    static int32_t sys_read(int fd, uint32_t buf, uint32_t count);
-    static int32_t sys_write(int fd, uint32_t buf, uint32_t count);
-    static int32_t sys_open(uint32_t pathname, uint32_t flags, uint32_t mode);
+    static int32_t sys_read(int fd, uintptr_t buf, uint64_t count);
+    static int32_t sys_write(int fd, uintptr_t buf, uint64_t count);
+    static int32_t sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode);
     static int32_t sys_close(int fd);
-    static int32_t sys_waitpid(uint32_t pid, uint32_t status, uint32_t options);
-    static int32_t sys_execve(uint32_t filename, uint32_t argv, uint32_t envp);
+    static int32_t sys_waitpid(uint32_t pid, uintptr_t status, uint32_t options);
+    static int32_t sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t envp);
     static int32_t sys_lseek(int fd, int32_t offset, uint32_t whence);
-    static int32_t sys_brk(uint32_t addr);
+    static int64_t sys_brk(uintptr_t addr);
     static int32_t sys_getpid();
     static int32_t sys_getuid();
     static int32_t sys_getgid();
     static int32_t sys_geteuid();
     static int32_t sys_getegid();
     static int32_t sys_getppid();
-    static int32_t sys_stat(uint32_t pathname, uint32_t statbuf);
-    static int32_t sys_fstat(int fd, uint32_t statbuf);
-    static int32_t sys_uname(uint32_t buf);
-    static int32_t sys_getcwd(uint32_t buf, uint32_t size);
-    static int32_t sys_chdir(uint32_t pathname);
-    static int32_t sys_mkdir(uint32_t pathname, uint32_t mode);
-    static int32_t sys_rmdir(uint32_t pathname);
-    static int32_t sys_unlink(uint32_t pathname);
-    static int32_t sys_access(uint32_t pathname, uint32_t mode);
+    static int32_t sys_stat(uintptr_t pathname, uintptr_t statbuf);
+    static int32_t sys_fstat(int fd, uintptr_t statbuf);
+    static int32_t sys_uname(uintptr_t buf);
+    static int64_t sys_getcwd(uintptr_t buf, uint64_t size);
+    static int32_t sys_chdir(uintptr_t pathname);
+    static int32_t sys_mkdir(uintptr_t pathname, uint32_t mode);
+    static int32_t sys_rmdir(uintptr_t pathname);
+    static int32_t sys_unlink(uintptr_t pathname);
+    static int32_t sys_access(uintptr_t pathname, uint32_t mode);
     static int32_t sys_dup(int oldfd);
     static int32_t sys_dup2(int oldfd, int newfd);
     static int32_t sys_ioctl(int fd, uint32_t cmd, uint32_t arg);
-    static int32_t sys_writev(int fd, uint32_t iov, uint32_t iovcnt);
-    static int32_t sys_mmap(uint32_t addr, uint32_t length, uint32_t prot,
-                            uint32_t flags, int fd, uint32_t offset);
-    static int32_t sys_munmap(uint32_t addr, uint32_t length);
-    static int32_t sys_nanosleep(uint32_t req, uint32_t rem);
-    static int32_t sys_getdents64(int fd, uint32_t dirp, uint32_t count);
-    static int32_t sys_clock_gettime(uint32_t clk_id, uint32_t tp);
-    static int32_t sys_set_thread_area(uint32_t u_info);
+    static int32_t sys_writev(int fd, uintptr_t iov, uint64_t iovcnt);
+    static int64_t sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
+                            uint32_t flags, int fd, uint64_t offset);
+    static int32_t sys_munmap(uintptr_t addr, uint64_t length);
+    static int32_t sys_nanosleep(uintptr_t req, uintptr_t rem);
+    static int32_t sys_getdents64(int fd, uintptr_t dirp, uint64_t count);
+    static int32_t sys_clock_gettime(uint32_t clk_id, uintptr_t tp);
+    static int32_t sys_set_thread_area(uintptr_t u_info);
     static int32_t sys_exit_group(uint32_t code);
 
     // fd helpers

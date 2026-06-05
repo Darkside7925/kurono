@@ -10,6 +10,7 @@
 #include "../system/gpu_driver_installer.h"
 #include "../system/system_update.h"
 #include "../virt/debian_data.h"
+#include "../ui/notification.h"
 
 Package PackageManager::packages[PKG_MAX_PACKAGES];
 int PackageManager::package_count = 0;
@@ -479,6 +480,29 @@ static bool pkro_extract_archive(const uint8_t* payload, int payload_len, const 
     return true;
 }
 
+// step logging for `kpkg sync`  -  writes each HTTP milestone to the serial
+// console so a failed sync against kurono.satorut.com shows exactly where it
+// stopped (dns/connect/send/headers/body/done). internal only. (satoru)
+static void phttp_log(const char* msg) {
+    SerialLogger::Log("[kpkg:http] ");
+    SerialLogger::Log(msg);
+    SerialLogger::Log("\r\n");
+}
+static void phttp_log_ip(const char* msg, uint32_t ip) {
+    char ip_text[16];
+    pformat_ip(ip, ip_text, (int)sizeof(ip_text));
+    SerialLogger::Log("[kpkg:http] ");
+    SerialLogger::Log(msg);
+    SerialLogger::Log(ip_text);
+    SerialLogger::Log("\r\n");
+}
+static void phttp_log_num(const char* msg, int n) {
+    SerialLogger::Log("[kpkg:http] ");
+    SerialLogger::Log(msg);
+    SerialLogger::LogDec(n);
+    SerialLogger::Log("\r\n");
+}
+
 static bool phttp_get(const char* host, const char* path,
                       char* body_out, int body_max,
                       int* status_out, int* body_len_out) {
@@ -486,6 +510,9 @@ static bool phttp_get(const char* host, const char* path,
         pset_sync_message("Package fetch parameters are invalid.");
         return false;
     }
+    phttp_log("--- phttp_get begin ---");
+    phttp_log(host);
+    phttp_log(path);
     if (!TCPStack::IsUp()) {
         if (!E1000::IsDetected()) {
             pset_sync_message("TCP/IP stack unavailable: no supported E1000 NIC detected.");
@@ -509,23 +536,30 @@ static bool phttp_get(const char* host, const char* path,
         uint32_t connect_targets[4];
         int connect_target_count = pbuild_connect_targets(host, connect_targets,
                                                           (int)(sizeof(connect_targets) / sizeof(connect_targets[0])));
+        phttp_log_num("resolved connect targets: ", connect_target_count);
         bool connected = false;
         bool socket_alloc_failed = false;
         for (int i = 0; i < connect_target_count; i++) {
+            phttp_log_ip("connect target: ", connect_targets[i]);
             sock = TCPStack::Socket(SOCK_STREAM);
             if (sock < 0) {
+                phttp_log("no free TCP socket");
                 pset_sync_message("No free TCP sockets are available.");
                 socket_alloc_failed = true;
                 break;
             }
+            phttp_log_ip("SYN -> ", connect_targets[i]);
             if (TCPStack::Connect(sock, connect_targets[i], 80)) {
+                phttp_log_ip("connect OK: ", connect_targets[i]);
                 connected = true;
                 break;
             }
+            phttp_log_ip("connect FAILED: ", connect_targets[i]);
             TCPStack::Close(sock);
             sock = -1;
         }
         if (!connected) {
+            phttp_log("all connect targets failed");
             if (socket_alloc_failed) break;
             char msg[160];
             int mp = 0;
@@ -555,11 +589,14 @@ static bool phttp_get(const char* host, const char* path,
         rp = pa(request, rp, sizeof(request), "\r\nUser-Agent: Kurono-kpkg/1.0\r\nConnection: close\r\nAccept: */*\r\n\r\n");
 
         if (TCPStack::Send(sock, request, rp) != rp) {
+            phttp_log("HTTP GET send FAILED");
             pset_sync_message("TCP send failed while requesting repository data.");
             break;
         }
+        phttp_log_num("HTTP GET sent, bytes: ", rp);
 
         int total = 0;
+        bool header_logged = false;
         uint32_t read_start_ms = Timer::GetTicks();
         uint32_t last_progress_ms = read_start_ms;
         bool recv_aborted = false;
@@ -594,6 +631,10 @@ static bool phttp_get(const char* host, const char* path,
             }
             total += got;
             last_progress_ms = Timer::GetTicks();
+            if (!header_logged && pfind_header_end(response, total) >= 0) {
+                header_logged = true;
+                phttp_log_num("response headers received at byte: ", pfind_header_end(response, total));
+            }
             if (total - prog_emit_anchor >= 16384) {
                 prog_emit_anchor = total;
                 char line[88];
@@ -606,11 +647,14 @@ static bool phttp_get(const char* host, const char* path,
         }
 
         if (recv_aborted) {
+            phttp_log("receive aborted (Ctrl+C)");
             pset_sync_message("Interrupted (Ctrl+C).");
             break;
         }
+        phttp_log_num("total bytes received: ", total);
 
         if (total <= 0) {
+            phttp_log("no HTTP payload received");
             pset_sync_message("Remote server returned no HTTP payload.");
             break;
         }
@@ -618,6 +662,7 @@ static bool phttp_get(const char* host, const char* path,
         response[total] = 0;
         int header_end = pfind_header_end(response, total);
         if (header_end < 0) {
+            phttp_log("missing header terminator");
             pset_sync_message("HTTP response was missing headers terminator.");
             break;
         }
@@ -627,12 +672,15 @@ static bool phttp_get(const char* host, const char* path,
         while (*status_ptr && *status_ptr != ' ') status_ptr++;
         if (*status_ptr == ' ') status = (int)patoi(status_ptr + 1);
         if (status_out) *status_out = status;
+        phttp_log_num("HTTP status: ", status);
 
         bool chunked = pcontains(response, "Transfer-Encoding: chunked");
         int body_bytes = total - header_end;
         if (chunked) {
+            phttp_log("body is chunked, decoding");
             body_bytes = pdecode_chunked(response + header_end, total - header_end, body_out, body_max);
             if (body_bytes < 0) {
+                phttp_log("chunked decode FAILED");
                 pset_sync_message("Chunked HTTP body decoding failed.");
                 break;
             }
@@ -642,9 +690,12 @@ static bool phttp_get(const char* host, const char* path,
         }
         body_out[body_bytes] = 0;
         if (body_len_out) *body_len_out = body_bytes;
+        phttp_log_num("body bytes received: ", body_bytes);
+        phttp_log("--- phttp_get OK ---");
         ok = true;
     } while (false);
 
+    if (!ok) phttp_log("--- phttp_get FAILED ---");
     KernelHeap::Free(response);
     if (sock >= 0) TCPStack::Close(sock);
     return ok;
@@ -1578,6 +1629,13 @@ bool PackageManager::SyncRepository() {
     KernelHeap::Free(manifest);
     pkg_repo_synced = synced;
     pkg_last_sync_ok = synced;
+    // surface the sync outcome as a toast for the desktop. (satoru)
+    if (synced)
+        NotificationManager::Post("kpkg", "repository sync complete",
+                                  NotificationManager::ICON_SUCCESS, 4000);
+    else
+        NotificationManager::Post("kpkg", pkg_last_sync_message,
+                                  NotificationManager::ICON_ERROR, 5000);
     return synced;
 }
 

@@ -73,6 +73,10 @@ public:
     // missing method used in implementation
     static DeviceType GetDeviceType();
     static void SetAutoDraw(bool enable);
+
+    // usb hid: decode a boot-protocol mouse report and inject motion/button
+    // events through the same ring as the ps/2 path (satoru).
+    static void ProcessUSBReport(const uint8_t* report, int len);
 private:
     static void Out(uint16_t p, uint8_t v);
     static uint8_t In(uint16_t p);

@@ -6,6 +6,7 @@
 #include "../drivers/e1000.h"
 #include "../hal/hal.h"
 #include "../system/logging.h"
+#include "../ui/notification.h"
 #include "tcpip.h"
 
 //  network stack implementation
@@ -501,6 +502,40 @@ static int ndns_skip_name(const uint8_t* data, int len, int pos) {
     return -1;
 }
 
+// Decompress a (possibly pointer-compressed) DNS name at `pos` into a dotted
+// hostname string. Follows compression pointers with a bounded jump budget so
+// a malicious self-referential packet can't loop forever. Returns true on
+// success; the parsed name lands in `out` (lowercased not required). (satoru)
+static bool ndns_read_name(const uint8_t* data, int len, int pos, char* out, int out_max) {
+    if (!out || out_max < 1) return false;
+    int op = 0;
+    int jumps = 0;
+    out[0] = 0;
+    while (pos >= 0 && pos < len) {
+        uint8_t label_len = data[pos];
+        if (label_len == 0) {
+            out[op] = 0;
+            return true;
+        }
+        if ((label_len & 0xC0) == 0xC0) {
+            if (pos + 1 >= len) return false;
+            if (++jumps > 16) return false;            // pointer loop guard (satoru)
+            int target = ((label_len & 0x3F) << 8) | data[pos + 1];
+            pos = target;
+            continue;
+        }
+        if (label_len & 0xC0) return false;
+        pos++;
+        if (pos + label_len > len) return false;
+        if (op > 0 && op < out_max - 1) out[op++] = '.';
+        for (int i = 0; i < label_len; i++) {
+            if (op < out_max - 1) out[op++] = (char)data[pos + i];
+        }
+        pos += label_len;
+    }
+    return false;
+}
+
 static void ndns_log(const char* action, const char* hostname, const IPv4Address* ip) {
     char line[192];
     int p = 0;
@@ -519,20 +554,20 @@ static void ndns_log(const char* action, const char* hostname, const IPv4Address
     RuntimeLog::LogSystem("network", line);
 }
 
-static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
-    if (!TCPStack::IsUp() || !hostname || !*hostname || !out) return false;
-
-    NetworkInterface* iface = Network::GetInterface("eth0");
-    if (!iface || iface->state != NIC_UP) {
-        NetworkInterface* wlan = Network::GetInterface("wlan0");
-        if (wlan && wlan->state == NIC_UP) iface = wlan;
-    }
-
-    uint32_t dns_ip = iface ? ndns_ip_to_u32(iface->dns) : 0;
-    if (dns_ip == 0) dns_ip = TCPStack::MakeIP(10, 0, 2, 3);
+// Single DNS A-query for `hostname`. Tri-state result:
+//   1  -> an A record was found; *out holds the address
+//   0  -> no A record, but a CNAME was present; its (decompressed) target is
+//         written to cname_out so the caller can follow the chain
+//  -1  -> hard failure (timeout / malformed / server rcode error)
+// The A-record scan still takes the FIRST A in the answer section, so a
+// response that already carries the CNAME->A pair resolves in one shot; the
+// CNAME hand-back only happens when the answer contains NO A record. (satoru)
+static int ndns_query_once(const char* hostname, uint32_t dns_ip,
+                           IPv4Address* out, char* cname_out, int cname_max) {
+    if (cname_out && cname_max > 0) cname_out[0] = 0;
 
     int sock = TCPStack::Socket(SOCK_DGRAM);
-    if (sock < 0) return false;
+    if (sock < 0) return -1;
 
     uint8_t query[512];
     uint8_t response[512];
@@ -553,11 +588,11 @@ static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
     int query_len = (int)sizeof(DNSHeader);
     if (!ndns_append_name(hostname, query, (int)sizeof(query), query_len)) {
         TCPStack::Close(sock);
-        return false;
+        return -1;
     }
     if (query_len + 4 > (int)sizeof(query)) {
         TCPStack::Close(sock);
-        return false;
+        return -1;
     }
 
     ndns_write_u16(query + query_len, 1);
@@ -578,7 +613,7 @@ static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
         while ((uint32_t)(Timer::GetTicks() - attempt_start_ms) < attempt_timeout_ms) {
             if (KuronoShell::IsCommandCancelRequested()) {
                 TCPStack::Close(sock);
-                return false;
+                return -1;
             }
             TCPStack::Tick();
             KuronoShell::PumpUI();
@@ -602,7 +637,7 @@ static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
             if ((flags & 0x8000u) == 0) continue;
             if ((flags & 0x000Fu) != 0) {
                 TCPStack::Close(sock);
-                return false;
+                return -1;
             }
 
             int questions = ndns_read_u16(response + 4);
@@ -613,16 +648,21 @@ static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
                 pos = ndns_skip_name(response, got, pos);
                 if (pos < 0 || pos + 4 > got) {
                     TCPStack::Close(sock);
-                    return false;
+                    return -1;
                 }
                 pos += 4;
             }
+
+            // remember the first CNAME target as a fallback if no A appears (satoru)
+            bool have_cname = false;
+            char cname_tmp[256];
+            cname_tmp[0] = 0;
 
             for (int a = 0; a < answers; a++) {
                 pos = ndns_skip_name(response, got, pos);
                 if (pos < 0 || pos + 10 > got) {
                     TCPStack::Close(sock);
-                    return false;
+                    return -1;
                 }
 
                 uint16_t type = ndns_read_u16(response + pos); pos += 2;
@@ -631,21 +671,69 @@ static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
                 uint16_t rdlen = ndns_read_u16(response + pos); pos += 2;
                 if (pos + rdlen > got) {
                     TCPStack::Close(sock);
-                    return false;
+                    return -1;
                 }
 
                 if (type == 1 && klass == 1 && rdlen == 4) {
                     *out = Network::MakeIP(response[pos], response[pos + 1], response[pos + 2], response[pos + 3]);
                     TCPStack::Close(sock);
-                    return true;
+                    return 1;
+                }
+                // CNAME (type 5): decompress its rdata target name and hold it
+                // in case the answer section carries no A record (satoru)
+                if (type == 5 && klass == 1 && !have_cname) {
+                    if (ndns_read_name(response, got, pos, cname_tmp, (int)sizeof(cname_tmp)) &&
+                        cname_tmp[0]) {
+                        have_cname = true;
+                    }
                 }
                 pos += rdlen;
             }
+
+            // got a valid response but no A record. If a CNAME was present,
+            // hand its target back so the caller can chase it. (satoru)
+            if (have_cname && cname_out && cname_max > 0) {
+                ncpy(cname_out, cname_tmp, cname_max);
+                TCPStack::Close(sock);
+                return 0;
+            }
+            TCPStack::Close(sock);
+            return -1;
         }
     }
 
     TCPStack::Close(sock);
-    return false;
+    return -1;
+}
+
+static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
+    if (!TCPStack::IsUp() || !hostname || !*hostname || !out) return false;
+
+    NetworkInterface* iface = Network::GetInterface("eth0");
+    if (!iface || iface->state != NIC_UP) {
+        NetworkInterface* wlan = Network::GetInterface("wlan0");
+        if (wlan && wlan->state == NIC_UP) iface = wlan;
+    }
+
+    uint32_t dns_ip = iface ? ndns_ip_to_u32(iface->dns) : 0;
+    if (dns_ip == 0) dns_ip = TCPStack::MakeIP(10, 0, 2, 3);
+
+    // Follow a CNAME chain, issuing a fresh A query for each canonical name.
+    // Bounded to 5 hops so a misconfigured/looping zone can't spin us. (satoru)
+    char name[256];
+    ncpy(name, hostname, (int)sizeof(name));
+    const int MAX_CNAME_HOPS = 5;
+    for (int hop = 0; hop < MAX_CNAME_HOPS; hop++) {
+        char cname[256];
+        int r = ndns_query_once(name, dns_ip, out, cname, (int)sizeof(cname));
+        if (r == 1) return true;            // resolved to an A record
+        if (r < 0) return false;            // timeout / error / NXDOMAIN
+        if (!cname[0]) return false;        // CNAME with no usable target
+        if (neq(name, cname)) return false; // self-referential CNAME loop (satoru)
+        ndns_log("dns cname", name, nullptr);
+        ncpy(name, cname, (int)sizeof(name)); // follow the canonical name
+    }
+    return false;                            // exceeded hop budget (satoru)
 }
 
 bool Network::Resolve(const char* hostname, IPv4Address* out) {
@@ -848,6 +936,9 @@ bool WiFi::Connect(const char* ssid, const char* password) {
             networks[i].connected = true;
             connected_index = i;
             state = WIFI_CONNECTED;
+            // wifi link came up  -  toast the connected ssid. (satoru)
+            NotificationManager::Post("Network", networks[i].ssid,
+                                      NotificationManager::ICON_SUCCESS, 3000);
             return true;
         }
     }
@@ -860,6 +951,9 @@ bool WiFi::Disconnect() {
         connected_index = -1;
     }
     state = WIFI_DISCONNECTED;
+    // wifi link went down. (satoru)
+    NotificationManager::Post("Network", "wifi disconnected",
+                              NotificationManager::ICON_WARNING, 3000);
     return true;
 }
 

@@ -24,7 +24,10 @@ extern "C" void scheduler_switch_to(uint64_t* prev_saved_rsp,
 extern "C" [[noreturn]] void scheduler_jump_to(uint64_t saved_rsp);
 
 namespace {
-constexpr uint64_t USER_STACK_BYTES = 16 * 1024;
+// 8 mb user stack (matches the linux main-thread default) so large static
+// binaries like ffmpeg have room; grows down from user_stack_top to base
+// 0x3fa00000, still ~506 mb above the mmap arena at 0x20000000. (satoru)
+constexpr uint64_t USER_STACK_BYTES = 8 * 1024 * 1024;
 constexpr uint64_t KERNEL_STACK_BYTES = 16 * 1024;
 constexpr uint64_t USER_STACK_TOP = USERSPACE_BASE + 0x00200000ULL;
 constexpr uint64_t USER_MMAP_BASE = 0x20000000ULL;
@@ -553,10 +556,12 @@ void Scheduler::Schedule() {
             HAL::SetKernelStack(current_process->kernel_stack_top);
         }
     } else if (current_process && current_process->state != Process_Running) {
-        // Nothing else runnable.  If our caller blocked us, leave
-        // current_process pointing at a non-running task  -  the caller
-        // owns the next step (idle loop / HLT).
-        current_process = nullptr;
+        // nothing else runnable. keep current_process pointing at the (now
+        // non-running) task instead of nulling it, so the idle window always has
+        // a valid current task as the fallback and no reader can fault on a null
+        // current_process; the blocking caller still drives the hlt/idle loop.
+        // the active preemptive scheduler (pick_next_kernel/perform_switch) has
+        // its own hlt idle fallback and never nulls current_process. (satoru)
     }
 }
 

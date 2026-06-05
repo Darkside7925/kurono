@@ -105,10 +105,16 @@ HELLO_USER_ELF    = $(BUILD)/userprogs/hello.elf
 HELLO_USER_OBJ    = $(BUILD)/userprogs/hello_user_embed.o
 HELLO_X64_ELF     = $(BUILD)/userprogs/hello_x64.elf
 HELLO_X64_OBJ     = $(BUILD)/userprogs/hello_x64_user_embed.o
+# prebuilt musl-static ET_EXEC hello, embedded as a blob (satoru)
+HELLO_MUSL_ELF    = $(USERPROGS_DIR)/hello_musl.elf
+HELLO_MUSL_OBJ    = $(BUILD)/userprogs/hello_musl_user_embed.o
 KPY_C_SRC         = $(USERPROGS_DIR)/kpython.c
 KPY_ELF           = $(BUILD)/userprogs/kpython.elf
 KPY_OBJ           = $(BUILD)/userprogs/kpython_user_embed.o
-USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(KPY_OBJ)
+# prebuilt musl-static ffmpeg n5.1.6 (~2.7 mb), embedded as a blob (satoru)
+FFMPEG_ELF        = $(USERPROGS_DIR)/ffmpeg.elf
+FFMPEG_OBJ        = $(BUILD)/userprogs/ffmpeg_user_embed.o
+USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ)
 
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
@@ -172,6 +178,8 @@ CXX_SRCS = \
     $(SRC)/ui/desktop.cpp \
     $(SRC)/ui/control_center.cpp \
     $(SRC)/ui/file_browser.cpp \
+    $(SRC)/ui/notification.cpp \
+    $(SRC)/ui/perf_hud.cpp \
     $(SRC)/apps/calculator.cpp \
     $(SRC)/apps/terminal.cpp \
     $(SRC)/apps/file_manager.cpp \
@@ -184,6 +192,8 @@ CXX_SRCS = \
     $(SRC)/apps/python_interp.cpp \
     $(SRC)/drivers/audio.cpp \
     $(SRC)/system/input_manager.cpp \
+    $(SRC)/system/clipboard.cpp \
+    $(SRC)/system/screenshot.cpp \
 	$(SRC)/system/conduit.cpp \
 	$(SRC)/system/logging.cpp \
 	$(SRC)/system/installer.cpp \
@@ -400,6 +410,24 @@ $(HELLO_X64_OBJ): $(HELLO_X64_ELF)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  hello_x64.elf.bin hello_x64_user_embed.o
 	rm -f $(BUILD)/userprogs/hello_x64.elf.bin
+
+# embed the prebuilt musl-static hello blob (satoru)
+$(HELLO_MUSL_OBJ): $(HELLO_MUSL_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/hello_musl.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  hello_musl.elf hello_musl_user_embed.o
+	rm -f $(BUILD)/userprogs/hello_musl.elf
+
+# embed the prebuilt musl-static ffmpeg blob (satoru)
+$(FFMPEG_OBJ): $(FFMPEG_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/ffmpeg.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  ffmpeg.elf ffmpeg_user_embed.o
+	rm -f $(BUILD)/userprogs/ffmpeg.elf
 
 # kpy: compile C with no libc, no PIE, link with user.ld @ 0x40100000
 $(KPY_ELF): $(KPY_C_SRC) $(USERPROGS_DIR)/user.ld

@@ -1,6 +1,10 @@
 //  kurono os  -  taskbar & desktop environment implementation
 #include "desktop.h"
 #include "control_center.h"
+#include "notification.h"
+#include "../system/screenshot.h"
+#include "wayland_server.h"
+#include "perf_hud.h"
 #include "../drivers/graphics.h"
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
@@ -22,6 +26,7 @@
 #include "../apps/browser.h"
 #include "../apps/media_player.h"
 #include "../proc/scheduler.h"
+#include "../hal/hal.h"
 
 static const unsigned int COL_TASKBAR      = 0xFF0C0C14;
 static const unsigned int COL_TASKBAR_TOP  = 0xFF2A2A40;
@@ -95,6 +100,10 @@ bool Taskbar::start_menu_open = false;
 int  Taskbar::hover_button    = -1;
 int  Taskbar::clock_h         = 12;
 int  Taskbar::clock_m         = 0;
+int  Taskbar::clock_mon       = 1;
+int  Taskbar::clock_dom       = 1;
+int  Taskbar::clock_year      = 1970;
+uint32_t Taskbar::clock_last_update_ms = 0;
 int  Taskbar::battery_pct     = 100;
 bool Taskbar::wifi_connected  = true;
 int  Taskbar::wifi_strength   = 3;
@@ -180,6 +189,10 @@ void Taskbar::Init(int sw,int sh){
     hover_button=-1;
     ReloadFromConfig();
     clock_h=12; clock_m=0;
+    // seed date cache; clock_last_update_ms=0 forces an immediate rtc read on
+    // the first Update() so the bar shows real time without a 1s lag. (satoru)
+    clock_mon=1; clock_dom=1; clock_year=1970;
+    clock_last_update_ms=0;
     battery_pct=100; wifi_connected=false; wifi_strength=0; volume_pct=75;
     volume_popup_open=false; volume_slider_dragging=false;
     volume_slider_val = Audio::IsAvailable() ? Audio::GetMasterVolume() : 80;
@@ -284,7 +297,7 @@ static void tb_render_quick_launch(){
     for (int i = 0; i < TB_PINNED_COUNT; i++) {
         // hover lift: scale [0..1] -> shrink rect by up to 2 px so the icon
         // visually pops without disturbing neighbours.
-        float t = (i < 8) ? Taskbar::pinned_hover_phase[i] : 0.0f;
+        float t = Taskbar::PinnedHoverPhase(i);
         int pop = (int)(t * 2.0f + 0.5f);
         int ix = x - pop;
         int iy = y - pop;
@@ -406,13 +419,13 @@ void Taskbar::RenderClock(){
     scpy(full_time, timebuf, 16);
     sapp(full_time, ampm, 16);
 
-    DateTime dt = TimeManager::NowLocalDateTime();
+    // date pulled from the once-per-second cache, not recomputed here. (satoru)
     char datebuf[16] = {0};
-    int_to_str(dt.mon, datebuf, 16);
+    int_to_str(clock_mon, datebuf, 16);
     sapp(datebuf, "/", 16);
-    char daybuf[4]; int_to_str(dt.dom, daybuf, 4); sapp(datebuf, daybuf, 16);
+    char daybuf[4]; int_to_str(clock_dom, daybuf, 4); sapp(datebuf, daybuf, 16);
     sapp(datebuf, "/", 16);
-    char yearbuf[8]; int_to_str(dt.year, yearbuf, 8); sapp(datebuf, yearbuf, 16);
+    char yearbuf[8]; int_to_str(clock_year, yearbuf, 8); sapp(datebuf, yearbuf, 16);
 
     int cx = tb_clock_x() + 4;
     Graphics::DrawString(cx, y_pos+6,  full_time, 0xFFF0F0FF, 0xFF000000);
@@ -769,7 +782,9 @@ bool Taskbar::HandleClick(int mx,int my){
                             case 9: KuronoShell::Init(); TerminalApp::Init();
                                     DesktopEnvironment::LaunchTerminal(); break;
                             case 10: DesktopEnvironment::RequestLogout(); break;
-                            case 11: break;
+                            // shutdown: halt the machine like the shell's
+                            // `shutdown` builtin (no acpi power-off here). (satoru)
+                            case 11: HAL::DisableInterrupts(); HAL::Halt(); break;
                         }
                         return true;
                     }
@@ -934,10 +949,17 @@ bool Taskbar::HandleClick(int mx,int my){
 }
 
 void Taskbar::Update(){
-    // update clock from real rtc-backed time
+    // refresh the clock from the real rtc-backed time at most once per second
+    // instead of every render frame; renderclock() reads the cached fields. (satoru)
+    uint32_t now = Timer::GetRealMs();
+    if (clock_last_update_ms != 0 && (now - clock_last_update_ms) < 1000) return;
+    clock_last_update_ms = now;
     DateTime dt = TimeManager::NowLocalDateTime();
     clock_h = dt.h;
     clock_m = dt.m;
+    clock_mon = dt.mon;
+    clock_dom = dt.dom;
+    clock_year = dt.year;
 }
 
 void Taskbar::Tick(uint32_t delta_ms, int mx, int my){
@@ -1810,8 +1832,13 @@ void DesktopEnvironment::Init(int sw,int sh){
 void DesktopEnvironment::Render(){
     Desktop::Render();
     WindowManager::RenderAll();
+    // pump queued wayland frame callbacks once per composited frame so clients
+    // are released to submit their next buffer. (satoru)
+    WaylandServer::DispatchPendingFrames();
     Taskbar::Render();
     ControlCenter::Render();
+    // toasts render topmost so they sit above every panel. (satoru)
+    NotificationManager::Render();
 }
 
 // double-click tracking state
@@ -1829,6 +1856,16 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
     Taskbar::Tick(delta_ms, mx, my);
 
     WindowManager::HandlePointerMove(mx, my);
+    // forward pointer motion + left-button transitions to wayland clients;
+    // mouse_down is the held-state, so edge-detecting it yields press/release. (satoru)
+    WaylandServer::ForwardPointerMotion(mx, my);
+    {
+        static bool wl_prev_left = false;
+        if (mouse_down != wl_prev_left) {
+            WaylandServer::ForwardPointerButton(mx, my, WaylandServer::WL_BTN_LEFT, mouse_down);
+            wl_prev_left = mouse_down;
+        }
+    }
 
     // alt-tab: cycle focus through visible windows by id (rough z-order proxy).
     // we want true z-order but the current z_order field changes only on Focus(),
@@ -1859,9 +1896,49 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         }
     }
 
+    // printscreen: capture a timestamped screenshot on the press edge only so a
+    // held key fires once. (satoru)
+    {
+        static bool printscreen_was_down = false;
+        bool printscreen_down = Keyboard::IsKeyPressed(KEY_PRINTSCREEN);
+        if (printscreen_down && !printscreen_was_down) {
+            Screenshot::CaptureTimestamped();
+            NotificationManager::Post("Screenshot", "saved to /home/user",
+                                      NotificationManager::ICON_SUCCESS, 3000);
+        }
+        printscreen_was_down = printscreen_down;
+    }
+
+    // perf hud toggle (f12) + window snapping (super+arrows), press-edge only. (satoru)
+    {
+        const KeyboardState& kss = Keyboard::GetState();
+        static bool f12_was = false;
+        bool f12_now = Keyboard::IsKeyPressed(KEY_F12);
+        if (f12_now && !f12_was) PerfHUD::Toggle();
+        f12_was = f12_now;
+
+        static bool snap_was = false;
+        bool snap_l = Keyboard::IsKeyPressed(KEY_LEFT);
+        bool snap_r = Keyboard::IsKeyPressed(KEY_RIGHT);
+        bool snap_u = Keyboard::IsKeyPressed(KEY_UP);
+        bool snap_d = Keyboard::IsKeyPressed(KEY_DOWN);
+        bool snap_now = kss.super && (snap_l || snap_r || snap_u || snap_d);
+        if (snap_now && !snap_was) {
+            if (snap_l)      WindowManager::SnapFocused(0); // left half (satoru)
+            else if (snap_r) WindowManager::SnapFocused(1); // right half (satoru)
+            else if (snap_u) WindowManager::SnapFocused(2); // maximize (satoru)
+            else if (snap_d) WindowManager::SnapFocused(3); // restore (satoru)
+        }
+        snap_was = snap_now;
+    }
+
     // right-click handling  -  forward event 4 to focused window
     bool right_clicked = Mouse::RightClicked();
     if(right_clicked){
+        // window context menu gets first crack on a titlebar right-click. (satoru)
+        if (WindowManager::HandleRightClick(mx, my)) {
+            // consumed by the wm context menu  -  skip default right-click routing.
+        } else {
         // check if click is on a window first
         Window* fw = WindowManager::GetFocusedWindow();
         if(fw && fw->visible && fw->state != WIN_CLOSED &&
@@ -1874,9 +1951,12 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
             // desktop right-click
             Desktop::HandleRightClick(mx, my);
         }
+        }
     }
 
     if(clicked){
+        // an open window context menu eats the next left-click. (satoru)
+        if (WindowManager::HandleContextMenuClick(mx, my)) return;
         // double-click detection: two clicks within ~400ms at same spot (real time)
         uint32_t now = Timer::GetRealMs();
         bool is_double = false;

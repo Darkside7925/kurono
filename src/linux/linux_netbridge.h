@@ -44,6 +44,11 @@
 #define LSHUT_WR     1
 #define LSHUT_RDWR   2
 
+// fcntl commands / flags (mirror linux_syscall.h) (satoru)
+#define LF_GETFL      3
+#define LF_SETFL      4
+#define LFD_O_NONBLOCK 0x0800
+
 // sockaddr_in
 struct LinuxSockaddrIn {
     uint16_t sin_family;
@@ -92,6 +97,7 @@ struct LinuxSocket {
     // options
     bool             reuse_addr;
     bool             keepalive;
+    bool             nonblocking;   // O_NONBLOCK via fcntl(F_SETFL) (satoru)
     int              backlog;
 
     // buffers
@@ -148,6 +154,10 @@ public:
                             const void* optval, int optlen);
     static int  Getsockopt(int sockfd, int level, int optname,
                             void* optval, int* optlen);
+    // fcntl(F_GETFL/F_SETFL): tracks the O_NONBLOCK flag so a non-blocking
+    // connect maps through to the kurono stack (satoru)
+    static int  Fcntl(int sockfd, int cmd, int arg);
+    static bool IsNonblocking(int sockfd);
     static int  Getpeername(int sockfd, LinuxSockaddrIn* addr);
     static int  Getsockname(int sockfd, LinuxSockaddrIn* addr);
 

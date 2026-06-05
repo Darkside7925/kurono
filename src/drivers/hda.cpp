@@ -188,9 +188,12 @@ bool HDAudio::InitCorbRirb() {
     Write8(HDA_RIRBCTL, 0);
     for (volatile int d = 0; d < 10000; d++);
 
-    // set corb base address
-    Write32(HDA_CORBLBASE, (uint32_t)(uintptr_t)corb);
-    Write32(HDA_CORBUBASE, 0);
+    // set corb base address  -  full 64-bit phys (identity-mapped: phys==virt),
+    // upper half must not be hardcoded to 0 or a heap address >4 gb would be
+    // truncated and the controller would dma the wrong page. (satoru)
+    uint64_t corb_phys = (uint64_t)(uintptr_t)corb;
+    Write32(HDA_CORBLBASE, (uint32_t)(corb_phys & 0xFFFFFFFFu));
+    Write32(HDA_CORBUBASE, (uint32_t)(corb_phys >> 32));
 
     // reset corb read pointer
     Write16(HDA_CORBRP, (1 << 15));
@@ -207,9 +210,11 @@ bool HDAudio::InitCorbRirb() {
     // reset corb write pointer
     Write16(HDA_CORBWP, 0);
 
-    // set rirb base address
-    Write32(HDA_RIRBLBASE, (uint32_t)(uintptr_t)rirb);
-    Write32(HDA_RIRBUBASE, 0);
+    // set rirb base address  -  full 64-bit phys, same upper-half fix as corb
+    // above so a >4 gb heap allocation is addressed correctly. (satoru)
+    uint64_t rirb_phys = (uint64_t)(uintptr_t)rirb;
+    Write32(HDA_RIRBLBASE, (uint32_t)(rirb_phys & 0xFFFFFFFFu));
+    Write32(HDA_RIRBUBASE, (uint32_t)(rirb_phys >> 32));
 
     // reset rirb write pointer
     Write16(HDA_RIRBWP, (1 << 15));
@@ -380,9 +385,17 @@ bool HDAudio::SetupOutputStream() {
     uint16_t fmt = EncodeFormat(current_format.sample_rate, current_format.bits, current_format.channels);
     Write16(stream_base + HDA_SD_FMT, fmt);
 
-    // set bdl address
-    Write32(stream_base + HDA_SD_BDPL, (uint32_t)(uintptr_t)bdl);
-    Write32(stream_base + HDA_SD_BDPU, 0);
+    // set bdl address  -  program the full 64-bit physical base, low half in
+    // sdbdpl and high half in sdbdpu.  the kernel is identity-mapped (phys ==
+    // virt, see vmm.cpp) so the bdl's physical address is just its pointer.
+    // we cannot borrow audiodma::acquire here: those four low-memory regions
+    // are statically owned by sb16/ac97 and are far too small for hda's 128 kb
+    // cyclic buffer + bdl.  hardcoding sdbdpu = 0 (the old code) truncated any
+    // heap address >4 gb and would corrupt dma on real 64-bit machines; the
+    // bdl entry addresses themselves are already full 64-bit. (satoru)
+    uint64_t bdl_phys = (uint64_t)(uintptr_t)bdl;
+    Write32(stream_base + HDA_SD_BDPL, (uint32_t)(bdl_phys & 0xFFFFFFFFu));
+    Write32(stream_base + HDA_SD_BDPU, (uint32_t)(bdl_phys >> 32));
 
     // set cyclic buffer length
     Write32(stream_base + HDA_SD_CBL, HDA_BUFFER_SIZE);

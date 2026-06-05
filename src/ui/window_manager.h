@@ -39,6 +39,10 @@ struct Window {
     int x, y, w, h;           // position and size
     int saved_x, saved_y;     // pre-maximize position
     int saved_w, saved_h;     // pre-maximize size
+    // pre-snap rect so SnapWindow(edge=3) can restore it; independent of
+    // the maximize save so snap/maximize don't clobber each other. (satoru)
+    int snap_saved_x, snap_saved_y, snap_saved_w, snap_saved_h;
+    bool snap_saved;
     WindowState state;
     bool visible;
     bool focused;
@@ -79,6 +83,11 @@ struct Window {
     // can repaint just what changed.
     int last_x, last_y, last_w, last_h;
     bool had_last;
+
+    // multi-monitor: index of the output this window currently lives on.
+    // a window belongs to the monitor whose rect contains its center; the
+    // wm recomputes this on move/resize. defaults to 0 (primary). (satoru)
+    int monitor_id;
 };
 
 class WindowManager {
@@ -100,6 +109,15 @@ public:
     static void Maximize(int id);
     static void Restore(int id);
     static void ToggleMaximize(int id);
+    // ── window snapping ───────────────────────────────────────────────
+    // snap a window to a screen region within the wm desktop area (taskbar
+    // excluded, reusing the maximize bounds). edge codes:
+    //   0=left half, 1=right half, 2=maximize, 3=restore pre-snap rect,
+    //   4=top-left quarter, 5=top-right, 6=bottom-left, 7=bottom-right.
+    // (satoru)
+    static void SnapWindow(int win_id, int edge);
+    // snap the currently focused window. (satoru)
+    static void SnapFocused(int edge);
     static void BringToFront(int id);
     static void Focus(int id);
     static void SetTitle(int id, const char* title);
@@ -107,6 +125,25 @@ public:
     static void ResizeWindow(int id, int w, int h);
     static void SetVisible(int id, bool visible);
     static void MarkDirty(int id);
+
+    // ── multi-monitor ─────────────────────────────────────────────────
+    // Which output a window currently lives on (by center point). (satoru)
+    static int  GetWindowMonitor(int id);
+    // Reposition a window onto another monitor's rect, preserving its
+    // offset within the old monitor where it fits. No-op if the index is
+    // invalid or there is only one monitor. (satoru)
+    static void MoveWindowToMonitor(int win_id, int monitor_index);
+
+    // ── window context menu (right-click on the titlebar) ─────────────
+    // Minimal self-contained popup menu. HandleRightClick opens it when the
+    // point is on a titlebar (returns true if consumed). HandleContextMenu-
+    // Click routes a subsequent left-click to the menu (returns true if the
+    // menu consumed/closed). The orchestrator wires these into its
+    // right-click / click dispatch. (satoru)
+    static bool HandleRightClick(int mx, int my);
+    static bool HandleContextMenuClick(int mx, int my);
+    static bool IsContextMenuOpen();
+    static void CloseContextMenu();
 
     // query
     static int  GetWindowCount();
@@ -176,4 +213,9 @@ private:
     static WMAction HitTest(Window* win, int px, int py);
     static int  TopWindowAt(int px, int py);
     static void SortByZOrder();
+
+    // multi-monitor: recompute win->monitor_id from its center point. (satoru)
+    static void UpdateWindowMonitor(Window* win);
+    // render the window context menu (called at the end of Render). (satoru)
+    static void RenderContextMenu();
 };

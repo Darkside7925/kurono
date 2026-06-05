@@ -60,7 +60,20 @@ struct MonitorInfo {
     uint8_t  max_refresh;
     float    physical_width_cm;
     float    physical_height_cm;
+
+    // multi-monitor: virtual desktop placement + owning display controller.
+    // monitors are laid out left-to-right so window_manager can map a
+    // global x to a specific output. (satoru)
+    int32_t  origin_x;       // top-left of this monitor in the virtual desktop
+    int32_t  origin_y;
+    uint16_t pci_bus;        // display controller that backs this output
+    uint8_t  pci_device;
+    uint8_t  pci_function;
+    uint16_t vendor_id;      // gpu vendor (0 if unknown / single-fb fallback)
 };
+
+// upper bound on independently tracked display outputs. (satoru)
+#define DISPLAY_MAX_MONITORS  4
 
 class DisplayManager {
 public:
@@ -101,6 +114,19 @@ public:
     static bool ReadEDID(MonitorInfo* info);
     static const MonitorInfo& GetMonitorInfo();
 
+    // multi-monitor: scan all pci display controllers and build the monitor
+    // list. monitors[0] is always the primary (mirrors GetMonitorInfo()).
+    // safe to call after Init(); Init() calls it automatically. returns the
+    // number of monitors detected. (satoru)
+    static int DetectDisplays();
+    static int GetMonitorCount();
+    // per-index monitor descriptor; nullptr if index out of range. (satoru)
+    static const MonitorInfo* GetMonitor(int index);
+    // per-index framebuffer. index 0 is the primary scanout; index >= 1 are
+    // secondary virtual framebuffers (ram-backed). nullptr if out of range
+    // or that output has no framebuffer. (satoru)
+    static const FramebufferInfo* GetFramebuffer(int index);
+
     // backend info
     static DisplayBackend GetBackend();
     static const char* GetBackendName();
@@ -123,6 +149,13 @@ private:
     static float gamma;
     static FramebufferInfo fb_info;
     static MonitorInfo monitor;
+
+    // multi-monitor state. monitors[0] mirrors `monitor`; fb_secondary is a
+    // ram-backed framebuffer exposed for a second usable display controller
+    // (index 1). (satoru)
+    static MonitorInfo monitors[DISPLAY_MAX_MONITORS];
+    static int monitor_count;
+    static FramebufferInfo fb_secondary;
 
     // double buffering
     static void* back_buffer;

@@ -8,6 +8,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
 #include "../drivers/audio.h"
+#include "../drivers/audio_server.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
 #include "../linux/linux_devices.h"
@@ -844,19 +845,34 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
                         break;
                     }
 
-                    bool ok = Audio::Play(pcm, (int)length, sample_rate, bits, channels);
+                    // route guest pcm through the unified audio server so it
+                    // mixes with host sound and uses the active backend; map
+                    // the guest's bit depth to the pcm sample format.  length
+                    // is in bytes. (satoru)
+                    AudioFormat::SampleFormat afmt =
+                        (bits == 8) ? AudioFormat::FMT_U8 :
+                        (bits == 32) ? AudioFormat::FMT_S32_LE :
+                                       AudioFormat::FMT_S16_LE;
+                    bool ok = AudioServer::PlayPCM(pcm, length, afmt,
+                                                   (uint32_t)sample_rate, channels);
                     cpu->regs[0] = ok ? 0 : 0xFFFFFFFF;
                     break;
                 }
                 case 2: { // stop
-                    Audio::Stop();
+                    // stop the active backend via the router (matches the
+                    // playpcm reroute above) instead of the legacy sb16 dsp
+                    // stop, which would not halt ac97/hda output. (satoru)
+                    AudioBackend* be = AudioServer::ActiveBackend();
+                    if (be) be->Stop();
                     cpu->regs[0] = 0;
                     break;
                 }
                 case 3: { // set volume
                     int vol = (int)(cpu->regs[2] & 0xFF); // rdx low byte
                     if (vol > 100) vol = 100;
-                    Audio::SetMasterVolume(vol);
+                    // master volume on the mixer scales every backend's output
+                    // through the router. (satoru)
+                    AudioMixer::SetMasterVolume(vol);
                     cpu->regs[0] = 0;
                     break;
                 }
