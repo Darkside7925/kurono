@@ -681,6 +681,9 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->remote_port = src_port;
                 sock->tcp_ack = their_seq + 1;
                 sock->tcp_state = TCP_SYN_RECEIVED;
+                sock->last_activity_ms = Timer::GetTicks();
+                sock->keepalive_last_ms = sock->last_activity_ms;
+                sock->keepalive_probes = 0;
                 SendTCP(sock, TCP_FLAG_SYN | TCP_FLAG_ACK, nullptr, 0);
                 sock->tcp_seq++;
             }
@@ -694,10 +697,18 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->tcp_ack = their_seq + 1;
                 sock->tcp_seq = their_ack;
                 sock->tcp_state = TCP_ESTABLISHED;
+                // background handshake finished: clear EINPROGRESS and arm
+                // the keepalive/activity clocks fresh (satoru)
+                sock->sock_errno = 0;
+                sock->last_activity_ms = Timer::GetTicks();
+                sock->keepalive_last_ms = sock->last_activity_ms;
+                sock->keepalive_probes = 0;
                 SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
                 slog("[TCP] -> ESTABLISHED\r\n");
             } else if (tcp->flags & TCP_FLAG_RST) {
                 sock->tcp_state = TCP_CLOSED;
+                // connection refused  -  surface to a non-blocking poller (satoru)
+                sock->sock_errno = TCP_ETIMEDOUT;
                 slog("[TCP] got RST -> CLOSED\r\n");
             }
             break;
@@ -711,6 +722,10 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
             if (tcp->flags & TCP_FLAG_ACK) {
                 ApplyAck(sock, their_ack);
                 sock->tcp_state = TCP_ESTABLISHED;
+                // server-side handshake complete: arm keepalive clocks (satoru)
+                sock->last_activity_ms = Timer::GetTicks();
+                sock->keepalive_last_ms = sock->last_activity_ms;
+                sock->keepalive_probes = 0;
             }
             break;
 
@@ -721,6 +736,11 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->active = false;
                 slog("[TCP] got RST in ESTABLISHED -> CLOSED\r\n");
             } else {
+                // any segment from the peer is proof the link is alive: reset
+                // the keepalive idle timer and clear pending probes (satoru)
+                sock->last_activity_ms = Timer::GetTicks();
+                sock->keepalive_probes = 0;
+                sock->keepalive_last_ms = sock->last_activity_ms;
                 bool ack_needed = false;
                 int accepted_data = 0;
                 if (tcp_data_len > 0) {
@@ -857,7 +877,13 @@ bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, i
     tcp->ack_num = htonl(sock->tcp_ack);
     tcp->data_offset = (5 << 4); // 20 bytes, no options
     tcp->flags = flags;
-    tcp->window = htons(sock->tcp_window ? sock->tcp_window : TCP_RX_BUFSIZE);
+    // advertise the ACTUAL free space in our rx ring, recomputed at every
+    // emission, so the peer never overruns the buffer (clamp to >=0) (satoru)
+    int rx_free = TCP_RX_BUFSIZE - sock->rx_count;
+    if (rx_free < 0) rx_free = 0;
+    if (rx_free > 0xFFFF) rx_free = 0xFFFF;
+    sock->tcp_window = (uint16_t)rx_free;
+    tcp->window = htons((uint16_t)rx_free);
     tcp->checksum = 0;
     tcp->urgent = 0;
 
@@ -994,6 +1020,7 @@ bool TCPStack::Connect(int sock, uint32_t ip, uint16_t port) {
     NetSocket* s = &sockets[sock];
     s->remote_ip = ip;
     s->remote_port = port;
+    s->sock_errno = 0;
     if (s->local_port == 0) s->local_port = AllocatePort();
 
     if (s->type == SOCK_STREAM) {
@@ -1008,6 +1035,11 @@ bool TCPStack::Connect(int sock, uint32_t ip, uint16_t port) {
         s->tcp_ack = 0;
         s->tx_unacked = s->tcp_seq;
         s->tcp_state = TCP_SYN_SENT;
+        // seed keepalive/activity clocks so an idle ESTABLISHED socket has a
+        // sane baseline the moment the handshake finishes (satoru)
+        s->last_activity_ms = Timer::GetTicks();
+        s->keepalive_last_ms = s->last_activity_ms;
+        s->keepalive_probes = 0;
         if (!SendTCP(s, TCP_FLAG_SYN, nullptr, 0)) {
             slog("[TCP] SendTCP(SYN) returned FALSE (route/ARP)\r\n");
             s->tcp_state = TCP_CLOSED;
@@ -1015,6 +1047,16 @@ bool TCPStack::Connect(int sock, uint32_t ip, uint16_t port) {
         }
         slog("[TCP] SYN sent, waiting for SYN-ACK\r\n");
         s->tcp_seq++;
+
+        // Non-blocking connect: return immediately with EINPROGRESS. The
+        // handshake finishes in the background (incoming SYN-ACK in
+        // ProcessTCP, retransmits in TCPTick); callers poll IsWritable to
+        // see the socket become ESTABLISHED. (satoru)
+        if (s->nonblocking) {
+            s->sock_errno = TCP_EINPROGRESS;
+            slog("[TCP] non-blocking connect -> EINPROGRESS\r\n");
+            return false;
+        }
 
         // Wait using real elapsed time. The old spin-count loop could burn
         // through the entire timeout window before QEMU/SLIRP delivered a
@@ -1120,6 +1162,10 @@ int TCPStack::Send(int sock, const void* data, int len) {
             }
             s->tcp_seq += (uint32_t)chunk;
             sent += chunk;
+            // outbound data is activity: hold off keepalive probing (satoru)
+            s->last_activity_ms = Timer::GetTicks();
+            s->keepalive_probes = 0;
+            s->keepalive_last_ms = s->last_activity_ms;
         }
         return sent;
     } else if (s->type == SOCK_DGRAM) {
@@ -1149,6 +1195,31 @@ bool TCPStack::IsPeerClosed(int sock) {
     TCPState state = sockets[sock].tcp_state;
     return state == TCP_CLOSE_WAIT || state == TCP_LAST_ACK ||
            state == TCP_TIME_WAIT || state == TCP_CLOSED;
+}
+
+void TCPStack::SetNonblocking(int sock, bool nonblocking) {
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return;
+    sockets[sock].nonblocking = nonblocking;
+}
+
+bool TCPStack::IsNonblocking(int sock) {
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    return sockets[sock].nonblocking;
+}
+
+bool TCPStack::IsWritable(int sock) {
+    // A stream socket is writable for poll/select once the handshake
+    // completed (ESTABLISHED)  -  this is how a background non-blocking
+    // connect signals success. UDP sockets are always writable. (satoru)
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    NetSocket* s = &sockets[sock];
+    if (s->type != SOCK_STREAM) return true;
+    return s->tcp_state == TCP_ESTABLISHED;
+}
+
+int TCPStack::GetSockError(int sock) {
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return 0;
+    return sockets[sock].sock_errno;
 }
 
 bool TCPStack::Close(int sock) {
@@ -1313,6 +1384,36 @@ void TCPStack::TCPTick() {
                               sockets[i].tx_len, sockets[i].tx_seq_base, false);
                 sockets[i].tx_retries++;
                 sockets[i].tx_last_tx_ms = now_ms;
+            }
+        }
+        // keepalive: probe an idle ESTABLISHED socket, then give up after a
+        // bounded number of unanswered probes. Any RX/TX activity resets these
+        // clocks (see ProcessTCP / Send), so this only fires on true idle.
+        // A keepalive probe is a zero-length segment carrying seq = snd.nxt-1,
+        // which forces the peer to emit an ACK without delivering data. (satoru)
+        if (sockets[i].tcp_state == TCP_ESTABLISHED && !sockets[i].tx_pending) {
+            uint32_t idle_ms = (uint32_t)(now_ms - sockets[i].last_activity_ms);
+            if (sockets[i].keepalive_probes == 0) {
+                if (idle_ms >= TCP_KEEPALIVE_IDLE_MS) {
+                    slog("[TCP] keepalive: idle, probing\r\n");
+                    SendTCPPacket(&sockets[i], TCP_FLAG_ACK, nullptr, 0,
+                                  sockets[i].tcp_seq - 1u, false);
+                    sockets[i].keepalive_probes = 1;
+                    sockets[i].keepalive_last_ms = now_ms;
+                }
+            } else if ((uint32_t)(now_ms - sockets[i].keepalive_last_ms) >= TCP_KEEPALIVE_INTVL_MS) {
+                if (sockets[i].keepalive_probes >= TCP_KEEPALIVE_MAX_PROBES) {
+                    slog("[TCP] keepalive: no response -> ETIMEDOUT, closing\r\n");
+                    sockets[i].sock_errno = TCP_ETIMEDOUT;
+                    sockets[i].tx_pending = false;
+                    sockets[i].tcp_state = TCP_CLOSED;
+                    sockets[i].active = false;
+                    continue;
+                }
+                SendTCPPacket(&sockets[i], TCP_FLAG_ACK, nullptr, 0,
+                              sockets[i].tcp_seq - 1u, false);
+                sockets[i].keepalive_probes++;
+                sockets[i].keepalive_last_ms = now_ms;
             }
         }
         if (sockets[i].tcp_state == TCP_TIME_WAIT) {

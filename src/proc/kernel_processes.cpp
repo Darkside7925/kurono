@@ -21,6 +21,8 @@
 #include "../drivers/audio_server.h"
 #include "../drivers/ac97.h"
 #include "../drivers/graphics.h"
+#include "../drivers/display_mgr.h"
+#include "../drivers/usb.h"
 #include "../drivers/e1000.h"
 #include "../net/network.h"
 #include "../net/tcpip.h"
@@ -28,6 +30,7 @@
 #include "../system/logging.h"
 #include "../ui/desktop.h"
 #include "../ui/window_manager.h"
+#include "../ui/perf_hud.h"
 #include "../ui/lockscreen.h"
 #include "../system/user_mgmt.h"
 #include "../apps/terminal.h"
@@ -37,6 +40,11 @@
 namespace KernelProcesses {
 
 namespace {
+// graphics-loop heartbeat: GUIProcessEntry stamps this with Timer::GetRealMs()
+// every iteration; the watchdog process treats a >3 s gap as a stalled display
+// and attempts a backend reinit. volatile because it is written by the gui
+// process and read by the watchdog process. (satoru)
+volatile uint32_t g_last_frame_ms = 0;
 constexpr int  GUI_AUTORUN_MAX = 256;
 char           g_gui_autorun_cmd[GUI_AUTORUN_MAX] = {};
 volatile bool  g_gui_autorun_armed = false;
@@ -87,6 +95,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             SpinLockCpuGuard guard(g_input_lock);
             Keyboard::Poll();
             Mouse::Poll();
+            USB::PollHID();   // poll usb hid interrupt-in endpoints (satoru)
             InputManager::Poll();
         }
         Scheduler::SleepMs(1);
@@ -173,6 +182,10 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     uint32_t autorun_target_ms = Timer::GetTicks() + 4000u;
 
     while (true) {
+        // stamp the graphics-loop heartbeat for the watchdog before any work,
+        // so a hang anywhere in the body is detectable as a stalled tick. (satoru)
+        g_last_frame_ms = Timer::GetRealMs();
+
         // Advance system wall-clock time once per frame.
         uint32_t real_elapsed = Timer::ElapsedSinceLast();
         if (real_elapsed > 0) TimeManager::AdvanceByMs(real_elapsed);
@@ -285,12 +298,34 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             Graphics::FillRoundedRect(tx, 6, pill_w, 22, 11, 0xB0101020);
             Graphics::DrawString(tx + 8, 10, fps_str, 0xFF00E676, 0xFF000000);
 
+            // performance hud overlay (toggle with f12). (satoru)
+            PerfHUD::Render(displayed_fps, displayed_fps ? 1000u / displayed_fps : 0u);
+
             Mouse::DrawAt(Mouse::mx, Mouse::my);
             Graphics::SwapBuffers();
         }
 
         // Hand the CPU back so the other tiers progress.
         Scheduler::YieldNow();
+    }
+}
+
+// watchdog: every 5 s, verify the graphics main loop ticked within the last
+// 3 s. on a stall, log to serial and attempt to reinitialize the display
+// backend. a healthy gui loop refreshes g_last_frame_ms every frame, so this
+// never fires under normal operation. (satoru)
+[[noreturn]] static void WatchdogProcessEntry() {
+    SerialLogger::Log("[watchdog] online\r\n");
+    for (;;) {
+        Scheduler::SleepMs(5000);
+        uint32_t last = g_last_frame_ms;
+        if (last == 0) continue;                  // gui loop not started yet (satoru)
+        uint32_t now = Timer::GetRealMs();
+        if (now > last && (now - last) > 3000) {
+            SerialLogger::Log("[watchdog] graphics main loop stalled >3s; reinitializing display backend (satoru)\r\n");
+            DisplayManager::Init();
+            g_last_frame_ms = Timer::GetRealMs(); // avoid immediate re-trigger after recovery (satoru)
+        }
     }
 }
 
@@ -310,6 +345,8 @@ int SpawnAll() {
     if (Scheduler::SpawnKernelProcess("shell",     ShellProcessEntry,
                                       PRIO_NORMAL, 512, 8192)) created++;
     if (Scheduler::SpawnKernelProcess("logging",   LoggingProcessEntry,
+                                      PRIO_LOW,    64,  2048)) created++;
+    if (Scheduler::SpawnKernelProcess("watchdog",  WatchdogProcessEntry,
                                       PRIO_LOW,    64,  2048)) created++;
     return created;
 }

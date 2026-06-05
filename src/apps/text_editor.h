@@ -48,6 +48,12 @@ private:
     static void InsertNewline();
     static void DeleteLine(int row);
 
+    // clipboard: copy/cut the active selection (or current line when there is
+    // no selection) and paste clipboard text at the cursor. (satoru)
+    static void CopySelection();
+    static void CutSelection();
+    static void PasteClipboard();
+
     // cursor movement
     static void MoveCursorUp();
     static void MoveCursorDown();

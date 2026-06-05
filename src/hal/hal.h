@@ -54,6 +54,16 @@ public:
 
     static void Reboot();
 
+    // soft power-off: try emulator/acpi poweroff ports, then fall back to
+    // halt. does not return on success. (satoru)
+    [[noreturn]] static void PowerOff();
+
+    // acpi s3 suspend-to-ram. attempts to locate pm1a_cnt_blk + the \_s3
+    // slp_typ via a minimal rsdp/rsdt/xsdt/fadt walk and enter s3. returns
+    // false (and stays running) when the acpi tables cannot be parsed
+    // safely. (satoru)
+    static bool Suspend();
+
     static void    OutByte(uint16_t port, uint8_t  value);
     static uint8_t InByte(uint16_t port);
     static void    OutWord(uint16_t port, uint16_t value);

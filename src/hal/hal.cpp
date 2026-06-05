@@ -441,9 +441,18 @@ void HAL::InitSyscallMSRs() {
         asm volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(msr));
     };
 
-    // Enable SCE.
+    // Enable SCE (syscall) + NXE (no-execute enable). NXE is mandatory here:
+    // our user brk/mmap demand-zero regions map with PTE_NX (bit 63). without
+    // efer.nxe that bit is *reserved*, so every demand-paged heap/anon page
+    // raises a reserved-bit #PF (err bit3). the fault handler remaps with the
+    // same flag and the instruction re-faults forever, leaking a frame each
+    // iteration until the pmm is exhausted and the kernel panics. enabling nxe
+    // makes the bit mean no-execute (valid) and gives real w^x for user
+    // heap/stack/anon memory. only mappings that explicitly set bit 63 are
+    // affected; kernel code + elf segments never do. (satoru)
     uint64_t efer = rdmsr(MSR_EFER);
-    efer |= 1ULL;
+    efer |= 1ULL;          // SCE
+    efer |= (1ULL << 11);  // NXE
     wrmsr(MSR_EFER, efer);
 
     // Program STAR.
@@ -532,6 +541,162 @@ void HAL::Reboot() {
         asm volatile("ud2");
         asm volatile("cli; hlt");
     }
+}
+
+void HAL::PowerOff() {
+    DisableInterrupts();
+    SerialLogger::Log("HAL: PowerOff requested\r\n");
+
+    // try the common emulator/acpi poweroff ports in order. each is a
+    // 16-bit write of the sleep value to a hardware-reduced acpi pm1a-style
+    // control port that the hypervisor watches. on real hardware these
+    // usually do nothing, so we fall through to a halt. (satoru)
+    for (int attempt = 0; attempt < 4; attempt++) {
+        // qemu (>= 2.0) acpi pm control register.
+        OutWord(0x604, 0x2000);
+        for (volatile uint32_t d = 0; d < 500000; d++) asm volatile("pause");
+        // bochs / older qemu (pre-2.0) acpi poweroff.
+        OutWord(0xB004, 0x2000);
+        for (volatile uint32_t d = 0; d < 500000; d++) asm volatile("pause");
+        // cloud-hypervisor / firecracker acpi shutdown port.
+        OutWord(0x4004, 0x3400);
+        for (volatile uint32_t d = 0; d < 500000; d++) asm volatile("pause");
+    }
+
+    // none of the poweroff ports took effect (likely real hardware without
+    // a parsed acpi fadt). leave the machine in a safe halted state. (satoru)
+    SerialLogger::Log("HAL: PowerOff ports had no effect  -  halting CPU\r\n");
+    while (true) {
+        asm volatile("cli; hlt");
+    }
+}
+
+namespace {
+//  minimal acpi fadt locator (satoru)
+//  walks rsdp -> rsdt/xsdt -> fadt to recover pm1a_cnt_blk. low physical
+//  memory is identity-mapped in this kernel (the same assumption gpu_probe
+//  relies on to dereference pci bars), so we can read these tables directly.
+
+struct AcpiSDTHeader {
+    char     signature[4];
+    uint32_t length;
+    uint8_t  revision;
+    uint8_t  checksum;
+    char     oem_id[6];
+    char     oem_table_id[8];
+    uint32_t oem_revision;
+    uint32_t creator_id;
+    uint32_t creator_revision;
+} __attribute__((packed));
+
+static bool acpi_sig_eq(const char* a, const char* b4) {
+    return a[0] == b4[0] && a[1] == b4[1] && a[2] == b4[2] && a[3] == b4[3];
+}
+
+// sum `len` bytes starting at `p`; valid acpi structures sum to 0 mod 256.
+static uint8_t acpi_checksum(const void* p, uint32_t len) {
+    const uint8_t* b = (const uint8_t*)p;
+    uint8_t sum = 0;
+    for (uint32_t i = 0; i < len; i++) sum = (uint8_t)(sum + b[i]);
+    return sum;
+}
+
+// scan the legacy bios area for the rsdp ("RSD PTR " on a 16-byte boundary).
+// returns the rsdp physical address, or 0 if not found. (satoru)
+static uintptr_t acpi_find_rsdp() {
+    const char sig[8] = {'R','S','D',' ','P','T','R',' '};
+    for (uintptr_t addr = 0xE0000; addr < 0x100000; addr += 16) {
+        const char* p = (const char*)addr;
+        bool match = true;
+        for (int i = 0; i < 8; i++) {
+            if (p[i] != sig[i]) { match = false; break; }
+        }
+        if (!match) continue;
+        // rsdp v1 checksum covers the first 20 bytes.
+        if (acpi_checksum(p, 20) == 0) return addr;
+    }
+    return 0;
+}
+
+// locate the fadt ("FACP") by walking the rsdt (32-bit ptrs) or xsdt
+// (64-bit ptrs). returns the fadt physical address, or 0. (satoru)
+static uintptr_t acpi_find_fadt() {
+    uintptr_t rsdp = acpi_find_rsdp();
+    if (!rsdp) return 0;
+
+    const uint8_t* r = (const uint8_t*)rsdp;
+    uint8_t rev = r[15];
+
+    // prefer the xsdt (64-bit) on acpi 2.0+ when its extended checksum is ok.
+    if (rev >= 2) {
+        uint32_t xsdt_len = *(const uint32_t*)(r + 20);
+        if (xsdt_len >= 33 && acpi_checksum(r, xsdt_len) == 0) {
+            uint64_t xsdt_addr = *(const uint64_t*)(r + 24);
+            if (xsdt_addr) {
+                const AcpiSDTHeader* xsdt = (const AcpiSDTHeader*)(uintptr_t)xsdt_addr;
+                if (acpi_sig_eq(xsdt->signature, "XSDT") && xsdt->length >= sizeof(AcpiSDTHeader)) {
+                    uint32_t entries = (xsdt->length - sizeof(AcpiSDTHeader)) / 8;
+                    const uint8_t* arr = (const uint8_t*)xsdt + sizeof(AcpiSDTHeader);
+                    for (uint32_t i = 0; i < entries; i++) {
+                        uint64_t ent;
+                        // entries are not guaranteed 8-byte aligned  -  copy.
+                        const uint8_t* src = arr + i * 8;
+                        uint8_t* dst = (uint8_t*)&ent;
+                        for (int b = 0; b < 8; b++) dst[b] = src[b];
+                        const AcpiSDTHeader* h = (const AcpiSDTHeader*)(uintptr_t)ent;
+                        if (h && acpi_sig_eq(h->signature, "FACP")) return (uintptr_t)ent;
+                    }
+                }
+            }
+        }
+    }
+
+    // fall back to the rsdt (32-bit pointers).
+    uint32_t rsdt_addr = *(const uint32_t*)(r + 16);
+    if (!rsdt_addr) return 0;
+    const AcpiSDTHeader* rsdt = (const AcpiSDTHeader*)(uintptr_t)rsdt_addr;
+    if (!acpi_sig_eq(rsdt->signature, "RSDT") || rsdt->length < sizeof(AcpiSDTHeader)) return 0;
+    uint32_t entries = (rsdt->length - sizeof(AcpiSDTHeader)) / 4;
+    const uint8_t* arr = (const uint8_t*)rsdt + sizeof(AcpiSDTHeader);
+    for (uint32_t i = 0; i < entries; i++) {
+        uint32_t ent;
+        const uint8_t* src = arr + i * 4;
+        uint8_t* dst = (uint8_t*)&ent;
+        for (int b = 0; b < 4; b++) dst[b] = src[b];
+        const AcpiSDTHeader* h = (const AcpiSDTHeader*)(uintptr_t)ent;
+        if (h && acpi_sig_eq(h->signature, "FACP")) return (uintptr_t)ent;
+    }
+    return 0;
+}
+}  // namespace
+
+bool HAL::Suspend() {
+    SerialLogger::Log("HAL: Suspend (ACPI S3) requested\r\n");
+
+    // step 1 (implemented): recover pm1a_cnt_blk from the fadt. the fadt
+    // (signature "FACP") stores pm1a_cnt_blk as a 32-bit io port at offset
+    // 64 per the acpi spec. (satoru)
+    uintptr_t fadt = acpi_find_fadt();
+    if (!fadt) {
+        SerialLogger::Log("HAL: Suspend aborted  -  no ACPI RSDP/FADT found\r\n");
+        return false;
+    }
+    uint32_t pm1a_cnt = *(const uint32_t*)(fadt + 64);
+    log_hex("HAL: FADT located, PM1a_CNT_BLK = ", pm1a_cnt);
+
+    // step 2 (blocked): the s3 sleep type written to pm1a_cnt (slp_typa,
+    // bits 10-12) is not stored in the fadt. it lives in the dsdt as the
+    // aml object \_s3, e.g. Name(_S3, Package(){5,5,0,0}). recovering it
+    // safely requires walking and decoding the dsdt's aml bytecode, which
+    // needs a real aml interpreter this kernel does not have. writing a
+    // guessed slp_typ (or skipping it) would either silently fail to sleep
+    // or, worse, trigger an undefined hardware transition. (satoru)
+    // TODO (satoru): requires ACPI FADT/DSDT parse for SLP_TYPx  -  decode the
+    // \_S3 AML package in the DSDT to obtain SLP_TYPa/SLP_TYPb before we can
+    // write (SLP_TYPa << 10) | SLP_EN to PM1a_CNT_BLK and enter S3.
+    SerialLogger::Log("HAL: Suspend aborted  -  SLP_TYP for S3 requires DSDT AML parse (not implemented)\r\n");
+    (void)pm1a_cnt;
+    return false;
 }
 
 void HAL::OutByte(uint16_t port, uint8_t value) {

@@ -782,6 +782,101 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
     prev_buttons = new_buttons;
 }
 
+// USB HID boot-protocol mouse report decode (satoru).
+//   byte0: buttons  -  bit0 left, bit1 right, bit2 middle
+//   byte1: dx  (signed int8, +x = right)
+//   byte2: dy  (signed int8, +y = down per HID convention)
+//   byte3: wheel (signed int8, optional; +z = up)
+// We translate into the same relative motion/button/wheel events the PS/2 path
+// emits, keeping the codebase convention of "dy positive = up" in events and
+// moving the cursor with down-positive screen coordinates (satoru).
+void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
+    if (!report || len < 3) return;
+
+    perf_stats.packets_processed++;
+
+    uint8_t hw_buttons = 0;
+    if (report[0] & 0x01) hw_buttons |= 0x01; // left
+    if (report[0] & 0x02) hw_buttons |= 0x02; // right
+    if (report[0] & 0x04) hw_buttons |= 0x04; // middle
+    if (report[0] & 0x08) hw_buttons |= 0x10; // button 4 -> x1 lane (satoru)
+    if (report[0] & 0x10) hw_buttons |= 0x20; // button 5 -> x2 lane (satoru)
+
+    int dx = (int)(int8_t)report[1];
+    int dy_hid = (int)(int8_t)report[2];        // +down (satoru)
+    int wheel = (len >= 4) ? (int)(int8_t)report[3] : 0; // +up (satoru)
+
+    // apply the coarse user multipliers used by the PS/2 path so feel matches
+    // (acceleration curve is intentionally left to the PS/2 stream; HID mice
+    // are already reported at device dpi) (satoru).
+    int m_dx = dx * (int)speed_mul;
+    int m_dy_down = dy_hid * (int)speed_mul;    // down-positive screen delta (satoru)
+    if (sensitivity_mul > 1) { m_dx *= (int)sensitivity_mul; m_dy_down *= (int)sensitivity_mul; }
+    if (deadzone_px) {
+        int dzp = (int)deadzone_px;
+        if (m_dx > -dzp && m_dx < dzp) m_dx = 0;
+        if (m_dy_down > -dzp && m_dy_down < dzp) m_dy_down = 0;
+    }
+
+    uint8_t new_buttons = MapButtons(hw_buttons);
+    bool left = (new_buttons & 0x01) != 0;
+    bool right = (new_buttons & 0x02) != 0;
+    if (left && !left_down) { left_clicked = true; SerialLogger::Log("Mouse: Left Click\r\n"); }
+    static bool usb_right_down = false;
+    if (right && !usb_right_down) { right_clicked = true; SerialLogger::Log("Mouse: Right Click\r\n"); }
+    usb_right_down = right;
+    left_down = left;
+    buttons = new_buttons;
+
+    lastx = mx; lasty = my;
+    int w = Graphics::GetWidth(); int h = Graphics::GetHeight();
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    int new_mx = mx + m_dx;
+    int new_my = my + m_dy_down;              // down-positive (satoru)
+    if (new_mx < 0) new_mx = 0; else if (new_mx > w - 1) new_mx = w - 1;
+    if (new_my < 0) new_my = 0; else if (new_my > h - 1) new_my = h - 1;
+    int delivered_dx = new_mx - mx;
+    int delivered_dy_up = my - new_my;         // event convention: + = up (satoru)
+    mx = new_mx; my = new_my;
+    if (cursor_visible && auto_draw && (delivered_dx || delivered_dy_up)) {
+        ClearAt(lastx, lasty);
+        DrawAt(mx, my);
+    }
+
+    uint64_t ts = TimeManager::NowUTC().us;
+    if (delivered_dx || delivered_dy_up) {
+        Event e{};
+        e.type = 0; e.x = mx; e.y = my;
+        e.dx = delivered_dx; e.dy = delivered_dy_up;
+        e.buttons = new_buttons; e.time_us = ts;
+        RingPush(e);
+        perf_stats.events_generated++;
+    }
+
+    uint8_t changed = (uint8_t)(new_buttons ^ prev_buttons);
+    if (changed) {
+        for (int i = 0; i < 5; i++) {
+            uint8_t mask = (i == 0 ? 0x01 : i == 1 ? 0x02 : i == 2 ? 0x04 : i == 3 ? 0x08 : 0x10);
+            if (!(changed & mask)) continue;
+            Event e{};
+            e.type = (uint8_t)((new_buttons & mask) ? 1 : 2);
+            e.x = mx; e.y = my; e.button = (uint8_t)i;
+            e.buttons = new_buttons; e.time_us = ts;
+            RingPush(e);
+        }
+    }
+    prev_buttons = new_buttons;
+
+    if (wheel) {
+        int dz = invert_scroll ? -wheel : wheel;
+        Event e{};
+        e.type = 3; e.x = mx; e.y = my; e.dz = dz;
+        e.buttons = new_buttons; e.time_us = ts;
+        RingPush(e);
+    }
+}
+
 bool Mouse::PollVirtualBoxAbsolute() {
     if (!vbox_vmmdev_available) {
         return false;

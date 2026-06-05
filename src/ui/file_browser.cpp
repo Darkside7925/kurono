@@ -13,35 +13,50 @@ VirtualFile* FileBrowser::selected_node = nullptr;
 
 void FileBrowser::Init() {
     if (root) return;
-    
-    // create file structure
+
+    // create file structure. operator new returns null on oom in this
+    // no-exceptions freestanding build, and VirtualFile::Add dereferences both
+    // the parent and the child, so every allocation is null-checked before use;
+    // on a failed allocation we abort init cleanly, leaving a valid (possibly
+    // partial) tree rather than dereferencing null. (satoru)
     root = new VirtualFile("Root", true, 0);
-    
+    if (!root) return;
+
     VirtualFile* c_drive = new VirtualFile("C:", true, 0);
+    if (!c_drive) return;
     root->Add(c_drive);
-    
+
     VirtualFile* users = new VirtualFile("Users", true, 0);
+    if (!users) return;
     c_drive->Add(users);
-    
+
     VirtualFile* admin = new VirtualFile("Admin", true, 0);
+    if (!admin) return;
     users->Add(admin);
-    
-    admin->Add(new VirtualFile("Documents", true, 0));
-    admin->Add(new VirtualFile("Downloads", true, 0));
+    current_dir = admin; // start in user folder (set early so a later oom still leaves a valid cwd) (satoru)
+
+    VirtualFile* docs = new VirtualFile("Documents", true, 0);
+    if (docs) admin->Add(docs);
+    VirtualFile* dls = new VirtualFile("Downloads", true, 0);
+    if (dls) admin->Add(dls);
+
     VirtualFile* pics = new VirtualFile("Pictures", true, 0);
-    admin->Add(pics);
-    
-    pics->Add(new VirtualFile("logo.png", false, 1024));
-    pics->Add(new VirtualFile("wallpaper.png", false, 2048));
-    pics->Add(new VirtualFile("user.jpg", false, 512));
-    pics->Add(new VirtualFile("screenshot.bmp", false, 4096));
-    
+    if (pics) {
+        admin->Add(pics);
+        VirtualFile* f;
+        if ((f = new VirtualFile("logo.png", false, 1024)))      pics->Add(f);
+        if ((f = new VirtualFile("wallpaper.png", false, 2048))) pics->Add(f);
+        if ((f = new VirtualFile("user.jpg", false, 512)))       pics->Add(f);
+        if ((f = new VirtualFile("screenshot.bmp", false, 4096)))pics->Add(f);
+    }
+
     VirtualFile* sys = new VirtualFile("System", true, 0);
-    c_drive->Add(sys);
-    sys->Add(new VirtualFile("kernel.elf", false, 12000));
-    sys->Add(new VirtualFile("drivers.sys", false, 500));
-    
-    current_dir = admin; // start in user folder
+    if (sys) {
+        c_drive->Add(sys);
+        VirtualFile* f;
+        if ((f = new VirtualFile("kernel.elf", false, 12000))) sys->Add(f);
+        if ((f = new VirtualFile("drivers.sys", false, 500)))  sys->Add(f);
+    }
 }
 
 void FileBrowser::Show() {

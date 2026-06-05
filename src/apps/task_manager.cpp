@@ -8,6 +8,7 @@
 #include "../drivers/bga.h"
 #include "../drivers/cpu_detect.h"
 #include "../drivers/gpu_probe.h"
+#include "../hal/cpufreq.h"
 #include "../drivers/graphics.h"
 #include "../drivers/mouse.h"
 #include "../kernel/userspace.h"
@@ -171,6 +172,25 @@ static int tm_cpu_pct_from_ticks(uint64_t delta_ticks,uint32_t elapsed_ms){
     uint64_t pct = (delta_ticks * 100ULL + (uint64_t)(elapsed_ms / 2)) / (uint64_t)elapsed_ms;
     if(pct > 100ULL) pct = 100ULL;
     return (int)pct;
+}
+
+// build a compact "c0/c1/c2" list of each present core's current MHz from the
+// cpufreq governor, bounded to the first few cores so it fits the panel. (satoru)
+static void tm_build_percore_mhz(char* out,int cap){
+    if(cap<1){ return; }
+    out[0]=0;
+    int n=CPUFreq::CPUCount();
+    if(n>8) n=8;            // keep the line short for the narrow cpu pane (satoru)
+    int shown=0;
+    char nbuf[12];
+    for(int i=0;i<n;i++){
+        const CPUFreq::CPUInfo* ci=CPUFreq::GetCPU((uint32_t)i);
+        if(!ci || !ci->present) continue;
+        if(shown>0) sapp(out,"/",cap);
+        int_to_str((int)ci->cur_mhz,nbuf,12); sapp(out,nbuf,cap);
+        shown++;
+    }
+    if(shown==0) sapp(out,"n/a",cap);
 }
 
 static void tm_store_cpu_samples(const SchedulerProcessSnapshot* snapshots,int count){
@@ -710,7 +730,8 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     char cpu_brand_line[48] = {0};
     char cpu_core_line[48] = "Cores: ";
     char cpu_freq_line[48] = "Base: ";
-    char cpu_arch_line[48] = "Arch: x86-64";
+    // live per-core current frequency from the cpufreq governor. (satoru)
+    char cpu_cur_line[64] = "Cur: ";
     char nbuf[12] = {0};
     scpy(cpu_brand_line, cpu_brand, 48);
     int_to_str(cpu_cores, nbuf, 12); sapp(cpu_core_line, nbuf, 48);
@@ -725,9 +746,11 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     } else {
         sapp(cpu_freq_line, "unknown", 48);
     }
+    char cur_mhz_list[40]; tm_build_percore_mhz(cur_mhz_list, 40);
+    sapp(cpu_cur_line, cur_mhz_list, 64); sapp(cpu_cur_line, " MHz", 64);
     Graphics::DrawString(x+16, ly+94, cpu_brand_line, TM_TEXT, 0xFF000000);
     Graphics::DrawString(x+16, ly+110, cpu_core_line, TM_DIM, 0xFF000000);
-    Graphics::DrawString(x+half_w/2, ly+94, cpu_arch_line, TM_DIM, 0xFF000000);
+    Graphics::DrawString(x+half_w/2, ly+94, cpu_cur_line, TM_DIM, 0xFF000000);
     Graphics::DrawString(x+half_w/2, ly+110, cpu_freq_line, TM_DIM, 0xFF000000);
 
     Graphics::FillRoundedRect(x+half_w+20, ly, half_w, 130, 6, TM_PANEL);
@@ -791,6 +814,9 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     scpy(cpu_pane_1, cpu_brand, 64);
     int_to_str(cpu_cores, t2, 8); sapp(cpu_pane_2, t2, 64); sapp(cpu_pane_2, "  Thr: ", 64);
     int_to_str(cpu_threads, t2, 8); sapp(cpu_pane_2, t2, 64);
+    // live per-core current mhz from cpufreq. (satoru)
+    char pane_cur_mhz[40]; tm_build_percore_mhz(pane_cur_mhz, 40);
+    sapp(cpu_pane_2, "  MHz: ", 64); sapp(cpu_pane_2, pane_cur_mhz, 64);
     tm_format_gpu_pane(gpr, gpu_pane_1, 64, gpu_pane_2, 64);
     sapp(wifi_pane_1, WiFi::StateString(), 64);
     WiFiNetwork* connected_wifi = WiFi::GetConnectedNetwork();

@@ -15,6 +15,14 @@
 
 constexpr uint64_t USERSPACE_BASE = 0x0000000040000000ULL;  // 1 GB low-half userspace window
 
+// top of the canonical lower-half user address space (last valid byte).
+// the cpu sign-extends bit 47, so 0x0000_7FFF_FFFF_FFFF is the highest
+// non-negative virtual address a user pointer can hold. mmap/brk/aslr are
+// bounded by this rather than the old 4gb ceiling so pie binaries placed
+// high by ld-kurono round-trip through the syscall abi intact (satoru)
+constexpr uint64_t USER_SPACE_TOP = 0x00007FFFFFFFFFFFULL;
+constexpr uint64_t TASK_SIZE      = USER_SPACE_TOP + 1;  // 0x0000_8000_0000_0000 (satoru)
+
 // page table entry flags (common across all levels)
 #define PTE_PRESENT    (1ULL << 0)
 #define PTE_WRITABLE   (1ULL << 1)

@@ -4,6 +4,13 @@
 #include "ext4.h"
 #include "../kernel/heap.h"
 #include "../drivers/serial.h"
+#include "../drivers/nvme.h"
+#include "../kernel/time.h"
+
+// current unix time in whole seconds, for inode timestamps (satoru)
+static uint32_t e4_now_secs() {
+    return (uint32_t)(TimeManager::NowUTC().us / 1000000ull);
+}
 
 bool           Ext4::mounted = false;
 Ext4Superblock Ext4::sb;
@@ -369,10 +376,105 @@ int Ext4::ReadInodeData(Ext4Inode* inode, uint64_t offset,
 int Ext4::WriteInodeData(Ext4Inode* inode, uint32_t ino,
                           uint64_t offset, uint32_t len,
                           const void* buf) {
-    // for write support  -  simplified: only overwrites existing blocks
+    // writes file data, growing the file by allocating + LINKING new blocks
+    // into the inode's classic block map when a logical offset is unmapped.
+    // this pass implements direct/indirect addressing only; extent inodes that
+    // need a brand-new block are rejected (no silent data loss). (satoru)
     bool use_extents = (inode->i_flags & EXT4_EXTENTS_FL) != 0;
     const uint8_t* src = (const uint8_t*)buf;
     uint32_t total = 0;
+    uint32_t hint_group = (ino - 1) / inodes_per_group;
+
+    // count of 512-byte sectors newly allocated (data + indirect metadata),
+    // used to bump i_blocks_lo once at the end. (satoru)
+    uint32_t sectors_added = 0;
+    bool dirty = false;
+    const uint32_t ppb = block_size / 4;
+    const uint32_t sectors_per_block = block_size / 512;
+
+    // allocate a fresh block, zero it on disk, and account it as metadata.
+    // returns the physical block number, or 0 on failure. (satoru)
+    auto alloc_meta = [&](uint32_t* out_blk) -> bool {
+        uint64_t nb = 0;
+        if (AllocBlock(hint_group, &nb) != 0) return false;
+        uint8_t* zero = (uint8_t*)KernelHeap::Alloc(block_size);
+        if (!zero) return false;
+        memset(zero, 0, block_size);
+        WriteBytes(nb * block_size, block_size, zero);
+        KernelHeap::Free(zero);
+        sectors_added += sectors_per_block;
+        *out_blk = (uint32_t)nb;
+        return true;
+    };
+
+    // ensure the indirect pointer word at (container_block, index) is non-zero,
+    // allocating + zero-initing a child block if needed and writing the pointer
+    // back to disk. returns the child block number, or 0 on failure. (satoru)
+    auto ensure_disk_ptr = [&](uint32_t container_block,
+                               uint32_t index, uint32_t* out_child) -> bool {
+        uint32_t val = 0;
+        ReadBytes((uint64_t)container_block * block_size + index * 4, 4, &val);
+        if (val != 0) { *out_child = val; return true; }
+        uint32_t nb = 0;
+        if (!alloc_meta(&nb)) return false;
+        val = nb;
+        WriteBytes((uint64_t)container_block * block_size + index * 4, 4, &val);
+        *out_child = nb;
+        return true;
+    };
+
+    // link an already-allocated data block `phys` at logical index `lb` into
+    // the classic block map, creating indirect levels as required. (satoru)
+    auto link_block = [&](uint32_t lb, uint64_t phys) -> bool {
+        uint32_t phys32 = (uint32_t)phys;
+
+        // direct (satoru)
+        if (lb < EXT4_NDIR_BLOCKS) {
+            inode->i_block[lb] = phys32;
+            return true;
+        }
+        // single indirect (satoru)
+        lb -= EXT4_NDIR_BLOCKS;
+        if (lb < ppb) {
+            uint32_t ind = inode->i_block[EXT4_IND_BLOCK];
+            if (ind == 0) {
+                if (!alloc_meta(&ind)) return false;
+                inode->i_block[EXT4_IND_BLOCK] = ind;
+            }
+            WriteBytes((uint64_t)ind * block_size + lb * 4, 4, &phys32);
+            return true;
+        }
+        // double indirect (satoru)
+        lb -= ppb;
+        if (lb < ppb * ppb) {
+            uint32_t dind = inode->i_block[EXT4_DIND_BLOCK];
+            if (dind == 0) {
+                if (!alloc_meta(&dind)) return false;
+                inode->i_block[EXT4_DIND_BLOCK] = dind;
+            }
+            uint32_t ind = 0;
+            if (!ensure_disk_ptr(dind, lb / ppb, &ind)) return false;
+            WriteBytes((uint64_t)ind * block_size + (lb % ppb) * 4, 4, &phys32);
+            return true;
+        }
+        // triple indirect (satoru)
+        lb -= ppb * ppb;
+        uint32_t ppb2 = ppb * ppb;
+        uint32_t tind = inode->i_block[EXT4_TIND_BLOCK];
+        if (tind == 0) {
+            if (!alloc_meta(&tind)) return false;
+            inode->i_block[EXT4_TIND_BLOCK] = tind;
+        }
+        uint32_t i1 = lb / ppb2;
+        uint32_t rem = lb % ppb2;
+        uint32_t i2 = rem / ppb;
+        uint32_t i3 = rem % ppb;
+        uint32_t dind = 0, ind = 0;
+        if (!ensure_disk_ptr(tind, i1, &dind)) return false;
+        if (!ensure_disk_ptr(dind, i2, &ind)) return false;
+        WriteBytes((uint64_t)ind * block_size + i3 * 4, 4, &phys32);
+        return true;
+    };
 
     while (len > 0) {
         uint32_t logical = (uint32_t)(offset / block_size);
@@ -385,17 +487,41 @@ int Ext4::WriteInodeData(Ext4Inode* inode, uint32_t ino,
                         : BlockMapLogical(inode, logical);
 
         if (phys == 0) {
-            // would need block allocation for sparse writes
-            // simplified: allocate a new block
-            uint32_t group = (ino - 1) / inodes_per_group;
-            if (AllocBlock(group, &phys) != 0) return -1;
-            // todo: update block map/extent  -  complex for production
+            // unmapped logical block  -  must allocate and LINK it (satoru)
+            if (use_extents) {
+                // this pass does not insert into the extent tree; refuse rather
+                // than allocate an orphan block that the next read can't find
+                // and would return as zeros (silent data loss). (satoru)
+                SerialLogger::Log("[ext4] WriteInodeData: cannot grow extent "
+                                  "inode (no extent insertion this pass)\r\n");
+                break;
+            }
+            if (AllocBlock(hint_group, &phys) != 0) break;
+            sectors_added += sectors_per_block;
+            if (!link_block(logical, phys)) {
+                // couldn't wire the block into the map; release it so it
+                // isn't leaked, then stop. (satoru)
+                FreeBlock(phys);
+                sectors_added -= sectors_per_block;
+                break;
+            }
+            dirty = true;
+            // a freshly allocated data block written only partially must start
+            // from zeros, not stale disk contents (satoru)
+            if (blk_off != 0 || to_write != block_size) {
+                uint8_t* z = (uint8_t*)KernelHeap::Alloc(block_size);
+                if (z) {
+                    memset(z, 0, block_size);
+                    WriteBytes(phys * block_size, block_size, z);
+                    KernelHeap::Free(z);
+                }
+            }
         }
 
         if (blk_off != 0 || to_write != block_size) {
             // partial block  -  read-modify-write
             uint8_t* tmp = (uint8_t*)KernelHeap::Alloc(block_size);
-            if (!tmp) return -1;
+            if (!tmp) break;
             ReadBytes(phys * block_size, block_size, tmp);
             memcpy(tmp + blk_off, src, to_write);
             WriteBytes(phys * block_size, block_size, tmp);
@@ -410,14 +536,28 @@ int Ext4::WriteInodeData(Ext4Inode* inode, uint32_t ino,
         total += to_write;
     }
 
-    // update size if needed
+    // update size if needed (satoru)
     uint64_t new_size = offset;
     uint64_t old_size = inode->i_size_lo |
                         ((uint64_t)inode->i_size_high << 32);
     if (new_size > old_size) {
         inode->i_size_lo = (uint32_t)(new_size & 0xFFFFFFFF);
         inode->i_size_high = (uint32_t)(new_size >> 32);
-        // write inode back
+        dirty = true;
+    }
+
+    // account newly allocated sectors and stamp mtime (satoru)
+    if (sectors_added > 0) {
+        inode->i_blocks_lo += sectors_added;
+        dirty = true;
+    }
+    if (total > 0) {
+        inode->i_mtime = e4_now_secs();
+        dirty = true;
+    }
+
+    // write the inode back if anything changed (satoru)
+    if (dirty) {
         uint64_t blk;
         uint32_t off;
         if (GetInodeBlock(ino, &blk, &off) == 0) {
@@ -427,6 +567,10 @@ int Ext4::WriteInodeData(Ext4Inode* inode, uint32_t ino,
         }
     }
 
+    // if we couldn't write everything the caller asked for, surface an error
+    // unless we made partial progress (which we report as the byte count).
+    // (satoru)
+    if (total == 0 && len > 0) return -1;
     return (int)total;
 }
 
@@ -531,11 +675,86 @@ int Ext4::DirAddEntry(uint32_t dir_ino, uint32_t new_ino,
         pos += block_size;
     }
 
-    // need to allocate a new block for the directory
-    // simplified: not implemented for now
+    // no existing block has room  -  extend the directory with a new block whose
+    // single entry spans the whole block, then write our dirent there. (satoru)
+    bool use_extents = (dir.i_flags & EXT4_EXTENTS_FL) != 0;
+
+    // build the new directory block: one entry covering the entire block.
+    // reuse `buf` (block-sized) as the staging buffer. (satoru)
+    memset(buf, 0, block_size);
+    Ext4DirEntry2* nd = (Ext4DirEntry2*)buf;
+    nd->inode = new_ino;
+    nd->rec_len = (uint16_t)block_size;
+    nd->name_len = (uint8_t)name_len;
+    nd->file_type = file_type;
+    memcpy(nd->name, name, name_len);
+
+    if (!use_extents) {
+        // classic block-map directory: append the block via WriteInodeData,
+        // which allocates + links it into the block map, grows i_size, updates
+        // i_blocks/i_mtime, and persists the inode. (satoru)
+        int w = WriteInodeData(&dir, dir_ino, dir_size,
+                               block_size, buf);
+        KernelHeap::Free(buf);
+        if (w != (int)block_size) {
+            SerialLogger::Log("[ext4] DirAddEntry: block-map extend failed\r\n");
+            return -1;
+        }
+        return 0;
+    }
+
+    // extent directory: append a new single-block extent to the inline header
+    // (depth 0, free slot). this is the only extent growth we can do safely in
+    // this pass; anything deeper is refused rather than faked. (satoru)
+    Ext4ExtentHeader* eh = (Ext4ExtentHeader*)dir.i_block;
+    if (eh->eh_magic != 0xF30A || eh->eh_depth != 0 ||
+        eh->eh_entries >= eh->eh_max) {
+        KernelHeap::Free(buf);
+        SerialLogger::Log("[ext4] DirAddEntry: extent dir extend unsupported "
+                          "(depth>0 or header full)\r\n");
+        return -1;
+    }
+
+    uint64_t new_blk = 0;
+    uint32_t grp = (dir_ino - 1) / inodes_per_group;
+    if (AllocBlock(grp, &new_blk) != 0) {
+        KernelHeap::Free(buf);
+        return -1;
+    }
+
+    // write the prepared dirent block to the freshly allocated block (satoru)
+    if (WriteBlock(new_blk, buf) != 0) {
+        FreeBlock(new_blk);
+        KernelHeap::Free(buf);
+        return -1;
+    }
     KernelHeap::Free(buf);
-    SerialLogger::Log("[ext4] DirAddEntry: dir needs expansion (unsupported)\r\n");
-    return -1;
+
+    // append the extent entry. new logical block index = current dir size in
+    // blocks. (satoru)
+    Ext4Extent* exts = (Ext4Extent*)(eh + 1);
+    Ext4Extent* ne = &exts[eh->eh_entries];
+    ne->ee_block = (uint32_t)(dir_size / block_size);
+    ne->ee_len = 1;
+    ne->ee_start_lo = (uint32_t)(new_blk & 0xFFFFFFFF);
+    ne->ee_start_hi = (uint16_t)(new_blk >> 32);
+    eh->eh_entries++;
+
+    // grow size, account the block, stamp mtime, persist inode (satoru)
+    uint64_t nsz = dir_size + block_size;
+    dir.i_size_lo = (uint32_t)(nsz & 0xFFFFFFFF);
+    dir.i_size_high = (uint32_t)(nsz >> 32);
+    dir.i_blocks_lo += block_size / 512;
+    dir.i_mtime = e4_now_secs();
+
+    uint64_t iblk;
+    uint32_t ioff;
+    if (GetInodeBlock(dir_ino, &iblk, &ioff) == 0) {
+        WriteBytes(iblk * block_size + ioff,
+                   (inode_size < sizeof(Ext4Inode))
+                   ? inode_size : sizeof(Ext4Inode), &dir);
+    }
+    return 0;
 }
 
 int Ext4::DirRemoveEntry(uint32_t dir_ino, const char* name) {
@@ -1286,3 +1505,31 @@ uint32_t Ext4::BlockSize() { return mounted ? block_size : 0; }
 const char* Ext4::VolumeName() {
     return mounted ? sb.s_volume_name : "";
 }
+
+//  durability / flush
+//
+//  this driver is write-through: every mutation (inode, block + inode bitmaps,
+//  group descriptors, superblock) is pushed to the block layer via WriteBytes
+//  the moment it happens. so a sync only needs to drive a device-level cache
+//  flush to guarantee those writes have actually reached stable storage. these
+//  are free functions (not Ext4 members) so the public header doesn't change;
+//  callers forward-declare and invoke them. (satoru)
+
+// flush the whole device write cache (general sync). returns 0 on success,
+// -1 if nothing is mounted, -2 if the device flush command failed. (satoru)
+int Ext4Sync() {
+    if (!Ext4::IsMounted()) return -1;
+    return NVMe::Flush() ? 0 : -2;
+}
+
+// force durability for a single file's data + metadata. since all writes are
+// already write-through to the block layer, this is a device-cache barrier.
+// the inode number is accepted for api symmetry/logging. returns 0 on success,
+// -1 if not mounted, -2 if the device flush failed. (satoru)
+int Ext4Fsync(uint32_t inode_num) {
+    (void)inode_num;
+    if (!Ext4::IsMounted()) return -1;
+    return NVMe::Flush() ? 0 : -2;
+}
+
+// end (satoru)

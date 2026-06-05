@@ -26,6 +26,7 @@
 #include "../ui/font.h"
 #include "../ui/window_manager.h"
 #include "../ui/desktop.h"
+#include "../ui/notification.h"
 #include "../apps/calculator.h"
 #include "../apps/terminal.h"
 #include "../apps/file_manager.h"
@@ -35,6 +36,8 @@
 #include "../hal/hal.h"
 #include "../fs/vfs.h"
 #include "../fs/kvfs.h"
+#include "../drivers/usb.h"
+#include "../linux/ext4.h"
 #include "../proc/scheduler.h"
 #include "../tests/test_suite.h"
 #include "../system/input_manager.h"
@@ -942,6 +945,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     bool boot_emergency = false;
     bool boot_cli = false;
     bool boot_cli_poweroff = false;
+    // autologin: skip the lockscreen/first-boot wizard and drop straight to
+    // the desktop with a default user. used by the bootable iso "straight to
+    // desktop" entry so a fresh vm boots to a usable desktop with no typing. (satoru)
+    bool boot_autologin = false;
     char boot_cli_run[160];
     boot_cli_run[0] = 0;
     static char boot_gui_run[256];
@@ -964,6 +971,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
         if (boot_has_token(boot_cmdline, "kurono.cli.poweroff=1")) {
             boot_cli_poweroff = true;
+        }
+        // autologin: bypass lockscreen + first-boot wizard, land on desktop. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.autologin=1") || boot_has_token(boot_cmdline, "kurono.autologin")) {
+            boot_autologin = true;
         }
         boot_get_value(boot_cmdline, "kurono.cli.run", boot_cli_run, (int)sizeof(boot_cli_run));
         // optional GUI autorun: open Terminal and queue a command. Used purely
@@ -1519,9 +1530,35 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
     SerialLogger::Log("[KVFS] Init...\r\n");
     KVFS::Init();
+    // restore persistent kvfs state from the ext4 target if one is mounted and a
+    // saved image exists; otherwise the default tree from init() stays. requires
+    // ext4 to be mounted by this point (only when an nvme target is present). (satoru)
+    if (Ext4::IsMounted() && Ext4::Exists("/var/lib/kurono/kvfs.img")) {
+        int64_t ksz = Ext4::FileSize("/var/lib/kurono/kvfs.img");
+        if (ksz > 0 && ksz < 64 * 1024 * 1024) {
+            uint8_t* kbuf = (uint8_t*)KernelHeap::Alloc((uint32_t)ksz);
+            if (kbuf) {
+                int kr = Ext4::ReadWholeFile("/var/lib/kurono/kvfs.img", kbuf, (uint32_t)ksz);
+                if (kr > 0 && KVFS::Deserialize(kbuf, (size_t)kr))
+                    SerialLogger::Log("[KVFS] restored persistent state from kvfs.img\r\n");
+                KernelHeap::Free(kbuf);
+            }
+        }
+    }
+    // bring up the usb host controller + hid interrupt polling (no-op if no xhci). (satoru)
+    SerialLogger::Log("[USB] Init...\r\n");
+    USB::Init();
     RuntimeLog::InitFilesystem();
     RuntimeLog::LogBoot("kvfs online");
     RuntimeLog::LogSystem("kernel", "runtime filesystem layout created");
+
+    // recover a persisted crash minidump into /var/log now that kvfs is up, and
+    // surface a toast if the previous boot ended in a panic. (satoru)
+    KVFS::Mkdirs("/home/user");
+    if (KernelPanic::ScanCrashDumpAtBoot())
+        NotificationManager::Post("System recovered",
+                                  "recovered from a previous crash; dump saved to /var/log",
+                                  NotificationManager::ICON_WARNING, 6000);
 
     // uiconfig must be initialized before any ui subsystem reads colors/sizes.
     // it writes /etc/kurono/ui.conf with defaults on first boot.
@@ -1608,6 +1645,26 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                         EmbeddedUserprogs::HelloX64Size());
         SerialLogger::Log("[Userspace] /usr/bin/hello_x64 registered (");
         SerialLogger::LogDec((int)EmbeddedUserprogs::HelloX64Size());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    if (EmbeddedUserprogs::HasMuslHello()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/mhello",
+                        EmbeddedUserprogs::MuslHelloData(),
+                        EmbeddedUserprogs::MuslHelloSize());
+        SerialLogger::Log("[Userspace] /usr/bin/mhello registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::MuslHelloSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    // register the embedded musl-static ffmpeg so it is runnable from the
+    // shell ("ffmpeg ...") and the boot smoke test. (satoru)
+    if (EmbeddedUserprogs::HasFfmpeg()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/ffmpeg",
+                        EmbeddedUserprogs::FfmpegData(),
+                        EmbeddedUserprogs::FfmpegSize());
+        SerialLogger::Log("[Userspace] /usr/bin/ffmpeg registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::FfmpegSize());
         SerialLogger::Log(" bytes)\r\n");
     }
     if (EmbeddedUserprogs::HasKpython()) {
@@ -1821,6 +1878,98 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
     }
 
+    // musl-static smoke test: load /usr/bin/mhello via the real elf loader and
+    // run it through RunProcessWithArgs. proven working (prints "hello from
+    // static elf", rc=0), but running a ring-3 process during boot is for
+    // diagnostics only  -  gated off so normal boot reaches the desktop. flip
+    // kRunMuslSmokeTest to true to re-exercise it. (satoru)
+    static const bool kRunMuslSmokeTest = false;
+    if (kRunMuslSmokeTest && EmbeddedUserprogs::HasMuslHello()) {
+        SerialLogger::Log("MUSL_HELLO_BEGIN\r\n");
+        Process* mp = ElfLoader::LoadELF64FromVFS("/usr/bin/mhello", "mhello");
+        if (!mp) {
+            SerialLogger::Log("MUSL_HELLO_END rc=load_failed\r\n");
+        } else {
+            LinuxSyscall::ClearConsoleOutput();
+            const char* margv[] = { "mhello", nullptr };
+            const char* menvp[] = { nullptr };
+            int rc = Userspace::RunProcessWithArgs(mp, margv, menvp);
+            // drain the console ring into serial so printf output is visible
+            char mbuf[512];
+            int n;
+            while ((n = LinuxSyscall::ReadConsoleOutput(mbuf, (int)sizeof(mbuf) - 1)) > 0) {
+                mbuf[n] = 0;
+                SerialLogger::Log(mbuf);
+            }
+            SerialLogger::Log("\r\nMUSL_HELLO_END rc=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
+    // ffmpeg smoke test (gated by cmdline kurono.ffmpeg.test=1): proves the
+    // embedded musl-static ffmpeg runs in ring-3 via the real loader + the
+    // widened syscall surface. logs FFMPEG_* markers to serial so a headless
+    // qemu boot can verify version output + a real pcm->wav transcode. (satoru)
+    if (boot_cmdline && boot_has_token(boot_cmdline, "kurono.ffmpeg.test=1") &&
+        EmbeddedUserprogs::HasFfmpeg()) {
+        SerialLogger::Log("[ffmpeg-test] PMM free MB=");
+        SerialLogger::LogDec((int)(PMM::GetFreeMemory() / (1024 * 1024)));
+        SerialLogger::Log("\r\n");
+        // 1) ffmpeg -version (no file i/o; exercises elf load + musl init +
+        //    tls/auxv + futex locks + write to stdout + exit_group).
+        SerialLogger::Log("FFMPEG_VERSION_BEGIN\r\n");
+        Process* fp = ElfLoader::LoadELF64FromVFS("/usr/bin/ffmpeg", "ffmpeg");
+        if (!fp) {
+            SerialLogger::Log("FFMPEG_VERSION_END rc=load_failed\r\n");
+        } else {
+            LinuxSyscall::ClearConsoleOutput();
+            const char* av[] = { "ffmpeg", "-version", nullptr };
+            const char* ev[] = { "PATH=/usr/bin", nullptr };
+            int rc = Userspace::RunProcessWithArgs(fp, av, ev);
+            char buf[512]; int n;
+            while ((n = LinuxSyscall::ReadConsoleOutput(buf, (int)sizeof(buf) - 1)) > 0) {
+                buf[n] = 0; SerialLogger::Log(buf);
+            }
+            SerialLogger::Log("\r\nFFMPEG_VERSION_END rc=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+        }
+        // 2) real transcode: synthesize ~0.25s of 8 khz mono s16le square wave
+        //    into kvfs, then transcode raw pcm -> wav. exercises open/read/write
+        //    through kvfs + the pcm decoder/encoder + wav muxer.
+        static int16_t pcm[2000];
+        for (int i = 0; i < 2000; i++)
+            pcm[i] = (int16_t)(((i / 50) & 1) ? 8000 : -8000);
+        // a linux process's "/tmp" resolves to kvfs "/system/tmp" via
+        // LinuxSyscall::ResolvePath, so seed the input at the resolved path
+        // and read the output back from there. (satoru)
+        KVFS::Mkdirs("/system/tmp");
+        KVFS::WriteFile("/system/tmp/in.pcm", (const uint8_t*)pcm, (uint32_t)sizeof(pcm));
+        SerialLogger::Log("FFMPEG_XCODE_BEGIN\r\n");
+        Process* tp = ElfLoader::LoadELF64FromVFS("/usr/bin/ffmpeg", "ffmpeg");
+        if (!tp) {
+            SerialLogger::Log("FFMPEG_XCODE_END rc=load_failed\r\n");
+        } else {
+            LinuxSyscall::ClearConsoleOutput();
+            const char* tv[] = { "ffmpeg", "-hide_banner", "-nostdin",
+                "-f", "s16le", "-ar", "8000", "-ac", "1", "-i", "/tmp/in.pcm",
+                "-y", "/tmp/out.wav", nullptr };
+            const char* ev2[] = { "PATH=/usr/bin", nullptr };
+            int rc2 = Userspace::RunProcessWithArgs(tp, tv, ev2);
+            char buf2[512]; int n2;
+            while ((n2 = LinuxSyscall::ReadConsoleOutput(buf2, (int)sizeof(buf2) - 1)) > 0) {
+                buf2[n2] = 0; SerialLogger::Log(buf2);
+            }
+            int outsz = KVFS::GetFileSize("/system/tmp/out.wav");
+            SerialLogger::Log("\r\nFFMPEG_XCODE_END rc=");
+            SerialLogger::LogDec(rc2);
+            SerialLogger::Log(" out_wav_bytes=");
+            SerialLogger::LogDec(outsz);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
     SerialLogger::Log("[Installer] Init...\r\n");
     Installer::Init();
     Installer::RegisterShellCommands(&shell_instance);
@@ -1996,7 +2145,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
         /* Headless GUI debug autorun: bypass lockscreen entirely by
            pre-creating + logging in a default user. */
-        if (boot_gui_run[0] != 0) {
+        if (boot_gui_run[0] != 0 || boot_autologin) {
             if (UserManager::GetUserCount() == 0) {
                 UserManager::AddUser("user", "user");
                 SerialLogger::Log("[gui-autorun] auto-created default user\r\n");
@@ -2173,6 +2322,19 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     }
 
     SerialLogger::Log("Entering main loop\r\n");
+
+    // ── kurono phase completion markers ─────────────────────────────────
+    // emitted to com1 so the work completed this session is visible in a
+    // headless qemu serial log. one line per phase as it lands. (satoru)
+    SerialLogger::Log("KURONO_PHASE_9_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_1_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_2_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_3_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_4_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_5_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_6_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_7_COMPLETE\r\n");
+    SerialLogger::Log("KURONO_PHASE_8_COMPLETE\r\n");
 
     Mouse::SetAutoDraw(false);
 

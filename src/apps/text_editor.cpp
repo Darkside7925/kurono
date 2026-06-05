@@ -5,6 +5,7 @@
 #include "../drivers/graphics.h"
 #include "../drivers/timer.h"
 #include "../system/logging.h"
+#include "../system/clipboard.h"
 
 static const unsigned int ED_BG        = 0xFF0A0A18;
 static const unsigned int ED_GUTTER    = 0xFF12122A;
@@ -259,6 +260,69 @@ void TextEditorApp::DeleteLine(int row){
     if(line_count==0){
         line_count=1;
         lines[0].text[0]=0; lines[0].len=0;
+    }
+}
+
+//  clipboard
+// build the active selection (or the current line) into clip and copy it to the
+// shared clipboard. multi-row selections join lines with '\n'. (satoru)
+void TextEditorApp::CopySelection(){
+    char clip[ED_LINE_MAX*4+4];
+    int n=0;
+    if(has_selection){
+        // normalize so (sr,sc) precedes (er,ec). (satoru)
+        int sr=sel_start_row, sc=sel_start_col, er=sel_end_row, ec=sel_end_col;
+        if(sr>er || (sr==er && sc>ec)){ int t; t=sr;sr=er;er=t; t=sc;sc=ec;ec=t; }
+        if(sr<0){ sr=0; }
+        if(er>=line_count){ er=line_count-1; }
+        for(int r=sr;r<=er && r<line_count;r++){
+            const EditorLine* ln=&lines[r];
+            int c0=(r==sr)?sc:0;
+            int c1=(r==er)?ec:ln->len;
+            if(c0<0){ c0=0; }
+            if(c1>ln->len){ c1=ln->len; }
+            for(int c=c0;c<c1 && n<(int)sizeof(clip)-1;c++) clip[n++]=ln->text[c];
+            if(r<er && n<(int)sizeof(clip)-1) clip[n++]='\n';
+        }
+    } else if(cursor_row>=0 && cursor_row<line_count){
+        const EditorLine* ln=&lines[cursor_row];
+        for(int c=0;c<ln->len && n<(int)sizeof(clip)-1;c++) clip[n++]=ln->text[c];
+    }
+    clip[n]=0;
+    ClipboardManager::SetText(clip);
+}
+
+// copy then remove: a selection is deleted via repeated backspace at its end; a
+// bare cursor cuts the whole current line. (satoru)
+void TextEditorApp::CutSelection(){
+    CopySelection();
+    if(has_selection){
+        int sr=sel_start_row, sc=sel_start_col, er=sel_end_row, ec=sel_end_col;
+        if(sr>er || (sr==er && sc>ec)){ int t; t=sr;sr=er;er=t; t=sc;sc=ec;ec=t; }
+        // place the cursor at the selection end, then backspace back to its start.
+        cursor_row=er; cursor_col=ec;
+        if(cursor_row>=line_count){ cursor_row=line_count-1; cursor_col=lines[cursor_row].len; }
+        while(cursor_row>sr || (cursor_row==sr && cursor_col>sc)) Backspace();
+        has_selection=false;
+        modified=true;
+    } else if(cursor_row>=0 && cursor_row<line_count){
+        DeleteLine(cursor_row);
+        if(cursor_row>=line_count) cursor_row=line_count-1;
+        cursor_col=0;
+        modified=true;
+    }
+}
+
+// insert clipboard text at the cursor; '\n' splits lines via insertnewline. (satoru)
+void TextEditorApp::PasteClipboard(){
+    if(!ClipboardManager::HasText()) return;
+    const char* s=ClipboardManager::GetText();
+    for(int i=0;s[i];i++){
+        char c=s[i];
+        if(c=='\r') continue;
+        if(c=='\n') InsertNewline();
+        else if(c=='\t'){ for(int k=0;k<4;k++) InsertChar(' '); }
+        else if(c>=32 && c<127) InsertChar(c);
     }
 }
 
@@ -561,6 +625,15 @@ bool TextEditorApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
 
     // ctrl+s  -  save
     if(key==19){ SaveFile(); return true; }
+
+    // ctrl+c  -  copy selection (or current line) to the clipboard. (satoru)
+    if(key==3){ CopySelection(); return true; }
+
+    // ctrl+x  -  cut selection (or current line) to the clipboard. (satoru)
+    if(key==24){ CutSelection(); return true; }
+
+    // ctrl+v  -  paste clipboard text at the cursor. (satoru)
+    if(key==22){ PasteClipboard(); return true; }
 
     // ctrl+l  -  toggle line numbers
     if(key==12){ show_line_numbers=!show_line_numbers; return true; }

@@ -5,7 +5,11 @@
 #include "../system/ui_config.h"
 #include "../ui/desktop.h"
 #include "../fs/kvfs.h"
+#include "../linux/ext4.h"
+#include "../kernel/heap.h"
 #include "../kernel/userspace.h"
+#include "../kernel/elf_loader.h"
+#include "../linux/linux_syscall.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
 #include "../drivers/gpu_probe.h"
@@ -14,6 +18,9 @@
 #include "../drivers/intel_gpu.h"
 #include "../drivers/display_mgr.h"
 #include "../hal/hal.h"
+#include "../hal/cpufreq.h"
+#include "../system/screenshot.h"
+#include "../ui/notification.h"
 #include "../kernel/time.h"
 #include "../drivers/timer.h"
 // Note: PumpUI must advance TimeManager so wallclock-based loops
@@ -897,12 +904,18 @@ namespace ShellBuiltins {
     int cmd_crash(KuronoShell*, int, const char**, char*, int);
     int cmd_gpu(KuronoShell*, int, const char**, char*, int);
     int cmd_kurono(KuronoShell*, int, const char**, char*, int);
+    int cmd_screenshot(KuronoShell*, int, const char**, char*, int);
+    int cmd_cpufreq(KuronoShell*, int, const char**, char*, int);
+    int cmd_poweroff(KuronoShell*, int, const char**, char*, int);
+    int cmd_suspend(KuronoShell*, int, const char**, char*, int);
+    int cmd_ffmpeg(KuronoShell*, int, const char**, char*, int);
 }
 
 void KuronoShell::RegisterBuiltins() {
     using namespace ShellBuiltins;
     RegisterCommand("help",     "Show available commands",     ENV_KURONO, "builtin", cmd_help);
     RegisterCommand("denji",    "Open Denji video player",     ENV_KURONO, "media",   cmd_denji);
+    RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
     RegisterCommand("version",  "Show OS version",             ENV_KURONO, "builtin", cmd_version);
     RegisterCommand("env",      "Show current environment",    ENV_KURONO, "builtin", cmd_env);
@@ -941,13 +954,19 @@ void KuronoShell::RegisterBuiltins() {
 
     // alpine vm bridge commands  -  embed alpine into shell
     RegisterCommand("alpine",   "Run command in Alpine VM",     ENV_KURONO, "system",  cmd_alpine);
-    RegisterCommand("ffmpeg",   "Video encode/decode (Alpine)", ENV_KURONO, "system",  cmd_ffmpeg);
+    // ffmpeg registered above as the real embedded musl-static transcoder (satoru)
     RegisterCommand("ffprobe",  "Media info (Alpine ffprobe)",  ENV_KURONO, "system",  cmd_ffprobe);
     RegisterCommand("apk",      "Alpine package manager",       ENV_KURONO, "package", cmd_apk);
     RegisterCommand("codecs",   "List registered codecs",       ENV_KURONO, "system",  cmd_codecs);
 
     // kurono system command  -  reload config, show info
     RegisterCommand("kurono",  "Kurono system control",        ENV_KURONO, "system",  cmd_kurono);
+
+    // phase 8: screenshots, cpu frequency, power management. (satoru)
+    RegisterCommand("screenshot","Capture screen to a BMP",      ENV_KURONO, "system",  cmd_screenshot);
+    RegisterCommand("cpufreq",  "Show per-core CPU frequency",   ENV_KURONO, "system",  cmd_cpufreq);
+    RegisterCommand("poweroff", "Power off the machine",         ENV_KURONO, "system",  cmd_poweroff);
+    RegisterCommand("suspend",  "Suspend to RAM (ACPI S3)",      ENV_KURONO, "system",  cmd_suspend);
 }
 
 //  built-in commands
@@ -1404,18 +1423,119 @@ int cmd_gpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     return p;
 }
 
+// serialize the in-memory kvfs tree to the persistent ext4 image so the desktop
+// filesystem survives a reboot/shutdown. no-op if no ext4 target is mounted. (satoru)
+static void persist_kvfs_to_ext4() {
+    if (!Ext4::IsMounted()) return;
+    const size_t cap = 8 * 1024 * 1024;  // generous bound for the kvfs tree (satoru)
+    uint8_t* buf = (uint8_t*)KernelHeap::Alloc(cap);
+    if (!buf) return;
+    size_t n = KVFS::Serialize(buf, cap);
+    if (n > 0) {
+        Ext4::Mkdir("/var", 0755);
+        Ext4::Mkdir("/var/lib", 0755);
+        Ext4::Mkdir("/var/lib/kurono", 0755);
+        Ext4::WriteFile("/var/lib/kurono/kvfs.img", buf, (uint32_t)n);
+    }
+    KernelHeap::Free(buf);
+}
+
 int cmd_reboot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Rebooting...\n");
+    persist_kvfs_to_ext4();   // save desktop fs before reboot (satoru)
     HAL::Reboot();
     return p;
 }
 
 int cmd_shutdown(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
-    int p = sappend(out, 0, maxo, "System halted.\n");
-    HAL::DisableInterrupts();
-    HAL::Halt();
+    int p = sappend(out, 0, maxo, "Shutting down...\n");
+    persist_kvfs_to_ext4();   // save desktop fs before power-off (satoru)
+    HAL::PowerOff();          // acpi/emulator soft power-off; does not return (satoru)
+    return p;
+}
+
+// capture the framebuffer to a bmp; explicit path or auto-timestamped. (satoru)
+int cmd_screenshot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh;
+    int p = 0;
+    if (argc > 1) {
+        if (Screenshot::CaptureToBMP(argv[1])) {
+            p = sappend(out, p, maxo, "screenshot saved to ");
+            p = sappend(out, p, maxo, argv[1]);
+            p = sappend(out, p, maxo, "\n");
+            NotificationManager::Post("Screenshot", argv[1],
+                                      NotificationManager::ICON_SUCCESS, 3000);
+        } else {
+            p = sappend(out, p, maxo, "screenshot failed (could not encode/write ");
+            p = sappend(out, p, maxo, argv[1]);
+            p = sappend(out, p, maxo, ")\n");
+        }
+    } else {
+        if (Screenshot::CaptureTimestamped()) {
+            p = sappend(out, p, maxo, "screenshot saved to /home/user\n");
+            NotificationManager::Post("Screenshot", "saved to /home/user",
+                                      NotificationManager::ICON_SUCCESS, 3000);
+        } else {
+            p = sappend(out, p, maxo, "screenshot failed\n");
+        }
+    }
+    return p;
+}
+
+// per-core current/base/turbo frequency + active governor. (satoru)
+int cmd_cpufreq(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    int p = 0;
+    int n = CPUFreq::CPUCount();
+    if (n <= 0) {
+        return sappend(out, p, maxo, "cpufreq: no cpus reported\n");
+    }
+    for (int i = 0; i < n; i++) {
+        const CPUFreq::CPUInfo* ci = CPUFreq::GetCPU((uint32_t)i);
+        if (!ci || !ci->present) continue;
+        p = sappend(out, p, maxo, "cpu");
+        p = sappend_int(out, p, maxo, i);
+        p = sappend(out, p, maxo, ": cur ");
+        p = sappend_int(out, p, maxo, (int)ci->cur_mhz);
+        p = sappend(out, p, maxo, " MHz  base ");
+        p = sappend_int(out, p, maxo, (int)ci->base_mhz);
+        p = sappend(out, p, maxo, " MHz  turbo ");
+        p = sappend_int(out, p, maxo, (int)ci->turbo_mhz);
+        p = sappend(out, p, maxo, " MHz  gov ");
+        const char* gov = "unknown";
+        switch (ci->governor) {
+            case CPUFreq::GOV_PERFORMANCE: gov = "performance"; break;
+            case CPUFreq::GOV_POWERSAVE:   gov = "powersave";   break;
+            case CPUFreq::GOV_ONDEMAND:    gov = "ondemand";    break;
+            case CPUFreq::GOV_SCHEDUTIL:   gov = "schedutil";   break;
+            case CPUFreq::GOV_USERSPACE:   gov = "userspace";   break;
+        }
+        p = sappend(out, p, maxo, gov);
+        p = sappend(out, p, maxo, "\n");
+    }
+    return p;
+}
+
+// soft power-off after persisting the desktop fs. does not return. (satoru)
+int cmd_poweroff(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    int p = sappend(out, 0, maxo, "Powering off...\n");
+    persist_kvfs_to_ext4();
+    HAL::PowerOff();
+    return p;
+}
+
+// acpi s3 suspend-to-ram; reports if the platform cannot enter s3. (satoru)
+int cmd_suspend(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    int p = 0;
+    if (!HAL::Suspend()) {
+        p = sappend(out, p, maxo, "suspend unsupported (acpi s3 unavailable)\n");
+    } else {
+        p = sappend(out, p, maxo, "resumed from suspend\n");
+    }
     return p;
 }
 
@@ -1570,6 +1690,45 @@ int cmd_usermode(KuronoShell* sh, int argc, const char** argv, char* out, int ma
     return p;
 }
 
+// run the embedded static ffmpeg as a real ring-3 linux process and capture
+// its stdout/stderr back into the terminal. e.g. "ffmpeg -version" or
+// "ffmpeg -i /tmp/in.wav /tmp/out.wav". paths like /tmp resolve into kvfs
+// via LinuxSyscall::ResolvePath. single-threaded (the binary is built so;
+// pass -threads 1 if a filter ever tries to spawn workers). (satoru)
+int cmd_ffmpeg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/usr/bin/ffmpeg")) {
+        return sappend(out, 0, mx, "ffmpeg: /usr/bin/ffmpeg not present in this build\n");
+    }
+    Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/ffmpeg", "ffmpeg");
+    if (!proc) {
+        return sappend(out, 0, mx, "ffmpeg: failed to load binary (out of memory?)\n");
+    }
+    // build a null-terminated argv copy (the shell's argv is not guaranteed
+    // null-terminated, and build_initial_stack scans for the null). (satoru)
+    const char* av[40];
+    int n = 0;
+    for (int i = 0; i < argc && n < 39; i++) av[n++] = argv[i];
+    av[n] = nullptr;
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", "TMPDIR=/tmp", nullptr };
+
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    if (p == 0) {
+        p = sappend(out, 0, mx, "ffmpeg: exited (code ");
+        p = sappend_int(out, p, mx, rc);
+        p = sappend(out, p, mx, ")\n");
+    }
+    // free the process (stack + address space). DestroyProcess has a
+    // double-free guard so this is safe on an already-exited task. (satoru)
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
 int cmd_pwd(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)argc; (void)argv;
     const char* cwd = sh->GetVar("PWD");
@@ -1713,30 +1872,8 @@ int cmd_alpine(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
 }
 
 //  ffmpeg  -  video encode/decode via alpine's ffmpeg
-int cmd_ffmpeg(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
-    (void)sh;
-    if (argc < 2) {
-        int p = 0;
-        p = sappend(out, p, maxo, "\033[33m[ffmpeg]\033[0m Video encode/decode via Alpine VM\n");
-        p = sappend(out, p, maxo, "  Usage: ffmpeg <args...>\n");
-        p = sappend(out, p, maxo, "  Examples:\n");
-        p = sappend(out, p, maxo, "    ffmpeg -version\n");
-        p = sappend(out, p, maxo, "    ffmpeg -codecs\n");
-        p = sappend(out, p, maxo, "    ffmpeg -i input.mp4 -c:v libx265 output.mp4\n");
-        p = sappend(out, p, maxo, "    ffmpeg -formats\n");
-        return p;
-    }
-
-    // build: ffmpeg <all args>
-    char cmd_buf[512];
-    scpy(cmd_buf, "ffmpeg", 512);
-    for (int i = 1; i < argc; i++) {
-        scat(cmd_buf, " ", 512);
-        scat(cmd_buf, argv[i], 512);
-    }
-
-    return KuronoShell::RunViaAlpine(cmd_buf, out, maxo);
-}
+// (legacy alpine-vm ffmpeg stub removed  -  replaced by the real embedded
+//  musl-static ffmpeg in cmd_ffmpeg above. (satoru))
 
 //  ffprobe  -  media file info via alpine's ffprobe
 int cmd_ffprobe(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {

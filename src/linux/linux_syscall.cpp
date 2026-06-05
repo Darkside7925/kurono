@@ -33,7 +33,12 @@ namespace {
 constexpr uint64_t EXEC_STACK_BYTES = 16 * 1024;
 constexpr int EXEC_MAX_ARGC = 16;
 constexpr uint64_t USER_MMAP_BASE = 0x20000000ULL;
-constexpr uint64_t USER_MMAP_LIMIT = USERSPACE_BASE - 0x01000000ULL;
+// the mmap arena still grows up from USER_MMAP_BASE, but the ceiling is
+// the canonical user-space top rather than the old sub-4gb cap. a pie
+// binary placed above 4gb by ld-kurono can now request (or be handed)
+// high mmap regions, and anonymous maps may run past 4gb  -  their
+// pointers round-trip through the now-64-bit syscall abi intact (satoru)
+constexpr uint64_t USER_MMAP_LIMIT = USER_SPACE_TOP;
 
 constexpr uint32_t PFERR_PRESENT = 1U << 0;
 constexpr uint32_t PFERR_WRITE   = 1U << 1;
@@ -220,7 +225,7 @@ static void unmap_user_range(Process* proc, uint64_t start, uint64_t end) {
     }
 }
 
-static bool ensure_heap_region(LinuxProcess* proc, Process* task, uint32_t new_break) {
+static bool ensure_heap_region(LinuxProcess* proc, Process* task, uint64_t new_break) {
     if (!proc || !task) return false;
 
     uint64_t region_start = align_up_u64(proc->brk_base, PAGE_SIZE);
@@ -584,14 +589,19 @@ static void LinuxInt80Entry(InterruptFrame* frame) {
     HAL::EnableInterrupts();
     KuronoShell::PumpUI();
 
-    uint32_t syscall_number = (uint32_t)frame->rax;
-    int32_t result = LinuxSyscall::Dispatch(
+    // the syscall number is small, but the arg registers carry full
+    // 64-bit user pointers/addresses  -  pass them through untruncated so a
+    // pie binary mapped above 4gb reaches the handlers with intact
+    // pointers, and keep the result 64-bit so a >4gb mmap return is not
+    // truncated before it lands in rax (satoru)
+    uint64_t syscall_number = frame->rax;
+    int64_t result = LinuxSyscall::Dispatch(
         syscall_number,
-        (uint32_t)frame->rbx,
-        (uint32_t)frame->rcx,
-        (uint32_t)frame->rdx,
-        (uint32_t)frame->rsi,
-        (uint32_t)frame->rdi
+        frame->rbx,
+        frame->rcx,
+        frame->rdx,
+        frame->rsi,
+        frame->rdi
     );
 
     if (!current_frame_rewritten) {
@@ -917,8 +927,8 @@ void LinuxSyscall::ResolvePath(const char* linux_path, char* kurono_path,
 
 //  syscall dispatcher
 
-int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
-                                uint32_t edx, uint32_t esi, uint32_t edi) {
+int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
+                                uint64_t edx, uint64_t esi, uint64_t edi) {
     (void)esi; (void)edi;
 
     KuronoShell::PumpUI();
@@ -1107,9 +1117,9 @@ int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
         case LSYS_PREAD64: {
             // pread64(fd, buf, count, offset)  -  emulate by lseek+read
             int fd = (int)ebx;
-            uint32_t buf = ecx;
-            uint32_t cnt = edx;
-            uint32_t off = esi;
+            uintptr_t buf = (uintptr_t)ecx;  // 64-bit user buffer (satoru)
+            uint64_t cnt = edx;
+            uint32_t off = (uint32_t)esi;
             uint32_t old = sys_lseek(fd, 0, 1);  // SEEK_CUR
             sys_lseek(fd, (int32_t)off, 0);      // SEEK_SET
             int32_t r = sys_read(fd, buf, cnt);
@@ -1118,9 +1128,9 @@ int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
         }
         case LSYS_PWRITE64: {
             int fd = (int)ebx;
-            uint32_t buf = ecx;
-            uint32_t cnt = edx;
-            uint32_t off = esi;
+            uintptr_t buf = (uintptr_t)ecx;  // 64-bit user buffer (satoru)
+            uint64_t cnt = edx;
+            uint32_t off = (uint32_t)esi;
             uint32_t old = sys_lseek(fd, 0, 1);
             sys_lseek(fd, (int32_t)off, 0);
             int32_t r = sys_write(fd, buf, cnt);
@@ -1297,19 +1307,20 @@ int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
         // sendfile/splice/tee  -  fall back to bounded read/write loop.
         case LSYS_SENDFILE: {
             int out_fd = (int)ebx; int in_fd = (int)ecx;
-            uint32_t off = edx; uint32_t cnt = esi;
+            uintptr_t off = (uintptr_t)edx; uint64_t cnt = esi;  // off is a 64-bit user ptr (satoru)
             if (off) {
-                uint32_t* off_p = (uint32_t*)(uintptr_t)edx;
+                uint32_t* off_p = (uint32_t*)off;
                 sys_lseek(in_fd, (int32_t)*off_p, 0);
             }
             char buf[512];
-            uint32_t total = 0;
+            uint64_t total = 0;
             while (total < cnt) {
                 KuronoShell::PumpUI();
-                uint32_t chunk = cnt - total > 512 ? 512 : cnt - total;
-                int r = sys_read(in_fd, (uint32_t)(uintptr_t)buf, chunk);
+                uint64_t chunk = cnt - total > 512 ? 512 : cnt - total;
+                // buf is a kernel stack address (64-bit under mcmodel=large) (satoru)
+                int r = sys_read(in_fd, (uintptr_t)buf, chunk);
                 if (r <= 0) break;
-                int w = sys_write(out_fd, (uint32_t)(uintptr_t)buf, (uint32_t)r);
+                int w = sys_write(out_fd, (uintptr_t)buf, (uint64_t)r);
                 if (w <= 0) break;
                 total += (uint32_t)w;
             }
@@ -1505,9 +1516,10 @@ int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
                 KuronoShell::PumpUI();
                 uint32_t chunk = len - copied;
                 if (chunk > sizeof(buf)) chunk = sizeof(buf);
-                int r = sys_read(fd_in, (uint32_t)(uintptr_t)buf, chunk);
+                // buf is a kernel stack address (64-bit under mcmodel=large) (satoru)
+                int r = sys_read(fd_in, (uintptr_t)buf, chunk);
                 if (r <= 0) break;
-                int w = sys_write(fd_out, (uint32_t)(uintptr_t)buf, (uint32_t)r);
+                int w = sys_write(fd_out, (uintptr_t)buf, (uint64_t)r);
                 if (w <= 0) break;
                 copied += (uint32_t)w;
                 if (offi) *offi += w;
@@ -1598,13 +1610,14 @@ int32_t LinuxSyscall::Dispatch(uint32_t eax, uint32_t ebx, uint32_t ecx,
             LinuxIovec* riov = (LinuxIovec*)(uintptr_t)esi;
             uint32_t rcnt    = edi;
             if (!liov || !riov || !lcnt || !rcnt) return -14;
-            uint32_t total = 0;
+            // byte offsets/counts are 64-bit to match the widened iovec (satoru)
+            uint64_t total = 0;
             uint32_t li = 0, ri = 0;
-            uint32_t lo = 0, ro = 0;
+            uint64_t lo = 0, ro = 0;
             while (li < lcnt && ri < rcnt) {
-                uint32_t want = liov[li].iov_len - lo;
-                uint32_t have = riov[ri].iov_len - ro;
-                uint32_t n = want < have ? want : have;
+                uint64_t want = liov[li].iov_len - lo;
+                uint64_t have = riov[ri].iov_len - ro;
+                uint64_t n = want < have ? want : have;
                 if (eax == LSYS_PROCESS_VM_READV) {
                     memcpy((void*)(uintptr_t)(liov[li].iov_base + lo),
                            (void*)(uintptr_t)(riov[ri].iov_base + ro), n);
@@ -1869,7 +1882,7 @@ int32_t LinuxSyscall::sys_exit_group(uint32_t code) {
     return sys_exit(code);
 }
 
-int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uint32_t status, uint32_t options) {
+int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uintptr_t status, uint32_t options) {
     (void)options;
 
     LinuxProcess* parent = Current();
@@ -1918,7 +1931,7 @@ int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uint32_t status, uint32_t option
     return 0;
 }
 
-int32_t LinuxSyscall::sys_execve(uint32_t filename, uint32_t argv, uint32_t envp) {
+int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t envp) {
     (void)envp;
 
     LinuxProcess* proc = Current();
@@ -1964,7 +1977,10 @@ int32_t LinuxSyscall::sys_execve(uint32_t filename, uint32_t argv, uint32_t envp
     }
 
     uint64_t new_rsp = 0;
-    if (!build_exec_stack(stack_phys, stack_top, argv, &new_rsp)) {
+    // this is the i386 elf32 static exec path (is_valid_exec_elf requires
+    // EM_386/ELFCLASS32), so argv is a genuine sub-4gb pointer; the explicit
+    // narrow keeps the 32-bit stack builder unchanged (satoru)
+    if (!build_exec_stack(stack_phys, stack_top, (uint32_t)argv, &new_rsp)) {
         KernelVMM::DestroyAddressSpace(new_address_space);
         KernelHeap::Free(image);
         return -12;
@@ -2018,17 +2034,17 @@ int32_t LinuxSyscall::sys_execve(uint32_t filename, uint32_t argv, uint32_t envp
     return 0;
 }
 
-int32_t LinuxSyscall::sys_read(int fd, uint32_t buf, uint32_t count) {
+int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9; // ebadf
 
     LinuxFd* lfd = &p->fds[fd];
-    uint8_t* dst = (uint8_t*)(uintptr_t)buf;
+    uint8_t* dst = (uint8_t*)buf;
 
     switch (lfd->type) {
         case LFD_CONSOLE: {
             // stdin  -  read from injection buffer (non-blocking)
-            uint32_t read = 0;
+            uint64_t read = 0;
             while (read < count && stdin_head != stdin_tail) {
                 dst[read++] = (uint8_t)stdin_buf[stdin_tail];
                 stdin_tail = (stdin_tail + 1) % STDIN_BUF_SIZE;
@@ -2037,13 +2053,13 @@ int32_t LinuxSyscall::sys_read(int fd, uint32_t buf, uint32_t count) {
         }
 
         case LFD_KVFS: {
-            int r = KVFS::Read(lfd->backend_fd, dst, count);
+            int r = KVFS::Read(lfd->backend_fd, dst, (uint32_t)count);
             if (r > 0) lfd->offset += r;
             return r;
         }
 
         case LFD_EXT4: {
-            int r = Ext4::Read(lfd->backend_fd, dst, count);
+            int r = Ext4::Read(lfd->backend_fd, dst, (uint32_t)count);
             if (r > 0) lfd->offset += r;
             return r;
         }
@@ -2134,7 +2150,7 @@ int32_t LinuxSyscall::sys_read(int fd, uint32_t buf, uint32_t count) {
                 //  /proc/loadavg, /proc/mounts, /proc/net/dev). Re-open lazily.
                 int kfd = KVFS::Open(lfd->path, 1);
                 if (kfd >= 0) {
-                    int r = KVFS::Read(kfd, dst, count);
+                    int r = KVFS::Read(kfd, dst, (uint32_t)count);
                     KVFS::Close(kfd);
                     return r > 0 ? r : 0;
                 }
@@ -2155,17 +2171,17 @@ int32_t LinuxSyscall::sys_read(int fd, uint32_t buf, uint32_t count) {
     }
 }
 
-int32_t LinuxSyscall::sys_write(int fd, uint32_t buf, uint32_t count) {
+int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
 
     LinuxFd* lfd = &p->fds[fd];
-    const uint8_t* src = (const uint8_t*)(uintptr_t)buf;
+    const uint8_t* src = (const uint8_t*)buf;
 
     switch (lfd->type) {
         case LFD_CONSOLE: {
             // stdout/stderr → capture to console ring buffer + serial
-            for (uint32_t i = 0; i < count; i++) {
+            for (uint64_t i = 0; i < count; i++) {
                 char c = (char)src[i];
                 // write to capture buffer
                 int next = (console_head + 1) % CONSOLE_BUF_SIZE;
@@ -2181,13 +2197,13 @@ int32_t LinuxSyscall::sys_write(int fd, uint32_t buf, uint32_t count) {
         }
 
         case LFD_KVFS: {
-            int r = KVFS::Write(lfd->backend_fd, src, count);
+            int r = KVFS::Write(lfd->backend_fd, src, (uint32_t)count);
             if (r > 0) lfd->offset += r;
             return r;
         }
 
         case LFD_EXT4: {
-            int r = Ext4::Write(lfd->backend_fd, src, count);
+            int r = Ext4::Write(lfd->backend_fd, src, (uint32_t)count);
             if (r > 0) lfd->offset += r;
             return r;
         }
@@ -2200,22 +2216,23 @@ int32_t LinuxSyscall::sys_write(int fd, uint32_t buf, uint32_t count) {
     }
 }
 
-int32_t LinuxSyscall::sys_writev(int fd, uint32_t iov, uint32_t iovcnt) {
-    LinuxIovec* vecs = (LinuxIovec*)(uintptr_t)iov;
+int32_t LinuxSyscall::sys_writev(int fd, uintptr_t iov, uint64_t iovcnt) {
+    LinuxIovec* vecs = (LinuxIovec*)iov;
     int32_t total = 0;
-    for (uint32_t i = 0; i < iovcnt; i++) {
-        int32_t r = sys_write(fd, vecs[i].iov_base, vecs[i].iov_len);
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        // iov_base is a 64-bit user pointer, iov_len a 64-bit length (satoru)
+        int32_t r = sys_write(fd, (uintptr_t)vecs[i].iov_base, vecs[i].iov_len);
         if (r < 0) return r;
         total += r;
     }
     return total;
 }
 
-int32_t LinuxSyscall::sys_open(uint32_t pathname, uint32_t flags, uint32_t mode) {
+int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode) {
     LinuxProcess* p = Current();
     if (!p) return -9;
 
-    const char* path = (const char*)(uintptr_t)pathname;
+    const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
 
@@ -2314,22 +2331,24 @@ int32_t LinuxSyscall::sys_lseek(int fd, int32_t offset, uint32_t whence) {
     return -29;  // espipe
 }
 
-int32_t LinuxSyscall::sys_brk(uint32_t addr) {
+int64_t LinuxSyscall::sys_brk(uintptr_t addr) {
     LinuxProcess* p = Current();
     if (!p) return -1;
 
-    if (addr == 0) return (int32_t)p->brk_current;
-    if (addr > p->brk_max) return (int32_t)p->brk_current;
-    if (addr < p->brk_base) return (int32_t)p->brk_current;
+    // brk returns the (possibly >4gb) break address; validate against the
+    // 64-bit per-process brk window and return it without truncation (satoru)
+    if (addr == 0) return (int64_t)p->brk_current;
+    if (addr > p->brk_max) return (int64_t)p->brk_current;
+    if (addr < p->brk_base) return (int64_t)p->brk_current;
 
     if (p->task && p->task->is_user()) {
         if (!ensure_heap_region(p, p->task, addr)) {
-            return (int32_t)p->brk_current;
+            return (int64_t)p->brk_current;
         }
     }
 
     p->brk_current = addr;
-    return (int32_t)addr;
+    return (int64_t)addr;
 }
 
 int32_t LinuxSyscall::sys_getpid() {
@@ -2362,15 +2381,15 @@ int32_t LinuxSyscall::sys_getegid() {
     return p ? (int32_t)p->egid : 0;
 }
 
-int32_t LinuxSyscall::sys_stat(uint32_t pathname, uint32_t statbuf) {
+int32_t LinuxSyscall::sys_stat(uintptr_t pathname, uintptr_t statbuf) {
     LinuxProcess* p = Current();
     if (!p) return -1;
 
-    const char* path = (const char*)(uintptr_t)pathname;
+    const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
 
-    LinuxStat* st = (LinuxStat*)(uintptr_t)statbuf;
+    LinuxStat* st = (LinuxStat*)statbuf;
     memset(st, 0, sizeof(LinuxStat));
 
     // try kvfs
@@ -2410,12 +2429,12 @@ int32_t LinuxSyscall::sys_stat(uint32_t pathname, uint32_t statbuf) {
     return -2;  // enoent
 }
 
-int32_t LinuxSyscall::sys_fstat(int fd, uint32_t statbuf) {
+int32_t LinuxSyscall::sys_fstat(int fd, uintptr_t statbuf) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
 
     // use the path stored in the fd
-    LinuxStat* st = (LinuxStat*)(uintptr_t)statbuf;
+    LinuxStat* st = (LinuxStat*)statbuf;
     memset(st, 0, sizeof(LinuxStat));
 
     LinuxFd* lfd = &p->fds[fd];
@@ -2432,12 +2451,13 @@ int32_t LinuxSyscall::sys_fstat(int fd, uint32_t statbuf) {
         return 0;
     }
 
-    // delegate to stat with the stored path
-    return sys_stat((uint32_t)(uintptr_t)lfd->path, statbuf);
+    // delegate to stat with the stored path. lfd->path is a kernel
+    // address (64-bit under mcmodel=large) so pass the full pointer (satoru)
+    return sys_stat((uintptr_t)lfd->path, statbuf);
 }
 
-int32_t LinuxSyscall::sys_uname(uint32_t buf) {
-    LinuxUtsname* u = (LinuxUtsname*)(uintptr_t)buf;
+int32_t LinuxSyscall::sys_uname(uintptr_t buf) {
+    LinuxUtsname* u = (LinuxUtsname*)buf;
     memset(u, 0, sizeof(LinuxUtsname));
     ls_scpy(u->sysname, "Linux", sizeof(u->sysname));
     ls_scpy(u->nodename, "kurono", sizeof(u->nodename));
@@ -2448,18 +2468,20 @@ int32_t LinuxSyscall::sys_uname(uint32_t buf) {
     return 0;
 }
 
-int32_t LinuxSyscall::sys_getcwd(uint32_t buf, uint32_t size) {
+int64_t LinuxSyscall::sys_getcwd(uintptr_t buf, uint64_t size) {
     LinuxProcess* p = Current();
     if (!p) return -1;
-    char* dst = (char*)(uintptr_t)buf;
+    char* dst = (char*)buf;
     ls_scpy(dst, p->cwd, (int)size);
-    return (int32_t)(uintptr_t)dst;
+    // this impl returns the (possibly >4gb) user buffer pointer; widen the
+    // return so it is not truncated/sign-mangled back to userspace (satoru)
+    return (int64_t)(uintptr_t)dst;
 }
 
-int32_t LinuxSyscall::sys_chdir(uint32_t pathname) {
+int32_t LinuxSyscall::sys_chdir(uintptr_t pathname) {
     LinuxProcess* p = Current();
     if (!p) return -1;
-    const char* path = (const char*)(uintptr_t)pathname;
+    const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
 
@@ -2471,10 +2493,10 @@ int32_t LinuxSyscall::sys_chdir(uint32_t pathname) {
     return -20;  // enotdir
 }
 
-int32_t LinuxSyscall::sys_mkdir(uint32_t pathname, uint32_t mode) {
+int32_t LinuxSyscall::sys_mkdir(uintptr_t pathname, uint32_t mode) {
     LinuxProcess* p = Current();
     if (!p) return -1;
-    const char* path = (const char*)(uintptr_t)pathname;
+    const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
 
@@ -2488,10 +2510,10 @@ int32_t LinuxSyscall::sys_mkdir(uint32_t pathname, uint32_t mode) {
     return -1;
 }
 
-int32_t LinuxSyscall::sys_rmdir(uint32_t pathname) {
+int32_t LinuxSyscall::sys_rmdir(uintptr_t pathname) {
     LinuxProcess* p = Current();
     if (!p) return -1;
-    const char* path = (const char*)(uintptr_t)pathname;
+    const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
 
@@ -2500,10 +2522,10 @@ int32_t LinuxSyscall::sys_rmdir(uint32_t pathname) {
     return -2;
 }
 
-int32_t LinuxSyscall::sys_unlink(uint32_t pathname) {
+int32_t LinuxSyscall::sys_unlink(uintptr_t pathname) {
     LinuxProcess* p = Current();
     if (!p) return -1;
-    const char* path = (const char*)(uintptr_t)pathname;
+    const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
 
@@ -2512,11 +2534,11 @@ int32_t LinuxSyscall::sys_unlink(uint32_t pathname) {
     return -2;
 }
 
-int32_t LinuxSyscall::sys_access(uint32_t pathname, uint32_t mode) {
+int32_t LinuxSyscall::sys_access(uintptr_t pathname, uint32_t mode) {
     (void)mode;
     LinuxProcess* p = Current();
     if (!p) return -1;
-    const char* path = (const char*)(uintptr_t)pathname;
+    const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
 
@@ -2559,8 +2581,8 @@ int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint32_t arg) {
     return -25;    // enotty
 }
 
-int32_t LinuxSyscall::sys_mmap(uint32_t addr, uint32_t length, uint32_t prot,
-                                uint32_t flags, int fd, uint32_t offset) {
+int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
+                                uint32_t flags, int fd, uint64_t offset) {
     (void)flags; (void)offset;
 
     if (length == 0) return -22;
@@ -2571,7 +2593,9 @@ int32_t LinuxSyscall::sys_mmap(uint32_t addr, uint32_t length, uint32_t prot,
         void* mem = KernelHeap::Alloc(length);
         if (!mem) return -12;
         memset(mem, 0, length);
-        return (int32_t)(uintptr_t)mem;
+        // kernel-heap address is 64-bit under mcmodel=large  -  return it
+        // through the widened result so it is not truncated (satoru)
+        return (int64_t)(uintptr_t)mem;
     }
 
     if (fd >= 0) return -38;
@@ -2587,10 +2611,11 @@ int32_t LinuxSyscall::sys_mmap(uint32_t addr, uint32_t length, uint32_t prot,
     }
 
     task->next_mmap_base = base + size;
-    return (int32_t)base;
+    // base may sit above 4gb; return the full 64-bit address (satoru)
+    return (int64_t)base;
 }
 
-int32_t LinuxSyscall::sys_munmap(uint32_t addr, uint32_t length) {
+int32_t LinuxSyscall::sys_munmap(uintptr_t addr, uint64_t length) {
     if (length == 0) return 0;
 
     LinuxProcess* proc = Current();
@@ -2625,10 +2650,10 @@ int32_t LinuxSyscall::sys_munmap(uint32_t addr, uint32_t length) {
     return unmapped ? 0 : -22;
 }
 
-int32_t LinuxSyscall::sys_nanosleep(uint32_t req, uint32_t rem) {
+int32_t LinuxSyscall::sys_nanosleep(uintptr_t req, uintptr_t rem) {
     (void)rem;
     struct { uint32_t tv_sec; uint32_t tv_nsec; }* ts =
-        (decltype(ts))(uintptr_t)req;
+        (decltype(ts))req;
     if (ts) {
         uint32_t ms = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
         if (ms > 5000) ms = 5000;  // cap at 5 seconds
@@ -2643,12 +2668,12 @@ int32_t LinuxSyscall::sys_nanosleep(uint32_t req, uint32_t rem) {
     return 0;
 }
 
-int32_t LinuxSyscall::sys_getdents64(int fd, uint32_t dirp, uint32_t count) {
+int32_t LinuxSyscall::sys_getdents64(int fd, uintptr_t dirp, uint64_t count) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
 
     LinuxFd* lfd = &p->fds[fd];
-    uint8_t* buf = (uint8_t*)(uintptr_t)dirp;
+    uint8_t* buf = (uint8_t*)dirp;
     uint32_t pos = 0;
 
     if (lfd->type == LFD_KVFS) {
@@ -2695,17 +2720,17 @@ int32_t LinuxSyscall::sys_getdents64(int fd, uint32_t dirp, uint32_t count) {
     return (int32_t)pos;
 }
 
-int32_t LinuxSyscall::sys_clock_gettime(uint32_t clk_id, uint32_t tp) {
+int32_t LinuxSyscall::sys_clock_gettime(uint32_t clk_id, uintptr_t tp) {
     (void)clk_id;
     struct { uint32_t tv_sec; uint32_t tv_nsec; }* ts =
-        (decltype(ts))(uintptr_t)tp;
+        (decltype(ts))tp;
     uint32_t ticks = Time::GetTicks();
     ts->tv_sec = ticks / 1000;
     ts->tv_nsec = (ticks % 1000) * 1000000;
     return 0;
 }
 
-int32_t LinuxSyscall::sys_set_thread_area(uint32_t u_info) {
+int32_t LinuxSyscall::sys_set_thread_area(uintptr_t u_info) {
     (void)u_info;
     // tls setup  -  simplified: pretend success
     return 0;

@@ -209,6 +209,15 @@ bool PlayPCM(const void* pcm, uint32_t bytes,
     return true;
 }
 
+bool PlayBuffer(const int16_t* pcm, size_t samples,
+                uint32_t sampleRate, uint8_t channels) {
+    if (!pcm || samples == 0) return false;
+    // `samples` counts every interleaved int16 across all channels, so the
+    // byte count is just samples * 2.  forward to PlayPCM as s16 le. (satoru)
+    uint32_t bytes = (uint32_t)(samples * sizeof(int16_t));
+    return PlayPCM(pcm, bytes, AudioFormat::FMT_S16_LE, sampleRate, (int)channels);
+}
+
 AudioMixer::StreamID OpenStream(const char* name,
                                 AudioFormat::SampleFormat fmt,
                                 uint32_t rate, int channels) {

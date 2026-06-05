@@ -48,6 +48,13 @@ void Beep();
 bool PlayPCM(const void* pcm, uint32_t bytes,
              AudioFormat::SampleFormat fmt, uint32_t rate, int channels);
 
+// spec-named one-shot playback for s16 pcm.  thin wrapper over PlayPCM:
+// `samples` is the total number of int16 samples across all channels
+// (i.e. interleaved, not per-channel frames), so the byte count is
+// samples * sizeof(int16_t).  format is fixed to signed 16-bit le. (satoru)
+bool PlayBuffer(const int16_t* pcm, size_t samples,
+                uint32_t sampleRate, uint8_t channels);
+
 // Stream-oriented API (thin wrapper around AudioMixer for symmetry).
 AudioMixer::StreamID OpenStream(const char* name,
                                 AudioFormat::SampleFormat fmt,

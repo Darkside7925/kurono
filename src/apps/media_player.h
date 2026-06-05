@@ -87,6 +87,11 @@ private:
     static int   video_frame_len;
     static int   video_anim_frame;    // animation counter for video viewport
 
+    // decoded-frame-rate counter for the video viewport overlay (satoru)
+    static int      fps_frame_accum;   // frames decoded in the current 1s window
+    static int      fps_display;       // frames-per-second from the last window
+    static uint32_t fps_window_start_ms;
+
     static void RenderPlayerUI(Window* w);
     static void RenderPlaylist(Window* w);
     static void RenderControls(Window* w);

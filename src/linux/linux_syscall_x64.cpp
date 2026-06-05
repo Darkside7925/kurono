@@ -7,8 +7,10 @@
 //
 //  We translate the x86_64 Linux syscall number to the i386 number used
 //  by `LinuxSyscall::Dispatch`, then route through the existing handlers.
-//  Pointers are truncated to uint32_t  -  fine for static binaries linked
-//  into the user window (0x40000000..0x7FFFFFFF).
+//  Arg registers carry full 64-bit user pointers/addresses and are passed
+//  through untruncated, so dynamic/PIE binaries that ld-kurono places
+//  above 4GB reach the handlers with intact pointers.  The result is kept
+//  64-bit so a >4GB mmap return reaches userspace in rax intact (satoru).
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "linux_syscall.h"
@@ -63,6 +65,30 @@ constexpr NrMap kNrMap[] = {
     {217, 220 },  // getdents64
     {228, 265 },  // clock_gettime
     {231, 252 },  // exit_group
+    // ── broadened static-musl / ffmpeg syscall surface. these route to
+    //    i386 dispatch handlers verified to exist; lsys_ macros guarantee the
+    //    correct internal id even where x64 and i386 numbers collide. (satoru)
+    {   4, LSYS_STAT },          // stat (by path)
+    {   6, LSYS_STAT },          // lstat -> stat (no symlinks in kvfs)
+    {   7, LSYS_POLL },          // poll
+    {  17, LSYS_PREAD64 },       // pread64
+    {  18, LSYS_PWRITE64 },      // pwrite64
+    {  23, LSYS_SELECT },        // select
+    {  26, LSYS_MSYNC },         // msync
+    {  28, LSYS_MADVISE },       // madvise
+    {  40, LSYS_SENDFILE },      // sendfile
+    {  56, LSYS_CLONE },         // clone (thread flags fail soft -> single threaded)
+    {  72, LSYS_FCNTL },         // fcntl
+    {  74, LSYS_FSYNC },         // fsync
+    {  75, LSYS_FDATASYNC },     // fdatasync
+    {  77, LSYS_FTRUNCATE },     // ftruncate
+    {  99, LSYS_SYSINFO },       // sysinfo
+    { 186, LSYS_GETTID },        // gettid
+    { 202, LSYS_FUTEX },         // futex (critical: musl locks/once/tls)
+    { 229, LSYS_CLOCK_GETRES },  // clock_getres
+    { 234, LSYS_TGKILL },        // tgkill
+    { 262, LSYS_FSTATAT },       // newfstatat
+    { 332, LSYS_STATX },         // statx
 };
 
 constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);
@@ -72,8 +98,12 @@ constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);
 constexpr uint32_t kStubOk[] = {
     13,   // rt_sigaction
     14,   // rt_sigprocmask
+    15,   // rt_sigreturn (no signals delivered, never really invoked) (satoru)
+    24,   // sched_yield (single-threaded: yield is a no-op success) (satoru)
+    73,   // flock (advisory lock pretend-success) (satoru)
     131,  // sigaltstack
     273,  // set_robust_list
+    324,  // membarrier (single-threaded: no-op success) (satoru)
     334,  // rseq
     302,  // prlimit64  (we'll fail soft)
     157,  // prctl
@@ -163,14 +193,19 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
         }
         case 257: {  // openat: ignore dirfd if AT_FDCWD, route to open.
             if ((int)a0 == -100 /* AT_FDCWD */) {
+                // pass the pathname pointer (a1) full-width  -  it may live
+                // above 4gb in a pie process (satoru)
                 return LinuxSyscall::Dispatch(5 /* open */,
-                    (uint32_t)a1, (uint32_t)a2, (uint32_t)a3, 0, 0);
+                    a1, a2, a3, 0, 0);
             }
             return -38;
         }
-        case 262: {  // newfstatat → fstat-like.  Stub OK for fd-based.
-            return -38;
+        case 230: {  // clock_nanosleep(clockid, flags, req, rem)  -  route to
+            // nanosleep(req, rem); clockid/flags ignored (satoru)
+            return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a2, a3, 0, 0, 0);
         }
+        // newfstatat (262) and statx (332) fall through to the kNrMap
+        // translation → LSYS_FSTATAT / LSYS_STATX handlers (satoru)
         case 302: {  // prlimit64  -  fail soft.
             return -38;
         }
@@ -192,13 +227,15 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
     // off the user stack. Once we're in C on the kernel stack, allow timer
     // IRQs and GUI pumping during longer syscall work.
     HAL::EnableInterrupts();
-    int32_t r = LinuxSyscall::Dispatch(
+    // pass arg registers untruncated; a >4gb user pointer must survive, and
+    // keep the result 64-bit so a high mmap address is not mangled (satoru)
+    int64_t r = LinuxSyscall::Dispatch(
         i386_nr,
-        (uint32_t)a0,
-        (uint32_t)a1,
-        (uint32_t)a2,
-        (uint32_t)a3,
-        (uint32_t)a4
+        a0,
+        a1,
+        a2,
+        a3,
+        a4
     );
 
     // exit / exit_group: never return to userspace.  Tear the

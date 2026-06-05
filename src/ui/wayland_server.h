@@ -91,6 +91,24 @@ namespace WaylandServer {
         DamageRect damage;
         // For wl_surface: id of the pending frame callback (0 if none).
         uint32_t pending_frame_cb;
+
+        // shm pool backing: base pointer + byte size of the mapped pool.
+        // populated by RegisterPoolMemory() once the fd transport supplies
+        // a kernel-visible mapping; nullptr means "not yet mappable". (satoru)
+        const uint8_t* pool_base;
+        uint32_t       pool_size;
+        // for wl_buffer: geometry into its parent pool. (satoru)
+        uint32_t buf_pool_id;
+        uint32_t buf_offset;
+        uint32_t buf_stride;
+        uint32_t buf_format;     // wl_shm format code (0 = ARGB8888)
+        // for wl_surface: the buffer id attached via wl_surface.attach,
+        // applied on the next commit, plus the attach hotspot offset and a
+        // per-surface alpha (0..255, 255 = opaque). (satoru)
+        uint32_t pending_buffer_id;
+        int32_t  attach_x, attach_y;
+        uint8_t  surf_alpha;
+        bool     mapped;         // true once bridged to a wm window. (satoru)
     };
 
     struct Client {
@@ -108,6 +126,16 @@ namespace WaylandServer {
         int      frame_cb_tail;
         uint32_t serial_next;
         bool     fatal;          // protocol error  -  drop on next dispatch
+
+        // input: ids of the wl_pointer / wl_keyboard resources this client
+        // created via wl_seat.get_pointer / get_keyboard (0 = none). a
+        // single seat is assumed so we track one of each. (satoru)
+        uint32_t pointer_id;
+        uint32_t keyboard_id;
+        // id of the wl_surface currently holding pointer / keyboard focus
+        // for this client, so we can emit leave before the next enter. (satoru)
+        uint32_t pointer_focus_sid;
+        uint32_t keyboard_focus_sid;
     };
 
     void Init();
@@ -121,6 +149,41 @@ namespace WaylandServer {
 
     int  ClientCount();
     int  SurfaceCount();
+
+    // ── shm pool backing registration ─────────────────────────────────
+    // The in-kernel compositor cannot see a client's wl_shm pool until the
+    // SCM_RIGHTS fd that backs it is resolved to a kernel-visible mapping.
+    // That resolution lives in the socket / memfd layer (outside this
+    // module); once it has a base pointer + size it calls this to attach
+    // the mapping to the pool object so commit-time blits read real pixels.
+    // sd = client socket descriptor, pool_id = wl_shm_pool object id. The
+    // pointer must stay valid for the pool's lifetime. (satoru)
+    void RegisterPoolMemory(int sd, uint32_t pool_id,
+                            const uint8_t* base, uint32_t size);
+
+    // ── input forwarding entry points ─────────────────────────────────
+    // Called by the input system (mouse / keyboard pump) to deliver host
+    // input to whichever Wayland surface currently sits under the pointer
+    // / holds keyboard focus.  Coordinates are global (screen) pixels;
+    // surface-local translation happens inside.  buttons use Linux evdev
+    // codes (BTN_LEFT=0x110 ...); `key` is a Kurono Key enum value (see
+    // drivers/keyboard.h) which is translated to a Linux evdev keycode on
+    // the wire; mods is a shift/ctrl/alt/meta bitmask. (satoru)
+    void ForwardPointerMotion(int gx, int gy);
+    void ForwardPointerButton(int gx, int gy, int evdev_button, bool pressed);
+    void ForwardPointerAxis(int gx, int gy, int axis, int value);
+    void ForwardKey(int key, bool pressed, uint32_t mods);
+
+    // Linux evdev button codes for ForwardPointerButton(). (satoru)
+    static const int WL_BTN_LEFT   = 0x110;
+    static const int WL_BTN_RIGHT  = 0x111;
+    static const int WL_BTN_MIDDLE = 0x112;
+
+    // modifier bitmask bits for ForwardKey()'s `mods` argument. (satoru)
+    static const uint32_t WL_MOD_SHIFT = 1u << 0;
+    static const uint32_t WL_MOD_CTRL  = 1u << 1;
+    static const uint32_t WL_MOD_ALT   = 1u << 2;
+    static const uint32_t WL_MOD_META  = 1u << 3;
 }
 
 #endif

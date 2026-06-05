@@ -264,6 +264,27 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
     }
 
     const Elf64_Phdr* ph = (const Elf64_Phdr*)(src_data + eh->e_phoff);
+
+    // record program-header location in user space for the sysv auxv. prefer an
+    // explicit pt_phdr; otherwise derive it from the pt_load that maps file
+    // offset 0 (which covers the elf header + phdrs). musl reads at_phdr to
+    // locate pt_tls / pt_gnu_relro during startup. (satoru)
+    proc->user_phnum = eh->e_phnum;
+    proc->user_phent = eh->e_phentsize;
+    proc->user_phdr_va = 0;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_PHDR) { proc->user_phdr_va = ph[i].p_vaddr; break; }
+    }
+    if (proc->user_phdr_va == 0) {
+        for (uint16_t i = 0; i < eh->e_phnum; i++) {
+            if (ph[i].p_type == PT_LOAD && ph[i].p_offset <= eh->e_phoff &&
+                eh->e_phoff < ph[i].p_offset + ph[i].p_filesz) {
+                proc->user_phdr_va = ph[i].p_vaddr + (eh->e_phoff - ph[i].p_offset);
+                break;
+            }
+        }
+    }
+
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_GNU_STACK || ph[i].p_type == PT_NOTE ||
             ph[i].p_type == PT_PHDR     || ph[i].p_type == PT_GNU_RELRO ||
@@ -296,7 +317,7 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
             // user/supervisor mismatch.
             uint64_t stack_top  = (proc->user_stack_top + 16 + PAGE_SIZE - 1)
                                   & ~(uint64_t)(PAGE_SIZE - 1);
-            uint64_t stack_base = stack_top - 16 * 1024;  // USER_STACK_BYTES
+            uint64_t stack_base = stack_top - 8 * 1024 * 1024;  // mirrors USER_STACK_BYTES (satoru)
             if (va >= stack_base && va < stack_top) {
                 continue;
             }
@@ -333,7 +354,7 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
 
 Process* ElfLoader::LoadELF64FromVFS(const char* path, const char* name) {
     if (!path) return nullptr;
-    constexpr uint32_t MAX_USER_ELF = 16u * 1024u * 1024u;  // 16 MB cap
+    constexpr uint32_t MAX_USER_ELF = 64u * 1024u * 1024u;  // 64 mb cap (large static binaries e.g. ffmpeg) (satoru)
     uint8_t* buf = (uint8_t*)KernelHeap::Alloc(MAX_USER_ELF);
     if (!buf) return nullptr;
     int got = KVFS::ReadFile(path, buf, MAX_USER_ELF);

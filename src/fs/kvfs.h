@@ -226,6 +226,13 @@ public:
     static int WriteString(const char* path, const char* str);
     static int ReadString(const char* path, char* buf, int max_len);
 
+    // persistence  -  flatten the whole tree to / rebuild it from a binary blob.
+    // Serialize returns bytes written (0 on failure/overflow); Deserialize
+    // returns true on success and leaves the live tree untouched on any
+    // malformation. (satoru)
+    static size_t Serialize(uint8_t* buffer, size_t maxSize);
+    static bool   Deserialize(const uint8_t* buffer, size_t size);
+
 private:
     static KVFSNode* root;
     static KVFSNode* cwd;
@@ -236,6 +243,10 @@ private:
     static void FreeNode(KVFSNode* node);
     static void FreeTree(KVFSNode* node);
     static void BuildDefaultTree();
+    // depth-first serialize of one node + its subtree into buffer at *pos,
+    // bounds-checked against maxSize; returns false on overflow. (satoru)
+    static bool SerializeNode(const KVFSNode* node, uint8_t* buffer,
+                              size_t maxSize, size_t* pos, uint32_t* count);
     static void NormalizePath(const char* input, char* output, int max_len);
     static bool PatternMatch(const char* pattern, const char* str);
     static void FindRecursive(KVFSNode* node, const char* pattern,

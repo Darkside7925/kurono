@@ -6,8 +6,10 @@
 #include "../shell/shell.h"
 #include "../drivers/graphics.h"
 #include "../drivers/timer.h"
+#include "../drivers/keyboard.h"
 #include "../fs/kvfs.h"
 #include "../system/logging.h"
+#include "../system/clipboard.h"
 
 static const unsigned int T_BG       = 0xFF0A0A18;
 static const unsigned int T_FG       = 0xFFD0D0D0;
@@ -275,6 +277,20 @@ void TerminalApp::Write(const char* text){
             }
             // \x1b[2j = clear screen
             if(text[j]=='J' && params[0]==2){ Clear(); WritePrompt(); i=j; continue; }
+            // \x1b[k = erase from cursor to end of line (param 0 or absent). (satoru)
+            if(text[j]=='K' && params[0]==0){
+                if(cursor_row>=0 && cursor_row<TERM_SCROLL_BK){
+                    for(int c=cursor_col;c<TERM_COLS;c++){
+                        buffer[cursor_row].cells[c].ch=' ';
+                        buffer[cursor_row].cells[c].fg=cur_fg;
+                        buffer[cursor_row].cells[c].bg=cur_bg;
+                        buffer[cursor_row].cells[c].bold=false;
+                    }
+                    if(buffer[cursor_row].len>cursor_col)
+                        buffer[cursor_row].len=cursor_col;
+                }
+                i=j; continue;
+            }
             // unknown escape - skip \x1b[
             continue;
         }
@@ -431,6 +447,29 @@ void TerminalApp::TabComplete(){
     int last_slash=-1;
     for(int i=0;i<partial_len;i++) if(partial[i]=='/') last_slash=i;
 
+    // first token (the command word) with no path separator also completes
+    // against the registered shell command list; argument tokens fall through
+    // to kvfs path completion below. (satoru)
+    bool is_command_token = (word_start==0 && last_slash<0);
+    if(is_command_token){
+        ShellCommand* cmds=KuronoShell::GetCommands();
+        int ccount=KuronoShell::GetCommandCount();
+        for(int i=0;i<ccount&&tab_match_count<TERM_TAB_MAX;i++){
+            const char* nm=cmds[i].name;
+            if(!nm||!nm[0]) continue;
+            bool match=true;
+            for(int k=0;k<partial_len;k++) if(nm[k]!=partial[k]){match=false;break;}
+            if(!match) continue;
+            // skip if this command name is already listed (handlers can share
+            // a name across environments). (satoru)
+            bool dup=false;
+            for(int d=0;d<tab_match_count;d++) if(seq(tab_matches[d],nm)){dup=true;break;}
+            if(dup) continue;
+            scpy(tab_matches[tab_match_count],nm,TERM_INPUT_MAX);
+            tab_match_count++;
+        }
+    }
+
     if(last_slash>=0){
         int copy_n = last_slash+1;
         if(copy_n > KVFS_MAX_PATH-1) copy_n = KVFS_MAX_PATH-1;
@@ -466,9 +505,16 @@ void TerminalApp::TabComplete(){
             for(int k=0;k<pfx_len;k++) if(nm[k]!=file_prefix[k]){match=false;break;}
         }
         if(match){
-            scpy(tab_matches[tab_match_count],nm,TERM_INPUT_MAX);
-            if(children[i]->is_dir()) sapp(tab_matches[tab_match_count],"/",TERM_INPUT_MAX);
-            tab_match_count++;
+            // avoid listing a cwd entry already added from the command list
+            // when completing the command token. (satoru)
+            bool dup=false;
+            if(is_command_token)
+                for(int d=0;d<tab_match_count;d++) if(seq(tab_matches[d],nm)){dup=true;break;}
+            if(!dup){
+                scpy(tab_matches[tab_match_count],nm,TERM_INPUT_MAX);
+                if(children[i]->is_dir()) sapp(tab_matches[tab_match_count],"/",TERM_INPUT_MAX);
+                tab_match_count++;
+            }
         }
     }
 
@@ -826,6 +872,37 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         Clear();
         input_buf[0]=0; input_len=0; input_cursor=0;
         WritePrompt();
+        return true;
+    }
+
+    // ctrl+shift+c  -  copy the current input line to the clipboard. shift held
+    // distinguishes it from the plain ctrl+c cancel below. (satoru)
+    if(key==3 && Keyboard::GetState().shift){
+        if(input_len>0){
+            char saved=input_buf[input_len]; input_buf[input_len]=0;
+            ClipboardManager::SetText(input_buf);
+            input_buf[input_len]=saved;
+        }
+        return true;
+    }
+
+    // ctrl+shift+v  -  paste clipboard text into the input line at the cursor.
+    // printable bytes only; a newline ends the paste without submitting. (satoru)
+    if(key==22 && Keyboard::GetState().shift){
+        if(ClipboardManager::HasText()){
+            const char* s=ClipboardManager::GetText();
+            for(int i=0;s[i] && s[i]!='\n' && s[i]!='\r';i++){
+                char c=s[i];
+                if(c<32 || c>=127) continue;
+                if(input_len>=TERM_INPUT_MAX-1) break;
+                for(int j=input_len;j>input_cursor;j--) input_buf[j]=input_buf[j-1];
+                input_buf[input_cursor]=c;
+                input_len++; input_cursor++;
+                input_buf[input_len]=0;
+            }
+            tab_match_count=0;
+            ScrollToBottom();
+        }
         return true;
     }
 

@@ -347,11 +347,17 @@ uint64_t aslr_rand() {
     return g_aslr_state;
 }
 
-// ASLR base in the user range 0x500000_0000 .. 0x700000_0000 ------
+// ASLR base in the canonical lower-half user range
+// 0x0000_4000_0000_0000 .. 0x0000_7F00_0000_0000 (~64TB..~127TB).  placing
+// pie images this high exercises the 64-bit syscall abi end to end; the
+// arena stays below the 0x0000_8000_0000_0000 non-canonical boundary so
+// every base+size remains a valid sign-extended user address (satoru)
+constexpr uint64_t ASLR_BASE_LO = 0x0000400000000000ULL;
+constexpr uint64_t ASLR_BASE_HI = 0x00007F0000000000ULL;
 uint64_t pick_aslr_base(uint64_t size) {
-    uint64_t span = 0x200000000ULL - ((size + 0xFFFFF) & ~0xFFFFFULL);
+    uint64_t span = (ASLR_BASE_HI - ASLR_BASE_LO) - ((size + 0xFFFFF) & ~0xFFFFFULL);
     uint64_t off  = (aslr_rand() % span) & ~0xFFFFFULL;
-    return 0x500000000ULL + off;
+    return ASLR_BASE_LO + off;
 }
 
 // String helpers ---------------------------------------------------

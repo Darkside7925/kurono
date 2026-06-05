@@ -8,6 +8,7 @@
 #include "nvidia_gpu.h"
 #include "amd_gpu.h"
 #include "intel_gpu.h"
+#include "serial.h"
 #include "../kernel/heap.h"
 #include "../kernel/io.h"
 
@@ -20,6 +21,9 @@ uint8_t DisplayManager::brightness = 255;
 float DisplayManager::gamma = 1.0f;
 FramebufferInfo DisplayManager::fb_info = {};
 MonitorInfo DisplayManager::monitor = {};
+MonitorInfo DisplayManager::monitors[DISPLAY_MAX_MONITORS] = {};
+int DisplayManager::monitor_count = 0;
+FramebufferInfo DisplayManager::fb_secondary = {};
 void* DisplayManager::back_buffer = nullptr;
 bool DisplayManager::double_buffered = false;
 
@@ -47,6 +51,7 @@ bool DisplayManager::Init() {
         backend = DISPLAY_BACKEND_VIRTIO_GPU;
         if (InitVirtIOGPU()) {
             initialized = true;
+            DetectDisplays();   // build multi-monitor list (satoru)
             return true;
         }
     }
@@ -56,6 +61,7 @@ bool DisplayManager::Init() {
         backend = DISPLAY_BACKEND_BGA;
         if (InitBGA()) {
             initialized = true;
+            DetectDisplays();   // build multi-monitor list (satoru)
             return true;
         }
     }
@@ -95,6 +101,7 @@ bool DisplayManager::Init() {
         }
 
         initialized = true;
+        DetectDisplays();   // build multi-monitor list (satoru)
         return true;
     }
 
@@ -434,6 +441,122 @@ bool DisplayManager::ReadEDID(MonitorInfo* info) {
 }
 
 const MonitorInfo& DisplayManager::GetMonitorInfo() { return monitor; }
+
+//  multi-monitor detection (satoru)
+//  reuses the early pci scan performed by GpuProbe (which already enumerates
+//  every class 0x03 display controller and its bars) instead of re-walking
+//  the bus, then turns each usable controller into a MonitorInfo laid out
+//  left-to-right across a virtual desktop. monitors[0] is always the primary
+//  and mirrors GetMonitorInfo(); the existing single-monitor api is unchanged.
+int DisplayManager::DetectDisplays() {
+    monitor_count = 0;
+    fb_secondary = {};
+    for (int i = 0; i < DISPLAY_MAX_MONITORS; i++) monitors[i] = {};
+
+    // primary monitor  -  make sure `monitor` is populated (the virtio/native
+    // init paths don't call ReadEDID like InitBGA does). (satoru)
+    if (!monitor.connected) {
+        ReadEDID(&monitor);
+    }
+    monitors[0] = monitor;
+    monitors[0].origin_x = 0;
+    monitors[0].origin_y = 0;
+    if (monitors[0].native_width == 0)  monitors[0].native_width  = fb_info.width;
+    if (monitors[0].native_height == 0) monitors[0].native_height = fb_info.height;
+    monitor_count = 1;
+
+    // pull the system gpu inventory from the early probe. (satoru)
+    const GpuProbeResult& gpr = GpuProbe::GetResult();
+
+    // tag the primary monitor with the gpu that drives the panel.
+    if (gpr.primary_idx >= 0 && gpr.primary_idx < gpr.count) {
+        const GpuInfo& pg = gpr.gpus[gpr.primary_idx];
+        monitors[0].pci_bus      = pg.bus;
+        monitors[0].pci_device   = pg.device;
+        monitors[0].pci_function = pg.function;
+        monitors[0].vendor_id    = pg.vendor_id;
+    }
+
+    // running x-origin for left-to-right virtual-desktop layout. (satoru)
+    int32_t next_origin_x = (int32_t)monitors[0].native_width;
+
+    // additional usable display controllers become extra outputs. "usable"
+    // means a distinct controller (not the primary) that exposes a linear
+    // framebuffer aperture via one of its bars. (satoru)
+    for (int i = 0; i < gpr.count && monitor_count < DISPLAY_MAX_MONITORS; i++) {
+        if (i == gpr.primary_idx) continue;
+        const GpuInfo& g = gpr.gpus[i];
+        if (!g.present) continue;
+        // bar2 is the vram/framebuffer aperture on every vendor we classify
+        // (intel gmadr, nvidia bar1, amd vram); bar0 is the mmio aperture.
+        // require at least one nonzero aperture so the output is real. (satoru)
+        if (g.bar2 == 0 && g.bar0 == 0) continue;
+
+        MonitorInfo& m = monitors[monitor_count];
+        m.connected     = true;
+        m.native_width  = fb_info.width;   // unknown without per-vendor edid/modeset
+        m.native_height = fb_info.height;
+        m.max_width     = 3840;
+        m.max_height    = 2160;
+        m.max_refresh   = 60;
+        m.physical_width_cm  = 60.0f;
+        m.physical_height_cm = 34.0f;
+        m.origin_x      = next_origin_x;
+        m.origin_y      = 0;
+        m.pci_bus       = g.bus;
+        m.pci_device    = g.device;
+        m.pci_function  = g.function;
+        m.vendor_id     = g.vendor_id;
+
+        // short label from the probe description (MonitorInfo.name is 14b).
+        int n = 0;
+        while (g.desc[n] && n < 13) { m.name[n] = g.desc[n]; n++; }
+        m.name[n] = 0;
+
+        next_origin_x += (int32_t)m.native_width;
+        monitor_count++;
+    }
+
+    // if we found a second output, expose a ram-backed virtual framebuffer
+    // for it at the primary resolution. scanning this out to the secondary
+    // controller's physical display needs per-vendor modeset code, so the
+    // compositor can render into it but presentation is a follow-up. (satoru)
+    if (monitor_count >= 2 && fb_info.width > 0 && fb_info.height > 0) {
+        fb_secondary.width  = fb_info.width;
+        fb_secondary.height = fb_info.height;
+        fb_secondary.bpp    = fb_info.bpp ? fb_info.bpp : 32;
+        fb_secondary.pitch  = fb_secondary.width * (fb_secondary.bpp / 8);
+        fb_secondary.size   = fb_secondary.pitch * fb_secondary.height;
+        fb_secondary.double_buffered = false;
+        int pages = (fb_secondary.size + 4095) / 4096;
+        fb_secondary.address = KernelHeap::Alloc(pages * 4096);
+        // TODO (satoru): drive fb_secondary to the secondary controller's
+        // scanout  -  needs per-vendor modeset (intel ggtt/pipe-b, virtio
+        // second scanout, etc.); until then it is a compositor-only surface.
+        if (!fb_secondary.address) {
+            // allocation failed  -  keep the output listed but with no fb.
+            fb_secondary.size = 0;
+        }
+    }
+
+    SerialLogger::Log("DisplayManager: detected ");
+    SerialLogger::LogDec(monitor_count);
+    SerialLogger::Log(" monitor(s)\r\n");
+    return monitor_count;
+}
+
+int DisplayManager::GetMonitorCount() { return monitor_count; }
+
+const MonitorInfo* DisplayManager::GetMonitor(int index) {
+    if (index < 0 || index >= monitor_count) return nullptr;
+    return &monitors[index];
+}
+
+const FramebufferInfo* DisplayManager::GetFramebuffer(int index) {
+    if (index == 0) return &fb_info;
+    if (index == 1 && fb_secondary.address != nullptr) return &fb_secondary;
+    return nullptr;
+}
 
 DisplayBackend DisplayManager::GetBackend() { return backend; }
 

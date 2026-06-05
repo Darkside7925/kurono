@@ -5,12 +5,14 @@
 #include "../drivers/audio.h"
 #include "../drivers/ac97.h"
 #include "../drivers/hda.h"
+#include "../drivers/audio_server.h"
 #include "../media/codec.h"
 #include "../ui/window_manager.h"
 #include "../fs/vfs.h"
 #include "../fs/kvfs.h"
 #include "../kernel/heap.h"
 #include "../drivers/timer.h"
+#include "../drivers/mouse.h"
 #include "../system/logging.h"
 
 // forward declaration
@@ -41,6 +43,9 @@ bool     MediaPlayerApp::cached_valid      = false;
 uint8_t  MediaPlayerApp::video_frame_buf[4096] = {0};
 int      MediaPlayerApp::video_frame_len   = 0;
 int      MediaPlayerApp::video_anim_frame  = 0;
+int      MediaPlayerApp::fps_frame_accum   = 0;
+int      MediaPlayerApp::fps_display       = 0;
+uint32_t MediaPlayerApp::fps_window_start_ms = 0;
 
 static int mp_slen(const char* s) { int n=0; if(s) while(s[n]) n++; return n; }
 static void mp_scpy(char* d, const char* s, int mx) {
@@ -395,6 +400,11 @@ void MediaPlayerApp::Play() {
     paused = false;
     playback_progress = 0;
 
+    // start the decoded-frame-rate window fresh for this track. (satoru)
+    fps_frame_accum = 0;
+    fps_display = 0;
+    fps_window_start_ms = 0;
+
     if (entry) {
         for (int i = 0; i < playlist_count; i++) playlist[i].is_playing = false;
         entry->is_playing = true;
@@ -404,39 +414,33 @@ void MediaPlayerApp::Play() {
 static bool PlayDecodedAudio(const uint8_t* data, int len, int rate, int bits, int channels) {
     if (!data || len <= 0) return false;
 
-    // try sb16 first (isa dma, most compatible with qemu)
-    if (Audio::IsAvailable()) {
-        if (Audio::Play(data, len, rate, bits, channels))
-            return true;
-    }
-
-    // try ac97 (pci bus master dma)
-    if (AC97::IsAvailable()) {
-        if (AC97::Play(data, len, rate, bits, channels))
-            return true;
-    }
-
-    // try intel hda (pci, corb/rirb)
-    if (HDAudio::IsDetected()) {
-        HDAudio::SetFormat(rate, bits, channels);
-        if (HDAudio::Play(data, len))
-            return true;
-    }
-
-    return false;
+    // route through the unified audio server instead of probing each backend
+    // by hand  -  audioserver owns the active backend (hda/ac97/sb16/pcspk) and
+    // mixes + resamples for us.  `len` is total bytes; map bits to the pcm
+    // sample format (codec output is s16, raw fallback is 8-bit). (satoru)
+    AudioFormat::SampleFormat fmt = (bits == 8) ? AudioFormat::FMT_U8
+                                  : (bits == 32) ? AudioFormat::FMT_S32_LE
+                                                 : AudioFormat::FMT_S16_LE;
+    return AudioServer::PlayPCM(data, (uint32_t)len, fmt, (uint32_t)rate, channels);
 }
 
 void MediaPlayerApp::Pause() {
     if (!playing) return;
-    Audio::Pause();
-    if (AC97::IsAvailable()) AC97::Pause();
+    // audioserver has no per-stream pause for the one-shot playpcm path, and
+    // the backend interface only exposes stop(), so halt the active backend's
+    // dma to silence output  -  the unified equivalent of the old per-backend
+    // pause fan-out. (satoru)
+    AudioBackend* be = AudioServer::ActiveBackend();
+    if (be) be->Stop();
     playing = false;
     paused = true;
 }
 
 void MediaPlayerApp::Stop() {
-    Audio::Stop();
-    if (AC97::IsAvailable()) AC97::Stop();
+    // stop the active backend through the router instead of poking sb16/ac97
+    // by hand; this halts hardware dma for whichever backend is live. (satoru)
+    AudioBackend* be = AudioServer::ActiveBackend();
+    if (be) be->Stop();
     playing = false;
     paused = false;
     playback_progress = 0;
@@ -471,10 +475,10 @@ void MediaPlayerApp::SetVolume(int vol) {
     if (vol < 0) vol = 0;
     if (vol > 100) vol = 100;
     volume_pct = vol;
-    // apply to all audio backends
-    if (Audio::IsAvailable())   Audio::SetMasterVolume(vol);
-    if (AC97::IsAvailable())    AC97::SetMasterVolume(vol);
-    if (HDAudio::IsDetected())  HDAudio::SetVolume((uint8_t)(vol * 255 / 100));
+    // single master-volume knob on the mixer (0..100) replaces the old
+    // per-backend fan-out; it scales every stream before the active backend
+    // and is what audioserver::getstatus() reports. (satoru)
+    AudioMixer::SetMasterVolume(vol);
 }
 
 int MediaPlayerApp::GetVolume() {
@@ -572,6 +576,17 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
         if (playing) {
             video_anim_frame++;
 
+            // real decoded-frame-rate counter: count frames produced for the
+            // viewport and roll the tally over once per real second. (satoru)
+            uint32_t fnow = Timer::GetRealMs();
+            if (fps_window_start_ms == 0) fps_window_start_ms = fnow;
+            fps_frame_accum++;
+            if (fnow - fps_window_start_ms >= 1000) {
+                fps_display = fps_frame_accum;
+                fps_frame_accum = 0;
+                fps_window_start_ms = fnow;
+            }
+
             // animated equalizer bars in center  -  represents audio playing
             int eq_cx = vx + vw/2;
             int eq_by = vy + vh - 20;
@@ -599,7 +614,23 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
             }
             Graphics::DrawString(np_x + 6, np_y + 1, np, 0xFFCCCCDD, 0xFF000000);
 
+            // decoded-frame-rate overlay  -  top-left of the viewport. (satoru)
+            char fps_str[16] = "";
+            mp_int_str(fps_display, fps_str, 12);
+            int fl = mp_slen(fps_str);
+            fps_str[fl] = ' '; fps_str[fl+1] = 'F'; fps_str[fl+2] = 'P';
+            fps_str[fl+3] = 'S'; fps_str[fl+4] = 0;
+            int fps_w = mp_slen(fps_str) * 8;
+            Graphics::FillRoundedRect(vx + 6, vy + 6, fps_w + 10, 16, 4, 0xAA000000);
+            Graphics::DrawString(vx + 11, vy + 8, fps_str, MP_GREEN, 0xFF000000);
+
         } else {
+            // playback not running  -  drop the fps tally so it restarts clean
+            // on the next play. (satoru)
+            fps_frame_accum = 0;
+            fps_display = 0;
+            fps_window_start_ms = 0;
+
             // stopped/paused  -  show play button overlay at center
             int pcx = vx + vw/2, pcy = vy + vh/2 + 10;
             Graphics::FillCircle(pcx, pcy, 24, 0x66000000);
@@ -1041,12 +1072,14 @@ void MediaPlayerApp::OnInput(Window* w, int event, int a, int b) {
         // mouse click: a=local_x, b=local_y (relative to content area)
         int cw = w->content_w;
 
-        // progress bar click (local y ~= 186, height ~= 10px)
+        // progress bar click (local y ~= 186, height ~= 10px)  -  also begins a
+        // drag-scrub; pointer-move (event 5) updates the seek until release. (satoru)
         if (b >= 180 && b <= 200) {
             int rel = a - 10;
             int bar_w = cw - 20;
             if (rel >= 0 && rel <= bar_w) {
                 Seek((rel * 100) / bar_w);
+                dragging_seek = true;
             }
             return;
         }
@@ -1108,6 +1141,44 @@ void MediaPlayerApp::OnInput(Window* w, int event, int a, int b) {
         if (scroll_offset < 0) scroll_offset = 0;
         if (scroll_offset >= playlist_count) scroll_offset = playlist_count - 1;
         if (scroll_offset < 0) scroll_offset = 0;
+    }
+
+    if (event == 5) {
+        // pointer-move: a=local_x, b=local_y. drive drag-scrub / drag-volume
+        // while the left button is held. the wm keeps capturing this window
+        // after the initial content press, so release is detected via the
+        // mouse button state. (satoru)
+        if (!Mouse::IsLeftDown()) {
+            dragging_seek = false;
+            dragging_vol = false;
+            return;
+        }
+        if (dragging_seek) {
+            int bar_w = w->content_w - 20;
+            int rel = a - 10;
+            if (rel < 0) rel = 0;
+            if (rel > bar_w) rel = bar_w;
+            if (bar_w > 0) Seek((rel * 100) / bar_w);
+            return;
+        }
+        if (dragging_vol) {
+            int bar_x = 36;
+            int bar_w = w->content_w - 46;
+            int rel = a - bar_x;
+            if (rel < 0) rel = 0;
+            if (rel > bar_w) rel = bar_w;
+            if (bar_w > 0) SetVolume((rel * 100) / bar_w);
+            return;
+        }
+    }
+
+    if (event == 6) {
+        // pointer button: a=button, b=pressed(1)/released(0). a release ends
+        // any active drag-scrub or drag-volume. (satoru)
+        if (b == 0) {
+            dragging_seek = false;
+            dragging_vol = false;
+        }
     }
 }
 

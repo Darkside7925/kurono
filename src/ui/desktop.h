@@ -86,6 +86,10 @@ private:
 
     // system tray
     static int clock_h, clock_m;
+    // cached date + once-per-second refresh gate so the clock is not
+    // recomputed from the rtc every render frame (satoru)
+    static int clock_mon, clock_dom, clock_year;
+    static uint32_t clock_last_update_ms;
     static int battery_pct;
     static bool wifi_connected;
     static int wifi_strength;
@@ -110,6 +114,10 @@ private:
 public:
     // Called by DesktopEnvironment each frame with delta_ms since last frame.
     static void Tick(uint32_t delta_ms, int mx, int my);
+
+    // bounds-checked read access to per-pinned-icon hover phase so file-scope
+    // taskbar renderers can read it without touching private anim state (satoru)
+    static float PinnedHoverPhase(int i){ return (i >= 0 && i < 8) ? pinned_hover_phase[i] : 0.0f; }
 
 private:
     static void StartMenuSet(bool open);

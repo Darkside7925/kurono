@@ -3,6 +3,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/timer.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/display_mgr.h"
 #include "../system/ui_config.h"
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -34,6 +35,19 @@ static bool comp_reduced_motion       = false;
 // 0 means "no throttle"; otherwise per-frame minimum gap in ms.
 static unsigned int wm_drag_min_gap_ms = 6;       // ~165 Hz upper bound
 static unsigned int wm_last_drag_ms    = 0;
+
+// ───────────────────────────────────────────────────────────────
+// Window context menu state (right-click on a titlebar). Kept as
+// plain statics  -  there was no reusable wm-level menu facility to
+// extend, so this is a minimal self-contained popup. (satoru)
+// ───────────────────────────────────────────────────────────────
+static bool wm_ctx_open   = false;
+static int  wm_ctx_win_id = -1;       // window the menu acts on
+static int  wm_ctx_x      = 0;        // top-left of the popup
+static int  wm_ctx_y      = 0;
+#define WM_CTX_W        180
+#define WM_CTX_ITEM_H    24
+#define WM_CTX_ITEMS      1           // entries: 0 = "Move to other monitor"
 
 Window WindowManager::windows[WM_MAX_WINDOWS];
 int WindowManager::window_count = 0;
@@ -160,7 +174,10 @@ void WindowManager::Init(int sw, int sh) {
         windows[i].had_last = false;
         windows[i].visible = false;
         windows[i].focused = false;
+        windows[i].monitor_id = 0;
     }
+    wm_ctx_open = false;
+    wm_ctx_win_id = -1;
     wm_input_capture_id = -1;
     wm_last_drag_ms = 0;
 
@@ -193,6 +210,9 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->w = w; win->h = h;
     win->saved_x = x; win->saved_y = y;
     win->saved_w = w; win->saved_h = h;
+    win->snap_saved_x = x; win->snap_saved_y = y;   // snap restore rect (satoru)
+    win->snap_saved_w = w; win->snap_saved_h = h;
+    win->snap_saved = false;
     win->state = WIN_NORMAL;
     win->visible = true;
     win->focused = false;
@@ -218,8 +238,10 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->last_x = x; win->last_y = y;
     win->last_w = w; win->last_h = h;
     win->had_last = false;
+    win->monitor_id = 0;
 
     UpdateContentArea(win);
+    UpdateWindowMonitor(win);   // assign to the output under its center (satoru)
     wm_damage_window(win);
 
     if (window_count < WM_MAX_WINDOWS) window_count++;
@@ -356,6 +378,90 @@ void WindowManager::ToggleMaximize(int id) {
     else Maximize(id);
 }
 
+// snap a window to a region of the desktop. reuses the same desktop bounds
+// the maximize path uses (x=0, y=GetDesktopY(), w=screen_width,
+// h=GetDesktopH()) so snapping never overlaps the taskbar. (satoru)
+void WindowManager::SnapWindow(int win_id, int edge) {
+    Window* win = GetWindow(win_id);
+    if (!win) return;
+
+    // desktop rect  -  same area maximize occupies. (satoru)
+    int dx = 0;
+    int dy = GetDesktopY();
+    int dw = screen_width;
+    int dh = GetDesktopH();
+    if (dw < WM_MIN_WIDTH)  dw = WM_MIN_WIDTH;
+    if (dh < WM_MIN_HEIGHT) dh = WM_MIN_HEIGHT;
+
+    // edge 3 = restore the pre-snap rect, then clear the snap save. (satoru)
+    if (edge == 3) {
+        if (!win->snap_saved) return;
+        wm_damage_window(win);
+        int rx = win->snap_saved_x, ry = win->snap_saved_y;
+        int rw = win->snap_saved_w, rh = win->snap_saved_h;
+        if (rw < WM_MIN_WIDTH)  rw = WM_MIN_WIDTH;
+        if (rh < WM_MIN_HEIGHT) rh = WM_MIN_HEIGHT;
+        if (rw > dw) rw = dw;
+        if (rh > dh) rh = dh;
+        if (rx < dx) rx = dx;
+        if (ry < dy) ry = dy;
+        if (rx + rw > dx + dw) rx = dx + dw - rw;
+        if (ry + rh > dy + dh) ry = dy + dh - rh;
+        win->x = rx; win->y = ry;
+        win->w = rw; win->h = rh;
+        win->state = WIN_NORMAL;
+        win->visible = true;
+        win->dirty = true;
+        win->snap_saved = false;
+        UpdateContentArea(win);
+        UpdateWindowMonitor(win);
+        wm_damage(win->x, win->y, win->w, win->h);
+        return;
+    }
+
+    // save the pre-snap rect once, before the first snap of a run. only
+    // capture from a non-snapped / normal window so repeated snaps don't
+    // overwrite the original geometry. (satoru)
+    if (!win->snap_saved && win->state != WIN_MAXIMIZED) {
+        win->snap_saved_x = win->x; win->snap_saved_y = win->y;
+        win->snap_saved_w = win->w; win->snap_saved_h = win->h;
+        win->snap_saved = true;
+    }
+
+    int halfw = dw / 2;
+    int halfh = dh / 2;
+    int nx = dx, ny = dy, nw = dw, nh = dh;
+
+    switch (edge) {
+        case 0: nx = dx;          ny = dy; nw = halfw;      nh = dh;    break; // left half (satoru)
+        case 1: nx = dx + halfw;  ny = dy; nw = dw - halfw; nh = dh;    break; // right half (satoru)
+        case 2: nx = dx;          ny = dy; nw = dw;         nh = dh;    break; // maximize (satoru)
+        case 4: nx = dx;          ny = dy;          nw = halfw;      nh = halfh;      break; // top-left (satoru)
+        case 5: nx = dx + halfw;  ny = dy;          nw = dw - halfw; nh = halfh;      break; // top-right (satoru)
+        case 6: nx = dx;          ny = dy + halfh;  nw = halfw;      nh = dh - halfh; break; // bottom-left (satoru)
+        case 7: nx = dx + halfw;  ny = dy + halfh;  nw = dw - halfw; nh = dh - halfh; break; // bottom-right (satoru)
+        default: return; // unknown edge (satoru)
+    }
+
+    if (nw < WM_MIN_WIDTH)  nw = WM_MIN_WIDTH;
+    if (nh < WM_MIN_HEIGHT) nh = WM_MIN_HEIGHT;
+
+    wm_damage_window(win);
+    win->x = nx; win->y = ny;
+    win->w = nw; win->h = nh;
+    // edge 2 maps to the maximized state; the rest are tiled normal. (satoru)
+    win->state = (edge == 2) ? WIN_MAXIMIZED : WIN_NORMAL;
+    win->visible = true;
+    win->dirty = true;
+    UpdateContentArea(win);
+    UpdateWindowMonitor(win);
+    wm_damage(win->x, win->y, win->w, win->h);
+}
+
+void WindowManager::SnapFocused(int edge) {
+    SnapWindow(focused_id, edge);
+}
+
 void WindowManager::BringToFront(int id) {
     Window* win = GetWindow(id);
     if (!win) return;
@@ -431,6 +537,7 @@ void WindowManager::MoveWindow(int id, int x, int y) {
     win->x = x; win->y = y;
     win->dirty = true;
     UpdateContentArea(win);
+    UpdateWindowMonitor(win);   // window may have crossed a monitor edge (satoru)
     wm_damage(win->x, win->y, win->w, win->h);
 }
 
@@ -1027,6 +1134,9 @@ void WindowManager::Render() {
 
         win->dirty = false;
     }
+
+    // window context menu draws on top of everything (satoru)
+    RenderContextMenu();
 }
 
 bool WindowManager::HandleMouseDown(int mx, int my) {
@@ -1155,6 +1265,11 @@ void WindowManager::HandleMouseUp(int mx, int my) {
         Window* win = GetWindow(action_window_id);
         if (win) win->dirty = true;
     }
+    // a finished drag/resize may have moved the window onto another output (satoru)
+    if (current_action != WM_NONE) {
+        Window* moved = GetWindow(action_window_id);
+        if (moved) UpdateWindowMonitor(moved);
+    }
     mouse_is_down = false;
     current_action = WM_NONE;
     action_window_id = -1;
@@ -1236,6 +1351,192 @@ bool WindowManager::IsDragging() {
 
 WMAction WindowManager::GetCurrentAction() {
     return current_action;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Multi-monitor: window<->output tracking + cross-monitor moves. (satoru)
+// ─────────────────────────────────────────────────────────────────────
+
+// fetch monitor `idx` rect from DisplayManager; returns false if it has no
+// usable geometry. falls back to the primary screen for index 0. (satoru)
+static bool wm_monitor_rect(int idx, int* ox, int* oy, int* ow, int* oh) {
+    const MonitorInfo* m = DisplayManager::GetMonitor(idx);
+    if (!m) {
+        if (idx == 0) {
+            // single-monitor fallback: the whole primary screen.
+            *ox = 0; *oy = 0;
+            *ow = WindowManager::GetScreenWidth();
+            *oh = WindowManager::GetScreenHeight();
+            return true;
+        }
+        return false;
+    }
+    int w = (int)m->native_width;
+    int h = (int)m->native_height;
+    if (w <= 0) w = WindowManager::GetScreenWidth();
+    if (h <= 0) h = WindowManager::GetScreenHeight();
+    *ox = (int)m->origin_x;
+    *oy = (int)m->origin_y;
+    *ow = w;
+    *oh = h;
+    return true;
+}
+
+void WindowManager::UpdateWindowMonitor(Window* win) {
+    if (!win) return;
+    int count = DisplayManager::GetMonitorCount();
+    if (count <= 1) { win->monitor_id = 0; return; }
+
+    int cx = win->x + win->w / 2;
+    int cy = win->y + win->h / 2;
+    for (int i = 0; i < count; i++) {
+        int ox, oy, ow, oh;
+        if (!wm_monitor_rect(i, &ox, &oy, &ow, &oh)) continue;
+        if (cx >= ox && cx < ox + ow && cy >= oy && cy < oy + oh) {
+            win->monitor_id = i;
+            return;
+        }
+    }
+    // center fell outside every monitor  -  leave the id unchanged.
+}
+
+int WindowManager::GetWindowMonitor(int id) {
+    Window* win = GetWindow(id);
+    return win ? win->monitor_id : 0;
+}
+
+void WindowManager::MoveWindowToMonitor(int win_id, int monitor_index) {
+    Window* win = GetWindow(win_id);
+    if (!win) return;
+    int count = DisplayManager::GetMonitorCount();
+    if (count <= 1) return;                       // nowhere else to go
+    if (monitor_index < 0 || monitor_index >= count) return;
+    if (monitor_index == win->monitor_id) return;
+
+    int dox, doy, dow, doh;                        // destination monitor rect
+    if (!wm_monitor_rect(monitor_index, &dox, &doy, &dow, &doh)) return;
+
+    // preserve the window's relative offset within its current monitor so it
+    // lands in roughly the same spot on the destination. (satoru)
+    int sox, soy, sow, soh;
+    int rel_x = 0, rel_y = 0;
+    if (wm_monitor_rect(win->monitor_id, &sox, &soy, &sow, &soh)) {
+        rel_x = win->x - sox;
+        rel_y = win->y - soy;
+    }
+
+    wm_damage_window(win);
+
+    // maximized windows refill the destination monitor; normal windows keep
+    // their size but get clamped to fit the destination rect. (satoru)
+    if (win->state == WIN_MAXIMIZED) {
+        win->x = dox; win->y = doy;
+        win->w = dow; win->h = doh;
+    } else {
+        if (win->w > dow) win->w = dow;
+        if (win->h > doh) win->h = doh;
+        int nx = dox + rel_x;
+        int ny = doy + rel_y;
+        if (nx < dox) nx = dox;
+        if (ny < doy) ny = doy;
+        if (nx + win->w > dox + dow) nx = dox + dow - win->w;
+        if (ny + win->h > doy + doh) ny = doy + doh - win->h;
+        win->x = nx; win->y = ny;
+    }
+
+    win->monitor_id = monitor_index;
+    win->dirty = true;
+    UpdateContentArea(win);
+    wm_damage(win->x - WM_SHADOW_SIZE, win->y - WM_SHADOW_SIZE,
+              win->w + 2*WM_SHADOW_SIZE, win->h + 2*WM_SHADOW_SIZE);
+    SerialLogger::Log("WindowManager: moved window to another monitor\r\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Window context menu (right-click on the titlebar). (satoru)
+// ─────────────────────────────────────────────────────────────────────
+
+bool WindowManager::IsContextMenuOpen() { return wm_ctx_open; }
+
+void WindowManager::CloseContextMenu() {
+    if (!wm_ctx_open) return;
+    wm_ctx_open = false;
+    // damage the popup footprint so it gets painted over next frame.
+    wm_damage(wm_ctx_x, wm_ctx_y, WM_CTX_W, WM_CTX_ITEMS * WM_CTX_ITEM_H + 8);
+    wm_ctx_win_id = -1;
+}
+
+bool WindowManager::HandleRightClick(int mx, int my) {
+    // a right-click anywhere dismisses an already-open menu first. (satoru)
+    if (wm_ctx_open) { CloseContextMenu(); return true; }
+
+    int top_id = TopWindowAt(mx, my);
+    if (top_id <= 0) return false;
+    Window* win = GetWindow(top_id);
+    if (!win || !win->has_titlebar) return false;
+
+    // only open on the titlebar strip, not the content area. (satoru)
+    if (!(my >= win->y && my < win->y + WM_TITLEBAR_H &&
+          mx >= win->x && mx < win->x + win->w)) {
+        return false;
+    }
+
+    Focus(top_id);
+    wm_ctx_win_id = top_id;
+    wm_ctx_x = mx;
+    wm_ctx_y = my;
+    // clamp so the popup stays on-screen.
+    int menu_h = WM_CTX_ITEMS * WM_CTX_ITEM_H + 8;
+    if (wm_ctx_x + WM_CTX_W > screen_width)  wm_ctx_x = screen_width - WM_CTX_W;
+    if (wm_ctx_y + menu_h   > screen_height) wm_ctx_y = screen_height - menu_h;
+    if (wm_ctx_x < 0) wm_ctx_x = 0;
+    if (wm_ctx_y < 0) wm_ctx_y = 0;
+    wm_ctx_open = true;
+    wm_damage(wm_ctx_x, wm_ctx_y, WM_CTX_W, menu_h);
+    return true;
+}
+
+bool WindowManager::HandleContextMenuClick(int mx, int my) {
+    if (!wm_ctx_open) return false;
+
+    int menu_h = WM_CTX_ITEMS * WM_CTX_ITEM_H + 8;
+    bool inside = (mx >= wm_ctx_x && mx < wm_ctx_x + WM_CTX_W &&
+                   my >= wm_ctx_y && my < wm_ctx_y + menu_h);
+    if (!inside) { CloseContextMenu(); return true; }   // click-away closes
+
+    int item = (my - (wm_ctx_y + 4)) / WM_CTX_ITEM_H;
+    int target = wm_ctx_win_id;
+    CloseContextMenu();
+
+    if (item == 0 && target > 0) {
+        // "Move to other monitor": pick the next output after the window's
+        // current one, wrapping. with two monitors this is the other one. (satoru)
+        int count = DisplayManager::GetMonitorCount();
+        if (count >= 2) {
+            int cur = GetWindowMonitor(target);
+            int next = (cur + 1) % count;
+            MoveWindowToMonitor(target, next);
+        }
+    }
+    return true;
+}
+
+void WindowManager::RenderContextMenu() {
+    if (!wm_ctx_open) return;
+    // if the target window vanished, drop the menu. (satoru)
+    if (!GetWindow(wm_ctx_win_id)) { wm_ctx_open = false; return; }
+
+    int menu_h = WM_CTX_ITEMS * WM_CTX_ITEM_H + 8;
+    // panel background + border (reuse the titlebar palette). (satoru)
+    Graphics::FillRoundedRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, menu_h, 6, COL_TITLE_FOCUSED);
+    Graphics::DrawRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, menu_h, COL_BORDER);
+
+    int count = DisplayManager::GetMonitorCount();
+    // entry 0  -  "Move to other monitor" (dimmed when only one output). (satoru)
+    int iy = wm_ctx_y + 4;
+    uint32_t txt = (count >= 2) ? COL_TITLE_TEXT : COL_TITLE_TEXT_DIM;
+    Graphics::DrawString(wm_ctx_x + 12, iy + (WM_CTX_ITEM_H - 12) / 2,
+                         "Move to other monitor", txt, 0x00000000);
 }
 
 int WindowManager::CreateWindow(const char* title, int x, int y, int w, int h,

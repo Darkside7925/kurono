@@ -2,6 +2,7 @@
 #include "multiboot.h"
 #include "../hal/hal.h"
 #include "../drivers/serial.h"
+#include "../drivers/rtc.h"
 #include "../fs/kvfs.h"
 #include "../../logo.h"
 
@@ -34,6 +35,18 @@ namespace {
         uint64_t rsi;
         uint64_t rdi;
         uint64_t rbp;
+        // r8-r15 captured from the interrupt frame so the minidump records the
+        // true fault-context extended registers (not the dump path's live
+        // values); zero for direct kebugcheckex calls. (satoru)
+        uint64_t r8;
+        uint64_t r9;
+        uint64_t r10;
+        uint64_t r11;
+        uint64_t r12;
+        uint64_t r13;
+        uint64_t r14;
+        uint64_t r15;
+        bool     have_extended;   // 1 when r8-r15 above came from a frame (satoru)
         uint64_t param1;
         uint64_t param2;
         uint64_t param3;
@@ -407,6 +420,231 @@ namespace {
         SerialLogger::Log("\r\n=== END PANIC ===\r\n");
     }
 
+    // ---- persistent minidump support ----------------------------------------
+    // we write a flat KuronoMiniDump to a fixed identity-mapped physical page
+    // so a freshly-booted kernel can recover it from ram (kvfs is wiped on the
+    // reboot the panic triggers). everything here is freestanding and avoids the
+    // heap. (satoru)
+
+    // freestanding byte fill (no libc in the kernel). (satoru)
+    static void dump_memset(void* dst, uint8_t val, uint32_t len) {
+        volatile uint8_t* p = (volatile uint8_t*)dst;
+        for (uint32_t i = 0; i < len; i++) p[i] = val;
+    }
+
+    // freestanding byte copy. (satoru)
+    static void dump_memcpy(void* dst, const void* src, uint32_t len) {
+        volatile uint8_t* d = (volatile uint8_t*)dst;
+        const uint8_t* s = (const uint8_t*)src;
+        for (uint32_t i = 0; i < len; i++) d[i] = s[i];
+    }
+
+    // copy a c-string into a fixed field, truncating and zero-padding. (satoru)
+    static void dump_copy_field(char* dst, uint32_t cap, const char* src) {
+        uint32_t i = 0;
+        if (src) {
+            for (; i < cap - 1 && src[i]; i++) dst[i] = src[i];
+        }
+        for (; i < cap; i++) dst[i] = 0;
+    }
+
+    // x86-64 canonical-address test: bits 63..47 must all match bit 47, so a
+    // valid pointer is either <= 0x00007FFF_FFFFFFFF or >= 0xFFFF8000_00000000.
+    // used to stop the stack walk on garbage. (satoru)
+    static bool dump_is_canonical(uint64_t a) {
+        uint64_t hi = a >> 47;
+        return hi == 0 || hi == 0x1FFFFu;
+    }
+
+    // days-from-epoch helpers, mirrored from timemanager::to_unix_s so the dump
+    // is self-contained and does not depend on timer state that may be unsafe to
+    // touch mid-panic. (satoru)
+    static bool dump_is_leap(uint16_t y) {
+        return ((y % 4) == 0 && (y % 100) != 0) || ((y % 400) == 0);
+    }
+    static uint16_t dump_month_days(uint16_t y, uint8_t m) {
+        static const uint8_t t[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        if (m == 2) return (uint16_t)(t[1] + (dump_is_leap(y) ? 1 : 0));
+        if (m >= 1 && m <= 12) return t[m - 1];
+        return 30;
+    }
+    static uint32_t dump_to_unix(uint16_t year, uint8_t mon, uint8_t dom,
+                                 uint8_t h, uint8_t m, uint8_t s) {
+        if (year < 1970) return 0;
+        uint32_t days = 0;
+        for (uint16_t y = 1970; y < year; y++) days += (dump_is_leap(y) ? 366u : 365u);
+        for (uint8_t mm = 1; mm < mon; mm++) days += dump_month_days(year, mm);
+        if (dom > 0) days += (uint32_t)(dom - 1);
+        return days * 86400u + (uint32_t)h * 3600u + (uint32_t)m * 60u + (uint32_t)s;
+    }
+
+    // pull the tail of the mirrored serial log out of kvfs (still intact at
+    // panic time  -  it is only lost on the reboot we are about to trigger). this
+    // is the best "recent serial lines" source available because seriallogger
+    // exposes no in-memory ring buffer. returns bytes copied; sets *truncated if
+    // older bytes were dropped. (satoru)
+    static uint32_t dump_collect_serial_tail(char* out, uint32_t cap, uint8_t* truncated) {
+        *truncated = 0;
+        if (cap == 0) return 0;
+        out[0] = 0;
+        if (!KVFS::GetRoot()) return 0;
+
+        // the runtime logger mirrors all seriallogger output to these files;
+        // try the in-os path first, then the system path. (satoru)
+        const char* candidates[2] = { "/kurono/logs/serial.log", "/system/logs/serial.log" };
+        for (int c = 0; c < 2; c++) {
+            int sz = KVFS::GetFileSize(candidates[c]);
+            if (sz <= 0) continue;
+
+            uint32_t fsize = (uint32_t)sz;
+            uint32_t want = cap - 1;
+            uint32_t start = 0;
+            if (fsize > want) { start = fsize - want; *truncated = 1; }
+
+            int fd = KVFS::Open(candidates[c], 1 /* read */);
+            if (fd < 0) continue;
+            KVFS::Seek(fd, (int32_t)start, 0 /* set */);
+            int got = KVFS::Read(fd, out, want);
+            KVFS::Close(fd);
+            if (got < 0) got = 0;
+            out[got] = 0;
+            return (uint32_t)got;
+        }
+        return 0;
+    }
+
+    // walk the rbp chain: frame layout is [rbp] = saved rbp, [rbp+8] = return
+    // address. stop on a null/non-canonical/non-increasing frame pointer. (satoru)
+    static uint32_t dump_walk_stack(uint64_t start_rbp, uint64_t* out, uint32_t max) {
+        uint32_t n = 0;
+        uint64_t rbp = start_rbp;
+        uint64_t prev = 0;
+        while (n < max && rbp != 0 && dump_is_canonical(rbp) && (rbp & 0x7) == 0) {
+            // frame pointers grow downward as we recurse, so each saved rbp must
+            // be strictly greater than the previous one; a non-increasing value
+            // means we've fallen off into garbage. (satoru)
+            if (prev != 0 && rbp <= prev) break;
+            uint64_t ret = ((const uint64_t*)(uintptr_t)rbp)[1];
+            if (ret == 0 || !dump_is_canonical(ret)) break;
+            out[n++] = ret;
+            prev = rbp;
+            rbp = ((const uint64_t*)(uintptr_t)rbp)[0];
+        }
+        return n;
+    }
+
+    // populate and persist the minidump. called from kebugcheckex after the
+    // panic screen renders but before reboot. registers that g_dump already
+    // captured from the interrupt frame are preferred (they reflect the actual
+    // fault context); r8-r15 and cr0/cr3/cr4 are read live here because g_dump
+    // does not carry them. (satoru)
+    static void write_minidump() {
+        // live register capture  -  used for r8-r15 unconditionally, and as a
+        // fallback for the gp regs / rsp / rbp when this is a direct
+        // kebugcheckex call (no interrupt frame, so g_dump's gp regs are 0). (satoru)
+        uint64_t l_rax, l_rbx, l_rcx, l_rdx, l_rsi, l_rdi, l_rbp, l_rsp;
+        uint64_t l_r8, l_r9, l_r10, l_r11, l_r12, l_r13, l_r14, l_r15;
+        __asm__ __volatile__("movq %%rax, %0" : "=r"(l_rax));
+        __asm__ __volatile__("movq %%rbx, %0" : "=r"(l_rbx));
+        __asm__ __volatile__("movq %%rcx, %0" : "=r"(l_rcx));
+        __asm__ __volatile__("movq %%rdx, %0" : "=r"(l_rdx));
+        __asm__ __volatile__("movq %%rsi, %0" : "=r"(l_rsi));
+        __asm__ __volatile__("movq %%rdi, %0" : "=r"(l_rdi));
+        __asm__ __volatile__("movq %%rbp, %0" : "=r"(l_rbp));
+        __asm__ __volatile__("movq %%rsp, %0" : "=r"(l_rsp));
+        __asm__ __volatile__("movq %%r8,  %0" : "=r"(l_r8));
+        __asm__ __volatile__("movq %%r9,  %0" : "=r"(l_r9));
+        __asm__ __volatile__("movq %%r10, %0" : "=r"(l_r10));
+        __asm__ __volatile__("movq %%r11, %0" : "=r"(l_r11));
+        __asm__ __volatile__("movq %%r12, %0" : "=r"(l_r12));
+        __asm__ __volatile__("movq %%r13, %0" : "=r"(l_r13));
+        __asm__ __volatile__("movq %%r14, %0" : "=r"(l_r14));
+        __asm__ __volatile__("movq %%r15, %0" : "=r"(l_r15));
+
+        // control registers read live (cr2 also lives in g_dump). (satoru)
+        uint64_t l_cr0, l_cr2, l_cr3, l_cr4;
+        __asm__ __volatile__("movq %%cr0, %0" : "=r"(l_cr0));
+        __asm__ __volatile__("movq %%cr2, %0" : "=r"(l_cr2));
+        __asm__ __volatile__("movq %%cr3, %0" : "=r"(l_cr3));
+        __asm__ __volatile__("movq %%cr4, %0" : "=r"(l_cr4));
+
+        // the dump lives at a fixed identity-mapped physical address. (satoru)
+        KuronoMiniDump* d = (KuronoMiniDump*)(uintptr_t)MiniDump::PHYS_ADDR;
+        dump_memset(d, 0, sizeof(KuronoMiniDump));
+
+        d->version   = 1;
+        d->size      = (uint32_t)sizeof(KuronoMiniDump);
+        d->stop_code = g_dump.stop_code;
+
+        // timestamp from the rtc  -  self-contained cmos read. (satoru)
+        RTC::Date rd; RTC::Time rt;
+        if (RTC::ReadDateTime(rd, rt)) {
+            d->time_valid = 1;
+            d->year   = rd.year;
+            d->month  = rd.mon;
+            d->day    = rd.dom;
+            d->hour   = rt.h;
+            d->minute = rt.m;
+            d->second = rt.s;
+            d->unix_time = dump_to_unix(rd.year, rd.mon, rd.dom, rt.h, rt.m, rt.s);
+        }
+
+        dump_copy_field(d->message, MiniDump::MSG_LEN, g_dump.reason);
+
+        // prefer fault-context gp regs from g_dump (populated from the interrupt
+        // frame); fall back to live values for direct bugchecks where they are
+        // zero. (satoru)
+        const bool have_frame = (g_dump.rip != 0 || g_dump.rsp != 0);
+        d->rax = have_frame ? g_dump.rax : l_rax;
+        d->rbx = have_frame ? g_dump.rbx : l_rbx;
+        d->rcx = have_frame ? g_dump.rcx : l_rcx;
+        d->rdx = have_frame ? g_dump.rdx : l_rdx;
+        d->rsi = have_frame ? g_dump.rsi : l_rsi;
+        d->rdi = have_frame ? g_dump.rdi : l_rdi;
+        d->rbp = have_frame ? g_dump.rbp : l_rbp;
+        d->rsp = have_frame ? g_dump.rsp : l_rsp;
+        // r8-r15 come from the fault frame when bugcheckfrominterrupt captured
+        // them; otherwise fall back to the live values read above. (satoru)
+        const bool have_ext = g_dump.have_extended;
+        d->r8  = have_ext ? g_dump.r8  : l_r8;
+        d->r9  = have_ext ? g_dump.r9  : l_r9;
+        d->r10 = have_ext ? g_dump.r10 : l_r10;
+        d->r11 = have_ext ? g_dump.r11 : l_r11;
+        d->r12 = have_ext ? g_dump.r12 : l_r12;
+        d->r13 = have_ext ? g_dump.r13 : l_r13;
+        d->r14 = have_ext ? g_dump.r14 : l_r14;
+        d->r15 = have_ext ? g_dump.r15 : l_r15;
+        d->rip    = g_dump.rip;
+        d->rflags = have_frame ? g_dump.rflags : 0;
+
+        d->cr0 = l_cr0;
+        d->cr2 = g_dump.cr2 ? g_dump.cr2 : l_cr2;
+        d->cr3 = l_cr3;
+        d->cr4 = l_cr4;
+
+        // stack trace: walk from the fault-context rbp when we have a frame,
+        // else from the live rbp captured above. (satoru)
+        uint64_t walk_rbp = have_frame ? g_dump.rbp : l_rbp;
+        d->frame_count = dump_walk_stack(walk_rbp, d->stack_trace, MiniDump::STACK_FRAMES);
+
+        // recent serial log tail (best-effort; see helper). (satoru)
+        d->serial_len = dump_collect_serial_tail(d->serial_tail,
+                                                 MiniDump::SERIAL_BYTES,
+                                                 &d->serial_truncated);
+
+        // publish the magic last so a reader never sees a half-written dump, and
+        // flush caches so the post-reboot kernel observes the bytes. (satoru)
+        __asm__ __volatile__("sfence" ::: "memory");
+        d->magic = MiniDump::MAGIC;
+        __asm__ __volatile__("sfence; wbinvd" ::: "memory");
+
+        SerialLogger::Log("KeBugCheckEx: minidump written to phys 0x1000000 (frames=");
+        SerialLogger::LogDec((int)d->frame_count);
+        SerialLogger::Log(", serial=");
+        SerialLogger::LogDec((int)d->serial_len);
+        SerialLogger::Log(")\r\n");
+    }
+
     static void draw_logo_small(uint32_t x, uint32_t y, uint32_t size) {
         if (size == 0) return;
         for (uint32_t dy = 0; dy < size; dy++) {
@@ -723,6 +961,10 @@ namespace KernelPanic {
         SerialLogger::Log(")\r\n");
         render_panic_screen();
 
+        // persist a full minidump to the reserved physical page so the next
+        // boot can recover it after kvfs (and this panic's reboot) wipe ram. (satoru)
+        write_minidump();
+
         // Persist the dump to /var/crash/last.dmp via KVFS so the next
         // boot can pick it up and present it to the user.  KVFS lives in
         // RAM, but the installer wires it through to the real disk on
@@ -784,6 +1026,16 @@ namespace KernelPanic {
         g_dump.rsi = frame->rsi;
         g_dump.rdi = frame->rdi;
         g_dump.rbp = frame->rbp;
+        // extended regs from the fault frame for the minidump. (satoru)
+        g_dump.r8  = frame->r8;
+        g_dump.r9  = frame->r9;
+        g_dump.r10 = frame->r10;
+        g_dump.r11 = frame->r11;
+        g_dump.r12 = frame->r12;
+        g_dump.r13 = frame->r13;
+        g_dump.r14 = frame->r14;
+        g_dump.r15 = frame->r15;
+        g_dump.have_extended = true;
 
         KeBugCheckEx(code,
                      frame->rip,
@@ -793,6 +1045,73 @@ namespace KernelPanic {
                      exception_name ? exception_name : "CPU EXCEPTION",
                      __FILE__,
                      (uint32_t)__LINE__);
+    }
+
+    bool ScanCrashDumpAtBoot() {
+        // the dump (if any) survives at this fixed identity-mapped physical
+        // address across the panic-triggered reboot. (satoru)
+        volatile KuronoMiniDump* d = (volatile KuronoMiniDump*)(uintptr_t)MiniDump::PHYS_ADDR;
+
+        // make sure we observe whatever the crashing kernel flushed. (satoru)
+        __asm__ __volatile__("mfence" ::: "memory");
+        if (d->magic != MiniDump::MAGIC) {
+            return false;  // no prior crash to recover (satoru)
+        }
+
+        // sanity-clamp the recorded size so a corrupt header can't make us copy
+        // past the reserved region. (satoru)
+        uint32_t copy_len = d->size;
+        if (copy_len == 0 || copy_len > MiniDump::MAX_BYTES) {
+            copy_len = (uint32_t)sizeof(KuronoMiniDump);
+        }
+
+        // build /var/log/kurono_crash_<timestamp>.dmp. fall back to a fixed
+        // suffix when the rtc timestamp was not valid at panic time. (satoru)
+        char ts[12];
+        if (d->time_valid && d->unix_time != 0) {
+            to_dec(d->unix_time, ts);
+        } else {
+            ts[0] = '0'; ts[1] = 0;
+        }
+
+        char path[64];
+        const char* prefix = "/var/log/kurono_crash_";
+        uint32_t pi = 0;
+        for (uint32_t i = 0; prefix[i] && pi < sizeof(path) - 1; i++) path[pi++] = prefix[i];
+        for (uint32_t i = 0; ts[i] && pi < sizeof(path) - 1; i++) path[pi++] = ts[i];
+        const char* suffix = ".dmp";
+        for (uint32_t i = 0; suffix[i] && pi < sizeof(path) - 1; i++) path[pi++] = suffix[i];
+        path[pi] = 0;
+
+        bool written = false;
+        if (KVFS::GetRoot()) {
+            KVFS::Mkdirs("/var/log");
+            // KuronoMiniDump is a flat pod  -  cast away volatile for the copy; the
+            // crashing kernel has long since finished writing it. (satoru)
+            int r = KVFS::WriteFile(path, (const void*)(uintptr_t)MiniDump::PHYS_ADDR, copy_len);
+            written = (r >= 0);
+            if (written) {
+                SerialLogger::Log("ScanCrashDumpAtBoot: recovered crash dump to ");
+                SerialLogger::Log(path);
+                SerialLogger::Log("\r\n");
+            } else {
+                SerialLogger::Log("ScanCrashDumpAtBoot: KVFS write FAILED for ");
+                SerialLogger::Log(path);
+                SerialLogger::Log("\r\n");
+            }
+        } else {
+            SerialLogger::Log("ScanCrashDumpAtBoot: KVFS not ready, skipping copy\r\n");
+        }
+
+        // clear the magic so the dump is recovered exactly once, regardless of
+        // whether the kvfs copy succeeded  -  leaving a stale magic would re-fire
+        // the recovery notice on every subsequent boot. a store fence is enough
+        // here: a full cache flush is only needed on the write side (which must
+        // reach ram before the panic reboot). (satoru)
+        d->magic = 0;
+        __asm__ __volatile__("sfence" ::: "memory");
+
+        return true;
     }
 }
 
