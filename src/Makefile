@@ -91,12 +91,23 @@ DENJI_MP4_BIN = $(MEDIA_DIR)/denji.mp4
 DENJI_MP4_OBJ = $(BUILD)/denji_mp4.o
 DENJI_KVID_BIN = $(SRC)/media/denji.kvid
 DENJI_KVID_OBJ = $(BUILD)/denji_kvid.o
+# user-imported video (satoru)
+SSSTIK_MP4_BIN  = $(SRC)/media/ssstik.mp4
+SSSTIK_MP4_OBJ  = $(BUILD)/ssstik_mp4.o
+SSSTIK_KVID_BIN = $(SRC)/media/ssstik.kvid
+SSSTIK_KVID_OBJ = $(BUILD)/ssstik_kvid.o
 MEDIA_OBJS    =
 ifneq ($(wildcard $(DENJI_MP4_BIN)),)
 MEDIA_OBJS   += $(DENJI_MP4_OBJ)
 endif
 ifneq ($(wildcard $(DENJI_KVID_BIN)),)
 MEDIA_OBJS   += $(DENJI_KVID_OBJ)
+endif
+ifneq ($(wildcard $(SSSTIK_MP4_BIN)),)
+MEDIA_OBJS   += $(SSSTIK_MP4_OBJ)
+endif
+ifneq ($(wildcard $(SSSTIK_KVID_BIN)),)
+MEDIA_OBJS   += $(SSSTIK_KVID_OBJ)
 endif
 
 # ─── User programs (test ELF64 binaries embedded into the kernel) ───────
@@ -384,6 +395,27 @@ $(DENJI_KVID_OBJ): $(DENJI_KVID_BIN)
 	  --set-section-flags .note.GNU-stack=noload,readonly \
 	  denji.kvid denji_kvid.o && \
 	rm -f denji.kvid
+
+# ─── Embed user-imported ssstik.mp4 + ssstik.kvid via objcopy (satoru) ────
+$(SSSTIK_MP4_OBJ): $(SSSTIK_MP4_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/ssstik.mp4 && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  --add-section .note.GNU-stack=/dev/null \
+	  --set-section-flags .note.GNU-stack=noload,readonly \
+	  ssstik.mp4 ssstik_mp4.o && \
+	rm -f ssstik.mp4
+
+$(SSSTIK_KVID_OBJ): $(SSSTIK_KVID_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/ssstik.kvid && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  --add-section .note.GNU-stack=/dev/null \
+	  --set-section-flags .note.GNU-stack=noload,readonly \
+	  ssstik.kvid ssstik_kvid.o && \
+	rm -f ssstik.kvid
 
 # ─── Compile assembly ─────────────────────────────────────────────────────
 $(BUILD)/%.o: $(SRC)/%.asm

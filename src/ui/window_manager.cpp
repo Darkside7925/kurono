@@ -111,10 +111,14 @@ static void wm_clamp_drag_bounds(Window* win) {
     if (visible_h < 16) visible_h = 16;
     int win_w = win->w > 0 ? win->w : 1;
     int win_h = win->h > 0 ? win->h : 1;
-    int min_x = wm_desktop_x - (win_w - visible_w);
-    int max_x = wm_desktop_x + wm_desktop_w - visible_w;
+    // keep the whole window on-screen so it can't be dragged off an edge and
+    // get lost / appear to "wrap" to the other side. oversized windows pin to
+    // the top-left via the max<min guards below. (satoru)
+    (void)visible_w; (void)visible_h;
+    int min_x = wm_desktop_x;
+    int max_x = wm_desktop_x + wm_desktop_w - win_w;
     int min_y = wm_desktop_y;
-    int max_y = wm_desktop_y + wm_desktop_h - visible_h;
+    int max_y = wm_desktop_y + wm_desktop_h - win_h;
     if (max_x < min_x) max_x = min_x;
     if (max_y < min_y) max_y = min_y;
     if (win->x < min_x) win->x = min_x;

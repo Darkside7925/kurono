@@ -17,4 +17,9 @@ bool IsOpen();
 // data must remain valid for the lifetime of the window.
 void OpenBuffer(const uint8_t* data, uint32_t size, const char* title);
 
+// open a .kvid file from the vfs: reads it into a heap buffer owned by the
+// app (freed on Close) and plays it. returns false if the file can't be
+// read or isn't a kvid. (satoru)
+bool OpenFile(const char* path);
+
 } // namespace DenjiApp

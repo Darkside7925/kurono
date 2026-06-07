@@ -60,8 +60,15 @@ static constexpr int32_t ACCEL_FAST_THRESHOLD = 24; // device units / packet
 static constexpr int32_t ACCEL_MAX_GAIN_Q8 = 640;   // 2.5x in Q8
 static constexpr int32_t ACCEL_BASE_GAIN_Q8 = 256;  // 1.0x
 
+// raw mode: 1:1 mapping, no dead-zone, no acceleration. used for precise
+// synthetic input (automated ui testing) and as an accessibility option for
+// users who dislike pointer acceleration. toggled via kurono.mouse.raw=1. (satoru)
+static bool g_raw_mouse = false;
+void Mouse::SetRawMode(bool enable) { g_raw_mouse = enable; }
+
 static inline int32_t apply_pointer_accel_q8(int32_t v) {
     if (v == 0) return 0;
+    if (g_raw_mouse) return v << 8;  // exact 1:1 in q8, no accel/deadzone (satoru)
     int32_t mag = v < 0 ? -v : v;
     if (mag <= ACCEL_DEADZONE) return 0;
     int32_t adj = mag - ACCEL_DEADZONE;

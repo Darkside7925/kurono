@@ -949,6 +949,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // the desktop with a default user. used by the bootable iso "straight to
     // desktop" entry so a fresh vm boots to a usable desktop with no typing. (satoru)
     bool boot_autologin = false;
+    // ffmpeg on-device smoke test, parsed early into a bool: the grub cmdline
+    // string lives in low memory that the (now large) kernel image/heap can
+    // clobber before the test runs deep in boot, so we must latch it now. (satoru)
+    bool boot_ffmpeg_test = false;
+    // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
+    bool boot_mouse_raw = false;
     char boot_cli_run[160];
     boot_cli_run[0] = 0;
     static char boot_gui_run[256];
@@ -975,6 +981,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // autologin: bypass lockscreen + first-boot wizard, land on desktop. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.autologin=1") || boot_has_token(boot_cmdline, "kurono.autologin")) {
             boot_autologin = true;
+        }
+        // latch the ffmpeg smoke-test flag early (see decl). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.ffmpeg.test=1") || boot_has_token(boot_cmdline, "kurono.ffmpeg.test")) {
+            boot_ffmpeg_test = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
+            boot_mouse_raw = true;
         }
         boot_get_value(boot_cmdline, "kurono.cli.run", boot_cli_run, (int)sizeof(boot_cli_run));
         // optional GUI autorun: open Terminal and queue a command. Used purely
@@ -1393,6 +1406,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (has_display && !force_text_mode) {
         Mouse::Init();
         Mouse::SetDPIScaling(800, 800);
+        if (boot_mouse_raw) {
+            Mouse::SetRawMode(true);
+            SerialLogger::Log("Mouse: raw 1:1 mode enabled (no acceleration)\r\n");
+        }
     } else {
         SerialLogger::Log("Mouse: Skipped in text-only boot mode\r\n");
     }
@@ -1911,8 +1928,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // embedded musl-static ffmpeg runs in ring-3 via the real loader + the
     // widened syscall surface. logs FFMPEG_* markers to serial so a headless
     // qemu boot can verify version output + a real pcm->wav transcode. (satoru)
-    if (boot_cmdline && boot_has_token(boot_cmdline, "kurono.ffmpeg.test=1") &&
-        EmbeddedUserprogs::HasFfmpeg()) {
+    if (boot_ffmpeg_test && EmbeddedUserprogs::HasFfmpeg()) {
         SerialLogger::Log("[ffmpeg-test] PMM free MB=");
         SerialLogger::LogDec((int)(PMM::GetFreeMemory() / (1024 * 1024)));
         SerialLogger::Log("\r\n");
@@ -1968,6 +1984,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             SerialLogger::LogDec(outsz);
             SerialLogger::Log("\r\n");
         }
+        // note: on-device h264 transcode via ffmpeg works but software
+        // decode of 934x720 under qemu-tcg (no kvm) is far too slow for a
+        // boot-time smoke test, so it is not exercised here. real-video
+        // playback is provided by the native kvid player (see playvideo /
+        // the imported ssstik.kvid), which is fast. on kvm/bare-metal the
+        // ffmpeg h264 path runs at normal speed. (satoru)
     }
 
     SerialLogger::Log("[Installer] Init...\r\n");
@@ -2075,6 +2097,23 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec(EmbeddedMedia::DenjiKVIDSize());
         SerialLogger::Log(" bytes\r\n");
     }
+    // user-imported video: original mp4 + playable kvid (satoru)
+    if (EmbeddedMedia::HasSsstikMP4()) {
+        KVFS::WriteFile("/home/user/Videos/ssstik.mp4",
+                        EmbeddedMedia::SsstikMP4Data(),
+                        EmbeddedMedia::SsstikMP4Size());
+        SerialLogger::Log("[KVFS] Imported ssstik.mp4: ");
+        SerialLogger::LogDec(EmbeddedMedia::SsstikMP4Size());
+        SerialLogger::Log(" bytes\r\n");
+    }
+    if (EmbeddedMedia::HasSsstikKVID()) {
+        KVFS::WriteFile("/home/user/Videos/ssstik.kvid",
+                        EmbeddedMedia::SsstikKVIDData(),
+                        EmbeddedMedia::SsstikKVIDSize());
+        SerialLogger::Log("[KVFS] Imported ssstik.kvid: ");
+        SerialLogger::LogDec(EmbeddedMedia::SsstikKVIDSize());
+        SerialLogger::Log(" bytes\r\n");
+    }
     KVFS::WriteString("/home/user/Music/startup.wav", "[WAV PCM 22050Hz 16-bit stereo 0:05]");
     KVFS::WriteString("/home/user/Music/notification.wav", "[WAV PCM 22050Hz 16-bit mono 0:02]");
     KVFS::WriteString("/home/user/hello.kcl", "# KCL Script\nprint \"Hello from Kurono!\"\nset x 42\nprint x\n");
@@ -2110,6 +2149,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     //   * The legacy Audio::Init() below remains for the SB16-direct
     //     callers that haven't been migrated yet (they all eventually
     //     forward to AudioServer)
+    // run c++ global constructors (.init_array) now, before the audio server
+    // probes its registry. the audio backends (sb16/ac97/hda/pcspk) register
+    // via static-init ctors; the kernel never ran them, so the registry was
+    // empty and audio reported "no usable backend". these are the only ctors
+    // in the image (4 of them, all audio backends). (satoru)
+    {
+        extern void (*__init_array_start[])();
+        extern void (*__init_array_end[])();
+        for (void (**ctor)() = __init_array_start; ctor != __init_array_end; ++ctor) {
+            if (*ctor) (*ctor)();
+        }
+    }
     AudioDMA::Init();
     AudioServer::Init();
 

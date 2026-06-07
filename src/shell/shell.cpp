@@ -10,6 +10,8 @@
 #include "../kernel/userspace.h"
 #include "../kernel/elf_loader.h"
 #include "../linux/linux_syscall.h"
+#include "../apps/denji_app.h"
+#include "../media/embedded_media.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
 #include "../drivers/gpu_probe.h"
@@ -909,6 +911,7 @@ namespace ShellBuiltins {
     int cmd_poweroff(KuronoShell*, int, const char**, char*, int);
     int cmd_suspend(KuronoShell*, int, const char**, char*, int);
     int cmd_ffmpeg(KuronoShell*, int, const char**, char*, int);
+    int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
 }
 
 void KuronoShell::RegisterBuiltins() {
@@ -916,6 +919,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("help",     "Show available commands",     ENV_KURONO, "builtin", cmd_help);
     RegisterCommand("denji",    "Open Denji video player",     ENV_KURONO, "media",   cmd_denji);
     RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
+    RegisterCommand("playvideo","Play the imported video (ssstik)", ENV_AUTO, "media",  cmd_playvideo);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
     RegisterCommand("version",  "Show OS version",             ENV_KURONO, "builtin", cmd_version);
     RegisterCommand("env",      "Show current environment",    ENV_KURONO, "builtin", cmd_env);
@@ -1727,6 +1731,18 @@ int cmd_ffmpeg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
     // double-free guard so this is safe on an already-exited task. (satoru)
     Scheduler::DestroyProcess(proc);
     return p;
+}
+
+// open the user-imported video in the native player window. plays the
+// embedded ssstik.kvid (transcoded from the imported mp4). (satoru)
+int cmd_playvideo(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    if (!EmbeddedMedia::HasSsstikKVID()) {
+        return sappend(out, 0, mx, "playvideo: no imported video in this build\n");
+    }
+    DenjiApp::OpenBuffer(EmbeddedMedia::SsstikKVIDData(),
+                         EmbeddedMedia::SsstikKVIDSize(), "ssstik.mp4");
+    return sappend(out, 0, mx, "playvideo: opening imported video (ssstik.mp4)...\n");
 }
 
 int cmd_pwd(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {

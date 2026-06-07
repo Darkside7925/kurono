@@ -691,7 +691,16 @@ int Scheduler::GetProcessSnapshot(SchedulerProcessSnapshot* out, int max_count) 
     if (!out || max_count <= 0) return 0;
 
     int count = 0;
+    int guard = 0;
     for (Process* proc = ready_queue; proc && count < max_count; proc = proc->next) {
+        // backstop against a corrupt/cyclic ready_queue: a bad `next` (e.g.
+        // a freed-then-reused node, or memory clobbered by an out-of-bounds
+        // write) would otherwise be dereferenced and #gp on a non-canonical
+        // address. validate the pointer is plausible (kernel-heap range, in
+        // physical ram, 8-aligned) and cap the walk. (satoru)
+        uintptr_t pa = (uintptr_t)proc;
+        if ((pa & 0x7u) || pa < 0x100000ULL || pa >= 0x400000000ULL) break;
+        if (++guard > 4096) break;
         SchedulerProcessSnapshot& snap = out[count++];
         memset(&snap, 0, sizeof(snap));
 
