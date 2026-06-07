@@ -20,6 +20,7 @@ public:
     static void SetInvertScroll(bool inv);
     static void GetPosition(int& x, int& y);
     static void DrawAt(int x, int y);
+    static void SetRawMode(bool enable);  // 1:1 pointer, no accel (satoru)
     static int mx, my;
     
     // touchpad/scroll configuration

@@ -9,6 +9,7 @@
 #include "../ui/desktop.h"
 #include "text_editor.h"
 #include "media_player.h"
+#include "denji_app.h"
 
 // ── color palette ──────────────────────────────────────────────────────
 static const unsigned int FM_BG        = 0xFF0F0F1A;
@@ -102,12 +103,14 @@ static bool ext_in(const char* name, const char* const* exts, int n){
 // ── extension classification ──────────────────────────────────────────
 static const char* TEXT_EXT[]={"txt","c","h","cpp","cc","hpp","py","kcl","md","sh","cfg","json","ini","log","conf","html","css","js","rs","toml","yml","yaml","xml"};
 static const char* MEDIA_EXT[]={"mp4","wav","mp3","ogg","flac","avi","mkv","webm","m4a","opus"};
+static const char* VIDEO_EXT[]={"kvid","mp4","mkv","avi","webm","mov","m4v"};
 static const char* IMG_EXT[]={"png","jpg","jpeg","bmp","gif","ppm","tga","ico","webp"};
 static const char* ARCHIVE_EXT[]={"zip","tar","gz","bz2","xz","7z","rar","kpkg","kro"};
 static const char* CODE_EXT[]={"c","h","cpp","cc","hpp","py","rs","js","kcl"};
 
 static bool is_text_file(const char* n){return ext_in(n,TEXT_EXT,sizeof(TEXT_EXT)/sizeof(TEXT_EXT[0]));}
 static bool is_media_file(const char* n){return ext_in(n,MEDIA_EXT,sizeof(MEDIA_EXT)/sizeof(MEDIA_EXT[0]));}
+static bool is_video_file(const char* n){return ext_in(n,VIDEO_EXT,sizeof(VIDEO_EXT)/sizeof(VIDEO_EXT[0]));}
 static bool is_image_file(const char* n){return ext_in(n,IMG_EXT,sizeof(IMG_EXT)/sizeof(IMG_EXT[0]));}
 static bool is_archive_file(const char* n){return ext_in(n,ARCHIVE_EXT,sizeof(ARCHIVE_EXT)/sizeof(ARCHIVE_EXT[0]));}
 static bool is_code_file(const char* n){return ext_in(n,CODE_EXT,sizeof(CODE_EXT)/sizeof(CODE_EXT[0]));}
@@ -460,7 +463,26 @@ void FileManagerApp::OpenEntryPane(int pane,int idx){
     if(e[idx].is_dir){ NavigateToPane(pane,full,true); return; }
     PushRecent(full);
     RuntimeLog::LogAppEvent("files","open-entry",full);
-    if(is_media_file(e[idx].name))      MediaPlayerApp::Open(full);
+    if(is_video_file(e[idx].name)){
+        // play through the native kvid player. real-time h264 decode isn't
+        // feasible on a freestanding kernel, so a non-kvid video plays its
+        // host-transcoded sibling "<name>.kvid" if one exists; otherwise we
+        // fall back to the media player's (audio) view. (satoru)
+        const char* dot=nullptr; for(const char* p=full;*p;++p) if(*p=='.') dot=p;
+        if(dot && istricmp(dot+1,"kvid")==0){
+            DenjiApp::OpenFile(full);
+        } else {
+            char kv[FM_MAX_PATH];
+            int blen = dot ? (int)(dot-full) : 0;
+            if(!dot){ while(full[blen]) blen++; }
+            int k=0; while(k<blen && k<FM_MAX_PATH-6){ kv[k]=full[k]; k++; }
+            const char* suf=".kvid"; for(int s=0; suf[s] && k<FM_MAX_PATH-1; s++) kv[k++]=suf[s];
+            kv[k]=0;
+            if(KVFS::Exists(kv)) DenjiApp::OpenFile(kv);
+            else MediaPlayerApp::Open(full);
+        }
+    }
+    else if(is_media_file(e[idx].name))      MediaPlayerApp::Open(full);
     else if(is_image_file(e[idx].name)) MediaPlayerApp::Open(full);
     else                                 TextEditorApp::OpenFile(full);
 }

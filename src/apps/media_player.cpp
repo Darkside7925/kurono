@@ -943,16 +943,14 @@ void MediaPlayerApp::RenderCodecInfo(Window* w) {
     int cnw = mp_slen(codec_name) * 8;
     Graphics::DrawString(cx + 10 + (60 - cnw)/2, info_y + 2, codec_name, 0xFF000000, 0xFF000000);
 
-    // active output backend indicator
-    const char* backend = "No Audio";
-    if (Audio::IsAvailable() && Audio::GetState() == AUDIO_PLAYING)
-        backend = "SB16";
-    if (AC97::IsAvailable() && AC97::GetState() == AC97_PLAYING)
-        backend = "AC97";
-    if (HDAudio::IsDetected() && HDAudio::IsPlaying())
-        backend = "HDA";
+    // active output backend indicator  -  reflects the unified AudioServer's
+    // chosen backend (hda/ac97/sb16/pcspk) rather than the legacy per-driver
+    // probes, which the player no longer routes through. (satoru)
+    const char* backend = AudioServer::ActiveBackendName();
+    if (!backend || backend[0] == 0 || backend[0] == '(') backend = "No Audio";
 
-    uint32_t bk_col = (playing && mp_slen(backend) > 6) ? MP_GREEN : MP_TEXT_DIM;
+    bool have_out = (backend[0] != 'N');  // "No Audio" begins with 'N'
+    uint32_t bk_col = (playing && have_out) ? MP_GREEN : MP_TEXT_DIM;
     char bk_label[16] = "Out: ";
     int bl = mp_slen(bk_label);
     for(int i=0; backend[i]&&bl<15; i++) bk_label[bl++]=backend[i];

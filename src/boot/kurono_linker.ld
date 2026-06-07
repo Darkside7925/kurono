@@ -21,7 +21,19 @@ SECTIONS
         *(.rodata)
         *(.rodata.*)
     }
-    
+
+    /* c++ global constructors (.init_array). the kernel calls these early in
+       boot via RunGlobalConstructors()  -  without it, static-init registrations
+       (e.g. the audio backends) never run and the subsystem appears absent. (satoru) */
+    .init_array BLOCK(4K) : ALIGN(8)
+    {
+        __init_array_start = .;
+        KEEP(*(.init_array))
+        KEEP(*(.init_array.*))
+        KEEP(*(.ctors))
+        __init_array_end = .;
+    }
+
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)

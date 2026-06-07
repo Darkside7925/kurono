@@ -7,6 +7,8 @@
 #include "../drivers/graphics.h"
 #include "../drivers/serial.h"
 #include "../system/logging.h"
+#include "../fs/kvfs.h"
+#include "../kernel/heap.h"
 
 namespace DenjiApp {
 
@@ -20,6 +22,9 @@ static char g_title_buf[64];
 static const uint8_t* g_pending_data = nullptr;
 static uint32_t g_pending_size = 0;
 static int g_defer_open_frames = 0;
+// heap buffer backing a kvid loaded from the vfs (OpenFile). owned here,
+// freed on Close. null when playing an embedded asset. (satoru)
+static uint8_t* g_file_buffer = nullptr;
 
 static void ResetPendingOpen() {
     g_pending_data = nullptr;
@@ -130,6 +135,31 @@ void OpenBuffer(const uint8_t* data, uint32_t size, const char* title) {
     (void)Slen;
 }
 
+bool OpenFile(const char* path) {
+    if (!path) return false;
+    int sz = KVFS::GetFileSize(path);
+    if (sz <= 16) return false;
+    uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)sz);
+    if (!buf) return false;
+    int got = KVFS::ReadFile(path, buf, (uint32_t)sz);
+    // validate the KVID magic before handing it to the player. (satoru)
+    if (got < 16 || buf[0] != 'K' || buf[1] != 'V' || buf[2] != 'I' || buf[3] != 'D') {
+        KernelHeap::Free(buf);
+        SerialLogger::Log("[DenjiApp] OpenFile: not a kvid: ");
+        SerialLogger::Log(path);
+        SerialLogger::Log("\r\n");
+        return false;
+    }
+    // close any current video (frees the previous file buffer) then take
+    // ownership of the new one. (satoru)
+    Close();
+    g_file_buffer = buf;
+    const char* base = path;
+    for (const char* p = path; *p; ++p) if (*p == '/') base = p + 1;
+    OpenBuffer(buf, (uint32_t)got, base);
+    return true;
+}
+
 void Close() {
     if (g_win_id >= 0) {
         WindowManager::CloseWindow(g_win_id);
@@ -138,6 +168,10 @@ void Close() {
     if (g_state_loaded) {
         VideoPlayer::Close(g_state);
         g_state_loaded = false;
+    }
+    if (g_file_buffer) {
+        KernelHeap::Free(g_file_buffer);
+        g_file_buffer = nullptr;
     }
     g_open_failed = false;
     ResetPendingOpen();
