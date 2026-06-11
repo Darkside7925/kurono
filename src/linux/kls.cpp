@@ -696,7 +696,10 @@ int KLS::LoadELFSegments(const void* elf_data, uint32_t size) {
     const Elf32Header* eh = (const Elf32Header*)elf_data;
     const uint8_t* data = (const uint8_t*)elf_data;
 
-    if (eh->e_phoff + eh->e_phnum * eh->e_phentsize > size) return -1;
+    // 64-bit math so a crafted ELF can't overflow this bound check. (satoru)
+    if ((uint64_t)eh->e_phoff +
+        (uint64_t)eh->e_phnum * (uint64_t)eh->e_phentsize > (uint64_t)size)
+        return -1;
 
     for (int i = 0; i < eh->e_phnum; i++) {
         const Elf32Phdr* ph = (const Elf32Phdr*)

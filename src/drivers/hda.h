@@ -57,6 +57,17 @@
 #define HDA_VERB(cad, nid, verb, payload) \
     (((uint32_t)(cad) << 28) | ((uint32_t)(nid) << 20) | ((uint32_t)(verb) << 8) | (payload))
 
+// 4-bit verb form (verb in [19:16], 16-bit payload in [15:0]). produces the
+// identical dword as HDA_VERB(cad,nid,0x300,payload) for the pre-shifted 0x3xx
+// constants, but keeps the spec verb id (0x3) explicit at the call site. (satoru)
+#define HDA_VERB4(cad, nid, verb4, payload) \
+    (((uint32_t)(cad) << 28) | ((uint32_t)(nid) << 20) | (((uint32_t)(verb4) & 0xF) << 16) | ((uint32_t)(payload) & 0xFFFF))
+
+// round v up to the next multiple of a (a must be a power of two). the hda spec
+// requires 128-byte alignment for corb/rirb/bdl dma structures; KernelHeap only
+// guarantees 16-byte, so we over-allocate and align the usable pointer. (satoru)
+static inline uint64_t hda_align_up(uint64_t v, uint64_t a) { return (v + (a - 1)) & ~(a - 1); }
+
 #define HDA_VERB_GET_PARAM     0xF00
 #define HDA_VERB_SET_STREAM    0x706
 #define HDA_VERB_SET_FORMAT    0x200  // set_stream_format 2xxxx
@@ -68,6 +79,8 @@
 #define HDA_VERB_GET_CONNLIST  0xF02
 #define HDA_VERB_GET_CONNSEL   0xF01
 #define HDA_VERB_SET_CONNSEL   0x701
+#define HDA_VERB_GET_CONFIG_DEF 0xF1C  // get configuration default (pin config) (satoru)
+#define HDA_VERB_SET_AMP_GAIN4  0x3    // 4-bit form of set amp gain/mute (satoru)
 
 #define HDA_PARAM_VENDOR_ID    0x00
 #define HDA_PARAM_NODE_COUNT   0x04
@@ -152,7 +165,11 @@ private:
     static bool detected;
     static volatile uint8_t* bar0;
 
-    // corb/rirb
+    // corb/rirb. the *_raw pointers hold the un-aligned heap allocations (kept
+    // so nothing is leaked / for completeness); corb & rirb are the 128-byte
+    // aligned usable pointers actually programmed into the controller. (satoru)
+    static void*     corb_raw;
+    static void*     rirb_raw;
     static uint32_t* corb;
     static uint64_t* rirb;
     static int corb_size;
@@ -166,7 +183,9 @@ private:
     static int pin_nid;        // output pin nid
     static int codec_addr;     // active codec address
 
-    // stream state
+    // stream state. bdl_raw is the un-aligned heap base; bdl is the 128-byte
+    // aligned bdl actually programmed into the stream descriptor. (satoru)
+    static void* bdl_raw;
     static HDA_BDL_Entry* bdl;
     static void* dma_buffer;
     static bool playing;
@@ -175,6 +194,12 @@ private:
 
     // stream base offset
     static uint32_t stream_base;
+
+    // calibrated busy-waits. DelayUs spins on the 24 mhz hda wall clock so the
+    // wait survives -O2 (the old for(volatile) loops compiled to nothing and
+    // codec power-up never completed); DelayMs defers to the pit timer. (satoru)
+    static void DelayUs(uint32_t us);
+    static void DelayMs(uint32_t ms);
 
     // register access
     static uint8_t  Read8(uint32_t offset);
@@ -191,6 +216,7 @@ private:
 
     // codec discovery
     static bool ProbeCodecs();
+    static int  FindAFG(int cad);          // locate the audio function group node (satoru)
     static bool FindOutputPath(int cad);
 
     // stream setup

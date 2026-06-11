@@ -16,11 +16,15 @@
 #include "../net/network.h"
 #include "../system/ui_config.h"
 #include "../fs/kvfs.h"
+#include "../media/mediadecoder.h"   // MediaDecoder::Image type for the wallpaper (satoru)
+#include "wallpaper.h"               // wallpaper_rgba_data  -> builtin index 0 (satoru)
+#include "wallpaper2.h"              // wallpaper2_rgba_data -> builtin index 1 (satoru)
 #include "../apps/terminal.h"
 #include "../apps/file_manager.h"
 #include "../apps/calculator.h"
 #include "../apps/text_editor.h"
 #include "../apps/settings.h"
+#include "../apps/system_settings.h"   // new modular settings app (satoru)
 #include "../shell/shell.h"
 #include "../apps/task_manager.h"
 #include "../apps/browser.h"
@@ -1003,6 +1007,18 @@ void Taskbar::Tick(uint32_t delta_ms, int mx, int my){
     }
 }
 
+bool Taskbar::IsAnimating(){
+    // open popups animate; closing ones keep a decaying phase until ~0.
+    if (start_menu_open   || start_menu_phase   > 0.01f) return true;
+    if (volume_popup_open || volume_popup_phase > 0.01f) return true;
+    // hover-lift on pinned icons eases out after the pointer leaves.
+    for (int i = 0; i < TB_PINNED_COUNT && i < 8; i++)
+        if (pinned_hover_phase[i] > 0.01f) return true;
+    // blinking search cursor needs periodic repaint while typing.
+    if (search_active) return true;
+    return false;
+}
+
 //  desktop (icons + wallpaper)
 int           Desktop::screen_width    = 0;
 int           Desktop::screen_height   = 0;
@@ -1028,6 +1044,11 @@ uint32_t*     Desktop::gradient_cache  = nullptr;
 int           Desktop::gradient_cache_h = 0;
 size_t        Desktop::gradient_cache_bytes = 0;
 bool          Desktop::have_image_wallpaper = false;
+uint8_t*      Desktop::wallpaper_src       = nullptr;
+int           Desktop::wallpaper_src_w     = 0;
+int           Desktop::wallpaper_src_h     = 0;
+int           Desktop::wallpaper_src_order = 0;
+size_t        Desktop::wallpaper_src_bytes = 0;
 
 int      Desktop::cfg_icon_size     = ICON_SIZE;
 int      Desktop::cfg_spacing_x    = ICON_SPACING_X;
@@ -1309,46 +1330,34 @@ void Desktop::SetWallpaper(unsigned int c){
         gradient_cache_bytes = 0;
         gradient_cache_h = 0;
     }
+    Graphics::MarkUIDirty();   // wallpaper swap is async (Settings); must repaint
 }
 
-void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
-    if (!img.valid || !img.data || img.width <= 0 || img.height <= 0) {
-        have_image_wallpaper = false;
-        if (gradient_cache) {
-            PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
-            gradient_cache = nullptr;
-            gradient_cache_bytes = 0;
-            gradient_cache_h = 0;
-        }
-        return;
-    }
-    int w = screen_width;
-    // Floating taskbar leaves a strip of wallpaper visible at the bottom
-    // and behind the bar's rounded corners  -  render full screen height.
-    int h = screen_height;
-    if (w <= 0 || h <= 0) return;
+// (re)build the full-screen wallpaper cache at w x h from the retained source
+// image using nearest-neighbor scaling. shared by SetWallpaperImage (initial)
+// and RenderWallpaper (on a mode change) so an image wallpaper survives
+// resolution switches instead of dropping to the procedural gradient. (satoru)
+bool Desktop::ScaleWallpaperCache(int w, int h){
+    if (!wallpaper_src || wallpaper_src_w <= 0 || wallpaper_src_h <= 0) return false;
+    if (w <= 0 || h <= 0) return false;
 
-    // allocate full-screen cache
     if (gradient_cache) { PMM::FreeBytes(gradient_cache, gradient_cache_bytes); gradient_cache = nullptr; }
-    int total = w * h;
-    size_t bytes = (size_t)total * sizeof(uint32_t);
+    size_t bytes = (size_t)w * (size_t)h * sizeof(uint32_t);
     gradient_cache = (uint32_t*)PMM::AllocBytes(bytes);
-    if (!gradient_cache) return;
+    if (!gradient_cache) { gradient_cache_bytes = 0; gradient_cache_h = 0; have_image_wallpaper = false; return false; }
     gradient_cache_bytes = bytes;
     gradient_cache_h = h;
     have_image_wallpaper = true;
 
-    // scale image to screen using nearest-neighbor sampling
     for (int y = 0; y < h; y++) {
-        int src_y = (y * img.height) / h;
-        if (src_y >= img.height) src_y = img.height - 1;
+        int src_y = (y * wallpaper_src_h) / h;
+        if (src_y >= wallpaper_src_h) src_y = wallpaper_src_h - 1;
         for (int x = 0; x < w; x++) {
-            int src_x = (x * img.width) / w;
-            if (src_x >= img.width) src_x = img.width - 1;
-            int idx = (src_y * img.width + src_x);
-            uint8_t* p = img.data + idx * 4;
+            int src_x = (x * wallpaper_src_w) / w;
+            if (src_x >= wallpaper_src_w) src_x = wallpaper_src_w - 1;
+            uint8_t* p = wallpaper_src + (size_t)(src_y * wallpaper_src_w + src_x) * 4;
             uint8_t r, g, b;
-            if (img.order == 1) { // bgra
+            if (wallpaper_src_order == 1) { // bgra
                 b = p[0]; g = p[1]; r = p[2];
             } else { // rgba
                 r = p[0]; g = p[1]; b = p[2];
@@ -1356,6 +1365,69 @@ void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
             gradient_cache[y * w + x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
         }
     }
+    return true;
+}
+
+void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
+    if (!img.valid || !img.data || img.width <= 0 || img.height <= 0) {
+        have_image_wallpaper = false;
+        if (wallpaper_src) {
+            PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes);
+            wallpaper_src = nullptr; wallpaper_src_bytes = 0;
+            wallpaper_src_w = 0; wallpaper_src_h = 0;
+        }
+        if (gradient_cache) {
+            PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
+            gradient_cache = nullptr;
+            gradient_cache_bytes = 0;
+            gradient_cache_h = 0;
+        }
+        Graphics::MarkUIDirty();   // cleared image wallpaper -> repaint
+        return;
+    }
+
+    // retain a copy of the source pixels so the wallpaper can be re-scaled on a
+    // later resolution change (the display backend may finalize a different mode
+    // after boot, e.g. virtio-gpu coming up at 1080p). (satoru)
+    size_t src_bytes = (size_t)img.width * (size_t)img.height * 4u;
+    if (wallpaper_src) { PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes); wallpaper_src = nullptr; }
+    wallpaper_src = (uint8_t*)PMM::AllocBytes(src_bytes);
+    if (!wallpaper_src) { wallpaper_src_bytes = 0; have_image_wallpaper = false; return; }
+    memcpy(wallpaper_src, img.data, src_bytes);
+    wallpaper_src_bytes = src_bytes;
+    wallpaper_src_w     = img.width;
+    wallpaper_src_h     = img.height;
+    wallpaper_src_order = img.order;
+
+    // Floating taskbar leaves a strip of wallpaper visible at the bottom and
+    // behind the bar's rounded corners  -  render full screen height.
+    if (screen_width <= 0 || screen_height <= 0) return;
+    ScaleWallpaperCache(screen_width, screen_height);
+    Graphics::MarkUIDirty();   // new wallpaper image ready -> repaint
+}
+
+// decode + apply one of the embedded builtin wallpapers (0 = primary, 1 =
+// secondary). used by the settings personalization page to switch the wallpaper
+// live, and at boot to honour the persisted desktop.wallpaper_index. (satoru)
+bool Desktop::ApplyBuiltinWallpaper(int idx){
+    // the builtin wallpapers are embedded as pre-decoded raw rgba (decoded on the
+    // host) so we never run the freestanding image decoder on them -- it corrupts
+    // a band of rows on large images. just point an Image at the rodata. (satoru)
+    MediaDecoder::Image img = {};
+    if (idx == 1) {
+        img.width  = (int)wallpaper2_rgba_w;
+        img.height = (int)wallpaper2_rgba_h;
+        img.data   = (uint8_t*)wallpaper2_rgba_data;
+    } else {
+        img.width  = (int)wallpaper_rgba_w;
+        img.height = (int)wallpaper_rgba_h;
+        img.data   = (uint8_t*)wallpaper_rgba_data;
+    }
+    img.valid = true;
+    img.order = 0;   // rgba
+    img.owns  = false;
+    SetWallpaperImage(img);
+    return true;
 }
 
 void Desktop::RenderWallpaper(){
@@ -1363,14 +1435,20 @@ void Desktop::RenderWallpaper(){
     if (h <= 0) return;
     int w = screen_width;
     size_t need_bytes = (size_t)w * (size_t)h * sizeof(uint32_t);
-    // If the screen dimensions changed since the cache was built (rare
-    // mode switch), drop the cache so it gets rebuilt at the new size.
+    // If the screen dimensions changed since the cache was built (mode switch),
+    // rebuild it at the new size. when an image wallpaper is set we re-scale it
+    // from the retained source so it survives the resolution change; otherwise
+    // we drop the stale cache and let the procedural gradient regenerate. (satoru)
     if (gradient_cache && (gradient_cache_h != h || gradient_cache_bytes != need_bytes)) {
-        PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
-        gradient_cache = nullptr;
-        gradient_cache_bytes = 0;
-        gradient_cache_h = 0;
-        have_image_wallpaper = false;
+        if (wallpaper_src) {
+            ScaleWallpaperCache(w, h);
+        } else {
+            PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
+            gradient_cache = nullptr;
+            gradient_cache_bytes = 0;
+            gradient_cache_h = 0;
+            have_image_wallpaper = false;
+        }
     }
 
     // if we have an image wallpaper, skip procedural generation
@@ -1667,6 +1745,15 @@ void Desktop::Tick(uint32_t delta_ms, int mx, int my){
     }
 }
 
+bool Desktop::IsAnimating(){
+    // hover-pop lift eases in/out over ~160ms; keep rendering until settled
+    // so the lift never freezes mid-transition once the pointer comes to
+    // rest on (or just off) an icon. mirrors Taskbar::IsAnimating(). (satoru)
+    for (int i = 0; i < icon_count && i < DESKTOP_MAX_ICONS; i++)
+        if (icon_hover_phase[i] > 0.01f) return true;
+    return false;
+}
+
 int Desktop::IconAt(int mx,int my){
     int sz = cfg_icon_size;
     for(int i=0;i<icon_count;i++){
@@ -1829,7 +1916,26 @@ void DesktopEnvironment::Init(int sw,int sh){
     WindowManager::SetDesktopArea(0, 0, sw, sh - Taskbar::GetHeight());
 }
 
-void DesktopEnvironment::Render(){
+// true when the scene behind a dragged window is "clean" enough that a cached
+// backdrop is safe to use: nothing that animates or overlays the window is
+// active. when any of these hold we fall back to a normal full render, so the
+// backdrop can never show stale/animating content. correctness over speed.
+// (satoru)
+static bool de_drag_backdrop_safe(){
+    if (WindowManager::HasActiveAnimations())       return false; // open/close/min/restore
+    if (ControlCenter::IsOpen() || ControlCenter::IsAnimating()) return false;
+    if (NotificationManager::ActiveCount() > 0)     return false; // a toast is visible
+    if (Taskbar::IsAnimating())                     return false; // start menu / tray anim
+    if (Taskbar::volume_popup_open)                 return false; // volume slider popup
+    if (Desktop::IsAnimating())                     return false; // icon hover-pop behind win
+    if (WindowManager::IsContextMenuOpen())         return false; // wm titlebar menu
+    return true;
+}
+
+// compose the full desktop once: wallpaper + icons, every window, taskbar,
+// control center, toasts. shared by the normal path and the drag-backdrop
+// capture (which first arms the wm to omit the dragged window). (satoru)
+static void de_render_full(){
     Desktop::Render();
     WindowManager::RenderAll();
     // pump queued wayland frame callbacks once per composited frame so clients
@@ -1839,6 +1945,32 @@ void DesktopEnvironment::Render(){
     ControlCenter::Render();
     // toasts render topmost so they sit above every panel. (satoru)
     NotificationManager::Render();
+}
+
+void DesktopEnvironment::Render(){
+    // ── cached-desktop snapshot fast path during a titlebar drag ──────
+    // while a window is being dragged and the scene behind it is static, we
+    // recompose ONLY the moving window each frame over a one-time snapshot of
+    // everything else, instead of re-blitting the wallpaper and every window /
+    // panel. that is what gives the drag steady frame times. (satoru)
+    if (WindowManager::IsWindowDragActive() && de_drag_backdrop_safe()){
+        if (WindowManager::DragBackdropReady()){
+            // common case: blit backdrop + redraw just the dragged window.
+            WindowManager::RenderDragFast();
+            return;
+        }
+        // first clean drag frame (or after an invalidation): compose one full
+        // frame WITHOUT the dragged window, snapshot it as the backdrop, then
+        // draw the dragged window on top so this frame is itself complete. the
+        // cost equals a normal frame  -  no regression on the transition. (satoru)
+        WindowManager::BeginDragCapture();
+        de_render_full();                       // dragged window omitted by the wm
+        WindowManager::CaptureDragBackdrop();   // snapshot back buffer -> backdrop
+        WindowManager::RenderDraggedWindowOnly();
+        return;
+    }
+
+    de_render_full();
 }
 
 // double-click tracking state
@@ -2091,6 +2223,7 @@ void DesktopEnvironment::ReloadFromConfig(){
     Taskbar::ReloadFromConfig();
     Desktop::ReloadFromConfig();
     WindowManager::ReloadFromConfig();
+    Graphics::MarkUIDirty();          // colors/layout/wallpaper may have changed
 }
 
 void DesktopEnvironment::LaunchTerminal(){
@@ -2121,7 +2254,7 @@ void DesktopEnvironment::LaunchTextEditor(){
     TextEditorApp::Open();
 }
 void DesktopEnvironment::LaunchSettings(){
-    SettingsApp::Open();
+    SystemSettings::Open();   // route to the new modular settings ui (satoru)
 }
 void DesktopEnvironment::LaunchTaskManager(){
     TaskManagerApp::Open();

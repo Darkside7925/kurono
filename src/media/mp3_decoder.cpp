@@ -861,8 +861,13 @@ uint8_t* MP3Decoder::DecodeAll(const uint8_t* mp3_data, int mp3_length,
     *out_sample_rate = hdr.sample_rate;
     *out_channels    = hdr.channels;
 
-    // allocate output buffer: 1152 samples/frame × channels × 2 bytes
-    int pcm_size = frame_count * 1152 * hdr.channels * 2;
+    // allocate output buffer: 1152 samples/frame × channels × 2 bytes.
+    // compute in 64-bit and cap: a crafted file packed with many tiny valid
+    // headers would overflow a 32-bit product into an undersized alloc, then
+    // the decode loop below would write past it (heap overflow). (satoru)
+    uint64_t pcm_size64 = (uint64_t)frame_count * 1152ull * (uint64_t)hdr.channels * 2ull;
+    if (pcm_size64 == 0 || pcm_size64 > 256ull * 1024ull * 1024ull) return nullptr;
+    int pcm_size = (int)pcm_size64;
     uint8_t* pcm = (uint8_t*)KernelHeap::Alloc(pcm_size);
     if (!pcm) return nullptr;
 
@@ -873,6 +878,9 @@ uint8_t* MP3Decoder::DecodeAll(const uint8_t* mp3_data, int mp3_length,
     while (pos + 4 < mp3_length) {
         if (!ParseHeader(mp3_data + pos, mp3_length - pos, &hdr)) break;
         if (pos + hdr.frame_size > mp3_length) break;
+        // never let a decode write past the allocation, even if the second
+        // pass diverges from the count pass. (satoru)
+        if (total_bytes + 1152 * hdr.channels * 2 > pcm_size) break;
 
         int16_t* pcm_ptr = (int16_t*)(pcm + total_bytes);
         int bytes = DecodeFrame(mp3_data + pos, hdr.frame_size, pcm_ptr);

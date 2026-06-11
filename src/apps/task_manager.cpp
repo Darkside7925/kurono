@@ -335,6 +335,7 @@ int         TaskManagerApp::action_menu_row  = -1;
 TMTab       TaskManagerApp::action_menu_tab  = TM_PROCESSES;
 int         TaskManagerApp::action_menu_x    = 0;
 int         TaskManagerApp::action_menu_y    = 0;
+int         TaskManagerApp::win_id           = -1;
 
 //  init / open
 void TaskManagerApp::Init(){
@@ -369,7 +370,23 @@ int TaskManagerApp::Open(){
             }
         }
     );
+    win_id = wid;
     return wid;
+}
+
+bool TaskManagerApp::IsOpen(){
+    if (win_id < 0) return false;
+    // Validate against live windows: the WM can close our window (titlebar X)
+    // without notifying us, which would leave win_id stale. Self-correct so we
+    // don't pin the GUI loop at full rate after the window is gone. The window
+    // array is NOT compacted (fixed slots, closed slots interspersed), so scan
+    // all WM_MAX_WINDOWS slots, not just GetWindowCount(). (satoru)
+    Window* ws = WindowManager::GetWindows();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        if (ws[i].state != WIN_CLOSED && ws[i].id == win_id) return true;
+    }
+    win_id = -1;   // no live window with our id exists anymore
+    return false;
 }
 
 void TaskManagerApp::InitServices(){

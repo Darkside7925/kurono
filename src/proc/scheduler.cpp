@@ -7,6 +7,7 @@
 #include "../kernel/hrtimer.h"
 #include "../kernel/panic.h"
 #include "../drivers/serial.h"
+#include "../drivers/timer.h"   // TSC ms clock for sleep deadlines (satoru)
 #include "../hal/hal.h"
 #include "../system/logging.h"
 
@@ -852,7 +853,14 @@ inline void kp_serial_log(const char* msg) {
 }
 
 inline uint64_t now_ms() {
-    return g_sched_now_ms;
+    // TSC-based real-time ms, NOT the PIT-IRQ count g_sched_now_ms. VMware
+    // COALESCES timer interrupts, so g_sched_now_ms (incremented by
+    // OnTimerTick(1) per IRQ) crawls  -  which made every SleepMs(N) wait for
+    // that slow clock and sleep ~10x too long, dragging the whole system to a
+    // crawl (the laggy/micro-freeze + slow boot). the TSC advances at real
+    // rate regardless of interrupt delivery, so sleep deadlines stay accurate
+    // and processes wake on time. (satoru)
+    return Timer::GetRealMs64();
 }
 
 inline uint8_t prio_tier_for(Process* p) {
@@ -1018,6 +1026,12 @@ static Process* pick_next_kernel(Process* after) {
 // Apply an I/O-wake interactivity boost proportional to sleep length:
 // short sleeps (typical of interactive event-loops) get the biggest bump.
 static void wake_due_processes() {
+    // this runs from BOTH IRQ0 (OnTimerTick) and process context (SleepMs idle
+    // loop, ServiceSleepQueue) and does non-atomic RMW on p->state /
+    // interactive_score. without the guard, IRQ0 firing mid-scan in process
+    // context loses or double-applies a wake. IrqGuard is save/restore, so it
+    // nests harmlessly when already called from IRQ context. (satoru)
+    IrqGuard _g;
     uint64_t t = now_ms();
     for (int i = 0; i < g_kernel_proc_count; i++) {
         Process* p = g_kernel_procs[i];
@@ -1059,6 +1073,10 @@ static void perform_switch(Process* prev, Process* next) {
 
 bool Scheduler::IsPreemptiveKernelSchedulerActive() {
     return g_preemptive_active;
+}
+
+uint64_t Scheduler::NowMs() {
+    return g_sched_now_ms;
 }
 
 Process* Scheduler::SpawnKernelProcess(const char* name,
@@ -1172,7 +1190,15 @@ void Scheduler::ServiceSleepQueue() {
 
 void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     g_sched_now_ms += ms_elapsed;
-    HRTimer::Tick();
+    // NOTE: HRTimer::Tick() is intentionally NOT called here. It fires periodic
+    // callbacks INLINE, and the only one (proc_refresh -> RuntimeLayout::
+    // RefreshProc) writes /proc files via KVFS -> KernelHeap. Running that from
+    // IRQ context re-entered KVFS/heap while a process was mid-operation,
+    // corrupting node->content/tree state and the heap (the "Free() bad magic"
+    // storm). SchedulerProcessEntry calls HRTimer::Tick() every 1ms in PROCESS
+    // context instead, so periodic callbacks still fire on time but safely.
+    // wake_due_processes() stays (it only flips process states, no heap/KVFS).
+    // (satoru)
     wake_due_processes();
 
     Process* p = current_process;

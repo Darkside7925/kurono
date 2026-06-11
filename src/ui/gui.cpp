@@ -51,6 +51,17 @@ void GUI::UpdateBackbuffer() {
 
     size_t sz = (size_t)h * (size_t)pitch;
 
+    // resolution changed: the existing buffers are sized for the old mode, so
+    // free them and reallocate at the new size. otherwise the compositor draws
+    // an old-size image into the larger framebuffer and the unwritten remainder
+    // shows uninitialized vram -- the "colors everywhere" corruption. (satoru)
+    if (backbuffer && buffer_size != sz) {
+        PMM::FreeBytes(backbuffer, buffer_size);
+        backbuffer = nullptr;
+        if (wallpaper_buffer) { PMM::FreeBytes(wallpaper_buffer, buffer_size); wallpaper_buffer = nullptr; }
+        buffer_size = 0;
+    }
+
     if (!backbuffer) {
         backbuffer = (uint8_t*)PMM::AllocBytes(sz);
         buffer_size = sz;

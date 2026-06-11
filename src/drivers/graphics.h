@@ -41,6 +41,9 @@ public:
     static void EndFrame();
     static void SetTargetFPS(uint32_t fps);
     static uint32_t GetTargetFPS();
+    static uint32_t GetTargetFrameTimeMs();  // frame budget in ms (1000/hz) for adaptive gui pacing (satoru)
+    static void SetVirtioPresent(bool on);   // DisplayManager enables this for the accelerated backend (satoru)
+    static void PresentVirtioIfActive();     // gui loop calls after SwapBuffers; pushes the frame to the host gpu (satoru)
     static uint32_t DetectRefreshRate();  // measure via vsync timing, fallback 60 hz
     static uint32_t GetMonitorHz();       // last detected monitor refresh rate
     static bool IsFramebufferWC();        // true if fb is write-combining (bare-metal safe)
@@ -96,7 +99,18 @@ public:
     static void MarkDirty(int x, int y, int w, int h);
     static void ClearDirtyRegions();
     static void RenderDirtyRegions();
-    
+
+    // ── Global UI dirty signal (damage-gated compositor) ───────────────
+    // Distinct from MarkDirty(): MarkDirty feeds the partial-swap region
+    // list *during* a render; this counter answers "does the GUI loop need
+    // to composite a NEW frame at all?".  Any code that changes on-screen
+    // state must call MarkUIDirty().  The GUI loop reads ConsumeUIDirty()
+    // once per frame.  Counter (not bool) so a mark that races with a
+    // consume is never silently lost. (satoru)
+    static void     MarkUIDirty();
+    static uint32_t UIDirtyCount();        // current value (no clear)
+    static bool     ConsumeUIDirty();      // true if dirty since last call; clears
+
     // information
     static int GetWidth();
     static int GetHeight();

@@ -233,11 +233,35 @@ public:
     static size_t Serialize(uint8_t* buffer, size_t maxSize);
     static bool   Deserialize(const uint8_t* buffer, size_t size);
 
+    // panic-path best-effort write. The kernel panic handler runs from an
+    // exception/IRQ context that may have interrupted a process holding
+    // g_vfs_lock; since the lock is a non-recursive SpinLockCpuGuard, an
+    // unconditional WriteFile() there would self-deadlock the dying CPU and
+    // silently kill the crash dump. This TRIES the lock (no spin) and writes
+    // via the _nolock cores only if it's free; if the lock is held it skips
+    // persistence (the physical-RAM minidump already covers recovery) and
+    // returns false rather than hanging. ONLY for the panic path. (satoru)
+    static bool TryWriteCrashDump(const char* path, const void* data, uint32_t len);
+
 private:
     static KVFSNode* root;
     static KVFSNode* cwd;
     static char cwd_path[KVFS_MAX_PATH];
     static KVFSFileDesc fds[KVFS_MAX_FDS];
+
+    // ── unlocked cores ──────────────────────────────────────────────────
+    // These contain the real logic and assume g_vfs_lock is ALREADY held.
+    // The public methods above are thin wrappers that take g_vfs_lock once
+    // and delegate here, so a public op that needs another op calls the
+    // _nolock core instead of re-entering the (non-recursive) lock. (satoru)
+    static KVFSNode* Resolve_nolock(const char* path);
+    static KVFSNode* ResolvePath_nolock(const char* path, KVFSNode* from = nullptr);
+    static int Mkdirs_nolock(const char* path, uint16_t mode = 0755);
+    static int CreateFile_nolock(const char* path, uint16_t mode = 0644);
+    static int WriteFile_nolock(const char* path, const void* data, uint32_t len);
+    static int ReadFile_nolock(const char* path, void* buf, uint32_t max_len);
+    static int Unlink_nolock(const char* path);
+    static int Copy_nolock(const char* src, const char* dst);
 
     static KVFSNode* AllocNode(const char* name, KVFSNodeType type, uint16_t mode = 0755);
     static void FreeNode(KVFSNode* node);

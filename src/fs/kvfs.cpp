@@ -1,6 +1,7 @@
 #include "kvfs.h"
 #include "../drivers/serial.h"
 #include "../kernel/time.h"
+#include "../proc/kernel_locks.h"   // g_vfs_lock, SpinLockCpuGuard
 
 KVFSNode* KVFS::root = nullptr;
 KVFSNode* KVFS::cwd = nullptr;
@@ -180,16 +181,26 @@ void KVFS::NormalizePath(const char* input, char* output, int max_len) {
 }
 
 KVFSNode* KVFS::Resolve(const char* path) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return Resolve_nolock(path);
+}
+
+KVFSNode* KVFS::Resolve_nolock(const char* path) {
     char norm[KVFS_MAX_PATH];
     NormalizePath(path, norm, KVFS_MAX_PATH);
     KVFSNode* cached = PathCacheGet(norm);
     if (cached) return cached;
-    KVFSNode* n = ResolvePath(norm, nullptr);
+    KVFSNode* n = ResolvePath_nolock(norm, nullptr);
     if (n) PathCachePut(norm, n);
     return n;
 }
 
 KVFSNode* KVFS::ResolvePath(const char* path, KVFSNode* from) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return ResolvePath_nolock(path, from);
+}
+
+KVFSNode* KVFS::ResolvePath_nolock(const char* path, KVFSNode* from) {
     if (!root) return nullptr;
     if (!path || path[0] == 0) return cwd ? cwd : root;
 
@@ -267,6 +278,7 @@ KVFSNode* KVFS::ResolvePath(const char* path, KVFSNode* from) {
 }
 
 int KVFS::Mkdir(const char* path, uint16_t mode) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     char norm[KVFS_MAX_PATH];
     NormalizePath(path, norm, KVFS_MAX_PATH);
 
@@ -289,7 +301,7 @@ int KVFS::Mkdir(const char* path, uint16_t mode) {
     kstrcpy(name, norm + last_slash + 1, KVFS_MAX_NAME);
     if (name[0] == 0) return KVFS_ERR_INVALID;
 
-    KVFSNode* parent = ResolvePath(parent_path);
+    KVFSNode* parent = ResolvePath_nolock(parent_path);
     if (!parent) return KVFS_ERR_NOT_FOUND;
     if (!parent->is_dir()) return KVFS_ERR_NOT_DIR;
     if (parent->find_child(name)) return KVFS_ERR_EXISTS;
@@ -302,6 +314,11 @@ int KVFS::Mkdir(const char* path, uint16_t mode) {
 }
 
 int KVFS::Mkdirs(const char* path, uint16_t mode) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return Mkdirs_nolock(path, mode);
+}
+
+int KVFS::Mkdirs_nolock(const char* path, uint16_t mode) {
     char norm[KVFS_MAX_PATH];
     NormalizePath(path, norm, KVFS_MAX_PATH);
 
@@ -336,7 +353,8 @@ int KVFS::Mkdirs(const char* path, uint16_t mode) {
 }
 
 int KVFS::Rmdir(const char* path) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (!node->is_dir()) return KVFS_ERR_NOT_DIR;
     if (node->child_count > 0) return KVFS_ERR_NOT_EMPTY;
@@ -349,7 +367,8 @@ int KVFS::Rmdir(const char* path) {
 }
 
 int KVFS::Listdir(const char* path, KVFSNode** out, int max_count) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (!node->is_dir()) return KVFS_ERR_NOT_DIR;
     int count = 0;
@@ -360,6 +379,11 @@ int KVFS::Listdir(const char* path, KVFSNode** out, int max_count) {
 }
 
 int KVFS::CreateFile(const char* path, uint16_t mode) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return CreateFile_nolock(path, mode);
+}
+
+int KVFS::CreateFile_nolock(const char* path, uint16_t mode) {
     char norm[KVFS_MAX_PATH];
     NormalizePath(path, norm, KVFS_MAX_PATH);
 
@@ -380,10 +404,10 @@ int KVFS::CreateFile(const char* path, uint16_t mode) {
     kstrcpy(name, norm + last_slash + 1, KVFS_MAX_NAME);
     if (name[0] == 0) return KVFS_ERR_INVALID;
 
-    KVFSNode* parent = ResolvePath(parent_path);
+    KVFSNode* parent = ResolvePath_nolock(parent_path);
     if (!parent) {
-        Mkdirs(parent_path);
-        parent = ResolvePath(parent_path);
+        Mkdirs_nolock(parent_path);
+        parent = ResolvePath_nolock(parent_path);
         if (!parent) return KVFS_ERR_NOT_FOUND;
     }
     if (!parent->is_dir()) return KVFS_ERR_NOT_DIR;
@@ -402,11 +426,16 @@ int KVFS::CreateFile(const char* path, uint16_t mode) {
 }
 
 int KVFS::WriteFile(const char* path, const void* data, uint32_t len) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return WriteFile_nolock(path, data, len);
+}
+
+int KVFS::WriteFile_nolock(const char* path, const void* data, uint32_t len) {
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) {
-        int r = CreateFile(path);
+        int r = CreateFile_nolock(path);
         if (r != KVFS_OK) return r;
-        node = Resolve(path);
+        node = Resolve_nolock(path);
         if (!node) return KVFS_ERR_NOT_FOUND;
     }
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
@@ -416,7 +445,10 @@ int KVFS::WriteFile(const char* path, const void* data, uint32_t len) {
         if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
         uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
-        if (node->content) KernelHeap::Free(node->content);
+        // only free a LIVE heap block  -  node->content may be a stale/non-heap
+        // pointer (deserialized image / freed elsewhere); a stray Free() trips
+        // heap "bad magic" and corrupts the allocator. (satoru)
+        if (node->content && KernelHeap::IsValidBlock(node->content)) KernelHeap::Free(node->content);
         node->content = new_buf;
         node->content_capacity = new_cap;
     }
@@ -427,9 +459,20 @@ int KVFS::WriteFile(const char* path, const void* data, uint32_t len) {
 }
 
 int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
-    KVFSNode* node = Resolve(path);
-    if (!node) return WriteFile(path, data, len);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
+    if (!node) return WriteFile_nolock(path, data, len);
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
+
+    // if content is a stale/non-heap pointer (from a deserialized image, or a
+    // region freed elsewhere), reading or Free()ing it would feed garbage and
+    // trip heap "bad magic" -> allocator corruption (the 63x-at-boot symptom).
+    // drop it and start fresh. valid content is untouched. (satoru)
+    if (node->content && !KernelHeap::IsValidBlock(node->content)) {
+        node->content = nullptr;
+        node->content_capacity = 0;
+        node->size = 0;
+    }
 
     uint32_t new_size = node->size + len;
     if (!node->content || node->content_capacity < new_size) {
@@ -451,7 +494,12 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
 }
 
 int KVFS::ReadFile(const char* path, void* buf, uint32_t max_len) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return ReadFile_nolock(path, buf, max_len);
+}
+
+int KVFS::ReadFile_nolock(const char* path, void* buf, uint32_t max_len) {
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
     uint32_t to_read = node->size < max_len ? node->size : max_len;
@@ -461,7 +509,12 @@ int KVFS::ReadFile(const char* path, void* buf, uint32_t max_len) {
 }
 
 int KVFS::Unlink(const char* path) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return Unlink_nolock(path);
+}
+
+int KVFS::Unlink_nolock(const char* path) {
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
     if (!node->parent) return KVFS_ERR_PERM;
@@ -480,12 +533,13 @@ int KVFS::Unlink(const char* path) {
 }
 
 int KVFS::Open(const char* path, uint8_t flags) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) {
         if (flags & 2) {
-            int r = CreateFile(path);
+            int r = CreateFile_nolock(path);
             if (r != KVFS_OK) return r;
-            node = Resolve(path);
+            node = Resolve_nolock(path);
             if (!node) return KVFS_ERR_NOT_FOUND;
         } else {
             return KVFS_ERR_NOT_FOUND;
@@ -505,6 +559,7 @@ int KVFS::Open(const char* path, uint8_t flags) {
 }
 
 int KVFS::Read(int fd, void* buf, uint32_t len) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     if (fd < 0 || fd >= KVFS_MAX_FDS || !fds[fd].open) return KVFS_ERR_INVALID;
     KVFSNode* node = fds[fd].node;
     if (!node) return KVFS_ERR_INVALID;
@@ -524,6 +579,7 @@ int KVFS::Read(int fd, void* buf, uint32_t len) {
 }
 
 int KVFS::Write(int fd, const void* buf, uint32_t len) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     if (fd < 0 || fd >= KVFS_MAX_FDS || !fds[fd].open) return KVFS_ERR_INVALID;
     if (!(fds[fd].flags & 2)) return KVFS_ERR_PERM;
     KVFSNode* node = fds[fd].node;
@@ -557,6 +613,7 @@ int KVFS::Write(int fd, const void* buf, uint32_t len) {
 }
 
 int KVFS::Seek(int fd, int32_t offset, int whence) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     if (fd < 0 || fd >= KVFS_MAX_FDS || !fds[fd].open) return KVFS_ERR_INVALID;
     KVFSNode* node = fds[fd].node;
     if (!node) return KVFS_ERR_INVALID;
@@ -573,6 +630,7 @@ int KVFS::Seek(int fd, int32_t offset, int whence) {
 }
 
 int KVFS::Close(int fd) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     if (fd < 0 || fd >= KVFS_MAX_FDS || !fds[fd].open) return KVFS_ERR_INVALID;
     fds[fd].open = false;
     fds[fd].node = nullptr;
@@ -580,27 +638,38 @@ int KVFS::Close(int fd) {
 }
 
 int KVFS::Copy(const char* src, const char* dst) {
-    KVFSNode* s = Resolve(src);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return Copy_nolock(src, dst);
+}
+
+int KVFS::Copy_nolock(const char* src, const char* dst) {
+    KVFSNode* s = Resolve_nolock(src);
     if (!s) return KVFS_ERR_NOT_FOUND;
     if (s->is_dir()) return KVFS_ERR_IS_DIR;
-    return WriteFile(dst, s->content, s->size);
+    // if dst is the same node (cp x x), WriteFile_nolock would free node->content
+    // and then copy from that just-freed pointer -> use-after-free. no-op. (satoru)
+    if (Resolve_nolock(dst) == s) return 0;
+    return WriteFile_nolock(dst, s->content, s->size);
 }
 
 int KVFS::Move(const char* src, const char* dst) {
-    int r = Copy(src, dst);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    int r = Copy_nolock(src, dst);
     if (r < 0) return r;
-    return Unlink(src);
+    return Unlink_nolock(src);
 }
 
 int KVFS::Chmod(const char* path, uint16_t mode) {
-    KVFSNode* n = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* n = Resolve_nolock(path);
     if (!n) return KVFS_ERR_NOT_FOUND;
     n->perms.mode = mode;
     return KVFS_OK;
 }
 
 int KVFS::Chown(const char* path, uint16_t uid, uint16_t gid) {
-    KVFSNode* n = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* n = Resolve_nolock(path);
     if (!n) return KVFS_ERR_NOT_FOUND;
     n->perms.uid = uid;
     n->perms.gid = gid;
@@ -608,24 +677,26 @@ int KVFS::Chown(const char* path, uint16_t uid, uint16_t gid) {
 }
 
 int KVFS::Stat(const char* path, KVFSNode** out) {
-    KVFSNode* n = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* n = Resolve_nolock(path);
     if (!n) return KVFS_ERR_NOT_FOUND;
     if (out) *out = n;
     return KVFS_OK;
 }
 
 void KVFS::SetCwd(const char* path) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     char norm[KVFS_MAX_PATH];
     NormalizePath(path, norm, KVFS_MAX_PATH);
-    KVFSNode* node = ResolvePath(norm);
+    KVFSNode* node = ResolvePath_nolock(norm);
     if (node && node->is_dir()) {
         cwd = node;
         kstrcpy(cwd_path, norm, KVFS_MAX_PATH);
     }
 }
 
-const char* KVFS::GetCwd() { return cwd_path; }
-KVFSNode* KVFS::GetCwdNode() { return cwd; }
+const char* KVFS::GetCwd() { SpinLockCpuGuard guard(g_vfs_lock); return cwd_path; }
+KVFSNode* KVFS::GetCwdNode() { SpinLockCpuGuard guard(g_vfs_lock); return cwd; }
 
 bool KVFS::PatternMatch(const char* pattern, const char* str) {
     // iterative wildcard match (no recursion): backtracks on '*' star
@@ -665,7 +736,8 @@ void KVFS::FindRecursive(KVFSNode* node, const char* pattern,
 }
 
 int KVFS::Find(const char* path, const char* pattern, KVFSNode** results, int max_results) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
     if (!node || !node->is_dir()) return 0;
     int count = 0;
     FindRecursive(node, pattern, results, max_results, count);
@@ -673,7 +745,8 @@ int KVFS::Find(const char* path, const char* pattern, KVFSNode** results, int ma
 }
 
 int KVFS::Grep(const char* path, const char* pattern, char* output, int max_output) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
     if (!node || !node->content) { if (output && max_output > 0) output[0] = 0; return 0; }
 
     int plen = kstrlen(pattern);
@@ -723,7 +796,8 @@ int KVFS::Grep(const char* path, const char* pattern, char* output, int max_outp
 }
 
 int KVFS::RmTree(const char* path) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (!node->parent) return KVFS_ERR_PERM;
     // close any fds that reference nodes in this subtree
@@ -744,7 +818,8 @@ int KVFS::RmTree(const char* path) {
 }
 
 uint32_t KVFS::DiskUsage(const char* path) {
-    KVFSNode* node = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
     if (!node) return 0;
     if (node->is_file()) return node->size;
     uint32_t total = 0;
@@ -766,25 +841,28 @@ uint32_t KVFS::DiskUsage(const char* path) {
     return total;
 }
 
-KVFSNode* KVFS::GetRoot() { return root; }
+KVFSNode* KVFS::GetRoot() { SpinLockCpuGuard guard(g_vfs_lock); return root; }
 
 int KVFS::GetFileSize(const char* path) {
-    KVFSNode* n = Resolve(path);
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* n = Resolve_nolock(path);
     if (!n) return KVFS_ERR_NOT_FOUND;
     return (int)n->size;
 }
 
-bool KVFS::Exists(const char* path) { return Resolve(path) != nullptr; }
-bool KVFS::IsDir(const char* path) { KVFSNode* n = Resolve(path); return n && n->is_dir(); }
-bool KVFS::IsFile(const char* path) { KVFSNode* n = Resolve(path); return n && n->is_file(); }
+bool KVFS::Exists(const char* path) { SpinLockCpuGuard guard(g_vfs_lock); return Resolve_nolock(path) != nullptr; }
+bool KVFS::IsDir(const char* path) { SpinLockCpuGuard guard(g_vfs_lock); KVFSNode* n = Resolve_nolock(path); return n && n->is_dir(); }
+bool KVFS::IsFile(const char* path) { SpinLockCpuGuard guard(g_vfs_lock); KVFSNode* n = Resolve_nolock(path); return n && n->is_file(); }
 
 int KVFS::WriteString(const char* path, const char* str) {
-    return WriteFile(path, str, (uint32_t)kstrlen(str));
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return WriteFile_nolock(path, str, (uint32_t)kstrlen(str));
 }
 
 int KVFS::ReadString(const char* path, char* buf, int max_len) {
     if (max_len <= 0 || !buf) return KVFS_ERR_INVALID;
-    int r = ReadFile(path, buf, (uint32_t)(max_len - 1));
+    SpinLockCpuGuard guard(g_vfs_lock);
+    int r = ReadFile_nolock(path, buf, (uint32_t)(max_len - 1));
     if (r < 0) { buf[0] = 0; return r; }
     buf[r] = 0;
     return r;
@@ -896,6 +974,7 @@ bool KVFS::SerializeNode(const KVFSNode* node, uint8_t* buffer,
 }
 
 size_t KVFS::Serialize(uint8_t* buffer, size_t maxSize) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     if (!buffer || !root) return 0;
     if (maxSize < 12) return 0;  // need at least the header (satoru)
 
@@ -919,9 +998,19 @@ size_t KVFS::Serialize(uint8_t* buffer, size_t maxSize) {
 // rebuild one node + its subtree from the buffer at *pos. allocates the node,
 // reattaches children, copies content. returns the new node, or nullptr on
 // malformation (the caller frees the partial temp tree). (satoru)
+// bound deserialize recursion: a crafted/corrupt image nesting one child per
+// node arbitrarily deep would blow the kernel stack. deserialize runs under
+// g_vfs_lock (single-threaded), so a static depth counter is safe. (satoru)
+namespace {
+struct DeserDepth { static int d; DeserDepth(){d++;} ~DeserDepth(){d--;} };
+int DeserDepth::d = 0;
+}
+
 static KVFSNode* kvfs_deser_node(const uint8_t* b, size_t size, size_t* pos,
                                  KVFSNode* (*alloc)(const char*, KVFSNodeType,
                                                     uint16_t)) {
+    if (DeserDepth::d >= 64) return nullptr;   // recursion bound (satoru)
+    DeserDepth _dg;
     uint8_t type;
     uint16_t mode, uid, gid;
     uint32_t created, modified, accessed, sz;
@@ -988,6 +1077,7 @@ static KVFSNode* kvfs_deser_node(const uint8_t* b, size_t size, size_t* pos,
 }
 
 bool KVFS::Deserialize(const uint8_t* buffer, size_t size) {
+    SpinLockCpuGuard guard(g_vfs_lock);
     if (!buffer || size < 12) return false;
 
     size_t pos = 0;
@@ -1014,6 +1104,33 @@ bool KVFS::Deserialize(const uint8_t* buffer, size_t size) {
     if (old_root) FreeTree(old_root);
 
     return true;
+}
+
+bool KVFS::TryWriteCrashDump(const char* path, const void* data, uint32_t len) {
+    // Panic-context entry: the dying CPU may have interrupted a process that
+    // already holds g_vfs_lock. Spinning on it (as a normal locked WriteFile
+    // would) self-deadlocks and silently kills the crash dump. So TRY the lock
+    // without spinning; if it's contended we give up persistence (the physical
+    // -RAM minidump written earlier in the panic path is the real recovery
+    // mechanism) and return false instead of hanging. (satoru)
+    if (!g_vfs_lock.TryLock()) return false;
+    bool ok = false;
+    if (root) {
+        // Mirror panic.cpp's old "mkdir parent then write" but via the _nolock
+        // cores so we never re-enter the lock we just took by hand.
+        char parent[KVFS_MAX_PATH];
+        int last_slash = -1;
+        for (int i = 0; path[i] && i < KVFS_MAX_PATH - 1; i++)
+            if (path[i] == '/') last_slash = i;
+        if (last_slash > 0) {
+            for (int i = 0; i < last_slash; i++) parent[i] = path[i];
+            parent[last_slash] = 0;
+            Mkdirs_nolock(parent);
+        }
+        ok = (WriteFile_nolock(path, data, len) == KVFS_OK);
+    }
+    g_vfs_lock.Unlock();
+    return ok;
 }
 
 void KVFS::BuildDefaultTree() {
@@ -1066,6 +1183,10 @@ void KVFS::BuildDefaultTree() {
     WriteString("/var/log/kurono.log", "[boot] Kurono OS started successfully.\n");
 }
 
+// NOTE: runs once at boot, single-threaded, BEFORE the scheduler starts.
+// Holds NO g_vfs_lock and calls the public (locked) wrappers below  -  they
+// acquire the lock without nesting. Adding a guard here would self-deadlock
+// because BuildDefaultTree() calls the locked Mkdirs()/WriteString(). (satoru)
 void KVFS::Init() {
     SerialLogger::Log("KVFS: Initializing...\r\n");
 

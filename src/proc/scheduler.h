@@ -233,6 +233,10 @@ public:
 
     /** After Scheduler::Start(): kproc multitasking is active. */
     static bool IsPreemptiveKernelSchedulerActive();
+
+    /** Monotonic millisecond clock advanced by the PIT IRQ (reliable, unlike
+     *  the polled Timer::PollUpdate clock). Use this for frame pacing. */
+    static uint64_t NowMs();
     
     // performance monitoring
     static uint32_t GetProcessCount();

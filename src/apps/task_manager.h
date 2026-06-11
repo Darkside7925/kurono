@@ -77,8 +77,14 @@ public:
 
     static void RefreshProcesses();
     static void Tick();   // call each frame to update perf
+    // true while the Task Manager window is open. The damage-gated GUI loop
+    // renders continuously while this holds so the live CPU/mem graphs and
+    // the periodic process-list refresh (frame_counter-gated) keep advancing
+    // even when the user is not interacting. (satoru, review fix)
+    static bool IsOpen();
 
 private:
+    static int win_id;        // wm window id, -1 when closed
     static TMTab current_tab;
     static TMProcess procs[TM_MAX_PROCS];
     static int proc_count;

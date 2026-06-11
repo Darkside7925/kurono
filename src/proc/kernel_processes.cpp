@@ -30,12 +30,17 @@
 #include "../system/logging.h"
 #include "../ui/desktop.h"
 #include "../ui/window_manager.h"
+#include "../ui/gui.h"   // GUI::UpdateBackbuffer for the resolution-change relayout (satoru)
 #include "../ui/perf_hud.h"
 #include "../ui/lockscreen.h"
 #include "../system/user_mgmt.h"
 #include "../apps/terminal.h"
 #include "../apps/task_manager.h"
 #include "../apps/settings.h"
+#include "../ui/control_center.h"
+#include "../ui/notification.h"
+#include "../apps/media_player.h"
+#include "../apps/denji_app.h"
 
 namespace KernelProcesses {
 
@@ -83,7 +88,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
                 E1000::Poll();
             }
         }
-        Scheduler::SleepMs(1);
+        Scheduler::SleepMs(10);   // RX latency-tolerant; 1ms over-polled an idle NIC (satoru)
     }
 }
 
@@ -98,7 +103,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             USB::PollHID();   // poll usb hid interrupt-in endpoints (satoru)
             InputManager::Poll();
         }
-        Scheduler::SleepMs(1);
+        Scheduler::SleepMs(8);   // 125Hz: ample for human input, 8x fewer 8042/backdoor VM-exits (satoru)
     }
 }
 
@@ -108,11 +113,15 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     while (true) {
         {
             SpinLockCpuGuard guard(g_audio_lock);
+            // AudioServer::Tick() already pumps the ACTIVE backend (it calls
+            // be->Tick() via the mixer), so the direct AC97::Tick()/Audio::Tick()
+            // were redundant per-tick MMIO/PIO (extra VM-exits on VMware)  -  dropped.
             AudioServer::Tick();
-            AC97::Tick();
-            Audio::Tick();
         }
-        Scheduler::SleepMs(4);
+        // 10ms: the mixer period is ~21ms (1024 frames @ 48kHz) with a ~170ms
+        // back-pressure buffer, so 4ms was ~4x over-polling  -  pure wakeups/exits
+        // that kept the cpu from ever idling (HLT) on VMware. (satoru)
+        Scheduler::SleepMs(10);
     }
 }
 
@@ -127,7 +136,10 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     while (true) {
         HRTimer::Tick();
         Scheduler::ServiceSleepQueue();
-        Scheduler::SleepMs(1);
+        // 50ms: IRQ0 already calls wake_due_processes() every tick, so this is a
+        // backup heartbeat. 1ms was 1000 redundant wakeups/sec that kept the cpu
+        // from idling (HLT)  -  the main VMware host-CPU burn. (satoru)
+        Scheduler::SleepMs(50);
     }
 }
 
@@ -159,9 +171,28 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     SerialLogger::Log("[ShellProcess] online\r\n");
     while (true) {
         TerminalApp::Tick();
-        Scheduler::SleepMs(2);
+        Scheduler::SleepMs(25);   // drains an almost-always-empty command queue; 2ms was 500 idle wakeups/sec (satoru)
     }
 }
+
+namespace {
+// Is anything that must keep rendering continuously currently live?
+// While ANY of these holds, the damage-gated loop renders every frame so a
+// missed MarkUIDirty() can never freeze an in-flight animation or video.
+// Conservative by design: when unsure, return true (render). (satoru)
+static inline bool ui_activity_active() {
+    if (WindowManager::IsDragging())            return true;  // live drag/resize
+    if (WindowManager::HasActiveAnimations())   return true;  // open/close/min/max
+    if (Taskbar::IsAnimating())                 return true;  // menus/popups/cursor
+    if (Desktop::IsAnimating())                 return true;  // icon hover-pop fade
+    if (ControlCenter::IsAnimating())           return true;  // panel slide+fade
+    if (NotificationManager::ActiveCount() > 0) return true;  // toasts in/hold/out
+    if (MediaPlayerApp::IsOpen())               return true;  // audio/video surface
+    if (DenjiApp::IsOpen())                     return true;  // kvid playback frames
+    if (TaskManagerApp::IsOpen())               return true;  // live perf graphs/list
+    return false;
+}
+} // namespace
 
 // ── GUI process: the original main render loop ────────────────────────
 //
@@ -179,12 +210,36 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     uint32_t fps_counter = 0;
     uint32_t last_fps_ms = Timer::GetRealMs();
     uint32_t displayed_fps = 0;
+    uint32_t last_render_ms = 0;
+    uint32_t last_activity_ms = Timer::GetRealMs();   // last input/animation (satoru)
     uint32_t autorun_target_ms = Timer::GetTicks() + 4000u;
 
     while (true) {
         // stamp the graphics-loop heartbeat for the watchdog before any work,
         // so a hang anywhere in the body is detectable as a stalled tick. (satoru)
         g_last_frame_ms = Timer::GetRealMs();
+
+        // resolution-sync handler: the desktop is first laid out during kernel
+        // init, but a display backend can finalize a *different* mode afterwards
+        // (virtio-gpu comes up at 1080p, after the boot-fb desktop layout), and
+        // the user can also change modes at runtime (settings -> display). in
+        // both cases the compositor backbuffer is still sized for the old mode
+        // and the desktop is laid out for the old screen, so the larger
+        // framebuffer shows uninitialized vram in the margins (desktop stuck in a
+        // corner). the -1 sentinel forces a one-time relayout on the first frame
+        // so the desktop always matches the *final* framebuffer size; after that
+        // we only relayout on an actual change. the wallpaper image survives a
+        // relayout (Desktop::Init keeps it). loop top is a safe point, never
+        // mid-input. (satoru)
+        { static int __sw = -1, __sh = -1;
+          int cw = Graphics::GetWidth(), ch = Graphics::GetHeight();
+          if (cw != __sw || ch != __sh) {
+              SerialLogger::Log("[res-sync] relayout to framebuffer mode\r\n");
+              GUI::UpdateBackbuffer();
+              DesktopEnvironment::Init(cw, ch);
+              Graphics::MarkUIDirty();
+          }
+          __sw = cw; __sh = ch; }
 
         // Advance system wall-clock time once per frame.
         uint32_t real_elapsed = Timer::ElapsedSinceLast();
@@ -194,10 +249,20 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             SettingsApp::PollDeferredActions();
         }
 
+        // Track cursor movement: any pointer motion marks the UI dirty so the
+        // cursor stays responsive even on an otherwise static screen. (satoru)
+        static int last_mx = -1, last_my = -1;
+        if (Mouse::mx != last_mx || Mouse::my != last_my) {
+            Graphics::MarkUIDirty();
+            last_mx = Mouse::mx;
+            last_my = Mouse::my;
+        }
+
         // Drain mouse events.
         int scroll_delta = 0;
         while (Mouse::HasEvent()) {
             Mouse::Event mevt = Mouse::GetEvent();
+            Graphics::MarkUIDirty();             // any button/scroll changes state
             if (mevt.type == 3) { scroll_delta += mevt.dz; continue; }
             if (mevt.type == 1 || mevt.type == 2) {
                 WindowManager::HandlePointerButton(mevt.x, mevt.y,
@@ -207,16 +272,19 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
 
         bool mouse_clicked = Mouse::LeftClicked();
         bool mouse_down = Mouse::IsLeftDown();
+        if (mouse_clicked || mouse_down) Graphics::MarkUIDirty();
         char kb_char = 0;
-        if (Keyboard::HasChar()) kb_char = Keyboard::GetChar();
+        if (Keyboard::HasChar()) { kb_char = Keyboard::GetChar(); Graphics::MarkUIDirty(); }
         DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my,
                                         mouse_down, mouse_clicked, kb_char);
         while (Keyboard::HasChar()) {
             kb_char = Keyboard::GetChar();
+            Graphics::MarkUIDirty();
             DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, false, false, kb_char);
         }
 
         if (scroll_delta != 0) {
+            Graphics::MarkUIDirty();
             Window* fw = WindowManager::GetFocusedWindow();
             if (fw && fw->input) {
                 fw->input(fw, 3, scroll_delta, 0);
@@ -249,14 +317,49 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             TaskManagerApp::RefreshProcesses();
         }
 
-        // Frame pacing: when the renderer says we still have budget we
-        // sleep briefly so the CPU can HLT instead of busy-yielding.  1 ms
-        // is well below human perception (~16 ms frame budget) and lets
-        // every other tier progress.
-        if (!Graphics::ShouldRender()) {
-            Scheduler::SleepMs(1);
+        // Frame pacing to ~60fps. Timer::GetRealMs() is now sourced from the
+        // PIT-IRQ scheduler clock (see timer.cpp GetRealMs), so it advances
+        // reliably regardless of poll cadence  -  fixing the FPS-0 freeze where
+        // a SleepMs(1) pacer starved the old *polled* clock (it lost whole PIT
+        // periods between calls, so the 16ms threshold was never reached and
+        // the loop slept forever). We sleep the WHOLE remaining budget in one
+        // shot instead of 1ms spins, avoiding ~16 context switches per frame.
+        // (satoru)
+        // ── Damage + adaptive pace gate ───────────────────────────────
+        // Decide whether anything needs drawing, THEN pace. Render only when
+        // (a) the UI was marked dirty, (b) an animation/video/popup is active,
+        // or (c) the ~250ms safety fallback is due (drives the clock/blink and
+        // bounds any missed dirty source to a 250ms delay, never a permanent
+        // freeze). (satoru)
+        constexpr uint32_t FALLBACK_MS = 250u;
+        bool dirty    = Graphics::ConsumeUIDirty();
+        bool active   = ui_activity_active();
+        bool fallback = (Timer::GetRealMs() - last_render_ms) >= FALLBACK_MS;
+        if (dirty || active) last_activity_ms = Timer::GetRealMs();
+        if (!dirty && !active && !fallback) {
+            // Nothing to draw. If we were active recently, POLL (yield, no HLT)
+            // so the next input/animation is caught instantly: SleepMs() halts
+            // the cpu, and WHPX/VMware coalesce the timer IRQ while halted,
+            // adding ~500ms wake latency (the lag/freeze on resume). Only after
+            // ~2s of true inactivity do we HLT to give the host its core back.
+            // (satoru)
+            if (Timer::GetRealMs() - last_activity_ms < 2000u) Scheduler::YieldNow();
+            else Scheduler::SleepMs(16u);
             continue;
         }
+        // There IS work. Pace to ~60fps WITHOUT halting: SleepMs() HLTs the
+        // cpu, and WHPX/VMware COALESCE the timer IRQ while the guest is
+        // halted, so a 16ms sleep actually lasts ~55ms -> a choppy ~18fps
+        // during interaction. Busy-yield instead  -  the loop wakes on the TSC
+        // clock, not the coalesced IRQ, giving smooth 60fps while active. Idle
+        // frames above still HLT, so host cpu stays low when nothing happens.
+        // (satoru)
+        // pace to the SELECTED refresh rate (display.refresh_hz -> Graphics
+        // target fps), not a hardcoded 60; busy-yield on the tsc clock so
+        // whpx/vmware timer coalescing can't stretch the frame. (satoru)
+        uint32_t frame_budget_ms = Graphics::GetTargetFrameTimeMs();
+        while (Timer::GetRealMs() - last_render_ms < frame_budget_ms) Scheduler::YieldNow();
+        last_render_ms = Timer::GetRealMs();
 
         if (WindowManager::IsDragging()) {
             Graphics::Clear(0xFF0C0C18);
@@ -303,6 +406,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
 
             Mouse::DrawAt(Mouse::mx, Mouse::my);
             Graphics::SwapBuffers();
+            Graphics::PresentVirtioIfActive();   // push the frame to the host gpu when accelerated (no-op otherwise) (satoru)
         }
 
         // Hand the CPU back so the other tiers progress.
@@ -316,15 +420,31 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
 // never fires under normal operation. (satoru)
 [[noreturn]] static void WatchdogProcessEntry() {
     SerialLogger::Log("[watchdog] online\r\n");
+    int consecutive = 0;
     for (;;) {
         Scheduler::SleepMs(5000);
         uint32_t last = g_last_frame_ms;
-        if (last == 0) continue;                  // gui loop not started yet (satoru)
+        if (last == 0) { consecutive = 0; continue; } // gui loop not started yet (satoru)
         uint32_t now = Timer::GetRealMs();
-        if (now > last && (now - last) > 3000) {
-            SerialLogger::Log("[watchdog] graphics main loop stalled >3s; reinitializing display backend (satoru)\r\n");
-            DisplayManager::Init();
-            g_last_frame_ms = Timer::GetRealMs(); // avoid immediate re-trigger after recovery (satoru)
+        // only treat the gui as truly hung after a LONG (>8s) gap confirmed
+        // across two consecutive checks (~13s total). the old 3s/one-shot rule
+        // tripped on transient boot/heavy-frame slowness, and then reinit'd the
+        // display WITHOUT g_fb_lock  -  racing the gui's render, tearing the
+        // framebuffer state, and cascading into more stalls + reinits. (satoru)
+        if (now > last && (now - last) > 8000) {
+            if (++consecutive >= 2) {
+                SerialLogger::Log("[watchdog] graphics loop hung >13s; reinitializing display (satoru)\r\n");
+                // hold g_fb_lock so the reinit never runs concurrently with a
+                // render in progress. (satoru)
+                {
+                    SpinLockCpuGuard guard(g_fb_lock);
+                    DisplayManager::Init();
+                }
+                g_last_frame_ms = Timer::GetRealMs();
+                consecutive = 0;
+            }
+        } else {
+            consecutive = 0;
         }
     }
 }

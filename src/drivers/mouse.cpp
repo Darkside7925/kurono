@@ -440,9 +440,19 @@ void Mouse::Init() {
     if (have_ccb) {
         ccb &= (uint8_t)~0x20; // AUX clock enabled
         ccb &= (uint8_t)~0x02; // keep IRQ delivery off, we poll
+        // never let this read-modify-write hurt the keyboard side: force
+        // the keyboard bits back to what Keyboard::Init programmed (clock
+        // on, irq on for hlt wake, set-1 translation) in case the ccb we
+        // read was stale/garbage. (satoru)
+        ccb &= (uint8_t)~0x10; // keyboard clock stays enabled
+        ccb |= 0x01;           // keyboard irq stays on
+        ccb |= 0x40;           // set-1 translation stays on
         if (!WriteControllerConfig(ccb)) {
             SerialLogger::Log("Mouse: Failed to write controller config\r\n");
         }
+        // belt-and-suspenders: explicitly re-enable the keyboard interface
+        // (0xae) -- harmless if already enabled. (satoru)
+        WriteCmd(0xAE);
     } else {
         SerialLogger::Log("Mouse: Failed to read controller config\r\n");
     }
@@ -1238,10 +1248,16 @@ const Mouse::PerformanceStats& Mouse::GetPerformanceStats() {
 
 void Mouse::Poll() {
     if (PollVirtualBoxAbsolute()) {
+        FlushPendingMotion();   // deliver coalesced motion/wheel  -  see below (satoru)
         FlushOutput();
         return;
     }
     if (PollVMwareAbsolute()) {
+        // the vmware/vbox absolute paths previously returned here WITHOUT the
+        // end-of-Poll motion flush, so pure cursor motion (no button edge)
+        // never enqueued an event  -  mx/my updated but the gui saw nothing, so
+        // drag/hover/move-tracking were dead under vmware. flush here too. (satoru)
+        FlushPendingMotion();
         FlushOutput();
         return;
     }
@@ -1493,6 +1509,13 @@ void Mouse::Poll() {
     }
 
     // Flush the per-tick coalesced motion and wheel deltas.
+    FlushPendingMotion();
+}
+
+// push the per-tick coalesced pointer motion + wheel deltas into the event
+// ring. shared by the ps/2 path (end of Poll) and the vmware/vbox absolute
+// paths (which return early) so pure cursor motion is delivered either way. (satoru)
+void Mouse::FlushPendingMotion() {
     if (pending_motion_dirty || pending_wheel_dz) {
         uint64_t ts = TimeManager::NowUTC().us;
         if (pending_motion_dirty) {
@@ -1598,6 +1621,15 @@ bool Mouse::ExpectAck(int timeout_us) {
 }
 bool Mouse::ReadControllerConfig(uint8_t& cfg) {
     if (!WaitInputBufferClear(200000)) return false;
+    // drain every stale output byte (keyboard acks included -- FlushOutput
+    // only drains aux-tagged bytes) before asking for the ccb: the first
+    // non-aux byte after cmd 0x20 is taken as the config, so a leftover
+    // keyboard ack (0xfa) gets misread as the ccb and written back with
+    // bit4 set = keyboard clock disabled. seen on qemu/whpx. (satoru)
+    for (int i = 0; i < 64; i++) {
+        if (!(In(0x64) & 0x01)) break;
+        (void)In(0x60);
+    }
     Out(0x64, 0x20);
     int t = 200000;
     while (t-- > 0) {

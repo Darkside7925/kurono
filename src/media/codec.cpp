@@ -233,7 +233,11 @@ AudioBuffer CodecRegistry::DecodeWAV(const uint8_t* data, int length) {
 
     while (pos + 8 < length) {
         char id[5] = { (char)data[pos], (char)data[pos+1], (char)data[pos+2], (char)data[pos+3], 0 };
-        int chunk_size = (int)(data[pos+4] | (data[pos+5]<<8) | (data[pos+6]<<16) | (data[pos+7]<<24));
+        uint32_t chunk_size = (uint32_t)data[pos+4] | ((uint32_t)data[pos+5]<<8) |
+                              ((uint32_t)data[pos+6]<<16) | ((uint32_t)data[pos+7]<<24);
+        // clamp to the remaining buffer: a negative-looking (signed) or huge
+        // size would otherwise wrap `pos` and spin this loop forever. (satoru)
+        if (chunk_size > (uint32_t)(length - pos - 8)) chunk_size = (uint32_t)(length - pos - 8);
 
         if (_cmp4(id, "fmt ")) {
             fmt_offset = pos + 8;

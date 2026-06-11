@@ -79,16 +79,31 @@ void Init() {
 
 void Tick() {
     if (!g_active) return;
-    // Aggressively pump the mixer until the backend has at least two
-    // periods queued.  This deprioritises any pending control RPC (which
-    // happens between Tick() calls) so a busy server doesn't underrun.
-    // Cap to 4 mix passes per tick to bound worst-case latency.
-    for (int i = 0; i < 4; i++) {
-        uint32_t q = g_active->QueuedFrames();
-        if (q >= AudioMixer::PERIOD_FRAMES * 2) break;
+    // nothing playing -> touch NO audio hardware. polling the backend's status
+    // / DMA-position registers on every 10ms tick while silent was pure VM-exit
+    // overhead on VMware (each in/out traps). the DMA engine idles fine and the
+    // next OpenStream re-kicks it. (satoru)
+    if (AudioMixer::ActiveStreamCount() == 0) return;
+    // refresh the backend's hardware queue depth + run codec housekeeping
+    // ONCE here (a single I/O-port read), then mix against a LOCAL estimate so
+    // the loop does zero further port I/O. reading the hardware queue on every
+    // loop iteration / gate check was a VM-exit storm under VMware that stole
+    // cpu from the gui/input tiers and caused microstutter. (satoru)
+    g_active->Tick();
+    uint32_t q = g_active->QueuedFrames();
+    // keep ~8 periods (~170ms @ 1024 frames/48khz) buffered to ride out
+    // cooperative-scheduler gaps  -  a slow gui/network frame can stall this pump
+    // for tens of ms, and 6 periods (~128ms) could drain the dma ring before
+    // the next refill, producing a crackle. raise the target to 8 and the
+    // per-tick refill cap from 12 to 16 passes so one stall can be made up in a
+    // single pump without unbounding worst-case fill latency. the mixer gate in
+    // AudioMixer::Tick() matches at PERIOD_FRAMES*8. (satoru)
+    for (int i = 0; i < 16; i++) {
+        if (q >= AudioMixer::PERIOD_FRAMES * 8) break;
         uint32_t produced = AudioMixer::Tick();
         if (produced == 0) break;
         g_periods_submitted++;
+        q += AudioMixer::PERIOD_FRAMES;   // Submit() queued ~one more period
     }
 }
 

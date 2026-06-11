@@ -3,6 +3,7 @@
 #include "virtio_gpu.h"
 #include "../kernel/heap.h"
 #include "../kernel/io.h"
+#include "../kernel/vmm.h"   // map the high 64-bit bar before dereferencing it (satoru)
 
 bool VirtIOGPU::detected = false;
 volatile uint8_t* VirtIOGPU::bar0 = nullptr;
@@ -79,6 +80,16 @@ static volatile uint8_t* resolve_bar(uint8_t bus, uint8_t dev, uint8_t func, uin
         base |= ((uint64_t)hi << 32);
     }
     if (base == 0) return nullptr;
+
+    // a 64-bit bar is often placed high above the boot identity map (qemu puts
+    // virtio modern config bars around 0x3_8000_0000), so dereferencing the
+    // base would #pf. identity-map ~4mb of it as uncached mmio first -- that
+    // covers the common/notify/isr/device config regions. cheap + idempotent
+    // (MapPage just rewrites the pte if already mapped). (satoru)
+    for (uint64_t p = base & ~0xFFFULL; p < (base & ~0xFFFULL) + 0x400000ULL; p += 0x1000ULL) {
+        KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+    }
+
     return (volatile uint8_t*)(uintptr_t)base;
 }
 

@@ -196,6 +196,18 @@ CXX_SRCS = \
     $(SRC)/apps/file_manager.cpp \
     $(SRC)/apps/text_editor.cpp \
     $(SRC)/apps/settings.cpp \
+    $(SRC)/apps/system_settings.cpp \
+    $(SRC)/apps/settings_mod_display.cpp \
+    $(SRC)/apps/settings_mod_about.cpp \
+    $(SRC)/apps/settings_mod_audio.cpp \
+    $(SRC)/apps/settings_mod_devices.cpp \
+    $(SRC)/apps/settings_mod_network.cpp \
+    $(SRC)/apps/settings_mod_power.cpp \
+    $(SRC)/apps/settings_mod_storage.cpp \
+    $(SRC)/apps/settings_mod_personalize.cpp \
+    $(SRC)/apps/settings_mod_a11y.cpp \
+    $(SRC)/apps/settings_mod_security.cpp \
+    $(SRC)/apps/settings_mod_system.cpp \
     $(SRC)/apps/task_manager.cpp \
     $(SRC)/apps/browser.cpp \
     $(SRC)/apps/media_player.cpp \
@@ -312,6 +324,11 @@ KURONO_GRUB_TIMEOUT ?= 10
 KURONO_CLI_RUN ?=
 KURONO_CLI_POWEROFF ?= 0
 KURONO_GUI_RUN ?=
+# autologin: bypass the lockscreen and boot straight to the desktop. on by
+# default so `make iso` / start.ps1 produce a desktop-booting image -- the
+# lockscreen's blocking Show() loop otherwise stalls headless/vm boots.
+# set KURONO_AUTOLOGIN=0 for a real lockscreen build. (satoru)
+KURONO_AUTOLOGIN ?= 1
 
 ifeq ($(KURONO_BOOT_PROFILE),cli)
 KURONO_BIOS_DEFAULT = 4
@@ -592,10 +609,11 @@ $(BUILD)/boot/efi_loader.so: $(BUILD)/boot/efi_loader.o $(BUILD)/boot/kernel_emb
 $(BUILD)/boot/efi_loader_emergency.so: $(BUILD)/boot/efi_loader_emergency.o $(BUILD)/boot/kernel_embed.o
 	$(EFI_LD) $(EFI_LDFLAGS) $(EFI_CRT0) $^ $(EFI_LIBS) -o $@
 
+# binutils 2.46 removed the efi-app-x86_64 bfd alias; pei-x86-64 + efi-app subsystem is the replacement (satoru)
 $(EFI_APP): $(BUILD)/boot/efi_loader.so
 	$(EFI_OBJCOPY) -j .text -j .sdata -j .data -j .rodata -j .dynamic \
 	    -j .dynsym -j .rel -j .rela -j .rel.* -j .rela.* -j .reloc \
-	    --target efi-app-x86_64 $< $@
+	    -O pei-x86-64 --subsystem efi-app $< $@
 
 $(BUILD)/boot/install_efi_embed.o: $(EFI_APP)
 	@mkdir -p $(dir $@)
@@ -604,10 +622,11 @@ $(BUILD)/boot/install_efi_embed.o: $(EFI_APP)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  kurono_installer_efi.efi install_efi_embed.o
 
+# binutils 2.46 removed the efi-app-x86_64 bfd alias; pei-x86-64 + efi-app subsystem is the replacement (satoru)
 $(EFI_APP_EMERGENCY): $(BUILD)/boot/efi_loader_emergency.so
 	$(EFI_OBJCOPY) -j .text -j .sdata -j .data -j .rodata -j .dynamic \
 	    -j .dynsym -j .rel -j .rela -j .rel.* -j .rela.* -j .reloc \
-	    --target efi-app-x86_64 $< $@
+	    -O pei-x86-64 --subsystem efi-app $< $@
 
 $(BUILD)/boot/install_efi_emergency_embed.o: $(EFI_APP_EMERGENCY)
 	@mkdir -p $(dir $@)
@@ -655,7 +674,7 @@ iso: all efi
 	@echo 'menuentry "Kurono OS (Multiboot2)" {'                       >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono OS kernel (multiboot2)..."'         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono_base.elf $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",)' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",)' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded OK. Booting..."'                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg

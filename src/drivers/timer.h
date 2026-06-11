@@ -11,6 +11,7 @@ public:
     // real-time tracking via pit counter polling (no irq needed)
     static void     PollUpdate();     // call frequently to track elapsed ticks
     static uint32_t GetRealMs();      // total real milliseconds since init
+    static uint64_t GetRealMs64();    // 64-bit TSC ms (no wrap; scheduler timebase)
     static uint32_t ElapsedSinceLast(); // ms elapsed since last call to this fn
     static uint32_t GetHz()   { return pit_freq; }
 

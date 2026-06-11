@@ -15,6 +15,8 @@ public:
     static void ToggleAt(int anchor_x, int anchor_y);
     static void Close();
     static bool IsOpen();
+    // true while open OR still running the slide/fade open-close animation.
+    static bool IsAnimating();
 
     // returns true if the click was consumed by the panel
     static bool HandleClick(int mx, int my);

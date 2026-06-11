@@ -30,6 +30,11 @@ static constexpr int kAC97RingChunkSamples = kAC97RingChunkBytes / 2;
 static bool     g_stream_live = false;
 static int      g_stream_next_fill = 0;   // BDL index we'll write next
 static uint32_t g_stream_queued_bytes = 0;
+// last civ we observed in WriteRingChunk.  used to detect that the dma engine
+// advanced past one or more entries since the last refill so we can zero the
+// stale period(s) it left behind  -  an underrun must produce clean silence, not
+// a replay of old bdl data (which is an audible pop/click). (satoru)
+static int      g_stream_last_civ = 0;
 
 static inline void _out8(uint16_t port, uint8_t val) {
     asm volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -166,10 +171,12 @@ void AC97::ResetCodec() {
         MixerWrite(AC97_EXT_AUDIO_CTRL, ext_ctrl);
     }
 
-    // set default volumes
-    MixerWrite(AC97_MASTER_VOL, 0x0808);     // -12db both channels
-    MixerWrite(AC97_PCM_OUT_VOL, 0x0808);    // -12db both channels
-    MixerWrite(AC97_HEADPHONE_VOL, 0x0808);
+    // set default volumes to MAX gain (0 attenuation). 0x0808 was ~-12db on
+    // each channel which, combined with later attenuation math, left output
+    // near-inaudible. SetMasterVolume() attenuates from this full-gain base. (satoru)
+    MixerWrite(AC97_MASTER_VOL, 0x0000);     // max gain, no attenuation
+    MixerWrite(AC97_PCM_OUT_VOL, 0x0000);    // max gain, no attenuation
+    MixerWrite(AC97_HEADPHONE_VOL, 0x0000);
 
     // power up all sections
     MixerWrite(AC97_POWERDOWN, 0x0000);
@@ -413,6 +420,7 @@ void AC97::Stop() {
     g_stream_live = false;
     g_stream_next_fill = 0;
     g_stream_queued_bytes = 0;
+    g_stream_last_civ = 0;
     info.state = AC97_STOPPED;
 }
 
@@ -451,6 +459,7 @@ bool AC97::EnsureStreaming(int sample_rate, int bits, int channels) {
     // data before advancing past the silence ring.
     BMWrite8(AC97_BM_PCM_OUT + BM_LVI, (uint8_t)0);
     g_stream_next_fill = 1;     // first chunk we fill goes to entry 1
+    g_stream_last_civ  = 0;     // dma starts at entry 0. (satoru)
     return true;
 }
 
@@ -460,6 +469,35 @@ uint32_t AC97::WriteRingChunk(const void* data, uint32_t bytes) {
     uint32_t written = 0;
 
     int civ = BMRead8(AC97_BM_PCM_OUT + BM_CIV);
+
+    // zero every entry the dma engine has *already played* since our last
+    // refill (g_stream_last_civ .. civ-1).  the controller cycles the ring, so
+    // any consumed-but-unrefilled entry would be replayed verbatim on the next
+    // wrap  -  an audible pop/click of stale period data on every underrun. blank
+    // them to silence so an underrun is clean, not a crackle.  walk forward mod
+    // N from last_civ up to (not including) civ; bounded to N iterations so a
+    // bogus civ can never spin. N = AC97_MAX_BDL_ENTRIES = 32. (satoru)
+    for (int idx = g_stream_last_civ, guard = 0;
+         idx != civ && guard < AC97_MAX_BDL_ENTRIES;
+         idx = (idx + 1) % AC97_MAX_BDL_ENTRIES, guard++) {
+        uint8_t* z = dma_buffer + idx * kAC97RingChunkBytes;
+        for (int i = 0; i < kAC97RingChunkBytes; i++) z[i] = 0;
+    }
+    g_stream_last_civ = civ;
+
+    // recovery after an underrun: if our write cursor sits on civ the ring
+    // *looks* full, but if the engine has halted (DCH) it actually drained dry
+    // and the indices merely collided because we stopped feeding it.  bailing
+    // here forever is the old "plays but stays silent" lock-up.  re-sync the
+    // fill cursor one slot ahead of civ so we resume writing fresh data instead
+    // of giving up.  (when DCH is clear, next_fill==civ is a genuinely full
+    // ring and the per-iteration guard below still backs off correctly.) (satoru)
+    if (g_stream_next_fill == civ) {
+        uint16_t st = BMRead16(AC97_BM_PCM_OUT + BM_STATUS);
+        if (st & BM_STATUS_DCH) {
+            g_stream_next_fill = (civ + 1) % AC97_MAX_BDL_ENTRIES;
+        }
+    }
 
     while (bytes > 0) {
         // Don't overwrite the entry the controller is currently playing.
@@ -496,9 +534,18 @@ uint32_t AC97::WriteRingChunk(const void* data, uint32_t bytes) {
     BMWrite16(AC97_BM_PCM_OUT + BM_STATUS,
               status & (BM_STATUS_LVBCI | BM_STATUS_BCIS | BM_STATUS_FIFOE));
 
-    // If the engine stalled (DCH) but we just gave it data, kick it back.
+    // If the engine stalled (DCH) but we just gave it data, resume it WITHOUT
+    // calling StartDMA(). StartDMA() re-arms LVI to the last bdl entry
+    // (AC97_MAX_BDL_ENTRIES-1); in streaming mode that makes RingQueuedBytes
+    // report an almost-full ring forever, which wedges the mixer's
+    // back-pressure gate (QueuedFrames > 3*PERIOD) permanently shut  -  so after
+    // the very first underrun no further audio is ever mixed. that is the
+    // "video/music plays but stays silent" bug. the bdl base is unchanged and
+    // we already advanced LVI to the entry we just filled, so just re-arm the
+    // run bit to resume from the current index. (satoru)
     if (status & BM_STATUS_DCH) {
-        StartDMA();
+        BMWrite8(AC97_BM_PCM_OUT + BM_CR,
+                 BM_CR_RUN | BM_CR_IOCE | BM_CR_LVBIE);
     }
 
     return written;
@@ -508,7 +555,17 @@ uint32_t AC97::RingQueuedBytes() {
     if (!g_stream_live) return 0;
     int civ = BMRead8(AC97_BM_PCM_OUT + BM_CIV);
     int lvi = BMRead8(AC97_BM_PCM_OUT + BM_LVI);
-    int dist = (lvi - civ + AC97_MAX_BDL_ENTRIES) % AC97_MAX_BDL_ENTRIES;
+    // in-flight entries = the entries the controller still has to play, i.e.
+    // civ up to and including lvi.  that count is (lvi+1-civ) mod N, NOT
+    // (lvi-civ) mod N.  the old (lvi-civ+N)%N was off by one and, worse, it
+    // BLEW UP after an underrun: once civ wrapped one slot past a stale lvi
+    // (e.g. lvi=8, civ=9) the old math returned (8-9+32)%32 = 31  -  a nearly
+    // full ring (31*4096 = 124 kb)  -  so the mixer's back-pressure gate
+    // (QueuedFrames > PERIOD*8) latched shut forever and never refilled again,
+    // i.e. audio went silent/crackly and never recovered. with (lvi+1-civ+N)%N
+    // the same case returns (8+1-9+32)%32 = 0 (empty) so the mixer resumes
+    // refilling. N = AC97_MAX_BDL_ENTRIES = 32, chunk = 4096 bytes. (satoru)
+    int dist = (lvi + 1 - civ + AC97_MAX_BDL_ENTRIES) % AC97_MAX_BDL_ENTRIES;
     return (uint32_t)dist * (uint32_t)kAC97RingChunkBytes;
 }
 

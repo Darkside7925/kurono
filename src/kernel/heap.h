@@ -29,6 +29,12 @@ public:
     static void  Free(void* ptr);
     static void  Reset();
 
+    // true if ptr is the payload of a live (allocated) heap block. lets a
+    // caller that may hold a stale/non-heap pointer (e.g. content deserialized
+    // from a saved image, or already freed elsewhere) avoid a stray Free()
+    // that would trip "bad magic" and corrupt the allocator. (satoru)
+    static bool  IsValidBlock(void* ptr);
+
     // statistics
     static size_t GetUsed();
     static size_t GetFree();

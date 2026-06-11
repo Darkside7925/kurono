@@ -121,6 +121,14 @@ namespace {
     }
 
     static void ensure_core_layout() {
+        // run ONCE, not on every log line. MirrorSerial() calls this per line;
+        // doing 7 Mkdirs + 6 ensure_file (now each a LOCKED KVFS tree-walk)
+        // for every serial line was a per-line storm that, under the new VFS
+        // lock + VMware's slower timing, starved the GUI for minutes at boot.
+        // the dirs/files persist once created, so a single pass suffices. (satoru)
+        static bool done = false;
+        if (done) return;
+        done = true;
         KVFS::Mkdirs("/system/logs");
         KVFS::Mkdirs("/system/logs/processes");
         KVFS::Mkdirs("/system/boot");

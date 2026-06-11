@@ -71,9 +71,16 @@ static void OnRender(Window* w) {
         return;
     }
 
-    // pump time-driven decode each paint.  cheap if frame hasn't
-    // advanced; otherwise decodes one jpeg + writes one chunk of pcm.
-    VideoPlayer::Tick(g_state);
+    // decode is now split from blit. PumpDecode only does the heavy jpeg
+    // work when the frame actually advances (true video fps, not the ~60/s
+    // paint rate); on a steady frame it is just a binary search + return.
+    // Render then blits the cached scaled frame (a row memcpy), so a static
+    // frame costs almost nothing even though we repaint every compositor
+    // pass. see decouple note in video_player.h: the only remaining stall is
+    // the single decode on the paint where the frame turns over; moving that
+    // decode onto its own scheduler-step cadence needs a pump call from a
+    // process file (not owned here). (satoru)
+    VideoPlayer::PumpDecode(g_state);
     VideoPlayer::Render(g_state, w->content_x, w->content_y,
                         w->content_w, w->content_h);
 }

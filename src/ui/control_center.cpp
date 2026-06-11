@@ -279,6 +279,7 @@ void ControlCenter::ToggleAt(int ax, int ay){ if (open) Close(); else OpenAt(ax,
 void ControlCenter::Close(){ open = false; dragging_volume = false; dragging_brightness = false; }
 void ControlCenter::Toggle(){ if (open) Close(); else Open(); }
 bool ControlCenter::IsOpen(){ return open; }
+bool ControlCenter::IsAnimating(){ return open || g_panel_animating; }
 int  ControlCenter::GetX(){ return panel_x; }
 int  ControlCenter::GetY(){ return panel_y; }
 int  ControlCenter::GetW(){ return panel_w; }

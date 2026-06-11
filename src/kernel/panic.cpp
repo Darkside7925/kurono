@@ -4,6 +4,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/rtc.h"
 #include "../fs/kvfs.h"
+#include "../proc/kernel_locks.h"   // g_vfs_lock  -  panic-path deadlock guard
 #include "../../logo.h"
 
 namespace {
@@ -487,6 +488,19 @@ namespace {
         *truncated = 0;
         if (cap == 0) return 0;
         out[0] = 0;
+
+        // This runs from the panic path, which can fire from an exception that
+        // interrupted a process holding g_vfs_lock. Every KVFS call below now
+        // takes that (non-recursive) lock, so we'd self-deadlock the dying CPU
+        // and never finish the minidump. Probe with TryLock: IF is already
+        // cleared by KeBugCheckEx (cli) on this uniprocessor, so if the probe
+        // succeeds nothing can grab the lock under us  -  release immediately and
+        // let the normal locked KVFS calls re-acquire. If the probe fails the
+        // lock is held by the interrupted context, so skip the (best-effort)
+        // serial tail rather than hang. (satoru)
+        if (!g_vfs_lock.TryLock()) return 0;
+        g_vfs_lock.Unlock();
+
         if (!KVFS::GetRoot()) return 0;
 
         // the runtime logger mirrors all seriallogger output to these files;
@@ -970,10 +984,18 @@ namespace KernelPanic {
         // RAM, but the installer wires it through to the real disk on
         // shutdown  -  and the dump is also visible to the in-RAM
         // /var/crash/ tree exposed via the /proc-style virtual fs.
-        if (KVFS::GetRoot()) {
-            KVFS::Mkdirs("/var/crash");
-            KVFS::WriteFile("/var/crash/last.dmp", &g_dump, sizeof(g_dump));
+        //
+        // Use TryWriteCrashDump: this panic can fire from an exception that
+        // interrupted a process holding g_vfs_lock. The KVFS public API now
+        // takes that (non-recursive) lock, so a normal WriteFile here would
+        // spin forever on the dying CPU and silently lose the BSOD. The Try
+        // variant skips persistence if the lock is held (the physical-RAM
+        // minidump from write_minidump() above is the real recovery path) so
+        // we always reach reboot_or_halt() and show the bugcheck screen. (satoru)
+        if (KVFS::TryWriteCrashDump("/var/crash/last.dmp", &g_dump, sizeof(g_dump))) {
             SerialLogger::Log("KeBugCheckEx: dump written to /var/crash/last.dmp\r\n");
+        } else {
+            SerialLogger::Log("KeBugCheckEx: KVFS dump skipped (lock held / no root)\r\n");
         }
 
         SerialLogger::Log("KeBugCheckEx: render done, halting\r\n");

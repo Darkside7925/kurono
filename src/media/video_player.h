@@ -62,6 +62,24 @@ struct State {
     int      rgba_h;
     bool     rgba_owns;                 // true if rgba_frame allocated by stb
 
+    // persistent decode scratch: one owned rgba buffer reused across frames
+    // so we don't malloc/free w*h*4 every frame. grows only when a larger
+    // frame appears, freed in Close. (satoru)
+    uint8_t* decode_buf;
+    uint32_t decode_cap;                // capacity in bytes
+
+    // scaled-output cache: the letterboxed bgra result for the current
+    // (frame,dst) blitted straight via row memcpy on a static frame so the
+    // per-pixel scale runs only when the frame or window size changes. (satoru)
+    uint8_t* scaled_buf;                // owned, cap == scaled_cap bytes
+    uint32_t scaled_cap;
+    int      scaled_w;                  // pixel dims of cached scaled image
+    int      scaled_h;
+    uint32_t scaled_key_frame;          // kvid_cur_frame the cache was built for
+    int      scaled_key_dw;             // dst_w the cache was built for
+    int      scaled_key_dh;             // dst_h the cache was built for
+    bool     scaled_valid;
+
     // audio mixer stream id (kvid only)
     int audio_stream_id;
 };
@@ -85,9 +103,20 @@ uint32_t DurationMs(const State& st);
 // pump time-driven decoding; safe to call every main-loop iteration.
 void Tick(State& st);
 
+// decode-only pump: advances to the frame due at "now" and decodes it,
+// WITHOUT any drawing. this is the heavy half of Tick split out so a
+// caller can run the decode on its own cadence (e.g. a scheduler step)
+// separate from the gui blit. Tick() forwards to this. returns true if a
+// new frame was decoded this call (i.e. the displayed frame changed). a
+// cooperative scheduler has no background thread, so "decouple" means
+// calling this from a lighter cadence than the compositor, not real
+// concurrency. (satoru)
+bool PumpDecode(State& st);
+
 // blit current frame + overlay HUD into pixel rectangle (x,y,w,h).
-// `wm_focused` shades the controls.
-void Render(const State& st, int x, int y, int w, int h);
+// non-const: maintains an internal scaled-output cache so a static frame
+// re-blits without re-running the per-pixel scale. (satoru)
+void Render(State& st, int x, int y, int w, int h);
 
 // produce a one-line summary like "h264 high 1280x720 24fps + aac lc"
 void DescribeShort(const State& st, char* out, int max);

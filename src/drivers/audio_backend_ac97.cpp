@@ -31,11 +31,18 @@ public:
         if (!ready_ || !pcm) return 0;
         const uint32_t bytes = frames * 4;     // stereo s16
         uint32_t written = AC97::WriteRingChunk((const void*)pcm, bytes);
-        // queued_frames_ reflects what the hardware ring currently holds.
-        queued_frames_ = AC97::RingQueuedBytes() / 4;
+        // bump the cached depth by what we just queued (no port I/O). the
+        // exact depth (accounting for hardware draining since) is reconciled
+        // once per pump in Tick(). (satoru)
+        queued_frames_ += written / 4;
         return written / 4;
     }
 
+    // return the CACHED queue depth  -  no port I/O. Tick() reconciles it from
+    // the hardware (CIV/LVI) exactly once per pump (called at the top of
+    // AudioServer::Tick before this gate is read), and Submit() bumps it per
+    // period, so the value the back-pressure gate sees is fresh without a
+    // per-call VM-exit storm. (satoru)
     uint32_t QueuedFrames() const override { return queued_frames_; }
     uint32_t SampleRate()   const override { return AudioMixer::INTERNAL_RATE; }
 

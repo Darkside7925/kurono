@@ -93,6 +93,11 @@ void NotificationManager::Post(const char* title, const char* body, int icon_typ
     tt.born_ms     = Timer::GetRealMs();
     copy_str(tt.title, title, TITLE_CAP);
     copy_str(tt.body,  body,  BODY_CAP);
+
+    // a freshly-posted toast changes the screen; ensure the GUI loop paints
+    // it even if no input is happening. lifecycle animation thereafter is
+    // kept alive by the activity predicate (ActiveCount() > 0). (satoru)
+    Graphics::MarkUIDirty();
 }
 
 void NotificationManager::Tick() {

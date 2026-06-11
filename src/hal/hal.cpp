@@ -3,6 +3,7 @@
 #include "../linux/linux_syscall.h"
 #include "../kernel/panic.h"
 #include "../proc/scheduler.h"
+#include "../kernel/userspace.h"   // Userspace::HandleProcessExit for user-fault termination (satoru)
 
 //  x86_64 idt, pic 8259a, and isr implementation
 //  isr stubs live in isr_stubs.asm  -  this file builds the idt from the
@@ -292,6 +293,16 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         log_hex("  RSI    = ", frame->rsi);
         log_hex("  RBP    = ", frame->rbp);
 
+        // a genuine ring-3 exception (segfault, #GP, #UD, div0, ...) must not
+        // panic the whole kernel. terminate the faulting user process with
+        // SIGSEGV semantics instead: HandleProcessExit marks it exited and
+        // longjmps back to RunProcessWithArgs on the kernel stack. it no-ops
+        // when there is no active user process, so a true kernel fault below
+        // still panics as before. (satoru -- task #24)
+        if ((frame->cs & 3) == 3) {
+            SerialLogger::Log("Terminating faulting user process (SIGSEGV).\r\n");
+            Userspace::HandleProcessExit(139);  // 128 + SIGSEGV; does not return
+        }
         SerialLogger::Log("Invoking kernel panic path.\r\n");
         KernelPanic::BugCheckFromInterrupt(frame, exception_names[vec]);
     }
@@ -321,12 +332,10 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         HAL::irq_fired[irq] = true;
         if (irq == 0) {
             HAL::pit_ticks++;
-            // Drive the preemptive scheduler from the timer IRQ.  At
-            // 1 kHz PIT this is one millisecond of charged runtime per
-            // tick.  Scheduler::OnTimerTick() handles vruntime / sleep
-            // wakeups / timeslice expiry; the actual switch happens at
-            // the next voluntary Yield/Sleep so the IRQ stack stays
-            // pristine.
+            // Drive the scheduler from the 1 kHz PIT: 1 ms of charged runtime
+            // per tick. A fine tick keeps SleepMs wakeups (input/cursor) timely
+            // for smooth 60fps; sleep deadlines + the ms clock are TSC-based and
+            // independent of this rate. (satoru)
             Scheduler::OnTimerTick(1);
         }
 
@@ -376,10 +385,15 @@ void HAL::Init() {
     InitIDT();
     // 2.5 program SYSCALL/SYSRET MSRs (depends on GDT being loaded)
     InitSyscallMSRs();
-    // 3. selectively enable interrupts we actually use
-    EnableIRQ(0);   // pit timer
-    EnableIRQ(1);   // keyboard
-    EnableIRQ(12);  // mouse
+    // 3. enable the interrupts we use. keyboard (IRQ1) and mouse (IRQ12) are
+    // POLLED (no handlers)  -  BUT we keep them UNMASKED on purpose: when the cpu
+    // is HLT'd in deep idle, a keystroke/mouse-move IRQ wakes it immediately so
+    // the polled InputProcess runs and the desktop responds without waiting for
+    // the (WHPX-coalesced, ~500ms) timer IRQ. the unhandled IRQ just EOIs; the
+    // wake is the point. (satoru)
+    EnableIRQ(0);   // pit timer (drives scheduler wakeups)
+    EnableIRQ(1);   // keyboard  -  polled, but wakes the cpu from HLT
+    EnableIRQ(12);  // mouse  -  polled, but wakes the cpu from HLT
 
     // 4. re-enable nmi now that idt is ready to handle it.
     //    boot assembly disables nmi via cmos port 0x70 bit 7 to prevent

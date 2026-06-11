@@ -48,6 +48,23 @@ static void heap_warn(const char* msg) {
     if (g_heap_warn_budget > 0) { g_heap_warn_budget--; SerialLogger::Log(msg); }
 }
 
+// Interrupt-safe critical section for every public heap operation. The heap is
+// re-entered from INTERRUPT context: PIT IRQ0 -> Scheduler::OnTimerTick ->
+// HRTimer::Tick fires the periodic "proc_refresh" callback inline, which calls
+// KVFS::WriteString -> KernelHeap::Alloc/Free. If IRQ0 lands while a process is
+// mid-Alloc/Free (e.g. between freelist_remove and mark_used, or mid-coalesce
+// with g_free_head dangling), the IRQ-context allocation corrupts a block
+// header -> "Free() bad magic" (the 63x-at-boot symptom; the warn->serial->kvfs
+// logging path then amplifies one corruption to the saturated budget). cli/sti
+// (NOT a spinlock) is the correct primitive: the contention is process-vs-IRQ
+// on a single cpu, so a spinlock would deadlock. saves/restores IF so nested
+// guards don't prematurely re-enable. (satoru)
+struct HeapIrqGuard {
+    uint64_t flags;
+    HeapIrqGuard()  { __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory"); }
+    ~HeapIrqGuard() { if (flags & 0x200ULL) __asm__ __volatile__("sti" ::: "memory"); }
+};
+
 static inline uint64_t* footer_of(HeapBlock* b) {
     return (uint64_t*)((uint8_t*)b + HEAP_HEADER_SIZE + b->size - HEAP_FOOTER_SIZE);
 }
@@ -192,6 +209,7 @@ HeapBlock* KernelHeap::FindFree(size_t size) {
 }
 
 void* KernelHeap::Alloc(size_t size) {
+    HeapIrqGuard _g;   // interrupt-safe: blocks IRQ-context re-entry (satoru)
     if (!initialized) Init();
     if (size == 0) size = 1;
     // reserve the trailing 8-byte boundary-tag footer OUTSIDE the caller's
@@ -230,6 +248,7 @@ void* KernelHeap::Alloc(size_t size) {
 
 void KernelHeap::Free(void* ptr) {
     if (!ptr) return;
+    HeapIrqGuard _g;   // interrupt-safe: blocks IRQ-context re-entry (satoru)
 
     uint8_t* data = (uint8_t*)ptr;
 
@@ -304,6 +323,7 @@ void KernelHeap::Coalesce(HeapBlock* block) {
 void* KernelHeap::Realloc(void* ptr, size_t new_size) {
     if (!ptr) return Alloc(new_size);
     if (new_size == 0) { Free(ptr); return nullptr; }
+    HeapIrqGuard _g;   // interrupt-safe; nests harmlessly with Alloc/Free (satoru)
     if (new_size > (size_t)-1 - 15) return nullptr;
 
     HeapBlock* block = (HeapBlock*)((uint8_t*)ptr - HEAP_HEADER_SIZE);
@@ -340,6 +360,7 @@ size_t KernelHeap::GetTotal() {
 }
 
 size_t KernelHeap::GetUsed() {
+    HeapIrqGuard _g;   // interrupt-safe: walk must not race an IRQ-context alloc (satoru)
     size_t used = 0;
     uint8_t* ptr = heap_base;
     uint8_t* end = heap_base + heap_capacity;
@@ -358,4 +379,13 @@ size_t KernelHeap::GetFree() {
     size_t total = heap_capacity;
     size_t used  = GetUsed();
     return total > used + HEAP_HEADER_SIZE ? total - used - HEAP_HEADER_SIZE : 0;
+}
+
+bool KernelHeap::IsValidBlock(void* ptr) {
+    if (!ptr) return false;
+    HeapIrqGuard _g;
+    uint8_t* data = (uint8_t*)ptr;
+    if (data < heap_base + HEAP_HEADER_SIZE || data >= heap_base + heap_capacity) return false;
+    HeapBlock* block = (HeapBlock*)(data - HEAP_HEADER_SIZE);
+    return valid_magic(block->flags) && block_used(block);
 }

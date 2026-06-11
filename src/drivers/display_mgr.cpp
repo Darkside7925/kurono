@@ -133,10 +133,17 @@ bool DisplayManager::InitBGA() {
 }
 
 bool DisplayManager::InitVirtIOGPU() {
-    uint32_t w = 0, h = 0;
-    if (!VirtIOGPU::GetDisplayInfo(0, &w, &h)) {
-        w = 1920;
-        h = 1080;
+    // default to 1080p. qemu's virtio-gpu advertises a 1280x800 "preferred"
+    // mode through GetDisplayInfo, but the guest drives the real scanout size
+    // and the host window resizes to match whatever we set -- so we create a
+    // 1920x1080 resource. only adopt the host-reported geometry when it is
+    // strictly larger (e.g. a 4k panel on real hardware) so we never downgrade
+    // a bigger display below 1080p. (satoru)
+    uint32_t w = 1920, h = 1080;
+    uint32_t hw = 0, hh = 0;
+    if (VirtIOGPU::GetDisplayInfo(0, &hw, &hh) && hw >= 1920 && hh >= 1080) {
+        w = hw;
+        h = hh;
     }
 
     fb_info.width = w;
@@ -156,6 +163,12 @@ bool DisplayManager::InitVirtIOGPU() {
 
     VirtIOGPU::AttachBacking(res, fb_info.address, fb_info.size);
     VirtIOGPU::SetScanout(0, res, 0, 0, w, h);
+
+    // point Graphics at this virtio backing buffer so all UI rendering lands in
+    // the resource that gets transferred to the host each present, and enable
+    // the per-frame host transfer in the gui loop. (satoru)
+    Graphics::ReinitForResolution((uintptr_t)fb_info.address, w, h, fb_info.pitch, 32);
+    Graphics::SetVirtioPresent(true);
 
     fb_info.double_buffered = false;
 
