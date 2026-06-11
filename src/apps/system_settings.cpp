@@ -3,6 +3,7 @@
 #include "system_settings.h"
 #include "../ui/window_manager.h"
 #include "../drivers/graphics.h"
+#include "../ui/kss.h"
 #include "../system/ui_config.h"
 #include "../system/logging.h"
 
@@ -104,14 +105,19 @@ static void render_sidebar(int x, int y, int h){
     Graphics::DrawString(x + 16, y + 12, "Settings", SH_HEADING, 0xFF000000);
     int ty = y + 40;
 
+    // selection highlight slides smoothly to the chosen row via the kss tween
+    // engine (the row fill + accent left-bar ease into place). first open seeds
+    // at the current row, so there's no slide-from-zero on launch. (satoru)
+    int sel_target = ty + s_selected * ROW_H;
+    int sel_y = (int)(KSS::Anim::Float(0xACCE5501u, (float)sel_target, 200, KSS::Anim::OutCubic) + 0.5f);
+    Graphics::FillRect(x, sel_y, SIDEBAR_W - 1, ROW_H, SH_SEL_BG);
+    Graphics::FillRect(x, sel_y, 3, ROW_H, sh_accent());
+
     for(int i = 0; i < g_module_count; i++){
         int row_y = ty + i * ROW_H;
         bool sel   = (i == s_selected);
         bool hover = (i == s_hover_tab) && !sel;
-        if(sel){
-            Graphics::FillRect(x, row_y, SIDEBAR_W - 1, ROW_H, SH_SEL_BG);
-            Graphics::FillRect(x, row_y, 3, ROW_H, sh_accent());  // accent left-bar (satoru)
-        } else if(hover){
+        if(hover){
             Graphics::FillRect(x, row_y, SIDEBAR_W - 1, ROW_H, SH_HOVER_BG);
         }
         int tx = x + 14;

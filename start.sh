@@ -175,10 +175,10 @@ if [ "$HEADLESS" -eq 1 ]; then
   QARGS+=(-display none -serial stdio -qmp "unix:/tmp/kurono.qmp,server,nowait")
   echo "  [*] headless: serial on stdio, QMP at /tmp/kurono.qmp"
 elif [ "$LOG_STDIO" -eq 1 ]; then
-  QARGS+=(-display gtk -serial stdio)
+  QARGS+=(-display gtk,gl=on -serial stdio)
   echo "  [*] serial -> this terminal (--log-stdio); may add lag"
 else
-  QARGS+=(-display gtk -serial "file:$SERIAL_LOG")
+  QARGS+=(-display gtk,gl=on -serial "file:$SERIAL_LOG")
   echo "  [*] serial -> $SERIAL_LOG  (terminal stays quiet for a smooth desktop)"
 fi
 

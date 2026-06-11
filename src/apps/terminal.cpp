@@ -10,18 +10,25 @@
 #include "../fs/kvfs.h"
 #include "../system/logging.h"
 #include "../system/clipboard.h"
+#include "../ui/kss.h"
+#include "../ui/font.h"
 
-static const unsigned int T_BG       = 0xFF0A0A18;
-static const unsigned int T_FG       = 0xFFD0D0D0;
-static const unsigned int T_PROMPT   = 0xFF3498DB;
+// theme chrome colors. seeded from the kss tokens at init so the terminal
+// matches the system black/grey palette; the background and primary text
+// double as the sentinels the render/escape code compares against (e.g.
+// `cell->bg != T_BG`), so they live as mutable globals, not const. (satoru)
+static unsigned int T_BG     = 0xFF101012;  // near-black app bg (kss .bg) (satoru)
+static unsigned int T_FG     = 0xFFE6E6EA;  // primary text (kss .text) (satoru)
+static unsigned int T_CURSOR = 0xFF3D7DFF;  // cursor / caret (kss accent) (satoru)
+static unsigned int T_PROMPT = 0xFF3D7DFF;  // prompt accent (kss accent) (satoru)
+static unsigned int T_GRAY   = 0xFF8A8A92;  // dim chrome text (kss .text_dim) (satoru)
+static unsigned int T_SEL_BG = 0xFF26262B;  // selection / raised bg (kss .sel) (satoru)
+// semantic ansi palette  -  fixed, these are color *meanings* not theme chrome. (satoru)
 static const unsigned int T_GREEN    = 0xFF2ECC71;
 static const unsigned int T_RED      = 0xFFE74C3C;
 static const unsigned int T_YELLOW   = 0xFFF1C40F;
 static const unsigned int T_MAGENTA  = 0xFF9B59B6;
 static const unsigned int T_CYAN     = 0xFF1ABC9C;
-static const unsigned int T_GRAY     = 0xFF7F8C8D;
-static const unsigned int T_CURSOR   = 0xFFFFFFFF;
-static const unsigned int T_SEL_BG   = 0xFF2C3E50;
 // bright variants
 static const unsigned int T_BRED     = 0xFFFF6B6B;
 static const unsigned int T_BGREEN   = 0xFF55EFC4;
@@ -31,8 +38,67 @@ static const unsigned int T_BMAGENTA = 0xFFA29BFE;
 static const unsigned int T_BCYAN    = 0xFF81ECEC;
 static const unsigned int T_BWHITE   = 0xFFFFFFFF;
 
-static const int CELL_W = 8;   // pixels per character
-static const int CELL_H = 16;  // pixels per line
+// monospace grid metrics, derived from real font metrics (not a hardcoded
+// 8x16). cell_pxh is the glyph height we render at; CELL_W comes from the
+// measured advance of "M" at that size, CELL_H from the px height plus a
+// little leading so rows don't touch. PAD_X/PAD_Y inset the grid from the
+// window edges. recomputed lazily by EnsureMetrics(). (satoru)
+static float cell_pxh = 16.0f;
+static int   CELL_W   = 8;
+static int   CELL_H   = 20;
+static const int PAD_X = 8;   // inner left/right padding (px) (satoru)
+static const int PAD_Y = 6;   // inner top/bottom padding (px) (satoru)
+static bool  metrics_ready = false;
+
+// pull theme chrome from kss; safe to call repeatedly. (satoru)
+static void TermSyncTheme(){
+    const KSS::Theme& t = KSS::T();
+    T_BG     = t.bg;
+    T_FG     = t.text;
+    T_CURSOR = KSS::Accent();
+    T_PROMPT = KSS::Accent();
+    T_GRAY   = t.text_dim;
+    T_SEL_BG = t.sel;
+}
+
+// compute the monospace cell from the active font once it's loaded. measuring
+// "M" gives the widest typical advance so every glyph fits its cell without
+// the old cramped overlap; height = px size + leading. (satoru)
+static void EnsureMetrics(){
+    if(metrics_ready) return;
+    cell_pxh = KSS::BodyPx();        // matches graphics' 16px body base (satoru)
+    if(cell_pxh < 8.0f) cell_pxh = 16.0f;
+    int mw = FontTTF::ok ? FontTTF::Measure(cell_pxh, "M") : 0;
+    if(mw <= 0) mw = (int)(cell_pxh * 0.5f + 0.5f);  // sane fallback (satoru)
+    CELL_W = mw;
+    CELL_H = (int)(cell_pxh * 1.30f + 0.5f);         // ~30% leading (satoru)
+    if(CELL_W < 4)  CELL_W = 4;
+    if(CELL_H < 10) CELL_H = 10;
+    metrics_ready = true;
+}
+
+// draw one run of text at the terminal grid size via fontttf, vertically
+// centered in the cell. bold = brighten + a 1px overdraw for real weight, so
+// bold cells visibly read as bold and not merely lighter. (satoru)
+static void TermDrawRun(int sx, int sy, const char* s, unsigned int fg, bool bold){
+    if(!s || !s[0]) return;
+    unsigned int draw_fg = fg;
+    if(bold){
+        unsigned int r=(fg>>16)&0xFF, g=(fg>>8)&0xFF, b=fg&0xFF;
+        r=r+50>255?255:r+50; g=g+50>255?255:g+50; b=b+50>255?255:b+50;
+        draw_fg = 0xFF000000|(r<<16)|(g<<8)|b;
+    }
+    // baseline offset so glyphs sit centered in CELL_H. (satoru)
+    int gy = sy + (CELL_H - (int)cell_pxh) / 2;
+    if(gy < sy) gy = sy;
+    if(FontTTF::ok){
+        FontTTF::DrawString(sx, gy, cell_pxh, s, draw_fg);
+        if(bold) FontTTF::DrawString(sx+1, gy, cell_pxh, s, draw_fg); // faux-bold (satoru)
+    } else {
+        // bitmap fallback path (no ttf): route through graphics' string draw. (satoru)
+        Graphics::DrawString(sx, gy, s, draw_fg, T_BG);
+    }
+}
 
 static int slen(const char* s){int n=0;if(s)while(s[n])n++;return n;}
 static void scpy(char* d,const char* s,int mx){
@@ -83,6 +149,10 @@ int          TerminalApp::target_scroll_offset = 0;
 
 //  init / open
 void TerminalApp::Init(){
+    // seed theme chrome + grid metrics from kss before anything draws. (satoru)
+    TermSyncTheme();
+    metrics_ready = false;
+    EnsureMetrics();
     buf_count=0; scroll_offset=0;
     cursor_row=0; cursor_col=0;
     cur_fg=T_FG; cur_bg=T_BG; cur_bold=false;
@@ -174,13 +244,14 @@ void TerminalApp::NewLine(){
     cursor_row++;
     if(cursor_row>=TERM_SCROLL_BK) cursor_row=TERM_SCROLL_BK-1;
     if(cursor_row>=buf_count) buf_count=cursor_row+1;
-    // clear the new row
+    // clear the new row (reset bold too, or stale weight leaks on reuse) (satoru)
     if(cursor_row<TERM_SCROLL_BK){
         buffer[cursor_row].len=0;
         for(int j=0;j<TERM_COLS;j++){
             buffer[cursor_row].cells[j].ch=' ';
             buffer[cursor_row].cells[j].fg=T_FG;
             buffer[cursor_row].cells[j].bg=T_BG;
+            buffer[cursor_row].cells[j].bold=false;
         }
     }
 }
@@ -200,6 +271,7 @@ void TerminalApp::WriteChar(char c){
     cell->ch=c;
     cell->fg=cur_fg;
     cell->bg=cur_bg;
+    cell->bold=cur_bold;   // record weight so bold cells actually draw bold (satoru)
     cursor_col++;
     if(cursor_col>buffer[cursor_row].len)
         buffer[cursor_row].len=cursor_col;
@@ -322,6 +394,10 @@ void TerminalApp::Clear(){
 
 void TerminalApp::SetColor(unsigned int fg,unsigned int bg){
     cur_fg=fg; cur_bg=bg;
+}
+
+void TerminalApp::SetBold(bool b){
+    cur_bold=b;
 }
 
 void TerminalApp::ScrollToBottom(){
@@ -669,24 +745,23 @@ void TerminalApp::HistoryDown(){
 
 //  rendering callback
 void TerminalApp::RenderCell(int sx,int sy,TermCell* cell){
+    EnsureMetrics();
     if(cell->bg!=T_BG){
         Graphics::FillRect(sx,sy,CELL_W,CELL_H,cell->bg);
     }
     if(cell->ch>' '){
         char s[2]={cell->ch,0};
-        unsigned int fg = cell->fg;
-        if(cell->bold){
-            // brighten bold text
-            unsigned int r=(fg>>16)&0xFF, g=(fg>>8)&0xFF, b=fg&0xFF;
-            r=r+50>255?255:r+50; g=g+50>255?255:g+50; b=b+50>255?255:b+50;
-            fg=0xFF000000|(r<<16)|(g<<8)|b;
-        }
-        Graphics::DrawString(sx,sy,s,fg,0xFF000000);
+        TermDrawRun(sx,sy,s,cell->fg,cell->bold);
     }
 }
 
 void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     (void)win_ptr;
+
+    // keep theme + grid metrics current (font may finish loading after init,
+    // and the theme can be re-themed live). (satoru)
+    TermSyncTheme();
+    EnsureMetrics();
 
     // ease scroll_offset toward target_scroll_offset (~3 frames to settle)
     if(scroll_offset != target_scroll_offset){
@@ -703,8 +778,15 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     // fill background
     Graphics::FillRect(cx,cy,cw,ch,T_BG);
 
-    int vis_rows = ch / CELL_H;
-    int vis_cols = cw / CELL_W;
+    // inset content by a few px so glyphs don't hug the window frame; all grid
+    // math below is relative to this padded origin. (satoru)
+    int ox = cx + PAD_X;
+    int oy = cy + PAD_Y;
+    int uw = cw - 2*PAD_X; if(uw < CELL_W) uw = CELL_W;
+    int uh = ch - 2*PAD_Y; if(uh < CELL_H) uh = CELL_H;
+
+    int vis_rows = uh / CELL_H;
+    int vis_cols = uw / CELL_W;
     if(vis_rows < 1) vis_rows = 1;
     if(vis_cols < 1) vis_cols = 1;
     if(vis_cols>TERM_COLS) vis_cols=TERM_COLS;
@@ -722,9 +804,9 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     if(start_line<0) start_line=0;
 
     // render buffer lines  -  batch consecutive same-bg cells into a single FillRect
-    int sy=cy;
+    int sy=oy;
     char run_buf[TERM_COLS+1];
-    for(int row=start_line; row<total_lines && sy+CELL_H<=cy+ch-CELL_H; row++){
+    for(int row=start_line; row<total_lines && sy+CELL_H<=oy+uh; row++){
         if(row<0||row>=TERM_SCROLL_BK) continue;
         int max_col = buffer[row].len;
         if(max_col > vis_cols) max_col = vis_cols;
@@ -735,7 +817,7 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
             if(bg == T_BG){ col++; continue; }
             int run_start = col;
             while(col < max_col && buffer[row].cells[col].bg == bg) col++;
-            Graphics::FillRect(cx + run_start*CELL_W, sy,
+            Graphics::FillRect(ox + run_start*CELL_W, sy,
                                (col - run_start) * CELL_W, CELL_H, bg);
         }
         // fg pass: batched consecutive same-color/bold text
@@ -754,15 +836,8 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
                 col++;
             }
             run_buf[rb] = 0;
-            if(rb > 0){
-                unsigned int draw_fg = fg;
-                if(bold){
-                    unsigned int r=(fg>>16)&0xFF, g=(fg>>8)&0xFF, b=fg&0xFF;
-                    r=r+50>255?255:r+50; g=g+50>255?255:g+50; b=b+50>255?255:b+50;
-                    draw_fg = 0xFF000000|(r<<16)|(g<<8)|b;
-                }
-                Graphics::DrawString(cx + run_start*CELL_W, sy, run_buf, draw_fg, 0xFF000000);
-            }
+            if(rb > 0)
+                TermDrawRun(ox + run_start*CELL_W, sy, run_buf, fg, bold);
         }
         sy+=CELL_H;
     }
@@ -771,8 +846,8 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     // first render what's in the current buffer row (prompt text)
     if(cursor_row<TERM_SCROLL_BK && cursor_row>=start_line){
         int prow = cursor_row;
-        int draw_y = cy + (prow - start_line) * CELL_H;
-        if(draw_y >= cy && draw_y+CELL_H <= cy+ch){
+        int draw_y = oy + (prow - start_line) * CELL_H;
+        if(draw_y >= oy && draw_y+CELL_H <= oy+uh){
             // already rendered above
         }
     }
@@ -785,8 +860,8 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
             int abs_col = prompt_end_col + i;
             int row_off = abs_col / vis_cols;
             int col = abs_col % vis_cols;
-            int dx = cx + col*CELL_W;
-            int dy = cy + ((cursor_row + row_off) - start_line) * CELL_H;
+            int dx = ox + col*CELL_W;
+            int dy = oy + ((cursor_row + row_off) - start_line) * CELL_H;
             int lb = 0;
             // gather until row wraps or input ends
             while(i < input_len && col < vis_cols && lb < TERM_COLS){
@@ -794,9 +869,8 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
                 col++;
             }
             line_buf[lb] = 0;
-            if(lb > 0 && dy >= cy && dy + CELL_H <= cy + ch){
-                Graphics::DrawString(dx, dy, line_buf, T_FG, 0xFF000000);
-            }
+            if(lb > 0 && dy >= oy && dy + CELL_H <= oy + uh)
+                TermDrawRun(dx, dy, line_buf, T_FG, false);
         }
     }
 
@@ -808,10 +882,10 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     else cursor_visible = (((now_ms - last_keypress_ms) / 500) % 2) == 0;
     if(cursor_visible){
         int abs_col = prompt_end_col + input_cursor;
-        int cur_x = cx + (abs_col % vis_cols) * CELL_W;
-        int cur_y = cy + ((cursor_row + (abs_col / vis_cols)) - start_line) * CELL_H;
-        if(cur_y>=cy && cur_y+CELL_H<=cy+ch){
-            // thin 2px wide blinking bar cursor
+        int cur_x = ox + (abs_col % vis_cols) * CELL_W;
+        int cur_y = oy + ((cursor_row + (abs_col / vis_cols)) - start_line) * CELL_H;
+        if(cur_y>=oy && cur_y+CELL_H<=oy+uh){
+            // thin 2px wide blinking bar cursor in the accent color (satoru)
             Graphics::FillRect(cur_x, cur_y+2, 2, CELL_H-4, T_CURSOR);
         }
     }

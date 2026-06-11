@@ -8,36 +8,46 @@
 #include "../drivers/keyboard.h"
 #include "../system/logging.h"
 #include "../ui/desktop.h"
+#include "../ui/kss.h"
+#include "../ui/font.h"
 #include "text_editor.h"
 #include "media_player.h"
 #include "denji_app.h"
 
 // ── color palette ──────────────────────────────────────────────────────
-static const unsigned int FM_BG        = 0xFF0F0F1A;
-static const unsigned int FM_TOOLBAR   = 0xFF16162B;
-static const unsigned int FM_PATH_BG   = 0xFF1A1A2E;
-static const unsigned int FM_SIDE_BG   = 0xFF131325;
-static const unsigned int FM_TAB_BG    = 0xFF0A0A14;
-static const unsigned int FM_TAB_ACT   = 0xFF1F1F36;
-static const unsigned int FM_SEL       = 0xFF2C5478;
-static const unsigned int FM_SEL_INACT = 0xFF2A2A3F;
-static const unsigned int FM_HOVER     = 0xFF1E1E35;
-static const unsigned int FM_TEXT      = 0xFFD0D0D0;
-static const unsigned int FM_DIM       = 0xFF888899;
-static const unsigned int FM_BLUE      = 0xFF3498DB;
-static const unsigned int FM_GREEN     = 0xFF2ECC71;
-static const unsigned int FM_AMBER     = 0xFFF39C12;
-static const unsigned int FM_PURPLE    = 0xFF9B59B6;
-static const unsigned int FM_PINK      = 0xFFE91E63;
-static const unsigned int FM_CYAN      = 0xFF00BCD4;
-static const unsigned int FM_RED       = 0xFFE74C3C;
-static const unsigned int FM_WHITE     = 0xFFFFFFFF;
-static const unsigned int FM_BTN       = 0xFF2C3E50;
-static const unsigned int FM_BTN_HVR   = 0xFF34495E;
-static const unsigned int FM_BORDER    = 0xFF2A2A45;
-static const unsigned int FM_BORDER_HI = 0xFF3498DB;
-static const unsigned int FM_STATUS    = 0xFF0D0D18;
-static const unsigned int FM_FOCUS_BAR = 0xFF3498DB;
+// re-pointed onto the shared kss theme so files matches the black/grey chrome
+// of settings: one accent, neutral surfaces/text/borders, no rainbow. these are
+// macros (not statics) so every draw reads the live theme tokens after kss init,
+// and a ui.conf theme reload retints the app for free. the former multicolor
+// file-type hues all collapse to the single accent (folders) or dim text
+// (everything else). (satoru)
+#define FM_BG        (KSS::T().bg)
+#define FM_TOOLBAR   (KSS::T().header)
+#define FM_PATH_BG   (KSS::T().surface)
+#define FM_SIDE_BG   (KSS::T().surface)
+#define FM_TAB_BG    (KSS::T().bg)
+#define FM_TAB_ACT   (KSS::T().surface_hi)
+#define FM_SEL       (KSS::Accent())
+#define FM_SEL_INACT (KSS::T().surface_hi)
+#define FM_HOVER     (KSS::T().surface_hi)
+#define FM_TEXT      (KSS::T().text)
+#define FM_DIM       (KSS::T().text_dim)
+#define FM_ACCENT    (KSS::Accent())
+// folders/active carry the one accent; all other former hues read as dim text. (satoru)
+#define FM_BLUE      (KSS::T().text_dim)
+#define FM_GREEN     (KSS::T().text_dim)
+#define FM_AMBER     (KSS::Accent())
+#define FM_PURPLE    (KSS::T().text_dim)
+#define FM_PINK      (KSS::T().text_dim)
+#define FM_CYAN      (KSS::T().text_dim)
+#define FM_RED       (KSS::T().text_dim)
+#define FM_WHITE     (KSS::T().white)
+#define FM_BTN       (KSS::T().surface)
+#define FM_BTN_HVR   (KSS::T().surface_hi)
+#define FM_BORDER    (KSS::T().border)
+#define FM_BORDER_HI (KSS::Accent())
+#define FM_STATUS    (KSS::T().header)
+#define FM_FOCUS_BAR (KSS::Accent())
 
 // ── layout constants ──────────────────────────────────────────────────
 static const int TAB_BAR_H   = 26;
@@ -117,29 +127,29 @@ static bool is_archive_file(const char* n){return ext_in(n,ARCHIVE_EXT,sizeof(AR
 static bool is_code_file(const char* n){return ext_in(n,CODE_EXT,sizeof(CODE_EXT)/sizeof(CODE_EXT[0]));}
 
 static unsigned int icon_color_for(const FMEntry* e){
-    if(e->is_dir) return FM_AMBER;
-    if(is_image_file(e->name))   return FM_PINK;
-    if(is_media_file(e->name))   return FM_PURPLE;
-    if(is_archive_file(e->name)) return FM_CYAN;
-    if(is_code_file(e->name))    return FM_GREEN;
-    if(is_text_file(e->name))    return FM_BLUE;
-    return 0xFF95A5A6;
+    // monochrome theming: folders take the single accent, files all read as dim
+    // text so the type palette no longer competes with the chrome. (satoru)
+    if(e->is_dir) return FM_ACCENT;
+    return FM_DIM;
 }
 
 // ── bookmarks ─────────────────────────────────────────────────────────
+// color is kept in the struct for layout/compat but no longer carries a per-row
+// hue  -  the kss theme is runtime, so the dot is tinted from theme tokens at draw
+// time (accent for the current place, dim otherwise) for the monochrome look. (satoru)
 struct Bookmark { const char* label; const char* path; unsigned int color; };
 static const Bookmark BOOKMARKS[] = {
-    {"Home",      "/home/user",            FM_BLUE},
-    {"Desktop",   "/home/user/Desktop",    FM_AMBER},
-    {"Documents", "/home/user/Documents",  FM_AMBER},
-    {"Downloads", "/home/user/Downloads",  FM_AMBER},
-    {"Pictures",  "/home/user/Pictures",   FM_PINK},
-    {"Music",     "/home/user/Music",      FM_PURPLE},
-    {"Videos",    "/home/user/Videos",     FM_PURPLE},
-    {"Trash",     "/home/user/.Trash",     FM_RED},
-    {"Root",      "/",                     FM_DIM},
-    {"System",    "/system",               FM_CYAN},
-    {"Etc",       "/etc",                  FM_CYAN},
+    {"Home",      "/home/user",            0},
+    {"Desktop",   "/home/user/Desktop",    0},
+    {"Documents", "/home/user/Documents",  0},
+    {"Downloads", "/home/user/Downloads",  0},
+    {"Pictures",  "/home/user/Pictures",   0},
+    {"Music",     "/home/user/Music",      0},
+    {"Videos",    "/home/user/Videos",     0},
+    {"Trash",     "/home/user/.Trash",     0},
+    {"Root",      "/",                     0},
+    {"System",    "/system",               0},
+    {"Etc",       "/etc",                  0},
 };
 static const int BOOKMARK_COUNT = sizeof(BOOKMARKS)/sizeof(BOOKMARKS[0]);
 
@@ -640,31 +650,33 @@ void FileManagerApp::RenderTabBar(int x,int y,int w){
         for(int k=len-1;k>=0;k--) if(p[k]=='/'){ base=p+k+1; break; }
         if(!*base) base="/";
         char title[20]; scpy(title,base,18);
-        Graphics::DrawString(tx+8,y+6,title, act?FM_WHITE:FM_DIM, 0xFF000000);
+        Graphics::DrawString(tx+8,y+6,title, act?FM_TEXT:FM_DIM, 0xFF000000);
         // close button "x" on right of each tab
         Graphics::DrawString(tx+per-14,y+6,"x", FM_DIM, 0xFF000000);
         tx += per;
     }
     // "+" new tab button
     Graphics::FillRect(tx+4,y+2,22,TAB_BAR_H-4,FM_TAB_BG);
-    Graphics::DrawString(tx+10,y+6,"+",FM_GREEN,0xFF000000);
+    Graphics::DrawString(tx+10,y+6,"+",FM_ACCENT,0xFF000000);
 }
 
 void FileManagerApp::RenderToolbar(int x,int y,int w){
     Graphics::FillRect(x,y,w,TOOLBAR_H,FM_TOOLBAR);
     Graphics::DrawLine(x,y+TOOLBAR_H,x+w,y+TOOLBAR_H,FM_BORDER);
     struct Btn { int x; int w; const char* label; unsigned int color; };
+    // neutral labels on surface buttons; the active "Dual" toggle takes the
+    // single accent to signal its on-state. (satoru)
     Btn btns[] = {
-        {  4,28,"<",FM_WHITE},    // back
-        { 36,28,">",FM_WHITE},    // fwd
-        { 68,28,"^",FM_WHITE},    // up
-        {100,28,"~",FM_WHITE},    // home
-        {132,28,"R",FM_WHITE},    // refresh
-        {168,56,"+Dir",FM_GREEN},
-        {228,56,"+File",FM_BLUE},
+        {  4,28,"<",FM_TEXT},    // back
+        { 36,28,">",FM_TEXT},    // fwd
+        { 68,28,"^",FM_TEXT},    // up
+        {100,28,"~",FM_TEXT},    // home
+        {132,28,"R",FM_TEXT},    // refresh
+        {168,56,"+Dir",FM_TEXT},
+        {228,56,"+File",FM_TEXT},
         {288,56,"Sort",FM_TEXT},
         {348,56,"View",FM_TEXT},
-        {408,72,"Dual",dual_pane?FM_GREEN:FM_TEXT},
+        {408,72,"Dual",dual_pane?FM_ACCENT:FM_TEXT},
         {488,28,"H",FM_TEXT},     // hidden toggle (Ctrl+H)
     };
     for(int i=0;i<11;i++){
@@ -682,9 +694,10 @@ void FileManagerApp::RenderSidebar(int x,int y,int w,int h){
     for(int i=0;i<BOOKMARK_COUNT;i++){
         bool current = seq(a->path, BOOKMARKS[i].path);
         if(current) Graphics::FillRect(x+2,by,w-4,22,FM_HOVER);
-        Graphics::FillRect(x+10,by+7,8,8,BOOKMARKS[i].color);
+        // monochrome place dot: accent on the active place, dim otherwise. (satoru)
+        Graphics::FillRect(x+10,by+7,8,8, current?KSS::Accent():KSS::T().text_dim);
         char lbl[20]; scpy(lbl,BOOKMARKS[i].label,18);
-        Graphics::DrawString(x+24,by+5,lbl, current?FM_WHITE:FM_TEXT, 0xFF000000);
+        Graphics::DrawString(x+24,by+5,lbl, current?FM_TEXT:FM_DIM, 0xFF000000);
         by += 22;
     }
     by += 8;
@@ -709,10 +722,14 @@ void FileManagerApp::RenderPathBar(int pane,int x,int y,int w){
     if(t->address_edit){
         // show editable buffer with text cursor
         Graphics::DrawRect(x+2,y+2,w-4,PATH_BAR_H-4,FM_BORDER_HI);
-        Graphics::DrawString(x+8,y+5,t->address_buf,FM_WHITE,0xFF000000);
-        // cursor
-        int cx = x+8 + t->address_cursor*8;
-        Graphics::FillRect(cx,y+4,1,PATH_BAR_H-8,FM_WHITE);
+        Graphics::DrawString(x+8,y+5,t->address_buf,FM_TEXT,0xFF000000);
+        // cursor  -  measure the text up to the caret rather than assuming 8px
+        // glyphs (the old fixed-font math drifted under fontttf). (satoru)
+        char acur[FM_MAX_PATH];
+        int an=t->address_cursor; if(an>FM_MAX_PATH-1) an=FM_MAX_PATH-1;
+        for(int k=0;k<an;k++) acur[k]=t->address_buf[k]; acur[an]=0;
+        int cx = x+8 + FontTTF::Measure(KSS::BodyPx(), acur);
+        Graphics::FillRect(cx,y+4,1,PATH_BAR_H-8,FM_TEXT);
     } else {
         // breadcrumb segments
         int cx = x+8;
@@ -726,8 +743,9 @@ void FileManagerApp::RenderPathBar(int pane,int x,int y,int w){
             while(buf[j] && buf[j]!='/') j++;
             char seg[40]; int sl = j-i; if(sl>38)sl=38;
             for(int k=0;k<sl;k++) seg[k]=buf[i+k]; seg[sl]=0;
-            Graphics::DrawString(cx,y+5,seg,FM_BLUE,0xFF000000);
-            cx += slen(seg)*8 + 4;
+            Graphics::DrawString(cx,y+5,seg,FM_TEXT,0xFF000000);
+            // advance by the measured segment width, not len*8. (satoru)
+            cx += FontTTF::Measure(KSS::BodyPx(), seg) + 4;
             if(buf[j]){
                 Graphics::DrawString(cx,y+5,"/",FM_DIM,0xFF000000);
                 cx += 10;
@@ -749,7 +767,8 @@ void FileManagerApp::RenderEntryIcon(int x,int y,int sz,FMEntry* e){
     unsigned int c = icon_color_for(e);
     if(e->is_dir){
         Graphics::FillRoundedRect(x,y+sz/4,sz,(sz*3)/4,3,c);
-        Graphics::FillRect(x,y+sz/4,sz/2,sz/8,0xFFD35400);
+        // folder tab: a subtle darker token instead of the old orange. (satoru)
+        Graphics::FillRect(x,y+sz/4,sz/2,sz/8,FM_BORDER);
     } else {
         Graphics::FillRoundedRect(x+sz/8,y,(sz*3)/4,sz,2,c);
         // fold corner
@@ -761,7 +780,7 @@ void FileManagerApp::RenderEntryIcon(int x,int y,int sz,FMEntry* e){
                 char up[5]; int k=0;
                 while(e2[k] && k<3){ char ch=e2[k]; if(ch>='a'&&ch<='z') ch-=32; up[k]=ch; k++; }
                 up[k]=0;
-                Graphics::DrawString(x+sz/4,y+sz/2-4,up,0xFFFFFFFF,0xFF000000);
+                Graphics::DrawString(x+sz/4,y+sz/2-4,up,FM_WHITE,0xFF000000);
             }
         }
     }
@@ -780,14 +799,18 @@ void FileManagerApp::RenderFileList(int pane,int x,int y,int w,int h){
         if(idx==t->selected){
             Graphics::FillRect(x,ry,w,ROW_H, focused?FM_SEL:FM_SEL_INACT);
         } else if(i%2){
-            Graphics::FillRect(x,ry,w,ROW_H,0xFF131325);
+            Graphics::FillRect(x,ry,w,ROW_H,KSS::T().surface);
         }
         if(rename_mode && rename_pane==pane && rename_target==idx){
             // draw editable name
-            Graphics::FillRect(x+30,ry+2,w-160,ROW_H-4,0xFF333366);
-            Graphics::DrawString(x+34,ry+5,rename_buf,FM_WHITE,0xFF000000);
-            int cx = x+34 + rename_cursor*8;
-            Graphics::FillRect(cx,ry+4,1,ROW_H-8,FM_WHITE);
+            Graphics::FillRect(x+30,ry+2,w-160,ROW_H-4,FM_HOVER);
+            Graphics::DrawString(x+34,ry+5,rename_buf,FM_TEXT,0xFF000000);
+            // caret position measured through fontttf, not rename_cursor*8. (satoru)
+            char rcur[FM_NAME_MAX];
+            int rn=rename_cursor; if(rn>FM_NAME_MAX-1) rn=FM_NAME_MAX-1;
+            for(int k=0;k<rn;k++) rcur[k]=rename_buf[k]; rcur[rn]=0;
+            int cx = x+34 + FontTTF::Measure(KSS::BodyPx(), rcur);
+            Graphics::FillRect(cx,ry+4,1,ROW_H-8,FM_TEXT);
         } else {
             // small icon
             Graphics::FillRoundedRect(x+8,ry+5,12,12,2,icon_color_for(ent));
@@ -841,7 +864,8 @@ void FileManagerApp::RenderFileGrid(int pane,int x,int y,int w,int h){
         }
         RenderEntryIcon(gx+(GRID_CELL-8)/2-20, gy+8, 36, ent);
         char lbl[14]; scpy(lbl,ent->name,12);
-        int tw = slen(lbl)*8;
+        // center using the measured label width, not len*8. (satoru)
+        int tw = FontTTF::Measure(KSS::BodyPx(), lbl);
         int tx = gx + (GRID_CELL-8)/2 - tw/2;
         Graphics::DrawString(tx, gy+GRID_CELL-22, lbl, FM_TEXT, 0xFF000000);
     }
@@ -907,15 +931,15 @@ void FileManagerApp::RenderContextMenu(int ox,int oy){
     const int N=16;
     int px = ox + context_menu_x;
     int py = oy + context_menu_y;
-    Graphics::FillRect(px,py,MENU_W,N*ITEM_H+4,0xFF1F1F36);
-    Graphics::DrawRect(px,py,MENU_W,N*ITEM_H+4,FM_BORDER_HI);
+    Graphics::FillRect(px,py,MENU_W,N*ITEM_H+4,KSS::T().surface);
+    Graphics::DrawRect(px,py,MENU_W,N*ITEM_H+4,FM_BORDER);
     for(int i=0;i<N;i++){
         int iy = py + 2 + i*ITEM_H;
         if(items[i][0]=='-'){
             Graphics::FillRect(px+6,iy+10,MENU_W-12,1,FM_BORDER);
         } else {
             uint32_t col = FM_TEXT;
-            if((i==5) && !clipboard_has_item) col = 0xFF666666;  // paste
+            if((i==5) && !clipboard_has_item) col = KSS::T().off;  // paste disabled (satoru)
             Graphics::DrawString(px+12,iy+4,items[i],col,0xFF000000);
         }
     }
@@ -927,8 +951,8 @@ void FileManagerApp::RenderSortMenu(int ox,int oy){
     const int N=7;
     int px = ox + 288;
     int py = oy + TAB_BAR_H + TOOLBAR_H + 4;
-    Graphics::FillRect(px,py,MENU_W,N*ITEM_H+4,0xFF1F1F36);
-    Graphics::DrawRect(px,py,MENU_W,N*ITEM_H+4,FM_BORDER_HI);
+    Graphics::FillRect(px,py,MENU_W,N*ITEM_H+4,KSS::T().surface);
+    Graphics::DrawRect(px,py,MENU_W,N*ITEM_H+4,FM_BORDER);
     FMTab* t = Active(focused_pane);
     for(int i=0;i<N;i++){
         int iy = py + 2 + i*ITEM_H;
@@ -939,7 +963,7 @@ void FileManagerApp::RenderSortMenu(int ox,int oy){
             if(i<4) checked = (t->sort_mode==i);
             else if(i==5) checked = !t->sort_desc;
             else if(i==6) checked = t->sort_desc;
-            if(checked) Graphics::DrawString(px+8,iy+4,"*",FM_GREEN,0xFF000000);
+            if(checked) Graphics::DrawString(px+8,iy+4,"*",FM_ACCENT,0xFF000000);
             Graphics::DrawString(px+22,iy+4,items[i],FM_TEXT,0xFF000000);
         }
     }
@@ -962,9 +986,9 @@ void FileManagerApp::RenderProperties(int cx,int cy,int cw,int ch){
     int dw=320, dh = credited ? 268 : 220;
     int dx = cx + (cw-dw)/2, dy = cy + (ch-dh)/2;
     Graphics::FillRectAlpha(cx,cy,cw,ch,180,0xFF000000);
-    Graphics::FillRoundedRect(dx,dy,dw,dh,8,0xFF1F1F36);
-    Graphics::DrawRect(dx,dy,dw,dh,FM_BORDER_HI);
-    Graphics::DrawString(dx+12,dy+10,"Properties",FM_WHITE,0xFF000000);
+    Graphics::FillRoundedRect(dx,dy,dw,dh,8,KSS::T().surface);
+    Graphics::DrawRect(dx,dy,dw,dh,FM_BORDER);
+    Graphics::DrawString(dx+12,dy+10,"Properties",FM_TEXT,0xFF000000);
     Graphics::DrawLine(dx,dy+32,dx+dw,dy+32,FM_BORDER);
     KVFSNode* n = KVFS::ResolvePath(properties_path);
     if(!n){
@@ -1023,7 +1047,8 @@ void FileManagerApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     if(dual_pane){
         int half = main_w/2;
         RenderPane(0, main_x, main_y, half, main_h);
-        Graphics::DrawLine(main_x+half, main_y, main_x+half, main_y+main_h, FM_BORDER_HI);
+        // split between panes is structural chrome -> hairline border. (satoru)
+        Graphics::DrawLine(main_x+half, main_y, main_x+half, main_y+main_h, FM_BORDER);
         RenderPane(1, main_x+half, main_y, main_w-half, main_h);
     } else {
         RenderPane(0, main_x, main_y, main_w, main_h);

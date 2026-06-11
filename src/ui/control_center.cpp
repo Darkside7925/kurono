@@ -47,11 +47,11 @@ namespace {
         SLOT_COUNT
     };
 
+    // per-tile press timing only  -  the on/off colour state now lives in the kss
+    // animation engine (keyed by a stable id), so the hand-rolled crossfade
+    // bookkeeping is no longer needed here. (satoru)
     struct TileAnim {
         uint32_t tap_start_ms;   // 0 when no tap underway
-        uint32_t state_change_ms; // when the on/off state last flipped
-        bool     prev_active;
-        bool     initialized;
     };
     TileAnim g_tiles[SLOT_COUNT] = {};
 
@@ -60,9 +60,14 @@ namespace {
     bool     g_panel_anim_opening = false;
     bool     g_panel_animating = false;
 
-    constexpr uint32_t TAP_DUR_MS    = 280;    // spring length on tile press
+    constexpr uint32_t TAP_DUR_MS    = 280;    // press window length on tile press
     constexpr uint32_t COLOR_DUR_MS  = 180;    // active/inactive colour crossfade
     constexpr uint32_t PANEL_DUR_MS  = 220;    // open/close timing
+
+    // stable base id for kss::anim slots; per-tile colour id is base + slot so
+    // each tile/slider/button eases independently. press ids are offset further
+    // so the colour and scale tweens never share a slot. (satoru)
+    constexpr uint32_t ANIM_ID_BASE  = 0xCC000000u;
 
     inline uint32_t NowMs() { return Time::GetTicks(); }
 
@@ -71,19 +76,23 @@ namespace {
         g_tiles[slot].tap_start_ms = NowMs();
     }
 
-    inline void NoteStateChange(int slot, bool active) {
-        if (slot < 0 || slot >= SLOT_COUNT) return;
-        if (!g_tiles[slot].initialized) {
-            g_tiles[slot].initialized = true;
-            g_tiles[slot].prev_active = active;
-            // back-date so the first colour crossfade is already complete.
-            g_tiles[slot].state_change_ms = NowMs() - COLOR_DUR_MS - 1;
-            return;
+    // smooth, engine-driven press scale for a tile/button: a subtle dip toward
+    // 0.95 right after a tap that eases back to 1.0, with no snap on release  - 
+    // the scale value itself rides kss::anim so it never jumps. (satoru)
+    inline float PressScale(int slot) {
+        if (slot < 0 || slot >= SLOT_COUNT) return 1.0f;
+        float target = 1.0f;
+        if (g_tiles[slot].tap_start_ms) {
+            uint32_t dt = NowMs() - g_tiles[slot].tap_start_ms;
+            if (dt >= TAP_DUR_MS) {
+                g_tiles[slot].tap_start_ms = 0;   // press window elapsed
+            } else if (dt < TAP_DUR_MS / 2) {
+                target = 0.95f;                   // pressed-in for the first half
+            }
         }
-        if (g_tiles[slot].prev_active != active) {
-            g_tiles[slot].prev_active = active;
-            g_tiles[slot].state_change_ms = NowMs();
-        }
+        // distinct id per slot, offset from the colour id so they never collide. (satoru)
+        return KSS::Anim::Float(ANIM_ID_BASE + 0x100u + (uint32_t)slot,
+                                target, 140, KSS::Anim::OutCubic);
     }
 }
 
@@ -291,34 +300,20 @@ int  ControlCenter::GetH(){ return panel_h; }
 static void DrawTileAnimated(int slot, int x, int y, int w, int h,
                              const char* label, const char* sub,
                              bool active, uint32_t accent) {
-    NoteStateChange(slot, active);
-
-    uint32_t now = NowMs();
-    // colour crossfade  -  ease-out cubic over COLOR_DUR_MS
-    uint32_t since_state = now - g_tiles[slot].state_change_ms;
-    float color_t = (since_state >= COLOR_DUR_MS) ? 1.0f
-                  : Animation::Ease((float)since_state / (float)COLOR_DUR_MS,
-                                    Animation::EaseOutCubic);
     // themed: inactive tiles are the raised surface, active tiles fill with the
     // user accent for a cohesive black/grey + accent look. (satoru)
     uint32_t surf = KSS::T().surface_hi;
     uint32_t acc  = KSS::Accent();
     (void)accent;
-    uint32_t from = active ? surf : acc;
-    uint32_t to   = active ? acc  : surf;
-    uint32_t bg   = Animation::LerpColor(from, to, (uint8_t)(color_t * 255.0f + 0.5f));
+    // colour crossfade now rides the kss anim engine: it seeds at the target on
+    // first sight (no jump) and eases from the live blended colour whenever the
+    // on/off state flips. distinct stable id per tile so they tween apart. (satoru)
+    uint32_t bg = KSS::Anim::Color(ANIM_ID_BASE + (uint32_t)slot,
+                                   active ? acc : surf,
+                                   COLOR_DUR_MS, KSS::Anim::OutCubic);
 
-    // tactile press  -  spring scale starting at 0.92, settling to 1.0
-    float scale = 1.0f;
-    if (g_tiles[slot].tap_start_ms) {
-        uint32_t dt = now - g_tiles[slot].tap_start_ms;
-        if (dt >= TAP_DUR_MS) {
-            g_tiles[slot].tap_start_ms = 0;
-        } else {
-            float s = Animation::SpringMs(dt, TAP_DUR_MS);
-            scale = 0.92f + (1.0f - 0.92f) * s;
-        }
-    }
+    // tactile press  -  engine-driven scale, eases in and back out with no snap. (satoru)
+    float scale = PressScale(slot);
 
     DrawRoundedTile(x, y, w, h, 12, bg, scale);
 
@@ -428,18 +423,11 @@ void ControlCenter::DrawUserCard(int x, int y, int w){
     settings_x = x + bw + 12; settings_y = btn_y; settings_w = bw; settings_h = 30;
     signout_x = x + 2*(bw + 12); signout_y = btn_y; signout_w = bw; signout_h = 30;
 
-    // animated press scale for action buttons
-    auto press_scale = [](int slot) -> float {
-        if (!g_tiles[slot].tap_start_ms) return 1.0f;
-        uint32_t dt = NowMs() - g_tiles[slot].tap_start_ms;
-        if (dt >= TAP_DUR_MS) { g_tiles[slot].tap_start_ms = 0; return 1.0f; }
-        float s = Animation::SpringMs(dt, TAP_DUR_MS);
-        return 0.92f + (1.0f - 0.92f) * s;
-    };
-
-    DrawRoundedTile(lock_x,     lock_y,     lock_w,     lock_h, 8, KSS::T().surface_hi, press_scale(SLOT_LOCK));
-    DrawRoundedTile(settings_x, settings_y, settings_w, settings_h, 8, KSS::T().surface_hi, press_scale(SLOT_SETTINGS));
-    DrawRoundedTile(signout_x,  signout_y,  signout_w,  signout_h, 8, 0xFFE0584E, press_scale(SLOT_SIGNOUT));
+    // action buttons share the engine-driven press scale so they ease smoothly
+    // in and back out with no snap, matching the toggle tiles. (satoru)
+    DrawRoundedTile(lock_x,     lock_y,     lock_w,     lock_h, 8, KSS::T().surface_hi, PressScale(SLOT_LOCK));
+    DrawRoundedTile(settings_x, settings_y, settings_w, settings_h, 8, KSS::T().surface_hi, PressScale(SLOT_SETTINGS));
+    DrawRoundedTile(signout_x,  signout_y,  signout_w,  signout_h, 8, 0xFFE0584E, PressScale(SLOT_SIGNOUT));
 
     // centered labels measured via fontttf (no fixed 8px/char assumption). (satoru)
     float bp = KSS::BodyPx();

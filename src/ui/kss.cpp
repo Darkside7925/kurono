@@ -2,6 +2,7 @@
 #include "kss.h"
 #include "../drivers/graphics.h"
 #include "font.h"
+#include "ui_elements.h"   // Animation easing helpers for the tween engine (satoru)
 #include "../system/ui_config.h"
 
 namespace KSS {
@@ -147,5 +148,116 @@ bool RectHit(int x, int y, int w, int h, int mx, int my) {
 }
 
 } // namespace W
+
+// ── animation engine ────────────────────────────────────────────────────────
+namespace Anim {
+
+static uint32_t g_now = 0;
+
+struct ASlot {
+    uint32_t id;
+    bool     used;
+    bool     init;
+    float    f_from, f_to;
+    uint32_t c_from, c_to;
+    uint32_t start_ms, dur_ms;
+    int      ease;
+    uint32_t last_seen;
+};
+static const int ANIM_MAX = 128;
+static ASlot g_anim[ANIM_MAX] = {};
+
+static float ease_apply(int e, float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    switch (e) {
+        case OutCubic:   return Animation::Ease(t, Animation::EaseOutCubic);
+        case InOutQuint: return Animation::Ease(t, Animation::EaseInOutQuint);
+        case Spring:     return Animation::SpringMs((uint32_t)(t * 1000.0f), 1000);
+        default:         return t;   // Linear
+    }
+}
+
+// find the slot for `id`, or claim a free/LRU one (resetting it). (satoru)
+static ASlot* slot_for(uint32_t id) {
+    ASlot* freeslot = nullptr;
+    ASlot* lru = nullptr;
+    for (int i = 0; i < ANIM_MAX; i++) {
+        if (g_anim[i].used && g_anim[i].id == id) return &g_anim[i];
+        if (!g_anim[i].used) { if (!freeslot) freeslot = &g_anim[i]; }
+        else if (!lru || g_anim[i].last_seen < lru->last_seen) lru = &g_anim[i];
+    }
+    ASlot* s = freeslot ? freeslot : lru;   // evict least-recently-used when full
+    s->id = id; s->used = true; s->init = false;
+    return s;
+}
+
+static float cur_float(ASlot* s) {
+    if (s->dur_ms == 0) return s->f_to;
+    uint32_t dt = g_now - s->start_ms;
+    if (dt >= s->dur_ms) return s->f_to;
+    float t = (float)dt / (float)s->dur_ms;
+    return s->f_from + (s->f_to - s->f_from) * ease_apply(s->ease, t);
+}
+
+static uint32_t cur_color(ASlot* s) {
+    if (s->dur_ms == 0) return s->c_to;
+    uint32_t dt = g_now - s->start_ms;
+    if (dt >= s->dur_ms) return s->c_to;
+    float t = ease_apply(s->ease, (float)dt / (float)s->dur_ms);
+    return Animation::LerpColor(s->c_from, s->c_to, (uint8_t)(t * 255.0f + 0.5f));
+}
+
+void Tick(uint32_t now_ms) {
+    g_now = now_ms;
+    // drop ids not touched for a couple seconds so the table can't fill up. (satoru)
+    for (int i = 0; i < ANIM_MAX; i++)
+        if (g_anim[i].used && (now_ms - g_anim[i].last_seen) > 2000) g_anim[i].used = false;
+}
+
+bool Active() {
+    for (int i = 0; i < ANIM_MAX; i++) {
+        ASlot* s = &g_anim[i];
+        if (s->used && s->init && s->dur_ms > 0 && (g_now - s->start_ms) < s->dur_ms) return true;
+    }
+    return false;
+}
+
+float Float(uint32_t id, float target, uint32_t dur_ms, Ease e) {
+    ASlot* s = slot_for(id);
+    s->last_seen = g_now;
+    if (!s->init) {
+        s->init = true;
+        s->f_from = s->f_to = target;
+        s->start_ms = g_now; s->dur_ms = dur_ms; s->ease = (int)e;
+        return target;
+    }
+    if (s->f_to != target) {           // retarget from the live value
+        s->f_from = cur_float(s);
+        s->f_to = target;
+        s->start_ms = g_now; s->dur_ms = dur_ms; s->ease = (int)e;
+    }
+    return cur_float(s);
+}
+
+uint32_t Color(uint32_t id, uint32_t target, uint32_t dur_ms, Ease e) {
+    ASlot* s = slot_for(id);
+    s->last_seen = g_now;
+    if (!s->init) {
+        s->init = true;
+        s->c_from = s->c_to = target;
+        s->start_ms = g_now; s->dur_ms = dur_ms; s->ease = (int)e;
+        return target;
+    }
+    if (s->c_to != target) {           // retarget from the live blended color
+        s->c_from = cur_color(s);
+        s->c_to = target;
+        s->start_ms = g_now; s->dur_ms = dur_ms; s->ease = (int)e;
+    }
+    return cur_color(s);
+}
+
+} // namespace Anim
+
 } // namespace KSS
 // end (satoru)

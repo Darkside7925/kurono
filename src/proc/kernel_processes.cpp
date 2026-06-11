@@ -38,6 +38,7 @@
 #include "../apps/task_manager.h"
 #include "../apps/settings.h"
 #include "../ui/control_center.h"
+#include "../ui/kss.h"
 #include "../ui/notification.h"
 #include "../apps/media_player.h"
 #include "../apps/denji_app.h"
@@ -186,6 +187,7 @@ static inline bool ui_activity_active() {
     if (Taskbar::IsAnimating())                 return true;  // menus/popups/cursor
     if (Desktop::IsAnimating())                 return true;  // icon hover-pop fade
     if (ControlCenter::IsAnimating())           return true;  // panel slide+fade
+    if (KSS::Anim::Active())                     return true;  // kss tween engine in flight
     if (NotificationManager::ActiveCount() > 0) return true;  // toasts in/hold/out
     if (MediaPlayerApp::IsOpen())               return true;  // audio/video surface
     if (DenjiApp::IsOpen())                     return true;  // kvid playback frames
@@ -332,18 +334,23 @@ static inline bool ui_activity_active() {
         // bounds any missed dirty source to a 250ms delay, never a permanent
         // freeze). (satoru)
         constexpr uint32_t FALLBACK_MS = 250u;
+        // advance the kss tween engine first so animated values progress and the
+        // Active() check inside ui_activity_active() reflects in-flight tweens. (satoru)
+        KSS::Anim::Tick(Timer::GetRealMs());
         bool dirty    = Graphics::ConsumeUIDirty();
         bool active   = ui_activity_active();
         bool fallback = (Timer::GetRealMs() - last_render_ms) >= FALLBACK_MS;
         if (dirty || active) last_activity_ms = Timer::GetRealMs();
         if (!dirty && !active && !fallback) {
-            // Nothing to draw. If we were active recently, POLL (yield, no HLT)
-            // so the next input/animation is caught instantly: SleepMs() halts
-            // the cpu, and WHPX/VMware coalesce the timer IRQ while halted,
-            // adding ~500ms wake latency (the lag/freeze on resume). Only after
-            // ~2s of true inactivity do we HLT to give the host its core back.
-            // (satoru)
-            if (Timer::GetRealMs() - last_activity_ms < 2000u) Scheduler::YieldNow();
+            // Nothing to draw. The old code BUSY-YIELDED here while "recently
+            // active" to dodge WHPX/VMware timer coalescing (which made SleepMs
+            // wake ~500ms late). but that spin pegged the vcpu at 100% the whole
+            // time the desktop sat idle  -  the dev is on KVM now, where the timer
+            // IRQ is NOT coalesced, so a 1ms sleep wakes on time AND frees the
+            // core (fixes the "whole os is laggy / fan spins" feel). after ~2s of
+            // true inactivity, sleep longer to idle the host core fully. if you
+            // ever run under WHPX again, bump this back to YieldNow(). (satoru)
+            if (Timer::GetRealMs() - last_activity_ms < 2000u) Scheduler::SleepMs(1u);
             else Scheduler::SleepMs(16u);
             continue;
         }
