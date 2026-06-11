@@ -1,7 +1,7 @@
 #include "rtc.h"
 
 RTC::Time RTC::Read() {
-    while (ReadReg(0x0A) & 0x80) { }
+    for (int g = 0; (ReadReg(0x0A) & 0x80) && g < 100000; g++) { }  // bounded: a stuck UIP bit must not hang under the input lock (satoru)
     uint8_t sec = ReadReg(0x00);
     uint8_t min = ReadReg(0x02);
     uint8_t hour = ReadReg(0x04);
@@ -18,7 +18,7 @@ RTC::Time RTC::Read() {
 }
 
 RTC::Date RTC::ReadDate() {
-    while (ReadReg(0x0A) & 0x80) { }
+    for (int g = 0; (ReadReg(0x0A) & 0x80) && g < 100000; g++) { }  // bounded: a stuck UIP bit must not hang under the input lock (satoru)
     uint8_t dow = ReadReg(0x06);
     uint8_t dom = ReadReg(0x07);
     uint8_t mon = ReadReg(0x08);

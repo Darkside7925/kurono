@@ -211,6 +211,10 @@ void TerminalApp::EmitShellChunk(const char* data, int len) {
     for (int i = 0; i < len; i++)
         WriteChar(data[i]);
     ScrollToBottom();
+    // async shell output lands on the Shell thread, not the input path, so the
+    // GUI gate would otherwise not see it for up to ~250ms. Mark dirty so the
+    // streamed chunk paints on the next frame. (satoru, review fix)
+    Graphics::MarkUIDirty();
 }
 
 void TerminalApp::Write(const char* text){
@@ -607,6 +611,11 @@ void TerminalApp::Tick(){
     command_running = false;
     ScrollToBottom();
     WritePrompt();
+    // a non-streamed command writes its whole result into the buffer here on
+    // the Shell thread (e.g. ls/pwd/cat/help); nothing in the input path saw
+    // it, so raise the global signal or the gate delays it up to ~250ms.
+    // (satoru, review fix)
+    Graphics::MarkUIDirty();
 }
 
 bool TerminalApp::IsBusy(){
@@ -685,6 +694,10 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
         int step = diff / 3;
         if(step == 0) step = (diff > 0) ? 1 : -1;
         scroll_offset += step;
+        // self-sustain the ease: a single wheel flick marks dirty once, but the
+        // animation needs ~3 frames. Request the next frame while still mid-
+        // ease so the gate keeps rendering until settled. (satoru, review fix)
+        Graphics::MarkUIDirty();
     }
 
     // fill background
@@ -802,6 +815,12 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
             Graphics::FillRect(cur_x, cur_y+2, 2, CELL_H-4, T_CURSOR);
         }
     }
+
+    // The input cursor blinks on a time-driven 500ms cycle. When this terminal
+    // is the focused window, self-sustain frames so the blink stays a clean
+    // square wave instead of jittering on the 250ms gate fallback grid. Scoped
+    // to focus so a background terminal still lets the GUI idle. (review fix)
+    if (win_ptr && ((Window*)win_ptr)->focused) Graphics::MarkUIDirty();
 }
 
 //  input callback

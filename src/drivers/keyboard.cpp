@@ -194,6 +194,16 @@ void Keyboard::Init() {
         kb_out(0x60, 0xF4);
     }
 
+    // consume the 0xf4 ack so no stale keyboard byte is left in the 8042
+    // output buffer: mouse init later reads the controller config (0x64
+    // cmd 0x20) and takes the first non-aux byte as the ccb -- a leftover
+    // ack (0xfa) read back as the config has bit4 set, which disables the
+    // keyboard clock entirely. that was the dead-keyboard bug on
+    // qemu/whpx. (satoru)
+    if (kb_wait_output_full()) {
+        (void)kb_in(0x60);
+    }
+
     // skip typematic/led programming during early init.
     // some laptop ec / i8042 implementations misbehave when we send extra
     // setup commands before the controller has fully settled.

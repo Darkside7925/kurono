@@ -197,6 +197,11 @@ uint64_t Ext4::ExtentLogicalToPhysical(Ext4Inode* inode,
                                         uint32_t logical_block) {
     Ext4ExtentHeader* eh = (Ext4ExtentHeader*)inode->i_block;
     if (eh->eh_magic != 0xF30A) return 0;
+    // eh_depth/eh_entries come straight from the on-disk inode. real ext4
+    // trees are <=5 deep and the inline i_block header holds <=eh_max (4)
+    // extents. unbounded depth = kernel stack overflow; entries>eh_max =
+    // out-of-bounds read past the inode. reject corrupt headers. (satoru)
+    if (eh->eh_depth > 5 || eh->eh_entries > eh->eh_max) return 0;
 
     if (eh->eh_depth == 0) {
         // leaf node  -  scan extents
@@ -230,6 +235,7 @@ uint64_t Ext4::ExtentLogicalToPhysical(Ext4Inode* inode,
 
 uint64_t Ext4::ExtentWalkIndex(uint64_t index_block,
                                 uint32_t logical_block, int depth) {
+    if (depth < 0 || depth > 5) return 0;   // bound recursion: a corrupt eh_depth must not blow the kernel stack (satoru)
     uint8_t* buf = (uint8_t*)KernelHeap::Alloc(block_size);
     if (!buf) return 0;
 
@@ -240,6 +246,7 @@ uint64_t Ext4::ExtentWalkIndex(uint64_t index_block,
 
     Ext4ExtentHeader* eh = (Ext4ExtentHeader*)buf;
     if (eh->eh_magic != 0xF30A) { KernelHeap::Free(buf); return 0; }
+    if (eh->eh_entries > eh->eh_max) { KernelHeap::Free(buf); return 0; }  // OOB guard: don't scan past the block (satoru)
 
     uint64_t result = 0;
 

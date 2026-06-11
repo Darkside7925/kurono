@@ -14,6 +14,19 @@ uint64_t  PMM::search_hint  = 0;
 extern "C" uint8_t kernel_start;
 extern "C" uint8_t kernel_end;       // after .boot_tables  -  safe to place bitmap here
 
+// interrupt guard for the frame allocator. these mutators are re-entered
+// from the #pf stack-grow handler (Scheduler::TryGrowGuardPage -> AllocBytes),
+// so a fault landing mid-allocation would corrupt bitmap/refs/used_frames.
+// cli/sti makes each mutation atomic vs the fault path, exactly like the
+// kernel heap's HeapIrqGuard. save/restore so it nests harmlessly. (satoru)
+namespace {
+struct PmmIrqGuard {
+    uint64_t f;
+    PmmIrqGuard()  { __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(f) :: "memory"); }
+    ~PmmIrqGuard() { if (f & 0x200ULL) __asm__ __volatile__("sti" ::: "memory"); }
+};
+}
+
 void PMM::SetFrame(uint64_t idx) {
     bitmap[idx / 64] |= (1ULL << (idx % 64));
 }
@@ -68,6 +81,7 @@ uint64_t PMM::FindFreeFrame() {
 }
 
 uint64_t PMM::AllocFrame() {
+    PmmIrqGuard _g;
     uint64_t idx = FindFreeFrame();
     if (idx == ~0ULL) {
         SerialLogger::Log("PMM: OUT OF MEMORY!\r\n");
@@ -84,6 +98,7 @@ uint64_t PMM::AllocFrame() {
 }
 
 void PMM::RetainFrame(uint64_t phys_addr) {
+    PmmIrqGuard _g;
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return;
     if (!TestFrame(idx)) return;
@@ -98,6 +113,7 @@ uint32_t PMM::GetFrameRefCount(uint64_t phys_addr) {
 }
 
 void PMM::FreeFrame(uint64_t phys_addr) {
+    PmmIrqGuard _g;
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return;
     if (!TestFrame(idx)) return;  // double-free guard
@@ -175,6 +191,7 @@ static void bulk_clear_frames(uint64_t start, uint64_t count,
 uint64_t PMM::AllocContiguous(uint64_t count) {
     if (count == 0) return 0;
     if (count == 1) return AllocFrame();
+    PmmIrqGuard _g;   // atomic vs the #pf stack-grow path (the run-scan below mutates the bitmap directly) (satoru)
     // overflow guard
     if (count > total_frames) return 0;
 
@@ -240,6 +257,7 @@ uint64_t PMM::AllocContiguous(uint64_t count) {
 
 void PMM::FreeContiguous(uint64_t phys_addr, uint64_t count) {
     if (!phys_addr || count == 0) return;
+    PmmIrqGuard _g;
     uint64_t start = phys_addr / PAGE_SIZE;
     if (start >= total_frames) return;
     if (count > total_frames - start) count = total_frames - start;
@@ -314,14 +332,20 @@ void PMM::Init(multiboot_info_t* mbi) {
     refs = (uint16_t*)(uintptr_t)(bitmap + bitmap_size);
     uint64_t refs_bytes = total_frames * sizeof(uint16_t);
 
-    uint8_t* bp = (uint8_t*)bitmap;
-    for (uint64_t i = 0; i < bitmap_bytes; i++) {
-        bp[i] = 0xFF;
-    }
-    uint8_t* rp = (uint8_t*)refs;
-    for (uint64_t i = 0; i < refs_bytes; i++) {
-        rp[i] = 0;
-    }
+    // qword-fill the bitmap (all 1s) and refs (all 0s) instead of byte-by-
+    // byte; on multi-GB RAM these byte loops were a measurable chunk of boot
+    // time. handle the sub-8-byte tail with a byte loop. (satoru)
+    uint64_t* bp64 = (uint64_t*)bitmap;
+    uint64_t  bq   = bitmap_bytes >> 3;
+    for (uint64_t i = 0; i < bq; i++) bp64[i] = 0xFFFFFFFFFFFFFFFFULL;
+    uint8_t*  bp   = (uint8_t*)bitmap;
+    for (uint64_t i = bq << 3; i < bitmap_bytes; i++) bp[i] = 0xFF;
+
+    uint64_t* rp64 = (uint64_t*)refs;
+    uint64_t  rq   = refs_bytes >> 3;
+    for (uint64_t i = 0; i < rq; i++) rp64[i] = 0;
+    uint8_t*  rp   = (uint8_t*)refs;
+    for (uint64_t i = rq << 3; i < refs_bytes; i++) rp[i] = 0;
 
     SerialLogger::Log("PMM: Bitmap at 0x");
     SerialLogger::LogHex((uint64_t)bitmap);

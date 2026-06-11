@@ -2,6 +2,7 @@
 #include "text_editor.h"
 #include "../ui/window_manager.h"
 #include "../fs/kvfs.h"
+#include "../kernel/heap.h"
 #include "../drivers/graphics.h"
 #include "../drivers/timer.h"
 #include "../system/logging.h"
@@ -113,11 +114,16 @@ int TextEditorApp::OpenFile(const char* path){
 //  file i/o
 bool TextEditorApp::LoadFile(const char* path){
     scpy(file_path, path, ED_PATH_MAX);
-    char content[KVFS_MAX_CONTENT];
+    // heap-allocate the 64KB content buffer  -  a KVFS_MAX_CONTENT-sized stack
+    // frame overflows the 32KB GUI / 8KB shell process stack and corrupts
+    // adjacent kernel memory (a cause of file-open crashes). (satoru)
+    char* content = (char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if(!content){ line_count=1; lines[0].text[0]=0; lines[0].len=0; return false; }
     int sz = KVFS::ReadFile(path, content, KVFS_MAX_CONTENT);
     if(sz<=0){
         line_count=1;
         lines[0].text[0]=0; lines[0].len=0;
+        KernelHeap::Free(content);
         return false;
     }
 
@@ -136,8 +142,9 @@ bool TextEditorApp::LoadFile(const char* path){
             }
         }
     }
-    // last line if no trailing newline
-    if(col>0 || line_count==0){
+    // last line if no trailing newline. guard line_count<ED_MAX_LINES so a
+    // file with exactly ED_MAX_LINES lines doesn't write one past the array. (satoru)
+    if((col>0 || line_count==0) && line_count<ED_MAX_LINES){
         lines[line_count].text[col]=0;
         lines[line_count].len=col;
         line_count++;
@@ -146,6 +153,7 @@ bool TextEditorApp::LoadFile(const char* path){
     cursor_row=0; cursor_col=0;
     scroll_x=0; scroll_y=0;
     modified=false;
+    KernelHeap::Free(content);
     return true;
 }
 
@@ -155,8 +163,10 @@ bool TextEditorApp::SaveFile(){
 }
 
 bool TextEditorApp::SaveFileAs(const char* path){
-    // assemble content
-    char content[KVFS_MAX_CONTENT];
+    // assemble content on the heap  -  see LoadFile: a 64KB stack buffer
+    // overflows the GUI/shell process stack. (satoru)
+    char* content = (char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if(!content) return false;
     int pos=0;
     for(int i=0;i<line_count && pos<KVFS_MAX_CONTENT-2;i++){
         for(int j=0;j<lines[i].len && pos<KVFS_MAX_CONTENT-2;j++){
@@ -167,6 +177,7 @@ bool TextEditorApp::SaveFileAs(const char* path){
     content[pos]=0;
 
     int err = KVFS::WriteString(path, content);
+    KernelHeap::Free(content);
     if(err==KVFS_OK){
         scpy(file_path, path, ED_PATH_MAX);
         modified=false;

@@ -2,6 +2,7 @@
 #include "file_manager.h"
 #include "../ui/window_manager.h"
 #include "../fs/kvfs.h"
+#include "../kernel/heap.h"
 #include "../drivers/graphics.h"
 #include "../drivers/timer.h"
 #include "../drivers/keyboard.h"
@@ -931,8 +932,21 @@ void FileManagerApp::RenderSortMenu(int ox,int oy){
     }
 }
 
+// the imported ssstik video carries a creator credit shown in its properties
+// for attribution (tiktok @neitux.vfx). detect it by path so the render and the
+// close-button hit-test agree on the (taller) dialog height. (satoru)
+static bool fm_path_has_ssstik(const char* path){
+    for (const char* a = path; *a; ++a) {
+        const char* b = "ssstik"; const char* c = a;
+        while (*b && *c && *b == *c) { ++b; ++c; }
+        if (!*b) return true;
+    }
+    return false;
+}
+
 void FileManagerApp::RenderProperties(int cx,int cy,int cw,int ch){
-    int dw=320, dh=220;
+    bool credited = fm_path_has_ssstik(properties_path);
+    int dw=320, dh = credited ? 268 : 220;
     int dx = cx + (cw-dw)/2, dy = cy + (ch-dh)/2;
     Graphics::FillRectAlpha(cx,cy,cw,ch,180,0xFF000000);
     Graphics::FillRoundedRect(dx,dy,dw,dh,8,0xFF1F1F36);
@@ -970,6 +984,13 @@ void FileManagerApp::RenderProperties(int cx,int cy,int cw,int ch){
         line[0]=0; sapp(line,"Modified (s since boot): ",160);
         char tb[16]; int_to_str((int)n->modified,tb,16); sapp(line,tb,160);
         Graphics::DrawString(dx+12,dy+152,line,FM_TEXT,0xFF000000);
+        if(credited){
+            // creator attribution for the imported tiktok video. (satoru)
+            Graphics::DrawLine(dx+12,dy+166,dx+dw-12,dy+166,FM_BORDER);
+            Graphics::DrawString(dx+12,dy+172,"Credit: neitux.vfx",FM_WHITE,0xFF000000);
+            Graphics::DrawString(dx+12,dy+190,"Source: tiktok.com/@neitux.vfx",FM_TEXT,0xFF000000);
+            Graphics::DrawString(dx+12,dy+208,"video/7393775041478954246",FM_TEXT,0xFF000000);
+        }
     }
     // close button
     Graphics::FillRoundedRect(dx+dw-72,dy+dh-30,60,22,4,FM_BTN);
@@ -1011,7 +1032,7 @@ bool FileManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     // properties dialog
     if(properties_open){
         if(clicked){
-            int dw=320, dh=220;
+            int dw=320, dh = fm_path_has_ssstik(properties_path) ? 268 : 220;
             int dx = (cw_local-dw)/2, dy = (ch_local-dh)/2;
             if(mx>=dx+dw-72 && mx<=dx+dw-12 && my>=dy+dh-30 && my<=dy+dh-8){
                 properties_open=false; return true;
@@ -1143,15 +1164,24 @@ bool FileManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
             // crude rename: copy + unlink (KVFS::Move handles files only; for dirs skip)
             KVFSNode* n = KVFS::ResolvePath(old_p);
             if(n && !n->is_dir()){
-                char buf[KVFS_MAX_CONTENT];
-                int len = KVFS::ReadFile(old_p,buf,KVFS_MAX_CONTENT);
-                KVFS::Unlink(old_p);
-                KVFS::CreateFile(new_p);
-                if(len>0) KVFS::WriteFile(new_p,buf,len);
+                // heap-allocate the 64KB copy buffer  -  a KVFS_MAX_CONTENT stack
+                // frame overflows the GUI process stack and corrupts memory. (satoru)
+                char* buf = (char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+                if(buf){
+                    int len = KVFS::ReadFile(old_p,buf,KVFS_MAX_CONTENT);
+                    KVFS::Unlink(old_p);
+                    KVFS::CreateFile(new_p);
+                    if(len>0) KVFS::WriteFile(new_p,buf,len);
+                    KernelHeap::Free(buf);
+                }
             } else if(n && n->is_dir()){
                 // mkdir new and recursive copy is too complex; just rename the node in place
                 // by mutating its name.
                 int i=0; while(rename_buf[i] && i<KVFS_MAX_NAME-1){ n->name[i]=rename_buf[i]; i++; } n->name[i]=0;
+                // the parent indexes children by name in a hash table; rebuild it
+                // so the renamed dir is reachable by its new name (and the old
+                // name stops resolving to it). (satoru)
+                if(n->parent) n->parent->rebuild_hash();
             }
             rename_mode=false;
             RefreshBoth();

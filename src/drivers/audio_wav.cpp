@@ -51,7 +51,9 @@ ParseResult Parse(const uint8_t* buf, uint32_t len) {
     while (off + 8 <= len) {
         const uint8_t* tag  = buf + off;
         uint32_t       size = Rd32LE(buf + off + 4);
-        if (off + 8 + size > len) { r.error = "chunk overflows buffer"; return r; }
+        // 64-bit compare: a crafted size near 0xFFFFFFFF would wrap the 32-bit
+        // sum and slip past the guard, then the walk reads out of bounds. (satoru)
+        if ((uint64_t)off + 8u + (uint64_t)size > (uint64_t)len) { r.error = "chunk overflows buffer"; return r; }
 
         if (TagEq(tag, "fmt ")) {
             if (size < 16) { r.error = "fmt chunk too small"; return r; }

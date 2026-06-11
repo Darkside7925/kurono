@@ -168,7 +168,46 @@ public:
 
     // query drag state for render optimization (skip shadows during drag)
     static bool IsDragging();
+    // true while any window is mid open/close/minimize/restore animation.
+    // The damage-gated GUI loop forces continuous rendering while this holds
+    // so animations never stall mid-flight. (satoru)
+    static bool HasActiveAnimations();
     static WMAction GetCurrentAction();
+
+    // ── cached-desktop snapshot during a window drag ──────────────────
+    // when a titlebar drag is in progress we compose the whole desktop
+    // (wallpaper + every other window + taskbar + control center) WITHOUT
+    // the dragged window ONCE into an offscreen "drag backdrop" buffer, then
+    // every subsequent drag frame we just blit that backdrop back and redraw
+    // the single moving window on top. that turns ~5 full-screen passes per
+    // frame into one straight backdrop copy plus one small window, which is
+    // what makes the drag feel smooth. correctness first: the backdrop is
+    // invalidated (forcing a normal full render) the instant anything behind
+    // the window could have changed. (satoru)
+
+    // true only while a left-button TITLEBAR drag (not resize) is active  - 
+    // the precondition for using the fast backdrop path. (satoru)
+    static bool IsWindowDragActive();
+    // true when a valid backdrop snapshot exists for the current drag. (satoru)
+    static bool DragBackdropReady();
+    // arm the next full render to omit the dragged window so the composed
+    // frame can be snapshotted as the backdrop. (satoru)
+    static void BeginDragCapture();
+    // copy the freshly composed (dragged-window-excluded) back buffer into
+    // the backdrop buffer, allocating it lazily, and mark the backdrop ready.
+    // clears the capture skip. (satoru)
+    static void CaptureDragBackdrop();
+    // fast drag frame: blit the backdrop over the back buffer and draw only
+    // the dragged window (and its shadow) on top, damaging just the union of
+    // the window's previous and current footprints. (satoru)
+    static void RenderDragFast();
+    // draw only the dragged window on top of the current back buffer (used on
+    // the capture frame, after the backdrop snapshot, so frame 1 is complete).
+    // (satoru)
+    static void RenderDraggedWindowOnly();
+    // drop the backdrop so the next frame falls back to a full render. called
+    // on drag end and by structural changes (open/close/focus/z-order). (satoru)
+    static void InvalidateDragBackdrop();
 
     // create window with render/input callbacks, returns window id
     static int CreateWindow(const char* title, int x, int y, int w, int h,
@@ -209,6 +248,10 @@ private:
 
     static void RenderTitlebar(Window* win);
     static void RenderShadow(Window* win);
+    // draw one settled (non-animated) window: optional shadow, body, titlebar,
+    // border and content. shared by the main z-order loop and the dragged-only
+    // fast path so both stay pixel-identical. (satoru)
+    static void RenderWindowBody(Window* win, bool with_shadow);
     static void UpdateContentArea(Window* win);
     static WMAction HitTest(Window* win, int px, int py);
     static int  TopWindowAt(int px, int py);

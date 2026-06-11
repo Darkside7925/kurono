@@ -13,6 +13,7 @@ param(
     [switch]$KVM,           # Use KVM (Linux host)
     [switch]$BareMetal,     # Create bootable ISO for bare-metal boot
     [switch]$UEFI,          # Boot with OVMF UEFI firmware (no SeaBIOS)
+    [switch]$Gpu,           # use the virtio-gpu accelerated display backend -vga virtio (satoru)
     [string]$Memory = "10G" # RAM allocation
 )
 
@@ -35,7 +36,7 @@ Write-Host ""
 
 # ── Build ──
 if (-not $NoBuild) {
-    $makeCmd = "cd /mnt/c/Users/genie/OS/src && "
+    $makeCmd = "cd /mnt/c/Users/ibrah/Downloads/OS/src && "
     $makeArgs = @()
     if ($Clean) {
         Write-Status "Cleaning previous build..."
@@ -118,10 +119,19 @@ if (-not $qemu) {
 $audioBackend = if ($useWSL) { "pa,id=hostaudio,server=unix:/mnt/wslg/PulseServer" }
                 else         { "dsound,id=hostaudio" }
 
+# display backend selection. default seavga (std) framebuffer is cpu scalar
+# writes into a hypervisor-trapped mmio surface -- that is the ~14 fps ceiling.
+# -Gpu picks the virtio-gpu accelerated backend: the kernel renders into guest
+# ram and hands the host a transfer+flush over a virtqueue, far cheaper under
+# whpx/kvm. the kernel auto-detects the virtio-gpu device and routes the
+# display through it; no other flag needed. (satoru)
+$vga = if ($Gpu) { "virtio" } else { "std" }
+if ($Gpu) { Write-Status "Display backend: virtio-gpu (accelerated) -- -vga virtio" }
+
 $qemuArgs = @(
     "-cdrom", $Iso,
     "-m", $Memory,
-    "-vga", "std",
+    "-vga", $vga,
     "-serial", "stdio",
     "-audiodev", $audioBackend,
     "-machine", "pcspk-audiodev=hostaudio",

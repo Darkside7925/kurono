@@ -295,7 +295,9 @@ bool UIConfig::Save(){
     // serialize current entries as "key = value\n" lines.
     static char out[8192];
     int p = 0;
-    for(int i=0;i<entry_count && p < (int)sizeof(out)-96; i++){
+    // margin must cover one full entry (key 48 + " = " 3 + val 48 + "\n" 1 +
+    // the trailing nul) or a near-boundary entry overruns `out` into BSS. (satoru)
+    for(int i=0;i<entry_count && p < (int)sizeof(out)-104; i++){
         if(!entries[i].used) continue;
         int kl = uic_slen(entries[i].key);
         int vl = uic_slen(entries[i].val);

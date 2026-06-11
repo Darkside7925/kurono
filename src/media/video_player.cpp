@@ -59,6 +59,10 @@ static int Sappend(char* dst, int pos, int max, const char* s) {
 // ----------------------------------------------------------------------
 // rgba buffer management
 // ----------------------------------------------------------------------
+// drop only the *view* fields. the backing pixels live in st.decode_buf
+// which is owned and reused; FreeDecodeBuf() (called from Close) releases
+// the actual memory. legacy stb-owned buffers (rgba_owns) are still freed
+// here for safety, though the new path never sets that flag. (satoru)
 static void FreeRgba(State& st) {
     if (st.rgba_frame && st.rgba_owns) stbi_image_free(st.rgba_frame);
     st.rgba_frame = nullptr;
@@ -67,8 +71,32 @@ static void FreeRgba(State& st) {
     st.rgba_owns = false;
 }
 
+static void FreeDecodeBuf(State& st) {
+    if (st.decode_buf) KernelHeap::Free(st.decode_buf);
+    st.decode_buf = nullptr;
+    st.decode_cap = 0;
+}
+
+static void FreeScaledBuf(State& st) {
+    if (st.scaled_buf) KernelHeap::Free(st.scaled_buf);
+    st.scaled_buf = nullptr;
+    st.scaled_cap = 0;
+    st.scaled_valid = false;
+    st.scaled_w = 0;
+    st.scaled_h = 0;
+}
+
+// cap for the one-time scratch so a hostile/garbage frame size can't ask
+// for an unbounded allocation (1920*1080*4 ≈ 8 mb). (satoru)
+static const uint32_t kMaxFramePixelsBytes = 1920u * 1080u * 4u;
+
 static bool DecodeJpegInto(State& st, const uint8_t* jpeg, uint32_t len) {
     int w = 0, h = 0, comp = 0;
+    // stb has no decode-into-caller-buffer api, so it mallocs a temp via
+    // STBI_MALLOC. we copy that temp into our persistent scratch and free it
+    // immediately, so steady-state holds exactly one owned rgba buffer and
+    // the per-frame churn becomes a single memcpy instead of alloc+free of
+    // the previous frame. (satoru)
     unsigned char* rgba = stbi_load_from_memory(jpeg, (int)len, &w, &h, &comp, 4);
     if (!rgba) {
         SerialLogger::Log("[VideoPlayer] jpeg decode failed: ");
@@ -77,11 +105,38 @@ static bool DecodeJpegInto(State& st, const uint8_t* jpeg, uint32_t len) {
         SerialLogger::Log("\r\n");
         return false;
     }
-    FreeRgba(st);
-    st.rgba_frame = rgba;
+    if (w <= 0 || h <= 0) { stbi_image_free(rgba); return false; }
+
+    uint64_t need = (uint64_t)w * (uint64_t)h * 4ull;
+    if (need > (uint64_t)kMaxFramePixelsBytes) {
+        // refuse absurd dimensions rather than blow up the heap. (satoru)
+        stbi_image_free(rgba);
+        SerialLogger::Log("[VideoPlayer] frame too large, skipping\r\n");
+        return false;
+    }
+
+    // grow the persistent scratch only when a larger frame appears. (satoru)
+    if (!st.decode_buf || st.decode_cap < (uint32_t)need) {
+        if (st.decode_buf) KernelHeap::Free(st.decode_buf);
+        st.decode_buf = (uint8_t*)KernelHeap::Alloc((uint32_t)need);
+        st.decode_cap = st.decode_buf ? (uint32_t)need : 0;
+        if (!st.decode_buf) {
+            stbi_image_free(rgba);
+            SerialLogger::Log("[VideoPlayer] scratch alloc failed\r\n");
+            FreeRgba(st);
+            return false;
+        }
+    }
+
+    memcpy(st.decode_buf, rgba, (size_t)need);
+    stbi_image_free(rgba);
+
+    // point the view at the persistent scratch; it is not stb-owned. (satoru)
+    st.rgba_frame = st.decode_buf;
     st.rgba_w     = w;
     st.rgba_h     = h;
-    st.rgba_owns  = true;
+    st.rgba_owns  = false;
+    st.scaled_valid = false;   // a new frame invalidates the scaled cache (satoru)
     if (s_decode_log_budget > 0) {
         s_decode_log_budget--;
         SerialLogger::Log("[VideoPlayer] decoded jpeg ");
@@ -158,7 +213,9 @@ bool Open(const uint8_t* data, uint32_t size, State& st) {
             if (vt.codec == MP4::Box::mjpg || vt.codec == MP4::Box::jpeg) {
                 if (vt.sample_count > 0) {
                     const MP4::Sample& s = vt.samples[0];
-                    if (s.file_offset + s.size <= size) {
+                    // bounds-check without addition so a malformed mp4 sample
+                    // table can't overflow file_offset+size and read OOB. (satoru)
+                    if (s.size <= size && s.file_offset <= size - s.size) {
                         DecodeJpegInto(st, data + s.file_offset, s.size);
                     }
                 }
@@ -204,6 +261,8 @@ void Close(State& st) {
     }
     if (st.kind == SRC_MP4) MP4::Close(st.mp4);
     FreeRgba(st);
+    FreeDecodeBuf(st);   // release the persistent decode scratch (satoru)
+    FreeScaledBuf(st);   // release the scaled-output cache (satoru)
     st = State{};
     st.audio_stream_id = -1;
     st.mp4_video_track = -1;
@@ -275,8 +334,11 @@ uint32_t ProgressPermil(const State& st) {
 // ----------------------------------------------------------------------
 // time-driven decode
 // ----------------------------------------------------------------------
-void Tick(State& st) {
-    if (!st.playing || st.paused) return;
+// the heavy half (jpeg decode + audio push). returns true iff the
+// displayed frame advanced this call. Tick() forwards here; a separate
+// cadence can also drive it to keep decode off the compositor. (satoru)
+bool PumpDecode(State& st) {
+    if (!st.playing || st.paused) return false;
     if (st.kind == SRC_KVID) {
         // figure out which frame we should be on at "now"
         uint32_t pos_ms = PositionMs(st);
@@ -285,7 +347,7 @@ void Tick(State& st) {
             // end of file → pause
             st.paused = true;
             st.pos_ms = DurationMs(st);
-            return;
+            return false;
         }
         // decode frames we've passed (usually just the next one)
         if (target_frame != st.kvid_cur_frame) {
@@ -321,6 +383,7 @@ void Tick(State& st) {
                 }
             }
             st.kvid_cur_frame = target_frame;
+            return true;   // displayed frame advanced (satoru)
         }
     } else if (st.kind == SRC_MP4) {
         // mjpeg-in-mp4 fast path
@@ -328,23 +391,32 @@ void Tick(State& st) {
             const MP4::Track& vt = st.mp4.tracks[st.mp4_video_track];
             if (vt.codec == MP4::Box::mjpg || vt.codec == MP4::Box::jpeg) {
                 uint32_t pos_ms = PositionMs(st);
-                if (vt.timescale == 0 || vt.sample_count == 0) return;
+                if (vt.timescale == 0 || vt.sample_count == 0) return false;
                 uint64_t target_units = MP4::MsToUnits(vt, pos_ms);
                 uint32_t target_idx = MP4::SeekKeyframe(vt, target_units);
                 if (target_idx >= vt.sample_count) {
                     st.paused = true;
-                    return;
+                    return false;
                 }
                 if (target_idx != st.kvid_cur_frame) {
                     const MP4::Sample& s = vt.samples[target_idx];
-                    if (s.file_offset + s.size <= st.size) {
+                    // overflow-safe bounds check (see above). (satoru)
+                    if (s.size <= st.size && s.file_offset <= st.size - s.size) {
                         DecodeJpegInto(st, st.data + s.file_offset, s.size);
                     }
                     st.kvid_cur_frame = target_idx;
+                    return true;   // displayed frame advanced (satoru)
                 }
             }
         }
     }
+    return false;
+}
+
+// thin forwarder kept for callers that pump decode + (later) blit in one
+// step. the decode is the expensive half; see PumpDecode. (satoru)
+void Tick(State& st) {
+    (void)PumpDecode(st);
 }
 
 // ----------------------------------------------------------------------
@@ -357,7 +429,49 @@ static const uint32_t COL_TRACK  = 0xFF353550;
 static const uint32_t COL_TEXT   = 0xFFE0E0F0;
 static const uint32_t COL_DIM    = 0xFF888899;
 
-static void BlitRgba(const State& st, int x, int y, int dst_w, int dst_h) {
+// run the per-pixel nearest-neighbor scale ONCE into st.scaled_buf, packed
+// as sw*sh uint32 in 0xFFrrggbb form. this is the expensive step we want to
+// avoid repeating on a static frame; BlitRgba calls it only when the cache
+// key (frame index, dst size) changes. returns false on alloc failure (the
+// caller then falls back to scaling straight to the framebuffer). (satoru)
+static bool BuildScaledCache(State& st, int sw, int sh) {
+    int src_w = st.rgba_w, src_h = st.rgba_h;
+    uint64_t need = (uint64_t)sw * (uint64_t)sh * 4ull;
+    if (need == 0 || need > (uint64_t)kMaxFramePixelsBytes) return false;
+    if (!st.scaled_buf || st.scaled_cap < (uint32_t)need) {
+        if (st.scaled_buf) KernelHeap::Free(st.scaled_buf);
+        st.scaled_buf = (uint8_t*)KernelHeap::Alloc((uint32_t)need);
+        st.scaled_cap = st.scaled_buf ? (uint32_t)need : 0;
+        if (!st.scaled_buf) return false;
+    }
+    uint32_t x_step_q16 = ((uint32_t)src_w << 16) / (uint32_t)sw;
+    uint32_t y_step_q16 = ((uint32_t)src_h << 16) / (uint32_t)sh;
+    uint32_t* out = (uint32_t*)st.scaled_buf;
+    uint32_t y_q16 = 0;
+    for (int j = 0; j < sh; j++) {
+        int src_y = (int)(y_q16 >> 16);
+        if (src_y >= src_h) src_y = src_h - 1;
+        const uint8_t* row = st.rgba_frame + src_y * src_w * 4;
+        uint32_t* orow = out + (uint32_t)j * (uint32_t)sw;
+        uint32_t x_q16 = 0;
+        for (int i = 0; i < sw; i++) {
+            int src_x = (int)(x_q16 >> 16);
+            if (src_x >= src_w) src_x = src_w - 1;
+            const uint8_t* p = row + src_x * 4;
+            orow[i] = 0xFF000000u |
+                      ((uint32_t)p[0] << 16) |
+                      ((uint32_t)p[1] << 8) |
+                      (uint32_t)p[2];
+            x_q16 += x_step_q16;
+        }
+        y_q16 += y_step_q16;
+    }
+    st.scaled_w = sw;
+    st.scaled_h = sh;
+    return true;
+}
+
+static void BlitRgba(State& st, int x, int y, int dst_w, int dst_h) {
     if (!st.rgba_frame || st.rgba_w <= 0 || st.rgba_h <= 0) return;
     int src_w = st.rgba_w, src_h = st.rgba_h;
     // compute fit-with-aspect rect
@@ -366,8 +480,26 @@ static void BlitRgba(const State& st, int x, int y, int dst_w, int dst_h) {
     int ox = x + (dst_w - sw) / 2;
     int oy = y + (dst_h - sh) / 2;
     if (sw <= 0 || sh <= 0) return;
-    uint32_t x_step_q16 = ((uint32_t)src_w << 16) / (uint32_t)sw;
-    uint32_t y_step_q16 = ((uint32_t)src_h << 16) / (uint32_t)sh;
+
+    // (re)build the scaled cache only when the frame index or the fit rect
+    // changed; otherwise the scale below is skipped entirely and we just
+    // copy cached pixels. this is what makes a static frame nearly free
+    // across the ~60 gui repaints/sec. (satoru)
+    bool key_match = st.scaled_valid &&
+                     st.scaled_key_frame == st.kvid_cur_frame &&
+                     st.scaled_key_dw == dst_w &&
+                     st.scaled_key_dh == dst_h &&
+                     st.scaled_w == sw && st.scaled_h == sh;
+    bool have_cache = key_match;
+    if (!key_match) {
+        if (BuildScaledCache(st, sw, sh)) {
+            st.scaled_key_frame = st.kvid_cur_frame;
+            st.scaled_key_dw = dst_w;
+            st.scaled_key_dh = dst_h;
+            st.scaled_valid = true;
+            have_cache = true;
+        }
+    }
 
     uint8_t* dst = Graphics::GetActiveBuffer();
     if (dst && Graphics::GetBpp() == 32) {
@@ -390,8 +522,25 @@ static void BlitRgba(const State& st, int x, int y, int dst_w, int dst_h) {
             int visible_w = draw_x1 - draw_x0;
             int visible_h = draw_y1 - draw_y0;
             uint32_t pitch = Graphics::GetPitch();
-            uint32_t y_q16 = (uint32_t)start_j * y_step_q16;
 
+            if (have_cache) {
+                // fast path: cached row -> framebuffer row is a straight
+                // memcpy of the visible span, no per-pixel scale. (satoru)
+                const uint32_t* cache = (const uint32_t*)st.scaled_buf;
+                for (int j = 0; j < visible_h; j++) {
+                    const uint32_t* crow =
+                        cache + (uint32_t)(start_j + j) * (uint32_t)sw + start_i;
+                    uint32_t* dst_row =
+                        (uint32_t*)(dst + (draw_y0 + j) * pitch) + draw_x0;
+                    memcpy(dst_row, crow, (size_t)visible_w * 4);
+                }
+                return;
+            }
+
+            // fallback (cache alloc failed): scale straight to framebuffer.
+            uint32_t x_step_q16 = ((uint32_t)src_w << 16) / (uint32_t)sw;
+            uint32_t y_step_q16 = ((uint32_t)src_h << 16) / (uint32_t)sh;
+            uint32_t y_q16 = (uint32_t)start_j * y_step_q16;
             for (int j = 0; j < visible_h; j++) {
                 int src_y = (int)(y_q16 >> 16);
                 if (src_y >= src_h) src_y = src_h - 1;
@@ -415,6 +564,16 @@ static void BlitRgba(const State& st, int x, int y, int dst_w, int dst_h) {
     }
 
     // fallback for non-32bpp targets
+    if (have_cache) {
+        const uint32_t* cache = (const uint32_t*)st.scaled_buf;
+        for (int j = 0; j < sh; j++) {
+            const uint32_t* crow = cache + (uint32_t)j * (uint32_t)sw;
+            for (int i = 0; i < sw; i++) Graphics::DrawPixel(ox + i, oy + j, crow[i]);
+        }
+        return;
+    }
+    uint32_t x_step_q16 = ((uint32_t)src_w << 16) / (uint32_t)sw;
+    uint32_t y_step_q16 = ((uint32_t)src_h << 16) / (uint32_t)sh;
     uint32_t y_q16 = 0;
     for (int j = 0; j < sh; j++) {
         const uint8_t* row = st.rgba_frame + (y_q16 >> 16) * src_w * 4;
@@ -432,7 +591,9 @@ static void BlitRgba(const State& st, int x, int y, int dst_w, int dst_h) {
     }
 }
 
-void Render(const State& st, int x, int y, int w, int h) {
+// non-const: Render owns the scaled-output cache it (re)builds on a frame
+// or resize, so the displayed frame can be re-blitted without re-scaling. (satoru)
+void Render(State& st, int x, int y, int w, int h) {
     Graphics::FillRect(x, y, w, h, COL_BG);
 
     // controls strip at bottom (32px)

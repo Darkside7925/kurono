@@ -4,7 +4,9 @@
 #include "../drivers/timer.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/display_mgr.h"
+#include "../drivers/mouse.h"   // cursor pos for fast-path damage (satoru)
 #include "../system/ui_config.h"
+#include "../kernel/pmm.h"   // drag-backdrop buffer alloc/free (satoru)
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define WM_LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -35,6 +37,42 @@ static bool comp_reduced_motion       = false;
 // 0 means "no throttle"; otherwise per-frame minimum gap in ms.
 static unsigned int wm_drag_min_gap_ms = 6;       // ~165 Hz upper bound
 static unsigned int wm_last_drag_ms    = 0;
+
+// ───────────────────────────────────────────────────────────────
+// Cached-desktop snapshot used during a titlebar drag. The backdrop
+// holds the whole composited desktop MINUS the dragged window so each
+// drag frame is one backdrop blit + the single moving window instead
+// of a full re-composite. Allocated once (lazily) at screen size and
+// reused for every drag; freed only if the screen geometry changes.
+// (satoru)
+// ───────────────────────────────────────────────────────────────
+static uint8_t*     wm_backdrop          = nullptr; // offscreen rgba copy
+static size_t       wm_backdrop_bytes    = 0;       // for PMM::FreeBytes
+static int          wm_backdrop_w        = 0;       // pixels it was sized for
+static int          wm_backdrop_h        = 0;
+static uint32_t     wm_backdrop_pitch    = 0;       // byte stride captured with
+static bool         wm_backdrop_ready    = false;   // holds a valid snapshot
+static bool         wm_backdrop_capturing= false;   // omit dragged win this frame
+static int          wm_backdrop_win_id   = -1;      // window the snapshot excludes
+static unsigned int wm_backdrop_built_ms = 0;       // age cap source (satoru)
+// set only while the fast drag path is repainting the moving window, so the
+// damage choke point below does NOT mistake the window's own movement for a
+// structural change and drop the backdrop. (satoru)
+static bool         wm_in_fast_render    = false;
+// previous-frame footprint of the dragged window so the fast path can
+// repaint where it used to be from the backdrop. (satoru)
+static int          wm_drag_prev_x = 0, wm_drag_prev_y = 0;
+static int          wm_drag_prev_w = 0, wm_drag_prev_h = 0;
+static bool         wm_drag_prev_valid = false;
+// previous-frame cursor hotspot: the OS draws the cursor after Render, so when
+// the pointer detaches from the window (e.g. dragged into a clamp edge) the
+// fast path must still restore the backdrop where the cursor was and damage
+// where it is, or it smears. (satoru)
+static int          wm_drag_cur_px = 0, wm_drag_cur_py = 0;
+static bool         wm_drag_cur_valid = false;
+// a backdrop older than this is rebuilt so a long drag still picks up the
+// once-a-second clock tick / any late toast behind the window. (satoru)
+#define WM_BACKDROP_MAX_AGE_MS 800u
 
 // ───────────────────────────────────────────────────────────────
 // Window context menu state (right-click on a titlebar). Kept as
@@ -90,6 +128,11 @@ static inline void wm_damage(int x, int y, int w, int h) {
     if (y + h > sh) h = sh - y;
     if (w <= 0 || h <= 0) return;
     Graphics::MarkDirty(x, y, w, h);
+    // Any WM-side damage (create/close/move/resize/focus/snap/minimize/
+    // maximize/restore/cross-monitor) implies the composite changed, so
+    // also raise the global frame signal. Single choke point keeps every
+    // WindowManager mutator covered without per-call edits. (satoru)
+    Graphics::MarkUIDirty();
 }
 
 // Damage a window's last and current rect, with shadow margin.
@@ -103,6 +146,14 @@ static inline void wm_damage_window(const Window* w) {
     if (w->state != WIN_CLOSED && w->visible && w->state != WIN_MINIMIZED) {
         wm_damage(w->x - m, w->y - m, w->w + 2*m, w->h + 2*m);
     }
+    // every window lifecycle/structural change (create/close/min/max/restore/
+    // snap/focus/move/resize/visibility/cross-monitor) funnels through here,
+    // and the per-frame drag movement does NOT (it damages explicit rects via
+    // wm_damage). so this is the right choke point to drop a stale drag
+    // backdrop: the set/geometry of windows BEHIND the dragged one changed.
+    // the guard exempts the fast path's own repaint of the moving window.
+    // (satoru)
+    if (!wm_in_fast_render) WindowManager::InvalidateDragBackdrop();
 }
 static void wm_clamp_drag_bounds(Window* win) {
     if (!win) return;
@@ -184,6 +235,9 @@ void WindowManager::Init(int sw, int sh) {
     wm_ctx_win_id = -1;
     wm_input_capture_id = -1;
     wm_last_drag_ms = 0;
+    // reset drag-snapshot state; the buffer (if any) is re-sized on next use
+    // via its geometry check, so we just drop readiness here. (satoru)
+    InvalidateDragBackdrop();
 
     SerialLogger::Log("WindowManager: Initialized\r\n");
 }
@@ -492,6 +546,9 @@ void WindowManager::BringToFront(int id) {
         max_z = window_count;
     }
     win->z_order = max_z + 1;
+    // z-order changed (no rect damage is raised here)  -  a cached drag backdrop
+    // composed in the old order is now stale. (satoru)
+    if (!wm_in_fast_render) InvalidateDragBackdrop();
 }
 
 void WindowManager::Focus(int id) {
@@ -531,6 +588,9 @@ void WindowManager::SetTitle(int id, const char* title) {
     wmcpy(win->title, title, 64);
     win->dirty = true;
     wm_damage(win->x, win->y, win->w, WM_TITLEBAR_H);
+    // a background window's titlebar text changed  -  invalidate the snapshot
+    // so it isn't shown with the old title behind a drag. (satoru)
+    if (!wm_in_fast_render) InvalidateDragBackdrop();
 }
 
 void WindowManager::MoveWindow(int id, int x, int y) {
@@ -573,6 +633,12 @@ void WindowManager::MarkDirty(int id) {
     if (!win) return;
     win->dirty = true;
     wm_damage(win->x, win->y, win->w, win->h);
+    // only a change to a window OTHER than the one being dragged makes the
+    // backdrop stale  -  the dragged window's content is redrawn every fast
+    // frame anyway, so its own MarkDirty must not drop the snapshot. (satoru)
+    if (!wm_in_fast_render && !(IsWindowDragActive() && id == action_window_id)) {
+        InvalidateDragBackdrop();
+    }
 }
 
 int WindowManager::GetWindowCount() {
@@ -786,6 +852,7 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
     }
 
     if (!mouse_down) {
+        if (current_action != WM_NONE) InvalidateDragBackdrop(); // drag ended (satoru)
         current_action = WM_NONE;
         action_window_id = -1;
     }
@@ -1012,6 +1079,11 @@ void WindowManager::Render() {
         for (int j = i + 1; j < count; j++) {
             const Window* o = &windows[indices[j]];
             if (o->anim_kind != 0 || o->alpha < 255 || o->state == WIN_FULLSCREEN) continue;
+            // when capturing the drag backdrop the dragged window is NOT drawn,
+            // so it must not occlude windows behind it  -  otherwise they'd be
+            // missing from the backdrop and vanish once the window slides off
+            // them. (satoru)
+            if (WM_UNLIKELY(wm_backdrop_capturing && o->id == wm_backdrop_win_id)) continue;
             // o covers w iff o's rect contains w's rect.
             if (o->x <= w->x && o->y <= w->y &&
                 o->x + o->w >= w->x + w->w &&
@@ -1025,7 +1097,6 @@ void WindowManager::Render() {
     // render each window
     bool dragging = IsDragging();
     unsigned int now = Timer::GetRealMs();
-    uint32_t accent = wm_get_accent();
     for (int i = 0; i < count; i++) {
         Window* win = &windows[indices[i]];
 
@@ -1038,6 +1109,14 @@ void WindowManager::Render() {
         win->had_last = true;
 
         if (!draw[i]) {
+            win->dirty = false;
+            continue;
+        }
+
+        // while snapshotting the drag backdrop, omit the dragged window so
+        // the captured frame contains only what sits BEHIND it. last_* was
+        // still refreshed above so move/close damage stays correct. (satoru)
+        if (WM_UNLIKELY(wm_backdrop_capturing && win->id == wm_backdrop_win_id)) {
             win->dirty = false;
             continue;
         }
@@ -1092,31 +1171,10 @@ void WindowManager::Render() {
             continue;
         }
 
-        // shadow  -  skip during drag/resize unless user opted in.
-        if (!dragging || comp_shadow_during_drag) {
-            RenderShadow(win);
-        }
-
-        // window body  -  smooth rounded rectangle
-        uint32_t border = win->focused ? accent : COL_BORDER;
-
-        // full body background with rounded corners
-        Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color);
-
-        // titlebar (draws over the top portion)
-        if (win->has_titlebar) RenderTitlebar(win);
-
-        // subtle border
-        Graphics::DrawRect(win->x, win->y, win->w, win->h, border);
-
-        // content (clipped to content area so text doesn't bleed outside
-        // when the user shrinks the window below the content's natural size)
-        if (win->render && win->content_w > 0 && win->content_h > 0) {
-            Graphics::SetClipRect(win->content_x, win->content_y,
-                                  win->content_w, win->content_h);
-            win->render(win, win->content_x, win->content_y, win->content_w, win->content_h);
-            Graphics::ClearClipRect();
-        }
+        // shadow + body + titlebar + border + content. shadow is skipped
+        // during drag/resize unless the user opted in. shared helper keeps the
+        // dragged-only fast path pixel-identical to this loop. (satoru)
+        RenderWindowBody(win, (!dragging || comp_shadow_during_drag));
 
         // ── post-pass: per-window opacity + open/close fade overlay ──
         int combined = (int)win->alpha * p_vis / 256;
@@ -1141,6 +1199,252 @@ void WindowManager::Render() {
 
     // window context menu draws on top of everything (satoru)
     RenderContextMenu();
+}
+
+// draw one settled window: shadow (optional) + rounded body + titlebar +
+// border + clipped content. factored out of Render()'s z-order loop so the
+// dragged-only fast path produces identical pixels. assumes the window is not
+// mid-animation (anim_kind==0), which holds for a window being dragged. (satoru)
+void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
+    if (!win) return;
+    if (with_shadow) RenderShadow(win);
+
+    uint32_t border = win->focused ? wm_get_accent() : COL_BORDER;
+
+    // full body background with rounded corners
+    Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color);
+
+    // titlebar (draws over the top portion)
+    if (win->has_titlebar) RenderTitlebar(win);
+
+    // subtle border
+    Graphics::DrawRect(win->x, win->y, win->w, win->h, border);
+
+    // content (clipped to content area so text doesn't bleed outside when the
+    // user shrinks the window below the content's natural size)
+    if (win->render && win->content_w > 0 && win->content_h > 0) {
+        Graphics::SetClipRect(win->content_x, win->content_y,
+                              win->content_w, win->content_h);
+        win->render(win, win->content_x, win->content_y, win->content_w, win->content_h);
+        Graphics::ClearClipRect();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Cached-desktop snapshot during a window drag. (satoru)
+// ─────────────────────────────────────────────────────────────────────
+
+// true only for an active left-button TITLEBAR drag (not a resize). resize is
+// deliberately excluded  -  its content relayout wants the full render. (satoru)
+bool WindowManager::IsWindowDragActive() {
+    return mouse_is_down && current_action == WM_DRAG && action_window_id > 0;
+}
+
+bool WindowManager::DragBackdropReady() {
+    if (!wm_backdrop_ready || !wm_backdrop) return false;
+    // a stale backdrop (resolution change or too old) must be rebuilt so the
+    // wallpaper/taskbar behind the window can't freeze on screen. compare to
+    // the live framebuffer geometry the snapshot was sized from. (satoru)
+    if (wm_backdrop_w != Graphics::GetWidth() ||
+        wm_backdrop_h != Graphics::GetHeight()) return false;
+    if (wm_backdrop_pitch != Graphics::GetPitch()) return false;
+    if ((Timer::GetRealMs() - wm_backdrop_built_ms) > WM_BACKDROP_MAX_AGE_MS) return false;
+    return true;
+}
+
+void WindowManager::InvalidateDragBackdrop() {
+    wm_backdrop_ready     = false;
+    wm_backdrop_capturing = false;
+    wm_backdrop_win_id    = -1;
+    wm_drag_prev_valid    = false;
+    wm_drag_cur_valid     = false;
+}
+
+// arm the next full render to leave the dragged window out so we can snapshot
+// what is behind it. no-op if there is no active titlebar drag. (satoru)
+void WindowManager::BeginDragCapture() {
+    if (!IsWindowDragActive()) { wm_backdrop_capturing = false; return; }
+    wm_backdrop_capturing = true;
+    wm_backdrop_win_id    = action_window_id;
+}
+
+// (re)allocate the backdrop buffer to the current screen geometry. sized from
+// the ACTUAL framebuffer (graphics) so the snapshot copy can never over/under-
+// run the back buffer if wm's screen_* ever drift from the fb. returns false
+// if allocation failed or geometry is unusable. (satoru)
+static bool wm_backdrop_alloc() {
+    int w = Graphics::GetWidth();
+    int h = Graphics::GetHeight();
+    uint32_t pitch = Graphics::GetPitch();
+    if (w <= 0 || h <= 0 || pitch == 0) return false;
+    size_t need = (size_t)pitch * (size_t)h;
+    if (wm_backdrop && (wm_backdrop_bytes != need)) {
+        PMM::FreeBytes(wm_backdrop, wm_backdrop_bytes);
+        wm_backdrop = nullptr;
+        wm_backdrop_bytes = 0;
+    }
+    if (!wm_backdrop) {
+        wm_backdrop = (uint8_t*)PMM::AllocBytes(need);
+        if (!wm_backdrop) { wm_backdrop_bytes = 0; return false; }
+        wm_backdrop_bytes = need;
+    }
+    wm_backdrop_w     = w;
+    wm_backdrop_h     = h;
+    wm_backdrop_pitch = pitch;
+    return true;
+}
+
+// snapshot the just-composed (dragged-window-excluded) back buffer into the
+// backdrop. one straight copy of cached RAM. clears the capture skip. (satoru)
+void WindowManager::CaptureDragBackdrop() {
+    wm_backdrop_capturing = false;          // capture frame is over either way
+    if (!IsWindowDragActive()) { InvalidateDragBackdrop(); return; }
+    if (!wm_backdrop_alloc()) { wm_backdrop_ready = false; return; }
+
+    uint8_t* back = Graphics::GetBackBuffer();
+    if (!back) { wm_backdrop_ready = false; return; }
+    // copy the rows actually backed by the framebuffer pitch. (satoru)
+    memcpy(wm_backdrop, back, (size_t)wm_backdrop_pitch * (size_t)wm_backdrop_h);
+
+    wm_backdrop_win_id = action_window_id;
+    wm_backdrop_ready  = true;
+    wm_backdrop_built_ms = Timer::GetRealMs();
+    // seed the previous footprint with the window as it stood in the snapshot
+    // frame so the first fast frame damages a correct prev rect. (satoru)
+    Window* w = GetWindow(action_window_id);
+    if (w) {
+        wm_drag_prev_x = w->x; wm_drag_prev_y = w->y;
+        wm_drag_prev_w = w->w; wm_drag_prev_h = w->h;
+        wm_drag_prev_valid = true;
+    } else {
+        wm_drag_prev_valid = false;
+    }
+}
+
+// blit a rectangular block from the backdrop back into the live back buffer.
+// rect is clipped to the screen; copies row-by-row at the captured pitch.
+// (satoru)
+static void wm_backdrop_blit(int x, int y, int w, int h) {
+    if (!wm_backdrop) return;
+    int sw = wm_backdrop_w, sh = wm_backdrop_h;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x >= sw || y >= sh) return;
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
+    if (w <= 0 || h <= 0) return;
+    uint8_t* back = Graphics::GetBackBuffer();
+    if (!back) return;
+    uint32_t pitch = wm_backdrop_pitch;
+    size_t   row_bytes = (size_t)w * 4u;       // 32bpp rgba
+    size_t   col_off   = (size_t)x * 4u;
+    for (int row = y; row < y + h; row++) {
+        size_t off = (size_t)row * pitch + col_off;
+        memcpy(back + off, wm_backdrop + off, row_bytes);
+    }
+}
+
+// footprint margin around the dragged window for backdrop-restore + damage.
+// must cover (a) the mouse cursor, which is drawn after Render and can reach
+// ~16px past the grab point when the titlebar is grabbed near an edge, and
+// (b) the soft shadow when shadows are kept during drag (reaches
+// comp_shadow_radius+3 beyond the body). a stale margin would leave a cursor
+// or shadow trail since only this region is swapped. (satoru)
+#define WM_DRAG_CURSOR_MARGIN 18
+static inline int wm_drag_margin() {
+    int m = WM_DRAG_CURSOR_MARGIN;
+    if (comp_shadow_during_drag) {
+        int s = comp_shadow_radius + 4;        // +3 focus bump, +1 slop (satoru)
+        if (s > m) m = s;
+    }
+    return m;
+}
+
+// fast drag frame: restore the backdrop only where the window was and is, then
+// redraw the moving window on top, damaging just that union so SwapBuffers
+// copies a small region. avoids the full wallpaper + every-window re-composite.
+// (satoru)
+void WindowManager::RenderDragFast() {
+    Window* win = GetWindow(action_window_id);
+    if (!win || !DragBackdropReady()) return;
+
+    const int m = wm_drag_margin();            // cover the soft shadow too
+
+    // the damage we raise below is the moving window's own footprint, NOT a
+    // structural change  -  keep wm_damage from dropping the very backdrop we
+    // are using. (satoru)
+    wm_in_fast_render = true;
+
+    // 1) repaint the previous footprint from the clean backdrop so the window
+    //    leaves no trail where it used to be. (satoru)
+    if (wm_drag_prev_valid) {
+        wm_backdrop_blit(wm_drag_prev_x - m, wm_drag_prev_y - m,
+                         wm_drag_prev_w + 2*m, wm_drag_prev_h + 2*m);
+        wm_damage(wm_drag_prev_x - m, wm_drag_prev_y - m,
+                  wm_drag_prev_w + 2*m, wm_drag_prev_h + 2*m);
+    }
+
+    // 2) lay the backdrop under the window's CURRENT spot (so the shadow,
+    //    rounded corners and any translucency composite over real pixels, not
+    //    over the previous frame's window). (satoru)
+    wm_backdrop_blit(win->x - m, win->y - m, win->w + 2*m, win->h + 2*m);
+
+    // 3) draw the moving window itself, shadow honouring the drag setting. (satoru)
+    RenderWindowBody(win, comp_shadow_during_drag);
+
+    // 4) damage the window's current footprint (+shadow) for the partial swap. (satoru)
+    wm_damage(win->x - m, win->y - m, win->w + 2*m, win->h + 2*m);
+
+    // 5) cursor trail guard: the OS redraws the cursor (12x16, hotspot at the
+    //    top-left) after this returns. when the pointer detaches from the
+    //    window at a clamp edge it can sit outside the window rect, so restore
+    //    the backdrop under the previous AND current cursor box and damage both
+    //     -  otherwise only the window region swaps and the cursor smears. boxes
+    //    that fall inside the window rect just re-copy harmlessly. (satoru)
+    {
+        const int cw = 12, ch = 16, cs = 2;     // cursor size + slop (satoru)
+        int cx = Mouse::mx, cy = Mouse::my;
+        if (wm_drag_cur_valid) {
+            wm_backdrop_blit(wm_drag_cur_px - cs, wm_drag_cur_py - cs,
+                             cw + 2*cs, ch + 2*cs);
+            wm_damage(wm_drag_cur_px - cs, wm_drag_cur_py - cs,
+                      cw + 2*cs, ch + 2*cs);
+        }
+        wm_backdrop_blit(cx - cs, cy - cs, cw + 2*cs, ch + 2*cs);
+        wm_damage(cx - cs, cy - cs, cw + 2*cs, ch + 2*cs);
+        wm_drag_cur_px = cx; wm_drag_cur_py = cy; wm_drag_cur_valid = true;
+    }
+
+    // remember where it is for next frame's prev-rect repaint. (satoru)
+    win->last_x = win->x; win->last_y = win->y;
+    win->last_w = win->w; win->last_h = win->h;
+    win->had_last = true;
+    wm_drag_prev_x = win->x; wm_drag_prev_y = win->y;
+    wm_drag_prev_w = win->w; wm_drag_prev_h = win->h;
+    wm_drag_prev_valid = true;
+
+    // the wm context menu can't be open during a drag, but keep parity with
+    // Render() in case that ever changes. (satoru)
+    RenderContextMenu();
+
+    wm_in_fast_render = false;
+}
+
+// draw only the dragged window over the current back buffer  -  used right after
+// the backdrop snapshot so the capture frame is itself complete. (satoru)
+void WindowManager::RenderDraggedWindowOnly() {
+    Window* win = GetWindow(action_window_id);
+    if (!win) return;
+    // guard so this window's own damage doesn't drop the backdrop that
+    // CaptureDragBackdrop just marked ready. (satoru)
+    wm_in_fast_render = true;
+    RenderWindowBody(win, comp_shadow_during_drag);
+    const int m = wm_drag_margin();
+    wm_damage(win->x - m, win->y - m, win->w + 2*m, win->h + 2*m);
+    win->last_x = win->x; win->last_y = win->y;
+    win->last_w = win->w; win->last_h = win->h;
+    win->had_last = true;
+    wm_in_fast_render = false;
 }
 
 bool WindowManager::HandleMouseDown(int mx, int my) {
@@ -1277,6 +1581,9 @@ void WindowManager::HandleMouseUp(int mx, int my) {
     mouse_is_down = false;
     current_action = WM_NONE;
     action_window_id = -1;
+    // drag is over  -  drop the snapshot so the next drag starts clean and the
+    // released window gets a normal full render this frame. (satoru)
+    InvalidateDragBackdrop();
     (void)mx; (void)my;
 }
 
@@ -1351,6 +1658,18 @@ void WindowManager::RenderAll() {
 
 bool WindowManager::IsDragging() {
     return mouse_is_down && current_action != WM_NONE;
+}
+
+bool WindowManager::HasActiveAnimations() {
+    unsigned int now = Timer::GetRealMs();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        const Window* w = &windows[i];
+        if (w->state == WIN_CLOSED) continue;
+        if (w->anim_kind == 0) continue;
+        if (w->anim_duration_ms == 0) continue;
+        if ((now - w->anim_start_ms) < w->anim_duration_ms) return true;
+    }
+    return false;
 }
 
 WMAction WindowManager::GetCurrentAction() {

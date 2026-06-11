@@ -150,12 +150,10 @@ void InputManager::Init() {
 }
 
 void InputManager::Poll() {
-    // Always drain both devices each tick so a busy mouse cannot starve the
-    // keyboard, and a busy keyboard cannot starve the mouse. The previous
-    // logic alternated polling order depending on mouse health, which made
-    // input feel jittery on shared 8042 controllers.
-    Keyboard::Poll();
-    Mouse::Poll();
+    // NOTE: Keyboard::Poll()/Mouse::Poll() are NOT called here. InputProcessEntry
+    // already polls both devices directly each tick; calling them again here
+    // doubled the 8042 status-port reads + VMware backdoor probes (every one a
+    // VM-exit) for zero benefit. This now only drains the event ring. (satoru)
 
     // Drain pending key events onto the routing fabric.
     ImEvent ev;

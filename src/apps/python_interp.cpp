@@ -1188,11 +1188,16 @@ int PythonInterp::RunFile(const char* vfs_path, char* out, int max_out) {
         swc(s, '\n');
         return s.len;
     }
-    char buf[8192];
-    int r = KVFS::ReadFile(vfs_path, buf, sizeof(buf) - 1);
+    // heap-allocate: an 8KB stack buffer overflows the 8KB shell process
+    // stack this runs on. (satoru)
+    char* buf = (char*)KernelHeap::Alloc(8192);
+    if (!buf) return 0;
+    int r = KVFS::ReadFile(vfs_path, buf, 8192 - 1);
     if (r < 0) r = 0;
     buf[r] = 0;
-    return RunSource(buf, out, max_out);
+    int ret = RunSource(buf, out, max_out);
+    KernelHeap::Free(buf);
+    return ret;
 }
 
 int PythonInterp::cmd_python(void* sh, int argc, const char** argv, char* out, int mx) {

@@ -372,7 +372,11 @@ static bool load_exec_segments(uint64_t address_space, const uint8_t* image,
                                uint32_t size, uint32_t* entry_point,
                                uint32_t* brk_end) {
     const Elf32Header* header = (const Elf32Header*)image;
-    if (header->e_phoff + header->e_phnum * header->e_phentsize > size) return false;
+    // compute in 64-bit so a crafted ELF (e_phnum/e_phentsize = 0xFFFF) can't
+    // overflow the bound check and pass, then OOB-read past the image. (satoru)
+    if ((uint64_t)header->e_phoff +
+        (uint64_t)header->e_phnum * (uint64_t)header->e_phentsize > (uint64_t)size)
+        return false;
 
     uint32_t highest_end = 0;
     for (int i = 0; i < header->e_phnum; i++) {
@@ -853,9 +857,11 @@ void LinuxSyscall::ResolvePath(const char* linux_path, char* kurono_path,
     char abs[256];
 
     if (linux_path[0] != '/') {
-        // relative path  -  prepend cwd
+        // relative path  -  prepend cwd. guard against an empty cwd (ls_slen==0
+        // would index abs[-1]). (satoru)
         ls_scpy(abs, p->cwd, sizeof(abs));
-        if (abs[ls_slen(abs) - 1] != '/') ls_cat(abs, "/", sizeof(abs));
+        int alen = ls_slen(abs);
+        if (alen == 0 || abs[alen - 1] != '/') ls_cat(abs, "/", sizeof(abs));
         ls_cat(abs, linux_path, sizeof(abs));
     } else {
         ls_scpy(abs, linux_path, sizeof(abs));

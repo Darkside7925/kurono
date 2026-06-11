@@ -7,6 +7,12 @@
 #include "../kernel/pmm.h"
 #include "../kernel/panic.h"
 #include "../ui/font.h"
+#include "virtio_gpu.h"   // accelerated present path (satoru)
+
+// when the virtio-gpu backend is active, fb_addr is a guest-ram resource
+// backing that must be transferred + flushed to the host after each frame.
+// DisplayManager sets this once it selects + inits the virtio backend. (satoru)
+static bool g_present_via_virtio = false;
 
 // page directory tables from kurono_boot.asm  -  needed to remap fb caching
 extern "C" uint8_t pd_tables[];
@@ -194,7 +200,7 @@ uint8_t Graphics::fb_bpp = 0;
 Graphics::RenderMode Graphics::render_mode = SINGLE_BUFFER;
 Graphics::BlendMode Graphics::blend_mode = BLEND_ALPHA;
 
-uint32_t Graphics::target_frame_time_us = 5555; // ~180hz (1000000/180)
+uint32_t Graphics::target_frame_time_us = 16667; // 60hz (1000000/60) (satoru)
 uint64_t Graphics::last_frame_time = 0;
 uint32_t Graphics::frame_count = 0;
 uint64_t Graphics::fps_sample_time = 0;
@@ -215,6 +221,24 @@ bool Graphics::clipping_enabled = false;
 
 Graphics::DirtyRegion Graphics::dirty_regions[16];
 int Graphics::dirty_count = 0;
+
+// Global UI dirty signal  -  see graphics.h. volatile: written from input /
+// app / animation paths (potentially other kernel processes) and read by
+// the GUI process each frame. A monotonically-incrementing counter lets the
+// GUI loop detect "changed since I last looked" via a snapshot compare, so a
+// MarkUIDirty() that lands between the loop's check and its clear is still
+// observed on the next iteration rather than being clobbered. (satoru)
+static volatile uint32_t g_ui_dirty = 1;          // start dirty: paint frame 0
+static uint32_t          g_ui_dirty_seen = 0;
+
+void Graphics::MarkUIDirty()        { g_ui_dirty++; }
+uint32_t Graphics::UIDirtyCount()   { return g_ui_dirty; }
+bool Graphics::ConsumeUIDirty() {
+    uint32_t cur = g_ui_dirty;
+    bool dirty = (cur != g_ui_dirty_seen);
+    g_ui_dirty_seen = cur;
+    return dirty;
+}
 
 void Graphics::Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp) {
     if (addr == 0 || width == 0 || height == 0 || pitch == 0 ||
@@ -286,6 +310,11 @@ void Graphics::InitAdvanced() {
     if (mode && DisplayController::SetMode(mode)) {
         Init(mode->framebuffer_addr, mode->width, mode->height, mode->pitch, mode->bpp);
         uint32_t hz = mode->refresh_rate ? mode->refresh_rate : 60;
+        // cap the compositor at 60fps. recompositing the entire desktop at
+        // 120-180hz pins the gui process at ~100% cpu redrawing identical
+        // idle frames and starves every other process (the "slow asf" the
+        // user hit). 60fps is smooth and frees the cpu. (satoru)
+        if (hz > 60) hz = 60;
         target_frame_time_us = 1000000 / hz;
         draw_stats.target_fps = hz;
         
@@ -388,6 +417,26 @@ void Graphics::SetTargetFPS(uint32_t fps) {
 
 uint32_t Graphics::GetTargetFPS() {
     return draw_stats.target_fps;
+}
+
+// frame budget in whole ms derived from the active target fps. drives the gui
+// loop's adaptive pacing so it follows the user's selected display.refresh_hz
+// (set via SetTargetFPS from WindowManager::ReloadFromConfig / settings) rather
+// than a hardcoded 60. clamped to >=1ms. (satoru)
+uint32_t Graphics::GetTargetFrameTimeMs() {
+    uint32_t ms = target_frame_time_us / 1000u;
+    return ms ? ms : 1u;
+}
+
+void Graphics::SetVirtioPresent(bool on) { g_present_via_virtio = on; }
+
+// push the just-swapped frame to the host gpu. called by the gui loop right
+// after SwapBuffers when the virtio-gpu backend is active; a no-op otherwise so
+// the bga/std-vga present path is unchanged. PresentFramebuffer pipelines the
+// transfer + flush into the virtqueue (one notify per frame). (satoru)
+void Graphics::PresentVirtioIfActive() {
+    if (!g_present_via_virtio || !fb_addr) return;
+    VirtIOGPU::PresentFramebuffer((void*)fb_addr, fb_width, fb_height);
 }
 
 uint32_t Graphics::GetMonitorHz() {
@@ -1014,6 +1063,45 @@ void Graphics::FillRectRounded(int x, int y, int w, int h, int r, uint32_t color
 }
 
 void Graphics::FillRectAlpha(int x, int y, int w, int h, uint8_t a, uint32_t color) {
+    if (a == 0 || w <= 0 || h <= 0) return;
+    // fully opaque  -  hand off to the 64-bit fast fill path. (satoru)
+    if (a == 255) { FillRect(x, y, w, h, color | 0xFF000000u); return; }
+
+    // clamp once to framebuffer bounds instead of bounds-checking every
+    // pixel, then blend inline. for a constant source colour the per-channel
+    // src*alpha terms are loop invariants (cr/cg/cb), so the inner loop only
+    // reads the destination, blends, and writes  -  no BlendPixel call, no
+    // per-pixel address math. this is the hot path for window drop-shadows
+    // that are redrawn every frame, so the win compounds. note: we clamp to
+    // the framebuffer (not the clip rect) to exactly match the old
+    // per-pixel DrawPixelUnsafe behaviour. (satoru)
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)fb_width)  w = (int)fb_width  - x;
+    if (y + h > (int)fb_height) h = (int)fb_height - y;
+    if (w <= 0 || h <= 0 || !active_buffer) return;
+
+    if (fb_bpp == 32) {
+        const uint32_t av  = a;
+        const uint32_t inv = 255u - av;
+        const uint32_t cr  = ((color >> 16) & 0xFFu) * av + 127u;
+        const uint32_t cg  = ((color >> 8)  & 0xFFu) * av + 127u;
+        const uint32_t cb  = ( color        & 0xFFu) * av + 127u;
+        for (int j = 0; j < h; j++) {
+            volatile uint32_t* p = (volatile uint32_t*)
+                (active_buffer + (size_t)(y + j) * fb_pitch + (size_t)x * 4);
+            for (int i = 0; i < w; i++) {
+                uint32_t dst = p[i];
+                uint32_t rr = (cr + ((dst >> 16) & 0xFFu) * inv) / 255u;
+                uint32_t gg = (cg + ((dst >> 8)  & 0xFFu) * inv) / 255u;
+                uint32_t bb = (cb + ( dst        & 0xFFu) * inv) / 255u;
+                p[i] = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
+            }
+        }
+        return;
+    }
+
+    // fallback for 16/24 bpp framebuffers: clipped per-pixel blend.
     uint8_t r = (color >> 16) & 0xFF;
     uint8_t g = (color >> 8) & 0xFF;
     uint8_t b = color & 0xFF;

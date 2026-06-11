@@ -46,6 +46,10 @@ public:
     static int  GetHeight();
     static int  GetY();
 
+    // true while the start menu or volume popup is open OR still mid
+    // open/close animation (phase not yet settled). (satoru)
+    static bool IsAnimating();
+
     // notification area
     static void SetClock(int h, int m);
     static void SetBattery(int percent);
@@ -151,6 +155,12 @@ public:
     // wallpaper
     static void SetWallpaper(unsigned int color);
     static void SetWallpaperImage(const MediaDecoder::Image& img);
+    static bool ApplyBuiltinWallpaper(int idx);   // 0 = primary, 1 = secondary embedded png (satoru)
+
+    // true while any desktop-icon hover-pop is still easing (~160ms). The
+    // damage-gated GUI loop renders continuously while this holds so the
+    // hover lift never freezes mid-transition once the pointer stops. (satoru)
+    static bool IsAnimating();
 
 private:
     static int screen_width, screen_height;
@@ -193,6 +203,16 @@ private:
     static int gradient_cache_h;
     static size_t gradient_cache_bytes; // for pmm freeing
     static bool have_image_wallpaper;  // true if we have a real image
+
+    // retained source image for the wallpaper so it can be re-scaled when the
+    // screen resolution changes (otherwise a mode switch drops the image and
+    // falls back to the procedural gradient). (satoru)
+    static uint8_t* wallpaper_src;
+    static int      wallpaper_src_w;
+    static int      wallpaper_src_h;
+    static int      wallpaper_src_order;     // 0 = rgba, 1 = bgra
+    static size_t   wallpaper_src_bytes;
+    static bool ScaleWallpaperCache(int w, int h);  // (re)build gradient_cache from wallpaper_src
 
     // Per-icon hover-scale phase (0..1)  -  used by RenderIcon for an
     // ease-out cubic pop on hover.  Updated by Tick().

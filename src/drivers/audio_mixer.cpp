@@ -342,9 +342,12 @@ uint32_t Tick() {
     AudioBackend* be = AudioServer::ActiveBackend();
     if (!be || !be->IsReady()) return 0;
 
-    be->Tick();
-
-    if (be->QueuedFrames() > PERIOD_FRAMES * 3) return 0;
+    // note: be->Tick() (hardware-queue refresh + codec housekeeping) is done
+    // ONCE per pump by AudioServer::Tick(), not here per-period  -  calling it
+    // every period meant an I/O-port read storm (each is a VM exit under
+    // VMware) that stole cpu from the gui/input tiers and caused microstutter.
+    // the gate below uses the cached queue depth (cheap, no port I/O). (satoru)
+    if (be->QueuedFrames() > PERIOD_FRAMES * 8) return 0;
 
     static int64_t  accum[PERIOD_FRAMES * INTERNAL_CHANNELS];
     static int16_t  output[PERIOD_FRAMES * INTERNAL_CHANNELS];

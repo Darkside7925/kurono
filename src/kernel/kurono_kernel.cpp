@@ -91,6 +91,7 @@
 #include "../drivers/amd_gpu.h"
 #include "../drivers/intel_gpu.h"
 #include "../drivers/display_mgr.h"
+#include "../drivers/virtio_gpu.h"   // bring up the virtio gpu so DisplayManager can select the accelerated backend (satoru)
 #include "../drivers/ac97.h"
 #include "../drivers/cpu_detect.h"
 #include "../drivers/gpu_probe.h"
@@ -1089,9 +1090,24 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
     multiboot_info_t* mbi = (multiboot_info_t*)mb_addr;
 
+    // 1000 Hz PIT: a fine tick is needed so SleepMs-based process wakeups
+    // (input/cursor at ~8ms) are timely -> smooth 60fps. The ~2000 timer
+    // VM-exits/sec this costs is ~0.4% cpu (negligible; the big VM-exit
+    // sources  -  input double-poll, idle non-HLT, audio polling  -  are fixed
+    // separately). The ms clock is TSC-based regardless of tick rate. (satoru)
     Timer::Init(1000);
     TimeManager::SelectPIT(1000);
     TimeManager::Init();
+
+    // Calibrate the TSC NOW (right after the PIT), not late in boot. Timer::
+    // GetRealMs()/WaitMs() prefer the TSC, and the boot splash + other early
+    // delays call WaitMs() long before this used to run. Without the TSC,
+    // WaitMs falls back to the polled PIT clock, which LOSES timer periods
+    // under hardware hypervisors (WHPX/VMware) where each port read VM-exits
+    // and host scheduling delays the poll  -  so the "~3s" splash stretched to
+    // 15s on WHPX and minutes on VMware (the black screen after the logo).
+    // CPUDetect::Init calibrates the TSC via the precise PIT ch2 one-shot. (satoru)
+    CPUDetect::Init();
 
     // note: interrupts stay disabled. the kernel is fully polling-based
     // (pit counter read, keyboard/mouse i/o ports). this avoids whpx
@@ -1451,23 +1467,27 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         Graphics::SwapBuffers();
         SerialLogger::Log("Boot splash: logo displayed\r\n");
 
-        // animate loading bar over ~3 seconds (60 steps x 50ms)
-        for (int step = 1; step <= 60; step++) {
-            int fill_w = (step * bar_w) / 60;
+        // animate loading bar over ~1 second (24 steps x 40ms). kept short on
+        // purpose: this is cosmetic and runs before the desktop, so it's dead
+        // time. WaitMs is now TSC-accurate (CPUDetect ran early), so this is a
+        // real ~1s, not the multi-minute overshoot it used to be on VMware.
+        // (satoru)
+        for (int step = 1; step <= 24; step++) {
+            int fill_w = (step * bar_w) / 24;
             for (int px = 0; px < fill_w; px++) {
                 uint32_t c = 0xFFD8D8D8;
                 for (int py = 0; py < bar_h; py++)
                     Graphics::DrawPixel(bar_x + px, bar_y + py, c);
             }
             Graphics::SwapBuffers();
-            Timer::WaitMs(50);
+            Timer::WaitMs(40);
         }
 
         // brief pause then smooth clear
-        Timer::WaitMs(200);
+        Timer::WaitMs(80);
         Graphics::Clear(0xFF000000);
         Graphics::SwapBuffers();
-        Timer::WaitMs(150);
+        Timer::WaitMs(60);
         SerialLogger::Log("Boot splash complete\r\n");
     }
 
@@ -1521,17 +1541,19 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
     }
 
-    // fallback: use embedded wallpaper if no module wallpaper loaded
+    // fallback: use the embedded wallpaper if no module wallpaper loaded. it is
+    // stored as pre-decoded raw rgba (decoded on the host) so we skip the
+    // freestanding image decoder, which corrupts a band of rows on large
+    // images. just point the Image at the rodata. (satoru)
     if (has_display && !wallpaper.valid) {
-        SerialLogger::Log("Loading embedded wallpaper...\r\n");
-        uint32_t wp_start = (uint32_t)(uintptr_t)wallpaper_png_data;
-        uint32_t wp_end = wp_start + wallpaper_png_size;
-        wallpaper = MediaDecoder::DecodeModule(wp_start, wp_end);
-        if (wallpaper.valid) {
-            SerialLogger::Log("Embedded wallpaper decoded OK\r\n");
-        } else {
-            SerialLogger::Log("Embedded wallpaper decode FAILED\r\n");
-        }
+        SerialLogger::Log("Loading embedded wallpaper (raw rgba)...\r\n");
+        wallpaper.width  = (int)wallpaper_rgba_w;
+        wallpaper.height = (int)wallpaper_rgba_h;
+        wallpaper.data   = (uint8_t*)wallpaper_rgba_data;
+        wallpaper.valid  = true;
+        wallpaper.order  = 0;   // rgba
+        wallpaper.owns   = false;
+        SerialLogger::Log("Embedded wallpaper ready\r\n");
     }
 
     if (has_display) {
@@ -2178,6 +2200,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (wallpaper.valid) {
             Desktop::SetWallpaperImage(wallpaper);
         }
+        // honour a persisted builtin-wallpaper choice (boot default is index 0 =
+        // the primary embedded wallpaper). config + desktop are both up here, so
+        // switching to the secondary is safe. (satoru)
+        if (UIConfig::Int("desktop.wallpaper_index", 0) == 1) {
+            Desktop::ApplyBuiltinWallpaper(1);
+        }
 
         // First-boot detection: if we've never been installed, run the
         // graphical installer before the lockscreen.  The installer either
@@ -2331,6 +2359,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::Log("[GPU] Intel iGPU driver skipped (no Intel iGPU present)\r\n");
     }
 
+    // bring up the virtio gpu driver first: it probes pci, sets up the
+    // virtqueues, and sets IsDetected() so the display manager can select the
+    // accelerated backend below. no-op (returns false) when no virtio gpu is
+    // present (e.g. -vga std), so the default path is unchanged. (satoru)
+    SerialLogger::Log("[VirtIOGPU] Init...\r\n");
+    if (VirtIOGPU::Init()) {
+        SerialLogger::Log("[VirtIOGPU] device ready -- accelerated backend available\r\n");
+    }
+
     // initialize unified display manager
     // detects the active backend and enables runtime resolution switching.
     SerialLogger::Log("[DisplayMgr] Init...\r\n");
@@ -2361,7 +2398,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
     // initialize cpu feature detection
     SerialLogger::Log("[CPU] Detecting CPU features...\r\n");
-    CPUDetect::Init();
+    // CPUDetect::Init() already ran right after Timer::Init (for the TSC clock);
+    // just print the detected info here. (satoru)
     CPUDetect::PrintInfo();
 
     if (boot_cli) {
