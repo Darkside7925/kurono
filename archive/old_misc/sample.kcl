@@ -1,0 +1,44 @@
+#!/usr/bin/env kcl
+# Sample KCL script demonstrating basic functionality
+
+# Set environment variables
+set USER = "kurono"
+set HOME = "/home/kurono"
+set PATH = "/kurono/bin:/usr/bin:/bin"
+
+# Display system information
+echo "Kurono OS - Hybrid Kernel System"
+echo "User: $USER"
+echo "Home: $HOME"
+echo "Path: $PATH"
+
+# Test cross-environment commands
+echo "Testing Linux commands:"
+ls -la /kurono
+
+echo "Testing Windows commands:"
+dir C:\\kurono
+
+echo "Testing Kurono native commands:"
+kurono --version
+
+# Package management
+echo "Installing sample packages..."
+install coreutils
+install bash
+install vim
+
+# Security test
+echo "Testing SUPR mode..."
+supr enable
+echo "SUPR mode enabled"
+supr disable
+
+# File operations
+mkdir /kurono/test
+touch /kurono/test/file.txt
+echo "Hello Kurono OS" > /kurono/test/file.txt
+cat /kurono/test/file.txt
+rm -rf /kurono/test
+
+echo "KCL script execution completed successfully!"

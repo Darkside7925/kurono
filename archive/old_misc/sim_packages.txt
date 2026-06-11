@@ -1,0 +1,6 @@
+install coreutils
+list
+search core
+remove coreutils
+list
+exit

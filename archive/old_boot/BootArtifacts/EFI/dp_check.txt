@@ -1,0 +1,1 @@
+select vdisk file="D:\Kurono\Kurnon OS\BootArtifacts\KuronoSystem.vhd"\nattach vdisk readonly\nlist vdisk\ndetach vdisk\nexit

@@ -1,0 +1,12 @@
++ set gfxmode=auto
++ set menu_color_normal=white/black
++ set menu_color_highlight=yellow/black
++ wallpaper: background.png
++ terminal: gfxterm
++ progress_bar {
+  id = 'timeout'
+  left = 40%
+  top = 90%
+  width = 20%
+  height = 2%
+}

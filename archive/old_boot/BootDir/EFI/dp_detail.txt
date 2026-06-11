@@ -1,0 +1,4 @@
+select vdisk file="D:\Kurono\Kurnon OS\BootArtifacts\KuronoSystem.vhd"
+detail vdisk
+detach vdisk
+exit

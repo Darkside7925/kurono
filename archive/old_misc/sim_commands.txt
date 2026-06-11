@@ -1,0 +1,10 @@
+help
+version
+env
+switch linux
+ls
+switch windows
+dir
+switch kurono
+kcl sample.kcl
+exit

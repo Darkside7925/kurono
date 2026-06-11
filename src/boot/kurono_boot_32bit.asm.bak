@@ -1,0 +1,54 @@
+; Kurono OS Bootloader
+; Multiboot compliant bootloader for standalone Kurono OS
+; NOTE: Uses short section names (<=8 chars) for COFF -f win32 compatibility
+
+MBALIGN  equ  1 << 0            ; align loaded modules on page boundaries
+MEMINFO  equ  1 << 1            ; provide memory map
+VIDEO    equ  1 << 2            ; request video mode
+FLAGS    equ  MBALIGN | MEMINFO | VIDEO
+MAGIC    equ  0x1BADB002        ; 'magic number' lets bootloader find the header
+CHECKSUM equ -(MAGIC + FLAGS)   ; checksum of above, to prove we are multiboot
+
+section .mboot
+align 4
+    dd MAGIC
+    dd FLAGS
+    dd CHECKSUM
+    dd 0, 0, 0, 0, 0 ; header_addr, load_addr, load_end_addr, bss_end_addr, entry_addr
+    dd 0             ; mode_type (0 = linear graphics)
+    dd 1024          ; width
+    dd 768           ; height
+    dd 32            ; depth
+
+section .stk, nobits
+align 4
+    stack_bottom:
+    resb 16384 ; 16 KiB stack
+    stack_top:
+
+section .text
+global _start
+_start:
+    mov esp, stack_top
+    
+    ; Save Multiboot registers and push arguments for kernel_main
+    push ebx ; Push Multiboot Info Address (2nd arg)
+    push eax ; Push Magic Number (1st arg)
+    
+    ; Clear BSS
+    extern kernel_bss_start
+    extern kernel_bss_end
+    mov edi, kernel_bss_start
+    mov ecx, kernel_bss_end
+    sub ecx, kernel_bss_start
+    xor eax, eax
+    rep stosb
+    
+    ; Call kernel main
+    extern kernel_main
+    call kernel_main
+    
+    ; Halt if kernel returns
+    cli
+.hang:	hlt
+    jmp .hang

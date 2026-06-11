@@ -1,0 +1,22 @@
+{
+  "files": [
+    {
+      "sha256": "037D164BC3F3F49CFF0DFA74065E1728C56C82D84C7D25B59B251E51A434AA00",
+      "path": "\\Drivers\\Mouse\\mouse.o"
+    },
+    {
+      "sha256": "388EFB9FAA210EB17767F905B3A552DBB56C3E687AB5EA8F6E093B7EB1BAC927",
+      "path": "\\Drivers\\Mouse\\mouse.cpp"
+    },
+    {
+      "sha256": "35D3F57523BEEF1F295056E67A4ACD016B8CE86C1AF094AC3E5321B98C97E557",
+      "path": "\\Drivers\\Mouse\\mouse.h"
+    },
+    {
+      "sha256": "90D5E2BDA0BCB1EB83AE8E96A056BF8EAC2FF2F628E84ADABF4527A7870A2357",
+      "path": "\\Config\\mouse.cfg"
+    }
+  ],
+  "version": "1.0.0",
+  "driver": "mouse"
+}
