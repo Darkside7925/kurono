@@ -81,5 +81,29 @@ namespace W {
     bool RectHit(int x, int y, int w, int h, int mx, int my);
 }
 
+// ── animation engine ────────────────────────────────────────────────────────
+// declarative tweening for the immediate-mode ui: a widget asks for a value that
+// eases toward a `target`, keyed by a stable `id`. the engine remembers per-id
+// state across frames, so callers stay stateless. think of it as the "smooth
+// animations" half of the kss style/motion combo (scripting/behavior is handled
+// by the existing python/kcl interpreters, not a bespoke js engine). (satoru)
+namespace Anim {
+    enum Ease { Linear = 0, OutCubic = 1, InOutQuint = 2, Spring = 3 };
+
+    // advance the clock; call once per frame BEFORE any Float()/Color() reads, and
+    // evict ids not touched recently so the table never fills. (satoru)
+    void Tick(uint32_t now_ms);
+    // true while any tween is still in flight  -  wire into the compositor's
+    // keep-rendering gate so motion doesn't freeze mid-animation. (satoru)
+    bool Active();
+
+    // current value of a float that eases toward `target` over `dur_ms`. first
+    // sight of an id seeds at `target` (no jump); a changed target animates from
+    // the live value. `id` is any stable key (e.g. a widget address + sub-index). (satoru)
+    float    Float(uint32_t id, float target, uint32_t dur_ms, Ease e);
+    // same, for an argb color (channel-lerped). (satoru)
+    uint32_t Color(uint32_t id, uint32_t target, uint32_t dur_ms, Ease e);
+}
+
 } // namespace KSS
 // end (satoru)

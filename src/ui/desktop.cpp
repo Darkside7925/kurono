@@ -20,6 +20,7 @@
 #include "../media/mediadecoder.h"   // MediaDecoder::Image type for the wallpaper (satoru)
 #include "wallpaper.h"               // wallpaper_rgba_data  -> builtin index 0 (satoru)
 #include "wallpaper2.h"              // wallpaper2_rgba_data -> builtin index 1 (satoru)
+#include "app_icons.h"               // flat vector app icons (replaces letter glyphs) (satoru)
 #include "../apps/terminal.h"
 #include "../apps/file_manager.h"
 #include "../apps/calculator.h"
@@ -286,11 +287,9 @@ void Taskbar::RenderStartButton(){
     // K logo button, anchored to the floating bar's left edge.
     int btn_w = 44, btn_h = TASKBAR_HEIGHT - 10;
     int bx = tb_bar_x() + 6, by = y_pos + 5;
-    // dark themed button so the (grey) boot emblem reads like the splash. (satoru)
-    unsigned int clr = (hover_button==0) ? 0xFF34343C : 0xFF222228;
-    Graphics::FillRoundedRect(bx, by, btn_w, btn_h, 8, clr);
-    // soft inner highlight for a more "tactile" feel
-    Graphics::FillRect(bx+1, by+1, btn_w-2, 1, 0x30FFFFFF);
+    // transparent start button: the boot emblem sits directly on the bar (no box).
+    // only a faint translucent highlight on hover so there's still a hover cue. (satoru)
+    if (hover_button == 0) Graphics::FillRectAlpha(bx, by, btn_w, btn_h, 30, 0xFFFFFF);
     // kurono boot logo (the angular emblem from the splash screen), cropped to
     // its bounding box in logo_data and scaled to fill the button  -  replaces the
     // old hand-drawn "k". (satoru)
@@ -330,9 +329,11 @@ static void tb_render_quick_launch(){
         int ih = TB_PIN_SZ + pop*2;
         Graphics::FillRoundedRect(ix, iy, iw, ih, 7, tb_pinned[i].colour);
         Graphics::FillRect(ix+1, iy+1, iw-2, 1, 0x55FFFFFF);
-        char letter[2] = { tb_pinned[i].glyph, 0 };
-        Graphics::DrawString(ix + (iw - 8)/2, iy + (ih - 14)/2 + 1,
-                             letter, 0xFFFFFFFF, 0x00000000);
+        // flat vector glyph in place of the old first-letter draw, inset a few
+        // px so the tile color frames it. (satoru)
+        int gpad = iw / 6;
+        AppIcons::Draw(AppIcons::IdForName(tb_pinned[i].name),
+                       ix + gpad, iy + gpad, iw - gpad*2);
 
         // running indicator: any window whose title starts with the glyph.
         bool running = false;
@@ -410,7 +411,7 @@ void Taskbar::RenderTaskButtons(){
             Graphics::FillRect(x+8, y_pos+TASKBAR_HEIGHT-4, bw-16, 3, COL_START_BTN);
         }
 
-        // app icon  -  colored rounded square with first letter
+        // app icon  -  colored rounded square with a flat vector glyph (satoru)
         unsigned int ic = 0xFF3498DB;
         char c0 = w->title[0];
         if(c0=='T') ic = 0xFF2ECC71;
@@ -423,8 +424,12 @@ void Taskbar::RenderTaskButtons(){
         else if(c0=='M') ic = 0xFFE91E63;
 
         Graphics::FillRoundedRect(x+6, y_pos+10, bw-12, TASKBAR_HEIGHT-20, 5, ic);
-        char letter[2] = {c0, 0};
-        Graphics::DrawString(x+13, y_pos+13, letter, COL_WHITE, 0xFF000000);
+        // vector glyph mapped from the window title (the title carries the app
+        // name, so IdForName picks the right icon). inset inside the tile. (satoru)
+        int tile = TASKBAR_HEIGHT-20;
+        int gpad = tile / 6;
+        AppIcons::Draw(AppIcons::IdForName(w->title),
+                       x+6 + gpad, y_pos+10 + gpad, tile - gpad*2);
 
         x += bw + gap;
     }
@@ -594,6 +599,14 @@ void Taskbar::RenderStartMenu(){
         0xFF3498DB, 0xFFE91E63, 0xFF607D8B, 0xFF00BCD4,
         0, 0xFF5C8AFF, 0xFFFFA726, 0xFFFF5252,
     };
+    // per-row vector icon for the app launchers (rows 0..7). the separator and
+    // the session-control rows (restart/sign out/shutdown) keep their accent bar
+    // and carry no icon (-1). (satoru)
+    static const int item_icons[] = {
+        AppIcons::TERMINAL, AppIcons::FILES, AppIcons::CALCULATOR, AppIcons::EDITOR,
+        AppIcons::BROWSER,  AppIcons::MEDIA, AppIcons::SETTINGS,   AppIcons::TASKS,
+        -1, -1, -1, -1,
+    };
     static const int nit = 12;
 
     int iy = my0 + 56;
@@ -603,9 +616,17 @@ void Taskbar::RenderStartMenu(){
             iy += 12;
             continue;
         }
-        if (item_accents[i])
-            Graphics::FillRoundedRect(mx0+8, iy+4, 3, 20, 1, item_accents[i]);
-        Graphics::DrawString(mx0+20, iy+4, items[i], COL_ICON_TEXT, 0xFF000000);
+        if (item_icons[i] >= 0){
+            // 24px vector glyph on the left; text shifts right to clear it. the
+            // accent bar is dropped here since the icon already carries the
+            // accent color. (satoru)
+            AppIcons::Draw(item_icons[i], mx0+12, iy+1, 24);
+            Graphics::DrawString(mx0+44, iy+4, items[i], COL_ICON_TEXT, 0xFF000000);
+        } else {
+            if (item_accents[i])
+                Graphics::FillRoundedRect(mx0+8, iy+4, 3, 20, 1, item_accents[i]);
+            Graphics::DrawString(mx0+20, iy+4, items[i], COL_ICON_TEXT, 0xFF000000);
+        }
         iy += 32;
     }
     Graphics::MarkDirty(mx0-2, my0-2, START_MENU_W+8, draw_h+10);
@@ -1666,40 +1687,16 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     // inner highlight (top glossy shine  -  lighter version of top color)
     // skip: these used alpha blending and are expensive, icon already looks good
 
-    // icon-specific symbols
-    int cx = ix + icon_sz/2;
-    int cy_icon = iy + icon_sz/2;
-    if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') {
-        Graphics::DrawString(cx-10, cy_icon-6, ">_", 0xFFFFFFFF, 0xFF000000);
-    } else if(nm[0]=='F' && nm[1]=='i') {
-        // folder
-        Graphics::FillRoundedRect(ix+12, iy+16, 28, 20, 3, 0xFFFFCC80);
-        Graphics::FillRect(ix+12, iy+16, 14, 5, 0xFFE0A050);
-    } else if(nm[0]=='C' && nm[1]=='o') {
-        Graphics::DrawString(cx-11, cy_icon-6, "<>", 0xFFFFFFFF, 0xFF000000);
-        Graphics::FillRect(ix+18, iy+30, 20, 3, 0xFFDDE7FF);
-    } else if(nm[0]=='C') {
-        // calculator grid
-        Graphics::FillRect(ix+12, iy+10, 28, 8, 0xFF1E88E5);
-        for(int r=0;r<2;r++) for(int c=0;c<3;c++)
-            Graphics::FillRoundedRect(ix+14+c*9, iy+22+r*9, 7, 7, 2, 0xFFFFFFFF);
-    } else if(nm[0]=='E') {
-        // text lines
-        Graphics::FillRect(ix+14, iy+14, 24, 3, 0xFFEEEEEE);
-        Graphics::FillRect(ix+14, iy+20, 18, 3, 0xFFCCCCCC);
-        Graphics::FillRect(ix+14, iy+26, 22, 3, 0xFFEEEEEE);
-        Graphics::FillRect(ix+14, iy+32, 14, 3, 0xFFCCCCCC);
-    } else if(nm[0]=='S') {
-        // gear
-        Graphics::FillCircle(cx, cy_icon, 14, 0xFF78909C);
-        Graphics::FillCircle(cx, cy_icon, 8, 0xFFCFD8DC);
-        Graphics::FillCircle(cx, cy_icon, 4, 0xFF78909C);
-    } else if(nm[0]=='H') {
-        // house
-        Graphics::FillRect(ix+16, iy+24, 20, 14, 0xFFFFCC80);
-        Graphics::FillRect(ix+12, iy+20, 28, 4, 0xFFE0A050);
-        Graphics::FillRect(ix+16, iy+16, 20, 4, 0xFFE0A050);
-    }
+    // flat vector glyph centered on the tile (replaces the old per-name symbol
+    // block). desktop file/folder entries carry arbitrary filenames, so map by
+    // icon_type first (0=file -> document, 1=folder -> files); app/system
+    // entries (2/3) map by name. the glyph follows the lifted tile y. (satoru)
+    int gid;
+    if(ic->icon_type==1)       gid = AppIcons::FILES;
+    else if(ic->icon_type==0)  gid = AppIcons::EDITOR;
+    else                       gid = AppIcons::IdForName(nm);
+    int gpad = (icon_sz * 5 + 14) / 28;           // ~18% inset so glyph fills ~64% (satoru)
+    AppIcons::Draw(gid, ix + gpad, iy + gpad, icon_sz - gpad*2);
 
     // label  -  centered below the un-lifted icon position so it stays put.
     char lbl[14]; scpy(lbl, ic->name, 13);
@@ -1995,7 +1992,13 @@ void DesktopEnvironment::Render(){
     // recompose ONLY the moving window each frame over a one-time snapshot of
     // everything else, instead of re-blitting the wallpaper and every window /
     // panel. that is what gives the drag steady frame times. (satoru)
-    if (WindowManager::IsWindowDragActive() && de_drag_backdrop_safe()){
+    //
+    // DISABLED: on the gtk/virtio-gpu present path this backdrop fast-path blacked
+    // out the whole desktop while dragging (the partial backdrop blit + damage left
+    // the non-footprint area unrepainted). drag now falls through to a full
+    // recompose each frame  -  correct, just a little more work per frame. re-enable
+    // only once the backdrop capture/present is reworked to cover the full scene. (satoru)
+    if (false && WindowManager::IsWindowDragActive() && de_drag_backdrop_safe()){
         if (WindowManager::DragBackdropReady()){
             // common case: blit backdrop + redraw just the dragged window.
             WindowManager::RenderDragFast();
