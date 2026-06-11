@@ -22,7 +22,21 @@ kurono.iso
 *.iso
 build/kurono.elf
 
-# Agent memory (Copilot session/repo notes)
+# local notes / scratch
 memories/
 /memories
 /sources/
+*.raw
+*.log
+*.avif
+shot_*.png
+serial_*.log
+qemu_err.log
+qmp_*.py
+*.raw
+*.log
+*.avif
+shot_*.png
+serial_*.log
+qemu_err.log
+qmp_*.py

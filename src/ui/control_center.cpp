@@ -4,6 +4,7 @@
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
 #include "font.h"
+#include "kss.h"
 #include "../net/network.h"
 #include "../system/user_mgmt.h"
 #include "desktop.h"
@@ -298,8 +299,13 @@ static void DrawTileAnimated(int slot, int x, int y, int w, int h,
     float color_t = (since_state >= COLOR_DUR_MS) ? 1.0f
                   : Animation::Ease((float)since_state / (float)COLOR_DUR_MS,
                                     Animation::EaseOutCubic);
-    uint32_t from = active ? 0xFF1E1E2E : accent;
-    uint32_t to   = active ? accent     : 0xFF1E1E2E;
+    // themed: inactive tiles are the raised surface, active tiles fill with the
+    // user accent for a cohesive black/grey + accent look. (satoru)
+    uint32_t surf = KSS::T().surface_hi;
+    uint32_t acc  = KSS::Accent();
+    (void)accent;
+    uint32_t from = active ? surf : acc;
+    uint32_t to   = active ? acc  : surf;
     uint32_t bg   = Animation::LerpColor(from, to, (uint8_t)(color_t * 255.0f + 0.5f));
 
     // tactile press  -  spring scale starting at 0.92, settling to 1.0
@@ -325,10 +331,10 @@ static void DrawTileAnimated(int slot, int x, int y, int w, int h,
     Graphics::FillRectRounded(rx + 1, ry + 1, rw - 2, 2, 1,
                               active ? 0x40FFFFFF : 0x10FFFFFF);
 
-    if (!active) Graphics::FillCircle(rx + 14, ry + rh / 2, 5, accent);
+    if (!active) Graphics::FillCircle(rx + 14, ry + rh / 2, 5, acc);
 
-    uint32_t txt = active ? 0xFFFFFFFF : 0xFFE0E0F0;
-    uint32_t sub_col = active ? 0xCCFFFFFF : 0xFF7878A0;
+    uint32_t txt = active ? KSS::T().white : KSS::T().text;
+    uint32_t sub_col = active ? 0xCCFFFFFF : KSS::T().text_dim;
     int tx = rx + 28;
     if (label) Graphics::DrawString(tx, ry + 8, label, txt, 0xFF000000);
     if (sub)   Graphics::DrawString(tx, ry + rh - 16, sub, sub_col, 0xFF000000);
@@ -352,28 +358,29 @@ void ControlCenter::DrawTile(int x, int y, int w, int h, const char* label,
 void ControlCenter::DrawSlider(int x, int y, int w, const char* label, int pct, uint32_t fill){
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     if (w < 16) return;
-    if (label) Graphics::DrawString(x, y, label, 0xFFB0B0C8, 0xFF000000);
+    if (label) Graphics::DrawString(x, y, label, KSS::T().text_dim, 0xFF000000);
     int track_y = y + 18;
     int track_h = 8;
-    Graphics::FillRoundedRect(x, track_y, w, track_h, 4, 0xFF252538);
+    Graphics::FillRoundedRect(x, track_y, w, track_h, 4, KSS::T().track);
     int fw = (pct * w) / 100;
     if (fw > 0) Graphics::FillRoundedRect(x, track_y, fw, track_h, 4, fill);
     int knob_x = x + fw - 8;
     if (knob_x < x) knob_x = x;
     if (knob_x > x + w - 16) knob_x = x + w - 16;
-    Graphics::FillCircle(knob_x + 8, track_y + track_h/2, 8, 0xFFFFFFFF);
+    Graphics::FillCircle(knob_x + 8, track_y + track_h/2, 8, KSS::T().white);
 
     char pct_buf[8] = {0};
     int_to_str(pct, pct_buf, 6);
     int p = slen(pct_buf);
     if (p < 6) { pct_buf[p] = '%'; pct_buf[p+1] = 0; }
-    int pw = slen(pct_buf) * 8;
-    Graphics::DrawString(x + w - pw, y, pct_buf, 0xFFE0E0F0, 0xFF000000);
+    // measure proper proportional width instead of assuming 8px/char. (satoru)
+    int pw = FontTTF::Measure(KSS::BodyPx(), pct_buf);
+    Graphics::DrawString(x + w - pw, y, pct_buf, KSS::T().text, 0xFF000000);
 }
 
 void ControlCenter::DrawUserCard(int x, int y, int w){
     if (w <= 0) return;
-    Graphics::FillRoundedRect(x, y, w, 64, 12, 0xFF1A1A2C);
+    Graphics::FillRoundedRect(x, y, w, 64, 12, KSS::T().surface_hi);
 
     int user_count = UserManager::GetUserCount();
     User* u = nullptr;
@@ -401,7 +408,7 @@ void ControlCenter::DrawUserCard(int x, int y, int w){
         if (u->display_name[0]) name = u->display_name;
         else if (u->username[0]) name = u->username;
     }
-    Graphics::DrawString(x + 64, y + 14, name, 0xFFF0F0FF, 0xFF000000);
+    Graphics::DrawString(x + 64, y + 14, name, KSS::T().text, 0xFF000000);
 
     char uline[40] = {0};
     if (u){
@@ -412,7 +419,7 @@ void ControlCenter::DrawUserCard(int x, int y, int w){
     } else {
         scpy(uline, "Guest session", sizeof(uline));
     }
-    Graphics::DrawString(x + 64, y + 32, uline, 0xFF7878A0, 0xFF000000);
+    Graphics::DrawString(x + 64, y + 32, uline, KSS::T().text_dim, 0xFF000000);
 
     int btn_y = y + 76;
     int bw = (w - 24) / 3;
@@ -430,18 +437,21 @@ void ControlCenter::DrawUserCard(int x, int y, int w){
         return 0.92f + (1.0f - 0.92f) * s;
     };
 
-    DrawRoundedTile(lock_x,     lock_y,     lock_w,     lock_h, 8, 0xFF222238, press_scale(SLOT_LOCK));
-    DrawRoundedTile(settings_x, settings_y, settings_w, settings_h, 8, 0xFF222238, press_scale(SLOT_SETTINGS));
-    DrawRoundedTile(signout_x,  signout_y,  signout_w,  signout_h, 8, 0xFFE74C3C, press_scale(SLOT_SIGNOUT));
+    DrawRoundedTile(lock_x,     lock_y,     lock_w,     lock_h, 8, KSS::T().surface_hi, press_scale(SLOT_LOCK));
+    DrawRoundedTile(settings_x, settings_y, settings_w, settings_h, 8, KSS::T().surface_hi, press_scale(SLOT_SETTINGS));
+    DrawRoundedTile(signout_x,  signout_y,  signout_w,  signout_h, 8, 0xFFE0584E, press_scale(SLOT_SIGNOUT));
 
-    Graphics::DrawString(lock_x + (lock_w - 4*8)/2,         lock_y + 11,    "Lock",     0xFFE0E0F0, 0xFF000000);
-    Graphics::DrawString(settings_x + (settings_w - 8*8)/2, settings_y + 11, "Settings", 0xFFE0E0F0, 0xFF000000);
-    Graphics::DrawString(signout_x + (signout_w - 8*8)/2,   signout_y + 11, "Sign Out", 0xFFFFFFFF, 0xFF000000);
+    // centered labels measured via fontttf (no fixed 8px/char assumption). (satoru)
+    float bp = KSS::BodyPx();
+    FontTTF::DrawStringCenter(lock_x + lock_w/2,         lock_y + 9,     bp, "Lock",     KSS::T().text);
+    FontTTF::DrawStringCenter(settings_x + settings_w/2, settings_y + 9, bp, "Settings", KSS::T().text);
+    FontTTF::DrawStringCenter(signout_x + signout_w/2,   signout_y + 9,  bp, "Sign Out", KSS::T().white);
 }
 
 void ControlCenter::DrawHeader(int x, int y, int w) {
     (void)w;
-    Graphics::DrawString(x, y, "Control Center", 0xFFF0F0FF, 0xFF000000);
+    // larger heading in the theme heading color for a modern panel title. (satoru)
+    FontTTF::DrawString(x, y - 2, 20.0f, "Control Center", KSS::T().heading);
 }
 
 // main render -------------------------------------------------------------
@@ -466,12 +476,13 @@ void ControlCenter::Render(){
         }
     }
 
-    // shadow
-    Graphics::FillRoundedRect(draw_x + 6, draw_y + 8, panel_w, panel_h, 16, 0xC0000000);
-    // body
-    Graphics::FillRoundedRect(draw_x, draw_y, panel_w, panel_h, 16, 0xFF12121E);
+    // soft drop shadow
+    Graphics::ApplyShadow(draw_x, draw_y, panel_w, panel_h, 0, 8, 110);
+    // body (themed card) + hairline border
+    Graphics::FillRoundedRect(draw_x, draw_y, panel_w, panel_h, 16, KSS::T().surface);
+    Graphics::DrawRect(draw_x, draw_y, panel_w, panel_h, KSS::T().border);
     // top accent bar
-    Graphics::FillRect(draw_x + 16, draw_y + 1, panel_w - 32, 2, 0xFF5C8AFF);
+    Graphics::FillRect(draw_x + 16, draw_y + 1, panel_w - 32, 2, KSS::Accent());
 
     int x = draw_x + 16;
     int y = draw_y + 18;
@@ -507,7 +518,7 @@ void ControlCenter::Render(){
     y += tile_h + 18;
 
     bright_track_x = x; bright_track_y = y + 18; bright_track_w = inner_w;
-    DrawSlider(x, y, inner_w, "Brightness", brightness_pct, 0xFFF1C40F);
+    DrawSlider(x, y, inner_w, "Brightness", brightness_pct, KSS::Accent());
     y += 38;
 
     int vol_pct = Audio::IsAvailable() ? Audio::GetMasterVolume() : 80;
@@ -515,7 +526,7 @@ void ControlCenter::Render(){
     if (vol_pct > 100) vol_pct = 100;
     if (Audio::IsAvailable() && Audio::IsMuted()) vol_pct = 0;
     vol_track_x = x; vol_track_y = y + 18; vol_track_w = inner_w;
-    DrawSlider(x, y, inner_w, "Volume", vol_pct, 0xFF2ECC71);
+    DrawSlider(x, y, inner_w, "Volume", vol_pct, KSS::Accent());
     y += 42;
 
     DrawUserCard(x, y, inner_w);

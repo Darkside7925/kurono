@@ -201,6 +201,12 @@ public:
     // dispatch reports to the keyboard / mouse drivers (satoru).
     static void PollHID();
 
+    // native usb hid input toggle (settings -> devices). when off, enumerated
+    // usb keyboards/mice/tablets still stay alive but their reports are not
+    // forwarded to the input stack, so the ps/2 path takes over. (satoru)
+    static void SetHIDInputEnabled(bool on);
+    static bool IsHIDInputEnabled();
+
     static void DumpInfo(char* out, int max_len);
 
 private:

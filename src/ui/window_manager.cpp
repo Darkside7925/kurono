@@ -1007,10 +1007,10 @@ void WindowManager::RenderTitlebar(Window* win) {
         int title_w = len * 8;
         int title_x = title_area_start + (title_area_end - title_area_start - title_w) / 2;
         if (title_x < title_area_start) title_x = title_area_start;
-        Graphics::SetClipRect(title_area_start, wy,
+        Graphics::PushClipRect(title_area_start, wy,
                               title_area_end - title_area_start, WM_TITLEBAR_H);
         Graphics::DrawString(title_x, wy + (WM_TITLEBAR_H - 12) / 2, win->title, text_col, 0x00000000);
-        Graphics::ClearClipRect();
+        Graphics::PopClipRect();
     }
 
     if (focused && ww > 2 * WM_CORNER_RADIUS) {
@@ -1223,10 +1223,10 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
     // content (clipped to content area so text doesn't bleed outside when the
     // user shrinks the window below the content's natural size)
     if (win->render && win->content_w > 0 && win->content_h > 0) {
-        Graphics::SetClipRect(win->content_x, win->content_y,
+        Graphics::PushClipRect(win->content_x, win->content_y,
                               win->content_w, win->content_h);
         win->render(win, win->content_x, win->content_y, win->content_w, win->content_h);
-        Graphics::ClearClipRect();
+        Graphics::PopClipRect();
     }
 }
 

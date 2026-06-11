@@ -292,7 +292,10 @@ bool Calculator::Input(int mx, int my, bool clicked, char key) {
     if (!active) return false;
 
     if (clicked) {
-        int idx = calc_hit_test_button(window_x, window_y, window_w, window_h, mx, my);
+        // mx,my arrive window-local from the wm input callback, but draw uses the
+        // global window_x/window_y origin  -  hit-test in the same local space (0,0)
+        // so clicks land on the right buttons (this was the "calculator broken" bug). (satoru)
+        int idx = calc_hit_test_button(0, 0, window_w, window_h, mx, my);
         if (idx >= 0) {
             selected_button = idx;
             press_button = idx;

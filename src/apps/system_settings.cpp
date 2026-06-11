@@ -38,20 +38,22 @@ static const SettingsModule* g_modules[] = {
 };
 static const int g_module_count = (int)(sizeof(g_modules) / sizeof(g_modules[0]));
 
-// ── shell palette (also surfaced to modules via SettingsUI::COL_*) ──────────
-static const unsigned int SH_BG       = 0xFF1A1A2E;
-static const unsigned int SH_SIDEBAR  = 0xFF16213E;
-static const unsigned int SH_SEL_BG   = 0xFF0F3460;
-static const unsigned int SH_HOVER_BG = 0xFF1E2A4A;
-static const unsigned int SH_HEADER   = 0xFF13182B;
-static const unsigned int SH_TEXT     = 0xFFE0E0E0;
-static const unsigned int SH_DIM      = 0xFF9099AA;
-static const unsigned int SH_HEADING  = 0xFF00D2FF;
-static const unsigned int SH_BORDER   = 0xFF2A3350;
-static const unsigned int SH_ON       = 0xFF00C853;
-static const unsigned int SH_OFF      = 0xFF444466;
+// ── shell palette: modern black/grey chrome (matches the kss theme defaults so
+// settings is consistent with the control center). headings are white instead of
+// cyan; interactive highlights still use the user's theme.accent. (satoru)
+static const unsigned int SH_BG       = 0xFF1B1B1D;
+static const unsigned int SH_SIDEBAR  = 0xFF202023;
+static const unsigned int SH_SEL_BG   = 0xFF323238;
+static const unsigned int SH_HOVER_BG = 0xFF2A2A2E;
+static const unsigned int SH_HEADER   = 0xFF202023;
+static const unsigned int SH_TEXT     = 0xFFF0F0F2;
+static const unsigned int SH_DIM      = 0xFF9A9AA2;
+static const unsigned int SH_HEADING  = 0xFFF0F0F2;
+static const unsigned int SH_BORDER   = 0xFF3A3A40;
+static const unsigned int SH_ON       = 0xFF32D74B;
+static const unsigned int SH_OFF      = 0xFF48484E;
 static const unsigned int SH_WHITE    = 0xFFFFFFFF;
-static const unsigned int SH_TRACK    = 0xFF333355;
+static const unsigned int SH_TRACK    = 0xFF3A3A40;
 
 static unsigned int sh_accent() { return UIConfig::Color("theme.accent", 0xFF3498DB); }
 
@@ -151,9 +153,9 @@ static void render_content(int x, int y, int w, int h){
     // clip the module's drawing to the body rect so scrolled-out content never
     // bleeds over the header / other windows. the module renders at body_x with
     // its own y running from body_y, already offset by `sc`. (satoru)
-    Graphics::SetClipRect(body_x, body_y, inner_w, body_h);
+    Graphics::PushClipRect(body_x, body_y, inner_w, body_h);
     if(m->render) m->render(body_x + CONTENT_PAD, body_y, inner_w - CONTENT_PAD, body_h, sc);
-    Graphics::ClearClipRect();
+    Graphics::PopClipRect();
 
     // scrollbar track + thumb. (satoru)
     if(has_bar){

@@ -1,6 +1,7 @@
 #include "linux_cmds.h"
 #include "../fs/kvfs.h"
 #include "../kernel/time.h"
+#include "../drivers/timer.h"
 #include "../kernel/heap.h"
 #include "../proc/scheduler.h"
 #include "../drivers/serial.h"
@@ -351,8 +352,17 @@ static bool _http_get_plain(const char* url, char* body_out, int body_max,
         }
 
         int total = 0;
-        int idle_loops = 0;
-        while (total < LINUX_HTTP_BUFFER_MAX && idle_loops < 40000) {
+        // wait on wall-clock time, not a raw iteration count. a real-internet
+        // round trip is tens of ms, but the old tight 40000-iteration spin
+        // burned out in a few ms and gave up (then closed the socket) before the
+        // response even arrived  -  fine under sub-ms slirp/localhost, broken
+        // against a real server. keep receiving until the peer closes or no new
+        // data arrives for ~10s, and pace each idle turn so the cooperative
+        // scheduler still runs. (satoru)
+        uint32_t last_rx_ms = Timer::GetTicks();
+        const uint32_t http_idle_timeout_ms = 10000u;
+        while (total < LINUX_HTTP_BUFFER_MAX) {
+            if (KuronoShell::IsCommandCancelRequested()) break;
             TCPStack::Tick();
             int got = TCPStack::Recv(sock, response + total, LINUX_HTTP_BUFFER_MAX - total);
             if (got < 0) {
@@ -365,11 +375,15 @@ static bool _http_get_plain(const char* url, char* body_out, int body_max,
                 if (TCPStack::IsPeerClosed(sock)) {
                     break;
                 }
-                idle_loops++;
+                if ((uint32_t)(Timer::GetTicks() - last_rx_ms) >= http_idle_timeout_ms) {
+                    break;
+                }
+                KuronoShell::PumpUI();
+                Scheduler::SleepMs(1);
                 continue;
             }
             total += got;
-            idle_loops = 0;
+            last_rx_ms = Timer::GetTicks();
         }
 
         if (total <= 0) {

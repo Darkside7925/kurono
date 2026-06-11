@@ -78,6 +78,7 @@ public:
     // usb hid: decode a boot-protocol mouse report and inject motion/button
     // events through the same ring as the ps/2 path (satoru).
     static void ProcessUSBReport(const uint8_t* report, int len);
+    static void ProcessUSBAbsReport(const uint8_t* report, int len);  // usb tablet (absolute) (satoru)
 private:
     static void Out(uint16_t p, uint8_t v);
     static uint8_t In(uint16_t p);

@@ -2462,6 +2462,182 @@ int32_t LinuxSyscall::sys_fstat(int fd, uintptr_t statbuf) {
     return sys_stat((uintptr_t)lfd->path, statbuf);
 }
 
+// ── x86_64 stat family ──────────────────────────────────────────────────────
+// x64 musl/glibc expect the 144-byte `struct LinuxStat64`, not the i386 layout
+// that sys_stat/sys_fstat fill.  These handlers share the same kvfs/ext4
+// resolution but format the 64-bit struct and validate the user statbuf.
+
+namespace {
+
+// Reject a statbuf the kernel must not write through: null, a wrapping range,
+// or one not fully contained in a single mapped user region of the caller.
+// Demand-zero pages *inside* a valid region fault in correctly on write, so we
+// only require region membership, not that every page is already present. (satoru)
+static bool stat_buf_writable(LinuxProcess* p, uint64_t ptr, uint64_t len) {
+    if (!p || !p->task || !p->task->is_user()) return false;
+    if (!ptr || len == 0) return false;
+    uint64_t end = ptr + len;
+    if (end < ptr) return false;                       // address-space wrap
+    UserMemoryRegion* region = find_region(p->task, ptr);
+    if (!region) return false;                         // not in any user region
+    if (end > region->end) return false;               // straddles region edge
+    return true;
+}
+
+// Neutral stat result, shared by the formatter so the kvfs/ext4 resolution
+// lives in one place.
+struct KStatInfo {
+    uint64_t ino;
+    uint32_t mode;
+    uint32_t nlink;
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t size;
+    uint64_t blksize;
+    uint64_t blocks;
+    uint64_t atime;
+    uint64_t mtime;
+    uint64_t ctime;
+};
+
+// Resolve an already-translated kurono path via kvfs then ext4.  Returns 0 on
+// success, or a negative errno mirroring sys_stat (-2 ENOENT). (satoru)
+static int gather_stat_path(const char* resolved, KStatInfo* out) {
+    memset(out, 0, sizeof(*out));
+
+    KVFSNode* node = KVFS::Resolve(resolved);
+    if (node) {
+        out->ino  = (uint64_t)(uintptr_t)node;
+        out->mode = node->perms.mode;
+        switch (node->type) {
+            case KVFS_DIR:
+            case KVFS_MOUNTPOINT: out->mode |= 0040000; break;  // S_IFDIR
+            case KVFS_SYMLINK:    out->mode |= 0120000; break;  // S_IFLNK
+            case KVFS_DEVICE:     out->mode |= 0020000; break;  // S_IFCHR
+            case KVFS_PIPE:       out->mode |= 0010000; break;  // S_IFIFO
+            default:              out->mode |= 0100000; break;  // S_IFREG
+        }
+        out->nlink   = 1;
+        out->uid     = node->perms.uid;
+        out->gid     = node->perms.gid;
+        out->size    = node->size;
+        out->blksize = 4096;
+        out->blocks  = (node->size + 511) / 512;
+        out->atime   = node->accessed;
+        out->mtime   = node->modified;
+        out->ctime   = node->modified;
+        return 0;
+    }
+
+    if (Ext4::IsMounted()) {
+        Ext4Inode in;
+        if (Ext4::Stat(resolved, &in) == 0) {
+            out->mode    = in.i_mode;
+            out->nlink   = in.i_links_count;
+            out->uid     = in.i_uid;
+            out->gid     = in.i_gid;
+            out->size    = in.i_size_lo;
+            out->blksize = Ext4::BlockSize();
+            out->blocks  = in.i_blocks_lo;
+            out->atime   = in.i_atime;
+            out->mtime   = in.i_mtime;
+            out->ctime   = in.i_ctime;
+            return 0;
+        }
+    }
+    return -2;  // ENOENT
+}
+
+static void fill_stat64(LinuxStat64* st, const KStatInfo* in) {
+    memset(st, 0, sizeof(*st));
+    st->st_dev     = 1;
+    st->st_ino     = in->ino;
+    st->st_nlink   = in->nlink;
+    st->st_mode    = in->mode;
+    st->st_uid     = in->uid;
+    st->st_gid     = in->gid;
+    st->st_rdev    = 0;
+    st->st_size    = (int64_t)in->size;
+    st->st_blksize = (int64_t)in->blksize;
+    st->st_blocks  = (int64_t)in->blocks;
+    st->st_atime   = in->atime;
+    st->st_mtime   = in->mtime;
+    st->st_ctime   = in->ctime;
+}
+
+}  // namespace
+
+int32_t LinuxSyscall::sys_stat64(uintptr_t pathname, uintptr_t statbuf) {
+    LinuxProcess* p = Current();
+    if (!p) return -1;
+    if (!stat_buf_writable(p, statbuf, sizeof(LinuxStat64))) return -14;  // EFAULT
+
+    char resolved[256];
+    ResolvePath((const char*)pathname, resolved, sizeof(resolved), p);
+
+    KStatInfo info;
+    int r = gather_stat_path(resolved, &info);
+    if (r != 0) return r;
+
+    fill_stat64((LinuxStat64*)statbuf, &info);
+    return 0;
+}
+
+int32_t LinuxSyscall::sys_fstat64(int fd, uintptr_t statbuf) {
+    LinuxProcess* p = Current();
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;   // EBADF
+    if (!stat_buf_writable(p, statbuf, sizeof(LinuxStat64))) return -14;      // EFAULT
+
+    LinuxFd* lfd = &p->fds[fd];
+
+    if (lfd->type == LFD_CONSOLE || lfd->type == LFD_DEVNULL) {
+        KStatInfo info;
+        memset(&info, 0, sizeof(info));
+        info.mode    = 0020666;   // S_IFCHR | rw-rw-rw-
+        info.nlink   = 1;
+        info.blksize = (lfd->type == LFD_CONSOLE) ? 1024 : 4096;
+        fill_stat64((LinuxStat64*)statbuf, &info);
+        return 0;
+    }
+
+    char resolved[256];
+    ResolvePath(lfd->path, resolved, sizeof(resolved), p);
+
+    KStatInfo info;
+    int r = gather_stat_path(resolved, &info);
+    if (r != 0) return r;
+
+    fill_stat64((LinuxStat64*)statbuf, &info);
+    return 0;
+}
+
+int32_t LinuxSyscall::sys_fstatat64(int dirfd, uintptr_t pathname,
+                                    uintptr_t statbuf, int flags) {
+    LinuxProcess* p = Current();
+    if (!p) return -1;
+    if (!stat_buf_writable(p, statbuf, sizeof(LinuxStat64))) return -14;  // EFAULT
+
+    const char* path = (const char*)pathname;
+    constexpr int AT_EMPTY_PATH = 0x1000;
+    // musl/glibc implement fstat() as newfstatat(fd, "", buf, AT_EMPTY_PATH):
+    // an empty path means "stat the dirfd itself" rather than a named file.
+    if ((flags & AT_EMPTY_PATH) && (!path || path[0] == '\0')) {
+        return sys_fstat64(dirfd, statbuf);
+    }
+
+    // dirfd is otherwise ignored: relative paths resolve against the process
+    // cwd, matching the i386 LSYS_FSTATAT handler. (satoru)
+    char resolved[256];
+    ResolvePath(path, resolved, sizeof(resolved), p);
+
+    KStatInfo info;
+    int r = gather_stat_path(resolved, &info);
+    if (r != 0) return r;
+
+    fill_stat64((LinuxStat64*)statbuf, &info);
+    return 0;
+}
+
 int32_t LinuxSyscall::sys_uname(uintptr_t buf) {
     LinuxUtsname* u = (LinuxUtsname*)buf;
     memset(u, 0, sizeof(LinuxUtsname));

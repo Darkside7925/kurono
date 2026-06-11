@@ -92,6 +92,13 @@ public:
     // performance optimization
     static void SetClipRect(int x, int y, int w, int h);
     static void ClearClipRect();
+    // nesting clip stack: PushClipRect intersects with the current clip and saves
+    // the prior state; PopClipRect restores it. use these instead of Set/Clear
+    // whenever one clipped region renders inside another (e.g. a window's content
+    // render that itself clips a scroll panel)  -  a bare ClearClipRect would disarm
+    // the outer clip and let inner content bleed onto the desktop. (satoru)
+    static void PushClipRect(int x, int y, int w, int h);
+    static void PopClipRect();
     static void SetBlendMode(BlendMode mode);
     static BlendMode GetBlendMode();
     
@@ -149,6 +156,8 @@ public:
     static void SetColorFilter(int mode);
     static int  GetColorFilter();
     static void SetHighContrast(bool on);
+    static void SetBrightness(int pct);   // software dim 10..100 (%) (satoru)
+    static int  GetBrightness();
 
 private:
     static uint8_t* fb_addr;
@@ -180,6 +189,11 @@ private:
     static int clip_w;
     static int clip_h;
     static bool clipping_enabled;
+    // saved clip states for PushClipRect/PopClipRect (fixed depth  -  render nesting
+    // is shallow: desktop -> window -> content -> scroll panel). (satoru)
+    struct ClipSave { int x, y, w, h; bool enabled; };
+    static ClipSave clip_stack[16];
+    static int clip_sp;
     
     // dirty regions for optimized rendering
     struct DirtyRegion {

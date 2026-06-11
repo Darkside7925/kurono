@@ -47,6 +47,9 @@ static void persist_brightness(){
     UIConfig::SetInt("display.brightness", s_brightness, true);
     // 0..100 → 0..255 hardware gamma scale where the backend supports it. (satoru)
     DisplayManager::SetBrightness((uint8_t)((s_brightness * 255) / 100));
+    // also dim in software via the compositor post-process so the slider has a
+    // real effect even when the backend has no panel/gamma control. (satoru)
+    Graphics::SetBrightness(s_brightness);
     UIConfig::Save();
 }
 
