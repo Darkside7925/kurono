@@ -30,9 +30,40 @@ bool USB::cmd_cycle = true;
 int USB::event_ring_idx = 0;
 bool USB::event_ccs = true;
 
+// route usb driver diagnostics to the serial console. supports %d/%x/%s; plain
+// runs are emitted in one go. previously a no-op, which left the whole xhci
+// enumeration path invisible during bring-up. (satoru)
 static void usb_log(const char* fmt, ...) {
-    (void)fmt;
-    // serial debug output could be added here
+    va_list ap; va_start(ap, fmt);
+    char run[128]; int ri = 0;
+    auto flush = [&](){ if (ri) { run[ri] = 0; SerialLogger::Log(run); ri = 0; } };
+    for (const char* p = fmt; *p; ++p) {
+        if (*p != '%') {
+            if (ri >= (int)sizeof(run) - 1) flush();
+            run[ri++] = *p;
+            continue;
+        }
+        ++p;
+        flush();
+        if      (*p == 'd') SerialLogger::LogDec(va_arg(ap, int));
+        else if (*p == 'x') SerialLogger::LogHex((uint32_t)va_arg(ap, unsigned int));
+        else if (*p == 's') SerialLogger::Log(va_arg(ap, const char*));
+        else if (*p == '%') { run[ri++] = '%'; }
+        else if (!*p) break;
+    }
+    flush();
+    va_end(ap);
+}
+
+// xHCI DMA structures (dcbaa, command/event rings, erst) require >=64-byte
+// alignment and must not straddle a 64KB boundary; KernelHeap::Alloc only
+// guarantees 16-byte alignment, so an unaligned ring made the controller raise
+// HCE (host controller error) and reject every command. over-allocate and round
+// up to a page so all alignment + no-cross constraints hold. (satoru)
+static void* usb_alloc_aligned(size_t size, size_t align) {
+    uintptr_t raw = (uintptr_t)KernelHeap::Alloc(size + align);
+    if (!raw) return nullptr;
+    return (void*)((raw + (align - 1)) & ~(uintptr_t)(align - 1));
 }
 
 // small helpers kept local so we do not pull in <cstring> on a freestanding
@@ -160,10 +191,18 @@ bool USB::SubmitCommand(xHCI_TRB* cmd_trb, xHCI_TRB* result) {
     // ring the command doorbell (slot 0, target 0)
     WriteDoorbell(0, 0);
 
-    // a command completion event lands on the (shared) event ring; spin for it.
-    // SubmitCommand only issues commands, so we treat the first matching event
-    // as the result. transfer/port events are handled separately by PollHID.
-    return PollEventRing(result, 5000);
+    // a command completion event lands on the (shared) event ring; spin for it,
+    // SKIPPING port-status-change events that a port reset interleaves onto the
+    // same ring (grabbing one made ENABLE_SLOT read a bogus slot id 0). ports are
+    // polled directly, so dropping those events is safe. (satoru)
+    for (int tries = 0; tries < 16; tries++) {
+        xHCI_TRB ev = {};
+        if (!PollEventRing(&ev, 5000)) return false;
+        uint8_t type = (ev.control >> 10) & 0x3F;
+        if (type == TRB_CMD_COMPLETE) { if (result) *result = ev; return true; }
+        // not a command completion (port status / stray transfer)  -  keep waiting.
+    }
+    return false;
 }
 
 // write the event-ring dequeue pointer back to the controller with the
@@ -280,14 +319,14 @@ bool USB::Init() {
     WriteOp(XHCI_OP_CONFIG, max_slots);
 
     // allocate device context base address array (dcbaa)
-    dcbaa = (uint64_t*)KernelHeap::Alloc(4096);
+    dcbaa = (uint64_t*)usb_alloc_aligned(4096, 4096);
     if (!dcbaa) return false;
     for (int i = 0; i < 256; i++) dcbaa[i] = 0;
     WriteOp(XHCI_OP_DCBAAP, (uint32_t)(uintptr_t)dcbaa);
     WriteOp(XHCI_OP_DCBAAP + 4, 0);
 
     // allocate command ring (64 trbs)
-    cmd_ring = (xHCI_TRB*)KernelHeap::Alloc(4096);
+    cmd_ring = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
     if (!cmd_ring) return false;
     usb_memset(cmd_ring, 0, USB_RING_TRBS * sizeof(xHCI_TRB));
     cmd_ring_idx = 0;
@@ -300,7 +339,7 @@ bool USB::Init() {
     WriteOp(XHCI_OP_CRCR + 4, (uint32_t)(crcr_val >> 32));
 
     // allocate event ring (64 trbs)
-    event_ring = (xHCI_TRB*)KernelHeap::Alloc(4096);
+    event_ring = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
     if (!event_ring) return false;
     usb_memset(event_ring, 0, USB_RING_TRBS * sizeof(xHCI_TRB));
     event_ring_idx = 0;
@@ -309,7 +348,7 @@ bool USB::Init() {
 
     // set up event ring segment table
     // erst entry: base address (8 bytes) + ring segment size (4 bytes) + reserved (4 bytes)
-    uint64_t* erst = (uint64_t*)KernelHeap::Alloc(4096);
+    uint64_t* erst = (uint64_t*)usb_alloc_aligned(4096, 4096);
     if (!erst) return false;
     erst[0] = (uint64_t)(uintptr_t)event_ring;
     ((uint32_t*)erst)[2] = USB_RING_TRBS; // segment size
@@ -418,9 +457,9 @@ int USB::FindDeviceByPort(uint8_t port) {
 bool USB::AddressDevice(int idx) {
     USBDeviceRuntime& rt = runtime[idx];
 
-    rt.device_ctx = (uint8_t*)KernelHeap::Alloc(4096);
-    rt.input_ctx  = (uint8_t*)KernelHeap::Alloc(4096);
-    rt.ep0_ring   = (xHCI_TRB*)KernelHeap::Alloc(4096);
+    rt.device_ctx = (uint8_t*)usb_alloc_aligned(4096, 4096);
+    rt.input_ctx  = (uint8_t*)usb_alloc_aligned(4096, 4096);
+    rt.ep0_ring   = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
     if (!rt.device_ctx || !rt.input_ctx || !rt.ep0_ring) return false;
     usb_memset(rt.device_ctx, 0, 4096);
     usb_memset(rt.input_ctx, 0, 4096);
@@ -581,8 +620,8 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         return false;
 
     // allocate the interrupt transfer ring + report buffer (satoru).
-    rt.intr_ring = (xHCI_TRB*)KernelHeap::Alloc(4096);
-    rt.intr_buf  = (uint8_t*)KernelHeap::Alloc(4096);
+    rt.intr_ring = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
+    rt.intr_buf  = (uint8_t*)usb_alloc_aligned(4096, 4096);
     if (!rt.intr_ring || !rt.intr_buf) return false;
     usb_memset(rt.intr_ring, 0, USB_RING_TRBS * sizeof(xHCI_TRB));
     usb_memset(rt.intr_buf, 0, 4096);
@@ -767,14 +806,26 @@ void USB::ParseReportDescriptor(int idx, const uint8_t* rpt, int len) {
 }
 
 // dispatch a completed boot-protocol report to the right driver (satoru).
+// native usb hid input enable (settings -> devices). default on. (satoru)
+static bool g_usb_hid_input = true;
+void USB::SetHIDInputEnabled(bool on) { g_usb_hid_input = on; }
+bool USB::IsHIDInputEnabled() { return g_usb_hid_input; }
+
 void USB::DispatchReport(int idx, const uint8_t* report, int len) {
+    if (!g_usb_hid_input) return;   // usb input disabled -> ps/2 takes over (satoru)
     USBDeviceRuntime& rt = runtime[idx];
     if (rt.hid_type == USB_HID_KEYBOARD) {
         // boot keyboard report is 8 bytes; the keyboard decoder requires >= 8
         // and indexes by device id (we use the devices[] index) (satoru).
         Keyboard::ProcessUSBReport((uint8_t)idx, report, (size_t)len);
     } else if (rt.hid_type == USB_HID_MOUSE) {
-        Mouse::ProcessUSBReport(report, len);
+        // a 6+ byte pointer report is qemu's usb-tablet (and HID digitizers):
+        // [buttons, X16, Y16, wheel] absolute. boot mice are 3-4 bytes relative.
+        // route absolute pointers to the absolute handler so the tablet places
+        // the cursor at a position instead of being decoded as relative deltas.
+        // (satoru)
+        if (len >= 6) Mouse::ProcessUSBAbsReport(report, len);
+        else          Mouse::ProcessUSBReport(report, len);
     }
 }
 
@@ -835,9 +886,9 @@ bool USB::EnumeratePort(int port) {
     xHCI_TRB enable_cmd = {};
     enable_cmd.control = TRB_TYPE(TRB_ENABLE_SLOT);
     xHCI_TRB result = {};
-    if (!SubmitCommand(&enable_cmd, &result)) return false;
+    if (!SubmitCommand(&enable_cmd, &result)) { usb_log("USB: port %d enable-slot cmd failed\n", port); return false; }
     uint8_t slot = (result.control >> 24) & 0xFF;
-    if (slot == 0) return false;
+    if (slot == 0) { usb_log("USB: port %d enable-slot returned slot 0\n", port); return false; }
 
     USBDeviceRuntime& rt = runtime[idx];
     usb_memset(&rt, 0, sizeof(rt));
@@ -905,6 +956,8 @@ bool USB::EnumeratePort(int port) {
         if (rt.hid_type == USB_HID_KEYBOARD) Keyboard::AddUSBDevice((uint8_t)idx);
         ArmInterrupt(idx);
     }
+    usb_log("USB: enumerated port %d -> slot %d hid_type=%d (0=none 1=kbd 2=mouse)\n",
+            port, idx, (int)rt.hid_type);
 
     return true;
 }

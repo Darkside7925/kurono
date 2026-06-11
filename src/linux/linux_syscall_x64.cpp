@@ -37,7 +37,8 @@ constexpr NrMap kNrMap[] = {
     {  1,   4 },  // write
     {  2,   5 },  // open
     {  3,   6 },  // close
-    {  5, 108 },  // fstat
+    // nr 5 (fstat) handled directly in SyscallEntryX64Handler  -  it must fill
+    // the 64-bit struct stat, not the i386 layout the LSYS_FSTAT handler writes.
     {  8,  19 },  // lseek
     {  9,  90 },  // mmap (anon ok, file-backed not supported)
     { 10, 125 },  // mprotect (stubbed in i386 dispatch)
@@ -68,8 +69,8 @@ constexpr NrMap kNrMap[] = {
     // ── broadened static-musl / ffmpeg syscall surface. these route to
     //    i386 dispatch handlers verified to exist; lsys_ macros guarantee the
     //    correct internal id even where x64 and i386 numbers collide. (satoru)
-    {   4, LSYS_STAT },          // stat (by path)
-    {   6, LSYS_STAT },          // lstat -> stat (no symlinks in kvfs)
+    // nr 4 (stat), 6 (lstat), 262 (newfstatat) handled directly in
+    // SyscallEntryX64Handler so they fill the 64-bit struct stat layout.
     {   7, LSYS_POLL },          // poll
     {  17, LSYS_PREAD64 },       // pread64
     {  18, LSYS_PWRITE64 },      // pwrite64
@@ -87,7 +88,6 @@ constexpr NrMap kNrMap[] = {
     { 202, LSYS_FUTEX },         // futex (critical: musl locks/once/tls)
     { 229, LSYS_CLOCK_GETRES },  // clock_getres
     { 234, LSYS_TGKILL },        // tgkill
-    { 262, LSYS_FSTATAT },       // newfstatat
     { 332, LSYS_STATX },         // statx
 };
 
@@ -204,8 +204,39 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             // nanosleep(req, rem); clockid/flags ignored (satoru)
             return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a2, a3, 0, 0, 0);
         }
-        // newfstatat (262) and statx (332) fall through to the kNrMap
-        // translation → LSYS_FSTATAT / LSYS_STATX handlers (satoru)
+        // stat/fstat/lstat/newfstatat must NOT route through the i386 LSYS_*
+        // handlers: those fill the 32-bit `struct LinuxStat`, but an x86_64
+        // binary expects the 144-byte `struct LinuxStat64`.  Call the 64-bit
+        // handlers directly so they format the correct layout (and validate the
+        // user statbuf).  Resolution may touch ext4, so allow IRQs first to
+        // match the translated path's HAL::EnableInterrupts(). (satoru)
+        case 4: {    // stat(const char* path, struct stat* statbuf)
+            HAL::EnableInterrupts();
+            int64_t r = LinuxSyscall::sys_stat64(a0, a1);
+            HAL::DisableInterrupts();
+            return r;
+        }
+        case 5: {    // fstat(int fd, struct stat* statbuf)
+            HAL::EnableInterrupts();
+            int64_t r = LinuxSyscall::sys_fstat64((int)a0, a1);
+            HAL::DisableInterrupts();
+            return r;
+        }
+        case 6: {    // lstat(const char* path, struct stat* statbuf)
+            // no symlinks in kvfs → identical to stat
+            HAL::EnableInterrupts();
+            int64_t r = LinuxSyscall::sys_stat64(a0, a1);
+            HAL::DisableInterrupts();
+            return r;
+        }
+        case 262: {  // newfstatat(int dirfd, const char* path,
+                     //            struct stat* statbuf, int flags)
+            HAL::EnableInterrupts();
+            int64_t r = LinuxSyscall::sys_fstatat64((int)a0, a1, a2, (int)a3);
+            HAL::DisableInterrupts();
+            return r;
+        }
+        // statx (332) falls through to the kNrMap translation → LSYS_STATX.
         case 302: {  // prlimit64  -  fail soft.
             return -38;
         }

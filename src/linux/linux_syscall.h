@@ -225,6 +225,35 @@ struct LinuxStat {
     uint32_t __unused5;
 } __attribute__((packed));
 
+// x86_64 `struct stat`  -  the layout an unmodified amd64 musl/glibc binary
+// expects from stat/fstat/lstat/newfstatat.  This is NOT the i386 layout above:
+// fields are 64-bit, st_mode/uid/gid are 32-bit, and there is a __pad0 word
+// before st_rdev.  Verified field-for-field against
+// sources/linux-ref/arch/x86/include/uapi/asm/stat.h (the !__i386__ branch).
+// Total size is exactly 144 bytes. (satoru)
+struct LinuxStat64 {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint64_t st_nlink;
+    uint32_t st_mode;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+    uint64_t st_atime;
+    uint64_t st_atime_nsec;
+    uint64_t st_mtime;
+    uint64_t st_mtime_nsec;
+    uint64_t st_ctime;
+    uint64_t st_ctime_nsec;
+    int64_t  __unused[3];
+} __attribute__((packed));
+
+static_assert(sizeof(LinuxStat64) == 144, "x86_64 struct stat must be 144 bytes");
+
 struct LinuxDirent64 {
     uint64_t d_ino;
     uint64_t d_off;
@@ -381,6 +410,17 @@ public:
     // or sign-mangled on the way back to userspace (satoru)
     static int64_t Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             uint64_t edx, uint64_t esi, uint64_t edi);
+
+    // x86_64-ABI stat family: same kvfs/ext4 resolution as the i386
+    // sys_stat/sys_fstat handlers, but they fill the 64-bit
+    // `struct LinuxStat64` layout and validate the user statbuf pointer.
+    // Called directly from the SYSCALL fast path (linux_syscall_x64.cpp) so
+    // an amd64 binary gets the struct it expects; the int 0x80 path keeps the
+    // 32-bit layout via sys_stat/sys_fstat. (satoru)
+    static int32_t sys_stat64(uintptr_t pathname, uintptr_t statbuf);
+    static int32_t sys_fstat64(int fd, uintptr_t statbuf);
+    static int32_t sys_fstatat64(int dirfd, uintptr_t pathname,
+                                 uintptr_t statbuf, int flags);
 
     // stats
     static int  ActiveProcessCount();

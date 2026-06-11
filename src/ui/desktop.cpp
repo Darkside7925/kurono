@@ -1,5 +1,6 @@
 //  kurono os  -  taskbar & desktop environment implementation
 #include "desktop.h"
+#include "../../logo.h"
 #include "control_center.h"
 #include "notification.h"
 #include "../system/screenshot.h"
@@ -232,6 +233,16 @@ static inline int tb_bar_y()  { return Taskbar::y_pos; }
 static inline int tb_bar_h()  { return TASKBAR_HEIGHT; }
 static inline int tb_bar_r()  { return TASKBAR_HEIGHT / 2 - 4; }       // pill-ish
 
+// y where a taskbar popup of height h floats just off the bar: above it when the
+// bar is docked at the bottom, below it when docked at the top. `lift` is an
+// optional open-animation slide (px) that always eases toward the bar. used by
+// both render and hit-test so the two stay in lockstep at either dock. (satoru)
+static inline int tb_popup_y(int h, int gap, int lift){
+    if(Taskbar::cfg_position_top)
+        return Taskbar::y_pos + TASKBAR_HEIGHT + gap - lift;
+    return Taskbar::y_pos - h - gap + lift;
+}
+
 // Quick-launch pinned apps.  Order = leftmost first.  Letter is the
 // 1-char glyph drawn in the icon (mirrors the start menu's coding so
 // the colour palette stays consistent).
@@ -275,21 +286,31 @@ void Taskbar::RenderStartButton(){
     // K logo button, anchored to the floating bar's left edge.
     int btn_w = 44, btn_h = TASKBAR_HEIGHT - 10;
     int bx = tb_bar_x() + 6, by = y_pos + 5;
-    unsigned int clr = (hover_button==0) ? COL_START_HOVER : COL_START_BTN;
+    // dark themed button so the (grey) boot emblem reads like the splash. (satoru)
+    unsigned int clr = (hover_button==0) ? 0xFF34343C : 0xFF222228;
     Graphics::FillRoundedRect(bx, by, btn_w, btn_h, 8, clr);
     // soft inner highlight for a more "tactile" feel
-    Graphics::FillRect(bx+1, by+1, btn_w-2, 1, 0x40FFFFFF);
-    // k logo  -  14px wide x 16px tall, centered in button
-    int kx = bx + (btn_w - 14) / 2;
-    int ky = by + (btn_h - 16) / 2;
-    Graphics::FillRect(kx, ky, 3, 16, 0xFFFFFFFF);
-    Graphics::FillRect(kx+3, ky+6, 2, 4, 0xFFE8EEFF);
-    Graphics::FillRect(kx+5, ky+4, 3, 3, 0xFFD0DDFF);
-    Graphics::FillRect(kx+8, ky+1, 3, 3, 0xFFB0C8FF);
-    Graphics::FillRect(kx+11, ky, 3, 2, 0xFF90B0FF);
-    Graphics::FillRect(kx+5, ky+10, 3, 3, 0xFFD0DDFF);
-    Graphics::FillRect(kx+8, ky+12, 3, 3, 0xFFB0C8FF);
-    Graphics::FillRect(kx+11, ky+14, 3, 2, 0xFF90B0FF);
+    Graphics::FillRect(bx+1, by+1, btn_w-2, 1, 0x30FFFFFF);
+    // kurono boot logo (the angular emblem from the splash screen), cropped to
+    // its bounding box in logo_data and scaled to fill the button  -  replaces the
+    // old hand-drawn "k". (satoru)
+    const int LBX0 = 97, LBY0 = 80, LBW = 99, LBH = 141;   // emblem bbox (satoru)
+    int lh = btn_h - 8;
+    int lw = (lh * LBW) / LBH;
+    if (lw > btn_w - 8){ lw = btn_w - 8; lh = (lw * LBH) / LBW; }
+    int lx = bx + (btn_w - lw) / 2;
+    int ly = by + (btn_h - lh) / 2;
+    for (int dy = 0; dy < lh; dy++){
+        int sy = LBY0 + (dy * LBH) / lh;
+        for (int dx = 0; dx < lw; dx++){
+            int sx = LBX0 + (dx * LBW) / lw;
+            uint32_t p = logo_data[sy * LOGO_WIDTH + sx];
+            uint8_t a = (p >> 24) & 0xFF;
+            if (a < 10) continue;
+            if (a >= 250) Graphics::DrawPixel(lx + dx, ly + dy, p | 0xFF000000);
+            else Graphics::BlendPixel(lx + dx, ly + dy, (p>>16)&0xFF, (p>>8)&0xFF, p&0xFF, a);
+        }
+    }
 }
 
 // Pinned quick-launch icons immediately after the K button.
@@ -530,9 +551,10 @@ void Taskbar::RenderStartMenu(){
     int draw_h = (int)(full_h * (0.92f + 0.08f * t) + 0.5f);
     int lift   = (int)((1.0f - t) * 16.0f);
 
-    // left-aligned above the k button (which is anchored to the floating bar)
+    // left-aligned off the k button (which is anchored to the floating bar)  - 
+    // above the bar when docked bottom, below it when docked top. (satoru)
     int mx0 = tb_bar_x() + 6;
-    int my0 = y_pos - draw_h - 8 + lift;
+    int my0 = tb_popup_y(draw_h, 8, lift);
 
     // shadow
     Graphics::FillRoundedRect(mx0+6, my0+6, START_MENU_W, draw_h, 14, 0xFF040408);
@@ -652,7 +674,7 @@ void Taskbar::RenderSearchResults(){
         int sx = tb_search_x();
         int sw = tb_search_w();
         int sh_ = 36;
-        int sy = y_pos - sh_ - 4;
+        int sy = tb_popup_y(sh_, 4, 0);
         Graphics::FillRoundedRect(sx, sy, sw, sh_, 10, 0xFF141424);
         Graphics::DrawRect(sx, sy, sw, sh_, 0xFF2A2A48);
         Graphics::DrawString(sx+12, sy+10, "No results", 0xFF606080, 0xFF000000);
@@ -662,7 +684,7 @@ void Taskbar::RenderSearchResults(){
 
     int sx = tb_search_x();
     int sh = match_count * 30 + 12;
-    int sy = y_pos - sh - 4;
+    int sy = tb_popup_y(sh, 4, 0);
     int sw = tb_search_w();
 
     // shadow + bg
@@ -687,7 +709,7 @@ void Taskbar::RenderVolumePopup(){
     int pop_w = 52, pop_h_full = 180;
     int pop_h = (int)(pop_h_full * (0.5f + 0.5f * t) + 0.5f);
     int pop_x = vol_x - pop_w/2 + TB_VOL_W/2;
-    int pop_y = y_pos - pop_h - 8 + (int)((1.0f - t) * 10.0f);
+    int pop_y = tb_popup_y(pop_h, 8, (int)((1.0f - t) * 10.0f));
 
     // shadow + background
     Graphics::FillRoundedRect(pop_x+4, pop_y+4, pop_w, pop_h, 8, 0xFF060610);
@@ -740,7 +762,7 @@ bool Taskbar::HandleClick(int mx,int my){
         int pop_w = 52, pop_h = 180;
         int vol_icon_x2 = tb_vol_x();
         int pop_x = vol_icon_x2 - pop_w/2 + TB_VOL_W/2;
-        int pop_y = y_pos - pop_h - 8;
+        int pop_y = tb_popup_y(pop_h, 8, 0);
 
         if(mx>=pop_x && mx<pop_x+pop_w && my>=pop_y && my<pop_y+pop_h){
             if(my < pop_y + 32){
@@ -761,12 +783,15 @@ bool Taskbar::HandleClick(int mx,int my){
         VolumePopupSet(false);
     }
 
-    // check if click is in taskbar area
-    if(my < y_pos){
+    // popups (start menu / search results) float off the bar: above it for a
+    // bottom dock (my < y_pos), below it for a top dock. handle those clicks
+    // here; bar-row clicks fall through to the widgets below. (satoru)
+    bool off_bar = cfg_position_top ? (my >= y_pos + TASKBAR_HEIGHT) : (my < y_pos);
+    if(off_bar){
         // start menu handling
         if(start_menu_open){
             int mx0 = tb_bar_x() + 6;
-            int my0 = y_pos - START_MENU_H - 8;
+            int my0 = tb_popup_y(START_MENU_H, 8, 0);
             if(mx>=mx0 && mx<mx0+START_MENU_W && my>=my0 && my<my0+START_MENU_H){
                 int iy = my0 + 56;
                 static const int nit = 12;
@@ -821,7 +846,7 @@ bool Taskbar::HandleClick(int mx,int my){
                 if(found) matches2[mc2++]=i;
             }
             if(mc2 > 0){
-                int sh2 = mc2*30+12, sy2 = y_pos-sh2-4, sx2=tb_search_x(), sw2=tb_search_w();
+                int sh2 = mc2*30+12, sy2 = tb_popup_y(sh2, 4, 0), sx2=tb_search_x(), sw2=tb_search_w();
                 if(mx>=sx2 && mx<sx2+sw2 && my>=sy2 && my<sy2+sh2){
                     int ry = sy2+6;
                     for(int i=0;i<mc2;i++){
@@ -845,6 +870,16 @@ bool Taskbar::HandleClick(int mx,int my){
                 }
             }
         }
+        return false;
+    }
+
+    // a click that is neither off-bar (handled above) nor inside the bar row is
+    // in the thin wallpaper gap on the bar's far side  -  pass it through rather
+    // than swallow it (swallowing it is what broke all input with a top dock). (satoru)
+    if(my < y_pos || my >= y_pos + TASKBAR_HEIGHT){
+        StartMenuSet(false);
+        VolumePopupSet(false);
+        search_active = false;
         return false;
     }
 
@@ -1766,7 +1801,14 @@ int Desktop::IconAt(int mx,int my){
 }
 
 bool Desktop::HandleClick(int mx,int my){
-    if(my >= Taskbar::GetY()) return false;
+    // ignore clicks that land on the taskbar's own row; the desktop owns the
+    // rest of the screen. with a top dock the desktop is *below* the bar, so the
+    // old `my >= GetY()` guard rejected nearly everything. (satoru)
+    if(Taskbar::cfg_position_top){
+        if(my < Taskbar::GetY() + TASKBAR_HEIGHT) return false;
+    } else {
+        if(my >= Taskbar::GetY()) return false;
+    }
 
     // if context menu is open, check for menu item click first
     if(context_menu_open){
@@ -2123,7 +2165,7 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         if(Taskbar::volume_popup_open && Taskbar::volume_slider_dragging){
             // use same popup position calculation as rendervolumepopup
             int pop_h = 180;
-            int pop_y = Taskbar::y_pos - pop_h - 8;
+            int pop_y = tb_popup_y(pop_h, 8, 0);
             int track_y = pop_y + 36;
             int track_h = 110;
             int rel = track_y + track_h - my;

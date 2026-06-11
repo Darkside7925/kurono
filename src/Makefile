@@ -183,6 +183,7 @@ CXX_SRCS = \
     $(SRC)/ui/font.cpp \
     $(SRC)/ui/text_layout.cpp \
     $(SRC)/ui/ui_elements.cpp \
+    $(SRC)/ui/kss.cpp \
     $(SRC)/ui/gui.cpp \
     $(SRC)/ui/lockscreen.cpp \
     $(SRC)/ui/window_manager.cpp \

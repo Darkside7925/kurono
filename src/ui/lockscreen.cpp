@@ -24,6 +24,7 @@
 #include "../drivers/serial.h"
 #include "../system/input_manager.h"
 #include "../fs/kvfs.h"
+#include "../proc/scheduler.h"
 
 LockScreen::State LockScreen::current_state = LockScreen::IDLE;
 
@@ -1286,7 +1287,12 @@ void LockScreen::Show(){
             Graphics::SwapBuffers();
         }
 
-        __asm__ __volatile__("pause");
+        // yield to the cooperative scheduler so the input process (which polls
+        // keyboard/mouse + usb hid interrupt-in endpoints) gets cpu time. without
+        // this the lockscreen monopolizes the core and usb input goes dead, which
+        // is why sign-out/lock froze all mouse interaction. no-op before the
+        // scheduler starts, so the boot wizard (ps/2 irq input) is unaffected. (satoru)
+        Scheduler::YieldNow();
     }
 
     // scrub plaintext credentials from RAM before returning

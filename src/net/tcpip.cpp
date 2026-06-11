@@ -192,6 +192,15 @@ bool TCPStack::Init() {
     gateway = MakeIP(10, 0, 2, 2);
     dns_server = MakeIP(10, 0, 2, 3);
 
+    // seed the ephemeral source port from rdtsc so successive boots (and
+    // reconnects to the same server) don't reuse the identical 4-tuple  -  a
+    // server still holding TIME_WAIT state for the old tuple answers a fresh
+    // syn with a bare challenge-ack instead of syn-ack (rfc 5961), so the
+    // handshake never completes. (satoru)
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    next_ephemeral_port = (uint16_t)(49152u + ((lo ^ hi) % (65535u - 49152u)));
+
     initialized = true;
     return true;
 }
@@ -609,6 +618,29 @@ void TCPStack::ProcessICMP(const IPv4Header* ip_hdr, const void* data, int len) 
     }
 }
 
+// buffer in-order tcp payload into the socket rx ring and advance our ack.
+// returns the number of bytes accepted; sets *ack_needed when any data arrived
+// (even out-of-order/duplicate, which still needs a duplicate ack). shared by
+// the ESTABLISHED and FIN_WAIT half-close states so a peer's data is never
+// dropped after we have sent our own FIN (the http "Connection: close" path).
+// (satoru)
+static int tcp_accept_rx_data(NetSocket* s, uint32_t their_seq,
+                              const uint8_t* payload, int payload_len,
+                              bool* ack_needed) {
+    if (payload_len <= 0) return 0;
+    *ack_needed = true;
+    if (their_seq != s->tcp_ack) return 0;  // out-of-order/dup: ack, don't buffer
+    int space = TCP_RX_BUFSIZE - s->rx_count;
+    int copy = payload_len < space ? payload_len : space;
+    for (int i = 0; i < copy; i++) {
+        s->rx_buf[s->rx_tail] = payload[i];
+        s->rx_tail = (s->rx_tail + 1) % TCP_RX_BUFSIZE;
+        s->rx_count++;
+    }
+    s->tcp_ack = their_seq + (uint32_t)copy;
+    return copy;
+}
+
 void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
     if (len < (int)sizeof(TCPHeader)) return;
     stats.tcp_rx++;
@@ -782,41 +814,64 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
             }
             break;
 
-        case TCP_FIN_WAIT_1:
+        case TCP_FIN_WAIT_1: {
             if (tcp->flags & TCP_FLAG_RST) {
                 sock->tcp_state = TCP_CLOSED;
                 sock->tx_pending = false;
                 sock->active = false;
                 break;
             }
-            if ((tcp->flags & TCP_FLAG_ACK) && (tcp->flags & TCP_FLAG_FIN)) {
-                ApplyAck(sock, their_ack);
-                sock->tcp_ack = their_seq + 1u;
-                sock->tcp_state = TCP_TIME_WAIT;
-                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
-            } else if (tcp->flags & TCP_FLAG_ACK) {
-                ApplyAck(sock, their_ack);
-                sock->tcp_state = TCP_FIN_WAIT_2;
-            } else if (tcp->flags & TCP_FLAG_FIN) {
-                sock->tcp_ack = their_seq + 1u;
-                sock->tcp_state = TCP_CLOSING;
-                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
-            }
-            break;
-
-        case TCP_FIN_WAIT_2:
-            if (tcp->flags & TCP_FLAG_RST) {
-                sock->tcp_state = TCP_CLOSED;
-                sock->tx_pending = false;
-                sock->active = false;
-                break;
-            }
+            // a half-close still receives the peer's response: buffer+ack any
+            // in-order data before acting on the ack/fin flags. (satoru)
+            bool ack_needed = false;
+            int accepted = tcp_accept_rx_data(sock, their_seq, tcp_data, tcp_data_len, &ack_needed);
+            if (tcp->flags & TCP_FLAG_ACK) ApplyAck(sock, their_ack);
+            // our fin is acked once the peer's ack reaches snd.nxt (tcp_seq was
+            // bumped past the fin in Close). (satoru)
+            bool our_fin_acked = (tcp->flags & TCP_FLAG_ACK) && !SeqBefore(their_ack, sock->tcp_seq);
+            bool their_fin = false;
             if (tcp->flags & TCP_FLAG_FIN) {
-                sock->tcp_ack = their_seq + 1u;
-                sock->tcp_state = TCP_TIME_WAIT;
-                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
+                uint32_t fin_seq = their_seq + (uint32_t)tcp_data_len;
+                if (tcp_data_len == 0 || accepted == tcp_data_len) {
+                    if (!SeqBefore(fin_seq + 1u, sock->tcp_ack))
+                        sock->tcp_ack = fin_seq + 1u;
+                    their_fin = true;
+                    ack_needed = true;
+                }
             }
+            if (our_fin_acked && their_fin)      sock->tcp_state = TCP_TIME_WAIT;
+            else if (their_fin)                  sock->tcp_state = TCP_CLOSING;
+            else if (our_fin_acked)              sock->tcp_state = TCP_FIN_WAIT_2;
+            if (ack_needed)
+                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
             break;
+        }
+
+        case TCP_FIN_WAIT_2: {
+            if (tcp->flags & TCP_FLAG_RST) {
+                sock->tcp_state = TCP_CLOSED;
+                sock->tx_pending = false;
+                sock->active = false;
+                break;
+            }
+            // our fin is already acked here; keep receiving the peer's data
+            // until it sends its own fin. (satoru)
+            bool ack_needed = false;
+            int accepted = tcp_accept_rx_data(sock, their_seq, tcp_data, tcp_data_len, &ack_needed);
+            if (tcp->flags & TCP_FLAG_ACK) ApplyAck(sock, their_ack);
+            if (tcp->flags & TCP_FLAG_FIN) {
+                uint32_t fin_seq = their_seq + (uint32_t)tcp_data_len;
+                if (tcp_data_len == 0 || accepted == tcp_data_len) {
+                    if (!SeqBefore(fin_seq + 1u, sock->tcp_ack))
+                        sock->tcp_ack = fin_seq + 1u;
+                    sock->tcp_state = TCP_TIME_WAIT;
+                    ack_needed = true;
+                }
+            }
+            if (ack_needed)
+                SendTCPPacket(sock, TCP_FLAG_ACK, nullptr, 0, sock->tcp_seq, false);
+            break;
+        }
 
         case TCP_CLOSE_WAIT:
             if (tcp->flags & TCP_FLAG_RST) {

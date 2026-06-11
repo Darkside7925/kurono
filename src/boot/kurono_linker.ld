@@ -46,6 +46,15 @@ SECTIONS
         kernel_bss_start = .;
         *(COMMON)
         *(.bss)
+        *(.bss.*)
+        /* large-model bss: -mcmodel=large emits zero-init globals bigger than
+           the small-data threshold into a SEPARATE .lbss section. it must live
+           inside the zeroed bss range AND below kernel_end, or large zero-init
+           globals (e.g. the wayland client table g_clients) boot as raw garbage
+           and the pmm also hands their memory out as free. pull it in here so
+           the boot bss-zero loop covers it and the pmm marks it used. (satoru) */
+        *(.lbss)
+        *(.lbss.*)
         *(.stk)
         kernel_bss_end = .;
 

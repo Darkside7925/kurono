@@ -10,6 +10,32 @@ Built from scratch in freestanding C++17 and x86 assembly - no libc in the kerne
 
 ## Quick Start
 
+I moved the whole thing onto Linux (KVM), so this is the path I actually use day to day:
+
+```bash
+# build the iso + boot it (KVM, virtio-gpu, audio, USB)  -  one command
+./start.sh
+
+# don't rebuild, just boot the existing iso
+./start.sh --no-build
+
+# clean rebuild then boot
+./start.sh --clean
+
+# plain framebuffer instead of the accelerated virtio-gpu
+./start.sh --std
+
+# boot the UEFI path instead of BIOS
+./start.sh --uefi
+
+# gdb stub on localhost:1234
+./start.sh --debug
+```
+
+> heads up: boot with **one core** for now (`start.sh` already does). the scheduler isn't SMP-safe yet, so anything above `-smp 1` deadlocks the desktop a few seconds in. fixing that is on the list.
+
+If you're still on Windows the old WHPX launcher works too:
+
 ```powershell
 # Build ISO and launch with the default QEMU profile
 .\start.ps1
@@ -69,6 +95,20 @@ wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make run-noaccel'
 ---
 
 ## Recent Updates
+
+### June 2026  -  moved to Linux + made the desktop actually usable
+
+Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It's way faster and it quietly fixed a pile of networking + input pain that WHPX was causing. Wrote a `start.sh` so booting is one command now.
+
+- **Boot doesn't hang anymore.** The desktop was coming up black  -  turned out the large-model BSS section wasn't being zeroed, so a bunch of pointers were straight-up garbage. Fixed it in the linker script. Also tracked down the SMP race that froze the desktop ~8s in (boot `-smp 1` for now, scheduler isn't SMP-safe yet).
+- **Networking actually works.** curl/HTTP goes end to end now  -  fixed a recv loop that gave up way too early, the FIN_WAIT half-close path, and ephemeral port selection. Pulled real pages off example.com and wikipedia over tap+NAT.
+- **USB works over xHCI.** keyboard, mouse, and tablet all enumerate and report now (the DMA structs just needed proper page alignment). The tablet gives accurate absolute cursor positioning, which is also how I drive it headless.
+- **Killed the bugs that made the desktop unusable:**
+  - top taskbar was eating *every* click  -  you literally couldn't use anything. Now only the bar itself grabs clicks; everything else passes through.
+  - Sign Out / Lock froze the whole machine (the lock screen never yielded, so USB input went dead). Fixed.
+  - dragging a window left ghost trails  -  added a real clip stack so nothing paints outside its own window.
+  - calculator clicks did nothing and right-click in Files was broken  -  both were window-local vs global coordinate mixups. Fixed.
+- **UI glow-up.** Built a little theme system (KSS) so everything themes the same way instead of every app hardcoding its own colors. Settings and the Control Center are black/grey + modern now, the start button uses the actual boot logo instead of a hand-drawn "K", and a bunch of off-center text (it assumed 8px-per-char on a proportional font) got fixed.
 
 ### May 2026
 

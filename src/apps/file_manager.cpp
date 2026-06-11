@@ -193,6 +193,18 @@ FMTab* FileManagerApp::Active(int pane){
 FMEntry* FileManagerApp::EntriesOf(int pane){ return (pane==1)?entries_r:entries_l; }
 int      FileManagerApp::EntryCount(int pane){ return (pane==1)?entry_count_r:entry_count_l; }
 
+// mouse-wheel scroll of the active pane's file list. dz>0 = wheel up = toward the
+// top. clamped to the entry range so it can't run off either end. (satoru)
+void FileManagerApp::Scroll(int dz){
+    FMTab* t = Active(0);
+    if(!t) return;
+    int n = EntryCount(0);
+    t->scroll -= dz * 3;
+    if(t->scroll < 0) t->scroll = 0;
+    int maxs = (n > 0) ? n - 1 : 0;
+    if(t->scroll > maxs) t->scroll = maxs;
+}
+
 void FileManagerApp::JoinPath(char* dst,int max,const char* dir,const char* name){
     scpy(dst,dir,max);
     if(!seq(dir,"/")) sapp(dst,"/",max);
@@ -592,7 +604,8 @@ int FileManagerApp::Open(){
         (WindowInputFunc)[](Window* w,int ev,int p1,int p2){
             if(ev==1) FileManagerApp::Input(w,p1,p2,true,0);
             else if(ev==2) FileManagerApp::Input(w,0,0,false,(char)p1);
-            else if(ev==4) FileManagerApp::Input(w,p1,p2,false,(char)4);  // right-click
+            else if(ev==4) FileManagerApp::Input(w,p1 - w->content_x,p2 - w->content_y,false,(char)4);  // right-click: ev4 arrives global, convert to content-local like task_manager (satoru)
+            else if(ev==3) FileManagerApp::Scroll(p1);                    // mouse wheel (satoru)
         }
     );
     RuntimeLog::LogAppEvent("files","open","");

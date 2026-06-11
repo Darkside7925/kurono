@@ -60,6 +60,7 @@ public:
     // window callbacks
     static void Render(void* win, int x, int y, int w, int h);
     static bool Input(void* win, int mx, int my, bool clicked, char key);
+    static void Scroll(int dz);   // mouse-wheel scroll of the active pane (satoru)
 
     // trash subsystem
     static void EnsureTrashDir();

@@ -45,6 +45,7 @@
 #include "../system/logging.h"
 #include "../system/installer.h"
 #include "../system/ui_config.h"
+#include "../ui/kss.h"
 #include "../system/gpu_driver_installer.h"
 #include "../system/system_update.h"
 #include "../shell/shell.h"
@@ -1603,6 +1604,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // it writes /etc/kurono/ui.conf with defaults on first boot.
     SerialLogger::Log("[UIConfig] Init...\r\n");
     UIConfig::Init();
+    // seed the kss theme tokens from ui.conf (defaults to the black/grey palette). (satoru)
+    KSS::Init();
 
     // apply persisted accessibility settings to the runtime layers
     Graphics::SetColorFilter(UIConfig::Int("a11y.color_filter", 0));

@@ -209,6 +209,10 @@ Graphics::DrawStats Graphics::draw_stats = {0};
 // accessibility post-process state
 static int  g_color_filter   = 0;     // 0=off,1=protan,2=deutan,3=tritan,4=gray
 static bool g_high_contrast  = false;
+// software display brightness 10..100 (%). this backend has no panel/gamma
+// dimming, so we dim in the swapbuffers post-process pass instead  -  the
+// display settings slider now has a real effect. 100 = unmodified. (satoru)
+static int  g_brightness     = 100;
 
 bool Graphics::fb_wc_active = false;
 uint32_t Graphics::monitor_hz = 0;
@@ -218,6 +222,8 @@ int Graphics::clip_y = 0;
 int Graphics::clip_w = 0;
 int Graphics::clip_h = 0;
 bool Graphics::clipping_enabled = false;
+Graphics::ClipSave Graphics::clip_stack[16] = {};
+int Graphics::clip_sp = 0;
 
 Graphics::DirtyRegion Graphics::dirty_regions[16];
 int Graphics::dirty_count = 0;
@@ -549,6 +555,11 @@ static inline uint32_t apply_a11y_filter(uint32_t c) {
         int yy = (299*nr + 587*ng + 114*nb) / 1000;
         nr = ng = nb = (yy < 96) ? 0 : 255;
     }
+    if (g_brightness < 100) {   // software dim (satoru)
+        nr = nr * g_brightness / 100;
+        ng = ng * g_brightness / 100;
+        nb = nb * g_brightness / 100;
+    }
     if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
     if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
     if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
@@ -579,7 +590,7 @@ void Graphics::SwapBuffers() {
     if (bytes_per_pixel == 0) return;
     const uint32_t bytes_per_line = fb_width * bytes_per_pixel;
     const bool pitch_match = (bytes_per_line == fb_pitch);
-    const bool filter_active = ((g_color_filter > 0 || g_high_contrast) && bytes_per_pixel == 4);
+    const bool filter_active = ((g_color_filter > 0 || g_high_contrast || g_brightness < 100) && bytes_per_pixel == 4);
 
     // accessibility path: per-pixel transform. We still honour the dirty
     // region list so a static screen with a moving cursor isn't a full
@@ -686,7 +697,7 @@ void Graphics::Present(const Rect* rects, int count) {
     if (render_mode == SINGLE_BUFFER || !back_buffer || !fb_addr) return;
     const uint32_t bytes_per_pixel = fb_bpp / 8;
     if (bytes_per_pixel == 0) return;
-    const bool filter_active = ((g_color_filter > 0 || g_high_contrast) && bytes_per_pixel == 4);
+    const bool filter_active = ((g_color_filter > 0 || g_high_contrast || g_brightness < 100) && bytes_per_pixel == 4);
 
     if (!rects || count <= 0) {
         // hand off to SwapBuffers full-frame path
@@ -746,7 +757,14 @@ void Graphics::ClearBackBuffer(uint32_t color) {
 
 void Graphics::DrawPixel(int x, int y, uint32_t color) {
     if (!IsPointInBounds(x, y)) return;
-    
+    // honour the active clip rect: every line/text/rounded-rect/alpha primitive
+    // funnels through here, so a single check makes them all respect SetClipRect.
+    // without it, scrolled UI (settings panels) drew its toggles/sliders/text
+    // outside the window. (satoru)
+    if (clipping_enabled &&
+        ((unsigned)(x - clip_x) >= (unsigned)clip_w ||
+         (unsigned)(y - clip_y) >= (unsigned)clip_h)) return;
+
     uint8_t alpha = (color >> 24) & 0xFF;
     if (alpha == 0) return;  // fully transparent  -  skip
     if (alpha >= 0xF0) {
@@ -995,6 +1013,47 @@ void Graphics::ClearClipRect() {
     clipping_enabled = false;
 }
 
+void Graphics::PushClipRect(int x, int y, int w, int h) {
+    // save the current clip so PopClipRect can restore it. on overflow we simply
+    // stop saving (the deepest clip still applies) rather than corrupt memory. (satoru)
+    if (clip_sp < 16) {
+        clip_stack[clip_sp].x = clip_x;
+        clip_stack[clip_sp].y = clip_y;
+        clip_stack[clip_sp].w = clip_w;
+        clip_stack[clip_sp].h = clip_h;
+        clip_stack[clip_sp].enabled = clipping_enabled;
+    }
+    clip_sp++;
+
+    // intersect the requested rect with the active clip so a child never draws
+    // outside its parent. (satoru)
+    int nx = x, ny = y, nw = w, nh = h;
+    if (clipping_enabled) {
+        int ax = clip_x > nx ? clip_x : nx;
+        int ay = clip_y > ny ? clip_y : ny;
+        int ar = (clip_x + clip_w) < (nx + nw) ? (clip_x + clip_w) : (nx + nw);
+        int ab = (clip_y + clip_h) < (ny + nh) ? (clip_y + clip_h) : (ny + nh);
+        nx = ax; ny = ay;
+        nw = ar - ax; nh = ab - ay;
+        if (nw < 0) nw = 0;
+        if (nh < 0) nh = 0;
+    }
+    clip_x = nx; clip_y = ny; clip_w = nw; clip_h = nh;
+    clipping_enabled = true;
+}
+
+void Graphics::PopClipRect() {
+    if (clip_sp <= 0) { clipping_enabled = false; return; }
+    clip_sp--;
+    if (clip_sp < 16) {
+        clip_x = clip_stack[clip_sp].x;
+        clip_y = clip_stack[clip_sp].y;
+        clip_w = clip_stack[clip_sp].w;
+        clip_h = clip_stack[clip_sp].h;
+        clipping_enabled = clip_stack[clip_sp].enabled;
+    }
+}
+
 uint32_t Graphics::RGB(uint8_t r, uint8_t g, uint8_t b) {
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
@@ -1019,6 +1078,11 @@ uint32_t Graphics::BlendColors(uint32_t src, uint32_t dst, uint8_t alpha) {
 void Graphics::BlendPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     if (a == 0) return;
     if (a == 255) { DrawPixel(x, y, RGB(r, g, b)); return; }
+    // honour the active clip  -  without this, alpha-blended primitives (shadows,
+    // translucent panels, rounded-corner AA) bled past their window. (satoru)
+    if (clipping_enabled &&
+        ((unsigned)(x - clip_x) >= (unsigned)clip_w ||
+         (unsigned)(y - clip_y) >= (unsigned)clip_h)) return;
     uint32_t dst = ReadPixel(x, y);
     uint32_t src = RGBA(r, g, b, a);
     uint32_t blended = BlendColors(src, dst, a);
@@ -1039,10 +1103,13 @@ void Graphics::FillRectRounded(int x, int y, int w, int h, int r, uint32_t color
             int dy2 = dy * dy;
             for (int dx = 0; dx < r; dx++) {
                 if (dx*dx + dy2 <= r2) {
-                    DrawPixelUnsafe(x + r - 1 - dx, y + r - 1 - dy, op);
-                    DrawPixelUnsafe(x + w - r + dx, y + r - 1 - dy, op);
-                    DrawPixelUnsafe(x + r - 1 - dx, y + h - r + dy, op);
-                    DrawPixelUnsafe(x + w - r + dx, y + h - r + dy, op);
+                    // route opaque corners through DrawPixel (clip-aware) so rounded
+                    // panels respect the active clip; DrawPixel fast-paths opaque
+                    // writes so the cost is just the clip test. (satoru)
+                    DrawPixel(x + r - 1 - dx, y + r - 1 - dy, op);
+                    DrawPixel(x + w - r + dx, y + r - 1 - dy, op);
+                    DrawPixel(x + r - 1 - dx, y + h - r + dy, op);
+                    DrawPixel(x + w - r + dx, y + h - r + dy, op);
                 }
             }
         }
@@ -1186,6 +1253,12 @@ void Graphics::SetColorFilter(int mode) {
 }
 int  Graphics::GetColorFilter()        { return g_color_filter; }
 void Graphics::SetHighContrast(bool on){ g_high_contrast = on; }
+void Graphics::SetBrightness(int pct){
+    if (pct < 10) pct = 10; else if (pct > 100) pct = 100;
+    g_brightness = pct;
+    MarkUIDirty();   // force a re-tonemap of the whole screen (satoru)
+}
+int  Graphics::GetBrightness(){ return g_brightness; }
 
 //  drawstring  -  convenience text renderer for desktop/app layers
 //  font size scales with resolution: 16px at 1024x768, 16px at 1080p,

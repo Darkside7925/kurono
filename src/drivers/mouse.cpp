@@ -721,6 +721,28 @@ void Mouse::RingPush(const Mouse::Event& e) {
     __atomic_store_n(&ev_head, next, __ATOMIC_RELEASE);
 }
 
+// usb tablet / absolute pointer report = [buttons, Xlo, Xhi, Ylo, Yhi, (wheel)].
+// qemu's usb-tablet reports X/Y over the hid logical range 0..0x7FFF; map to the
+// live screen and feed the shared absolute path (the one vmmouse also uses), so
+// the tablet places the cursor at an absolute position instead of being
+// mis-decoded as a 3-byte relative boot mouse. (satoru)
+void Mouse::ProcessUSBAbsReport(const uint8_t* report, int len) {
+    if (!report || len < 5) return;
+    uint8_t hw = 0;
+    if (report[0] & 0x01) hw |= 0x01;   // left
+    if (report[0] & 0x02) hw |= 0x02;   // right
+    if (report[0] & 0x04) hw |= 0x04;   // middle
+    int ax = (int)report[1] | ((int)report[2] << 8);
+    int ay = (int)report[3] | ((int)report[4] << 8);
+    int wheel = (len >= 6) ? (int)(int8_t)report[5] : 0;
+    const int LOGMAX = 0x7FFF;
+    int w = Graphics::GetWidth(); int h = Graphics::GetHeight();
+    if (w < 1) w = 1; if (h < 1) h = 1;
+    int sx = (int)((long long)ax * (w - 1) / LOGMAX);
+    int sy = (int)((long long)ay * (h - 1) / LOGMAX);
+    EmitHostAbsoluteSample(sx, sy, hw, wheel);
+}
+
 void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int wheel_delta) {
     perf_stats.packets_processed++;
 

@@ -1,6 +1,17 @@
 ﻿# Kurono OS -- Development Status
 
-**Last Updated:** April 2026
+**Last Updated:** June 2026
+
+## What's New (June 2026)
+
+Big one this month: I moved the whole dev setup off Windows/WHPX onto **Linux + KVM**. Faster, and it fixed a stack of networking/input weirdness WHPX was causing. There's a `./start.sh` now that builds + boots in one shot.
+
+- Boot no longer hangs black  -  the large-model BSS wasn't getting zeroed (garbage pointers). Fixed in the linker script.
+- Boot **`-smp 1`** for now  -  the scheduler isn't SMP-safe yet and >1 core deadlocks the desktop ~8s in.
+- curl/HTTP works end to end (recv-loop + FIN_WAIT half-close + ephemeral ports). Fetched real pages off example.com / wikipedia over tap+NAT.
+- USB keyboard/mouse/tablet work over xHCI (DMA alignment was the fix); tablet does accurate absolute positioning.
+- Fixed the desktop-breaking bugs: top-taskbar swallowing all input, Sign Out/Lock freezing the machine, window-drag ghost trails, dead calculator clicks, broken Files right-click.
+- Started the UI pass: a small theme system (**KSS**), black/grey + modern **Settings** and **Control Center**, the start button now uses the real boot logo, and a bunch of off-center text got fixed.
 
 ## Current State
 
@@ -13,7 +24,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - **Source files:** ~65 C++ + 1 ASM
 - **Primary outputs:** `build/kurono.elf`, `build/kurono.iso`, `build/kurono_efi.efi`, `build/kurono_emergency.efi`
 - **Build errors:** 0
-- **QEMU target:** `qemu-system-x86_64` with WHPX acceleration (10 GB RAM, 4 SMP cores)
+- **QEMU target:** `qemu-system-x86_64` with KVM on Linux (WHPX on Windows), 4 GB RAM, **1 vCPU** for now (scheduler isn't SMP-safe yet), virtio-gpu + tap/NAT networking + xHCI USB
 
 ---
 

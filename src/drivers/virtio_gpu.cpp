@@ -688,10 +688,16 @@ bool VirtIOGPU::PresentFramebuffer(void* pixels, uint32_t width, uint32_t height
         vq->free_head = vq->desc[head_b].next;
         vq->num_free--;
 
-        // each indirect table uses 4 slots: 0,1 = xfer pair; 4,5 = flush pair
+        // two separate indirect tables: [0],[1] = xfer pair (based at &[0]);
+        // [4],[5] = flush pair (based at &[4]). the `next` field of an indirect
+        // descriptor is an index RELATIVE to its own table base, so the flush
+        // head's next must be 1 (-> [5]), NOT the absolute 5  -  pointing at 5 in a
+        // 2-entry table is out of range and makes qemu reject the chain
+        // ("Desc next is 5"), which breaks the virtqueue and freezes the desktop
+        // once a real display drains the queue. (satoru)
         s_indirect_table[0] = { (uint64_t)(uintptr_t)&xfer,       sizeof(xfer),       VIRTQ_DESC_F_NEXT, 1 };
         s_indirect_table[1] = { (uint64_t)(uintptr_t)&resp_xfer,  sizeof(resp_xfer),  VIRTQ_DESC_F_WRITE, 0 };
-        s_indirect_table[4] = { (uint64_t)(uintptr_t)&flush,      sizeof(flush),      VIRTQ_DESC_F_NEXT, 5 };
+        s_indirect_table[4] = { (uint64_t)(uintptr_t)&flush,      sizeof(flush),      VIRTQ_DESC_F_NEXT, 1 };
         s_indirect_table[5] = { (uint64_t)(uintptr_t)&resp_flush, sizeof(resp_flush), VIRTQ_DESC_F_WRITE, 0 };
 
         vq->desc[head_a].addr = (uint64_t)(uintptr_t)&s_indirect_table[0];

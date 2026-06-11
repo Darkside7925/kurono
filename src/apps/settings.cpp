@@ -378,6 +378,9 @@ void SettingsApp::Init(){
     if (fs >= 1 && fs <= 3) state.font_scale = fs;
     Graphics::SetColorFilter(state.a11y_color_filter);
     Graphics::SetHighContrast(state.a11y_high_contrast);
+    // restore software display brightness so the persisted level applies from
+    // boot, not just when the display panel is opened. (satoru)
+    Graphics::SetBrightness(UIConfig::Int("display.brightness", 100));
     Keyboard::SetStickyKeys(state.a11y_sticky_keys);
     Keyboard::SetSlowKeys(state.a11y_slow_keys ? 250 : 0);
     Keyboard::SetBounceKeys(state.a11y_bounce_keys ? 200 : 0);
@@ -405,6 +408,7 @@ int SettingsApp::Open(){
         (WindowInputFunc)[](Window* w,int ev,int p1,int p2){
             if(ev==1) SettingsApp::Input(w,p1,p2,true,0);
             else if(ev==2) SettingsApp::Input(w,0,0,false,(char)p1);
+            else if(ev==3) SettingsApp::Scroll(p1);   // mouse wheel (satoru)
         }
     );
     return wid;
@@ -915,21 +919,27 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
 
     int px=cx+SIDEBAR_W;
     int pw=cw-SIDEBAR_W;
+    // scrollable content panel: clip to the panel rect and shift content up by
+    // scroll_offset so tall panels can be mouse-wheel scrolled. the sidebar is
+    // outside the clip so it never scrolls. (satoru)
+    Graphics::PushClipRect(px, cy, pw, ch);
+    int sy = cy - scroll_offset;
     switch(current_tab){
-        case STAB_DISPLAY:     RenderDisplay(px,cy,pw,ch); break;
-        case STAB_SOUND:       RenderSound(px,cy,pw,ch); break;
-        case STAB_NETWORK:     RenderNetwork(px,cy,pw,ch); break;
-        case STAB_STORAGE:     RenderStorage(px,cy,pw,ch); break;
-        case STAB_POWER:       RenderPower(px,cy,pw,ch); break;
-        case STAB_PERSONALIZE: RenderPersonalize(px,cy,pw,ch); break;
-        case STAB_SECURITY:    RenderSecurity(px,cy,pw,ch); break;
-        case STAB_PACKAGES:    RenderPackages(px,cy,pw,ch); break;
-        case STAB_UPDATES:     RenderUpdates(px,cy,pw,ch); break;
-        case STAB_SYSTEM:      RenderSystem(px,cy,pw,ch); break;
-        case STAB_ABOUT:       RenderAbout(px,cy,pw,ch); break;
-        case STAB_ACCESSIBILITY: RenderAccessibility(px,cy,pw,ch); break;
+        case STAB_DISPLAY:     RenderDisplay(px,sy,pw,ch); break;
+        case STAB_SOUND:       RenderSound(px,sy,pw,ch); break;
+        case STAB_NETWORK:     RenderNetwork(px,sy,pw,ch); break;
+        case STAB_STORAGE:     RenderStorage(px,sy,pw,ch); break;
+        case STAB_POWER:       RenderPower(px,sy,pw,ch); break;
+        case STAB_PERSONALIZE: RenderPersonalize(px,sy,pw,ch); break;
+        case STAB_SECURITY:    RenderSecurity(px,sy,pw,ch); break;
+        case STAB_PACKAGES:    RenderPackages(px,sy,pw,ch); break;
+        case STAB_UPDATES:     RenderUpdates(px,sy,pw,ch); break;
+        case STAB_SYSTEM:      RenderSystem(px,sy,pw,ch); break;
+        case STAB_ABOUT:       RenderAbout(px,sy,pw,ch); break;
+        case STAB_ACCESSIBILITY: RenderAccessibility(px,sy,pw,ch); break;
         default: break;
     }
+    Graphics::PopClipRect();
 
     // ── modal: WiFi connect dialog ──
     if (wifi_dialog_open) {
@@ -955,6 +965,14 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
         Graphics::DrawString    (dx + dw - 102,  dy + dh - 28, "Connect", S_WHITE, 0xFF000000);
         Graphics::DrawString(dx + 16, dy + dh - 60, "Enter password, then press Enter or Connect.", S_DIM, 0xFF000000);
     }
+}
+
+// mouse-wheel scroll of the content panel. dz>0 = wheel up = toward the top.
+// ~24px per notch; clamped so it can't run far past the content. (satoru)
+void SettingsApp::Scroll(int dz){
+    scroll_offset -= dz * 24;
+    if(scroll_offset < 0) scroll_offset = 0;
+    if(scroll_offset > 800) scroll_offset = 800;
 }
 
 bool SettingsApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
@@ -1016,16 +1034,18 @@ bool SettingsApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     if(mx >= 0 && mx < SIDEBAR_W){
         int tab = (my - 6) / 32;
         if(tab>=0 && tab<STAB_COUNT){
+            if((SettingsTab)tab != current_tab) scroll_offset = 0; // reset scroll per tab (satoru)
             current_tab=(SettingsTab)tab;
             return true;
         }
     }
 
-    // content area clicks (right of sidebar)
+    // content area clicks (right of sidebar). add scroll_offset so a click lands
+    // on the scrolled control, mirroring the Render shift. (satoru)
     int pw = w->w - 2 - SIDEBAR_W;
     int ph = w->h - WM_TITLEBAR_H - 1;
-    int rx = mx - SIDEBAR_W;  // relative x within panel
-    int ry = my;               // relative y within content
+    int rx = mx - SIDEBAR_W;          // relative x within panel
+    int ry = my + scroll_offset;       // relative y within (scrolled) content
 
     if (rx < 0 || ry < 0) return false;
 
