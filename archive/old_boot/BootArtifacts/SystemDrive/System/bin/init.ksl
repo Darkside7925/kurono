@@ -1,0 +1,4 @@
+# Kurono init script
+load graphics
+load input
+start shell

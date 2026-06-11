@@ -1,0 +1,510 @@
+#include "types.h"
+#include "multiboot.h" 
+#include "system.h"
+#include "../drivers/graphics.h"
+#include "../drivers/keyboard.h"
+#include "../drivers/mouse.h"
+#include "../drivers/display.h"
+
+extern "C" void kernel_main(uint32_t magic, uint32_t mb_addr) {
+    SerialLogger::Init();
+    SerialLogger::Log("Kurono C++ Kernel Starting...\r\n");
+
+    // Initialize New Architecture Components
+    HAL::Init();
+    MemoryManager::Init();
+    Scheduler::Init();
+    VFS::Init();
+
+    // Run Diagnostics
+    TestSuite::Run();
+
+    if (magic != 0x2BADB002) {
+        SerialLogger::Log("Invalid Multiboot Magic!\r\n");
+        return;
+    }
+
+    multiboot_info_t* mbi = (multiboot_info_t*)mb_addr;
+    
+    // 1. Initialize Graphics
+    if (mbi->flags & (1u << 12)) {
+        Graphics::Init(mbi->framebuffer_addr, mbi->framebuffer_width, mbi->framebuffer_height, mbi->framebuffer_pitch, mbi->framebuffer_bpp);
+    } else {
+        SerialLogger::Log("No framebuffer found! Proceeding with Text Mode...\r\n");
+        // We will continue without graphics. 
+        // TODO: Initialize VGA Text Mode driver here if needed.
+        // For now, we will rely on Serial logs and simple logic.
+        // Or we can return if we strictly require graphics.
+        // But to "Fix QEMU" boot loop, we proceed.
+    }
+
+    Timer::Init(1000);
+    TimeManager::SelectPIT(1000);
+    TimeManager::Init();
+    Keyboard::Init();
+
+    Graphics::Clear(0xFF000000);
+    Timer::WaitMs(2000);
+
+    MediaDecoder::Image logo = {0,0,0,false,0,false};
+    int lx = 0, ly = 0, lw = 0, lh = 0;
+    if (mbi->flags & (1u << 3) && mbi->mods_count > 0) {
+        multiboot_module_t* mods = (multiboot_module_t*)mbi->mods_addr;
+        auto streq = [](const char* a, const char* b){
+            if (!a || !b) return false;
+            while (*a && *b) { if (*a != *b) return false; a++; b++; }
+            return *a == 0 && *b == 0;
+        };
+        for (uint32_t i = 0; i < mbi->mods_count; i++) {
+            const char* name = (const char*)mods[i].string;
+            if (name && streq(name, "logo")) {
+                MediaDecoder::Image candidate = MediaDecoder::DecodeModule(mods[i].mod_start, mods[i].mod_end);
+                if (candidate.valid) { logo = candidate; break; }
+            }
+        }
+        if (!logo.valid) {
+            for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                const char* name = (const char*)mods[i].string;
+                if (name && streq(name, "logo_raw")) {
+                    MediaDecoder::Image candidate = MediaDecoder::DecodeRaw(mods[i].mod_start);
+                    if (candidate.valid) { logo = candidate; break; }
+                }
+            }
+        }
+        if (!logo.valid) {
+            for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                uint32_t start = mods[i].mod_start; uint32_t end = mods[i].mod_end;
+                const uint8_t* d = (const uint8_t*)start; size_t n = (size_t)(end - start);
+                MediaDecoder::Image candidate;
+                if (MediaDecoder::IsPNG(d, n) || MediaDecoder::IsJPEG(d, n)) {
+                    candidate = MediaDecoder::DecodeModule(start, end);
+                } else {
+                    candidate = MediaDecoder::DecodeRaw(start);
+                }
+                if (candidate.valid) { logo = candidate; break; }
+            }
+        }
+        if (logo.valid) {
+            int screen_w = Graphics::GetWidth();
+            int screen_h = Graphics::GetHeight();
+            lw = (screen_w * 3) / 10;
+            lh = (logo.height * lw) / logo.width;
+            lx = (screen_w - lw) / 2;
+            ly = (screen_h / 3) - (lh / 2);
+            MediaDecoder::DrawImageScaled(logo, lx, ly, lw, lh);
+            Timer::WaitMs(3000);
+        }
+    }
+
+    Graphics::Clear(0xFF000000);
+
+    System::Initialize();
+
+    MediaDecoder::Image wallpaper = {0,0,0,false,0,false};
+    if (mbi->flags & (1u << 3) && mbi->mods_count > 0) {
+        multiboot_module_t* mods = (multiboot_module_t*)mbi->mods_addr;
+        auto streq = [](const char* a, const char* b){
+            if (!a || !b) return false;
+            while (*a && *b) { if (*a != *b) return false; a++; b++; }
+            return *a == 0 && *b == 0;
+        };
+        for (uint32_t i = 0; i < mbi->mods_count; i++) {
+            const char* name = (const char*)mods[i].string;
+            if (name && streq(name, "wallpaper")) {
+                MediaDecoder::Image candidate = MediaDecoder::DecodeModule(mods[i].mod_start, mods[i].mod_end);
+                if (candidate.valid) { wallpaper = candidate; break; }
+            }
+        }
+        for (uint32_t i = 0; i < mbi->mods_count; i++) {
+            const char* name = (const char*)mods[i].string;
+            SerialLogger::Log("Module found: ");
+            if (name) SerialLogger::Log(name); else SerialLogger::Log("null");
+            SerialLogger::Log("\r\n");
+            
+            if (name && streq(name, "font")) {
+                const uint8_t* fptr = (const uint8_t*)mods[i].mod_start; int fsize = (int)(mods[i].mod_end - mods[i].mod_start);
+                SerialLogger::Log("Font found at "); SerialLogger::LogHex((uint32_t)fptr); 
+                SerialLogger::Log(" Size: "); SerialLogger::LogDec(fsize); SerialLogger::Log("\r\n");
+                FontTTF::Init(fptr, fsize);
+                if (FontTTF::ok) SerialLogger::Log("Font Initialized OK\r\n");
+                else SerialLogger::Log("Font Initialization FAILED\r\n");
+                break;
+            }
+        }
+        if (!wallpaper.valid) {
+            for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                uint32_t start = mods[i].mod_start; uint32_t end = mods[i].mod_end;
+                const uint8_t* d = (const uint8_t*)start; size_t n = (size_t)(end - start);
+                MediaDecoder::Image candidate;
+                if (MediaDecoder::IsPNG(d, n) || MediaDecoder::IsJPEG(d, n)) {
+                    candidate = MediaDecoder::DecodeModule(start, end);
+                } else {
+                    candidate = MediaDecoder::DecodeRaw(start);
+                }
+                if (candidate.valid) { wallpaper = candidate; break; }
+            }
+        }
+    }
+
+    GUI::SetWallpaper(wallpaper);
+    Mouse::Init();
+    TimeManager::SetTimezoneMinutes(0);
+    TimeManager::EnableDST(false);
+    
+    // Only show GUI if graphics initialized
+    if (mbi->flags & (1u << 12)) {
+        LockScreen::Show();
+        GUI::DrawDesktop();
+    }
+    MediaDecoder::FreeImage(logo);
+    
+    // Init Calculator
+    Calculator::Init(100, 100);
+    
+    uint32_t acc = 0;
+    
+    // Create a dirty region rect to minimize redraws
+    // -1 means nothing dirty
+    // int dirty_x = 0, dirty_y = 0, dirty_w = Graphics::GetWidth(), dirty_h = Graphics::GetHeight();
+    
+    // Initial full redraw
+    GUI::DrawDesktop();
+    Calculator::Draw();
+    Mouse::ForceRedraw();
+    
+    // Disable mouse internal drawing as we handle it in the main loop (double buffered)
+    Mouse::SetAutoDraw(false);
+    
+    while (true) {
+        Timer::WaitMs(16); // 60fps
+        TimeManager::AdvanceByMs(16);
+        InputManager::Poll();
+        TimeManager::MaybeSyncRTC(TimeManager::NowUTC().us);
+        acc += 16;
+        
+        Scheduler::Tick();
+        
+#include "kernel/types.h"
+#include "kernel/multiboot.h"
+#include "kernel/system.h"
+#include "drivers/serial.h"
+#include "drivers/display.h"    // Enhanced display controller
+#include "drivers/graphics.h"
+#include "drivers/timer.h"
+#include "drivers/keyboard.h"
+#include "drivers/mouse.h"
+#include "media/mediadecoder.h"
+#include "ui/gui.h"
+#include "ui/lockscreen.h"
+#include "ui/font.h"
+#include "kernel/time.h"
+#include "../apps/calculator.h"
+#include "../hal/hal.h"
+#include "../fs/vfs.h"
+#include "../proc/scheduler.h"
+#include "../kernel/memory_mgr.h"
+#include "../tests/test_suite.h"
+#include "../system/input_manager.h"
+
+extern "C" void kernel_main(uint32_t magic, uint32_t mb_addr) {
+    SerialLogger::Init();
+    SerialLogger::Log("Kurono Enhanced Kernel Starting (180Hz)...\r\n");
+
+    // Initialize New Architecture Components
+    HAL::Init();
+    MemoryManager::Init();
+    Scheduler::Init();
+    VFS::Init();
+
+    // Run Diagnostics
+    TestSuite::Run();
+
+    if (magic != 0x2BADB002) {
+        SerialLogger::Log("Invalid Multiboot Magic!\r\n");
+        return;
+    }
+
+    multiboot_info_t* mbi = (multiboot_info_t*)mb_addr;
+    
+    // 1. Initialize Enhanced Display system
+    SerialLogger::Log("Initializing Enhanced Display Controller...\r\n");
+    
+    // First try advanced display init for high refresh rates
+    bool advanced_display = false;
+    if (DisplayController::Init()) {
+        Graphics::InitAdvanced(); // This will find and set the best 180Hz mode
+        advanced_display = true;
+        SerialLogger::Log("Advanced display system initialized\r\n");
+    } else {
+        // Fallback to basic initialization
+        SerialLogger::Log("Falling back to basic display mode\r\n");
+        if (mbi->flags & (1u << 12)) {
+            Graphics::Init(mbi->framebuffer_addr, mbi->framebuffer_width, 
+                          mbi->framebuffer_height, mbi->framebuffer_pitch, mbi->framebuffer_bpp);
+        } else {
+            SerialLogger::Log("No framebuffer found! Proceeding with Text Mode...\r\n");
+        }
+    }
+
+    // Set target to 180Hz
+    Graphics::SetTargetFPS(180);
+    Graphics::SetRenderMode(Graphics::DOUBLE_BUFFER); // Enable double buffering for smooth 180Hz
+    
+    Timer::Init(1000);
+    TimeManager::SelectPIT(1000);
+    TimeManager::Init();
+    
+    // Initialize enhanced input devices
+    Keyboard::Init();
+    Keyboard::InitUSB(); // Initialize USB support stubs
+    
+    Mouse::Init();
+    Mouse::SetPollingRate(1000); // 1000Hz for ultra-low latency
+    Mouse::SetHighPrecision(true);
+    Mouse::SetDPIScaling(1600, 1600); // High DPI for precision
+
+    Graphics::Clear(0xFF000000);
+    
+    // Shorter wait since we're running at 180Hz now
+    for (int i = 0; i < 360; i++) { // 2 seconds at 180Hz
+        if (Graphics::ShouldRender()) {
+            Graphics::BeginFrame();
+            Graphics::EndFrame();
+        }
+    }
+
+    MediaDecoder::Image logo = {0,0,0,false,0,false};
+    int lx = 0, ly = 0, lw = 0, lh = 0;
+    if (mbi->flags & (1u << 3) && mbi->mods_count > 0) {
+        multiboot_module_t* mods = (multiboot_module_t*)mbi->mods_addr;
+        auto streq = [](const char* a, const char* b){
+            if (!a || !b) return false;
+            while (*a && *b) { if (*a != *b) return false; a++; b++; }
+            return *a == 0 && *b == 0;
+        };
+        for (uint32_t i = 0; i < mbi->mods_count; i++) {
+            const char* name = (const char*)mods[i].string;
+            if (name && streq(name, "logo")) {
+                MediaDecoder::Image candidate = MediaDecoder::DecodeModule(mods[i].mod_start, mods[i].mod_end);
+                if (candidate.valid) { logo = candidate; break; }
+            }
+        }
+        if (!logo.valid) {
+            for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                const char* name = (const char*)mods[i].string;
+                if (name && streq(name, "logo_raw")) {
+                    MediaDecoder::Image candidate = MediaDecoder::DecodeRaw(mods[i].mod_start);
+                    if (candidate.valid) { logo = candidate; break; }
+                }
+            }
+        }
+        if (!logo.valid) {
+            for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                uint32_t start = mods[i].mod_start; uint32_t end = mods[i].mod_end;
+                const uint8_t* d = (const uint8_t*)start; size_t n = (size_t)(end - start);
+                MediaDecoder::Image candidate;
+                if (MediaDecoder::IsPNG(d, n) || MediaDecoder::IsJPEG(d, n)) {
+                    candidate = MediaDecoder::DecodeModule(start, end);
+                } else {
+                    candidate = MediaDecoder::DecodeRaw(start);
+                }
+                if (candidate.valid) { logo = candidate; break; }
+            }
+        }
+        if (logo.valid) {
+            int screen_w = Graphics::GetWidth();
+            int screen_h = Graphics::GetHeight();
+            lw = (screen_w * 3) / 10;
+            lh = (logo.height * lw) / logo.width;
+            lx = (screen_w - lw) / 2;
+            ly = (screen_h / 3) - (lh / 2);
+            
+            // Draw logo using enhanced graphics
+            Graphics::BeginFrame();
+            MediaDecoder::DrawImageScaled(logo, lx, ly, lw, lh);
+            Graphics::EndFrame();
+            
+            // Wait 3 seconds at 180Hz (540 frames)
+            for (int i = 0; i < 540; i++) {
+                if (Graphics::ShouldRender()) {
+                    Graphics::BeginFrame();
+                    Graphics::EndFrame();
+                }
+            }
+        }
+    }
+
+    Graphics::Clear(0xFF000000);
+
+    System::Initialize();
+
+    MediaDecoder::Image wallpaper = {0,0,0,false,0,false};
+    if (mbi->flags & (1u << 3) && mbi->mods_count > 0) {
+        multiboot_module_t* mods = (multiboot_module_t*)mbi->mods_addr;
+        auto streq = [](const char* a, const char* b){
+            if (!a || !b) return false;
+            while (*a && *b) { if (*a != *b) return false; a++; b++; }
+            return *a == 0 && *b == 0;
+        };
+        for (uint32_t i = 0; i < mbi->mods_count; i++) {
+            const char* name = (const char*)mods[i].string;
+            if (name && streq(name, "wallpaper")) {
+                MediaDecoder::Image candidate = MediaDecoder::DecodeModule(mods[i].mod_start, mods[i].mod_end);
+                if (candidate.valid) { wallpaper = candidate; break; }
+            }
+        }
+        for (uint32_t i = 0; i < mbi->mods_count; i++) {
+            const char* name = (const char*)mods[i].string;
+            SerialLogger::Log("Module found: ");
+            if (name) SerialLogger::Log(name); else SerialLogger::Log("null");
+            SerialLogger::Log("\r\n");
+            
+            if (name && streq(name, "font")) {
+                const uint8_t* fptr = (const uint8_t*)mods[i].mod_start; int fsize = (int)(mods[i].mod_end - mods[i].mod_start);
+                SerialLogger::Log("Font found at "); SerialLogger::LogHex((uint32_t)fptr); 
+                SerialLogger::Log(" Size: "); SerialLogger::LogDec(fsize); SerialLogger::Log("\r\n");
+                FontTTF::Init(fptr, fsize);
+                if (FontTTF::ok) SerialLogger::Log("Font Initialized OK\r\n");
+                else SerialLogger::Log("Font Initialization FAILED\r\n");
+                break;
+            }
+        }
+        if (!wallpaper.valid) {
+            for (uint32_t i = 0; i < mbi->mods_count; i++) {
+                uint32_t start = mods[i].mod_start; uint32_t end = mods[i].mod_end;
+                const uint8_t* d = (const uint8_t*)start; size_t n = (size_t)(end - start);
+                MediaDecoder::Image candidate;
+                if (MediaDecoder::IsPNG(d, n) || MediaDecoder::IsJPEG(d, n)) {
+                    candidate = MediaDecoder::DecodeModule(start, end);
+                } else {
+                    candidate = MediaDecoder::DecodeRaw(start);
+                }
+                if (candidate.valid) { wallpaper = candidate; break; }
+            }
+        }
+    }
+
+    GUI::SetWallpaper(wallpaper);
+    
+    TimeManager::SetTimezoneMinutes(0);
+    TimeManager::EnableDST(false);
+    
+    // Only show GUI if graphics initialized
+    if (advanced_display || (mbi->flags & (1u << 12))) {
+        LockScreen::Show();
+        GUI::DrawDesktop();
+    }
+    MediaDecoder::FreeImage(logo);
+    
+    // Init Calculator
+    Calculator::Init(100, 100);
+    
+    uint32_t frame_counter = 0;
+    uint32_t fps_counter = 0;
+    uint32_t last_fps_time = 0;
+    
+    // Enhanced main loop for 180Hz
+    SerialLogger::Log("Starting 180Hz main loop\r\n");
+    
+    // Print performance info every few seconds
+    uint32_t last_perf_print = 0;
+    
+    while (true) {
+        // Frame pacing - target 180Hz (5.555ms per frame)
+        if (Graphics::ShouldRender()) {
+            Graphics::BeginFrame();
+            
+            // Advance time by precise frame increment for 180Hz
+            TimeManager::AdvanceByMs(5); // Slightly less than 5.555 to account for processing time
+            
+            // Enhanced input polling with higher frequency
+            InputManager::Poll();
+            
+            // Mouse polling at higher rate for responsiveness
+            Mouse::Poll();
+            
+            TimeManager::MaybeSyncRTC(TimeManager::NowUTC().us);
+            
+            Scheduler::Tick();
+            
+            // Check for events
+            bool needs_redraw = false;
+            
+            if (Mouse::HasEvent()) {
+                needs_redraw = true;
+            }
+            
+            if (Calculator::IsActive()) {
+                Calculator::Update();
+                needs_redraw = true;
+            }
+            
+            // Redraw every second for clock or when needed
+            if (needs_redraw || (frame_counter % 180 == 0)) { // Every 180 frames = 1 second at 180Hz
+                // Enhanced double-buffered rendering
+                Graphics::ClearBackBuffer(0xFF000000);
+                
+                // Render to back buffer
+                GUI::UpdateBackbuffer();
+                
+                if (Calculator::IsActive()) {
+                    Calculator::Draw();
+                }
+                
+                GUI::DrawTaskbar();
+                
+                // Draw mouse cursor
+                Mouse::DrawAt(Mouse::mx, Mouse::my);
+                
+                // Present frame
+                Graphics::SwapBuffers();
+                Graphics::WaitForVSync();
+            }
+            
+            Graphics::EndFrame();
+            
+            frame_counter++;
+            fps_counter++;
+            
+            // Calculate and log FPS every second
+            uint32_t current_time = TimeManager::NowUTC().ms;
+            if (current_time - last_fps_time >= 1000) {
+                const Graphics::DrawStats& stats = Graphics::GetDrawStats();
+                
+                SerialLogger::Log("180Hz Performance: ");
+                SerialLogger::LogDec(fps_counter);
+                SerialLogger::Log(" fps, Target: ");
+                SerialLogger::LogDec(stats.target_fps);
+                SerialLogger::Log("Hz, Frame time: ");
+                SerialLogger::LogDec(stats.last_frame_time_us);
+                SerialLogger::Log("us\r\n");
+                
+                fps_counter = 0;
+                last_fps_time = current_time;
+            }
+            
+            // Print detailed performance every 10 seconds
+            if (current_time - last_perf_print >= 10000) {
+                const Mouse::PerformanceStats& mouse_stats = Mouse::GetPerformanceStats();
+                SerialLogger::Log("Mouse Performance: ");
+                SerialLogger::LogDec(mouse_stats.packets_processed);
+                SerialLogger::Log(" packets, ");
+                SerialLogger::LogDec(mouse_stats.avg_polling_rate);
+                SerialLogger::Log("Hz poll rate\r\n");
+                
+                // Print DPI info
+                SerialLogger::Log("Mouse DPI Profile: ");
+                SerialLogger::LogDec(Mouse::GetCurrentDPIProfile());
+                SerialLogger::Log(", Rate: ");
+                SerialLogger::LogDec(Mouse::GetPollingRate());
+                SerialLogger::Log("Hz\r\n");
+                
+                last_perf_print = current_time;
+            }
+        } else {
+            // Micro-sleep when not time to render to save CPU
+            // This allows other processes to run while maintaining timing precision
+            HAL::Halt(); // Short halt to give CPU a break
+        }
+    }
+}

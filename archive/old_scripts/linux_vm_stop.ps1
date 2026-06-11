@@ -1,0 +1,2 @@
+Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow(); Start-Sleep -Seconds 2; if (!$_.HasExited) { $_.Kill() } }
+Write-Host "Stopped QEMU VM if running." -ForegroundColor Green
