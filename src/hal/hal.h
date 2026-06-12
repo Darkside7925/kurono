@@ -46,6 +46,11 @@ public:
     static void RegisterSystemCallHandler(SystemCallHandler handler);
     static void SetKernelStack(uint64_t rsp0);
 
+    // bring an application processor's cpu state up to par with the bsp: its own
+    // gdt + tss (so faults / int 0x80 don't share one rsp0 stack), the shared
+    // idt, and the per-core SYSCALL msrs. called from ap_entry. (satoru)
+    static void SetupAPCpuState();
+
     // Configure MSRs for the x86_64 SYSCALL/SYSRET fast path.
     // Must be called once after GDT is loaded.  Enables EFER.SCE,
     // programs STAR/LSTAR/SFMASK, and points the LSTAR handler at

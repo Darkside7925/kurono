@@ -1163,7 +1163,7 @@ void KVFS::BuildDefaultTree() {
         "/kurono", "/kurono/apps", "/kurono/packages", "/kurono/scripts",
         "/kurono/themes", "/kurono/drivers", "/kurono/drivers/wifi",
         "/kurono/drivers/audio", "/kurono/drivers/video",
-        "/kurono/logs", "/kurono/config",
+        "/kurono/var", "/kurono/var/log", "/kurono/var/lib", "/kurono/etc", "/kurono/config",
         "/windows", "/windows/System32", "/windows/Users",
         "/windows/Program Files",
         nullptr,

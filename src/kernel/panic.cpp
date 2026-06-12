@@ -505,7 +505,7 @@ namespace {
 
         // the runtime logger mirrors all seriallogger output to these files;
         // try the in-os path first, then the system path. (satoru)
-        const char* candidates[2] = { "/kurono/logs/serial.log", "/system/logs/serial.log" };
+        const char* candidates[2] = { "/kurono/var/log/serial.log", "/system/logs/serial.log" };
         for (int c = 0; c < 2; c++) {
             int sz = KVFS::GetFileSize(candidates[c]);
             if (sz <= 0) continue;

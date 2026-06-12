@@ -4,7 +4,7 @@
 
 ## 1. What KVFS is
 
-KVFS is an in-memory key-value filesystem organized as a path tree. It is not backed by a disk  -  it exists entirely in RAM and is populated fresh on every boot. Think of it as a ramdisk with a POSIX-path interface.
+KVFS is an in-memory key-value filesystem organized as a path tree. It lives in RAM and is populated fresh on every boot, but its user-data subtrees now **persist across reboots** by being mirrored to **KFS**, a real on-disk filesystem (see [KFS.md](KFS.md)). Think of it as a ramdisk with a POSIX-path interface; KFS is its on-disk backing store.
 
 KVFS is the filesystem that the shell, the desktop, the settings app, the text editor, and the config system all use. Unless explicitly using FAT32 or ext4, all file operations go through KVFS.
 
@@ -53,9 +53,9 @@ The shell commands, the desktop icon system, and the config all rely on these di
 
 ## 4. Persistence
 
-KVFS does not persist across reboots. All changes are lost when the machine resets. This matches the design of a live OS image and is not a bug.
+KVFS persists across reboots through **KFS**, a real on-disk filesystem (see [KFS.md](KFS.md)), via `PersistStore::SaveTree` / `LoadTree` (`src/fs/persist.cpp`). On a clean shutdown / reboot  -  and on demand via the `persisttest` shell command  -  `SaveTree` formats a fresh KFS volume on the NVMe data disk and **mirrors the user-data subtrees (`/home`, `/etc`, `/root`) into it as real files + directories**. At boot, `LoadTree` mounts the volume and walks it back into KVFS, before the boot seeding re-fills the large `/usr` binaries.
 
-If persistence is needed, use FAT32 via the NVMe driver or write to a real mounted filesystem.
+To keep the volume small and the restore fast, only file content up to `KFS_MAX_FILE` per file is stored; the re-seeded `/usr` binaries and the >4 MB sample media are skipped (the boot seeding re-creates them). Because the snapshot is a real filesystem, a future `kfs-fuse` driver could mount the volume on Linux and browse the files directly. (The earlier opaque raw-sector blob store still exists as `PersistStore::Save`/`Load` but is no longer the path persistence takes.)
 
 ## 5. Limitations
 

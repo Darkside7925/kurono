@@ -68,6 +68,17 @@ struct State {
     uint8_t* decode_buf;
     uint32_t decode_cap;                // capacity in bytes
 
+    // decode-ahead: on a compositor frame where the displayed video frame hasn't
+    // advanced (display caught up to the clock), we decode the NEXT video frame
+    // into this second buffer. when the clock then crosses into it, advancing is
+    // a cheap pointer swap instead of an inline jpeg decode that stalls the
+    // compositor  -  so frames land on time. (satoru)
+    uint8_t* decode_buf2;
+    uint32_t decode_cap2;
+    int      prefetch_frame;            // frame index held in decode_buf2, -1 = none
+    int      prefetch_w;
+    int      prefetch_h;
+
     // scaled-output cache: the letterboxed bgra result for the current
     // (frame,dst) blitted straight via row memcpy on a static frame so the
     // per-pixel scale runs only when the frame or window size changes. (satoru)

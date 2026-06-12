@@ -1438,16 +1438,12 @@ int cmd_gpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
 // filesystem survives a reboot/shutdown. no-op if no ext4 target is mounted. (satoru)
 static void persist_kvfs() {
     if (!PersistStore::Available()) return;
-    // KVFS::Serialize only keeps file CONTENT for user-data subtrees (/home, /etc,
-    // /root), skipping the re-seeded /usr binaries + sample media, so the blob is
-    // small; a fixed 32MB buffer is plenty. it goes straight to the raw nvme store,
-    // bypassing any filesystem (the ext4 writer's block allocation is broken). (satoru)
-    const size_t cap = 32 * 1024 * 1024;
-    uint8_t* buf = (uint8_t*)KernelHeap::Alloc(cap);
-    if (!buf) return;
-    size_t n = KVFS::Serialize(buf, cap);
-    if (n > 0) PersistStore::Save(buf, (uint32_t)n);
-    KernelHeap::Free(buf);
+    // mirror the kvfs user-data subtrees (/home, /etc, /root) to a real on-disk
+    // KFS filesystem on the nvme data disk  -  re-seeded /usr binaries + the big
+    // sample media are skipped (size-capped) and re-filled by the boot seeding.
+    // KFS::WriteFile uses contiguous runs + multi-page dma, so this completes in
+    // a handful of commands. (satoru)
+    PersistStore::SaveTree();
 }
 
 int cmd_reboot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {

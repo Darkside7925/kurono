@@ -347,7 +347,7 @@ uint32_t Tick() {
     // every period meant an I/O-port read storm (each is a VM exit under
     // VMware) that stole cpu from the gui/input tiers and caused microstutter.
     // the gate below uses the cached queue depth (cheap, no port I/O). (satoru)
-    if (be->QueuedFrames() > PERIOD_FRAMES * 8) return 0;
+    if (be->QueuedFrames() > PERIOD_FRAMES * 10) return 0;   // ~213ms; matches AudioServer::Tick (satoru)
 
     static int64_t  accum[PERIOD_FRAMES * INTERNAL_CHANNELS];
     static int16_t  output[PERIOD_FRAMES * INTERNAL_CHANNELS];

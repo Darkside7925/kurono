@@ -29,8 +29,17 @@ The scheduler owns the canonical process table. The Task Manager app reads from 
 
 `Scheduler::Tick()` is called from the main loop each iteration. It advances time-slice counters and runs context switches.
 
-## 5. Related files
+## 5. Multi-core (SMP)
 
+All logical CPUs are brought up at boot (`src/proc/smp.{h,cpp}` + `src/boot/ap_trampoline.asm`): the local APIC is enabled, the ACPI MADT enumerates the cores, and each application processor (AP) is started with INIT-SIPI-SIPI through a real-mode→long-mode trampoline onto the kernel's shared page tables. Every core then loads its own GDT/TSS, the shared IDT, and per-core SYSCALL MSRs (`HAL::SetupAPCpuState`), and the 64-bit SYSCALL fast-path uses `swapgs` + a per-CPU kernel stack (`PerCpu.kernel_rsp` at `gs:8`) so two cores can syscall at once without sharing one stack.
+
+`Scheduler::GetCurrentProcess()` / `SetCurrentForThisCpu()` track the running task **per CPU** (`PerCpu.current` on an AP, the global on the boot core), so the shared Linux syscall handler operates on the right task whichever core it runs on.
+
+The boot core runs the desktop, drivers, and kernel processes as before. The remaining work is the AP dispatch loop that actually places **user** threads onto the secondary cores  -  it needs ready-queue synchronization (a spinlock around every queue scan/mutation, released before any context switch) so the boot core and an AP can't run the same task. Until that lands, user threads run on the boot core while the kernel runs on all cores.
+
+## 6. Related files
+
+- `src/proc/smp.cpp` / `src/boot/ap_trampoline.asm`  -  multi-core bring-up
 - `src/apps/task_manager.cpp`  -  reads process table for display
 - `src/drivers/timer.cpp`  -  timer interrupt triggers tick
 - `src/kernel/kurono_kernel.cpp`  -  calls `Scheduler::Tick()` in main loop

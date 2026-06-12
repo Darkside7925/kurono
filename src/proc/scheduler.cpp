@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "spinlock.h"
 #include "kernel_locks.h"
+#include "smp.h"            // per-cpu current process for application processors (satoru)
 #include "../kernel/heap.h"
 #include "../kernel/vmm.h"
 #include "../kernel/pmm.h"
@@ -499,7 +500,7 @@ void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame) {
 bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     if (!proc || !frame || !proc->is_user() || !proc->has_user_frame) return false;
 
-    current_process = proc;
+    SetCurrentForThisCpu(proc);   // per-cpu: bsp global / ap PerCpu.current (satoru)
     proc->state = Process_Running;
     HAL::SetKernelStack(proc->kernel_stack_top);
     KernelVMM::ActivateAddressSpace(proc->address_space);
@@ -554,11 +555,14 @@ Process* Scheduler::GetNextRunnableUser(Process* after) {
 }
 
 bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
-    Process* next = GetNextRunnableUser(current_process);
+    // per-cpu: switch relative to THIS cpu's current task. on an ap this picks the
+    // ap's next thread; on the bsp it behaves exactly as before. (satoru)
+    Process* cur = GetCurrentProcess();
+    Process* next = GetNextRunnableUser(cur);
     if (!next) return false;
 
-    if (current_process && current_process->state == Process_Running) {
-        current_process->state = Process_Ready;
+    if (cur && cur->state == Process_Running) {
+        cur->state = Process_Ready;
     }
 
     return LoadUserFrame(next, frame);
@@ -759,7 +763,17 @@ const char* Scheduler::GetCurrentProcessName() {
 }
 
 Process* Scheduler::GetCurrentProcess() {
+    // per-cpu: an application processor tracks its own running task in its PerCpu
+    // block; the bsp keeps using the global. so the (shared) syscall handler asks
+    // GetCurrentProcess() and transparently gets the right task per core. (satoru)
+    if (SMP::CpuIndex() != 0) return SMP::Current()->current;
     return current_process;
+}
+
+// set the calling cpu's current task (global on the bsp, PerCpu.current on an ap). (satoru)
+void Scheduler::SetCurrentForThisCpu(Process* p) {
+    if (SMP::CpuIndex() != 0) SMP::Current()->current = p;
+    else current_process = p;
 }
 
 Process* Scheduler::FindProcessByPid(uint32_t pid) {

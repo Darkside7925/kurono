@@ -6,6 +6,7 @@
 #include "../kernel/heap.h"
 #include "../kernel/time.h"
 #include "../shell/shell.h"
+#include "../system/logging.h"   // notable net events -> /kurono/var/log/network.log (satoru)
 
 // tiny helpers for serial diag
 static void slog(const char* s){ SerialLogger::Log(s); }
@@ -737,11 +738,13 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->keepalive_probes = 0;
                 SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
                 slog("[TCP] -> ESTABLISHED\r\n");
+                RuntimeLog::LogNetwork("tcp connection established", nullptr);
             } else if (tcp->flags & TCP_FLAG_RST) {
                 sock->tcp_state = TCP_CLOSED;
                 // connection refused  -  surface to a non-blocking poller (satoru)
                 sock->sock_errno = TCP_ETIMEDOUT;
                 slog("[TCP] got RST -> CLOSED\r\n");
+                RuntimeLog::LogNetwork("tcp connection reset by peer", nullptr);
             }
             break;
 

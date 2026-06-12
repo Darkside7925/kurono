@@ -568,9 +568,12 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
         return out_a(out, 0, max_out, "Failed to mount ext4 target\n");
     }
 
-    ext4_mkdirs("/system");
-    ext4_mkdirs("/system/logs");
-    ext4_mkdirs("/system/kurono");
+    ext4_mkdirs("/system");                  // KLS linux-subsystem rootfs (satoru)
+    ext4_mkdirs("/kurono");                   // kurono-native namespace (satoru)
+    ext4_mkdirs("/kurono/var");
+    ext4_mkdirs("/kurono/var/log");
+    ext4_mkdirs("/kurono/var/lib");
+    ext4_mkdirs("/kurono/etc");
     ext4_mkdirs("/system/packages");
     ext4_mkdirs("/system/modules");
     ext4_mkdirs("/system/assets");
@@ -595,9 +598,9 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
         ext4_mkdirs(path);
     }
 
-    copy_kvfs_to_ext4("/system/logs/serial.log", "/system/logs/serial.log");
-    copy_kvfs_to_ext4("/system/logs/system.log", "/system/logs/system.log");
-    copy_kvfs_to_ext4("/system/boot/boot.log", "/system/logs/boot.log");
+    copy_kvfs_to_ext4("/kurono/var/log/serial.log", "/kurono/var/log/serial.log");
+    copy_kvfs_to_ext4("/kurono/var/log/system.log", "/kurono/var/log/system.log");
+    copy_kvfs_to_ext4("/kurono/var/log/boot.log",   "/kurono/var/log/boot.log");
     copy_kvfs_to_ext4("/boot/kernel.info", "/boot/kernel.info");
     copy_kvfs_to_ext4("/boot/apps.info", "/boot/apps.info");
     copy_kvfs_to_ext4("/etc/hostname", "/etc/hostname");

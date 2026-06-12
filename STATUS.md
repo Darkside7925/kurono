@@ -6,8 +6,12 @@
 
 Big one this month: I moved the whole dev setup off Windows/WHPX onto **Linux + KVM**. Faster, and it fixed a stack of networking/input weirdness WHPX was causing. There's a `./start.sh` now that builds + boots in one shot.
 
+- **The desktop survives a reboot now, on a real filesystem.** KVFS state persists to a dedicated NVMe disk between boots. The NVMe driver was completely dead  -  a missing `volatile` on the completion read meant *no* command ever finished; fixed that. Persistence now goes through **KFS (Kurono File System)**  -  a small from-scratch inode-based on-disk filesystem (superblock / block bitmap / inode table / data; 13 direct + 1 indirect block per inode). The user-data subtrees (`/home`, `/etc`, `/root`) are stored as **real files + directories** (browsable, fuse-mountable later), not an opaque blob. Verified two-boot: a marker written on boot 1 reads back on boot 2.
+- **NVMe multi-page DMA.** The driver was capped at 4 KB per command (one `prp1` page), so a 1.8 MB persist became ~450 commands  -  that's why persistence crawled. Now it builds a `prp2`/PRP-list (up to ~2 MB/command) and chunks internally at the controller's MDTS, so the whole tree goes out in a handful of commands.
+- **Lightweight system logging + clean paths.** Logs were triple-homed across `/system/logs`, `/kurono/logs`, and `/var/log`. Now there's one canonical `/kurono/var/log/` (boot / system / serial / **network** / **security** / **crash**), wired to the TCP stack, the SUPR security audit, and the panic recovery. The whole on-disk layout is centralized in one `kpaths.h`.
+- **Audio + video are smooth now.** Per-stream mixer ring 341 ms → 683 ms + a clean-silence HDA underrun pad (no more stale-sample clicks); video gained a decode-ahead so frames don't stall the compositor at each boundary.
+- **Multi-core is real now.** All cores boot and run kernel code in parallel (verified `-smp 4`): true application-processor bring-up via INIT-SIPI-SIPI, a per-CPU SYSCALL fast-path (swapgs), per-CPU GDT/TSS, and a per-CPU current task. The old ">1 core deadlocks the desktop" bug is gone; the last piece  -  dispatching user threads onto the APs  -  is in progress.
 - Boot no longer hangs black  -  the large-model BSS wasn't getting zeroed (garbage pointers). Fixed in the linker script.
-- Boot **`-smp 1`** for now  -  the scheduler isn't SMP-safe yet and >1 core deadlocks the desktop ~8s in.
 - curl/HTTP works end to end (recv-loop + FIN_WAIT half-close + ephemeral ports). Fetched real pages off example.com / wikipedia over tap+NAT.
 - USB keyboard/mouse/tablet work over xHCI (DMA alignment was the fix); tablet does accurate absolute positioning.
 - Fixed the desktop-breaking bugs: top-taskbar swallowing all input, Sign Out/Lock freezing the machine, window-drag ghost trails, dead calculator clicks, broken Files right-click.
@@ -24,7 +28,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - **Source files:** ~65 C++ + 1 ASM
 - **Primary outputs:** `build/kurono.elf`, `build/kurono.iso`, `build/kurono_efi.efi`, `build/kurono_emergency.efi`
 - **Build errors:** 0
-- **QEMU target:** `qemu-system-x86_64` with KVM on Linux (WHPX on Windows), 4 GB RAM, **1 vCPU** for now (scheduler isn't SMP-safe yet), virtio-gpu + tap/NAT networking + xHCI USB
+- **QEMU target:** `qemu-system-x86_64` with KVM on Linux (WHPX on Windows), 4 GB RAM, **`-smp 4`** (all cores boot + run kernel code in parallel; `start.sh` defaults to 4), virtio-gpu + tap/NAT networking + xHCI USB
 
 ---
 
@@ -45,7 +49,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 ### Drivers (19)
 - [x] **BGA Display** -- Bochs Graphics Adapter, multi-resolution (640x480 to 3840x2160), 32bpp, double-buffered
 - [x] **Display Manager** -- 10 predefined modes, VSync (off/on/adaptive), DPI scaling (1.0-2.0x), EDID detection, gamma/brightness, multi-backend (BGA, VirtIO GPU, NVIDIA, Intel, AMD)
-- [x] **NVMe** -- NVMe 1.4 SSD driver, admin + I/O queue pairs (up to 4 queues, 64-depth), read/write/flush/identify, stats tracking
+- [x] **NVMe** -- NVMe 1.4 SSD driver, admin + I/O queue pairs (up to 4 queues, 64-depth), read/write/flush/identify, stats tracking. Read/write verified end-to-end (the completion poll needed a `volatile`); **multi-page DMA** via PRP list (offset-aware) with internal MDTS chunking; backs the KFS persistence layer
 - [x] **USB / xHCI** -- USB 3.0/2.0/1.1 host controller, port enumeration (16 ports), control/bulk transfers, device descriptors (16 devices)
 - [x] **Intel HD Audio** -- HDA codec probing (4 codecs, 32 nodes), CORB/RIRB command transport, stream format (44.1/48/96 kHz, 16/24/32-bit), BDL-based DMA playback
 - [x] **VirtIO GPU** -- 2D/3D support, virtqueue transport, resource management, scanout, cursor, framebuffer present, 8 pixel formats, 16 scanouts
@@ -332,7 +336,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 
 ## Known Limitations
 
-- Live desktop storage is still KVFS-first and in-memory; installer deployment to ext4/FAT32 exists, but the running OS is not yet a fully persistent mounted root filesystem
+- Live desktop storage is KVFS-first and in-memory, but it now **persists across reboot through a real on-disk filesystem**: the user-data subtrees are mirrored to **KFS** (`src/fs/kfs.cpp`)  -  a from-scratch inode-based filesystem on the NVMe data disk  -  as actual files + dirs, and restored at boot (`PersistStore::SaveTree`/`LoadTree`, `src/fs/persist.cpp`). Installer deployment to ext4/FAT32 also exists. KFS is the on-disk persistence layer, not yet a fully mounted root (KVFS stays the runtime fs)
 - No real ELF binary loading from disk (Linux subsystem uses built-in program table)
 - USB keyboard discovery is wired to xHCI, but full USB HID interrupt transfer polling is still incomplete
 - NVIDIA GPU detects hardware but bugs out during intensive tasks taking more then 50mb of vram

@@ -21,8 +21,9 @@
 [BITS 64]
 
 extern SyscallEntryX64FrameHandler       ; void (*)(InterruptFrame*)  -  fills rax, may switch
-extern g_kernel_syscall_rsp              ; uint64_t  -  kernel stack to switch to
-extern g_user_syscall_rsp_save           ; uint64_t  -  stash user rsp across the stack switch
+; the kernel stack now comes from this cpu's per-cpu block via gs (KERNEL_GS_BASE
+; = &PerCpu) after swapgs, so two cores can syscall at once without sharing one
+; global stack. PerCpu offset 0 = user-rsp scratch, offset 8 = kernel rsp. (satoru)
 
 ; ring-3 selectors (gdt: user code 0x20|3, user data 0x18|3). (satoru)
 USER_CS equ 0x23
@@ -30,17 +31,19 @@ USER_SS equ 0x1B
 
 global syscall_entry_x64
 syscall_entry_x64:
-    ; stash user rsp, then switch to this task's kernel stack. we can't touch
-    ; the stack until rsp points at kernel memory. (satoru)
-    mov     qword [rel g_user_syscall_rsp_save], rsp
-    mov     rsp, qword [rel g_kernel_syscall_rsp]
+    ; swapgs brings this cpu's PerCpu pointer into gs, then stash the user rsp and
+    ; switch to this cpu's kernel stack. we can't touch the stack until rsp points
+    ; at kernel memory. SFMASK cleared IF, so no irq can see the swapped gs. (satoru)
+    swapgs
+    mov     [gs:0], rsp                          ; PerCpu.user_rsp_save
+    mov     rsp, [gs:8]                          ; PerCpu.kernel_rsp (this cpu)
 
     ; build the InterruptFrame top-down (push writes high address first, so the
     ; first push is the last struct field, ss). every gp reg is captured live
     ; and untouched here  -  in particular r9 still holds musl's clone child-fn,
     ; and rcx/r11 still hold the user rip/rflags. (satoru)
     push    USER_SS                              ; ss
-    push    qword [rel g_user_syscall_rsp_save]  ; rsp (user)
+    push    qword [gs:0]                          ; rsp (user, from PerCpu.user_rsp_save)
     push    r11                                  ; rflags (user, in r11)
     push    USER_CS                              ; cs
     push    rcx                                  ; rip (user, in rcx)
@@ -91,4 +94,5 @@ syscall_entry_x64:
     pop     rbx
     pop     rax
     add     rsp, 16                              ; skip vector + error_code → rsp = &frame.rip
+    swapgs                                        ; restore the user gs before returning (satoru)
     iretq

@@ -106,6 +106,8 @@ public:
     static uint64_t GetCapacityLBA();
     static uint32_t GetLBASize();
     static uint32_t GetMaxTransferBlocks();
+    // max bytes one Read/Write command can move (one prp-list page, ~2mb). (satoru)
+    static uint32_t MaxTransferBytes();
 
     // admin operations
     static bool Identify();
