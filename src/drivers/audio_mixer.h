@@ -24,7 +24,11 @@ constexpr int      MAX_STREAMS         = 16;
 constexpr uint32_t INTERNAL_RATE       = 48000;
 constexpr int      INTERNAL_CHANNELS   = 2;
 constexpr uint32_t PERIOD_FRAMES       = 1024;     // 21.3 ms @ 48 kHz
-constexpr uint32_t STREAM_RING_FRAMES  = 16384;    // 341 ms ring per stream
+constexpr uint32_t STREAM_RING_FRAMES  = 32768;    // 683 ms ring per stream  -  bigger
+                                                   // headroom so a compositor / decode
+                                                   // stall drains the ring without an
+                                                   // underrun click (producer can fall
+                                                   // ~0.68 s behind). (satoru)
 
 using StreamID = int;
 constexpr StreamID INVALID_STREAM = -1;

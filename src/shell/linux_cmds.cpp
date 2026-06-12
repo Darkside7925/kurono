@@ -561,7 +561,7 @@ void LinuxCmds::RegisterAll(KuronoShell* sh) {
     sh->RegisterCommand("tr",       "Translate chars",         ENV_AUTO, "text",       cmd_tr);
     sh->RegisterCommand("free",     "Memory usage",            ENV_AUTO, "system",     cmd_free);
     sh->RegisterCommand("mount",    "Show mounts",             ENV_AUTO, "system",     cmd_mount);
-    sh->RegisterCommand("dmesg",    "Serial log tail (/kurono/logs/serial.log)", ENV_AUTO, "system", cmd_dmesg);
+    sh->RegisterCommand("dmesg",    "Serial log tail (/kurono/var/log/serial.log)", ENV_AUTO, "system", cmd_dmesg);
     sh->RegisterCommand("journal",  "KVFS log tail viewer",                     ENV_AUTO, "system", cmd_journal);
     sh->RegisterCommand("lspci",    "List PCI devices",        ENV_AUTO, "system",     cmd_lspci);
     sh->RegisterCommand("lsmod",    "List loaded drivers",     ENV_AUTO, "system",     cmd_lsmod);
@@ -1348,7 +1348,7 @@ static int lc_kvfs_tail_into_out(const char* path, char* out, int mx,
 int LinuxCmds::cmd_journal(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
 
-    const char* log_path = "/kurono/logs/system.log";
+    const char* log_path = "/kurono/var/log/system.log";
     int approx_lines = 120;
 
     if (argc >= 2 && lc_arg_is_decimal_pos(argv[1]))
@@ -1399,13 +1399,13 @@ int LinuxCmds::cmd_dmesg(KuronoShell* sh, int argc, const char** argv, char* out
     (void)argv;
     uint32_t sec = Time::GetTicks() / 1000u;
     char banner[144];
-    int bp = _sa(banner, 0, sizeof(banner), "=== mirrored serial (/kurono/logs/serial.log)  -  uptime ");
+    int bp = _sa(banner, 0, sizeof(banner), "=== mirrored serial (/kurono/var/log/serial.log)  -  uptime ");
     bp = _sau(banner, bp, sizeof(banner), sec);
     bp = _sa(banner, bp, sizeof(banner), " s ===\n");
     int hint = mx > 384 ? mx - 256 : 512;
     if (hint > 7800)
         hint = 7800;
-    return lc_kvfs_tail_into_out("/kurono/logs/serial.log", out, mx, hint, banner);
+    return lc_kvfs_tail_into_out("/kurono/var/log/serial.log", out, mx, hint, banner);
 }
 
 int LinuxCmds::cmd_lspci(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {

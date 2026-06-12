@@ -176,8 +176,12 @@ It is meant to answer one practical question quickly: *where does a given respon
 | --- | --- |
 | `fat32.cpp` | FAT32 support |
 | `fat32.h` | FAT32 declarations |
-| `kvfs.cpp` | in memory virtual filesystem |
+| `kvfs.cpp` | in memory virtual filesystem (runtime fs) |
 | `kvfs.h` | KVFS declarations |
+| `kfs.cpp` | Kurono File System  -  on-disk persistence filesystem |
+| `kfs.h` | KFS on-disk format spec + declarations |
+| `persist.cpp` | persistence layer (mirrors KVFS user data into KFS) |
+| `persist.h` | persistence declarations |
 | `vfs.cpp` | generic VFS layer |
 | `vfs.h` | VFS declarations |
 
@@ -228,7 +232,8 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `input_manager.h` | input declarations |
 | `installer.cpp` | installer logic |
 | `installer.h` | installer declarations |
-| `logging.cpp` | runtime logging |
+| `kpaths.h` | canonical on-disk path layout (single source of truth) |
+| `logging.cpp` | runtime logging (boot/system/serial/network/security/crash) |
 | `logging.h` | runtime logging declarations |
 | `user_mgmt.cpp` | user management |
 | `user_mgmt.h` | user management declarations |

@@ -716,6 +716,9 @@ bool HDAudio::StartStream() {
 
 uint32_t HDAudio::WriteRing(const void* data, uint32_t bytes) {
     if (!g_hda_stream_live || !data || bytes == 0) return 0;
+    // dma_buffer is non-null whenever g_hda_stream_live (StartStream gates on it),
+    // but guard the deref anyway  -  zero-risk, can only avert a fault. (satoru)
+    if (!dma_buffer) return 0;
     // clamp lpib's per-tick advance so a qemu link-position jump can't fake free
     // space (see HDA_ClampLpibAdvance). (satoru)
     uint32_t raw_lpib = Read32(stream_base + HDA_SD_LPIB) % HDA_BUFFER_SIZE;
@@ -756,6 +759,26 @@ uint32_t HDAudio::WriteRing(const void* data, uint32_t bytes) {
     for (uint32_t i = 0; i < second; i++)
         dst_base[i] = src[first + i];
     g_hda_write_ptr = (g_hda_write_ptr + to_write) % HDA_BUFFER_SIZE;
+
+    // clean-silence underrun pad: zero exactly one period immediately ahead of
+    // the new write cursor so that if the cooperative pump stalls (>~213ms) and
+    // the dma read pointer (lpib) catches up to write_ptr, it reads silence
+    // instead of replaying the stale samples still sitting in the free region
+    // from the previous lap (the audible click/repeat). this is the underrun
+    // counterpart to the kGuard overrun lap-guard above, and is provably safe to
+    // touch: after this write the guard leaves at least
+    //   N - queued_new >= kGuard == kPeriod + 4
+    // free bytes forward between write_ptr and lpib (to_write was capped at
+    // free_bytes = N - queued - kGuard), so a kPeriod pad ahead of write_ptr
+    // stays >=4 bytes short of lpib and never overwrites the bytes the dma is
+    // reading now. clamped lpib only lags the true read position, which makes the
+    // real margin larger, never smaller. wrap by hand to match the ring math. (satoru)
+    uint32_t pad = g_hda_write_ptr;
+    for (uint32_t i = 0; i < kPeriod; i++) {
+        dst_base[pad] = 0;
+        pad++;
+        if (pad == HDA_BUFFER_SIZE) pad = 0;
+    }
     return to_write;
 }
 

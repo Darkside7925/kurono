@@ -102,12 +102,17 @@ void MediaPlayerApp::Open() {
     );
     if (win_id < 0) return;
 
-    // add some demo entries if playlist is empty
-    if (playlist_count == 0) {
-        AddToPlaylist("/home/user/Documents/denji.mp4");
-        AddToPlaylist("/home/user/Music/startup.wav");
-        AddToPlaylist("/home/user/Music/notification.wav");
-    }
+    // DISABLED: auto-loading + playing the preset media here breaks the global
+    // audio init (the player's own mp4/wav audio path corrupts the AudioServer
+    // backend state  -  completely broken). the file-explorer double-click path
+    // (Open(file_path) below) works perfectly and is the supported way in. so the
+    // bare "Media Player" launch now opens an empty player instead of a preset
+    // playlist. revisit when the player's audio engine is rewritten. (satoru)
+    // if (playlist_count == 0) {
+    //     AddToPlaylist("/home/user/Documents/denji.mp4");
+    //     AddToPlaylist("/home/user/Music/startup.wav");
+    //     AddToPlaylist("/home/user/Music/notification.wav");
+    // }
 }
 
 void MediaPlayerApp::Open(const char* file_path) {

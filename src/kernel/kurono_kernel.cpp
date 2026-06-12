@@ -44,6 +44,7 @@
 #include "../system/input_manager.h"
 #include "../system/vconsole.h"
 #include "../system/logging.h"
+#include "../system/kpaths.h"
 #include "../system/installer.h"
 #include "../system/ui_config.h"
 #include "../ui/kss.h"
@@ -96,6 +97,7 @@
 #include "../drivers/virtio_gpu.h"   // bring up the virtio gpu so DisplayManager can select the accelerated backend (satoru)
 #include "../drivers/ac97.h"
 #include "../drivers/cpu_detect.h"
+#include "../proc/smp.h"
 #include "../drivers/gpu_probe.h"
 #include "../../logo.h"
 #include "../media/embedded_media.h"
@@ -1111,6 +1113,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // CPUDetect::Init calibrates the TSC via the precise PIT ch2 one-shot. (satoru)
     CPUDetect::Init();
 
+    // smp phase 1: enable the local apic + enumerate the cpus (no APs started yet,
+    // so this is harmless on the single-core path). (satoru)
+    SerialLogger::Log("[SMP] Init...\r\n");
+    SMP::Init();
+    // smp phase 2: bring up the application processors (INIT-SIPI-SIPI). each ap
+    // reaches ap_entry, marks itself online, then idles until the scheduler hands
+    // it work (phase 3). a failed ap is non-fatal  -  the bsp carries on. (satoru)
+    SMP::StartAPs();
+
     // note: interrupts stay disabled. the kernel is fully polling-based
     // (pit counter read, keyboard/mouse i/o ports). this avoids whpx
     // compatibility issues with hardware interrupt delivery.
@@ -1577,22 +1588,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // detect the nvme data disk  -  MountDataDisk runs NVMe::Init for us; its ext4
     // probe just fails harmlessly on our raw persistence store. (satoru)
     Installer::MountDataDisk();
-    // restore persistent kvfs state from the raw nvme store if a valid blob is
-    // present; otherwise the default tree from init() stays. the /usr/bin binary
-    // re-seeding below re-fills the entries we deliberately saved content-free. (satoru)
+    // restore persistent kvfs state from the on-disk KFS volume if one is present;
+    // otherwise the default tree from init() stays. the /usr/bin binary re-seeding
+    // below re-fills the large entries KFS deliberately doesn't carry. (satoru)
     if (PersistStore::Available()) {
-        const uint32_t cap = 32 * 1024 * 1024;
-        uint8_t* kbuf = (uint8_t*)KernelHeap::Alloc(cap);
-        if (kbuf) {
-            uint32_t klen = 0;
-            if (PersistStore::Load(kbuf, cap, &klen) && klen > 0) {
-                bool de = KVFS::Deserialize(kbuf, (size_t)klen);
-                SerialLogger::Log("[KVFS] restore: loaded="); SerialLogger::LogDec((int)klen);
-                SerialLogger::Log(" deserialize="); SerialLogger::LogDec(de ? 1 : 0); SerialLogger::Log("\r\n");
-                if (de) SerialLogger::Log("[KVFS] restored persistent state\r\n");
-            }
-            KernelHeap::Free(kbuf);
-        }
+        bool ok = PersistStore::LoadTree();
+        if (ok) SerialLogger::Log("[KVFS] restored persistent state from KFS\r\n");
+        else    SerialLogger::Log("[KVFS] no KFS volume to restore (fresh disk)\r\n");
     }
     // bring up the usb host controller + hid interrupt polling (no-op if no xhci). (satoru)
     SerialLogger::Log("[USB] Init...\r\n");
@@ -1601,13 +1603,16 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     RuntimeLog::LogBoot("kvfs online");
     RuntimeLog::LogSystem("kernel", "runtime filesystem layout created");
 
-    // recover a persisted crash minidump into /var/log now that kvfs is up, and
-    // surface a toast if the previous boot ended in a panic. (satoru)
+    // recover a persisted crash minidump now that kvfs is up, log it to the crash
+    // log, and surface a toast if the previous boot ended in a panic. (satoru)
     KVFS::Mkdirs("/home/user");
-    if (KernelPanic::ScanCrashDumpAtBoot())
+    if (KernelPanic::ScanCrashDumpAtBoot()) {
+        RuntimeLog::LogCrash("recovered minidump from previous boot panic",
+                             "see " KP_LOG_CRASH_DIR);
         NotificationManager::Post("System recovered",
-                                  "recovered from a previous crash; dump saved to /var/log",
+                                  "recovered from a previous crash; logged to " KP_LOG_CRASH_DIR,
                                   NotificationManager::ICON_WARNING, 6000);
+    }
 
     // uiconfig must be initialized before any ui subsystem reads colors/sizes.
     // it writes /etc/kurono/ui.conf with defaults on first boot.
@@ -1645,7 +1650,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         KVFS::Mkdirs("/var/log");
         KVFS::WriteString("/etc/hostname", "kurono-emergency");
         KVFS::WriteString("/etc/os-release", "Kurono Emergency Kernel\nMODE=emergency\n");
-        KVFS::WriteString("/system/boot/emergency.txt",
+        KVFS::Mkdirs(KP_LOG_DIR);
+        KVFS::WriteString(KP_LOG_DIR "/emergency.txt",
             "Kurono emergency mode\n"
             "Commands:\n"
             "  help\n"

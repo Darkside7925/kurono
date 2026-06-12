@@ -2,6 +2,7 @@
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
+#include "../system/logging.h"   // mirror the audit trail to /kurono/var/log/security.log (satoru)
 
 //  supr security engine implementation
 
@@ -344,6 +345,9 @@ void SUPR::Log(SUPRAction action, const char* username, const char* detail) {
     scpy(audit_log[idx].detail, detail, 64);
     audit_log[idx].timestamp = Time::GetTicks();
     audit_count++;
+    // persist the audit event to the security log (detail already carries the
+    // human description, e.g. "Escalation granted"); username is the actor. (satoru)
+    RuntimeLog::LogSecurity(detail && *detail ? detail : "event", username);
 }
 
 int SUPR::GetAuditLog(SUPRAuditEntry* entries, int max_entries) {

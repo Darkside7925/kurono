@@ -91,15 +91,15 @@ void Tick() {
     // cpu from the gui/input tiers and caused microstutter. (satoru)
     g_active->Tick();
     uint32_t q = g_active->QueuedFrames();
-    // keep ~8 periods (~170ms @ 1024 frames/48khz) buffered to ride out
+    // keep ~10 periods (~213ms @ 1024 frames/48khz) buffered to ride out
     // cooperative-scheduler gaps  -  a slow gui/network frame can stall this pump
-    // for tens of ms, and 6 periods (~128ms) could drain the dma ring before
-    // the next refill, producing a crackle. raise the target to 8 and the
-    // per-tick refill cap from 12 to 16 passes so one stall can be made up in a
-    // single pump without unbounding worst-case fill latency. the mixer gate in
-    // AudioMixer::Tick() matches at PERIOD_FRAMES*8. (satoru)
-    for (int i = 0; i < 16; i++) {
-        if (q >= AudioMixer::PERIOD_FRAMES * 8) break;
+    // for tens of ms, and a shallower ring could drain the dma before the next
+    // refill, producing a crackle. 10 periods rides out a bigger single-core
+    // stall (the residual per-video glitch) for only ~43ms more latency than 8;
+    // the per-tick cap of 20 lets one stall be made up in a single pump. the
+    // mixer gate in AudioMixer::Tick() matches at PERIOD_FRAMES*10. (satoru)
+    for (int i = 0; i < 20; i++) {
+        if (q >= AudioMixer::PERIOD_FRAMES * 10) break;
         uint32_t produced = AudioMixer::Tick();
         if (produced == 0) break;
         g_periods_submitted++;

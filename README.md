@@ -32,7 +32,7 @@ I moved the whole thing onto Linux (KVM), so this is the path I actually use day
 ./start.sh --debug
 ```
 
-> heads up: boot with **one core** for now (`start.sh` already does). the scheduler isn't SMP-safe yet, so anything above `-smp 1` deadlocks the desktop a few seconds in. fixing that is on the list.
+> multi-core: boot **`-smp 4`** (what `start.sh` defaults to). all cores boot and run kernel code in parallel  -  real AP bring-up (INIT-SIPI-SIPI), a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, and a per-CPU current task are in. the old ">1 core deadlocks the desktop" bug is gone. the remaining piece is actually scheduling **user** threads onto the secondary cores (the kernel runs on all of them today; user threads still run on the boot core).
 
 If you're still on Windows the old WHPX launcher works too:
 
@@ -100,7 +100,8 @@ wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make run-noaccel'
 
 Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It's way faster and it quietly fixed a pile of networking + input pain that WHPX was causing. Wrote a `start.sh` so booting is one command now.
 
-- **Boot doesn't hang anymore.** The desktop was coming up black  -  turned out the large-model BSS section wasn't being zeroed, so a bunch of pointers were straight-up garbage. Fixed it in the linker script. Also tracked down the SMP race that froze the desktop ~8s in (boot `-smp 1` for now, scheduler isn't SMP-safe yet).
+- **Boot doesn't hang anymore.** The desktop was coming up black  -  turned out the large-model BSS section wasn't being zeroed, so a bunch of pointers were straight-up garbage. Fixed it in the linker script. The old SMP race that froze the desktop ~8s in is also fixed  -  `-smp 4` is the default now and all cores boot and run kernel code in parallel.
+- **Reboot persistence on a real filesystem + multi-core bring-up.** KVFS state now survives a reboot through **KFS**  -  a from-scratch inode-based on-disk filesystem (the NVMe driver was dead until a missing `volatile` on the completion poll was fixed; it now does multi-page DMA via a PRP list). The user-data tree is stored as real files + dirs, not a blob. And the secondary cores are genuinely up: INIT-SIPI-SIPI bring-up, a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, per-CPU current task. Scheduling user threads onto the APs is the next step.
 - **Networking actually works.** curl/HTTP goes end to end now  -  fixed a recv loop that gave up way too early, the FIN_WAIT half-close path, and ephemeral port selection. Pulled real pages off example.com and wikipedia over tap+NAT.
 - **USB works over xHCI.** keyboard, mouse, and tablet all enumerate and report now (the DMA structs just needed proper page alignment). The tablet gives accurate absolute cursor positioning, which is also how I drive it headless.
 - **Killed the bugs that made the desktop unusable:**
@@ -725,7 +726,7 @@ Alpine guest assets are linked when `Alpine/vmlinuz-virt` and `Alpine/initramfs-
 ## Known Limitations
 
 - The Wayland compositor is functional at the wire-protocol level (registry, globals, surface creation, xdg_toplevel configure) but the surface-to-framebuffer blit bridge and input event forwarding are still stubbed.
-- Live desktop storage is still KVFS-first and RAM-backed; installer deployment exists, but the running desktop is not yet a fully persistent mounted root filesystem.
+- Live desktop storage is KVFS-first and RAM-backed, but it now **persists across reboot through KFS**  -  a from-scratch inode-based on-disk filesystem on the NVMe data disk. The user-data subtrees (`/home`, `/etc`, `/root`) are stored as real files + directories and restored at boot. KVFS stays the runtime fs; KFS is the on-disk persistence layer (not yet a fully mounted root).
 - The Linux syscall layer still uses a 32-bit-style pointer ABI constraint, so user mappings and pointers currently need to remain below 4 GB.
 - General ELF loading from disk is still limited; the Linux subsystem primarily executes built-in or staged runtime programs rather than arbitrary disk-resident binaries.
 - USB host-controller work is present, but full USB HID interrupt transfer polling is not complete.

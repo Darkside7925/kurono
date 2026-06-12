@@ -1,5 +1,6 @@
 #include "hal.h"
 #include "../drivers/serial.h"
+#include "../proc/smp.h"          // per-cpu kernel-stack (gs:8) for the syscall path (satoru)
 #include "../linux/linux_syscall.h"
 #include "../kernel/panic.h"
 #include "../proc/scheduler.h"
@@ -160,6 +161,59 @@ void HAL::InitGDT() {
 
     uint16_t tss_selector = GDT_TSS_SELECTOR;
     asm volatile("ltr %0" : : "rm"(tss_selector) : "memory");
+}
+
+//  per-cpu gdt + tss for the application processors. each ap needs its own tss:
+//  rsp0 is loaded by the cpu on a ring3->ring0 transition (fault / int 0x80), so
+//  two cores sharing one tss would corrupt each other's kernel entry stack. the
+//  fixed code/data descriptors are copied from the bsp gdt; only the tss
+//  descriptor differs per core. (satoru)
+alignas(16) static GDTDescriptor ap_gdt[SMP_MAX_CPUS][GDT_ENTRY_COUNT];
+static TSS64 ap_tss[SMP_MAX_CPUS];
+alignas(16) static uint8_t ap_priv_stack[SMP_MAX_CPUS][16384];
+
+void HAL::SetupAPCpuState() {
+    uint32_t cpu = SMP::CpuIndex();
+    if (cpu == 0 || cpu >= SMP_MAX_CPUS) return;   // bsp already set up via InitGDT (satoru)
+
+    for (int i = 0; i < 5; i++) ap_gdt[cpu][i].value = gdt_entries[i].value;
+
+    TSS64* t = &ap_tss[cpu];
+    for (size_t i = 0; i < sizeof(TSS64); i++) ((uint8_t*)t)[i] = 0;
+    t->rsp0 = (uint64_t)(uintptr_t)(ap_priv_stack[cpu] + sizeof(ap_priv_stack[cpu]));
+    t->ist1 = t->rsp0;
+    t->iomap_base = sizeof(TSS64);
+
+    // 16-byte tss descriptor into gdt slots 5,6 (same layout as BuildTSSDescriptor). (satoru)
+    uint64_t base = (uint64_t)(uintptr_t)t;
+    uint32_t limit = sizeof(TSS64) - 1;
+    uint64_t low = (uint64_t)(limit & 0xFFFF);
+    low |= (base & 0xFFFFFFULL) << 16;
+    low |= 0x89ULL << 40;
+    low |= ((uint64_t)((limit >> 16) & 0xF)) << 48;
+    low |= ((base >> 24) & 0xFFULL) << 56;
+    ap_gdt[cpu][5].value = low;
+    ap_gdt[cpu][6].value = base >> 32;
+
+    GDTPointer gp;
+    gp.limit = sizeof(GDTDescriptor) * GDT_ENTRY_COUNT - 1;
+    gp.base  = (uint64_t)(uintptr_t)&ap_gdt[cpu][0];
+    asm volatile("lgdt %0" : : "m"(gp) : "memory");
+
+    uint16_t kd = GDT_KERNEL_DATA_SELECTOR;
+    asm volatile(
+        "mov %0, %%ax\n\t"
+        "mov %%ax, %%ds\n\t mov %%ax, %%es\n\t mov %%ax, %%ss\n\t"
+        "mov %%ax, %%fs\n\t mov %%ax, %%gs\n\t"
+        : : "rm"(kd) : "ax", "memory");
+    uint16_t ts = GDT_TSS_SELECTOR;
+    asm volatile("ltr %0" : : "rm"(ts) : "memory");
+
+    // share the bsp's idt (read-only after setup) so faults on this ap dispatch. (satoru)
+    asm volatile("lidt %0" : : "m"(idt_ptr) : "memory");
+
+    // per-core SYSCALL msrs (lstar/star/sfmask/efer.sce+nxe). (satoru)
+    InitSyscallMSRs();
 }
 
 //  pic 8259a
@@ -417,8 +471,12 @@ void HAL::SetKernelStack(uint64_t rsp0) {
     system_tss.rsp0 = rsp0;
     system_tss.ist1 = rsp0;
 
-    // Mirror to the global the SYSCALL entry stub reads.
+    // mirror to the legacy global (still defined) AND to this cpu's PerCpu block,
+    // which the reworked SYSCALL stub reads via gs:8 after swapgs. SMP::Current()
+    // resolves the calling cpu (reads the lapic) so this is correct on the bsp and
+    // on any ap that runs the scheduler. (satoru)
     g_kernel_syscall_rsp = rsp0;
+    SMP::Current()->kernel_rsp = rsp0;
 }
 
 void HAL::InitSyscallMSRs() {

@@ -372,44 +372,95 @@ bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
 
 //  block i/o
 
+//  build prp1/prp2 for a CONTIGUOUS, page-aligned buffer of `bytes`. one page ->
+//  prp1 only; two pages -> prp2 is the 2nd page directly; more -> prp2 points at a
+//  prp-list page holding the physical addresses of pages 2..N (the buffer is
+//  contiguous + identity-mapped, so page k = base + k*4096). one list page = 512
+//  entries -> up to ~2mb per command, vs the old 4kb single-page cap that turned a
+//  1.8mb persist into ~450 commands. callers chunk transfers above the list cap.
+//  the list scratch is reused serially (nvme i/o here is polled to completion, one
+//  at a time). (satoru)
+static uint8_t* g_prp_list = nullptr;
+
+static bool nvme_build_prp(uint64_t base, uint32_t bytes, uint64_t* prp1, uint64_t* prp2) {
+    const uint32_t PAGE = 4096;
+    *prp1 = base;
+    // prp1 may carry a byte offset (the transfer starts there); the first page
+    // then covers only PAGE-off bytes. prp2 + every list entry must be page
+    // aligned, so they name the 2nd..Nth pages. all kernel buffers are identity
+    // mapped + physically contiguous, so page k = (base rounded down) + k*PAGE.
+    // this lets any kernel buffer (stack/heap/pmm) be a dma target, not just
+    // page-aligned ones. (satoru)
+    uint32_t off   = (uint32_t)(base & (PAGE - 1));
+    uint32_t first = PAGE - off;
+    if (bytes <= first) { *prp2 = 0; return true; }
+    uint64_t page2 = (base & ~(uint64_t)(PAGE - 1)) + PAGE;
+    uint32_t rem = bytes - first;
+    if (rem <= PAGE) { *prp2 = page2; return true; }
+    uint32_t n_list = (rem + PAGE - 1) / PAGE;      // pages after the first (satoru)
+    if (n_list > PAGE / 8) return false;            // > one list page (~2mb): caller must chunk (satoru)
+    if (!g_prp_list) {
+        g_prp_list = (uint8_t*)PMM::AllocBytes(PAGE);
+        if (!g_prp_list) return false;
+    }
+    uint64_t* list = (uint64_t*)g_prp_list;
+    for (uint32_t i = 0; i < n_list; i++) list[i] = page2 + (uint64_t)i * PAGE;
+    *prp2 = (uint64_t)(uintptr_t)g_prp_list;
+    return true;
+}
+
+//  largest transfer one command can describe: the smaller of our single prp-list
+//  page (512 entries) and the controller's MDTS (max data transfer size). qemu
+//  reports a finite MDTS, and exceeding it is rejected with "invalid field"
+//  (sc=0x02)  -  so a 1MB transfer must be split. max_transfer_size is 1<<MDTS in
+//  4kb pages; 0/1 means "unlimited", so fall back to our prp cap. (satoru)
+uint32_t NVMe::MaxTransferBytes() {
+    uint32_t mdts_pages = info.max_transfer_size;
+    if (mdts_pages < 2)   mdts_pages = 512;   // unlimited -> use the prp-list cap (satoru)
+    if (mdts_pages > 512) mdts_pages = 512;
+    return mdts_pages * 4096u;
+}
+
 bool NVMe::Read(uint64_t lba, uint32_t count, void* buffer) {
     if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
-
-    NVMeSQE cmd = {};
-    NVMeCQE result = {};
-    cmd.opcode = NVME_IO_READ;
-    cmd.nsid = 1;
-    cmd.prp1 = (uint64_t)(uintptr_t)buffer;
-    cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
-    cmd.cdw11 = (uint32_t)(lba >> 32);
-    cmd.cdw12 = count - 1; // 0-based
-
-    bool ok = SubmitIOCmd(0, &cmd, &result);
-    if (ok) {
-        read_count++;
-        bytes_read += (uint64_t)count * GetLBASize();
+    uint32_t lbasz = GetLBASize();
+    uint32_t per = MaxTransferBytes() / lbasz; if (!per) per = 1;
+    uint8_t* p = (uint8_t*)buffer;
+    while (count > 0) {
+        uint32_t n = count > per ? per : count;
+        uint64_t prp1 = 0, prp2 = 0;
+        if (!nvme_build_prp((uint64_t)(uintptr_t)p, n * lbasz, &prp1, &prp2)) return false;
+        NVMeSQE cmd = {}; NVMeCQE result = {};
+        cmd.opcode = NVME_IO_READ; cmd.nsid = 1;
+        cmd.prp1 = prp1; cmd.prp2 = prp2;
+        cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF); cmd.cdw11 = (uint32_t)(lba >> 32);
+        cmd.cdw12 = n - 1;
+        if (!SubmitIOCmd(0, &cmd, &result)) return false;
+        read_count++; bytes_read += (uint64_t)n * lbasz;
+        lba += n; count -= n; p += (uint64_t)n * lbasz;
     }
-    return ok;
+    return true;
 }
 
 bool NVMe::Write(uint64_t lba, uint32_t count, const void* buffer) {
     if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
-
-    NVMeSQE cmd = {};
-    NVMeCQE result = {};
-    cmd.opcode = NVME_IO_WRITE;
-    cmd.nsid = 1;
-    cmd.prp1 = (uint64_t)(uintptr_t)buffer;
-    cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
-    cmd.cdw11 = (uint32_t)(lba >> 32);
-    cmd.cdw12 = count - 1;
-
-    bool ok = SubmitIOCmd(0, &cmd, &result);
-    if (ok) {
-        write_count++;
-        bytes_written += (uint64_t)count * GetLBASize();
+    uint32_t lbasz = GetLBASize();
+    uint32_t per = MaxTransferBytes() / lbasz; if (!per) per = 1;
+    const uint8_t* p = (const uint8_t*)buffer;
+    while (count > 0) {
+        uint32_t n = count > per ? per : count;
+        uint64_t prp1 = 0, prp2 = 0;
+        if (!nvme_build_prp((uint64_t)(uintptr_t)p, n * lbasz, &prp1, &prp2)) return false;
+        NVMeSQE cmd = {}; NVMeCQE result = {};
+        cmd.opcode = NVME_IO_WRITE; cmd.nsid = 1;
+        cmd.prp1 = prp1; cmd.prp2 = prp2;
+        cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF); cmd.cdw11 = (uint32_t)(lba >> 32);
+        cmd.cdw12 = n - 1;
+        if (!SubmitIOCmd(0, &cmd, &result)) return false;
+        write_count++; bytes_written += (uint64_t)n * lbasz;
+        lba += n; count -= n; p += (uint64_t)n * lbasz;
     }
-    return ok;
+    return true;
 }
 
 bool NVMe::Flush() {

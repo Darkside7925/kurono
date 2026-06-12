@@ -75,6 +75,12 @@ static void FreeDecodeBuf(State& st) {
     if (st.decode_buf) KernelHeap::Free(st.decode_buf);
     st.decode_buf = nullptr;
     st.decode_cap = 0;
+    // decode-ahead slot  -  released here too; Open() calls Close() first so this
+    // also zero-inits the prefetch state on a freshly opened (zeroed) State. (satoru)
+    if (st.decode_buf2) KernelHeap::Free(st.decode_buf2);
+    st.decode_buf2 = nullptr;
+    st.decode_cap2 = 0;
+    st.prefetch_frame = -1;
 }
 
 static void FreeScaledBuf(State& st) {
@@ -90,13 +96,14 @@ static void FreeScaledBuf(State& st) {
 // for an unbounded allocation (1920*1080*4 ≈ 8 mb). (satoru)
 static const uint32_t kMaxFramePixelsBytes = 1920u * 1080u * 4u;
 
-static bool DecodeJpegInto(State& st, const uint8_t* jpeg, uint32_t len) {
+// decode a jpeg into *buf (growing it as needed); sets *ow,*oh on success. stb
+// has no decode-into-caller-buffer api, so it mallocs a temp via STBI_MALLOC; we
+// copy into the (reused) scratch and free it immediately, so the per-frame churn
+// is a single memcpy. used for BOTH the live frame (decode_buf) and the
+// decode-ahead slot (decode_buf2). (satoru)
+static bool DecodeJpegToBuf(const uint8_t* jpeg, uint32_t len,
+                            uint8_t** buf, uint32_t* cap, int* ow, int* oh) {
     int w = 0, h = 0, comp = 0;
-    // stb has no decode-into-caller-buffer api, so it mallocs a temp via
-    // STBI_MALLOC. we copy that temp into our persistent scratch and free it
-    // immediately, so steady-state holds exactly one owned rgba buffer and
-    // the per-frame churn becomes a single memcpy instead of alloc+free of
-    // the previous frame. (satoru)
     unsigned char* rgba = stbi_load_from_memory(jpeg, (int)len, &w, &h, &comp, 4);
     if (!rgba) {
         SerialLogger::Log("[VideoPlayer] jpeg decode failed: ");
@@ -115,34 +122,39 @@ static bool DecodeJpegInto(State& st, const uint8_t* jpeg, uint32_t len) {
         return false;
     }
 
-    // grow the persistent scratch only when a larger frame appears. (satoru)
-    if (!st.decode_buf || st.decode_cap < (uint32_t)need) {
-        if (st.decode_buf) KernelHeap::Free(st.decode_buf);
-        st.decode_buf = (uint8_t*)KernelHeap::Alloc((uint32_t)need);
-        st.decode_cap = st.decode_buf ? (uint32_t)need : 0;
-        if (!st.decode_buf) {
+    // grow the scratch only when a larger frame appears. (satoru)
+    if (!*buf || *cap < (uint32_t)need) {
+        if (*buf) KernelHeap::Free(*buf);
+        *buf = (uint8_t*)KernelHeap::Alloc((uint32_t)need);
+        *cap = *buf ? (uint32_t)need : 0;
+        if (!*buf) {
             stbi_image_free(rgba);
             SerialLogger::Log("[VideoPlayer] scratch alloc failed\r\n");
-            FreeRgba(st);
             return false;
         }
     }
 
-    memcpy(st.decode_buf, rgba, (size_t)need);
+    memcpy(*buf, rgba, (size_t)need);
     stbi_image_free(rgba);
+    *ow = w; *oh = h;
+    return true;
+}
 
+static bool DecodeJpegInto(State& st, const uint8_t* jpeg, uint32_t len) {
+    if (!DecodeJpegToBuf(jpeg, len, &st.decode_buf, &st.decode_cap, &st.rgba_w, &st.rgba_h)) {
+        FreeRgba(st);
+        return false;
+    }
     // point the view at the persistent scratch; it is not stb-owned. (satoru)
     st.rgba_frame = st.decode_buf;
-    st.rgba_w     = w;
-    st.rgba_h     = h;
     st.rgba_owns  = false;
     st.scaled_valid = false;   // a new frame invalidates the scaled cache (satoru)
     if (s_decode_log_budget > 0) {
         s_decode_log_budget--;
         SerialLogger::Log("[VideoPlayer] decoded jpeg ");
-        SerialLogger::LogDec(w);
+        SerialLogger::LogDec(st.rgba_w);
         SerialLogger::Log("x");
-        SerialLogger::LogDec(h);
+        SerialLogger::LogDec(st.rgba_h);
         SerialLogger::Log(" bytes=");
         SerialLogger::LogDec((int)len);
         SerialLogger::Log("\r\n");
@@ -303,6 +315,7 @@ void SeekMs(State& st, uint32_t ms) {
     if (st.kind == SRC_KVID) {
         st.kvid_cur_frame = KVID::FrameAtMs(st.kvid, ms);
     }
+    st.prefetch_frame = -1;   // a seek discards the decode-ahead frame (satoru)
     uint32_t now = Timer::GetRealMs();
     st.play_started_ms = now - ms;
     st.pause_remainder_ms = ms;
@@ -351,22 +364,30 @@ bool PumpDecode(State& st) {
         }
         // decode frames we've passed (usually just the next one)
         if (target_frame != st.kvid_cur_frame) {
-            uint32_t jpeg_size = 0;
-            const uint8_t* jpeg = KVID::GetFrameJpeg(st.kvid, target_frame, &jpeg_size);
             if (s_frame_log_budget > 0) {
                 s_frame_log_budget--;
                 SerialLogger::Log("[VideoPlayer] frame=");
                 SerialLogger::LogDec((int)target_frame);
                 SerialLogger::Log(" pos_ms=");
                 SerialLogger::LogDec((int)pos_ms);
-                SerialLogger::Log(" jpeg=");
-                SerialLogger::LogDec((int)jpeg_size);
                 SerialLogger::Log("\r\n");
             }
-            if (jpeg && jpeg_size >= 4) {
-                DecodeJpegInto(st, jpeg, jpeg_size);
+            // fast path: this frame was decoded ahead on an earlier idle compositor
+            // frame -> swap it in, no inline jpeg decode stall. (satoru)
+            if (st.prefetch_frame == (int)target_frame && st.decode_buf2) {
+                uint8_t* tb = st.decode_buf; uint32_t tc = st.decode_cap;
+                st.decode_buf  = st.decode_buf2; st.decode_cap  = st.decode_cap2;
+                st.decode_buf2 = tb;             st.decode_cap2 = tc;
+                st.rgba_w = st.prefetch_w; st.rgba_h = st.prefetch_h;
+                st.rgba_frame = st.decode_buf; st.rgba_owns = false;
+                st.scaled_valid = false;
+                st.prefetch_frame = -1;
             } else {
-                SerialLogger::Log("[VideoPlayer] missing/short jpeg frame\r\n");
+                uint32_t jpeg_size = 0;
+                const uint8_t* jpeg = KVID::GetFrameJpeg(st.kvid, target_frame, &jpeg_size);
+                if (jpeg && jpeg_size >= 4) DecodeJpegInto(st, jpeg, jpeg_size);
+                else SerialLogger::Log("[VideoPlayer] missing/short jpeg frame\r\n");
+                st.prefetch_frame = -1;   // a real decode supersedes any stale prefetch (satoru)
             }
             // push audio for this frame interval
             if (st.audio_stream_id >= 0) {
@@ -384,6 +405,21 @@ bool PumpDecode(State& st) {
             }
             st.kvid_cur_frame = target_frame;
             return true;   // displayed frame advanced (satoru)
+        } else {
+            // display caught up to the clock: spend this otherwise-idle compositor
+            // frame decoding the NEXT video frame ahead, so the upcoming boundary
+            // is a cheap swap instead of a stalling decode. one prefetch in flight,
+            // video only (audio is still pushed on the real advance). (satoru)
+            uint32_t nxt = target_frame + 1;
+            if (st.prefetch_frame != (int)nxt && nxt < st.kvid.hdr.frame_count) {
+                uint32_t js = 0;
+                const uint8_t* j = KVID::GetFrameJpeg(st.kvid, nxt, &js);
+                if (j && js >= 4 &&
+                    DecodeJpegToBuf(j, js, &st.decode_buf2, &st.decode_cap2,
+                                    &st.prefetch_w, &st.prefetch_h)) {
+                    st.prefetch_frame = (int)nxt;
+                }
+            }
         }
     } else if (st.kind == SRC_MP4) {
         // mjpeg-in-mp4 fast path

@@ -103,7 +103,8 @@ The project is broad, but the actual top level shape is easy to hold in the head
 
 ### Filesystem (`fs/`)
 
-- `fs/KVFS.md`  -  in-memory virtual filesystem
+- `fs/KVFS.md`  -  in-memory virtual filesystem (runtime fs)
+- `fs/KFS.md`  -  Kurono File System (on-disk persistence layer)
 - `fs/VFS.md`  -  filesystem routing layer
 - `fs/FAT32.md`  -  FAT32 disk filesystem
 
@@ -112,6 +113,7 @@ The project is broad, but the actual top level shape is easy to hold in the head
 - `system/UI_CONFIG.md`  -  runtime UI configuration system
 - `system/INPUT_MANAGER.md`  -  input event routing
 - `system/INSTALLER.md`  -  disk installer
+- `system/LOGGING.md`  -  runtime logging + canonical path layout (`kpaths.h`)
 
 ### Network (`net/`)
 

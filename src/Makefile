@@ -174,10 +174,12 @@ CXX_SRCS = \
     $(SRC)/drivers/mouse.cpp \
     $(SRC)/drivers/rtc.cpp \
     $(SRC)/proc/scheduler.cpp \
+    $(SRC)/proc/smp.cpp \
     $(SRC)/proc/kernel_processes.cpp \
     $(SRC)/fs/vfs.cpp \
     $(SRC)/fs/kvfs.cpp \
     $(SRC)/fs/persist.cpp \
+    $(SRC)/fs/kfs.cpp \
 	$(SRC)/fs/fat32.cpp \
     $(SRC)/shell/shell.cpp \
     $(SRC)/shell/linux_cmds.cpp \
@@ -367,11 +369,24 @@ all: dirs $(KERNEL)
 
 # ─── Link ─────────────────────────────────────────────────────────────────
 
-$(KERNEL_BASE): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS)
+# ap trampoline object  -  must be defined before the link rules use it (make
+# expands prerequisites at parse time). (satoru)
+AP_TRAMP_OBJ = $(BUILD)/boot/ap_trampoline.o
+
+$(KERNEL_BASE): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS) $(AP_TRAMP_OBJ)
 	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld -nostdlib -o $@ $^ -lgcc
 
-$(KERNEL): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS) $(INSTALLER_PAYLOAD_OBJS)
+$(KERNEL): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS) $(AP_TRAMP_OBJ) $(INSTALLER_PAYLOAD_OBJS)
 	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld -nostdlib -o $@ $^ -lgcc
+
+# ─── AP trampoline: flat 16/32/64-bit blob (nasm -f bin) embedded via objcopy ──
+# runs at physical 0x8000 after SIPI; copied there at runtime by SMP::StartAPs. (satoru)
+$(BUILD)/boot/ap_trampoline.bin: $(SRC)/boot/ap_trampoline.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f bin $< -o $@
+$(AP_TRAMP_OBJ): $(BUILD)/boot/ap_trampoline.bin
+	cd $(BUILD)/boot && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  ap_trampoline.bin ap_trampoline.o
 
 # ─── Embed Alpine kernel via objcopy (binary → ELF .rodata) ──────────────
 $(ALPINE_KERNEL_OBJ): $(ALPINE_KERNEL_BIN)

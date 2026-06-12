@@ -265,6 +265,8 @@ public:
     static uint32_t GetProcessCount();
     static const char* GetCurrentProcessName();
     static Process* GetCurrentProcess();
+    // set the calling cpu's current task (bsp global / ap PerCpu.current). (satoru)
+    static void SetCurrentForThisCpu(Process* p);
     static Process* FindProcessByPid(uint32_t pid);
     static int GetProcessSnapshot(SchedulerProcessSnapshot* out, int max_count);
 
