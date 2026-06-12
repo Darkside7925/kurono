@@ -1202,11 +1202,14 @@ bool FileManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
             // crude rename: copy + unlink (KVFS::Move handles files only; for dirs skip)
             KVFSNode* n = KVFS::ResolvePath(old_p);
             if(n && !n->is_dir()){
-                // heap-allocate the 64KB copy buffer  -  a KVFS_MAX_CONTENT stack
-                // frame overflows the GUI process stack and corrupts memory. (satoru)
-                char* buf = (char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+                // heap-allocate the copy buffer sized to the file (a big stack
+                // frame overflows the GUI process stack). cap at the per-file
+                // ceiling so renaming large files doesn't truncate them. (satoru)
+                uint32_t need = n->size + 1;
+                if(need > KVFS_MAX_FILE_SIZE) need = KVFS_MAX_FILE_SIZE;
+                char* buf = (char*)KernelHeap::Alloc(need);
                 if(buf){
-                    int len = KVFS::ReadFile(old_p,buf,KVFS_MAX_CONTENT);
+                    int len = KVFS::ReadFile(old_p,buf,need);
                     KVFS::Unlink(old_p);
                     KVFS::CreateFile(new_p);
                     if(len>0) KVFS::WriteFile(new_p,buf,len);

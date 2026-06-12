@@ -3,6 +3,8 @@
 #include "nvme.h"
 #include "../hal/hal.h"
 #include "../kernel/heap.h"
+#include "../kernel/pmm.h"   // page-aligned dma memory for the admin/io queues (satoru)
+#include "../kernel/vmm.h"   // identity-map the high 64-bit bar before touching it (satoru)
 #include "../drivers/serial.h"
 #include <string.h>
 
@@ -61,7 +63,24 @@ bool NVMe::Init() {
                 // found nvme controller
                 HAL::OutLong(0xCF8, addr | 0x10); // bar0
                 uint32_t bar0_val = HAL::InLong(0xCFC);
-                bar0 = (volatile uint8_t*)(uintptr_t)(bar0_val & ~0xFu);
+                uint64_t bar_addr = (uint64_t)(bar0_val & ~0xFu);
+                // 64-bit memory bar (type bits 10b): the high 32 bits live in bar1.
+                // qemu places the nvme bar above 4gb under -m 4G, so reading only
+                // bar0 yields a null base (0x...04 = type bits, base 0) and every
+                // register read returns 0 -> "version 0.0.0" + enable timeout. (satoru)
+                if (((bar0_val >> 1) & 0x3) == 0x2) {
+                    HAL::OutLong(0xCF8, addr | 0x14); // bar1 (high 32 bits)
+                    uint32_t bar1_val = HAL::InLong(0xCFC);
+                    bar_addr |= ((uint64_t)bar1_val << 32);
+                }
+                // the bar may sit above the boot identity map -> identity-map its
+                // register window (64kb covers controller regs + doorbells) as
+                // uncached mmio before any dereference, or ReadReg #pfs. (satoru)
+                for (uint64_t p = bar_addr & ~0xFFFULL;
+                     p < (bar_addr & ~0xFFFULL) + 0x10000ULL; p += 0x1000ULL) {
+                    KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+                }
+                bar0 = (volatile uint8_t*)(uintptr_t)bar_addr;
 
                 SerialLogger::Log("[NVMe] Controller found at PCI ");
                 SerialLogger::LogDec(0); SerialLogger::Log(":");
@@ -71,7 +90,9 @@ bool NVMe::Init() {
                 SerialLogger::LogHex(bar0_val);
                 SerialLogger::Log("\r\n");
 
-                // enable bus mastering
+                // enable bus mastering + memory space (the controller needs bus
+                // master to dma the queues; without it commands never complete
+                // even though CSTS.RDY=1). (satoru)
                 HAL::OutLong(0xCF8, addr | 0x04);
                 uint32_t cmd = HAL::InLong(0xCFC);
                 cmd |= (1 << 2) | (1 << 1); // bus master + memory space
@@ -79,6 +100,17 @@ bool NVMe::Init() {
                 HAL::OutLong(0xCFC, cmd);
 
                 detected = true;
+
+                // diag: controller capabilities  -  MQES (max queue entries-1),
+                // DSTRD (doorbell stride), TO (enable timeout, 500ms units). a
+                // depth > MQES+1 or a non-zero DSTRD breaks our hardcoded queue
+                // depth / doorbell offsets. (satoru)
+                uint64_t cap = ReadReg64(NVME_REG_CAP);
+                SerialLogger::Log("[NVMe] CAP MQES=");
+                SerialLogger::LogDec((int)(cap & 0xFFFF));
+                SerialLogger::Log(" DSTRD="); SerialLogger::LogDec((int)((cap >> 32) & 0xF));
+                SerialLogger::Log(" TO="); SerialLogger::LogDec((int)((cap >> 24) & 0xFF));
+                SerialLogger::Log("\r\n");
 
                 // read version
                 uint32_t vs = ReadReg(NVME_REG_VS);
@@ -101,8 +133,12 @@ bool NVMe::Init() {
                 admin_queue.cq_phase = 1;
                 admin_queue.qid = 0;
 
-                admin_queue.sq = (NVMeSQE*)KernelHeap::Alloc(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
-                admin_queue.cq = (NVMeCQE*)KernelHeap::Alloc(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
+                // the admin sq/cq must be 4kb page-aligned for the controller's
+                // dma engine; KernelHeap is only 16-byte aligned, so the queues
+                // straddle pages and the controller never reaches RDY. PMM hands
+                // out page-aligned, identity-mapped (virt==phys) frames. (satoru)
+                admin_queue.sq = (NVMeSQE*)PMM::AllocBytes(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
+                admin_queue.cq = (NVMeCQE*)PMM::AllocBytes(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
                 if (admin_queue.sq) memset(admin_queue.sq, 0, sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
                 if (admin_queue.cq) memset(admin_queue.cq, 0, sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
 
@@ -157,7 +193,9 @@ uint64_t NVMe::GetBytesWritten() { return bytes_written; }
 bool NVMe::Identify() {
     if (!detected || !admin_queue.sq) return false;
 
-    uint8_t* id_buf = (uint8_t*)KernelHeap::Alloc(4096);
+    // page-aligned: this is the prp1 dma target for IDENTIFY (a 4kb transfer),
+    // which the controller requires page-aligned. (satoru)
+    uint8_t* id_buf = (uint8_t*)PMM::AllocBytes(4096);
     if (!id_buf) return false;
     memset(id_buf, 0, 4096);
 
@@ -169,7 +207,7 @@ bool NVMe::Identify() {
 
     NVMeCQE result = {};
     if (!SubmitAdminCmd(&cmd, &result)) {
-        KernelHeap::Free(id_buf);
+        PMM::FreeBytes(id_buf, 4096);
         return false;
     }
 
@@ -210,7 +248,7 @@ bool NVMe::Identify() {
         SerialLogger::Log(" bytes\r\n");
     }
 
-    KernelHeap::Free(id_buf);
+    PMM::FreeBytes(id_buf, 4096);
     return true;
 }
 
@@ -224,8 +262,9 @@ bool NVMe::CreateIOQueues() {
     qp->cq_phase = 1;
     qp->qid = 1;
 
-    qp->sq = (NVMeSQE*)KernelHeap::Alloc(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
-    qp->cq = (NVMeCQE*)KernelHeap::Alloc(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
+    // page-aligned for the controller dma engine, same as the admin queues. (satoru)
+    qp->sq = (NVMeSQE*)PMM::AllocBytes(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
+    qp->cq = (NVMeCQE*)PMM::AllocBytes(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
     if (qp->sq) memset(qp->sq, 0, sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
     if (qp->cq) memset(qp->cq, 0, sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
 
@@ -286,9 +325,16 @@ bool NVMe::SubmitIOCmd(int qid, NVMeSQE* cmd, NVMeCQE* result) {
 bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
     for (int timeout = 0; timeout < 100000; timeout++) {
         NVMeCQE* cqe = &qp->cq[qp->cq_head];
-        uint16_t phase = (cqe->status & 1);
+        // VOLATILE read: the controller dma-writes this completion. a plain read
+        // gets hoisted out of the loop by the compiler, so we spin on the stale
+        // cached 0 and time out even though the completion (phase + status) is
+        // already in memory  -  this one missing volatile is why NO nvme command
+        // ever completed. (satoru)
+        uint16_t st = *(volatile uint16_t*)&cqe->status;
+        uint16_t phase = (st & 1);
         if (phase == qp->cq_phase) {
             if (result) *result = *cqe;
+            uint16_t sc = (st >> 1) & 0x7FF;  // status code (0 = success) (satoru)
 
             qp->cq_head++;
             if (qp->cq_head >= qp->depth) {
@@ -300,10 +346,27 @@ bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
             uint32_t cq_db = NVME_REG_SQ0TDBL + (qp->qid * 2 + 1) * 4;
             WriteReg(cq_db, qp->cq_head);
 
-            return ((cqe->status >> 1) & 0x7FF) == 0; // check status code
+            if (sc != 0) {  // diag: command completed but the controller rejected it (satoru)
+                SerialLogger::Log("[NVMe] cmd ERR q=");
+                SerialLogger::LogDec((int)qp->qid);
+                SerialLogger::Log(" sc=0x"); SerialLogger::LogHex(sc);
+                SerialLogger::Log("\r\n");
+            }
+            return sc == 0; // check status code
         }
         for (volatile int j = 0; j < 100; j++) {} // spin
     }
+    // diag: completion never appeared. dump the raw cqe at cq_head  -  if it's all
+    // zero the controller wrote nothing (didn't fetch/process the command); if it
+    // has data the phase bit / slot is being misread. (satoru)
+    NVMeCQE* cqe = &qp->cq[qp->cq_head];
+    SerialLogger::Log("[NVMe] poll TIMEOUT q=");
+    SerialLogger::LogDec((int)qp->qid);
+    SerialLogger::Log(" cqe: status=0x"); SerialLogger::LogHex(cqe->status);
+    SerialLogger::Log(" sqhd=0x"); SerialLogger::LogHex(cqe->sq_head);
+    SerialLogger::Log(" cid=0x"); SerialLogger::LogHex(cqe->command_id);
+    SerialLogger::Log(" res=0x"); SerialLogger::LogHex(cqe->result);
+    SerialLogger::Log("\r\n");
     return false;
 }
 

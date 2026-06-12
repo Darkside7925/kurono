@@ -930,7 +930,8 @@ static bool kget32(const uint8_t* b, size_t size, size_t* pos, uint32_t* out) {
 }
 
 bool KVFS::SerializeNode(const KVFSNode* node, uint8_t* buffer,
-                         size_t maxSize, size_t* pos, uint32_t* count) {
+                         size_t maxSize, size_t* pos, uint32_t* count,
+                         bool persist_content) {
     if (!node) return true;
 
     uint16_t name_len = (uint16_t)kstrlen(node->name);
@@ -938,8 +939,14 @@ bool KVFS::SerializeNode(const KVFSNode* node, uint8_t* buffer,
     uint16_t link_len = (node->type == KVFS_SYMLINK)
                         ? (uint16_t)kstrlen(node->link_target) : 0;
     if (link_len > KVFS_MAX_PATH) link_len = KVFS_MAX_PATH;
-    // only real files carry content; cap at the declared size (satoru)
-    uint32_t content_len = (node->is_file() && node->content) ? node->size : 0;
+    // only real files carry content, only inside user-data subtrees, and only up
+    // to the per-file ceiling: the re-seeded /usr binaries + the big >4mb media
+    // (denji.kvid, ssstik.*) serialize as empty entries (structure only) and are
+    // re-filled by the boot seeding. capping at KVFS_MAX_FILE_SIZE also keeps any
+    // single content_len within what deserialize will accept, so one oversized
+    // file can never fail the whole-tree restore. (satoru)
+    uint32_t content_len = (node->is_file() && node->content && persist_content
+                            && node->size <= KVFS_MAX_FILE_SIZE) ? node->size : 0;
 
     if (!kput8(buffer, maxSize, pos, (uint8_t)node->type)) return false;
     if (!kput16(buffer, maxSize, pos, node->perms.mode)) return false;
@@ -967,7 +974,15 @@ bool KVFS::SerializeNode(const KVFSNode* node, uint8_t* buffer,
 
     for (int i = 0; i < node->child_count; i++) {
         if (!node->children[i]) continue;
-        if (!SerializeNode(node->children[i], buffer, maxSize, pos, count))
+        // turn on content persistence when descending into a user-data top-level
+        // dir; stays on for the whole subtree below it. (satoru)
+        bool cp = persist_content;
+        if (node == root) {
+            const char* nm = node->children[i]->name;
+            if (kstreq(nm, "home") || kstreq(nm, "etc") || kstreq(nm, "root"))
+                cp = true;
+        }
+        if (!SerializeNode(node->children[i], buffer, maxSize, pos, count, cp))
             return false;
     }
     return true;
@@ -986,7 +1001,7 @@ size_t KVFS::Serialize(uint8_t* buffer, size_t maxSize) {
     if (!kput32(buffer, maxSize, &pos, 0)) return 0;
 
     uint32_t count = 0;
-    if (!SerializeNode(root, buffer, maxSize, &pos, &count)) return 0;
+    if (!SerializeNode(root, buffer, maxSize, &pos, &count, false)) return 0;
 
     // back-patch node_count (satoru)
     size_t tmp = count_pos;
@@ -1052,7 +1067,7 @@ static KVFSNode* kvfs_deser_node(const uint8_t* b, size_t size, size_t* pos,
 
     uint32_t content_len;
     if (!kget32(b, size, pos, &content_len)) return nullptr;
-    if (content_len > KVFS_MAX_CONTENT) return nullptr;
+    if (content_len > KVFS_MAX_FILE_SIZE) return nullptr;
     if (*pos + content_len > size) return nullptr;
     if (content_len) {
         uint32_t cap = (content_len + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);

@@ -36,6 +36,7 @@
 #include "../hal/hal.h"
 #include "../fs/vfs.h"
 #include "../fs/kvfs.h"
+#include "../fs/persist.h"
 #include "../drivers/usb.h"
 #include "../linux/ext4.h"
 #include "../proc/scheduler.h"
@@ -1570,19 +1571,27 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
     SerialLogger::Log("[KVFS] Init...\r\n");
     KVFS::Init();
-    // restore persistent kvfs state from the ext4 target if one is mounted and a
-    // saved image exists; otherwise the default tree from init() stays. requires
-    // ext4 to be mounted by this point (only when an nvme target is present). (satoru)
-    if (Ext4::IsMounted() && Ext4::Exists("/var/lib/kurono/kvfs.img")) {
-        int64_t ksz = Ext4::FileSize("/var/lib/kurono/kvfs.img");
-        if (ksz > 0 && ksz < 64 * 1024 * 1024) {
-            uint8_t* kbuf = (uint8_t*)KernelHeap::Alloc((uint32_t)ksz);
-            if (kbuf) {
-                int kr = Ext4::ReadWholeFile("/var/lib/kurono/kvfs.img", kbuf, (uint32_t)ksz);
-                if (kr > 0 && KVFS::Deserialize(kbuf, (size_t)kr))
-                    SerialLogger::Log("[KVFS] restored persistent state from kvfs.img\r\n");
-                KernelHeap::Free(kbuf);
+    // bring up + mount a persistent ext4 data disk (if attached) BEFORE restoring,
+    // so kvfs.img survives a reboot on a normal boot  -  not just after an install.
+    // Installer::Init() runs much later, so do the mount here ourselves. (satoru)
+    // detect the nvme data disk  -  MountDataDisk runs NVMe::Init for us; its ext4
+    // probe just fails harmlessly on our raw persistence store. (satoru)
+    Installer::MountDataDisk();
+    // restore persistent kvfs state from the raw nvme store if a valid blob is
+    // present; otherwise the default tree from init() stays. the /usr/bin binary
+    // re-seeding below re-fills the entries we deliberately saved content-free. (satoru)
+    if (PersistStore::Available()) {
+        const uint32_t cap = 32 * 1024 * 1024;
+        uint8_t* kbuf = (uint8_t*)KernelHeap::Alloc(cap);
+        if (kbuf) {
+            uint32_t klen = 0;
+            if (PersistStore::Load(kbuf, cap, &klen) && klen > 0) {
+                bool de = KVFS::Deserialize(kbuf, (size_t)klen);
+                SerialLogger::Log("[KVFS] restore: loaded="); SerialLogger::LogDec((int)klen);
+                SerialLogger::Log(" deserialize="); SerialLogger::LogDec(de ? 1 : 0); SerialLogger::Log("\r\n");
+                if (de) SerialLogger::Log("[KVFS] restored persistent state\r\n");
             }
+            KernelHeap::Free(kbuf);
         }
     }
     // bring up the usb host controller + hid interrupt polling (no-op if no xhci). (satoru)

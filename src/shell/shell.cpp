@@ -5,6 +5,7 @@
 #include "../system/ui_config.h"
 #include "../ui/desktop.h"
 #include "../fs/kvfs.h"
+#include "../fs/persist.h"
 #include "../linux/ext4.h"
 #include "../kernel/heap.h"
 #include "../kernel/userspace.h"
@@ -914,6 +915,7 @@ namespace ShellBuiltins {
     int cmd_wltest(KuronoShell*, int, const char**, char*, int);
     int cmd_pthtest(KuronoShell*, int, const char**, char*, int);
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
+    int cmd_persisttest(KuronoShell*, int, const char**, char*, int);
 }
 
 void KuronoShell::RegisterBuiltins() {
@@ -923,6 +925,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
     RegisterCommand("wltest",   "Run the wl_shm wayland render test", ENV_AUTO, "media", cmd_wltest);
     RegisterCommand("pthtest",  "Run the pthreads (clone+futex) smoke test", ENV_AUTO, "media", cmd_pthtest);
+    RegisterCommand("persisttest","Test kvfs persistence across reboot", ENV_AUTO, "system", cmd_persisttest);
     RegisterCommand("playvideo","Play the imported video (ssstik)", ENV_AUTO, "media",  cmd_playvideo);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
     RegisterCommand("version",  "Show OS version",             ENV_KURONO, "builtin", cmd_version);
@@ -1433,25 +1436,24 @@ int cmd_gpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
 
 // serialize the in-memory kvfs tree to the persistent ext4 image so the desktop
 // filesystem survives a reboot/shutdown. no-op if no ext4 target is mounted. (satoru)
-static void persist_kvfs_to_ext4() {
-    if (!Ext4::IsMounted()) return;
-    const size_t cap = 8 * 1024 * 1024;  // generous bound for the kvfs tree (satoru)
+static void persist_kvfs() {
+    if (!PersistStore::Available()) return;
+    // KVFS::Serialize only keeps file CONTENT for user-data subtrees (/home, /etc,
+    // /root), skipping the re-seeded /usr binaries + sample media, so the blob is
+    // small; a fixed 32MB buffer is plenty. it goes straight to the raw nvme store,
+    // bypassing any filesystem (the ext4 writer's block allocation is broken). (satoru)
+    const size_t cap = 32 * 1024 * 1024;
     uint8_t* buf = (uint8_t*)KernelHeap::Alloc(cap);
     if (!buf) return;
     size_t n = KVFS::Serialize(buf, cap);
-    if (n > 0) {
-        Ext4::Mkdir("/var", 0755);
-        Ext4::Mkdir("/var/lib", 0755);
-        Ext4::Mkdir("/var/lib/kurono", 0755);
-        Ext4::WriteFile("/var/lib/kurono/kvfs.img", buf, (uint32_t)n);
-    }
+    if (n > 0) PersistStore::Save(buf, (uint32_t)n);
     KernelHeap::Free(buf);
 }
 
 int cmd_reboot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Rebooting...\n");
-    persist_kvfs_to_ext4();   // save desktop fs before reboot (satoru)
+    persist_kvfs();   // save desktop fs before reboot (satoru)
     HAL::Reboot();
     return p;
 }
@@ -1459,8 +1461,35 @@ int cmd_reboot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
 int cmd_shutdown(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Shutting down...\n");
-    persist_kvfs_to_ext4();   // save desktop fs before power-off (satoru)
+    persist_kvfs();   // save desktop fs before power-off (satoru)
     HAL::PowerOff();          // acpi/emulator soft power-off; does not return (satoru)
+    return p;
+}
+
+// persisttest  -  prove the kvfs persistence loop end to end. first run writes a
+// marker and flushes it to the ext4 data disk; after a reboot the boot-mount +
+// restore brings it back, so a second run reports it survived. (satoru)
+int cmd_persisttest(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    const char* path = "/home/user/.persisttest";
+    if (KVFS::Exists(path)) {
+        char val[64]; val[0] = 0;
+        KVFS::ReadString(path, val, (int)sizeof(val));
+        int p = sappend(out, 0, maxo, "PERSIST OK: marker survived the reboot -> \"");
+        p = sappend(out, p, maxo, val);
+        p = sappend(out, p, maxo, "\"\n");
+        return p;
+    }
+    KVFS::WriteString(path, "kurono-persist-v1");
+    int p = sappend(out, 0, maxo, "PERSIST CREATED: wrote marker to ");
+    p = sappend(out, p, maxo, path);
+    p = sappend(out, p, maxo, "\n");
+    if (PersistStore::Available()) {
+        persist_kvfs();
+        p = sappend(out, p, maxo, "PERSIST SAVED: flushed kvfs to the raw nvme store; reboot + rerun to verify\n");
+    } else {
+        p = sappend(out, p, maxo, "PERSIST WARN: no nvme data disk present -> will NOT survive a reboot\n");
+    }
     return p;
 }
 
@@ -1530,7 +1559,7 @@ int cmd_cpufreq(KuronoShell* sh, int argc, const char** argv, char* out, int max
 int cmd_poweroff(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Powering off...\n");
-    persist_kvfs_to_ext4();
+    persist_kvfs();
     HAL::PowerOff();
     return p;
 }
