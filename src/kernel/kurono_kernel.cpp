@@ -994,6 +994,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
         }
+        // smp 3d: run user processes on the application processors (opt-in). set the
+        // gate BEFORE StartAPs so each ap dispatches from the moment it comes up;
+        // without the token the APs park (hlt) exactly as before. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.apsched=1") || boot_has_token(boot_cmdline, "kurono.apsched")) {
+            SMP::SetApUserSched(true);
+        }
         boot_get_value(boot_cmdline, "kurono.cli.run", boot_cli_run, (int)sizeof(boot_cli_run));
         // optional GUI autorun: open Terminal and queue a command. Used purely
         // for headless QEMU debug runs where we cannot type interactively.
@@ -2452,6 +2458,27 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         RuntimeLog::LogBoot("cli shell ready");
         RuntimeLog::LogSystem("kernel", "entered cli boot mode");
         cli_run_shell(boot_cli_run[0] ? boot_cli_run : nullptr, boot_cli_poweroff);
+    }
+
+    // smp phase 3d (TEMP  -  gate behind a cmdline token before the final commit):
+    // run this AFTER all the noisy init so an AP fault dump is clean. load
+    // /usr/bin/hello, pin it to the APs (affinity excludes cpu 0), flip the
+    // ap-dispatch gate; a spinning ap claims + launches it in ring-3 in parallel
+    // with the bsp. watch the serial for "[SMP] cpuN running user proc". (satoru)
+    // smp 3d demo (opt-in via kurono.apsched): queue a real user program for an
+    // application processor to run in ring-3 in parallel with the bsp desktop. uses
+    // mhello (static musl, SYSCALL-based, proven rc=0); the int-0x80 hello SIGSEGVs
+    // on the bsp too (a pre-existing loader/int80 issue, unrelated to smp). (satoru)
+    if (SMP::ApUserSched() && SMP::CpuCount() > 1 && EmbeddedUserprogs::HasPthreadTest()) {
+        SerialLogger::Log("[aptest] queueing /usr/bin/pthread_test (multithreaded) for AP execution...\r\n");
+        Process* ap_hp = ElfLoader::LoadELF64FromVFS("/usr/bin/pthread_test", "ap_pthtest");
+        if (!ap_hp) {
+            SerialLogger::Log("[aptest] load failed\r\n");
+        } else {
+            ap_hp->cpu_affinity = 0xFE;   // cpus 1..7 only, never the bsp (satoru)
+            LinuxSyscall::ClearConsoleOutput();
+            SerialLogger::Log("[aptest] queued; an AP should run it (preemptively) in ring-3\r\n");
+        }
     }
 
     SerialLogger::Log("Entering main loop\r\n");

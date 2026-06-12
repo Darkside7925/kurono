@@ -56,5 +56,12 @@ public:
 
     // phase 2  -  bring up the application processors. no-op until implemented. (satoru)
     static void StartAPs();
+
+    // phase 3d  -  cooperative user-thread dispatch on the application processors.
+    // when enabled, each ap claims fresh Ready user processes (affinity-permitting)
+    // off the ready_queue and runs them in ring-3, in parallel with the bsp. default
+    // OFF so a normal boot parks the APs exactly as before. (satoru)
+    static void SetApUserSched(bool on);
+    static bool ApUserSched();
 };
 // end (satoru)

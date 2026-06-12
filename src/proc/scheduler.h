@@ -206,6 +206,21 @@ public:
     static bool LoadUserFrame(Process* proc, InterruptFrame* frame);
     static Process* GetNextRunnableUser(Process* after);
     static bool ScheduleNextUser(InterruptFrame* frame);
+    // atomically claim a Ready user thread this cpu may run (smp phase 3d: the
+    // application-processor dispatch loop calls this to bootstrap a thread). marks
+    // the winner Running under the scheduler lock so no two cores claim one
+    // thread; returns null if nothing runnable is allowed on this cpu. (satoru)
+    static Process* ClaimNextUserForCpu(uint32_t cpu);
+    // claim a fresh (never-entered) Ready user process this cpu may LAUNCH (the AP
+    // dispatch loop runs it via Userspace::RunProcessWithArgs). marks it Running
+    // under the lock; returns null if none is allowed on this cpu. (satoru)
+    static Process* ClaimFreshUserForCpu(uint32_t cpu);
+    // smp phase 4: called from an application processor's LAPIC-timer ISR to
+    // PREEMPT the user thread it is running  -  save the interrupted frame and
+    // switch to the next runnable user thread for this cpu (the threads of one
+    // process share an address space, so no cr3 change). ring-3 frames only; a
+    // tick in the kernel/idle is ignored. (satoru)
+    static void ApTimerPreempt(InterruptFrame* frame);
     static void ReapProcess(Process* proc);
     static void DestroyProcess(Process* proc);
     static void Schedule();

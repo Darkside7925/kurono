@@ -16,9 +16,13 @@
 #include "../net/unix_socket.h"
 #include "../shell/shell.h"
 #include "../system/logging.h"
+#include "../proc/smp.h"          // per-cpu syscall-entry scratch (smp phase 3d) (satoru)
 
 LinuxProcess LinuxSyscall::procs[LINUX_MAX_PROCS];
-int LinuxSyscall::current_proc = -1;
+int LinuxSyscall::current_proc_cpu[SMP_MAX_CPUS] = {};
+// keep the ~8 internal uses of `current_proc` textually unchanged; each resolves
+// to the calling cpu's slot. Init() seeds every slot to -1. (smp 3d) (satoru)
+#define current_proc (current_proc_cpu[SMP::CpuIndex()])
 
 // console output capture ring buffer
 char LinuxSyscall::console_buf[CONSOLE_BUF_SIZE];
@@ -49,10 +53,20 @@ constexpr uint32_t PFERR_FETCH   = 1U << 4;
 constexpr uint32_t LINUX_PROT_WRITE = 0x2;
 constexpr uint32_t LINUX_PROT_EXEC  = 0x4;
 
-InterruptFrame* current_syscall_frame = nullptr;
-bool current_frame_rewritten = false;
-bool resume_userspace_session = false;
-int resume_userspace_exit_code = 0;
+// per-cpu syscall-entry scratch (smp phase 3d): each cpu has its own in-flight
+// frame pointer + rewrite/resume flags, so two cores can be inside int 0x80 /
+// SYSCALL at the same time without clobbering each other's state. the macros
+// keep the existing ~50 use sites textually unchanged; the cpu doesn't migrate
+// mid-syscall, so re-reading CpuIndex() per access is stable. on the bsp this is
+// slot 0  -  identical to the old single-frame behaviour. (satoru)
+static InterruptFrame* g_cur_syscall_frame[SMP_MAX_CPUS] = {};
+static bool g_cur_frame_rewritten[SMP_MAX_CPUS]  = {};
+static bool g_resume_us_session[SMP_MAX_CPUS]    = {};
+static int  g_resume_us_exit[SMP_MAX_CPUS]       = {};
+#define current_syscall_frame      g_cur_syscall_frame[SMP::CpuIndex()]
+#define current_frame_rewritten    g_cur_frame_rewritten[SMP::CpuIndex()]
+#define resume_userspace_session   g_resume_us_session[SMP::CpuIndex()]
+#define resume_userspace_exit_code g_resume_us_exit[SMP::CpuIndex()]
 
 static inline uint64_t align_down_u64(uint64_t value, uint64_t align) {
     return value & ~(align - 1);
@@ -1006,7 +1020,7 @@ void LinuxSyscall::Init() {
         procs[i].active = false;
         procs[i].pid = 0;
     }
-    current_proc = -1;
+    for (uint32_t c = 0; c < SMP_MAX_CPUS; c++) current_proc_cpu[c] = -1;  // none, every cpu (satoru)
     console_head = 0;
     console_tail = 0;
     stdin_head = 0;

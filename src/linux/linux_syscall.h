@@ -4,6 +4,7 @@
 //  unmodified linux elf binaries to run inside kurono os.
 
 #include "../kernel/types.h"
+#include "../proc/smp.h"        // SMP_MAX_CPUS  -  current_proc is per-cpu (smp 3d) (satoru)
 
 struct InterruptFrame;
 struct Process;
@@ -447,7 +448,9 @@ public:
 
 private:
     static LinuxProcess procs[LINUX_MAX_PROCS];
-    static int current_proc;
+    // the "current linux process" is per-cpu so each core resolves its own caller
+    // when running user threads in parallel; -1 = none. (smp phase 3d) (satoru)
+    static int current_proc_cpu[SMP_MAX_CPUS];
 
     // console output ring buffer (syscall writes land here)
     static constexpr int CONSOLE_BUF_SIZE = 8192;

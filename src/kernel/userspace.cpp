@@ -8,12 +8,9 @@
 #include "../linux/linux_syscall.h"
 
 bool Userspace::initialized = false;
-uint64_t Userspace::kernel_address_space = 0;
-Process* Userspace::previous_process = nullptr;
-int Userspace::previous_linux_process = -1;
-Process* Userspace::active_process = nullptr;
-int Userspace::active_linux_process = -1;
-UserspaceReturnContext Userspace::return_context = {};
+UserspaceCpuState Userspace::cpu_state[SMP_MAX_CPUS] = {};
+//  the calling cpu's user-execution context (bsp = index 0). (satoru)
+UserspaceCpuState& Userspace::cpu() { return cpu_state[SMP::CpuIndex()]; }
 
 namespace {
 constexpr uint64_t USER_DEMO_CODE_ADDR = USERSPACE_BASE + 0x00100000ULL;
@@ -28,7 +25,7 @@ static int append_demo_text(uint8_t* page, int pos, const char* text) {
 
 void Userspace::Init() {
     initialized = true;
-    kernel_address_space = KernelVMM::GetCurrentAddressSpace();
+    cpu().kernel_address_space = KernelVMM::GetCurrentAddressSpace();
 }
 
 bool Userspace::IsReady() {
@@ -36,7 +33,7 @@ bool Userspace::IsReady() {
 }
 
 bool Userspace::IsActive() {
-    return active_process != nullptr;
+    return cpu().active_process != nullptr;
 }
 
 bool Userspace::MapUserPage(Process* proc, uint64_t virt_addr, const void* data,
@@ -281,28 +278,31 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
                                   const char* const* envp) {
     if (!initialized) Init();
     if (!proc || !proc->is_user()) return -1;
-    if (active_process) return -2;
+    // per-cpu context: this cpu runs its own active user process. another core
+    // can be running a different one at the same time. (satoru)
+    UserspaceCpuState& u = cpu();
+    if (u.active_process) return -2;
 
-    active_process = proc;
-    previous_process = Scheduler::current_process;
-    kernel_address_space = KernelVMM::GetCurrentAddressSpace();
-    previous_linux_process = LinuxSyscall::GetCurrentIndex();
-    active_linux_process = LinuxSyscall::CreateProcess(proc->name, 0, 0);
-    if (active_linux_process < 0) {
-        active_process = nullptr;
-        previous_process = nullptr;
-        previous_linux_process = -1;
+    u.active_process = proc;
+    u.previous_process = Scheduler::GetCurrentProcess();
+    u.kernel_address_space = KernelVMM::GetCurrentAddressSpace();
+    u.previous_linux_process = LinuxSyscall::GetCurrentIndex();
+    u.active_linux_process = LinuxSyscall::CreateProcess(proc->name, 0, 0);
+    if (u.active_linux_process < 0) {
+        u.active_process = nullptr;
+        u.previous_process = nullptr;
+        u.previous_linux_process = -1;
         return -3;
     }
 
-    LinuxProcess* linux_proc = LinuxSyscall::GetProcess(active_linux_process);
+    LinuxProcess* linux_proc = LinuxSyscall::GetProcess(u.active_linux_process);
     if (linux_proc) {
         linux_proc->task = proc;
     }
 
-    LinuxSyscall::SetCurrent(active_linux_process);
+    LinuxSyscall::SetCurrent(u.active_linux_process);
 
-    Scheduler::current_process = proc;
+    Scheduler::SetCurrentForThisCpu(proc);
     proc->state = Process_Running;
     HAL::SetKernelStack(proc->kernel_stack_top);
     KernelVMM::ActivateAddressSpace(proc->address_space);
@@ -313,29 +313,30 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     uint64_t entry_rsp = build_initial_stack(proc->user_stack_top, argv, envp, proc);
     if (!entry_rsp) entry_rsp = proc->user_stack_top;
 
-    int exit_code = UserspaceEnter(proc->rip, entry_rsp, &return_context);
+    int exit_code = UserspaceEnter(proc->rip, entry_rsp, &u.return_context);
 
-    KernelVMM::ActivateAddressSpace(kernel_address_space);
-    if (previous_process && previous_process->is_user()) {
-        HAL::SetKernelStack(previous_process->kernel_stack_top);
+    KernelVMM::ActivateAddressSpace(u.kernel_address_space);
+    if (u.previous_process && u.previous_process->is_user()) {
+        HAL::SetKernelStack(u.previous_process->kernel_stack_top);
     }
 
-    LinuxSyscall::DestroyProcess(active_linux_process);
-    LinuxSyscall::SetCurrent(previous_linux_process);
-    Scheduler::current_process = previous_process;
-    previous_process = nullptr;
-    previous_linux_process = -1;
-    active_linux_process = -1;
-    active_process = nullptr;
+    LinuxSyscall::DestroyProcess(u.active_linux_process);
+    LinuxSyscall::SetCurrent(u.previous_linux_process);
+    Scheduler::SetCurrentForThisCpu(u.previous_process);
+    u.previous_process = nullptr;
+    u.previous_linux_process = -1;
+    u.active_linux_process = -1;
+    u.active_process = nullptr;
 
     return exit_code;
 }
 
 void Userspace::HandleProcessExit(int exit_code) {
-    if (!active_process) return;
+    UserspaceCpuState& u = cpu();
+    if (!u.active_process) return;
 
-    Scheduler::MarkProcessExited(active_process, exit_code);
-    KernelVMM::ActivateAddressSpace(kernel_address_space);
-    UserspaceResume(&return_context, exit_code);
+    Scheduler::MarkProcessExited(u.active_process, exit_code);
+    KernelVMM::ActivateAddressSpace(u.kernel_address_space);
+    UserspaceResume(&u.return_context, exit_code);
     __builtin_unreachable();
 }
