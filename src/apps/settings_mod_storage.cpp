@@ -222,8 +222,8 @@ static void storage_render(int x, int y, int w, int h, int scroll){
         SettingsUI::Row(x, ly, "Max Entries/Dir:", buf);
         ly += 22;
 
-        SettingsUI::IntToStr(KVFS_MAX_CONTENT / 1024, buf, 64);
-        SettingsUI::StrApp(buf, " KB", 64);
+        SettingsUI::IntToStr(KVFS_MAX_FILE_SIZE / (1024 * 1024), buf, 64);
+        SettingsUI::StrApp(buf, " MB", 64);
         SettingsUI::Row(x, ly, "Max File Size:", buf);
         ly += 22;
 

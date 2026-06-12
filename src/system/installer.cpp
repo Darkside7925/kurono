@@ -2,6 +2,7 @@
 #include "../drivers/nvme.h"
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
+#include "../kernel/pmm.h"   // page-aligned dma buffers for nvme reads/writes (satoru)
 #include "../fs/kvfs.h"
 #include "../fs/fat32.h"
 #include "../linux/ext4.h"
@@ -201,11 +202,11 @@ static bool nvme_read_bytes(uint64_t byte_offset, uint32_t len, void* buf, void*
     uint64_t first_lba = byte_offset / sector_size;
     uint64_t last_lba = (byte_offset + len - 1) / sector_size;
     uint32_t sectors = (uint32_t)(last_lba - first_lba + 1);
-    uint8_t* tmp = (uint8_t*)KernelHeap::Alloc(sectors * sector_size);
+    uint8_t* tmp = (uint8_t*)PMM::AllocBytes(sectors * sector_size);
     if (!tmp) return false;
     bool ok = NVMe::Read(first_lba, sectors, tmp);
     if (ok) memcpy(buf, tmp + (byte_offset % sector_size), len);
-    KernelHeap::Free(tmp);
+    PMM::FreeBytes(tmp, sectors * sector_size);
     return ok;
 }
 
@@ -216,7 +217,7 @@ static bool nvme_write_bytes(uint64_t byte_offset, uint32_t len, const void* buf
     uint64_t first_lba = byte_offset / sector_size;
     uint64_t last_lba = (byte_offset + len - 1) / sector_size;
     uint32_t sectors = (uint32_t)(last_lba - first_lba + 1);
-    uint8_t* tmp = (uint8_t*)KernelHeap::Alloc(sectors * sector_size);
+    uint8_t* tmp = (uint8_t*)PMM::AllocBytes(sectors * sector_size);
     if (!tmp) return false;
     bool ok = NVMe::Read(first_lba, sectors, tmp);
     if (ok) {
@@ -224,7 +225,7 @@ static bool nvme_write_bytes(uint64_t byte_offset, uint32_t len, const void* buf
         ok = NVMe::Write(first_lba, sectors, tmp);
         if (ok) NVMe::Flush();
     }
-    KernelHeap::Free(tmp);
+    PMM::FreeBytes(tmp, sectors * sector_size);
     return ok;
 }
 
@@ -315,6 +316,25 @@ static uint32_t payload_size(uint8_t* start, uint8_t* end) {
     if (!start || !end || end < start) return 0;
     return (uint32_t)(end - start);
 }
+}
+
+// boot-time persistence mount  -  see installer.h. brings up the nvme controller
+// and mounts a whole-disk raw ext4 (superblock at offset 0) so the kvfs.img
+// save/restore path works on a normal boot, not just after an install. the ext4
+// block callbacks live in the anonymous namespace above; they're visible here in
+// the same TU. (satoru)
+bool Installer::MountDataDisk() {
+    if (Ext4::IsMounted()) return true;            // already mounted (installed system)
+    if (!NVMe::IsDetected()) NVMe::Init();
+    if (!NVMe::IsDetected()) return false;          // no nvme data disk attached
+    // Ext4::Mount validates the superblock magic, so a non-ext4 / partitioned
+    // disk fails cleanly here rather than mis-mounting. (satoru)
+    if (Ext4::Mount(ext4_read_cb, ext4_write_cb, nullptr, 0) == 0) {
+        SerialLogger::Log("[persist] data disk mounted (raw ext4 @ 0)\r\n");
+        return true;
+    }
+    SerialLogger::Log("[persist] nvme present but no ext4 superblock @ 0\r\n");
+    return false;
 }
 
 void Installer::Init() {

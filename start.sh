@@ -13,7 +13,8 @@ RUN_ISO="/tmp/kurono_run.iso"
 
 # ── defaults ──
 BUILD=1 CLEAN=0 DEBUG=0 CLI=0 CLI_POWEROFF=0 CLI_CMD=""
-GPU=1 UEFI=0 HEADLESS=0 RAW_MOUSE=0 NO_USB=0 LOG_STDIO=0 MEM="8G"
+GPU=1 UEFI=0 HEADLESS=0 RAW_MOUSE=0 NO_USB=0 LOG_STDIO=0 MEM="8G" CPUS=4
+PERSIST=1 WIPE_DISK=0
 
 usage() {
   cat <<EOF
@@ -32,6 +33,9 @@ usage: ./start.sh [options]
   --no-usb           don't attach the xHCI USB tablet (fall back to PS/2 relative; needs click-to-grab)
   --raw-mouse        boot with kurono.mouse.raw=1 + vmport=off (1:1 PS/2; for synthetic input)
   --mem <size>       RAM (default 8G)
+  --smp <N>          number of vCPUs (default 4; the old -smp>1 freeze is fixed)
+  --no-persist       don't attach the persistent data disk (files won't survive reboot)
+  --wipe-disk        recreate the persistent data disk from scratch (loses saved files)
   -h, --help         this help
 EOF
 }
@@ -52,6 +56,9 @@ while [ $# -gt 0 ]; do
     --no-usb) NO_USB=1 ;;
     --raw-mouse) RAW_MOUSE=1 ;;
     --mem) MEM="${2:?}"; shift ;;
+    --smp) CPUS="${2:?}"; shift ;;
+    --no-persist) PERSIST=0 ;;
+    --wipe-disk) WIPE_DISK=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1"; usage; exit 1 ;;
   esac
@@ -104,12 +111,43 @@ VGA="virtio"; [ "$GPU" -eq 0 ] && VGA="std"
 # instead. (satoru)
 MACHINE="pc,vmport=off"
 
+# ── persistent data disk ──────────────────────────────────────────────────────
+# a whole-disk raw ext4 image attached as nvme. kurono mounts it at boot
+# (Installer::MountDataDisk) and saves/restores its kvfs tree to
+# /var/lib/kurono/kvfs.img there, so files survive a reboot. created + formatted on
+# the host the first time (the kernel has no mkfs); conservative features only
+# (no journal/csum/64bit) so the kernel's ext4 driver reads + writes it cleanly.
+# --no-persist skips it; --wipe-disk recreates it. (satoru)
+KDISK="${KURONO_DISK:-$HOME/.kurono/data.img}"
+if [ "$PERSIST" -eq 1 ]; then
+  [ "$WIPE_DISK" -eq 1 ] && rm -f "$KDISK"
+  if [ ! -f "$KDISK" ]; then
+    MKE2FS="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
+    if [ -x "$MKE2FS" ]; then
+      mkdir -p "$(dirname "$KDISK")"
+      qemu-img create -f raw "$KDISK" 1G >/dev/null 2>&1
+      STAGE="$(mktemp -d)"; mkdir -p "$STAGE/var/lib/kurono"
+      if "$MKE2FS" -q -F -O ^has_journal,^metadata_csum,^64bit -b 4096 -d "$STAGE" "$KDISK" 2>/dev/null; then
+        echo "  [*] persist: created ext4 data disk $KDISK (1G)"
+      else
+        echo "  [!] persist: mkfs.ext4 failed  -  disabling persistence"; PERSIST=0
+      fi
+      rm -rf "$STAGE"
+    else
+      echo "  [!] persist: mkfs.ext4 not found  -  disabling persistence"; PERSIST=0
+    fi
+  fi
+fi
+
 QARGS=(
-  # -smp 1: kurono's scheduler is cooperative / single-CPU ("no preemption yet").
-  # under KVM with -smp >1 the APs race the scheduler state and the whole thing
-  # deadlocks ~8s in (gui heartbeat stops -> FPS 0, frozen cursor). single CPU is
-  # the correct config until SMP-safe scheduling lands. (satoru)
-  -machine "$MACHINE" -cpu host -smp 1
+  # -smp: the old ~8s deadlock under -smp >1 is FIXED  -  it was a scheduler bug,
+  # not an AP race (the APs never start; no SIPI is sent). the preemptive
+  # scheduler + x86_64 SYSCALL-path frame switching resolved it. verified headless:
+  # the desktop stays live (differing frames, 0 watchdog hangs, 0 panics) and the
+  # pthread test passes under both -smp 2 and -smp 4. note the APs still park in
+  # wait-for-sipi, so extra cores are present + stable but the bsp does all the
+  # scheduling  -  true multi-core task execution is still future work. (satoru)
+  -machine "$MACHINE" -cpu host -smp "$CPUS"
   -m "$MEM"
   -cdrom "$RUN_ISO"
   -vga "$VGA"
@@ -118,6 +156,11 @@ QARGS=(
   -no-reboot -no-shutdown
 )
 [ -e /dev/kvm ] && QARGS+=(-enable-kvm)
+if [ "$PERSIST" -eq 1 ] && [ -f "$KDISK" ]; then
+  QARGS+=(-drive "file=$KDISK,if=none,id=kdata,format=raw"
+          -device nvme,serial=kuronodata,drive=kdata)
+  echo "  [*] persist: data disk attached as nvme"
+fi
 
 # USB: default to an xHCI controller with a tablet+keyboard so kurono's native
 # USB HID driver binds them. the tablet is an ABSOLUTE pointer, so the gtk-window

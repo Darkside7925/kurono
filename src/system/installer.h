@@ -64,6 +64,12 @@ public:
     static int  FindESPPartition();
     static int  FindFirstExt4Partition();
 
+    // boot-time persistence: bring up the nvme data disk and mount its raw ext4
+    // (whole-disk, offset 0) so kvfs.img save/restore works on a normal boot, not
+    // just after an install. returns true if an ext4 data disk is now mounted.
+    // safe to call when none is present  -  it just returns false. (satoru)
+    static bool MountDataDisk();
+
     static void RegisterShellCommands(void* shell);
     static int  InstallToPartition(int partition_index, char* out, int max_out);
     static void DescribeInstallPlan(int partition_index, char* out, int max_out);

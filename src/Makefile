@@ -177,6 +177,7 @@ CXX_SRCS = \
     $(SRC)/proc/kernel_processes.cpp \
     $(SRC)/fs/vfs.cpp \
     $(SRC)/fs/kvfs.cpp \
+    $(SRC)/fs/persist.cpp \
 	$(SRC)/fs/fat32.cpp \
     $(SRC)/shell/shell.cpp \
     $(SRC)/shell/linux_cmds.cpp \

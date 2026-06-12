@@ -45,7 +45,6 @@ static const unsigned int TM_GRAPH_GD = 0xFF151525;
 static const unsigned int TM_BORDER   = 0xFF252540;
 static const unsigned int TM_WHITE    = 0xFFFFFFFF;
 static const unsigned int TM_STATUS   = 0xFF0A0A12;
-static constexpr const char TM_IDLE_NAME[] = "CPU Idle";
 
 static const int ROW_H = 20;
 static const int TAB_H = 32;
@@ -447,6 +446,11 @@ void TaskManagerApp::RefreshProcesses(){
 
     for(int i=0;i<snapshot_count && proc_count<TM_MAX_PROCS-1;i++){
         const SchedulerProcessSnapshot& snap = snapshots[i];
+        // skip the kernel idle task (pid 0): the scheduler charges it a tick
+        // whenever the cpu would otherwise halt, so it reads as ~100% and is not
+        // a process the user cares about. idle is reflected in the overall cpu
+        // figure on the performance tab instead. (satoru)
+        if(snap.pid == 0) continue;
         int sample_idx = tm_find_cpu_sample(snap.pid);
         uint64_t prev_ticks = snap.cpu_ticks_total;
         if(g_tm_cpu_samples_ready && sample_idx >= 0){
@@ -500,7 +504,9 @@ void TaskManagerApp::RefreshProcesses(){
         p->pid = row->id;
         scpy(p->name, row->title, 32);
         p->cpu_pct = 0;
-        p->mem_kb = 128 + i * 32;
+        // honest memory: a pure-ui window with no backing scheduler task costs
+        // its rgba framebuffer (w*h*4). no fabricated per-index number. (satoru)
+        p->mem_kb = tm_max(4, (row->w * row->h * 4) / 1024);
         p->threads = 1;
         scpy(p->state, "RUNNING", 12);
         scpy(p->user, "user", 16);
@@ -517,27 +523,9 @@ void TaskManagerApp::RefreshProcesses(){
         p->is_kernel_proc = false;
     }
 
-    if(proc_count < TM_MAX_PROCS){
-        TMProcess* idle = &procs[proc_count++];
-        idle->pid = 0;
-        scpy(idle->name, TM_IDLE_NAME, 32);
-        idle->cpu_pct = tm_clamp(100 - total_busy_cpu, 0, 100);
-        idle->mem_kb = 4;
-        idle->threads = 1;
-        scpy(idle->state, "RUNNING", 12);
-        scpy(idle->user, "SYSTEM", 16);
-        idle->priority = 0;
-        idle->io_read_kb = 0;
-        idle->io_write_kb = 0;
-        idle->flags = PROCESS_FLAG_NONE;
-        idle->source_kind = TM_PROC_IDLE;
-        idle->stack_kb = 0;
-        idle->stack_cap_kb = 0;
-        idle->cpu_ms_total = 0;
-        idle->stack_grow_count = 0;
-        idle->prio_tier = 0;
-        idle->is_kernel_proc = false;
-    }
+    // no synthetic "CPU Idle" row: it sat at 100-busy and read as a process
+    // pinned at 100% on an idle machine. idle is implicit  -  the overall cpu
+    // figure (cpu_usage, below) is low when nothing is working. (satoru)
 
     SortProcesses();
 
@@ -1054,9 +1042,19 @@ bool TaskManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     // action menu takes priority when open
     if(action_menu_open){
         int am_w = 120, am_h = 52;
-        if(abs_mx >= action_menu_x && abs_mx < action_menu_x + am_w &&
-           abs_my >= action_menu_y && abs_my < action_menu_y + am_h){
-            int row = (abs_my - action_menu_y) / 26;
+        // hit-test against the ACTUAL drawn position: RenderActionMenu clamps the
+        // popup to the content area, so a right-click near the right/bottom edge
+        // draws it shifted. mirror that exact clamp here or the click misses the
+        // visible menu  -  this was the broken hit test. (satoru)
+        int am_x = action_menu_x;
+        int am_y = action_menu_y;
+        if(w){
+            if(am_x + am_w > w->content_x + w->content_w) am_x = w->content_x + w->content_w - am_w;
+            if(am_y + am_h > w->content_y + w->content_h) am_y = w->content_y + w->content_h - am_h;
+        }
+        if(abs_mx >= am_x && abs_mx < am_x + am_w &&
+           abs_my >= am_y && abs_my < am_y + am_h){
+            int row = (abs_my - am_y) / 26;
             if(action_menu_tab == TM_WINDOWS){
                 if(row == 0) KillWindow(action_menu_row);
                 else if(row == 1) RestartWindow(action_menu_row);

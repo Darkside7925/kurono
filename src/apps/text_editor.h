@@ -1,7 +1,7 @@
 #pragma once
 //  kurono os  -  text editor application
 
-#define ED_MAX_LINES   2048
+#define ED_MAX_LINES   8192
 #define ED_LINE_MAX    256
 #define ED_PATH_MAX    256
 

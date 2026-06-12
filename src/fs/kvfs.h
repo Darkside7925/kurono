@@ -6,8 +6,9 @@
 
 #define KVFS_MAX_NAME     64
 #define KVFS_MAX_PATH     256
-#define KVFS_MAX_CHILDREN 128
-#define KVFS_MAX_CONTENT  (64 * 1024)  // 64kb per file max
+#define KVFS_MAX_CHILDREN 512   // entries per directory (TODO: make children dynamic for unbounded dirs) (satoru)
+#define KVFS_MAX_CONTENT  (64 * 1024)  // 64kb  -  shell cat/grep display chunk (stack-safe)
+#define KVFS_MAX_FILE_SIZE (4 * 1024 * 1024)  // 4mb  -  real per-file storage ceiling (satoru)
 #define KVFS_BLOCK_SIZE   4096
 
 enum KVFSNodeType : uint8_t {
@@ -69,8 +70,8 @@ struct KVFSNode {
     int (*dev_write)(KVFSNode* node, uint32_t offset, uint32_t len, const uint8_t* buf);
 
     // small open-addressing hash; size = next power of two >= KVFS_MAX_CHILDREN*2.
-    // 256 buckets, each storing the index into children[] (-1 = empty).
-    static const int HASH_SIZE = 256;
+    // 1024 buckets, each storing the index into children[] (-1 = empty).
+    static const int HASH_SIZE = 1024;
     int16_t hash_table[HASH_SIZE];
 
     bool is_dir() const { return type == KVFS_DIR || type == KVFS_MOUNTPOINT; }
@@ -268,9 +269,14 @@ private:
     static void FreeTree(KVFSNode* node);
     static void BuildDefaultTree();
     // depth-first serialize of one node + its subtree into buffer at *pos,
-    // bounds-checked against maxSize; returns false on overflow. (satoru)
+    // bounds-checked against maxSize; returns false on overflow. persist_content
+    // gates whether file BYTES are written: the tree structure is always saved,
+    // but content is only kept for user-data subtrees (/home, /etc, /root) so the
+    // image stays small  -  the big re-seeded /usr binaries + sample media are
+    // restored as empty entries and re-filled by the boot seeding. (satoru)
     static bool SerializeNode(const KVFSNode* node, uint8_t* buffer,
-                              size_t maxSize, size_t* pos, uint32_t* count);
+                              size_t maxSize, size_t* pos, uint32_t* count,
+                              bool persist_content);
     static void NormalizePath(const char* input, char* output, int max_len);
     static bool PatternMatch(const char* pattern, const char* str);
     static void FindRecursive(KVFSNode* node, const char* pattern,

@@ -114,12 +114,17 @@ int TextEditorApp::OpenFile(const char* path){
 //  file i/o
 bool TextEditorApp::LoadFile(const char* path){
     scpy(file_path, path, ED_PATH_MAX);
-    // heap-allocate the 64KB content buffer  -  a KVFS_MAX_CONTENT-sized stack
-    // frame overflows the 32KB GUI / 8KB shell process stack and corrupts
-    // adjacent kernel memory (a cause of file-open crashes). (satoru)
-    char* content = (char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    // heap-allocate the content buffer sized to the actual file (a big stack
+    // frame overflows the GUI/shell process stack and corrupts adjacent kernel
+    // memory). cap at the per-file ceiling; the line model (ED_MAX_LINES) bounds
+    // what's actually editable, the rest is read but not parsed. (satoru)
+    int fsz = KVFS::GetFileSize(path);
+    if(fsz < 0) fsz = 0;
+    if(fsz > KVFS_MAX_FILE_SIZE) fsz = KVFS_MAX_FILE_SIZE;
+    uint32_t buf_sz = (uint32_t)fsz + 1;
+    char* content = (char*)KernelHeap::Alloc(buf_sz);
     if(!content){ line_count=1; lines[0].text[0]=0; lines[0].len=0; return false; }
-    int sz = KVFS::ReadFile(path, content, KVFS_MAX_CONTENT);
+    int sz = KVFS::ReadFile(path, content, buf_sz);
     if(sz<=0){
         line_count=1;
         lines[0].text[0]=0; lines[0].len=0;
@@ -163,13 +168,17 @@ bool TextEditorApp::SaveFile(){
 }
 
 bool TextEditorApp::SaveFileAs(const char* path){
-    // assemble content on the heap  -  see LoadFile: a 64KB stack buffer
-    // overflows the GUI/shell process stack. (satoru)
-    char* content = (char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    // assemble content on the heap, sized to the actual document (sum of line
+    // lengths + newlines + nul), capped at the per-file ceiling  -  a big stack
+    // buffer overflows the GUI/shell process stack. (satoru)
+    uint32_t need = 1;
+    for(int i=0;i<line_count;i++) need += (uint32_t)lines[i].len + 1;
+    if(need > KVFS_MAX_FILE_SIZE) need = KVFS_MAX_FILE_SIZE;
+    char* content = (char*)KernelHeap::Alloc(need);
     if(!content) return false;
     int pos=0;
-    for(int i=0;i<line_count && pos<KVFS_MAX_CONTENT-2;i++){
-        for(int j=0;j<lines[i].len && pos<KVFS_MAX_CONTENT-2;j++){
+    for(int i=0;i<line_count && pos<(int)need-2;i++){
+        for(int j=0;j<lines[i].len && pos<(int)need-2;j++){
             content[pos++]=lines[i].text[j];
         }
         if(i<line_count-1) content[pos++]='\n';
