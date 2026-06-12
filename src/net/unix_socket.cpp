@@ -290,9 +290,16 @@ int Pair(SockType type, int* sd0, int* sd1) {
     return 0;
 }
 
-int Send(int sd, const void* buf, int len, int flags,
-         const int* pass_fds, int n_fds) {
-    (void)flags;
+// pending ancillary for in-kernel servers: the message a server's on_data is
+// parsing right now may have carried SCM_RIGHTS fds (e.g. a wl_shm pool fd). We
+// stash the ControlMsg here so the handler can pull it via TakePendingControl()
+// during the synchronous on_data call. (satoru)
+static ControlMsg g_pending_ctrl[UNIX_MAX_SOCKETS];
+static bool       g_pending_ctrl_valid[UNIX_MAX_SOCKETS];
+
+// shared write core: enqueue to the peer ring and, for an in-kernel server peer,
+// drive its on_data handler with the ancillary made available for this delivery.
+static int send_core(int sd, const void* buf, int len, const ControlMsg& cm) {
     if (!valid(sd) || !g_socks[sd].connected) return -32;   // EPIPE
     Socket& s = g_socks[sd];
     if (s.shutdown_wr) return -32;
@@ -300,21 +307,17 @@ int Send(int sd, const void* buf, int len, int flags,
     if (!valid(peer)) return -32;
     Socket& ps = g_socks[peer];
     if (ps.shutdown_rd) return -32;
-    ControlMsg cm = {};
-    if (pass_fds && n_fds > 0) {
-        if (n_fds > UNIX_MAX_PASSED_FD) n_fds = UNIX_MAX_PASSED_FD;
-        for (int i = 0; i < n_fds; i++) cm.passed_fds[i] = pass_fds[i];
-        cm.passed_fd_count = n_fds;
-    }
-    cm.creds_valid = true;
-    cm.peer_creds  = s.creds;
     int w = ring_write(ps.rx, (const uint8_t*)buf, len, &cm, s.type);
     if (w == 0 && len > 0) return -11;  // EAGAIN
     if (ps.is_kernel_server && ps.on_data && w > 0) {
-        // Drain into the kernel-side handler with no extra copy where
-        // possible: for streams, walk the ring in contiguous spans and
-        // hand each span directly to the callback. Only fall back to a
-        // bounce buffer when the consumer needs ancillary data merged.
+        // expose ancillary (passed fds / resolved shm) to the handler. (satoru)
+        if (cm.passed_fd_count > 0) {
+            g_pending_ctrl[peer]       = cm;
+            g_pending_ctrl_valid[peer] = true;
+        }
+        // Drain into the kernel-side handler with no extra copy where possible:
+        // for streams, walk the ring in contiguous spans and hand each span
+        // directly to the callback.
         if (ps.type == UNIX_SOCK_STREAM) {
             while (ps.rx.avail() > 0) {
                 uint32_t off = ps.rx.tail % UNIX_RING_BYTES;
@@ -331,8 +334,41 @@ int Send(int sd, const void* buf, int len, int flags,
             int got = ring_read(ps.rx, scratch, sizeof(scratch), nullptr, ps.type);
             if (got > 0) ps.on_data(peer, scratch, got, ps.user);
         }
+        g_pending_ctrl_valid[peer] = false;
     }
     return w;
+}
+
+int Send(int sd, const void* buf, int len, int flags,
+         const int* pass_fds, int n_fds) {
+    (void)flags;
+    if (!valid(sd)) return -32;
+    ControlMsg cm = {};
+    if (pass_fds && n_fds > 0) {
+        if (n_fds > UNIX_MAX_PASSED_FD) n_fds = UNIX_MAX_PASSED_FD;
+        for (int i = 0; i < n_fds; i++) cm.passed_fds[i] = pass_fds[i];
+        cm.passed_fd_count = n_fds;
+    }
+    cm.creds_valid = true;
+    cm.peer_creds  = g_socks[sd].creds;
+    return send_core(sd, buf, len, cm);
+}
+
+int SendMsg(int sd, const void* buf, int len, int flags, const ControlMsg* cmin) {
+    (void)flags;
+    if (!valid(sd)) return -32;
+    ControlMsg cm = cmin ? *cmin : ControlMsg{};
+    cm.creds_valid = true;
+    cm.peer_creds  = g_socks[sd].creds;
+    return send_core(sd, buf, len, cm);
+}
+
+bool TakePendingControl(int sd, ControlMsg* out) {
+    if (sd < 0 || sd >= UNIX_MAX_SOCKETS) return false;
+    if (!g_pending_ctrl_valid[sd]) return false;
+    if (out) *out = g_pending_ctrl[sd];
+    g_pending_ctrl_valid[sd] = false;
+    return true;
 }
 
 int Recv(int sd, void* buf, int len, int flags, ControlMsg* cmsg) {

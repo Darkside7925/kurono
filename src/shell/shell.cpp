@@ -911,6 +911,7 @@ namespace ShellBuiltins {
     int cmd_poweroff(KuronoShell*, int, const char**, char*, int);
     int cmd_suspend(KuronoShell*, int, const char**, char*, int);
     int cmd_ffmpeg(KuronoShell*, int, const char**, char*, int);
+    int cmd_wltest(KuronoShell*, int, const char**, char*, int);
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
 }
 
@@ -919,6 +920,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("help",     "Show available commands",     ENV_KURONO, "builtin", cmd_help);
     RegisterCommand("denji",    "Open Denji video player",     ENV_KURONO, "media",   cmd_denji);
     RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
+    RegisterCommand("wltest",   "Run the wl_shm wayland render test", ENV_AUTO, "media", cmd_wltest);
     RegisterCommand("playvideo","Play the imported video (ssstik)", ENV_AUTO, "media",  cmd_playvideo);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
     RegisterCommand("version",  "Show OS version",             ENV_KURONO, "builtin", cmd_version);
@@ -1729,6 +1731,36 @@ int cmd_ffmpeg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
     }
     // free the process (stack + address space). DestroyProcess has a
     // double-free guard so this is safe on an already-exited task. (satoru)
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// run the embedded wl_shm wayland test client as a real ring-3 linux process.
+// proves the compositor's shared-memory render path (memfd -> mmap -> SCM_RIGHTS
+// -> wl_shm pool -> buffer -> commit). run it from a desktop terminal to see a
+// blue toplevel window appear. (satoru)
+int cmd_wltest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/usr/bin/wl_shm_test")) {
+        return sappend(out, 0, mx, "wltest: /usr/bin/wl_shm_test not present in this build\n");
+    }
+    Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/wl_shm_test", "wl_shm_test");
+    if (!proc) {
+        return sappend(out, 0, mx, "wltest: failed to load binary (out of memory?)\n");
+    }
+    const char* av[] = { "wl_shm_test", nullptr };
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user",
+                           "XDG_RUNTIME_DIR=/system/run/user/1000",
+                           "WAYLAND_DISPLAY=wayland-0", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    p = sappend(out, p, mx, "\nwltest: exited (code ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, ")\n");
     Scheduler::DestroyProcess(proc);
     return p;
 }

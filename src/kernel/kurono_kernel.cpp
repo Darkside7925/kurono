@@ -1709,6 +1709,17 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec((int)EmbeddedUserprogs::FfmpegSize());
         SerialLogger::Log(" bytes)\r\n");
     }
+    // register the raw-protocol wl_shm wayland client so `wltest` can prove the
+    // compositor's shared-memory render path end to end. (satoru)
+    if (EmbeddedUserprogs::HasWlShmTest()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/wl_shm_test",
+                        EmbeddedUserprogs::WlShmTestData(),
+                        EmbeddedUserprogs::WlShmTestSize());
+        SerialLogger::Log("[Userspace] /usr/bin/wl_shm_test registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::WlShmTestSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
     if (EmbeddedUserprogs::HasKpython()) {
         KVFS::Mkdirs("/usr/bin");
         KVFS::Mkdirs("/usr/share");

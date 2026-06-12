@@ -297,6 +297,55 @@ static bool split_or_trim_region(Process* task, UserMemoryRegion* region,
     return true;
 }
 
+// ---- shm objects: memfd_create backing for wl_shm / posix shared memory ----
+// a memfd is backed by a contiguous PMM allocation. mmap(MAP_SHARED, memfd)
+// eager-maps those physical pages into the caller, and the in-kernel wayland
+// compositor reads the very same pages directly (low ram is identity-mapped,
+// so the kernel pointer == physical addr). that is how a real wl_shm pixel
+// buffer round-trips client -> compositor without a copy. (satoru)
+struct LinuxShmObj {
+    uint8_t* base;      // kernel ptr == phys addr (identity-mapped low ram)
+    uint64_t size;
+    int      refcount;
+    bool     used;
+};
+static LinuxShmObj g_linux_shm[64];
+
+static int shm_alloc_slot() {
+    for (int i = 0; i < 64; i++) {
+        if (!g_linux_shm[i].used) {
+            g_linux_shm[i].used = true;
+            g_linux_shm[i].base = nullptr;
+            g_linux_shm[i].size = 0;
+            g_linux_shm[i].refcount = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+static LinuxShmObj* shm_slot(int idx) {
+    if (idx < 0 || idx >= 64 || !g_linux_shm[idx].used) return nullptr;
+    return &g_linux_shm[idx];
+}
+// resolve a process fd to its shm object, or null when the fd isn't a memfd (satoru)
+static LinuxShmObj* shm_for_fd(LinuxProcess* p, int fd) {
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS) return nullptr;
+    if (!p->fds[fd].open || p->fds[fd].type != LFD_MEMFD) return nullptr;
+    return shm_slot(p->fds[fd].backend_fd);
+}
+// grow a memfd's backing to at least `size` bytes; first ftruncate wins (satoru)
+static bool shm_set_size(LinuxShmObj* s, uint64_t size) {
+    if (!s || size == 0) return false;
+    if (s->base) return s->size >= size;        // already sized; never shrink
+    uint64_t rounded = align_up_u64(size, PAGE_SIZE);
+    void* mem = PMM::AllocBytes((size_t)rounded);
+    if (!mem) return false;
+    memset(mem, 0, (size_t)rounded);
+    s->base = (uint8_t*)mem;
+    s->size = rounded;
+    return true;
+}
+
 static bool handle_demand_zero_fault(Process* task, UserMemoryRegion* region,
                                      uint64_t page_base, InterruptFrame* frame) {
     if (!task || !region || !frame) return false;
@@ -1108,7 +1157,13 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_CAPGET:
         case LSYS_CAPSET:
             return 0;  // we run as root-equivalent
-        case LSYS_FTRUNCATE:
+        case LSYS_FTRUNCATE: {
+            // size a memfd's backing; non-memfd fds grow on write (kvfs). (satoru)
+            LinuxProcess* p = Current();
+            LinuxShmObj* s = shm_for_fd(p, (int)ebx);
+            if (s) return shm_set_size(s, (uint64_t)ecx) ? 0 : -28;  // -ENOSPC
+            return 0;
+        }
         case LSYS_FSYNC:
         case LSYS_FDATASYNC:
         case LSYS_MADVISE:
@@ -1117,9 +1172,39 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_DUP3:
             // dup3(oldfd, newfd, flags)  -  flags ignored, behaves like dup2
             return sys_dup2((int)ebx, (int)ecx);
-        case LSYS_PIPE2:
-            // ignore O_CLOEXEC/O_NONBLOCK flags for now: pipes not yet wired
-            return -38;
+        case LSYS_PIPE:
+        case LSYS_PIPE2: {
+            // back a pipe with a connected unix-socket pair: read/write already
+            // route through LFD_SOCKET, and write(fd[1]) lands in the peer's rx
+            // for read(fd[0]). O_CLOEXEC/O_NONBLOCK (ecx on pipe2) are accepted
+            // but not yet enforced. needed for firefox/glibc ipc. (satoru)
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            uint32_t* ufds = (uint32_t*)(uintptr_t)ebx;   // int pipefd[2]
+            if (!ufds) return -14;                        // EFAULT
+            int sd0 = -1, sd1 = -1;
+            UnixSocket::Pair(UnixSocket::UNIX_SOCK_STREAM, &sd0, &sd1);
+            if (sd0 < 0 || sd1 < 0) return -24;           // EMFILE
+            int rfd = AllocFd(p);
+            if (rfd < 0) { UnixSocket::Close(sd0); UnixSocket::Close(sd1); return -24; }
+            memset(&p->fds[rfd], 0, sizeof(LinuxFd));
+            p->fds[rfd].type = LFD_SOCKET;
+            p->fds[rfd].backend_fd = sd0;
+            p->fds[rfd].open = true;
+            int wfd = AllocFd(p);
+            if (wfd < 0) {
+                p->fds[rfd].open = false;
+                UnixSocket::Close(sd0); UnixSocket::Close(sd1);
+                return -24;
+            }
+            memset(&p->fds[wfd], 0, sizeof(LinuxFd));
+            p->fds[wfd].type = LFD_SOCKET;
+            p->fds[wfd].backend_fd = sd1;
+            p->fds[wfd].open = true;
+            ufds[0] = (uint32_t)rfd;   // read end
+            ufds[1] = (uint32_t)wfd;   // write end
+            return 0;
+        }
         case LSYS_PREAD64: {
             // pread64(fd, buf, count, offset)  -  emulate by lseek+read
             int fd = (int)ebx;
@@ -1291,14 +1376,29 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_EVENTFD2:
         case LSYS_SIGNALFD4:
         case LSYS_TIMERFD_CREATE:
-        case LSYS_INOTIFY_INIT1:
-        case LSYS_MEMFD_CREATE: {
+        case LSYS_INOTIFY_INIT1: {
             LinuxProcess* p = Current();
             if (!p) return -1;
             int fd = AllocFd(p);
             if (fd < 0) return -24;
             memset(&p->fds[fd], 0, sizeof(LinuxFd));
             p->fds[fd].type = LFD_DEVNULL;
+            p->fds[fd].open = true;
+            return fd;
+        }
+        // memfd_create: a real, sizeable shared-memory object (wl_shm pools,
+        // posix shm). backed by contiguous physical pages once ftruncate sets
+        // the size; mmap(MAP_SHARED) then maps those pages in. (satoru)
+        case LSYS_MEMFD_CREATE: {
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            int slot = shm_alloc_slot();
+            if (slot < 0) return -24;
+            int fd = AllocFd(p);
+            if (fd < 0) { g_linux_shm[slot].used = false; return -24; }
+            memset(&p->fds[fd], 0, sizeof(LinuxFd));
+            p->fds[fd].type = LFD_MEMFD;
+            p->fds[fd].backend_fd = slot;
             p->fds[fd].open = true;
             return fd;
         }
@@ -1707,8 +1807,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             const char* path = (const char*)(sa + 2);
             return UnixSocket::Connect(lp->fds[fd].backend_fd, path);
         }
-        case LSYS_SENDTO:
-        case LSYS_SENDMSG: {
+        case LSYS_SENDTO: {
             int fd = (int)ebx;
             const void* buf = (const void*)(uintptr_t)ecx;
             int len = (int)edx;
@@ -1716,6 +1815,64 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             if (fd < 0 || fd >= LINUX_MAX_FDS ||
                 lp->fds[fd].type != LFD_SOCKET) return -9;
             return UnixSocket::Send(lp->fds[fd].backend_fd, buf, len, 0);
+        }
+        case LSYS_SENDMSG: {
+            // sendmsg(fd, const struct msghdr*, flags): gather the iov payload
+            // and parse SCM_RIGHTS, so a passed memfd (e.g. a wl_shm pool fd)
+            // reaches the in-kernel server resolved to its shm backing. (satoru)
+            int fd = (int)ebx;
+            const uint8_t* m = (const uint8_t*)(uintptr_t)ecx;   // struct msghdr*
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            if (!m) return -14;
+            const uint8_t* iov = *(const uint8_t* const*)(m + 16);  // msg_iov
+            uint64_t iovlen    = *(const uint64_t*)(m + 24);        // msg_iovlen
+            const uint8_t* ctl = *(const uint8_t* const*)(m + 32);  // msg_control
+            uint64_t ctllen    = *(const uint64_t*)(m + 40);        // msg_controllen
+
+            // gather iov into a static scratch (cooperative single-cpu: safe;
+            // libwayland flushes are <= one 4 KB connection buffer). (satoru)
+            static uint8_t s_sendmsg_buf[8192];
+            int total = 0;
+            for (uint64_t i = 0; iov && i < iovlen &&
+                                 total < (int)sizeof(s_sendmsg_buf); i++) {
+                const uint8_t* ibase = *(const uint8_t* const*)(iov + i * 16);
+                uint64_t ilen        = *(const uint64_t*)(iov + i * 16 + 8);
+                for (uint64_t k = 0; ibase && k < ilen &&
+                                     total < (int)sizeof(s_sendmsg_buf); k++)
+                    s_sendmsg_buf[total++] = ibase[k];
+            }
+
+            // parse the control buffer for SCM_RIGHTS fd arrays. (satoru)
+            UnixSocket::ControlMsg cm = {};
+            if (ctl && ctllen >= 16) {
+                uint64_t off = 0;
+                while (off + 16 <= ctllen) {
+                    uint64_t clen = *(const uint64_t*)(ctl + off);   // cmsg_len
+                    int level     = *(const int*)(ctl + off + 8);    // cmsg_level
+                    int ctype     = *(const int*)(ctl + off + 12);   // cmsg_type
+                    if (clen < 16 || off + clen > ctllen) break;
+                    if (level == 1 /*SOL_SOCKET*/ && ctype == 1 /*SCM_RIGHTS*/) {
+                        const int* cfds = (const int*)(ctl + off + 16);
+                        uint64_t ndata = (clen - 16) / 4;
+                        for (uint64_t k = 0; k < ndata &&
+                             cm.passed_fd_count < UnixSocket::UNIX_MAX_PASSED_FD; k++) {
+                            int pfd = cfds[k];
+                            int idx = cm.passed_fd_count++;
+                            cm.passed_fds[idx] = pfd;
+                            LinuxShmObj* s = shm_for_fd(lp, pfd);
+                            if (s && s->base) {
+                                cm.passed_shm_base[idx] = (uint64_t)(uintptr_t)s->base;
+                                cm.passed_shm_size[idx] = s->size;
+                            }
+                        }
+                    }
+                    off += (clen + 7) & ~7ULL;   // CMSG_ALIGN
+                }
+            }
+            return UnixSocket::SendMsg(lp->fds[fd].backend_fd,
+                                       s_sendmsg_buf, total, 0, &cm);
         }
         case LSYS_RECVFROM:
         case LSYS_RECVMSG: {
@@ -2765,7 +2922,7 @@ int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint32_t arg) {
 
 int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                                 uint32_t flags, int fd, uint64_t offset) {
-    (void)flags; (void)offset;
+    (void)flags;
 
     if (length == 0) return -22;
 
@@ -2780,7 +2937,33 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
         return (int64_t)(uintptr_t)mem;
     }
 
-    if (fd >= 0) return -38;
+    // file-backed mmap: only memfd / shared-memory objects are supported (wl_shm
+    // pixel pools, posix shm). map the memfd's physical pages straight into the
+    // caller so its writes land in the same buffer the compositor reads. (satoru)
+    if (fd >= 0) {
+        LinuxShmObj* shm = shm_for_fd(proc, fd);
+        if (!shm || !shm->base) return -38;
+        uint64_t msize = align_up_u64(length, PAGE_SIZE);
+        if (offset + msize > shm->size) return -22;
+        uint64_t vbase = choose_mmap_base(task, addr, msize);
+        if (!vbase) return -12;
+        uint64_t pflags = page_flags_from_prot(prot);
+        uint64_t phys0 = (uint64_t)(uintptr_t)shm->base + offset;
+        for (uint64_t o = 0; o < msize; o += PAGE_SIZE) {
+            if (!KernelVMM::MapPageInAddressSpace(task->address_space,
+                                                  vbase + o, phys0 + o, pflags)) {
+                return -12;
+            }
+        }
+        // tracked so munmap works; not demand-zero (pages already mapped). (satoru)
+        add_region(task, vbase, vbase + msize, pflags, USER_REGION_MMAP);
+        if (Scheduler::GetCurrentProcess() == task) {
+            for (uint64_t o = 0; o < msize; o += PAGE_SIZE)
+                KernelVMM::InvalidatePage(vbase + o);
+        }
+        task->next_mmap_base = vbase + msize;
+        return (int64_t)vbase;
+    }
 
     uint64_t size = align_up_u64(length, PAGE_SIZE);
     uint64_t base = choose_mmap_base(task, addr, size);
@@ -3220,4 +3403,4 @@ int LinuxSyscall::RunProgram(const char* name, int argc, const char** argv,
     SetCurrent(saved);
 
     return out_len;
-}
+}

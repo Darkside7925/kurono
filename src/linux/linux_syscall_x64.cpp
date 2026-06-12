@@ -89,6 +89,28 @@ constexpr NrMap kNrMap[] = {
     { 229, LSYS_CLOCK_GETRES },  // clock_getres
     { 234, LSYS_TGKILL },        // tgkill
     { 332, LSYS_STATX },         // statx
+    // ── socket family: x86_64 has direct socket syscalls (i386 multiplexed
+    //    them through socketcall). without these, any networked / wayland /
+    //    ipc client's socket() returns -ENOSYS at the first call. (satoru)
+    {  41, LSYS_SOCKET },        // socket
+    {  42, LSYS_CONNECT },       // connect
+    {  43, LSYS_ACCEPT },        // accept
+    {  44, LSYS_SENDTO },        // sendto
+    {  45, LSYS_RECVFROM },      // recvfrom
+    {  46, LSYS_SENDMSG },       // sendmsg (carries scm_rights fd passing)
+    {  47, LSYS_RECVMSG },       // recvmsg
+    {  48, LSYS_SHUTDOWN },      // shutdown
+    {  49, LSYS_BIND },          // bind
+    {  50, LSYS_LISTEN },        // listen
+    {  51, LSYS_GETSOCKNAME },   // getsockname
+    {  52, LSYS_GETPEERNAME },   // getpeername
+    {  53, LSYS_SOCKETPAIR },    // socketpair
+    {  54, LSYS_SETSOCKOPT },    // setsockopt
+    {  55, LSYS_GETSOCKOPT },    // getsockopt
+    { 288, LSYS_ACCEPT4 },       // accept4
+    { 319, LSYS_MEMFD_CREATE },  // memfd_create (wl_shm pools / posix shm)
+    {  22, LSYS_PIPE },          // pipe
+    { 293, LSYS_PIPE2 },         // pipe2
 };
 
 constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);

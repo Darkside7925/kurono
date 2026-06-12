@@ -48,6 +48,11 @@ namespace UnixSocket {
     // Inline cmsg-style ancillary data attached to one send/recv call.
     struct ControlMsg {
         int      passed_fds[UNIX_MAX_PASSED_FD];
+        // when a passed fd is a memfd/shm object, the sender resolves it to the
+        // backing here so an in-kernel server (wayland wl_shm) can use the pages
+        // directly  -  a raw client fd number is meaningless to the kernel. (satoru)
+        uint64_t passed_shm_base[UNIX_MAX_PASSED_FD];
+        uint64_t passed_shm_size[UNIX_MAX_PASSED_FD];
         int      passed_fd_count;
         Credentials peer_creds;
         bool     creds_valid;
@@ -70,8 +75,17 @@ namespace UnixSocket {
     // Read / write with optional ancillary data.
     int  Send(int sd, const void* buf, int len, int flags,
               const int* pass_fds = nullptr, int n_fds = 0);
+    // Send with a fully-built ControlMsg (carries resolved shm backings for
+    // memfd fds passed via SCM_RIGHTS). Used by the sendmsg syscall path.
+    int  SendMsg(int sd, const void* buf, int len, int flags, const ControlMsg* cm);
     int  Recv(int sd, void* buf, int len, int flags,
               ControlMsg* cmsg = nullptr);
+
+    // An in-kernel server (wayland) calls this from inside its on_data handler
+    // to retrieve the ancillary data (passed fds / shm backings) that arrived
+    // with the message it is currently parsing. Returns true + fills *out, and
+    // clears the pending slot. (satoru)
+    bool TakePendingControl(int sd, ControlMsg* out);
     int  Shutdown(int sd, int how);
     int  Close(int sd);
 
