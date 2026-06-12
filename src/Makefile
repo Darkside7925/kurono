@@ -125,7 +125,10 @@ KPY_OBJ           = $(BUILD)/userprogs/kpython_user_embed.o
 # prebuilt musl-static ffmpeg n5.1.6 (~2.7 mb), embedded as a blob (satoru)
 FFMPEG_ELF        = $(USERPROGS_DIR)/ffmpeg.elf
 FFMPEG_OBJ        = $(BUILD)/userprogs/ffmpeg_user_embed.o
-USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ)
+# raw-protocol wl_shm wayland test client (proves the compositor render path) (satoru)
+WLSHM_ELF         = $(USERPROGS_DIR)/wl_shm_test.elf
+WLSHM_OBJ         = $(BUILD)/userprogs/wl_shm_test_user_embed.o
+USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ)
 
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
@@ -479,6 +482,15 @@ $(FFMPEG_OBJ): $(FFMPEG_ELF)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  ffmpeg.elf ffmpeg_user_embed.o
 	rm -f $(BUILD)/userprogs/ffmpeg.elf
+
+# embed the wl_shm wayland test client blob (satoru)
+$(WLSHM_OBJ): $(WLSHM_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/wl_shm_test.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  wl_shm_test.elf wl_shm_test_user_embed.o
+	rm -f $(BUILD)/userprogs/wl_shm_test.elf
 
 # kpy: compile C with no libc, no PIE, link with user.ld @ 0x40100000
 $(KPY_ELF): $(KPY_C_SRC) $(USERPROGS_DIR)/user.ld

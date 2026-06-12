@@ -1760,6 +1760,41 @@ int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out
     // stage it to disk, write pending-update marker, prompt reboot.
     if (peq(name, "debian")) {
         int p = 0;
+        // resolve the real rootfs url + size from the published manifest rather
+        // than a stale hardcoded path (the old "/dist/debian-minbase.ext4" 404s
+        //  -  the artifact lives under /packages/debian/ per manifest.json). (satoru)
+        Package* dpkg = Find("debian");
+        if (!dpkg && SyncRepository()) dpkg = Find("debian");
+        if (!dpkg) {
+            return pa(out, p, mx, "\xE2\x9C\x97 'debian' is not in the repository index.\n");
+        }
+        if (!pfetch_manifest(dpkg)) {
+            p = pa(out, p, mx, "\xE2\x9C\x97 ");
+            p = pa(out, p, mx, GetLastSyncMessage());
+            return pac(out, p, mx, '\n');
+        }
+        char dpath[200];
+        purl_path(dpkg->download_url, dpath, sizeof(dpath));
+        if (!dpath[0]) {
+            return pa(out, p, mx, "\xE2\x9C\x97 Debian manifest carries no download url.\n");
+        }
+        // the single-shot path buffers the whole image in ram; the full rootfs
+        // needs a streaming download + persistent storage (this build boots from
+        // CD with a ram-backed fs). be honest about the limit instead of silently
+        // truncating or timing out at the 20s recv cap. (satoru)
+        unsigned int rootfs_kb = dpkg->size;  // manifest size, already in KB
+        if (rootfs_kb > (unsigned int)(PKG_HTTP_BUFFER_MAX / 1024)) {
+            p = pa(out, p, mx, "\xE2\x9C\x97 Debian rootfs is ");
+            p = pai(out, p, mx, rootfs_kb / 1024u);
+            p = pa(out, p, mx, " MB \xE2\x80\x94 larger than the ");
+            p = pai(out, p, mx, (unsigned int)(PKG_HTTP_BUFFER_MAX / (1024 * 1024)));
+            p = pa(out, p, mx, " MB single-shot download path.\n");
+            p = pa(out, p, mx, "  A streaming download + a persistent disk are required first\n");
+            p = pa(out, p, mx, "  (see HANDOFF). To run Debian now, rebuild with ");
+            p = pa(out, p, mx, "\033[36mEMBED_DEBIAN=1\033[0m\n");
+            p = pa(out, p, mx, "  to bake the rootfs into the kernel image.\n");
+            return p;
+        }
         p = pa(out, p, mx, "Downloading Debian rootfs from ");
         p = pa(out, p, mx, PKG_REPOSITORY_HOST);
         p = pa(out, p, mx, " (this may take several minutes)...\n");
@@ -1769,7 +1804,7 @@ int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out
             return pa(out, p, mx, "\xE2\x9C\x97 Not enough heap to buffer the download.\n");
         }
         int status = 0, payload_len = 0;
-        bool ok = phttp_get(PKG_REPOSITORY_HOST, "/dist/debian-minbase.ext4",
+        bool ok = phttp_get(PKG_REPOSITORY_HOST, dpath,
                               payload, PKG_HTTP_BUFFER_MAX + 1, &status, &payload_len);
         if (!ok || status != 200 || payload_len <= 0) {
             KernelHeap::Free(payload);
@@ -1815,6 +1850,28 @@ int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out
         }
         p = pa(out, p, mx, "    \xE2\x80\xA2 then continue to the desktop.\n");
         return p;
+    }
+
+    // firefox / firefox-esr: not a standalone Kurono package  -  the browser runs
+    // on the Debian runtime layer (real glibc userland) through the linux syscall
+    // bridge + the in-kernel wayland compositor. give the real path rather than a
+    // bare "package not found". (satoru)
+    if (peq(name, "firefox") || peq(name, "firefox-esr")) {
+        if (!Find(name)) SyncRepository();   // honour a published firefox pkg if it exists
+        if (!Find(name)) {
+            int p = 0;
+            p = pa(out, p, mx, "Firefox isn't a standalone package \xE2\x80\x94 it runs on the Debian\n");
+            p = pa(out, p, mx, "runtime layer in Kurono (real glibc userland).\n\n");
+            if (!DebianRootfs::Available()) {
+                p = pa(out, p, mx, "  1) Install the runtime:  \033[36mkpkg install debian\033[0m\n");
+                p = pa(out, p, mx, "  2) Then re-run:          \033[36mkpkg install firefox\033[0m\n");
+            } else {
+                p = pa(out, p, mx, "  The Debian runtime is present. Firefox-in-Debian wiring\n");
+                p = pa(out, p, mx, "  (apt + launcher bridge) is still landing \xE2\x80\x94 see HANDOFF.\n");
+            }
+            return p;
+        }
+        // a firefox package is published: fall through to the generic installer.
     }
 
     int p = 0;

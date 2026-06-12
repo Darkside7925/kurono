@@ -919,15 +919,26 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
         case WL_SHM: {
             if (opcode == 0) {                    // create_pool(new_id, fd, size)
                 // fd travels in scm_rights ancillary data (0 bytes on the
-                // wire) so the on-wire args are: new_id(u32), size(u32).
-                // we record the size as a hint; the authoritative base+size
-                // arrives later via RegisterPoolMemory(). (satoru)
+                // wire) so the on-wire args are: new_id(u32), size(u32). (satoru)
                 if (args_len < 8) return;
                 uint32_t pid  = get32(args);
                 uint32_t size = get32(args + 4);
                 if (!register_obj(c, pid, WL_SHM_POOL, 1)) return;
                 Object* po = find_obj(c, pid);
                 if (po) po->pool_size = size;     // hint until mapping lands
+                // the pool fd arrived as SCM_RIGHTS ancillary; the kernel
+                // resolved that memfd to its shm backing. bind it now so blits
+                // read the client's real pixels instead of a null pool. (satoru)
+                UnixSocket::ControlMsg cm;
+                if (po && UnixSocket::TakePendingControl(c->sd, &cm)) {
+                    for (int i = 0; i < cm.passed_fd_count; i++) {
+                        if (!cm.passed_shm_base[i]) continue;
+                        po->pool_base = (const uint8_t*)(uintptr_t)cm.passed_shm_base[i];
+                        uint32_t msz = (uint32_t)cm.passed_shm_size[i];
+                        po->pool_size = (size && size <= msz) ? size : msz;
+                        break;
+                    }
+                }
             }
             break;
         }
