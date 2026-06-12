@@ -128,7 +128,10 @@ FFMPEG_OBJ        = $(BUILD)/userprogs/ffmpeg_user_embed.o
 # raw-protocol wl_shm wayland test client (proves the compositor render path) (satoru)
 WLSHM_ELF         = $(USERPROGS_DIR)/wl_shm_test.elf
 WLSHM_OBJ         = $(BUILD)/userprogs/wl_shm_test_user_embed.o
-USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ)
+# pthreads smoke test (proves CLONE_THREAD + futex) (satoru)
+PTHREAD_ELF       = $(USERPROGS_DIR)/pthread_test.elf
+PTHREAD_OBJ       = $(BUILD)/userprogs/pthread_test_user_embed.o
+USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ)
 
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
@@ -491,6 +494,15 @@ $(WLSHM_OBJ): $(WLSHM_ELF)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  wl_shm_test.elf wl_shm_test_user_embed.o
 	rm -f $(BUILD)/userprogs/wl_shm_test.elf
+
+# embed the pthreads smoke-test blob (satoru)
+$(PTHREAD_OBJ): $(PTHREAD_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/pthread_test.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  pthread_test.elf pthread_test_user_embed.o
+	rm -f $(BUILD)/userprogs/pthread_test.elf
 
 # kpy: compile C with no libc, no PIE, link with user.ld @ 0x40100000
 $(KPY_ELF): $(KPY_C_SRC) $(USERPROGS_DIR)/user.ld

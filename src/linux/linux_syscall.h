@@ -342,6 +342,10 @@ enum LinuxFdType {
     LFD_URING,       // io_uring instance  -  backend_fd = ring id (stub)
     LFD_LANDLOCK,    // landlock ruleset (stub)
     LFD_FANOTIFY,    // fanotify group (stub)
+    LFD_EPOLL,       // epoll instance  -  backend_fd = epoll table slot (satoru)
+    LFD_EVENTFD,     // eventfd  -  backend_fd = eventfd table slot (satoru)
+    LFD_TIMERFD,     // timerfd  -  backend_fd = timerfd table slot (satoru)
+    LFD_SIGNALFD,    // signalfd  -  harmless stub, never fires (satoru)
 };
 
 // memfd seal bits live alongside the LinuxFd so fcntl can interrogate.
@@ -400,6 +404,8 @@ public:
     static int  GetCurrentIndex();
     static void SetCurrent(int pid_idx);
     static bool HandlePageFault(InterruptFrame* frame);
+    // register the irq0 timer-preemption handler (round-robins user threads). (satoru)
+    static void EnableTimerPreemption();
 
     // the main syscall dispatcher
     // called when int 0x80 fires from a linux elf binary, or from the
@@ -428,6 +434,10 @@ public:
     static bool HasConsoleOutput();
     static int  ReadConsoleOutput(char* buf, int max_len);
     static void ClearConsoleOutput();
+
+    // true when stdin has buffered, unread bytes  -  used by the poll/epoll
+    // readiness logic to report EPOLLIN on fd 0 (satoru)
+    static bool StdinReadable();
 
     static void InjectStdin(const char* data, int len);
 
@@ -489,6 +499,7 @@ private:
     static int64_t sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                             uint32_t flags, int fd, uint64_t offset);
     static int32_t sys_munmap(uintptr_t addr, uint64_t length);
+    static int32_t sys_mprotect(uintptr_t addr, uint64_t length, uint32_t prot);
     static int32_t sys_nanosleep(uintptr_t req, uintptr_t rem);
     static int32_t sys_getdents64(int fd, uintptr_t dirp, uint64_t count);
     static int32_t sys_clock_gettime(uint32_t clk_id, uintptr_t tp);

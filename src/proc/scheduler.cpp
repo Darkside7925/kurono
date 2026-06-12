@@ -104,6 +104,12 @@ static void init_process_common(Process* proc, const char* name, uint32_t priori
     proc->sleep_start_ms    = 0;
     proc->cgroup_quota_left_us      = 0;
     proc->cgroup_throttle_until_ms  = 0;
+
+    // seed a valid fxsave image so the first fxrstor on switch-in doesn't #GP:
+    // the memset zeroed the regs; set the default x87 control word (0x037f) and
+    // mxcsr (0x1f80). user code resets these as it likes. (satoru)
+    *(uint16_t*)(proc->fpu_state + 0)  = 0x037F;   // fcw
+    *(uint32_t*)(proc->fpu_state + 24) = 0x1F80;   // mxcsr
 }
 
 static uint32_t estimate_process_memory_kb(const Process* proc) {
@@ -379,6 +385,62 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
     return proc;
 }
 
+// create a real thread: a schedulable task that SHARES the parent's address
+// space (same cr3  -  page tables are not cloned) but owns a fresh kernel stack
+// and runs on the caller-provided user stack. mirrors CloneUserProcess except
+// for the shared address_space + the PROCESS_FLAG_THREAD marker that keeps
+// DestroyProcess from tearing the address space down on thread exit. (satoru)
+Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
+                                     uint64_t tls_base, bool set_tls) {
+    if (!parent || !parent->is_user() || !parent->has_user_frame || next_pid >= 32) {
+        return nullptr;
+    }
+    if (!child_stack) return nullptr;
+
+    Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
+    if (!proc) return nullptr;
+
+    init_process_common(proc, parent->name, parent->priority);
+    // user + thread: shares the address space, must not free it on exit (satoru)
+    proc->flags = PROCESS_FLAG_USER | PROCESS_FLAG_THREAD;
+
+    // share the parent's address space verbatim  -  same pml4 phys / cr3 (satoru)
+    proc->address_space = parent->address_space;
+
+    if (!alloc_kernel_stack(proc)) {
+        KernelHeap::Free(proc);
+        return nullptr;
+    }
+
+    // start from the parent's saved user frame so cs/ss/rflags and the clone()
+    // call-site rip are correct, then point the thread at its own stack and make
+    // the syscall "return" 0 in the child like a real clone(). (satoru)
+    proc->user_frame = parent->user_frame;
+    proc->user_frame.rsp = child_stack;
+    proc->user_frame.rbp = 0;
+    proc->user_frame.rax = 0;
+    proc->has_user_frame = true;
+
+    proc->user_stack_top = child_stack;
+    proc->rip = (uintptr_t)proc->user_frame.rip;
+    proc->rsp = (uintptr_t)child_stack;
+    proc->rbp = 0;
+    proc->next_mmap_base = parent->next_mmap_base;
+
+    // clone_settls: store the thread's tls as its saved fs base so LoadUserFrame
+    // installs it when this thread is switched in. do NOT wrmsr here  -  the
+    // parent is still running, and writing fs base now would clobber the
+    // parent's tls. inherit the parent's fs base otherwise. (satoru)
+    proc->fs_base = set_tls ? tls_base : parent->fs_base;
+    // start from a copy of the parent's vector state (valid fxsave image). (satoru)
+    for (int b = 0; b < 512; b++) proc->fpu_state[b] = parent->fpu_state[b];
+
+    link_child(parent, proc);
+    enqueue_process(proc);
+    sched_log_process_event(proc, "created", "native user thread");
+    return proc;
+}
+
 void Scheduler::MarkProcessExited(Process* proc, int exit_code) {
     if (!proc || proc->reaped) return;
 
@@ -423,6 +485,15 @@ void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame) {
     proc->rip = (uintptr_t)frame->rip;
     proc->rsp = (uintptr_t)frame->rsp;
     proc->rbp = (uintptr_t)frame->rbp;
+
+    // capture this task's live tls (fs base) + x87/sse state so a switch to a
+    // sibling thread doesn't clobber them. fxsave/rdmsr are explicit asm (safe
+    // under -mno-sse; sse is enabled in cr0/cr4 at boot). (satoru)
+    constexpr uint32_t MSR_FS_BASE = 0xC0000100;
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_FS_BASE));
+    proc->fs_base = ((uint64_t)hi << 32) | lo;
+    __asm__ __volatile__("fxsave %0" : "=m"(proc->fpu_state));
 }
 
 bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
@@ -432,6 +503,13 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     proc->state = Process_Running;
     HAL::SetKernelStack(proc->kernel_stack_top);
     KernelVMM::ActivateAddressSpace(proc->address_space);
+
+    // restore this task's tls (fs base) + vector state. (satoru)
+    constexpr uint32_t MSR_FS_BASE = 0xC0000100;
+    uint32_t lo = (uint32_t)proc->fs_base, hi = (uint32_t)(proc->fs_base >> 32);
+    __asm__ __volatile__("wrmsr" : : "c"(MSR_FS_BASE), "a"(lo), "d"(hi));
+    __asm__ __volatile__("fxrstor %0" : : "m"(proc->fpu_state));
+
     *frame = proc->user_frame;
     return true;
 }
@@ -517,7 +595,10 @@ void Scheduler::DestroyProcess(Process* proc) {
     if (current_process == proc) current_process = nullptr;
 
     if (proc->is_user()) {
-        if (proc->address_space) {
+        // a thread shares its parent's address space + user stack  -  only the
+        // process that owns the address space may tear it down. tearing it down
+        // from a thread would unmap the parent and every sibling. (satoru)
+        if (proc->address_space && !proc->is_thread()) {
             KernelVMM::DestroyAddressSpace(proc->address_space);
         }
         if (proc->kernel_stack_top) {

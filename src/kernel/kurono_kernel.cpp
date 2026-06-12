@@ -1720,6 +1720,17 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec((int)EmbeddedUserprogs::WlShmTestSize());
         SerialLogger::Log(" bytes)\r\n");
     }
+    // register the pthreads smoke test so `pthtest` can prove CLONE_THREAD +
+    // futex (mutex serialisation + pthread_join). (satoru)
+    if (EmbeddedUserprogs::HasPthreadTest()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/pthread_test",
+                        EmbeddedUserprogs::PthreadTestData(),
+                        EmbeddedUserprogs::PthreadTestSize());
+        SerialLogger::Log("[Userspace] /usr/bin/pthread_test registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::PthreadTestSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
     if (EmbeddedUserprogs::HasKpython()) {
         KVFS::Mkdirs("/usr/bin");
         KVFS::Mkdirs("/usr/share");
@@ -2077,6 +2088,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     WaylandServer::Init();
     SerialLogger::Log("[ld-kurono] Initialising dynamic linker...\r\n");
     LdKurono::Init();
+
+    // turn on timer-driven preemption so concurrent user threads time-share. (satoru)
+    SerialLogger::Log("[Sched] Enabling user-thread preemption...\r\n");
+    LinuxSyscall::EnableTimerPreemption();
 
     SerialLogger::Log("[KCL] Init...\r\n");
     KCL::Init(&shell_instance);

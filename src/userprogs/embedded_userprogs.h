@@ -20,6 +20,9 @@ extern "C" {
     // raw-protocol wl_shm wayland test client blob (satoru)
     extern const uint8_t _binary_wl_shm_test_elf_start[]   __attribute__((weak));
     extern const uint8_t _binary_wl_shm_test_elf_end[]     __attribute__((weak));
+    // pthreads smoke-test blob (satoru)
+    extern const uint8_t _binary_pthread_test_elf_start[]  __attribute__((weak));
+    extern const uint8_t _binary_pthread_test_elf_end[]    __attribute__((weak));
 }
 
 namespace EmbeddedUserprogs {
@@ -99,6 +102,18 @@ inline const uint8_t* WlShmTestData() { return _binary_wl_shm_test_elf_start; }
 inline uint32_t WlShmTestSize() {
     return (uint32_t)((uintptr_t)_binary_wl_shm_test_elf_end -
                       (uintptr_t)_binary_wl_shm_test_elf_start);
+}
+
+// pthreads smoke-test accessors (satoru)
+inline bool HasPthreadTest() {
+    return _binary_pthread_test_elf_start != nullptr &&
+           _binary_pthread_test_elf_end   != nullptr &&
+           +_binary_pthread_test_elf_end > +_binary_pthread_test_elf_start;
+}
+inline const uint8_t* PthreadTestData() { return _binary_pthread_test_elf_start; }
+inline uint32_t PthreadTestSize() {
+    return (uint32_t)((uintptr_t)_binary_pthread_test_elf_end -
+                      (uintptr_t)_binary_pthread_test_elf_start);
 }
 
 } // namespace EmbeddedUserprogs

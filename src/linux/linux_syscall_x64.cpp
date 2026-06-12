@@ -18,12 +18,12 @@
 #include "../hal/hal.h"
 #include "../kernel/userspace.h"
 
-// Globals shared with syscall_entry.asm.
+// Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
+// switches to, and a one-slot stash for the user rsp across that switch (every
+// other register is captured into the InterruptFrame the stub builds). (satoru)
 extern "C" {
-    volatile uint64_t g_kernel_syscall_rsp        = 0;
-    volatile uint64_t g_user_syscall_rsp_save     = 0;
-    volatile uint64_t g_user_syscall_rip_save     = 0;
-    volatile uint64_t g_user_syscall_rflags_save  = 0;
+    volatile uint64_t g_kernel_syscall_rsp    = 0;
+    volatile uint64_t g_user_syscall_rsp_save = 0;
 }
 
 namespace {
@@ -111,6 +111,26 @@ constexpr NrMap kNrMap[] = {
     { 319, LSYS_MEMFD_CREATE },  // memfd_create (wl_shm pools / posix shm)
     {  22, LSYS_PIPE },          // pipe
     { 293, LSYS_PIPE2 },         // pipe2
+    // ── async I/O event surface: route the amd64 numbers to the real
+    //    epoll/eventfd/timerfd/poll handlers so glib's main loop (firefox)
+    //    gets actual readiness events. epoll_wait(232) and epoll_pwait(281)
+    //    share one handler; same for eventfd/signalfd variants. (satoru)
+    { 232, LSYS_EPOLL_WAIT },     // epoll_wait
+    { 233, LSYS_EPOLL_CTL },      // epoll_ctl
+    { 281, LSYS_EPOLL_WAIT },     // epoll_pwait (sigmask/sigsetsize ignored)
+    { 291, LSYS_EPOLL_CREATE1 },  // epoll_create1
+    { 270, LSYS_PSELECT6 },       // pselect6
+    { 271, LSYS_PPOLL },          // ppoll
+    { 284, LSYS_EVENTFD2 },       // eventfd  (legacy: initval only)
+    { 290, LSYS_EVENTFD2 },       // eventfd2
+    { 283, LSYS_TIMERFD_CREATE }, // timerfd_create
+    { 286, LSYS_TIMERFD_SETTIME },// timerfd_settime
+    { 287, LSYS_TIMERFD_GETTIME },// timerfd_gettime
+    { 282, LSYS_SIGNALFD4 },      // signalfd  (stub)
+    { 289, LSYS_SIGNALFD4 },      // signalfd4 (stub)
+    { 294, LSYS_INOTIFY_INIT1 },  // inotify_init1 (stub fd)
+    { 254, LSYS_INOTIFY_ADD_WATCH },// inotify_add_watch (no-op)
+    { 255, LSYS_INOTIFY_RM_WATCH }, // inotify_rm_watch (no-op)
 };
 
 constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);
@@ -156,7 +176,10 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                                           uint64_t a0, uint64_t a1,
                                           uint64_t a2, uint64_t a3,
                                           uint64_t a4, uint64_t a5) {
-    (void)a5;  // 6th arg unused for now
+    // a5 is the user's real r9 (the frame handler reads it straight from the
+    // InterruptFrame). no 6-arg syscall we implement needs it  -  clone's child
+    // start fn rides in the parent's saved frame, not here  -  so ignore it. (satoru)
+    (void)a5;
 
     // ── Direct x86_64 syscalls that need full 64-bit args or special
     //    handling and have no i386 equivalent we can route to. ──
@@ -193,8 +216,12 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             return -22;  // -EINVAL
         }
         case 218: {  // set_tid_address(int* tidptr)
-            if (a0) *(int*)(uintptr_t)a0 = 1;
-            return 1;
+            // must record the clear-on-exit ptr and return the CALLING thread's
+            // REAL tid. returning a constant 1 made musl's main thread adopt tid
+            // 1; __tl_lock stores the owner tid in __thread_list_lock, so every
+            // pthread create/join/exit then aliased owner "1" and deadlocked. route
+            // to the i386 handler which returns the live task pid. (satoru)
+            return LinuxSyscall::Dispatch(LSYS_SET_TID_ADDRESS, a0, 0, 0, 0, 0);
         }
         case 318: {  // getrandom(void* buf, size_t buflen, uint flags)
             // Weak entropy via TSC; fine for hash-seed bootstrap.
@@ -291,17 +318,12 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
         a4
     );
 
-    // exit / exit_group: never return to userspace.  Tear the
-    // process down via Userspace::HandleProcessExit which longjmps
-    // out of the enclosing Userspace::RunProcess call.  This mirrors
-    // what the int 0x80 path does via resume_userspace_session.
-    if (nr == 60 /* exit */ || nr == 231 /* exit_group */) {
-        Userspace::HandleProcessExit((int)a0);
-        // Unreachable, but be defensive.
-        for (;;) {
-            asm volatile("hlt");
-        }
-    }
+    // exit / exit_group (nr 60/231) deliberately fall through here: they route
+    // via translate_nr → Dispatch(LSYS_EXIT) → sys_exit, which (now that the
+    // fast path sets current_syscall_frame) switches to a sibling thread if one
+    // is ready, or sets resume_userspace_session so the frame handler tears the
+    // process down. driving the teardown from a single int-0x80-style exit on a
+    // thread would kill its siblings mid-run  -  the bug that crashed pthreads. (satoru)
 
     HAL::DisableInterrupts();
     return (int64_t)r;
