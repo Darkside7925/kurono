@@ -20,6 +20,16 @@ Spinlock g_fb_lock;
 Spinlock g_audio_lock;
 Spinlock g_log_lock;
 
+// cross-core scheduler lock  -  protects ready_queue membership and the atomic
+// "pick a Ready user thread and mark it Running" claim, so the bsp and the
+// application processors can pull from one ready_queue without racing. the
+// _nolock helpers below assume this is held; the public wrappers take it with
+// LockIrqSave (cli first) so a timer irq that re-enters the scheduler on the
+// SAME core can't self-deadlock, and so two CORES never corrupt the list. on a
+// single active core it is always uncontended, so the bsp path is unchanged.
+// this is the "_nolock discipline" smp phase 3d needs. (satoru)
+static Spinlock g_sched_lock;
+
 // switch_to.asm helpers
 extern "C" void scheduler_switch_to(uint64_t* prev_saved_rsp,
                                     uint64_t  next_saved_rsp);
@@ -129,9 +139,13 @@ static uint32_t estimate_process_memory_kb(const Process* proc) {
     return (uint32_t)((bytes + 1023ULL) / 1024ULL);
 }
 
-static void enqueue_process(Process* proc) {
+// ── ready_queue helpers ────────────────────────────────────────────────────
+// _nolock variants assume g_sched_lock is already held; the public wrappers
+// take it. callers that already hold the lock (the atomic claim, the user pick)
+// use the _nolock forms to avoid a self-deadlock on the non-recursive lock.
+// (satoru)
+static void enqueue_process_nolock(Process* proc) {
     if (!proc) return;
-    IrqGuard g;
     // Reject duplicate enqueue  -  caused leaked queue cycles on resume races.
     for (Process* cur = Scheduler::ready_queue; cur; cur = cur->next) {
         if (cur == proc) return;
@@ -140,22 +154,33 @@ static void enqueue_process(Process* proc) {
     Scheduler::ready_queue = proc;
 }
 
-static void remove_from_ready_queue(Process* proc) {
+static void remove_from_ready_queue_nolock(Process* proc) {
     if (!proc) return;
-    IrqGuard g;
-
     if (Scheduler::ready_queue == proc) {
         Scheduler::ready_queue = proc->next;
         proc->next = nullptr;
         return;
     }
-
     Process* cursor = Scheduler::ready_queue;
     while (cursor && cursor->next != proc) cursor = cursor->next;
     if (cursor) {
         cursor->next = proc->next;
     }
     proc->next = nullptr;
+}
+
+static void enqueue_process(Process* proc) {
+    if (!proc) return;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    enqueue_process_nolock(proc);
+    g_sched_lock.UnlockIrqRestore(f);
+}
+
+static void remove_from_ready_queue(Process* proc) {
+    if (!proc) return;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    remove_from_ready_queue_nolock(proc);
+    g_sched_lock.UnlockIrqRestore(f);
 }
 
 static void link_child(Process* parent, Process* child) {
@@ -515,18 +540,24 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     return true;
 }
 
-Process* Scheduler::GetNextRunnableUser(Process* after) {
-    if (!ready_queue) return nullptr;
+// affinity gate: a thread with cpu_affinity 0 may run on any cpu; otherwise bit
+// n must be set to run on cpu n. (satoru)
+static inline bool cpu_allowed(const Process* p, uint32_t cpu) {
+    return p->cpu_affinity == 0 || (p->cpu_affinity & (1u << cpu)) != 0;
+}
 
-    // CFS-style pick: scan all runnable user processes and select the one
-    // with the smallest virtual runtime (so lighter-weight tasks that have
-    // been starved get the CPU first).  SCHED_FIFO/RR processes (sched_class
-    // 1/2) preempt CFS unconditionally.  Falls back to ready_queue order
-    // when nothing has accrued vruntime yet.
+// the user pick  -  assumes g_sched_lock is held. selects the best Ready user
+// thread THIS cpu is allowed to run (cfs vruntime, fifo/rr preempt, round-robin
+// fallback). a thread already Running on another core has state != Ready, so it
+// is skipped here; that, plus marking the winner Running under the SAME lock, is
+// what stops two cores grabbing one thread. (satoru)
+static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
+    if (!Scheduler::ready_queue) return nullptr;
     Process* best = nullptr;
     Process* fifo = nullptr;
-    for (Process* c = ready_queue; c; c = c->next) {
+    for (Process* c = Scheduler::ready_queue; c; c = c->next) {
         if (!c->is_user() || c->state != Process_Ready || !c->has_user_frame) continue;
+        if (!cpu_allowed(c, cpu)) continue;
         if (c->sched_class == 1 || c->sched_class == 2) {       // FIFO/RR
             if (!fifo || c->priority < fifo->priority) fifo = c;
             continue;
@@ -538,34 +569,112 @@ Process* Scheduler::GetNextRunnableUser(Process* after) {
     if (best) return best;
 
     // Final fallback: round-robin starting after `after`.
-    Process* start = (after && after->next) ? after->next : ready_queue;
-    Process* cursor = start;
-    while (cursor) {
-        if (cursor->is_user() && cursor->state == Process_Ready && cursor->has_user_frame)
+    Process* start = (after && after->next) ? after->next : Scheduler::ready_queue;
+    for (Process* cursor = start; cursor; cursor = cursor->next)
+        if (cursor->is_user() && cursor->state == Process_Ready &&
+            cursor->has_user_frame && cpu_allowed(cursor, cpu))
             return cursor;
-        cursor = cursor->next;
-    }
-    cursor = ready_queue;
-    while (cursor && cursor != start) {
-        if (cursor->is_user() && cursor->state == Process_Ready && cursor->has_user_frame)
+    for (Process* cursor = Scheduler::ready_queue; cursor && cursor != start; cursor = cursor->next)
+        if (cursor->is_user() && cursor->state == Process_Ready &&
+            cursor->has_user_frame && cpu_allowed(cursor, cpu))
             return cursor;
-        cursor = cursor->next;
-    }
     return nullptr;
 }
 
+Process* Scheduler::GetNextRunnableUser(Process* after) {
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* p = pick_next_user_nolock(after, SMP::CpuIndex());
+    g_sched_lock.UnlockIrqRestore(f);
+    return p;
+}
+
 bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
-    // per-cpu: switch relative to THIS cpu's current task. on an ap this picks the
-    // ap's next thread; on the bsp it behaves exactly as before. (satoru)
+    // per-cpu, smp-safe: atomically release THIS cpu's current user thread and
+    // claim the next Ready one this cpu may run. EVERY state transition happens
+    // under g_sched_lock so there is never a window where a thread is Ready-but-
+    // unowned that another core could double-claim. on the bsp with a single
+    // contender this behaves exactly as the old version. (satoru)
+    uint32_t cpu = SMP::CpuIndex();
     Process* cur = GetCurrentProcess();
-    Process* next = GetNextRunnableUser(cur);
-    if (!next) return false;
-
-    if (cur && cur->state == Process_Running) {
-        cur->state = Process_Ready;
+    Process* next = nullptr;
+    {
+        uint64_t f; g_sched_lock.LockIrqSave(&f);
+        if (cur && cur->state == Process_Running) cur->state = Process_Ready;
+        Process* cand = pick_next_user_nolock(cur, cpu);
+        if (cand && cand != cur) {
+            cand->state = Process_Running;
+            next = cand;
+        } else if (cur && cur->is_user()) {
+            cur->state = Process_Running;            // keep running cur (best/only)
+        }
+        g_sched_lock.UnlockIrqRestore(f);
     }
-
+    if (!next) return false;
+    SetCurrentForThisCpu(next);
     return LoadUserFrame(next, frame);
+}
+
+// atomic bootstrap claim for an application processor that has no current user
+// thread: pick + mark Running under the lock. returns null if nothing this cpu
+// may run is Ready. the caller sets PerCpu.current and enters ring-3. (satoru)
+Process* Scheduler::ClaimNextUserForCpu(uint32_t cpu) {
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* next = pick_next_user_nolock(nullptr, cpu);
+    if (next) next->state = Process_Running;
+    g_sched_lock.UnlockIrqRestore(f);
+    return next;
+}
+
+// claim a FRESH (never-entered) Ready user process this cpu is allowed to run,
+// for LAUNCH via RunProcessWithArgs  -  as opposed to ClaimNextUserForCpu, which
+// claims an already-running thread to RESUME. "fresh" = has_user_frame == false.
+// marks it Running under the lock so the bsp / another ap can't also grab it.
+// the smp phase 3d AP dispatch loop uses this to run independent user processes
+// on the secondary cores in parallel with the bsp. (satoru)
+Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    // require an EXPLICIT affinity pin to this cpu  -  NOT the "affinity 0 = any cpu"
+    // default. this closes a load race: CreateUserProcess enqueues a proc Ready
+    // (affinity 0) and the CALLER then maps its ELF segments; a spinning ap must
+    // not grab it mid-load. the launcher pins the proc to an ap (sets the affinity
+    // bit) only AFTER it is fully loaded, so a pinned proc is always ready to run.
+    // (satoru)
+    Process* pick = nullptr;
+    for (Process* c = ready_queue; c; c = c->next) {
+        if (!c->is_user() || c->state != Process_Ready) continue;
+        // never LAUNCH a clone sibling thread  -  it must be RESUMED from its saved
+        // frame (the timer-preempt ScheduleNextUser path does that on the core
+        // running the parent). launching it via RunProcessWithArgs would build a
+        // fresh stack over its real one and corrupt it (RIP jumps to garbage). only
+        // the thread-group process is claimable here. (satoru)
+        if (c->is_thread()) continue;
+        if ((c->cpu_affinity & (1u << cpu)) == 0) continue;   // explicit pin only (satoru)
+        pick = c; break;
+    }
+    if (pick) {
+        pick->state = Process_Running;
+        // narrow the pin to THIS cpu. while the launching cpu runs this process it
+        // time-shares the process's threads via the timer preempt, which releases
+        // the leader back to Ready between slices  -  without this, ANOTHER ap would
+        // see the released leader and launch a second copy. pinned to the owner,
+        // only the owner (busy in RunProcessWithArgs) can re-pick it. (satoru)
+        pick->cpu_affinity = (uint8_t)(1u << cpu);
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return pick;
+}
+
+void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
+    if (!frame || (frame->cs & 3) != 3) return;   // ring-3 user code only (satoru)
+    Process* cur = GetCurrentProcess();
+    if (!cur || !cur->is_user()) return;
+    // save the interrupted thread's full state, then switch to the next runnable
+    // user thread for this cpu. ScheduleNextUser rewrites *frame in place; the
+    // ISR's iretq resumes whatever it picks. the threads of one process share cr3,
+    // so no address-space switch is needed. ring-3 only, so the AP never holds a
+    // kernel lock when this fires -> ScheduleNextUser's lock is safe. (satoru)
+    SaveUserFrame(cur, frame);
+    ScheduleNextUser(frame);
 }
 
 void Scheduler::ReapProcess(Process* proc) {
@@ -616,7 +725,11 @@ void Scheduler::DestroyProcess(Process* proc) {
 }
 
 void Scheduler::Schedule() {
-    IrqGuard g;
+    // hold the cross-core scheduler lock for the whole pick: an application
+    // processor may be removing a just-exited user thread from ready_queue at the
+    // same time. SpinLockGuard does cli + lock and releases on every return path.
+    // (satoru)
+    SpinLockGuard g(g_sched_lock);
     if (!ready_queue) return;
 
     if (current_process && current_process->state == Process_Running) {

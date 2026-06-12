@@ -122,6 +122,7 @@ The project is broad, but the actual top level shape is easy to hold in the head
 ### Process (`proc/`)
 
 - `proc/SCHEDULER.md`  -  process scheduler
+- `proc/SMP.md`  -  multi-core (AP bring-up + the per-CPU user-execution rewrite)
 
 ### Security (`security/`)
 

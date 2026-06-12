@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include "../proc/scheduler.h"
+#include "../proc/smp.h"        // SMP_MAX_CPUS  -  userspace state is per-cpu now (satoru)
 
 struct UserspaceReturnContext {
     uint64_t kernel_rsp;
@@ -9,6 +10,20 @@ struct UserspaceReturnContext {
     int32_t exit_code;
     uint32_t reserved;
 } __attribute__((packed));
+
+// per-cpu user-execution context. smp phase 3d: each cpu (the bsp and every
+// application processor) runs its OWN active user process with its OWN return
+// context, so an exit/fault longjmps back to THAT cpu's RunProcessWithArgs frame
+// rather than a single shared one. on the bsp this is just index 0, identical to
+// the old single-active-process behaviour. (satoru)
+struct UserspaceCpuState {
+    uint64_t kernel_address_space;
+    Process* previous_process;
+    int      previous_linux_process;
+    Process* active_process;
+    int      active_linux_process;
+    UserspaceReturnContext return_context;
+};
 
 extern "C" int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext* ctx);
 extern "C" void UserspaceResume(UserspaceReturnContext* ctx, int exit_code);
@@ -33,10 +48,7 @@ private:
                             size_t len, uint64_t flags);
 
     static bool initialized;
-    static uint64_t kernel_address_space;
-    static Process* previous_process;
-    static int previous_linux_process;
-    static Process* active_process;
-    static int active_linux_process;
-    static UserspaceReturnContext return_context;
+    // one user-execution context per cpu; cpu() returns the caller's. (satoru)
+    static UserspaceCpuState cpu_state[SMP_MAX_CPUS];
+    static UserspaceCpuState& cpu();
 };

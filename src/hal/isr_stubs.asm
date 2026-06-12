@@ -92,6 +92,7 @@ ISR_NOERR 45   ; IRQ13 FPU
 ISR_NOERR 46   ; IRQ14 Primary ATA
 ISR_NOERR 47   ; IRQ15 Secondary ATA / Spurious
 ISR_NOERR 128  ; User syscall gate
+ISR_NOERR 64   ; per-AP LAPIC timer (smp phase 4)
 
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  Common handler  -  saves all GPRs, calls C, restores, iretq

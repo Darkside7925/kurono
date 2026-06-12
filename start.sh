@@ -13,7 +13,7 @@ RUN_ISO="/tmp/kurono_run.iso"
 
 # ── defaults ──
 BUILD=1 CLEAN=0 DEBUG=0 CLI=0 CLI_POWEROFF=0 CLI_CMD=""
-GPU=1 UEFI=0 HEADLESS=0 RAW_MOUSE=0 NO_USB=0 LOG_STDIO=0 MEM="8G" CPUS=4
+GPU=1 UEFI=0 HEADLESS=0 RAW_MOUSE=0 NO_USB=0 LOG_STDIO=0 MEM="8G" CPUS=4 APSCHED=0
 PERSIST=1 WIPE_DISK=0
 
 usage() {
@@ -32,6 +32,7 @@ usage: ./start.sh [options]
   --log-stdio        stream the kernel serial to this terminal (debug; can cause lag)
   --no-usb           don't attach the xHCI USB tablet (fall back to PS/2 relative; needs click-to-grab)
   --raw-mouse        boot with kurono.mouse.raw=1 + vmport=off (1:1 PS/2; for synthetic input)
+  --apsched          run user processes on the secondary cores (kurono.apsched; smp phase 3d demo)
   --mem <size>       RAM (default 8G)
   --smp <N>          number of vCPUs (default 4; the old -smp>1 freeze is fixed)
   --no-persist       don't attach the persistent data disk (files won't survive reboot)
@@ -55,6 +56,7 @@ while [ $# -gt 0 ]; do
     --log-stdio) LOG_STDIO=1 ;;
     --no-usb) NO_USB=1 ;;
     --raw-mouse) RAW_MOUSE=1 ;;
+    --apsched) APSCHED=1 ;;
     --mem) MEM="${2:?}"; shift ;;
     --smp) CPUS="${2:?}"; shift ;;
     --no-persist) PERSIST=0 ;;
@@ -92,6 +94,14 @@ fi
 if [ "$RAW_MOUSE" -eq 1 ]; then
   echo "  [*] enabling raw 1:1 mouse (kurono.mouse.raw=1)"
   sed -i 's#kurono.autologin=1#kurono.autologin=1 kurono.mouse.raw=1#' "$ROOT/build/isodir/boot/grub/grub.cfg" 2>/dev/null || true
+  grub-mkrescue -o "$ISO" "$ROOT/build/isodir" >/dev/null 2>&1 || true
+fi
+
+# smp phase 3d: run user processes on the application processors (opt-in). same
+# grub.cfg-patch + repack trick. (satoru)
+if [ "$APSCHED" -eq 1 ]; then
+  echo "  [*] enabling AP user-thread scheduling (kurono.apsched)"
+  sed -i 's#kurono.autologin=1#kurono.autologin=1 kurono.apsched#' "$ROOT/build/isodir/boot/grub/grub.cfg" 2>/dev/null || true
   grub-mkrescue -o "$ISO" "$ROOT/build/isodir" >/dev/null 2>&1 || true
 fi
 

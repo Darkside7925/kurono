@@ -1,6 +1,7 @@
 #include "hal.h"
 #include "../drivers/serial.h"
 #include "../proc/smp.h"          // per-cpu kernel-stack (gs:8) for the syscall path (satoru)
+#include "../proc/spinlock.h"     // serialize cross-core exception dumps (satoru)
 #include "../linux/linux_syscall.h"
 #include "../kernel/panic.h"
 #include "../proc/scheduler.h"
@@ -65,6 +66,7 @@ static void BuildTSSDescriptor(uint64_t base, uint32_t limit) {
 extern "C" {
     extern uint64_t isr_stub_table[48];   // 48 function pointers (vectors 0-47)
     extern void isr_stub_128();
+    extern void isr_stub_64();            // per-AP LAPIC timer (smp phase 4) (satoru)
 }
 
 static const char* exception_names[32] = {
@@ -313,6 +315,15 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         return;
     }
 
+    // per-AP LAPIC timer (smp phase 4): preempt the user thread this ap is running,
+    // then signal end-of-interrupt to the local apic. fires only while ring-3 user
+    // code runs (ApTimerPreempt no-ops otherwise). (satoru)
+    if (vec == 0x40) {
+        Scheduler::ApTimerPreempt(frame);
+        SMP::LapicWrite(0xB0, 0);   // lapic EOI register (satoru)
+        return;
+    }
+
     if (vec < 32) {
         if (vec == 14) {
             // 1) Adaptive kernel-stack growth: if CR2 falls in any kernel
@@ -328,9 +339,17 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             }
         }
 
+        // serialize the whole dump so a fault on an application processor isn't
+        // interleaved char-by-char with bsp serial output. unlocked before
+        // HandleProcessExit (which longjmps and would never release it). user
+        // ring-3 code can't be holding this lock, so no deadlock. (satoru)
+        static Spinlock g_exc_dump_lock;
+        uint64_t _exc_f; g_exc_dump_lock.LockIrqSave(&_exc_f);
         SerialLogger::Log("\r\n!!! EXCEPTION: ");
         SerialLogger::Log(exception_names[vec]);
-        SerialLogger::Log(" !!!\r\n");
+        SerialLogger::Log(" !!! cpu");
+        SerialLogger::LogDec((int)SMP::CpuIndex());
+        SerialLogger::Log("\r\n");
         log_hex("  RIP    = ", frame->rip);
         log_hex("  CS     = ", frame->cs);
         log_hex("  RFLAGS = ", frame->rflags);
@@ -346,6 +365,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         log_hex("  RDI    = ", frame->rdi);
         log_hex("  RSI    = ", frame->rsi);
         log_hex("  RBP    = ", frame->rbp);
+        g_exc_dump_lock.UnlockIrqRestore(_exc_f);
 
         // a genuine ring-3 exception (segfault, #GP, #UD, div0, ...) must not
         // panic the whole kernel. terminate the faulting user process with
@@ -420,6 +440,9 @@ void HAL::InitIDT() {
 
     // user-mode syscall trap gate (int 0x80).
     idt_set(0x80, (uint64_t)(uintptr_t)&isr_stub_128, 0, 3);
+
+    // per-AP LAPIC timer (vector 0x40), kernel-only (dpl 0). (satoru)
+    idt_set(0x40, (uint64_t)(uintptr_t)&isr_stub_64, 0, 0);
 
     // vectors 48-255: leave as not-present (type_attr = 0).
     // if hardware triggers one, the cpu will fire a #gp which we handle above.

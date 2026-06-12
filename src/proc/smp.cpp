@@ -3,6 +3,10 @@
 #include "../drivers/cpu_detect.h"
 #include "../kernel/pmm.h"
 #include "../hal/hal.h"
+#include "scheduler.h"            // ap dispatch: claim + run user procs (smp 3d) (satoru)
+#include "spinlock.h"
+#include "../kernel/userspace.h"  // Userspace::RunProcessWithArgs on the ap (satoru)
+#include "../linux/linux_syscall.h" // drain the ap process's console output (satoru)
 
 //  the ap trampoline blob (flat binary, embedded via objcopy)  -  copied to phys
 //  0x8000 before the first SIPI. (satoru)
@@ -18,6 +22,10 @@ namespace {
     uint32_t g_cpu_count = 0;
     uint64_t g_lapic_base = 0;     // identity-mapped xapic mmio window (satoru)
     bool     g_inited = false;
+
+    //  phase 3d gate + a lock so two cores' ap-dispatch serial lines don't interleave. (satoru)
+    volatile bool g_ap_user_sched = false;
+    Spinlock      g_ap_log_lock;
 
     inline uint64_t rdmsr(uint32_t msr) {
         uint32_t lo, hi;
@@ -271,8 +279,77 @@ extern "C" void ap_entry() {
     SMP::SetupGsBase();      // KERNEL_GS_BASE -> this ap's PerCpu (after the gs reload) (satoru)
     PerCpu* me = SMP::Current();
     if (me) me->online = 1;
-    for (;;) __asm__ volatile("hlt; pause");
+
+    //  phase 4  -  arm a per-ap LAPIC timer (vector 0x40, periodic) so user threads
+    //  on this ap are PREEMPTED, not just cooperative. calibrate the reload count
+    //  against the tsc (irqs are still off here) for a ~100 hz tick, then enable
+    //  interrupts on this ap so the timer (the only irq targeted at an ap) fires.
+    //  the timer no-ops unless it interrupts ring-3 user code. (satoru)
+    {
+        SMP::LapicWrite(0x3E0, 0x3);            // divide config: 0x3 = divide by 16 (satoru)
+        SMP::LapicWrite(0x320, (1u << 16));     // LVT timer: masked one-shot for calibration (satoru)
+        SMP::LapicWrite(0x380, 0xFFFFFFFFu);    // count down from max (satoru)
+        busy_us(10000);                          // 10 ms (satoru)
+        uint32_t ticks_10ms = 0xFFFFFFFFu - SMP::LapicRead(0x390);
+        SMP::LapicWrite(0x380, 0);              // stop (satoru)
+        uint32_t period = ticks_10ms ? ticks_10ms : 1000000u;   // ~100 hz (ticks in 10 ms) (satoru)
+        SMP::LapicWrite(0x320, 0x40u | (1u << 17));   // LVT timer: vector 0x40, periodic (satoru)
+        SMP::LapicWrite(0x380, period);                // arm (satoru)
+        __asm__ volatile("sti");                       // let the timer fire on this ap (satoru)
+    }
+
+    //  phase 3d  -  cooperative user-thread dispatch. when the gate is off we park
+    //  exactly as before (hlt). when on, claim a fresh Ready user process this cpu
+    //  is allowed to run and launch it in ring-3 via the now-per-cpu
+    //  RunProcessWithArgs; it runs in parallel with the bsp and yields back here
+    //  when it exits (its exit longjmps to THIS cpu's return context). spin-poll
+    //  for work while the gate is on (no per-ap timer yet  -  that is phase 4). (satoru)
+    uint32_t idx = SMP::CpuIndex();
+    for (;;) {
+        if (g_ap_user_sched) {
+            Process* t = Scheduler::ClaimFreshUserForCpu(idx);
+            if (t) {
+                {
+                    uint64_t f; g_ap_log_lock.LockIrqSave(&f);
+                    SerialLogger::Log("[SMP] cpu");
+                    SerialLogger::LogDec((int)idx);
+                    SerialLogger::Log(" running user proc '");
+                    SerialLogger::Log(t->name);
+                    SerialLogger::Log("'\r\n");
+                    g_ap_log_lock.UnlockIrqRestore(f);
+                }
+                int rc = Userspace::RunProcessWithArgs(t, nullptr, nullptr);
+                {
+                    uint64_t f; g_ap_log_lock.LockIrqSave(&f);
+                    // drain what the user program printed (proves it ran on this ap). (satoru)
+                    char obuf[256]; int on;
+                    while ((on = LinuxSyscall::ReadConsoleOutput(obuf, (int)sizeof(obuf) - 1)) > 0) {
+                        obuf[on] = 0;
+                        SerialLogger::Log("[SMP] cpu"); SerialLogger::LogDec((int)idx);
+                        SerialLogger::Log(" out: "); SerialLogger::Log(obuf); SerialLogger::Log("\r\n");
+                    }
+                    SerialLogger::Log("[SMP] cpu");
+                    SerialLogger::LogDec((int)idx);
+                    SerialLogger::Log(" user proc finished, exit=");
+                    SerialLogger::LogDec(rc);
+                    SerialLogger::Log("\r\n");
+                    g_ap_log_lock.UnlockIrqRestore(f);
+                }
+                continue;
+            }
+            //  gate on but nothing to claim: spin-poll (no per-ap timer yet). (satoru)
+            __asm__ volatile("pause");
+            continue;
+        }
+        //  gate off: parked exactly as before. the gate is decided at boot from
+        //  kurono.apsched (set before the APs start), so a parked ap never needs to
+        //  be woken mid-run; an IPI-wake for a runtime toggle is phase 4. (satoru)
+        __asm__ volatile("hlt; pause");
+    }
 }
+
+void SMP::SetApUserSched(bool on) { g_ap_user_sched = on; }
+bool SMP::ApUserSched()           { return g_ap_user_sched; }
 
 void SMP::StartAPs() {
     if (g_cpu_count <= 1) {

@@ -4,7 +4,9 @@ A bare-metal x86_64 operating system with a hybrid kernel that combines a native
 
 Built from scratch in freestanding C++17 and x86 assembly - no libc in the kernel, no borrowed POSIX runtime under the kernel, and no existing host kernel reused as the core OS. Kurono boots as a Multiboot2 ELF kernel, also produces standalone EFI loaders, runs in QEMU with WHPX or KVM, supports emergency recovery boot, can deploy onto FAT32/ext4 installer targets, and ships both Alpine and Debian guest paths.
 
-> **19 hardware drivers - 76+ compatibility commands plus Kurono-native commands - full TCP/IP stack - in-kernel ELF64 dynamic linker - in-kernel Wayland compositor - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
+> **19 hardware drivers - 76+ compatibility commands plus Kurono-native commands - full TCP/IP stack - in-kernel ELF64 dynamic linker (ld-kurono) - a Linux syscall runtime with real concurrent threads/futex, epoll, mprotect W^X and SCM_RIGHTS fd-passing - an in-kernel Wayland compositor that renders real musl-compiled Wayland clients on screen - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
+
+> **On the browser question:** Kurono does *not* ship a cut-down toy browser, and the GUI "Browser" tile is a deliberate placeholder. The real answer is **Firefox on the Linux runtime**  -  a full Firefox 140.11.0esr is already cross-compiled against musl + Wayland (174 MB `libxul.so`), and the OS provides the syscalls, IPC and Wayland surface it targets. Loading its shared-library closure through `ld-kurono` and lifting the current <4 GB pointer-ABI limit is the active frontier, not an impossibility. `curl <url>` is the working HTTP path today.
 
 ---
 
@@ -32,7 +34,7 @@ I moved the whole thing onto Linux (KVM), so this is the path I actually use day
 ./start.sh --debug
 ```
 
-> multi-core: boot **`-smp 4`** (what `start.sh` defaults to). all cores boot and run kernel code in parallel  -  real AP bring-up (INIT-SIPI-SIPI), a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, and a per-CPU current task are in. the old ">1 core deadlocks the desktop" bug is gone. the remaining piece is actually scheduling **user** threads onto the secondary cores (the kernel runs on all of them today; user threads still run on the boot core).
+> multi-core: boot **`-smp 4`** (what `start.sh` defaults to). all cores boot and run kernel code in parallel  -  real AP bring-up (INIT-SIPI-SIPI), a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, and a per-CPU current task are in. the old ">1 core deadlocks the desktop" bug is gone. And the **secondary cores now run real ring-3 Linux user processes in parallel with the desktop**: the per-CPU rewrite (cross-core ready-queue lock + atomic per-CPU claim, a per-CPU user-execution context replacing the old single-active-process model, per-CPU syscall state) is done, and an application processor has been shown launching `/usr/bin/mhello`, running it, and exiting 0 while the desktop rendered untouched. It's opt-in (`./start.sh --apsched`); the default boot parks the APs exactly as before. And the APs are now **preemptive**  -  each arms a per-CPU LAPIC timer that time-slices the user threads it runs, instead of only switching cooperatively at syscalls. Running `clone` sibling threads across cores and load balancing are the next step. See [docs/developers/proc/SMP.md](docs/developers/proc/SMP.md).
 
 If you're still on Windows the old WHPX launcher works too:
 
@@ -101,7 +103,9 @@ wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make run-noaccel'
 Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It's way faster and it quietly fixed a pile of networking + input pain that WHPX was causing. Wrote a `start.sh` so booting is one command now.
 
 - **Boot doesn't hang anymore.** The desktop was coming up black  -  turned out the large-model BSS section wasn't being zeroed, so a bunch of pointers were straight-up garbage. Fixed it in the linker script. The old SMP race that froze the desktop ~8s in is also fixed  -  `-smp 4` is the default now and all cores boot and run kernel code in parallel.
-- **Reboot persistence on a real filesystem + multi-core bring-up.** KVFS state now survives a reboot through **KFS**  -  a from-scratch inode-based on-disk filesystem (the NVMe driver was dead until a missing `volatile` on the completion poll was fixed; it now does multi-page DMA via a PRP list). The user-data tree is stored as real files + dirs, not a blob. And the secondary cores are genuinely up: INIT-SIPI-SIPI bring-up, a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, per-CPU current task. Scheduling user threads onto the APs is the next step.
+- **Reboot persistence on a real filesystem + multi-core bring-up.** KVFS state now survives a reboot through **KFS**  -  a from-scratch inode-based on-disk filesystem (the NVMe driver was dead until a missing `volatile` on the completion poll was fixed; it now does multi-page DMA via a PRP list). The user-data tree is stored as real files + dirs, not a blob. And the secondary cores are genuinely up: INIT-SIPI-SIPI bring-up, a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, per-CPU current task. The **per-CPU scheduling foundation** for running user threads on them then landed  -  a cross-core ready-queue lock + atomic per-CPU claim, a per-CPU user-execution context (replacing the single-active-process model), and per-CPU syscall state, all verified non-regressing under `-smp 4` (desktop renders, no faults). The AP dispatch loop that actually enters ring-3 on the secondary cores is the remaining step.
+- **A real Linux GUI client renders through the in-kernel Wayland compositor.** This is the milestone the rest of the runtime was building toward. The userspace layer grew the pieces a real GUI app actually blocks on: preemptive concurrent threads (`clone`/`CLONE_THREAD`) backed by a real `futex` (the multithreaded pthread gate passes), `epoll`/`poll`, `mprotect` with W^X enforcement, `memfd`/file-backed `mmap`, and `SCM_RIGHTS` fd-passing end to end. With those in place, a Wayland client compiled with **musl-gcc** (`wl_shm_test`, embedded in the kernel and launched by the `wltest` command) connects to the compositor over the AF_UNIX socket, fd-passes a `wl_shm` buffer, and the compositor blits its pixels into a real window-manager window with damage tracking and forwards pointer input back to it. That's the whole `wl_shm` + `xdg-shell` render path working  -  not just the wire protocol. (Keyboard-to-client forwarding is the next wire-up.)
+- **Firefox is cross-compiled for Kurono.** A real **Firefox 140.11.0esr** is built against **musl** (clang/lld, `--disable-jit`, `cairo-gtk3-wayland`)  -  `firefox`/`firefox-bin` plus a 174 MB `libxul.so` Gecko engine, build rc=0, all of Alpine's musl portability patches applied. This is the concrete rebuttal to "a freestanding OS can't have a browser": the engine targets musl + Wayland, both of which Kurono's runtime provides, and the launcher already does a real `execve`. What's left to actually run it is bringing libxul's `.so` dependency closure onto the OS and loading it through `ld-kurono`, plus lifting the <4 GB user-pointer ABI limit.
 - **Networking actually works.** curl/HTTP goes end to end now  -  fixed a recv loop that gave up way too early, the FIN_WAIT half-close path, and ephemeral port selection. Pulled real pages off example.com and wikipedia over tap+NAT.
 - **USB works over xHCI.** keyboard, mouse, and tablet all enumerate and report now (the DMA structs just needed proper page alignment). The tablet gives accurate absolute cursor positioning, which is also how I drive it headless.
 - **Killed the bugs that made the desktop unusable:**
@@ -193,7 +197,7 @@ Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It'
 - **GPU probe:** early PCI scan for all display controllers (class 0x03), hybrid topology detection (Optimus muxless/MUX, PowerXpress, dual discrete, virtual), framebuffer address validation via Intel DSPSURF register read
 - **Display manager:** 10 predefined modes from 640x480 through 3840x2160, runtime mode switching, EDID reading, DPI scaling, gamma/brightness, VSync modes (off/on/adaptive)
 - **Graphics driver:** double/triple buffering with SSE2 non-temporal store swap path, write-combining framebuffer remap via PAT, dirty region tracking (16 rectangles), frame pacing with FPS measurement, blend modes (alpha/additive/multiply), accessibility color-blindness filters
-- **Wayland compositor:** in-kernel server listening at `/system/run/user/1000/wayland-0`, speaks the real libwayland wire protocol, advertises `wl_compositor` v5, `xdg_wm_base` v3, `wl_seat` v7, `zwp_linux_dmabuf_v1` v3, and 6 other globals  -  bridges `xdg_toplevel` surfaces into the Kurono window manager
+- **Wayland compositor:** in-kernel server listening at `/system/run/user/1000/wayland-0`, speaks the real libwayland wire protocol, advertises `wl_compositor` v5, `xdg_wm_base` v3, `wl_seat` v7, `zwp_linux_dmabuf_v1` v3, and 6 other globals. It goes past the wire protocol: an `xdg_toplevel` surface becomes a real window-manager window, the client's `wl_shm` buffer (fd-passed via `SCM_RIGHTS`) is blitted into that window's framebuffer rect with damage tracking, and pointer enter/leave/motion/button events are forwarded back to the focused client  -  verified with a real **musl-compiled** Wayland client (`wl_shm_test`, run via `wltest`). Keyboard-to-client forwarding is implemented but not yet wired into the input loop; `zwp_linux_dmabuf` GPU buffers are advertised but only `wl_shm` software buffers are composited today
 - **Window manager:** compositing WM with z-ordering, server-side decorations (titlebar, 1px border, 10px corner radius, drop shadows), 8-direction resize, drag, minimize/maximize/close, per-window alpha, smooth-step animation (open/close/minimize/restore with taskbar fly-to effect), configurable shadow and animation settings
 - **Desktop environment:** wallpaper (image or midnight-blue gradient), desktop icons with context menus, taskbar with start button/search/task icons/system tray/audio popup/clock, Alt-Tab window cycling
 - Boot splash with logo and animated loading feedback
@@ -213,10 +217,10 @@ Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It'
 | Denji | GUI app / shell command | windowed KVID/JPEG playback wrapper around `VideoPlayer` for the bundled Denji media asset |
 | Settings | GUI app | 10-tab settings UI including display, wallpaper, system, accessibility, and a real Updates tab |
 | Task Manager | GUI app | process list, CPU/memory stats, auto-refresh |
-| Firefox Launcher | runtime app path | launches a Linux userspace Firefox-style workload through the syscall/runtime layer and seeded `/system` layout |
+| Firefox Launcher | runtime app path | real `execve` of `/apps/firefox/firefox` through the Linux syscall/runtime layer (seeded `/system`, `firefox.env`, `LD_LIBRARY_PATH` from the runtime layout). A real Firefox 140.11.0esr is cross-compiled (musl, Wayland); shipping + loading its 174 MB libxul closure via `ld-kurono` is the remaining bring-up step |
 | Conduit | GUI app | event-dialogue viewer backed by `ConduitBridge` telemetry for system, package, GPU, guest, and command events |
 | Mini Python 3 | shell/runtime | built-in `python` / `python3` interpreter with file, `-c`, and `-e` execution |
-| Browser stub | GUI app | intentionally reduced to a removal notice because current freestanding browser candidates still require libc/POSIX stacks Kurono does not provide |
+| Browser (placeholder) | GUI app | a deliberate placeholder tile  -  `curl <url>` is today's working HTTP path. The real browser strategy is **Firefox on the Linux runtime** (cross-compiled against musl + Wayland, in bring-up; see the Firefox Launcher row), not a cut-down freestanding engine |
 
 ### Hybrid Shell and Command Environments
 
@@ -393,6 +397,7 @@ This is more than a command shim. Kurono has an in-kernel Linux compatibility/ru
 - **Syscall layer**
   - 67 syscall numbers defined
   - 35+ implemented handlers, including `read`, `write`, `open`, `close`, `lseek`, `brk`, `fork`, `waitpid`, `execve`, `stat`, `fstat`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `dup`, `dup2`, `ioctl`, `writev`, `mmap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, and more
+  - the syscalls a real GUI app actually blocks on are implemented for real, not stubbed: `futex` (FUTEX_WAIT/WAKE), `clone`/`CLONE_THREAD`, `epoll_create1`/`epoll_ctl`/`epoll_wait`, `poll`/`ppoll`, `mprotect` (W^X with region splitting), `memfd_create`, file-backed `mmap`, and `sendmsg`/`recvmsg` carrying `SCM_RIGHTS`
 
 - **Process model**
   - Up to 16 Linux processes
@@ -400,6 +405,12 @@ This is more than a command shim. Kurono has an in-kernel Linux compatibility/ru
   - Parent/child tracking
   - Saved interrupt-frame and user-context state
   - Scheduler-backed ring-3 tasks
+
+- **Threads and concurrency**
+  - `clone`/`CLONE_THREAD` threads sharing one address space
+  - a real `futex` (FUTEX_WAIT/WAKE) for blocking and wakeups
+  - preemptive switching on the user-thread path  -  verified by a multithreaded pthread gate test (a two-thread counter reliably reaches 2000)
+  - `epoll`/`poll` event loops backed by eventfd, timerfd, and sockets
 
 - **Memory model**
   - Lazy `brk`
@@ -420,10 +431,10 @@ This is more than a command shim. Kurono has an in-kernel Linux compatibility/ru
 
 - **IPC and session services**
   - AF_UNIX socket table with `STREAM`, `DGRAM`, and `SEQPACKET`
-  - `SCM_RIGHTS` file descriptor passing
+  - `SCM_RIGHTS` file descriptor passing  -  exercised end to end: a Wayland client fd-passes its `wl_shm` buffer to the compositor, which maps and composites it
   - D-Bus session bus
   - PulseAudio-compatible server
-  - Wayland compositor socket
+  - Wayland compositor socket  -  a real musl-compiled client (`wl_shm_test`) connects, renders, and receives pointer input through it
 
 - **Dynamic linking**
   - `ld-kurono` interpreter path for PIE userspace binaries
@@ -725,7 +736,7 @@ Alpine guest assets are linked when `Alpine/vmlinuz-virt` and `Alpine/initramfs-
 
 ## Known Limitations
 
-- The Wayland compositor is functional at the wire-protocol level (registry, globals, surface creation, xdg_toplevel configure) but the surface-to-framebuffer blit bridge and input event forwarding are still stubbed.
+- The Wayland compositor renders real clients  -  an `xdg_toplevel` surface becomes a managed window and its `wl_shm` buffer (fd-passed via `SCM_RIGHTS`) is blitted to the framebuffer with damage tracking, and pointer input is forwarded to the focused client (proven with a real musl-compiled client, `wl_shm_test`). The remaining gaps are **keyboard**-to-client forwarding (the handler exists but isn't wired into the input loop) and `zwp_linux_dmabuf` GPU buffers (only `wl_shm` software buffers are composited today).
 - Live desktop storage is KVFS-first and RAM-backed, but it now **persists across reboot through KFS**  -  a from-scratch inode-based on-disk filesystem on the NVMe data disk. The user-data subtrees (`/home`, `/etc`, `/root`) are stored as real files + directories and restored at boot. KVFS stays the runtime fs; KFS is the on-disk persistence layer (not yet a fully mounted root).
 - The Linux syscall layer still uses a 32-bit-style pointer ABI constraint, so user mappings and pointers currently need to remain below 4 GB.
 - General ELF loading from disk is still limited; the Linux subsystem primarily executes built-in or staged runtime programs rather than arbitrary disk-resident binaries.
@@ -734,7 +745,7 @@ Alpine guest assets are linked when `Alpine/vmlinuz-virt` and `Alpine/initramfs-
 - ext4 write support is still partial; sparse allocation and full directory-growth handling are not complete.
 - FAT32 support is focused on EFI System Partition deployment rather than full long-filename desktop storage workloads.
 - Nested or hardware-assisted virtualization still depends on host support for VT-x or AMD-V through QEMU, WHPX, or KVM.
-- Browser functionality is intentionally not shipped as a real native browser because current C/C++ browser engines still assume libc, POSIX, X11, SDL, Qt, or similar host stacks that Kurono does not provide inside its freestanding kernel environment.
+- A native browser isn't running on the OS **yet**  -  but not for the usual "freestanding can't do it" reason. A real **Firefox 140.11.0esr** is cross-compiled against **musl** (`--disable-jit`, `cairo-gtk3-wayland`, 174 MB libxul), and the Linux runtime already provides what it targets: pthreads/`futex`, `epoll`/`poll`, `mprotect` W^X, AF_UNIX + `SCM_RIGHTS`, and a Wayland compositor that composites real `wl_shm` clients. The open work is (1) bringing libxul's shared-library closure onto the OS and loading it through `ld-kurono`, and (2) lifting the current <4 GB user-pointer ABI limit. The GUI "Browser" tile stays a placeholder until then; `curl <url>` is the working HTTP path today.
 
 ---
 
