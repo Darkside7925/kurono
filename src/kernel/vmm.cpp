@@ -235,6 +235,37 @@ static void unmap_page_in_root(uint64_t root_phys, uint64_t virt_addr, bool free
     pt[p1i] = 0;
 }
 
+// rewrite the protection bits of an existing 4kb leaf pte in place, keeping the
+// mapped physical frame but swapping the flags for PTE_PRESENT|new_flags. walks
+// the four levels exactly like unmap_page_in_root; if any level is missing, or
+// the translation is served by a huge page, or the leaf isn't present, there is
+// nothing to reprotect so we return false (the caller skips it). (satoru)
+static bool protect_page_in_root(uint64_t root_phys, uint64_t virt_addr,
+                                 uint64_t new_flags) {
+    virt_addr &= ~0xFFFULL;
+
+    uint64_t* pml4 = phys_to_virt(root_phys);
+    uint16_t p4i = pml4_index(virt_addr);
+    if (!(pml4[p4i] & PTE_PRESENT)) return false;
+
+    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint16_t p3i = pdpt_index(virt_addr);
+    if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return false;
+
+    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint16_t p2i = pd_index(virt_addr);
+    if (!(pd[p2i] & PTE_PRESENT) || (pd[p2i] & PTE_HUGE)) return false;
+
+    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint16_t p1i = pt_index(virt_addr);
+    if (!(pt[p1i] & PTE_PRESENT)) return false;
+
+    // keep the physical frame, replace every permission/attr bit (satoru)
+    uint64_t phys = pt[p1i] & ~0xFFFULL & ~PTE_NX;
+    pt[p1i] = phys | PTE_PRESENT | new_flags;
+    return true;
+}
+
 static uint64_t query_mapping_in_root(uint64_t root_phys, uint64_t virt_addr) {
     uint64_t* pml4 = phys_to_virt(root_phys);
     uint16_t p4i = pml4_index(virt_addr);
@@ -243,22 +274,26 @@ static uint64_t query_mapping_in_root(uint64_t root_phys, uint64_t virt_addr) {
     uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT)) return 0;
+    // mask to the 52-bit physical frame (bits 12-51), stripping the NX bit (63)
+    // and any other high flag bits  -  otherwise an NX (rw data) page returns a
+    // non-canonical "phys" and dereferencing it #GPs. exposed by the threading
+    // path writing ptid/ctid to nx thread-stack pages via write_user_u32. (satoru)
     if (pdpt[p3i] & PTE_HUGE) {
-        return (pdpt[p3i] & ~0x3FFFFFFFULL) | (virt_addr & 0x3FFFFFFFULL);
+        return (pdpt[p3i] & 0x000FFFFFC0000000ULL) | (virt_addr & 0x3FFFFFFFULL);
     }
 
     uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT)) return 0;
     if (pd[p2i] & PTE_HUGE) {
-        return (pd[p2i] & ~0x1FFFFFULL) | (virt_addr & 0x1FFFFFULL);
+        return (pd[p2i] & 0x000FFFFFFFE00000ULL) | (virt_addr & 0x1FFFFFULL);
     }
 
     uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
     uint16_t p1i = pt_index(virt_addr);
     if (!(pt[p1i] & PTE_PRESENT)) return 0;
 
-    return (pt[p1i] & ~0xFFFULL) | (virt_addr & 0xFFFULL);
+    return (pt[p1i] & 0x000FFFFFFFFFF000ULL) | (virt_addr & 0xFFFULL);
 }
 
 static uint64_t query_page_flags_in_root(uint64_t root_phys, uint64_t virt_addr) {
@@ -391,6 +426,13 @@ void KernelVMM::UnmapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                         bool free_frame) {
     unmap_page_in_root(root_pml4, virt_addr, free_frame);
     if (root_pml4 == current_cr3()) InvalidatePage(virt_addr);
+}
+
+bool KernelVMM::ProtectPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
+                                          uint64_t new_flags) {
+    // leave the tlb to the caller: mprotect reprotects many pages in a loop and
+    // flushes the whole touched range once, rather than per-page here. (satoru)
+    return protect_page_in_root(root_pml4, virt_addr, new_flags);
 }
 
 // invalidate a contiguous virtual range. for small ranges (< 32 pages) we

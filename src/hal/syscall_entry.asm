@@ -2,130 +2,93 @@
 ;  x86_64 SYSCALL fast-path entry (Linux ABI)
 ;
 ;  On entry:
-;    CPL=0, RCX = user RIP, R11 = user RFLAGS, RSP = user RSP (UNCHANGED)
-;    syscall nr in RAX, args in RDI, RSI, RDX, R10, R8, R9.
+;    CPL=0, RCX = user RIP, R11 = user RFLAGS, RSP = user RSP (UNCHANGED),
+;    IF cleared by SFMASK.  syscall nr in RAX, args in RDI, RSI, RDX, R10, R8, R9.
 ;
-;  We:
-;    1. Stash user RSP into g_user_syscall_rsp_save.
-;    2. Load kernel RSP from g_kernel_syscall_rsp.
-;    3. Save GPRs that we / the C handler may clobber.
-;    4. Call SyscallEntryX64Handler(nr, a0..a5, &saved_user_rip, &saved_user_rflags).
-;       (We use a flat struct passed in registers for simplicity  -  see below.)
-;    5. Restore GPRs, restore user RSP, sysretq back to user (RCX=user RIP, R11=user RFLAGS).
+;  We build a full InterruptFrame on the kernel stack  -  byte-identical to the
+;  one the int 0x80 / irq stubs build  -  and hand it to a C handler. that lets a
+;  syscall switch tasks the same way int 0x80 does: the handler rewrites the
+;  frame in place (futex block, thread exit, clone), and we IRETQ to whatever
+;  task the frame now describes instead of SYSRET-ing back to the caller. a
+;  non-switching syscall just IRETQs back to the original task with rax set.
 ;
-;  The handler returns a 64-bit value that we place in RAX (syscall result).
+;  InterruptFrame layout (see hal.h, packed, low→high address):
+;    cr2, r15,r14,r13,r12,r11,r10,r9,r8, rbp,rdi,rsi,rdx,rcx,rbx,rax,
+;    vector, error_code, rip, cs, rflags, rsp, ss      (23 qwords = 184 bytes)
+;  the bottom five (rip,cs,rflags,rsp,ss) are exactly the hardware IRETQ frame.
 ; ═══════════════════════════════════════════════════════════════════════════
 
 [BITS 64]
 
-extern SyscallEntryX64Handler            ; int64_t (*)(uint64_t nr, uint64_t a0..a5)
+extern SyscallEntryX64FrameHandler       ; void (*)(InterruptFrame*)  -  fills rax, may switch
 extern g_kernel_syscall_rsp              ; uint64_t  -  kernel stack to switch to
-extern g_user_syscall_rsp_save           ; uint64_t  -  stash user rsp
-extern g_user_syscall_rip_save           ; uint64_t  -  stash user rip (rcx)
-extern g_user_syscall_rflags_save        ; uint64_t  -  stash user rflags (r11)
+extern g_user_syscall_rsp_save           ; uint64_t  -  stash user rsp across the stack switch
+
+; ring-3 selectors (gdt: user code 0x20|3, user data 0x18|3). (satoru)
+USER_CS equ 0x23
+USER_SS equ 0x1B
 
 global syscall_entry_x64
 syscall_entry_x64:
-    ; Stash user state.  We can't touch the stack yet  -  RSP is still user's.
-    mov     qword [rel g_user_syscall_rsp_save],    rsp
-    mov     qword [rel g_user_syscall_rip_save],    rcx
-    mov     qword [rel g_user_syscall_rflags_save], r11
-
-    ; Switch to kernel stack.
+    ; stash user rsp, then switch to this task's kernel stack. we can't touch
+    ; the stack until rsp points at kernel memory. (satoru)
+    mov     qword [rel g_user_syscall_rsp_save], rsp
     mov     rsp, qword [rel g_kernel_syscall_rsp]
 
-    ; Save callee-clobbered registers we need to preserve for the user.
-    ; SysV ABI: caller-saved are rax, rcx, rdx, rsi, rdi, r8-r11.
-    ; We'll preserve everything to be safe.
-    push    rbx
-    push    rbp
-    push    r12
-    push    r13
-    push    r14
-    push    r15
+    ; build the InterruptFrame top-down (push writes high address first, so the
+    ; first push is the last struct field, ss). every gp reg is captured live
+    ; and untouched here  -  in particular r9 still holds musl's clone child-fn,
+    ; and rcx/r11 still hold the user rip/rflags. (satoru)
+    push    USER_SS                              ; ss
+    push    qword [rel g_user_syscall_rsp_save]  ; rsp (user)
+    push    r11                                  ; rflags (user, in r11)
+    push    USER_CS                              ; cs
+    push    rcx                                  ; rip (user, in rcx)
+    push    0                                    ; error_code
+    push    0x80                                 ; vector (cosmetic  -  mark syscall)
+    push    rax                                  ; rax (syscall nr; handler overwrites with result)
+    push    rbx                                  ; rbx
+    push    rcx                                  ; rcx
+    push    rdx                                  ; rdx
+    push    rsi                                  ; rsi
+    push    rdi                                  ; rdi
+    push    rbp                                  ; rbp
+    push    r8                                   ; r8
+    push    r9                                   ; r9  (pristine  -  clone child start fn)
+    push    r10                                  ; r10
+    push    r11                                  ; r11
+    push    r12                                  ; r12
+    push    r13                                  ; r13
+    push    r14                                  ; r14
+    push    r15                                  ; r15
+    mov     rax, cr2
+    push    rax                                  ; cr2 (offset 0  -  rsp now = &frame)
 
-    ; the linux x86_64 syscall abi requires the kernel to preserve ALL
-    ; gp registers except rax (result), rcx and r11 (clobbered by the
-    ; syscall instruction itself).  musl keeps live values in r8/r10/etc
-    ; across a syscall (e.g. __stdout_write holds the FILE* in r8 across
-    ; its ioctl probe), so we must save+restore the arg registers too,
-    ; not just the sysv callee-saved set (satoru)
-    push    rdi
-    push    rsi
-    push    rdx
-    push    r8
-    push    r9
-    push    r10
-
-    ; Build the call: SyscallEntryX64Handler(nr, a0,a1,a2,a3,a4,a5)
-    ; SysV ABI passes: rdi, rsi, rdx, rcx, r8, r9 as first 6 args.
-    ; Linux x86_64 syscall ABI uses: rdi, rsi, rdx, r10, r8, r9 for args.
-    ; nr is in rax.
-    ;
-    ; Map: handler(arg1=nr, arg2=a0, arg3=a1, arg4=a2, arg5=a3, arg6=a4)
-    ; ... then we'd need to pass a5 on the stack. To keep things simple
-    ; we cap at 6 args (nr + 5).  The 6th syscall arg (r9) is rare in
-    ; early CPython startup; we can extend later by pushing on stack.
-    ;
-    ; Final arg map for the C handler (declared as
-    ;   int64_t SyscallEntryX64Handler(uint64_t nr,
-    ;                                  uint64_t a0, uint64_t a1,
-    ;                                  uint64_t a2, uint64_t a3,
-    ;                                  uint64_t a4, uint64_t a5);):
-    ;   rdi = nr   (rax)
-    ;   rsi = a0   (rdi)
-    ;   rdx = a1   (rsi)
-    ;   rcx = a2   (rdx)
-    ;   r8  = a3   (r10)
-    ;   r9  = a4   (r8)
-    ;   stack[0] = a5 (r9)
-
-    ; Save originals into temps before scribbling.
-    mov     r12, rdi          ; r12 = a0
-    mov     r13, rsi          ; r13 = a1
-    mov     r14, rdx          ; r14 = a2
-    mov     r15, r10          ; r15 = a3
-    mov     rbx, r8           ; rbx = a4
-    mov     rbp, r9           ; rbp = a5
-
-    ; Now load ABI args.
-    mov     rdi, rax          ; nr
-    mov     rsi, r12          ; a0
-    mov     rdx, r13          ; a1
-    mov     rcx, r14          ; a2
-    mov     r8,  r15          ; a3
-    mov     r9,  rbx          ; a4
-    push    rbp               ; a5 on stack
-    sub     rsp, 8            ; align (16-byte boundary before call)
-
+    ; hand &frame to the C handler. the kernel stack base is 16-aligned and the
+    ; frame is 184 bytes (≡8 mod 16), so one extra sub aligns the call site. (satoru)
+    mov     rdi, rsp
+    sub     rsp, 8
     cld
-    call    SyscallEntryX64Handler
+    call    SyscallEntryX64FrameHandler
+    add     rsp, 8                               ; rsp = &frame again
 
-    add     rsp, 16           ; pop a5 + alignment
-
-    ; restore the user arg registers (reverse push order) so r8/r10/etc
-    ; survive the syscall as the linux abi guarantees (satoru)
-    pop     r10
-    pop     r9
-    pop     r8
-    pop     rdx
-    pop     rsi
-    pop     rdi
-
-    ; Restore preserved regs.
+    ; restore every gp reg from the (possibly rewritten) frame, then IRETQ the
+    ; bottom five fields. cr2 is not restorable, so skip it. (satoru)
+    add     rsp, 8                               ; skip cr2
     pop     r15
     pop     r14
     pop     r13
     pop     r12
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
     pop     rbp
+    pop     rdi
+    pop     rsi
+    pop     rdx
+    pop     rcx
     pop     rbx
-
-    ; Restore user RIP and RFLAGS into rcx/r11 for sysretq.
-    mov     rcx, qword [rel g_user_syscall_rip_save]
-    mov     r11, qword [rel g_user_syscall_rflags_save]
-
-    ; Restore user RSP.
-    mov     rsp, qword [rel g_user_syscall_rsp_save]
-
-    ; rax already holds the return value from the C handler.
-    o64 sysret
+    pop     rax
+    add     rsp, 16                              ; skip vector + error_code → rsp = &frame.rip
+    iretq

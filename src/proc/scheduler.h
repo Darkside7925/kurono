@@ -67,6 +67,10 @@ struct UserMemoryRegion {
 
 constexpr uint32_t PROCESS_FLAG_NONE = 0;
 constexpr uint32_t PROCESS_FLAG_USER = 1 << 0;
+// task is a thread that shares its parent's address space (clone with
+// clone_vm|clone_thread). such a task must not free the shared address_space
+// or the shared user stack when it exits  -  only its own kernel stack. (satoru)
+constexpr uint32_t PROCESS_FLAG_THREAD = 1 << 1;
 
 struct Process {
     uint32_t pid;
@@ -103,6 +107,9 @@ struct Process {
     int exit_code;
     InterruptFrame user_frame;
     bool has_user_frame;
+    // clone child_cleartid: user va whose word is zeroed + futex-woken on thread
+    // exit (0 = unset). recorded so a joiner blocked in futex wakes up. (satoru)
+    uint64_t clear_child_tid;
     bool waiting_for_child;
     uint32_t waiting_child_pid;
     uint64_t waiting_status_ptr;
@@ -141,7 +148,15 @@ struct Process {
 
     Process* next;
 
+    // per-task fs base (tls) and x87/sse state, saved on switch-out and
+    // restored on switch-in so concurrent threads don't clobber each other's
+    // tls or vector registers. fpu_state is the 512-byte fxsave image and must
+    // stay 16-byte aligned. (satoru)
+    uint64_t fs_base;
+    alignas(16) uint8_t fpu_state[512];
+
     bool is_user() const { return (flags & PROCESS_FLAG_USER) != 0; }
+    bool is_thread() const { return (flags & PROCESS_FLAG_THREAD) != 0; }
 };
 
 struct SchedulerProcessSnapshot {
@@ -176,6 +191,14 @@ public:
     static Process* CreateProcess(const char* name, void (*entry_point)(), uint32_t priority);
     static Process* CreateUserProcess(const char* name, uint64_t entry_point, uint32_t priority);
     static Process* CloneUserProcess(Process* parent);
+    // create a thread that SHARES the parent's address space (same cr3)  -  used
+    // by clone(clone_vm|clone_thread). the thread gets its own kernel stack and
+    // runs on the caller-supplied user stack `child_stack`; its user frame is
+    // copied from the parent so it returns to the same clone() call-site with
+    // rax=0. tls_base, when set_tls is true, becomes the new thread's fs base.
+    // (satoru)
+    static Process* CreateUserThread(Process* parent, uint64_t child_stack,
+                                     uint64_t tls_base, bool set_tls);
     static void MarkProcessExited(Process* proc, int exit_code);
     static Process* WaitForChild(Process* parent, uint32_t child_pid, int* exit_code);
     static bool WaitForProcess(Process* proc, int* exit_code);

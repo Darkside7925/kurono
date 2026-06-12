@@ -912,6 +912,7 @@ namespace ShellBuiltins {
     int cmd_suspend(KuronoShell*, int, const char**, char*, int);
     int cmd_ffmpeg(KuronoShell*, int, const char**, char*, int);
     int cmd_wltest(KuronoShell*, int, const char**, char*, int);
+    int cmd_pthtest(KuronoShell*, int, const char**, char*, int);
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
 }
 
@@ -921,6 +922,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("denji",    "Open Denji video player",     ENV_KURONO, "media",   cmd_denji);
     RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
     RegisterCommand("wltest",   "Run the wl_shm wayland render test", ENV_AUTO, "media", cmd_wltest);
+    RegisterCommand("pthtest",  "Run the pthreads (clone+futex) smoke test", ENV_AUTO, "media", cmd_pthtest);
     RegisterCommand("playvideo","Play the imported video (ssstik)", ENV_AUTO, "media",  cmd_playvideo);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
     RegisterCommand("version",  "Show OS version",             ENV_KURONO, "builtin", cmd_version);
@@ -1759,6 +1761,33 @@ int cmd_wltest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
     if (p < 0) p = 0;
     out[p] = 0;
     p = sappend(out, p, mx, "\nwltest: exited (code ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, ")\n");
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// run the embedded pthreads smoke test  -  proves CLONE_THREAD + the futex-backed
+// mutex (serialisation) + pthread_join. a correct run prints "counter=200000
+// PASS". (satoru)
+int cmd_pthtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/usr/bin/pthread_test")) {
+        return sappend(out, 0, mx, "pthtest: /usr/bin/pthread_test not present in this build\n");
+    }
+    Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/pthread_test", "pthread_test");
+    if (!proc) {
+        return sappend(out, 0, mx, "pthtest: failed to load binary (out of memory?)\n");
+    }
+    const char* av[] = { "pthread_test", nullptr };
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    p = sappend(out, p, mx, "\npthtest: exited (code ");
     p = sappend_int(out, p, mx, rc);
     p = sappend(out, p, mx, ")\n");
     Scheduler::DestroyProcess(proc);

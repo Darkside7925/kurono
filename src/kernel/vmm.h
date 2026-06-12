@@ -77,6 +77,16 @@ public:
                                        uint64_t phys_base, uint64_t bytes,
                                        uint64_t flags);
 
+    // change the protection of an already-mapped 4kb page in place, keeping the
+    // same physical frame but rewriting its pte to PTE_PRESENT|new_flags.
+    // new_flags carries WRITABLE/USER/NX (and any pat/global bits). used by
+    // mprotect to flip a page between rw and rx for w^x jits. returns false if
+    // the page is not currently mapped (caller can skip it  -  demand-zero will
+    // map it on first touch with the updated region flags). does NOT flush the
+    // tlb; the caller must InvalidatePage when root is the active cr3. (satoru)
+    static bool ProtectPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
+                                          uint64_t new_flags);
+
     // unmap a single 4kb page. frees the physical frame if free_frame is true.
     static void UnmapPage(uint64_t virt_addr, bool free_frame = false);
     static void UnmapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,

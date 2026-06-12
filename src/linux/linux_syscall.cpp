@@ -10,6 +10,7 @@
 #include "../kernel/userspace.h"
 #include "../kernel/vmm.h"
 #include "../kernel/time.h"
+#include "../drivers/timer.h"
 #include "../drivers/serial.h"
 #include "../security/supr.h"
 #include "../net/unix_socket.h"
@@ -86,6 +87,165 @@ static uint8_t ext4_open_flags(uint32_t flags) {
     return 3;
 }
 
+// ---- epoll / eventfd / timerfd backing tables --------------------------
+// firefox's main loop is glib's epoll loop: it eventfd-wakes a worker thread,
+// arms timerfds for timeouts, and epoll_waits on wayland/pulse/dbus unix
+// sockets. these tables give those fds real state so epoll_wait/poll return
+// actual readiness instead of an empty set (the old dead loop). (satoru)
+
+// x86_64 epoll_event is packed: 4-byte events + 8-byte data = 12 bytes (satoru)
+struct LinuxEpollEvent {
+    uint32_t events;
+    uint64_t data;   // epoll_data_t (u64 / ptr / fd) opaque cookie (satoru)
+} __attribute__((packed));
+static_assert(sizeof(LinuxEpollEvent) == 12, "epoll_event must be 12 bytes packed");
+
+// epoll readiness bits we actually compute (satoru)
+static const uint32_t L_EPOLLIN  = 0x001;
+static const uint32_t L_EPOLLOUT = 0x004;
+static const uint32_t L_EPOLLERR = 0x008;
+static const uint32_t L_EPOLLHUP = 0x010;
+
+static const int EVENTFD_MAX = 64;
+struct EventfdState {
+    bool     used;
+    bool     semaphore;   // EFD_SEMAPHORE: read() decrements by 1 (satoru)
+    uint64_t counter;     // readable when > 0 (satoru)
+};
+static EventfdState g_eventfd[EVENTFD_MAX];
+
+static const int TIMERFD_MAX = 64;
+struct TimerfdState {
+    bool     used;
+    bool     armed;
+    uint64_t expiry_ms;     // absolute ms (Timer::GetRealMs timebase) (satoru)
+    uint64_t interval_ms;   // 0 = one-shot (satoru)
+    uint64_t expirations;   // accumulated, returned + cleared on read() (satoru)
+};
+static TimerfdState g_timerfd[TIMERFD_MAX];
+
+static const int EPOLL_MAX        = 32;   // epoll instances (satoru)
+static const int EPOLL_MAX_WATCH  = 64;   // fds watched per instance (satoru)
+struct EpollWatch {
+    bool     used;
+    int      fd;        // the watched linux fd number (satoru)
+    uint32_t events;    // interest mask from epoll_ctl (satoru)
+    uint64_t data;      // user cookie echoed back on epoll_wait (satoru)
+};
+struct EpollState {
+    bool       used;
+    EpollWatch watch[EPOLL_MAX_WATCH];
+};
+static EpollState g_epoll[EPOLL_MAX];
+
+static int eventfd_alloc() {
+    for (int i = 0; i < EVENTFD_MAX; i++)
+        if (!g_eventfd[i].used) {
+            g_eventfd[i].used = true;
+            g_eventfd[i].semaphore = false;
+            g_eventfd[i].counter = 0;
+            return i;
+        }
+    return -1;
+}
+
+static int timerfd_alloc() {
+    for (int i = 0; i < TIMERFD_MAX; i++)
+        if (!g_timerfd[i].used) {
+            g_timerfd[i].used = true;
+            g_timerfd[i].armed = false;
+            g_timerfd[i].expiry_ms = 0;
+            g_timerfd[i].interval_ms = 0;
+            g_timerfd[i].expirations = 0;
+            return i;
+        }
+    return -1;
+}
+
+static int epoll_alloc() {
+    for (int i = 0; i < EPOLL_MAX; i++)
+        if (!g_epoll[i].used) {
+            g_epoll[i].used = true;
+            for (int w = 0; w < EPOLL_MAX_WATCH; w++) g_epoll[i].watch[w].used = false;
+            return i;
+        }
+    return -1;
+}
+
+// roll a timerfd forward: count how many intervals have elapsed since the
+// stored expiry and re-arm if periodic. call before reading readiness. (satoru)
+static void timerfd_tick(int slot) {
+    if (slot < 0 || slot >= TIMERFD_MAX) return;
+    TimerfdState* t = &g_timerfd[slot];
+    if (!t->used || !t->armed) return;
+    uint64_t now = (uint64_t)Timer::GetRealMs();
+    if (now < t->expiry_ms) return;
+    if (t->interval_ms == 0) {
+        // one-shot: a single expiration, then disarm (satoru)
+        t->expirations += 1;
+        t->armed = false;
+        return;
+    }
+    // periodic: account every interval boundary we've crossed (satoru)
+    uint64_t elapsed = now - t->expiry_ms;
+    uint64_t n = elapsed / t->interval_ms + 1;
+    t->expirations += n;
+    t->expiry_ms += n * t->interval_ms;
+}
+
+// compute the ready event mask for one linux fd against an interest mask.
+// this is the single source of truth shared by epoll_wait and poll. (satoru)
+static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) {
+        // closed/invalid fd: report error so the loop drops it (satoru)
+        return L_EPOLLERR | (interest & (L_EPOLLERR | L_EPOLLHUP));
+    }
+    LinuxFd* lfd = &p->fds[fd];
+    uint32_t ready = 0;
+    switch (lfd->type) {
+        case LFD_SOCKET:
+            if (UnixSocket::PendingBytes(lfd->backend_fd) > 0) ready |= L_EPOLLIN;
+            ready |= L_EPOLLOUT;   // our unix sockets never block on write (satoru)
+            break;
+        case LFD_PIPE:
+            // pipes are socketpair-backed: same PendingBytes path (satoru)
+            if (UnixSocket::PendingBytes(lfd->backend_fd) > 0) ready |= L_EPOLLIN;
+            ready |= L_EPOLLOUT;
+            break;
+        case LFD_EVENTFD: {
+            int s = lfd->backend_fd;
+            if (s >= 0 && s < EVENTFD_MAX && g_eventfd[s].counter > 0) ready |= L_EPOLLIN;
+            ready |= L_EPOLLOUT;   // writable unless counter saturated (satoru)
+            break;
+        }
+        case LFD_TIMERFD: {
+            int s = lfd->backend_fd;
+            timerfd_tick(s);
+            if (s >= 0 && s < TIMERFD_MAX && g_timerfd[s].expirations > 0) ready |= L_EPOLLIN;
+            break;
+        }
+        case LFD_CONSOLE:
+            // stdin readable when injection buffer has data; stdout/stderr
+            // are always writable. caller passes interest to disambiguate. (satoru)
+            if (LinuxSyscall::StdinReadable()) ready |= L_EPOLLIN;
+            ready |= L_EPOLLOUT;
+            break;
+        case LFD_KVFS:
+        case LFD_EXT4:
+        case LFD_PROC:
+            // regular files are always ready for read and write (satoru)
+            ready |= L_EPOLLIN | L_EPOLLOUT;
+            break;
+        default:
+            // devnull / stubs: writable, never readable (satoru)
+            ready |= L_EPOLLOUT;
+            break;
+    }
+    // EPOLLHUP/EPOLLERR are always reported regardless of interest; otherwise
+    // mask to what the caller asked for (satoru)
+    return ready & (interest | L_EPOLLERR | L_EPOLLHUP);
+}
+
 static void clone_file_descriptors(const LinuxProcess* parent, LinuxProcess* child) {
     for (int fd = 0; fd < LINUX_MAX_FDS; fd++) {
         child->fds[fd].open = false;
@@ -130,6 +290,20 @@ static bool write_user_u32(Process* proc, uint64_t user_addr, uint32_t value) {
     if (!phys) return false;
 
     *(uint32_t*)(uintptr_t)phys = value;
+    return true;
+}
+
+// read a 32-bit word from a user address via the task's own address space so
+// the value is valid even if a different cr3 is active. used by futex to test
+// *uaddr == val without trusting the currently-loaded address space. (satoru)
+static bool read_user_u32(Process* proc, uint64_t user_addr, uint32_t* out) {
+    if (!proc || !proc->is_user() || !user_addr || !out) return false;
+    if ((user_addr & 0xFFFULL) > PAGE_SIZE - sizeof(uint32_t)) return false;
+
+    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, user_addr);
+    if (!phys) return false;
+
+    *out = *(const uint32_t*)(uintptr_t)phys;
     return true;
 }
 
@@ -544,6 +718,30 @@ static bool switch_to_ready_user(InterruptFrame* frame) {
     return true;
 }
 
+// timer-driven preemption (registered as the irq0 handler). when the 1 khz pit
+// tick interrupts ring-3 user code and another user task is ready, round-robin
+// to it: save the interrupted task's full state (regs + fs base + fpu) and load
+// the next; the irq's iretq then resumes that task. ring-3 frames only, so a
+// tick during a syscall (ring-0) or a kernel process is ignored, and a single-
+// threaded user program (no other ready task) is never switched. this is what
+// lets clone+futex threads actually time-share the cpu. (satoru)
+static uint32_t g_preempt_ticks = 0;
+static void kls_timer_preempt(InterruptFrame* frame) {
+    if (!frame || (frame->cs & 3) != 3) return;      // ring-3 user only
+    if (!Userspace::IsActive()) return;
+    Process* cur = Scheduler::GetCurrentProcess();
+    if (!cur || !cur->is_user()) return;
+
+    // ~4 ms timeslice so the fxsave/fxrstor + cr3 switch cost stays modest. (satoru)
+    if ((++g_preempt_ticks & 3u) != 0) return;
+
+    Scheduler::SaveUserFrame(cur, frame);            // capture live regs+fs+fpu
+    if (!Scheduler::ScheduleNextUser(frame)) return; // nothing else ready
+
+    int next_idx = find_process_index_by_task(Scheduler::GetCurrentProcess());
+    if (next_idx >= 0) LinuxSyscall::SetCurrent(next_idx);
+}
+
 static void wake_waiting_parent(LinuxProcess* child, int child_index) {
     if (!child || !child->task || !child->task->parent) return;
 
@@ -570,6 +768,79 @@ static void wake_waiting_parent(LinuxProcess* child, int child_index) {
     Scheduler::ReapProcess(child->task);
     child->task = nullptr;
     LinuxSyscall::DestroyProcess(child_index);
+}
+
+// ── real futex wait-queue ────────────────────────────────────────────────
+// a waiter is keyed by (address_space, uaddr): two distinct processes can map
+// the same virtual address yet must not cross-wake, and threads in one process
+// share an address space so they DO match. (satoru)
+constexpr int FUTEX_MAX_WAITERS = 64;
+struct FutexWaiter {
+    Process*  task;
+    uint64_t  addr_space;
+    uintptr_t uaddr;
+    uint32_t  bitset;
+    bool      active;
+};
+static FutexWaiter g_futex_waiters[FUTEX_MAX_WAITERS];
+
+// block the current task on (address_space, uaddr) and yield to another ready
+// user task by rewriting the int 0x80 trap frame (same mechanism as waitpid).
+// returns true if the task was enqueued AND successfully descheduled. (satoru)
+static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
+                                    uint32_t bitset) {
+    if (!task || !current_syscall_frame) return false;
+
+    int slot = -1;
+    for (int i = 0; i < FUTEX_MAX_WAITERS; i++) {
+        if (!g_futex_waiters[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return false;  // queue full  -  caller returns -EAGAIN (satoru)
+
+    g_futex_waiters[slot].task       = task;
+    g_futex_waiters[slot].addr_space = task->address_space;
+    g_futex_waiters[slot].uaddr      = uaddr;
+    g_futex_waiters[slot].bitset     = bitset ? bitset : 0xFFFFFFFFu;
+    g_futex_waiters[slot].active     = true;
+
+    task->state = Process_Blocked;
+    task->user_frame.rax = 0;
+
+    if (!switch_to_ready_user(current_syscall_frame)) {
+        // nothing else runnable  -  undo the block so we don't wedge the only
+        // user task off the run queue with no one left to wake it. (satoru)
+        g_futex_waiters[slot].active = false;
+        task->state = Process_Running;
+        return false;
+    }
+    return true;
+}
+
+// wake up to `max` waiters matching (address_space, uaddr) whose bitset
+// intersects `bitset`. each woken task is made ready and its futex syscall made
+// to return 0. returns the number woken. (satoru)
+static int futex_do_wake(uint64_t addr_space, uintptr_t uaddr, int max,
+                         uint32_t bitset) {
+    if (max <= 0) return 0;
+    uint32_t want = bitset ? bitset : 0xFFFFFFFFu;
+    int woken = 0;
+    for (int i = 0; i < FUTEX_MAX_WAITERS && woken < max; i++) {
+        FutexWaiter* w = &g_futex_waiters[i];
+        if (!w->active) continue;
+        if (w->addr_space != addr_space || w->uaddr != uaddr) continue;
+        if ((w->bitset & want) == 0) continue;
+
+        if (w->task) {
+            w->task->user_frame.rax = 0;   // futex() returns 0 to the waiter
+            if (w->task->state == Process_Blocked) {
+                w->task->state = Process_Ready;
+            }
+        }
+        w->active = false;
+        w->task   = nullptr;
+        woken++;
+    }
+    return woken;
 }
 }
 
@@ -660,6 +931,59 @@ static void LinuxInt80Entry(InterruptFrame* frame) {
     if (!current_frame_rewritten) {
         frame->rax = (uint64_t)(int64_t)result;
 
+        Process* current = Scheduler::GetCurrentProcess();
+        if (Userspace::IsActive() && current && current->is_user()) {
+            Scheduler::SaveUserFrame(current, frame);
+        }
+    }
+
+    current_syscall_frame = nullptr;
+
+    if (resume_userspace_session) {
+        Userspace::HandleProcessExit(resume_userspace_exit_code);
+    }
+
+    HAL::DisableInterrupts();
+}
+
+// the x86_64 syscall core lives in linux_syscall_x64.cpp (translates the amd64
+// nr and dispatches). we call it from the frame handler below  -  defined here in
+// the same TU as current_syscall_frame and the switch helpers so the SYSCALL
+// fast path can block/switch/exit threads exactly like int 0x80. (satoru)
+extern "C" int64_t SyscallEntryX64Handler(uint64_t nr, uint64_t a0, uint64_t a1,
+                                          uint64_t a2, uint64_t a3, uint64_t a4,
+                                          uint64_t a5);
+
+// x86_64 SYSCALL fast-path frame handler. the asm stub (src/hal/syscall_entry.asm)
+// builds a full InterruptFrame from the live registers and calls here; on return
+// it restores the (possibly rewritten) frame and IRETQs. this mirrors
+// LinuxInt80Entry field-for-field: save the caller's frame so clone snapshots a
+// fresh parent, dispatch, then either write the result back or  -  if a handler
+// rewrote the frame (futex block / thread exit / clone)  -  leave it for the stub
+// to IRETQ into the next task. (satoru)
+extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
+    if (!frame) return;
+
+    current_syscall_frame      = frame;
+    current_frame_rewritten    = false;
+    resume_userspace_session   = false;
+    resume_userspace_exit_code = 0;
+
+    Process* running = Scheduler::GetCurrentProcess();
+    if (Userspace::IsActive() && running && running->is_user()) {
+        Scheduler::SaveUserFrame(running, frame);
+    }
+
+    // amd64 syscall abi: nr in rax, args in rdi, rsi, rdx, r10, r8, r9. the
+    // frame captured r9 pristine (musl's clone child-fn), so clone no longer
+    // needs the g_user_syscall_*_save shim. (satoru)
+    int64_t result = SyscallEntryX64Handler(
+        frame->rax,
+        frame->rdi, frame->rsi, frame->rdx,
+        frame->r10, frame->r8,  frame->r9);
+
+    if (!current_frame_rewritten) {
+        frame->rax = (uint64_t)(int64_t)result;
         Process* current = Scheduler::GetCurrentProcess();
         if (Userspace::IsActive() && current && current->is_user()) {
             Scheduler::SaveUserFrame(current, frame);
@@ -835,6 +1159,13 @@ int LinuxSyscall::GetCurrentIndex() {
 
 void LinuxSyscall::SetCurrent(int pid_idx) {
     current_proc = pid_idx;
+}
+
+// registered once at boot; turns on round-robin preemption of user threads. the
+// static kls_timer_preempt handler lives earlier in this TU (internal linkage,
+// still visible here). (satoru)
+void LinuxSyscall::EnableTimerPreemption() {
+    HAL::RegisterIRQHandler(0, kls_timer_preempt);
 }
 
 int LinuxSyscall::ActiveProcessCount() {
@@ -1026,10 +1357,12 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_SET_THREAD_AREA: return sys_set_thread_area(ebx);
         case LSYS_EXIT_GROUP:  return sys_exit_group(ebx);
 
+        // mprotect: real  -  flip page-table perms so w^x jits (rw->rx) work (satoru)
+        case LSYS_MPROTECT:    return sys_mprotect(ebx, ecx, (uint32_t)edx);
+
         // stubs that return success
         case LSYS_SIGNAL:
         case LSYS_SIGACTION:
-        case LSYS_MPROTECT:
         case LSYS_SYNC:
             return 0;
 
@@ -1086,9 +1419,25 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return -3;
         }
 
-        // thread / process metadata (single-thread model: tid == pid)
-        case LSYS_GETTID:           return sys_getpid();
-        case LSYS_SET_TID_ADDRESS:  return sys_getpid();
+        // thread / process metadata. the per-thread id is the scheduler pid of
+        // the currently running task (distinct for each clone-thread); only the
+        // thread-group leader has tid == pid. (satoru)
+        case LSYS_GETTID: {
+            Process* t = Scheduler::GetCurrentProcess();
+            if (t && t->is_user()) return (int32_t)t->pid;
+            return sys_getpid();
+        }
+        // set_tid_address(tidptr): record the clear-on-exit tid pointer for the
+        // current task and return its tid (glibc nptl uses this on the main
+        // thread). (satoru)
+        case LSYS_SET_TID_ADDRESS: {
+            Process* t = Scheduler::GetCurrentProcess();
+            if (t && t->is_user()) {
+                t->clear_child_tid = ebx;
+                return (int32_t)t->pid;
+            }
+            return sys_getpid();
+        }
         case LSYS_TGKILL: {
             // tgkill(tgid, tid, sig)  -  we map to plain kill(tid, sig)
             int tid = (int)ecx; int sig = (int)edx;
@@ -1311,40 +1660,136 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             }
         }
 
-        // Futex: single-threaded model  -  WAIT returns 0 immediately if value
-        //        already changed, WAKE always wakes 0 waiters.
+        // Real futex. WAIT enqueues the calling task on (address_space, uaddr)
+        // and blocks (deschedules to another ready user task) when *uaddr still
+        // equals val; WAKE moves up to `val` matching waiters back to runnable.
+        // FUTEX_PRIVATE_FLAG (0x80) and FUTEX_CLOCK_REALTIME (0x100) are stripped
+        // when matching the op. the bitset (val3) isn't plumbed through this
+        // 5-arg dispatch, so the *_bitset ops are treated as match-any (what
+        // glibc/musl pass for condvars). the timeout arg is infinite for now. (satoru)
         case LSYS_FUTEX: {
-            uint32_t op = ecx & 0x7F;  // strip private/realtime bits
-            uint32_t* uaddr = (uint32_t*)(uintptr_t)ebx;
-            uint32_t val = edx;
+            const uint32_t FUTEX_PRIVATE   = 0x80;
+            const uint32_t FUTEX_CLOCK_RT  = 0x100;
+            uint32_t op    = ecx & ~(FUTEX_PRIVATE | FUTEX_CLOCK_RT);
+            uint64_t uaddr = ebx;
+            uint32_t val   = (uint32_t)edx;
+
+            Process* task = Scheduler::GetCurrentProcess();
+            if (!task || !task->is_user()) return -22;  // -EINVAL
+
             switch (op) {
-                case 0: /* FUTEX_WAIT */
-                    if (uaddr && *uaddr == val) return 0;
-                    return -11;  // EAGAIN  -  value changed
-                case 1: /* FUTEX_WAKE */
+                case 0:   /* FUTEX_WAIT */
+                case 9: { /* FUTEX_WAIT_BITSET (match-any) */
+                    uint32_t cur = 0;
+                    if (!read_user_u32(task, uaddr, &cur)) return -14;  // -EFAULT
+                    if (cur != val) return -11;  // -EAGAIN  -  value already changed
+
+                    // preferred path: enqueue + deschedule by rewriting the trap
+                    // frame (works exactly like sys_waitpid). both the int 0x80 and
+                    // the x86_64 SYSCALL paths set current_syscall_frame now, so on
+                    // success the frame is rewritten and our return value is
+                    // ignored. (satoru)
+                    if (futex_enqueue_and_block(task, (uintptr_t)uaddr, 0xFFFFFFFFu)) {
+                        return 0;
+                    }
+
+                    // fallback: enqueue failed because no other user task is
+                    // runnable (every sibling is blocked) or the wait queue is
+                    // full. we can't deschedule the last runnable task or userspace
+                    // would wedge, so return a spurious wake; the caller re-tests
+                    // *uaddr in ring-3 where the timer (irq0) can preempt it once a
+                    // sibling becomes ready. (satoru)
                     return 0;
-                case 9: /* FUTEX_WAIT_BITSET */
-                    if (uaddr && *uaddr == val) return 0;
-                    return -11;
-                case 10: /* FUTEX_WAKE_BITSET */
-                    return 0;
+                }
+                case 1:    /* FUTEX_WAKE */
+                case 10: { /* FUTEX_WAKE_BITSET (match-any) */
+                    int max = (int)val;
+                    if (max < 0) max = 0x7FFFFFFF;
+                    return futex_do_wake(task->address_space, (uintptr_t)uaddr,
+                                         max, 0xFFFFFFFFu);
+                }
                 default:
+                    // FUTEX_REQUEUE/CMP_REQUEUE/WAKE_OP/PI variants: accept and
+                    // no-op so callers don't see -ENOSYS mid-lock. (satoru)
                     return 0;
             }
         }
 
-        // clone / fork emulation: we don't yet support real threads or COW
-        // forking, so for now this returns -ENOSYS for the heavy flags but
-        // succeeds for plain fork()-equivalent calls (CLONE_CHILD_CLEARTID etc).
+        // clone(). CLONE_THREAD (as glibc/musl pthread_create issues it) creates
+        // a REAL kernel thread sharing the caller's address space; everything
+        // else stays fork-like. x86_64 arg order: flags,stack,ptid,ctid,tls. (satoru)
         case LSYS_CLONE: {
-            uint32_t flags = ebx;
-            const uint32_t CLONE_THREAD = 0x00010000;
-            if (flags & CLONE_THREAD) return -38;
-            // Plain fork: create a sibling process with the same name
-            LinuxProcess* p = Current();
-            int idx = CreateProcess(p ? p->name : "child", p ? p->uid : 0, p ? p->gid : 0);
-            if (idx < 0) return -11;
-            return (int32_t)procs[idx].pid;
+            uint32_t  flags       = (uint32_t)ebx;
+            uint64_t  child_stack = ecx;
+            uint64_t  ptid        = edx;   // CLONE_PARENT_SETTID target
+            uint64_t  ctid        = esi;   // CLONE_CHILD_*TID target (x86_64)
+            uint64_t  tls         = edi;   // CLONE_SETTLS new fs base (x86_64)
+
+            const uint32_t F_VM            = 0x00000100;
+            const uint32_t F_THREAD        = 0x00010000;
+            const uint32_t F_SETTLS        = 0x00080000;
+            const uint32_t F_PARENT_SETTID = 0x00100000;
+            const uint32_t F_CHILD_CLEARTID= 0x00200000;
+            const uint32_t F_CHILD_SETTID  = 0x01000000;
+
+            // not a thread (no shared VM) → keep the existing fork-like path. (satoru)
+            if (!(flags & (F_THREAD | F_VM)) || !child_stack) {
+                LinuxProcess* p = Current();
+                int idx = CreateProcess(p ? p->name : "child", p ? p->uid : 0, p ? p->gid : 0);
+                if (idx < 0) return -11;
+                return (int32_t)procs[idx].pid;
+            }
+
+            LinuxProcess* parent       = Current();
+            Process*      parent_task  = Scheduler::GetCurrentProcess();
+            if (!parent || !parent_task || !parent_task->is_user()) return -22;
+
+            // spawn the schedulable thread task that shares parent_task's cr3. (satoru)
+            Process* thread_task = Scheduler::CreateUserThread(
+                parent_task, child_stack, tls, (flags & F_SETTLS) != 0);
+            if (!thread_task) return -11;  // -EAGAIN (out of task slots)
+
+            // both the int 0x80 and x86_64 SYSCALL paths now build a full
+            // InterruptFrame and set current_syscall_frame before dispatch, so the
+            // parent's user_frame was freshly saved and CreateUserThread copied a
+            // correct post-clone rip/rflags with musl's child start fn live in r9.
+            // no frame fixup needed. (satoru)
+
+            // every schedulable user task needs a LinuxProcess whose ->task
+            // points back at it. give the thread its own context copying the
+            // parent's fds/cwd/brk. (satoru)
+            int tidx = CreateProcess(parent->name, parent->uid, parent->gid);
+            if (tidx < 0) {
+                Scheduler::DestroyProcess(thread_task);
+                return -11;
+            }
+            LinuxProcess* tproc = &procs[tidx];
+            tproc->ppid        = parent->pid;
+            tproc->euid        = parent->euid;
+            tproc->egid        = parent->egid;
+            tproc->brk_base    = parent->brk_base;
+            tproc->brk_current = parent->brk_current;
+            tproc->brk_max     = parent->brk_max;
+            tproc->exit_code   = -1;
+            tproc->exited      = false;
+            tproc->task        = thread_task;
+            tproc->signal_mask = parent->signal_mask;
+            ls_scpy(tproc->cwd,  parent->cwd,  sizeof(tproc->cwd));
+            ls_scpy(tproc->name, parent->name, sizeof(tproc->name));
+            clone_file_descriptors(parent, tproc);
+
+            int32_t tid = (int32_t)thread_task->pid;
+
+            // CLONE_PARENT_SETTID / CHILD_SETTID: publish the tid through the
+            // shared address space (visible to parent and child). (satoru)
+            if (flags & F_PARENT_SETTID) write_user_u32(parent_task, ptid, (uint32_t)tid);
+            if (flags & F_CHILD_SETTID)  write_user_u32(parent_task, ctid, (uint32_t)tid);
+
+            // CLONE_CHILD_CLEARTID: remember ctid so thread exit zeroes it and
+            // futex-wakes any joiner (pthread_join waits on exactly this). (satoru)
+            if (flags & F_CHILD_CLEARTID) thread_task->clear_child_tid = ctid;
+
+            return tid;  // parent sees the child tid; the child returns 0 (frame)
         }
 
         // Posix realtime signal stubs  -  accept both i386 numbering (174..)
@@ -1361,21 +1806,146 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
 
         // poll / select / ppoll / pselect6: return readiness count of 0 (no I/O).
         // For polled-stdin reads, the existing read() handler does its own
-        // blocking wait via console buffering, so 0 here is safe and correct
-        // for short timeouts.
+        // blocking wait via console buffering, so a short cooperative spin is
+        // enough; we then report real per-fd readiness. (satoru)
+        // poll/ppoll: struct pollfd { int fd; short events; short revents; }
+        // is 8 bytes each on x86_64. we walk the user array, compute revents
+        // from the same fd_readiness() logic epoll uses, and return the count
+        // of fds with nonzero revents. ppoll's extra timespec/sigmask args are
+        // ignored beyond using the timeout as a bounded spin. (satoru)
         case LSYS_POLL:
-        case LSYS_PPOLL:
+        case LSYS_PPOLL: {
+            LinuxProcess* p = Current();
+            struct LinuxPollfd { int fd; int16_t events; int16_t revents; } __attribute__((packed));
+            LinuxPollfd* fds = (LinuxPollfd*)(uintptr_t)ebx;
+            uint64_t nfds = ecx;
+            if (!p || !fds || nfds == 0 || nfds > 1024) return 0;
+            // timeout handling: poll() passes ms in edx; ppoll() passes a
+            // timespec pointer (also in edx). a 0-ms poll / null ppoll-timespec
+            // wants a single pass; anything else gets a bounded cooperative
+            // spin. good enough for the cooperative scheduler  -  there is no true
+            // blocking here. (satoru)
+            int spins = edx ? 64 : 0;
+            int ready_total = 0;
+            for (int s = 0; ; s++) {
+                ready_total = 0;
+                for (uint64_t i = 0; i < nfds; i++) {
+                    int16_t want = fds[i].events;
+                    fds[i].revents = 0;
+                    if (fds[i].fd < 0) continue;   // negative fd ignored (satoru)
+                    // poll bits match epoll bits for IN/OUT/ERR/HUP (satoru)
+                    uint32_t interest = (uint32_t)(uint16_t)want | L_EPOLLERR | L_EPOLLHUP;
+                    uint32_t r = fd_readiness(p, fds[i].fd, interest);
+                    if (r) { fds[i].revents = (int16_t)(uint16_t)r; ready_total++; }
+                }
+                if (ready_total > 0 || s >= spins) break;
+                KuronoShell::PumpUI();   // bounded cooperative wait (satoru)
+            }
+            return ready_total;
+        }
+        // select/pselect6: translate the three fd_sets into the same readiness
+        // logic. fd_set is a bitmap of LINUX_MAX_FDS bits; we honour read/write
+        // sets and clear bits that aren't ready. exceptfds is left untouched
+        // (we never report exceptional conditions). nfds bounds the scan. (satoru)
         case LSYS_SELECT:
-        case LSYS_PSELECT6:
-            return 0;
+        case LSYS_PSELECT6: {
+            LinuxProcess* p = Current();
+            int maxfd = (int)ebx;
+            uint64_t* rset = (uint64_t*)(uintptr_t)ecx;
+            uint64_t* wset = (uint64_t*)(uintptr_t)edx;
+            if (!p || maxfd <= 0) return 0;
+            if (maxfd > LINUX_MAX_FDS) maxfd = LINUX_MAX_FDS;
+            int spins = 64;
+            int ready_total = 0;
+            for (int s = 0; ; s++) {
+                ready_total = 0;
+                for (int fd = 0; fd < maxfd; fd++) {
+                    uint64_t bit = 1ULL << (fd & 63);
+                    int word = fd >> 6;
+                    bool want_r = rset && (rset[word] & bit);
+                    bool want_w = wset && (wset[word] & bit);
+                    if (!want_r && !want_w) continue;
+                    uint32_t interest = (want_r ? L_EPOLLIN : 0) |
+                                        (want_w ? L_EPOLLOUT : 0);
+                    uint32_t r = fd_readiness(p, fd, interest);
+                    if (want_r && !(r & L_EPOLLIN)) rset[word] &= ~bit;
+                    else if (want_r) ready_total++;
+                    if (want_w && !(r & L_EPOLLOUT)) wset[word] &= ~bit;
+                    else if (want_w) ready_total++;
+                }
+                if (ready_total > 0 || s >= spins) break;
+                KuronoShell::PumpUI();
+            }
+            return ready_total;
+        }
 
-        // epoll, eventfd, signalfd, timerfd, inotify  -  return real but unused fds.
-        // These are accepted so that programs initialising async I/O don't crash;
-        // events never fire (the dispatch returns 0 from poll/wait below).
-        case LSYS_EPOLL_CREATE1:
-        case LSYS_EVENTFD2:
-        case LSYS_SIGNALFD4:
-        case LSYS_TIMERFD_CREATE:
+        // epoll_create1: allocate a real epoll instance with its own watch
+        // table so epoll_ctl/epoll_wait can track interest and compute
+        // readiness. backend_fd = epoll table slot. (satoru)
+        case LSYS_EPOLL_CREATE1: {
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            int slot = epoll_alloc();
+            if (slot < 0) return -24;
+            int fd = AllocFd(p);
+            if (fd < 0) { g_epoll[slot].used = false; return -24; }
+            memset(&p->fds[fd], 0, sizeof(LinuxFd));
+            p->fds[fd].type = LFD_EPOLL;
+            p->fds[fd].backend_fd = slot;
+            p->fds[fd].open = true;
+            return fd;
+        }
+        // eventfd2: a real 64-bit counter. ebx = initial value, ecx = flags
+        // (EFD_SEMAPHORE = 1). write() adds, read() drains (or -1 in semaphore
+        // mode); readable when counter > 0. (satoru)
+        case LSYS_EVENTFD2: {
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            int slot = eventfd_alloc();
+            if (slot < 0) return -24;
+            int fd = AllocFd(p);
+            if (fd < 0) { g_eventfd[slot].used = false; return -24; }
+            const uint32_t EFD_SEMAPHORE = 1;
+            g_eventfd[slot].counter = (uint64_t)ebx;
+            g_eventfd[slot].semaphore = (ecx & EFD_SEMAPHORE) != 0;
+            memset(&p->fds[fd], 0, sizeof(LinuxFd));
+            p->fds[fd].type = LFD_EVENTFD;
+            p->fds[fd].backend_fd = slot;
+            p->fds[fd].flags = ecx;
+            p->fds[fd].open = true;
+            return fd;
+        }
+        // timerfd_create: ebx = clockid (ignored  -  single monotonic base),
+        // ecx = flags. armed later by timerfd_settime; readable once expired.
+        // backend_fd = timerfd table slot. (satoru)
+        case LSYS_TIMERFD_CREATE: {
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            int slot = timerfd_alloc();
+            if (slot < 0) return -24;
+            int fd = AllocFd(p);
+            if (fd < 0) { g_timerfd[slot].used = false; return -24; }
+            memset(&p->fds[fd], 0, sizeof(LinuxFd));
+            p->fds[fd].type = LFD_TIMERFD;
+            p->fds[fd].backend_fd = slot;
+            p->fds[fd].flags = ecx;
+            p->fds[fd].open = true;
+            return fd;
+        }
+        // signalfd4: harmless stub  -  we have no real signal delivery, so the
+        // fd never becomes readable. accepted so setup code doesn't crash. (satoru)
+        case LSYS_SIGNALFD4: {
+            LinuxProcess* p = Current();
+            if (!p) return -1;
+            int fd = AllocFd(p);
+            if (fd < 0) return -24;
+            memset(&p->fds[fd], 0, sizeof(LinuxFd));
+            p->fds[fd].type = LFD_SIGNALFD;   // never reports EPOLLIN (satoru)
+            p->fds[fd].open = true;
+            return fd;
+        }
+        // inotify_init1  -  a real but inert fd (no events fire). memfd is handled
+        // separately below with real shm backing. (satoru)
         case LSYS_INOTIFY_INIT1: {
             LinuxProcess* p = Current();
             if (!p) return -1;
@@ -1402,10 +1972,148 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             p->fds[fd].open = true;
             return fd;
         }
-        case LSYS_EPOLL_CTL:
-        case LSYS_EPOLL_WAIT:
-        case LSYS_TIMERFD_SETTIME:
-        case LSYS_TIMERFD_GETTIME:
+        // epoll_ctl(epfd, op, fd, event): op 1=ADD 2=DEL 3=MOD. Records the
+        // {fd, interest, user-data} tuple in the epoll instance's watch table
+        // so epoll_wait can scan it. (satoru)
+        case LSYS_EPOLL_CTL: {
+            LinuxProcess* p = Current();
+            int epfd = (int)ebx; int op = (int)ecx; int tfd = (int)edx;
+            LinuxEpollEvent* ev = (LinuxEpollEvent*)(uintptr_t)esi;
+            if (!p || epfd < 0 || epfd >= LINUX_MAX_FDS || !p->fds[epfd].open) return -9;
+            if (p->fds[epfd].type != LFD_EPOLL) return -22;  // einval (satoru)
+            int slot = p->fds[epfd].backend_fd;
+            if (slot < 0 || slot >= EPOLL_MAX || !g_epoll[slot].used) return -22;
+            EpollState* es = &g_epoll[slot];
+            const int EPOLL_CTL_ADD = 1, EPOLL_CTL_DEL = 2, EPOLL_CTL_MOD = 3;
+            // find an existing watch for this fd (satoru)
+            int found = -1;
+            for (int w = 0; w < EPOLL_MAX_WATCH; w++)
+                if (es->watch[w].used && es->watch[w].fd == tfd) { found = w; break; }
+            if (op == EPOLL_CTL_DEL) {
+                if (found < 0) return -2;   // enoent (satoru)
+                es->watch[found].used = false;
+                return 0;
+            }
+            if (op == EPOLL_CTL_MOD) {
+                if (found < 0) return -2;
+                if (!ev) return -14;        // efault (satoru)
+                es->watch[found].events = ev->events;
+                es->watch[found].data   = ev->data;
+                return 0;
+            }
+            if (op == EPOLL_CTL_ADD) {
+                if (found >= 0) return -17; // eexist (satoru)
+                if (!ev) return -14;
+                for (int w = 0; w < EPOLL_MAX_WATCH; w++) {
+                    if (!es->watch[w].used) {
+                        es->watch[w].used   = true;
+                        es->watch[w].fd     = tfd;
+                        es->watch[w].events = ev->events;
+                        es->watch[w].data   = ev->data;
+                        return 0;
+                    }
+                }
+                return -28;   // enospc  -  watch table full (satoru)
+            }
+            return -22;
+        }
+        // epoll_wait(epfd, events, maxevents, timeout): scan the watch table,
+        // compute readiness per fd, fill the user epoll_event array, return the
+        // count. if nothing ready and timeout != 0, do a bounded cooperative
+        // spin (PumpUI) re-scanning each pass, then return what we have (which
+        // may be 0). this is NOT a true blocking wait  -  it spins a fixed number
+        // of iterations so the cooperative scheduler keeps making progress
+        // rather than parking the caller. (satoru)
+        case LSYS_EPOLL_WAIT: {
+            LinuxProcess* p = Current();
+            int epfd = (int)ebx;
+            LinuxEpollEvent* out = (LinuxEpollEvent*)(uintptr_t)ecx;
+            int maxevents = (int)edx;
+            int timeout = (int)esi;   // ms; -1 = infinite, 0 = nonblocking
+            if (!p || epfd < 0 || epfd >= LINUX_MAX_FDS || !p->fds[epfd].open) return -9;
+            if (p->fds[epfd].type != LFD_EPOLL || !out || maxevents <= 0) return -22;
+            int slot = p->fds[epfd].backend_fd;
+            if (slot < 0 || slot >= EPOLL_MAX || !g_epoll[slot].used) return -22;
+            EpollState* es = &g_epoll[slot];
+            // bound the spin: 0 => single pass; otherwise a fixed budget so an
+            // infinite (-1) timeout still returns to the cooperative loop. (satoru)
+            int spins = (timeout == 0) ? 0 : 128;
+            int n = 0;
+            for (int s = 0; ; s++) {
+                n = 0;
+                for (int w = 0; w < EPOLL_MAX_WATCH && n < maxevents; w++) {
+                    if (!es->watch[w].used) continue;
+                    uint32_t interest = es->watch[w].events | L_EPOLLERR | L_EPOLLHUP;
+                    uint32_t r = fd_readiness(p, es->watch[w].fd, interest);
+                    if (r) {
+                        out[n].events = r;
+                        out[n].data   = es->watch[w].data;
+                        n++;
+                    }
+                }
+                if (n > 0 || s >= spins) break;
+                KuronoShell::PumpUI();   // let kernel servers push socket data (satoru)
+            }
+            return n;
+        }
+        // timerfd_settime(fd, flags, new_value, old_value): arm/disarm. The
+        // itimerspec is two timespecs { it_interval, it_value }, each
+        // { time_t tv_sec; long tv_nsec } = 16 bytes on x86_64, so new_value is
+        // 32 bytes. flags bit0 = TFD_TIMER_ABSTIME. it_value == 0 disarms.
+        // (satoru)
+        case LSYS_TIMERFD_SETTIME: {
+            LinuxProcess* p = Current();
+            int fd = (int)ebx; int flags = (int)ecx;
+            const uint64_t* nv = (const uint64_t*)(uintptr_t)edx;  // itimerspec (satoru)
+            uint64_t* ov = (uint64_t*)(uintptr_t)esi;
+            if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
+            if (p->fds[fd].type != LFD_TIMERFD) return -22;
+            int slot = p->fds[fd].backend_fd;
+            if (slot < 0 || slot >= TIMERFD_MAX || !g_timerfd[slot].used) return -22;
+            TimerfdState* t = &g_timerfd[slot];
+            // report the old setting if the caller asked (best-effort) (satoru)
+            if (ov) {
+                uint64_t now = (uint64_t)Timer::GetRealMs();
+                uint64_t remain = (t->armed && t->expiry_ms > now) ? (t->expiry_ms - now) : 0;
+                ov[0] = t->interval_ms / 1000;            // it_interval.tv_sec
+                ov[1] = (t->interval_ms % 1000) * 1000000ULL;
+                ov[2] = remain / 1000;                    // it_value.tv_sec
+                ov[3] = (remain % 1000) * 1000000ULL;
+            }
+            if (!nv) return -14;
+            uint64_t interval_ms = nv[0] * 1000ULL + nv[1] / 1000000ULL;  // it_interval
+            uint64_t value_ms    = nv[2] * 1000ULL + nv[3] / 1000000ULL;  // it_value
+            const int TFD_TIMER_ABSTIME = 1;
+            uint64_t now = (uint64_t)Timer::GetRealMs();
+            t->interval_ms = interval_ms;
+            t->expirations = 0;
+            if (nv[2] == 0 && nv[3] == 0) {
+                t->armed = false;          // it_value == 0 disarms (satoru)
+            } else {
+                t->armed = true;
+                t->expiry_ms = (flags & TFD_TIMER_ABSTIME) ? value_ms : (now + value_ms);
+            }
+            return 0;
+        }
+        // timerfd_gettime(fd, curr_value): report remaining time + interval.
+        // (satoru)
+        case LSYS_TIMERFD_GETTIME: {
+            LinuxProcess* p = Current();
+            int fd = (int)ebx;
+            uint64_t* cv = (uint64_t*)(uintptr_t)ecx;
+            if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
+            if (p->fds[fd].type != LFD_TIMERFD || !cv) return -22;
+            int slot = p->fds[fd].backend_fd;
+            if (slot < 0 || slot >= TIMERFD_MAX || !g_timerfd[slot].used) return -22;
+            TimerfdState* t = &g_timerfd[slot];
+            uint64_t now = (uint64_t)Timer::GetRealMs();
+            uint64_t remain = (t->armed && t->expiry_ms > now) ? (t->expiry_ms - now) : 0;
+            cv[0] = t->interval_ms / 1000;
+            cv[1] = (t->interval_ms % 1000) * 1000000ULL;
+            cv[2] = remain / 1000;
+            cv[3] = (remain % 1000) * 1000000ULL;
+            return 0;
+        }
         case LSYS_INOTIFY_ADD_WATCH:
         case LSYS_INOTIFY_RM_WATCH:
             return 0;
@@ -1874,8 +2582,8 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return UnixSocket::SendMsg(lp->fds[fd].backend_fd,
                                        s_sendmsg_buf, total, 0, &cm);
         }
-        case LSYS_RECVFROM:
-        case LSYS_RECVMSG: {
+        case LSYS_RECVFROM: {
+            // raw recv: ecx is a plain buffer, no msghdr/cmsg parsing. (satoru)
             int fd = (int)ebx;
             void* buf = (void*)(uintptr_t)ecx;
             int len = (int)edx;
@@ -1884,6 +2592,107 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 lp->fds[fd].type != LFD_SOCKET) return -9;
             return UnixSocket::Recv(lp->fds[fd].backend_fd, buf, len, 0);
         }
+        case LSYS_RECVMSG: {
+            // recvmsg(fd, struct msghdr*, flags): the symmetric inverse of the
+            // sendmsg path. parse the iov, recv into scratch with a ControlMsg
+            // out-param, scatter the bytes back into the user iov, then for any
+            // SCM_RIGHTS fds the sender passed install NEW fds in this process
+            // and write a proper SCM_RIGHTS cmsg into msg_control. (satoru)
+            int fd = (int)ebx;
+            uint8_t* m = (uint8_t*)(uintptr_t)ecx;              // struct msghdr*
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;
+            if (!m) return -14;
+            uint8_t* iov     = *(uint8_t* const*)(m + 16);      // msg_iov
+            uint64_t iovlen  = *(const uint64_t*)(m + 24);      // msg_iovlen
+            uint8_t* ctl     = *(uint8_t* const*)(m + 32);      // msg_control
+            uint64_t ctllen  = *(const uint64_t*)(m + 40);      // msg_controllen
+
+            // total room the caller offered across all iov segments  -  bound to
+            // scratch so a cooperative single-cpu copy stays safe. (satoru)
+            static uint8_t s_recvmsg_buf[8192];
+            uint64_t want = 0;
+            for (uint64_t i = 0; iov && i < iovlen; i++)
+                want += *(const uint64_t*)(iov + i * 16 + 8);
+            if (want > sizeof(s_recvmsg_buf)) want = sizeof(s_recvmsg_buf);
+
+            UnixSocket::ControlMsg cm = {};
+            int got = UnixSocket::Recv(lp->fds[fd].backend_fd,
+                                       s_recvmsg_buf, (int)want, 0, &cm);
+            if (got < 0) return got;
+
+            // scatter received bytes back into the user iov segments. (satoru)
+            int copied = 0;
+            for (uint64_t i = 0; iov && i < iovlen && copied < got; i++) {
+                uint8_t* ibase = *(uint8_t* const*)(iov + i * 16);
+                uint64_t ilen  = *(const uint64_t*)(iov + i * 16 + 8);
+                for (uint64_t k = 0; ibase && k < ilen && copied < got; k++)
+                    ibase[k] = s_recvmsg_buf[copied++];
+            }
+
+            // clear msg_flags (offset +48) before reporting any condition. (satoru)
+            uint32_t* mflags = (uint32_t*)(m + 48);
+            *mflags = 0;
+
+            // install received SCM_RIGHTS fds + write the cmsg back. for a passed
+            // memfd the sender resolved its shm backing into the ControlMsg, so we
+            // re-create a real shm fd that maps the SAME pages; otherwise install a
+            // closeable placeholder (full cross-process aliasing of pipes/sockets
+            // is a follow-up). (satoru)
+            if (cm.passed_fd_count > 0) {
+                int n = cm.passed_fd_count;
+                if (n > UnixSocket::UNIX_MAX_PASSED_FD)
+                    n = UnixSocket::UNIX_MAX_PASSED_FD;
+                uint64_t need = 16 + (uint64_t)4 * n;   // CMSG_LEN(sizeof(int)*n)
+                if (!ctl || ctllen < need) {
+                    *mflags |= 0x8;                      // MSG_CTRUNC
+                    *(uint64_t*)(m + 40) = 0;            // msg_controllen = 0
+                } else {
+                    int newfds[UnixSocket::UNIX_MAX_PASSED_FD];
+                    int ninst = 0;
+                    for (int k = 0; k < n; k++) {
+                        int nf = AllocFd(lp);
+                        if (nf < 0) break;               // fd table full; stop
+                        memset(&lp->fds[nf], 0, sizeof(LinuxFd));
+                        if (cm.passed_shm_base[k]) {
+                            // re-wrap the shared backing as a real memfd. (satoru)
+                            int slot = shm_alloc_slot();
+                            if (slot >= 0) {
+                                g_linux_shm[slot].base = (uint8_t*)(uintptr_t)cm.passed_shm_base[k];
+                                g_linux_shm[slot].size = cm.passed_shm_size[k];
+                                lp->fds[nf].type = LFD_MEMFD;
+                                lp->fds[nf].backend_fd = slot;
+                            } else {
+                                lp->fds[nf].type = LFD_DEVNULL;
+                            }
+                        } else {
+                            // no resolved backing: closeable placeholder. (satoru)
+                            lp->fds[nf].type = LFD_DEVNULL;
+                        }
+                        lp->fds[nf].open = true;
+                        newfds[ninst++] = nf;
+                    }
+                    if (ninst == 0) {
+                        *mflags |= 0x8;                  // MSG_CTRUNC
+                        *(uint64_t*)(m + 40) = 0;
+                    } else {
+                        uint64_t clen = 16 + (uint64_t)4 * ninst;
+                        *(uint64_t*)(ctl + 0)  = clen;   // cmsg_len
+                        *(int*)(ctl + 8)       = 1;      // cmsg_level SOL_SOCKET
+                        *(int*)(ctl + 12)      = 1;      // cmsg_type  SCM_RIGHTS
+                        int* outfds = (int*)(ctl + 16);
+                        for (int k = 0; k < ninst; k++) outfds[k] = newfds[k];
+                        *(uint64_t*)(m + 40) = clen;     // msg_controllen written
+                        if (ninst < cm.passed_fd_count) *mflags |= 0x8;
+                    }
+                }
+            } else {
+                // nothing ancillary delivered: report zero control bytes. (satoru)
+                *(uint64_t*)(m + 40) = 0;
+            }
+            return got;
+        }
         case LSYS_SHUTDOWN: {
             int fd = (int)ebx;
             LinuxProcess* lp = Current();
@@ -1891,9 +2700,58 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 lp->fds[fd].type != LFD_SOCKET) return -9;
             return UnixSocket::Shutdown(lp->fds[fd].backend_fd, (int)ecx);
         }
-        case LSYS_SETSOCKOPT:
-        case LSYS_GETSOCKOPT:
+        case LSYS_SETSOCKOPT: {
+            // setsockopt(fd, level, optname, optval, optlen). we don't model
+            // most options on the AF_UNIX backend, so accept the common ones
+            // and return success rather than failing the caller. silently
+            // ignoring an unknown option is also fine here  -  programs treat a
+            // 0 return as "applied". (satoru)
+            int fd = (int)ebx;
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;   // -EBADF
+            // SOL_SOCKET(1): SO_REUSEADDR(2)/SO_SNDBUF(7)/SO_RCVBUF(8)/
+            //   SO_KEEPALIVE(9)/SO_REUSEPORT(15); IPPROTO_TCP(6): TCP_NODELAY(1).
+            // all accepted-and-ignored. (satoru)
             return 0;
+        }
+        case LSYS_GETSOCKOPT: {
+            // getsockopt(fd, level, optname, optval*, optlen*). return sane
+            // int values for the options programs probe after connect() so
+            // non-blocking connect loops don't spin on a bogus SO_ERROR. write
+            // the int into the user optval and 4 into the user optlen. (satoru)
+            int fd       = (int)ebx;
+            int level    = (int)ecx;
+            int optname  = (int)edx;
+            int* optval  = (int*)(uintptr_t)esi;
+            uint32_t* optlen = (uint32_t*)(uintptr_t)edi;
+            LinuxProcess* lp = Current();
+            if (fd < 0 || fd >= LINUX_MAX_FDS ||
+                lp->fds[fd].type != LFD_SOCKET) return -9;   // -EBADF
+            if (!optval || !optlen) return -14;              // -EFAULT
+            if (*optlen < sizeof(int)) return -22;           // -EINVAL
+            int val = 0;
+            if (level == 1) {                 // SOL_SOCKET
+                switch (optname) {
+                    case 4:  val = 0;     break;  // SO_ERROR  -> no error
+                    case 3:  val = 1;     break;  // SO_TYPE   -> SOCK_STREAM
+                    case 7:                       // SO_SNDBUF
+                    case 8:  val = 65536; break;  // SO_RCVBUF -> sane default
+                    case 2:                       // SO_REUSEADDR
+                    case 9:                       // SO_KEEPALIVE
+                    case 15: val = 0;     break;  // SO_REUSEPORT (default off)
+                    default: val = 0;     break;
+                }
+            } else if (level == 6) {          // IPPROTO_TCP
+                // TCP_NODELAY(1) and friends: report default off. (satoru)
+                val = 0;
+            } else {
+                val = 0;
+            }
+            *optval = val;
+            *optlen = sizeof(int);
+            return 0;
+        }
         case LSYS_GETSOCKNAME: {
             int fd = (int)ebx;
             uint8_t* sa = (uint8_t*)(uintptr_t)ecx;
@@ -1985,6 +2843,18 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
 
         if (p->task) {
             int current_index = current_proc;
+
+            // clone child_cleartid: a thread exiting must zero *clear_child_tid
+            // and futex-wake it so a joiner blocked in pthread_join wakes up.
+            // the write goes through this task's (shared) address space. (satoru)
+            if (p->task->clear_child_tid) {
+                uint64_t ctid = p->task->clear_child_tid;
+                write_user_u32(p->task, ctid, 0);
+                futex_do_wake(p->task->address_space, (uintptr_t)ctid,
+                              0x7FFFFFFF, 0xFFFFFFFFu);
+                p->task->clear_child_tid = 0;
+            }
+
             Scheduler::MarkProcessExited(p->task, (int)code);
             wake_waiting_parent(p, current_index);
 
@@ -2227,7 +3097,37 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
             return r;
         }
 
+        // eventfd read: returns the 8-byte counter and zeroes it (or returns 1
+        // and decrements in semaphore mode). EAGAIN when the counter is 0  -  the
+        // event loop epoll_waits for EPOLLIN before reading. (satoru)
+        case LFD_EVENTFD: {
+            int s = lfd->backend_fd;
+            if (s < 0 || s >= EVENTFD_MAX || count < 8) return -22;  // einval
+            uint64_t v = g_eventfd[s].counter;
+            if (v == 0) return -11;   // eagain  -  nothing to read (satoru)
+            uint64_t ret;
+            if (g_eventfd[s].semaphore) { ret = 1; g_eventfd[s].counter = v - 1; }
+            else                        { ret = v; g_eventfd[s].counter = 0; }
+            *(uint64_t*)dst = ret;
+            return 8;
+        }
+
+        // timerfd read: returns the 8-byte count of expirations since last read
+        // (re-armed if periodic), then clears it. EAGAIN if not yet expired.
+        // (satoru)
+        case LFD_TIMERFD: {
+            int s = lfd->backend_fd;
+            if (s < 0 || s >= TIMERFD_MAX || count < 8) return -22;
+            timerfd_tick(s);
+            uint64_t v = g_timerfd[s].expirations;
+            if (v == 0) return -11;   // eagain (satoru)
+            g_timerfd[s].expirations = 0;
+            *(uint64_t*)dst = v;
+            return 8;
+        }
+
         case LFD_DEVNULL:
+        case LFD_SIGNALFD:   // signalfd never delivers  -  reads as empty (satoru)
             return 0;
 
         case LFD_PROC: {
@@ -2371,7 +3271,25 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
             return r;
         }
 
+        // eventfd write: adds an 8-byte value to the counter, making the fd
+        // readable (EPOLLIN). this is how glib's main loop wakes its epoll. an
+        // add of 0 is a no-op; UINT64_MAX is rejected per the eventfd(2) abi.
+        // (satoru)
+        case LFD_EVENTFD: {
+            int s = lfd->backend_fd;
+            if (s < 0 || s >= EVENTFD_MAX || count < 8) return -22;  // einval
+            uint64_t add = *(const uint64_t*)src;
+            if (add == 0xFFFFFFFFFFFFFFFFULL) return -22;
+            // saturate at UINT64_MAX-1 rather than overflow-wrap (satoru)
+            if (g_eventfd[s].counter + add < g_eventfd[s].counter)
+                g_eventfd[s].counter = 0xFFFFFFFFFFFFFFFEULL;
+            else
+                g_eventfd[s].counter += add;
+            return 8;
+        }
+
         case LFD_DEVNULL:
+        case LFD_SIGNALFD:   // writes to a signalfd are meaningless; swallow (satoru)
             return (int32_t)count;
 
         default:
@@ -2476,6 +3394,18 @@ int32_t LinuxSyscall::sys_close(int fd) {
     LinuxFd* lfd = &p->fds[fd];
     if (lfd->type == LFD_KVFS) KVFS::Close(lfd->backend_fd);
     else if (lfd->type == LFD_EXT4) Ext4::Close(lfd->backend_fd);
+    // release epoll/eventfd/timerfd table slots back to the pool so the
+    // bounded tables don't leak across a long-lived process (satoru)
+    else if (lfd->type == LFD_EPOLL) {
+        int s = lfd->backend_fd;
+        if (s >= 0 && s < EPOLL_MAX) g_epoll[s].used = false;
+    } else if (lfd->type == LFD_EVENTFD) {
+        int s = lfd->backend_fd;
+        if (s >= 0 && s < EVENTFD_MAX) g_eventfd[s].used = false;
+    } else if (lfd->type == LFD_TIMERFD) {
+        int s = lfd->backend_fd;
+        if (s >= 0 && s < TIMERFD_MAX) g_timerfd[s].used = false;
+    }
     lfd->open = false;
     return 0;
 }
@@ -3015,6 +3945,108 @@ int32_t LinuxSyscall::sys_munmap(uintptr_t addr, uint64_t length) {
     return unmapped ? 0 : -22;
 }
 
+// mprotect(addr, len, prot): change the protection of an existing user mapping.
+// this is what makes w^x jits work  -  e.g. spidermonkey mmaps a code buffer rw,
+// writes machine code into it, then mprotect()s it rx and jumps in. a no-op stub
+// leaves the pages writable+nx, so the cpu either faults on the instruction
+// fetch (nx) or runs with the wrong perms. here we (1) re-derive the pte flags
+// from prot, (2) update every overlapping user region's page_flags (splitting
+// regions on partial coverage so future demand-zero faults pick up the new prot)
+// and (3) rewrite the live pte of any already-faulted-in page in place + flush
+// the tlb. nx is handled by page_flags_from_prot: PROT_EXEC clears PTE_NX,
+// PROT_WRITE without PROT_EXEC sets it, and efer.nxe enforces it. (satoru)
+int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t prot) {
+    if (length == 0) return 0;
+
+    LinuxProcess* proc = Current();
+    Process* task = proc ? proc->task : nullptr;
+    if (!task || !task->is_user()) {
+        // no per-process address space to reprotect; nothing to do (satoru)
+        return 0;
+    }
+
+    // addr must be page-aligned per posix; len rounds up to a page (satoru)
+    if (addr & (PAGE_SIZE - 1)) return -22;        // einval
+    uint64_t start = align_down_u64(addr, PAGE_SIZE);
+    uint64_t end = align_up_u64((uint64_t)addr + length, PAGE_SIZE);
+    if (end <= start) return -22;                  // einval (overflow / empty)
+    if (end > USER_SPACE_TOP + 1) return -22;      // outside the user half
+
+    uint64_t new_flags = page_flags_from_prot(prot);
+
+    // step 1: bring the region table in line so demand-zero pages that have not
+    // faulted in yet get the new protection on first touch. for each active
+    // region overlapping [start,end) we split off the covered span and stamp it
+    // with new_flags, leaving the non-covered remainder(s) on their old flags.
+    // iterating the whole array is safe: a remainder slot we create lies outside
+    // [start,end) (empty overlap -> skipped on re-scan) and a covered slot we
+    // create already carries new_flags (re-stamp is idempotent). (satoru)
+    bool covered_any = false;
+    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
+        UserMemoryRegion* region = &task->regions[i];
+        if (!region->active) continue;
+
+        uint64_t os = start > region->start ? start : region->start;
+        uint64_t oe = end < region->end ? end : region->end;
+        if (os >= oe) continue;                    // no overlap (satoru)
+        covered_any = true;
+
+        if (region->page_flags == new_flags) continue;  // already this prot (satoru)
+
+        uint64_t rs = region->start, re = region->end;
+        uint32_t rflags = region->flags;           // DEMAND_ZERO / MMAP / HEAP (satoru)
+
+        if (os <= rs && oe >= re) {
+            // whole region covered  -  just restamp its protection (satoru)
+            region->page_flags = new_flags;
+            continue;
+        }
+
+        // partial coverage: shrink this slot to one of the surviving pieces and
+        // re-add the others. need up to two free slots (middle split). if none
+        // are free we cannot split correctly, so fail rather than silently
+        // reprotecting bytes outside [start,end). (satoru)
+        if (os <= rs) {
+            // covered prefix [rs,oe): keep tail [oe,re) on old flags here,
+            // add the covered head with new flags. (satoru)
+            region->start = oe;
+            if (!add_region(task, rs, oe, new_flags, rflags)) return -12;  // enomem
+        } else if (oe >= re) {
+            // covered suffix [os,re): keep head [rs,os) on old flags here,
+            // add the covered tail with new flags. (satoru)
+            region->end = os;
+            if (!add_region(task, os, re, new_flags, rflags)) return -12;
+        } else {
+            // covered middle [os,oe): head [rs,os) stays here on old flags,
+            // add covered middle (new flags) + tail [oe,re) (old flags). (satoru)
+            region->end = os;
+            if (!add_region(task, os, oe, new_flags, rflags)) return -12;
+            if (!add_region(task, oe, re, region->page_flags, rflags)) return -12;
+        }
+    }
+
+    // step 2: rewrite the live pte of every page in [start,end) that is already
+    // mapped (faulted-in rw jit buffers land here and get flipped to rx). pages
+    // not yet present are skipped  -  they will fault in later with the region
+    // flags updated above. collect whether anything changed so we can flush. (satoru)
+    bool active_cr3 = (Scheduler::GetCurrentProcess() == task);
+    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
+        if (KernelVMM::ProtectPageInAddressSpace(task->address_space, page, new_flags)) {
+            if (active_cr3) KernelVMM::InvalidatePage(page);
+        }
+    }
+
+    // linux returns 0 even when the range has no backing region yet (a fresh
+    // demand-zero mmap region still counts). only reject when the range maps
+    // nothing at all and overlaps no region. (satoru)
+    if (!covered_any) {
+        // still walk pages above; if none were mapped either, the address range
+        // is genuinely unmapped -> enomem per posix. (satoru)
+        return -12;
+    }
+    return 0;
+}
+
 int32_t LinuxSyscall::sys_nanosleep(uintptr_t req, uintptr_t rem) {
     (void)rem;
     struct { uint32_t tv_sec; uint32_t tv_nsec; }* ts =
@@ -3086,12 +4118,37 @@ int32_t LinuxSyscall::sys_getdents64(int fd, uintptr_t dirp, uint64_t count) {
 }
 
 int32_t LinuxSyscall::sys_clock_gettime(uint32_t clk_id, uintptr_t tp) {
-    (void)clk_id;
-    struct { uint32_t tv_sec; uint32_t tv_nsec; }* ts =
-        (decltype(ts))tp;
-    uint32_t ticks = Time::GetTicks();
-    ts->tv_sec = ticks / 1000;
-    ts->tv_nsec = (ticks % 1000) * 1000000;
+    // x86_64 struct timespec is { long tv_sec; long tv_nsec; } = 16 bytes;
+    // both fields are 8 bytes. the old code wrote a 32-bit pair (8 bytes total)
+    // which under-fills the user buffer on the x64 path. (satoru)
+    struct timespec64 { int64_t tv_sec; int64_t tv_nsec; };
+    if (!tp) return -14;        // -EFAULT
+    timespec64* ts = (timespec64*)tp;
+
+    // CLOCK_REALTIME(0) / CLOCK_REALTIME_COARSE(5): wall-clock. source the
+    // microsecond utc clock (RTC unix-epoch seconds captured at boot + the
+    // monotonic uptime + the sub-ms PIT fraction) from TimeManager::NowUTC.
+    // if the RTC epoch was never set this is "boot epoch + uptime" instead,
+    // but it is still wall-clock-shaped and never jumps. (satoru)
+    if (clk_id == 0 || clk_id == 5) {
+        uint64_t us = TimeManager::NowUTC().us;
+        ts->tv_sec  = (int64_t)(us / 1000000ull);
+        ts->tv_nsec = (int64_t)((us % 1000000ull) * 1000ull);
+        return 0;
+    }
+
+    // CLOCK_MONOTONIC(1) / CLOCK_MONOTONIC_RAW(4) / CLOCK_BOOTTIME(7): a
+    // strictly increasing nanosecond value derived from the TSC-based
+    // millisecond uptime clock (no 49.7-day wrap, cadence-independent). a
+    // static floor guards against any one-time backward step when the clock
+    // source switches at boot, so MONOTONIC never goes backwards. firefox
+    // uses this for performance timing  -  drift/discontinuity shows as
+    // stutter. (satoru)
+    static uint64_t mono_floor_ms = 0;
+    uint64_t ms = Timer::GetRealMs64();
+    if (ms < mono_floor_ms) ms = mono_floor_ms; else mono_floor_ms = ms;
+    ts->tv_sec  = (int64_t)(ms / 1000ull);
+    ts->tv_nsec = (int64_t)((ms % 1000ull) * 1000000ull);
     return 0;
 }
 
@@ -3105,6 +4162,10 @@ int32_t LinuxSyscall::sys_set_thread_area(uintptr_t u_info) {
 
 bool LinuxSyscall::HasConsoleOutput() {
     return console_head != console_tail;
+}
+
+bool LinuxSyscall::StdinReadable() {
+    return stdin_head != stdin_tail;
 }
 
 int LinuxSyscall::ReadConsoleOutput(char* buf, int max_len) {
@@ -3403,4 +4464,4 @@ int LinuxSyscall::RunProgram(const char* name, int argc, const char** argv,
     SetCurrent(saved);
 
     return out_len;
-}
+}
