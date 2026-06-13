@@ -49,6 +49,22 @@ static const unsigned int TM_STATUS   = 0xFF0A0A12;
 static const int ROW_H = 20;
 static const int TAB_H = 32;
 
+// Processes-tab column geometry (content-relative x offsets), sized so every
+// column + its widest value fits inside the ~558 px content width with clean
+// gaps. The old layout collided cpu% into memory ("0%16 KB") and the kernel
+// stack value into the status dot ("1024/32768RUNNING"); these offsets give
+// each field breathing room. The header, the cells, and the sort hit-test all
+// read from here so they can never drift apart. (satoru)
+static const int PL_PID    = 8;    // pid (up to ~6 digits)
+static const int PL_NAME   = 56;   // process name (~15 chars before cpu)
+static const int PL_CPUBAR = 188;  // cpu utilisation bar (36 px wide)
+static const int PL_CPUNUM = 228;  // cpu percentage text ("100%")
+static const int PL_MEM    = 270;  // memory ("xxxx MB")
+static const int PL_THR    = 340;  // thread count
+static const int PL_STACK  = 372;  // kernel stack "used/cap" ("1024/32768")
+static const int PL_STDOT  = 458;  // status indicator dot
+static const int PL_STATE  = 468;  // status text ("SLEEPING")
+
 static int slen(const char* s){int n=0;if(s)while(s[n])n++;return n;}
 static void scpy(char* d,const char* s,int mx){
     int i=0;if(s)while(s[i]&&i<mx-1){d[i]=s[i];i++;}d[i]=0;}
@@ -173,24 +189,6 @@ static int tm_cpu_pct_from_ticks(uint64_t delta_ticks,uint32_t elapsed_ms){
     return (int)pct;
 }
 
-// build a compact "c0/c1/c2" list of each present core's current MHz from the
-// cpufreq governor, bounded to the first few cores so it fits the panel. (satoru)
-static void tm_build_percore_mhz(char* out,int cap){
-    if(cap<1){ return; }
-    out[0]=0;
-    int n=CPUFreq::CPUCount();
-    if(n>8) n=8;            // keep the line short for the narrow cpu pane (satoru)
-    int shown=0;
-    char nbuf[12];
-    for(int i=0;i<n;i++){
-        const CPUFreq::CPUInfo* ci=CPUFreq::GetCPU((uint32_t)i);
-        if(!ci || !ci->present) continue;
-        if(shown>0) sapp(out,"/",cap);
-        int_to_str((int)ci->cur_mhz,nbuf,12); sapp(out,nbuf,cap);
-        shown++;
-    }
-    if(shown==0) sapp(out,"n/a",cap);
-}
 
 static void tm_store_cpu_samples(const SchedulerProcessSnapshot* snapshots,int count){
     if(!snapshots || count <= 0){
@@ -217,21 +215,28 @@ static void tm_format_process_state(ProcessState state,char* out,int max_len){
     }
 }
 
-static void tm_query_memory_usage_kb(int& total_kb,int& used_kb,int& available_kb){
+// honest system-ram accounting straight from the physical memory manager:
+// total = all usable frames, free = unallocated frames, used = total - free.
+// this is REAL physical ram, not a sum of per-process figures (which would
+// double-count shared pages, framebuffers, the kernel image, etc). the kernel
+// heap is reported separately as a sub-component of used. (satoru)
+static void tm_query_memory_usage_kb(int& total_kb,int& used_kb,int& free_kb,int& heap_kb){
     uint64_t total_bytes = PMM::GetTotalMemory();
-    uint64_t free_bytes = PMM::GetFreeMemory();
+    uint64_t free_bytes  = PMM::GetFreeMemory();
 
+    // pmm not initialised (e.g. very early / fallback): fall back to the heap
+    // arena so we still show a plausible total instead of zero. (satoru)
     if (total_bytes == 0) {
         total_bytes = (uint64_t)KernelHeap::GetTotal();
-        free_bytes = (uint64_t)KernelHeap::GetFree();
+        free_bytes  = (uint64_t)KernelHeap::GetFree();
     }
-    if (free_bytes > total_bytes) free_bytes = 0;
+    if (free_bytes > total_bytes) free_bytes = total_bytes;
 
     total_kb = (int)(total_bytes / 1024ULL);
-    available_kb = (int)(free_bytes / 1024ULL);
-    used_kb = total_kb - available_kb;
+    free_kb  = (int)(free_bytes  / 1024ULL);
+    used_kb  = total_kb - free_kb;
     if (used_kb < 0) used_kb = 0;
-    if (total_kb < used_kb) total_kb = used_kb;
+    heap_kb  = (int)((uint64_t)KernelHeap::GetUsed() / 1024ULL);
 }
 
 static void tm_format_window_state(WindowState state,char* out,int max_len){
@@ -264,6 +269,27 @@ static int tm_find_linux_process_index_by_task_pid(int native_pid){
         if(proc && proc->task && (int)proc->task->pid == native_pid) return i;
     }
     return -1;
+}
+
+// a linux/user process is backed by a scheduler task but carries richer info
+// in its LinuxProcess record: a real command name and a heap (brk) region the
+// scheduler snapshot's region scan may not fully cover. find the live, non-exited
+// LinuxProcess whose task matches this pid so we can enrich the row. (satoru)
+static const LinuxProcess* tm_find_live_linux_proc(int native_pid){
+    int idx = tm_find_linux_process_index_by_task_pid(native_pid);
+    if(idx < 0) return nullptr;
+    const LinuxProcess* lp = LinuxSyscall::GetProcess(idx);
+    if(!lp || lp->exited || !lp->active) return nullptr;
+    return lp;
+}
+
+// resident heap (brk) bytes for a linux process, in kb. clamped so a stale or
+// uninitialised brk window never produces a wild figure. (satoru)
+static int tm_linux_heap_kb(const LinuxProcess* lp){
+    if(!lp || lp->brk_current <= lp->brk_base) return 0;
+    uint64_t bytes = lp->brk_current - lp->brk_base;
+    if(bytes > (1ULL<<34)) return 0;   // > 16 GB => clearly bogus, ignore (satoru)
+    return (int)(bytes / 1024ULL);
 }
 
 static bool tm_terminate_scheduler_process(const TMProcess* proc){
@@ -319,6 +345,8 @@ int         TaskManagerApp::cpu_usage      = 0;
 int         TaskManagerApp::cpu_cores      = 1;
 int         TaskManagerApp::mem_used_kb    = 0;
 int         TaskManagerApp::mem_total_kb   = 0;
+int         TaskManagerApp::mem_free_kb    = 0;
+int         TaskManagerApp::mem_heap_kb    = 0;
 int         TaskManagerApp::mem_cached_kb  = 0;
 int         TaskManagerApp::uptime_sec     = 0;
 int         TaskManagerApp::net_rx_kb      = 0;
@@ -329,6 +357,7 @@ int         TaskManagerApp::cpu_history[60];
 int         TaskManagerApp::mem_history[60];
 int         TaskManagerApp::hist_idx       = 0;
 int         TaskManagerApp::tick_counter   = 0;
+int         TaskManagerApp::last_list_vis  = 0;
 bool        TaskManagerApp::action_menu_open = false;
 int         TaskManagerApp::action_menu_row  = -1;
 TMTab       TaskManagerApp::action_menu_tab  = TM_PROCESSES;
@@ -343,7 +372,7 @@ void TaskManagerApp::Init(){
     sort_col=TM_SORT_CPU; sort_asc=false;
     cpu_cores=CPUDetect::GetCoreCount();
     if(cpu_cores < 1) cpu_cores = 1;
-    tm_query_memory_usage_kb(mem_total_kb, mem_used_kb, mem_cached_kb);
+    tm_query_memory_usage_kb(mem_total_kb, mem_used_kb, mem_free_kb, mem_heap_kb);
     if(mem_total_kb < 1024) mem_total_kb = 262144;
     for(int i=0;i<60;i++){cpu_history[i]=0;mem_history[i]=0;}
     hist_idx=0; tick_counter=0;
@@ -354,13 +383,18 @@ void TaskManagerApp::Init(){
 int TaskManagerApp::Open(){
     Init();
     RuntimeLog::LogAppEvent("tasks", "open");
-    int wid = WindowManager::CreateWindow("Task Manager", -1, -1, 560, 420,
+    // taller (500) so the Performance tab's four device panes fit fully under
+    // the disk/network/system rows instead of overflowing the panel + the
+    // content area (the old 420-tall window clipped them). (satoru)
+    int wid = WindowManager::CreateWindow("Task Manager", -1, -1, 560, 500,
         (WindowRenderFunc)[](Window* w,int cx,int cy,int cw,int ch){
             TaskManagerApp::Render(w,cx,cy,cw,ch);
         },
         (WindowInputFunc)[](Window* w,int ev,int p1,int p2){
             if(ev==1) TaskManagerApp::Input(w,p1,p2,true,0);
             else if(ev==2) TaskManagerApp::Input(w,0,0,false,(char)p1);
+            // ev 3 = scroll wheel (p1 = delta): scroll the process/window list. (satoru)
+            else if(ev==3) TaskManagerApp::Scroll(p1);
             else if(ev==4) TaskManagerApp::Input(w,p1 - w->content_x,p2 - w->content_y,false,(char)4);
             else if(ev==6 && p1 == 1 && p2 == 1){
                 int mx = 0, my = 0;
@@ -427,11 +461,29 @@ void TaskManagerApp::Tick(){
     RefreshProcesses();
 }
 
+// scroll the list on the active tab. positive delta = scroll toward the end.
+// the offset is clamped against the row count of whichever list this tab shows
+// and the last-rendered viewport height; the renderers re-clamp too. (satoru)
+void TaskManagerApp::Scroll(int delta){
+    if(delta == 0) return;
+    int count = (current_tab == TM_WINDOWS) ? window_count : proc_count;
+    int vis = last_list_vis > 0 ? last_list_vis : 1;
+    int max_off = count - vis; if(max_off < 0) max_off = 0;
+    // wheel deltas come in as small signed steps; one notch == one row. (satoru)
+    scroll_offset -= delta;
+    if(scroll_offset > max_off) scroll_offset = max_off;
+    if(scroll_offset < 0) scroll_offset = 0;
+}
+
 void TaskManagerApp::RefreshProcesses(){
     proc_count=0;
-    uint32_t now_ms = Time::GetTicks();
-    static uint32_t last_sample_ms = 0;
-    uint32_t elapsed_ms = (last_sample_ms == 0 || now_ms <= last_sample_ms) ? 500 : (now_ms - last_sample_ms);
+    // monotonic boot clock (pit-driven) for cpu% sampling + uptime. Time::GetTicks
+    // is wall-clock-derived (utc ms) and produces a nonsense "uptime" of hundreds
+    // of hours; Scheduler::NowMs counts from boot. (satoru)
+    uint64_t now_ms = Scheduler::NowMs();
+    static uint64_t last_sample_ms = 0;
+    uint32_t elapsed_ms = (last_sample_ms == 0 || now_ms <= last_sample_ms)
+                              ? 500u : (uint32_t)(now_ms - last_sample_ms);
     last_sample_ms = now_ms;
 
     NetworkInterface* eth = Network::GetInterface("eth0");
@@ -461,14 +513,28 @@ void TaskManagerApp::RefreshProcesses(){
         if(snap.cpu_ticks_total >= prev_ticks) delta_ticks = snap.cpu_ticks_total - prev_ticks;
         int cpu_pct = g_tm_cpu_samples_ready ? tm_cpu_pct_from_ticks(delta_ticks, elapsed_ms) : 0;
 
+        // a scheduler task may also be a linux/user process  -  if so, take its
+        // real command name and add its heap to the rss. user processes are
+        // tagged via PROCESS_FLAG_USER; everything else is a kernel task. (satoru)
+        bool is_user = (snap.flags & PROCESS_FLAG_USER) != 0;
+        const LinuxProcess* lp = is_user ? tm_find_live_linux_proc((int)snap.pid) : nullptr;
+
         TMProcess* p = &procs[proc_count++];
         p->pid = (int)snap.pid;
-        scpy(p->name, snap.name[0] ? snap.name : "process", 32);
+        if(lp && lp->name[0]) scpy(p->name, lp->name, 32);
+        else                  scpy(p->name, snap.name[0] ? snap.name : "process", 32);
         p->cpu_pct = cpu_pct;
-        p->mem_kb = tm_max(4, (int)snap.memory_kb);
+        // per-process memory: the scheduler snapshot already accounts kernel
+        // stack + user stack + mapped regions (rss-style). for user processes
+        // fold in the heap (brk) so the figure is meaningful, not just the
+        // stack. kernel tasks keep their committed kernel-stack cost. (satoru)
+        int mem_kb = (int)snap.memory_kb;
+        if(lp) mem_kb += tm_linux_heap_kb(lp);
+        p->mem_kb = tm_max(4, mem_kb);
         p->threads = 1;
         tm_format_process_state(snap.state, p->state, 12);
-        scpy(p->user, (snap.flags & PROCESS_FLAG_USER) ? "user" : "SYSTEM", 16);
+        // label kernel vs user clearly (shown in the Details "User" column). (satoru)
+        scpy(p->user, is_user ? "user" : "kernel", 16);
         p->priority = (int)snap.priority;
         p->io_read_kb = 0;
         p->io_write_kb = 0;
@@ -479,68 +545,31 @@ void TaskManagerApp::RefreshProcesses(){
         p->cpu_ms_total = snap.cpu_ms_total;
         p->stack_grow_count = snap.stack_grow_count;
         p->prio_tier = snap.prio_tier;
-        p->is_kernel_proc = snap.is_kernel_proc;
+        // is_kernel_proc drives the kernel-stack telemetry column; treat any
+        // non-user task as kernel so the column populates correctly. (satoru)
+        p->is_kernel_proc = snap.is_kernel_proc || !is_user;
         total_busy_cpu += cpu_pct;
     }
 
     tm_store_cpu_samples(snapshots, snapshot_count);
     g_tm_cpu_samples_ready = true;
 
-    // Blend open windows as process rows (CPU 0  -  these are UI sessions,
-    // not scheduler tasks, so no fake percentages).
+    // open windows are NOT processes  -  a window is a ui surface owned by some
+    // process, and listing it here both inflated the count and double-counted
+    // its framebuffer as "memory". windows have their own dedicated tab
+    // (RenderWindows). just refresh that list; don't blend it into procs. (satoru)
     RefreshWindows();
-    for(int i=0;i<window_count && proc_count<TM_MAX_PROCS-1;i++){
-        TMWindowRow* row = &window_rows[i];
-        bool already_listed = false;
-        for(int j=0;j<proc_count;j++){
-            if(procs[j].pid == row->id && procs[j].source_kind == TM_PROC_SCHED){
-                already_listed = true;
-                break;
-            }
-        }
-        if(already_listed) continue;
-
-        TMProcess* p = &procs[proc_count++];
-        p->pid = row->id;
-        scpy(p->name, row->title, 32);
-        p->cpu_pct = 0;
-        // honest memory: a pure-ui window with no backing scheduler task costs
-        // its rgba framebuffer (w*h*4). no fabricated per-index number. (satoru)
-        p->mem_kb = tm_max(4, (row->w * row->h * 4) / 1024);
-        p->threads = 1;
-        scpy(p->state, "RUNNING", 12);
-        scpy(p->user, "user", 16);
-        p->priority = 20;
-        p->io_read_kb = 0;
-        p->io_write_kb = 0;
-        p->flags = PROCESS_FLAG_NONE;
-        p->source_kind = TM_PROC_IDLE;
-        p->stack_kb = 0;
-        p->stack_cap_kb = 0;
-        p->cpu_ms_total = 0;
-        p->stack_grow_count = 0;
-        p->prio_tier = 0;
-        p->is_kernel_proc = false;
-    }
-
-    // no synthetic "CPU Idle" row: it sat at 100-busy and read as a process
-    // pinned at 100% on an idle machine. idle is implicit  -  the overall cpu
-    // figure (cpu_usage, below) is low when nothing is working. (satoru)
 
     SortProcesses();
 
-    // compute totals
-    int total_mem=0;
-    for(int i=0;i<proc_count;i++){
-        total_mem+=procs[i].mem_kb;
-    }
     cpu_usage = tm_clamp(total_busy_cpu, 0, 100);
 
-    tm_query_memory_usage_kb(mem_total_kb, mem_used_kb, mem_cached_kb);
-    if(mem_used_kb<1) mem_used_kb = total_mem;
-    if(mem_total_kb < mem_used_kb) mem_total_kb = mem_used_kb + 1024;
+    // honest system ram: real total/used/free from the pmm  -  never a sum of
+    // per-process figures (that double-counts shared pages + framebuffers). (satoru)
+    tm_query_memory_usage_kb(mem_total_kb, mem_used_kb, mem_free_kb, mem_heap_kb);
+    mem_cached_kb = mem_free_kb;   // keep the legacy field coherent (satoru)
 
-    uptime_sec = Time::GetTicks() / 1000;
+    uptime_sec = (int)(Scheduler::NowMs() / 1000ULL);
     disk_read_kb = (int)(KVFS::DiskUsage("/") / 1024);
     disk_write_kb = (int)(KernelHeap::GetFree() / 1024);
 
@@ -646,7 +675,7 @@ static void DrawGraph(int gx, int gy, int gw, int gh, int* data, int idx, int ma
 void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
     // column header
     Graphics::FillRect(x,y,w,ROW_H,TM_HEAD_BG);
-    int cols[] = {8, 48, 200, 258, 320, 360, 432}; // pid, name, cpu%, mem, thr, stack, status
+    int  cols[]    = {PL_PID, PL_NAME, PL_CPUBAR, PL_MEM, PL_THR, PL_STACK, PL_STATE};
     const char* headers[] = {"PID", "Name", "CPU", "Memory", "Thr", "Stack KB", "Status"};
     TMSortCol scols[] = {TM_SORT_PID, TM_SORT_NAME, TM_SORT_CPU, TM_SORT_MEM, TM_SORT_PID, TM_SORT_MEM, TM_SORT_NAME};
     for(int i=0;i<7;i++){
@@ -656,6 +685,12 @@ void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
     y+=ROW_H;
 
     int vis=(h-ROW_H)/ROW_H;
+    last_list_vis = vis;
+    // clamp the scroll offset to a valid range every frame so a stale offset
+    // (after the list shrinks, or a tab switch) can't blank the viewport. (satoru)
+    int max_off = proc_count - vis; if(max_off < 0) max_off = 0;
+    if(scroll_offset > max_off) scroll_offset = max_off;
+    if(scroll_offset < 0) scroll_offset = 0;
     for(int i=0;i<vis && (i+scroll_offset)<proc_count;i++){
         int idx=i+scroll_offset;
         TMProcess* p=&procs[idx];
@@ -665,17 +700,18 @@ void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
         else if(i%2) Graphics::FillRect(x,ry,w,ROW_H,TM_ROW_ALT);
 
         // pid
-        char num[8]; int_to_str(p->pid,num,8);
-        Graphics::DrawString(x+8, ry+2, num, TM_DIM, 0xFF000000);
+        char num[12]; int_to_str(p->pid,num,12);
+        Graphics::DrawString(x+PL_PID, ry+2, num, TM_DIM, 0xFF000000);
         // name with colored indicator
         unsigned int nc = (p->state[0]=='R') ? TM_TEXT : TM_DIM;
-        Graphics::DrawString(x+48, ry+2, p->name, nc, 0xFF000000);
-        // cpu bar + number
-        int cpu_bar_w = (p->cpu_pct * 40) / 100;
+        Graphics::DrawString(x+PL_NAME, ry+2, p->name, nc, 0xFF000000);
+        // cpu bar (36 px) then the percentage in its own column  -  the two no
+        // longer collide with each other or with memory. (satoru)
+        int cpu_bar_w = (p->cpu_pct * 36) / 100;
         unsigned int bar_c = p->cpu_pct > 50 ? TM_RED : (p->cpu_pct > 20 ? TM_ORANGE : TM_GREEN);
-        if (cpu_bar_w > 0) Graphics::FillRect(x+200, ry+6, cpu_bar_w, 8, bar_c);
-        int_to_str(p->cpu_pct, num, 8); sapp(num, "%", 8);
-        Graphics::DrawString(x+244, ry+2, num, bar_c, 0xFF000000);
+        if (cpu_bar_w > 0) Graphics::FillRect(x+PL_CPUBAR, ry+6, cpu_bar_w, 8, bar_c);
+        int_to_str(p->cpu_pct, num, 12); sapp(num, "%", 12);
+        Graphics::DrawString(x+PL_CPUNUM, ry+2, num, bar_c, 0xFF000000);
         // memory
         char mem[16]={0};
         if (p->mem_kb >= 1024) {
@@ -683,11 +719,11 @@ void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
         } else {
             int_to_str(p->mem_kb, mem, 16); sapp(mem, " KB", 16);
         }
-        Graphics::DrawString(x+258, ry+2, mem, TM_DIM, 0xFF000000);
+        Graphics::DrawString(x+PL_MEM, ry+2, mem, TM_DIM, 0xFF000000);
         // threads
-        int_to_str(p->threads, num, 8);
-        Graphics::DrawString(x+328, ry+2, num, TM_DIM, 0xFF000000);
-        // stack KB / cap KB (only meaningful for kernel processes)
+        int_to_str(p->threads, num, 12);
+        Graphics::DrawString(x+PL_THR, ry+2, num, TM_DIM, 0xFF000000);
+        // stack KB / cap KB (only meaningful for kernel tasks; user procs show "-")
         if (p->is_kernel_proc && p->stack_cap_kb > 0) {
             char stk[24] = {0};
             int_to_str((int)p->stack_kb, stk, 24);
@@ -699,17 +735,30 @@ void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
             if (p->stack_cap_kb > 0 &&
                 (uint32_t)((uint64_t)p->stack_kb * 100ULL / (uint64_t)p->stack_cap_kb) > 75)
                 sc = TM_ORANGE;
-            Graphics::DrawString(x+360, ry+2, stk, sc, 0xFF000000);
+            Graphics::DrawString(x+PL_STACK, ry+2, stk, sc, 0xFF000000);
         } else {
-            Graphics::DrawString(x+360, ry+2, "-", TM_DIM, 0xFF000000);
+            Graphics::DrawString(x+PL_STACK, ry+2, "-", TM_DIM, 0xFF000000);
         }
-        // state with color
+        // state: dot + text, in their own column clear of the stack figure. (satoru)
         unsigned int st_clr = TM_DIM;
         if(p->state[0]=='R') st_clr = TM_GREEN;
         else if(p->state[0]=='S') st_clr = TM_YELLOW;
         else if(p->state[0]=='Z') st_clr = TM_RED;
-        Graphics::FillCircle(x+436, ry+10, 3, st_clr);
-        Graphics::DrawString(x+444, ry+2, p->state, st_clr, 0xFF000000);
+        Graphics::FillCircle(x+PL_STDOT, ry+10, 3, st_clr);
+        Graphics::DrawString(x+PL_STATE, ry+2, p->state, st_clr, 0xFF000000);
+    }
+
+    // scrollbar hint when the list overflows the viewport: a thin track + thumb
+    // on the right edge so the user can tell there are more rows (the list
+    // scrolls via the wheel). (satoru)
+    if(proc_count > vis && vis > 0){
+        int track_x = x + w - 4;
+        int track_h = vis * ROW_H;
+        Graphics::FillRect(track_x, y, 3, track_h, TM_GRAPH_BG);
+        int thumb_h = tm_max(8, track_h * vis / proc_count);
+        int max_off = proc_count - vis;
+        int thumb_y = y + (max_off > 0 ? (track_h - thumb_h) * scroll_offset / max_off : 0);
+        Graphics::FillRect(track_x, thumb_y, 3, thumb_h, TM_BORDER);
     }
 }
 
@@ -726,76 +775,81 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     const LinuxDriver* wifi_drv = tm_find_wifi_driver();
     const LinuxDriver* bt_drv = tm_find_bt_driver();
 
-    Graphics::FillRoundedRect(x+8, ly, half_w, 130, 6, TM_PANEL);
+    Graphics::FillRoundedRect(x+8, ly, half_w, 140, 6, TM_PANEL);
     Graphics::DrawString(x+16, ly+6, "CPU", TM_BLUE, 0xFF000000);
     char pct[8]; int_to_str(cpu_usage,pct,8); sapp(pct,"%",8);
     Graphics::DrawString(x+half_w-20, ly+6, pct, TM_WHITE, 0xFF000000);
     DrawGraph(x+16, ly+24, half_w-16, 64, cpu_history, hist_idx, 100, TM_BLUE, TM_BLUE);
-    // cpu info
+    // cpu info  -  two STACKED lines (brand, then cores/threads + base mhz). the
+    // old layout drew the brand and a "Cur:" line at overlapping x on the same
+    // row, mashing them together ("Intel(R) Core(TM)...255HXCur:..."); detailed
+    // per-core current mhz lives in the CPU device pane below instead. (satoru)
     char cpu_brand_line[48] = {0};
-    char cpu_core_line[48] = "Cores: ";
-    char cpu_freq_line[48] = "Base: ";
-    // live per-core current frequency from the cpufreq governor. (satoru)
-    char cpu_cur_line[64] = "Cur: ";
+    char cpu_core_line[48]  = "Cores: ";
     char nbuf[12] = {0};
     scpy(cpu_brand_line, cpu_brand, 48);
     int_to_str(cpu_cores, nbuf, 12); sapp(cpu_core_line, nbuf, 48);
     sapp(cpu_core_line, "  Threads: ", 48);
     int_to_str(cpu_threads, nbuf, 12); sapp(cpu_core_line, nbuf, 48);
+    Graphics::DrawString(x+16, ly+94,  cpu_brand_line, TM_TEXT, 0xFF000000);
+    Graphics::DrawString(x+16, ly+110, cpu_core_line,  TM_DIM,  0xFF000000);
+    // base / turbo on the third line (the brand line is long, so frequencies
+    // get their own row rather than crowding the cores line). (satoru)
     if (cpu_base_mhz > 0) {
+        char cpu_freq_line[48] = "Base: ";
         int_to_str(cpu_base_mhz, nbuf, 12); sapp(cpu_freq_line, nbuf, 48); sapp(cpu_freq_line, " MHz", 48);
         if (cpu_turbo_mhz > 0) {
             sapp(cpu_freq_line, "  Turbo: ", 48);
             int_to_str(cpu_turbo_mhz, nbuf, 12); sapp(cpu_freq_line, nbuf, 48); sapp(cpu_freq_line, " MHz", 48);
         }
-    } else {
-        sapp(cpu_freq_line, "unknown", 48);
+        Graphics::DrawString(x+16, ly+124, cpu_freq_line, TM_DIM, 0xFF000000);
     }
-    char cur_mhz_list[40]; tm_build_percore_mhz(cur_mhz_list, 40);
-    sapp(cpu_cur_line, cur_mhz_list, 64); sapp(cpu_cur_line, " MHz", 64);
-    Graphics::DrawString(x+16, ly+94, cpu_brand_line, TM_TEXT, 0xFF000000);
-    Graphics::DrawString(x+16, ly+110, cpu_core_line, TM_DIM, 0xFF000000);
-    Graphics::DrawString(x+half_w/2, ly+94, cpu_cur_line, TM_DIM, 0xFF000000);
-    Graphics::DrawString(x+half_w/2, ly+110, cpu_freq_line, TM_DIM, 0xFF000000);
 
-    Graphics::FillRoundedRect(x+half_w+20, ly, half_w, 130, 6, TM_PANEL);
+    Graphics::FillRoundedRect(x+half_w+20, ly, half_w, 140, 6, TM_PANEL);
     Graphics::DrawString(x+half_w+28, ly+6, "Memory", TM_PURPLE, 0xFF000000);
     int mem_pct = tm_clamp((mem_used_kb*100)/(mem_total_kb>0?mem_total_kb:1), 0, 100);
     int_to_str(mem_pct,pct,8); sapp(pct,"%",8);
     Graphics::DrawString(x+w-40, ly+6, pct, TM_WHITE, 0xFF000000);
     DrawGraph(x+half_w+28, ly+24, half_w-16, 64, mem_history, hist_idx, 100, TM_PURPLE, TM_PURPLE);
-    // memory details
-    char mb[24]={0}; int_to_str(mem_used_kb/1024,mb,24); sapp(mb," / ",24);
-    char t2[8]; int_to_str(mem_total_kb/1024,t2,8); sapp(mb,t2,24); sapp(mb," MB",24);
+    // memory details  -  honest pmm figures: used/total on one line, free + the
+    // kernel-heap sub-total on the next. no per-process summing. (satoru)
+    char mb[32]={0}; int_to_str(mem_used_kb/1024,mb,32); sapp(mb," / ",32);
+    char t2[12]; int_to_str(mem_total_kb/1024,t2,12); sapp(mb,t2,32); sapp(mb," MB used",32);
     Graphics::DrawString(x+half_w+28, ly+94, mb, TM_DIM, 0xFF000000);
-    char cached[24]="Available: "; int_to_str(mem_cached_kb/1024,t2,8); sapp(cached,t2,24); sapp(cached," MB",24);
-    Graphics::DrawString(x+half_w+28, ly+110, cached, TM_DIM, 0xFF000000);
-    ly += 140;
+    char freeln[32]="Free: "; int_to_str(mem_free_kb/1024,t2,12); sapp(freeln,t2,32); sapp(freeln," MB",32);
+    sapp(freeln,"  Heap: ",32); int_to_str(mem_heap_kb/1024,t2,12); sapp(freeln,t2,32); sapp(freeln," MB",32);
+    Graphics::DrawString(x+half_w+28, ly+110, freeln, TM_DIM, 0xFF000000);
+    ly += 150;
 
-    Graphics::FillRoundedRect(x+8, ly, half_w, 70, 6, TM_PANEL);
+    // disk pane: a touch taller (80) so the usage bar sits BELOW the read/write
+    // lines instead of being drawn on top of "Read:" like before. (satoru)
+    Graphics::FillRoundedRect(x+8, ly, half_w, 80, 6, TM_PANEL);
     Graphics::DrawString(x+16, ly+6, "Disk", TM_ORANGE, 0xFF000000);
-    char dio[32]="Read: "; int_to_str(disk_read_kb,t2,8); sapp(dio,t2,32); sapp(dio," KB",32);
-    Graphics::DrawString(x+16, ly+26, dio, TM_DIM, 0xFF000000);
-    scpy(dio,"Write: ",32); int_to_str(disk_write_kb,t2,8); sapp(dio,t2,32); sapp(dio," KB",32);
-    Graphics::DrawString(x+16, ly+44, dio, TM_DIM, 0xFF000000);
-    // kvfs bar
+    char dio[32]="Used: "; int_to_str(disk_read_kb,t2,12); sapp(dio,t2,32); sapp(dio," KB",32);
+    Graphics::DrawString(x+16, ly+24, dio, TM_DIM, 0xFF000000);
+    scpy(dio,"Free: ",32); int_to_str(disk_write_kb,t2,12); sapp(dio,t2,32); sapp(dio," KB",32);
+    Graphics::DrawString(x+16, ly+40, dio, TM_DIM, 0xFF000000);
+    // usage bar, full pane width, on its own row clear of the text. (satoru)
     int disk_total_kb = (int)(KernelHeap::GetTotal() / 1024);
     int disk_pct = (disk_read_kb * 100) / (disk_total_kb > 0 ? disk_total_kb : 1);
     disk_pct = tm_clamp(disk_pct, 0, 100);
-    int dbw = half_w - 32;
-    Graphics::FillRoundedRect(x+half_w-dbw-8, ly+30, dbw, 10, 4, TM_GRAPH_BG);
-    Graphics::FillRoundedRect(x+half_w-dbw-8, ly+30, dbw*disk_pct/100, 10, 4, TM_ORANGE);
+    int dbw = half_w - 24;
+    Graphics::FillRoundedRect(x+16, ly+58, dbw, 10, 4, TM_GRAPH_BG);
+    if(disk_pct > 0) Graphics::FillRoundedRect(x+16, ly+58, dbw*disk_pct/100, 10, 4, TM_ORANGE);
 
-    Graphics::FillRoundedRect(x+half_w+20, ly, half_w, 70, 6, TM_PANEL);
+    Graphics::FillRoundedRect(x+half_w+20, ly, half_w, 80, 6, TM_PANEL);
     Graphics::DrawString(x+half_w+28, ly+6, "Network", TM_CYAN, 0xFF000000);
-    char nio[32]="RX: "; int_to_str(net_rx_kb,t2,8); sapp(nio,t2,32); sapp(nio," KB",32);
-    Graphics::DrawString(x+half_w+28, ly+26, nio, TM_DIM, 0xFF000000);
-    scpy(nio,"TX: ",32); int_to_str(net_tx_kb,t2,8); sapp(nio,t2,32); sapp(nio," KB",32);
-    Graphics::DrawString(x+half_w+28, ly+44, nio, TM_DIM, 0xFF000000);
-    Graphics::DrawString(x+w-80, ly+26, "eth0", TM_GREEN, 0xFF000000);
-    ly += 80;
+    char nio[32]="RX: "; int_to_str(net_rx_kb,t2,12); sapp(nio,t2,32); sapp(nio," KB",32);
+    Graphics::DrawString(x+half_w+28, ly+24, nio, TM_DIM, 0xFF000000);
+    scpy(nio,"TX: ",32); int_to_str(net_tx_kb,t2,12); sapp(nio,t2,32); sapp(nio," KB",32);
+    Graphics::DrawString(x+half_w+28, ly+40, nio, TM_DIM, 0xFF000000);
+    Graphics::DrawString(x+w-48, ly+6, "eth0", TM_GREEN, 0xFF000000);
+    ly += 88;
 
-    Graphics::FillRoundedRect(x+8, ly, w-16, 120, 6, TM_PANEL);
+    // system panel sized (150) to fully contain the two rows of device panes
+    // below; the old 120 left the panes hanging past the panel + the content
+    // area, where they got clipped. (satoru)
+    Graphics::FillRoundedRect(x+8, ly, w-16, 150, 6, TM_PANEL);
     // uptime
     int hrs=uptime_sec/3600, mins=(uptime_sec%3600)/60, secs=uptime_sec%60;
     char up[48]="Uptime: ";
@@ -819,9 +873,13 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     scpy(cpu_pane_1, cpu_brand, 64);
     int_to_str(cpu_cores, t2, 8); sapp(cpu_pane_2, t2, 64); sapp(cpu_pane_2, "  Thr: ", 64);
     int_to_str(cpu_threads, t2, 8); sapp(cpu_pane_2, t2, 64);
-    // live per-core current mhz from cpufreq. (satoru)
-    char pane_cur_mhz[40]; tm_build_percore_mhz(pane_cur_mhz, 40);
-    sapp(cpu_pane_2, "  MHz: ", 64); sapp(cpu_pane_2, pane_cur_mhz, 64);
+    // a single representative current MHz (cpufreq cur is uniform across cores)
+    // instead of a per-core list that overflowed into the GPU pane. (satoru)
+    const CPUFreq::CPUInfo* ci0 = CPUFreq::GetCPU(0);
+    if(ci0 && ci0->present){
+        sapp(cpu_pane_2, "  ", 64);
+        int_to_str((int)ci0->cur_mhz, t2, 8); sapp(cpu_pane_2, t2, 64); sapp(cpu_pane_2, " MHz", 64);
+    }
     tm_format_gpu_pane(gpr, gpu_pane_1, 64, gpu_pane_2, 64);
     sapp(wifi_pane_1, WiFi::StateString(), 64);
     WiFiNetwork* connected_wifi = WiFi::GetConnectedNetwork();
@@ -841,20 +899,26 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
 }
 
 void TaskManagerApp::RenderDetails(int x,int y,int w,int h){
-    // detailed view  -  all columns
+    // detailed view  -  header x and value x share one set of offsets so the
+    // numbers line up under their labels (Thr/Pri used to be a few px off). (satoru)
+    const int D_PID=4, D_USER=40, D_NAME=104, D_CPU=224, D_MEM=264, D_THR=336, D_PRI=372, D_IOR=408, D_IOW=470;
     Graphics::FillRect(x,y,w,ROW_H,TM_HEAD_BG);
-    Graphics::DrawString(x+4,  y+3,"PID",  TM_DIM,0xFF000000);
-    Graphics::DrawString(x+36, y+3,"User", TM_DIM,0xFF000000);
-    Graphics::DrawString(x+100,y+3,"Name", TM_DIM,0xFF000000);
-    Graphics::DrawString(x+220,y+3,"CPU", TM_DIM,0xFF000000);
-    Graphics::DrawString(x+260,y+3,"Mem",  TM_DIM,0xFF000000);
-    Graphics::DrawString(x+320,y+3,"Thr",  TM_DIM,0xFF000000);
-    Graphics::DrawString(x+350,y+3,"Pri",  TM_DIM,0xFF000000);
-    Graphics::DrawString(x+390,y+3,"I/O R",TM_DIM,0xFF000000);
-    Graphics::DrawString(x+440,y+3,"I/O W",TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_PID, y+3,"PID",  TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_USER,y+3,"User", TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_NAME,y+3,"Name", TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_CPU, y+3,"CPU",  TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_MEM, y+3,"Mem",  TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_THR, y+3,"Thr",  TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_PRI, y+3,"Pri",  TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_IOR, y+3,"I/O R",TM_DIM,0xFF000000);
+    Graphics::DrawString(x+D_IOW, y+3,"I/O W",TM_DIM,0xFF000000);
     y+=ROW_H;
 
     int vis=(h-ROW_H)/ROW_H;
+    last_list_vis = vis;
+    int max_off = proc_count - vis; if(max_off < 0) max_off = 0;
+    if(scroll_offset > max_off) scroll_offset = max_off;
+    if(scroll_offset < 0) scroll_offset = 0;
     for(int i=0;i<vis && (i+scroll_offset)<proc_count;i++){
         int idx=i+scroll_offset;
         TMProcess* p=&procs[idx];
@@ -862,23 +926,28 @@ void TaskManagerApp::RenderDetails(int x,int y,int w,int h){
         if(idx==selected_proc) Graphics::FillRect(x,ry,w,ROW_H,TM_SEL_BG);
         else if(i%2) Graphics::FillRect(x,ry,w,ROW_H,TM_ROW_ALT);
 
-        char num[8];
-        int_to_str(p->pid,num,8);
-        Graphics::DrawString(x+4,  ry+2,num,TM_DIM,0xFF000000);
-        Graphics::DrawString(x+36, ry+2,p->user,TM_DIM,0xFF000000);
-        Graphics::DrawString(x+100,ry+2,p->name,TM_TEXT,0xFF000000);
-        int_to_str(p->cpu_pct,num,8); sapp(num,"%",8);
-        Graphics::DrawString(x+220,ry+2,num,p->cpu_pct>20?TM_ORANGE:TM_DIM,0xFF000000);
-        char mem[16]={0}; int_to_str(p->mem_kb,mem,16); sapp(mem,"K",16);
-        Graphics::DrawString(x+260,ry+2,mem,TM_DIM,0xFF000000);
-        int_to_str(p->threads,num,8);
-        Graphics::DrawString(x+328,ry+2,num,TM_DIM,0xFF000000);
-        int_to_str(p->priority,num,8);
-        Graphics::DrawString(x+354,ry+2,num,TM_DIM,0xFF000000);
-        int_to_str(p->io_read_kb,num,8);
-        Graphics::DrawString(x+390,ry+2,num,TM_DIM,0xFF000000);
-        int_to_str(p->io_write_kb,num,8);
-        Graphics::DrawString(x+440,ry+2,num,TM_DIM,0xFF000000);
+        char num[12];
+        int_to_str(p->pid,num,12);
+        Graphics::DrawString(x+D_PID, ry+2,num,TM_DIM,0xFF000000);
+        // kernel vs user, colour-coded so the distinction reads at a glance. (satoru)
+        bool is_user = (p->flags & PROCESS_FLAG_USER) != 0;
+        Graphics::DrawString(x+D_USER,ry+2,p->user,is_user?TM_CYAN:TM_DIM,0xFF000000);
+        Graphics::DrawString(x+D_NAME,ry+2,p->name,TM_TEXT,0xFF000000);
+        int_to_str(p->cpu_pct,num,12); sapp(num,"%",12);
+        Graphics::DrawString(x+D_CPU, ry+2,num,p->cpu_pct>20?TM_ORANGE:TM_DIM,0xFF000000);
+        // memory: MB rollup over 1 MB, else KB  -  consistent with Processes. (satoru)
+        char mem[16]={0};
+        if(p->mem_kb >= 1024){ int_to_str(p->mem_kb/1024,mem,16); sapp(mem,"M",16); }
+        else                 { int_to_str(p->mem_kb,mem,16); sapp(mem,"K",16); }
+        Graphics::DrawString(x+D_MEM, ry+2,mem,TM_DIM,0xFF000000);
+        int_to_str(p->threads,num,12);
+        Graphics::DrawString(x+D_THR, ry+2,num,TM_DIM,0xFF000000);
+        int_to_str(p->priority,num,12);
+        Graphics::DrawString(x+D_PRI, ry+2,num,TM_DIM,0xFF000000);
+        int_to_str(p->io_read_kb,num,12);
+        Graphics::DrawString(x+D_IOR, ry+2,num,TM_DIM,0xFF000000);
+        int_to_str(p->io_write_kb,num,12);
+        Graphics::DrawString(x+D_IOW, ry+2,num,TM_DIM,0xFF000000);
     }
 }
 
@@ -893,6 +962,10 @@ void TaskManagerApp::RenderWindows(int x,int y,int w,int h){
     y += ROW_H;
 
     int vis = (h - ROW_H) / ROW_H;
+    last_list_vis = vis;
+    int max_off = window_count - vis; if(max_off < 0) max_off = 0;
+    if(scroll_offset > max_off) scroll_offset = max_off;
+    if(scroll_offset < 0) scroll_offset = 0;
     for(int i=0;i<vis && (i+scroll_offset)<window_count;i++){
         int idx = i + scroll_offset;
         TMWindowRow* row = &window_rows[idx];
@@ -1074,6 +1147,7 @@ bool TaskManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         for(int i=0;i<TM_TAB_COUNT;i++){
             int tw=slen(tabs[i])*8+20;
             if(mx>=tx && mx<tx+tw){
+                if(current_tab != (TMTab)i) scroll_offset = 0;  // fresh scroll per tab (satoru)
                 current_tab=(TMTab)i;
                 return true;
             }
@@ -1081,12 +1155,13 @@ bool TaskManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         }
     }
 
-    // column header click for sorting (processes tab)
+    // column header click for sorting (processes tab)  -  ranges mirror the
+    // PL_* column geometry so a header click hits the column it's under. (satoru)
     if(current_tab==TM_PROCESSES && my >= TAB_H+1 && my < TAB_H+1+ROW_H){
-        if(mx>=48 && mx<200){ sort_col=TM_SORT_NAME; sort_asc=!sort_asc; SortProcesses(); return true; }
-        if(mx>=200 && mx<258){ sort_col=TM_SORT_CPU; sort_asc=!sort_asc; SortProcesses(); return true; }
-        if(mx>=258 && mx<320){ sort_col=TM_SORT_MEM; sort_asc=!sort_asc; SortProcesses(); return true; }
-        if(mx>=8 && mx<48){ sort_col=TM_SORT_PID; sort_asc=!sort_asc; SortProcesses(); return true; }
+        if(mx>=PL_PID && mx<PL_NAME){ sort_col=TM_SORT_PID; sort_asc=!sort_asc; SortProcesses(); return true; }
+        if(mx>=PL_NAME && mx<PL_CPUBAR){ sort_col=TM_SORT_NAME; sort_asc=!sort_asc; SortProcesses(); return true; }
+        if(mx>=PL_CPUBAR && mx<PL_MEM){ sort_col=TM_SORT_CPU; sort_asc=!sort_asc; SortProcesses(); return true; }
+        if(mx>=PL_MEM && mx<PL_THR){ sort_col=TM_SORT_MEM; sort_asc=!sort_asc; SortProcesses(); return true; }
     }
 
     // process row click  -  if already selected, open action menu

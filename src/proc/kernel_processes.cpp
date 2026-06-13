@@ -307,11 +307,21 @@ static inline bool ui_activity_active() {
 
         if (g_gui_autorun_armed && (int32_t)(Timer::GetTicks() - autorun_target_ms) >= 0) {
             g_gui_autorun_armed = false;
-            SerialLogger::Log("[gui-autorun] launching terminal + queuing: ");
-            SerialLogger::Log(g_gui_autorun_cmd);
-            SerialLogger::Log("\r\n");
-            TerminalApp::Open();
-            TerminalApp::EnqueueCommand(g_gui_autorun_cmd);
+            // sentinel "@taskmgr": open the task manager instead of the terminal
+            // (headless ui-debug harness for the task manager overhaul). (satoru)
+            const char* cmd = g_gui_autorun_cmd;
+            bool open_taskmgr = (cmd[0]=='@' && cmd[1]=='t' && cmd[2]=='a' && cmd[3]=='s' &&
+                                 cmd[4]=='k' && cmd[5]=='m' && cmd[6]=='g' && cmd[7]=='r' && cmd[8]==0);
+            if (open_taskmgr) {
+                SerialLogger::Log("[gui-autorun] launching task manager\r\n");
+                DesktopEnvironment::LaunchTaskManager();
+            } else {
+                SerialLogger::Log("[gui-autorun] launching terminal + queuing: ");
+                SerialLogger::Log(g_gui_autorun_cmd);
+                SerialLogger::Log("\r\n");
+                TerminalApp::Open();
+                TerminalApp::EnqueueCommand(g_gui_autorun_cmd);
+            }
         }
 
         DesktopEnvironment::Update();

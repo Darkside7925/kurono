@@ -74,6 +74,8 @@ public:
 
     static void Render(void* win, int x, int y, int w, int h);
     static bool Input(void* win, int mx, int my, bool clicked, char key);
+    // scroll the active list by `delta` wheel notches (positive = down). (satoru)
+    static void Scroll(int delta);
 
     static void RefreshProcesses();
     static void Tick();   // call each frame to update perf
@@ -104,7 +106,9 @@ private:
     static int cpu_cores;
     static int mem_used_kb;
     static int mem_total_kb;
-    static int mem_cached_kb;
+    static int mem_free_kb;     // real free physical ram (pmm total - free) (satoru)
+    static int mem_heap_kb;     // kernel heap bytes in use (satoru)
+    static int mem_cached_kb;   // legacy name retained; unused by the honest model
     static int uptime_sec;
     static int net_rx_kb;
     static int net_tx_kb;
@@ -115,6 +119,9 @@ private:
     static int mem_history[60];
     static int hist_idx;
     static int tick_counter;
+    // rows visible in the list viewport on the last render  -  used to clamp
+    // wheel scrolling so the offset can't run past the end of the list. (satoru)
+    static int last_list_vis;
 
     static void RenderTabs(int x, int y, int w);
     static void RenderProcessList(int x, int y, int w, int h);
