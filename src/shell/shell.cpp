@@ -39,6 +39,8 @@
 #include "../drivers/mouse.h"
 #include "../drivers/keyboard.h"
 #include "../system/input_manager.h"
+#include "../security/supr.h"   // supr policy / passwd commands (satoru)
+#include "../security/ksa.h"    // ksa status for `supr policy` (satoru)
 
 //  kurono shell implementation
 
@@ -916,6 +918,7 @@ namespace ShellBuiltins {
     int cmd_pthtest(KuronoShell*, int, const char**, char*, int);
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
     int cmd_persisttest(KuronoShell*, int, const char**, char*, int);
+    int cmd_supr(KuronoShell*, int, const char**, char*, int);
 }
 
 void KuronoShell::RegisterBuiltins() {
@@ -962,6 +965,9 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("uptime",    "Print system uptime",          ENV_KURONO, "system",  cmd_uptime);
     RegisterCommand("pwd",       "Print working directory",      ENV_KURONO, "filesystem",cmd_pwd);
     RegisterCommand("usermode",  "Run ring-3 demo process",      ENV_KURONO, "system",  cmd_usermode);
+
+    // ksa / supr  -  hypervisor-backed privilege prompts + auth policy. (satoru)
+    RegisterCommand("supr",      "Privilege & auth policy (KSA)", ENV_KURONO, "security", cmd_supr);
 
     // alpine vm bridge commands  -  embed alpine into shell
     RegisterCommand("alpine",   "Run command in Alpine VM",     ENV_KURONO, "system",  cmd_alpine);
@@ -2130,6 +2136,147 @@ int cmd_kurono(KuronoShell*, int argc, const char** argv, char* out, int maxo) {
     }
 
     p = sappend(out, p, maxo, "kurono: unknown subcommand '");
+    p = sappend(out, p, maxo, sub);
+    p = sappend(out, p, maxo, "'\n");
+    return p;
+}
+
+// argv flag helpers for `supr`. (satoru)
+static bool supr_has_flag(int argc, const char** argv, const char* flag) {
+    for (int i = 1; i < argc; i++) if (seq(argv[i], flag)) return true;
+    return false;
+}
+// match "--auth=VALUE" → returns VALUE or nullptr. (satoru)
+static const char* supr_auth_value(int argc, const char** argv) {
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        const char* pre = "--auth=";
+        int k = 0; while (pre[k] && a[k] == pre[k]) k++;
+        if (!pre[k]) return a + k;
+    }
+    return nullptr;
+}
+
+//  supr  -  kurono privilege / auth policy control.
+//    supr policy                     show current policy + ksa status
+//    supr policy --auth=passwd|kvault|both [--sovereign-override]
+//    supr policy kvault disable --force --acknowledge-risk [--sovereign-override]
+//    supr policy kvault enable
+//    supr policy --auth=kvault --disable-passwd --acknowledge-risk
+//    supr policy passwd enable
+//    supr passwd                     change password (no ksa; normal flow)
+//    supr selftest                   run the ksa isolation self-test (logs to serial)
+//  every policy mutation is audited (even when ksa is disabled). (satoru)
+int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh;
+    int p = 0;
+    int sid = SUPR::GetCurrentSession();
+
+    if (argc < 2) {
+        p = sappend(out, p, maxo, "usage: supr policy | supr passwd | supr selftest\n");
+        return p;
+    }
+
+    const char* sub = argv[1];
+
+    if (seq(sub, "selftest")) {
+        bool ok = KSA::SelfTest();
+        p = sappend(out, p, maxo, "ksa selftest: ");
+        p = sappend(out, p, maxo, ok ? "PASS" : "FAIL");
+        p = sappend(out, p, maxo, " (see serial log for details)\n");
+        return p;
+    }
+
+    if (seq(sub, "passwd")) {
+        // normal password-change flow  -  NO ksa involvement, per spec. (satoru)
+        p = sappend(out, p, maxo, "supr passwd: interactive password change is GUI/login-driven.\n");
+        p = sappend(out, p, maxo, "(no ksa involved; uses the standard password flow)\n");
+        return p;
+    }
+
+    if (seq(sub, "policy")) {
+        bool sov   = supr_has_flag(argc, argv, "--sovereign-override");
+        bool force = supr_has_flag(argc, argv, "--force");
+        bool ack   = supr_has_flag(argc, argv, "--acknowledge-risk");
+        char err[160]; err[0] = 0;
+
+        // kvault enable/disable subforms. (satoru)
+        if (argc >= 3 && seq(argv[2], "kvault")) {
+            if (argc >= 4 && seq(argv[3], "disable")) {
+                bool ok = SUPR::DisableKvault(sid, force, ack, sov, err, sizeof(err));
+                p = sappend(out, p, maxo, ok ? "ksa (kvault) disabled.\n" : "refused: ");
+                if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
+                if (ok && SUPR::BothAuthDisabled())
+                    p = sappend(out, p, maxo, "WARNING: both auth factors are now disabled.\n");
+                return p;
+            }
+            if (argc >= 4 && seq(argv[3], "enable")) {
+                bool ok = SUPR::EnableKvault(sid, err, sizeof(err));
+                p = sappend(out, p, maxo, ok ? "ksa (kvault) enabled.\n" : "refused: ");
+                if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
+                return p;
+            }
+        }
+        if (argc >= 3 && seq(argv[2], "passwd")) {
+            if (argc >= 4 && seq(argv[3], "enable")) {
+                bool ok = SUPR::EnablePasswd(sid, err, sizeof(err));
+                p = sappend(out, p, maxo, ok ? "password auth enabled.\n" : "refused: ");
+                if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
+                return p;
+            }
+        }
+
+        // --disable-passwd (requires ksa active). (satoru)
+        if (supr_has_flag(argc, argv, "--disable-passwd")) {
+            bool ok = SUPR::DisablePasswd(sid, ack, sov, err, sizeof(err));
+            // also apply any --auth= mode given alongside (e.g. --auth=kvault).
+            const char* mode = supr_auth_value(argc, argv);
+            if (ok && mode && seq(mode, "kvault")) {
+                char e2[160]; e2[0]=0; SUPR::EnableKvault(sid, e2, sizeof(e2));
+            }
+            p = sappend(out, p, maxo, ok ? "password auth disabled.\n" : "refused: ");
+            if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
+            return p;
+        }
+
+        // --auth=mode. (satoru)
+        const char* mode = supr_auth_value(argc, argv);
+        if (mode) {
+            SUPRAuthMode m;
+            if (seq(mode, "passwd")) m = AUTH_PASSWD;
+            else if (seq(mode, "kvault")) m = AUTH_KVAULT;
+            else if (seq(mode, "both")) m = AUTH_BOTH;
+            else { p = sappend(out, p, maxo, "supr: --auth must be passwd|kvault|both\n"); return p; }
+            bool ok = SUPR::SetAuthMode(sid, m, sov, err, sizeof(err));
+            p = sappend(out, p, maxo, ok ? "auth policy set.\n" : "refused: ");
+            if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
+            if (ok && SUPR::BothAuthDisabled())
+                p = sappend(out, p, maxo, "WARNING: both auth factors are now disabled.\n");
+            return p;
+        }
+
+        // no mutation → show status. (satoru)
+        p = sappend(out, p, maxo, "KSA / SUPR auth policy\n");
+        p = sappend(out, p, maxo, "  password factor: ");
+        p = sappend(out, p, maxo, SUPR::IsPasswdEnabled() ? "ENABLED\n" : "disabled\n");
+        p = sappend(out, p, maxo, "  kvault (ksa)   : ");
+        p = sappend(out, p, maxo, SUPR::IsKvaultEnabled() ? "ENABLED\n" : "disabled\n");
+        p = sappend(out, p, maxo, "  effective mode : ");
+        SUPRAuthMode em = SUPR::GetAuthMode();
+        p = sappend(out, p, maxo, em == AUTH_BOTH ? "both\n" : (em == AUTH_KVAULT ? "kvault\n" : "passwd\n"));
+        p = sappend(out, p, maxo, "  ksa available  : ");
+        p = sappend(out, p, maxo, KSA::IsAvailable() ? "yes" : "no (hypervisor not present)");
+        p = sappend_char(out, p, maxo, '\n');
+        p = sappend(out, p, maxo, "  ksa prompt path: ");
+        p = sappend(out, p, maxo, KSA::IsAvailable()
+            ? (KSA::IsRealNestedVM() ? "nested VM\n" : "EPT-isolated context (nested-virt fallback)\n")
+            : "n/a\n");
+        if (SUPR::BothAuthDisabled())
+            p = sappend(out, p, maxo, "  WARNING: both auth factors disabled  -  escalations show a risk warning.\n");
+        return p;
+    }
+
+    p = sappend(out, p, maxo, "supr: unknown subcommand '");
     p = sappend(out, p, maxo, sub);
     p = sappend(out, p, maxo, "'\n");
     return p;

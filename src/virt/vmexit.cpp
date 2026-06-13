@@ -13,6 +13,7 @@
 #include "../drivers/mouse.h"
 #include "../linux/linux_devices.h"
 #include "v9fs.h"
+#include "../security/ksa.h"   // ksa restricted result channel (vmcall 0x4b) (satoru)
 
 CPUIDOverride VMExitHandler::cpuid_overrides[MAX_CPUID_OVERRIDES];
 int           VMExitHandler::cpuid_override_count = 0;
@@ -1050,6 +1051,37 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
         //  returns: eax = v9fs_err
         case 0x20: {
             V9FS::HandleVMCall(cpu->regs);
+            break;
+        }
+
+        //  0x4b ('K')  -  ksa restricted result channel.
+        //  this is the ONLY bridge out of the ksa isolated context. it is
+        //  READ-ONLY: there is no sub-function that writes an approval into
+        //  ksa memory, so the main os cannot forge a "yes". (satoru)
+        //  ecx(regs[1]) = sub-function:
+        //    KSA_SUB_GET_VERDICT(0): returns eax=completed, ebx=approved,
+        //                            ecx=have_cred_hash. the credential hash
+        //                            itself is never exposed over the channel  - 
+        //                            only supr (in-kernel) consumes it. (satoru)
+        //    KSA_SUB_GET_INFO(1):    returns eax=channel revision.
+        case KSA_VMCALL_CHANNEL: {
+            uint32_t subfn = cpu->regs[1]; // ecx
+            switch (subfn) {
+                case KSA_SUB_GET_VERDICT: {
+                    KSAVerdict v;
+                    bool ok = KSA::ReadVerdictForChannel(v);
+                    cpu->regs[0] = (ok && v.completed) ? 1 : 0; // eax
+                    cpu->regs[3] = v.approved ? 1 : 0;          // ebx
+                    cpu->regs[1] = v.have_cred_hash ? 1 : 0;    // ecx
+                    break;
+                }
+                case KSA_SUB_GET_INFO:
+                    cpu->regs[0] = KSA::ChannelRevision();
+                    break;
+                default:
+                    cpu->regs[0] = 0xFFFFFFFF;
+                    break;
+            }
             break;
         }
 

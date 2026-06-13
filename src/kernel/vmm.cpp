@@ -394,6 +394,76 @@ uint64_t KernelVMM::GetCurrentAddressSpace() {
     return current_cr3();
 }
 
+// walk to the leaf PT entry for virt_addr in root_phys, demoting a covering
+// 2mb huge page into a fresh 4kb page table first if necessary. returns a
+// pointer to the leaf uint64_t pte (host-virtual, identity-mapped) or nullptr
+// if the upper levels are absent / a 1gb huge page blocks the split. (satoru)
+static uint64_t* leaf_pte_demoting(uint64_t root_phys, uint64_t virt_addr,
+                                   bool* out_demoted) {
+    if (out_demoted) *out_demoted = false;
+    uint64_t* pml4 = phys_to_virt(root_phys);
+    uint16_t p4i = pml4_index(virt_addr);
+    if (!(pml4[p4i] & PTE_PRESENT)) return nullptr;
+
+    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint16_t p3i = pdpt_index(virt_addr);
+    if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return nullptr;
+
+    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint16_t p2i = pd_index(virt_addr);
+    if (!(pd[p2i] & PTE_PRESENT)) return nullptr;
+
+    if (pd[p2i] & PTE_HUGE) {
+        // demote the 2mb huge page to 512 identity 4kb leaves so we can
+        // surgically unmap individual frames. (satoru)
+        uint64_t huge_base  = pd[p2i] & ~0x1FFFFFULL;
+        uint64_t huge_flags = pd[p2i] & 0xFFFULL;
+        uint64_t new_pt_phys = alloc_table_page();
+        if (!new_pt_phys) return nullptr;
+        uint64_t* new_pt = phys_to_virt(new_pt_phys);
+        uint64_t leaf_flags = (huge_flags & ~PTE_HUGE) | PTE_PRESENT;
+        for (int i = 0; i < 512; i++) {
+            new_pt[i] = (huge_base + (uint64_t)i * PAGE_SIZE) | leaf_flags;
+        }
+        pd[p2i] = new_pt_phys | PTE_PRESENT | PTE_WRITABLE;
+        if (out_demoted) *out_demoted = true;
+    }
+
+    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    return &pt[pt_index(virt_addr)];
+}
+
+bool KernelVMM::IsolateFrames(uint64_t phys_base, uint64_t count) {
+    phys_base &= ~0xFFFULL;
+    bool any_demoted = false;
+    bool all_ok = true;
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t va = phys_base + i * PAGE_SIZE;   // identity: va == pa (satoru)
+        bool demoted = false;
+        uint64_t* pte = leaf_pte_demoting(pml4_phys, va, &demoted);
+        any_demoted = any_demoted || demoted;
+        if (!pte) { all_ok = false; continue; }
+        *pte = 0;   // zero the leaf  -  frame is now unmapped in the main os (satoru)
+    }
+    // demoting a huge page invalidates 512 large-page translations; a full
+    // flush is the safe way to drop any stale large-page tlb entries. (satoru)
+    if (any_demoted) FlushTLB();
+    else {
+        for (uint64_t i = 0; i < count; i++) InvalidatePage(phys_base + i * PAGE_SIZE);
+    }
+    return all_ok;
+}
+
+bool KernelVMM::RevealFrames(uint64_t phys_base, uint64_t count, uint64_t flags) {
+    phys_base &= ~0xFFFULL;
+    bool ok = true;
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t pa = phys_base + i * PAGE_SIZE;
+        if (!MapPage(pa, pa, flags)) ok = false;   // identity remap (satoru)
+    }
+    return ok;
+}
+
 bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
     bool demoted = false;
     bool mapped = map_page_in_root_ex(pml4_phys, virt_addr, phys_addr, flags, &demoted);

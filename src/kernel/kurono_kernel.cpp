@@ -37,6 +37,7 @@
 #include "../fs/vfs.h"
 #include "../fs/kvfs.h"
 #include "../fs/persist.h"
+#include "../drivers/nvme.h"   // command-count stats for the kfstest speed proof (satoru)
 #include "../drivers/usb.h"
 #include "../linux/ext4.h"
 #include "../proc/scheduler.h"
@@ -56,6 +57,7 @@
 #include "../shell/windows_cmds.h"
 #include "../kcl/kcl.h"
 #include "../security/supr.h"
+#include "../security/ksa.h"
 #include "../packages/pkgmgr.h"
 #include "../apps/python_interp.h"
 #include "elf_loader.h"
@@ -960,6 +962,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     bool boot_ffmpeg_test = false;
     bool boot_dyntest_test = false;   // run the dynamic-pie ld-kurono smoke test (satoru)
     bool boot_logcheck = false;       // dump /kurono/var/log contents to verify logging (satoru)
+    // headless two-boot kfs persistence test (kurono.kfstest): boot 1 writes user
+    // data + times SaveTree then powers off; boot 2 verifies it restored from the
+    // KFS volume + times LoadTree, logs PASS/FAIL, then powers off. (satoru)
+    bool boot_kfstest = false;
+    // ksa isolation self-test: spawn the isolated context, prove the main os has
+    // no page-table mapping into it, exercise the read-only verdict channel, then
+    // tear down. latched early like the other smoke-test flags. (satoru)
+    bool boot_ksa_test = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     char boot_cli_run[160];
@@ -1001,8 +1011,16 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.logcheck=1") || boot_has_token(boot_cmdline, "kurono.logcheck")) {
             boot_logcheck = true;
         }
+        // latch the headless two-boot kfs persistence test flag (see decl). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kfstest=1") || boot_has_token(boot_cmdline, "kurono.kfstest")) {
+            boot_kfstest = true;
+        }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
+        }
+        // ksa isolation self-test gate. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.ksa.test=1") || boot_has_token(boot_cmdline, "kurono.ksa.test")) {
+            boot_ksa_test = true;
         }
         // smp 3d: run user processes on the application processors (opt-in). set the
         // gate BEFORE StartAPs so each ap dispatches from the moment it comes up;
@@ -1608,9 +1626,86 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // otherwise the default tree from init() stays. the /usr/bin binary re-seeding
     // below re-fills the large entries KFS deliberately doesn't carry. (satoru)
     if (PersistStore::Available()) {
+        uint64_t t0 = Timer::GetRealMs64();
         bool ok = PersistStore::LoadTree();
-        if (ok) SerialLogger::Log("[KVFS] restored persistent state from KFS\r\n");
-        else    SerialLogger::Log("[KVFS] no KFS volume to restore (fresh disk)\r\n");
+        uint64_t t1 = Timer::GetRealMs64();
+        if (ok) {
+            SerialLogger::Log("[KVFS] restored persistent state from KFS in ");
+            SerialLogger::LogDec((int)(t1 - t0)); SerialLogger::Log(" ms\r\n");
+        } else {
+            SerialLogger::Log("[KVFS] no KFS volume to restore (fresh disk)\r\n");
+        }
+    }
+    // headless two-boot kfs persistence test (gated by cmdline kurono.kfstest):
+    // boot 1  -  no marker present after restore  -  writes a small user-data tree
+    // under /home/user/.kfstest, times PersistStore::SaveTree() (the KFS format +
+    // mirror + sync), logs the byte count + ms, then powers off. boot 2  -  the same
+    // disk image  -  the restore above brings the tree back, so the marker IS present;
+    // we verify each file's content + the deep path, log PASS/FAIL + the LoadTree
+    // ms, then power off. this exercises the whole KFS persist/restore loop with no
+    // interactive shell, and the timing proves the multi-page-dma speed. (satoru)
+    if (boot_kfstest) {
+        SerialLogger::Log("[KFSTEST] begin\r\n");
+        const char* marker = "/home/user/.kfstest/marker";
+        const char* big    = "/home/user/.kfstest/big.bin";
+        const char* deep   = "/etc/kfstest/deep/nested/file.txt";
+        const char* MVAL   = "kurono-kfs-twoboot-v1";
+        const char* DVAL   = "deep-nested-payload";
+        if (KVFS::Exists(marker)) {
+            // boot 2: the restore should have rebuilt these from the KFS volume. (satoru)
+            bool pass = true;
+            char buf[64]; buf[0] = 0;
+            KVFS::ReadString(marker, buf, (int)sizeof(buf));
+            if (!streq(buf, MVAL)) { pass = false; SerialLogger::Log("[KFSTEST] marker content mismatch\r\n"); }
+            char dbuf[64]; dbuf[0] = 0;
+            if (!KVFS::Exists(deep)) { pass = false; SerialLogger::Log("[KFSTEST] deep path missing\r\n"); }
+            else { KVFS::ReadString(deep, dbuf, (int)sizeof(dbuf)); if (!streq(dbuf, DVAL)) { pass = false; SerialLogger::Log("[KFSTEST] deep content mismatch\r\n"); } }
+            // the big file is a 256 KB pattern (1 + (i&0xff)); verify a few bytes. (satoru)
+            int bsz = KVFS::GetFileSize(big);
+            if (bsz != 256 * 1024) { pass = false; SerialLogger::Log("[KFSTEST] big size wrong: "); SerialLogger::LogDec(bsz); SerialLogger::Log("\r\n"); }
+            else {
+                static uint8_t vbuf[256 * 1024];
+                int got = KVFS::ReadFile(big, vbuf, sizeof(vbuf));
+                bool content_ok = (got == 256 * 1024);
+                if (content_ok) for (int i = 0; i < 256 * 1024; i++) if (vbuf[i] != (uint8_t)(1 + (i & 0xff))) { content_ok = false; SerialLogger::Log("[KFSTEST] big content mismatch at "); SerialLogger::LogDec(i); SerialLogger::Log("\r\n"); break; }
+                if (!content_ok) pass = false;
+            }
+            SerialLogger::Log(pass ? "[KFSTEST] PASS: user data restored from KFS volume across reboot\r\n"
+                                   : "[KFSTEST] FAIL: restored data did not match\r\n");
+        } else {
+            // boot 1: write the user-data tree, then time the KFS save. (satoru)
+            KVFS::Mkdirs("/home/user/.kfstest");
+            KVFS::Mkdirs("/etc/kfstest/deep/nested");
+            KVFS::WriteString(marker, MVAL);
+            KVFS::WriteString(deep, DVAL);
+            static uint8_t pat[256 * 1024];
+            for (int i = 0; i < 256 * 1024; i++) pat[i] = (uint8_t)(1 + (i & 0xff));
+            KVFS::WriteFile(big, pat, sizeof(pat));
+            SerialLogger::Log("[KFSTEST] boot1 wrote marker + deep + 256KB big.bin\r\n");
+            if (PersistStore::Available()) {
+                // snapshot the nvme write counters around SaveTree so we can show the
+                // multi-page-dma payoff: how many real commands moved the bytes vs how
+                // many the old 4kb/command (single-prp1) path would have needed. (satoru)
+                uint64_t wc0 = NVMe::GetWriteCount(); uint64_t wb0 = NVMe::GetBytesWritten();
+                uint64_t s0 = Timer::GetRealMs64();
+                bool ok = PersistStore::SaveTree();
+                uint64_t s1 = Timer::GetRealMs64();
+                uint64_t cmds = NVMe::GetWriteCount() - wc0;
+                uint64_t bytes = NVMe::GetBytesWritten() - wb0;
+                uint64_t old_cmds = (bytes + 4095) / 4096;   // one page per command on the old path (satoru)
+                SerialLogger::Log(ok ? "[KFSTEST] boot1 SaveTree OK in " : "[KFSTEST] boot1 SaveTree FAILED in ");
+                SerialLogger::LogDec((int)(s1 - s0)); SerialLogger::Log(" ms\r\n");
+                SerialLogger::Log("[KFSTEST] boot1 nvme write: "); SerialLogger::LogDec((int)bytes);
+                SerialLogger::Log(" bytes in "); SerialLogger::LogDec((int)cmds);
+                SerialLogger::Log(" multi-page cmds (old 4kb/cmd path: ");
+                SerialLogger::LogDec((int)old_cmds); SerialLogger::Log(" cmds)\r\n");
+                SerialLogger::Log("[KFSTEST] boot1 done; reboot with the same disk to verify\r\n");
+            } else {
+                SerialLogger::Log("[KFSTEST] FAIL: no nvme data disk -> cannot persist\r\n");
+            }
+        }
+        SerialLogger::Log("[KFSTEST] end; powering off\r\n");
+        HAL::PowerOff();
     }
     // bring up the usb host controller + hid interrupt polling (no-op if no xhci). (satoru)
     SerialLogger::Log("[USB] Init...\r\n");
@@ -1687,6 +1782,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
     SerialLogger::Log("[SUPR] Init...\r\n");
     SUPR::Init();
+
+    // ksa isolation self-test (kurono.ksa.test): prove the main os has no
+    // page-table mapping into the isolated prompt region and that the verdict
+    // only crosses via the read-only channel. logs KSA-SELFTEST lines to
+    // serial. headless-verifiable; does not gate normal boot. (satoru)
+    if (boot_ksa_test) {
+        SerialLogger::Log("[KSA] running boot self-test...\r\n");
+        bool ksa_ok = KSA::SelfTest();
+        SerialLogger::Log(ksa_ok ? "[KSA] self-test PASS\r\n" : "[KSA] self-test FAIL\r\n");
+        bool pol_ok = SUPR::PolicySelfTest();
+        SerialLogger::Log(pol_ok ? "[KSA] policy self-test PASS\r\n" : "[KSA] policy self-test FAIL\r\n");
+    }
 
     SerialLogger::Log("[PackageManager] Init...\r\n");
     PackageManager::Init();

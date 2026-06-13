@@ -67,6 +67,13 @@ time  -  this is what made the two-boot persistence test complete within the boo
 window. The bitmap and inode table are cached in RAM during a session and flushed
 in `Sync()` after a batch of writes.
 
+**Verified speed.** With the headless two-boot test (`kurono.kfstest`, see §7), a
+save of the user-data tree (≈ 0.95 MB including a 256 KB test file) goes to disk
+in **46 multi-page NVMe commands and ~5 ms**; the old single-page path
+(4 KB / command, `prp1` only) would have needed **237 commands** for the same
+bytes. The restore (mount + walk + rebuild KVFS) completes in **~4 ms**. The 256 KB
+file's every byte round-trips correctly across the reboot.
+
 This snapshot model trades in-place mutation for simplicity and speed: there is
 no free-list reuse or fragmentation handling, because each save starts clean.
 
@@ -91,7 +98,125 @@ KFS is driven entirely by `PersistStore` (`src/fs/persist.cpp`):
 
 See [KVFS.md](KVFS.md) §4 for how this fits the overall persistence flow.
 
-## 7. Related files
+## 7. FUSE-compatible on-disk spec
+
+KFS is intentionally simple enough to mount on Linux with a small FUSE driver.
+The layout below is the complete, authoritative format  -  a `kfs-fuse` driver only
+has to read it; it never needs Kurono-internal state.
+
+**Conventions.** All multi-byte integers are **little-endian**. The block size is
+**4096 bytes** (`block_size` in the superblock; reject anything else). All
+structures are tightly packed (`__attribute__((packed))`); offsets below are exact
+byte offsets within the structure. Block numbers are absolute, 0-based 4 KB block
+indices into the device.
+
+**Superblock  -  block 0** (`KFSSuper`, fields in order):
+
+| Off | Type | Field | Notes |
+| --- | --- | --- | --- |
+| 0 | u32 | `magic` | `0x4B465331` ("KFS1") |
+| 4 | u32 | `version` | `1` |
+| 8 | u32 | `block_size` | `4096` |
+| 12 | u32 | `total_blocks` | volume size in blocks |
+| 16 | u32 | `inode_count` | number of inode slots |
+| 20 | u32 | `bitmap_start` | first bitmap block (always `1`) |
+| 24 | u32 | `bitmap_blocks` | bitmap length in blocks |
+| 28 | u32 | `inode_start` | first inode-table block |
+| 32 | u32 | `inode_blocks` | inode-table length in blocks |
+| 36 | u32 | `data_start` | first data block |
+| 40 | u32 | `free_blocks` | running free count (advisory) |
+| 44 | u32 | `crc` | CRC32 of bytes `[0, 44)` |
+
+`crc` is the standard CRC32 (reflected, polynomial `0xEDB88320`, init/xor-out
+`0xFFFFFFFF`) over the 44 bytes preceding it. A mounter validates `magic`,
+`version`, `block_size`, then `crc`.
+
+**Free-block bitmap  -  blocks `bitmap_start .. bitmap_start+bitmap_blocks-1`.**
+1 bit per block, LSB-first within each byte: block `b`'s bit is
+`bitmap[b >> 3] & (1 << (b & 7))`. Bit **set = used**. Metadata blocks
+(`0 .. data_start-1`) are marked used at format time. The bitmap is advisory for a
+read-only FUSE driver (file extents are found through inodes), but a read-write
+driver must honor it.
+
+**Inode table  -  blocks `inode_start ..`,** 32 inodes per block, each exactly **128
+bytes** (`KFS_INODE_SIZE`). Inode number `n` lives at byte offset `n * 128` from
+`inode_start`'s base. **Inode 0 is reserved** (`type == FREE`, means "no inode").
+**Inode 1 is the root directory.** `KFSInode` fields:
+
+| Off | Type | Field | Notes |
+| --- | --- | --- | --- |
+| 0 | u32 | `type` | `0`=free, `1`=file, `2`=dir |
+| 4 | u16 | `mode` | unix `rwxrwxrwx` |
+| 6 | u16 | `uid` |  |
+| 8 | u16 | `gid` |  |
+| 10 | u16 | `_pad0` | 0 |
+| 12 | u32 | `size` | bytes (file) / dir-data bytes (dir) |
+| 16 | u32 | `ctime` | seconds (boot-relative in this build) |
+| 20 | u32 | `mtime` |  |
+| 24 | u32 | `atime` |  |
+| 28 | u32 | `nlink` |  |
+| 32 | u32×13 | `direct[13]` | data block numbers; `0` = unused |
+| 84 | u32 | `indirect` | block of up to 1024 u32 block numbers |
+| 88 | u32×8 | `_pad1[8]` | reserved → 128 bytes |
+
+A file's data blocks are `direct[0..12]` then, if `size` needs more than 13
+blocks, the `indirect` block holds the remaining block numbers (1024 u32 entries,
+little-endian). Max file size is `(13 + 1024) × 4096 ≈ 4.05 MB`. In the current
+snapshot writer every file occupies one **contiguous** run starting at `direct[0]`,
+but a conformant reader must not assume contiguity  -  it must follow the pointers.
+
+**Directory data** is an array of **64-byte** `KFSDirEnt` entries (64 per block),
+stored in the directory inode's data blocks:
+
+| Off | Type | Field | Notes |
+| --- | --- | --- | --- |
+| 0 | u32 | `inode` | child inode number; `0` = empty slot |
+| 4 | u16 | `name_len` | name length (≤ 55) |
+| 6 | u16 | `type` | listing hint (`1`=file, `2`=dir) |
+| 8 | char[56] | `name` | NUL-terminated, up to 55 chars |
+
+To enumerate a directory, read its data blocks and emit every entry with
+`inode != 0`. There are no `.`/`..` entries on disk  -  a FUSE driver synthesizes
+them. The current writer uses only the 13 direct blocks for directory data (it
+never grows a directory past `13 × 64 = 832` entries); a reader should still walk
+`indirect` for forward compatibility.
+
+A minimal read-only `kfs-fuse`: read the superblock, validate it, read the inode
+table (and bitmap) into memory, then implement `getattr`/`readdir`/`read` by
+resolving paths through `dir` inodes and reading file extents via `direct` +
+`indirect`. No journaling or in-place writes are required for read-only use.
+
+## 8. Headless two-boot test
+
+The whole persist/restore loop is exercised without an interactive shell via the
+`kurono.kfstest` kernel cmdline token (parsed in `kurono_kernel.cpp` alongside the
+other `kurono.*` tokens; the hook runs right after the boot-time `LoadTree`):
+
+- **Boot 1** (no marker present after restore): writes `/home/user/.kfstest/marker`,
+  a deep nested `/etc/kfstest/deep/nested/file.txt`, and a 256 KB
+  `/home/user/.kfstest/big.bin` (byte pattern `1 + (i & 0xff)`), times
+  `PersistStore::SaveTree()`, logs the byte/command counts (`[KFSTEST] boot1 nvme
+  write: ...`), then powers off.
+- **Boot 2** (same disk): the boot-time restore rebuilds the tree, so the marker is
+  present; the hook verifies the marker string, the deep path's content, and every
+  byte of `big.bin`, logs `[KFSTEST] PASS`/`FAIL` and the restore time, then powers
+  off.
+
+Run it headless (BIOS path, fresh disk for boot 1, same disk for boot 2):
+
+```
+qemu-img create -f raw /tmp/kfs_test.img 256M
+qemu-system-x86_64 -machine pc,vmport=off -cpu host -smp 4 -m 4G \
+  -cdrom build/kurono.iso -vga virtio -no-reboot -enable-kvm \
+  -drive file=/tmp/kfs_test.img,if=none,id=kdata,format=raw \
+  -device nvme,serial=kuronodata,drive=kdata \
+  -display none -serial file:/tmp/kfs_serial.log
+```
+
+with a grub entry that appends `kurono.text=1 kurono.kfstest=1`. Boot twice; the
+second run logs `[KFSTEST] PASS`.
+
+## 9. Related files
 
 - `src/fs/kfs.h`  -  on-disk format spec + API (the authoritative reference)
 - `src/fs/persist.cpp`  -  `PersistStore`, the only KFS caller

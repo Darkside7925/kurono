@@ -468,7 +468,12 @@ Kurono includes a Type 1 hypervisor stack designed for Linux guest boot and devi
 - **Guest lifecycle**
   - `CreateVM`, `RunVM`, `PauseVM`, `ResumeVM`, `DestroyVM`
   - Per-cycle VM run helpers
-  - VMCALL support for NOP, info, shutdown, and reboot
+  - VMCALL support for NOP, info, shutdown, reboot, GPU/audio/net/9p bridges,
+    and the **KSA read-only authorization-verdict channel** (`0x4B`)
+
+- **KSA secure-authorization context** (see Security section)
+  - EPT-isolated prompt region carved from physical memory and unmapped from the
+    main-OS page tables; used to back hypervisor-arbitrated privilege prompts
 
 - **Linux guest boot**
   - bzImage parser and Linux boot protocol v2.15
@@ -511,8 +516,25 @@ Kurono includes a Type 1 hypervisor stack designed for Linux guest boot and devi
 - **SUPR privilege system**
   - privilege escalation with timeout
   - audit logging
-  - Guest/User/Admin/Root roles
+  - Guest/User/Admin/Root/Sovereign roles
   - salted password hashing
+
+- **KSA  -  Kurono Secure Authorization (hypervisor-backed privilege prompts)**
+  - Kurono's answer to Windows UAC, but the prompt is rendered and arbitrated
+    inside a hypervisor-isolated region the main OS has **no page-table mapping
+    into**  -  ring-0 malware in the main OS can't read it or auto-approve it
+  - the verdict (approve/deny + salted credential hash) crosses back through a
+    single **read-only** VMCALL channel (`0x4B`); there is no path to inject a
+    forged approval from the main OS
+  - auth policy via `supr policy --auth=passwd|kvault|both`; disabling either
+    factor needs explicit acknowledgement, and disabling *both* requires
+    `--sovereign-override` (Sovereign role only)  -  all changes audited even when
+    KSA is off
+  - on a host without nested VMX (e.g. Kurono under KVM/QEMU) the prompt runs as
+    an **EPT-isolated guest context** rather than a separately launched VM; the
+    memory-isolation and read-only-channel guarantees still hold and are proven
+    by a runtime self-test (`kurono.ksa.test=1` / `supr selftest`). See
+    `docs/developers/security/KSA.md`.
 
 - **User management**
   - multiple users
