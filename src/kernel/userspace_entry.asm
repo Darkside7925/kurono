@@ -4,8 +4,9 @@ section .text
 global UserspaceEnter
 global UserspaceResume
 
-; int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext* ctx)
-;   rdi = rip, rsi = user rsp, rdx = ctx
+; int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext* ctx,
+;                    uint64_t fs_base)
+;   rdi = rip, rsi = user rsp, rdx = ctx, rcx = fs_base
 UserspaceEnter:
     push rbx
     push rbp
@@ -23,6 +24,20 @@ UserspaceEnter:
     mov es, ax
     mov fs, ax
     mov gs, ax
+
+    ; loading the fs SELECTOR above reset fsbase to the descriptor base (0). a
+    ; dynamic pie needs its tls thread pointer live before _start runs, so
+    ; program MSR_FS_BASE (0xC0000100) from rcx now, after the selector load and
+    ; before iretq. rcx==0 (static binaries) -> leave it; they set their own fs
+    ; via arch_prctl. clobbers rax/rcx/rdx, all dead here (ctx already saved). (satoru)
+    test rcx, rcx
+    jz .no_user_fsbase
+    mov rax, rcx
+    mov rdx, rcx
+    shr rdx, 32
+    mov ecx, 0xC0000100
+    wrmsr
+.no_user_fsbase:
 
     push qword 0x1B
     push rsi

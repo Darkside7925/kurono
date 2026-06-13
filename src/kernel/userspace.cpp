@@ -309,11 +309,24 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
 
     // Build SysV initial stack with argc/argv/envp/auxv.  Must happen
     // *after* address-space activation so writes land in the user's
-    // physical pages.
-    uint64_t entry_rsp = build_initial_stack(proc->user_stack_top, argv, envp, proc);
-    if (!entry_rsp) entry_rsp = proc->user_stack_top;
+    // physical pages.  a dynamic pie is the exception: ld-kurono already
+    // built its stack (with the complete auxv: at_phdr/at_base/at_entry of the
+    // loaded image) at proc->rsp, so enter there as-is  -  rebuilding would drop
+    // that auxv and break musl's tls/dynamic startup. (satoru)
+    uint64_t entry_rsp;
+    if (proc->flags & PROCESS_FLAG_STACK_READY) {
+        entry_rsp = proc->rsp;
+    } else {
+        entry_rsp = build_initial_stack(proc->user_stack_top, argv, envp, proc);
+        if (!entry_rsp) entry_rsp = proc->user_stack_top;
+    }
 
-    int exit_code = UserspaceEnter(proc->rip, entry_rsp, &u.return_context);
+    // enter ring-3. the tls thread pointer (fs base) is programmed INSIDE
+    // UserspaceEnter  -  after it reloads the fs selector (which on x86-64 zeroes
+    // fsbase) and right before iretq. a dynamic pie set proc->fs_base via
+    // ld-kurono's install_main_tls; static binaries pass 0 and set their own fs
+    // later via arch_prctl. resume (preempt) reprograms fs via LoadUserFrame. (satoru)
+    int exit_code = UserspaceEnter(proc->rip, entry_rsp, &u.return_context, proc->fs_base);
 
     KernelVMM::ActivateAddressSpace(u.kernel_address_space);
     if (u.previous_process && u.previous_process->is_user()) {

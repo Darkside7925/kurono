@@ -71,6 +71,10 @@ constexpr uint32_t PROCESS_FLAG_USER = 1 << 0;
 // clone_vm|clone_thread). such a task must not free the shared address_space
 // or the shared user stack when it exits  -  only its own kernel stack. (satoru)
 constexpr uint32_t PROCESS_FLAG_THREAD = 1 << 1;
+// the user stack (argc/argv/envp/auxv) is already built  -  by ld-kurono's
+// ExecPIE for a dynamic pie  -  so the runner must enter at proc->rsp as-is and
+// must NOT rebuild the stack (that would drop ld-kurono's complete auxv). (satoru)
+constexpr uint32_t PROCESS_FLAG_STACK_READY = 1 << 2;
 
 struct Process {
     uint32_t pid;

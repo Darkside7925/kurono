@@ -418,6 +418,12 @@ public:
     static int64_t Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             uint64_t edx, uint64_t esi, uint64_t edi);
 
+    // public so the x86_64 SYSCALL path can route mmap straight here with the
+    // full 64-bit file offset (a5/r9)  -  the i386 dispatch drops it, which breaks
+    // file-backed mmap of .so segments at non-zero offsets. (satoru)
+    static int64_t sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
+                            uint32_t flags, int fd, uint64_t offset);
+
     // x86_64-ABI stat family: same kvfs/ext4 resolution as the i386
     // sys_stat/sys_fstat handlers, but they fill the 64-bit
     // `struct LinuxStat64` layout and validate the user statbuf pointer.
@@ -499,8 +505,6 @@ private:
     static int32_t sys_dup2(int oldfd, int newfd);
     static int32_t sys_ioctl(int fd, uint32_t cmd, uint32_t arg);
     static int32_t sys_writev(int fd, uintptr_t iov, uint64_t iovcnt);
-    static int64_t sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
-                            uint32_t flags, int fd, uint64_t offset);
     static int32_t sys_munmap(uintptr_t addr, uint64_t length);
     static int32_t sys_mprotect(uintptr_t addr, uint64_t length, uint32_t prot);
     static int32_t sys_nanosleep(uintptr_t req, uintptr_t rem);

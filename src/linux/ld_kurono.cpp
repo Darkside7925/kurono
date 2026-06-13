@@ -1337,6 +1337,84 @@ void push_qword(Process* proc, uint64_t* sp_ref, uint64_t v) {
     *(uint64_t*)(uintptr_t)(phys + (addr & (PAGE_SIZE - 1))) = v;
 }
 
+// write len bytes from kernel `src` (or zero-fill if src==null) to user va
+// `dst`, page by page  -  tls block pages are individually allocated and not
+// physically contiguous, so each page is resolved through the address space
+// separately, and writes that straddle a page boundary are split. (satoru)
+bool write_user_mem(Process* proc, uint64_t dst, const uint8_t* src, uint64_t len) {
+    uint64_t done = 0;
+    while (done < len) {
+        uint64_t va    = dst + done;
+        uint64_t page  = va & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t off   = va & (PAGE_SIZE - 1);
+        uint64_t chunk = PAGE_SIZE - off;
+        if (chunk > len - done) chunk = len - done;
+        uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, page);
+        if (!phys) return false;
+        uint8_t* d = (uint8_t*)(uintptr_t)(phys + off);
+        if (src) for (uint64_t i = 0; i < chunk; i++) d[i] = src[done + i];
+        else     for (uint64_t i = 0; i < chunk; i++) d[i] = 0;
+        done += chunk;
+    }
+    return true;
+}
+inline bool write_user_u64(Process* proc, uint64_t dst, uint64_t v) {
+    return write_user_mem(proc, dst, (const uint8_t*)&v, 8);
+}
+
+// install the main thread's variant-2 tls + thread pointer. a dynamic musl
+// program expects its linker (us) to have set tls up before _start runs: the
+// thread pointer (fs base) points at a tcb whose self-slot (fs:0) is the tp
+// itself, with each module's tls image laid out at tp - tls_offset just below
+// it. without this the very first __pthread_self() reads fs:0 == null and
+// faults (the cr2=0 #pf we hit). static musl escapes this by setting its own fs
+// via the syscall path; dynamic musl never does. (satoru)
+bool install_main_tls(Process* proc, ProcLinkerState* pls) {
+    constexpr uint64_t TCB_SIZE = 0x100;        // musl struct pthread head: self@0 dtv@8 canary@0x28
+    uint64_t modcount  = pls->next_tls_modid;   // module ids run 1..modcount
+    uint64_t tls_area  = (pls->tls_block_size + 63) & ~63ULL;  // tls data sits below tp
+    uint64_t dtv_bytes = (modcount + 1) * 8;
+    uint64_t total = tls_area + TCB_SIZE + dtv_bytes;
+    total = (total + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (!total) total = PAGE_SIZE;
+
+    uint64_t base  = pick_aslr_base(total);
+    uint64_t flags = PTE_USER | PTE_WRITABLE | PTE_NX;
+    for (uint64_t off = 0; off < total; off += PAGE_SIZE) {
+        if (!map_user_page(proc, base + off, nullptr, 0, 0, flags)) {
+            set_error(pls, "tls block map failed");
+            return false;
+        }
+    }
+
+    uint64_t tp     = base + tls_area;          // thread pointer == tcb base (>=64-aligned)
+    uint64_t dtv_va = tp + TCB_SIZE;
+
+    // copy each module's init image to tp - tls_offset; record it in the dtv.
+    for (int i = 0; i < pls->lib_count; i++) {
+        Lib* l = &g_libs[pls->libs[i]];
+        // skip modules with no tls or no assigned offset (e.g. a main exec with
+        // its own tls  -  that case needs a separate offset pass, noted). (satoru)
+        if (!l->tls_memsz || !l->tls_offset) continue;
+        uint64_t mod_addr = tp - l->tls_offset;
+        if (l->tls_template && l->tls_filesz)
+            write_user_mem(proc, mod_addr, l->tls_template, l->tls_filesz);
+        // the rest (tls_memsz - tls_filesz, the .tbss) stays zero (pages cleared).
+        if (l->tls_modid)
+            write_user_u64(proc, dtv_va + l->tls_modid * 8, mod_addr);
+    }
+    write_user_u64(proc, dtv_va, modcount);             // dtv[0] = module count
+
+    // tcb head (x86-64 variant 2): self-pointer, dtv pointer, stack canary.
+    write_user_u64(proc, tp + 0x00, tp);
+    write_user_u64(proc, tp + 0x08, dtv_va);
+    write_user_u64(proc, tp + 0x28, aslr_rand() | 1ULL);
+
+    pls->tls_block_va = base;
+    proc->fs_base = tp;                                 // scheduler programs MSR_FS_BASE from this
+    return true;
+}
+
 // ============================================================
 // Init/fini.
 // ============================================================
@@ -1765,17 +1843,53 @@ bool ExecPIE(Process* proc,
         }
     }
 
-    // ---- DT_NEEDED of main exec --------------------------------
-    process_dt_needed(proc, pls, main_l);
-
-    // ---- Apply relocations bottom-up -----------------------------
-    for (int i = pls->lib_count - 1; i >= 0; i--) {
-        Lib* l = &g_libs[pls->libs[i]];
-        if (!l->relocated) {
-            apply_relocs(proc, pls, l);
-            apply_relro (proc, l);
+    // ---- Load the program interpreter (ld-musl == libc.so) ----------
+    // we do NOT replace musl's dynamic linker. we map the exe + the interp and
+    // jump to the INTERP's entry; musl's _dlstart then self-relocates, loads the
+    // exe's DT_NEEDED closure, relocates everything, sets up tls + its own dso
+    // list, runs init, and tail-jumps to the exe. that is why we deliberately do
+    // NOT process_dt_needed / apply_relocs / install_main_tls / run init here  - 
+    // musl owns all of it, and its libc startup (do_init_fini etc.) crashes if
+    // those globals were not built by its own linker. (satoru)
+    const char* interp_path = nullptr;
+    for (int i = 0; i < main_l->phnum; i++) {
+        if (main_l->phdrs[i].p_type == PT_INTERP) {
+            interp_path = (const char*)(main_l->image + main_l->phdrs[i].p_offset);
+            break;
         }
     }
+    Lib* interp = nullptr;
+    {
+        char resolved[LDK_PATH_LEN];
+        // try the exe's PT_INTERP path verbatim, then fall back to the musl libc
+        // soname in a default search path. load segments only (is_linker=true):
+        // no dep recursion, no in-kernel relocation. (satoru)
+        if (interp_path && resolve_lib_path(pls, interp_path, resolved, sizeof(resolved)))
+            interp = do_load(proc, pls, resolved, false, true, true);
+        else if (resolve_lib_path(pls, "libc.musl-x86_64.so.1", resolved, sizeof(resolved)))
+            interp = do_load(proc, pls, resolved, false, true, true);
+    }
+    if (!interp) { set_error(pls, "interp load failed"); return false; }
+
+    // log each module's load base (hi/lo, since LogHex is 32-bit) so a fault rip
+    // from the exception dump can be mapped to a module + file offset for symbol
+    // lookup while the dynamic path is being brought up. (satoru)
+    for (int i = 0; i < pls->lib_count; i++) {
+        Lib* l = &g_libs[pls->libs[i]];
+        SerialLogger::Log("[ldso] module ");
+        SerialLogger::Log(l->soname[0] ? l->soname : l->path);
+        SerialLogger::Log(" base=");
+        SerialLogger::LogHex((uint32_t)(l->load_base >> 32));
+        SerialLogger::Log(":");
+        SerialLogger::LogHex((uint32_t)(l->load_base & 0xFFFFFFFF));
+        SerialLogger::Log("\r\n");
+    }
+
+    // ---- TLS / thread pointer: handled by musl's linker ----------
+    // in interp mode musl's __init_tls allocates the tls block + sets the fs
+    // base (via arch_prctl) itself, so we leave proc->fs_base = 0 and do NOT
+    // install_main_tls here. (install_main_tls remains for a future
+    // replace-the-linker mode but is unused on this path.) (satoru)
 
     // ---- Map vDSO ------------------------------------------------
     pls->vdso_va = MapVDSO(proc);
@@ -1831,7 +1945,7 @@ bool ExecPIE(Process* proc,
         { AT_PHENT,   main_l->phentsize },
         { AT_PHNUM,   main_l->phnum },
         { AT_PAGESZ,  PAGE_SIZE },
-        { AT_BASE,    0 },                       // built-in linker
+        { AT_BASE,    interp->load_base },        // musl self-relocates from this
         { AT_FLAGS,   0 },
         { AT_ENTRY,   main_l->load_base + main_l->entry },
         { AT_UID,     uid },
@@ -1845,7 +1959,11 @@ bool ExecPIE(Process* proc,
         { AT_CLKTCK,  100 },
         { AT_PLATFORM,platform_addr },
         { AT_EXECFN,  execfn_addr },
-        { AT_SYSINFO_EHDR, pls->vdso_va },
+        // do NOT advertise the vdso: the synthesised vdso page lacks a musl-
+        // parseable PT_DYNAMIC, so musl's vdso decode walked a null dynv and
+        // #pf'd in decode_vec. with AT_SYSINFO_EHDR=0 musl skips the vdso and
+        // uses the real clock_gettime/gettimeofday syscalls. (satoru)
+        { AT_SYSINFO_EHDR, 0 },
     };
     int auxn = sizeof(aux) / sizeof(aux[0]);
     for (int i = 0; i < auxn; i++) {
@@ -1862,16 +1980,11 @@ bool ExecPIE(Process* proc,
     push_qword(proc, &sp, (uint64_t)argc);
 
     *out_rsp   = sp;
-    *out_entry = main_l->load_base + main_l->entry;
-
-    // ---- DT_INIT / DT_INIT_ARRAY ---------------------------------
-    // Mark all libs init_called in dep order then synthesise a single
-    // user-mode trampoline page that invokes every constructor and
-    // tail-jumps to the real entry.  This makes ctors run with the
-    // correct user CR3 / FS / SS, which we cannot do from kernel-mode.
-    for (int i = pls->lib_count - 1; i >= 0; i--)
-        call_init_arrays_recursive(proc, pls, &g_libs[pls->libs[i]]);
-    *out_entry = build_init_trampoline(proc, pls, *out_entry);
+    // enter at the INTERP entry (musl's _dlstart), NOT the exe entry. musl
+    // self-relocates, links the exe + its closure, sets up tls, runs every
+    // init/ctor (do_init_fini), then tail-jumps to AT_ENTRY (the exe). so we do
+    // NOT run init arrays or build an init trampoline here. (satoru)
+    *out_entry = interp->load_base + interp->entry;
 
     DlDebugStateNotify();
     SerialLogger::Log("[ldso] ExecPIE complete: ");

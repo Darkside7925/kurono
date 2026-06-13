@@ -131,7 +131,16 @@ WLSHM_OBJ         = $(BUILD)/userprogs/wl_shm_test_user_embed.o
 # pthreads smoke test (proves CLONE_THREAD + futex) (satoru)
 PTHREAD_ELF       = $(USERPROGS_DIR)/pthread_test.elf
 PTHREAD_OBJ       = $(BUILD)/userprogs/pthread_test_user_embed.o
-USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ)
+# dynamic musl pie + its libc.so: first real exercise of the ld-kurono dynamic path (satoru)
+DYNTEST_ELF       = $(USERPROGS_DIR)/dyntest.elf
+DYNTEST_OBJ       = $(BUILD)/userprogs/dyntest_user_embed.o
+MUSL_LIBC_SO      = $(USERPROGS_DIR)/musl_libc.so
+MUSL_LIBC_OBJ     = $(BUILD)/userprogs/musl_libc_user_embed.o
+# tiny extra .so the dyntest pie depends on  -  exercises musl loading a non-interp
+# library via the new file-backed mmap path (satoru)
+LIBFOO_SO         = $(USERPROGS_DIR)/libfoo.so
+LIBFOO_OBJ        = $(BUILD)/userprogs/libfoo_user_embed.o
+USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ) $(DYNTEST_OBJ) $(MUSL_LIBC_OBJ) $(LIBFOO_OBJ)
 
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
@@ -519,6 +528,33 @@ $(PTHREAD_OBJ): $(PTHREAD_ELF)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  pthread_test.elf pthread_test_user_embed.o
 	rm -f $(BUILD)/userprogs/pthread_test.elf
+
+# embed the dynamic musl pie blob (first ld-kurono dynamic-load test) (satoru)
+$(DYNTEST_OBJ): $(DYNTEST_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/dyntest.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  dyntest.elf dyntest_user_embed.o
+	rm -f $(BUILD)/userprogs/dyntest.elf
+
+# embed musl libc.so so ld-kurono can resolve the dynamic pie's DT_NEEDED (satoru)
+$(MUSL_LIBC_OBJ): $(MUSL_LIBC_SO)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/musl_libc.so
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  musl_libc.so musl_libc_user_embed.o
+	rm -f $(BUILD)/userprogs/musl_libc.so
+
+# embed libfoo.so  -  the dyntest pie's extra DT_NEEDED (file-backed mmap test) (satoru)
+$(LIBFOO_OBJ): $(LIBFOO_SO)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/libfoo.so
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  libfoo.so libfoo_user_embed.o
+	rm -f $(BUILD)/userprogs/libfoo.so
 
 # kpy: compile C with no libc, no PIE, link with user.ld @ 0x40100000
 $(KPY_ELF): $(KPY_C_SRC) $(USERPROGS_DIR)/user.ld

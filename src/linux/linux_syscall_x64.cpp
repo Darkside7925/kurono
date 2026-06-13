@@ -177,13 +177,20 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                                           uint64_t a2, uint64_t a3,
                                           uint64_t a4, uint64_t a5) {
     // a5 is the user's real r9 (the frame handler reads it straight from the
-    // InterruptFrame). no 6-arg syscall we implement needs it  -  clone's child
-    // start fn rides in the parent's saved frame, not here  -  so ignore it. (satoru)
-    (void)a5;
+    // InterruptFrame). only mmap (below) needs it  -  the 6th arg is its file
+    // offset; everything else ignores it. (satoru)
 
     // ── Direct x86_64 syscalls that need full 64-bit args or special
     //    handling and have no i386 equivalent we can route to. ──
     switch (nr) {
+        case 9: {  // mmap(addr, len, prot, flags, fd, offset)
+            // route straight to sys_mmap with the full 64-bit file offset (a5 =
+            // r9). the i386 path maps x64 mmap -> old_mmap and passes offset 0,
+            // which breaks file-backed mmap of .so segments at non-zero offsets  - 
+            // exactly what musl's dynamic linker does for every library. (satoru)
+            return LinuxSyscall::sys_mmap(a0, a1, (uint32_t)a2, (uint32_t)a3,
+                                          (int)a4, a5);
+        }
         case 158: {  // arch_prctl(int code, unsigned long addr)
             // Used by musl to install TLS via FS base.
             // ARCH_SET_FS=0x1002, ARCH_SET_GS=0x1001,
