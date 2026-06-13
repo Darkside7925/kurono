@@ -13,6 +13,8 @@
 #include "text_editor.h"
 #include "media_player.h"
 #include "denji_app.h"
+#include "terminal.h"
+#include "../kcl/kcl.h"
 
 // ── color palette ──────────────────────────────────────────────────────
 // re-pointed onto the shared kss theme so files matches the black/grey chrome
@@ -125,6 +127,9 @@ static bool is_video_file(const char* n){return ext_in(n,VIDEO_EXT,sizeof(VIDEO_
 static bool is_image_file(const char* n){return ext_in(n,IMG_EXT,sizeof(IMG_EXT)/sizeof(IMG_EXT[0]));}
 static bool is_archive_file(const char* n){return ext_in(n,ARCHIVE_EXT,sizeof(ARCHIVE_EXT)/sizeof(ARCHIVE_EXT[0]));}
 static bool is_code_file(const char* n){return ext_in(n,CODE_EXT,sizeof(CODE_EXT)/sizeof(CODE_EXT[0]));}
+// a .kcl script is double-click-runnable through the kcl interpreter. (satoru)
+static const char* KCL_EXT[]={"kcl"};
+static bool is_kcl_file(const char* n){return ext_in(n,KCL_EXT,sizeof(KCL_EXT)/sizeof(KCL_EXT[0]));}
 
 static unsigned int icon_color_for(const FMEntry* e){
     // monochrome theming: folders take the single accent, files all read as dim
@@ -486,6 +491,19 @@ void FileManagerApp::OpenEntryPane(int pane,int idx){
     if(e[idx].is_dir){ NavigateToPane(pane,full,true); return; }
     PushRecent(full);
     RuntimeLog::LogAppEvent("files","open-entry",full);
+    if(is_kcl_file(e[idx].name)){
+        // double-click a .kcl script: open the terminal and run it through the
+        // kcl interpreter so its output (and any errors) are visible. (satoru)
+        RuntimeLog::LogAppEvent("files","run-kcl",full);
+        TerminalApp::Open();
+        char cmd[FM_MAX_PATH+8];
+        int ci=0; const char* pfx="kcl ";
+        for(int s=0; pfx[s] && ci<(int)sizeof(cmd)-1; s++) cmd[ci++]=pfx[s];
+        for(int s=0; full[s] && ci<(int)sizeof(cmd)-1; s++) cmd[ci++]=full[s];
+        cmd[ci]=0;
+        TerminalApp::EnqueueCommand(cmd);
+        return;
+    }
     if(is_video_file(e[idx].name)){
         // play through the native kvid player. real-time h264 decode isn't
         // feasible on a freestanding kernel, so a non-kvid video plays its

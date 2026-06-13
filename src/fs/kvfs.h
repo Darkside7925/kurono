@@ -180,6 +180,21 @@ public:
     static int Rmdir(const char* path);
     static int Listdir(const char* path, KVFSNode** out, int max_count);
 
+    // symlink  -  create (or replace a stale entry of) a KVFS_SYMLINK node at
+    // `path` pointing at `target`. used to lay the compat-symlink overlay that
+    // maps the old top-level names (/system /home /etc /bin /lib /tmp /proc /dev
+    // /var /apps /usr/bin /usr/lib) into the canonical /kurono tree, so the ~800
+    // hardcoded path references keep resolving. parent dirs are created as
+    // needed. (satoru)
+    static int Symlink(const char* path, const char* target);
+
+    // install the canonical /kurono/* tree + the top-level compat symlinks.
+    // MUST run at the earliest fs init (called at the tail of Init() and again
+    // after a persistent-tree restore)  -  before any other code touches a path,
+    // so a later Mkdirs("/system/...") resolves THROUGH the symlink instead of
+    // materialising a real /system dir. (satoru)
+    static void InstallCanonicalLayout();
+
     // file operations
     static int CreateFile(const char* path, uint16_t mode = 0644);
     static int WriteFile(const char* path, const void* data, uint32_t len);
@@ -258,6 +273,7 @@ private:
     static KVFSNode* Resolve_nolock(const char* path);
     static KVFSNode* ResolvePath_nolock(const char* path, KVFSNode* from = nullptr);
     static int Mkdirs_nolock(const char* path, uint16_t mode = 0755);
+    static int Symlink_nolock(const char* path, const char* target);
     static int CreateFile_nolock(const char* path, uint16_t mode = 0644);
     static int WriteFile_nolock(const char* path, const void* data, uint32_t len);
     static int ReadFile_nolock(const char* path, void* buf, uint32_t max_len);

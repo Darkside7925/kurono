@@ -37,6 +37,7 @@
 #include "../fs/vfs.h"
 #include "../fs/kvfs.h"
 #include "../fs/persist.h"
+#include "../fs/kfs_bench.h"   // headless storage benchmark (kurono.kfsbench) (satoru)
 #include "../drivers/nvme.h"   // command-count stats for the kfstest speed proof (satoru)
 #include "../drivers/usb.h"
 #include "../linux/ext4.h"
@@ -56,6 +57,7 @@
 #include "../shell/linux_cmds.h"
 #include "../shell/windows_cmds.h"
 #include "../kcl/kcl.h"
+#include "../kcl/kcl_test.h"
 #include "../security/supr.h"
 #include "../security/ksa.h"
 #include "../packages/pkgmgr.h"
@@ -966,10 +968,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // data + times SaveTree then powers off; boot 2 verifies it restored from the
     // KFS volume + times LoadTree, logs PASS/FAIL, then powers off. (satoru)
     bool boot_kfstest = false;
+    // headless storage benchmark (kurono.kfsbench): formats the nvme DATA disk to
+    // a fresh KFS volume + measures seq/rand throughput, snapshot save/restore,
+    // and per-op nvme command counts; logs everything to serial, then powers off.
+    // destructive to the data disk, so gate it behind the explicit token. (satoru)
+    bool boot_kfsbench = false;
     // ksa isolation self-test: spawn the isolated context, prove the main os has
     // no page-table mapping into it, exercise the read-only verdict channel, then
     // tear down. latched early like the other smoke-test flags. (satoru)
     bool boot_ksa_test = false;
+    // kcl language self-test: run the kcl interpreter test suite headless at
+    // boot and log PASS/FAIL per test to serial. gated by kurono.kcltest. (satoru)
+    bool boot_kcl_test = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     char boot_cli_run[160];
@@ -1014,6 +1024,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // latch the headless two-boot kfs persistence test flag (see decl). (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kfstest=1") || boot_has_token(boot_cmdline, "kurono.kfstest")) {
             boot_kfstest = true;
+        }
+        // latch the headless storage benchmark flag (see decl). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kfsbench=1") || boot_has_token(boot_cmdline, "kurono.kfsbench")) {
+            boot_kfsbench = true;
+        }
+        // latch the kcl self-test flag (see decl). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kcltest=1") || boot_has_token(boot_cmdline, "kurono.kcltest")) {
+            boot_kcl_test = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -1635,6 +1653,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         } else {
             SerialLogger::Log("[KVFS] no KFS volume to restore (fresh disk)\r\n");
         }
+        // a restore replays user-data subtrees (/home, /etc, /root) into the live
+        // tree; re-assert the canonical /kurono dirs + compat symlinks afterward
+        // so the overlay is intact regardless of what the on-disk image carried. (satoru)
+        KVFS::InstallCanonicalLayout();
     }
     // headless two-boot kfs persistence test (gated by cmdline kurono.kfstest):
     // boot 1  -  no marker present after restore  -  writes a small user-data tree
@@ -1644,6 +1666,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // we verify each file's content + the deep path, log PASS/FAIL + the LoadTree
     // ms, then power off. this exercises the whole KFS persist/restore loop with no
     // interactive shell, and the timing proves the multi-page-dma speed. (satoru)
+    // headless storage benchmark (gated by cmdline kurono.kfsbench): runs the KFS
+    // / nvme bench suite against the data disk + powers off. destructive, so it
+    // must come BEFORE any real persistence work and only on the explicit token. (satoru)
+    if (boot_kfsbench) {
+        KfsBench::Run();
+        SerialLogger::Log("[KFSBENCH] powering off\r\n");
+        HAL::PowerOff();
+    }
     if (boot_kfstest) {
         SerialLogger::Log("[KFSTEST] begin\r\n");
         const char* marker = "/home/user/.kfstest/marker";
@@ -1699,6 +1729,16 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 SerialLogger::Log(" bytes in "); SerialLogger::LogDec((int)cmds);
                 SerialLogger::Log(" multi-page cmds (old 4kb/cmd path: ");
                 SerialLogger::LogDec((int)old_cmds); SerialLogger::Log(" cmds)\r\n");
+                // layer 6: a SECOND save with no changes must be near-instant (the
+                // incremental fingerprint matches -> skip the full reformat+rewrite). (satoru)
+                uint64_t iw0 = NVMe::GetWriteCount();
+                uint64_t i0 = Timer::GetRealMs64();
+                bool iok = PersistStore::SaveTree();
+                uint64_t i1 = Timer::GetRealMs64();
+                uint64_t icmds = NVMe::GetWriteCount() - iw0;
+                SerialLogger::Log(iok ? "[KFSTEST] boot1 incremental re-save (no change) in " : "[KFSTEST] boot1 incremental re-save FAILED in ");
+                SerialLogger::LogDec((int)(i1 - i0)); SerialLogger::Log(" ms, ");
+                SerialLogger::LogDec((int)icmds); SerialLogger::Log(" nvme write cmds\r\n");
                 SerialLogger::Log("[KFSTEST] boot1 done; reboot with the same disk to verify\r\n");
             } else {
                 SerialLogger::Log("[KFSTEST] FAIL: no nvme data disk -> cannot persist\r\n");
@@ -2377,10 +2417,11 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     }
     KVFS::WriteString("/home/user/Music/startup.wav", "[WAV PCM 22050Hz 16-bit stereo 0:05]");
     KVFS::WriteString("/home/user/Music/notification.wav", "[WAV PCM 22050Hz 16-bit mono 0:02]");
-    KVFS::WriteString("/home/user/hello.kcl", "# KCL Script\nprint \"Hello from Kurono!\"\nset x 42\nprint x\n");
-    KVFS::WriteString("/home/user/math.kcl", "# Math demo\nset a 16\nset b sqrt(a)\nprint \"sqrt(16) = \"\nprint b\nset r rand()\nprint \"random = \"\nprint r\n");
-    KVFS::WriteString("/home/user/loop.kcl", "# Loop demo\nset sum 0\nfor i in 1 10 do\n  set sum sum + i\nend\nprint \"Sum 1..10 = \"\nprint sum\n");
-    KVFS::WriteString("/home/user/fib.kcl", "# Fibonacci\nset a 0\nset b 1\nfor i in 1 10 do\n  set c a + b\n  print c\n  set a b\n  set b c\nend\n");
+    // kcl sample scripts  -  kcl v2 syntax (set x = expr, for i in a..b). (satoru)
+    KVFS::WriteString("/home/user/hello.kcl", "# kcl script\nprint(\"Hello from Kurono!\")\nset x = 42\nprint(\"x =\", x)\n");
+    KVFS::WriteString("/home/user/math.kcl", "# math demo\nset a = 16\nprint(\"sqrt(16) =\", sqrt(a))\nprint(\"random =\", rand(100))\n");
+    KVFS::WriteString("/home/user/loop.kcl", "# loop demo\nset sum = 0\nfor i in 1..10 do\n  set sum = sum + i\nend\nprint(\"Sum 1..10 =\", sum)\n");
+    KVFS::WriteString("/home/user/fib.kcl", "# fibonacci\nfunc fib(n)\n  if n < 2 then\n    return n\n  end\n  return fib(n-1) + fib(n-2)\nend\nfor i in 0..10 do\n  print(fib(i))\nend\n");
     // Pre-populate more visible directories and files for the File Manager
     KVFS::Mkdirs("/home/user/Desktop");
     KVFS::Mkdirs("/home/user/Pictures");
@@ -2390,7 +2431,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     KVFS::Mkdirs("/home/user/Projects/kurono");
     KVFS::WriteString("/home/user/Desktop/README.txt", "Your Kurono desktop.\n\nApps can be launched from the Start Menu (bottom-left).\nRight-click the desktop for wallpaper & display settings.\n");
     KVFS::WriteString("/home/user/Pictures/screenshot.bmp", "[BMP 1024x768 24-bit placeholder]");
-    KVFS::WriteString("/home/user/Projects/kurono/main.kcl", "# Kurono project\nset project_name \"MyApp\"\nprint \"Building \"\nprint project_name\nprint \"...\"\nprint \"\\nDone!\"\n");
+    KVFS::WriteString("/home/user/Projects/kurono/main.kcl", "# kurono project\nset project_name = \"MyApp\"\nprint(\"Building\", project_name, \"...\")\nprint(\"Done!\")\n");
     KVFS::WriteString("/home/user/.bashrc", "alias ls='ls -l'\nalias ll='ls -la'\nalias cls='clear'\necho \"Welcome back to Kurono!\"\n");
     KVFS::WriteString("/home/user/.profile", "export PATH=/usr/bin:/usr/local/bin:/home/user/bin\nexport HOME=/home/user\nexport USER=user\n");
     KVFS::WriteString("/home/user/notes.txt", "Kurono OS Notes\n==============\n\nThings to try:\n- Open Terminal and type 'help'\n- Run 'kurono log' to see system logs\n- Open Task Manager to see processes\n- Browse files in File Manager\n- Try the Calculator app\n- Run 'neofetch' for system info\n");
@@ -2398,6 +2439,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[KVFS] Filesystem populated\r\n");
     RuntimeLog::LogSystem("kernel", "default filesystem populated");
     RuntimeLog::LogBoot("default files populated");
+
+    // kcl language self-test (gated by cmdline kurono.kcltest): kcl + kvfs are
+    // both ready here, so run the interpreter test suite and log PASS/FAIL per
+    // test to serial for headless verification. (satoru)
+    if (boot_kcl_test) {
+        SerialLogger::Log("[KCL] running self-test suite\r\n");
+        KCLTest::RunAll();
+    }
 
     // initialize the unified audio stack.
     //

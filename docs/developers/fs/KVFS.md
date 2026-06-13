@@ -13,7 +13,9 @@ KVFS is the filesystem that the shell, the desktop, the settings app, the text e
 ```cpp
 // Create and write
 KVFS::Mkdir(path)                          // create directory
-KVFS::Mkdirs(path)                         // create directory tree
+KVFS::Mkdirs(path)                         // create directory tree (follows symlinks)
+KVFS::Symlink(path, target)                // create/repoint a symlink node
+KVFS::InstallCanonicalLayout()             // lay the /kurono tree + compat symlinks
 KVFS::WriteString(path, content)           // write file from string
 KVFS::WriteBytes(path, buf, len)           // write file from buffer
 
@@ -30,26 +32,35 @@ KVFS::List(path)                           // list directory entries
 KVFS::Delete(path)                         // delete file or empty directory
 ```
 
-## 3. Initial population
+## 3. Initial population & the canonical path layout
 
-The kernel populates KVFS at boot with the standard directory tree and some demonstration files:
+KVFS uses a **single canonical tree rooted at `/kurono`** plus a thin **compat-symlink overlay** at the old top-level names. Everything Kurono-native lives under `/kurono`; the bare names (`/system`, `/home`, `/etc`, `/bin`, `/lib`, `/tmp`, `/proc`, `/dev`, `/var`, `/apps`, `/usr/bin`, `/usr/lib`) are **symlinks** into it. This keeps the ~800 hardcoded path references across the codebase resolving while collapsing the old `/system` vs `/kurono/system` split.
 
 ```
 /
-  etc/
-    kurono/
-      ui.conf
-  home/
-    user/
-      Desktop/
-  tmp/
-  var/
-    log/
-  usr/
-    bin/
+└── kurono/
+    ├── system/    core os (bin, lib, drivers, config, boot, security, themes)
+    ├── linux/     linux compat (compat/{bin,lib}, linker, bridge, drivers)
+    ├── windows/   windows compat environment
+    ├── apps/      installed native kurono apps (bin, lib)
+    ├── user/      all user data (home/user/{Desktop,Documents,...}, shared)
+    ├── packages/  kpkg state
+    ├── runtime/   live state (proc, dev, tmp, sockets)  -  conceptually cleared on boot
+    └── var/{log,lib,updates,state}
+
+compat symlinks at the root (resolved through intermediate components):
+  /system  -> /kurono/system          /home    -> /kurono/user/home
+  /etc     -> /kurono/system/config    /bin     -> /kurono/system/bin
+  /lib     -> /kurono/linux/compat     /usr/bin -> /kurono/linux/compat/bin
+  /usr/lib -> /kurono/linux/compat/lib /tmp     -> /kurono/runtime/tmp
+  /proc    -> /kurono/runtime/proc     /dev     -> /kurono/runtime/dev
+  /var     -> /kurono/var              /apps    -> /kurono/apps
+  /windows -> /kurono/windows
 ```
 
-The shell commands, the desktop icon system, and the config all rely on these directories existing.
+The canonical roots are centralized as macros in `src/system/kpaths.h` (`KP_SYSTEM_ROOT`, `KP_LINUX_COMPAT`, `KP_USER_HOME`, `KP_RUNTIME`, ...). The tree and the symlinks are installed by `KVFS::InstallCanonicalLayout()`, which runs at the **very start** of `BuildDefaultTree()` (i.e. inside `KVFS::Init()`, before any other code touches a path) and again after a persistent-tree restore. Because `KVFS::Resolve` and `KVFS::Mkdirs` both follow symlinks in intermediate path components (16-hop budget), a later `Mkdirs("/system/lib/x")` or `WriteFile("/etc/hostname")` resolves *through* the symlink into the real `/kurono` dir instead of materialising a stray real `/system` or `/etc` at the root.
+
+The shell commands, the desktop icon system, the config system, the dynamic linker (ld-kurono searches `/system/lib`), and the logging subsystem (`/kurono/var/log`) all rely on this layout.
 
 ## 4. Persistence
 

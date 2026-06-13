@@ -6,10 +6,15 @@
 //  KFS implementation  -  see kfs.h. the persistence layer formats a fresh volume
 //  each save and writes the user-data tree as real files + dirs, so a bump-style
 //  allocator hands out CONTIGUOUS block runs and a whole file goes to disk in one
-//  multi-page nvme command. the bitmap is still maintained on disk (it's part of
-//  the format spec a fuse driver reads), allocation just never has to search it
-//  on a fresh volume. metadata (superblock + bitmap + inode table) is cached in
-//  ram and flushed in Sync(). (satoru)
+//  multi-page nvme command and is described by a SINGLE extent. the bitmap is
+//  still maintained on disk (it's part of the format spec a fuse driver reads),
+//  allocation just never has to search it on a fresh volume. metadata (superblock
+//  + bitmap + inode table) is cached in ram and flushed in Sync().
+//
+//  EXTENT-BASED (KFS v2): files/dirs are lists of extents {start,len}, NOT
+//  per-block pointers  -  23 inline in the inode + an unbounded overflow chain. no
+//  ~4 MB file cap, no max-dir-entry cap, and a 174 MB binary is one extent. tiny
+//  files (<= KFS_INLINE_MAX) live inline in the inode with no data block. (satoru)
 
 namespace {
     KFSReadFn  g_rd  = nullptr;
@@ -22,6 +27,8 @@ namespace {
     uint8_t*   g_bitmap = nullptr;   // in-ram free-block bitmap (satoru)
     uint8_t*   g_inodes = nullptr;   // in-ram inode table (satoru)
     uint32_t   g_next   = 0;         // bump hint for contiguous allocation (satoru)
+
+    KFSStats   g_stats = {};
 
     //  a page-aligned, physically-contiguous bounce for multi-page block i/o. one
     //  command moves at most this many blocks (matches the nvme prp-list cap of
@@ -45,14 +52,14 @@ namespace {
     }
 
     void bit_set(uint32_t b) { if (g_bitmap) g_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7)); }
-    bool bit_get(uint32_t b) { return g_bitmap && ((g_bitmap[b >> 3] >> (b & 7)) & 1); }
 
     //  bump-allocate `n` contiguous data blocks; returns the first, or 0 if full.
-    //  on a fresh volume the hint walks straight up, so runs are contiguous. (satoru)
+    //  on a fresh volume the hint walks straight up, so runs are contiguous and a
+    //  whole file is a single extent. (satoru)
     uint32_t alloc_run(uint32_t n) {
         if (n == 0) return 0;
         if (g_next < g_sb.data_start) g_next = g_sb.data_start;
-        if (g_next + n > g_sb.total_blocks) return 0;
+        if ((uint64_t)g_next + n > g_sb.total_blocks) return 0;
         uint32_t start = g_next;
         for (uint32_t i = 0; i < n; i++) bit_set(start + i);
         g_next += n;
@@ -71,21 +78,122 @@ namespace {
         return g_bounce != nullptr;
     }
 
+    //  ── extent helpers ──────────────────────────────────────────────────────
+    //  append one extent {start,len} to an inode, auto-merging with the previous
+    //  extent if it is physically adjacent (so the snapshot writer's contiguous
+    //  runs collapse to a single extent). spills to an overflow-block chain when
+    //  the inline slots fill, so the extent list is unbounded. (satoru)
+    bool ext_append(KFSInode* n, uint32_t start, uint32_t len) {
+        if (len == 0) return true;
+        // try to merge with the last extent (inline or last overflow). (satoru)
+        if (n->ext_count > 0) {
+            if (n->ext_count <= KFS_INLINE_EXTENTS) {
+                KFSExtent* last = &n->extent[n->ext_count - 1];
+                if (last->start + last->len == start) { last->len += len; n->blocks += len; return true; }
+            } else if (n->ext_overflow) {
+                uint8_t blk[KFS_BLOCK_SIZE];
+                uint32_t cur = n->ext_overflow;
+                while (cur) {
+                    if (!rd_block(cur, 1, blk)) return false;
+                    KFSExtOverflow* o = (KFSExtOverflow*)blk;
+                    if (o->next == 0) {
+                        if (o->count > 0) {
+                            KFSExtent* last = &o->ext[o->count - 1];
+                            if (last->start + last->len == start) {
+                                last->len += len; n->blocks += len;
+                                return wr_block(cur, 1, blk);
+                            }
+                        }
+                        break;
+                    }
+                    cur = o->next;
+                }
+            }
+        }
+        // store inline while there is room. (satoru)
+        if (n->ext_count < KFS_INLINE_EXTENTS) {
+            n->extent[n->ext_count].start = start;
+            n->extent[n->ext_count].len   = len;
+            n->ext_count++; n->blocks += len; g_stats.extents_used++;
+            return true;
+        }
+        // spill to an overflow block: walk to the last block with room, else add. (satoru)
+        uint8_t blk[KFS_BLOCK_SIZE];
+        uint32_t cur = n->ext_overflow, last_blk = 0;
+        while (cur) {
+            if (!rd_block(cur, 1, blk)) return false;
+            KFSExtOverflow* o = (KFSExtOverflow*)blk;
+            last_blk = cur;
+            if (o->count < KFS_EXT_PER_OVF) {
+                o->ext[o->count].start = start; o->ext[o->count].len = len;
+                o->count++;
+                if (!wr_block(cur, 1, blk)) return false;
+                n->ext_count++; n->blocks += len; g_stats.extents_used++;
+                return true;
+            }
+            cur = o->next;
+        }
+        // allocate a new overflow block. (satoru)
+        uint32_t nb = alloc_block();
+        if (!nb) return false;
+        for (uint32_t k = 0; k < KFS_BLOCK_SIZE; k++) blk[k] = 0;
+        KFSExtOverflow* o = (KFSExtOverflow*)blk;
+        o->next = 0; o->count = 1; o->ext[0].start = start; o->ext[0].len = len;
+        if (!wr_block(nb, 1, blk)) return false;
+        if (last_blk == 0) {
+            n->ext_overflow = nb;
+        } else {
+            // patch the previous tail's next pointer. (satoru)
+            uint8_t pblk[KFS_BLOCK_SIZE];
+            if (!rd_block(last_blk, 1, pblk)) return false;
+            ((KFSExtOverflow*)pblk)->next = nb;
+            if (!wr_block(last_blk, 1, pblk)) return false;
+        }
+        n->ext_count++; n->blocks += len; g_stats.extents_used++;
+        return true;
+    }
+
+    //  resolve the i'th logical data block of an inode to its physical block by
+    //  walking the extents. linear in the extent count, which is tiny (≈1 for a
+    //  contiguous file). (satoru)
+    uint32_t logical_to_phys(KFSInode* n, uint32_t lblk) {
+        uint32_t base = 0;
+        uint32_t inline_n = n->ext_count < KFS_INLINE_EXTENTS ? n->ext_count : KFS_INLINE_EXTENTS;
+        for (uint32_t i = 0; i < inline_n; i++) {
+            if (lblk < base + n->extent[i].len) return n->extent[i].start + (lblk - base);
+            base += n->extent[i].len;
+        }
+        uint8_t blk[KFS_BLOCK_SIZE];
+        uint32_t cur = (n->ext_count > KFS_INLINE_EXTENTS) ? n->ext_overflow : 0;
+        while (cur) {
+            if (!rd_block(cur, 1, blk)) return 0;
+            KFSExtOverflow* o = (KFSExtOverflow*)blk;
+            for (uint32_t i = 0; i < o->count; i++) {
+                if (lblk < base + o->ext[i].len) return o->ext[i].start + (lblk - base);
+                base += o->ext[i].len;
+            }
+            cur = o->next;
+        }
+        return 0;
+    }
+
     //  path helpers  -  split into components, no allocation. (satoru)
     bool comp_eq(const char* a, const char* b, int blen) {
         for (int i = 0; i < blen; i++) if (a[i] != b[i]) return false;
         return a[blen] == 0;
     }
 
-    //  look up `name` (length nlen) in directory inode `dir`; returns child inode
-    //  or 0. (satoru)
+    //  ── directory machinery (extent-backed, unbounded entries) ───────────────
+    //  the directory's data is a run of dir-entry blocks described by the inode's
+    //  extents (64 entries/block). lookup/add/list walk those blocks. (satoru)
     uint32_t dir_lookup(KFSInode* dir, const char* name, int nlen) {
         if (!dir || dir->type != KFS_DIR) return 0;
         uint8_t blk[KFS_BLOCK_SIZE];
-        uint32_t nblocks = (dir->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE;
-        for (uint32_t i = 0; i < nblocks && i < KFS_DIRECT; i++) {
-            if (!dir->direct[i]) continue;
-            if (!rd_block(dir->direct[i], 1, blk)) return 0;
+        uint32_t nblocks = (uint32_t)((dir->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE);
+        for (uint32_t i = 0; i < nblocks; i++) {
+            uint32_t pb = logical_to_phys(dir, i);
+            if (!pb) continue;
+            if (!rd_block(pb, 1, blk)) return 0;
             KFSDirEnt* e = (KFSDirEnt*)blk;
             for (uint32_t j = 0; j < KFS_BLOCK_SIZE / sizeof(KFSDirEnt); j++) {
                 if (e[j].inode && e[j].name_len == (uint16_t)nlen &&
@@ -96,29 +204,29 @@ namespace {
         return 0;
     }
 
-    //  add (name -> child) to directory `dir`, growing it a block at a time.
-    //  returns false on i/o or capacity error. (satoru)
+    //  add (name -> child) to directory `dir`, growing it a block at a time. no
+    //  cap on entries  -  growth chains extents like a file. (satoru)
     bool dir_add(KFSInode* dir, const char* name, int nlen, uint32_t child, KFSType t) {
         if (!dir || nlen <= 0 || nlen > KFS_NAME_MAX) return false;
         uint8_t blk[KFS_BLOCK_SIZE];
         uint32_t per = KFS_BLOCK_SIZE / sizeof(KFSDirEnt);
+        uint32_t nblocks = (uint32_t)((dir->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE);
         // try to reuse a free slot in an existing block. (satoru)
-        uint32_t nblocks = (dir->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE;
-        for (uint32_t i = 0; i < nblocks && i < KFS_DIRECT; i++) {
-            if (!dir->direct[i]) continue;
-            if (!rd_block(dir->direct[i], 1, blk)) return false;
+        for (uint32_t i = 0; i < nblocks; i++) {
+            uint32_t pb = logical_to_phys(dir, i);
+            if (!pb) continue;
+            if (!rd_block(pb, 1, blk)) return false;
             KFSDirEnt* e = (KFSDirEnt*)blk;
             for (uint32_t j = 0; j < per; j++) {
                 if (!e[j].inode) {
                     e[j].inode = child; e[j].name_len = (uint16_t)nlen; e[j].type = (uint16_t)t;
                     for (int k = 0; k < nlen; k++) e[j].name[k] = name[k];
                     e[j].name[nlen] = 0;
-                    return wr_block(dir->direct[i], 1, blk);
+                    return wr_block(pb, 1, blk);
                 }
             }
         }
-        // grow: allocate a fresh dir block. (satoru)
-        if (nblocks >= KFS_DIRECT) return false;
+        // grow: allocate a fresh dir block and record it as an extent. (satoru)
         uint32_t nb = alloc_block();
         if (!nb) return false;
         for (uint32_t k = 0; k < KFS_BLOCK_SIZE; k++) blk[k] = 0;
@@ -127,8 +235,8 @@ namespace {
         for (int k = 0; k < nlen; k++) e[0].name[k] = name[k];
         e[0].name[nlen] = 0;
         if (!wr_block(nb, 1, blk)) return false;
-        dir->direct[nblocks] = nb;
-        dir->size = (nblocks + 1) * KFS_BLOCK_SIZE;
+        if (!ext_append(dir, nb, 1)) return false;
+        dir->size = (uint64_t)(nblocks + 1) * KFS_BLOCK_SIZE;
         return true;
     }
 
@@ -181,6 +289,7 @@ namespace {
                     child = new_inode(KFS_DIR, 0755);
                     if (!child) return 0;
                     if (!dir_add(d, s, nlen, child, KFS_DIR)) return 0;
+                    g_stats.dirs_made++;
                 }
                 cur = child;
             }
@@ -189,13 +298,14 @@ namespace {
         return cur;
     }
 
-    //  split "/a/b/c" -> parent inode of "c" + the leaf name. (satoru)
+    //  split "/a/b/c" -> parent inode of "c" + the leaf name. parent_path is a
+    //  4096-byte buffer (linux PATH_MAX) so deep canonical paths fit; it is on
+    //  the heap because the recursion makes a 4 KB stack buffer here unsafe. (satoru)
     bool split_parent(const char* path, uint32_t* parent, const char** leaf, int* leaf_len, bool make) {
         if (!path || path[0] != '/') return false;
         const char* last = path + 1;
         const char* p = path + 1;
         const char* lstart = path + 1;
-        // find the final component. (satoru)
         while (*p) {
             if (*p == '/') { if (p[1]) lstart = p + 1; }
             p++;
@@ -203,49 +313,115 @@ namespace {
         last = lstart;
         int llen = 0; while (last[llen] && last[llen] != '/') llen++;
         if (llen == 0) return false;
-        // parent path is everything before the leaf. (satoru)
-        char parent_path[256];
         int plen = (int)(last - path);
         if (plen <= 1) { *parent = KFS_ROOT_INODE; }
         else {
-            if (plen >= (int)sizeof(parent_path)) return false;
+            char* parent_path = (char*)KernelHeap::Alloc(4096);
+            if (!parent_path) return false;
+            if (plen >= 4096) { KernelHeap::Free(parent_path); return false; }
             for (int i = 0; i < plen; i++) parent_path[i] = path[i];
             parent_path[plen] = 0;
             *parent = make ? mkdirs_ino(parent_path) : resolve(parent_path);
+            KernelHeap::Free(parent_path);
             if (!*parent) return false;
         }
         *leaf = last; *leaf_len = llen;
         return true;
     }
 
-    //  read file inode `n` into buf (up to max). returns bytes or -1. files in
-    //  the snapshot model occupy one contiguous run starting at direct[0], so we
-    //  read run-by-run through the page-aligned bounce (one multi-page command per
-    //  run)  -  fast + no large stack buffers. (satoru)
-    int read_file(KFSInode* n, void* buf, uint32_t max) {
-        if (!n || n->type != KFS_FILE) return -1;
-        uint32_t len = n->size; if (len > max) len = max;
+    //  read file inode `n` into buf (up to max). returns bytes or -1. reads each
+    //  contiguous physical run through the page-aligned bounce (one multi-page
+    //  command per ≤2 MB chunk). inline files copy straight out of the inode. (satoru)
+    int64_t read_file(KFSInode* n, void* buf, uint64_t max) {
+        if (!n || (n->type != KFS_FILE && n->type != KFS_SYMLINK)) return -1;
+        uint64_t len = n->size; if (len > max) len = max;
         if (len == 0) return 0;
-        uint32_t start = n->direct[0];
-        if (!start) return -1;
-        uint32_t nblocks = (n->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE;
         uint8_t* out = (uint8_t*)buf;
-        uint32_t done = 0, blk_off = 0;
-        while (done < len && blk_off < nblocks) {
-            uint32_t run = nblocks - blk_off; if (run > KFS_MAX_RUN_BLOCKS) run = KFS_MAX_RUN_BLOCKS;
+        if (n->flags & KFS_FLAG_INLINE) {
+            for (uint64_t i = 0; i < len; i++) out[i] = n->inline_data[i];
+            return (int64_t)len;
+        }
+        uint64_t done = 0;
+        uint32_t lblk = 0;
+        uint32_t total_blocks = (uint32_t)((n->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE);
+        while (done < len && lblk < total_blocks) {
+            // find the longest contiguous physical run starting at lblk. (satoru)
+            uint32_t pstart = logical_to_phys(n, lblk);
+            if (!pstart) return -1;
+            uint32_t run = 1;
+            while (lblk + run < total_blocks && run < KFS_MAX_RUN_BLOCKS) {
+                if (logical_to_phys(n, lblk + run) == pstart + run) run++;
+                else break;
+            }
             uint32_t run_bytes = run * KFS_BLOCK_SIZE;
             if (!ensure_bounce(run_bytes)) return -1;
-            if (!rd_block(start + blk_off, run, g_bounce)) return -1;
-            uint32_t copy = len - done; if (copy > run_bytes) copy = run_bytes;
-            for (uint32_t i = 0; i < copy; i++) out[done + i] = g_bounce[i];
-            done += copy; blk_off += run;
+            if (!rd_block(pstart, run, g_bounce)) return -1;
+            uint64_t copy = len - done; if (copy > run_bytes) copy = run_bytes;
+            for (uint64_t i = 0; i < copy; i++) out[done + i] = g_bounce[i];
+            done += copy; lblk += run;
         }
-        return (int)done;
+        return (int64_t)done;
+    }
+
+    //  common writer for files + symlinks: store small payloads inline, large ones
+    //  as one (or a few) extents. (satoru)
+    bool write_payload(KFSInode* f, const void* data, uint64_t len, KFSType t) {
+        f->type = t;
+        f->size = len;
+        f->flags = 0; f->ext_count = 0; f->ext_overflow = 0; f->blocks = 0;
+        if (len == 0) return true;
+
+        // tiny payload -> store inline, no data block. (satoru)
+        if (len <= KFS_INLINE_MAX) {
+            const uint8_t* src = (const uint8_t*)data;
+            for (uint64_t i = 0; i < len; i++) f->inline_data[i] = src[i];
+            for (uint64_t i = len; i < KFS_INLINE_MAX; i++) f->inline_data[i] = 0;
+            f->flags |= KFS_FLAG_INLINE;
+            g_stats.inline_files++;
+            return true;
+        }
+
+        // one contiguous run for the whole file -> a single extent + a few
+        // multi-page commands. (satoru)
+        uint32_t nblocks = (uint32_t)((len + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE);
+        uint32_t start = alloc_run(nblocks);
+        if (!start) return false;
+        if (!ext_append(f, start, nblocks)) return false;
+
+        const uint8_t* src = (const uint8_t*)data;
+        uint32_t per = KFS_MAX_RUN_BLOCKS;
+        uint64_t off = 0;
+        uint32_t blk_off = 0;
+        while (off < len) {
+            uint32_t run_blocks = nblocks - blk_off; if (run_blocks > per) run_blocks = per;
+            uint32_t run_bytes  = run_blocks * KFS_BLOCK_SIZE;
+            if (!ensure_bounce(run_bytes)) return false;
+            uint64_t copy = len - off; if (copy > run_bytes) copy = run_bytes;
+            for (uint64_t i = 0; i < copy; i++) g_bounce[i] = src[off + i];
+            for (uint64_t i = copy; i < run_bytes; i++) g_bounce[i] = 0;   // zero-pad tail (satoru)
+            if (!wr_block(start + blk_off, run_blocks, g_bounce)) return false;
+            off     += copy;
+            blk_off += run_blocks;
+        }
+        return true;
     }
 }
 
 void KFS::SetBackend(KFSReadFn rd, KFSWriteFn wr, void* ctx) { g_rd = rd; g_wr = wr; g_ctx = ctx; }
 bool KFS::IsMounted() { return g_mounted; }
+const KFSStats& KFS::Stats() { return g_stats; }
+void KFS::ResetStats() { for (uint32_t i = 0; i < sizeof(g_stats); i++) ((uint8_t*)&g_stats)[i] = 0; }
+
+//  layer 6: the 64-bit user-data fingerprint lives in superblock reserved[0..1]
+//  (lo, hi). it survives reboot because Sync() writes the superblock. (satoru)
+uint64_t KFS::MountedFingerprint() {
+    if (!g_mounted) return 0;
+    return ((uint64_t)g_sb.reserved[1] << 32) | g_sb.reserved[0];
+}
+void KFS::SetFingerprint(uint64_t fp) {
+    g_sb.reserved[0] = (uint32_t)(fp & 0xFFFFFFFFu);
+    g_sb.reserved[1] = (uint32_t)(fp >> 32);
+}
 
 bool KFS::Format(uint32_t total_blocks) {
     if (!g_wr || total_blocks < 64) return false;
@@ -253,10 +429,11 @@ bool KFS::Format(uint32_t total_blocks) {
     KFSSuper sb;
     for (uint32_t i = 0; i < sizeof(sb); i++) ((uint8_t*)&sb)[i] = 0;
     sb.magic = KFS_MAGIC; sb.version = KFS_VERSION; sb.block_size = KFS_BLOCK_SIZE;
+    sb.inode_size    = KFS_INODE_SIZE;
     sb.total_blocks  = total_blocks;
     sb.bitmap_start  = 1;
     sb.bitmap_blocks = (total_blocks + (KFS_BLOCK_SIZE * 8 - 1)) / (KFS_BLOCK_SIZE * 8);
-    sb.inode_count   = total_blocks / 32; if (sb.inode_count < 256) sb.inode_count = 256;  // ~2k inodes / 256kb table for a 256mb disk (satoru)
+    sb.inode_count   = total_blocks / 32; if (sb.inode_count < 256) sb.inode_count = 256;
     sb.inode_start   = sb.bitmap_start + sb.bitmap_blocks;
     sb.inode_blocks  = (sb.inode_count + KFS_INODES_PER_BLOCK - 1) / KFS_INODES_PER_BLOCK;
     sb.data_start    = sb.inode_start + sb.inode_blocks;
@@ -274,6 +451,7 @@ bool KFS::Format(uint32_t total_blocks) {
 
     g_sb = sb;
     g_next = sb.data_start;
+    ResetStats();
     // mark all metadata blocks used. (satoru)
     for (uint32_t b = 0; b < sb.data_start; b++) bit_set(b);
     // root directory. (satoru)
@@ -324,9 +502,8 @@ bool KFS::Mkdirs(const char* path) {
     return mkdirs_ino(path) != 0;
 }
 
-bool KFS::WriteFile(const char* path, const void* data, uint32_t len) {
+bool KFS::WriteFile(const char* path, const void* data, uint64_t len) {
     if (!g_mounted || !path) return false;
-    if (len > KFS_MAX_FILE) return false;
 
     uint32_t parent; const char* leaf; int llen;
     if (!split_parent(path, &parent, &leaf, &llen, true)) return false;
@@ -338,70 +515,58 @@ bool KFS::WriteFile(const char* path, const void* data, uint32_t len) {
     if (!fino) return false;
     if (!dir_add(pdir, leaf, llen, fino, KFS_FILE)) return false;
     KFSInode* f = inode_ptr(fino);
-    f->size = len;
-
-    if (len == 0) return true;
-
-    // one contiguous run for the whole file -> a few multi-page commands. (satoru)
-    uint32_t nblocks = (len + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE;
-    uint32_t start = alloc_run(nblocks);
-    if (!start) return false;
-
-    // record the block pointers (contiguous: start..start+nblocks-1). (satoru)
-    uint32_t indirect[KFS_PTRS_PER_BLOCK];
-    bool need_ind = nblocks > KFS_DIRECT;
-    if (need_ind) for (uint32_t i = 0; i < KFS_PTRS_PER_BLOCK; i++) indirect[i] = 0;
-    for (uint32_t i = 0; i < nblocks; i++) {
-        if (i < KFS_DIRECT) f->direct[i] = start + i;
-        else                indirect[i - KFS_DIRECT] = start + i;
-    }
-    if (need_ind) {
-        uint32_t ib = alloc_block();
-        if (!ib) return false;
-        f->indirect = ib;
-        if (!wr_block(ib, 1, indirect)) return false;
-    }
-
-    // copy the data into a big page-aligned bounce and write it in MAXCHUNK runs;
-    // the run is contiguous, so each write is a single multi-page command. (satoru)
-    const uint8_t* src = (const uint8_t*)data;
-    uint32_t per = KFS_MAX_RUN_BLOCKS;
-    uint32_t off = 0;
-    uint32_t blk_off = 0;
-    while (off < len) {
-        uint32_t run_blocks = nblocks - blk_off; if (run_blocks > per) run_blocks = per;
-        uint32_t run_bytes  = run_blocks * KFS_BLOCK_SIZE;
-        if (!ensure_bounce(run_bytes)) return false;
-        uint32_t copy = len - off; if (copy > run_bytes) copy = run_bytes;
-        for (uint32_t i = 0; i < copy; i++) g_bounce[i] = src[off + i];
-        for (uint32_t i = copy; i < run_bytes; i++) g_bounce[i] = 0;   // zero-pad tail (satoru)
-        if (!wr_block(start + blk_off, run_blocks, g_bounce)) return false;
-        off     += copy;
-        blk_off += run_blocks;
-    }
+    if (!write_payload(f, data, len, KFS_FILE)) return false;
+    g_stats.files_written++; g_stats.bytes_written += len;
     return true;
 }
 
-int KFS::ReadFile(const char* path, void* buf, uint32_t max) {
+int64_t KFS::ReadFile(const char* path, void* buf, uint64_t max) {
     if (!g_mounted) return -1;
     KFSInode* n = inode_ptr(resolve(path));
+    if (n && n->type == KFS_SYMLINK) return -1;  // symlinks read via ReadLink (satoru)
     return read_file(n, buf, max);
+}
+
+bool KFS::Symlink(const char* path, const char* target) {
+    if (!g_mounted || !path || !target) return false;
+    uint32_t parent; const char* leaf; int llen;
+    if (!split_parent(path, &parent, &leaf, &llen, true)) return false;
+    KFSInode* pdir = inode_ptr(parent);
+    if (!pdir) return false;
+    uint32_t sino = new_inode(KFS_SYMLINK, 0777);
+    if (!sino) return false;
+    if (!dir_add(pdir, leaf, llen, sino, KFS_SYMLINK)) return false;
+    KFSInode* s = inode_ptr(sino);
+    uint64_t tlen = 0; while (target[tlen]) tlen++;
+    return write_payload(s, target, tlen, KFS_SYMLINK);
+}
+
+int KFS::ReadLink(const char* path, char* buf, int max) {
+    if (!g_mounted || !buf || max <= 0) return -1;
+    KFSInode* n = inode_ptr(resolve(path));
+    if (!n || n->type != KFS_SYMLINK) return -1;
+    int64_t got = read_file(n, buf, (uint64_t)(max - 1));
+    if (got < 0) return -1;
+    buf[got] = 0;
+    return (int)got;
 }
 
 bool KFS::Exists(const char* path)  { return g_mounted && resolve(path) != 0; }
 bool KFS::IsDir(const char* path)   { KFSInode* n = g_mounted ? inode_ptr(resolve(path)) : nullptr; return n && n->type == KFS_DIR; }
-int  KFS::FileSize(const char* path){ KFSInode* n = g_mounted ? inode_ptr(resolve(path)) : nullptr; return (n && n->type == KFS_FILE) ? (int)n->size : -1; }
+bool KFS::IsSymlink(const char* path){ KFSInode* n = g_mounted ? inode_ptr(resolve(path)) : nullptr; return n && n->type == KFS_SYMLINK; }
+int64_t KFS::FileSize(const char* path){ KFSInode* n = g_mounted ? inode_ptr(resolve(path)) : nullptr; return (n && n->type == KFS_FILE) ? (int64_t)n->size : -1; }
 
 int KFS::List(const char* path, ListCb cb, void* ctx) {
     if (!g_mounted || !cb) return -1;
     KFSInode* d = inode_ptr(resolve(path));
     if (!d || d->type != KFS_DIR) return -1;
     uint8_t blk[KFS_BLOCK_SIZE];
-    uint32_t nblocks = (d->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE;
+    uint32_t nblocks = (uint32_t)((d->size + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE);
     int count = 0;
-    for (uint32_t i = 0; i < nblocks && i < KFS_DIRECT; i++) {
-        if (!d->direct[i]) continue;
-        if (!rd_block(d->direct[i], 1, blk)) return -1;
+    for (uint32_t i = 0; i < nblocks; i++) {
+        uint32_t pb = logical_to_phys(d, i);
+        if (!pb) continue;
+        if (!rd_block(pb, 1, blk)) return -1;
         KFSDirEnt* e = (KFSDirEnt*)blk;
         for (uint32_t j = 0; j < KFS_BLOCK_SIZE / sizeof(KFSDirEnt); j++) {
             if (e[j].inode) { cb(e[j].name, e[j].type == KFS_DIR, ctx); count++; }

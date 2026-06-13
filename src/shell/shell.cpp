@@ -41,6 +41,7 @@
 #include "../system/input_manager.h"
 #include "../security/supr.h"   // supr policy / passwd commands (satoru)
 #include "../security/ksa.h"    // ksa status for `supr policy` (satoru)
+#include "../kcl/kcl.h"
 
 //  kurono shell implementation
 
@@ -623,13 +624,23 @@ int KuronoShell::Execute(const char* cmdline, char* output, int max_output) {
         static KuronoShell shell_singleton;
         result = cmd->handler(&shell_singleton, argc, argv, output, max_output);
     } else {
-        // check if it's a kcl script
+        // check if it's a kcl script  -  run it through the kcl interpreter.
+        // resolve a bare name against the cwd if it isn't already a path. (satoru)
         int nlen = slen(argv[0]);
         if (nlen > 4 && argv[0][nlen-4] == '.' && argv[0][nlen-3] == 'k' &&
             argv[0][nlen-2] == 'c' && argv[0][nlen-1] == 'l') {
-            result = sappend(output, 0, max_output, "kcl: would execute ");
-            result = sappend(output, result, max_output, argv[0]);
-            result = sappend_char(output, result, max_output, '\n');
+            if (KVFS::Exists(argv[0])) {
+                result = KCL::ExecFile(argv[0], output, max_output);
+            } else {
+                char path[KVFS_MAX_PATH];
+                const char* cwd = KVFS::GetCwd();
+                int pi = 0;
+                for (int i = 0; cwd && cwd[i] && pi < KVFS_MAX_PATH - 1; i++) path[pi++] = cwd[i];
+                if (pi == 0 || path[pi-1] != '/') { if (pi < KVFS_MAX_PATH - 1) path[pi++] = '/'; }
+                for (int i = 0; argv[0][i] && pi < KVFS_MAX_PATH - 1; i++) path[pi++] = argv[0][i];
+                path[pi] = 0;
+                result = KCL::ExecFile(path, output, max_output);
+            }
         } else {
             result = sappend(output, 0, max_output, "ksh: command not found: ");
             result = sappend(output, result, max_output, argv[0]);

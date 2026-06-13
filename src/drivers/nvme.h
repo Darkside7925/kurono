@@ -42,6 +42,10 @@
 
 #define NVME_MAX_QUEUES      4
 #define NVME_QUEUE_DEPTH     64
+//  layer 1: how many i/o commands a batched Read/Write posts before ringing the
+//  doorbell + reaping. kept < QUEUE_DEPTH so the ring never wraps past unreaped
+//  completions. 32 saturates the qemu nvme model's pipelining. (satoru)
+#define NVME_IO_BATCH        32
 
 struct NVMeSQE {
     uint8_t  opcode;
@@ -142,4 +146,15 @@ private:
     static bool SubmitIOCmd(int qid, NVMeSQE* cmd, NVMeCQE* result);
     static void RingDoorbell(NVMeQueuePair* qp);
     static bool PollCompletion(NVMeQueuePair* qp, NVMeCQE* result);
+
+    // layer 1  -  queue-depth batching. a single Read/Write that spans many ≤2 MB
+    // chunks posts up to NVME_IO_BATCH commands at once, rings the sq doorbell
+    // ONCE, then reaps all their completions  -  letting the controller pipeline
+    // the chunks instead of the old submit-one / poll-one (QD=1) round trips.
+    // direction: NVME_IO_READ or NVME_IO_WRITE. (satoru)
+    static bool SubmitIOBatch(int qid, uint8_t opcode, uint64_t lba,
+                              uint32_t count, uint8_t* buffer);
+    // reap exactly `n` completions off qp (any order), returning false on any
+    // error/timeout. used by SubmitIOBatch after a batched doorbell ring. (satoru)
+    static bool ReapCompletions(NVMeQueuePair* qp, int n);
 };

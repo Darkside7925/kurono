@@ -189,11 +189,13 @@ CXX_SRCS = \
     $(SRC)/fs/kvfs.cpp \
     $(SRC)/fs/persist.cpp \
     $(SRC)/fs/kfs.cpp \
+    $(SRC)/fs/kfs_bench.cpp \
 	$(SRC)/fs/fat32.cpp \
     $(SRC)/shell/shell.cpp \
     $(SRC)/shell/linux_cmds.cpp \
     $(SRC)/shell/windows_cmds.cpp \
     $(SRC)/kcl/kcl.cpp \
+    $(SRC)/kcl/kcl_test.cpp \
     $(SRC)/security/supr.cpp \
     $(SRC)/security/ksa.cpp \
     $(SRC)/packages/pkgmgr.cpp \

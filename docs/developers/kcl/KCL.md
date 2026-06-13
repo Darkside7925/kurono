@@ -1,33 +1,46 @@
-# KCL  -  Kurono Configuration Language
+# KCL  -  Kurono Command Language
 
-`src/kcl/kcl.cpp` and `kcl.h` implement a small scripting/configuration language built into Kurono.
+`src/kcl/kcl.cpp` and `kcl.h` implement a complete tree-walking scripting
+language built into Kurono. See [KCL_REFERENCE.md](KCL_REFERENCE.md) for the
+full grammar and stdlib.
 
 ## 1. What KCL is
 
-KCL is a simple interpreted language for automating Kurono shell operations, writing configuration scripts, and building lightweight tools inside the OS. It runs in the `kcl` shell command or from `.kcl` files.
+KCL is a real interpreted language (lexer + recursive-descent parser +
+evaluator) for automating Kurono shell operations, writing scripts, and
+building lightweight tools inside the OS. It runs via the `kcl` shell command,
+from `.kcl` files, or by double-clicking a `.kcl` file in the File Manager.
 
 ## 2. Language features
 
-- Variables: `let name = value`
-- Arithmetic and string expressions
-- Conditionals: `if ... else`
-- Loops: `for`, `while`
-- Shell command invocation: `run("command")`
-- File operations: `read(path)`, `write(path, content)`
-- Print output: `print(value)`
+- Typed values: int, float, string, bool, list, none
+- Variables: `set x = 10`, `let name = "Kurono"`
+- Arithmetic, string concatenation/repeat, comparisons, boolean logic (`and`/`or`/`not`)
+- Conditionals: `if` / `elif` / `else` / `end`
+- Loops: `while`, `for x in a..b`, `for x in <list/string>`, with `break`/`continue`
+- Functions with parameters, return values, and recursion: `func name(args) ... end`
+- Lists: literals `[1, 2, 3]`, indexing, `append` / `remove` / `len`
+- `import` to load another `.kcl` file; `#` comments and `#!/kcl` shebang
+- Stdlib: `print` `input` `len` `str` `int` `float` `sqrt` `rand` `abs` `min` `max`
+  `type` `read` `write` `exists` `exec` `sleep` `upper` `lower`
 
 ## 3. Running KCL
 
 From the shell:
 ```
 kcl /path/to/script.kcl
+kcl -c "print('Hello, World!')"
 ```
 
-Or interactively:
+A script can start with a shebang:
 ```
-kcl
-> let x = 10 + 5
-> print(x)
+#!/kcl
+print("Hello, World!")
+```
+
+Example session:
+```
+> kcl -c "set x = 10 + 5  print(x)"
 15
 ```
 
@@ -43,6 +56,8 @@ KCL commands are registered with `RegisterBuiltins()` in the shell startup seque
 
 ## 6. Related files
 
-- `src/shell/shell.cpp`  -  KCL command registration
-- `src/fs/kvfs.cpp`  -  file operations called from KCL scripts
-- `src/system/ui_config.cpp`  -  frequently the target of KCL customization scripts
+- `src/kcl/kcl.cpp`, `src/kcl/kcl.h`  -  the interpreter (lexer/parser/evaluator)
+- `src/kcl/kcl_test.cpp`  -  the 11-script self-test suite (boot token `kurono.kcltest`)
+- `src/shell/shell.cpp`  -  KCL command registration + `.kcl` shell dispatch
+- `src/apps/file_manager.cpp`  -  `.kcl` double-click → run in Terminal
+- `src/fs/kvfs.cpp`  -  file operations called from KCL scripts (`read`/`write`/`exists`)

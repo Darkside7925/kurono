@@ -30,12 +30,24 @@ block size, total/free block counts, and the start block + length of the bitmap
 and inode regions, plus a CRC32 over those fields. `Mount` validates the magic
 and CRC before trusting anything.
 
-**Inode** (`KFSInode`, exactly 128 bytes): type (`FREE`/`FILE`/`DIR`), unix
-`mode`/`uid`/`gid`, `size`, c/m/a-times, `nlink`, **13 direct** block pointers
-and **1 single-indirect** pointer (a block of 1024 pointers). That gives a max
-file size of `(13 + 1024) × 4 KB ≈ 4.05 MB` (`KFS_MAX_FILE`), which is the cap
-the persistence layer also uses to skip oversized re-seeded media. Inode 0 is
-reserved (means "none"); **inode 1 is the root directory**.
+> **KFS v2 (extent-based)  -  current on-disk format.** As of the performance +
+> capability overhaul the magic is `"KFS2"` (`0x4B465332`), the inode is **256
+> bytes**, and files/dirs are described by **extents**, not per-block pointers.
+> The v1 (`"KFS1"`, 128-byte inode, 13-direct + 1-indirect) layout below is kept
+> for historical reference; the §7 FUSE byte-offset tables still describe v1 and
+> need a v2 refresh. See **§10 Limits removed** and **§11 Optimization layers +
+> benchmarks** for the v2 format and numbers.
+
+**Inode** (`KFSInode`, exactly 128 bytes in v1 / **256 bytes in v2**): type
+(`FREE`/`FILE`/`DIR`/`SYMLINK`), unix `mode`/`uid`/`gid`, `size`, c/m/a-times,
+`nlink`. **v1** used **13 direct** block pointers + **1 single-indirect** pointer
+(a block of 1024 pointers), capping a file at `(13 + 1024) × 4 KB ≈ 4.05 MB`
+(`KFS_MAX_FILE`). **v2 removed that cap**: the inode holds **23 inline extents**
+`{start_lba, len_blocks}` plus an **unbounded overflow-block chain** (511 extents
+per 4 KB block), so a file is limited only by free disk space and a contiguous
+file is a **single extent** (a 174 MB binary = 1 extent, not 43520 pointers).
+Tiny files (`≤ 184 B`) are stored **inline in the inode** with no data block.
+Inode 0 is reserved (means "none"); **inode 1 is the root directory**.
 
 **Directory entry** (`KFSDirEnt`, exactly 64 bytes): child inode number,
 `name_len`, a type hint for listings, and up to a 55-char name. A directory's
@@ -219,6 +231,123 @@ second run logs `[KFSTEST] PASS`.
 ## 9. Related files
 
 - `src/fs/kfs.h`  -  on-disk format spec + API (the authoritative reference)
+- `src/fs/kfs.cpp`  -  KFS v2 (extent-based) implementation
+- `src/fs/kfs_bench.{h,cpp}`  -  headless storage benchmark (`kurono.kfsbench`)
 - `src/fs/persist.cpp`  -  `PersistStore`, the only KFS caller
 - `src/fs/kvfs.cpp`  -  the in-memory runtime filesystem KFS backs
 - `src/drivers/nvme.cpp`  -  the block device under KFS
+
+## 10. Limits removed (v2 capability overhaul)
+
+Every hard cap that existed in v1 was removed:
+
+| Limit (v1) | v1 value | v2 |
+| --- | --- | --- |
+| Max file size | `(13 + 1024) × 4 KB ≈ 4.05 MB` (`KFS_MAX_FILE`) | **none**  -  extents; limited only by free disk |
+| Max directory entries | `13 × 64 = 832` (13 direct dir blocks) | **none**  -  dirs grow via the same extents |
+| Max volume size | `65536` blocks = **256 MB** (`kfs_disk_blocks`) | **full NVMe capacity** (clamped only by a 512 MB metadata-cache budget ≈ 228 GB, and the u32 block-number space) |
+| Max path length | `256` (KFS internal `parent_path`) | **4096** (Linux `PATH_MAX`), heap-backed |
+| Hardcoded buffers | 512-child save / 256-entry restore | **dynamic** (sized to the actual directory) |
+
+The persistence layer no longer skips "oversized" files  -  it mirrors whatever
+KVFS holds. Symlinks are now a first-class KFS node type (`KFS::Symlink` /
+`ReadLink`) so the Linux-compat overlay round-trips through persistence.
+
+## 11. Optimization layers + benchmarks
+
+Measured headless via `kurono.kfsbench` (`src/fs/kfs_bench.cpp`): a fresh KFS
+volume on a dedicated 1 GB NVMe data disk, 32 MB sequential file, under
+**QEMU 10 + KVM**, `-cpu host -smp 4 -m 4G`, 2880 MHz TSC. **All timing is
+rdtsc-based.** Run with:
+
+```
+qemu-img create -f raw /tmp/kfsopt.img 1G
+# grub entry appends: kurono.text=1 kurono.kfsbench=1   (destructive to the disk)
+qemu-system-x86_64 -machine pc,vmport=off -cpu host -smp 4 -m 4G \
+  -cdrom build/kurono.iso -vga virtio -no-reboot -enable-kvm \
+  -drive file=/tmp/kfsopt.img,if=none,id=kdata,format=raw \
+  -device nvme,serial=kuronodata,drive=kdata -display none -serial stdio
+```
+
+**Honest caveat on the QEMU/KVM numbers.** The emulated NVMe is host-RAM-backed,
+so sequential throughput is bounded by the bounce-buffer **memcpy + QEMU
+emulation overhead**, not by disk or NVMe queue latency. Per-run variance is
+**±15 - 20%**, which is large. Numbers below are the median of 5 runs; treat
+single-digit-percent diffs as noise.
+
+| Metric | v1 (pre-overhaul, single-page DMA*) | v2 all layers (median of 5) |
+| --- | --- | --- |
+| Sequential write | ~14 MB/s (the old framebuffer-era path) | **~889 MB/s** |
+| Sequential read | n/a (blob) | **~2556 MB/s** |
+| Random 4K write IOPS (raw NVMe) |  -  | **~38 000** |
+| Snapshot save (full, 32 MB) |  -  | **~36.7 ms** |
+| Snapshot save (incremental, no change) |  -  (always full) | **~1 ms, 0 NVMe write cmds** |
+| Boot restore (mount + read 32 MB) |  -  | **~14.6 ms** |
+| 32 MB file extent count | 8192 block pointers | **1 extent** |
+| 512 tiny files (≤184 B) | 512 data blocks | **0 data blocks** (all inline) |
+
+\* The multi-page-DMA `prp` work that predates this overhaul already lifted the
+old 4 KB-per-command path; e.g. the two-boot test moves 1.45 MB in **35
+multi-page commands** vs **354** on the old single-page path.
+
+### Layers implemented
+
+- **Layer 4  -  extent layout (done).** Files/dirs are extent lists; the bump
+  allocator yields one contiguous run, so a file is one extent. This is the
+  mechanism that removes the file-size + dir-entry caps. Verified: a 32 MB file
+  = 1 file extent; reads coalesce adjacent extents into one ≤2 MB NVMe command.
+
+- **Layer 1  -  NVMe queue-depth (done, honest).** `NVMe::Read`/`Write` now batch
+  up to 32 ≤2 MB chunks per submission-queue doorbell ring and reap all
+  completions together (vs the old submit-one/poll-one QD=1), and one I/O queue
+  pair is created **per CPU core** (QID 1..4), routed by `SMP::CpuIndex()`.
+  Architecturally correct and verified at boot (`4 i/o queue pair(s) created`),
+  **but** on the RAM-backed QEMU NVMe the win is within the ±15 - 20% run-to-run
+  noise  -  the bottleneck there is memcpy/emulation, not doorbell round-trips.
+  This is the right primitive for real hardware (deep queues, true per-core
+  concurrency); multi-queue's per-core benefit is also latent until the
+  cooperative scheduler permits concurrent submitters.
+
+- **Layer 6  -  incremental snapshot (done).** `SaveTree` fingerprints the
+  user-data set (64-bit FNV over path/type/size/content), persists it in the
+  superblock, and **skips the entire reformat+rewrite when nothing changed**.
+  Verified: re-saving an unchanged tree drops from **6 ms / 35 NVMe write cmds**
+  to **1 ms / 0 cmds**. Tiny files (≤184 B) are stored **inline in the inode**
+  (Layer 6 "inline-compress small files")  -  512/512 tiny files used 0 data
+  blocks.
+
+### Layers NOT implemented (honest scope)
+
+Layers 2 (write-back page cache), 3 (log-structured write path + NAT + cleaner),
+5 (read-ahead/prefetch), and 7 (NVMe FDP placement groups) were **not** built.
+They presuppose a **mutable, mounted** filesystem with random in-place writes;
+KFS today is a **snapshot** filesystem (each `SaveTree` formats a fresh volume
+and writes contiguous runs), so those layers would require a different on-disk
+model than the one that makes the snapshot path fast and simple. They are the
+right next step if/when KFS becomes the live runtime FS rather than the
+periodic-snapshot persistence layer.
+
+### Comparison to ext4 / NTFS
+
+An honest comparison is **structural, not a head-to-head throughput shoot-out**  - 
+the only block device available here is QEMU's RAM-backed NVMe, on which any
+filesystem is memcpy-bound, so a MB/s race against ext4 would measure QEMU, not
+the filesystems. On capabilities and the workload that matters for Kurono
+(snapshotting the user-data tree across reboots):
+
+- **Extents.** KFS v2 uses extents like ext4 and NTFS (vs ext2/FAT block
+  pointers). A 174 MB file is 1 extent in all three; KFS reaches it through ≤23
+  inline + an overflow chain, ext4 through an extent tree, NTFS through runlists.
+- **Inline small files.** KFS stores ≤184 B files in the inode (0 data blocks),
+  like NTFS resident files and ext4 inline_data. A 512-file tiny-file set costs
+  0 data blocks in KFS.
+- **Contiguity.** KFS's snapshot bump-allocator guarantees a fresh file is
+  perfectly contiguous (1 extent, no fragmentation)  -  something ext4/NTFS only
+  approximate after use because they allocate in a live, fragmented free space.
+- **Incremental snapshot.** "Save nothing if nothing changed" (1 ms / 0 writes)
+  has no direct ext4/NTFS equivalent at the volume level; it is closer to a
+  copy-on-write snapshot (Btrfs/ZFS/VSS) but coarser (whole-tree fingerprint).
+- **What KFS does NOT have vs ext4/NTFS:** journaling, in-place random writes, a
+  write-back page cache, prefetch, ACLs/xattrs, online resize, fsck. These are
+  the unbuilt Layers 2/3/5 plus general maturity. KFS is a fast, simple,
+  unbounded **snapshot** store  -  not yet a general-purpose mutable FS.

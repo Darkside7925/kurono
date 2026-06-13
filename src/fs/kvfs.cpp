@@ -337,6 +337,18 @@ int KVFS::Mkdirs_nolock(const char* path, uint16_t mode) {
                     if (!child) return KVFS_ERR_NO_MEM;
                     if (!cur->add_child(child)) { FreeNode(child); return KVFS_ERR_FULL; }
                 }
+                // follow a symlink in an intermediate component so the compat
+                // overlay works: Mkdirs("/system/lib") must walk THROUGH the
+                // /system -> /kurono/system symlink into the real dir, not bail
+                // with NOT_DIR (a symlink's is_dir() is false). resolve the
+                // target to its directory node and continue from there. bounded
+                // hop count guards against a symlink cycle. (satoru)
+                int hops = 0;
+                while (child && child->type == KVFS_SYMLINK && hops < 16) {
+                    child = ResolvePath_nolock(child->link_target);
+                    hops++;
+                }
+                if (!child) return KVFS_ERR_NOT_FOUND;
                 if (!child->is_dir()) return KVFS_ERR_NOT_DIR;
                 cur = child;
                 ci = 0;
@@ -348,6 +360,66 @@ int KVFS::Mkdirs_nolock(const char* path, uint16_t mode) {
             i++;
         }
     }
+    PathCacheInvalidate();
+    return KVFS_OK;
+}
+
+int KVFS::Symlink(const char* path, const char* target) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return Symlink_nolock(path, target);
+}
+
+// create a KVFS_SYMLINK node at `path` whose link_target is `target`. mirrors
+// CreateFile_nolock's parent split + parent autocreate, but allocates a symlink
+// node and copies the target string. if an entry already exists at `path` and
+// is already a symlink, its target is just rewritten (idempotent re-install);
+// any other existing node-type is left alone and EXISTS is returned. (satoru)
+int KVFS::Symlink_nolock(const char* path, const char* target) {
+    if (!path || !target) return KVFS_ERR_INVALID;
+    char norm[KVFS_MAX_PATH];
+    NormalizePath(path, norm, KVFS_MAX_PATH);
+
+    char parent_path[KVFS_MAX_PATH];
+    char name[KVFS_MAX_NAME];
+    int len = kstrlen(norm);
+    int last_slash = -1;
+    for (int i = len - 1; i >= 0; i--) {
+        if (norm[i] == '/') { last_slash = i; break; }
+    }
+    if (last_slash < 0) return KVFS_ERR_INVALID;
+    if (last_slash == 0) {
+        parent_path[0] = '/'; parent_path[1] = 0;
+    } else {
+        for (int i = 0; i < last_slash && i < KVFS_MAX_PATH - 1; i++) parent_path[i] = norm[i];
+        parent_path[last_slash] = 0;
+    }
+    kstrcpy(name, norm + last_slash + 1, KVFS_MAX_NAME);
+    if (name[0] == 0) return KVFS_ERR_INVALID;
+
+    KVFSNode* parent = ResolvePath_nolock(parent_path);
+    if (!parent) {
+        Mkdirs_nolock(parent_path);
+        parent = ResolvePath_nolock(parent_path);
+        if (!parent) return KVFS_ERR_NOT_FOUND;
+    }
+    if (!parent->is_dir()) return KVFS_ERR_NOT_DIR;
+
+    KVFSNode* existing = parent->find_child(name);
+    if (existing) {
+        // idempotent: rewrite an existing symlink's target; never clobber a
+        // real dir/file that already lives at this name. (satoru)
+        if (existing->type == KVFS_SYMLINK) {
+            kstrcpy(existing->link_target, target, KVFS_MAX_PATH);
+            PathCacheInvalidate();
+            return KVFS_OK;
+        }
+        return KVFS_ERR_EXISTS;
+    }
+
+    KVFSNode* link = AllocNode(name, KVFS_SYMLINK, 0777);
+    if (!link) return KVFS_ERR_NO_MEM;
+    kstrcpy(link->link_target, target, KVFS_MAX_PATH);
+    if (!parent->add_child(link)) { FreeNode(link); return KVFS_ERR_FULL; }
     PathCacheInvalidate();
     return KVFS_OK;
 }
@@ -1148,24 +1220,129 @@ bool KVFS::TryWriteCrashDump(const char* path, const void* data, uint32_t len) {
     return ok;
 }
 
+// install the canonical /kurono/* tree and the top-level compat-symlink overlay.
+// this is the FIRST thing that touches the tree (called from BuildDefaultTree(),
+// which Init() runs before anything else), so when later boot stages do
+// Mkdirs("/system/...") / WriteFile("/etc/...") / seed "/usr/bin/...", every old
+// top-level name resolves THROUGH a symlink into the real /kurono dir instead of
+// materialising a stray real /system, /etc, ... at the root. (satoru)
+void KVFS::InstallCanonicalLayout() {
+    // ---- real directories under /kurono (the single home for everything) ----
+    static const char* real_dirs[] = {
+        "/kurono",
+        // core os
+        "/kurono/system",
+        "/kurono/system/bin",
+        "/kurono/system/lib",
+        "/kurono/system/drivers",
+        "/kurono/system/drivers/wifi",
+        "/kurono/system/drivers/audio",
+        "/kurono/system/drivers/video",
+        "/kurono/system/config",          // the compat /etc target (satoru)
+        "/kurono/system/config/kurono",
+        "/kurono/system/config/network",
+        "/kurono/system/config/wifi",
+        "/kurono/system/boot",
+        "/kurono/system/security",
+        "/kurono/system/scripts",
+        "/kurono/system/themes",
+        // linux compat (linker libs live here; /lib + /usr/lib point in) (satoru)
+        "/kurono/linux",
+        "/kurono/linux/compat",
+        "/kurono/linux/compat/bin",
+        "/kurono/linux/compat/lib",
+        "/kurono/linux/linker",
+        "/kurono/linux/bridge",
+        "/kurono/linux/drivers",
+        // windows compat
+        "/kurono/windows",
+        "/kurono/windows/System32",
+        "/kurono/windows/Users",
+        "/kurono/windows/Program Files",
+        // native apps + packages
+        "/kurono/apps",
+        "/kurono/apps/bin",
+        "/kurono/apps/lib",
+        "/kurono/packages",
+        // all user data
+        "/kurono/user",
+        "/kurono/user/home",
+        "/kurono/user/home/user",
+        "/kurono/user/home/user/Documents",
+        "/kurono/user/home/user/Downloads",
+        "/kurono/user/home/user/Desktop",
+        "/kurono/user/home/user/Pictures",
+        "/kurono/user/home/user/Music",
+        "/kurono/user/home/user/Videos",
+        "/kurono/user/shared",
+        // live state, conceptually cleared on boot
+        "/kurono/runtime",
+        "/kurono/runtime/proc",
+        "/kurono/runtime/dev",
+        "/kurono/runtime/tmp",
+        "/kurono/runtime/sockets",
+        // persistent var
+        "/kurono/var",
+        "/kurono/var/log",
+        "/kurono/var/lib",
+        "/kurono/var/updates",
+        "/kurono/var/state",
+        nullptr,
+    };
+    for (int i = 0; real_dirs[i]; i++) Mkdirs_nolock(real_dirs[i]);
+
+    // /usr must be a REAL dir so the per-subdir symlinks (/usr/bin, /usr/lib)
+    // can live inside it; /usr/share stays a real dir too. (satoru)
+    Mkdirs_nolock("/usr");
+    Mkdirs_nolock("/usr/share");
+
+    // a handful of bare FHS dirs that aren't remapped keep their own real homes;
+    // nothing in the spec routes them into /kurono. (satoru)
+    Mkdirs_nolock("/sbin");
+    Mkdirs_nolock("/lib64");
+    Mkdirs_nolock("/root");
+    Mkdirs_nolock("/opt");
+    Mkdirs_nolock("/opt/kurono");
+    Mkdirs_nolock("/mnt");
+    Mkdirs_nolock("/mnt/usb");
+    Mkdirs_nolock("/sys");
+    Mkdirs_nolock("/boot");
+
+    // ---- compat symlinks: old top-level names -> canonical /kurono dirs ----
+    // intermediate-component symlink following (Resolve + Mkdirs) makes
+    // /system/lib/x, /etc/hostname, /home/user/... all resolve through here. (satoru)
+    Symlink_nolock("/system", "/kurono/system");
+    Symlink_nolock("/home",   "/kurono/user/home");
+    Symlink_nolock("/etc",    "/kurono/system/config");
+    Symlink_nolock("/bin",    "/kurono/system/bin");
+    Symlink_nolock("/lib",    "/kurono/linux/compat");
+    Symlink_nolock("/usr/bin","/kurono/linux/compat/bin");
+    Symlink_nolock("/usr/lib","/kurono/linux/compat/lib");
+    Symlink_nolock("/tmp",    "/kurono/runtime/tmp");
+    Symlink_nolock("/proc",   "/kurono/runtime/proc");
+    Symlink_nolock("/dev",    "/kurono/runtime/dev");
+    Symlink_nolock("/var",    "/kurono/var");
+    Symlink_nolock("/apps",   "/kurono/apps");
+    Symlink_nolock("/windows","/kurono/windows");
+
+    PathCacheInvalidate();
+}
+
 void KVFS::BuildDefaultTree() {
+    // lay the canonical /kurono tree + compat symlinks FIRST; every path below
+    // (and in every later boot stage) resolves through the overlay. (satoru)
+    InstallCanonicalLayout();
+
+    // remaining seed dirs  -  these resolve through the symlinks into /kurono. the
+    // top-level names (/etc, /home, /var, ...) are now symlinks, so Mkdirs walks
+    // through them into the real dirs. (satoru)
     const char* dirs[] = {
-        "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/share",
-        "/etc", "/etc/kurono", "/etc/network", "/etc/wifi",
-        "/home", "/home/user", "/home/user/Documents", "/home/user/Downloads",
+        "/usr/share",
+        "/etc/kurono", "/etc/network", "/etc/wifi",
+        "/home/user", "/home/user/Documents", "/home/user/Downloads",
         "/home/user/Desktop", "/home/user/Pictures", "/home/user/Music",
         "/home/user/Videos",
-        "/var", "/var/log", "/var/lib", "/var/cache",
-        "/tmp", "/proc", "/sys", "/dev",
-        "/lib", "/lib64", "/root",
-        "/opt", "/opt/kurono",
-        "/mnt", "/mnt/usb",
-        "/kurono", "/kurono/apps", "/kurono/packages", "/kurono/scripts",
-        "/kurono/themes", "/kurono/drivers", "/kurono/drivers/wifi",
-        "/kurono/drivers/audio", "/kurono/drivers/video",
-        "/kurono/var", "/kurono/var/log", "/kurono/var/lib", "/kurono/etc", "/kurono/config",
-        "/windows", "/windows/System32", "/windows/Users",
-        "/windows/Program Files",
+        "/var/log", "/var/lib", "/var/cache",
         nullptr,
     };
 
