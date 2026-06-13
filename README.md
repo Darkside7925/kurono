@@ -542,21 +542,24 @@ Kurono includes a Type 1 hypervisor stack designed for Linux guest boot and devi
   - home directories
   - runtime session tracking
 
-- **KCL**
-  - variables
-  - functions
-  - `if` / `else`
-  - `while` / `for`
-  - imports
-  - math helpers like `sqrt` and `rand`
-  - `print` and `set`
+- **KCL** (Kurono Command Language)  -  a complete tree-walking scripting language
+  - typed values: int, float, string, bool, list, none (real doubles)
+  - variables (`set x = 10`), arithmetic, string concat, comparisons, boolean logic (`and`/`or`/`not`)
+  - control flow: `if` / `elif` / `else` / `end`, `while`, `for x in a..b` and `for x in <list/string>`
+  - functions with parameters, return values, and recursion (`func name(args) ... end`)
+  - lists: literals `[1, 2, 3]`, indexing (incl. negative), `append` / `remove` / `len`
+  - imports (`import lib.kcl`) and `#` comments / shebang (`#!/kcl`)
+  - stdlib builtins: `print` `input` `len` `str` `int` `float` `sqrt` `rand` `abs` `min` `max` `type` `read` `write` `exists` `exec` `sleep` `upper` `lower`
+  - run via `kcl script.kcl`, `kcl -c "code"`, a `.kcl` shebang, or double-click in the File Manager
+  - errors are reported with line numbers and never crash the OS
 
 - **KVFS**
   - in-memory virtual filesystem
   - directories, files, symlinks, devices, pipes, mountpoints
   - POSIX-style permissions
   - common file operations across shell and apps
-  - pre-seeded `/home`, `/etc`, `/tmp`, `/var/log`, `/usr/bin`
+  - one **canonical tree under `/kurono`** (`system`, `linux`, `windows`, `apps`, `user`, `packages`, `runtime`, `var`); the old top-level names are **compat symlinks** into it (`/system -> /kurono/system`, `/home -> /kurono/user/home`, `/etc -> /kurono/system/config`, `/bin`, `/lib`, `/usr/{bin,lib}`, `/tmp`, `/proc`, `/dev`, `/var`, `/apps`, `/windows`), installed at the earliest fs init by `KVFS::InstallCanonicalLayout()` and centralized in `src/system/kpaths.h` (see `docs/developers/fs/KVFS.md`)
+  - pre-seeded `/home`, `/etc`, `/tmp`, `/var/log`, `/usr/bin` (all resolving through the overlay)
 
 - **ext4 and FAT32**
   - ext4 parsing for the Linux layer and installer targets

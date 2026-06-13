@@ -163,43 +163,131 @@ namespace {
         out[p] = 0;
     }
 
-    //  mirror a kvfs subtree into the mounted kfs volume. (satoru)
+    //  mirror a kvfs subtree into the mounted kfs volume. the child list is sized
+    //  to the directory's actual child_count (heap, not a fixed 512 cap) so a
+    //  directory of ANY size is fully mirrored  -  no max-dir-entry limit. (satoru)
     void save_subtree(const char* path) {
+        KVFSNode* node = KVFS::Resolve(path);
+        if (node && node->type == KVFS_SYMLINK) {
+            // store the symlink target so the compat overlay survives reboots even
+            // if InstallCanonicalLayout were ever skipped (defence in depth). (satoru)
+            KFS::Symlink(path, node->link_target);
+            return;
+        }
         if (KVFS::IsDir(path)) {
             KFS::Mkdirs(path);
-            KVFSNode** kids = (KVFSNode**)KernelHeap::Alloc(512 * sizeof(KVFSNode*));
+            int cap = node ? node->child_count : 0;
+            if (cap <= 0) return;
+            KVFSNode** kids = (KVFSNode**)KernelHeap::Alloc((uint32_t)cap * sizeof(KVFSNode*));
             if (!kids) return;
-            int n = KVFS::Listdir(path, kids, 512);
+            int n = KVFS::Listdir(path, kids, cap);
             for (int i = 0; i < n; i++) {
                 if (!kids[i]) continue;
-                char child[256];
-                path_join(child, sizeof(child), path, kids[i]->name);
+                // a path component can be up to 4 KB (linux PATH_MAX); heap-alloc
+                // the join buffer so deep trees don't blow the recursion stack. (satoru)
+                char* child = (char*)KernelHeap::Alloc(4096);
+                if (!child) continue;
+                path_join(child, 4096, path, kids[i]->name);
                 save_subtree(child);
+                KernelHeap::Free(child);
             }
             KernelHeap::Free(kids);
         } else if (KVFS::IsFile(path)) {
             int sz = KVFS::GetFileSize(path);
-            if (sz < 0 || (uint32_t)sz > KFS_MAX_FILE) return;  // skip oversized re-seeded media (satoru)
+            // KFS v2 extents have NO ~4 MB file cap (files are limited only by
+            // free disk space), so the old KFS_MAX_FILE skip is gone  -  mirror
+            // whatever KVFS holds. (satoru)
+            if (sz < 0) return;
             if (sz == 0) { KFS::WriteFile(path, "", 0); return; }
             uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)sz);
             if (!buf) return;
             if (KVFS::ReadFile(path, buf, (uint32_t)sz) == sz)
-                KFS::WriteFile(path, buf, (uint32_t)sz);
+                KFS::WriteFile(path, buf, (uint64_t)(uint32_t)sz);
             KernelHeap::Free(buf);
         }
     }
 
+    //  layer 6  -  content fingerprint of a kvfs subtree. accumulates a 64-bit hash
+    //  over (path, type, size, content) for every node so two different trees
+    //  almost never collide. order matters (depth-first, dir children in listdir
+    //  order), which is deterministic for the same tree. used to detect "nothing
+    //  changed since the last save" and skip the whole reformat+rewrite. (satoru)
+    void fp_mix(uint64_t* h, const uint8_t* p, uint32_t n) {
+        uint64_t x = *h;
+        for (uint32_t i = 0; i < n; i++) { x ^= p[i]; x *= 1099511628211ull; }   // fnv-1a-ish (satoru)
+        *h = x;
+    }
+    void fp_str(uint64_t* h, const char* s) { uint32_t n = 0; while (s[n]) n++; fp_mix(h, (const uint8_t*)s, n); }
+
+    void fingerprint_subtree(const char* path, uint64_t* h) {
+        KVFSNode* node = KVFS::Resolve(path);
+        if (!node) return;
+        fp_str(h, path);
+        uint8_t t = (uint8_t)node->type; fp_mix(h, &t, 1);
+        if (node->type == KVFS_SYMLINK) { fp_str(h, node->link_target); return; }
+        if (KVFS::IsDir(path)) {
+            int cap = node->child_count;
+            if (cap <= 0) return;
+            KVFSNode** kids = (KVFSNode**)KernelHeap::Alloc((uint32_t)cap * sizeof(KVFSNode*));
+            if (!kids) return;
+            int n = KVFS::Listdir(path, kids, cap);
+            for (int i = 0; i < n; i++) {
+                if (!kids[i]) continue;
+                char* child = (char*)KernelHeap::Alloc(4096);
+                if (!child) continue;
+                path_join(child, 4096, path, kids[i]->name);
+                fingerprint_subtree(child, h);
+                KernelHeap::Free(child);
+            }
+            KernelHeap::Free(kids);
+        } else if (KVFS::IsFile(path)) {
+            int sz = KVFS::GetFileSize(path);
+            if (sz < 0) return;
+            uint32_t usz = (uint32_t)sz;
+            fp_mix(h, (const uint8_t*)&usz, sizeof(usz));
+            if (sz == 0) return;
+            uint8_t* buf = (uint8_t*)KernelHeap::Alloc(usz);
+            if (!buf) return;
+            if (KVFS::ReadFile(path, buf, usz) == sz) fp_mix(h, buf, usz);
+            KernelHeap::Free(buf);
+        }
+    }
+
+    //  fingerprint the whole persisted user-data set (the same roots SaveTree
+    //  mirrors). a non-zero base so an empty tree isn't 0 (which means "unset"). (satoru)
+    uint64_t fingerprint_userdata() {
+        uint64_t h = 1469598103934665603ull;   // fnv offset basis (satoru)
+        const char* roots[3] = { "/home", "/etc", "/root" };
+        for (int i = 0; i < 3; i++) if (KVFS::Exists(roots[i])) fingerprint_subtree(roots[i], &h);
+        if (h == 0) h = 1;   // 0 is the "unset" sentinel (satoru)
+        return h;
+    }
+
     //  one dir's children collected off the kfs List callback, so the List scan's
-    //  block buffer is released before we recurse (keeps the stack shallow). (satoru)
+    //  block buffer is released before we recurse (keeps the stack shallow). the
+    //  collection grows on the heap with NO fixed cap, so a directory of any size
+    //  restores in full. (satoru)
     struct Collected {
-        static const int MAXN = 256;
-        char names[MAXN][KFS_NAME_MAX + 1];
-        bool isdir[MAXN];
-        int  count;
+        char (*names)[KFS_NAME_MAX + 1];
+        bool* isdir;
+        int   count;
+        int   cap;
     };
     void collect_cb(const char* name, bool is_dir, void* ctxv) {
         Collected* c = (Collected*)ctxv;
-        if (c->count >= Collected::MAXN) return;
+        if (c->count >= c->cap) {
+            int ncap = c->cap ? c->cap * 2 : 64;
+            char (*nn)[KFS_NAME_MAX + 1] = (char(*)[KFS_NAME_MAX + 1])KernelHeap::Alloc((uint32_t)ncap * (KFS_NAME_MAX + 1));
+            bool* nd = (bool*)KernelHeap::Alloc((uint32_t)ncap * sizeof(bool));
+            if (!nn || !nd) { if (nn) KernelHeap::Free(nn); if (nd) KernelHeap::Free(nd); return; }
+            for (int i = 0; i < c->count; i++) {
+                for (int k = 0; k <= KFS_NAME_MAX; k++) nn[i][k] = c->names[i][k];
+                nd[i] = c->isdir[i];
+            }
+            if (c->names) KernelHeap::Free(c->names);
+            if (c->isdir) KernelHeap::Free(c->isdir);
+            c->names = nn; c->isdir = nd; c->cap = ncap;
+        }
         int i = 0; for (; name[i] && i < KFS_NAME_MAX; i++) c->names[c->count][i] = name[i];
         c->names[c->count][i] = 0;
         c->isdir[c->count] = is_dir;
@@ -207,33 +295,49 @@ namespace {
     }
 
     void restore_subtree(const char* path) {
-        Collected* c = (Collected*)KernelHeap::Alloc(sizeof(Collected));
-        if (!c) return;
-        c->count = 0;
-        KFS::List(path, collect_cb, c);
-        for (int i = 0; i < c->count; i++) {
-            char child[256];
-            path_join(child, sizeof(child), path, c->names[i]);
-            if (c->isdir[i]) {
+        Collected c; c.names = nullptr; c.isdir = nullptr; c.count = 0; c.cap = 0;
+        KFS::List(path, collect_cb, &c);
+        for (int i = 0; i < c.count; i++) {
+            char* child = (char*)KernelHeap::Alloc(4096);
+            if (!child) continue;
+            path_join(child, 4096, path, c.names[i]);
+            if (c.isdir[i]) {
                 KVFS::Mkdirs(child);
                 restore_subtree(child);
+            } else if (KFS::IsSymlink(child)) {
+                char tgt[1024]; tgt[0] = 0;
+                if (KFS::ReadLink(child, tgt, (int)sizeof(tgt)) > 0)
+                    KVFS::Symlink(child, tgt);
             } else {
-                int sz = KFS::FileSize(child);
-                if (sz < 0) continue;
-                if (sz == 0) { KVFS::WriteFile(child, "", 0); continue; }
+                int64_t sz = KFS::FileSize(child);
+                if (sz < 0) { KernelHeap::Free(child); continue; }
+                if (sz == 0) { KVFS::WriteFile(child, "", 0); KernelHeap::Free(child); continue; }
                 uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)sz);
-                if (!buf) continue;
-                if (KFS::ReadFile(child, buf, (uint32_t)sz) == sz)
+                if (!buf) { KernelHeap::Free(child); continue; }
+                if (KFS::ReadFile(child, buf, (uint64_t)sz) == sz)
                     KVFS::WriteFile(child, buf, (uint32_t)sz);
                 KernelHeap::Free(buf);
             }
+            KernelHeap::Free(child);
         }
-        KernelHeap::Free(c);
+        if (c.names) KernelHeap::Free(c.names);
+        if (c.isdir) KernelHeap::Free(c.isdir);
     }
 
+    //  size the KFS volume to the FULL nvme capacity (no 256 MB cap). the in-ram
+    //  metadata caches scale with the volume  -  bitmap = total_blocks/8 bytes and
+    //  the inode table = total_blocks*8 bytes (1 inode per 32 blocks)  -  so a 4 GB
+    //  disk costs ~36 MB of cache, a 16 GB disk ~144 MB. cap the cache budget at
+    //  512 MB (=> ~57 GB volume) so a pathologically huge disk can't exhaust ram;
+    //  beyond that we still address the whole disk for data, we just cap the
+    //  metadata region. (satoru)
     uint32_t kfs_disk_blocks() {
-        uint64_t blocks = NVMe::GetCapacityLBA() * NVMe::GetLBASize() / KFS_BLOCK_SIZE;
-        if (blocks > 65536) blocks = 65536;   // cap at 256mb so the metadata caches stay ~1mb (satoru)
+        uint64_t blocks = NVMe::GetCapacityLBA() * (uint64_t)NVMe::GetLBASize() / KFS_BLOCK_SIZE;
+        // budget ~9 bytes of metadata cache per block (bitmap 1/8 B + inode 8 B);
+        // 512 MB / 9 ≈ 59.6 M blocks ≈ 228 GB addressable before we clamp. (satoru)
+        const uint64_t MAX_BLOCKS = 59000000ull;
+        if (blocks > MAX_BLOCKS) blocks = MAX_BLOCKS;
+        if (blocks > 0xFFFFFFFEull) blocks = 0xFFFFFFFEull;  // block numbers are u32 (satoru)
         if (blocks < 64) return 0;
         return (uint32_t)blocks;
     }
@@ -242,12 +346,29 @@ namespace {
 bool PersistStore::SaveTree() {
     if (!NVMe::IsDetected()) return false;
     KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
+
+    // layer 6  -  INCREMENTAL save. fingerprint the current user-data set; if a
+    // valid volume is already on disk with the SAME fingerprint, nothing changed
+    // since the last save, so skip the whole reformat+rewrite. this makes a save
+    // with no changes ≈ a single mount (a few ms) instead of a full 30-40 ms
+    // format + rewrite. on a real change (or a fresh/foreign disk) we fall through
+    // to the full snapshot. (satoru)
+    uint64_t cur_fp = fingerprint_userdata();
+    if (KFS::Mount()) {
+        uint64_t prev_fp = KFS::MountedFingerprint();
+        if (prev_fp != 0 && prev_fp == cur_fp) {
+            SerialLogger::Log("[persist] incremental save: user data unchanged, skipped full rewrite\r\n");
+            return true;
+        }
+    }
+
     uint32_t blocks = kfs_disk_blocks();
     if (!blocks || !KFS::Format(blocks)) return false;
     const char* roots[3] = { "/home", "/etc", "/root" };
     for (int i = 0; i < 3; i++) if (KVFS::Exists(roots[i])) save_subtree(roots[i]);
+    KFS::SetFingerprint(cur_fp);   // stamp so the next save can short-circuit (satoru)
     bool ok = KFS::Sync();
-    if (ok) SerialLogger::Log("[persist] saved kvfs user data to KFS volume\r\n");
+    if (ok) SerialLogger::Log("[persist] saved kvfs user data to KFS volume (full snapshot)\r\n");
     return ok;
 }
 

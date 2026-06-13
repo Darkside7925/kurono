@@ -6,6 +6,7 @@
 #include "../kernel/pmm.h"   // page-aligned dma memory for the admin/io queues (satoru)
 #include "../kernel/vmm.h"   // identity-map the high 64-bit bar before touching it (satoru)
 #include "../drivers/serial.h"
+#include "../proc/smp.h"     // one i/o queue per cpu core; route by calling cpu (satoru)
 #include <string.h>
 
 bool              NVMe::detected        = false;
@@ -253,39 +254,67 @@ bool NVMe::Identify() {
 }
 
 bool NVMe::CreateIOQueues() {
-    // simplified: create one i/o queue pair (qid=1)
-    io_queue_count = 1;
-    NVMeQueuePair* qp = &io_queues[0];
-    qp->depth = NVME_QUEUE_DEPTH;
-    qp->sq_tail = 0;
-    qp->cq_head = 0;
-    qp->cq_phase = 1;
-    qp->qid = 1;
+    // layer 1: create ONE i/o queue pair PER cpu core (qid 1..N), so each core
+    // can submit on its own queue without contending on a shared doorbell/ring.
+    // negotiate the queue count with the controller first (set features 0x07),
+    // then create cq+sq per queue. routing is by SMP::CpuIndex() in Read/Write.
+    // (satoru)
+    uint32_t want = SMP::CpuCount();
+    if (want < 1) want = 1;
+    if (want > NVME_MAX_QUEUES) want = NVME_MAX_QUEUES;
 
-    // page-aligned for the controller dma engine, same as the admin queues. (satoru)
-    qp->sq = (NVMeSQE*)PMM::AllocBytes(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
-    qp->cq = (NVMeCQE*)PMM::AllocBytes(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
-    if (qp->sq) memset(qp->sq, 0, sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
-    if (qp->cq) memset(qp->cq, 0, sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
+    // set features: number of queues. cdw11 = (ncqr<<16)|nsqr, 0-based counts.
+    // the controller returns the GRANTED count in the completion result; honor
+    // it so we never create more queues than allocated. (satoru)
+    NVMeSQE sf = {}; NVMeCQE sfr = {};
+    sf.opcode = NVME_ADM_SET_FEAT;
+    sf.cdw10  = 0x07;                                   // number of queues (satoru)
+    sf.cdw11  = ((want - 1) << 16) | (want - 1);        // request want sq + want cq (satoru)
+    uint32_t granted = want;
+    if (SubmitAdminCmd(&sf, &sfr)) {
+        uint32_t nsq = (sfr.result & 0xFFFF) + 1;
+        uint32_t ncq = ((sfr.result >> 16) & 0xFFFF) + 1;
+        uint32_t g = nsq < ncq ? nsq : ncq;
+        if (g >= 1 && g < want) granted = g;            // controller gave us fewer (satoru)
+    }
+    if (granted > NVME_MAX_QUEUES) granted = NVME_MAX_QUEUES;
 
-    // create cq first, then sq
-    NVMeSQE cmd = {};
-    NVMeCQE result = {};
+    io_queue_count = 0;
+    for (uint32_t i = 0; i < granted; i++) {
+        NVMeQueuePair* qp = &io_queues[i];
+        uint16_t qid = (uint16_t)(i + 1);
+        qp->depth = NVME_QUEUE_DEPTH;
+        qp->sq_tail = 0; qp->cq_head = 0; qp->cq_phase = 1; qp->qid = qid;
 
-    cmd.opcode = NVME_ADM_CREATE_CQ;
-    cmd.prp1 = (uint64_t)(uintptr_t)qp->cq;
-    cmd.cdw10 = ((NVME_QUEUE_DEPTH - 1) << 16) | 1; // qid=1
-    cmd.cdw11 = 1; // physically contiguous
-    SubmitAdminCmd(&cmd, &result);
+        // page-aligned for the controller dma engine, same as the admin queues. (satoru)
+        qp->sq = (NVMeSQE*)PMM::AllocBytes(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
+        qp->cq = (NVMeCQE*)PMM::AllocBytes(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
+        if (!qp->sq || !qp->cq) break;
+        memset(qp->sq, 0, sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
+        memset(qp->cq, 0, sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
 
-    cmd = {};
-    cmd.opcode = NVME_ADM_CREATE_SQ;
-    cmd.prp1 = (uint64_t)(uintptr_t)qp->sq;
-    cmd.cdw10 = ((NVME_QUEUE_DEPTH - 1) << 16) | 1; // qid=1
-    cmd.cdw11 = (1 << 16) | 1; // cq=1, physically contiguous
-    SubmitAdminCmd(&cmd, &result);
+        // create cq first, then sq. (satoru)
+        NVMeSQE cmd = {}; NVMeCQE result = {};
+        cmd.opcode = NVME_ADM_CREATE_CQ;
+        cmd.prp1 = (uint64_t)(uintptr_t)qp->cq;
+        cmd.cdw10 = ((NVME_QUEUE_DEPTH - 1) << 16) | qid;
+        cmd.cdw11 = 1; // physically contiguous (no interrupts: we poll) (satoru)
+        if (!SubmitAdminCmd(&cmd, &result)) break;
 
-    SerialLogger::Log("[NVMe] I/O queue pair created (QID=1)\r\n");
+        cmd = {}; result = {};
+        cmd.opcode = NVME_ADM_CREATE_SQ;
+        cmd.prp1 = (uint64_t)(uintptr_t)qp->sq;
+        cmd.cdw10 = ((NVME_QUEUE_DEPTH - 1) << 16) | qid;
+        cmd.cdw11 = ((uint32_t)qid << 16) | 1; // bind to its own cq, contiguous (satoru)
+        if (!SubmitAdminCmd(&cmd, &result)) break;
+
+        io_queue_count++;
+    }
+    if (io_queue_count == 0) { SerialLogger::Log("[NVMe] FAILED to create any i/o queue\r\n"); return false; }
+
+    SerialLogger::Log("[NVMe] "); SerialLogger::LogDec(io_queue_count);
+    SerialLogger::Log(" i/o queue pair(s) created (one per cpu core, QID=1..");
+    SerialLogger::LogDec(io_queue_count); SerialLogger::Log(")\r\n");
     return true;
 }
 
@@ -382,7 +411,12 @@ bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
 //  at a time). (satoru)
 static uint8_t* g_prp_list = nullptr;
 
-static bool nvme_build_prp(uint64_t base, uint32_t bytes, uint64_t* prp1, uint64_t* prp2) {
+//  build prp1/prp2 using `list_page` for the prp list when one is needed. when
+//  list_page is null the shared g_prp_list scratch is used (single-command
+//  path). the batched path passes a DISTINCT page per in-flight command so two
+//  outstanding commands never share a list (which would corrupt one of them).
+//  (satoru)
+static bool nvme_build_prp_on(uint64_t base, uint32_t bytes, uint64_t* prp1, uint64_t* prp2, uint8_t* list_page) {
     const uint32_t PAGE = 4096;
     *prp1 = base;
     // prp1 may carry a byte offset (the transfer starts there); the first page
@@ -399,13 +433,39 @@ static bool nvme_build_prp(uint64_t base, uint32_t bytes, uint64_t* prp1, uint64
     if (rem <= PAGE) { *prp2 = page2; return true; }
     uint32_t n_list = (rem + PAGE - 1) / PAGE;      // pages after the first (satoru)
     if (n_list > PAGE / 8) return false;            // > one list page (~2mb): caller must chunk (satoru)
-    if (!g_prp_list) {
-        g_prp_list = (uint8_t*)PMM::AllocBytes(PAGE);
-        if (!g_prp_list) return false;
+    if (!list_page) {
+        if (!g_prp_list) {
+            g_prp_list = (uint8_t*)PMM::AllocBytes(PAGE);
+            if (!g_prp_list) return false;
+        }
+        list_page = g_prp_list;
     }
-    uint64_t* list = (uint64_t*)g_prp_list;
+    uint64_t* list = (uint64_t*)list_page;
     for (uint32_t i = 0; i < n_list; i++) list[i] = page2 + (uint64_t)i * PAGE;
-    *prp2 = (uint64_t)(uintptr_t)g_prp_list;
+    *prp2 = (uint64_t)(uintptr_t)list_page;
+    return true;
+}
+
+//  single-command helper (shared scratch); kept for the non-batched callers /
+//  future use. (satoru)
+__attribute__((unused))
+static bool nvme_build_prp(uint64_t base, uint32_t bytes, uint64_t* prp1, uint64_t* prp2) {
+    return nvme_build_prp_on(base, bytes, prp1, prp2, nullptr);
+}
+
+//  one prp-list page per batch slot PER i/o queue, so NVME_IO_BATCH commands can
+//  be in flight at once on a queue each with its own list, AND two cores
+//  submitting on their own queues concurrently never share a list page. allocated
+//  lazily on first batched i/o. (satoru)
+static uint8_t* g_batch_prp[NVME_MAX_QUEUES][NVME_IO_BATCH] = {};
+static bool ensure_batch_prp(int qidx) {
+    if (qidx < 0 || qidx >= NVME_MAX_QUEUES) return false;
+    for (int i = 0; i < NVME_IO_BATCH; i++) {
+        if (!g_batch_prp[qidx][i]) {
+            g_batch_prp[qidx][i] = (uint8_t*)PMM::AllocBytes(4096);
+            if (!g_batch_prp[qidx][i]) return false;
+        }
+    }
     return true;
 }
 
@@ -421,46 +481,104 @@ uint32_t NVMe::MaxTransferBytes() {
     return mdts_pages * 4096u;
 }
 
-bool NVMe::Read(uint64_t lba, uint32_t count, void* buffer) {
-    if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
-    uint32_t lbasz = GetLBASize();
-    uint32_t per = MaxTransferBytes() / lbasz; if (!per) per = 1;
-    uint8_t* p = (uint8_t*)buffer;
-    while (count > 0) {
-        uint32_t n = count > per ? per : count;
-        uint64_t prp1 = 0, prp2 = 0;
-        if (!nvme_build_prp((uint64_t)(uintptr_t)p, n * lbasz, &prp1, &prp2)) return false;
-        NVMeSQE cmd = {}; NVMeCQE result = {};
-        cmd.opcode = NVME_IO_READ; cmd.nsid = 1;
-        cmd.prp1 = prp1; cmd.prp2 = prp2;
-        cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF); cmd.cdw11 = (uint32_t)(lba >> 32);
-        cmd.cdw12 = n - 1;
-        if (!SubmitIOCmd(0, &cmd, &result)) return false;
-        read_count++; bytes_read += (uint64_t)n * lbasz;
-        lba += n; count -= n; p += (uint64_t)n * lbasz;
+//  reap exactly `n` completions off qp (phase-bit polled, any order). returns
+//  false on any non-zero status code or a timeout. mirrors PollCompletion's
+//  phase/doorbell handling but loops n times for the batch. (satoru)
+bool NVMe::ReapCompletions(NVMeQueuePair* qp, int n) {
+    int reaped = 0;
+    while (reaped < n) {
+        bool got = false;
+        for (int timeout = 0; timeout < 200000 && !got; timeout++) {
+            NVMeCQE* cqe = &qp->cq[qp->cq_head];
+            // VOLATILE: the controller dma-writes the completion (see PollCompletion). (satoru)
+            uint16_t st = *(volatile uint16_t*)&cqe->status;
+            if ((st & 1) == qp->cq_phase) {
+                uint16_t sc = (st >> 1) & 0x7FF;
+                qp->cq_head++;
+                if (qp->cq_head >= qp->depth) { qp->cq_head = 0; qp->cq_phase ^= 1; }
+                uint32_t cq_db = NVME_REG_SQ0TDBL + (qp->qid * 2 + 1) * 4;
+                WriteReg(cq_db, qp->cq_head);
+                if (sc != 0) {
+                    SerialLogger::Log("[NVMe] batch cmd ERR q=");
+                    SerialLogger::LogDec((int)qp->qid);
+                    SerialLogger::Log(" sc=0x"); SerialLogger::LogHex(sc); SerialLogger::Log("\r\n");
+                    return false;
+                }
+                got = true;
+                reaped++;
+            } else {
+                for (volatile int j = 0; j < 100; j++) {}
+            }
+        }
+        if (!got) {
+            SerialLogger::Log("[NVMe] batch reap TIMEOUT q=");
+            SerialLogger::LogDec((int)qp->qid);
+            SerialLogger::Log(" reaped="); SerialLogger::LogDec(reaped);
+            SerialLogger::Log("/"); SerialLogger::LogDec(n); SerialLogger::Log("\r\n");
+            return false;
+        }
     }
     return true;
 }
 
-bool NVMe::Write(uint64_t lba, uint32_t count, const void* buffer) {
-    if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
+//  layer 1  -  post up to NVME_IO_BATCH ≤2 MB chunks of one transfer at once, ring
+//  the sq doorbell ONCE per batch, then reap all their completions. the buffer is
+//  contiguous + identity-mapped, so each chunk's prp list is built on its own
+//  scratch page. opcode picks read vs write. (satoru)
+bool NVMe::SubmitIOBatch(int qid, uint8_t opcode, uint64_t lba, uint32_t count, uint8_t* buffer) {
+    if (qid < 0 || qid >= io_queue_count) return false;
+    NVMeQueuePair* qp = &io_queues[qid];
+    if (!qp->sq || !qp->cq) return false;
     uint32_t lbasz = GetLBASize();
     uint32_t per = MaxTransferBytes() / lbasz; if (!per) per = 1;
-    const uint8_t* p = (const uint8_t*)buffer;
+    if (!ensure_batch_prp(qid)) return false;
+
+    uint8_t* p = buffer;
     while (count > 0) {
-        uint32_t n = count > per ? per : count;
-        uint64_t prp1 = 0, prp2 = 0;
-        if (!nvme_build_prp((uint64_t)(uintptr_t)p, n * lbasz, &prp1, &prp2)) return false;
-        NVMeSQE cmd = {}; NVMeCQE result = {};
-        cmd.opcode = NVME_IO_WRITE; cmd.nsid = 1;
-        cmd.prp1 = prp1; cmd.prp2 = prp2;
-        cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF); cmd.cdw11 = (uint32_t)(lba >> 32);
-        cmd.cdw12 = n - 1;
-        if (!SubmitIOCmd(0, &cmd, &result)) return false;
-        write_count++; bytes_written += (uint64_t)n * lbasz;
-        lba += n; count -= n; p += (uint64_t)n * lbasz;
+        // build a batch of up to NVME_IO_BATCH chunks. (satoru)
+        int in_batch = 0;
+        while (count > 0 && in_batch < NVME_IO_BATCH) {
+            uint32_t n = count > per ? per : count;
+            uint64_t prp1 = 0, prp2 = 0;
+            if (!nvme_build_prp_on((uint64_t)(uintptr_t)p, n * lbasz, &prp1, &prp2, g_batch_prp[qid][in_batch]))
+                return false;
+            uint16_t tail = qp->sq_tail;
+            NVMeSQE* s = &qp->sq[tail];
+            for (uint32_t z = 0; z < sizeof(NVMeSQE); z++) ((uint8_t*)s)[z] = 0;
+            s->opcode = opcode; s->nsid = 1; s->command_id = tail;
+            s->prp1 = prp1; s->prp2 = prp2;
+            s->cdw10 = (uint32_t)(lba & 0xFFFFFFFF); s->cdw11 = (uint32_t)(lba >> 32);
+            s->cdw12 = n - 1;
+            qp->sq_tail = (tail + 1) % qp->depth;
+            if (opcode == NVME_IO_READ) { read_count++;  bytes_read += (uint64_t)n * lbasz; }
+            else                        { write_count++; bytes_written += (uint64_t)n * lbasz; }
+            lba += n; count -= n; p += (uint64_t)n * lbasz;
+            in_batch++;
+        }
+        // ring the sq doorbell ONCE for the whole batch, then reap. (satoru)
+        uint32_t db_offset = NVME_REG_SQ0TDBL + qp->qid * 2 * 4;
+        WriteReg(db_offset, qp->sq_tail);
+        if (!ReapCompletions(qp, in_batch)) return false;
     }
     return true;
+}
+
+//  pick the i/o queue for the calling cpu (one queue per core). falls back to
+//  queue 0 if smp isn't up or the index is out of range. (satoru)
+static int nvme_pick_queue(int io_queue_count) {
+    if (io_queue_count <= 1) return 0;
+    uint32_t idx = SMP::CpuIndex();
+    return (int)(idx % (uint32_t)io_queue_count);
+}
+
+bool NVMe::Read(uint64_t lba, uint32_t count, void* buffer) {
+    if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
+    return SubmitIOBatch(nvme_pick_queue(io_queue_count), NVME_IO_READ, lba, count, (uint8_t*)buffer);
+}
+
+bool NVMe::Write(uint64_t lba, uint32_t count, const void* buffer) {
+    if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
+    return SubmitIOBatch(nvme_pick_queue(io_queue_count), NVME_IO_WRITE, lba, count, (uint8_t*)(uintptr_t)buffer);
 }
 
 bool NVMe::Flush() {
