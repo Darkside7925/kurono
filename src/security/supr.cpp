@@ -342,6 +342,73 @@ bool SUPR::Escalate(int session_id, const char* password) {
     return true;
 }
 
+bool SUPR::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
+    if (out_saved_user) *out_saved_user = -1;
+    if (!ValidateSession(session_id)) return false;
+    const char* actor = users[sessions[session_id].user_index].username;
+
+    bool authed = false;
+    if (BothAuthDisabled()) {
+        // no factor required  -  proceed, but warn + audit loudly. (satoru)
+        Log(ACT_RISK_WARNING, actor, "supr escalation with both auth factors disabled");
+        RuntimeLog::LogSecurity("RISK: supr escalation, no auth factor", reason);
+        SerialLogger::Log("SUPR: WARNING  -  supr escalation with BOTH auth factors disabled\r\n");
+        authed = true;
+    } else {
+        bool need_pw  = policy.passwd_enabled;
+        bool need_ksa = policy.kvault_enabled && KSA::IsAvailable();
+        if (policy.kvault_enabled && !KSA::IsAvailable()) {
+            if (!policy.passwd_enabled) {
+                Log(ACT_PERMISSION_DENIED, actor, "kvault-only policy but ksa unavailable");
+                return false;
+            }
+            need_pw = true;   // ksa gone, password carries it (satoru)
+        }
+        // the shell can't read a password inline, so collect the credential +
+        // approval through the interactive ksa modal  -  available whenever the
+        // hypervisor is, even if kvault is policy-off. want_cred when a password
+        // factor is required. (satoru)
+        if (!KSA::IsAvailable()) {
+            Log(ACT_PERMISSION_DENIED, actor, "no interactive auth path for supr");
+            return false;
+        }
+        KSARequest req;
+        req.title    = "Privilege Escalation (supr)";
+        req.detail   = reason ? reason : "An action requires elevated rights.";
+        req.username = "root";
+        req.want_cred = need_pw;
+        KSAVerdict v;
+        if (!KSA::Prompt(req, v) || !v.approved) {
+            Log(ACT_KSA_DENY, actor, "supr escalation denied at prompt");
+            return false;
+        }
+        bool ok = true;
+        if (need_pw) {
+            SUPRUser* root_u = FindUser("root");
+            ok = root_u && v.have_cred_hash &&
+                 smemeq(v.cred_hash, root_u->pwd_hash, SUPR_HASH_LEN);
+            if (!ok) Log(ACT_PERMISSION_DENIED, actor, "supr password factor failed");
+        }
+        (void)need_ksa;   // the ksa factor IS the approval, already required above (satoru)
+        authed = ok;
+    }
+    if (!authed) return false;
+
+    // elevate the session to root for the duration of the command. (satoru)
+    SUPRUser* root = FindUser("root");
+    if (!root) return false;
+    if (out_saved_user) *out_saved_user = sessions[session_id].user_index;
+    sessions[session_id].user_index = (int)(root - users);
+    Log(ACT_ESCALATE, actor, reason ? reason : "supr escalation");
+    return true;
+}
+
+void SUPR::SudoEnd(int session_id, int saved_user) {
+    if (!ValidateSession(session_id)) return;
+    if (saved_user >= 0 && saved_user < SUPR_MAX_USERS)
+        sessions[session_id].user_index = saved_user;
+}
+
 SUPRLevel SUPR::GetLevel(int session_id) {
     if (!ValidateSession(session_id)) return SUPR_GUEST;
     return users[sessions[session_id].user_index].level;

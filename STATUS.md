@@ -21,10 +21,11 @@ Big one this month: I moved the whole dev setup off Windows/WHPX onto **Linux + 
 - USB keyboard/mouse/tablet work over xHCI (DMA alignment was the fix); tablet does accurate absolute positioning.
 - Fixed the desktop-breaking bugs: top-taskbar swallowing all input, Sign Out/Lock freezing the machine, window-drag ghost trails, dead calculator clicks, broken Files right-click.
 - Started the UI pass: a small theme system (**KSS**), black/grey + modern **Settings** and **Control Center**, the start button now uses the real boot logo, and a bunch of off-center text got fixed.
+- **KSS grew into a real styling + animation layer, and the desktop got a scripting language (KJ).** KSS now has a `Sheet` layer on top of the theme tokens: named style rules (selectors like `button:hover`) with a property bag (colors + radius/pad/border/font/opacity/scale/translate), per-property **transitions** that ease automatically when a value changes, and named **keyframe** tracks the compositor samples per frame (fixed-size tables, no heap). Window **open/close now fade *and* scale** (a "pop/zoom" via scaled chrome), on top of the existing notification slide and control-center panel slide; KSS button widgets ease their hover/focus color. **KJ (Kurono JavaScript)** is a new freestanding JS-subset interpreter (`src/apps/kj.cpp`, modeled on KCL): lexer + recursive-descent parser → AST + tree-walking evaluator over a tagged value type (undefined/null/bool/number/string/array/object/function-closure). It does var/let/const, functions + **closures**, objects, arrays (`.push`/`.length`/`for..of`), arithmetic/strings, `if`/`while`/`for`, ternary, `typeof`, `Math.*`, `console.log`, and `// /* */` comments  -  no libc, no STL. **Host bindings let scripts drive the live UI**: `kss.set/get/transition/keyframes/play` mutate the KSS sheet, `ui.notify` posts a toast. Usable from the shell as `kj` / `node`. **Verified headless:** `kurono.kjtest` 11/11 ALL PASS (every language feature + two KSS-binding tests that mutate the sheet from a script and read the result back through C++); `kurono.kcltest` still 11/11; desktop boots faultless under `-smp 4` KVM; window open fade+scale captured via QMP screendump mid-animation.
 
 ## Current State
 
-The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, and runs in QEMU with a full graphical desktop, 19 hardware drivers, a complete TCP/IP stack, 76+ shell commands, emergency recovery boot paths, an installer stack, and a Type 1 hypervisor that can boot Alpine Linux on demand.
+The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, and runs in QEMU with a full graphical desktop, 19 hardware drivers, a complete TCP/IP stack, 76+ shell commands, emergency recovery boot paths, an installer stack, and a Type 1 hypervisor with an Alpine/Debian guest-boot path. **Honest caveat:** booting a Linux guest needs the host to expose *nested* VT-x to Kurono; under plain nested KVM (Kurono itself a guest) the guest VM-entry fails with a VMX entry error, so guest boot is confirmed only where nested VMX is available.
 
 ### Build Info
 - **Architecture:** x86_64 bare-metal (no libc)
@@ -166,7 +167,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - [x] **Linux boot protocol** -- v2.15 bzImage parser, kernel loader to 0x100000, boot_params + cmdline, initrd loading
 - [x] **Hypervisor lifecycle** -- CreateVM, LoadLinuxKernel, ConfigureGuestProtectedMode, RunVM, RunOneCycle, PauseVM, ResumeVM, DestroyVM
 - [x] **vm shell command** -- Full VM management from terminal (create, run, pause, resume, destroy, serial, regs, info, boot-test, boot-alpine)
-- [x] **Alpine Linux VM** -- Pre-compiled Alpine Linux (vmlinuz-virt + initramfs-virt) embedded via objcopy as weak symbols; launched on-demand with `vm boot-alpine`; boots through the Type 1 hypervisor's BootAlpineWithExtraction() using the Linux boot protocol
+- [~] **Alpine Linux VM** -- Pre-compiled Alpine Linux (vmlinuz-virt + initramfs-virt) embedded via objcopy as weak symbols; launched on-demand with `vm boot-alpine`; boots through the Type 1 hypervisor's BootAlpineWithExtraction() using the Linux boot protocol. **Requires nested VT-x exposed to Kurono**  -  under plain nested KVM the guest VM-entry fails (VMX entry error); the path is verified only where nested VMX is available
 - [x] **Guest serial bridge** -- Guest COM1 output captured by VirtualSerial and piped into Kurono shell
 - [x] **VMCALL hypercalls** -- NOP, info ("KURO"/"NO S"), shutdown, reboot
 - [x] **IOMMU** -- Intel VT-d / AMD-Vi, DMA remapping, root/context tables, DRHD parsing, PCI device passthrough (GPU passthrough support)
@@ -175,6 +176,9 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 
 ### Recovery and Installation
 - [x] **Emergency EFI boot** -- separate emergency EFI loader and GRUB entries using the same EFI boot flow
+- [x] **Kurono Setup boot entry** -- dedicated GRUB menu entry (`kurono.setup=1`) that runs the graphical installer / first-setup wizard; the main/default entry still boots straight to the desktop (`kurono.autologin=1`). `boot_setup` token parsed in `kurono_kernel.cpp`; optional `kurono.setup.screen=N` opens the wizard on a specific screen
+- [x] **Setup wizard screens** -- welcome, language, keyboard, network (wired status + Wi-Fi config), disk, partition, filesystem, administrator account, hostname + timezone + preferences, and optional Linux guests (Debian/Alpine/Python). Debian reuses the `kpkg install debian` + system-update reboot flow; provisioning (user, hostname, prefs, `/etc/network`, guest queue) is written via KVFS so the wizard works even with no ext4 target
+- [x] **Network/Wi-Fi setup** -- wired link probed live (carrier + DHCP address shown); Wi-Fi screen records SSID/password to `/etc/network` and is honest that there is no radio driver yet (e1000 / virtio-net wired only)
 - [x] **Emergency shell** -- minimal recovery environment with VGA text console and command access
 - [x] **Disk enumeration** -- NVMe-backed disk scan integrated into installer subsystem
 - [x] **GPT/MBR parsing** -- partition table inspection for installer workflows
@@ -350,9 +354,9 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 ## Known Limitations
 
 - Live desktop storage is KVFS-first and in-memory, but it now **persists across reboot through a real on-disk filesystem**: the user-data subtrees are mirrored to **KFS** (`src/fs/kfs.cpp`)  -  a from-scratch inode-based filesystem on the NVMe data disk  -  as actual files + dirs, and restored at boot (`PersistStore::SaveTree`/`LoadTree`, `src/fs/persist.cpp`). Installer deployment to ext4/FAT32 also exists. KFS is the on-disk persistence layer, not yet a fully mounted root (KVFS stays the runtime fs)
-- No real ELF binary loading from disk (Linux subsystem uses built-in program table)
+- ELF loading from disk is improving but limited: static built-in programs run from the program table, and **dynamic musl PIEs now load through ld-kurono** (the `dyntest` PIE resolves `libc.musl-x86_64.so.1` and exits `rc=0`; file-backed `mmap` of `.so` segments landed). Running an arbitrary large closure on-device (e.g. Firefox's libxul) still needs its full `.so` set staged and the <4 GB user-pointer ABI lifted
 - USB keyboard discovery is wired to xHCI, but full USB HID interrupt transfer polling is still incomplete
 - NVIDIA GPU detects hardware but bugs out during intensive tasks taking more then 50mb of vram
 - ext4 write support is partial (sparse block allocation and directory expansion are not fully implemented)
 - FAT32 support is currently scoped to installer/ESP deployment rather than a full long-filename general-purpose filesystem
-- Hypervisor requires Intel VT-x or AMD-V hardware support
+- Hypervisor requires Intel VT-x or AMD-V exposed to Kurono. Booting an Alpine/Debian **guest** additionally needs *nested* VMX: under plain nested KVM (Kurono itself a guest) the guest VM-entry fails (VMX entry error), so guest boot is confirmed only where nested VMX is available. (Same constraint behind KSA's nested-VM-vs-EPT-isolated-context fallback)

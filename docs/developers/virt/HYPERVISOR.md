@@ -10,11 +10,21 @@ The hypervisor is a hardware-accelerated virtual machine monitor built into the 
 
 The hypervisor requires:
 
-- Intel VMX support (checked with `CPUDetect::HasVMX()`)
-- VMXON permission (CR4.VMXE set)
+- Intel VMX (`CPUDetect::HasVMX()`) **or** AMD-V/SVM detection (both detection +
+  enable paths exist; EPT on Intel / NPT on AMD)
+- VMXON permission (CR4.VMXE set) for the VT-x path
 - Sufficient RAM for guest physical memory regions
 
-AMD SVM is a planned future addition. The current implementation is VT-x only.
+> **Honest caveat  -  nested VMX for guest boot.** The VMCS/VMCB + Linux-boot path
+> is implemented, but actually *booting* an Alpine/Debian guest needs the host to
+> expose **nested** VT-x to Kurono. In the common dev environment  -  Kurono itself
+> running as a guest under nested KVM/QEMU  -  that nested layer is not available,
+> and the guest **VM-entry fails with a VMX entry error** (`hypervisor.cpp` logs
+> "VM-entry failed ... host likely doesn't support nested virt"). Guest boot is
+> therefore confirmed only where nested VMX is present. `VMM::IsNested()` reports
+> the situation at boot. This is the same constraint behind KSA's
+> nested-VM-vs-EPT-isolated-context fallback (see
+> [../security/KSA.md](../security/KSA.md) §3).
 
 ## 3. Initialization
 

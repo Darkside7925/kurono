@@ -34,6 +34,27 @@ The live source tree under `src/` is approximately 137,000 lines of freestanding
 6. Read `developers/ui/WAYLAND_SERVER.md`  -  in-kernel Wayland compositor
 7. Read `developers/ui/WINDOW_MANAGER.md`  -  compositing window manager
 
+### If the reader is working on storage, persistence, or paths
+
+1. Read `developers/fs/KVFS.md`  -  the in-memory runtime filesystem
+2. Read `developers/fs/KFS.md`  -  the on-disk persistence filesystem (extents, no limits)
+3. Read `developers/system/LOGGING.md`  -  the canonical `/kurono` path layout + logging
+4. Read `developers/drivers/NVME.md`  -  the block device under KFS
+
+### If the reader is working on the Linux runtime
+
+1. Read `developers/linux/LINUX_SYSCALL.md`  -  the in-kernel Linux syscall runtime
+2. Read `developers/linux/LD_KURONO.md`  -  the in-kernel ELF64 dynamic linker
+3. Read `developers/ui/WAYLAND_SERVER.md`  -  the compositor real clients render through
+4. Read `developers/net/NETWORK.md`  -  TCP/IP + AF_UNIX sockets
+
+### If the reader is working on security or multi-core
+
+1. Read `developers/security/SUPR.md`  -  the privilege engine + roles
+2. Read `developers/security/KSA.md`  -  hypervisor-backed authorization prompts
+3. Read `developers/proc/SCHEDULER.md`  -  the cooperative + preemptive scheduler
+4. Read `developers/proc/SMP.md`  -  multi-core bring-up + the per-CPU rewrite
+
 ## Existing Specialized Guides
 
 The original deep technical guide remains useful and should stay in circulation.

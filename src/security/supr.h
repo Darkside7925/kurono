@@ -118,6 +118,15 @@ public:
     static bool RunEscalationGate(int session_id, const char* password,
                                   const char* reason);
 
+    // sudo-style escalation for `supr <cmd>`: a line-based shell command can't
+    // prompt for a password inline, so this runs the policy gate collecting the
+    // credential/approval through the interactive ksa modal (available whenever
+    // the hypervisor is, even if kvault is policy-off  -  it's just the secure
+    // prompt). on success it elevates the session to root and writes the
+    // pre-elevation user index to *out_saved; call SudoEnd to restore. (satoru)
+    static bool SudoBegin(int session_id, const char* reason, int* out_saved_user);
+    static void SudoEnd(int session_id, int saved_user);
+
     // policy mutation  -  these enforce the loophole rules and audit. each
     // returns true on success.  err (optional) receives a human reason on
     // failure. sovereign_override gates the dangerous "disable both" path.

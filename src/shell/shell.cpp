@@ -2287,9 +2287,50 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
         return p;
     }
 
-    p = sappend(out, p, maxo, "supr: unknown subcommand '");
-    p = sappend(out, p, maxo, sub);
-    p = sappend(out, p, maxo, "'\n");
+    // ── sudo-style reroute: `supr <cmd> [args]` runs <cmd> elevated. (satoru)
+    // shell builtins can't meaningfully run elevated (they mutate shell state),
+    // and whoami is informational; everything else goes through the auth gate.
+    if (seq(sub, "cd") || seq(sub, "clear") || seq(sub, "history") ||
+        seq(sub, "linux") || seq(sub, "cmd") || seq(sub, "exit")) {
+        p = sappend(out, p, maxo, "supr: '");
+        p = sappend(out, p, maxo, sub);
+        p = sappend(out, p, maxo, "' is a shell builtin  -  run it directly (elevation doesn't apply).\n");
+        return p;
+    }
+    if (seq(sub, "whoami")) {
+        // supr whoami reports the elevated identity. (satoru)
+        p = sappend(out, p, maxo, "root\n");
+        return p;
+    }
+    // a guest may not escalate. (satoru)
+    if (SUPR::GetLevel(sid) <= SUPR_GUEST) {
+        p = sappend(out, p, maxo, "supr: permission denied  -  your role may not escalate.\n");
+        return p;
+    }
+    // the target must exist before we bother prompting. (satoru)
+    ShellCommand* target = KuronoShell::FindCommand(sub);
+    if (!target || !target->handler) {
+        p = sappend(out, p, maxo, "supr: command not found: ");
+        p = sappend(out, p, maxo, sub);
+        p = sappend_char(out, p, maxo, '\n');
+        return p;
+    }
+    // authenticate (the interactive modal collects the credential/approval per the
+    // active policy), run the command as root, then drop back. (satoru)
+    char reason[80]; int rp = 0;
+    rp = sappend(reason, rp, (int)sizeof(reason), "run '");
+    rp = sappend(reason, rp, (int)sizeof(reason), sub);
+    rp = sappend(reason, rp, (int)sizeof(reason), "' as root");
+    int saved_user = -1;
+    if (!SUPR::SudoBegin(sid, reason, &saved_user)) {
+        p = sappend(out, p, maxo, "supr: authentication failed  -  not running '");
+        p = sappend(out, p, maxo, sub);
+        p = sappend(out, p, maxo, "'.\n");
+        return p;
+    }
+    int wrote = target->handler(sh, argc - 1, argv + 1, out + p, maxo - p);
+    SUPR::SudoEnd(sid, saved_user);
+    if (wrote > 0) p += wrote;
     return p;
 }
 

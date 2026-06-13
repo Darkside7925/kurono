@@ -236,6 +236,8 @@ CXX_SRCS = \
     $(SRC)/apps/media_player.cpp \
     $(SRC)/apps/denji_app.cpp \
     $(SRC)/apps/python_interp.cpp \
+    $(SRC)/apps/kj.cpp \
+    $(SRC)/apps/kj_test.cpp \
     $(SRC)/drivers/audio.cpp \
     $(SRC)/system/input_manager.cpp \
     $(SRC)/system/clipboard.cpp \
@@ -353,10 +355,13 @@ KURONO_GUI_RUN ?=
 # set KURONO_AUTOLOGIN=0 for a real lockscreen build. (satoru)
 KURONO_AUTOLOGIN ?= 1
 
+# bios menu indices. the "Kurono Setup" entry sits at index 3 (right after the
+# main Multiboot2/desktop entry at 2), so the cli/emergency entries shift down by
+# one vs. the old layout. (satoru)
 ifeq ($(KURONO_BOOT_PROFILE),cli)
-KURONO_BIOS_DEFAULT = 4
+KURONO_BIOS_DEFAULT = 5
 else ifeq ($(KURONO_BOOT_PROFILE),emergency)
-KURONO_BIOS_DEFAULT = 3
+KURONO_BIOS_DEFAULT = 4
 else
 KURONO_BIOS_DEFAULT = 2
 endif
@@ -757,6 +762,14 @@ iso: all efi
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",)' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded OK. Booting..."'                     >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo ''                                                           >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo 'menuentry "Kurono Setup" {'                                 >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    echo "Loading Kurono Setup (installer / first-setup)..."' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf kurono.setup=1 kurono.autologin=1' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    echo "Setup kernel loaded OK. Booting..."'              >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo ''                                                           >> $(ISO_DIR)/boot/grub/grub.cfg

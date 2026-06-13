@@ -126,7 +126,8 @@ The project is broad, but the actual top level shape is easy to hold in the head
 
 ### Security (`security/`)
 
-- `security/SUPR.md`  -  privilege system
+- `security/SUPR.md`  -  privilege system (Guest/User/Admin/Root/Sovereign roles)
+- `security/KSA.md`  -  Kurono Secure Authorization (hypervisor-backed privilege prompts)
 
 ### Packages (`packages/`)
 
@@ -138,9 +139,10 @@ The project is broad, but the actual top level shape is easy to hold in the head
 
 ### Linux Integration (`linux/`)
 
+- `linux/LINUX_SYSCALL.md`  -  in-kernel Linux syscall runtime (process/memory/fd, the GUI-blocking set)
+- `linux/LD_KURONO.md`  -  in-kernel ELF64 dynamic linker (runs real musl PIEs)
 - `linux/KLS.md`  -  Kurono Linux Shell (Trixie personality)
 - `linux/DUAL_BOOT.md`  -  integrated Debian Linux boot
-- `linux/LINUX_SYSCALL.md`  -  Linux syscall compatibility layer
 - `linux/LINUX_NETBRIDGE.md`  -  guest network bridge
 
 ### Virtualization (`virt/`)

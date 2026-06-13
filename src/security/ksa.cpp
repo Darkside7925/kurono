@@ -36,6 +36,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/mouse.h"
 #include "../drivers/timer.h"
 #include "../kernel/time.h"
 #include "../virt/hypervisor.h"
@@ -53,7 +54,7 @@ bool KSA::initialized  = false;
 //   [KSA_VERDICT_OFF ..]            KSAVerdict (the only thing the channel reads)
 //   [KSA_SCRATCH_OFF ..]            credential scratch (wiped on teardown)
 static const int      KSA_W          = 460;
-static const int      KSA_H          = 240;
+static const int      KSA_H          = 270;
 static const uint64_t KSA_REGION_SZ  = 0x200000ULL;            // 2mb (satoru)
 static const uint64_t KSA_FB_BYTES   = (uint64_t)KSA_W * KSA_H * 4;
 static const uint64_t KSA_VERDICT_OFF= 0x1F0000ULL;            // near top of region
@@ -219,48 +220,109 @@ static void ksa_fb_rect(uint8_t* fb, int x, int y, int w, int h, uint32_t c) {
         for (int i = 0; i < w; i++) ksa_fb_px(fb, x + i, y + j, c);
 }
 
-// blit the isolated framebuffer onto the visible screen, centered. this is the
-// hypervisor present path  -  the main-os compositor is not involved and gets no
-// pointer to the isolated region; ksa copies pixel-by-pixel to the screen.
-static void ksa_present(uint8_t* fb) {
-    int sw = Graphics::GetWidth();
-    int sh = Graphics::GetHeight();
-    int ox = (sw - KSA_W) / 2;
-    int oy = (sh - KSA_H) / 2;
-    if (ox < 0) ox = 0;
-    if (oy < 0) oy = 0;
-    // dim the backdrop so the prompt reads as a modal security surface. (satoru)
-    Graphics::FillRectAlpha(0, 0, sw, sh, 150, 0x000000);
-    for (int y = 0; y < KSA_H; y++) {
-        for (int x = 0; x < KSA_W; x++) {
-            uint32_t px = ((uint32_t*)fb)[y * KSA_W + x];
-            Graphics::DrawPixel(ox + x, oy + y, px);
-        }
-    }
-    Graphics::SwapBuffers();
-    Graphics::PresentVirtioIfActive();
-}
-
-static void ksa_render(uint8_t* fb, const KSARequest& req, const char* typed,
-                       int typed_len, bool show_risk) {
-    // chrome: dark panel, accent header, title + detail + masked credential.
-    ksa_fb_rect(fb, 0, 0, KSA_W, KSA_H, 0xFF1C1F26);       // panel bg
-    ksa_fb_rect(fb, 0, 0, KSA_W, 40, 0xFF2D6CDF);          // header accent
-    ksa_fb_rect(fb, 0, KSA_H - 2, KSA_W, 2, 0xFF2D6CDF);   // footer line
-
-    // present the isolated buffer first, then draw text via Graphics::DrawString
-    // directly onto the composited screen rect (text rendering needs the font
-    // engine which targets the main framebuffer). the security-relevant pixels
-    // (panel + verdict) originate in the isolated buffer. (satoru)
-    ksa_present(fb);
-
+// where the modal sits on the real screen. computed once per frame so the
+// renderer and the mouse hit-test agree on the same geometry. all members are
+// screen coordinates. (satoru)
+struct KSALayout {
+    int ox, oy;                  // top-left of the panel on screen
+    int approve_x, approve_y, approve_w, approve_h;
+    int deny_x, deny_y, deny_w, deny_h;
+};
+static KSALayout ksa_layout() {
     int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
     int ox = (sw - KSA_W) / 2, oy = (sh - KSA_H) / 2;
     if (ox < 0) ox = 0;
     if (oy < 0) oy = 0;
+    KSALayout L;
+    L.ox = ox; L.oy = oy;
+    const int bw = 120, bh = 36;
+    const int by = oy + KSA_H - bh - 16;
+    // deny on the left, approve on the right, mirroring the [Esc]/[Enter] hints.
+    L.deny_w = bw;    L.deny_h = bh;
+    L.deny_x = ox + 16;          L.deny_y = by;
+    L.approve_w = bw; L.approve_h = bh;
+    L.approve_x = ox + KSA_W - bw - 16; L.approve_y = by;
+    return L;
+}
+static inline bool ksa_hit(int px, int py, int x, int y, int w, int h) {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+// blit the isolated framebuffer onto the visible screen, centered. this is the
+// hypervisor present path  -  the main-os compositor is not involved and gets no
+// pointer to the isolated region; ksa copies pixel-by-pixel into the back
+// buffer. the caller composes the full frame (panel + text + buttons) THEN
+// presents once, so the text  -  which the font engine draws into the same back
+// buffer  -  actually reaches the screen. (satoru)
+static void ksa_blit_panel(uint8_t* fb, const KSALayout& L) {
+    int sw = Graphics::GetWidth();
+    int sh = Graphics::GetHeight();
+    // dim the backdrop so the prompt reads as a modal security surface. (satoru)
+    Graphics::FillRectAlpha(0, 0, sw, sh, 170, 0x000000);
+    for (int y = 0; y < KSA_H; y++) {
+        for (int x = 0; x < KSA_W; x++) {
+            uint32_t px = ((uint32_t*)fb)[y * KSA_W + x];
+            Graphics::DrawPixel(L.ox + x, L.oy + y, px);
+        }
+    }
+}
+// push the composed back buffer to the real framebuffer + the host gpu.
+// SwapBuffers only copies the dirty-region list, and the dim + panel blit go
+// through FillRectAlpha/DrawPixel which do NOT mark dirty (only the FillRect
+// buttons did  -  which is why an earlier build showed buttons over a live
+// desktop with no panel). mark the whole screen so the full composed frame is
+// flushed to the front buffer and transferred to the virtio gpu. (satoru)
+static void ksa_present() {
+    Graphics::MarkDirty(0, 0, Graphics::GetWidth(), Graphics::GetHeight());
+    Graphics::SwapBuffers();
+    Graphics::PresentVirtioIfActive();
+}
+
+// draw one button into the back buffer (over the already-blitted panel). hot
+// = pointer hovering, so the user sees which target a click will land on. the
+// label is drawn by the font engine into the same back buffer. (satoru)
+static void ksa_button(int x, int y, int w, int h, const char* label,
+                       uint32_t fill, uint32_t hot_fill, bool hot) {
+    Graphics::FillRect(x, y, w, h, hot ? hot_fill : fill);
+    Graphics::FillRect(x, y, w, 1, 0xFF404858);   // top hairline (satoru)
+    int approx = 0; while (label[approx]) approx++;
+    int tw = approx * 8;
+    Graphics::DrawString(x + (w - tw) / 2, y + (h - 16) / 2, label, 0xFFFFFFFF, fill);
+}
+
+static void ksa_render(uint8_t* fb, const KSARequest& req, const char* typed,
+                       int typed_len, bool show_risk, int mouse_x, int mouse_y) {
+    // the main-os compositor leaves a clip rect set from its last frame; our
+    // per-pixel panel/dim blit goes through DrawPixel which honours the clip and
+    // would otherwise be silently dropped outside it (that left the buttons
+    // visible  -  FillRect clamps instead of dropping  -  but the panel/backdrop
+    // missing). reset to full-screen so ksa owns the whole surface. (satoru)
+    Graphics::ClearClipRect();
+
+    // chrome: dark panel, accent header, title + detail + masked credential.
+    // composed entirely into the isolated framebuffer first (the security-
+    // relevant pixels originate in the unmapped region). (satoru)
+    ksa_fb_rect(fb, 0, 0, KSA_W, KSA_H, 0xFF1C1F26);       // panel bg
+    ksa_fb_rect(fb, 0, 0, KSA_W, 40, 0xFF2D6CDF);          // header accent
+    ksa_fb_rect(fb, 0, KSA_H - 2, KSA_W, 2, 0xFF2D6CDF);   // footer line
+    if (req.want_cred) {
+        // credential input box (drawn in the isolated buffer; text overlaid). (satoru)
+        ksa_fb_rect(fb, 110, 124, KSA_W - 126, 26, 0xFF0E1014);
+        ksa_fb_rect(fb, 110, 124, KSA_W - 126, 1, 0xFF3A4250);
+    }
+
+    KSALayout L = ksa_layout();
+    int ox = L.ox, oy = L.oy;
+
+    // blit the isolated panel into the back buffer, then draw text + buttons
+    // over it, THEN present once. text rendering needs the font engine, which
+    // targets the main back buffer; doing it before the present is what makes
+    // the labels visible (the old code presented first and lost the text). (satoru)
+    ksa_blit_panel(fb, L);
+
     (void)typed;   // credential is echoed masked via typed_len, not the chars (satoru)
 
-    Graphics::DrawString(ox + 12, oy + 12, "KSA  -  Kurono Secure Authorization",
+    Graphics::DrawString(ox + 12, oy + 12, "KSA - Kurono Secure Authorization",
                          0xFFFFFFFF, 0xFF2D6CDF);
     Graphics::DrawString(ox + 14, oy + 54,
                          req.title ? req.title : "Privilege Escalation",
@@ -277,20 +339,43 @@ static void ksa_render(uint8_t* fb, const KSARequest& req, const char* typed,
     Graphics::DrawString(ox + 14, oy + 102, acct, 0xFFB8C0D0, 0xFF1C1F26);
 
     if (req.want_cred) {
-        Graphics::DrawString(ox + 14, oy + 132, "Credential:", 0xFFFFFFFF, 0xFF1C1F26);
-        // masked credential echo. (satoru)
+        Graphics::DrawString(ox + 14, oy + 128, "Credential:", 0xFFFFFFFF, 0xFF1C1F26);
+        // masked credential echo (never the real characters). (satoru)
         char mask[64];
         int m = 0; for (; m < typed_len && m < 48; m++) mask[m] = '*';
         mask[m] = 0;
-        Graphics::DrawString(ox + 120, oy + 132, mask, 0xFF7CFF9B, 0xFF1C1F26);
+        Graphics::DrawString(ox + 118, oy + 128, mask, 0xFF7CFF9B, 0xFF0E1014);
     }
 
     if (show_risk) {
-        Graphics::DrawString(ox + 14, oy + 160,
+        Graphics::DrawString(ox + 14, oy + 162,
             "WARNING: both auth factors are disabled.", 0xFFFF6B6B, 0xFF1C1F26);
     }
-    Graphics::DrawString(ox + 14, oy + KSA_H - 30,
-        "[Enter]=Approve   [Esc]=Deny", 0xFFB8C0D0, 0xFF1C1F26);
+
+    // real clickable buttons + the keyboard-shortcut hints. (satoru)
+    bool hot_deny    = ksa_hit(mouse_x, mouse_y, L.deny_x, L.deny_y, L.deny_w, L.deny_h);
+    bool hot_approve = ksa_hit(mouse_x, mouse_y, L.approve_x, L.approve_y, L.approve_w, L.approve_h);
+    ksa_button(L.deny_x, L.deny_y, L.deny_w, L.deny_h, "Deny",
+               0xFF3A2226, 0xFF5A2A30, hot_deny);
+    ksa_button(L.approve_x, L.approve_y, L.approve_w, L.approve_h, "Approve",
+               0xFF1E3A28, 0xFF276B43, hot_approve);
+    Graphics::DrawString(ox + 14, oy + KSA_H - 56,
+        "[Enter] Approve    [Esc] Deny", 0xFF8892A4, 0xFF1C1F26);
+
+    // hand the composed frame to the screen + host gpu in one present. (satoru)
+    ksa_present();
+}
+
+// drain any keystrokes / mouse events the main os queued BEFORE the secure
+// prompt took over, so a key already sitting in the ps/2 ring can't be consumed
+// as a credential char or counted as an Enter/Esc. nothing the main os queued
+// can drive the verdict. (satoru)
+static void ksa_flush_input() {
+    Keyboard::Poll();
+    while (Keyboard::HasChar()) Keyboard::GetChar();
+    Mouse::Poll();
+    while (Mouse::HasEvent()) Mouse::GetEvent();
+    (void)Mouse::LeftClicked();   // clear a pending click edge (satoru)
 }
 
 bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
@@ -304,10 +389,36 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
     RuntimeLog::LogSecurity("ksa prompt shown", req.detail ? req.detail : req.title);
     SUPR::Log(ACT_KSA_PROMPT, req.username ? req.username : "root",
               req.detail ? req.detail : "ksa prompt");
+    SerialLogger::Log("KSA: prompt up  -  secure desktop owns the screen + input\r\n");
+
+    // ── DISPLAY OWNERSHIP / SECURE DESKTOP ─────────────────────────────────
+    // the cooperative scheduler is the lever here. this loop never calls
+    // Scheduler::Yield/SleepMs, so while it runs the gui compositor process and
+    // the input process are BOTH starved  -  the main os cannot draw over the
+    // prompt, cannot read the framebuffer that ksa is presenting to, and cannot
+    // pull the keystrokes/clicks (this loop is the only code polling the 8042).
+    // ksa is therefore the sole owner of the screen and of input for the prompt's
+    // lifetime. we snapshot the back buffer up front and restore it on the way
+    // out so the desktop the main os left behind is put back exactly, then a
+    // MarkUIDirty() lets the resumed compositor repaint normally. (satoru)
+    int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
+    int pitch = Graphics::GetPitch();
+    uint8_t* back = Graphics::GetBackBuffer();
+    uint8_t* saved = nullptr;
+    uint64_t saved_bytes = (uint64_t)sh * (uint64_t)pitch;
+    if (back && saved_bytes) {
+        saved = (uint8_t*)PMM::AllocBytes(saved_bytes);
+        if (saved) memcpy(saved, back, saved_bytes);
+    }
+
+    // drop any pre-queued main-os input before we start reading for real. (satoru)
+    ksa_flush_input();
 
     bool show_risk = SUPR::BothAuthDisabled();
     char typed[64]; int typed_len = 0; typed[0] = 0;
     bool decided = false, approved = false;
+    int mx = sw / 2, my = sh / 2;
+    Mouse::GetPosition(mx, my);
 
     // arbiter render/input loop. open the ephemeral window to render into the
     // isolated fb, then re-isolate between frames so the region spends most of
@@ -316,15 +427,17 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
     Timer::ElapsedSinceLast();   // reset baseline
     {
         uint8_t* fb = ksa_open_window();
-        if (fb) ksa_render(fb, req, typed, typed_len, show_risk);
+        if (fb) ksa_render(fb, req, typed, typed_len, show_risk, mx, my);
         ksa_close_window();
     }
 
     while (!decided && waited_ms < 60000) {
         uint32_t e = Timer::ElapsedSinceLast();
         if (e > 0) { TimeManager::AdvanceByMs(e); waited_ms += e; }
-        Keyboard::Poll();
         bool dirty = false;
+
+        // keyboard: type the credential, Enter approves, Esc denies. (satoru)
+        Keyboard::Poll();
         while (Keyboard::HasChar()) {
             char c = Keyboard::GetChar();
             if (c == '\r' || c == '\n') { decided = true; approved = true; break; }
@@ -332,11 +445,39 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
             else if (c == 8 || c == 127) { if (typed_len > 0) { typed[--typed_len] = 0; dirty = true; } }
             else if (c >= 32 && c < 127 && typed_len < 62) { typed[typed_len++] = c; typed[typed_len] = 0; dirty = true; }
         }
-        if (dirty) {
+
+        // mouse: drain motion (for button hover) and detect a click on the
+        // Approve/Deny rects. ksa polls the mouse itself  -  the paused input
+        // process is not feeding it. (satoru)
+        if (!decided) {
+            Mouse::Poll();
+            while (Mouse::HasEvent()) {
+                Mouse::Event m = Mouse::GetEvent();
+                if (m.x != mx || m.y != my) { mx = m.x; my = m.y; dirty = true; }
+            }
+            int cur_mx, cur_my; Mouse::GetPosition(cur_mx, cur_my);
+            if (cur_mx != mx || cur_my != my) { mx = cur_mx; my = cur_my; dirty = true; }
+            if (Mouse::LeftClicked()) {
+                KSALayout L = ksa_layout();
+                if (ksa_hit(mx, my, L.approve_x, L.approve_y, L.approve_w, L.approve_h)) {
+                    decided = true; approved = true;
+                } else if (ksa_hit(mx, my, L.deny_x, L.deny_y, L.deny_w, L.deny_h)) {
+                    decided = true; approved = false;
+                }
+            }
+        }
+
+        if (dirty && !decided) {
             uint8_t* fb = ksa_open_window();
-            if (fb) ksa_render(fb, req, typed, typed_len, show_risk);
+            if (fb) ksa_render(fb, req, typed, typed_len, show_risk, mx, my);
             ksa_close_window();
         }
+    }
+
+    if (!decided) {
+        // timed out with no answer  -  fail closed (treated as a deny). (satoru)
+        approved = false;
+        SerialLogger::Log("KSA: prompt timed out  -  failing closed (deny)\r\n");
     }
 
     // write the verdict INTO the isolated region (the in-vm result), then read
@@ -366,10 +507,20 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
         ksa_close_window();
     }
 
-    // wipe local typed buffer. (satoru)
+    // wipe local typed buffer  -  the cleartext credential must not linger in
+    // main-os memory. (satoru)
     for (int i = 0; i < 64; i++) typed[i] = 0;
 
-    // restore the desktop under the modal. (satoru)
+    // restore the desktop pixels the main os had before the modal, then release
+    // the secure desktop: a final present puts the saved frame on screen and
+    // MarkUIDirty() tells the resumed compositor to repaint. (satoru)
+    if (saved && back && saved_bytes) {
+        memcpy(back, saved, saved_bytes);
+        Graphics::MarkDirty(0, 0, sw, sh);   // full flush so the panel is wiped (satoru)
+        Graphics::SwapBuffers();
+        Graphics::PresentVirtioIfActive();
+    }
+    if (saved) PMM::FreeBytes(saved, saved_bytes);
     Graphics::MarkUIDirty();
 
     bool got = ReadVerdictForChannel(out);
@@ -463,6 +614,36 @@ bool KSA::SelfTest() {
                            : "KSA-SELFTEST: OVERALL FAIL\r\n");
     RuntimeLog::LogSecurity("ksa selftest", pass ? "pass" : "fail");
     return pass;
+}
+
+// ── interactive prompt demo (kurono.ksa.prompt) ─────────────────────────
+// drive the REAL on-screen modal so a headless screendump can prove it draws,
+// and synthetic input (Enter/Esc or an Approve/Deny click) can prove the
+// verdict flows. this is the render-path counterpart to SelfTest() (which only
+// checks the isolation invariants and never paints the prompt). (satoru)
+bool KSA::PromptDemo(bool want_cred) {
+    SerialLogger::Log("KSA-PROMPT-DEMO: begin (want_cred=");
+    SerialLogger::Log(want_cred ? "yes)\r\n" : "no)\r\n");
+    if (!available) {
+        SerialLogger::Log("KSA-PROMPT-DEMO: ksa unavailable on this host  -  cannot draw the prompt\r\n");
+        return false;
+    }
+
+    KSARequest req;
+    req.title     = "Privilege Escalation";
+    req.detail    = "Allow Settings to change the system auth policy?";
+    req.username  = "root";
+    req.want_cred = want_cred;
+
+    KSAVerdict v;
+    bool ran = Prompt(req, v);
+    SerialLogger::Log("KSA-PROMPT-DEMO: prompt ");
+    SerialLogger::Log(ran ? "ran" : "did NOT run");
+    SerialLogger::Log(", verdict=");
+    SerialLogger::Log(v.approved ? "APPROVE" : "DENY");
+    SerialLogger::Log(v.have_cred_hash ? " (cred-hash present)\r\n" : "\r\n");
+    RuntimeLog::LogSecurity("ksa prompt demo", v.approved ? "approved" : "denied");
+    return v.approved;
 }
 
 // end (satoru)

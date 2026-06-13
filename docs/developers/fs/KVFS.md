@@ -72,10 +72,10 @@ To keep the volume small and the restore fast, only file content up to `KFS_MAX_
 
 | Limitation | Note |
 | --- | --- |
-| No permissions | All files accessible to all code |
-| No hard links | Path is the only way to identify a file |
-| No large files | Buffer backed; RAM limited |
-| No persistence | Volatile; reset on reboot |
+| Permissions advisory | POSIX-style mode bits are stored, but the single-address-space kernel does not yet enforce them across all callers |
+| No hard links | Path is the only way to identify a file (symlinks *are* supported  -  see §3) |
+| RAM-resident live tree | The live tree lives in RAM, so total live size is bounded by the kernel heap |
+| Selective persistence | The runtime tree is rebuilt fresh each boot, but the user-data subtrees (`/home`, `/etc`, `/root`) persist across reboot through KFS (§4); large re-seeded `/usr` binaries and >`KFS_MAX_FILE` media are regenerated at boot rather than stored |
 
 ## 6. Related files
 

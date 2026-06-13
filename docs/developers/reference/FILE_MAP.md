@@ -191,22 +191,40 @@ It is meant to answer one practical question quickly: *where does a given respon
 | --- | --- |
 | `network.cpp` | network interface and socket management |
 | `network.h` | network declarations |
-| `tcpip.cpp` | protocol stack implementation |
+| `tcpip.cpp` | protocol stack implementation (IPv4/ICMP/UDP/TCP) |
 | `tcpip.h` | protocol declarations |
+| `ipv6.cpp` | IPv6 stack |
+| `ipv6.h` | IPv6 declarations |
+| `netfilter.cpp` | 5-hook packet-filter pipeline |
+| `netfilter.h` | netfilter declarations |
+| `tuntap.cpp` | Tun/Tap subsystem |
+| `tuntap.h` | Tun/Tap declarations |
+| `unix_socket.cpp` | AF_UNIX sockets + `SCM_RIGHTS` fd-passing |
+| `unix_socket.h` | AF_UNIX declarations |
 
 ## 11. `src/proc`
 
 | File | Role |
 | --- | --- |
-| `scheduler.cpp` | scheduler implementation |
+| `scheduler.cpp` | scheduler implementation (cross-core lock, per-CPU pick) |
 | `scheduler.h` | scheduler declarations |
+| `smp.cpp` | multi-core: LAPIC, MADT parse, per-CPU blocks, AP bring-up |
+| `smp.h` | SMP declarations |
+| `kernel_processes.cpp` | built-in kernel processes (GUI, WM, daemons) |
+| `kernel_processes.h` | kernel-process declarations |
+| `cgroup.cpp` | cgroups v2 hierarchy |
+| `cgroup.h` | cgroup declarations |
+| `spinlock.h` / `kernel_locks.h` | `lock cmpxchg` spinlocks |
+| `switch_to.asm` | context-switch assembly |
 
 ## 12. `src/security`
 
 | File | Role |
 | --- | --- |
-| `supr.cpp` | privilege system |
+| `supr.cpp` | privilege system + auth policy + escalation gate |
 | `supr.h` | privilege declarations |
+| `ksa.cpp` | Kurono Secure Authorization (hypervisor-backed prompts) |
+| `ksa.h` | KSA declarations |
 
 ## 13. `src/packages`
 
@@ -246,6 +264,8 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `dual_boot.h` | dual boot declarations |
 | `ext4.cpp` | ext4 support |
 | `ext4.h` | ext4 declarations |
+| `ld_kurono.cpp` | in-kernel ELF64 dynamic linker (PIE/`PT_INTERP`, `DT_NEEDED`, relocations, TLS, dlopen) |
+| `ld_kurono.h` | ld-kurono declarations + capability list |
 | `kls.cpp` | Linux style shell helpers |
 | `kls.h` | KLS declarations |
 | `linux_devices.cpp` | Linux device surface |

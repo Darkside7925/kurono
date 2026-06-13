@@ -37,11 +37,15 @@ authorization decision *outside* that compromised domain:
    this first *demotes* the covering huge page into 4 KB leaves, then zeroes the
    target PTEs. After this, `KernelVMM::QueryMapping()` returns 0 for every
    frame  -  ring-0 code in the main OS that dereferences the region faults.
-4. **Render + input.** KSA (the arbiter) is the only code that briefly
-   re-establishes an ephemeral mapping to draw the prompt and read the verdict
-   (`ksa_open_window` / `ksa_close_window`), re-isolating between frames. The
-   main-OS compositor never receives a pointer into the region; only the final
-   frame is blitted to the screen.
+4. **Render + input (the interactive prompt).** KSA (the arbiter) is the only
+   code that briefly re-establishes an ephemeral mapping to draw the prompt and
+   read the verdict (`ksa_open_window` / `ksa_close_window`), re-isolating
+   between frames. The main-OS compositor never receives a pointer into the
+   region; only the composited frame is blitted to the screen. The prompt is a
+   **real on-screen modal** (see §9): it dims the desktop, shows the action +
+   requesting identity, a credential field when the policy needs one, and
+   clickable **Approve / Deny** buttons, and it blocks the escalation on live
+   keyboard + mouse input.
 5. **Result channel.** The verdict crosses back via **VMCALL `0x4B`** (`'K'`),
    sub-function `KSA_SUB_GET_VERDICT`. The handler in `src/virt/vmexit.cpp`
    returns a *copy* of the latched verdict (completed / approved / has-hash)  - 
@@ -155,12 +159,78 @@ disable-passwd refused while KSA off; disable-kvault refused without
 force/ack; disable-kvault refused while passwd off; sovereign override; both-off
 risk warning; `auth=both` gated on KSA availability; password verification.
 
-## 8. Related files
+## 9. The interactive on-screen prompt
 
-- `src/security/ksa.{cpp,h}`  -  KSA module (spawn / isolate / prompt / channel / self-test)
+When `RunEscalationGate` requires the KSA factor (`policy auth=kvault` or
+`both`), `KSA::Prompt()` renders a **real modal confirmation panel on the
+actual framebuffer** and blocks the escalation until the user answers. It is
+not the old auto-answered self-test  -  it takes live keyboard and mouse input.
+
+**What it shows.** A dimmed-desktop backdrop with a centred panel: the
+"KSA  -  Kurono Secure Authorization" header, the action being authorized
+(`req.title` / `req.detail`), the requesting identity (`Account: <user>`), a
+masked credential field when the policy needs KSA to collect the credential
+(`req.want_cred`), and clickable **Deny** (left) / **Approve** (right) buttons.
+
+**Input.**
+- keyboard: printable keys type into the credential field (echoed masked, the
+  real characters never leave the isolated region); **Enter = approve**,
+  **Esc = deny**; backspace edits.
+- mouse: the loop polls the pointer itself and hit-tests a left click against
+  the Approve / Deny button rects (with hover highlight). 
+- on a ~60 s timeout with no answer the prompt **fails closed** (deny).
+
+**Display ownership / secure desktop.** The guarantee is enforced by the
+cooperative scheduler. `KSA::Prompt()` runs on the stack of whichever process
+triggered the escalation (e.g. the GUI process) and its render/input loop
+**never yields** (`Scheduler::Yield`/`SleepMs`). While it runs, the GUI
+compositor process and the input process are both starved, so:
+
+- the main OS cannot draw over the prompt (it never gets a frame);
+- the main OS cannot read the framebuffer KSA is presenting to or the
+  credential (it isn't running);
+- this loop is the **only** code polling the 8042, so the main OS cannot forge
+  a keystroke or click into the verdict.
+
+On entry KSA snapshots the back buffer (`PMM::AllocBytes` + `memcpy`) and
+**flushes any pre-queued keyboard/mouse input** so a keystroke the main OS left
+in the ring can't be consumed as a credential char or counted as Enter/Esc.
+Each frame is composed into the isolated framebuffer, blitted into the back
+buffer, overlaid with text + buttons, then presented in one `SwapBuffers()`  - 
+with a full-screen `MarkDirty` so the dim + panel (drawn via
+`FillRectAlpha`/`DrawPixel`, which don't self-mark dirty) actually reach the
+front buffer and the virtio GPU. On exit KSA restores the saved desktop pixels,
+wipes the local credential buffer, and calls `MarkUIDirty()` so the resumed
+compositor repaints. The verdict still crosses back **only** via the read-only
+VMCALL channel (§2.5)  -  the credential is hashed inside the isolated region and
+only the salted hash + approve/deny flag leave it.
+
+**Verification (render path + verdict flow).** Boot with
+`kurono.ksa.prompt` (credential variant) or `kurono.ksa.prompt=nocred`
+(approve/deny only). Once the desktop is up the GUI process fires
+`KSA::PromptDemo()` once, so the modal is drawn on the real screen (capture it
+headless with `qmp_shot.py`) and synthetic input drives the verdict:
+
+```
+[gui] firing interactive ksa prompt demo
+KSA-PROMPT-DEMO: begin (want_cred=yes)
+KSA: prompt up  -  secure desktop owns the screen + input
+KSA-PROMPT-DEMO: prompt ran, verdict=APPROVE (cred-hash present)
+```
+
+This was verified headless under QEMU/KVM: the panel renders (screendump shows
+header, title, detail, account, masked credential field, Deny/Approve buttons),
+a QMP `send-key ret` Enter flows through as `verdict=APPROVE`, a correctly typed
+credential yields `cred-hash present`, and the desktop is restored cleanly after
+the prompt closes.
+
+## 10. Related files
+
+- `src/security/ksa.{cpp,h}`  -  KSA module (spawn / isolate / prompt / channel / self-test / `PromptDemo`)
 - `src/security/supr.{cpp,h}`  -  auth policy, escalation gate, Sovereign role, audit actions
 - `src/kernel/vmm.{cpp,h}`  -  `IsolateFrames` / `RevealFrames` isolation primitives
 - `src/virt/vmexit.cpp`  -  VMCALL `0x4B` read-only result channel
 - `src/virt/ept.cpp`, `hypervisor.cpp`  -  EPT root + hardware-virt detection
 - `src/shell/shell.cpp`  -  the `supr` command
-- `src/kernel/kurono_kernel.cpp`  -  `kurono.ksa.test` boot self-test gate
+- `src/kernel/kurono_kernel.cpp`  -  `kurono.ksa.test` self-test + `kurono.ksa.prompt` interactive demo gates
+- `src/proc/kernel_processes.cpp`  -  GUI process fires the armed `KSA::PromptDemo()` once the desktop is up

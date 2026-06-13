@@ -75,6 +75,15 @@ public:
     // every check to serial. returns true if all invariants held. (satoru)
     static bool SelfTest();
 
+    // interactive render-path verification  -  used by the boot gate
+    // kurono.ksa.prompt. runs the REAL KSA::Prompt() with a sample request so
+    // the modal is drawn on the actual framebuffer; a headless screendump can
+    // then capture it, and synthetic input (Enter/Esc or an Approve/Deny click)
+    // drives the verdict. logs the verdict to serial. unlike SelfTest() this
+    // exercises the on-screen renderer + input loop, not just the isolation
+    // invariants. returns the approve/deny decision. (satoru)
+    static bool PromptDemo(bool want_cred);
+
     // host-side accessors used by the vmcall handler ONLY. these are the sole
     // bridge out of the isolated region and expose a copy of the verdict, not
     // a pointer into ksa memory. (satoru)
