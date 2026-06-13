@@ -195,6 +195,7 @@ CXX_SRCS = \
     $(SRC)/shell/windows_cmds.cpp \
     $(SRC)/kcl/kcl.cpp \
     $(SRC)/security/supr.cpp \
+    $(SRC)/security/ksa.cpp \
     $(SRC)/packages/pkgmgr.cpp \
     $(SRC)/net/network.cpp \
     $(SRC)/media/mediadecoder.cpp \

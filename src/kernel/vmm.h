@@ -114,6 +114,21 @@ public:
     static uint64_t GetPML4();
     static uint64_t GetCurrentAddressSpace();
 
+    // ── ksa isolation primitives ───────────────────────────────────────
+    // remove `count` contiguous 4kb frames starting at phys_base from the
+    // kernel (main-os) page tables entirely, so QueryMapping returns 0 for
+    // them and any kernel-side dereference faults. if the frames are served
+    // by a 2mb huge identity mapping, the covering PD entry is first demoted
+    // to a 4kb page table, then the target leaves are zeroed. used by ksa to
+    // make the isolated prompt region unreachable from ring-0 in the main os.
+    // returns true if every target leaf ended up unmapped. (satoru)
+    static bool IsolateFrames(uint64_t phys_base, uint64_t count);
+
+    // re-establish an identity (virt==phys) 4kb mapping for `count` frames
+    // previously removed by IsolateFrames, restoring kernel access so the
+    // frames can be wiped + freed on teardown. (satoru)
+    static bool RevealFrames(uint64_t phys_base, uint64_t count, uint64_t flags);
+
 private:
     static uint64_t pml4_phys;  // physical address of pml4 table
 };
