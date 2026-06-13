@@ -58,6 +58,8 @@
 #include "../shell/windows_cmds.h"
 #include "../kcl/kcl.h"
 #include "../kcl/kcl_test.h"
+#include "../apps/kj.h"        // kj (kurono javascript) interpreter (satoru)
+#include "../apps/kj_test.h"   // kj (kurono javascript) self-test suite (satoru)
 #include "../security/supr.h"
 #include "../security/ksa.h"
 #include "../packages/pkgmgr.h"
@@ -977,11 +979,25 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // no page-table mapping into it, exercise the read-only verdict channel, then
     // tear down. latched early like the other smoke-test flags. (satoru)
     bool boot_ksa_test = false;
+    // interactive ksa prompt demo: once the desktop is up, draw the REAL
+    // on-screen ksa modal and let keyboard/mouse (or synthetic input) drive the
+    // verdict. for headless screendump + verdict-flow verification of the
+    // prompt. gated by kurono.ksa.prompt[=cred|nocred]. (satoru)
+    bool boot_ksa_prompt = false;
+    bool boot_ksa_prompt_cred = true;   // default: collect a credential (satoru)
     // kcl language self-test: run the kcl interpreter test suite headless at
     // boot and log PASS/FAIL per test to serial. gated by kurono.kcltest. (satoru)
     bool boot_kcl_test = false;
+    // kj language self-test: run the kj (kurono javascript) suite + kss-binding
+    // checks headless at boot. gated by kurono.kjtest. (satoru)
+    bool boot_kj_test = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
+    // setup mode: run the graphical installer / first-setup wizard instead of
+    // dropping straight to the desktop. gated by the "Kurono Setup" grub entry
+    // (kurono.setup=1). the main entry stays autologin -> desktop. (satoru)
+    bool boot_setup = false;
+    int  boot_setup_screen = 0;   // optional start screen for the setup wizard (satoru)
     char boot_cli_run[160];
     boot_cli_run[0] = 0;
     static char boot_gui_run[256];
@@ -1033,12 +1049,43 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.kcltest=1") || boot_has_token(boot_cmdline, "kurono.kcltest")) {
             boot_kcl_test = true;
         }
+        // latch the kj self-test flag. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kjtest=1") || boot_has_token(boot_cmdline, "kurono.kjtest")) {
+            boot_kj_test = true;
+        }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
+        }
+        // setup/installer wizard gate (the "Kurono Setup" grub entry). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.setup=1") || boot_has_token(boot_cmdline, "kurono.setup")) {
+            boot_setup = true;
+        }
+        // optional: open the setup wizard on a specific screen index. used for
+        // headless screendump verification of individual screens. (satoru)
+        {
+            char sv[8]; sv[0] = 0;
+            if (boot_get_value(boot_cmdline, "kurono.setup.screen", sv, (int)sizeof(sv)) && sv[0]) {
+                int v = 0; for (int i = 0; sv[i] >= '0' && sv[i] <= '9'; i++) v = v * 10 + (sv[i] - '0');
+                boot_setup_screen = v;
+                boot_setup = true;
+            }
         }
         // ksa isolation self-test gate. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.ksa.test=1") || boot_has_token(boot_cmdline, "kurono.ksa.test")) {
             boot_ksa_test = true;
+        }
+        // interactive ksa prompt demo gate. bare token => credential variant;
+        // kurono.ksa.prompt=nocred => approve/deny-only (no password field). (satoru)
+        {
+            char pv[16]; pv[0] = 0;
+            if (boot_get_value(boot_cmdline, "kurono.ksa.prompt", pv, (int)sizeof(pv))) {
+                boot_ksa_prompt = true;
+                if (pv[0] == 'n' || pv[0] == '0') boot_ksa_prompt_cred = false;  // nocred / 0 (satoru)
+                else boot_ksa_prompt_cred = true;
+            } else if (boot_has_token(boot_cmdline, "kurono.ksa.prompt")) {
+                boot_ksa_prompt = true;
+                boot_ksa_prompt_cred = true;
+            }
         }
         // smp 3d: run user processes on the application processors (opt-in). set the
         // gate BEFORE StartAPs so each ap dispatches from the moment it comes up;
@@ -1771,6 +1818,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     UIConfig::Init();
     // seed the kss theme tokens from ui.conf (defaults to the black/grey palette). (satoru)
     KSS::Init();
+    // build the kss stylesheet layer (named rules + transitions + keyframes) from
+    // the theme; this is what the kj interpreter binds to for scripted styling. (satoru)
+    KSS::Sheet::Init();
 
     // apply persisted accessibility settings to the runtime layers
     Graphics::SetColorFilter(UIConfig::Int("a11y.color_filter", 0));
@@ -1845,6 +1895,11 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[Python] Init mini interpreter...\r\n");
     PythonInterp::Init();
     PythonInterp::RegisterShellCommands(&shell_instance);
+
+    // kj (kurono javascript): register the `kj`/`node` shell commands. (satoru)
+    SerialLogger::Log("[KJ] Init interpreter...\r\n");
+    KJ::Init();
+    KJ::RegisterShellCommands(&shell_instance);
 
     SerialLogger::Log("[Userspace] Init ring-3 runtime...\r\n");
     LinuxSyscall::Init();
@@ -2448,6 +2503,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         KCLTest::RunAll();
     }
 
+    // kj language self-test (gated by cmdline kurono.kjtest): kss sheet layer is
+    // initialized above, so the kss host-binding checks have a live sheet. (satoru)
+    if (boot_kj_test) {
+        SerialLogger::Log("[KJ] running self-test suite\r\n");
+        KJTest::RunAll();
+    }
+
     // initialize the unified audio stack.
     //
     // AudioServer probes every registered backend (HDA, AC97, SB16,
@@ -2544,6 +2606,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // Installer is launched on demand from the desktop "Install Kurono"
         // shortcut, not auto-run on first boot  -  auto-launch left users
         // staring at a black installer screen with no working input.
+        // Setup wizard: the "Kurono Setup" grub entry boots with kurono.setup=1
+        // and lands here. run the graphical installer / first-setup flow. when
+        // the user completes an install the success screen reboots; when they
+        // choose "Live Boot" / finish setup, Run() returns false and we fall
+        // through to the desktop just like a normal boot. (satoru)
+        if (boot_setup) {
+            RuntimeLog::LogBoot("setup wizard");
+            SerialLogger::Log("[setup] kurono.setup=1 -> launching installer/first-setup wizard\r\n");
+            InstallerGUI::Run(boot_setup_screen);
+            SerialLogger::Log("[setup] wizard returned, continuing to desktop\r\n");
+        }
+
         // Pending system update (e.g. `kpkg install debian` queued one).
         // Runs full-screen progress UI, then continues to lockscreen.
         if (SystemUpdate::HasPendingUpdate()) {
@@ -2787,6 +2861,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     (void)gui_autorun_armed;
     uint32_t gui_autorun_ms_target = Timer::GetTicks() + 4000u;
     (void)gui_autorun_ms_target;
+
+    // arm the interactive ksa prompt demo so the gui process fires the real
+    // on-screen modal once the desktop is up (kurono.ksa.prompt). (satoru)
+    if (boot_ksa_prompt) {
+        SerialLogger::Log("[KSA] interactive prompt demo armed (kurono.ksa.prompt)\r\n");
+        KernelProcesses::ArmKsaPromptDemo(boot_ksa_prompt_cred);
+    }
 
     // ── Preemptive multitasking switch-over ─────────────────────────────
     // For graphical / headless boots we hand control to the new scheduler.

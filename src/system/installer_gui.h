@@ -11,10 +11,14 @@ public:
         SCR_WELCOME = 0,
         SCR_LANGUAGE,
         SCR_KEYBOARD,
+        SCR_NETWORK,        // network setup: wired status + offer wifi config (satoru)
+        SCR_WIFI,           // wifi ssid/password config screen (satoru)
         SCR_DISK,
         SCR_PARTITION_MODE,
         SCR_FILESYSTEM,
         SCR_USER,
+        SCR_HOSTNAME,       // hostname + basic prefs (satoru)
+        SCR_GUESTS,         // optional linux guests / packages (debian, alpine, python) (satoru)
         SCR_SUMMARY,
         SCR_CONFIRM,
         SCR_PROGRESS,
@@ -25,7 +29,9 @@ public:
 
     // Returns true if installation was completed (user should reboot),
     // false if the user chose Live Boot (continue to desktop).
-    static bool Run();
+    // start_screen lets the "Kurono Setup" boot path (and headless tests) open
+    // the wizard on a specific screen; defaults to the welcome screen. (satoru)
+    static bool Run(int start_screen = 0 /* SCR_WELCOME */);
 
     // Detect whether the OS has been installed previously.  Looks for the
     // marker file /etc/kurono-installed in KVFS (mirrored from disk).

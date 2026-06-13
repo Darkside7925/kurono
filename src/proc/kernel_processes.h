@@ -17,4 +17,11 @@ namespace KernelProcesses {
     // autorun.  Called once early in the GUI loop.
     void SetGuiAutorun(const char* cmd);
     const char* GuiAutorun();
+
+    // arm a one-shot interactive ksa prompt demo (kurono.ksa.prompt boot gate).
+    // once the desktop has presented a few frames the GUI process calls
+    // KSA::PromptDemo() once, so a headless screendump can capture the real
+    // on-screen modal and synthetic input can drive the verdict. want_cred
+    // selects the credential-collecting variant (auth=kvault-only). (satoru)
+    void ArmKsaPromptDemo(bool want_cred);
 }

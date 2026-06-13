@@ -42,6 +42,7 @@
 #include "../ui/notification.h"
 #include "../apps/media_player.h"
 #include "../apps/denji_app.h"
+#include "../security/ksa.h"   // one-shot interactive prompt demo (kurono.ksa.prompt) (satoru)
 
 namespace KernelProcesses {
 
@@ -54,6 +55,16 @@ volatile uint32_t g_last_frame_ms = 0;
 constexpr int  GUI_AUTORUN_MAX = 256;
 char           g_gui_autorun_cmd[GUI_AUTORUN_MAX] = {};
 volatile bool  g_gui_autorun_armed = false;
+// one-shot interactive ksa prompt demo (kurono.ksa.prompt). armed early; the
+// gui process fires it once after the desktop has presented some frames so the
+// modal lands over a real desktop. (satoru)
+volatile bool  g_ksa_prompt_demo_armed = false;
+volatile bool  g_ksa_prompt_demo_cred  = false;
+}
+
+void ArmKsaPromptDemo(bool want_cred) {
+    g_ksa_prompt_demo_cred  = want_cred;
+    g_ksa_prompt_demo_armed = true;
 }
 
 void SetGuiAutorun(const char* cmd) {
@@ -188,6 +199,7 @@ static inline bool ui_activity_active() {
     if (Desktop::IsAnimating())                 return true;  // icon hover-pop fade
     if (ControlCenter::IsAnimating())           return true;  // panel slide+fade
     if (KSS::Anim::Active())                     return true;  // kss tween engine in flight
+    if (KSS::Sheet::Active())                    return true;  // kss keyframe track playing
     if (NotificationManager::ActiveCount() > 0) return true;  // toasts in/hold/out
     if (MediaPlayerApp::IsOpen())               return true;  // audio/video surface
     if (DenjiApp::IsOpen())                     return true;  // kvid playback frames
@@ -315,6 +327,20 @@ static inline bool ui_activity_active() {
             continue;
         }
 
+        // one-shot interactive ksa prompt demo (kurono.ksa.prompt). fire once the
+        // desktop has presented enough frames that the modal lands over a real
+        // desktop. KSA::Prompt blocks this loop until the user (or synthetic
+        // input) answers  -  that block IS the secure desktop: the gui compositor
+        // and input process are starved while ksa owns the screen + input. when
+        // it returns, the saved desktop is restored and the loop repaints. (satoru)
+        if (g_ksa_prompt_demo_armed && frame_counter > 90) {
+            g_ksa_prompt_demo_armed = false;
+            SerialLogger::Log("[gui] firing interactive ksa prompt demo\r\n");
+            KSA::PromptDemo(g_ksa_prompt_demo_cred);
+            Graphics::MarkUIDirty();
+            continue;   // repaint the desktop on the next iteration (satoru)
+        }
+
         if (frame_counter % 300 == 0) {
             TaskManagerApp::RefreshProcesses();
         }
@@ -335,8 +361,10 @@ static inline bool ui_activity_active() {
         // freeze). (satoru)
         constexpr uint32_t FALLBACK_MS = 250u;
         // advance the kss tween engine first so animated values progress and the
-        // Active() check inside ui_activity_active() reflects in-flight tweens. (satoru)
+        // Active() check inside ui_activity_active() reflects in-flight tweens. then
+        // advance the stylesheet keyframe layer against that same clock. (satoru)
         KSS::Anim::Tick(Timer::GetRealMs());
+        KSS::Sheet::Tick();
         bool dirty    = Graphics::ConsumeUIDirty();
         bool active   = ui_activity_active();
         bool fallback = (Timer::GetRealMs() - last_render_ms) >= FALLBACK_MS;

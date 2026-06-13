@@ -1,34 +1,85 @@
 # Linux Syscall Layer
 
-`src/linux/linux_syscall.cpp` and `linux_syscall.h` implement the Linux system call dispatch table.
+`src/linux/linux_syscall.cpp` / `linux_syscall_x64.cpp` and `linux_syscall.h`
+implement Kurono's in-kernel Linux system-call layer. This is more than a command
+shim: it is a real process / memory / file-descriptor / syscall runtime that lets
+native musl-compiled Linux binaries run on Kurono in ring 3.
 
 ## 1. What it does
 
-The Linux syscall layer intercepts `syscall` instructions from guest code that expects a Linux kernel. It maps Linux syscall numbers to Kurono implementations or personality stubs.
+When a ring-3 Linux process executes a `syscall` instruction (or `int 0x80`), the
+HAL entry path routes it into `LinuxSyscall::Dispatch()`, which maps the Linux
+x86-64 syscall number to a Kurono implementation. The layer owns the Linux process
+model (per-process fd table, brk heap, cwd, signal disposition), backs file I/O on
+KVFS, and translates Linux paths into the canonical `/kurono` tree on the way in.
 
-This is the core of the Linux binary compatibility feature: native Kurono code can run simple Linux ELF binaries by routing their syscalls through this table.
+## 2. Coverage
 
-## 2. Dispatch table
+`linux_syscall.h` defines syscall numbers across the x86-64 ABI (both the symbolic
+`LSYS_*` names and their numeric synonyms). **35+ core handlers** are implemented
+for real  -  not stubbed  -  covering the surface a command-line or GUI program needs:
 
-Syscalls are dispatched by number. The table covers the most commonly used x86-64 Linux syscalls:
+| Group | Syscalls |
+| --- | --- |
+| File I/O | `read`, `write`, `open`/`openat`, `close`, `lseek`, `dup`, `dup2`, `ioctl`, `writev`, `getdents64`, `stat`, `fstat`, `statx`, `access` |
+| FS namespace | `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink` (paths translated to `/kurono`) |
+| Process | `fork`, `clone`/`clone3`, `execve`/`execveat`, `waitpid`, `exit`, `exit_group`, `getpid`, `getuid`/`getgid` |
+| Memory | `brk` (lazy), `mmap` (anonymous + **file-backed**), `munmap` (with region split), `mprotect` (W^X + region split) |
+| Time | `nanosleep`, `clock_gettime`, `clock_nanosleep` |
+| TLS | `arch_prctl(ARCH_SET_FS)`, `set_thread_area`, `set_tid_address` |
+| Identity | `uname` (reports `Linux 6.8.0-kurono`) |
 
-| Number | Name | Implementation |
-| --- | --- | --- |
-| 0 | `read` | KVFS read path |
-| 1 | `write` | Output buffer |
-| 2 | `open` | KVFS open |
-| 3 | `close` | File descriptor close |
-| 12 | `brk` | Heap extension stub |
-| 60 | `exit` | Process termination |
-| 231 | `exit_group` | Group exit |
+### The GUI-blocking set (implemented, not stubbed)
 
-The list extends to cover enough surface area for basic command-line programs.
+A real GUI app blocks on a handful of syscalls that are easy to stub wrongly.
+These are implemented for real, which is what makes the Wayland render path work:
 
-## 3. Unsupported syscalls
+- **`futex`** (`FUTEX_WAIT` / `FUTEX_WAKE`)  -  real blocking + wakeups. The
+  multithreaded pthread gate test (`pthread_test`) reliably reaches `counter=2000`.
+- **`clone` / `CLONE_THREAD`**  -  threads sharing one address space, preemptively
+  switched on the user-thread path.
+- **`epoll_create1` / `epoll_ctl` / `epoll_wait`** and **`poll` / `ppoll`**  - 
+  event loops backed by eventfd, timerfd, and sockets.
+- **`mprotect`**  -  W^X enforcement with region splitting.
+- **`memfd_create`** + file-backed **`mmap`**  -  shared-memory backing for `wl_shm`.
+- **`sendmsg` / `recvmsg`** carrying **`SCM_RIGHTS`**  -  file-descriptor passing.
+  A Wayland client fd-passes a `wl_shm` buffer to the compositor end to end.
 
-Unsupported syscall numbers are logged to serial and return `-ENOSYS`. Programs that hit unsupported syscalls frequently may need the full hypervisor path (a real Linux guest) rather than the native syscall stub layer.
+## 3. Process & memory model
 
-## 4. Related files
+- Up to 16 concurrent Linux processes, 64 file descriptors each.
+- A lazy `brk` heap and anonymous `mmap` regions, with recoverable user page
+  faults and copy-on-write address-space cloning behind `fork`.
+- **ABI constraint:** the layer still uses a 32-bit-style pointer convention, so
+  user mappings and pointers currently need to remain **below 4 GB**. Lifting this
+  is one of the two open items for running Firefox on-device.
 
-- `src/linux/linux_kernel.cpp`  -  personality coordinator that activates the syscall layer
-- `src/virt/hypervisor.cpp`  -  full hardware virtualization path for heavier Linux workloads
+## 4. Path translation
+
+`ResolvePath()` rewrites Linux paths into Kurono's canonical tree before any KVFS
+op  -  e.g. `/usr/lib*` and `/lib*` resolve through the compat symlinks into
+`/kurono/...`, `/proc` / `/dev` / `/run` / `/tmp` map under `/kurono/runtime`, and
+`/etc` maps to `/kurono/system/config`. See [KVFS.md](../fs/KVFS.md) §3 and
+[../system/LOGGING.md](../system/LOGGING.md) §1 for the layout.
+
+## 5. Dynamic linking
+
+When `execve` loads an ET_DYN ELF that declares `PT_INTERP`, the ELF loader hands
+the image to the in-kernel dynamic linker rather than mapping it as a static
+binary. The linker resolves `DT_NEEDED` (e.g. musl's `libc.musl-x86_64.so.1`),
+applies relocations, sets up TLS + the SysV auxv stack, and enters the program.
+See **[LD_KURONO.md](LD_KURONO.md)**.
+
+## 6. Unsupported syscalls
+
+An unrecognized syscall number is logged to serial and returns `-ENOSYS`. Heavier
+Linux workloads that need a full kernel run instead through the hypervisor path (a
+real Linux guest)  -  see [../virt/HYPERVISOR.md](../virt/HYPERVISOR.md).
+
+## 7. Related files
+
+- `src/linux/linux_syscall.cpp` / `linux_syscall_x64.cpp` / `.h`  -  the dispatch table + handlers
+- `src/linux/linux_kernel.cpp`  -  personality coordinator that activates the layer
+- `src/linux/ld_kurono.cpp`  -  the dynamic linker the loader hands PIEs to
+- `src/net/unix_socket.cpp`  -  AF_UNIX sockets + `SCM_RIGHTS` fd-passing
+- `src/virt/hypervisor.cpp`  -  full hardware-virtualization path for heavier guests

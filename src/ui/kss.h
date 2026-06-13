@@ -85,8 +85,8 @@ namespace W {
 // declarative tweening for the immediate-mode ui: a widget asks for a value that
 // eases toward a `target`, keyed by a stable `id`. the engine remembers per-id
 // state across frames, so callers stay stateless. think of it as the "smooth
-// animations" half of the kss style/motion combo (scripting/behavior is handled
-// by the existing python/kcl interpreters, not a bespoke js engine). (satoru)
+// animations" half of the kss style/motion combo. scripting/behavior is handled
+// by the kj interpreter (src/apps/kj.cpp), which binds to the Sheet api below. (satoru)
 namespace Anim {
     enum Ease { Linear = 0, OutCubic = 1, InOutQuint = 2, Spring = 3 };
 
@@ -103,7 +103,89 @@ namespace Anim {
     float    Float(uint32_t id, float target, uint32_t dur_ms, Ease e);
     // same, for an argb color (channel-lerped). (satoru)
     uint32_t Color(uint32_t id, uint32_t target, uint32_t dur_ms, Ease e);
+
+    // now_ms as last seen by Tick(); lets the Sheet/keyframe layer share one clock. (satoru)
+    uint32_t Now();
 }
+
+// ── stylesheet layer (the "kss" in kurono style sheet) ──────────────────────
+// a real, scriptable styling layer on top of the theme tokens: named style
+// rules (selectors) each carry a property bag (colors + metrics), per-property
+// transitions (duration + easing applied automatically when a property's value
+// changes), and named keyframe animations the compositor samples per frame.
+// host code AND the kj interpreter both drive this through the same api, so a
+// script can restyle / animate live widgets. fixed-size tables, no heap, no stl.
+// (satoru)
+namespace Sheet {
+
+    // style properties addressable by name from scripts/config. (satoru)
+    enum Prop {
+        P_BG = 0,        // background fill (argb)
+        P_FG,            // foreground / text (argb)
+        P_BORDER,        // hairline border (argb)
+        P_ACCENT,        // accent (argb)
+        P_SHADOW,        // shadow base (argb)
+        P_RADIUS,        // corner radius (px)
+        P_PAD,           // content padding (px)
+        P_BORDER_W,      // border width (px)
+        P_FONT_PX,       // font height (px, scalar)
+        P_OPACITY,       // 0..255
+        P_SCALE,         // x1000 fixed display, stored as scalar 0..n (1.0 = full)
+        P_DX,            // translate x (px)
+        P_DY,            // translate y (px)
+        P_COUNT
+    };
+
+    // resolved property bag for one element/selector. colors are argb; scalars
+    // are float so transitions/keyframes interpolate smoothly. (satoru)
+    struct Style {
+        uint32_t color[5];   // P_BG..P_SHADOW
+        float    scalar[P_COUNT - 5]; // P_RADIUS..P_DY
+    };
+
+    void Init();   // seed the builtin rules from the active Theme. call after KSS::Init(). (satoru)
+
+    // ── named style rules (selectors) ────────────────────────────────────────
+    // register / fetch a rule by selector string (e.g. "button", "button:hover",
+    // "card", "window.open"). DefineRule returns a stable rule id (>=0) or -1 if
+    // the table is full. (satoru)
+    int   DefineRule(const char* selector);
+    int   FindRule(const char* selector);          // -1 if absent (satoru)
+    // set one property on a rule. color props take an argb in `v` (cast); scalar
+    // props take the float bits. the typed setters below are the friendly api. (satoru)
+    void  SetColor (int rule, Prop p, uint32_t argb);
+    void  SetScalar(int rule, Prop p, float v);
+    uint32_t GetColor (int rule, Prop p);
+    float    GetScalar(int rule, Prop p);
+    // resolve a rule's full Style (after applying any in-flight transitions for
+    // this rule's properties). (satoru)
+    void  Resolve(int rule, Style& out);
+
+    // name->Prop lookup for scripts/config ("background"->P_BG, etc). (satoru)
+    int   PropByName(const char* name);   // -1 if unknown
+
+    // ── transitions ──────────────────────────────────────────────────────────
+    // give a rule's property a transition: future SetColor/SetScalar on it will
+    // ease over dur_ms with easing e instead of snapping. (satoru)
+    void  SetTransition(int rule, Prop p, uint32_t dur_ms, Anim::Ease e);
+
+    // ── keyframe animations ──────────────────────────────────────────────────
+    // define a named keyframe track for a single property: `stops` are (offset
+    // 0..1, value) pairs in ascending offset. returns an anim id or -1. (satoru)
+    int   DefineKeyframes(const char* name, Prop p, const float* offsets,
+                          const float* values, int n_stops);
+    // bind a keyframe track to a rule so the compositor samples it every frame;
+    // dur_ms is one loop, loop=true repeats. returns false if name/rule unknown. (satoru)
+    bool  PlayKeyframes(int rule, const char* name, uint32_t dur_ms, bool loop, Anim::Ease e);
+    void  StopKeyframes(int rule);
+
+    // advance keyframe playback against Anim::Now(). call once per frame from the
+    // same place that ticks the Anim engine. (satoru)
+    void  Tick();
+    // true while any keyframe track is playing (feeds the keep-rendering gate). (satoru)
+    bool  Active();
+
+} // namespace Sheet
 
 } // namespace KSS
 // end (satoru)

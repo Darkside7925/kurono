@@ -28,7 +28,7 @@ static int  comp_shadow_radius        = 8;        // 0..16
 static int  comp_shadow_opacity_pct   = 60;       // 0..100
 static bool comp_shadow_during_drag   = false;
 static bool comp_animations_enabled   = true;
-static int  comp_anim_duration_ms     = 90;
+static int  comp_anim_duration_ms     = 180;   // open/close fade+scale, perceptible but snappy (satoru)
 static int  comp_default_alpha        = 255;
 static bool comp_frosted_titlebar     = true;
 static bool comp_reduced_motion       = false;
@@ -1041,6 +1041,42 @@ static int wm_ease_q8(int p_q8) {
     return v;
 }
 
+// open/close scale: draw the window CHROME (rounded body + titlebar strip +
+// border) scaled toward its own center by factor s_q8 (Q8, 0..256). content
+// callbacks draw at fixed coords so they're skipped while scaling  -  the body
+// snaps to full size + real content the instant the phase completes, which is
+// the cheap-but-honest "pop / zoom" the task asks for (fade is layered on top
+// by the caller's dim overlay). returns the scaled rect via out_* so the caller
+// can fade exactly that footprint. (satoru)
+static void wm_render_scaled_chrome(const Window* win, int s_q8, bool focused,
+                                    int& ox, int& oy, int& ow, int& oh) {
+    if (s_q8 < 24)  s_q8 = 24;            // floor so a closing/opening win is still visible
+    if (s_q8 > 256) s_q8 = 256;
+    int cx = win->x + win->w / 2;
+    int cy = win->y + win->h / 2;
+    int sw = (win->w * s_q8) >> 8;
+    int sh = (win->h * s_q8) >> 8;
+    if (sw < 8) sw = 8;
+    if (sh < 8) sh = 8;
+    int sx = cx - sw / 2;
+    int sy = cy - sh / 2;
+    // proportionally smaller corner radius so the rounding reads right at scale.
+    int r = (WM_CORNER_RADIUS * s_q8) >> 8;
+    if (r < 2) r = 2;
+    uint32_t border = focused ? wm_get_accent() : COL_BORDER;
+    Graphics::FillRoundedRect(sx, sy, sw, sh, r, win->bg_color);
+    // a thin titlebar-coloured strip across the top so the scaled card reads as a
+    // window, not a plain box. (satoru)
+    if (win->has_titlebar) {
+        int tb = (WM_TITLEBAR_H * s_q8) >> 8;
+        if (tb < 4) tb = 4;
+        if (tb > sh) tb = sh;
+        Graphics::FillRoundedRect(sx, sy, sw, tb, r, COL_TITLE_BG);
+    }
+    Graphics::DrawRect(sx, sy, sw, sh, border);
+    ox = sx; oy = sy; ow = sw; oh = sh;
+}
+
 void WindowManager::Render() {
     // First retire any animations that have completed since the last
     // tick so windows in their final CLOSE/MINIMIZE phase are dropped
@@ -1171,20 +1207,41 @@ void WindowManager::Render() {
             continue;
         }
 
+        // ── open/close fade+scale ────────────────────────────────────
+        // while an OPEN (1) or CLOSE (2) animation is in flight we draw a
+        // scaled chrome card (grow on open, shrink on close) toward the
+        // window center and fade it, instead of the full body. this is the
+        // visible "pop/zoom" half of the kss motion combo; the body snaps to
+        // full size + live content at phase end. minimize/restore already have
+        // their own fly-to-taskbar paths above, so they never reach here. (satoru)
+        if (WM_UNLIKELY((kind == 1 || kind == 2) && p_raw < 256)) {
+            // scale: open 0.78 -> 1.00 (p_vis 0..256), close 1.00 -> 0.78.
+            // map p_vis (256=full) to s_q8 in [200, 256]. (satoru)
+            int s_q8 = 200 + (p_vis * 56) / 256;
+            int sx, sy, sw, sh;
+            wm_render_scaled_chrome(win, s_q8, win->focused, sx, sy, sw, sh);
+            int combined = (int)win->alpha * p_vis / 256;
+            if (combined < 255) {
+                unsigned int dim = (unsigned int)(255 - combined);
+                if (kind == 1 && dim > 110) dim = 110;   // never start fully black
+                Graphics::FillRectAlpha(sx, sy, sw, sh, (uint8_t)dim, 0xFF000000u);
+            }
+            // keep repainting the scaled footprint (plus a margin) until done.
+            wm_damage(win->x - WM_SHADOW_SIZE, win->y - WM_SHADOW_SIZE,
+                      win->w + 2*WM_SHADOW_SIZE, win->h + 2*WM_SHADOW_SIZE);
+            win->dirty = false;
+            continue;
+        }
+
         // shadow + body + titlebar + border + content. shadow is skipped
         // during drag/resize unless the user opted in. shared helper keeps the
         // dragged-only fast path pixel-identical to this loop. (satoru)
         RenderWindowBody(win, (!dragging || comp_shadow_during_drag));
 
-        // ── post-pass: per-window opacity + open/close fade overlay ──
+        // ── post-pass: per-window opacity overlay (animation done) ──
         int combined = (int)win->alpha * p_vis / 256;
         if (combined < 255) {
             unsigned int dim = (unsigned int)(255 - combined);
-            if (kind == 1 && dim > 96) {
-                // Never start a new app window fully black. If the frame loop
-                // stalls during launch, a full blackout reads as a dead app.
-                dim = 96;
-            }
             Graphics::FillRectAlpha(win->x, win->y, win->w, win->h, (uint8_t)dim, 0xFF000000u);
         }
 
@@ -1920,7 +1977,7 @@ void WindowManager::ReloadFromConfig() {
     comp_shadow_opacity_pct   = UIConfig::Int ("compositor.shadow_opacity",       60);
     comp_shadow_during_drag   = UIConfig::Bool("compositor.shadow_during_drag",   false);
     comp_animations_enabled   = UIConfig::Bool("compositor.window_animations",    true);
-    comp_anim_duration_ms     = UIConfig::Int ("compositor.animation_speed_ms",   90);
+    comp_anim_duration_ms     = UIConfig::Int ("compositor.animation_speed_ms",   180);
     comp_default_alpha        = UIConfig::Int ("compositor.window_alpha",         255);
     comp_frosted_titlebar     = UIConfig::Bool("compositor.frosted_titlebar",     true);
     comp_reduced_motion       = UIConfig::Bool("compositor.reduced_motion",       false);
