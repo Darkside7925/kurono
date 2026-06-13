@@ -3579,9 +3579,21 @@ static bool stat_buf_writable(LinuxProcess* p, uint64_t ptr, uint64_t len) {
     if (!ptr || len == 0) return false;
     uint64_t end = ptr + len;
     if (end < ptr) return false;                       // address-space wrap
+    // a tracked region that fully covers it is fine (and handles demand-zero
+    // pages not yet faulted in). (satoru)
     UserMemoryRegion* region = find_region(p->task, ptr);
-    if (!region) return false;                         // not in any user region
-    if (end > region->end) return false;               // straddles region edge
+    if (region && end <= region->end) return true;
+    // otherwise accept it if the pages are actually mapped: the user stack and
+    // ld-kurono-mapped elf segments are valid write targets that live OUTSIDE
+    // the region table  -  e.g. musl fstat()s into a stack buffer while loading a
+    // shared library. (rejecting those returned EFAULT and broke .so loading.)
+    // (satoru)
+    uint64_t first = ptr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t last  = (end - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint64_t pg = first; pg <= last; pg += PAGE_SIZE) {
+        if (!KernelVMM::QueryMappingInAddressSpace(p->task->address_space, pg))
+            return false;
+    }
     return true;
 }
 
@@ -3881,32 +3893,88 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
         return (int64_t)(uintptr_t)mem;
     }
 
-    // file-backed mmap: only memfd / shared-memory objects are supported (wl_shm
-    // pixel pools, posix shm). map the memfd's physical pages straight into the
-    // caller so its writes land in the same buffer the compositor reads. (satoru)
     if (fd >= 0) {
+        // (a) memfd / shared-memory objects: map the object's physical pages
+        // straight into the caller so writes are shared (wl_shm pixel pools,
+        // posix shm). (satoru)
         LinuxShmObj* shm = shm_for_fd(proc, fd);
-        if (!shm || !shm->base) return -38;
-        uint64_t msize = align_up_u64(length, PAGE_SIZE);
-        if (offset + msize > shm->size) return -22;
-        uint64_t vbase = choose_mmap_base(task, addr, msize);
-        if (!vbase) return -12;
-        uint64_t pflags = page_flags_from_prot(prot);
-        uint64_t phys0 = (uint64_t)(uintptr_t)shm->base + offset;
-        for (uint64_t o = 0; o < msize; o += PAGE_SIZE) {
-            if (!KernelVMM::MapPageInAddressSpace(task->address_space,
-                                                  vbase + o, phys0 + o, pflags)) {
-                return -12;
+        if (shm && shm->base) {
+            uint64_t msize = align_up_u64(length, PAGE_SIZE);
+            if (offset + msize > shm->size) return -22;
+            uint64_t vbase = choose_mmap_base(task, addr, msize);
+            if (!vbase) return -12;
+            uint64_t pflags = page_flags_from_prot(prot);
+            uint64_t phys0 = (uint64_t)(uintptr_t)shm->base + offset;
+            for (uint64_t o = 0; o < msize; o += PAGE_SIZE) {
+                if (!KernelVMM::MapPageInAddressSpace(task->address_space,
+                                                      vbase + o, phys0 + o, pflags)) {
+                    return -12;
+                }
             }
+            // tracked so munmap works; not demand-zero (pages already mapped). (satoru)
+            add_region(task, vbase, vbase + msize, pflags, USER_REGION_MMAP);
+            if (Scheduler::GetCurrentProcess() == task) {
+                for (uint64_t o = 0; o < msize; o += PAGE_SIZE)
+                    KernelVMM::InvalidatePage(vbase + o);
+            }
+            task->next_mmap_base = vbase + msize;
+            return (int64_t)vbase;
         }
-        // tracked so munmap works; not demand-zero (pages already mapped). (satoru)
-        add_region(task, vbase, vbase + msize, pflags, USER_REGION_MMAP);
-        if (Scheduler::GetCurrentProcess() == task) {
-            for (uint64_t o = 0; o < msize; o += PAGE_SIZE)
-                KernelVMM::InvalidatePage(vbase + o);
+
+        // (b) regular file (kvfs): copy the file's bytes into freshly-allocated
+        // private pages and map them. THIS is how musl's dynamic linker loads
+        // every .so segment  -  mmap(fd, MAP_PRIVATE[, MAP_FIXED], offset)  -  so
+        // it's the gate for the firefox closure. mapped eagerly (no demand
+        // paging of file content); bytes past EOF are zeroed (.bss tail). a
+        // MAP_FIXED map overlays an earlier reservation, so we free the page we
+        // displace to keep peak memory at ~one copy of the image. (satoru)
+        constexpr uint32_t MAP_FIXED_FLAG = 0x10;
+        LinuxFd* lfd = (fd < LINUX_MAX_FDS) ? &proc->fds[fd] : nullptr;
+        if (lfd && lfd->open && lfd->type == LFD_KVFS) {
+            KVFSNode* node = KVFS::Resolve(lfd->path);
+            if (!node || node->is_dir()) return -13;          // eacces
+            const uint8_t* content = node->content;
+            uint32_t fsize = node->size;
+            uint64_t msize = align_up_u64(length, PAGE_SIZE);
+            bool fixed = (flags & MAP_FIXED_FLAG) != 0;
+            uint64_t vbase = fixed ? (addr & ~(uint64_t)(PAGE_SIZE - 1))
+                                   : choose_mmap_base(task, addr, msize);
+            if (!vbase) return -12;
+            uint64_t pflags = page_flags_from_prot(prot);
+            bool active = (Scheduler::GetCurrentProcess() == task);
+            for (uint64_t o = 0; o < msize; o += PAGE_SIZE) {
+                uint64_t va = vbase + o;
+                if (fixed) {
+                    uint64_t old = KernelVMM::QueryMappingInAddressSpace(task->address_space, va);
+                    if (old) PMM::FreeBytes((void*)(uintptr_t)old, PAGE_SIZE);
+                }
+                void* pg = PMM::AllocBytes(PAGE_SIZE);
+                if (!pg) return -12;
+                uint64_t fpos = offset + o;
+                uint32_t copy = 0;
+                if (content && fpos < fsize) {
+                    uint64_t avail = (uint64_t)fsize - fpos;
+                    copy = (uint32_t)(avail < PAGE_SIZE ? avail : PAGE_SIZE);
+                    memcpy(pg, content + fpos, copy);
+                }
+                if (copy < PAGE_SIZE) memset((uint8_t*)pg + copy, 0, PAGE_SIZE - copy);
+                if (!KernelVMM::MapPageInAddressSpace(task->address_space, va,
+                                                      (uint64_t)(uintptr_t)pg, pflags)) {
+                    PMM::FreeBytes(pg, PAGE_SIZE);
+                    return -12;
+                }
+                if (active) KernelVMM::InvalidatePage(va);
+            }
+            // a fixed overlay sits inside an already-tracked reservation; only
+            // record + bump the arena for a fresh (non-fixed) mapping. (satoru)
+            if (!fixed) {
+                add_region(task, vbase, vbase + msize, pflags, USER_REGION_MMAP);
+                task->next_mmap_base = vbase + msize;
+            }
+            return (int64_t)vbase;
         }
-        task->next_mmap_base = vbase + msize;
-        return (int64_t)vbase;
+
+        return -38;   // other fd types are not mmappable
     }
 
     uint64_t size = align_up_u64(length, PAGE_SIZE);
@@ -4044,20 +4112,23 @@ int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t pro
     // not yet present are skipped  -  they will fault in later with the region
     // flags updated above. collect whether anything changed so we can flush. (satoru)
     bool active_cr3 = (Scheduler::GetCurrentProcess() == task);
+    bool mapped_any = false;
     for (uint64_t page = start; page < end; page += PAGE_SIZE) {
         if (KernelVMM::ProtectPageInAddressSpace(task->address_space, page, new_flags)) {
+            mapped_any = true;
             if (active_cr3) KernelVMM::InvalidatePage(page);
         }
     }
 
     // linux returns 0 even when the range has no backing region yet (a fresh
-    // demand-zero mmap region still counts). only reject when the range maps
-    // nothing at all and overlaps no region. (satoru)
-    if (!covered_any) {
-        // still walk pages above; if none were mapped either, the address range
-        // is genuinely unmapped -> enomem per posix. (satoru)
-        return -12;
-    }
+    // demand-zero mmap region still counts). it ALSO succeeds for a range that
+    // is live in the page tables but not in our region array  -  e.g. elf segments
+    // mapped directly by ld-kurono, which musl then mprotect()s read-only for
+    // RELRO. (returning enomem there made musl treat RELRO as a fatal error and
+    // abort with exit 127, even though step 2 above already applied the new
+    // protection.) only reject when the range overlaps NO region AND maps no
+    // live page at all -> genuinely unmapped -> enomem per posix. (satoru)
+    if (!covered_any && !mapped_any) return -12;
     return 0;
 }
 

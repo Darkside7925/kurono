@@ -958,6 +958,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // string lives in low memory that the (now large) kernel image/heap can
     // clobber before the test runs deep in boot, so we must latch it now. (satoru)
     bool boot_ffmpeg_test = false;
+    bool boot_dyntest_test = false;   // run the dynamic-pie ld-kurono smoke test (satoru)
+    bool boot_logcheck = false;       // dump /kurono/var/log contents to verify logging (satoru)
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     char boot_cli_run[160];
@@ -990,6 +992,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // latch the ffmpeg smoke-test flag early (see decl). (satoru)
         if (boot_has_token(boot_cmdline, "kurono.ffmpeg.test=1") || boot_has_token(boot_cmdline, "kurono.ffmpeg.test")) {
             boot_ffmpeg_test = true;
+        }
+        // latch the dynamic-pie smoke-test flag (kurono.dyntest). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.dyntest=1") || boot_has_token(boot_cmdline, "kurono.dyntest")) {
+            boot_dyntest_test = true;
+        }
+        // latch the logging self-check flag (kurono.logcheck). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.logcheck=1") || boot_has_token(boot_cmdline, "kurono.logcheck")) {
+            boot_logcheck = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -1752,6 +1762,48 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec((int)EmbeddedUserprogs::PthreadTestSize());
         SerialLogger::Log(" bytes)\r\n");
     }
+    // register the dynamic musl pie + its libc.so. this is the first real
+    // exercise of ld-kurono's dynamic-load path (load a pie at the 64tb aslr
+    // base, recurse into DT_NEEDED, relocate, run). the .so lands in a default
+    // ld-kurono search path so the pie's DT_NEEDED (libc.musl-x86_64.so.1)
+    // resolves. `dyntest` runs it from the shell. (satoru)
+    if (EmbeddedUserprogs::HasMuslLibc()) {
+        KVFS::Mkdirs("/system/lib");
+        KVFS::WriteFile("/system/lib/libc.musl-x86_64.so.1",
+                        EmbeddedUserprogs::MuslLibcData(),
+                        EmbeddedUserprogs::MuslLibcSize());
+        // also seed it at the PT_INTERP path so ld-kurono resolves the exe's
+        // program interpreter (/lib/ld-musl-x86_64.so.1) verbatim  -  musl's libc
+        // IS the dynamic linker. (satoru)
+        KVFS::Mkdirs("/lib");
+        KVFS::WriteFile("/lib/ld-musl-x86_64.so.1",
+                        EmbeddedUserprogs::MuslLibcData(),
+                        EmbeddedUserprogs::MuslLibcSize());
+        SerialLogger::Log("[Userspace] musl libc.so registered at /system/lib + /lib (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::MuslLibcSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    if (EmbeddedUserprogs::HasLibfoo()) {
+        // dyntest's extra dependency. seeded in a default musl search dir
+        // (LD_LIBRARY_PATH=/system/lib, set in the env ExecPIE passes) so musl's
+        // linker resolves + file-backed-mmaps it. (satoru)
+        KVFS::Mkdirs("/system/lib");
+        KVFS::WriteFile("/system/lib/libfoo.so",
+                        EmbeddedUserprogs::LibfooData(),
+                        EmbeddedUserprogs::LibfooSize());
+        SerialLogger::Log("[Userspace] /system/lib/libfoo.so registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::LibfooSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    if (EmbeddedUserprogs::HasDyntest()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/dyntest",
+                        EmbeddedUserprogs::DyntestData(),
+                        EmbeddedUserprogs::DyntestSize());
+        SerialLogger::Log("[Userspace] /usr/bin/dyntest registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::DyntestSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
     if (EmbeddedUserprogs::HasKpython()) {
         KVFS::Mkdirs("/usr/bin");
         KVFS::Mkdirs("/usr/share");
@@ -2060,6 +2112,36 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // ffmpeg h264 path runs at normal speed. (satoru)
     }
 
+    // dynamic-pie smoke test (gated by cmdline kurono.dyntest): the FIRST real
+    // exercise of ld-kurono's dynamic-load path. loading /usr/bin/dyntest (a
+    // musl pie, PT_INTERP present) routes through ld-kurono: pick a 64tb aslr
+    // base, map the pie, recurse into DT_NEEDED (libc.musl-x86_64.so.1 from
+    // /system/lib), apply relocations, set up tls + the sysv auxv stack, and
+    // run. it prints DYNOK on success. DYNTEST_* markers let a headless qemu
+    // boot verify it. proving this is the prerequisite for running firefox
+    // (itself a musl pie + an 80-library closure). (satoru)
+    if (boot_dyntest_test && EmbeddedUserprogs::HasDyntest()) {
+        SerialLogger::Log("[dyntest] PMM free MB=");
+        SerialLogger::LogDec((int)(PMM::GetFreeMemory() / (1024 * 1024)));
+        SerialLogger::Log("\r\nDYNTEST_BEGIN\r\n");
+        Process* dp = ElfLoader::LoadELF64FromVFS("/usr/bin/dyntest", "dyntest");
+        if (!dp) {
+            SerialLogger::Log("DYNTEST_END rc=load_failed\r\n");
+        } else {
+            LinuxSyscall::ClearConsoleOutput();
+            const char* av[] = { "dyntest", nullptr };
+            const char* ev[] = { nullptr };
+            int rc = Userspace::RunProcessWithArgs(dp, av, ev);
+            char buf[512]; int n;
+            while ((n = LinuxSyscall::ReadConsoleOutput(buf, (int)sizeof(buf) - 1)) > 0) {
+                buf[n] = 0; SerialLogger::Log(buf);
+            }
+            SerialLogger::Log("\r\nDYNTEST_END rc=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
     SerialLogger::Log("[Installer] Init...\r\n");
     Installer::Init();
     Installer::RegisterShellCommands(&shell_instance);
@@ -2233,6 +2315,47 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             if (*ctor) (*ctor)();
         }
     }
+    // logging self-check (gated by cmdline kurono.logcheck): read back the core
+    // log files from /kurono/var/log and dump their sizes + a sample to serial so
+    // a headless boot can confirm the logging subsystem actually captured boot /
+    // system / network / security events to disk. (satoru)
+    if (boot_logcheck) {
+        SerialLogger::Log("LOGCHECK_BEGIN\r\n");
+        static const char* logpaths[] = {
+            "/kurono/var/log/boot.log",
+            "/kurono/var/log/system.log",
+            "/kurono/var/log/network.log",
+            "/kurono/var/log/security.log",
+            "/kurono/var/log/crash/crash.log",
+            nullptr
+        };
+        static char lbuf[4096];
+        for (int i = 0; logpaths[i]; i++) {
+            int n = KVFS::ReadFile(logpaths[i], lbuf, (uint32_t)sizeof(lbuf) - 1);
+            SerialLogger::Log("  ");
+            SerialLogger::Log(logpaths[i]);
+            SerialLogger::Log(" bytes=");
+            SerialLogger::LogDec(n > 0 ? n : 0);
+            SerialLogger::Log("\r\n");
+            if (n > 0) {
+                lbuf[n] = 0;
+                int lines = 0, p = 0;
+                while (lbuf[p] && lines < 3) {     // sample the first 3 lines (satoru)
+                    int s = p;
+                    while (lbuf[p] && lbuf[p] != '\n') p++;
+                    char save = lbuf[p]; lbuf[p] = 0;
+                    SerialLogger::Log("    | ");
+                    SerialLogger::Log(lbuf + s);
+                    SerialLogger::Log("\r\n");
+                    lbuf[p] = save;
+                    if (lbuf[p]) p++;
+                    lines++;
+                }
+            }
+        }
+        SerialLogger::Log("LOGCHECK_END\r\n");
+    }
+
     AudioDMA::Init();
     AudioServer::Init();
 

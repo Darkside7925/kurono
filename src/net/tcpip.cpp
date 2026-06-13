@@ -770,6 +770,7 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->tx_pending = false;
                 sock->active = false;
                 slog("[TCP] got RST in ESTABLISHED -> CLOSED\r\n");
+                RuntimeLog::LogNetwork("tcp connection reset", "peer RST in established");
             } else {
                 // any segment from the peer is proof the link is alive: reset
                 // the keepalive idle timer and clear pending probes (satoru)
@@ -809,6 +810,7 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                             sock->tcp_ack = fin_seq + 1u;
                         sock->tcp_state = TCP_CLOSE_WAIT;
                         ack_needed = true;
+                        RuntimeLog::LogNetwork("tcp connection closed", "peer FIN (graceful)");
                     }
                 }
                 if (ack_needed) {

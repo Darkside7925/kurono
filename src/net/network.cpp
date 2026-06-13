@@ -101,6 +101,8 @@ void Network::Init() {
         eth.dns = MakeIP(10, 0, 2, 3);
         eth.state = E1000::IsLinkUp() ? NIC_UP : NIC_DOWN;
         SerialLogger::Log("Network: eth0 backed by real E1000 NIC\r\n");
+        RuntimeLog::LogNetwork(eth.state == NIC_UP ? "link up" : "link down",
+                               "eth0 (e1000)");
     } else {
         // keep a default config for diagnostics, but do not advertise carrier
         // unless a real NIC exists. Linux keeps carrier state separate from

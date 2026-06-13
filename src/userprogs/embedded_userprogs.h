@@ -23,6 +23,15 @@ extern "C" {
     // pthreads smoke-test blob (satoru)
     extern const uint8_t _binary_pthread_test_elf_start[]  __attribute__((weak));
     extern const uint8_t _binary_pthread_test_elf_end[]    __attribute__((weak));
+    // dynamic musl pie blob  -  first ld-kurono dynamic-load test (satoru)
+    extern const uint8_t _binary_dyntest_elf_start[]       __attribute__((weak));
+    extern const uint8_t _binary_dyntest_elf_end[]         __attribute__((weak));
+    // musl libc.so blob  -  satisfies the pie's DT_NEEDED (satoru)
+    extern const uint8_t _binary_musl_libc_so_start[]      __attribute__((weak));
+    extern const uint8_t _binary_musl_libc_so_end[]        __attribute__((weak));
+    // libfoo.so blob  -  the dyntest pie's extra dependency (satoru)
+    extern const uint8_t _binary_libfoo_so_start[]         __attribute__((weak));
+    extern const uint8_t _binary_libfoo_so_end[]           __attribute__((weak));
 }
 
 namespace EmbeddedUserprogs {
@@ -114,6 +123,42 @@ inline const uint8_t* PthreadTestData() { return _binary_pthread_test_elf_start;
 inline uint32_t PthreadTestSize() {
     return (uint32_t)((uintptr_t)_binary_pthread_test_elf_end -
                       (uintptr_t)_binary_pthread_test_elf_start);
+}
+
+// dynamic musl pie accessors (satoru)
+inline bool HasDyntest() {
+    return _binary_dyntest_elf_start != nullptr &&
+           _binary_dyntest_elf_end   != nullptr &&
+           +_binary_dyntest_elf_end > +_binary_dyntest_elf_start;
+}
+inline const uint8_t* DyntestData() { return _binary_dyntest_elf_start; }
+inline uint32_t DyntestSize() {
+    return (uint32_t)((uintptr_t)_binary_dyntest_elf_end -
+                      (uintptr_t)_binary_dyntest_elf_start);
+}
+
+// musl libc.so accessors (satoru)
+inline bool HasMuslLibc() {
+    return _binary_musl_libc_so_start != nullptr &&
+           _binary_musl_libc_so_end   != nullptr &&
+           +_binary_musl_libc_so_end > +_binary_musl_libc_so_start;
+}
+inline const uint8_t* MuslLibcData() { return _binary_musl_libc_so_start; }
+inline uint32_t MuslLibcSize() {
+    return (uint32_t)((uintptr_t)_binary_musl_libc_so_end -
+                      (uintptr_t)_binary_musl_libc_so_start);
+}
+
+// libfoo.so accessors (satoru)
+inline bool HasLibfoo() {
+    return _binary_libfoo_so_start != nullptr &&
+           _binary_libfoo_so_end   != nullptr &&
+           +_binary_libfoo_so_end > +_binary_libfoo_so_start;
+}
+inline const uint8_t* LibfooData() { return _binary_libfoo_so_start; }
+inline uint32_t LibfooSize() {
+    return (uint32_t)((uintptr_t)_binary_libfoo_so_end -
+                      (uintptr_t)_binary_libfoo_so_start);
 }
 
 } // namespace EmbeddedUserprogs

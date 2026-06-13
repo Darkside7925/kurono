@@ -25,7 +25,8 @@ struct UserspaceCpuState {
     UserspaceReturnContext return_context;
 };
 
-extern "C" int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext* ctx);
+extern "C" int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext* ctx,
+                              uint64_t fs_base);
 extern "C" void UserspaceResume(UserspaceReturnContext* ctx, int exit_code);
 
 class Userspace {

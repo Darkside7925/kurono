@@ -177,6 +177,9 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
             proc->rsp = rsp;
             proc->user_frame.rip = entry;
             proc->user_frame.rsp = rsp;
+            // ld-kurono already built the sysv stack (argv/envp/auxv) at rsp;
+            // tell the runner to enter at rsp as-is, not rebuild it. (satoru)
+            proc->flags |= PROCESS_FLAG_STACK_READY;
             log("[ELF] dynamic exec ready via ld-kurono\r\n");
             return proc;
         }
