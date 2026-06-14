@@ -204,6 +204,46 @@ int KJTest::RunAll(){
         if (ok) pass++;
     }
 
+    // ── live-accent transition test: a script eases the "window" rule's accent
+    // (the value wm_get_accent reads), proving the kj path drives the REAL on-
+    // screen accent. we set a target, advance the clock partway, and confirm the
+    // live accent is between the old and new values (mid-transition), then settle
+    // it and confirm it reaches the target. (satoru)
+    total += 1;
+    {
+        out[0]=0;
+        // seed a known starting accent on the window rule, settled (no transition). (satoru)
+        int wr = KSS::Sheet::FindRule("window");
+        if (wr < 0) wr = KSS::Sheet::DefineRule("window");
+        KSS::Sheet::SetColor(wr, KSS::Sheet::P_ACCENT, 0xFF000000u);
+        KSS::Anim::Tick(KSS::Anim::Now() + 1);
+        uint32_t t0 = KSS::Anim::Now();
+        const char* src =
+            "kss.transition('window','accent', 400, 'outcubic');\n"
+            "kss.set('window','accent', 4294967295);\n"   // 0xFFFFFFFF target (satoru)
+            "console.log('accent set');\n";
+        KJ::Execute(src, out, 8192);
+        // partway through: the live accent must be strictly between start+target. (satoru)
+        KSS::Anim::Tick(t0 + 200);
+        uint32_t mid = KSS::Sheet::LiveAccent();
+        uint32_t mid_r = (mid >> 16) & 0xFF;
+        bool easing = (mid_r > 0x05 && mid_r < 0xFA);
+        // settle it and confirm it reaches the target. (satoru)
+        KSS::Anim::Tick(t0 + 500);
+        uint32_t fin = KSS::Sheet::LiveAccent();
+        bool ok = easing && (fin == 0xFFFFFFFFu) && tcontains(out, "accent set");
+        SerialLogger::Log("KJ-TEST: kss_live_accent");
+        SerialLogger::Log(ok? " PASS\r\n" : " FAIL\r\n");
+        if (!ok){
+            SerialLogger::Log("KJ-TEST:   mid="); SerialLogger::LogHex(mid);
+            SerialLogger::Log(" fin="); SerialLogger::LogHex(fin); SerialLogger::Log("\r\n");
+        }
+        if (ok) pass++;
+        // leave the accent settled at white briefly, then restore to the theme so
+        // the test doesn't recolor a real desktop. (satoru)
+        KSS::Sheet::SetColor(wr, KSS::Sheet::P_ACCENT, KSS::T().accent);
+    }
+
     SerialLogger::Log("KJ-TEST: SUMMARY ");
     SerialLogger::LogDec(pass);
     SerialLogger::Log("/");

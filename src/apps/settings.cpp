@@ -28,6 +28,9 @@
 #include "media_player.h"
 #include "browser.h"
 #include "file_manager.h"
+#include "../drivers/timer.h"     // Timer::GetRealMs for tab/modal transitions (satoru)
+#include "../ui/kss.h"            // shared motion tokens (satoru)
+#include "../ui/ui_elements.h"    // Animation easing helpers (satoru)
 
 static const unsigned int S_BG       = 0xFF1A1A2E;
 static const unsigned int S_SIDEBAR  = 0xFF16213E;
@@ -180,6 +183,8 @@ static void draw_info_card(int x,int y,int w,int h,const char* title,const char*
 
 SettingsTab SettingsApp::current_tab  = STAB_DISPLAY;
 int         SettingsApp::scroll_offset = 0;
+uint32_t    SettingsApp::tab_switch_ms = 0;
+uint32_t    SettingsApp::wifi_dialog_ms = 0;
 SettingsState SettingsApp::state = {
     /* brightness */ 75, /* cursor_blink */ true, /* dark_mode */ true,
     /* animations */ true, /* font_scale */ 1, /* wallpaper_idx */ 0,
@@ -426,12 +431,17 @@ void SettingsApp::RenderSidebar(int x,int y,int w,int h){
         "Updates", "System", "About", "Accessibility"
     };
 
+    // the selection highlight slides between tabs instead of snapping: its y eases
+    // toward the active tab's row through the kss anim engine, keyed by the
+    // settings sidebar address so it keeps state across frames. (satoru)
+    float sel_y = KSS::Anim::Float((uint32_t)0x5E771000u,
+                                   (float)(y + (int)current_tab * 32 + 6),
+                                   KSS::Motion::Window, KSS::Motion::Std);
+    int isel = (int)(sel_y + 0.5f);
+    Graphics::FillRect(x, isel, SIDEBAR_W-1, 28, S_TAB_SEL);
+    Graphics::FillRect(x, isel, 3, 28, S_HEADING);
     for(int i=0;i<STAB_COUNT;i++){
         int ty = y + i * 32 + 6;
-        if(i==(int)current_tab){
-            Graphics::FillRect(x, ty, SIDEBAR_W-1, 28, S_TAB_SEL);
-            Graphics::FillRect(x, ty, 3, 28, S_HEADING);
-        }
         Graphics::DrawString(x+16, ty+6, tabs[i], S_TAB_TXT, 0xFF000000);
     }
 }
@@ -923,7 +933,15 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     // scroll_offset so tall panels can be mouse-wheel scrolled. the sidebar is
     // outside the clip so it never scrolls. (satoru)
     Graphics::PushClipRect(px, cy, pw, ch);
-    int sy = cy - scroll_offset;
+    // tab-switch transition: the freshly-selected panel rises a few px and fades
+    // in over Motion::Window. driven off elapsed ms (frame-rate independent), eased
+    // ease-out-cubic to match the rest of the desktop. (satoru)
+    uint32_t tsw = Timer::GetRealMs() - tab_switch_ms;
+    float tab_t = (tab_switch_ms == 0 || tsw >= KSS::Motion::Window)
+                      ? 1.0f
+                      : Animation::EaseMs(tsw, KSS::Motion::Window, Animation::EaseOutCubic);
+    int rise = (int)((1.0f - tab_t) * 14.0f + 0.5f);
+    int sy = cy - scroll_offset + rise;
     switch(current_tab){
         case STAB_DISPLAY:     RenderDisplay(px,sy,pw,ch); break;
         case STAB_SOUND:       RenderSound(px,sy,pw,ch); break;
@@ -939,16 +957,40 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
         case STAB_ACCESSIBILITY: RenderAccessibility(px,sy,pw,ch); break;
         default: break;
     }
+    // fade the panel in over the rise so the switch crossfades cleanly. (satoru)
+    if (tab_t < 1.0f) {
+        uint8_t dim = (uint8_t)((1.0f - tab_t) * 200.0f);
+        if (dim > 0) Graphics::FillRectAlpha(px, cy, pw, ch, dim, S_BG);
+        Graphics::MarkUIDirty();   // keep rendering until the transition settles (satoru)
+    }
     Graphics::PopClipRect();
 
     // ── modal: WiFi connect dialog ──
     if (wifi_dialog_open) {
+        // backdrop fade + content scale-in over Motion::Window. the backdrop dim
+        // ramps to 160 and the dialog grows 88% -> 100% from its center. (satoru)
+        uint32_t mdt = Timer::GetRealMs() - wifi_dialog_ms;
+        float mt = (wifi_dialog_ms == 0 || mdt >= KSS::Motion::Window)
+                       ? 1.0f
+                       : Animation::EaseMs(mdt, KSS::Motion::Window, Animation::EaseOutCubic);
         int dw = 360, dh = 180;
-        int dx = cx + (cw - dw) / 2;
-        int dy = cy + (ch - dh) / 2;
-        Graphics::FillRectAlpha(cx, cy, cw, ch, 160, 0xFF000000);
-        Graphics::FillRoundedRect(dx, dy, dw, dh, 10, 0xFF1B1B2E);
-        Graphics::DrawRect(dx, dy, dw, dh, S_HEADING);
+        // scale the dialog from its center as it appears. (satoru)
+        float sc = 0.88f + 0.12f * mt;
+        int sdw = (int)(dw * sc + 0.5f), sdh = (int)(dh * sc + 0.5f);
+        int dx = cx + (cw - sdw) / 2;
+        int dy = cy + (ch - sdh) / 2;
+        Graphics::FillRectAlpha(cx, cy, cw, ch, (uint8_t)(160.0f * mt), 0xFF000000);
+        Graphics::FillRoundedRect(dx, dy, sdw, sdh, 10, 0xFF1B1B2E);
+        Graphics::DrawRect(dx, dy, sdw, sdh, S_HEADING);
+        if (mt < 1.0f) {
+            // hold the static layout until the grow settles; only the frame is
+            // animated so the text doesn't jitter mid-scale. keep rendering. (satoru)
+            uint8_t cdim = (uint8_t)((1.0f - mt) * 220.0f);
+            Graphics::FillRectAlpha(dx, dy, sdw, sdh, cdim, 0xFF1B1B2E);
+            Graphics::MarkUIDirty();
+            return;
+        }
+        dw = sdw; dh = sdh;
         Graphics::DrawString(dx + 16, dy + 14, "Connect to network", S_HEADING, 0xFF000000);
         Graphics::DrawString(dx + 16, dy + 44, "SSID:", S_TEXT, 0xFF000000);
         Graphics::DrawString(dx + 80, dy + 44, wifi_dialog_ssid, S_WHITE, 0xFF000000);
@@ -1034,7 +1076,11 @@ bool SettingsApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     if(mx >= 0 && mx < SIDEBAR_W){
         int tab = (my - 6) / 32;
         if(tab>=0 && tab<STAB_COUNT){
-            if((SettingsTab)tab != current_tab) scroll_offset = 0; // reset scroll per tab (satoru)
+            if((SettingsTab)tab != current_tab) {
+                scroll_offset = 0;                 // reset scroll per tab (satoru)
+                tab_switch_ms = Timer::GetRealMs(); // kick the crossfade+rise (satoru)
+                Graphics::MarkUIDirty();
+            }
             current_tab=(SettingsTab)tab;
             return true;
         }
@@ -1811,6 +1857,7 @@ bool SettingsApp::HandleNetworkInput(int rx, int ry, int pw, int ph) {
                     wifi_dialog_pass[0] = 0;
                     wifi_dialog_pass_len = 0;
                     wifi_dialog_open = true;
+                    wifi_dialog_ms = Timer::GetRealMs();   // modal scale-in (satoru)
                 }
             }
             return true;
@@ -1834,6 +1881,7 @@ bool SettingsApp::HandleNetworkInput(int rx, int ry, int pw, int ph) {
                 wifi_dialog_pass[0] = 0;
                 wifi_dialog_pass_len = 0;
                 wifi_dialog_open = true;
+                wifi_dialog_ms = Timer::GetRealMs();   // modal scale-in (satoru)
                 return true;
             }
         }

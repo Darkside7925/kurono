@@ -78,6 +78,14 @@ struct Window {
     unsigned char alpha;            // 0..255
     short anchor_x, anchor_y;       // taskbar target for minimize anim
 
+    // titlebar traffic-light hover/press: which button the pointer is over
+    // (0=close,1=min,2=max, -1=none) and the ms timestamp of the last press so
+    // the render path can ease a hover-grow + press-dip through KSS::Anim. the
+    // colour/scale tweens themselves live in the anim engine keyed by window id,
+    // so these two fields are all the per-window state needed. (satoru)
+    signed char tb_hover_btn;
+    unsigned int tb_press_ms;
+
     // last-rendered geometry: used to damage the previous footprint
     // when the window moves/resizes/closes so the compositor below
     // can repaint just what changed.
@@ -164,6 +172,9 @@ public:
     static void HandleMouseUp(int mx, int my);
     static void HandlePointerMove(int mx, int my);
     static void HandlePointerButton(int mx, int my, int button, bool pressed);
+    // refresh which titlebar traffic-light button the pointer is over so the
+    // render path can ease its hover/press. (satoru)
+    static void UpdateTitlebarHover(int mx, int my);
     static void RenderAll();
 
     // query drag state for render optimization (skip shadows during drag)

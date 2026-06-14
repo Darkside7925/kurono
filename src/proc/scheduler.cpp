@@ -42,7 +42,15 @@ namespace {
 constexpr uint64_t USER_STACK_BYTES = 8 * 1024 * 1024;
 constexpr uint64_t KERNEL_STACK_BYTES = 16 * 1024;
 constexpr uint64_t USER_STACK_TOP = USERSPACE_BASE + 0x00200000ULL;
-constexpr uint64_t USER_MMAP_BASE = 0x20000000ULL;
+// user mmap arena base. MUST sit above all identity-mapped physical ram: the
+// kernel accesses every physical frame through the low identity map (phys==virt),
+// so a user mapping whose VA aliases a physical frame the kernel later
+// identity-touches (pmm zero-on-alloc, page-table walks, the framebuffer)
+// clobbers that frame's identity leaf in the process's private page tables and
+// #pf's the kernel. the old 0x20000000 (512mb) base aliased real ram; firefox's
+// mmap-heavy musl mallocng hit it. park it at 16tb  -  above ram, below ld-kurono's
+// 64tb aslr region. (satoru)
+constexpr uint64_t USER_MMAP_BASE = 0x0000100000000000ULL;
 
 // Lightweight IRQ-disable RAII guard for short scheduler critical sections.
 // Cheaper than the global spinlocks and safe to nest (each guard snapshots
@@ -82,10 +90,23 @@ static bool alloc_kernel_stack(Process* proc) {
     return true;
 }
 
+// count of currently-live (allocated, not yet reaped) Process objects. the
+// creation cap gates on THIS, not the monotonic next_pid  -  next_pid is a unique
+// id source that only ever increases, so capping on it wedged the system after
+// ~32 TOTAL creations across the whole boot (firefox alone churns far more
+// threads than that). gating on the live count lets thread create/exit cycles
+// reuse capacity, which firefox 140 (heavily multithreaded) needs. (satoru)
+static uint32_t g_live_proc_count = 0;
+// ceiling on simultaneously-live tasks. kept at/below the linux process table
+// size (LINUX_MAX_PROCS=64) since every schedulable user task pairs with a
+// LinuxProcess slot. (satoru)
+static constexpr uint32_t MAX_LIVE_PROCS = 64;
+
 static void init_process_common(Process* proc, const char* name, uint32_t priority) {
     memset(proc, 0, sizeof(Process));
     proc->pid = Scheduler::next_pid++;
     proc->parent_pid = 0;
+    g_live_proc_count++;
 
     int i = 0;
     while (name[i] && i < 31) {
@@ -276,7 +297,7 @@ void Scheduler::Init() {
 
 Process* Scheduler::CreateProcess(const char* name, void (*entry_point)(), uint32_t priority) {
     (void)entry_point;
-    if (next_pid >= 32) return nullptr; // max processes cap for now
+    if (g_live_proc_count >= MAX_LIVE_PROCS) return nullptr; // live-task cap (satoru)
     Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
     if (!proc) return nullptr;
 
@@ -296,7 +317,7 @@ Process* Scheduler::CreateProcess(const char* name, void (*entry_point)(), uint3
 }
 
 Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, uint32_t priority) {
-    if (next_pid >= 32) return nullptr;
+    if (g_live_proc_count >= MAX_LIVE_PROCS) return nullptr;  // live-task cap (satoru)
 
     Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
     if (!proc) return nullptr;
@@ -356,7 +377,8 @@ Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, ui
 }
 
 Process* Scheduler::CloneUserProcess(Process* parent) {
-    if (!parent || !parent->is_user() || !parent->has_user_frame || next_pid >= 32) {
+    if (!parent || !parent->is_user() || !parent->has_user_frame ||
+        g_live_proc_count >= MAX_LIVE_PROCS) {
         return nullptr;
     }
 
@@ -418,7 +440,8 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
 // DestroyProcess from tearing the address space down on thread exit. (satoru)
 Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
                                      uint64_t tls_base, bool set_tls) {
-    if (!parent || !parent->is_user() || !parent->has_user_frame || next_pid >= 32) {
+    if (!parent || !parent->is_user() || !parent->has_user_frame ||
+        g_live_proc_count >= MAX_LIVE_PROCS) {
         return nullptr;
     }
     if (!child_stack) return nullptr;
@@ -501,6 +524,19 @@ bool Scheduler::WaitForProcess(Process* proc, int* exit_code) {
     if (!proc || proc->state != Process_Terminated) return false;
     if (exit_code) *exit_code = proc->exit_code;
     return true;
+}
+
+// raw current-task pointer for the syscall asm stub. the SYSCALL fast path
+// fxsaves the user's pristine fpu/sse state on entry and must fxrstor it before
+// returning to ring-3  -  otherwise kernel code that touches xmm (memcpy/graphics
+// inline asm) leaves the user's xmm registers clobbered, which corrupted musl's
+// __init_tp movups store of the main thread's tcb next/prev links and #pf'd the
+// first pthread_create. but when the handler SWITCHED tasks (clone/futex/exit),
+// LoadUserFrame already loaded the next task's fpu, so the stub must skip its
+// restore. the stub compares this pointer before/after the handler to tell the
+// two apart. (satoru)
+extern "C" void* sched_current_task_raw() {
+    return (void*)Scheduler::GetCurrentProcess();
 }
 
 void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame) {
@@ -721,6 +757,7 @@ void Scheduler::DestroyProcess(Process* proc) {
 
     proc->reaped = 1;
     proc->state  = Process_Terminated;
+    if (g_live_proc_count > 0) g_live_proc_count--;   // free a live-task slot (satoru)
     KernelHeap::Free(proc);
 }
 

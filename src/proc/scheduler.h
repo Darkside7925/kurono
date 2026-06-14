@@ -144,6 +144,12 @@ struct Process {
     uint32_t ns_ipc;            // ipc namespace id
     uint32_t ns_cgroup;         // cgroup namespace id
 
+    // real on-disk path of the executed image, recorded at exec time so
+    // /proc/self/exe (readlink + open) resolves to the actual install path
+    // (e.g. /apps/firefox/firefox) instead of a synthesized /system/bin/<name>.
+    // gecko 140 anchors its app directory off this; empty = unknown. (satoru)
+    char     exe_path[256];
+
     // elf program-header info for the sysv auxv (musl uses at_phdr to locate
     // pt_tls / pt_gnu_relro). zero for non-elf / kernel processes. (satoru)
     uint64_t user_phdr_va;      // user va of the program headers (0 if unknown)

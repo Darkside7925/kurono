@@ -1757,6 +1757,17 @@ bool ExecPIE(Process* proc,
     if (!pls) return false;
     pls->secure = (uid == 0 || gid == 0) && (uid != 0 || gid != 0);
 
+    // record the real exec path on the task so /proc/self/exe (readlink + open)
+    // resolves to the actual install path (e.g. /apps/firefox/firefox), which is
+    // what anchors gecko's app directory. empty if path is null. (satoru)
+    if (proc && path) {
+        int i = 0;
+        while (path[i] && i < (int)sizeof(proc->exe_path) - 1) {
+            proc->exe_path[i] = path[i]; i++;
+        }
+        proc->exe_path[i] = 0;
+    }
+
     // Parse env for LD_LIBRARY_PATH / LD_PRELOAD / LD_DEBUG.
     const char* ld_lib = nullptr;
     const char* ld_pre = nullptr;

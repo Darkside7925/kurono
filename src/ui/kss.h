@@ -108,6 +108,31 @@ namespace Anim {
     uint32_t Now();
 }
 
+// ── motion tokens ────────────────────────────────────────────────────────────
+// ONE source of truth for the desktop's animation feel: a tiny standard set of
+// durations + easings every surface shares so windows, taskbar, menus, dialogs
+// and widgets all move with the same rhythm. all values are milliseconds and
+// drive the ms-based Anim engine, so motion is frame-rate-independent (looks the
+// same at 14fps and 60fps). use Motion::Micro for hover/press feedback,
+// Motion::Window for windows/panels/menus, Motion::Slow for big surfaces. the
+// default easing for ui reveals is OutCubic; spring is reserved for tap/bounce
+// feedback. (satoru)
+namespace Motion {
+    static const uint32_t Micro  = 140;   // hover / press / focus micro-interactions
+    static const uint32_t Window = 220;   // windows, panels, menus, dropdowns
+    static const uint32_t Slow   = 280;   // dialogs/modals, large surface reveals
+    static const Anim::Ease Std    = Anim::OutCubic;    // standard reveal/ease-out
+    static const Anim::Ease Panel  = Anim::InOutQuint;  // panel slide accel+decel
+    static const Anim::Ease Bounce = Anim::Spring;      // tap/launch bounce feedback
+
+    // a stable Anim id from a base + small index. callers pass a per-surface base
+    // (e.g. a window id, a widget address) so each animated thing keeps its own
+    // tween state across frames without a heap table of its own. (satoru)
+    static inline uint32_t Id(uint32_t base, uint32_t idx) {
+        return (base * 0x9E3779B1u) ^ (idx + 0x85u);
+    }
+}
+
 // ── stylesheet layer (the "kss" in kurono style sheet) ──────────────────────
 // a real, scriptable styling layer on top of the theme tokens: named style
 // rules (selectors) each carry a property bag (colors + metrics), per-property
@@ -144,6 +169,18 @@ namespace Sheet {
     };
 
     void Init();   // seed the builtin rules from the active Theme. call after KSS::Init(). (satoru)
+
+    // ── live accent (scriptable, eased) ──────────────────────────────────────
+    // the desktop chrome (window borders/titlebar accent, focus rings) reads its
+    // accent through here instead of straight from the theme, so a kj script doing
+    //   kss.transition("window","accent",ms); kss.set("window","accent",color)
+    // eases the REAL on-screen accent live. resolves the "window" rule's P_ACCENT
+    // through any in-flight transition; falls back to the theme accent before Init.
+    // cheap: one rule resolve, no allocation. (satoru)
+    uint32_t LiveAccent();
+    // point the live accent at a new color over dur_ms (sets up the transition the
+    // first time, then retargets). host-side convenience mirroring the kj path. (satoru)
+    void     SetAccent(uint32_t argb, uint32_t dur_ms);
 
     // ── named style rules (selectors) ────────────────────────────────────────
     // register / fetch a rule by selector string (e.g. "button", "button:hover",

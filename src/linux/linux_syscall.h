@@ -435,6 +435,11 @@ public:
     static int32_t sys_fstatat64(int dirfd, uintptr_t pathname,
                                  uintptr_t statbuf, int flags);
 
+    // readv (x86_64 nr 19)  -  the read counterpart of writev. there is no i386
+    // dispatch entry for it, so the SYSCALL fast path (linux_syscall_x64.cpp)
+    // calls this directly; public for the same reason sys_mmap is. (satoru)
+    static int32_t sys_readv(int fd, uintptr_t iov, uint64_t iovcnt);
+
     // stats
     static int  ActiveProcessCount();
 

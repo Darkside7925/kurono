@@ -24,4 +24,10 @@ namespace KernelProcesses {
     // on-screen modal and synthetic input can drive the verdict. want_cred
     // selects the credential-collecting variant (auth=kvault-only). (satoru)
     void ArmKsaPromptDemo(bool want_cred);
+
+    // arm a one-shot kj-scripted animation demo (kurono.kjdemo boot gate). once
+    // the desktop is up the GUI process runs the shipped accent-animation .kj
+    // script once, so a real on-screen animation is driven through the kj host
+    // bindings (kss.transition/kss.set/ui.notify). (satoru)
+    void ArmKjDemo();
 }

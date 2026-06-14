@@ -364,6 +364,30 @@ void Init() {
     int rb = FindRule("button");
     if (rb >= 0) { SetTransition(rb, P_BG, 140, Anim::OutCubic);
                    SetTransition(rb, P_FG, 140, Anim::OutCubic); }
+    // give the window rule's accent a default transition so a script (or
+    // SetAccent) that retargets the live accent eases it instead of snapping. a
+    // 0ms first set still seeds without a visible jump. (satoru)
+    int rw = FindRule("window");
+    if (rw >= 0) SetTransition(rw, P_ACCENT, 220, Anim::OutCubic);
+}
+
+uint32_t LiveAccent() {
+    if (!g_init) return T().accent;
+    int rw = FindRule("window");
+    if (rw < 0) return T().accent;
+    // resolving the rule reads the live eased value if a transition is in flight,
+    // else the settled base color. (satoru)
+    Style s; Resolve(rw, s);
+    uint32_t a = s.color[P_ACCENT];
+    return a ? a : T().accent;
+}
+
+void SetAccent(uint32_t argb, uint32_t dur_ms) {
+    if (!g_init) return;
+    int rw = FindRule("window");
+    if (rw < 0) return;
+    SetTransition(rw, P_ACCENT, dur_ms, Anim::OutCubic);
+    SetColor(rw, P_ACCENT, argb);
 }
 
 int DefineRule(const char* selector) {

@@ -1,5 +1,6 @@
 #pragma once
 //  kurono os  -  settings application (advanced)
+#include "../kernel/types.h"   // uint32_t for the transition timestamps (satoru)
 
 enum SettingsTab {
     STAB_DISPLAY      = 0,
@@ -99,6 +100,8 @@ public:
 private:
     static SettingsTab current_tab;
     static int scroll_offset;
+    static uint32_t tab_switch_ms;   // ms the active tab last changed; drives the crossfade+rise (satoru)
+    static uint32_t wifi_dialog_ms;  // ms the wifi modal opened; drives backdrop fade + content scale-in (satoru)
 
     static void RenderSidebar(int x, int y, int w, int h);
     static void RenderDisplay(int x, int y, int w, int h);

@@ -991,6 +991,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // kj language self-test: run the kj (kurono javascript) suite + kss-binding
     // checks headless at boot. gated by kurono.kjtest. (satoru)
     bool boot_kj_test = false;
+    // kj-scripted animation demo: once the desktop is up, run the shipped
+    // accent-animation .kj script so a real on-screen animation is driven through
+    // the kj host bindings. gated by kurono.kjdemo. (satoru)
+    bool boot_kj_demo = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     // setup mode: run the graphical installer / first-setup wizard instead of
@@ -1052,6 +1056,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // latch the kj self-test flag. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kjtest=1") || boot_has_token(boot_cmdline, "kurono.kjtest")) {
             boot_kj_test = true;
+        }
+        // latch the kj-scripted animation demo flag. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kjdemo=1") || boot_has_token(boot_cmdline, "kurono.kjdemo")) {
+            boot_kj_demo = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -2029,6 +2037,25 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::Log(" bytes)\r\n");
     }
     {
+        // ship a kj-scripted animation example: a script that eases the desktop
+        // accent via the kss host bindings, then toasts. runnable from the shell
+        // (`kj /kurono/scripts/accent_anim.kj`) and by the kurono.kjdemo boot hook.
+        // the "window" rule's accent feeds the live window borders/titlebar, so
+        // running this animates the real on-screen accent. (satoru)
+        KVFS::Mkdirs("/kurono/scripts");
+        const char* accent_kj =
+            "// accent_anim.kj  -  drive a real on-screen animation from kj. (satoru)\n"
+            "// ease the live desktop accent (window borders + titlebar) to a warm\n"
+            "// red over 600ms, then post a toast. re-run to ease it back.\n"
+            "kss.transition('window', 'accent', 600, 'outcubic');\n"
+            "kss.set('window', 'accent', 4292032130);   // 0xFFE74C42\n"
+            "ui.notify('KJ animation', 'accent eased by a kj script');\n"
+            "console.log('accent_anim: transition fired');\n";
+        uint32_t akj_len = 0; while (accent_kj[akj_len]) ++akj_len;
+        KVFS::WriteFile("/kurono/scripts/accent_anim.kj", (const uint8_t*)accent_kj, akj_len);
+        SerialLogger::Log("[KJ] /kurono/scripts/accent_anim.kj shipped\r\n");
+    }
+    {
         auto cmd_runelf = +[](KuronoShell* sh, int argc, const char** argv,
                               char* out, int maxo) -> int {
             (void)sh;
@@ -2867,6 +2894,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_ksa_prompt) {
         SerialLogger::Log("[KSA] interactive prompt demo armed (kurono.ksa.prompt)\r\n");
         KernelProcesses::ArmKsaPromptDemo(boot_ksa_prompt_cred);
+    }
+
+    // arm the kj-scripted animation demo so the gui process runs the shipped
+    // accent-animation .kj once the desktop is up (kurono.kjdemo). (satoru)
+    if (boot_kj_demo) {
+        SerialLogger::Log("[KJ] scripted animation demo armed (kurono.kjdemo)\r\n");
+        KernelProcesses::ArmKjDemo();
     }
 
     // ── Preemptive multitasking switch-over ─────────────────────────────
