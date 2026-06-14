@@ -51,9 +51,13 @@ These are implemented for real, which is what makes the Wayland render path work
 - Up to 16 concurrent Linux processes, 64 file descriptors each.
 - A lazy `brk` heap and anonymous `mmap` regions, with recoverable user page
   faults and copy-on-write address-space cloning behind `fork`.
-- **ABI constraint:** the layer still uses a 32-bit-style pointer convention, so
-  user mappings and pointers currently need to remain **below 4 GB**. Lifting this
-  is one of the two open items for running Firefox on-device.
+- **Full 64-bit user address space.** The old sub-4 GB pointer-ABI cap is gone:
+  `mmap`/`brk` and PIE load bases run up to `USER_SPACE_TOP`
+  (`0x0000_7FFF_FFFF_FFFF`, the canonical user-half top), and the syscall ABI
+  widens user pointers/lengths/offsets to 64-bit so a high (multi-TB) mapping
+  round-trips intact. This is what lets Firefox's libxul load and relocate at a
+  multi-terabyte base. (The kernel still identity-maps low *physical* memory for
+  its own access  -  a physical-mapping detail, not a user-address limit.)
 
 ## 4. Path translation
 

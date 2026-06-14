@@ -27,11 +27,18 @@ freestanding engine:
   compositor that composites real `wl_shm` clients.
 - The launcher (`src/apps/firefox_launcher.cpp`) does a real `execve` of the
   rootfs Firefox binary through the Linux syscall/runtime layer.
+- **The Gecko engine loads and runs on-device.** [ld-kurono](../linux/LD_KURONO.md)
+  resolves libxul's full `.so` dependency closure and loads + relocates `libxul`
+  (130 MB+) at a multi-terabyte base; XPCOM and Gecko's own application code
+  execute, and Firefox's child processes spawn (via `clone3`). The syscall
+  layer's old sub-4 GB pointer-ABI cap is **lifted**  -  user mappings span the full
+  canonical 64-bit user range, so a high PIE base is no longer a blocker.
 
-**What's left to actually run it on-device** (the active frontier, *not* shipped):
-bringing libxul's full `.so` dependency closure onto the OS and loading it through
-[ld-kurono](../linux/LD_KURONO.md), and lifting the **<4 GB user-pointer ABI
-limit** in the syscall layer. The GUI tile stays a placeholder until then.
+**What's left to render a Firefox window** (the active frontier, *not* shipped):
+the **e10s multiprocess IPC** path between the parent and content processes, plus
+a **musl symbol/threading** issue still being chased down. This is no longer an
+address-space or ELF-loading limitation. The GUI tile stays a placeholder until
+the window renders.
 
 ## 3. The working HTTP path today
 
@@ -45,6 +52,6 @@ HTTP-only.
 
 - `src/apps/browser.cpp` / `.h`  -  the placeholder tile
 - `src/apps/firefox_launcher.cpp` / `.h`  -  the real Firefox `execve` launcher
-- `src/linux/ld_kurono.cpp`  -  the dynamic linker that will load libxul's closure
+- `src/linux/ld_kurono.cpp`  -  the dynamic linker that loads libxul's closure
 - `src/net/tcpip.cpp`  -  the TCP/IP stack behind `curl`
 - `src/ui/desktop.cpp`  -  `LaunchBrowser()` entry point
