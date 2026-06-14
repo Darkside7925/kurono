@@ -731,15 +731,26 @@ static Value eval_mul(Parser& p, Env& env) {
         bool any_float = (lhs.type == V_FLOAT) || (rhs.type == V_FLOAT);
         if (c == '*') {
             if (lhs.type == V_STR && rhs.type == V_INT) {
+                // compute the repeat count in 64-bit and reject overflow/oversize
+                // BEFORE allocating so the fill loop can never outrun the buffer (satoru)
                 long long n = rhs.i; if (n < 0) n = 0;
-                int total = (int)(lhs.slen * n);
-                char* buf = (char*)KernelHeap::Alloc((unsigned)(total + 1));
-                if (buf) {
-                    int o = 0;
-                    for (long long k = 0; k < n; k++) for (int j = 0; j < lhs.slen; j++) buf[o++] = lhs.s[j];
-                    buf[o] = 0;
-                    vset_str(out, buf, total);
-                    KernelHeap::Free(buf);
+                long long slen = (long long)lhs.slen; if (slen < 0) slen = 0;
+                long long total64 = slen * n;            // can't wrap: both <= 2^31 (satoru)
+                const long long REPEAT_CAP = 8 * 1024 * 1024; // a few MB sanity cap (satoru)
+                if (total64 > REPEAT_CAP) {
+                    perr(p, "string repeat too large");
+                } else {
+                    int total = (int)total64;
+                    char* buf = (char*)KernelHeap::Alloc((unsigned)(total + 1));
+                    if (buf) {
+                        int o = 0;
+                        // bound the loop by total so it never exceeds the alloc (satoru)
+                        for (long long k = 0; k < n && o < total; k++)
+                            for (int j = 0; j < lhs.slen && o < total; j++) buf[o++] = lhs.s[j];
+                        buf[o] = 0;
+                        vset_str(out, buf, total);
+                        KernelHeap::Free(buf);
+                    }
                 }
             } else if (any_float) { out.type = V_FLOAT; out.f = vnumf(lhs) * vnumf(rhs); }
             else { out.type = V_INT; out.i = vnumi(lhs) * vnumi(rhs); }

@@ -181,10 +181,16 @@ static bool map_page_in_root_ex(uint64_t root_phys, uint64_t virt_addr,
     if (pd[p2i] & PTE_HUGE) {
         uint64_t huge_base = pd[p2i] & ~0x1FFFFFULL;
         uint64_t huge_flags = pd[p2i] & 0xFFFULL;
-        if (phys_addr >= huge_base && phys_addr < huge_base + 0x200000ULL) {
-            return true;
-        }
-
+        // always demote the covering 2mb huge page to a 4kb pt  -  even when
+        // phys_addr already falls inside this huge page's range. previously we
+        // early-returned here, which silently discarded the caller's requested
+        // flags (pte_user / pte_nx / pte_pcd|pwt cache bits): every identity
+        // MapPage(p,p,flags) for p<512gb hits the boot supervisor-wb huge map
+        // and would have kept write-back/supervisor rather than the requested
+        // attrs (nvme/virtio-gpu mmio asked for pte_pcd but got write-back; user
+        // mappings over kernel identity pages stayed supervisor-only). demote so
+        // the leaf write below (pt[p1i] = phys|present|flags) lands the real
+        // bits. mirrors leaf_pte_demoting. (satoru)
         uint64_t new_pt_phys = alloc_table_page();
         if (!new_pt_phys) return false;
         uint64_t* new_pt = phys_to_virt(new_pt_phys);

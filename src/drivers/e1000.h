@@ -156,6 +156,9 @@ private:
     static void PciWrite(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value);
     static bool ScanPCI();
     
+    // reclaim completed tx descriptors (lazy, called from Send + Poll) (satoru)
+    static void ReclaimTx();
+
     // initialization steps
     static void ReadMAC();
     static void InitRX();

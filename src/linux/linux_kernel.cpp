@@ -224,8 +224,13 @@ int LinuxKernel::ProcIndex(const char* path) {
     if (last_slash < 0) return -1;
 
     char parent[64], name[64];
-    memcpy(parent, path, last_slash);
-    parent[last_slash] = 0;
+    // bound the parent copy to the buffer: last_slash can be the full path
+    // length, which would overflow parent[] (and the nul write). truncating an
+    // over-long parent prefix just makes it not match a registered entry. (satoru)
+    int plen = last_slash;
+    if (plen > (int)sizeof(parent) - 1) plen = (int)sizeof(parent) - 1;
+    memcpy(parent, path, plen);
+    parent[plen] = 0;
     if (parent[0] == 0) lk_scpy(parent, "/proc", sizeof(parent));
     lk_scpy(name, path + last_slash + 1, sizeof(name));
 
