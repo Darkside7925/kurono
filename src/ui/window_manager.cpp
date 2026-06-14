@@ -7,6 +7,8 @@
 #include "../drivers/mouse.h"   // cursor pos for fast-path damage (satoru)
 #include "../system/ui_config.h"
 #include "../kernel/pmm.h"   // drag-backdrop buffer alloc/free (satoru)
+#include "kss.h"             // motion tokens + live (scriptable) accent (satoru)
+#include "ui_elements.h"     // Animation::LerpColor for the traffic-light ease (satoru)
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define WM_LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -83,6 +85,7 @@ static bool wm_ctx_open   = false;
 static int  wm_ctx_win_id = -1;       // window the menu acts on
 static int  wm_ctx_x      = 0;        // top-left of the popup
 static int  wm_ctx_y      = 0;
+static unsigned int wm_ctx_open_ms = 0;   // drives the fade+unfold on open (satoru)
 #define WM_CTX_W        180
 #define WM_CTX_ITEM_H    24
 #define WM_CTX_ITEMS      1           // entries: 0 = "Move to other monitor"
@@ -192,9 +195,14 @@ static void wm_clamp_resize_bounds(Window* win) {
 
 // kurono ui color scheme  -  modern glassmorphism
 // Static fallbacks used when UIConfig is not yet available.
-// At render time, focused colours read theme.accent from UIConfig.
+// At render time, focused colours read the LIVE accent from the kss stylesheet
+// (the "window" rule's P_ACCENT), so a kj script doing kss.transition+kss.set on
+// "window"/"accent" eases the real window borders + titlebar accent on screen.
+// LiveAccent() falls back to the theme accent before Sheet::Init, which itself
+// seeds from theme.accent  -  so behaviour is unchanged until something animates
+// the accent. (satoru)
 static uint32_t wm_get_accent(){
-    return UIConfig::Color("theme.accent", 0xFF6C8CFF);
+    return KSS::Sheet::LiveAccent();
 }
 #define COL_TITLE_BG       0xFF1C1C2E  // frosted dark
 #define COL_TITLE_FOCUSED  0xFF22223A  // focused: base  -  overlaid with accent
@@ -293,6 +301,8 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->alpha            = (unsigned char)comp_default_alpha;
     win->anchor_x         = (short)(x + w / 2);
     win->anchor_y         = (short)(screen_height - 22);
+    win->tb_hover_btn     = -1;
+    win->tb_press_ms      = 0;
     win->last_x = x; win->last_y = y;
     win->last_w = w; win->last_h = h;
     win->had_last = false;
@@ -869,11 +879,13 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
                 int btn_start_x = win->x + 14;
                 const int btn_r2 = 8 * 8; // click radius squared
 
-                // close button
+                // close button. stamp the press time first so the traffic-light
+                // press-dip eases even on the frame the window starts closing. (satoru)
                 if (win->closable) {
                     int dx = mouse_x - btn_start_x;
                     int dy = mouse_y - btn_cy;
                     if (dx*dx + dy*dy <= btn_r2) {
+                        win->tb_press_ms = Timer::GetRealMs();
                         CloseWindow(top_id);
                         return;
                     }
@@ -884,6 +896,7 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
                     int dx = mouse_x - (btn_start_x + 22);
                     int dy = mouse_y - btn_cy;
                     if (dx*dx + dy*dy <= btn_r2) {
+                        win->tb_press_ms = Timer::GetRealMs();
                         Minimize(top_id);
                         return;
                     }
@@ -894,6 +907,7 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
                     int dx = mouse_x - (btn_start_x + 44);
                     int dy = mouse_y - btn_cy;
                     if (dx*dx + dy*dy <= btn_r2) {
+                        win->tb_press_ms = Timer::GetRealMs();
                         ToggleMaximize(top_id);
                         return;
                     }
@@ -979,21 +993,37 @@ void WindowManager::RenderTitlebar(Window* win) {
     const int btn_r = 6;
     int btn_start_x = wx + 14;
 
-    if (win->closable) {
-        Graphics::FillCircle(btn_start_x, btn_y, btn_r, COL_CLOSE_BTN);
-        if (focused) {
-            Graphics::DrawLine(btn_start_x - 2, btn_y - 2, btn_start_x + 2, btn_y + 2, 0xFF401010);
-            Graphics::DrawLine(btn_start_x + 2, btn_y - 2, btn_start_x - 2, btn_y + 2, 0xFF401010);
+    // ── traffic-light buttons with eased hover-grow + press-dip ──────────────
+    // each button's fill brightens toward white and its radius grows ~2px on
+    // hover, and dips ~1px for ~120ms after a press  -  all eased through the kss
+    // anim engine keyed by (window id, button index), so motion is shared with
+    // the rest of the desktop and costs only table-driven float lerps. (satoru)
+    {
+        const int cx[3] = { btn_start_x, btn_start_x + 22, btn_start_x + 44 };
+        const uint32_t base[3] = { COL_CLOSE_BTN, COL_MIN_BTN, COL_MAX_BTN };
+        unsigned int pe = Timer::GetRealMs() - win->tb_press_ms;
+        bool pressing = win->tb_press_ms != 0 && pe < KSS::Motion::Micro;
+        for (int i = 0; i < 3; i++) {
+            if (i == 0 && !win->closable) continue;
+            bool hov = (win->tb_hover_btn == i);
+            // hover lift 0..1 and a fill brightened toward white when hovered. (satoru)
+            float lift = KSS::Anim::Float(KSS::Motion::Id((uint32_t)win->id, 0x10u + i),
+                                          hov ? 1.0f : 0.0f, KSS::Motion::Micro, KSS::Motion::Std);
+            uint32_t fill = KSS::Anim::Color(KSS::Motion::Id((uint32_t)win->id, 0x20u + i),
+                                             hov ? Animation::LerpColor(base[i], 0xFFFFFFFF, 70)
+                                                 : base[i], KSS::Motion::Micro, KSS::Motion::Std);
+            int r = btn_r + (int)(lift * 2.0f + 0.5f);
+            if (pressing && hov) r -= 1;            // tactile press-dip (satoru)
+            Graphics::FillCircle(cx[i], btn_y, r, fill);
         }
     }
 
-    Graphics::FillCircle(btn_start_x + 22, btn_y, btn_r, COL_MIN_BTN);
+    if (win->closable && focused) {
+        Graphics::DrawLine(btn_start_x - 2, btn_y - 2, btn_start_x + 2, btn_y + 2, 0xFF401010);
+        Graphics::DrawLine(btn_start_x + 2, btn_y - 2, btn_start_x - 2, btn_y + 2, 0xFF401010);
+    }
     if (focused) {
         Graphics::FillRect(btn_start_x + 19, btn_y, 6, 1, 0xFF403010);
-    }
-
-    Graphics::FillCircle(btn_start_x + 44, btn_y, btn_r, COL_MAX_BTN);
-    if (focused) {
         Graphics::DrawLine(btn_start_x + 42, btn_y - 2, btn_start_x + 46, btn_y + 2, 0xFF103010);
         Graphics::DrawLine(btn_start_x + 46, btn_y - 2, btn_start_x + 42, btn_y + 2, 0xFF103010);
     }
@@ -1266,7 +1296,12 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
     if (!win) return;
     if (with_shadow) RenderShadow(win);
 
-    uint32_t border = win->focused ? wm_get_accent() : COL_BORDER;
+    // focus<->unfocus border: ease between the accent (focused) and the plain
+    // border so gaining/losing focus reads as a subtle elevation change rather
+    // than a hard snap. keyed per window so each keeps its own state. (satoru)
+    uint32_t border = KSS::Anim::Color(KSS::Motion::Id((uint32_t)win->id, 0x30u),
+                                       win->focused ? wm_get_accent() : COL_BORDER,
+                                       KSS::Motion::Window, KSS::Motion::Std);
 
     // full body background with rounded corners
     Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color);
@@ -1644,7 +1679,43 @@ void WindowManager::HandleMouseUp(int mx, int my) {
     (void)mx; (void)my;
 }
 
+// which traffic-light button (0=close,1=min,2=max) is (mx,my) over for `win`,
+// or -1 if none. mirrors the geometry in RenderTitlebar/the click handler:
+// centers at btn_start_x + {0,22,44}, click radius 8. (satoru)
+static int wm_titlebar_button_at(const Window* win, int mx, int my) {
+    if (!win || !win->has_titlebar) return -1;
+    int btn_cy = win->y + WM_TITLEBAR_H / 2;
+    int btn_start_x = win->x + 14;
+    const int r2 = 8 * 8;
+    const int cx[3] = { btn_start_x, btn_start_x + 22, btn_start_x + 44 };
+    for (int i = 0; i < 3; i++) {
+        if (i == 0 && !win->closable) continue;
+        int dx = mx - cx[i], dy = my - btn_cy;
+        if (dx * dx + dy * dy <= r2) return i;
+    }
+    return -1;
+}
+
+// update which titlebar button the top window's pointer is over; mark dirty on a
+// change so the hover ease repaints. called from the wm update path with the
+// live pointer even when no app owns the cursor. (satoru)
+void WindowManager::UpdateTitlebarHover(int mx, int my) {
+    int top_id = (current_action == WM_NONE) ? TopWindowAt(mx, my) : -1;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        Window* w = &windows[i];
+        if (w->state == WIN_CLOSED) continue;
+        int hb = (w->id == top_id) ? wm_titlebar_button_at(w, mx, my) : -1;
+        if (hb != w->tb_hover_btn) {
+            w->tb_hover_btn = (signed char)hb;
+            Graphics::MarkUIDirty();   // hover ease needs to render (satoru)
+        }
+    }
+}
+
 void WindowManager::HandlePointerMove(int mx, int my) {
+    // keep the titlebar traffic-light hover state fresh even while the pointer
+    // isn't over an app's content area. (satoru)
+    UpdateTitlebarHover(mx, my);
     // While dragging/resizing a window, suppress hover input to apps so
     // they don't react to the pointer slipping over them.
     if (current_action != WM_NONE) return;
@@ -1872,6 +1943,7 @@ bool WindowManager::HandleRightClick(int mx, int my) {
     if (wm_ctx_x < 0) wm_ctx_x = 0;
     if (wm_ctx_y < 0) wm_ctx_y = 0;
     wm_ctx_open = true;
+    wm_ctx_open_ms = Timer::GetRealMs();   // start the fade+unfold (satoru)
     wm_damage(wm_ctx_x, wm_ctx_y, WM_CTX_W, menu_h);
     return true;
 }
@@ -1907,16 +1979,30 @@ void WindowManager::RenderContextMenu() {
     if (!GetWindow(wm_ctx_win_id)) { wm_ctx_open = false; return; }
 
     int menu_h = WM_CTX_ITEMS * WM_CTX_ITEM_H + 8;
+    // fade+unfold from the click anchor, matching the desktop context menu so all
+    // menus share one feel. eased ease-out-cubic off elapsed ms. (satoru)
+    unsigned int e = Timer::GetRealMs() - wm_ctx_open_ms;
+    float t = (e >= KSS::Motion::Window) ? 1.0f
+                                         : Animation::EaseMs(e, KSS::Motion::Window, Animation::EaseOutCubic);
+    int draw_h = (int)(menu_h * (0.62f + 0.38f * t) + 0.5f);
+    if (draw_h < 6) draw_h = 6;
     // panel background + border (reuse the titlebar palette). (satoru)
-    Graphics::FillRoundedRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, menu_h, 6, COL_TITLE_FOCUSED);
-    Graphics::DrawRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, menu_h, COL_BORDER);
+    Graphics::FillRoundedRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h, 6, COL_TITLE_FOCUSED);
+    Graphics::DrawRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h, COL_BORDER);
 
     int count = DisplayManager::GetMonitorCount();
     // entry 0  -  "Move to other monitor" (dimmed when only one output). (satoru)
     int iy = wm_ctx_y + 4;
     uint32_t txt = (count >= 2) ? COL_TITLE_TEXT : COL_TITLE_TEXT_DIM;
+    Graphics::PushClipRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h);
     Graphics::DrawString(wm_ctx_x + 12, iy + (WM_CTX_ITEM_H - 12) / 2,
                          "Move to other monitor", txt, 0x00000000);
+    Graphics::PopClipRect();
+    if (t < 1.0f) {
+        uint8_t dim = (uint8_t)((1.0f - t) * 150.0f);
+        if (dim > 0) Graphics::FillRectAlpha(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h, dim, 0xFF000000u);
+        wm_damage(wm_ctx_x, wm_ctx_y, WM_CTX_W, menu_h);   // keep repainting while it fades (satoru)
+    }
 }
 
 int WindowManager::CreateWindow(const char* title, int x, int y, int w, int h,

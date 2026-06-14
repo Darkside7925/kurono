@@ -6,6 +6,7 @@
 #include "../kernel/panic.h"
 #include "../proc/scheduler.h"
 #include "../kernel/userspace.h"   // Userspace::HandleProcessExit for user-fault termination (satoru)
+#include "../kernel/vmm.h"         // resolve user va->phys to dump the tls/tcb at a fault (satoru)
 
 //  x86_64 idt, pic 8259a, and isr implementation
 //  isr stubs live in isr_stubs.asm  -  this file builds the idt from the
@@ -365,6 +366,43 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         log_hex("  RDI    = ", frame->rdi);
         log_hex("  RSI    = ", frame->rsi);
         log_hex("  RBP    = ", frame->rbp);
+        log_hex("  R14    = ", frame->r14);
+        log_hex("  R15    = ", frame->r15);
+        // tls diagnostic for the firefox pthread_create #gp bring-up: dump the
+        // live fs base, the saved proc->fs_base, and the tcb head words (self@0,
+        // prev@0x10, next@0x18) so we can see empirically whether the live thread
+        // pointer matches what musl __init_tp initialized. ring-3 only. (satoru)
+        if ((frame->cs & 3) == 3) {
+            uint32_t fsl, fsh;
+            __asm__ __volatile__("rdmsr" : "=a"(fsl), "=d"(fsh) : "c"(0xC0000100));
+            uint64_t live_fs = ((uint64_t)fsh << 32) | fsl;
+            log_hex("  liveFS = ", live_fs);
+            Process* fp = Scheduler::GetCurrentProcess();
+            if (fp) {
+                log_hex("  procFS = ", fp->fs_base);
+                log_hex("  pid    = ", (uint64_t)fp->pid);
+            }
+            // read tcb words at the live fs base (and at r14 if it differs) by
+            // resolving the user va -> phys in the faulting proc's address space.
+            // r14 = musl's `self` (the thread descriptor it derived). (satoru)
+            auto dump_tcb = [&](const char* tag, uint64_t va) {
+                if (!fp || !va) return;
+                for (uint64_t off = 0; off <= 0x18; off += 8) {
+                    uint64_t pg = (va + off) & ~0xFFFULL;
+                    uint64_t ph = KernelVMM::QueryMappingInAddressSpace(fp->address_space, pg);
+                    char p[40]; int n = 0;
+                    while (tag[n] && n < 8) { p[n] = tag[n]; n++; }
+                    while (n < 8) p[n++] = ' ';
+                    p[n++] = '+'; const char* hx = "0123456789ABCDEF";
+                    p[n++] = hx[(off >> 4) & 0xF]; p[n++] = hx[off & 0xF];
+                    p[n] = 0;
+                    uint64_t v = ph ? *(volatile uint64_t*)(uintptr_t)(ph + ((va + off) & 0xFFF)) : 0xDEADULL;
+                    log_hex(p, v);
+                }
+            };
+            dump_tcb("liveTCB", live_fs);
+            if (frame->r14 != live_fs) dump_tcb("r14TCB", frame->r14);
+        }
         g_exc_dump_lock.UnlockIrqRestore(_exc_f);
 
         // a genuine ring-3 exception (segfault, #GP, #UD, div0, ...) must not
@@ -376,6 +414,35 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         if ((frame->cs & 3) == 3) {
             SerialLogger::Log("Terminating faulting user process (SIGSEGV).\r\n");
             Userspace::HandleProcessExit(139);  // 128 + SIGSEGV; does not return
+        }
+        // kernel-mode fault diagnostic: dump cr3 + walk the page tables for cr2
+        // so we can see whether the identity (or user) mapping is present in the
+        // ACTIVE address space at the fault. helps pin the firefox pmm/teardown
+        // #pf (a kernel write to a frame whose mapping is missing). (satoru)
+        if (vec == 14 && (frame->cs & 3) == 0) {
+            uint64_t cr3;
+            __asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
+            log_hex("  CR3    = ", cr3);
+            Process* kf = Scheduler::GetCurrentProcess();
+            if (kf) { log_hex("  curAS  = ", kf->address_space); log_hex("  curPID = ", (uint64_t)kf->pid); }
+            uint64_t va = frame->cr2;
+            uint64_t* pml4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+            uint64_t e4 = pml4[(va >> 39) & 0x1FF];
+            log_hex("  pml4e  = ", e4);
+            if (e4 & 1) {
+                uint64_t* pdpt = (uint64_t*)(uintptr_t)(e4 & ~0xFFFULL & ~(1ULL<<63));
+                uint64_t e3 = pdpt[(va >> 30) & 0x1FF];
+                log_hex("  pdpte  = ", e3);
+                if ((e3 & 1) && !(e3 & 0x80)) {
+                    uint64_t* pd = (uint64_t*)(uintptr_t)(e3 & ~0xFFFULL & ~(1ULL<<63));
+                    uint64_t e2 = pd[(va >> 21) & 0x1FF];
+                    log_hex("  pde    = ", e2);
+                    if ((e2 & 1) && !(e2 & 0x80)) {
+                        uint64_t* pt = (uint64_t*)(uintptr_t)(e2 & ~0xFFFULL & ~(1ULL<<63));
+                        log_hex("  pte    = ", pt[(va >> 12) & 0x1FF]);
+                    }
+                }
+            }
         }
         SerialLogger::Log("Invoking kernel panic path.\r\n");
         KernelPanic::BugCheckFromInterrupt(frame, exception_names[vec]);

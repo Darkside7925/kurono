@@ -1221,7 +1221,11 @@ static bool pfetch_package_payload(Package* pkg) {
 
 // origin host that actually serves /packages/firefox/* (see ip fallbacks).
 static const char* FF_ORIGIN_HOST = "kurono.satorut.com";
-static const char* FF_TAR_PATH    = "/packages/firefox/firefox-140.11.0esr.tar";
+// the -full tar is the COMPLETE package: binaries + the 88-lib closure PLUS the
+// gecko app resources (omni.ja, browser/omni.ja, application.ini, greprefs.js,
+// defaults/, fonts/) the old tar was missing  -  without these no window renders.
+// ustar layout, longest entry 51 chars (under the 100-byte name field). (satoru)
+static const char* FF_TAR_PATH    = "/packages/firefox/firefox-140.11.0esr-full.tar";
 static const uint32_t FF_ORIGIN_IP =
     (((uint32_t)92 << 24) | ((uint32_t)5 << 16) |
      ((uint32_t)63 << 8) | (uint32_t)184);

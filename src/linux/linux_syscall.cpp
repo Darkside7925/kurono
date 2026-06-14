@@ -3050,6 +3050,9 @@ int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t e
     proc->brk_max = brk_end + 0x01000000U;
     proc->exited = false;
     ls_scpy(proc->name, resolved, sizeof(proc->name));
+    // record the real exec path on the task too, so /proc/self/exe resolves to
+    // it (the dynamic-pie path records this in ld-kurono::ExecPIE). (satoru)
+    ls_scpy(task->exe_path, resolved, sizeof(task->exe_path));
 
     KernelVMM::ActivateAddressSpace(new_address_space);
     HAL::SetKernelStack(task->kernel_stack_top);
@@ -3203,7 +3206,14 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                 PROC_APPEND(hex);
                 PROC_APPEND(" rw-p 00000000 00:00 0                          [heap]\n");
             } else if (ls_starts(pp, "/proc/self/exe") && curp) {
-                PROC_APPEND("/system/bin/"); PROC_APPEND(curp->name);
+                // prefer the real recorded exec path (e.g. /apps/firefox/firefox)
+                // so gecko anchors its app dir correctly; fall back to the old
+                // synthesized /system/bin/<name> when no path was recorded. (satoru)
+                if (curp->task && curp->task->exe_path[0]) {
+                    PROC_APPEND(curp->task->exe_path);
+                } else {
+                    PROC_APPEND("/system/bin/"); PROC_APPEND(curp->name);
+                }
             } else if (ls_starts(pp, "/proc/self/cwd") && curp) {
                 PROC_APPEND(curp->cwd);
             } else if (ls_starts(pp, "/proc/self/stat") && curp) {
@@ -3319,6 +3329,26 @@ int32_t LinuxSyscall::sys_writev(int fd, uintptr_t iov, uint64_t iovcnt) {
         int32_t r = sys_write(fd, (uintptr_t)vecs[i].iov_base, vecs[i].iov_len);
         if (r < 0) return r;
         total += r;
+    }
+    return total;
+}
+
+// readv  -  the read counterpart of writev: fill each iovec from fd in order.
+// modelled on sys_writev (iterate base/len, route to sys_read). returns the
+// running total; an error on the first vector propagates, otherwise we return
+// what we've read so far. a short read (fewer bytes than the vector asked for)
+// stops the scatter, matching readv(2) semantics. gecko uses this once running.
+// (satoru)
+int32_t LinuxSyscall::sys_readv(int fd, uintptr_t iov, uint64_t iovcnt) {
+    LinuxIovec* vecs = (LinuxIovec*)iov;
+    int32_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        uint64_t want = vecs[i].iov_len;
+        if (want == 0) continue;
+        int32_t r = sys_read(fd, (uintptr_t)vecs[i].iov_base, want);
+        if (r < 0) return total > 0 ? total : r;
+        total += r;
+        if ((uint64_t)r < want) break;  // short read → source drained (satoru)
     }
     return total;
 }

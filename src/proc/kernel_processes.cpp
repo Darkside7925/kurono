@@ -40,6 +40,7 @@
 #include "../ui/control_center.h"
 #include "../ui/kss.h"
 #include "../ui/notification.h"
+#include "../apps/kj.h"   // kj-scripted animation demo (kurono.kjdemo) (satoru)
 #include "../apps/media_player.h"
 #include "../apps/denji_app.h"
 #include "../security/ksa.h"   // one-shot interactive prompt demo (kurono.ksa.prompt) (satoru)
@@ -60,12 +61,19 @@ volatile bool  g_gui_autorun_armed = false;
 // modal lands over a real desktop. (satoru)
 volatile bool  g_ksa_prompt_demo_armed = false;
 volatile bool  g_ksa_prompt_demo_cred  = false;
+// one-shot kj-scripted animation demo (kurono.kjdemo). armed early; the gui
+// process runs a shipped .kj script once after the desktop is up, so a real
+// on-screen animation (an eased accent transition) is driven through the kj host
+// bindings rather than c++. (satoru)
+volatile bool  g_kj_demo_armed = false;
 }
 
 void ArmKsaPromptDemo(bool want_cred) {
     g_ksa_prompt_demo_cred  = want_cred;
     g_ksa_prompt_demo_armed = true;
 }
+
+void ArmKjDemo() { g_kj_demo_armed = true; }
 
 void SetGuiAutorun(const char* cmd) {
     if (!cmd) {
@@ -349,6 +357,33 @@ static inline bool ui_activity_active() {
             KSA::PromptDemo(g_ksa_prompt_demo_cred);
             Graphics::MarkUIDirty();
             continue;   // repaint the desktop on the next iteration (satoru)
+        }
+
+        // one-shot kj-scripted animation demo (kurono.kjdemo): once the desktop
+        // has presented a few seconds of frames, run the shipped accent-animation
+        // script. it drives kss.transition + kss.set on the "window" rule's accent
+        // (which feeds the live window-border/titlebar accent) so the on-screen
+        // accent eases  -  proving the js path drives real animation  -  then posts a
+        // toast via ui.notify. prefer the shipped file; fall back to inline. (satoru)
+        if (g_kj_demo_armed && frame_counter > 120) {
+            g_kj_demo_armed = false;
+            SerialLogger::Log("[gui] running kj-scripted animation demo\r\n");
+            static char kj_out[512];
+            int n = KJ::ExecFile("/kurono/scripts/accent_anim.kj", kj_out, sizeof(kj_out));
+            if (n <= 0 || kj_out[0] == 0) {
+                // fallback: same effect inline if the script file isn't present. (satoru)
+                static const char* SRC =
+                    "kss.transition('window','accent', 600, 'outcubic');\n"
+                    "kss.set('window','accent', 4292032130);\n"   // 0xFFE74C42 warm red (satoru)
+                    "ui.notify('KJ animation', 'accent eased by a kj script');\n"
+                    "console.log('kjdemo: accent transition fired');\n";
+                KJ::Execute(SRC, kj_out, sizeof(kj_out));
+            }
+            SerialLogger::Log("[kjdemo] ");
+            SerialLogger::Log(kj_out);
+            SerialLogger::Log("\r\n");
+            Graphics::MarkUIDirty();
+            continue;
         }
 
         if (frame_counter % 300 == 0) {

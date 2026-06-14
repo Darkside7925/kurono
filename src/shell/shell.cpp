@@ -1895,7 +1895,9 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     if (!url) av[1] = nullptr;
     const char* envp[] = {
         "HOME=/home/user", "USER=user",
-        "LD_LIBRARY_PATH=/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
+        // /apps/firefox first: gecko's dependent libs (libxul.so etc.) live next
+        // to the binary at the gre dir, system lib closure under lib/. (satoru)
+        "LD_LIBRARY_PATH=/apps/firefox:/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
         "XDG_RUNTIME_DIR=/system/run/user/1000",
         "WAYLAND_DISPLAY=wayland-0",
         "MOZ_ENABLE_WAYLAND=1", "GDK_BACKEND=wayland",

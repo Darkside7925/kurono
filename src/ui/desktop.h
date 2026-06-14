@@ -111,6 +111,9 @@ private:
     static float    pinned_hover_phase[8];     // sized for tb_pinned cap
     static int      pinned_hover_target;       // index currently hovered, -1 none
     static uint32_t pinned_anim_last_ms;
+    // ms timestamp of the last launch tap on each pinned icon; 0 = idle. drives a
+    // spring "bounce" pop when the app is launched. (satoru)
+    static uint32_t pinned_launch_ms[8];
 
     // cursor blink driven by real time.
     static uint32_t search_cursor_t0_ms;
@@ -122,6 +125,9 @@ public:
     // bounds-checked read access to per-pinned-icon hover phase so file-scope
     // taskbar renderers can read it without touching private anim state (satoru)
     static float PinnedHoverPhase(int i){ return (i >= 0 && i < 8) ? pinned_hover_phase[i] : 0.0f; }
+    // record a launch tap so the icon bounces; read the bounce timestamp. (satoru)
+    static void  PinnedLaunched(int i);
+    static uint32_t PinnedLaunchMs(int i){ return (i >= 0 && i < 8) ? pinned_launch_ms[i] : 0; }
 
 private:
     static void StartMenuSet(bool open);
@@ -171,6 +177,7 @@ private:
     static bool context_menu_open;
     static int context_menu_x, context_menu_y;
     static int context_menu_target;         // icon index right-clicked, or -1
+    static uint32_t context_menu_open_ms;   // ms the menu opened; drives fade+scale-in (satoru)
     static int new_folder_counter;
     static int new_file_counter;
     static bool icon_dragging;

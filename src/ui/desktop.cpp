@@ -21,6 +21,8 @@
 #include "wallpaper.h"               // wallpaper_rgba_data  -> builtin index 0 (satoru)
 #include "wallpaper2.h"              // wallpaper2_rgba_data -> builtin index 1 (satoru)
 #include "app_icons.h"               // flat vector app icons (replaces letter glyphs) (satoru)
+#include "kss.h"                      // motion tokens for shared animation feel (satoru)
+#include "ui_elements.h"             // Animation easing/spring helpers (satoru)
 #include "../apps/terminal.h"
 #include "../apps/file_manager.h"
 #include "../apps/calculator.h"
@@ -143,6 +145,11 @@ float    Taskbar::volume_popup_phase        = 0.0f;
 float    Taskbar::pinned_hover_phase[8]     = {0,0,0,0,0,0,0,0};
 int      Taskbar::pinned_hover_target       = -1;
 uint32_t Taskbar::pinned_anim_last_ms       = 0;
+uint32_t Taskbar::pinned_launch_ms[8]       = {0,0,0,0,0,0,0,0};
+
+// record a launch bounce on a pinned icon (out-of-line so the header stays free
+// of the Timer include). (satoru)
+void Taskbar::PinnedLaunched(int i){ if (i >= 0 && i < 8) pinned_launch_ms[i] = Timer::GetRealMs(); }
 uint32_t Taskbar::search_cursor_t0_ms       = 0;
 
 void Taskbar::ReloadFromConfig(){
@@ -213,7 +220,7 @@ void Taskbar::Init(int sw,int sh){
     volume_popup_phase = 0.0f;
     pinned_hover_target = -1;
     pinned_anim_last_ms = 0;
-    for (int i = 0; i < 8; i++) pinned_hover_phase[i] = 0.0f;
+    for (int i = 0; i < 8; i++) { pinned_hover_phase[i] = 0.0f; pinned_launch_ms[i] = 0; }
 }
 
 int Taskbar::GetHeight(){ return TASKBAR_HEIGHT + 10; }
@@ -323,6 +330,19 @@ static void tb_render_quick_launch(){
         // visually pops without disturbing neighbours.
         float t = Taskbar::PinnedHoverPhase(i);
         int pop = (int)(t * 2.0f + 0.5f);
+        // launch bounce: a spring pop on top of the hover lift, peaking ~+4px
+        // just after launch then settling. driven off elapsed ms so it reads the
+        // same at any frame rate. (satoru)
+        uint32_t lms = Taskbar::PinnedLaunchMs(i);
+        if (lms) {
+            uint32_t e = Timer::GetRealMs() - lms;
+            if (e < KSS::Motion::Window) {
+                float s = Animation::SpringMs(e, KSS::Motion::Window);   // 0..~1 overshoot
+                // bell-shaped pop: rises then returns to 0 by the end. (satoru)
+                float bell = s * (1.0f - (float)e / (float)KSS::Motion::Window);
+                pop += (int)(bell * 5.0f + 0.5f);
+            }
+        }
         int ix = x - pop;
         int iy = y - pop;
         int iw = TB_PIN_SZ + pop*2;
@@ -923,6 +943,7 @@ bool Taskbar::HandleClick(int mx,int my){
             int ix = strip_x + i * (TB_PIN_SZ + TB_PIN_GAP);
             if (mx >= ix && mx < ix + TB_PIN_SZ &&
                 my >= strip_y && my < strip_y + TB_PIN_SZ) {
+                PinnedLaunched(i);                 // spring bounce feedback (satoru)
                 if (tb_pinned[i].launch) tb_pinned[i].launch();
                 StartMenuSet(false);
                 VolumePopupSet(false);
@@ -1070,6 +1091,10 @@ bool Taskbar::IsAnimating(){
     // hover-lift on pinned icons eases out after the pointer leaves.
     for (int i = 0; i < TB_PINNED_COUNT && i < 8; i++)
         if (pinned_hover_phase[i] > 0.01f) return true;
+    // a launch bounce is in flight until ~Motion::Window after the tap. (satoru)
+    uint32_t now = Timer::GetRealMs();
+    for (int i = 0; i < TB_PINNED_COUNT && i < 8; i++)
+        if (pinned_launch_ms[i] && (now - pinned_launch_ms[i]) < KSS::Motion::Window) return true;
     // blinking search cursor needs periodic repaint while typing.
     if (search_active) return true;
     return false;
@@ -1085,6 +1110,7 @@ int           Desktop::selected_icon   = -1;
 bool          Desktop::context_menu_open = false;
 int           Desktop::context_menu_x  = 0;
 int           Desktop::context_menu_y  = 0;
+uint32_t      Desktop::context_menu_open_ms = 0;
 int           Desktop::context_menu_target = -1;
 int           Desktop::new_folder_counter  = 1;
 int           Desktop::new_file_counter    = 1;
@@ -1729,13 +1755,25 @@ void Desktop::RenderContextMenu(){
     int ih = cfg_ctx_item_h;
     int mh = nit * ih + 12;
 
-    // shadow
-    Graphics::FillRoundedRect(context_menu_x+5, context_menu_y+5, mw, mh, 8, 0xFF060610);
-    // background
-    Graphics::FillRoundedRect(context_menu_x, context_menu_y, mw, mh, 8, cfg_col_ctx_bg);
-    // accent border
-    Graphics::DrawRect(context_menu_x, context_menu_y, mw, mh, cfg_col_ctx_border);
+    // fade+scale-from-origin: the menu unfolds downward from its top-left anchor
+    // (the click point) while a dim overlay fades out. driven off elapsed ms so it
+    // looks right at any frame rate; eased ease-out-cubic to match the desktop's
+    // standard reveal feel. (satoru)
+    uint32_t e = Timer::GetRealMs() - context_menu_open_ms;
+    float t = (e >= KSS::Motion::Window) ? 1.0f
+                                         : Animation::EaseMs(e, KSS::Motion::Window, Animation::EaseOutCubic);
+    int draw_h = (int)(mh * (0.62f + 0.38f * t) + 0.5f);   // grow 62% -> 100% height
+    if (draw_h < 8) draw_h = 8;
 
+    // shadow
+    Graphics::FillRoundedRect(context_menu_x+5, context_menu_y+5, mw, draw_h, 8, 0xFF060610);
+    // background
+    Graphics::FillRoundedRect(context_menu_x, context_menu_y, mw, draw_h, 8, cfg_col_ctx_bg);
+    // accent border
+    Graphics::DrawRect(context_menu_x, context_menu_y, mw, draw_h, cfg_col_ctx_border);
+
+    // clip item rows to the growing body so they reveal as the menu unfolds. (satoru)
+    Graphics::PushClipRect(context_menu_x, context_menu_y, mw, draw_h);
     int iy = context_menu_y + 6;
     for(int i=0;i<nit;i++){
         if(i > 0){
@@ -1746,6 +1784,12 @@ void Desktop::RenderContextMenu(){
         if(on_icon && i==2) txt_col = 0xFFFF6666;
         Graphics::DrawString(context_menu_x+16, iy + (ih-14)/2, items[i], txt_col, 0xFF000000);
         iy += ih;
+    }
+    Graphics::PopClipRect();
+    // fade overlay over the menu footprint, fully clear by t=1. (satoru)
+    if (t < 1.0f) {
+        uint8_t dim = (uint8_t)((1.0f - t) * 150.0f);
+        if (dim > 0) Graphics::FillRectAlpha(context_menu_x, context_menu_y, mw, draw_h, dim, 0xFF000000u);
     }
     Graphics::MarkDirty(context_menu_x-2, context_menu_y-2, mw+10, mh+10);
 }
@@ -1783,6 +1827,9 @@ bool Desktop::IsAnimating(){
     // rest on (or just off) an icon. mirrors Taskbar::IsAnimating(). (satoru)
     for (int i = 0; i < icon_count && i < DESKTOP_MAX_ICONS; i++)
         if (icon_hover_phase[i] > 0.01f) return true;
+    // context menu fade+scale-in needs continuous frames until it settles. (satoru)
+    if (context_menu_open && (Timer::GetRealMs() - context_menu_open_ms) < KSS::Motion::Window)
+        return true;
     return false;
 }
 
@@ -1915,6 +1962,7 @@ void Desktop::HandleRightClick(int mx,int my){
     context_menu_x = mx;
     context_menu_y = my;
     context_menu_open = true;
+    context_menu_open_ms = Timer::GetRealMs();   // start the fade+scale-in (satoru)
 }
 
 void Desktop::Update(int mx,int my,bool mouse_down,bool clicked){

@@ -21,6 +21,7 @@
 [BITS 64]
 
 extern SyscallEntryX64FrameHandler       ; void (*)(InterruptFrame*)  -  fills rax, may switch
+extern sched_current_task_raw            ; void* ()  -  current task ptr, to detect a switch (satoru)
 ; the kernel stack now comes from this cpu's per-cpu block via gs (KERNEL_GS_BASE
 ; = &PerCpu) after swapgs, so two cores can syscall at once without sharing one
 ; global stack. PerCpu offset 0 = user-rsp scratch, offset 8 = kernel rsp. (satoru)
@@ -67,16 +68,47 @@ syscall_entry_x64:
     mov     rax, cr2
     push    rax                                  ; cr2 (offset 0  -  rsp now = &frame)
 
-    ; hand &frame to the C handler. the kernel stack base is 16-aligned and the
-    ; frame is 184 bytes (≡8 mod 16), so one extra sub aligns the call site. (satoru)
-    mov     rdi, rsp
-    sub     rsp, 8
+    ; preserve the user's fpu/sse (xmm) state across the whole syscall. kernel
+    ; code (memcpy, graphics inline asm) freely clobbers xmm, and the SYSRET/IRETQ
+    ; return path does NOT otherwise restore it  -  which corrupted musl __init_tp's
+    ; movups store of the main thread's tcb next/prev and #pf'd pthread_create.
+    ;
+    ; keep &frame in r12 (frame-saved, so clobbering it here is fine  -  the exit
+    ; pops reload the user's r12 from the frame). carve a 16-aligned 512-byte
+    ; fxsave area BELOW the frame; do NOT derive &frame back from rsp afterwards
+    ; (the alignment `and` drops a variable 0..15 bytes, which silently shifted
+    ; the frame pointer by 8 and made iretq #gp on a corrupt return frame). r13
+    ; holds the fxsave area; r14 the pre-handler task. (satoru)
+    mov     r12, rsp                             ; r12 = &frame (preserved across calls)
+    sub     rsp, 512
+    and     rsp, ~0xF                            ; 16-align for fxsave/fxrstor
+    mov     r13, rsp                             ; r13 = fxsave area
+    fxsave  [r13]                                 ; save PRISTINE user fpu/sse
+
+    ; record the current task BEFORE the handler so we can tell on return whether
+    ; it switched tasks (clone/futex/thread-exit)  -  in which case LoadUserFrame
+    ; already loaded the next task's fpu and we must not overwrite it. (satoru)
+    call    sched_current_task_raw
+    mov     r14, rax                             ; r14 = pre-handler task
+
+    ; hand the true &frame (r12) to the C handler. rsp is 16-aligned (r13), and a
+    ; call pushes 8 -> the callee sees the abi-required rsp%16==8. (satoru)
+    mov     rdi, r12
     cld
     call    SyscallEntryX64FrameHandler
-    add     rsp, 8                               ; rsp = &frame again
 
-    ; restore every gp reg from the (possibly rewritten) frame, then IRETQ the
-    ; bottom five fields. cr2 is not restorable, so skip it. (satoru)
+    ; if the task is unchanged, restore the pristine user fpu state we saved; if
+    ; it switched, the new task's fpu is already live (via LoadUserFrame)  -  skip.
+    ; (satoru)
+    call    sched_current_task_raw
+    cmp     rax, r14
+    jne     .skip_fxrstor
+    fxrstor [r13]
+.skip_fxrstor:
+
+    ; restore rsp to the true &frame (r12), then pop the (possibly rewritten)
+    ; frame. cr2 is not restorable, so skip it. (satoru)
+    mov     rsp, r12
     add     rsp, 8                               ; skip cr2
     pop     r15
     pop     r14

@@ -298,6 +298,23 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     LinuxProcess* linux_proc = LinuxSyscall::GetProcess(u.active_linux_process);
     if (linux_proc) {
         linux_proc->task = proc;
+        // relocate the brk heap above all identity-mapped physical ram. the
+        // default brk window (0x08100000..0x0C000000) ALIASES low physical
+        // addresses  -  the framebuffer, kernel heap, and pmm frames all live
+        // there  -  and the kernel reaches every physical frame through the low
+        // identity map (phys==virt). when a user brk page is mapped at e.g. va
+        // 0x83f9000 and later released, it clears that frame's identity leaf in
+        // the process's private page tables, so the kernel's next identity write
+        // to that physical frame (pmm zero-on-alloc) #pf'd. firefox's heap grew
+        // into that range and crashed the kernel. park brk at 24tb  -  above ram,
+        // clear of the mmap arena (16tb) and ld-kurono's aslr region (64tb+). we
+        // set it here, in an allowed file, via the public accessor  -  the default
+        // is assigned in linux_syscall (a separately-owned file). (satoru)
+        constexpr uint64_t HIGH_BRK_BASE = 0x0000180000000000ULL;
+        constexpr uint64_t HIGH_BRK_SIZE = 0x0000000010000000ULL;  // 256mb window
+        linux_proc->brk_base    = HIGH_BRK_BASE;
+        linux_proc->brk_current = HIGH_BRK_BASE;
+        linux_proc->brk_max     = HIGH_BRK_BASE + HIGH_BRK_SIZE;
     }
 
     LinuxSyscall::SetCurrent(u.active_linux_process);

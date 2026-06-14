@@ -17,6 +17,7 @@
 #include "../drivers/serial.h"
 #include "../hal/hal.h"
 #include "../kernel/userspace.h"
+#include "../proc/scheduler.h"   // full Process def for LinuxProcess::task->exe_path (satoru)
 
 // Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
 // switches to, and a one-slot stash for the user rsp across that switch (every
@@ -244,8 +245,54 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             }
             return (int64_t)n;
         }
-        case 89: {  // readlink  -  just fail; CPython tolerates ENOENT.
-            return -2;
+        case 89: {  // readlink(path, buf, bufsiz)
+            // /proc/self/exe → the process's real recorded exec path. gecko 140
+            // finds its binary (and thus its app directory) ONLY via this symlink
+            //  -  there is no argv[0] fallback  -  so this must yield the actual
+            // install path (e.g. /apps/firefox/firefox). everything else: -ENOENT,
+            // which callers tolerate. readlink does NOT nul-terminate. (satoru)
+            const char* path = (const char*)(uintptr_t)a0;
+            char*       buf  = (char*)(uintptr_t)a1;
+            size_t      bufsiz = (size_t)a2;
+            if (!path || !buf || bufsiz == 0) return -22;  // -EINVAL
+            auto streq = [](const char* x, const char* y) {
+                while (*x && *y) { if (*x != *y) return false; x++; y++; }
+                return *x == *y;
+            };
+            if (streq(path, "/proc/self/exe")) {
+                LinuxProcess* lp = LinuxSyscall::Current();
+                const char* exe = (lp && lp->task && lp->task->exe_path[0])
+                                      ? lp->task->exe_path : nullptr;
+                if (!exe) return -2;  // -ENOENT (no recorded path)
+                size_t n = 0;
+                while (exe[n] && n < bufsiz) { buf[n] = exe[n]; n++; }
+                return (int64_t)n;
+            }
+            return -2;  // -ENOENT
+        }
+        case 267: {  // readlinkat(dirfd, path, buf, bufsiz)
+            // musl's readlink() is implemented via this syscall, so /proc/self/exe
+            // arrives here (dirfd=AT_FDCWD). resolve it identically to case 89 so
+            // gecko's binary lookup works regardless of which libc path it took.
+            // any other target: -ENOENT (no real symlinks in kvfs). (satoru)
+            const char* path = (const char*)(uintptr_t)a1;
+            char*       buf  = (char*)(uintptr_t)a2;
+            size_t      bufsiz = (size_t)a3;
+            if (!path || !buf || bufsiz == 0) return -22;  // -EINVAL
+            auto streq = [](const char* x, const char* y) {
+                while (*x && *y) { if (*x != *y) return false; x++; y++; }
+                return *x == *y;
+            };
+            if (streq(path, "/proc/self/exe")) {
+                LinuxProcess* lp = LinuxSyscall::Current();
+                const char* exe = (lp && lp->task && lp->task->exe_path[0])
+                                      ? lp->task->exe_path : nullptr;
+                if (!exe) return -2;  // -ENOENT
+                size_t n = 0;
+                while (exe[n] && n < bufsiz) { buf[n] = exe[n]; n++; }
+                return (int64_t)n;
+            }
+            return -2;  // -ENOENT
         }
         case 257: {  // openat: ignore dirfd if AT_FDCWD, route to open.
             if ((int)a0 == -100 /* AT_FDCWD */) {
@@ -255,6 +302,15 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                     a1, a2, a3, 0, 0);
             }
             return -38;
+        }
+        case 19: {   // readv(fd, iovec*, iovcnt)  -  no i386 equivalent in the
+            // dispatch table (only writev/#20 is mapped), so handle it directly.
+            // the iovec pointer (a1) may live above 4gb in a pie process, so pass
+            // it full-width. allow irqs since a read may touch ext4/kvfs. (satoru)
+            HAL::EnableInterrupts();
+            int64_t r = LinuxSyscall::sys_readv((int)a0, a1, a2);
+            HAL::DisableInterrupts();
+            return r;
         }
         case 230: {  // clock_nanosleep(clockid, flags, req, rem)  -  route to
             // nanosleep(req, rem); clockid/flags ignored (satoru)
