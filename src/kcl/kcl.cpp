@@ -561,6 +561,28 @@ static int cur_line(Interp& it, int pos) {
     return (pos >= 0 && pos <= it.count) ? it.toks[pos].line : 0;
 }
 
+// recursive-descent depth guard. kcl parses-and-evaluates in one pass, so the
+// same call chain (eval_expr -> ... -> eval_atom -> eval_expr for nested parens,
+// eval_unary -> eval_unary for ---x / not not x, and exec_if -> exec_block ->
+// exec_stmt -> exec_if for nested if/while/for) recurses ~9 c++ frames per level
+// with no natural bound  -  deeply nested input would overflow the 64kb kernel
+// stack. an raii guard bumps a file-local counter on entry (safe: the
+// cooperative scheduler runs one script to completion at a time) and the
+// recursive entry points (eval_expr / eval_unary / exec_block) fail closed past
+// the cap, raising a normal script error instead of crashing. file-local so
+// editing this file does not force a `make clean`. (satoru)
+static const int KCL_MAX_DEPTH = 64;
+static int g_kcl_depth = 0;
+struct KclDepthGuard {
+    bool ok;
+    KclDepthGuard(Interp& it, int pos){
+        ok = (g_kcl_depth < KCL_MAX_DEPTH);
+        if (ok) g_kcl_depth++;
+        else raise_err(it, cur_line(it, pos), "nesting too deep");
+    }
+    ~KclDepthGuard(){ if (ok) g_kcl_depth--; }
+};
+
 static Value eval_atom(Interp& it, Env& env, int& pos) {
     Value v; vinit(v);
     if (it.failed) return v;
@@ -679,6 +701,8 @@ static Value eval_postfix(Interp& it, Env& env, int& pos) {
 }
 
 static Value eval_unary(Interp& it, Env& env, int& pos) {
+    KclDepthGuard depth(it, pos);                 // bounds ---x / not not x chains (satoru)
+    if (!depth.ok) { Value v; vinit(v); return v; }
     if (cur(it, pos) == KT_MINUS) {
         pos++;
         Value r = eval_unary(it, env, pos);
@@ -858,6 +882,8 @@ static Value eval_or(Interp& it, Env& env, int& pos) {
 }
 
 static Value eval_expr(Interp& it, Env& env, int& pos) {
+    KclDepthGuard depth(it, pos);                 // bounds nested parens / call args / list elems (satoru)
+    if (!depth.ok) { Value v; vinit(v); return v; }
     return eval_or(it, env, pos);
 }
 
@@ -894,6 +920,8 @@ static void exec_stmt(Interp& it, Env& env, int& pos);
 
 // run statements until a block terminator (end/else/elif/eof). (satoru)
 static void exec_block(Interp& it, Env& env, int& pos) {
+    KclDepthGuard depth(it, pos);                 // bounds nested if/while/for blocks (satoru)
+    if (!depth.ok) return;
     while (!unwinding(it)) {
         skip_seps(it, pos);
         KCLTok t = cur(it, pos);
@@ -1217,7 +1245,12 @@ static Value call_func(Interp& it, const char* name, FuncDef& fn, Value* args, i
     KCLToken* saved_toks = it.toks; int saved_count = it.count;
     if (fn.toks) { it.toks = fn.toks; it.count = fn.count; }
 
+    // a function body is a fresh nesting context: reset the parse/eval depth
+    // counter for the call so a recursive chain doesn't accumulate it and trip
+    // the cap. the call chain itself is bounded by it.recursion above. (satoru)
+    int saved_depth = g_kcl_depth; g_kcl_depth = 0;
     exec_block(it, *local, pos);
+    g_kcl_depth = saved_depth;
 
     it.toks = saved_toks; it.count = saved_count;
 

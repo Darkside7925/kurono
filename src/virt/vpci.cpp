@@ -27,10 +27,15 @@ void VPCI::Init() {
 }
 
 void VPCI::Cfg16(VPCIDevice* dev, uint8_t off, uint16_t v) {
+    // bound the access  -  off near 255 would index cfg[256]/[257] past the
+    // 256-byte cfg array into the rest of the struct (oob write). (satoru)
+    if ((int)off + 2 > VPCI_CFG_SIZE) return;
     dev->cfg[off]     = (uint8_t)(v & 0xFF);
     dev->cfg[off + 1] = (uint8_t)((v >> 8) & 0xFF);
 }
 void VPCI::Cfg32(VPCIDevice* dev, uint8_t off, uint32_t v) {
+    // same bound  -  off near 255 would index up to cfg[258] (oob write). (satoru)
+    if ((int)off + 4 > VPCI_CFG_SIZE) return;
     dev->cfg[off]     = (uint8_t)(v & 0xFF);
     dev->cfg[off + 1] = (uint8_t)((v >> 8) & 0xFF);
     dev->cfg[off + 2] = (uint8_t)((v >> 16) & 0xFF);

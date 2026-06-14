@@ -161,14 +161,19 @@ int WindowsCmds::cmd_del(KuronoShell* sh, int argc, const char** argv, char* out
 int WindowsCmds::cmd_type(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (argc < 2) return _wa(out, 0, mx, "The syntax of the command is incorrect.\n");
-    unsigned char buf[KVFS_MAX_CONTENT];
+    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if (!buf) return _wa(out, 0, mx, "Not enough memory resources are available.\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);
-    if (sz < 0)
+    if (sz < 0) {
+        KernelHeap::Free(buf);
         return _wa(out, 0, mx, "The system cannot find the file specified.\n");
+    }
 
     int p = 0;
     for (int i = 0; i < sz && p < mx - 1; i++) out[p++] = (char)buf[i];
     out[p] = 0;
+    KernelHeap::Free(buf);
     return p;
 }
 

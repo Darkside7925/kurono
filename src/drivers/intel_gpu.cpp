@@ -1,8 +1,25 @@
 //  kurono os  -  intel integrated gpu driver
 //  pci scan, bar mapping, display pipe state, generation detection
-//  identity-mapped mmio via boot page tables  -  no special mapping needed
+//  low mmio is identity-mapped by the boot tables, but a 64-bit gttmmaddr bar
+//  can sit above that window, so map it explicitly before the first deref
 #include "intel_gpu.h"
 #include "serial.h"
+#include "../kernel/vmm.h"   // map the (possibly high 64-bit) bar before deref (satoru)
+
+// identity-map a bar's register window as uncached mmio before any access.
+// the igpu gttmmaddr bar is 64-bit and can land above the boot identity map,
+// so a register read would #pf unmapped. mirrors nvme.cpp / virtio_gpu.cpp;
+// caps at 16mb (the gen register aperture fits) and is idempotent. (satoru)
+static void igpu_map_bar_window(uint64_t base, uint64_t size) {
+    if (base == 0) return;
+    uint64_t window = size ? size : 0x1000000ULL; // default 16mb if size unknown
+    if (window > 0x1000000ULL) window = 0x1000000ULL;
+    uint64_t start = base & ~0xFFFULL;
+    uint64_t end   = (base + window + 0xFFFULL) & ~0xFFFULL;
+    for (uint64_t p = start; p < end; p += 0x1000ULL) {
+        KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+    }
+}
 
 IntelGPUInfo IntelGPU::gpu_info = {};
 
@@ -233,6 +250,11 @@ void IntelGPU::Init() {
                     PciWrite(bus, dev, func, 0x10, orig);
                     if (mask) gpu_info.bar0_size = (uint64_t)(~mask) + 1;
                 }
+
+                // map the bar window before any register read (ReadPipeState
+                // below)  -  a high 64-bit bar isn't covered by the boot identity
+                // map and would #pf otherwise. (satoru)
+                igpu_map_bar_window(gpu_info.bar0, gpu_info.bar0_size);
 
                 // enable memory space + bus mastering (igpu needs master for blitter DMA)
                 uint32_t cmd = PciRead(bus, dev, func, 0x04);
