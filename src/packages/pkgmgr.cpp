@@ -1573,6 +1573,22 @@ static void ff_finalize_install() {
     KVFS::Chmod("/apps/firefox/firefox", 0755);
     KVFS::Chmod("/apps/firefox/firefox-bin", 0755);
 
+    // gecko's nsAppRunner refuses to run when geteuid()==0 but a key user dir is
+    // owned by a different uid ("Running ... as root in a regular user's session
+    // is not supported ($X is ... owned by uid 1000)"). it walks $HOME,
+    // $XDG_RUNTIME_DIR, $XDG_CONFIG_HOME, $XDG_DATA_HOME, $XDG_CACHE_HOME and
+    // $TMPDIR. kurono runs the browser as the system uid (0); MOZ_ALLOW_ROOT
+    // didn't take (lost across the launcher's re-exec), so make every dir gecko
+    // stats owned by 0 to match geteuid() and pass the guard. (satoru)
+    KVFS::Chown("/home/user", 0, 0);
+    KVFS::Chown("/home/user/.config", 0, 0);
+    KVFS::Chown("/home/user/.cache", 0, 0);
+    KVFS::Chown("/home/user/.local", 0, 0);
+    KVFS::Chown("/home/user/.local/share", 0, 0);
+    KVFS::Chown("/home/user/.mozilla", 0, 0);
+    KVFS::Chown("/system/run/user/1000", 0, 0);
+    KVFS::Chown("/tmp", 0, 0);
+
     // the launcher's IsInstalled() gate wants a readable deps manifest at
     // /system/lib/firefox-deps.manifest. the package ships its own list at
     // /apps/firefox/firefox-deps.manifest  -  copy it across (small text). (satoru)

@@ -492,6 +492,9 @@ void Init() {
        "MOZ_X11_EGL=0\n"
        "MOZ_DISABLE_GPU_SANDBOX=1\n"
        "MOZ_DISABLE_CONTENT_SANDBOX=1\n"
+       // gecko runs as the system uid (0) with $HOME owned by uid 1000; this is
+       // its official override for the "running as root" startup refusal. (satoru)
+       "MOZ_ALLOW_ROOT=1\n"
        "GALLIUM_DRIVER=llvmpipe\n"
        "WAYLAND_DISPLAY=wayland-0\n"
        "DBUS_SESSION_BUS_ADDRESS=unix:path=/system/run/user/1000/bus\n"

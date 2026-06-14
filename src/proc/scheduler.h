@@ -55,7 +55,12 @@ enum UserMemoryRegionFlags : uint32_t {
     USER_REGION_MMAP        = 1 << 2,
 };
 
-constexpr int PROCESS_MAX_USER_REGIONS = 32;
+// firefox's gecko closure is ~54 shared objects; even with adjacent same-prot
+// reservations coalescing, libxul (loaded last, 133 mb) + the scattered musl
+// malloc arenas + per-dso .bss anon maps blow past 32 -> add_region() returned
+// null -> mmap -ENOMEM -> musl "Out of memory" loading libxul. give the region
+// table real headroom (each slot is 28 bytes; 256 -> ~7 kb/process). (satoru)
+constexpr int PROCESS_MAX_USER_REGIONS = 256;
 
 struct UserMemoryRegion {
     uint64_t start;
