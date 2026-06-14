@@ -102,10 +102,30 @@ int Ext4::Mount(Ext4BlockRead read_fn, Ext4BlockWrite write_fn,
         return -2;
     }
 
+    // s_log_block_size is attacker-controlled; a large value overflows the
+    // 1024<<n shift (and the result would index past block_cache). cap it so
+    // block_size lands in [MIN,MAX]. (satoru)
+    if (sb.s_log_block_size > 16) {
+        SerialLogger::Log("[ext4] Bad s_log_block_size\r\n");
+        return -3;
+    }
     block_size = EXT4_BLOCK_SIZE_MIN << sb.s_log_block_size;
-    if (block_size > EXT4_BLOCK_SIZE_MAX) {
+    if (block_size < EXT4_BLOCK_SIZE_MIN || block_size > EXT4_BLOCK_SIZE_MAX) {
         SerialLogger::Log("[ext4] Block size too large\r\n");
         return -3;
+    }
+
+    // s_blocks_per_group / s_inodes_per_group come straight off disk and are
+    // used as DIVISORS in group-count and inode-location math (here, plus
+    // GetInodeBlock / Alloc* / Free*). a zero from a corrupt or malicious
+    // superblock is a guaranteed divide-by-zero (#DE) at mount. inodes/group
+    // must also fit one block's inode bitmap (block_size*8 bits) or later
+    // bitmap scans run off the end. reject the superblock. (satoru)
+    if (sb.s_blocks_per_group == 0 || sb.s_inodes_per_group == 0 ||
+        sb.s_inodes_per_group > block_size * 8) {
+        SerialLogger::Log("[ext4] Bad per-group counts (blocks/group or "
+                          "inodes/group); refusing mount\r\n");
+        return -4;
     }
 
     inodes_per_group = sb.s_inodes_per_group;
@@ -203,10 +223,21 @@ uint64_t Ext4::ExtentLogicalToPhysical(Ext4Inode* inode,
     // out-of-bounds read past the inode. reject corrupt headers. (satoru)
     if (eh->eh_depth > 5 || eh->eh_entries > eh->eh_max) return 0;
 
+    // eh_max itself is on-disk and unbounded  -  clamping only against it lets a
+    // corrupt eh_max (e.g. 60000) admit an eh_entries that walks far past the
+    // inline area. the i_block inline header has room for exactly
+    // (sizeof(i_block) - header) / sizeof(extent) entries; bound the scan to the
+    // real inline capacity regardless of eh_max. (satoru)
+    const uint32_t inline_cap =
+        (uint32_t)(sizeof(((Ext4Inode*)0)->i_block) - sizeof(Ext4ExtentHeader))
+        / (uint32_t)sizeof(Ext4Extent);
+    uint32_t entries = eh->eh_entries;
+    if (entries > inline_cap) entries = inline_cap;
+
     if (eh->eh_depth == 0) {
         // leaf node  -  scan extents
         Ext4Extent* ext = (Ext4Extent*)(eh + 1);
-        for (int i = 0; i < eh->eh_entries; i++) {
+        for (uint32_t i = 0; i < entries; i++) {
             uint32_t start = ext[i].ee_block;
             uint32_t len = ext[i].ee_len;
             if (len > 32768) len = len - 32768;  // uninitialized extent
@@ -219,11 +250,12 @@ uint64_t Ext4::ExtentLogicalToPhysical(Ext4Inode* inode,
         return 0;
     }
 
-    // internal index node  -  find the right child
+    // internal index node  -  find the right child (Ext4ExtentIdx is the same
+    // 12 bytes as Ext4Extent, so the inline capacity bound is identical). (satoru)
     Ext4ExtentIdx* idx = (Ext4ExtentIdx*)(eh + 1);
     int found = -1;
-    for (int i = 0; i < eh->eh_entries; i++) {
-        if (logical_block >= idx[i].ei_block) found = i;
+    for (uint32_t i = 0; i < entries; i++) {
+        if (logical_block >= idx[i].ei_block) found = (int)i;
         else break;
     }
     if (found < 0) return 0;
@@ -248,12 +280,22 @@ uint64_t Ext4::ExtentWalkIndex(uint64_t index_block,
     if (eh->eh_magic != 0xF30A) { KernelHeap::Free(buf); return 0; }
     if (eh->eh_entries > eh->eh_max) { KernelHeap::Free(buf); return 0; }  // OOB guard: don't scan past the block (satoru)
 
+    // eh_max is on-disk and unbounded, so also clamp eh_entries to the real
+    // capacity of one block: (block_size - header) / sizeof(entry). a corrupt
+    // eh_max that admits a huge eh_entries would otherwise read off the end of
+    // this block buffer. (satoru)
+    const uint32_t block_cap =
+        (block_size - (uint32_t)sizeof(Ext4ExtentHeader))
+        / (uint32_t)sizeof(Ext4Extent);
+    uint32_t entries = eh->eh_entries;
+    if (entries > block_cap) entries = block_cap;
+
     uint64_t result = 0;
 
     if (depth == 0) {
         // leaf level
         Ext4Extent* ext = (Ext4Extent*)(eh + 1);
-        for (int i = 0; i < eh->eh_entries; i++) {
+        for (uint32_t i = 0; i < entries; i++) {
             uint32_t start = ext[i].ee_block;
             uint32_t len = ext[i].ee_len;
             if (len > 32768) len -= 32768;
@@ -267,8 +309,8 @@ uint64_t Ext4::ExtentWalkIndex(uint64_t index_block,
     } else {
         Ext4ExtentIdx* idx = (Ext4ExtentIdx*)(eh + 1);
         int found = -1;
-        for (int i = 0; i < eh->eh_entries; i++) {
-            if (logical_block >= idx[i].ei_block) found = i;
+        for (uint32_t i = 0; i < entries; i++) {
+            if (logical_block >= idx[i].ei_block) found = (int)i;
             else break;
         }
         if (found >= 0) {
@@ -585,6 +627,9 @@ int Ext4::WriteInodeData(Ext4Inode* inode, uint32_t ino,
 
 int Ext4::DirLookup(Ext4Inode* dir_inode, const char* name,
                      uint32_t* ino_out) {
+    // a null dir inode dereferences below; reject defensively so no caller can
+    // turn a bad path into a null-deref crash. (satoru)
+    if (!dir_inode) return -1;
     uint64_t dir_size = dir_inode->i_size_lo |
                         ((uint64_t)dir_inode->i_size_high << 32);
     int name_len = e4_slen(name);
@@ -605,7 +650,13 @@ int Ext4::DirLookup(Ext4Inode* dir_inode, const char* name,
         uint32_t off = 0;
         while (off < block_size) {
             Ext4DirEntry2* de = (Ext4DirEntry2*)(buf + off);
-            if (de->rec_len == 0) break;
+            // validate the on-disk rec_len BEFORE trusting it to advance: a
+            // dirent header is 8 bytes, the record must fit the rest of the
+            // block, and the name must fit inside the record. a corrupt rec_len
+            // would otherwise OOB-read and either loop forever or desync the
+            // walk. stop the walk on any violation. (satoru)
+            if (de->rec_len < 8 || off + de->rec_len > block_size ||
+                (uint32_t)8 + de->name_len > de->rec_len) break;
             if (de->inode != 0 && de->name_len == name_len &&
                 e4_seqn(de->name, name, name_len)) {
                 *ino_out = de->inode;
@@ -647,10 +698,18 @@ int Ext4::DirAddEntry(uint32_t dir_ino, uint32_t new_ino,
         uint32_t off = 0;
         while (off < block_size) {
             Ext4DirEntry2* de = (Ext4DirEntry2*)(buf + off);
-            if (de->rec_len == 0) break;
+            // validate the on-disk rec_len before using it (header is 8 bytes,
+            // record fits the block, name fits the record). without this a
+            // corrupt rec_len makes `slack` underflow and the split path writes
+            // an entry out of bounds. stop the walk on violation. (satoru)
+            if (de->rec_len < 8 || off + de->rec_len > block_size ||
+                (uint32_t)8 + de->name_len > de->rec_len) break;
 
             uint16_t actual = (uint16_t)(8 + de->name_len + 3) & ~3;
-            uint16_t slack = de->rec_len - actual;
+            // `actual` rounds up; if it overruns the record there is no usable
+            // slack here  -  skip this entry rather than underflow. (satoru)
+            uint16_t slack = (actual <= de->rec_len)
+                             ? (uint16_t)(de->rec_len - actual) : 0;
 
             if (de->inode == 0 && de->rec_len >= needed) {
                 // reuse deleted entry
@@ -789,7 +848,12 @@ int Ext4::DirRemoveEntry(uint32_t dir_ino, const char* name) {
         uint32_t off = 0;
         while (off < block_size) {
             Ext4DirEntry2* de = (Ext4DirEntry2*)(buf + off);
-            if (de->rec_len == 0) break;
+            // validate rec_len before trusting it (header 8 bytes, fits the
+            // block, name fits the record). a corrupt rec_len would OOB-read /
+            // desync the walk, and coalescing prev->rec_len += de->rec_len on
+            // garbage would write a bogus length back to disk. (satoru)
+            if (de->rec_len < 8 || off + de->rec_len > block_size ||
+                (uint32_t)8 + de->name_len > de->rec_len) break;
 
             if (de->inode != 0 && de->name_len == name_len &&
                 e4_seqn(de->name, name, name_len)) {
@@ -1139,7 +1203,11 @@ int Ext4::ListDir(const char* path, Ext4DirInfo* entries, int max) {
         uint32_t off = 0;
         while (off < block_size && count < max) {
             Ext4DirEntry2* de = (Ext4DirEntry2*)(buf + off);
-            if (de->rec_len == 0) break;
+            // validate rec_len before trusting it (header 8 bytes, fits the
+            // block, name fits the record). a corrupt rec_len/name_len would
+            // OOB-read the name out of the block or desync the walk. (satoru)
+            if (de->rec_len < 8 || off + de->rec_len > block_size ||
+                (uint32_t)8 + de->name_len > de->rec_len) break;
 
             if (de->inode != 0) {
                 // copy entry info
@@ -1290,9 +1358,13 @@ int Ext4::Mkdir(const char* path, uint16_t mode) {
     uint32_t parent_ino;
     if (PathWalk(parent_path, &parent_ino) != 0) return -1;
 
-    // check doesn't already exist
+    // check doesn't already exist. DirLookup dereferences the dir inode, so it
+    // must get the PARENT inode  -  passing nullptr here was a guaranteed
+    // null-deref crash. read the parent first. (satoru)
+    Ext4Inode parent_dir;
+    if (ReadInode(parent_ino, &parent_dir) != 0) return -1;
     uint32_t existing;
-    if (DirLookup(nullptr, basename, &existing) == 0) return -1;
+    if (DirLookup(&parent_dir, basename, &existing) == 0) return -1;
 
     uint32_t grp = (parent_ino - 1) / inodes_per_group;
     uint32_t new_ino;
