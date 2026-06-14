@@ -8,11 +8,9 @@ At the repository root, the files that matter most to a newcomer are these.
 
 1. `README.md`
 2. `STATUS.md`
-3. `start.ps1`
+3. `start.sh` (Linux/KVM launcher  -  the path used day to day) / `start.ps1` (Windows/WHPX)
 4. `docs/`
 5. `src/`
-
-`archive/` exists for history and recovery, not for day to day development.
 
 ## 2. The source tree at a glance
 

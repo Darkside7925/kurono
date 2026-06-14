@@ -42,7 +42,7 @@ authorization decision *outside* that compromised domain:
    read the verdict (`ksa_open_window` / `ksa_close_window`), re-isolating
    between frames. The main-OS compositor never receives a pointer into the
    region; only the composited frame is blitted to the screen. The prompt is a
-   **real on-screen modal** (see §9): it dims the desktop, shows the action +
+   **real on-screen modal** (see §8): it dims the desktop, shows the action +
    requesting identity, a credential field when the policy needs one, and
    clickable **Approve / Deny** buttons, and it blocks the escalation on live
    keyboard + mouse input.
@@ -159,7 +159,7 @@ disable-passwd refused while KSA off; disable-kvault refused without
 force/ack; disable-kvault refused while passwd off; sovereign override; both-off
 risk warning; `auth=both` gated on KSA availability; password verification.
 
-## 9. The interactive on-screen prompt
+## 8. The interactive on-screen prompt
 
 When `RunEscalationGate` requires the KSA factor (`policy auth=kvault` or
 `both`), `KSA::Prompt()` renders a **real modal confirmation panel on the
@@ -224,7 +224,7 @@ a QMP `send-key ret` Enter flows through as `verdict=APPROVE`, a correctly typed
 credential yields `cred-hash present`, and the desktop is restored cleanly after
 the prompt closes.
 
-## 10. Related files
+## 9. Related files
 
 - `src/security/ksa.{cpp,h}`  -  KSA module (spawn / isolate / prompt / channel / self-test / `PromptDemo`)
 - `src/security/supr.{cpp,h}`  -  auth policy, escalation gate, Sovereign role, audit actions

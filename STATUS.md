@@ -25,16 +25,16 @@ Big one this month: I moved the whole dev setup off Windows/WHPX onto **Linux + 
 
 ## Current State
 
-The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, and runs in QEMU with a full graphical desktop, 19 hardware drivers, a complete TCP/IP stack, 76+ shell commands, emergency recovery boot paths, an installer stack, and a Type 1 hypervisor with an Alpine/Debian guest-boot path. **Honest caveat:** booting a Linux guest needs the host to expose *nested* VT-x to Kurono; under plain nested KVM (Kurono itself a guest) the guest VM-entry fails with a VMX entry error, so guest boot is confirmed only where nested VMX is available.
+The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, and runs in QEMU with a full graphical desktop, 19 hardware drivers, a complete TCP/IP stack, ~150 shell commands, emergency recovery boot paths, an installer stack, and a Type 1 hypervisor with an Alpine/Debian guest-boot path. **Honest caveat:** booting a Linux guest needs the host to expose *nested* VT-x to Kurono; under plain nested KVM (Kurono itself a guest) the guest VM-entry fails with a VMX entry error, so guest boot is confirmed only where nested VMX is available.
 
 ### Build Info
 - **Architecture:** x86_64 bare-metal (no libc)
 - **Language:** C++17 + NASM assembly
 - **Toolchain:** x86_64-elf cross-compiler (fallback: native g++ -m64)
-- **Source files:** ~65 C++ + 1 ASM
+- **Source files:** ~171 C/C++ implementation files (166 `.cpp` + 5 `.c`), ~161 headers, 9 assembly files (8 `.asm` + 1 `.S`); ~130,000 hand-written lines (raw `wc -l` over `src/` is ~337k, but ~207k of that is the two embedded raw-RGBA wallpaper headers and ~13k is vendored third_party)
 - **Primary outputs:** `build/kurono.elf`, `build/kurono.iso`, `build/kurono_efi.efi`, `build/kurono_emergency.efi`
 - **Build errors:** 0
-- **QEMU target:** `qemu-system-x86_64` with KVM on Linux (WHPX on Windows), 4 GB RAM, **`-smp 4`** (all cores boot + run kernel code in parallel; `start.sh` defaults to 4), virtio-gpu + tap/NAT networking + xHCI USB
+- **QEMU target:** `qemu-system-x86_64` with KVM on Linux (WHPX on Windows). `start.sh` defaults to **8 GB RAM** + **`-smp 4`**; `start.ps1` defaults to 10 GB + `-smp 4`. All cores boot + run kernel code in parallel; virtio-gpu + tap/NAT networking + xHCI USB
 
 ---
 
@@ -110,12 +110,12 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - [x] **Text Editor** -- Create/save/load files on KVFS
 - [~] **Browser**  -  the GUI tile is a deliberate placeholder (use `curl <url>` today). The real browser path is **Firefox on the Linux runtime**: Firefox 140.11.0esr is cross-compiled against musl + Wayland (see *Firefox-Class Userspace Runtime* below), and the OS provides the syscalls/IPC/Wayland it targets. Bringing libxul on-device + lifting the <4 GB pointer ABI is what's left to run it.
 - [x] **Media Player v2.0** -- Real video viewport rendering (raw data visualization with FPS counter, scanline effect, cinematic vignette), heap-allocated 256KB decode buffer (was 32KB), correct file_size via KVFS::GetFileSize(), cached video metadata (no per-frame file reads), codec badge + backend indicator + volume slider, audio SB16→AC97→HDA routing
-- [x] **Settings** -- 10-tab settings with real resolution change via BGA::SetMode, deferred apply, apps reopen after switch
+- [x] **Settings** -- 12-tab settings (`STAB_COUNT=12`: Display/Sound/Network/Storage/Power/Personalize/Security/Packages/Updates/System/About/Accessibility) with real resolution change via BGA::SetMode, deferred apply, apps reopen after switch
 - [x] **Task Manager** -- Process list, CPU/memory stats, auto-refresh
 
-### Hybrid Shell (76 Commands)
-- [x] **KuronoShell** -- Command registry (256 max), environment switching, variable expansion, aliases, history (128 entries)
-- [x] **Linux commands (58)** -- ls, cd, cat, grep, find, sort, uniq, head, tail, wc, chmod, stat, df, du, ln, ps, kill, free, mount, dmesg, ifconfig, ping, wget, curl, lspci, lsusb, lsblk, lscpu, modprobe, modinfo, insmod, rmmod, dmidecode, hwinfo, top, iotop, ip, ss, tr, tee, uname, uptime, whoami, hostname, date, which, linux-exec, syscall, vm, and more
+### Hybrid Shell (~153 commands)
+- [x] **KuronoShell** -- Command registry (256 max), environment switching, variable expansion, aliases, history (128 entries). ~153 distinct commands are registered across the whole tree (`RegisterCommand` calls in `src/shell/*`, `src/apps/kj.cpp`, `src/kcl/`, `src/packages/`, `src/linux/`, `src/net/`, `src/system/installer.cpp`, etc.)
+- [x] **Linux commands (63)** -- ls, cd, cat, grep, find, sort, uniq, head, tail, wc, chmod, stat, df, du, ln, ps, kill, free, mount, dmesg, ifconfig, ping, wget, curl, lspci, lsusb, lsblk, lscpu, modprobe, modinfo, insmod, rmmod, dmidecode, hwinfo, top, iotop, ip, ss, tr, tee, uname, uptime, whoami, hostname, date, which, journal, linux-exec, syscall, vm, alpine, apk, apt, debian, and more (63 distinct registered in `src/shell/linux_cmds.cpp`)
 - [x] **Windows commands (18)** -- dir, copy, move, del, type, md, rd, ren, cls, findstr, tasklist, taskkill, systeminfo, ipconfig, ver, tree, attrib, chkdsk
 - [x] **All commands pull real driver data** -- lspci reads PCI, lsusb reads USB, ifconfig reads E1000, free reads heap, ps reads scheduler, etc.
 - [x] **Environment switching** -- `switch linux`, `switch windows`, `switch kurono`, `bash`, `cmd`
@@ -146,8 +146,8 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - [x] **Limits** -- 16 sockets, 8 KB RX/TX buffers, 1460 MSS
 
 ### Linux Subsystem
-- [x] **67 syscall numbers** defined (LSYS_*)
-- [x] **35+ real syscall handlers** -- exit, read, write, open, close, lseek, brk, getpid, getuid, getgid, stat, fstat, uname, getcwd, chdir, mkdir, rmdir, unlink, access, dup, dup2, ioctl, writev, mmap, munmap, nanosleep, getdents64, clock_gettime, set_thread_area, exit_group, and more
+- [x] **177 syscall numbers** defined (`LSYS_*` in `src/linux/linux_syscall.h`)
+- [x] **~155 real syscall handlers** (case arms in `src/linux/linux_syscall.cpp`) -- exit, read, write, open, close, lseek, brk, getpid, getuid, getgid, stat, fstat, uname, getcwd, chdir, mkdir, rmdir, unlink, access, dup, dup2, ioctl, writev, mmap, munmap, nanosleep, getdents64, clock_gettime, set_thread_area, exit_group, futex, clone, epoll_*, mprotect, memfd_create, sendmsg/recvmsg (SCM_RIGHTS), and many more
 - [x] **Process management** -- up to 16 Linux processes, 64 FDs per process, brk heap (0x08100000-0x0C000000), cwd tracking
 - [x] **Signal handling** -- 30 POSIX signals (SIGHUP through SIGPWR)
 - [x] **Device nodes** -- /dev/null, /dev/zero, /dev/random, /dev/tty
@@ -189,7 +189,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - [x] **ISO build validation** -- `make iso` completed successfully after the installer payload pipeline changes
 
 ### Security and Scripting
-- [x] **SUPR** -- Privilege escalation with timeout, audit logging, permission levels (Guest/User/Admin/Root), password hashing with salt
+- [x] **SUPR** -- Privilege escalation with timeout, audit logging, permission levels (Guest/User/Admin/Root/**Sovereign**), salted password hashing, and a sudo-style reroute: `supr <cmd> [args]` runs any command elevated (gated by the auth policy, collected via the KSA modal; `supr whoami` reports the elevated identity, guest is denied)  -  see `SUPR::SudoBegin`/`SudoEnd` and `cmd_supr` in `src/shell/shell.cpp`
 - [x] **User management** -- Multi-user, groups, home directories, session tracking
 - [x] **KCL (Kurono Command Language)** -- complete tree-walking scripting language: lexer + recursive-descent parser + interpreter over a tagged value type (int/float/string/bool/list/none). Variables (`set x = expr`), arithmetic + string concat, comparisons, boolean logic (and/or/not), `if`/`elif`/`else`/`end`, `while`, `for x in a..b`/list/string, `func`/`return` with recursion, lists (literals/index/append/remove/len), `import`, `#` comments + shebang. Stdlib: print, input, len, str, int, float, sqrt, rand, abs, min, max, type, read, write, exists, exec, sleep, upper, lower. Errors carry line numbers and never crash the OS. Run via `kcl file.kcl` / `kcl -c "code"` / `.kcl` shebang / File Manager double-click. Verified by an 11-test self-test suite (`kurono.kcltest`, 11/11 PASS headless).
 - [x] **Package manager (kpkg)** -- install, remove, update, search, list, dependency support, 64 max packages
@@ -204,10 +204,10 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - **Per-segment ASLR** with RDTSC-derived entropy in the user range `0x500000_0000` - `0x700000_0000`, page-aligned, span-clamped.
 - **Recursive DT_NEEDED resolution** with circular-dep tracking and SONAME-based deduplication. Search path: `LD_LIBRARY_PATH` (ignored if setuid) → `/system/lib` → `/system/lib/kurono` → `/system/lib/x86_64-linux-gnu` → `/apps/lib` → `/system/local/lib` → `/home/user/.local/lib`. Internal `ld-linux*` and `ld-kurono.so` references are short-circuited (the linker IS the kernel).
 - **Symbol lookup**: GNU_HASH primary path (bloom filter + bucket + chain), SYSV hash fallback, linear scan as a last resort. `STB_GLOBAL` / `STB_WEAK` / `STB_LOCAL` and `STV_DEFAULT` / `STV_HIDDEN` / `STV_PROTECTED` / `STV_INTERNAL` honoured. Versioned lookup via `DT_VERSYM` / `DT_VERDEF` / `DT_VERNEED`.
-- **Full x86_64 relocation set** -- 23 types: `NONE`, `64`, `PC32`, `PC64`, `PLT32`, `GOTPCREL`, `GOTPCRELX`, `REX_GOTPCRELX`, `32`, `32S`, `GLOB_DAT`, `JUMP_SLOT`, `RELATIVE`, `IRELATIVE`, `COPY`, `TPOFF32/64`, `DTPMOD64`, `DTPOFF32/64`, `TLSDESC`, `TLSGD`, `TLSLD`, `GOTTPOFF`. Eager binding (matches `DT_BIND_NOW` / `LD_BIND_NOW=1` semantics).
+- **Full x86_64 relocation set** -- 24 types handled (distinct `case R_X86_64_*` arms): `NONE`, `64`, `PC32`, `PC64`, `PLT32`, `GOTPCREL`, `GOTPCRELX`, `REX_GOTPCRELX`, `32`, `32S`, `GLOB_DAT`, `JUMP_SLOT`, `RELATIVE`, `IRELATIVE`, `COPY`, `TPOFF32`, `TPOFF64`, `DTPMOD64`, `DTPOFF32`, `DTPOFF64`, `TLSDESC`, `TLSGD`, `TLSLD`, `GOTTPOFF`. Eager binding (matches `DT_BIND_NOW` / `LD_BIND_NOW=1` semantics).
 - **PT_GNU_RELRO enforcement** -- after relocations the linker re-protects the relro region as `PTE_USER | PTE_NX` (read-only).
 - **Static TLS** -- variant-2 layout with monotonic offset assignment, per-module ID. `arch_prctl(ARCH_SET_FS)` already wired in the syscall layer.
-- **vDSO** -- 4 KB ELF64 stub mapped at `0x7FFFF7FFC000` exporting `__vdso_clock_gettime` (NR 228), `__vdso_gettimeofday` (NR 96), `__vdso_time` (NR 201), `__vdso_getcpu` (NR 309) as `mov rax, NR; syscall; ret` trampolines. Surfaced via `AT_SYSINFO_EHDR`.
+- **vDSO** -- 4 KB ELF64 stub built at `0x7FFFF7FFC000` exporting `__vdso_clock_gettime` (NR 228), `__vdso_gettimeofday` (NR 96), `__vdso_time` (NR 201), `__vdso_getcpu` (NR 309) as `mov rax, NR; syscall; ret` trampolines. **Currently NOT advertised**  -  `AT_SYSINFO_EHDR` is set to `0` (commit `919820b`): the synthesized page lacks a musl-parseable `PT_DYNAMIC`, so musl's vdso decode walked a null `dynv` and `#PF`'d in `decode_vec`; with `AT_SYSINFO_EHDR=0` musl skips the vdso and falls back to plain `syscall`s. The page is still built (so the address is valid) but the loader is told it isn't there.
 - **Auxv builder** -- pushes `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_FLAGS`, `AT_ENTRY`, `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_SECURE`, `AT_RANDOM` (16 bytes of RDTSC entropy on the stack), `AT_HWCAP` (`0x0001f8bb`), `AT_HWCAP2`, `AT_CLKTCK=100`, `AT_PLATFORM="x86_64"`, `AT_EXECFN`, `AT_SYSINFO_EHDR`. Full SysV stack frame: `argc / argv[]+NULL / envp[]+NULL / auxv[]+AT_NULL / strings`.
 - **Constructor trampoline** -- `build_init_trampoline()` emits a real user-mode bootstrap shim (one page, hand-encoded x86_64 machine code) that walks every queued `DT_INIT` and `DT_INIT_ARRAY` entry in dependency order, preserves SysV `(rdi=argc, rsi=argv, rdx=envp)` between calls (re-materialised from `r12`/`r14` via `lea rdx, [r14 + r12*8 + 8]`), then tail-jumps to the program's real entry. The kernel sets RIP to this trampoline so ctors run with the correct user CR3, FS, and SS.
 - **Public API** -- `Init`, `MapVDSO`, `ExecPIE`, `Dlopen`, `Dlclose`, `Dlsym`, `Dlvsym`, `Dladdr`, `Dlerror`, `IsLoaded`, `LoadedCount`, `DumpMaps`, `DlDebugStateNotify`. All `RTLD_*` flags (`LAZY` / `NOW` / `GLOBAL` / `LOCAL` / `NOLOAD` / `DEEPBIND` / `NODELETE`) plus `RTLD_DEFAULT` and `RTLD_NEXT`.

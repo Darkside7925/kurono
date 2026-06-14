@@ -28,8 +28,17 @@ These are the commands a Linux user would expect. Representative list:
 | `ifconfig` | Network interface info |
 | `ping` | ICMP echo |
 | `curl` | HTTP fetch via TCP/IP stack |
-| `apt` | Package manager frontend |
-| `sudo` | Privilege escalation stub |
+| `wget` | HTTP download |
+| `apt` | Debian package manager frontend |
+| `alpine` / `apk` / `debian` | guest package/management bridges |
+
+> `echo` is **not** a Linux command  -  it is a Kurono-native builtin (registered
+> in `shell.cpp` with `ENV_KURONO`). There is **no `sudo` command**; privilege
+> escalation is done with the native `supr` command (`supr <cmd>` runs a command
+> elevated  -  see [../security/SUPR.md](../security/SUPR.md)).
+>
+> `linux_cmds.cpp` registers **63 distinct commands**  -  the table above is a
+> representative subset, not the full list.
 
 ## 2. KVFS backing
 
@@ -37,11 +46,16 @@ All file operations work against the KVFS virtual filesystem. `ls`, `cat`, `mkdi
 
 ## 3. Registration
 
-All commands in this file are registered in bulk during `RegisterBuiltins()` inside `shell.cpp`. The category for these commands is `"linux"` or the more specific `"files"`, `"network"`, etc.
+All commands in this file are registered in bulk by `LinuxCmds::RegisterAll(sh)`
+(in `linux_cmds.cpp`, invoked from shell init)  -  *not* by `RegisterBuiltins()` in
+`shell.cpp`. Their `category` is one of `filesystem`, `text`, `system`,
+`network`, or `package`, and most use the `ENV_LINUX` (or `ENV_AUTO`)
+environment flag so they appear in the Linux shell surface.
 
 ## 4. Related files
 
-- `src/shell/shell.cpp`  -  registration and dispatch
+- `src/shell/linux_cmds.cpp` / `.h`  -  the commands + `RegisterAll`
+- `src/shell/shell.cpp`  -  the registry + dispatch they hook into
 - `src/fs/kvfs.cpp`  -  filesystem operations
 - `src/net/network.cpp`  -  used by `ping` and `ifconfig`
 - `src/packages/pkgmgr.cpp`  -  used by `apt`

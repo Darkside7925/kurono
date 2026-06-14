@@ -238,10 +238,15 @@ Important files:
 | File | Role |
 | --- | --- |
 | `input_manager.*` | input device registration and keyboard callback route |
-| `logging.*` | runtime log mirroring |
-| `installer.*` | disk discovery and deployment planning |
+| `logging.*` | runtime logging (boot/system/serial/network/security/crash) |
+| `kpaths.h` | the canonical `/kurono` on-disk path layout (single source of truth) |
+| `installer.*` / `installer_gui.*` | disk discovery + deployment planning; graphical setup wizard |
+| `runtime_layout.*` | Linux runtime layout seeder (`/system` tree, firefox.env) |
+| `dbus_server.*` | D-Bus session bus daemon |
+| `system_update.*` | boot-time staged-rootfs / update flow |
+| `ui_config.*` | `/etc/kurono/ui.conf` theme tokens |
 | `user_mgmt.*` | user data and account services |
-| `conduit.*` | system bridge logic |
+| `conduit.*` | system bridge logic (also the GUI Conduit app) |
 
 ## 13. Security
 
@@ -249,7 +254,9 @@ Folder: `src/security`
 
 Purpose: privilege management and escalation policy.
 
-Main file: `supr.*`
+Files: `supr.*` (the SUPR privilege engine, roles, auth policy, the `supr <cmd>`
+sudo-style reroute) and `ksa.*` (KSA  -  hypervisor-backed authorization prompts in
+an EPT-isolated region; see `security/KSA.md`).
 
 ## 14. Packages
 
@@ -261,19 +268,24 @@ Main file: `pkgmgr.*`
 
 ## 15. Scripting
 
-Folder: `src/kcl`
+Folders: `src/kcl` and `src/apps`
 
-Purpose: Kurono Command Language.
+Purpose: in-OS scripting languages.
 
-Main file: `kcl.*`
+- `kcl/kcl.*`  -  KCL (Kurono Command Language), a tree-walking interpreter.
+- `apps/kj.*`  -  KJ (Kurono JavaScript), a freestanding JS-subset interpreter
+  exposed as the `kj` / `node` commands, with `kss`/`ui` host bindings.
 
 ## 16. Process scheduling
 
 Folder: `src/proc`
 
-Purpose: process objects, queue handling, tick based progression, and execution bookkeeping.
+Purpose: process objects, queue handling, tick-based progression, execution
+bookkeeping, and multi-core bring-up.
 
-Main file: `scheduler.*`
+Files: `scheduler.*` (the cross-core ready-queue lock + per-CPU pick), `smp.*`
+(LAPIC, MADT parse, AP bring-up, per-CPU blocks; see `proc/SMP.md`),
+`kernel_processes.*` (built-in kernel processes), `cgroup.*` (cgroups v2).
 
 ## 17. Media and third party glue
 

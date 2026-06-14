@@ -46,7 +46,11 @@ Example session:
 
 ## 4. Registration
 
-KCL commands are registered with `RegisterBuiltins()` in the shell startup sequence. The `kcl` command category is `"kcl"`.
+The `kcl` command is registered by KCL itself, in `src/kcl/kcl.cpp`
+(`RegisterCommand("kcl", "Run KCL script", ENV_KURONO, "scripting", cmd_kcl)`)  - 
+not in `shell.cpp`'s `RegisterBuiltins()`. Its category is `"scripting"`.
+Separately, `shell.cpp` recognizes a `.kcl` path on the command line and runs it
+through `KCL::ExecFile()`.
 
 ## 5. Use cases
 

@@ -1201,6 +1201,10 @@ void seed_searchpath(ProcLinkerState* pls, const char* env_ld_library_path) {
     add("/system/lib/kurono");
     add("/system/lib/x86_64-linux-gnu");
     add("/apps/lib");
+    // firefox ships its whole .so closure (incl. the musl loader) here; keep it
+    // on the default path so the exe resolves even without LD_LIBRARY_PATH set.
+    // (satoru)
+    add("/apps/firefox/lib");
     add("/system/local/lib");
     add("/home/user/.local/lib");
 }

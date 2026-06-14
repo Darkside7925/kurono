@@ -1058,7 +1058,9 @@ int TCPStack::Socket(int type) {
             sockets[i].type = type;
             sockets[i].local_ip = local_ip;
             sockets[i].tcp_state = TCP_CLOSED;
-            sockets[i].tcp_window = TCP_RX_BUFSIZE;
+            // tcp window is a 16-bit field; clamp (TCP_RX_BUFSIZE is now 64 kb,
+            // which would wrap to 0 in a uint16_t). recomputed per-send. (satoru)
+            sockets[i].tcp_window = (TCP_RX_BUFSIZE > 0xFFFF) ? 0xFFFF : (uint16_t)TCP_RX_BUFSIZE;
             sockets[i].rx_head = 0;
             sockets[i].rx_tail = 0;
             sockets[i].rx_count = 0;
@@ -1240,12 +1242,32 @@ int TCPStack::Recv(int sock, void* buf, int max_len) {
     NetSocket* s = &sockets[sock];
     if (s->rx_count == 0) return 0;
 
+    // free space BEFORE we drain  -  this is roughly what the peer last saw us
+    // advertise. (satoru)
+    int free_before = TCP_RX_BUFSIZE - s->rx_count;
+
     uint8_t* dst = (uint8_t*)buf;
     int count = 0;
     while (count < max_len && s->rx_count > 0) {
         dst[count++] = s->rx_buf[s->rx_head];
         s->rx_head = (s->rx_head + 1) % TCP_RX_BUFSIZE;
         s->rx_count--;
+    }
+
+    // window-update ack: on a bulk download the rx ring fills and our
+    // advertised window collapses toward 0, so the peer stops sending. once the
+    // app drains the ring the window reopens  -  but tcp only learns that if we
+    // emit a segment. without this, slirp deadlocks waiting for a window update
+    // that never comes (the 235 mb firefox tar stalled after ~4 kb). when the
+    // window was small before the drain and is now substantially larger, send a
+    // pure ack carrying the fresh (large) window. SendTCP recomputes the window
+    // from rx_count at emission time. (satoru)
+    if (count > 0 && s->type == SOCK_STREAM && s->tcp_state == TCP_ESTABLISHED) {
+        int free_after = TCP_RX_BUFSIZE - s->rx_count;
+        if (free_before < (TCP_RX_BUFSIZE / 2) &&
+            free_after - free_before >= (TCP_MSS * 2)) {
+            SendTCP(s, TCP_FLAG_ACK, nullptr, 0);
+        }
     }
     return count;
 }

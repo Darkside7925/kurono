@@ -14,79 +14,76 @@ This guide covers:
 
 ## 1. KCL Language Reference
 
-KCL is a simple imperative scripting language. All variables are global and dynamically typed (integer or string).
+KCL is a tree-walking interpreted language with typed values (int, float, string,
+bool, list, none). See **[../kcl/KCL.md](../kcl/KCL.md)** and
+**[../kcl/KCL_REFERENCE.md](../kcl/KCL_REFERENCE.md)** for the authoritative
+grammar  -  the summary below matches the real `src/kcl/kcl.cpp` parser.
 
 ### Variables
 
-```
-set name value      # declare or update a variable
-let x 42            # alias for set
-name = "Kurono"     # inline assignment
-```
+Assignment **requires `=`** (`set x value` without `=` is a parse error):
 
-Built-in constants:
-- `PI` = 3
-- `VERSION` = "1.0.0"
-- `OS` = "Kurono"
-- `TRUE` = 1
-- `FALSE` = 0
+```
+set x = 10          # declare or update a variable
+let name = "Kurono" # let is accepted too
+```
 
 ### Control Flow
 
 ```
-# If/Else
-if condition then
-  print "yes"
+# If / elif / else  (blocks end with `end`)
+if x > 5
+  print("big")
+elif x > 0
+  print("small")
 else
-  print "no"
+  print("non-positive")
 end
 
 # While loop
-set i 0
-while i < 10 do
-  print i
-  set i i + 1
+set i = 0
+while i < 10
+  print(i)
+  set i = i + 1
 end
 
-# For loop (numeric range)
-for i in 1 10 do
-  print i
+# For loop over a numeric range a..b  (NOT `1 10`)
+for i in 1..10
+  print(i)
 end
 
-# Break / Continue
-while true do
-  if condition then
-    break
-  end
+# For over a list or string
+for item in [1, 2, 3]
+  print(item)
 end
+
+# break / continue work inside loops
 ```
 
 ### Built-in Functions
 
-| Function       | Description                    | Example              |
-|---------------|--------------------------------|----------------------|
-| `abs(n)`      | Absolute value                 | `abs(-5)` → 5        |
-| `min(a,b)`    | Minimum of two numbers         | `min(3,7)` → 3       |
-| `max(a,b)`    | Maximum of two numbers         | `max(3,7)` → 7       |
-| `len(s)`      | Length of string               | `len("hello")` → 5   |
-| `rand()`      | Random integer (0-32767)       | `rand()`              |
-| `time()`      | Current time in milliseconds    | `time()`              |
-| `sqrt(n)`     | Integer square root            | `sqrt(16)` → 4       |
-| `pow(b,e)`    | Power                          | `pow(2,10)` → 1024   |
-| `clamp(v,l,h)`| Clamp value to range           | `clamp(15,0,10)` → 10|
+The real stdlib (`call_builtin` in `kcl.cpp`):
+
+`print` `input` `len` `str` `int` `float` `sqrt` `rand` `abs` `min` `max` `type`
+`read` `write` `exists` `exec` `sleep` `upper` `lower` (plus the list ops
+`append` / `remove`).
+
+> Note: `pow`, `clamp`, `time`, and constants like `PI` / `VERSION` / `OS` /
+> `TRUE` / `FALSE` are **not** part of KCL  -  earlier versions of this guide listed
+> them but they do not exist in the interpreter.
 
 ### Shell Execution
 
 ```
-exec "ls -la"       # execute a shell command
-exec "curl http://example.com"  # HTTP GET
-exec "echo hello > /home/user/test.txt"  # file output
+exec("ls -la")                    # execute a shell command
+exec("curl http://example.com")   # HTTP GET
+exec("echo hello > /home/user/test.txt")
 ```
 
 ### Import
 
 ```
-import "math.kcl"   # include another KCL script
+import lib.kcl      # include another KCL script (no quotes)
 ```
 
 ### Comments
@@ -121,24 +118,26 @@ my_app/
 ### manifest.kcl
 
 ```
-set app_name "MyApp"
-set app_version "1.0.0"
-set app_author "Your Name"
-set app_type "app"
-set app_entry "main.kcl"
+set app_name = "MyApp"
+set app_version = "1.0.0"
+set app_author = "Your Name"
+set app_type = "app"
+set app_entry = "main.kcl"
 ```
+
+(The package manager reads `app_entry` from `manifest.kcl`; it defaults to
+`main.kcl`  -  see `pkgmgr.cpp`.)
 
 ### main.kcl (entry point)
 
 ```
 # Your app logic here
-print "Hello from MyApp!"
-set result 0
-for i in 1 100 do
-  set result result + i
+print("Hello from MyApp!")
+set result = 0
+for i in 1..100
+  set result = result + i
 end
-print "Sum: "
-print result
+print("Sum: " + str(result))
 ```
 
 ### Packaging
@@ -225,45 +224,40 @@ exec "taskmgr"                                 # Open task manager
 
 ```
 func greet(name)
-  print "Hello, "
-  print name
-  print "!"
+  print("Hello, " + name + "!")
 end
 
-exec greet("World")    # call the function
+greet("World")    # call the function directly (no `exec`)
 ```
 
-Functions are defined at the top level and can be called from anywhere in the script. Function arguments are numeric.
+Functions are declared with `func name(args) ... end`, support parameters,
+`return` values, and recursion, and are called directly by name (not via `exec`,
+which runs *shell* commands).
 
 ---
 
 ## 7. Debugging
 
 ```
-# Enable verbose logging
-set DEBUG 1
-
 # Print variable values
-print "x = "
-print x
-
-# Time execution
-set start time()
-# ... your code ...
-set elapsed time() - start
-print "Elapsed ms: "
-print elapsed
+print("x = " + str(x))
 ```
+
+KCL reports parse/runtime errors with line numbers and never crashes the OS, so
+the fastest debugging loop is `kcl -c "<snippet>"` in the terminal. (There is no
+built-in `time()` / `DEBUG` facility  -  use serial logs or `print` checkpoints.)
 
 ---
 
 ## 8. Best Practices
 
-1. **Keep scripts small**: KCL token limit is 256 tokens per execution
-2. **Use imports**: Split large apps into multiple .kcl files
+1. **Mind the limits**: a script source is capped at 65536 bytes and 8192 tokens
+   (`KCL_MAX_SCRIPT` / `KCL_MAX_TOKENS`); recursion depth is 20, params per func 8,
+   imports 16
+2. **Use imports**: Split large apps into multiple `.kcl` files (`import lib.kcl`)
 3. **Use exec for heavy tasks**: Shell commands are more efficient for file I/O
-4. **Test incrementally**: Run scripts line-by-line in the terminal first
-5. **Handle errors**: Check return values from exec and file operations
+4. **Test incrementally**: Run snippets with `kcl -c "..."` in the terminal first
+5. **Handle errors**: Check return values from `exec` and file operations
 
 ---
 
@@ -271,27 +265,26 @@ print elapsed
 
 ```kcl
 # ── Hello World App ──
-set app_name "HelloApp"
-print "Hello from " + app_name
-print "Running on " + OS + " v" + VERSION
+set app_name = "HelloApp"
+print("Hello from " + app_name)
 
-# ── Counter App ──  
-set count 0
-while count < 5 do
-  print count
-  set count count + 1
+# ── Counter App ──
+set count = 0
+while count < 5
+  print(count)
+  set count = count + 1
 end
 
 # ── Calculator App ──
-set a 10
-set b 20
-set result a + b * 2
-print result
+set a = 10
+set b = 20
+set result = a + b * 2
+print(result)
 
 # ── File Writer App ──
-exec "mkdir -p /home/user/MyApp"
-exec "echo 'App data' > /home/user/MyApp/data.txt"
+exec("mkdir -p /home/user/MyApp")
+exec("echo 'App data' > /home/user/MyApp/data.txt")
 
 # ── Network App ──
-exec "curl http://example.com"
+exec("curl http://example.com")
 ```

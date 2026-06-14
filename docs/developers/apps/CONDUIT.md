@@ -1,38 +1,44 @@
 # Conduit
 
-`src/apps/conduit.cpp`, `conduit.h`, `src/system/conduit.cpp`, and `src/system/conduit.h` implement the Conduit app and its underlying bridge services.
+`src/system/conduit.cpp` and `src/system/conduit.h` implement Conduit. (Note:
+Conduit lives entirely under `src/system/`  -  there is no `src/apps/conduit.*`.)
 
 ## 1. What Conduit is
 
-Conduit is Kurono's integration app for the embedded Linux guest. It provides a windowed terminal that connects to the Debian guest VM over the virtual serial link, a file browser that can access the guest filesystem via v9fs, and controls to start/stop the VM.
+Conduit is an **event / telemetry bridge** (`ConduitBridge`) plus the GUI viewer
+that displays its events. It is not a guest terminal  -  it observes the live
+system and surfaces a running dialogue of what's happening: boot/shutdown,
+package operations, GPU rendering, guest-OS switches, driver activity, and
+generic shell commands.
 
-## 2. Architecture
+## 2. The event model
 
-Conduit sits above two layers:
+`ConduitBridge` keeps a fixed ring of `ConduitEvent` records (`CONDUIT_MAX_EVENTS`),
+each with a sequence number, a `ConduitEventType`, the relevant Linux guest
+profile, and a short summary/detail. The event types (`ConduitEventType` in
+`conduit.h`) are:
 
-- **`src/virt/vserial.cpp`**  -  virtual serial port connecting Kurono and the guest. Conduit reads and writes characters through this to drive the guest terminal.
-- **`src/virt/v9fs.cpp`**  -  shared 9P filesystem protocol. The guest mounts a v9fs share that maps to a KVFS directory on the Kurono side, enabling file transfer.
+`SYSTEM_BOOT`, `BOOT_SEQUENCE`, `SHUTDOWN`, `PACKAGE_INSTALL`, `PACKAGE_UPDATE`,
+`PACKAGE_REMOVE`, `GPU_RENDER`, `WIFI_DRIVER`, `AUDIO_DRIVER`, `RAM_WARNING`,
+`NVIDIA_FAULT`, `GUEST_SWITCH`, and `GENERIC_COMMAND`.
 
-## 3. Terminal rendering
+## 3. API
 
-The Conduit terminal renders the guest serial output in a scrollable view using the same font and GUI infrastructure as the main terminal app. Input typed in Conduit is forwarded to the guest over the virtual serial link.
+| Function | Role |
+| --- | --- |
+| `ConduitBridge::Init()` | initialize the ring; push the first boot event |
+| `PollSystemState()` | sample live system state (guest boot status, etc.) and emit change events |
+| `RecordCommand(cmdline)` | classify a shell command (`classify_command`) and record it as an event |
+| `Consume(after_seq, out, max)` | pull events newer than a sequence number (the viewer's read path) |
+| `GetLatestSeq()` | the most recent sequence number |
 
-## 4. File sharing
+`classify_command` inspects a command line and maps it onto an event type (e.g.
+`kpkg`/`apt` → a package event, GPU commands → `GPU_RENDER`, a guest launch →
+`GUEST_SWITCH`).
 
-Files dropped into `/mnt/conduit` on the Kurono side appear at `/mnt/host` inside the guest. The v9fs protocol handles the translation. This is similar to VirtualBox shared folders.
+## 4. Related files
 
-## 5. Starting Conduit
-
-From the start menu → Conduit, or from the shell:
-```
-kurono vm start
-```
-
-Conduit opens automatically when the VM starts.
-
-## 6. Related files
-
-- `src/virt/vserial.cpp`  -  virtual serial link
-- `src/virt/v9fs.cpp`  -  shared filesystem
-- `src/virt/hypervisor.cpp`  -  VM backend
-- `src/linux/dual_boot.cpp`  -  guest Linux configuration
+- `src/system/conduit.cpp` / `.h`  -  `ConduitBridge` event ring + classifier
+- `src/virt/hypervisor.cpp`  -  guest boot state polled for `GUEST_SWITCH` events
+- `src/packages/pkgmgr.cpp`  -  package operations that produce package events
+- `src/shell/shell.cpp`  -  calls `RecordCommand` to log executed commands

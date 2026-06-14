@@ -4,7 +4,7 @@ A bare-metal x86_64 operating system with a hybrid kernel that combines a native
 
 Built from scratch in freestanding C++17 and x86 assembly - no libc in the kernel, no borrowed POSIX runtime under the kernel, and no existing host kernel reused as the core OS. Kurono boots as a Multiboot2 ELF kernel, also produces standalone EFI loaders, runs in QEMU with WHPX or KVM, supports emergency recovery boot, can deploy onto FAT32/ext4 installer targets, and ships both Alpine and Debian guest paths.
 
-> **19 hardware drivers - 76+ compatibility commands plus Kurono-native commands - full TCP/IP stack - in-kernel ELF64 dynamic linker (ld-kurono) - a Linux syscall runtime with real concurrent threads/futex, epoll, mprotect W^X and SCM_RIGHTS fd-passing - an in-kernel Wayland compositor that renders real musl-compiled Wayland clients on screen - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
+> **19 hardware drivers - 150+ shell commands across the Kurono / Linux / Windows environments - full TCP/IP stack - in-kernel ELF64 dynamic linker (ld-kurono) - a Linux syscall runtime with real concurrent threads/futex, epoll, mprotect W^X and SCM_RIGHTS fd-passing - an in-kernel Wayland compositor that renders real musl-compiled Wayland clients on screen - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
 
 > **On the browser question:** Kurono does *not* ship a cut-down toy browser, and the GUI "Browser" tile is a deliberate placeholder. The real answer is **Firefox on the Linux runtime**  -  a full Firefox 140.11.0esr is already cross-compiled against musl + Wayland (174 MB `libxul.so`), and the OS provides the syscalls, IPC and Wayland surface it targets. Loading its shared-library closure through `ld-kurono` and lifting the current <4 GB pointer-ABI limit is the active frontier, not an impossibility. `curl <url>` is the working HTTP path today.
 
@@ -169,10 +169,10 @@ Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It'
   - PIE ASLR in the user address range
   - recursive `DT_NEEDED` resolution with SONAME deduplication
   - GNU hash and SYSV hash lookup
-  - 23 x86_64 relocation types
+  - 24 x86_64 relocation types handled
   - `PT_GNU_RELRO` enforcement
   - static TLS support
-  - vDSO mapping at `0x7FFFF7FFC000`
+  - vDSO page built at `0x7FFFF7FFC000` (currently **not advertised** to the loader  -  `AT_SYSINFO_EHDR=0`  -  because the synthesized page lacks a musl-parseable `PT_DYNAMIC`, so musl falls back to plain `syscall`s)
   - full SysV auxv construction
   - constructor trampoline for `DT_INIT` / `DT_INIT_ARRAY`
   - `dlopen`, `dlsym`, `dlclose`, `dlvsym`, `dladdr`, `dlerror`
@@ -229,7 +229,7 @@ Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It'
 - **GPU probe:** early PCI scan for all display controllers (class 0x03), hybrid topology detection (Optimus muxless/MUX, PowerXpress, dual discrete, virtual), framebuffer address validation via Intel DSPSURF register read
 - **Display manager:** 10 predefined modes from 640x480 through 3840x2160, runtime mode switching, EDID reading, DPI scaling, gamma/brightness, VSync modes (off/on/adaptive)
 - **Graphics driver:** double/triple buffering with SSE2 non-temporal store swap path, write-combining framebuffer remap via PAT, dirty region tracking (16 rectangles), frame pacing with FPS measurement, blend modes (alpha/additive/multiply), accessibility color-blindness filters
-- **Wayland compositor:** in-kernel server listening at `/system/run/user/1000/wayland-0`, speaks the real libwayland wire protocol, advertises `wl_compositor` v5, `xdg_wm_base` v3, `wl_seat` v7, `zwp_linux_dmabuf_v1` v3, and 6 other globals. It goes past the wire protocol: an `xdg_toplevel` surface becomes a real window-manager window, the client's `wl_shm` buffer (fd-passed via `SCM_RIGHTS`) is blitted into that window's framebuffer rect with damage tracking, and pointer enter/leave/motion/button events are forwarded back to the focused client  -  verified with a real **musl-compiled** Wayland client (`wl_shm_test`, run via `wltest`). Keyboard-to-client forwarding is implemented but not yet wired into the input loop; `zwp_linux_dmabuf` GPU buffers are advertised but only `wl_shm` software buffers are composited today
+- **Wayland compositor:** in-kernel server listening at `/system/run/user/1000/wayland-0`, speaks the real libwayland wire protocol, advertises `wl_compositor` v5, `xdg_wm_base` v3, `wl_seat` v7, `zwp_linux_dmabuf_v1` v3, and 5 other globals (9 in total: also `wl_subcompositor`, `wl_shm`, `wl_output`, `wl_data_device_manager`, `zxdg_decoration_manager_v1`). It goes past the wire protocol: an `xdg_toplevel` surface becomes a real window-manager window, the client's `wl_shm` buffer (fd-passed via `SCM_RIGHTS`) is blitted into that window's framebuffer rect with damage tracking, and pointer enter/leave/motion/button events are forwarded back to the focused client  -  verified with a real **musl-compiled** Wayland client (`wl_shm_test`, run via `wltest`). Keyboard-to-client forwarding is implemented but not yet wired into the input loop; `zwp_linux_dmabuf` GPU buffers are advertised but only `wl_shm` software buffers are composited today
 - **Window manager:** compositing WM with z-ordering, server-side decorations (titlebar, 1px border, 10px corner radius, drop shadows), 8-direction resize, drag, minimize/maximize/close, per-window alpha, smooth-step animation (open/close/minimize/restore with taskbar fly-to effect), configurable shadow and animation settings
 - **Desktop environment:** wallpaper (image or midnight-blue gradient), desktop icons with context menus, taskbar with start button/search/task icons/system tray/audio popup/clock, Alt-Tab window cycling
 - Boot splash with logo and animated loading feedback
@@ -247,7 +247,7 @@ Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It'
 | Text Editor | GUI app | KVFS file create/load/save |
 | Media Player v2.0 | GUI app | video/audio playback UI, codec badges, metadata caching, decode buffer, FPS overlay, audio routing across SB16/AC97/HDA |
 | Denji | GUI app / shell command | windowed KVID/JPEG playback wrapper around `VideoPlayer` for the bundled Denji media asset |
-| Settings | GUI app | 10-tab settings UI including display, wallpaper, system, accessibility, and a real Updates tab |
+| Settings | GUI app | 12-tab settings UI (Display, Sound, Network, Storage, Power, Personalize, Security, Packages, Updates, System, About, Accessibility)  -  incl. a real Updates tab |
 | Task Manager | GUI app | process list, CPU/memory stats, auto-refresh |
 | Firefox Launcher | runtime app path | real `execve` of `/apps/firefox/firefox` through the Linux syscall/runtime layer (seeded `/system`, `firefox.env`, `LD_LIBRARY_PATH` from the runtime layout). A real Firefox 140.11.0esr is cross-compiled (musl, Wayland); shipping + loading its 174 MB libxul closure via `ld-kurono` is the remaining bring-up step |
 | Conduit | GUI app | event-dialogue viewer backed by `ConduitBridge` telemetry for system, package, GPU, guest, and command events |
@@ -428,8 +428,8 @@ Kurono includes a real custom TCP/IP stack instead of a guest-host shortcut.
 This is more than a command shim. Kurono has an in-kernel Linux compatibility/runtime layer with real process, memory, fd, and syscall handling.
 
 - **Syscall layer**
-  - 67 syscall numbers defined
-  - 35+ implemented handlers, including `read`, `write`, `open`, `close`, `lseek`, `brk`, `fork`, `waitpid`, `execve`, `stat`, `fstat`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `dup`, `dup2`, `ioctl`, `writev`, `mmap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, and more
+  - 177 `LSYS_*` syscall numbers defined
+  - ~155 implemented handlers (case arms in `src/linux/linux_syscall.cpp`), including `read`, `write`, `open`, `close`, `lseek`, `brk`, `fork`, `waitpid`, `execve`, `stat`, `fstat`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `dup`, `dup2`, `ioctl`, `writev`, `mmap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, and more
   - the syscalls a real GUI app actually blocks on are implemented for real, not stubbed: `futex` (FUTEX_WAIT/WAKE), `clone`/`CLONE_THREAD`, `epoll_create1`/`epoll_ctl`/`epoll_wait`, `poll`/`ppoll`, `mprotect` (W^X with region splitting), `memfd_create`, file-backed `mmap`, and `sendmsg`/`recvmsg` carrying `SCM_RIGHTS`
 
 - **Process model**

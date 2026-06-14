@@ -83,6 +83,48 @@ Rules:
 | `taskmgr.row_h` | 20 | int |
 | `taskmgr.allow_kill` | 1 | bool |
 
+### Display (frame pacing)
+| Key | Default | Type |
+| --- | --- | --- |
+| `display.refresh_hz` | 60 | int |
+| `display.vsync` | 1 | bool (paces frames to `refresh_hz`) |
+| `display.adaptive_sync` | 1 | bool (drop to half rate on budget overrun) |
+
+### Compositor (shadows + animation)
+| Key | Default | Type |
+| --- | --- | --- |
+| `compositor.shadow_enabled` | 1 | bool |
+| `compositor.shadow_radius` | 8 | int (0..16 layers) |
+| `compositor.shadow_opacity` | 60 | int (0..100 percent) |
+| `compositor.shadow_during_drag` | 0 | bool |
+| `compositor.window_animations` | 1 | bool |
+| `compositor.animation_speed_ms` | 90 | int (0 = instant) |
+| `compositor.window_alpha` | 255 | int (0..255) |
+| `compositor.frosted_titlebar` | 1 | bool |
+| `compositor.reduced_motion` | 0 | bool (1 disables all animations) |
+
+### KSS theme tokens (`theme.*`)
+
+The KSS styling layer (`src/ui/kss.cpp`) reads its theme token set from the same
+`ui.conf` via `UIConfig::Color(...)`  -  these keys are **not written into the
+generated default file** (KSS supplies built-in defaults shown below), but adding
+them to `ui.conf` overrides the theme. All are `0xAARRGGBB` colors except the
+metric tokens (`theme.radius`, `theme.pad`, plain ints).
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `theme.bg` | 0xFF1B1B1D | base background |
+| `theme.surface` | 0xFF2A2A2D | panel surface |
+| `theme.surface_hi` | 0xFF35353A | raised surface |
+| `theme.sel` | 0xFF3A3A40 | selection |
+| `theme.header` | 0xFF222225 | header bar |
+| `theme.text` | 0xFFF0F0F2 | body text |
+| `theme.text_dim` | 0xFF9A9AA2 | dim text |
+| `theme.heading` | 0xFFF0F0F2 | heading text |
+| `theme.border` | 0xFF3A3A40 | borders |
+| `theme.accent` / `theme.on` / `theme.off` / `theme.track` / `theme.white` / `theme.shadow` | (built-in) | accent, toggle on/off, slider track, white, shadow |
+| `theme.radius` / `theme.pad` | (built-in ints) | corner radius / padding metrics |
+
 ## 4. Applying changes at runtime
 
 Edit `/etc/kurono/ui.conf` using the text editor, then run:
