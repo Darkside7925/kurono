@@ -223,7 +223,16 @@ void Tick(uint32_t now_ms) {
 bool Active() {
     for (int i = 0; i < ANIM_MAX; i++) {
         ASlot* s = &g_anim[i];
-        if (s->used && s->init && s->dur_ms > 0 && (g_now - s->start_ms) < s->dur_ms) return true;
+        if (!s->used || !s->init || s->dur_ms == 0) continue;
+        if ((g_now - s->start_ms) >= s->dur_ms) continue;
+        // only count a slot as "in flight" when it actually has motion: a fresh
+        // seed (first sight of an id) sets from==to with no visible change, so it
+        // must NOT keep the compositor repainting for dur_ms over nothing. a
+        // color slot leaves its float pair at 0==0 and vice-versa, so this is
+        // true only when BOTH pairs are settled  -  exactly the no-motion case.
+        // keeps idle cost unchanged when a window's titlebar tweens merely seed
+        // (first appearance) instead of forcing ~140ms of needless repaint. (satoru)
+        if (s->f_from != s->f_to || s->c_from != s->c_to) return true;
     }
     return false;
 }

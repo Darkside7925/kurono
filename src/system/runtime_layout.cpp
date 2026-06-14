@@ -484,6 +484,15 @@ void Init() {
        "MOZ_ENABLE_WAYLAND=1\n"
        "MOZ_DISABLE_RDD_SANDBOX=1\n"
        "LIBGL_ALWAYS_SOFTWARE=1\n"
+       // kurono's compositor only blits wl_shm (no dmabuf/egl); force gecko onto
+       // the software/basic path so it commits shm buffers, never egl. (satoru)
+       "MOZ_WEBRENDER=0\n"
+       "WEBRENDER_SOFTWARE=1\n"
+       "MOZ_ACCELERATED=0\n"
+       "MOZ_X11_EGL=0\n"
+       "MOZ_DISABLE_GPU_SANDBOX=1\n"
+       "MOZ_DISABLE_CONTENT_SANDBOX=1\n"
+       "GALLIUM_DRIVER=llvmpipe\n"
        "WAYLAND_DISPLAY=wayland-0\n"
        "DBUS_SESSION_BUS_ADDRESS=unix:path=/system/run/user/1000/bus\n"
        "HOME=/home/user\n"

@@ -1905,6 +1905,13 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "FONTCONFIG_PATH=/system/fonts",
         "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_CONTENT_SANDBOX=1",
         "MOZ_CRASHREPORTER_DISABLE=1",
+        // kurono's compositor only blits wl_shm (no dmabuf/egl); force gecko onto
+        // the software/basic path so it commits shm buffers, never egl/webrender.
+        // (the firefox.env file carries the same set but this inline envp is the
+        // one actually handed to the user stack here.) (satoru)
+        "MOZ_WEBRENDER=0", "WEBRENDER_SOFTWARE=1", "MOZ_ACCELERATED=0",
+        "MOZ_X11_EGL=0", "MOZ_DISABLE_GPU_SANDBOX=1",
+        "GALLIUM_DRIVER=llvmpipe",
         nullptr
     };
 

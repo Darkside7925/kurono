@@ -1003,6 +1003,7 @@ void WindowManager::RenderTitlebar(Window* win) {
         const uint32_t base[3] = { COL_CLOSE_BTN, COL_MIN_BTN, COL_MAX_BTN };
         unsigned int pe = Timer::GetRealMs() - win->tb_press_ms;
         bool pressing = win->tb_press_ms != 0 && pe < KSS::Motion::Micro;
+        bool moving = pressing;   // does the cluster still need to repaint? (satoru)
         for (int i = 0; i < 3; i++) {
             if (i == 0 && !win->closable) continue;
             bool hov = (win->tb_hover_btn == i);
@@ -1015,7 +1016,19 @@ void WindowManager::RenderTitlebar(Window* win) {
             int r = btn_r + (int)(lift * 2.0f + 0.5f);
             if (pressing && hov) r -= 1;            // tactile press-dip (satoru)
             Graphics::FillCircle(cx[i], btn_y, r, fill);
+            // a button is still in motion until its lift settles to fully on/off;
+            // that's the cheap per-frame "is the hover ease running" signal. (satoru)
+            if ((hov && lift < 0.999f) || (!hov && lift > 0.001f)) moving = true;
         }
+        // damage ONLY the traffic-light cluster while it eases so the present
+        // stays partial (the whole titlebar/screen is not re-copied for a 140ms
+        // micro-interaction). cluster spans btn_start_x-8 .. +44+8, height = the
+        // grown circle. the hover state-change itself already raised MarkUIDirty
+        // in UpdateTitlebarHover; this keeps the render gate open AND scopes the
+        // framebuffer copy for the in-between frames. (satoru)
+        if (moving)
+            wm_damage(btn_start_x - 8, btn_y - (btn_r + 3),
+                      (44 + 16), (btn_r + 3) * 2 + 2);
     }
 
     if (win->closable && focused) {
@@ -1299,9 +1312,19 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
     // focus<->unfocus border: ease between the accent (focused) and the plain
     // border so gaining/losing focus reads as a subtle elevation change rather
     // than a hard snap. keyed per window so each keeps its own state. (satoru)
+    uint32_t border_target = win->focused ? wm_get_accent() : COL_BORDER;
     uint32_t border = KSS::Anim::Color(KSS::Motion::Id((uint32_t)win->id, 0x30u),
-                                       win->focused ? wm_get_accent() : COL_BORDER,
-                                       KSS::Motion::Window, KSS::Motion::Std);
+                                       border_target, KSS::Motion::Window, KSS::Motion::Std);
+    // while the border colour is still easing toward its target, damage just the
+    // four edge strips so the present stays partial instead of re-copying the
+    // whole frame for a 220ms colour fade. Focus() already raised the initial
+    // dirty signal + edge damage; this scopes the trailing ease frames. (satoru)
+    if (border != border_target && !wm_in_fast_render) {
+        wm_damage(win->x, win->y, win->w, 1);
+        wm_damage(win->x, win->y + win->h - 1, win->w, 1);
+        wm_damage(win->x, win->y, 1, win->h);
+        wm_damage(win->x + win->w - 1, win->y, 1, win->h);
+    }
 
     // full body background with rounded corners
     Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color);
