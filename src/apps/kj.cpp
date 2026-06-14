@@ -427,8 +427,30 @@ static Node* parse_assign(Parser& ps);
 static Node* parse_stmt(Parser& ps);
 static Node* parse_block(Parser& ps);
 
+// recursive-descent depth guard: deeply nested input  -  ((((...)))), 1+1+1+...,
+// !!!!x, nested if/while  -  recurses several c++ frames per level with no natural
+// bound and would overflow the 64kb kernel stack. an raii guard bumps a file-
+// local counter on entry (safe under the single-threaded cooperative scheduler:
+// one parse runs to completion before the next) and the recursive entry points
+// (parse_primary / parse_unary / parse_bin) fail closed past the cap, so the
+// parse aborts cleanly instead of crashing. kept off the Parser struct so
+// editing this file does not force a `make clean`. (satoru)
+static const int KJ_MAX_PARSE_DEPTH = 64;
+static int g_kj_parse_depth = 0;
+struct KjParseGuard {
+    bool ok;
+    explicit KjParseGuard(Parser& ps){
+        ok = (g_kj_parse_depth < KJ_MAX_PARSE_DEPTH);
+        if (ok) g_kj_parse_depth++;
+        else P_err(ps, "expression nesting too deep");
+    }
+    ~KjParseGuard(){ if (ok) g_kj_parse_depth--; }
+};
+
 static Node* parse_primary(Parser& ps){
     if (ps.failed) return nullptr;
+    KjParseGuard depth(ps);
+    if (!depth.ok) return node_new(*ps.a, N_UNDEF);
     int t=P_tk(ps);
     Arena& a=*ps.a;
     if (t==K_NUM){ Node* n=node_new(a,N_NUM); n->num=ps.t[ps.p].num; ps.p++; return n; }
@@ -528,6 +550,8 @@ static Node* parse_postfix(Parser& ps){
 }
 
 static Node* parse_unary(Parser& ps){
+    KjParseGuard depth(ps);                       // bounds !!!!x / ---x chains (satoru)
+    if (!depth.ok) return node_new(*ps.a, N_UNDEF);
     Arena& a=*ps.a;
     int t=P_tk(ps);
     if (t==K_NOT||t==K_MINUS||t==K_PLUS||t==K_TYPEOF){
@@ -554,6 +578,8 @@ static int binprec(int t){
     }
 }
 static Node* parse_bin(Parser& ps, int minp){
+    KjParseGuard depth(ps);                       // bounds right-recursion of nested binaries (satoru)
+    if (!depth.ok) return node_new(*ps.a, N_UNDEF);
     Node* left=parse_unary(ps);
     Arena& a=*ps.a;
     while (!ps.failed){
@@ -994,11 +1020,36 @@ static Value eval_binary(Interp& it, int op, const Value& l, const Value& r){
     }
 }
 
+// runtime (eval/exec) depth guard: a deeply nested AST  -  ((((...)))), 1+1+1+...,
+// !!!!x, nested if/while  -  drives eval()/exec() recursively one frame per level.
+// the parser now caps AST nesting, but this is the matching defense-in-depth for
+// the walk so a hand-built or pathological tree can't overflow the 64kb stack
+// either. one shared counter spans eval+exec (they co-recurse); the recursive
+// entry points fail closed past the cap. call_function saves/restores it so a
+// recursive call chain (already bounded by it.recursion) starts each frame's
+// expression nesting fresh and doesn't false-trip. file-local to avoid touching
+// the Interp struct (which would force a `make clean`). (satoru)
+static const int KJ_MAX_EVAL_DEPTH = 64;
+static int g_kj_eval_depth = 0;
+struct KjEvalGuard {
+    bool ok;
+    explicit KjEvalGuard(Interp& it){
+        ok = (g_kj_eval_depth < KJ_MAX_EVAL_DEPTH);
+        if (ok) g_kj_eval_depth++;
+        else rt_err(it, "evaluation nesting too deep");
+    }
+    ~KjEvalGuard(){ if (ok) g_kj_eval_depth--; }
+};
+
 // invoke a function value with already-evaluated args. (satoru)
 static Value call_function(Interp& it, Obj* fn, Value* args, int argc){
     if (!fn || fn->kind!=O_FUNC){ rt_err(it,"value is not a function"); return mk_undef(); }
     if (it.recursion>=KJ_MAX_RECURSION){ rt_err(it,"recursion limit"); return mk_undef(); }
     it.recursion++;
+    // a function body is a fresh expression context; reset the eval/exec nesting
+    // counter for the call so a recursive chain doesn't accumulate it and trip
+    // the cap. the call chain itself is bounded by it.recursion above. (satoru)
+    int saved_eval_depth = g_kj_eval_depth; g_kj_eval_depth = 0;
     Scope* call_sc=scope_new(fn->fn_closure? fn->fn_closure : it.globals);
     for (int i=0;i<fn->fn_nparams;i++){
         Value a = (i<argc)? args[i] : mk_undef();
@@ -1009,12 +1060,15 @@ static Value call_function(Interp& it, Obj* fn, Value* args, int argc){
     if (fn->fn_body) exec(it, fn->fn_body, call_sc);
     if (it.ret_flag){ v_copy(result, it.ret_val); v_free(it.ret_val); it.ret_flag=false; }
     scope_unref(call_sc);
+    g_kj_eval_depth = saved_eval_depth;
     it.recursion--;
     return result;
 }
 
 static Value eval(Interp& it, Node* n, Scope* sc){
     if (!n || it.failed) return mk_undef();
+    KjEvalGuard depth(it);                        // bounds nested binary/logical/ternary/member recursion (satoru)
+    if (!depth.ok) return mk_undef();
     switch (n->t){
         case N_NUM:  return mk_num(n->num);
         case N_STR:  return mk_str(n->str?n->str:"",-1);
@@ -1164,6 +1218,8 @@ static void exec_block(Interp& it, Node* n, Scope* sc){
 
 static void exec(Interp& it, Node* n, Scope* sc){
     if (!n || it.failed) return;
+    KjEvalGuard depth(it);                        // bounds nested if/while/for/block recursion (satoru)
+    if (!depth.ok) return;
     switch (n->t){
         case N_PROGRAM:
         case N_BLOCK: {

@@ -10,6 +10,22 @@
 //  we can read intel's dspsurf register to get the real scanout address.
 #include "gpu_probe.h"
 #include "serial.h"
+#include "../kernel/vmm.h"   // map the (possibly high 64-bit) igpu bar before deref (satoru)
+
+// identity-map a bar's register window as uncached mmio before any access.
+// the intel gttmmaddr bar is 64-bit and can land above the boot identity map,
+// so IntelReadMMIO would #pf unmapped. mirrors nvme.cpp / virtio_gpu.cpp; caps
+// at 16mb (the display register block fits) and is idempotent. (satoru)
+static void gpuprobe_map_bar_window(uint64_t base, uint64_t size) {
+    if (base == 0) return;
+    uint64_t window = size ? size : 0x1000000ULL; // default 16mb if size unknown
+    if (window > 0x1000000ULL) window = 0x1000000ULL;
+    uint64_t start = base & ~0xFFFULL;
+    uint64_t end   = (base + window + 0xFFFULL) & ~0xFFFULL;
+    for (uint64_t p = start; p < end; p += 0x1000ULL) {
+        KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+    }
+}
 
 GpuProbeResult GpuProbe::result = {};
 
@@ -529,6 +545,11 @@ uintptr_t GpuProbe::ValidateFramebuffer(uintptr_t mb_fb_addr, uint32_t width,
 
     if (primary.vendor_id == GPU_VENDOR_INTEL && primary.bar0 != 0) {
         SerialLogger::Log("[GpuProbe] Reading Intel iGPU display registers...\r\n");
+
+        // map the bar window before any IntelReadMMIO below  -  a high 64-bit bar
+        // isn't covered by the boot identity map and would #pf otherwise.
+        // (satoru)
+        gpuprobe_map_bar_window(primary.bar0, primary.bar0_size);
 
         // read actual display surface address from mmio
         uintptr_t hw_surface = IntelGetActiveSurface(primary.bar0);

@@ -5,6 +5,7 @@
 #include "../kernel/pci.h"
 #include "../kernel/heap.h"
 #include "../kernel/io.h"
+#include "../kernel/vmm.h"   // map the (possibly high 64-bit) bar0 before deref (satoru)
 
 bool HDAudio::detected = false;
 volatile uint8_t* HDAudio::bar0 = nullptr;
@@ -111,7 +112,7 @@ bool HDAudio::Init() {
     pin_nid = -1;
 
     // scan pci for intel hda controller (class 04:03:xx)
-    uint32_t found_bar0 = 0;
+    uint64_t found_bar0 = 0;
     uint8_t found_bus = 0, found_dev = 0, found_func = 0;
     bool found = false;
 
@@ -132,7 +133,16 @@ bool HDAudio::Init() {
                 // hda: class=04, subclass=03
                 if (base_class == 0x04 && sub_class == 0x03) {
                     outl(0xCF8, addr | 0x10);
-                    found_bar0 = inl(0xCFC) & ~0xF;
+                    uint32_t bar_lo = inl(0xCFC);
+                    if (bar_lo & 1) continue; // i/o bar  -  not mmio, skip (satoru)
+                    found_bar0 = (uint64_t)(bar_lo & ~0xFu);
+                    // 64-bit bar (type bits 10b): high dword lives in bar1.
+                    // truncating to 32 bits would yield a bogus base when qemu
+                    // places it above 4gb. (satoru)
+                    if (((bar_lo >> 1) & 0x3) == 0x2) {
+                        outl(0xCF8, addr | 0x14);
+                        found_bar0 |= ((uint64_t)inl(0xCFC) << 32);
+                    }
                     found_bus = bus;
                     found_dev = dev;
                     found_func = func;
@@ -143,6 +153,17 @@ bool HDAudio::Init() {
     }
 
     if (!found) return false;
+
+    // map the bar window as uncached mmio before any register access  -  a
+    // 64-bit bar can sit above the boot identity map, so Write32/Read32 below
+    // would #pf otherwise. mirrors nvme.cpp / virtio_gpu.cpp; 64kb covers the
+    // controller regs + stream descriptors, idempotent. (satoru)
+    {
+        uint64_t start = found_bar0 & ~0xFFFULL;
+        for (uint64_t p = start; p < start + 0x10000ULL; p += 0x1000ULL) {
+            KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+        }
+    }
 
     bar0 = (volatile uint8_t*)(uintptr_t)found_bar0;
 

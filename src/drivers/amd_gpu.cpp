@@ -1,5 +1,22 @@
 #include "amd_gpu.h"
 #include "../drivers/serial.h"
+#include "../kernel/vmm.h"   // map the (possibly high 64-bit) bar before deref (satoru)
+
+// identity-map a bar's register window as uncached mmio before any access.
+// a 64-bit gpu bar can be placed above the boot identity map (qemu puts them
+// high), so dereferencing it unmapped would #pf. mirrors nvme.cpp /
+// virtio_gpu.cpp. caps the window at 16mb (covers the register aperture; the
+// huge vram bar is never poked through this path) and is idempotent. (satoru)
+static void amdgpu_map_bar_window(uint64_t base, uint64_t size) {
+    if (base == 0) return;
+    uint64_t window = size ? size : 0x1000000ULL; // default 16mb if size unknown
+    if (window > 0x1000000ULL) window = 0x1000000ULL;
+    uint64_t start = base & ~0xFFFULL;
+    uint64_t end   = (base + window + 0xFFFULL) & ~0xFFFULL;
+    for (uint64_t p = start; p < end; p += 0x1000ULL) {
+        KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+    }
+}
 
 //  kurono os  -  amd radeon gpu driver implementation
 //  real pci scan, bar mapping, register access, display engine init
@@ -274,6 +291,10 @@ int AmdGPU::IdentifyBusWidth(uint16_t did, AmdArch arch) {
 //  bar mapping
 bool AmdGPU::MapBAR() {
     if (info.bar0 == 0) return false;
+
+    // map the bar window before the first register read  -  a high 64-bit bar is
+    // not covered by the boot identity map and would #pf otherwise. (satoru)
+    amdgpu_map_bar_window(info.bar0, info.bar0_size);
 
     // map bar0 as uncacheable mmio (identity-mapped in our kernel)
     mmio_base = (volatile uint32_t*)(uintptr_t)info.bar0;

@@ -618,6 +618,14 @@ void VirtIOGPUHost::ReadBackingBytes(VGpuResource* r, uint64_t offset,
 void VirtIOGPUHost::TransferToHost(VGpuResource* r, uint32_t x, uint32_t y,
                                      uint32_t w, uint32_t h, uint64_t guest_off) {
     if (!r || !r->host_pixels) return;
+    // reject out-of-range / overflowing rects up front (64-bit to dodge
+    // wraparound). without this a guest x >= width made (width - x) underflow
+    // below into a huge `copy`, smashing host_pixels past its end (oob write).
+    // (satoru)
+    if (x >= r->width || y >= r->height ||
+        (uint64_t)x + w > r->width || (uint64_t)y + h > r->height) {
+        return;
+    }
     uint32_t bpp = bytes_per_pixel_for_format(r->format);
     uint32_t row_bytes = w * bpp;
     for (uint32_t row = 0; row < h; row++) {

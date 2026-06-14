@@ -91,7 +91,10 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
                     rotate_on_eoi = true;
                     break;
                 case 6: // set priority command
-                    priority = (value & 0x07 + 1) & 7;
+                    // precedence: + binds before &, so the old expr was
+                    // value & (0x07+1) & 7 == value & 8 & 7 == 0 always.
+                    // intended: take the low 3 bits, then +1 mod 8. (satoru)
+                    priority = ((value & 0x07) + 1) & 7;
                     break;
                 default:
                     break;

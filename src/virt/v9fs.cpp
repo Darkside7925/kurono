@@ -271,13 +271,13 @@ int V9FS::DoRead(uint64_t* regs) {
     int rd = KVFS::ReadFile(fids[fid].path, v9fs_iobuf, (uint32_t)file_size);
     if (rd < 0) return V9FS_EIO;
 
-    // write to guest memory
-    uint8_t* host_dst = GuestMemoryManager::GuestPhysToHost(guest_buf);
-    if (!host_dst) return V9FS_EIO;
-
-    for (uint32_t i = 0; i < count; i++) {
-        host_dst[i] = v9fs_iobuf[offset + i];
-    }
+    // write to guest memory through the region-clipped helper. GuestPhysToHost
+    // only translates the start address; copying `count` bytes past it would
+    // overrun into adjacent host heap when guest_buf sits near a region
+    // boundary (a guest vm-escape). WriteGuestPhys re-translates every chunk and
+    // fails the moment any byte leaves a single backing region. (satoru)
+    if (!GuestMemoryManager::WriteGuestPhys(guest_buf, v9fs_iobuf + offset, count))
+        return V9FS_EIO;
 
     fids[fid].offset = offset + count;
     regs[1] = count; // ecx = bytes read
@@ -303,9 +303,6 @@ int V9FS::DoWrite(uint64_t* regs) {
 
     if (count > V9FS_MAX_IOSIZE) count = V9FS_MAX_IOSIZE;
 
-    uint8_t* host_src = GuestMemoryManager::GuestPhysToHost(guest_buf);
-    if (!host_src) return V9FS_EIO;
-
     // read existing file content, extend if necessary
     int existing_size = KVFS::GetFileSize(fids[fid].path);
     if (existing_size < 0) existing_size = 0;
@@ -324,10 +321,13 @@ int V9FS::DoWrite(uint64_t* regs) {
     if (existing_size > 0) {
         KVFS::ReadFile(fids[fid].path, v9fs_iobuf, (uint32_t)existing_size);
     }
-    // overlay new data
-    for (uint32_t i = 0; i < count; i++) {
-        v9fs_iobuf[offset + i] = host_src[i];
-    }
+    // overlay new data pulled from guest via the region-clipped helper.
+    // GuestPhysToHost only translates the start address; reading `count` bytes
+    // past it would overrun adjacent host heap when guest_buf sits near a region
+    // boundary (a guest vm-escape). ReadGuestPhys re-translates every chunk and
+    // fails the moment any byte leaves a single backing region. (satoru)
+    if (!GuestMemoryManager::ReadGuestPhys(guest_buf, v9fs_iobuf + offset, count))
+        return V9FS_EIO;
 
     if (KVFS::WriteFile(fids[fid].path, v9fs_iobuf, new_size) < 0) {
         return V9FS_EIO;
@@ -379,14 +379,12 @@ int V9FS::DoStat(uint64_t* regs) {
     }
     kstrcpy(st.name, last_slash, sizeof(st.name));
 
-    // write to guest memory
-    uint8_t* host_dst = GuestMemoryManager::GuestPhysToHost(guest_buf);
-    if (!host_dst) return V9FS_EIO;
-
-    const uint8_t* src = (const uint8_t*)&st;
-    for (uint32_t i = 0; i < sizeof(V9FS_Stat); i++) {
-        host_dst[i] = src[i];
-    }
+    // write the stat struct to guest memory via the region-clipped helper.
+    // GuestPhysToHost only translates the start; writing sizeof(stat) bytes past
+    // it would overrun adjacent host heap when guest_buf sits near a region
+    // boundary (a guest vm-escape). WriteGuestPhys rejects cross-region. (satoru)
+    if (!GuestMemoryManager::WriteGuestPhys(guest_buf, &st, sizeof(V9FS_Stat)))
+        return V9FS_EIO;
 
     return V9FS_OK;
 }
@@ -406,9 +404,6 @@ int V9FS::DoReadDir(uint64_t* regs) {
 
     if (!ValidFid(fid)) return V9FS_EBADF;
     if (!fids[fid].is_dir) return V9FS_ENOTDIR;
-
-    uint8_t* host_dst = GuestMemoryManager::GuestPhysToHost(guest_buf);
-    if (!host_dst) return V9FS_EIO;
 
     // clamp max_entries so we don't overflow the guest buffer
     if (max_entries > 16) max_entries = 16;
@@ -430,10 +425,16 @@ int V9FS::DoReadDir(uint64_t* regs) {
         st.size = node->is_dir() ? 0 : node->size;
         kstrcpy(st.name, node->name, sizeof(st.name));
 
-        const uint8_t* src = (const uint8_t*)&st;
-        uint8_t* entry_dst = host_dst + returned * sizeof(V9FS_Stat);
-        for (uint32_t b = 0; b < sizeof(V9FS_Stat); b++) {
-            entry_dst[b] = src[b];
+        // write each entry through the region-clipped helper. the old code
+        // translated only the base of the guest array then copied
+        // returned*sizeof(stat) bytes sequentially, overrunning adjacent host
+        // heap once the array crossed a region boundary (a guest vm-escape).
+        // WriteGuestPhys re-translates per chunk; if an entry would leave a
+        // single backing region it fails and we stop returning further. (satoru)
+        uint64_t entry_addr = guest_buf + (uint64_t)returned * sizeof(V9FS_Stat);
+        if (!GuestMemoryManager::WriteGuestPhys(entry_addr, &st, sizeof(V9FS_Stat))) {
+            if (returned == 0) return V9FS_EIO;
+            break;
         }
         returned++;
     }

@@ -795,10 +795,12 @@ int LinuxCmds::cmd_touch(KuronoShell* sh, int argc, const char** argv, char* out
 int LinuxCmds::cmd_cat(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: cat <file...>\n");
+    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if (!buf) return _sa(out, 0, mx, "cat: out of memory\n");
     int p = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] == '-') continue;
-        unsigned char buf[KVFS_MAX_CONTENT];
         int bytes_read = KVFS::ReadFile(argv[i], buf, KVFS_MAX_CONTENT);
         if (bytes_read < 0) {
             p = _sa(out, p, mx, "cat: ");
@@ -810,6 +812,7 @@ int LinuxCmds::cmd_cat(KuronoShell* sh, int argc, const char** argv, char* out, 
             out[p++] = (char)buf[j];
         out[p] = 0;
     }
+    KernelHeap::Free(buf);
     return p;
 }
 
@@ -823,10 +826,14 @@ int LinuxCmds::cmd_head(KuronoShell* sh, int argc, const char** argv, char* out,
     }
     if (!file) return _sa(out, 0, mx, "Usage: head [-n N] <file>\n");
 
-    unsigned char buf[KVFS_MAX_CONTENT];
+    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if (!buf) return _sa(out, 0, mx, "head: out of memory\n");
     int sz = KVFS::ReadFile(file, buf, KVFS_MAX_CONTENT);
-    if (sz < 0)
+    if (sz < 0) {
+        KernelHeap::Free(buf);
         return _sa(out, 0, mx, "head: cannot read file\n");
+    }
 
     int p = 0;
     int lc = 0;
@@ -835,6 +842,7 @@ int LinuxCmds::cmd_head(KuronoShell* sh, int argc, const char** argv, char* out,
         if (buf[i] == '\n') lc++;
     }
     out[p] = 0;
+    KernelHeap::Free(buf);
     return p;
 }
 
@@ -848,10 +856,14 @@ int LinuxCmds::cmd_tail(KuronoShell* sh, int argc, const char** argv, char* out,
     }
     if (!file) return _sa(out, 0, mx, "Usage: tail [-n N] <file>\n");
 
-    unsigned char buf[KVFS_MAX_CONTENT];
+    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if (!buf) return _sa(out, 0, mx, "tail: out of memory\n");
     int sz = KVFS::ReadFile(file, buf, KVFS_MAX_CONTENT);
-    if (sz < 0)
+    if (sz < 0) {
+        KernelHeap::Free(buf);
         return _sa(out, 0, mx, "tail: cannot read file\n");
+    }
 
     // count newlines from end
     int lc = 0;
@@ -864,6 +876,7 @@ int LinuxCmds::cmd_tail(KuronoShell* sh, int argc, const char** argv, char* out,
     int p = 0;
     for (int i = start; i < (int)sz && p < mx - 1; i++) out[p++] = (char)buf[i];
     out[p] = 0;
+    KernelHeap::Free(buf);
     return p;
 }
 
@@ -871,10 +884,14 @@ int LinuxCmds::cmd_wc(KuronoShell* sh, int argc, const char** argv, char* out, i
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: wc <file>\n");
 
-    unsigned char buf[KVFS_MAX_CONTENT];
+    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if (!buf) return _sa(out, 0, mx, "wc: out of memory\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);
-    if (sz < 0)
+    if (sz < 0) {
+        KernelHeap::Free(buf);
         return _sa(out, 0, mx, "wc: cannot read file\n");
+    }
 
     int lines = 0, words = 0, chars = sz;
     bool in_word = false;
@@ -886,6 +903,7 @@ int LinuxCmds::cmd_wc(KuronoShell* sh, int argc, const char** argv, char* out, i
             in_word = true; words++;
         }
     }
+    KernelHeap::Free(buf);
 
     int p = 0;
     p = _sa(out, p, mx, "  ");
@@ -1065,12 +1083,16 @@ int LinuxCmds::cmd_sort(KuronoShell* sh, int argc, const char** argv, char* out,
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: sort <file>\n");
 
-    unsigned char buf[KVFS_MAX_CONTENT];
+    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if (!buf) return _sa(out, 0, mx, "sort: out of memory\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);
-    if (sz < 0)
+    if (sz < 0) {
+        KernelHeap::Free(buf);
         return _sa(out, 0, mx, "sort: cannot read file\n");
+    }
 
-    // split into lines
+    // split into lines  -  lines[] point into buf, so keep it alive until after output (satoru)
     char* lines[256];
     int lc = 0;
     char* start = (char*)buf;
@@ -1098,6 +1120,7 @@ int LinuxCmds::cmd_sort(KuronoShell* sh, int argc, const char** argv, char* out,
         p = _sa(out, p, mx, lines[i]);
         p = _sac(out, p, mx, '\n');
     }
+    KernelHeap::Free(buf);
     return p;
 }
 
@@ -1105,10 +1128,14 @@ int LinuxCmds::cmd_uniq(KuronoShell* sh, int argc, const char** argv, char* out,
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: uniq <file>\n");
 
-    unsigned char buf[KVFS_MAX_CONTENT];
+    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
+    if (!buf) return _sa(out, 0, mx, "uniq: out of memory\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);
-    if (sz < 0)
+    if (sz < 0) {
+        KernelHeap::Free(buf);
         return _sa(out, 0, mx, "uniq: cannot read file\n");
+    }
 
     int p = 0;
     char prev[256]; prev[0] = 0;
@@ -1127,6 +1154,7 @@ int LinuxCmds::cmd_uniq(KuronoShell* sh, int argc, const char** argv, char* out,
             if (li < 255) line[li++] = (char)buf[i];
         }
     }
+    KernelHeap::Free(buf);
     return p;
 }
 
