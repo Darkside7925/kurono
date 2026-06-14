@@ -1905,6 +1905,11 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "FONTCONFIG_PATH=/system/fonts",
         "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_CONTENT_SANDBOX=1",
         "MOZ_CRASHREPORTER_DISABLE=1",
+        // kurono runs the browser as the system uid (0) while $HOME is owned by
+        // uid 1000; gecko's nsAppRunner refuses that mismatch ("Running ... as
+        // root in a regular user's session is not supported") and exits 1. this
+        // is gecko's official override for exactly that case. (satoru)
+        "MOZ_ALLOW_ROOT=1",
         // kurono's compositor only blits wl_shm (no dmabuf/egl); force gecko onto
         // the software/basic path so it commits shm buffers, never egl/webrender.
         // (the firefox.env file carries the same set but this inline envp is the

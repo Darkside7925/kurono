@@ -3908,8 +3908,6 @@ int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint32_t arg) {
 
 int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                                 uint32_t flags, int fd, uint64_t offset) {
-    (void)flags;
-
     if (length == 0) return -22;
 
     LinuxProcess* proc = Current();
@@ -4008,10 +4006,59 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
     }
 
     uint64_t size = align_up_u64(length, PAGE_SIZE);
+    uint64_t page_flags = page_flags_from_prot(prot);
+
+    // anonymous MAP_FIXED: the caller demands this exact address and expects any
+    // existing mapping there to be REPLACED. musl's map_library uses this to map
+    // the .bss tail of a dso's data segment that spills past the file-backed
+    // pages (mmap(base+vaddr, n, RW, MAP_ANON|MAP_FIXED, -1, 0)). that range sits
+    // INSIDE the dso's prior PROT_READ reservation. the old anon path ran
+    // choose_mmap_base() which, on overlap, SLID to a different address and
+    // returned that  -  musl saw addr != requested and failed the load with EINVAL
+    // ("Error loading shared library ...: Invalid argument"): the
+    // libgraphite2/harfbuzz blocker. honor the fixed address by REMAPPING the
+    // pages in place  -  exactly like the file-backed FIXED branch above: free the
+    // displaced frame, map a fresh zeroed page with the requested prot. crucially
+    // we do NOT split/carve the underlying reservation region: doing so desynced
+    // region_overlaps() from the page tables, so a later malloc mmap got handed an
+    // address still physically mapped PROT_READ and #PF'd writing free-list
+    // metadata into it. leave the reservation region intact (the pages are now
+    // present+writable; region flags only gate not-yet-faulted demand-zero pages,
+    // and these are faulted in). only add a region if the fixed range lands
+    // outside every existing one. (satoru)
+    {
+        constexpr uint32_t MAP_FIXED_FLAG = 0x10;
+        if (flags & MAP_FIXED_FLAG) {
+            uint64_t fbase = align_down_u64(addr, PAGE_SIZE);
+            if (!fbase) return -22;                 // can't fix at NULL
+            bool active = (Scheduler::GetCurrentProcess() == task);
+            for (uint64_t o = 0; o < size; o += PAGE_SIZE) {
+                uint64_t va = fbase + o;
+                uint64_t old = KernelVMM::QueryMappingInAddressSpace(task->address_space, va);
+                if (old) PMM::FreeBytes((void*)(uintptr_t)old, PAGE_SIZE);
+                void* pg = PMM::AllocBytes(PAGE_SIZE);
+                if (!pg) return -12;
+                memset(pg, 0, PAGE_SIZE);
+                if (!KernelVMM::MapPageInAddressSpace(task->address_space, va,
+                                                      (uint64_t)(uintptr_t)pg, page_flags)) {
+                    PMM::FreeBytes(pg, PAGE_SIZE);
+                    return -12;
+                }
+                if (active) KernelVMM::InvalidatePage(va);
+            }
+            // if no existing region covers the fixed range, track it so munmap and
+            // region_overlaps stay correct; otherwise leave the covering region as
+            // is (splitting it is what caused the desync). (satoru)
+            if (!region_overlaps(task, fbase, fbase + size))
+                add_region(task, fbase, fbase + size, page_flags, USER_REGION_MMAP);
+            if (task->next_mmap_base < fbase + size) task->next_mmap_base = fbase + size;
+            return (int64_t)fbase;
+        }
+    }
+
     uint64_t base = choose_mmap_base(task, addr, size);
     if (!base) return -12;
 
-    uint64_t page_flags = page_flags_from_prot(prot);
     if (!add_region(task, base, base + size, page_flags,
                     USER_REGION_DEMAND_ZERO | USER_REGION_MMAP)) {
         return -12;
