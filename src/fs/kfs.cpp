@@ -462,6 +462,61 @@ bool KFS::Format(uint32_t total_blocks) {
     return Sync();
 }
 
+//  validate an on-disk superblock before we trust ANY of its size/count fields
+//  to size an allocation or a read. the crc only proves the block is internally
+//  consistent  -  it does NOT stop a malicious image (an attacker recomputes the
+//  crc), so every field is bounded here independently. all arithmetic is 64-bit
+//  so the u32 fields can't overflow a size calc (e.g. bitmap_blocks * 4096
+//  wrapping a u32 to allocate a tiny buffer that a large read then overflows).
+//  returns true iff the layout is self-consistent and inside sane maxima. (satoru)
+static bool kfs_super_sane(const KFSSuper* sb) {
+    // hard ceiling on the volume: the in-ram metadata caches scale with it
+    // (bitmap = total/8 bytes, inode table = total*8 bytes), so persist.cpp caps
+    // a real volume at ~59M blocks. mirror that here as the trust boundary. (satoru)
+    const uint64_t MAX_TOTAL_BLOCKS = 59000000ull;
+
+    uint64_t total   = sb->total_blocks;
+    uint64_t bm_strt = sb->bitmap_start;
+    uint64_t bm_blks = sb->bitmap_blocks;
+    uint64_t in_strt = sb->inode_start;
+    uint64_t in_blks = sb->inode_blocks;
+    uint64_t in_cnt  = sb->inode_count;
+    uint64_t dt_strt = sb->data_start;
+
+    // basic ranges. (satoru)
+    if (total < 64 || total > MAX_TOTAL_BLOCKS) return false;
+    if (bm_strt != 1) return false;                 // bitmap always follows the superblock (satoru)
+    if (bm_blks == 0 || in_blks == 0 || in_cnt < 2) return false;
+
+    // the bitmap must be big enough to cover every block, and not absurdly big.
+    // (satoru)
+    uint64_t need_bm = (total + (KFS_BLOCK_SIZE * 8 - 1)) / (KFS_BLOCK_SIZE * 8);
+    if (bm_blks < need_bm || bm_blks > need_bm + 1) return false;
+
+    // the inode table must exactly cover inode_count inodes (16 per block). (satoru)
+    uint64_t need_in = (in_cnt + KFS_INODES_PER_BLOCK - 1) / KFS_INODES_PER_BLOCK;
+    if (in_blks != need_in) return false;
+    if (in_cnt > total) return false;               // can't have more inodes than blocks (satoru)
+
+    // the in-ram caches are allocated as (blocks * KFS_BLOCK_SIZE) BYTES with a
+    // u32 multiply; even within the block ceiling above, inode_blocks*4096 can
+    // overflow a u32. bound both byte sizes in 64-bit so the allocation size is
+    // exactly what the subsequent read fills (no wrap -> tiny-buffer overflow).
+    // cap at 512 MB each (matches persist.cpp's metadata-cache budget). (satoru)
+    const uint64_t MAX_CACHE_BYTES = 512ull * 1024 * 1024;
+    if (bm_blks * (uint64_t)KFS_BLOCK_SIZE > MAX_CACHE_BYTES) return false;
+    if (in_blks * (uint64_t)KFS_BLOCK_SIZE > MAX_CACHE_BYTES) return false;
+
+    // the regions must be laid out in order, non-overlapping, and entirely inside
+    // the volume: [sb][bitmap][inodes][data...]. (satoru)
+    if (in_strt != bm_strt + bm_blks) return false;
+    if (dt_strt != in_strt + in_blks) return false;
+    if (dt_strt >= total) return false;             // at least one data block (satoru)
+    if (sb->free_blocks > total) return false;
+
+    return true;
+}
+
 bool KFS::Mount() {
     if (!g_rd) return false;
     uint8_t blk[KFS_BLOCK_SIZE];
@@ -470,6 +525,13 @@ bool KFS::Mount() {
     if (sb->magic != KFS_MAGIC || sb->version != KFS_VERSION || sb->block_size != KFS_BLOCK_SIZE)
         return false;
     if (crc32((uint8_t*)sb, __builtin_offsetof(KFSSuper, crc)) != sb->crc) return false;
+    // gate on a fully validated layout BEFORE any field is used to size an
+    // allocation or a read  -  a corrupt/malicious superblock that passes magic +
+    // crc must not be able to overflow g_bitmap / g_inodes. (satoru)
+    if (!kfs_super_sane(sb)) {
+        SerialLogger::Log("[KFS] superblock failed sanity check; refusing mount\r\n");
+        return false;
+    }
     g_sb = *sb;
 
     if (g_bitmap) KernelHeap::Free(g_bitmap);

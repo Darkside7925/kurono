@@ -7,6 +7,7 @@
 #include "../kernel/vmm.h"   // identity-map the high 64-bit bar before touching it (satoru)
 #include "../drivers/serial.h"
 #include "../proc/smp.h"     // one i/o queue per cpu core; route by calling cpu (satoru)
+#include "../proc/spinlock.h"  // serialize cores that share an sq when cpus > queues (satoru)
 #include <string.h>
 
 bool              NVMe::detected        = false;
@@ -19,6 +20,16 @@ uint64_t          NVMe::read_count      = 0;
 uint64_t          NVMe::write_count     = 0;
 uint64_t          NVMe::bytes_read      = 0;
 uint64_t          NVMe::bytes_written   = 0;
+
+//  one lock per i/o queue. the calling cpu picks its queue by (CpuIndex %
+//  io_queue_count); when CpuCount() > io_queue_count (or > NVME_MAX_QUEUES)
+//  several cores map to the SAME submission queue. without a guard they race
+//  on qp->sq_tail + the doorbell + the completion ring and corrupt the queue.
+//  taking the queue's lock across submit+ring+reap serializes those cores. a
+//  core on its own queue takes an uncontended lock (cheap). bare Lock() (no
+//  cli/sti): nvme i/o polls for a long time, so disabling irqs across it would
+//  starve the timer. (satoru)
+static Spinlock g_io_q_lock[NVME_MAX_QUEUES];
 
 //  register access
 
@@ -219,7 +230,11 @@ bool NVMe::Identify() {
     info.model[40] = 0;
     for (int i = 0; i < 8; i++) info.firmware[i] = (char)id_buf[64 + i];
     info.firmware[8] = 0;
-    info.max_transfer_size = 1u << id_buf[77]; // mdts
+    // mdts is on-disk (controller-reported); `1u << n` is UB for n >= 32. clamp
+    // the shift. MaxTransferBytes() then caps the result to our prp-list size, so
+    // a large-but-valid mdts still works; we only need to avoid the UB. (satoru)
+    uint8_t mdts = id_buf[77];
+    info.max_transfer_size = (mdts < 31) ? (1u << mdts) : 0u; // 0 => "unlimited" path (satoru)
     info.num_namespaces = *(uint32_t*)(id_buf + 516);
     info.detected = true;
 
@@ -239,7 +254,12 @@ bool NVMe::Identify() {
         info.total_capacity_lba = *(uint64_t*)(id_buf + 0);
         uint8_t lba_format_idx = id_buf[26] & 0x0F;
         uint32_t lbaf = *(uint32_t*)(id_buf + 128 + lba_format_idx * 4);
-        info.lba_size = 1u << ((lbaf >> 16) & 0xFF);
+        // LBADS is on-disk; `1u << n` is UB for n >= 32, and an implausible size
+        // would skew every block calc. clamp the shift and fall back to 512 for
+        // anything outside the sane 512..4096 range. (satoru)
+        uint32_t lbads = (lbaf >> 16) & 0xFF;
+        uint32_t sz = (lbads < 31) ? (1u << lbads) : 0u;
+        info.lba_size = (sz >= 512 && sz <= 4096) ? sz : 512u;
 
         SerialLogger::Log("[NVMe] Capacity: ");
         SerialLogger::LogHex((uint32_t)(info.total_capacity_lba >> 32));
@@ -335,9 +355,12 @@ bool NVMe::SubmitAdminCmd(NVMeSQE* cmd, NVMeCQE* result) {
 }
 
 bool NVMe::SubmitIOCmd(int qid, NVMeSQE* cmd, NVMeCQE* result) {
-    if (qid < 0 || qid >= io_queue_count) return false;
+    if (qid < 0 || qid >= io_queue_count || qid >= NVME_MAX_QUEUES) return false;
     NVMeQueuePair* qp = &io_queues[qid];
     if (!qp->sq || !qp->cq) return false;
+
+    // serialize cores that share this sq (cpus > queues). (satoru)
+    SpinLockCpuGuard g(g_io_q_lock[qid]);
 
     uint16_t tail = qp->sq_tail;
     qp->sq[tail] = *cmd;
@@ -526,9 +549,14 @@ bool NVMe::ReapCompletions(NVMeQueuePair* qp, int n) {
 //  contiguous + identity-mapped, so each chunk's prp list is built on its own
 //  scratch page. opcode picks read vs write. (satoru)
 bool NVMe::SubmitIOBatch(int qid, uint8_t opcode, uint64_t lba, uint32_t count, uint8_t* buffer) {
-    if (qid < 0 || qid >= io_queue_count) return false;
+    if (qid < 0 || qid >= io_queue_count || qid >= NVME_MAX_QUEUES) return false;
     NVMeQueuePair* qp = &io_queues[qid];
     if (!qp->sq || !qp->cq) return false;
+    // serialize cores that share this queue (cpus > queues): the lock covers the
+    // sq ring (sq_tail + doorbell + reap) AND this queue's per-slot prp scratch
+    // pages (g_batch_prp[qid][..]), both of which two cores would otherwise
+    // corrupt concurrently. uncontended for a core on its own queue. (satoru)
+    SpinLockCpuGuard g(g_io_q_lock[qid]);
     uint32_t lbasz = GetLBASize();
     uint32_t per = MaxTransferBytes() / lbasz; if (!per) per = 1;
     if (!ensure_batch_prp(qid)) return false;
