@@ -7,6 +7,7 @@
 #include "../hal/hal.h"
 #include "../system/logging.h"
 #include "../ui/notification.h"
+#include "../proc/scheduler.h"    // cooperative yield between dns recv attempts (satoru)
 #include "tcpip.h"
 
 //  network stack implementation
@@ -624,12 +625,12 @@ static int ndns_query_once(const char* hostname, uint32_t dns_ip,
             uint16_t from_port = 0;
             int got = TCPStack::RecvFrom(sock, response, sizeof(response), &from_ip, &from_port);
             if (got <= 0) {
-                /* ~1ms PIT-poll between recv attempts so we don't starve
-                   the kernel main loop / E1000 path. */
-                uint32_t iter_start = Timer::GetTicks();
-                while ((uint32_t)(Timer::GetTicks() - iter_start) < 1u) {
-                    __asm__ __volatile__("pause");
-                }
+                /* yield ~1ms between recv attempts instead of busy-spinning
+                   `pause`, so other cooperative processes run during the wait.
+                   Scheduler::SleepMs(1) HLTs (or switches to the next kernel
+                   process) rather than burning a core; the loop re-polls via
+                   Tick() each pass so we don't miss the dns reply. (satoru) */
+                Scheduler::SleepMs(1);
                 continue;
             }
             if (from_port != 53 || got < (int)sizeof(DNSHeader)) continue;

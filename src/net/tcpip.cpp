@@ -6,6 +6,7 @@
 #include "../kernel/heap.h"
 #include "../kernel/time.h"
 #include "../shell/shell.h"
+#include "../proc/scheduler.h"    // cooperative yield in network wait loops (satoru)
 #include "../system/logging.h"   // notable net events -> /kurono/var/log/network.log (satoru)
 
 // tiny helpers for serial diag
@@ -14,13 +15,15 @@ static void slog(const char* s){ SerialLogger::Log(s); }
 /* Cooperative ~1ms throttle inside network wait loops. The previous
    `for (volatile d=0;d<100;d++)` and `pause` spins called Tick + PumpUI
    thousands of times per millisecond, starving the kernel main loop and
-   the E1000 poll path. PIT-poll once-per-ms keeps the CPU off fire,
-   keeps PumpUI smooth, and still services the NIC fast enough. */
+   the E1000 poll path. Now we YIELD for ~1ms instead of busy-spinning
+   `pause`, so other cooperative processes actually run during the wait.
+   Scheduler::SleepMs(1) gives up the cpu to the next runnable kernel
+   process when the preemptive scheduler is live, and otherwise HLTs until
+   the next IRQ (still no busy spin)  -  both keep the ~1ms cadence and stop
+   burning a core. The callers re-poll the NIC via Tick() each pass, so
+   correctness holds. Matches the recv-loop pacing in linux_cmds.cpp. (satoru) */
 static inline void net_wait_one_ms() {
-    uint32_t iter_start = Timer::GetTicks();
-    while ((uint32_t)(Timer::GetTicks() - iter_start) < 1u) {
-        __asm__ __volatile__("pause");
-    }
+    Scheduler::SleepMs(1);
 }
 static void sloghex(uint32_t v){
     char b[12]; b[0]='0'; b[1]='x';
@@ -89,6 +92,19 @@ void ApplyAck(NetSocket* sock, uint32_t ack_seq) {
     if (sock->tx_pending && !SeqBefore(ack_seq, sock->tx_seq_end)) {
         sock->tx_pending = false;
         sock->tx_retries = 0;
+    }
+
+    // free every send-window data segment the peer has cumulatively acked. a
+    // segment is fully acked once ack_seq has advanced to or past its last
+    // byte (seq + len). this opens slots for Send to keep the pipe full and
+    // stops TCPTick retransmitting acked data. (satoru)
+    for (int i = 0; i < TCP_SND_WND_SEGS; i++) {
+        TxDataSeg* seg = &sock->tx_segs[i];
+        if (!seg->in_use) continue;
+        if (!SeqBefore(ack_seq, seg->seq + (uint32_t)seg->len)) {
+            seg->in_use = false;
+            if (sock->tx_seg_inflight > 0) sock->tx_seg_inflight--;
+        }
     }
 }
 }
@@ -1174,6 +1190,10 @@ int TCPStack::Accept(int sock) {
             if (new_sock < 0) return -1;
             sockets[new_sock] = sockets[sock];
             sockets[new_sock].tx_pending = false;
+            // the accepted socket starts with an empty send window  -  a listener
+            // never queued data, but make the invariant explicit. (satoru)
+            for (int k = 0; k < TCP_SND_WND_SEGS; k++) sockets[new_sock].tx_segs[k].in_use = false;
+            sockets[new_sock].tx_seg_inflight = 0;
             sockets[sock].tcp_state = TCP_LISTEN;
             sockets[sock].remote_ip = 0;
             sockets[sock].remote_port = 0;
@@ -1197,12 +1217,22 @@ int TCPStack::Send(int sock, const void* data, int len) {
         while (sent < len) {
             int chunk = len - sent;
             if (chunk > TCP_MSS) chunk = TCP_MSS;
-            // Wait for the previous segment to be ACKed before sending
-            // the next one. Tracking only one in-flight segment keeps
-            // retransmit simple, but cap the wait at 2s so a stalled
-            // peer surfaces as an error promptly.
+
+            // sliding send window: find a free scoreboard slot. up to
+            // TCP_SND_WND_SEGS data segments may be outstanding at once, so we
+            // only block here when the window is FULL (vs the old stop-and-wait
+            // that blocked after every single segment). while we wait for an
+            // ack to free a slot, Tick() runs ProcessTCP (which frees acked
+            // segments via ApplyAck) and TCPTick (which retransmits on rto).
+            // cap the wait at 2s so a stalled peer surfaces promptly. (satoru)
+            int slot = -1;
             uint32_t wait_start_ms = Timer::GetTicks();
-            while (s->tx_pending && (uint32_t)(Timer::GetTicks() - wait_start_ms) < 2000u) {
+            for (;;) {
+                for (int i = 0; i < TCP_SND_WND_SEGS; i++) {
+                    if (!s->tx_segs[i].in_use) { slot = i; break; }
+                }
+                if (slot >= 0) break;
+                if ((uint32_t)(Timer::GetTicks() - wait_start_ms) >= 2000u) break;
                 if (KuronoShell::IsCommandCancelRequested())
                     return sent > 0 ? sent : -1;
                 Tick();
@@ -1211,15 +1241,37 @@ int TCPStack::Send(int sock, const void* data, int len) {
                     return sent > 0 ? sent : -1;
                 net_wait_one_ms();
             }
-            if (s->tx_pending) {
-                slog("[TCP] Send ACK timeout\r\n");
+            if (slot < 0) {
+                slog("[TCP] Send window-full ACK timeout\r\n");
                 return sent > 0 ? sent : -1;
             }
             if (s->tcp_state != TCP_ESTABLISHED)
                 return sent > 0 ? sent : -1;
-            s->tx_unacked = s->tcp_seq;
-            if (!SendTCP(s, TCP_FLAG_ACK | TCP_FLAG_PSH, ptr + sent, chunk)) {
+
+            // when the window is empty, snd.una starts at snd.nxt; ApplyAck
+            // advances it as cumulative acks arrive. don't reset it mid-window
+            // or in-flight segments would look un-acked. (satoru)
+            if (s->tx_seg_inflight == 0) s->tx_unacked = s->tcp_seq;
+
+            // buffer the payload + bookkeeping BEFORE emitting so a retransmit
+            // that races in from TCPTick (same tick path) sees a complete slot.
+            TxDataSeg* seg = &s->tx_segs[slot];
+            for (int i = 0; i < chunk; i++) seg->data[i] = ptr[sent + i];
+            seg->seq = s->tcp_seq;
+            seg->len = chunk;
+            seg->retries = 0;
+            seg->last_tx_ms = Timer::GetTicks();
+            seg->in_use = true;
+            s->tx_seg_inflight++;
+
+            // emit without touching the single-slot control machinery
+            // (track_pending=false): the scoreboard owns this segment's
+            // retransmit, and SYN/FIN must keep their own tx_pending slot. (satoru)
+            if (!SendTCPPacket(s, TCP_FLAG_ACK | TCP_FLAG_PSH, seg->data, chunk,
+                               seg->seq, false)) {
                 slog("[TCP] Send failed in established state\r\n");
+                seg->in_use = false;
+                if (s->tx_seg_inflight > 0) s->tx_seg_inflight--;
                 return sent > 0 ? sent : -1;
             }
             s->tcp_seq += (uint32_t)chunk;
@@ -1468,12 +1520,48 @@ void TCPStack::TCPTick() {
                 sockets[i].tx_last_tx_ms = now_ms;
             }
         }
+
+        // send-window retransmit: each outstanding DATA segment carries its own
+        // rto + retry count and is retransmitted independently. acks free
+        // segments in ApplyAck; anything still in_use past its rto goes back on
+        // the wire. if any one segment blows its retransmit budget the peer is
+        // gone  -  tear the connection down (same policy as the control slot).
+        // payload was buffered in the scoreboard so we resend without the
+        // caller. (satoru)
+        bool conn_dead = false;
+        for (int k = 0; k < TCP_SND_WND_SEGS; k++) {
+            TxDataSeg* seg = &sockets[i].tx_segs[k];
+            if (!seg->in_use) continue;
+            uint32_t rto_ms = 500u << (seg->retries < 4 ? seg->retries : 4);
+            if (rto_ms > 4000u) rto_ms = 4000u;
+            if ((uint32_t)(now_ms - seg->last_tx_ms) < rto_ms) continue;
+            if (seg->retries >= 6) {
+                slog("[TCP] data retransmit budget exhausted\r\n");
+                conn_dead = true;
+                break;
+            }
+            SendTCPPacket(&sockets[i], TCP_FLAG_ACK | TCP_FLAG_PSH,
+                          seg->data, seg->len, seg->seq, false);
+            seg->retries++;
+            seg->last_tx_ms = now_ms;
+        }
+        if (conn_dead) {
+            sockets[i].tx_pending = false;
+            for (int k = 0; k < TCP_SND_WND_SEGS; k++) sockets[i].tx_segs[k].in_use = false;
+            sockets[i].tx_seg_inflight = 0;
+            sockets[i].tcp_state = TCP_CLOSED;
+            sockets[i].active = false;
+            continue;
+        }
+
         // keepalive: probe an idle ESTABLISHED socket, then give up after a
         // bounded number of unanswered probes. Any RX/TX activity resets these
         // clocks (see ProcessTCP / Send), so this only fires on true idle.
         // A keepalive probe is a zero-length segment carrying seq = snd.nxt-1,
-        // which forces the peer to emit an ACK without delivering data. (satoru)
-        if (sockets[i].tcp_state == TCP_ESTABLISHED && !sockets[i].tx_pending) {
+        // which forces the peer to emit an ACK without delivering data. don't
+        // probe while data is still in flight  -  that's not idle. (satoru)
+        if (sockets[i].tcp_state == TCP_ESTABLISHED && !sockets[i].tx_pending &&
+            sockets[i].tx_seg_inflight == 0) {
             uint32_t idle_ms = (uint32_t)(now_ms - sockets[i].last_activity_ms);
             if (sockets[i].keepalive_probes == 0) {
                 if (idle_ms >= TCP_KEEPALIVE_IDLE_MS) {

@@ -124,6 +124,27 @@ enum TCPState {
 #define TCP_MSS        1460
 #define PENDING_IPV4_TX 8
 
+// send window: how many full data segments may be outstanding (un-acked) at
+// once. the old send path was stop-and-wait  -  exactly one mss in flight per
+// rtt regardless of the peer's advertised window  -  which capped throughput on
+// every bulk transfer (curl/firefox). a small fixed ring of outstanding data
+// segments lets us keep ~N*mss bytes on the wire before blocking, each segment
+// independently retransmitted on its own rto. control segments (syn/fin/
+// keepalive) still use the legacy single-slot tx_pending machinery below, so
+// handshake/close correctness is untouched. (satoru)
+#define TCP_SND_WND_SEGS 8
+
+// one outstanding data segment on the send scoreboard. payload is kept so the
+// segment can be retransmitted from tcp tick on rto without the caller. (satoru)
+struct TxDataSeg {
+    bool     in_use;
+    uint32_t seq;            // first sequence number of this segment's payload (satoru)
+    int      len;            // payload byte count (1..tcp_mss) (satoru)
+    uint8_t  retries;        // retransmit attempts so far for this segment (satoru)
+    uint32_t last_tx_ms;     // when this segment was last (re)transmitted (satoru)
+    uint8_t  data[TCP_MSS];  // buffered payload for retransmit (satoru)
+};
+
 struct PendingIPv4Frame {
     bool     active;
     uint32_t next_hop;
@@ -164,6 +185,14 @@ struct NetSocket {
     uint32_t tx_seq_end;
     uint32_t tx_last_tx_ms;
     uint8_t  tx_buf[TCP_MSS];
+
+    // send-window scoreboard for bulk DATA segments (Send path). independent of
+    // the single-slot control machinery above: control segments (syn/fin/
+    // keepalive) never carry data here, so the two paths don't overlap. a
+    // segment is freed when a cumulative ack reaches seq+len (ApplyAck), and
+    // retransmitted per-segment on rto from TCPTick. (satoru)
+    TxDataSeg tx_segs[TCP_SND_WND_SEGS];
+    int       tx_seg_inflight;   // count of in_use scoreboard slots (satoru)
 
     // non-blocking connect: when set, Connect() returns EINPROGRESS after
     // sending SYN and the 3-way handshake completes from TCPTick/RX (satoru)
