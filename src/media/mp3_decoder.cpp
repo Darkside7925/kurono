@@ -140,11 +140,26 @@ void MP3Decoder::Init() {
 
 //  bitstream reading
 int MP3Decoder::ReadBits(const uint8_t* data, int* bit_pos, int n_bits) {
+    // bound reads against the fixed 2048-byte reservoir: huffmandecode /
+    // readscalefactors drive bit_pos from attacker part2_3_length, which can run
+    // byte_idx past state.reservoir and read oob. when `data` points into the
+    // reservoir, stop once the absolute index reaches its end (read as zero). the
+    // side-info path passes the frame buffer (outside the reservoir) and is
+    // already caller-bounded, so leave it untouched. (satoru)
+    int res_avail = -1;
+    if (data >= state.reservoir && data < state.reservoir + 2048)
+        res_avail = (int)((state.reservoir + 2048) - data);
     int val = 0;
     for (int i = 0; i < n_bits; i++) {
         int byte_idx = (*bit_pos) >> 3;
-        int bit_idx  = 7 - ((*bit_pos) & 7);
-        val = (val << 1) | ((data[byte_idx] >> bit_idx) & 1);
+        int bit;
+        if (byte_idx < 0 || (res_avail >= 0 && byte_idx >= res_avail))
+            bit = 0;  // past end of reservoir  -  stop consuming real bytes (satoru)
+        else {
+            int bit_idx = 7 - ((*bit_pos) & 7);
+            bit = (data[byte_idx] >> bit_idx) & 1;
+        }
+        val = (val << 1) | bit;
         (*bit_pos)++;
     }
     return val;

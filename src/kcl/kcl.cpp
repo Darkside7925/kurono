@@ -712,10 +712,20 @@ static Value eval_mul(Interp& it, Env& env, int& pos) {
         if (op == KT_STAR) {
             // string * int repeats. (satoru)
             if (left.type == V_STR && right.type == V_INT) {
-                int reps = (int)right.i; if (reps < 0) reps = 0;
-                int per = left.slen; int total = per * reps;
-                char* buf = (char*)KernelHeap::Alloc((unsigned)(total + 1));
-                if (buf) { int o = 0; for (int r = 0; r < reps; r++) for (int k = 0; k < per; k++) buf[o++] = left.s[k]; buf[o] = 0; vfree(out); out.type = V_STR; out.s = buf; out.slen = total; }
+                // compute the repeat count in 64-bit and reject overflow/oversize
+                // BEFORE allocating so the fill loop can never outrun the buffer (satoru)
+                long long reps = right.i; if (reps < 0) reps = 0;
+                long long per = left.slen; if (per < 0) per = 0;
+                long long total64 = per * reps;          // can't wrap: both <= 2^31 (satoru)
+                const long long REPEAT_CAP = 8 * 1024 * 1024; // a few MB sanity cap (satoru)
+                if (total64 > REPEAT_CAP) {
+                    raise_err(it, line, "string repeat too large");
+                } else {
+                    int total = (int)total64;
+                    char* buf = (char*)KernelHeap::Alloc((unsigned)(total + 1));
+                    // bound the loop by total so it never exceeds the alloc (satoru)
+                    if (buf) { int o = 0; for (long long r = 0; r < reps && o < total; r++) for (int k = 0; k < per && o < total; k++) buf[o++] = left.s[k]; buf[o] = 0; vfree(out); out.type = V_STR; out.s = buf; out.slen = total; }
+                }
             } else if (isf) vset_float(out, vnumf(left) * vnumf(right));
             else vset_int(out, vnumi(left) * vnumi(right));
         } else if (op == KT_SLASH) {
