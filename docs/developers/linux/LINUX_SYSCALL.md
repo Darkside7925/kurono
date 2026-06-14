@@ -15,9 +15,10 @@ KVFS, and translates Linux paths into the canonical `/kurono` tree on the way in
 
 ## 2. Coverage
 
-`linux_syscall.h` defines syscall numbers across the x86-64 ABI (both the symbolic
-`LSYS_*` names and their numeric synonyms). **35+ core handlers** are implemented
-for real  -  not stubbed  -  covering the surface a command-line or GUI program needs:
+`linux_syscall.h` defines **177 `LSYS_*` syscall numbers** across the x86-64 ABI
+(symbolic names + their numeric synonyms), and `linux_syscall.cpp` implements
+**~155 of them for real** (distinct `case LSYS_*` arms)  -  not stubbed  -  covering
+the surface a command-line or GUI program needs:
 
 | Group | Syscalls |
 | --- | --- |

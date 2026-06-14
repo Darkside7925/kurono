@@ -109,8 +109,11 @@ across cores), and **load balancing**.
 
 ## 4. Constraints that shape the design
 
-- The kernel scheduler for *kernel processes* is preemptive on the BSP (PIT IRQ0);
-  the APs currently have no timer, so AP user scheduling starts cooperative.
+- The kernel scheduler for *kernel processes* is preemptive on the BSP (PIT IRQ0).
+  AP user scheduling *started* cooperative, but each AP now arms its own periodic
+  LAPIC timer (Phase 4 part 1, §3) that drives `ApTimerPreempt` → `ScheduleNextUser`,
+  so user threads on an AP are time-sliced. The remaining preemption work is
+  multithreaded `clone`-sibling placement and load balancing, not the timer itself.
 - Spinlocks are real `lock cmpxchg` atomics, so the existing global subsystem
   locks are already SMP-safe.
 - `HAL::SetKernelStack` updates the per-CPU syscall stack (`gs:8`); each AP's

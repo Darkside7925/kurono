@@ -66,7 +66,14 @@ The shell commands, the desktop icon system, the config system, the dynamic link
 
 KVFS persists across reboots through **KFS**, a real on-disk filesystem (see [KFS.md](KFS.md)), via `PersistStore::SaveTree` / `LoadTree` (`src/fs/persist.cpp`). On a clean shutdown / reboot  -  and on demand via the `persisttest` shell command  -  `SaveTree` formats a fresh KFS volume on the NVMe data disk and **mirrors the user-data subtrees (`/home`, `/etc`, `/root`) into it as real files + directories**. At boot, `LoadTree` mounts the volume and walks it back into KVFS, before the boot seeding re-fills the large `/usr` binaries.
 
-To keep the volume small and the restore fast, only file content up to `KFS_MAX_FILE` per file is stored; the re-seeded `/usr` binaries and the >4 MB sample media are skipped (the boot seeding re-creates them). Because the snapshot is a real filesystem, a future `kfs-fuse` driver could mount the volume on Linux and browse the files directly. (The earlier opaque raw-sector blob store still exists as `PersistStore::Save`/`Load` but is no longer the path persistence takes.)
+As of the KFS **v2** (extent-based) overhaul the old per-file size cap
+(`KFS_MAX_FILE`) is **gone**  -  `SaveTree` now mirrors whatever KVFS holds, limited
+only by free disk space (see [KFS.md](KFS.md) §10). The re-seeded `/usr` binaries
+are still skipped on save because the boot seeding re-creates them, not because of
+a size limit. Because the snapshot is a real filesystem, a future `kfs-fuse`
+driver could mount the volume on Linux and browse the files directly. (The earlier
+opaque raw-sector blob store still exists as `PersistStore::Save`/`Load` but is no
+longer the path persistence takes.)
 
 ## 5. Limitations
 
@@ -75,7 +82,7 @@ To keep the volume small and the restore fast, only file content up to `KFS_MAX_
 | Permissions advisory | POSIX-style mode bits are stored, but the single-address-space kernel does not yet enforce them across all callers |
 | No hard links | Path is the only way to identify a file (symlinks *are* supported  -  see §3) |
 | RAM-resident live tree | The live tree lives in RAM, so total live size is bounded by the kernel heap |
-| Selective persistence | The runtime tree is rebuilt fresh each boot, but the user-data subtrees (`/home`, `/etc`, `/root`) persist across reboot through KFS (§4); large re-seeded `/usr` binaries and >`KFS_MAX_FILE` media are regenerated at boot rather than stored |
+| Selective persistence | The runtime tree is rebuilt fresh each boot, but the user-data subtrees (`/home`, `/etc`, `/root`) persist across reboot through KFS (§4); the re-seeded `/usr` binaries are regenerated at boot rather than stored. There is no longer a per-file size cap on what persists (the v1 `KFS_MAX_FILE` limit was removed in KFS v2) |
 
 ## 6. Related files
 

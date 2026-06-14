@@ -23,7 +23,8 @@ When the loader detects `PT_INTERP`, `ExecPIE` does the full dynamic bring-up:
    SONAME-based deduplication. Search order: `DT_RPATH`/`DT_RUNPATH` →
    `LD_LIBRARY_PATH` (ignored for setuid) → `/system/lib` →
    `/system/lib/kurono` → `/system/lib/x86_64-linux-gnu` → `/apps/lib` →
-   `/home/user/.local/lib` (all resolving through the `/kurono` compat symlinks).
+   `/system/local/lib` → `/home/user/.local/lib` (all resolving through the
+   `/kurono` compat symlinks).
    References to `ld-linux*` / `ld-kurono.so` are short-circuited  -  the linker
    *is* the kernel.
 3. Apply relocations (see §3), enforce `PT_GNU_RELRO`, set up **static TLS**, and
@@ -44,7 +45,8 @@ The kernel then enters ring 3 with the correct user CR3, FS base, and stack.
 
 ## 3. Relocations
 
-The full x86-64 set  -  **23 relocation types**: `NONE`, `64`, `PC32`, `PC64`,
+The full x86-64 set  -  **24 relocation types handled** (distinct `case R_X86_64_*`
+arms in the reloc switch): `NONE`, `64`, `PC32`, `PC64`,
 `PLT32`, `GOTPCREL`, `GOTPCRELX`, `REX_GOTPCRELX`, `32`, `32S`, `GLOB_DAT`,
 `JUMP_SLOT`, `RELATIVE`, `IRELATIVE` (IFUNC resolvers), `COPY`, `TPOFF32/64`,
 `DTPMOD64`, `DTPOFF32/64`, `TLSDESC`, `TLSGD`, `TLSLD`, `GOTTPOFF`. Binding is

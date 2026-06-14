@@ -103,7 +103,8 @@ KFS is driven entirely by `PersistStore` (`src/fs/persist.cpp`):
 
 - **Save** (`SaveTree`): `Format` a fresh volume, then recursively mirror the
   user-data subtrees `/home`, `/etc`, `/root` from KVFS into KFS as real files +
-  dirs (skipping files over `KFS_MAX_FILE` and the re-seeded `/usr` binaries),
+  dirs (the re-seeded `/usr` binaries are skipped because boot seeding recreates
+  them; the old per-file `KFS_MAX_FILE` size cap was removed in v2  -  see §10),
   then `Sync`.
 - **Restore** (`LoadTree`): `Mount`, then walk the volume with `List` and rebuild
   the KVFS tree before boot seeding re-fills the large `/usr` binaries.

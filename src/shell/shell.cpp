@@ -12,6 +12,10 @@
 #include "../kernel/elf_loader.h"
 #include "../linux/linux_syscall.h"
 #include "../apps/denji_app.h"
+#include "../apps/firefox_launcher.h"
+#include "../packages/pkgmgr.h"
+#include "../linux/ld_kurono.h"
+#include "../proc/scheduler.h"
 #include "../media/embedded_media.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
@@ -930,6 +934,7 @@ namespace ShellBuiltins {
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
     int cmd_persisttest(KuronoShell*, int, const char**, char*, int);
     int cmd_supr(KuronoShell*, int, const char**, char*, int);
+    int cmd_firefox(KuronoShell*, int, const char**, char*, int);
 }
 
 void KuronoShell::RegisterBuiltins() {
@@ -939,6 +944,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
     RegisterCommand("wltest",   "Run the wl_shm wayland render test", ENV_AUTO, "media", cmd_wltest);
     RegisterCommand("pthtest",  "Run the pthreads (clone+futex) smoke test", ENV_AUTO, "media", cmd_pthtest);
+    RegisterCommand("firefox",  "Launch Firefox (installs it first if needed)", ENV_AUTO, "apps", cmd_firefox);
     RegisterCommand("persisttest","Test kvfs persistence across reboot", ENV_AUTO, "system", cmd_persisttest);
     RegisterCommand("playvideo","Play the imported video (ssstik)", ENV_AUTO, "media",  cmd_playvideo);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
@@ -1832,6 +1838,95 @@ int cmd_pthtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     p = sappend(out, p, mx, "\npthtest: exited (code ");
     p = sappend_int(out, p, mx, rc);
     p = sappend(out, p, mx, ")\n");
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// launch firefox. if it isn't installed yet, run the kpkg streaming installer
+// first (download+extract into /apps/firefox), then exec it through the
+// FirefoxLauncher (which seeds the env + execve /apps/firefox/firefox via
+// ld-kurono -> musl). this is the single entrypoint used by the terminal and
+// by the gui autorun. (satoru)
+int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (!Userspace::IsReady()) Userspace::Init();
+
+    const char* url = (argc >= 2) ? argv[1] : nullptr;
+
+    int p = 0;
+    if (!FirefoxLauncher::IsInstalled()) {
+        p = sappend(out, p, mx, "firefox: not installed yet  -  installing via kpkg...\n");
+        const char* iav[] = { "install", "firefox", nullptr };
+        // reuse the package manager's firefox branch (streaming install). (satoru)
+        char ibuf[1024];
+        int n = PackageManager::cmd_install(nullptr, 2, iav, ibuf, (int)sizeof(ibuf));
+        if (n > 0) { ibuf[n < (int)sizeof(ibuf) ? n : (int)sizeof(ibuf) - 1] = 0; p = sappend(out, p, mx, ibuf); }
+        if (!FirefoxLauncher::IsInstalled()) {
+            p = sappend(out, p, mx, "firefox: install did not complete; aborting launch.\n");
+            return p;
+        }
+    }
+
+    p = sappend(out, p, mx, "firefox: launching /apps/firefox/firefox via ld-kurono...\n");
+
+    // run firefox through ld-kurono ExecPIE directly (the proven dynamic-pie
+    // path used by dyntest), so we control the env passed on the user stack.
+    // the old FirefoxLauncher::Launch() used LSYS_EXECVE dispatched from kernel
+    // context, which returns -ENOSYS (sys_execve requires a live user task).
+    // we DON'T use ElfLoader::LoadELF64FromVFS because it hardcodes an envp
+    // without the wayland/egl vars gecko needs. (satoru)
+    int fsz = KVFS::GetFileSize("/apps/firefox/firefox");
+    if (fsz <= 0) {
+        p = sappend(out, p, mx, "firefox: /apps/firefox/firefox missing or empty.\n");
+        return p;
+    }
+    uint8_t* image = (uint8_t*)KernelHeap::Alloc((uint32_t)fsz);
+    if (!image) { p = sappend(out, p, mx, "firefox: OOM reading exe.\n"); return p; }
+    if (KVFS::ReadFile("/apps/firefox/firefox", image, (uint32_t)fsz) != fsz) {
+        KernelHeap::Free(image);
+        p = sappend(out, p, mx, "firefox: read of exe failed.\n");
+        return p;
+    }
+
+    Process* proc = Scheduler::CreateUserProcess("firefox", 0, 1);
+    if (!proc) { KernelHeap::Free(image); p = sappend(out, p, mx, "firefox: CreateUserProcess failed.\n"); return p; }
+
+    const char* av[] = { "/apps/firefox/firefox", url, nullptr };
+    if (!url) av[1] = nullptr;
+    const char* envp[] = {
+        "HOME=/home/user", "USER=user",
+        "LD_LIBRARY_PATH=/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
+        "XDG_RUNTIME_DIR=/system/run/user/1000",
+        "WAYLAND_DISPLAY=wayland-0",
+        "MOZ_ENABLE_WAYLAND=1", "GDK_BACKEND=wayland",
+        "LIBGL_ALWAYS_SOFTWARE=1", "DISPLAY=:0",
+        "FONTCONFIG_PATH=/system/fonts",
+        "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_CONTENT_SANDBOX=1",
+        "MOZ_CRASHREPORTER_DISABLE=1",
+        nullptr
+    };
+
+    uint64_t entry = 0, rsp = 0;
+    bool ok = LdKurono::ExecPIE(proc, image, (uint64_t)fsz, "/apps/firefox/firefox",
+                                av, envp, 1000, 1000, &entry, &rsp);
+    KernelHeap::Free(image);
+    if (!ok) {
+        p = sappend(out, p, mx, "firefox: ld-kurono ExecPIE failed (see serial for which lib/reloc).\n");
+        Scheduler::DestroyProcess(proc);
+        return p;
+    }
+    proc->rip = entry; proc->rsp = rsp;
+    proc->user_frame.rip = entry; proc->user_frame.rsp = rsp;
+    proc->flags |= PROCESS_FLAG_STACK_READY;
+
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    int q = LinuxSyscall::ReadConsoleOutput(out + p, mx - 1 - p);
+    if (q > 0) p += q;
+    out[p] = 0;
+    p = sappend(out, p, mx, "\nfirefox: process returned (code ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, ")  -  see serial for ld-kurono module bases + any fault.\n");
     Scheduler::DestroyProcess(proc);
     return p;
 }

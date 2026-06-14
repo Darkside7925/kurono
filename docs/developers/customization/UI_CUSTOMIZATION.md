@@ -93,6 +93,18 @@ desktop.allow_edit = 0
 taskmgr.allow_kill = 0
 ```
 
+### Retheme via KSS theme tokens
+The KSS styling layer reads a `theme.*` token set from the same file (these keys
+aren't in the generated default  -  add them to override the built-in theme):
+```
+theme.bg      = 0xFF101014
+theme.surface = 0xFF1E1E24
+theme.accent  = 0xFF5C8AFF
+theme.text    = 0xFFF0F0F2
+```
+See `system/UI_CONFIG.md` for the full `theme.*` / `compositor.*` / `display.*`
+key list.
+
 ## 5. Applying changes on the fly
 
 After editing and saving the config file:

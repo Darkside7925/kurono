@@ -154,11 +154,14 @@ void KernelHeap::ExpandWithPMM() {
     uint64_t total_phys = PMM::GetTotalMemory();
 
     uint64_t target = total_phys / 2;
-    // cap the eager heap grab at 1 gb. it used to take 2 gb contiguous up
-    // front, which starved the raw pmm frame pool that ring-3 processes need
-    // for demand-paged brk/mmap/stacks (large static binaries like ffmpeg hit
-    // pmm oom). 1 gb is far more than the desktop+kvfs ever use. (satoru)
-    const uint64_t MAX_HEAP = 1ULL * 1024 * 1024 * 1024;
+    // cap the eager heap grab at 2 gb. it used to be 1 gb, but the firefox
+    // closure stores ~235 mb in kvfs as one contiguous heap block per file
+    // (libxul alone is a 174 mb block); 1 gb left too little headroom once the
+    // desktop+kvfs metadata are accounted for and the streamed install
+    // fragmented the pool. on a 4 gb vm total_phys/2 = 2 gb, which still leaves
+    // ~2 gb in the raw pmm frame pool for demand-paged user brk/mmap/stacks.
+    // (satoru)
+    const uint64_t MAX_HEAP = 2ULL * 1024 * 1024 * 1024;
     const uint64_t MIN_HEAP = 32ULL * 1024 * 1024;
     if (target > MAX_HEAP) target = MAX_HEAP;
 

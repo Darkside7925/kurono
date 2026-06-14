@@ -8,9 +8,18 @@ The scheduler maintains the list of runnable tasks and decides which one runs ea
 
 ## 2. Current model
 
-The current scheduler is a cooperative/time-slice hybrid. Processes yield explicitly or are preempted after a timer quantum. Priority values (stored in the `TMProcess` struct) influence the time quantum allocation  -  higher priority processes run more often.
+The scheduler is a cooperative/time-slice hybrid with a CFS-style vruntime pick
+plus FIFO/RR preempt tiers. **Kernel processes** on the boot core are still
+largely cooperative (they loop `work(); SleepMs(n)` and yield), while priority
+values influence each task's time quantum.
 
-Because Kurono does not use hardware context switching (no separate user-space rings with full register save/restore), the "processes" are actually OS-managed tasks that share the kernel stack. Full preemptive user-space processes would require TSS setup and syscall infrastructure.
+The OS **does** have full ring-3 user processes: a per-CPU TSS (`TSS64` in
+`src/hal/hal.cpp`), `int 0x80` + the per-CPU `swapgs` SYSCALL fast path, and
+saved user interrupt frames. Linux user threads are preemptively switched  -  on
+the boot core via the PIT IRQ, and (opt-in) on the application processors via a
+per-CPU LAPIC timer (see §5 and [SMP.md](SMP.md)). The earlier claim that "full
+preemptive user-space processes would require TSS/syscall infrastructure" is no
+longer true  -  that infrastructure is in.
 
 ## 3. Process table
 
@@ -35,7 +44,16 @@ All logical CPUs are brought up at boot (`src/proc/smp.{h,cpp}` + `src/boot/ap_t
 
 `Scheduler::GetCurrentProcess()` / `SetCurrentForThisCpu()` track the running task **per CPU** (`PerCpu.current` on an AP, the global on the boot core), so the shared Linux syscall handler operates on the right task whichever core it runs on.
 
-The boot core runs the desktop, drivers, and kernel processes as before. The remaining work is the AP dispatch loop that actually places **user** threads onto the secondary cores  -  it needs ready-queue synchronization (a spinlock around every queue scan/mutation, released before any context switch) so the boot core and an AP can't run the same task. Until that lands, user threads run on the boot core while the kernel runs on all cores.
+The boot core runs the desktop, drivers, and kernel processes as before. The
+AP dispatch loop that places **user** threads onto the secondary cores has since
+landed: a cross-core ready-queue spinlock (`g_sched_lock`) with an atomic per-CPU
+claim, a per-CPU user-execution context, and per-CPU syscall state, all verified
+non-regressing under `-smp 4`. With the opt-in gate on (`./start.sh --apsched`)
+an application processor was shown launching and running a ring-3 Linux program
+to exit 0 in parallel with the desktop, and each AP arms a per-CPU LAPIC timer so
+those threads are time-sliced rather than purely cooperative. The default boot
+still parks the APs. Remaining: `clone`-sibling placement across cores and load
+balancing. See [SMP.md](SMP.md) for the full phased state.
 
 ## 6. Related files
 

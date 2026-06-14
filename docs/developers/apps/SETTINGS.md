@@ -4,14 +4,22 @@
 
 ## 1. What it configures
 
-The Settings app provides a graphical interface for changing system preferences. Major sections:
+The Settings app provides a graphical interface for changing system preferences.
+It has **12 tabs** (`SettingsTab` enum in `settings.h`, `STAB_COUNT = 12`), each
+backed by its own `settings_mod_*.cpp` module:
 
-- **Display**  -  resolution, color depth, refresh
-- **Audio**  -  volume level, device selection
-- **Network**  -  connection status, IP configuration
-- **Appearance**  -  wallpaper, theme color presets
-- **About**  -  OS version, build info, hardware summary
-- **Users**  -  user management (create, delete, change password)
+1. **Display**  -  resolution, refresh, VSync, DPI
+2. **Sound**  -  volume level, device selection
+3. **Network**  -  connection status, IP configuration
+4. **Storage**
+5. **Power**
+6. **Personalize** (Personal)  -  wallpaper, theme color presets
+7. **Security**
+8. **Packages**
+9. **Updates**  -  real repository fetch + pending-update counts
+10. **System**
+11. **About**  -  OS version, build info, hardware summary
+12. **Accessibility** (a11y)
 
 ## 2. How settings are saved
 
@@ -29,6 +37,8 @@ The About tab shows `© 2026 Kurono OS` and the current kernel version string fr
 
 ## 5. Related files
 
+- `src/apps/settings.cpp` / `.h`  -  the app + `SettingsTab` enum
+- `src/apps/settings_mod_*.cpp`  -  the 11 per-tab module implementations
 - `src/system/ui_config.cpp`  -  reads and writes the config file
 - `src/ui/desktop.cpp`  -  `LaunchSettings()` entry point and `ReloadFromConfig()` target
 - `src/drivers/display_mgr.cpp`  -  display mode changing

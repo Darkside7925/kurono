@@ -4,7 +4,7 @@ Kurono OS now has a docs tree arranged by audience.
 
 ## Documentation Scope
 
-The live source tree under `src/` is approximately 137,000 lines of freestanding C++17, NASM assembly, and C. The full repository text and documentation footprint is larger.
+The live source tree under `src/` is approximately 130,000 lines of hand-written freestanding C++17, NASM assembly, and C. (The raw `wc -l` over `src/` is much larger  -  around 337,000 lines  -  but roughly 207,000 of those are the two pre-decoded raw-RGBA wallpaper headers, `src/ui/wallpaper.h` and `src/ui/wallpaper2.h`, which are embedded pixel data, not code; the vendored `src/third_party/` stb glue adds another ~13,000.) The full repository text and documentation footprint is larger.
 
 ## Reading Order
 

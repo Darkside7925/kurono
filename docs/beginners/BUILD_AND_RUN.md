@@ -4,15 +4,26 @@ This document describes the practical build path that matches the current reposi
 
 ## 1. The easiest entry point
 
-From Windows PowerShell, the easiest first command is the helper script at the repository root.
+The project's primary dev host is now **Linux + KVM**, so the easiest first
+command is the Linux launcher at the repository root:
 
-`start.ps1` is the normal entry point for build and launch flow.
+```bash
+./start.sh                 # build the ISO and boot it (KVM, virtio-gpu, audio)
+./start.sh --no-build      # boot the existing ISO without rebuilding
+./start.sh --clean         # clean rebuild, then boot
+./start.sh --std           # plain framebuffer instead of virtio-gpu
+./start.sh --uefi          # UEFI boot path
+./start.sh --debug         # gdb stub on :1234
+```
+
+On a Windows host the older PowerShell launcher `start.ps1` (WHPX) still works
+and drives `make iso` inside WSL.
 
 ## 2. The build reality in this workspace
 
-The repository contains a VS Code task named `Build OS`, but in the current environment plain `make` from PowerShell is not enough by itself because the useful build path is the WSL based one.
-
-The working build route used in this workspace is the `src` folder under WSL.
+Builds run from the `src/` folder with `make` on a Linux toolchain (on Windows
+the same `make` is driven through WSL). The repository also contains a VS Code
+task named `Build OS`.
 
 ## 3. The important output files
 

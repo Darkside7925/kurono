@@ -114,7 +114,12 @@ enum TCPState {
 #define SOCK_RAW       3   // raw ip
 
 #define MAX_SOCKETS    16
-#define TCP_RX_BUFSIZE 8192
+// 64 kb rx ring (was 8 kb). the small ring made the advertised receive window
+// collapse to ~0 after a few segments on a fast bulk transfer (e.g. the 235 mb
+// firefox tar), and with no window-update ack emitted on drain the peer
+// (slirp) deadlocked waiting to reopen the window. a 64 kb window keeps the
+// pipe full between Recv() drains. (satoru)
+#define TCP_RX_BUFSIZE 65536
 #define TCP_TX_BUFSIZE 8192
 #define TCP_MSS        1460
 #define PENDING_IPV4_TX 8

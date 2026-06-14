@@ -27,7 +27,14 @@ I/O port accesses from the guest are forwarded to `vdevices.cpp` which checks a 
 
 ## 4. Hypercalls
 
-Guest software can request hypervisor services via `VMCALL`. The hypervisor recognizes a set of hypercall numbers for operations like shared memory setup and host file access (v9fs).
+Guest software can request hypervisor services via `VMCALL` (the handler reads the
+hypercall number from guest `eax`). The recognized set includes: NOP/info (returns
+`"kuro"`), shutdown, reboot, an audio PCM passthrough channel (`0x11`), network
+status + packet passthrough (`0x12` / `0x14`), the 9p shared-filesystem channel
+(`0x20`, host KVFS ↔ guest), and the **KSA read-only authorization-verdict channel
+(`0x4B`)**  -  `KSA_SUB_GET_VERDICT` returns a *copy* of the latched verdict
+(completed / approved / has-hash) and never a pointer; there is no path to write an
+approval back into KSA memory from the main OS (see `security/KSA.md`).
 
 ## 5. Related files
 

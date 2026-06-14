@@ -489,7 +489,7 @@ void Init() {
        "HOME=/home/user\n"
        "USER=user\n"
        "DISPLAY=:0\n"
-       "LD_LIBRARY_PATH=/system/lib:/system/lib/kurono:/apps/lib\n"
+       "LD_LIBRARY_PATH=/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib\n"
        "FONTCONFIG_PATH=/system/fonts\n"
        "SSL_CERT_FILE=/system/ssl/certs/ca-certificates.crt\n"
        "XDG_RUNTIME_DIR=/system/run/user/1000\n"

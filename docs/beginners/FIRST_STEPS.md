@@ -6,7 +6,7 @@ This is the shortest practical introduction to the repository.
 
 The live repository is not small.
 
-The source tree under `src/` is approximately 137,000 lines of freestanding C++17, NASM assembly, and C.
+The source tree under `src/` is approximately 130,000 lines of hand-written freestanding C++17, NASM assembly, and C. (A raw `wc -l` reports far more  -  around 337,000  -  but ~207,000 of that is the two pre-decoded raw-RGBA wallpaper headers in `src/ui/`, which are embedded image data, not code.)
 
 That means the right strategy is not reading everything in random order. The right strategy is reading the control files first.
 

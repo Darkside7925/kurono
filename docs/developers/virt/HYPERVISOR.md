@@ -30,11 +30,17 @@ The hypervisor requires:
 
 Hypervisor initialization is deferred  -  it does not run during normal Kurono boot. It is activated only when the user explicitly starts a VM. This is a deliberate decision: VT-x initialization is risky on some real laptop hardware and deferring it prevents boot failures.
 
-To start the hypervisor:
+To start a VM, use the `vm` shell command (registered in `linux_cmds.cpp`, category
+`virt`):
 ```
-kurono vm start
+vm create [ram_mb]      # create a VM
+vm run [max_exits]      # enter the VM run loop
+vm boot-alpine          # boot the embedded Alpine guest
+vm boot-test            # minimal guest that prints to serial
 ```
-Or from the Conduit app.
+(There is no `kurono vm start` command  -  `vm` is its own top-level command with
+`create` / `run` / `pause` / `resume` / `destroy` / `serial` / `regs` / `info` /
+`boot-test` / `boot-alpine` subcommands.)
 
 ## 4. VMCS setup
 

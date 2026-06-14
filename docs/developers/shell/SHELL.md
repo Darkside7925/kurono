@@ -10,7 +10,15 @@ The shell is not a separate process  -  it is a library that the terminal app an
 
 Commands are registered with `RegisterCommand(name, description, env_flags, category, handler_fn)`. The `env_flags` field controls which runtime environments (desktop, emergency, KCL, etc.) each command is visible in.
 
-All built-in commands are registered in `RegisterBuiltins()` which is called from `KuronoShell::Init()`. Subsystems like the package manager, Linux integration, and system control register their own commands there as well.
+The Kurono-native built-ins are registered in `RegisterBuiltins()` (called from
+`KuronoShell::Init()`), but many commands are registered by *their own*
+subsystems: `src/shell/linux_cmds.cpp` and `windows_cmds.cpp` (the Linux/Windows
+surfaces), `src/apps/kj.cpp` (`kj`/`node`), `src/kcl/kcl.cpp` (`kcl`),
+`src/apps/python_interp.cpp` (`python`/`py`), `src/packages/pkgmgr.cpp` (`kpkg`
+and friends), `src/system/installer.cpp` (`installer`), `src/net/network.cpp`,
+`src/shell/shell.cpp` (the `firefox` command  -  auto-installs the package then
+launches it via `LdKurono::ExecPIE`), `src/linux/*`, etc. In total ~154 distinct
+commands are registered (counting `RegisterCommand` call sites across the tree).
 
 The `kurono` command group provides:
 
@@ -33,7 +41,10 @@ Commands write output via `KuronoShell::Print(str)` and `KuronoShell::Println(st
 
 ## 5. Command categories
 
-The `category` field groups commands for the `help` command output. Current categories: `navigation`, `files`, `system`, `network`, `packages`, `linux`, `virt`, `kcl`.
+The `category` field groups commands for the `help` command output. The category
+strings actually passed to `RegisterCommand` across the tree are: `builtin`,
+`filesystem`, `text`, `system`, `network`, `package`, `linux`, `virt`,
+`security`, `media`, `lang`, and `scripting`.
 
 ## 6. Related files
 

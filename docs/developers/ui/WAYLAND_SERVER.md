@@ -35,11 +35,25 @@ The compositor advertises the following globals via `wl_registry`:
 - `zwp_linux_dmabuf_v1` v3
 - `zxdg_decoration_manager_v1` v1
 
-## 4. Surface bridging
+## 4. Surface bridging (working)
 
-The intended design is that each `xdg_toplevel` surface becomes a `Window` in the Kurono window manager. Each `wl_buffer` attach becomes a blit into the framebuffer.
+Each `xdg_toplevel` surface becomes a real `Window` in the Kurono window manager,
+and each committed `wl_shm` buffer is blitted into that window  -  this is
+**implemented, not stubbed**:
 
-The bridge is currently stubbed. `DispatchPendingFrames()` and `DamageAll()` are placeholder no-ops.
+- `commit_surface()` → `bridge_surface_window()` calls
+  `WindowManager::CreateWindow()` the first time a toplevel commits, then
+  `blit_surface_region()` → `blit_argb()` copies the client's pixels (a
+  `wl_shm` buffer fd-passed via `SCM_RIGHTS`) into the window's framebuffer rect,
+  honouring damage.
+- `DispatchPendingFrames()` and `DamageAll()` are real (paced from the desktop
+  redraw), not no-ops.
+- Pointer events are forwarded back to the focused client every frame via
+  `ForwardPointerMotion()` / `ForwardPointerButton()` (called from `desktop.cpp`).
+
+This was proven with a real **musl-gcc**-compiled client,
+`src/userprogs/wl_shm_test.c`, embedded in the kernel and launched by the
+`wltest` shell command.
 
 ## 5. Limits
 
@@ -51,13 +65,23 @@ The compositor has these limits:
 
 ## 6. Current status
 
-The compositor is functional at the wire-protocol level:
+The compositor goes well past the wire protocol  -  the full `wl_shm` + xdg-shell
+render path works:
 
-- Registry and globals are advertised correctly
-- Surface creation works
-- `xdg_toplevel` configure events are sent
+- Registry and globals advertised correctly; surface creation + `xdg_toplevel`
+  configure events work.
+- A committed `wl_shm` buffer (fd-passed via `SCM_RIGHTS`) is blitted into a real
+  WM window with damage tracking, and pointer enter/leave/motion/button events are
+  forwarded back to the focused client. Verified end to end with a musl-compiled
+  client (`wl_shm_test`, via `wltest`).
 
-However, the surface-to-framebuffer blit bridge and input event forwarding are still stubbed. A real Wayland client can connect and negotiate surfaces, but the pixels do not yet appear on screen.
+**Honest gaps that remain:**
+
+- **Keyboard-to-client forwarding** (`ForwardKey`) is implemented but **not yet
+  wired into the input loop**, so the focused client doesn't receive keystrokes
+  yet.
+- **`zwp_linux_dmabuf` GPU buffers are advertised but not composited**  -  only
+  `wl_shm` software buffers are blitted today.
 
 ## 7. Related files
 

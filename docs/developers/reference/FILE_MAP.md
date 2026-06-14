@@ -10,10 +10,11 @@ It is meant to answer one practical question quickly: *where does a given respon
 | --- | --- |
 | `README.md` | project overview |
 | `STATUS.md` | development snapshot |
-| `start.ps1` | build and launch helper |
+| `start.sh` | Linux/KVM build-and-launch helper (the path used day to day) |
+| `start.ps1` | Windows/WSL (WHPX) build and launch helper |
 | `create_working_boot.ps1` | boot media helper |
 | `build_iso.ps1` | ISO helper script |
-| `flash_usb.ps1` | USB deployment helper |
+| `build_debian_rootfs.ps1` | Debian guest rootfs build helper |
 | `fix_conflicts.py` | maintenance utility |
 | `logo.h` | embedded logo pixels |
 | `docs/` | project documentation |
@@ -26,6 +27,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | --- | --- |
 | `efi_loader.c` | standalone EFI loader |
 | `kurono_boot.asm` | early assembly boot path |
+| `ap_trampoline.asm` | application-processor (SMP) real-mode → long-mode trampoline |
 | `kurono_linker.ld` | main linker script |
 | `multiboot_header.S` | Multiboot header |
 
@@ -33,11 +35,14 @@ It is meant to answer one practical question quickly: *where does a given respon
 
 | File | Role |
 | --- | --- |
+| `buddy.cpp` / `buddy.h` | buddy page allocator |
+| `slab.cpp` / `slab.h` | slab allocator |
+| `elf_loader.cpp` / `elf_loader.h` | ELF loader + `PT_INTERP` handoff to ld-kurono |
 | `heap.cpp` | heap implementation |
 | `heap.h` | heap declarations |
+| `hrtimer.cpp` / `hrtimer.h` | high-resolution timer support |
 | `io.h` | low level I/O helpers |
 | `kurono_kernel.cpp` | boot coordinator and main loop |
-| `kurono_kernel.cpp.bak` | historical backup |
 | `kurono_kernel_simplified.cpp` | simplified kernel variant |
 | `memory_mgr.h` | memory manager declarations |
 | `multiboot.h` | Multiboot structures |
@@ -52,6 +57,8 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `time.h` | time declarations |
 | `types.cpp` | type related support |
 | `types.h` | core types |
+| `userspace.cpp` / `userspace.h` | ring-3 entry / user-process launch helpers |
+| `userspace_entry.asm` | ring-3 entry / IRETQ stubs |
 | `vmm.cpp` | virtual memory or mapping support at kernel layer |
 | `vmm.h` | VMM declarations |
 
@@ -61,6 +68,9 @@ It is meant to answer one practical question quickly: *where does a given respon
 | --- | --- |
 | `hal.cpp` | IDT, PIC, reboot, interrupt dispatch |
 | `hal.h` | HAL interface |
+| `cpufreq.cpp` / `cpufreq.h` | CPUFreq governors + P-state control |
+| `isr_stubs.asm` | ISR entry stubs |
+| `syscall_entry.asm` | SYSCALL/`int 0x80` entry (per-CPU swapgs path) |
 
 ## 5. `src/drivers`
 
@@ -72,6 +82,15 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `amd_gpu.h` | AMD GPU interface |
 | `audio.cpp` | audio services and tone support |
 | `audio.h` | audio interface |
+| `audio_backend.cpp` / `audio_backend.h` | audio backend dispatch layer |
+| `audio_backend_ac97.cpp` / `audio_backend_hda.cpp` / `audio_backend_sb16.cpp` / `audio_backend_pcspk.cpp` | per-device audio backends |
+| `audio_dma.cpp` / `audio_dma.h` | audio DMA buffer management |
+| `audio_format.cpp` / `audio_format.h` | PCM format conversion |
+| `audio_mixer.cpp` / `audio_mixer.h` | per-stream software mixer |
+| `audio_server.cpp` / `audio_server.h` | audio server / stream routing |
+| `audio_wav.cpp` / `audio_wav.h` | WAV parse/playback helpers |
+| `pulse_server.cpp` / `pulse_server.h` | PulseAudio-compatible daemon |
+| `tpm.cpp` / `tpm.h` | TPM 2.0 (CRB + FIFO) |
 | `bga.cpp` | Bochs graphics adapter |
 | `bga.h` | BGA interface |
 | `cpu_detect.cpp` | CPUID and feature discovery |
@@ -113,6 +132,8 @@ It is meant to answer one practical question quickly: *where does a given respon
 
 | File | Role |
 | --- | --- |
+| `app_icons.cpp` / `app_icons.h` | drawn app/desktop icons |
+| `control_center.cpp` / `control_center.h` | control-center panel |
 | `desktop.cpp` | desktop shell and taskbar |
 | `desktop.h` | desktop interface |
 | `file_browser.cpp` | file browser UI helpers |
@@ -121,14 +142,18 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `font.h` | font interface |
 | `gui.cpp` | GUI drawing helpers |
 | `gui.h` | GUI interface |
+| `kss.cpp` / `kss.h` | KSS theme tokens + scriptable stylesheet/animation layer |
 | `lockscreen.cpp` | lock screen flow |
 | `lockscreen.h` | lock screen interface |
+| `notification.cpp` / `notification.h` | toast/notification system |
+| `perf_hud.cpp` / `perf_hud.h` | FPS / performance overlay |
 | `text_layout.cpp` | text layout logic |
 | `text_layout.h` | text layout interface |
 | `ui_elements.cpp` | reusable UI components |
 | `ui_elements.h` | UI component declarations |
 | `vga_font.h` | VGA font data |
-| `wallpaper.h` | wallpaper declarations |
+| `wallpaper.h` | wallpaper #1 declarations (pre-decoded raw RGBA) |
+| `wallpaper2.h` | wallpaper #2 declarations (pre-decoded raw RGBA) |
 | `wayland_server.cpp` | in-kernel Wayland compositor |
 | `wayland_server.h` | Wayland compositor interface |
 | `window_manager.cpp` | window manager implementation |
@@ -136,20 +161,27 @@ It is meant to answer one practical question quickly: *where does a given respon
 
 ## 7. `src/apps`
 
+> Note: the GUI `conduit` app/interface lives in `src/system/` (`conduit.cpp`/`conduit.h`), not `src/apps/`. Earlier revisions of this map listed it here.
+
 | File | Role |
 | --- | --- |
-| `browser.cpp` | browser app shell |
+| `browser.cpp` | browser app shell (deliberate placeholder tile) |
 | `browser.h` | browser interface |
 | `calculator.cpp` | calculator app |
 | `calculator.h` | calculator interface |
-| `conduit.cpp` | conduit app |
-| `conduit.h` | conduit interface |
+| `denji_app.cpp` / `denji_app.h` | Denji windowed video-player app |
 | `file_manager.cpp` | file manager app |
 | `file_manager.h` | file manager interface |
+| `firefox_launcher.cpp` / `firefox_launcher.h` | Firefox runtime launcher (`execve` path) |
+| `kj.cpp` / `kj.h` | KJ (Kurono JavaScript) interpreter + `kj`/`node` shell commands |
+| `kj_test.cpp` / `kj_test.h` | KJ self-test suite (`kurono.kjtest`, 11/11) |
 | `media_player.cpp` | media player app |
 | `media_player.h` | media player interface |
+| `python_interp.cpp` / `python_interp.h` | Mini Python 3 interpreter |
 | `settings.cpp` | settings app |
 | `settings.h` | settings interface |
+| `settings_mod_*.cpp` | per-tab settings modules (a11y, about, audio, devices, display, network, personalize, power, security, storage, system) |
+| `system_settings.cpp` / `system_settings.h` | system-settings backing store |
 | `task_manager.cpp` | task manager app |
 | `task_manager.h` | task manager interface |
 | `terminal.cpp` | terminal app |
@@ -157,7 +189,6 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `text_editor.cpp` | text editor app |
 | `text_editor.h` | text editor interface |
 | `README.md` | app notes |
-| `syncthing-windows-setup.exe` | bundled external installer artifact |
 
 ## 8. `src/shell`
 
@@ -180,6 +211,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `kvfs.h` | KVFS declarations |
 | `kfs.cpp` | Kurono File System  -  on-disk persistence filesystem |
 | `kfs.h` | KFS on-disk format spec + declarations |
+| `kfs_bench.cpp` / `kfs_bench.h` | KFS benchmark (`kurono.kfsbench`) |
 | `persist.cpp` | persistence layer (mirrors KVFS user data into KFS) |
 | `persist.h` | persistence declarations |
 | `vfs.cpp` | generic VFS layer |
@@ -239,22 +271,32 @@ It is meant to answer one practical question quickly: *where does a given respon
 | --- | --- |
 | `kcl.cpp` | KCL interpreter |
 | `kcl.h` | KCL declarations |
+| `kcl_test.cpp` / `kcl_test.h` | KCL self-test suite (`kurono.kcltest`, 11/11) |
 
 ## 15. `src/system`
 
 | File | Role |
 | --- | --- |
-| `conduit.cpp` | conduit bridge services |
+| `clipboard.cpp` / `clipboard.h` | system clipboard |
+| `conduit.cpp` | conduit bridge services (also the GUI Conduit app) |
 | `conduit.h` | conduit declarations |
+| `dbus_server.cpp` / `dbus_server.h` | D-Bus session bus daemon |
+| `gpu_driver_installer.cpp` / `gpu_driver_installer.h` | guest GPU driver installer |
 | `input_manager.cpp` | input manager |
 | `input_manager.h` | input declarations |
 | `installer.cpp` | installer logic |
 | `installer.h` | installer declarations |
+| `installer_gui.cpp` / `installer_gui.h` | graphical installer / first-setup wizard (`kurono.setup=1`) |
 | `kpaths.h` | canonical on-disk path layout (single source of truth) |
 | `logging.cpp` | runtime logging (boot/system/serial/network/security/crash) |
 | `logging.h` | runtime logging declarations |
+| `runtime_layout.cpp` / `runtime_layout.h` | Linux runtime layout seeder (`/system` tree, firefox.env) |
+| `screenshot.cpp` / `screenshot.h` | screen-capture support |
+| `system_update.cpp` / `system_update.h` | boot-time updater / staged-rootfs flow |
+| `ui_config.cpp` / `ui_config.h` | UI config (`/etc/kurono/ui.conf` theme tokens) |
 | `user_mgmt.cpp` | user management |
 | `user_mgmt.h` | user management declarations |
+| `vconsole.cpp` / `vconsole.h` | virtual consoles |
 
 ## 16. `src/linux`
 
@@ -282,6 +324,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `linux_signals.h` | signal declarations |
 | `linux_syscall.cpp` | syscall handling |
 | `linux_syscall.h` | syscall declarations |
+| `linux_syscall_x64.cpp` | x86_64 syscall-number dispatch table |
 | `shared_mount.cpp` | shared mount logic |
 | `shared_mount.h` | shared mount declarations |
 | `user_bridge.cpp` | user bridge logic |
@@ -292,7 +335,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | File | Role |
 | --- | --- |
 | `alpine_data.h` | embedded Alpine payload |
-| `debian_data.h` | embedded Debian payload |
+| `debian_data.cpp` / `debian_data.h` | embedded Debian payload |
 | `ept.cpp` | EPT and NPT mapping |
 | `ept.h` | EPT declarations |
 | `guest_mem.cpp` | guest memory setup |
@@ -303,12 +346,15 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `iommu.h` | IOMMU declarations |
 | `linux_boot.cpp` | guest Linux loader |
 | `linux_boot.h` | guest boot declarations |
+| `pci_passthrough.cpp` / `pci_passthrough.h` | PCI/GPU passthrough |
 | `v9fs.cpp` | shared file protocol layer |
 | `v9fs.h` | v9fs declarations |
 | `vdevices.cpp` | virtual devices |
 | `vdevices.h` | virtual device declarations |
 | `vdisk.cpp` | virtual disk |
 | `vdisk.h` | virtual disk declarations |
+| `virtio_gpu_host.cpp` / `virtio_gpu_host.h` | host-side virtio-gpu device bridge |
+| `vpci.cpp` / `vpci.h` | virtual PCI bus |
 | `vmexit.cpp` | VM exit policy |
 | `vmexit.h` | VM exit declarations |
 | `vmm.cpp` | virtualization backend glue |
@@ -320,13 +366,18 @@ It is meant to answer one practical question quickly: *where does a given respon
 
 | File | Role |
 | --- | --- |
+| `aac_parse.cpp` / `aac_parse.h` | AAC-LC parser |
 | `codec.cpp` | codec registry and helpers |
 | `codec.h` | codec declarations |
 | `embedded_media.h` | embedded media declarations |
+| `h264_parse.cpp` / `h264_parse.h` | H.264 parser |
+| `kvid.cpp` / `kvid.h` | KVID container/player |
 | `mediadecoder.cpp` | image and media decoding |
 | `mediadecoder.h` | decoder declarations |
 | `mp3_decoder.cpp` | MP3 decoder |
 | `mp3_decoder.h` | MP3 declarations |
+| `mp4_demux.cpp` / `mp4_demux.h` | MP4 demuxer |
+| `video_player.cpp` / `video_player.h` | `VideoPlayer` decode/playback core |
 
 ## 19. `src/tests`
 
@@ -337,9 +388,26 @@ It is meant to answer one practical question quickly: *where does a given respon
 
 ## 20. `src/third_party`
 
-This folder carries the glue layer around embedded third party components used by the media and font stack.
+This folder carries the glue layer around embedded third party components used by the media and font stack (`stb_image`, `stb_truetype`, and their `*_glue.cpp` wrappers).
 
-## 21. Fast lookup guide
+## 21. `src/userprogs`
+
+Userspace test programs (cross-compiled with musl-gcc / NASM) embedded into the kernel image and launched by shell commands. Built ELF artifacts are tracked alongside their sources.
+
+| File | Role |
+| --- | --- |
+| `wl_shm_test.c` / `wl_shm_test.elf` | musl Wayland client exercising the `wl_shm` + xdg-shell render path (`wltest`) |
+| `pthread_test.c` / `pthread_test.elf` | pthreads (clone+futex) smoke test (`pthtest`) |
+| `hello_musl.c` / `hello_musl.elf` | dynamic musl PIE used by `kurono.dyntest` |
+| `dyntest.elf` | dynamic-linker bring-up artifact |
+| `hello.asm` / `hello_x64.asm` | hand-written ring-3 syscall demos |
+| `kpython.c` | embedded Python helper source |
+| `libfoo.so` / `musl_libc.so` | shared objects for the ld-kurono 2-lib test |
+| `ffmpeg.elf` | embedded ffmpeg artifact |
+| `user.ld` | userspace linker script |
+| `embedded_userprogs.h` | generated table of embedded user programs |
+
+## 22. Fast lookup guide
 
 If the question is about one of the subjects below, the first file to open should usually be this one.
 
@@ -357,4 +425,9 @@ If the question is about one of the subjects below, the first file to open shoul
 | Installer issue | `src/system/installer.cpp` |
 | VM boot issue | `src/virt/hypervisor.cpp` and `src/virt/vmm.cpp` |
 | Linux syscall issue | `src/linux/linux_syscall.cpp` |
+| Dynamic-linker / PIE-load issue | `src/linux/ld_kurono.cpp` and `src/kernel/elf_loader.cpp` |
 | Network issue | `src/net/tcpip.cpp` |
+| Multi-core / AP issue | `src/proc/smp.cpp` and `src/proc/scheduler.cpp` |
+| Privilege / auth-prompt issue | `src/security/supr.cpp` and `src/security/ksa.cpp` |
+| Persistence / on-disk fs issue | `src/fs/persist.cpp` and `src/fs/kfs.cpp` |
+| Canonical path / symlink issue | `src/system/kpaths.h` and `src/fs/kvfs.cpp` |
