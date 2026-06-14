@@ -268,11 +268,17 @@ AudioBuffer CodecRegistry::DecodeWAV(const uint8_t* data, int length) {
             ((uint8_t*)buf.samples)[i] = data[data_offset + i];
         buf.length = data_size;
     } else if (bits == 8) {
-        // convert 8-bit unsigned to 16-bit signed
-        int out_size = data_size * 2;
+        // convert 8-bit unsigned to 16-bit signed.
+        // compute output size in 64-bit: data_size*2 overflows a 32-bit int for a
+        // ~1gb+ data chunk, giving a tiny alloc the write loop then overruns. (satoru)
+        uint64_t out_size64 = (uint64_t)(uint32_t)data_size * 2;
+        if (out_size64 == 0 || out_size64 > (256ULL << 20)) return buf;
+        int out_size = (int)out_size64;
         buf.samples = (int16_t*)KernelHeap::Alloc(out_size);
         if (!buf.samples) return buf;
-        for (int i = 0; i < data_size; i++)
+        // bound the write loop to the samples we actually allocated. (satoru)
+        int samples_out = out_size / 2;
+        for (int i = 0; i < data_size && i < samples_out; i++)
             buf.samples[i] = (int16_t)((data[data_offset + i] - 128) << 8);
         buf.length = out_size;
     } else if (bits == 24) {
@@ -480,10 +486,20 @@ AudioBuffer CodecRegistry::DecodeAAC(const uint8_t* data, int length) {
     aac_state.channels = ch;
     aac_state.profile = hdr.profile;
 
-    // allocate: 1024 samples/frame × channels × 2 bytes
-    int pcm_size = frame_count * 1024 * ch * 2;
+    // allocate: 1024 samples/frame × channels × 2 bytes.
+    // compute in 64-bit and cap: frame_count comes from attacker-controlled adts
+    // framing, so the 32-bit product would overflow into an undersized alloc and
+    // the decode loop below would then write 1024*ch int16/frame past it (heap
+    // overflow). reject zero / >256mb before allocating. (satoru)
+    uint64_t pcm_size64 = (uint64_t)frame_count * 1024ull * (uint64_t)ch * 2ull;
+    if (pcm_size64 == 0 || pcm_size64 > 256ull * 1024ull * 1024ull) return buf;
+    int pcm_size = (int)pcm_size64;
     buf.samples = (int16_t*)KernelHeap::Alloc(pcm_size);
     if (!buf.samples) return buf;
+
+    // capacity in int16 slots  -  the write loop must never exceed this even if the
+    // second (decode) pass diverges from the count pass above. (satoru)
+    int sample_cap = pcm_size / 2;
 
     int total_samples = 0;
     pos = 0;
@@ -496,14 +512,17 @@ AudioBuffer CodecRegistry::DecodeAAC(const uint8_t* data, int length) {
 
         AACDecodeFrame(data + pos, hdr.frame_length, ch, left, right);
 
-        // convert float → int16 and interleave
+        // convert float → int16 and interleave. bound every store by sample_cap
+        // so a divergent frame count can never write past the allocation. (satoru)
         for (int i = 0; i < 1024; i++) {
+            if (total_samples >= sample_cap) break;
             int l = (int)(left[i] * 32767.0f);
             if (l > 32767) l = 32767;
             if (l < -32768) l = -32768;
             buf.samples[total_samples++] = (int16_t)l;
 
             if (ch >= 2) {
+                if (total_samples >= sample_cap) break;
                 int r = (int)(right[i] * 32767.0f);
                 if (r > 32767) r = 32767;
                 if (r < -32768) r = -32768;
@@ -573,17 +592,37 @@ AudioBuffer CodecRegistry::DecodeFLAC(const uint8_t* data, int length) {
 
     // decode flac frames
     // flac frames start with sync code 0xfff8 or 0xfff9
-    int total_out_samples = (int)info.total_samples;
-    if (total_out_samples <= 0) total_out_samples = (length - pos) / (info.channels * info.bits_per_sample / 8);
-    if (total_out_samples <= 0) return buf;
+    // info.total_samples is a 36-bit on-disk field  -  keep it 64-bit. (satoru)
+    uint64_t total_out_samples = info.total_samples;
+    if (total_out_samples == 0) {
+        // estimate from remaining bytes. guard the divisor: a crafted streaminfo
+        // can set bits_per_sample<8, making (bits/8)==0 and the divisor 0 →
+        // divide-by-zero #de. (satoru)
+        int bytes_per_frame = info.channels * (info.bits_per_sample / 8);
+        if (bytes_per_frame <= 0) return buf;
+        total_out_samples = (uint64_t)(length - pos) / (uint64_t)bytes_per_frame;
+    }
+    if (total_out_samples == 0) return buf;
 
-    int pcm_size = total_out_samples * info.channels * 2;
+    // total int16 slots = samples × channels. compute in 64-bit and cap: the old
+    // int pcm_size = total_out_samples * channels * 2 overflowed 32-bit into an
+    // undersized alloc, after which the verbatim-sample loop wrote past it. the
+    // recomputed (total_out_samples * channels) bound was itself overflow-prone
+    // and thus unreliable. reject zero / >256mb before alloc. (satoru)
+    uint64_t slot_count64 = total_out_samples * (uint64_t)info.channels;
+    uint64_t pcm_size64 = slot_count64 * 2ull;
+    if (pcm_size64 == 0 || pcm_size64 > 256ull * 1024ull * 1024ull) return buf;
+    int pcm_size = (int)pcm_size64;
     buf.samples = (int16_t*)KernelHeap::Alloc(pcm_size);
     if (!buf.samples) return buf;
 
+    // single reliable store bound: the allocation's int16 capacity. used for
+    // every write below instead of recomputing total_out_samples*channels. (satoru)
+    int sample_cap = pcm_size / 2;
+
     int sample_idx = 0;
 
-    while (pos + 4 < length && sample_idx < total_out_samples * info.channels) {
+    while (pos + 4 < length && sample_idx < sample_cap) {
         // check for frame sync
         if (data[pos] != 0xFF || (data[pos+1] & 0xFC) != 0xF8) {
             pos++;
@@ -646,7 +685,7 @@ AudioBuffer CodecRegistry::DecodeFLAC(const uint8_t* data, int length) {
                     hdr_end += 4;
                     continue;
                 }
-                if (sample_idx < total_out_samples * info.channels)
+                if (sample_idx < sample_cap)
                     buf.samples[sample_idx++] = (int16_t)val;
             }
         }
@@ -716,9 +755,14 @@ bool CodecRegistry::ParseMP4(const uint8_t* data, int length, MP4TrackInfo* info
     info->video_data_offset = 0;
     info->video_data_size = 0;
 
-    // recursive box parser
+    // recursive box parser. a crafted mp4 can nest container boxes
+    // (moov/trak/mdia/minf/stbl...) arbitrarily deep; without a depth cap the
+    // recursion below overflows the kernel stack. cap at 16 levels, mirroring
+    // mp4_demux.cpp's kMaxBoxNestDepth. (satoru)
+    static const int kMaxScanDepth = 16;
     struct BoxScanner {
-        static void Scan(const uint8_t* d, int start, int end, MP4TrackInfo* inf) {
+        static void Scan(const uint8_t* d, int start, int end, MP4TrackInfo* inf, int depth) {
+            if (depth > kMaxScanDepth) return;
             int pos = start;
             while (pos + 8 < end) {
                 MP4Box box;
@@ -767,9 +811,9 @@ bool CodecRegistry::ParseMP4(const uint8_t* data, int length, MP4TrackInfo* info
                     }
                 }
 
-                // recurse into container boxes
+                // recurse into container boxes (depth-bounded above) (satoru)
                 if (box.is_container) {
-                    Scan(d, pos + 8, box_end, inf);
+                    Scan(d, pos + 8, box_end, inf, depth + 1);
                 }
 
                 pos = box_end;
@@ -777,7 +821,7 @@ bool CodecRegistry::ParseMP4(const uint8_t* data, int length, MP4TrackInfo* info
         }
     };
 
-    BoxScanner::Scan(data, 0, length, info);
+    BoxScanner::Scan(data, 0, length, info, 0);
     return (info->has_audio || info->has_video);
 }
 

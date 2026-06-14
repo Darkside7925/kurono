@@ -231,7 +231,12 @@ void MediaPlayerApp::AddToPlaylist(const char* path) {
                 int data_size   = data[40] | (data[41] << 8) | (data[42] << 16) | (data[43] << 24);
                 if (sample_rate > 0 && channels > 0 && bits > 0) {
                     int bps = (bits / 8) * channels;
-                    if (bps > 0) e->duration_sec = data_size / (sample_rate * bps);
+                    // compute byte rate in 64-bit: sample_rate*bps can overflow a
+                    // 32-bit int to exactly 0 (crafted wav header) and divide-by-
+                    // zero #de. guard the product is nonzero before dividing. (satoru)
+                    uint64_t byte_rate = (uint64_t)(uint32_t)sample_rate * (uint32_t)bps;
+                    if (byte_rate > 0)
+                        e->duration_sec = (int)((uint64_t)(uint32_t)data_size / byte_rate);
                 }
             }
             break;
