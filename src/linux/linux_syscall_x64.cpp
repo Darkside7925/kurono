@@ -150,6 +150,9 @@ constexpr uint32_t kStubOk[] = {
     334,  // rseq
     302,  // prlimit64  (we'll fail soft)
     157,  // prctl
+    187,  // readahead  -  advisory prefetch; mozglue ReadAhead()s each .so before
+          // dlopen and treated -ENOSYS as fatal, breaking XPCOMGlueLoad of the
+          // libmozgtk->libxkbcommon chain. no-op success is correct. (satoru)
 };
 
 constexpr int kStubOkCount = sizeof(kStubOk) / sizeof(kStubOk[0]);

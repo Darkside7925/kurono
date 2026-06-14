@@ -1224,8 +1224,16 @@ static const char* FF_ORIGIN_HOST = "kurono.satorut.com";
 // the -full tar is the COMPLETE package: binaries + the 88-lib closure PLUS the
 // gecko app resources (omni.ja, browser/omni.ja, application.ini, greprefs.js,
 // defaults/, fonts/) the old tar was missing  -  without these no window renders.
-// ustar layout, longest entry 51 chars (under the 100-byte name field). (satoru)
-static const char* FF_TAR_PATH    = "/packages/firefox/firefox-140.11.0esr-full.tar";
+// ustar layout, longest entry 51 chars (under the 100-byte name field).
+// full2: libglycin-2.so.0 is swapped for a no-tls no-op stub. firefox uses its
+// own image/decoders, not gdk-pixbuf's glycin loader, so glycin is dead weight;
+// the real glycin carried the ONLY dlopen-time PT_TLS in the gtk closure and
+// tripped musl's dynamic-tls-on-dlopen path (EINVAL -> "Couldn't load XPCOM").
+// the stub exports the gly_* symbols libgdk_pixbuf needs as no-ops with no
+// PT_TLS segment, so it loads cleanly and the dlopen chain proceeds. (satoru)
+static const char* FF_TAR_PATH    = "/packages/firefox/firefox-140.11.0esr-full2.tar";
+// the real origin. a dev-only slirp mirror (10.0.2.100) may be swapped in here
+// UNCOMMITTED while iterating, but every commit ships this real ip. (satoru)
 static const uint32_t FF_ORIGIN_IP =
     (((uint32_t)92 << 24) | ((uint32_t)5 << 16) |
      ((uint32_t)63 << 8) | (uint32_t)184);

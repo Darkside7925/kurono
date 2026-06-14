@@ -333,6 +333,7 @@ static void tb_render_quick_launch(){
         // launch bounce: a spring pop on top of the hover lift, peaking ~+4px
         // just after launch then settling. driven off elapsed ms so it reads the
         // same at any frame rate. (satoru)
+        bool bouncing = false;
         uint32_t lms = Taskbar::PinnedLaunchMs(i);
         if (lms) {
             uint32_t e = Timer::GetRealMs() - lms;
@@ -341,8 +342,15 @@ static void tb_render_quick_launch(){
                 // bell-shaped pop: rises then returns to 0 by the end. (satoru)
                 float bell = s * (1.0f - (float)e / (float)KSS::Motion::Window);
                 pop += (int)(bell * 5.0f + 0.5f);
+                bouncing = true;
             }
         }
+        // while this icon is mid hover-lift or launch-bounce, damage only its
+        // tile (plus the max pop margin) so the present stays partial  -  a single
+        // icon animating must not re-copy the whole framebuffer. the +8 margin
+        // covers the largest pop (2px hover + 5px bounce, rounded). (satoru)
+        if (bouncing || t > 0.01f)
+            Graphics::MarkDirty(x - 8, y - 8, TB_PIN_SZ + 16, TB_PIN_SZ + 18);
         int ix = x - pop;
         int iy = y - pop;
         int iw = TB_PIN_SZ + pop*2;

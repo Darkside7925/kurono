@@ -434,12 +434,17 @@ void SettingsApp::RenderSidebar(int x,int y,int w,int h){
     // the selection highlight slides between tabs instead of snapping: its y eases
     // toward the active tab's row through the kss anim engine, keyed by the
     // settings sidebar address so it keeps state across frames. (satoru)
-    float sel_y = KSS::Anim::Float((uint32_t)0x5E771000u,
-                                   (float)(y + (int)current_tab * 32 + 6),
+    float target_y = (float)(y + (int)current_tab * 32 + 6);
+    float sel_y = KSS::Anim::Float((uint32_t)0x5E771000u, target_y,
                                    KSS::Motion::Window, KSS::Motion::Std);
     int isel = (int)(sel_y + 0.5f);
     Graphics::FillRect(x, isel, SIDEBAR_W-1, 28, S_TAB_SEL);
     Graphics::FillRect(x, isel, 3, 28, S_HEADING);
+    // while the highlight is still sliding, damage just the sidebar column so the
+    // present stays partial  -  the tab-switch content damage doesn't cover the
+    // sidebar (it sits left of the content panel). (satoru)
+    if (isel != (int)(target_y + 0.5f))
+        Graphics::MarkDirty(x, y, SIDEBAR_W, h);
     for(int i=0;i<STAB_COUNT;i++){
         int ty = y + i * 32 + 6;
         Graphics::DrawString(x+16, ty+6, tabs[i], S_TAB_TXT, 0xFF000000);
@@ -962,6 +967,10 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
         uint8_t dim = (uint8_t)((1.0f - tab_t) * 200.0f);
         if (dim > 0) Graphics::FillRectAlpha(px, cy, pw, ch, dim, S_BG);
         Graphics::MarkUIDirty();   // keep rendering until the transition settles (satoru)
+        // scope the present to the content panel  -  the tab crossfade only touches
+        // this rect, so the wallpaper/taskbar/other windows must not be re-copied
+        // to the framebuffer each frame of the transition. (satoru)
+        Graphics::MarkDirty(px, cy, pw, ch);
     }
     Graphics::PopClipRect();
 
@@ -988,6 +997,9 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
             uint8_t cdim = (uint8_t)((1.0f - mt) * 220.0f);
             Graphics::FillRectAlpha(dx, dy, sdw, sdh, cdim, 0xFF1B1B2E);
             Graphics::MarkUIDirty();
+            // the modal backdrop dim + scale-in only touches the settings window
+            // content rect; scope the present to it. (satoru)
+            Graphics::MarkDirty(cx, cy, cw, ch);
             return;
         }
         dw = sdw; dh = sdh;
