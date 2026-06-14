@@ -712,13 +712,33 @@ int KLS::LoadELFSegments(const void* elf_data, uint32_t size) {
         // (only works if vaddr is in accessible memory)
         if (ph->p_vaddr < 0x100000) continue;  // skip low addresses
 
+        // a crafted elf can name any p_vaddr (all <4gb is identity-mapped),
+        // turning this into an arbitrary kernel write. reject any segment whose
+        // [p_vaddr, p_vaddr+p_memsz) escapes a sane i386 user-image window or
+        // whose p_memsz is absurd. end computed in 64-bit so it can't wrap.
+        // window = [0x100000, 0xC0000000)  -  the classic i386 user space; a 1mb
+        // read-capped legit elf lands well inside it. this is a REJECT, not a
+        // page-table rewrite. (satoru)
+        const uint64_t USER_LO  = 0x100000ull;
+        const uint64_t USER_HI  = 0xC0000000ull;        // 3gb i386 TASK_SIZE (satoru)
+        const uint64_t MEMSZ_CAP = 256ull * 1024 * 1024; // generous bss cap (satoru)
+        uint64_t seg_lo = (uint64_t)ph->p_vaddr;
+        uint64_t seg_hi = seg_lo + (uint64_t)ph->p_memsz;
+        if (ph->p_memsz > MEMSZ_CAP || seg_lo < USER_LO || seg_hi > USER_HI) {
+            SerialLogger::Log("[KLS] rejecting out-of-range segment @ 0x");
+            SerialLogger::LogHex(ph->p_vaddr);
+            SerialLogger::Log("\r\n");
+            return -1;
+        }
+
         uint8_t* dest = (uint8_t*)(uintptr_t)ph->p_vaddr;
 
         // zero the memory region
         memset(dest, 0, ph->p_memsz);
 
-        // copy file data
-        if (ph->p_filesz > 0 && ph->p_offset + ph->p_filesz <= size) {
+        // copy file data (64-bit bound so p_offset+p_filesz can't wrap) (satoru)
+        if (ph->p_filesz > 0 &&
+            (uint64_t)ph->p_offset + (uint64_t)ph->p_filesz <= (uint64_t)size) {
             memcpy(dest, data + ph->p_offset, ph->p_filesz);
         }
 

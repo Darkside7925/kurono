@@ -210,17 +210,45 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
                     logh("[ELF] PT_TLS memsz = ", ph0[i].p_memsz);
                 }
             }
-            if (dynph) {
+            // reject any pt_load whose file range overruns the scratch buffer
+            // before we translate vaddrs through it  -  otherwise vaddr_to_scratch
+            // could hand back a pointer past the end of `scratch`. (satoru)
+            bool segments_ok = true;
+            for (uint16_t j = 0; j < eh->e_phnum; j++) {
+                if (ph0[j].p_type != PT_LOAD) continue;
+                if (ph0[j].p_offset > size ||
+                    ph0[j].p_filesz > size - ph0[j].p_offset) {
+                    log("[ELF] PT_LOAD file range overruns image  -  skipping relocs\r\n");
+                    segments_ok = false;
+                    break;
+                }
+            }
+            if (dynph && segments_ok) {
                 // Helper to translate a virtual address (vaddr-space, base 0)
                 // back to a file-offset pointer in the scratch image, by
-                // searching PT_LOAD segments.
-                auto vaddr_to_scratch = [&](uint64_t vaddr) -> uint8_t* {
+                // searching PT_LOAD segments. `need` is the access width (in
+                // bytes) the caller will touch at the returned pointer; we only
+                // return a pointer when the whole [vaddr, vaddr+need) window is
+                // backed by file bytes inside this segment AND lands inside the
+                // scratch buffer, so a reloc near a segment/EOF boundary can't
+                // write past it (the caller stores a full uint64_t). (satoru)
+                auto vaddr_to_scratch = [&](uint64_t vaddr, uint64_t need) -> uint8_t* {
                     for (uint16_t j = 0; j < eh->e_phnum; j++) {
                         if (ph0[j].p_type != PT_LOAD) continue;
-                        if (vaddr >= ph0[j].p_vaddr &&
-                            vaddr <  ph0[j].p_vaddr + ph0[j].p_filesz) {
-                            return scratch + ph0[j].p_offset + (vaddr - ph0[j].p_vaddr);
+                        if (vaddr < ph0[j].p_vaddr) continue;
+                        // [vaddr, vaddr+need) must lie within this segment's
+                        // file-backed bytes: vaddr + need <= p_vaddr + p_filesz.
+                        uint64_t off = vaddr - ph0[j].p_vaddr;
+                        if (off > ph0[j].p_filesz || need > ph0[j].p_filesz - off) {
+                            continue;
                         }
+                        // ...and within the scratch buffer:
+                        // p_offset + off + need <= size. (segments_ok already
+                        // guarantees p_offset + p_filesz <= size, so this holds,
+                        // but check explicitly for defence in depth.) (satoru)
+                        uint64_t file_off = ph0[j].p_offset + off;
+                        if (file_off > size || need > size - file_off) continue;
+                        return scratch + file_off;
                     }
                     return nullptr;
                 };
@@ -235,8 +263,10 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
                         default: break;
                     }
                 }
-                if (rela_va && rela_sz && rela_ent) {
-                    uint8_t* rela_p = vaddr_to_scratch(rela_va);
+                if (rela_va && rela_sz && rela_ent >= sizeof(Elf64_Rela)) {
+                    // require the WHOLE rela table to be file-backed + in-bounds
+                    // so every rela_p + k*rela_ent read below is valid. (satoru)
+                    uint8_t* rela_p = vaddr_to_scratch(rela_va, rela_sz);
                     if (rela_p) {
                         uint64_t count = rela_sz / rela_ent;
                         uint64_t applied = 0;
@@ -244,7 +274,11 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
                         for (uint64_t k = 0; k < count; k++) {
                             const Elf64_Rela* r = (const Elf64_Rela*)(rela_p + k * rela_ent);
                             if (ELF64_R_TYPE(r->r_info) == R_X86_64_RELATIVE) {
-                                uint8_t* tgt = vaddr_to_scratch(r->r_offset);
+                                // we store a full uint64_t at tgt  -  demand 8
+                                // file-backed bytes so a reloc whose r_offset
+                                // lands in the last 1-7 bytes of a segment is
+                                // rejected instead of writing oob. (satoru)
+                                uint8_t* tgt = vaddr_to_scratch(r->r_offset, 8);
                                 if (tgt) {
                                     *(uint64_t*)tgt = base + (uint64_t)r->r_addend;
                                     applied++;

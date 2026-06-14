@@ -816,7 +816,11 @@ static char* val_cstr(const Value& v){
     val_to_str(v,tmp);
     return buf;
 }
-static void val_to_str(const Value& v, Sink& s){
+// depth-tracking renderer; a self-referential value (a=[]; a.push(a)) would
+// otherwise recurse forever and exhaust the stack. past the cap emit an
+// ellipsis placeholder instead of descending further. (satoru)
+static void val_to_str_d(const Value& v, Sink& s, int depth){
+    const int MAX_DEPTH = 64;
     char nb[40];
     switch (v.t){
         case T_UNDEF: out_str(s,"undefined"); break;
@@ -826,19 +830,23 @@ static void val_to_str(const Value& v, Sink& s){
         case T_STR:   out_str(s, v.s?v.s:""); break;
         case T_OBJ:
             if (!v.o){ out_str(s,"null"); break; }
+            if (depth >= MAX_DEPTH){
+                out_str(s, v.o->kind==O_ARRAY? "[...]" : v.o->kind==O_OBJECT? "{...}" : "[function]");
+                break;
+            }
             if (v.o->kind==O_ARRAY){
                 out_ch(s,'[');
                 for (int i=0;i<v.o->n;i++){ if (i) out_str(s,", ");
-                    if (v.o->items[i].t==T_STR){ out_ch(s,'"'); val_to_str(v.o->items[i],s); out_ch(s,'"'); }
-                    else val_to_str(v.o->items[i],s);
+                    if (v.o->items[i].t==T_STR){ out_ch(s,'"'); val_to_str_d(v.o->items[i],s,depth+1); out_ch(s,'"'); }
+                    else val_to_str_d(v.o->items[i],s,depth+1);
                 }
                 out_ch(s,']');
             } else if (v.o->kind==O_OBJECT){
                 out_ch(s,'{');
                 for (int i=0;i<v.o->np;i++){ if (i) out_str(s,", ");
                     out_str(s, v.o->props[i].key); out_str(s,": ");
-                    if (v.o->props[i].val.t==T_STR){ out_ch(s,'"'); val_to_str(v.o->props[i].val,s); out_ch(s,'"'); }
-                    else val_to_str(v.o->props[i].val,s);
+                    if (v.o->props[i].val.t==T_STR){ out_ch(s,'"'); val_to_str_d(v.o->props[i].val,s,depth+1); out_ch(s,'"'); }
+                    else val_to_str_d(v.o->props[i].val,s,depth+1);
                 }
                 out_ch(s,'}');
             } else out_str(s,"[function]");
@@ -846,6 +854,7 @@ static void val_to_str(const Value& v, Sink& s){
         default: out_str(s,"undefined"); break;
     }
 }
+static void val_to_str(const Value& v, Sink& s){ val_to_str_d(v, s, 0); }
 
 static bool strict_eq(const Value& a, const Value& b){
     if (a.t!=b.t) return false;

@@ -311,21 +311,46 @@ void E1000::GetMAC(uint8_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = mac[i];
 }
 
+// reclaim tx descriptors the nic has finished with. a slot is reclaimable
+// once its descriptor reports dd (descriptor done); we just clear the status
+// so the producer (Send) can tell drained slots from in-flight ones. lazy:
+// called from Send (entry) and from Poll, so the 32-entry ring drains in the
+// background instead of stalling each Send. (satoru)
+void E1000::ReclaimTx() {
+    for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
+        // only slots we actually armed (cmd!=0) and that the nic marked done.
+        if (tx_descs[i].cmd != 0 && (tx_descs[i].status & E1000_TXD_STAT_DD)) {
+            tx_descs[i].cmd = 0;    // mark reclaimed / free (satoru)
+        }
+    }
+}
+
 bool E1000::Send(const uint8_t* data, uint16_t length) {
     if (!detected || !data || length == 0 || length > E1000_MAX_TX_FRAME) {
         SerialLogger::Log("[E1000:TX] reject: bad params or no NIC\r\n");
         return false;
     }
 
-    // wait for current tx descriptor to be done
+    // lazily reap descriptors the nic already finished so the ring keeps
+    // flowing without ever blocking on a per-packet completion. (satoru)
+    ReclaimTx();
+
+    // the slot we're about to (re)use is free iff its descriptor is dd  -  the
+    // nic has transmitted whatever was last queued there. all slots start dd
+    // (InitTX), and once armed they only go dd again when the nic finishes, so
+    // a non-dd slot here means the 32-entry ring has wrapped fully around and
+    // is actually full. that's the ONLY case we block  -  briefly, bounded  - 
+    // rather than spinning on every frame. (satoru)
     volatile E1000_TXDesc* txd = &tx_descs[tx_cur];
-    int timeout = 10000;
-    while (!(txd->status & E1000_TXD_STAT_DD) && --timeout > 0) {
-        __asm__ __volatile__("pause");
-    }
-    if (timeout == 0) {
-        SerialLogger::Log("[E1000:TX] descriptor never went DD before queue\r\n");
-        return false;
+    if (!(txd->status & E1000_TXD_STAT_DD)) {
+        int timeout = 100000;
+        while (!(txd->status & E1000_TXD_STAT_DD) && --timeout > 0) {
+            __asm__ __volatile__("pause");
+        }
+        if (!(txd->status & E1000_TXD_STAT_DD)) {
+            SerialLogger::Log("[E1000:TX] ring full, descriptor never drained (link down?)\r\n");
+            return false;
+        }
     }
 
     // Copy into a driver-owned DMA buffer. Most callers build packets in
@@ -335,60 +360,60 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
         tx_buffers[tx_cur][i] = data[i];
     }
 
-    // set up the descriptor
+    // set up the descriptor. clear status (dd) so the nic can re-flag it on
+    // completion; cmd!=0 also marks the slot in-flight for ReclaimTx. order the
+    // descriptor writes before the doorbell so the nic sees a complete
+    // descriptor when we bump the tail. (satoru)
     txd->length = length;
-    txd->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
     txd->status = 0;
+    txd->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
 
-    // advance tail
-    uint16_t old_cur = tx_cur;
-    tx_cur = (tx_cur + 1) % E1000_NUM_TX_DESC;
-    WriteReg(E1000_TDT, tx_cur);
-
-    // wait for transmit to complete
-    timeout = 100000;
-    while (!(tx_descs[old_cur].status & E1000_TXD_STAT_DD) && --timeout > 0) {
-        __asm__ __volatile__("pause");
-    }
-
-    if (tx_descs[old_cur].status & E1000_TXD_STAT_DD) {
-        tx_count++;
-        tx_bytes += length;
-        // first 6 packets: dump dst MAC + ethertype for diagnostics
-        if (tx_count <= 6) {
-            char b[80]; int n = 0;
-            const char* p = "[E1000:TX] OK len=";
-            while (*p) b[n++] = *p++;
-            // length decimal
-            uint16_t v = length; char t[8]; int ti = 0;
-            if (v == 0) t[ti++] = '0';
-            while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
-            while (ti) b[n++] = t[--ti];
-            const char* p2 = " dst=";
-            while (*p2) b[n++] = *p2++;
-            const char* hex = "0123456789abcdef";
-            for (int i = 0; i < 6; i++) {
-                b[n++] = hex[(data[i] >> 4) & 0xF];
-                b[n++] = hex[data[i] & 0xF];
-                if (i < 5) b[n++] = ':';
-            }
-            const char* p3 = " et=";
-            while (*p3) b[n++] = *p3++;
-            uint16_t et = (uint16_t)((data[12] << 8) | data[13]);
-            for (int i = 12; i >= 0; i -= 4) {
-                b[n++] = hex[(et >> i) & 0xF];
-            }
-            b[n++] = '\r'; b[n++] = '\n'; b[n] = 0;
-            SerialLogger::Log(b);
+    // count it as sent at enqueue time  -  we no longer wait for the wire. (satoru)
+    tx_count++;
+    tx_bytes += length;
+    // first 6 packets: dump dst MAC + ethertype for diagnostics
+    if (tx_count <= 6) {
+        char b[80]; int n = 0;
+        const char* p = "[E1000:TX] queued len=";
+        while (*p) b[n++] = *p++;
+        // length decimal
+        uint16_t v = length; char t[8]; int ti = 0;
+        if (v == 0) t[ti++] = '0';
+        while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ti) b[n++] = t[--ti];
+        const char* p2 = " dst=";
+        while (*p2) b[n++] = *p2++;
+        const char* hex = "0123456789abcdef";
+        for (int i = 0; i < 6; i++) {
+            b[n++] = hex[(data[i] >> 4) & 0xF];
+            b[n++] = hex[data[i] & 0xF];
+            if (i < 5) b[n++] = ':';
         }
-        return true;
+        const char* p3 = " et=";
+        while (*p3) b[n++] = *p3++;
+        uint16_t et = (uint16_t)((data[12] << 8) | data[13]);
+        for (int i = 12; i >= 0; i -= 4) {
+            b[n++] = hex[(et >> i) & 0xF];
+        }
+        b[n++] = '\r'; b[n++] = '\n'; b[n] = 0;
+        SerialLogger::Log(b);
     }
-    SerialLogger::Log("[E1000:TX] descriptor never went DD after queue (link down?)\r\n");
-    return false;
+
+    // advance the tail and ring the doorbell  -  fire-and-forget, no wait for
+    // dd. the sfence makes the descriptor + buffer writes globally visible
+    // before the nic reads them off the bump. (satoru)
+    tx_cur = (tx_cur + 1) % E1000_NUM_TX_DESC;
+    __asm__ __volatile__("sfence" ::: "memory");
+    WriteReg(E1000_TDT, tx_cur);
+    return true;
 }
 
 void E1000::Poll() {
     if (!detected) return;
+
+    // drain finished tx descriptors here too so the ring empties even during
+    // idle/rx-only periods, not just when the next Send happens. (satoru)
+    ReclaimTx();
 
     while (rx_descs[rx_cur].status & E1000_RXD_STAT_DD) {
         uint16_t len = rx_descs[rx_cur].length;

@@ -225,15 +225,35 @@ static void ld_render_surface(Window* win, int cx, int cy, int cw, int ch) {
 
     if (dst && Graphics::GetBpp() == 32 && draw_w == (int)g_linux_display.width &&
         draw_h == (int)g_linux_display.height) {
-        uint32_t dst_pitch = Graphics::GetPitch();
-        for (uint32_t row = 0; row < g_linux_display.height; row++) {
-            memcpy(dst + (uint32_t)(draw_y + (int)row) * dst_pitch + (uint32_t)draw_x * 4,
-                   g_linux_display.pixels + row * g_linux_display.pitch,
-                   g_linux_display.width * 4);
+        // clip the destination rect to the back buffer. the guest controls its
+        // fb size and the window can be dragged partly/fully off-screen, so
+        // draw_x/draw_y can be negative or run past the edge -> this memcpy
+        // would write out of bounds without clamping. (satoru)
+        int sw = Graphics::GetWidth();
+        int sh = Graphics::GetHeight();
+        int x0 = draw_x, y0 = draw_y;
+        int x1 = draw_x + (int)g_linux_display.width;
+        int y1 = draw_y + (int)g_linux_display.height;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > sw) x1 = sw;
+        if (y1 > sh) y1 = sh;
+        if (x1 > x0 && y1 > y0) {
+            uint32_t dst_pitch = Graphics::GetPitch();
+            int copy_w = (x1 - x0) * 4;                 // bytes per visible row (satoru)
+            for (int dy = y0; dy < y1; dy++) {
+                uint32_t src_row = (uint32_t)(dy - draw_y);   // in-bounds by construction (satoru)
+                uint32_t src_col = (uint32_t)(x0 - draw_x);
+                memcpy(dst + (uint32_t)dy * dst_pitch + (uint32_t)x0 * 4,
+                       g_linux_display.pixels + src_row * g_linux_display.pitch + src_col * 4,
+                       (uint32_t)copy_w);
+            }
         }
         return;
     }
 
+    // slow/scaled path: every write goes through Graphics::DrawPixel which
+    // bounds-checks via IsPointInBounds, so it is already clamped. (satoru)
     for (int y = 0; y < draw_h; y++) {
         uint32_t src_y = (uint32_t)(((uint64_t)y * g_linux_display.height) / (uint32_t)draw_h);
         const uint32_t* src_row = (const uint32_t*)(g_linux_display.pixels + src_y * g_linux_display.pitch);

@@ -106,9 +106,12 @@ inline int pad_to(int p, int align) { return (p + (align - 1)) & ~(align - 1); }
 //
 // Header is then padded to 8-byte alignment before the body.
 
-int put_header_field(uint8_t* p, uint8_t field_code, char sig, const void* val,
-                     int val_len) {
+// cap = bytes available at p; every write is bounded so a client-controlled
+// val_len can't run past the caller's buffer. returns bytes written. (satoru)
+int put_header_field(uint8_t* p, int cap, uint8_t field_code, char sig,
+                     const void* val, int val_len) {
     int s = 0;
+    if (cap < 4) return 0;        // need at least the variant preamble (satoru)
     p[s++] = field_code;
     // variant: signature(1 char) then value
     p[s++] = 1;          // signature length
@@ -117,16 +120,18 @@ int put_header_field(uint8_t* p, uint8_t field_code, char sig, const void* val,
     if (sig == 's' || sig == 'o') {
         // string: u32 length + bytes + nul
         s = pad_to(s, 4);
+        if (s + 4 > cap) return s;
         put_le32(p + s, (uint32_t)val_len); s += 4;
-        for (int i = 0; i < val_len; i++) p[s++] = ((const uint8_t*)val)[i];
-        p[s++] = 0;
+        for (int i = 0; i < val_len && s < cap; i++) p[s++] = ((const uint8_t*)val)[i];
+        if (s < cap) p[s++] = 0;
     } else if (sig == 'g') {
         // signature: u8 length + bytes + nul
-        p[s++] = (uint8_t)val_len;
-        for (int i = 0; i < val_len; i++) p[s++] = ((const uint8_t*)val)[i];
-        p[s++] = 0;
+        if (s < cap) p[s++] = (uint8_t)val_len;
+        for (int i = 0; i < val_len && s < cap; i++) p[s++] = ((const uint8_t*)val)[i];
+        if (s < cap) p[s++] = 0;
     } else if (sig == 'u') {
         s = pad_to(s, 4);
+        if (s + 4 > cap) return s;
         put_le32(p + s, *(const uint32_t*)val); s += 4;
     }
     return s;
@@ -148,20 +153,23 @@ void send_method_return(Client* c, uint32_t reply_serial, const char* body_sig,
     put_le32(buf + p, 0); p += 4;
     int fields_start = p;
 
+    // every pad_to/put_header_field below is bounded against sizeof(buf) so a
+    // client-controlled name length can't overflow the stack buffer. (satoru)
+    const int cap = (int)sizeof(buf);
     // REPLY_SERIAL (5) u32
     p = pad_to(p, 8);
-    p += put_header_field(buf + p, 5, 'u', &reply_serial, 0);
+    if (p <= cap) p += put_header_field(buf + p, cap - p, 5, 'u', &reply_serial, 0);
     // DESTINATION (6) string
     p = pad_to(p, 8);
     int un_len = str_len(c->unique_name);
-    p += put_header_field(buf + p, 6, 's', c->unique_name, un_len);
+    if (p <= cap) p += put_header_field(buf + p, cap - p, 6, 's', c->unique_name, un_len);
     // SENDER (7) string ":1.0"
     p = pad_to(p, 8);
-    p += put_header_field(buf + p, 7, 's', "org.freedesktop.DBus", 20);
+    if (p <= cap) p += put_header_field(buf + p, cap - p, 7, 's', "org.freedesktop.DBus", 20);
     // SIGNATURE (8)
     if (body_sig && body_sig[0]) {
         p = pad_to(p, 8);
-        p += put_header_field(buf + p, 8, 'g', body_sig, str_len(body_sig));
+        if (p <= cap) p += put_header_field(buf + p, cap - p, 8, 'g', body_sig, str_len(body_sig));
     }
 
     int fields_len = p - fields_start;
@@ -169,8 +177,9 @@ void send_method_return(Client* c, uint32_t reply_serial, const char* body_sig,
 
     // Pad header to 8 bytes.
     p = pad_to(p, 8);
-    // Append body.
-    for (int i = 0; i < body_len; i++) buf[p++] = body[i];
+    if (p > cap) p = cap;
+    // Append body, bounded by remaining capacity. (satoru)
+    for (int i = 0; i < body_len && p < cap; i++) buf[p++] = body[i];
 
     UnixSocket::KernelInject(c->sd, buf, p);
 }
@@ -288,14 +297,19 @@ void handle_message(Client* c, const uint8_t* msg, int len) {
                str_eq(pm.member, "ListNames")) {
         // Reply: array of strings.  We return [":1.0", own + every owned name].
         uint8_t body[1024];
+        const int bcap = (int)sizeof(body);
         int p = 0;
         // u32 array byte length placeholder
         int len_off = p; p += 4;
-        // Each string: u32 len + bytes + nul, padded to 4.
+        // Each string: u32 len + bytes + nul, padded to 4.  Every entry is
+        // bounded against sizeof(body); names are client-controlled so an entry
+        // that wouldn't fit is dropped rather than overflowing the stack. (satoru)
         const char* fixed[] = { "org.freedesktop.DBus", c->unique_name, nullptr };
         for (int i = 0; fixed[i]; i++) {
             int sl = str_len(fixed[i]);
-            p = pad_to(p, 4);
+            int padded = pad_to(p, 4);
+            if (padded + 4 + sl + 1 > bcap) break;
+            p = padded;
             put_le32(body + p, (uint32_t)sl); p += 4;
             for (int k = 0; k < sl; k++) body[p++] = (uint8_t)fixed[i][k];
             body[p++] = 0;
@@ -303,7 +317,9 @@ void handle_message(Client* c, const uint8_t* msg, int len) {
         for (int i = 0; i < DBusServer::DBUS_MAX_NAMES; i++) {
             if (!g_names[i].in_use) continue;
             int sl = str_len(g_names[i].name);
-            p = pad_to(p, 4);
+            int padded = pad_to(p, 4);
+            if (padded + 4 + sl + 1 > bcap) break;
+            p = padded;
             put_le32(body + p, (uint32_t)sl); p += 4;
             for (int k = 0; k < sl; k++) body[p++] = (uint8_t)g_names[i].name[k];
             body[p++] = 0;
