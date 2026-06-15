@@ -5,10 +5,35 @@
 #include "../kernel/heap.h"
 #include "../kernel/pmm.h"   // page-aligned dma memory for the admin/io queues (satoru)
 #include "../kernel/vmm.h"   // identity-map the high 64-bit bar before touching it (satoru)
+#include "../kernel/kdf.h"   // kdf-sandboxed dma/mmio: guard-fenced queues + bar (satoru)
 #include "../drivers/serial.h"
 #include "../proc/smp.h"     // one i/o queue per cpu core; route by calling cpu (satoru)
 #include "../proc/spinlock.h"  // serialize cores that share an sq when cpus > queues (satoru)
 #include <string.h>
+
+//  ── kdf migration (satoru) ──────────────────────────────────────────────────
+//  nvme is the first driver migrated into the kernel driver framework: every dma
+//  buffer it hands the controller (admin sq/cq, identify, the io sq/cq pairs, the
+//  prp-list pages) is now allocated via KDF::AllocDMA, so it sits in nvme's
+//  guard-fenced higher-half window. an overrun of any of those rings/buffers
+//  walks into an unmapped guard page -> kdf crash path (quarantine + kinit
+//  restart) instead of silently corrupting an adjacent kernel allocation. the
+//  controller still needs the PHYSICAL address of each buffer, so every place
+//  that used `(uintptr_t)buf` as a controller address now uses KDF::PhysOf(buf).
+//  the bar0 register window is mapped via KDF::MapMMIO (bounds-checked + fenced).
+//  the driver runs its init inside KDF::Start's crash sandbox. (satoru)
+namespace {
+int g_nvme_kdf_id = -1;   // kdf driver id for "nvme", set in NVMe::Init (satoru)
+
+// physical address of a kdf-fenced dma buffer for controller programming. all
+// nvme dma buffers are kdf regions, so this resolves them; falls back to the
+// identity assumption (phys==va) only for a non-kdf pointer, which shouldn't
+// happen post-migration but keeps a stray caller safe. (satoru)
+inline uint64_t dma_phys(const void* va) {
+    uint64_t p = KDF::PhysOf((void*)(uintptr_t)va);
+    return p ? p : (uint64_t)(uintptr_t)va;
+}
+}  // namespace
 
 bool              NVMe::detected        = false;
 NVMeControllerInfo NVMe::info           = {};
@@ -56,8 +81,12 @@ void NVMe::WriteReg64(uint32_t offset, uint64_t val) {
 }
 
 //  init  -  pci probe + controller enable
-
-bool NVMe::Init() {
+//
+//  KdfInit is the real init body; it runs INSIDE the kdf crash sandbox (NVMe::Init
+//  registers the "nvme" kdf driver and calls KDF::Start, which invokes this via
+//  RunGuarded). all dma buffers are obtained via KDF::AllocDMA so they are
+//  guard-fenced, and the bar0 register window via KDF::MapMMIO. (satoru)
+bool NVMe::KdfInit() {
     SerialLogger::Log("[NVMe] Scanning PCI for NVMe controllers...\r\n");
 
     // pci scan: class 01h (mass storage), subclass 08h (nvme), progif 02h
@@ -85,14 +114,18 @@ bool NVMe::Init() {
                     uint32_t bar1_val = HAL::InLong(0xCFC);
                     bar_addr |= ((uint64_t)bar1_val << 32);
                 }
-                // the bar may sit above the boot identity map -> identity-map its
-                // register window (64kb covers controller regs + doorbells) as
-                // uncached mmio before any dereference, or ReadReg #pfs. (satoru)
-                for (uint64_t p = bar_addr & ~0xFFFULL;
-                     p < (bar_addr & ~0xFFFULL) + 0x10000ULL; p += 0x1000ULL) {
-                    KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+                // map the bar's register window (64kb covers controller regs +
+                // doorbells) through kdf as guard-fenced uncached mmio. an access
+                // past the window walks into a guard page -> kdf crash path rather
+                // than poking unrelated mmio. KDF::MapMMIO preserves the in-page
+                // offset, so the returned pointer points at the real bar base in
+                // nvme's fenced higher-half window. (satoru)
+                void* bar_win = KDF::MapMMIO(bar_addr, 0x10000ULL);
+                if (!bar_win) {
+                    SerialLogger::Log("[NVMe] FATAL: KDF::MapMMIO(bar) failed\r\n");
+                    return false;
                 }
-                bar0 = (volatile uint8_t*)(uintptr_t)bar_addr;
+                bar0 = (volatile uint8_t*)bar_win;
 
                 SerialLogger::Log("[NVMe] Controller found at PCI ");
                 SerialLogger::LogDec(0); SerialLogger::Log(":");
@@ -146,18 +179,19 @@ bool NVMe::Init() {
                 admin_queue.qid = 0;
 
                 // the admin sq/cq must be 4kb page-aligned for the controller's
-                // dma engine; KernelHeap is only 16-byte aligned, so the queues
-                // straddle pages and the controller never reaches RDY. PMM hands
-                // out page-aligned, identity-mapped (virt==phys) frames. (satoru)
-                admin_queue.sq = (NVMeSQE*)PMM::AllocBytes(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
-                admin_queue.cq = (NVMeCQE*)PMM::AllocBytes(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
+                // dma engine. KDF::AllocDMA returns page-aligned, physically-
+                // contiguous frames fenced by guard pages; the buffer is zeroed.
+                // the controller is programmed with KDF::PhysOf (dma_phys), not the
+                // fenced higher-half va. (satoru)
+                admin_queue.sq = (NVMeSQE*)KDF::AllocDMA(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
+                admin_queue.cq = (NVMeCQE*)KDF::AllocDMA(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
                 if (admin_queue.sq) memset(admin_queue.sq, 0, sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
                 if (admin_queue.cq) memset(admin_queue.cq, 0, sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
 
-                // program admin queue base addresses
+                // program admin queue base addresses (physical, via kdf) (satoru)
                 WriteReg(NVME_REG_AQA, ((NVME_QUEUE_DEPTH - 1) << 16) | (NVME_QUEUE_DEPTH - 1));
-                WriteReg64(NVME_REG_ASQ, (uint64_t)(uintptr_t)admin_queue.sq);
-                WriteReg64(NVME_REG_ACQ, (uint64_t)(uintptr_t)admin_queue.cq);
+                WriteReg64(NVME_REG_ASQ, dma_phys(admin_queue.sq));
+                WriteReg64(NVME_REG_ACQ, dma_phys(admin_queue.cq));
 
                 // configure and enable controller
                 uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_IOSQES | NVME_CC_IOCQES;
@@ -178,6 +212,38 @@ bool NVMe::Init() {
 
     SerialLogger::Log("[NVMe] No NVMe controller found\r\n");
     return false;
+}
+
+//  public entry: register "nvme" with kdf (once) and bring it up inside the kdf
+//  crash sandbox. on the FIRST call this also registers the driver; on a kinit
+//  restart after a guard-page crash, kinit calls KDF::Start("nvme") which re-runs
+//  KdfInit through this same RunGuarded path. resets the per-controller state so
+//  a re-init re-probes cleanly. (satoru)
+bool NVMe::Init() {
+    // reset state so a (re-)init starts from a known-clean slate. (satoru)
+    detected = false;
+    bar0 = nullptr;
+    io_queue_count = 0;
+    for (int q = 0; q < NVME_MAX_QUEUES; q++) {
+        io_queues[q].sq = nullptr;
+        io_queues[q].cq = nullptr;
+    }
+    admin_queue.sq = nullptr;
+    admin_queue.cq = nullptr;
+
+    if (g_nvme_kdf_id < 0)
+        g_nvme_kdf_id = KDF::RegisterDriver("nvme", &NVMe::KdfInit);
+    if (g_nvme_kdf_id < 0) {
+        // kdf unavailable (shouldn't happen post-Init): fall back to a direct,
+        // unsandboxed init so storage still works. honest + safe. (satoru)
+        SerialLogger::Log("[NVMe] KDF unavailable; running unsandboxed init\r\n");
+        return KdfInit();
+    }
+    // KDF::Start runs KdfInit inside RunGuarded (crash sandbox + active-driver
+    // attribution for AllocDMA/MapMMIO). returns true if it initialized cleanly.
+    // (satoru)
+    bool ok = KDF::Start(g_nvme_kdf_id);
+    return ok && detected;
 }
 
 bool NVMe::WaitReady(bool expected, int timeout_ms) {
@@ -206,20 +272,21 @@ bool NVMe::Identify() {
     if (!detected || !admin_queue.sq) return false;
 
     // page-aligned: this is the prp1 dma target for IDENTIFY (a 4kb transfer),
-    // which the controller requires page-aligned. (satoru)
-    uint8_t* id_buf = (uint8_t*)PMM::AllocBytes(4096);
+    // which the controller requires page-aligned. kdf-fenced. (satoru)
+    uint8_t* id_buf = (uint8_t*)KDF::AllocDMA(4096);
     if (!id_buf) return false;
     memset(id_buf, 0, 4096);
 
     NVMeSQE cmd = {};
     cmd.opcode = NVME_ADM_IDENTIFY;
     cmd.nsid = 0;
-    cmd.prp1 = (uint64_t)(uintptr_t)id_buf;
+    cmd.prp1 = dma_phys(id_buf);  // physical (kdf) (satoru)
     cmd.cdw10 = NVME_ID_CNS_CTRL; // identify controller
 
     NVMeCQE result = {};
     if (!SubmitAdminCmd(&cmd, &result)) {
-        PMM::FreeBytes(id_buf, 4096);
+        // kdf-owned buffer: it is reclaimed when the driver is torn down /
+        // quarantined; we just drop the reference on the error path. (satoru)
         return false;
     }
 
@@ -247,7 +314,7 @@ bool NVMe::Identify() {
     cmd = {};
     cmd.opcode = NVME_ADM_IDENTIFY;
     cmd.nsid = 1;
-    cmd.prp1 = (uint64_t)(uintptr_t)id_buf;
+    cmd.prp1 = dma_phys(id_buf);  // physical (kdf) (satoru)
     cmd.cdw10 = NVME_ID_CNS_NS;
 
     if (SubmitAdminCmd(&cmd, &result)) {
@@ -269,7 +336,9 @@ bool NVMe::Identify() {
         SerialLogger::Log(" bytes\r\n");
     }
 
-    PMM::FreeBytes(id_buf, 4096);
+    // release the one-shot identify scratch back to kdf (unmaps + frees its
+    // frames + reclaims the region slot). (satoru)
+    KDF::FreeDMA(id_buf);
     return true;
 }
 
@@ -306,24 +375,25 @@ bool NVMe::CreateIOQueues() {
         qp->depth = NVME_QUEUE_DEPTH;
         qp->sq_tail = 0; qp->cq_head = 0; qp->cq_phase = 1; qp->qid = qid;
 
-        // page-aligned for the controller dma engine, same as the admin queues. (satoru)
-        qp->sq = (NVMeSQE*)PMM::AllocBytes(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
-        qp->cq = (NVMeCQE*)PMM::AllocBytes(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
+        // page-aligned for the controller dma engine, same as the admin queues,
+        // now kdf-fenced (guard pages around each ring). (satoru)
+        qp->sq = (NVMeSQE*)KDF::AllocDMA(sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
+        qp->cq = (NVMeCQE*)KDF::AllocDMA(sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
         if (!qp->sq || !qp->cq) break;
         memset(qp->sq, 0, sizeof(NVMeSQE) * NVME_QUEUE_DEPTH);
         memset(qp->cq, 0, sizeof(NVMeCQE) * NVME_QUEUE_DEPTH);
 
-        // create cq first, then sq. (satoru)
+        // create cq first, then sq. queue bases are physical (via kdf). (satoru)
         NVMeSQE cmd = {}; NVMeCQE result = {};
         cmd.opcode = NVME_ADM_CREATE_CQ;
-        cmd.prp1 = (uint64_t)(uintptr_t)qp->cq;
+        cmd.prp1 = dma_phys(qp->cq);
         cmd.cdw10 = ((NVME_QUEUE_DEPTH - 1) << 16) | qid;
         cmd.cdw11 = 1; // physically contiguous (no interrupts: we poll) (satoru)
         if (!SubmitAdminCmd(&cmd, &result)) break;
 
         cmd = {}; result = {};
         cmd.opcode = NVME_ADM_CREATE_SQ;
-        cmd.prp1 = (uint64_t)(uintptr_t)qp->sq;
+        cmd.prp1 = dma_phys(qp->sq);
         cmd.cdw10 = ((NVME_QUEUE_DEPTH - 1) << 16) | qid;
         cmd.cdw11 = ((uint32_t)qid << 16) | 1; // bind to its own cq, contiguous (satoru)
         if (!SubmitAdminCmd(&cmd, &result)) break;

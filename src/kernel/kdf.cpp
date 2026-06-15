@@ -337,6 +337,16 @@ uint64_t pages_for(uint64_t size) {
     return (size + KDF_PAGE_SIZE - 1) / KDF_PAGE_SIZE;
 }
 
+// claim a region-record slot in the active driver: reuse the lowest freed
+// (KDF_REGION_NONE) slot before growing, so a driver that cycles scratch buffers
+// (FreeDMA) does not exhaust KDF_MAX_REGIONS. returns the slot index or -1. (satoru)
+int claim_region_slot(KDFDriver* d) {
+    for (int r = 0; r < d->region_count; r++)
+        if (d->regions[r].kind == KDF_REGION_NONE) return r;
+    if (d->region_count >= KDF_MAX_REGIONS) return -1;
+    return d->region_count++;
+}
+
 // add a region record to the active driver. returns the user_va or nullptr. the
 // payload phys must already be allocated; this maps it guard-fenced + records it.
 // (satoru)
@@ -344,11 +354,12 @@ void* register_region(KDFRegionKind kind, uint64_t phys, uint64_t pages,
                       uint64_t usable_bytes) {
     if (g_active_driver < 0 || g_active_driver >= g_drv_count) return nullptr;
     KDFDriver* d = &g_drv[g_active_driver];
-    if (d->region_count >= KDF_MAX_REGIONS) return nullptr;
+    int slot = claim_region_slot(d);
+    if (slot < 0) return nullptr;
     uint64_t region_va = 0, total = 0;
     uint64_t user_va = carve_region(d, phys, pages, &region_va, &total);
     if (!user_va) return nullptr;
-    KDFRegion* rg = &d->regions[d->region_count++];
+    KDFRegion* rg = &d->regions[slot];
     rg->kind        = kind;
     rg->region_va   = region_va;
     rg->user_va     = user_va;
@@ -359,6 +370,29 @@ void* register_region(KDFRegionKind kind, uint64_t phys, uint64_t pages,
     return (void*)(uintptr_t)user_va;
 }
 }  // namespace
+
+void FreeDMA(void* user_va) {
+    if (!user_va) return;
+    uint64_t va = (uint64_t)(uintptr_t)user_va;
+    KDFDriver* d = nullptr;
+    KDFRegion* rg = region_for_va(va, &d);
+    if (!rg || !d) return;
+    if (rg->kind != KDF_REGION_DMA && rg->kind != KDF_REGION_CONTIGUOUS) return;
+    uint64_t payload = rg->total_pages >= 2 ? rg->total_pages - 2 : 0;
+    if (!rg->quarantined) {
+        for (uint64_t i = 0; i < payload; i++)
+            KernelVMM::UnmapPage(rg->user_va + i * KDF_PAGE_SIZE, false);
+        if (rg->phys && payload) PMM::FreeContiguous(rg->phys, payload);
+    }
+    // free the slot for reuse (leave the va window fenced/unmapped). (satoru)
+    rg->kind        = KDF_REGION_NONE;
+    rg->quarantined = false;
+    rg->phys        = 0;
+    rg->bytes       = 0;
+    rg->user_va     = 0;
+    rg->region_va   = 0;
+    rg->total_pages = 0;
+}
 
 void* AllocDMA(uint64_t size) {
     uint64_t pages = pages_for(size);

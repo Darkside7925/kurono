@@ -108,6 +108,13 @@ void* AllocDMA(uint64_t size);                 // page-aligned dma buffer (sator
 void* AllocContiguous(uint64_t size);          // physically-contiguous + fenced (satoru)
 void* MapMMIO(uint64_t paddr, uint64_t size);  // bounds-checked device bar window (satoru)
 
+// release a region previously returned by AllocDMA/AllocContiguous: unmaps its
+// payload, frees its backing frames, and frees the region slot for reuse (so a
+// driver that cycles scratch buffers does not exhaust KDF_MAX_REGIONS). a no-op
+// for a va that is not a live kdf dma region (mmio is not freed here; it is
+// reclaimed on quarantine / teardown). (satoru)
+void FreeDMA(void* user_va);
+
 // translate a kdf user_va back to its backing physical address (for dma program-
 // ming: prp/descriptor base). returns 0 if the va is not a live kdf region. the
 // payload is physically contiguous so phys+offset is valid across the buffer.
