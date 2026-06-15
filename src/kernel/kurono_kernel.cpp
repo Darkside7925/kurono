@@ -58,6 +58,7 @@
 #include "../shell/windows_cmds.h"
 #include "../kcl/kcl.h"
 #include "../kcl/kcl_test.h"
+#include "../net/ieee80211_test.h"  // 802.11i wpa2 crypto self-test (kurono.wifitest) (satoru)
 #include "../apps/kj.h"        // kj (kurono javascript) interpreter (satoru)
 #include "../apps/kj_test.h"   // kj (kurono javascript) self-test suite (satoru)
 #include "../security/supr.h"
@@ -988,6 +989,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // kcl language self-test: run the kcl interpreter test suite headless at
     // boot and log PASS/FAIL per test to serial. gated by kurono.kcltest. (satoru)
     bool boot_kcl_test = false;
+    // 802.11i wpa2 crypto self-test: assert the wifi security core (pbkdf2/prf/
+    // ccmp/...) against published vectors headless at boot. gated by
+    // kurono.wifitest. proves the security core even with no radio. (satoru)
+    bool boot_wifi_test = false;
     // kj language self-test: run the kj (kurono javascript) suite + kss-binding
     // checks headless at boot. gated by kurono.kjtest. (satoru)
     bool boot_kj_test = false;
@@ -1052,6 +1057,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // latch the kcl self-test flag (see decl). (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kcltest=1") || boot_has_token(boot_cmdline, "kurono.kcltest")) {
             boot_kcl_test = true;
+        }
+        // latch the 802.11i wifi crypto self-test flag (see decl). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.wifitest=1") || boot_has_token(boot_cmdline, "kurono.wifitest")) {
+            boot_wifi_test = true;
         }
         // latch the kj self-test flag. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kjtest=1") || boot_has_token(boot_cmdline, "kurono.kjtest")) {
@@ -2528,6 +2537,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_kcl_test) {
         SerialLogger::Log("[KCL] running self-test suite\r\n");
         KCLTest::RunAll();
+    }
+
+    // 802.11i wpa2 crypto self-test (gated by kurono.wifitest): assert the wifi
+    // security core against published test vectors. needs no radio/hardware  -  it
+    // proves the pmk/ptk/mic/ccmp math the supplicant relies on is byte-correct.
+    // (satoru)
+    if (boot_wifi_test) {
+        SerialLogger::Log("[80211] running wpa2 security self-test\r\n");
+        Ieee80211Test::RunAll();
     }
 
     // kj language self-test (gated by cmdline kurono.kjtest): kss sheet layer is

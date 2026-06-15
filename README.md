@@ -4,7 +4,9 @@ A bare-metal x86_64 operating system with a hybrid kernel that combines a native
 
 Built from scratch in freestanding C++17 and x86 assembly - no libc in the kernel, no borrowed POSIX runtime under the kernel, and no existing host kernel reused as the core OS. Kurono boots and runs on real x86_64 hardware - it boots as a Multiboot2 ELF kernel, also produces standalone EFI loaders, supports emergency recovery boot, can deploy onto FAT32/ext4 installer targets, and ships both Alpine and Debian guest paths. QEMU/KVM (and WHPX on Windows) is the day-to-day development, iteration, and CI environment; bare metal is the target.
 
-> **19 hardware drivers - 150+ shell commands across the Kurono / Linux / Windows environments - full TCP/IP stack - in-kernel ELF64 dynamic linker (ld-kurono) - a Linux syscall runtime with real concurrent threads/futex, epoll, mprotect W^X and SCM_RIGHTS fd-passing - an in-kernel Wayland compositor that renders real musl-compiled Wayland clients on screen - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
+> **19 core hardware drivers (+ a new wireless-NIC hardware layer) - 150+ shell commands across the Kurono / Linux / Windows environments - full TCP/IP stack - in-kernel ELF64 dynamic linker (ld-kurono) - a Linux syscall runtime with real concurrent threads/futex, epoll, mprotect W^X and SCM_RIGHTS fd-passing - an in-kernel Wayland compositor that renders real musl-compiled Wayland clients on screen - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
+
+> **Security note:** Kurono recently went through a whole-OS security audit (~68 issues triaged; **~20 confirmed memory-safety bugs fixed and merged so far, more in progress**)  -  integer-overflow heap overflows in the media codecs (AAC/FLAC/WAV/MP3/MP4), two remotely-triggerable D-Bus stack overflows, a 9p (v9fs) guest→host VM-escape, GPU 64-bit-BAR mapping bugs, "trust-the-on-disk-data" bugs in ext4/KFS/NVMe, interpreter recursion/overflow bugs (KCL/KJ), and a shell 64 KB-stack→heap fix. This was a real hardening pass  -  but Kurono is **not** "production-ready" or "bug-free"; the audit is ongoing and there are known open issues. See *Security Hardening* below.
 
 > **On the browser question:** Kurono does *not* ship a cut-down toy browser, and the GUI "Browser" tile is a deliberate placeholder. The real answer is **Firefox on the Linux runtime**  -  a full Firefox 140.11.0esr is cross-compiled against musl + Wayland (174 MB `libxul.so`), and the OS provides the syscalls, IPC and Wayland surface it targets. The **Gecko engine now loads and runs on-device**: `ld-kurono` resolves libxul's full shared-library closure, loads and relocates `libxul` (130 MB+) at a multi-terabyte base, and XPCOM plus Gecko's own application code execute and spawn child processes. The remaining frontier is getting a **rendered Firefox window**, which needs the e10s multiprocess IPC path and a musl symbol/threading issue resolved  -  *not* an address-space limit (the old `<4 GB` pointer-ABI cap is gone; user mappings now span the full canonical 64-bit user range). `curl <url>` is the working HTTP path today.
 
@@ -123,6 +125,20 @@ to the EFI loader; on BIOS it defaults to the Multiboot2 kernel. The entries are
 
 ## Recent Updates
 
+### Latest  -  security hardening pass + wireless-NIC hardware layer
+
+- **Whole-OS security audit (~68 issues triaged, ~20 memory-safety bugs fixed + merged, more in progress).** This was a deliberate hardening pass, not a cosmetic one. Fixed so far:
+  - **Media codecs:** integer-overflow-into-heap-overflow bugs in the AAC, FLAC, WAV (8-bit decode + duration divide-by-zero), and MP4 paths, plus an MP3 `ReadBits` out-of-bounds read and an MP4 box-recursion stack overflow  -  these are reachable by simply opening a malformed media file.
+  - **D-Bus:** two remotely-triggerable stack overflows in the session-bus server (`ListNames` reply body and `send_method_return` header/body writes now bounded).
+  - **Hypervisor / guest boundary:** a 9p (`v9fs`) **guest→host VM-escape**  -  the handlers translated only the start of a guest buffer, then copied `count`/`sizeof(stat)` bytes sequentially past it; a malicious guest could read/write host memory. Also bounded the virtual-PCI config writes and a virtio-GPU `TransferToHost` out-of-range rect.
+  - **GPU:** 64-bit BAR mapping bugs (the GPU and HDA drivers dereferenced a BAR before mapping the full 64-bit address) fixed.
+  - **Storage (trust-the-on-disk-data):** ext4 superblock / directory-entry / extent-header validation (zero blocks-per-group divide-by-zero, `rec_len` walk, `Mkdir` null-deref, extent-count clamp), a KFS superblock validator on mount, and an NVMe shared-submission-queue serialization + untrusted-shift clamp.
+  - **Interpreters:** KCL `*` (string-repeat) integer overflow and KCL/KJ parser+eval recursion-depth caps (a deep script could overflow the kernel stack); same string-repeat overflow fixed in the mini-Python interpreter; KJ `val_to_str` recursion capped.
+  - **Shell:** `cat`/`head`/`tail`/`wc`/`sort`/`uniq` (Linux) and `type` (Windows) moved their 64 KB read buffers off the kernel stack onto the heap.
+  - Plus loader/network bounds fixes (ELF `RELATIVE` reloc target, `kls` PT_LOAD range check, `ProcIndex` parent copy bound, guest-framebuffer blit clip, a VMM huge-page flag-drop bug).
+  - **Honest framing:** ~20 of ~68 found are fixed; the rest (including remaining concurrency/perf items) are still open. This moved the safety floor a lot  -  it does **not** make the OS bug-free.
+- **Real wireless-NIC hardware layer (`drivers/wifi_dev`).** Kurono now actually *finds and identifies* the WiFi card: a PCI-bus walk for wireless network controllers, exact chip identification (Intel Wi-Fi 6 AX200/AX210/AX211/AX201 + Wireless-AC 9560/8265/7260, Atheros AR9xxx + Qualcomm QCA988x/QCA6174/QCA9377, Realtek RTL88xx/87xx, Broadcom BCM43xx), 64-bit MMIO BAR mapping, and PCI bus-master enable  -  the hardware foundation a radio driver sits on. **What this is *not* (yet):** there is no association. The shared 802.11 MAC (scan/auth/assoc) + WPA2 software stack is **in progress**, and the per-vendor radio/firmware drivers are the next phase and need **real hardware** to bring up (QEMU emulates no WiFi NIC). The desktop tray and the setup wizard report the detected chip but stay honest that the link isn't up. **WiFi is detected and identified; it does not connect yet.**
+
 ### June 2026  -  moved to Linux + made the desktop actually usable
 
 Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It's way faster and it quietly fixed a pile of networking + input pain that WHPX was causing. Wrote a `start.sh` so booting is one command now.
@@ -131,7 +147,7 @@ Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It'
 - **Reboot persistence on a real filesystem + multi-core bring-up.** KVFS state now survives a reboot through **KFS**  -  a from-scratch inode-based on-disk filesystem (the NVMe driver was dead until a missing `volatile` on the completion poll was fixed; it now does multi-page DMA via a PRP list). The user-data tree is stored as real files + dirs, not a blob. And the secondary cores are genuinely up: INIT-SIPI-SIPI bring-up, a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, per-CPU current task. The **per-CPU scheduling foundation** for running user threads on them then landed  -  a cross-core ready-queue lock + atomic per-CPU claim, a per-CPU user-execution context (replacing the single-active-process model), and per-CPU syscall state, all verified non-regressing under `-smp 4` (desktop renders, no faults). And the AP dispatch loop now **enters ring-3 on the secondary cores**: opt-in via `./start.sh --apsched`, an application processor was shown launching `/usr/bin/mhello`, running its syscalls, and exiting 0 in parallel with the desktop; the APs are then made **preemptive** with a per-CPU LAPIC timer. Spreading a process's `clone` threads across multiple cores and load balancing are the remaining steps. See [docs/developers/proc/SMP.md](docs/developers/proc/SMP.md).
 - **A real Linux GUI client renders through the in-kernel Wayland compositor.** This is the milestone the rest of the runtime was building toward. The userspace layer grew the pieces a real GUI app actually blocks on: preemptive concurrent threads (`clone`/`CLONE_THREAD`) backed by a real `futex` (the multithreaded pthread gate passes), `epoll`/`poll`, `mprotect` with W^X enforcement, `memfd`/file-backed `mmap`, and `SCM_RIGHTS` fd-passing end to end. With those in place, a Wayland client compiled with **musl-gcc** (`wl_shm_test`, embedded in the kernel and launched by the `wltest` command) connects to the compositor over the AF_UNIX socket, fd-passes a `wl_shm` buffer, and the compositor blits its pixels into a real window-manager window with damage tracking and forwards pointer input back to it. That's the whole `wl_shm` + `xdg-shell` render path working  -  not just the wire protocol. (Keyboard-to-client forwarding is the next wire-up.)
 - **Firefox's Gecko engine loads and runs on Kurono.** A real **Firefox 140.11.0esr** is built against **musl** (clang/lld, `--disable-jit`, `cairo-gtk3-wayland`)  -  `firefox`/`firefox-bin` plus a 174 MB `libxul.so` Gecko engine, build rc=0, all of Alpine's musl portability patches applied. This is the concrete rebuttal to "a freestanding OS can't have a browser": the engine targets musl + Wayland, both of which Kurono's runtime provides, the launcher does a real `execve`, and on-device `ld-kurono` now resolves libxul's full `.so` dependency closure, loads and relocates `libxul` (130 MB+) at a multi-terabyte base, and runs XPCOM and Gecko's own application code  -  including spawning the child processes Firefox launches via `clone3`. The remaining work is a **rendered Firefox window**: wiring up the e10s multiprocess IPC path and resolving a musl symbol/threading issue. The old `<4 GB` user-pointer ABI cap that used to block this is **gone**  -  user mappings now span the full canonical 64-bit user address range.
-- **Networking actually works.** curl/HTTP goes end to end now  -  fixed a recv loop that gave up way too early, the FIN_WAIT half-close path, and ephemeral port selection. Pulled real pages off example.com and wikipedia over tap+NAT.
+- **Networking actually works.** curl/HTTP goes end to end now  -  fixed a recv loop that gave up way too early, the FIN_WAIT half-close path, and ephemeral port selection. Pulled real pages off example.com and wikipedia over tap+NAT. Throughput then improved: TCP send went from stop-and-wait to a **fixed multi-segment send window**, and the ~1 ms network wait loops now yield instead of busy-spinning.
 - **USB works over xHCI.** keyboard, mouse, and tablet all enumerate and report now (the DMA structs just needed proper page alignment). The tablet gives accurate absolute cursor positioning, which is also how I drive it headless.
 - **Killed the bugs that made the desktop unusable:**
   - top taskbar was eating *every* click  -  you literally couldn't use anything. Now only the bar itself grabs clicks; everything else passes through.
@@ -248,7 +264,7 @@ Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It'
 | Media Player v2.0 | GUI app | video/audio playback UI, codec badges, metadata caching, decode buffer, FPS overlay, audio routing across SB16/AC97/HDA |
 | Denji | GUI app / shell command | windowed KVID/JPEG playback wrapper around `VideoPlayer` for the bundled Denji media asset |
 | Settings | GUI app | 12-tab settings UI (Display, Sound, Network, Storage, Power, Personalize, Security, Packages, Updates, System, About, Accessibility)  -  incl. a real Updates tab |
-| Task Manager | GUI app | process list, CPU/memory stats, auto-refresh |
+| Task Manager | GUI app | overhauled tabbed UI (Processes / Performance / Services / Details): sortable process columns, per-process kill, a live CPU-history graph, honest RAM accounting straight from the PMM, plus disk/network counters and auto-refresh |
 | Firefox Launcher | runtime app path | real `execve` of `/apps/firefox/firefox` through the Linux syscall/runtime layer (seeded `/system`, `firefox.env`, `LD_LIBRARY_PATH` from the runtime layout). A real Firefox 140.11.0esr is cross-compiled (musl, Wayland); shipping + loading its 174 MB libxul closure via `ld-kurono` is the remaining bring-up step |
 | Conduit | GUI app | event-dialogue viewer backed by `ConduitBridge` telemetry for system, package, GPU, guest, and command events |
 | Mini Python 3 | shell/runtime | built-in `python` / `python3` interpreter with file, `-c`, and `-e` execution |
@@ -356,7 +372,7 @@ Kurono ships both a native package manager and guest-aware update flows.
 
 ### Hardware Drivers
 
-Kurono currently ships 19 core hardware drivers plus additional kernel services layered on top of them.
+Kurono currently ships 19 core hardware drivers plus additional kernel services layered on top of them. A new wireless-NIC hardware layer (`drivers/wifi_dev`) detects and identifies WiFi cards (see the WiFi row below and *Networking*).
 
 | Driver / Subsystem | Details |
 |--------------------|---------|
@@ -376,6 +392,7 @@ Kurono currently ships 19 core hardware drivers plus additional kernel services 
 | AC97 | PCI DMA audio, NAM/NABM control, 48 kHz PCM, parallel operation with SB16 |
 | CPU Detect | CPUID vendor/brand/model/family/features/topology reporting |
 | Intel E1000 | PCI NIC init, descriptor rings, MAC readout, link status |
+| WiFi (hardware layer) | PCI detect of wireless NICs + exact chip ID (Intel AX2xx/9xxx/8xxx/7xxx, Atheros/QCA, Realtek, Broadcom), 64-bit MMIO BAR map, bus-master enable. **Hardware-detect only**  -  802.11 MAC + WPA2 software stack in progress, per-vendor radio drivers next; no association yet (and QEMU has no WiFi NIC) |
 | PS/2 Keyboard | scancodes, compatibility init, event drain |
 | PS/2 Mouse | polling, DPI scaling, packet re-sync, burst compatibility |
 | PIT Timer | 1000 Hz timing and wait helpers |
@@ -391,6 +408,7 @@ Kurono includes a real custom TCP/IP stack instead of a guest-host shortcut.
 - **Link layer**
   - Ethernet II framing
   - ARP request/reply and 32-entry cache
+  - Wired NIC: Intel E1000 (`eth0`). Wireless: the `wifi_dev` hardware layer detects + identifies the WiFi chip (Intel/Atheros/Realtek/Broadcom) and maps its BAR, but the 802.11/WPA2 stack is still in progress  -  **WiFi does not associate yet**, so the live link is e1000 / virtio-net only
 
 - **Internet layer**
   - IPv4 header build and parse
@@ -552,6 +570,17 @@ Kurono includes a Type 1 hypervisor stack designed for Linux guest boot and devi
 - Two-stage build (`kurono_base.elf` then final `kurono.elf`) so installable payloads can be embedded in the shipping kernel
 
 ### Security, Users, Scripting, and Filesystem
+
+- **Security Hardening (audit pass  -  ongoing)**
+  - A whole-OS audit triaged **~68 issues**; **~20 confirmed memory-safety bugs are fixed and merged**, with more still in progress. Highlights, all backed by commits in the tree:
+    - **Media-codec heap overflows** from 32-bit integer overflows in AAC / FLAC / WAV / MP3 / MP4 decode + parse paths (reachable by opening a malformed file), plus an MP4 box-recursion stack overflow.
+    - **Two remotely-triggerable D-Bus stack overflows** in the session-bus server (`ListNames` and `send_method_return` now write bounded into their stack buffers).
+    - A **9p (`v9fs`) guest→host VM-escape**: `DoRead`/`DoWrite`/`DoStat`/`DoReadDir` translated only the *start* of a guest buffer then walked past it into host memory  -  now bounds-checked. Hardened alongside virtual-PCI config-write bounds and a virtio-GPU out-of-range transfer rect.
+    - **GPU/HDA 64-bit BAR** mapping bugs (BAR dereferenced before the full 64-bit address was mapped).
+    - **ext4 / KFS / NVMe "trust-the-on-disk-data" bugs**: ext4 superblock + directory-entry + extent-header validation, KFS superblock validation on mount, NVMe submission-queue serialization + untrusted-shift clamp.
+    - **Interpreter bugs**: KCL `*` string-repeat overflow, KCL/KJ parser+eval recursion-depth caps, KJ `val_to_str` recursion cap, and the same string-repeat overflow in mini-Python.
+    - **Shell**: the 64 KB read buffers in `cat`/`head`/`tail`/`wc`/`sort`/`uniq`/`type` moved off the kernel stack onto the heap.
+  - **This does not make Kurono bug-free or production-ready.** Roughly 20 of ~68 are resolved; the rest (including some concurrency/perf issues) are open and tracked.
 
 - **SUPR privilege system**
   - privilege escalation with timeout

@@ -4,6 +4,8 @@
 #include "../shell/shell.h"
 #include "../drivers/serial.h"
 #include "../drivers/e1000.h"
+#include "../drivers/wifi_dev.h"    // real wireless nic detection + bar mapping (satoru)
+#include "ieee80211.h"              // the 802.11 software mac (scan/auth/assoc/wpa2) (satoru)
 #include "../hal/hal.h"
 #include "../system/logging.h"
 #include "../ui/notification.h"
@@ -805,6 +807,20 @@ void WiFi::ProbePCIWireless() {
     link_probed = true;
     detected_link = LINK_NONE;
     wireless_chip[0] = 0;
+
+    // real wireless-nic detection: the wifi hardware layer (drivers/wifi_dev)
+    // walks the pci bus, names the exact chip, maps its mmio bar, and enables
+    // bus-mastering  -  the foundation the 802.11 radio driver sits on. (satoru)
+    if (WifiDev::Probe()) {
+        const WifiDevice* d = WifiDev::Info();
+        detected_link = LINK_WIFI;
+        int wp = 0;
+        while (d->model[wp] && wp < 60) { wireless_chip[wp] = d->model[wp]; wp++; }
+        wireless_chip[wp] = 0;
+        return;
+    }
+
+    // no wireless radio -> fall back to detecting a wired link. (satoru)
     bool wired_found = false;
     for (uint32_t bus = 0; bus < 256; bus++) {
         for (uint32_t slot = 0; slot < 32; slot++) {
@@ -813,7 +829,6 @@ void WiFi::ProbePCIWireless() {
             uint32_t id;
             __asm__ __volatile__("inl %1, %0" : "=a"(id) : "Nd"((uint16_t)0xCFC));
             uint16_t vendor = id & 0xFFFF;
-            uint16_t device = (id >> 16) & 0xFFFF;
             if (vendor == 0xFFFF || vendor == 0) continue;
             addr = (1u << 31) | (bus << 16) | (slot << 11) | 0x08;
             __asm__ __volatile__("outl %0, %1" : : "a"(addr), "Nd"((uint16_t)0xCF8));
@@ -821,33 +836,7 @@ void WiFi::ProbePCIWireless() {
             __asm__ __volatile__("inl %1, %0" : "=a"(cls) : "Nd"((uint16_t)0xCFC));
             uint8_t class_code = (cls >> 24) & 0xFF;
             uint8_t subclass   = (cls >> 16) & 0xFF;
-            if (class_code != 0x02) continue;
-            // 0x00 = ethernet, 0x80 = other (wireless), 0x01 = token ring
-            bool is_wireless = (subclass == 0x80);
-            // Also flag known WiFi vendor/device combos even if subclass==0
-            // Intel iwlwifi: 0x8086 + (0x0084..0x24fd range)
-            // Atheros: 0x168c
-            // Broadcom: 0x14e4 wifi devices
-            // Realtek RTL8821/8723: 0x10ec 0x8821 etc.
-            if (!is_wireless) {
-                if (vendor == 0x168c) is_wireless = true; // Atheros
-                else if (vendor == 0x14e4 && (device == 0x4359 || device == 0x4727 || device == 0x43a0)) is_wireless = true;
-                else if (vendor == 0x10ec && (device == 0x8821 || device == 0x8723 || device == 0xb822)) is_wireless = true;
-                else if (vendor == 0x8086 && (device == 0x24fd || device == 0x095a || device == 0x08b1 || device == 0x2723)) is_wireless = true;
-            }
-            if (is_wireless) {
-                detected_link = LINK_WIFI;
-                const char* vname = "Unknown";
-                if (vendor == 0x8086) vname = "Intel iwlwifi";
-                else if (vendor == 0x168c) vname = "Atheros ath";
-                else if (vendor == 0x14e4) vname = "Broadcom brcmfmac";
-                else if (vendor == 0x10ec) vname = "Realtek rtw";
-                int wp = 0;
-                while (vname[wp] && wp < 60) { wireless_chip[wp] = vname[wp]; wp++; }
-                wireless_chip[wp] = 0;
-                return;
-            }
-            if (subclass == 0x00) wired_found = true;
+            if (class_code == 0x02 && subclass == 0x00) wired_found = true;
         }
     }
     if (wired_found || E1000::IsDetected()) detected_link = LINK_ETHERNET;
@@ -900,7 +889,13 @@ void WiFi::Init() {
     ProbePCIWireless();
 
     if (detected_link == LINK_WIFI) {
-        SerialLogger::Log("WiFi: Controller detected, native 802.11 stack not implemented yet\r\n");
+        const WifiDevice* d = WifiDev::Info();
+        SerialLogger::Log("WiFi: ");
+        SerialLogger::Log(d->model);
+        SerialLogger::Log(d->mmio_mapped ? " - mmio mapped, " : " - mmio unmapped, ");
+        SerialLogger::Log(d->needs_firmware
+            ? "needs firmware; 802.11 radio bring-up is the next phase\r\n"
+            : "firmware-free; 802.11 radio bring-up is the next phase\r\n");
     } else if (detected_link == LINK_ETHERNET) {
         SerialLogger::Log("WiFi: No native WiFi radio in current environment (wired link only)\r\n");
     } else {
@@ -923,32 +918,82 @@ bool WiFi::Disable() {
 bool WiFi::Scan() {
     if (state == WIFI_OFF || DetectedLink() != LINK_WIFI) return false;
     state = WIFI_SCANNING;
-    SimulateNetworks();
+
+    // drive the real 802.11 stack if a vendor radio driver has registered. it
+    // sweeps channels, sends probe-reqs, and parses beacons/probe-resps into our
+    // WiFiNetwork[] array. with no registered radio (no vendor driver yet / no
+    // hardware) it returns 0  -  we keep an empty list rather than fake one. (satoru)
+    if (Ieee80211::HasRadio()) {
+        network_count = Ieee80211::Scan(networks, NET_MAX_WIFI_NETS);
+    } else {
+        network_count = 0;
+    }
+    connected_index = -1;   // a fresh scan replaces the list; re-connect to relink (satoru)
+
     state = connected_index >= 0 ? WIFI_CONNECTED : WIFI_DISCONNECTED;
     return true;
 }
 
 bool WiFi::Connect(const char* ssid, const char* password) {
-    (void)password;
     if (state == WIFI_OFF || DetectedLink() != LINK_WIFI) return false;
 
-    // find network
-    for (int i = 0; i < network_count; i++) {
-        if (neq(networks[i].ssid, ssid)) {
-            if (connected_index >= 0) networks[connected_index].connected = false;
-            networks[i].connected = true;
-            connected_index = i;
-            state = WIFI_CONNECTED;
-            // wifi link came up  -  toast the connected ssid. (satoru)
-            NotificationManager::Post("Network", networks[i].ssid,
-                                      NotificationManager::ICON_SUCCESS, 3000);
-            return true;
+    // real path: drive the 802.11 stack (auth -> assoc -> wpa2 4-way handshake)
+    // through the registered vendor radio. only succeeds with a registered radio
+    // + real hardware; otherwise fails honestly (no fake "connected"). (satoru)
+    if (Ieee80211::HasRadio()) {
+        state = WIFI_CONNECTING;
+        uint8_t bssid[6] = {0};
+        bool ok = Ieee80211::Connect(ssid, password ? password : "", bssid);
+        if (!ok) {
+            state = WIFI_DISCONNECTED;
+            NotificationManager::Post("Network", "wifi connect failed",
+                                      NotificationManager::ICON_WARNING, 3000);
+            return false;
         }
+
+        // associate succeeded + keys installed. reflect it in our network list
+        // (locate the ssid from the last scan, or synthesize a minimal entry). (satoru)
+        connected_index = -1;
+        for (int i = 0; i < network_count; i++) {
+            if (neq(networks[i].ssid, ssid)) { connected_index = i; break; }
+        }
+        if (connected_index < 0 && network_count < NET_MAX_WIFI_NETS) {
+            connected_index = network_count++;
+            ncpy(networks[connected_index].ssid, ssid, NET_MAX_SSID);
+            networks[connected_index].security = WIFI_WPA2;
+            networks[connected_index].channel = 0;
+        }
+        if (connected_index >= 0) {
+            networks[connected_index].connected = true;
+            for (int i = 0; i < 6; i++) networks[connected_index].bssid.bytes[i] = bssid[i];
+            networks[connected_index].signal_strength = Ieee80211::GetSignal();
+        }
+        state = WIFI_CONNECTED;
+
+        // bring the wlan0 interface up so the ip stack will route over it. the
+        // link-layer + ccmp keys are established here; obtaining an ip address is
+        // the dhcp client's job (the tcpip stack exposes the address setters but
+        // no dhcp client yet)  -  honest: we mark the carrier up, not an ip. (satoru)
+        NetworkInterface* wlan = Network::GetInterface("wlan0");
+        if (wlan) wlan->state = NIC_UP;
+
+        NotificationManager::Post("Network", ssid,
+                                  NotificationManager::ICON_SUCCESS, 3000);
+        SerialLogger::Log("WiFi: associated + 4-way handshake complete on wlan0\r\n");
+        return true;
     }
+
+    // no registered radio -> cannot associate. honest failure. (satoru)
+    SerialLogger::Log("WiFi: no 802.11 radio registered; cannot connect\r\n");
     return false;
 }
 
 bool WiFi::Disconnect() {
+    // tear the real link down (deauth + stop the radio) if one is up. (satoru)
+    if (Ieee80211::HasRadio()) Ieee80211::Disconnect();
+    NetworkInterface* wlan = Network::GetInterface("wlan0");
+    if (wlan) wlan->state = NIC_DOWN;
+
     if (connected_index >= 0) {
         networks[connected_index].connected = false;
         connected_index = -1;
@@ -969,6 +1014,11 @@ WiFiNetwork* WiFi::GetConnectedNetwork() {
 }
 
 int WiFi::GetSignalStrength() {
+    // prefer the live radio rssi when associated; else the cached scan value. (satoru)
+    if (connected_index >= 0 && Ieee80211::HasRadio() &&
+        Ieee80211::State() == Ieee80211::SUPP_HANDSHAKE_DONE) {
+        return Ieee80211::GetSignal();
+    }
     return connected_index >= 0 ? networks[connected_index].signal_strength : -100;
 }
 
