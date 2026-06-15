@@ -313,8 +313,12 @@ void LogEvent(const char* event, const char* service, const char* detail);
 // the driver's kdf init entry (the same one passed to KDF::RegisterDriver, which
 // this calls for you). returns the kinit service index, or -1. (satoru)
 typedef bool (*KdfDriverInit)();
+// already_running=true adopts a driver kdf already brought up (e.g. nvme, inited
+// during the early data-disk mount) as RUNNING so the boot sequence does not
+// re-init it; false leaves it INACTIVE for KInit::Boot to start at its target.
+// (satoru)
 int RegisterKdfDriver(const char* name, KdfDriverInit init, KTarget target,
-                      bool critical);
+                      bool critical, bool already_running);
 
 // the bridge KDF calls (via KDF::SetCrashNotifier) when a driver's guard page
 // faults: looks up the matching kdf-driver unit and schedules a backoff restart

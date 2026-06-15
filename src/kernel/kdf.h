@@ -171,6 +171,17 @@ uint64_t    DriverMappedBytes(int driver_id);
 void        SetRunning(int driver_id);
 void        SetRestarting(int driver_id);
 
+// ── crash-recovery self-test (kurono.kdf.test gate; kdf_test.cpp) (satoru) ────
+// register a deliberately-faulting test driver as a supervised kinit kdf unit.
+// call before KInit::Boot. (satoru)
+void RegisterCrashTestDriver();
+// power off after the test finishes (kurono.kdf.poweroff). (satoru)
+void SetCrashTestPoweroff(bool v);
+// run the 3 crash-recovery scenarios (sandbox unwind / kinit restart / in-bounds
+// still-works) and log PASS/FAIL to serial. call from a kernel-process after the
+// desktop is up so kinit's monitor is ticking. (satoru)
+void RunCrashRecoveryTest();
+
 }  // namespace KDF
 
 // end (satoru)

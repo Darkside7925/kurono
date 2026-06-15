@@ -683,10 +683,12 @@ int RegisterService(const KService* tmpl) {
 
 // ── kdf-driver registration + crash bridge (satoru) ───────────────────────────
 int RegisterKdfDriver(const char* name, KdfDriverInit init, KTarget target,
-                      bool critical) {
+                      bool critical, bool already_running) {
     if (!name || !name[0]) return -1;
     if (g_kdf_count >= KINIT_MAX_KDF_DRIVERS) return -1;
-    // register the driver with kdf (gets its guard-page va window + crash id). (satoru)
+    // register the driver with kdf (gets its guard-page va window + crash id).
+    // idempotent: nvme already registered itself during the early data-disk
+    // mount, so this reuses its existing id. (satoru)
     int kdf_id = KDF::RegisterDriver(name, init);
     if (kdf_id < 0) return -1;
 
@@ -712,6 +714,17 @@ int RegisterKdfDriver(const char* name, KdfDriverInit init, KTarget target,
     if (svc < 0) { b->in_use = false; return -1; }
     b->svc_index = svc;
     g_kdf_count++;
+
+    // a driver kdf already brought up (e.g. nvme, inited during the data-disk
+    // mount long before kinit) is adopted as RUNNING so the boot sequence does
+    // not re-run its init; only a later crash drives a restart. otherwise the
+    // unit stays INACTIVE and KInit::Boot brings it up at its target. (satoru)
+    if (already_running) {
+        g_services[svc].state = KSVC_RUNNING;
+        g_services[svc].ready_time_ms = now_ms();
+        KDF::SetRunning(kdf_id);
+    }
+
     LogEvent("kdf-register", name, nullptr);
     return svc;
 }
