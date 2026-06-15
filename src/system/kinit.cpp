@@ -28,6 +28,7 @@
 #include "../net/unix_socket.h"          // socket activation + sd_notify listener (satoru)
 #include "../proc/cgroup.h"              // CPUQuota -> cpu.weight, MemoryMax charge (satoru)
 #include "../kernel/heap.h"              // test memhog allocations (satoru)
+#include "../kernel/kdf.h"               // kdf-sandboxed kernel driver supervision (satoru)
 #include "kpkg_daemon.h"
 #include "kdaemons.h"
 
@@ -301,6 +302,46 @@ void ensure_supervisor(int slot) {
     // kernel stack. give it room. (satoru)
     Scheduler::SpawnKernelProcess(nm, g_sup_entry[slot], PRIO_NORMAL, 64, 16 * 1024);
 }
+
+// ── kdf-driver bindings (satoru) ──────────────────────────────────────────────
+// each kdf-sandboxed kernel driver supervised by kinit gets a binding: its kdf
+// init entry + the kdf driver id + the kinit service index that supervises it.
+// the service's start_fn is a fixed trampoline (one per binding slot, since
+// KInkernelHook takes no argument) that re-inits the driver via KDF::Start. a
+// guard-page crash routes through NotifyDriverCrash -> the standard in-kernel
+// backoff machinery, which re-fires that trampoline. (satoru)
+constexpr int KINIT_MAX_KDF_DRIVERS = 16;
+struct KdfBinding {
+    bool          in_use;
+    char          name[KINIT_NAME_LEN];
+    KdfDriverInit init;
+    int           kdf_id;       // KDF::RegisterDriver id (satoru)
+    int           svc_index;    // the supervising kinit service (satoru)
+};
+KdfBinding g_kdf[KINIT_MAX_KDF_DRIVERS];
+int        g_kdf_count = 0;
+
+// (re-)init binding `slot`'s driver inside its kdf crash sandbox. (satoru)
+void kdf_binding_start(int slot) {
+    if (slot < 0 || slot >= g_kdf_count) return;
+    KdfBinding* b = &g_kdf[slot];
+    if (!b->in_use || b->kdf_id < 0) return;
+    bool ok = KDF::Start(b->kdf_id);
+    LogEvent(ok ? "kdf-init-ok" : "kdf-init-fail", b->name, nullptr);
+}
+
+// one trampoline per binding slot (the in-kernel start hook takes no arg). (satoru)
+#define KIKDF(n) void kdf_start_##n() { kdf_binding_start(n); }
+KIKDF(0)  KIKDF(1)  KIKDF(2)  KIKDF(3)  KIKDF(4)  KIKDF(5)  KIKDF(6)  KIKDF(7)
+KIKDF(8)  KIKDF(9)  KIKDF(10) KIKDF(11) KIKDF(12) KIKDF(13) KIKDF(14) KIKDF(15)
+#undef KIKDF
+KInkernelHook g_kdf_start_entry[KINIT_MAX_KDF_DRIVERS] = {
+    kdf_start_0,  kdf_start_1,  kdf_start_2,  kdf_start_3,
+    kdf_start_4,  kdf_start_5,  kdf_start_6,  kdf_start_7,
+    kdf_start_8,  kdf_start_9,  kdf_start_10, kdf_start_11,
+    kdf_start_12, kdf_start_13, kdf_start_14, kdf_start_15
+};
+static_assert(KINIT_MAX_KDF_DRIVERS == 16, "kdf trampoline table must match KINIT_MAX_KDF_DRIVERS");
 
 // capability gate: a process unit that asks for a capability it cannot have is
 // refused at spawn. for now we gate on the active supr level: a service that
@@ -638,6 +679,87 @@ int RegisterService(const KService* tmpl) {
     s->notify_status[0] = 0;
     s->isolated_active = false;
     return slot;
+}
+
+// ── kdf-driver registration + crash bridge (satoru) ───────────────────────────
+int RegisterKdfDriver(const char* name, KdfDriverInit init, KTarget target,
+                      bool critical) {
+    if (!name || !name[0]) return -1;
+    if (g_kdf_count >= KINIT_MAX_KDF_DRIVERS) return -1;
+    // register the driver with kdf (gets its guard-page va window + crash id). (satoru)
+    int kdf_id = KDF::RegisterDriver(name, init);
+    if (kdf_id < 0) return -1;
+
+    int slot = g_kdf_count;
+    KdfBinding* b = &g_kdf[slot];
+    b->in_use   = true;
+    ki_cpy(b->name, name, sizeof(b->name));
+    b->init     = init;
+    b->kdf_id   = kdf_id;
+    b->svc_index = -1;
+
+    // register the supervising kinit unit: in-kernel, restart-on-failure, with
+    // this slot's trampoline as the (re-)init hook. a short backoff (1s base) so a
+    // crashed driver comes back fast, but the 5-in-60s burst rule still caps a
+    // hard-looping fault. (satoru)
+    char desc[64];
+    int p = 0;
+    p = ki_cat(desc, p, (int)sizeof(desc), "kdf driver: ");
+    p = ki_cat(desc, p, (int)sizeof(desc), name);
+    int svc = RegisterInkernel(name, desc, target, g_kdf_start_entry[slot],
+                               nullptr, nullptr, "", KRESTART_ON_FAILURE, 1000,
+                               critical);
+    if (svc < 0) { b->in_use = false; return -1; }
+    b->svc_index = svc;
+    g_kdf_count++;
+    LogEvent("kdf-register", name, nullptr);
+    return svc;
+}
+
+void NotifyDriverCrash(const char* driver, const char* reason) {
+    if (!driver) return;
+    int slot = -1;
+    for (int i = 0; i < g_kdf_count; i++)
+        if (g_kdf[i].in_use && ki_eq(g_kdf[i].name, driver)) { slot = i; break; }
+    if (slot < 0) {
+        // a kdf driver kinit doesn't supervise (or an unknown name): just audit
+        // it. kdf already quarantined + logged. (satoru)
+        LogEvent("kdf-crash-unmanaged", driver, reason);
+        return;
+    }
+    KdfBinding* b = &g_kdf[slot];
+    int idx = b->svc_index;
+    if (idx < 0 || idx >= g_service_count) return;
+    KService* s = &g_services[idx];
+    uint32_t t = now_ms();
+
+    s->crash_count++;
+    if (t - s->burst_window_start_ms > KINIT_BURST_WINDOW_MS) {
+        s->burst_window_start_ms = t;
+        s->crash_burst = 0;
+    }
+    s->crash_burst++;
+    LogEvent("kdf-crash", s->name, reason);
+    RuntimeLog::LogCrash("kdf driver crash", s->name);
+
+    if (s->crash_burst >= KINIT_BURST_LIMIT) {
+        s->state = KSVC_FAILED;
+        LogEvent("kdf-failed", s->name, "5 crashes in 60s; giving up");
+        if (s->critical) notify_critical_failure(s);
+        return;
+    }
+    // schedule the backoff relaunch; Tick() block 4 (in-kernel RESTARTING) fires
+    // this unit's start trampoline -> KDF::Start -> driver re-init. (satoru)
+    s->state = KSVC_RESTARTING;
+    s->next_restart_ms = t + s->cur_backoff_ms;
+    uint32_t next = s->cur_backoff_ms * 2;
+    s->cur_backoff_ms = (next > KINIT_BACKOFF_MAX_MS) ? KINIT_BACKOFF_MAX_MS : next;
+    char d[48];
+    int q = 0;
+    q = ki_cat(d, q, (int)sizeof(d), "restart in ");
+    q = ki_cat_u(d, q, (int)sizeof(d), s->cur_backoff_ms);
+    q = ki_cat(d, q, (int)sizeof(d), "ms");
+    LogEvent("kdf-restart-scheduled", s->name, d);
 }
 
 // mark a service as fully up and record its boot timing for `kinit analyze`. a
