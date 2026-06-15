@@ -98,7 +98,13 @@ struct NVMeControllerInfo {
 
 class NVMe {
 public:
+    // public entry: registers the "nvme" kdf driver (once) and brings it up
+    // inside the kdf crash sandbox. (satoru)
     static bool Init();
+    // the real init body, run by kdf via KDF::Start (RunGuarded). all dma buffers
+    // are kdf-fenced; the bar0 window is kdf mmio. also the re-init entry kinit
+    // fires after a guard-page crash. (satoru)
+    static bool KdfInit();
     static bool IsDetected();
     static const NVMeControllerInfo& GetInfo();
 
