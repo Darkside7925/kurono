@@ -793,10 +793,23 @@ struct FutexWaiter {
     Process*  task;
     uint64_t  addr_space;
     uintptr_t uaddr;
+    uint64_t  phys_key;   // physical page|offset backing uaddr, so a SHARED futex
+                          // can cross-wake between processes with different address
+                          // spaces / virtual addresses (e10s ipc). (satoru)
     uint32_t  bitset;
     bool      active;
 };
 static FutexWaiter g_futex_waiters[FUTEX_MAX_WAITERS];
+
+// translate a user futex VA to a stable cross-process key: the physical
+// page|offset backing it. two processes that MAP_SHARED the same object see the
+// same word at the same physical address, so keying on phys lets a shared futex
+// wake across address spaces. returns 0 if the page isn't mapped (the caller
+// then falls back to matching on the address_space+uaddr key). (satoru)
+static uint64_t futex_phys_key(Process* task, uintptr_t uaddr) {
+    if (!task) return 0;
+    return KernelVMM::QueryMappingInAddressSpace(task->address_space, uaddr);
+}
 
 // block the current task on (address_space, uaddr) and yield to another ready
 // user task by rewriting the int 0x80 trap frame (same mechanism as waitpid).
@@ -814,6 +827,7 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
     g_futex_waiters[slot].task       = task;
     g_futex_waiters[slot].addr_space = task->address_space;
     g_futex_waiters[slot].uaddr      = uaddr;
+    g_futex_waiters[slot].phys_key   = futex_phys_key(task, uaddr);
     g_futex_waiters[slot].bitset     = bitset ? bitset : 0xFFFFFFFFu;
     g_futex_waiters[slot].active     = true;
 
@@ -833,15 +847,20 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
 // wake up to `max` waiters matching (address_space, uaddr) whose bitset
 // intersects `bitset`. each woken task is made ready and its futex syscall made
 // to return 0. returns the number woken. (satoru)
-static int futex_do_wake(uint64_t addr_space, uintptr_t uaddr, int max,
-                         uint32_t bitset) {
+static int futex_do_wake(uint64_t addr_space, uintptr_t uaddr, uint64_t phys_key,
+                         int max, uint32_t bitset) {
     if (max <= 0) return 0;
     uint32_t want = bitset ? bitset : 0xFFFFFFFFu;
     int woken = 0;
     for (int i = 0; i < FUTEX_MAX_WAITERS && woken < max; i++) {
         FutexWaiter* w = &g_futex_waiters[i];
         if (!w->active) continue;
-        if (w->addr_space != addr_space || w->uaddr != uaddr) continue;
+        // match by EITHER the (address_space,uaddr) key (same-process threads,
+        // the common case) OR the same physical page|offset, so a SHARED-memory
+        // futex can wake a waiter in a different process (e10s ipc). (satoru)
+        bool same_va   = (w->addr_space == addr_space && w->uaddr == uaddr);
+        bool same_phys = (phys_key && w->phys_key && w->phys_key == phys_key);
+        if (!same_va && !same_phys) continue;
         if ((w->bitset & want) == 0) continue;
 
         if (w->task) {
@@ -1720,6 +1739,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     int max = (int)val;
                     if (max < 0) max = 0x7FFFFFFF;
                     return futex_do_wake(task->address_space, (uintptr_t)uaddr,
+                                         futex_phys_key(task, (uintptr_t)uaddr),
                                          max, 0xFFFFFFFFu);
                 }
                 default:
@@ -2865,6 +2885,7 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
                 uint64_t ctid = p->task->clear_child_tid;
                 write_user_u32(p->task, ctid, 0);
                 futex_do_wake(p->task->address_space, (uintptr_t)ctid,
+                              futex_phys_key(p->task, (uintptr_t)ctid),
                               0x7FFFFFFF, 0xFFFFFFFFu);
                 p->task->clear_child_tid = 0;
             }
