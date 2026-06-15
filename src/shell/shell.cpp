@@ -1900,6 +1900,10 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "LD_LIBRARY_PATH=/apps/firefox:/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
         "XDG_RUNTIME_DIR=/system/run/user/1000",
         "WAYLAND_DISPLAY=wayland-0",
+        // point gecko at kurono's in-kernel d-bus (dbus_server binds this path)
+        // so it connects directly instead of fork+exec'ing dbus-launch, which
+        // isn't installed and otherwise stalls startup. (satoru)
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/system/run/user/1000/bus",
         "MOZ_ENABLE_WAYLAND=1", "GDK_BACKEND=wayland",
         "LIBGL_ALWAYS_SOFTWARE=1", "DISPLAY=:0",
         "FONTCONFIG_PATH=/system/fonts",

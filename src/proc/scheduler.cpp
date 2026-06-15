@@ -428,6 +428,12 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
     proc->has_user_frame = parent->has_user_frame;
     proc->next_mmap_base = parent->next_mmap_base;
     memcpy(proc->regions, parent->regions, sizeof(proc->regions));
+    // the forked child IS a copy of the calling thread, so it must inherit that
+    // thread's tls pointer (fs base) and fpu/sse state. without this the child
+    // runs with fs base == 0 and musl's first tls access (%fs:0) reads NULL and
+    // #PFs in set_tid_address/thread setup. (satoru)
+    proc->fs_base = parent->fs_base;
+    for (int b = 0; b < 512; b++) proc->fpu_state[b] = parent->fpu_state[b];
     link_child(parent, proc);
     enqueue_process(proc);
     return proc;
