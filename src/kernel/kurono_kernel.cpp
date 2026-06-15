@@ -2558,6 +2558,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // unit BEFORE KInit::Boot so it is started at its target; the runner spawned
     // after Boot faults it and verifies recovery. (satoru)
     if (boot_kdf_test) KDF::RegisterCrashTestDriver();
+    KDF::RegisterShellCommands(&shell_instance);   // `hwfw` status command (satoru)
     KInit::RegisterShellCommands(&shell_instance);
     KpkgDaemon::RegisterShellCommands(&shell_instance);
     KUpdate::RegisterShellCommands(&shell_instance);

@@ -18,6 +18,9 @@
 //     to unwind a faulting ring-3 process without panicking. (satoru)
 
 #include "kdf.h"
+#include "udf.h"
+#include "irp.h"
+#include "kexec.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "../drivers/serial.h"
@@ -25,6 +28,7 @@
 #include "../proc/smp.h"
 #include "../fs/kvfs.h"
 #include "../system/kpaths.h"
+#include "../shell/shell.h"
 
 namespace KDF {
 
@@ -703,6 +707,27 @@ int Status(char* out, int mx) {
         p = kd_cat(out, p, mx, "\n");
     }
     return p;
+}
+
+// ── shell: `hwfw` prints the whole hybrid-kernel framework status (satoru) ────
+namespace {
+int cmd_hwfw(void* /*sh*/, int /*argc*/, const char** /*argv*/, char* out, int mx) {
+    int p = 0;
+    p += Status(out + p, mx - p);
+    p = kd_cat(out, p, mx, "\n");
+    p += UDF::Status(out + p, mx - p);
+    p = kd_cat(out, p, mx, "\n");
+    p += IRP::Status(out + p, mx - p);
+    p = kd_cat(out, p, mx, "\n");
+    p += KExec::Status(out + p, mx - p);
+    return p;
+}
+}  // namespace
+
+void RegisterShellCommands(void* shell) {
+    (void)shell;
+    Shell::RegisterCommand("hwfw", cmd_hwfw,
+        "show hybrid-kernel driver frameworks (KDF/UDF/IRP/KExec) status");
 }
 
 }  // namespace KDF

@@ -182,6 +182,11 @@ void SetCrashTestPoweroff(bool v);
 // desktop is up so kinit's monitor is ticking. (satoru)
 void RunCrashRecoveryTest();
 
+// ── shell integration (satoru) ────────────────────────────────────────────────
+// register the `hwfw` command (prints KDF + UDF + IRP + KExec status tables). the
+// shell pointer is opaque here to avoid a header dependency. (satoru)
+void RegisterShellCommands(void* shell);
+
 }  // namespace KDF
 
 // end (satoru)
