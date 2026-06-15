@@ -46,6 +46,8 @@
 #include "../system/input_manager.h"
 #include "../system/vconsole.h"
 #include "../system/logging.h"
+#include "../system/kinit.h"          // service + init manager (satoru)
+#include "../system/kpkg_daemon.h"    // background package install daemon (satoru)
 #include "../system/kpaths.h"
 #include "../system/installer.h"
 #include "../system/ui_config.h"
@@ -2458,6 +2460,16 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[Linux] Subsystem fully integrated\r\n");
     RuntimeLog::LogSystem("linux", "subsystem integrated");
 
+    // ── kinit: service + init manager ──────────────────────────────────
+    // register the service model + shell commands now (registration only; no
+    // kernel-processes are spawned until KInit::Boot(), which runs after the
+    // canonical processes are up so its supervisors/monitor join the scheduler).
+    // (satoru)
+    SerialLogger::Log("[kinit] Init...\r\n");
+    KInit::Init();
+    KInit::RegisterShellCommands(&shell_instance);
+    KpkgDaemon::RegisterShellCommands(&shell_instance);
+
     KVFS::Mkdirs("/home/user/Documents");
     KVFS::Mkdirs("/home/user/Downloads");
     KVFS::Mkdirs("/home/user/Desktop");
@@ -2934,6 +2946,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec(spawned);
         SerialLogger::Log("\r\n");
         RuntimeLog::LogBoot("preemptive scheduler engaged");
+        // bring up kinit AFTER the canonical kernel processes: it adopts the
+        // already-running in-kernel services (klog/knet/kdbus/kwayland/kaudio)
+        // as supervised units, sequences the boot targets, and spawns its crash
+        // monitor + the kpkg-daemon worker so they join the scheduler. (satoru)
+        KpkgDaemon::Init();
+        KInit::Boot();
         Scheduler::Start();
         // Unreachable.
     }
