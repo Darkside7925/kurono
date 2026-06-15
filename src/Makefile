@@ -285,6 +285,10 @@ CXX_SRCS = \
     $(SRC)/drivers/intel_gpu.cpp \
     $(SRC)/drivers/e1000.cpp \
     $(SRC)/drivers/wifi_dev.cpp \
+    $(SRC)/drivers/wifi_rtw.cpp \
+    $(SRC)/drivers/wifi_ath.cpp \
+    $(SRC)/drivers/wifi_iwl.cpp \
+    $(SRC)/drivers/wifi_brcm.cpp \
     $(SRC)/drivers/nvme.cpp \
     $(SRC)/drivers/usb.cpp \
     $(SRC)/drivers/hda.cpp \

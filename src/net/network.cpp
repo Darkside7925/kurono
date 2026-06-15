@@ -5,6 +5,10 @@
 #include "../drivers/serial.h"
 #include "../drivers/e1000.h"
 #include "../drivers/wifi_dev.h"    // real wireless nic detection + bar mapping (satoru)
+#include "../drivers/wifi_iwl.h"    // per-vendor radio drivers (phase 2) (satoru)
+#include "../drivers/wifi_ath.h"
+#include "../drivers/wifi_rtw.h"
+#include "../drivers/wifi_brcm.h"
 #include "ieee80211.h"              // the 802.11 software mac (scan/auth/assoc/wpa2) (satoru)
 #include "../hal/hal.h"
 #include "../system/logging.h"
@@ -893,9 +897,17 @@ void WiFi::Init() {
         SerialLogger::Log("WiFi: ");
         SerialLogger::Log(d->model);
         SerialLogger::Log(d->mmio_mapped ? " - mmio mapped, " : " - mmio unmapped, ");
-        SerialLogger::Log(d->needs_firmware
-            ? "needs firmware; 802.11 radio bring-up is the next phase\r\n"
-            : "firmware-free; 802.11 radio bring-up is the next phase\r\n");
+        SerialLogger::Log(d->needs_firmware ? "needs firmware\r\n" : "firmware-free\r\n");
+        // dispatch to the per-vendor radio driver: the first whose chip family
+        // matches the detected nic registers its WifiRadioOps with the 802.11
+        // stack, which then drives it on scan/connect. (satoru)
+        if (WifiIwl::TryRegister()  || WifiAth::TryRegister() ||
+            WifiRtw::TryRegister()  || WifiBrcm::TryRegister()) {
+            SerialLogger::Log("WiFi: radio driver registered; 802.11 stack ready\r\n");
+        } else {
+            SerialLogger::Log("WiFi: no vendor radio claimed the chip "
+                              "(driver needs its firmware blob / real hardware)\r\n");
+        }
     } else if (detected_link == LINK_ETHERNET) {
         SerialLogger::Log("WiFi: No native WiFi radio in current environment (wired link only)\r\n");
     } else {
