@@ -1553,6 +1553,21 @@ void register_test_services() {
         RegisterInkernel("kt-cyc-b", "test: cyclic dep B", KTGT_USER,
                          noop_start, noop_stop, nullptr, "kt-cyc-a", KRESTART_NO, 2000, false);
     }
+
+    // seed on-disk fixtures for the template + user-session + hot-reload checks.
+    // these are process units (Exec=...) whose binaries do not exist, which is
+    // fine: the checks exercise registration / instantiation / the reload diff,
+    // not the (missing) program. written disabled so boot does not try to spawn
+    // them. (satoru)
+    KVFS::Mkdirs("/kurono/system/services");
+    KVFS::WriteString("/kurono/system/services/kt-tmpl@.kservice",
+        "[Service]\nName=kt-tmpl@\nDescription=test template for %i\n"
+        "Exec=/kurono/system/bin/kt-tmpl --instance %i\nEnabled=no\nWantedBy=user.target\n");
+    KVFS::Mkdirs("/kurono/user/home/user/.config/kinit");
+    KVFS::WriteString("/kurono/user/home/user/.config/kinit/kt-usersvc.kservice",
+        "[Service]\nName=kt-usersvc\nDescription=test per-user unit\n"
+        "Exec=/kurono/system/bin/kt-usersvc\nWantedBy=user.target\n");
+
     SerialLogger::Log("[kinit-test] test services registered\r\n");
 }
 
@@ -2175,6 +2190,66 @@ void RunSelfTests() {
         LogEvent("test-cycle", "-", (a_ok && b_ok) ? "both started; no deadlock" : "cycle blocked startup");
         SerialLogger::Log((a_ok && b_ok) ? "[kinit-test] CYCLE  PASS (no deadlock, both up)\r\n"
                                          : "[kinit-test] CYCLE  FAIL\r\n");
+    }
+
+    // (F) templates: reload to pick up the seeded kt-tmpl@ template, then
+    // instantiate kt-tmpl@inst1 and check %i was substituted. (satoru)
+    {
+        Reload();   // registers the seeded kt-tmpl@ template unit (satoru)
+        int ti = find_index("kt-tmpl@");
+        int ii = InstantiateTemplate("kt-tmpl@inst1");
+        bool ok = (ti >= 0 && g_services[ti].is_template && ii >= 0 &&
+                   g_services[ii].is_instance);
+        // verify the %i substitution landed in the instance's Exec. (satoru)
+        bool subst_ok = false;
+        if (ii >= 0) {
+            const char* ex = g_services[ii].exec;
+            for (int k = 0; ex[k]; k++) {
+                if (ex[k]=='i'&&ex[k+1]=='n'&&ex[k+2]=='s'&&ex[k+3]=='t'&&ex[k+4]=='1') { subst_ok = true; break; }
+            }
+        }
+        LogEvent("test-template", "-", (ok && subst_ok) ? "instantiated kt-tmpl@inst1" : "template failed");
+        SerialLogger::Log((ok && subst_ok) ? "[kinit-test] TEMPLATE  PASS (kt-tmpl@inst1, %i substituted)\r\n"
+                                           : "[kinit-test] TEMPLATE  FAIL\r\n");
+    }
+
+    // (G) hot reload: add a new unit file + reload (must appear), then delete it +
+    // reload (must be removed), leaving the rest untouched. (satoru)
+    {
+        const char* addp = "/kurono/system/services/kt-reload-add.kservice";
+        KVFS::WriteString(addp,
+            "[Service]\nName=kt-reload-add\nExec=/kurono/system/bin/kt-reload-add\n"
+            "Enabled=no\nWantedBy=user.target\n");
+        Reload();
+        bool added = (find_index("kt-reload-add") >= 0);
+        // capture an unchanged unit's identity to confirm reload leaves it alone. (satoru)
+        int kp = find_index("kpkg-daemon");
+        KServiceState kp_state = (kp >= 0) ? g_services[kp].state : KSVC_INACTIVE;
+        KVFS::Unlink(addp);
+        Reload();
+        bool removed = (find_index("kt-reload-add") < 0);
+        int kp2 = find_index("kpkg-daemon");
+        bool untouched = (kp2 >= 0 && g_services[kp2].state == kp_state);
+        LogEvent("test-reload", "-", (added && removed && untouched) ? "add+remove+untouched ok" : "reload diff failed");
+        SerialLogger::Log((added && removed && untouched) ? "[kinit-test] RELOAD  PASS (added, removed, others untouched)\r\n"
+                                                          : "[kinit-test] RELOAD  FAIL\r\n");
+    }
+
+    // (H) user session: start the seeded per-user unit on login, stop on logout.
+    // (satoru)
+    {
+        int started = StartUserSession("user");
+        bool reg = (find_index("user:kt-usersvc") >= 0);
+        int stopped = StopUserSession("user");
+        bool gone = (find_index("user:kt-usersvc") < 0);
+        char d[64];
+        int q = 0;
+        q = ki_cat(d, q, (int)sizeof(d), "started="); q = ki_cat_u(d, q, (int)sizeof(d), (uint32_t)started);
+        q = ki_cat(d, q, (int)sizeof(d), " stopped="); q = ki_cat_u(d, q, (int)sizeof(d), (uint32_t)stopped);
+        LogEvent("test-usersession", "-", d);
+        SerialLogger::Log("[kinit-test] USERSESSION "); SerialLogger::Log(d);
+        SerialLogger::Log((reg && gone && started >= 1 && stopped >= 1) ? "  PASS (registered on login, removed on logout)\r\n"
+                                                                        : "  FAIL\r\n");
     }
 
     SerialLogger::Log("[kinit-test] ===== kinit self-tests end =====\r\n");
