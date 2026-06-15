@@ -1,11 +1,11 @@
-# KDF  -  Kernel Driver Framework
+# KDF, Kernel Driver Framework
 
 Kurono's answer to Windows KMDF: the **ring-0+** tier of a Windows-NT-style hybrid
 kernel. The performance-critical core (VMM, PMM, scheduler, compositor, the NVMe
 data path, the TCP stack) stays in plain ring 0. A KMDF-equivalent *kernel driver*
 also runs in ring 0 (same privilege, same CR3), but every DMA buffer and MMIO
 window it obtains through KDF is fenced by **unmapped guard pages**, so the common
-driver bug  -  running off the end of a ring / descriptor / DMA buffer  -  is caught
+driver bug, running off the end of a ring / descriptor / DMA buffer, is caught
 and isolated instead of silently corrupting an adjacent kernel allocation or
 panicking the whole OS.
 
@@ -80,12 +80,12 @@ KInit::RegisterKdfDriver("mydrv", &MyDriver::Init, KInit::KTGT_KERNEL,
 
 ## Migrated drivers
 
-- **NVMe** (`src/drivers/nvme.cpp`)  -  first migration. The admin SQ/CQ, the identify
+- **NVMe** (`src/drivers/nvme.cpp`), first migration. The admin SQ/CQ, the identify
   scratch, and the per-core I/O SQ/CQ pairs are `KDF::AllocDMA` (guard-fenced); the
   controller is programmed with `KDF::PhysOf` of each. BAR0 is `KDF::MapMMIO`. The
   hot Read/Write path is unchanged (data buffers are ordinary identity-mapped
   kernel memory, the queues are set up once), so steady-state throughput is
-  unaffected  -  measured **879 MB/s seq write, 1082 MB/s seq read, 35.5k 4K IOPS**
+  unaffected, measured **879 MB/s seq write, 1082 MB/s seq read, 35.5k 4K IOPS**
   under KDF, with `verify=OK`.
 
 ## The `kurono.kdf.test` gate
@@ -93,11 +93,11 @@ KInit::RegisterKdfDriver("mydrv", &MyDriver::Init, KInit::KTGT_KERNEL,
 Boot with `kurono.kdf.test` (add `kurono.kdf.poweroff=1` for a bounded CI run) to
 run three headless crash-recovery scenarios (`src/kernel/kdf_test.cpp`):
 
-- **A. sandbox unwind**  -  a guarded op writes one byte past its `AllocDMA` buffer
+- **A. sandbox unwind**, a guarded op writes one byte past its `AllocDMA` buffer
   into the trailing guard page; the kernel survives, the op returns failure, the
   region is quarantined.
-- **B. in-bounds still works**  -  a normal in-bounds op completes after recovery.
-- **C. kinit restart**  -  the reported crash drives kinit's backoff restart; the
+- **B. in-bounds still works**, a normal in-bounds op completes after recovery.
+- **C. kinit restart**, the reported crash drives kinit's backoff restart; the
   driver re-inits and its unit returns to RUNNING.
 
 Verified result on `-smp 4` with an NVMe data disk: `KDF-SELFTEST: 3/3 OVERALL
@@ -109,7 +109,7 @@ after the fault.
 
 - KDF isolation is **VMM guard pages, NOT full address-space separation.** A KDF
   driver shares the kernel page tables; a wild write to an arbitrary *in-range*
-  kernel address is not caught  -  only the fenced guard pages around its own
+  kernel address is not caught, only the fenced guard pages around its own
   DMA/MMIO are. It catches the common real bug (buffer overrun) and keeps the OS
   alive. For full isolation, a driver belongs in **UDF** (ring 3, see UDF.md).
 - A driver restart means a **brief window of hardware unavailability** while it
