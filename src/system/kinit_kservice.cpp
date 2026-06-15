@@ -62,6 +62,30 @@ uint32_t ks_atou(const char* s) {
     return v;
 }
 
+// parse a memory size into kib. accepts a bare number (bytes) or a K/M/G suffix
+// (case-insensitive, optional trailing 'B'): "64M" -> 65536 kib, "512K" -> 512,
+// "1G" -> 1048576. a bare "65536" is treated as bytes (-> 64 kib). (satoru)
+uint32_t ks_atomem_kb(const char* s) {
+    while (*s == ' ' || *s == '\t') s++;
+    uint64_t v = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (uint64_t)(*s - '0'); s++; }
+    char suf = *s;
+    if (suf >= 'a' && suf <= 'z') suf = (char)(suf - 'a' + 'A');
+    uint64_t kb;
+    if (suf == 'G')      kb = v * 1024ULL * 1024ULL;
+    else if (suf == 'M') kb = v * 1024ULL;
+    else if (suf == 'K') kb = v;
+    else                 kb = (v + 1023ULL) / 1024ULL;   // bare = bytes (satoru)
+    if (kb > 0xFFFFFFFFULL) kb = 0xFFFFFFFFULL;
+    return (uint32_t)kb;
+}
+
+// parse a CPUQuota value to a percent: "50%" -> 50, "200%" -> 200, "50" -> 50.
+// (satoru)
+uint32_t ks_atopct(const char* s) {
+    return ks_atou(s);   // the trailing '%' is ignored by ks_atou (satoru)
+}
+
 KTarget target_from_wantedby(const char* v) {
     // accept "<stage>.target" or a bare "<stage>". (satoru)
     if (ks_ieq(v, "kernel.target")  || ks_ieq(v, "kernel"))  return KTGT_KERNEL;
@@ -94,14 +118,16 @@ bool ParseKService(const char* text, int len, KService* out) {
     // zero the struct, then set sane defaults. (satoru)
     for (int i = 0; i < (int)sizeof(KService); i++) ((char*)out)[i] = 0;
     out->kind = KUNIT_PROCESS;       // .kservice files describe real processes (satoru)
+    out->type = KTYPE_SIMPLE;
     out->target = KTGT_USER;
     out->restart = KRESTART_NO;
     out->restart_delay_ms = 2000;
     out->enabled = true;
     out->state = KSVC_INACTIVE;
+    out->listen_sd = -1;             // sentinel: no socket (satoru)
 
     bool have_name = false;
-    int section = 0;   // 0=none, 1=[Service], 2=[Capabilities] (satoru)
+    int section = 0;   // 0=none, 1=[Service], 2=[Capabilities], 3=[Limits] (satoru)
 
     int i = 0;
     while (i < len) {
@@ -126,6 +152,7 @@ bool ParseKService(const char* text, int len, KService* out) {
             sec[n] = 0;
             if (ks_ieq(sec, "Service"))           section = 1;
             else if (ks_ieq(sec, "Capabilities")) section = 2;
+            else if (ks_ieq(sec, "Limits"))       section = 3;
             else                                  section = 0;
             continue;
         }
@@ -157,17 +184,44 @@ bool ParseKService(const char* text, int len, KService* out) {
             else if (ks_ieq(key, "Critical"))     out->critical = ks_truthy(val);
             else if (ks_ieq(key, "Enabled"))      out->enabled = ks_truthy(val);
             else if (ks_ieq(key, "Type")) {
-                // optional: "oneshot" marks a run-once unit. (satoru)
-                if (ks_ieq(val, "oneshot")) out->kind = KUNIT_ONESHOT;
+                // "oneshot" marks a run-once unit; "notify" defers "started" until
+                // sd_notify READY=1; everything else is a simple daemon. (satoru)
+                if (ks_ieq(val, "oneshot"))     out->kind = KUNIT_ONESHOT;
+                else if (ks_ieq(val, "notify")) out->type = KTYPE_NOTIFY;
             }
+            // resource limits may appear directly in [Service] (systemd style) or
+            // in a dedicated [Limits] section; accept both. (satoru)
+            else if (ks_ieq(key, "MemoryMax"))   out->limits.memory_max_kb = ks_atomem_kb(val);
+            else if (ks_ieq(key, "CPUQuota"))    out->limits.cpu_quota_pct = ks_atopct(val);
+            else if (ks_ieq(key, "LimitNOFILE")) out->limits.limit_nofile  = ks_atou(val);
+            // socket activation: only start on first connect to this AF_UNIX path. (satoru)
+            else if (ks_ieq(key, "ListenStream")) ks_cpy(out->listen_path, val, sizeof(out->listen_path));
+            // watchdog: missing WATCHDOG=1 within this many seconds -> kill+restart. (satoru)
+            else if (ks_ieq(key, "WatchdogSec"))  out->watchdog_sec = ks_atou(val);
+            // conservative true isolation opt-in (only honoured for safe units). (satoru)
+            else if (ks_ieq(key, "Isolate"))      out->isolate = ks_truthy(val);
+            // per-user session unit owner (also set from the per-user dir scan). (satoru)
+            else if (ks_ieq(key, "User"))         ks_cpy(out->owner_user, val, sizeof(out->owner_user));
         } else if (section == 2) {
             if (ks_ieq(key, "Network"))         out->caps.network = ks_truthy(val);
             else if (ks_ieq(key, "Filesystem")) out->caps.filesystem = ks_truthy(val);
             else if (ks_ieq(key, "GUI"))        out->caps.gui = ks_truthy(val);
+        } else if (section == 3) {
+            if (ks_ieq(key, "MemoryMax"))        out->limits.memory_max_kb = ks_atomem_kb(val);
+            else if (ks_ieq(key, "CPUQuota"))    out->limits.cpu_quota_pct = ks_atopct(val);
+            else if (ks_ieq(key, "LimitNOFILE")) out->limits.limit_nofile  = ks_atou(val);
         }
     }
 
-    return have_name && out->name[0] != 0;
+    if (!(have_name && out->name[0] != 0)) return false;
+
+    // a unit whose name ends in '@' is a TEMPLATE: it is never started directly,
+    // only instantiated as "name@instance". record it so the loader marks it. the
+    // trailing '@' is kept in the stored name so InstantiateTemplate can find it.
+    // (satoru)
+    int nl = ks_len(out->name);
+    if (nl > 0 && out->name[nl - 1] == '@') out->is_template = true;
+    return true;
 }
 
 int LoadServiceDir() {
@@ -206,25 +260,15 @@ int LoadServiceDir() {
         KService svc;
         if (!ParseKService(buf, got, &svc)) continue;
 
-        // register through the public api so dedup + the live-state reset are
-        // shared with the built-ins. (satoru)
-        int idx;
-        if (svc.kind == KUNIT_ONESHOT)
-            idx = RegisterProcess(svc.name, svc.description, svc.target, svc.exec,
-                                  svc.after, svc.restart, svc.restart_delay_ms,
-                                  svc.caps, svc.critical);
-        else
-            idx = RegisterProcess(svc.name, svc.description, svc.target, svc.exec,
-                                  svc.after, svc.restart, svc.restart_delay_ms,
-                                  svc.caps, svc.critical);
+        // register the whole parsed struct so every key (limits, sockets, notify,
+        // watchdog, template/isolate flags) is preserved; dedup + live-state reset
+        // live in RegisterService. (satoru)
+        int idx = RegisterService(&svc);
         if (idx >= 0) {
-            // preserve the oneshot kind + enabled flag the parser computed. (satoru)
-            KService* reg = &GetServices()[idx];
-            reg->kind = svc.kind;
-            reg->enabled = svc.enabled;
             registered++;
             SerialLogger::Log("[kinit] loaded .kservice: ");
             SerialLogger::Log(svc.name);
+            if (svc.is_template) SerialLogger::Log(" (template)");
             SerialLogger::Log("\r\n");
         }
     }
