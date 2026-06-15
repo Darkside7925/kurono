@@ -1,4 +1,5 @@
 #include "dbus_server.h"
+#include "systemd_compat.h"   // org.freedesktop.systemd1 / .login1 bridge (satoru)
 #include "../net/unix_socket.h"
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
@@ -39,6 +40,12 @@ inline void put_le32(uint8_t* p, uint32_t v) {
 bool str_eq(const char* a, const char* b) {
     while (*a && *b && *a == *b) { a++; b++; }
     return *a == *b;
+}
+// does `s` start with `prefix`? used to route Properties calls on a systemd1
+// unit object path to the systemd-compat bridge. (satoru)
+bool str_eq_prefix(const char* s, const char* prefix) {
+    while (*prefix) { if (*s != *prefix) return false; s++; prefix++; }
+    return true;
 }
 int str_len(const char* s) { int n = 0; while (s[n]) n++; return n; }
 void str_cpy(char* d, const char* s, int max) {
@@ -137,9 +144,13 @@ int put_header_field(uint8_t* p, int cap, uint8_t field_code, char sig,
     return s;
 }
 
-void send_method_return(Client* c, uint32_t reply_serial, const char* body_sig,
-                        const uint8_t* body, int body_len) {
-    uint8_t buf[1024];
+// marshal a method_return into a caller-supplied scratch buffer (cap bytes) and
+// inject it to the client. split out from send_method_return so a large reply
+// (e.g. the systemd1 ListUnits array) can pass a bigger buffer than the default
+// 1 KB stack one. every write stays bounded against cap. (satoru)
+void send_method_return_buf(Client* c, uint32_t reply_serial, const char* body_sig,
+                            const uint8_t* body, int body_len,
+                            uint8_t* buf, int cap) {
     int p = 0;
     buf[p++] = 'l';            // little endian
     buf[p++] = 2;              // method_return
@@ -153,9 +164,8 @@ void send_method_return(Client* c, uint32_t reply_serial, const char* body_sig,
     put_le32(buf + p, 0); p += 4;
     int fields_start = p;
 
-    // every pad_to/put_header_field below is bounded against sizeof(buf) so a
-    // client-controlled name length can't overflow the stack buffer. (satoru)
-    const int cap = (int)sizeof(buf);
+    // every pad_to/put_header_field below is bounded against cap so a
+    // client-controlled name length can't overflow the buffer. (satoru)
     // REPLY_SERIAL (5) u32
     p = pad_to(p, 8);
     if (p <= cap) p += put_header_field(buf + p, cap - p, 5, 'u', &reply_serial, 0);
@@ -182,6 +192,13 @@ void send_method_return(Client* c, uint32_t reply_serial, const char* body_sig,
     for (int i = 0; i < body_len && p < cap; i++) buf[p++] = body[i];
 
     UnixSocket::KernelInject(c->sd, buf, p);
+}
+
+void send_method_return(Client* c, uint32_t reply_serial, const char* body_sig,
+                        const uint8_t* body, int body_len) {
+    uint8_t buf[1024];
+    send_method_return_buf(c, reply_serial, body_sig, body, body_len,
+                           buf, (int)sizeof(buf));
 }
 
 // Tiny string-builder body for "s" signature.
@@ -347,8 +364,37 @@ void handle_message(Client* c, const uint8_t* msg, int len) {
         uint8_t body[8]; put_le32(body, notif_id++);
         send_method_return(c, pm.serial, "u", body, 4);
     } else {
-        // Generic empty success reply for everything else.
-        send_method_return(c, pm.serial, "", nullptr, 0);
+        // org.freedesktop.systemd1 / .login1: hand off to the systemd-compat
+        // bridge, which answers ListUnits/GetUnit/StartUnit/StopUnit/RestartUnit
+        // + unit properties (ActiveState/SubState/LoadState) from kinit's live
+        // state. it returns the marshalled reply body + signature, or -1 if it
+        // does not handle the method (then we fall back to a generic empty
+        // success reply, preserving the old behaviour for every other interface).
+        // Properties.Get/GetAll on a systemd1 unit object path is also routed
+        // here (the unit identity lives in the object path, not the iface).
+        // (satoru)
+        bool is_systemd = str_eq(pm.iface, "org.freedesktop.systemd1.Manager") ||
+                          str_eq(pm.iface, "org.freedesktop.login1.Manager") ||
+                          str_eq(pm.iface, "org.freedesktop.systemd1.Unit") ||
+                          ((str_eq(pm.iface, "org.freedesktop.DBus.Properties")) &&
+                           pm.path[0] && str_eq_prefix(pm.path, "/org/freedesktop/systemd1"));
+        int handled = -1;
+        if (is_systemd) {
+            static uint8_t sd_body[8192];   // large enough for a full ListUnits (satoru)
+            const char* sig = "";
+            handled = SystemdCompat::DBusDispatch(pm.iface, pm.member, pm.path,
+                                                  msg, len, pm.body_off,
+                                                  sd_body, (int)sizeof(sd_body), &sig);
+            if (handled >= 0) {
+                static uint8_t sd_out[9216];   // reply scratch: body + header (satoru)
+                send_method_return_buf(c, pm.serial, sig, sd_body, handled,
+                                       sd_out, (int)sizeof(sd_out));
+            }
+        }
+        if (handled < 0) {
+            // Generic empty success reply for everything else.
+            send_method_return(c, pm.serial, "", nullptr, 0);
+        }
     }
 }
 

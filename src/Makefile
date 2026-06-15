@@ -246,6 +246,7 @@ CXX_SRCS = \
 	$(SRC)/system/logging.cpp \
 	$(SRC)/system/kinit.cpp \
 	$(SRC)/system/kinit_kservice.cpp \
+	$(SRC)/system/systemd_compat.cpp \
 	$(SRC)/system/kpkg_daemon.cpp \
 	$(SRC)/system/kdaemons.cpp \
 	$(SRC)/system/installer.cpp \
