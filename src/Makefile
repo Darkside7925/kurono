@@ -168,6 +168,7 @@ CXX_SRCS = \
     $(SRC)/kernel/slab.cpp \
     $(SRC)/kernel/vmm.cpp \
     $(SRC)/kernel/kdf.cpp \
+    $(SRC)/kernel/kdf_test.cpp \
 	$(SRC)/kernel/userspace.cpp \
 	$(SRC)/kernel/elf_loader.cpp \
     $(SRC)/kernel/time.cpp \
@@ -363,6 +364,10 @@ KURONO_GRUB_TIMEOUT ?= 10
 KURONO_CLI_RUN ?=
 KURONO_CLI_POWEROFF ?= 0
 KURONO_GUI_RUN ?=
+# extra tokens appended to the main (Multiboot2 desktop) grub cmdline. used for
+# headless self-test gates, e.g. KURONO_EXTRA_CMDLINE='kurono.kdf.test kurono.kdf.poweroff=1'.
+# (satoru)
+KURONO_EXTRA_CMDLINE ?=
 # autologin: bypass the lockscreen and boot straight to the desktop. on by
 # default so `make iso` / start.ps1 produce a desktop-booting image -- the
 # lockscreen's blocking Show() loop otherwise stalls headless/vm boots.
@@ -774,7 +779,7 @@ iso: all efi
 	@echo 'menuentry "Kurono OS (Multiboot2)" {'                       >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono OS kernel (multiboot2)..."'         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",)' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",) $(KURONO_EXTRA_CMDLINE)' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded OK. Booting..."'                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg

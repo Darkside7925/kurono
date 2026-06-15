@@ -890,6 +890,17 @@ static volatile bool g_kinit_test_poweroff = false;
     for (;;) Scheduler::SleepMs(60000);
 }
 
+// kdf crash-recovery self-test runner kernel-process (kurono.kdf.test). spawned
+// after the desktop is up; deliberately faults a kdf driver + verifies the
+// kernel survives + the driver restarts, logs PASS/FAIL, optionally powers off.
+// (satoru)
+[[noreturn]] static void kdf_selftest_entry() {
+    // let the desktop + kinit settle so the crash monitor is ticking. (satoru)
+    Scheduler::SleepMs(3000);
+    KDF::RunCrashRecoveryTest();
+    for (;;) Scheduler::SleepMs(60000);
+}
+
 extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Init();
     SerialLogger::Log("Kurono OS Starting...\r\n");
@@ -1027,6 +1038,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // ci). (satoru)
     bool boot_kinit_test = false;
     bool boot_kinit_poweroff = false;
+    // kdf crash-recovery self-test gate (kurono.kdf.test) + poweroff-after. (satoru)
+    bool boot_kdf_test = false;
+    bool boot_kdf_poweroff = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     // setup mode: run the graphical installer / first-setup wizard instead of
@@ -1103,6 +1117,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
         if (boot_has_token(boot_cmdline, "kurono.kinit.poweroff=1") || boot_has_token(boot_cmdline, "kurono.kinit.poweroff")) {
             boot_kinit_poweroff = true;
+        }
+        // latch the kdf crash-recovery self-test gate + optional poweroff-after. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kdf.test=1") || boot_has_token(boot_cmdline, "kurono.kdf.test")) {
+            boot_kdf_test = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kdf.poweroff=1") || boot_has_token(boot_cmdline, "kurono.kdf.poweroff")) {
+            boot_kdf_poweroff = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -2516,6 +2537,16 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // looks up the matching kdf-driver service and runs its restart/backoff
     // policy (which re-inits the driver via kdf). (satoru)
     KDF::SetCrashNotifier(KInit::NotifyDriverCrash);
+    // adopt the kdf-migrated drivers as supervised kinit units so a guard-page
+    // crash drives a restart. nvme was already inited during the data-disk mount,
+    // so it is adopted as already-running (kinit won't re-init it; only a crash
+    // restarts it). it sits at the kernel target (storage is foundational). (satoru)
+    KInit::RegisterKdfDriver("nvme", &NVMe::KdfInit, KInit::KTGT_KERNEL,
+                             /*critical=*/false, /*already_running=*/NVMe::IsDetected());
+    // register the kdf crash-recovery test driver (kurono.kdf.test) as a kinit
+    // unit BEFORE KInit::Boot so it is started at its target; the runner spawned
+    // after Boot faults it and verifies recovery. (satoru)
+    if (boot_kdf_test) KDF::RegisterCrashTestDriver();
     KInit::RegisterShellCommands(&shell_instance);
     KpkgDaemon::RegisterShellCommands(&shell_instance);
     KUpdate::RegisterShellCommands(&shell_instance);
@@ -3017,6 +3048,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_kinit_test) {
             g_kinit_test_poweroff = boot_kinit_poweroff;
             Scheduler::SpawnKernelProcess("kinit-selftest", kinit_selftest_entry, PRIO_LOW, 64, 16 * 1024);
+        }
+        // headless kdf crash-recovery self-test: spawn the runner off the gui loop.
+        // the test driver was registered before KInit::Boot (so it is a known unit
+        // started at the user target); the runner faults it + checks recovery. a
+        // bigger kernel stack since RunGuarded + the fault unwind run on it. (satoru)
+        if (boot_kdf_test) {
+            KDF::SetCrashTestPoweroff(boot_kdf_poweroff);
+            Scheduler::SpawnKernelProcess("kdf-selftest", kdf_selftest_entry, PRIO_LOW, 64, 32 * 1024);
         }
         Scheduler::Start();
         // Unreachable.
