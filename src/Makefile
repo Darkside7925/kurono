@@ -244,6 +244,9 @@ CXX_SRCS = \
     $(SRC)/system/screenshot.cpp \
 	$(SRC)/system/conduit.cpp \
 	$(SRC)/system/logging.cpp \
+	$(SRC)/system/kinit.cpp \
+	$(SRC)/system/kinit_kservice.cpp \
+	$(SRC)/system/kpkg_daemon.cpp \
 	$(SRC)/system/installer.cpp \
 	$(SRC)/system/installer_gui.cpp \
 	$(SRC)/system/gpu_driver_installer.cpp \
