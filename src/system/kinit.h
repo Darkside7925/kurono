@@ -258,6 +258,14 @@ int Analyze(char* out, int mx);
 // total boot critical-path time in ms (last service ready - boot start). (satoru)
 uint32_t BootElapsedMs();
 
+// ── runtime capability sandboxing (satoru) ───────────────────────────────────
+// enforce a service's [Capabilities] at RUNTIME (not only at spawn) via SUPR:
+// returns true if the calling service is permitted the requested capability now.
+// an in-kernel service calls this before a privileged operation; a denied call is
+// audited. CAP_* select the capability. (satoru)
+enum KCapBit : uint32_t { KCAP_NETWORK = 1u<<0, KCAP_FILESYSTEM = 1u<<1, KCAP_GUI = 1u<<2 };
+bool CheckCapability(const char* service, uint32_t cap);
+
 // ── headless test harness (satoru) ───────────────────────────────────────────
 // enable the bounded self-test services (gated by the kurono.kinit.test boot
 // token). called from kernel_main BEFORE Init() so register_test_services adds
@@ -269,6 +277,7 @@ enum KTestBits : uint32_t {
     KTEST_SOCKET    = 1u << 2,   // a socket-activated unit (satoru)
     KTEST_PARALLEL  = 1u << 3,   // slow units used to measure parallel vs sequential (satoru)
     KTEST_CYCLE     = 1u << 4,   // a circular After= pair (satoru)
+    KTEST_SANDBOX   = 1u << 6,   // a runtime-capability sandbox test service (satoru)
     KTEST_ALL       = 0xFFFFFFFFu
 };
 void EnableTestServices(uint32_t bits);
