@@ -604,6 +604,7 @@ static bool phttp_get(const char* host, const char* path,
         bool header_logged = false;
         uint32_t read_start_ms = Timer::GetTicks();
         uint32_t last_progress_ms = read_start_ms;
+        uint32_t last_pump_ms = read_start_ms;
         bool recv_aborted = false;
         int prog_emit_anchor = 0;
         while (total < PKG_HTTP_BUFFER_MAX &&
@@ -614,7 +615,12 @@ static bool phttp_get(const char* host, const char* path,
                 break;
             }
             TCPStack::Tick();
-            KuronoShell::PumpUI();
+            // pump ui at ~10 fps, not per recv iteration: a per-chunk full-screen
+            // repaint throttled downloads to the ui frame rate. (satoru)
+            if ((uint32_t)(Timer::GetTicks() - last_pump_ms) >= 100u) {
+                KuronoShell::PumpUI();
+                last_pump_ms = Timer::GetTicks();
+            }
             int got = TCPStack::Recv(sock, response + total, PKG_HTTP_BUFFER_MAX - total);
             if (got < 0) {
                 pset_sync_message("TCP receive failed while reading repository data.");
@@ -624,7 +630,10 @@ static bool phttp_get(const char* host, const char* path,
                 if (TCPStack::IsPeerClosed(sock)) {
                     break;
                 }
-                KuronoShell::PumpUI();
+                if ((uint32_t)(Timer::GetTicks() - last_pump_ms) >= 100u) {
+                    KuronoShell::PumpUI();
+                    last_pump_ms = Timer::GetTicks();
+                }
                 /* ~1ms throttle: PIT-polled wait so this loop doesn't
                    call Tick/PumpUI thousands of times per ms while waiting
                    for the next chunk. */
@@ -1437,6 +1446,7 @@ static bool ff_stream_install() {
 
     bool ok = false;
     uint32_t last_progress_ms = Timer::GetTicks();
+    uint32_t last_pump_ms = Timer::GetTicks();
     int total_body = 0;
     int last_logged_mb = -1;
 
@@ -1446,7 +1456,14 @@ static bool ff_stream_install() {
             break;
         }
         TCPStack::Tick();
-        KuronoShell::PumpUI();
+        // pump the ui at most ~10 fps, NOT every recv iteration: a full-screen
+        // software repaint per 64 kb chunk throttled the download to the desktop
+        // frame rate (~0.5 mb/s regardless of link speed). gating it lets recv
+        // run at network/extract speed while the progress ui still updates. (satoru)
+        if ((uint32_t)(Timer::GetTicks() - last_pump_ms) >= 100u) {
+            KuronoShell::PumpUI();
+            last_pump_ms = Timer::GetTicks();
+        }
         // byte-progress to serial so a headless run shows download liveness.
         // (satoru)
         int cur_mb = total_body / (1024 * 1024);

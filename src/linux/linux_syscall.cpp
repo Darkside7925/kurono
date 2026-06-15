@@ -4,6 +4,7 @@
 #include "linux_syscall.h"
 #include "ext4.h"
 #include "kls.h"
+#include "ld_kurono.h"          // ExecPIE for x86_64 dynamic execve (firefox content procs) (satoru)
 #include "../fs/kvfs.h"
 #include "../hal/hal.h"
 #include "../kernel/heap.h"
@@ -319,6 +320,60 @@ static bool read_user_u32(Process* proc, uint64_t user_addr, uint32_t* out) {
 
     *out = *(const uint32_t*)(uintptr_t)phys;
     return true;
+}
+
+// read a 64-bit user word as two page-checked u32 halves. (satoru)
+static bool read_user_u64(Process* proc, uint64_t addr, uint64_t* out) {
+    uint32_t lo, hi;
+    if (!read_user_u32(proc, addr, &lo)) return false;
+    if (!read_user_u32(proc, addr + 4, &hi)) return false;
+    *out = ((uint64_t)hi << 32) | lo;
+    return true;
+}
+
+// copy a NUL-terminated user string into kbuf (bounded). returns length, or -1
+// if a page in the string isn't mapped. walks page-by-page via the process
+// page tables (low phys is identity-mapped, so phys == kernel ptr). (satoru)
+static int read_user_str(Process* proc, uint64_t addr, char* kbuf, int max) {
+    if (!proc || !addr || !kbuf || max <= 0) return -1;
+    uint64_t cur_page = ~0ULL, cur_phys = 0;
+    int i = 0;
+    for (; i < max - 1; i++) {
+        uint64_t a  = addr + (uint64_t)i;
+        uint64_t pg = a & ~0xFFFULL;
+        if (pg != cur_page) {
+            cur_phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, pg);
+            if (!cur_phys) return -1;
+            cur_page = pg;
+        }
+        char c = *(const char*)(uintptr_t)((cur_phys & ~0xFFFULL) + (a & 0xFFFULL));
+        kbuf[i] = c;
+        if (!c) return i;
+    }
+    kbuf[i] = 0;
+    return i;
+}
+
+// copy a user argv/envp vector (NULL-terminated array of user char* pointers)
+// into kernel storage; fills out[] with kernel string pointers (NULL-terminated)
+// and returns the entry count. used by the x86_64 dynamic execve path. (satoru)
+static int copy_user_strv(Process* proc, uint64_t arr_addr, char* storage,
+                          int storage_sz, const char** out, int max_entries) {
+    int n = 0, used = 0;
+    if (arr_addr) {
+        for (; n < max_entries; n++) {
+            uint64_t p = 0;
+            if (!read_user_u64(proc, arr_addr + (uint64_t)n * 8, &p)) break;
+            if (!p) break;                       // NULL terminator (satoru)
+            if (used >= storage_sz - 1) break;
+            int len = read_user_str(proc, p, storage + used, storage_sz - used);
+            if (len < 0) break;
+            out[n] = storage + used;
+            used += len + 1;
+        }
+    }
+    out[n] = nullptr;
+    return n;
 }
 
 static UserMemoryRegion* find_region(Process* proc, uint64_t addr) {
@@ -2999,6 +3054,81 @@ int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uintptr_t status, uint32_t optio
     return 0;
 }
 
+// x86_64 dynamic execve: load `resolved` (an elf64 dynamic PIE, e.g. firefox
+// re-execing /proc/self/exe for a content process) via ld-kurono ExecPIE into a
+// FRESH address space for the calling task, copying argv/envp out of the caller's
+// still-active old AS first, then rewrite the syscall frame to the new entry.
+// mirrors the i386 static path but for elf64 dynamic binaries. (satoru)
+static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_t envp_u,
+                                LinuxProcess* proc, Process* task) {
+    int fsz = KVFS::GetFileSize(resolved);
+    if (fsz <= 0) return -2;
+    uint8_t* image = (uint8_t*)KernelHeap::Alloc((uint32_t)fsz);
+    if (!image) return -12;
+    if (KVFS::ReadFile(resolved, image, (uint32_t)fsz) != fsz) { KernelHeap::Free(image); return -2; }
+
+    // copy argv/envp out of the caller's address space (still active here). (satoru)
+    char* abuf = (char*)KernelHeap::Alloc(16384);
+    char* ebuf = (char*)KernelHeap::Alloc(16384);
+    const char** av = (const char**)KernelHeap::Alloc(128 * sizeof(char*));
+    const char** ev = (const char**)KernelHeap::Alloc(256 * sizeof(char*));
+    if (!abuf || !ebuf || !av || !ev) {
+        KernelHeap::Free(image);
+        if (abuf) KernelHeap::Free(abuf);
+        if (ebuf) KernelHeap::Free(ebuf);
+        if (av) KernelHeap::Free((void*)av);
+        if (ev) KernelHeap::Free((void*)ev);
+        return -12;
+    }
+    copy_user_strv(task, (uint64_t)argv_u, abuf, 16384, av, 127);
+    copy_user_strv(task, (uint64_t)envp_u, ebuf, 16384, ev, 255);
+
+    uint64_t old_as = task->address_space;
+    uint64_t new_as = KernelVMM::CreateAddressSpace();
+    if (!new_as) {
+        KernelHeap::Free(image); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
+        KernelHeap::Free((void*)av); KernelHeap::Free((void*)ev);
+        return -12;
+    }
+    task->address_space = new_as;
+    memset(task->regions, 0, sizeof(task->regions));
+    task->next_mmap_base = USER_MMAP_BASE;
+
+    uint64_t entry = 0, rsp = 0;
+    bool ok = LdKurono::ExecPIE(task, image, (uint64_t)fsz, resolved, av, ev,
+                                proc->uid, proc->gid, &entry, &rsp);
+    KernelHeap::Free(image); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
+    KernelHeap::Free((void*)av); KernelHeap::Free((void*)ev);
+    if (!ok) {
+        SerialLogger::Log("execve: ld-kurono failed to load dynamic image\r\n");
+        task->address_space = old_as;                 // keep the caller's AS live
+        KernelVMM::DestroyAddressSpace(new_as);
+        return -8;
+    }
+
+    KernelVMM::ActivateAddressSpace(new_as);
+    HAL::SetKernelStack(task->kernel_stack_top);
+    KernelVMM::DestroyAddressSpace(old_as);
+
+    ls_scpy(task->exe_path, resolved, sizeof(task->exe_path));
+    ls_scpy(proc->name, resolved, sizeof(proc->name));
+
+    current_syscall_frame->rip = entry;
+    current_syscall_frame->rsp = rsp;
+    current_syscall_frame->rbp = 0;
+    current_syscall_frame->rax = 0; current_syscall_frame->rbx = 0;
+    current_syscall_frame->rcx = 0; current_syscall_frame->rdx = 0;
+    current_syscall_frame->rsi = 0; current_syscall_frame->rdi = 0;
+    current_syscall_frame->r8  = 0; current_syscall_frame->r9  = 0;
+    current_syscall_frame->r10 = 0; current_syscall_frame->r11 = 0;
+    current_syscall_frame->r12 = 0; current_syscall_frame->r13 = 0;
+    current_syscall_frame->r14 = 0; current_syscall_frame->r15 = 0;
+    current_syscall_frame->rflags = 0x202ULL;
+    Scheduler::SaveUserFrame(task, current_syscall_frame);
+    current_frame_rewritten = true;
+    return 0;
+}
+
 int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t envp) {
     (void)envp;
 
@@ -3009,6 +3139,18 @@ int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t e
     const char* path = (const char*)(uintptr_t)filename;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), proc);
+
+    // x86_64 dynamic ELF (firefox re-execs /proc/self/exe for content procs):
+    // route through ld-kurono ExecPIE. is_valid_exec_elf below only accepts i386
+    // static ELFs, so an elf64 execve would otherwise be rejected. (satoru)
+    {
+        uint8_t eh[5] = {0,0,0,0,0};
+        int en = KVFS::ReadFile(resolved, eh, 5);
+        if (en < 5 && Ext4::IsMounted()) en = Ext4::ReadWholeFile(resolved, eh, 5);
+        if (en >= 5 && eh[0] == 0x7F && eh[1] == 'E' && eh[2] == 'L' && eh[3] == 'F' && eh[4] == 2) {
+            return execve_dynamic64(resolved, argv, envp, proc, task);
+        }
+    }
 
     uint8_t* image = (uint8_t*)KernelHeap::Alloc(1024 * 1024);
     if (!image) return -12;

@@ -80,6 +80,12 @@ constexpr NrMap kNrMap[] = {
     {  28, LSYS_MADVISE },       // madvise
     {  40, LSYS_SENDFILE },      // sendfile
     {  56, LSYS_CLONE },         // clone (thread flags fail soft -> single threaded)
+    {  57, LSYS_FORK },          // fork -> COW CloneUserProcess (firefox spawns content procs) (satoru)
+    {  58, LSYS_FORK },          // vfork -> aliased to fork (no parent-suspend yet) (satoru)
+    {  59, LSYS_EXECVE },        // execve -> sys_execve (firefox child re-execs) (satoru)
+    {  61, LSYS_WAITPID },       // wait4 -> sys_waitpid (rusage ignored; parent reaps children) (satoru)
+    {  97, LSYS_GETRLIMIT },     // getrlimit -> existing rlimit handler (satoru)
+    { 302, LSYS_PRLIMIT64 },     // prlimit64 -> existing rlimit handler (satoru)
     {  72, LSYS_FCNTL },         // fcntl
     {  74, LSYS_FSYNC },         // fsync
     {  75, LSYS_FDATASYNC },     // fdatasync
