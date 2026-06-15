@@ -1081,26 +1081,36 @@ void StartTarget(KTarget t, bool parallel) {
     // (satoru)
     const uint32_t SETTLE_CAP_MS = 8000;
 
+    // a unit is "attempted" once we have called StartService for it this target,
+    // so the fixpoint never re-tries it (a socket-activated unit deliberately
+    // stays INACTIVE waiting for a connect, and must not loop the fixpoint). (satoru)
+    bool attempted[KINIT_MAX_SERVICES];
+    for (int i = 0; i < g_service_count; i++) attempted[i] = false;
+
     bool changed = true;
     int guard = 0;
     while (changed && guard++ < 128) {
         changed = false;
 
         if (parallel) {
-            // start EVERY dep-ready, inactive unit in this target in one pass, then
-            // wait for the batch to settle concurrently. independent slow services
-            // overlap instead of serialising. (satoru)
+            // start EVERY dep-ready, not-yet-attempted unit in this target in one
+            // pass, then wait for the batch to settle concurrently. independent slow
+            // services overlap instead of serialising. (satoru)
             int batch[KINIT_MAX_SERVICES];
             int bn = 0;
             for (int i = 0; i < g_service_count; i++) {
                 KService* s = &g_services[i];
-                if (s->target != t || s->name[0] == 0) continue;
+                if (s->target != t || s->name[0] == 0 || attempted[i]) continue;
                 if (!s->enabled || s->state != KSVC_INACTIVE) continue;
                 if (!deps_ready(i)) continue;
                 StartService(s->name);
-                if (s->kind == KUNIT_ONESHOT && s->state != KSVC_FAILED) s->state = KSVC_STOPPED;
-                batch[bn++] = i;
+                attempted[i] = true;
                 changed = true;
+                if (s->kind == KUNIT_ONESHOT && s->state != KSVC_FAILED) s->state = KSVC_STOPPED;
+                // a socket-activated unit stays INACTIVE on purpose; do not wait on
+                // it (it settles only when a client connects, post-boot). (satoru)
+                if (s->state == KSVC_INACTIVE) continue;
+                batch[bn++] = i;
             }
             // wait for the whole batch together. (satoru)
             uint32_t wstart = now_ms();
@@ -1119,13 +1129,15 @@ void StartTarget(KTarget t, bool parallel) {
             // (satoru)
             for (int i = 0; i < g_service_count; i++) {
                 KService* s = &g_services[i];
-                if (s->target != t || s->name[0] == 0) continue;
+                if (s->target != t || s->name[0] == 0 || attempted[i]) continue;
                 if (!s->enabled || s->state != KSVC_INACTIVE) continue;
                 if (!deps_ready(i)) continue;
                 StartService(s->name);
-                if (s->kind == KUNIT_ONESHOT && s->state != KSVC_FAILED) s->state = KSVC_STOPPED;
-                wait_settled(i, SETTLE_CAP_MS);
+                attempted[i] = true;
                 changed = true;
+                if (s->kind == KUNIT_ONESHOT && s->state != KSVC_FAILED) s->state = KSVC_STOPPED;
+                // socket-activated units do not block the sequence. (satoru)
+                if (s->state != KSVC_INACTIVE) wait_settled(i, SETTLE_CAP_MS);
                 break;     // re-evaluate deps from the top after each unit (satoru)
             }
         }
@@ -1495,8 +1507,13 @@ void par_start_3() { par_start_n(3); }
 
 void register_test_services() {
     if (g_test_bits == 0) return;
-    KCapabilities nocap = { false, false, false };
-    (void)nocap;
+
+    // the memhog / watchdog / socket / parallel test units rely on their worker
+    // kernel-processes, which only run after Scheduler::Start(). they are therefore
+    // registered DISABLED so the (pre-Start) boot sequence skips them; RunSelfTests
+    // enables + starts them once the scheduler is live. boot stays fast + identical
+    // to a normal boot. the CYCLE units are noop (instant) and DO run at boot, to
+    // prove a circular After= does not deadlock the boot sequence. (satoru)
 
     if (g_test_bits & KTEST_MEMLIMIT) {
         int idx = RegisterInkernel("kt-memhog", "test: 64M memory hog (oom-killed)", KTGT_USER,
@@ -1504,31 +1521,33 @@ void register_test_services() {
         if (idx >= 0) {
             g_services[idx].limits.memory_max_kb = 64 * 1024;   // 64 MiB (satoru)
             g_services[idx].mem_probe = memhog_mem_probe;
+            g_services[idx].enabled = false;
         }
     }
     if (g_test_bits & KTEST_WATCHDOG) {
         int g = RegisterInkernel("kt-wd-good", "test: watchdog unit (keeps pinging)", KTGT_USER,
                                  wd_good_start, noop_stop, nullptr, "", KRESTART_ON_FAILURE, 1000, false);
-        if (g >= 0) { g_services[g].type = KTYPE_NOTIFY; g_services[g].watchdog_sec = 3; }
+        if (g >= 0) { g_services[g].type = KTYPE_NOTIFY; g_services[g].watchdog_sec = 3; g_services[g].enabled = false; }
         int b = RegisterInkernel("kt-wd-bad", "test: watchdog unit (stops pinging -> restart)", KTGT_USER,
                                  wd_bad_start, noop_stop, nullptr, "", KRESTART_ON_FAILURE, 1000, false);
-        if (b >= 0) { g_services[b].type = KTYPE_NOTIFY; g_services[b].watchdog_sec = 3; }
+        if (b >= 0) { g_services[b].type = KTYPE_NOTIFY; g_services[b].watchdog_sec = 3; g_services[b].enabled = false; }
     }
     if (g_test_bits & KTEST_SOCKET) {
         int idx = RegisterInkernel("kt-socktest", "test: socket-activated unit", KTGT_USER,
                                    sock_start, noop_stop, nullptr, "", KRESTART_NO, 2000, false);
-        if (idx >= 0) ki_cpy(g_services[idx].listen_path, "/kurono/runtime/sockets/kt-socktest", sizeof(g_services[idx].listen_path));
+        if (idx >= 0) { ki_cpy(g_services[idx].listen_path, "/kurono/runtime/sockets/kt-socktest", sizeof(g_services[idx].listen_path)); g_services[idx].enabled = false; }
     }
     if (g_test_bits & KTEST_PARALLEL) {
         KInkernelHook starts[KPAR_COUNT] = { par_start_0, par_start_1, par_start_2, par_start_3 };
         for (int i = 0; i < KPAR_COUNT; i++) {
             int idx = RegisterInkernel(g_par_names[i], "test: slow parallel unit", KTGT_USER,
                                        starts[i], noop_stop, nullptr, "", KRESTART_NO, 2000, false);
-            if (idx >= 0) g_services[idx].type = KTYPE_NOTIFY;
+            if (idx >= 0) { g_services[idx].type = KTYPE_NOTIFY; g_services[idx].enabled = false; }
         }
     }
     if (g_test_bits & KTEST_CYCLE) {
-        // a deliberate cycle: cyc-a After=cyc-b, cyc-b After=cyc-a. (satoru)
+        // a deliberate cycle: cyc-a After=cyc-b, cyc-b After=cyc-a. these run at
+        // boot (enabled) so the test proves boot does not deadlock. (satoru)
         RegisterInkernel("kt-cyc-a", "test: cyclic dep A", KTGT_USER,
                          noop_start, noop_stop, nullptr, "kt-cyc-b", KRESTART_NO, 2000, false);
         RegisterInkernel("kt-cyc-b", "test: cyclic dep B", KTGT_USER,
@@ -2014,6 +2033,7 @@ void par_reset() {
     for (int i = 0; i < KPAR_COUNT; i++) {
         int idx = find_index(g_par_names[i]);
         if (idx < 0) continue;
+        g_services[idx].enabled = true;   // they register disabled; enable for the measurement (satoru)
         g_services[idx].state = KSVC_INACTIVE;
         g_services[idx].notify_ready = false;
         g_par_seen[i] = g_par_gen[i];   // mark current arming consumed so a fresh start re-arms (satoru)
@@ -2077,9 +2097,11 @@ void RunSelfTests() {
         SerialLogger::Log(par < seq ? "  PASS (parallel faster)\r\n" : "  FAIL (not faster)\r\n");
     }
 
-    // (B) memory limit: wait for kt-memhog to be oom-killed. (satoru)
+    // (B) memory limit: enable + start the hog, then wait for the MemoryMax kill.
+    // (satoru)
     if (g_test_bits & KTEST_MEMLIMIT) {
         int idx = find_index("kt-memhog");
+        if (idx >= 0) { EnableService("kt-memhog"); StartService("kt-memhog"); }
         bool killed = false;
         uint32_t w = now_ms();
         while (idx >= 0 && now_ms() - w < 30000) {
@@ -2095,10 +2117,13 @@ void RunSelfTests() {
         SerialLogger::Log(killed ? "  PASS (MemoryMax kill fired)\r\n" : "  FAIL (never killed)\r\n");
     }
 
-    // (C) watchdog: kt-wd-bad must be killed+restarted; kt-wd-good must not. (satoru)
+    // (C) watchdog: enable + start both units; kt-wd-bad must be killed+restarted,
+    // kt-wd-good must not. (satoru)
     if (g_test_bits & KTEST_WATCHDOG) {
         int bad = find_index("kt-wd-bad");
         int good = find_index("kt-wd-good");
+        if (good >= 0) { EnableService("kt-wd-good"); StartService("kt-wd-good"); }
+        if (bad >= 0)  { EnableService("kt-wd-bad");  StartService("kt-wd-bad"); }
         bool restarted = false;
         uint32_t w = now_ms();
         while (bad >= 0 && now_ms() - w < 30000) {
@@ -2117,10 +2142,12 @@ void RunSelfTests() {
         SerialLogger::Log((restarted && good_ok) ? "  PASS (bad restarted, good survived)\r\n" : "  FAIL\r\n");
     }
 
-    // (D) socket activation: kt-socktest must only run after the client connects.
-    // (satoru)
+    // (D) socket activation: enable + start the unit (which only ARMS the
+    // listening socket and stays inactive); it must run only after the client
+    // connects. (satoru)
     if (g_test_bits & KTEST_SOCKET) {
         int idx = find_index("kt-socktest");
+        if (idx >= 0) { EnableService("kt-socktest"); StartService("kt-socktest"); }
         // it must be inactive now (no connect yet) ... (satoru)
         bool was_inactive = (idx >= 0 && g_services[idx].state == KSVC_INACTIVE);
         SerialLogger::Log(was_inactive ? "[kinit-test] socktest pre-connect: inactive (good)\r\n"

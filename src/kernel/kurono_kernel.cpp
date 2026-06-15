@@ -874,6 +874,21 @@ static void convert_mb2_to_mb1(uint64_t mb_addr) {
     }
 }
 
+// kinit self-test runner kernel-process. spawned (when kurono.kinit.test is set)
+// after the desktop is up; it runs the bounded scenarios off the gui loop, logs
+// PASS/FAIL to serial, and optionally powers off for headless ci. (satoru)
+static volatile bool g_kinit_test_poweroff = false;
+[[noreturn]] static void kinit_selftest_entry() {
+    // let the desktop + the kinit boot scenarios settle a moment first. (satoru)
+    Scheduler::SleepMs(2500);
+    KInit::RunSelfTests();
+    if (g_kinit_test_poweroff) {
+        SerialLogger::Log("[kinit-test] powering off (kurono.kinit.poweroff)\r\n");
+        HAL::PowerOff();
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
 extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Init();
     SerialLogger::Log("Kurono OS Starting...\r\n");
@@ -1004,6 +1019,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // accent-animation .kj script so a real on-screen animation is driven through
     // the kj host bindings. gated by kurono.kjdemo. (satoru)
     bool boot_kj_demo = false;
+    // kinit self-test gate (kurono.kinit.test): register the bounded kinit test
+    // services (memory-limit hog, watchdog, socket-activated, parallel, cycle) and,
+    // once the desktop is up, run the self-tests + log PASS/FAIL + measured numbers
+    // to serial. kurono.kinit.poweroff=1 powers off after they finish (headless
+    // ci). (satoru)
+    bool boot_kinit_test = false;
+    bool boot_kinit_poweroff = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     // setup mode: run the graphical installer / first-setup wizard instead of
@@ -1073,6 +1095,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // latch the kj-scripted animation demo flag. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kjdemo=1") || boot_has_token(boot_cmdline, "kurono.kjdemo")) {
             boot_kj_demo = true;
+        }
+        // latch the kinit self-test gate + optional poweroff-after. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kinit.test=1") || boot_has_token(boot_cmdline, "kurono.kinit.test")) {
+            boot_kinit_test = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kinit.poweroff=1") || boot_has_token(boot_cmdline, "kurono.kinit.poweroff")) {
+            boot_kinit_poweroff = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -2468,6 +2497,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // canonical processes are up so its supervisors/monitor join the scheduler).
     // (satoru)
     SerialLogger::Log("[kinit] Init...\r\n");
+    // arm the bounded kinit self-test services before Init registers them. (satoru)
+    if (boot_kinit_test) KInit::EnableTestServices(KInit::KTEST_ALL);
     KInit::Init();
     KInit::RegisterShellCommands(&shell_instance);
     KpkgDaemon::RegisterShellCommands(&shell_instance);
@@ -2965,6 +2996,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // kpkg-daemon / kupdate / ksecurity workers via their start hooks), and
         // spawns its crash monitor  -  all joining the scheduler. (satoru)
         KInit::Boot();
+        // headless kinit self-tests: run off the gui loop so the bounded waits
+        // never stall rendering. (satoru)
+        if (boot_kinit_test) {
+            g_kinit_test_poweroff = boot_kinit_poweroff;
+            Scheduler::SpawnKernelProcess("kinit-selftest", kinit_selftest_entry, PRIO_LOW, 64, 16 * 1024);
+        }
         Scheduler::Start();
         // Unreachable.
     }
