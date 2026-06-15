@@ -31,14 +31,38 @@ static bool kstreq(const char* a, const char* b) {
 }
 
 static void kmemcpy(void* dst, const void* src, uint32_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+    // delegate to the kernel's 64-bit-word memcpy (kernel/types.cpp) instead of
+    // a per-byte loop. a single file write copies the whole content here, so on
+    // a big file (the ~130 mb firefox libxul) the byte loop was 130 m iterations
+    // of pure copy overhead; the word-wise memcpy runs it at memory bandwidth.
+    // (satoru)
+    memcpy(dst, src, (size_t)n);
 }
 
 static void kmemset(void* dst, uint8_t v, uint32_t n) {
     uint8_t* d = (uint8_t*)dst;
     for (uint32_t i = 0; i < n; i++) d[i] = v;
+}
+
+// choose a new content_capacity for a buffer that must hold at least `need`
+// bytes, growing GEOMETRICALLY (at least double the old capacity) so an
+// incremental writer that appends in small chunks reallocs O(log n) times
+// instead of every KVFS_BLOCK_SIZE bytes. without this, appending a large file
+// a few kb at a time re-copied the whole buffer on each 4 kb boundary -> O(n^2)
+// total copying (the slow path the throughput work targets). the result is
+// rounded up to a block and never below one block. (satoru)
+static uint32_t kvfs_grow_cap(uint32_t old_cap, uint32_t need) {
+    uint32_t cap = old_cap ? old_cap : (uint32_t)KVFS_BLOCK_SIZE;
+    while (cap < need) {
+        uint32_t doubled = cap << 1;
+        if (doubled < cap) { cap = need; break; }   // overflow guard (satoru)
+        cap = doubled;
+    }
+    // round to a block boundary; clamp the minimum to one block. (satoru)
+    cap = (cap + KVFS_BLOCK_SIZE - 1) & ~((uint32_t)KVFS_BLOCK_SIZE - 1);
+    if (cap < KVFS_BLOCK_SIZE) cap = KVFS_BLOCK_SIZE;
+    if (cap < need) cap = (need + KVFS_BLOCK_SIZE - 1) & ~((uint32_t)KVFS_BLOCK_SIZE - 1);
+    return cap;
 }
 
 // small recently-resolved-path cache so repeated Open of the same path
@@ -548,8 +572,9 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
 
     uint32_t new_size = node->size + len;
     if (!node->content || node->content_capacity < new_size) {
-        uint32_t new_cap = (new_size + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
-        if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
+        // grow geometrically so repeated small appends amortize to O(n) total
+        // copying instead of re-copying on every 4 kb boundary. (satoru)
+        uint32_t new_cap = kvfs_grow_cap(node->content_capacity, new_size);
         uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
         if (node->content) {
@@ -665,13 +690,18 @@ int KVFS::Write(int fd, const void* buf, uint32_t len) {
 
     uint32_t write_end = fds[fd].offset + len;
     if (!node->content || node->content_capacity < write_end) {
-        uint32_t new_cap = (write_end + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
-        if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
+        // grow geometrically (amortized O(n)) instead of re-copying on every 4
+        // kb boundary, which made a large file written in small fd chunks
+        // O(n^2). zero only the newly-exposed tail (from the old size up) so a
+        // write past the end keeps hole-fill semantics without re-zeroing bytes
+        // we already hold. (satoru)
+        uint32_t new_cap = kvfs_grow_cap(node->content_capacity, write_end);
         uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
         if (node->content) {
             kmemcpy(new_buf, node->content, node->size);
             KernelHeap::Free(node->content);
+            if (new_cap > node->size) kmemset(new_buf + node->size, 0, new_cap - node->size);
         } else {
             kmemset(new_buf, 0, new_cap);
         }
