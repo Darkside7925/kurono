@@ -23,6 +23,7 @@ uint32_t E1000::tx_count = 0;
 uint32_t E1000::rx_count = 0;
 uint32_t E1000::tx_bytes = 0;
 uint32_t E1000::rx_bytes = 0;
+uint32_t E1000::rx_missed = 0;
 
 static const uint16_t E1000_MAX_TX_FRAME = 1518;
 
@@ -411,6 +412,13 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
 void E1000::Poll() {
     if (!detected) return;
 
+    // accumulate the missed-packets count (clear-on-read in hw). a non-zero
+    // value means frames arrived with no free rx descriptor and were dropped,
+    // forcing the sender to time out + retransmit (the classic bulk-download
+    // throughput killer when the ring is too small for the offered window).
+    // (satoru)
+    rx_missed += ReadReg(E1000_MPC);
+
     // drain finished tx descriptors here too so the ring empties even during
     // idle/rx-only periods, not just when the next Send happens. (satoru)
     ReclaimTx();
@@ -478,3 +486,4 @@ uint32_t E1000::GetTxCount() { return tx_count; }
 uint32_t E1000::GetRxCount() { return rx_count; }
 uint32_t E1000::GetTxBytes() { return tx_bytes; }
 uint32_t E1000::GetRxBytes() { return rx_bytes; }
+uint32_t E1000::GetRxMissed() { return rx_missed; }

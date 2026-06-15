@@ -34,6 +34,7 @@
 #define E1000_RAH          0x5404   // receive address high
 #define E1000_MTA          0x5200   // multicast table array (128 entries)
 #define E1000_TIPG         0x0410   // tx inter-packet gap
+#define E1000_MPC          0x4010   // missed packets count: rx dropped, no free descriptor (satoru)
 
 // ctrl register bits
 #define E1000_CTRL_FD      (1 << 0)   // full duplex
@@ -77,7 +78,15 @@
 #define E1000_RXD_STAT_EOP (1 << 1)   // end of packet
 
 // descriptor counts  (must be multiple of 8, aligned to 128 bytes)
-#define E1000_NUM_RX_DESC  32
+// rx ring raised 32 -> 256. at 32 descriptors the ring held only 64 kb, so a
+// peer that fills a large (window-scaled) tcp receive window bursts more than
+// the ring can hold between Poll() drains; the nic then drops frames (MPC
+// climbs) and the sender stalls a full rto (~the slirp 1.5s quantum seen on
+// bulk downloads) before retransmitting. 256 * 2 kb = 512 kb absorbs a full
+// 256 kb window plus slack, so the ring stops overflowing. rdlen = 256*16 =
+// 4096 bytes (still a 128-byte multiple); everything else indexes mod the
+// constant, so only the ring storage grows. (satoru)
+#define E1000_NUM_RX_DESC  256
 #define E1000_NUM_TX_DESC  32
 #define E1000_RX_BUFFER_SIZE  2048
 #define E1000_TX_BUFFER_SIZE  2048
@@ -129,6 +138,11 @@ public:
     static uint32_t GetRxCount();
     static uint32_t GetTxBytes();
     static uint32_t GetRxBytes();
+    // missed-packets count: frames the nic dropped because the rx descriptor
+    // ring had no free slot when they arrived (clear-on-read in hw, so we
+    // accumulate). a rising value means the ring is too small / polled too
+    // infrequently for the offered load. (satoru)
+    static uint32_t GetRxMissed();
 
 private:
     static bool detected;
@@ -146,6 +160,7 @@ private:
     
     static E1000_PacketHandler packet_handler;
     static uint32_t tx_count, rx_count, tx_bytes, rx_bytes;
+    static uint32_t rx_missed;   // accumulated MPC: nic rx-ring overflow drops (satoru)
     
     // mmio register access
     static void WriteReg(uint16_t offset, uint32_t value);
