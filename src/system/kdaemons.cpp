@@ -1,4 +1,4 @@
-//  kurono os  -  kupdate + ksecurity in-kernel service daemons. see kdaemons.h.
+//  kurono os: kupdate + ksecurity in-kernel service daemons. see kdaemons.h.
 
 #include "kdaemons.h"
 #include "kinit.h"
@@ -100,11 +100,6 @@ volatile bool g_started = false;
 volatile bool g_healthy = true;
 volatile bool g_supr_ok = true;
 volatile bool g_ksa_ok  = true;
-
-bool ks_eq(const char* a, const char* b) {
-    while (*a && *b) { if (*a != *b) return false; a++; b++; }
-    return *a == 0 && *b == 0;
-}
 
 [[noreturn]] void worker_entry() {
     SerialLogger::Log("[ksecurity] policy watch online\r\n");

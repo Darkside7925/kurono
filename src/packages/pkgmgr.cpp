@@ -9,6 +9,7 @@
 #include "../net/tcpip.h"
 #include "../system/gpu_driver_installer.h"
 #include "../system/system_update.h"
+#include "../system/kpkg_daemon.h"   // background (non-blocking) install routing (satoru)
 #include "../virt/debian_data.h"
 #include "../ui/notification.h"
 
@@ -2131,6 +2132,34 @@ void PackageManager::RegisterCommands(void* shell_ptr) {
 int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (argc < 2) return pa(out, 0, mx, "Usage: install <package>\n");
+
+    // background install: `kpkg install --daemon <pkg>` (or `--bg`) hands the
+    // download+extract to kpkg-daemon's worker and returns IMMEDIATELY so a
+    // gui-initiated install never blocks the desktop. the foreground form (no
+    // flag) still runs inline for the cli, where blocking is expected. (satoru)
+    {
+        bool bg = false;
+        const char* bg_name = nullptr;
+        for (int i = 1; i < argc; i++) {
+            if (peq(argv[i], "--daemon") || peq(argv[i], "--bg")) { bg = true; continue; }
+            // first non-flag, non-subcommand token after argv0 is the package. (satoru)
+            if (!bg_name && !peq(argv[i], "install") && !peq(argv[i], "kpkg") &&
+                argv[i][0] != '-') bg_name = argv[i];
+        }
+        if (bg) {
+            int p = 0;
+            if (!bg_name) return pa(out, 0, mx, "Usage: kpkg install --daemon <package>\n");
+            if (KpkgDaemon::RequestInstall(bg_name)) {
+                p = pa(out, p, mx, "Queued '");
+                p = pa(out, p, mx, bg_name);
+                p = pa(out, p, mx, "' for background install via kpkg-daemon.\n");
+                p = pa(out, p, mx, "The desktop stays responsive; watch progress with: kpkg-daemon status\n");
+            } else {
+                p = pa(out, p, mx, "kpkg-daemon is busy with another install; try again shortly.\n");
+            }
+            return p;
+        }
+    }
 
     if (peq(argv[0], "kpkg") && argc >= 2 && peq(argv[1], "sync")) {
         int p = 0;
