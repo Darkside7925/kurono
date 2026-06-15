@@ -18,6 +18,7 @@
 #include "../hal/hal.h"
 #include "../kernel/userspace.h"
 #include "../proc/scheduler.h"   // full Process def for LinuxProcess::task->exe_path (satoru)
+#include "../kernel/udf.h"       // SYS_UDF_CALL -> user driver framework proxy (satoru)
 
 // Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
 // switches to, and a one-slot stash for the user rsp across that switch (every
@@ -360,6 +361,20 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
         // statx (332) falls through to the kNrMap translation → LSYS_STATX.
         case 302: {  // prlimit64  -  fail soft.
             return -38;
+        }
+        // ── KDF/UDF hybrid-kernel addition (satoru) ─────────────────────────────
+        // SYS_UDF_CALL: the user driver framework entry. a ring-3 udf driver
+        // (wifi/usb-hid/...) calls udf_call(op,a0..a3) through this number; the
+        // kernel UDFProxy marshals it and performs the privileged op (or queues
+        // it for the driver). number 0x4B554446 ("KUDF") is well outside the
+        // linux syscall space so it never collides with a real number. added
+        // additively here (a clearly-marked custom case) so it does NOT touch the
+        // firefox e10s / ipc syscall handlers. (satoru)
+        case 0x4B554446: {
+            HAL::EnableInterrupts();
+            int64_t r = UDF::Call((uint32_t)a0, a1, a2, a3, a4);
+            HAL::DisableInterrupts();
+            return r;
         }
     }
 

@@ -6,6 +6,7 @@
 #include "../kernel/pmm.h"   // page-aligned dma memory for the admin/io queues (satoru)
 #include "../kernel/vmm.h"   // identity-map the high 64-bit bar before touching it (satoru)
 #include "../kernel/kdf.h"   // kdf-sandboxed dma/mmio: guard-fenced queues + bar (satoru)
+#include "../kernel/irp.h"   // register nvme as an irp block device (executive i/o) (satoru)
 #include "../drivers/serial.h"
 #include "../proc/smp.h"     // one i/o queue per cpu core; route by calling cpu (satoru)
 #include "../proc/spinlock.h"  // serialize cores that share an sq when cpus > queues (satoru)
@@ -32,6 +33,36 @@ int g_nvme_kdf_id = -1;   // kdf driver id for "nvme", set in NVMe::Init (satoru
 inline uint64_t dma_phys(const void* va) {
     uint64_t p = KDF::PhysOf((void*)(uintptr_t)va);
     return p ? p : (uint64_t)(uintptr_t)va;
+}
+
+//  irp dispatch routine for the "nvme0" block device: routes read/write/flush
+//  irps from the executive to NVMe's block i/o. completes synchronously (the
+//  controller path polls), so it sets status+info and returns. this makes the
+//  IRP + KExec::IO path a REAL working route to storage, not just a stub. (satoru)
+int32_t nvme_irp_dispatch(IRP::Irp* irp) {
+    switch (irp->major) {
+        case IRP::IRP_MJ_READ: {
+            bool ok = NVMe::Read(irp->lba, irp->count, irp->buffer);
+            irp->status = ok ? IRP::IRP_SUCCESS : IRP::IRP_EIO;
+            irp->info   = ok ? irp->count * NVMe::GetLBASize() : 0;
+            return irp->status;
+        }
+        case IRP::IRP_MJ_WRITE: {
+            bool ok = NVMe::Write(irp->lba, irp->count, irp->buffer);
+            irp->status = ok ? IRP::IRP_SUCCESS : IRP::IRP_EIO;
+            irp->info   = ok ? irp->count * NVMe::GetLBASize() : 0;
+            return irp->status;
+        }
+        case IRP::IRP_MJ_FLUSH: {
+            bool ok = NVMe::Flush();
+            irp->status = ok ? IRP::IRP_SUCCESS : IRP::IRP_EIO;
+            irp->info   = 0;
+            return irp->status;
+        }
+        default:
+            irp->status = IRP::IRP_EINVAL;
+            return IRP::IRP_EINVAL;
+    }
 }
 }  // namespace
 
@@ -201,6 +232,11 @@ bool NVMe::KdfInit() {
                     SerialLogger::Log("[NVMe] Controller enabled\r\n");
                     Identify();
                     CreateIOQueues();
+                    // expose nvme as an irp block device so the executive (KExec::IO)
+                    // + any irp-stacked driver can reach storage through the
+                    // structured i/o path. idempotent across re-inits. (satoru)
+                    if (io_queue_count > 0)
+                        IRP::RegisterDevice("nvme0", nvme_irp_dispatch);
                 } else {
                     SerialLogger::Log("[NVMe] Controller enable timeout\r\n");
                 }

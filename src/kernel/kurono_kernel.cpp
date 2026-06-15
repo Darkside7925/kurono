@@ -48,6 +48,9 @@
 #include "../system/logging.h"
 #include "../system/kinit.h"          // service + init manager (satoru)
 #include "kdf.h"                       // kernel driver framework (hybrid-kernel ring-0+ sandbox) (satoru)
+#include "udf.h"                       // user driver framework (ring-3 drivers via SYS_UDF_CALL) (satoru)
+#include "irp.h"                       // i/o request packet executive (stackable async i/o) (satoru)
+#include "kexec.h"                     // kernel executive (NT-style Mm/Ps/Io/Se/Cm facade) (satoru)
 #include "../system/kpkg_daemon.h"    // background package install daemon (satoru)
 #include "../system/kdaemons.h"       // kupdate + ksecurity service daemons (satoru)
 #include "../system/systemd_compat.h" // systemd compatibility shim (-> kinit) (satoru)
@@ -1758,6 +1761,11 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // the kinit crash-restart notifier is wired later (after KInit::Init). (satoru)
     SerialLogger::Log("[KDF] Init...\r\n");
     KDF::Init();
+    // the irp executive + the kexec facade are part of the hybrid-kernel layer;
+    // bring them up alongside kdf (they need only pmm/vmm). nvme registers as an
+    // irp block device after it inits (in MountDataDisk). (satoru)
+    IRP::Init();
+    KExec::Init();
 
     SerialLogger::Log("[KVFS] Init...\r\n");
     KVFS::Init();
@@ -1986,6 +1994,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[Userspace] Init ring-3 runtime...\r\n");
     LinuxSyscall::Init();
     Userspace::Init();
+    // udf: the ring-3 user driver framework. brought up after the syscall path so
+    // SYS_UDF_CALL can route into the kernel UDFProxy. (satoru)
+    UDF::Init();
     if (EmbeddedUserprogs::HasHello()) {
         KVFS::Mkdirs("/usr/bin");
         KVFS::WriteFile("/usr/bin/hello",
