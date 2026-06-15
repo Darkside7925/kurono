@@ -49,6 +49,7 @@
 #include "../system/kinit.h"          // service + init manager (satoru)
 #include "../system/kpkg_daemon.h"    // background package install daemon (satoru)
 #include "../system/kdaemons.h"       // kupdate + ksecurity service daemons (satoru)
+#include "../system/systemd_compat.h" // systemd compatibility shim (-> kinit) (satoru)
 #include "../system/kpaths.h"
 #include "../system/installer.h"
 #include "../system/ui_config.h"
@@ -2472,6 +2473,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     KpkgDaemon::RegisterShellCommands(&shell_instance);
     KUpdate::RegisterShellCommands(&shell_instance);
     KSecurity::RegisterShellCommands(&shell_instance);
+
+    // ── systemd compatibility shim ──────────────────────────────────────
+    // create the /run/systemd presence tree (so linux apps' sd_booted() probes
+    // pass) and register the systemctl/journalctl/loginctl shims, which translate
+    // onto kinit. the org.freedesktop.systemd1 d-bus bridge lives in
+    // dbus_server.cpp and is already wired. (satoru)
+    SerialLogger::Log("[systemd-compat] Init...\r\n");
+    SystemdCompat::InitRuntime();
+    SystemdCompat::RegisterShellCommands(&shell_instance);
 
     KVFS::Mkdirs("/home/user/Documents");
     KVFS::Mkdirs("/home/user/Downloads");
