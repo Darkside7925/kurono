@@ -1,4 +1,4 @@
-//  kurono os  -  kinit core: registration, target sequencing, spawn, crash
+//  kurono os: kinit core: registration, target sequencing, spawn, crash
 //  monitor, shell commands, audit logging.
 //
 //  see kinit.h for the design. the honest short version: kinit supervises two
@@ -664,7 +664,7 @@ bool health_ksec()  { return KSecurity::IsHealthy(); }
 
 // in-kernel "start" hooks: the core subsystems (klog/knet/kdbus/kwayland/kaudio)
 // are brought up by the kernel BEFORE kinit runs (DBusServer::Init,
-// WaylandServer::Init, the kernel_processes, etc)  -  kinit ADOPTS them as
+// WaylandServer::Init, the kernel_processes, etc), kinit ADOPTS them as
 // already-running units rather than re-initialising and risking a double-init,
 // so their start hooks are no-ops. the user.target daemons, by contrast, are
 // genuinely started here via their Init(). (satoru)
@@ -695,7 +695,7 @@ void register_builtins() {
     // functionality (package install, update-checking, policy self-test) and run
     // as dedicated worker kernel-processes so they never block the gui. they are
     // registered as in-kernel units because that is what they HONESTLY are today
-    //  -  an in-kernel worker, not a separate linux address space. the matching
+    //, an in-kernel worker, not a separate linux address space. the matching
     // .kservice files on disk document the eventual fully-isolated process form
     // (Exec=/kurono/system/bin/<name>); kinit will run that form once those
     // binaries are built + installed. critical=false: a failed updater/security
@@ -851,7 +851,7 @@ int CmdKinit(void* sh, int argc, const char** argv, char* out, int mx) {
 
     if (argc < 2 || ki_eq(argv[1], "status")) {
         // overview + per-service table grouped by target. (satoru)
-        p = ki_cat(out, p, mx, "kinit  -  service manager   running ");
+        p = ki_cat(out, p, mx, "kinit service manager   running ");
         p = ki_cat_u(out, p, mx, (uint32_t)RunningCount());
         p = ki_cat(out, p, mx, "/");
         p = ki_cat_u(out, p, mx, (uint32_t)g_service_count);

@@ -1,4 +1,4 @@
-//  kurono os  -  kinit .kservice parser.
+//  kurono os: kinit .kservice parser.
 //
 //  parses the ini-style unit files under /kurono/system/services/*.kservice:
 //

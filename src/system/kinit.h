@@ -1,20 +1,20 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  kurono os  -  kinit, the service + init manager (kurono's answer to systemd).
+//  kurono os: kinit, the service + init manager (kurono's answer to systemd).
 //
 //  kinit is the supervisor for kurono's background services. it is NOT a
 //  from-scratch unix init: kurono's core services (kdbus, kwayland, kaudio,
 //  knet, klog) are in-kernel kernel-processes that already run, so kinit
 //  SUPERVISES two kinds of unit honestly:
 //
-//    KUNIT_INKERNEL   -  an existing in-kernel subsystem (dbus / wayland / audio /
+//    KUNIT_INKERNEL  = an existing in-kernel subsystem (dbus / wayland / audio /
 //                      network / logging). kinit tracks its state and can
 //                      "restart" it via a registered hook, but it is not a
 //                      separate address space. these are marked so status / docs
 //                      never pretend they are isolated processes. (satoru)
 //
-//    KUNIT_PROCESS    -  a genuine isolated linux user process spawned via
+//    KUNIT_PROCESS   = a genuine isolated linux user process spawned via
 //                      fork/exec (LinuxSyscall). the kpkg-daemon is the first
 //                      real one: it downloads + installs in its own process so
 //                      the gui never blocks. requires the dynamic-exec path

@@ -1,4 +1,4 @@
-//  kurono os  -  kpkg-daemon implementation.
+//  kurono os: kpkg-daemon implementation.
 //
 //  see kpkg_daemon.h. a single-job daemon: a request ring of depth 1 (one
 //  install at a time, like apt's lock), a worker kernel-process that drains it
@@ -147,7 +147,7 @@ int Cmd(void* sh, int argc, const char** argv, char* out, int mx) {
         if (RequestInstall(argv[2])) {
             cat("kpkg-daemon: queued '");
             cat(argv[2]);
-            cat("'  -  installing in background; the desktop stays responsive.\n");
+            cat("' (installing in background); the desktop stays responsive.\n");
             cat("watch progress: kpkg-daemon status\n");
         } else {
             cat("kpkg-daemon: busy with another install; try again when it finishes.\n");

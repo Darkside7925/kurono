@@ -1,7 +1,7 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  kurono os  -  kpkg-daemon: the package install/download daemon.
+//  kurono os: kpkg-daemon: the package install/download daemon.
 //
 //  the concrete win kinit buys us: the package download+extract loop is slow
 //  (large tars, slirp-bound networking) and it USED to run inline on whatever
@@ -19,7 +19,7 @@
 //  kinit process-unit; it launches once that binary is built+installed. the
 //  in-kernel worker is what works today and is what the gui talks to. it does
 //  NOT change the download throughput (that is slirp + kvfs-write bound, not
-//  cpu-bound)  -  its value is purely non-blocking isolation. (satoru)
+//  cpu-bound); its value is purely non-blocking isolation. (satoru)
 
 namespace KpkgDaemon {
 

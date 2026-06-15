@@ -494,6 +494,14 @@ This is more than a command shim. Kurono has an in-kernel Linux compatibility/ru
   - `dlopen` family support
   - TLS, RELRO, auxv, vDSO, and constructor handling
 
+- **kinit - service and init manager** (`src/system/kinit.*`, `docs/developers/system/KINIT.md`)
+  - Supervises two honestly-distinct unit kinds: **in-kernel units** (`klog`, `knet`, `kdbus`, `kwayland`, `kaudio`, adopted as the already-running in-kernel subsystems with periodic health probes) and **isolated Linux process units** spawned via fork/exec, each driven by its own supervisor kernel-process so the blocking `RunProcessWithArgs` never freezes the desktop
+  - Dependency-sequenced boot targets: `kernel.target → network.target → dbus.target → desktop.target → user.target`
+  - Crash monitor: exponential restart backoff (2s → 4s → 8s ... capped at 60s), a service is marked `failed` after 5 crashes in 60s, and a *critical* service (kdbus/kwayland) failure raises a desktop notification
+  - `.kservice` unit files under `/kurono/system/services/` (`[Service]` + `[Capabilities]` INI), capability gating at spawn via SUPR, and an audit log at `/kurono/var/log/services.log`
+  - `kinit status | start | stop | restart | enable | disable | logs | reload`
+  - **kpkg-daemon** moves the package download/extract loop into a worker kernel-process so a GUI/`kpkg install --daemon` install never blocks the desktop (progress via a polled status + an `org.kurono.Pkg` D-Bus signal); plus `kupdate` (pending-update poller) and `ksecurity` (periodic SUPR/KSA policy self-test). Honest scope: this is non-blocking *isolation*, not a download-throughput change
+
 - **Commands and launchers**
   - `linux-exec`
   - `syscall`

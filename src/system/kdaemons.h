@@ -1,18 +1,18 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  kurono os  -  kupdate + ksecurity, two small in-kernel service daemons managed
+//  kurono os: kupdate + ksecurity, two small in-kernel service daemons managed
 //  by kinit.
 //
 //  like kpkg-daemon's in-kernel worker, these run as dedicated kernel-processes
 //  (so they never block the gui) and wrap functionality that already exists in
 //  the kernel rather than pretending to be separate linux binaries:
 //
-//    kupdate    -  periodically asks the package manager how many updates are
+//    kupdate   = periodically asks the package manager how many updates are
 //                pending (a real PackageManager::GetPendingUpdateCount query)
 //                and publishes the count; raises a toast when updates appear.
 //
-//    ksecurity  -  periodically re-runs the supr + ksa policy self-tests
+//    ksecurity = periodically re-runs the supr + ksa policy self-tests
 //                (SUPR::PolicySelfTest / KSA::SelfTest) so a corrupted security
 //                policy is caught early, and exposes the last result as the
 //                unit's health. (satoru)
