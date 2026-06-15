@@ -114,15 +114,30 @@ enum TCPState {
 #define SOCK_RAW       3   // raw ip
 
 #define MAX_SOCKETS    16
-// 64 kb rx ring (was 8 kb). the small ring made the advertised receive window
-// collapse to ~0 after a few segments on a fast bulk transfer (e.g. the 235 mb
-// firefox tar), and with no window-update ack emitted on drain the peer
-// (slirp) deadlocked waiting to reopen the window. a 64 kb window keeps the
-// pipe full between Recv() drains. (satoru)
-#define TCP_RX_BUFSIZE 65536
+// 256 kb rx ring (was 64 kb, was 8 kb). a 16-bit tcp window field tops out at
+// 64 kb, which caps a bulk download at 64kb/rtt with no window scaling; a real
+// (non-zero-rtt) link then sits idle most of each round trip. with rfc 1323
+// window scaling negotiated in the handshake we advertise (rx_free >>
+// TCP_RCV_WSCALE), so a 256 kb buffer yields a 256 kb effective receive window
+// (4x past the legacy 16-bit ceiling) and keeps the pipe full between Recv()
+// drains. 16 sockets * 256 kb = 4 mb of rx bss, well within budget. (satoru)
+#define TCP_RX_BUFSIZE 262144
 #define TCP_TX_BUFSIZE 8192
 #define TCP_MSS        1460
 #define PENDING_IPV4_TX 8
+
+// rfc 1323 window scaling. TCP_RCV_WSCALE is the shift we advertise for OUR
+// receive window: 2^7 = 128, so a 256 kb buffer fits in the 16-bit window
+// field as 262144>>7 = 2048 units. scaling is only ever applied if the PEER
+// also sent a window scale option in its syn/syn-ack (negotiated, per rfc),
+// tracked per socket in wscale_ok/snd_wscale. the wscale option itself is
+// kind=3 len=3 { shift }. (satoru)
+#define TCP_OPT_END    0
+#define TCP_OPT_NOP    1
+#define TCP_OPT_MSS    2
+#define TCP_OPT_WSCALE 3
+#define TCP_RCV_WSCALE 7
+#define TCP_WSCALE_MAX 14   // rfc 1323 caps the shift at 14 (satoru)
 
 // send window: how many full data segments may be outstanding (un-acked) at
 // once. the old send path was stop-and-wait  -  exactly one mss in flight per
@@ -166,7 +181,18 @@ struct NetSocket {
     TCPState tcp_state;
     uint32_t tcp_seq;       // our sequence number
     uint32_t tcp_ack;       // their sequence number
-    uint16_t tcp_window;
+    uint16_t tcp_window;    // our last-advertised window (already scaled-down) (satoru)
+
+    // rfc 1323 window scaling, negotiated in the 3-way handshake. wscale_ok is
+    // set only when the peer sent a window scale option (so scaling is mutual,
+    // per the rfc); snd_wscale is the peer's shift (apply to THEIR advertised
+    // window); rcv_wscale is OUR shift (apply to the window field we send). if
+    // the peer omits the option, both shifts stay 0 and we fall back to a plain
+    // 16-bit window, so legacy peers keep working. (satoru)
+    bool     wscale_ok;
+    uint8_t  snd_wscale;    // peer's receive-window shift (their option) (satoru)
+    uint8_t  rcv_wscale;    // our receive-window shift (our option) (satoru)
+    uint32_t snd_wnd;       // peer's advertised window, de-scaled to bytes (satoru)
 
     // receive buffer
     uint8_t  rx_buf[TCP_RX_BUFSIZE];

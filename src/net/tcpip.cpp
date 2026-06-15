@@ -25,6 +25,23 @@ static void slog(const char* s){ SerialLogger::Log(s); }
 static inline void net_wait_one_ms() {
     Scheduler::SleepMs(1);
 }
+
+// copy `n` bytes from `src` into the socket rx ring at rx_tail, advancing
+// rx_tail (mod TCP_RX_BUFSIZE) and rx_count. uses at most two bulk memcpy spans
+// (the region before the wrap and the region after) instead of the old per-byte
+// loop, so a full-mss segment lands at memory bandwidth. caller has already
+// clamped n to the free space. (satoru)
+static inline void tcp_ring_push(NetSocket* s, const uint8_t* src, int n) {
+    if (n <= 0) return;
+    int tail = s->rx_tail;
+    int first = TCP_RX_BUFSIZE - tail;        // bytes until the ring wraps (satoru)
+    if (first > n) first = n;
+    memcpy(s->rx_buf + tail, src, (size_t)first);
+    int rem = n - first;
+    if (rem > 0) memcpy(s->rx_buf, src + first, (size_t)rem);
+    s->rx_tail = (tail + n) % TCP_RX_BUFSIZE;
+    s->rx_count += n;
+}
 static void sloghex(uint32_t v){
     char b[12]; b[0]='0'; b[1]='x';
     const char* h = "0123456789ABCDEF";
@@ -649,13 +666,40 @@ static int tcp_accept_rx_data(NetSocket* s, uint32_t their_seq,
     if (their_seq != s->tcp_ack) return 0;  // out-of-order/dup: ack, don't buffer
     int space = TCP_RX_BUFSIZE - s->rx_count;
     int copy = payload_len < space ? payload_len : space;
-    for (int i = 0; i < copy; i++) {
-        s->rx_buf[s->rx_tail] = payload[i];
-        s->rx_tail = (s->rx_tail + 1) % TCP_RX_BUFSIZE;
-        s->rx_count++;
-    }
+    tcp_ring_push(s, payload, copy);
     s->tcp_ack = their_seq + (uint32_t)copy;
     return copy;
+}
+
+// parse the tcp options area of a received syn/syn-ack for the rfc 1323 window
+// scale option. options live between the fixed 20-byte header and data_offset.
+// on finding a wscale option, set *out_shift (clamped to TCP_WSCALE_MAX) and
+// *out_found. unknown options are skipped by their length byte; nop/end are
+// handled explicitly; a malformed length bails out. called only during the
+// handshake, so the cost is negligible. (satoru)
+static void tcp_parse_wscale(const uint8_t* tcp_hdr, int data_offset,
+                             bool* out_found, uint8_t* out_shift) {
+    *out_found = false;
+    *out_shift = 0;
+    int opt_start = (int)sizeof(TCPHeader);
+    int i = opt_start;
+    while (i < data_offset) {
+        uint8_t kind = tcp_hdr[i];
+        if (kind == TCP_OPT_END) break;
+        if (kind == TCP_OPT_NOP) { i++; continue; }
+        // every other option carries a length byte; need at least 2 bytes and a
+        // length that stays within the options area. (satoru)
+        if (i + 1 >= data_offset) break;
+        uint8_t optlen = tcp_hdr[i + 1];
+        if (optlen < 2 || i + optlen > data_offset) break;
+        if (kind == TCP_OPT_WSCALE && optlen == 3) {
+            uint8_t shift = tcp_hdr[i + 2];
+            if (shift > TCP_WSCALE_MAX) shift = TCP_WSCALE_MAX;
+            *out_shift = shift;
+            *out_found = true;
+        }
+        i += optlen;
+    }
 }
 
 void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
@@ -733,6 +777,17 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->last_activity_ms = Timer::GetTicks();
                 sock->keepalive_last_ms = sock->last_activity_ms;
                 sock->keepalive_probes = 0;
+                // learn the peer's window scale from their syn. we (server side)
+                // only enable scaling, and only then echo the option in our
+                // syn-ack, when the client offered it (rfc 1323 mutual rule).
+                // wscale_ok gates the option echo inside SendTCPPacket. (satoru)
+                {
+                    bool ws_found = false; uint8_t ws_shift = 0;
+                    tcp_parse_wscale((const uint8_t*)tcp, data_offset, &ws_found, &ws_shift);
+                    sock->wscale_ok = ws_found;
+                    sock->snd_wscale = ws_found ? ws_shift : 0;
+                    if (!ws_found) sock->rcv_wscale = 0;
+                }
                 SendTCP(sock, TCP_FLAG_SYN | TCP_FLAG_ACK, nullptr, 0);
                 sock->tcp_seq++;
             }
@@ -746,6 +801,19 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->tcp_ack = their_seq + 1;
                 sock->tcp_seq = their_ack;
                 sock->tcp_state = TCP_ESTABLISHED;
+                // we sent the window-scale option in our syn (Connect, so
+                // rcv_wscale is already TCP_RCV_WSCALE). scaling is mutual: only
+                // keep ours active if the syn-ack echoed a window scale option.
+                // if the peer didn't, drop back to a plain 16-bit window so our
+                // advertised value isn't silently shifted down for a peer that
+                // won't shift it back up. (satoru)
+                {
+                    bool ws_found = false; uint8_t ws_shift = 0;
+                    tcp_parse_wscale((const uint8_t*)tcp, data_offset, &ws_found, &ws_shift);
+                    sock->wscale_ok = ws_found;
+                    sock->snd_wscale = ws_found ? ws_shift : 0;
+                    if (!ws_found) sock->rcv_wscale = 0;
+                }
                 // background handshake finished: clear EINPROGRESS and arm
                 // the keepalive/activity clocks fresh (satoru)
                 sock->sock_errno = 0;
@@ -754,6 +822,15 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 sock->keepalive_probes = 0;
                 SendTCP(sock, TCP_FLAG_ACK, nullptr, 0);
                 slog("[TCP] -> ESTABLISHED\r\n");
+                // report the negotiated rfc 1323 window scaling so a headless
+                // run can confirm the option round-tripped: wscale_ok=1 means
+                // the peer echoed it; rcv/snd shifts are the agreed exponents.
+                // (satoru)
+                slog(sock->wscale_ok ? "[TCP] wscale negotiated ok rcv_shift="
+                                     : "[TCP] wscale NOT negotiated rcv_shift=");
+                slognum((int)sock->rcv_wscale);
+                slog("[TCP]   snd_shift=");
+                slognum((int)sock->snd_wscale);
                 RuntimeLog::LogNetwork("tcp connection established", nullptr);
             } else if (tcp->flags & TCP_FLAG_RST) {
                 sock->tcp_state = TCP_CLOSED;
@@ -799,11 +876,7 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                     if (their_seq == sock->tcp_ack) {
                         int space = TCP_RX_BUFSIZE - sock->rx_count;
                         int copy = tcp_data_len < space ? tcp_data_len : space;
-                        for (int i = 0; i < copy; i++) {
-                            sock->rx_buf[sock->rx_tail] = tcp_data[i];
-                            sock->rx_tail = (sock->rx_tail + 1) % TCP_RX_BUFSIZE;
-                            sock->rx_count++;
-                        }
+                        tcp_ring_push(sock, tcp_data, copy);
                         sock->tcp_ack = their_seq + (uint32_t)copy;
                         accepted_data = copy;
                         ack_needed = true;
@@ -944,32 +1017,64 @@ uint32_t TCPStack::TCPSeqAdvance(uint8_t flags, int len) {
 bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, int len,
                              uint32_t seq, bool track_pending) {
     if (!sock) return false;
-    uint8_t buf[sizeof(TCPHeader) + TCP_MSS];
+    // room for the fixed header + a 4-byte window-scale option (only on syn) +
+    // a full mss of payload. (satoru)
+    uint8_t buf[sizeof(TCPHeader) + 4 + TCP_MSS];
     TCPHeader* tcp = (TCPHeader*)buf;
 
     tcp->src_port = htons(sock->local_port);
     tcp->dst_port = htons(sock->remote_port);
     tcp->seq_num = htonl(seq);
     tcp->ack_num = htonl(sock->tcp_ack);
-    tcp->data_offset = (5 << 4); // 20 bytes, no options
+
+    // window-scale option goes ONLY on syn / syn-ack segments (rfc 1323). it is
+    // 3 bytes (kind=3,len=3,shift); pad with a leading nop to keep the header a
+    // 4-byte multiple, giving a 24-byte header (data offset 6). for a client
+    // syn we always offer it; for a syn-ack we echo it only if the peer's syn
+    // offered scaling (wscale_ok), so a non-scaling peer gets a plain header
+    // back. (satoru)
+    int opt_len = 0;
+    bool emit_wscale = (flags & TCP_FLAG_SYN) &&
+                       (sock->tcp_state == TCP_SYN_SENT || sock->wscale_ok);
+    if (emit_wscale) {
+        uint8_t* opt = buf + sizeof(TCPHeader);
+        opt[0] = TCP_OPT_NOP;
+        opt[1] = TCP_OPT_WSCALE;
+        opt[2] = 3;
+        opt[3] = TCP_RCV_WSCALE;
+        opt_len = 4;
+        sock->rcv_wscale = TCP_RCV_WSCALE;   // we have committed to scaling our rx window (satoru)
+    }
+    int hdr_words = (int)(sizeof(TCPHeader) + opt_len) / 4;
+    tcp->data_offset = (uint8_t)(hdr_words << 4);
     tcp->flags = flags;
     // advertise the ACTUAL free space in our rx ring, recomputed at every
-    // emission, so the peer never overruns the buffer (clamp to >=0) (satoru)
+    // emission, so the peer never overruns the buffer (clamp to >=0). once
+    // scaling is in effect (rcv_wscale>0, only after a syn that carried the
+    // option), shift the byte count down into the 16-bit window field; the peer
+    // shifts it back up by the same amount. the syn segment itself is NEVER
+    // scaled (rfc 1323), so on a syn we send the raw (clamped) value. (satoru)
     int rx_free = TCP_RX_BUFSIZE - sock->rx_count;
     if (rx_free < 0) rx_free = 0;
-    if (rx_free > 0xFFFF) rx_free = 0xFFFF;
-    sock->tcp_window = (uint16_t)rx_free;
-    tcp->window = htons((uint16_t)rx_free);
+    uint32_t adv = (uint32_t)rx_free;
+    if (!(flags & TCP_FLAG_SYN) && sock->rcv_wscale)
+        adv >>= sock->rcv_wscale;
+    if (adv > 0xFFFFu) adv = 0xFFFFu;
+    sock->tcp_window = (uint16_t)adv;
+    tcp->window = htons((uint16_t)adv);
     tcp->checksum = 0;
     tcp->urgent = 0;
 
     if (data && len > 0) {
         if (len > TCP_MSS) len = TCP_MSS;
         const uint8_t* src = (const uint8_t*)data;
-        for (int i = 0; i < len; i++) buf[sizeof(TCPHeader) + i] = src[i];
+        for (int i = 0; i < len; i++) buf[sizeof(TCPHeader) + opt_len + i] = src[i];
     }
 
-    // compute tcp checksum (need pseudo-header with ip info)
+    // compute tcp checksum (need pseudo-header with ip info). TCPChecksum reads
+    // the data-offset field to learn the header length, so the option bytes
+    // (contiguous after the fixed header in buf) are covered automatically;
+    // `data`/`len` is just the application payload. (satoru)
     IPv4Header pseudo_ip;
     pseudo_ip.src_ip = htonl(local_ip);
     pseudo_ip.dst_ip = htonl(sock->remote_ip);
@@ -979,7 +1084,7 @@ bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, i
     tcp->checksum = htons(TCPChecksum(&pseudo_ip, tcp, data, len));
 
     stats.tcp_tx++;
-    bool ok = SendIPv4(sock->remote_ip, IP_PROTO_TCP, buf, sizeof(TCPHeader) + len);
+    bool ok = SendIPv4(sock->remote_ip, IP_PROTO_TCP, buf, sizeof(TCPHeader) + opt_len + len);
     if (!ok) return false;
 
     if (track_pending) {
@@ -1055,11 +1160,7 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
 
         int space = TCP_RX_BUFSIZE - sock->rx_count;
         int copy = payload_len < space ? payload_len : space;
-        for (int j = 0; j < copy; j++) {
-            sock->rx_buf[sock->rx_tail] = payload[j];
-            sock->rx_tail = (sock->rx_tail + 1) % TCP_RX_BUFSIZE;
-            sock->rx_count++;
-        }
+        tcp_ring_push(sock, payload, copy);
         return;
     }
 
@@ -1292,32 +1393,62 @@ int TCPStack::Recv(int sock, void* buf, int max_len) {
     if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
 
     NetSocket* s = &sockets[sock];
+
+    // throttled rx diagnostics (~every 2s): nic missed-packets (ring overflow),
+    // total rx bytes, and the current ring occupancy. lets a headless bulk
+    // download show whether the nic is dropping frames (the retransmit-stall
+    // throughput killer) vs flowing cleanly. (satoru)
+    {
+        static uint32_t last_diag_ms = 0;
+        uint32_t now = Timer::GetTicks();
+        if ((uint32_t)(now - last_diag_ms) >= 2000u) {
+            last_diag_ms = now;
+            slog("[NETDIAG] rx_missed=");
+            slognum((int)E1000::GetRxMissed());
+            slog("[NETDIAG]   rx_kb=");
+            slognum((int)(E1000::GetRxBytes() / 1024));
+            slog("[NETDIAG]   ring_used=");
+            slognum(s->rx_count);
+        }
+    }
+
     if (s->rx_count == 0) return 0;
 
     // free space BEFORE we drain  -  this is roughly what the peer last saw us
     // advertise. (satoru)
     int free_before = TCP_RX_BUFSIZE - s->rx_count;
 
+    // drain the ring into the caller's buffer with at most two bulk memcpy
+    // spans (the bytes up to the wrap, then the rest), instead of the old
+    // per-byte loop. at a 256 kb window a single Recv can move a quarter
+    // megabyte, so the per-byte loop was pure cpu overhead on the hot download
+    // path. (satoru)
     uint8_t* dst = (uint8_t*)buf;
-    int count = 0;
-    while (count < max_len && s->rx_count > 0) {
-        dst[count++] = s->rx_buf[s->rx_head];
-        s->rx_head = (s->rx_head + 1) % TCP_RX_BUFSIZE;
-        s->rx_count--;
+    int count = max_len < s->rx_count ? max_len : s->rx_count;
+    if (count > 0) {
+        int head = s->rx_head;
+        int first = TCP_RX_BUFSIZE - head;     // bytes until the ring wraps (satoru)
+        if (first > count) first = count;
+        memcpy(dst, s->rx_buf + head, (size_t)first);
+        int rem = count - first;
+        if (rem > 0) memcpy(dst + first, s->rx_buf, (size_t)rem);
+        s->rx_head = (head + count) % TCP_RX_BUFSIZE;
+        s->rx_count -= count;
     }
 
     // window-update ack: on a bulk download the rx ring fills and our
     // advertised window collapses toward 0, so the peer stops sending. once the
     // app drains the ring the window reopens  -  but tcp only learns that if we
     // emit a segment. without this, slirp deadlocks waiting for a window update
-    // that never comes (the 235 mb firefox tar stalled after ~4 kb). when the
-    // window was small before the drain and is now substantially larger, send a
-    // pure ack carrying the fresh (large) window. SendTCP recomputes the window
-    // from rx_count at emission time. (satoru)
+    // that never comes (the 235 mb firefox tar stalled after ~4 kb). emit a
+    // pure ack (which recomputes + carries the fresh, scaled window) whenever
+    // the drain meaningfully reopens the window: either the ring was at least
+    // half full before draining, or we just freed >= 2 mss. SendTCP recomputes
+    // the window from rx_count at emission time. (satoru)
     if (count > 0 && s->type == SOCK_STREAM && s->tcp_state == TCP_ESTABLISHED) {
-        int free_after = TCP_RX_BUFSIZE - s->rx_count;
-        if (free_before < (TCP_RX_BUFSIZE / 2) &&
-            free_after - free_before >= (TCP_MSS * 2)) {
+        bool was_pressured = free_before < (TCP_RX_BUFSIZE / 2);
+        bool freed_a_lot   = count >= (TCP_MSS * 2);
+        if (was_pressured && freed_a_lot) {
             SendTCP(s, TCP_FLAG_ACK, nullptr, 0);
         }
     }
