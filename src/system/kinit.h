@@ -304,6 +304,23 @@ void RegisterShellCommands(void* shell);
 // append "<uptime_ms> <event> <service> <detail>" to services.log. (satoru)
 void LogEvent(const char* event, const char* service, const char* detail);
 
+// ── kdf (kernel driver framework) integration (satoru) ────────────────────────
+// register a kdf-sandboxed kernel driver as a supervised in-kernel kinit unit.
+// kinit owns the (re-)init policy: it brings the driver up via KDF::Start at the
+// given boot target, and a kdf guard-page crash (reported through
+// NotifyDriverCrash) is run through the same backoff + 5-in-60s machinery as any
+// other in-kernel unit, re-running KDF::Start to re-init the driver. `init` is
+// the driver's kdf init entry (the same one passed to KDF::RegisterDriver, which
+// this calls for you). returns the kinit service index, or -1. (satoru)
+typedef bool (*KdfDriverInit)();
+int RegisterKdfDriver(const char* name, KdfDriverInit init, KTarget target,
+                      bool critical);
+
+// the bridge KDF calls (via KDF::SetCrashNotifier) when a driver's guard page
+// faults: looks up the matching kdf-driver unit and schedules a backoff restart
+// (honouring the burst limit). safe to call from the fault path. (satoru)
+void NotifyDriverCrash(const char* driver, const char* reason);
+
 }  // namespace KInit
 
 // end (satoru)

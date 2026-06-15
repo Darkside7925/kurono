@@ -7,6 +7,7 @@
 #include "../proc/scheduler.h"
 #include "../kernel/userspace.h"   // Userspace::HandleProcessExit for user-fault termination (satoru)
 #include "../kernel/vmm.h"         // resolve user va->phys to dump the tls/tcb at a fault (satoru)
+#include "../kernel/kdf.h"         // kdf guard-page fault isolation (catches driver oob -> no panic) (satoru)
 
 //  x86_64 idt, pic 8259a, and isr implementation
 //  isr stubs live in isr_stubs.asm  -  this file builds the idt from the
@@ -332,6 +333,20 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             //    Runs first so user-mode demand-zero handling never sees
             //    these faults.
             if (Scheduler::TryGrowGuardPage(frame->cr2)) {
+                return;
+            }
+            // 1.5) KDF driver guard-page isolation: if CR2 lands in a kdf
+            //      driver's fenced dma/mmio window (a guard page or a quarantined
+            //      region), the kdf hook quarantines the region, dumps regs, logs,
+            //      reports the crash to kinit, and longjmps the faulting driver
+            //      operation back to its RunGuarded() call-site (it DOES NOT
+            //      return in that case). when there is no armed sandbox to unwind
+            //      to it returns true after quarantining, so we still avoid the
+            //      kernel panic. only kdf addresses are claimed; everything else
+            //      falls through to the normal user/kernel fault path below.
+            //      this is the load-bearing "a driver crash doesn't take down the
+            //      kernel" path of the hybrid architecture. (satoru)
+            if ((frame->cs & 3) == 0 && KDF::HandleGuardFault(frame->cr2, frame->rip)) {
                 return;
             }
             // 2) User-mode page-fault dispatch (demand-zero, COW, etc.).

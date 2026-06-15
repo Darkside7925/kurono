@@ -47,6 +47,7 @@
 #include "../system/vconsole.h"
 #include "../system/logging.h"
 #include "../system/kinit.h"          // service + init manager (satoru)
+#include "kdf.h"                       // kernel driver framework (hybrid-kernel ring-0+ sandbox) (satoru)
 #include "../system/kpkg_daemon.h"    // background package install daemon (satoru)
 #include "../system/kdaemons.h"       // kupdate + ksecurity service daemons (satoru)
 #include "../system/systemd_compat.h" // systemd compatibility shim (-> kinit) (satoru)
@@ -1729,8 +1730,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     TimeManager::SetTimezoneMinutes(0);
     TimeManager::EnableDST(false);
 
+    // ── KDF: kernel driver framework (hybrid-kernel ring-0+ sandbox) ────
+    // bring up the guard-page driver framework BEFORE any driver inits, since
+    // Installer::MountDataDisk() below runs NVMe::Init() (the first kdf-migrated
+    // driver) during the kvfs mount. kdf only needs vmm+pmm, both already up.
+    // the kinit crash-restart notifier is wired later (after KInit::Init). (satoru)
+    SerialLogger::Log("[KDF] Init...\r\n");
+    KDF::Init();
+
     SerialLogger::Log("[KVFS] Init...\r\n");
     KVFS::Init();
+    // kvfs is up now: let kdf mirror its driver log to /kurono/var/log/drivers.log. (satoru)
+    KDF::EnableFileLog();
     // bring up + mount a persistent ext4 data disk (if attached) BEFORE restoring,
     // so kvfs.img survives a reboot on a normal boot  -  not just after an install.
     // Installer::Init() runs much later, so do the mount here ourselves. (satoru)
@@ -2500,6 +2511,11 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // arm the bounded kinit self-test services before Init registers them. (satoru)
     if (boot_kinit_test) KInit::EnableTestServices(KInit::KTEST_ALL);
     KInit::Init();
+    // wire the kdf -> kinit crash-restart bridge now that kinit's service model
+    // exists: a kdf guard-page fault calls ReportCrash -> this notifier -> kinit
+    // looks up the matching kdf-driver service and runs its restart/backoff
+    // policy (which re-inits the driver via kdf). (satoru)
+    KDF::SetCrashNotifier(KInit::NotifyDriverCrash);
     KInit::RegisterShellCommands(&shell_instance);
     KpkgDaemon::RegisterShellCommands(&shell_instance);
     KUpdate::RegisterShellCommands(&shell_instance);

@@ -167,6 +167,7 @@ CXX_SRCS = \
     $(SRC)/kernel/buddy.cpp \
     $(SRC)/kernel/slab.cpp \
     $(SRC)/kernel/vmm.cpp \
+    $(SRC)/kernel/kdf.cpp \
 	$(SRC)/kernel/userspace.cpp \
 	$(SRC)/kernel/elf_loader.cpp \
     $(SRC)/kernel/time.cpp \
