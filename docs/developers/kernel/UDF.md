@@ -1,12 +1,12 @@
-# UDF  -  User Driver Framework
+# UDF, User Driver Framework
 
 Kurono's answer to Windows UMDF: the **ring-3** tier of the hybrid kernel. A driver
 that does not need ring 0 (a WiFi control plane, USB-HID, USB-storage, a printer)
 runs as an ordinary kinit-managed Linux user process and reaches hardware **only**
-through a thin kernel proxy. This is the strongest isolation Kurono offers  -  a real
+through a thin kernel proxy. This is the strongest isolation Kurono offers, a real
 CPL-3 address space, so a wild pointer or a crash cannot touch kernel memory at all
 (unlike a KDF driver, which shares the kernel page tables and is only guard-fenced).
-The tradeoff is a syscall round-trip per call (~10 - 15 µs), so performance-critical
+The tradeoff is a syscall round-trip per call (~10-15 µs), so performance-critical
 drivers stay in ring 0 / KDF.
 
 Source: `src/kernel/udf.{h,cpp}`, the `SYS_UDF_CALL` dispatch added surgically to
@@ -16,7 +16,7 @@ Source: `src/kernel/udf.{h,cpp}`, the `SYS_UDF_CALL` dispatch added surgically t
 ## How it works
 
 A ring-3 driver calls `udf_call(op, a0..a3)` through the **`SYS_UDF_CALL`** syscall
-(number `0x4B554446`, "KUDF" in ASCII  -  well outside the Linux syscall space, so it
+(number `0x4B554446`, "KUDF" in ASCII, well outside the Linux syscall space, so it
 never collides). The kernel `UDFProxy`:
 
 1. Validates user pointers (non-null, in the canonical lower half) before any
@@ -69,7 +69,7 @@ alongside KDF / IRP / KExec status.
 
 - The framework, the `SYS_UDF_CALL` dispatch, the proxy registry, the request
   queue, and the kinit proxy-death bridge are **real and built**. No ring-3 UDF
-  *driver* ships yet  -  `wifi_udf` and `usb_hid_udf` are the first candidates
+  *driver* ships yet, `wifi_udf` and `usb_hid_udf` are the first candidates
   (WiFi has no QEMU hardware to test against; USB-HID is the more testable one).
 - Wiring a normalized `UDF_OP_HID_REPORT` event into the kernel input dispatch is a
   documented follow-up (the input manager has no public synthetic-inject API yet);
@@ -78,5 +78,5 @@ alongside KDF / IRP / KExec status.
 - A per-request completion table (so a poster blocks for a specific async result)
   is a follow-up; today `UDF_OP_COMPLETE` acknowledges and the WiFi ops are
   fire-and-queue.
-- Each `udf_call` adds the syscall round-trip (~10 - 15 µs); this is the cost of the
+- Each `udf_call` adds the syscall round-trip (~10-15 µs); this is the cost of the
   ring-3 isolation and is why the perf-critical drivers stay in ring 0 / KDF.
