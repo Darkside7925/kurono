@@ -27,8 +27,6 @@
 #include "../shell/shell.h"
 #include "../net/unix_socket.h"          // socket activation + sd_notify listener (satoru)
 #include "../proc/cgroup.h"              // CPUQuota -> cpu.weight, MemoryMax charge (satoru)
-#include "../kernel/vmm.h"               // isolation: own address space + guard pages (satoru)
-#include "../kernel/pmm.h"               // isolation: frame allocation (satoru)
 #include "../kernel/heap.h"              // test memhog allocations (satoru)
 #include "kpkg_daemon.h"
 #include "kdaemons.h"
@@ -1553,6 +1551,18 @@ void register_test_services() {
         RegisterInkernel("kt-cyc-b", "test: cyclic dep B", KTGT_USER,
                          noop_start, noop_stop, nullptr, "kt-cyc-a", KRESTART_NO, 2000, false);
     }
+    if (g_test_bits & KTEST_SANDBOX) {
+        // a dedicated service for the runtime capability sandbox: declares
+        // filesystem but NOT network, so CheckCapability can assert a granted
+        // capability passes (session-gated) and an undeclared one is denied. (satoru)
+        int idx = RegisterInkernel("kt-cap", "test: runtime capability sandbox", KTGT_USER,
+                                   noop_start, noop_stop, nullptr, "", KRESTART_NO, 2000, false);
+        if (idx >= 0) {
+            g_services[idx].enabled = false;
+            g_services[idx].caps.filesystem = true;
+            g_services[idx].caps.network = false;
+        }
+    }
 
     // seed on-disk fixtures for the template + user-session + hot-reload checks.
     // these are process units (Exec=...) whose binaries do not exist, which is
@@ -2038,6 +2048,44 @@ int Analyze(char* out, int mx) {
     return p;
 }
 
+// ── runtime capability sandboxing (satoru) ───────────────────────────────────
+// enforce a service's declared [Capabilities] at RUNTIME via SUPR. an in-kernel
+// service calls this before a privileged op; a process unit can route a request
+// here too. the decision combines (1) what the .kservice GRANTED the unit and
+// (2) the live SUPR session level (a guest/disabled session cannot exercise a
+// privileged capability even if the unit declared it). every denial is audited.
+// this is enforced at the points documented in KINIT.md. (satoru)
+bool CheckCapability(const char* service, uint32_t cap) {
+    int idx = find_index(service);
+    if (idx < 0) return false;
+    const KService* s = &g_services[idx];
+
+    // (1) did the unit declare this capability? (satoru)
+    bool declared =
+        (cap == KCAP_NETWORK    && s->caps.network) ||
+        (cap == KCAP_FILESYSTEM && s->caps.filesystem) ||
+        (cap == KCAP_GUI        && s->caps.gui);
+    if (!declared) {
+        LogEvent("cap-deny", service, (cap == KCAP_NETWORK) ? "network (not granted)" :
+                                       (cap == KCAP_FILESYSTEM) ? "filesystem (not granted)" : "gui (not granted)");
+        RuntimeLog::LogSecurity("kinit runtime capability denied", service);
+        return false;
+    }
+
+    // (2) for the privileged capabilities, require a live logged-in SUPR session.
+    // gui is not privileged (any session may draw). (satoru)
+    if (cap == KCAP_NETWORK || cap == KCAP_FILESYSTEM) {
+        int sid = SUPR::GetCurrentSession();
+        SUPRLevel lvl = (sid >= 0) ? SUPR::GetLevel(sid) : SUPR_GUEST;
+        if (lvl < SUPR_USER) {
+            LogEvent("cap-deny", service, "no privileged session");
+            RuntimeLog::LogSecurity("kinit runtime capability denied (session)", service);
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── headless self-test harness (satoru) ──────────────────────────────────────
 void EnableTestServices(uint32_t bits) { g_test_bits = bits; }
 
@@ -2250,6 +2298,24 @@ void RunSelfTests() {
         SerialLogger::Log("[kinit-test] USERSESSION "); SerialLogger::Log(d);
         SerialLogger::Log((reg && gone && started >= 1 && stopped >= 1) ? "  PASS (registered on login, removed on logout)\r\n"
                                                                         : "  FAIL\r\n");
+    }
+
+    // (J) runtime capability sandbox: a capability the unit did NOT declare is
+    // denied regardless of session (deterministic); a declared one is gated on the
+    // session. kt-cap declares filesystem but not network. (satoru)
+    if (g_test_bits & KTEST_SANDBOX) {
+        bool net_denied = !CheckCapability("kt-cap", KCAP_NETWORK);   // not declared -> always denied (satoru)
+        bool fs_result  =  CheckCapability("kt-cap", KCAP_FILESYSTEM); // declared -> session-gated (satoru)
+        char d[64];
+        int q = 0;
+        q = ki_cat(d, q, (int)sizeof(d), "net-denied="); q = ki_cat(d, q, (int)sizeof(d), net_denied ? "1" : "0");
+        q = ki_cat(d, q, (int)sizeof(d), " fs-allowed="); q = ki_cat(d, q, (int)sizeof(d), fs_result ? "1" : "0");
+        LogEvent("test-sandbox", "-", d);
+        SerialLogger::Log("[kinit-test] SANDBOX "); SerialLogger::Log(d);
+        // the load-bearing assertion is that an undeclared capability is denied at
+        // runtime; the declared one's grant depends on the live session. (satoru)
+        SerialLogger::Log(net_denied ? "  PASS (undeclared capability denied at runtime)\r\n"
+                                     : "  FAIL\r\n");
     }
 
     SerialLogger::Log("[kinit-test] ===== kinit self-tests end =====\r\n");
