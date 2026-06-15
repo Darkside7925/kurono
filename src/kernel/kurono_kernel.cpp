@@ -48,6 +48,7 @@
 #include "../system/logging.h"
 #include "../system/kinit.h"          // service + init manager (satoru)
 #include "../system/kpkg_daemon.h"    // background package install daemon (satoru)
+#include "../system/kdaemons.h"       // kupdate + ksecurity service daemons (satoru)
 #include "../system/kpaths.h"
 #include "../system/installer.h"
 #include "../system/ui_config.h"
@@ -2469,6 +2470,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     KInit::Init();
     KInit::RegisterShellCommands(&shell_instance);
     KpkgDaemon::RegisterShellCommands(&shell_instance);
+    KUpdate::RegisterShellCommands(&shell_instance);
+    KSecurity::RegisterShellCommands(&shell_instance);
 
     KVFS::Mkdirs("/home/user/Documents");
     KVFS::Mkdirs("/home/user/Downloads");
@@ -2948,9 +2951,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         RuntimeLog::LogBoot("preemptive scheduler engaged");
         // bring up kinit AFTER the canonical kernel processes: it adopts the
         // already-running in-kernel services (klog/knet/kdbus/kwayland/kaudio)
-        // as supervised units, sequences the boot targets, and spawns its crash
-        // monitor + the kpkg-daemon worker so they join the scheduler. (satoru)
-        KpkgDaemon::Init();
+        // as supervised units, sequences the boot targets (which start the
+        // kpkg-daemon / kupdate / ksecurity workers via their start hooks), and
+        // spawns its crash monitor  -  all joining the scheduler. (satoru)
         KInit::Boot();
         Scheduler::Start();
         // Unreachable.

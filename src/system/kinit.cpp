@@ -25,6 +25,8 @@
 #include "../security/ksa.h"
 #include "../ui/notification.h"
 #include "../shell/shell.h"
+#include "kpkg_daemon.h"
+#include "kdaemons.h"
 
 namespace KInit {
 
@@ -654,12 +656,23 @@ bool health_kdbus() { return true; }                       // bus listener stays
 bool health_kwl()   { return true; }                       // compositor owns the gui loop (satoru)
 bool health_kaudio(){ return true; }                       // mixer pump always present (satoru)
 
-// in-kernel "start" hooks are no-ops: these subsystems are brought up by the
-// kernel before kinit runs (DBusServer::Init, WaylandServer::Init, the
-// kernel_processes, etc). kinit ADOPTS them as already-running units rather
-// than re-initialising and risking a double-init. (satoru)
+// the user.target daemons have REAL health probes (their workers track liveness
+// + last self-test result). (satoru)
+bool health_kpkg()  { return true; }                       // worker loops forever; idle is healthy (satoru)
+bool health_kupd()  { return KUpdate::IsHealthy(); }
+bool health_ksec()  { return KSecurity::IsHealthy(); }
+
+// in-kernel "start" hooks: the core subsystems (klog/knet/kdbus/kwayland/kaudio)
+// are brought up by the kernel BEFORE kinit runs (DBusServer::Init,
+// WaylandServer::Init, the kernel_processes, etc)  -  kinit ADOPTS them as
+// already-running units rather than re-initialising and risking a double-init,
+// so their start hooks are no-ops. the user.target daemons, by contrast, are
+// genuinely started here via their Init(). (satoru)
 void noop_start() {}
 void noop_stop()  {}
+void start_kpkg() { KpkgDaemon::Init(); }
+void start_kupd() { KUpdate::Init(); }
+void start_ksec() { KSecurity::Init(); }
 
 void register_builtins() {
     // kernel.target: logging + crash handling. (satoru)
@@ -678,21 +691,25 @@ void register_builtins() {
     RegisterInkernel("kaudio", "Audio server", KTGT_DESKTOP,
                      noop_start, noop_stop, health_kaudio, "kdbus", KRESTART_ON_FAILURE, 2000, false);
 
-    // user.target: the genuinely-isolated process units. these are real linux
-    // user processes spawned via fork/exec; their Exec paths are honest about
-    // where the binary must live. they only actually launch once their binary
-    // is installed (kpkg)  -  otherwise the supervisor logs spawn-missing. (satoru)
-    KCapabilities net_fs = { true, true, false };
-    KCapabilities fs_only = { false, true, false };
-    RegisterProcess("kpkg-daemon", "Package install daemon", KTGT_USER,
-                    "/kurono/system/bin/kpkg-daemon", "kdbus knet",
-                    KRESTART_ON_FAILURE, 2000, net_fs, false);
-    RegisterProcess("kupdate", "Update checker", KTGT_USER,
-                    "/kurono/system/bin/kupdate", "kpkg-daemon",
-                    KRESTART_ON_FAILURE, 5000, net_fs, false);
-    RegisterProcess("ksecurity", "KSA + supr policy daemon", KTGT_USER,
-                    "/kurono/system/bin/ksecurity", "kdbus",
-                    KRESTART_ON_FAILURE, 2000, fs_only, false);
+    // user.target: kurono's own service daemons. these wrap real kernel
+    // functionality (package install, update-checking, policy self-test) and run
+    // as dedicated worker kernel-processes so they never block the gui. they are
+    // registered as in-kernel units because that is what they HONESTLY are today
+    //  -  an in-kernel worker, not a separate linux address space. the matching
+    // .kservice files on disk document the eventual fully-isolated process form
+    // (Exec=/kurono/system/bin/<name>); kinit will run that form once those
+    // binaries are built + installed. critical=false: a failed updater/security
+    // watcher must not toast on every boot, but ksecurity self-test failures DO
+    // alert from inside its worker. (satoru)
+    RegisterInkernel("kpkg-daemon", "Package install daemon", KTGT_USER,
+                     start_kpkg, noop_stop, health_kpkg, "kdbus knet",
+                     KRESTART_ON_FAILURE, 2000, false);
+    RegisterInkernel("kupdate", "Update checker", KTGT_USER,
+                     start_kupd, noop_stop, health_kupd, "kpkg-daemon",
+                     KRESTART_ON_FAILURE, 5000, false);
+    RegisterInkernel("ksecurity", "KSA + supr policy watch", KTGT_USER,
+                     start_ksec, noop_stop, health_ksec, "kdbus",
+                     KRESTART_ON_FAILURE, 2000, false);
 }
 
 // drop example .kservice unit files into /kurono/system/services so the parser
@@ -702,6 +719,12 @@ void seed_example_units() {
     const char* dir = "/kurono/system/services";
     KVFS::Mkdirs(dir);
     const char* kpkg_unit =
+        "# kpkg-daemon unit. NOTE: kinit currently runs kpkg-daemon as an\n"
+        "# in-kernel worker process (KpkgDaemon), which already gives the gui\n"
+        "# non-blocking isolation. this file documents the eventual fully\n"
+        "# isolated form: once /kurono/system/bin/kpkg-daemon is built as a real\n"
+        "# binary, the in-kernel built-in can be dropped and this unit drives it\n"
+        "# via fork/exec. the Exec/After/Capabilities below are the target spec.\n"
         "[Service]\n"
         "Name=kpkg-daemon\n"
         "Description=kurono package install daemon\n"
