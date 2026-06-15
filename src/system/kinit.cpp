@@ -29,6 +29,7 @@
 #include "../proc/cgroup.h"              // CPUQuota -> cpu.weight, MemoryMax charge (satoru)
 #include "../kernel/heap.h"              // test memhog allocations (satoru)
 #include "../kernel/kdf.h"               // kdf-sandboxed kernel driver supervision (satoru)
+#include "../kernel/udf.h"               // udf proxy-death notification on process exit (satoru)
 #include "kpkg_daemon.h"
 #include "kdaemons.h"
 
@@ -1301,6 +1302,12 @@ void Tick() {
             g_sup[i].in_use && g_sup[i].exited && !g_sup[i].running) {
             g_sup[i].exited = false;
             int rc = g_sup[i].exit_code;
+
+            // if this process was a udf (ring-3) driver, tell the user driver
+            // framework its proxy died so the proxy's class ops return UDF_EDEAD
+            // until it re-registers after the restart. harmless for a non-udf
+            // process (no proxy matches the pid). (satoru)
+            if (s->pid > 0) UDF::NotifyProxyDied(s->pid);
 
             // a clean oneshot is just done. (satoru)
             if (s->kind == KUNIT_ONESHOT) {
