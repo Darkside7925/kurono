@@ -2,6 +2,12 @@
 
 **Last Updated:** June 2026
 
+## What's New (latest)
+
+- **Security hardening pass (whole-OS audit).** ~68 issues triaged; **~20 confirmed memory-safety bugs fixed + merged so far**, more in progress. Fixed: media-codec integer-overflow heap overflows (AAC/FLAC/WAV/MP3/MP4) + an MP4 box-recursion stack overflow; two remotely-triggerable D-Bus stack overflows (`ListNames`, `send_method_return`); a 9p (`v9fs`) **guest→host VM-escape** (`DoRead`/`DoWrite`/`DoStat`/`DoReadDir` walked past a single-translated guest buffer into host memory); GPU/HDA 64-bit-BAR dereference-before-map bugs; ext4/KFS/NVMe "trust-the-on-disk-data" validation (ext4 superblock/dir-entry/extent-header, KFS superblock-on-mount, NVMe SQ serialization + untrusted-shift clamp); interpreter overflow/recursion caps (KCL `*` overflow, KCL/KJ parser+eval depth, KJ `val_to_str`, mini-Python string-repeat); shell 64 KB read buffers (`cat`/`head`/`tail`/`wc`/`sort`/`uniq`/`type`) moved stack→heap; plus loader/net bounds (ELF `RELATIVE` reloc, `kls` PT_LOAD, `ProcIndex` copy, guest-fb blit clip, VMM huge-page flag-drop). **Honest:** ~20 of ~68 are done; the rest (incl. concurrency/perf) are open. Not bug-free / not production-ready.
+- **Real wireless-NIC hardware layer (`src/drivers/wifi_dev.{cpp,h}`).** Walks the PCI bus for wireless controllers, identifies the exact chip (Intel AX2xx/9xxx/8xxx/7xxx, Atheros AR9xxx + Qualcomm QCA, Realtek, Broadcom), maps the 64-bit MMIO BAR, and enables bus-mastering  -  the foundation a radio driver sits on. Wired into `WiFi::ProbePCIWireless()` in `src/net/network.cpp`; the tray + setup wizard show the detected chip. **Hardware-detect/ID only:** the shared 802.11 MAC (scan/auth/assoc) + WPA2 software stack is in progress, per-vendor radio/firmware drivers are next, and bring-up needs real hardware (QEMU has no WiFi NIC). **No association yet.**
+- **Net throughput.** TCP send moved from stop-and-wait to a fixed multi-segment send window; the ~1 ms network wait loops yield instead of busy-spinning.
+
 ## What's New (June 2026)
 
 Big one this month: I moved the whole dev setup off Windows/WHPX onto **Linux + KVM**. Faster, and it fixed a stack of networking/input weirdness WHPX was causing. There's a `./start.sh` now that builds + boots in one shot.
@@ -65,6 +71,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - [x] **CPU Detect** -- x86 CPUID vendor/brand/family/model/stepping, feature flag extraction (SSE4.2, AVX, AVX-512, FMA, AES-NI, SHA-NI), log output on kernel init
 - [x] **SB16 Audio** -- Sound Blaster 16, ISA DMA, PlayTone/Beep/GenerateBuffer, master volume, 22050 Hz, 32 KB DMA buffer
 - [x] **Intel E1000** -- 82540EM NIC, PCI MMIO BAR mapping, TX/RX descriptor rings (32 each), MAC address read, stats
+- [~] **WiFi hardware layer** (`wifi_dev`, new, not in the "19" count) -- PCI detect of wireless NICs + exact chip ID (Intel AX2xx/9xxx/8xxx/7xxx, Atheros/QCA, Realtek, Broadcom), 64-bit MMIO BAR map, bus-master enable. Hardware-detect/ID only; 802.11 MAC + WPA2 stack in progress, per-vendor radio drivers next, needs real hardware (QEMU has no WiFi NIC)  -  no association yet
 - [x] **PS/2 Keyboard** -- Full scancode handling, drain-all-chars-per-frame input loop
 - [x] **PS/2 Mouse** -- 1000 Hz polling, 1600 DPI scaling, auto-draw gate (prevents double cursor)
 - [x] **PIT Timer** -- Real-time polling, WaitMs(), interrupt-driven frame pacing
@@ -111,7 +118,7 @@ The OS builds successfully as an x86_64 Multiboot ELF kernel and bootable ISO, a
 - [~] **Browser**  -  the GUI tile is a deliberate placeholder (use `curl <url>` today). The real browser path is **Firefox on the Linux runtime**: Firefox 140.11.0esr is cross-compiled against musl + Wayland (see *Firefox-Class Userspace Runtime* below), the OS provides the syscalls/IPC/Wayland it targets, and on-device `ld-kurono` already loads libxul's full closure so the **Gecko engine runs** (XPCOM + Gecko app code + child-process spawn). What's left is a **rendered window** (e10s IPC + a musl symbol/threading issue), not the old pointer-ABI limit (that cap is lifted).
 - [x] **Media Player v2.0** -- Real video viewport rendering (raw data visualization with FPS counter, scanline effect, cinematic vignette), heap-allocated 256KB decode buffer (was 32KB), correct file_size via KVFS::GetFileSize(), cached video metadata (no per-frame file reads), codec badge + backend indicator + volume slider, audio SB16→AC97→HDA routing
 - [x] **Settings** -- 12-tab settings (`STAB_COUNT=12`: Display/Sound/Network/Storage/Power/Personalize/Security/Packages/Updates/System/About/Accessibility) with real resolution change via BGA::SetMode, deferred apply, apps reopen after switch
-- [x] **Task Manager** -- Process list, CPU/memory stats, auto-refresh
+- [x] **Task Manager** -- Overhauled tabbed UI (Processes / Performance / Services / Details): sortable process columns, per-process kill, live CPU-history graph, honest RAM accounting from the PMM, disk/network counters, auto-refresh
 
 ### Hybrid Shell (~153 commands)
 - [x] **KuronoShell** -- Command registry (256 max), environment switching, variable expansion, aliases, history (128 entries). ~153 distinct commands are registered across the whole tree (`RegisterCommand` calls in `src/shell/*`, `src/apps/kj.cpp`, `src/kcl/`, `src/packages/`, `src/linux/`, `src/net/`, `src/system/installer.cpp`, etc.)

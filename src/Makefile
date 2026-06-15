@@ -284,6 +284,7 @@ CXX_SRCS = \
     $(SRC)/drivers/nvidia_gpu.cpp \
     $(SRC)/drivers/intel_gpu.cpp \
     $(SRC)/drivers/e1000.cpp \
+    $(SRC)/drivers/wifi_dev.cpp \
     $(SRC)/drivers/nvme.cpp \
     $(SRC)/drivers/usb.cpp \
     $(SRC)/drivers/hda.cpp \
@@ -315,6 +316,9 @@ CXX_SRCS = \
     $(SRC)/net/ipv6.cpp \
     $(SRC)/net/netfilter.cpp \
     $(SRC)/net/unix_socket.cpp \
+    $(SRC)/net/wifi_crypto.cpp \
+    $(SRC)/net/ieee80211.cpp \
+    $(SRC)/net/ieee80211_test.cpp \
     $(SRC)/proc/cgroup.cpp \
     $(SRC)/drivers/tpm.cpp \
     $(SRC)/drivers/pulse_server.cpp \
