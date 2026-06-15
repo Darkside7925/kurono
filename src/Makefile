@@ -169,6 +169,9 @@ CXX_SRCS = \
     $(SRC)/kernel/vmm.cpp \
     $(SRC)/kernel/kdf.cpp \
     $(SRC)/kernel/kdf_test.cpp \
+    $(SRC)/kernel/udf.cpp \
+    $(SRC)/kernel/irp.cpp \
+    $(SRC)/kernel/kexec.cpp \
 	$(SRC)/kernel/userspace.cpp \
 	$(SRC)/kernel/elf_loader.cpp \
     $(SRC)/kernel/time.cpp \
