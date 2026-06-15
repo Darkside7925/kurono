@@ -335,8 +335,43 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                 return;
             }
             // 2) User-mode page-fault dispatch (demand-zero, COW, etc.).
-            if (LinuxSyscall::HandlePageFault(frame)) {
-                return;
+            //
+            //    A ring-3 fault can be a RESTARTABLE faulting SSE store: e.g.
+            //    musl's memcpy fast path `movups %xmm0,(mem)` faulting on the
+            //    first byte of a fresh demand-zero page. After we map the page
+            //    and IRET, the cpu RE-EXECUTES that store from %xmm0  -  so %xmm0
+            //    (the whole fpu/sse state) must be byte-identical to what the
+            //    faulting code held. But the #pf path runs kernel code that
+            //    touches xmm (memcpy/graphics inline asm, an IRQ-driven task
+            //    switch's fxrstor), clobbering %xmm0. That silently zeroed the
+            //    first 16 bytes of the page the restarted movups wrote  -  exactly
+            //    the lost atom[0x50]/[0x51] pointers that #pf'd xkbcommon. fix:
+            //    fxsave the user fpu/sse before handling and fxrstor it right
+            //    before returning to ring-3, mirroring the SYSCALL fast path.
+            //    skip the restore if the handler switched tasks (the new task's
+            //    state was already loaded). (satoru)
+            if ((frame->cs & 3) == 3) {
+                // fxsave/fxrstor require a 16-byte-aligned operand. the ISR stub
+                // does not guarantee the SysV stack alignment the compiler assumes
+                // for an alignas(16) stack object (the hand-written stub leaves
+                // rsp 16-aligned at the call, not the ABI rsp%16==8), so align the
+                // pointer at runtime instead of trusting alignas. (satoru)
+                uint8_t fxraw[512 + 16];
+                uint8_t* fx = (uint8_t*)(((uintptr_t)fxraw + 15) & ~(uintptr_t)15);
+                __asm__ __volatile__("fxsave (%0)" :: "r"(fx) : "memory");
+                void* before = (void*)Scheduler::GetCurrentProcess();
+                bool handled = LinuxSyscall::HandlePageFault(frame);
+                if (handled) {
+                    void* after = (void*)Scheduler::GetCurrentProcess();
+                    if (after == before) {
+                        __asm__ __volatile__("fxrstor (%0)" :: "r"(fx) : "memory");
+                    }
+                    return;
+                }
+            } else {
+                if (LinuxSyscall::HandlePageFault(frame)) {
+                    return;
+                }
             }
         }
 
