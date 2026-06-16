@@ -67,6 +67,7 @@
 #include "../kcl/kcl.h"
 #include "../kcl/kcl_test.h"
 #include "../net/ieee80211_test.h"  // 802.11i wpa2 crypto self-test (kurono.wifitest) (satoru)
+#include "kmemx.h"             // kmemx memory compression engine (satoru)
 #include "kmemx_test.h"        // kmemx memory-compression self-test (kurono.kmemxtest) (satoru)
 #include "../apps/kj.h"        // kj (kurono javascript) interpreter (satoru)
 #include "../apps/kj_test.h"   // kj (kurono javascript) self-test suite (satoru)
@@ -1262,6 +1263,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     Buddy::Init();
     SerialLogger::Log("[2b] Slab::Init\r\n");
     Slab::Init();
+    // [2c] kmemx (memory compression engine): reserve the compressed-page pool +
+    // metadata table now, while contiguous memory is plentiful (it allocates the
+    // table first, then a free-memory-bounded pool). this only RESERVES the
+    // infrastructure; whether the engine is enabled + its worker process started
+    // is decided later from config at the kernel.target (see kmemx.enabled). the
+    // never-compress list for dma rings / framebuffer / ept is registered by the
+    // owning subsystems as they come up. (satoru)
+    SerialLogger::Log("[2c] KMemX::Init\r\n");
+    KMemX::Init(20);
     vga_puts("Scheduler init...\n");
     SerialLogger::Log("[3] Scheduler::Init\r\n");
     Scheduler::Init();

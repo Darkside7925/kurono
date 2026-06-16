@@ -473,6 +473,86 @@ static bool test_vmm_aging() {
     return fail == 0;
 }
 
+// ── stage 6: end-to-end compress -> real #pf -> decompress on a live page ────
+// the most important integration test: map a real frame at a scratch VA, fill it
+// with known content, CompressPage() it (which makes the leaf not-present +
+// marked and frees the frame), confirm it is no longer present, then TOUCH the
+// page. that read triggers a genuine #PF; the hal hook calls KMemX::HandleFault,
+// which decompresses the blob into a fresh frame, crc-verifies it, and restores
+// the leaf  -  so the touch must observe the original bytes. repeated over many
+// pages of varied content. proves the whole pipeline + the fault wiring. (satoru)
+static bool test_fault_roundtrip() {
+    if (!KMemX::IsInitialized() || !KMemX::IsEnabled()) {
+        SerialLogger::Log("KMEMX-TEST: fault_roundtrip FAIL (engine off)\r\n");
+        return false;
+    }
+    if (KMemXPool::TotalBytes() == 0) {
+        SerialLogger::Log("KMEMX-TEST: fault_roundtrip FAIL (no pool)\r\n");
+        return false;
+    }
+    uint64_t as = KernelVMM::GetCurrentAddressSpace();
+    int fail = 0, cycles = 0;
+    const int COUNT = 64;   // 64 live pages through the full pipeline (satoru)
+
+    for (int i = 0; i < COUNT; i++) {
+        uint64_t frame = PMM::AllocFrame();
+        if (!frame) break;
+        uint64_t va = 0x510000000ULL + (uint64_t)i * 0x2000ULL;   // spaced scratch VAs (satoru)
+        if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE)) { PMM::FreeFrame(frame); fail++; continue; }
+
+        // fill with a known pattern (kind cycles for variety). (satoru)
+        uint8_t* p = (uint8_t*)(uintptr_t)va;
+        make_page(p, i, 0xC0FFEEu + (uint32_t)i * 2654435761u);
+        uint32_t crc_before = KMemXLZ4::Crc32(p, PAGE);
+
+        // age the leaf to the threshold so it is eligible regardless of A-bit, then
+        // compress it explicitly. (CompressPage re-checks compressibility.) (satoru)
+        for (int a = 0; a < 16; a++) KernelVMM::KmemxAgeLeaf(as, va);
+        bool comp = KMemX::CompressPage(as, va);
+        if (!comp) {
+            // could legitimately decline (e.g. pool full)  -  clean up + skip. (satoru)
+            KernelVMM::UnmapPage(va, true);
+            continue;
+        }
+        // the leaf must now be not-present + marked. (satoru)
+        if (KernelVMM::KmemxIsLeafPresent(as, va)) { fail++; SerialLogger::Log("KMEMX-TEST: still present after compress\r\n"); }
+        if (!KernelVMM::KmemxIsCompressed(as, va)) { fail++; SerialLogger::Log("KMEMX-TEST: not marked compressed\r\n"); }
+
+        // TOUCH the page -> genuine #PF -> HandleFault decompresses + restores.
+        // read every byte and recompute the crc; it must match the pre-compress
+        // value exactly. (satoru)
+        volatile uint8_t* vp = (volatile uint8_t*)(uintptr_t)va;
+        uint8_t check[16];
+        for (int b = 0; b < 16; b++) check[b] = vp[b * 256];   // sample touches across the page (satoru)
+        (void)check;
+        uint32_t crc_after = KMemXLZ4::Crc32((const uint8_t*)(uintptr_t)va, PAGE);
+        if (crc_after != crc_before) { fail++; if (fail <= 3) { log_kv("KMEMX-TEST: fault page ", i); SerialLogger::Log(" crc mismatch after decompress\r\n"); } }
+        else cycles++;
+
+        // the page must be present + writable again. (satoru)
+        if (!KernelVMM::KmemxIsLeafPresent(as, va)) { fail++; SerialLogger::Log("KMEMX-TEST: not present after fault\r\n"); }
+        vp[0] = 0x77; if (vp[0] != 0x77) { fail++; }
+
+        // cleanup: free the (new) frame the fault path mapped. (satoru)
+        KernelVMM::UnmapPage(va, true);
+    }
+
+    const KMemX::Stats& st = KMemX::GetStats();
+    int mean_ns = st.faults_served ? (int)(st.ns_decompress_sum / st.faults_served) : 0;
+    SerialLogger::Log("KMEMX-TEST: fault_roundtrip ");
+    SerialLogger::Log(fail == 0 ? "PASS" : "FAIL");
+    log_kv(" cycles=", cycles);
+    log_kv(" fail=", fail);
+    log_kv(" faults_served=", (int)st.faults_served);
+    log_kv(" decomp_ns_min=", (int)st.ns_decompress_min);
+    log_kv(" decomp_ns_mean=", mean_ns);
+    log_kv(" decomp_ns_max=", (int)st.ns_decompress_max);
+    log_kv(" over_10us=", (int)st.decomp_over_10us);
+    log_kv(" comp_ns_max=", (int)st.ns_compress_max);
+    SerialLogger::Log("\r\n");
+    return fail == 0 && cycles > 0;
+}
+
 int RunAll() {
     SerialLogger::Log("KMEMX-TEST: starting\r\n");
     int pass = 0, total = 0;
@@ -490,6 +570,9 @@ int RunAll() {
 
     // stage 3: vmm page aging (generation counter in spare pte bits). (satoru)
     total++; if (test_vmm_aging())                 pass++;
+
+    // stage 6: end-to-end compress -> real page-fault -> decompress. (satoru)
+    total++; if (test_fault_roundtrip())           pass++;
 
     SerialLogger::Log("KMEMX-TEST: SUMMARY ");
     SerialLogger::LogDec(pass);

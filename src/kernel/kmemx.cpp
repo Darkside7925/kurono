@@ -4,8 +4,11 @@
 #include "kmemx_pool.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "panic.h"
 #include "../drivers/serial.h"
+#include "../drivers/cpu_detect.h"
 #include "../proc/spinlock.h"
+#include "../proc/scheduler.h"
 
 //  KMemX engine core. stage 2: pool + flat metadata table + stats + the
 //  never-compress list + the byte-level store/retrieve primitives. the pte
@@ -124,6 +127,27 @@ static uint32_t next_pow2(uint32_t v) {
     uint32_t p = 1;
     while (p < v) p <<= 1;
     return p;
+}
+
+// ── timing (rdtsc -> ns for the latency stats + invisibility budget) ────────
+static inline uint64_t rdtsc() {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+// tsc ticks per microsecond (cached; pre-warmed in Init so the fault path never
+// pays the CPUDetect::GetInfo() cost). guards against a 0 freq. (satoru)
+static uint64_t g_tsc_per_us = 0;
+static inline void timing_prewarm() {
+    if (g_tsc_per_us == 0) {
+        uint64_t hz = CPUDetect::GetInfo().frequency.tsc_frequency;
+        g_tsc_per_us = hz ? (hz / 1000000ULL) : 1000;   // assume ~1ghz if unknown (satoru)
+        if (g_tsc_per_us == 0) g_tsc_per_us = 1000;
+    }
+}
+static inline uint64_t tsc_to_ns(uint64_t cycles) {
+    if (g_tsc_per_us == 0) timing_prewarm();
+    return (cycles * 1000ULL) / g_tsc_per_us;
 }
 
 }  // namespace
@@ -293,6 +317,13 @@ bool Init(int pool_pct) {
     ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_hash, KMemXLZ4::SCRATCH_BYTES, "kmemx.scratch");
     ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_comp, (uint64_t)KMemXLZ4::CompressBound(PAGE), "kmemx.scratch2");
 
+    // pre-warm the fault hot path: build the crc32 table + cache the tsc freq now
+    // (one-time costs that would otherwise land on the FIRST decompression fault
+    // and blow its latency). a single crc over the scratch buffer builds the
+    // table; timing_prewarm caches the frequency. (satoru)
+    (void)KMemXLZ4::Crc32(g_scratch_comp, 64);
+    timing_prewarm();
+
     g_inited = true;
     SerialLogger::Log("[kmemx] initialized: pool=");
     SerialLogger::LogDec((int)(got / (1024 * 1024)));
@@ -418,19 +449,265 @@ void UnregisterGuest(uint64_t ept_root) {
     }
 }
 
-// ── stage-2 placeholder definitions (completed in later stages) ─────────────
-// these touch the page tables / scheduler and are fully implemented in stages 3
-// (aging), 5 (scan/process bulk ops), 6 (fault path), 9 (guests), 10 (dedup).
-// they are defined now (as safe no-ops) so the header's surface is stable and
-// the engine links cleanly at every stage boundary; each gets its real body in
-// its own stage's commit. (satoru)
-bool CompressPage(uint64_t /*as*/, uint64_t /*vaddr*/) { return false; }   // stage 5/6 (satoru)
-bool HandleFault(uint64_t /*fault_vaddr*/)             { return false; }   // stage 6 (satoru)
-int  ScanAndCompress(int /*budget*/)                   { return 0; }       // stage 5 (satoru)
-int  CompressProcess(uint32_t /*pid*/)                 { return 0; }       // stage 5 (satoru)
-int  DecompressProcess(uint32_t /*pid*/)               { return 0; }       // stage 5 (satoru)
-int  DecompressAll()                                   { return 0; }       // stage 5/11 (satoru)
-int  DedupPass(int /*budget*/)                         { return 0; }       // stage 10 (satoru)
+// ── stage 5/6: compress one page ─────────────────────────────────────────────
+// resolve the page's backing frame, compress its bytes into the pool, make the
+// leaf not-present + marked, then free the original frame. the original frame's
+// bytes are identity-mapped so we read them directly from kernel context (no cr3
+// switch needed  -  kmemx runs in the kernel address space but the target page
+// tables + frames are all identity-mapped). (satoru)
+bool CompressPage(uint64_t as, uint64_t vaddr) {
+    if (!g_inited || !g_enabled) return false;
+    vaddr &= ~0xFFFULL;
+    if (!IsCompressible(as, vaddr)) return false;
+
+    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(as, vaddr);
+    if (phys == 0) return false;
+    phys &= ~0xFFFULL;
+    const uint8_t* page = (const uint8_t*)(uintptr_t)phys;   // identity-mapped (satoru)
+
+    uint64_t t0 = rdtsc();
+    uint64_t f; g_lock.LockIrqSave(&f);
+
+    // re-check under the lock: nothing must have compressed this in the gap. (satoru)
+    if (meta_find(as, vaddr) >= 0) { g_lock.UnlockIrqRestore(f); return false; }
+
+    int slot = store_compressed_locked(as, vaddr, page, 0);
+    if (slot < 0) { g_lock.UnlockIrqRestore(f); return false; }   // pool/table full (satoru)
+
+    // take the leaf out of service: capture its perms, mark not-present. on the
+    // off chance the leaf vanished (raced an unmap), roll back the pool entry. (satoru)
+    uint64_t cap_phys = 0, cap_flags = 0;
+    if (!KernelVMM::KmemxMarkCompressed(as, vaddr, &cap_phys, &cap_flags) || cap_phys != phys) {
+        free_slot_locked(slot);
+        g_lock.UnlockIrqRestore(f);
+        return false;
+    }
+    // record the real permission bits so the fault path restores them exactly. (satoru)
+    g_meta[slot].orig_pte_flags = (uint32_t)cap_flags;
+    g_meta[slot].generation = (uint8_t)KernelVMM::KmemxGetGeneration(as, vaddr);
+
+    uint64_t dt = tsc_to_ns(rdtsc() - t0);
+    if (dt > g_stats.ns_compress_max) g_stats.ns_compress_max = dt;
+    g_lock.UnlockIrqRestore(f);
+
+    // free the now-spare physical frame back to the pmm (the page lives in the
+    // pool now) and flush the stale tlb entry. done OUTSIDE the lock  -  PMM has its
+    // own irq guard, and the leaf is already not-present so no one can fault it
+    // into a half state. (satoru)
+    PMM::FreeFrame(phys);
+    if (as == KernelVMM::GetCurrentAddressSpace()) KernelVMM::InvalidatePage(vaddr);
+    return true;
+}
+
+// ── stage 6: the page-fault decompression path (target < 5us) ───────────────
+// called from the #pf handler. if `fault_vaddr` in the CURRENT address space is
+// a kmemx-compressed leaf, decompress it back into a fresh frame (crc-verified;
+// a mismatch panics), restore the leaf, free the pool slot, and return true so
+// the faulting instruction is retried. lock-held window is tiny (the lz4 decode
+// of a 4kb page). (satoru)
+bool HandleFault(uint64_t fault_vaddr) {
+    if (!g_inited) return false;
+    uint64_t as = KernelVMM::GetCurrentAddressSpace();
+    uint64_t va = fault_vaddr & ~0xFFFULL;
+
+    // cheap pte check first: is this even one of ours? (avoids taking the lock on
+    // the overwhelmingly-common non-kmemx fault.) (satoru)
+    if (!KernelVMM::KmemxIsCompressed(as, va)) return false;
+
+    uint64_t t0 = rdtsc();
+
+    // a fresh frame to decompress into. allocate BEFORE taking the lock (PMM has
+    // its own guard); if the pmm is empty we cannot serve the fault. (satoru)
+    uint64_t frame = PMM::AllocFrame();
+    if (frame == 0) {
+        // out of memory mid-fault: nothing safe to do but fail the fault (the
+        // generic handler will then terminate the process / panic). (satoru)
+        return false;
+    }
+    uint8_t* dst = (uint8_t*)(uintptr_t)frame;   // identity-mapped (satoru)
+
+    uint64_t f; g_lock.LockIrqSave(&f);
+    int idx = meta_find(as, va);
+    if (idx < 0) {
+        // the marker said compressed but the metadata is gone  -  treat as not-ours
+        // (another path may have restored it). free the spare frame. (satoru)
+        g_lock.UnlockIrqRestore(f);
+        PMM::FreeFrame(frame);
+        return false;
+    }
+
+    uint32_t saved_flags = g_meta[idx].orig_pte_flags;
+    bool ok = retrieve_compressed_locked(idx, dst);
+    if (!ok) {
+        // crc32 mismatch (or malformed blob) == silent memory corruption. this is
+        // the safety backstop the spec demands: never hand back wrong bytes. (satoru)
+        uint32_t want_crc = g_meta[idx].crc32;
+        g_lock.UnlockIrqRestore(f);
+        KernelPanic::KeBugCheckEx(StopCode::KMEMX_CORRUPTION, as, va,
+                                  (uint64_t)want_crc, 0,
+                                  "kmemx: crc mismatch decompressing a pooled page",
+                                  __FILE__, (uint32_t)__LINE__);
+    }
+
+    // restore the leaf to point at the fresh frame with the original perms, then
+    // free the pool slot + metadata. (satoru)
+    KernelVMM::KmemxRestoreLeaf(as, va, frame, saved_flags);
+    free_slot_locked(idx);
+    g_stats.pages_out++;
+    g_stats.faults_served++;
+
+    uint64_t dt = tsc_to_ns(rdtsc() - t0);
+    if (dt > g_stats.ns_decompress_max) g_stats.ns_decompress_max = dt;
+    if (g_stats.ns_decompress_min == 0 || dt < g_stats.ns_decompress_min)
+        g_stats.ns_decompress_min = dt;
+    g_stats.ns_decompress_sum += dt;
+    if (dt > 10000) {
+        // blew the 10us invisibility budget  -  count it (per spec: normal case is
+        // 2-3us). do NOT log from the hot path: SerialLogger does port i/o that
+        // would itself dwarf the budget and perturb the next measurement. the
+        // count is surfaced by `kmemx status` / the self-test instead. (satoru)
+        g_stats.decomp_over_10us++;
+    }
+    g_lock.UnlockIrqRestore(f);
+    return true;
+}
+
+// ── stage 5: scan candidate address spaces and compress aged pages ──────────
+namespace {
+// per-scan cursor so we round-robin across processes + their regions without
+// rescanning the same hot range every tick. (satoru)
+uint32_t g_scan_pid_cursor = 0;
+uint64_t g_scan_va_cursor  = 0;
+}
+
+int ScanAndCompress(int budget) {
+    if (!g_inited || !g_enabled || budget <= 0) return 0;
+    if (KMemXPool::TotalBytes() == 0) return 0;   // no pool reserved (satoru)
+    int threshold = Threshold();
+    int taken = 0;
+    int aged = 0;
+    const int AGE_LIMIT = budget * 64;   // bound the per-call work (satoru)
+
+    // walk the process list. we hold no scheduler lock (the list is append-mostly
+    // and we tolerate a transient miss), and we only read each Process' regions +
+    // address_space, which are stable while the process lives. (satoru)
+    for (Process* p = Scheduler::ready_queue; p && (taken < budget) && (aged < AGE_LIMIT); p = p->next) {
+        if (!p->is_user()) continue;          // native+linux user processes are eligible (satoru)
+        uint64_t as = p->address_space;
+        if (as == 0) continue;
+
+        for (int r = 0; r < PROCESS_MAX_USER_REGIONS && (taken < budget) && (aged < AGE_LIMIT); r++) {
+            const UserMemoryRegion& reg = p->regions[r];
+            if (!reg.active || reg.end <= reg.start) continue;
+            // start at the cursor if it falls in this region, else the region top. (satoru)
+            uint64_t va = reg.start;
+            if (g_scan_pid_cursor == p->pid && g_scan_va_cursor >= reg.start &&
+                g_scan_va_cursor < reg.end) {
+                va = g_scan_va_cursor & ~0xFFFULL;
+            }
+            for (; va < reg.end && (taken < budget) && (aged < AGE_LIMIT); va += PAGE) {
+                if (!KernelVMM::KmemxIsLeafPresent(as, va)) continue;
+                aged++;
+                int gen = KernelVMM::KmemxAgeLeaf(as, va);
+                if (gen < 0) continue;
+                if (gen >= threshold) {
+                    if (CompressPage(as, va)) taken++;
+                }
+            }
+            g_scan_pid_cursor = p->pid;
+            g_scan_va_cursor  = va;
+        }
+    }
+    // a full flush of the cleared-accessed-bit pages: a single FlushTLB is cheaper
+    // than thousands of INVLPGs and the aged pages span many ranges. only needed
+    // when we actually aged pages in the active address space. cheap + safe. (satoru)
+    if (aged > 0) KernelVMM::FlushTLB();
+    return taken;
+}
+
+// decompress live pages back into their owning address space. if `all`, every
+// live entry; else only entries whose address_space == `as`. each page is
+// decompressed into a fresh frame (crc-verified -> panic on mismatch) and the
+// owning leaf is restored, then the pool slot is freed. used by the per-process
+// decompress, DecompressAll (kmemx disable / flush), and proactive guest
+// restore. returns pages restored. (satoru)
+static int DecompressMatching(uint64_t as, bool all) {
+    int restored = 0;
+    // iterate the whole metadata table. we re-acquire the lock per page so a long
+    // drain never holds it across thousands of decodes (keeps the fault path
+    // responsive). (satoru)
+    for (uint32_t i = 0; i < g_meta_cap; i++) {
+        uint64_t f; g_lock.LockIrqSave(&f);
+        PageMeta& m = g_meta[i];
+        if (m.pool_off == KMEMX_POOL_NULL) { g_lock.UnlockIrqRestore(f); continue; }
+        if (!all && m.address_space != as) { g_lock.UnlockIrqRestore(f); continue; }
+        uint64_t page_as = m.address_space;
+        uint64_t va = m.vaddr;
+        uint32_t saved_flags = m.orig_pte_flags;
+        g_lock.UnlockIrqRestore(f);
+
+        // allocate a frame, then re-find under the lock (it may have been faulted
+        // in + freed in the gap). (satoru)
+        uint64_t frame = PMM::AllocFrame();
+        if (frame == 0) break;   // out of memory; stop draining (satoru)
+        uint8_t* dst = (uint8_t*)(uintptr_t)frame;
+
+        g_lock.LockIrqSave(&f);
+        int idx = meta_find(page_as, va);
+        if (idx < 0) { g_lock.UnlockIrqRestore(f); PMM::FreeFrame(frame); continue; }
+        if (!retrieve_compressed_locked(idx, dst)) {
+            uint32_t want_crc = g_meta[idx].crc32;
+            g_lock.UnlockIrqRestore(f);
+            KernelPanic::KeBugCheckEx(StopCode::KMEMX_CORRUPTION, page_as, va,
+                                      (uint64_t)want_crc, 1,
+                                      "kmemx: crc mismatch draining a pooled page",
+                                      __FILE__, (uint32_t)__LINE__);
+        }
+        KernelVMM::KmemxRestoreLeaf(page_as, va, frame, saved_flags);
+        free_slot_locked(idx);
+        g_stats.pages_out++;
+        g_lock.UnlockIrqRestore(f);
+        restored++;
+    }
+    return restored;
+}
+
+// ── stage 5: bulk per-process + global operations (shell + toggle) ──────────
+// compress every eligible page of one process now (a minimized-app / idle-service
+// instant candidate). pid is a scheduler pid. (satoru)
+int CompressProcess(uint32_t pid) {
+    if (!g_inited || !g_enabled) return 0;
+    Process* p = Scheduler::FindProcessByPid(pid);
+    if (!p || !p->is_user() || p->address_space == 0) return 0;
+    uint64_t as = p->address_space;
+    int taken = 0;
+    for (int r = 0; r < PROCESS_MAX_USER_REGIONS; r++) {
+        const UserMemoryRegion& reg = p->regions[r];
+        if (!reg.active || reg.end <= reg.start) continue;
+        for (uint64_t va = reg.start; va < reg.end; va += PAGE) {
+            if (CompressPage(as, va)) taken++;
+        }
+    }
+    return taken;
+}
+
+// decompress every live page belonging to one process, restoring its working set
+// to physical ram. walks the metadata table for entries whose address_space
+// matches. (satoru)
+int DecompressProcess(uint32_t pid) {
+    if (!g_inited) return 0;
+    Process* p = Scheduler::FindProcessByPid(pid);
+    if (!p || p->address_space == 0) return 0;
+    return DecompressMatching(p->address_space, /*all=*/false);
+}
+
+// decompress EVERY live page (kmemx disable / flush). drains the whole pool. (satoru)
+int DecompressAll() {
+    if (!g_inited) return 0;
+    return DecompressMatching(0, /*all=*/true);
+}
+
+int DedupPass(int /*budget*/) { return 0; }       // stage 10 (satoru)
 
 // ── test-only hooks used by the stage-2 pool self-test ──────────────────────
 // (declared in kmemx_internal.h so the test TU can reach the locked primitives
