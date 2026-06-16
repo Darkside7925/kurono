@@ -261,6 +261,74 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
     return ready & (interest | L_EPOLLERR | L_EPOLLHUP);
 }
 
+// fwd decl: defined further down. poll's cooperative block uses it to hand the
+// cpu to a sibling user thread. (satoru)
+static bool switch_to_ready_user(InterruptFrame* frame);
+
+// deschedule a user thread that is about to block in poll/ppoll: rewind its saved
+// user frame to RE-RUN the syscall on wake, mark it Blocked with a short
+// sleep_ticks (the timer tick re-readies threads in the ready queue), and switch
+// to a sibling user thread. returns true if it switched (poll's return value is
+// then ignored via current_frame_rewritten, and the thread re-enters poll when
+// rescheduled). false == no sibling runnable, so the caller blocks in-place.
+// restart_nr is the x86_64 syscall number to re-issue (7 poll / 271 ppoll). this
+// is what stops a blocking poller from starving its sibling threads: SleepMs only
+// context-switches kernel procs, so an in-place user-thread wait would monopolize
+// the cpu in ring-0 (timer preempt is ignored mid-syscall). (satoru)
+static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
+    Process* task = p ? p->task : nullptr;
+    if (!task || !current_syscall_frame) return false;
+    task->user_frame.rip -= 2;                          // SYSCALL/int0x80 are both 2 bytes (satoru)
+    task->user_frame.rax  = (uint64_t)(uint32_t)restart_nr;
+    task->state           = Process_Blocked;
+    task->sleep_ticks     = 2;                          // re-ready in ~2 ticks, then re-scan (satoru)
+    if (!switch_to_ready_user(current_syscall_frame)) {
+        task->sleep_ticks     = 0;                      // no sibling: undo + block in-place (satoru)
+        task->state           = Process_Running;
+        task->user_frame.rip += 2;
+        return false;
+    }
+    return true;
+}
+
+// shared poll/ppoll wait. scan readiness; if nothing is ready, hand the cpu to a
+// sibling user thread and re-run this syscall on wake, until an fd is ready or the
+// timeout elapses. timeout_ms < 0 == infinite, 0 == one non-blocking pass.
+// honouring the timeout stops glib's main loop busy-spinning on ppoll; the
+// deschedule stops a blocked thread from starving its siblings. the deadline is
+// kept in the LinuxProcess so it survives the syscall re-runs. (satoru)
+static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
+                        int64_t timeout_ms, int restart_nr) {
+    struct LinuxPollfd { int fd; int16_t events; int16_t revents; } __attribute__((packed));
+    LinuxPollfd* fds = (LinuxPollfd*)fdsp;
+    if (!p || !fds || nfds == 0 || nfds > 1024) { if (p) p->poll_blocking = false; return 0; }
+    for (;;) {
+        int ready_total = 0;
+        for (uint64_t i = 0; i < nfds; i++) {
+            int16_t want = fds[i].events;
+            fds[i].revents = 0;
+            if (fds[i].fd < 0) continue;   // negative fd ignored (satoru)
+            uint32_t interest = (uint32_t)(uint16_t)want | L_EPOLLERR | L_EPOLLHUP;
+            uint32_t r = fd_readiness(p, fds[i].fd, interest);
+            if (r) { fds[i].revents = (int16_t)(uint16_t)r; ready_total++; }
+        }
+        if (ready_total > 0) { p->poll_blocking = false; return ready_total; }
+        if (timeout_ms == 0) { p->poll_blocking = false; return 0; }   // non-blocking pass (satoru)
+        uint64_t now = Time::GetTicks();
+        if (!p->poll_blocking) {                                       // first block: arm deadline (satoru)
+            p->poll_blocking    = true;
+            p->poll_deadline_ms = (timeout_ms < 0) ? 0xFFFFFFFFFFFFFFFFULL
+                                                   : now + (uint64_t)timeout_ms;
+        }
+        if (now >= p->poll_deadline_ms) { p->poll_blocking = false; return 0; }  // timed out (satoru)
+        // hand the cpu to a sibling user thread; this poll re-runs when we wake (satoru)
+        if (poll_try_deschedule(p, restart_nr)) return 0;   // switched; return value ignored
+        // single user thread (no sibling): cooperative in-place wait, then re-scan (satoru)
+        KuronoShell::PumpUI();
+        Scheduler::SleepMs(1);
+    }
+}
+
 static void clone_file_descriptors(const LinuxProcess* parent, LinuxProcess* child) {
     for (int fd = 0; fd < LINUX_MAX_FDS; fd++) {
         child->fds[fd].open = false;
@@ -1900,37 +1968,26 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         // poll/ppoll: struct pollfd { int fd; short events; short revents; }
         // is 8 bytes each on x86_64. we walk the user array, compute revents
         // from the same fd_readiness() logic epoll uses, and return the count
-        // of fds with nonzero revents. ppoll's extra timespec/sigmask args are
-        // ignored beyond using the timeout as a bounded spin. (satoru)
-        case LSYS_POLL:
+        // of fds with nonzero revents. the actual blocking + timeout handling
+        // lives in do_poll_wait() above; poll passes a ms timeout, ppoll a
+        // timespec. (satoru)
+        case LSYS_POLL: {
+            // poll(fds, nfds, timeout_ms): edx == timeout in ms, <0 == infinite (satoru)
+            int32_t ms = (int32_t)edx;
+            return do_poll_wait(Current(), (void*)(uintptr_t)ebx, ecx,
+                                ms < 0 ? (int64_t)-1 : (int64_t)ms, 7);  // x86_64 poll nr (satoru)
+        }
         case LSYS_PPOLL: {
-            LinuxProcess* p = Current();
-            struct LinuxPollfd { int fd; int16_t events; int16_t revents; } __attribute__((packed));
-            LinuxPollfd* fds = (LinuxPollfd*)(uintptr_t)ebx;
-            uint64_t nfds = ecx;
-            if (!p || !fds || nfds == 0 || nfds > 1024) return 0;
-            // timeout handling: poll() passes ms in edx; ppoll() passes a
-            // timespec pointer (also in edx). a 0-ms poll / null ppoll-timespec
-            // wants a single pass; anything else gets a bounded cooperative
-            // spin. good enough for the cooperative scheduler  -  there is no true
-            // blocking here. (satoru)
-            int spins = edx ? 64 : 0;
-            int ready_total = 0;
-            for (int s = 0; ; s++) {
-                ready_total = 0;
-                for (uint64_t i = 0; i < nfds; i++) {
-                    int16_t want = fds[i].events;
-                    fds[i].revents = 0;
-                    if (fds[i].fd < 0) continue;   // negative fd ignored (satoru)
-                    // poll bits match epoll bits for IN/OUT/ERR/HUP (satoru)
-                    uint32_t interest = (uint32_t)(uint16_t)want | L_EPOLLERR | L_EPOLLHUP;
-                    uint32_t r = fd_readiness(p, fds[i].fd, interest);
-                    if (r) { fds[i].revents = (int16_t)(uint16_t)r; ready_total++; }
-                }
-                if (ready_total > 0 || s >= spins) break;
-                KuronoShell::PumpUI();   // bounded cooperative wait (satoru)
+            // ppoll(fds, nfds, const timespec*, sigmask, sigsetsize): edx == a
+            // timespec* (null == infinite). parse it to ms and honour it so
+            // glib's main loop blocks instead of busy-spinning on ppoll. (satoru)
+            int64_t to = -1;
+            if (edx) {
+                struct TS { int64_t tv_sec; int64_t tv_nsec; };
+                TS* ts = (TS*)(uintptr_t)edx;
+                to = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
             }
-            return ready_total;
+            return do_poll_wait(Current(), (void*)(uintptr_t)ebx, ecx, to, 271);  // x86_64 ppoll nr (satoru)
         }
         // select/pselect6: translate the three fd_sets into the same readiness
         // logic. fd_set is a bitmap of LINUX_MAX_FDS bits; we honour read/write
