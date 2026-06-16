@@ -214,6 +214,51 @@ bool ProcessRunning();
 // stays at 1-5% regardless of load. exposed for the shell `kmemx status`. (satoru)
 int TokenBudget();
 
+// ── toggle + config (stage 11) ───────────────────────────────────────────────
+// read kmemx.enabled / kmemx.pool_pct / kmemx.threshold from UIConfig and apply
+// them (SetEnabled + pool size + aggressiveness). called at boot after UIConfig
+// is up. logs the boot banner ("[KMemX] starting... pool=NNMB" or "[KMemX]
+// disabled by user configuration"). (satoru)
+void ApplyConfig();
+
+// turn the engine ON at runtime: persist kmemx.enabled=1, mark enabled, and
+// start the worker process if not already running. returns true. (satoru)
+bool Enable();
+
+// turn the engine OFF at runtime: decompress EVERY pooled page back into ram
+// (so nothing stays compressed), mark disabled (the worker then idles), and
+// persist kmemx.enabled=0. returns the number of pages decompressed. takes a few
+// seconds for a large pool. (satoru)
+int  Disable();
+
+// write the human-readable /kurono/system/config/kmemx.conf the installer + boot
+// path use (mirrors the UIConfig keys). (satoru)
+void WriteConfFile();
+
+// the enable / disable disclaimer text (newline-separated paragraphs) shown by
+// the shell + Settings + the installer. `ram_mb` lets the installer tailor the
+// recommendation (RAM<512 -> strongly recommended; RAM>4096 -> optional); pass 0
+// for the generic runtime text. returns bytes written (excluding NUL). (satoru)
+int  EnableDisclaimer(char* out, int mx, uint64_t ram_mb);
+int  DisableDisclaimer(char* out, int mx);
+
+// render a one-screen status summary (enabled, pool, ratio, live pages, faults,
+// pressure, latency) into `out`. used by `kmemx status` + Settings. (satoru)
+int  StatusText(char* out, int mx);
+
+// ── benchmark (stage 14) ──────────────────────────────────────────────────────
+// run an in-engine micro-benchmark (compress + decompress throughput + ratio by
+// page type, latency percentiles) over synthetic pages and render a report into
+// `out`. measures what is actually measurable on this host. (satoru)
+int  Benchmark(char* out, int mx);
+
+// ── shell (stage 14) ──────────────────────────────────────────────────────────
+// the `kmemx` shell command: status|stats|pressure|compress|decompress|flush|
+// config|enable|disable|benchmark. signature matches the shell's void* handler.
+// (satoru)
+int  CmdKmemx(void* sh, int argc, const char** argv, char* out, int mx);
+void RegisterShellCommands(void* shell);
+
 }  // namespace KMemX
 
 // end (satoru)
