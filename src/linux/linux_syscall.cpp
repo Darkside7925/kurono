@@ -444,7 +444,20 @@ static int copy_user_strv(Process* proc, uint64_t arr_addr, char* storage,
     return n;
 }
 
+// CLONE_VM threads share one address space but each Process carries its own user
+// region table; the regions actually live in the thread-group leader (the
+// non-thread ancestor that ran the mmaps). resolve to it so a worker thread's
+// demand-zero fault (e.g. growing its own stack) finds the region the leader
+// registered, instead of SIGSEGV'ing on an empty per-thread table. every region
+// helper below funnels through this. (satoru)
+static Process* region_owner(Process* p) {
+    int guard = 0;
+    while (p && p->is_thread() && p->parent && guard++ < 64) p = p->parent;
+    return p;
+}
+
 static UserMemoryRegion* find_region(Process* proc, uint64_t addr) {
+    proc = region_owner(proc);
     if (!proc) return nullptr;
 
     for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
@@ -456,6 +469,7 @@ static UserMemoryRegion* find_region(Process* proc, uint64_t addr) {
 }
 
 static UserMemoryRegion* find_region_by_flag(Process* proc, uint32_t flag) {
+    proc = region_owner(proc);
     if (!proc) return nullptr;
 
     for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
@@ -466,6 +480,7 @@ static UserMemoryRegion* find_region_by_flag(Process* proc, uint32_t flag) {
 }
 
 static UserMemoryRegion* find_free_region_slot(Process* proc) {
+    proc = region_owner(proc);
     if (!proc) return nullptr;
 
     for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
@@ -475,6 +490,7 @@ static UserMemoryRegion* find_free_region_slot(Process* proc) {
 }
 
 static bool region_overlaps(Process* proc, uint64_t start, uint64_t end) {
+    proc = region_owner(proc);
     if (!proc) return false;
 
     for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
@@ -487,6 +503,7 @@ static bool region_overlaps(Process* proc, uint64_t start, uint64_t end) {
 
 static UserMemoryRegion* add_region(Process* proc, uint64_t start, uint64_t end,
                                     uint64_t page_flags, uint32_t flags) {
+    proc = region_owner(proc);
     if (!proc || start >= end) return nullptr;
 
     for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
