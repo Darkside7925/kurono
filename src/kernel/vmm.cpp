@@ -470,6 +470,89 @@ bool KernelVMM::RevealFrames(uint64_t phys_base, uint64_t count, uint64_t flags)
     return ok;
 }
 
+// walk to the 4kb LEAF pte for virt_addr in root_phys WITHOUT demoting: a
+// covering huge page (1gb or 2mb) returns nullptr, because kmemx only ages /
+// compresses individual 4kb leaves and must never split a huge identity map.
+// returns a host-virtual pointer to the leaf uint64_t, or nullptr. (satoru)
+static uint64_t* leaf_pte_nodemote(uint64_t root_phys, uint64_t virt_addr) {
+    uint64_t* pml4 = phys_to_virt(root_phys);
+    uint16_t p4i = pml4_index(virt_addr);
+    if (!(pml4[p4i] & PTE_PRESENT)) return nullptr;
+    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint16_t p3i = pdpt_index(virt_addr);
+    if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return nullptr;
+    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint16_t p2i = pd_index(virt_addr);
+    if (!(pd[p2i] & PTE_PRESENT) || (pd[p2i] & PTE_HUGE)) return nullptr;
+    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    return &pt[pt_index(virt_addr)];
+}
+
+int KernelVMM::KmemxAgeLeaf(uint64_t root_pml4, uint64_t virt_addr) {
+    uint64_t* pte = leaf_pte_nodemote(root_pml4, virt_addr & ~0xFFFULL);
+    if (!pte || !(*pte & PTE_PRESENT)) return -1;
+    uint64_t e = *pte;
+    if (e & PTE_ACCESSED) {
+        // touched recently: clear A so we can observe the NEXT interval, reset gen. (satoru)
+        e &= ~PTE_ACCESSED;
+        e &= ~PTE_KMEMX_GEN_MASK;
+        *pte = e;
+        return 0;
+    }
+    // untouched this interval: bump the generation (saturating at 15). (satoru)
+    uint64_t gen = (e & PTE_KMEMX_GEN_MASK) >> PTE_KMEMX_GEN_SHIFT;
+    if (gen < 15) gen++;
+    e = (e & ~PTE_KMEMX_GEN_MASK) | (gen << PTE_KMEMX_GEN_SHIFT);
+    *pte = e;
+    return (int)gen;
+}
+
+int KernelVMM::KmemxGetGeneration(uint64_t root_pml4, uint64_t virt_addr) {
+    uint64_t* pte = leaf_pte_nodemote(root_pml4, virt_addr & ~0xFFFULL);
+    if (!pte || !(*pte & PTE_PRESENT)) return -1;
+    return (int)((*pte & PTE_KMEMX_GEN_MASK) >> PTE_KMEMX_GEN_SHIFT);
+}
+
+bool KernelVMM::KmemxIsLeafPresent(uint64_t root_pml4, uint64_t virt_addr) {
+    uint64_t* pte = leaf_pte_nodemote(root_pml4, virt_addr & ~0xFFFULL);
+    return pte && (*pte & PTE_PRESENT);
+}
+
+bool KernelVMM::KmemxMarkCompressed(uint64_t root_pml4, uint64_t virt_addr,
+                                    uint64_t* out_phys, uint64_t* out_flags) {
+    virt_addr &= ~0xFFFULL;
+    uint64_t* pte = leaf_pte_nodemote(root_pml4, virt_addr);
+    if (!pte || !(*pte & PTE_PRESENT)) return false;
+    uint64_t e = *pte;
+    if (out_phys)  *out_phys  = e & 0x000FFFFFFFFFF000ULL;
+    // preserve the permission/attr bits the page had (writable/user/nx/pcd/pwt/
+    // global) so the restored page is byte-for-byte the same mapping. (satoru)
+    if (out_flags) *out_flags = e & (PTE_WRITABLE | PTE_USER | PTE_PWT | PTE_PCD |
+                                     PTE_GLOBAL | PTE_NX);
+    // rewrite as NOT-present + the kmemx marker. the frame is the caller's to
+    // free once the bytes are safely in the pool. (satoru)
+    *pte = PTE_KMEMX_COMPRESSED;
+    return true;
+}
+
+bool KernelVMM::KmemxIsCompressed(uint64_t root_pml4, uint64_t virt_addr) {
+    uint64_t* pte = leaf_pte_nodemote(root_pml4, virt_addr & ~0xFFFULL);
+    // a compressed leaf is NOT-present but carries the marker. (satoru)
+    return pte && !(*pte & PTE_PRESENT) && (*pte & PTE_KMEMX_COMPRESSED);
+}
+
+bool KernelVMM::KmemxRestoreLeaf(uint64_t root_pml4, uint64_t virt_addr,
+                                 uint64_t phys, uint64_t flags) {
+    virt_addr &= ~0xFFFULL;
+    uint64_t* pte = leaf_pte_nodemote(root_pml4, virt_addr);
+    if (!pte) return false;   // the leaf table must still exist (it does  -  only the leaf changed) (satoru)
+    // clear any stale generation/marker; install the fresh frame + perms. (satoru)
+    *pte = (phys & 0x000FFFFFFFFFF000ULL) | PTE_PRESENT | (flags & (PTE_WRITABLE |
+            PTE_USER | PTE_PWT | PTE_PCD | PTE_GLOBAL | PTE_NX));
+    if (root_pml4 == current_cr3()) InvalidatePage(virt_addr);
+    return true;
+}
+
 bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
     bool demoted = false;
     bool mapped = map_page_in_root_ex(pml4_phys, virt_addr, phys_addr, flags, &demoted);
