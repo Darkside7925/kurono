@@ -456,9 +456,11 @@ Kurono includes a real custom TCP/IP stack instead of a guest-host shortcut.
 This is more than a command shim. Kurono has an in-kernel Linux compatibility/runtime layer with real process, memory, fd, and syscall handling.
 
 - **Syscall layer**
-  - 177 `LSYS_*` syscall numbers defined
-  - ~155 implemented handlers (case arms in `src/linux/linux_syscall.cpp`), including `read`, `write`, `open`, `close`, `lseek`, `brk`, `fork`, `waitpid`, `execve`, `stat`, `fstat`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `dup`, `dup2`, `ioctl`, `writev`, `mmap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, and more
-  - the syscalls a real GUI app actually blocks on are implemented for real, not stubbed: `futex` (FUTEX_WAIT/WAKE), `clone`/`CLONE_THREAD`, `epoll_create1`/`epoll_ctl`/`epoll_wait`, `poll`/`ppoll`, `mprotect` (W^X with region splitting), `memfd_create`, file-backed `mmap`, and `sendmsg`/`recvmsg` carrying `SCM_RIGHTS`
+  - 280 `LSYS_*` syscall numbers defined; 304 handler arms in `src/linux/linux_syscall.cpp`
+  - the **whole x86_64 ABI completeness list (Tier 1-11) is now reachable** from the amd64 `SYSCALL` fast path: 231 amd64 numbers are wired through the translation table (`kNrMap` in `src/linux/linux_syscall_x64.cpp`), plus a stub-ok set and the direct-handled numbers. No spec syscall returns a blind `-ENOSYS` anymore. The file/io, identity (uid/gid/pgrp/sid), scheduler (affinity/nice/policy), memory-query (`mremap`/`mincore`/`statfs`), and signal-post families are real; the sandbox/namespace/advisory/NUMA/xattr families are contract-stubs (the value real Linux returns when the feature is unavailable); only `ptrace` (non-TRACEME), `add_key`, `request_key` are honest `-ENOSYS`. Full per-syscall table: `docs/developers/linux/SYSCALLS.md`
+  - core handlers include `read`, `write`, `open`, `close`, `lseek`, `brk`, `fork`, `waitpid`, `execve`, `stat`, `fstat`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `dup`, `dup2`/`dup3`, `ioctl`, `writev`/`readv`/`preadv`/`pwritev`, `mmap`/`mremap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, `clone3`, `pidfd_open`/`pidfd_send_signal`, `copy_file_range`, `sched_setaffinity`, the full uid/gid identity family, and more
+  - the syscalls a real GUI app actually blocks on are implemented for real, not stubbed: `futex` (FUTEX_WAIT/WAKE), `clone`/`CLONE_THREAD`, `epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait2`, `poll`/`ppoll`, `mprotect` (W^X with region splitting), `memfd_create`, file-backed `mmap`, and `sendmsg`/`recvmsg`/`sendmmsg`/`recvmmsg` carrying `SCM_RIGHTS`
+  - a permanent rate-limited `[kls] ENOSYS nr=<n>` serial trace on every unimplemented hit gives a strace-equivalent audit; a `kurono.klstest` boot path drives a per-tier self-test (30/30 PASS headless), and the musl dynamic-linker path (`kurono.dyntest`) still resolves libc and runs to `rc=0` after the build-out
 
 - **Process model**
   - Up to 16 Linux processes
