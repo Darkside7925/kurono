@@ -2597,6 +2597,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_kdf_test) KDF::RegisterCrashTestDriver();
     KDF::RegisterShellCommands(&shell_instance);   // `hwfw` status command (satoru)
     KInit::RegisterShellCommands(&shell_instance);
+    KMemX::RegisterShellCommands(&shell_instance);  // `kmemx` engine control (satoru)
     KpkgDaemon::RegisterShellCommands(&shell_instance);
     KUpdate::RegisterShellCommands(&shell_instance);
     KSecurity::RegisterShellCommands(&shell_instance);
@@ -3086,6 +3087,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec(spawned);
         SerialLogger::Log("\r\n");
         RuntimeLog::LogBoot("preemptive scheduler engaged");
+        // kmemx: apply the persisted config (kmemx.enabled/pool_pct/threshold)
+        // and, if enabled, start the compression worker so it joins the scheduler
+        // with the canonical processes. logs the boot banner. (satoru)
+        KMemX::ApplyConfig();
         // bring up kinit AFTER the canonical kernel processes: it adopts the
         // already-running in-kernel services (klog/knet/kdbus/kwayland/kaudio)
         // as supervised units, sequences the boot targets (which start the
