@@ -30,6 +30,7 @@
 #include "../kernel/heap.h"              // test memhog allocations (satoru)
 #include "../kernel/kdf.h"               // kdf-sandboxed kernel driver supervision (satoru)
 #include "../kernel/udf.h"               // udf proxy-death notification on process exit (satoru)
+#include "../kernel/kmemx.h"             // memory-pressure monitor + service shedding (satoru)
 #include "kpkg_daemon.h"
 #include "kdaemons.h"
 
@@ -794,6 +795,13 @@ int StartService(const char* name) {
     if (s->is_template) { LogEvent("start-skip-template", s->name, "instantiate as name@instance"); return -4; }
     if (!s->enabled) { LogEvent("start-skip-disabled", s->name, nullptr); return -2; }
     if (s->state == KSVC_RUNNING || s->state == KSVC_STARTING) return 0;
+    // memory-pressure gate: under Red+ kmemx pressure, refuse to launch a NEW
+    // non-critical service (critical units always start  -  the desktop must come
+    // up). this is the spec's "Red -> stop launching new services". (satoru)
+    if (!s->critical && KMemX::ShouldBlockNewServices()) {
+        LogEvent("start-defer-pressure", s->name, "memory pressure red+; not launching");
+        return -5;
+    }
 
     s->state = KSVC_STARTING;
     s->start_time_ms = now_ms();
@@ -1448,6 +1456,40 @@ void Tick() {
     // cross-service enforcement after the per-unit pass. (satoru)
     enforce_memory_limits();
     PollSocketActivation();
+
+    // kmemx memory-pressure monitor, throttled to ~1hz (Tick runs ~4hz). kmemx
+    // recomputes pressure + compresses guests at Orange+; here kinit applies the
+    // pressure-driven service policy: at Critical, gracefully terminate the
+    // lowest-priority RUNNING services (highest boot target first) to free
+    // memory. new-service launches are gated separately in StartService. (satoru)
+    {
+        static uint32_t last_pressure_ms = 0;
+        if (t - last_pressure_ms >= 1000) {
+            last_pressure_ms = t;
+            KMemX::Pressure p = KMemX::PressureTick();
+            if (KMemX::ShouldShedServices()) {
+                // shed one service from the highest (latest) boot target down,
+                // skipping critical units. one per second so the system can
+                // recover between kills rather than mass-terminating. (satoru)
+                for (int tgt = (int)KTGT_COUNT - 1; tgt >= (int)KTGT_USER; tgt--) {
+                    bool shed = false;
+                    for (int i = 0; i < g_service_count; i++) {
+                        KService* s = &g_services[i];
+                        if (s->state == KSVC_RUNNING && !s->critical &&
+                            (int)s->target == tgt && s->kind == KUNIT_PROCESS) {
+                            LogEvent("pressure-shed", s->name, "critical memory pressure");
+                            kill_and_supervise(i, "kmemx: critical memory pressure");
+                            s->state = KSVC_STOPPED;   // do not auto-restart while critical (satoru)
+                            shed = true;
+                            break;
+                        }
+                    }
+                    if (shed) break;
+                }
+            }
+            (void)p;
+        }
+    }
 }
 
 // the crash-monitor kernel-process: calls Tick() ~4x/sec. (satoru)

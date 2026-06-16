@@ -9,6 +9,7 @@
 #include "../drivers/cpu_detect.h"
 #include "../proc/spinlock.h"
 #include "../proc/scheduler.h"
+#include "../virt/ept.h"          // ept leaf walk for hypervisor guest-page compression (satoru)
 
 //  KMemX engine core. stage 2: pool + flat metadata table + stats + the
 //  never-compress list + the byte-level store/retrieve primitives. the pte
@@ -498,6 +499,36 @@ Pressure UpdatePressure() {
     return g_pressure;
 }
 
+// kinit's once-per-second pressure monitor. recompute the level; on a TRANSITION
+// log it; at Orange+ aggressively compress guest VM pages (signal them to release
+// memory). the returned level drives kinit's service-launch / shed decisions. (satoru)
+Pressure PressureTick() {
+    static Pressure last = PRESS_GREEN;
+    Pressure p = UpdatePressure();
+    if (p != last) {
+        SerialLogger::Log("[kmemx] memory pressure -> ");
+        SerialLogger::Log(PressureName(p));
+        SerialLogger::Log("\r\n");
+        last = p;
+    }
+    if (g_enabled && p >= PRESS_ORANGE) {
+        // orange+: compress idle guest pages so guests give memory back. bounded
+        // so this 1hz call never spikes cpu. (satoru)
+        CompressGuests(64);
+    }
+    return p;
+}
+
+bool ShouldBlockNewServices() {
+    // red / critical: stop launching new services to avoid pushing into oom. (satoru)
+    return g_enabled && g_pressure >= PRESS_RED;
+}
+
+bool ShouldShedServices() {
+    // critical: kinit should gracefully terminate its lowest-priority services. (satoru)
+    return g_enabled && g_pressure >= PRESS_CRITICAL;
+}
+
 bool SetPoolPct(int pct) {
     if (pct < 10) pct = 10;
     if (pct > 40) pct = 40;
@@ -522,6 +553,152 @@ void UnregisterGuest(uint64_t ept_root) {
             return;
         }
     }
+}
+
+// ── stage 9: hypervisor guest-page compression (ept level) ──────────────────
+// the guest has zero knowledge: we compress its host-backing frame, clear the
+// ept leaf (so the next guest access faults with an ept violation), and free the
+// frame  -  exactly the native flow but at the ept layer. the page is keyed
+// (ept_root, guest_phys) in the SAME pool + metadata table, tagged KMETA_GUEST.
+// only registered guests are touched; with no running guest this is inert. the
+// scan cursor round-robins guest-physical space across the mapped regions. (satoru)
+namespace { uint64_t g_guest_scan_gpa = 0; int g_guest_scan_idx = 0; }
+
+// compress one guest-physical page; returns true if taken. caller must NOT hold
+// g_lock (this takes it). (satoru)
+static bool compress_guest_page(uint64_t ept_root, uint64_t gpa) {
+    if (ept_root == 0) return false;
+    gpa &= ~0xFFFULL;
+    EPT_PML4* pml4 = (EPT_PML4*)(uintptr_t)ept_root;
+    uint64_t* leaf = EPTManager::KmemxLeafEntry(pml4, gpa);
+    if (!leaf) return false;
+    uint64_t e = *leaf;
+    // a present, writable, 4kb ram leaf is a candidate. skip not-present / pure
+    // mmio (uncacheable) / already-compressed. (satoru)
+    if (!(e & (EPT_READ | EPT_WRITE | EPT_EXECUTE))) return false;
+    if (e & EPT_LARGE_PAGE) return false;
+    uint64_t host_phys = e & EPT_ADDR_MASK;
+    if (host_phys == 0) return false;
+    // never compress an mmio-typed page (e.g. a passthrough bar). (satoru)
+    if ((e & EPT_MEM_TYPE_MASK) == EPT_MT_UC) return false;
+    // never-compress physical ranges still apply (e.g. ept structures). (satoru)
+    for (int i = 0; i < g_never_count; i++)
+        if (host_phys >= g_never[i].base && host_phys < g_never[i].end) return false;
+
+    const uint8_t* page = (const uint8_t*)(uintptr_t)host_phys;   // identity-mapped (satoru)
+    uint64_t f; g_lock.LockIrqSave(&f);
+    if (meta_find(ept_root, gpa) >= 0) { g_lock.UnlockIrqRestore(f); return false; }
+    int slot = store_compressed_locked(ept_root, gpa, page, 0);
+    if (slot < 0) { g_lock.UnlockIrqRestore(f); return false; }
+    // record the ept permission/memory-type bits to restore, and tag as guest. (satoru)
+    g_meta[slot].orig_pte_flags = (uint32_t)(e & (EPT_READ | EPT_WRITE | EPT_EXECUTE |
+                                                  EPT_MEM_TYPE_MASK | EPT_IGNORE_PAT));
+    g_meta[slot].flags |= KMETA_GUEST;
+    // clear the ept leaf -> the next guest access ept-violations. (satoru)
+    *leaf = 0;
+    g_lock.UnlockIrqRestore(f);
+
+    PMM::FreeFrame(host_phys);
+    EPTManager::InvalidateEPT();
+    return true;
+}
+
+int CompressGuests(int budget) {
+    if (!g_inited || !g_enabled || budget <= 0) return 0;
+    if (g_guest_count == 0) return 0;   // no registered guest -> nothing to do (satoru)
+    int taken = 0;
+    int regions = EPTManager::GetRegionCount();
+    if (regions <= 0) return 0;
+
+    // walk guest-physical pages across the mapped ram regions, round-robined by a
+    // persistent cursor, for the FIRST registered guest's ept root. (one guest at
+    // a time keeps each pass bounded; the cursor advances guests over passes.) (satoru)
+    if (g_guest_scan_idx >= g_guest_count) g_guest_scan_idx = 0;
+    uint64_t ept_root = g_guests[g_guest_scan_idx].ept_root;
+
+    const int AGE_LIMIT = budget * 64;
+    int looked = 0;
+    for (int r = 0; r < regions && taken < budget && looked < AGE_LIMIT; r++) {
+        const GuestMemRegion* reg = EPTManager::GetRegion(r);
+        if (!reg) continue;
+        // only normal ram is compressible  -  skip rom / mmio / reserved /
+        // framebuffer regions entirely (those must never be compressed). the
+        // per-leaf checks in compress_guest_page are a second line of defence. (satoru)
+        if (reg->type != MEM_RAM) continue;
+        uint64_t base = reg->guest_phys_start;
+        uint64_t end  = reg->guest_phys_start + reg->size;
+        uint64_t gpa = base;
+        if (g_guest_scan_gpa >= base && g_guest_scan_gpa < end) gpa = g_guest_scan_gpa & ~0xFFFULL;
+        for (; gpa < end && taken < budget && looked < AGE_LIMIT; gpa += PAGE) {
+            looked++;
+            if (compress_guest_page(ept_root, gpa)) taken++;
+        }
+        g_guest_scan_gpa = gpa;
+    }
+    // advance to the next guest for the following pass. (satoru)
+    g_guest_scan_idx++;
+    return taken;
+}
+
+bool HandleGuestFault(uint64_t ept_root, uint64_t guest_phys) {
+    if (!g_inited || ept_root == 0) return false;
+    uint64_t gpa = guest_phys & ~0xFFFULL;
+
+    // is this a guest page we compressed? (the metadata is keyed by ept root.) (satoru)
+    uint64_t f; g_lock.LockIrqSave(&f);
+    int idx = meta_find(ept_root, gpa);
+    if (idx < 0 || !(g_meta[idx].flags & KMETA_GUEST)) {
+        g_lock.UnlockIrqRestore(f);
+        return false;   // not ours  -  the hypervisor handles it normally (satoru)
+    }
+    uint32_t ept_flags = g_meta[idx].orig_pte_flags;
+    g_lock.UnlockIrqRestore(f);
+
+    uint64_t t0 = rdtsc();
+    uint64_t frame = PMM::AllocFrame();
+    if (frame == 0) return false;
+    uint8_t* dst = (uint8_t*)(uintptr_t)frame;
+
+    g_lock.LockIrqSave(&f);
+    idx = meta_find(ept_root, gpa);
+    if (idx < 0) { g_lock.UnlockIrqRestore(f); PMM::FreeFrame(frame); return false; }
+    if (!retrieve_compressed_locked(idx, dst)) {
+        uint32_t want = g_meta[idx].crc32;
+        g_lock.UnlockIrqRestore(f);
+        KernelPanic::KeBugCheckEx(StopCode::KMEMX_CORRUPTION, ept_root, gpa,
+                                  (uint64_t)want, 4,
+                                  "kmemx: crc mismatch decompressing a guest page",
+                                  __FILE__, (uint32_t)__LINE__);
+    }
+    // re-establish the ept leaf -> fresh frame with the saved r/w/x + memtype. (satoru)
+    EPT_PML4* pml4 = (EPT_PML4*)(uintptr_t)ept_root;
+    uint64_t* leaf = EPTManager::KmemxLeafEntry(pml4, gpa);
+    if (leaf) *leaf = (frame & EPT_ADDR_MASK) | (uint64_t)ept_flags;
+    free_slot_locked(idx);
+    g_stats.pages_out++;
+    g_stats.faults_served++;
+    uint64_t dt = tsc_to_ns(rdtsc() - t0);
+    if (dt > g_stats.ns_decompress_max) g_stats.ns_decompress_max = dt;
+    g_lock.UnlockIrqRestore(f);
+
+    EPTManager::InvalidateEPT();
+    return true;
+}
+
+bool HandleGuestFaultAny(uint64_t guest_phys) {
+    if (!g_inited || g_guest_count == 0) return false;
+    // snapshot the roots under the lock (the list is tiny), then try each. (satoru)
+    uint64_t roots[MAX_GUESTS]; int n;
+    {
+        uint64_t f; g_lock.LockIrqSave(&f);
+        n = g_guest_count;
+        for (int i = 0; i < n; i++) roots[i] = g_guests[i].ept_root;
+        g_lock.UnlockIrqRestore(f);
+    }
+    for (int i = 0; i < n; i++) {
+        if (HandleGuestFault(roots[i], guest_phys)) return true;
+    }
+    return false;
 }
 
 // ── stage 5/6: compress one page ─────────────────────────────────────────────
