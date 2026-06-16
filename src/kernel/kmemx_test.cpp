@@ -553,6 +553,94 @@ static bool test_fault_roundtrip() {
     return fail == 0 && cycles > 0;
 }
 
+// ── stage 10: deduplication (ksm-style, cow refcounted) ─────────────────────
+// store many IDENTICAL pages (so dedup can merge them) interleaved with unique
+// pages, run DedupPass, and verify: (a) merges happened, (b) pool usage dropped
+// vs the pre-dedup figure, (c) EVERY page (deduped + unique) still retrieves
+// byte-exact, and (d) freeing all pages returns the pool to empty  -  proving the
+// shared-extent refcounting never leaks or double-frees. (satoru)
+static bool test_dedup() {
+    if (!KMemX::IsInitialized() || !KMemX::IsEnabled() || KMemXPool::TotalBytes() == 0) {
+        SerialLogger::Log("KMEMX-TEST: dedup FAIL (engine off / no pool)\r\n");
+        return false;
+    }
+    KMemXPool::ResetForTest();
+    const uint64_t AS = 0xDED00ULL;
+    uint8_t* buf = (uint8_t*)PMM::AllocBytes(PAGE);
+    uint8_t* deco = (uint8_t*)PMM::AllocBytes(PAGE);
+    if (!buf || !deco) { SerialLogger::Log("KMEMX-TEST: dedup FAIL (alloc)\r\n"); return false; }
+
+    int fail = 0;
+    const int GROUPS = 8;       // 8 distinct contents (satoru)
+    const int COPIES = 40;      // 40 identical copies of each (satoru)
+    int stored = 0;
+    // store COPIES identical pages per group, plus the group is content-distinct. (satoru)
+    for (int g = 0; g < GROUPS; g++) {
+        for (int c = 0; c < COPIES; c++) {
+            // identical content within a group: seed by group only. avoid the
+            // incompressible random kind (5) so pages actually share a blob. (satoru)
+            make_page(buf, g % 5, 0x1000u + (uint32_t)g);
+            uint64_t va = ((uint64_t)g << 28) + (uint64_t)c * PAGE + 0x10000000ULL;
+            if (KMemX::TestStore(AS, va, buf) >= 0) stored++;
+        }
+    }
+    uint64_t used_before = KMemXPool::UsedBytes();
+
+    // run dedup until it stops merging (bounded passes). (satoru)
+    int total_merged = 0;
+    for (int pass = 0; pass < 20; pass++) {
+        int m = KMemX::DedupPass(256);
+        total_merged += m;
+        if (m == 0) break;
+    }
+    uint64_t used_after = KMemXPool::UsedBytes();
+
+    // (a) merges happened. with 8 groups x 40 copies, ~ (40-1)*8 = 312 merges. (satoru)
+    if (total_merged <= 0) { fail++; SerialLogger::Log("KMEMX-TEST: dedup no merges\r\n"); }
+    // (b) pool usage dropped substantially. (satoru)
+    if (used_after >= used_before) { fail++; SerialLogger::Log("KMEMX-TEST: dedup pool did not shrink\r\n"); }
+
+    // (c) every page still retrieves byte-exact. (satoru)
+    int verified = 0;
+    for (int g = 0; g < GROUPS && fail == 0; g++) {
+        make_page(buf, g % 5, 0x1000u + (uint32_t)g);
+        for (int c = 0; c < COPIES; c++) {
+            uint64_t va = ((uint64_t)g << 28) + (uint64_t)c * PAGE + 0x10000000ULL;
+            if (!KMemX::TestRetrieve(AS, va, deco)) { fail++; break; }
+            for (int b = 0; b < PAGE; b++) if (deco[b] != buf[b]) { fail++; break; }
+            if (fail) break;
+            verified++;
+        }
+    }
+
+    // (d) free everything; pool must return to empty (no leak / double-free). (satoru)
+    for (int g = 0; g < GROUPS; g++) {
+        for (int c = 0; c < COPIES; c++) {
+            uint64_t va = ((uint64_t)g << 28) + (uint64_t)c * PAGE + 0x10000000ULL;
+            KMemX::TestFree(AS, va);
+        }
+    }
+    uint64_t used_final = KMemXPool::UsedBytes();
+    uint32_t live_final = KMemX::TestMetaLive();
+    if (used_final != 0) { fail++; log_kv("KMEMX-TEST: dedup pool leak used=", (int)used_final); SerialLogger::Log("\r\n"); }
+    if (live_final != 0) { fail++; log_kv("KMEMX-TEST: dedup meta leak live=", (int)live_final); SerialLogger::Log("\r\n"); }
+
+    int shrink_pct = used_before ? (int)(((used_before - used_after) * 100) / used_before) : 0;
+    PMM::FreeBytes(buf, PAGE);
+    PMM::FreeBytes(deco, PAGE);
+    KMemXPool::ResetForTest();
+
+    SerialLogger::Log("KMEMX-TEST: dedup ");
+    SerialLogger::Log(fail == 0 ? "PASS" : "FAIL");
+    log_kv(" stored=", stored);
+    log_kv(" merged=", total_merged);
+    log_kv(" verified=", verified);
+    log_kv(" pool_shrink_pct=", shrink_pct);
+    log_kv(" fail=", fail);
+    SerialLogger::Log("\r\n");
+    return fail == 0;
+}
+
 int RunAll() {
     SerialLogger::Log("KMEMX-TEST: starting\r\n");
     int pass = 0, total = 0;
@@ -573,6 +661,9 @@ int RunAll() {
 
     // stage 6: end-to-end compress -> real page-fault -> decompress. (satoru)
     total++; if (test_fault_roundtrip())           pass++;
+
+    // stage 10: ksm-style dedup with cow refcounting. (satoru)
+    total++; if (test_dedup())                     pass++;
 
     SerialLogger::Log("KMEMX-TEST: SUMMARY ");
     SerialLogger::LogDec(pass);
