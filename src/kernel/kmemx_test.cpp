@@ -4,6 +4,7 @@
 #include "kmemx_pool.h"
 #include "kmemx_internal.h"
 #include "pmm.h"
+#include "vmm.h"
 #include "../drivers/serial.h"
 
 //  kmemx self-tests.
@@ -397,6 +398,81 @@ static bool test_pool_store_retrieve_1000() {
     return fail == 0;
 }
 
+// ── stage 3: vmm page aging (generation counter in spare pte bits) ──────────
+// map a fresh frame at a scratch virtual address, then exercise the leaf-pte
+// aging primitives directly:
+//   - KmemxAgeLeaf with the Accessed bit set must reset generation to 0
+//   - repeated KmemxAgeLeaf with A clear must increment the generation, and it
+//     must saturate at 15
+//   - KmemxMarkCompressed must hand back the phys + perms and leave the leaf
+//     not-present + marked (KmemxIsCompressed true)
+//   - KmemxRestoreLeaf must re-map the frame and clear the marker (touching the
+//     page must not fault afterward). (satoru)
+static bool test_vmm_aging() {
+    // a scratch identity-mappable frame + a high, otherwise-unused VA window. the
+    // kernel's own address space (cr3) is fine; we map/unmap our own leaf. (satoru)
+    uint64_t as = KernelVMM::GetCurrentAddressSpace();
+    uint64_t frame = PMM::AllocFrame();
+    if (!frame) { SerialLogger::Log("KMEMX-TEST: vmm_aging FAIL (no frame)\r\n"); return false; }
+    // pick a VA far from anything mapped: 0x5_0000_0000 (20gb) is above the
+    // identity map's hot region; MapPage builds the tables on demand. (satoru)
+    uint64_t va = 0x500000000ULL;
+    if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE)) {
+        SerialLogger::Log("KMEMX-TEST: vmm_aging FAIL (map)\r\n");
+        PMM::FreeFrame(frame);
+        return false;
+    }
+    // write something so the page is real + sets the Accessed bit. (satoru)
+    volatile uint8_t* p = (volatile uint8_t*)(uintptr_t)va;
+    for (int i = 0; i < 4096; i += 256) p[i] = (uint8_t)i;
+
+    int fail = 0;
+
+    // 1) A is set (we just wrote) -> age resets gen to 0. (satoru)
+    int g0 = KernelVMM::KmemxAgeLeaf(as, va);
+    if (g0 != 0) { fail++; log_kv("KMEMX-TEST: aging A-set gen!=0 got=", g0); SerialLogger::Log("\r\n"); }
+
+    // 2) with A now clear, each age increments the generation. don't touch the
+    //    page (a read would re-set A). step several times and watch it climb. (satoru)
+    int prev = 0;
+    for (int i = 0; i < 6; i++) {
+        int g = KernelVMM::KmemxAgeLeaf(as, va);
+        if (g != prev + 1) { fail++; if (fail <= 3) { log_kv("KMEMX-TEST: aging step expected ", prev + 1); log_kv(" got ", g); SerialLogger::Log("\r\n"); } }
+        prev = g;
+    }
+    // 3) saturate at 15. (satoru)
+    for (int i = 0; i < 20; i++) KernelVMM::KmemxAgeLeaf(as, va);
+    int gsat = KernelVMM::KmemxGetGeneration(as, va);
+    if (gsat != 15) { fail++; log_kv("KMEMX-TEST: aging saturate gen!=15 got=", gsat); SerialLogger::Log("\r\n"); }
+
+    // 4) mark-compressed: capture phys + perms, leave the leaf not-present+marked. (satoru)
+    uint64_t cap_phys = 0, cap_flags = 0;
+    bool marked = KernelVMM::KmemxMarkCompressed(as, va, &cap_phys, &cap_flags);
+    if (!marked) { fail++; SerialLogger::Log("KMEMX-TEST: aging mark failed\r\n"); }
+    if (cap_phys != frame) { fail++; SerialLogger::Log("KMEMX-TEST: aging mark wrong phys\r\n"); }
+    if (!(cap_flags & PTE_WRITABLE)) { fail++; SerialLogger::Log("KMEMX-TEST: aging mark lost WRITABLE\r\n"); }
+    if (!KernelVMM::KmemxIsCompressed(as, va)) { fail++; SerialLogger::Log("KMEMX-TEST: aging not marked compressed\r\n"); }
+    if (KernelVMM::KmemxIsLeafPresent(as, va)) { fail++; SerialLogger::Log("KMEMX-TEST: aging still present after mark\r\n"); }
+
+    // 5) restore: re-map the frame, clear the marker, and confirm a touch works. (satoru)
+    bool restored = KernelVMM::KmemxRestoreLeaf(as, va, cap_phys, cap_flags);
+    if (!restored) { fail++; SerialLogger::Log("KMEMX-TEST: aging restore failed\r\n"); }
+    if (KernelVMM::KmemxIsCompressed(as, va)) { fail++; SerialLogger::Log("KMEMX-TEST: aging still marked after restore\r\n"); }
+    if (KernelVMM::KmemxGetGeneration(as, va) != 0) { fail++; SerialLogger::Log("KMEMX-TEST: aging gen not cleared on restore\r\n"); }
+    // the page must be writable again. (satoru)
+    p[0] = 0xAB; if (p[0] != 0xAB) { fail++; SerialLogger::Log("KMEMX-TEST: aging restored page not writable\r\n"); }
+
+    // cleanup: unmap + free. (satoru)
+    KernelVMM::UnmapPage(va, false);
+    PMM::FreeFrame(frame);
+
+    SerialLogger::Log("KMEMX-TEST: vmm_aging ");
+    SerialLogger::Log(fail == 0 ? "PASS" : "FAIL");
+    log_kv(" fail=", fail);
+    SerialLogger::Log("\r\n");
+    return fail == 0;
+}
+
 int RunAll() {
     SerialLogger::Log("KMEMX-TEST: starting\r\n");
     int pass = 0, total = 0;
@@ -411,6 +487,9 @@ int RunAll() {
     KMemX::SetEnabled(true);
     total++; if (test_pool_allocator())            pass++;
     total++; if (test_pool_store_retrieve_1000())  pass++;
+
+    // stage 3: vmm page aging (generation counter in spare pte bits). (satoru)
+    total++; if (test_vmm_aging())                 pass++;
 
     SerialLogger::Log("KMEMX-TEST: SUMMARY ");
     SerialLogger::LogDec(pass);
