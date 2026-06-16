@@ -147,6 +147,13 @@ public:
     static void DumpEPT(EPT_PML4* pml4, int max_entries);
     static void DumpRegions();
 
+    // kmemx hook: return a pointer to the existing 4kb LEAF ept entry for
+    // `guest_phys` (no create), or nullptr if the upper levels are absent or the
+    // mapping is served by a large page (kmemx only compresses 4kb leaves). lets
+    // the memory-compression engine read/clear/restore a single guest page's ept
+    // entry at the hypervisor level without exposing the private walker. (satoru)
+    static uint64_t* KmemxLeafEntry(EPT_PML4* pml4, uint64_t guest_phys);
+
 private:
     static GuestMemRegion regions[MAX_MEM_REGIONS];
     static int region_count;
