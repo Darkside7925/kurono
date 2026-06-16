@@ -444,6 +444,17 @@ int PendingBytes(int sd) {
     return g_socks[sd].rx.avail();
 }
 
+// true when a listening socket has a connection waiting in its backlog. poll /
+// epoll must report POLLIN on a listen fd so an accept loop (e.g. firefox's
+// WaylandProxy, which listens on wayland-proxy-<pid> and forwards to wayland-0)
+// wakes and accept()s the pending client. without it the proxy never accepts,
+// so firefox's get_registry is never forwarded to the compositor. (satoru)
+bool HasPendingConnection(int sd) {
+    if (!valid(sd)) return false;
+    const Socket& s = g_socks[sd];
+    return s.listening && s.backlog_head != s.backlog_tail;
+}
+
 int KernelInject(int sd, const void* buf, int len) {
     if (!valid(sd)) return -1;
     Socket& s = g_socks[sd];

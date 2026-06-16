@@ -219,7 +219,11 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
     uint32_t ready = 0;
     switch (lfd->type) {
         case LFD_SOCKET:
-            if (UnixSocket::PendingBytes(lfd->backend_fd) > 0) ready |= L_EPOLLIN;
+            // readable when there are bytes OR (for a listen fd) a pending
+            // connection -- the latter is what wakes firefox's WaylandProxy
+            // accept loop so it forwards get_registry to wayland-0. (satoru)
+            if (UnixSocket::PendingBytes(lfd->backend_fd) > 0 ||
+                UnixSocket::HasPendingConnection(lfd->backend_fd)) ready |= L_EPOLLIN;
             ready |= L_EPOLLOUT;   // our unix sockets never block on write (satoru)
             break;
         case LFD_PIPE:
@@ -1230,6 +1234,13 @@ int LinuxSyscall::CreateProcess(const char* name, uint32_t uid, uint32_t gid) {
         if (!procs[i].active) {
             LinuxProcess* p = &procs[i];
             memset(p, 0, sizeof(LinuxProcess));
+            // heap-allocate this slot's fd table (the struct now holds a pointer, not
+            // an inline array). a CLONE_FILES thread re-points this at its leader's
+            // table below so threads share fds. NOTE: not freed on exit yet -- a
+            // small bounded leak; refcounted free is a follow-up. (satoru)
+            p->fds = (LinuxFd*)KernelHeap::Alloc(sizeof(LinuxFd) * LINUX_MAX_FDS);
+            if (!p->fds) return -1;
+            memset(p->fds, 0, sizeof(LinuxFd) * LINUX_MAX_FDS);
             p->pid = (uint32_t)(i + 100);  // linux pids start at 100
             LinuxProcess* parent = Current();
             p->ppid = parent ? parent->pid : 1;
@@ -1520,7 +1531,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_ACCESS:      return sys_access(ebx, ecx);
         case LSYS_DUP:         return sys_dup((int)ebx);
         case LSYS_DUP2:        return sys_dup2((int)ebx, (int)ecx);
-        case LSYS_IOCTL:       return sys_ioctl((int)ebx, ecx, edx);
+        case LSYS_IOCTL:       return sys_ioctl((int)ebx, (uint32_t)ecx, edx);
         case LSYS_WRITEV:      return sys_writev((int)ebx, ecx, edx);
         case LSYS_MMAP:        return sys_mmap(ebx, ecx, edx, esi, (int)edi, 0);
         case LSYS_MUNMAP:      return sys_munmap(ebx, ecx);
@@ -1950,7 +1961,17 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             tproc->signal_mask = parent->signal_mask;
             ls_scpy(tproc->cwd,  parent->cwd,  sizeof(tproc->cwd));
             ls_scpy(tproc->name, parent->name, sizeof(tproc->name));
-            clone_file_descriptors(parent, tproc);
+            // CLONE_FILES (0x400): the thread SHARES the leader's fd table rather
+            // than getting a private copy -- so fds opened by one thread are visible
+            // to its siblings (firefox's WaylandProxy thread + GTK main thread depend
+            // on this; without it the proxy can't see GTK's connection). drop the
+            // fresh table CreateProcess just allocated and alias the parent's. (satoru)
+            if (flags & 0x400u) {
+                if (tproc->fds) KernelHeap::Free(tproc->fds);
+                tproc->fds = parent->fds;
+            } else {
+                clone_file_descriptors(parent, tproc);
+            }
 
             int32_t tid = (int32_t)thread_task->pid;
 
@@ -4134,12 +4155,29 @@ int32_t LinuxSyscall::sys_dup2(int oldfd, int newfd) {
     return newfd;
 }
 
-int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint32_t arg) {
-    (void)fd; (void)cmd; (void)arg;
-    // terminal ioctls  -  return enotty for non-ttys
+int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint64_t arg) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
-    if (p->fds[fd].type == LFD_CONSOLE) return 0;  // pretend success
+    LinuxFd* lfd = &p->fds[fd];
+
+    // FIONREAD: bytes available to read without blocking. firefox's wayland
+    // proxy issues this on its client socket to size each read; returning enotty
+    // for it made ProxiedConnection::Process abort with "Failed to read data
+    // from client" and tear the whole connection down. (satoru)
+    if (cmd == 0x541Bu /* FIONREAD */) {
+        int navail = 0;
+        if ((lfd->type == LFD_SOCKET || lfd->type == LFD_PIPE) && lfd->backend_fd >= 0)
+            navail = UnixSocket::PendingBytes(lfd->backend_fd);
+        if (navail < 0) navail = 0;
+        if (arg && p->task) write_user_u32(p->task, arg, (uint32_t)navail);
+        return 0;
+    }
+    // FIONBIO: set/clear non-blocking. we drive o_nonblock through the fcntl
+    // flags, so just acknowledge instead of returning enotty to probes. (satoru)
+    if (cmd == 0x5421u /* FIONBIO */) return 0;
+
+    // terminal ioctls  -  return enotty for non-ttys
+    if (lfd->type == LFD_CONSOLE) return 0;  // pretend success
     return -25;    // enotty
 }
 

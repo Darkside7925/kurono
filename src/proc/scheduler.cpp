@@ -1452,6 +1452,26 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     // (satoru)
     wake_due_processes();
 
+    // re-ready descheduled user-thread pollers. poll_try_deschedule parks a
+    // blocking poll as Process_Blocked + sleep_ticks and relies on a periodic
+    // decrement to wake it, but the decrement in Tick() only runs on the kernel
+    // scheduler path; while a user thread is the current process this handler
+    // returns early below, so without this the parked poll never re-runs to
+    // consume data that arrived while it slept (firefox's wayland proxy hung
+    // here waiting on get_registry). wake them so a spinning sibling's
+    // poll_try_deschedule retry can switch back into them. (satoru)
+    for (Process* q = ready_queue; q; q = q->next) {
+        if (q->is_user() && q->state == Process_Blocked && q->sleep_ticks > 0) {
+            if (q->sleep_ticks > ms_elapsed) {
+                q->sleep_ticks -= ms_elapsed;
+            } else {
+                q->sleep_ticks = 0;
+                q->state = Process_Ready;
+                if (q->interactive_score < 16) q->interactive_score += 2;
+            }
+        }
+    }
+
     Process* p = current_process;
     if (!p || !p->is_kernel_proc) return;
 
