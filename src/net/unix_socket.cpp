@@ -243,6 +243,15 @@ int Connect(int sd, const char* path) {
     as.connected = true;
     as.peer_sd = sd;
     for (int i = 0; i < UNIX_PATH_MAX; i++) as.path[i] = server.path[i];
+    // an in-kernel server's accepted connection inherits the server's data
+    // handler + flag, so a client's writes drive the server synchronously: this
+    // is how the wayland / dbus compositors process a connected client's
+    // requests. without it the accepted socket has no on_data, so firefox's
+    // wl_display.get_registry sits unread and firefox hangs polling its display
+    // fd for the registry globals the compositor never sends. (satoru)
+    as.is_kernel_server = server.is_kernel_server;
+    as.on_data          = server.on_data;
+    as.user             = server.user;
 
     Socket& cs = g_socks[sd];
     cs.connected = true;
