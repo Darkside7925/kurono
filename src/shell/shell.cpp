@@ -1954,6 +1954,28 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         if (xok) p = sappend(out, p, mx, "firefox: unpacked xkeyboard-config data.\n");
     }
 
+    // pin gecko's compositor into the parent process (software webrender) and
+    // run content in-process, via the autoconfig mechanism so no profile dir is
+    // needed. without this the parent spawns a gpu process + content process and
+    // blocks forever on their ipc (gl is stubbed) before ever mapping its
+    // toplevel window, so the wayland handshake completes but no window shows. (satoru)
+    {
+        KVFS::Mkdirs("/apps/firefox/defaults/pref");
+        const char* ac =
+            "pref(\"general.config.filename\", \"firefox.cfg\");\n"
+            "pref(\"general.config.obscure_value\", 0);\n"
+            "pref(\"general.config.sandbox_enabled\", false);\n";
+        KVFS::WriteFile("/apps/firefox/defaults/pref/autoconfig.js", ac, (uint32_t)__builtin_strlen(ac));
+        const char* cfg =
+            "//\n"
+            "lockPref(\"layers.gpu-process.enabled\", false);\n"
+            "lockPref(\"gfx.webrender.software\", true);\n"
+            "lockPref(\"browser.tabs.remote.autostart\", false);\n"
+            "lockPref(\"fission.autostart\", false);\n";
+        KVFS::WriteFile("/apps/firefox/firefox.cfg", cfg, (uint32_t)__builtin_strlen(cfg));
+        SerialLogger::Log("[ffcfg] wrote autoconfig (gpu-process off, sw webrender, single-process)\r\n");
+    }
+
     Process* proc = Scheduler::CreateUserProcess("firefox", 0, 1);
     if (!proc) { KernelHeap::Free(image); p = sappend(out, p, mx, "firefox: CreateUserProcess failed.\n"); return p; }
 
