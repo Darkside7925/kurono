@@ -378,6 +378,13 @@ struct LinuxProcess {
     int      exit_code;
     Process* task;
 
+    // poll/ppoll cooperative-block state: a user thread that blocks in poll
+    // deschedules to a sibling and re-runs the syscall on wake; poll_blocking
+    // marks that an in-progress block owns poll_deadline_ms (absolute ms; ~UINT64_MAX
+    // for an infinite -1 timeout) so the deadline survives the re-runs. (satoru)
+    bool     poll_blocking;
+    uint64_t poll_deadline_ms;
+
     // signal state (simplified)
     uint32_t signal_mask;
     uint32_t pending_signals;
