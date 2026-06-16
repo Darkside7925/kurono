@@ -16,6 +16,7 @@
 #include "../linux/kls.h"
 #include "../packages/pkgmgr.h"
 #include "../kernel/pmm.h"
+#include "../kernel/kmemx.h"   // memory-compression status + toggle + sliders (satoru)
 
 static const char* KURONO_VERSION = "Kurono OS 1.0.0";
 
@@ -245,6 +246,85 @@ static void system_render(int x, int y, int w, int h, int scroll){
             shown++;
         }
     }
+    ly += 8;
+
+    // ── memory compression (KMemX) ───────────────────────────────────────
+    // physical ram, pool size, ratio, pages compressed; a toggle; a pool-size
+    // slider (10-40% RAM) and an aggressiveness slider (generation threshold
+    // 4-16, shown as a 0-100 fill). a usage indicator approximates physical-vs-
+    // logical (the spec's real-time graph reduced to a one-line gauge here). (satoru)
+    SettingsUI::SectionHeader(x, ly, "Memory Compression (KMemX)");
+    ly += 26;
+    {
+        const KMemX::Stats& st = KMemX::GetStats();
+        // physical ram. (satoru)
+        mem_total_str(buf, 80);
+        SettingsUI::Row(x, ly, "Physical RAM:", buf);
+        ly += 22;
+        // pool size. (satoru)
+        SettingsUI::IntToStr((int)(st.pool_bytes / (1024 * 1024)), buf, 80);
+        SettingsUI::StrApp(buf, " MB", 80);
+        SettingsUI::Row(x, ly, "Pool Size:", buf);
+        ly += 22;
+        // compression ratio (x.yy:1). (satoru)
+        {
+            int r = KMemX::RatioX100();
+            SettingsUI::IntToStr(r / 100, buf, 80);
+            SettingsUI::StrApp(buf, ".", 80);
+            char frac[8]; SettingsUI::IntToStr(r % 100, frac, 8);
+            SettingsUI::StrApp(buf, frac, 80);
+            SettingsUI::StrApp(buf, ":1", 80);
+            SettingsUI::Row(x, ly, "Compression:", buf);
+        }
+        ly += 22;
+        // pages compressed (live). (satoru)
+        SettingsUI::IntToStr((int)st.live_pages, buf, 80);
+        SettingsUI::StrApp(buf, " pages", 80);
+        SettingsUI::Row(x, ly, "Compressed:", buf);
+        ly += 22;
+        // RAM saved. (satoru)
+        SettingsUI::IntToStr((int)(st.bytes_saved / (1024 * 1024)), buf, 80);
+        SettingsUI::StrApp(buf, " MB saved", 80);
+        SettingsUI::Row(x, ly, "RAM Saved:", buf);
+        ly += 26;
+
+        // enable toggle. (satoru)
+        Graphics::DrawString(x, ly + 2, "Enable KMemX:", SettingsUI::COL_TEXT, 0xFF000000);
+        SettingsUI::Toggle(ctrl_x, ly, KMemX::IsEnabled());
+        Graphics::DrawString(ctrl_x + SettingsUI::TOGGLE_W + 10, ly + 2,
+                             KMemX::IsEnabled() ? "On (compressing inactive memory)" : "Off (full RAM mode)",
+                             SettingsUI::COL_DIM, 0xFF000000);
+        ly += 32;
+
+        // pool-size slider: map 10..40% -> 0..100 fill. (satoru)
+        Graphics::DrawString(x, ly - 2, "Pool Size (10-40%):", SettingsUI::COL_TEXT, 0xFF000000);
+        {
+            int pct = KMemX::PoolPct();
+            int fill = ((pct - 10) * 100) / 30;
+            SettingsUI::Slider(ctrl_x, ly + 2, ctrl_w, fill);
+            char pb[8]; SettingsUI::IntToStr(pct, pb, 8);
+            Graphics::DrawString(ctrl_x + ctrl_w + 8, ly - 2, pb, SettingsUI::COL_DIM, 0xFF000000);
+        }
+        ly += 26;
+
+        // aggressiveness slider: generation threshold 4..16 -> 0..100 fill. a
+        // LOWER threshold == more aggressive, so we invert the fill. (satoru)
+        Graphics::DrawString(x, ly - 2, "Aggressiveness:", SettingsUI::COL_TEXT, 0xFF000000);
+        {
+            int thr = KMemX::Threshold();
+            int fill = 100 - (((thr - 4) * 100) / 12);
+            SettingsUI::Slider(ctrl_x, ly + 2, ctrl_w, fill);
+        }
+        ly += 26;
+
+        // physical-vs-logical usage gauge: pool_used / pool_bytes. (satoru)
+        Graphics::DrawString(x, ly - 2, "Pool Usage:", SettingsUI::COL_TEXT, 0xFF000000);
+        {
+            int used_pct = st.pool_bytes ? (int)((st.pool_used * 100) / st.pool_bytes) : 0;
+            SettingsUI::Slider(ctrl_x, ly + 2, ctrl_w, used_pct);
+        }
+        ly += 26;
+    }
 }
 
 // ── input: pane-local mx,my. we walk the SAME running-y layout as render
@@ -306,6 +386,79 @@ static bool system_input(int mx, int my, bool click, char key, int scroll){
             return true;
         }
     }
+    ly += 32;          // boot-profile dropdown row (satoru)
+    ly += 22;          // guest-state row (satoru)
+    ly += 22;          // guest-kernel row (satoru)
+    ly += 22;          // linux-processes row (satoru)
+    ly += 30;          // tail after linux subsystem (satoru)
+
+    // ── packages section (read-only; walk its advances to reach memory) ──
+    ly += 26;          // "Packages" header (satoru)
+    ly += 22;          // installed row (satoru)
+    ly += 22;          // available row (satoru)
+    ly += 22;          // repository row (satoru)
+    {
+        // mirror render's "up to 4 real package rows" advance exactly. (satoru)
+        int total = PackageManager::GetPackageCount();
+        int shown = 0;
+        for(int i = 0; i < total && shown < 4; i++){
+            Package* p = PackageManager::GetPackage(i);
+            if(!p || !p->name[0]) continue;
+            ly += 22;
+            shown++;
+        }
+    }
+    ly += 8;
+
+    // ── memory compression (KMemX) controls ──────────────────────────────
+    // the input signature has no pane width; mirror the existing dropdown hit
+    // convention and use the fixed CTRL_W for the slider tracks (render clamps to
+    // the same value on any normally-wide pane). (satoru)
+    int ctrl_w = CTRL_W;
+    ly += 26;          // "Memory Compression (KMemX)" header (satoru)
+    ly += 22;          // physical ram row (satoru)
+    ly += 22;          // pool size row (satoru)
+    ly += 22;          // compression ratio row (satoru)
+    ly += 22;          // compressed pages row (satoru)
+    ly += 26;          // ram saved row (satoru)
+
+    // enable toggle: flips KMemX live (Enable decompresses-all on its own). (satoru)
+    if(SettingsUI::ToggleHit(ctrl_x, ly, mx, my)){
+        if(KMemX::IsEnabled()) KMemX::Disable(); else KMemX::Enable();
+        return true;
+    }
+    ly += 32;          // enable toggle row (satoru)
+
+    // pool-size slider: 0..100 fill -> 10..40%. (satoru)
+    {
+        int hit = SettingsUI::SliderHit(ctrl_x, ly + 2, ctrl_w, mx, my);
+        if(hit >= 0){
+            int pct = 10 + (hit * 30) / 100;
+            if(pct < 10) pct = 10; if(pct > 40) pct = 40;
+            KMemX::SetPoolPct(pct);
+            UIConfig::SetInt("kmemx.pool_pct", pct, true);
+            UIConfig::Save();
+            KMemX::WriteConfFile();
+            return true;
+        }
+    }
+    ly += 26;          // pool slider row (satoru)
+
+    // aggressiveness slider: 0..100 fill (high == aggressive) -> threshold 16..4. (satoru)
+    {
+        int hit = SettingsUI::SliderHit(ctrl_x, ly + 2, ctrl_w, mx, my);
+        if(hit >= 0){
+            int thr = 16 - (hit * 12) / 100;
+            if(thr < 4) thr = 4; if(thr > 16) thr = 16;
+            KMemX::SetThreshold(thr);
+            UIConfig::SetInt("kmemx.threshold", thr, true);
+            UIConfig::Save();
+            KMemX::WriteConfFile();
+            return true;
+        }
+    }
+    ly += 26;          // aggressiveness slider row (satoru)
+    ly += 26;          // pool-usage gauge row (read-only) (satoru)
     return false;
 }
 
@@ -316,6 +469,9 @@ static int system_content_height(){
     h += 26 + 32 + 22 + 22 + 22 + 22 + 22 + 38; // software updates (satoru)
     h += 26 + 32 + 32 + 22 + 22 + 30;     // linux subsystem (satoru)
     h += 26 + 22 + 22 + 22 + (4 * 22);    // packages + up to 4 package rows (satoru)
+    h += 8;                               // gap before memory section (satoru)
+    h += 26 + 22 + 22 + 22 + 22 + 26;     // memory: header + 5 info rows (satoru)
+    h += 32 + 26 + 26 + 26;               // memory: toggle + 3 sliders/gauge (satoru)
     h += 16;                              // tail (satoru)
     return h;
 }

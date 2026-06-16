@@ -8,6 +8,7 @@
 #include "../kernel/userspace.h"   // Userspace::HandleProcessExit for user-fault termination (satoru)
 #include "../kernel/vmm.h"         // resolve user va->phys to dump the tls/tcb at a fault (satoru)
 #include "../kernel/kdf.h"         // kdf guard-page fault isolation (catches driver oob -> no panic) (satoru)
+#include "../kernel/kmemx.h"        // kmemx compressed-page fault decompression path (satoru)
 
 //  x86_64 idt, pic 8259a, and isr implementation
 //  isr stubs live in isr_stubs.asm  -  this file builds the idt from the
@@ -347,6 +348,20 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             //      this is the load-bearing "a driver crash doesn't take down the
             //      kernel" path of the hybrid architecture. (satoru)
             if ((frame->cs & 3) == 0 && KDF::HandleGuardFault(frame->cr2, frame->rip)) {
+                return;
+            }
+            // 1.7) KMemX compressed-page fault: if CR2 is a page kmemx compressed
+            //      out (its leaf is not-present + carries PTE_KMEMX_COMPRESSED),
+            //      decompress it from the pool back into a fresh frame, restore the
+            //      leaf, and resume  -  the faulting instruction is then retried over
+            //      the now-present page. crc32 is verified inside; a mismatch
+            //      panics (never hand back wrong bytes). this is the transparent
+            //      "touch a cold page, get it back in a few microseconds" path. it
+            //      claims only kmemx-marked leaves, so every other fault falls
+            //      through to the normal user/kernel handling below. runs before
+            //      the demand-zero dispatch so a compressed page is never mistaken
+            //      for a fresh anonymous page. (satoru)
+            if (KMemX::HandleFault(frame->cr2)) {
                 return;
             }
             // 2) User-mode page-fault dispatch (demand-zero, COW, etc.).

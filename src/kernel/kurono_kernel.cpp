@@ -67,6 +67,8 @@
 #include "../kcl/kcl.h"
 #include "../kcl/kcl_test.h"
 #include "../net/ieee80211_test.h"  // 802.11i wpa2 crypto self-test (kurono.wifitest) (satoru)
+#include "kmemx.h"             // kmemx memory compression engine (satoru)
+#include "kmemx_test.h"        // kmemx memory-compression self-test (kurono.kmemxtest) (satoru)
 #include "../apps/kj.h"        // kj (kurono javascript) interpreter (satoru)
 #include "../apps/kj_test.h"   // kj (kurono javascript) self-test suite (satoru)
 #include "../security/supr.h"
@@ -1050,6 +1052,11 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // without a GUI run. kurono.klstest.poweroff=1 powers off after. (satoru)
     bool boot_kls_test = false;
     bool boot_kls_poweroff = false;
+    // kmemx (memory compression engine) self-test gate (kurono.kmemxtest):
+    // run the lz4 + pool + dedup self-tests headless at boot, log PASS/FAIL to
+    // serial, optionally power off. proves the engine without the gui. (satoru)
+    bool boot_kmemx_test = false;
+    bool boot_kmemx_poweroff = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     // setup mode: run the graphical installer / first-setup wizard instead of
@@ -1140,6 +1147,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
         if (boot_has_token(boot_cmdline, "kurono.klstest.poweroff=1") || boot_has_token(boot_cmdline, "kurono.klstest.poweroff")) {
             boot_kls_poweroff = true;
+        }
+        // latch the kmemx (memory compression) self-test gate + optional poweroff. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kmemxtest=1") || boot_has_token(boot_cmdline, "kurono.kmemxtest")) {
+            boot_kmemx_test = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kmemx.poweroff=1") || boot_has_token(boot_cmdline, "kurono.kmemx.poweroff")) {
+            boot_kmemx_poweroff = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -1262,6 +1276,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     Buddy::Init();
     SerialLogger::Log("[2b] Slab::Init\r\n");
     Slab::Init();
+    // [2c] kmemx (memory compression engine): reserve the compressed-page pool +
+    // metadata table now, while contiguous memory is plentiful (it allocates the
+    // table first, then a free-memory-bounded pool). this only RESERVES the
+    // infrastructure; whether the engine is enabled + its worker process started
+    // is decided later from config at the kernel.target (see kmemx.enabled). the
+    // never-compress list for dma rings / framebuffer / ept is registered by the
+    // owning subsystems as they come up. (satoru)
+    SerialLogger::Log("[2c] KMemX::Init\r\n");
+    KMemX::Init(20);
     vga_puts("Scheduler init...\n");
     SerialLogger::Log("[3] Scheduler::Init\r\n");
     Scheduler::Init();
@@ -1823,6 +1846,20 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         KfsBench::Run();
         SerialLogger::Log("[KFSBENCH] powering off\r\n");
         HAL::PowerOff();
+    }
+    // headless kmemx self-test (gated by cmdline kurono.kmemxtest): run the
+    // lz4 + pool + metadata self-tests inline here (pmm + heap are up; no gui
+    // needed), log PASS/FAIL to serial, and power off if kurono.kmemx.poweroff is
+    // set. running inline (like kfsbench) makes the test mode-independent  -  it
+    // does not rely on the graphical scheduler path that hosts the kproc runner,
+    // so a headless text-mode ci boot exercises it deterministically. (satoru)
+    if (boot_kmemx_test) {
+        SerialLogger::Log("[KMEMX-TEST] begin (inline headless)\r\n");
+        KMemXTest::RunAll();
+        if (boot_kmemx_poweroff) {
+            SerialLogger::Log("[KMEMX-TEST] powering off (kurono.kmemx.poweroff)\r\n");
+            HAL::PowerOff();
+        }
     }
     if (boot_kfstest) {
         SerialLogger::Log("[KFSTEST] begin\r\n");
@@ -2573,6 +2610,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_kdf_test) KDF::RegisterCrashTestDriver();
     KDF::RegisterShellCommands(&shell_instance);   // `hwfw` status command (satoru)
     KInit::RegisterShellCommands(&shell_instance);
+    KMemX::RegisterShellCommands(&shell_instance);  // `kmemx` engine control (satoru)
     KpkgDaemon::RegisterShellCommands(&shell_instance);
     KUpdate::RegisterShellCommands(&shell_instance);
     KSecurity::RegisterShellCommands(&shell_instance);
@@ -3077,6 +3115,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec(spawned);
         SerialLogger::Log("\r\n");
         RuntimeLog::LogBoot("preemptive scheduler engaged");
+        // kmemx: apply the persisted config (kmemx.enabled/pool_pct/threshold)
+        // and, if enabled, start the compression worker so it joins the scheduler
+        // with the canonical processes. logs the boot banner. (satoru)
+        KMemX::ApplyConfig();
         // bring up kinit AFTER the canonical kernel processes: it adopts the
         // already-running in-kernel services (klog/knet/kdbus/kwayland/kaudio)
         // as supervised units, sequences the boot targets (which start the
@@ -3097,6 +3139,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             KDF::SetCrashTestPoweroff(boot_kdf_poweroff);
             Scheduler::SpawnKernelProcess("kdf-selftest", kdf_selftest_entry, PRIO_LOW, 64, 32 * 1024);
         }
+        // (the kmemx self-test runs inline earlier in kernel_main  -  see the
+        //  boot_kmemx_test block near kfsbench  -  so it is mode-independent and
+        //  needs no gui-path kproc here.) (satoru)
         Scheduler::Start();
         // Unreachable.
     }

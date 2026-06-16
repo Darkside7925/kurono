@@ -20,6 +20,9 @@
 #include "gpu_driver_installer.h"
 #include "system_update.h"            // queue debian-install for the reboot flow (satoru)
 #include "../net/network.h"           // wired link probe + wifi config screen (satoru)
+#include "../kernel/kmemx.h"          // memory-compression install option (satoru)
+#include "../kernel/pmm.h"            // total ram for the kmemx recommendation (satoru)
+#include "ui_config.h"                // persist the kmemx.enabled install choice (satoru)
 
 InstallerGUI::Screen InstallerGUI::current_screen = InstallerGUI::SCR_WELCOME;
 int  InstallerGUI::progress_pct = 0;
@@ -58,6 +61,9 @@ int  g_hostname_len       = 6;
 int  g_tz_idx             = 0;   // index into TIMEZONES
 bool g_pref_dark          = true;
 bool g_pref_24h           = true;
+// KMemX memory compression  -  offered as an install option, default ON
+// (recommended). persisted to kmemx.enabled when the install applies prefs. (satoru)
+bool g_pref_kmemx         = true;
 
 // network setup screen state (satoru). wired link is real (e1000/virtio); wifi
 // is an honest config UI with no radio to drive it yet  -  see scr_wifi.
@@ -521,6 +527,22 @@ static void scr_hostname(){
     // record the second checkbox's x so the click handler can tell them apart
     g_hit.alt_x = x + w/2 + 8; g_hit.alt_y = pby; g_hit.alt_w = w/2 - 8; g_hit.alt_h = 44;
 
+    // KMemX memory compression  -  a full-width option below, default on. its hit
+    // rect is recorded in cb_y[2]. a one-line note carries the recommendation,
+    // tailored by system RAM (the spec's installer disclaimer in brief). (satoru)
+    int kmy = pby + 52;
+    g_hit.cb_y[2] = kmy;
+    draw_checkbox_row(x, kmy, w, 44, "Memory compression (KMemX)",
+                      "Recommended - run more apps in the same RAM (~1-5% CPU)", g_pref_kmemx);
+    {
+        uint64_t ram_mb = PMM::GetTotalMemory() / (1024 * 1024);
+        const char* note = (ram_mb < 512)
+            ? "Strongly recommended for this system's RAM."
+            : (ram_mb > 4096 ? "Optional on this system (still recommended)."
+                             : "Recommended. Compresses inactive memory; decompress is transparent.");
+        FontTTF::DrawString(x, kmy + 50, 12.0f, note, 0xA0FFFFFF);
+    }
+
     g_hit.back_x = g_w/2 - 220; g_hit.back_y = g_h - 90; g_hit.back_w = 140; g_hit.back_h = 50;
     g_hit.next_x = g_w/2 + 80;  g_hit.next_y = g_h - 90; g_hit.next_w = 140; g_hit.next_h = 50;
     if (draw_button(g_hit.back_x, g_hit.back_y, g_hit.back_w, g_hit.back_h, "Back", 0xFF555570, false)) InstallerGUI::current_screen = InstallerGUI::SCR_USER;
@@ -880,6 +902,13 @@ static void install_step(){
             { const char* v = g_pref_24h ? "24h" : "12h"; while (*v) prefs[pp++] = *v++; }
             prefs[pp++] = '\n'; prefs[pp] = 0;
             KVFS::WriteString("/etc/kurono-prefs", prefs);
+            // kmemx memory-compression choice -> UIConfig + /kurono/system/config/
+            // kmemx.conf, so the first booted desktop honours the installer pick
+            // (ApplyConfig reads kmemx.enabled at boot). (satoru)
+            UIConfig::SetInt("kmemx.enabled", g_pref_kmemx ? 1 : 0, true);
+            UIConfig::Save();
+            KMemX::SetEnabled(g_pref_kmemx);
+            KMemX::WriteConfFile();
             // network config: record wired + any wifi credentials honestly. (satoru)
             KVFS::Mkdirs("/etc/network");
             char netc[160]; int np = 0;
@@ -1059,6 +1088,8 @@ bool InstallerGUI::Run(int start_screen){
                     // dark-theme checkbox (cb_x) vs 24h checkbox (alt_x)  -  distinguished by x. (satoru)
                     if (point_in(mx, my, g_hit.cb_x,  g_hit.cb_y[0], g_hit.cb_w,  g_hit.cb_h - 6)) g_pref_dark = !g_pref_dark;
                     if (point_in(mx, my, g_hit.alt_x, g_hit.alt_y,   g_hit.alt_w, g_hit.alt_h - 6)) g_pref_24h  = !g_pref_24h;
+                    // kmemx full-width checkbox (cb_y[2], full width from cb_x). (satoru)
+                    if (point_in(mx, my, g_hit.cb_x,  g_hit.cb_y[2], g_hit.cb_w,  g_hit.cb_h - 6)) g_pref_kmemx = !g_pref_kmemx;
                     break;
                 case SCR_GUESTS:
                     for (int i = 0; i < g_guest_count; i++){
