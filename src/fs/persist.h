@@ -29,5 +29,18 @@ public:
     // LoadTree mounts it and restores them. (satoru)
     static bool SaveTree();
     static bool LoadTree();
+
+    // restore ONLY the /apps subtree (large installed packages, e.g. firefox)
+    // on demand. LoadTree deliberately skips /apps at early boot so the ~288 mb
+    // bulk read does not run before the desktop is up (that early heap+timing
+    // state re-triggered a firefox thread-scheduling stall before its wayland
+    // connect); cmd_firefox calls this lazily, matching the install path where
+    // /apps fills only once firefox is actually launched. idempotent: returns
+    // true if /apps was restored, false if there is no volume to restore. (satoru)
+    static bool RestoreApps();
+
+    // true if the on-disk KFS volume has a populated /apps/firefox (so a lazy
+    // RestoreApps would bring a usable install back without a re-download). (satoru)
+    static bool HasPersistedFirefox();
 };
 // end (satoru)

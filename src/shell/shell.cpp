@@ -1854,6 +1854,42 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     const char* url = (argc >= 2) ? argv[1] : nullptr;
 
     int p = 0;
+    // lazy /apps restore: the boot restore (LoadTree) deliberately skips the big
+    // /apps subtree so its ~288 mb read does not run before the desktop is up
+    // (that early heap+timing state stalled firefox's threads before its wayland
+    // connect). if firefox is not in the live tree yet but a usable install is on
+    // the persist disk, restore it NOW -- at launch, the desktop already running,
+    // matching the working install path's memory+timing. (satoru)
+    if (!FirefoxLauncher::IsInstalled() && PersistStore::HasPersistedFirefox()) {
+        p = sappend(out, p, mx, "firefox: restoring persisted install from disk...\n");
+        PersistStore::RestoreApps();
+        // IsInstalled() also gates on /system/lib/firefox-deps.manifest, which
+        // lives under the non-persisted /kurono/system tree (rebuilt fresh each
+        // boot), so the restore of /apps alone does not bring it back. re-stamp
+        // it here from the package's own copy under /apps, exactly as the install
+        // path does, so the launcher gate passes on a restored boot. (satoru)
+        if (KVFS::Exists("/apps/firefox/firefox") &&
+            !KVFS::Exists("/system/lib/firefox-deps.manifest")) {
+            KVFS::Mkdirs("/system/lib");
+            KVFS::WriteString("/system/lib/firefox-deps.manifest",
+                              "# firefox deps resolved from /apps/firefox/lib\n");
+        }
+        // re-apply the gecko root-guard chowns the install path does. gecko runs
+        // as euid 0 here and refuses to start when $HOME / the xdg dirs / $TMPDIR
+        // are owned by a different uid ("Running as root ... is not supported").
+        // these dirs live under /kurono/user (and /kurono/system, /tmp), which is
+        // rebuilt FRESH each boot owned by uid 1000, so a restored boot trips the
+        // guard exactly like a fresh install before its chowns. mirror them. (satoru)
+        KVFS::Chown("/home/user", 0, 0);
+        KVFS::Chown("/home/user/.config", 0, 0);
+        KVFS::Chown("/home/user/.cache", 0, 0);
+        KVFS::Chown("/home/user/.local", 0, 0);
+        KVFS::Chown("/home/user/.local/share", 0, 0);
+        KVFS::Chown("/home/user/.mozilla", 0, 0);
+        KVFS::Chown("/system/run/user/1000", 0, 0);
+        KVFS::Chown("/tmp", 0, 0);
+    }
+
     if (!FirefoxLauncher::IsInstalled()) {
         p = sappend(out, p, mx, "firefox: not installed yet  -  installing via kpkg...\n");
         const char* iav[] = { "install", "firefox", nullptr };
