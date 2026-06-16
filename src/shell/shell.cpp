@@ -1865,6 +1865,11 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             p = sappend(out, p, mx, "firefox: install did not complete; aborting launch.\n");
             return p;
         }
+        // persist the fresh install (/apps/firefox) so the next boot restores it
+        // from nvme instead of re-downloading + re-extracting it (saves ~145s per
+        // run once an nvme data disk is attached). (satoru)
+        if (PersistStore::SaveTree())
+            p = sappend(out, p, mx, "firefox: install persisted to disk for next boot.\n");
     }
 
     p = sappend(out, p, mx, "firefox: launching /apps/firefox/firefox via ld-kurono...\n");

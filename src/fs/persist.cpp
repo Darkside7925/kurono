@@ -313,9 +313,19 @@ namespace {
                 if (sz < 0) { KernelHeap::Free(child); continue; }
                 if (sz == 0) { KVFS::WriteFile(child, "", 0); KernelHeap::Free(child); continue; }
                 uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)sz);
-                if (!buf) { KernelHeap::Free(child); continue; }
-                if (KFS::ReadFile(child, buf, (uint64_t)sz) == sz)
+                if (!buf) {   // a silent skip here leaves a restored install incomplete (satoru)
+                    SerialLogger::Log("[persist] RESTORE alloc FAIL "); SerialLogger::Log(child);
+                    SerialLogger::Log(" sz="); SerialLogger::LogDec((int)sz); SerialLogger::Log("\r\n");
+                    KernelHeap::Free(child); continue;
+                }
+                int64_t got = KFS::ReadFile(child, buf, (uint64_t)sz);
+                if (got == sz) {
                     KVFS::WriteFile(child, buf, (uint32_t)sz);
+                } else {   // a truncated restore is silent corruption -- surface it (satoru)
+                    SerialLogger::Log("[persist] RESTORE short read "); SerialLogger::Log(child);
+                    SerialLogger::Log(" sz="); SerialLogger::LogDec((int)sz);
+                    SerialLogger::Log(" got="); SerialLogger::LogDec((int)got); SerialLogger::Log("\r\n");
+                }
                 KernelHeap::Free(buf);
             }
             KernelHeap::Free(child);
@@ -364,8 +374,10 @@ bool PersistStore::SaveTree() {
 
     uint32_t blocks = kfs_disk_blocks();
     if (!blocks || !KFS::Format(blocks)) return false;
-    const char* roots[3] = { "/home", "/etc", "/root" };
-    for (int i = 0; i < 3; i++) if (KVFS::Exists(roots[i])) save_subtree(roots[i]);
+    // /apps persists too so a large installed package (e.g. firefox in
+    // /apps/firefox) survives reboot and isn't re-downloaded every boot. (satoru)
+    const char* roots[4] = { "/home", "/etc", "/root", "/apps" };
+    for (int i = 0; i < 4; i++) if (KVFS::Exists(roots[i])) save_subtree(roots[i]);
     KFS::SetFingerprint(cur_fp);   // stamp so the next save can short-circuit (satoru)
     bool ok = KFS::Sync();
     if (ok) SerialLogger::Log("[persist] saved kvfs user data to KFS volume (full snapshot)\r\n");
@@ -376,8 +388,8 @@ bool PersistStore::LoadTree() {
     if (!NVMe::IsDetected()) return false;
     KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
     if (!KFS::Mount()) return false;
-    const char* roots[3] = { "/home", "/etc", "/root" };
-    for (int i = 0; i < 3; i++) if (KFS::Exists(roots[i])) restore_subtree(roots[i]);
+    const char* roots[4] = { "/home", "/etc", "/root", "/apps" };
+    for (int i = 0; i < 4; i++) if (KFS::Exists(roots[i])) restore_subtree(roots[i]);
     SerialLogger::Log("[persist] restored kvfs user data from KFS volume\r\n");
     return true;
 }
