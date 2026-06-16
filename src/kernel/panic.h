@@ -41,6 +41,7 @@ namespace StopCode {
     constexpr uint32_t SCHEDULER_FAULT        = 0x00010008;
     constexpr uint32_t VFS_CORRUPTION         = 0x00010009;
     constexpr uint32_t VMM_FAULT              = 0x0001000A;
+    constexpr uint32_t KMEMX_CORRUPTION       = 0x0001000B;  // crc mismatch decompressing a kmemx page (satoru)
     // fatal / unrecoverable
     constexpr uint32_t KERNEL_FATAL           = 0xDEAD0001;
     constexpr uint32_t MANUAL_CRASH           = 0xDEAD0002;

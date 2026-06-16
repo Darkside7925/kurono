@@ -71,6 +71,8 @@ struct Stats {
     uint32_t compress_fail;   // pages that did not fit / declined (stored raw) (satoru)
     uint64_t ns_compress_max; // worst single-page compress time (ns) (satoru)
     uint64_t ns_decompress_max; // worst single-page decompress time (ns) (satoru)
+    uint64_t ns_decompress_min; // best single-page decompress time (ns)  -  warm path (satoru)
+    uint64_t ns_decompress_sum; // running sum for the mean decompress latency (satoru)
     uint64_t decomp_over_10us;  // decompressions that blew the 10us invisibility budget (satoru)
 };
 
@@ -161,6 +163,21 @@ int DedupPass(int budget);
 // compressed at the ept level. (satoru)
 void RegisterGuest(uint64_t ept_root, const char* name);
 void UnregisterGuest(uint64_t ept_root);
+
+// ── kernel process (stage 4) ─────────────────────────────────────────────────
+// spawn the dedicated, cpu-capped kmemx compression kernel-process. it wakes
+// every 10ms, acquires a token-bucket budget (1-16 pages/tick by pressure),
+// yields immediately if the compositor is rendering, scans for aged candidates,
+// and runs a low-frequency dedup pass. highest kernel-process priority below
+// the scheduler. returns true if spawned. only starts if IsEnabled(). (satoru)
+bool StartProcess();
+// true once the process has been spawned this boot. (satoru)
+bool ProcessRunning();
+
+// the per-tick page budget derived from the live pressure level (1..16). the
+// token bucket caps the process to this many compressions per 10ms tick so cpu
+// stays at 1-5% regardless of load. exposed for the shell `kmemx status`. (satoru)
+int TokenBudget();
 
 }  // namespace KMemX
 
