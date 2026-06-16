@@ -67,6 +67,7 @@
 #include "../kcl/kcl.h"
 #include "../kcl/kcl_test.h"
 #include "../net/ieee80211_test.h"  // 802.11i wpa2 crypto self-test (kurono.wifitest) (satoru)
+#include "kmemx_test.h"        // kmemx memory-compression self-test (kurono.kmemxtest) (satoru)
 #include "../apps/kj.h"        // kj (kurono javascript) interpreter (satoru)
 #include "../apps/kj_test.h"   // kj (kurono javascript) self-test suite (satoru)
 #include "../security/supr.h"
@@ -904,6 +905,20 @@ static volatile bool g_kinit_test_poweroff = false;
     for (;;) Scheduler::SleepMs(60000);
 }
 
+// kmemx self-test runner kernel-process (kurono.kmemxtest). spawned after the
+// desktop is up; runs the lz4/pool/dedup self-tests off the gui loop, logs
+// PASS/FAIL to serial, optionally powers off for headless ci. (satoru)
+static volatile bool g_kmemx_test_poweroff = false;
+[[noreturn]] static void kmemx_selftest_entry() {
+    Scheduler::SleepMs(2000);
+    KMemXTest::RunAll();
+    if (g_kmemx_test_poweroff) {
+        SerialLogger::Log("[kmemx-test] powering off (kurono.kmemx.poweroff)\r\n");
+        HAL::PowerOff();
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
 extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Init();
     SerialLogger::Log("Kurono OS Starting...\r\n");
@@ -1044,6 +1059,11 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // kdf crash-recovery self-test gate (kurono.kdf.test) + poweroff-after. (satoru)
     bool boot_kdf_test = false;
     bool boot_kdf_poweroff = false;
+    // kmemx (memory compression engine) self-test gate (kurono.kmemxtest):
+    // run the lz4 + pool + dedup self-tests headless at boot, log PASS/FAIL to
+    // serial, optionally power off. proves the engine without the gui. (satoru)
+    bool boot_kmemx_test = false;
+    bool boot_kmemx_poweroff = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     // setup mode: run the graphical installer / first-setup wizard instead of
@@ -1127,6 +1147,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
         if (boot_has_token(boot_cmdline, "kurono.kdf.poweroff=1") || boot_has_token(boot_cmdline, "kurono.kdf.poweroff")) {
             boot_kdf_poweroff = true;
+        }
+        // latch the kmemx (memory compression) self-test gate + optional poweroff. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kmemxtest=1") || boot_has_token(boot_cmdline, "kurono.kmemxtest")) {
+            boot_kmemx_test = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kmemx.poweroff=1") || boot_has_token(boot_cmdline, "kurono.kmemx.poweroff")) {
+            boot_kmemx_poweroff = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -3068,6 +3095,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_kdf_test) {
             KDF::SetCrashTestPoweroff(boot_kdf_poweroff);
             Scheduler::SpawnKernelProcess("kdf-selftest", kdf_selftest_entry, PRIO_LOW, 64, 32 * 1024);
+        }
+        // headless kmemx self-tests: lz4 roundtrip over 1000 pages etc., off the
+        // gui loop so the bounded waits never stall rendering. (satoru)
+        if (boot_kmemx_test) {
+            g_kmemx_test_poweroff = boot_kmemx_poweroff;
+            Scheduler::SpawnKernelProcess("kmemx-selftest", kmemx_selftest_entry, PRIO_LOW, 256, 32 * 1024);
         }
         Scheduler::Start();
         // Unreachable.

@@ -167,6 +167,8 @@ CXX_SRCS = \
     $(SRC)/kernel/buddy.cpp \
     $(SRC)/kernel/slab.cpp \
     $(SRC)/kernel/vmm.cpp \
+    $(SRC)/kernel/kmemx_lz4.cpp \
+    $(SRC)/kernel/kmemx_test.cpp \
     $(SRC)/kernel/kdf.cpp \
     $(SRC)/kernel/kdf_test.cpp \
     $(SRC)/kernel/udf.cpp \
