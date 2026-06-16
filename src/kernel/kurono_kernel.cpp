@@ -1044,6 +1044,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // kdf crash-recovery self-test gate (kurono.kdf.test) + poweroff-after. (satoru)
     bool boot_kdf_test = false;
     bool boot_kdf_poweroff = false;
+    // linux syscall-abi self-test gate (kurono.klstest): drive a representative
+    // syscall from each tier through LinuxSyscall::Dispatch and log PASS/FAIL per
+    // check headless at boot. proves the tier 1-11 build-out is wired + sane
+    // without a GUI run. kurono.klstest.poweroff=1 powers off after. (satoru)
+    bool boot_kls_test = false;
+    bool boot_kls_poweroff = false;
     // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     // setup mode: run the graphical installer / first-setup wizard instead of
@@ -1127,6 +1133,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
         if (boot_has_token(boot_cmdline, "kurono.kdf.poweroff=1") || boot_has_token(boot_cmdline, "kurono.kdf.poweroff")) {
             boot_kdf_poweroff = true;
+        }
+        // latch the linux syscall-abi self-test gate + optional poweroff-after. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.klstest=1") || boot_has_token(boot_cmdline, "kurono.klstest")) {
+            boot_kls_test = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.klstest.poweroff=1") || boot_has_token(boot_cmdline, "kurono.klstest.poweroff")) {
+            boot_kls_poweroff = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.mouse.raw=1") || boot_has_token(boot_cmdline, "kurono.mouse.raw")) {
             boot_mouse_raw = true;
@@ -2668,6 +2681,21 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_kj_test) {
         SerialLogger::Log("[KJ] running self-test suite\r\n");
         KJTest::RunAll();
+    }
+
+    // linux syscall-abi self-test (gated by kurono.klstest): exercise a
+    // representative syscall from each tier through Dispatch and log PASS/FAIL.
+    // LinuxSyscall::Init() ran earlier so the process table + fd machinery are
+    // live. powers off afterwards if kurono.klstest.poweroff=1 (headless ci). (satoru)
+    if (boot_kls_test) {
+        SerialLogger::Log("[KLS] running syscall-abi self-test\r\n");
+        int kls_fails = LinuxSyscall::SelfTest();
+        SerialLogger::Log(kls_fails == 0 ? "[KLS] self-test: ALL PASS\r\n"
+                                         : "[KLS] self-test: FAILURES\r\n");
+        if (boot_kls_poweroff) {
+            SerialLogger::Log("[KLS] poweroff requested\r\n");
+            HAL::PowerOff();
+        }
     }
 
     // initialize the unified audio stack.
