@@ -998,6 +998,12 @@ static bool ustar_extract(const char* archive, int archive_len, const char* base
     return any;
 }
 
+// public wrapper so other subsystems (e.g. the firefox launcher unpacking the
+// embedded xkeyboard-config tree) can extract an in-memory ustar blob. (satoru)
+bool PackageManager::ExtractTar(const char* archive, int archive_len, const char* base_dir) {
+    return ustar_extract(archive, archive_len, base_dir);
+}
+
 // ---------------- record / installed.json ----------------
 static void pwrite_package_record(const Package* pkg, const char* payload, int payload_len,
                                   const char* payload_name) {
