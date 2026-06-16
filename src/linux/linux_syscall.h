@@ -369,7 +369,10 @@ struct LinuxProcess {
     uint32_t euid, egid;
     char     cwd[256];
     char     name[64];
-    LinuxFd  fds[LINUX_MAX_FDS];
+    // heap-allocated fd table. CLONE_FILES threads share ONE table (the leader's)
+    // so a multithreaded app's threads see each other's fds -- required by e.g.
+    // firefox's WaylandProxy + GTK threads. allocated in CreateProcess. (satoru)
+    LinuxFd* fds;
     uint64_t brk_base;     // heap addresses are 64-bit so a high pie heap fits (satoru)
     uint64_t brk_current;
     uint64_t brk_max;
@@ -515,7 +518,7 @@ private:
     static int32_t sys_access(uintptr_t pathname, uint32_t mode);
     static int32_t sys_dup(int oldfd);
     static int32_t sys_dup2(int oldfd, int newfd);
-    static int32_t sys_ioctl(int fd, uint32_t cmd, uint32_t arg);
+    static int32_t sys_ioctl(int fd, uint32_t cmd, uint64_t arg);
     static int32_t sys_writev(int fd, uintptr_t iov, uint64_t iovcnt);
     static int32_t sys_munmap(uintptr_t addr, uint64_t length);
     static int32_t sys_mprotect(uintptr_t addr, uint64_t length, uint32_t prot);

@@ -100,6 +100,7 @@ namespace UnixSocket {
                         DataCallback       on_data,
                         void*              user);
     int  PendingBytes(int sd);
+    bool HasPendingConnection(int sd);   // listen fd has a backlog conn -> POLLIN (satoru)
     int  KernelInject(int sd, const void* buf, int len);  // kernel→client
 
     // Resolve a socket path back to a listening sd, or -1.
