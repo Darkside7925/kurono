@@ -42,6 +42,8 @@ uint32_t  g_meta_live = 0;
 // ── compress/decompress scratch (pre-allocated; never malloc'd on hot path) ──
 uint8_t*  g_scratch_hash = nullptr;   // lz4 compressor hash table (satoru)
 uint8_t*  g_scratch_comp = nullptr;   // CompressBound(4096) staging buffer (satoru)
+uint8_t*  g_scratch_dda  = nullptr;   // dedup decompress buffer A (4kb) (satoru)
+uint8_t*  g_scratch_ddb  = nullptr;   // dedup decompress buffer B (4kb) (satoru)
 constexpr int PAGE = 4096;
 
 // ── never-compress physical ranges ──────────────────────────────────────────
@@ -55,6 +57,39 @@ struct GuestReg { uint64_t ept_root; const char* name; };
 constexpr int MAX_GUESTS = 8;
 GuestReg g_guests[MAX_GUESTS];
 int      g_guest_count = 0;
+
+// ── dedup shared-extent refcounts (stage 10) ────────────────────────────────
+// when two compressed pages have identical bytes, dedup points both PageMetas
+// at ONE pool extent and the second's frame/extent is freed. a shared extent
+// must not be freed back to the pool until the LAST referencing page faults in,
+// so its reference count lives here, keyed by pool_off (the blob's stable
+// handle). a small open-addressed table; only deduped extents (refs >= 2)
+// occupy an entry  -  a normal 1:1 page never touches it. (satoru)
+struct DedupRef { uint32_t pool_off; uint32_t refs; };
+constexpr int MAX_DEDUP = 4096;
+DedupRef g_dedup[MAX_DEDUP];
+int      g_dedup_count = 0;   // live shared-extent entries (diagnostic) (satoru)
+
+// find the refcount entry for a shared pool_off, or -1. (satoru)
+static int dedup_find(uint32_t pool_off) {
+    for (int i = 0; i < MAX_DEDUP; i++)
+        if (g_dedup[i].refs != 0 && g_dedup[i].pool_off == pool_off) return i;
+    return -1;
+}
+// get-or-create the refcount entry for a shared extent, seeded to `init`. (satoru)
+static int dedup_intern(uint32_t pool_off, uint32_t init) {
+    int idx = dedup_find(pool_off);
+    if (idx >= 0) return idx;
+    for (int i = 0; i < MAX_DEDUP; i++) {
+        if (g_dedup[i].refs == 0) {
+            g_dedup[i].pool_off = pool_off;
+            g_dedup[i].refs = init;
+            g_dedup_count++;
+            return i;
+        }
+    }
+    return -1;   // table full -> dedup declines this merge (satoru)
+}
 
 // fnv-1a-ish hash of (as,vaddr) -> table slot. (satoru)
 static inline uint32_t meta_hash(uint64_t as, uint64_t vaddr) {
@@ -199,7 +234,6 @@ static int store_compressed_locked(uint64_t as, uint64_t vaddr,
     g_stats.pages_in++;
     g_stats.live_pages = g_meta_live;
     g_stats.pool_used = KMemXPool::UsedBytes();
-    g_stats.bytes_saved += (PAGE - blob_len);
     return slot;
 }
 
@@ -224,11 +258,38 @@ static bool retrieve_compressed_locked(int idx, uint8_t* dst) {
     return true;
 }
 
-// free slot `idx`'s pool extent + metadata. caller holds g_lock. (satoru)
+// free slot `idx`'s pool extent + metadata. caller holds g_lock. dedup-aware: a
+// shared extent (KMETA_DEDUP) is only returned to the pool when its last
+// reference is freed; until then we just drop this page's metadata + refcount.
+// (satoru)
 static void free_slot_locked(int idx) {
     PageMeta& m = g_meta[idx];
     if (m.pool_off == KMEMX_POOL_NULL) return;
-    g_stats.bytes_saved -= (PAGE - m.comp_size);
+
+    if (m.flags & KMETA_DEDUP) {
+        // a deduped page: decrement the shared extent's refcount and free the pool
+        // bytes only when the LAST reference goes (refs reaches 0). the refcount
+        // == the number of metas pointing at this extent, so the entry stays live
+        // (even at refs==1) until its final page is freed. (satoru)
+        int d = dedup_find(m.pool_off);
+        if (d >= 0) {
+            if (g_dedup[d].refs > 0) g_dedup[d].refs--;
+            if (g_dedup[d].refs == 0) {
+                KMemXPool::Free(m.pool_off, m.comp_size);
+                g_stats.pool_used = KMemXPool::UsedBytes();
+                g_dedup[d].pool_off = 0;
+                g_dedup_count--;
+            }
+            // every freed deduped page (except the one keeping the extent) gives
+            // back its saved bytes; track the live dedup-eliminated count. (satoru)
+            if (g_stats.dedup_saved > 0) g_stats.dedup_saved--;
+        }
+        meta_erase(idx);
+        g_meta_live--;
+        g_stats.live_pages = g_meta_live;
+        return;
+    }
+
     KMemXPool::Free(m.pool_off, m.comp_size);
     meta_erase(idx);
     g_meta_live--;
@@ -256,7 +317,9 @@ bool Init(int pool_pct) {
     //  contiguous block for the table  -  the original boot failure.) (satoru)
     g_scratch_hash = (uint8_t*)PMM::AllocBytes(KMemXLZ4::SCRATCH_BYTES);
     g_scratch_comp = (uint8_t*)PMM::AllocBytes((size_t)KMemXLZ4::CompressBound(PAGE));
-    if (!g_scratch_hash || !g_scratch_comp) {
+    g_scratch_dda  = (uint8_t*)PMM::AllocBytes(PAGE);   // dedup byte-compare A (satoru)
+    g_scratch_ddb  = (uint8_t*)PMM::AllocBytes(PAGE);   // dedup byte-compare B (satoru)
+    if (!g_scratch_hash || !g_scratch_comp || !g_scratch_dda || !g_scratch_ddb) {
         SerialLogger::Log("[kmemx] FATAL: could not allocate scratch\r\n");
         return false;
     }
@@ -316,6 +379,8 @@ bool Init(int pool_pct) {
                          (uint64_t)g_meta_cap * sizeof(PageMeta), "kmemx.meta");
     ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_hash, KMemXLZ4::SCRATCH_BYTES, "kmemx.scratch");
     ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_comp, (uint64_t)KMemXLZ4::CompressBound(PAGE), "kmemx.scratch2");
+    ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_dda, PAGE, "kmemx.dedupA");
+    ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_ddb, PAGE, "kmemx.dedupB");
 
     // pre-warm the fault hot path: build the crc32 table + cache the tsc freq now
     // (one-time costs that would otherwise land on the FIRST decompression fault
@@ -370,7 +435,17 @@ bool IsCompressible(uint64_t as, uint64_t vaddr) {
 }
 
 // ── stats ─────────────────────────────────────────────────────────────────────
-const Stats& GetStats() { return g_stats; }
+const Stats& GetStats() {
+    // bytes_saved is derived exactly from the live logical size minus the real
+    // physical pool bytes in use (the pool allocator tracks UsedBytes() exactly),
+    // so dedup + raw-stored pages are all accounted without per-op delta bugs.
+    // (satoru)
+    uint64_t logical = (uint64_t)g_meta_live * PAGE;
+    uint64_t used = KMemXPool::UsedBytes();
+    g_stats.pool_used = used;
+    g_stats.bytes_saved = (logical > used) ? (logical - used) : 0;
+    return g_stats;
+}
 
 int RatioX100() {
     // ratio over live pages: (live*4096) / pool_used. (satoru)
@@ -707,7 +782,90 @@ int DecompressAll() {
     return DecompressMatching(0, /*all=*/true);
 }
 
-int DedupPass(int /*budget*/) { return 0; }       // stage 10 (satoru)
+// ── stage 10: ksm-style deduplication ───────────────────────────────────────
+// find compressed pages with identical content and merge them onto one shared
+// pool extent (copy-on-write: a later fault decompresses + restores the page and
+// drops the shared refcount). matches by crc32 first (cheap), then a full
+// byte-compare of the decompressed pages (crc collisions are rare but possible  - 
+// we must never merge non-identical pages). runs at the lowest priority inside
+// the kmemx process and is strictly bounded by `budget` merges per pass. big win
+// for libxul zero pages + musl pages shared across processes. (satoru)
+namespace { uint32_t g_dedup_cursor = 0; }
+
+int DedupPass(int budget) {
+    if (!g_inited || !g_enabled || budget <= 0) return 0;
+    if (g_meta_cap == 0) return 0;
+    int merged = 0;
+    // bound the work: scan at most this many table slots per pass. (satoru)
+    const uint32_t SCAN = g_meta_cap;   // one full sweep, amortized by the cursor (satoru)
+    uint32_t scanned = 0;
+
+    uint64_t f; g_lock.LockIrqSave(&f);
+    uint32_t i = g_dedup_cursor & g_meta_mask;
+    while (scanned < SCAN && merged < budget) {
+        scanned++;
+        uint32_t slot_a = i;
+        i = (i + 1) & g_meta_mask;
+
+        PageMeta& a = g_meta[slot_a];
+        if (a.pool_off == KMEMX_POOL_NULL) continue;
+        if (a.flags & (KMETA_DEDUP | KMETA_RAW)) continue;   // skip already-deduped + raw (satoru)
+
+        // decompress page A into buffer A (crc-verified). (satoru)
+        if (!retrieve_compressed_locked((int)slot_a, g_scratch_dda)) {
+            uint32_t want = a.crc32;
+            g_lock.UnlockIrqRestore(f);
+            KernelPanic::KeBugCheckEx(StopCode::KMEMX_CORRUPTION, a.address_space,
+                                      a.vaddr, (uint64_t)want, 2,
+                                      "kmemx: crc mismatch during dedup scan",
+                                      __FILE__, (uint32_t)__LINE__);
+        }
+        uint32_t crc_a = a.crc32;
+
+        // scan a bounded window forward for another page with the same crc. (satoru)
+        const uint32_t WINDOW = 512;
+        for (uint32_t w = 1; w <= WINDOW && merged < budget; w++) {
+            uint32_t slot_b = (slot_a + w) & g_meta_mask;
+            PageMeta& b = g_meta[slot_b];
+            if (b.pool_off == KMEMX_POOL_NULL) continue;
+            if (b.flags & (KMETA_DEDUP | KMETA_RAW)) continue;
+            if (b.crc32 != crc_a) continue;
+            if (b.pool_off == a.pool_off) continue;          // already the same blob (satoru)
+
+            // crc matches  -  confirm with a full byte-compare. (satoru)
+            if (!retrieve_compressed_locked((int)slot_b, g_scratch_ddb)) {
+                uint32_t want = b.crc32;
+                g_lock.UnlockIrqRestore(f);
+                KernelPanic::KeBugCheckEx(StopCode::KMEMX_CORRUPTION, b.address_space,
+                                          b.vaddr, (uint64_t)want, 3,
+                                          "kmemx: crc mismatch during dedup compare",
+                                          __FILE__, (uint32_t)__LINE__);
+            }
+            if (memcmp(g_scratch_dda, g_scratch_ddb, PAGE) != 0) continue;  // crc collision (satoru)
+
+            // identical: merge B onto A's extent. intern A's extent as shared
+            // (refs start at 1 for A), bump for B, then free B's own extent. (satoru)
+            int d = dedup_intern(a.pool_off, 1);
+            if (d < 0) break;   // dedup table full -> stop merging this pass (satoru)
+            // free B's now-redundant pool bytes + point B at A's blob. (satoru)
+            uint32_t b_size = b.comp_size;
+            uint32_t b_off  = b.pool_off;
+            // mark A as part of a dedup set too (so its free path decrements). (satoru)
+            if (!(a.flags & KMETA_DEDUP)) a.flags |= KMETA_DEDUP;
+            b.flags |= KMETA_DEDUP;
+            b.pool_off = a.pool_off;
+            b.comp_size = a.comp_size;
+            g_dedup[d].refs++;            // now A + B reference the shared extent (satoru)
+            KMemXPool::Free(b_off, b_size);
+            g_stats.pool_used = KMemXPool::UsedBytes();
+            g_stats.dedup_saved++;
+            merged++;
+        }
+    }
+    g_dedup_cursor = i;
+    g_lock.UnlockIrqRestore(f);
+    return merged;
+}
 
 // ── test-only hooks used by the stage-2 pool self-test ──────────────────────
 // (declared in kmemx_internal.h so the test TU can reach the locked primitives
