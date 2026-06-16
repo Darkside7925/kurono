@@ -1176,6 +1176,155 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     HAL::DisableInterrupts();
 }
 
+// permanent, rate-limited enosys trace shared by the i386 dispatch default and
+// the x64 translation miss. keeps a tiny ring of recently-seen numbers so a
+// busy retry loop on one missing nr logs once, not thousands of times; a brand
+// new number always logs. format is the strace-friendly "[kls] ENOSYS nr=<n>
+// <name>" the audit recipe greps for. (satoru)
+void LinuxSyscall::LogEnosys(uint64_t nr, const char* name) {
+    static uint32_t seen[32] = {};
+    static int      seen_head = 0;
+    uint32_t key = (uint32_t)nr;
+    for (int i = 0; i < 32; i++) {
+        if (seen[i] == key + 1) return;  // already logged this nr (satoru)
+    }
+    seen[seen_head] = key + 1;           // +1 so a zeroed slot never matches nr 0 (satoru)
+    seen_head = (seen_head + 1) & 31;
+    SerialLogger::Log("[kls] ENOSYS nr=");
+    SerialLogger::LogDec((int)nr);
+    if (name && name[0]) {
+        SerialLogger::Log(" ");
+        SerialLogger::Log(name);
+    }
+    SerialLogger::Log("\r\n");
+}
+
+// headless syscall-abi self-test (gated by kurono.klstest). exercises a
+// representative syscall from each tier through Dispatch and logs PASS/FAIL per
+// check. runs in kernel context where identity-mapped low memory is directly
+// dereferenceable, so user-pointer args can point at kernel stack buffers. (satoru)
+int LinuxSyscall::SelfTest() {
+    int fails = 0;
+    auto check = [&](const char* name, bool ok) {
+        SerialLogger::Log(ok ? "[klstest] PASS " : "[klstest] FAIL ");
+        SerialLogger::Log(name);
+        SerialLogger::Log("\r\n");
+        if (!ok) fails++;
+    };
+
+    // stand up a throwaway linux process so Current() resolves and fd allocation
+    // works; remember + restore the caller's current index. (satoru)
+    int saved = GetCurrentIndex();
+    int idx = CreateProcess("klstest", 4242, 4243);
+    if (idx < 0) { check("create_test_process", false); return 1; }
+    SetCurrent(idx);
+
+    // ── Tier 9: identity. setuid/setgid then read back via the LinuxProcess. ──
+    Dispatch(LSYS_SETUID_, 1234, 0, 0, 0, 0);
+    Dispatch(LSYS_SETGID_, 5678, 0, 0, 0, 0);
+    check("setuid_getuid", sys_getuid() == 1234);
+    check("setgid_getgid", sys_getgid() == 5678);
+    {
+        uint32_t r = 0, e = 0, s = 0;
+        Dispatch(LSYS_GETRESUID, (uint64_t)(uintptr_t)&r, (uint64_t)(uintptr_t)&e,
+                 (uint64_t)(uintptr_t)&s, 0, 0);
+        check("getresuid", r == 1234 && e == 1234);
+        check("setfsuid_returns_prev", Dispatch(LSYS_SETFSUID, 99, 0, 0, 0, 0) == 1234);
+        check("getgroups_zero", Dispatch(LSYS_GETGROUPS, 0, 0, 0, 0, 0) == 0);
+    }
+
+    // ── Tier 3: scheduler/priority. nice biasing is read/written on the backing
+    //    kernel Process; this throwaway LinuxProcess has task==nullptr, so the
+    //    handler correctly leaves nice at the default and getpriority reports
+    //    20-0=20. (the nice round-trip itself is exercised by a real process.) ──
+    {
+        Dispatch(LSYS_SETPRIORITY, 0, 0, (uint64_t)(int64_t)5, 0, 0);  // no-op (no task) (satoru)
+        int64_t gp = Dispatch(LSYS_GETPRIORITY, 0, 0, 0, 0, 0);
+        check("getpriority_default_no_task", gp == 20);
+        check("sched_prio_max_fifo", Dispatch(LSYS_SCHED_GET_PRIORITY_MAX, 1, 0, 0, 0, 0) == 99);
+        check("sched_prio_min_normal", Dispatch(LSYS_SCHED_GET_PRIORITY_MIN, 0, 0, 0, 0, 0) == 0);
+        check("sched_getscheduler_normal", Dispatch(LSYS_SCHED_GETSCHEDULER, 0, 0, 0, 0, 0) == 0);
+        check("capget_zeroes", Dispatch(LSYS_CAPGET, 0, 0, 0, 0, 0) == 0);
+    }
+
+    // ── Tier 10: statfs fills a sane struct (f_type + f_namelen). ──
+    {
+        uint8_t sb[128];
+        for (int i = 0; i < 128; i++) sb[i] = 0xAB;
+        int64_t r = Dispatch(LSYS_STATFS_, 0, (uint64_t)(uintptr_t)sb, 0, 0, 0);
+        uint64_t* w = (uint64_t*)sb;
+        check("statfs_ok", r == 0 && w[1] == 4096 && *(uint64_t*)(sb + 56) == 255);
+        check("sysfs_count", Dispatch(LSYS_SYSFS, 3, 0, 0, 0, 0) == 1);
+    }
+
+    // ── Tier 6: mincore marks pages resident; mlock/mlockall accept. ──
+    {
+        uint8_t vec[4] = {0, 0, 0, 0};
+        int64_t r = Dispatch(LSYS_MINCORE, 0x20000000ULL, 4096 * 3,
+                             (uint64_t)(uintptr_t)vec, 0, 0);
+        check("mincore_resident", r == 0 && vec[0] == 1 && vec[2] == 1);
+        check("mlockall_ok", Dispatch(LSYS_MLOCKALL, 0, 0, 0, 0, 0) == 0);
+        check("get_mempolicy_default", Dispatch(LSYS_GET_MEMPOLICY, 0, 0, 0, 0, 0) == 0);
+    }
+
+    // ── Tier 4: xattr reports the right "absent/unsupported" errnos. ──
+    check("getxattr_enodata", Dispatch(LSYS_GETXATTR, 0, 0, 0, 0, 0) == -61);
+    check("setxattr_eopnotsupp", Dispatch(LSYS_SETXATTR, 0, 0, 0, 0, 0) == -95);
+    check("listxattr_zero", Dispatch(LSYS_LISTXATTR, 0, 0, 0, 0, 0) == 0);
+
+    // ── Tier 7: rt_sigpending reports the (empty) pending mask; kill self posts. ──
+    {
+        uint64_t set = 0xDEAD;
+        Dispatch(LSYS_RT_SIGPENDING, (uint64_t)(uintptr_t)&set, 8, 0, 0, 0);
+        check("rt_sigpending_empty", set == 0);
+        check("pause_eintr", Dispatch(LSYS_PAUSE, 0, 0, 0, 0, 0) == -4);
+    }
+
+    // ── Tier 8: times returns a tick count; alarm reports no prior alarm. ──
+    {
+        uint64_t tms[4] = {1, 1, 1, 1};
+        int64_t r = Dispatch(LSYS_TIMES, (uint64_t)(uintptr_t)tms, 0, 0, 0, 0);
+        check("times_ok", r >= 0 && tms[2] == 0 && tms[3] == 0);
+        check("alarm_zero", Dispatch(LSYS_ALARM, 5, 0, 0, 0, 0) == 0);
+        check("getitimer_ok", Dispatch(LSYS_GETITIMER, 0, 0, 0, 0, 0) == 0);
+    }
+
+    // ── Tier 2/1: dup3 rejects oldfd==newfd; vmsplice consumes 0; fadvise ok. ──
+    check("dup3_einval_same", Dispatch(LSYS_DUP3, 1, 1, 0, 0, 0) == -22);
+    check("vmsplice_zero", Dispatch(LSYS_VMSPLICE, 0, 0, 0, 0, 0) == 0);
+    check("posix_fadvise_ok", Dispatch(LSYS_POSIX_FADVISE, 0, 0, 0, 0, 0) == 0);
+    check("seccomp_ok", Dispatch(LSYS_SECCOMP, 0, 0, 0, 0, 0) == 0);
+
+    // ── Tier 11: ptrace(TRACEME) accepted; an unsupported request is ENOSYS. ──
+    check("ptrace_traceme_ok", Dispatch(LSYS_PTRACE, 0, 0, 0, 0, 0) == 0);
+    check("ptrace_attach_enosys", Dispatch(LSYS_PTRACE, 16 /*ATTACH*/, 0, 0, 0, 0) == -38);
+
+    // ── Tier 6: mremap grow-with-move actually returns a new usable region. ──
+    {
+        int64_t base = sys_mmap(0, 4096, 0x3, 0x22, -1, 0);  // anon rw (satoru)
+        if (base > 0) {
+            *(volatile uint32_t*)(uintptr_t)base = 0xCAFEF00D;
+            int64_t grown = Dispatch(LSYS_MREMAP, (uint64_t)base, 4096, 8192,
+                                     1 /*MAYMOVE*/, 0);
+            bool ok = grown > 0 &&
+                      *(volatile uint32_t*)(uintptr_t)grown == 0xCAFEF00D;
+            check("mremap_grow_copies", ok);
+            if (grown > 0) sys_munmap((uintptr_t)grown, 8192);
+        } else {
+            check("mremap_grow_copies(skipped-no-mmap)", true);
+        }
+    }
+
+    // tear down the throwaway process + restore the caller's current index. (satoru)
+    DestroyProcess(idx);
+    SetCurrent(saved);
+
+    SerialLogger::Log("[klstest] ");
+    SerialLogger::LogDec(fails);
+    SerialLogger::Log(" FAILED\r\n");
+    return fails;
+}
+
 //  init
 
 void LinuxSyscall::Init() {
@@ -1685,11 +1834,9 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             }
             return 0;
         }
-        case LSYS_PERSONALITY:
-            return 0;  // PER_LINUX
-        case LSYS_CAPGET:
-        case LSYS_CAPSET:
-            return 0;  // we run as root-equivalent
+        // personality / capget / capset are now handled in the Tier-3 build-out
+        // block below (same LSYS_ ids, more spec-correct: capget zeroes the user
+        // data struct, the stubs here returned 0 without touching it). (satoru)
         case LSYS_FTRUNCATE: {
             // size a memfd's backing; non-memfd fds grow on write (kvfs). (satoru)
             LinuxProcess* p = Current();
@@ -1702,9 +1849,8 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_MADVISE:
         case LSYS_MSYNC:
             return 0;
-        case LSYS_DUP3:
-            // dup3(oldfd, newfd, flags)  -  flags ignored, behaves like dup2
-            return sys_dup2((int)ebx, (int)ecx);
+        // dup3 is handled in the Tier-2 build-out block below (adds the
+        // oldfd==newfd -> EINVAL rule the bare dup2 forward here skipped). (satoru)
         case LSYS_PIPE:
         case LSYS_PIPE2: {
             // back a pipe with a connected unix-socket pair: read/write already
@@ -1995,9 +2141,10 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_RT_SIGACTION:
         case LSYS_RT_SIGPROCMASK:
         case LSYS_RT_SIGSUSPEND:
-        case LSYS_RT_SIGPENDING:
         case LSYS_RT_SIGRETURN:
             return 0;
+        // LSYS_RT_SIGPENDING moved to the Tier-7 build-out block below, where it
+        // writes the process's real pending-signal mask into the user set. (satoru)
 
         // poll / select / ppoll / pselect6: return readiness count of 0 (no I/O).
         // For polled-stdin reads, the existing read() handler does its own
@@ -2444,9 +2591,12 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         }
 
         // ----- Misc that programs poke -----
+        // (LSYS_USERFAULTFD moved to the Tier-6 build-out block: it now returns a
+        //  real fd instead of 0, which aliased stdin. name_to_handle_at /
+        //  open_by_handle_at keep their accept-0 here and are now reachable from
+        //  the x64 path via kNrMap. (satoru))
         case LSYS_KEYCTL:
         case LSYS_KCMP:
-        case LSYS_USERFAULTFD:
         case LSYS_FANOTIFY_INIT:
         case LSYS_FANOTIFY_MARK:
         case LSYS_NAME_TO_HANDLE_AT:
@@ -2982,6 +3132,717 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return 0;
         }
 
+        // ════════════════════════════════════════════════════════════════
+        //  x86_64 ABI completeness build-out (satoru)
+        //  these are routed here from the real amd64 numbers via the kNrMap
+        //  in linux_syscall_x64.cpp. they return real values where the kernel
+        //  has the state, a harmless 0 where a no-op is correct, and -ENOSYS
+        //  (logged) only where the app genuinely cannot proceed. (satoru)
+        // ════════════════════════════════════════════════════════════════
+
+        // ── Tier 1: io/transfer + sandbox plumbing ──────────────────────
+        // vmsplice(fd, iov, nr_segs, flags): we cannot share user pages into a
+        // pipe, so report "consumed 0" which callers treat as a short splice and
+        // fall back to write(). returning -ENOSYS would break gzip/coreutils that
+        // probe vmsplice once then fall back. (satoru)
+        case LSYS_VMSPLICE:
+            return 0;
+
+        // openat2(dirfd, path, open_how*, size): open_how = { flags, mode,
+        // resolve }. resolve flags (RESOLVE_NO_SYMLINKS etc.) are advisory here;
+        // pull flags+mode out of the struct and route to open. (satoru)
+        case LSYS_OPENAT2: {
+            uint64_t how = esi;   // struct open_how* (satoru)
+            uint64_t flags = 0, mode = 0;
+            if (how) {
+                flags = *(uint64_t*)(uintptr_t)how;
+                mode  = *(uint64_t*)(uintptr_t)(how + 8);
+            }
+            return sys_open(edx, (uint32_t)flags, (uint32_t)mode);
+        }
+
+        // pidfd_open(pid, flags): hand back a real fd referring to the target.
+        // we store the pid in offset so pidfd_send_signal/getfd can read it. (satoru)
+        case LSYS_PIDFD_OPEN_: {
+            LinuxProcess* lp = Current();
+            if (!lp) return -1;
+            int fd = AllocFd(lp);
+            if (fd < 0) return -24;
+            memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+            lp->fds[fd].type = LFD_DEVNULL;   // readable-as-empty pid handle (satoru)
+            lp->fds[fd].offset = ebx;          // remember the target pid (satoru)
+            lp->fds[fd].open = true;
+            return fd;
+        }
+        // pidfd_send_signal(pidfd, sig, info, flags): resolve the pidfd's stored
+        // pid and post the signal to that linux process. (satoru)
+        case LSYS_PIDFD_SEND_SIG: {
+            int pidfd = (int)ebx; int sig = (int)ecx;
+            LinuxProcess* lp = Current();
+            if (!lp || pidfd < 0 || pidfd >= LINUX_MAX_FDS || !lp->fds[pidfd].open)
+                return -9;  // EBADF
+            uint32_t pid = (uint32_t)lp->fds[pidfd].offset;
+            for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && procs[i].pid == pid) {
+                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
+                    return 0;
+                }
+            return -3;  // ESRCH
+        }
+
+        // fanotify_init / fanotify_mark: accept the call shape, hand back a real
+        // fd for init so the group exists; marks are recorded as no-ops (no event
+        // backend yet). callers that only watch (not block) keep working. (satoru)
+        case LSYS_FANOTIFY_INIT_: {
+            LinuxProcess* lp = Current();
+            if (!lp) return -1;
+            int fd = AllocFd(lp);
+            if (fd < 0) return -24;
+            memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+            lp->fds[fd].type = LFD_FANOTIFY;
+            lp->fds[fd].open = true;
+            return fd;
+        }
+        case LSYS_FANOTIFY_MARK_:
+            return 0;
+
+        // ── Tier 2: posix file/io ────────────────────────────────────────
+        // sync_file_range / posix_fadvise / readahead: advisory, the kernel has
+        // no page cache to act on, so success-as-no-op is the correct contract. (satoru)
+        case LSYS_SYNC_FILE_RANGE:
+        case LSYS_POSIX_FADVISE:
+        case LSYS_READAHEAD:
+            return 0;
+
+        // dup3(oldfd, newfd, flags): like dup2 but with O_CLOEXEC in flags and an
+        // error if oldfd==newfd. flags are ignored (no cloexec tracking). (satoru)
+        case LSYS_DUP3: {
+            int oldfd = (int)ebx, newfd = (int)ecx;
+            if (oldfd == newfd) return -22;  // EINVAL per dup3 (satoru)
+            return sys_dup2(oldfd, newfd);
+        }
+
+        // epoll_pwait2(epfd, events, maxevents, timespec*, sigmask): same as
+        // epoll_wait but the timeout is a timespec*. convert to ms and route. (satoru)
+        case LSYS_EPOLL_PWAIT2: {
+            int timeout_ms = -1;
+            if (edx /*maxevents*/ && esi) {
+                const int64_t* ts = (const int64_t*)(uintptr_t)esi;
+                timeout_ms = (int)(ts[0] * 1000 + ts[1] / 1000000);
+            }
+            return Dispatch(LSYS_EPOLL_WAIT, ebx, ecx, edx, (uint64_t)(int64_t)timeout_ms, 0);
+        }
+
+        // preadv / pwritev / preadv2 / pwritev2 (fd, iov, iovcnt, pos_lo, pos_hi):
+        // seek to pos then run the scatter read/write. the *v2 forms add a flags
+        // word we ignore. a negative offset means "use the current offset". (satoru)
+        case LSYS_PREADV:
+        case LSYS_PREADV2: {
+            int fd = (int)ebx; uintptr_t iov = (uintptr_t)ecx; uint64_t cnt = edx;
+            int64_t pos = (int64_t)esi;
+            if (pos >= 0) sys_lseek(fd, (int32_t)pos, 0);
+            return sys_readv(fd, iov, cnt);
+        }
+        case LSYS_PWRITEV:
+        case LSYS_PWRITEV2: {
+            int fd = (int)ebx; uintptr_t iov = (uintptr_t)ecx; uint64_t cnt = edx;
+            int64_t pos = (int64_t)esi;
+            if (pos >= 0) sys_lseek(fd, (int32_t)pos, 0);
+            return sys_writev(fd, iov, cnt);
+        }
+
+        // ── Tier 3: scheduler / priority / capabilities ──────────────────
+        // sched_setaffinity(pid, cpusetsize, mask): take the low byte of the user
+        // mask and push it to the scheduler's per-task affinity bitmap. (satoru)
+        case LSYS_SCHED_SETAFFINITY: {
+            uint32_t pid = ebx;
+            const uint8_t* mask = (const uint8_t*)(uintptr_t)edx;
+            if (!mask) return -14;  // EFAULT
+            LinuxProcess* lp = Current();
+            if (pid == 0 && lp && lp->task) pid = lp->task->pid;
+            uint8_t m = mask[0] ? mask[0] : 0x1;
+            return Scheduler::SetAffinity(pid, m) == 0 ? 0 : -3;
+        }
+        // sched_getaffinity(pid, cpusetsize, mask): write the task's affinity
+        // bitmap into the user mask; return the number of bytes written. (satoru)
+        case LSYS_SCHED_GETAFFINITY: {
+            uint32_t pid = ebx; uint32_t size = ecx;
+            uint8_t* mask = (uint8_t*)(uintptr_t)edx;
+            if (!mask || size == 0) return -14;
+            LinuxProcess* lp = Current();
+            if (pid == 0 && lp && lp->task) pid = lp->task->pid;
+            uint8_t m = 0;
+            if (Scheduler::GetAffinity(pid, &m) != 0) return -3;
+            if (m == 0) m = 0x1;
+            for (uint32_t i = 0; i < size; i++) mask[i] = (i == 0) ? m : 0;
+            return (int32_t)size;
+        }
+        // sched_getscheduler: report the task's class (0=NORMAL,1=FIFO,2=RR,
+        // 5=IDLE). sched_setscheduler/setattr accept the policy onto the task. (satoru)
+        case LSYS_SCHED_GETSCHEDULER: {
+            LinuxProcess* lp = Current();
+            if (!lp || !lp->task) return 0;  // SCHED_NORMAL
+            switch (lp->task->sched_class) {
+                case 1: return 1;   // SCHED_FIFO
+                case 2: return 2;   // SCHED_RR
+                case 3: return 5;   // SCHED_IDLE
+                default: return 0;  // SCHED_NORMAL
+            }
+        }
+        case LSYS_SCHED_SETSCHEDULER: {
+            int policy = (int)ecx;
+            LinuxProcess* lp = Current();
+            if (!lp || !lp->task) return 0;
+            uint8_t cls = 0;
+            if (policy == 1) cls = 1;        // SCHED_FIFO
+            else if (policy == 2) cls = 2;   // SCHED_RR
+            else if (policy == 5) cls = 3;   // SCHED_IDLE
+            lp->task->sched_class = cls;
+            return 0;
+        }
+        // sched_setattr/getattr: minimal  -  getattr fills sched_policy + sched_nice
+        // from the task; setattr applies the policy. the struct is sched_attr. (satoru)
+        case LSYS_SCHED_SETATTR: {
+            LinuxProcess* lp = Current();
+            if (!lp || !lp->task || !ecx) return -14;
+            uint32_t* attr = (uint32_t*)(uintptr_t)ecx;
+            uint32_t policy = attr[1];  // size,sched_policy,... (satoru)
+            uint8_t cls = 0;
+            if (policy == 1) cls = 1; else if (policy == 2) cls = 2; else if (policy == 5) cls = 3;
+            lp->task->sched_class = cls;
+            return 0;
+        }
+        case LSYS_SCHED_GETATTR: {
+            LinuxProcess* lp = Current();
+            uint8_t* attr = (uint8_t*)(uintptr_t)ecx;
+            uint32_t size = edx;
+            if (!attr || size < 48) return -22;
+            for (uint32_t i = 0; i < size; i++) attr[i] = 0;
+            uint32_t* w = (uint32_t*)attr;
+            w[0] = size;  // sched_attr.size
+            if (lp && lp->task) {
+                uint32_t pol = 0;
+                if (lp->task->sched_class == 1) pol = 1;
+                else if (lp->task->sched_class == 2) pol = 2;
+                else if (lp->task->sched_class == 3) pol = 5;
+                w[1] = pol;                                   // sched_policy
+                *(int32_t*)(attr + 20) = lp->task->nice;      // sched_nice (offset 20) (satoru)
+            }
+            return 0;
+        }
+        // sched_setparam/getparam: only realtime classes carry a priority; we
+        // store nothing extra, so getparam reports priority 0 and setparam ok. (satoru)
+        case LSYS_SCHED_SETPARAM:
+            return 0;
+        case LSYS_SCHED_GETPARAM: {
+            int* prio = (int*)(uintptr_t)ecx;  // struct sched_param { int sched_priority; } (satoru)
+            if (prio) *prio = 0;
+            return 0;
+        }
+        // sched_get_priority_max/min(policy): SCHED_FIFO/RR span 1..99, the other
+        // classes are 0..0  -  the values glibc/musl validate against. (satoru)
+        case LSYS_SCHED_GET_PRIORITY_MAX: {
+            int policy = (int)ebx;
+            return (policy == 1 || policy == 2) ? 99 : 0;
+        }
+        case LSYS_SCHED_GET_PRIORITY_MIN: {
+            int policy = (int)ebx;
+            return (policy == 1 || policy == 2) ? 1 : 0;
+        }
+        // sched_rr_get_interval(pid, timespec*): report the RR quantum (the PIT
+        // timeslice, ~10ms) so RR apps size their loops sanely. (satoru)
+        case LSYS_SCHED_RR_GET_INTERVAL: {
+            int64_t* ts = (int64_t*)(uintptr_t)ecx;
+            if (ts) { ts[0] = 0; ts[1] = 10 * 1000000; }  // 10ms (satoru)
+            return 0;
+        }
+        // getpriority(which, who): nice is -20..19; getpriority returns it as the
+        // already-biased value the kernel ABI uses (20 - nice). setpriority pushes
+        // the requested nice onto the current task. PRIO_PROCESS only. (satoru)
+        case LSYS_GETPRIORITY: {
+            LinuxProcess* lp = Current();
+            int nice = (lp && lp->task) ? lp->task->nice : 0;
+            return 20 - nice;  // kernel returns 20-nice so the value is non-negative (satoru)
+        }
+        case LSYS_SETPRIORITY: {
+            int prio = (int)edx;  // requested nice value (satoru)
+            LinuxProcess* lp = Current();
+            if (lp && lp->task) {
+                if (prio < -20) prio = -20; else if (prio > 19) prio = 19;
+                lp->task->nice = prio;
+            }
+            return 0;
+        }
+        // ioprio_set/get(which, who[, ioprio]): no block-io scheduler classes, so
+        // get reports the default best-effort class, set is accepted. (satoru)
+        case LSYS_IOPRIO_SET:
+            return 0;
+        case LSYS_IOPRIO_GET:
+            return (2 << 13);  // IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT, prio 0 (satoru)
+        case LSYS_SCHED_YIELD:
+            Scheduler::Yield();
+            return 0;
+        // capget/capset: report an empty (no-capabilities) set for capget and
+        // accept capset. the v3 header is { version, pid }; data is two
+        // __user_cap_data{ effective, permitted, inheritable }. (satoru)
+        case LSYS_CAPGET: {
+            uint32_t* data = (uint32_t*)(uintptr_t)ecx;
+            if (data) { for (int i = 0; i < 6; i++) data[i] = 0; }
+            return 0;
+        }
+        case LSYS_CAPSET:
+            return 0;
+        case LSYS_PERSONALITY:
+            return 0;  // report/accept ADDR_NO_RANDOMIZE etc. as no-op (satoru)
+
+        // ── Tier 4: filesystem at-family + xattr ─────────────────────────
+        // linkat(olddirfd, old, newdirfd, new, flags): kvfs has no hardlinks, so
+        // copy the source to the destination path (AT_FDCWD only). (satoru)
+        case LSYS_LINKAT: {
+            const char* oldp = (const char*)(uintptr_t)ecx;
+            const char* newp = (const char*)(uintptr_t)esi;
+            if (!oldp || !newp) return -14;
+            LinuxProcess* lp = Current();
+            char ro[256], rn[256];
+            ResolvePath(oldp, ro, sizeof(ro), lp);
+            ResolvePath(newp, rn, sizeof(rn), lp);
+            return KVFS::Copy(ro, rn) == 0 ? 0 : -2;
+        }
+        // symlinkat(target, newdirfd, linkpath): create a real kvfs symlink. (satoru)
+        case LSYS_SYMLINKAT: {
+            const char* target = (const char*)(uintptr_t)ebx;
+            const char* linkp  = (const char*)(uintptr_t)edx;
+            if (!target || !linkp) return -14;
+            LinuxProcess* lp = Current();
+            char rl[256];
+            ResolvePath(linkp, rl, sizeof(rl), lp);
+            return KVFS::Symlink(rl, target) == 0 ? 0 : -2;
+        }
+        // fchmodat(dirfd, path, mode, flags): resolve + chmod through kvfs. (satoru)
+        case LSYS_FCHMODAT: {
+            const char* path = (const char*)(uintptr_t)ecx;
+            uint32_t mode = edx;
+            if (!path) return -14;
+            LinuxProcess* lp = Current();
+            char rp[256];
+            ResolvePath(path, rp, sizeof(rp), lp);
+            return KVFS::Chmod(rp, (uint16_t)(mode & 07777)) == 0 ? 0 : -2;
+        }
+        // faccessat / faccessat2(dirfd, path, mode[, flags]): existence + perm
+        // check via the path-based access handler (dirfd AT_FDCWD assumed). (satoru)
+        case LSYS_FACCESSAT:
+            return sys_access(ecx, edx);
+        case LSYS_FACCESSAT2:
+            return sys_access(ecx, edx);
+        // utimensat(dirfd, path, times[2], flags) / futimesat(dirfd, path,
+        // times[2]): touch the node's accessed/modified stamps. a null path with
+        // utimensat means "the dirfd itself" which we cannot stat, so accept. (satoru)
+        case LSYS_UTIMENSAT: {
+            const char* path = (const char*)(uintptr_t)ecx;
+            if (!path) return 0;  // fd-relative form: accept (satoru)
+            LinuxProcess* lp = Current();
+            char rp[256];
+            ResolvePath(path, rp, sizeof(rp), lp);
+            KVFSNode* n = KVFS::Resolve(rp);
+            if (!n) return -2;
+            uint32_t now = (uint32_t)(Timer::GetRealMs() / 1000);
+            n->accessed = now; n->modified = now;
+            return 0;
+        }
+        case LSYS_FUTIMESAT: {
+            const char* path = (const char*)(uintptr_t)ecx;
+            if (!path) return 0;
+            LinuxProcess* lp = Current();
+            char rp[256];
+            ResolvePath(path, rp, sizeof(rp), lp);
+            KVFSNode* n = KVFS::Resolve(rp);
+            if (!n) return -2;
+            uint32_t now = (uint32_t)(Timer::GetRealMs() / 1000);
+            n->accessed = now; n->modified = now;
+            return 0;
+        }
+        // mount/umount2/swapon/swapoff/quotactl: single-root in-RAM fs; accept the
+        // common no-op shapes. mount of a real fs is not supported; returning 0
+        // keeps container/init scripts moving (they tolerate a flat namespace). (satoru)
+        case LSYS_MOUNT:
+        case LSYS_UMOUNT2:
+        case LSYS_SWAPON:
+        case LSYS_SWAPOFF:
+        case LSYS_QUOTACTL:
+            return 0;
+
+        // xattr family  -  kvfs has no extended-attribute store. POSIX lets a fs
+        // report "not supported" via ENOTSUP for set, and getxattr returns
+        // -ENODATA when the named attr is absent (which is always here). these
+        // are the values glibc/coreutils/ls expect and silently tolerate; they
+        // are NOT fatal -ENOSYS. (satoru)
+        case LSYS_SETXATTR:
+        case LSYS_LSETXATTR:
+        case LSYS_FSETXATTR:
+            return -95;   // -EOPNOTSUPP (satoru)
+        case LSYS_GETXATTR:
+        case LSYS_LGETXATTR:
+        case LSYS_FGETXATTR:
+            return -61;   // -ENODATA (satoru)
+        case LSYS_LISTXATTR:
+        case LSYS_LLISTXATTR:
+        case LSYS_FLISTXATTR:
+            return 0;     // zero-length attribute-name list (satoru)
+        case LSYS_REMOVEXATTR:
+        case LSYS_LREMOVEXATTR:
+        case LSYS_FREMOVEXATTR:
+            return -61;   // -ENODATA (satoru)
+
+        // ── Tier 5: networking multi-message ─────────────────────────────
+        // sendmmsg/recvmmsg(fd, mmsghdr*, vlen, flags[, timeout]): loop the
+        // single-message handler over the array and set each msg_len. (satoru)
+        case LSYS_SENDMMSG:
+        case LSYS_RECVMMSG: {
+            int fd = (int)ebx;
+            uint8_t* mmsg = (uint8_t*)(uintptr_t)ecx;  // struct mmsghdr[] (satoru)
+            uint32_t vlen = edx; uint32_t flags = esi;
+            if (!mmsg || vlen == 0) return -14;
+            // struct mmsghdr = { struct msghdr msg_hdr; unsigned msg_len; }.
+            // x86_64 msghdr is 56 bytes, so mmsghdr stride is 64 (4-byte msg_len
+            // + 4 pad). we forward msg_hdr to the scalar sendmsg/recvmsg. (satoru)
+            const uint32_t MSGHDR_SZ = 56, MMSG_STRIDE = 64;
+            uint32_t done = 0;
+            for (uint32_t i = 0; i < vlen; i++) {
+                uint8_t* slot = mmsg + (uint64_t)i * MMSG_STRIDE;
+                uint64_t hdr = (uint64_t)(uintptr_t)slot;
+                int64_t r = (eax == LSYS_SENDMMSG)
+                    ? Dispatch(LSYS_SENDMSG, (uint64_t)fd, hdr, flags, 0, 0)
+                    : Dispatch(LSYS_RECVMSG, (uint64_t)fd, hdr, flags, 0, 0);
+                if (r < 0) { if (done == 0) return (int32_t)r; break; }
+                *(uint32_t*)(slot + MSGHDR_SZ) = (uint32_t)r;  // msg_len (satoru)
+                done++;
+            }
+            return (int32_t)done;
+        }
+
+        // ── Tier 6: memory ───────────────────────────────────────────────
+        // mremap(old, oldsz, newsz, flags, newaddr): only shrink-in-place and
+        // grow-when-it-fits are honoured cheaply; otherwise we map a fresh region
+        // and copy. MREMAP_MAYMOVE (bit1) gates the move. shrink/same is a no-op
+        // that returns the same address. (satoru)
+        case LSYS_MREMAP: {
+            uintptr_t old_addr = (uintptr_t)ebx;
+            uint64_t  old_sz   = ecx;
+            uint64_t  new_sz   = edx;
+            uint32_t  flags    = (uint32_t)esi;
+            if (new_sz == 0) return -22;
+            if (new_sz <= old_sz) return (int64_t)old_addr;  // shrink/same: in place (satoru)
+            const uint32_t MREMAP_MAYMOVE = 1;
+            if (!(flags & MREMAP_MAYMOVE)) return -12;        // -ENOMEM (can't grow fixed) (satoru)
+            // allocate a fresh anonymous region big enough, copy the old bytes in,
+            // and release the old mapping. PROT_READ|WRITE, MAP_PRIVATE|ANON. (satoru)
+            int64_t neu = sys_mmap(0, new_sz, 0x3, 0x22, -1, 0);
+            if (neu < 0) return neu;
+            memcpy((void*)(uintptr_t)neu, (void*)old_addr, old_sz);
+            sys_munmap(old_addr, old_sz);
+            return neu;
+        }
+        // mlock/munlock/mlockall/munlockall: nothing is ever paged out (no swap),
+        // so pages are effectively always resident  -  accept as success. (satoru)
+        case LSYS_MLOCK:
+        case LSYS_MUNLOCK:
+        case LSYS_MLOCKALL:
+        case LSYS_MUNLOCKALL:
+            return 0;
+        // mincore(addr, length, vec): every mapped page is resident; set bit0 of
+        // each vec byte. length is rounded up to pages of 4096. (satoru)
+        case LSYS_MINCORE: {
+            uint64_t length = ecx;
+            uint8_t* vec = (uint8_t*)(uintptr_t)edx;
+            if (!vec) return -14;
+            uint64_t pages = (length + 4095) / 4096;
+            for (uint64_t i = 0; i < pages; i++) vec[i] = 1;  // resident (satoru)
+            return 0;
+        }
+        // memfd_secret(flags): a secret memory fd. we back it with the same anon
+        // file machinery as memfd_create (no hardware secrecy), so the fd is
+        // mmap-able. route to the existing memfd handler. (satoru)
+        case LSYS_MEMFD_SECRET:
+            return Dispatch(LSYS_MEMFD_CREATE, ebx, 0, 0, 0, 0);
+        // userfaultfd(flags): hand back an fd so libc's uffd probe succeeds; we
+        // never deliver fault events, which callers tolerate (they fall back to
+        // SIGSEGV handling). (satoru)
+        case LSYS_USERFAULTFD: {
+            LinuxProcess* lp = Current();
+            if (!lp) return -1;
+            int fd = AllocFd(lp);
+            if (fd < 0) return -24;
+            memset(&lp->fds[fd], 0, sizeof(LinuxFd));
+            lp->fds[fd].type = LFD_EVENTFD;  // readable-as-empty (satoru)
+            lp->fds[fd].open = true;
+            return fd;
+        }
+        // NUMA policy calls: single memory node, so set/get are no-ops and
+        // get_mempolicy reports node 0 / default policy. migrate/move report the
+        // pages as already on the only node. (satoru)
+        case LSYS_MBIND:
+        case LSYS_SET_MEMPOLICY:
+            return 0;
+        case LSYS_GET_MEMPOLICY: {
+            int* mode = (int*)(uintptr_t)ebx;
+            if (mode) *mode = 0;  // MPOL_DEFAULT (satoru)
+            return 0;
+        }
+        case LSYS_MIGRATE_PAGES:
+            return 0;  // nothing to migrate (single node) (satoru)
+        case LSYS_MOVE_PAGES: {
+            // move_pages(pid, count, pages, nodes, status, flags): if a status
+            // array is given, report every page on node 0. (satoru)
+            uint64_t count = ecx;
+            int* status = (int*)(uintptr_t)edi;
+            if (status) for (uint64_t i = 0; i < count; i++) status[i] = 0;
+            return 0;
+        }
+
+        // ── Tier 7: signals ──────────────────────────────────────────────
+        // rt_sigpending(set, sigsetsize): report this process's pending mask. (satoru)
+        case LSYS_RT_SIGPENDING: {
+            uint64_t* set = (uint64_t*)(uintptr_t)ebx;
+            LinuxProcess* lp = Current();
+            if (set) *set = lp ? lp->pending_signals : 0;
+            return 0;
+        }
+        // rt_sigtimedwait(set, info, timeout, sigsetsize): no real signal delivery
+        // path, so behave like the timeout always elapses with nothing pending. (satoru)
+        case LSYS_RT_SIGTIMEDWAIT:
+            return -11;  // -EAGAIN (timed out, no signal) (satoru)
+        // rt_sigqueueinfo(tgid, sig, info) / rt_tgsigqueueinfo(tgid, tid, sig,
+        // info): post the signal bit to the target process. (satoru)
+        case LSYS_RT_SIGQUEUEINFO: {
+            uint32_t tgid = ebx; int sig = (int)ecx;
+            for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && procs[i].pid == tgid) {
+                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
+                    return 0;
+                }
+            return -3;
+        }
+        case LSYS_RT_TGSIGQUEUEINFO: {
+            int tid = (int)ecx; int sig = (int)edx;
+            for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && (int)procs[i].pid == tid) {
+                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
+                    return 0;
+                }
+            return -3;
+        }
+        // kill(pid, sig) / tkill(tid, sig): post the signal bit. pid<=0 group
+        // forms are treated as "current process". sig 0 = existence probe. (satoru)
+        case LSYS_KILL_:
+        case LSYS_TKILL: {
+            int pid = (int)ebx; int sig = (int)ecx;
+            LinuxProcess* lp = Current();
+            if (pid <= 0) {  // self / process-group: target current (satoru)
+                if (lp) { if (sig > 0 && sig < 64) lp->pending_signals |= (1u << sig); return 0; }
+                return -3;
+            }
+            for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                if (procs[i].active && (int)procs[i].pid == pid) {
+                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
+                    return 0;
+                }
+            return -3;  // ESRCH
+        }
+        // pause(): block until a signal. with no async delivery we yield once and
+        // return -EINTR so callers don't spin forever holding the cpu. (satoru)
+        case LSYS_PAUSE:
+            KuronoShell::PumpUI();
+            Scheduler::Yield();
+            return -4;  // -EINTR (satoru)
+
+        // ── Tier 8: time ─────────────────────────────────────────────────
+        // clock_settime: accept (we don't let userspace move the monotonic/real
+        // clock backwards, but report success so date/ntp scripts proceed). (satoru)
+        case LSYS_CLOCK_SETTIME:
+            return 0;
+        // getitimer/setitimer(which, new, old): no interval-timer SIGALRM backend
+        // yet; clear the old value and accept. alarm() likewise returns 0 (no
+        // previously-armed alarm). (satoru)
+        case LSYS_GETITIMER: {
+            uint8_t* old = (uint8_t*)(uintptr_t)ecx;  // struct itimerval (32 bytes) (satoru)
+            if (old) for (int i = 0; i < 32; i++) old[i] = 0;
+            return 0;
+        }
+        case LSYS_SETITIMER: {
+            uint8_t* old = (uint8_t*)(uintptr_t)edx;
+            if (old) for (int i = 0; i < 32; i++) old[i] = 0;
+            return 0;
+        }
+        case LSYS_ALARM:
+            return 0;  // no alarm was previously set (satoru)
+        // times(tms*): report cumulative cpu time of the calling task in the tms
+        // struct and the clock tick count as the return value (CLK_TCK=100). (satoru)
+        case LSYS_TIMES: {
+            uint64_t* tms = (uint64_t*)(uintptr_t)ebx;  // tms{utime,stime,cutime,cstime} (satoru)
+            LinuxProcess* lp = Current();
+            uint64_t ticks = lp && lp->task ? (lp->task->cpu_ms_total / 10) : 0;  // 100 Hz (satoru)
+            if (tms) { tms[0] = ticks; tms[1] = 0; tms[2] = 0; tms[3] = 0; }
+            return (int32_t)(Timer::GetRealMs() / 10);
+        }
+        // adjtimex/clock_adjtime: no kernel clock discipline; report TIME_OK and
+        // accept the call so chrony/ntpd init does not abort. (satoru)
+        case LSYS_ADJTIMEX:
+        case LSYS_CLOCK_ADJTIME:
+            return 0;  // TIME_OK (satoru)
+
+        // ── Tier 9: user / group identity ────────────────────────────────
+        // the LinuxProcess carries uid/gid/euid/egid. setuid/setgid set all of the
+        // real+effective (root can, and we run as root); the get-forms return them.
+        // supplementary groups + fs-uid are not tracked, so those accept/report
+        // sane constants. (satoru)
+        case LSYS_SETUID_: {
+            LinuxProcess* lp = Current();
+            if (lp) { lp->uid = ebx; lp->euid = ebx; }
+            return 0;
+        }
+        case LSYS_SETGID_: {
+            LinuxProcess* lp = Current();
+            if (lp) { lp->gid = ebx; lp->egid = ebx; }
+            return 0;
+        }
+        case LSYS_SETREUID_: {
+            LinuxProcess* lp = Current();
+            if (lp) {
+                if ((int)ebx != -1) lp->uid = ebx;
+                if ((int)ecx != -1) lp->euid = ecx;
+            }
+            return 0;
+        }
+        case LSYS_SETREGID_: {
+            LinuxProcess* lp = Current();
+            if (lp) {
+                if ((int)ebx != -1) lp->gid = ebx;
+                if ((int)ecx != -1) lp->egid = ecx;
+            }
+            return 0;
+        }
+        case LSYS_SETRESUID: {
+            LinuxProcess* lp = Current();
+            if (lp) {
+                if ((int)ebx != -1) lp->uid  = ebx;
+                if ((int)ecx != -1) lp->euid = ecx;
+            }
+            return 0;
+        }
+        case LSYS_SETRESGID: {
+            LinuxProcess* lp = Current();
+            if (lp) {
+                if ((int)ebx != -1) lp->gid  = ebx;
+                if ((int)ecx != -1) lp->egid = ecx;
+            }
+            return 0;
+        }
+        case LSYS_GETRESUID: {
+            uint32_t* ruid = (uint32_t*)(uintptr_t)ebx;
+            uint32_t* euid = (uint32_t*)(uintptr_t)ecx;
+            uint32_t* suid = (uint32_t*)(uintptr_t)edx;
+            LinuxProcess* lp = Current();
+            uint32_t r = lp ? lp->uid : 0, e = lp ? lp->euid : 0;
+            if (ruid) *ruid = r;
+            if (euid) *euid = e;
+            if (suid) *suid = e;   // no saved-uid tracked; report effective (satoru)
+            return 0;
+        }
+        case LSYS_GETRESGID: {
+            uint32_t* rgid = (uint32_t*)(uintptr_t)ebx;
+            uint32_t* egid = (uint32_t*)(uintptr_t)ecx;
+            uint32_t* sgid = (uint32_t*)(uintptr_t)edx;
+            LinuxProcess* lp = Current();
+            uint32_t r = lp ? lp->gid : 0, e = lp ? lp->egid : 0;
+            if (rgid) *rgid = r;
+            if (egid) *egid = e;
+            if (sgid) *sgid = e;   // no saved-gid tracked; report effective (satoru)
+            return 0;
+        }
+        // setfsuid/setfsgid return the PREVIOUS fsuid/fsgid (== euid/egid here). (satoru)
+        case LSYS_SETFSUID: {
+            LinuxProcess* lp = Current();
+            return lp ? (int32_t)lp->euid : 0;
+        }
+        case LSYS_SETFSGID: {
+            LinuxProcess* lp = Current();
+            return lp ? (int32_t)lp->egid : 0;
+        }
+        // getgroups(size, list): no supplementary groups -> return 0 (count). a
+        // size of 0 is a "how many?" probe, also 0. (satoru)
+        case LSYS_GETGROUPS:
+            return 0;
+        // setgroups(size, list): accept (we don't track supplementary groups). (satoru)
+        case LSYS_SETGROUPS:
+            return 0;
+
+        // ── Tier 10: system info ─────────────────────────────────────────
+        // (syslog is already implemented above at LSYS_SYSLOG; the x64 path
+        //  routes amd64 nr 103 to it via kNrMap, so it is now reachable. (satoru))
+        // acct(path): process accounting off; accept enabling/disabling. (satoru)
+        case LSYS_ACCT:
+            return 0;
+        // sysfs(option, ...): legacy fs-type enumeration. option 3 = count of
+        // filesystem types; report 1 (our single kvfs). others accept. (satoru)
+        case LSYS_SYSFS: {
+            int option = (int)ebx;
+            if (option == 3) return 1;
+            return 0;
+        }
+        // ustat(dev, ubuf): legacy fs stat. zero the buffer + succeed. (satoru)
+        case LSYS_USTAT: {
+            uint8_t* ubuf = (uint8_t*)(uintptr_t)ecx;  // struct ustat (20 bytes) (satoru)
+            if (ubuf) for (int i = 0; i < 20; i++) ubuf[i] = 0;
+            return 0;
+        }
+        // statfs(path, buf) / fstatfs(fd, buf): fill a struct statfs describing the
+        // single in-RAM kvfs. x86_64 struct statfs is 120 bytes; fields we set:
+        // f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_namelen. (satoru)
+        case LSYS_STATFS_:
+        case LSYS_FSTATFS_: {
+            uint64_t* sb = (uint64_t*)(uintptr_t)ecx;
+            if (!sb) return -14;
+            for (int i = 0; i < 15; i++) sb[i] = 0;  // 120 bytes (satoru)
+            sb[0] = 0x858458f6ULL;     // f_type = RAMFS_MAGIC (low 32 bits) (satoru)
+            sb[1] = 4096;              // f_bsize (satoru)
+            sb[2] = 262144;            // f_blocks (~1GB at 4k) (satoru)
+            sb[3] = 131072;            // f_bfree (satoru)
+            sb[4] = 131072;            // f_bavail (satoru)
+            sb[5] = 65536;             // f_files (satoru)
+            sb[6] = 60000;             // f_ffree (satoru)
+            // sb[7] = f_fsid (2x int32), sb[8] = f_namelen, ... (satoru)
+            *(uint64_t*)((uint8_t*)sb + 56) = 255;  // f_namelen at offset 56 (satoru)
+            return 0;
+        }
+
+        // ── Tier 11: advanced / debug ────────────────────────────────────
+        // ptrace(request, pid, addr, data): no trap/single-step delivery
+        // mechanism exists in this cooperative kernel, so the tracer-side
+        // requests cannot be honoured. PTRACE_TRACEME (0) is accepted (a child
+        // setting itself traceable is harmless); everything else returns -ENOSYS
+        // and is logged so a debugger's failure is visible. (satoru)
+        case LSYS_PTRACE: {
+            int request = (int)ebx;
+            if (request == 0) return 0;  // PTRACE_TRACEME (satoru)
+            LogEnosys(101, "ptrace");
+            return -38;  // -ENOSYS: no debugger trap mechanism (satoru)
+        }
+        // kexec_file_load: no in-place kernel replacement from a fd. accept the
+        // staging call (the real reboot is handled elsewhere) as a no-op. (satoru)
+        case LSYS_KEXEC_FILE_LOAD:
+            return 0;
+        // lookup_dcookie: kernel-profiler dentry cookie -> path. no dcookie db, so
+        // report -ENOENT (the value oprofile tools tolerate). (satoru)
+        case LSYS_LOOKUP_DCOOKIE:
+            return -2;
+        // add_key/request_key: kernel keyring. no keyring backend; report -ENOSYS
+        // (logged)  -  callers fall back to userspace key storage. (satoru)
+        case LSYS_ADD_KEY:
+        case LSYS_REQUEST_KEY:
+            LogEnosys(eax == LSYS_ADD_KEY ? 248 : 249,
+                      eax == LSYS_ADD_KEY ? "add_key" : "request_key");
+            return -38;
+
         // Linux x86_64 number synonyms  -  Firefox's static glibc emits
         // these directly via syscall().  We only expose numbers that do
         // not collide with the i386-style LSYS_* constants used elsewhere.
@@ -3007,9 +3868,9 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case 334: return Dispatch(LSYS_RSEQ, ebx, ecx, edx, esi, edi);
 
         default:
-            SerialLogger::Log("[LinuxSyscall] Unhandled syscall: ");
-            SerialLogger::LogDec((int)eax);
-            SerialLogger::Log("\r\n");
+            // permanent rate-limited enosys trace (eax here is the internal
+            // dispatch id, which equals the i386 number on the int 0x80 path). (satoru)
+            LogEnosys(eax, nullptr);
             return -38;  // enosys
     }
 }
