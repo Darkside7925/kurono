@@ -458,6 +458,21 @@ bool HasPendingConnection(int sd) {
 int KernelInject(int sd, const void* buf, int len) {
     if (!valid(sd)) return -1;
     Socket& s = g_socks[sd];
+    // kernel->client: an in-kernel server (wayland/dbus/pulse) holds the ACCEPTED
+    // socket `sd` and reads the client's requests off sd.rx (send_core drains sd.rx
+    // into the server's on_data). its replies/events must reach the CLIENT, which
+    // Recv()s its own fd == the PEER of sd, so they have to land in the peer's rx
+    // ring. writing them into sd.rx instead looped them straight back into the
+    // server's own on_data: firefox's wl_registry.global + wl_seat/wl_output events
+    // re-arrived as phantom requests (the global event payload name+iface+version
+    // parses byte-for-byte as a wl_registry.bind), the client received nothing on
+    // its fd, and gtk stalled waiting for wl_seat.capabilities. route to the peer
+    // when one is connected (an unconnected/self-fed socket keeps own.rx). (satoru)
+    int peer = s.peer_sd;
+    if (s.connected && valid(peer)) {
+        Socket& ps = g_socks[peer];
+        return ring_write(ps.rx, (const uint8_t*)buf, len, nullptr, ps.type);
+    }
     return ring_write(s.rx, (const uint8_t*)buf, len, nullptr, s.type);
 }
 
