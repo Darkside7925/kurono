@@ -905,20 +905,6 @@ static volatile bool g_kinit_test_poweroff = false;
     for (;;) Scheduler::SleepMs(60000);
 }
 
-// kmemx self-test runner kernel-process (kurono.kmemxtest). spawned after the
-// desktop is up; runs the lz4/pool/dedup self-tests off the gui loop, logs
-// PASS/FAIL to serial, optionally powers off for headless ci. (satoru)
-static volatile bool g_kmemx_test_poweroff = false;
-[[noreturn]] static void kmemx_selftest_entry() {
-    Scheduler::SleepMs(2000);
-    KMemXTest::RunAll();
-    if (g_kmemx_test_poweroff) {
-        SerialLogger::Log("[kmemx-test] powering off (kurono.kmemx.poweroff)\r\n");
-        HAL::PowerOff();
-    }
-    for (;;) Scheduler::SleepMs(60000);
-}
-
 extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Init();
     SerialLogger::Log("Kurono OS Starting...\r\n");
@@ -1837,6 +1823,20 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         KfsBench::Run();
         SerialLogger::Log("[KFSBENCH] powering off\r\n");
         HAL::PowerOff();
+    }
+    // headless kmemx self-test (gated by cmdline kurono.kmemxtest): run the
+    // lz4 + pool + metadata self-tests inline here (pmm + heap are up; no gui
+    // needed), log PASS/FAIL to serial, and power off if kurono.kmemx.poweroff is
+    // set. running inline (like kfsbench) makes the test mode-independent  -  it
+    // does not rely on the graphical scheduler path that hosts the kproc runner,
+    // so a headless text-mode ci boot exercises it deterministically. (satoru)
+    if (boot_kmemx_test) {
+        SerialLogger::Log("[KMEMX-TEST] begin (inline headless)\r\n");
+        KMemXTest::RunAll();
+        if (boot_kmemx_poweroff) {
+            SerialLogger::Log("[KMEMX-TEST] powering off (kurono.kmemx.poweroff)\r\n");
+            HAL::PowerOff();
+        }
     }
     if (boot_kfstest) {
         SerialLogger::Log("[KFSTEST] begin\r\n");
@@ -3096,12 +3096,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             KDF::SetCrashTestPoweroff(boot_kdf_poweroff);
             Scheduler::SpawnKernelProcess("kdf-selftest", kdf_selftest_entry, PRIO_LOW, 64, 32 * 1024);
         }
-        // headless kmemx self-tests: lz4 roundtrip over 1000 pages etc., off the
-        // gui loop so the bounded waits never stall rendering. (satoru)
-        if (boot_kmemx_test) {
-            g_kmemx_test_poweroff = boot_kmemx_poweroff;
-            Scheduler::SpawnKernelProcess("kmemx-selftest", kmemx_selftest_entry, PRIO_LOW, 256, 32 * 1024);
-        }
+        // (the kmemx self-test runs inline earlier in kernel_main  -  see the
+        //  boot_kmemx_test block near kfsbench  -  so it is mode-independent and
+        //  needs no gui-path kproc here.) (satoru)
         Scheduler::Start();
         // Unreachable.
     }
