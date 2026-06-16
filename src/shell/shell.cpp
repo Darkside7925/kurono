@@ -1874,6 +1874,20 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             KVFS::WriteString("/system/lib/firefox-deps.manifest",
                               "# firefox deps resolved from /apps/firefox/lib\n");
         }
+        // re-apply the gecko root-guard chowns the install path does. gecko runs
+        // as euid 0 here and refuses to start when $HOME / the xdg dirs / $TMPDIR
+        // are owned by a different uid ("Running as root ... is not supported").
+        // these dirs live under /kurono/user (and /kurono/system, /tmp), which is
+        // rebuilt FRESH each boot owned by uid 1000, so a restored boot trips the
+        // guard exactly like a fresh install before its chowns. mirror them. (satoru)
+        KVFS::Chown("/home/user", 0, 0);
+        KVFS::Chown("/home/user/.config", 0, 0);
+        KVFS::Chown("/home/user/.cache", 0, 0);
+        KVFS::Chown("/home/user/.local", 0, 0);
+        KVFS::Chown("/home/user/.local/share", 0, 0);
+        KVFS::Chown("/home/user/.mozilla", 0, 0);
+        KVFS::Chown("/system/run/user/1000", 0, 0);
+        KVFS::Chown("/tmp", 0, 0);
     }
 
     if (!FirefoxLauncher::IsInstalled()) {

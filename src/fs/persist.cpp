@@ -401,12 +401,22 @@ bool PersistStore::LoadTree() {
     return true;
 }
 
+// mount the KFS volume only if it is not already mounted. each KFS::Mount()
+// FREES and re-allocates the ~36 mb in-ram bitmap+inode caches; calling it
+// repeatedly at launch time (HasPersistedFirefox then RestoreApps) churned those
+// large blocks on the live, fragmented desktop heap. the boot-time LoadTree
+// already left the volume mounted, so reuse that state. (satoru)
+static bool kfs_ensure_mounted() {
+    KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
+    if (KFS::IsMounted()) return true;
+    return KFS::Mount();
+}
+
 bool PersistStore::RestoreApps() {
     if (!NVMe::IsDetected()) return false;
-    KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
-    if (!KFS::Mount()) return false;
+    if (!kfs_ensure_mounted()) return false;
     if (!KFS::Exists("/apps")) return false;
-    // already restored this boot? a populated /apps/firefox means LoadApps ran
+    // already restored this boot? a populated /apps/firefox means RestoreApps ran
     // (or the install path created it), so don't re-read 288 mb. (satoru)
     if (KVFS::IsDir("/apps") && KVFS::Exists("/apps/firefox/firefox")) return true;
     uint64_t t0 = Timer::GetRealMs64();
@@ -419,8 +429,7 @@ bool PersistStore::RestoreApps() {
 
 bool PersistStore::HasPersistedFirefox() {
     if (!NVMe::IsDetected()) return false;
-    KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
-    if (!KFS::Mount()) return false;
+    if (!kfs_ensure_mounted()) return false;
     // a non-empty firefox binary in the on-disk volume == a reusable install. (satoru)
     return KFS::Exists("/apps/firefox/firefox") &&
            KFS::FileSize("/apps/firefox/firefox") > 0;
