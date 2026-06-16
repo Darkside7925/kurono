@@ -341,7 +341,11 @@ uint16_t iface_id_of(const char* name, int max_len) {
         const char* a = name; const char* b = table[i].n;
         int seen = 0;
         while (seen < max_len && *a && *b && *a == *b) { a++; b++; seen++; }
-        if ((seen < max_len) && *a == 0 && *b == 0) return table[i].v;
+        // a full match consumes the whole name: seen can reach max_len exactly
+        // (an interface name passed without trailing slack), so accept seen ==
+        // max_len too -- the old `< max_len` rejected every exact-length name,
+        // which made firefox's wl_compositor bind look like an unknown global. (satoru)
+        if ((seen <= max_len) && *a == 0 && *b == 0) return table[i].v;
     }
     return 0;
 }
@@ -844,6 +848,71 @@ void keyboard_modifiers(Client* c, uint32_t kbd, uint32_t mods) {
 
 // Process one Wayland request.  All bounds checks must complete before
 // any side effect.
+// firefox's bundled libwayland/proxy omits the trailing object id of
+// wl_registry::bind's interface-less new_id on the wire. when it's absent we
+// assign the lowest free client id, which mirrors libwayland's own sequential
+// id allocation so the assigned id matches what firefox subsequently uses
+// (e.g. its first bind, wl_compositor, becomes obj 3 just as firefox expects). (satoru)
+static uint32_t lowest_free_client_id(Client* c) {
+    for (uint32_t id = 2; id < 0x01000000u; id++) {
+        if (!find_obj(c, id)) return id;
+    }
+    return 0;
+}
+
+// append a wayland string (u32 length-incl-nul, bytes, nul, pad to 4) at *pp. (satoru)
+static void put_wl_string(uint8_t* buf, int* pp, const char* s) {
+    int n = 0; while (s[n]) n++;
+    int withnul = n + 1;
+    int padded  = (withnul + 3) & ~3;
+    put32(buf + *pp, (uint32_t)withnul); *pp += 4;
+    for (int i = 0; i < n; i++)      buf[*pp + i] = (uint8_t)s[i];
+    for (int i = n; i < padded; i++) buf[*pp + i] = 0;
+    *pp += padded;
+}
+
+// a global must announce its initial state right after bind or gtk/firefox
+// stalls before it ever maps a window: wl_shm advertises pixel formats, wl_seat
+// its input capabilities, wl_output its geometry+mode and a closing done. (satoru)
+static void send_initial_global_events(Client* c, uint32_t id, uint16_t iface,
+                                       uint16_t version) {
+    if (iface == WL_SHM) {
+        uint8_t f[4];
+        put32(f, 0); send_event(c, id, 0, f, 4);   // wl_shm.format argb8888
+        put32(f, 1); send_event(c, id, 0, f, 4);   // wl_shm.format xrgb8888
+    } else if (iface == WL_SEAT) {
+        uint8_t cap[4]; put32(cap, 3);             // pointer | keyboard
+        send_event(c, id, 0, cap, 4);              // wl_seat.capabilities
+        if (version >= 2) {
+            uint8_t nm[16]; int p = 0; put_wl_string(nm, &p, "seat0");
+            send_event(c, id, 1, nm, p);           // wl_seat.name
+        }
+    } else if (iface == WL_OUTPUT) {
+        int sw = Graphics::GetWidth();
+        int sh = Graphics::GetHeight();
+        if (sw <= 0) sw = 1280;
+        if (sh <= 0) sh = 800;
+        uint8_t g[80]; int p = 0;
+        put32(g + p, 0);   p += 4;                 // x
+        put32(g + p, 0);   p += 4;                 // y
+        put32(g + p, 300); p += 4;                 // physical_width (mm)
+        put32(g + p, 200); p += 4;                 // physical_height (mm)
+        put32(g + p, 0);   p += 4;                 // subpixel unknown
+        put_wl_string(g, &p, "kurono");            // make
+        put_wl_string(g, &p, "kurono");            // model
+        put32(g + p, 0);   p += 4;                 // transform normal
+        send_event(c, id, 0, g, p);                // wl_output.geometry
+        uint8_t m[16];
+        put32(m, 1);                               // flags: current
+        put32(m + 4,  (uint32_t)sw);
+        put32(m + 8,  (uint32_t)sh);
+        put32(m + 12, 60000);                      // refresh (mHz)
+        send_event(c, id, 1, m, 16);               // wl_output.mode
+        if (version >= 2) { uint8_t s[4]; put32(s, 1); send_event(c, id, 3, s, 4); } // scale
+        send_event(c, id, 2, nullptr, 0);          // wl_output.done
+    }
+}
+
 void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     const uint8_t* args, int args_len) {
     if (c->fatal) return;
@@ -878,29 +947,35 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
             break;
         }
         case WL_REGISTRY: {
-            if (opcode == 0) {                    // bind(name, iface_str, version, new_id)
+            if (opcode == 0) {                    // bind(name, iface, [version], new_id)
                 if (args_len < 8) return;
-                /* name = get32(args + 0); */
-                uint32_t slen = get32(args + 4);
+                uint32_t slen  = get32(args + 4);
                 if (slen == 0 || slen > 64) return;
                 int padded = ((int)slen + 3) & ~3;
-                if (8 + padded + 8 > args_len) return;
+                int off = 8 + padded;                 // name(4)+len(4)+string(padded)
+                if (off + 4 > args_len) return;       // need at least the version word
+                // wire form of the interface-less new_id is interface(string) +
+                // version(u32) + id(u32). a spec-compliant client sends the id;
+                // firefox's libwayland/proxy omits it, so when only the version is
+                // present we assign the lowest free id (matches libwayland's own
+                // allocation -> the id firefox then references). (satoru)
+                uint32_t version = get32(args + off);
+                uint32_t new_id  = (off + 8 <= args_len) ? get32(args + off + 4)
+                                                         : lowest_free_client_id(c);
                 char ifname[65];
                 int copy_n = (int)slen - 1;
                 if (copy_n < 0) copy_n = 0;
                 if (copy_n > 64) copy_n = 64;
                 for (int i = 0; i < copy_n; i++) ifname[i] = (char)args[8 + i];
                 ifname[copy_n] = 0;
-                int off = 8 + padded;
-                uint32_t version = get32(args + off);
-                uint32_t new_id  = get32(args + off + 4);
-                uint16_t iface   = iface_id_of(ifname, copy_n);
+                uint16_t iface = iface_id_of(ifname, copy_n);
                 if (iface == 0) {
                     send_display_error(c, object_id, 0, "unknown global");
                     return;
                 }
                 if (version == 0 || version > 32) version = 1;
                 register_obj(c, new_id, iface, (uint16_t)version);
+                send_initial_global_events(c, new_id, iface, (uint16_t)version);
             }
             break;
         }
