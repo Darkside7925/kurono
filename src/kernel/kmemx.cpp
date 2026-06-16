@@ -360,6 +360,12 @@ bool Init(int pool_pct) {
     } else {
         want = 0;   // memory too tight to compress safely (satoru)
     }
+    // and never take more than HALF of currently-free ram, so the heap + apps +
+    // guests have ample room to grow afterwards without immediately driving the
+    // pressure system to red/critical. (the pmm can over-report total ram on some
+    // hosts, so sizing off free + this proportional cap is the safe rule.) (satoru)
+    uint64_t half_free = free_bytes / 2;
+    if (want > half_free) want = half_free;
     // also bound by table capacity (avg blob ~2kb -> entries*2kb of pool is
     // the most we could ever fill). (satoru)
     uint64_t table_bound = (uint64_t)g_meta_cap * 2048ULL;
@@ -533,9 +539,29 @@ bool SetPoolPct(int pct) {
     if (pct < 10) pct = 10;
     if (pct > 40) pct = 40;
     g_pool_pct = pct;
+    // bound the target exactly like Init: never grow so far that free ram drops
+    // below POOL_HEADROOM, and never past what the metadata table can index.
+    // GrowTo only ever ADDS chunks (it never shrinks), and it stops on the first
+    // failed contiguous alloc, so this can only ever cap the growth  -  on a tight
+    // host (e.g. the 2gb headless test where the pmm reports 4gb) it keeps the
+    // pool from pushing the system into oom/critical. (satoru)
     uint64_t total_ram = PMM::GetTotalMemory();
     uint64_t want = (total_ram / 100) * (uint64_t)pct;
-    uint64_t got = KMemXPool::GrowTo(want);     // only safe-grows for now (satoru)
+    // include what we already hold so "free" reflects post-reservation memory. (satoru)
+    uint64_t free_plus_pool = PMM::GetFreeMemory() + KMemXPool::TotalBytes();
+    if (free_plus_pool > POOL_HEADROOM) {
+        uint64_t max_safe = free_plus_pool - POOL_HEADROOM;
+        if (want > max_safe) want = max_safe;
+    } else {
+        want = KMemXPool::TotalBytes();   // too tight to grow further (satoru)
+    }
+    // never more than half of (free + what we hold)  -  same proportional cap as
+    // Init, so growing the pool can't drive the system into critical. (satoru)
+    uint64_t half = free_plus_pool / 2;
+    if (want > half) want = half;
+    uint64_t table_bound = (uint64_t)g_meta_cap * 2048ULL;
+    if (want > table_bound) want = table_bound;
+    uint64_t got = KMemXPool::GrowTo(want);
     g_stats.pool_bytes = got;
     return true;
 }
