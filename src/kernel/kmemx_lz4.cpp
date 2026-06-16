@@ -37,6 +37,25 @@ constexpr int ML_BITS     = 4;
 constexpr int ML_MASK     = (1 << ML_BITS) - 1;
 constexpr int RUN_MASK    = (1 << (8 - ML_BITS)) - 1;  // 15 (satoru)
 
+// ── sse2 copy helpers (hand-written asm; compiler-generated code is -mno-sse,
+//    but sse2 is enabled in cr0/cr4 at boot so explicit intrinsics-via-asm are
+//    fine  -  the framebuffer copy already relies on this). these accelerate the
+//    decompressor's literal + long-distance match copies, the hot bytes of the
+//    fault path. (satoru)
+static inline void sse_copy16(uint8_t* d, const uint8_t* s) {
+    __asm__ __volatile__("movdqu (%1), %%xmm0\n\t movdqu %%xmm0, (%0)"
+                         :: "r"(d), "r"(s) : "xmm0", "memory");
+}
+// copy `n` bytes d<-s where the regions DO NOT overlap within 16 bytes (literals,
+// or a match whose offset >= 16). writes in 16-byte chunks and is allowed to
+// OVERWRITE up to 15 bytes past the logical end, so callers must guarantee >=16
+// bytes of destination slack; the precise byte-exact tail is handled by the
+// caller's slow path when slack is insufficient. (satoru)
+static inline void sse_wildcopy(uint8_t* d, const uint8_t* s, int n) {
+    int i = 0;
+    do { sse_copy16(d + i, s + i); i += 16; } while (i < n);
+}
+
 // ── compression ──────────────────────────────────────────────────────────────
 int Compress(const uint8_t* src, int src_len,
              uint8_t* dst, int dst_cap, void* scratch) {
@@ -204,10 +223,18 @@ int Decompress(const uint8_t* src, int src_len,
             } while (b == 255);
         }
 
-        // copy literals (bounds-checked). (satoru)
+        // copy literals (bounds-checked). use the sse wildcopy when both the
+        // source and destination have >= 16 bytes of slack past the run (so the
+        // 16-byte overwrite stays in-bounds of both buffers); otherwise byte-wise.
+        // (satoru)
         if (ip + lit_len > iend) return -1;
         if (op + lit_len > oend) return -1;
-        for (int i = 0; i < lit_len; i++) *op++ = *ip++;
+        if (lit_len > 0 && (iend - (ip + lit_len)) >= 16 && (oend - (op + lit_len)) >= 16) {
+            sse_wildcopy(op, ip, lit_len);
+            op += lit_len; ip += lit_len;
+        } else {
+            for (int i = 0; i < lit_len; i++) *op++ = *ip++;
+        }
 
         // the final sequence is literals only  -  if we consumed the input, stop. (satoru)
         if (ip >= iend) break;
@@ -233,16 +260,29 @@ int Decompress(const uint8_t* src, int src_len,
         match_len += MIN_MATCH;
 
         if (op + match_len > oend) return -1;
-        // byte-wise copy: correct even when offset < match_len (overlap), which
-        // is the run-length-encoding case lz4 relies on. (satoru)
-        for (int i = 0; i < match_len; i++) *op++ = *mp++;
+        // when the match distance is >= 16 the source and destination 16-byte
+        // chunks never overlap, so the sse wildcopy is safe (given 16 bytes of
+        // destination slack). otherwise fall back to the byte-wise copy, which is
+        // correct even when offset < match_len (the rle/overlap case lz4 relies
+        // on). (satoru)
+        if (offset >= 16 && (oend - (op + match_len)) >= 16) {
+            sse_wildcopy(op, mp, match_len);
+            op += match_len;
+        } else {
+            for (int i = 0; i < match_len; i++) *op++ = *mp++;
+        }
     }
 
     return (int)(op - dst);
 }
 
-// ── crc32 (reflected, poly 0xEDB88320) ─────────────────────────────────────────
-static uint32_t g_crc_table[256];
+// ── crc32 (reflected, poly 0xEDB88320), slice-by-8 ─────────────────────────────
+// the crc runs over every full 4kb page on every compress AND every decompress,
+// so it sits squarely on the fault latency path. a byte-at-a-time table loop is
+// ~4096 dependent loads per page; slice-by-8 consumes 8 bytes per iteration from
+// 8 precomputed tables (the classic intel slicing technique), cutting the loop
+// count 8x while staying a pure-integer, sse-free computation. (satoru)
+static uint32_t g_crc_table[8][256];
 static bool g_crc_ready = false;
 
 static void crc_build() {
@@ -251,7 +291,16 @@ static void crc_build() {
         for (int k = 0; k < 8; k++) {
             c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
         }
-        g_crc_table[i] = c;
+        g_crc_table[0][i] = c;
+    }
+    // tables 1..7: each is the previous table's value run through one more byte
+    // of the crc shift, so table[n][b] folds in a byte n positions back. (satoru)
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = g_crc_table[0][i];
+        for (int t = 1; t < 8; t++) {
+            c = g_crc_table[0][c & 0xFF] ^ (c >> 8);
+            g_crc_table[t][i] = c;
+        }
     }
     g_crc_ready = true;
 }
@@ -259,8 +308,30 @@ static void crc_build() {
 uint32_t Crc32(const uint8_t* data, int len) {
     if (!g_crc_ready) crc_build();
     uint32_t crc = 0xFFFFFFFFu;
-    for (int i = 0; i < len; i++) {
-        crc = g_crc_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    const uint8_t* p = data;
+    int n = len;
+
+    // 8 bytes per iteration: read two little-endian 32-bit words, fold the
+    // running crc into the low word, then index all 8 tables. (satoru)
+    while (n >= 8) {
+        uint32_t lo = ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) |
+                      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint32_t hi = ((uint32_t)p[4]) | ((uint32_t)p[5] << 8) |
+                      ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+        lo ^= crc;
+        crc = g_crc_table[7][ lo        & 0xFF] ^
+              g_crc_table[6][(lo >> 8)  & 0xFF] ^
+              g_crc_table[5][(lo >> 16) & 0xFF] ^
+              g_crc_table[4][(lo >> 24) & 0xFF] ^
+              g_crc_table[3][ hi        & 0xFF] ^
+              g_crc_table[2][(hi >> 8)  & 0xFF] ^
+              g_crc_table[1][(hi >> 16) & 0xFF] ^
+              g_crc_table[0][(hi >> 24) & 0xFF];
+        p += 8; n -= 8;
+    }
+    // byte-wise tail. (satoru)
+    while (n-- > 0) {
+        crc = g_crc_table[0][(crc ^ *p++) & 0xFF] ^ (crc >> 8);
     }
     return crc ^ 0xFFFFFFFFu;
 }
