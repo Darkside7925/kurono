@@ -150,6 +150,114 @@ struct Process;
 #define LSYS_MEMBARRIER        556
 #define LSYS_RSEQ              557
 
+// ── x86_64 ABI completeness build-out  -  internal IDs (satoru) ──────────────
+// fresh 600+ block so these never collide with the i386-style numbers used as
+// dispatch keys above.  each is routed from the real x86_64 number in
+// linux_syscall_x64.cpp (kNrMap) and handled in Dispatch. (satoru)
+#define LSYS_VMSPLICE          600
+#define LSYS_OPENAT2           601
+#define LSYS_SYNC_FILE_RANGE   602
+#define LSYS_POSIX_FADVISE     603
+#define LSYS_READAHEAD         604
+#define LSYS_EPOLL_PWAIT2      605
+#define LSYS_PREADV            606
+#define LSYS_PWRITEV           607
+#define LSYS_PREADV2           608
+#define LSYS_PWRITEV2          609
+#define LSYS_SCHED_SETAFFINITY 610
+#define LSYS_SCHED_GETAFFINITY 611
+#define LSYS_SCHED_SETATTR     612
+#define LSYS_SCHED_GETATTR     613
+#define LSYS_SCHED_SETPARAM    614
+#define LSYS_SCHED_GETPARAM    615
+#define LSYS_SCHED_SETSCHEDULER 616
+#define LSYS_SCHED_GETSCHEDULER 617
+#define LSYS_SCHED_GET_PRIORITY_MAX 618
+#define LSYS_SCHED_GET_PRIORITY_MIN 619
+#define LSYS_SCHED_RR_GET_INTERVAL 620
+#define LSYS_SETPRIORITY       621
+#define LSYS_GETPRIORITY       622
+#define LSYS_IOPRIO_SET        623
+#define LSYS_IOPRIO_GET        624
+#define LSYS_SCHED_YIELD       625
+#define LSYS_LINKAT            626
+#define LSYS_SYMLINKAT         627
+#define LSYS_FCHMODAT          628
+#define LSYS_FACCESSAT         629
+#define LSYS_FACCESSAT2        630
+#define LSYS_UTIMENSAT         631
+#define LSYS_FUTIMESAT         632
+#define LSYS_UMOUNT2           633
+#define LSYS_SWAPON            634
+#define LSYS_SWAPOFF           635
+#define LSYS_QUOTACTL          636
+#define LSYS_SETXATTR          637
+#define LSYS_LSETXATTR         638
+#define LSYS_FSETXATTR         639
+#define LSYS_GETXATTR          640
+#define LSYS_LGETXATTR         641
+#define LSYS_FGETXATTR         642
+#define LSYS_LISTXATTR         643
+#define LSYS_LLISTXATTR        644
+#define LSYS_FLISTXATTR        645
+#define LSYS_REMOVEXATTR       646
+#define LSYS_LREMOVEXATTR      647
+#define LSYS_FREMOVEXATTR      648
+#define LSYS_SENDMMSG          649
+#define LSYS_RECVMMSG          650
+#define LSYS_MREMAP            651
+#define LSYS_MLOCK             652
+#define LSYS_MUNLOCK           653
+#define LSYS_MLOCKALL          654
+#define LSYS_MUNLOCKALL        655
+#define LSYS_MINCORE           656
+#define LSYS_MEMFD_SECRET      657
+#define LSYS_MBIND             658
+#define LSYS_SET_MEMPOLICY     659
+#define LSYS_GET_MEMPOLICY     660
+#define LSYS_MIGRATE_PAGES     661
+#define LSYS_MOVE_PAGES        662
+#define LSYS_RT_SIGTIMEDWAIT   663
+#define LSYS_RT_SIGQUEUEINFO   664
+#define LSYS_RT_TGSIGQUEUEINFO 665
+#define LSYS_KILL_             666
+#define LSYS_TKILL             667
+#define LSYS_PAUSE             668
+#define LSYS_CLOCK_SETTIME     669
+#define LSYS_GETITIMER         670
+#define LSYS_SETITIMER         671
+#define LSYS_ALARM             672
+#define LSYS_TIMES             673
+#define LSYS_ADJTIMEX          674
+#define LSYS_CLOCK_ADJTIME     675
+#define LSYS_SETUID_           676
+#define LSYS_SETGID_           677
+#define LSYS_SETREUID_         678
+#define LSYS_SETREGID_         679
+#define LSYS_SETRESUID         680
+#define LSYS_SETRESGID         681
+#define LSYS_GETRESUID         682
+#define LSYS_GETRESGID         683
+#define LSYS_SETFSUID          684
+#define LSYS_SETFSGID          685
+#define LSYS_GETGROUPS         686
+#define LSYS_SETGROUPS         687
+#define LSYS_SYSFS             688
+#define LSYS_ACCT              689
+#define LSYS_USTAT             690
+#define LSYS_STATFS_           691
+#define LSYS_FSTATFS_          692
+#define LSYS_PTRACE            693
+#define LSYS_KEXEC_FILE_LOAD   694
+#define LSYS_LOOKUP_DCOOKIE    695
+#define LSYS_ADD_KEY           696
+#define LSYS_REQUEST_KEY       697
+#define LSYS_FANOTIFY_INIT_    698
+#define LSYS_FANOTIFY_MARK_    699
+#define LSYS_PIDFD_OPEN_       700
+#define LSYS_PIDFD_SEND_SIG    701
+#define LSYS_GETPRIORITY_DONE  702
+
 // AF_UNIX socket family  -  internal IDs.  Dispatch also accepts the
 // Linux x86_64 numbers (41..55) where they don't collide.
 #define LSYS_SOCKET            560
@@ -450,6 +558,13 @@ public:
     // calls this directly; public for the same reason sys_mmap is. (satoru)
     static int32_t sys_readv(int fd, uintptr_t iov, uint64_t iovcnt);
 
+    // permanent, rate-limited "[kls] ENOSYS nr=<n> <name>" trace. an unknown or
+    // unimplemented x86_64 number routes here from BOTH the i386 dispatch default
+    // and the x64 translation miss, so a strace-equivalent audit of any real
+    // binary shows exactly which numbers it still needs. rate-limited so a busy
+    // poll loop on a missing nr cannot flood COM1. (satoru)
+    static void LogEnosys(uint64_t nr, const char* name);
+
     // stats
     static int  ActiveProcessCount();
 
@@ -466,6 +581,13 @@ public:
     // creates a process, runs the named builtin, and returns output
     static int  RunProgram(const char* name, int argc, const char** argv,
                            char* output, int max_output);
+
+    // headless syscall-ABI self-test (gated by kurono.klstest): exercises a
+    // representative syscall from each tier through Dispatch and logs PASS/FAIL
+    // per check to serial, in the kurono.kfstest/kjtest style. proves the new
+    // tier 1-11 handlers are wired and return sane values without a GUI run.
+    // returns the number of FAILED checks (0 == all pass). (satoru)
+    static int  SelfTest();
 
 private:
     static LinuxProcess procs[LINUX_MAX_PROCS];
