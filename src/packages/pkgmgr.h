@@ -56,6 +56,10 @@ public:
     static bool LastSyncSucceeded();
     static int GetPendingUpdateCount();
 
+    // extract an in-memory ustar archive (e.g. the embedded xkeyboard-config
+    // tree) into a kvfs base dir. returns true if any entry was written. (satoru)
+    static bool ExtractTar(const char* archive, int archive_len, const char* base_dir);
+
     // shell integration
     static int cmd_install(void* sh, int argc, const char** argv, char* out, int mx);
     static int cmd_remove(void* sh, int argc, const char** argv, char* out, int mx);

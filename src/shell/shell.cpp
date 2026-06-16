@@ -1847,6 +1847,13 @@ int cmd_pthtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
 // FirefoxLauncher (which seeds the env + execve /apps/firefox/firefox via
 // ld-kurono -> musl). this is the single entrypoint used by the terminal and
 // by the gui autorun. (satoru)
+// embedded xkeyboard-config ustar tree (Makefile objcopy of assets_xkb.tar);
+// unpacked to kvfs at firefox launch so gtk/gecko can build an xkb keymap. (satoru)
+extern "C" {
+    extern const unsigned char _binary_kurono_xkb_start[];
+    extern const unsigned char _binary_kurono_xkb_end[];
+}
+
 int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (!Userspace::IsReady()) Userspace::Init();
@@ -1929,6 +1936,24 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         return p;
     }
 
+    // unpack the embedded xkeyboard-config tree so gtk/gecko's
+    // xkb_keymap_new_from_names(evdev/pc105/us) at wl_seat init finds its data
+    // (the firefox tar ships libxkbcommon but no config data); XKB_CONFIG_ROOT
+    // in the envp below points xkbcommon here. without it gdk aborts. (satoru)
+    // extract under /apps/firefox (where gecko already reads its own resources,
+    // so the path resolves identically for the firefox process) rather than
+    // /usr/share/X11 (whose canonical-layout symlinks resolve differently for a
+    // linux process than for the kernel's kvfs); XKB_CONFIG_ROOT points here. (satoru)
+    {
+        int xkb_len = (int)(_binary_kurono_xkb_end - _binary_kurono_xkb_start);
+        bool xok = PackageManager::ExtractTar((const char*)_binary_kurono_xkb_start, xkb_len, "/apps/firefox");
+        SerialLogger::Log("[ffxkb] len="); SerialLogger::LogDec(xkb_len);
+        SerialLogger::Log(" extract="); SerialLogger::LogDec(xok ? 1 : 0);
+        SerialLogger::Log(" evdev="); SerialLogger::LogDec(KVFS::Exists("/apps/firefox/xkb/rules/evdev") ? 1 : 0);
+        SerialLogger::Log("\r\n");
+        if (xok) p = sappend(out, p, mx, "firefox: unpacked xkeyboard-config data.\n");
+    }
+
     Process* proc = Scheduler::CreateUserProcess("firefox", 0, 1);
     if (!proc) { KernelHeap::Free(image); p = sappend(out, p, mx, "firefox: CreateUserProcess failed.\n"); return p; }
 
@@ -1941,6 +1966,9 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "LD_LIBRARY_PATH=/apps/firefox:/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
         "XDG_RUNTIME_DIR=/system/run/user/1000",
         "WAYLAND_DISPLAY=wayland-0",
+        // xkbcommon data root: we unpacked the xkeyboard-config tree here above,
+        // so gdk builds its default keymap instead of aborting at seat init. (satoru)
+        "XKB_CONFIG_ROOT=/apps/firefox/xkb",
         // point gecko at kurono's in-kernel d-bus (dbus_server binds this path)
         // so it connects directly instead of fork+exec'ing dbus-launch, which
         // isn't installed and otherwise stalls startup. (satoru)

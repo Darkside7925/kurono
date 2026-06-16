@@ -110,6 +110,17 @@ ifneq ($(wildcard $(SSSTIK_KVID_BIN)),)
 MEDIA_OBJS   += $(SSSTIK_KVID_OBJ)
 endif
 
+# ─── xkeyboard-config data (embedded via objcopy) ──────────────────────────
+# gtk/gecko builds a default xkb keymap from names (evdev/pc105/us) at wl_seat
+# init via xkbcommon, which needs the xkeyboard-config data the firefox tar
+# omits; without it gdk g_error()s and gecko aborts. embedded ustar tree,
+# unpacked to kvfs + pointed at by XKB_CONFIG_ROOT at firefox launch. (satoru)
+XKB_TAR_BIN  = $(SRC)/assets_xkb.tar
+XKB_TAR_OBJ  = $(BUILD)/kurono_xkb.o
+ifneq ($(wildcard $(XKB_TAR_BIN)),)
+MEDIA_OBJS   += $(XKB_TAR_OBJ)
+endif
+
 # ─── User programs (test ELF64 binaries embedded into the kernel) ───────
 USERPROGS_DIR     = $(SRC)/userprogs
 HELLO_USER_ELF    = $(BUILD)/userprogs/hello.elf
@@ -450,6 +461,15 @@ $(ALPINE_INITRD_OBJ): $(ALPINE_INITRD_BIN)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  initramfs-virt alpine_initramfs.o && \
 	rm -f initramfs-virt
+
+# ─── Embed xkeyboard-config tar via objcopy (binary → ELF .rodata) ────────
+$(XKB_TAR_OBJ): $(XKB_TAR_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/kurono_xkb && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kurono_xkb kurono_xkb.o && \
+	rm -f kurono_xkb
 
 # ─── Embed Debian rootfs image via objcopy (binary → ELF .rodata) ───────
 $(DEBIAN_ROOTFS_OBJ): $(DEBIAN_ROOTFS_BIN)
