@@ -133,6 +133,21 @@ const char* PressureName(Pressure p);
 // and every second by kinit. returns the (possibly changed) level. (satoru)
 Pressure UpdatePressure();
 
+// kinit calls this once per second. it recomputes pressure and drives the
+// cross-system reactions the engine owns: at Orange+ it aggressively compresses
+// guest VM pages (signalling them to release memory); the level it returns lets
+// kinit decide whether to stop launching services (Red) or shed the
+// lowest-priority ones (Critical). logs a level transition to serial. (satoru)
+Pressure PressureTick();
+
+// true when memory pressure is high enough (Red or Critical) that kinit should
+// NOT launch new services. (satoru)
+bool ShouldBlockNewServices();
+
+// true at Critical: kinit should gracefully terminate its lowest-priority
+// services to free memory. (satoru)
+bool ShouldShedServices();
+
 // ── pool sizing (settings slider 10..40%) ───────────────────────────────────
 int  PoolPct();
 // resize the pool to a new pct. only grows/shrinks when safe (no live pages in
@@ -160,9 +175,29 @@ int DedupPass(int budget);
 
 // ── guests (stage 9) ─────────────────────────────────────────────────────────
 // register the hypervisor's ept root + a guest's name so guest pages can be
-// compressed at the ept level. (satoru)
+// compressed at the ept level. the ept root is passed as a host pointer cast to
+// uint64_t (EPT_PML4*). (satoru)
 void RegisterGuest(uint64_t ept_root, const char* name);
 void UnregisterGuest(uint64_t ept_root);
+
+// compress up to `budget` idle guest-physical pages across all registered guests
+// at the hypervisor ept level (the guest has zero knowledge). returns pages
+// taken. called by PressureTick at Orange+ and by `kmemx compress --guests`. on
+// a host with no running guest this is a no-op. (satoru)
+int CompressGuests(int budget);
+
+// the ept-violation entry: when a guest touches a page kmemx compressed out at
+// the ept level, the hypervisor's ept-violation VMEXIT calls this with the
+// faulting guest-physical address. if it is one of ours, decompress it back into
+// a fresh frame, restore the ept mapping, and return true so the guest
+// instruction is retried. returns false if not ours. crc-verified; mismatch
+// panics. (satoru)
+bool HandleGuestFault(uint64_t ept_root, uint64_t guest_phys);
+
+// convenience for the ept-violation handler, which sees the guest-physical
+// address but not which ept root it belongs to: try every registered guest's
+// ept root. returns true if any served the fault. inert with no guest. (satoru)
+bool HandleGuestFaultAny(uint64_t guest_phys);
 
 // ── kernel process (stage 4) ─────────────────────────────────────────────────
 // spawn the dedicated, cpu-capped kmemx compression kernel-process. it wakes
