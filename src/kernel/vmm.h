@@ -36,6 +36,20 @@ constexpr uint64_t TASK_SIZE      = USER_SPACE_TOP + 1;  // 0x0000_8000_0000_000
 #define PTE_COW        (1ULL << 9)   // software-defined copy-on-write marker
 #define PTE_NX         (1ULL << 63)  // no-execute (requires efer.nxe = 1)
 
+// ── kmemx page-aging software bits ──────────────────────────────────────────
+// x86_64 leaves bits 52-58 software-available on a present 4kb leaf (no pku on
+// this kernel). kmemx parks a 4-bit "generation" age counter there (bits 52-55):
+// its compression process increments the generation of pages whose hardware
+// Accessed bit (bit 5) is clear, and resets it to 0 when Accessed is set, so a
+// high generation == "not touched in a while" == a compression candidate. on a
+// page kmemx has compressed-out, the leaf becomes NOT-present and carries the
+// KMEMX_COMPRESSED marker (bit 9 reused on a not-present pte, where PTE_COW is
+// meaningless) so the #pf handler knows to ask kmemx to decompress it rather
+// than treating it as a fresh demand-zero fault. (satoru)
+#define PTE_KMEMX_GEN_SHIFT  52ULL
+#define PTE_KMEMX_GEN_MASK   (0xFULL << PTE_KMEMX_GEN_SHIFT)   // bits 52-55 (satoru)
+#define PTE_KMEMX_COMPRESSED (1ULL << 9)   // marker on a NOT-present leaf (satoru)
+
 // virtual address bit layout for 4-level paging:
 //   [63:48]    sign extension
 //   [47:39]    pml4 index  (9 bits, 512 entries)
@@ -128,6 +142,45 @@ public:
     // previously removed by IsolateFrames, restoring kernel access so the
     // frames can be wiped + freed on teardown. (satoru)
     static bool RevealFrames(uint64_t phys_base, uint64_t count, uint64_t flags);
+
+    // ── kmemx page-aging + compression primitives ───────────────────────────
+    // all operate on a 4kb LEAF pte in `root_pml4` for `virt_addr`. they never
+    // demote a huge page (only 4kb leaves are compression candidates) and never
+    // flush the tlb themselves unless noted  -  kmemx batches a flush per scan. a
+    // missing/huge/non-leaf translation makes every accessor a safe no-op. (satoru)
+
+    // age one leaf: if the hardware Accessed bit is set, clear it + reset the
+    // generation to 0 and report 0; otherwise increment the generation (saturating
+    // at 15) and report the new value. returns -1 if `virt_addr` is not a present
+    // 4kb leaf. does NOT flush; the caller InvalidatePage's pages it cleared A on.
+    // (satoru)
+    static int  KmemxAgeLeaf(uint64_t root_pml4, uint64_t virt_addr);
+
+    // read the current 4-bit generation of a leaf (0..15), or -1 if not a leaf. (satoru)
+    static int  KmemxGetGeneration(uint64_t root_pml4, uint64_t virt_addr);
+
+    // is this a present 4kb leaf whose backing frame == `phys`? (used by the
+    // scanner to confirm a candidate is still the page it sampled). (satoru)
+    static bool KmemxIsLeafPresent(uint64_t root_pml4, uint64_t virt_addr);
+
+    // atomically take a leaf out of service for compression: read its phys frame
+    // + permission flags into *out_phys / *out_flags, then rewrite the leaf as
+    // NOT-present carrying PTE_KMEMX_COMPRESSED (so the #pf handler routes it to
+    // kmemx). returns false if it is not a present 4kb leaf. the caller frees the
+    // frame (its bytes are now in the pool) and flushes the tlb. (satoru)
+    static bool KmemxMarkCompressed(uint64_t root_pml4, uint64_t virt_addr,
+                                    uint64_t* out_phys, uint64_t* out_flags);
+
+    // is this leaf a kmemx-compressed (not-present + marker) pte? the #pf handler
+    // checks this before asking kmemx to decompress. (satoru)
+    static bool KmemxIsCompressed(uint64_t root_pml4, uint64_t virt_addr);
+
+    // restore a previously-compressed leaf: map `phys` at `virt_addr` with
+    // `flags` (clearing the marker + generation). used by the fault path after it
+    // decompresses the blob into a fresh frame. flushes the single page if the
+    // root is the active cr3. (satoru)
+    static bool KmemxRestoreLeaf(uint64_t root_pml4, uint64_t virt_addr,
+                                 uint64_t phys, uint64_t flags);
 
 private:
     static uint64_t pml4_phys;  // physical address of pml4 table

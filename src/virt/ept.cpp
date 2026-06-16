@@ -4,6 +4,7 @@
 #include "vmm.h"
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
+#include "../kernel/kmemx.h"   // guest-page decompression on ept violation (satoru)
 
 // helper: allocate page-aligned memory
 static void* HeapAllocAligned(size_t size, size_t align) {
@@ -118,6 +119,14 @@ uint64_t EPTManager::BuildNCR3(NPT_PML4* pml4) {
 }
 
 //  ept page table walk  -  allocate intermediate levels on demand
+
+// kmemx hook: a no-create leaf walk. returns the existing 4kb leaf entry pointer
+// or nullptr (absent uppers or a large-page mapping). thin wrapper over WalkEPT.
+// (satoru)
+uint64_t* EPTManager::KmemxLeafEntry(EPT_PML4* pml4, uint64_t guest_phys) {
+    if (!pml4) return nullptr;
+    return WalkEPT(pml4, guest_phys & ~0xFFFULL, /*create=*/false);
+}
 
 uint64_t* EPTManager::WalkEPT(EPT_PML4* pml4, uint64_t guest_phys, bool create) {
     // extract indices from guest physical address
@@ -458,6 +467,12 @@ void EPTManager::InvalidateVPID() {
 //  ept violation / nested page fault handling
 
 bool EPTManager::HandleEPTViolation(uint64_t guest_phys, uint64_t qualification) {
+    // kmemx: if kmemx compressed this guest page out at the ept level, decompress
+    // it back + restore the leaf and resume the guest. checked first + silently
+    // (no serial spam) since it is the common case once guest compression is
+    // active; only non-kmemx violations fall through to the diagnostic path. (satoru)
+    if (KMemX::HandleGuestFaultAny(guest_phys)) return true;
+
     SerialLogger::Log("EPT: Violation at GPA ");
     SerialLogger::LogHex((uint32_t)(guest_phys >> 32));
     SerialLogger::LogHex((uint32_t)guest_phys);
