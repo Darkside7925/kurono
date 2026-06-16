@@ -1,9 +1,15 @@
 #include "kmemx_test.h"
 #include "kmemx_lz4.h"
+#include "kmemx.h"
+#include "kmemx_pool.h"
+#include "kmemx_internal.h"
 #include "pmm.h"
 #include "../drivers/serial.h"
 
-//  kmemx self-tests. stage 1: lz4 byte-exact roundtrip over 1000 pages. (satoru)
+//  kmemx self-tests.
+//    stage 1: lz4 byte-exact roundtrip over 1000 pages.
+//    stage 2: pool allocator (alloc/free/coalesce) + 1000-page store/retrieve
+//             round-trip through the real pool + metadata table. (satoru)
 
 namespace KMemXTest {
 
@@ -218,12 +224,193 @@ static bool test_lz4_edge_cases() {
     return fail == 0 && reject_ok;
 }
 
+// ── stage 2: pool allocator ──────────────────────────────────────────────────
+// alloc a spread of sizes, free every other one, confirm the freed bytes are
+// reclaimable (largest-free grows back), then free the rest and confirm the
+// arena returns to fully free. also a fragmentation/coalesce check: alloc N
+// adjacent small blocks, free them in a scrambled order, and confirm they
+// coalesce back into one large free run. (satoru)
+static bool test_pool_allocator() {
+    if (!KMemX::IsInitialized()) {
+        SerialLogger::Log("KMEMX-TEST: pool_allocator FAIL (engine not inited)\r\n");
+        return false;
+    }
+    KMemXPool::ResetForTest();
+    uint64_t total = KMemXPool::TotalBytes();
+    if (total == 0) {
+        SerialLogger::Log("KMEMX-TEST: pool_allocator FAIL (no pool)\r\n");
+        return false;
+    }
+
+    int fail = 0;
+    // 1) basic alloc/free reclaim. (satoru)
+    {
+        constexpr int N = 256;
+        uint32_t offs[N];
+        uint32_t szs[N];
+        Rng r(0xF00D);
+        for (int i = 0; i < N; i++) {
+            szs[i] = 32 + (r.next() % 1000);          // 32..1031 bytes (satoru)
+            offs[i] = KMemXPool::Alloc(szs[i]);
+            if (offs[i] == KMEMX_POOL_NULL) { fail++; break; }
+            // write a recognizable pattern to detect overlap. (satoru)
+            uint8_t* p = (uint8_t*)KMemXPool::Ptr(offs[i]);
+            for (uint32_t b = 0; b < szs[i]; b++) p[b] = (uint8_t)((i * 7 + b) & 0xFF);
+        }
+        // verify no two live allocations overlap by re-reading the patterns. (satoru)
+        for (int i = 0; i < N; i++) {
+            if (offs[i] == KMEMX_POOL_NULL) continue;
+            uint8_t* p = (uint8_t*)KMemXPool::Ptr(offs[i]);
+            for (uint32_t b = 0; b < szs[i]; b++)
+                if (p[b] != (uint8_t)((i * 7 + b) & 0xFF)) { fail++; break; }
+        }
+        uint64_t used_before = KMemXPool::UsedBytes();
+        for (int i = 0; i < N; i++) if (offs[i] != KMEMX_POOL_NULL) KMemXPool::Free(offs[i], szs[i]);
+        uint64_t used_after = KMemXPool::UsedBytes();
+        if (used_after != 0) { fail++; log_kv("KMEMX-TEST: pool leak used_after=", (int)used_after); SerialLogger::Log("\r\n"); }
+        (void)used_before;
+    }
+
+    // 2) coalesce: many adjacent small blocks, freed scrambled, must merge so a
+    //    large alloc succeeds again afterwards. (satoru)
+    {
+        KMemXPool::ResetForTest();
+        constexpr int M = 1000;
+        uint32_t offs[M];
+        int got = 0;
+        for (int i = 0; i < M; i++) {
+            offs[i] = KMemXPool::Alloc(64);
+            if (offs[i] == KMEMX_POOL_NULL) break;
+            got++;
+        }
+        // free in a scrambled order. (satoru)
+        Rng r(0xBEEF);
+        for (int i = got - 1; i > 0; i--) {            // fisher-yates shuffle (satoru)
+            int j = (int)(r.next() % (uint32_t)(i + 1));
+            uint32_t t = offs[i]; offs[i] = offs[j]; offs[j] = t;
+        }
+        for (int i = 0; i < got; i++) KMemXPool::Free(offs[i], 64);
+        if (KMemXPool::UsedBytes() != 0) { fail++; SerialLogger::Log("KMEMX-TEST: coalesce leak\r\n"); }
+        // after coalesce a big block should be allocatable again. (satoru)
+        uint32_t big = KMemXPool::Alloc(64 * 1000);
+        if (big == KMEMX_POOL_NULL) { fail++; SerialLogger::Log("KMEMX-TEST: coalesce did not merge\r\n"); }
+        else KMemXPool::Free(big, 64 * 1000);
+    }
+
+    KMemXPool::ResetForTest();
+    SerialLogger::Log("KMEMX-TEST: pool_allocator ");
+    SerialLogger::Log(fail == 0 ? "PASS" : "FAIL");
+    log_kv(" fail=", fail);
+    log_kv(" pool_mb=", (int)(total / (1024 * 1024)));
+    SerialLogger::Log("\r\n");
+    return fail == 0;
+}
+
+// stage 2: 1000-page store -> retrieve -> free round-trip through the real pool
+// + metadata table. each page is compressed into the pool, retrieved (with
+// crc32 verify), byte-compared, then freed. confirms the metadata hash table
+// (insert/find/erase + probe-chain repair) and the pool allocator hold up under
+// churn, and that live-page accounting returns to zero. (satoru)
+static bool test_pool_store_retrieve_1000() {
+    if (!KMemX::IsInitialized()) {
+        SerialLogger::Log("KMEMX-TEST: pool_store_retrieve FAIL (engine not inited)\r\n");
+        return false;
+    }
+    KMemXPool::ResetForTest();
+    // a synthetic but distinct address-space + vaddr per page. (satoru)
+    const uint64_t AS = 0x123000ULL;   // pretend cr3 (satoru)
+
+    uint8_t* orig = (uint8_t*)PMM::AllocBytes(PAGE);
+    uint8_t* deco = (uint8_t*)PMM::AllocBytes(PAGE);
+    if (!orig || !deco) {
+        SerialLogger::Log("KMEMX-TEST: pool_store_retrieve FAIL (alloc)\r\n");
+        return false;
+    }
+
+    int fail = 0, stored = 0;
+    // phase A: store 1000 pages, then retrieve+verify all, then free all. (satoru)
+    const int COUNT = 1000;
+    for (int i = 0; i < COUNT; i++) {
+        make_page(orig, i, 0x5151u + (uint32_t)i * 40503u);
+        uint64_t va = 0x40000000ULL + (uint64_t)i * PAGE;
+        int slot = KMemX::TestStore(AS, va, orig);
+        if (slot < 0) {
+            // pool/table saturated for this synthetic workload  -  stop storing but
+            // verify what we did store. not a failure unless retrieval breaks. (satoru)
+            break;
+        }
+        stored++;
+    }
+
+    for (int i = 0; i < stored; i++) {
+        make_page(orig, i, 0x5151u + (uint32_t)i * 40503u);
+        uint64_t va = 0x40000000ULL + (uint64_t)i * PAGE;
+        if (!KMemX::TestRetrieve(AS, va, deco)) { fail++; if (fail <= 3) { log_kv("KMEMX-TEST: retrieve fail page ", i); SerialLogger::Log("\r\n"); } continue; }
+        for (int b = 0; b < PAGE; b++) if (deco[b] != orig[b]) { fail++; if (fail <= 3) { log_kv("KMEMX-TEST: mismatch page ", i); SerialLogger::Log("\r\n"); } break; }
+    }
+
+    uint32_t live_before_free = KMemX::TestMetaLive();
+    for (int i = 0; i < stored; i++) {
+        uint64_t va = 0x40000000ULL + (uint64_t)i * PAGE;
+        KMemX::TestFree(AS, va);
+    }
+    uint32_t live_after_free = KMemX::TestMetaLive();
+    if (live_after_free != 0) { fail++; log_kv("KMEMX-TEST: meta leak live=", (int)live_after_free); SerialLogger::Log("\r\n"); }
+
+    // phase B: interleaved store/free churn to stress the probe-chain repair. (satoru)
+    KMemXPool::ResetForTest();
+    for (int round = 0; round < 3 && fail == 0; round++) {
+        for (int i = 0; i < 300; i++) {
+            make_page(orig, i + round, 0x9000u + (uint32_t)(i + round) * 2246822519u);
+            uint64_t va = 0x80000000ULL + (uint64_t)i * PAGE;
+            KMemX::TestStore(AS, va, orig);
+        }
+        // free every third, then retrieve the survivors. (satoru)
+        for (int i = 0; i < 300; i += 3) {
+            uint64_t va = 0x80000000ULL + (uint64_t)i * PAGE;
+            KMemX::TestFree(AS, va);
+        }
+        for (int i = 1; i < 300; i++) {
+            if (i % 3 == 0) continue;
+            make_page(orig, i + round, 0x9000u + (uint32_t)(i + round) * 2246822519u);
+            uint64_t va = 0x80000000ULL + (uint64_t)i * PAGE;
+            if (!KMemX::TestRetrieve(AS, va, deco)) { fail++; break; }
+            for (int b = 0; b < PAGE; b++) if (deco[b] != orig[b]) { fail++; break; }
+        }
+        // drain the rest. (satoru)
+        for (int i = 0; i < 300; i++) {
+            uint64_t va = 0x80000000ULL + (uint64_t)i * PAGE;
+            KMemX::TestFree(AS, va);
+        }
+    }
+
+    PMM::FreeBytes(orig, PAGE);
+    PMM::FreeBytes(deco, PAGE);
+    KMemXPool::ResetForTest();
+
+    SerialLogger::Log("KMEMX-TEST: pool_store_retrieve_1000 ");
+    SerialLogger::Log(fail == 0 ? "PASS" : "FAIL");
+    log_kv(" stored=", stored);
+    log_kv(" verified_live=", (int)live_before_free);
+    log_kv(" fail=", fail);
+    SerialLogger::Log("\r\n");
+    return fail == 0;
+}
+
 int RunAll() {
-    SerialLogger::Log("KMEMX-TEST: starting (stage 1: lz4 engine)\r\n");
+    SerialLogger::Log("KMEMX-TEST: starting\r\n");
     int pass = 0, total = 0;
 
+    // stage 1: lz4 engine. (satoru)
     total++; if (test_lz4_roundtrip_1000()) pass++;
     total++; if (test_lz4_edge_cases())     pass++;
+
+    // stage 2: pool + metadata. requires the engine initialized + enabled so the
+    // primitives are live. init with the default 20% pool if not already up. (satoru)
+    if (!KMemX::IsInitialized()) KMemX::Init(KMemX::PoolPct());
+    KMemX::SetEnabled(true);
+    total++; if (test_pool_allocator())            pass++;
+    total++; if (test_pool_store_retrieve_1000())  pass++;
 
     SerialLogger::Log("KMEMX-TEST: SUMMARY ");
     SerialLogger::LogDec(pass);

@@ -168,6 +168,8 @@ CXX_SRCS = \
     $(SRC)/kernel/slab.cpp \
     $(SRC)/kernel/vmm.cpp \
     $(SRC)/kernel/kmemx_lz4.cpp \
+    $(SRC)/kernel/kmemx_pool.cpp \
+    $(SRC)/kernel/kmemx.cpp \
     $(SRC)/kernel/kmemx_test.cpp \
     $(SRC)/kernel/kdf.cpp \
     $(SRC)/kernel/kdf_test.cpp \
