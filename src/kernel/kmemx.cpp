@@ -213,6 +213,12 @@ static void free_slot_locked(int idx) {
 }
 
 // ── public lifecycle ─────────────────────────────────────────────────────────
+// the table is capped so it never needs a giant contiguous allocation, and the
+// pool is sized against *current free* memory with headroom so it can never
+// starve the heap/buddy/the rest of the kernel of contiguous frames. (satoru)
+constexpr uint32_t META_MAX_ENTRIES = 256 * 1024;   // 256k entries (~10mb @ 40b) (satoru)
+constexpr uint64_t POOL_HEADROOM    = 256ULL * 1024 * 1024;  // leave >=256mb free (satoru)
+
 bool Init(int pool_pct) {
     if (g_inited) return true;
     if (pool_pct < 10) pool_pct = 10;
@@ -221,18 +227,25 @@ bool Init(int pool_pct) {
 
     for (int i = 0; i < (int)(sizeof(Stats) / 8); i++) ((uint64_t*)&g_stats)[i] = 0;
 
-    uint64_t total_ram = PMM::GetTotalMemory();
-    uint64_t want = (total_ram / 100) * (uint64_t)pool_pct;
-    uint64_t got = KMemXPool::Reserve(want);
-    if (got == 0) {
-        SerialLogger::Log("[kmemx] FATAL: could not reserve pool\r\n");
+    // ── 1) scratch + metadata FIRST, while contiguous memory is plentiful ──
+    // (allocating these after the pool grabbed hundreds of 2mb chunks left no
+    //  contiguous block for the table  -  the original boot failure.) (satoru)
+    g_scratch_hash = (uint8_t*)PMM::AllocBytes(KMemXLZ4::SCRATCH_BYTES);
+    g_scratch_comp = (uint8_t*)PMM::AllocBytes((size_t)KMemXLZ4::CompressBound(PAGE));
+    if (!g_scratch_hash || !g_scratch_comp) {
+        SerialLogger::Log("[kmemx] FATAL: could not allocate scratch\r\n");
         return false;
     }
-    g_stats.pool_bytes = got;
 
-    // metadata table: ~1 entry per 1.5kb of pool, power-of-two, capped. (satoru)
-    uint32_t entries = (uint32_t)(got / 1500);
+    // metadata table: ~1 entry per 1.5kb of the INTENDED pool, power-of-two,
+    // hard-capped at META_MAX_ENTRIES so the contiguous allocation stays small
+    // (a larger pool than the cap can serve just limits concurrent live pages  - 
+    // a soft cap, never a crash). (satoru)
+    uint64_t total_ram = PMM::GetTotalMemory();
+    uint64_t intended_pool = (total_ram / 100) * (uint64_t)pool_pct;
+    uint32_t entries = (uint32_t)(intended_pool / 1500);
     if (entries < 1024) entries = 1024;
+    if (entries > META_MAX_ENTRIES) entries = META_MAX_ENTRIES;
     g_meta_cap = next_pow2(entries);
     g_meta_mask = g_meta_cap - 1;
     g_meta = (PageMeta*)PMM::AllocBytes((size_t)g_meta_cap * sizeof(PageMeta));
@@ -246,13 +259,31 @@ bool Init(int pool_pct) {
         g_meta[i].pool_off = KMEMX_POOL_NULL;
     }
 
-    // scratch buffers  -  allocated ONCE so the hot path never allocates. (satoru)
-    g_scratch_hash = (uint8_t*)PMM::AllocBytes(KMemXLZ4::SCRATCH_BYTES);
-    g_scratch_comp = (uint8_t*)PMM::AllocBytes((size_t)KMemXLZ4::CompressBound(PAGE));
-    if (!g_scratch_hash || !g_scratch_comp) {
-        SerialLogger::Log("[kmemx] FATAL: could not allocate scratch\r\n");
-        return false;
+    // ── 2) reserve the pool LAST, bounded so it leaves headroom ──
+    // never reserve so much that fewer than POOL_HEADROOM bytes stay free, and
+    // never exceed what the metadata table can index (entries * ~max-blob). the
+    // chunk loop also stops on the first failed contiguous alloc, so on a tight
+    // host we keep whatever chunks we got rather than starving the kernel. (satoru)
+    uint64_t free_bytes = PMM::GetFreeMemory();
+    uint64_t want = intended_pool;
+    if (free_bytes > POOL_HEADROOM) {
+        uint64_t max_safe = free_bytes - POOL_HEADROOM;
+        if (want > max_safe) want = max_safe;
+    } else {
+        want = 0;   // memory too tight to compress safely (satoru)
     }
+    // also bound by table capacity (avg blob ~2kb -> entries*2kb of pool is
+    // the most we could ever fill). (satoru)
+    uint64_t table_bound = (uint64_t)g_meta_cap * 2048ULL;
+    if (want > table_bound) want = table_bound;
+
+    uint64_t got = (want > 0) ? KMemXPool::Reserve(want) : 0;
+    if (got == 0) {
+        SerialLogger::Log("[kmemx] WARN: reserved 0 pool (low memory)  -  engine idle\r\n");
+        // not fatal: the engine inits but compresses nothing until memory frees
+        // up and SetPoolPct grows it. (satoru)
+    }
+    g_stats.pool_bytes = got;
 
     // never-compress: kmemx's own pool + metadata + scratch (do not compress the
     // thing that holds the compressed pages!). the rest of the never-list is
