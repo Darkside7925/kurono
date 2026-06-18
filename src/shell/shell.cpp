@@ -14,6 +14,7 @@
 #include "../apps/denji_app.h"
 #include "../apps/firefox_launcher.h"
 #include "../packages/pkgmgr.h"
+#include "../system/kpkg_daemon.h"
 #include "../linux/ld_kurono.h"
 #include "../proc/scheduler.h"
 #include "../media/embedded_media.h"
@@ -1898,14 +1899,31 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     }
 
     if (!FirefoxLauncher::IsInstalled()) {
-        p = sappend(out, p, mx, "firefox: not installed yet  -  installing via kpkg...\n");
-        const char* iav[] = { "install", "firefox", nullptr };
-        // reuse the package manager's firefox branch (streaming install). (satoru)
-        char ibuf[1024];
-        int n = PackageManager::cmd_install(nullptr, 2, iav, ibuf, (int)sizeof(ibuf));
-        if (n > 0) { ibuf[n < (int)sizeof(ibuf) ? n : (int)sizeof(ibuf) - 1] = 0; p = sappend(out, p, mx, ibuf); }
-        if (!FirefoxLauncher::IsInstalled()) {
-            p = sappend(out, p, mx, "firefox: install did not complete; aborting launch.\n");
+        // install through the kpkg-daemon WORKER PROCESS instead of inline. the
+        // download+extract is ~262 mb and running it on this thread (the kernel
+        // main loop) froze the whole desktop + mouse: the inline path only pumps
+        // the ui between coarse steps, so the big libxul write + slow recv stalled
+        // it. the daemon's worker is preemptively time-shared against the gui, so
+        // we enqueue + poll its status, pumping the ui each tick, and the desktop
+        // stays live the whole install. (satoru)
+        if (!KpkgDaemon::RequestInstall("firefox")) {
+            p = sappend(out, p, mx, "firefox: kpkg-daemon is busy with another install; try again shortly.\n");
+            return p;
+        }
+        p = sappend(out, p, mx, "firefox: installing in the background (the desktop stays responsive)...\n");
+        KpkgDaemon::JobStatus js;
+        for (;;) {
+            KpkgDaemon::GetStatus(&js);
+            if (js.state == KpkgDaemon::KPKG_DONE || js.state == KpkgDaemon::KPKG_FAILED) break;
+            // just sleep: SleepMs yields the cpu so the (separate) GUIProcess
+            // keeps rendering the desktop + cursor and the daemon worker keeps
+            // downloading/extracting. do NOT PumpUI here -- that would drive a
+            // second full-screen blit from this thread, competing with the
+            // worker's network recv and crawling the download to a halt. (satoru)
+            Scheduler::SleepMs(50);
+        }
+        if (js.state != KpkgDaemon::KPKG_DONE || !FirefoxLauncher::IsInstalled()) {
+            p = sappend(out, p, mx, "firefox: background install failed; aborting launch.\n");
             return p;
         }
         // persist the fresh install (/apps/firefox) so the next boot restores it
@@ -1971,9 +1989,36 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"layers.gpu-process.enabled\", false);\n"
             "lockPref(\"gfx.webrender.software\", true);\n"
             "lockPref(\"browser.tabs.remote.autostart\", false);\n"
-            "lockPref(\"fission.autostart\", false);\n";
+            "lockPref(\"fission.autostart\", false);\n"
+            // kill every helper CHILD PROCESS so the parent does everything itself
+            // and never blocks on a child-ipc handshake (the e10s launch deadlock
+            // that stops the window from mapping). (satoru)
+            "lockPref(\"media.rdd-process.enabled\", false);\n"
+            "lockPref(\"network.process.enabled\", false);\n"
+            "lockPref(\"media.utility-process.enabled\", false);\n"
+            "lockPref(\"dom.ipc.processCount\", 1);\n"
+            "lockPref(\"dom.ipc.processPrelaunch.enabled\", false);\n"
+            "lockPref(\"dom.ipc.keepProcessesAlive.web\", 0);\n"
+            "lockPref(\"toolkit.telemetry.enabled\", false);\n"
+            "lockPref(\"datareporting.policy.dataSubmissionEnabled\", false);\n"
+            "lockPref(\"browser.contentblocking.database.enabled\", false);\n"
+            "lockPref(\"extensions.webextensions.remote\", false);\n"
+            // enable gecko module logging via PREFS  -  the env/cmdline MOZ_LOG paths
+            // produced nothing in this build, but prefs are confirmed-honored here
+            // (dom.ipc.processCount=1 took effect -> exactly 1 content proc). a
+            // logging.<module> pref calls LogModule::Get(module)->SetLevel; output
+            // goes to stderr -> serial. this is the diagnostic for the content
+            // launch handshake. (satoru)
+            "lockPref(\"logging.ForkService\", 5);\n"
+            "lockPref(\"logging.NodeController\", 5);\n"
+            "lockPref(\"logging.ipc\", 5);\n"
+            "lockPref(\"logging.MessageChannel\", 5);\n"
+            "lockPref(\"logging.DataPipe\", 5);\n"
+            "lockPref(\"logging.SharedMemory\", 5);\n"
+            "lockPref(\"logging.config.LOG_FILE\", \"/tmp/mozlog\");\n"
+            "lockPref(\"logging.config.sync\", true);\n";
         KVFS::WriteFile("/apps/firefox/firefox.cfg", cfg, (uint32_t)__builtin_strlen(cfg));
-        SerialLogger::Log("[ffcfg] wrote autoconfig (gpu-process off, sw webrender, single-process)\r\n");
+        SerialLogger::Log("[ffcfg] wrote autoconfig (all helper child procs disabled)\r\n");
     }
 
     Process* proc = Scheduler::CreateUserProcess("firefox", 0, 1);
@@ -1988,6 +2033,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "LD_LIBRARY_PATH=/apps/firefox:/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
         "XDG_RUNTIME_DIR=/system/run/user/1000",
         "WAYLAND_DISPLAY=wayland-0",
+        "WAYLAND_DEBUG=1",   // wayland protocol trace (firefox bring-up; drop for production) (satoru)
         // xkbcommon data root: we unpacked the xkeyboard-config tree here above,
         // so gdk builds its default keymap instead of aborting at seat init. (satoru)
         "XKB_CONFIG_ROOT=/apps/firefox/xkb",
@@ -1998,6 +2044,22 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "MOZ_ENABLE_WAYLAND=1", "GDK_BACKEND=wayland",
         "LIBGL_ALWAYS_SOFTWARE=1", "DISPLAY=:0",
         "FONTCONFIG_PATH=/system/fonts",
+        // gecko was built --with-system-icu against alpine's STUB libicudata.so
+        // (9KB, no tables); the real unicode data is a separate icudt78l.dat that we
+        // bundled into the package at /apps/firefox/. point ICU at that dir so
+        // u_init() finds it -- without it u_init fails and JS_InitWithFailureDiagnostic
+        // returns "ICU4CLibrary::Initialize() failed", MOZ_CRASH'ing the chrome main
+        // thread inside InitializeJS during NS_InitXPCOM. (satoru)
+        "ICU_DATA=/apps/firefox",
+        // GDK loads a cursor theme NAMED "default" at display init; with no theme
+        // present `wl_cursor_theme_load` fails, GDK leaves display->cursor_theme_name
+        // NULL and later G_ASSERTs (gdkdisplay-wayland.c
+        // _gdk_wayland_display_get_scaled_cursor_theme) -> abort -> SIGSEGV. we
+        // bundle Adwaita's cursors as theme "default" under /apps/firefox/icons/;
+        // point libXcursor/libwayland-cursor at it. (satoru)
+        "XCURSOR_PATH=/apps/firefox/icons",
+        "XCURSOR_THEME=default",
+        "XCURSOR_SIZE=24",
         "MOZ_DISABLE_RDD_SANDBOX=1", "MOZ_DISABLE_CONTENT_SANDBOX=1",
         "MOZ_CRASHREPORTER_DISABLE=1",
         // kurono runs the browser as the system uid (0) while $HOME is owned by
@@ -2012,6 +2074,10 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "MOZ_WEBRENDER=0", "WEBRENDER_SOFTWARE=1", "MOZ_ACCELERATED=0",
         "MOZ_X11_EGL=0", "MOZ_DISABLE_GPU_SANDBOX=1",
         "GALLIUM_DRIVER=llvmpipe",
+        // disable the fork server: content procs then spawn via plain fork+exec
+        // (covered by the socketpair refcount fix) instead of the fork-server
+        // SCM_RIGHTS+fork hop that the launch handshake deadlocks on. (satoru)
+        "MOZ_ENABLE_FORKSERVER=0",
         nullptr
     };
 

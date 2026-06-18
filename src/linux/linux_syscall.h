@@ -509,7 +509,10 @@ struct LinuxProcess {
 
 //  linuxsyscall  -  the syscall handler
 
-#define LINUX_MAX_PROCS  64
+#define LINUX_MAX_PROCS  256   // 64->256: firefox (multi-thread parent + fork
+                               // server + 8 content procs w/ threads) exceeds 64
+                               // live tasks; clone then fails and a critical
+                               // launch thread never spawns -> deadlock. (satoru)
 
 class LinuxSyscall {
 public:
