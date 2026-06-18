@@ -40,7 +40,13 @@ namespace {
 // binaries like ffmpeg have room; grows down from user_stack_top to base
 // 0x3fa00000, still ~506 mb above the mmap arena at 0x20000000. (satoru)
 constexpr uint64_t USER_STACK_BYTES = 8 * 1024 * 1024;
-constexpr uint64_t KERNEL_STACK_BYTES = 16 * 1024;
+// 16K->64K: a wayland client's sendmsg runs the in-kernel compositor SYNCHRONOUSLY
+// on the caller's kernel stack (sendmsg -> UnixSocket::send_core -> wayland on_data
+// -> handle_request -> commit_surface -> WindowManager blit), and each hop also
+// carries ~824-byte ControlMsg locals. that chain exceeds 16K and overflowed the
+// kernel stack, smashing a return address -> a ring-0 #UD (RIP=3) the first time a
+// firefox surface committed. 64K gives the deep path headroom. (satoru)
+constexpr uint64_t KERNEL_STACK_BYTES = 64 * 1024;
 constexpr uint64_t USER_STACK_TOP = USERSPACE_BASE + 0x00200000ULL;
 // user mmap arena base. MUST sit above all identity-mapped physical ram: the
 // kernel accesses every physical frame through the low identity map (phys==virt),
@@ -100,7 +106,7 @@ static uint32_t g_live_proc_count = 0;
 // ceiling on simultaneously-live tasks. kept at/below the linux process table
 // size (LINUX_MAX_PROCS=64) since every schedulable user task pairs with a
 // LinuxProcess slot. (satoru)
-static constexpr uint32_t MAX_LIVE_PROCS = 64;
+static constexpr uint32_t MAX_LIVE_PROCS = 256;  // 64->256 to match LINUX_MAX_PROCS (firefox thread/proc count) (satoru)
 
 static void init_process_common(Process* proc, const char* name, uint32_t priority) {
     memset(proc, 0, sizeof(Process));

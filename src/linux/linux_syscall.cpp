@@ -806,7 +806,16 @@ static bool handle_cow_fault(Process* task, uint64_t page_base,
     if (Scheduler::GetCurrentProcess() == task) {
         KernelVMM::InvalidatePage(page_base);
     }
-    Scheduler::SaveUserFrame(task, frame);
+    // only persist the trap frame as the task's USER state for a ring-3 fault; a
+    // kernel-mode COW fault (the kernel writing a forked/threaded task's not-yet-
+    // resolved COW page mid-syscall -- e.g. recvmsg scattering bytes into a shared
+    // page) carries the ring-0 exception frame. saving it overwrites the task's
+    // saved user frame with kernel cs/ss + a kernel rip, and the next schedule
+    // iretq's into ring-0 garbage -> the firefox ppoll-switch #UD (RIP=3 CS=8).
+    // mirror handle_demand_zero_fault's gate. (satoru)
+    if (frame->error_code & PFERR_USER) {
+        Scheduler::SaveUserFrame(task, frame);
+    }
     return true;
 }
 
