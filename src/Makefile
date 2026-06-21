@@ -121,6 +121,17 @@ ifneq ($(wildcard $(XKB_TAR_BIN)),)
 MEDIA_OBJS   += $(XKB_TAR_OBJ)
 endif
 
+# ─── DejaVu fonts data (embedded via objcopy) ──────────────────────────────
+# gecko's gfxPlatformFontList::GetDefaultFontLocked MOZ_RELEASE_ASSERTs when there
+# are zero font families; kurono shipped only a .ttf placeholder. embed real
+# DejaVu TTFs (sans/serif/mono), unpacked to /system/fonts at firefox launch so
+# fontconfig has a real default font. (satoru)
+FONTS_TAR_BIN = $(SRC)/assets_fonts.tar
+FONTS_TAR_OBJ = $(BUILD)/kurono_fonts.o
+ifneq ($(wildcard $(FONTS_TAR_BIN)),)
+MEDIA_OBJS   += $(FONTS_TAR_OBJ)
+endif
+
 # ─── User programs (test ELF64 binaries embedded into the kernel) ───────
 USERPROGS_DIR     = $(SRC)/userprogs
 HELLO_USER_ELF    = $(BUILD)/userprogs/hello.elf
@@ -471,6 +482,15 @@ $(XKB_TAR_OBJ): $(XKB_TAR_BIN)
 	  kurono_xkb kurono_xkb.o && \
 	rm -f kurono_xkb
 
+# ─── Embed DejaVu fonts tar via objcopy (binary → ELF .rodata) ────────────
+$(FONTS_TAR_OBJ): $(FONTS_TAR_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/kurono_fonts && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kurono_fonts kurono_fonts.o && \
+	rm -f kurono_fonts
+
 # ─── Embed Debian rootfs image via objcopy (binary → ELF .rodata) ───────
 $(DEBIAN_ROOTFS_OBJ): $(DEBIAN_ROOTFS_BIN)
 	@mkdir -p $(dir $@)
@@ -716,7 +736,7 @@ efi: dirs $(EFI_APP) $(EFI_APP_EMERGENCY)
 
 $(BUILD)/boot/efi_loader.o: $(SRC)/boot/efi_loader.c
 	@mkdir -p $(dir $@)
-	$(EFI_CC) $(EFI_CFLAGS) -DKURONO_EFI_CMDLINE='"efi"' -c $< -o $@
+	$(EFI_CC) $(EFI_CFLAGS) -DKURONO_EFI_CMDLINE='"efi kurono.autologin=1"' -c $< -o $@
 
 $(BUILD)/boot/efi_loader_emergency.o: $(SRC)/boot/efi_loader.c
 	@mkdir -p $(dir $@)
