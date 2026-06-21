@@ -13,7 +13,13 @@
 #include <efilib.h>
 
 #ifndef KURONO_EFI_CMDLINE
-#define KURONO_EFI_CMDLINE "efi"
+/* boot straight to the desktop on baremetal EFI, same as the grub/multiboot2
+ * path (which passes kurono.autologin=1). without this flag the kernel does NOT
+ * autologin and lands on the lockscreen/first-boot wizard instead of the
+ * desktop -- so a baremetal EFI boot looked "stuck" after the loader echoed its
+ * cmdline. the leading "efi" marker is harmless (no kernel token matches it) and
+ * keeps EFI boots identifiable in the cmdline echo/logs. (satoru) */
+#define KURONO_EFI_CMDLINE "efi kurono.autologin=1"
 #endif
 
 /* ── ELF64 structures (minimal, self-contained) ─────────────────────── */
@@ -68,7 +74,7 @@ struct mb2_tag_fb {
 struct mb2_tag_cmdline {
     UINT32 type;          /* 1 */
     UINT32 size;
-    char   string[8];     /* "efi\0" + padding */
+    char   string[64];    /* boot cmdline, e.g. "efi kurono.autologin=1" (satoru) */
 };
 struct mb2_tag_mmap_entry {
     UINT64 addr;
@@ -87,6 +93,13 @@ struct mb2_tag_mmap {
 
 /* Statically-allocated boot info buffer (must survive ExitBootServices) */
 static UINT8 boot_info_buf[16384] __attribute__((aligned(8)));
+
+/* Our own page tables, installed AFTER ExitBootServices so the fixed low kernel
+ * range is writable+executable (RWX) regardless of the firmware's W^X/NX policy
+ * on EFI-allocated pages -- that policy is what hung the pre-ExitBootServices
+ * kernel copy on real UEFI hardware. 1 GiB pages, identity-map 0..512 GiB. (satoru) */
+static UINT64 kpml4[512] __attribute__((aligned(4096)));
+static UINT64 kpdpt[512] __attribute__((aligned(4096)));
 
 /* ── Embedded kernel binary (linked via objcopy) ─────────────────────── */
 extern UINT8 _binary_kurono_elf_start[];
@@ -167,43 +180,28 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     /*    KEY: allocate as EfiLoaderCode so pages are EXECUTABLE.       */
     /*    This avoids the NX page fault that kills the GRUB relocator   */
     /*    on real firmware.                                              */
+    /*    The copy is DEFERRED to after ExitBootServices (step 7b): copying a
+     *    non-PIC kernel onto its fixed low phys range while boot services are
+     *    live writes through EFI's page tables, which on W^X firmware map
+     *    EFI-allocated code pages read-only -> the write faults and the loader
+     *    hangs right here (screen froze at "ELF entry" on real hardware). After
+     *    ExitBootServices we install our own RWX tables and copy then. (satoru) */
     phdr = (Elf64_Phdr *)(elf_buf + ehdr->e_phoff);
     for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
         if (phdr->p_type != PT_LOAD) continue;
-
-        UINT64 paddr = phdr->p_paddr;
-        UINT64 memsz = phdr->p_memsz;
-        UINT64 filesz = phdr->p_filesz;
-        UINTN pages = (UINTN)((memsz + 4095) / 4096);
-
-        /* Allocate at exact physical address as EfiLoaderCode (EXECUTABLE) */
-        EFI_PHYSICAL_ADDRESS alloc_addr = paddr;
-        status = uefi_call_wrapper(BS->AllocatePages, 4,
-                                   AllocateAddress,
-                                   EfiLoaderCode,
-                                   pages, &alloc_addr);
-        if (EFI_ERROR(status)) {
-            Print(L"WARN: AllocatePages at 0x%lx: %r\r\n", paddr, status);
-            /* On some firmware the low 1MB is reserved.  For the kernel
-               at 0x100000 this should generally be free.  If not, we
-               can't relocate a non-PIC kernel, so just try anyway. */
-        }
-
-        /* Copy segment data */
-        CopyMem((void *)(UINTN)paddr, elf_buf + phdr->p_offset, (UINTN)filesz);
-        /* Zero BSS */
-        if (memsz > filesz)
-            SetMem((void *)(UINTN)(paddr + filesz), (UINTN)(memsz - filesz), 0);
-
-        Print(L"  LOAD 0x%lx  file=%u mem=%u\r\n", paddr, filesz, memsz);
+        Print(L"  SEG 0x%lx  file=%u mem=%u (deferred)\r\n",
+              phdr->p_paddr, phdr->p_filesz, phdr->p_memsz);
     }
 
     /* ── 4. Find _start_efi64 from the loaded MB2 header ─────────── */
     /*    Scan for MB2 magic 0xE85250D6 in the loaded kernel, then    */
     /*    parse tags to find type 9 (EFI amd64 entry address).        */
     {
-        UINT32 *scan = (UINT32 *)(UINTN)0x100000;
-        UINT32 *scan_end = scan + (0x8000 / 4); /* first 32 KiB */
+        /* scan the EMBEDDED kernel image (it is NOT copied to 0x100000 until
+         * after ExitBootServices now), so look in elf_buf, not at 0x100000. the
+         * MB2 header lives near the start of the kernel; 256 KiB is plenty. (satoru) */
+        UINT32 *scan = (UINT32 *)elf_buf;
+        UINT32 *scan_end = scan + (0x40000 / 4); /* first 256 KiB of the file */
         for (; scan < scan_end; scan++) {
             if (*scan == 0xE85250D6U) { /* MB2 header magic */
                 UINT32 hdr_len = scan[2];
@@ -386,9 +384,10 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     }
 
     /* ═══════════════════════════════════════════════════════════════
-     * NO MORE EFI BOOT SERVICES FROM HERE.  We're in 64-bit long
-     * mode with EFI's identity-mapped page tables still active.
-     * The kernel code was allocated as EfiLoaderCode → executable.
+     * NO MORE EFI BOOT SERVICES FROM HERE.  We're in 64-bit long mode,
+     * still on EFI's page tables for the moment.  Below we install our
+     * own RWX tables, copy the kernel to its fixed low addresses, then
+     * jump  -  none of that uses boot services.
      * ═══════════════════════════════════════════════════════════════ */
 
     /* ── 8. Init COM1 serial (115200 8N1) ──────────────────────────── */
@@ -406,6 +405,41 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     serial_str("EFI_LOADER: cmdline=");
     serial_str(mb2_cmdline);
     serial_str("\r\n");
+
+    /* ── 7b. Install our own RWX identity page tables, then copy the kernel ──
+     *    Boot services are gone, so we own all conventional memory and may
+     *    replace EFI's page tables. Map 0..512 GiB identity with 1 GiB pages,
+     *    present+writable, NX clear (executable). This makes the fixed low
+     *    kernel range BOTH writable (for the copy below) and executable (for the
+     *    jump) no matter how the firmware mapped its own pages  -  the W^X policy
+     *    on EFI code pages is what hung the pre-ExitBootServices copy. (satoru) */
+    {
+        int t;
+        for (t = 0; t < 512; t++) { kpml4[t] = 0; kpdpt[t] = 0; }
+        for (t = 0; t < 512; t++)
+            kpdpt[t] = ((UINT64)t << 30) | 0x83ULL;  /* present|write|PS(1GiB), NX=0 */
+        kpml4[0] = (UINT64)(UINTN)kpdpt | 0x03ULL;   /* present|write */
+        __asm__ volatile("mov %0, %%cr3" : : "r"((UINT64)(UINTN)kpml4) : "memory");
+    }
+    serial_str("EFI_LOADER: RWX paging installed\r\n");
+
+    /* copy each PT_LOAD segment to its physical address. manual qword copy  - 
+     * CopyMem is a boot service and is invalid now. the loader image (holding
+     * the embedded kernel we read FROM) sits high, clear of 0x100000.. (satoru) */
+    {
+        Elf64_Phdr *cph = (Elf64_Phdr *)(elf_buf + ehdr->e_phoff);
+        int k;
+        for (k = 0; k < ehdr->e_phnum; k++, cph++) {
+            if (cph->p_type != PT_LOAD) continue;
+            UINT8 *d = (UINT8 *)(UINTN)cph->p_paddr;
+            UINT8 *s = elf_buf + cph->p_offset;
+            UINT64 n = cph->p_filesz, j;
+            for (j = 0; j + 8 <= n; j += 8) *(UINT64 *)(d + j) = *(UINT64 *)(s + j);
+            for (; j < n; j++) d[j] = s[j];
+            for (j = cph->p_filesz; j < cph->p_memsz; j++) d[j] = 0; /* .bss */
+        }
+    }
+    serial_str("EFI_LOADER: kernel copied\r\n");
 
     /* ── 9. PC Speaker beep  -  audible proof-of-life ───────────────── */
     serial_out(0x43, 0xB6);

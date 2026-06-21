@@ -18,11 +18,19 @@ static bool g_present_via_virtio = false;
 extern "C" uint8_t pd_tables[];
 // pdpt from kurono_boot.asm  -  needed to add new pd tables for >16gb fbs
 extern "C" uint8_t pdpt[];
+// 1 gib-page pdpts for pml4[1..3] (512 gb..2 tb) from kurono_boot.asm  -  needed to
+// set write-combining on a high efi gop framebuffer that lands in that range (satoru)
+extern "C" uint8_t efi_hi_pdpts[];
 
-// must stay in sync with num_pds in kurono_boot.asm.
-// the boot path now identity-maps 512 gb specifically to cover high efi gop
-// framebuffers seen on real laptops (e.g. 0x4000000000 = 256 gb).
-static constexpr uint64_t BOOT_IDENTITY_MAP_GB = 512;
+// must stay in sync with kurono_boot.asm: the EFI path maps 0..512 GB with 2 MB
+// pages (PML4[0]) PLUS 512 GB..2 TB with 1 GB pages (PML4[1..3], efi_hi_pdpts),
+// so high EFI GOP framebuffers up to 2 TB are reachable (seen: ~1 TB at
+// 0xFA10000000 on a real laptop; older note: 0x4000000000 = 256 gb). (satoru)
+static constexpr uint64_t BOOT_IDENTITY_MAP_GB = 2048;
+// the 2 MB-page PD range (= NUM_PDS in kurono_boot.asm). gb indices below this live
+// in pd_tables (2 MB PDs); [PD_MAP_GB, BOOT_IDENTITY_MAP_GB) are 1 GiB pages in
+// efi_hi_pdpts and must have WC set on the pdpte, not a (nonexistent) pd. (satoru)
+static constexpr uint64_t PD_MAP_GB = 512;
 
 // utility functions (static to avoid linking conflicts)
 static int abs(int x) { return x < 0 ? -x : x; }
@@ -128,9 +136,20 @@ static bool remap_fb_writecombining(uintptr_t fb_phys, size_t fb_size) {
 
         uint64_t* pd = nullptr;
 
-        if (gb_idx < BOOT_IDENTITY_MAP_GB) {
-            // within the boot-time identity map built in kurono_boot.asm.
+        if (gb_idx < PD_MAP_GB) {
+            // 0..512 gb: 2 mb-page pds built by the boot asm.
             pd = (uint64_t*)((uintptr_t)pd_tables + gb_idx * 4096);
+        } else if (gb_idx < BOOT_IDENTITY_MAP_GB) {
+            // 512 gb..2 tb: a 1 gib page in efi_hi_pdpts (pml4[1..3]). there is NO pd
+            // here (the old code indexed pd_tables out of bounds → memory corruption →
+            // black screen), so set wc on the 1 gib pdpte directly. one 1 gib page
+            // covers this whole gb, so this is idempotent across the 2 mb steps. (satoru)
+            uint64_t* he = &((uint64_t*)(uintptr_t)efi_hi_pdpts)[gb_idx - PD_MAP_GB];
+            *he &= ~((1ULL << 3) | (1ULL << 4) | (1ULL << 12));
+            *he |=  (1ULL << 3);                 // pwt = 1 → pat entry 1 = wc
+            __asm__ __volatile__("invlpg (%0)" :: "r"(addr) : "memory");
+            pages_remapped++;
+            continue;
         } else if (gb_idx < (BOOT_IDENTITY_MAP_GB + 4) && extra_pd_count < 4) {
             // legacy fallback path: dynamically add a page directory.
             // build a fresh 1 gb identity-mapped pd for this gb region.

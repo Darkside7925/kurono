@@ -183,7 +183,13 @@ pml4:           resb 4096               ; Page Map Level 4
 global pdpt                             ; exported so C can wire extra PDs for >16 GB FBs
 pdpt:           resb 4096               ; Page Directory Pointer Table
 global pd_tables                        ; exported so C code can remap FB pages
-pd_tables:      resb 4096 * NUM_PDS     ; 16 Page Directories → 16 GB
+pd_tables:      resb 4096 * NUM_PDS     ; NUM_PDS Page Directories → NUM_PDS GB (512)
+; EFI path only: 3 extra PDPTs of 1 GiB pages for PML4[1..3], extending the
+; identity map to 2 TiB so high GOP framebuffers (e.g. ~1 TiB at 0xFA10000000
+; on some laptops) are mapped  -  the 512 GB PD map above does not reach them. (satoru)
+alignb 4096
+global efi_hi_pdpts                      ; exported so graphics.cpp can set WC on the 1 GiB FB page
+efi_hi_pdpts:   resb 4096 * 3
 
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  Stack  -  in .stk (zeroed with BSS, that's fine)
@@ -782,6 +788,36 @@ _start_efi64:
     adc edx, 0
     dec ecx
     jnz .efi64_fill_pd
+
+    ; ── Extend the identity map to 2 TiB for high EFI GOP framebuffers ──
+    ;    Some laptops place the GOP LFB above 512 GB (seen: ~1 TiB at
+    ;    0xFA10000000), beyond the PD map above, so the kernel could not reach
+    ;    the framebuffer to render. Map PML4[1..3] -> 3 PDPTs of 1 GiB pages
+    ;    (no PDs needed), covering 512 GiB..2 TiB. PML4[0] is untouched so the
+    ;    low map and the BIOS path are unchanged. 1 GiB pages need Page1GB
+    ;    (standard on modern CPUs). (satoru)
+    lea rbx, [efi_hi_pdpts]            ; base of the 3 hi PDPTs
+    mov rax, pml4
+    mov rcx, 1                          ; PML4 index 1..3
+.efi64_hi_pml4:
+    mov rdx, rbx
+    or  rdx, 0x03                       ; present | write
+    mov [rax + rcx*8], rdx              ; PML4[rcx] -> hi PDPT
+    add rbx, 4096
+    inc rcx
+    cmp rcx, 4
+    jl  .efi64_hi_pml4
+    lea rbx, [efi_hi_pdpts]            ; fill 1536 entries (3 PDPTs)
+    xor rcx, rcx
+.efi64_hi_fill:
+    mov rax, rcx
+    add rax, 512                        ; phys index in GiB (this map starts at 512 GiB)
+    shl rax, 30                         ; * 1 GiB
+    or  rax, 0x83                       ; present | write | PS (1 GiB page)
+    mov [rbx + rcx*8], rax
+    inc rcx
+    cmp rcx, 1536
+    jl  .efi64_hi_fill
 
     SERIAL_CHAR 'K'
     SERIAL_CHAR '2'
