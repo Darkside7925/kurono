@@ -45,6 +45,14 @@ struct Socket {
     DataCallback       on_data;
     void*              user;
     bool       is_kernel_server;
+    int        refs;             // open-fd refcount. >1 once a socketpair end is
+                                 // duplicated across fork (clone_file_descriptors
+                                 // calls Retain). Close() only severs the peer +
+                                 // frees the slot on the LAST close. without this
+                                 // the parent's standard post-fork close of the
+                                 // child's socketpair end tore down its own live
+                                 // ipc end -> firefox e10s child replies never
+                                 // arrived -> parent busy-spun. (satoru)
 };
 
 Socket g_socks[UNIX_MAX_SOCKETS];
@@ -69,6 +77,7 @@ int alloc_sd() {
             s->on_data = nullptr;
             s->user = nullptr;
             s->is_kernel_server = false;
+            s->refs = 1;
             s->creds = {0, 0, 0};
             return i;
         }
@@ -305,24 +314,70 @@ int Pair(SockType type, int* sd0, int* sd1) {
 // during the synchronous on_data call. (satoru)
 static ControlMsg g_pending_ctrl[UNIX_MAX_SOCKETS];
 static bool       g_pending_ctrl_valid[UNIX_MAX_SOCKETS];
+// how many of the pending message's passed fds have already been handed out.
+// one sendmsg can carry MANY SCM_RIGHTS fds (firefox batches several
+// wl_shm.create_pool requests, each with its own memfd, into one send); each
+// create_pool must consume the NEXT fd in order. the old code returned the whole
+// message on the first TakePendingControl and dropped the rest, so every pool
+// after the first got a null backing -> the browser window's large shm buffer
+// never mapped -> the window painted black. (satoru)
+static int        g_pending_ctrl_taken[UNIX_MAX_SOCKETS];
 
 // shared write core: enqueue to the peer ring and, for an in-kernel server peer,
 // drive its on_data handler with the ancillary made available for this delivery.
 static int send_core(int sd, const void* buf, int len, const ControlMsg& cm) {
-    if (!valid(sd) || !g_socks[sd].connected) return -32;   // EPIPE
+    if (!valid(sd) || !g_socks[sd].connected) {
+        // (satoru) TEMP: this EPIPE is silent (no [usend] below). catch a firefox
+        // parent->content send that fails because the inherited channel lost its
+        // `connected` flag  -  distinguishes a kernel socket bug from "never sent".
+        SerialLogger::Log("[usend] sd="); SerialLogger::LogDec(sd);
+        SerialLogger::Log(" EPIPE valid="); SerialLogger::LogDec(valid(sd) ? 1 : 0);
+        SerialLogger::Log(" conn="); SerialLogger::LogDec((valid(sd) && g_socks[sd].connected) ? 1 : 0);
+        SerialLogger::Log(" len="); SerialLogger::LogDec(len);
+        SerialLogger::Log("\r\n");
+        return -32;   // EPIPE
+    }
     Socket& s = g_socks[sd];
     if (s.shutdown_wr) return -32;
     int peer = s.peer_sd;
-    if (!valid(peer)) return -32;
+    if (!valid(peer)) {
+        SerialLogger::Log("[usend] sd="); SerialLogger::LogDec(sd);
+        SerialLogger::Log(" NOPEER len="); SerialLogger::LogDec(len);
+        SerialLogger::Log("\r\n");
+        return -32;
+    }
     Socket& ps = g_socks[peer];
+    if (false && !ps.is_kernel_server) {  // (satoru) TEMP gated off: user<->user (firefox ipc) send trace
+        SerialLogger::Log("[usend] sd="); SerialLogger::LogDec(sd);
+        SerialLogger::Log(" -> peer="); SerialLogger::LogDec(peer);
+        SerialLogger::Log(" len="); SerialLogger::LogDec(len);
+        SerialLogger::Log("\r\n");
+    }
     if (ps.shutdown_rd) return -32;
     int w = ring_write(ps.rx, (const uint8_t*)buf, len, &cm, s.type);
     if (w == 0 && len > 0) return -11;  // EAGAIN
     if (ps.is_kernel_server && ps.on_data && w > 0) {
+        // (satoru) TEMP [sc] guard+diag for the firefox sibling-sendmsg #UD: a
+        // kernel-server peer whose on_data is a garbage pointer (e.g. 3) means this
+        // indirect call jumps into nothing -> #UD RIP=3. log the socket identity +
+        // skip the insane handler so we don't execute address 0x3. debug.
+        if ((uint64_t)(uintptr_t)ps.on_data < 0x1000ULL) {
+            SerialLogger::Log("[sc] BAD on_data sd="); SerialLogger::LogDec(sd);
+            SerialLogger::Log(" peer="); SerialLogger::LogDec(peer);
+            SerialLogger::Log(" od="); SerialLogger::LogHex((uint32_t)((uint64_t)(uintptr_t)ps.on_data >> 32));
+            SerialLogger::LogHex((uint32_t)(uintptr_t)ps.on_data);
+            SerialLogger::Log(" type="); SerialLogger::LogDec((int)ps.type);
+            SerialLogger::Log(" ks="); SerialLogger::LogDec(ps.is_kernel_server ? 1 : 0);
+            SerialLogger::Log(" refs="); SerialLogger::LogDec(ps.refs);
+            SerialLogger::Log(" inuse="); SerialLogger::LogDec(ps.in_use ? 1 : 0);
+            SerialLogger::Log("\r\n");
+            return w;   // bytes are queued in the ring; skip the corrupt handler (satoru)
+        }
         // expose ancillary (passed fds / resolved shm) to the handler. (satoru)
         if (cm.passed_fd_count > 0) {
             g_pending_ctrl[peer]       = cm;
             g_pending_ctrl_valid[peer] = true;
+            g_pending_ctrl_taken[peer] = 0;   // hand out fds one at a time (satoru)
         }
         // Drain into the kernel-side handler with no extra copy where possible:
         // for streams, walk the ring in contiguous spans and hand each span
@@ -375,7 +430,30 @@ int SendMsg(int sd, const void* buf, int len, int flags, const ControlMsg* cmin)
 bool TakePendingControl(int sd, ControlMsg* out) {
     if (sd < 0 || sd >= UNIX_MAX_SOCKETS) return false;
     if (!g_pending_ctrl_valid[sd]) return false;
-    if (out) *out = g_pending_ctrl[sd];
+    ControlMsg& p = g_pending_ctrl[sd];
+    int t = g_pending_ctrl_taken[sd];
+    // a message with fds is consumed one fd per call so consecutive create_pool
+    // requests in the same send each get their own memfd. a creds-only message
+    // (no fds) is returned once as before. (satoru)
+    if (p.passed_fd_count > 0) {
+        if (t >= p.passed_fd_count) { g_pending_ctrl_valid[sd] = false; return false; }
+        if (out) {
+            ControlMsg one = {};
+            one.passed_fd_count     = 1;
+            one.passed_fds[0]       = p.passed_fds[t];
+            one.passed_shm_base[0]  = p.passed_shm_base[t];
+            one.passed_shm_size[0]  = p.passed_shm_size[t];
+            one.passed_sd[0]        = p.passed_sd[t];
+            one.passed_is_socket[0] = p.passed_is_socket[t];
+            one.creds_valid         = p.creds_valid;
+            one.peer_creds          = p.peer_creds;
+            *out = one;
+        }
+        g_pending_ctrl_taken[sd] = t + 1;
+        if (g_pending_ctrl_taken[sd] >= p.passed_fd_count) g_pending_ctrl_valid[sd] = false;
+        return true;
+    }
+    if (out) *out = p;
     g_pending_ctrl_valid[sd] = false;
     return true;
 }
@@ -395,9 +473,21 @@ int Shutdown(int sd, int how) {
     return 0;
 }
 
+int Retain(int sd) {
+    if (!valid(sd)) return -1;
+    g_socks[sd].refs++;
+    return 0;
+}
+
 int Close(int sd) {
     if (!valid(sd)) return -1;
     Socket& s = g_socks[sd];
+    // a socketpair end inherited across fork is referenced by both the parent's
+    // and the child's fd tables (same global sd). only the LAST close severs the
+    // peer + frees the slot; an earlier close just drops this fd's reference, so
+    // the still-live peer keeps working. (satoru)
+    if (s.refs > 1) { s.refs--; return 0; }
+    s.refs = 0;
     if (s.peer_sd >= 0 && valid(s.peer_sd)) {
         Socket& ps = g_socks[s.peer_sd];
         ps.shutdown_wr = true;     // peer's writes will start failing

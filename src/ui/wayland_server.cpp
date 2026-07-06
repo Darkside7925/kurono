@@ -63,6 +63,9 @@ inline void clear_obj_ext(Object& o) {
     o.attach_y          = 0;
     o.surf_alpha        = 255;
     o.mapped            = false;
+    o.subsurface_parent = 0;
+    o.subsurface_x      = 0;
+    o.subsurface_y      = 0;
 }
 
 void reset_client_state(Client* c, int sd) {
@@ -427,7 +430,9 @@ void winmap_clear(int win_id) {
 // forward decl: blit a surface's attached buffer into its window content
 // rect. if use_damage is true only the accumulated damage rect is painted;
 // otherwise the whole buffer is painted (used for full wm repaints). (satoru)
-void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage);
+void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
+                         int ox = 0, int oy = 0);
+void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin);
 
 // wm render callback for bridged wayland windows: repaint the full client
 // buffer into the (already chrome-drawn) content rect so the surface
@@ -443,6 +448,10 @@ void wl_render_thunk(Window* win, int x, int y, int w, int h) {
     Object* surf = find_obj(c, sid);
     if (!surf || surf->iface != WL_SURFACE) return;
     blit_surface_region(c, surf, win, /*use_damage=*/false);
+    // a wm repaint refills the whole content rect from the parent buffer, which
+    // would re-cover any subsurface content  -  re-composite children on top.
+    // forward-declared below; defined with commit_surface. (satoru)
+    blit_child_subsurfaces(c, surf, win);
 }
 
 // bridge a toplevel wl_surface to a wm window the first time it is
@@ -544,7 +553,8 @@ void blit_argb(const uint8_t* src, uint32_t stride, int bw, int bh,
 // use_damage is true, only the surface's accumulated damage rect is
 // painted (incremental commit path); otherwise the whole buffer is painted
 // (full wm repaint path). returns true if any pixels were written. (satoru)
-void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage) {
+void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
+                         int ox, int oy) {
     if (!surf || !win) return;
     uint32_t bid = surf->pending_buffer_id;
     if (bid == 0) return;                       // nothing attached
@@ -596,10 +606,43 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage) 
     uint32_t wm_a = WindowManager::GetAlpha(win->id);
     uint32_t eff  = ((uint32_t)surf->surf_alpha * wm_a) / 255u;
     if (eff > 255) eff = 255;
+    // ox/oy shift the destination for a subsurface composited onto its parent
+    // window (0,0 for a normal toplevel). the clip stays the window content rect
+    // so a subsurface can't paint outside its parent. (satoru)
     blit_argb(src, buf->buf_stride, dw, dh, buf->buf_format,
-              cx + dx, cy + dy,
+              cx + ox + dx, cy + oy + dy,
               cx, cy, cw, ch, (uint8_t)eff);
-    if (use_damage) Graphics::MarkDirty(cx + dx, cy + dy, dw, dh);
+    if (use_damage) Graphics::MarkDirty(cx + ox + dx, cy + oy + dy, dw, dh);
+}
+
+// find the wl_subsurface role object that wraps `surf_id` (i.e. gives that
+// wl_surface the subsurface role). returns null if surf is a plain surface.
+// (satoru)
+Object* find_subsurface_role(Client* c, uint32_t surf_id) {
+    if (surf_id == 0) return nullptr;
+    for (int i = 0; i < WL_MAX_OBJECTS; i++) {
+        Object& o = c->objects[i];
+        if (o.in_use && o.iface == WL_SUBSURFACE && o.parent_surface_id == surf_id)
+            return &o;
+    }
+    return nullptr;
+}
+
+// composite every subsurface parented to `parent_surf` onto `pwin` (which the
+// parent already painted), each at its set_position offset, on top. called
+// after a parent's own blit so the parent's (often black csd) buffer never
+// covers the real content the client drew into its child surface. (satoru)
+void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin) {
+    if (!parent_surf || !pwin) return;
+    for (int i = 0; i < WL_MAX_OBJECTS; i++) {
+        Object& ss = c->objects[i];
+        if (!ss.in_use || ss.iface != WL_SUBSURFACE) continue;
+        if (ss.subsurface_parent != parent_surf->id) continue;
+        Object* child = find_obj(c, ss.parent_surface_id);
+        if (!child || child->pending_buffer_id == 0) continue;
+        blit_surface_region(c, child, pwin, /*use_damage=*/false,
+                            ss.subsurface_x, ss.subsurface_y);
+    }
 }
 
 // apply the surface's currently-attached buffer to its window on commit:
@@ -615,6 +658,30 @@ void commit_surface(Client* c, Object* surf) {
     int bh = buf->height;
     if (bw <= 0 || bh <= 0) return;
 
+    // if this surface is a subsurface (firefox's gtk content surface, inset
+    // inside the black csd toplevel), composite it ONTO the parent window at
+    // its set_position offset instead of giving it its own window behind the
+    // parent  -  that separate-window path is exactly why the content drew but
+    // the screen stayed black. (satoru)
+    Object* role = find_subsurface_role(c, surf->id);
+    if (role) {
+        Object* psurf = find_obj(c, role->subsurface_parent);
+        if (psurf && psurf->wm_window) {
+            int pwid = (int)(intptr_t)psurf->wm_window;
+            Window* pwin = WindowManager::GetWindow(pwid);
+            if (pwin) {
+                blit_surface_region(c, surf, pwin, /*use_damage=*/true,
+                                    role->subsurface_x, role->subsurface_y);
+                WindowManager::MarkDirty(pwid);
+                surf->damage.valid = false;
+                return;
+            }
+        }
+        // parent not mapped yet  -  fall through to a temporary own-window so the
+        // content isn't lost; it re-homes onto the parent on the next commit.
+        // (satoru)
+    }
+
     // ensure the surface owns an on-screen rect. (satoru)
     int wid = bridge_surface_window(c, surf, bw, bh);
     if (wid < 0) return;
@@ -626,6 +693,9 @@ void commit_surface(Client* c, Object* surf) {
     // the window dirty so the wm paints its chrome and, once a mapping
     // arrives via RegisterPoolMemory(), the render thunk fills content. (satoru)
     blit_surface_region(c, surf, win, /*use_damage=*/true);
+    // re-composite any child subsurfaces on top so the parent's fresh (black)
+    // buffer doesn't cover content the client committed into a child. (satoru)
+    blit_child_subsurfaces(c, surf, win);
     WindowManager::MarkDirty(wid);
     surf->damage.valid = false;
 }
@@ -991,6 +1061,50 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
             }
             break;
         }
+        case WL_SUBCOMPOSITOR: {
+            // get_subsurface(new_id, surface, parent): give an existing wl_surface
+            // the subsurface role, parented to `parent`. gtk uses this for the
+            // client-side-decoration surfaces around a firefox toplevel. we don't
+            // composite sub-surfaces as a separate layer yet, but the OBJECT must
+            // exist  -  otherwise the client's later wl_subsurface requests hit an
+            // "invalid object" protocol error and libwayland aborts (the crash in
+            // WlLogHandler right after gtk_widget_show). register the role object +
+            // remember which surface it wraps; its commits already blit through the
+            // WL_SURFACE path. opcode 0 = destroy. (satoru)
+            if (opcode == 1) {
+                if (args_len < 12) return;
+                uint32_t new_id  = get32(args);
+                uint32_t surf_id = get32(args + 4);
+                uint32_t parent  = get32(args + 8);
+                if (!register_obj(c, new_id, WL_SUBSURFACE, obj->version)) return;
+                Object* so = find_obj(c, new_id);
+                if (so) {
+                    so->parent_surface_id = surf_id;   // the wl_surface it roles
+                    so->subsurface_parent = parent;    // the parent wl_surface
+                }
+            } else if (opcode == 0) {
+                destroy_obj(c, object_id);
+            }
+            break;
+        }
+        case WL_SUBSURFACE: {
+            // opcode 0 = destroy. opcode 1 = set_position(x,y): record the offset
+            // so commit_surface can composite the wrapped surface ONTO its parent
+            // window at the right place (firefox's gtk content surface is a
+            // subsurface inset inside the toplevel; without this it drew into its
+            // own window BEHIND the black parent = the black-window bug). the other
+            // opcodes (place_above/below, set_sync/desync) stay benign no-ops.
+            // (satoru)
+            if (opcode == 0) { destroy_obj(c, object_id); break; }
+            if (opcode == 1 && args_len >= 8) {
+                Object* ss = find_obj(c, object_id);
+                if (ss) {
+                    ss->subsurface_x = (int32_t)get32(args);
+                    ss->subsurface_y = (int32_t)get32(args + 4);
+                }
+            }
+            break;
+        }
         case WL_SHM: {
             if (opcode == 0) {                    // create_pool(new_id, fd, size)
                 // fd travels in scm_rights ancillary data (0 bytes on the
@@ -1005,7 +1119,8 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 // resolved that memfd to its shm backing. bind it now so blits
                 // read the client's real pixels instead of a null pool. (satoru)
                 UnixSocket::ControlMsg cm;
-                if (po && UnixSocket::TakePendingControl(c->sd, &cm)) {
+                bool gotcm = po && UnixSocket::TakePendingControl(c->sd, &cm);
+                if (gotcm) {
                     for (int i = 0; i < cm.passed_fd_count; i++) {
                         if (!cm.passed_shm_base[i]) continue;
                         po->pool_base = (const uint8_t*)(uintptr_t)cm.passed_shm_base[i];
