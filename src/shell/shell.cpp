@@ -1854,6 +1854,16 @@ extern "C" {
     extern const unsigned char _binary_kurono_xkb_start[];
     extern const unsigned char _binary_kurono_xkb_end[];
 }
+// embedded DejaVu TTFs (Makefile objcopy of assets_fonts.tar); unpacked to
+// /system/fonts at firefox launch. without a real text font fontconfig returns
+// zero families and gecko's gfxPlatformFontList::GetDefaultFontLocked
+// MOZ_RELEASE_ASSERTs (mFontFamilies.Count() > 0) -> abort. the firefox tar's
+// own fonts dir is unreliable here (fontconfig never surfaced them); /system/fonts
+// is fontconfig's primary <dir> so this is the dependable path. (satoru)
+extern "C" {
+    extern const unsigned char _binary_kurono_fonts_start[];
+    extern const unsigned char _binary_kurono_fonts_end[];
+}
 
 int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
@@ -1972,6 +1982,19 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         if (xok) p = sappend(out, p, mx, "firefox: unpacked xkeyboard-config data.\n");
     }
 
+    // unpack the embedded DejaVu TTFs into /system/fonts (fontconfig's primary
+    // <dir>, where it definitely scans) so gecko finds a usable default font and
+    // does not abort with zero font families. mirrors the xkb unpack above. (satoru)
+    {
+        int fonts_len = (int)(_binary_kurono_fonts_end - _binary_kurono_fonts_start);
+        bool fok = PackageManager::ExtractTar((const char*)_binary_kurono_fonts_start, fonts_len, "/system/fonts");
+        SerialLogger::Log("[fffont] len="); SerialLogger::LogDec(fonts_len);
+        SerialLogger::Log(" extract="); SerialLogger::LogDec(fok ? 1 : 0);
+        SerialLogger::Log(" dejavu="); SerialLogger::LogDec(KVFS::Exists("/system/fonts/DejaVuSans.ttf") ? 1 : 0);
+        SerialLogger::Log("\r\n");
+        if (fok) p = sappend(out, p, mx, "firefox: unpacked DejaVu fonts.\n");
+    }
+
     // pin gecko's compositor into the parent process (software webrender) and
     // run content in-process, via the autoconfig mechanism so no profile dir is
     // needed. without this the parent spawns a gpu process + content process and
@@ -1988,14 +2011,38 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "//\n"
             "lockPref(\"layers.gpu-process.enabled\", false);\n"
             "lockPref(\"gfx.webrender.software\", true);\n"
+            // firefox 140 is WEBRENDER-ONLY (the old basic/non-WR compositor is gone),
+            // so WR must come up or there is no compositor at all. the failed glxtest
+            // marks the GPU unusable in gfxInfo; force-enable WR so the SOFTWARE backend
+            // (cpu rasterizer, no GL needed) starts regardless of "no GPU detected"  - 
+            // otherwise the compositor thread never starts and the main thread null-derefs
+            // the absent compositor (#PF CR2=0). (satoru)
+            "lockPref(\"gfx.webrender.force-enabled\", true);\n"
+            "lockPref(\"gfx.webrender.all\", true);\n"
             "lockPref(\"browser.tabs.remote.autostart\", false);\n"
             "lockPref(\"fission.autostart\", false);\n"
+            // single-threaded servo styling. with >1 thread, global_style_data.rs builds
+            // a rayon STYLE_THREAD_POOL whose ThreadPoolBuilder::build() prime-barrier
+            // (use_current_thread + parking_lot/futex) DEADLOCKS during nsLayoutStatics::
+            // Initialize on kurono  -  the workers spawn as nsThreads (the KX5: markers) but
+            // the barrier never completes, wedging the chrome main thread inside
+            // nsComponentManagerImpl::Init (KX2:I, CompMgrInit). layout.css.stylo-threads<=1
+            // makes stylo skip the pool entirely (None) and style on the main thread  - 
+            // slower but correct, and it lets startup get past CompMgrInit. (satoru)
+            "lockPref(\"layout.css.stylo-threads\", 1);\n"
             // kill every helper CHILD PROCESS so the parent does everything itself
             // and never blocks on a child-ipc handshake (the e10s launch deadlock
             // that stops the window from mapping). (satoru)
             "lockPref(\"media.rdd-process.enabled\", false);\n"
             "lockPref(\"network.process.enabled\", false);\n"
             "lockPref(\"media.utility-process.enabled\", false);\n"
+            // the FORK SERVER is itself a child process launched early via
+            // GeckoChildProcessHost; kurono can't fork+exec a fresh subprocess, so
+            // LaunchAndWaitForProcessHandle() blocks the main thread forever (the
+            // [stk] stall: main thread futex-waits in WaitForProcessHandle, no child
+            // ever reports a handle). disabling it stops the only remaining startup
+            // child launch so the parent does everything in-process. (satoru)
+            "lockPref(\"dom.ipc.forkserver.enable\", false);\n"
             "lockPref(\"dom.ipc.processCount\", 1);\n"
             "lockPref(\"dom.ipc.processPrelaunch.enabled\", false);\n"
             "lockPref(\"dom.ipc.keepProcessesAlive.web\", 0);\n"
@@ -2003,20 +2050,139 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"datareporting.policy.dataSubmissionEnabled\", false);\n"
             "lockPref(\"browser.contentblocking.database.enabled\", false);\n"
             "lockPref(\"extensions.webextensions.remote\", false);\n"
+            // kurono's in-kernel d-bus has no org.freedesktop.portal.* service; firefox's
+            // nsLookAndFeel sync ReadAll to portal.Settings (theme) never returns -> chrome
+            // stalls after nsWindow::Create, before Show. skip the portal so firefox uses its
+            // built-in defaults instead of a sync d-bus roundtrip that hangs. (satoru)
+            "lockPref(\"widget.use-xdg-desktop-portal.settings\", 0);\n"
+            "lockPref(\"widget.use-xdg-desktop-portal.file-picker\", 0);\n"
+            "lockPref(\"widget.use-xdg-desktop-portal.mime-handler\", 0);\n"
+            "lockPref(\"widget.use-xdg-desktop-portal.location\", 0);\n"
+            "lockPref(\"widget.use-xdg-desktop-portal.open-uri\", 0);\n"
+            // kurono's compositor blits wl_shm only; force dmabuf/vaapi off so the gfx path
+            // stays pure-shm software and never waits on a gbm dmabuf buffer alloc that the
+            // stub gbm device can't complete (140.12 does a dmabuf init the old build didn't). (satoru)
+            "lockPref(\"widget.dmabuf.force-enabled\", false);\n"
+            "lockPref(\"media.ffmpeg.vaapi.enabled\", false);\n"
+            "lockPref(\"media.hardware-video-decoding.enabled\", false);\n"
+            // route chrome-context console + dump() to stderr -> serial so a js-level startup
+            // stall is visible: the main thread spins in js/gc after nsWindow::Create with no
+            // c++ module log to show why. (satoru)
+            "lockPref(\"browser.dom.window.dump.enabled\", true);\n"
+            "lockPref(\"devtools.console.stdout.chrome\", true);\n"
+            // RE-ENABLED baseline jit + native_regexp (satoru): the old build forced
+            // the pure bytecode interpreter because mprotect couldn't make jit code
+            // pages executable (the chrome js spun retrying the failing mprotect(RX)).
+            // now mprotect works correctly (region_owner for worker-thread mprotect,
+            // the smp stale-tlb retry, PROT_EXEC clears PTE_NX), so mprotect(RX) on a
+            // jit code buffer actually makes it executable. baseline jit compiles the
+            // chrome js to native code instead of interpreting it, which is the
+            // dominant startup cost  -  this is what lets the (interpreter-slow) browser
+            // window finish loading in a reasonable time. ion stays OFF (heavier W^X
+            // churn); baseline is enough. (satoru)
+            "lockPref(\"javascript.options.baselinejit\", true);\n"
+            "lockPref(\"javascript.options.ion\", false);\n"
+            "lockPref(\"javascript.options.native_regexp\", true);\n"
+            "lockPref(\"javascript.options.asmjs\", false);\n"
+            "lockPref(\"javascript.options.wasm\", false);\n"
+            "lockPref(\"javascript.options.wasm_baselinejit\", false);\n"
+            "lockPref(\"javascript.options.wasm_optimizingjit\", false);\n"
+            // the chrome-startup stall is a GC/allocator mprotect spin: the vmm probe saw
+            // ONLY nx-set DATA protects (0 exec) on a 2MB stride = jemalloc/gc empty-chunk
+            // decommit+recommit thrash on kurono. keep empty chunks committed + drop the
+            // compacting gc so it stops mprotect-churning; mem.log dumps each gc to stderr
+            // (-> serial) to confirm whether it's thrashing and why. (satoru)
+            "lockPref(\"javascript.options.mem.gc_compacting\", false);\n"
+            "lockPref(\"javascript.options.mem.gc_max_empty_chunk_count\", 10000);\n"
+            "lockPref(\"javascript.options.mem.gc_min_empty_chunk_count\", 10000);\n"
+            "lockPref(\"javascript.options.mem.log\", true);\n"
+            // RE-ENABLED generational + incremental GC (satoru): these were forced
+            // OFF for the old single-core cooperative scheduler to dodge nursery
+            // minor-GC mprotect churn. but non-generational forces EVERY allocation
+            // to be a TENURED chunk alloc, so chrome-JS startup stalled the main
+            // thread in GCRuntime::getOrAllocChunk(StallAndRetry) waiting on the GC
+            // background-alloc thread (the browser-window-open crawl). now that smp
+            // gives the GC helper threads real cores AND mprotect works correctly
+            // (region_owner + stale-tlb fixes), the nursery keeps short-lived
+            // startup objects OUT of tenured chunks (far fewer getOrAllocChunk
+            // stalls) and incremental GC spreads the work  -  startup progresses to
+            // the window instead of crawling. (satoru)
+            // non-generational + non-incremental (satoru): generational GC made the
+            // chrome main STALL in GCRuntime::getOrAllocChunk waiting on the
+            // background nursery-chunk alloc thread (stuck across dumps). the
+            // non-generational path allocates tenured chunks inline and progressed
+            // PAST this to window creation. keep it off + e10s off so startup
+            // advances to the window. (satoru)
+            "lockPref(\"javascript.options.mem.gc_incremental\", false);\n"
+            "lockPref(\"javascript.options.mem.gc_generational\", false);\n"
             // enable gecko module logging via PREFS  -  the env/cmdline MOZ_LOG paths
             // produced nothing in this build, but prefs are confirmed-honored here
             // (dom.ipc.processCount=1 took effect -> exactly 1 content proc). a
             // logging.<module> pref calls LogModule::Get(module)->SetLevel; output
             // goes to stderr -> serial. this is the diagnostic for the content
             // launch handshake. (satoru)
-            "lockPref(\"logging.ForkService\", 5);\n"
-            "lockPref(\"logging.NodeController\", 5);\n"
-            "lockPref(\"logging.ipc\", 5);\n"
-            "lockPref(\"logging.MessageChannel\", 5);\n"
-            "lockPref(\"logging.DataPipe\", 5);\n"
-            "lockPref(\"logging.SharedMemory\", 5);\n"
-            "lockPref(\"logging.config.LOG_FILE\", \"/tmp/mozlog\");\n"
-            "lockPref(\"logging.config.sync\", true);\n";
+            // (satoru) DISABLED these verbose MOZ_LOG modules: gdb on the 140.11
+            // build (matching symbols) showed the main thread Ready-but-crawling, its
+            // whole stack in LogModuleManager::Print -> SprintfAppend during
+            // CompMgrInit -> firefox throttled to a near-halt formatting+writing log
+            // lines on the cooperative scheduler (even to /dev/null, the per-line
+            // overhead starves everything). the KX:/KX2: printf_stderr markers baked
+            // into libxul give the launch+connection trace without that overhead.
+            // re-enable a SINGLE module briefly if a specific MOZ_LOG trace is needed.
+            // "lockPref(\"logging.ForkService\", 5);\n"
+            // "lockPref(\"logging.NodeController\", 5);\n"
+            // "lockPref(\"logging.ipc\", 5);\n"
+            // "lockPref(\"logging.MessageChannel\", 5);\n"
+            // "lockPref(\"logging.DataPipe\", 5);\n"
+            // "lockPref(\"logging.SharedMemory\", 5);\n"
+            // (satoru) discard the debug-log flood to /dev/null. the baked debug
+            // logging writev's every line -> /tmp/mozlog -> the kernel [mozw] serial
+            // dump (~ms per line at 115200 baud); that writev is a ring-0 syscall and
+            // the timer preempt only fires on ring-3, so it starves the in-process
+            // software-webrender compositor. firefox thus opens its window + reaches
+            // browser-delayed-startup-finished but the compositor never gets cpu to
+            // paint/commit. /dev/null makes the writes ~free so the compositor runs
+            // and the window actually paints. (satoru)
+            "lockPref(\"logging.config.LOG_FILE\", \"/dev/null\");\n"
+            "lockPref(\"logging.config.sync\", true);\n"
+            // kurono has no working outbound network for firefox; the remote
+            // startup services (RemoteSettings sync, region lookup, Normandy,
+            // safebrowsing, telemetry, captive-portal, connectivity) then retry
+            // in tight loops and SATURATE all cores, starving the compositor so
+            // the browser window never gets cpu to paint. hard-disable them so
+            // startup settles and the first frame renders. (satoru)
+            "lockPref(\"network.online\", true);\n"
+            "lockPref(\"browser.region.update.enabled\", false);\n"
+            "lockPref(\"browser.region.network.url\", \"\");\n"
+            "lockPref(\"services.settings.server\", \"\");\n"
+            "lockPref(\"app.normandy.enabled\", false);\n"
+            "lockPref(\"app.normandy.api_url\", \"\");\n"
+            "lockPref(\"app.update.enabled\", false);\n"
+            "lockPref(\"browser.safebrowsing.malware.enabled\", false);\n"
+            "lockPref(\"browser.safebrowsing.phishing.enabled\", false);\n"
+            "lockPref(\"browser.safebrowsing.downloads.enabled\", false);\n"
+            "lockPref(\"browser.safebrowsing.blockedURIs.enabled\", false);\n"
+            "lockPref(\"network.connectivity-service.enabled\", false);\n"
+            "lockPref(\"captivedetect.canonicalURL\", \"\");\n"
+            "lockPref(\"network.captive-portal-service.enabled\", false);\n"
+            "lockPref(\"datareporting.healthreport.uploadEnabled\", false);\n"
+            "lockPref(\"toolkit.telemetry.server\", \"\");\n"
+            "lockPref(\"browser.newtabpage.activity-stream.feeds.telemetry\", false);\n"
+            "lockPref(\"browser.newtabpage.activity-stream.telemetry\", false);\n"
+            "lockPref(\"browser.discovery.enabled\", false);\n"
+            "lockPref(\"browser.ping-centre.telemetry\", false);\n"
+            "lockPref(\"extensions.getAddons.cache.enabled\", false);\n"
+            "lockPref(\"extensions.systemAddon.update.enabled\", false);\n"
+            "lockPref(\"media.gmp-provider.enabled\", false);\n"
+            "lockPref(\"network.trr.mode\", 5);\n"
+            "lockPref(\"dom.push.enabled\", false);\n"
+            "lockPref(\"browser.contentblocking.report.hide_vpn_banner\", true);\n"
+            // open a blank window fast; skip session restore + about:welcome. (satoru)
+            "lockPref(\"browser.startup.homepage\", \"about:blank\");\n"
+            "lockPref(\"browser.startup.page\", 0);\n"
+            "lockPref(\"browser.aboutwelcome.enabled\", false);\n"
+            "lockPref(\"browser.sessionstore.resume_from_crash\", false);\n"
+            "lockPref(\"browser.shell.checkDefaultBrowser\", false);\n";
         KVFS::WriteFile("/apps/firefox/firefox.cfg", cfg, (uint32_t)__builtin_strlen(cfg));
         SerialLogger::Log("[ffcfg] wrote autoconfig (all helper child procs disabled)\r\n");
     }
@@ -2024,8 +2190,120 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     Process* proc = Scheduler::CreateUserProcess("firefox", 0, 1);
     if (!proc) { KernelHeap::Free(image); p = sappend(out, p, mx, "firefox: CreateUserProcess failed.\n"); return p; }
 
-    const char* av[] = { "/apps/firefox/firefox", url, nullptr };
-    if (!url) av[1] = nullptr;
+    // profile: without an explicit -profile, gecko tries to build a default
+    // profile from ~/.mozilla/firefox/profiles.ini; on kurono that resolution
+    // fails (no lock / no writable default) and firefox paints its "Profile
+    // Missing" error page instead of a browser window. give it a pre-created,
+    // writable profile dir + -profile so it skips the profile manager entirely
+    // and opens a normal window. seed prefs.js so it goes straight to the URL
+    // with no first-run/EULA/what's-new interception. (satoru)
+    // profile via the DEFAULT-profile mechanism (a profiles.ini in the standard
+    // location), NOT -profile: the -profile arg makes gecko realpath() the path
+    // (XRE_GetFileFromPath), and a succeeding realpath on kurono pushes early
+    // startup into a parking_lot deadlock. the default path reads profiles.ini and
+    // selects Profile0 with no realpath. pre-create the app-data + cache dirs (Init
+    // needs both) and the profile dir, seed prefs.js to skip first-run screens, and
+    // write profiles.ini + installs.ini so Profile0 is the auto-selected default.
+    // all owned by the firefox uid. (satoru)
+    const char* prof_dirs[] = {
+        "/home/user/.mozilla",
+        "/home/user/.mozilla/firefox",
+        "/home/user/.mozilla/firefox/kurono.default",
+        "/home/user/.cache",
+        "/home/user/.cache/mozilla",
+        "/home/user/.cache/mozilla/firefox",
+        "/home/user/.cache/mozilla/firefox/kurono.default",
+        // standard profile subdirs firefox's startup workers (IOUtils / PromiseWorker
+        // / places / storage) enumerate at chrome load. a missing one throws an
+        // uncaught "I/O error NotFound" that breaks the awaiting promise chain, so
+        // browser.xhtml never finishes and the toplevel paints black. create them all
+        // up front so the chrome init completes. (satoru)
+        "/home/user/.mozilla/firefox/kurono.default/thumbnails",
+        "/home/user/.mozilla/firefox/kurono.default/sessionstore-backups",
+        "/home/user/.mozilla/firefox/kurono.default/bookmarkbackups",
+        "/home/user/.mozilla/firefox/kurono.default/crashes",
+        "/home/user/.mozilla/firefox/kurono.default/crashes/events",
+        "/home/user/.mozilla/firefox/kurono.default/minidumps",
+        "/home/user/.mozilla/firefox/kurono.default/saved-telemetry-pings",
+        "/home/user/.mozilla/firefox/kurono.default/datareporting",
+        "/home/user/.mozilla/firefox/kurono.default/security_state",
+        "/home/user/.mozilla/firefox/kurono.default/settings",
+        "/home/user/.mozilla/firefox/kurono.default/storage",
+        "/home/user/.mozilla/firefox/kurono.default/storage/default",
+        "/home/user/.mozilla/firefox/kurono.default/storage/permanent",
+        "/home/user/.mozilla/firefox/kurono.default/storage/temporary",
+        "/home/user/.mozilla/firefox/kurono.default/storage/to-be-removed",
+        "/home/user/.cache/mozilla/firefox/kurono.default/startupCache",
+        "/home/user/.cache/mozilla/firefox/kurono.default/cache2",
+        "/home/user/.cache/mozilla/firefox/kurono.default/cache2/entries",
+        nullptr
+    };
+    for (int i = 0; prof_dirs[i]; i++) { KVFS::Mkdirs(prof_dirs[i]); KVFS::Chown(prof_dirs[i], 1000, 1000); }
+    {
+        const char* prefs =
+            "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n"
+            "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n"
+            "user_pref(\"startup.homepage_welcome_url\", \"\");\n"
+            "user_pref(\"startup.homepage_welcome_url.additional\", \"\");\n"
+            "user_pref(\"browser.aboutwelcome.enabled\", false);\n"
+            "user_pref(\"trailhead.firstrun.didSeeAboutWelcome\", true);\n"
+            "user_pref(\"toolkit.startup.max_resumed_crashes\", -1);\n"
+            "user_pref(\"browser.sessionstore.resume_from_crash\", false);\n"
+            "user_pref(\"datareporting.policy.firstRunURL\", \"\");\n"
+            // trim startup service dependencies that hard-fail on kurono and can
+            // stall the chrome paint: a11y needs a dbus proxy (org.a11y.Bus, absent),
+            // login-manager pulls in crypto-SDR/NSS softoken (ServiceManager::GetService
+            // failure), places/thumbnails maintenance hammers IOUtils. disabling them
+            // lets browser.xhtml finish loading and paint. (satoru)
+            "user_pref(\"accessibility.force_disabled\", 1);\n"
+            "user_pref(\"signon.rememberSignons\", false);\n"
+            "user_pref(\"signon.autofillForms\", false);\n"
+            "user_pref(\"browser.pagethumbnails.capturing_disabled\", true);\n"
+            "user_pref(\"browser.newtabpage.enabled\", false);\n"
+            "user_pref(\"browser.newtabpage.activity-stream.feeds.telemetry\", false);\n"
+            "user_pref(\"browser.newtabpage.activity-stream.telemetry\", false);\n"
+            "user_pref(\"browser.startup.page\", 0);\n"
+            "user_pref(\"toolkit.telemetry.enabled\", false);\n"
+            "user_pref(\"toolkit.telemetry.unified\", false);\n"
+            "user_pref(\"datareporting.healthreport.uploadEnabled\", false);\n"
+            "user_pref(\"places.database.lastMaintenance\", 9999999999);\n";
+        KVFS::WriteFile("/home/user/.mozilla/firefox/kurono.default/prefs.js",
+                        prefs, (uint32_t)__builtin_strlen(prefs));
+        KVFS::Chown("/home/user/.mozilla/firefox/kurono.default/prefs.js", 1000, 1000);
+        // profiles.ini: Profile0 is the relative, default profile. (satoru)
+        const char* pini =
+            "[Install4F96D1932A9F858E]\n"
+            "Default=kurono.default\n"
+            "Locked=1\n"
+            "\n"
+            "[Profile0]\n"
+            "Name=default\n"
+            "IsRelative=1\n"
+            "Path=kurono.default\n"
+            "Default=1\n"
+            "\n"
+            "[General]\n"
+            "StartWithLastProfile=1\n"
+            "Version=2\n";
+        KVFS::WriteFile("/home/user/.mozilla/firefox/profiles.ini",
+                        pini, (uint32_t)__builtin_strlen(pini));
+        KVFS::Chown("/home/user/.mozilla/firefox/profiles.ini", 1000, 1000);
+        // installs.ini: pin the install's default profile so gecko does not try to
+        // create a fresh dedicated one. (satoru)
+        const char* iini =
+            "[4F96D1932A9F858E]\n"
+            "Default=kurono.default\n"
+            "Locked=1\n";
+        KVFS::WriteFile("/home/user/.mozilla/firefox/installs.ini",
+                        iini, (uint32_t)__builtin_strlen(iini));
+        KVFS::Chown("/home/user/.mozilla/firefox/installs.ini", 1000, 1000);
+    }
+    // default to about:blank when autorun with no url, so firefox opens a real
+    // (blank) browser window that proves the full chrome + content paint path. (satoru)
+    const char* real_url = url ? url : "about:blank";
+
+    const char* av[] = { "/apps/firefox/firefox", "-no-remote",
+                         real_url, nullptr };
     const char* envp[] = {
         "HOME=/home/user", "USER=user",
         // /apps/firefox first: gecko's dependent libs (libxul.so etc.) live next
@@ -2033,7 +2311,6 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "LD_LIBRARY_PATH=/apps/firefox:/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
         "XDG_RUNTIME_DIR=/system/run/user/1000",
         "WAYLAND_DISPLAY=wayland-0",
-        "WAYLAND_DEBUG=1",   // wayland protocol trace (firefox bring-up; drop for production) (satoru)
         // xkbcommon data root: we unpacked the xkeyboard-config tree here above,
         // so gdk builds its default keymap instead of aborting at seat init. (satoru)
         "XKB_CONFIG_ROOT=/apps/firefox/xkb",
@@ -2044,6 +2321,25 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "MOZ_ENABLE_WAYLAND=1", "GDK_BACKEND=wayland",
         "LIBGL_ALWAYS_SOFTWARE=1", "DISPLAY=:0",
         "FONTCONFIG_PATH=/system/fonts",
+        // (satoru) force ALL gecko MOZ_LOG modules OFF. gdb on the 140.11 build (with
+        // matching symbols) showed the main thread Ready-but-crawling, its entire
+        // stack in LogModuleManager::Print -> SprintfAppend during CompMgrInit: many
+        // default modules (LookAndFeel/ObserverService/nsThread/nsZipArchive...) were
+        // logging at Debug and the per-line format+write to the 115200-baud serial on
+        // the cooperative scheduler throttled firefox to a near-halt (looked like a
+        // CompMgrInit hang). all:0 generates zero log lines -> no throttle. the KX:/
+        // KX2: printf_stderr markers are NOT MOZ_LOG-gated so they still print. also
+        // dropped FC_DEBUG=1408 (stale fontconfig spew, fonts long since fixed). (satoru)
+        "MOZ_LOG=all:0",
+        // redirect MOZ_LOG output to /dev/null via the ENV (read at logging init,
+        // BEFORE the firefox.cfg logging.config.LOG_FILE pref which applies too late
+        //  -  the CompMgrInit flood happens pre-profile). default MOZ_LOG output is
+        // stderr->serial, and each line is an ~8.7ms ring-0 UART busy-wait at 115200
+        // baud (timer preempt only fires on ring-3, so the busy-wait monopolizes the
+        // cpu); the component-registration log flood thus throttled firefox to a
+        // near-halt at CompMgrInit. /dev/null writes are ~free so it progresses. the
+        // KX:/KX2: printf_stderr markers still reach the serial (few, not MOZ_LOG). (satoru)
+        "MOZ_LOG_FILE=/dev/null",
         // gecko was built --with-system-icu against alpine's STUB libicudata.so
         // (9KB, no tables); the real unicode data is a separate icudt78l.dat that we
         // bundled into the package at /apps/firefox/. point ICU at that dir so
@@ -2067,17 +2363,43 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         // root in a regular user's session is not supported") and exits 1. this
         // is gecko's official override for exactly that case. (satoru)
         "MOZ_ALLOW_ROOT=1",
-        // kurono's compositor only blits wl_shm (no dmabuf/egl); force gecko onto
-        // the software/basic path so it commits shm buffers, never egl/webrender.
+        // kurono's compositor only blits wl_shm (no dmabuf/egl). firefox 140 is
+        // webrender-only, so we can't avoid WR  -  instead force its SOFTWARE backend
+        // (cpu rasterizer, MOZ_ACCELERATED=0 + WEBRENDER_SOFTWARE=1), which commits
+        // plain shm buffers and needs no GL. MOZ_WEBRENDER=1 force-enables WR past
+        // the gfxInfo blocklist that the (disabled) glxtest leaves marking the GPU
+        // unusable; =0 would force WR OFF and leave no compositor at all -> #PF.
         // (the firefox.env file carries the same set but this inline envp is the
         // one actually handed to the user stack here.) (satoru)
-        "MOZ_WEBRENDER=0", "WEBRENDER_SOFTWARE=1", "MOZ_ACCELERATED=0",
+        "MOZ_WEBRENDER=1", "WEBRENDER_SOFTWARE=1", "MOZ_ACCELERATED=0",
         "MOZ_X11_EGL=0", "MOZ_DISABLE_GPU_SANDBOX=1",
         "GALLIUM_DRIVER=llvmpipe",
         // disable the fork server: content procs then spawn via plain fork+exec
         // (covered by the socketpair refcount fix) instead of the fork-server
         // SCM_RIGHTS+fork hop that the launch handshake deadlocks on. (satoru)
         "MOZ_ENABLE_FORKSERVER=0",
+        // (satoru) force the socket(network) process OFF. it's the only child proc
+        // firefox still tries to spawn at startup; nsIOService::UseSocketProcess()
+        // honours this env BEFORE its cached pref check (the cfg lockPref loads too
+        // late  -  sUseSocketProcessChecked caches true first). its launch task parks
+        // the IPC i/o thread (kurono can't cleanly fork+exec a child) and wedges the
+        // chrome main at GeckoChildProcessHost::AsyncLaunch. (satoru)
+        "MOZ_DISABLE_SOCKET_PROCESS=1",
+        // THE e10s kill switch. fx140 IGNORES browser.tabs.remote.autostart=false
+        // (it forces e10s on), so the first browser tab's BrowsingContext tried to
+        // launch a CONTENT process via vfork+execve and the chrome main wedged in
+        // ContentParent::WaitForLaunchSync / GeckoChildProcessHost::
+        // WaitForProcessHandle forever (kurono can't complete the content-process
+        // ipc handshake  -  the original content-launch deadlock). BrowserTabsRemote-
+        // Autostart() honours MOZ_FORCE_DISABLE_E10S=="1" on a non-official build
+        // (allowDisablingE10s=true) and turns e10s OFF, so tabs render IN the parent
+        // process and no content process is ever launched -> the window paints. (satoru)
+        "MOZ_FORCE_DISABLE_E10S=1",
+        // use the profiles.ini Profile0 (kurono.default, with our first-run-
+        // suppressing prefs.js) directly instead of gecko's per-install
+        // "dedicated" profile, which is a fresh random dir each boot that ignores
+        // our seeded prefs. (satoru)
+        "MOZ_LEGACY_PROFILES=1",
         nullptr
     };
 

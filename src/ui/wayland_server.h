@@ -71,6 +71,7 @@ namespace WaylandServer {
         XDG_TOPLEVEL          = 18,
         WL_CALLBACK           = 19,
         WL_SHM_POOL           = 20,
+        WL_SUBSURFACE         = 21,
     };
 
     struct DamageRect {
@@ -84,6 +85,8 @@ namespace WaylandServer {
         uint16_t version;
         bool     in_use;
         uint32_t parent_surface_id;
+        uint32_t subsurface_parent;   // for WL_SUBSURFACE: the parent wl_surface id (satoru)
+        int32_t  subsurface_x, subsurface_y;  // wl_subsurface.set_position offset in parent (satoru)
         // For wl_surface objects: the bound Kurono WMWindow handle.
         void*    wm_window;
         int      width, height;
