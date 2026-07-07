@@ -1,5 +1,6 @@
 #include "wayland_server.h"
 #include "../net/unix_socket.h"
+#include "xkb_keymap_us.h"        // compiled us keymap for wl_keyboard.keymap (satoru)
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
 #include "../kernel/time.h"
@@ -597,8 +598,8 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
     size_t last = buf->buf_offset
                 + (size_t)(dy + dh - 1) * buf->buf_stride
                 + (size_t)(dx + dw) * 4u;
-    if (buf->buf_stride < (uint32_t)(dx + dw) * 4u) return;
-    if (last > psize) return;
+    if (buf->buf_stride < (uint32_t)(dx + dw) * 4u) return;   // malformed stride (satoru)
+    if (last > psize) return;                                 // out-of-bounds pool read (satoru)
 
     // effective alpha = surface alpha combined with the bridged window's
     // wm opacity, so WindowManager::SetAlpha modulates client content too.
@@ -1287,11 +1288,32 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 uint32_t kid = get32(args);
                 if (!register_obj(c, kid, WL_KEYBOARD, obj->version)) return;
                 c->keyboard_id = kid;
+                // wl_keyboard.keymap (opcode 0): format=1 (XKB_V1) + an fd +
+                // size. gdk/firefox mmap the fd and compile the keymap to
+                // translate the evdev codes wl_keyboard.key carries  -  without
+                // it typing produces nothing. the fd travels as ancillary via
+                // KernelInjectMsg: the recvmsg side re-wraps the passed shm
+                // backing (the embedded compiled us keymap) as a real memfd
+                // the client can mmap. flush queued events first so the cmsg
+                // frame lines up with THIS message. (satoru)
+                {
+                    tx_flush(c);
+                    uint8_t km[16];
+                    put32(km + 0, kid);
+                    put16(km + 4, 0);                       // wl_keyboard.keymap
+                    put16(km + 6, 16);                      // header+8 payload
+                    put32(km + 8, 1);                       // format XKB_V1
+                    put32(km + 12, g_xkb_keymap_us_len);    // size incl. nul
+                    UnixSocket::ControlMsg kcm = {};
+                    kcm.passed_fd_count   = 1;
+                    kcm.passed_fds[0]     = 1;              // sender-fd slot, unused (satoru)
+                    kcm.passed_shm_base[0] = (uint64_t)(uintptr_t)g_xkb_keymap_us;
+                    kcm.passed_shm_size[0] = g_xkb_keymap_us_len;
+                    if (UnixSocket::KernelInjectMsg(c->sd, km, 16, &kcm) < 0)
+                        c->fatal = true;
+                }
                 // wl_keyboard.repeat_info (opcode 4, v4+): rate, delay. a
-                // sane default keeps clients that gate on it happy. no
-                // keymap event is sent because that requires passing an fd
-                // via ancillary data which the in-kernel tx path cannot do;
-                // key events still carry raw linux evdev codes. (satoru)
+                // sane default keeps clients that gate on it happy. (satoru)
                 if (obj->version >= 4) {
                     uint8_t ri[8];
                     put32(ri + 0, 25);            // 25 keys/sec

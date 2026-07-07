@@ -234,7 +234,11 @@ static inline bool ui_activity_active() {
     uint32_t displayed_fps = 0;
     uint32_t last_render_ms = 0;
     uint32_t last_activity_ms = Timer::GetRealMs();   // last input/animation (satoru)
-    uint32_t autorun_target_ms = Timer::GetTicks() + 4000u;
+    // autorun grace: 2s halves the old 4s dead time while still comfortably
+    // past session init. (a 1s + rendered-frame gate variant was flaky: an
+    // idle dirty-driven desktop can render too few frames to ever pass the
+    // gate.) (satoru)
+    uint32_t autorun_target_ms = Timer::GetTicks() + 2000u;
 
     while (true) {
         // stamp the graphics-loop heartbeat for the watchdog before any work,

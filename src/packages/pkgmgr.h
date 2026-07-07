@@ -60,6 +60,11 @@ public:
     // tree) into a kvfs base dir. returns true if any entry was written. (satoru)
     static bool ExtractTar(const char* archive, int archive_len, const char* base_dir);
 
+    // toggled by the kpkg-daemon worker around an install so the inline UI pumps
+    // in the download/extract path are suppressed (GUIProcess renders the desktop
+    // on demand instead); the synchronous install path leaves it off. (satoru)
+    static void SetBackgroundInstall(bool on);
+
     // shell integration
     static int cmd_install(void* sh, int argc, const char** argv, char* out, int mx);
     static int cmd_remove(void* sh, int argc, const char** argv, char* out, int mx);

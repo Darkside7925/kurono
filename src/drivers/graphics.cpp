@@ -244,8 +244,10 @@ bool Graphics::clipping_enabled = false;
 Graphics::ClipSave Graphics::clip_stack[16] = {};
 int Graphics::clip_sp = 0;
 
-Graphics::DirtyRegion Graphics::dirty_regions[16];
+Graphics::DirtyRegion Graphics::dirty_regions[Graphics::DIRTY_REGION_CAP];
 int Graphics::dirty_count = 0;
+bool Graphics::full_screen_dirty = false;
+uint64_t Graphics::dirty_area_total = 0;
 
 // Global UI dirty signal  -  see graphics.h. volatile: written from input /
 // app / animation paths (potentially other kernel processes) and read by
@@ -293,7 +295,7 @@ void Graphics::Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pi
     draw_stats.target_fps = 60;
     draw_stats.vsync_enabled = false;
 
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < DIRTY_REGION_CAP; i++) {
         dirty_regions[i].active = false;
     }
     dirty_count = 0;
@@ -616,7 +618,7 @@ void Graphics::SwapBuffers() {
     // re-tonemap each frame.
     if (filter_active) {
         bool any_dirty = false;
-        for (int i = 0; i < dirty_count && i < 16; i++) {
+        for (int i = 0; i < dirty_count && i < DIRTY_REGION_CAP; i++) {
             if (dirty_regions[i].active) { any_dirty = true; break; }
         }
         if (!any_dirty || dirty_count == 0) {
@@ -653,7 +655,7 @@ void Graphics::SwapBuffers() {
     // partial swap when dirty area is small enough; otherwise full-frame.
     // 60 % threshold trades per-rect copy overhead vs cache locality of a
     // single contiguous blit.
-    if (dirty_count > 0 && dirty_count <= 16) {
+    if (dirty_count > 0 && dirty_count <= DIRTY_REGION_CAP) {
         uint64_t dirty_pixels = 0;
         int active_rects = 0;
         for (int i = 0; i < dirty_count; i++) {
@@ -955,42 +957,56 @@ void Graphics::MarkDirty(int x, int y, int w, int h) {
     if (y + h > (int)fb_height) h = (int)fb_height - y;
     if (w <= 0 || h <= 0) return;
 
-    if (dirty_count < 16) {
+    // already collapsed to full-screen for this frame  -  nothing more to track. (satoru)
+    if (full_screen_dirty) return;
+
+    // fast path: there's still room, just record the rect. o(1)  -  the running
+    // area sum is kept incrementally so small-rect frames stay cheap. (satoru)
+    if (dirty_count < DIRTY_REGION_CAP) {
         DirtyRegion& region = dirty_regions[dirty_count++];
         region.x = x; region.y = y; region.w = w; region.h = h;
         region.active = true;
+
+        // accumulate damaged area in 64-bit so it can never wrap; w/h are already
+        // clipped to the fb above, so each term is non-negative. (satoru)
+        dirty_area_total += (uint64_t)w * (uint64_t)h;
+
+        // if accumulated damage already covers most of the screen, a per-rect
+        // partial blit buys nothing over one contiguous copy  -  collapse to a
+        // single full-screen damage now so the decision is deterministic, not an
+        // accident of coalescing order. (satoru)
+        uint64_t total = (uint64_t)fb_width * (uint64_t)fb_height;
+        if (total > 0 && dirty_area_total >= (total * 3 / 4)) {
+            MarkFullScreenDirty();
+        }
         return;
     }
-    // list full  -  coalesce the new rect into the existing region with
-    // smallest growth so we never silently drop damage.
-    int best = 0;
-    int64_t best_growth = -1;
-    for (int i = 0; i < 16; i++) {
-        DirtyRegion& r = dirty_regions[i];
-        int nx0 = r.x < x ? r.x : x;
-        int ny0 = r.y < y ? r.y : y;
-        int nx1 = (r.x + r.w) > (x + w) ? (r.x + r.w) : (x + w);
-        int ny1 = (r.y + r.h) > (y + h) ? (r.y + r.h) : (y + h);
-        int64_t cur = (int64_t)r.w * r.h;
-        int64_t nu  = (int64_t)(nx1 - nx0) * (ny1 - ny0);
-        int64_t growth = nu - cur;
-        if (best_growth < 0 || growth < best_growth) {
-            best_growth = growth;
-            best = i;
-        }
-    }
-    DirtyRegion& r = dirty_regions[best];
-    int nx0 = r.x < x ? r.x : x;
-    int ny0 = r.y < y ? r.y : y;
-    int nx1 = (r.x + r.w) > (x + w) ? (r.x + r.w) : (x + w);
-    int ny1 = (r.y + r.h) > (y + h) ? (r.y + r.h) : (y + h);
-    r.x = nx0; r.y = ny0; r.w = nx1 - nx0; r.h = ny1 - ny0;
-    r.active = true;
+
+    // list is full. rather than fragile minimum-area coalescing (which can
+    // silently grow one rect to near-fullscreen and trip the partial-swap
+    // threshold anyway), deterministically collapse the whole frame to a single
+    // full-screen damage rect. this is the cheap, predictable thing to do once
+    // the screen is this fragmented. (satoru)
+    MarkFullScreenDirty();
+}
+
+void Graphics::MarkFullScreenDirty() {
+    // one rect covering the whole framebuffer; latches until ClearDirtyRegions. (satoru)
+    for (int i = 0; i < DIRTY_REGION_CAP; i++) dirty_regions[i].active = false;
+    dirty_regions[0].x = 0;
+    dirty_regions[0].y = 0;
+    dirty_regions[0].w = (int)fb_width;
+    dirty_regions[0].h = (int)fb_height;
+    dirty_regions[0].active = true;
+    dirty_count = 1;
+    full_screen_dirty = true;
 }
 
 void Graphics::ClearDirtyRegions() {
     dirty_count = 0;
-    for (int i = 0; i < 16; i++) {
+    full_screen_dirty = false;
+    dirty_area_total = 0;
+    for (int i = 0; i < DIRTY_REGION_CAP; i++) {
         dirty_regions[i].active = false;
     }
 }
@@ -1018,6 +1034,11 @@ void Graphics::ClipRect(int& x, int& y, int& w, int& h) {
     
     w = right - x;
     h = bottom - y;
+    // a rect that lies fully outside the clip yields right<x / bottom<y here; clamp
+    // so callers don't get a negative w/h that their unsigned compares read as a
+    // huge extent and draw far past the clip. (satoru)
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
 }
 
 void Graphics::SetClipRect(int x, int y, int w, int h) {

@@ -167,7 +167,7 @@ USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_O
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
            -fno-rtti -fno-stack-protector -fno-use-cxa-atexit \
-           -mno-red-zone -m64 -mcmodel=large -fno-pie -I$(SRC)
+           -mno-red-zone -m64 -mcmodel=large -fno-pie -I$(SRC) -g
 
 ASFLAGS  = -f elf64
 LDFLAGS  = -T $(SRC)/boot/kurono_linker.ld -nostdlib -no-pie -lgcc

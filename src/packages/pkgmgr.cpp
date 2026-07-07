@@ -509,6 +509,16 @@ static void phttp_log_num(const char* msg, int n) {
     SerialLogger::Log("\r\n");
 }
 
+// set true while the kpkg-daemon WORKER process runs an install: it suppresses
+// the inline PumpUI() calls in the download/extract paths below. the separate
+// GUIProcess already renders the desktop + cursor on demand, so a second
+// full-screen blit driven from the worker thread just competes for the one
+// active core and stalls its network recv (the tcp window keeps closing),
+// crawling the download. the synchronous (main-loop) install path leaves this
+// false and keeps pumping, because there it IS the only thing that can. (satoru)
+static volatile bool g_kpkg_bg_install = false;
+void PackageManager::SetBackgroundInstall(bool on) { g_kpkg_bg_install = on; }
+
 static bool phttp_get(const char* host, const char* path,
                       char* body_out, int body_max,
                       int* status_out, int* body_len_out) {
@@ -619,7 +629,7 @@ static bool phttp_get(const char* host, const char* path,
             // pump ui at ~10 fps, not per recv iteration: a per-chunk full-screen
             // repaint throttled downloads to the ui frame rate. (satoru)
             if ((uint32_t)(Timer::GetTicks() - last_pump_ms) >= 100u) {
-                KuronoShell::PumpUI();
+                if (!g_kpkg_bg_install) KuronoShell::PumpUI();
                 last_pump_ms = Timer::GetTicks();
             }
             int got = TCPStack::Recv(sock, response + total, PKG_HTTP_BUFFER_MAX - total);
@@ -632,7 +642,7 @@ static bool phttp_get(const char* host, const char* path,
                     break;
                 }
                 if ((uint32_t)(Timer::GetTicks() - last_pump_ms) >= 100u) {
-                    KuronoShell::PumpUI();
+                    if (!g_kpkg_bg_install) KuronoShell::PumpUI();
                     last_pump_ms = Timer::GetTicks();
                 }
                 /* ~1ms throttle: PIT-polled wait so this loop doesn't
@@ -883,7 +893,7 @@ static int jforeach_object(const char* arr_start, void (*cb)(const char* obj_sta
     p++;
     int count = 0;
     while (*p) {
-        KuronoShell::PumpUI();
+        if (!g_kpkg_bg_install) KuronoShell::PumpUI();
         p = jskip_ws(p);
         if (*p == ']') break;
         if (*p == ',') { p++; continue; }
@@ -941,7 +951,7 @@ static bool ustar_extract(const char* archive, int archive_len, const char* base
     int pos = 0;
     bool any = false;
     while (pos + 512 <= archive_len) {
-        KuronoShell::PumpUI();
+        if (!g_kpkg_bg_install) KuronoShell::PumpUI();
         const char* hdr = archive + pos;
         // empty block = end
         bool empty = true;
@@ -1251,8 +1261,10 @@ static const char* FF_TAR_PATH    = "/packages/firefox/firefox-140.11.0esr-full2
 // the real origin. a dev-only slirp mirror (10.0.2.100) may be swapped in here
 // UNCOMMITTED while iterating, but every commit ships this real ip. (satoru)
 static const uint32_t FF_ORIGIN_IP =
-    (((uint32_t)92 << 24) | ((uint32_t)5 << 16) |
-     ((uint32_t)63 << 8) | (uint32_t)184);
+    // DEV-ONLY (uncommitted): local tap0 mirror at 10.0.2.2 for fast iteration.
+    // real origin is 92.5.63.184 -- restore before committing. (satoru)
+    (((uint32_t)10 << 24) | ((uint32_t)0 << 16) |
+     ((uint32_t)2 << 8) | (uint32_t)2);
 
 // remap a tar entry name ("firefox/lib/libxul.so", "firefox/firefox", or a
 // bare "firefox/") to an absolute kvfs path under /apps/firefox. returns false
@@ -1468,7 +1480,7 @@ static bool ff_stream_install() {
         // frame rate (~0.5 mb/s regardless of link speed). gating it lets recv
         // run at network/extract speed while the progress ui still updates. (satoru)
         if ((uint32_t)(Timer::GetTicks() - last_pump_ms) >= 100u) {
-            KuronoShell::PumpUI();
+            if (!g_kpkg_bg_install) KuronoShell::PumpUI();
             last_pump_ms = Timer::GetTicks();
         }
         // byte-progress to serial so a headless run shows download liveness.
@@ -1776,7 +1788,7 @@ int PackageManager::ParseRepositoryManifest(const char* manifest) {
 
     int pos = 0;
     while (manifest[pos]) {
-        KuronoShell::PumpUI();
+        if (!g_kpkg_bg_install) KuronoShell::PumpUI();
         char line[256];
         int lp = 0;
         while (manifest[pos] && manifest[pos] != '\n' && lp < (int)sizeof(line) - 1) {
@@ -1820,6 +1832,26 @@ void PackageManager::Init() {
 }
 
 bool PackageManager::Install(const char* name) {
+    // firefox ships as a ~235 mb tar that must be STREAMED (the generic buffered
+    // path below caps at 16 mb), then finalized (launcher symlinks + deps
+    // manifest) and registered. route it here so non-shell callers -- notably the
+    // kpkg-daemon worker -- install it correctly too, not just `kpkg install`.
+    // without this the daemon pulled a truncated 16 mb firefox and launching it
+    // faulted (#UD). (satoru)
+    if (peq(name, "firefox") || peq(name, "firefox-esr")) {
+        if (!ff_stream_install()) return false;
+        ff_finalize_install();
+        Package* fp = FindOrCreate("firefox");
+        if (fp) {
+            pcpy(fp->version, "140.11.0esr", (int)sizeof(fp->version));
+            pcpy(fp->latest_version, "140.11.0esr", (int)sizeof(fp->latest_version));
+            pcpy(fp->description, "Firefox 140.11.0esr (musl/Wayland)", PKG_MAX_DESC);
+            pcpy(fp->category, "apps", (int)sizeof(fp->category));
+            fp->state = PKG_INSTALLED;
+            pregister_installed(fp);
+        }
+        return true;
+    }
     Package* pkg = Find(name);
     if (!pkg) {
         if (!SyncRepository()) return false;
@@ -1972,7 +2004,7 @@ bool PackageManager::UpdateAll() {
     if (!SyncRepository()) return false;
     bool ok = true;
     for (int i = 0; i < package_count; i++) {
-        KuronoShell::PumpUI();
+        if (!g_kpkg_bg_install) KuronoShell::PumpUI();
         if (packages[i].state == PKG_INSTALLED &&
             packages[i].latest_version[0] &&
             !peq(packages[i].version, packages[i].latest_version)) {

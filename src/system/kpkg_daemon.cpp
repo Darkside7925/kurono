@@ -67,8 +67,12 @@ void set_status(JobState st, const char* pkg, int pct, const char* msg) {
             // the real work. this blocks the WORKER (not the gui) for the whole
             // download+extract. progress granularity inside Install is coarse
             // (pkgmgr emits its own [kpkg] received N bytes lines), so we report
-            // the phase transitions here. (satoru)
+            // the phase transitions here. mark it a background install so pkgmgr
+            // suppresses its inline UI pumps -- GUIProcess renders the desktop on
+            // demand, and a worker-driven blit would only stall this recv. (satoru)
+            PackageManager::SetBackgroundInstall(true);
             bool ok = PackageManager::Install(pkg);
+            PackageManager::SetBackgroundInstall(false);
 
             if (ok) {
                 set_status(KPKG_DONE, pkg, 100, "install complete");
