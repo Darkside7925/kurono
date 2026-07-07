@@ -42,6 +42,32 @@ static inline void tcp_ring_push(NetSocket* s, const uint8_t* src, int n) {
     s->rx_tail = (tail + n) % TCP_RX_BUFSIZE;
     s->rx_count += n;
 }
+
+// pop n bytes from the rx ring into dst (or discard when dst is null),
+// wrap-aware, advancing rx_head. caller has verified rx_count >= n. the udp
+// datagram-framing path uses this to pop one record at a time. (satoru)
+static inline void tcp_ring_pop(NetSocket* s, uint8_t* dst, int n) {
+    if (n <= 0) return;
+    int head = s->rx_head;
+    int first = TCP_RX_BUFSIZE - head;
+    if (first > n) first = n;
+    if (dst) memcpy(dst, s->rx_buf + head, (size_t)first);
+    int rem = n - first;
+    if (rem > 0 && dst) memcpy(dst + first, s->rx_buf, (size_t)rem);
+    s->rx_head = (head + n) % TCP_RX_BUFSIZE;
+    s->rx_count -= n;
+}
+
+// udp datagram record header pushed ahead of each payload in the rx ring so
+// RecvFrom returns DISTINCT datagrams with their true source. without framing
+// the ring concatenated datagrams and remote_ip/port were clobbered per packet
+//  -  musl's resolver (parallel A+AAAA on one socket, memcmp on the reply
+// source) breaks on both. (satoru)
+struct UdpRecHdr {
+    uint16_t len;        // payload bytes following this header (satoru)
+    uint16_t src_port;   // datagram source port (host order) (satoru)
+    uint32_t src_ip;     // datagram source ip (host order) (satoru)
+} __attribute__((packed));
 static void sloghex(uint32_t v){
     char b[12]; b[0]='0'; b[1]='x';
     const char* h = "0123456789ABCDEF";
@@ -834,8 +860,10 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 RuntimeLog::LogNetwork("tcp connection established", nullptr);
             } else if (tcp->flags & TCP_FLAG_RST) {
                 sock->tcp_state = TCP_CLOSED;
-                // connection refused  -  surface to a non-blocking poller (satoru)
-                sock->sock_errno = TCP_ETIMEDOUT;
+                // rst during the handshake IS connection-refused; timed-out was
+                // a mislabel that made every closed port read as a dead host in
+                // getsockopt(SO_ERROR). (satoru)
+                sock->sock_errno = TCP_ECONNREFUSED;
                 slog("[TCP] got RST -> CLOSED\r\n");
                 RuntimeLog::LogNetwork("tcp connection reset by peer", nullptr);
             }
@@ -1158,9 +1186,19 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
         sock->remote_ip = src_ip;
         sock->remote_port = src_port;
 
+        // framed push: an 8-byte record header + the payload, dropped WHOLE if
+        // the ring can't hold both  -  a truncated datagram record would desync
+        // every later pop. RecvFrom pops one record per call so datagram
+        // boundaries + true source survive (musl's dns resolver needs both).
+        // (satoru)
         int space = TCP_RX_BUFSIZE - sock->rx_count;
-        int copy = payload_len < space ? payload_len : space;
-        tcp_ring_push(sock, payload, copy);
+        if (payload_len + (int)sizeof(UdpRecHdr) > space) { stats.dropped++; return; }
+        UdpRecHdr rh;
+        rh.len      = (uint16_t)payload_len;
+        rh.src_port = src_port;
+        rh.src_ip   = src_ip;
+        tcp_ring_push(sock, (const uint8_t*)&rh, (int)sizeof(rh));
+        tcp_ring_push(sock, payload, payload_len);
         return;
     }
 
@@ -1487,6 +1525,33 @@ int TCPStack::GetSockError(int sock) {
     return sockets[sock].sock_errno;
 }
 
+// lock-free single-word getters for the linux af_inet bridge (see tcpip.h);
+// staleness is bounded by the caller's next poll pass. (satoru)
+int TCPStack::RxAvailable(int sock) {
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return 0;
+    return sockets[sock].rx_count;
+}
+
+int TCPStack::TxFreeSegs(int sock) {
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return 0;
+    NetSocket* s = &sockets[sock];
+    if (s->type != SOCK_STREAM) return TCP_SND_WND_SEGS;   // udp never queues (satoru)
+    if (s->tcp_state != TCP_ESTABLISHED) return 0;
+    int free_slots = TCP_SND_WND_SEGS - s->tx_seg_inflight;
+    return free_slots > 0 ? free_slots : 0;
+}
+
+bool TCPStack::GetAddrInfo(int sock, uint32_t* lip, uint16_t* lport,
+                           uint32_t* rip, uint16_t* rport) {
+    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    NetSocket* s = &sockets[sock];
+    if (lip)   *lip   = s->local_ip ? s->local_ip : local_ip;
+    if (lport) *lport = s->local_port;
+    if (rip)   *rip   = s->remote_ip;
+    if (rport) *rport = s->remote_port;
+    return true;
+}
+
 bool TCPStack::Close(int sock) {
     if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
 
@@ -1551,6 +1616,24 @@ int TCPStack::RecvFrom(int sock, void* buf, int max_len, uint32_t* from_ip, uint
     if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
 
     NetSocket* s = &sockets[sock];
+
+    // udp: pop exactly ONE framed datagram record (see UdpRecHdr) so each call
+    // returns one distinct datagram with its true source, not a concatenation
+    // with a clobbered remote. oversize payload is truncated to max_len and the
+    // tail discarded  -  standard udp semantics. (satoru)
+    if (s->type == SOCK_DGRAM) {
+        if (s->rx_count < (int)sizeof(UdpRecHdr)) return 0;   // nothing queued (satoru)
+        UdpRecHdr rh;
+        tcp_ring_pop(s, (uint8_t*)&rh, (int)sizeof(rh));
+        int give = (int)rh.len < max_len ? (int)rh.len : max_len;
+        tcp_ring_pop(s, (uint8_t*)buf, give);
+        int discard = (int)rh.len - give;
+        if (discard > 0) tcp_ring_pop(s, nullptr, discard);
+        if (from_ip)   *from_ip   = rh.src_ip;
+        if (from_port) *from_port = rh.src_port;
+        return give;
+    }
+
     if (from_ip) *from_ip = s->remote_ip;
     if (from_port) *from_port = s->remote_port;
 

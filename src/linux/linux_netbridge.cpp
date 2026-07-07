@@ -2,11 +2,21 @@
 
 #include "linux_netbridge.h"
 #include "../kernel/heap.h"
+#include "../drivers/timer.h"
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
 #include "../net/network.h"
 #include "../net/tcpip.h"
 #include "../shell/shell.h"
+#include "../proc/kernel_locks.h"
+
+// every MUTATING TCPStack call from the bridge runs under g_net_lock (the
+// leaf lock the NetworkProcess tick already takes)  -  linux syscalls run on
+// the bsp AND the aps truly parallel to that tick. readiness/rx-count checks
+// stay lock-free single-word reads (bounded staleness, next poll re-reads).
+// the bridge is strictly NON-BLOCKING: TCPStack's internal blocking waits
+// (Connect/Accept/Send window-full) call PumpUI, which is unsafe off the
+// bsp, so every path here pre-checks state to keep those unreachable. (satoru)
 
 LinuxSocket       LinuxNetBridge::sockets[LNET_MAX_SOCKETS];
 int               LinuxNetBridge::socket_count = 0;
@@ -143,8 +153,21 @@ LinuxSocket* LinuxNetBridge::GetSocket(int fd) {
 }
 
 int LinuxNetBridge::Socket(int family, int type, int protocol, int owner_pid) {
+    if (family != LAF_INET) return -97;                 // -EAFNOSUPPORT (satoru)
+    if (type != LSOCK_STREAM && type != LSOCK_DGRAM) return -94;  // -ESOCKTNOSUPPORT (satoru)
     int idx = AllocSocket();
-    if (idx < 0) return -1;
+    if (idx < 0) return -24;                            // -EMFILE (satoru)
+
+    int ks;
+    {
+        SpinLockCpuGuard g(g_net_lock);
+        ks = TCPStack::Socket(type == LSOCK_STREAM ? SOCK_STREAM : SOCK_DGRAM);
+        // ALWAYS non-blocking at the stack level: the bridge owns no waiting,
+        // so TCPStack's internal PumpUI waits stay unreachable (ap-unsafe).
+        // linux-level blocking is emulated in the syscall layer. (satoru)
+        if (ks >= 0) TCPStack::SetNonblocking(ks, true);
+    }
+    if (ks < 0) return -24;                             // stack table full (satoru)
 
     LinuxSocket* s = &sockets[idx];
     memset(s, 0, sizeof(LinuxSocket));
@@ -155,7 +178,9 @@ int LinuxNetBridge::Socket(int family, int type, int protocol, int owner_pid) {
     s->state = LSOCK_CREATED;
     s->active = true;
     s->owner_pid = owner_pid;
-    s->kurono_socket = -1;
+    s->kurono_socket = ks;
+    s->nonblocking = true;
+    s->refs = 1;
 
     socket_count++;
     return idx;
@@ -163,147 +188,316 @@ int LinuxNetBridge::Socket(int family, int type, int protocol, int owner_pid) {
 
 int LinuxNetBridge::Bind(int sockfd, const LinuxSockaddrIn* addr) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s) return -1;
+    if (!s || !addr) return -9;                         // -EBADF (satoru)
 
     s->local_addr = Ntohl(addr->sin_addr);
     s->local_port = Ntohs(addr->sin_port);
+    // port 0 stays 0 here: TCPStack allocates an ephemeral port at the first
+    // SendTo/Connect (musl's resolver binds 0.0.0.0:0 then sendto's). (satoru)
+    if (s->local_port != 0) {
+        SpinLockCpuGuard g(g_net_lock);
+        TCPStack::Bind(s->kurono_socket, s->local_port);
+    }
     s->state = LSOCK_BOUND;
     return 0;
 }
 
 int LinuxNetBridge::Listen(int sockfd, int backlog) {
-    LinuxSocket* s = GetSocket(sockfd);
-    if (!s || s->state != LSOCK_BOUND) return -1;
-
-    s->backlog = backlog > LNET_MAX_BACKLOG ? LNET_MAX_BACKLOG : backlog;
-    s->state = LSOCK_LISTENING;
-    return 0;
+    // v1: no inbound tcp  -  TCPStack::Accept blocks with PumpUI (ap-unsafe)
+    // and nothing firefox needs listens. (satoru)
+    (void)sockfd; (void)backlog;
+    return -95;                                          // -EOPNOTSUPP (satoru)
 }
 
 int LinuxNetBridge::Accept(int sockfd, LinuxSockaddrIn* addr) {
-    LinuxSocket* s = GetSocket(sockfd);
-    if (!s || s->state != LSOCK_LISTENING) return -1;
-
-    // create new socket for the accepted connection
-    int new_fd = Socket(s->family, s->type, s->protocol, s->owner_pid);
-    if (new_fd < 0) return -1;
-
-    LinuxSocket* ns = &sockets[new_fd];
-    ns->state = LSOCK_CONNECTED;
-    ns->local_addr = s->local_addr;
-    ns->local_port = s->local_port;
-    ns->remote_addr = 0xC0A80001;  // simulated remote
-    ns->remote_port = 12345;
-
-    if (addr) {
-        addr->sin_family = LAF_INET;
-        addr->sin_addr = Htonl(ns->remote_addr);
-        addr->sin_port = Htons(ns->remote_port);
-    }
-
-    return new_fd;
+    (void)sockfd; (void)addr;
+    return -95;                                          // -EOPNOTSUPP (satoru)
 }
 
 int LinuxNetBridge::Connect(int sockfd, const LinuxSockaddrIn* addr) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s) return -1;
+    if (!s || !addr) return -9;
+    if (s->state == LSOCK_CONNECTING) return -114;       // -EALREADY (satoru)
+    if (s->state == LSOCK_CONNECTED && s->type == LSOCK_STREAM) return -106;  // -EISCONN (satoru)
 
-    s->remote_addr = Ntohl(addr->sin_addr);
-    s->remote_port = Ntohs(addr->sin_port);
+    uint32_t ip   = Ntohl(addr->sin_addr);
+    uint16_t port = Ntohs(addr->sin_port);
 
-    // if not bound, auto-bind
-    if (s->local_port == 0) {
-        s->local_addr = 0xC0A80064;  // 192.168.0.100
-        s->local_port = 49152 + sockfd;
+    // no loopback in the kurono stack: fast-fail so a 127.0.0.1 probe reads
+    // as refused instead of hanging firefox startup. (satoru)
+    if ((ip >> 24) == 127 || ip == 0) return -111;       // -ECONNREFUSED (satoru)
+
+    s->remote_addr = ip;
+    s->remote_port = port;
+
+    if (s->type == LSOCK_DGRAM) {
+        // connected-udp just fixes the default destination. (satoru)
+        s->state = LSOCK_CONNECTED;
+        return 0;
     }
 
-    // honour O_NONBLOCK: report the handshake as in-progress and return
-    // -EINPROGRESS, matching BSD semantics; blocking connect stays the
-    // default and immediately reports CONNECTED as before (satoru)
-    if (s->nonblocking) {
+    bool ok;
+    {
+        SpinLockCpuGuard g(g_net_lock);
+        ok = TCPStack::Connect(s->kurono_socket, ip, port);
+    }
+    if (ok) { s->state = LSOCK_CONNECTED; return 0; }    // same-tick establish (satoru)
+    // non-blocking connect: SYN is out, handshake completes from the network
+    // tick. the caller polls (POLLOUT) + getsockopt(SO_ERROR). (satoru)
+    if (TCPStack::GetSockError(s->kurono_socket) == TCP_EINPROGRESS) {
         s->state = LSOCK_CONNECTING;
-        return -115;  // -EINPROGRESS
+        return -115;                                     // -EINPROGRESS (satoru)
     }
+    return -111;                                         // -ECONNREFUSED (satoru)
+}
 
-    s->state = LSOCK_CONNECTED;
-    return 0;
+// sample a connecting socket's state without blocking: 0 once established,
+// -EINPROGRESS while the handshake runs, else the connect error. transitions
+// the bridge state so later Send/Recv see CONNECTED. (satoru)
+int LinuxNetBridge::ConnectPoll(int sockfd) {
+    LinuxSocket* s = GetSocket(sockfd);
+    if (!s) return -9;
+    if (s->state == LSOCK_CONNECTED) return 0;
+    if (s->state != LSOCK_CONNECTING) return -107;       // -ENOTCONN (satoru)
+    if (TCPStack::IsWritable(s->kurono_socket)) {
+        s->state = LSOCK_CONNECTED;
+        return 0;
+    }
+    int e = TCPStack::GetSockError(s->kurono_socket);
+    if (e == TCP_EINPROGRESS || e == 0) return -115;     // still handshaking (satoru)
+    s->state = LSOCK_CLOSED;
+    return -e;                                           // -ECONNREFUSED / -ETIMEDOUT (satoru)
 }
 
 int LinuxNetBridge::Send(int sockfd, const void* buf, int len, int flags) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s || s->state != LSOCK_CONNECTED) return -1;
+    if (!s || !buf || len < 0) return -9;
     (void)flags;
 
-    // buffer the data
-    int copy = len < (LNET_BUF_SIZE - s->send_len) ? len : (LNET_BUF_SIZE - s->send_len);
-    if (copy > 0) {
-        memcpy(s->send_buf + s->send_len, buf, copy);
-        s->send_len += copy;
+    if (s->type == LSOCK_DGRAM) {
+        // connected-udp send: bridge-stored remote, never NetSocket state
+        // (ProcessUDP clobbers remote_* per received packet). (satoru)
+        if (s->state != LSOCK_CONNECTED) return -107;    // -ENOTCONN (satoru)
+        if (len > 1472) return -90;                      // -EMSGSIZE (satoru)
+        int w;
+        {
+            SpinLockCpuGuard g(g_net_lock);
+            w = TCPStack::SendTo(s->kurono_socket, buf, len, s->remote_addr, s->remote_port);
+        }
+        return w < 0 ? -11 : w;                          // -EAGAIN on stack refusal (satoru)
     }
 
-    // update interface stats
+    // tcp. late-complete a pending connect (caller may skip ConnectPoll and
+    // go straight to write after its poll saw POLLOUT). (satoru)
+    if (s->state == LSOCK_CONNECTING) {
+        if (TCPStack::IsWritable(s->kurono_socket)) s->state = LSOCK_CONNECTED;
+        else return -107;                                // -ENOTCONN (satoru)
+    }
+    if (s->state != LSOCK_CONNECTED) return -107;
+    if (TCPStack::IsPeerClosed(s->kurono_socket)) return -32;   // -EPIPE (satoru)
+
+    // pre-check the send window so TCPStack::Send can NEVER enter its
+    // internal window-full PumpUI wait  -  short writes are fine, callers
+    // loop. (satoru)
+    int free_segs = TCPStack::TxFreeSegs(s->kurono_socket);
+    if (free_segs <= 0) return -11;                      // -EAGAIN (satoru)
+    int chunk = free_segs * TCP_MSS;
+    if (chunk > len) chunk = len;
+
+    int w;
+    {
+        SpinLockCpuGuard g(g_net_lock);
+        w = TCPStack::Send(s->kurono_socket, buf, chunk);
+    }
+    if (w < 0) return -11;
     LinuxNetInterface* eth = GetInterface("eth0");
-    if (eth) {
-        eth->tx_bytes += copy;
-        eth->tx_packets++;
-    }
-
-    return copy;
+    if (eth) { eth->tx_bytes += w; eth->tx_packets++; }
+    return w;
 }
 
 int LinuxNetBridge::Recv(int sockfd, void* buf, int len, int flags) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s || s->state != LSOCK_CONNECTED) return -1;
+    if (!s || !buf || len < 0) return -9;
     (void)flags;
 
-    int copy = len < s->recv_len ? len : s->recv_len;
-    if (copy > 0) {
-        memcpy(buf, s->recv_buf, copy);
-        // shift remaining
-        memmove(s->recv_buf, s->recv_buf + copy, s->recv_len - copy);
-        s->recv_len -= copy;
+    if (s->type == LSOCK_DGRAM) {
+        return Recvfrom(sockfd, buf, len, 0, nullptr);
     }
 
-    return copy;
+    if (s->state == LSOCK_CONNECTING) {
+        if (TCPStack::IsWritable(s->kurono_socket)) s->state = LSOCK_CONNECTED;
+        else return -107;                                // -ENOTCONN (satoru)
+    }
+
+    // 0-vs-EAGAIN: an empty ring is EOF only once the peer is gone; getting
+    // this wrong reads as instant-eof (broken pages) or a spin (hung
+    // transfers). (satoru)
+    if (TCPStack::RxAvailable(s->kurono_socket) == 0) {
+        if (TCPStack::IsPeerClosed(s->kurono_socket)) return 0;   // eof (satoru)
+        return -11;                                      // -EAGAIN (satoru)
+    }
+
+    int r;
+    {
+        SpinLockCpuGuard g(g_net_lock);
+        // Recv mutates state (window-update acks)  -  locked. (satoru)
+        r = TCPStack::Recv(s->kurono_socket, buf, len);
+    }
+    if (r < 0) return -11;
+    if (r == 0) return -11;                              // raced empty (satoru)
+    LinuxNetInterface* eth = GetInterface("eth0");
+    if (eth) { eth->rx_bytes += r; eth->rx_packets++; }
+    return r;
 }
 
 int LinuxNetBridge::Sendto(int sockfd, const void* buf, int len, int flags,
                             const LinuxSockaddrIn* dest_addr) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s) return -1;
-    (void)flags; (void)dest_addr;
+    if (!s || !buf || len < 0) return -9;
+    (void)flags;
 
-    int copy = len < LNET_BUF_SIZE ? len : LNET_BUF_SIZE;
-    memcpy(s->send_buf, buf, copy);
-    s->send_len = copy;
+    // null dest = connected-mode send. (satoru)
+    if (!dest_addr) return Send(sockfd, buf, len, 0);
+    if (s->type != LSOCK_DGRAM) return Send(sockfd, buf, len, 0);
+    if (len > 1472) return -90;                          // -EMSGSIZE (satoru)
 
+    uint32_t ip   = Ntohl(dest_addr->sin_addr);
+    uint16_t port = Ntohs(dest_addr->sin_port);
+    int w;
+    {
+        SpinLockCpuGuard g(g_net_lock);
+        w = TCPStack::SendTo(s->kurono_socket, buf, len, ip, port);
+    }
+    if (w < 0) return -11;
     LinuxNetInterface* eth = GetInterface("eth0");
-    if (eth) { eth->tx_bytes += copy; eth->tx_packets++; }
-
-    return copy;
+    if (eth) { eth->tx_bytes += w; eth->tx_packets++; }
+    return w;
 }
 
 int LinuxNetBridge::Recvfrom(int sockfd, void* buf, int len, int flags,
                               LinuxSockaddrIn* src_addr) {
-    (void)flags; (void)src_addr;
-    return Recv(sockfd, buf, len, 0);
+    LinuxSocket* s = GetSocket(sockfd);
+    if (!s || !buf || len < 0) return -9;
+    (void)flags;
+
+    if (s->type != LSOCK_DGRAM) return Recv(sockfd, buf, len, 0);
+
+    if (TCPStack::RxAvailable(s->kurono_socket) == 0) return -11;  // -EAGAIN (satoru)
+
+    uint32_t fip = 0; uint16_t fport = 0;
+    int r;
+    {
+        SpinLockCpuGuard g(g_net_lock);
+        // pops exactly one framed datagram record (true per-datagram source  - 
+        // musl's resolver memcmps it). (satoru)
+        r = TCPStack::RecvFrom(s->kurono_socket, buf, len, &fip, &fport);
+    }
+    if (r < 0) return -11;
+    if (r == 0) return -11;                              // raced empty (satoru)
+    if (src_addr) {
+        src_addr->sin_family = LAF_INET;
+        src_addr->sin_addr = Htonl(fip);
+        src_addr->sin_port = Htons(fport);
+        memset(src_addr->sin_zero, 0, sizeof(src_addr->sin_zero));
+    }
+    return r;
 }
 
 int LinuxNetBridge::Shutdown(int sockfd, int how) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s) return -1;
-    (void)how;
-    s->state = LSOCK_CLOSED;
+    if (!s) return -9;
+    // shut_wr / shut_rdwr sends fin via Close; shut_rd is a benign no-op
+    // (the rx ring keeps draining). the linux fd stays open either way  - 
+    // sys_close does the final release. (satoru)
+    if (how == LSHUT_WR || how == LSHUT_RDWR) {
+        if (s->type == LSOCK_STREAM && s->kurono_socket >= 0) {
+            SpinLockCpuGuard g(g_net_lock);
+            TCPStack::Close(s->kurono_socket);
+        }
+        s->state = LSOCK_CLOSED;
+    }
     return 0;
 }
 
 int LinuxNetBridge::Close(int sockfd) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s) return -1;
+    if (!s) return -9;
+    // dup/fork refcount: only the LAST linux fd release tears down the
+    // kurono socket  -  the 16-slot stack table makes leak discipline
+    // critical. (satoru)
+    if (--s->refs > 0) return 0;
+    if (s->kurono_socket >= 0) {
+        SpinLockCpuGuard g(g_net_lock);
+        TCPStack::Close(s->kurono_socket);
+    }
+    s->kurono_socket = -1;
     s->active = false;
     s->state = LSOCK_CLOSED;
     socket_count--;
     return 0;
+}
+
+void LinuxNetBridge::Retain(int sockfd) {
+    LinuxSocket* s = GetSocket(sockfd);
+    if (s) s->refs++;
+}
+
+// poll/epoll readiness  -  lock-free single-word reads (same precedent as
+// UnixSocket::PendingBytes in fd_readiness); staleness is bounded by the
+// caller's next poll pass. (satoru)
+uint32_t LinuxNetBridge::Readiness(int sockfd) {
+    LinuxSocket* s = GetSocket(sockfd);
+    if (!s) return LNET_POLLERR | LNET_POLLHUP;
+
+    uint32_t r = 0;
+    int ks = s->kurono_socket;
+    if (s->type == LSOCK_DGRAM) {
+        if (TCPStack::RxAvailable(ks) > 0) r |= LNET_POLLIN;
+        r |= LNET_POLLOUT;                               // udp never queues (satoru)
+        return r;
+    }
+    // tcp: readable on data OR peer-gone (recv returns eof); writable once
+    // established with window space; err/hup on a failed connect so the
+    // poll(POLLOUT) connect pattern wakes and reads SO_ERROR. (satoru)
+    if (TCPStack::RxAvailable(ks) > 0) r |= LNET_POLLIN;
+    bool peer_closed = TCPStack::IsPeerClosed(ks);
+    if (peer_closed && s->state != LSOCK_CREATED && s->state != LSOCK_BOUND) {
+        r |= LNET_POLLIN | LNET_POLLHUP;
+    }
+    if (TCPStack::IsWritable(ks) && TCPStack::TxFreeSegs(ks) > 0) r |= LNET_POLLOUT;
+    int e = TCPStack::GetSockError(ks);
+    if (e != 0 && e != TCP_EINPROGRESS) r |= LNET_POLLERR | LNET_POLLHUP;
+    return r;
+}
+
+// getsockopt(SO_ERROR): pending connect error, 0 when fine. v1 keeps the
+// error sticky (no clear-on-read)  -  firefox reads it once then closes the
+// fd, so the simplification never bites. (satoru)
+int LinuxNetBridge::SockError(int sockfd) {
+    LinuxSocket* s = GetSocket(sockfd);
+    if (!s) return 9;                                    // EBADF as a value (satoru)
+    int e = TCPStack::GetSockError(s->kurono_socket);
+    if (e == TCP_EINPROGRESS) return 0;                  // still in progress = no error (satoru)
+    return e;
+}
+
+int LinuxNetBridge::RxAvail(int sockfd) {
+    LinuxSocket* s = GetSocket(sockfd);
+    if (!s) return 0;
+    return TCPStack::RxAvailable(s->kurono_socket);
+}
+
+// rate-limited network pump for the bsp's poll/epoll wait loops: beats the
+// NetworkProcess's 10ms cadence during dns/handshake/tls bursts. no-ops
+// when no inet socket is live so non-network workloads pay nothing. (satoru)
+void LinuxNetBridge::PumpTick() {
+    if (socket_count <= 0) return;
+    static uint32_t last_ms = 0;
+    uint32_t now = Timer::GetRealMs();
+    if (now - last_ms < 1) return;
+    last_ms = now;
+    SpinLockCpuGuard g(g_net_lock);
+    TCPStack::Tick();
 }
 
 int LinuxNetBridge::Setsockopt(int sockfd, int level, int optname,
@@ -411,9 +605,11 @@ int LinuxNetBridge::Resolve(const char* hostname, uint32_t* ip_out) {
     if (ln_seq(hostname, "localhost")) { *ip_out = 0x7F000001; return 0; }
     if (ln_seq(hostname, "kurono"))    { *ip_out = 0x7F000001; return 0; }
 
-    // simulate resolution
-    *ip_out = 0x8EFB2108;  // example: 142.251.33.8
-    return 0;
+    // real dns via the kernel resolver (bsp-only shell path  -  it pumps ui
+    // internally). the old body returned a hardcoded fake ip. (satoru)
+    IPv4Address r;
+    if (Network::Resolve(hostname, &r)) { *ip_out = ln_ip_to_u32(r); return 0; }
+    return -1;
 }
 
 void LinuxNetBridge::SetDNS(uint32_t primary, uint32_t secondary) {
