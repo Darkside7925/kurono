@@ -200,8 +200,16 @@ private:
         int x, y, w, h;
         bool active;
     };
-    static DirtyRegion dirty_regions[16];
+    // larger cap = fewer forced coalesces of unrelated small rects (satoru)
+    static const int DIRTY_REGION_CAP = 32;
+    static DirtyRegion dirty_regions[DIRTY_REGION_CAP];
     static int dirty_count;
+    // once total damage crosses a sane fraction of the screen we stop tracking
+    // individual rects and present the whole frame; reset by ClearDirtyRegions (satoru)
+    static bool full_screen_dirty;
+    // running sum of damaged pixels this frame (64-bit, overflow-safe) (satoru)
+    static uint64_t dirty_area_total;
+    static void MarkFullScreenDirty();
     
     // internal helpers
     static bool IsPointInBounds(int x, int y);

@@ -571,10 +571,14 @@ void WindowManager::Focus(int id) {
         if (windows[i].focused) {
             windows[i].focused = false;
             windows[i].dirty = true;
-            wm_damage(windows[i].x, windows[i].y, windows[i].w, WM_TITLEBAR_H + 1);
-            wm_damage(windows[i].x, windows[i].y, 1, windows[i].h);
-            wm_damage(windows[i].x + windows[i].w - 1, windows[i].y, 1, windows[i].h);
-            wm_damage(windows[i].x, windows[i].y + windows[i].h - 1, windows[i].w, 1);
+            // damage the whole footprint INCLUDING the shadow margin: losing focus
+            // changes the titlebar tint, the accent line and the shadow, and the old
+            // 1px edge strips missed the shadow band, leaving it stale behind a newly
+            // focused overlapping window. focus changes are click-rare so the extra
+            // repaint is free. (satoru)
+            const int fm = WM_SHADOW_SIZE + 2;
+            wm_damage(windows[i].x - fm, windows[i].y - fm,
+                      windows[i].w + 2 * fm, windows[i].h + 2 * fm);
         }
     }
     Window* win = GetWindow(id);
@@ -690,8 +694,11 @@ void WindowManager::UpdateContentArea(Window* win) {
     if (win->has_titlebar) {
         win->content_x = win->x + WM_BORDER_W;
         win->content_y = win->y + WM_TITLEBAR_H;
-        win->content_w = win->w - WM_BORDER_W * 2;
-        win->content_h = win->h - WM_TITLEBAR_H - WM_BORDER_W;
+        // clamp: a window resized below chrome size would make these negative, which
+        // the unsigned clip math then reads as a huge extent. (satoru)
+        win->content_w = win->w > WM_BORDER_W * 2 ? win->w - WM_BORDER_W * 2 : 0;
+        win->content_h = win->h > WM_TITLEBAR_H + WM_BORDER_W
+                       ? win->h - WM_TITLEBAR_H - WM_BORDER_W : 0;
     } else {
         win->content_x = win->x;
         win->content_y = win->y;
@@ -1046,13 +1053,24 @@ void WindowManager::RenderTitlebar(Window* win) {
     if (title_area_end > title_area_start + 8) {
         int max_chars = (title_area_end - title_area_start) / 8;
         int len = wmlen(win->title);
-        if (len > max_chars) len = max_chars;
+        char tbuf[128];
+        const char* draw = win->title;
+        if (len > max_chars && max_chars >= 4 && max_chars < (int)sizeof(tbuf)) {
+            // truncate with a trailing ellipsis so a cut-off title is visibly marked
+            // instead of being silently clipped mid-glyph. (satoru)
+            int keep = max_chars - 3;
+            for (int c = 0; c < keep; c++) tbuf[c] = win->title[c];
+            tbuf[keep] = '.'; tbuf[keep + 1] = '.'; tbuf[keep + 2] = '.'; tbuf[keep + 3] = 0;
+            draw = tbuf; len = max_chars;
+        } else if (len > max_chars) {
+            len = max_chars;
+        }
         int title_w = len * 8;
         int title_x = title_area_start + (title_area_end - title_area_start - title_w) / 2;
         if (title_x < title_area_start) title_x = title_area_start;
         Graphics::PushClipRect(title_area_start, wy,
                               title_area_end - title_area_start, WM_TITLEBAR_H);
-        Graphics::DrawString(title_x, wy + (WM_TITLEBAR_H - 12) / 2, win->title, text_col, 0x00000000);
+        Graphics::DrawString(title_x, wy + (WM_TITLEBAR_H - 12) / 2, draw, text_col, 0x00000000);
         Graphics::PopClipRect();
     }
 
@@ -1219,7 +1237,7 @@ void WindowManager::Render() {
         // framebuffer.
         if (WM_UNLIKELY(kind == 3 && p_raw < 256)) {
             int q = 256 - p;                       // 256..0
-            int ax = win->anchor_x, ay = win->anchor_y;
+            int ax = win->x + win->w / 2, ay = screen_height - 22;  // live anchor, not stale create-time (satoru)
             int rx = win->x + ((ax - win->x) * (256 - q)) / 256;
             int ry = win->y + ((ay - win->y) * (256 - q)) / 256;
             int rw = (win->w * q) / 256;
@@ -1236,7 +1254,7 @@ void WindowManager::Render() {
         }
         if (WM_UNLIKELY(kind == 4 && p_raw < 256)) {
             int q = p;                             // 0..256
-            int ax = win->anchor_x, ay = win->anchor_y;
+            int ax = win->x + win->w / 2, ay = screen_height - 22;  // live anchor, not stale create-time (satoru)
             int rx = ax + ((win->x - ax) * q) / 256;
             int ry = ay + ((win->y - ay) * q) / 256;
             int rw = (win->w * q) / 256;

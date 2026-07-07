@@ -2011,6 +2011,19 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "//\n"
             "lockPref(\"layers.gpu-process.enabled\", false);\n"
             "lockPref(\"gfx.webrender.software\", true);\n"
+            // (satoru) open the kurono repo page on startup so a headless boot shows
+            // firefox rendering a real webpage (proof shot). page=1 => open homepage.
+            // (satoru) point the homepage at the LOCAL mirror (plain http, always 200)
+            // instead of real github (needs dns+tls+http2 over the wsl nat, unreliable).
+            // ff_net_run.sh serves the kurono repo page at http://10.0.2.2/kurono/.
+            "lockPref(\"browser.startup.homepage\", \"http://10.0.2.2/kurono/\");\n"
+            "lockPref(\"browser.startup.page\", 1);\n"
+            // (satoru) firefox null-write MOZ_CRASH at page-load symbolized into the
+            // dom/media/webcodecs ImageTrack init; disable webcodecs + related media so
+            // that path is skipped for a plain page render. (satoru)
+            "lockPref(\"dom.media.webcodecs.enabled\", false);\n"
+            "lockPref(\"dom.media.webcodecs.image.enabled\", false);\n"
+            "lockPref(\"image.webp.enabled\", false);\n"
             // firefox 140 is WEBRENDER-ONLY (the old basic/non-WR compositor is gone),
             // so WR must come up or there is no compositor at all. the failed glxtest
             // marks the GPU unusable in gfxInfo; force-enable WR so the SOFTWARE backend
@@ -2080,7 +2093,26 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // dominant startup cost  -  this is what lets the (interpreter-slow) browser
             // window finish loading in a reasonable time. ion stays OFF (heavier W^X
             // churn); baseline is enough. (satoru)
+            // real networking over the af_inet bridge: no quic (the udp bridge is
+            // dns-grade, not http/3-grade), no ipv6 (the stack is v4-only), and a
+            // tight connection cap  -  the kurono stack has 16 socket slots shared
+            // with the kernel's own use. (satoru)
+            "lockPref(\"network.http.http3.enable\", false);\n"
+            "lockPref(\"network.dns.disableIPv6\", true);\n"
+            "lockPref(\"network.http.max-connections\", 8);\n"
+            "lockPref(\"network.http.max-persistent-connections-per-server\", 2);\n"
+            "lockPref(\"network.connectivity-service.enabled\", false);\n"
+            "lockPref(\"network.captive-portal-service.enabled\", false);\n"
+            "lockPref(\"network.dns.disablePrefetch\", true);\n"
+            "lockPref(\"network.prefetch-next\", false);\n"
             "lockPref(\"javascript.options.baselinejit\", true);\n"
+            // ion tested 2026-07-06 and REVERTED (satoru): with ion=true the run
+            // reached the window then died on a ring-3 #PF  -  a null WRITE (cr2=0
+            // err=7) with rip inside the jit-code reservation (0x1800_xxxxxxxx),
+            // i.e. ion-generated code itself misbehaving on kurono. mprotect
+            // already broadcasts tlb flushes, so it isn't the known stale-tlb
+            // class; diagnosing ion codegen is out of scope for now. baseline
+            // remains the workhorse.
             "lockPref(\"javascript.options.ion\", false);\n"
             "lockPref(\"javascript.options.native_regexp\", true);\n"
             "lockPref(\"javascript.options.asmjs\", false);\n"
@@ -2266,7 +2298,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "user_pref(\"toolkit.telemetry.enabled\", false);\n"
             "user_pref(\"toolkit.telemetry.unified\", false);\n"
             "user_pref(\"datareporting.healthreport.uploadEnabled\", false);\n"
-            "user_pref(\"places.database.lastMaintenance\", 9999999999);\n";
+            "user_pref(\"places.database.lastMaintenance\", 2000000000);\n";  // int32-safe (satoru)
         KVFS::WriteFile("/home/user/.mozilla/firefox/kurono.default/prefs.js",
                         prefs, (uint32_t)__builtin_strlen(prefs));
         KVFS::Chown("/home/user/.mozilla/firefox/kurono.default/prefs.js", 1000, 1000);
@@ -2300,7 +2332,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     }
     // default to about:blank when autorun with no url, so firefox opens a real
     // (blank) browser window that proves the full chrome + content paint path. (satoru)
-    const char* real_url = url ? url : "about:blank";
+    const char* real_url = url ? url : "http://10.0.2.2/kurono/";
 
     const char* av[] = { "/apps/firefox/firefox", "-no-remote",
                          real_url, nullptr };
