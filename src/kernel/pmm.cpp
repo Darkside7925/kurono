@@ -1,5 +1,6 @@
 #include "pmm.h"
 #include "../drivers/serial.h"
+#include "../proc/smp.h"   // cpu index for the cross-core pmm lock (satoru)
 
 //  physical memory manager  -  bitmap frame allocator implementation
 
@@ -19,11 +20,38 @@ extern "C" uint8_t kernel_end;       // after .boot_tables  -  safe to place bit
 // so a fault landing mid-allocation would corrupt bitmap/refs/used_frames.
 // cli/sti makes each mutation atomic vs the fault path, exactly like the
 // kernel heap's HeapIrqGuard. save/restore so it nests harmlessly. (satoru)
+// since smp thread dispatch, cli alone is not enough: an ap's syscall (mmap,
+// demand-zero fault) mutates bitmap/refs concurrently with the bsp  -  the guard
+// is now cli + a cross-core lock, cpu-owner-recursive because the #pf
+// stack-grow re-entry above still happens on the SAME core and cli can't stop
+// exceptions (a plain spinlock would self-deadlock there). (satoru)
 namespace {
+volatile uint32_t g_pmm_lock_word  = 0;
+volatile int      g_pmm_lock_owner = -1;
 struct PmmIrqGuard {
     uint64_t f;
-    PmmIrqGuard()  { __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(f) :: "memory"); }
-    ~PmmIrqGuard() { if (f & 0x200ULL) __asm__ __volatile__("sti" ::: "memory"); }
+    bool nested;
+    PmmIrqGuard() {
+        __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+        int cpu = (int)SMP::CpuIndex();
+        if (g_pmm_lock_owner == cpu) { nested = true; return; }
+        nested = false;
+        for (;;) {
+            uint32_t expected = 0;
+            if (__atomic_compare_exchange_n(&g_pmm_lock_word, &expected, 1u, false,
+                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+            do { __asm__ __volatile__("pause" ::: "memory"); }
+            while (__atomic_load_n(&g_pmm_lock_word, __ATOMIC_RELAXED) != 0);
+        }
+        g_pmm_lock_owner = cpu;
+    }
+    ~PmmIrqGuard() {
+        if (!nested) {
+            g_pmm_lock_owner = -1;
+            __atomic_store_n(&g_pmm_lock_word, 0u, __ATOMIC_RELEASE);
+        }
+        if (f & 0x200ULL) __asm__ __volatile__("sti" ::: "memory");
+    }
 };
 }
 

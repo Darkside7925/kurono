@@ -70,3 +70,38 @@ scheduler_jump_to:
     pop  rbp
     popfq
     ret
+
+; ═══════════════════════════════════════════════════════════════════════════
+;  void ap_enter_user_frame(InterruptFrame* f)    -  never returns
+;
+;  smp thread dispatch: an application processor resumes a claimed user
+;  thread from its saved InterruptFrame. mirrors the isr_common restore
+;  path exactly: point rsp at the frame, skip cr2, pop the 15 gprs, skip
+;  vector+error, iretq into ring-3. the caller (LoadUserFrame) has already
+;  set cr3, tss.rsp0/gs:8, fs base and the fpu state. cli first so no irq
+;  lands between the stack pivot and the iretq; the frame's rflags carries
+;  IF=1 so interrupts resume with the thread. (satoru)
+; ═══════════════════════════════════════════════════════════════════════════
+global ap_enter_user_frame
+ap_enter_user_frame:
+    cli
+    mov  rsp, rdi        ; rsp -> InterruptFrame (cr2 first) (satoru)
+    add  rsp, 8          ; skip cr2 (satoru)
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  r11
+    pop  r10
+    pop  r9
+    pop  r8
+    pop  rbp
+    pop  rdi
+    pop  rsi
+    pop  rdx
+    pop  rcx
+    pop  rbx
+    pop  rax
+    add  rsp, 16         ; skip vector + error code (satoru)
+    iretq
+; end (satoru)

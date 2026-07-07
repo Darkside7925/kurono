@@ -455,6 +455,7 @@ enum LinuxFdType {
     LFD_EVENTFD,     // eventfd  -  backend_fd = eventfd table slot (satoru)
     LFD_TIMERFD,     // timerfd  -  backend_fd = timerfd table slot (satoru)
     LFD_SIGNALFD,    // signalfd  -  harmless stub, never fires (satoru)
+    LFD_INET,        // AF_INET tcp/udp  -  backend_fd = LinuxNetBridge slot (satoru)
 };
 
 // memfd seal bits live alongside the LinuxFd so fcntl can interrogate.
@@ -525,6 +526,12 @@ public:
     static LinuxProcess* Current();
     static int  GetCurrentIndex();
     static void SetCurrent(int pid_idx);
+    // point this cpu's linux "current process" at the LinuxProcess owning `task`.
+    // an application processor that RESUMES a scheduler thread (smp thread
+    // dispatch) must sync this before the thread runs, or LinuxSyscall::Current()
+    // is null on that cpu and syscalls (mremap stack-probe, etc.) misbehave in a
+    // loop. no-op if the task has no LinuxProcess. (satoru)
+    static void SyncCurrentToTask(Process* task);
     static bool HandlePageFault(InterruptFrame* frame);
     // register the irq0 timer-preemption handler (round-robins user threads). (satoru)
     static void EnableTimerPreemption();
@@ -555,6 +562,15 @@ public:
     static int32_t sys_fstat64(int fd, uintptr_t statbuf);
     static int32_t sys_fstatat64(int dirfd, uintptr_t pathname,
                                  uintptr_t statbuf, int flags);
+
+    // readlink resolution shared by the x86_64 readlink/readlinkat handlers.
+    // handles /proc/self/exe, /proc/self/fd/N, real kvfs symlinks, and  -  crucially
+    //  -  returns -EINVAL (not -ENOENT) for a path that EXISTS but is not a symlink,
+    // because musl's realpath() walks each path component with readlink and treats
+    // ENOENT as "path missing" (which aborts gecko's XRE_GetFileFromPath -> the
+    // -profile path). writes up to bufsiz bytes (no nul); returns count or -errno.
+    // (satoru)
+    static int ReadlinkResolve(const char* path, char* buf, int bufsiz);
 
     // readv (x86_64 nr 19)  -  the read counterpart of writev. there is no i386
     // dispatch entry for it, so the SYSCALL fast path (linux_syscall_x64.cpp)
@@ -647,6 +663,7 @@ private:
     static int32_t sys_writev(int fd, uintptr_t iov, uint64_t iovcnt);
     static int32_t sys_munmap(uintptr_t addr, uint64_t length);
     static int32_t sys_mprotect(uintptr_t addr, uint64_t length, uint32_t prot);
+    static int32_t sys_madvise(uintptr_t addr, uint64_t length, uint32_t advice);
     static int32_t sys_nanosleep(uintptr_t req, uintptr_t rem);
     static int32_t sys_getdents64(int fd, uintptr_t dirp, uint64_t count);
     static int32_t sys_clock_gettime(uint32_t clk_id, uintptr_t tp);

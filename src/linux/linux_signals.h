@@ -151,7 +151,7 @@ public:
     static bool IsValid(int signo);
 
 private:
-    static ProcessSignalState states[64];  // matches LINUX_MAX_PROCS
+    static ProcessSignalState states[256];  // matches LINUX_MAX_PROCS (satoru)
 
     // alarm tracking
     struct AlarmEntry {

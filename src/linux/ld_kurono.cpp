@@ -1099,6 +1099,16 @@ Lib* do_load(Process* proc, ProcLinkerState* pls,
         s_cpy(l->soname, b, sizeof(l->soname));
     }
 
+    // (satoru) [ldbase] logs each lib's ASLR load base so a stalled-thread stack
+    // dump can be symbolized offline against the .so. gated off for the checkpoint.
+    if (false) {
+        SerialLogger::Log("[ldbase] "); SerialLogger::Log(l->soname);
+        SerialLogger::Log(" base="); SerialLogger::LogHex((uint32_t)(l->load_base >> 32));
+        SerialLogger::Log(":"); SerialLogger::LogHex((uint32_t)(l->load_base & 0xFFFFFFFFu));
+        SerialLogger::Log(" size="); SerialLogger::LogHex((uint32_t)l->load_size);
+        SerialLogger::Log("\r\n");
+    }
+
     parse_dynamic(l);
 
     // TLS module id assignment.
@@ -1320,14 +1330,20 @@ struct AuxEnt { uint64_t a_type; uint64_t a_val; };
 uint64_t push_string(Process* proc, uint64_t* sp_ref, const char* s) {
     int len = s_len(s) + 1;
     *sp_ref -= len;
-    // Find user page.
     uint64_t addr = *sp_ref;
-    uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
-    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(
-        proc->address_space, page);
-    if (!phys) return 0;
-    uint8_t* dst = (uint8_t*)(uintptr_t)(phys + (addr & (PAGE_SIZE - 1)));
-    for (int i = 0; i < len; i++) dst[i] = (uint8_t)s[i];
+    // re-resolve the physical page for EACH byte: a long string (e.g. MOZ_LOG or
+    // LD_LIBRARY_PATH) can straddle two user-stack pages, and the old code mapped
+    // only the start page then wrote the overflow past it into the wrong physical
+    // page  -  silently corrupting the tail of the value. (satoru)
+    for (int i = 0; i < len; i++) {
+        uint64_t a = addr + (uint64_t)i;
+        uint64_t page = a & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t phys = KernelVMM::QueryMappingInAddressSpace(
+            proc->address_space, page);
+        if (!phys) return (i == 0) ? 0 : addr;
+        uint8_t* dst = (uint8_t*)(uintptr_t)(phys + (a & (PAGE_SIZE - 1)));
+        *dst = (uint8_t)s[i];
+    }
     return addr;
 }
 
@@ -1787,6 +1803,19 @@ bool ExecPIE(Process* proc,
             }
             else if (s_starts(envp[i], "LD_VERBOSE="))  pls->verbose = true;
             else if (s_starts(envp[i], "LD_BIND_NOW=")) pls->bind_now = true;
+        }
+    }
+
+    // (satoru) TEMP [ffenv]: dump the cursor/icu/home env this exec receives so we
+    // can confirm XCURSOR_PATH actually reaches firefox (the GDK cursor-theme
+    // abort fires when it doesn't). low volume (only on exec). debug.
+    if (envp) {
+        for (int i = 0; envp[i]; i++) {
+            if (s_starts(envp[i], "XCURSOR") || s_starts(envp[i], "ICU_DATA") ||
+                s_starts(envp[i], "HOME=")   || s_starts(envp[i], "GDK_") ||
+                s_starts(envp[i], "GTK")) {
+                SerialLogger::Log("[ffenv] "); SerialLogger::Log(envp[i]); SerialLogger::Log("\r\n");
+            }
         }
     }
     if (pls->secure) { ld_lib = nullptr; ld_pre = nullptr; }

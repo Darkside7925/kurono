@@ -139,6 +139,38 @@ namespace {
     }
 }
 
+// ── cross-core log guard (smp thread dispatch) ──────────────────────────────
+// every serial line mirrors into kvfs (append_file_text -> kvfs node realloc):
+// with multiple cores logging concurrently that ran UNSYNCHRONIZED kernel-heap
+// / kvfs-tree mutation  -  kernel structs (incl. Process/user_frame) got clobbered
+// and resumed user threads crashed on garbled registers. owner-recursive so a
+// log emitted from inside a locked section on the same cpu (kvfs warning paths)
+// flows through instead of self-deadlocking. (satoru)
+#include "../proc/smp.h"
+static volatile uint32_t g_rtlog_word  = 0;
+static volatile int      g_rtlog_owner = -1;
+struct RtLogGuard {
+    bool nested;
+    RtLogGuard() {
+        int cpu = (int)SMP::CpuIndex();
+        if (g_rtlog_owner == cpu) { nested = true; return; }
+        nested = false;
+        for (;;) {
+            uint32_t expected = 0;
+            if (__atomic_compare_exchange_n(&g_rtlog_word, &expected, 1u, false,
+                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+            do { __asm__ __volatile__("pause" ::: "memory"); }
+            while (__atomic_load_n(&g_rtlog_word, __ATOMIC_RELAXED) != 0);
+        }
+        g_rtlog_owner = cpu;
+    }
+    ~RtLogGuard() {
+        if (nested) return;
+        g_rtlog_owner = -1;
+        __atomic_store_n(&g_rtlog_word, 0u, __ATOMIC_RELEASE);
+    }
+};
+
 void RuntimeLog::InitFilesystem() {
     if (g_fs_ready) return;
     ensure_core_layout();
@@ -159,6 +191,7 @@ void RuntimeLog::InitFilesystem() {
 }
 
 void RuntimeLog::MirrorSerial(const char* text) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!text || !*text) return;
     if (g_fs_ready) {
         ensure_core_layout();
@@ -169,6 +202,7 @@ void RuntimeLog::MirrorSerial(const char* text) {
 }
 
 void RuntimeLog::LogSystem(const char* component, const char* message) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     char line[512];
     char prefix[96];
     prefix[0] = 0;
@@ -181,6 +215,7 @@ void RuntimeLog::LogSystem(const char* component, const char* message) {
 }
 
 void RuntimeLog::LogBoot(const char* message) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     char line[512];
     format_line(line, sizeof(line), "[boot] ", message, nullptr);
     if (g_fs_ready) { ensure_core_layout(); append_file_text(KP_LOG_BOOT, line); return; }
@@ -188,6 +223,7 @@ void RuntimeLog::LogBoot(const char* message) {
 }
 
 void RuntimeLog::LogNetwork(const char* event, const char* detail) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!event || !*event) return;
     char line[512];
     format_line(line, sizeof(line), "[net] ", event, detail);
@@ -196,6 +232,7 @@ void RuntimeLog::LogNetwork(const char* event, const char* detail) {
 }
 
 void RuntimeLog::LogSecurity(const char* event, const char* detail) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!event || !*event) return;
     char line[512];
     format_line(line, sizeof(line), "[sec] ", event, detail);
@@ -204,6 +241,7 @@ void RuntimeLog::LogSecurity(const char* event, const char* detail) {
 }
 
 void RuntimeLog::LogCrash(const char* summary, const char* detail) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!summary || !*summary) return;
     char line[512];
     format_line(line, sizeof(line), "[crash] ", summary, detail);
@@ -216,6 +254,7 @@ void RuntimeLog::LogCrash(const char* summary, const char* detail) {
 }
 
 void RuntimeLog::LogAppEvent(const char* app, const char* event, const char* detail) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!app || !*app || !event || !*event) return;
     char path[192];
     char line[512];
@@ -236,6 +275,7 @@ void RuntimeLog::LogAppEvent(const char* app, const char* event, const char* det
 }
 
 void RuntimeLog::LogProcessEvent(const char* process_name, int pid, const char* event, const char* detail) {
+    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!process_name || !*process_name || !event || !*event) return;
     char path[224];
     char line[512];

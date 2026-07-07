@@ -5,7 +5,7 @@
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
 
-ProcessSignalState LinuxSignals::states[64];
+ProcessSignalState LinuxSignals::states[256];   // matches LINUX_MAX_PROCS (satoru)
 LinuxSignals::AlarmEntry LinuxSignals::alarms[64];
 
 void LinuxSignals::SetBit(LinuxSigset* set, int signo) {
