@@ -70,6 +70,7 @@ extern "C" {
     extern uint64_t isr_stub_table[48];   // 48 function pointers (vectors 0-47)
     extern void isr_stub_128();
     extern void isr_stub_64();            // per-AP LAPIC timer (smp phase 4) (satoru)
+    extern void isr_stub_65();            // tlb-shootdown ipi (smp thread dispatch) (satoru)
 }
 
 static const char* exception_names[32] = {
@@ -327,6 +328,15 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         return;
     }
 
+    // tlb-shootdown ipi: reload cr3 (flushes non-global tlb entries) and ack so
+    // the sender can proceed knowing this core holds no stale user translation
+    // for the just-unmapped/reprotected range. (satoru)
+    if (vec == 0x41) {
+        SMP::HandleTlbIpi();
+        SMP::LapicWrite(0xB0, 0);   // lapic EOI register (satoru)
+        return;
+    }
+
     if (vec < 32) {
         if (vec == 14) {
             // 1) Adaptive kernel-stack growth: if CR2 falls in any kernel
@@ -433,6 +443,23 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         log_hex("  RBP    = ", frame->rbp);
         log_hex("  R14    = ", frame->r14);
         log_hex("  R15    = ", frame->r15);
+        // (satoru) raw kernel-stack dump for a corrupted-control-flow fault: an
+        // #UD with a tiny RIP (e.g. RIP=3) is a ret/call to a smashed target;
+        // the real call chain is the return addresses still sitting on the stack.
+        // -O2 omits frame pointers so an rbp-walk is unreliable -- dump raw qwords
+        // from RSP upward (already-used stack, safely mapped) and symbolize the
+        // code-looking ones offline with addr2line. ring-0 faults only. debug.
+        if ((frame->cs & 3) == 0 && frame->rsp &&
+            ((frame->rsp >> 47) == 0 || (frame->rsp >> 47) == 0x1FFFFULL)) {
+            const uint64_t* sp = (const uint64_t*)(uintptr_t)frame->rsp;
+            for (int i = 0; i < 32; i++) {
+                if ((i & 3) == 0) { SerialLogger::Log("\r\n  S+"); SerialLogger::LogDec(i * 8); SerialLogger::Log(": "); }
+                SerialLogger::Log("0x");
+                SerialLogger::LogHex((uint32_t)(sp[i] >> 32)); SerialLogger::LogHex((uint32_t)sp[i]);
+                SerialLogger::Log(" ");
+            }
+            SerialLogger::Log("\r\n");
+        }
         // tls diagnostic for the firefox pthread_create #gp bring-up: dump the
         // live fs base, the saved proc->fs_base, and the tcb head words (self@0,
         // prev@0x10, next@0x18) so we can see empirically whether the live thread
@@ -467,6 +494,25 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             };
             dump_tcb("liveTCB", live_fs);
             if (frame->r14 != live_fs) dump_tcb("r14TCB", frame->r14);
+            // user stack qwords at the fault: [rsp+0x18] is the return address
+            // for a 3-push prologue  -  symbolizing it names the CALLER of the
+            // faulting function (the AssignLiteral garbage-args hunt). (satoru)
+            if (fp) {
+                for (uint64_t off = 0; off <= 0x78; off += 8) {
+                    uint64_t va = frame->rsp + off;
+                    uint64_t pg = va & ~0xFFFULL;
+                    uint64_t ph = KernelVMM::QueryMappingInAddressSpace(fp->address_space, pg);
+                    if (!ph) continue;
+                    char p[16]; int n = 0;
+                    const char* tg = "ustk +";
+                    while (tg[n]) { p[n] = tg[n]; n++; }
+                    const char* hx = "0123456789ABCDEF";
+                    p[n++] = hx[(off >> 4) & 0xF]; p[n++] = hx[off & 0xF];
+                    p[n] = 0;
+                    uint64_t v = *(volatile uint64_t*)(uintptr_t)(ph + (va & 0xFFF));
+                    log_hex(p, v);
+                }
+            }
         }
         g_exc_dump_lock.UnlockIrqRestore(_exc_f);
 
@@ -576,6 +622,10 @@ void HAL::InitIDT() {
     // per-AP LAPIC timer (vector 0x40), kernel-only (dpl 0). (satoru)
     idt_set(0x40, (uint64_t)(uintptr_t)&isr_stub_64, 0, 0);
 
+    // tlb-shootdown ipi (vector 0x41): another core changed page tables in an
+    // address space this cpu may be running threads of  -  reload cr3. (satoru)
+    idt_set(0x41, (uint64_t)(uintptr_t)&isr_stub_65, 0, 0);
+
     // vectors 48-255: leave as not-present (type_attr = 0).
     // if hardware triggers one, the cpu will fire a #gp which we handle above.
 
@@ -623,14 +673,24 @@ extern "C" volatile uint64_t g_kernel_syscall_rsp;
 
 void HAL::SetKernelStack(uint64_t rsp0) {
     if (!rsp0) return;
-    system_tss.rsp0 = rsp0;
-    system_tss.ist1 = rsp0;
+    // write the CALLING cpu's own tss: each ap loaded its private ap_tss via
+    // SetupAPCpuState, so an ap running a user thread must update that one  - 
+    // writing the bsp's system_tss from an ap would (a) leave the ap's ring-3
+    // interrupt stack stale and (b) point the bsp's rsp0 at the ap thread's
+    // kernel stack, colliding two cores on one stack. (satoru)
+    uint32_t cpu = SMP::CpuIndex();
+    if (cpu == 0) {
+        system_tss.rsp0 = rsp0;
+        system_tss.ist1 = rsp0;
+        // legacy global mirror  -  only meaningful on the bsp. (satoru)
+        g_kernel_syscall_rsp = rsp0;
+    } else if (cpu < SMP_MAX_CPUS) {
+        ap_tss[cpu].rsp0 = rsp0;
+        ap_tss[cpu].ist1 = rsp0;
+    }
 
-    // mirror to the legacy global (still defined) AND to this cpu's PerCpu block,
-    // which the reworked SYSCALL stub reads via gs:8 after swapgs. SMP::Current()
-    // resolves the calling cpu (reads the lapic) so this is correct on the bsp and
-    // on any ap that runs the scheduler. (satoru)
-    g_kernel_syscall_rsp = rsp0;
+    // this cpu's PerCpu block, which the SYSCALL stub reads via gs:8 after
+    // swapgs. (satoru)
     SMP::Current()->kernel_rsp = rsp0;
 }
 

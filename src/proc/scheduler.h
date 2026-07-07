@@ -58,9 +58,14 @@ enum UserMemoryRegionFlags : uint32_t {
 // firefox's gecko closure is ~54 shared objects; even with adjacent same-prot
 // reservations coalescing, libxul (loaded last, 133 mb) + the scattered musl
 // malloc arenas + per-dso .bss anon maps blow past 32 -> add_region() returned
-// null -> mmap -ENOMEM -> musl "Out of memory" loading libxul. give the region
-// table real headroom (each slot is 28 bytes; 256 -> ~7 kb/process). (satoru)
-constexpr int PROCESS_MAX_USER_REGIONS = 256;
+// null -> mmap -ENOMEM -> musl "Out of memory" loading libxul. 256 was enough to
+// LOAD firefox but once it reaches the webrender render thread, mozjemalloc
+// scatters hundreds more arena chunks across the shared address space (regions are
+// per-address-space via region_owner) and 256 is exhausted -> a 512-byte rust
+// alloc in the render thread returns null -> "memory allocation of 512 bytes
+// failed" -> abort. give it real headroom for startup + early use. each slot is
+// 28 bytes; 4096 -> ~114 kb/process (heap-allocated, so this is fine). (satoru)
+constexpr int PROCESS_MAX_USER_REGIONS = 4096;
 
 struct UserMemoryRegion {
     uint64_t start;
@@ -134,6 +139,12 @@ struct Process {
     int      nice;              // -20..+19, default 0
     uint8_t  sched_class;       // 0=NORMAL/CFS, 1=FIFO, 2=RR, 3=IDLE
     uint8_t  cpu_affinity;      // bitmask of allowed CPUs (bit n = CPU n)
+    // smp thread dispatch: which cpu last executed this task + when that cpu
+    // last switched away from it. a task whose old cpu may still be unwinding
+    // on its kernel stack (pre-iretq) must not be picked up by ANOTHER cpu  - 
+    // the pickers give cross-cpu resumes a ~2ms grace after release. (satoru)
+    uint8_t  last_run_cpu;
+    uint64_t released_ms;
     uint8_t  interactive_score; // 0..16; recent I/O wakes bump it, CPU burn decays it
     uint8_t  reaped;            // 1 once DestroyProcess has freed the struct (double-free guard)
     uint64_t last_wake_ms;      // wall-time of most recent block->ready transition
@@ -168,6 +179,13 @@ struct Process {
     // tls or vector registers. fpu_state is the 512-byte fxsave image and must
     // stay 16-byte aligned. (satoru)
     uint64_t fs_base;
+    // per-thread USER gs base (arch_prctl ARCH_SET_GS). firefox's rlbox/wasm2c
+    // sandbox reads thread-locals through %gs, so a thread that set its gs base
+    // must have it restored on every switch-in  -  exactly like fs_base. 0 = never
+    // set (the common case; musl uses fs for tls). NOT read from an msr on
+    // save-out: it only ever changes via arch_prctl, which persists it here, so
+    // the stable stored value is authoritative. (satoru)
+    uint64_t gs_base;
     alignas(16) uint8_t fpu_state[512];
 
     bool is_user() const { return (flags & PROCESS_FLAG_USER) != 0; }
@@ -230,12 +248,26 @@ public:
     // dispatch loop runs it via Userspace::RunProcessWithArgs). marks it Running
     // under the lock; returns null if none is allowed on this cpu. (satoru)
     static Process* ClaimFreshUserForCpu(uint32_t cpu);
+    // claim a Ready sibling THREAD (clone with a saved user frame) this cpu may
+    // RESUME  -  the smp thread-dispatch path. an ap pulls a ready thread of a
+    // multi-threaded process (cpu_affinity 0 = any cpu) and irets into its saved
+    // frame, so it runs in parallel with the thread-group leader on the bsp. the
+    // leader itself is never claimed here (its userspace session lives on the
+    // bsp). the winner is marked Running under the scheduler lock so no two
+    // cores can double-run one thread. (satoru)
+    static Process* ClaimReadyThreadForCpu(uint32_t cpu);
     // smp phase 4: called from an application processor's LAPIC-timer ISR to
     // PREEMPT the user thread it is running  -  save the interrupted frame and
     // switch to the next runnable user thread for this cpu (the threads of one
     // process share an address space, so no cr3 change). ring-3 frames only; a
     // tick in the kernel/idle is ignored. (satoru)
     static void ApTimerPreempt(InterruptFrame* frame);
+    // gs-base fixup for the IRQ preempt paths (kls_timer_preempt / ApTimerPreempt).
+    // those enter via isr_common, which does NOT swapgs, so on iret the ACTIVE gs
+    // must already hold the resumed thread's user gs and KERNEL_GS_BASE must hold
+    // the per-cpu ptr  -  the opposite of the syscall (swapgs) path that LoadUserFrame
+    // targets. call after a successful ScheduleNextUser in an IRQ context. (satoru)
+    static void FixupGsAfterIsrSwitch();
     static void ReapProcess(Process* proc);
     static void DestroyProcess(Process* proc);
     static void Schedule();

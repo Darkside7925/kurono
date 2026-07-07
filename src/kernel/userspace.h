@@ -34,6 +34,12 @@ public:
     static void Init();
     static bool IsReady();
     static bool IsActive();
+    // smp thread dispatch: mark a directly-resumed thread as this cpu's active
+    // user process. an ap that irets into a claimed sibling thread never goes
+    // through RunProcessWithArgs, and IsActive() (per-cpu) gates the syscall
+    // entry's frame save + linux-current sync AND sys_exit's switch path  -  all
+    // of which silently no-op'd on the aps without this. (satoru)
+    static void SetActiveForThisCpu(Process* p);
 
     static Process* CreateDemoProcess();
     static int RunProcess(Process* proc);

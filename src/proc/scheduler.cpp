@@ -46,7 +46,12 @@ constexpr uint64_t USER_STACK_BYTES = 8 * 1024 * 1024;
 // carries ~824-byte ControlMsg locals. that chain exceeds 16K and overflowed the
 // kernel stack, smashing a return address -> a ring-0 #UD (RIP=3) the first time a
 // firefox surface committed. 64K gives the deep path headroom. (satoru)
-constexpr uint64_t KERNEL_STACK_BYTES = 64 * 1024;
+// 64K->128K: once firefox's crypto (NSS softoken: cert-db SQLite I/O + login
+// manager + SDR) runs during browser-window init, the syscall chain deepens
+// further and, combined with that synchronous compositor path, overflowed 64K  - 
+// a smashed return jumped to garbage and #UD-panicked (ring-0, RIP not in kernel
+// text). 128K covers the combined crypto + compositor depth. (satoru)
+constexpr uint64_t KERNEL_STACK_BYTES = 128 * 1024;
 constexpr uint64_t USER_STACK_TOP = USERSPACE_BASE + 0x00200000ULL;
 // user mmap arena base. MUST sit above all identity-mapped physical ram: the
 // kernel accesses every physical frame through the low identity map (phys==virt),
@@ -487,6 +492,10 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
     proc->rsp = (uintptr_t)child_stack;
     proc->rbp = 0;
     proc->next_mmap_base = parent->next_mmap_base;
+    // (satoru) start the child at the parent's vruntime, not 0. with the cfs charge
+    // now applied in ScheduleNextUser, a vruntime-0 child would otherwise monopolize
+    // the cpu until it caught up to its already-accumulated siblings. (satoru)
+    proc->vruntime = parent->vruntime;
 
     // clone_settls: store the thread's tls as its saved fs base so LoadUserFrame
     // installs it when this thread is switched in. do NOT wrmsr here  -  the
@@ -574,6 +583,7 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     if (!proc || !frame || !proc->is_user() || !proc->has_user_frame) return false;
 
     SetCurrentForThisCpu(proc);   // per-cpu: bsp global / ap PerCpu.current (satoru)
+    proc->last_run_cpu = (uint8_t)SMP::CpuIndex();   // cross-cpu resume grace (satoru)
     proc->state = Process_Running;
     HAL::SetKernelStack(proc->kernel_stack_top);
     KernelVMM::ActivateAddressSpace(proc->address_space);
@@ -584,6 +594,17 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     __asm__ __volatile__("wrmsr" : : "c"(MSR_FS_BASE), "a"(lo), "d"(hi));
     __asm__ __volatile__("fxrstor %0" : : "m"(proc->fpu_state));
 
+    // restore this task's USER gs base into KERNEL_GS_BASE (0xC0000102). we run
+    // in the kernel with active gs = per-cpu ptr; the syscall stub's swapgs on
+    // exit swaps active <-> KERNEL_GS_BASE, so writing the thread's gs_base here
+    // installs it in ring-3 %gs while the per-cpu ptr (currently active) lands
+    // back in KERNEL_GS_BASE for the next entry. threads that never set a gs
+    // base carry 0 = the default. firefox's rlbox/wasm2c reads thread-locals via
+    // %gs, so without this the sandbox faults at the raw tls offset. (satoru)
+    constexpr uint32_t MSR_KERNEL_GS_BASE_ = 0xC0000102;
+    uint32_t glo = (uint32_t)proc->gs_base, ghi = (uint32_t)(proc->gs_base >> 32);
+    __asm__ __volatile__("wrmsr" : : "c"(MSR_KERNEL_GS_BASE_), "a"(glo), "d"(ghi));
+
     *frame = proc->user_frame;
     return true;
 }
@@ -592,6 +613,16 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
 // n must be set to run on cpu n. (satoru)
 static inline bool cpu_allowed(const Process* p, uint32_t cpu) {
     return p->cpu_affinity == 0 || (p->cpu_affinity & (1u << cpu)) != 0;
+}
+
+// cross-cpu resume grace: after a cpu switches away from a task, its kernel
+// stack stays live until that cpu's final iretq. the same cpu may re-pick the
+// task immediately (it can't race itself), but ANOTHER cpu must wait ~2ms past
+// the release timestamp so the unwind window (microseconds, but real) has
+// passed. fresh tasks (released_ms 0) pass trivially. (satoru)
+static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
+    if ((uint32_t)p->last_run_cpu == cpu) return true;
+    return Scheduler::NowMs() > p->released_ms + 1;
 }
 
 // the user pick  -  assumes g_sched_lock is held. selects the best Ready user
@@ -606,6 +637,7 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     for (Process* c = Scheduler::ready_queue; c; c = c->next) {
         if (!c->is_user() || c->state != Process_Ready || !c->has_user_frame) continue;
         if (!cpu_allowed(c, cpu)) continue;
+        if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
         if (c->sched_class == 1 || c->sched_class == 2) {       // FIFO/RR
             if (!fifo || c->priority < fifo->priority) fifo = c;
             continue;
@@ -620,11 +652,13 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     Process* start = (after && after->next) ? after->next : Scheduler::ready_queue;
     for (Process* cursor = start; cursor; cursor = cursor->next)
         if (cursor->is_user() && cursor->state == Process_Ready &&
-            cursor->has_user_frame && cpu_allowed(cursor, cpu))
+            cursor->has_user_frame && cpu_allowed(cursor, cpu) &&
+            cross_run_grace_ok(cursor, cpu))
             return cursor;
     for (Process* cursor = Scheduler::ready_queue; cursor && cursor != start; cursor = cursor->next)
         if (cursor->is_user() && cursor->state == Process_Ready &&
-            cursor->has_user_frame && cpu_allowed(cursor, cpu))
+            cursor->has_user_frame && cpu_allowed(cursor, cpu) &&
+            cross_run_grace_ok(cursor, cpu))
             return cursor;
     return nullptr;
 }
@@ -647,13 +681,40 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
     Process* next = nullptr;
     {
         uint64_t f; g_sched_lock.LockIrqSave(&f);
-        if (cur && cur->state == Process_Running) cur->state = Process_Ready;
+        if (cur) {
+            // stamp the release BEFORE the pick: whatever happens next, this
+            // cpu is abandoning cur's kernel context (its stack stays in use
+            // until our iretq  -  the grace the pickers honour). (satoru)
+            cur->last_run_cpu = (uint8_t)cpu;
+            cur->released_ms  = NowMs();
+        }
+        if (cur && cur->state == Process_Running) {
+            // (satoru) charge cpu time to the OUTGOING thread so the cfs pick rotates.
+            // this per-cpu user-thread switch (ApTimerPreempt + the futex/yield paths)
+            // never passed through Tick's vruntime accounting  -  so a firefox worker that
+            // spins without blocking kept the LOWEST vruntime and was re-picked forever,
+            // starving the ready chrome main (the "main st=0 Ready but never runs, one
+            // worker always Running" stall). mirror Tick's nice-weighted charge. (satoru)
+            static const uint32_t kNiceW[40] = {
+                88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+                 9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
+                 1024,   820,   655,   526,   423,   335,   272,   215,   172,   137,
+                  110,    87,    70,    56,    45,    36,    29,    23,    18,    15 };
+            int nn = cur->nice; if (nn < -20) nn = -20; if (nn > 19) nn = 19;
+            uint32_t ww = kNiceW[nn + 20];
+            cur->vruntime += (1024u * 1024u) / (ww ? ww : 1);
+            cur->state = Process_Ready;
+        }
         Process* cand = pick_next_user_nolock(cur, cpu);
         if (cand && cand != cur) {
             cand->state = Process_Running;
             next = cand;
-        } else if (cur && cur->is_user()) {
-            cur->state = Process_Running;            // keep running cur (best/only)
+        } else if (cur && cur->is_user() && cur->state == Process_Ready) {
+            // keep running cur  -  but ONLY if it was Ready because WE released it
+            // above. resurrecting a Blocked/Terminated cur to Running here let a
+            // thread that just exited on an ap live forever (and hid it from the
+            // pickers). the block-undo paths set Running themselves. (satoru)
+            cur->state = Process_Running;
         }
         g_sched_lock.UnlockIrqRestore(f);
     }
@@ -712,6 +773,44 @@ Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
     return pick;
 }
 
+// resume-claim for the ap thread-dispatch loop: pick the lowest-vruntime Ready
+// SIBLING THREAD this cpu may run and mark it Running under the lock. threads
+// only  -  the thread-group leader is bsp-owned (its exit must unwind the bsp's
+// userspace session), and a fresh process without a saved frame must be
+// LAUNCHED (ClaimFreshUserForCpu), not resumed. (satoru)
+Process* Scheduler::ClaimReadyThreadForCpu(uint32_t cpu) {
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* pick = nullptr;
+    for (Process* c = ready_queue; c; c = c->next) {
+        if (!c->is_user() || !c->is_thread()) continue;
+        if (c->state != Process_Ready || !c->has_user_frame) continue;
+        if (c->sched_class == 3) continue;                    // idle class last (satoru)
+        if (!cpu_allowed(c, cpu)) continue;
+        if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
+        if (!pick || c->vruntime < pick->vruntime) pick = c;
+    }
+    if (pick) pick->state = Process_Running;
+    g_sched_lock.UnlockIrqRestore(f);
+    return pick;
+}
+
+// see the header: undo LoadUserFrame's swapgs-oriented KERNEL_GS_BASE write for
+// the no-swapgs IRQ path. after this, ring-3 iret resumes with active gs =
+// resumed thread's user gs and KERNEL_GS_BASE = per-cpu ptr (so the next syscall
+// entry swapgs still finds the per-cpu block). a thread that never set a gs base
+// carries 0, which is the correct default. (satoru)
+void Scheduler::FixupGsAfterIsrSwitch() {
+    Process* cur = GetCurrentProcess();
+    uint64_t gs  = cur ? cur->gs_base : 0;
+    uint64_t percpu = (uint64_t)(uintptr_t)SMP::Current();
+    constexpr uint32_t MSR_GS_BASE        = 0xC0000101;
+    constexpr uint32_t MSR_KERNEL_GS_BASE = 0xC0000102;
+    uint32_t alo = (uint32_t)gs, ahi = (uint32_t)(gs >> 32);
+    __asm__ __volatile__("wrmsr" : : "c"(MSR_GS_BASE), "a"(alo), "d"(ahi));
+    uint32_t plo = (uint32_t)percpu, phi = (uint32_t)(percpu >> 32);
+    __asm__ __volatile__("wrmsr" : : "c"(MSR_KERNEL_GS_BASE), "a"(plo), "d"(phi));
+}
+
 void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
     if (!frame || (frame->cs & 3) != 3) return;   // ring-3 user code only (satoru)
     Process* cur = GetCurrentProcess();
@@ -722,7 +821,18 @@ void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
     // so no address-space switch is needed. ring-3 only, so the AP never holds a
     // kernel lock when this fires -> ScheduleNextUser's lock is safe. (satoru)
     SaveUserFrame(cur, frame);
-    ScheduleNextUser(frame);
+    if (ScheduleNextUser(frame)) {
+        // isr path (no swapgs on iret): fix up gs so the resumed thread's user
+        // gs is active and KERNEL_GS_BASE holds the per-cpu ptr. (satoru)
+        FixupGsAfterIsrSwitch();
+    } else {
+        // staying on the same thread: reload cr3 anyway so a stale translation
+        // (a sibling's munmap/madvise on another core that raced the shootdown
+        // ipi) is bounded to one timer period, not forever. (satoru)
+        uint64_t c3;
+        __asm__ __volatile__("mov %%cr3, %0" : "=r"(c3));
+        __asm__ __volatile__("mov %0, %%cr3" : : "r"(c3) : "memory");
+    }
 }
 
 void Scheduler::ReapProcess(Process* proc) {
@@ -763,7 +873,16 @@ void Scheduler::DestroyProcess(Process* proc) {
             KernelVMM::DestroyAddressSpace(proc->address_space);
         }
         if (proc->kernel_stack_top) {
-            PMM::FreeBytes((void*)(uintptr_t)(proc->kernel_stack_top - KERNEL_STACK_BYTES), KERNEL_STACK_BYTES);
+            // never free the kernel stack we are CURRENTLY EXECUTING ON (a thread
+            // reaped from inside its own exit syscall): with smp another core
+            // reuses + zeroes the frames immediately, smashing the live exit path
+            // under our feet. leak it instead  -  rare, and only 64k. (satoru)
+            uint64_t rsp_now;
+            __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp_now));
+            uint64_t kbase = proc->kernel_stack_top - KERNEL_STACK_BYTES;
+            if (rsp_now < kbase || rsp_now >= proc->kernel_stack_top) {
+                PMM::FreeBytes((void*)(uintptr_t)kbase, KERNEL_STACK_BYTES);
+            }
         }
     }
 
@@ -1466,16 +1585,24 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     // consume data that arrived while it slept (firefox's wayland proxy hung
     // here waiting on get_registry). wake them so a spinning sibling's
     // poll_try_deschedule retry can switch back into them. (satoru)
-    for (Process* q = ready_queue; q; q = q->next) {
-        if (q->is_user() && q->state == Process_Blocked && q->sleep_ticks > 0) {
-            if (q->sleep_ticks > ms_elapsed) {
-                q->sleep_ticks -= ms_elapsed;
-            } else {
-                q->sleep_ticks = 0;
-                q->state = Process_Ready;
-                if (q->interactive_score < 16) q->interactive_score += 2;
+    {
+        // hold the cross-core scheduler lock for the walk: with smp thread
+        // dispatch an ap may be claiming/removing queue nodes at this exact
+        // moment (the documented -smp 4 re-ready race). LockIrqSave is safe
+        // here (irq context, cli while held, aps hold it only briefly). (satoru)
+        uint64_t lf; g_sched_lock.LockIrqSave(&lf);
+        for (Process* q = ready_queue; q; q = q->next) {
+            if (q->is_user() && q->state == Process_Blocked && q->sleep_ticks > 0) {
+                if (q->sleep_ticks > ms_elapsed) {
+                    q->sleep_ticks -= ms_elapsed;
+                } else {
+                    q->sleep_ticks = 0;
+                    q->state = Process_Ready;
+                    if (q->interactive_score < 16) q->interactive_score += 2;
+                }
             }
         }
+        g_sched_lock.UnlockIrqRestore(lf);
     }
 
     Process* p = current_process;

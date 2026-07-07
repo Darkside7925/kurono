@@ -204,11 +204,20 @@ static bool boot_get_value(const char* cmdline, const char* key, char* out, int 
 
     int key_len = stlen(key);
     for (const char* p = cmdline; *p; p++) {
-        if (p != cmdline && !stspace(*(p - 1))) continue;
+        // grub re-quotes a spaced argument around the WHOLE token
+        // ("key=multi word value"), so the char before the key may be an
+        // opening quote rather than a space  -  accept it and remember it as
+        // the value terminator so the spaces inside survive. (satoru)
+        char lead_quote = 0;
+        if (p != cmdline) {
+            char prev = *(p - 1);
+            if (prev == '"' || prev == '\'') lead_quote = prev;
+            else if (!stspace(prev)) continue;
+        }
         if (!ststarts_with(p, key) || p[key_len] != '=') continue;
 
         const char* value = p + key_len + 1;
-        char quote = 0;
+        char quote = lead_quote;
         if (*value == '"' || *value == '\'') {
             quote = *value;
             value++;
@@ -1194,6 +1203,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // without the token the APs park (hlt) exactly as before. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.apsched=1") || boot_has_token(boot_cmdline, "kurono.apsched")) {
             SMP::SetApUserSched(true);
+        }
+        // smp thread dispatch: aps also RESUME ready sibling threads of a
+        // multi-threaded process (firefox's compositor/render/ipc threads run in
+        // parallel with the chrome main on the bsp). same before-StartAPs
+        // ordering as apsched. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.apthreads=1") || boot_has_token(boot_cmdline, "kurono.apthreads")) {
+            SMP::SetApThreadSched(true);
         }
         boot_get_value(boot_cmdline, "kurono.cli.run", boot_cli_run, (int)sizeof(boot_cli_run));
         // optional GUI autorun: open Terminal and queue a command. Used purely

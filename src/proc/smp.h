@@ -8,7 +8,8 @@
 
 #define SMP_MAX_CPUS 32
 
-struct Process;  // fwd  -  set per-cpu in the scheduler phase (satoru)
+struct Process;        // fwd  -  set per-cpu in the scheduler phase (satoru)
+struct InterruptFrame; // fwd  -  ApIdleFrame fills one for the syscall exit path (satoru)
 
 //  one of these per logical cpu, indexed by a dense cpu index (0 = bsp). the
 //  apic-id -> index map lets a running cpu find its own block in O(1). (satoru)
@@ -63,5 +64,25 @@ public:
     // OFF so a normal boot parks the APs exactly as before. (satoru)
     static void SetApUserSched(bool on);
     static bool ApUserSched();
+
+    // smp thread dispatch  -  when enabled, each ap also RESUMES ready sibling
+    // threads of multi-threaded processes (clone threads with a saved user
+    // frame, affinity-permitting), so e.g. firefox's compositor/render/ipc
+    // threads run truly in parallel with the chrome main on the bsp. default
+    // OFF (kurono.apthreads=1 enables it before the aps start). (satoru)
+    static void SetApThreadSched(bool on);
+    static bool ApThreadSched();
+
+    // fill f with a ring-0 reentry into this ap's dispatch loop: the syscall
+    // exit path irets into it when the ap's current thread exits and nothing
+    // else is claimable for this cpu. (satoru)
+    static void ApIdleFrame(InterruptFrame* f);
+
+    // tlb shootdown: ipi (vector 0x41) every OTHER online cpu to reload cr3,
+    // then wait (bounded) for their acks. call after unmapping/reprotecting
+    // user pages of an address space whose threads may run on other cores;
+    // no-op with a single online cpu. (satoru)
+    static void BroadcastTlbFlush();
+    static void HandleTlbIpi();   // receiver side: reload cr3 + ack (satoru)
 };
 // end (satoru)

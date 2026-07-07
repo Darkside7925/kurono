@@ -1,6 +1,7 @@
 #include "heap.h"
 #include "pmm.h"
 #include "../drivers/serial.h"
+#include "../proc/smp.h"   // cpu index for the cross-core heap lock (satoru)
 
 //  kernel heap  -  segregated free-list allocator with coalescing
 //
@@ -55,14 +56,40 @@ static void heap_warn(const char* msg) {
 // mid-Alloc/Free (e.g. between freelist_remove and mark_used, or mid-coalesce
 // with g_free_head dangling), the IRQ-context allocation corrupts a block
 // header -> "Free() bad magic" (the 63x-at-boot symptom; the warn->serial->kvfs
-// logging path then amplifies one corruption to the saturated budget). cli/sti
-// (NOT a spinlock) is the correct primitive: the contention is process-vs-IRQ
-// on a single cpu, so a spinlock would deadlock. saves/restores IF so nested
-// guards don't prematurely re-enable. (satoru)
+// logging path then amplifies one corruption to the saturated budget). since
+// smp thread dispatch, cli alone is not enough: an ap running a user thread's
+// syscall allocates concurrently with the bsp's kernel procs, so the guard is
+// now cli + a CROSS-CORE lock. the lock is cpu-owner-recursive because same-cpu
+// re-entry still exists and cli can't stop it: a #pf (kernel stack grow, kmemx)
+// mid-Alloc re-enters the heap on the SAME core  -  a plain spinlock would
+// self-deadlock there. saves/restores IF so nested guards don't prematurely
+// re-enable. (satoru)
+static volatile uint32_t g_heap_lock_word  = 0;
+static volatile int      g_heap_lock_owner = -1;
 struct HeapIrqGuard {
     uint64_t flags;
-    HeapIrqGuard()  { __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory"); }
-    ~HeapIrqGuard() { if (flags & 0x200ULL) __asm__ __volatile__("sti" ::: "memory"); }
+    bool nested;
+    HeapIrqGuard() {
+        __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+        int cpu = (int)SMP::CpuIndex();
+        if (g_heap_lock_owner == cpu) { nested = true; return; }
+        nested = false;
+        for (;;) {
+            uint32_t expected = 0;
+            if (__atomic_compare_exchange_n(&g_heap_lock_word, &expected, 1u, false,
+                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+            do { __asm__ __volatile__("pause" ::: "memory"); }
+            while (__atomic_load_n(&g_heap_lock_word, __ATOMIC_RELAXED) != 0);
+        }
+        g_heap_lock_owner = cpu;
+    }
+    ~HeapIrqGuard() {
+        if (!nested) {
+            g_heap_lock_owner = -1;
+            __atomic_store_n(&g_heap_lock_word, 0u, __ATOMIC_RELEASE);
+        }
+        if (flags & 0x200ULL) __asm__ __volatile__("sti" ::: "memory");
+    }
 };
 
 static inline uint64_t* footer_of(HeapBlock* b) {

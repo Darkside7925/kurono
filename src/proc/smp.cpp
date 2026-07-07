@@ -13,6 +13,14 @@
 extern "C" uint8_t _binary_ap_trampoline_bin_start[];
 extern "C" uint8_t _binary_ap_trampoline_bin_end[];
 
+//  switch_to.asm: pivot onto a saved InterruptFrame and iretq into ring-3  - 
+//  how an ap RESUMES a claimed sibling thread. never returns. (satoru)
+extern "C" [[noreturn]] void ap_enter_user_frame(InterruptFrame* f);
+
+//  the ap dispatch loop (defined below ap_entry)  -  also the iret target the
+//  syscall exit path uses when an ap runs out of threads. (satoru)
+extern "C" [[noreturn]] void ap_dispatch_reenter();
+
 //  smp phase 1  -  lapic enable + cpu enumeration + per-cpu blocks. see smp.h. (satoru)
 
 namespace {
@@ -26,6 +34,13 @@ namespace {
     //  phase 3d gate + a lock so two cores' ap-dispatch serial lines don't interleave. (satoru)
     volatile bool g_ap_user_sched = false;
     Spinlock      g_ap_log_lock;
+
+    //  thread-dispatch gate (kurono.apthreads): aps also resume ready sibling
+    //  threads, giving a multi-threaded process true parallelism. (satoru)
+    volatile bool g_ap_thread_sched = false;
+
+    //  tlb-shootdown ack counter: receivers increment after reloading cr3. (satoru)
+    volatile uint32_t g_tlb_ack = 0;
 
     inline uint64_t rdmsr(uint32_t msr) {
         uint32_t lo, hi;
@@ -292,20 +307,74 @@ extern "C" void ap_entry() {
         busy_us(10000);                          // 10 ms (satoru)
         uint32_t ticks_10ms = 0xFFFFFFFFu - SMP::LapicRead(0x390);
         SMP::LapicWrite(0x380, 0);              // stop (satoru)
-        uint32_t period = ticks_10ms ? ticks_10ms : 1000000u;   // ~100 hz (ticks in 10 ms) (satoru)
+        // ~100 hz. (tried 1 khz to tighten thread handshakes  -  firefox stalled
+        // right after its thread-spawn burst: the 10x preempt rate on the aps
+        // widened a save/resume race window. back to the proven 10 ms grain.)
+        // (satoru)
+        uint32_t period = ticks_10ms ? ticks_10ms : 1000000u;   // ticks in 10 ms (satoru)
         SMP::LapicWrite(0x320, 0x40u | (1u << 17));   // LVT timer: vector 0x40, periodic (satoru)
         SMP::LapicWrite(0x380, period);                // arm (satoru)
         __asm__ volatile("sti");                       // let the timer fire on this ap (satoru)
     }
 
-    //  phase 3d  -  cooperative user-thread dispatch. when the gate is off we park
-    //  exactly as before (hlt). when on, claim a fresh Ready user process this cpu
-    //  is allowed to run and launch it in ring-3 via the now-per-cpu
-    //  RunProcessWithArgs; it runs in parallel with the bsp and yields back here
-    //  when it exits (its exit longjmps to THIS cpu's return context). spin-poll
-    //  for work while the gate is on (no per-ap timer yet  -  that is phase 4). (satoru)
+    //  dispatch forever (fresh procs and/or resumable threads, per the gates). (satoru)
+    ap_dispatch_reenter();
+}
+
+//  the ap dispatch loop, extern so the syscall exit path can iret BACK into it
+//  (via SMP::ApIdleFrame) when this ap's last thread exits. two claim sources:
+//  1) thread resume (kurono.apthreads): pull a Ready sibling thread of a
+//     multi-threaded process and iretq into its saved frame  -  from then on the
+//     per-ap LAPIC timer (ApTimerPreempt) multiplexes this cpu across the ready
+//     threads, giving the process TRUE parallelism with the bsp.
+//  2) phase 3d fresh-proc launch (kurono.apsched): claim an explicitly-pinned
+//     never-entered user process and run it via RunProcessWithArgs. (satoru)
+extern "C" [[noreturn]] void ap_dispatch_reenter() {
     uint32_t idx = SMP::CpuIndex();
+    Scheduler::SetCurrentForThisCpu(nullptr);   // no task on this cpu right now (satoru)
+    Userspace::SetActiveForThisCpu(nullptr);    // no active user session either (satoru)
     for (;;) {
+        if (g_ap_thread_sched) {
+            Process* t = Scheduler::ClaimReadyThreadForCpu(idx);
+            if (t) {
+                {
+                    // claim trace  -  resumes are infrequent (an idle ap picking up a
+                    // ready sibling), so this stays low-volume. (satoru)
+                    uint64_t lf; g_ap_log_lock.LockIrqSave(&lf);
+                    SerialLogger::Log("[apr] cpu"); SerialLogger::LogDec((int)idx);
+                    SerialLogger::Log(" resume pid="); SerialLogger::LogDec((int)t->pid);
+                    SerialLogger::Log("\r\n");
+                    g_ap_log_lock.UnlockIrqRestore(lf);
+                }
+                //  resume the thread from its saved user frame. LoadUserFrame sets
+                //  this cpu's current task, tss.rsp0 + gs:8, cr3, fs base and fpu;
+                //  the asm pivot then irets into ring-3. never returns  -  the LAPIC
+                //  timer preempt keeps this cpu multiplexing ready threads, and a
+                //  thread exit with nothing left claimable irets back here. (satoru)
+                InterruptFrame f;
+                if (Scheduler::LoadUserFrame(t, &f)) {
+                    //  the per-cpu userspace-active gate: without it IsActive() is
+                    //  false on this ap and the whole linux syscall layer no-ops
+                    //  (no frame save, no linux current, sys_exit does nothing  - 
+                    //  the thread's exit loop spins forever). (satoru)
+                    Userspace::SetActiveForThisCpu(t);
+                    //  sync this cpu's linux current-process to the resumed thread,
+                    //  or LinuxSyscall::Current() is null on the ap and syscalls
+                    //  (mremap stack-probe) loop on ENOMEM (the [eag] pid=-1 spam).
+                    //  (satoru)
+                    LinuxSyscall::SyncCurrentToTask(t);
+                    //  ap_enter_user_frame irets WITHOUT swapgs, so set the active
+                    //  gs to the thread's user gs (and park the per-cpu ptr in
+                    //  KERNEL_GS_BASE)  -  the no-swapgs form, same as the isr
+                    //  preempt path. (satoru)
+                    Scheduler::FixupGsAfterIsrSwitch();
+                    ap_enter_user_frame(&f);
+                }
+                //  load failed (no saved frame?)  -  put it back. (satoru)
+                t->state = Process_Ready;
+                Scheduler::SetCurrentForThisCpu(nullptr);
+            }
+        }
         if (g_ap_user_sched) {
             Process* t = Scheduler::ClaimFreshUserForCpu(idx);
             if (t) {
@@ -341,15 +410,71 @@ extern "C" void ap_entry() {
             __asm__ volatile("pause");
             continue;
         }
-        //  gate off: parked exactly as before. the gate is decided at boot from
-        //  kurono.apsched (set before the APs start), so a parked ap never needs to
-        //  be woken mid-run; an IPI-wake for a runtime toggle is phase 4. (satoru)
+        if (g_ap_thread_sched) {
+            //  thread gate on, nothing claimable right now: back off ~50us so the
+            //  idle aps don't hammer g_sched_lock at core speed while the bsp is
+            //  trying to schedule. (satoru)
+            busy_us(50);
+            continue;
+        }
+        //  gates off: parked exactly as before. the gates are decided at boot from
+        //  kurono.apsched / kurono.apthreads (set before the APs start), so a parked
+        //  ap never needs to be woken mid-run; an IPI-wake for a runtime toggle is
+        //  phase 4. (satoru)
         __asm__ volatile("hlt; pause");
     }
 }
 
 void SMP::SetApUserSched(bool on) { g_ap_user_sched = on; }
 bool SMP::ApUserSched()           { return g_ap_user_sched; }
+
+void SMP::SetApThreadSched(bool on) { g_ap_thread_sched = on; }
+bool SMP::ApThreadSched()           { return g_ap_thread_sched; }
+
+//  ring-0 reentry frame into the dispatch loop, for the syscall exit path: the
+//  ap's current thread just exited and nothing else is claimable, so the
+//  handler's iretq must land somewhere  -  back at the top of the claim loop, on
+//  this cpu's (currently dead) bring-up stack. IF=1 in rflags so the lapic
+//  timer + tlb ipis keep firing while the loop spins. (satoru)
+void SMP::ApIdleFrame(InterruptFrame* f) {
+    if (!f) return;
+    for (unsigned long i = 0; i < sizeof(InterruptFrame); i++) ((uint8_t*)f)[i] = 0;
+    PerCpu* me = Current();
+    f->rip    = (uint64_t)(uintptr_t)&ap_dispatch_reenter;
+    f->cs     = (uint64_t)GDT_KERNEL_CODE_SELECTOR;
+    f->ss     = (uint64_t)GDT_KERNEL_DATA_SELECTOR;
+    f->rsp    = me ? me->kernel_stack_top : 0;
+    f->rflags = 0x202ULL;
+}
+
+//  tlb shootdown. sender: pulse vector 0x41 at every other cpu (all-excluding-
+//  self shorthand) and wait  -  bounded  -  for each online peer to ack. bounded
+//  because a peer may briefly sit with IF=0 (a spinlock hold); the per-ap timer
+//  cr3 reload in ApTimerPreempt bounds any missed window to one tick. (satoru)
+void SMP::BroadcastTlbFlush() {
+    uint32_t online = OnlineCount();
+    if (online <= 1) return;
+    __atomic_store_n(&g_tlb_ack, 0u, __ATOMIC_RELEASE);
+    //  wait for any prior ipi to leave the icr (delivery status, bit 12). (satoru)
+    for (int i = 0; i < 100000 && (LapicRead(0x300) & (1u << 12)); i++)
+        __asm__ volatile("pause");
+    //  fixed delivery, assert, destination shorthand 11 = all excluding self. (satoru)
+    LapicWrite(0x300, (3u << 18) | (1u << 14) | 0x41u);
+    uint32_t want = online - 1;
+    for (int i = 0; i < 400000; i++) {   // ~sub-ms bound (satoru)
+        if (__atomic_load_n(&g_tlb_ack, __ATOMIC_ACQUIRE) >= want) return;
+        __asm__ volatile("pause");
+    }
+    //  timed out  -  a peer had interrupts masked; its next timer tick reloads
+    //  cr3, so proceed rather than wedge the unmap path. (satoru)
+}
+
+void SMP::HandleTlbIpi() {
+    uint64_t c3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(c3) : "memory");
+    __atomic_fetch_add(&g_tlb_ack, 1u, __ATOMIC_ACQ_REL);
+}
 
 void SMP::StartAPs() {
     if (g_cpu_count <= 1) {

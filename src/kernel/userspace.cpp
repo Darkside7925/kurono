@@ -36,6 +36,14 @@ bool Userspace::IsActive() {
     return cpu().active_process != nullptr;
 }
 
+// smp thread dispatch: an ap resumes claimed sibling threads directly (no
+// RunProcessWithArgs session), so it must mark its per-cpu active process
+// explicitly or every IsActive() gate on that cpu stays false and the linux
+// syscall layer silently no-ops there. (satoru)
+void Userspace::SetActiveForThisCpu(Process* p) {
+    cpu().active_process = p;
+}
+
 bool Userspace::MapUserPage(Process* proc, uint64_t virt_addr, const void* data,
                             size_t len, uint64_t flags) {
     if (!proc || !proc->is_user()) return false;

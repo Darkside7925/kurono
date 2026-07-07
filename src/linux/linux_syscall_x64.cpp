@@ -18,6 +18,7 @@
 #include "../hal/hal.h"
 #include "../kernel/userspace.h"
 #include "../proc/scheduler.h"   // full Process def for LinuxProcess::task->exe_path (satoru)
+#include "../proc/smp.h"         // cpu index in the [ff] trace (satoru)
 #include "../kernel/udf.h"       // SYS_UDF_CALL -> user driver framework proxy (satoru)
 
 // Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
@@ -342,6 +343,84 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
     // InterruptFrame). only mmap (below) needs it  -  the 6th arg is its file
     // offset; everything else ignores it. (satoru)
 
+    // (satoru) TEMP [ff]: trace the firefox worker tasks (kurono pids 100..139;
+    // getpid()=28 is the tgid, not the task pid) to localize the paint stall.
+    // per-pid dedup of consecutive syscalls + global cap. tag = kurono pid, nr =
+    // x64 syscall number. trace stops for a blocked thread (last nr = what it
+    // waits in); loops for a spinner. remove before commit.
+    {
+        LinuxProcess* cpff = LinuxSyscall::Current();
+        // (satoru) gated OFF for the checkpoint: this fired ~52k serial lines/boot
+        // (every firefox-pid syscall), the single biggest hidden boot cost. NOTE:
+        // the serial delay it introduced also damped the multicore startup timing
+        // races (a heisenbug workaround)  -  if the pre-mainRun stall resurfaces with
+        // this off, the real fix is the futex lost-wake / AS-mutation lock, not
+        // re-enabling the tracer. flip to true to trace again.
+        if (false && cpff && cpff->pid >= 100 && cpff->pid < 140) {
+            int fpid = cpff->pid;
+            if (nr == 202) {   // (satoru) [ftx] futex op + uaddr per thread (capped)  -  who waits, who wakes
+                static int nftx = 0;
+                if (nftx < 12000) {
+                    nftx++;
+                    SerialLogger::Log("[ftx "); SerialLogger::LogDec(fpid);
+                    SerialLogger::Log("] op="); SerialLogger::LogDec((int)(a1 & 0x7F));
+                    SerialLogger::Log(" ua="); SerialLogger::LogHex((uint32_t)(uintptr_t)a0);
+                    SerialLogger::Log("\r\n");
+                }
+            } else if (nr == 20 && fpid == 100 && a2 > 0 && a1) {
+                // (satoru) [wvx] dump the looping main's writev content (the gecko log
+                // line it repeats)  -  names the failing/retried operation = the stall
+                // root. read the iovecs directly here (where writev=20 is seen). (satoru)
+                static int wvx = 0;
+                if (wvx < 240) {
+                    struct IOVx { uint64_t base; uint64_t len; };
+                    const IOVx* v = (const IOVx*)(uintptr_t)a1;
+                    for (uint64_t iv = 0; iv < a2 && iv < 3; iv++) {
+                        const char* b = (const char*)(uintptr_t)v[iv].base;
+                        uint64_t L = v[iv].len; if (L > 120) L = 120;
+                        if (!b || L == 0) continue;
+                        wvx++;
+                        SerialLogger::Log("[wvx] fd="); SerialLogger::LogDec((int)a0);
+                        SerialLogger::Log(" :");
+                        for (uint64_t k = 0; k < L; k++) {
+                            char c = b[k];
+                            char s[2] = { (c == '\n' ? ' ' : (c >= 32 && c < 127) ? c : '.'), 0 };
+                            SerialLogger::Log(s);
+                        }
+                        SerialLogger::Log("\r\n");
+                    }
+                }
+            } else if (nr == 1 && (int)a0 == 2 && a1 && a2 > 0) {
+                // (satoru) [wr2] plain write(2, ...) capture  -  rust panic messages
+                // bypass writev, so the crash reason never hit the serial. debug.
+                static int wr2 = 0;
+                if (wr2 < 400) {
+                    wr2++;
+                    const char* b = (const char*)(uintptr_t)a1;
+                    uint64_t L = a2; if (L > 160) L = 160;
+                    SerialLogger::Log("[wr2 "); SerialLogger::LogDec(fpid);
+                    SerialLogger::Log("] :");
+                    for (uint64_t k = 0; k < L; k++) {
+                        char c = b[k];
+                        char s[2] = { (c == '\n' ? ' ' : (c >= 32 && c < 127) ? c : '.'), 0 };
+                        SerialLogger::Log(s);
+                    }
+                    SerialLogger::Log("\r\n");
+                }
+            } else {
+                static uint64_t lastff[140] = {0};
+                static int nff = 0;
+                if (nr != lastff[fpid] && nff < 40000) {
+                    lastff[fpid] = nr;
+                    SerialLogger::Log("[ff "); SerialLogger::LogDec(fpid);
+                    SerialLogger::Log("@"); SerialLogger::LogDec((int)SMP::CpuIndex());  // which core (satoru)
+                    SerialLogger::Log("] "); SerialLogger::LogDec((int)nr);
+                    SerialLogger::Log("\r\n"); nff++;
+                }
+            }
+        }
+    }
+
     // ── Direct x86_64 syscalls that need full 64-bit args or special
     //    handling and have no i386 equivalent we can route to. ──
     switch (nr) {
@@ -358,7 +437,15 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             // ARCH_SET_FS=0x1002, ARCH_SET_GS=0x1001,
             // ARCH_GET_FS=0x1003, ARCH_GET_GS=0x1004.
             constexpr uint32_t MSR_FS_BASE = 0xC0000100;
-            constexpr uint32_t MSR_GS_BASE = 0xC0000101;
+            // ARCH_SET_GS must NOT write MSR_GS_BASE (0xC0000101): firefox reaches
+            // here via the SYSCALL fast path, whose entry swapgs already moved the
+            // per-cpu pointer INTO the active gs and parked the user's gs base in
+            // KERNEL_GS_BASE. writing MSR_GS_BASE would clobber the per-cpu ptr and
+            // leave the user gs at 0 (which is exactly why rlbox/wasm2c faulted on
+            // %gs:<tls>). instead persist the base on the task + write
+            // KERNEL_GS_BASE, so the stub's exit swapgs installs it in ring-3 %gs
+            // and LoadUserFrame restores it on every future switch-in. (satoru)
+            constexpr uint32_t MSR_KERNEL_GS_BASE = 0xC0000102;
             auto wrmsr = [](uint32_t msr, uint64_t v) {
                 uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
                 asm volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
@@ -368,16 +455,25 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                 asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
                 return ((uint64_t)hi << 32) | lo;
             };
+            Process* apt = Scheduler::GetCurrentProcess();
             switch ((uint32_t)a0) {
-                case 0x1002: wrmsr(MSR_FS_BASE, a1); return 0;
-                case 0x1001: wrmsr(MSR_GS_BASE, a1); return 0;
+                case 0x1002:
+                    wrmsr(MSR_FS_BASE, a1);
+                    if (apt) apt->fs_base = a1;   // keep the saved copy in sync (satoru)
+                    return 0;
+                case 0x1001:
+                    if (apt) apt->gs_base = a1;                 // restored on switch-in (satoru)
+                    wrmsr(MSR_KERNEL_GS_BASE, a1);              // effective on syscall exit (satoru)
+                    return 0;
                 case 0x1003: {
-                    uint64_t v = rdmsr(MSR_FS_BASE);
+                    uint64_t v = apt ? apt->fs_base : rdmsr(MSR_FS_BASE);
                     if (a1) *(uint64_t*)(uintptr_t)a1 = v;
                     return 0;
                 }
                 case 0x1004: {
-                    uint64_t v = rdmsr(MSR_GS_BASE);
+                    // the live user gs base lives on the task (KERNEL_GS_BASE holds
+                    // it only between entry and exit swapgs). (satoru)
+                    uint64_t v = apt ? apt->gs_base : 0;
                     if (a1) *(uint64_t*)(uintptr_t)a1 = v;
                     return 0;
                 }
@@ -407,53 +503,22 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             return (int64_t)n;
         }
         case 89: {  // readlink(path, buf, bufsiz)
-            // /proc/self/exe → the process's real recorded exec path. gecko 140
-            // finds its binary (and thus its app directory) ONLY via this symlink
-            //  -  there is no argv[0] fallback  -  so this must yield the actual
-            // install path (e.g. /apps/firefox/firefox). everything else: -ENOENT,
-            // which callers tolerate. readlink does NOT nul-terminate. (satoru)
+            // shared resolver: /proc/self/exe, /proc/self/fd/N, kvfs symlinks, and
+            // EINVAL-for-existing-non-symlink (so musl realpath's component walk
+            // doesn't abort). readlink does NOT nul-terminate. (satoru)
             const char* path = (const char*)(uintptr_t)a0;
             char*       buf  = (char*)(uintptr_t)a1;
-            size_t      bufsiz = (size_t)a2;
-            if (!path || !buf || bufsiz == 0) return -22;  // -EINVAL
-            auto streq = [](const char* x, const char* y) {
-                while (*x && *y) { if (*x != *y) return false; x++; y++; }
-                return *x == *y;
-            };
-            if (streq(path, "/proc/self/exe")) {
-                LinuxProcess* lp = LinuxSyscall::Current();
-                const char* exe = (lp && lp->task && lp->task->exe_path[0])
-                                      ? lp->task->exe_path : nullptr;
-                if (!exe) return -2;  // -ENOENT (no recorded path)
-                size_t n = 0;
-                while (exe[n] && n < bufsiz) { buf[n] = exe[n]; n++; }
-                return (int64_t)n;
-            }
-            return -2;  // -ENOENT
+            int         bufsiz = (int)a2;
+            if (!path || !buf || bufsiz <= 0) return -22;  // -EINVAL
+            return (int64_t)LinuxSyscall::ReadlinkResolve(path, buf, bufsiz);
         }
         case 267: {  // readlinkat(dirfd, path, buf, bufsiz)
-            // musl's readlink() is implemented via this syscall, so /proc/self/exe
-            // arrives here (dirfd=AT_FDCWD). resolve it identically to case 89 so
-            // gecko's binary lookup works regardless of which libc path it took.
-            // any other target: -ENOENT (no real symlinks in kvfs). (satoru)
+            // musl's readlink() routes here (dirfd=AT_FDCWD); resolve identically. (satoru)
             const char* path = (const char*)(uintptr_t)a1;
             char*       buf  = (char*)(uintptr_t)a2;
-            size_t      bufsiz = (size_t)a3;
-            if (!path || !buf || bufsiz == 0) return -22;  // -EINVAL
-            auto streq = [](const char* x, const char* y) {
-                while (*x && *y) { if (*x != *y) return false; x++; y++; }
-                return *x == *y;
-            };
-            if (streq(path, "/proc/self/exe")) {
-                LinuxProcess* lp = LinuxSyscall::Current();
-                const char* exe = (lp && lp->task && lp->task->exe_path[0])
-                                      ? lp->task->exe_path : nullptr;
-                if (!exe) return -2;  // -ENOENT
-                size_t n = 0;
-                while (exe[n] && n < bufsiz) { buf[n] = exe[n]; n++; }
-                return (int64_t)n;
-            }
-            return -2;  // -ENOENT
+            int         bufsiz = (int)a3;
+            if (!path || !buf || bufsiz <= 0) return -22;  // -EINVAL
+            return (int64_t)LinuxSyscall::ReadlinkResolve(path, buf, bufsiz);
         }
         case 257: {  // openat: ignore dirfd if AT_FDCWD, route to open.
             if ((int)a0 == -100 /* AT_FDCWD */) {
@@ -464,6 +529,15 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             }
             return -38;
         }
+        // rename family  -  all normalize to Dispatch(LSYS_RENAMEAT2, _, oldpath,
+        // _, newpath, _) so the single KVFS-move handler serves every variant.
+        // musl's rename() picks whichever the kernel advertises; without these
+        // two, rename(82)/renameat(264) hit ENOSYS and firefox's atomic writes
+        // fail. (satoru)
+        case 82:  // rename(oldpath, newpath): a0=old, a1=new
+            return LinuxSyscall::Dispatch(316 /*LSYS_RENAMEAT2*/, 0, a0, 0, a1, 0);
+        case 264: // renameat(oldfd, oldpath, newfd, newpath): a1=old, a3=new
+            return LinuxSyscall::Dispatch(316 /*LSYS_RENAMEAT2*/, 0, a1, 0, a3, 0);
         case 19: {   // readv(fd, iovec*, iovcnt)  -  no i386 equivalent in the
             // dispatch table (only writev/#20 is mapped), so handle it directly.
             // the iovec pointer (a1) may live above 4gb in a pie process, so pass
