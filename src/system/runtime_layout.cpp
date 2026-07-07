@@ -162,12 +162,13 @@ void Init() {
        "ff00::0     ip6-mcastprefix\n"
        "ff02::1     ip6-allnodes\n"
        "ff02::2     ip6-allrouters\n");
+    // single nameserver: musl's resolver fires its queries at EVERY listed
+    // server in parallel on one socket  -  three servers would triple the udp
+    // datagrams through the 16-slot stack for no gain. 8.8.8.8 routes out the
+    // tap0 masquerade with zero host-side services. (satoru)
     wr("/system/etc/resolv.conf",
        "# Populated by Kurono NetworkManager\n"
-       "nameserver 1.1.1.1\n"
-       "nameserver 1.0.0.1\n"
-       "nameserver 8.8.8.8\n"
-       "options edns0 single-request-reopen\n");
+       "nameserver 8.8.8.8\n");
     wr("/system/etc/nsswitch.conf",
        "passwd:     files\n"
        "group:      files\n"
@@ -210,6 +211,12 @@ void Init() {
        "<fontconfig>\n"
        "  <dir>/system/fonts</dir>\n"
        "  <dir>/system/share/fonts</dir>\n"
+       // the firefox bundle ships real DejaVu TTFs under /apps/firefox/fonts;
+       // without an actual text font here fontconfig enumerates zero usable
+       // families and gecko's gfxPlatformFontList::GetDefaultFontLocked MOZ_CRASHes
+       // at startup. search the bundle dir so the DejaVu Sans/Serif/Mono aliases
+       // below resolve. (satoru)
+       "  <dir>/apps/firefox/fonts</dir>\n"
        "  <dir prefix=\"xdg\">fonts</dir>\n"
        "  <dir>~/.fonts</dir>\n"
        "  <cachedir>/home/user/.cache/fontconfig</cachedir>\n"
@@ -383,7 +390,13 @@ void Init() {
        "00500000-00510000 r--p 00100000 08:01 1 /system/bin/init\n"
        "00510000-00520000 rw-p 00110000 08:01 1 /system/bin/init\n"
        "00520000-00540000 rw-p 00000000 00:00 0 [heap]\n"
-       "7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0 [stack]\n");
+       // [stack] MUST cover kurono's real user stack so musl's pthread_getattr_np
+       // (main thread) finds the line containing its SP and skips the per-page
+       // mremap stack-extent probe. all user procs share USER_STACK_TOP=0x40200000
+       // (scheduler.cpp), stack = [top-8MB, top) = 0x3fa00000-0x40200000. the old
+       // hardcoded 0x7ffffffde000 never matched -> firefox wedged doing a ~2048-page
+       // mremap walk per pthread_getattr_np, dominating startup cpu. (satoru)
+       "3fa00000-40200000 rw-p 00000000 00:00 0 [stack]\n");
 
     // ---- /system/sys placeholders -----------------------------------
     wr("/system/sys/class/net/eth0/operstate", "up\n");
@@ -484,14 +497,21 @@ void Init() {
        "MOZ_ENABLE_WAYLAND=1\n"
        "MOZ_DISABLE_RDD_SANDBOX=1\n"
        "LIBGL_ALWAYS_SOFTWARE=1\n"
-       // kurono's compositor only blits wl_shm (no dmabuf/egl); force gecko onto
-       // the software/basic path so it commits shm buffers, never egl. (satoru)
-       "MOZ_WEBRENDER=0\n"
+       // kurono's compositor blits wl_shm only (no dmabuf/egl). firefox 140 is
+       // webrender-only, so force its SOFTWARE backend (cpu rasterizer, no GL) which
+       // commits plain shm buffers; MOZ_WEBRENDER=1 force-enables WR past the gfxInfo
+       // blocklist (=0 would leave no compositor -> #PF). (satoru)
+       "MOZ_WEBRENDER=1\n"
        "WEBRENDER_SOFTWARE=1\n"
        "MOZ_ACCELERATED=0\n"
        "MOZ_X11_EGL=0\n"
        "MOZ_DISABLE_GPU_SANDBOX=1\n"
        "MOZ_DISABLE_CONTENT_SANDBOX=1\n"
+       // (satoru) force the socket(network) process off  -  the one child proc firefox
+       // still spawns at startup; its launch parks the ipc i/o thread + wedges the
+       // chrome main at AsyncLaunch (kurono can't cleanly fork+exec a child). honoured
+       // before the cached pref check in nsIOService::UseSocketProcess. (satoru)
+       "MOZ_DISABLE_SOCKET_PROCESS=1\n"
        // gecko runs as the system uid (0) with $HOME owned by uid 1000; this is
        // its official override for the "running as root" startup refusal. (satoru)
        "MOZ_ALLOW_ROOT=1\n"

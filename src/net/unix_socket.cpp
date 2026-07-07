@@ -566,6 +566,21 @@ int KernelInject(int sd, const void* buf, int len) {
     return ring_write(s.rx, (const uint8_t*)buf, len, nullptr, s.type);
 }
 
+// kernel→client with ancillary data: same peer routing as KernelInject but
+// the ControlMsg rides the ring frame, so the client's recvmsg installs the
+// passed backing as a real memfd (SCM_RIGHTS out of an in-kernel server  - 
+// the wl_keyboard.keymap fd is the first user). (satoru)
+int KernelInjectMsg(int sd, const void* buf, int len, const ControlMsg* cm) {
+    if (!valid(sd)) return -1;
+    Socket& s = g_socks[sd];
+    int peer = s.peer_sd;
+    if (s.connected && valid(peer)) {
+        Socket& ps = g_socks[peer];
+        return ring_write(ps.rx, (const uint8_t*)buf, len, cm, ps.type);
+    }
+    return ring_write(s.rx, (const uint8_t*)buf, len, cm, s.type);
+}
+
 int ActiveCount() {
     int n = 0;
     for (int i = 0; i < UNIX_MAX_SOCKETS; i++) if (g_socks[i].in_use) n++;

@@ -53,6 +53,13 @@ namespace UnixSocket {
         // directly  -  a raw client fd number is meaningless to the kernel. (satoru)
         uint64_t passed_shm_base[UNIX_MAX_PASSED_FD];
         uint64_t passed_shm_size[UNIX_MAX_PASSED_FD];
+        // when a passed fd is an AF_UNIX socket (firefox's e10s ipc channel sent
+        // to the fork server via SCM_RIGHTS), the sender records its global socket
+        // sd here so the receiver installs a real refcounted alias of the SAME
+        // socket instead of a /dev/null placeholder -- without this the passed ipc
+        // channel was dead and the parent busy-spun on a reply. (satoru)
+        int      passed_sd[UNIX_MAX_PASSED_FD];
+        bool     passed_is_socket[UNIX_MAX_PASSED_FD];
         int      passed_fd_count;
         Credentials peer_creds;
         bool     creds_valid;
@@ -88,6 +95,10 @@ namespace UnixSocket {
     bool TakePendingControl(int sd, ControlMsg* out);
     int  Shutdown(int sd, int how);
     int  Close(int sd);
+    // bump the open-fd refcount. the fork fd-table copy calls this for an
+    // inherited socket so a later close of one fd does not tear down the peer
+    // while another fd (the child's) still references the same socket. (satoru)
+    int  Retain(int sd);
 
     int  GetSockName(int sd, char* path, int path_len);
     int  GetPeerName(int sd, char* path, int path_len);
@@ -102,6 +113,9 @@ namespace UnixSocket {
     int  PendingBytes(int sd);
     bool HasPendingConnection(int sd);   // listen fd has a backlog conn -> POLLIN (satoru)
     int  KernelInject(int sd, const void* buf, int len);  // kernel→client
+    // kernel→client with ancillary data (SCM_RIGHTS out of an in-kernel
+    // server; the wl_keyboard.keymap fd path). (satoru)
+    int  KernelInjectMsg(int sd, const void* buf, int len, const ControlMsg* cm);
 
     // Resolve a socket path back to a listening sd, or -1.
     int  Lookup(const char* path);

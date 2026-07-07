@@ -235,6 +235,7 @@ struct NetSocket {
 // errno-style codes surfaced via TCPStack::GetSockError (satoru)
 #define TCP_EINPROGRESS 115
 #define TCP_ETIMEDOUT   110
+#define TCP_ECONNREFUSED 111
 
 // keepalive tuning (ms): idle before first probe, gap between probes,
 // and probe budget before the connection is declared dead (satoru)
@@ -298,6 +299,15 @@ public:
     static bool IsWritable(int sock);
     // most-recent errno-style code for this socket (0 if none) (satoru)
     static int  GetSockError(int sock);
+
+    // lock-free state getters for the linux af_inet bridge: poll/epoll readiness
+    // must not take g_net_lock (a waiter spinning on it would convoy the
+    // NetworkProcess tick), so these are single-word reads whose staleness is
+    // bounded by the next poll iteration. (satoru)
+    static int  RxAvailable(int sock);   // bytes queued in the rx ring (0 if bad/inactive)
+    static int  TxFreeSegs(int sock);    // free tx scoreboard slots; 0 unless ESTABLISHED; 8 for udp
+    static bool GetAddrInfo(int sock, uint32_t* lip, uint16_t* lport,
+                            uint32_t* rip, uint16_t* rport);  // getsockname/getpeername
 
     // udp convenience
     static int  SendTo(int sock, const void* data, int len, uint32_t ip, uint16_t port);

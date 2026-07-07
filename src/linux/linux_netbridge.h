@@ -49,6 +49,14 @@
 #define LF_SETFL      4
 #define LFD_O_NONBLOCK 0x0800
 
+// poll/epoll readiness bits returned by Readiness()  -  standard linux values,
+// matching linux_syscall.cpp's L_EPOLL* so fd_readiness can or them in
+// directly. (satoru)
+#define LNET_POLLIN   0x001
+#define LNET_POLLOUT  0x004
+#define LNET_POLLERR  0x008
+#define LNET_POLLHUP  0x010
+
 // sockaddr_in
 struct LinuxSockaddrIn {
     uint16_t sin_family;
@@ -111,6 +119,10 @@ struct LinuxSocket {
 
     // owner
     int              owner_pid;
+
+    // dup/fork refcount: Close() releases the kurono socket only when the
+    // last linux fd referencing this slot closes. (satoru)
+    int              refs;
 };
 
 #define LNET_MAX_INTERFACES  4
@@ -160,6 +172,15 @@ public:
     static bool IsNonblocking(int sockfd);
     static int  Getpeername(int sockfd, LinuxSockaddrIn* addr);
     static int  Getsockname(int sockfd, LinuxSockaddrIn* addr);
+
+    // af_inet bridge over the kurono TCPStack (real backend, non-blocking
+    // primitives only  -  the syscall layer owns all waiting). (satoru)
+    static int  ConnectPoll(int sockfd);       // 0 / -EINPROGRESS / -ECONNREFUSED / -ETIMEDOUT
+    static uint32_t Readiness(int sockfd);     // LNET_POLL* bitmask, lock-free reads
+    static int  SockError(int sockfd);         // getsockopt(SO_ERROR) value, clears on read
+    static void Retain(int sockfd);            // dup/fork refcount bump
+    static int  RxAvail(int sockfd);           // ioctl(FIONREAD)
+    static void PumpTick();                    // rate-limited TCPStack::Tick (bsp only)
 
     static void InitInterfaces();
     static LinuxNetInterface* GetInterface(const char* name);
