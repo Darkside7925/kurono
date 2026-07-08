@@ -1261,10 +1261,10 @@ static const char* FF_TAR_PATH    = "/packages/firefox/firefox-140.11.0esr-full2
 // the real origin. a dev-only slirp mirror (10.0.2.100) may be swapped in here
 // UNCOMMITTED while iterating, but every commit ships this real ip. (satoru)
 static const uint32_t FF_ORIGIN_IP =
-    // DEV-ONLY (uncommitted): local tap0 mirror at 10.0.2.2 for fast iteration.
-    // real origin is 92.5.63.184 -- restore before committing. (satoru)
-    (((uint32_t)10 << 24) | ((uint32_t)0 << 16) |
-     ((uint32_t)2 << 8) | (uint32_t)2);
+    // the real firefox package origin. a dev-only slirp/tap mirror may be swapped
+    // in here UNCOMMITTED while iterating; every commit ships this real ip. (satoru)
+    (((uint32_t)92 << 24) | ((uint32_t)5 << 16) |
+     ((uint32_t)63 << 8) | (uint32_t)184);
 
 // remap a tar entry name ("firefox/lib/libxul.so", "firefox/firefox", or a
 // bare "firefox/") to an absolute kvfs path under /apps/firefox. returns false

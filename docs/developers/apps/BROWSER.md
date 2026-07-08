@@ -21,24 +21,33 @@ Kurono's browser answer is **Firefox on the Linux runtime**, not a hand-written
 freestanding engine:
 
 - A real **Firefox 140.11.0esr** is cross-compiled against **musl + Wayland**
-  (`--disable-jit`, `cairo-gtk3-wayland`, ~174 MB `libxul.so`), build rc=0.
+  (`cairo-gtk3-wayland`, software WebRender, ~174 MB `libxul.so`), build rc=0.
 - The Linux runtime already provides what it targets: pthreads/`futex`,
-  `epoll`/`poll`, `mprotect` W^X, AF_UNIX + `SCM_RIGHTS`, and an in-kernel Wayland
-  compositor that composites real `wl_shm` clients.
+  `epoll`/`poll`, `mprotect` W^X, real `fcntl` byte-range locks, AF_UNIX +
+  `SCM_RIGHTS`, and an in-kernel Wayland compositor that composites real `wl_shm`
+  clients  -  including **`wl_subsurface` compositing** (a child surface composited
+  onto its parent at its `set_position` offset), which is what GTK uses to inset
+  Firefox's content into its client-side-decorated toplevel.
 - The launcher (`src/apps/firefox_launcher.cpp`) does a real `execve` of the
   rootfs Firefox binary through the Linux syscall/runtime layer.
-- **The Gecko engine loads and runs on-device.** [ld-kurono](../linux/LD_KURONO.md)
-  resolves libxul's full `.so` dependency closure and loads + relocates `libxul`
-  (130 MB+) at a multi-terabyte base; XPCOM and Gecko's own application code
-  execute, and Firefox's child processes spawn (via `clone3`). The syscall
-  layer's old sub-4 GB pointer-ABI cap is **lifted**  -  user mappings span the full
-  canonical 64-bit user range, so a high PIE base is no longer a blocker.
+- **Firefox composites its real browser chrome on the desktop.**
+  [ld-kurono](../linux/LD_KURONO.md) resolves libxul's full `.so` closure and
+  loads + relocates `libxul` at a multi-terabyte base; Firefox runs a real
+  profile **single-process** (e10s off) with its threads dispatched across the
+  secondary cores (`kurono.apthreads=1`, `-smp 4`), and the compositor composites
+  its 973×743 GTK content subsurface onto the 1025×795 CSD toplevel  -  tab strip,
+  URL bar, back/forward/reload, bookmark star, account/extensions/hamburger menus,
+  window controls, all real pixels (`0xFFF9F9FB` ARGB8888). The syscall layer's
+  old sub-4 GB pointer-ABI cap is **lifted**, so a high PIE base is no longer a
+  blocker.
 
-**What's left to render a Firefox window** (the active frontier, *not* shipped):
-the **e10s multiprocess IPC** path between the parent and content processes, plus
-a **musl symbol/threading** issue still being chased down. This is no longer an
-address-space or ELF-loading limitation. The GUI tile stays a placeholder until
-the window renders.
+**What's left for a reliably rendered web page** (the active frontier, *not* fully
+shipped): navigation reaches necko, and the current fix is the **socket thread's
+poll-wakeup delivery** (NSPR's `PollableEvent`/eventfd wakeup vs the kernel's fd
+readiness), plus some multicore startup/render-timing flakiness. This is no longer
+an e10s, address-space, or ELF-loading limitation  -  Firefox runs single-process
+and the chrome already paints. The GUI tile stays a placeholder until the page
+render is reliable.
 
 ## 3. The working HTTP path today
 

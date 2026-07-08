@@ -50,10 +50,20 @@ and each committed `wl_shm` buffer is blitted into that window  -  this is
   redraw), not no-ops.
 - Pointer events are forwarded back to the focused client every frame via
   `ForwardPointerMotion()` / `ForwardPointerButton()` (called from `desktop.cpp`).
+- **`wl_subsurface` compositing** is implemented: a client can inset a child
+  surface into a parent at a `set_position` offset (`blit_child_subsurfaces`,
+  `find_subsurface_role`), and the compositor composites the child onto the
+  parent window at that offset. This is what a real GTK app needs  -  GTK renders
+  its content into a subsurface inset inside a client-side-decorated toplevel  - 
+  and is what lets **Firefox composite its full browser chrome** (a 973×743 GTK
+  content subsurface onto a 1025×795 CSD toplevel). A companion fix makes
+  `UnixSocket::TakePendingControl` hand back one fd per call so every `wl_shm`
+  pool's memfd maps individually.
 
 This was proven with a real **musl-gcc**-compiled client,
 `src/userprogs/wl_shm_test.c`, embedded in the kernel and launched by the
-`wltest` shell command.
+`wltest` shell command, and  -  at full scale  -  by Firefox 140.11.0esr painting
+its real browser chrome through the subsurface path.
 
 ## 5. Limits
 

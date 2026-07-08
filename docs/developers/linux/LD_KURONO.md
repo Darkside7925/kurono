@@ -93,16 +93,18 @@ attach rescan the loaded library list on each `Dlopen`/`Dlclose`.
   `kurono.logcheck`), proving the dynamic-load + musl-libc resolution path.
 - **File-backed `mmap` of `.so` segments** landed (commits `e3a5952`, `df45ed1`):
   musl can `mmap` its shared-object segments from a regular file.
-- **Firefox's Gecko engine loads and runs through ld-kurono; the window does not
-  render yet.** A real Firefox 140.11.0esr (cross-compiled against musl + Wayland,
-  174 MB `libxul.so`) is loaded on-device: ld-kurono resolves libxul's full `.so`
-  dependency closure and loads + relocates `libxul` (130 MB+) at a multi-terabyte
-  base, and XPCOM plus Gecko's own application code execute  -  including spawning
-  Firefox's child processes (via `clone3`). The sub-4 GB user-pointer ABI cap that
+- **Firefox's Gecko engine loads through ld-kurono and composites its real browser
+  chrome on the desktop.** A real Firefox 140.11.0esr (musl + Wayland, software
+  WebRender, 174 MB `libxul.so`) is loaded on-device: ld-kurono resolves libxul's
+  full `.so` dependency closure and loads + relocates `libxul` (130 MB+) at a
+  multi-terabyte base, XPCOM plus Gecko's own application code run, and Firefox
+  paints its tab strip / URL bar / navigation controls / menus through the
+  compositor's `wl_subsurface` path  -  **single-process** (e10s off), threads
+  dispatched across the secondary cores. The sub-4 GB user-pointer ABI cap that
   used to block a high PIE base is **lifted** (the syscall layer now spans the full
   canonical 64-bit user range  -  see [LINUX_SYSCALL.md](LINUX_SYSCALL.md) §3). What
-  remains for a **rendered window** is the e10s multiprocess IPC path and a musl
-  symbol/threading issue  -  not the dynamic-loader path.
+  remains for a **reliably rendered web page** is the socket thread's poll-wakeup
+  delivery and some render-timing flakiness  -  not the dynamic-loader path.
 
 ## 7. Limits (`ld_kurono.h`)
 

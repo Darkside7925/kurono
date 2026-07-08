@@ -9,7 +9,10 @@
 namespace {
     static bool g_fs_ready = false;
 
-    static char g_serial_pending[16384];
+    // serial mirror staging: EVERY serial line lands here first (any context),
+    // and only the LoggingProcess moves it into kvfs. 32k of headroom; when full
+    // the mirror drops lines (the real serial console always has everything). (satoru)
+    static char g_serial_pending[32768];
     static int  g_serial_pending_len = 0;
 
     static char g_boot_pending[8192];
@@ -193,12 +196,40 @@ void RuntimeLog::InitFilesystem() {
 void RuntimeLog::MirrorSerial(const char* text) {
     RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!text || !*text) return;
-    if (g_fs_ready) {
-        ensure_core_layout();
-        append_file_text(KP_LOG_SERIAL, text);
-        return;
-    }
+    // ALWAYS defer  -  never touch kvfs/heap from here. this used to append into
+    // kvfs synchronously, which runs from ANY context (timer irq, #pf/#gp dump
+    // paths, even heap-corruption warnings inside a heap op). every lock on
+    // that path (RtLogGuard, g_vfs_lock, the heap guard) is cpu-owner-RECURSIVE,
+    // so an exception on the owning cpu re-entered a HALF-MUTATED kvfs tree /
+    // heap freelist and wrote log text over live blocks  -  the recurring
+    // corruption whose frames are full of "serial.log"/"/kurono/" path bytes,
+    // and the #pf-dump -> nested-fault -> triple-fault cascades. the pending
+    // ring is plain static memory: safe from every context. the LoggingProcess
+    // kernel process flushes it into kvfs from process context every 500ms
+    // (FlushSerialMirror). when the ring is full the MIRROR drops lines  -  the
+    // real serial console still carries everything. (satoru)
+    if (g_serial_pending_len >= (int)sizeof(g_serial_pending) - 1) return;
     append_buffer(g_serial_pending, g_serial_pending_len, sizeof(g_serial_pending), text);
+}
+
+void RuntimeLog::FlushSerialMirror() {
+    if (!g_fs_ready) return;
+    // stage the pending text out under the log lock, then write to kvfs with
+    // the lock RELEASED  -  an exception mid-append then finds no half-held log
+    // state to recurse into (its MirrorSerial just stages into the ring). (satoru)
+    static char staged[sizeof(g_serial_pending)];
+    int n;
+    {
+        RtLogGuard _rtg;
+        n = g_serial_pending_len;
+        if (n <= 0) return;
+        for (int i = 0; i < n; i++) staged[i] = g_serial_pending[i];
+        staged[n] = 0;
+        g_serial_pending_len = 0;
+        g_serial_pending[0]  = 0;
+    }
+    ensure_core_layout();
+    append_file_text(KP_LOG_SERIAL, staged);
 }
 
 void RuntimeLog::LogSystem(const char* component, const char* message) {

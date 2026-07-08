@@ -171,11 +171,12 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
 [[noreturn]] static void LoggingProcessEntry() {
     SerialLogger::Log("[LoggingProcess] online\r\n");
     while (true) {
-        // Tickling MirrorSerial with an empty string is enough to flush
-        // pending append paths without injecting noise into the log.
+        // move the staged serial-mirror ring into kvfs. this is the ONLY place
+        // the mirror touches kvfs/heap  -  MirrorSerial itself just stages into
+        // a static ring from whatever context it runs in. (satoru)
         {
             SpinLockCpuGuard guard(g_log_lock);
-            RuntimeLog::MirrorSerial("");
+            RuntimeLog::FlushSerialMirror();
         }
         Scheduler::SleepMs(500);
     }

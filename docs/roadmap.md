@@ -39,42 +39,70 @@ These are built and verified enough to build on. They still have rough edges.
 
 ## Now: the active frontier
 
-### Firefox: from a rendered window to a painted page
+### Firefox: from painted chrome to a reliably painted page
 
-A real Firefox 140.11.0esr (cross-compiled against musl + Wayland) **loads, runs
-its Gecko engine, and now maps a real window on the Kurono desktop**. The window
-is currently blank because the content process is blocked before its first paint,
-in Firefox's multiprocess (e10s) IPC path. Closing that path is the headline goal.
+A real Firefox 140.11.0esr (musl + Wayland, software WebRender) **loads, runs its
+Gecko engine, and now composites its real browser chrome on the Kurono desktop**  - 
+tab strip, URL bar, back/forward/reload, bookmark star, account/extensions/
+hamburger menus, window controls. It runs **single-process** (e10s off), so the
+old "the content process is blocked in the e10s IPC path" framing is retired. The
+headline goal now is a **reliably rendered web page**: navigation reaches necko,
+and the socket thread's poll-wakeup is the active fix.
 
-- **[done] Restartable SSE-store demand-zero fix** (`src/hal/hal.cpp`). A ring-3
-  `movups` store faulting onto a fresh demand-zero page was losing its first 16
-  bytes because the fault handler clobbered the user's `%xmm0`. Fixed by
-  `fxsave`/`fxrstor` of the user FPU/SSE around the ring-3 page-fault path. This is
-  what got the window to render. It very likely also fixes the long-standing
-  large-image "band corruption" bug; that should be re-tested.
-- **[done] Cross-process (shared) futex** (`src/linux/linux_syscall.cpp`). Futexes
-  were keyed by `(address_space, virtual_address)`, so a `FUTEX_WAKE` in the
-  Firefox parent could never match a `FUTEX_WAIT` in a content process (different
-  address space). They are now also keyed by the **physical page** backing the
-  word, so a futex in shared memory wakes across processes. The same-process
-  thread path is unchanged.
-- **[next] Cross-process AF_UNIX data transfer.** The parent and content processes
-  talk over a `socketpair`. The bytes (and `SCM_RIGHTS` fds) have to move between
-  two distinct processes' endpoints, not just client-to-compositor.
-- **[next] Fork fd-inheritance + child shared-memory re-map.** A forked/exec'd
-  content process must inherit (or be passed) the parent's memfd and shared
-  socket, and its `mmap(MAP_SHARED)` of that memfd must resolve to the **same
-  physical frames** the parent allocated.
-- **[next] Growable shared-memory segments** for the IPC message rings.
+- **[done] `wl_subsurface` compositing** (`src/ui/wayland_server.cpp`). GTK renders
+  Firefox's UI into a 973×743 content subsurface inset inside a 1025×795
+  client-side-decorated toplevel; the compositor now composites child subsurfaces
+  onto the parent at their `set_position` offsets. Plus a one-fd-per-call
+  `SCM_RIGHTS` `TakePendingControl` fix so every `wl_shm` pool maps. This is what
+  got the chrome to paint.
+- **[done] SMP futex waiter-slot ownership** (`src/linux/linux_syscall.cpp`). Two
+  abort paths in `futex_enqueue_and_block` cleared their wait-queue slot
+  unconditionally; a cross-CPU `FUTEX_WAKE` could consume and re-assign the slot in
+  that window, so the blind clear stranded the new owner blocked forever. Both
+  sites now verify slot ownership first  -  this killed the "startup stalls at
+  thread-init, no crash" heisenbug.
+- **[done] TLB shootdown ack-wait** (`src/proc/smp.cpp`). `BroadcastTlbFlush` gave
+  up in sub-millisecond time while a peer core could sit interrupts-off ~8.7 ms in
+  a serial write, so a stale instruction translation survived the JIT's W^X
+  `mprotect` flip and produced per-boot-random wild-jump `#GP`s. Bounded to a
+  ~20 ms wall-clock wait; the JIT stays enabled.
+- **[done] Process-reap use-after-free** (`src/proc/scheduler.cpp`).
+  `DestroyProcess` freed the `Process` struct while a CPU was still unwinding on
+  it; the recycled block came back as a path buffer and the CPU `iretq`'d through
+  ASCII. Now leaks the struct/stack (bounded) when the context is still live.
+- **[done] Serial→KVFS log-mirror deferral** (`src/system/logging.cpp`). The mirror
+  synchronously wrote KVFS from the exception-dump path, and the recursive
+  log/vfs/heap locks let a fault re-enter a half-mutated heap and corrupt live
+  memory (the dump→nested-fault→triple-fault cascades). `MirrorSerial` now only
+  stages into a static ring; the `LoggingProcess` flushes from process context.
+- **[done] Real `fcntl` byte-range locks** (`src/linux/linux_syscall.cpp`).
+  `F_GETLK`/`F_SETLK`/`F_SETLKW` are real advisory locks now, not an always-grant
+  stub  -  which had let two SQLite connections both "own" a WAL lock and fail with
+  `SQLITE_PROTOCOL`, wedging Places init and NSS's `cert9.db` open.
+- **[done] `readlink` errno + socket/pipe `read`/`write`.** `readlink` on an
+  existing non-symlink now returns POSIX `-EINVAL` (was `-ENOENT`, which broke
+  Rust `fs::canonicalize` for every dir); `sys_read`/`sys_write` gained the missing
+  `LFD_SOCKET`/`LFD_PIPE` cases (a pipe `write()` was returning `-EBADF`, which
+  broke NSPR's `PollableEvent` and left the socket thread wake-less).
+- **[wip] Socket-thread poll-wakeup.** With the pipe `write()` fixed, the socket
+  thread's `PollableEvent` self-test passes, but the thread still parks: it polls
+  its wakeup fd for `POLLIN` and never sees it readable while the dispatch signals
+  land. Narrowed to how NSPR's socketpair/eventfd wakeup maps to the kernel fd
+  readiness (the 8-byte dispatch writes point at an eventfd); an in-kernel
+  socketpair self-test proves the primitive itself delivers correctly. Closing
+  this is what unblocks the first painted page.
+- **[next] Render-timing reliability.** Some boots reach the window but the
+  software WebRender frame doesn't land before the screenshot, or startup stalls
+  before window-create. Once the socket wakeup is closed, tighten the remaining
+  multicore startup-timing flakiness so a good boot is the common case.
 - **[later] Keyboard-to-client forwarding.** Pointer events already reach Wayland
   clients; the keyboard handler exists but is not yet wired into the input loop.
 - **[later] GPU buffers.** `zwp_linux_dmabuf` is advertised but only `wl_shm`
   software buffers are composited today.
 
 ### Verify the band-corruption fix
-Re-test the freestanding stb image decoder on a large image now that the SSE
-demand-zero bug is fixed. If clean, wallpapers no longer need to ship as
-pre-decoded raw RGBA.
+Re-test the freestanding stb image decoder on a large image. If clean, wallpapers
+no longer need to ship as pre-decoded raw RGBA.
 
 ---
 

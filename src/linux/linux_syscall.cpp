@@ -1399,6 +1399,44 @@ constexpr int FUTEX_MAX_WAITERS = 256;  // 64->256: firefox's many threads can h
 // wake that ISN'T lost still wakes immediately  -  this only bounds the worst
 // case. (satoru)
 constexpr uint64_t FUTEX_REPOLL_MS = 8;
+
+// ── posix byte-range file locks (fcntl F_GETLK / F_SETLK / F_SETLKW) ─────────
+// REAL advisory locks keyed by (file path hash, [start,end), owner). the old
+// stub granted every F_SETLK unconditionally  -  sqlite's wal shm-lock dance then
+// let two connections both hold "exclusive" wal locks, sqlite detects the
+// inconsistency and fails with SQLITE_PROTOCOL ("locking protocol" console
+// errors) in retry loops: wedged places init (delayedStartupFinished never
+// fires) and a wedged nss cert9.db open (the SOCKET THREAD's first act) = dead
+// networking. owner = thread-group leader, so threads of one process share
+// locks (posix semantics) while distinct processes conflict. (satoru)
+struct KFileLock {
+    bool     active;
+    int16_t  type;          // 0=F_RDLCK 1=F_WRLCK (satoru)
+    uint64_t path_hash;
+    uint64_t start, end;    // [start,end); end==~0ull means to-eof (satoru)
+    Process* owner;
+};
+constexpr int KFILE_LOCK_SLOTS = 256;
+static KFileLock g_file_locks[KFILE_LOCK_SLOTS];
+static Spinlock  g_flock_lock;
+
+static uint64_t flock_path_hash(const char* s) {
+    uint64_t h = 1469598103934665603ull;              // fnv-1a (satoru)
+    if (s) while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ull; }
+    return h;
+}
+
+// drop every lock `owner` holds on `path_hash`  -  posix close semantics (any
+// close of a file drops the process's locks on it; sqlite's unix vfs is built
+// around exactly this behaviour). (satoru)
+static void flock_drop(Process* owner, uint64_t path_hash) {
+    SpinLockGuard g(g_flock_lock);
+    for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+        KFileLock* L = &g_file_locks[i];
+        if (L->active && L->owner == owner && L->path_hash == path_hash)
+            L->active = false;
+    }
+}
 // (satoru) NON-static + the table NON-static below so gdb can resolve the type +
 // the array by name (file-statics get no DWARF entry in this -g build) to dump the
 // full live futex wait-graph while chasing the firefox startup deadlock. (satoru)
@@ -1532,7 +1570,13 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         uint32_t recheck = 0;
         if (read_user_u32(task, uaddr, &recheck) && recheck != expected_val) {
             SpinLockGuard fg(g_futex_lock);
-            g_futex_waiters[slot].active = false;
+            // only clear the slot if it is still OURS: a cross-cpu wake may have
+            // consumed it and ANOTHER waiter re-enqueued into the same index in
+            // this window. blindly clearing destroys the new owner's entry and
+            // leaves that thread blocked with no waiter slot + no deadline =
+            // unwakeable forever (the smp startup stall). (satoru)
+            if (g_futex_waiters[slot].active && g_futex_waiters[slot].task == task)
+                g_futex_waiters[slot].active = false;
             return false;
         }
     }
@@ -1558,9 +1602,18 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         // user task off the run queue with no one left to wake it. (satoru)
         {
             SpinLockGuard fg(g_futex_lock);
-            g_futex_waiters[slot].active = false;
+            // same ownership check as the recheck-abort above: a cross-cpu wake
+            // may have consumed this slot and another waiter reused it while we
+            // were inside switch_to_ready_user  -  clearing it blindly would make
+            // the new owner unwakeable. (satoru)
+            if (g_futex_waiters[slot].active && g_futex_waiters[slot].task == task)
+                g_futex_waiters[slot].active = false;
         }
         task->state = Process_Running;
+        // a raced wake may have set the deferred-promotion tick while we were
+        // blocked; we are resuming ourselves, so drop it  -  a stale sleep_ticks
+        // would spuriously re-ready this task out of its NEXT unrelated block. (satoru)
+        task->sleep_ticks = 0;
         return false;
     }
     return true;
@@ -1667,6 +1720,12 @@ static void futex_sweep_timeouts() {
     // see the circular pthread_join structure. debug-only. (satoru)
     {
         static uint64_t fwg_next = 80000;
+        // (satoru) RE-GATED: enabling this correlated with kernel panics at the
+        // exact 80s first-fire mark  -  it reads OTHER tasks' user memory (page
+        // walks of address spaces that may be mid-mutation) and prints ~100
+        // serial lines in one timer-irq (long IF-off stretch)  -  too invasive
+        // under smp. diagnose the chrome-init stall with a process-context
+        // probe instead if needed.
         if (false && now > fwg_next) {
             fwg_next = now + 60000;  // (satoru) periodic (was one-shot): watch the deadlock SETTLE + catch the main's final futex wait addr
             SerialLogger::Log("[FWG] === full thread map (pid st fs wait) @t="); SerialLogger::LogDec((int)now); SerialLogger::Log(" ===\r\n");
@@ -2260,18 +2319,54 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
             !(frame->error_code & PFERR_PRESENT)) {
             uint64_t ursp = frame->rsp;
             // plausible stack access: at/just-above rsp (a push crossing a page) down
-            // to 512kb below it (a large frame / alloca). (satoru)
-            if (frame->cr2 + 0x80000ull >= ursp && frame->cr2 <= ursp + 0x1000ull) {
-                UserMemoryRegion* nr = add_region(task, page_base, page_base + PAGE_SIZE,
-                                                  page_flags_from_prot(0x1 | 0x2),  // PROT_READ|PROT_WRITE (satoru)
-                                                  USER_REGION_DEMAND_ZERO | USER_REGION_MMAP);
-                if (nr) return handle_demand_zero_fault(task, nr, page_base, frame);
+            // to 128kb below it. map the ONE faulting page DIRECTLY  -  do NOT add_region:
+            // a whole missing thread-stack faults page-by-page and an add_region per page
+            // would bloat the 4096-slot table + slow the linear find_region, itself
+            // stalling startup. one page per fault, no bookkeeping. (satoru)
+            if (frame->cr2 + 0x20000ull >= ursp && frame->cr2 <= ursp + 0x1000ull) {
+                void* pg = PMM::AllocBytes(PAGE_SIZE);
+                if (pg) {
+                    memset(pg, 0, PAGE_SIZE);
+                    uint64_t pflags = page_flags_from_prot(0x1 | 0x2);  // PROT_READ|PROT_WRITE (satoru)
+                    if (KernelVMM::MapPageInAddressSpace(task->address_space, page_base,
+                                                         (uint64_t)(uintptr_t)pg, pflags)) {
+                        KernelVMM::InvalidatePage(page_base);
+                        if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame);
+                        return true;
+                    }
+                    PMM::FreeBytes(pg, PAGE_SIZE);
+                }
             }
         }
         return false;
     }
 
-    return handle_demand_zero_fault(task, region, page_base, frame);
+    {
+        bool hz = handle_demand_zero_fault(task, region, page_base, frame);
+        // (satoru) TEMP [pfr]: region EXISTS but the fault was not handled  -  dump
+        // the region's flags (the present-RO write crash lands here if the loader
+        // mapped a data page read-only). capped. remove before commit.
+        if (false && !hz) {
+            static int npfr2 = 0;
+            if (npfr2 < 20) {
+                npfr2++;
+                LinuxProcess* fp = Current();
+                SerialLogger::Log("[pfr] pid="); SerialLogger::LogDec(fp ? fp->pid : -1);
+                SerialLogger::Log(" UNHANDLED cr2=");
+                SerialLogger::LogHex((uint32_t)(frame->cr2 >> 32));
+                SerialLogger::Log(":"); SerialLogger::LogHex((uint32_t)frame->cr2);
+                SerialLogger::Log(" ec="); SerialLogger::LogDec((int)frame->error_code);
+                SerialLogger::Log(" reg=");
+                SerialLogger::LogHex((uint32_t)(region->start >> 32));
+                SerialLogger::Log(":"); SerialLogger::LogHex((uint32_t)region->start);
+                SerialLogger::Log("-"); SerialLogger::LogHex((uint32_t)region->end);
+                SerialLogger::Log(" pf="); SerialLogger::LogHex((uint32_t)region->page_flags);
+                SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)region->flags);
+                SerialLogger::Log("\r\n");
+            }
+        }
+        return hz;
+    }
 }
 
 //  process management
@@ -2925,17 +3020,92 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 case 2:  return 0;             // F_SETFD (CLOEXEC ignored)
                 case 3:  return (int32_t)lfd->flags;       // F_GETFL
                 case 4:  lfd->flags = arg; return 0;        // F_SETFL
-                case 5: {                                 // F_GETLK  -  must report NO
-                    // conflicting lock or sqlite (firefox places/cookies/permissions
-                    // dbs) reads back the stale l_type it passed in, thinks the file is
-                    // locked, and fails with SQLITE_PROTOCOL. write l_type = F_UNLCK (2)
-                    // into the caller's struct flock (l_type is the first field). the arg
-                    // lives in the caller's address space and we are in its cr3. (satoru)
-                    if (arg) *(volatile int16_t*)(uintptr_t)arg = 2;   // F_UNLCK
-                    return 0;
+                case 5: case 6: case 7: {   // F_GETLK / F_SETLK / F_SETLKW  -  REAL locks (satoru)
+                    // struct flock (x86_64): i16 l_type; i16 l_whence; pad;
+                    // i64 l_start; i64 l_len; i32 l_pid. sqlite always uses
+                    // SEEK_SET, so whence is taken as SET. the struct lives in
+                    // the caller's address space and we are in its cr3. (satoru)
+                    if (!arg) return -14;                             // -EFAULT (satoru)
+                    volatile int16_t* fl_type  = (volatile int16_t*)(uintptr_t)arg;
+                    volatile int64_t* fl_start = (volatile int64_t*)(uintptr_t)((uint64_t)arg + 8);
+                    volatile int64_t* fl_len   = (volatile int64_t*)(uintptr_t)((uint64_t)arg + 16);
+                    volatile int32_t* fl_pid   = (volatile int32_t*)(uintptr_t)((uint64_t)arg + 24);
+                    int16_t  want = *fl_type;                         // 0 rd / 1 wr / 2 unlck (satoru)
+                    uint64_t st   = (uint64_t)*fl_start;
+                    uint64_t ln   = (uint64_t)*fl_len;
+                    uint64_t en   = ln ? (st + ln) : ~0ull;           // len 0 = to eof (satoru)
+                    uint64_t ph   = flock_path_hash(lfd->path);
+                    Process* owner = region_owner(p->task);
+
+                    if (cmd == 5) {                                   // F_GETLK (satoru)
+                        SpinLockGuard g(g_flock_lock);
+                        for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                            KFileLock* L = &g_file_locks[i];
+                            if (!L->active || L->path_hash != ph || L->owner == owner) continue;
+                            if (L->start >= en || L->end <= st) continue;   // no overlap (satoru)
+                            if (want == 1 || L->type == 1) {          // would conflict (satoru)
+                                *fl_type  = L->type;                  // F_RDLCK/F_WRLCK (satoru)
+                                *fl_start = (int64_t)L->start;
+                                *fl_len   = (L->end == ~0ull) ? 0 : (int64_t)(L->end - L->start);
+                                *fl_pid   = 1;                        // some other "process" (satoru)
+                                return 0;
+                            }
+                        }
+                        *fl_type = 2;                                 // F_UNLCK  -  no conflict (satoru)
+                        return 0;
+                    }
+
+                    if (want == 2) {                                  // unlock (satoru)
+                        SpinLockGuard g(g_flock_lock);
+                        for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                            KFileLock* L = &g_file_locks[i];
+                            if (L->active && L->owner == owner && L->path_hash == ph &&
+                                !(L->start >= en || L->end <= st))
+                                L->active = false;
+                        }
+                        return 0;
+                    }
+                    if (want != 0 && want != 1) return -22;           // -EINVAL (satoru)
+
+                    // acquire: F_SETLK fails fast on conflict; F_SETLKW yields
+                    // (bounded ~10s  -  a longer wait is a deadlock) and retries. (satoru)
+                    uint64_t fl_deadline = Time::GetTicks() + 10000;
+                    for (;;) {
+                        {
+                            SpinLockGuard g(g_flock_lock);
+                            bool conflict = false;
+                            for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                                KFileLock* L = &g_file_locks[i];
+                                if (!L->active || L->path_hash != ph || L->owner == owner) continue;
+                                if (L->start >= en || L->end <= st) continue;
+                                if (want == 1 || L->type == 1) { conflict = true; break; }
+                            }
+                            if (!conflict) {
+                                // replace this owner's overlapping ranges (posix
+                                // re-lock = upgrade/downgrade in place). (satoru)
+                                for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                                    KFileLock* L = &g_file_locks[i];
+                                    if (L->active && L->owner == owner && L->path_hash == ph &&
+                                        !(L->start >= en || L->end <= st))
+                                        L->active = false;
+                                }
+                                for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                                    KFileLock* L = &g_file_locks[i];
+                                    if (L->active) continue;
+                                    L->active = true; L->type = want;
+                                    L->path_hash = ph; L->start = st; L->end = en;
+                                    L->owner = owner;
+                                    return 0;
+                                }
+                                return -37;                           // -ENOLCK table full (satoru)
+                            }
+                        }
+                        if (cmd == 6) return -11;                     // -EAGAIN (satoru)
+                        if (Time::GetTicks() > fl_deadline) return -35;  // -EDEADLK (satoru)
+                        if (SMP::CpuIndex() == 0) { KuronoShell::PumpUI(); Scheduler::SleepMs(1); }
+                        else kls_relax();
+                    }
                 }
-                case 6:  case 7:                          // F_SETLK / F_SETLKW  -  grant
-                    return 0;                              // (single-writer, no real advisory locks)
                 default: return 0;
             }
         }
@@ -5575,6 +5745,14 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
         task->user_stack_top = U_STACK_TOP - 16;
     }
 
+    // (satoru) [exv] trace: name every dynamic execve (which child re-execs).
+    // gated off  -  one line per exec, low volume, flip to true to watch. (satoru)
+    if (false) {
+        SerialLogger::Log("[exv] pid="); SerialLogger::LogDec(proc->pid);
+        SerialLogger::Log(" "); SerialLogger::Log(resolved);
+        SerialLogger::Log("\r\n");
+    }
+
     uint64_t entry = 0, rsp = 0;
     bool ok = LdKurono::ExecPIE(task, image, (uint64_t)fsz, resolved, av, ev,
                                 proc->uid, proc->gid, &entry, &rsp);
@@ -5776,6 +5954,23 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                     LinuxNetBridge::PumpTick();            // drain the nic while we wait (satoru)
                     KuronoShell::PumpUI(); Scheduler::SleepMs(1);
                 } else kls_relax();
+                return -11;   // re-issued by the caller's retry (satoru)
+            }
+            return r;
+        }
+
+        // unix sockets + pipes: plain read() must work, not just recv()  -  the
+        // missing case fell through to -EBADF (mirror of the sys_write gap that
+        // broke nspr's PollableEvent). EAGAIN when empty: sockets are polled by
+        // their owners (glib/nspr) before reading; a BLOCKING fd yields like the
+        // inet path. (satoru)
+        case LFD_SOCKET:
+        case LFD_PIPE: {
+            int r = UnixSocket::Recv(lfd->backend_fd, dst, (int)count, 0);
+            if (r == -11 && !(lfd->flags & L_O_NONBLOCK)) {
+                if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
+                if (SMP::CpuIndex() == 0) { KuronoShell::PumpUI(); Scheduler::SleepMs(1); }
+                else kls_relax();
                 return -11;   // re-issued by the caller's retry (satoru)
             }
             return r;
@@ -5989,12 +6184,35 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
 // dumps gecko-log lines (those carrying the "]: " thread-prefix delimiter) so
 // cache/pref writes are skipped. remove before commit.
 static void mozlog_probe(LinuxProcess* p, LinuxFd* lfd, const uint8_t* src, uint64_t count) {
-    return;  // (satoru) DISABLED: this serial-dumped EVERY firefox gecko-log write
-             // (~8.7ms/line ring-0 UART busy-wait at 115200 baud), which  -  together
-             // with MOZ_LOG_FILE=/dev/null sending the flood here  -  throttled firefox
-             // to a near-halt at CompMgrInit (gdb: main stuck in LogModuleManager).
-             // the KX:/KX2: markers reach the serial via the normal stderr/console
-             // path, not this probe. re-enable only for a targeted MOZ_LOG dump. (satoru)
+    return;  // (satoru) DISABLED: serial-dumping firefox gecko-log writes (~8.7ms/line
+             // ring-0 UART busy-wait at 115200 baud) throttles firefox to a near-halt.
+             // flip the guard below to fish socket-transport (nsSocketTransport) lines
+             // out of a .moz_log sink for a targeted trace only. (satoru)
+    {
+        if (!p || p->pid < 100 || p->pid >= 140 || !lfd || !src || count < 8) return;
+        static int nmzl = 0;
+        if (nmzl >= 300) return;
+        uint64_t scan = count < 400 ? count : 400;
+        bool hit = false;
+        for (uint64_t i = 0; i + 7 < scan && !hit; i++) {
+            if ((src[i]=='o'&&src[i+1]=='c'&&src[i+2]=='k'&&src[i+3]=='e'&&src[i+4]=='t'&&src[i+5]=='T') ||
+                (src[i]=='o'&&src[i+1]=='l'&&src[i+2]=='l'&&src[i+3]=='a'&&src[i+4]=='b'&&src[i+5]=='l') ||
+                (src[i]=='S'&&src[i+1]=='T'&&src[i+2]=='S'&&src[i+3]==' '))
+                hit = true;
+        }
+        if (!hit) return;
+        nmzl++;
+        SerialLogger::Log("[mzl] ");
+        char b[2] = {0, 0};
+        for (uint64_t i = 0; i < scan; i++) {
+            char c = (char)src[i];
+            if (c == '\n') break;
+            b[0] = (c >= 32 && c < 127) ? c : '.';
+            SerialLogger::Log(b);
+        }
+        SerialLogger::Log("\r\n");
+        return;
+    }
     if (!p || p->pid < 100 || p->pid >= 140 || !lfd || !src || count < 1) return;
     // dump (a) the FIRST write to each file (offset 0) so we see every file firefox
     // creates + its first bytes -> spot the MOZ_LOG file, and (b) any later write
@@ -6082,6 +6300,16 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
         // necko writes are poll-driven, the caller retries on POLLOUT. (satoru)
         case LFD_INET:
             return LinuxNetBridge::Send(lfd->backend_fd, src, (int)count, 0);
+
+        // unix sockets + pipes: plain write() must work, not just send()  -  this
+        // case was MISSING and every write() on a socket/pipe fd fell through to
+        // the default -EBADF. nspr's PollableEvent (firefox's SOCKET THREAD wake
+        // mechanism) self-tests exactly that: pipe(); write(fd[1])  -  the -9 made
+        // it tear the event down and the socket thread ran wake-less forever
+        // (transports queued, zero AF_INET traffic, page loads hung). (satoru)
+        case LFD_SOCKET:
+        case LFD_PIPE:
+            return UnixSocket::Send(lfd->backend_fd, src, (int)count, 0);
 
         // eventfd write: adds an 8-byte value to the counter, making the fd
         // readable (EPOLLIN). this is how glib's main loop wakes its epoll. an
@@ -6316,6 +6544,10 @@ int32_t LinuxSyscall::sys_close(int fd) {
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
 
     LinuxFd* lfd = &p->fds[fd];
+    // posix: closing ANY fd of a file drops the process's byte-range locks on
+    // it. sqlite's unix vfs is designed around exactly this, so honour it. (satoru)
+    if ((lfd->type == LFD_KVFS || lfd->type == LFD_EXT4) && lfd->path[0])
+        flock_drop(region_owner(p->task), flock_path_hash(lfd->path));
     if (lfd->type == LFD_KVFS) { if (lfd->backend_fd >= 0) KVFS::Close(lfd->backend_fd); }  // dir fds have no backend handle (satoru)
     else if (lfd->type == LFD_EXT4) Ext4::Close(lfd->backend_fd);
     // release epoll/eventfd/timerfd table slots back to the pool so the
@@ -6704,13 +6936,18 @@ int LinuxSyscall::ReadlinkResolve(const char* path, char* buf, int bufsiz) {
         int k = 0; while (t[k] && k < bufsiz) { buf[k] = t[k]; k++; }
         return k;
     }
-    // NOT a symlink: return -ENOENT (the historical behaviour). returning
-    // -EINVAL for existing-non-symlinks made musl's realpath() SUCCEED on the
-    // GRE/omni path in XRE_mainStartup, which pushed firefox into a component-load
-    // path that deadlocks a parking_lot futex before it ever reaches profile
-    // selection. the profile is instead supplied via a profiles.ini in the
-    // default location (no realpath needed), so realpath can keep failing. (satoru)
-    return -2;   // -ENOENT
+    // exists but is NOT a symlink: -EINVAL, the posix answer. this was -ENOENT
+    // on purpose for a while (a SUCCEEDING musl realpath() on the GRE/omni path
+    // pushed 07-04-era firefox into a component-load path that deadlocked a
+    // parking_lot futex)  -  but that deadlock class is now fixed (futex repoll +
+    // the waiter-slot ownership fix + smp thread dispatch), and the broken
+    // realpath had grown its own casualties: rust fs::canonicalize (musl
+    // realpath) fails NotFound for EVERY existing dir, so rkv/kvstore
+    // (extension-store, ProfD stores) errors out and firefox's chrome init
+    // spams "uncaught exception: I/O error: NotFound" retry loops. missing
+    // paths still return -ENOENT below. (satoru)
+    if (n) return -22;   // -EINVAL: real node, not a symlink (satoru)
+    return -2;           // -ENOENT: nothing at that path (satoru)
 }
 
 int32_t LinuxSyscall::sys_fstatat64(int dirfd, uintptr_t pathname,
