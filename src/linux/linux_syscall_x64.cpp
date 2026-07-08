@@ -95,6 +95,7 @@ constexpr NrMap kNrMap[] = {
     {  99, LSYS_SYSINFO },       // sysinfo
     { 186, LSYS_GETTID },        // gettid
     { 202, LSYS_FUTEX },         // futex (critical: musl locks/once/tls)
+    { 157, LSYS_PRCTL },         // prctl PR_SET_NAME/GET_NAME (thread comm) (satoru)
     { 229, LSYS_CLOCK_GETRES },  // clock_getres
     { 234, LSYS_TGKILL },        // tgkill
     { 332, LSYS_STATX },         // statx
@@ -308,7 +309,9 @@ constexpr uint32_t kStubOk[] = {
     324,  // membarrier (single-threaded: no-op success) (satoru)
     334,  // rseq
     302,  // prlimit64  (we'll fail soft)
-    157,  // prctl
+    // 157 (prctl) now routed to the real LSYS_PRCTL handler via kNrMap so
+    // PR_SET_NAME actually records the thread name (comm) instead of no-op'ing.
+    // the handler returns 0 for every other op, same as this stub did. (satoru)
     187,  // readahead  -  advisory prefetch; mozglue ReadAhead()s each .so before
           // dlopen and treated -ENOSYS as fatal, breaking XPCOMGlueLoad of the
           // libmozgtk->libxkbcommon chain. no-op success is correct. (satoru)

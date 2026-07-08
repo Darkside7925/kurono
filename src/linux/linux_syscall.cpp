@@ -5790,6 +5790,18 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
     current_syscall_frame->r12 = 0; current_syscall_frame->r13 = 0;
     current_syscall_frame->r14 = 0; current_syscall_frame->r15 = 0;
     current_syscall_frame->rflags = 0x202ULL;
+    // reset the TLS base like linux does on execve: the fresh image starts with
+    // fs_base = 0 and musl's __init_tls installs its own via arch_prctl. WITHOUT
+    // this the execve'd child inherits the PARENT's fs_base (a fork/vfork child
+    // keeps the MAIN thread's static-TLS fs), so the new musl crt runs with the
+    // wrong TLS and, when it sets its own fs mid-function, the stack-canary read
+    // (%fs:0x28) changes underneath it -> __stack_chk_fail -> #GP; the child then
+    // dies holding a shared musl lock and the firefox main thread deadlocks. (satoru)
+    {
+        constexpr uint32_t MSR_FS_BASE = 0xC0000100;
+        __asm__ __volatile__("wrmsr" : : "c"(MSR_FS_BASE), "a"(0u), "d"(0u));
+        task->fs_base = 0;
+    }
     Scheduler::SaveUserFrame(task, current_syscall_frame);
     current_frame_rewritten = true;
     return 0;
@@ -5905,6 +5917,14 @@ int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t e
     current_syscall_frame->r15 = 0;
     current_syscall_frame->rflags = 0x202ULL;
 
+    // reset TLS base like linux execve (see the dynamic-PIE path for the full
+    // rationale): the fresh image must start with fs_base = 0 so musl installs
+    // its own TLS, not inherit the parent's fs_base. (satoru)
+    {
+        constexpr uint32_t MSR_FS_BASE = 0xC0000100;
+        __asm__ __volatile__("wrmsr" : : "c"(MSR_FS_BASE), "a"(0u), "d"(0u));
+        task->fs_base = 0;
+    }
     Scheduler::SaveUserFrame(task, current_syscall_frame);
     current_frame_rewritten = true;
 
