@@ -865,6 +865,26 @@ void Scheduler::DestroyProcess(Process* proc) {
 
     if (current_process == proc) current_process = nullptr;
 
+    // is the task's kernel context possibly still LIVE somewhere? two cases:
+    // (a) we are reaping from inside the task's OWN exit syscall (our rsp is on
+    //     its kernel stack), so the exit path keeps unwinding on that stack and
+    //     reading this struct until its final iretq;
+    // (b) another cpu still has it as its current task (mid-exit pre-iretq, or
+    //     the released_ms grace window). (satoru)
+    bool ctx_live = false;
+    {
+        uint64_t rsp_now;
+        __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp_now));
+        uint64_t kbase = proc->kernel_stack_top - KERNEL_STACK_BYTES;
+        if (proc->kernel_stack_top &&
+            rsp_now >= kbase && rsp_now < proc->kernel_stack_top) ctx_live = true;
+        if (current_process == proc) ctx_live = true;
+        for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+            PerCpu* pc = SMP::ByIndex(ci);
+            if (pc && pc->current == proc) ctx_live = true;
+        }
+    }
+
     if (proc->is_user()) {
         // a thread shares its parent's address space + user stack  -  only the
         // process that owns the address space may tear it down. tearing it down
@@ -872,24 +892,25 @@ void Scheduler::DestroyProcess(Process* proc) {
         if (proc->address_space && !proc->is_thread()) {
             KernelVMM::DestroyAddressSpace(proc->address_space);
         }
-        if (proc->kernel_stack_top) {
-            // never free the kernel stack we are CURRENTLY EXECUTING ON (a thread
-            // reaped from inside its own exit syscall): with smp another core
-            // reuses + zeroes the frames immediately, smashing the live exit path
-            // under our feet. leak it instead  -  rare, and only 64k. (satoru)
-            uint64_t rsp_now;
-            __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp_now));
+        if (proc->kernel_stack_top && !ctx_live) {
+            // never free the kernel stack a cpu is still EXECUTING ON (a thread
+            // reaped from inside its own exit syscall, or a cross-cpu reap racing
+            // the exiting cpu's unwind): with smp another core reuses + zeroes
+            // the frames immediately, smashing the live exit path under its
+            // feet. leak it instead  -  rare, and only 64k. (satoru)
             uint64_t kbase = proc->kernel_stack_top - KERNEL_STACK_BYTES;
-            if (rsp_now < kbase || rsp_now >= proc->kernel_stack_top) {
-                PMM::FreeBytes((void*)(uintptr_t)kbase, KERNEL_STACK_BYTES);
-            }
+            PMM::FreeBytes((void*)(uintptr_t)kbase, KERNEL_STACK_BYTES);
         }
     }
 
     proc->reaped = 1;
     proc->state  = Process_Terminated;
     if (g_live_proc_count > 0) g_live_proc_count--;   // free a live-task slot (satoru)
-    KernelHeap::Free(proc);
+    // freeing the struct while a cpu still unwinds on it hands the heap a block
+    // that gets recycled instantly (path buffers were observed landing in it)  - 
+    // the cpu then iretq's through ascii garbage (#UD/#GP with string-data
+    // registers). leak it in the live cases, same tradeoff as the stack. (satoru)
+    if (!ctx_live) KernelHeap::Free(proc);
 }
 
 void Scheduler::Schedule() {

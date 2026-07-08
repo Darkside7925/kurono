@@ -7,6 +7,9 @@
 namespace RuntimeLog {
     void InitFilesystem();
     void MirrorSerial(const char* text);
+    // move the staged serial-mirror text into kvfs. call from PROCESS context
+    // only (the LoggingProcess)  -  MirrorSerial itself never touches kvfs. (satoru)
+    void FlushSerialMirror();
     void LogSystem(const char* component, const char* message);
     void LogBoot(const char* message);
     // network events  -  connect / disconnect / link state / errors. (satoru)

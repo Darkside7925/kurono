@@ -33,7 +33,7 @@ per category, written through KVFS. The API is the `RuntimeLog` namespace:
 | --- | --- | --- |
 | `LogBoot` | `boot.log` | boot milestones |
 | `LogSystem(component, msg)` | `system.log` | general system events |
-| `MirrorSerial` | `serial.log` | mirror of the serial console |
+| `MirrorSerial` | `serial.log` | mirror of the serial console (**deferred**  -  see §2.1) |
 | `LogNetwork(event, detail)` | `network.log` | TCP connect / disconnect / RST / errors |
 | `LogSecurity(event, detail)` | `security.log` | SUPR escalations, KSA prompts, grants/denials |
 | `LogCrash(summary, detail)` | `crash/<n>.log` | kernel panics + minidumps |
@@ -41,6 +41,23 @@ per category, written through KVFS. The API is the `RuntimeLog` namespace:
 | `LogProcessEvent` | `processes/<name>` | per-kernel-process logs |
 
 `InitFilesystem()` creates the directory tree at boot.
+
+## 2.1 `MirrorSerial` is deferred (never touches KVFS inline)
+
+`MirrorSerial` runs from *any* context  -  timer IRQs, and critically the `#PF`/
+`#GP` exception-dump path. It used to append the line into KVFS synchronously
+(a heap realloc). Because the log, VFS, and heap locks are all CPU-owner-
+**recursive**, a fault taken while one of them was already held on the same core
+re-entered a half-mutated KVFS tree and heap free-list and wrote log text over
+live blocks  -  the root cause of a whole family of "register dump full of
+`serial.l`/`/kurono/` ASCII" corruptions and `#PF`-dump → nested-fault →
+triple-fault reboot cascades.
+
+`MirrorSerial` now **only stages the text into a fixed static ring** (no KVFS, no
+heap, safe from every context). The `LoggingProcess` kernel-process is the *only*
+thing that moves that ring into KVFS, from safe process context, via
+`FlushSerialMirror()` on its periodic tick. **Rule:** never add serial logging to
+an exception or heap-internal path without this deferral.
 
 ## 3. Where the events come from
 

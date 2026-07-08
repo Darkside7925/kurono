@@ -40,3 +40,52 @@ shot_*.png
 serial_*.log
 qemu_err.log
 qmp_*.py
+
+# session work notes + recoverable WIP diff (not for commit) (satoru)
+NOTES.md
+kpkg-daemon-freeze-fix.diff
+
+# feature brainstorm/planning workspace (libraries vendored here; not for the repo) (satoru)
+feats/
+
+# ai/session debugging artifacts (firefox bring-up + misc)  -  dev-machine only,
+# not part of the os tree (satoru)
+/ROADMAP.md
+/fable.handoff.md
+/ff_*.sh
+/ff_*.png
+/ff_mirror/
+/add_cursors.sh
+/add_icudata.sh
+/bm_recon.sh
+/check_modules.sh
+/inspect_libxul.sh
+/swap_libxul.sh
+/wl_run.sh
+/patch_*.py
+/g*.gdb
+/oracle/
+
+# host-side binary blobs from the firefox bring-up (unstripped libxul for
+# symbolization, icu data, cursor/font tars, patched libs) (satoru)
+/libxul*.so
+/libxul*.so.gz
+/icudt78l.dat
+/cursors.tar
+/fffront.tar
+/ffkx2_kurono.tar
+/fflibs.tar.gz
+/firefox-esr.APKBUILD
+/src/assets_fonts.tar
+
+# wallpaper conversion experiments + qmp screendumps at the repo root (satoru)
+/2nd_wallpaper*
+/new_wallpaper*
+/replace_new_wallpaper.jpg
+/e9b2f0e1*.jpg
+/fix_shot_*.png
+/res_*.png
+/res3_*.png
+
+# stray ssh public keys  -  never commit key material of any kind (satoru)
+ssh-key-*

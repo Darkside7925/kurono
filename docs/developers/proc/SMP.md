@@ -107,6 +107,34 @@ Still ahead: live-verifying multithreaded time-slicing on an AP (`pthread_test`)
 deciding `clone` **sibling-thread placement** (pin to the parent's core vs spread
 across cores), and **load balancing**.
 
+### Phase 4  -  SMP correctness fixes (from the Firefox bring-up)
+
+Running Firefox's threads across the APs surfaced three real SMP races, all fixed
+(see `src/proc/scheduler.cpp`, `src/proc/smp.cpp`, `src/linux/linux_syscall.cpp`):
+
+- **Futex waiter-slot ownership.** `futex_enqueue_and_block` had two abort paths
+  that cleared their wait-queue slot *unconditionally*. Under `-smp` a cross-CPU
+  `FUTEX_WAKE` can consume the slot and a *different* thread re-enqueue into the
+  same index inside that window; the blind clear then destroyed the new owner's
+  entry, leaving it blocked forever with no slot and no deadline. Both sites now
+  re-check `active && task == us` before clearing. This was the dominant
+  "startup stalls at thread-init, no crash" heisenbug.
+- **`BroadcastTlbFlush` ack-wait.** The shootdown gave up its peer-ack spin in
+  sub-millisecond time "because a peer may briefly hold IF=0"  -  but a single
+  serial line is an ~8.7 ms ring-0 UART busy-wait with interrupts off, so under
+  serial load a core could keep a **stale instruction translation after a W^X
+  `mprotect` flip** (the JIT's) and jump into stale code (per-boot-random `#GP`s).
+  It now waits up to a ~20 ms wall-clock bound; still bounded so a genuinely
+  wedged peer can't hang the unmap path (its next timer tick reloads cr3), and
+  safe to spin because waiters on the mmap lock keep IF=1 and still take the IPI.
+- **Process-reap use-after-free.** `DestroyProcess` freed the `Process` struct and
+  kernel stack even when a CPU was still unwinding on it (its own exit syscall, or
+  a cross-CPU reap racing the exiting core's final `iretq`). The heap block
+  recycled instantly and the CPU `iretq`'d through whatever landed there. It now
+  computes whether the task context is still live on *any* CPU (own rsp on its
+  kstack, or any `PerCpu.current == proc`) and leaks the struct/stack in that case
+  (bounded, rare) instead of freeing it under a live core.
+
 ## 4. Constraints that shape the design
 
 - The kernel scheduler for *kernel processes* is preemptive on the BSP (PIT IRQ0).

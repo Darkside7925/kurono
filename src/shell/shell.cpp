@@ -2209,9 +2209,11 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"network.trr.mode\", 5);\n"
             "lockPref(\"dom.push.enabled\", false);\n"
             "lockPref(\"browser.contentblocking.report.hide_vpn_banner\", true);\n"
-            // open a blank window fast; skip session restore + about:welcome. (satoru)
-            "lockPref(\"browser.startup.homepage\", \"about:blank\");\n"
-            "lockPref(\"browser.startup.page\", 0);\n"
+            // skip session restore + about:welcome. do NOT re-lock
+            // browser.startup.homepage/.page here: a later lockPref silently wins,
+            // and a second "about:blank"/page=0 pair here was overriding the mirror
+            // homepage + page=1 set earlier in this same cfg, so firefox opened a
+            // blank tab and never navigated. (satoru)
             "lockPref(\"browser.aboutwelcome.enabled\", false);\n"
             "lockPref(\"browser.sessionstore.resume_from_crash\", false);\n"
             "lockPref(\"browser.shell.checkDefaultBrowser\", false);\n";
@@ -2294,7 +2296,14 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "user_pref(\"browser.newtabpage.enabled\", false);\n"
             "user_pref(\"browser.newtabpage.activity-stream.feeds.telemetry\", false);\n"
             "user_pref(\"browser.newtabpage.activity-stream.telemetry\", false);\n"
-            "user_pref(\"browser.startup.page\", 0);\n"
+            // page=1 => open the homepage (the kurono mirror) on startup so firefox
+            // NAVIGATES instead of sitting on about:blank; this was 0, which could
+            // win over the autoconfig lockPref. also kill session-restore + the
+            // crash-resume path so neither hijacks the first window. (satoru)
+            "user_pref(\"browser.startup.page\", 1);\n"
+            "user_pref(\"browser.sessionstore.resume_from_crash\", false);\n"
+            "user_pref(\"browser.sessionstore.max_resumed_crashes\", 0);\n"
+            "user_pref(\"browser.startup.couldRestoreSession.count\", 0);\n"
             "user_pref(\"toolkit.telemetry.enabled\", false);\n"
             "user_pref(\"toolkit.telemetry.unified\", false);\n"
             "user_pref(\"datareporting.healthreport.uploadEnabled\", false);\n"

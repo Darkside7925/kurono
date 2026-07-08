@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "../kernel/userspace.h"  // Userspace::RunProcessWithArgs on the ap (satoru)
 #include "../linux/linux_syscall.h" // drain the ap process's console output (satoru)
+#include "../drivers/timer.h"     // wall-clock bound for the tlb-shootdown ack wait (satoru)
 
 //  the ap trampoline blob (flat binary, embedded via objcopy)  -  copied to phys
 //  0x8000 before the first SIPI. (satoru)
@@ -461,12 +462,24 @@ void SMP::BroadcastTlbFlush() {
     //  fixed delivery, assert, destination shorthand 11 = all excluding self. (satoru)
     LapicWrite(0x300, (3u << 18) | (1u << 14) | 0x41u);
     uint32_t want = online - 1;
-    for (int i = 0; i < 400000; i++) {   // ~sub-ms bound (satoru)
+    //  ack wait: the old ~sub-ms pause bound silently missed any peer holding
+    //  IF=0 longer than that  -  and a single serial line is an ~8.7ms ring-0
+    //  uart busy-wait with interrupts off. a peer that misses the ipi keeps a
+    //  STALE translation while the caller (mprotect/munmap) believes the flush
+    //  completed; for the jit's W^X flips that is another core executing stale
+    //  code bytes = the per-boot-random-rip #GP crashes. wait up to ~20ms wall
+    //  clock instead: covers the serial hold, still bounded so a wedged peer
+    //  cannot hang the unmap path. safe to spin here  -  waiters on the locks the
+    //  caller may hold (g_mmap_lock is a SpinLockCpuGuard, no cli) keep IF=1
+    //  and still take this very ipi while they spin. (satoru)
+    uint64_t t0 = Timer::GetRealMs64();
+    for (;;) {
         if (__atomic_load_n(&g_tlb_ack, __ATOMIC_ACQUIRE) >= want) return;
+        if (Timer::GetRealMs64() - t0 > 20) break;
         __asm__ volatile("pause");
     }
-    //  timed out  -  a peer had interrupts masked; its next timer tick reloads
-    //  cr3, so proceed rather than wedge the unmap path. (satoru)
+    //  timed out  -  a peer had interrupts masked >20ms; its next timer tick
+    //  reloads cr3, so proceed rather than wedge the unmap path. (satoru)
 }
 
 void SMP::HandleTlbIpi() {
