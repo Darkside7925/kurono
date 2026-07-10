@@ -2,7 +2,7 @@
 #include "kpaths.h"
 #include "../fs/kvfs.h"
 
-//  kurono runtime logging  -  lightweight, no daemon. one canonical root
+//  kurono runtime logging - lightweight, no daemon. one canonical root
 //  (/kurono/var/log, see kpaths.h); the old triple-homing across /system/logs,
 //  /kurono/logs and /var/log is gone. (satoru)
 
@@ -145,7 +145,7 @@ namespace {
 // ── cross-core log guard (smp thread dispatch) ──────────────────────────────
 // every serial line mirrors into kvfs (append_file_text -> kvfs node realloc):
 // with multiple cores logging concurrently that ran UNSYNCHRONIZED kernel-heap
-// / kvfs-tree mutation  -  kernel structs (incl. Process/user_frame) got clobbered
+// / kvfs-tree mutation - kernel structs (incl. Process/user_frame) got clobbered
 // and resumed user threads crashed on garbled registers. owner-recursive so a
 // log emitted from inside a locked section on the same cpu (kvfs warning paths)
 // flows through instead of self-deadlocking. (satoru)
@@ -196,17 +196,17 @@ void RuntimeLog::InitFilesystem() {
 void RuntimeLog::MirrorSerial(const char* text) {
     RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
     if (!text || !*text) return;
-    // ALWAYS defer  -  never touch kvfs/heap from here. this used to append into
+    // ALWAYS defer - never touch kvfs/heap from here. this used to append into
     // kvfs synchronously, which runs from ANY context (timer irq, #pf/#gp dump
     // paths, even heap-corruption warnings inside a heap op). every lock on
     // that path (RtLogGuard, g_vfs_lock, the heap guard) is cpu-owner-RECURSIVE,
     // so an exception on the owning cpu re-entered a HALF-MUTATED kvfs tree /
-    // heap freelist and wrote log text over live blocks  -  the recurring
+    // heap freelist and wrote log text over live blocks - the recurring
     // corruption whose frames are full of "serial.log"/"/kurono/" path bytes,
     // and the #pf-dump -> nested-fault -> triple-fault cascades. the pending
     // ring is plain static memory: safe from every context. the LoggingProcess
     // kernel process flushes it into kvfs from process context every 500ms
-    // (FlushSerialMirror). when the ring is full the MIRROR drops lines  -  the
+    // (FlushSerialMirror). when the ring is full the MIRROR drops lines - the
     // real serial console still carries everything. (satoru)
     if (g_serial_pending_len >= (int)sizeof(g_serial_pending) - 1) return;
     append_buffer(g_serial_pending, g_serial_pending_len, sizeof(g_serial_pending), text);
@@ -215,7 +215,7 @@ void RuntimeLog::MirrorSerial(const char* text) {
 void RuntimeLog::FlushSerialMirror() {
     if (!g_fs_ready) return;
     // stage the pending text out under the log lock, then write to kvfs with
-    // the lock RELEASED  -  an exception mid-append then finds no half-held log
+    // the lock RELEASED - an exception mid-append then finds no half-held log
     // state to recurse into (its MirrorSerial just stages into the ring). (satoru)
     static char staged[sizeof(g_serial_pending)];
     int n;

@@ -2,18 +2,18 @@
 #include "types.h"
 
 //  kurono os: kexec, the kernel executive (kurono's answer to the windows nt
-//  executive  -  Ex/Mm/Ps/Io/Se/Cm).
+//  executive - Ex/Mm/Ps/Io/Se/Cm).
 //
 //  the executive is the clean, named service layer the rest of the kernel + the
 //  driver frameworks (kdf/udf) call into, instead of reaching into vmm/pmm/
 //  scheduler/supr internals directly. it groups the core services into five
 //  namespaces mirroring nt:
 //
-//    KExec::Memory   (Mm)   -  page + contiguous allocation, map/unmap, query
-//    KExec::Process  (Ps)   -  current pid, spawn a kernel worker, yield/sleep
-//    KExec::IO       (Io)   -  post an irp (routes to the IRP executive)
-//    KExec::Security (Se)   -  capability / privilege checks (routes to SUPR)
-//    KExec::Config   (Cm)   -  a tiny key/value config store (the "registry")
+//    KExec::Memory   (Mm)  - page + contiguous allocation, map/unmap, query
+//    KExec::Process  (Ps)  - current pid, spawn a kernel worker, yield/sleep
+//    KExec::IO       (Io)  - post an irp (routes to the IRP executive)
+//    KExec::Security (Se)  - capability / privilege checks (routes to SUPR)
+//    KExec::Config   (Cm)  - a tiny key/value config store (the "registry")
 //
 //  HONEST SCOPE: this is a facade. it does not replace the subsystems; it gives
 //  drivers a stable, documented api surface and a single place capability checks

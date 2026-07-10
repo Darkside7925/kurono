@@ -796,7 +796,7 @@ int StartService(const char* name) {
     if (!s->enabled) { LogEvent("start-skip-disabled", s->name, nullptr); return -2; }
     if (s->state == KSVC_RUNNING || s->state == KSVC_STARTING) return 0;
     // memory-pressure gate: under Red+ kmemx pressure, refuse to launch a NEW
-    // non-critical service (critical units always start  -  the desktop must come
+    // non-critical service (critical units always start - the desktop must come
     // up). this is the spec's "Red -> stop launching new services". (satoru)
     if (!s->critical && KMemX::ShouldBlockNewServices()) {
         LogEvent("start-defer-pressure", s->name, "memory pressure red+; not launching");

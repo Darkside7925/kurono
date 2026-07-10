@@ -1,4 +1,4 @@
-// kurono os  -  mp4 / iso base media file format (isobmff) demuxer
+// kurono os - mp4 / iso base media file format (isobmff) demuxer
 // =================================================================
 // industrial-grade demuxer for the iso base media file format
 // (iso/iec 14496-12), the container behind .mp4, .m4a, .m4v, .mov,
@@ -23,11 +23,11 @@
 //     real codec
 //   * pure integer math, no fpu, freestanding-clean
 //
-// what this DOES NOT do (intentional  -  kept upstairs in the player):
+// what this DOES NOT do (intentional - kept upstairs in the player):
 //   * actually decode video / audio samples (handled by codec modules)
-//   * fragmented mp4 (moof/mfra)  -  denji.mp4 is non-fragmented
-//   * encryption (cenc, pssh, sinf)  -  out of scope
-//   * edit lists (elst)  -  composition is taken straight from stts+ctts
+//   * fragmented mp4 (moof/mfra) - denji.mp4 is non-fragmented
+//   * encryption (cenc, pssh, sinf) - out of scope
+//   * edit lists (elst) - composition is taken straight from stts+ctts
 //
 // design notes:
 //   we parse once at Open() and cache everything.  the underlying byte

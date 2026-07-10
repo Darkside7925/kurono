@@ -1,5 +1,5 @@
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Kurono OS  -  Cooperative Context Switch (x86_64)
+;  Kurono OS - Cooperative Context Switch (x86_64)
 ;
 ;  void scheduler_switch_to(uint64_t* prev_saved_rsp,
 ;                           uint64_t  next_saved_rsp);
@@ -34,7 +34,7 @@ scheduler_switch_to:
     push r14
     push r15
 
-    ; persist current rsp into *prev_saved_rsp (if non-null  -  initial
+    ; persist current rsp into *prev_saved_rsp (if non-null - initial
     ; bootstrap from kernel_main passes nullptr to discard).
     test rdi, rdi
     jz   .no_save
@@ -72,7 +72,7 @@ scheduler_jump_to:
     ret
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  void ap_enter_user_frame(InterruptFrame* f)    -  never returns
+;  void ap_enter_user_frame(InterruptFrame* f)   - never returns
 ;
 ;  smp thread dispatch: an application processor resumes a claimed user
 ;  thread from its saved InterruptFrame. mirrors the isr_common restore

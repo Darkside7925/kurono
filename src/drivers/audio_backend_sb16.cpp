@@ -1,4 +1,4 @@
-//  kurono os  -  Sound Blaster 16 backend (auto-init DMA, double-buffered)
+//  kurono os - Sound Blaster 16 backend (auto-init DMA, double-buffered)
 
 #include "audio_backend.h"
 #include "audio_dma.h"
@@ -73,7 +73,7 @@ public:
         if (!p) return false;
         dma_buf_phys_ = (uint32_t)(uintptr_t)p;
         dma_buf_      = (uint8_t*)p;
-        // 32 KB buffer at the start of a 128 KB DMA-16 page  -  verify.
+        // 32 KB buffer at the start of a 128 KB DMA-16 page - verify.
         if (!AudioDMA::SplitForDMA16(dma_buf_phys_, kBufBytes).valid) {
             SerialLogger::Log("[SB16] DMA buffer crosses 128KB page; refusing\r\n");
             return false;
@@ -288,7 +288,7 @@ private:
             }
             for (volatile int d = 0; d < 32; d++) {}
         }
-        // Fall through if we ran out of patience  -  the half is still
+        // Fall through if we ran out of patience - the half is still
         // being played but we have no choice; mixer is starved.
         active_half_ = next_fill_half_ ^ 1;
     }

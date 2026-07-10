@@ -1,4 +1,4 @@
-//  kurono os  -  software audio mixer (implementation)
+//  kurono os - software audio mixer (implementation)
 #include "audio_mixer.h"
 #include "audio_backend.h"
 #include "audio_format.h"
@@ -21,7 +21,7 @@ struct Stream {
     int      pan;
     bool     muted;
 
-    // Smoothed gain values in q15  -  updated once per period so per-stream
+    // Smoothed gain values in q15 - updated once per period so per-stream
     // volume / pan changes don't click.  Target values are derived from
     // volume_pct + pan; smoothing is a one-pole filter with ~4 ms tau.
     int32_t  cur_lg_q15;
@@ -156,7 +156,7 @@ StreamID Open(const char* name, AudioFormat::SampleFormat fmt,
     s->volume_pct     = 100;
     s->pan            = 0;
     s->muted          = false;
-    // Start gain ramps muted so the first period fades up  -  eliminates
+    // Start gain ramps muted so the first period fades up - eliminates
     // the click some apps get when opening a stream while another is
     // playing at full scale.
     // Snap to full gain on Open so transient sounds (taps, beeps) don't
@@ -343,7 +343,7 @@ uint32_t Tick() {
     if (!be || !be->IsReady()) return 0;
 
     // note: be->Tick() (hardware-queue refresh + codec housekeeping) is done
-    // ONCE per pump by AudioServer::Tick(), not here per-period  -  calling it
+    // ONCE per pump by AudioServer::Tick(), not here per-period - calling it
     // every period meant an I/O-port read storm (each is a VM exit under
     // VMware) that stole cpu from the gui/input tiers and caused microstutter.
     // the gate below uses the cached queue depth (cheap, no port I/O). (satoru)

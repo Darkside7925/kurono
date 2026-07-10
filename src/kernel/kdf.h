@@ -152,7 +152,7 @@ void EnableFileLog();
 // longjmp the active RunGuarded()/Start() back to its call-site. DOES NOT RETURN
 // when it handles a fault on the armed cpu (it longjmps). returns false if cr2 is
 // not a kdf address (the normal kernel-fault path then proceeds to panic). a true
-// return with no active sandbox means "kdf address but nothing to unwind to"  - 
+// return with no active sandbox means "kdf address but nothing to unwind to" - 
 // the caller still must not panic; kdf has already quarantined + logged. (satoru)
 bool HandleGuardFault(uint64_t cr2, uint64_t rip);
 

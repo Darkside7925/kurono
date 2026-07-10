@@ -1,9 +1,9 @@
 #pragma once
-//  kurono os  -  virtual device emulation
+//  kurono os - virtual device emulation
 //  emulated pic (8259a), apic, pit (8254), hpet for vm guests
 #include "../kernel/types.h"
 
-//  virtual pic  -  intel 8259a programmable interrupt controller
+//  virtual pic - intel 8259a programmable interrupt controller
 //  two pics: master (ports 0x20-0x21) and slave (ports 0xa0-0xa1)
 
 struct VirtualPIC {
@@ -37,7 +37,7 @@ struct VirtualPIC {
     void AcknowledgeIRQ(int irq);     // eoi
 };
 
-//  virtual apic  -  advanced programmable interrupt controller
+//  virtual apic - advanced programmable interrupt controller
 //  mmio at 0xfee00000 (4kb region), per-cpu local apic
 
 #define VAPIC_BASE_ADDR     0xFEE00000
@@ -105,7 +105,7 @@ struct VirtualAPIC {
     void EOI();                         // end of interrupt
 };
 
-//  virtual pit  -  intel 8254 programmable interval timer
+//  virtual pit - intel 8254 programmable interval timer
 //  ports 0x40-0x43: channel 0/1/2 data, plus command register
 
 #define PIT_FREQ_HZ         1193182  // base oscillator frequency
@@ -121,7 +121,7 @@ struct PITChannel {
     bool     output;        // output state
     bool     latched;       // count latched for read
     bool     null_count;    // count hasn't been loaded yet
-    bool     flip_flop;     // for lo-hi access mode  -  tracks which byte
+    bool     flip_flop;     // for lo-hi access mode - tracks which byte
     uint32_t tick_accum;    // sub-tick accumulator for precise timing
 };
 
@@ -138,7 +138,7 @@ struct VirtualPIT {
     uint32_t GetFrequencyHz(int channel);
 };
 
-//  virtual hpet  -  high precision event timer
+//  virtual hpet - high precision event timer
 //  mmio at configurable base (typically 0xfed00000), 1024 bytes
 
 #define HPET_BASE_ADDR       0xFED00000
@@ -203,7 +203,7 @@ struct VirtualHPET {
     int  CheckFiredTimers();  // returns bitmask of timers that fired
 };
 
-//  virtual device manager  -  coordinates all virtual devices for a vm
+//  virtual device manager - coordinates all virtual devices for a vm
 
 class VirtualDevices {
 public:
@@ -217,10 +217,10 @@ public:
     static bool HandleMMIO(uint64_t phys_addr, bool is_write, uint8_t size,
                             uint32_t& value);
 
-    // timer ticks  -  advance all virtual timers
+    // timer ticks - advance all virtual timers
     static void Tick(uint32_t elapsed_us);
 
-    // irq delivery  -  check if virtual devices want to inject interrupts
+    // irq delivery - check if virtual devices want to inject interrupts
     static int GetPendingIRQ(); // returns irq# or -1
 
     // access individual devices

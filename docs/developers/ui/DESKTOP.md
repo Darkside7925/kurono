@@ -6,11 +6,11 @@
 
 Three classes cooperate to produce the desktop.
 
-**`Taskbar`**  -  renders the bottom (or top) bar with the start button, running window buttons, system tray (clock, battery, Wi-Fi, volume), and the search bar.
+**`Taskbar`** - renders the bottom (or top) bar with the start button, running window buttons, system tray (clock, battery, Wi-Fi, volume), and the search bar.
 
-**`Desktop`**  -  renders the desktop background (wallpaper or gradient), manages icon placement, handles double-click to launch and right-click for context menus.
+**`Desktop`** - renders the desktop background (wallpaper or gradient), manages icon placement, handles double-click to launch and right-click for context menus.
 
-**`DesktopEnvironment`**  -  the coordinator that owns both Taskbar and Desktop. All input routes through `DesktopEnvironment::HandleInput()`. The main loop calls `DesktopEnvironment::Update()` and `DesktopEnvironment::Render()`.
+**`DesktopEnvironment`** - the coordinator that owns both Taskbar and Desktop. All input routes through `DesktopEnvironment::HandleInput()`. The main loop calls `DesktopEnvironment::Update()` and `DesktopEnvironment::Render()`.
 
 ## 2. Icons
 
@@ -56,8 +56,8 @@ Call `Taskbar::ReloadFromConfig()` to apply changes at runtime without rebooting
 
 ## 7. Related files
 
-- `src/system/ui_config.cpp`  -  config source for all visual settings
-- `src/ui/window_manager.cpp`  -  window layer rendered above the desktop
-- `src/ui/wayland_server.cpp`  -  in-kernel Wayland compositor that can bridge to the window manager
-- `src/fs/kvfs.cpp`  -  KVFS used for desktop file creation and deletion
-- `src/apps/settings.cpp`  -  launched from the context menu's Settings item
+- `src/system/ui_config.cpp` - config source for all visual settings
+- `src/ui/window_manager.cpp` - window layer rendered above the desktop
+- `src/ui/wayland_server.cpp` - in-kernel Wayland compositor that can bridge to the window manager
+- `src/fs/kvfs.cpp` - KVFS used for desktop file creation and deletion
+- `src/apps/settings.cpp` - launched from the context menu's Settings item

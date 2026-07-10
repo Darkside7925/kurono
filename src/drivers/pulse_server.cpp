@@ -317,14 +317,14 @@ void on_data(int sd, const uint8_t* data, int len, void* user) {
         uint32_t channel = be32(c->rx + p + 4);
         const uint8_t* payload = c->rx + p + 20;
         if (channel == 0xFFFFFFFFu) {
-            // Command packet  -  payload is tagstruct(u32 cmd, u32 tag, ...)
+            // Command packet - payload is tagstruct(u32 cmd, u32 tag, ...)
             if (plen >= 10 && payload[0] == PA_TAG_U32 && payload[5] == PA_TAG_U32) {
                 uint32_t cmd = be32(payload + 1);
                 uint32_t tag = be32(payload + 6);
                 handle_request(c, cmd, tag, payload + 10, (int)plen - 10);
             }
         } else {
-            // Stream audio data  -  forward to the mixer.  Frames count is
+            // Stream audio data - forward to the mixer.  Frames count is
             // payload bytes / frame size.  The mixer takes care of any
             // resampling and channel remix.
             Stream* s = find_stream_by_channel(channel);

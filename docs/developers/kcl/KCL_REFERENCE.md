@@ -1,8 +1,8 @@
-# KCL  -  Kurono Command Language Reference
+# KCL - Kurono Command Language Reference
 
 KCL is the built-in scripting language of Kurono OS. It is a complete
 tree-walking interpreter (lexer + recursive-descent parser + evaluator) that
-runs inside the kernel  -  no libc, no external runtime. Implemented in
+runs inside the kernel - no libc, no external runtime. Implemented in
 `src/kcl/kcl.cpp` / `kcl.h`.
 
 ## Value types
@@ -188,9 +188,9 @@ kcl -c "print('hi')"    # run inline code  (-e is an alias)
 ## Errors
 
 Errors are reported with line numbers (e.g. `kcl: line 3: division by zero`)
-and captured into the command output. A script error  -  including infinite
+and captured into the command output. A script error - including infinite
 recursion (bounded by a call-depth guard) and runaway loops (bounded by an
-iteration guard)  -  is contained and reported; it never crashes the OS.
+iteration guard) - is contained and reported; it never crashes the OS.
 
 ## Limits
 

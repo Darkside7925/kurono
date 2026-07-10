@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  kcl self-test harness
+//  kurono os - kcl self-test harness
 //  runs a suite of kcl scripts headless at boot (gated by a cmdline token)
 //  and logs PASS/FAIL per test to serial. covers every major language
 //  feature plus the stdlib. (satoru)

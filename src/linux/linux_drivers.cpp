@@ -1,4 +1,4 @@
-//  kurono os  -  linux driver compatibility framework  -  implementation
+//  kurono os - linux driver compatibility framework - implementation
 //  full driver model with built-in drivers for all detected hardware
 
 #include "linux_drivers.h"
@@ -472,7 +472,7 @@ void LinuxDriverFramework::RegisterGPUDrivers() {
     drv.probe = probe_amdgpu;
     RegisterDriver(&drv);
 
-    // amd vcn (video core next  -  hardware encode/decode)
+    // amd vcn (video core next - hardware encode/decode)
     memset(&drv, 0, sizeof(drv));
     lf_scpy(drv.name, "amdgpu_vcn", LDRV_MAX_NAME);
     lf_scpy(drv.description, "AMD VCN video encode/decode (H.264/HEVC/AV1)", LDRV_MAX_DESC);
@@ -490,7 +490,7 @@ void LinuxDriverFramework::RegisterGPUDrivers() {
     lf_scpy(drv.license, "GPL", 16);
     drv.category = LDRV_CAT_GPU;
     drv.major = 226;
-    // intel igpus  -  detect by vendor + class since device ids vary per gen
+    // intel igpus - detect by vendor + class since device ids vary per gen
     drv.pci_ids[0] = {0x8086, 0x56A5, 0, 0, 0x030000, 0xFFFF00}; // arc a770
     drv.pci_ids[1] = {0x8086, 0x56A0, 0, 0, 0x030000, 0xFFFF00}; // arc a750
     drv.pci_ids[2] = {0x8086, 0xA780, 0, 0, 0x030000, 0xFFFF00}; // rpl uhd 770
@@ -499,10 +499,10 @@ void LinuxDriverFramework::RegisterGPUDrivers() {
     drv.pci_ids[5] = {0x8086, 0x3E92, 0, 0, 0x030000, 0xFFFF00}; // cfl uhd 630
     drv.pci_id_count = 6;
     // intel igpu probe: pci class 0x03 + vendor 0x8086
-    drv.probe = probe_bga; // reuse bga probe  -  real intel gpu uses same fb
+    drv.probe = probe_bga; // reuse bga probe - real intel gpu uses same fb
     RegisterDriver(&drv);
 
-    // intel qsv (quick sync video  -  hardware encode/decode)
+    // intel qsv (quick sync video - hardware encode/decode)
     memset(&drv, 0, sizeof(drv));
     lf_scpy(drv.name, "i915_qsv", LDRV_MAX_NAME);
     lf_scpy(drv.description, "Intel Quick Sync Video encode/decode", LDRV_MAX_DESC);
@@ -1017,7 +1017,7 @@ void LinuxDriverFramework::DumpDrivers(char* out, int max_out) {
     }
 }
 
-//  procfs  -  virtual /proc filesystem
+//  procfs - virtual /proc filesystem
 
 void ProcFS::Init() {
     Populate();
@@ -1153,7 +1153,7 @@ void ProcFS::UpdateMounts() {
         "tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0\n");
 }
 
-//  sysfs  -  virtual /sys filesystem
+//  sysfs - virtual /sys filesystem
 
 void SysFS::Init() {
     Populate();

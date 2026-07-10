@@ -1,4 +1,4 @@
-//  kurono os  -  linux network stack bridge  -  implementation
+//  kurono os - linux network stack bridge - implementation
 
 #include "linux_netbridge.h"
 #include "../kernel/heap.h"
@@ -11,7 +11,7 @@
 #include "../proc/kernel_locks.h"
 
 // every MUTATING TCPStack call from the bridge runs under g_net_lock (the
-// leaf lock the NetworkProcess tick already takes)  -  linux syscalls run on
+// leaf lock the NetworkProcess tick already takes) - linux syscalls run on
 // the bsp AND the aps truly parallel to that tick. readiness/rx-count checks
 // stay lock-free single-word reads (bounded staleness, next poll re-reads).
 // the bridge is strictly NON-BLOCKING: TCPStack's internal blocking waits
@@ -77,7 +77,7 @@ void LinuxNetBridge::Init() {
 void LinuxNetBridge::InitInterfaces() {
     iface_count = 0;
 
-    // lo  -  loopback
+    // lo - loopback
     LinuxNetInterface* lo = &interfaces[iface_count++];
     ln_scpy(lo->name, "lo", sizeof(lo->name));
     lo->ip_addr = 0x7F000001;     // 127.0.0.1
@@ -91,7 +91,7 @@ void LinuxNetBridge::InitInterfaces() {
     lo->rx_bytes = lo->tx_bytes = 0;
     lo->rx_packets = lo->tx_packets = 0;
 
-    // eth0  -  primary interface (shared with kurono)
+    // eth0 - primary interface (shared with kurono)
     LinuxNetInterface* eth = &interfaces[iface_count++];
     ln_scpy(eth->name, "eth0", sizeof(eth->name));
     NetworkInterface* kurono_eth = Network::GetInterface("eth0");
@@ -203,7 +203,7 @@ int LinuxNetBridge::Bind(int sockfd, const LinuxSockaddrIn* addr) {
 }
 
 int LinuxNetBridge::Listen(int sockfd, int backlog) {
-    // v1: no inbound tcp  -  TCPStack::Accept blocks with PumpUI (ap-unsafe)
+    // v1: no inbound tcp - TCPStack::Accept blocks with PumpUI (ap-unsafe)
     // and nothing firefox needs listens. (satoru)
     (void)sockfd; (void)backlog;
     return -95;                                          // -EOPNOTSUPP (satoru)
@@ -297,7 +297,7 @@ int LinuxNetBridge::Send(int sockfd, const void* buf, int len, int flags) {
     if (TCPStack::IsPeerClosed(s->kurono_socket)) return -32;   // -EPIPE (satoru)
 
     // pre-check the send window so TCPStack::Send can NEVER enter its
-    // internal window-full PumpUI wait  -  short writes are fine, callers
+    // internal window-full PumpUI wait - short writes are fine, callers
     // loop. (satoru)
     int free_segs = TCPStack::TxFreeSegs(s->kurono_socket);
     if (free_segs <= 0) return -11;                      // -EAGAIN (satoru)
@@ -340,7 +340,7 @@ int LinuxNetBridge::Recv(int sockfd, void* buf, int len, int flags) {
     int r;
     {
         SpinLockCpuGuard g(g_net_lock);
-        // Recv mutates state (window-update acks)  -  locked. (satoru)
+        // Recv mutates state (window-update acks) - locked. (satoru)
         r = TCPStack::Recv(s->kurono_socket, buf, len);
     }
     if (r < 0) return -11;
@@ -388,7 +388,7 @@ int LinuxNetBridge::Recvfrom(int sockfd, void* buf, int len, int flags,
     int r;
     {
         SpinLockCpuGuard g(g_net_lock);
-        // pops exactly one framed datagram record (true per-datagram source  - 
+        // pops exactly one framed datagram record (true per-datagram source - 
         // musl's resolver memcmps it). (satoru)
         r = TCPStack::RecvFrom(s->kurono_socket, buf, len, &fip, &fport);
     }
@@ -407,7 +407,7 @@ int LinuxNetBridge::Shutdown(int sockfd, int how) {
     LinuxSocket* s = GetSocket(sockfd);
     if (!s) return -9;
     // shut_wr / shut_rdwr sends fin via Close; shut_rd is a benign no-op
-    // (the rx ring keeps draining). the linux fd stays open either way  - 
+    // (the rx ring keeps draining). the linux fd stays open either way - 
     // sys_close does the final release. (satoru)
     if (how == LSHUT_WR || how == LSHUT_RDWR) {
         if (s->type == LSOCK_STREAM && s->kurono_socket >= 0) {
@@ -423,7 +423,7 @@ int LinuxNetBridge::Close(int sockfd) {
     LinuxSocket* s = GetSocket(sockfd);
     if (!s) return -9;
     // dup/fork refcount: only the LAST linux fd release tears down the
-    // kurono socket  -  the 16-slot stack table makes leak discipline
+    // kurono socket - the 16-slot stack table makes leak discipline
     // critical. (satoru)
     if (--s->refs > 0) return 0;
     if (s->kurono_socket >= 0) {
@@ -442,7 +442,7 @@ void LinuxNetBridge::Retain(int sockfd) {
     if (s) s->refs++;
 }
 
-// poll/epoll readiness  -  lock-free single-word reads (same precedent as
+// poll/epoll readiness - lock-free single-word reads (same precedent as
 // UnixSocket::PendingBytes in fd_readiness); staleness is bounded by the
 // caller's next poll pass. (satoru)
 uint32_t LinuxNetBridge::Readiness(int sockfd) {
@@ -471,7 +471,7 @@ uint32_t LinuxNetBridge::Readiness(int sockfd) {
 }
 
 // getsockopt(SO_ERROR): pending connect error, 0 when fine. v1 keeps the
-// error sticky (no clear-on-read)  -  firefox reads it once then closes the
+// error sticky (no clear-on-read) - firefox reads it once then closes the
 // fd, so the simplification never bites. (satoru)
 int LinuxNetBridge::SockError(int sockfd) {
     LinuxSocket* s = GetSocket(sockfd);
@@ -605,7 +605,7 @@ int LinuxNetBridge::Resolve(const char* hostname, uint32_t* ip_out) {
     if (ln_seq(hostname, "localhost")) { *ip_out = 0x7F000001; return 0; }
     if (ln_seq(hostname, "kurono"))    { *ip_out = 0x7F000001; return 0; }
 
-    // real dns via the kernel resolver (bsp-only shell path  -  it pumps ui
+    // real dns via the kernel resolver (bsp-only shell path - it pumps ui
     // internally). the old body returned a hardcoded fake ip. (satoru)
     IPv4Address r;
     if (Network::Resolve(hostname, &r)) { *ip_out = ln_ip_to_u32(r); return 0; }

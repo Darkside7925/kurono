@@ -24,8 +24,8 @@ VirtIO devices communicate with the guest driver via descriptor rings (virtqueue
 
 ## 4. Related files
 
-- `src/virt/vmexit.cpp`  -  I/O dispatch into this module
-- `src/virt/vdisk.cpp`  -  block device backend
-- `src/virt/vserial.cpp`  -  serial backend (Conduit terminal)
-- `src/virt/v9fs.cpp`  -  filesystem sharing backend
-- `src/linux/linux_netbridge.cpp`  -  NIC bridge
+- `src/virt/vmexit.cpp` - I/O dispatch into this module
+- `src/virt/vdisk.cpp` - block device backend
+- `src/virt/vserial.cpp` - serial backend (Conduit terminal)
+- `src/virt/v9fs.cpp` - filesystem sharing backend
+- `src/linux/linux_netbridge.cpp` - NIC bridge

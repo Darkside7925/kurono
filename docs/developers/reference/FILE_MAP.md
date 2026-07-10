@@ -209,7 +209,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `fat32.h` | FAT32 declarations |
 | `kvfs.cpp` | in memory virtual filesystem (runtime fs) |
 | `kvfs.h` | KVFS declarations |
-| `kfs.cpp` | Kurono File System  -  on-disk persistence filesystem |
+| `kfs.cpp` | Kurono File System - on-disk persistence filesystem |
 | `kfs.h` | KFS on-disk format spec + declarations |
 | `kfs_bench.cpp` / `kfs_bench.h` | KFS benchmark (`kurono.kfsbench`) |
 | `persist.cpp` | persistence layer (mirrors KVFS user data into KFS) |

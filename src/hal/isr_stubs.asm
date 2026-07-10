@@ -1,12 +1,12 @@
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Kurono OS  -  ISR / IRQ Assembly Stubs (x86_64)
+;  Kurono OS - ISR / IRQ Assembly Stubs (x86_64)
 ;
 ;  Each stub saves the full register state into an InterruptFrame on the
 ;  stack, calls the common C handler, and restores state before iretq.
 ;
 ;  Exception vectors 0-31:
 ;    - Some push an error code automatically (8,10-14,17,21,29,30).
-;    - Others do NOT  -  we push a dummy 0 to keep the frame consistent.
+;    - Others do NOT - we push a dummy 0 to keep the frame consistent.
 ;
 ;  IRQ vectors 32-47:
 ;    - All push a dummy 0 (hardware interrupts never push error codes).
@@ -96,7 +96,7 @@ ISR_NOERR 64   ; per-AP LAPIC timer (smp phase 4)
 ISR_NOERR 65   ; tlb-shootdown ipi (smp thread dispatch) (satoru)
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Common handler  -  saves all GPRs, calls C, restores, iretq
+;  Common handler - saves all GPRs, calls C, restores, iretq
 ;
 ;  Stack layout on entry here (growing downward, RSP points to top):
 ;    [RSP+ 0]  vector number   (pushed by our stub)
@@ -138,7 +138,7 @@ isr_common:
 
     call isr_common_handler
 
-    ; Pop CR2 (we don't write it back  -  it's read-only effectively)
+    ; Pop CR2 (we don't write it back - it's read-only effectively)
     add  rsp, 8
 
     ; Restore all GPRs
@@ -164,7 +164,7 @@ isr_common:
     iretq
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  ISR stub table  -  array of 48 function pointers for C to index
+;  ISR stub table - array of 48 function pointers for C to index
 ; ═══════════════════════════════════════════════════════════════════════════
 section .rodata
 global isr_stub_table

@@ -25,5 +25,5 @@ Every file that uses numeric types, pointer widths, or boolean values should inc
 
 ## 4. Related files
 
-- `src/kernel/kurono_kernel.cpp`  -  includes types transitively through almost every header
-- `src/kernel/io.h`  -  I/O port helpers that use the types defined here
+- `src/kernel/kurono_kernel.cpp` - includes types transitively through almost every header
+- `src/kernel/io.h` - I/O port helpers that use the types defined here

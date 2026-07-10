@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  linux network stack bridge
+//  kurono os - linux network stack bridge
 //  shares the network stack between kurono and linux subsystem.
 //  linux programs see standard socket apis; the bridge translates
 //  to kurono's native network stack.
@@ -49,7 +49,7 @@
 #define LF_SETFL      4
 #define LFD_O_NONBLOCK 0x0800
 
-// poll/epoll readiness bits returned by Readiness()  -  standard linux values,
+// poll/epoll readiness bits returned by Readiness() - standard linux values,
 // matching linux_syscall.cpp's L_EPOLL* so fd_readiness can or them in
 // directly. (satoru)
 #define LNET_POLLIN   0x001
@@ -143,7 +143,7 @@ struct LinuxNetInterface {
     int      mtu;
 };
 
-//  linuxnetbridge  -  socket and network bridge
+//  linuxnetbridge - socket and network bridge
 
 class LinuxNetBridge {
 public:
@@ -174,7 +174,7 @@ public:
     static int  Getsockname(int sockfd, LinuxSockaddrIn* addr);
 
     // af_inet bridge over the kurono TCPStack (real backend, non-blocking
-    // primitives only  -  the syscall layer owns all waiting). (satoru)
+    // primitives only - the syscall layer owns all waiting). (satoru)
     static int  ConnectPoll(int sockfd);       // 0 / -EINPROGRESS / -ECONNREFUSED / -ETIMEDOUT
     static uint32_t Readiness(int sockfd);     // LNET_POLL* bitmask, lock-free reads
     static int  SockError(int sockfd);         // getsockopt(SO_ERROR) value, clears on read

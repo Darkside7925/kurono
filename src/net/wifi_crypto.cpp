@@ -1,4 +1,4 @@
-//  kurono os  -  802.11i security crypto primitives (satoru)
+//  kurono os - 802.11i security crypto primitives (satoru)
 //  see wifi_crypto.h. from-scratch sha1/hmac/pbkdf2/aes/cmac/prf/ccmp, no libc.
 //  validated against published 802.11i + rfc test vectors (ieee80211_test.cpp).
 //  ref: fips-197 (aes), rfc 3174 (sha1), rfc 2104 (hmac), rfc 2898 (pbkdf2),
@@ -136,7 +136,7 @@ void Pbkdf2HmacSha1(const uint8_t* pass, uint32_t pass_len,
     uint32_t blocks = (dk_len + WC_SHA1_DIGEST - 1) / WC_SHA1_DIGEST;
     uint32_t out_pos = 0;
     for (uint32_t i = 1; i <= blocks; i++) {
-        // u1 = prf(pass, salt || int(i))  -  big-endian block index. (satoru)
+        // u1 = prf(pass, salt || int(i)) - big-endian block index. (satoru)
         uint8_t ibuf[4] = { (uint8_t)(i >> 24), (uint8_t)(i >> 16),
                             (uint8_t)(i >> 8), (uint8_t)(i) };
         uint8_t u[WC_SHA1_DIGEST], t[WC_SHA1_DIGEST];

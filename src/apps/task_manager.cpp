@@ -1,4 +1,4 @@
-//  kurono os  -  task manager (professional redesign)
+//  kurono os - task manager (professional redesign)
 #include "task_manager.h"
 #include "browser.h"
 #include "media_player.h"
@@ -513,7 +513,7 @@ void TaskManagerApp::RefreshProcesses(){
         if(snap.cpu_ticks_total >= prev_ticks) delta_ticks = snap.cpu_ticks_total - prev_ticks;
         int cpu_pct = g_tm_cpu_samples_ready ? tm_cpu_pct_from_ticks(delta_ticks, elapsed_ms) : 0;
 
-        // a scheduler task may also be a linux/user process  -  if so, take its
+        // a scheduler task may also be a linux/user process - if so, take its
         // real command name and add its heap to the rss. user processes are
         // tagged via PROCESS_FLAG_USER; everything else is a kernel task. (satoru)
         bool is_user = (snap.flags & PROCESS_FLAG_USER) != 0;
@@ -554,7 +554,7 @@ void TaskManagerApp::RefreshProcesses(){
     tm_store_cpu_samples(snapshots, snapshot_count);
     g_tm_cpu_samples_ready = true;
 
-    // open windows are NOT processes  -  a window is a ui surface owned by some
+    // open windows are NOT processes - a window is a ui surface owned by some
     // process, and listing it here both inflated the count and double-counted
     // its framebuffer as "memory". windows have their own dedicated tab
     // (RenderWindows). just refresh that list; don't blend it into procs. (satoru)
@@ -564,7 +564,7 @@ void TaskManagerApp::RefreshProcesses(){
 
     cpu_usage = tm_clamp(total_busy_cpu, 0, 100);
 
-    // honest system ram: real total/used/free from the pmm  -  never a sum of
+    // honest system ram: real total/used/free from the pmm - never a sum of
     // per-process figures (that double-counts shared pages + framebuffers). (satoru)
     tm_query_memory_usage_kb(mem_total_kb, mem_used_kb, mem_free_kb, mem_heap_kb);
     mem_cached_kb = mem_free_kb;   // keep the legacy field coherent (satoru)
@@ -705,7 +705,7 @@ void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
         // name with colored indicator
         unsigned int nc = (p->state[0]=='R') ? TM_TEXT : TM_DIM;
         Graphics::DrawString(x+PL_NAME, ry+2, p->name, nc, 0xFF000000);
-        // cpu bar (36 px) then the percentage in its own column  -  the two no
+        // cpu bar (36 px) then the percentage in its own column - the two no
         // longer collide with each other or with memory. (satoru)
         int cpu_bar_w = (p->cpu_pct * 36) / 100;
         unsigned int bar_c = p->cpu_pct > 50 ? TM_RED : (p->cpu_pct > 20 ? TM_ORANGE : TM_GREEN);
@@ -780,7 +780,7 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     char pct[8]; int_to_str(cpu_usage,pct,8); sapp(pct,"%",8);
     Graphics::DrawString(x+half_w-20, ly+6, pct, TM_WHITE, 0xFF000000);
     DrawGraph(x+16, ly+24, half_w-16, 64, cpu_history, hist_idx, 100, TM_BLUE, TM_BLUE);
-    // cpu info  -  two STACKED lines (brand, then cores/threads + base mhz). the
+    // cpu info - two STACKED lines (brand, then cores/threads + base mhz). the
     // old layout drew the brand and a "Cur:" line at overlapping x on the same
     // row, mashing them together ("Intel(R) Core(TM)...255HXCur:..."); detailed
     // per-core current mhz lives in the CPU device pane below instead. (satoru)
@@ -811,7 +811,7 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     int_to_str(mem_pct,pct,8); sapp(pct,"%",8);
     Graphics::DrawString(x+w-40, ly+6, pct, TM_WHITE, 0xFF000000);
     DrawGraph(x+half_w+28, ly+24, half_w-16, 64, mem_history, hist_idx, 100, TM_PURPLE, TM_PURPLE);
-    // memory details  -  honest pmm figures: used/total on one line, free + the
+    // memory details - honest pmm figures: used/total on one line, free + the
     // kernel-heap sub-total on the next. no per-process summing. (satoru)
     char mb[32]={0}; int_to_str(mem_used_kb/1024,mb,32); sapp(mb," / ",32);
     char t2[12]; int_to_str(mem_total_kb/1024,t2,12); sapp(mb,t2,32); sapp(mb," MB used",32);
@@ -899,7 +899,7 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
 }
 
 void TaskManagerApp::RenderDetails(int x,int y,int w,int h){
-    // detailed view  -  header x and value x share one set of offsets so the
+    // detailed view - header x and value x share one set of offsets so the
     // numbers line up under their labels (Thr/Pri used to be a few px off). (satoru)
     const int D_PID=4, D_USER=40, D_NAME=104, D_CPU=224, D_MEM=264, D_THR=336, D_PRI=372, D_IOR=408, D_IOW=470;
     Graphics::FillRect(x,y,w,ROW_H,TM_HEAD_BG);
@@ -935,7 +935,7 @@ void TaskManagerApp::RenderDetails(int x,int y,int w,int h){
         Graphics::DrawString(x+D_NAME,ry+2,p->name,TM_TEXT,0xFF000000);
         int_to_str(p->cpu_pct,num,12); sapp(num,"%",12);
         Graphics::DrawString(x+D_CPU, ry+2,num,p->cpu_pct>20?TM_ORANGE:TM_DIM,0xFF000000);
-        // memory: MB rollup over 1 MB, else KB  -  consistent with Processes. (satoru)
+        // memory: MB rollup over 1 MB, else KB - consistent with Processes. (satoru)
         char mem[16]={0};
         if(p->mem_kb >= 1024){ int_to_str(p->mem_kb/1024,mem,16); sapp(mem,"M",16); }
         else                 { int_to_str(p->mem_kb,mem,16); sapp(mem,"K",16); }
@@ -1118,7 +1118,7 @@ bool TaskManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         // hit-test against the ACTUAL drawn position: RenderActionMenu clamps the
         // popup to the content area, so a right-click near the right/bottom edge
         // draws it shifted. mirror that exact clamp here or the click misses the
-        // visible menu  -  this was the broken hit test. (satoru)
+        // visible menu - this was the broken hit test. (satoru)
         int am_x = action_menu_x;
         int am_y = action_menu_y;
         if(w){
@@ -1155,7 +1155,7 @@ bool TaskManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         }
     }
 
-    // column header click for sorting (processes tab)  -  ranges mirror the
+    // column header click for sorting (processes tab) - ranges mirror the
     // PL_* column geometry so a header click hits the column it's under. (satoru)
     if(current_tab==TM_PROCESSES && my >= TAB_H+1 && my < TAB_H+1+ROW_H){
         if(mx>=PL_PID && mx<PL_NAME){ sort_col=TM_SORT_PID; sort_asc=!sort_asc; SortProcesses(); return true; }
@@ -1164,14 +1164,14 @@ bool TaskManagerApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         if(mx>=PL_MEM && mx<PL_THR){ sort_col=TM_SORT_MEM; sort_asc=!sort_asc; SortProcesses(); return true; }
     }
 
-    // process row click  -  if already selected, open action menu
+    // process row click - if already selected, open action menu
     if(current_tab==TM_PROCESSES || current_tab==TM_DETAILS){
         int list_y = TAB_H + 1 + ROW_H;
         if(my >= list_y){
             int row = (my - list_y) / ROW_H + scroll_offset;
             if(row>=0 && row<proc_count){
                 if(row == selected_proc){
-                    // second click on same row  -  open action menu
+                    // second click on same row - open action menu
                     action_menu_open = true;
                     action_menu_row  = row;
                     action_menu_tab  = current_tab;

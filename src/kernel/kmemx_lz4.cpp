@@ -1,6 +1,6 @@
 #include "kmemx_lz4.h"
 
-//  freestanding lz4 block-format codec  -  see kmemx_lz4.h. (satoru)
+//  freestanding lz4 block-format codec - see kmemx_lz4.h. (satoru)
 //
 //  block format recap (so the bounds logic below reads clearly): a stream is a
 //  series of sequences. each sequence is one token byte split into two nibbles:
@@ -39,7 +39,7 @@ constexpr int RUN_MASK    = (1 << (8 - ML_BITS)) - 1;  // 15 (satoru)
 
 // ── sse2 copy helpers (hand-written asm; compiler-generated code is -mno-sse,
 //    but sse2 is enabled in cr0/cr4 at boot so explicit intrinsics-via-asm are
-//    fine  -  the framebuffer copy already relies on this). these accelerate the
+//    fine - the framebuffer copy already relies on this). these accelerate the
 //    decompressor's literal + long-distance match copies, the hot bytes of the
 //    fault path. (satoru)
 static inline void sse_copy16(uint8_t* d, const uint8_t* s) {
@@ -236,7 +236,7 @@ int Decompress(const uint8_t* src, int src_len,
             for (int i = 0; i < lit_len; i++) *op++ = *ip++;
         }
 
-        // the final sequence is literals only  -  if we consumed the input, stop. (satoru)
+        // the final sequence is literals only - if we consumed the input, stop. (satoru)
         if (ip >= iend) break;
 
         // ── match offset ──

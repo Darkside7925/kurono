@@ -1,8 +1,8 @@
-//  kurono os  -  low-memory ISA DMA allocator (implementation)
+//  kurono os - low-memory ISA DMA allocator (implementation)
 //
 //  See audio_dma.h for the layout description.  This file is intentionally
 //  small: the allocation policy is "fixed regions, take-or-fail".  No
-//  fragmentation, no metadata persistence, no locking  -  audio drivers
+//  fragmentation, no metadata persistence, no locking - audio drivers
 //  acquire their region at boot and never release it during normal
 //  operation.
 #include "audio_dma.h"

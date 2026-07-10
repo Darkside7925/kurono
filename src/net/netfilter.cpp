@@ -116,7 +116,7 @@ Action Evaluate(Hook h,
     if (h >= HOOK_COUNT) return NF_ACCEPT;
     Chain& c = g_chains[h];
     // Periodically resort rules by hit count so the most-frequent matches
-    // are checked first  -  turns the hot path into an O(1) lookup.
+    // are checked first - turns the hot path into an O(1) lookup.
     if (((++g_eval_count[h]) & 0x7FF) == 0 && c.rule_count > 1) {
         resort_chain(c);
     }
@@ -143,7 +143,7 @@ Action Evaluate(Hook h,
             SerialLogger::Log("\r\n");
             continue;             // LOG continues evaluation
         }
-        // First non-LOG match wins  -  RETURN falls through to policy.
+        // First non-LOG match wins - RETURN falls through to policy.
         if (r.action == NF_RETURN) break;
         return r.action;
     }

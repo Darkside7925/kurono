@@ -1,4 +1,4 @@
-//  kurono os  -  virtual serial port (8250/16550a uart) implementation
+//  kurono os - virtual serial port (8250/16550a uart) implementation
 //  full register-accurate emulation for guest vm serial console.
 //
 //  features implemented:
@@ -17,7 +17,7 @@
 #include "../drivers/serial.h"
 #include "../kernel/types.h"
 
-//  reset  -  set all registers to power-on defaults
+//  reset - set all registers to power-on defaults
 
 void VirtualSerial::Reset() {
     base_port    = 0;
@@ -64,7 +64,7 @@ void VirtualSerial::Init(uint16_t port_base, uint8_t irq_num) {
     SerialLogger::Log("\r\n");
 }
 
-//  writeport  -  guest writes to a uart register
+//  writeport - guest writes to a uart register
 
 void VirtualSerial::WritePort(uint16_t port, uint8_t value) {
     uint16_t offset = port - base_port;
@@ -158,7 +158,7 @@ void VirtualSerial::WritePort(uint16_t port, uint8_t value) {
     UpdateIIR();
 }
 
-//  readport  -  guest reads a uart register
+//  readport - guest reads a uart register
 
 uint8_t VirtualSerial::ReadPort(uint16_t port) {
     uint16_t offset = port - base_port;
@@ -237,7 +237,7 @@ uint8_t VirtualSerial::ReadPort(uint16_t port) {
     }
 }
 
-//  transmitbyte  -  handle guest tx output
+//  transmitbyte - handle guest tx output
 
 void VirtualSerial::TransmitByte(uint8_t byte) {
     // capture to output buffer for host-side reading
@@ -251,7 +251,7 @@ void VirtualSerial::TransmitByte(uint8_t byte) {
 
 void VirtualSerial::OutputCapture(uint8_t byte) {
     if (output_count >= UART_OUTPUT_BUF_SIZE) {
-        // buffer full  -  drop oldest byte
+        // buffer full - drop oldest byte
         output_head = (output_head + 1) % UART_OUTPUT_BUF_SIZE;
         output_count--;
     }
@@ -260,7 +260,7 @@ void VirtualSerial::OutputCapture(uint8_t byte) {
     output_count++;
 }
 
-//  external rx injection  -  push data from host into guest
+//  external rx injection - push data from host into guest
 
 void VirtualSerial::InjectRxByte(uint8_t byte) {
     if (fifo_enabled) {
@@ -290,7 +290,7 @@ void VirtualSerial::InjectRxString(const char* str) {
     }
 }
 
-//  output buffer read  -  host reads guest tx output
+//  output buffer read - host reads guest tx output
 
 int VirtualSerial::ReadOutput(char* buf, int max_len) {
     int read = 0;
@@ -408,7 +408,7 @@ void VirtualSerial::ClearIRQ() {
     irq_pending = false;
 }
 
-//  tick  -  advance character timeout timer
+//  tick - advance character timeout timer
 
 void VirtualSerial::Tick(uint32_t elapsed_us) {
     if (!fifo_enabled || rx_fifo.IsEmpty()) {

@@ -153,7 +153,7 @@ bool BGA::SetMode(uint32_t w, uint32_t h, uint32_t b) {
     SerialLogger::Log("\r\n");
 
     if (xr != (uint16_t)w || yr != (uint16_t)h || br != (uint16_t)b) {
-        SerialLogger::Log("BGA: Mode set FAILED  -  restoring previous mode\r\n");
+        SerialLogger::Log("BGA: Mode set FAILED - restoring previous mode\r\n");
         // restore previous mode
         WriteReg(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
         WriteReg(VBE_DISPI_INDEX_XRES,        prev_w);
@@ -195,7 +195,7 @@ bool BGA::Init(uint32_t w, uint32_t h, uint32_t b) {
     for (uint8_t dev = 0; dev < 32; dev++) {
         uint32_t id = pci_cfg_read(0, dev, 0, 0x00);
         if (id == 0x11111234u) {
-            // found bga device  -  program bar0
+            // found bga device - program bar0
             uint32_t bar = pci_program_bar0(0, dev, 0, BGA_FRAMEBUFFER_ADDR);
             SerialLogger::Log("BGA: PCI dev=");
             SerialLogger::LogDec(dev);

@@ -1,4 +1,4 @@
-//  kurono os  -  vm exit / vm entry handler implementation
+//  kurono os - vm exit / vm entry handler implementation
 //  comprehensive vm exit dispatch for intel vt-x and amd-v
 #include "vmexit.h"
 #include "vmm.h"
@@ -46,7 +46,7 @@ void VMExitHandler::Init() {
     SerialLogger::Log("VMExit: Handler initialized with default CPUID overrides\r\n");
 }
 
-//  main dispatch  -  intel vt-x
+//  main dispatch - intel vt-x
 
 VMExitAction VMExitHandler::HandleExit(vCPU* cpu) {
     if (!cpu) return VMEXIT_FATAL;
@@ -132,7 +132,7 @@ VMExitAction VMExitHandler::HandleExit(vCPU* cpu) {
             return HandleXSETBV(cpu);
 
         case EXIT_REASON_INVALID_GUEST:
-            SerialLogger::Log("VMExit: INVALID GUEST STATE  -  fatal\r\n");
+            SerialLogger::Log("VMExit: INVALID GUEST STATE - fatal\r\n");
             VMM::DumpVCPUState(cpu);
             return VMEXIT_FATAL;
 
@@ -145,7 +145,7 @@ VMExitAction VMExitHandler::HandleExit(vCPU* cpu) {
     }
 }
 
-//  main dispatch  -  amd svm
+//  main dispatch - amd svm
 
 VMExitAction VMExitHandler::HandleSVMExit(vCPU* cpu) {
     if (!cpu || !cpu->vmcb) return VMEXIT_FATAL;
@@ -183,10 +183,10 @@ VMExitAction VMExitHandler::HandleSVMExit(vCPU* cpu) {
             return VMEXIT_HANDLED; // external interrupt, just continue
 
         case SVM_EXIT_NMI:
-            return VMEXIT_HANDLED; // nmi  -  continue
+            return VMEXIT_HANDLED; // nmi - continue
 
         case SVM_EXIT_VINTR:
-            return VMEXIT_HANDLED; // virtual interrupt  -  continue
+            return VMEXIT_HANDLED; // virtual interrupt - continue
 
         case SVM_EXIT_RDTSC:
         case 0x0087: // rdtscp
@@ -203,7 +203,7 @@ VMExitAction VMExitHandler::HandleSVMExit(vCPU* cpu) {
 
         case SVM_EXIT_PUSHF:
         case SVM_EXIT_POPF:
-            // pushf/popf  -  shouldn't normally be intercepted, but if so, skip
+            // pushf/popf - shouldn't normally be intercepted, but if so, skip
             AdvanceGuestRIP(cpu);
             return VMEXIT_HANDLED;
 
@@ -212,12 +212,12 @@ VMExitAction VMExitHandler::HandleSVMExit(vCPU* cpu) {
             return HandleCPUID(cpu);
 
         case SVM_EXIT_INVLPG:
-            // invalidate page  -  just continue
+            // invalidate page - just continue
             AdvanceGuestRIP(cpu);
             return VMEXIT_HANDLED;
 
         case SVM_EXIT_INVD:
-            // invd/wbinvd  -  skip
+            // invd/wbinvd - skip
             AdvanceGuestRIP(cpu);
             return VMEXIT_HANDLED;
 
@@ -256,7 +256,7 @@ VMExitAction VMExitHandler::HandleSVMExit(vCPU* cpu) {
                 SerialLogger::LogHex((uint32_t)exit_code);
                 SerialLogger::Log(" at RIP=");
                 SerialLogger::LogHex((uint32_t)cpu->vmcb->rip);
-                SerialLogger::Log("  -  skipping\r\n");
+                SerialLogger::Log(" - skipping\r\n");
             }
             AdvanceGuestRIP(cpu);
             return VMEXIT_HANDLED;
@@ -269,7 +269,7 @@ VMExitAction VMExitHandler::HandleSVMCRAccess(vCPU* cpu, uint32_t cr_num, bool i
     VMCB* vmcb = cpu->vmcb;
 
     if (is_write) {
-        // guest writing to cr  -  exit_info1 has the new value on some cpus,
+        // guest writing to cr - exit_info1 has the new value on some cpus,
         // but standard svm doesn't provide it directly. we decode from next_rip.
         // for cr0 writes during linux boot: read the value from the gpr that
         // the guest used. since we can't decode the instruction portably,
@@ -291,7 +291,7 @@ VMExitAction VMExitHandler::HandleSVMCRAccess(vCPU* cpu, uint32_t cr_num, bool i
                 break;
         }
     } else {
-        // guest reading cr  -  put the value in a gpr
+        // guest reading cr - put the value in a gpr
         // on svm, exit_info1 for cr reads gives the gpr number (0=rax etc.)
         uint64_t val = 0;
         switch (cr_num) {
@@ -313,7 +313,7 @@ VMExitAction VMExitHandler::HandleSVMCRAccess(vCPU* cpu, uint32_t cr_num, bool i
     return VMEXIT_HANDLED;
 }
 
-//  cpuid exit  -  intercept, optionally override, advance rip
+//  cpuid exit - intercept, optionally override, advance rip
 
 VMExitAction VMExitHandler::HandleCPUID(vCPU* cpu) {
     uint32_t leaf = cpu->regs[0]; // eax = leaf
@@ -333,7 +333,7 @@ VMExitAction VMExitHandler::HandleCPUID(vCPU* cpu) {
         }
     }
 
-    // no override  -  execute real cpuid and pass through
+    // no override - execute real cpuid and pass through
     uint32_t eax, ebx, ecx, edx;
     asm volatile("cpuid"
         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
@@ -354,7 +354,7 @@ VMExitAction VMExitHandler::HandleCPUID(vCPU* cpu) {
     return VMEXIT_HANDLED;
 }
 
-//  hlt exit  -  guest executed hlt
+//  hlt exit - guest executed hlt
 
 VMExitAction VMExitHandler::HandleHLT(vCPU* cpu) {
     SerialLogger::Log("VMExit: Guest HLT\r\n");
@@ -364,7 +364,7 @@ VMExitAction VMExitHandler::HandleHLT(vCPU* cpu) {
     return VMEXIT_HANDLED;
 }
 
-//  i/o instruction exit  -  port i/o interception
+//  i/o instruction exit - port i/o interception
 
 VMExitAction VMExitHandler::HandleIO(vCPU* cpu) {
     IOAccessInfo io;
@@ -416,7 +416,7 @@ VMExitAction VMExitHandler::HandleIO(vCPU* cpu) {
     }
 
     if (!handled) {
-        // unhandled port  -  log it for debugging
+        // unhandled port - log it for debugging
         SerialLogger::Log("VMExit: Unhandled I/O port=0x");
         SerialLogger::LogHex(io.port);
         SerialLogger::Log(io.is_out ? " OUT" : " IN");
@@ -502,7 +502,7 @@ VMExitAction VMExitHandler::HandleMSRWrite(vCPU* cpu) {
 
     // silently absorb most msr writes (they affect virtual state only)
     switch (msr) {
-        case 0x1B:  // ia32_apic_base  -  store for virtual apic
+        case 0x1B:  // ia32_apic_base - store for virtual apic
             break;
         case 0xC0000080: // ia32_efer
             break;
@@ -543,7 +543,7 @@ VMExitAction VMExitHandler::HandleCRAccess(vCPU* cpu) {
     };
 
     if (access_type == 0) {
-        // mov to crn  -  guest is writing
+        // mov to crn - guest is writing
         uint64_t val = GetGPR(reg);
         switch (cr_num) {
             case 0: {
@@ -555,7 +555,7 @@ VMExitAction VMExitHandler::HandleCRAccess(vCPU* cpu) {
                 break;
             }
             case 3:
-                // cr3 write: page table base change  -  update and flush guest tlb
+                // cr3 write: page table base change - update and flush guest tlb
                 VMM::VMWrite(VMCS_GUEST_CR3, val);
                 break;
             case 4:
@@ -567,7 +567,7 @@ VMExitAction VMExitHandler::HandleCRAccess(vCPU* cpu) {
                 break;
         }
     } else if (access_type == 1) {
-        // mov from crn  -  guest is reading
+        // mov from crn - guest is reading
         uint64_t val = 0;
         switch (cr_num) {
             case 0: val = VMM::VMRead(VMCS_GUEST_CR0); break;
@@ -625,8 +625,8 @@ VMExitAction VMExitHandler::HandleExceptionNMI(vCPU* cpu) {
     if (cpu->type == VIRT_INTEL_VTX) {
         // triple fault (vector 0, type 3=7 in some encodings) → crash
         if (vector == 8 || (vector == 0 && type == 3)) {
-            // #df or triple fault  -  halt the vm
-            SerialLogger::Log("VMExit: Fatal exception  -  halting VM\r\n");
+            // #df or triple fault - halt the vm
+            SerialLogger::Log("VMExit: Fatal exception - halting VM\r\n");
             return VMEXIT_SHUTDOWN;
         }
 
@@ -646,14 +646,14 @@ VMExitAction VMExitHandler::HandleExceptionNMI(vCPU* cpu) {
         }
     }
 
-    // don't advance rip  -  the guest should re-execute the faulting instruction
+    // don't advance rip - the guest should re-execute the faulting instruction
     // after handling the exception via its idt
     return VMEXIT_HANDLED;
 }
 
 VMExitAction VMExitHandler::HandleExternalInterrupt(vCPU* cpu) {
     (void)cpu;
-    // external interrupt (from host)  -  handle in host, then re-enter guest
+    // external interrupt (from host) - handle in host, then re-enter guest
     return VMEXIT_CONTINUE;
 }
 
@@ -670,7 +670,7 @@ VMExitAction VMExitHandler::HandleEPTViolation(vCPU* cpu) {
         qualification = cpu->vmcb->exit_info1;
     }
 
-    // check if this is an mmio access  -  route to hypervisor device layer
+    // check if this is an mmio access - route to hypervisor device layer
     bool is_write = (qualification & 0x02) != 0; // bit 1 = write access
     uint32_t mmio_value = 0;
     if (is_write) {
@@ -698,7 +698,7 @@ VMExitAction VMExitHandler::HandleEPTViolation(vCPU* cpu) {
     SerialLogger::LogHex((uint32_t)guest_phys);
     SerialLogger::Log(" qual=0x");
     SerialLogger::LogHex((uint32_t)qualification);
-    SerialLogger::Log("  -  shutting down guest\r\n");
+    SerialLogger::Log(" - shutting down guest\r\n");
     VMM::DumpVCPUState(cpu);
     return VMEXIT_SHUTDOWN;
 }
@@ -711,19 +711,19 @@ VMExitAction VMExitHandler::HandleEPTMisconfig(vCPU* cpu) {
     SerialLogger::Log("VMExit: EPT MISCONFIGURATION at GPA ");
     SerialLogger::LogHex((uint32_t)(guest_phys >> 32));
     SerialLogger::LogHex((uint32_t)guest_phys);
-    SerialLogger::Log("  -  FATAL\r\n");
+    SerialLogger::Log(" - FATAL\r\n");
     return VMEXIT_FATAL;
 }
 
-//  triple fault  -  catastrophic guest failure
+//  triple fault - catastrophic guest failure
 
 VMExitAction VMExitHandler::HandleTripleFault(vCPU* cpu) {
-    SerialLogger::Log("VMExit: TRIPLE FAULT  -  guest crashed\r\n");
+    SerialLogger::Log("VMExit: TRIPLE FAULT - guest crashed\r\n");
     VMM::DumpVCPUState(cpu);
     return VMEXIT_REBOOT;
 }
 
-//  vmcall  -  hypercall from guest
+//  vmcall - hypercall from guest
 
 VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
     uint32_t call_num = cpu->regs[0]; // eax = hypercall number
@@ -749,7 +749,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
         case 3: // request reboot
             return VMEXIT_REBOOT;
 
-        //  0x10  -  gpu framebuffer passthrough
+        //  0x10 - gpu framebuffer passthrough
         //  ecx(regs[1]) = sub-function
         //    0: get display info
         //       returns: eax=width, ebx=height, ecx=pitch, edx=bpp
@@ -804,7 +804,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
             break;
         }
 
-        //  0x11  -  audio pcm passthrough
+        //  0x11 - audio pcm passthrough
         //  ecx(regs[1]) = sub-function
         //    0: get audio info
         //       returns: eax=sample_rate, ecx=channels, edx=bits_per_sample
@@ -884,7 +884,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
             break;
         }
 
-        //  0x12  -  wifi / network status passthrough
+        //  0x12 - wifi / network status passthrough
         //  ecx(regs[1]) = sub-function
         //    0: get network status
         //       returns: eax = state (0=down,1=connected,2=scanning),
@@ -935,7 +935,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
             break;
         }
 
-        //  0x13  -  input (keyboard + mouse) passthrough
+        //  0x13 - input (keyboard + mouse) passthrough
         //  ecx(regs[1]) = sub-function
         //    0: poll keyboard
         //       returns: eax = ascii char (0 if none), ecx = key enum,
@@ -990,7 +990,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
             break;
         }
 
-        //  0x14  -  network packet passthrough
+        //  0x14 - network packet passthrough
         //  ecx(regs[1]) = sub-function
         //    0: send packet
         //       rdi(regs[7]) = guest phys addr of packet data
@@ -1045,7 +1045,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
             break;
         }
 
-        //  0x20  -  9p shared filesystem (host kvfs ↔ guest)
+        //  0x20 - 9p shared filesystem (host kvfs ↔ guest)
         //  all sub-functions dispatched by v9fs::handlevmcall.
         //  ecx = v9fs_op sub-function, other regs carry args.
         //  returns: eax = v9fs_err
@@ -1054,14 +1054,14 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
             break;
         }
 
-        //  0x4b ('K')  -  ksa restricted result channel.
+        //  0x4b ('K') - ksa restricted result channel.
         //  this is the ONLY bridge out of the ksa isolated context. it is
         //  READ-ONLY: there is no sub-function that writes an approval into
         //  ksa memory, so the main os cannot forge a "yes". (satoru)
         //  ecx(regs[1]) = sub-function:
         //    KSA_SUB_GET_VERDICT(0): returns eax=completed, ebx=approved,
         //                            ecx=have_cred_hash. the credential hash
-        //                            itself is never exposed over the channel  - 
+        //                            itself is never exposed over the channel - 
         //                            only supr (in-kernel) consumes it. (satoru)
         //    KSA_SUB_GET_INFO(1):    returns eax=channel revision.
         case KSA_VMCALL_CHANNEL: {
@@ -1094,7 +1094,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
     return VMEXIT_HANDLED;
 }
 
-//  rdtsc / rdtscp  -  timestamp counter access
+//  rdtsc / rdtscp - timestamp counter access
 
 VMExitAction VMExitHandler::HandleRDTSC(vCPU* cpu) {
     uint32_t lo, hi;
@@ -1115,7 +1115,7 @@ VMExitAction VMExitHandler::HandleRDTSCP(vCPU* cpu) {
 //  miscellaneous exits
 
 VMExitAction VMExitHandler::HandleINVLPG(vCPU* cpu) {
-    // guest invalidated a tlb page  -  we could invalidate our ept mapping
+    // guest invalidated a tlb page - we could invalidate our ept mapping
     AdvanceGuestRIP(cpu);
     return VMEXIT_HANDLED;
 }
@@ -1128,7 +1128,7 @@ VMExitAction VMExitHandler::HandleTaskSwitch(vCPU* cpu) {
 
 VMExitAction VMExitHandler::HandlePreemptTimer(vCPU* cpu) {
     (void)cpu;
-    // vmx preemption timer fired  -  time slice expired
+    // vmx preemption timer fired - time slice expired
     return VMEXIT_CONTINUE;
 }
 
@@ -1148,13 +1148,13 @@ VMExitAction VMExitHandler::HandlePause(vCPU* cpu) {
 }
 
 VMExitAction VMExitHandler::HandleWBINVD(vCPU* cpu) {
-    // write-back and invalidate cache  -  expensive, just skip
+    // write-back and invalidate cache - expensive, just skip
     AdvanceGuestRIP(cpu);
     return VMEXIT_HANDLED;
 }
 
 VMExitAction VMExitHandler::HandleXSETBV(vCPU* cpu) {
-    // extended control register write  -  used for avx state
+    // extended control register write - used for avx state
     AdvanceGuestRIP(cpu);
     return VMEXIT_HANDLED;
 }

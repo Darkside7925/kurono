@@ -1,6 +1,6 @@
 #pragma once
 
-//  kurono canonical on-disk path layout  -  the single source of truth so the whole
+//  kurono canonical on-disk path layout - the single source of truth so the whole
 //  tree agrees on where things live. before this, logs were triple-homed across
 //  /system/logs, /kurono/logs and /var/log, and "system" files were split between
 //  /system and /kurono. everything kurono-native now lives under /kurono; the

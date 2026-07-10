@@ -1,9 +1,9 @@
-//  kurono os  -  PC speaker fallback audio backend
+//  kurono os - PC speaker fallback audio backend
 //
 //  Last-resort backend when nothing else is present.  Uses the PIT
 //  channel 2 + KB controller port 0x61 to drive the motherboard speaker
 //  with a square wave whose frequency tracks the dominant tone in each
-//  submitted period.  Quality is awful  -  this is for "did we boot?"
+//  submitted period.  Quality is awful - this is for "did we boot?"
 //  feedback, not for music playback.
 //
 //  Implementation:
@@ -30,7 +30,7 @@ public:
     const char* Name() const override { return "pcspk"; }
 
     bool Init() override {
-        // Always succeeds  -  this is the last-resort fallback.
+        // Always succeeds - this is the last-resort fallback.
         ready_ = true;
         return true;
     }
@@ -53,7 +53,7 @@ public:
             prev = s;
         }
         if (peak < 1500) {
-            // Too quiet  -  mute the speaker.
+            // Too quiet - mute the speaker.
             uint8_t v = in8(0x61);
             v &= ~0x03;
             out8(0x61, v);

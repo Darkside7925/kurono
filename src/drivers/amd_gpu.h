@@ -1,23 +1,23 @@
 #pragma once
-//  kurono os  -  amd radeon gpu driver
+//  kurono os - amd radeon gpu driver
 //  pci device detection, bar mapping, display engine identification
 //  supports gcn, rdna 1/2/3 architectures (rx 6000/7000/9000 series)
 #include "../kernel/types.h"
 
 #define AMD_VENDOR_ID     0x1002
 
-// rdna 3  -  radeon rx 7000 series (navi 3x)
+// rdna 3 - radeon rx 7000 series (navi 3x)
 #define AMD_RX_7900XTX    0x744C
 #define AMD_RX_7900XT     0x7448
 #define AMD_RX_7800XT     0x7480
 #define AMD_RX_7700XT     0x7484
 #define AMD_RX_7600       0x7422
 
-// rdna 3.5  -  radeon rx 9000 series (navi 4x)
+// rdna 3.5 - radeon rx 9000 series (navi 4x)
 #define AMD_RX_9070XT     0x7560
 #define AMD_RX_9070       0x7564
 
-// rdna 2  -  radeon rx 6000 series (navi 2x)
+// rdna 2 - radeon rx 6000 series (navi 2x)
 #define AMD_RX_6950XT     0x73A5
 #define AMD_RX_6900XT     0x73BF
 #define AMD_RX_6800XT     0x73AF
@@ -26,13 +26,13 @@
 #define AMD_RX_6600XT     0x73FF
 #define AMD_RX_6600       0x73EF
 
-// rdna 1  -  radeon rx 5000 series (navi 1x)
+// rdna 1 - radeon rx 5000 series (navi 1x)
 #define AMD_RX_5700XT     0x731F
 #define AMD_RX_5700       0x7310
 #define AMD_RX_5600XT     0x7340
 #define AMD_RX_5500XT     0x7360
 
-// gcn 5  -  vega
+// gcn 5 - vega
 #define AMD_VEGA_64       0x687F
 #define AMD_VEGA_56       0x6863
 
@@ -116,7 +116,7 @@ struct AmdGPUInfo {
 
 class AmdGPU {
 public:
-    // initialization  -  pci scan, bar mapping
+    // initialization - pci scan, bar mapping
     static bool Init();
     static bool IsAvailable();
 
@@ -154,7 +154,7 @@ public:
     // debug
     static void DumpRegisters(char* buf, int max_len);
 
-    // accel capability  -  compositor checks this before issuing GPU work
+    // accel capability - compositor checks this before issuing GPU work
     static bool HasHardwareAccel();
 
 private:

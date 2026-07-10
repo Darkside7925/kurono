@@ -67,7 +67,7 @@ int Launch(uint32_t uid, uint32_t gid, const char* url) {
     SerialLogger::LogDec(env_count);
     SerialLogger::Log(" env vars\r\n");
 
-    // The actual exec  -  pass argv = ["firefox", url?, NULL].
+    // The actual exec - pass argv = ["firefox", url?, NULL].
     const char* argv0 = "/apps/firefox/firefox";
     const char* argv[3] = { argv0, url, nullptr };
     if (!url) { argv[1] = nullptr; }

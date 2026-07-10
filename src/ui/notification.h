@@ -1,7 +1,7 @@
 #pragma once
 #include "../kernel/types.h"
 
-// toast notification manager  -  top-right stacked cards that slide+fade
+// toast notification manager - top-right stacked cards that slide+fade
 // in/out via the animation easing system and auto-dismiss after a timeout.
 // fully static / fixed-array backed: no dynamic allocation. (satoru)
 

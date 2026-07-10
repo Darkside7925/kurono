@@ -205,7 +205,7 @@ void Init() {
     // entry in the kernel root, so the entry exists and is copied into every
     // user address space created later (CreateAddressSpace copies all 512 pml4
     // entries). without this, a driver registered after a user process spawned
-    // could map into a pml4 slot the user space never saw  -  harmless for kernel-
+    // could map into a pml4 slot the user space never saw - harmless for kernel-
     // cr3 driver code, but this keeps the window globally coherent. (satoru)
     uint64_t probe = KDF_VA_BASE;
     uint64_t probe_phys = PMM::AllocFrame();
@@ -324,7 +324,7 @@ bool RunGuarded(int driver_id, KDFGuardedOp op, void* arg) {
 
     // we got here via longjmp from HandleGuardFault: the op faulted. the fault
     // was a cpu exception (#pf), which entered with interrupts DISABLED, and
-    // __builtin_longjmp does NOT restore rflags  -  so IF is still 0 here. driver
+    // __builtin_longjmp does NOT restore rflags - so IF is still 0 here. driver
     // code (and the scheduler it returns into) runs with interrupts enabled, so
     // re-enable them before unwinding. mirrors how the userspace resume path
     // lands back on an irqs-enabled kernel stack. (satoru)

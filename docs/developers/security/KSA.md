@@ -1,7 +1,7 @@
-# KSA  -  Kurono Secure Authorization (Hypervisor-Backed Privilege Prompts)
+# KSA - Kurono Secure Authorization (Hypervisor-Backed Privilege Prompts)
 
 `src/security/ksa.cpp` / `ksa.h` implement KSA, Kurono's equivalent of Windows
-UAC  -  but backed by the hypervisor so that malware with ring-0 access in the
+UAC - but backed by the hypervisor so that malware with ring-0 access in the
 main OS still cannot touch the prompt, read its memory, or auto-approve it.
 
 KSA is an *auth factor* that plugs into the existing SUPR privilege engine (see
@@ -19,7 +19,7 @@ authorization decision *outside* that compromised domain:
   memory the main OS has **no page-table mapping into**;
 - the only thing that crosses back is a verdict (approve/deny + a salted
   credential hash), through a **single, read-only VMCALL channel**;
-- there is no inverse channel  -  nothing lets the main OS *write* an approval
+- there is no inverse channel - nothing lets the main OS *write* an approval
   into KSA memory, so a forged "yes" cannot be injected.
 
 ## 2. Isolation model (how the guarantee is realized)
@@ -31,12 +31,12 @@ authorization decision *outside* that compromised domain:
 2. **Dedicated EPT.** A separate EPT root is built (`EPTManager::CreateEPT`) and
    the region is mapped into KSA guest-physical space **only**. The main-OS
    identity map never references it.
-3. **Unmap from the main OS  -  the key step.**
+3. **Unmap from the main OS - the key step.**
    `KernelVMM::IsolateFrames(phys, 512)` removes the region from the main-OS
    page tables. Because the low memory is identity-mapped with 2 MB huge pages,
    this first *demotes* the covering huge page into 4 KB leaves, then zeroes the
    target PTEs. After this, `KernelVMM::QueryMapping()` returns 0 for every
-   frame  -  ring-0 code in the main OS that dereferences the region faults.
+   frame - ring-0 code in the main OS that dereferences the region faults.
 4. **Render + input (the interactive prompt).** KSA (the arbiter) is the only
    code that briefly re-establishes an ephemeral mapping to draw the prompt and
    read the verdict (`ksa_open_window` / `ksa_close_window`), re-isolating
@@ -48,7 +48,7 @@ authorization decision *outside* that compromised domain:
    keyboard + mouse input.
 5. **Result channel.** The verdict crosses back via **VMCALL `0x4B`** (`'K'`),
    sub-function `KSA_SUB_GET_VERDICT`. The handler in `src/virt/vmexit.cpp`
-   returns a *copy* of the latched verdict (completed / approved / has-hash)  - 
+   returns a *copy* of the latched verdict (completed / approved / has-hash) - 
    never a pointer, and the credential hash itself is consumed only in-kernel by
    SUPR, never exposed over the channel.
 6. **Teardown.** The region is wiped (credential residue destroyed),
@@ -58,7 +58,7 @@ authorization decision *outside* that compromised domain:
 
 KSA wants the prompt to run inside a *true nested VM* (its own `VMLAUNCH`).
 That requires the host to expose nested VMX to Kurono. In the common dev
-environment  -  **Kurono itself running as a guest under KVM/QEMU**  -  nested VMX
+environment - **Kurono itself running as a guest under KVM/QEMU** - nested VMX
 for an *inner* VM is not available to Kurono, so KSA runs the prompt as an
 **EPT-isolated guest context** instead of a separately launched VM.
 
@@ -67,7 +67,7 @@ for an *inner* VM is not available to Kurono, so KSA runs the prompt as an
 not hidden.
 
 **What still holds in the fallback:** the memory-isolation invariant (no main-OS
-page-table mapping into the region) and the read-only result channel  -  both are
+page-table mapping into the region) and the read-only result channel - both are
 exercised and proven by the self-test below. **What real hardware adds:** a true
 inner `VMLAUNCH` would also put a CPU privilege boundary between the main OS and
 the prompt's *execution*, not just its memory. On bare metal with nested VMX (or
@@ -85,7 +85,7 @@ and `kvault_enabled`. The effective mode is derived from them.
 | `supr policy --auth=kvault` | KSA prompt only |
 | `supr policy --auth=both` | require both (max security) |
 | `supr policy kvault enable` / `... passwd enable` | turn a factor on |
-| `supr passwd` | change password  -  **no KSA involved**, normal flow |
+| `supr passwd` | change password - **no KSA involved**, normal flow |
 | `supr selftest` | run the KSA isolation self-test (logs to serial) |
 
 Disabling KSA:
@@ -116,11 +116,11 @@ supr policy --auth=kvault --disable-passwd --acknowledge-risk
 - **Unavailable factor is never silently satisfied.** If policy requires
   `kvault` but the hypervisor isn't present, the gate downgrades to the
   password factor and audits it; if password is also off, it refuses.
-- **EPT isolation**  -  the main OS has no mapping to KSA VM memory (proven at
+- **EPT isolation** - the main OS has no mapping to KSA VM memory (proven at
   runtime, below).
-- **Read-only channel**  -  no VMCALL sub-function writes an approval into KSA
+- **Read-only channel** - no VMCALL sub-function writes an approval into KSA
   memory, so a forged approval cannot be injected from the main OS.
-- **Tamper-evident audit**  -  all policy changes, prompts, approvals, denials,
+- **Tamper-evident audit** - all policy changes, prompts, approvals, denials,
   overrides and risk warnings are written to `/kurono/var/log/security.log`
   (`RuntimeLog::LogSecurity`) **even when KSA is disabled**.
 - The KSA region has **no network, no disk, no shared memory** with the main OS
@@ -143,7 +143,7 @@ Boot with `kurono.ksa.test=1` (or run `supr selftest`). The self-test spawns the
 isolated context and asserts, logging each result to serial:
 
 ```
-KSA: init  -  hypervisor available, prompt path=ept-isolated-context
+KSA: init - hypervisor available, prompt path=ept-isolated-context
 KSA-SELFTEST: main-os reach base=no mid=no verdict=no
 KSA-SELFTEST: PASS isolation (region unmapped from main OS)
 KSA-SELFTEST: while arbiter window open, main-os reach=YES (arbiter only)
@@ -164,10 +164,10 @@ risk warning; `auth=both` gated on KSA availability; password verification.
 When `RunEscalationGate` requires the KSA factor (`policy auth=kvault` or
 `both`), `KSA::Prompt()` renders a **real modal confirmation panel on the
 actual framebuffer** and blocks the escalation until the user answers. It is
-not the old auto-answered self-test  -  it takes live keyboard and mouse input.
+not the old auto-answered self-test - it takes live keyboard and mouse input.
 
 **What it shows.** A dimmed-desktop backdrop with a centred panel: the
-"KSA  -  Kurono Secure Authorization" header, the action being authorized
+"KSA - Kurono Secure Authorization" header, the action being authorized
 (`req.title` / `req.detail`), the requesting identity (`Account: <user>`), a
 masked credential field when the policy needs KSA to collect the credential
 (`req.want_cred`), and clickable **Deny** (left) / **Approve** (right) buttons.
@@ -196,13 +196,13 @@ On entry KSA snapshots the back buffer (`PMM::AllocBytes` + `memcpy`) and
 **flushes any pre-queued keyboard/mouse input** so a keystroke the main OS left
 in the ring can't be consumed as a credential char or counted as Enter/Esc.
 Each frame is composed into the isolated framebuffer, blitted into the back
-buffer, overlaid with text + buttons, then presented in one `SwapBuffers()`  - 
+buffer, overlaid with text + buttons, then presented in one `SwapBuffers()` - 
 with a full-screen `MarkDirty` so the dim + panel (drawn via
 `FillRectAlpha`/`DrawPixel`, which don't self-mark dirty) actually reach the
 front buffer and the virtio GPU. On exit KSA restores the saved desktop pixels,
 wipes the local credential buffer, and calls `MarkUIDirty()` so the resumed
 compositor repaints. The verdict still crosses back **only** via the read-only
-VMCALL channel (§2.5)  -  the credential is hashed inside the isolated region and
+VMCALL channel (§2.5) - the credential is hashed inside the isolated region and
 only the salted hash + approve/deny flag leave it.
 
 **Verification (render path + verdict flow).** Boot with
@@ -214,7 +214,7 @@ headless with `qmp_shot.py`) and synthetic input drives the verdict:
 ```
 [gui] firing interactive ksa prompt demo
 KSA-PROMPT-DEMO: begin (want_cred=yes)
-KSA: prompt up  -  secure desktop owns the screen + input
+KSA: prompt up - secure desktop owns the screen + input
 KSA-PROMPT-DEMO: prompt ran, verdict=APPROVE (cred-hash present)
 ```
 
@@ -226,11 +226,11 @@ the prompt closes.
 
 ## 9. Related files
 
-- `src/security/ksa.{cpp,h}`  -  KSA module (spawn / isolate / prompt / channel / self-test / `PromptDemo`)
-- `src/security/supr.{cpp,h}`  -  auth policy, escalation gate, Sovereign role, audit actions
-- `src/kernel/vmm.{cpp,h}`  -  `IsolateFrames` / `RevealFrames` isolation primitives
-- `src/virt/vmexit.cpp`  -  VMCALL `0x4B` read-only result channel
-- `src/virt/ept.cpp`, `hypervisor.cpp`  -  EPT root + hardware-virt detection
-- `src/shell/shell.cpp`  -  the `supr` command
-- `src/kernel/kurono_kernel.cpp`  -  `kurono.ksa.test` self-test + `kurono.ksa.prompt` interactive demo gates
-- `src/proc/kernel_processes.cpp`  -  GUI process fires the armed `KSA::PromptDemo()` once the desktop is up
+- `src/security/ksa.{cpp,h}` - KSA module (spawn / isolate / prompt / channel / self-test / `PromptDemo`)
+- `src/security/supr.{cpp,h}` - auth policy, escalation gate, Sovereign role, audit actions
+- `src/kernel/vmm.{cpp,h}` - `IsolateFrames` / `RevealFrames` isolation primitives
+- `src/virt/vmexit.cpp` - VMCALL `0x4B` read-only result channel
+- `src/virt/ept.cpp`, `hypervisor.cpp` - EPT root + hardware-virt detection
+- `src/shell/shell.cpp` - the `supr` command
+- `src/kernel/kurono_kernel.cpp` - `kurono.ksa.test` self-test + `kurono.ksa.prompt` interactive demo gates
+- `src/proc/kernel_processes.cpp` - GUI process fires the armed `KSA::PromptDemo()` once the desktop is up

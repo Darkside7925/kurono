@@ -1,4 +1,4 @@
-//  kurono os  -  gpu driver installer (path a/b finishing piece)
+//  kurono os - gpu driver installer (path a/b finishing piece)
 //
 //  detects the host gpu, asks (via ui) whether the user wants to install
 //  vendor drivers into a guest distro, and runs the actual install
@@ -42,7 +42,7 @@ public:
     static DetectedGPU DetectVendor();
     static const char* VendorName(DetectedGPU v);
 
-    // distro presence  -  alpine is always available (initramfs is baked in),
+    // distro presence - alpine is always available (initramfs is baked in),
     // debian needs the rootfs to be extracted first
     static bool IsAlpineAvailable();
     static bool IsDebianAvailable();
@@ -60,7 +60,7 @@ public:
     static int  GetProgress();        // 0-100
     static const char* GetStatusText();
 
-    // shell entry  -  wired from PackageManager::cmd_install when argv[1] == "setup"
+    // shell entry - wired from PackageManager::cmd_install when argv[1] == "setup"
     //   kpkg setup alpine-nvidia | alpine-amd | alpine-auto
     //   kpkg setup debian-nvidia | debian-amd | debian-auto
     static int CmdSetup(int argc, const char** argv, char* out, int out_max);

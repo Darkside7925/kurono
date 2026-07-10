@@ -1,4 +1,4 @@
-//  kurono os  -  guest memory manager implementation
+//  kurono os - guest memory manager implementation
 //  allocates and manages guest physical memory backed by host heap.
 //
 //  memory layout for guest:
@@ -59,7 +59,7 @@ void GuestMemoryManager::Init(uint32_t ram_mb) {
     SerialLogger::Log("GuestMem: Initialization complete\r\n");
 }
 
-//  allocateguestram  -  allocate host memory for guest physical address space
+//  allocateguestram - allocate host memory for guest physical address space
 
 bool GuestMemoryManager::AllocateGuestRAM(uint32_t ram_mb) {
     if (ram_mb < GUEST_MIN_RAM_MB) ram_mb = GUEST_MIN_RAM_MB;
@@ -142,7 +142,7 @@ void GuestMemoryManager::FreeGuestRAM() {
     initialized = false;
 }
 
-//  addphysmap  -  register a guest physical → host virtual mapping
+//  addphysmap - register a guest physical → host virtual mapping
 
 void GuestMemoryManager::AddPhysMap(uint64_t guest, uint8_t* host,
                                      uint32_t size, uint32_t type) {
@@ -273,7 +273,7 @@ void GuestMemoryManager::BuildE820Table() {
     e820_table[e820_count].acpi_extended = 1;
     e820_count++;
 
-    // entry 3: reserved  -  mmio hole for apic/hpet (0xfec00000 - 0xfef00000)
+    // entry 3: reserved - mmio hole for apic/hpet (0xfec00000 - 0xfef00000)
     e820_table[e820_count].base   = 0xFEC00000ULL;
     e820_table[e820_count].length = 0x00300000ULL; // 3 mb
     e820_table[e820_count].type   = E820_TYPE_RESERVED;
@@ -298,7 +298,7 @@ bool GuestMemoryManager::WriteE820ToGuest(uint64_t guest_addr) {
                           e820_count * sizeof(E820Entry));
 }
 
-//  bda setup  -  minimal bios data area for real-mode guest
+//  bda setup - minimal bios data area for real-mode guest
 //  the bda lives at 0x0400 - 0x04ff in conventional memory.
 
 void GuestMemoryManager::SetupBDA() {
@@ -348,7 +348,7 @@ void GuestMemoryManager::SetupBDA() {
     SerialLogger::Log("GuestMem: BDA configured at 0x0400\r\n");
 }
 
-//  ivt setup  -  minimal interrupt vector table for real-mode guest
+//  ivt setup - minimal interrupt vector table for real-mode guest
 //  the ivt occupies 0x0000-0x03ff (256 entries × 4 bytes each).
 //  each entry is segment:offset in little-endian (offset low, offset high,
 //  segment low, segment high).
@@ -367,12 +367,12 @@ void GuestMemoryManager::SetupIVT() {
         ivt[i] = 0x00000500; // offset = 0x0500, segment = 0x0000
     }
 
-    // int 0x10 (video bios)  -  point to a minimal handler
+    // int 0x10 (video bios) - point to a minimal handler
     // we'll put a simple handler at 0x0510 that just does iret
     low_ram[0x0510] = 0xCF; // iret
     ivt[0x10] = 0x00000510;
 
-    // int 0x12 (get memory size)  -  return conventional memory size
+    // int 0x12 (get memory size) - return conventional memory size
     // handler at 0x0520: mov ax, [0x0413] ; iret
     low_ram[0x0520] = 0xA1; // mov ax, [addr16]
     low_ram[0x0521] = 0x13; // addr low = 0x13
@@ -380,18 +380,18 @@ void GuestMemoryManager::SetupIVT() {
     low_ram[0x0523] = 0xCF; // iret
     ivt[0x12] = 0x00000520;
 
-    // int 0x13 (disk bios)  -  minimal: return error (cf set)
+    // int 0x13 (disk bios) - minimal: return error (cf set)
     // handler at 0x0530: stc ; iret
     low_ram[0x0530] = 0xF9; // stc (set carry flag)
     low_ram[0x0531] = 0xCF; // iret
     ivt[0x13] = 0x00000530;
 
-    // int 0x15 (system services)  -  we handle e820 via vm exits
+    // int 0x15 (system services) - we handle e820 via vm exits
     // handler at 0x0540: iret
     low_ram[0x0540] = 0xCF; // iret
     ivt[0x15] = 0x00000540;
 
-    // int 0x16 (keyboard)  -  return no key
+    // int 0x16 (keyboard) - return no key
     // handler at 0x0550: xor ax, ax ; iret
     low_ram[0x0550] = 0x31; // xor
     low_ram[0x0551] = 0xC0; // ax, ax

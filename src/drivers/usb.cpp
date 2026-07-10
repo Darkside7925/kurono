@@ -1,4 +1,4 @@
-//  kurono os  -  usb (xhci) host controller driver implementation
+//  kurono os - usb (xhci) host controller driver implementation
 //  pci class 0c:03:30 (xhci usb 3.0)
 #include "usb.h"
 #include "../kernel/pci.h"
@@ -107,7 +107,7 @@ void USB::WriteRuntime(uint32_t offset, uint32_t val) {
     *(volatile uint32_t*)(bar0 + rts_off + offset) = val;
 }
 
-// 64-bit runtime write, low dword first then high  -  required for ERDP so the
+// 64-bit runtime write, low dword first then high - required for ERDP so the
 // controller latches a coherent dequeue pointer (satoru).
 void USB::WriteRuntime64(uint32_t offset, uint64_t val) {
     WriteRuntime(offset, (uint32_t)(val & 0xFFFFFFFF));
@@ -200,7 +200,7 @@ bool USB::SubmitCommand(xHCI_TRB* cmd_trb, xHCI_TRB* result) {
         if (!PollEventRing(&ev, 5000)) return false;
         uint8_t type = (ev.control >> 10) & 0x3F;
         if (type == TRB_CMD_COMPLETE) { if (result) *result = ev; return true; }
-        // not a command completion (port status / stray transfer)  -  keep waiting.
+        // not a command completion (port status / stray transfer) - keep waiting.
     }
     return false;
 }
@@ -496,7 +496,7 @@ bool USB::AddressDevice(int idx) {
     ep0[3] = (uint32_t)(ep0_deq >> 32);
     ep0[4] = 8;  // average trb length hint (satoru)
 
-    // Address Device command  -  input context pointer in parameter, slot in
+    // Address Device command - input context pointer in parameter, slot in
     // control[31:24] (satoru).
     xHCI_TRB cmd = {};
     cmd.parameter = (uint64_t)(uintptr_t)rt.input_ctx;
@@ -615,7 +615,7 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         }
     }
 
-    // SET_CONFIGURATION(config_value)  -  no data stage (satoru).
+    // SET_CONFIGURATION(config_value) - no data stage (satoru).
     if (!ControlTransferEP(idx, 0x00, USB_REQ_SET_CONFIG, config_value, 0, 0, nullptr))
         return false;
 
@@ -664,7 +664,7 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
     // for boot-capable HID, ask the device to speak the fixed boot report
     // layout so our byte0/byte1/byte2 decode is valid (satoru).
     if (hid_boot) {
-        // SET_PROTOCOL(boot)  -  class request to the interface, no data (satoru).
+        // SET_PROTOCOL(boot) - class request to the interface, no data (satoru).
         ControlTransferEP(idx, 0x21, HID_REQ_SET_PROTOCOL, HID_PROTO_BOOT,
                           hid_iface_num, 0, nullptr);
     }
@@ -734,7 +734,7 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
             uint8_t cc = (ev.status >> 24) & 0xFF;
             return cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PKT;
         }
-        // not ours (port status / command completion)  -  keep waiting (satoru).
+        // not ours (port status / command completion) - keep waiting (satoru).
     }
     return false;
 }

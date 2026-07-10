@@ -26,10 +26,10 @@ CPU detection runs during early boot in `kurono_kernel.cpp`. The results are cac
 
 ## 4. Hypervisor detection
 
-The hypervisor presence bit (CPUID ECX bit 31 on leaf 1) indicates that the processor is running inside a virtual machine. Kurono uses this to adjust behavior  -  for example, preferring the BGA display path when a hypervisor is detected.
+The hypervisor presence bit (CPUID ECX bit 31 on leaf 1) indicates that the processor is running inside a virtual machine. Kurono uses this to adjust behavior - for example, preferring the BGA display path when a hypervisor is detected.
 
 ## 5. Related files
 
-- `src/virt/hypervisor.cpp`  -  checks for VMX support before init
-- `src/apps/task_manager.cpp`  -  displays CPU info
-- `src/shell/shell.cpp`  -  `kurono info` command reports CPU features
+- `src/virt/hypervisor.cpp` - checks for VMX support before init
+- `src/apps/task_manager.cpp` - displays CPU info
+- `src/shell/shell.cpp` - `kurono info` command reports CPU features

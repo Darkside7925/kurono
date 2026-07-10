@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  performance hud (satoru)
+//  kurono os - performance hud (satoru)
 //  compact top-left overlay: fps, frame time, heap usage, window count,
 //  uptime. self-contained; uses only graphics:: primitives. (satoru)
 

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  taskbar & desktop environment
+//  kurono os - taskbar & desktop environment
 
 #include "window_manager.h"
 #include "../kernel/types.h"
@@ -99,7 +99,7 @@ private:
     static int wifi_strength;
     static int volume_pct;
 
-    // animation state  -  all phases are time-driven (Timer::GetRealMs).
+    // animation state - all phases are time-driven (Timer::GetRealMs).
     static uint32_t start_menu_anim_start_ms;  // 0 = idle
     static bool     start_menu_anim_opening;   // true=opening, false=closing
     static float    start_menu_phase;          // 0..1 eased
@@ -221,7 +221,7 @@ private:
     static size_t   wallpaper_src_bytes;
     static bool ScaleWallpaperCache(int w, int h);  // (re)build gradient_cache from wallpaper_src
 
-    // Per-icon hover-scale phase (0..1)  -  used by RenderIcon for an
+    // Per-icon hover-scale phase (0..1) - used by RenderIcon for an
     // ease-out cubic pop on hover.  Updated by Tick().
     static float    icon_hover_phase[DESKTOP_MAX_ICONS];
     static int      icon_hover_target;

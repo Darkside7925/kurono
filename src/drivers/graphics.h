@@ -95,7 +95,7 @@ public:
     // nesting clip stack: PushClipRect intersects with the current clip and saves
     // the prior state; PopClipRect restores it. use these instead of Set/Clear
     // whenever one clipped region renders inside another (e.g. a window's content
-    // render that itself clips a scroll panel)  -  a bare ClearClipRect would disarm
+    // render that itself clips a scroll panel) - a bare ClearClipRect would disarm
     // the outer clip and let inner content bleed onto the desktop. (satoru)
     static void PushClipRect(int x, int y, int w, int h);
     static void PopClipRect();
@@ -147,7 +147,7 @@ public:
         DrawLine(x+w-1, y, x+w-1, y+h-1, c);
     }
 
-    // text rendering  -  delegates to fontttf w/ bitmap fallback
+    // text rendering - delegates to fontttf w/ bitmap fallback
     static void DrawString(int x, int y, const char* s, uint32_t fg, uint32_t bg);
 
     // accessibility post-processing applied just before SwapBuffers copies
@@ -172,7 +172,7 @@ private:
     static RenderMode render_mode;
     static BlendMode blend_mode;
     
-    // frame timing  -  64-bit μs to avoid wrap (uint32 wraps every ~71 min)
+    // frame timing - 64-bit μs to avoid wrap (uint32 wraps every ~71 min)
     static uint32_t target_frame_time_us;
     static uint64_t last_frame_time;
     static uint32_t frame_count;
@@ -189,7 +189,7 @@ private:
     static int clip_w;
     static int clip_h;
     static bool clipping_enabled;
-    // saved clip states for PushClipRect/PopClipRect (fixed depth  -  render nesting
+    // saved clip states for PushClipRect/PopClipRect (fixed depth - render nesting
     // is shallow: desktop -> window -> content -> scroll panel). (satoru)
     struct ClipSave { int x, y, w, h; bool enabled; };
     static ClipSave clip_stack[16];

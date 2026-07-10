@@ -2,7 +2,7 @@
 #include "types.h"
 #include "multiboot.h"
 
-//  physical memory manager  -  bitmap-based frame allocator
+//  physical memory manager - bitmap-based frame allocator
 //
 //  manages physical memory in 4 kb frames using a bitmap. each bit in the
 //  bitmap represents one 4 kb frame: 0 = free, 1 = used.

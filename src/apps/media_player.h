@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  media player application
+//  kurono os - media player application
 //  supports wav/mp3/aac/flac/mp4 via codecregistry + sb16/ac97/hda output
 #include "../ui/window_manager.h"
 #include "../kernel/types.h"

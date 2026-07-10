@@ -1,4 +1,4 @@
-//  kurono os  -  AC97 audio backend (wraps drivers/ac97.cpp)
+//  kurono os - AC97 audio backend (wraps drivers/ac97.cpp)
 //
 //  Uses the streaming API on AC97 (EnsureStreaming + WriteRingChunk)
 //  so the BDL ring runs continuously and the mixer just refills the
@@ -38,7 +38,7 @@ public:
         return written / 4;
     }
 
-    // return the CACHED queue depth  -  no port I/O. Tick() reconciles it from
+    // return the CACHED queue depth - no port I/O. Tick() reconciles it from
     // the hardware (CIV/LVI) exactly once per pump (called at the top of
     // AudioServer::Tick before this gate is read), and Submit() bumps it per
     // period, so the value the back-pressure gate sees is fresh without a

@@ -1,4 +1,4 @@
-//  kurono os  -  virtio-gpu host device implementation
+//  kurono os - virtio-gpu host device implementation
 //
 //  see virtio_gpu_host.h for design.
 #include "virtio_gpu_host.h"
@@ -303,7 +303,7 @@ bool VirtIOGPUHost::Init() {
         SerialLogger::Log("VirtIOGPUHost: failed to register pci device\r\n");
         return false;
     }
-    // VPCI::RegisterDevice copies the device into its slot  -  pick that up
+    // VPCI::RegisterDevice copies the device into its slot - pick that up
     // so subsequent state queries reflect the canonical instance.
     VPCIDevice* canonical = VPCI::GetDevice(slot);
     if (canonical) {
@@ -382,7 +382,7 @@ bool VirtIOGPUHost::BarWrite(VPCIDevice*, int bar, uint32_t off,
         return true;
     }
     if (off >= BAR_NOTIFY_OFF && off < BAR_NOTIFY_OFF + BAR_NOTIFY_LEN) {
-        // notify_off_multiplier is 4  -  qid = (off - notify_off) / 4
+        // notify_off_multiplier is 4 - qid = (off - notify_off) / 4
         uint32_t qid = (off - BAR_NOTIFY_OFF) / BAR_NOTIFY_OFF_MULT;
         if (qid < (uint32_t)num_queues) {
             NotifyQueue((int)qid);

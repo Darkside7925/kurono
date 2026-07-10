@@ -121,7 +121,7 @@ static bool test_lz4_roundtrip_1000() {
             stored_uncompressed++;
             src_for_decode = orig;        // raw page IS the stored bytes (satoru)
             src_len_for_decode = PAGE;
-            // a raw-stored page is not lz4  -  skip decode, just confirm identity. (satoru)
+            // a raw-stored page is not lz4 - skip decode, just confirm identity. (satoru)
             for (int b = 0; b < PAGE; b++) deco[b] = orig[b];
         } else {
             total_in  += PAGE;
@@ -336,7 +336,7 @@ static bool test_pool_store_retrieve_1000() {
         uint64_t va = 0x40000000ULL + (uint64_t)i * PAGE;
         int slot = KMemX::TestStore(AS, va, orig);
         if (slot < 0) {
-            // pool/table saturated for this synthetic workload  -  stop storing but
+            // pool/table saturated for this synthetic workload - stop storing but
             // verify what we did store. not a failure unless retrieval breaks. (satoru)
             break;
         }
@@ -479,7 +479,7 @@ static bool test_vmm_aging() {
 // marked and frees the frame), confirm it is no longer present, then TOUCH the
 // page. that read triggers a genuine #PF; the hal hook calls KMemX::HandleFault,
 // which decompresses the blob into a fresh frame, crc-verifies it, and restores
-// the leaf  -  so the touch must observe the original bytes. repeated over many
+// the leaf - so the touch must observe the original bytes. repeated over many
 // pages of varied content. proves the whole pipeline + the fault wiring. (satoru)
 static bool test_fault_roundtrip() {
     if (!KMemX::IsInitialized() || !KMemX::IsEnabled()) {
@@ -510,7 +510,7 @@ static bool test_fault_roundtrip() {
         for (int a = 0; a < 16; a++) KernelVMM::KmemxAgeLeaf(as, va);
         bool comp = KMemX::CompressPage(as, va);
         if (!comp) {
-            // could legitimately decline (e.g. pool full)  -  clean up + skip. (satoru)
+            // could legitimately decline (e.g. pool full) - clean up + skip. (satoru)
             KernelVMM::UnmapPage(va, true);
             continue;
         }
@@ -557,7 +557,7 @@ static bool test_fault_roundtrip() {
 // store many IDENTICAL pages (so dedup can merge them) interleaved with unique
 // pages, run DedupPass, and verify: (a) merges happened, (b) pool usage dropped
 // vs the pre-dedup figure, (c) EVERY page (deduped + unique) still retrieves
-// byte-exact, and (d) freeing all pages returns the pool to empty  -  proving the
+// byte-exact, and (d) freeing all pages returns the pool to empty - proving the
 // shared-extent refcounting never leaks or double-frees. (satoru)
 static bool test_dedup() {
     if (!KMemX::IsInitialized() || !KMemX::IsEnabled() || KMemXPool::TotalBytes() == 0) {

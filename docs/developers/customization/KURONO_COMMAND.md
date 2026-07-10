@@ -46,7 +46,7 @@ Prints the full current contents of `/etc/kurono/ui.conf`:
 ```
 $ kurono config
 # ═════════════════════════════════════════
-#  Kurono OS  -  UI configuration
+#  Kurono OS - UI configuration
 ...
 ```
 
@@ -62,6 +62,6 @@ The `kurono` command is registered in `KuronoShell::RegisterBuiltins()` in `src/
 
 ## 3. Related documentation
 
-- `customization/UI_CUSTOMIZATION.md`  -  how to use reload in practice
-- `system/UI_CONFIG.md`  -  UIConfig technical reference
-- `shell/SHELL.md`  -  shell architecture
+- `customization/UI_CUSTOMIZATION.md` - how to use reload in practice
+- `system/UI_CONFIG.md` - UIConfig technical reference
+- `shell/SHELL.md` - shell architecture

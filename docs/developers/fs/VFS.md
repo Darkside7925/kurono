@@ -1,4 +1,4 @@
-# VFS  -  Virtual Filesystem Interface
+# VFS - Virtual Filesystem Interface
 
 `src/fs/vfs.cpp` and `vfs.h` implement the generic filesystem routing layer.
 
@@ -41,6 +41,6 @@ Most of the OS still calls KVFS directly because the VFS layer was added to supp
 
 ## 5. Related files
 
-- `src/fs/kvfs.cpp`  -  primary backend
-- `src/fs/fat32.cpp`  -  FAT32 backend
-- `src/linux/ext4.cpp`  -  ext4 backend for Linux partitions
+- `src/fs/kvfs.cpp` - primary backend
+- `src/fs/fat32.cpp` - FAT32 backend
+- `src/linux/ext4.cpp` - ext4 backend for Linux partitions

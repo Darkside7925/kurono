@@ -4,7 +4,7 @@
 
 ## 1. Purpose
 
-When the kernel hits a state it cannot continue from  -  a CPU exception with no handler, a null pointer in a critical path, an assert failure  -  it calls the panic path. The panic path:
+When the kernel hits a state it cannot continue from - a CPU exception with no handler, a null pointer in a critical path, an assert failure - it calls the panic path. The panic path:
 
 1. Stops the current execution context.
 2. Draws a crash screen to the framebuffer.
@@ -44,6 +44,6 @@ After displaying the crash screen, the panic path waits briefly and then either 
 
 ## 7. Related files
 
-- `src/kernel/kurono_kernel.cpp`  -  early panic init placement
-- `src/hal/hal.cpp`  -  CPU exception handlers that feed into panic
-- `src/drivers/display.cpp`  -  framebuffer setup that panic depends on
+- `src/kernel/kurono_kernel.cpp` - early panic init placement
+- `src/hal/hal.cpp` - CPU exception handlers that feed into panic
+- `src/drivers/display.cpp` - framebuffer setup that panic depends on

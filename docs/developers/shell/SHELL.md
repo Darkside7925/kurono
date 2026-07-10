@@ -4,7 +4,7 @@
 
 ## 1. Architecture
 
-The shell is not a separate process  -  it is a library that the terminal app and the emergency boot shell both call into. The shell receives characters through `KuronoShell::Input(char)`, assembles lines, and dispatches to registered commands.
+The shell is not a separate process - it is a library that the terminal app and the emergency boot shell both call into. The shell receives characters through `KuronoShell::Input(char)`, assembles lines, and dispatches to registered commands.
 
 ## 2. Command registry
 
@@ -16,15 +16,15 @@ subsystems: `src/shell/linux_cmds.cpp` and `windows_cmds.cpp` (the Linux/Windows
 surfaces), `src/apps/kj.cpp` (`kj`/`node`), `src/kcl/kcl.cpp` (`kcl`),
 `src/apps/python_interp.cpp` (`python`/`py`), `src/packages/pkgmgr.cpp` (`kpkg`
 and friends), `src/system/installer.cpp` (`installer`), `src/net/network.cpp`,
-`src/shell/shell.cpp` (the `firefox` command  -  auto-installs the package then
+`src/shell/shell.cpp` (the `firefox` command - auto-installs the package then
 launches it via `LdKurono::ExecPIE`), `src/linux/*`, etc. In total ~154 distinct
 commands are registered (counting `RegisterCommand` call sites across the tree).
 
 The `kurono` command group provides:
 
-- `kurono reload`  -  reload `/etc/kurono/ui.conf` and apply live
-- `kurono info`  -  show OS version, CPU, and memory summary
-- `kurono config`  -  print the current config file contents
+- `kurono reload` - reload `/etc/kurono/ui.conf` and apply live
+- `kurono info` - show OS version, CPU, and memory summary
+- `kurono config` - print the current config file contents
 
 ## 3. Line editing
 
@@ -48,8 +48,8 @@ strings actually passed to `RegisterCommand` across the tree are: `builtin`,
 
 ## 6. Related files
 
-- `src/apps/terminal.cpp`  -  terminal that calls `KuronoShell::Input()`
-- `src/shell/linux_cmds.cpp`  -  Linux-style commands (ls, cat, pwd, etc.)
-- `src/shell/windows_cmds.cpp`  -  Windows-style commands (dir, type, etc.)
-- `src/system/ui_config.cpp`  -  used by `kurono config` and `kurono reload`
-- `src/ui/desktop.cpp`  -  `ReloadFromConfig()` called from `kurono reload`
+- `src/apps/terminal.cpp` - terminal that calls `KuronoShell::Input()`
+- `src/shell/linux_cmds.cpp` - Linux-style commands (ls, cat, pwd, etc.)
+- `src/shell/windows_cmds.cpp` - Windows-style commands (dir, type, etc.)
+- `src/system/ui_config.cpp` - used by `kurono config` and `kurono reload`
+- `src/ui/desktop.cpp` - `ReloadFromConfig()` called from `kurono reload`

@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  Kurono OS  -  Directory Cleanup & Organization Script
+#  Kurono OS - Directory Cleanup & Organization Script
 #  Moves all loose files into organized folders, removes stale artifacts
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -282,7 +282,7 @@ Get-ChildItem (Join-Path $Root "archive") -Directory | ForEach-Object {
 }
 
 # ──────────────────────────────────────────────────────────────────────────
-#  Done  -  Show final structure
+#  Done - Show final structure
 # ──────────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Ok "Cleanup complete! Final directory structure:"

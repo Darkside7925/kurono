@@ -18,7 +18,7 @@ Standard PS/2 mice send 3-byte packets: a status byte (button bits, overflow fla
 
 ## 4. Touchpad notes
 
-Laptop touchpads typically emulate a PS/2 mouse at the protocol level. The driver works with them through the same path. Extended touchpad features (multi-touch, gestures, palm rejection) are not implemented  -  the driver sees basic pointer movement and left/right button clicks only.
+Laptop touchpads typically emulate a PS/2 mouse at the protocol level. The driver works with them through the same path. Extended touchpad features (multi-touch, gestures, palm rejection) are not implemented - the driver sees basic pointer movement and left/right button clicks only.
 
 ## 5. Cursor position
 
@@ -35,6 +35,6 @@ The mouse driver maintains a global cursor position that the desktop renderer us
 
 ## 7. Related files
 
-- `src/hal/hal.cpp`  -  IRQ 12 registration
-- `src/drivers/keyboard.cpp`  -  keyboard re-arm after aux init
-- `src/system/input_manager.cpp`  -  consumer of mouse events
+- `src/hal/hal.cpp` - IRQ 12 registration
+- `src/drivers/keyboard.cpp` - keyboard re-arm after aux init
+- `src/system/input_manager.cpp` - consumer of mouse events

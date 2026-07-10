@@ -14,8 +14,8 @@ BGA is detected by checking for PCI vendor ID 0x1234 (QEMU/Bochs). The device ID
 
 BGA uses two I/O ports for configuration:
 
-- **Index port (0x01CE)**  -  write a register index
-- **Data port (0x01CF)**  -  read or write the register value
+- **Index port (0x01CE)** - write a register index
+- **Data port (0x01CF)** - read or write the register value
 
 ### Important registers
 
@@ -50,9 +50,9 @@ On some QEMU configurations, BAR0 may not be pre-configured. The driver can prog
 
 BGA supports multiple pixel formats:
 
-- **16 bpp**  -  RGB 565
-- **24 bpp**  -  RGB 888
-- **32 bpp**  -  BGRA 8888 (most common in Kurono)
+- **16 bpp** - RGB 565
+- **24 bpp** - RGB 888
+- **32 bpp** - BGRA 8888 (most common in Kurono)
 
 The driver prefers 32 bpp for compatibility with the graphics layer.
 
@@ -71,6 +71,6 @@ To use BGA in QEMU, add `-vga std` to the command line. This enables the Bochs G
 
 ## 9. Related files
 
-- `src/drivers/display_mgr.cpp`  -  uses BGA as a display backend
-- `src/drivers/graphics.cpp`  -  framebuffer operations
-- `src/kernel/pci.h`  -  PCI configuration helpers
+- `src/drivers/display_mgr.cpp` - uses BGA as a display backend
+- `src/drivers/graphics.cpp` - framebuffer operations
+- `src/kernel/pci.h` - PCI configuration helpers

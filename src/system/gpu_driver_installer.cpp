@@ -1,4 +1,4 @@
-//  kurono os  -  gpu driver installer.  see header for design.
+//  kurono os - gpu driver installer.  see header for design.
 #include "gpu_driver_installer.h"
 #include "../drivers/nvidia_gpu.h"
 #include "../drivers/amd_gpu.h"
@@ -262,7 +262,7 @@ DriverInstallStatus GpuDriverInstaller::Setup(DriverDistro distro, DetectedGPU v
         return DRV_ERROR_NO_DISTRO;
     }
 
-    // gpu guard  -  auto-detect if caller passed DGPU_NONE
+    // gpu guard - auto-detect if caller passed DGPU_NONE
     if (vendor == DGPU_NONE) vendor = DetectVendor();
     if (vendor != DGPU_NVIDIA && vendor != DGPU_AMD) {
         SetStatus(DRV_ERROR_NO_GPU, 0,

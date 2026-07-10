@@ -1,8 +1,8 @@
-//  kurono os  -  802.11i security self-test (satoru)
+//  kurono os - 802.11i security self-test (satoru)
 //  see ieee80211_test.h. asserts the wpa2 crypto core against published vectors:
 //   - sha1 (rfc 3174), hmac-sha1 (rfc 2202)
 //   - pbkdf2-hmac-sha1: the 802.11i wpa-psk vector (ssid "IEEE", pass "password"
-//     -> pmk f42c6fc52df0ebef9ebb4b90b38a5f90...)  -  task-mandated. (satoru)
+//     -> pmk f42c6fc52df0ebef9ebb4b90b38a5f90...) - task-mandated. (satoru)
 //   - aes-128 (fips-197 c.1), aes-cmac (rfc 4493), aes key wrap (rfc 3394)
 //   - the ieee 802.11 prf-384 ptk derivation vector
 //   - ccmp (aes-ctr + cbc-mac): rfc 3610 packet vector #1 + mic verify + a

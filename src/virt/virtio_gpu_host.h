@@ -1,4 +1,4 @@
-//  kurono os  -  virtio-gpu host device emulator
+//  kurono os - virtio-gpu host device emulator
 //
 //  presents a virtio 1.0+ pci gpu to the guest vm so the alpine/debian
 //  guest can load its in-tree virtio_gpu drm driver and render to the
@@ -104,7 +104,7 @@ class VirtIOGPUHost {
 public:
     static bool Init();              // registers a vpci device
 
-    // called from the hypervisor tick loop  -  checks all virtqueues for
+    // called from the hypervisor tick loop - checks all virtqueues for
     // newly-submitted requests and processes them.
     static void ProcessQueues();
 
@@ -164,7 +164,7 @@ private:
     static uint32_t ReadCommonCfg (uint32_t off, uint8_t size);
     static void     WriteCommonCfg(uint32_t off, uint8_t size, uint32_t value);
 
-    // queue notify  -  guest tells us a virtqueue has new requests
+    // queue notify - guest tells us a virtqueue has new requests
     static void NotifyQueue(int qid);
 
     // process a single virtio-gpu command pulled from the controlq

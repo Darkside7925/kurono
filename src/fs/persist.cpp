@@ -7,7 +7,7 @@
 #include "kfs.h"
 #include "kvfs.h"
 
-//  raw-sector persistence  -  see persist.h. all i/o goes through a single page
+//  raw-sector persistence - see persist.h. all i/o goes through a single page
 //  aligned bounce buffer (PMM::AllocBytes hands out page-aligned, identity-mapped
 //  frames) because nvme read/write here use prp1 only, so one command moves at
 //  most one 4096-byte page. (satoru)
@@ -166,7 +166,7 @@ namespace {
 
     //  mirror a kvfs subtree into the mounted kfs volume. the child list is sized
     //  to the directory's actual child_count (heap, not a fixed 512 cap) so a
-    //  directory of ANY size is fully mirrored  -  no max-dir-entry limit. (satoru)
+    //  directory of ANY size is fully mirrored - no max-dir-entry limit. (satoru)
     void save_subtree(const char* path) {
         KVFSNode* node = KVFS::Resolve(path);
         if (node && node->type == KVFS_SYMLINK) {
@@ -196,7 +196,7 @@ namespace {
         } else if (KVFS::IsFile(path)) {
             int sz = KVFS::GetFileSize(path);
             // KFS v2 extents have NO ~4 MB file cap (files are limited only by
-            // free disk space), so the old KFS_MAX_FILE skip is gone  -  mirror
+            // free disk space), so the old KFS_MAX_FILE skip is gone - mirror
             // whatever KVFS holds. (satoru)
             if (sz < 0) return;
             if (sz == 0) { KFS::WriteFile(path, "", 0); return; }
@@ -208,7 +208,7 @@ namespace {
         }
     }
 
-    //  layer 6  -  content fingerprint of a kvfs subtree. accumulates a 64-bit hash
+    //  layer 6 - content fingerprint of a kvfs subtree. accumulates a 64-bit hash
     //  over (path, type, size, content) for every node so two different trees
     //  almost never collide. order matters (depth-first, dir children in listdir
     //  order), which is deterministic for the same tree. used to detect "nothing
@@ -336,8 +336,8 @@ namespace {
     }
 
     //  size the KFS volume to the FULL nvme capacity (no 256 MB cap). the in-ram
-    //  metadata caches scale with the volume  -  bitmap = total_blocks/8 bytes and
-    //  the inode table = total_blocks*8 bytes (1 inode per 32 blocks)  -  so a 4 GB
+    //  metadata caches scale with the volume - bitmap = total_blocks/8 bytes and
+    //  the inode table = total_blocks*8 bytes (1 inode per 32 blocks) - so a 4 GB
     //  disk costs ~36 MB of cache, a 16 GB disk ~144 MB. cap the cache budget at
     //  512 MB (=> ~57 GB volume) so a pathologically huge disk can't exhaust ram;
     //  beyond that we still address the whole disk for data, we just cap the
@@ -358,7 +358,7 @@ bool PersistStore::SaveTree() {
     if (!NVMe::IsDetected()) return false;
     KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
 
-    // layer 6  -  INCREMENTAL save. fingerprint the current user-data set; if a
+    // layer 6 - INCREMENTAL save. fingerprint the current user-data set; if a
     // valid volume is already on disk with the SAME fingerprint, nothing changed
     // since the last save, so skip the whole reformat+rewrite. this makes a save
     // with no changes ≈ a single mount (a few ms) instead of a full 30-40 ms

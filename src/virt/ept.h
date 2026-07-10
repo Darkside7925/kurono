@@ -1,9 +1,9 @@
 #pragma once
-//  kurono os  -  extended page tables (ept) / nested page tables (npt)
+//  kurono os - extended page tables (ept) / nested page tables (npt)
 //  memory virtualization for intel vt-x and amd-v
 #include "../kernel/types.h"
 
-//  intel ept  -  4-level page table (pml4 → pdpt → pd → pt)
+//  intel ept - 4-level page table (pml4 → pdpt → pd → pt)
 //  each entry is 64 bits. we use 4kb pages for fine-grained control.
 
 #define EPT_READ        (1ULL << 0)   // allow read
@@ -21,7 +21,7 @@
 #define EPT_DIRTY       (1ULL << 9)   // dirty (if enabled)
 #define EPT_EXEC_USER   (1ULL << 10)  // user-mode execute (mbec)
 
-// address mask  -  bits [51:12] hold the physical page frame number
+// address mask - bits [51:12] hold the physical page frame number
 #define EPT_ADDR_MASK   0x000FFFFFFFFFF000ULL
 
 #define EPTP_MT_WB      (6ULL << 0)   // memory type = wb for ept structure
@@ -35,7 +35,7 @@
 #define EPT_VIOL_WRITABLE (1 << 4)
 #define EPT_VIOL_EXECUTABLE (1 << 5)
 
-//  amd npt  -  nested page tables (same 4-level structure as normal x86 pt)
+//  amd npt - nested page tables (same 4-level structure as normal x86 pt)
 //  uses standard pte format bits with some additions
 
 #define NPT_PRESENT     (1ULL << 0)
@@ -49,7 +49,7 @@
 #define NPT_NX          (1ULL << 63)  // no execute
 #define NPT_ADDR_MASK   0x000FFFFFFFFFF000ULL
 
-//  page table structures  -  512 entries per level
+//  page table structures - 512 entries per level
 
 struct alignas(4096) EPT_PML4 {
     uint64_t entries[512];
@@ -95,7 +95,7 @@ struct GuestMemRegion {
 
 #define MAX_MEM_REGIONS 32
 
-//  ept manager  -  handles ept/npt page table creation and manipulation
+//  ept manager - handles ept/npt page table creation and manipulation
 
 class EPTManager {
 public:

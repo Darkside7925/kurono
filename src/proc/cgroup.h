@@ -11,13 +11,13 @@
 // (Process::cgroup_id) pointing at their leaf node.
 //
 // Supported controllers (matching Linux v6 names):
-//   memory    -  sets memory.max byte cap, enforced cooperatively in
+//   memory   - sets memory.max byte cap, enforced cooperatively in
 //              KernelHeap::Alloc when MEMCG_CHARGE is wrapped around it.
-//   cpu       -  sets cpu.weight 1..10000, hooked into the scheduler's
+//   cpu      - sets cpu.weight 1..10000, hooked into the scheduler's
 //              vruntime accounting (lower weight ⇒ slower vruntime
 //              accumulation, like nice).
-//   pids      -  sets pids.max, enforced in Scheduler::CreateUserProcess.
-//   io        -  sets io.weight, used by the block layer's elevator.
+//   pids     - sets pids.max, enforced in Scheduler::CreateUserProcess.
+//   io       - sets io.weight, used by the block layer's elevator.
 //
 // We keep up to CGROUP_MAX nodes in a flat table; lookups are linear but
 // the count is small (containers typically use <50 cgroups).
@@ -72,7 +72,7 @@ namespace Cgroup {
     // Move a process into a cgroup.  Updates pids_current of old/new.
     bool     Attach(uint32_t cgroup_id, uint32_t pid);
 
-    // Knob setters  -  called from /sys/fs/cgroup/<x>/<knob> writes.
+    // Knob setters - called from /sys/fs/cgroup/<x>/<knob> writes.
     bool SetMemoryMax(uint32_t id, uint64_t bytes);
     bool SetCpuWeight(uint32_t id, uint32_t weight);
     bool SetPidsMax(uint32_t id, uint32_t max);

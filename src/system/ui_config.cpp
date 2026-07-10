@@ -1,4 +1,4 @@
-//  kurono os  -  ui configuration implementation
+//  kurono os - ui configuration implementation
 //
 //  parser is deliberately small: one pass, line oriented, `key = value`,
 //  `#` comments, blank lines allowed. values are stored as strings and
@@ -37,7 +37,7 @@ const char* UIConfig::Path(){ return "/etc/kurono/ui.conf"; }
 const char* UIConfig::DefaultFile(){
     return
     "# ═══════════════════════════════════════════════════════════════════\n"
-    "#  Kurono OS  -  UI configuration\n"
+    "#  Kurono OS - UI configuration\n"
     "# ═══════════════════════════════════════════════════════════════════\n"
     "#\n"
     "#  Format: key = value\n"
@@ -233,7 +233,7 @@ void UIConfig::Load(){
     static char buf[4096];
     int n = KVFS::ReadString(Path(), buf, sizeof(buf));
     if(n <= 0){
-        // no file  -  rely on fallbacks. still counts as a successful load.
+        // no file - rely on fallbacks. still counts as a successful load.
         SerialLogger::Log("[UIConfig] no config file, using defaults\r\n");
         return;
     }

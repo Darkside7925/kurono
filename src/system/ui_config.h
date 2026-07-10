@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  ui configuration (backed by /etc/kurono/ui.conf)
+//  kurono os - ui configuration (backed by /etc/kurono/ui.conf)
 //
 //  this module provides a single source of truth for user-tweakable ui
 //  colors, sizes, and toggles. it is read from a plain key=value file in
@@ -14,7 +14,7 @@
 //  boot. if a key is missing, the built-in default is returned.
 //
 //  any code that wants to react to reloads should call the version()
-//  counter  -  every successful reload() bumps it.
+//  counter - every successful reload() bumps it.
 //
 #include "../kernel/types.h"
 

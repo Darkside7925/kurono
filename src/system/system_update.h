@@ -1,4 +1,4 @@
-//  kurono os  -  boot-time system update screen
+//  kurono os - boot-time system update screen
 //
 //  shown immediately after kernel boot when /var/lib/kurono/pending-update
 //  exists (written by `kpkg install debian` and similar long-running

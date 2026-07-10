@@ -1,4 +1,4 @@
-//  kurono os  -  linux boot protocol implementation
+//  kurono os - linux boot protocol implementation
 //  implements the x86 linux boot protocol for loading a bzimage/vmlinuz
 //  into a virtual machine.
 //
@@ -105,7 +105,7 @@ struct LinuxImageInfo {
     uint32_t init_size;         // total init size
 };
 
-//  linuxbootloader  -  handles bzimage loading and boot parameter setup
+//  linuxbootloader - handles bzimage loading and boot parameter setup
 class LinuxBootLoader {
 public:
     // returns true if the image is a valid linux bzimage.

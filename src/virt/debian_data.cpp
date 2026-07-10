@@ -1,4 +1,4 @@
-//  kurono os  -  debian rootfs loader (embedded or on-disk)
+//  kurono os - debian rootfs loader (embedded or on-disk)
 #include "debian_data.h"
 #include "../fs/kvfs.h"
 #include "../kernel/heap.h"

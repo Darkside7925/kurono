@@ -8,7 +8,7 @@ The keyboard driver communicates with the 8042 PS/2 controller to receive scan c
 
 ## 2. Initialization
 
-The driver registers an IRQ 1 handler with the HAL during kernel bring-up. It programs the 8042 to enable the keyboard port and sets an LED state. On real laptop hardware, the 8042 initialization is fragile  -  the driver re-arms the keyboard after the PS/2 auxiliary (mouse) port is initialized because some controllers drop keyboard state during auxiliary bring-up.
+The driver registers an IRQ 1 handler with the HAL during kernel bring-up. It programs the 8042 to enable the keyboard port and sets an LED state. On real laptop hardware, the 8042 initialization is fragile - the driver re-arms the keyboard after the PS/2 auxiliary (mouse) port is initialized because some controllers drop keyboard state during auxiliary bring-up.
 
 ## 3. Scan code translation
 
@@ -31,6 +31,6 @@ Translated key characters are placed in a small circular buffer. The main loop d
 
 ## 6. Related files
 
-- `src/hal/hal.cpp`  -  IRQ registration
-- `src/drivers/mouse.cpp`  -  PS/2 auxiliary path that can affect keyboard
-- `src/system/input_manager.cpp`  -  consumer of the keyboard queue
+- `src/hal/hal.cpp` - IRQ registration
+- `src/drivers/mouse.cpp` - PS/2 auxiliary path that can affect keyboard
+- `src/system/input_manager.cpp` - consumer of the keyboard queue

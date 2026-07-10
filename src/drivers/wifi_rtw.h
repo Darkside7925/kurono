@@ -1,9 +1,9 @@
 #pragma once
-//  kurono os  -  realtek rtw pcie wifi radio driver (satoru)
+//  kurono os - realtek rtw pcie wifi radio driver (satoru)
 //
 //  implements the Ieee80211::WifiRadioOps contract for realtek pcie wlan parts
 //  in the rtl88xx/rtl87xx family: rtl8821ce, rtl8723be, rtl8822ce, rtl8812ae.
-//  this is the *radio* layer  -  the 802.11 mac (scan/auth/assoc) and the wpa2
+//  this is the *radio* layer - the 802.11 mac (scan/auth/assoc) and the wpa2
 //  supplicant live above us in net/ieee80211; we only touch the chip: the mac
 //  power-on sequence, llt/fifo init, firmware download, the pci tx/rx dma rings,
 //  the phy channel set, and the bssid/rx-filter regs. (satoru)

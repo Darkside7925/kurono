@@ -47,7 +47,7 @@ def connect_rfb(host="127.0.0.1", port=5900, idle_secs=60):
         w, h = struct.unpack(">HH", server_init[:4])
         print(f"Framebuffer: {w}x{h}", file=sys.stderr)
 
-    # 7. Idle  -  keep connection alive until killed
+    # 7. Idle - keep connection alive until killed
     print(f"Connected. Idling for {idle_secs}s...", file=sys.stderr)
     sock.settimeout(1)
     start = time.time()

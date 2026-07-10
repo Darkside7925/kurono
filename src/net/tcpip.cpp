@@ -19,7 +19,7 @@ static void slog(const char* s){ SerialLogger::Log(s); }
    `pause`, so other cooperative processes actually run during the wait.
    Scheduler::SleepMs(1) gives up the cpu to the next runnable kernel
    process when the preemptive scheduler is live, and otherwise HLTs until
-   the next IRQ (still no busy spin)  -  both keep the ~1ms cadence and stop
+   the next IRQ (still no busy spin) - both keep the ~1ms cadence and stop
    burning a core. The callers re-poll the NIC via Tick() each pass, so
    correctness holds. Matches the recv-loop pacing in linux_cmds.cpp. (satoru) */
 static inline void net_wait_one_ms() {
@@ -61,7 +61,7 @@ static inline void tcp_ring_pop(NetSocket* s, uint8_t* dst, int n) {
 // udp datagram record header pushed ahead of each payload in the rx ring so
 // RecvFrom returns DISTINCT datagrams with their true source. without framing
 // the ring concatenated datagrams and remote_ip/port were clobbered per packet
-//  -  musl's resolver (parallel A+AAAA on one socket, memcmp on the reply
+// - musl's resolver (parallel A+AAAA on one socket, memcmp on the reply
 // source) breaks on both. (satoru)
 struct UdpRecHdr {
     uint16_t len;        // payload bytes following this header (satoru)
@@ -253,7 +253,7 @@ bool TCPStack::Init() {
     dns_server = MakeIP(10, 0, 2, 3);
 
     // seed the ephemeral source port from rdtsc so successive boots (and
-    // reconnects to the same server) don't reuse the identical 4-tuple  -  a
+    // reconnects to the same server) don't reuse the identical 4-tuple - a
     // server still holding TIME_WAIT state for the old tuple answers a fresh
     // syn with a bare challenge-ack instead of syn-ack (rfc 5961), so the
     // handshake never completes. (satoru)
@@ -556,7 +556,7 @@ void TCPStack::ProcessRxPacket(const void* data, int length) {
             ProcessIPv4(payload, payload_len);
             break;
         case ETH_TYPE_IPV6:
-            // Hand off to the IPv6 stack  -  it expects the full ethernet
+            // Hand off to the IPv6 stack - it expects the full ethernet
             // frame so it can echo MACs back on replies.
             IPv6::ProcessRx((const unsigned char*)data, length,
                             eth->dst_mac, eth->src_mac);
@@ -909,7 +909,7 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                         accepted_data = copy;
                         ack_needed = true;
                     } else {
-                        // Out-of-order or duplicate  -  send a duplicate ACK
+                        // Out-of-order or duplicate - send a duplicate ACK
                         // so the peer fast-retransmits. Do not advance
                         // tcp_ack; do not buffer (no reassembly window).
                         ack_needed = true;
@@ -1106,7 +1106,7 @@ bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, i
     IPv4Header pseudo_ip;
     pseudo_ip.src_ip = htonl(local_ip);
     pseudo_ip.dst_ip = htonl(sock->remote_ip);
-    // Guard against null data pointer  -  only pass valid payload to checksum
+    // Guard against null data pointer - only pass valid payload to checksum
     uint8_t null_buf[1] = {0};
     if (!data) { data = null_buf; len = 0; }
     tcp->checksum = htons(TCPChecksum(&pseudo_ip, tcp, data, len));
@@ -1150,7 +1150,7 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
 
     // Optional UDP-over-IPv4 checksum: 0 means "not computed", anything
     // else must verify or we drop. We reuse TCPChecksum which builds the
-    // same pseudo-header layout  -  but the protocol byte differs, so
+    // same pseudo-header layout - but the protocol byte differs, so
     // compute manually here.
     if (udp->checksum != 0) {
         struct {
@@ -1187,7 +1187,7 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
         sock->remote_port = src_port;
 
         // framed push: an 8-byte record header + the payload, dropped WHOLE if
-        // the ring can't hold both  -  a truncated datagram record would desync
+        // the ring can't hold both - a truncated datagram record would desync
         // every later pop. RecvFrom pops one record per call so datagram
         // boundaries + true source survive (musl's dns resolver needs both).
         // (satoru)
@@ -1329,7 +1329,7 @@ int TCPStack::Accept(int sock) {
             if (new_sock < 0) return -1;
             sockets[new_sock] = sockets[sock];
             sockets[new_sock].tx_pending = false;
-            // the accepted socket starts with an empty send window  -  a listener
+            // the accepted socket starts with an empty send window - a listener
             // never queued data, but make the invariant explicit. (satoru)
             for (int k = 0; k < TCP_SND_WND_SEGS; k++) sockets[new_sock].tx_segs[k].in_use = false;
             sockets[new_sock].tx_seg_inflight = 0;
@@ -1452,7 +1452,7 @@ int TCPStack::Recv(int sock, void* buf, int max_len) {
 
     if (s->rx_count == 0) return 0;
 
-    // free space BEFORE we drain  -  this is roughly what the peer last saw us
+    // free space BEFORE we drain - this is roughly what the peer last saw us
     // advertise. (satoru)
     int free_before = TCP_RX_BUFSIZE - s->rx_count;
 
@@ -1476,7 +1476,7 @@ int TCPStack::Recv(int sock, void* buf, int max_len) {
 
     // window-update ack: on a bulk download the rx ring fills and our
     // advertised window collapses toward 0, so the peer stops sending. once the
-    // app drains the ring the window reopens  -  but tcp only learns that if we
+    // app drains the ring the window reopens - but tcp only learns that if we
     // emit a segment. without this, slirp deadlocks waiting for a window update
     // that never comes (the 235 mb firefox tar stalled after ~4 kb). emit a
     // pure ack (which recomputes + carries the fresh, scaled window) whenever
@@ -1512,7 +1512,7 @@ bool TCPStack::IsNonblocking(int sock) {
 
 bool TCPStack::IsWritable(int sock) {
     // A stream socket is writable for poll/select once the handshake
-    // completed (ESTABLISHED)  -  this is how a background non-blocking
+    // completed (ESTABLISHED) - this is how a background non-blocking
     // connect signals success. UDP sockets are always writable. (satoru)
     if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
     NetSocket* s = &sockets[sock];
@@ -1620,7 +1620,7 @@ int TCPStack::RecvFrom(int sock, void* buf, int max_len, uint32_t* from_ip, uint
     // udp: pop exactly ONE framed datagram record (see UdpRecHdr) so each call
     // returns one distinct datagram with its true source, not a concatenation
     // with a clobbered remote. oversize payload is truncated to max_len and the
-    // tail discarded  -  standard udp semantics. (satoru)
+    // tail discarded - standard udp semantics. (satoru)
     if (s->type == SOCK_DGRAM) {
         if (s->rx_count < (int)sizeof(UdpRecHdr)) return 0;   // nothing queued (satoru)
         UdpRecHdr rh;
@@ -1739,7 +1739,7 @@ void TCPStack::TCPTick() {
         // rto + retry count and is retransmitted independently. acks free
         // segments in ApplyAck; anything still in_use past its rto goes back on
         // the wire. if any one segment blows its retransmit budget the peer is
-        // gone  -  tear the connection down (same policy as the control slot).
+        // gone - tear the connection down (same policy as the control slot).
         // payload was buffered in the scoreboard so we resend without the
         // caller. (satoru)
         bool conn_dead = false;
@@ -1773,7 +1773,7 @@ void TCPStack::TCPTick() {
         // clocks (see ProcessTCP / Send), so this only fires on true idle.
         // A keepalive probe is a zero-length segment carrying seq = snd.nxt-1,
         // which forces the peer to emit an ACK without delivering data. don't
-        // probe while data is still in flight  -  that's not idle. (satoru)
+        // probe while data is still in flight - that's not idle. (satoru)
         if (sockets[i].tcp_state == TCP_ESTABLISHED && !sockets[i].tx_pending &&
             sockets[i].tx_seg_inflight == 0) {
             uint32_t idle_ms = (uint32_t)(now_ms - sockets[i].last_activity_ms);

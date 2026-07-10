@@ -44,7 +44,7 @@ HAL provides a `Reboot()` function that pulses the 8042 reset line. This is the 
 
 ## 7. Related files
 
-- `src/kernel/kurono_kernel.cpp`  -  calls `HAL::Init()` first in boot sequence
-- `src/kernel/panic.cpp`  -  receives CPU fault callbacks from HAL exception handlers
-- `src/drivers/keyboard.cpp`  -  registers IRQ 1 handler through HAL
-- `src/drivers/timer.cpp`  -  registers IRQ 0 handler through HAL
+- `src/kernel/kurono_kernel.cpp` - calls `HAL::Init()` first in boot sequence
+- `src/kernel/panic.cpp` - receives CPU fault callbacks from HAL exception handlers
+- `src/drivers/keyboard.cpp` - registers IRQ 1 handler through HAL
+- `src/drivers/timer.cpp` - registers IRQ 0 handler through HAL

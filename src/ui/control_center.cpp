@@ -1,4 +1,4 @@
-//  kurono os  -  control center implementation
+//  kurono os - control center implementation
 #include "control_center.h"
 #include "../drivers/graphics.h"
 #include "../drivers/audio.h"
@@ -47,7 +47,7 @@ namespace {
         SLOT_COUNT
     };
 
-    // per-tile press timing only  -  the on/off colour state now lives in the kss
+    // per-tile press timing only - the on/off colour state now lives in the kss
     // animation engine (keyed by a stable id), so the hand-rolled crossfade
     // bookkeeping is no longer needed here. (satoru)
     struct TileAnim {
@@ -77,7 +77,7 @@ namespace {
     }
 
     // smooth, engine-driven press scale for a tile/button: a subtle dip toward
-    // 0.95 right after a tap that eases back to 1.0, with no snap on release  - 
+    // 0.95 right after a tap that eases back to 1.0, with no snap on release - 
     // the scale value itself rides kss::anim so it never jumps. (satoru)
     inline float PressScale(int slot) {
         if (slot < 0 || slot >= SLOT_COUNT) return 1.0f;
@@ -199,7 +199,7 @@ static void DrawRoundedTile(int x, int y, int w, int h, int r, uint32_t fill, fl
     if (!g_corner_mask_ready) BuildCornerMasks();
     if (scale < 0.5f) scale = 0.5f;
     if (scale > 1.0f) scale = 1.0f;
-    // Inset by (1 - scale) * w/2 horizontally, same vertically  -  keeps it
+    // Inset by (1 - scale) * w/2 horizontally, same vertically - keeps it
     // centered.  Round to nearest integer.
     int dx = (int)((1.0f - scale) * (float)w * 0.5f + 0.5f);
     int dy = (int)((1.0f - scale) * (float)h * 0.5f + 0.5f);
@@ -312,7 +312,7 @@ static void DrawTileAnimated(int slot, int x, int y, int w, int h,
                                    active ? acc : surf,
                                    COLOR_DUR_MS, KSS::Anim::OutCubic);
 
-    // tactile press  -  engine-driven scale, eases in and back out with no snap. (satoru)
+    // tactile press - engine-driven scale, eases in and back out with no snap. (satoru)
     float scale = PressScale(slot);
 
     DrawRoundedTile(x, y, w, h, 12, bg, scale);
@@ -337,7 +337,7 @@ static void DrawTileAnimated(int slot, int x, int y, int w, int h,
 
 void ControlCenter::DrawTile(int x, int y, int w, int h, const char* label,
                              const char* sub, bool active, uint32_t accent){
-    // legacy entry  -  fall through with no slot (no animation)
+    // legacy entry - fall through with no slot (no animation)
     uint32_t bg = active ? accent : 0xFF1E1E2E;
     if (!RectVisible(x, y, w, h)) return;
     Graphics::FillRoundedRect(x, y, w, h, 12, bg);

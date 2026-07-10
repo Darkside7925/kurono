@@ -1,4 +1,4 @@
-//  kurono os  -  guest memory manager
+//  kurono os - guest memory manager
 //  manages physical memory layout for a virtual machine guest.
 //  allocates ram, sets up ept/npt mappings, handles mmio regions,
 //  provides the e820 memory map for the guest bios/kernel.
@@ -46,7 +46,7 @@ constexpr uint32_t GUEST_DEFAULT_RAM_MB = 64;
 constexpr uint32_t GUEST_MAX_RAM_MB     = 128; // stay within our 64mb heap budget
 constexpr uint32_t GUEST_MIN_RAM_MB     = 4;
 
-//  guestphysmap  -  a region of guest physical memory backed by host memory
+//  guestphysmap - a region of guest physical memory backed by host memory
 struct GuestPhysMap {
     uint64_t  guest_phys;   // guest physical address
     uint8_t*  host_virt;    // host virtual (kernelheap-allocated)
@@ -57,7 +57,7 @@ struct GuestPhysMap {
 
 constexpr int MAX_GUEST_PHYS_MAPS = 16;
 
-//  bda  -  bios data area setup helpers
+//  bda - bios data area setup helpers
 constexpr uint32_t BDA_BASE = 0x0400;
 constexpr uint32_t BDA_COM1 = 0x0400; // com1 base port
 constexpr uint32_t BDA_COM2 = 0x0402; // com2 base port
@@ -65,7 +65,7 @@ constexpr uint32_t BDA_EQUIP_FLAGS = 0x0410;
 constexpr uint32_t BDA_MEM_SIZE_KB = 0x0413; // conventional memory size in kb
 constexpr uint32_t BDA_KBD_FLAGS   = 0x0417;
 
-//  guestmemorymanager  -  manages the complete guest physical address space
+//  guestmemorymanager - manages the complete guest physical address space
 class GuestMemoryManager {
 public:
     static void Init(uint32_t ram_mb);

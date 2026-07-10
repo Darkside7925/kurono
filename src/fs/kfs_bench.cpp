@@ -7,8 +7,8 @@
 #include "../kernel/heap.h"
 #include "../hal/hal.h"
 
-//  kfs_bench  -  see kfs_bench.h. all timing is rdtsc-based for sub-ms precision;
-//  MB/s + IOPS are computed in integer math (no fp  -  kernel is -mno-sse and the
+//  kfs_bench - see kfs_bench.h. all timing is rdtsc-based for sub-ms precision;
+//  MB/s + IOPS are computed in integer math (no fp - kernel is -mno-sse and the
 //  compiler must not emit sse). (satoru)
 
 namespace {

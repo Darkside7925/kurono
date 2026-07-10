@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  settings application (advanced)
+//  kurono os - settings application (advanced)
 #include "../kernel/types.h"   // uint32_t for the transition timestamps (satoru)
 
 enum SettingsTab {
@@ -85,7 +85,7 @@ public:
     static bool Input(void* win, int mx, int my, bool clicked, char key);
     static void Scroll(int dz);   // mouse-wheel scroll of the content panel (satoru)
 
-    // deferred resolution change  -  called from main loop between frames
+    // deferred resolution change - called from main loop between frames
     static void PollDeferredActions();
 
     static SettingsState state;

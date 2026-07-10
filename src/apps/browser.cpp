@@ -1,4 +1,4 @@
-//  kurono os  -  browser removed
+//  kurono os - browser removed
 //  no compatible bare-metal c++ browser found on github.
 //  all real browsers (netsurf, dillo, ladybird, links2) require:
 //    - libc (malloc, stdio, string.h)

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  nvidia gpu driver
+//  kurono os - nvidia gpu driver
 //  pci device detection, bar mapping, and basic gpu management
 //  supports geforce rtx 30xx/40xx/50xx series detection
 #include "../kernel/types.h"
@@ -59,7 +59,7 @@ enum GpuDriverState {
     GPU_STATE_ERROR,
 };
 
-//  nvidiagpu  -  static driver interface
+//  nvidiagpu - static driver interface
 class NvidiaGPU {
 public:
     static void Init();                        // scan pci bus for nvidia gpus
@@ -91,7 +91,7 @@ public:
     static void     DumpInfo(char* out, int maxo);
     static void     DumpRegisters(char* out, int maxo);
 
-    // accel capability  -  compositor calls this to decide whether to issue GPU blits
+    // accel capability - compositor calls this to decide whether to issue GPU blits
     static bool     HasHardwareAccel();
 
 private:

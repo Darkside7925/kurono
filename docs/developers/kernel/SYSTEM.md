@@ -12,7 +12,7 @@ Typical contents include:
 
 ## 2. Why not use libc
 
-The kernel does not link a standard C library. Any function the OS needs that would normally come from libc must either be written here or in a similar utility module. The implementations in `system.cpp` are intentionally minimal  -  just enough to work correctly on the known target architecture.
+The kernel does not link a standard C library. Any function the OS needs that would normally come from libc must either be written here or in a similar utility module. The implementations in `system.cpp` are intentionally minimal - just enough to work correctly on the known target architecture.
 
 ## 3. Rules
 
@@ -21,5 +21,5 @@ The kernel does not link a standard C library. Any function the OS needs that wo
 
 ## 4. Related files
 
-- `src/kernel/types.h`  -  primitive types used by these helpers
-- `src/kernel/heap.cpp`  -  heap allocator that relies on `memset`/`memcpy` from here at initialization time
+- `src/kernel/types.h` - primitive types used by these helpers
+- `src/kernel/heap.cpp` - heap allocator that relies on `memset`/`memcpy` from here at initialization time

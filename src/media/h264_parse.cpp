@@ -1,4 +1,4 @@
-// kurono os  -  h.264 bitstream metadata parser
+// kurono os - h.264 bitstream metadata parser
 // see h264_parse.h for the api surface.
 //
 // implements:
@@ -16,7 +16,7 @@
 namespace H264 {
 
 // ----------------------------------------------------------------------
-// emulation-prevention byte removal  -  many parsers do this in-place but
+// emulation-prevention byte removal - many parsers do this in-place but
 // we want immutable input, so we copy into a small heap scratch buffer
 // and operate from there.  the rbsp is always shorter than the ebsp,
 // so the same length is a safe upper bound.
@@ -235,7 +235,7 @@ bool ParseSPS(const uint8_t* rbsp, uint32_t rbsp_len, SPS& out) {
     uint32_t crop_v_factor = sub_h * (out.frame_mbs_only ? 1u : 2u);
     out.pic_height -= crop_v_factor * (crop_t + crop_b);
 
-    // vui parameters (optional  -  used for fps)
+    // vui parameters (optional - used for fps)
     out.timing_info_present = false;
     if (!br.Empty() && br.U1()) {
         // vui_parameters

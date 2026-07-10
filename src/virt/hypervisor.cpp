@@ -1,4 +1,4 @@
-//  kurono os  -  hypervisor / vm lifecycle manager implementation
+//  kurono os - hypervisor / vm lifecycle manager implementation
 //  orchestrates all virtualization components to create and run a vm
 //  capable of booting a linux kernel.
 //
@@ -148,7 +148,7 @@ static void FillGenericVMEntryFailureDiag(char* buf, int& len, int max, const ch
     AppendDiagText(buf, len, max, "[kurono] Hardware virtualization is not available to the guest hypervisor.\n");
 }
 
-//  init  -  detect hardware virtualization
+//  init - detect hardware virtualization
 
 bool Hypervisor::Init() {
     SerialLogger::Log("Hypervisor: Initializing...\r\n");
@@ -166,9 +166,9 @@ bool Hypervisor::Init() {
     } else {
         SerialLogger::Log("Hypervisor: No hardware virtualization");
         if (VMM::IsWHPX()) {
-            SerialLogger::Log("  -  WHPX detected but nested virt blocked by host");
+            SerialLogger::Log(" - WHPX detected but nested virt blocked by host");
         }
-        SerialLogger::Log("  -  software emulation only\r\n");
+        SerialLogger::Log(" - software emulation only\r\n");
     }
 
     // initialize exit handler
@@ -191,7 +191,7 @@ bool Hypervisor::IsAvailable() {
     return hw_available;
 }
 
-//  createvm  -  set up a new virtual machine
+//  createvm - set up a new virtual machine
 
 bool Hypervisor::CreateVM(const VMConfig& cfg) {
     if (vm_state != VM_STATE_UNINITIALIZED && vm_state != VM_STATE_DESTROYED) {
@@ -246,7 +246,7 @@ bool Hypervisor::CreateVM(const VMConfig& cfg) {
     return true;
 }
 
-//  destroyvm  -  tear down and free all vm resources
+//  destroyvm - tear down and free all vm resources
 
 void Hypervisor::DestroyVM() {
     SerialLogger::Log("Hypervisor: Destroying VM...\r\n");
@@ -308,7 +308,7 @@ bool Hypervisor::CanSwitchLinuxGuestProfile() {
     return vm_state == VM_STATE_UNINITIALIZED || vm_state == VM_STATE_DESTROYED;
 }
 
-//  setupiobitmap  -  configure which i/o ports cause vm-exits
+//  setupiobitmap - configure which i/o ports cause vm-exits
 
 bool Hypervisor::SetupIOBitmap() {
     // allocate two 4 kb pages (must be page-aligned)
@@ -356,7 +356,7 @@ bool Hypervisor::SetupIOBitmap() {
     return true;
 }
 
-//  setupmsrbitmap  -  configure which msrs cause vm-exits
+//  setupmsrbitmap - configure which msrs cause vm-exits
 
 bool Hypervisor::SetupMSRBitmap() {
     msr_bitmap = (uint8_t*)HVAllocAligned(MSR_BITMAP_SIZE, 4096);
@@ -375,7 +375,7 @@ bool Hypervisor::SetupMSRBitmap() {
     memset(msr_bitmap, 0xFF, MSR_BITMAP_SIZE);
 
     // allow safe msrs to pass through (no vm-exit):
-    // ia32_time_stamp_counter (0x10)  -  let guest read tsc directly
+    // ia32_time_stamp_counter (0x10) - let guest read tsc directly
     uint32_t tsc_byte = 0x10 / 8;
     uint32_t tsc_bit  = 0x10 % 8;
     msr_bitmap[tsc_byte] &= ~(1 << tsc_bit);               // read pass-through
@@ -406,7 +406,7 @@ bool Hypervisor::SetupMSRBitmap() {
     return true;
 }
 
-//  setupept  -  create extended page tables mapping guest physical memory
+//  setupept - create extended page tables mapping guest physical memory
 
 bool Hypervisor::SetupEPT() {
     if (VMM::GetType() == VIRT_INTEL_VTX) {
@@ -457,11 +457,11 @@ bool Hypervisor::SetupEPT() {
         EPTManager::AddRegion({GUEST_HPET_BASE, 0, 0x400, MEM_MMIO,
                                true, true, false});
 
-        // map vpci mmio window  -  virtio device bars live here
+        // map vpci mmio window - virtio device bars live here
         EPTManager::AddRegion({VPCI_MMIO_BASE, 0, (uint32_t)VPCI_MMIO_SIZE,
                                MEM_MMIO, true, true, false});
 
-        // write eptp to vmcs  -  single 64-bit write, do not split into
+        // write eptp to vmcs - single 64-bit write, do not split into
         // field / field+1 (field+1 is a different vmcs encoding on 64-bit)
         uint64_t eptp = EPTManager::BuildEPTP(ept_root);
         if (vcpu && vcpu->vmcs) {
@@ -504,7 +504,7 @@ bool Hypervisor::SetupEPT() {
     return true;
 }
 
-//  setupdevices  -  initialize all virtual devices
+//  setupdevices - initialize all virtual devices
 
 bool Hypervisor::SetupDevices() {
     // serial port (com1)
@@ -531,7 +531,7 @@ bool Hypervisor::SetupDevices() {
     return true;
 }
 
-//  loadlinuxkernel  -  load a bzimage into guest memory
+//  loadlinuxkernel - load a bzimage into guest memory
 
 bool Hypervisor::LoadLinuxKernel(const uint8_t* bzimage, uint32_t size,
                                   const char* cmdline) {
@@ -560,7 +560,7 @@ bool Hypervisor::LoadInitrd(const uint8_t* data, uint32_t size) {
     return LinuxBootLoader::LoadInitrd(data, size);
 }
 
-//  configureguestprotectedmode  -  set up vmcs/vmcb for 32-bit protected mode
+//  configureguestprotectedmode - set up vmcs/vmcb for 32-bit protected mode
 //  this is how linux expects to be entered (per boot protocol ≥ 2.00):
 //    - protected mode enabled (cr0.pe = 1)
 //    - flat 4 gb code/data segments
@@ -671,7 +671,7 @@ void Hypervisor::ConfigureGuestProtectedMode(uint32_t entry_point,
 
         // esi = pointer to boot_params
         // this is passed via general-purpose registers, but vmcs doesn't
-        // have direct gpr fields  -  they're managed via the vm-exit save area.
+        // have direct gpr fields - they're managed via the vm-exit save area.
         // for vmlaunch, we set esi in the vcpu register array.
         vcpu->regs[6] = boot_params_addr; // esi
 
@@ -760,11 +760,11 @@ void Hypervisor::ConfigureGuestProtectedMode(uint32_t entry_point,
     }
 }
 
-//  runvm  -  main execution loop
+//  runvm - main execution loop
 
 VMState Hypervisor::RunVM(uint32_t max_exits) {
     if (vm_state != VM_STATE_CREATED) {
-        SerialLogger::Log("Hypervisor: Cannot run  -  VM not ready\r\n");
+        SerialLogger::Log("Hypervisor: Cannot run - VM not ready\r\n");
         return vm_state;
     }
 
@@ -792,7 +792,7 @@ VMState Hypervisor::RunVM(uint32_t max_exits) {
     uint32_t tsc_lo_start, tsc_hi_start;
     asm volatile("rdtsc" : "=a"(tsc_lo_start), "=d"(tsc_hi_start));
     uint64_t tsc_start = ((uint64_t)tsc_hi_start << 32) | tsc_lo_start;
-    // ~3 seconds at 3 ghz  -  prevents the loop from blocking boot display
+    // ~3 seconds at 3 ghz - prevents the loop from blocking boot display
     const uint64_t MAX_TSC_DELTA = 9000000000ULL;
 
     uint32_t exit_count = 0;
@@ -833,7 +833,7 @@ VMState Hypervisor::RunVM(uint32_t max_exits) {
     return vm_state;
 }
 
-//  runonecycle  -  single vm-entry → vm-exit → handle cycle
+//  runonecycle - single vm-entry → vm-exit → handle cycle
 
 VMState Hypervisor::RunOneCycle() {
     if (!vcpu) return VM_STATE_CRASHED;
@@ -844,7 +844,7 @@ VMState Hypervisor::RunOneCycle() {
     CheckAndInjectPendingIRQs();
 
     if (!hw_available) {
-        // no hardware virt  -  can't actually run guest
+        // no hardware virt - can't actually run guest
         // in production this would be a software interpreter
         if (stats.run_cycles <= 1) {
             SerialLogger::Log("Hypervisor: No HW virt, cannot execute guest\r\n");
@@ -855,14 +855,14 @@ VMState Hypervisor::RunOneCycle() {
     // enter guest
     int exit_reason = VMM::RunVCPU(vcpu);
     if (exit_reason < 0) {
-        // vm-entry failed  -  under whpx this can happen if nested virt
+        // vm-entry failed - under whpx this can happen if nested virt
         // isn't truly supported despite cpuid detection succeeding
         if (stats.run_cycles <= 1) {
             SerialLogger::Log("Hypervisor: VM-entry failed (exit_reason=");
             SerialLogger::LogDec(exit_reason);
             SerialLogger::Log(")\r\n");
             if (VMM::IsWHPX()) {
-                SerialLogger::Log("Hypervisor: WHPX nested VM-entry rejected  -  "
+                SerialLogger::Log("Hypervisor: WHPX nested VM-entry rejected - "
                                  "host likely doesn't support nested virt\r\n");
             } else if (VMM::GetType() == VIRT_INTEL_VTX) {
                 SerialLogger::Log("Hypervisor: Bare-metal/local VT-x VM-entry failure: instr_error=");
@@ -882,7 +882,7 @@ VMState Hypervisor::RunOneCycle() {
     return ProcessVMExit();
 }
 
-//  processvmexit  -  dispatch vm-exit to handlers
+//  processvmexit - dispatch vm-exit to handlers
 
 VMState Hypervisor::ProcessVMExit() {
     if (!vcpu) return VM_STATE_CRASHED;
@@ -922,7 +922,7 @@ VMState Hypervisor::ProcessVMExit() {
     }
 }
 
-//  handleguestio  -  route guest i/o to virtual devices
+//  handleguestio - route guest i/o to virtual devices
 
 bool Hypervisor::HandleGuestIO(uint16_t port, bool is_out, uint8_t size,
                                  uint32_t& value) {
@@ -958,21 +958,21 @@ bool Hypervisor::HandleGuestIO(uint16_t port, bool is_out, uint8_t size,
         return true;
     }
 
-    // port 0x80  -  post code (ignore)
+    // port 0x80 - post code (ignore)
     if (port == 0x80) return true;
 
-    // ports 0xcf8 / 0xcfc-0xcff  -  virtual pci configuration mechanism #1
+    // ports 0xcf8 / 0xcfc-0xcff - virtual pci configuration mechanism #1
     if (port == 0xCF8 || (port >= 0xCFC && port <= 0xCFF)) {
         return VPCI::HandlePortIO(port, is_out, size, value);
     }
 
-    // port 0x92 (system control port a  -  a20 gate)
+    // port 0x92 (system control port a - a20 gate)
     if (port == 0x92) {
         if (!is_out) value = 0x02; // a20 enabled
         return true;
     }
 
-    // port 0x70/0x71  -  cmos/rtc
+    // port 0x70/0x71 - cmos/rtc
     if (port == 0x70 || port == 0x71) {
         if (!is_out) value = 0;
         return true;
@@ -982,7 +982,7 @@ bool Hypervisor::HandleGuestIO(uint16_t port, bool is_out, uint8_t size,
     return false;
 }
 
-//  handleguestmmio  -  route mmio to virtual devices
+//  handleguestmmio - route mmio to virtual devices
 
 bool Hypervisor::HandleGuestMMIO(uint64_t phys_addr, bool is_write,
                                    uint8_t size, uint32_t& value) {
@@ -991,7 +991,7 @@ bool Hypervisor::HandleGuestMMIO(uint64_t phys_addr, bool is_write,
     return VirtualDevices::HandleMMIO(phys_addr, is_write, size, value);
 }
 
-//  interrupt injection  -  inject interrupts/exceptions into guest
+//  interrupt injection - inject interrupts/exceptions into guest
 
 bool Hypervisor::InjectInterrupt(uint8_t vector) {
     if (!vcpu) return false;
@@ -1078,7 +1078,7 @@ void Hypervisor::CheckAndInjectPendingIRQs() {
     }
 }
 
-//  tickdevices  -  advance virtual device emulation
+//  tickdevices - advance virtual device emulation
 
 void Hypervisor::TickDevices() {
     stats.tick_count++;
@@ -1122,7 +1122,7 @@ bool Hypervisor::HasSerialOutput() {
     return serial.HasOutput();
 }
 
-//  serial command bridge  -  host → guest via virtual com1
+//  serial command bridge - host → guest via virtual com1
 
 void Hypervisor::SendSerialCommand(const char* cmd) {
     if (!cmd || vm_state != VM_STATE_RUNNING) return;
@@ -1163,7 +1163,7 @@ int Hypervisor::DrainSerialOutput(char* buf, int max, int max_cycles) {
     return serial.ReadOutput(buf, max);
 }
 
-//  bootalpine  -  one-call boot of embedded alpine linux guest vm
+//  bootalpine - one-call boot of embedded alpine linux guest vm
 
 bool Hypervisor::BootAlpine() {
     if (!alpine_data_available()) {
@@ -1209,7 +1209,7 @@ bool Hypervisor::BootAlpine() {
         return false;
     }
 
-    SerialLogger::Log("Hypervisor: Alpine VM configured  -  entering run loop\r\n");
+    SerialLogger::Log("Hypervisor: Alpine VM configured - entering run loop\r\n");
     VMState final_state = RunVM(0); // run until halt/crash
 
     SerialLogger::Log("Hypervisor: Alpine VM exited with state ");
@@ -1219,7 +1219,7 @@ bool Hypervisor::BootAlpine() {
     return (final_state != VM_STATE_CRASHED);
 }
 
-//  bootalpinewithextraction  -  boot alpine, capture boot log, extract drivers
+//  bootalpinewithextraction - boot alpine, capture boot log, extract drivers
 
 bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
     if (!alpine_data_available()) {
@@ -1239,7 +1239,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
         DestroyVM();
     }
     Init();
-    // re-read hw_available  -  init() detects svm/vt-x and may update it
+    // re-read hw_available - init() detects svm/vt-x and may update it
     hw_available = VMM::IsSupported();
 
     if (hw_available) {
@@ -1322,9 +1322,9 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
                     }
 
                     // under whpx, vm entry failure (crashed state) means
-                    // nested virt truly isn't supported  -  fall back cleanly
+                    // nested virt truly isn't supported - fall back cleanly
                     if (st == VM_STATE_CRASHED && VMM::IsWHPX()) {
-                        SerialLogger::Log("Hypervisor: WHPX VM entry failed  -  "
+                        SerialLogger::Log("Hypervisor: WHPX VM entry failed - "
                                          "nested virt not supported by host\r\n");
                         hw_ok = false;
                     }
@@ -1333,7 +1333,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
         }
 
         if (hw_ok) {
-            // hardware boot succeeded  -  extract drivers and return
+            // hardware boot succeeded - extract drivers and return
             int drv_count = ExtractAlpineDrivers();
             _auto_setup_alpine_userland();
             SerialLogger::Log("Hypervisor: Extracted ");
@@ -1342,7 +1342,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
             return true;
         }
 
-        SerialLogger::Log("Hypervisor: HW Alpine boot failed  -  state=");
+        SerialLogger::Log("Hypervisor: HW Alpine boot failed - state=");
         SerialLogger::LogDec((int)vm_state);
         SerialLogger::Log(", exits=");
         SerialLogger::LogDec((int)stats.total_exits);
@@ -1363,7 +1363,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
     } else {
         SerialLogger::Log("Hypervisor: No HW virt available");
         if (VMM::IsWHPX()) {
-            SerialLogger::Log("  -  WHPX doesn't support nested virt\r\n");
+            SerialLogger::Log(" - WHPX doesn't support nested virt\r\n");
             SerialLogger::Log("Hypervisor: QEMU's WHPX accelerator cannot emulate vmrun/vmlaunch.\r\n");
             SerialLogger::Log("Hypervisor: To get real HW Alpine, use KVM (Linux) or bare metal.\r\n");
         } else {
@@ -1374,7 +1374,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
         // write diagnostic into boot log
         if (alpine_boot_log_len == 0) {
             const char* diag =
-                "[kurono] Alpine boot failed  -  no hardware virtualization.\n"
+                "[kurono] Alpine boot failed - no hardware virtualization.\n"
                 "[kurono] VT-x/AMD-V was not detected on this system.\n"
                 "[kurono] Enable Intel VT-x or AMD-V in BIOS settings,\n"
                 "[kurono] or run Kurono on hardware that supports it.\n";
@@ -1388,11 +1388,11 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
         }
     }
 
-    // no software fallback  -  honest failure beats fake success
+    // no software fallback - honest failure beats fake success
     return false;
 }
 
-//  bootdebianwithextraction  -  boot embedded debian ext4 rootfs guest
+//  bootdebianwithextraction - boot embedded debian ext4 rootfs guest
 
 bool Hypervisor::BootDebianWithExtraction(uint32_t max_boot_exits) {
     if (!alpine_kernel_data() || alpine_kernel_size() == 0) {
@@ -1421,7 +1421,7 @@ bool Hypervisor::BootDebianWithExtraction(uint32_t max_boot_exits) {
         SerialLogger::Log("Hypervisor: Debian requires hardware virtualization\r\n");
         // provide diagnostic boot log
         const char* diag =
-            "[kurono] Debian boot failed  -  no hardware virtualization.\n"
+            "[kurono] Debian boot failed - no hardware virtualization.\n"
             "[kurono] VT-x/AMD-V was not detected on this system.\n"
             "[kurono] Enable Intel VT-x or AMD-V in BIOS, or run\n"
             "[kurono] Kurono on hardware that supports it.\n";
@@ -1516,14 +1516,14 @@ bool Hypervisor::BootDebianWithExtraction(uint32_t max_boot_exits) {
     return false;
 }
 
-// bootalpinesoftware  -  removed
+// bootalpinesoftware - removed
 // all stubs removed. alpine requires real hardware virtualization (amd-v / vt-x).
 // honest failure > fake success.
 
-// softwarealpineexec  -  removed
+// softwarealpineexec - removed
 // no fake command responses. alpine runs real or not at all.
 
-//  extractalpinedrivers  -  parse boot log + query /proc /sys for drivers
+//  extractalpinedrivers - parse boot log + query /proc /sys for drivers
 //
 //  strategy:
 //    1. parse the kernel boot log for "driver loaded" / module messages
@@ -1809,7 +1809,7 @@ int Hypervisor::ExtractAlpineDrivers() {
             drv.description[ni] = 0;
 
             drv.version[0] = 'A'; drv.version[1] = 'L'; drv.version[2] = 'P';
-            drv.version[3] = 0; // "alp"  -  alpine-sourced
+            drv.version[3] = 0; // "alp" - alpine-sourced
             drv.license[0] = 'G'; drv.license[1] = 'P'; drv.license[2] = 'L';
             drv.license[3] = 0;
             drv.category = boot_drivers[d].cat;
@@ -1885,7 +1885,7 @@ int Hypervisor::ExtractAlpineDrivers() {
         if (n > 0) {
             proc_buf[n] = 0;
             // parse: "character devices:\n  1 mem\n  4 tty\n..."
-            // we just log this for now  -  the boot log parse above covers most
+            // we just log this for now - the boot log parse above covers most
             SerialLogger::Log("Hypervisor: /proc/devices (");
             SerialLogger::LogDec(n);
             SerialLogger::Log(" bytes):\r\n");
@@ -1918,7 +1918,7 @@ int Hypervisor::ExtractAlpineDrivers() {
     return registered;
 }
 
-//  runalpinecycles  -  incremental alpine vm execution
+//  runalpinecycles - incremental alpine vm execution
 
 VMState Hypervisor::RunAlpineCycles(uint32_t max_exits) {
     if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) {
@@ -1943,7 +1943,7 @@ VMState Hypervisor::RunAlpineCycles(uint32_t max_exits) {
                 alpine_boot_log[alpine_boot_log_len] = 0;
             }
         } else {
-            // boot log full  -  just drain and discard
+            // boot log full - just drain and discard
             char discard[256];
             serial.ReadOutput(discard, (int)sizeof(discard) - 1);
         }
@@ -1982,7 +1982,7 @@ VMState Hypervisor::RunDebianCycles(uint32_t max_exits) {
     return vm_state;
 }
 
-//  alpineexec  -  send command to guest, run cycles, capture output
+//  alpineexec - send command to guest, run cycles, capture output
 
 int Hypervisor::AlpineExec(const char* cmd, char* out_buf, int out_max) {
     if (!cmd || out_max <= 0) return 0;
@@ -2027,7 +2027,7 @@ int Hypervisor::AlpineExec(const char* cmd, char* out_buf, int out_max) {
                 if ((i & 127u) == 0) KuronoShell::PumpUI();
             }
             if (!serial.HasOutput()) break; // cmd finished
-            // still output coming  -  read more
+            // still output coming - read more
             int n = serial.ReadOutput(out_buf + total_read, out_max - total_read - 1);
             if (n > 0) total_read += n;
         }

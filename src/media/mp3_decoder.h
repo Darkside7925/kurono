@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  mp3 decoder (mpeg-1 layer iii)
+//  kurono os - mp3 decoder (mpeg-1 layer iii)
 //  real frame parser with huffman decoding, imdct, subband synthesis
 //  outputs signed 16-bit pcm for audio::play()
 #include "../kernel/types.h"

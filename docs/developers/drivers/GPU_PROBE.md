@@ -61,9 +61,9 @@ The GPU probe can identify hardware but cannot perform a full modesetting (KMS-s
 
 ## 7. Related files
 
-- `src/drivers/nvidia_gpu.cpp`  -  NVIDIA support
-- `src/drivers/amd_gpu.cpp`  -  AMD support
-- `src/drivers/intel_gpu.cpp`  -  Intel support
-- `src/drivers/virtio_gpu.cpp`  -  VirtIO GPU path
-- `src/drivers/bga.cpp`  -  BGA fallback for QEMU
-- `src/drivers/display_mgr.cpp`  -  backend selection based on probe results
+- `src/drivers/nvidia_gpu.cpp` - NVIDIA support
+- `src/drivers/amd_gpu.cpp` - AMD support
+- `src/drivers/intel_gpu.cpp` - Intel support
+- `src/drivers/virtio_gpu.cpp` - VirtIO GPU path
+- `src/drivers/bga.cpp` - BGA fallback for QEMU
+- `src/drivers/display_mgr.cpp` - backend selection based on probe results

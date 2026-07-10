@@ -31,6 +31,6 @@ Basic SGR sequences (colors, bold, reset) are supported. The terminal handles es
 
 ## 6. Related files
 
-- `src/shell/shell.cpp`  -  shell backend the terminal talks to
-- `src/ui/font.cpp`  -  character rendering
-- `src/ui/gui.cpp`  -  window background and scroll bar
+- `src/shell/shell.cpp` - shell backend the terminal talks to
+- `src/ui/font.cpp` - character rendering
+- `src/ui/gui.cpp` - window background and scroll bar

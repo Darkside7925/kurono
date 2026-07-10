@@ -1,4 +1,4 @@
-//  kurono os  -  kj (kurono javascript) interpreter implementation. (satoru)
+//  kurono os - kj (kurono javascript) interpreter implementation. (satoru)
 #include "kj.h"
 #include "../kernel/heap.h"
 #include "../fs/kvfs.h"
@@ -427,8 +427,8 @@ static Node* parse_assign(Parser& ps);
 static Node* parse_stmt(Parser& ps);
 static Node* parse_block(Parser& ps);
 
-// recursive-descent depth guard: deeply nested input  -  ((((...)))), 1+1+1+...,
-// !!!!x, nested if/while  -  recurses several c++ frames per level with no natural
+// recursive-descent depth guard: deeply nested input - ((((...)))), 1+1+1+...,
+// !!!!x, nested if/while - recurses several c++ frames per level with no natural
 // bound and would overflow the 64kb kernel stack. an raii guard bumps a file-
 // local counter on entry (safe under the single-threaded cooperative scheduler:
 // one parse runs to completion before the next) and the recursive entry points
@@ -1020,8 +1020,8 @@ static Value eval_binary(Interp& it, int op, const Value& l, const Value& r){
     }
 }
 
-// runtime (eval/exec) depth guard: a deeply nested AST  -  ((((...)))), 1+1+1+...,
-// !!!!x, nested if/while  -  drives eval()/exec() recursively one frame per level.
+// runtime (eval/exec) depth guard: a deeply nested AST - ((((...)))), 1+1+1+...,
+// !!!!x, nested if/while - drives eval()/exec() recursively one frame per level.
 // the parser now caps AST nesting, but this is the matching defense-in-depth for
 // the walk so a hand-built or pathological tree can't overflow the 64kb stack
 // either. one shared counter spans eval+exec (they co-recurse); the recursive
@@ -1159,7 +1159,7 @@ static Value eval(Interp& it, Node* n, Scope* sc){
                 for (int i=0;i<argc;i++) args[i]=eval(it,n->kids[i+1],sc); }
             Value out=mk_undef();
             bool done=false;
-            // member call: obj.method(...)  -  route builtins + array .push, else user fn. (satoru)
+            // member call: obj.method(...) - route builtins + array .push, else user fn. (satoru)
             if (callee->t==N_MEMBER && !callee->computed){
                 Node* objn=callee->kids[0];
                 const char* method=callee->kids[1]->str;
@@ -1192,7 +1192,7 @@ static Value eval(Interp& it, Node* n, Scope* sc){
                     v_free(recv);
                 }
             } else {
-                // plain call: f(...)  -  global builtin or user function. (satoru)
+                // plain call: f(...) - global builtin or user function. (satoru)
                 if (callee->t==N_IDENT){
                     bool handled=false;
                     done=call_builtin_global(it, callee->str, args, argc, out, handled);
@@ -1510,7 +1510,7 @@ int KJ::cmd_kj(void* sh, int argc, const char** argv, char* out, int mx){
     (void)sh;
     if (argc < 2){
         const char* banner =
-            "KJ (Kurono JavaScript)  -  a freestanding JS-subset interpreter.\n"
+            "KJ (Kurono JavaScript) - a freestanding JS-subset interpreter.\n"
             "Usage: kj <file.js>            run a script from the filesystem\n"
             "       kj -c \"<code>\"          run inline source\n"
             "Bindings: console.log, kss.set/get/transition/keyframes/play, ui.notify, Math.*\n";

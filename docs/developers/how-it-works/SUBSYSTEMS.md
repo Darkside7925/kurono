@@ -255,7 +255,7 @@ Folder: `src/security`
 Purpose: privilege management and escalation policy.
 
 Files: `supr.*` (the SUPR privilege engine, roles, auth policy, the `supr <cmd>`
-sudo-style reroute) and `ksa.*` (KSA  -  hypervisor-backed authorization prompts in
+sudo-style reroute) and `ksa.*` (KSA - hypervisor-backed authorization prompts in
 an EPT-isolated region; see `security/KSA.md`).
 
 ## 14. Packages
@@ -272,8 +272,8 @@ Folders: `src/kcl` and `src/apps`
 
 Purpose: in-OS scripting languages.
 
-- `kcl/kcl.*`  -  KCL (Kurono Command Language), a tree-walking interpreter.
-- `apps/kj.*`  -  KJ (Kurono JavaScript), a freestanding JS-subset interpreter
+- `kcl/kcl.*` - KCL (Kurono Command Language), a tree-walking interpreter.
+- `apps/kj.*` - KJ (Kurono JavaScript), a freestanding JS-subset interpreter
   exposed as the `kj` / `node` commands, with `kss`/`ui` host bindings.
 
 ## 16. Process scheduling

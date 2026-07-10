@@ -4,18 +4,18 @@
 
 ## 1. What it does
 
-The graphics driver owns the framebuffer pointer and exposes a set of drawing operations that the entire UI layer calls. No UI code writes directly to the framebuffer  -  it goes through the graphics driver.
+The graphics driver owns the framebuffer pointer and exposes a set of drawing operations that the entire UI layer calls. No UI code writes directly to the framebuffer - it goes through the graphics driver.
 
 Provided operations (representative list):
 
-- `PutPixel(x, y, color)`  -  write a single pixel
-- `FillRect(x, y, w, h, color)`  -  solid rectangle
-- `DrawRect(x, y, w, h, color)`  -  rectangle outline
-- `DrawLine(x0, y0, x1, y1, color)`  -  line
-- `BlitRect(dst_x, dst_y, src, src_x, src_y, w, h)`  -  blit from a pixel buffer
-- `CopyToScreen(buf, x, y, w, h)`  -  copy a region to the live framebuffer
-- `SwapBuffers()`  -  swap back buffer to framebuffer with NT-store path
-- `BeginFrame()` / `EndFrame()`  -  frame pacing and FPS tracking
+- `PutPixel(x, y, color)` - write a single pixel
+- `FillRect(x, y, w, h, color)` - solid rectangle
+- `DrawRect(x, y, w, h, color)` - rectangle outline
+- `DrawLine(x0, y0, x1, y1, color)` - line
+- `BlitRect(dst_x, dst_y, src, src_x, src_y, w, h)` - blit from a pixel buffer
+- `CopyToScreen(buf, x, y, w, h)` - copy a region to the live framebuffer
+- `SwapBuffers()` - swap back buffer to framebuffer with NT-store path
+- `BeginFrame()` / `EndFrame()` - frame pacing and FPS tracking
 
 ## 2. Color format
 
@@ -51,7 +51,7 @@ Blend modes (alpha, additive, multiply) add overhead. The desktop uses opaque re
 
 ## 7. Related files
 
-- `src/drivers/display_mgr.cpp`  -  mode selection and framebuffer pointer setup
-- `src/drivers/gpu_probe.cpp`  -  GPU detection for backend selection
-- `src/ui/gui.cpp`  -  uses graphics primitives exclusively
-- `src/ui/desktop.cpp`  -  uses blit path for wallpaper
+- `src/drivers/display_mgr.cpp` - mode selection and framebuffer pointer setup
+- `src/drivers/gpu_probe.cpp` - GPU detection for backend selection
+- `src/ui/gui.cpp` - uses graphics primitives exclusively
+- `src/ui/desktop.cpp` - uses blit path for wallpaper

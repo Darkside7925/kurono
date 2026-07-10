@@ -1,4 +1,4 @@
-//  kurono os  -  pci device passthrough orchestrator (path b)
+//  kurono os - pci device passthrough orchestrator (path b)
 //  see pci_passthrough.h for design.
 #include "pci_passthrough.h"
 #include "vpci.h"
@@ -29,7 +29,7 @@ bool PCIPassthrough::BarRead(VPCIDevice* dev, int bar, uint32_t off,
         if (bar < 0 || bar >= 6) return false;
         uint64_t host_phys = e.bar_host_phys[bar];
         if (host_phys == 0) { value = 0xFFFFFFFFu; return true; }
-        // mmio is identity-mapped in kurono's address space  -  we read
+        // mmio is identity-mapped in kurono's address space - we read
         // directly.  Note: this fallback path runs only when the guest
         // accesses a bar offset that wasn't ept-mapped (e.g. during
         // initial size probe).
@@ -79,7 +79,7 @@ bool PCIPassthrough::RegisterOnVPCI(PCIPassthroughEntry* e,
     VPCI::Cfg16(&d, PCI_SUBSYS_VEND, vendor);
     VPCI::Cfg16(&d, PCI_SUBSYS_ID,   device);
 
-    // mirror bar sizes  -  vpci will assign new guest-phys bases inside
+    // mirror bar sizes - vpci will assign new guest-phys bases inside
     // its mmio window.  on a future EPTManager::MapMMIO call we'll
     // map host_phys → those guest bases so the guest's loads bypass
     // vm-exits entirely.
@@ -119,7 +119,7 @@ bool PCIPassthrough::RegisterOnVPCI(PCIPassthroughEntry* e,
 // ----------------------------------------------------------------- nvidia
 bool PCIPassthrough::HandoffNvidiaGPU() {
     if (!IOMMU::IsSupported()) {
-        SerialLogger::Log("PCIPassthrough: IOMMU not available  -  refusing nvidia handoff\r\n");
+        SerialLogger::Log("PCIPassthrough: IOMMU not available - refusing nvidia handoff\r\n");
         return false;
     }
     if (!NvidiaGPU::IsDetected()) {
@@ -151,7 +151,7 @@ bool PCIPassthrough::HandoffNvidiaGPU() {
     e->bar_size[0]      = (uint32_t)info.bar0_size;
     e->bar_host_phys[1] = info.bar1;
     e->bar_size[1]      = (uint32_t)info.bar1_size;
-    // legacy intx line  -  read from real device
+    // legacy intx line - read from real device
     uint32_t intl = NvidiaGPU::PciRead(info.bus, info.device, info.function, 0x3C);
     e->host_irq = (uint8_t)(intl & 0xFF);
 
@@ -171,7 +171,7 @@ bool PCIPassthrough::HandoffNvidiaGPU() {
 // ----------------------------------------------------------------- amd
 bool PCIPassthrough::HandoffAmdGPU() {
     if (!IOMMU::IsSupported()) {
-        SerialLogger::Log("PCIPassthrough: IOMMU not available  -  refusing amd handoff\r\n");
+        SerialLogger::Log("PCIPassthrough: IOMMU not available - refusing amd handoff\r\n");
         return false;
     }
     if (!AmdGPU::IsAvailable()) {

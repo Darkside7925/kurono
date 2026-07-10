@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  package manager (kpkg)
+//  kurono os - package manager (kpkg)
 
 #define PKG_MAX_PACKAGES  64
 #define PKG_MAX_NAME      32

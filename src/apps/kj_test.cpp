@@ -1,4 +1,4 @@
-//  kurono os  -  kj self-test harness
+//  kurono os - kj self-test harness
 //
 //  scripts exercising every major kj feature + the kss host bindings. each test
 //  runs the source through KJ::Execute and compares the captured output to an

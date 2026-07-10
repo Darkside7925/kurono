@@ -188,7 +188,7 @@ bool vbox_guest_info_reported = false;
 // Last raw absolute coordinates the host reported (in 0..0xFFFF VMMDev space).
 // We use 0xFFFFFFFF as "no prior sample" sentinel so we can ignore the host's
 // initial 0,0 read-back before the user has actually moved their pointer into
-// the VM window  -  without this the cursor warps to top-left whenever absolute
+// the VM window - without this the cursor warps to top-left whenever absolute
 // mode flips active.
 uint32_t vbox_last_raw_x = 0xFFFFFFFFu;
 uint32_t vbox_last_raw_y = 0xFFFFFFFFu;
@@ -781,7 +781,7 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
             ClearAt(lastx, lasty);
             DrawAt(mx, my);
         }
-        // Coalesce  -  multiple absolute samples per Poll() tick collapse into a
+        // Coalesce - multiple absolute samples per Poll() tick collapse into a
         // single motion event holding cumulative deltas + the final position.
         pending_motion_dx += rel_dx;
         pending_motion_dy += rel_dy;
@@ -822,7 +822,7 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
 }
 
 // USB HID boot-protocol mouse report decode (satoru).
-//   byte0: buttons  -  bit0 left, bit1 right, bit2 middle
+//   byte0: buttons - bit0 left, bit1 right, bit2 middle
 //   byte1: dx  (signed int8, +x = right)
 //   byte2: dy  (signed int8, +y = down per HID convention)
 //   byte3: wheel (signed int8, optional; +z = up)
@@ -1270,14 +1270,14 @@ const Mouse::PerformanceStats& Mouse::GetPerformanceStats() {
 
 void Mouse::Poll() {
     if (PollVirtualBoxAbsolute()) {
-        FlushPendingMotion();   // deliver coalesced motion/wheel  -  see below (satoru)
+        FlushPendingMotion();   // deliver coalesced motion/wheel - see below (satoru)
         FlushOutput();
         return;
     }
     if (PollVMwareAbsolute()) {
         // the vmware/vbox absolute paths previously returned here WITHOUT the
         // end-of-Poll motion flush, so pure cursor motion (no button edge)
-        // never enqueued an event  -  mx/my updated but the gui saw nothing, so
+        // never enqueued an event - mx/my updated but the gui saw nothing, so
         // drag/hover/move-tracking were dead under vmware. flush here too. (satoru)
         FlushPendingMotion();
         FlushOutput();
@@ -1347,14 +1347,14 @@ void Mouse::Poll() {
             // Reconstruct the signed delta as (raw_byte | sign_extension):
             //   delta = pkt[N] - ((pkt[0] << k) & 0x100)
             // Without this, fast motion (|delta| > 127) wraps into the opposite
-            // direction and warps the cursor into a corner  -  exactly the bug
+            // direction and warps the cursor into a corner - exactly the bug
             // we hit when VBox synthesises a big delta on capture.
             int dx_full = 0;
             int dy_full = 0;
             int8_t dz = 0;
             if (!abs_mode && (packet_len == 3 || packet_len == 4)) {
                 if (b & 0x40) {
-                    // X overflow  -  host saw a delta too big to encode. Drop the
+                    // X overflow - host saw a delta too big to encode. Drop the
                     // axis rather than guess; otherwise we'd jam the cursor at
                     // an edge.
                     dx_full = 0;

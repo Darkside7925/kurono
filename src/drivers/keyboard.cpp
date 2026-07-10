@@ -459,7 +459,7 @@ void Keyboard::ProcessUSBReport(uint8_t device_id, const uint8_t* report, size_t
 }
 
 void Keyboard::Poll() {
-    // copy current to prev BEFORE we mutate keys[] from this drain  -  that way
+    // copy current to prev BEFORE we mutate keys[] from this drain - that way
     // IsKeyPressed() reflects the edges that landed during this exact tick.
     for(int i=0; i<256; i++) prev_keys[i] = keys[i];
 
@@ -608,7 +608,7 @@ void Keyboard::HandleScancode(uint8_t sc) {
         return;
     }
 
-    // Single-byte controller responses  -  swallow without touching state.
+    // Single-byte controller responses - swallow without touching state.
     if (sc == KB_RESP_ACK || sc == KB_RESP_NAK ||
         sc == KB_RESP_BAT_OK || sc == KB_RESP_BAT_FAIL ||
         sc == KB_RESP_ECHO) {
@@ -646,7 +646,7 @@ void Keyboard::HandleScancode(uint8_t sc) {
         key = ScancodeToKey(code, e0_prefix);
         if (key == KEY_UNKNOWN) {
             // Sticky fallback: some BIOSes pass set 2 through despite our
-            // translation flag  -  try the alternate table.
+            // translation flag - try the alternate table.
             Key alt = ScancodeSet2ToKey(sc, e0_prefix);
             if (alt != KEY_UNKNOWN) {
                 // Set 2 has no high-bit break; demote and let set 2 path own it.

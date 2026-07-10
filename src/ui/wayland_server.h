@@ -47,7 +47,7 @@ namespace WaylandServer {
     // a single KernelInject call.
     static const int WL_TX_SCRATCH   = 4096;
 
-    // Pending frame callbacks per client  -  drained on vsync.
+    // Pending frame callbacks per client - drained on vsync.
     static const int WL_MAX_FRAME_CB = 64;
 
     enum InterfaceId : uint16_t {
@@ -112,6 +112,18 @@ namespace WaylandServer {
         int32_t  attach_x, attach_y;
         uint8_t  surf_alpha;
         bool     mapped;         // true once bridged to a wm window. (satoru)
+        // per-surface SHADOW buffer: server-side accumulation of the client's
+        // committed pixels. damage-incremental clients (firefox SW-WR) attach a
+        // FRESH mostly-zero buffer each frame and paint only the damaged strip
+        // into it; blitting the raw attached buffer therefore wipes the window
+        // with zeros (the black-firefox bug). on commit the damaged region is
+        // copied client-buffer -> shadow, and every blit reads the SHADOW, so a
+        // full repaint (wm render thunk / damage-less commit) always shows the
+        // accumulated picture. raw client pixel format, stride = shadow_w*4. (satoru)
+        uint8_t* shadow;
+        int32_t  shadow_w, shadow_h;
+        uint32_t shadow_fmt;     // wl_shm format of the shadow pixels (satoru)
+        bool     shadow_filled;  // first full copy done - partial copies valid after (satoru)
     };
 
     struct Client {
@@ -128,7 +140,7 @@ namespace WaylandServer {
         int      frame_cb_head;
         int      frame_cb_tail;
         uint32_t serial_next;
-        bool     fatal;          // protocol error  -  drop on next dispatch
+        bool     fatal;          // protocol error - drop on next dispatch
 
         // input: ids of the wl_pointer / wl_keyboard resources this client
         // created via wl_seat.get_pointer / get_keyboard (0 = none). a
@@ -146,7 +158,7 @@ namespace WaylandServer {
     // Listening socket descriptor for /system/run/user/1000/wayland-0.
     int  ListenSd();
 
-    // Per-frame helpers  -  called by the compositor render loop.
+    // Per-frame helpers - called by the compositor render loop.
     void DispatchPendingFrames();
     void DamageAll();
 

@@ -28,6 +28,6 @@ Time is initialized in `kurono_kernel.cpp` after HAL and the PIT are ready. The 
 
 ## 5. Related files
 
-- `src/drivers/timer.cpp`  -  PIT driver that feeds ticks into the time module
-- `src/drivers/rtc.cpp`  -  RTC driver used for wall clock seeding
-- `src/kernel/kurono_kernel.cpp`  -  initialization order
+- `src/drivers/timer.cpp` - PIT driver that feeds ticks into the time module
+- `src/drivers/rtc.cpp` - RTC driver used for wall clock seeding
+- `src/kernel/kurono_kernel.cpp` - initialization order

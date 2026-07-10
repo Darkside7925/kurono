@@ -7,7 +7,7 @@
 //  well-known fixed physical addresses of the identity-mapped kernel layout.
 //  the kernel is linked at and runs from physical 0x100000 (boot/kurono_linker.ld)
 //  with all physical ram identity-mapped (phys == virt), so there is no separate
-//  kernel_virt_base or fixed kheap_start to assert against  -  the phase-2 heap base
+//  kernel_virt_base or fixed kheap_start to assert against - the phase-2 heap base
 //  is whatever pmm hands out at runtime. these constants name the addresses that
 //  are otherwise scattered as magic literals and let the static_asserts below
 //  guard the heap floor against the reserved text/mmio windows. (satoru)
@@ -31,7 +31,7 @@ static_assert(VGA_TEXT_PHYS < LAPIC_PHYS,
               "vga text buffer must lie below the local apic window (satoru)");
 static_assert(PAGE_SIZE == 4096ULL, "kernel layout assumes 4 kb pages (satoru)");
 
-//  memory manager  -  unified interface to pmm, vmm, and kernel heap
+//  memory manager - unified interface to pmm, vmm, and kernel heap
 //  backward-compatible api: init(), allocpage(), freepage(), gettotalmemory()
 
 class MemoryManager {
@@ -48,7 +48,7 @@ public:
     // legacy no-arg init for backward compatibility
     static void Init() {
         KernelHeap::Init();
-        // pmm/vmm not initialized without multiboot info  -  caller should
+        // pmm/vmm not initialized without multiboot info - caller should
         // use init(mb_addr) instead.
     }
 

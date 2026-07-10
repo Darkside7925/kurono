@@ -196,7 +196,7 @@ namespace TunTap {
         // Drain each device's tx_ring with a per-tick budget so a busy
         // VPN daemon can't starve the rest of the kernel main loop. If
         // the downstream NIC refuses a packet we leave it queued (head
-        // not advanced) so the next Tick retries  -  this is what gives
+        // not advanced) so the next Tick retries - this is what gives
         // Write() real backpressure: tx_ring fills up and Write() then
         // returns -1 instead of silently dropping.
         const int kTickBudget = TUNTAP_RING_SLOTS;
@@ -209,7 +209,7 @@ namespace TunTap {
                 if (!Network::SendPacket("eth0", p.data, p.len)) {
                     // Underlying NIC is congested. Stop draining; the
                     // queued packet stays in the ring and Write() will
-                    // start failing as the ring fills  -  true backpressure.
+                    // start failing as the ring fills - true backpressure.
                     break;
                 }
                 d.tx_tail++;

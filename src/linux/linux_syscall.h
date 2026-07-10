@@ -1,10 +1,10 @@
 #pragma once
-//  kurono os  -  linux syscall abi translation layer
+//  kurono os - linux syscall abi translation layer
 //  translates linux syscalls into kurono kernel operations, enabling
 //  unmodified linux elf binaries to run inside kurono os.
 
 #include "../kernel/types.h"
-#include "../proc/smp.h"        // SMP_MAX_CPUS  -  current_proc is per-cpu (smp 3d) (satoru)
+#include "../proc/smp.h"        // SMP_MAX_CPUS - current_proc is per-cpu (smp 3d) (satoru)
 
 struct InterruptFrame;
 struct Process;
@@ -150,7 +150,7 @@ struct Process;
 #define LSYS_MEMBARRIER        556
 #define LSYS_RSEQ              557
 
-// ── x86_64 ABI completeness build-out  -  internal IDs (satoru) ──────────────
+// ── x86_64 ABI completeness build-out - internal IDs (satoru) ──────────────
 // fresh 600+ block so these never collide with the i386-style numbers used as
 // dispatch keys above.  each is routed from the real x86_64 number in
 // linux_syscall_x64.cpp (kNrMap) and handled in Dispatch. (satoru)
@@ -258,7 +258,7 @@ struct Process;
 #define LSYS_PIDFD_SEND_SIG    701
 #define LSYS_GETPRIORITY_DONE  702
 
-// AF_UNIX socket family  -  internal IDs.  Dispatch also accepts the
+// AF_UNIX socket family - internal IDs.  Dispatch also accepts the
 // Linux x86_64 numbers (41..55) where they don't collide.
 #define LSYS_SOCKET            560
 #define LSYS_BIND              561
@@ -334,7 +334,7 @@ struct LinuxStat {
     uint32_t __unused5;
 } __attribute__((packed));
 
-// x86_64 `struct stat`  -  the layout an unmodified amd64 musl/glibc binary
+// x86_64 `struct stat` - the layout an unmodified amd64 musl/glibc binary
 // expects from stat/fstat/lstat/newfstatat.  This is NOT the i386 layout above:
 // fields are 64-bit, st_mode/uid/gid are 32-bit, and there is a __pad0 word
 // before st_rdev.  Verified field-for-field against
@@ -385,7 +385,7 @@ struct LinuxIovec {
     uint64_t iov_len;
 } __attribute__((packed));
 
-// statx() result block  -  Linux 5.x layout.
+// statx() result block - Linux 5.x layout.
 struct LinuxStatxTimestamp {
     int64_t  tv_sec;
     uint32_t tv_nsec;
@@ -446,16 +446,16 @@ enum LinuxFdType {
     LFD_PIPE,
     LFD_DEVNULL,
     LFD_PROC,        // /proc virtual files
-    LFD_SOCKET,      // AF_UNIX socket  -  backend_fd = UnixSocket sd
-    LFD_MEMFD,       // memfd_create  -  backend_fd = kvfs anon file fd
-    LFD_URING,       // io_uring instance  -  backend_fd = ring id (stub)
+    LFD_SOCKET,      // AF_UNIX socket - backend_fd = UnixSocket sd
+    LFD_MEMFD,       // memfd_create - backend_fd = kvfs anon file fd
+    LFD_URING,       // io_uring instance - backend_fd = ring id (stub)
     LFD_LANDLOCK,    // landlock ruleset (stub)
     LFD_FANOTIFY,    // fanotify group (stub)
-    LFD_EPOLL,       // epoll instance  -  backend_fd = epoll table slot (satoru)
-    LFD_EVENTFD,     // eventfd  -  backend_fd = eventfd table slot (satoru)
-    LFD_TIMERFD,     // timerfd  -  backend_fd = timerfd table slot (satoru)
-    LFD_SIGNALFD,    // signalfd  -  harmless stub, never fires (satoru)
-    LFD_INET,        // AF_INET tcp/udp  -  backend_fd = LinuxNetBridge slot (satoru)
+    LFD_EPOLL,       // epoll instance - backend_fd = epoll table slot (satoru)
+    LFD_EVENTFD,     // eventfd - backend_fd = eventfd table slot (satoru)
+    LFD_TIMERFD,     // timerfd - backend_fd = timerfd table slot (satoru)
+    LFD_SIGNALFD,    // signalfd - harmless stub, never fires (satoru)
+    LFD_INET,        // AF_INET tcp/udp - backend_fd = LinuxNetBridge slot (satoru)
 };
 
 // memfd seal bits live alongside the LinuxFd so fcntl can interrogate.
@@ -508,7 +508,7 @@ struct LinuxProcess {
     bool     is_session_leader;
 };
 
-//  linuxsyscall  -  the syscall handler
+//  linuxsyscall - the syscall handler
 
 #define LINUX_MAX_PROCS  256   // 64->256: firefox (multi-thread parent + fork
                                // server + 8 content procs w/ threads) exceeds 64
@@ -547,7 +547,7 @@ public:
                             uint64_t edx, uint64_t esi, uint64_t edi);
 
     // public so the x86_64 SYSCALL path can route mmap straight here with the
-    // full 64-bit file offset (a5/r9)  -  the i386 dispatch drops it, which breaks
+    // full 64-bit file offset (a5/r9) - the i386 dispatch drops it, which breaks
     // file-backed mmap of .so segments at non-zero offsets. (satoru)
     static int64_t sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                             uint32_t flags, int fd, uint64_t offset);
@@ -564,15 +564,15 @@ public:
                                  uintptr_t statbuf, int flags);
 
     // readlink resolution shared by the x86_64 readlink/readlinkat handlers.
-    // handles /proc/self/exe, /proc/self/fd/N, real kvfs symlinks, and  -  crucially
-    //  -  returns -EINVAL (not -ENOENT) for a path that EXISTS but is not a symlink,
+    // handles /proc/self/exe, /proc/self/fd/N, real kvfs symlinks, and - crucially
+    // - returns -EINVAL (not -ENOENT) for a path that EXISTS but is not a symlink,
     // because musl's realpath() walks each path component with readlink and treats
     // ENOENT as "path missing" (which aborts gecko's XRE_GetFileFromPath -> the
     // -profile path). writes up to bufsiz bytes (no nul); returns count or -errno.
     // (satoru)
     static int ReadlinkResolve(const char* path, char* buf, int bufsiz);
 
-    // readv (x86_64 nr 19)  -  the read counterpart of writev. there is no i386
+    // readv (x86_64 nr 19) - the read counterpart of writev. there is no i386
     // dispatch entry for it, so the SYSCALL fast path (linux_syscall_x64.cpp)
     // calls this directly; public for the same reason sys_mmap is. (satoru)
     static int32_t sys_readv(int fd, uintptr_t iov, uint64_t iovcnt);
@@ -591,7 +591,7 @@ public:
     static int  ReadConsoleOutput(char* buf, int max_len);
     static void ClearConsoleOutput();
 
-    // true when stdin has buffered, unread bytes  -  used by the poll/epoll
+    // true when stdin has buffered, unread bytes - used by the poll/epoll
     // readiness logic to report EPOLLIN on fd 0 (satoru)
     static bool StdinReadable();
 

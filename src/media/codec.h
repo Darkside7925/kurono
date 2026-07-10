@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  unified codec registry
+//  kurono os - unified codec registry
 //  central dispatch for audio/video codecs: wav, mp3, aac, flac, ogg,
 //  mp4 container, h.264 nal parser, avi container
 #include "../kernel/types.h"
@@ -122,7 +122,7 @@ struct FLACStreamInfo {
     bool valid;
 };
 
-//  codec registry  -  central api
+//  codec registry - central api
 class CodecRegistry {
 public:
     // initialize all codec decoders

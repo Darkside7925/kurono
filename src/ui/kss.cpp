@@ -1,4 +1,4 @@
-//  kurono os  -  kurono style sheet (kss): theme tokens + widget toolkit. (satoru)
+//  kurono os - kurono style sheet (kss): theme tokens + widget toolkit. (satoru)
 #include "kss.h"
 #include "../drivers/graphics.h"
 #include "font.h"
@@ -229,7 +229,7 @@ bool Active() {
         // seed (first sight of an id) sets from==to with no visible change, so it
         // must NOT keep the compositor repainting for dur_ms over nothing. a
         // color slot leaves its float pair at 0==0 and vice-versa, so this is
-        // true only when BOTH pairs are settled  -  exactly the no-motion case.
+        // true only when BOTH pairs are settled - exactly the no-motion case.
         // keeps idle cost unchanged when a window's titlebar tweens merely seed
         // (first appearance) instead of forcing ~140ms of needless repaint. (satoru)
         if (s->f_from != s->f_to || s->c_from != s->c_to) return true;
@@ -278,7 +278,7 @@ uint32_t Now() { return g_now; }
 // ── stylesheet layer ─────────────────────────────────────────────────────────
 namespace Sheet {
 
-// small freestanding string helpers  -  no libc. (satoru)
+// small freestanding string helpers - no libc. (satoru)
 static bool seq(const char* a, const char* b) {
     if (!a || !b) return false;
     while (*a && *b && *a == *b) { a++; b++; }

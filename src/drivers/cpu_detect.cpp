@@ -1,7 +1,7 @@
 #include "cpu_detect.h"
 #include "../drivers/serial.h"
 
-//  kurono os  -  cpu detection & feature identification
+//  kurono os - cpu detection & feature identification
 //  real cpuid-based processor identification
 
 CpuInfo CPUDetect::info;
@@ -208,7 +208,7 @@ void CPUDetect::DetectCache() {
     }
 }
 
-//  topology  -  core / thread counting
+//  topology - core / thread counting
 void CPUDetect::DetectTopology() {
     info.topology.physical_cores = 1;
     info.topology.logical_cores = 1;

@@ -1,4 +1,4 @@
-//  kurono os  -  Intel HD Audio backend (wraps drivers/hda.cpp)
+//  kurono os - Intel HD Audio backend (wraps drivers/hda.cpp)
 //
 //  Streams mixer periods into the HDA cyclic buffer through HDAudio's
 //  ring API.  The DMA engine runs continuously after StartStream(); we

@@ -1,4 +1,4 @@
-# ld-kurono  -  In-Kernel ELF64 Dynamic Linker
+# ld-kurono - In-Kernel ELF64 Dynamic Linker
 
 `src/linux/ld_kurono.cpp` / `ld_kurono.h` implement **ld-kurono**, a dynamic
 linker built directly into the kernel. There is no separate `ld.so` binary on
@@ -25,7 +25,7 @@ When the loader detects `PT_INTERP`, `ExecPIE` does the full dynamic bring-up:
    `/system/lib/kurono` → `/system/lib/x86_64-linux-gnu` → `/apps/lib` →
    `/system/local/lib` → `/home/user/.local/lib` (all resolving through the
    `/kurono` compat symlinks).
-   References to `ld-linux*` / `ld-kurono.so` are short-circuited  -  the linker
+   References to `ld-linux*` / `ld-kurono.so` are short-circuited - the linker
    *is* the kernel.
 3. Apply relocations (see §3), enforce `PT_GNU_RELRO`, set up **static TLS**, and
    build the SysV **auxv** stack frame.
@@ -45,7 +45,7 @@ The kernel then enters ring 3 with the correct user CR3, FS base, and stack.
 
 ## 3. Relocations
 
-The full x86-64 set  -  **24 relocation types handled** (distinct `case R_X86_64_*`
+The full x86-64 set - **24 relocation types handled** (distinct `case R_X86_64_*`
 arms in the reloc switch): `NONE`, `64`, `PC32`, `PC64`,
 `PLT32`, `GOTPCREL`, `GOTPCRELX`, `REX_GOTPCRELX`, `32`, `32S`, `GLOB_DAT`,
 `JUMP_SLOT`, `RELATIVE`, `IRELATIVE` (IFUNC resolvers), `COPY`, `TPOFF32/64`,
@@ -55,21 +55,21 @@ RELRO region is re-protected read-only (`PTE_USER | PTE_NX`).
 
 ## 4. TLS, vDSO, auxv, constructors
 
-- **Static TLS**  -  variant-2 layout, monotonic per-module offset assignment, with
+- **Static TLS** - variant-2 layout, monotonic per-module offset assignment, with
   `arch_prctl(ARCH_SET_FS)` wired through the syscall layer (the main-thread TLS +
   thread pointer are installed for dynamic PIEs; the user FS base is programmed in
   `UserspaceEnter`).
-- **vDSO**  -  a 4 KB ELF64 stub is synthesized (exporting `__vdso_clock_gettime`,
+- **vDSO** - a 4 KB ELF64 stub is synthesized (exporting `__vdso_clock_gettime`,
   `__vdso_gettimeofday`, `__vdso_time`, `__vdso_getcpu` as `syscall` trampolines)
   and can be mapped via `MapVDSO`. **Honest note:** as of commit `919820b` the
   linker deliberately does **not advertise** the synthesized vDSO
-  (`AT_SYSINFO_EHDR=0`)  -  musl falls back to direct `syscall`, which avoided a
+  (`AT_SYSINFO_EHDR=0`) - musl falls back to direct `syscall`, which avoided a
   bring-up issue. The stub code remains; the auxv just doesn't point at it.
-- **Auxv builder**  -  pushes `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_PAGESZ`,
+- **Auxv builder** - pushes `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`, `AT_PAGESZ`,
   `AT_BASE`, `AT_ENTRY`, `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`, `AT_SECURE`,
   `AT_RANDOM` (16 bytes of RDTSC entropy), `AT_HWCAP`/`AT_HWCAP2`,
   `AT_CLKTCK=100`, `AT_PLATFORM="x86_64"`, `AT_EXECFN`, `AT_SYSINFO_EHDR`.
-- **Constructors**  -  `DT_INIT` / `DT_INIT_ARRAY` run in dependency order via a
+- **Constructors** - `DT_INIT` / `DT_INIT_ARRAY` run in dependency order via a
   hand-emitted user-mode trampoline page that preserves the SysV `(argc, argv,
   envp)` registers between calls, then tail-jumps to the program entry.
 
@@ -83,11 +83,11 @@ serial and `/system/log/ldso.log`; `LD_PRELOAD` is honoured (dropped for
 setuid/setgid). An `r_debug` rendezvous + `_dl_debug_state` hook lets a future GDB
 attach rescan the loaded library list on each `Dlopen`/`Dlclose`.
 
-## 6. Verification  -  current honest state
+## 6. Verification - current honest state
 
 - **`dyntest`** (`kurono.dyntest` cmdline token, or the `dyntest` shell command) is
-  the first real exercise of the dynamic path: it loads `/usr/bin/dyntest`  -  a
-  musl PIE with `PT_INTERP`  -  through ld-kurono, recurses into
+  the first real exercise of the dynamic path: it loads `/usr/bin/dyntest` - a
+  musl PIE with `PT_INTERP` - through ld-kurono, recurses into
   `libc.musl-x86_64.so.1` from `/system/lib`, relocates, sets up TLS + auxv, and
   runs. The boot gate reports **`DYNTEST_END rc=0`** (also surfaced by
   `kurono.logcheck`), proving the dynamic-load + musl-libc resolution path.
@@ -99,12 +99,12 @@ attach rescan the loaded library list on each `Dlopen`/`Dlclose`.
   full `.so` dependency closure and loads + relocates `libxul` (130 MB+) at a
   multi-terabyte base, XPCOM plus Gecko's own application code run, and Firefox
   paints its tab strip / URL bar / navigation controls / menus through the
-  compositor's `wl_subsurface` path  -  **single-process** (e10s off), threads
+  compositor's `wl_subsurface` path - **single-process** (e10s off), threads
   dispatched across the secondary cores. The sub-4 GB user-pointer ABI cap that
   used to block a high PIE base is **lifted** (the syscall layer now spans the full
-  canonical 64-bit user range  -  see [LINUX_SYSCALL.md](LINUX_SYSCALL.md) §3). What
+  canonical 64-bit user range - see [LINUX_SYSCALL.md](LINUX_SYSCALL.md) §3). What
   remains for a **reliably rendered web page** is the socket thread's poll-wakeup
-  delivery and some render-timing flakiness  -  not the dynamic-loader path.
+  delivery and some render-timing flakiness - not the dynamic-loader path.
 
 ## 7. Limits (`ld_kurono.h`)
 
@@ -113,10 +113,10 @@ preloads.
 
 ## 8. Related files
 
-- `src/linux/ld_kurono.cpp` / `.h`  -  the linker (the `.h` header comment is the
+- `src/linux/ld_kurono.cpp` / `.h` - the linker (the `.h` header comment is the
   authoritative capability list)
-- `src/kernel/elf_loader.cpp`  -  `PT_INTERP` detection + handoff to `ExecPIE`
-- `src/linux/linux_syscall.cpp`  -  `execve`, `mmap` (file-backed), `arch_prctl`,
+- `src/kernel/elf_loader.cpp` - `PT_INTERP` detection + handoff to `ExecPIE`
+- `src/linux/linux_syscall.cpp` - `execve`, `mmap` (file-backed), `arch_prctl`,
   path translation to the interpreter name
-- `src/kernel/userspace.cpp`  -  `UserspaceEnter` (programs the user FS base)
-- `src/kernel/kurono_kernel.cpp`  -  the `kurono.dyntest` boot gate
+- `src/kernel/userspace.cpp` - `UserspaceEnter` (programs the user FS base)
+- `src/kernel/kurono_kernel.cpp` - the `kurono.dyntest` boot gate

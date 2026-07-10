@@ -1,4 +1,4 @@
-//  kurono os  -  virtual ide/ata disk controller emulation
+//  kurono os - virtual ide/ata disk controller emulation
 //  emulates a primary ide controller with a single disk (master).
 //  supports pio mode transfers, identify device, read/write sectors.
 //  backed by a ram buffer as virtual disk image.
@@ -89,7 +89,7 @@ struct ATAIdentify {
                const char* model);
 };
 
-//  virtualdisk  -  full ide/ata controller with ram-backed storage
+//  virtualdisk - full ide/ata controller with ram-backed storage
 class VirtualDisk {
 public:
     void Init(uint32_t disk_size_bytes);

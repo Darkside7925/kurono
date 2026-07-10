@@ -315,7 +315,7 @@ void DisplayController::WaitVSync() {
 
     // input status register 1 (0x3da/color). bit 3 = vertical retrace.
     // Modern EFI/non-VGA GPUs do not wire 0x3da; the port reads 0xff or
-    // 0x00 in those cases. We do a quick probe and bail out  -  falling back
+    // 0x00 in those cases. We do a quick probe and bail out - falling back
     // to the caller's frame-pacing yield path is far better than burning
     // a million cycles in a tight loop on real hardware.
     static bool vsync_dead = false;
@@ -359,7 +359,7 @@ bool DisplayController::GetVbeInfo() {
     // transferring control.  simulating vbe info here would cause
     // enumeratemodes() to dereference modes_ptr=0, reading garbage from
     // the ivt at physical address 0.  return false to indicate vbe is
-    // not directly available  -  the kernel already has the framebuffer
+    // not directly available - the kernel already has the framebuffer
     // from multiboot info.
     return false;
 }

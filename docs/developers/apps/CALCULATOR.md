@@ -22,5 +22,5 @@ Button clicks are hit-tested against the button grid. Keyboard digits and operat
 
 ## 4. Related files
 
-- `src/ui/gui.cpp`  -  button rendering
-- `src/ui/desktop.cpp`  -  `LaunchCalculator()` entry point
+- `src/ui/gui.cpp` - button rendering
+- `src/ui/desktop.cpp` - `LaunchCalculator()` entry point

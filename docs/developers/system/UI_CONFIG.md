@@ -106,7 +106,7 @@ Rules:
 ### KSS theme tokens (`theme.*`)
 
 The KSS styling layer (`src/ui/kss.cpp`) reads its theme token set from the same
-`ui.conf` via `UIConfig::Color(...)`  -  these keys are **not written into the
+`ui.conf` via `UIConfig::Color(...)` - these keys are **not written into the
 generated default file** (KSS supplies built-in defaults shown below), but adding
 them to `ui.conf` overrides the theme. All are `0xAARRGGBB` colors except the
 metric tokens (`theme.radius`, `theme.pad`, plain ints).
@@ -141,6 +141,6 @@ If the config file does not exist on boot, UIConfig writes the complete default 
 
 ## 6. Related files
 
-- `src/ui/desktop.cpp`  -  `ReloadFromConfig()` for taskbar and desktop
-- `src/shell/shell.cpp`  -  `kurono reload`, `kurono config` commands
-- `src/fs/kvfs.cpp`  -  file read/write backing
+- `src/ui/desktop.cpp` - `ReloadFromConfig()` for taskbar and desktop
+- `src/shell/shell.cpp` - `kurono reload`, `kurono config` commands
+- `src/fs/kvfs.cpp` - file read/write backing

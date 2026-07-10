@@ -1,4 +1,4 @@
-// Kurono OS  -  kernel process registry implementation
+// Kurono OS - kernel process registry implementation
 //
 // Each kernel-mode process spawned here owns one subsystem and runs an
 // infinite Sleep/Yield loop.  They are scheduled cooperatively via the
@@ -135,11 +135,11 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             SpinLockCpuGuard guard(g_audio_lock);
             // AudioServer::Tick() already pumps the ACTIVE backend (it calls
             // be->Tick() via the mixer), so the direct AC97::Tick()/Audio::Tick()
-            // were redundant per-tick MMIO/PIO (extra VM-exits on VMware)  -  dropped.
+            // were redundant per-tick MMIO/PIO (extra VM-exits on VMware) - dropped.
             AudioServer::Tick();
         }
         // 10ms: the mixer period is ~21ms (1024 frames @ 48kHz) with a ~170ms
-        // back-pressure buffer, so 4ms was ~4x over-polling  -  pure wakeups/exits
+        // back-pressure buffer, so 4ms was ~4x over-polling - pure wakeups/exits
         // that kept the cpu from ever idling (HLT) on VMware. (satoru)
         Scheduler::SleepMs(10);
     }
@@ -158,7 +158,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
         Scheduler::ServiceSleepQueue();
         // 50ms: IRQ0 already calls wake_due_processes() every tick, so this is a
         // backup heartbeat. 1ms was 1000 redundant wakeups/sec that kept the cpu
-        // from idling (HLT)  -  the main VMware host-CPU burn. (satoru)
+        // from idling (HLT) - the main VMware host-CPU burn. (satoru)
         Scheduler::SleepMs(50);
     }
 }
@@ -172,7 +172,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     SerialLogger::Log("[LoggingProcess] online\r\n");
     while (true) {
         // move the staged serial-mirror ring into kvfs. this is the ONLY place
-        // the mirror touches kvfs/heap  -  MirrorSerial itself just stages into
+        // the mirror touches kvfs/heap - MirrorSerial itself just stages into
         // a static ring from whatever context it runs in. (satoru)
         {
             SpinLockCpuGuard guard(g_log_lock);
@@ -186,7 +186,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
 //
 //   `TerminalApp::Tick()` performs the actual KuronoShell::Execute call
 //   when a command is pending.  Decoupling that from the GUI thread
-//   means `kpkg sync` / `ping 8.8.8.8` no longer freezes the desktop  - 
+//   means `kpkg sync` / `ping 8.8.8.8` no longer freezes the desktop - 
 //   the GUI keeps rendering at full FPS while we churn.
 [[noreturn]] static void ShellProcessEntry() {
     SerialLogger::Log("[ShellProcess] online\r\n");
@@ -353,7 +353,7 @@ static inline bool ui_activity_active() {
         // one-shot interactive ksa prompt demo (kurono.ksa.prompt). fire once the
         // desktop has presented enough frames that the modal lands over a real
         // desktop. KSA::Prompt blocks this loop until the user (or synthetic
-        // input) answers  -  that block IS the secure desktop: the gui compositor
+        // input) answers - that block IS the secure desktop: the gui compositor
         // and input process are starved while ksa owns the screen + input. when
         // it returns, the saved desktop is restored and the loop repaints. (satoru)
         if (g_ksa_prompt_demo_armed && frame_counter > 90) {
@@ -368,7 +368,7 @@ static inline bool ui_activity_active() {
         // has presented a few seconds of frames, run the shipped accent-animation
         // script. it drives kss.transition + kss.set on the "window" rule's accent
         // (which feeds the live window-border/titlebar accent) so the on-screen
-        // accent eases  -  proving the js path drives real animation  -  then posts a
+        // accent eases - proving the js path drives real animation - then posts a
         // toast via ui.notify. prefer the shipped file; fall back to inline. (satoru)
         if (g_kj_demo_armed && frame_counter > 120) {
             g_kj_demo_armed = false;
@@ -397,7 +397,7 @@ static inline bool ui_activity_active() {
 
         // Frame pacing to ~60fps. Timer::GetRealMs() is now sourced from the
         // PIT-IRQ scheduler clock (see timer.cpp GetRealMs), so it advances
-        // reliably regardless of poll cadence  -  fixing the FPS-0 freeze where
+        // reliably regardless of poll cadence - fixing the FPS-0 freeze where
         // a SleepMs(1) pacer starved the old *polled* clock (it lost whole PIT
         // periods between calls, so the 16ms threshold was never reached and
         // the loop slept forever). We sleep the WHOLE remaining budget in one
@@ -423,7 +423,7 @@ static inline bool ui_activity_active() {
             // Nothing to draw. The old code BUSY-YIELDED here while "recently
             // active" to dodge WHPX/VMware timer coalescing (which made SleepMs
             // wake ~500ms late). but that spin pegged the vcpu at 100% the whole
-            // time the desktop sat idle  -  the dev is on KVM now, where the timer
+            // time the desktop sat idle - the dev is on KVM now, where the timer
             // IRQ is NOT coalesced, so a 1ms sleep wakes on time AND frees the
             // core (fixes the "whole os is laggy / fan spins" feel). after ~2s of
             // true inactivity, sleep longer to idle the host core fully. if you
@@ -435,7 +435,7 @@ static inline bool ui_activity_active() {
         // There IS work. Pace to ~60fps WITHOUT halting: SleepMs() HLTs the
         // cpu, and WHPX/VMware COALESCE the timer IRQ while the guest is
         // halted, so a 16ms sleep actually lasts ~55ms -> a choppy ~18fps
-        // during interaction. Busy-yield instead  -  the loop wakes on the TSC
+        // during interaction. Busy-yield instead - the loop wakes on the TSC
         // clock, not the coalesced IRQ, giving smooth 60fps while active. Idle
         // frames above still HLT, so host cpu stays low when nothing happens.
         // (satoru)
@@ -450,7 +450,7 @@ static inline bool ui_activity_active() {
             Graphics::Clear(0xFF0C0C18);
         }
 
-        // Framebuffer access  -  protected so any concurrent E1000 RX
+        // Framebuffer access - protected so any concurrent E1000 RX
         // path or audio mixer scratch doesn't interleave a SwapBuffers
         // mid-DrawPixel.
         {
@@ -466,7 +466,7 @@ static inline bool ui_activity_active() {
                 last_fps_ms = now_ms;
             }
 
-            // FPS pill overlay  -  preserved verbatim from kernel_main.
+            // FPS pill overlay - preserved verbatim from kernel_main.
             char fps_str[16] = "FPS ";
             char num_buf[8];
             int val = (int)displayed_fps;
@@ -514,7 +514,7 @@ static inline bool ui_activity_active() {
         // only treat the gui as truly hung after a LONG (>8s) gap confirmed
         // across two consecutive checks (~13s total). the old 3s/one-shot rule
         // tripped on transient boot/heavy-frame slowness, and then reinit'd the
-        // display WITHOUT g_fb_lock  -  racing the gui's render, tearing the
+        // display WITHOUT g_fb_lock - racing the gui's render, tearing the
         // framebuffer state, and cascading into more stalls + reinits. (satoru)
         if (now > last && (now - last) > 8000) {
             if (++consecutive >= 2) {

@@ -11,7 +11,7 @@
 #include "../kernel/kmemx.h"        // kmemx compressed-page fault decompression path (satoru)
 
 //  x86_64 idt, pic 8259a, and isr implementation
-//  isr stubs live in isr_stubs.asm  -  this file builds the idt from the
+//  isr stubs live in isr_stubs.asm - this file builds the idt from the
 //  stub table and handles the c-level interrupt dispatch.
 
 volatile uint64_t HAL::pit_ticks = 0;
@@ -236,7 +236,7 @@ void HAL::InitPIC() {
     OutByte(PIC1_CMD,  0x11);  IOWait();
     OutByte(PIC2_CMD,  0x11);  IOWait();
 
-    // icw2: vector base offsets  -  irq0-7 → 32-39, irq8-15 → 40-47
+    // icw2: vector base offsets - irq0-7 → 32-39, irq8-15 → 40-47
     OutByte(PIC1_DATA, 0x20);  IOWait();
     OutByte(PIC2_DATA, 0x28);  IOWait();
 
@@ -248,7 +248,7 @@ void HAL::InitPIC() {
     OutByte(PIC1_DATA, 0x01);  IOWait();
     OutByte(PIC2_DATA, 0x01);  IOWait();
 
-    // ocw1: mask all irqs initially  -  the kernel will selectively enable them
+    // ocw1: mask all irqs initially - the kernel will selectively enable them
     OutByte(PIC1_DATA, 0xFF);
     OutByte(PIC2_DATA, 0xFF);
 }
@@ -293,7 +293,7 @@ void HAL::RegisterIRQHandler(uint8_t irq, IRQHandler handler) {
     }
 }
 
-//  common c interrupt handler  -  called from isr_stubs.asm
+//  common c interrupt handler - called from isr_stubs.asm
 static void log_hex(const char* prefix, uint64_t val) {
     char buf[32];
     const char* hex = "0123456789ABCDEF";
@@ -363,7 +363,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             // 1.7) KMemX compressed-page fault: if CR2 is a page kmemx compressed
             //      out (its leaf is not-present + carries PTE_KMEMX_COMPRESSED),
             //      decompress it from the pool back into a fresh frame, restore the
-            //      leaf, and resume  -  the faulting instruction is then retried over
+            //      leaf, and resume - the faulting instruction is then retried over
             //      the now-present page. crc32 is verified inside; a mismatch
             //      panics (never hand back wrong bytes). this is the transparent
             //      "touch a cold page, get it back in a few microseconds" path. it
@@ -379,12 +379,12 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             //    A ring-3 fault can be a RESTARTABLE faulting SSE store: e.g.
             //    musl's memcpy fast path `movups %xmm0,(mem)` faulting on the
             //    first byte of a fresh demand-zero page. After we map the page
-            //    and IRET, the cpu RE-EXECUTES that store from %xmm0  -  so %xmm0
+            //    and IRET, the cpu RE-EXECUTES that store from %xmm0 - so %xmm0
             //    (the whole fpu/sse state) must be byte-identical to what the
             //    faulting code held. But the #pf path runs kernel code that
             //    touches xmm (memcpy/graphics inline asm, an IRQ-driven task
             //    switch's fxrstor), clobbering %xmm0. That silently zeroed the
-            //    first 16 bytes of the page the restarted movups wrote  -  exactly
+            //    first 16 bytes of the page the restarted movups wrote - exactly
             //    the lost atom[0x50]/[0x51] pointers that #pf'd xkbcommon. fix:
             //    fxsave the user fpu/sse before handling and fxrstor it right
             //    before returning to ring-3, mirroring the SYSCALL fast path.
@@ -495,7 +495,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             dump_tcb("liveTCB", live_fs);
             if (frame->r14 != live_fs) dump_tcb("r14TCB", frame->r14);
             // user stack qwords at the fault: [rsp+0x18] is the return address
-            // for a 3-push prologue  -  symbolizing it names the CALLER of the
+            // for a 3-push prologue - symbolizing it names the CALLER of the
             // faulting function (the AssignLiteral garbage-args hunt). (satoru)
             if (fp) {
                 for (uint64_t off = 0; off <= 0x78; off += 8) {
@@ -567,14 +567,14 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             // read master pic isr (ocw3: read isr)
             HAL::OutByte(PIC1_CMD, 0x0B);
             if (!(HAL::InByte(PIC1_CMD) & 0x80)) {
-                return;  // spurious  -  no eoi
+                return;  // spurious - no eoi
             }
         }
         if (irq == 15) {
             // read slave pic isr
             HAL::OutByte(PIC2_CMD, 0x0B);
             if (!(HAL::InByte(PIC2_CMD) & 0x80)) {
-                // spurious from slave  -  still must eoi master
+                // spurious from slave - still must eoi master
                 HAL::OutByte(PIC1_CMD, PIC_EOI);
                 return;
             }
@@ -604,7 +604,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
     log_hex("HAL: unhandled interrupt vector ", vec);
 }
 
-//  idt initialization  -  populate all 256 entries from the nasm stub table
+//  idt initialization - populate all 256 entries from the nasm stub table
 void HAL::InitIDT() {
     // clear all entries
     for (int i = 0; i < 256; i++) {
@@ -623,7 +623,7 @@ void HAL::InitIDT() {
     idt_set(0x40, (uint64_t)(uintptr_t)&isr_stub_64, 0, 0);
 
     // tlb-shootdown ipi (vector 0x41): another core changed page tables in an
-    // address space this cpu may be running threads of  -  reload cr3. (satoru)
+    // address space this cpu may be running threads of - reload cr3. (satoru)
     idt_set(0x41, (uint64_t)(uintptr_t)&isr_stub_65, 0, 0);
 
     // vectors 48-255: leave as not-present (type_attr = 0).
@@ -645,14 +645,14 @@ void HAL::Init() {
     // 2.5 program SYSCALL/SYSRET MSRs (depends on GDT being loaded)
     InitSyscallMSRs();
     // 3. enable the interrupts we use. keyboard (IRQ1) and mouse (IRQ12) are
-    // POLLED (no handlers)  -  BUT we keep them UNMASKED on purpose: when the cpu
+    // POLLED (no handlers) - BUT we keep them UNMASKED on purpose: when the cpu
     // is HLT'd in deep idle, a keystroke/mouse-move IRQ wakes it immediately so
     // the polled InputProcess runs and the desktop responds without waiting for
     // the (WHPX-coalesced, ~500ms) timer IRQ. the unhandled IRQ just EOIs; the
     // wake is the point. (satoru)
     EnableIRQ(0);   // pit timer (drives scheduler wakeups)
-    EnableIRQ(1);   // keyboard  -  polled, but wakes the cpu from HLT
-    EnableIRQ(12);  // mouse  -  polled, but wakes the cpu from HLT
+    EnableIRQ(1);   // keyboard - polled, but wakes the cpu from HLT
+    EnableIRQ(12);  // mouse - polled, but wakes the cpu from HLT
 
     // 4. re-enable nmi now that idt is ready to handle it.
     //    boot assembly disables nmi via cmos port 0x70 bit 7 to prevent
@@ -674,7 +674,7 @@ extern "C" volatile uint64_t g_kernel_syscall_rsp;
 void HAL::SetKernelStack(uint64_t rsp0) {
     if (!rsp0) return;
     // write the CALLING cpu's own tss: each ap loaded its private ap_tss via
-    // SetupAPCpuState, so an ap running a user thread must update that one  - 
+    // SetupAPCpuState, so an ap running a user thread must update that one - 
     // writing the bsp's system_tss from an ap would (a) leave the ap's ring-3
     // interrupt stack stale and (b) point the bsp's rsp0 at the ap thread's
     // kernel stack, colliding two cores on one stack. (satoru)
@@ -682,7 +682,7 @@ void HAL::SetKernelStack(uint64_t rsp0) {
     if (cpu == 0) {
         system_tss.rsp0 = rsp0;
         system_tss.ist1 = rsp0;
-        // legacy global mirror  -  only meaningful on the bsp. (satoru)
+        // legacy global mirror - only meaningful on the bsp. (satoru)
         g_kernel_syscall_rsp = rsp0;
     } else if (cpu < SMP_MAX_CPUS) {
         ap_tss[cpu].rsp0 = rsp0;
@@ -852,7 +852,7 @@ void HAL::PowerOff() {
 
     // none of the poweroff ports took effect (likely real hardware without
     // a parsed acpi fadt). leave the machine in a safe halted state. (satoru)
-    SerialLogger::Log("HAL: PowerOff ports had no effect  -  halting CPU\r\n");
+    SerialLogger::Log("HAL: PowerOff ports had no effect - halting CPU\r\n");
     while (true) {
         asm volatile("cli; hlt");
     }
@@ -926,7 +926,7 @@ static uintptr_t acpi_find_fadt() {
                     const uint8_t* arr = (const uint8_t*)xsdt + sizeof(AcpiSDTHeader);
                     for (uint32_t i = 0; i < entries; i++) {
                         uint64_t ent;
-                        // entries are not guaranteed 8-byte aligned  -  copy.
+                        // entries are not guaranteed 8-byte aligned - copy.
                         const uint8_t* src = arr + i * 8;
                         uint8_t* dst = (uint8_t*)&ent;
                         for (int b = 0; b < 8; b++) dst[b] = src[b];
@@ -965,7 +965,7 @@ bool HAL::Suspend() {
     // 64 per the acpi spec. (satoru)
     uintptr_t fadt = acpi_find_fadt();
     if (!fadt) {
-        SerialLogger::Log("HAL: Suspend aborted  -  no ACPI RSDP/FADT found\r\n");
+        SerialLogger::Log("HAL: Suspend aborted - no ACPI RSDP/FADT found\r\n");
         return false;
     }
     uint32_t pm1a_cnt = *(const uint32_t*)(fadt + 64);
@@ -978,10 +978,10 @@ bool HAL::Suspend() {
     // needs a real aml interpreter this kernel does not have. writing a
     // guessed slp_typ (or skipping it) would either silently fail to sleep
     // or, worse, trigger an undefined hardware transition. (satoru)
-    // TODO (satoru): requires ACPI FADT/DSDT parse for SLP_TYPx  -  decode the
+    // TODO (satoru): requires ACPI FADT/DSDT parse for SLP_TYPx - decode the
     // \_S3 AML package in the DSDT to obtain SLP_TYPa/SLP_TYPb before we can
     // write (SLP_TYPa << 10) | SLP_EN to PM1a_CNT_BLK and enter S3.
-    SerialLogger::Log("HAL: Suspend aborted  -  SLP_TYP for S3 requires DSDT AML parse (not implemented)\r\n");
+    SerialLogger::Log("HAL: Suspend aborted - SLP_TYP for S3 requires DSDT AML parse (not implemented)\r\n");
     (void)pm1a_cnt;
     return false;
 }
@@ -1012,7 +1012,7 @@ uint32_t HAL::InLong(uint16_t port) {
 }
 
 void HAL::IOWait() {
-    // write to unused port 0x80  -  introduces ~1 µs delay for pic/slow devices
+    // write to unused port 0x80 - introduces ~1 µs delay for pic/slow devices
     asm volatile("outb %%al, $0x80" : : "a"((uint8_t)0));
 }
 

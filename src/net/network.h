@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  network stack & wifi driver
+//  kurono os - network stack & wifi driver
 //  bare-metal nic abstraction + basic tcp/ip
 
 #define NET_MAX_INTERFACES  4
@@ -95,8 +95,8 @@ enum NICType {
     NIC_ETHERNET,
     NIC_WIFI,
     NIC_LOOPBACK,
-    NIC_TUN,            // L3 (IP) tunnel  -  userspace reads/writes IP packets
-    NIC_TAP,            // L2 (Ethernet) tunnel  -  userspace reads/writes frames
+    NIC_TUN,            // L3 (IP) tunnel - userspace reads/writes IP packets
+    NIC_TAP,            // L2 (Ethernet) tunnel - userspace reads/writes frames
     NIC_BRIDGE,         // software L2 bridge across multiple NICs
     NIC_VLAN            // 802.1Q tagged subinterface
 };

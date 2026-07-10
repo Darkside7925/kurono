@@ -6,9 +6,9 @@
 
 The media player handles:
 
-- **MP3** audio files  -  decoded by `src/media/mp3_decoder.cpp`
-- **Image files**  -  displayed in the player window (PNG, JPEG, BMP)
-- **Playlist support**  -  queue multiple files and navigate with next/previous
+- **MP3** audio files - decoded by `src/media/mp3_decoder.cpp`
+- **Image files** - displayed in the player window (PNG, JPEG, BMP)
+- **Playlist support** - queue multiple files and navigate with next/previous
 
 ## 2. Playback pipeline
 
@@ -36,7 +36,7 @@ A simple waveform or spectrum visualizer renders in the player window using the 
 
 ## 5. Related files
 
-- `src/media/mp3_decoder.cpp`  -  audio decode
-- `src/media/mediadecoder.cpp`  -  image decode for album art
-- `src/drivers/audio.cpp`  -  audio driver
-- `src/ui/desktop.cpp`  -  `LaunchMediaPlayer()` entry point
+- `src/media/mp3_decoder.cpp` - audio decode
+- `src/media/mediadecoder.cpp` - image decode for album art
+- `src/drivers/audio.cpp` - audio driver
+- `src/ui/desktop.cpp` - `LaunchMediaPlayer()` entry point

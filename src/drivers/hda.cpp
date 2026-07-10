@@ -1,4 +1,4 @@
-//  kurono os  -  intel hd audio (hda) controller driver implementation
+//  kurono os - intel hd audio (hda) controller driver implementation
 //  pci class 04:03:00 (multimedia audio controller)
 #include "hda.h"
 #include "timer.h"
@@ -32,7 +32,7 @@ uint8_t HDAudio::volume = 200;
 HDAStreamFormat HDAudio::current_format = {48000, 16, 2};
 uint32_t HDAudio::stream_base = 0;
 
-// streaming state  -  independent of the legacy one-shot Play() path.
+// streaming state - independent of the legacy one-shot Play() path.
 static bool     g_hda_stream_live  = false;
 static uint32_t g_hda_write_ptr    = 0;     // byte offset into cyclic buffer
 static uint32_t g_hda_last_lpib    = 0;     // last observed read position
@@ -75,7 +75,7 @@ void HDAudio::Write32(uint32_t offset, uint32_t val) { *(volatile uint32_t*)(bar
 // timer for the fallback path). (satoru)
 void HDAudio::DelayUs(uint32_t us) {
     if (!bar0) {
-        // no mmio yet  -  approximate with a bounded volatile spin. (satoru)
+        // no mmio yet - approximate with a bounded volatile spin. (satoru)
         for (uint32_t i = 0; i < us; i++)
             for (volatile int d = 0; d < 30; d++) { __asm__ __volatile__("pause"); }
         return;
@@ -87,7 +87,7 @@ void HDAudio::DelayUs(uint32_t us) {
         if (Read32(HDA_WALCLK) != start) { ticking = true; break; }
     }
     if (!ticking) {
-        // wall clock dead (link not up)  -  fall back to a coarse volatile spin
+        // wall clock dead (link not up) - fall back to a coarse volatile spin
         // so we still wait *something* rather than nothing at all. (satoru)
         for (uint32_t i = 0; i < us; i++)
             for (volatile int d = 0; d < 30; d++) { __asm__ __volatile__("pause"); }
@@ -134,7 +134,7 @@ bool HDAudio::Init() {
                 if (base_class == 0x04 && sub_class == 0x03) {
                     outl(0xCF8, addr | 0x10);
                     uint32_t bar_lo = inl(0xCFC);
-                    if (bar_lo & 1) continue; // i/o bar  -  not mmio, skip (satoru)
+                    if (bar_lo & 1) continue; // i/o bar - not mmio, skip (satoru)
                     found_bar0 = (uint64_t)(bar_lo & ~0xFu);
                     // 64-bit bar (type bits 10b): high dword lives in bar1.
                     // truncating to 32 bits would yield a bogus base when qemu
@@ -154,7 +154,7 @@ bool HDAudio::Init() {
 
     if (!found) return false;
 
-    // map the bar window as uncached mmio before any register access  -  a
+    // map the bar window as uncached mmio before any register access - a
     // 64-bit bar can sit above the boot identity map, so Write32/Read32 below
     // would #pf otherwise. mirrors nvme.cpp / virtio_gpu.cpp; 64kb covers the
     // controller regs + stream descriptors, idempotent. (satoru)
@@ -291,7 +291,7 @@ bool HDAudio::InitCorbRirb() {
     Write8(HDA_RIRBCTL, 0);
     DelayUs(100);
 
-    // set corb base address  -  full 64-bit phys (identity-mapped: phys==virt),
+    // set corb base address - full 64-bit phys (identity-mapped: phys==virt),
     // upper half must not be hardcoded to 0 or a heap address >4 gb would be
     // truncated and the controller would dma the wrong page. (satoru)
     uint64_t corb_phys = (uint64_t)(uintptr_t)corb;
@@ -313,7 +313,7 @@ bool HDAudio::InitCorbRirb() {
     // reset corb write pointer
     Write16(HDA_CORBWP, 0);
 
-    // set rirb base address  -  full 64-bit phys, same upper-half fix as corb
+    // set rirb base address - full 64-bit phys, same upper-half fix as corb
     // above so a >4 gb heap allocation is addressed correctly. (satoru)
     uint64_t rirb_phys = (uint64_t)(uintptr_t)rirb;
     Write32(HDA_RIRBLBASE, (uint32_t)(rirb_phys & 0xFFFFFFFFu));
@@ -332,7 +332,7 @@ bool HDAudio::InitCorbRirb() {
     // status register doesn't start out wedged. (satoru)
     Write8(HDA_RIRBSTS, (1 << 0) | (1 << 2));
 
-    // set rintcnt  -  one response per interrupt. (satoru)
+    // set rintcnt - one response per interrupt. (satoru)
     Write16(HDA_RINTCNT, 1);
 
     // start corb and rirb
@@ -551,7 +551,7 @@ bool HDAudio::FindOutputPath(int cad) {
     if (best_pincap & (1 << 3)) pinctl |= (1u << 7);  // HP_EN
     SendVerb(HDA_VERB(cad, best_pin, HDA_VERB_SET_PINCTL, pinctl), &resp);
 
-    // (h) if the pin supports EAPD (pin caps bit 16), enable it (bit1)  -  many
+    // (h) if the pin supports EAPD (pin caps bit 16), enable it (bit1) - many
     // consumer codecs keep the external amp / charge pump powered down until
     // EAPD is asserted. then wait for the analog stage to settle. (satoru)
     if (best_pincap & (1 << 16)) {
@@ -600,7 +600,7 @@ uint16_t HDAudio::EncodeFormat(uint32_t sample_rate, uint8_t bits, uint8_t chann
 bool HDAudio::SetupOutputStream() {
     if (!bdl || !dma_buffer) return false;
 
-    // reset stream  -  assert SRST and wait for the controller to acknowledge by
+    // reset stream - assert SRST and wait for the controller to acknowledge by
     // reading the bit back as 1 (calibrated waits so the settle survives -O2). (satoru)
     Write8(stream_base + HDA_SD_CTL, HDA_SD_CTL_SRST);
     for (int i = 0; i < 1000; i++) {
@@ -619,7 +619,7 @@ bool HDAudio::SetupOutputStream() {
     uint16_t fmt = EncodeFormat(current_format.sample_rate, current_format.bits, current_format.channels);
     Write16(stream_base + HDA_SD_FMT, fmt);
 
-    // set bdl address  -  program the full 64-bit physical base, low half in
+    // set bdl address - program the full 64-bit physical base, low half in
     // sdbdpl and high half in sdbdpu.  the kernel is identity-mapped (phys ==
     // virt, see vmm.cpp) so the bdl's physical address is just its pointer.
     // we cannot borrow audiodma::acquire here: those four low-memory regions
@@ -738,7 +738,7 @@ bool HDAudio::StartStream() {
 uint32_t HDAudio::WriteRing(const void* data, uint32_t bytes) {
     if (!g_hda_stream_live || !data || bytes == 0) return 0;
     // dma_buffer is non-null whenever g_hda_stream_live (StartStream gates on it),
-    // but guard the deref anyway  -  zero-risk, can only avert a fault. (satoru)
+    // but guard the deref anyway - zero-risk, can only avert a fault. (satoru)
     if (!dma_buffer) return 0;
     // clamp lpib's per-tick advance so a qemu link-position jump can't fake free
     // space (see HDA_ClampLpibAdvance). (satoru)
@@ -760,7 +760,7 @@ uint32_t HDAudio::WriteRing(const void* data, uint32_t bytes) {
     // one period + one frame of slack so even with the full/empty ambiguity at
     // write_ptr==lpib (which the old N-(write-lpib) math mis-read as a totally
     // FREE ring) we can't overwrite samples the dma is mid-flight on.  when the
-    // ring is already that full, skip this period  -  the mixer back-pressure gate
+    // ring is already that full, skip this period - the mixer back-pressure gate
     // will simply try again next tick. (satoru)
     const uint32_t kPeriod = 4096;
     const uint32_t kGuard  = kPeriod + 4;

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  linux device bridge
+//  kurono os - linux device bridge
 //  shares hardware devices between kurono and linux subsystem.
 //  creates /dev nodes that map to kurono's native drivers.
 //
@@ -74,7 +74,7 @@ struct LinuxInputEvent {
 #define EV_REL   0x02
 #define EV_ABS   0x03
 
-//  linuxdevicebridge  -  the device management class
+//  linuxdevicebridge - the device management class
 
 class LinuxDeviceBridge {
 public:

@@ -1,11 +1,11 @@
 #pragma once
-//  kurono os  -  kurono style sheet (kss)
+//  kurono os - kurono style sheet (kss)
 //
 //  a single source of truth for ui colors + metrics so every app themes the
 //  same way, plus a small immediate-mode widget toolkit whose text always
 //  measures through fontttf (no fixed-width *8 assumptions). tokens default to
 //  the proven settings palette and can be overridden from /etc/kurono/ui.conf
-//  via theme.* keys. this is NOT a browser css engine  -  just a struct + helpers.
+//  via theme.* keys. this is NOT a browser css engine - just a struct + helpers.
 //  (satoru)
 #include "../kernel/types.h"
 
@@ -93,7 +93,7 @@ namespace Anim {
     // advance the clock; call once per frame BEFORE any Float()/Color() reads, and
     // evict ids not touched recently so the table never fills. (satoru)
     void Tick(uint32_t now_ms);
-    // true while any tween is still in flight  -  wire into the compositor's
+    // true while any tween is still in flight - wire into the compositor's
     // keep-rendering gate so motion doesn't freeze mid-animation. (satoru)
     bool Active();
 

@@ -1,4 +1,4 @@
-//  kurono os  -  embedded alpine linux guest data
+//  kurono os - embedded alpine linux guest data
 //
 //  the alpine linux kernel (vmlinuz-virt) and initramfs are converted
 //  from binary files to elf objects via objcopy and linked directly into
@@ -19,12 +19,12 @@
 // resolve them against the objcopy-generated symbols.
 
 extern "C" {
-    // alpine linux 6.x virt kernel  -  bzimage
+    // alpine linux 6.x virt kernel - bzimage
     // __attribute__((weak)): resolves to null if alpine objects aren't linked
     extern const uint8_t _binary_vmlinuz_virt_start[] __attribute__((weak));
     extern const uint8_t _binary_vmlinuz_virt_end[]   __attribute__((weak));
 
-    // alpine linux initramfs (mkinitfs output  -  modules + init scripts)
+    // alpine linux initramfs (mkinitfs output - modules + init scripts)
     extern const uint8_t _binary_initramfs_virt_start[] __attribute__((weak));
     extern const uint8_t _binary_initramfs_virt_end[]   __attribute__((weak));
 }

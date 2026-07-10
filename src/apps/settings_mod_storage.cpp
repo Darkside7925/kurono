@@ -1,8 +1,8 @@
-//  kurono os  -  settings module: storage (satoru)
+//  kurono os - settings module: storage (satoru)
 //  read-only, scrollable storage page: kernel-heap usage bar, kvfs volume +
 //  mount-point list with type/usage bars, detected block device (nvme model +
 //  capacity, else the virtual disk), and filesystem detail rows (block size,
-//  inode/node counts). everything is detected live; no persisted state  -  but
+//  inode/node counts). everything is detected live; no persisted state - but
 //  written through the same SettingsUI helpers so it matches the shell. (satoru)
 #include "system_settings.h"
 #include "../drivers/graphics.h"
@@ -10,7 +10,7 @@
 #include "../fs/kvfs.h"
 #include "../kernel/heap.h"
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 // snapshots taken in on_show so render/content_height agree on one reading and
 // the page does not flicker as the heap churns under us. (satoru)
 static size_t s_heap_used   = 0;     // bytes (satoru)
@@ -192,7 +192,7 @@ static void storage_render(int x, int y, int w, int h, int scroll){
         SettingsUI::Row(x, ly, "Written:", buf);
         ly += 22;
     } else {
-        // no nvme  -  describe the in-memory virtual disk the kvfs lives on. (satoru)
+        // no nvme - describe the in-memory virtual disk the kvfs lives on. (satoru)
         SettingsUI::Row(x, ly, "Device:", "Virtual Disk (RAM-backed)");
         ly += 22;
         SettingsUI::Row(x, ly, "Model:", "Kurono KVFS Volume");

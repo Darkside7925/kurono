@@ -1,13 +1,13 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  kfs_bench  -  headless KFS / NVMe storage benchmark. gated behind the
+//  kfs_bench - headless KFS / NVMe storage benchmark. gated behind the
 //  kurono.kfsbench cmdline token (parsed in kurono_kernel.cpp). it measures the
 //  storage stack against the attached nvme DATA disk (NOT the boot disk) and logs
 //  every number to serial so a CI run can scrape it:
 //    - sequential write MB/s  (large contiguous file through KFS)
 //    - sequential read  MB/s
-//    - random 4 KB write IOPS (raw nvme 4 KB writes  -  the lsm/page-cache layers
+//    - random 4 KB write IOPS (raw nvme 4 KB writes - the lsm/page-cache layers
 //      build on this primitive)
 //    - snapshot save time (full) + incremental
 //    - boot restore time

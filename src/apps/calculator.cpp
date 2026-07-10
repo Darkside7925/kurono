@@ -235,7 +235,7 @@ void Calculator::Draw() {
     // background
     Graphics::FillRect(x0, y0, w, h, 0xFF1E1E2E);
 
-    // display area  -  error flashes red briefly
+    // display area - error flashes red briefly
     int disp_h = 36;
     unsigned int disp_bg = 0xFF2A2A3C;
     if (error_state && (now - press_ms) < 600) disp_bg = 0xFF552430;
@@ -278,7 +278,7 @@ void Calculator::Draw() {
 void Calculator::Update() {
     if (!active) return;
 
-    // hover tracking  -  refresh every Update so visuals react same tick
+    // hover tracking - refresh every Update so visuals react same tick
     int mx, my;
     Mouse::GetPosition(mx, my);
     hover_button = calc_hit_test_button(window_x, window_y, window_w, window_h, mx, my);
@@ -293,7 +293,7 @@ bool Calculator::Input(int mx, int my, bool clicked, char key) {
 
     if (clicked) {
         // mx,my arrive window-local from the wm input callback, but draw uses the
-        // global window_x/window_y origin  -  hit-test in the same local space (0,0)
+        // global window_x/window_y origin - hit-test in the same local space (0,0)
         // so clicks land on the right buttons (this was the "calculator broken" bug). (satoru)
         int idx = calc_hit_test_button(0, 0, window_w, window_h, mx, my);
         if (idx >= 0) {

@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-//  kurono os  -  cpu detection & feature identification driver
+//  kurono os - cpu detection & feature identification driver
 //  uses cpuid instruction for real hardware feature detection
 
 // feature flags (edx from cpuid eax=1)
@@ -118,7 +118,7 @@ struct CpuInfo {
     int ext_model;
     char brand_string[52];     // e.g., "intel(r) core(tm) i7-12700k"
 
-    // features  -  standard
+    // features - standard
     uint32_t features_edx;     // cpuid eax=1 edx
     uint32_t features_ecx;     // cpuid eax=1 ecx
     uint32_t features_ebx7;    // cpuid eax=7 ebx

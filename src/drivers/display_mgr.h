@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  display resolution manager
+//  kurono os - display resolution manager
 //  dynamic resolution switching, vsync control, multi-monitor support
 //  wraps bga, virtio gpu, and native gpu drivers
 #include "../kernel/types.h"

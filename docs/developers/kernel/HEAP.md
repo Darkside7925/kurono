@@ -29,5 +29,5 @@ If the heap runs out of its initial region it can request additional pages from 
 
 ## 5. Related files
 
-- `src/kernel/pmm.cpp`  -  raw page source for the heap
-- `src/kernel/memory_mgr.h`  -  higher level memory manager declarations
+- `src/kernel/pmm.cpp` - raw page source for the heap
+- `src/kernel/memory_mgr.h` - higher level memory manager declarations

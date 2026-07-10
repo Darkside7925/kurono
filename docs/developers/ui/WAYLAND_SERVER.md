@@ -38,7 +38,7 @@ The compositor advertises the following globals via `wl_registry`:
 ## 4. Surface bridging (working)
 
 Each `xdg_toplevel` surface becomes a real `Window` in the Kurono window manager,
-and each committed `wl_shm` buffer is blitted into that window  -  this is
+and each committed `wl_shm` buffer is blitted into that window - this is
 **implemented, not stubbed**:
 
 - `commit_surface()` → `bridge_surface_window()` calls
@@ -53,8 +53,8 @@ and each committed `wl_shm` buffer is blitted into that window  -  this is
 - **`wl_subsurface` compositing** is implemented: a client can inset a child
   surface into a parent at a `set_position` offset (`blit_child_subsurfaces`,
   `find_subsurface_role`), and the compositor composites the child onto the
-  parent window at that offset. This is what a real GTK app needs  -  GTK renders
-  its content into a subsurface inset inside a client-side-decorated toplevel  - 
+  parent window at that offset. This is what a real GTK app needs - GTK renders
+  its content into a subsurface inset inside a client-side-decorated toplevel - 
   and is what lets **Firefox composite its full browser chrome** (a 973×743 GTK
   content subsurface onto a 1025×795 CSD toplevel). A companion fix makes
   `UnixSocket::TakePendingControl` hand back one fd per call so every `wl_shm`
@@ -62,7 +62,7 @@ and each committed `wl_shm` buffer is blitted into that window  -  this is
 
 This was proven with a real **musl-gcc**-compiled client,
 `src/userprogs/wl_shm_test.c`, embedded in the kernel and launched by the
-`wltest` shell command, and  -  at full scale  -  by Firefox 140.11.0esr painting
+`wltest` shell command, and - at full scale - by Firefox 140.11.0esr painting
 its real browser chrome through the subsurface path.
 
 ## 5. Limits
@@ -75,7 +75,7 @@ The compositor has these limits:
 
 ## 6. Current status
 
-The compositor goes well past the wire protocol  -  the full `wl_shm` + xdg-shell
+The compositor goes well past the wire protocol - the full `wl_shm` + xdg-shell
 render path works:
 
 - Registry and globals advertised correctly; surface creation + `xdg_toplevel`
@@ -90,11 +90,11 @@ render path works:
 - **Keyboard-to-client forwarding** (`ForwardKey`) is implemented but **not yet
   wired into the input loop**, so the focused client doesn't receive keystrokes
   yet.
-- **`zwp_linux_dmabuf` GPU buffers are advertised but not composited**  -  only
+- **`zwp_linux_dmabuf` GPU buffers are advertised but not composited** - only
   `wl_shm` software buffers are blitted today.
 
 ## 7. Related files
 
-- `src/ui/window_manager.cpp`  -  intended target for `xdg_toplevel` bridge
-- `src/drivers/graphics.cpp`  -  framebuffer blit target
-- `src/system/input_manager.cpp`  -  input event forwarding source
+- `src/ui/window_manager.cpp` - intended target for `xdg_toplevel` bridge
+- `src/drivers/graphics.cpp` - framebuffer blit target
+- `src/system/input_manager.cpp` - input event forwarding source

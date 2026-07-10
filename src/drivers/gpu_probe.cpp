@@ -1,11 +1,11 @@
-//  kurono os  -  gpu probe & hybrid gpu support
+//  kurono os - gpu probe & hybrid gpu support
 //  scans pci bus for all display controllers, classifies hybrid gpu
 //  topologies (optimus, powerxpress, mux, etc.), and validates/corrects
 //  the framebuffer address for the gpu that actually drives the display.
 //
 //  this is the fix for black screens on optimus laptops:
 //  the multiboot framebuffer address from grub always points to the gpu
-//  that uefi gop initialized  -  on muxless optimus, that's the intel igpu.
+//  that uefi gop initialized - on muxless optimus, that's the intel igpu.
 //  but if the address is stale or the display plane was reconfigured,
 //  we can read intel's dspsurf register to get the real scanout address.
 #include "gpu_probe.h"
@@ -59,7 +59,7 @@ uint64_t GpuProbe::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_i
     uint8_t offset = 0x10 + bar_idx * 4;
     uint32_t bar_lo = PciRead(bus, dev, func, offset);
     if (bar_lo == 0 || bar_lo == 0xFFFFFFFF) return 0;
-    if (bar_lo & 1) return 0; // I/O BAR  -  not usable here
+    if (bar_lo & 1) return 0; // I/O BAR - not usable here
 
     uint64_t base = bar_lo & 0xFFFFFFF0;
     uint8_t type = (bar_lo >> 1) & 0x03;
@@ -106,7 +106,7 @@ uint32_t GpuProbe::IntelReadMMIO(uint64_t bar0, uint32_t offset) {
 uintptr_t GpuProbe::IntelGetActiveSurface(uint64_t bar0) {
     if (!bar0) return 0;
 
-    // check pipe a  -  dspcntr_a bit 31 = plane enabled
+    // check pipe a - dspcntr_a bit 31 = plane enabled
     uint32_t dspcntr_a = IntelReadMMIO(bar0, INTEL_DSPCNTR_A);
     if (dspcntr_a & (1u << 31)) {
         uint32_t surf_a = IntelReadMMIO(bar0, INTEL_DSPSURF_A);
@@ -143,7 +143,7 @@ uintptr_t GpuProbe::IntelGetActiveSurface(uint64_t bar0) {
 //  intel igpu identification (by device id ranges)
 
 const char* GpuProbe::IntelIdentify(uint16_t did) {
-    // gen12+ (alder lake, raptor lake, meteor lake  -  12th/13th/14th gen)
+    // gen12+ (alder lake, raptor lake, meteor lake - 12th/13th/14th gen)
     if ((did >= 0x4680 && did <= 0x46FF) || did == 0x4626 || did == 0x4628 ||
         did == 0x462A || did == 0x46A6 || did == 0x46A8 || did == 0x46AA ||
         did == 0x46B0 || did == 0x46B1 || did == 0x46B3 || did == 0x46C0 ||
@@ -235,7 +235,7 @@ static void _scat(char* d, const char* s, int max) {
     d[i] = 0;
 }
 
-//  full pci bus scan  -  find all display controllers
+//  full pci bus scan - find all display controllers
 
 void GpuProbe::ScanAll() {
     // clear previous results
@@ -250,7 +250,7 @@ void GpuProbe::ScanAll() {
 
     SerialLogger::Log("[GpuProbe] Scanning PCI bus for display controllers...\r\n");
 
-    // bound the scan  -  track the highest bus number we've seen any device on
+    // bound the scan - track the highest bus number we've seen any device on
     // and stop after a generous 16-bus gap. virtually all real systems have
     // all display controllers below bus 16, but pcie bridges can push them
     // higher on workstations.
@@ -448,7 +448,7 @@ void GpuProbe::ClassifyTopology() {
     SerialLogger::Log("\r\n");
 }
 
-//  role assignment  -  which gpu drives the panel?
+//  role assignment - which gpu drives the panel?
 
 void GpuProbe::AssignRoles() {
     result.primary_idx = -1;
@@ -530,7 +530,7 @@ uintptr_t GpuProbe::ValidateFramebuffer(uintptr_t mb_fb_addr, uint32_t width,
     result.validated_fb_addr = mb_fb_addr;
 
     if (result.primary_idx < 0) {
-        SerialLogger::Log("[GpuProbe] Cannot validate FB  -  no primary GPU\r\n");
+        SerialLogger::Log("[GpuProbe] Cannot validate FB - no primary GPU\r\n");
         return mb_fb_addr;
     }
 
@@ -546,7 +546,7 @@ uintptr_t GpuProbe::ValidateFramebuffer(uintptr_t mb_fb_addr, uint32_t width,
     if (primary.vendor_id == GPU_VENDOR_INTEL && primary.bar0 != 0) {
         SerialLogger::Log("[GpuProbe] Reading Intel iGPU display registers...\r\n");
 
-        // map the bar window before any IntelReadMMIO below  -  a high 64-bit bar
+        // map the bar window before any IntelReadMMIO below - a high 64-bit bar
         // isn't covered by the boot identity map and would #pf otherwise.
         // (satoru)
         gpuprobe_map_bar_window(primary.bar0, primary.bar0_size);
@@ -592,8 +592,8 @@ uintptr_t GpuProbe::ValidateFramebuffer(uintptr_t mb_fb_addr, uint32_t width,
                              mb_fb_addr < gmadr + gmadr_size);
 
             if (match_gmadr || match_abs || match_direct || in_gmadr) {
-                SerialLogger::Log("[GpuProbe] FB address MATCHES Intel iGPU  -  OK\r\n");
-                // all good  -  multiboot fb points to the correct gpu
+                SerialLogger::Log("[GpuProbe] FB address MATCHES Intel iGPU - OK\r\n");
+                // all good - multiboot fb points to the correct gpu
             } else {
                 // fb address mismatch! this is likely the optimus black screen cause.
                 SerialLogger::Log("[GpuProbe] WARNING: FB address MISMATCH!\r\n");
@@ -628,8 +628,8 @@ uintptr_t GpuProbe::ValidateFramebuffer(uintptr_t mb_fb_addr, uint32_t width,
                 }
             }
         } else {
-            // couldn't read dspsurf  -  trust multiboot
-            SerialLogger::Log("[GpuProbe] Intel DSPSURF read returned 0  -  using Multiboot FB\r\n");
+            // couldn't read dspsurf - trust multiboot
+            SerialLogger::Log("[GpuProbe] Intel DSPSURF read returned 0 - using Multiboot FB\r\n");
         }
 
         // additional intel-specific checks:
@@ -658,7 +658,7 @@ uintptr_t GpuProbe::ValidateFramebuffer(uintptr_t mb_fb_addr, uint32_t width,
             SerialLogger::Log("[GpuProbe] NVIDIA BAR1(fb)=0x");
             SerialLogger::LogHex((uint32_t)(nv_fb >> 32));
             SerialLogger::LogHex((uint32_t)(nv_fb & 0xFFFFFFFF));
-            SerialLogger::Log(in_nv_vram ? "  -  FB in VRAM ✓" : "  -  FB NOT in VRAM");
+            SerialLogger::Log(in_nv_vram ? " - FB in VRAM ✓" : " - FB NOT in VRAM");
             SerialLogger::Log("\r\n");
         }
     }

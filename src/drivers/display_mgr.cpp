@@ -1,4 +1,4 @@
-//  kurono os  -  display resolution manager implementation
+//  kurono os - display resolution manager implementation
 //  detects display backend, provides unified resolution switching
 #include "display_mgr.h"
 #include "bga.h"
@@ -66,7 +66,7 @@ bool DisplayManager::Init() {
         }
     }
 
-    // use native graphics framebuffer  -  classify backend from gpuprobe
+    // use native graphics framebuffer - classify backend from gpuprobe
     if (Graphics::GetWidth() > 0 && Graphics::GetHeight() > 0) {
         // determine the actual backend from detected gpu topology
         const GpuProbeResult& gpr = GpuProbe::GetResult();
@@ -77,7 +77,7 @@ bool DisplayManager::Init() {
             else if (vid == GPU_VENDOR_AMD)     backend = DISPLAY_BACKEND_AMD;
             else                                backend = DISPLAY_BACKEND_BGA;
         } else {
-            // no primary detected  -  check individual drivers
+            // no primary detected - check individual drivers
             if (IntelGPU::IsDetected())         backend = DISPLAY_BACKEND_INTEL;
             else if (NvidiaGPU::IsDetected())   backend = DISPLAY_BACKEND_NVIDIA;
             else if (AmdGPU::IsAvailable())     backend = DISPLAY_BACKEND_AMD;
@@ -208,7 +208,7 @@ bool DisplayManager::SetResolution(uint32_t width, uint32_t height, uint8_t bpp)
     }
 
     if (!result) {
-        // restore snapshot  -  most backends keep state on a failed call
+        // restore snapshot - most backends keep state on a failed call
         fb_info = prev;
         current_mode = prev_mode;
         return false;
@@ -392,7 +392,7 @@ VSyncMode DisplayManager::GetVSync() { return vsync_mode; }
 void DisplayManager::WaitVSync() {
     if (vsync_mode == VSYNC_OFF) return;
 
-    // VGA retrace polling  -  bit 3 of port 0x3da. Unbounded reads can hang
+    // VGA retrace polling - bit 3 of port 0x3da. Unbounded reads can hang
     // forever on EFI/non-VGA hardware (port reads 0xff or 0x00); time them
     // out so the present path never wedges the kernel.
     static bool vsync_dead = false;
@@ -466,7 +466,7 @@ int DisplayManager::DetectDisplays() {
     fb_secondary = {};
     for (int i = 0; i < DISPLAY_MAX_MONITORS; i++) monitors[i] = {};
 
-    // primary monitor  -  make sure `monitor` is populated (the virtio/native
+    // primary monitor - make sure `monitor` is populated (the virtio/native
     // init paths don't call ReadEDID like InitBGA does). (satoru)
     if (!monitor.connected) {
         ReadEDID(&monitor);
@@ -544,10 +544,10 @@ int DisplayManager::DetectDisplays() {
         int pages = (fb_secondary.size + 4095) / 4096;
         fb_secondary.address = KernelHeap::Alloc(pages * 4096);
         // TODO (satoru): drive fb_secondary to the secondary controller's
-        // scanout  -  needs per-vendor modeset (intel ggtt/pipe-b, virtio
+        // scanout - needs per-vendor modeset (intel ggtt/pipe-b, virtio
         // second scanout, etc.); until then it is a compositor-only surface.
         if (!fb_secondary.address) {
-            // allocation failed  -  keep the output listed but with no fb.
+            // allocation failed - keep the output listed but with no fb.
             fb_secondary.size = 0;
         }
     }

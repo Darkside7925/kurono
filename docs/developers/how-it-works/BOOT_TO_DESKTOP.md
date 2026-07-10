@@ -14,7 +14,7 @@ Kurono supports a Multiboot path and an EFI loader path. The important point for
 
 The entire high level boot sequence lives in `src/kernel/kurono_kernel.cpp`.
 
-That file is not a stub and not a placeholder. It is the project’s boot script in C++ form.
+That file is not a stub and not a placeholder. It is the project's boot script in C++ form.
 
 The kernel starts by doing four jobs immediately.
 
@@ -92,7 +92,7 @@ The kernel registers Linux commands, Windows commands, installer commands, packa
 
 ## 9. Linux and virtualization policy
 
-Kurono’s Linux subsystem and Kurono’s hypervisor are related but not identical.
+Kurono's Linux subsystem and Kurono's hypervisor are related but not identical.
 
 The Linux subsystem inside `src/linux` is a personality and syscall environment implemented by the native kernel.
 

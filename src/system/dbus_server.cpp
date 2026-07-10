@@ -266,7 +266,7 @@ bool parse_message(const uint8_t* msg, int len, ParsedMsg* out) {
             p = pad_to(p, 4);
             p += 4;
         } else {
-            // Unknown variant  -  bail.
+            // Unknown variant - bail.
             return false;
         }
     }
@@ -287,7 +287,7 @@ void handle_message(Client* c, const uint8_t* msg, int len) {
         c->sent_hello = true;
     } else if (str_eq(pm.iface, "org.freedesktop.DBus") &&
                str_eq(pm.member, "RequestName")) {
-        // body: string name, u32 flags  -  we honour any well-formed name.
+        // body: string name, u32 flags - we honour any well-formed name.
         if (pm.body_len >= 8) {
             uint32_t slen = le32(msg + pm.body_off);
             int boff = pm.body_off + 4;
@@ -359,7 +359,7 @@ void handle_message(Client* c, const uint8_t* msg, int len) {
         send_method_return(c, pm.serial, "as", body, p);
     } else if (str_eq(pm.iface, "org.freedesktop.Notifications") &&
                str_eq(pm.member, "Notify")) {
-        // Always succeed  -  return a fresh notification id.
+        // Always succeed - return a fresh notification id.
         static uint32_t notif_id = 1;
         uint8_t body[8]; put_le32(body, notif_id++);
         send_method_return(c, pm.serial, "u", body, 4);

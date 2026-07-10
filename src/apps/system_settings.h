@@ -1,17 +1,17 @@
-//  kurono os  -  system settings (new, modular) public api + module interface (satoru)
+//  kurono os - system settings (new, modular) public api + module interface (satoru)
 //
 //  this is the FOUNDATION of a detailed, modular "System Settings" app. it
 //  coexists with the legacy src/apps/settings.cpp and does not touch it. the
 //  shell (system_settings.cpp) owns the window, a left sidebar, a scrolling
 //  content pane, and a registry of SettingsModule entries. each category lives
 //  in its own settings_mod_<x>.cpp file and is registered EXPLICITLY via an
-//  extern struct  -  there are NO global constructors in this kernel
+//  extern struct - there are NO global constructors in this kernel
 //  (-fno-use-cxa-atexit), so we never rely on ctor-time registration.
 //
 //  ── how to add a new module in ONE file ───────────────────────────────────
 //  a module author writes exactly one new .cpp, e.g. settings_mod_audio.cpp:
 //
-//      //  kurono os  -  settings module: audio (satoru)
+//      //  kurono os - settings module: audio (satoru)
 //      #include "system_settings.h"
 //      #include "../drivers/graphics.h"      // + whatever the module needs
 //
@@ -52,7 +52,7 @@
 class Window;  // fwd (satoru)
 
 //  one settings category. all fields are plain data / function pointers so the
-//  struct is a constant-initialised aggregate with static storage  -  no runtime
+//  struct is a constant-initialised aggregate with static storage - no runtime
 //  constructor runs. function pointers may be null where noted. (satoru)
 struct SettingsModule {
     const char* id;        // "display","audio",... stable key (satoru)
@@ -71,7 +71,7 @@ namespace SystemSettings {
     void Input(Window* w, int ev, int p1, int p2);
 }
 
-//  reusable control helpers  -  every module draws through these so the whole
+//  reusable control helpers - every module draws through these so the whole
 //  app stays visually consistent and the per-category fan-out is trivial.
 //  drawing helpers paint at the given screen coords; the matching *Hit helpers
 //  take the same anchor plus the pane-local mouse and report a hit. callers own

@@ -30,6 +30,6 @@ The input manager maintains the global cursor position. The desktop renderer que
 
 ## 5. Related files
 
-- `src/drivers/keyboard.cpp`  -  keyboard event source
-- `src/drivers/mouse.cpp`  -  mouse event source
-- `src/ui/desktop.cpp`  -  `HandleInput()` consumer
+- `src/drivers/keyboard.cpp` - keyboard event source
+- `src/drivers/mouse.cpp` - mouse event source
+- `src/ui/desktop.cpp` - `HandleInput()` consumer

@@ -1,4 +1,4 @@
-//  kurono os  -  kcl self-test harness
+//  kurono os - kcl self-test harness
 //
 //  ten scripts exercising every major language feature + the stdlib. each test
 //  runs the source through KCL::Execute and compares the captured output to an
@@ -186,7 +186,7 @@ int KCLTest::RunAll() {
     }
 
     // extra: exercise the shell/file-manager entry point (KCL::ExecFile) and the
-    // import statement together  -  write a library + a main script to kvfs, then
+    // import statement together - write a library + a main script to kvfs, then
     // run the main via ExecFile exactly as `kcl <file>` does. (satoru)
     int total = TEST_COUNT + 1;
     {

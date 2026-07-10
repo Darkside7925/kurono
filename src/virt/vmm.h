@@ -1,11 +1,11 @@
 #pragma once
-//  kurono os  -  virtual machine monitor (vmm)
+//  kurono os - virtual machine monitor (vmm)
 //  intel vt-x / amd-v hardware virtualization support
 #include "../kernel/types.h"
 
-#define CPUID_VMX_BIT       (1 << 5)   // ecx bit 5  -  intel vt-x
-#define CPUID_SVM_BIT       (1 << 2)   // ecx bit 2  -  amd-v (svm)
-#define CPUID_HYPERVISOR_BIT (1 << 31) // ecx bit 31  -  running under hypervisor
+#define CPUID_VMX_BIT       (1 << 5)   // ecx bit 5 - intel vt-x
+#define CPUID_SVM_BIT       (1 << 2)   // ecx bit 2 - amd-v (svm)
+#define CPUID_HYPERVISOR_BIT (1 << 31) // ecx bit 31 - running under hypervisor
 
 #define MSR_IA32_FEATURE_CONTROL    0x0000003A
 #define MSR_IA32_VMX_BASIC          0x00000480
@@ -24,9 +24,9 @@
 #define MSR_IA32_VMX_TRUE_PROCBASED 0x0000048E
 #define MSR_IA32_VMX_TRUE_EXIT      0x0000048F
 #define MSR_IA32_VMX_TRUE_ENTRY     0x00000490
-#define MSR_VM_HSAVE_PA             0xC0010117  // amd  -  host save area pa
-#define MSR_VM_CR                   0xC0010114  // amd  -  vm control
-#define MSR_SVM_KEY                 0xC0010118  // amd  -  svm lock key
+#define MSR_VM_HSAVE_PA             0xC0010117  // amd - host save area pa
+#define MSR_VM_CR                   0xC0010114  // amd - vm control
+#define MSR_SVM_KEY                 0xC0010118  // amd - svm lock key
 
 #define FEATURE_CONTROL_LOCKED      (1 << 0)
 #define FEATURE_CONTROL_VMXON       (1 << 2)
@@ -285,38 +285,38 @@ struct alignas(4096) VMCSRegion {
     uint8_t  data[4096 - 8];  // implementation-specific
 };
 
-//  amd vmcb  -  virtual machine control block (4kb-aligned)
+//  amd vmcb - virtual machine control block (4kb-aligned)
 //  split into control area (offset 0x000) and state save area (offset 0x400)
 struct alignas(4096) VMCB {
-    uint32_t intercept_cr_read;     // 0x000  -  cr read intercepts
-    uint32_t intercept_cr_write;    // 0x004  -  cr write intercepts
-    uint32_t intercept_dr_read;     // 0x008  -  dr read intercepts
-    uint32_t intercept_dr_write;    // 0x00c  -  dr write intercepts
-    uint32_t intercept_exceptions;  // 0x010  -  exception intercepts (bitmap)
-    uint32_t intercept_misc1;       // 0x014  -  misc intercept set 1
-    uint32_t intercept_misc2;       // 0x018  -  misc intercept set 2
+    uint32_t intercept_cr_read;     // 0x000 - cr read intercepts
+    uint32_t intercept_cr_write;    // 0x004 - cr write intercepts
+    uint32_t intercept_dr_read;     // 0x008 - dr read intercepts
+    uint32_t intercept_dr_write;    // 0x00c - dr write intercepts
+    uint32_t intercept_exceptions;  // 0x010 - exception intercepts (bitmap)
+    uint32_t intercept_misc1;       // 0x014 - misc intercept set 1
+    uint32_t intercept_misc2;       // 0x018 - misc intercept set 2
     uint8_t  reserved_0[0x040 - 0x01C];
     uint16_t pause_filter_threshold;// 0x040
     uint16_t pause_filter_count;    // 0x042
-    uint64_t iopm_base_pa;          // 0x048  -  i/o permission map base
-    uint64_t msrpm_base_pa;         // 0x050  -  msr permission map base
+    uint64_t iopm_base_pa;          // 0x048 - i/o permission map base
+    uint64_t msrpm_base_pa;         // 0x050 - msr permission map base
     uint64_t tsc_offset;            // 0x058
-    uint32_t guest_asid;            // 0x060  -  address space identifier
+    uint32_t guest_asid;            // 0x060 - address space identifier
     uint8_t  tlb_control;           // 0x064
     uint8_t  reserved_1[0x068 - 0x065];
-    uint64_t v_tpr;                 // 0x068  -  virtual tpr + v_irq (packed)
-    uint64_t exit_code;             // 0x070  -  exit code
-    uint64_t exit_info1;            // 0x078  -  exit info 1
-    uint64_t exit_info2;            // 0x080  -  exit info 2
-    uint64_t exit_int_info;         // 0x088  -  exit interrupt info
-    uint64_t np_enable;             // 0x090  -  nested paging enable
-    uint64_t avic_apic_bar;         // 0x098  -  avic apic bar
+    uint64_t v_tpr;                 // 0x068 - virtual tpr + v_irq (packed)
+    uint64_t exit_code;             // 0x070 - exit code
+    uint64_t exit_info1;            // 0x078 - exit info 1
+    uint64_t exit_info2;            // 0x080 - exit info 2
+    uint64_t exit_int_info;         // 0x088 - exit interrupt info
+    uint64_t np_enable;             // 0x090 - nested paging enable
+    uint64_t avic_apic_bar;         // 0x098 - avic apic bar
     uint8_t  reserved_2[0x0B0 - 0x0A0];
-    uint64_t event_inject;          // 0x0b0  -  event injection
-    uint64_t n_cr3;                 // 0x0b8  -  nested page table cr3 (ncr3)
+    uint64_t event_inject;          // 0x0b0 - event injection
+    uint64_t n_cr3;                 // 0x0b8 - nested page table cr3 (ncr3)
     uint64_t lbr_virt_enable;       // 0x0c0
     uint64_t vmcb_clean_bits;       // 0x0c8
-    uint64_t next_rip;              // 0x0d0  -  next sequential rip on intercept
+    uint64_t next_rip;              // 0x0d0 - next sequential rip on intercept
     uint8_t  reserved_3[0x400 - 0x0D8];
 
     // segment registers
@@ -362,7 +362,7 @@ struct alignas(4096) VMCB {
     uint64_t sysenter_eip;          // 0x630
     uint64_t cr2;                   // 0x638
     uint8_t  reserved_9[0x668 - 0x640];
-    uint64_t g_pat;                 // 0x668  -  guest pat
+    uint64_t g_pat;                 // 0x668 - guest pat
     uint64_t dbg_ctl;               // 0x670
     uint64_t br_from;               // 0x678
     uint64_t br_to;                 // 0x680
@@ -371,7 +371,7 @@ struct alignas(4096) VMCB {
     uint8_t  reserved_end[4096 - 0x698];
 };
 
-//  vcpu  -  per-virtual-cpu state
+//  vcpu - per-virtual-cpu state
 struct vCPU {
     int          vcpu_id;
     VirtType     type;       // vtx or svm
@@ -384,7 +384,7 @@ struct vCPU {
     uint64_t     regs[16];  // rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8-r15
 };
 
-//  vmm  -  virtual machine monitor
+//  vmm - virtual machine monitor
 class VMM {
 public:
     static void   Init();

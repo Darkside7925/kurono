@@ -165,7 +165,7 @@ void EnterIdle(uint64_t predicted_residency_us) {
             __asm__ __volatile__("sti; hlt; cli");
         }
     } else {
-        // Deep idle  -  for now also MWAIT C3 hint 0x20.
+        // Deep idle - for now also MWAIT C3 hint 0x20.
         __asm__ __volatile__("monitor" : : "a"(0), "c"(0), "d"(0));
         __asm__ __volatile__("mwait"   : : "a"(0x20), "c"(0));
     }
@@ -175,12 +175,12 @@ bool SuspendToRam() {
     // ACPI S3 entry would: flush dirty cache, save processor state,
     // store wakeup vector at FACS+0x0C, write SLP_TYP|SLP_EN to PM1a/b.
     // We have no real ACPI parser yet, so log + return false.
-    SerialLogger::Log("CPUFreq: SuspendToRam (S3) requested  -  ACPI tables required\r\n");
+    SerialLogger::Log("CPUFreq: SuspendToRam (S3) requested - ACPI tables required\r\n");
     return false;
 }
 
 bool Hibernate() {
-    SerialLogger::Log("CPUFreq: Hibernate (S4) requested  -  swap image required\r\n");
+    SerialLogger::Log("CPUFreq: Hibernate (S4) requested - swap image required\r\n");
     return false;
 }
 

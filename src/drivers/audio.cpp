@@ -1,5 +1,5 @@
-//  kurono os  -  sound blaster 16 audio driver implementation
-//  polling-based (no irq handler)  -  compatible with qemu -device sb16
+//  kurono os - sound blaster 16 audio driver implementation
+//  polling-based (no irq handler) - compatible with qemu -device sb16
 #include "audio.h"
 #include "../hal/hal.h"
 #include "../drivers/serial.h"
@@ -230,7 +230,7 @@ bool Audio::Init() {
     
     // try to reset the dsp
     if (!ResetDSP()) {
-        SerialLogger::Log("[AUDIO] DSP reset failed  -  no SB16 detected\n");
+        SerialLogger::Log("[AUDIO] DSP reset failed - no SB16 detected\n");
         available = false;
         return false;
     }
@@ -272,7 +272,7 @@ bool Audio::IsAvailable() {
 
 void Audio::FillDMABuffer() {
     if (!pcm_source || pcm_offset >= pcm_length) {
-        // no more data  -  fill with silence
+        // no more data - fill with silence
         if (current_bits == 8) {
             memset(dma_buffer, 0x80, AUDIO_BUFFER_SIZE);   // unsigned 8-bit silence
         } else {
@@ -300,7 +300,7 @@ void Audio::FillDMABuffer() {
 void Audio::StartPlayback() {
     if (!available) return;
     
-    // always transfer the full dma buffer  -  filldmabuffer() already padded with silence
+    // always transfer the full dma buffer - filldmabuffer() already padded with silence
     int transfer_len = AUDIO_BUFFER_SIZE;
     
     uint32_t buf_phys = (uint32_t)(uintptr_t)dma_buffer;
@@ -686,7 +686,7 @@ void Audio::HandleIRQ() {
         FillDMABuffer();
         StartPlayback();
     } else {
-        // Stream finished  -  mark stopped and release the source pointer
+        // Stream finished - mark stopped and release the source pointer
         // so a subsequent Play() / Stop() doesn't see stale state.
         state = AUDIO_STOPPED;
         pcm_source = nullptr;
@@ -695,14 +695,14 @@ void Audio::HandleIRQ() {
     }
 }
 
-//  tick  -  polling-based buffer management
+//  tick - polling-based buffer management
 //  call this periodically from the main loop
 
 void Audio::Tick() {
     if (!available || state != AUDIO_PLAYING) return;
 
     // Read DMA remaining-count from the relevant controller.  Bytes (8-bit
-    // DMA) or words (16-bit DMA)  -  semantics here are just "did the DMA
+    // DMA) or words (16-bit DMA) - semantics here are just "did the DMA
     // reach the end of the buffer?"  Ack the IRQ regardless to avoid
     // missing the next half on auto-init engines.
     uint16_t remaining_count;

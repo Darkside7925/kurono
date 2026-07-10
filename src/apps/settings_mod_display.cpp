@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: display & monitors (reference module #1) (satoru)
+//  kurono os - settings module: display & monitors (reference module #1) (satoru)
 //  shows backend/monitor, a resolution selector (from DisplayManager supported
 //  modes), a refresh-rate selector that applies live + persists, a brightness
 //  slider, and a vsync toggle. all writes go through UIConfig + Graphics. (satoru)
@@ -7,7 +7,7 @@
 #include "../drivers/display_mgr.h"
 #include "../system/ui_config.h"
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 static int      s_brightness = 75;     // 0..100, persisted to display.brightness (satoru)
 static int      s_refresh_hz = 60;     // target fps cap, persisted to display.refresh_hz (satoru)
 static bool     s_vsync      = true;   // persisted to display.vsync (satoru)
@@ -185,7 +185,7 @@ static void display_render(int x, int y, int w, int h, int scroll){
     ly += 24;
     // honest note: the value persists, but this backend has no panel/gamma
     // dimming, so the slider does not actually change screen brightness. (satoru)
-    Graphics::DrawString(x, ly, "Saved as a preference  -  this backend has no hardware dimming.",
+    Graphics::DrawString(x, ly, "Saved as a preference - this backend has no hardware dimming.",
                          SettingsUI::COL_DIM, 0xFF000000);
     ly += 16;
 }

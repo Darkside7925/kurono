@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  linux driver compatibility framework
+//  kurono os - linux driver compatibility framework
 //  implements linux-style driver model for native hardware drivers
 //  that are compatible with the linux subsystem.
 //
@@ -117,7 +117,7 @@ struct LinuxDriver {
     uint32_t             hw_base;          // hardware base address (if any)
 };
 
-//  linuxdriverframework  -  manages all drivers
+//  linuxdriverframework - manages all drivers
 
 class LinuxDriverFramework {
 public:

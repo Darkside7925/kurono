@@ -1,4 +1,4 @@
-//  kurono os  -  intel iwlwifi wifi radio driver implementation (satoru)
+//  kurono os - intel iwlwifi wifi radio driver implementation (satoru)
 //  see wifi_iwl.h. implements WifiRadioOps for intel wireless nics and registers
 //  it with net/ieee80211. cross-referenced from linux iwlwifi for the hardware
 //  behaviour; original kurono code. (satoru)
@@ -13,12 +13,12 @@
 #include <string.h>
 
 // ════════════════════════════════════════════════════════════════════════════
-//  register definitions  -  ref: linux iwlwifi/iwl-csr.h, iwl-fh.h, iwl-prph.h
+//  register definitions - ref: linux iwlwifi/iwl-csr.h, iwl-fh.h, iwl-prph.h
 //  these are the same offsets the real hardware decodes; named lowercase per the
 //  kurono convention but kept 1:1 with the linux macro names in comments. (satoru)
 // ════════════════════════════════════════════════════════════════════════════
 
-// ── CSR (control/status registers)  -  directly pci-mapped, no nic-access needed.
+// ── CSR (control/status registers) - directly pci-mapped, no nic-access needed.
 //    ref: iwl-csr.h (satoru)
 #define CSR_HW_IF_CONFIG_REG    0x000   // hardware interface config (satoru)
 #define CSR_INT_COALESCING      0x004
@@ -44,7 +44,7 @@
 #define CSR_DBG_LINK_PWR_MGMT_REG 0x250
 #define CSR_HW_REV_WA_REG       0x22c
 
-// HBUS (host bus)  -  indirect access to internal sram + periphery. these need the
+// HBUS (host bus) - indirect access to internal sram + periphery. these need the
 // mac powered up (grab-nic-access). ref: iwl-csr.h §HBUS (satoru)
 #define HBUS_TARG_MEM_RADDR     0x40c
 #define HBUS_TARG_MEM_WADDR     0x410
@@ -120,7 +120,7 @@
 #define CSR_FH_INT_RX_MASK      (CSR_FH_INT_BIT_HI_PRIOR | CSR_FH_INT_BIT_RX_CHNL0 | (1u<<17))
 #define CSR_FH_INT_TX_MASK      (CSR_FH_INT_BIT_TX_CHNL0 | (1u<<1))
 
-// CSR_DRAM_INT_TBL (ict  -  interrupt coalescing table; we leave it disabled and
+// CSR_DRAM_INT_TBL (ict - interrupt coalescing table; we leave it disabled and
 // use the legacy non-ict isr path which is simpler for a bring-up). (satoru)
 
 // ── FH (flow-handler / busmaster dma) registers. these are CSR-class (directly
@@ -134,7 +134,7 @@
 #define FH_MEM_CBBC_0_15_LOWER_BOUND   (FH_MEM_LOWER_BOUND + 0x9D0)
 #define FH_MEM_CBBC_QUEUE(q)           (FH_MEM_CBBC_0_15_LOWER_BOUND + 4 * (q))
 
-// rx ring (rscsr/rcsr/rssr)  -  legacy single-rx-queue path. ref: iwl-fh.h (satoru)
+// rx ring (rscsr/rcsr/rssr) - legacy single-rx-queue path. ref: iwl-fh.h (satoru)
 #define FH_MEM_RSCSR_LOWER_BOUND       (FH_MEM_LOWER_BOUND + 0xBC0)
 #define FH_MEM_RSCSR_CHNL0             (FH_MEM_RSCSR_LOWER_BOUND)
 #define FH_RSCSR_CHNL0_STTS_WPTR_REG   (FH_MEM_RSCSR_CHNL0)         // rx status buf base >>4 (satoru)
@@ -173,7 +173,7 @@
 #define FH_TX_CHICKEN_BITS_REG         (FH_MEM_LOWER_BOUND + 0xE98)
 #define FH_TX_CHICKEN_BITS_SCD_AUTO_RETRY_EN  0x00000002
 
-// ── PRPH (periphery) registers  -  internal, NOT pci-mapped. accessed indirectly
+// ── PRPH (periphery) registers - internal, NOT pci-mapped. accessed indirectly
 //    via HBUS_TARG_PRPH_*. ref: iwl-prph.h (satoru)
 #define APMG_BASE                      0x3000
 #define APMG_CLK_CTRL_REG              (APMG_BASE + 0x0000)
@@ -189,13 +189,13 @@
 #define APMG_PCIDEV_STT_VAL_L1_ACT_DIS 0x00000800       // disable l1-active (satoru)
 #define APMG_RTC_INT_STT_RFKILL        0x10000000
 
-// scheduler (scd) prph base  -  used for tx-queue chain/credit setup on real hw.
+// scheduler (scd) prph base - used for tx-queue chain/credit setup on real hw.
 // ref: iwl-prph.h / iwl-scd.h. left minimal here (UNVERIFIED full scd setup needs
 // the mvm fw api + real silicon). (satoru)
 #define SCD_BASE                       0xa02c00
 
 // ════════════════════════════════════════════════════════════════════════════
-//  dma ring layout  -  ref: iwl-fh.h (TFD / RBD formats) (satoru)
+//  dma ring layout - ref: iwl-fh.h (TFD / RBD formats) (satoru)
 // ════════════════════════════════════════════════════════════════════════════
 
 // rx: 256 receive-buffer descriptors, each a 4k buffer. the legacy rbd is just
@@ -261,7 +261,7 @@ struct IwlRxPacketHdr {
 // ════════════════════════════════════════════════════════════════════════════
 struct IwlState {
     bool      registered;             // RegisterRadio called (satoru)
-    bool      started;                // start() succeeded  -  rings live, ucode loaded (satoru)
+    bool      started;                // start() succeeded - rings live, ucode loaded (satoru)
     bool      fw_loaded;              // ucode dma'd in and alive seen (satoru)
     const WifiDevice* dev;
 
@@ -300,7 +300,7 @@ static Ieee80211::WifiRadioOps g_iwl_ops = {};
 static inline uint32_t r32(uint32_t off)            { return WifiDev::RegRead(off); }
 static inline void     w32(uint32_t off, uint32_t v){ WifiDev::RegWrite(off, v); }
 
-// set/clear bits preserving the rest (the iwl_set_bit / iwl_clear_bit idiom  -  the
+// set/clear bits preserving the rest (the iwl_set_bit / iwl_clear_bit idiom - the
 // hardware leaves default bits set after reset that we must not stomp). (satoru)
 static inline void set_bit(uint32_t off, uint32_t mask)   { w32(off, r32(off) | mask); }
 static inline void clear_bit(uint32_t off, uint32_t mask) { w32(off, r32(off) & ~mask); }
@@ -366,7 +366,7 @@ static void set_bits_mask_prph(uint32_t ofs, uint32_t bits, uint32_t mask) {
 
 // ════════════════════════════════════════════════════════════════════════════
 //  apm (advanced power management) + nic reset/init.
-//  ref: linux iwlwifi/pcie/gen1_2/trans.c  -  iwl_pcie_apm_init,
+//  ref: linux iwlwifi/pcie/gen1_2/trans.c - iwl_pcie_apm_init,
 //  iwl_pcie_set_hw_ready, iwl_pcie_prepare_card_hw, iwl_trans_pcie_sw_reset,
 //  iwl_pcie_gen1_2_activate_nic. (satoru)
 // ════════════════════════════════════════════════════════════════════════════
@@ -430,7 +430,7 @@ static bool sw_reset(bool retake_ownership) {
 static bool apm_init() {
     SerialLogger::Log("[iwl] apm_init: bringing up basic nic functions\r\n");
 
-    // disable the l0s exit timer (platform nmi w/a  -  applies to <8000 family; we
+    // disable the l0s exit timer (platform nmi w/a - applies to <8000 family; we
     // set it unconditionally, it is harmless on newer parts). (satoru)
     set_bit(CSR_GIO_CHICKEN_BITS, CSR_GIO_CHICKEN_BITS_REG_BIT_DIS_L0S_EXIT_TIMER);
     // disable l0s without affecting l1; don't wait for ich l0s (ich bug w/a). (satoru)
@@ -448,7 +448,7 @@ static bool apm_init() {
     // enable the dma clock and let it stabilise, then disable l1-active and clear
     // any apmg rfkill interrupt. these are apmg-prph (periphery) accesses, valid
     // now that the mac clock is ready. parts without apmg (newer ax / gen2) skip
-    // this  -  UNVERIFIED which exact device families we get; the apmg writes are
+    // this - UNVERIFIED which exact device families we get; the apmg writes are
     // ignored by the prph mux on parts that lack the block. (satoru)
     write_prph(APMG_CLK_EN_REG, APMG_CLK_VAL_DMA_CLK_RQT);
     udelay(20);
@@ -480,12 +480,12 @@ static void apm_stop() {
 static bool hw_rfkill_set() {
     return (r32(CSR_GP_CNTRL) & CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) == 0;
     // NOTE on real hw the bit is "1 = switch NOT killing"; the sense is inverted
-    // per platform wiring. UNVERIFIED polarity  -  confirm on silicon. (satoru)
+    // per platform wiring. UNVERIFIED polarity - confirm on silicon. (satoru)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 //  dma ring allocation + setup. all rings come from PMM::AllocBytes, which hands
-//  back page-aligned, zeroed, contiguous, identity-mapped (phys==virt) memory  - 
+//  back page-aligned, zeroed, contiguous, identity-mapped (phys==virt) memory - 
 //  exactly the dma-coherent property the device needs. the returned pointer value
 //  IS the physical address for the descriptor base registers. (satoru)
 // ════════════════════════════════════════════════════════════════════════════
@@ -591,7 +591,7 @@ static bool tx_hw_init() {
 
     // NOTE: a full tx path also needs the firmware scheduler (scd) queue chain +
     // the per-queue byte-count table + a tx command (TX_CMD) wrapper carrying the
-    // rate/antenna/flags  -  all part of the mvm fw api. that handshake needs the
+    // rate/antenna/flags - all part of the mvm fw api. that handshake needs the
     // alive notification + real silicon. UNVERIFIED beyond the fh-level ring here.
     // (satoru)
     SerialLogger::Log("[iwl] tx ring enabled (queue 0)\r\n");
@@ -759,7 +759,7 @@ static uint32_t read_ucode_file(uint16_t device, uint8_t** out_buf) {
     tries[nt++] = "iwlwifi-default.ucode";
 
     for (int t = 0; t < nt; t++) {
-        // path = IWL_FW_DIR + tries[t] (separate src/dst indices  -  concatenate the
+        // path = IWL_FW_DIR + tries[t] (separate src/dst indices - concatenate the
         // dir then the name, bounded by sizeof(path)). (satoru)
         int p = 0;
         const char* d = IWL_FW_DIR;
@@ -819,7 +819,7 @@ static bool fw_load_and_start(const uint8_t* blob, uint32_t len) {
     }
 
     // honesty: without the device we cannot observe ALIVE. report it plainly; the
-    // sections are in sram and the cpu was released  -  the maintainer confirms the
+    // sections are in sram and the cpu was released - the maintainer confirms the
     // alive handshake (and the subsequent fw INIT/calibration phase) on silicon.
     // (satoru)
     SerialLogger::Log("[iwl] ucode: ALIVE not observed (expected without real hw)\r\n");
@@ -827,7 +827,7 @@ static bool fw_load_and_start(const uint8_t* blob, uint32_t len) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  rx drain  -  pull received frames out of the rbd ring and push to the stack.
+//  rx drain - pull received frames out of the rbd ring and push to the stack.
 //  ref: iwl-fh.h §rx (the closed-rb write pointer in rb_status) + linux
 //  iwl_pcie_rx_handle. (satoru)
 // ════════════════════════════════════════════════════════════════════════════
@@ -848,7 +848,7 @@ static int rx_drain_one(uint8_t* buf, int buf_max) {
     // the rb begins with the rx-packet header giving the payload byte count. the
     // 802.11 frame sits after the rx command's phy-info; the exact payload offset
     // is fw-api-specific. we expose the header length and hand the body region to
-    // the stack. UNVERIFIED payload offset  -  the maintainer pins it on silicon.
+    // the stack. UNVERIFIED payload offset - the maintainer pins it on silicon.
     // (satoru)
     const IwlRxPacketHdr* h = (const IwlRxPacketHdr*)rb;
     uint32_t plen = le32((const uint8_t*)&h->len_n_flags) & IWL_RX_LEN_MASK;
@@ -923,7 +923,7 @@ bool WifiIwl::op_start(void* ctx) {
     uint8_t* fw = nullptr;
     uint32_t fwlen = read_ucode_file(g_iwl.dev->device, &fw);
     if (fwlen == 0) {
-        SerialLogger::Log("[iwl] start: failing gracefully  -  firmware required\r\n");
+        SerialLogger::Log("[iwl] start: failing gracefully - firmware required\r\n");
         return false;
     }
     bool ok = fw_load_and_start(fw, fwlen);
@@ -932,7 +932,7 @@ bool WifiIwl::op_start(void* ctx) {
 
     if (!ok) {
         // hardware + rings are up but the ucode didn't come alive (no device).
-        // honest failure  -  do NOT pretend the radio is operational. (satoru)
+        // honest failure - do NOT pretend the radio is operational. (satoru)
         return false;
     }
 
@@ -968,10 +968,10 @@ bool WifiIwl::op_set_channel(void* ctx, int ch) {
     // tuning the phy is a firmware command: on the mvm api this is a PHY_CONTEXT_
     // CMD (add/modify) carrying the band + channel + width, or on dvm parts an
     // RXON with the channel. that requires the live fw command queue (post-alive).
-    // we cache the channel and report success only if the fw is up  -  otherwise the
+    // we cache the channel and report success only if the fw is up - otherwise the
     // synth never actually moves, and lying would race the scan dwell. since we
     // can't issue the cmd without silicon, return whether fw is loaded. ref: mvm
-    // phy_ctxt_cmd. UNVERIFIED  -  needs real hw. (satoru)
+    // phy_ctxt_cmd. UNVERIFIED - needs real hw. (satoru)
     if (!g_iwl.fw_loaded) return false;
     // (real impl: build + enqueue PHY_CONTEXT_CMD on the cmd queue, wait for the
     // response, then return.) (satoru)
@@ -1075,7 +1075,7 @@ bool WifiIwl::TryRegister() {
     g_iwl.last_rssi = -100;
 
     if (!d->mmio_mapped)
-        SerialLogger::Log("[iwl] warning: mmio window not live  -  start() will fail\r\n");
+        SerialLogger::Log("[iwl] warning: mmio window not live - start() will fail\r\n");
 
     // fill the ops vtable. (satoru)
     g_iwl_ops.start         = &WifiIwl::op_start;

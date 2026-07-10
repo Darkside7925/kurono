@@ -1,7 +1,7 @@
-// kurono os  -  built-in mini Python 3 interpreter.
+// kurono os - built-in mini Python 3 interpreter.
 //
 // Supported subset (sufficient for hello-world, fizzbuzz, fibonacci,
-// list comprehensions are NOT supported  -  but plain for/while are):
+// list comprehensions are NOT supported - but plain for/while are):
 //   - literals: int, float, "string" / 'string', True/False/None, [a,b,c]
 //   - operators: + - * / // % **, == != < > <= >=, and, or, not, in
 //   - parens, function calls, list/string indexing, len/range/str/int/abs/min/max/print/type/input

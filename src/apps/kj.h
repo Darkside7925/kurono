@@ -1,12 +1,12 @@
 #pragma once
-//  kurono os  -  kj (kurono javascript)
+//  kurono os - kj (kurono javascript)
 //
 //  a freestanding javascript-subset interpreter for scripting the desktop: a
 //  hand-written lexer + recursive-descent parser to an ast, then a tree-walking
 //  evaluator over a tagged value type (undefined/null/bool/number/string/array/
 //  object/function-closure). no libc, no stl. modeled on the proven kcl/python
 //  in-kernel interpreters. compiled with the generic sse-enabled rule so the
-//  double-based number type works (see Makefile  -  kj.cpp is NOT in the no-sse
+//  double-based number type works (see Makefile - kj.cpp is NOT in the no-sse
 //  list, same as kcl.cpp).
 //
 //  language subset:
@@ -22,7 +22,7 @@
 //    - if/else, while, for(init;cond;step), for-of, break/continue
 //    - // and /* */ comments
 //
-//  host bindings (the point  -  scripts drive the kss styling/animation layer):
+//  host bindings (the point - scripts drive the kss styling/animation layer):
 //    console.log(...)                     -> program output
 //    kss.set(selector, prop, value)       -> KSS::Sheet::SetColor/SetScalar
 //    kss.get(selector, prop)              -> read a resolved property
@@ -37,7 +37,7 @@ public:
     static void Init();
 
     // run kj source; program output (console.log etc.) is written to `out` (capped
-    // at max_out, always nul-terminated). errors are captured into `out` too  -  kj
+    // at max_out, always nul-terminated). errors are captured into `out` too - kj
     // never crashes the os. returns bytes written. (satoru)
     static int Execute(const char* source, char* out, int max_out);
     // run a script stored in the kvfs. (satoru)

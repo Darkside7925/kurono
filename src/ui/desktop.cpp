@@ -1,4 +1,4 @@
-//  kurono os  -  taskbar & desktop environment implementation
+//  kurono os - taskbar & desktop environment implementation
 #include "desktop.h"
 #include "../../logo.h"
 #include "control_center.h"
@@ -79,13 +79,13 @@ static void int2(int v,char*b){b[0]='0'+(v/10)%10;b[1]='0'+v%10;b[2]=0;}
 static uint32_t de_last_frame_ms        = 0;
 
 static inline float clamp01(float v){ return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
-// Ease-out cubic  -  fast start, gentle landing.  Used for one-shot pops.
+// Ease-out cubic - fast start, gentle landing.  Used for one-shot pops.
 static inline float ease_out_cubic(float t){
     t = clamp01(t);
     float inv = 1.0f - t;
     return 1.0f - inv*inv*inv;
 }
-// Ease-in-out cubic  -  for symmetric open/close transitions.
+// Ease-in-out cubic - for symmetric open/close transitions.
 static inline float ease_in_out_cubic(float t){
     t = clamp01(t);
     if (t < 0.5f) return 4.0f * t*t*t;
@@ -298,7 +298,7 @@ void Taskbar::RenderStartButton(){
     // only a faint translucent highlight on hover so there's still a hover cue. (satoru)
     if (hover_button == 0) Graphics::FillRectAlpha(bx, by, btn_w, btn_h, 30, 0xFFFFFF);
     // kurono boot logo (the angular emblem from the splash screen), cropped to
-    // its bounding box in logo_data and scaled to fill the button  -  replaces the
+    // its bounding box in logo_data and scaled to fill the button - replaces the
     // old hand-drawn "k". (satoru)
     const int LBX0 = 97, LBY0 = 80, LBW = 99, LBH = 141;   // emblem bbox (satoru)
     int lh = btn_h - 8;
@@ -323,7 +323,7 @@ void Taskbar::RenderStartButton(){
 static void tb_render_quick_launch(){
     int x = tb_pin_strip_x();
     int y = tb_bar_y() + (TASKBAR_HEIGHT - TB_PIN_SZ) / 2;
-    // Walk the windows array directly (id != index  -  GetWindow(i) was wrong).
+    // Walk the windows array directly (id != index - GetWindow(i) was wrong).
     Window* wlist = WindowManager::GetWindows();
     for (int i = 0; i < TB_PINNED_COUNT; i++) {
         // hover lift: scale [0..1] -> shrink rect by up to 2 px so the icon
@@ -346,7 +346,7 @@ static void tb_render_quick_launch(){
             }
         }
         // while this icon is mid hover-lift or launch-bounce, damage only its
-        // tile (plus the max pop margin) so the present stays partial  -  a single
+        // tile (plus the max pop margin) so the present stays partial - a single
         // icon animating must not re-copy the whole framebuffer. the +8 margin
         // covers the largest pop (2px hover + 5px bounce, rounded). (satoru)
         if (bouncing || t > 0.01f)
@@ -400,7 +400,7 @@ void Taskbar::RenderTaskButtons(){
     } else {
         Graphics::DrawString(sb_x + 28, sb_y + 6, "Search apps...", 0xFF606080, 0xFF000000);
     }
-    // blinking cursor when active  -  driven by real time (~500ms period).
+    // blinking cursor when active - driven by real time (~500ms period).
     if (search_active) {
         int cx = sb_x + 28 + search_len * 8;
         uint32_t dt = Timer::GetRealMs() - search_cursor_t0_ms;
@@ -408,7 +408,7 @@ void Taskbar::RenderTaskButtons(){
             Graphics::FillRect(cx, sb_y + 5, 2, sb_h - 10, 0xFF5C8AFF);
     }
 
-    // count visible windows for centering  -  walk array directly.
+    // count visible windows for centering - walk array directly.
     int win_ids[WM_MAX_WINDOWS];
     int wcount = 0;
     Window* wlist = WindowManager::GetWindows();
@@ -439,7 +439,7 @@ void Taskbar::RenderTaskButtons(){
             Graphics::FillRect(x+8, y_pos+TASKBAR_HEIGHT-4, bw-16, 3, COL_START_BTN);
         }
 
-        // app icon  -  colored rounded square with a flat vector glyph (satoru)
+        // app icon - colored rounded square with a flat vector glyph (satoru)
         unsigned int ic = 0xFF3498DB;
         char c0 = w->title[0];
         if(c0=='T') ic = 0xFF2ECC71;
@@ -491,7 +491,7 @@ void Taskbar::RenderClock(){
 }
 
 void Taskbar::RenderSystemTray(){
-    // System tray cluster: bell, network, volume, battery  -  packed
+    // System tray cluster: bell, network, volume, battery - packed
     // from right to left using helpers.
 
     // Notifications bell (decorative for now; click opens ControlCenter).
@@ -584,7 +584,7 @@ void Taskbar::RenderStartMenu(){
     int draw_h = (int)(full_h * (0.92f + 0.08f * t) + 0.5f);
     int lift   = (int)((1.0f - t) * 16.0f);
 
-    // left-aligned off the k button (which is anchored to the floating bar)  - 
+    // left-aligned off the k button (which is anchored to the floating bar) - 
     // above the bar when docked bottom, below it when docked top. (satoru)
     int mx0 = tb_bar_x() + 6;
     int my0 = tb_popup_y(draw_h, 8, lift);
@@ -672,7 +672,7 @@ void Taskbar::Render(){
     Graphics::FillRectAlpha(bx + 2, by + bh + 2, bw - 4, 4, 90,  0xFF000000);
     Graphics::FillRectAlpha(bx + 4, by + bh + 6, bw - 8, 3, 50,  0xFF000000);
 
-    // Bar body  -  rounded "card"
+    // Bar body - rounded "card"
     Graphics::FillRoundedRect(bx, by, bw, bh, br, COL_TASKBAR);
     // Subtle top inner highlight (fakes a glossy edge)
     Graphics::FillRoundedRect(bx, by, bw, 1, 0, COL_TASKBAR_TOP);
@@ -765,7 +765,7 @@ void Taskbar::RenderVolumePopup(){
     Graphics::FillRoundedRect(pop_x, pop_y, pop_w, pop_h, 8, 0xFF181828);
     Graphics::DrawRect(pop_x, pop_y, pop_w, pop_h, 0xFF333355);
     Graphics::MarkDirty(pop_x-4, pop_y-4, pop_w+12, pop_h_full+16);
-    if (t < 0.55f) return;   // skip content while still squat  -  looks smoother
+    if (t < 0.55f) return;   // skip content while still squat - looks smoother
 
     // mute/unmute icon at top
     int icon_cx = pop_x + pop_w/2;
@@ -923,7 +923,7 @@ bool Taskbar::HandleClick(int mx,int my){
     }
 
     // a click that is neither off-bar (handled above) nor inside the bar row is
-    // in the thin wallpaper gap on the bar's far side  -  pass it through rather
+    // in the thin wallpaper gap on the bar's far side - pass it through rather
     // than swallow it (swallowing it is what broke all input with a top dock). (satoru)
     if(my < y_pos || my >= y_pos + TASKBAR_HEIGHT){
         StartMenuSet(false);
@@ -932,7 +932,7 @@ bool Taskbar::HandleClick(int mx,int my){
         return false;
     }
 
-    // K button  -  anchored to the floating bar's left edge
+    // K button - anchored to the floating bar's left edge
     {
         int k_x = tb_bar_x() + 6;
         if(mx>=k_x && mx<k_x+44 && my>=y_pos+4 && my<y_pos+TASKBAR_HEIGHT-4){
@@ -973,7 +973,7 @@ bool Taskbar::HandleClick(int mx,int my){
         }
     }
 
-    // Task buttons  -  centered, layout matches RenderTaskButtons.
+    // Task buttons - centered, layout matches RenderTaskButtons.
     {
         int win_ids[WM_MAX_WINDOWS];
         int wcount = 0;
@@ -1007,7 +1007,7 @@ bool Taskbar::HandleClick(int mx,int my){
 
     // Right cluster: bell, network, volume, battery, clock.
     {
-        // Volume icon  -  opens dedicated volume popup
+        // Volume icon - opens dedicated volume popup
         int vol_x3 = tb_vol_x();
         if(mx>=vol_x3 && mx<vol_x3+TB_VOL_W && my>=y_pos){
             bool was_open = volume_popup_open;
@@ -1072,7 +1072,7 @@ void Taskbar::Tick(uint32_t delta_ms, int mx, int my){
         volume_popup_phase = volume_popup_anim_opening ? raw : (1.0f - raw);
     }
 
-    // ── Pinned-icon hover phase  -  ease toward 1 if hovered, 0 if not ─
+    // ── Pinned-icon hover phase - ease toward 1 if hovered, 0 if not ─
     int strip_x = tb_pin_strip_x();
     int strip_y = tb_bar_y() + (TASKBAR_HEIGHT - TB_PIN_SZ) / 2;
     int hover = -1;
@@ -1490,7 +1490,7 @@ void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
     wallpaper_src_order = img.order;
 
     // Floating taskbar leaves a strip of wallpaper visible at the bottom and
-    // behind the bar's rounded corners  -  render full screen height.
+    // behind the bar's rounded corners - render full screen height.
     if (screen_width <= 0 || screen_height <= 0) return;
     ScaleWallpaperCache(screen_width, screen_height);
     Graphics::MarkUIDirty();   // new wallpaper image ready -> repaint
@@ -1543,7 +1543,7 @@ void Desktop::RenderWallpaper(){
 
     // if we have an image wallpaper, skip procedural generation
     if (have_image_wallpaper && gradient_cache && gradient_cache_h == h) {
-        // fast blit image wallpaper  -  row-wise memcpy for maximum throughput
+        // fast blit image wallpaper - row-wise memcpy for maximum throughput
         uint8_t* buf = Graphics::GetBackBuffer();
         if (!buf) buf = Graphics::GetBuffer();
         uint32_t pitch = Graphics::GetPitch();
@@ -1583,7 +1583,7 @@ void Desktop::RenderWallpaper(){
                     // base: deep midnight blue-purple
                     float r = 8.0f, g = 5.0f, b = 22.0f;
 
-                    // warm orb (upper-right)  -  amber/orange glow
+                    // warm orb (upper-right) - amber/orange glow
                     float dx1 = tx - 0.78f;
                     float dy1 = ty - 0.18f;
                     float d1 = dx1*dx1 + dy1*dy1;
@@ -1592,7 +1592,7 @@ void Desktop::RenderWallpaper(){
                     g += 110.0f * orb1;
                     b += 25.0f * orb1;
 
-                    // cool orb (lower-left)  -  deep blue glow
+                    // cool orb (lower-left) - deep blue glow
                     float dx2 = tx - 0.15f;
                     float dy2 = ty - 0.82f;
                     float d2 = dx2*dx2 + dy2*dy2;
@@ -1601,7 +1601,7 @@ void Desktop::RenderWallpaper(){
                     g += 30.0f * orb2;
                     b += 140.0f * orb2;
 
-                    // accent orb (center)  -  soft magenta/pink
+                    // accent orb (center) - soft magenta/pink
                     float dx3 = tx - 0.5f;
                     float dy3 = ty - 0.42f;
                     float d3 = dx3*dx3 + dy3*dy3;
@@ -1610,7 +1610,7 @@ void Desktop::RenderWallpaper(){
                     g += 25.0f * orb3;
                     b += 70.0f * orb3;
 
-                    // aurora ribbon (upper-center)  -  teal/cyan sweep
+                    // aurora ribbon (upper-center) - teal/cyan sweep
                     float dx4 = tx - 0.4f;
                     float dy4 = ty - 0.1f;
                     float d4 = dx4*dx4*0.5f + dy4*dy4*4.0f;
@@ -1628,7 +1628,7 @@ void Desktop::RenderWallpaper(){
                     g += 20.0f * orb5;
                     b += 50.0f * orb5;
 
-                    // vignette  -  darken edges for depth
+                    // vignette - darken edges for depth
                     float vx = (tx - 0.5f) * 2.0f;
                     float vy = (ty - 0.5f) * 2.0f;
                     float vignette = 1.0f - (vx*vx + vy*vy) * 0.15f;
@@ -1673,12 +1673,12 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     int ix=ic->x, iy=ic->y;
     int icon_sz = cfg_icon_size;
 
-    // Hover lift  -  eased pop, max 3 px lift.  Drawn before the icon body
+    // Hover lift - eased pop, max 3 px lift.  Drawn before the icon body
     // by offsetting iy so the label below stays put.
     int lift = (int)(hover_t * 3.0f + 0.5f);
     iy -= lift;
 
-    // selection highlight  -  glowing aura
+    // selection highlight - glowing aura
     if(ic->selected){
         Graphics::FillRoundedRect(ix-6, iy-6, icon_sz+12, icon_sz+26, 8, cfg_col_icon_sel);
     }
@@ -1711,14 +1711,14 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     // drop shadow
     Graphics::FillRoundedRect(ix+3, iy+4, icon_sz, icon_sz, 14, 0xFF060610);
 
-    // icon body  -  rounded square with gradient effect
+    // icon body - rounded square with gradient effect
     Graphics::FillRoundedRect(ix, iy, icon_sz, icon_sz, 13, ic_top);
     // bottom gradient half
     Graphics::FillRoundedRect(ix, iy + icon_sz/2, icon_sz, icon_sz/2, 13, ic_bot);
     // smooth blend zone
     Graphics::FillRect(ix + 4, iy + icon_sz/2, icon_sz - 8, 6, ic_top);
 
-    // inner highlight (top glossy shine  -  lighter version of top color)
+    // inner highlight (top glossy shine - lighter version of top color)
     // skip: these used alpha blending and are expensive, icon already looks good
 
     // flat vector glyph centered on the tile (replaces the old per-name symbol
@@ -1732,7 +1732,7 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     int gpad = (icon_sz * 5 + 14) / 28;           // ~18% inset so glyph fills ~64% (satoru)
     AppIcons::Draw(gid, ix + gpad, iy + gpad, icon_sz - gpad*2);
 
-    // label  -  centered below the un-lifted icon position so it stays put.
+    // label - centered below the un-lifted icon position so it stays put.
     char lbl[14]; scpy(lbl, ic->name, 13);
     int tw=slen(lbl)*8;
     int tx=ix + icon_sz/2 - tw/2;
@@ -1742,7 +1742,7 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     Graphics::DrawString(tx, label_y+2, lbl, cfg_col_icon_text, 0xFF000000);
 }
 
-// context menu item lists  -  icon-targeted vs empty-desktop.
+// context menu item lists - icon-targeted vs empty-desktop.
 // Ordered so trimming with nit=2 yields a sensible (Open / Refresh) menu
 // when editing is disabled.  The "Delete" row stays last.
 static const char* ctx_items_icon[]  = { "Open", "Refresh", "Delete" };
@@ -1788,7 +1788,7 @@ void Desktop::RenderContextMenu(){
             Graphics::FillRect(context_menu_x+12, iy-1, mw-24, 1, 0xFF1A1A30);
         }
         uint32_t txt_col = cfg_col_ctx_text;
-        // tint "Delete" red  -  it's the last icon-menu row.
+        // tint "Delete" red - it's the last icon-menu row.
         if(on_icon && i==2) txt_col = 0xFFFF6666;
         Graphics::DrawString(context_menu_x+16, iy + (ih-14)/2, items[i], txt_col, 0xFF000000);
         iy += ih;
@@ -1893,7 +1893,7 @@ bool Desktop::HandleClick(int mx,int my){
             }
             return true;
         }
-        // click outside menu  -  close it
+        // click outside menu - close it
         context_menu_open = false;
     }
 
@@ -2052,7 +2052,7 @@ void DesktopEnvironment::Render(){
     // DISABLED: on the gtk/virtio-gpu present path this backdrop fast-path blacked
     // out the whole desktop while dragging (the partial backdrop blit + damage left
     // the non-footprint area unrepainted). drag now falls through to a full
-    // recompose each frame  -  correct, just a little more work per frame. re-enable
+    // recompose each frame - correct, just a little more work per frame. re-enable
     // only once the backdrop capture/present is reworked to cover the full scene. (satoru)
     if (false && WindowManager::IsWindowDragActive() && de_drag_backdrop_safe()){
         if (WindowManager::DragBackdropReady()){
@@ -2063,7 +2063,7 @@ void DesktopEnvironment::Render(){
         // first clean drag frame (or after an invalidation): compose one full
         // frame WITHOUT the dragged window, snapshot it as the backdrop, then
         // draw the dragged window on top so this frame is itself complete. the
-        // cost equals a normal frame  -  no regression on the transition. (satoru)
+        // cost equals a normal frame - no regression on the transition. (satoru)
         WindowManager::BeginDragCapture();
         de_render_full();                       // dragged window omitted by the wm
         WindowManager::CaptureDragBackdrop();   // snapshot back buffer -> backdrop
@@ -2108,7 +2108,7 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         if (ks.alt && Keyboard::IsKeyPressed(KEY_TAB)) {
             int cur = WindowManager::GetFocusedIndex();
             Window* ws = WindowManager::GetWindows();
-            // gather candidate ids  -  iterate the full slot array since
+            // gather candidate ids - iterate the full slot array since
             // closed slots can sit between live windows.
             int cand[WM_MAX_WINDOWS]; int nc = 0;
             for (int i = 0; i < WM_MAX_WINDOWS; i++) {
@@ -2165,12 +2165,12 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         snap_was = snap_now;
     }
 
-    // right-click handling  -  forward event 4 to focused window
+    // right-click handling - forward event 4 to focused window
     bool right_clicked = Mouse::RightClicked();
     if(right_clicked){
         // window context menu gets first crack on a titlebar right-click. (satoru)
         if (WindowManager::HandleRightClick(mx, my)) {
-            // consumed by the wm context menu  -  skip default right-click routing.
+            // consumed by the wm context menu - skip default right-click routing.
         } else {
         // check if click is on a window first
         Window* fw = WindowManager::GetFocusedWindow();
@@ -2248,7 +2248,7 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         // if search is active, route keys there
         if(Taskbar::search_active){
             if(key == '\n' || key == '\r'){
-                // execute search  -  launch best matching app (substring match)
+                // execute search - launch best matching app (substring match)
                 Taskbar::search_active = false;
                 const char* sb = Taskbar::search_buf;
                 int sblen = slen(sb);

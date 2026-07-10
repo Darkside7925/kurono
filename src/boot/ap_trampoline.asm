@@ -1,5 +1,5 @@
 ; ═══════════════════════════════════════════════════════════════════════════
-;  kurono ap trampoline  -  brings an application processor from its real-mode
+;  kurono ap trampoline - brings an application processor from its real-mode
 ;  SIPI entry up to 64-bit long mode on the kernel's *shared* page tables, then
 ;  jumps to the C ap_entry().
 ;
@@ -43,7 +43,7 @@ ap_pm32:
     mov ss, ax
 
     mov eax, cr4
-    or  eax, (1 << 5)          ; CR4.PAE  -  before cr3, per intel sdm (satoru)
+    or  eax, (1 << 5)          ; CR4.PAE - before cr3, per intel sdm (satoru)
     mov cr4, eax
 
     mov eax, [P_CR3]           ; shared pml4 from the patch area (satoru)
@@ -80,7 +80,7 @@ ap_lm64:
 
     mov rsp, [P_STACK]         ; this ap's stack top (satoru)
     mov rax, [P_ENTRY]
-    call rax                   ; ap_entry()  -  never returns (satoru)
+    call rax                   ; ap_entry() - never returns (satoru)
 .hang:
     cli
     hlt

@@ -26,14 +26,14 @@ root so the Kurono Linux Subsystem (KLS) keeps working.
 
 ## 2. Logging design
 
-Lightweight by design  -  **no syslog daemon**, just clean structured files, one
+Lightweight by design - **no syslog daemon**, just clean structured files, one
 per category, written through KVFS. The API is the `RuntimeLog` namespace:
 
 | Function | Target | When |
 | --- | --- | --- |
 | `LogBoot` | `boot.log` | boot milestones |
 | `LogSystem(component, msg)` | `system.log` | general system events |
-| `MirrorSerial` | `serial.log` | mirror of the serial console (**deferred**  -  see §2.1) |
+| `MirrorSerial` | `serial.log` | mirror of the serial console (**deferred** - see §2.1) |
 | `LogNetwork(event, detail)` | `network.log` | TCP connect / disconnect / RST / errors |
 | `LogSecurity(event, detail)` | `security.log` | SUPR escalations, KSA prompts, grants/denials |
 | `LogCrash(summary, detail)` | `crash/<n>.log` | kernel panics + minidumps |
@@ -44,12 +44,12 @@ per category, written through KVFS. The API is the `RuntimeLog` namespace:
 
 ## 2.1 `MirrorSerial` is deferred (never touches KVFS inline)
 
-`MirrorSerial` runs from *any* context  -  timer IRQs, and critically the `#PF`/
+`MirrorSerial` runs from *any* context - timer IRQs, and critically the `#PF`/
 `#GP` exception-dump path. It used to append the line into KVFS synchronously
 (a heap realloc). Because the log, VFS, and heap locks are all CPU-owner-
 **recursive**, a fault taken while one of them was already held on the same core
 re-entered a half-mutated KVFS tree and heap free-list and wrote log text over
-live blocks  -  the root cause of a whole family of "register dump full of
+live blocks - the root cause of a whole family of "register dump full of
 `serial.l`/`/kurono/` ASCII" corruptions and `#PF`-dump → nested-fault →
 triple-fault reboot cascades.
 
@@ -61,14 +61,14 @@ an exception or heap-internal path without this deferral.
 
 ## 3. Where the events come from
 
-- **Network**  -  `src/net/tcpip.cpp` calls `LogNetwork` when a TCP connection
+- **Network** - `src/net/tcpip.cpp` calls `LogNetwork` when a TCP connection
   reaches ESTABLISHED and when it sees a RST.
-- **Security**  -  `src/security/supr.cpp::SUPR::Log` mirrors every privilege
+- **Security** - `src/security/supr.cpp::SUPR::Log` mirrors every privilege
   decision into `LogSecurity` (with the requesting username).
-- **Crash**  -  the kernel's panic / crash-recovery path (`src/kernel/
+- **Crash** - the kernel's panic / crash-recovery path (`src/kernel/
   kurono_kernel.cpp`) writes a `LogCrash` record and drops an `emergency.txt`
   under `KP_LOG_DIR`.
-- **Boot / system**  -  milestones throughout bring-up.
+- **Boot / system** - milestones throughout bring-up.
 
 ## 4. Inspecting logs
 
@@ -79,6 +79,6 @@ subtrees are mirrored to disk).
 
 ## 5. Related files
 
-- `src/system/kpaths.h`  -  the path layout (authoritative)
-- `src/system/logging.cpp` / `.h`  -  the logging implementation
-- `src/net/tcpip.cpp`, `src/security/supr.cpp`, `src/kernel/kurono_kernel.cpp`  -  log producers
+- `src/system/kpaths.h` - the path layout (authoritative)
+- `src/system/logging.cpp` / `.h` - the logging implementation
+- `src/net/tcpip.cpp`, `src/security/supr.cpp`, `src/kernel/kurono_kernel.cpp` - log producers

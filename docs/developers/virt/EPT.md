@@ -4,7 +4,7 @@
 
 ## 1. What EPT does
 
-EPT provides a second level of address translation for virtual machines. When a guest accesses a physical address, EPT translates that guest physical address to a real host physical address. Without EPT, the hypervisor would have to intercept every single guest page table modification  -  very slow. With EPT, the hardware handles most translations in hardware.
+EPT provides a second level of address translation for virtual machines. When a guest accesses a physical address, EPT translates that guest physical address to a real host physical address. Without EPT, the hypervisor would have to intercept every single guest page table modification - very slow. With EPT, the hardware handles most translations in hardware.
 
 ## 2. Structure
 
@@ -22,6 +22,6 @@ When the guest accesses a guest physical address not covered by the current EPT,
 
 ## 5. Related files
 
-- `src/virt/hypervisor.cpp`  -  creates and holds the EPT pointer
-- `src/virt/vmexit.cpp`  -  calls EPT on EPT_VIOLATION exits
-- `src/virt/guest_mem.cpp`  -  allocates host physical pages for guest RAM
+- `src/virt/hypervisor.cpp` - creates and holds the EPT pointer
+- `src/virt/vmexit.cpp` - calls EPT on EPT_VIOLATION exits
+- `src/virt/guest_mem.cpp` - allocates host physical pages for guest RAM

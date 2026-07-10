@@ -89,7 +89,7 @@ If no special routing won, the shell falls back to direct command lookup and han
 
 Conflict resolution is not a toy menu. It is a persistent routing state.
 
-`ResolveConflict()` consumes the user’s later numeric answer and replays the stored command line against the selected backend.
+`ResolveConflict()` consumes the user's later numeric answer and replays the stored command line against the selected backend.
 
 That means a later line like `1` is not interpreted as a normal command when a conflict is pending. It is treated as a route choice.
 

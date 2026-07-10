@@ -17,7 +17,7 @@ This guide covers:
 KCL is a tree-walking interpreted language with typed values (int, float, string,
 bool, list, none). See **[../kcl/KCL.md](../kcl/KCL.md)** and
 **[../kcl/KCL_REFERENCE.md](../kcl/KCL_REFERENCE.md)** for the authoritative
-grammar  -  the summary below matches the real `src/kcl/kcl.cpp` parser.
+grammar - the summary below matches the real `src/kcl/kcl.cpp` parser.
 
 ### Variables
 
@@ -69,7 +69,7 @@ The real stdlib (`call_builtin` in `kcl.cpp`):
 `append` / `remove`).
 
 > Note: `pow`, `clamp`, `time`, and constants like `PI` / `VERSION` / `OS` /
-> `TRUE` / `FALSE` are **not** part of KCL  -  earlier versions of this guide listed
+> `TRUE` / `FALSE` are **not** part of KCL - earlier versions of this guide listed
 > them but they do not exist in the interpreter.
 
 ### Shell Execution
@@ -126,7 +126,7 @@ set app_entry = "main.kcl"
 ```
 
 (The package manager reads `app_entry` from `manifest.kcl`; it defaults to
-`main.kcl`  -  see `pkgmgr.cpp`.)
+`main.kcl` - see `pkgmgr.cpp`.)
 
 ### main.kcl (entry point)
 
@@ -245,7 +245,7 @@ print("x = " + str(x))
 
 KCL reports parse/runtime errors with line numbers and never crashes the OS, so
 the fastest debugging loop is `kcl -c "<snippet>"` in the terminal. (There is no
-built-in `time()` / `DEBUG` facility  -  use serial logs or `print` checkpoints.)
+built-in `time()` / `DEBUG` facility - use serial logs or `print` checkpoints.)
 
 ---
 

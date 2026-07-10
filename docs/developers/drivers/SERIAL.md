@@ -12,9 +12,9 @@ If you need to debug a boot hang, the serial port is where to look.
 
 The driver initializes the first COM UART (0x3F8) at boot with a standard baud rate (typically 115200). It provides simple log functions:
 
-- `SerialLogger::Log(const char*)`  -  write a null-terminated string
-- `SerialLogger::LogDec(int)`  -  write a decimal integer
-- `SerialLogger::LogHex(uint32_t)`  -  write a hex value
+- `SerialLogger::Log(const char*)` - write a null-terminated string
+- `SerialLogger::LogDec(int)` - write a decimal integer
+- `SerialLogger::LogHex(uint32_t)` - write a hex value
 
 All log calls are synchronous (polling, no interrupts). This avoids any dependency on the interrupt infrastructure and makes the logger safe to call from the panic path.
 
@@ -39,6 +39,6 @@ This streams all serial output to the QEMU window. Boot logs, shell activity, an
 
 ## 5. Related files
 
-- `src/kernel/kurono_kernel.cpp`  -  serial is the very first init call
-- `src/kernel/panic.cpp`  -  writes panic info to serial
-- `src/system/ui_config.cpp`  -  writes config load results to serial
+- `src/kernel/kurono_kernel.cpp` - serial is the very first init call
+- `src/kernel/panic.cpp` - writes panic info to serial
+- `src/system/ui_config.cpp` - writes config load results to serial

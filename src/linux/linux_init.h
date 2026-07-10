@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  linux init system
+//  kurono os - linux init system
 //  bootstraps the linux subsystem like a real init/systemd process.
 //  this is pid 1 of the linux world inside kurono.
 //
@@ -29,7 +29,7 @@ enum LinuxServiceState {
 enum LinuxServiceType {
     LSVC_TYPE_ONESHOT = 0,    // runs once, then marked completed
     LSVC_TYPE_DAEMON,         // long-running background process
-    LSVC_TYPE_VIRTUAL         // virtual  -  just marks a target as reached
+    LSVC_TYPE_VIRTUAL         // virtual - just marks a target as reached
 };
 
 enum LinuxTarget {
@@ -48,7 +48,7 @@ struct LinuxService {
     LinuxTarget       target;
     int               pid;        // pid if daemon
 
-    // dependency  -  name of service that must run first
+    // dependency - name of service that must run first
     char              after[32];
 
     // function to call to start/stop
@@ -78,7 +78,7 @@ struct LinitLogEntry {
     bool     ok;           // green check or red x
 };
 
-//  linuxinit  -  pid 1 for the linux subsystem
+//  linuxinit - pid 1 for the linux subsystem
 
 class LinuxInit {
 public:

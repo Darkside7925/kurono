@@ -40,7 +40,7 @@ constexpr NrMap kNrMap[] = {
     {  1,   4 },  // write
     {  2,   5 },  // open
     {  3,   6 },  // close
-    // nr 5 (fstat) handled directly in SyscallEntryX64Handler  -  it must fill
+    // nr 5 (fstat) handled directly in SyscallEntryX64Handler - it must fill
     // the 64-bit struct stat, not the i386 layout the LSYS_FSTAT handler writes.
     {  8,  19 },  // lseek
     {  9,  90 },  // mmap (anon ok, file-backed not supported)
@@ -296,7 +296,7 @@ constexpr NrMap kNrMap[] = {
 
 constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);
 
-// Stubs that just return success (0)  -  needed by musl/CPython startup
+// Stubs that just return success (0) - needed by musl/CPython startup
 // but harmless if we no-op them.  Listed by x86_64 nr.
 constexpr uint32_t kStubOk[] = {
     13,   // rt_sigaction
@@ -312,7 +312,7 @@ constexpr uint32_t kStubOk[] = {
     // 157 (prctl) now routed to the real LSYS_PRCTL handler via kNrMap so
     // PR_SET_NAME actually records the thread name (comm) instead of no-op'ing.
     // the handler returns 0 for every other op, same as this stub did. (satoru)
-    187,  // readahead  -  advisory prefetch; mozglue ReadAhead()s each .so before
+    187,  // readahead - advisory prefetch; mozglue ReadAhead()s each .so before
           // dlopen and treated -ENOSYS as fatal, breaking XPCOMGlueLoad of the
           // libmozgtk->libxkbcommon chain. no-op success is correct. (satoru)
 };
@@ -343,7 +343,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                                           uint64_t a2, uint64_t a3,
                                           uint64_t a4, uint64_t a5) {
     // a5 is the user's real r9 (the frame handler reads it straight from the
-    // InterruptFrame). only mmap (below) needs it  -  the 6th arg is its file
+    // InterruptFrame). only mmap (below) needs it - the 6th arg is its file
     // offset; everything else ignores it. (satoru)
 
     // (satoru) TEMP [ff]: trace the firefox worker tasks (kurono pids 100..139;
@@ -356,12 +356,12 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
         // (satoru) gated OFF for the checkpoint: this fired ~52k serial lines/boot
         // (every firefox-pid syscall), the single biggest hidden boot cost. NOTE:
         // the serial delay it introduced also damped the multicore startup timing
-        // races (a heisenbug workaround)  -  if the pre-mainRun stall resurfaces with
+        // races (a heisenbug workaround) - if the pre-mainRun stall resurfaces with
         // this off, the real fix is the futex lost-wake / AS-mutation lock, not
         // re-enabling the tracer. flip to true to trace again.
         if (false && cpff && cpff->pid >= 100 && cpff->pid < 140) {
             int fpid = cpff->pid;
-            if (nr == 202) {   // (satoru) [ftx] futex op + uaddr per thread (capped)  -  who waits, who wakes
+            if (nr == 202) {   // (satoru) [ftx] futex op + uaddr per thread (capped) - who waits, who wakes
                 static int nftx = 0;
                 if (nftx < 12000) {
                     nftx++;
@@ -372,7 +372,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                 }
             } else if (nr == 20 && fpid == 100 && a2 > 0 && a1) {
                 // (satoru) [wvx] dump the looping main's writev content (the gecko log
-                // line it repeats)  -  names the failing/retried operation = the stall
+                // line it repeats) - names the failing/retried operation = the stall
                 // root. read the iovecs directly here (where writev=20 is seen). (satoru)
                 static int wvx = 0;
                 if (wvx < 240) {
@@ -394,7 +394,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                     }
                 }
             } else if (nr == 1 && (int)a0 == 2 && a1 && a2 > 0) {
-                // (satoru) [wr2] plain write(2, ...) capture  -  rust panic messages
+                // (satoru) [wr2] plain write(2, ...) capture - rust panic messages
                 // bypass writev, so the crash reason never hit the serial. debug.
                 static int wr2 = 0;
                 if (wr2 < 400) {
@@ -430,7 +430,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
         case 9: {  // mmap(addr, len, prot, flags, fd, offset)
             // route straight to sys_mmap with the full 64-bit file offset (a5 =
             // r9). the i386 path maps x64 mmap -> old_mmap and passes offset 0,
-            // which breaks file-backed mmap of .so segments at non-zero offsets  - 
+            // which breaks file-backed mmap of .so segments at non-zero offsets - 
             // exactly what musl's dynamic linker does for every library. (satoru)
             return LinuxSyscall::sys_mmap(a0, a1, (uint32_t)a2, (uint32_t)a3,
                                           (int)a4, a5);
@@ -525,14 +525,14 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
         }
         case 257: {  // openat: ignore dirfd if AT_FDCWD, route to open.
             if ((int)a0 == -100 /* AT_FDCWD */) {
-                // pass the pathname pointer (a1) full-width  -  it may live
+                // pass the pathname pointer (a1) full-width - it may live
                 // above 4gb in a pie process (satoru)
                 return LinuxSyscall::Dispatch(5 /* open */,
                     a1, a2, a3, 0, 0);
             }
             return -38;
         }
-        // rename family  -  all normalize to Dispatch(LSYS_RENAMEAT2, _, oldpath,
+        // rename family - all normalize to Dispatch(LSYS_RENAMEAT2, _, oldpath,
         // _, newpath, _) so the single KVFS-move handler serves every variant.
         // musl's rename() picks whichever the kernel advertises; without these
         // two, rename(82)/renameat(264) hit ENOSYS and firefox's atomic writes
@@ -541,7 +541,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             return LinuxSyscall::Dispatch(316 /*LSYS_RENAMEAT2*/, 0, a0, 0, a1, 0);
         case 264: // renameat(oldfd, oldpath, newfd, newpath): a1=old, a3=new
             return LinuxSyscall::Dispatch(316 /*LSYS_RENAMEAT2*/, 0, a1, 0, a3, 0);
-        case 19: {   // readv(fd, iovec*, iovcnt)  -  no i386 equivalent in the
+        case 19: {   // readv(fd, iovec*, iovcnt) - no i386 equivalent in the
             // dispatch table (only writev/#20 is mapped), so handle it directly.
             // the iovec pointer (a1) may live above 4gb in a pie process, so pass
             // it full-width. allow irqs since a read may touch ext4/kvfs. (satoru)
@@ -550,7 +550,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             HAL::DisableInterrupts();
             return r;
         }
-        case 230: {  // clock_nanosleep(clockid, flags, req, rem)  -  route to
+        case 230: {  // clock_nanosleep(clockid, flags, req, rem) - route to
             // nanosleep(req, rem); clockid/flags ignored (satoru)
             return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a2, a3, 0, 0, 0);
         }
@@ -587,7 +587,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             return r;
         }
         // statx (332) falls through to the kNrMap translation → LSYS_STATX.
-        case 302: {  // prlimit64  -  fail soft.
+        case 302: {  // prlimit64 - fail soft.
             return -38;
         }
         // ── KDF/UDF hybrid-kernel addition (satoru) ─────────────────────────────
@@ -638,7 +638,7 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
     // fast path sets current_syscall_frame) switches to a sibling thread if one
     // is ready, or sets resume_userspace_session so the frame handler tears the
     // process down. driving the teardown from a single int-0x80-style exit on a
-    // thread would kill its siblings mid-run  -  the bug that crashed pthreads. (satoru)
+    // thread would kill its siblings mid-run - the bug that crashed pthreads. (satoru)
 
     HAL::DisableInterrupts();
     return (int64_t)r;

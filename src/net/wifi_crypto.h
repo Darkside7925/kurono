@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  802.11i security crypto primitives (satoru)
+//  kurono os - 802.11i security crypto primitives (satoru)
 //
 //  freestanding-from-scratch crypto used by the wpa2/wpa2-psk supplicant in the
 //  ieee80211 stack. no libc, no openssl. everything here is byte-exact against
@@ -8,7 +8,7 @@
 //  contents:
 //    - sha1 + hmac-sha1            (rfc 3174 / rfc 2104)
 //    - pbkdf2-hmac-sha1           (rfc 2898; wpa psk = pbkdf2(pass, ssid, 4096, 256))
-//    - aes-128 block cipher        (fips-197)  -  encrypt + decrypt
+//    - aes-128 block cipher        (fips-197) - encrypt + decrypt
 //    - aes key wrap / unwrap       (rfc 3394; used to unwrap the gtk in eapol-key 3)
 //    - aes-cmac                    (rfc 4493 / nist sp 800-38b; akm 802.1x mic)
 //    - ieee 802.11 prf             (ieee 802.11-2016 §12.7.1.2; ptk derivation)

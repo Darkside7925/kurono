@@ -1,4 +1,4 @@
-//  kurono os  -  nvme block device driver implementation
+//  kurono os - nvme block device driver implementation
 //  pcie nvme 1.4 ssd support with admin + i/o queues
 #include "nvme.h"
 #include "../hal/hal.h"
@@ -111,7 +111,7 @@ void NVMe::WriteReg64(uint32_t offset, uint64_t val) {
     WriteReg(offset + 4, (uint32_t)(val >> 32));
 }
 
-//  init  -  pci probe + controller enable
+//  init - pci probe + controller enable
 //
 //  KdfInit is the real init body; it runs INSIDE the kdf crash sandbox (NVMe::Init
 //  registers the "nvme" kdf driver and calls KDF::Start, which invokes this via
@@ -177,7 +177,7 @@ bool NVMe::KdfInit() {
 
                 detected = true;
 
-                // diag: controller capabilities  -  MQES (max queue entries-1),
+                // diag: controller capabilities - MQES (max queue entries-1),
                 // DSTRD (doorbell stride), TO (enable timeout, 500ms units). a
                 // depth > MQES+1 or a non-zero DSTRD breaks our hardcoded queue
                 // depth / doorbell offsets. (satoru)
@@ -486,7 +486,7 @@ bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
         // VOLATILE read: the controller dma-writes this completion. a plain read
         // gets hoisted out of the loop by the compiler, so we spin on the stale
         // cached 0 and time out even though the completion (phase + status) is
-        // already in memory  -  this one missing volatile is why NO nvme command
+        // already in memory - this one missing volatile is why NO nvme command
         // ever completed. (satoru)
         uint16_t st = *(volatile uint16_t*)&cqe->status;
         uint16_t phase = (st & 1);
@@ -514,7 +514,7 @@ bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
         }
         for (volatile int j = 0; j < 100; j++) {} // spin
     }
-    // diag: completion never appeared. dump the raw cqe at cq_head  -  if it's all
+    // diag: completion never appeared. dump the raw cqe at cq_head - if it's all
     // zero the controller wrote nothing (didn't fetch/process the command); if it
     // has data the phase bit / slot is being misread. (satoru)
     NVMeCQE* cqe = &qp->cq[qp->cq_head];
@@ -601,7 +601,7 @@ static bool ensure_batch_prp(int qidx) {
 //  largest transfer one command can describe: the smaller of our single prp-list
 //  page (512 entries) and the controller's MDTS (max data transfer size). qemu
 //  reports a finite MDTS, and exceeding it is rejected with "invalid field"
-//  (sc=0x02)  -  so a 1MB transfer must be split. max_transfer_size is 1<<MDTS in
+//  (sc=0x02) - so a 1MB transfer must be split. max_transfer_size is 1<<MDTS in
 //  4kb pages; 0/1 means "unlimited", so fall back to our prp cap. (satoru)
 uint32_t NVMe::MaxTransferBytes() {
     uint32_t mdts_pages = info.max_transfer_size;
@@ -650,7 +650,7 @@ bool NVMe::ReapCompletions(NVMeQueuePair* qp, int n) {
     return true;
 }
 
-//  layer 1  -  post up to NVME_IO_BATCH ≤2 MB chunks of one transfer at once, ring
+//  layer 1 - post up to NVME_IO_BATCH ≤2 MB chunks of one transfer at once, ring
 //  the sq doorbell ONCE per batch, then reap all their completions. the buffer is
 //  contiguous + identity-mapped, so each chunk's prp list is built on its own
 //  scratch page. opcode picks read vs write. (satoru)

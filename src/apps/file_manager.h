@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  file manager (multi-tab, dual-pane, bookmarks, trash, search)
+//  kurono os - file manager (multi-tab, dual-pane, bookmarks, trash, search)
 
 #define FM_MAX_ENTRIES   256
 #define FM_MAX_PATH      256

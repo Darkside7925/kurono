@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  vm exit / vm entry handler
+//  kurono os - vm exit / vm entry handler
 //  dispatches all vm exits: cpuid, msr, i/o, interrupts, hlt, ept faults
 #include "vmm.h"
 #include "ept.h"
@@ -13,7 +13,7 @@ enum VMExitAction {
     VMEXIT_REBOOT     = 4   // vm wants to reboot
 };
 
-//  cpuid leaf override  -  lets us mask/modify cpuid results for the guest
+//  cpuid leaf override - lets us mask/modify cpuid results for the guest
 struct CPUIDOverride {
     uint32_t leaf;
     uint32_t subleaf;
@@ -23,14 +23,14 @@ struct CPUIDOverride {
 
 #define MAX_CPUID_OVERRIDES 16
 
-//  msr access record  -  for logging/auditing all msr reads/writes
+//  msr access record - for logging/auditing all msr reads/writes
 struct MSRAccess {
     uint32_t msr;
     uint64_t value;
     bool     is_write;
 };
 
-//  i/o access info  -  decoded from exit qualification
+//  i/o access info - decoded from exit qualification
 struct IOAccessInfo {
     uint16_t port;
     uint8_t  size;     // 1, 2, or 4 bytes

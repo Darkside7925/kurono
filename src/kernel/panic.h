@@ -1,6 +1,6 @@
 #pragma once
-//  kurono os  -  kernel panic / bugcheck subsystem
-//  direct framebuffer rendering  -  zero dependencies on graphics/font/heap.
+//  kurono os - kernel panic / bugcheck subsystem
+//  direct framebuffer rendering - zero dependencies on graphics/font/heap.
 //  scales to any monitor resolution (640x480 → 4k).
 #include "types.h"
 
@@ -52,7 +52,7 @@ namespace StopCode {
 // persistent crash minidump written to a fixed physical page on panic, then
 // recovered into kvfs on the next boot. laid out as a flat pod so it can be
 // memcpy'd byte-for-byte through a volatile pointer at the reserved physical
-// address  -  no heap, no constructors. (satoru)
+// address - no heap, no constructors. (satoru)
 namespace MiniDump {
     constexpr uint32_t MAGIC        = 0x4B44554Du;  // 'KDUM' (satoru)
     constexpr uint64_t PHYS_ADDR    = 0x1000000ull; // 16 mb identity-mapped slot (satoru)

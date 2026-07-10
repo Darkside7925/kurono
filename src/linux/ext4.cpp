@@ -1,4 +1,4 @@
-//  kurono os  -  ext4 filesystem driver implementation
+//  kurono os - ext4 filesystem driver implementation
 //  full read/write ext4 support for accessing the linux partition
 
 #include "ext4.h"
@@ -223,7 +223,7 @@ uint64_t Ext4::ExtentLogicalToPhysical(Ext4Inode* inode,
     // out-of-bounds read past the inode. reject corrupt headers. (satoru)
     if (eh->eh_depth > 5 || eh->eh_entries > eh->eh_max) return 0;
 
-    // eh_max itself is on-disk and unbounded  -  clamping only against it lets a
+    // eh_max itself is on-disk and unbounded - clamping only against it lets a
     // corrupt eh_max (e.g. 60000) admit an eh_entries that walks far past the
     // inline area. the i_block inline header has room for exactly
     // (sizeof(i_block) - header) / sizeof(extent) entries; bound the scan to the
@@ -235,7 +235,7 @@ uint64_t Ext4::ExtentLogicalToPhysical(Ext4Inode* inode,
     if (entries > inline_cap) entries = inline_cap;
 
     if (eh->eh_depth == 0) {
-        // leaf node  -  scan extents
+        // leaf node - scan extents
         Ext4Extent* ext = (Ext4Extent*)(eh + 1);
         for (uint32_t i = 0; i < entries; i++) {
             uint32_t start = ext[i].ee_block;
@@ -250,7 +250,7 @@ uint64_t Ext4::ExtentLogicalToPhysical(Ext4Inode* inode,
         return 0;
     }
 
-    // internal index node  -  find the right child (Ext4ExtentIdx is the same
+    // internal index node - find the right child (Ext4ExtentIdx is the same
     // 12 bytes as Ext4Extent, so the inline capacity bound is identical). (satoru)
     Ext4ExtentIdx* idx = (Ext4ExtentIdx*)(eh + 1);
     int found = -1;
@@ -406,7 +406,7 @@ int Ext4::ReadInodeData(Ext4Inode* inode, uint64_t offset,
                         : BlockMapLogical(inode, logical);
 
         if (phys == 0) {
-            // sparse block  -  zeros
+            // sparse block - zeros
             memset(dst, 0, to_read);
         } else {
             if (ReadBytes(phys * block_size + blk_off, to_read, dst) != 0)
@@ -536,7 +536,7 @@ int Ext4::WriteInodeData(Ext4Inode* inode, uint32_t ino,
                         : BlockMapLogical(inode, logical);
 
         if (phys == 0) {
-            // unmapped logical block  -  must allocate and LINK it (satoru)
+            // unmapped logical block - must allocate and LINK it (satoru)
             if (use_extents) {
                 // this pass does not insert into the extent tree; refuse rather
                 // than allocate an orphan block that the next read can't find
@@ -568,7 +568,7 @@ int Ext4::WriteInodeData(Ext4Inode* inode, uint32_t ino,
         }
 
         if (blk_off != 0 || to_write != block_size) {
-            // partial block  -  read-modify-write
+            // partial block - read-modify-write
             uint8_t* tmp = (uint8_t*)KernelHeap::Alloc(block_size);
             if (!tmp) break;
             ReadBytes(phys * block_size, block_size, tmp);
@@ -707,7 +707,7 @@ int Ext4::DirAddEntry(uint32_t dir_ino, uint32_t new_ino,
 
             uint16_t actual = (uint16_t)(8 + de->name_len + 3) & ~3;
             // `actual` rounds up; if it overruns the record there is no usable
-            // slack here  -  skip this entry rather than underflow. (satoru)
+            // slack here - skip this entry rather than underflow. (satoru)
             uint16_t slack = (actual <= de->rec_len)
                              ? (uint16_t)(de->rec_len - actual) : 0;
 
@@ -741,7 +741,7 @@ int Ext4::DirAddEntry(uint32_t dir_ino, uint32_t new_ino,
         pos += block_size;
     }
 
-    // no existing block has room  -  extend the directory with a new block whose
+    // no existing block has room - extend the directory with a new block whose
     // single entry spans the whole block, then write our dirent there. (satoru)
     bool use_extents = (dir.i_flags & EXT4_EXTENTS_FL) != 0;
 
@@ -980,7 +980,7 @@ int Ext4::AllocBlock(uint32_t hint_group, uint64_t* block_out) {
                 WriteBlock(bmp_blk, bmp);
                 // update group descriptor
                 gd.bg_free_blocks_count_lo--;
-                // write gd back  -  simplified
+                // write gd back - simplified
                 uint64_t gdt_block = (block_size == 1024) ? 2 : 1;
                 uint64_t gd_off = gdt_block * block_size +
                                   (uint64_t)grp * desc_size;
@@ -1359,7 +1359,7 @@ int Ext4::Mkdir(const char* path, uint16_t mode) {
     if (PathWalk(parent_path, &parent_ino) != 0) return -1;
 
     // check doesn't already exist. DirLookup dereferences the dir inode, so it
-    // must get the PARENT inode  -  passing nullptr here was a guaranteed
+    // must get the PARENT inode - passing nullptr here was a guaranteed
     // null-deref crash. read the parent first. (satoru)
     Ext4Inode parent_dir;
     if (ReadInode(parent_ino, &parent_dir) != 0) return -1;
@@ -1483,7 +1483,7 @@ int Ext4::Unlink(const char* path) {
     if (file_in.i_links_count == 0) {
         // free inode and blocks
         FreeInode(file_ino);
-        // todo: free data blocks  -  complex for extent/blockmap
+        // todo: free data blocks - complex for extent/blockmap
     } else {
         uint64_t blk;
         uint32_t off;

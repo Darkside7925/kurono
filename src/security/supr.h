@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  supr security engine
+//  kurono os - supr security engine
 //  user auth, sessions, audit logging, permissions
 
 #define SUPR_MAX_USERS     16
@@ -22,12 +22,12 @@ enum SUPRAction {
     ACT_CREATE_USER, ACT_DELETE_USER, ACT_CHANGE_PWD,
     ACT_ESCALATE, ACT_FILE_ACCESS, ACT_EXEC_CMD,
     ACT_PERMISSION_DENIED,
-    // ksa / auth-policy actions  -  audited even when ksa is disabled. (satoru)
+    // ksa / auth-policy actions - audited even when ksa is disabled. (satoru)
     ACT_POLICY_CHANGE, ACT_KSA_PROMPT, ACT_KSA_APPROVE, ACT_KSA_DENY,
     ACT_SOVEREIGN_OVERRIDE, ACT_RISK_WARNING
 };
 
-// auth policy  -  which factors a privilege escalation must satisfy. (satoru)
+// auth policy - which factors a privilege escalation must satisfy. (satoru)
 enum SUPRAuthMode {
     AUTH_PASSWD = 0,   // password prompt only (default)
     AUTH_KVAULT = 1,   // ksa hypervisor prompt only
@@ -61,7 +61,7 @@ struct SUPRSession {
     bool active;
     unsigned int login_time;
     unsigned int last_activity;
-    unsigned int timeout;     // ms  -  0 = no timeout
+    unsigned int timeout;     // ms - 0 = no timeout
     char tty[16];
 };
 
@@ -121,13 +121,13 @@ public:
     // sudo-style escalation for `supr <cmd>`: a line-based shell command can't
     // prompt for a password inline, so this runs the policy gate collecting the
     // credential/approval through the interactive ksa modal (available whenever
-    // the hypervisor is, even if kvault is policy-off  -  it's just the secure
+    // the hypervisor is, even if kvault is policy-off - it's just the secure
     // prompt). on success it elevates the session to root and writes the
     // pre-elevation user index to *out_saved; call SudoEnd to restore. (satoru)
     static bool SudoBegin(int session_id, const char* reason, int* out_saved_user);
     static void SudoEnd(int session_id, int saved_user);
 
-    // policy mutation  -  these enforce the loophole rules and audit. each
+    // policy mutation - these enforce the loophole rules and audit. each
     // returns true on success.  err (optional) receives a human reason on
     // failure. sovereign_override gates the dangerous "disable both" path.
     static bool SetAuthMode(int session_id, SUPRAuthMode mode,
@@ -139,7 +139,7 @@ public:
     static bool EnableKvault(int session_id, char* err, int err_max);
     static bool EnablePasswd(int session_id, char* err, int err_max);
 
-    // true if both factors are off  -  every escalation must then show a risk
+    // true if both factors are off - every escalation must then show a risk
     // warning before proceeding. (satoru)
     static bool BothAuthDisabled();
 

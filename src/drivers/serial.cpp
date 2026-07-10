@@ -32,10 +32,10 @@ void SerialLogger::Init() {
     outb(0x3F8 + 4, 0x0B);   // irqs enabled, rts/dsr set
 
     // self-test: verify uart exists by reading back lsr
-    // if lsr reads 0xff, there's no uart  -  don't hang later
+    // if lsr reads 0xff, there's no uart - don't hang later
     uint8_t lsr = inb(0x3F8 + 5);
     if (lsr == 0xFF) {
-        // no uart present  -  mark as unavailable
+        // no uart present - mark as unavailable
         // (future: set a flag to skip serial output)
     }
 }

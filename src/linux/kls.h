@@ -103,7 +103,7 @@ struct KLSConfig {
     uint32_t linux_partition_size;  // size in sectors
 };
 
-//  kls  -  kurono linux subsystem main class
+//  kls - kurono linux subsystem main class
 
 class KLS {
 public:
@@ -152,7 +152,7 @@ public:
     static int  RunCommand(const char* cmd, char* output, int max_output);
     static int  RunShellCommand(const char* cmd, char* output, int max_output);
 
-    // shell integration  -  register linux commands with kurono shell
+    // shell integration - register linux commands with kurono shell
     static void RegisterShellCommands(void* shell);
 
     // syscall handler (called from idt int 0x80)

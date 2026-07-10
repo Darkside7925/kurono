@@ -1,4 +1,4 @@
-//  kurono os  -  file manager (multi-tab, dual-pane, bookmarks, trash, search)
+//  kurono os - file manager (multi-tab, dual-pane, bookmarks, trash, search)
 #include "file_manager.h"
 #include "../ui/window_manager.h"
 #include "../fs/kvfs.h"
@@ -140,7 +140,7 @@ static unsigned int icon_color_for(const FMEntry* e){
 
 // ── bookmarks ─────────────────────────────────────────────────────────
 // color is kept in the struct for layout/compat but no longer carries a per-row
-// hue  -  the kss theme is runtime, so the dot is tinted from theme tokens at draw
+// hue - the kss theme is runtime, so the dot is tinted from theme tokens at draw
 // time (accent for the current place, dim otherwise) for the monochrome look. (satoru)
 struct Bookmark { const char* label; const char* path; unsigned int color; };
 static const Bookmark BOOKMARKS[] = {
@@ -308,7 +308,7 @@ void FileManagerApp::NotifyFilesystemChanged(const char* path){
 
 static bool fm_path_is_safe(const char* path){
     if(!path || !*path) return false;
-    // reject embedded ".." segments  -  prevents traversal abuse via address bar
+    // reject embedded ".." segments - prevents traversal abuse via address bar
     int n = slen(path);
     for(int i=0;i<n-1;i++){
         if(path[i]=='.' && path[i+1]=='.'){
@@ -403,7 +403,7 @@ void FileManagerApp::MoveToTrash(const char* full_path){
         // recursive copy then RmTree
         // simple: just unlink in place (full recursive dir move is complex
         // and KVFS::Move only supports files).  Accept that directory trash
-        // is destructive for now  -  log and remove.
+        // is destructive for now - log and remove.
         KVFS::RmTree(full_path);
     } else {
         KVFS::Move(full_path, dst);
@@ -542,7 +542,7 @@ void FileManagerApp::DeleteEntryPane(int pane,int idx,bool permanent){
     } else {
         MoveToTrash(full);
     }
-    // clear selection  -  the index just got invalidated
+    // clear selection - the index just got invalidated
     t->selected = -1;
     RefreshBoth();
     notify_desktop_path_changed(full);
@@ -599,7 +599,7 @@ void FileManagerApp::PastePane(int pane){
     if(!clipboard_has_item) return;
     FMTab* t = Active(pane);
     char dst[FM_MAX_PATH]; JoinPath(dst,FM_MAX_PATH,t->path,clipboard_name);
-    if(seq(dst,clipboard_path)){ /* same place  -  make a copy with " - copy" suffix */
+    if(seq(dst,clipboard_path)){ /* same place - make a copy with " - copy" suffix */
         scpy(dst,t->path,FM_MAX_PATH);
         if(!seq(t->path,"/")) sapp(dst,"/",FM_MAX_PATH);
         sapp(dst,clipboard_name,FM_MAX_PATH);
@@ -741,7 +741,7 @@ void FileManagerApp::RenderPathBar(int pane,int x,int y,int w){
         // show editable buffer with text cursor
         Graphics::DrawRect(x+2,y+2,w-4,PATH_BAR_H-4,FM_BORDER_HI);
         Graphics::DrawString(x+8,y+5,t->address_buf,FM_TEXT,0xFF000000);
-        // cursor  -  measure the text up to the caret rather than assuming 8px
+        // cursor - measure the text up to the caret rather than assuming 8px
         // glyphs (the old fixed-font math drifted under fontttf). (satoru)
         char acur[FM_MAX_PATH];
         int an=t->address_cursor; if(an>FM_MAX_PATH-1) an=FM_MAX_PATH-1;

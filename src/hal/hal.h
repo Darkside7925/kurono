@@ -1,7 +1,7 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  interruptframe  -  matches the layout pushed by isr_stubs.asm
+//  interruptframe - matches the layout pushed by isr_stubs.asm
 //  isr_common pushes: cr2, r15-r8, rbp, rdi, rsi, rdx, rcx, rbx, rax,
 //                     then vector + error_code were pushed by the stub,
 //                     and rip, cs, rflags, rsp, ss were pushed by the cpu.

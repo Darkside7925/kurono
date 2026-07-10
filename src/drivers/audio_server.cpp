@@ -1,4 +1,4 @@
-//  kurono os  -  unified audio server (implementation)
+//  kurono os - unified audio server (implementation)
 #include "audio_server.h"
 #include "audio_dma.h"
 #include "audio_mixer.h"
@@ -18,7 +18,7 @@ static int           g_backend_count          = 0;
 static AudioBackend* g_active                  = nullptr;
 static uint64_t      g_periods_submitted       = 0;
 
-// Stable priority by name  -  earlier in the list wins.
+// Stable priority by name - earlier in the list wins.
 static int BackendPriority(const char* name) {
     if (!name) return 99;
     if (name[0] == 'h' && name[1] == 'd' && name[2] == 'a') return 0;
@@ -45,7 +45,7 @@ void Init() {
     AudioDMA::Init();
     AudioMixer::Init();
 
-    // Sort by priority (insertion sort  -  n <= 8).
+    // Sort by priority (insertion sort - n <= 8).
     for (int i = 1; i < g_backend_count; i++) {
         for (int j = i; j > 0; j--) {
             int pa = BackendPriority(g_backends[j-1]->Name());
@@ -92,7 +92,7 @@ void Tick() {
     g_active->Tick();
     uint32_t q = g_active->QueuedFrames();
     // keep ~10 periods (~213ms @ 1024 frames/48khz) buffered to ride out
-    // cooperative-scheduler gaps  -  a slow gui/network frame can stall this pump
+    // cooperative-scheduler gaps - a slow gui/network frame can stall this pump
     // for tens of ms, and a shallower ring could drain the dma before the next
     // refill, producing a crackle. 10 periods rides out a bigger single-core
     // stall (the residual per-video glitch) for only ~43ms more latency than 8;

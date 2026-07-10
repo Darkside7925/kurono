@@ -1,4 +1,4 @@
-//  kurono os  -  linux boot protocol implementation
+//  kurono os - linux boot protocol implementation
 //  loads a linux bzimage/vmlinuz into guest vm memory following the
 //  official x86 linux boot protocol.
 //
@@ -24,7 +24,7 @@ bool           LinuxBootLoader::initrd_loaded  = false;
 uint32_t       LinuxBootLoader::initrd_guest_addr = 0;
 uint32_t       LinuxBootLoader::initrd_size    = 0;
 
-//  parseimage  -  validate and extract information from a bzimage
+//  parseimage - validate and extract information from a bzimage
 
 bool LinuxBootLoader::ParseImage(const uint8_t* image_data, uint32_t image_size,
                                   LinuxImageInfo& info) {
@@ -132,7 +132,7 @@ bool LinuxBootLoader::ParseImage(const uint8_t* image_data, uint32_t image_size,
     return true;
 }
 
-//  loadkernel  -  load bzimage into guest physical memory
+//  loadkernel - load bzimage into guest physical memory
 
 bool LinuxBootLoader::LoadKernel(const uint8_t* image_data, uint32_t image_size,
                                   const char* cmdline) {
@@ -219,7 +219,7 @@ bool LinuxBootLoader::LoadKernel(const uint8_t* image_data, uint32_t image_size,
 
     // set loadflags: loaded high, can use heap
     hdr->loadflags |= LOADFLAG_LOADED_HIGH | LOADFLAG_CAN_USE_HEAP;
-    hdr->loadflags &= ~LOADFLAG_QUIET; // not quiet  -  we want console output
+    hdr->loadflags &= ~LOADFLAG_QUIET; // not quiet - we want console output
 
     // heap end pointer (relative to setup start, 0x10000)
     // use the area just below the command line
@@ -239,7 +239,7 @@ bool LinuxBootLoader::LoadKernel(const uint8_t* image_data, uint32_t image_size,
     return true;
 }
 
-//  loadinitrd  -  load initial ramdisk into guest memory
+//  loadinitrd - load initial ramdisk into guest memory
 
 bool LinuxBootLoader::LoadInitrd(const uint8_t* initrd_data,
                                   uint32_t initrd_sz) {
@@ -250,7 +250,7 @@ bool LinuxBootLoader::LoadInitrd(const uint8_t* initrd_data,
 
     if (!initrd_data || initrd_sz == 0) {
         SerialLogger::Log("LinuxBoot: No initrd to load\r\n");
-        return true; // not an error  -  initrd is optional
+        return true; // not an error - initrd is optional
     }
 
     // place initrd at linux_initrd_addr
@@ -287,7 +287,7 @@ bool LinuxBootLoader::LoadInitrd(const uint8_t* initrd_data,
     return true;
 }
 
-//  setupbootparams  -  fill remaining boot parameter fields
+//  setupbootparams - fill remaining boot parameter fields
 
 bool LinuxBootLoader::SetupBootParams() {
     if (!kernel_loaded) return false;
@@ -298,14 +298,14 @@ bool LinuxBootLoader::SetupBootParams() {
     // fill e820 memory map
     FillE820(bp_host);
 
-    // fill screen info (minimal  -  text mode)
+    // fill screen info (minimal - text mode)
     FillScreenInfo(bp_host);
 
     SerialLogger::Log("LinuxBoot: Boot params configured\r\n");
     return true;
 }
 
-//  fillscreeninfo  -  set up minimal vga text mode info
+//  fillscreeninfo - set up minimal vga text mode info
 
 void LinuxBootLoader::FillScreenInfo(uint8_t* boot_params) {
     // struct screen_info at offset 0x000 in boot_params
@@ -337,7 +337,7 @@ void LinuxBootLoader::FillScreenInfo(uint8_t* boot_params) {
     boot_params[0x1E3] = (uint8_t)((alt_kb >> 24) & 0xFF);
 }
 
-//  fille820  -  write e820 memory map into boot_params
+//  fille820 - write e820 memory map into boot_params
 
 void LinuxBootLoader::FillE820(uint8_t* boot_params) {
     int count = GuestMemoryManager::GetE820Count();
@@ -363,7 +363,7 @@ void LinuxBootLoader::FillE820(uint8_t* boot_params) {
     SerialLogger::Log(" E820 entries to boot_params\r\n");
 }
 
-//  getentrypoint  -  return the address to jump to for kernel start
+//  getentrypoint - return the address to jump to for kernel start
 
 uint32_t LinuxBootLoader::GetEntryPoint() {
     if (!kernel_loaded) return 0;

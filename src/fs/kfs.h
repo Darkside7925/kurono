@@ -1,10 +1,10 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  KFS  -  Kurono File System.
+//  KFS - Kurono File System.
 //
 //  a small, fast, inode-based on-disk filesystem designed from scratch for
-//  Kurono  -  no linux baggage. it is the on-disk PERSISTENCE layer: the in-memory
+//  Kurono - no linux baggage. it is the on-disk PERSISTENCE layer: the in-memory
 //  KVFS stays the runtime filesystem, and KFS stores the user-data subset across
 //  reboots as REAL files + directories (not an opaque blob), so a volume is
 //  browsable + a Linux kfs-fuse driver could mount it later (the on-disk format
@@ -20,7 +20,7 @@
 //  {start_lba, length_blocks} instead of per-block pointers. the inode holds
 //  KFS_INLINE_EXTENTS inline; when a file needs more, the inode chains to an
 //  "extent overflow" block (itself a list of extents + a next pointer), so a
-//  file is limited only by free disk space  -  NO ~4 MB direct/indirect cap. the
+//  file is limited only by free disk space - NO ~4 MB direct/indirect cap. the
 //  bump allocator hands out one contiguous run per file, so the common case is a
 //  SINGLE extent (a 174 MB binary = 1 extent, not 43520 pointers). directories
 //  use the same extent machinery, so there is no max-dir-entry cap either.
@@ -31,8 +31,8 @@
 //  device-agnostic: the caller supplies block read/write callbacks (the kernel
 //  wires NVMe; a fuse driver would wire a host file). (satoru)
 
-#define KFS_MAGIC        0x4B465332u   // "KFS2"  -  extent-based on-disk format (satoru)
-#define KFS_MAGIC_V1     0x4B465331u   // "KFS1"  -  legacy direct/indirect format (satoru)
+#define KFS_MAGIC        0x4B465332u   // "KFS2" - extent-based on-disk format (satoru)
+#define KFS_MAGIC_V1     0x4B465331u   // "KFS1" - legacy direct/indirect format (satoru)
 #define KFS_VERSION      2u
 #define KFS_BLOCK_SIZE   4096u
 #define KFS_INODE_SIZE   256u          // grew 128->256 to hold more inline extents (satoru)
@@ -84,7 +84,7 @@ struct KFSSuper {
     uint32_t crc;            // crc32 of the fields above (satoru)
 } __attribute__((packed));
 
-//  inode  -  exactly 256 bytes. fixed 72-byte header + 184-byte inline area that
+//  inode - exactly 256 bytes. fixed 72-byte header + 184-byte inline area that
 //  holds either KFS_INLINE_EXTENTS extents OR (for a tiny file) inline data. an
 //  overflow block chain extends the extent list with no size cap. (satoru)
 struct KFSInode {
@@ -94,7 +94,7 @@ struct KFSInode {
     uint16_t gid;
     uint16_t gid_pad;        // (kept for layout symmetry) (satoru)
     uint16_t flags;          // KFS_FLAG_* (satoru)
-    uint64_t size;           // bytes  -  64-bit so files exceed 4 GB (satoru)
+    uint64_t size;           // bytes - 64-bit so files exceed 4 GB (satoru)
     uint32_t ctime, mtime, atime;
     uint32_t nlink;
     uint32_t blocks;         // total data blocks across all extents (satoru)
@@ -116,7 +116,7 @@ struct KFSExtOverflow {
     KFSExtent ext[KFS_EXT_PER_OVF];
 } __attribute__((packed));
 
-//  directory entry  -  exactly 64 bytes; a directory's data blocks are arrays of
+//  directory entry - exactly 64 bytes; a directory's data blocks are arrays of
 //  these (64 entries/block), inode==0 marks a free slot. (satoru)
 struct KFSDirEnt {
     uint32_t inode;          // 0 = empty slot (satoru)
@@ -155,7 +155,7 @@ public:
     //  flush all dirty metadata to disk (call after a batch of writes). (satoru)
     static bool Sync();
 
-    //  path ops  -  absolute '/'-separated paths. (satoru)
+    //  path ops - absolute '/'-separated paths. (satoru)
     static bool Mkdirs(const char* path);                       // create dir + parents (satoru)
     static bool WriteFile(const char* path, const void* data, uint64_t len);
     static int64_t ReadFile(const char* path, void* buf, uint64_t max);   // bytes read, -1 on error
@@ -175,7 +175,7 @@ public:
     static const KFSStats& Stats();
     static void ResetStats();
 
-    //  layer 6  -  incremental snapshot. the 64-bit content fingerprint of the last
+    //  layer 6 - incremental snapshot. the 64-bit content fingerprint of the last
     //  saved user-data tree is persisted in the superblock (reserved fields), so a
     //  save can compare the current tree's fingerprint against it and skip the
     //  whole reformat+rewrite when nothing changed. these read/write the MOUNTED

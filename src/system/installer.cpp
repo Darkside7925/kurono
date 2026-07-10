@@ -318,7 +318,7 @@ static uint32_t payload_size(uint8_t* start, uint8_t* end) {
 }
 }
 
-// boot-time persistence mount  -  see installer.h. brings up the nvme controller
+// boot-time persistence mount - see installer.h. brings up the nvme controller
 // and mounts a whole-disk raw ext4 (superblock at offset 0) so the kvfs.img
 // save/restore path works on a normal boot, not just after an install. the ext4
 // block callbacks live in the anonymous namespace above; they're visible here in

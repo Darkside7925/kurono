@@ -1,4 +1,4 @@
-// kurono os  -  aac metadata parser
+// kurono os - aac metadata parser
 // see aac_parse.h.  integer-only, freestanding-clean.
 #include "aac_parse.h"
 

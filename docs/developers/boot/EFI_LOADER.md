@@ -4,7 +4,7 @@
 
 ## 1. Purpose
 
-GRUB handles BIOS and most EFI boot scenarios. The EFI loader is for cases where a minimal native EFI application is preferred  -  for example, custom firmware, Secure Boot setups, or environments where GRUB is not installed.
+GRUB handles BIOS and most EFI boot scenarios. The EFI loader is for cases where a minimal native EFI application is preferred - for example, custom firmware, Secure Boot setups, or environments where GRUB is not installed.
 
 ## 2. How it works
 
@@ -25,6 +25,6 @@ The EFI loader is intentionally minimal. It does not implement ACPI enumeration,
 
 ## 5. Related files
 
-- `src/boot/kurono_boot.asm`  -  entry point the loader jumps to
-- `src/boot/kurono_linker.ld`  -  kernel image layout that the loader must respect
-- `src/Makefile`  -  separate build rules for the EFI binary
+- `src/boot/kurono_boot.asm` - entry point the loader jumps to
+- `src/boot/kurono_linker.ld` - kernel image layout that the loader must respect
+- `src/Makefile` - separate build rules for the EFI binary

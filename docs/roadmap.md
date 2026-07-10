@@ -42,7 +42,7 @@ These are built and verified enough to build on. They still have rough edges.
 ### Firefox: from painted chrome to a reliably painted page
 
 A real Firefox 140.11.0esr (musl + Wayland, software WebRender) **loads, runs its
-Gecko engine, and now composites its real browser chrome on the Kurono desktop**  - 
+Gecko engine, and now composites its real browser chrome on the Kurono desktop** - 
 tab strip, URL bar, back/forward/reload, bookmark star, account/extensions/
 hamburger menus, window controls. It runs **single-process** (e10s off), so the
 old "the content process is blocked in the e10s IPC path" framing is retired. The
@@ -59,7 +59,7 @@ and the socket thread's poll-wakeup is the active fix.
   abort paths in `futex_enqueue_and_block` cleared their wait-queue slot
   unconditionally; a cross-CPU `FUTEX_WAKE` could consume and re-assign the slot in
   that window, so the blind clear stranded the new owner blocked forever. Both
-  sites now verify slot ownership first  -  this killed the "startup stalls at
+  sites now verify slot ownership first - this killed the "startup stalls at
   thread-init, no crash" heisenbug.
 - **[done] TLB shootdown ack-wait** (`src/proc/smp.cpp`). `BroadcastTlbFlush` gave
   up in sub-millisecond time while a peer core could sit interrupts-off ~8.7 ms in
@@ -77,7 +77,7 @@ and the socket thread's poll-wakeup is the active fix.
   stages into a static ring; the `LoggingProcess` flushes from process context.
 - **[done] Real `fcntl` byte-range locks** (`src/linux/linux_syscall.cpp`).
   `F_GETLK`/`F_SETLK`/`F_SETLKW` are real advisory locks now, not an always-grant
-  stub  -  which had let two SQLite connections both "own" a WAL lock and fail with
+  stub - which had let two SQLite connections both "own" a WAL lock and fail with
   `SQLITE_PROTOCOL`, wedging Places init and NSS's `cert9.db` open.
 - **[done] `readlink` errno + socket/pipe `read`/`write`.** `readlink` on an
   existing non-symlink now returns POSIX `-EINVAL` (was `-ENOENT`, which broke

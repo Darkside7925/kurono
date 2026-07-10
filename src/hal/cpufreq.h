@@ -11,13 +11,13 @@
 // On bare-metal hypervisors we fall back to ACPI _PSS objects.
 //
 // Governors:
-//   PERFORMANCE  -  pin to highest non-turbo P-state.
-//   POWERSAVE    -  pin to lowest P-state.
-//   ONDEMAND     -  sample CPU utilisation each tick; ramp up at >80%,
+//   PERFORMANCE - pin to highest non-turbo P-state.
+//   POWERSAVE   - pin to lowest P-state.
+//   ONDEMAND    - sample CPU utilisation each tick; ramp up at >80%,
 //                 step down at <20%.
-//   SCHEDUTIL    -  directly tied to scheduler load; bump on enqueue.
+//   SCHEDUTIL   - directly tied to scheduler load; bump on enqueue.
 //
-// Idle states (C-states) are entered from Scheduler::Idle()  -  we MWAIT
+// Idle states (C-states) are entered from Scheduler::Idle() - we MWAIT
 // into C1/C2/C3 depending on predicted residency.
 
 namespace CPUFreq {
@@ -73,7 +73,7 @@ namespace CPUFreq {
     bool SetPState(uint32_t cpu_id, uint8_t pstate_idx);
     Governor GetGovernor(uint32_t cpu_id);
 
-    // Idle entry  -  called by Scheduler::Idle().  Picks the deepest
+    // Idle entry - called by Scheduler::Idle().  Picks the deepest
     // C-state whose latency fits the predicted idle residency.
     void EnterIdle(uint64_t predicted_residency_us);
 

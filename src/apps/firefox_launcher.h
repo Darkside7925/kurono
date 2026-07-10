@@ -1,4 +1,4 @@
-// Firefox launcher  -  sets up the env Firefox expects, then exec's the
+// Firefox launcher - sets up the env Firefox expects, then exec's the
 // installed binary at /apps/firefox/firefox.
 #ifndef KURONO_FIREFOX_LAUNCHER_H
 #define KURONO_FIREFOX_LAUNCHER_H

@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  Kurono OS  -  Cross-Compilation Makefile (x86_64 bare metal)
+#  Kurono OS - Cross-Compilation Makefile (x86_64 bare metal)
 # ═══════════════════════════════════════════════════════════════════════════
 #
 #  Requirements:
@@ -10,11 +10,11 @@
 #    • QEMU (for testing)
 #
 #  Targets:
-#    make           -  build kernel ELF binary
-#    make iso       -  build bootable ISO
-#    make run       -  run in QEMU with BGA display
-#    make clean     -  remove build artefacts
-#    make debug     -  run in QEMU with GDB stub
+#    make          - build kernel ELF binary
+#    make iso      - build bootable ISO
+#    make run      - run in QEMU with BGA display
+#    make clean    - remove build artefacts
+#    make debug    - run in QEMU with GDB stub
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ─── Toolchain ────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ endif
 
 # ─── Debian Linux guest rootfs (embedded via objcopy) ────────────────────
 #
-#  Off by default  -  the rootfs is ~108 MB and bloats the ISO.  Users
+#  Off by default - the rootfs is ~108 MB and bloats the ISO.  Users
 #  obtain it at runtime via `kpkg install debian`, which downloads it
 #  to /var/lib/kurono/debian-rootfs.ext4 and then prompts to reboot
 #  into the system update screen.  To force-embed for offline ISOs:
@@ -158,7 +158,7 @@ DYNTEST_ELF       = $(USERPROGS_DIR)/dyntest.elf
 DYNTEST_OBJ       = $(BUILD)/userprogs/dyntest_user_embed.o
 MUSL_LIBC_SO      = $(USERPROGS_DIR)/musl_libc.so
 MUSL_LIBC_OBJ     = $(BUILD)/userprogs/musl_libc_user_embed.o
-# tiny extra .so the dyntest pie depends on  -  exercises musl loading a non-interp
+# tiny extra .so the dyntest pie depends on - exercises musl loading a non-interp
 # library via the new file-backed mmap path (satoru)
 LIBFOO_SO         = $(USERPROGS_DIR)/libfoo.so
 LIBFOO_OBJ        = $(BUILD)/userprogs/libfoo_user_embed.o
@@ -181,7 +181,7 @@ ASM_SRCS = $(SRC)/boot/kurono_boot.asm \
            $(SRC)/hal/syscall_entry.asm \
            $(SRC)/proc/switch_to.asm
 
-# C++ sources  -  listed in dependency order for clarity
+# C++ sources - listed in dependency order for clarity
 CXX_SRCS = \
     $(SRC)/kernel/types.cpp \
     $(SRC)/kernel/heap.cpp \
@@ -436,7 +436,7 @@ all: dirs $(KERNEL)
 
 # ─── Link ─────────────────────────────────────────────────────────────────
 
-# ap trampoline object  -  must be defined before the link rules use it (make
+# ap trampoline object - must be defined before the link rules use it (make
 # expands prerequisites at parse time). (satoru)
 AP_TRAMP_OBJ = $(BUILD)/boot/ap_trampoline.o
 
@@ -623,7 +623,7 @@ $(MUSL_LIBC_OBJ): $(MUSL_LIBC_SO)
 	  musl_libc.so musl_libc_user_embed.o
 	rm -f $(BUILD)/userprogs/musl_libc.so
 
-# embed libfoo.so  -  the dyntest pie's extra DT_NEEDED (file-backed mmap test) (satoru)
+# embed libfoo.so - the dyntest pie's extra DT_NEEDED (file-backed mmap test) (satoru)
 $(LIBFOO_OBJ): $(LIBFOO_SO)
 	@mkdir -p $(dir $@)
 	cp $< $(BUILD)/userprogs/libfoo.so
@@ -653,7 +653,7 @@ $(BUILD)/%.o: $(SRC)/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Files exercised from interrupt context  -  disable SSE codegen so the
+# Files exercised from interrupt context - disable SSE codegen so the
 # compiler doesn't emit movaps/movdqa that fault on partially-aligned
 # kernel stack/heap when reached via int 0x80. Graphics inline asm
 # uses xmm explicitly, so we can't apply this globally.
@@ -699,7 +699,7 @@ $(BUILD)/apps/task_manager.o: $(SRC)/apps/task_manager.cpp
 
 # Video player runs every frame from GUIProcess and decodes JPEGs via
 # stb_image which contains aligned SSE intrinsics.  Same alignment risk
-# as task_manager  -  disable codegen-emitted SSE.
+# as task_manager - disable codegen-emitted SSE.
 $(BUILD)/media/video_player.o: $(SRC)/media/video_player.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
@@ -728,7 +728,7 @@ debian-rootfs:
 	sh ../tools/build_debian_rootfs.sh
 
 # ─── Standalone EFI Loader ─────────────────────────────────────────────
-#    Bypasses GRUB multiboot2  -  loads kurono.elf directly via EFI
+#    Bypasses GRUB multiboot2 - loads kurono.elf directly via EFI
 #    protocols.  Memory allocated as EfiLoaderCode (executable).
 efi: dirs $(EFI_APP) $(EFI_APP_EMERGENCY)
 	@echo "  EFI loader: $(EFI_APP)"
@@ -749,7 +749,7 @@ $(BUILD)/boot/kernel_embed.o: $(KERNEL_BASE)
 	cd $(BUILD)/boot && $(EFI_OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
 	    kurono.elf kernel_embed.o
 
-# Installer payload embeddings  -  linked only into the final kernel
+# Installer payload embeddings - linked only into the final kernel
 $(BUILD)/boot/install_kernel_embed.o: $(KERNEL_BASE)
 	@mkdir -p $(dir $@)
 	cp $< $(BUILD)/boot/kurono_installer_kernel.elf && \

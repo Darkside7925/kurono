@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  linux bridge commands
+//  kurono os - linux bridge commands
 //  posix-like commands operating on kvfs for bare-metal kernel
 
 #include "../shell/shell.h"

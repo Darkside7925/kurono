@@ -1,4 +1,4 @@
-// kurono os  -  kvid: kurono native video container
+// kurono os - kvid: kurono native video container
 // =================================================================
 // .kvid is a deliberately tiny, deliberately simple container we can
 // guarantee plays correctly on a freestanding kernel without an h264
@@ -6,7 +6,7 @@
 // video can be transcoded to .kvid via the host-side ffmpeg helper
 // (see tools/transcode_to_kvid.ps1) and then played natively.
 //
-// file layout (all integers little-endian  -  easier from this side):
+// file layout (all integers little-endian - easier from this side):
 //
 //   offset  size  field
 //   ------  ----  -------------------------------------------------

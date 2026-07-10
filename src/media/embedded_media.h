@@ -1,7 +1,7 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  embedded media assets  -  linked via objcopy from binary files
+//  embedded media assets - linked via objcopy from binary files
 //
 //  objcopy converts the file name (with dots/dashes replaced by underscores)
 //  into linker symbols:
@@ -56,7 +56,7 @@ inline uint32_t DenjiKVIDSize() {
                       (uintptr_t)_binary_denji_kvid_start);
 }
 
-// user-imported ssstik.mp4 (original)  -  preserved for inspection/transcode (satoru)
+// user-imported ssstik.mp4 (original) - preserved for inspection/transcode (satoru)
 inline bool HasSsstikMP4() {
     return _binary_ssstik_mp4_start != nullptr &&
            _binary_ssstik_mp4_end   != nullptr &&

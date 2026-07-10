@@ -1,10 +1,10 @@
 #pragma once
-//  kurono os  -  ksa (kurono secure authorization)
+//  kurono os - ksa (kurono secure authorization)
 //  hypervisor-backed privilege prompts. kurono's equivalent of windows uac,
 //  but the prompt is rendered + arbitrated inside an ept-isolated guest
 //  context that the main os has no page-table mapping into.  the result
 //  (approve/deny + credential hash) returns through a single restricted
-//  vmcall channel  -  ring-0 malware in the main os cannot intercept it or
+//  vmcall channel - ring-0 malware in the main os cannot intercept it or
 //  inject a forged approval.
 //
 //  isolation model (see docs/security/ksa.md):
@@ -23,7 +23,7 @@
 //      hold either way; the difference is documented, not hidden.
 #include "../kernel/types.h"
 
-// vmcall number for the ksa result channel  -  'K' = 0x4B. read-only verdict.
+// vmcall number for the ksa result channel - 'K' = 0x4B. read-only verdict.
 #define KSA_VMCALL_CHANNEL  0x4B
 
 // ksa result channel sub-functions (ecx). (satoru)
@@ -31,7 +31,7 @@
 #define KSA_SUB_GET_INFO    1   // host queries channel revision
 
 // a single ksa prompt request. the credential the user types never leaves the
-// isolated region in cleartext  -  only its salted hash is exposed to the host
+// isolated region in cleartext - only its salted hash is exposed to the host
 // verdict reader. (satoru)
 struct KSARequest {
     const char* title;       // e.g. "Privilege Escalation"
@@ -68,14 +68,14 @@ public:
     // (then callers fall back per policy). (satoru)
     static bool Prompt(const KSARequest& req, KSAVerdict& out);
 
-    // diagnostics  -  used by the boot self-test (kurono.ksa.test). renders a
+    // diagnostics - used by the boot self-test (kurono.ksa.test). renders a
     // synthetic prompt, auto-answers it inside the isolated context, and
     // verifies: (a) the isolated region is NOT reachable through the main-os
     // page tables, and (b) the verdict only crosses via the channel. logs
     // every check to serial. returns true if all invariants held. (satoru)
     static bool SelfTest();
 
-    // interactive render-path verification  -  used by the boot gate
+    // interactive render-path verification - used by the boot gate
     // kurono.ksa.prompt. runs the REAL KSA::Prompt() with a sample request so
     // the modal is drawn on the actual framebuffer; a headless screendump can
     // then capture it, and synthetic input (Enter/Esc or an Approve/Deny click)

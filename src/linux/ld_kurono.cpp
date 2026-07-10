@@ -1,7 +1,7 @@
-// ld-kurono.cpp  -  production dynamic linker (see ld_kurono.h).
+// ld-kurono.cpp - production dynamic linker (see ld_kurono.h).
 //
 // This module is intentionally self-contained except for KVFS, PMM/VMM
-// and the scheduler.  It does NOT depend on the userspace_entry asm  - 
+// and the scheduler.  It does NOT depend on the userspace_entry asm - 
 // the lazy-binding trampoline is emitted as raw machine code into a
 // per-process scratch page.
 
@@ -150,7 +150,7 @@ constexpr uint64_t DF_BIND_NOW  = 0x8;
 constexpr uint64_t DF_1_NOW     = 0x1;
 constexpr uint64_t DF_1_PIE     = 0x08000000;
 
-// Relocation types  -  full x86_64 set ------------------------------
+// Relocation types - full x86_64 set ------------------------------
 constexpr uint32_t R_X86_64_NONE        = 0;
 constexpr uint32_t R_X86_64_64          = 1;
 constexpr uint32_t R_X86_64_PC32        = 2;
@@ -855,7 +855,7 @@ bool apply_one_reloc(Process* proc, ProcLinkerState* pls, Lib* l,
             S = l->load_base + sx->st_value;
             defining = l;
         } else {
-            // Undefined  -  global lookup.
+            // Undefined - global lookup.
             SymHit hit = lookup_global(pls, nm);
             if (hit.sym) {
                 S = hit.lib->load_base + hit.sym->st_value;
@@ -867,7 +867,7 @@ bool apply_one_reloc(Process* proc, ProcLinkerState* pls, Lib* l,
             } else if (ST_BIND(sx->st_info) == STB_WEAK) {
                 S = 0;            // weak undef -> NULL
             } else {
-                // Hard undefined  -  don't fail the whole load; emit
+                // Hard undefined - don't fail the whole load; emit
                 // diagnostic and patch with 0 so the program can run
                 // until it actually invokes the missing symbol.
                 static char ebuf[256];
@@ -908,7 +908,7 @@ bool apply_one_reloc(Process* proc, ProcLinkerState* pls, Lib* l,
         case R_X86_64_IRELATIVE: {
             // Call resolver at (load_base + A); whatever it returns is
             // the final address.  Resolver runs in the user context's
-            // address space  -  but for correctness during early link we
+            // address space - but for correctness during early link we
             // simply patch with the function pointer itself.  The first
             // call from user code will execute the resolver normally.
             patch_image_u64(proc, l, P, l->load_base + A);
@@ -931,7 +931,7 @@ bool apply_one_reloc(Process* proc, ProcLinkerState* pls, Lib* l,
                     ((uint8_t*)&v)[b] = sp[k + b];
                 if (take == 8) patch_image_u64(proc, l, P + k, v);
                 else {
-                    // Partial trailing bytes  -  fall back to per-byte.
+                    // Partial trailing bytes - fall back to per-byte.
                     uint64_t page = (P + k) & ~(uint64_t)(PAGE_SIZE - 1);
                     uint64_t phys = KernelVMM::QueryMappingInAddressSpace(
                         proc->address_space, page);
@@ -977,7 +977,7 @@ bool apply_one_reloc(Process* proc, ProcLinkerState* pls, Lib* l,
             patch_image_u32(proc, l, P, (uint32_t)((tls_off + A) - P));
             return true;
         default:
-            // Unknown relocation type  -  log but don't fail; many
+            // Unknown relocation type - log but don't fail; many
             // libraries contain a few reloc types our handler doesn't
             // need (e.g. older MIPS-isms slipped into x86_64).
             dlog(pls, LdKurono::DBG_RELOC, "unknown reloc type, skipped");
@@ -1182,7 +1182,7 @@ Lib* load_library_recursive(Process* proc, ProcLinkerState* pls,
     if (!l) return nullptr;
 
     // Recurse into dependencies before applying relocations to *this*
-    // library  -  symbol lookup needs all defs visible.
+    // library - symbol lookup needs all defs visible.
     process_dt_needed(proc, pls, l);
     return l;
 }
@@ -1220,7 +1220,7 @@ void seed_searchpath(ProcLinkerState* pls, const char* env_ld_library_path) {
 }
 
 // ============================================================
-// vDSO emission  -  write a tiny ELF into a single user page that
+// vDSO emission - write a tiny ELF into a single user page that
 // exports clock_gettime / gettimeofday / time / getcpu trampolines.
 // ============================================================
 uint64_t build_vdso(Process* proc) {
@@ -1334,7 +1334,7 @@ uint64_t push_string(Process* proc, uint64_t* sp_ref, const char* s) {
     // re-resolve the physical page for EACH byte: a long string (e.g. MOZ_LOG or
     // LD_LIBRARY_PATH) can straddle two user-stack pages, and the old code mapped
     // only the start page then wrote the overflow past it into the wrong physical
-    // page  -  silently corrupting the tail of the value. (satoru)
+    // page - silently corrupting the tail of the value. (satoru)
     for (int i = 0; i < len; i++) {
         uint64_t a = addr + (uint64_t)i;
         uint64_t page = a & ~(uint64_t)(PAGE_SIZE - 1);
@@ -1358,7 +1358,7 @@ void push_qword(Process* proc, uint64_t* sp_ref, uint64_t v) {
 }
 
 // write len bytes from kernel `src` (or zero-fill if src==null) to user va
-// `dst`, page by page  -  tls block pages are individually allocated and not
+// `dst`, page by page - tls block pages are individually allocated and not
 // physically contiguous, so each page is resolved through the address space
 // separately, and writes that straddle a page boundary are split. (satoru)
 bool write_user_mem(Process* proc, uint64_t dst, const uint8_t* src, uint64_t len) {
@@ -1414,7 +1414,7 @@ bool install_main_tls(Process* proc, ProcLinkerState* pls) {
     for (int i = 0; i < pls->lib_count; i++) {
         Lib* l = &g_libs[pls->libs[i]];
         // skip modules with no tls or no assigned offset (e.g. a main exec with
-        // its own tls  -  that case needs a separate offset pass, noted). (satoru)
+        // its own tls - that case needs a separate offset pass, noted). (satoru)
         if (!l->tls_memsz || !l->tls_offset) continue;
         uint64_t mod_addr = tp - l->tls_offset;
         if (l->tls_template && l->tls_filesz)
@@ -1454,7 +1454,7 @@ void call_init_arrays_recursive(Process* proc, ProcLinkerState* pls, Lib* l) {
 // (argc, argv, envp) registers between calls, and finally tail-jumps
 // to the real ELF entry point.  Returns the new entry VA the kernel
 // should set as the process RIP.  On failure it returns real_entry,
-// which is harmless  -  we just skip constructors.
+// which is harmless - we just skip constructors.
 // ============================================================
 uint64_t build_init_trampoline(Process* proc, ProcLinkerState* pls,
                                uint64_t real_entry) {
@@ -1476,7 +1476,7 @@ uint64_t build_init_trampoline(Process* proc, ProcLinkerState* pls,
     if (nf == 0) return real_entry;
 
     // Bound the trampoline to one page.  Each call site is 24 bytes,
-    // prologue 14, epilogue 12  -  plenty of room for ~160 inits.
+    // prologue 14, epilogue 12 - plenty of room for ~160 inits.
     constexpr int CALL_BYTES = 24;
     constexpr int PROLOGUE   = 14;
     constexpr int EPILOGUE   = 12;
@@ -1641,7 +1641,7 @@ int Dlclose(Process* proc, void* handle) {
     if (l->refcount == 0 && !l->nodelete) {
         // Run finalizers (queued, deferred).
         dlog(pls, DBG_LIBS, "unload library");
-        // Do not actually unmap pages  -  Firefox's plugin model dlcloses
+        // Do not actually unmap pages - Firefox's plugin model dlcloses
         // libxul aggressively and we don't want to crash on next call.
     }
     DlDebugStateNotify();
@@ -1759,7 +1759,7 @@ void DumpMaps(Process* proc, char* out, int max_len) {
 }
 
 // ============================================================
-// ExecPIE  -  main entry from execve.
+// ExecPIE - main entry from execve.
 // ============================================================
 bool ExecPIE(Process* proc,
              const uint8_t* image, uint64_t image_size,
@@ -1892,7 +1892,7 @@ bool ExecPIE(Process* proc,
     // jump to the INTERP's entry; musl's _dlstart then self-relocates, loads the
     // exe's DT_NEEDED closure, relocates everything, sets up tls + its own dso
     // list, runs init, and tail-jumps to the exe. that is why we deliberately do
-    // NOT process_dt_needed / apply_relocs / install_main_tls / run init here  - 
+    // NOT process_dt_needed / apply_relocs / install_main_tls / run init here - 
     // musl owns all of it, and its libc startup (do_init_fini etc.) crashes if
     // those globals were not built by its own linker. (satoru)
     const char* interp_path = nullptr;

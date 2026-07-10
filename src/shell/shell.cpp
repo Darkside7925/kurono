@@ -231,7 +231,7 @@ int KuronoShell::ResolveConflict(int choice, char* output, int max_output) {
         return r;
     }
 
-    // cb_registered  -  use the stored shellcommand handler
+    // cb_registered - use the stored shellcommand handler
     ShellCommand* cmd = conflict_choices[choice - 1];
     if (!cmd || !cmd->handler) return 0;
 
@@ -446,7 +446,7 @@ void KuronoShell::PumpUI() {
 
     WindowManager::HandlePointerMove(Mouse::mx, Mouse::my);
 
-    // Drain keyboard chars through the desktop environment  -  mirrors the
+    // Drain keyboard chars through the desktop environment - mirrors the
     // kernel main loop's input pattern so keystrokes reach the focused
     // window even while a shell command blocks the main loop.
     {
@@ -629,7 +629,7 @@ int KuronoShell::Execute(const char* cmdline, char* output, int max_output) {
         static KuronoShell shell_singleton;
         result = cmd->handler(&shell_singleton, argc, argv, output, max_output);
     } else {
-        // check if it's a kcl script  -  run it through the kcl interpreter.
+        // check if it's a kcl script - run it through the kcl interpreter.
         // resolve a bare name against the cwd if it isn't already a path. (satoru)
         int nlen = slen(argv[0]);
         if (nlen > 4 && argv[0][nlen-4] == '.' && argv[0][nlen-3] == 'k' &&
@@ -773,7 +773,7 @@ void KuronoShell::GetPrompt(char* buf, int max_len) {
     }
 }
 
-//  dynamic os probing  -  kernel-level backend detection
+//  dynamic os probing - kernel-level backend detection
 
 // known powershell commands/aliases for fast probe (no vm call needed)
 static const char* pwsh_known[] = {
@@ -970,7 +970,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("linux",     "Switch to Linux environment",  ENV_KURONO, "builtin", cmd_bash);
     RegisterCommand("cmd",       "Switch to Windows shell",      ENV_KURONO, "builtin", cmd_cmd);
 
-    // powershell  -  real pwsh via alpine vm
+    // powershell - real pwsh via alpine vm
     RegisterCommand("pwsh-setup","Install PowerShell in Alpine", ENV_KURONO, "system",  cmd_pwsh_setup);
     RegisterCommand("pwsh",      "Run PowerShell command",       ENV_KURONO, "system",  cmd_pwsh);
     RegisterCommand("powershell","Run PowerShell command",       ENV_KURONO, "system",  cmd_pwsh);
@@ -984,17 +984,17 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("pwd",       "Print working directory",      ENV_KURONO, "filesystem",cmd_pwd);
     RegisterCommand("usermode",  "Run ring-3 demo process",      ENV_KURONO, "system",  cmd_usermode);
 
-    // ksa / supr  -  hypervisor-backed privilege prompts + auth policy. (satoru)
+    // ksa / supr - hypervisor-backed privilege prompts + auth policy. (satoru)
     RegisterCommand("supr",      "Privilege & auth policy (KSA)", ENV_KURONO, "security", cmd_supr);
 
-    // alpine vm bridge commands  -  embed alpine into shell
+    // alpine vm bridge commands - embed alpine into shell
     RegisterCommand("alpine",   "Run command in Alpine VM",     ENV_KURONO, "system",  cmd_alpine);
     // ffmpeg registered above as the real embedded musl-static transcoder (satoru)
     RegisterCommand("ffprobe",  "Media info (Alpine ffprobe)",  ENV_KURONO, "system",  cmd_ffprobe);
     RegisterCommand("apk",      "Alpine package manager",       ENV_KURONO, "package", cmd_apk);
     RegisterCommand("codecs",   "List registered codecs",       ENV_KURONO, "system",  cmd_codecs);
 
-    // kurono system command  -  reload config, show info
+    // kurono system command - reload config, show info
     RegisterCommand("kurono",  "Kurono system control",        ENV_KURONO, "system",  cmd_kurono);
 
     // phase 8: screenshots, cpu frequency, power management. (satoru)
@@ -1049,7 +1049,7 @@ int cmd_help(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
 
 int cmd_version(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
-    return sappend(out, 0, maxo, "Kurono OS 1.0.0 \"Aurora\"\nHybrid Kernel  -  Linux · Windows · Kurono\n");
+    return sappend(out, 0, maxo, "Kurono OS 1.0.0 \"Aurora\"\nHybrid Kernel - Linux · Windows · Kurono\n");
 }
 
 int cmd_denji(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
@@ -1246,7 +1246,7 @@ int cmd_crash(KuronoShell* sh, int argc, const char** argv, char* out, int maxo)
     // helper lambdas would be nice but we're freestanding, so just branch:
     if (seq(method, "div0")) {
         p = sappend(out, p, maxo, "Crash: CPU divide-by-zero (#DE, vector 0)\n");
-        // inline asm  -  compiler cannot optimise this away
+        // inline asm - compiler cannot optimise this away
         __asm__ __volatile__(
             "xorl %%ecx, %%ecx\n\t"   // ecx = 0
             "movl $1, %%eax\n\t"       // eax = 1
@@ -1256,7 +1256,7 @@ int cmd_crash(KuronoShell* sh, int argc, const char** argv, char* out, int maxo)
         );
     } else if (seq(method, "null")) {
         p = sappend(out, p, maxo, "Crash: NULL pointer write (#PF, vector 14)\n");
-        // write to address 0  -  guaranteed page fault
+        // write to address 0 - guaranteed page fault
         __asm__ __volatile__(
             "xorl %%eax, %%eax\n\t"
             "movl $0xDEAD, (%%rax)\n\t"
@@ -1264,14 +1264,14 @@ int cmd_crash(KuronoShell* sh, int argc, const char** argv, char* out, int maxo)
         );
     } else if (seq(method, "ud2")) {
         p = sappend(out, p, maxo, "Crash: Invalid opcode (#UD, vector 6)\n");
-        // ud2  -  guaranteed invalid-opcode exception
+        // ud2 - guaranteed invalid-opcode exception
         __asm__ __volatile__("ud2" ::: "memory");
     } else if (seq(method, "int3")) {
         p = sappend(out, p, maxo, "Crash: Breakpoint trap (#BP, vector 3)\n");
         __asm__ __volatile__("int $3" ::: "memory");
     } else if (seq(method, "overflow")) {
         p = sappend(out, p, maxo, "Crash: Stack overflow (recursive)\n");
-        // infinite recursion  -  will blow the stack and page-fault
+        // infinite recursion - will blow the stack and page-fault
         cmd_crash(sh, argc, argv, out, maxo);
     } else if (seq(method, "gpf")) {
         p = sappend(out, p, maxo, "Crash: General protection fault (#GP, vector 13)\n");
@@ -1320,7 +1320,7 @@ int cmd_gpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     };
 
     p = sappend(out, p, maxo, "\033[36m╔══════════════════════════════════════════╗\033[0m\n");
-    p = sappend(out, p, maxo, "\033[36m║        Kurono OS  -  GPU Information       ║\033[0m\n");
+    p = sappend(out, p, maxo, "\033[36m║        Kurono OS - GPU Information       ║\033[0m\n");
     p = sappend(out, p, maxo, "\033[36m╚══════════════════════════════════════════╝\033[0m\n\n");
 
     const GpuProbeResult& gpr = GpuProbe::GetResult();
@@ -1463,7 +1463,7 @@ int cmd_gpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
 static void persist_kvfs() {
     if (!PersistStore::Available()) return;
     // mirror the kvfs user-data subtrees (/home, /etc, /root) to a real on-disk
-    // KFS filesystem on the nvme data disk  -  re-seeded /usr binaries + the big
+    // KFS filesystem on the nvme data disk - re-seeded /usr binaries + the big
     // sample media are skipped (size-capped) and re-filled by the boot seeding.
     // KFS::WriteFile uses contiguous runs + multi-page dma, so this completes in
     // a handful of commands. (satoru)
@@ -1486,7 +1486,7 @@ int cmd_shutdown(KuronoShell* sh, int argc, const char** argv, char* out, int ma
     return p;
 }
 
-// persisttest  -  prove the kvfs persistence loop end to end. first run writes a
+// persisttest - prove the kvfs persistence loop end to end. first run writes a
 // marker and flushes it to the ext4 data disk; after a reboot the boot-mount +
 // restore brings it back, so a second run reports it survived. (satoru)
 int cmd_persisttest(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
@@ -1816,7 +1816,7 @@ int cmd_wltest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
     return p;
 }
 
-// run the embedded pthreads smoke test  -  proves CLONE_THREAD + the futex-backed
+// run the embedded pthreads smoke test - proves CLONE_THREAD + the futex-backed
 // mutex (serialisation) + pthread_join. a correct run prints "counter=200000
 // PASS". (satoru)
 int cmd_pthtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
@@ -2027,20 +2027,110 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // firefox 140 is WEBRENDER-ONLY (the old basic/non-WR compositor is gone),
             // so WR must come up or there is no compositor at all. the failed glxtest
             // marks the GPU unusable in gfxInfo; force-enable WR so the SOFTWARE backend
-            // (cpu rasterizer, no GL needed) starts regardless of "no GPU detected"  - 
+            // (cpu rasterizer, no GL needed) starts regardless of "no GPU detected" - 
             // otherwise the compositor thread never starts and the main thread null-derefs
             // the absent compositor (#PF CR2=0). (satoru)
             "lockPref(\"gfx.webrender.force-enabled\", true);\n"
             "lockPref(\"gfx.webrender.all\", true);\n"
+            // (satoru) 2026-07-09: the SMP context-corruption is fixed (firefox no
+            // longer crashes, loads+lays out the page), but on screen only the page
+            // BACKGROUND (#0d1117) composites - the TEXT/content is missing. that
+            // content is rasterized by the rayon WRWorker pool; the render thread
+            // only does the bg fill. force SINGLE-THREADED SW-WR so the render
+            // thread rasters glyphs/boxes itself (no worker pool) - test whether the
+            // pool is the remaining content blocker. (satoru)
+            "lockPref(\"gfx.webrender.multithreading\", false);\n"
+            "lockPref(\"gfx.webrender.enable-low-priority-pool\", false);\n"
+            // (satoru) SW-WR content frames go renderer thread -> rayon WRWorker pool
+            // (glyph/blob raster, scene build) -> SwComposite thread -> condvar back,
+            // all over RAW futex (rust-std/rayon bypass musl's pthread paths). the
+            // real fix is the kernel futex lost-wake race (atomic value-check+enqueue
+            // in futex_enqueue_and_block); with that fixed, multithreaded SW-WR is
+            // left ON so the fix is actually exercised. (workaround prefs
+            // gfx.webrender.multithreading=false + enable-low-priority-pool=false
+            // remain available if the futex fix regresses.) (satoru)
             "lockPref(\"browser.tabs.remote.autostart\", false);\n"
             "lockPref(\"fission.autostart\", false);\n"
+            // (satoru) the network path fully works (firefox receives the whole
+            // http response), but the loaded document never PAINTS into the
+            // <browser> content area - it stays firefox's blank content canvas
+            // (0xFFF9F9FB), not the page. on a minimal wayland compositor firefox
+            // can consider the top-level content browsing context inactive/occluded
+            // and skip content painting (chrome still paints). force the content
+            // active + never-throttled so the parsed document lays out and paints.
+            "lockPref(\"layout.testing.top-level-always-active\", true);\n"
+            "lockPref(\"dom.suspend_inactive.enabled\", false);\n"
+            "lockPref(\"dom.min_background_timeout_value\", 4);\n"
+            "lockPref(\"gfx.display.max-frame-rate\", 60);\n"
+            // (satoru) [cpx] confirms firefox composites its CHROME (toolbar light)
+            // but the web-CONTENT viewport stays firefox's blank canvas 0xFFF9F9FB
+            // even at readyState=complete (bodyLen=2973). the content document's
+            // presentation isn't painting. two likely gates on a headless wayland
+            // compositor with no hardware vsync:
+            //  1. INITIAL-PAINT SUPPRESSION: PresShell suppresses the first content
+            //     paint until nglayout.initialpaint.delay after the first reflow; if
+            //     that timer path is flaky the content never un-suppresses. force 0.
+            //  2. VSYNC-DRIVEN REFRESH DRIVER never ticks (no vsync source) so the
+            //     content refresh driver never composites; layout.frame_rate>0 forces
+            //     a SOFTWARE timer-driven refresh driver (chrome paints because it is
+            //     invalidated directly, but content relies on the driver ticking).
+            // (satoru)
+            "lockPref(\"nglayout.initialpaint.delay\", 0);\n"
+            "lockPref(\"nglayout.initialpaint.delay_in_oopif\", 0);\n"
+            "lockPref(\"layout.frame_rate\", 60);\n"
+            // (satoru) content presShell PAINTS (paintCount reaches 3, bg computes
+            // to the dark page color) but the committed wl buffer's content region
+            // stays blank white and firefox commits NO other surface - so the paint
+            // produces an EMPTY visible scene. most likely the async-scroll
+            // DISPLAYPORT is empty/uninitialised (no active window/APZ init on this
+            // headless compositor), so WebRender culls all content display items.
+            // disable APZ so the content paints its real viewport rect directly
+            // instead of a (possibly empty) displayport. (satoru)
+            "lockPref(\"layers.async-pan-zoom.enabled\", false);\n"
+            "lockPref(\"apz.allow_zooming\", false);\n"
+            // (satoru) the content PAINTS (paintCount climbs) but its pixels never
+            // reach the committed wl buffer and firefox emits no extra surface, so
+            // the rendered content frame is not PRESENTED. WebRender partial-present
+            // + retained display lists only re-render/blit CHANGED regions; if the
+            // content's damage rect isn't applied on this compositor, the content
+            // (which appears AFTER the initial blank frame) is never re-presented.
+            // force full-frame rebuild + present so every frame carries the content.
+            "lockPref(\"gfx.webrender.max-partial-present-rects\", 0);\n"
+            "lockPref(\"gfx.partialpresent.force\", 0);\n"
+            "lockPref(\"layout.display-list.retain\", false);\n"
+            // (satoru) firefox has NO active window (activeWin=n) even when forced
+            // via Services.focus.activeWindow - the focus manager delegates to the
+            // nsWindow widget, which never gets real OS focus on this compositor.
+            // testmode lets the focus manager honor programmatic activation without
+            // real OS focus, so w.focus() can mark the window active. tests whether
+            // 'no active window' is what stops the painted content from presenting.
+            "lockPref(\"focusmanager.testmode\", true);\n"
+            // (satoru) TEMP: disable HTTP cache so the mirror page is refetched each
+            // boot (the golden profile cached the old page; needed to test whether a
+            // TRIVIAL page renders vs the real one -> content-specific SWGL failure).
+            "lockPref(\"browser.cache.disk.enable\", false);\n"
+            "lockPref(\"browser.cache.memory.enable\", false);\n"
+            "lockPref(\"network.http.use-cache\", false);\n"
+            // (satoru) the kill -9 boots make firefox think it CRASHED, so it
+            // session-restores the golden profile's saved /kurono/ tab, overriding
+            // the homepage. disable crash restore so the fresh homepage loads.
+            "lockPref(\"browser.sessionstore.resume_from_crash\", false);\n"
+            "lockPref(\"browser.sessionstore.max_resumed_crashes\", 0);\n"
+            // (satoru) [KDOC] showed the tab committed the mirror URL + received the
+            // full response, but readyState stays 'loading' with no <body> - the
+            // HTML parser parses 0 bytes. the html5 parser runs on a BACKGROUND
+            // parser thread and posts tree-ops to the main thread; that cross-thread
+            // hop is the fragile path on kurono. force the parser onto the main
+            // thread (which runs - the KDOC timer fires) so the received bytes
+            // tokenize + build the DOM without the parser-thread dispatch. (satoru)
+            "lockPref(\"html5.offmainthread\", false);\n"
             // single-threaded servo styling. with >1 thread, global_style_data.rs builds
             // a rayon STYLE_THREAD_POOL whose ThreadPoolBuilder::build() prime-barrier
             // (use_current_thread + parking_lot/futex) DEADLOCKS during nsLayoutStatics::
-            // Initialize on kurono  -  the workers spawn as nsThreads (the KX5: markers) but
+            // Initialize on kurono - the workers spawn as nsThreads (the KX5: markers) but
             // the barrier never completes, wedging the chrome main thread inside
             // nsComponentManagerImpl::Init (KX2:I, CompMgrInit). layout.css.stylo-threads<=1
-            // makes stylo skip the pool entirely (None) and style on the main thread  - 
+            // makes stylo skip the pool entirely (None) and style on the main thread - 
             // slower but correct, and it lets startup get past CompMgrInit. (satoru)
             "lockPref(\"layout.css.stylo-threads\", 1);\n"
             // kill every helper CHILD PROCESS so the parent does everything itself
@@ -2090,12 +2180,12 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // the smp stale-tlb retry, PROT_EXEC clears PTE_NX), so mprotect(RX) on a
             // jit code buffer actually makes it executable. baseline jit compiles the
             // chrome js to native code instead of interpreting it, which is the
-            // dominant startup cost  -  this is what lets the (interpreter-slow) browser
+            // dominant startup cost - this is what lets the (interpreter-slow) browser
             // window finish loading in a reasonable time. ion stays OFF (heavier W^X
             // churn); baseline is enough. (satoru)
             // real networking over the af_inet bridge: no quic (the udp bridge is
             // dns-grade, not http/3-grade), no ipv6 (the stack is v4-only), and a
-            // tight connection cap  -  the kurono stack has 16 socket slots shared
+            // tight connection cap - the kurono stack has 16 socket slots shared
             // with the kernel's own use. (satoru)
             "lockPref(\"network.http.http3.enable\", false);\n"
             "lockPref(\"network.dns.disableIPv6\", true);\n"
@@ -2107,7 +2197,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"network.prefetch-next\", false);\n"
             "lockPref(\"javascript.options.baselinejit\", true);\n"
             // ion tested 2026-07-06 and REVERTED (satoru): with ion=true the run
-            // reached the window then died on a ring-3 #PF  -  a null WRITE (cr2=0
+            // reached the window then died on a ring-3 #PF - a null WRITE (cr2=0
             // err=7) with rip inside the jit-code reservation (0x1800_xxxxxxxx),
             // i.e. ion-generated code itself misbehaving on kurono. mprotect
             // already broadcasts tlb flushes, so it isn't the known stale-tlb
@@ -2137,7 +2227,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // gives the GC helper threads real cores AND mprotect works correctly
             // (region_owner + stale-tlb fixes), the nursery keeps short-lived
             // startup objects OUT of tenured chunks (far fewer getOrAllocChunk
-            // stalls) and incremental GC spreads the work  -  startup progresses to
+            // stalls) and incremental GC spreads the work - startup progresses to
             // the window instead of crawling. (satoru)
             // non-generational + non-incremental (satoru): generational GC made the
             // chrome main STALL in GCRuntime::getOrAllocChunk waiting on the
@@ -2147,7 +2237,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // advances to the window. (satoru)
             "lockPref(\"javascript.options.mem.gc_incremental\", false);\n"
             "lockPref(\"javascript.options.mem.gc_generational\", false);\n"
-            // enable gecko module logging via PREFS  -  the env/cmdline MOZ_LOG paths
+            // enable gecko module logging via PREFS - the env/cmdline MOZ_LOG paths
             // produced nothing in this build, but prefs are confirmed-honored here
             // (dom.ipc.processCount=1 took effect -> exactly 1 content proc). a
             // logging.<module> pref calls LogModule::Get(module)->SetLevel; output
@@ -2177,6 +2267,22 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // and the window actually paints. (satoru)
             "lockPref(\"logging.config.LOG_FILE\", \"/dev/null\");\n"
             "lockPref(\"logging.config.sync\", true);\n"
+            // (satoru) force the gfx font/cmap log modules to Disabled (level 0).
+            // MOZ_LOG env is a no-op in this build (see above) so these default ON,
+            // and gfxSparseBitSet::Dump (reached only when cmapdata logging is
+            // enabled) has a snprintf size-underflow: index += snprintf(&out[index],
+            // BUFSIZE-index, ...) in a loop, and a long fontconfig name ("DejaVu
+            // Sans:familylang=...") drives index past the 256-byte stack buffer ->
+            // BUFSIZE-index wraps to a huge size_t -> subsequent snprintf writes
+            // SMASH the caller's frame + stack canary. that is the DETERMINISTIC
+            // nsCaret::GetPaintGeometry stack-canary #gp that blocks page paint.
+            // disabling the module gates the Dump off entirely. (satoru)
+            "lockPref(\"logging.cmapdata\", 0);\n"
+            "lockPref(\"logging.fontlist\", 0);\n"
+            "lockPref(\"logging.fontinit\", 0);\n"
+            "lockPref(\"logging.textrun\", 0);\n"
+            "lockPref(\"logging.textrunui\", 0);\n"
+            "lockPref(\"logging.textperf\", 0);\n"
             // kurono has no working outbound network for firefox; the remote
             // startup services (RemoteSettings sync, region lookup, Normandy,
             // safebrowsing, telemetry, captive-portal, connectivity) then retry
@@ -2374,7 +2480,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         "MOZ_LOG=all:0",
         // redirect MOZ_LOG output to /dev/null via the ENV (read at logging init,
         // BEFORE the firefox.cfg logging.config.LOG_FILE pref which applies too late
-        //  -  the CompMgrInit flood happens pre-profile). default MOZ_LOG output is
+        // - the CompMgrInit flood happens pre-profile). default MOZ_LOG output is
         // stderr->serial, and each line is an ~8.7ms ring-0 UART busy-wait at 115200
         // baud (timer preempt only fires on ring-3, so the busy-wait monopolizes the
         // cpu); the component-registration log flood thus throttled firefox to a
@@ -2405,7 +2511,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         // is gecko's official override for exactly that case. (satoru)
         "MOZ_ALLOW_ROOT=1",
         // kurono's compositor only blits wl_shm (no dmabuf/egl). firefox 140 is
-        // webrender-only, so we can't avoid WR  -  instead force its SOFTWARE backend
+        // webrender-only, so we can't avoid WR - instead force its SOFTWARE backend
         // (cpu rasterizer, MOZ_ACCELERATED=0 + WEBRENDER_SOFTWARE=1), which commits
         // plain shm buffers and needs no GL. MOZ_WEBRENDER=1 force-enables WR past
         // the gfxInfo blocklist that the (disabled) glxtest leaves marking the GPU
@@ -2422,7 +2528,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         // (satoru) force the socket(network) process OFF. it's the only child proc
         // firefox still tries to spawn at startup; nsIOService::UseSocketProcess()
         // honours this env BEFORE its cached pref check (the cfg lockPref loads too
-        // late  -  sUseSocketProcessChecked caches true first). its launch task parks
+        // late - sUseSocketProcessChecked caches true first). its launch task parks
         // the IPC i/o thread (kurono can't cleanly fork+exec a child) and wedges the
         // chrome main at GeckoChildProcessHost::AsyncLaunch. (satoru)
         "MOZ_DISABLE_SOCKET_PROCESS=1",
@@ -2431,7 +2537,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         // launch a CONTENT process via vfork+execve and the chrome main wedged in
         // ContentParent::WaitForLaunchSync / GeckoChildProcessHost::
         // WaitForProcessHandle forever (kurono can't complete the content-process
-        // ipc handshake  -  the original content-launch deadlock). BrowserTabsRemote-
+        // ipc handshake - the original content-launch deadlock). BrowserTabsRemote-
         // Autostart() honours MOZ_FORCE_DISABLE_E10S=="1" on a non-official build
         // (allowDisablingE10s=true) and turns e10s OFF, so tabs render IN the parent
         // process and no content process is ever launched -> the window paints. (satoru)
@@ -2464,7 +2570,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     out[p] = 0;
     p = sappend(out, p, mx, "\nfirefox: process returned (code ");
     p = sappend_int(out, p, mx, rc);
-    p = sappend(out, p, mx, ")  -  see serial for ld-kurono module bases + any fault.\n");
+    p = sappend(out, p, mx, ") - see serial for ld-kurono module bases + any fault.\n");
     Scheduler::DestroyProcess(proc);
     return p;
 }
@@ -2488,7 +2594,7 @@ int cmd_pwd(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     return sappend_char(out, p, maxo, '\n');
 }
 
-//  pwsh-setup  -  install powershell in alpine vm guest
+//  pwsh-setup - install powershell in alpine vm guest
 
 int cmd_pwsh_setup(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
@@ -2566,7 +2672,7 @@ int cmd_pwsh_setup(KuronoShell* sh, int argc, const char** argv, char* out, int 
     return p;
 }
 
-//  pwsh  -  run a powershell command directly
+//  pwsh - run a powershell command directly
 
 int cmd_pwsh(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh;
@@ -2597,7 +2703,7 @@ int cmd_pwsh(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
     return KuronoShell::RunViaPwsh(cmd_buf, out, maxo);
 }
 
-//  alpine  -  run any command in alpine vm guest
+//  alpine - run any command in alpine vm guest
 int cmd_alpine(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh;
     if (argc < 2) {
@@ -2623,11 +2729,11 @@ int cmd_alpine(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
     return KuronoShell::RunViaAlpine(cmd_buf, out, maxo);
 }
 
-//  ffmpeg  -  video encode/decode via alpine's ffmpeg
-// (legacy alpine-vm ffmpeg stub removed  -  replaced by the real embedded
+//  ffmpeg - video encode/decode via alpine's ffmpeg
+// (legacy alpine-vm ffmpeg stub removed - replaced by the real embedded
 //  musl-static ffmpeg in cmd_ffmpeg above. (satoru))
 
-//  ffprobe  -  media file info via alpine's ffprobe
+//  ffprobe - media file info via alpine's ffprobe
 int cmd_ffprobe(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh;
     if (argc < 2) {
@@ -2648,7 +2754,7 @@ int cmd_ffprobe(KuronoShell* sh, int argc, const char** argv, char* out, int max
     return KuronoShell::RunViaAlpine(cmd_buf, out, maxo);
 }
 
-//  apk  -  alpine package manager
+//  apk - alpine package manager
 int cmd_apk(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh;
     if (argc < 2) {
@@ -2680,7 +2786,7 @@ int cmd_apk(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     return p;
 }
 
-//  codecs  -  list registered codecs and their status
+//  codecs - list registered codecs and their status
 int cmd_codecs(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = 0;
@@ -2736,7 +2842,7 @@ int cmd_kurono(KuronoShell*, int argc, const char** argv, char* out, int maxo) {
     int p = 0;
     if (argc < 2) {
         p = sappend(out, p, maxo,
-            "kurono  -  system control\n"
+            "kurono - system control\n"
             "\n"
             "  kurono reload    Reload UI config and refresh desktop\n"
             "  kurono info      Show system information\n"
@@ -2801,7 +2907,7 @@ static const char* supr_auth_value(int argc, const char** argv) {
     return nullptr;
 }
 
-//  supr  -  kurono privilege / auth policy control.
+//  supr - kurono privilege / auth policy control.
 //    supr policy                     show current policy + ksa status
 //    supr policy --auth=passwd|kvault|both [--sovereign-override]
 //    supr policy kvault disable --force --acknowledge-risk [--sovereign-override]
@@ -2832,7 +2938,7 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
     }
 
     if (seq(sub, "passwd")) {
-        // normal password-change flow  -  NO ksa involvement, per spec. (satoru)
+        // normal password-change flow - NO ksa involvement, per spec. (satoru)
         p = sappend(out, p, maxo, "supr passwd: interactive password change is GUI/login-driven.\n");
         p = sappend(out, p, maxo, "(no ksa involved; uses the standard password flow)\n");
         return p;
@@ -2916,7 +3022,7 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
             ? (KSA::IsRealNestedVM() ? "nested VM\n" : "EPT-isolated context (nested-virt fallback)\n")
             : "n/a\n");
         if (SUPR::BothAuthDisabled())
-            p = sappend(out, p, maxo, "  WARNING: both auth factors disabled  -  escalations show a risk warning.\n");
+            p = sappend(out, p, maxo, "  WARNING: both auth factors disabled - escalations show a risk warning.\n");
         return p;
     }
 
@@ -2927,7 +3033,7 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
         seq(sub, "linux") || seq(sub, "cmd") || seq(sub, "exit")) {
         p = sappend(out, p, maxo, "supr: '");
         p = sappend(out, p, maxo, sub);
-        p = sappend(out, p, maxo, "' is a shell builtin  -  run it directly (elevation doesn't apply).\n");
+        p = sappend(out, p, maxo, "' is a shell builtin - run it directly (elevation doesn't apply).\n");
         return p;
     }
     if (seq(sub, "whoami")) {
@@ -2937,7 +3043,7 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
     }
     // a guest may not escalate. (satoru)
     if (SUPR::GetLevel(sid) <= SUPR_GUEST) {
-        p = sappend(out, p, maxo, "supr: permission denied  -  your role may not escalate.\n");
+        p = sappend(out, p, maxo, "supr: permission denied - your role may not escalate.\n");
         return p;
     }
     // the target must exist before we bother prompting. (satoru)
@@ -2956,7 +3062,7 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
     rp = sappend(reason, rp, (int)sizeof(reason), "' as root");
     int saved_user = -1;
     if (!SUPR::SudoBegin(sid, reason, &saved_user)) {
-        p = sappend(out, p, maxo, "supr: authentication failed  -  not running '");
+        p = sappend(out, p, maxo, "supr: authentication failed - not running '");
         p = sappend(out, p, maxo, sub);
         p = sappend(out, p, maxo, "'.\n");
         return p;

@@ -15,7 +15,7 @@
 //       of a 10ms tick == ~0.16% of one core; the bucket guarantees the cpu cap
 //       holds regardless of how many candidates exist.
 //    3. yield IMMEDIATELY if the compositor has pending frames (UIDirtyCount>0)
-//       so a scan never delays a render  -  the single most visible thing.
+//       so a scan never delays a render - the single most visible thing.
 //    4. scan for aged candidates and compress up to the budget.
 //    5. occasionally run a low-priority dedup pass.
 //    6. sleep to the next 10ms tick.
@@ -32,17 +32,17 @@ bool g_proc_started = false;
 // red/critical push the 16-page batch. (satoru)
 int budget_for_pressure(Pressure p) {
     switch (p) {
-        case PRESS_GREEN:    return 2;    // ~1%  -  oldest pages only (satoru)
+        case PRESS_GREEN:    return 2;    // ~1% - oldest pages only (satoru)
         case PRESS_YELLOW:   return 4;    // ~2% (satoru)
         case PRESS_ORANGE:   return 8;    // ~4% (satoru)
         case PRESS_RED:      return 16;   // ~5% (satoru)
-        case PRESS_CRITICAL: return 16;   // emergency  -  full batch every tick (satoru)
+        case PRESS_CRITICAL: return 16;   // emergency - full batch every tick (satoru)
     }
     return 2;
 }
 
 // is the compositor mid-frame / about to render? a non-destructive peek at the
-// dirty counter (we must NOT consume it  -  that is the gui loop's job). if there
+// dirty counter (we must NOT consume it - that is the gui loop's job). if there
 // is pending visual work, kmemx steps aside this tick. (satoru)
 inline bool compositor_busy() {
     return Graphics::UIDirtyCount() > 0;

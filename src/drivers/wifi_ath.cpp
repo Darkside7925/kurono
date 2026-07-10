@@ -1,4 +1,4 @@
-//  kurono os  -  atheros / qualcomm wifi radio driver (ath9k + ath10k) (satoru)
+//  kurono os - atheros / qualcomm wifi radio driver (ath9k + ath10k) (satoru)
 //  see wifi_ath.h. implements the WifiRadioOps contract for atheros ar9xxx
 //  (ath9k, firmware-free, implemented in full) and qualcomm qca988x/qca6174
 //  (ath10k, firmware-based, bring-up scaffold). (satoru)
@@ -60,7 +60,7 @@ static inline void mdelay(uint32_t ms) { Timer::WaitMs(ms); }
 #define   AR_CR_RXE        0x00000004   // rx enable (satoru)
 #define   AR_CR_RXD        0x00000020   // rx disable (satoru)
 #define AR_RXDP            0x000C   // rx descriptor pointer (head of rx ring) (satoru)
-#define AR_CFG             0x0014   // config  -  endianness/byte-swap (satoru)
+#define AR_CFG             0x0014   // config - endianness/byte-swap (satoru)
 #define   AR_CFG_SWTD      0x00000001   // byte-swap tx descriptor (satoru)
 #define   AR_CFG_SWRD      0x00000002   // byte-swap rx descriptor (satoru)
 
@@ -175,7 +175,7 @@ static inline void mdelay(uint32_t ms) { Timer::WaitMs(ms); }
 #define AR5416_EEP_MAGIC_OFFSET     0x00
 #define AR5416_EEPROM_MAGIC         0xA55A
 
-// otp (one-time-programmable) memory for ar9003 chips  -  they have no serial
+// otp (one-time-programmable) memory for ar9003 chips - they have no serial
 // eeprom; the cal+mac live in otp read via the otp controller. (ref: ar9003_eeprom.c)
 #define AR9300_OTP_BASE            0x14000
 #define AR9300_OTP_STATUS          0x15F18
@@ -233,7 +233,7 @@ struct AthDesc {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ath10k copy-engine / firmware constants (ref: linux ath10k pci.c, ce.c, bmi.c,
-//  hw.h). these are scaffold-level  -  enough to map the ce register banks, reset
+//  hw.h). these are scaffold-level - enough to map the ce register banks, reset
 //  the chip, and walk the firmware-download path. (satoru)
 // ─────────────────────────────────────────────────────────────────────────────
 #define ATH10K_SOC_CHIP_ID         0x000000ec   // soc chip id register (qca988x) (satoru)
@@ -255,7 +255,7 @@ static const char* ATH10K_FW_QCA6174    = "/system/lib/firmware/ath10k/QCA6174/h
 static const char* ATH10K_FW_QCA6174_BD = "/system/lib/firmware/ath10k/QCA6174/hw3.0/board.bin";
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  driver private state  -  the opaque ctx handed back to every WifiRadioOps call.
+//  driver private state - the opaque ctx handed back to every WifiRadioOps call.
 //  one global instance (only one radio at a time, per the stack contract). (satoru)
 // ─────────────────────────────────────────────────────────────────────────────
 struct AthState {
@@ -296,7 +296,7 @@ extern const WifiRadioOps ATH_OPS;
 static bool g_active = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  register i/o shims  -  everything goes through WifiDev's bounds-checked mmio. a
+//  register i/o shims - everything goes through WifiDev's bounds-checked mmio. a
 //  read/modify/write helper mirrors ath9k's REG_RMW. (satoru)
 // ─────────────────────────────────────────────────────────────────────────────
 static inline uint32_t rd(uint32_t off) { return WifiDev::RegRead(off); }
@@ -352,7 +352,7 @@ static bool ath9k_chip_reset() {
     // the engine clears AR_RTC_RC_M when the reset completes. (satoru)
     if (!reg_wait(AR_RTC_RC, AR_RTC_RC_M, 0, 4000)) {
         // fall back to a cold reset if warm never cleared. (satoru)
-        log("[ath9k] warm reset stuck  -  trying cold\r\n");
+        log("[ath9k] warm reset stuck - trying cold\r\n");
         wr(AR_RTC_RC, AR_RTC_RC_MAC_COLD);
         udelay(50);
         if (!reg_wait(AR_RTC_RC, AR_RTC_RC_M, 0, 4000)) {
@@ -419,7 +419,7 @@ static bool ath9k_read_mac_from_eeprom(uint8_t mac[6]) {
                                          (AR5416_EEPROM_MAGIC << 8)));
     if (!magic_ok) {
         log("[ath9k] eeprom magic mismatch (got ");
-        logx(magic); log(")  -  no serial eeprom\r\n");
+        logx(magic); log(") - no serial eeprom\r\n");
         return false;
     }
     // the mac sits in 3 consecutive words at the base-header mac offset, stored
@@ -446,7 +446,7 @@ static bool ath9k_read_mac_from_otp(uint8_t mac[6]) {
     // the ar9003 stores its eeprom image compressed in otp; pulling the mac
     // properly means decompressing the block. that is out of scope for the
     // scaffold, so we only attempt it and return false to fall back. flagged
-    // UNSURE  -  needs real ar9003 silicon to validate. (satoru)
+    // UNSURE - needs real ar9003 silicon to validate. (satoru)
     (void)mac;
     return false;
 }
@@ -464,7 +464,7 @@ static void ath9k_derive_mac(uint8_t mac[6], const WifiDevice* d) {
 
 // ── init register vectors (analog + mac + phy) ──────────────────────────────
 //  ref: linux ath9k hw.c ath9k_hw_init_macaddr / ar5008_hw_process_ini /
-//  ar9003_hw_set_channel_regs  -  after reset the driver writes large per-chip ini
+//  ar9003_hw_set_channel_regs - after reset the driver writes large per-chip ini
 //  arrays (ar5416Modes / ar9300Modes etc.) into the phy/analog. those tables are
 //  thousands of (offset,value) pairs in the gpl source and are NOT reproduced
 //  here (both for size and license). instead we apply the minimal, generic set
@@ -476,7 +476,7 @@ static void ath9k_derive_mac(uint8_t mac[6], const WifiDevice* d) {
 //  rings and exercise the tx/rx paths; it is NOT enough to actually transmit rf
 //  energy on calibrated hardware (the missing ini/calibration owns that). (satoru)
 static void ath9k_apply_init_regs() {
-    // dma descriptor byte-order: little-endian (x86)  -  clear the swap bits so the
+    // dma descriptor byte-order: little-endian (x86) - clear the swap bits so the
     // engine reads descriptors in native order. (ref: ath9k hw.c AR_CFG). (satoru)
     rmw(AR_CFG, 0, AR_CFG_SWTD | AR_CFG_SWRD);
 
@@ -504,7 +504,7 @@ static void ath9k_apply_init_regs() {
 }
 
 // ── dma ring allocation (identity-mapped coherent memory) ───────────────────
-//  ref: linux ath9k recv.c ath_rx_init / xmit.c ath_tx_init  -  allocate the
+//  ref: linux ath9k recv.c ath_rx_init / xmit.c ath_tx_init - allocate the
 //  descriptor array + per-descriptor frame buffers as dma-coherent memory and
 //  link each descriptor to the next (ds_link), forming a ring. kurono's PMM
 //  hands out page-aligned identity-mapped (virt==phys) frames, which are exactly
@@ -594,7 +594,7 @@ static void ath9k_setup_interrupts() {
     wr(AR_IER, AR_IER_DISABLE);
     wr(AR_IMR, AR_IMR_RXOK | AR_IMR_RXERR | AR_IMR_RXEOL |
                AR_IMR_TXOK | AR_IMR_TXERR);
-    // leave the global enable OFF  -  we poll. flip this on once an irq handler is
+    // leave the global enable OFF - we poll. flip this on once an irq handler is
     // wired through the kernel's interrupt layer. (satoru)
     wr(AR_IER, AR_IER_DISABLE);
 }
@@ -628,7 +628,7 @@ static bool ath9k_hw_init() {
         log("[ath9k] mac from otp\r\n");
     } else {
         ath9k_derive_mac(s->mac, s->dev);
-        log("[ath9k] mac derived (no eeprom/otp)  -  locally administered\r\n");
+        log("[ath9k] mac derived (no eeprom/otp) - locally administered\r\n");
     }
     log("[ath9k] sta mac ");
     for (int i = 0; i < 6; i++) { logx(s->mac[i]); if (i < 5) log(":"); }
@@ -689,7 +689,7 @@ static bool ath9k_set_channel(int ch) {
     // program the synthesizer control with a band-select + a coarse frequency-
     // derived value. the real driver computes a precise channelSel/refDiv word;
     // this is a placeholder encoding (freq in 1/4-mhz units in the low bits).
-    // UNSURE: not the exact ar5008/ar9003 synth word  -  needs hw to calibrate. (satoru)
+    // UNSURE: not the exact ar5008/ar9003 synth word - needs hw to calibrate. (satoru)
     uint32_t synth = ((uint32_t)freq & 0xFFFF) << 8;
     if (!is_2ghz) synth |= 0x00000001;   // band bit (satoru)
     wr(AR_PHY_SYNTH_CONTROL, synth);
@@ -719,7 +719,7 @@ static bool ath9k_tx_frame(const uint8_t* buf, int len) {
     AthDesc* d = &s->tx_ring[i];
     uint8_t* dma = s->tx_bufs + (uint64_t)i * ATH_BUF_SIZE;
 
-    // copy the fully-formed frame (mac hdr + body, no fcs  -  hw appends it). (satoru)
+    // copy the fully-formed frame (mac hdr + body, no fcs - hw appends it). (satoru)
     a_memcpy(dma, buf, (unsigned long)len);
 
     // single-buffer frame: this desc is both first and last. ds_ctl0 carries the
@@ -856,7 +856,7 @@ static bool ath10k_bmi_download(const uint8_t* blob, int len) {
     s->fw_len = (uint32_t)len;
     s->fw_loaded = true;
     log("[ath10k] firmware blob staged ("); logd(len);
-    log(" bytes)  -  on-target BMI start requires real hardware\r\n");
+    log(" bytes) - on-target BMI start requires real hardware\r\n");
     return true;
 }
 
@@ -878,7 +878,7 @@ static bool ath10k_load_firmware_from_fs() {
     if (!KVFS::Exists(fwpath)) {
         log("[ath10k] firmware not found at ");
         log(fwpath);
-        log("  -  install the ath10k firmware blob there (the os does not ship it)\r\n");
+        log(" - install the ath10k firmware blob there (the os does not ship it)\r\n");
         return false;
     }
     int sz = KVFS::GetFileSize(fwpath);
@@ -905,7 +905,7 @@ static bool ath10k_load_firmware_from_fs() {
         log(" ("); logd(bsz > 0 ? bsz : 0); log(" bytes)\r\n");
     } else {
         log("[ath10k] board data missing at "); log(bdpath);
-        log("  -  rf calibration will be absent\r\n");
+        log(" - rf calibration will be absent\r\n");
     }
 
     return ath10k_bmi_download(fw, got);
@@ -926,14 +926,14 @@ static bool ath10k_wmi_cmd_send(uint32_t cmd_id, const uint8_t* payload, int len
 
 static bool ath10k_hw_init() {
     AthState* s = &g_ath;
-    log("[ath10k] bring-up (firmware-based  -  scaffold)\r\n");
+    log("[ath10k] bring-up (firmware-based - scaffold)\r\n");
     if (!ath10k_map_ce()) { log("[ath10k] ce map failed\r\n"); return false; }
     if (!ath10k_warm_reset()) return false;
     // the copy-engine ring setup (per-pipe src/dst rings) would go here; it is a
     // large block (8 pipes, each with descriptor rings) and is only useful with a
     // responding target, so we defer it to the firmware-load milestone. (satoru)
     if (!ath10k_load_firmware_from_fs()) {
-        log("[ath10k] firmware load incomplete  -  radio cannot associate without it\r\n");
+        log("[ath10k] firmware load incomplete - radio cannot associate without it\r\n");
         // keep hw_ok false; the ops will report failure honestly. (satoru)
         return false;
     }
@@ -944,7 +944,7 @@ static bool ath10k_hw_init() {
     // the honest result under emulation. (ref: ath10k wmi.c WMI_INIT_CMDID). (satoru)
     const uint32_t WMI_INIT_CMDID = 0x00000001;   // placeholder cmd id (satoru)
     if (!ath10k_wmi_cmd_send(WMI_INIT_CMDID, nullptr, 0)) {
-        log("[ath10k] wmi init not acknowledged (no live target)  -  expected w/o hw\r\n");
+        log("[ath10k] wmi init not acknowledged (no live target) - expected w/o hw\r\n");
     }
     log("[ath10k] firmware staged; wmi/htc handshake needs real hardware\r\n");
     s->hw_ok = false;   // honest: not actually ready to tx/rx (satoru)
@@ -952,7 +952,7 @@ static bool ath10k_hw_init() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  WifiRadioOps implementation  -  dispatch ath9k vs ath10k (satoru)
+//  WifiRadioOps implementation - dispatch ath9k vs ath10k (satoru)
 // ═════════════════════════════════════════════════════════════════════════════
 
 static bool op_start(void* ctx) {
@@ -1059,7 +1059,7 @@ static int op_get_signal(void* ctx) {
 static bool op_load_firmware(void* ctx, const uint8_t* blob, int len) {
     AthState* s = (AthState*)ctx;
     if (!s->is_ath10k) {
-        // ath9k is firmware-free  -  a no-op returning true, per the contract. (satoru)
+        // ath9k is firmware-free - a no-op returning true, per the contract. (satoru)
         return true;
     }
     // ath10k: if the caller handed us a blob, download it; else source it from fs.
@@ -1100,7 +1100,7 @@ bool TryRegister() {
     }
 
     if (!d->mmio_mapped) {
-        log("[ath] device present but mmio not mapped  -  cannot drive it\r\n");
+        log("[ath] device present but mmio not mapped - cannot drive it\r\n");
         return false;
     }
 
@@ -1120,7 +1120,7 @@ bool TryRegister() {
     // and the ath9k path is the one expected to work. (satoru)
     bool hw = op_start(&g_ath);
     if (is9k && !hw) {
-        log("[ath9k] hardware init failed  -  not registering radio\r\n");
+        log("[ath9k] hardware init failed - not registering radio\r\n");
         return false;
     }
 
@@ -1130,10 +1130,10 @@ bool TryRegister() {
     g_active = true;
 
     if (is10k) {
-        log("[ath10k] radio registered (scaffold)  -  assoc needs real hardware "
+        log("[ath10k] radio registered (scaffold) - assoc needs real hardware "
             "+ firmware\r\n");
     } else {
-        log("[ath9k] radio registered  -  scan/connect will drive real hardware\r\n");
+        log("[ath9k] radio registered - scan/connect will drive real hardware\r\n");
     }
     return true;
 }

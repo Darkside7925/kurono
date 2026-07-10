@@ -1,4 +1,4 @@
-//  kurono os  -  intel integrated gpu driver
+//  kurono os - intel integrated gpu driver
 //  pci scan, bar mapping, display pipe state, generation detection
 //  low mmio is identity-mapped by the boot tables, but a 64-bit gttmmaddr bar
 //  can sit above that window, so map it explicitly before the first deref
@@ -51,7 +51,7 @@ uint64_t IntelGPU::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_i
     uint8_t offset = 0x10 + bar_idx * 4;
     uint32_t bar_lo = PciRead(bus, dev, func, offset);
     if (bar_lo == 0 || bar_lo == 0xFFFFFFFF) return 0;
-    // I/O BARs are not useful for GPU MMIO  -  refuse them so callers don't try to dereference them
+    // I/O BARs are not useful for GPU MMIO - refuse them so callers don't try to dereference them
     if (bar_lo & 1) return 0;
     uint64_t base = bar_lo & 0xFFFFFFF0;
     uint8_t type = (bar_lo >> 1) & 0x03;
@@ -66,7 +66,7 @@ uint64_t IntelGPU::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_i
 
 uint32_t IntelGPU::ReadReg(uint32_t offset) {
     if (!gpu_info.bar0) return 0;
-    // refuse out-of-bounds reads  -  protects against driver bugs poking past BAR0
+    // refuse out-of-bounds reads - protects against driver bugs poking past BAR0
     if (gpu_info.bar0_size && offset + 4 > gpu_info.bar0_size) return 0;
     volatile uint32_t* reg = (volatile uint32_t*)((uintptr_t)gpu_info.bar0 + offset);
     uint32_t v = *reg;
@@ -85,36 +85,36 @@ void IntelGPU::WriteReg(uint32_t offset, uint32_t value) {
 //  generation classification
 
 IntelGpuGen IntelGPU::ClassifyGen(uint16_t did) {
-    // gen 12.7  -  meteor lake / arrow lake / lunar lake
+    // gen 12.7 - meteor lake / arrow lake / lunar lake
     if ((did >= 0x7D40 && did <= 0x7D67) || (did >= 0x7DD0 && did <= 0x7DDF) ||
         (did >= 0xE200 && did <= 0xE2FF) || (did >= 0x6480 && did <= 0x64FF))
         return INTEL_GEN_12_7;
 
-    // gen 12  -  tiger lake / alder lake / raptor lake
+    // gen 12 - tiger lake / alder lake / raptor lake
     if ((did >= 0x9A40 && did <= 0x9AF8) || (did >= 0x4680 && did <= 0x46D2) ||
         (did >= 0xA780 && did <= 0xA7AF) || (did >= 0x5690 && did <= 0x56C1))
         return INTEL_GEN_12;
 
-    // gen 11  -  ice lake
+    // gen 11 - ice lake
     if (did >= 0x8A50 && did <= 0x8A71)
         return INTEL_GEN_11;
 
-    // gen 9 / 9.5  -  skylake / kaby lake / coffee lake / comet lake
+    // gen 9 / 9.5 - skylake / kaby lake / coffee lake / comet lake
     if ((did >= 0x1900 && did <= 0x193D) || (did >= 0x5900 && did <= 0x593D) ||
         (did >= 0x3E90 && did <= 0x3EA8) || (did >= 0x9B00 && did <= 0x9BF6) ||
         (did >= 0x4E51 && did <= 0x4E90))
         return INTEL_GEN_9;
 
-    // gen 8  -  broadwell
+    // gen 8 - broadwell
     if (did >= 0x1600 && did <= 0x163D)
         return INTEL_GEN_8;
 
-    // gen 7 / 7.5  -  ivy bridge / haswell
+    // gen 7 / 7.5 - ivy bridge / haswell
     if ((did >= 0x0150 && did <= 0x016A) || (did >= 0x0400 && did <= 0x0426) ||
         (did >= 0x0A00 && did <= 0x0A2E) || (did >= 0x0D00 && did <= 0x0D36))
         return INTEL_GEN_7;
 
-    // gen 6  -  sandy bridge
+    // gen 6 - sandy bridge
     if (did >= 0x0100 && did <= 0x012B)
         return INTEL_GEN_6;
 
@@ -252,7 +252,7 @@ void IntelGPU::Init() {
                 }
 
                 // map the bar window before any register read (ReadPipeState
-                // below)  -  a high 64-bit bar isn't covered by the boot identity
+                // below) - a high 64-bit bar isn't covered by the boot identity
                 // map and would #pf otherwise. (satoru)
                 igpu_map_bar_window(gpu_info.bar0, gpu_info.bar0_size);
 
@@ -368,7 +368,7 @@ bool IntelGPU::HasHardwareAccel() {
 
 bool IntelGPU::BlitFillARGB(uint32_t color, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     // submitting a blitter command stream from a kernel without a ring buffer
-    // setup is unsafe  -  fall back to a CPU fill through the gmadr aperture
+    // setup is unsafe - fall back to a CPU fill through the gmadr aperture
     // when one is exposed. callers detect "no accel" via HasHardwareAccel.
     if (!gpu_info.detected || !gpu_info.bar2 || !gpu_info.pipe_a.enabled) return false;
     uint32_t pw = gpu_info.pipe_a.width;

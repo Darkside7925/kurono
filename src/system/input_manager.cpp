@@ -25,7 +25,7 @@ SubscriberId g_focus_sub = 0;
 
 // Tiny ring of (device, key, pressed) events written from the keyboard
 // callback and drained at Poll(). The callback may be invoked from an IRQ
-// or from the polling tick  -  either way the consumer side must never block.
+// or from the polling tick - either way the consumer side must never block.
 struct ImEvent { int device_id; Key key; bool pressed; };
 constexpr int IM_EVENT_RING = 128;
 ImEvent g_events[IM_EVENT_RING];
@@ -60,7 +60,7 @@ void dispatch_to_focus(int device_id, Key key, bool pressed) {
             return;
         }
     }
-    // Focused subscriber vanished mid-stream  -  drop the event silently rather
+    // Focused subscriber vanished mid-stream - drop the event silently rather
     // than crash. The next Subscribe() / SetFocus() reattaches routing.
 }
 } // namespace

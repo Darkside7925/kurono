@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: accessibility (satoru)
+//  kurono os - settings module: accessibility (satoru)
 //  ports the legacy settings.cpp accessibility tab onto the modular shell:
 //  visual toggles (high contrast, reduced motion), keyboard assists (sticky /
 //  slow / bounce keys), screen reader, a text-scale stepper, and a colour-blind
@@ -13,7 +13,7 @@
 #include "../system/ui_config.h"        // UIConfig persistence (satoru)
 #include "settings.h"                   // SettingsApp::state.font_scale is the live consumer (satoru)
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 // six boolean assists, mirrored from ui.conf on every on_show. (satoru)
 static bool s_high_contrast  = false;   // a11y.high_contrast (satoru)
 static bool s_reduced_motion = false;   // compositor.reduced_motion (satoru)
@@ -29,7 +29,7 @@ static int  s_color_filter   = 0;       // a11y.color_filter, 0..4 (satoru)
 static const uint32_t kSlowKeyMs   = 250;
 static const uint32_t kBounceKeyMs = 200;
 
-// colour-filter labels  -  index matches Graphics::SetColorFilter modes. (satoru)
+// colour-filter labels - index matches Graphics::SetColorFilter modes. (satoru)
 static const char* kFilters[] = { "Off", "Protanopia", "Deuteranopia", "Tritanopia", "Grayscale" };
 static const int   kFilterCount = (int)(sizeof(kFilters) / sizeof(kFilters[0]));
 
@@ -46,7 +46,7 @@ static A11yToggle s_toggles[] = {
 };
 static const int kToggleCount = (int)(sizeof(s_toggles) / sizeof(s_toggles[0]));
 
-// ── runtime apply  -  mirrors persist_a11y() in the legacy tab ────────────────
+// ── runtime apply - mirrors persist_a11y() in the legacy tab ────────────────
 // re-arms every accessibility subsystem from the cached state so a click takes
 // effect immediately, then nudges the chrome to repaint from config. (satoru)
 static void apply_a11y(){

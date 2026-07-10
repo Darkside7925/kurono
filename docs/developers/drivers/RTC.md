@@ -25,5 +25,5 @@ The RTC's status register determines whether hours are in 24-hour or 12-hour for
 
 ## 5. Related files
 
-- `src/kernel/time.cpp`  -  consumer of the boot-time RTC reading
-- `src/drivers/timer.cpp`  -  provides ongoing elapsed time after boot
+- `src/kernel/time.cpp` - consumer of the boot-time RTC reading
+- `src/drivers/timer.cpp` - provides ongoing elapsed time after boot

@@ -1,4 +1,4 @@
-//  kurono linux subsystem  -  shared mount layer implementation
+//  kurono linux subsystem - shared mount layer implementation
 //  unified namespace between kvfs and linux ext4
 
 #include "shared_mount.h"
@@ -114,7 +114,7 @@ int SharedMountMgr::Remount(const char* linux_path, bool read_only) {
 void SharedMountMgr::MountDefaults() {
     SerialLogger::Log("[SharedMount] Setting up default mounts...\r\n");
 
-    // shared /home  -  same users, same files
+    // shared /home - same users, same files
     Mount("/home",     "/home",     SM_BIND, SM_FS_KVFS, false);
 
     // shared /tmp
@@ -132,10 +132,10 @@ void SharedMountMgr::MountDefaults() {
     // /sys sysfs (read-only)
     Mount("/sys",      "/sys",      SM_PASSTHROUGH, SM_FS_SYS,  true);
 
-    // /etc shared (overlay  -  kvfs base, ext4 overlay)
+    // /etc shared (overlay - kvfs base, ext4 overlay)
     Mount("/etc",      "/etc",      SM_OVERLAY, SM_FS_KVFS, false);
 
-    // /mnt/kurono  -  linux can access all of kvfs here
+    // /mnt/kurono - linux can access all of kvfs here
     Mount("/mnt/kurono", "/",       SM_BIND, SM_FS_KVFS, false);
 
     // /boot shared
@@ -171,7 +171,7 @@ void SharedMountMgr::TranslatePath(const char* src_path, const char* src_prefix,
     while (*s && dp < max_out - 1) out[dp++] = *s++;
     out[dp] = 0;
 
-    // handle root mount case  -  if result is empty, make it "/"
+    // handle root mount case - if result is empty, make it "/"
     if (dp == 0) { out[0] = '/'; out[1] = 0; }
 }
 
@@ -199,7 +199,7 @@ const char* SharedMountMgr::LinuxToKurono(const char* linux_path) {
         return translated;
     }
 
-    // no mount found  -  prefix with /linux
+    // no mount found - prefix with /linux
     sm_scpy(translated, "/linux", sizeof(translated));
     int tl = sm_slen(translated);
     sm_scpy(translated + tl, linux_path, (int)(sizeof(translated) - tl));
@@ -229,7 +229,7 @@ const char* SharedMountMgr::KuronoToLinux(const char* kurono_path) {
         return translated;
     }
 
-    // no translation  -  return as-is
+    // no translation - return as-is
     sm_scpy(translated, kurono_path, sizeof(translated));
     return translated;
 }

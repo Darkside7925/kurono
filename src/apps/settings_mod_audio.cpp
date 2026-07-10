@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: sound (satoru)
+//  kurono os - settings module: sound (satoru)
 //  a detailed sound page: active output backend + device, detected hda codecs
 //  and jack/config-default legend, a live master-volume slider, a mute toggle,
 //  a balance slider, and a read-only format summary. all live writes go through
@@ -11,7 +11,7 @@
 #include "../drivers/hda.h"
 #include "../system/ui_config.h"
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 static int  s_master  = 75;     // 0..100, persisted to audio.master_volume (satoru)
 static bool s_muted   = false;  // persisted to audio.muted (satoru)
 static int  s_balance = 50;     // 0..100 (50 = centre), persisted to audio.balance (satoru)
@@ -259,7 +259,7 @@ static void audio_render(int x, int y, int w, int h, int scroll){
     ly += 24;
     // honest note: the mixer exposes only per-stream pan, not a master balance,
     // so this is saved as a preference but not applied to the master bus. (satoru)
-    Graphics::DrawString(x, ly, "Saved as a preference  -  the mixer has no master balance bus.",
+    Graphics::DrawString(x, ly, "Saved as a preference - the mixer has no master balance bus.",
                          SettingsUI::COL_DIM, 0xFF000000);
     ly += 16;
 
@@ -361,11 +361,11 @@ static bool audio_input(int mx, int my, bool click, char key, int scroll){
     }
     ly += 24 + 16;   // balance slider + honest note row (satoru)
 
-    // format section is read-only  -  nothing to hit below here. (satoru)
+    // format section is read-only - nothing to hit below here. (satoru)
     return false;
 }
 
-// total content height for the scrollbar  -  must mirror the row advances in
+// total content height for the scrollbar - must mirror the row advances in
 // render(), including the hda-detected branch. (satoru)
 static int audio_content_height(){
     int hh = 8;

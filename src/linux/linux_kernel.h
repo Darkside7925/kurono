@@ -1,7 +1,7 @@
 #pragma once
-//  kurono os  -  linux kernel emulation layer
+//  kurono os - linux kernel emulation layer
 //  a virtual linux kernel running inside kurono os, providing full linux
-//  abi compatibility. this is not a real linux kernel  -  it translates
+//  abi compatibility. this is not a real linux kernel - it translates
 //  linux kernel interfaces to kurono's native subsystems while presenting
 //  itself as a real linux 6.8 kernel to userspace programs.
 //
@@ -44,7 +44,7 @@ struct ProcEntry {
     ProcEntryType   type;
     bool            active;
 
-    // for dynamic content  -  called when read
+    // for dynamic content - called when read
     int (*generator)(char* buf, int max_len, void* ctx);
     void* ctx;
 
@@ -149,7 +149,7 @@ struct LinuxFutex {
     bool      active;
 };
 
-//  linuxkernel  -  the virtual kernel class
+//  linuxkernel - the virtual kernel class
 
 class LinuxKernel {
 public:

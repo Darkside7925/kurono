@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  tcp/ip network stack
+//  kurono os - tcp/ip network stack
 //  lightweight implementation over e1000 ethernet driver
 //  supports: ethernet ii, arp, ipv4, icmp, udp, tcp
 #include "../kernel/types.h"
@@ -140,8 +140,8 @@ enum TCPState {
 #define TCP_WSCALE_MAX 14   // rfc 1323 caps the shift at 14 (satoru)
 
 // send window: how many full data segments may be outstanding (un-acked) at
-// once. the old send path was stop-and-wait  -  exactly one mss in flight per
-// rtt regardless of the peer's advertised window  -  which capped throughput on
+// once. the old send path was stop-and-wait - exactly one mss in flight per
+// rtt regardless of the peer's advertised window - which capped throughput on
 // every bulk transfer (curl/firefox). a small fixed ring of outstanding data
 // segments lets us keep ~N*mss bytes on the wire before blocking, each segment
 // independently retransmitted on its own rto. control segments (syn/fin/

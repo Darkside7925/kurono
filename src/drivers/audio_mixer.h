@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  software audio mixer
+//  kurono os - software audio mixer
 //
 //  Up to 16 simultaneous streams.  Each stream owns a ring buffer of
 //  canonical (24-bit-in-32) MixSamples at the mixer's internal rate
@@ -24,7 +24,7 @@ constexpr int      MAX_STREAMS         = 16;
 constexpr uint32_t INTERNAL_RATE       = 48000;
 constexpr int      INTERNAL_CHANNELS   = 2;
 constexpr uint32_t PERIOD_FRAMES       = 1024;     // 21.3 ms @ 48 kHz
-constexpr uint32_t STREAM_RING_FRAMES  = 32768;    // 683 ms ring per stream  -  bigger
+constexpr uint32_t STREAM_RING_FRAMES  = 32768;    // 683 ms ring per stream - bigger
                                                    // headroom so a compositor / decode
                                                    // stall drains the ring without an
                                                    // underrun click (producer can fall
@@ -64,7 +64,7 @@ StreamID Open(const char* name,
 // after a 5 ms fade-out.  Safe to call on INVALID_STREAM.
 void Close(StreamID id);
 
-// Tell the mixer "this is the last batch of samples  -  when the ring
+// Tell the mixer "this is the last batch of samples - when the ring
 // drains, free the stream automatically".  Useful for one-shot sounds.
 void Drain(StreamID id);
 
@@ -117,7 +117,7 @@ int   ActiveStreamCount();
 const char* StreamName(StreamID id);
 void  Dump();
 
-// Backend selection helpers  -  implemented in audio_server.cpp.
+// Backend selection helpers - implemented in audio_server.cpp.
 // AudioMixer itself only knows about the AudioBackend interface.
 
 } // namespace AudioMixer

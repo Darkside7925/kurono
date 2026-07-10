@@ -1,20 +1,20 @@
 #pragma once
-//  kurono os  -  ieee 802.11 software mac (the mac80211/cfg80211-equivalent) (satoru)
+//  kurono os - ieee 802.11 software mac (the mac80211/cfg80211-equivalent) (satoru)
 //
 //  this is the shared 802.11 stack that every per-vendor wifi radio driver plugs
 //  into. it owns the protocol: scan/auth/assoc state machine, the management-
 //  frame builders/parsers, information elements, and the wpa2/wpa2-psk
 //  supplicant (4-way handshake + ccmp). it sits ON TOP of the hardware layer
 //  (drivers/wifi_dev) and BELOW the net stack (net/network WiFi class). it does
-//  NOT touch registers itself  -  all radio i/o goes through a WifiRadioOps vtable
+//  NOT touch registers itself - all radio i/o goes through a WifiRadioOps vtable
 //  that a vendor driver registers. (satoru)
 //
 //  layering:
 //    net/network.cpp  WiFi::Scan/Connect   (user-facing)
 //        │
-//    net/ieee80211    Ieee80211::Scan/Connect  (this  -  protocol + supplicant)
+//    net/ieee80211    Ieee80211::Scan/Connect  (this - protocol + supplicant)
 //        │  WifiRadioOps (function-pointer vtable)
-//    vendor driver    (phase 2: iwlwifi/ath9k/rtw  -  implements WifiRadioOps)
+//    vendor driver    (phase 2: iwlwifi/ath9k/rtw - implements WifiRadioOps)
 //        │  drivers/wifi_dev RegRead/RegWrite
 //    hardware (pci mmio)
 //
@@ -117,12 +117,12 @@ enum SupplicantState {
     SUPP_FAILED
 };
 
-// ── WifiRadioOps  -  THE driver contract ───────────────────────────────── (satoru)
+// ── WifiRadioOps - THE driver contract ───────────────────────────────── (satoru)
 //
 //  a per-vendor radio driver fills this vtable and registers it via
 //  Ieee80211::RegisterRadio(&ops, wifi_device). every function takes the same
 //  opaque `ctx` the driver supplied at registration (its private state). the
-//  802.11 stack NEVER touches the hardware directly  -  it only calls these. (satoru)
+//  802.11 stack NEVER touches the hardware directly - it only calls these. (satoru)
 //
 //  contract for each op (this is what phase-2 vendor drivers implement):
 struct WifiRadioOps {
@@ -146,13 +146,13 @@ struct WifiRadioOps {
     bool (*config_bss)(void* ctx, const uint8_t bssid[6], const char* ssid);
 
     // install a key into the hardware crypto engine (or accept null to mean
-    // "software crypto  -  the stack will ccmp in software"). idx is the key index
+    // "software crypto - the stack will ccmp in software"). idx is the key index
     // (0..3; pairwise keys conventionally use a separate slot), key is `key_len`
     // bytes, type is one of WIFI_KEY_* below. a driver that can't offload returns
     // false and the stack falls back to software ccmp. (satoru)
     bool (*set_key)(void* ctx, int idx, const uint8_t* key, int key_len, int type);
 
-    // transmit one fully-formed 802.11 frame (mac header + body, no fcs  -  the
+    // transmit one fully-formed 802.11 frame (mac header + body, no fcs - the
     // hardware appends the fcs). len bytes at buf. return true if queued. used for
     // probe-req, auth, assoc-req, eapol, and (post-handshake) data frames. (satoru)
     bool (*tx_frame)(void* ctx, const uint8_t* buf, int len);
@@ -196,7 +196,7 @@ void DeliverRx(const uint8_t* frame, int len);
 
 // active scan: sweep channels, send probe-reqs, collect beacons/probe-resps into
 // `out` (capacity max). returns the number of networks found. if no radio is
-// registered, returns 0 (honest  -  no fake results). (satoru)
+// registered, returns 0 (honest - no fake results). (satoru)
 int  Scan(WiFiNetwork* out, int max);
 
 // full connect: auth (open) → assoc → (if secured) wpa2 4-way handshake → install
