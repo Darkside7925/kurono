@@ -4,7 +4,7 @@
 #include "../kernel/heap.h"
 #include "../proc/scheduler.h"
 
-//  windows bridge  -  nt-style commands for kurono shell
+//  windows bridge - nt-style commands for kurono shell
 
 static int _wlen(const char* s) { int n=0; while (s[n]) n++; return n; }
 static void _wcpy(char* d, const char* s, int m) {
@@ -161,7 +161,7 @@ int WindowsCmds::cmd_del(KuronoShell* sh, int argc, const char** argv, char* out
 int WindowsCmds::cmd_type(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (argc < 2) return _wa(out, 0, mx, "The syntax of the command is incorrect.\n");
-    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    // heap-alloc the read buffer - 64kb on the stack overflows the 64kb kernel stack (satoru)
     unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
     if (!buf) return _wa(out, 0, mx, "Not enough memory resources are available.\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);

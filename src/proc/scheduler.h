@@ -53,6 +53,13 @@ enum UserMemoryRegionFlags : uint32_t {
     USER_REGION_DEMAND_ZERO = 1 << 0,
     USER_REGION_HEAP        = 1 << 1,
     USER_REGION_MMAP        = 1 << 2,
+    // the main thread's initial (execve) stack. it is mapped eagerly but was
+    // never recorded as a region, so choose_mmap_base()'s arena (growing up from
+    // USER_MMAP_BASE) eventually handed a clone thread's stack right on top of
+    // it once ~480 mb was mapped -> the font-loader thread's buffer stomped the
+    // chrome main thread's live frame (deterministic nsCaret stack-canary #gp).
+    // registering it makes region_overlaps_cross_thread() reserve the range. (satoru)
+    USER_REGION_STACK       = 1 << 3,
 };
 
 // firefox's gecko closure is ~54 shared objects; even with adjacent same-prot
@@ -79,10 +86,10 @@ constexpr uint32_t PROCESS_FLAG_NONE = 0;
 constexpr uint32_t PROCESS_FLAG_USER = 1 << 0;
 // task is a thread that shares its parent's address space (clone with
 // clone_vm|clone_thread). such a task must not free the shared address_space
-// or the shared user stack when it exits  -  only its own kernel stack. (satoru)
+// or the shared user stack when it exits - only its own kernel stack. (satoru)
 constexpr uint32_t PROCESS_FLAG_THREAD = 1 << 1;
-// the user stack (argc/argv/envp/auxv) is already built  -  by ld-kurono's
-// ExecPIE for a dynamic pie  -  so the runner must enter at proc->rsp as-is and
+// the user stack (argc/argv/envp/auxv) is already built - by ld-kurono's
+// ExecPIE for a dynamic pie - so the runner must enter at proc->rsp as-is and
 // must NOT rebuild the stack (that would drop ld-kurono's complete auxv). (satoru)
 constexpr uint32_t PROCESS_FLAG_STACK_READY = 1 << 2;
 
@@ -140,10 +147,17 @@ struct Process {
     uint8_t  sched_class;       // 0=NORMAL/CFS, 1=FIFO, 2=RR, 3=IDLE
     uint8_t  cpu_affinity;      // bitmask of allowed CPUs (bit n = CPU n)
     // smp thread dispatch: which cpu last executed this task + when that cpu
-    // last switched away from it. a task whose old cpu may still be unwinding
-    // on its kernel stack (pre-iretq) must not be picked up by ANOTHER cpu  - 
-    // the pickers give cross-cpu resumes a ~2ms grace after release. (satoru)
+    // last switched away from it. (satoru)
     uint8_t  last_run_cpu;
+    // frame-handoff barrier (finish_task model). on_cpu==1 means this task's
+    // user_frame is LIVE on last_run_cpu (being modified by execution); ==0 means
+    // the owning cpu has finished saving it and another cpu may safely load it.
+    // set 1 in LoadUserFrame (dispatch); store-RELEASED to 0 in ScheduleNextUser
+    // AFTER the frame save, by the owning cpu; the picker load-ACQUIREs it. this
+    // pairs the release of the saved frame with the acquire before another cpu
+    // reads it - closing the half-saved-frame read that ran a task with corrupt
+    // registers (the RIP=0x3 / userspace #PF). (satoru)
+    volatile uint8_t on_cpu;
     uint64_t released_ms;
     uint8_t  interactive_score; // 0..16; recent I/O wakes bump it, CPU burn decays it
     uint8_t  reaped;            // 1 once DestroyProcess has freed the struct (double-free guard)
@@ -181,7 +195,7 @@ struct Process {
     uint64_t fs_base;
     // per-thread USER gs base (arch_prctl ARCH_SET_GS). firefox's rlbox/wasm2c
     // sandbox reads thread-locals through %gs, so a thread that set its gs base
-    // must have it restored on every switch-in  -  exactly like fs_base. 0 = never
+    // must have it restored on every switch-in - exactly like fs_base. 0 = never
     // set (the common case; musl uses fs for tls). NOT read from an msr on
     // save-out: it only ever changes via arch_prctl, which persists it here, so
     // the stable stored value is authoritative. (satoru)
@@ -224,7 +238,7 @@ public:
     static Process* CreateProcess(const char* name, void (*entry_point)(), uint32_t priority);
     static Process* CreateUserProcess(const char* name, uint64_t entry_point, uint32_t priority);
     static Process* CloneUserProcess(Process* parent);
-    // create a thread that SHARES the parent's address space (same cr3)  -  used
+    // create a thread that SHARES the parent's address space (same cr3) - used
     // by clone(clone_vm|clone_thread). the thread gets its own kernel stack and
     // runs on the caller-supplied user stack `child_stack`; its user frame is
     // copied from the parent so it returns to the same clone() call-site with
@@ -237,6 +251,14 @@ public:
     static bool WaitForProcess(Process* proc, int* exit_code);
     static void SaveUserFrame(Process* proc, const InterruptFrame* frame);
     static bool LoadUserFrame(Process* proc, InterruptFrame* frame);
+    // single-owner state: task->state and sleep_ticks are written ONLY under
+    // g_sched_lock. the futex layer (a separate g_futex_lock domain) nests these
+    // around its state transitions (g_futex_lock -> g_sched_lock, never the
+    // reverse) so a woken/blocked task's state is never torn between the futex
+    // and scheduler domains - the two-lock-one-field race that replayed user loop
+    // iterations. (satoru)
+    static void StateLock(uint64_t* out_flags);
+    static void StateUnlock(uint64_t flags);
     static Process* GetNextRunnableUser(Process* after);
     static bool ScheduleNextUser(InterruptFrame* frame);
     // atomically claim a Ready user thread this cpu may run (smp phase 3d: the
@@ -249,7 +271,7 @@ public:
     // under the lock; returns null if none is allowed on this cpu. (satoru)
     static Process* ClaimFreshUserForCpu(uint32_t cpu);
     // claim a Ready sibling THREAD (clone with a saved user frame) this cpu may
-    // RESUME  -  the smp thread-dispatch path. an ap pulls a ready thread of a
+    // RESUME - the smp thread-dispatch path. an ap pulls a ready thread of a
     // multi-threaded process (cpu_affinity 0 = any cpu) and irets into its saved
     // frame, so it runs in parallel with the thread-group leader on the bsp. the
     // leader itself is never claimed here (its userspace session lives on the
@@ -257,7 +279,7 @@ public:
     // cores can double-run one thread. (satoru)
     static Process* ClaimReadyThreadForCpu(uint32_t cpu);
     // smp phase 4: called from an application processor's LAPIC-timer ISR to
-    // PREEMPT the user thread it is running  -  save the interrupted frame and
+    // PREEMPT the user thread it is running - save the interrupted frame and
     // switch to the next runnable user thread for this cpu (the threads of one
     // process share an address space, so no cr3 change). ring-3 frames only; a
     // tick in the kernel/idle is ignored. (satoru)
@@ -265,7 +287,7 @@ public:
     // gs-base fixup for the IRQ preempt paths (kls_timer_preempt / ApTimerPreempt).
     // those enter via isr_common, which does NOT swapgs, so on iret the ACTIVE gs
     // must already hold the resumed thread's user gs and KERNEL_GS_BASE must hold
-    // the per-cpu ptr  -  the opposite of the syscall (swapgs) path that LoadUserFrame
+    // the per-cpu ptr - the opposite of the syscall (swapgs) path that LoadUserFrame
     // targets. call after a successful ScheduleNextUser in an IRQ context. (satoru)
     static void FixupGsAfterIsrSwitch();
     static void ReapProcess(Process* proc);
@@ -297,7 +319,7 @@ public:
     static void YieldNow();
 
     // Service the sleep queue.  Called from the PIT IRQ0 hook (and from
-    // any process via Yield)  -  wakes any process whose deadline has
+    // any process via Yield) - wakes any process whose deadline has
     // passed.  Cheap O(N) scan; N is small.
     static void ServiceSleepQueue();
 
@@ -338,4 +360,16 @@ public:
     static void     GetLoadAverageStr(char* out, int max_len);  // "0.42 0.31 0.18"
     static int      SetAffinity(uint32_t pid, uint8_t mask);
     static int      GetAffinity(uint32_t pid, uint8_t* out_mask);
+
+    // SMP futex liveness. the deferred-wake promotion (sleep_ticks -> Ready) and
+    // the linux futex repoll/timeout heal used to run ONLY on the bsp (via
+    // Scheduler::Tick + kls_timer_preempt). when the bsp task blocks - e.g. the
+    // firefox chrome main thread waiting on the software-WebRender render, whose
+    // WRWorker/SwComposite threads run on APs - those AP threads that park on a
+    // futex were never promoted/healed, so the render frame never completes
+    // (the blank-content deadlock). the APs now run both in ApTimerPreempt:
+    // PromoteDeferredWakes advances sleep_ticks->Ready; the registered hook runs
+    // the linux futex sweep (futex_sweep_timeouts). (satoru)
+    static void PromoteDeferredWakes();
+    static void SetApFutexMaintHook(void (*fn)());
 };

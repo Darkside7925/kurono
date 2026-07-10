@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  nvme (nvm express) block device driver
+//  kurono os - nvme (nvm express) block device driver
 //  supports pcie nvme 1.4 ssds with admin + i/o queue pairs
 #include "../kernel/types.h"
 
@@ -153,9 +153,9 @@ private:
     static void RingDoorbell(NVMeQueuePair* qp);
     static bool PollCompletion(NVMeQueuePair* qp, NVMeCQE* result);
 
-    // layer 1  -  queue-depth batching. a single Read/Write that spans many ≤2 MB
+    // layer 1 - queue-depth batching. a single Read/Write that spans many ≤2 MB
     // chunks posts up to NVME_IO_BATCH commands at once, rings the sq doorbell
-    // ONCE, then reaps all their completions  -  letting the controller pipeline
+    // ONCE, then reaps all their completions - letting the controller pipeline
     // the chunks instead of the old submit-one / poll-one (QD=1) round trips.
     // direction: NVME_IO_READ or NVME_IO_WRITE. (satoru)
     static bool SubmitIOBatch(int qid, uint8_t opcode, uint64_t lba,

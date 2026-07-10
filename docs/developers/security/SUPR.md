@@ -4,17 +4,17 @@
 
 ## 1. What it does
 
-SUPR (Super Privilege) manages privilege escalation requests. When a command or subsystem needs elevated access  -  for example, mounting a disk, modifying system config, or killing another user's process  -  it calls through the SUPR layer.
+SUPR (Super Privilege) manages privilege escalation requests. When a command or subsystem needs elevated access - for example, mounting a disk, modifying system config, or killing another user's process - it calls through the SUPR layer.
 
 ## 2. Privilege model
 
 SUPR has five roles (`SUPRLevel`):
 
-- **Guest**  -  minimal access
-- **User**  -  standard unprivileged operations
-- **Admin**  -  elevated operations
-- **Root**  -  all operations permitted
-- **Sovereign**  -  root-equivalent owner; the only role allowed to use
+- **Guest** - minimal access
+- **User** - standard unprivileged operations
+- **Admin** - elevated operations
+- **Root** - all operations permitted
+- **Sovereign** - root-equivalent owner; the only role allowed to use
   `--sovereign-override` for the most dangerous policy changes (see KSA).
 
 SUPR enforces behavioral limits even when hardware memory isolation is not
@@ -38,7 +38,7 @@ registered command elevated, not just SUPR's own subcommands (`cmd_supr` in
   temporarily raises the session's user to root; `SudoEnd` restores the
   pre-elevation user (`src/security/supr.cpp`).
 - `supr whoami` reports the elevated identity (`root`).
-- a **Guest** role is denied (`permission denied  -  your role may not escalate`).
+- a **Guest** role is denied (`permission denied - your role may not escalate`).
 - shell builtins that mutate shell state (`cd`, `clear`, `history`, `linux`,
   `cmd`, `exit`) are refused with a "run it directly" message, since elevating
   them is meaningless.
@@ -46,8 +46,8 @@ registered command elevated, not just SUPR's own subcommands (`cmd_supr` in
 
 ## 4. Auth policy + KSA
 
-The auth policy (`SUPRAuthPolicy`) tracks two independent factors  - 
-`passwd_enabled` and `kvault_enabled`  -  managed via the `supr policy` command.
+The auth policy (`SUPRAuthPolicy`) tracks two independent factors - 
+`passwd_enabled` and `kvault_enabled` - managed via the `supr policy` command.
 The KSA (Kurono Secure Authorization) factor renders its prompt inside a
 hypervisor-isolated context the main OS cannot map or forge an answer into. See
 **`KSA.md`** for the full design, loophole-prevention rules, and the runtime
@@ -63,8 +63,8 @@ from an EPT-isolated context to a true nested VM automatically.
 
 ## 6. Related files
 
-- `src/security/ksa.{cpp,h}`  -  the KSA hypervisor-backed auth factor (see `KSA.md`)
-- `src/shell/shell.cpp`  -  the `supr` command (`policy` / `passwd` / `selftest`,
+- `src/security/ksa.{cpp,h}` - the KSA hypervisor-backed auth factor (see `KSA.md`)
+- `src/shell/shell.cpp` - the `supr` command (`policy` / `passwd` / `selftest`,
   the `supr <cmd>` sudo-style reroute, and `supr whoami`)
-- `src/security/supr.cpp`  -  `SudoBegin` / `SudoEnd` elevate-and-restore helpers
-- `src/system/user_mgmt.cpp`  -  user credentials stored and checked here
+- `src/security/supr.cpp` - `SudoBegin` / `SudoEnd` elevate-and-restore helpers
+- `src/system/user_mgmt.cpp` - user credentials stored and checked here

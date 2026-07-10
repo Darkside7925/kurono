@@ -3,7 +3,7 @@
 #include "../kernel/heap.h"
 #include "../virt/hypervisor.h"
 
-//  kurono os  -  unified codec registry implementation
+//  kurono os - unified codec registry implementation
 //  wav, mp3, aac, flac decoders + mp4 container + h.264 nal parser
 
 CodecInfo CodecRegistry::codecs[32];
@@ -42,7 +42,7 @@ static float _cosf_approx(float x) {
 }
 static float _sinf_approx(float x) { return _cosf_approx(x - 1.5707963f); }
 
-//  initialization  -  register all codecs
+//  initialization - register all codecs
 void CodecRegistry::Init() {
     codec_count = 0;
 
@@ -103,7 +103,7 @@ void CodecRegistry::Init() {
         }
 
         if (has_ffmpeg) {
-            // enable video codecs  -  decode via alpine ffmpeg
+            // enable video codecs - decode via alpine ffmpeg
             for (int i = 0; i < codec_count; i++) {
                 if (codecs[i].type == CODEC_H265 || codecs[i].type == CODEC_VP9 ||
                     codecs[i].type == CODEC_AV1) {
@@ -130,7 +130,7 @@ void CodecRegistry::Init() {
     }
 }
 
-//  codec detection  -  magic bytes
+//  codec detection - magic bytes
 CodecType CodecRegistry::Detect(const uint8_t* data, int length) {
     if (!data || length < 4) return CODEC_UNKNOWN;
 
@@ -497,7 +497,7 @@ AudioBuffer CodecRegistry::DecodeAAC(const uint8_t* data, int length) {
     buf.samples = (int16_t*)KernelHeap::Alloc(pcm_size);
     if (!buf.samples) return buf;
 
-    // capacity in int16 slots  -  the write loop must never exceed this even if the
+    // capacity in int16 slots - the write loop must never exceed this even if the
     // second (decode) pass diverges from the count pass above. (satoru)
     int sample_cap = pcm_size / 2;
 
@@ -592,7 +592,7 @@ AudioBuffer CodecRegistry::DecodeFLAC(const uint8_t* data, int length) {
 
     // decode flac frames
     // flac frames start with sync code 0xfff8 or 0xfff9
-    // info.total_samples is a 36-bit on-disk field  -  keep it 64-bit. (satoru)
+    // info.total_samples is a 36-bit on-disk field - keep it 64-bit. (satoru)
     uint64_t total_out_samples = info.total_samples;
     if (total_out_samples == 0) {
         // estimate from remaining bytes. guard the divisor: a crafted streaminfo
@@ -773,7 +773,7 @@ bool CodecRegistry::ParseMP4(const uint8_t* data, int length, MP4TrackInfo* info
                 if (box_end > end) box_end = end;
 
                 if (_cmp4(box.type, "mvhd") && pos + 28 < end) {
-                    // movie header  -  extract timescale and duration
+                    // movie header - extract timescale and duration
                     int ver = d[pos+8];
                     if (ver == 0) {
                         uint32_t ts = ((uint32_t)d[pos+20]<<24)|((uint32_t)d[pos+21]<<16)|
@@ -800,7 +800,7 @@ bool CodecRegistry::ParseMP4(const uint8_t* data, int length, MP4TrackInfo* info
                     inf->has_video = true;
                     inf->video_codec = 2;  // h.265
                 } else if (_cmp4(box.type, "mdat")) {
-                    // media data box  -  contains actual audio/video data
+                    // media data box - contains actual audio/video data
                     if (inf->has_audio && inf->audio_data_offset == 0) {
                         inf->audio_data_offset = pos + 8;
                         inf->audio_data_size = (int)box.size - 8;
@@ -845,7 +845,7 @@ AudioBuffer CodecRegistry::ExtractMP4Audio(const uint8_t* data, int length) {
             return DecodeAAC(audio_data, audio_len);
         }
 
-        // raw aac frames without adts  -  wrap and decode
+        // raw aac frames without adts - wrap and decode
         // for raw frames, create synthetic adts headers
         buf.sample_rate = info.audio_sample_rate > 0 ? info.audio_sample_rate : 44100;
         buf.channels = info.audio_channels > 0 ? info.audio_channels : 2;
@@ -957,7 +957,7 @@ bool CodecRegistry::ParseSPS(const uint8_t* data, int length, H264SPS* sps) {
             sps->profile_idc = nal.data[0];
             sps->level_idc   = nal.data[2];
 
-            // exp-golomb coded width/height  -  simplified extraction
+            // exp-golomb coded width/height - simplified extraction
             // real parser needs full exp-golomb but we look for common patterns
             // width and height are in pic_width_in_mbs/pic_height_in_map_units
             // for common resolutions, we can detect from profile+level

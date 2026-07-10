@@ -1,4 +1,4 @@
-# Kurono Linux syscall ABI  -  full table
+# Kurono Linux syscall ABI - full table
 
 This is the authoritative status of the in-kernel Linux syscall layer (KLS), the
 thing that lets unmodified x86_64 musl/glibc ELF binaries run on Kurono with no
@@ -29,12 +29,12 @@ numbers it still needs.
 
 ## Status legend
 
-- **real**  -  does meaningful work backed by real kernel state (fs, scheduler,
+- **real** - does meaningful work backed by real kernel state (fs, scheduler,
   memory, process/identity tables) and returns real values.
-- **stub**  -  accepts the call shape and returns a correct-contract value (often
+- **stub** - accepts the call shape and returns a correct-contract value (often
   `0`, or a canned errno like `-ENODATA`/`-EOPNOTSUPP`) without a full backend.
   Chosen so the call is non-fatal to the caller, never a blind `-ENOSYS`.
-- **enosys**  -  genuinely cannot proceed in this kernel; returns `-ENOSYS` and is
+- **enosys** - genuinely cannot proceed in this kernel; returns `-ENOSYS` and is
   logged. Limited to ops that need a mechanism the kernel lacks (a ptrace trap
   path, a kernel keyring).
 
@@ -55,7 +55,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 
 ---
 
-### Tier 1  -  blocks real apps now
+### Tier 1 - blocks real apps now
 
 | #   | name                    | status | notes |
 |-----|-------------------------|--------|-------|
@@ -84,7 +84,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 310 | process_vm_readv        | real   | iovec-to-iovec memcpy (single address space) |
 | 311 | process_vm_writev       | real   | iovec-to-iovec memcpy |
 
-### Tier 2  -  POSIX file/io
+### Tier 2 - POSIX file/io
 
 | #   | name              | status | notes |
 |-----|-------------------|--------|-------|
@@ -114,7 +114,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 327 | preadv2           | real   | as preadv (flags ignored) |
 | 328 | pwritev2          | real   | as pwritev (flags ignored) |
 
-### Tier 3  -  process / thread / scheduler / capabilities
+### Tier 3 - process / thread / scheduler / capabilities
 
 | #   | name                   | status | notes |
 |-----|------------------------|--------|-------|
@@ -144,7 +144,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 158 | arch_prctl             | real   | ARCH_SET/GET_FS/GS via the FS/GS-base MSRs (direct case) |
 | 135 | personality           | stub   | accepted (ADDR_NO_RANDOMIZE etc. no-op) |
 
-### Tier 4  -  filesystem (at-family + xattr)
+### Tier 4 - filesystem (at-family + xattr)
 
 | #   | name         | status | notes |
 |-----|--------------|--------|-------|
@@ -174,7 +174,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 198 | lremovexattr | stub   | `-ENODATA` |
 | 199 | fremovexattr | stub   | `-ENODATA` |
 
-### Tier 5  -  networking
+### Tier 5 - networking
 
 | #   | name        | status | notes |
 |-----|-------------|--------|-------|
@@ -187,7 +187,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 307 | sendmmsg    | real   | loops sendmsg over the mmsghdr array, sets each msg_len |
 | 299 | recvmmsg    | real   | loops recvmsg over the mmsghdr array |
 
-### Tier 6  -  memory
+### Tier 6 - memory
 
 | #   | name           | status | notes |
 |-----|----------------|--------|-------|
@@ -207,7 +207,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 256 | migrate_pages  | stub   | accepted (nothing to migrate) |
 | 279 | move_pages     | stub   | reports every page on node 0 |
 
-### Tier 7  -  signals
+### Tier 7 - signals
 
 | #   | name              | status | notes |
 |-----|-------------------|--------|-------|
@@ -224,7 +224,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 234 | tgkill            | real   | maps to kill(tid, sig) |
 | 34  | pause             | stub   | yields once, returns `-EINTR` (no async delivery) |
 
-### Tier 8  -  time
+### Tier 8 - time
 
 | #   | name            | status | notes |
 |-----|-----------------|--------|-------|
@@ -240,7 +240,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 159 | adjtimex        | stub   | TIME_OK |
 | 305 | clock_adjtime   | stub   | TIME_OK |
 
-### Tier 9  -  user / group identity
+### Tier 9 - user / group identity
 
 | #   | name       | status | notes |
 |-----|------------|--------|-------|
@@ -262,7 +262,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 115 | getgroups  | stub   | 0 (no supplementary groups tracked) |
 | 116 | setgroups  | stub   | accepted |
 
-### Tier 10  -  system info
+### Tier 10 - system info
 
 | #   | name     | status | notes |
 |-----|----------|--------|-------|
@@ -275,7 +275,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 137 | statfs   | real   | fills struct statfs for the in-RAM kvfs |
 | 138 | fstatfs  | real   | same as statfs |
 
-### Tier 11  -  misc / advanced
+### Tier 11 - misc / advanced
 
 | #   | name            | status | notes |
 |-----|-----------------|--------|-------|
@@ -318,5 +318,5 @@ grep -E '\[klstest\]|ENOSYS' /tmp/s.log
 ```
 
 To audit a real binary's needs, boot it (e.g. `kurono.dyntest`, or
-`KURONO_GUI_RUN=firefox`) and grep the serial for `[kls] ENOSYS nr=`  -  each
+`KURONO_GUI_RUN=firefox`) and grep the serial for `[kls] ENOSYS nr=` - each
 unimplemented number it hits logs once (rate-limited).

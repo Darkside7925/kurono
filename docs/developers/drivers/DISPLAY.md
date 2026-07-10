@@ -12,9 +12,9 @@ The display manager (`display_mgr.cpp`) provides a multi-backend abstraction tha
 
 The driver tries framebuffer sources in priority order:
 
-1. **Multiboot framebuffer**  -  provided by GRUB via EFI GOP on real hardware. The GPU probe validates the address on hybrid GPU laptops.
-2. **VBE linear framebuffer**  -  provided by BIOS-era bootloaders. Works on most legacy hardware.
-3. **BGA (Bochs Graphics Adapter)**  -  used in virtual machines (QEMU, VirtualBox).
+1. **Multiboot framebuffer** - provided by GRUB via EFI GOP on real hardware. The GPU probe validates the address on hybrid GPU laptops.
+2. **VBE linear framebuffer** - provided by BIOS-era bootloaders. Works on most legacy hardware.
+3. **BGA (Bochs Graphics Adapter)** - used in virtual machines (QEMU, VirtualBox).
 
 Once a source is accepted, the display manager selects the appropriate backend based on the GPU probe results and hands the framebuffer address, dimensions, and pitch to the graphics driver.
 
@@ -22,9 +22,9 @@ Once a source is accepted, the display manager selects the appropriate backend b
 
 The display manager tries backends in this order:
 
-1. **VirtIO GPU**  -  if detected, provides 2D resource management and scanout (highest quality in VMs)
-2. **BGA**  -  Bochs Graphics Adapter fallback for QEMU/Bochs
-3. **Native**  -  Intel, NVIDIA, or AMD based on GPU probe primary GPU selection
+1. **VirtIO GPU** - if detected, provides 2D resource management and scanout (highest quality in VMs)
+2. **BGA** - Bochs Graphics Adapter fallback for QEMU/Bochs
+3. **Native** - Intel, NVIDIA, or AMD based on GPU probe primary GPU selection
 
 ## 4. Panic framebuffer update
 
@@ -46,9 +46,9 @@ The display manager provides 10 predefined modes from 640x480 through 3840x2160.
 
 ## 7. Related files
 
-- `src/drivers/display_mgr.cpp`  -  multi-backend display manager
-- `src/drivers/gpu_probe.cpp`  -  GPU detection and hybrid topology
-- `src/drivers/graphics.cpp`  -  receives framebuffer parameters
-- `src/drivers/bga.cpp`  -  BGA path for virtual machines
-- `src/drivers/virtio_gpu.cpp`  -  VirtIO GPU path
-- `src/kernel/panic.cpp`  -  framebuffer update target
+- `src/drivers/display_mgr.cpp` - multi-backend display manager
+- `src/drivers/gpu_probe.cpp` - GPU detection and hybrid topology
+- `src/drivers/graphics.cpp` - receives framebuffer parameters
+- `src/drivers/bga.cpp` - BGA path for virtual machines
+- `src/drivers/virtio_gpu.cpp` - VirtIO GPU path
+- `src/kernel/panic.cpp` - framebuffer update target

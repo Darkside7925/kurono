@@ -3,10 +3,10 @@
 #include "../drivers/serial.h"
 #include "../proc/smp.h"   // cpu index for the cross-core heap lock (satoru)
 
-//  kernel heap  -  segregated free-list allocator with coalescing
+//  kernel heap - segregated free-list allocator with coalescing
 //
-//  phase 1: 64 kb bootstrap buffer (in bss  -  always available)
-//  phase 2: pmm-backed region  -  up to 50% of physical ram
+//  phase 1: 64 kb bootstrap buffer (in bss - always available)
+//  phase 2: pmm-backed region - up to 50% of physical ram
 //
 //  Each block has a HeapBlock header followed by `size` bytes of payload.
 //  Free blocks store a doubly-linked-list pointer pair in the payload
@@ -15,7 +15,7 @@
 //  arithmetic.  A footer mirroring `size` is written just before each
 //  block to enable backward coalescing without scanning the whole heap.
 
-// 64 kb bootstrap heap (in bss  -  zeroed by boot asm). 16-byte aligned so
+// 64 kb bootstrap heap (in bss - zeroed by boot asm). 16-byte aligned so
 // HeapBlock header / FreeLink overlay stays naturally aligned.
 #define BOOT_HEAP_SIZE (64ULL * 1024)
 alignas(16) uint8_t KernelHeap::boot_buffer[BOOT_HEAP_SIZE];
@@ -61,7 +61,7 @@ static void heap_warn(const char* msg) {
 // syscall allocates concurrently with the bsp's kernel procs, so the guard is
 // now cli + a CROSS-CORE lock. the lock is cpu-owner-recursive because same-cpu
 // re-entry still exists and cli can't stop it: a #pf (kernel stack grow, kmemx)
-// mid-Alloc re-enters the heap on the SAME core  -  a plain spinlock would
+// mid-Alloc re-enters the heap on the SAME core - a plain spinlock would
 // self-deadlock there. saves/restores IF so nested guards don't prematurely
 // re-enable. (satoru)
 static volatile uint32_t g_heap_lock_word  = 0;
@@ -200,7 +200,7 @@ void KernelHeap::ExpandWithPMM() {
     }
 
     if (!big) {
-        SerialLogger::Log("Heap: PMM expand FAILED  -  staying on 64 KB bootstrap\r\n");
+        SerialLogger::Log("Heap: PMM expand FAILED - staying on 64 KB bootstrap\r\n");
         return;
     }
 
@@ -229,7 +229,7 @@ void KernelHeap::ExpandWithPMM() {
 }
 
 HeapBlock* KernelHeap::FindFree(size_t size) {
-    // first-fit over the freelist  -  O(k) where k = #free blocks, vs the
+    // first-fit over the freelist - O(k) where k = #free blocks, vs the
     // prior O(n) over every block.
     for (FreeLink* l = g_free_head; l; l = l->next) {
         HeapBlock* b = block_from_link(l);
@@ -245,8 +245,8 @@ void* KernelHeap::Alloc(size_t size) {
     // reserve the trailing 8-byte boundary-tag footer OUTSIDE the caller's
     // payload. the footer occupies the last 8 bytes of the block and is read
     // by prev_block() during backward coalesce; if it overlapped the caller's
-    // usable region (as it did before this fix), a full-size write  -  e.g. a
-    // jpeg decode buffer or a linux-init struct  -  clobbers it, corrupting the
+    // usable region (as it did before this fix), a full-size write - e.g. a
+    // jpeg decode buffer or a linux-init struct - clobbers it, corrupting the
     // coalesce path and eventually tripping "free() bad magic". round
     // (size + footer) up to 16-byte alignment so block->size always leaves a
     // clear 8 bytes for the footer past the caller's data. (satoru)
@@ -319,7 +319,7 @@ void KernelHeap::Free(void* ptr) {
 
     uint8_t* heap_end = heap_base + heap_capacity;
 
-    // forward coalesce  -  O(1) via footer
+    // forward coalesce - O(1) via footer
     while (true) {
         HeapBlock* n = next_block(heap_end, block);
         if (!n || block_used(n)) break;
@@ -330,7 +330,7 @@ void KernelHeap::Free(void* ptr) {
         mark_free(block);
     }
 
-    // backward coalesce  -  O(1) via previous footer
+    // backward coalesce - O(1) via previous footer
     while (true) {
         HeapBlock* p2 = prev_block(heap_base, block);
         if (!p2 || block_used(p2)) break;

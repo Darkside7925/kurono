@@ -78,7 +78,7 @@ static bool         wm_drag_cur_valid = false;
 
 // ───────────────────────────────────────────────────────────────
 // Window context menu state (right-click on a titlebar). Kept as
-// plain statics  -  there was no reusable wm-level menu facility to
+// plain statics - there was no reusable wm-level menu facility to
 // extend, so this is a minimal self-contained popup. (satoru)
 // ───────────────────────────────────────────────────────────────
 static bool wm_ctx_open   = false;
@@ -118,7 +118,7 @@ static void wmcpy(char* d, const char* s, int m) {
     int i=0; while(s[i]&&i<m-1) { d[i]=s[i]; i++; } d[i]=0;
 }
 
-// Damage helper  -  push a rect to Graphics' dirty-region tracker, but
+// Damage helper - push a rect to Graphics' dirty-region tracker, but
 // only the portion that lies on-screen.  Cheap to call.
 static inline void wm_damage(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
@@ -193,19 +193,19 @@ static void wm_clamp_resize_bounds(Window* win) {
     if (win->h > max_h) win->h = max_h;
 }
 
-// kurono ui color scheme  -  modern glassmorphism
+// kurono ui color scheme - modern glassmorphism
 // Static fallbacks used when UIConfig is not yet available.
 // At render time, focused colours read the LIVE accent from the kss stylesheet
 // (the "window" rule's P_ACCENT), so a kj script doing kss.transition+kss.set on
 // "window"/"accent" eases the real window borders + titlebar accent on screen.
 // LiveAccent() falls back to the theme accent before Sheet::Init, which itself
-// seeds from theme.accent  -  so behaviour is unchanged until something animates
+// seeds from theme.accent - so behaviour is unchanged until something animates
 // the accent. (satoru)
 static uint32_t wm_get_accent(){
     return KSS::Sheet::LiveAccent();
 }
 #define COL_TITLE_BG       0xFF1C1C2E  // frosted dark
-#define COL_TITLE_FOCUSED  0xFF22223A  // focused: base  -  overlaid with accent
+#define COL_TITLE_FOCUSED  0xFF22223A  // focused: base - overlaid with accent
 #define COL_TITLE_GRAD     0xFF2A2A48  // gradient bottom for focused
 #define COL_TITLE_TEXT     0xFFF0F0F5
 #define COL_TITLE_TEXT_DIM 0xFF888898
@@ -453,7 +453,7 @@ void WindowManager::SnapWindow(int win_id, int edge) {
     Window* win = GetWindow(win_id);
     if (!win) return;
 
-    // desktop rect  -  same area maximize occupies. (satoru)
+    // desktop rect - same area maximize occupies. (satoru)
     int dx = 0;
     int dy = GetDesktopY();
     int dw = screen_width;
@@ -556,7 +556,7 @@ void WindowManager::BringToFront(int id) {
         max_z = window_count;
     }
     win->z_order = max_z + 1;
-    // z-order changed (no rect damage is raised here)  -  a cached drag backdrop
+    // z-order changed (no rect damage is raised here) - a cached drag backdrop
     // composed in the old order is now stale. (satoru)
     if (!wm_in_fast_render) InvalidateDragBackdrop();
 }
@@ -602,7 +602,7 @@ void WindowManager::SetTitle(int id, const char* title) {
     wmcpy(win->title, title, 64);
     win->dirty = true;
     wm_damage(win->x, win->y, win->w, WM_TITLEBAR_H);
-    // a background window's titlebar text changed  -  invalidate the snapshot
+    // a background window's titlebar text changed - invalidate the snapshot
     // so it isn't shown with the old title behind a drag. (satoru)
     if (!wm_in_fast_render) InvalidateDragBackdrop();
 }
@@ -648,7 +648,7 @@ void WindowManager::MarkDirty(int id) {
     win->dirty = true;
     wm_damage(win->x, win->y, win->w, win->h);
     // only a change to a window OTHER than the one being dragged makes the
-    // backdrop stale  -  the dragged window's content is redrawn every fast
+    // backdrop stale - the dragged window's content is redrawn every fast
     // frame anyway, so its own MarkDirty must not drop the snapshot. (satoru)
     if (!wm_in_fast_render && !(IsWindowDragActive() && id == action_window_id)) {
         InvalidateDragBackdrop();
@@ -727,7 +727,7 @@ WMAction WindowManager::HitTest(Window* win, int px, int py) {
         if (right)  return WM_RESIZE_R;
     }
 
-    // titlebar drag  -  skipped for fullscreen since drag has no effect
+    // titlebar drag - skipped for fullscreen since drag has no effect
     if (win->has_titlebar && win->state != WIN_FULLSCREEN &&
         py >= win->y && py < win->y + WM_TITLEBAR_H &&
         px >= win->x && px < win->x + win->w) {
@@ -752,7 +752,7 @@ int WindowManager::TopWindowAt(int px, int py) {
 }
 
 void WindowManager::SortByZOrder() {
-    // insertion sort  -  N <= 32, almost-sorted in practice
+    // insertion sort - N <= 32, almost-sorted in practice
     for (int i = 1; i < WM_MAX_WINDOWS; i++) {
         Window key = windows[i];
         int j = i - 1;
@@ -1002,7 +1002,7 @@ void WindowManager::RenderTitlebar(Window* win) {
 
     // ── traffic-light buttons with eased hover-grow + press-dip ──────────────
     // each button's fill brightens toward white and its radius grows ~2px on
-    // hover, and dips ~1px for ~120ms after a press  -  all eased through the kss
+    // hover, and dips ~1px for ~120ms after a press - all eased through the kss
     // anim engine keyed by (window id, button index), so motion is shared with
     // the rest of the desktop and costs only table-driven float lerps. (satoru)
     {
@@ -1104,7 +1104,7 @@ static int wm_ease_q8(int p_q8) {
 
 // open/close scale: draw the window CHROME (rounded body + titlebar strip +
 // border) scaled toward its own center by factor s_q8 (Q8, 0..256). content
-// callbacks draw at fixed coords so they're skipped while scaling  -  the body
+// callbacks draw at fixed coords so they're skipped while scaling - the body
 // snaps to full size + real content the instant the phase completes, which is
 // the cheap-but-honest "pop / zoom" the task asks for (fade is layered on top
 // by the caller's dim overlay). returns the scaled rect via out_* so the caller
@@ -1154,7 +1154,7 @@ void WindowManager::Render() {
             indices[count++] = i;
     }
 
-    // sort by z-order  -  insertion sort (count small, near-sorted)
+    // sort by z-order - insertion sort (count small, near-sorted)
     for (int i = 1; i < count; i++) {
         int key = indices[i];
         int key_z = windows[key].z_order;
@@ -1177,7 +1177,7 @@ void WindowManager::Render() {
             const Window* o = &windows[indices[j]];
             if (o->anim_kind != 0 || o->alpha < 255 || o->state == WIN_FULLSCREEN) continue;
             // when capturing the drag backdrop the dragged window is NOT drawn,
-            // so it must not occlude windows behind it  -  otherwise they'd be
+            // so it must not occlude windows behind it - otherwise they'd be
             // missing from the backdrop and vanish once the window slides off
             // them. (satoru)
             if (WM_UNLIKELY(wm_backdrop_capturing && o->id == wm_backdrop_win_id)) continue;
@@ -1368,7 +1368,7 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
 // ─────────────────────────────────────────────────────────────────────
 
 // true only for an active left-button TITLEBAR drag (not a resize). resize is
-// deliberately excluded  -  its content relayout wants the full render. (satoru)
+// deliberately excluded - its content relayout wants the full render. (satoru)
 bool WindowManager::IsWindowDragActive() {
     return mouse_is_down && current_action == WM_DRAG && action_window_id > 0;
 }
@@ -1504,7 +1504,7 @@ void WindowManager::RenderDragFast() {
     const int m = wm_drag_margin();            // cover the soft shadow too
 
     // the damage we raise below is the moving window's own footprint, NOT a
-    // structural change  -  keep wm_damage from dropping the very backdrop we
+    // structural change - keep wm_damage from dropping the very backdrop we
     // are using. (satoru)
     wm_in_fast_render = true;
 
@@ -1532,7 +1532,7 @@ void WindowManager::RenderDragFast() {
     //    top-left) after this returns. when the pointer detaches from the
     //    window at a clamp edge it can sit outside the window rect, so restore
     //    the backdrop under the previous AND current cursor box and damage both
-    //     -  otherwise only the window region swaps and the cursor smears. boxes
+    //    - otherwise only the window region swaps and the cursor smears. boxes
     //    that fall inside the window rect just re-copy harmlessly. (satoru)
     {
         const int cw = 12, ch = 16, cs = 2;     // cursor size + slop (satoru)
@@ -1563,7 +1563,7 @@ void WindowManager::RenderDragFast() {
     wm_in_fast_render = false;
 }
 
-// draw only the dragged window over the current back buffer  -  used right after
+// draw only the dragged window over the current back buffer - used right after
 // the backdrop snapshot so the capture frame is itself complete. (satoru)
 void WindowManager::RenderDraggedWindowOnly() {
     Window* win = GetWindow(action_window_id);
@@ -1714,7 +1714,7 @@ void WindowManager::HandleMouseUp(int mx, int my) {
     mouse_is_down = false;
     current_action = WM_NONE;
     action_window_id = -1;
-    // drag is over  -  drop the snapshot so the next drag starts clean and the
+    // drag is over - drop the snapshot so the next drag starts clean and the
     // released window gets a normal full render this frame. (satoru)
     InvalidateDragBackdrop();
     (void)mx; (void)my;
@@ -1889,7 +1889,7 @@ void WindowManager::UpdateWindowMonitor(Window* win) {
             return;
         }
     }
-    // center fell outside every monitor  -  leave the id unchanged.
+    // center fell outside every monitor - leave the id unchanged.
 }
 
 int WindowManager::GetWindowMonitor(int id) {
@@ -2032,7 +2032,7 @@ void WindowManager::RenderContextMenu() {
     Graphics::DrawRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h, COL_BORDER);
 
     int count = DisplayManager::GetMonitorCount();
-    // entry 0  -  "Move to other monitor" (dimmed when only one output). (satoru)
+    // entry 0 - "Move to other monitor" (dimmed when only one output). (satoru)
     int iy = wm_ctx_y + 4;
     uint32_t txt = (count >= 2) ? COL_TITLE_TEXT : COL_TITLE_TEXT_DIM;
     Graphics::PushClipRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h);
@@ -2069,7 +2069,7 @@ void WindowManager::TickAnimations() {
             (now - w->anim_start_ms) < w->anim_duration_ms) {
             continue;
         }
-        // animation done  -  finalise according to kind
+        // animation done - finalise according to kind
         unsigned char k = w->anim_kind;
         w->anim_kind = 0;
         switch (k) {
@@ -2129,13 +2129,13 @@ void WindowManager::ReloadFromConfig() {
     } else {
         Graphics::SetTargetFPS(360);
     }
-    // Drag throttle: 1 frame interval  -  coalesces multi-event-per-frame
+    // Drag throttle: 1 frame interval - coalesces multi-event-per-frame
     // pointer storms into a single window move so we never repaint twice
     // for the same monitor scan-out.
     wm_drag_min_gap_ms = (unsigned int)(1000 / (refresh_hz > 0 ? refresh_hz : 60));
     if (wm_drag_min_gap_ms < 2)  wm_drag_min_gap_ms = 2;
     if (wm_drag_min_gap_ms > 16) wm_drag_min_gap_ms = 16;
-    (void)comp_frosted_titlebar; // currently passive  -  read by titlebar render
+    (void)comp_frosted_titlebar; // currently passive - read by titlebar render
 }
 
 void WindowManager::SetAlpha(int id, unsigned char a) {

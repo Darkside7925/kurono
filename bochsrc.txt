@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  Kurono OS  -  Bochs Configuration
+#  Kurono OS - Bochs Configuration
 #  Bochs is much stricter than QEMU and catches real hardware issues.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -40,4 +40,4 @@ clock: sync=none, time0=utc
 # Mouse
 mouse: enabled=0
 
-# No acceleration  -  pure emulation
+# No acceleration - pure emulation

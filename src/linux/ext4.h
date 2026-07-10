@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  ext4 filesystem driver (read/write)
+//  kurono os - ext4 filesystem driver (read/write)
 //  full ext4 support for accessing the linux partition from kurono
 
 #include "../kernel/types.h"
@@ -244,7 +244,7 @@ typedef int (*Ext4BlockRead)(uint64_t byte_offset, uint32_t len, void* buf,
 typedef int (*Ext4BlockWrite)(uint64_t byte_offset, uint32_t len,
                                const void* buf, void* dev_ctx);
 
-//  ext4 driver  -  class interface
+//  ext4 driver - class interface
 
 class Ext4 {
 public:

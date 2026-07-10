@@ -17,7 +17,7 @@ KVFS, and translates Linux paths into the canonical `/kurono` tree on the way in
 
 `linux_syscall.h` defines **177 `LSYS_*` syscall numbers** across the x86-64 ABI
 (symbolic names + their numeric synonyms), and `linux_syscall.cpp` implements
-**~155 of them for real** (distinct `case LSYS_*` arms)  -  not stubbed  -  covering
+**~155 of them for real** (distinct `case LSYS_*` arms) - not stubbed - covering
 the surface a command-line or GUI program needs:
 
 | Group | Syscalls |
@@ -35,15 +35,15 @@ the surface a command-line or GUI program needs:
 A real GUI app blocks on a handful of syscalls that are easy to stub wrongly.
 These are implemented for real, which is what makes the Wayland render path work:
 
-- **`futex`** (`FUTEX_WAIT` / `FUTEX_WAKE`)  -  real blocking + wakeups. The
+- **`futex`** (`FUTEX_WAIT` / `FUTEX_WAKE`) - real blocking + wakeups. The
   multithreaded pthread gate test (`pthread_test`) reliably reaches `counter=2000`.
-- **`clone` / `CLONE_THREAD`**  -  threads sharing one address space, preemptively
+- **`clone` / `CLONE_THREAD`** - threads sharing one address space, preemptively
   switched on the user-thread path.
-- **`epoll_create1` / `epoll_ctl` / `epoll_wait`** and **`poll` / `ppoll`**  - 
+- **`epoll_create1` / `epoll_ctl` / `epoll_wait`** and **`poll` / `ppoll`** - 
   event loops backed by eventfd, timerfd, and sockets.
-- **`mprotect`**  -  W^X enforcement with region splitting.
-- **`memfd_create`** + file-backed **`mmap`**  -  shared-memory backing for `wl_shm`.
-- **`sendmsg` / `recvmsg`** carrying **`SCM_RIGHTS`**  -  file-descriptor passing.
+- **`mprotect`** - W^X enforcement with region splitting.
+- **`memfd_create`** + file-backed **`mmap`** - shared-memory backing for `wl_shm`.
+- **`sendmsg` / `recvmsg`** carrying **`SCM_RIGHTS`** - file-descriptor passing.
   A Wayland client fd-passes a `wl_shm` buffer to the compositor end to end.
 
 ## 3. Process & memory model
@@ -57,12 +57,12 @@ These are implemented for real, which is what makes the Wayland render path work
   widens user pointers/lengths/offsets to 64-bit so a high (multi-TB) mapping
   round-trips intact. This is what lets Firefox's libxul load and relocate at a
   multi-terabyte base. (The kernel still identity-maps low *physical* memory for
-  its own access  -  a physical-mapping detail, not a user-address limit.)
+  its own access - a physical-mapping detail, not a user-address limit.)
 
 ## 4. Path translation
 
 `ResolvePath()` rewrites Linux paths into Kurono's canonical tree before any KVFS
-op  -  e.g. `/usr/lib*` and `/lib*` resolve through the compat symlinks into
+op - e.g. `/usr/lib*` and `/lib*` resolve through the compat symlinks into
 `/kurono/...`, `/proc` / `/dev` / `/run` / `/tmp` map under `/kurono/runtime`, and
 `/etc` maps to `/kurono/system/config`. See [KVFS.md](../fs/KVFS.md) §3 and
 [../system/LOGGING.md](../system/LOGGING.md) §1 for the layout.
@@ -79,12 +79,12 @@ See **[LD_KURONO.md](LD_KURONO.md)**.
 
 An unrecognized syscall number is logged to serial and returns `-ENOSYS`. Heavier
 Linux workloads that need a full kernel run instead through the hypervisor path (a
-real Linux guest)  -  see [../virt/HYPERVISOR.md](../virt/HYPERVISOR.md).
+real Linux guest) - see [../virt/HYPERVISOR.md](../virt/HYPERVISOR.md).
 
 ## 7. Related files
 
-- `src/linux/linux_syscall.cpp` / `linux_syscall_x64.cpp` / `.h`  -  the dispatch table + handlers
-- `src/linux/linux_kernel.cpp`  -  personality coordinator that activates the layer
-- `src/linux/ld_kurono.cpp`  -  the dynamic linker the loader hands PIEs to
-- `src/net/unix_socket.cpp`  -  AF_UNIX sockets + `SCM_RIGHTS` fd-passing
-- `src/virt/hypervisor.cpp`  -  full hardware-virtualization path for heavier guests
+- `src/linux/linux_syscall.cpp` / `linux_syscall_x64.cpp` / `.h` - the dispatch table + handlers
+- `src/linux/linux_kernel.cpp` - personality coordinator that activates the layer
+- `src/linux/ld_kurono.cpp` - the dynamic linker the loader hands PIEs to
+- `src/net/unix_socket.cpp` - AF_UNIX sockets + `SCM_RIGHTS` fd-passing
+- `src/virt/hypervisor.cpp` - full hardware-virtualization path for heavier guests

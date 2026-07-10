@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  KMemX pool  -  the fixed physical arena that holds compressed page blobs, plus
+//  KMemX pool - the fixed physical arena that holds compressed page blobs, plus
 //  its variable-size slot allocator. split out of kmemx.cpp so the allocator can
 //  be unit-tested in isolation (the stage-2 self-test exercises it directly).
 //  (satoru)

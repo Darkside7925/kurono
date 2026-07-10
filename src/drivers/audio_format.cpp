@@ -1,4 +1,4 @@
-//  kurono os  -  audio format conversion (implementation)
+//  kurono os - audio format conversion (implementation)
 #include "audio_format.h"
 
 namespace AudioFormat {

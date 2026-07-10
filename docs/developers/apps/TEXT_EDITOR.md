@@ -29,6 +29,6 @@ On open, the editor reads the file with `KVFS::ReadString`. On save, it writes w
 
 ## 5. Related files
 
-- `src/fs/kvfs.cpp`  -  file read/write
-- `src/ui/font.cpp`  -  text rendering
-- `src/apps/file_manager.cpp`  -  launches editor on file double-click
+- `src/fs/kvfs.cpp` - file read/write
+- `src/ui/font.cpp` - text rendering
+- `src/apps/file_manager.cpp` - launches editor on file double-click

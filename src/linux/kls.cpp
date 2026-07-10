@@ -1,4 +1,4 @@
-//  kurono linux subsystem (kls)  -  implementation
+//  kurono linux subsystem (kls) - implementation
 //  the master orchestrator for linux integration inside kurono os
 
 #include "kls.h"
@@ -224,7 +224,7 @@ void KLS::SaveConfig() {
 void KLS::LoadConfig() {
     char buf[1024];
     if (KVFS::ReadString("/etc/kls.conf", buf, sizeof(buf)) > 0) {
-        // simple parser  -  look for key=value lines
+        // simple parser - look for key=value lines
         // in production, parse properly; simplified here
         SerialLogger::Log("[KLS] Config loaded from /etc/kls.conf\r\n");
     }
@@ -360,7 +360,7 @@ void KLS::PopulateDefaultRootfs() {
 
     // /etc/bash.bashrc
     KVFS::WriteString("/linux/etc/bash.bashrc",
-        "# Kurono Linux Subsystem  -  bash defaults\n"
+        "# Kurono Linux Subsystem - bash defaults\n"
         "alias ll='ls -la'\n"
         "alias la='ls -A'\n"
         "alias l='ls -CF'\n"
@@ -466,7 +466,7 @@ void KLS::PopulateDefaultRootfs() {
 void KLS::MountSharedDirs() {
     SerialLogger::Log("[KLS] Mounting shared directories...\r\n");
 
-    // /home is shared  -  both kurono and linux see the same /home/user
+    // /home is shared - both kurono and linux see the same /home/user
     if (config.share_home) {
         // in our kvfs model, /home already exists; /linux/home is a symlink
         KVFS::Mkdirs("/linux/home");
@@ -486,7 +486,7 @@ void KLS::MountSharedDirs() {
 
 void KLS::UnmountSharedDirs() {
     SerialLogger::Log("[KLS] Unmounting shared directories\r\n");
-    // in kvfs, no actual unmount needed  -  just log
+    // in kvfs, no actual unmount needed - just log
 }
 
 void KLS::SyncFilesystems() {
@@ -568,7 +568,7 @@ void KLS::GenerateShadow(char* buf, int max_len) {
         SUPRUser* u = &users[i];
         if (kls_seq(u->username, "root")) continue;
         p = kls_pa(buf, p, max_len, u->username);
-        // hash from supr  -  represent as locked (!) for shadow
+        // hash from supr - represent as locked (!) for shadow
         p = kls_pa(buf, p, max_len, ":$6$kurono$locked:19723:0:99999:7:::\n");
     }
 }
@@ -716,7 +716,7 @@ int KLS::LoadELFSegments(const void* elf_data, uint32_t size) {
         // turning this into an arbitrary kernel write. reject any segment whose
         // [p_vaddr, p_vaddr+p_memsz) escapes a sane i386 user-image window or
         // whose p_memsz is absurd. end computed in 64-bit so it can't wrap.
-        // window = [0x100000, 0xC0000000)  -  the classic i386 user space; a 1mb
+        // window = [0x100000, 0xC0000000) - the classic i386 user space; a 1mb
         // read-capped legit elf lands well inside it. this is a REJECT, not a
         // page-table rewrite. (satoru)
         const uint64_t USER_LO  = 0x100000ull;
@@ -943,7 +943,7 @@ uint64_t KLS::GetExt4TotalSpace() {
     return Ext4::TotalBlocks() * Ext4::BlockSize();
 }
 
-//  shell integration  -  register kls commands with kurono shell
+//  shell integration - register kls commands with kurono shell
 
 void KLS::RegisterShellCommands(void* shell_ptr) {
     KuronoShell* sh = (KuronoShell*)shell_ptr;

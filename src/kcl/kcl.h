@@ -1,12 +1,12 @@
 #pragma once
-//  kurono os  -  kcl (kurono command language) interpreter
+//  kurono os - kcl (kurono command language) interpreter
 //  a complete tree-walking scripting language for bare-metal kurono:
 //  lexer + recursive-descent parser/evaluator over a tagged value type
 //  (int / float / string / bool / list / none). no libc, no stl. (satoru)
 
 class KuronoShell;
 
-// hard limits  -  fixed buffers keep us off the stl and bound recursion (satoru)
+// hard limits - fixed buffers keep us off the stl and bound recursion (satoru)
 #define KCL_MAX_SCRIPT     65536   // largest script source we will load (satoru)
 #define KCL_MAX_TOKENS     8192    // token stream cap per script (satoru)
 #define KCL_MAX_OUTPUT     8192    // default output buffer for shell glue (satoru)

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  usb (xhci) host controller driver
+//  kurono os - usb (xhci) host controller driver
 //  supports usb 3.0/2.0/1.1 via xhci (extensible host controller interface)
 #include "../kernel/types.h"
 
@@ -196,7 +196,7 @@ public:
     static bool BulkRead(int device, uint8_t endpoint, void* buffer, int length);
     static bool BulkWrite(int device, uint8_t endpoint, const void* buffer, int length);
 
-    // hid interrupt polling  -  call periodically (e.g. from the input poll
+    // hid interrupt polling - call periodically (e.g. from the input poll
     // loop, ~1 khz) to drain transfer-completion + port-change events and
     // dispatch reports to the keyboard / mouse drivers (satoru).
     static void PollHID();

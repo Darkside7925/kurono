@@ -58,12 +58,12 @@ uint64_t Timer::GetRealMs64() {
     // from the PIT-IRQ-advanced g_sched_now_ms (via Scheduler::NowMs). the
     // polled PollUpdate() clock loses whole PIT reload periods between calls,
     // so sampling it at ~1ms cadence (e.g. a SleepMs(1) frame pacer) makes it
-    // crawl far behind wall-clock  -  which froze the gui at "FPS 0". the IRQ
+    // crawl far behind wall-clock - which froze the gui at "FPS 0". the IRQ
     // clock is monotonic and cadence-independent. before Start() (early boot)
     // we still use the polled clock since IRQs/scheduler aren't up yet. (satoru)
     // TSC-based monotonic ms clock. the PIT-IRQ-advanced g_sched_now_ms
     // (OnTimerTick(1) per IRQ) UNDERCOUNTS badly on VMware, which COALESCES
-    // timer interrupts  -  fewer IRQs delivered means the clock crawls, so the
+    // timer interrupts - fewer IRQs delivered means the clock crawls, so the
     // gui's 60fps pace + 250ms damage-gate fallback rarely fire and you get a
     // 5-10 minute black screen before the desktop crawls up. the polled PIT
     // counter instead loses whole reload periods between infrequent samples.

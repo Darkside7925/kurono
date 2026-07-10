@@ -3,7 +3,7 @@
 #include "../kernel/pmm.h"
 #include "../drivers/serial.h"
 
-//  KFS implementation  -  see kfs.h. the persistence layer formats a fresh volume
+//  KFS implementation - see kfs.h. the persistence layer formats a fresh volume
 //  each save and writes the user-data tree as real files + dirs, so a bump-style
 //  allocator hands out CONTIGUOUS block runs and a whole file goes to disk in one
 //  multi-page nvme command and is described by a SINGLE extent. the bitmap is
@@ -12,7 +12,7 @@
 //  + bitmap + inode table) is cached in ram and flushed in Sync().
 //
 //  EXTENT-BASED (KFS v2): files/dirs are lists of extents {start,len}, NOT
-//  per-block pointers  -  23 inline in the inode + an unbounded overflow chain. no
+//  per-block pointers - 23 inline in the inode + an unbounded overflow chain. no
 //  ~4 MB file cap, no max-dir-entry cap, and a 174 MB binary is one extent. tiny
 //  files (<= KFS_INLINE_MAX) live inline in the inode with no data block. (satoru)
 
@@ -177,7 +177,7 @@ namespace {
         return 0;
     }
 
-    //  path helpers  -  split into components, no allocation. (satoru)
+    //  path helpers - split into components, no allocation. (satoru)
     bool comp_eq(const char* a, const char* b, int blen) {
         for (int i = 0; i < blen; i++) if (a[i] != b[i]) return false;
         return a[blen] == 0;
@@ -205,7 +205,7 @@ namespace {
     }
 
     //  add (name -> child) to directory `dir`, growing it a block at a time. no
-    //  cap on entries  -  growth chains extents like a file. (satoru)
+    //  cap on entries - growth chains extents like a file. (satoru)
     bool dir_add(KFSInode* dir, const char* name, int nlen, uint32_t child, KFSType t) {
         if (!dir || nlen <= 0 || nlen > KFS_NAME_MAX) return false;
         uint8_t blk[KFS_BLOCK_SIZE];
@@ -464,7 +464,7 @@ bool KFS::Format(uint32_t total_blocks) {
 
 //  validate an on-disk superblock before we trust ANY of its size/count fields
 //  to size an allocation or a read. the crc only proves the block is internally
-//  consistent  -  it does NOT stop a malicious image (an attacker recomputes the
+//  consistent - it does NOT stop a malicious image (an attacker recomputes the
 //  crc), so every field is bounded here independently. all arithmetic is 64-bit
 //  so the u32 fields can't overflow a size calc (e.g. bitmap_blocks * 4096
 //  wrapping a u32 to allocate a tiny buffer that a large read then overflows).
@@ -526,7 +526,7 @@ bool KFS::Mount() {
         return false;
     if (crc32((uint8_t*)sb, __builtin_offsetof(KFSSuper, crc)) != sb->crc) return false;
     // gate on a fully validated layout BEFORE any field is used to size an
-    // allocation or a read  -  a corrupt/malicious superblock that passes magic +
+    // allocation or a read - a corrupt/malicious superblock that passes magic +
     // crc must not be able to overflow g_bitmap / g_inodes. (satoru)
     if (!kfs_super_sane(sb)) {
         SerialLogger::Log("[KFS] superblock failed sanity check; refusing mount\r\n");

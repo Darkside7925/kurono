@@ -1,4 +1,4 @@
-//  kurono os  -  debian guest rootfs accessor
+//  kurono os - debian guest rootfs accessor
 //
 //  on-disk fallback path: /var/lib/kurono/debian-rootfs.ext4
 //
@@ -17,7 +17,7 @@ namespace DebianRootfs {
     void           EvictCache();
 }
 
-// legacy inline shims  -  keep existing call sites compiling.
+// legacy inline shims - keep existing call sites compiling.
 static inline uint32_t debian_rootfs_size()       { return DebianRootfs::Size(); }
 static inline const uint8_t* debian_rootfs_data() { return DebianRootfs::Data(); }
 static inline bool debian_rootfs_available()      { return DebianRootfs::Available(); }

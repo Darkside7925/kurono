@@ -5,8 +5,8 @@
 ;    CPL=0, RCX = user RIP, R11 = user RFLAGS, RSP = user RSP (UNCHANGED),
 ;    IF cleared by SFMASK.  syscall nr in RAX, args in RDI, RSI, RDX, R10, R8, R9.
 ;
-;  We build a full InterruptFrame on the kernel stack  -  byte-identical to the
-;  one the int 0x80 / irq stubs build  -  and hand it to a C handler. that lets a
+;  We build a full InterruptFrame on the kernel stack - byte-identical to the
+;  one the int 0x80 / irq stubs build - and hand it to a C handler. that lets a
 ;  syscall switch tasks the same way int 0x80 does: the handler rewrites the
 ;  frame in place (futex block, thread exit, clone), and we IRETQ to whatever
 ;  task the frame now describes instead of SYSRET-ing back to the caller. a
@@ -20,8 +20,8 @@
 
 [BITS 64]
 
-extern SyscallEntryX64FrameHandler       ; void (*)(InterruptFrame*)  -  fills rax, may switch
-extern sched_current_task_raw            ; void* ()  -  current task ptr, to detect a switch (satoru)
+extern SyscallEntryX64FrameHandler       ; void (*)(InterruptFrame*) - fills rax, may switch
+extern sched_current_task_raw            ; void* () - current task ptr, to detect a switch (satoru)
 ; the kernel stack now comes from this cpu's per-cpu block via gs (KERNEL_GS_BASE
 ; = &PerCpu) after swapgs, so two cores can syscall at once without sharing one
 ; global stack. PerCpu offset 0 = user-rsp scratch, offset 8 = kernel rsp. (satoru)
@@ -41,7 +41,7 @@ syscall_entry_x64:
 
     ; build the InterruptFrame top-down (push writes high address first, so the
     ; first push is the last struct field, ss). every gp reg is captured live
-    ; and untouched here  -  in particular r9 still holds musl's clone child-fn,
+    ; and untouched here - in particular r9 still holds musl's clone child-fn,
     ; and rcx/r11 still hold the user rip/rflags. (satoru)
     push    USER_SS                              ; ss
     push    qword [gs:0]                          ; rsp (user, from PerCpu.user_rsp_save)
@@ -49,7 +49,7 @@ syscall_entry_x64:
     push    USER_CS                              ; cs
     push    rcx                                  ; rip (user, in rcx)
     push    0                                    ; error_code
-    push    0x80                                 ; vector (cosmetic  -  mark syscall)
+    push    0x80                                 ; vector (cosmetic - mark syscall)
     push    rax                                  ; rax (syscall nr; handler overwrites with result)
     push    rbx                                  ; rbx
     push    rcx                                  ; rcx
@@ -58,7 +58,7 @@ syscall_entry_x64:
     push    rdi                                  ; rdi
     push    rbp                                  ; rbp
     push    r8                                   ; r8
-    push    r9                                   ; r9  (pristine  -  clone child start fn)
+    push    r9                                   ; r9  (pristine - clone child start fn)
     push    r10                                  ; r10
     push    r11                                  ; r11
     push    r12                                  ; r12
@@ -66,14 +66,14 @@ syscall_entry_x64:
     push    r14                                  ; r14
     push    r15                                  ; r15
     mov     rax, cr2
-    push    rax                                  ; cr2 (offset 0  -  rsp now = &frame)
+    push    rax                                  ; cr2 (offset 0 - rsp now = &frame)
 
     ; preserve the user's fpu/sse (xmm) state across the whole syscall. kernel
     ; code (memcpy, graphics inline asm) freely clobbers xmm, and the SYSRET/IRETQ
-    ; return path does NOT otherwise restore it  -  which corrupted musl __init_tp's
+    ; return path does NOT otherwise restore it - which corrupted musl __init_tp's
     ; movups store of the main thread's tcb next/prev and #pf'd pthread_create.
     ;
-    ; keep &frame in r12 (frame-saved, so clobbering it here is fine  -  the exit
+    ; keep &frame in r12 (frame-saved, so clobbering it here is fine - the exit
     ; pops reload the user's r12 from the frame). carve a 16-aligned 512-byte
     ; fxsave area BELOW the frame; do NOT derive &frame back from rsp afterwards
     ; (the alignment `and` drops a variable 0..15 bytes, which silently shifted
@@ -86,7 +86,7 @@ syscall_entry_x64:
     fxsave  [r13]                                 ; save PRISTINE user fpu/sse
 
     ; record the current task BEFORE the handler so we can tell on return whether
-    ; it switched tasks (clone/futex/thread-exit)  -  in which case LoadUserFrame
+    ; it switched tasks (clone/futex/thread-exit) - in which case LoadUserFrame
     ; already loaded the next task's fpu and we must not overwrite it. (satoru)
     call    sched_current_task_raw
     mov     r14, rax                             ; r14 = pre-handler task
@@ -98,7 +98,7 @@ syscall_entry_x64:
     call    SyscallEntryX64FrameHandler
 
     ; if the task is unchanged, restore the pristine user fpu state we saved; if
-    ; it switched, the new task's fpu is already live (via LoadUserFrame)  -  skip.
+    ; it switched, the new task's fpu is already live (via LoadUserFrame) - skip.
     ; (satoru)
     call    sched_current_task_raw
     cmp     rax, r14

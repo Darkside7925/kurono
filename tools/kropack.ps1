@@ -18,7 +18,7 @@ if (-not (Test-Path $AppDir)) {
 
 $manifestPath = Join-Path $AppDir "manifest.kcl"
 if (-not (Test-Path $manifestPath)) {
-    Write-Error "manifest.kcl not found in $AppDir  -  every .kro app requires a manifest"
+    Write-Error "manifest.kcl not found in $AppDir - every .kro app requires a manifest"
     exit 1
 }
 

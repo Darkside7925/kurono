@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  Kurono OS  -  Start Script
+#  Kurono OS - Start Script
 #  Build and launch Kurono OS in QEMU
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -140,7 +140,7 @@ $qemuArgs = @(
     "-device", "hda-duplex,audiodev=hostaudio",
     "-device", "AC97,audiodev=hostaudio",
     "-device", "e1000,netdev=net0",
-    # SLIRP defaults: guest 10.0.2.15 / gw 10.0.2.2 / dns 10.0.2.3  -  matches
+    # SLIRP defaults: guest 10.0.2.15 / gw 10.0.2.2 / dns 10.0.2.3 - matches
     # the IPs hardcoded in src/net/network.cpp.  Overriding `net=` here used
     # to put SLIRP on 10.0.0.0/24 while the kernel still claimed 10.0.2.15,
     # which silently broke every packet after the first ARP reply.
@@ -149,7 +149,7 @@ $qemuArgs = @(
     "-no-shutdown"
 )
 
-# ── UEFI firmware (OVMF)  -  replaces SeaBIOS with real UEFI ──
+# ── UEFI firmware (OVMF) - replaces SeaBIOS with real UEFI ──
 if ($UEFI) {
     # OVMF needs a writable copy of the vars file (EFI variables / NVRAM)
     $ovmfVarsCopy = Join-Path $Root "build\OVMF_VARS_4M.fd"
@@ -160,7 +160,7 @@ if ($UEFI) {
         "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
         "-drive", "if=pflash,format=raw,file=$wslVarsCopy"
     )
-    Write-Status "UEFI boot via OVMF (TianoCore EDK2)  -  no SeaBIOS"
+    Write-Status "UEFI boot via OVMF (TianoCore EDK2) - no SeaBIOS"
 }
 
 if ($Debug) {
@@ -184,7 +184,7 @@ if ($BareMetal) {
     $qemuArgs += @("-cpu", "host", "-smp", "4", "-enable-kvm", "-machine", "type=q35")
     Write-Status "Running with KVM acceleration"
 } else {
-    # WHPX  -  Windows Hypervisor Platform (hardware-accelerated).
+    # WHPX - Windows Hypervisor Platform (hardware-accelerated).
     # Auto-detect host CPU vendor to pick the correct virt extension.
     # Intel hosts → expose VT-x (+vmx) for nested virtualisation
     # AMD hosts   → expose SVM (+svm) for nested virtualisation
@@ -193,7 +193,7 @@ if ($BareMetal) {
 
     $cpuVendor = (Get-CimInstance Win32_Processor | Select-Object -First 1).Manufacturer
     if ($cpuVendor -match "AMD|Advanced") {
-        # AMD host  -  WHPX + nested SVM.
+        # AMD host - WHPX + nested SVM.
         # -cpu host / -cpu max cause VP exit code 4 (expose features WHPX can't handle).
         # 'qemu64' is the minimal safe model.  +svm tells QEMU to expose the SVM CPUID
         # bit so the guest kernel can detect it; actual nested vmrun depends on whether
@@ -201,11 +201,11 @@ if ($BareMetal) {
         $qemuArgs += @("-smp", "4", "-accel", "whpx,kernel-irqchip=off", "-cpu", "qemu64,+svm")
         Write-Status "Running with WHPX + SVM (AMD host, qemu64 model)"
     } elseif ($cpuVendor -match "Intel") {
-        # Intel host  -  WHPX can nest VT-x
+        # Intel host - WHPX can nest VT-x
         $qemuArgs += @("-smp", "4", "-accel", "whpx,kernel-irqchip=off", "-cpu", "qemu64,+vmx")
         Write-Status "Running with WHPX + VT-x (Intel host, qemu64 model)"
     } else {
-        # Unknown vendor  -  use max CPU model
+        # Unknown vendor - use max CPU model
         $qemuArgs += @("-smp", "4", "-accel", "whpx,kernel-irqchip=off", "-cpu", "qemu64")
         Write-Status "Running with WHPX (unknown CPU vendor: $cpuVendor)"
     }

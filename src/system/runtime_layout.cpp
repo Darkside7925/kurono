@@ -163,7 +163,7 @@ void Init() {
        "ff02::1     ip6-allnodes\n"
        "ff02::2     ip6-allrouters\n");
     // single nameserver: musl's resolver fires its queries at EVERY listed
-    // server in parallel on one socket  -  three servers would triple the udp
+    // server in parallel on one socket - three servers would triple the udp
     // datagrams through the 16-slot stack for no gain. 8.8.8.8 routes out the
     // tap0 masquerade with zero host-side services. (satoru)
     wr("/system/etc/resolv.conf",
@@ -193,7 +193,7 @@ void Init() {
     wr("/system/etc/shells",
        "/system/bin/sh\n/system/bin/bash\n/system/bin/ksh\n");
 
-    // Dynamic loader search list  -  consumed by ld.so / dlopen wrappers.
+    // Dynamic loader search list - consumed by ld.so / dlopen wrappers.
     wr("/system/etc/ld.so.conf",
        "/system/lib\n"
        "/system/lib/kurono\n"
@@ -234,11 +234,11 @@ void Init() {
        "<include>/system/fonts/fonts.conf</include></fontconfig>\n");
     // Register at least one TTF placeholder so fc-cache succeeds.
     wr("/system/fonts/truetype/DejaVuSans.ttf.placeholder",
-       "TTF placeholder  -  install real font via kpkg dejavu-fonts\n");
+       "TTF placeholder - install real font via kpkg dejavu-fonts\n");
 
     // ---- SSL CA bundle placeholder ----------------------------------
     wr("/system/ssl/certs/ca-certificates.crt",
-       "# Kurono CA bundle  -  install via kpkg ca-certificates\n"
+       "# Kurono CA bundle - install via kpkg ca-certificates\n"
        "# Until then HTTPS will fall back to system trust store.\n");
     KVFS::Mkdirs("/system/ssl/certs/source");
 
@@ -507,7 +507,7 @@ void Init() {
        "MOZ_X11_EGL=0\n"
        "MOZ_DISABLE_GPU_SANDBOX=1\n"
        "MOZ_DISABLE_CONTENT_SANDBOX=1\n"
-       // (satoru) force the socket(network) process off  -  the one child proc firefox
+       // (satoru) force the socket(network) process off - the one child proc firefox
        // still spawns at startup; its launch parks the ipc i/o thread + wedges the
        // chrome main at AsyncLaunch (kurono can't cleanly fork+exec a child). honoured
        // before the cached pref check in nsIOService::UseSocketProcess. (satoru)
@@ -561,7 +561,7 @@ void Init() {
         Scheduler::GetLoadAverageStr(lbuf, sizeof(lbuf));
         wr("/system/proc/loadavg", lbuf);
 
-        // hrtimer snapshot  -  refreshed by RefreshProc()
+        // hrtimer snapshot - refreshed by RefreshProc()
         HRTimer::DumpProcInfo(buf, sizeof(buf));
         wr("/system/proc/timer_list", buf);
     }

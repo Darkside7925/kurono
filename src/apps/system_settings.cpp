@@ -1,4 +1,4 @@
-//  kurono os  -  system settings shell: window, sidebar, content pane, scrolling,
+//  kurono os - system settings shell: window, sidebar, content pane, scrolling,
 //  module registry + dispatch, and the shared SettingsUI control helpers (satoru)
 #include "system_settings.h"
 #include "../ui/window_manager.h"
@@ -65,7 +65,7 @@ static const int ROW_H       = 38;   // sidebar entry height (satoru)
 static const int SCROLLBAR_W = 8;
 static const int CONTENT_PAD = 16;   // inner padding inside the content pane (satoru)
 
-// ── shell state (constant-initialised statics  -  ctor-free) ──────────────────
+// ── shell state (constant-initialised statics - ctor-free) ──────────────────
 static int  s_win_id        = -1;
 static int  s_selected      = 0;                 // index into g_modules[] (satoru)
 static int  s_scroll[16]    = {0};               // per-module scroll offset, indexed like g_modules (satoru)
@@ -292,7 +292,7 @@ void SystemSettings::Open(){
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SettingsUI  -  shared control helpers (drawing + hit-testing)
+//  SettingsUI - shared control helpers (drawing + hit-testing)
 // ════════════════════════════════════════════════════════════════════════════
 namespace SettingsUI {
     const unsigned int COL_BG      = SH_BG;

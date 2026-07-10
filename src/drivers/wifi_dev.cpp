@@ -159,7 +159,7 @@ bool WifiDev::Probe() {
                 uint8_t  sub = (clsreg >> 16) & 0xFF;
                 if (!is_wireless(vendor, device, cls, sub)) continue;
 
-                // found a wireless nic  -  capture it. (satoru)
+                // found a wireless nic - capture it. (satoru)
                 dev.present = true;
                 dev.bus = (uint8_t)bus; dev.slot = slot; dev.func = func;
                 dev.vendor = vendor; dev.device = device;

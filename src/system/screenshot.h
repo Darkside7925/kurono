@@ -1,7 +1,7 @@
 #pragma once
 #include "../kernel/types.h"
 
-// screenshot  -  snapshot the active framebuffer into a 32bpp uncompressed
+// screenshot - snapshot the active framebuffer into a 32bpp uncompressed
 // bottom-up BMP and persist it through the kvfs. heap-backed, freed after
 // the write. (satoru)
 

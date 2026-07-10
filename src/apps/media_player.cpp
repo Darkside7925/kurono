@@ -1,4 +1,4 @@
-//  kurono os  -  media player application implementation
+//  kurono os - media player application implementation
 //  supports wav/mp3/aac/flac/mp4 via codecregistry + sb16/ac97/hda output
 #include "media_player.h"
 #include "../drivers/graphics.h"
@@ -104,7 +104,7 @@ void MediaPlayerApp::Open() {
 
     // DISABLED: auto-loading + playing the preset media here breaks the global
     // audio init (the player's own mp4/wav audio path corrupts the AudioServer
-    // backend state  -  completely broken). the file-explorer double-click path
+    // backend state - completely broken). the file-explorer double-click path
     // (Open(file_path) below) works perfectly and is the supported way in. so the
     // bare "Media Player" launch now opens an empty player instead of a preset
     // playlist. revisit when the player's audio engine is rewritten. (satoru)
@@ -358,7 +358,7 @@ void MediaPlayerApp::Play() {
                            ? &playlist[current_track] : nullptr;
 
     if (entry) {
-        // read audio data from kvfs  -  use heap for large buffer
+        // read audio data from kvfs - use heap for large buffer
         int read_size = entry->file_size;
         if (read_size <= 0) read_size = 131072; // 128kb default
         if (read_size > 524288) read_size = 524288; // 512kb max
@@ -379,7 +379,7 @@ void MediaPlayerApp::Play() {
 
             if (fmt == CODEC_WAV || fmt == CODEC_MP3 || fmt == CODEC_AAC ||
                 fmt == CODEC_FLAC) {
-                // unified decode path  -  codec registry handles format dispatch
+                // unified decode path - codec registry handles format dispatch
                 AudioBuffer abuf = CodecRegistry::DecodeAudio(audio_buf, rd);
                 if (abuf.valid && abuf.samples && abuf.length > 0) {
                     audio_started = PlayDecodedAudio(
@@ -388,7 +388,7 @@ void MediaPlayerApp::Play() {
                 }
             }
             else if (fmt == CODEC_MP4) {
-                // mp4 container  -  extract and decode audio track
+                // mp4 container - extract and decode audio track
                 AudioBuffer abuf = CodecRegistry::ExtractMP4Audio(audio_buf, rd);
                 if (abuf.valid && abuf.samples && abuf.length > 0) {
                     audio_started = PlayDecodedAudio(
@@ -397,7 +397,7 @@ void MediaPlayerApp::Play() {
                 }
             }
             else if (rd > 0) {
-                // unknown format  -  try raw pcm at 22050hz 8-bit mono
+                // unknown format - try raw pcm at 22050hz 8-bit mono
                 audio_started = PlayDecodedAudio(audio_buf, rd, 22050, 8, 1);
             }
 
@@ -425,7 +425,7 @@ static bool PlayDecodedAudio(const uint8_t* data, int len, int rate, int bits, i
     if (!data || len <= 0) return false;
 
     // route through the unified audio server instead of probing each backend
-    // by hand  -  audioserver owns the active backend (hda/ac97/sb16/pcspk) and
+    // by hand - audioserver owns the active backend (hda/ac97/sb16/pcspk) and
     // mixes + resamples for us.  `len` is total bytes; map bits to the pcm
     // sample format (codec output is s16, raw fallback is 8-bit). (satoru)
     AudioFormat::SampleFormat fmt = (bits == 8) ? AudioFormat::FMT_U8
@@ -438,7 +438,7 @@ void MediaPlayerApp::Pause() {
     if (!playing) return;
     // audioserver has no per-stream pause for the one-shot playpcm path, and
     // the backend interface only exposes stop(), so halt the active backend's
-    // dma to silence output  -  the unified equivalent of the old per-backend
+    // dma to silence output - the unified equivalent of the old per-backend
     // pause fan-out. (satoru)
     AudioBackend* be = AudioServer::ActiveBackend();
     if (be) be->Stop();
@@ -540,7 +540,7 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
         int vx = cx + border, vy = cy + border;
         int vw = cw - border*2, vh = preview_h - border*2;
 
-        // cinema-style video viewport  -  dark letterbox with metadata
+        // cinema-style video viewport - dark letterbox with metadata
         Graphics::FillRect(vx, vy, vw, vh, 0xFF0E0E1C);
 
         // subtle gradient-style cinema bars at top & bottom
@@ -551,7 +551,7 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
             Graphics::FillRect(vx, vy + vh - 1 - i, vw, 1, bar_col);
         }
 
-        // track name  -  large, centered
+        // track name - large, centered
         const char* name = e->name;
         int nlen = mp_slen(name);
         int name_x = vx + vw/2 - (nlen * 8) / 2;
@@ -597,7 +597,7 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
                 fps_window_start_ms = fnow;
             }
 
-            // animated equalizer bars in center  -  represents audio playing
+            // animated equalizer bars in center - represents audio playing
             int eq_cx = vx + vw/2;
             int eq_by = vy + vh - 20;
             for (int i = 0; i < 15; i++) {
@@ -624,7 +624,7 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
             }
             Graphics::DrawString(np_x + 6, np_y + 1, np, 0xFFCCCCDD, 0xFF000000);
 
-            // decoded-frame-rate overlay  -  top-left of the viewport. (satoru)
+            // decoded-frame-rate overlay - top-left of the viewport. (satoru)
             char fps_str[16] = "";
             mp_int_str(fps_display, fps_str, 12);
             int fl = mp_slen(fps_str);
@@ -635,13 +635,13 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
             Graphics::DrawString(vx + 11, vy + 8, fps_str, MP_GREEN, 0xFF000000);
 
         } else {
-            // playback not running  -  drop the fps tally so it restarts clean
+            // playback not running - drop the fps tally so it restarts clean
             // on the next play. (satoru)
             fps_frame_accum = 0;
             fps_display = 0;
             fps_window_start_ms = 0;
 
-            // stopped/paused  -  show play button overlay at center
+            // stopped/paused - show play button overlay at center
             int pcx = vx + vw/2, pcy = vy + vh/2 + 10;
             Graphics::FillCircle(pcx, pcy, 24, 0x66000000);
             Graphics::DrawCircle(pcx, pcy, 24, 0xAAFFFFFF);
@@ -677,7 +677,7 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
 
     } else if (current_track >= 0 && current_track < playlist_count &&
                playlist[current_track].type == MEDIA_AUDIO) {
-        // audio file  -  show waveform visualization
+        // audio file - show waveform visualization
         Graphics::FillRect(cx, cy, cw, preview_h, 0xFF0A0A18);
 
         // show track name
@@ -707,7 +707,7 @@ void MediaPlayerApp::RenderVideoPreview(Window* w) {
             }
         }
 
-        // show playback status  -  check all audio backends
+        // show playback status - check all audio backends
         const char* status = "Stopped";
         if (Audio::IsAvailable()) {
             AudioState astate = Audio::GetState();
@@ -780,7 +780,7 @@ void MediaPlayerApp::RenderProgressBar(Window* w) {
             for(int i=0; s2[i] && l3<15; i++) dur_str[l3++] = s2[i];
             dur_str[l3] = 0;
         } else {
-            // unknown duration  -  show dashes
+            // unknown duration - show dashes
             mp_scpy(cur_str, "0:00", 16);
             mp_scpy(dur_str, "--:--", 16);
         }
@@ -953,7 +953,7 @@ void MediaPlayerApp::RenderCodecInfo(Window* w) {
     int cnw = mp_slen(codec_name) * 8;
     Graphics::DrawString(cx + 10 + (60 - cnw)/2, info_y + 2, codec_name, 0xFF000000, 0xFF000000);
 
-    // active output backend indicator  -  reflects the unified AudioServer's
+    // active output backend indicator - reflects the unified AudioServer's
     // chosen backend (hda/ac97/sb16/pcspk) rather than the legacy per-driver
     // probes, which the player no longer routes through. (satoru)
     const char* backend = AudioServer::ActiveBackendName();
@@ -1035,9 +1035,9 @@ void MediaPlayerApp::OnRender(Window* w) {
 
     // advance progress if playing
     if (playing) {
-        // check real audio state  -  if audio hardware finished, update accordingly
+        // check real audio state - if audio hardware finished, update accordingly
         if (Audio::IsAvailable() && Audio::GetState() == AUDIO_STOPPED && playback_progress > 0) {
-            // audio finished playing  -  if duration known, auto-advance
+            // audio finished playing - if duration known, auto-advance
             int dur = 0;
             if (current_track >= 0 && current_track < playlist_count)
                 dur = playlist[current_track].duration_sec;
@@ -1080,7 +1080,7 @@ void MediaPlayerApp::OnInput(Window* w, int event, int a, int b) {
         // mouse click: a=local_x, b=local_y (relative to content area)
         int cw = w->content_w;
 
-        // progress bar click (local y ~= 186, height ~= 10px)  -  also begins a
+        // progress bar click (local y ~= 186, height ~= 10px) - also begins a
         // drag-scrub; pointer-move (event 5) updates the seek until release. (satoru)
         if (b >= 180 && b <= 200) {
             int rel = a - 10;

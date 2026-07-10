@@ -1,4 +1,4 @@
-//  kurono os  -  hypervisor / vm lifecycle manager
+//  kurono os - hypervisor / vm lifecycle manager
 //  type 1 (bare-metal) hypervisor that orchestrates:
 //    - hardware virtualization (vt-x / amd-v)
 //    - extended page tables (ept / npt)
@@ -87,7 +87,7 @@ constexpr uint32_t IO_BITMAP_B_SIZE = 4096;
 // 1 bit per msr, read/write separate = 4 * 1024 bytes
 constexpr uint32_t MSR_BITMAP_SIZE  = 4096;
 
-//  hypervisor  -  the main vm lifecycle manager
+//  hypervisor - the main vm lifecycle manager
 class Hypervisor {
 public:
     static bool Init();
@@ -112,7 +112,7 @@ public:
     static bool BootDebianWithExtraction(uint32_t max_boot_exits = 75000);
 
     // after alpine is booted, send commands via serial to enumerate
-    // its drivers, modules, and hardware  -  register them into kurono's
+    // its drivers, modules, and hardware - register them into kurono's
     // linuxdriverframework.
     static int  ExtractAlpineDrivers();
 

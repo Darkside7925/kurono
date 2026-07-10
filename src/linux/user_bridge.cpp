@@ -1,4 +1,4 @@
-//  kurono linux subsystem  -  user bridge implementation
+//  kurono linux subsystem - user bridge implementation
 //  bidirectional supr ↔ linux user synchronization
 
 #include "user_bridge.h"
@@ -142,7 +142,7 @@ UBSyncResult UserBridge::SyncToLinux() {
         UBMappedUser* mu = FindMapped(su->username);
 
         if (!mu) {
-            // new user  -  add mapping
+            // new user - add mapping
             if (mapped_count >= UB_MAX_MAPPED_USERS) continue;
             mu = &mapped[mapped_count++];
             memset(mu, 0, sizeof(UBMappedUser));
@@ -165,7 +165,7 @@ UBSyncResult UserBridge::SyncToLinux() {
 
             result.users_added++;
         } else {
-            // existing mapping  -  update if changed
+            // existing mapping - update if changed
             bool changed = false;
             if (su->uid > 0 && su->uid != mu->supr_uid) {
                 mu->supr_uid = su->uid;

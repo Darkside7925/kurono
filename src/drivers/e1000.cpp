@@ -1,5 +1,5 @@
 //  intel e1000 (82540em) ethernet driver for kurono os
-//  real pci network card driver  -  works with qemu -device e1000
+//  real pci network card driver - works with qemu -device e1000
 
 #include "e1000.h"
 #include "serial.h"
@@ -72,7 +72,7 @@ bool E1000::ScanPCI() {
                 // read bar0 (mmio base address)
                 uint32_t bar0 = PciRead((uint8_t)bus, slot, 0, 0x10);
                 if (bar0 & 1) {
-                    // i/o space  -  not expected for e1000
+                    // i/o space - not expected for e1000
                     SerialLogger::Log("[E1000] BAR0 is I/O space, skipping\r\n");
                     continue;
                 }
@@ -172,7 +172,7 @@ void E1000::InitRX() {
 
     rx_cur = 0;
 
-    // enable receiver  -  also enable UPE/MPE so SLIRP unicast replies
+    // enable receiver - also enable UPE/MPE so SLIRP unicast replies
     // are not silently filtered if the RAR programming raced.  Verbose
     // for diagnostics; we can tighten later.
     uint32_t rctl = E1000_RCTL_EN |
@@ -336,11 +336,11 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
     // flowing without ever blocking on a per-packet completion. (satoru)
     ReclaimTx();
 
-    // the slot we're about to (re)use is free iff its descriptor is dd  -  the
+    // the slot we're about to (re)use is free iff its descriptor is dd - the
     // nic has transmitted whatever was last queued there. all slots start dd
     // (InitTX), and once armed they only go dd again when the nic finishes, so
     // a non-dd slot here means the 32-entry ring has wrapped fully around and
-    // is actually full. that's the ONLY case we block  -  briefly, bounded  - 
+    // is actually full. that's the ONLY case we block - briefly, bounded - 
     // rather than spinning on every frame. (satoru)
     volatile E1000_TXDesc* txd = &tx_descs[tx_cur];
     if (!(txd->status & E1000_TXD_STAT_DD)) {
@@ -369,7 +369,7 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
     txd->status = 0;
     txd->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
 
-    // count it as sent at enqueue time  -  we no longer wait for the wire. (satoru)
+    // count it as sent at enqueue time - we no longer wait for the wire. (satoru)
     tx_count++;
     tx_bytes += length;
     // first 6 packets: dump dst MAC + ethertype for diagnostics
@@ -400,7 +400,7 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
         SerialLogger::Log(b);
     }
 
-    // advance the tail and ring the doorbell  -  fire-and-forget, no wait for
+    // advance the tail and ring the doorbell - fire-and-forget, no wait for
     // dd. the sfence makes the descriptor + buffer writes globally visible
     // before the nic reads them off the bump. (satoru)
     tx_cur = (tx_cur + 1) % E1000_NUM_TX_DESC;
@@ -464,7 +464,7 @@ void E1000::Poll() {
             }
         }
 
-        // reset descriptor for reuse  -  clear status/length/errors so we
+        // reset descriptor for reuse - clear status/length/errors so we
         // never re-deliver a stale frame on ring wrap, then issue a
         // compiler+memory barrier so the descriptor write is globally
         // visible before we hand the slot back to the NIC via RDT.

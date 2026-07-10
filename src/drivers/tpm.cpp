@@ -105,7 +105,7 @@ bool Init() {
     g_info.manufacturer = 0;        // filled in by SubmitCommand path
     g_info.firmware_v1  = 0;
     g_info.firmware_v2  = 0;
-    g_info.v2_capable   = true;     // assume 2.0  -  we don't fall back to 1.2
+    g_info.v2_capable   = true;     // assume 2.0 - we don't fall back to 1.2
     g_info.present      = true;
     g_initialized       = true;
 

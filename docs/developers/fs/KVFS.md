@@ -1,4 +1,4 @@
-# KVFS  -  Kernel Virtual Filesystem
+# KVFS - Kernel Virtual Filesystem
 
 `src/fs/kvfs.cpp` and `kvfs.h` implement the in-memory virtual filesystem that is the primary storage mechanism in Kurono.
 
@@ -45,7 +45,7 @@ KVFS uses a **single canonical tree rooted at `/kurono`** plus a thin **compat-s
     ├── apps/      installed native kurono apps (bin, lib)
     ├── user/      all user data (home/user/{Desktop,Documents,...}, shared)
     ├── packages/  kpkg state
-    ├── runtime/   live state (proc, dev, tmp, sockets)  -  conceptually cleared on boot
+    ├── runtime/   live state (proc, dev, tmp, sockets) - conceptually cleared on boot
     └── var/{log,lib,updates,state}
 
 compat symlinks at the root (resolved through intermediate components):
@@ -64,10 +64,10 @@ The shell commands, the desktop icon system, the config system, the dynamic link
 
 ## 4. Persistence
 
-KVFS persists across reboots through **KFS**, a real on-disk filesystem (see [KFS.md](KFS.md)), via `PersistStore::SaveTree` / `LoadTree` (`src/fs/persist.cpp`). On a clean shutdown / reboot  -  and on demand via the `persisttest` shell command  -  `SaveTree` formats a fresh KFS volume on the NVMe data disk and **mirrors the user-data subtrees (`/home`, `/etc`, `/root`) into it as real files + directories**. At boot, `LoadTree` mounts the volume and walks it back into KVFS, before the boot seeding re-fills the large `/usr` binaries.
+KVFS persists across reboots through **KFS**, a real on-disk filesystem (see [KFS.md](KFS.md)), via `PersistStore::SaveTree` / `LoadTree` (`src/fs/persist.cpp`). On a clean shutdown / reboot - and on demand via the `persisttest` shell command - `SaveTree` formats a fresh KFS volume on the NVMe data disk and **mirrors the user-data subtrees (`/home`, `/etc`, `/root`) into it as real files + directories**. At boot, `LoadTree` mounts the volume and walks it back into KVFS, before the boot seeding re-fills the large `/usr` binaries.
 
 As of the KFS **v2** (extent-based) overhaul the old per-file size cap
-(`KFS_MAX_FILE`) is **gone**  -  `SaveTree` now mirrors whatever KVFS holds, limited
+(`KFS_MAX_FILE`) is **gone** - `SaveTree` now mirrors whatever KVFS holds, limited
 only by free disk space (see [KFS.md](KFS.md) §10). The re-seeded `/usr` binaries
 are still skipped on save because the boot seeding re-creates them, not because of
 a size limit. Because the snapshot is a real filesystem, a future `kfs-fuse`
@@ -80,12 +80,12 @@ longer the path persistence takes.)
 | Limitation | Note |
 | --- | --- |
 | Permissions advisory | POSIX-style mode bits are stored, but the single-address-space kernel does not yet enforce them across all callers |
-| No hard links | Path is the only way to identify a file (symlinks *are* supported  -  see §3) |
+| No hard links | Path is the only way to identify a file (symlinks *are* supported - see §3) |
 | RAM-resident live tree | The live tree lives in RAM, so total live size is bounded by the kernel heap |
 | Selective persistence | The runtime tree is rebuilt fresh each boot, but the user-data subtrees (`/home`, `/etc`, `/root`) persist across reboot through KFS (§4); the re-seeded `/usr` binaries are regenerated at boot rather than stored. There is no longer a per-file size cap on what persists (the v1 `KFS_MAX_FILE` limit was removed in KFS v2) |
 
 ## 6. Related files
 
-- `src/fs/vfs.cpp`  -  generic VFS layer that routes calls to KVFS or FAT32
-- `src/system/ui_config.cpp`  -  reads `/etc/kurono/ui.conf` from KVFS
-- `src/ui/desktop.cpp`  -  reads/writes `/home/user/Desktop/` entries
+- `src/fs/vfs.cpp` - generic VFS layer that routes calls to KVFS or FAT32
+- `src/system/ui_config.cpp` - reads `/etc/kurono/ui.conf` from KVFS
+- `src/ui/desktop.cpp` - reads/writes `/home/user/Desktop/` entries

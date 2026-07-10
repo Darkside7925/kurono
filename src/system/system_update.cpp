@@ -1,4 +1,4 @@
-//  kurono os  -  boot-time system update screen.  see header for design.
+//  kurono os - boot-time system update screen.  see header for design.
 #include "system_update.h"
 #include "gpu_driver_installer.h"
 #include "../fs/kvfs.h"
@@ -72,7 +72,7 @@ void su_bg() {
         Graphics::FillRect(0, y, g_w, 4, c);
     }
     Graphics::FillRect(0, 0, g_w, 60, 0xFF12121C);
-    FontTTF::DrawString(24, 40, 22.0f, "Kurono OS  -  System Update", 0xFFFFFFFF);
+    FontTTF::DrawString(24, 40, 22.0f, "Kurono OS - System Update", 0xFFFFFFFF);
     Graphics::FillRect(0, 60, g_w, 1, 0xFF5C8AFF);
 }
 

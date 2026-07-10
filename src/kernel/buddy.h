@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  kurono os  -  buddy physical-memory allocator
+//  kurono os - buddy physical-memory allocator
 //
 //  Sits on top of PMM.  Maintains per-order free lists for power-of-two
 //  page-count allocations (4 KB * 2^order).  ORDER_MAX = 11 gives a max
@@ -43,7 +43,7 @@ public:
     static void* AllocBytes(uint64_t bytes);
     static void  FreeBytes(void* ptr, uint64_t bytes);
 
-    // huge-page helpers (2 MB = order 9, 1 GB = order 18  -  out of pool).
+    // huge-page helpers (2 MB = order 9, 1 GB = order 18 - out of pool).
     static void* AllocHugePage();                          // 2 MB
     static void  FreeHugePage(void* ptr);
 

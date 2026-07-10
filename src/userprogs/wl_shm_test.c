@@ -1,4 +1,4 @@
-// minimal raw-protocol wayland wl_shm client  -  proves the kurono compositor's
+// minimal raw-protocol wayland wl_shm client - proves the kurono compositor's
 // shared-memory render path end to end (memfd -> mmap -> SCM_RIGHTS -> wl_shm
 // pool -> buffer -> commit). no libwayland: the wire protocol is hand-rolled so
 // it builds as a tiny static-musl binary the kls runtime can exec. (satoru)
@@ -36,7 +36,7 @@ static void wl_send(uint32_t obj, uint16_t op, const uint32_t* args, int nargs) 
     write(g_fd, m, size);
 }
 
-// wl_registry.bind(name, "iface", version, new_id)  -  the new_id is encoded as
+// wl_registry.bind(name, "iface", version, new_id) - the new_id is encoded as
 // (iface_string, version, id) on the wire. (satoru)
 static void wl_bind(uint32_t name, const char* iface, uint32_t version, uint32_t newid) {
     uint32_t m[64];

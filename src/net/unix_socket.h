@@ -9,9 +9,9 @@
 //   * SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET
 //   * Pathname sockets (bind to /system/run/user/1000/wayland-0 etc.)
 //   * Abstract namespace sockets (sun_path[0] == '\0'; len-prefixed name)
-//   * socketpair()  -  pre-connected pair, used by every fork()ed process
-//   * SCM_RIGHTS  -  file descriptor passing in cmsg control buffers
-//   * SCM_CREDENTIALS  -  peer pid/uid/gid passing
+//   * socketpair() - pre-connected pair, used by every fork()ed process
+//   * SCM_RIGHTS - file descriptor passing in cmsg control buffers
+//   * SCM_CREDENTIALS - peer pid/uid/gid passing
 //
 // Usage from the syscall layer:
 //   int sd = UnixSocket::Create(SOCK_STREAM);
@@ -50,7 +50,7 @@ namespace UnixSocket {
         int      passed_fds[UNIX_MAX_PASSED_FD];
         // when a passed fd is a memfd/shm object, the sender resolves it to the
         // backing here so an in-kernel server (wayland wl_shm) can use the pages
-        // directly  -  a raw client fd number is meaningless to the kernel. (satoru)
+        // directly - a raw client fd number is meaningless to the kernel. (satoru)
         uint64_t passed_shm_base[UNIX_MAX_PASSED_FD];
         uint64_t passed_shm_size[UNIX_MAX_PASSED_FD];
         // when a passed fd is an AF_UNIX socket (firefox's e10s ipc channel sent
@@ -104,13 +104,14 @@ namespace UnixSocket {
     int  GetPeerName(int sd, char* path, int path_len);
     int  GetPeerCred(int sd, Credentials* out);
 
-    // In-kernel server hooks  -  Wayland/PulseAudio/DBus register here so
+    // In-kernel server hooks - Wayland/PulseAudio/DBus register here so
     // they can dispatch protocol traffic without a user-space process.
     void RegisterServer(int sd,
                         ConnectionCallback on_connect,
                         DataCallback       on_data,
                         void*              user);
     int  PendingBytes(int sd);
+    int  PeerPendingBytes(int sd);       // TEMP diag: bytes in the peer's rx ring (satoru)
     bool HasPendingConnection(int sd);   // listen fd has a backlog conn -> POLLIN (satoru)
     int  KernelInject(int sd, const void* buf, int len);  // kernel→client
     // kernel→client with ancillary data (SCM_RIGHTS out of an in-kernel

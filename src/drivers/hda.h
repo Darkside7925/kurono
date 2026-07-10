@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  intel hd audio (hda) controller driver
+//  kurono os - intel hd audio (hda) controller driver
 //  implements intel high definition audio specification for pcm playback
 #include "../kernel/types.h"
 

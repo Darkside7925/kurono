@@ -1,4 +1,4 @@
-//  kurono os  -  settings application implementation
+//  kurono os - settings application implementation
 #include "settings.h"
 #include "../ui/window_manager.h"
 #include "../drivers/graphics.h"
@@ -215,7 +215,7 @@ char SettingsApp::wifi_dialog_ssid[64]  = {0};
 char SettingsApp::wifi_dialog_pass[64]  = {0};
 int  SettingsApp::wifi_dialog_pass_len  = 0;
 
-// schedule resolution change  -  applied between frames by the main loop
+// schedule resolution change - applied between frames by the main loop
 static void RequestResolution(int idx) {
     SettingsApp::pending_resolution_idx = idx;
 }
@@ -260,7 +260,7 @@ static void DoApplyResolution(int idx) {
         return;
     }
 
-    // close all windows first  -  their content areas reference old buffers
+    // close all windows first - their content areas reference old buffers
     WindowManager::CloseAll();
 
     // reset app-level win_id statics so apps can reopen after resolution change
@@ -441,7 +441,7 @@ void SettingsApp::RenderSidebar(int x,int y,int w,int h){
     Graphics::FillRect(x, isel, SIDEBAR_W-1, 28, S_TAB_SEL);
     Graphics::FillRect(x, isel, 3, 28, S_HEADING);
     // while the highlight is still sliding, damage just the sidebar column so the
-    // present stays partial  -  the tab-switch content damage doesn't cover the
+    // present stays partial - the tab-switch content damage doesn't cover the
     // sidebar (it sits left of the content panel). (satoru)
     if (isel != (int)(target_y + 0.5f))
         Graphics::MarkDirty(x, y, SIDEBAR_W, h);
@@ -529,7 +529,7 @@ void SettingsApp::RenderDisplay(int x,int y,int w,int h){
     Graphics::DrawString(x+w-46, ly, ">", S_WHITE, 0xFF000000);
     ly+=26;
 
-    // framebuffer info (wc status  -  important for bare-metal debugging)
+    // framebuffer info (wc status - important for bare-metal debugging)
     {
         Graphics::DrawString(x+12,ly,"FB Cache:",S_TEXT,0xFF000000);
         if (Graphics::IsFramebufferWC()) {
@@ -967,7 +967,7 @@ void SettingsApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
         uint8_t dim = (uint8_t)((1.0f - tab_t) * 200.0f);
         if (dim > 0) Graphics::FillRectAlpha(px, cy, pw, ch, dim, S_BG);
         Graphics::MarkUIDirty();   // keep rendering until the transition settles (satoru)
-        // scope the present to the content panel  -  the tab crossfade only touches
+        // scope the present to the content panel - the tab crossfade only touches
         // this rect, so the wallpaper/taskbar/other windows must not be re-copied
         // to the framebuffer each frame of the transition. (satoru)
         Graphics::MarkDirty(px, cy, pw, ch);
@@ -1165,9 +1165,9 @@ bool SettingsApp::HandleDisplayInput(int rx, int ry, int pw, int ph) {
     ly += 26; // = 90 → monitor hz (read-only, skip)
     ly += 26; // = 116 → max fps selector
 
-    // max fps < > buttons  -  expanded rate options including monitor-detected hz
+    // max fps < > buttons - expanded rate options including monitor-detected hz
     if (ry >= ly && ry < ly + 20) {
-        // build dynamic rate list  -  standard rates + detected monitor hz
+        // build dynamic rate list - standard rates + detected monitor hz
         int rates[8]; int nrates = 0;
         static const int std_rates[] = {30, 60, 75, 120, 144, 165, 240, 360};
         uint32_t mon_hz = Graphics::GetMonitorHz();
@@ -1822,7 +1822,7 @@ bool SettingsApp::HandleUpdatesInput(int rx,int ry,int pw,int ph){
             state.update_status=1;
             return true;
         }
-        // GPU driver install button  -  auto-detect vendor, target Alpine
+        // GPU driver install button - auto-detect vendor, target Alpine
         if(ry>=btn_y && ry<btn_y+28 && rx>=164 && rx<344){
             DetectedGPU v = GpuDriverInstaller::DetectVendor();
             if (v == DGPU_NVIDIA || v == DGPU_AMD){

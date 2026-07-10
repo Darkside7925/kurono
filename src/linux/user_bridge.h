@@ -1,4 +1,4 @@
-//  kurono linux subsystem  -  user bridge
+//  kurono linux subsystem - user bridge
 //  bidirectional user synchronization between supr and linux
 #pragma once
 #include "../kernel/types.h"

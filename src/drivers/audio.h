@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  sound blaster 16 audio driver
+//  kurono os - sound blaster 16 audio driver
 //  supports pcm playback via isa dma + sb16 dsp
 #include "../kernel/types.h"
 
@@ -86,7 +86,7 @@ public:
     // irq handler (called from interrupt)
     static void HandleIRQ();
 
-    // tick  -  maintains playback buffer refilling
+    // tick - maintains playback buffer refilling
     static void Tick();
 
 private:
@@ -96,7 +96,7 @@ private:
     static int  dsp_version;
     static AudioState state;
 
-    // dma buffer  -  must be in low physical memory (<16mb) for isa dma.
+    // dma buffer - must be in low physical memory (<16mb) for isa dma.
     // pointer to a fixed address (0x10000) in conventional memory below the
     // kernel load address (1mb).  the bss lives above the 2 gb heap, far
     // beyond the 16 mb isa dma addressing limit, so a static array won't work.

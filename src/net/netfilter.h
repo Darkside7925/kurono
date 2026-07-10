@@ -13,7 +13,7 @@
 //
 // Each hook holds a list of rules.  A rule is a 5-tuple match + action.
 // Actions: ACCEPT (let it through), DROP (silently discard), REJECT
-// (ICMP unreachable), LOG (record + continue), JUMP (target chain  -  not
+// (ICMP unreachable), LOG (record + continue), JUMP (target chain - not
 // yet implemented).  Default policy per chain is configurable.
 //
 // We support TCP, UDP, ICMP matching plus interface name matching.

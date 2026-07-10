@@ -29,7 +29,7 @@ public:
     int GetWidth();
 
 private:
-    // cache key  -  re-layout when any of these change.
+    // cache key - re-layout when any of these change.
     const char* cached_text = nullptr;
     float       cached_font_size = 0.0f;
     int         cached_max_width = -1;

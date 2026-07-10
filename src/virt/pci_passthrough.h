@@ -1,4 +1,4 @@
-//  kurono os  -  pci device passthrough orchestrator (path b)
+//  kurono os - pci device passthrough orchestrator (path b)
 //
 //  routes a real host pci device (e.g. a discrete nvidia or amd gpu) into
 //  the alpine guest so the upstream linux nvidia/amdgpu .ko can drive
@@ -16,7 +16,7 @@
 //    5. forward the device's host irq into the guest as a virtual
 //       interrupt vector (msi or legacy intx).
 //
-//  this module is a thin orchestrator  -  the actual heavy lifting (iommu
+//  this module is a thin orchestrator - the actual heavy lifting (iommu
 //  page tables, ept mapping, irq registration) lives in iommu.cpp /
 //  ept.cpp / hal.cpp and is invoked from here.
 //
@@ -71,7 +71,7 @@ public:
     static void DumpStatus(char* out, int maxo);
 
     // delivered by hal when a passthrough device's real irq fires
-    //  -  forwards to hypervisor as guest interrupt injection
+    // - forwards to hypervisor as guest interrupt injection
     static void OnHostIRQ(uint8_t host_irq);
 
 private:
@@ -83,7 +83,7 @@ private:
                                  const char* name, uint16_t vendor,
                                  uint16_t device, uint8_t pci_class);
 
-    // guest reads/writes a bar on a passthrough device  -  forward to
+    // guest reads/writes a bar on a passthrough device - forward to
     // the real mmio at host_phys + off (we just identity-mapped it
     // into ept so this should be unreachable from the fast path; this
     // exists for size-probe and unmapped accesses)

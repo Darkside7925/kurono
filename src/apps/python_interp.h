@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  built-in Python 3.x mini interpreter
+//  kurono os - built-in Python 3.x mini interpreter
 //  Subset: int/float/string/list/bool/None, arithmetic, comparisons,
 //  logical ops, indexing, slicing (start:stop), function calls,
 //  print/len/range/str/int/abs/min/max/input/type, assignment,

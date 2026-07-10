@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  windows bridge commands
+//  kurono os - windows bridge commands
 //  nt-style commands operating on kvfs for bare-metal kernel
 
 #include "../shell/shell.h"

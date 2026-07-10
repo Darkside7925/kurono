@@ -1,7 +1,7 @@
 #ifndef KURONO_LD_KURONO_H
 #define KURONO_LD_KURONO_H
 
-// ld-kurono  -  production-grade dynamic linker for Kurono OS
+// ld-kurono - production-grade dynamic linker for Kurono OS
 // ============================================================
 //
 // Built directly into the kernel.  When `execve()` loads an ELF that
@@ -48,14 +48,14 @@
 //
 // Public API
 // ----------
-//   * LdKurono::Init()               -  boot-time global setup
-//   * LdKurono::ExecPIE(...)         -  entry from execve when PT_INTERP
+//   * LdKurono::Init()              - boot-time global setup
+//   * LdKurono::ExecPIE(...)        - entry from execve when PT_INTERP
 //                                     is present in the main binary
-//   * LdKurono::Dlopen(...)          -  runtime library load
-//   * LdKurono::Dlsym(...)           -  symbol lookup
-//   * LdKurono::Dlclose(...)         -  refcount / unload
-//   * LdKurono::Dladdr(...)          -  reverse address lookup
-//   * LdKurono::Dlerror()            -  last error string
+//   * LdKurono::Dlopen(...)         - runtime library load
+//   * LdKurono::Dlsym(...)          - symbol lookup
+//   * LdKurono::Dlclose(...)        - refcount / unload
+//   * LdKurono::Dladdr(...)         - reverse address lookup
+//   * LdKurono::Dlerror()           - last error string
 //
 // All operations are kernel-side and address user processes through
 // KernelVMM::MapPageInAddressSpace; user-mode trampolines for the lazy
@@ -138,18 +138,18 @@ namespace LdKurono {
                  uint64_t* out_rsp);
 
     // ---- runtime API ----------------------------------------------
-    // dlopen  -  returns an opaque handle (>0) or 0 on error.  Call
+    // dlopen - returns an opaque handle (>0) or 0 on error.  Call
     // Dlerror() for details.
     void* Dlopen(Process* proc, const char* file, uint32_t flags);
     int   Dlclose(Process* proc, void* handle);
 
-    // dlsym  -  find `name` in `handle` (or any global lib if handle ==
+    // dlsym - find `name` in `handle` (or any global lib if handle ==
     // RTLD_DEFAULT).  Returns the resolved user-mode address or 0.
     uint64_t Dlsym (Process* proc, void* handle, const char* name);
     uint64_t Dlvsym(Process* proc, void* handle, const char* name,
                     const char* version);
 
-    // dladdr  -  `addr` must be a user-mode address inside one of the
+    // dladdr - `addr` must be a user-mode address inside one of the
     // process's loaded libraries.  Fills out the dl_info-style fields.
     struct DlInfo {
         const char* dli_fname;   // pathname of object
@@ -159,7 +159,7 @@ namespace LdKurono {
     };
     bool Dladdr(Process* proc, uint64_t addr, DlInfo* out);
 
-    // Last error string  -  thread-local in glibc, here per-process.
+    // Last error string - thread-local in glibc, here per-process.
     const char* Dlerror(Process* proc);
 
     // Issue a debug notification that GDB sets a breakpoint on.  Called

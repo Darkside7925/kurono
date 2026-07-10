@@ -1,4 +1,4 @@
-// kurono os  -  h.264 (avc) bitstream metadata parser
+// kurono os - h.264 (avc) bitstream metadata parser
 // =================================================================
 // parses just enough of an h.264 elementary stream to expose codec
 // metadata: profile, level, picture width/height, chroma format,
@@ -10,8 +10,8 @@
 // future decoder skip the hand-wavy ffmpeg dance to find slices.
 //
 // supports both wire formats:
-//   * "annex b" byte streams  -  start codes 0x000001 / 0x00000001
-//   * "avcC" length-prefixed format used inside mp4  -  1/2/3/4-byte
+//   * "annex b" byte streams - start codes 0x000001 / 0x00000001
+//   * "avcC" length-prefixed format used inside mp4 - 1/2/3/4-byte
 //     length fields followed by the nal payload
 //
 // integer-only, freestanding-clean.

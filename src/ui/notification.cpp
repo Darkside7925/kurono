@@ -3,7 +3,7 @@
 #include "../drivers/graphics.h"
 #include "../drivers/timer.h"
 
-// fixed storage  -  no heap, lives in bss. (satoru)
+// fixed storage - no heap, lives in bss. (satoru)
 NotificationManager::Toast NotificationManager::toasts[NotificationManager::MAX_TOASTS];
 bool NotificationManager::initialized = false;
 

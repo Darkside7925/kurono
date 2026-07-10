@@ -67,7 +67,7 @@ public:
     // boot-time persistence: bring up the nvme data disk and mount its raw ext4
     // (whole-disk, offset 0) so kvfs.img save/restore works on a normal boot, not
     // just after an install. returns true if an ext4 data disk is now mounted.
-    // safe to call when none is present  -  it just returns false. (satoru)
+    // safe to call when none is present - it just returns false. (satoru)
     static bool MountDataDisk();
 
     static void RegisterShellCommands(void* shell);

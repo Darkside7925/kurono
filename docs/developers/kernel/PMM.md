@@ -34,6 +34,6 @@ The PMM does not zero pages before returning them. If a caller needs zeroed memo
 
 ## 6. Related files
 
-- `src/kernel/heap.cpp`  -  heap built on top of PMM
-- `src/kernel/vmm.cpp`  -  virtual address mapping that uses PMM pages
-- `src/kernel/kurono_kernel.cpp`  -  initialization order
+- `src/kernel/heap.cpp` - heap built on top of PMM
+- `src/kernel/vmm.cpp` - virtual address mapping that uses PMM pages
+- `src/kernel/kurono_kernel.cpp` - initialization order

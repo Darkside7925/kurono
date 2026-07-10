@@ -1,5 +1,5 @@
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Kurono OS  -  64-bit Bootloader (x86_64 Long Mode)
+;  Kurono OS - 64-bit Bootloader (x86_64 Long Mode)
 ;  Multiboot2 + Multiboot1 → Protected Mode → Long Mode trampoline
 ;
 ;  Flow:
@@ -10,8 +10,8 @@
 ;    5. Clear BSS, call kernel_main(magic, mb_info_addr)
 ;
 ;  Two multiboot headers are present:
-;    • Multiboot2  -  preferred by GRUB on UEFI (much better EFI trampoline)
-;    • Multiboot1  -  fallback for BIOS GRUB and QEMU "-kernel" direct load
+;    • Multiboot2 - preferred by GRUB on UEFI (much better EFI trampoline)
+;    • Multiboot1 - fallback for BIOS GRUB and QEMU "-kernel" direct load
 ;
 ;  Serial debug markers (COM1 @ 115200 8N1):
 ;    K0 = _start reached, serial initialised
@@ -51,7 +51,7 @@ COM1         equ  0x3F8
 NUM_PDS      equ  512             ; 512 GB identity map
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Serial output helper  -  works in both [BITS 32] and [BITS 64] modes
+;  Serial output helper - works in both [BITS 32] and [BITS 64] modes
 ;  Clobbers: AL, DX
 ; ═══════════════════════════════════════════════════════════════════════════
 %macro SERIAL_CHAR 1
@@ -66,7 +66,7 @@ NUM_PDS      equ  512             ; 512 GB identity map
 %endmacro
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Multiboot2 Header  -  preferred for UEFI GRUB
+;  Multiboot2 Header - preferred for UEFI GRUB
 ;  Must be 8-byte aligned and within first 32 KiB of the image.
 ; ═══════════════════════════════════════════════════════════════════════════
 section .mboot
@@ -132,7 +132,7 @@ mb2_hdr_start:
 mb2_hdr_end:
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Multiboot1 Header  -  fallback for BIOS GRUB and QEMU "-kernel"
+;  Multiboot1 Header - fallback for BIOS GRUB and QEMU "-kernel"
 ;  Must be within first 8 KiB of the image.
 ; ═══════════════════════════════════════════════════════════════════════════
 align 4
@@ -140,7 +140,7 @@ mb1_header:
     dd  MB1_MAGIC
     dd  MB1_FLAGS
     dd  MB1_CHECKSUM
-    ; ── Address fields (unused  -  GRUB uses ELF headers) ──
+    ; ── Address fields (unused - GRUB uses ELF headers) ──
     dd 0, 0, 0, 0, 0
     ; ── VBE mode request (VIDEO flag set) ──
     dd  0                               ; mode_type: 0 = linear graphics
@@ -154,11 +154,11 @@ mb1_header:
 section .rodata
 align 16
 gdt64:
-    dq  0                               ; 0x00  -  null descriptor
+    dq  0                               ; 0x00 - null descriptor
 .code: equ $ - gdt64
-    dq  0x00AF9A000000FFFF              ; 0x08  -  64-bit code (L=1 D=0 P=1 DPL=0)
+    dq  0x00AF9A000000FFFF              ; 0x08 - 64-bit code (L=1 D=0 P=1 DPL=0)
 .data: equ $ - gdt64
-    dq  0x00CF92000000FFFF              ; 0x10  -  data        (G=1 DB=1 P=1 DPL=0)
+    dq  0x00CF92000000FFFF              ; 0x10 - data        (G=1 DB=1 P=1 DPL=0)
 gdt64_end:
 
 ; 32-bit GDT pointer (used before we switch to long mode)
@@ -174,7 +174,7 @@ gdt64_ptr64:
     dq  gdt64                           ; full 64-bit base address
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Page Tables  -  in .boot_tables (lives INSIDE .bss LOAD segment via linker
+;  Page Tables - in .boot_tables (lives INSIDE .bss LOAD segment via linker
 ;  script, but AFTER kernel_bss_end so BSS zeroing won't clobber them)
 ; ═══════════════════════════════════════════════════════════════════════════
 section .boot_tables nobits alloc write
@@ -186,13 +186,13 @@ global pd_tables                        ; exported so C code can remap FB pages
 pd_tables:      resb 4096 * NUM_PDS     ; NUM_PDS Page Directories → NUM_PDS GB (512)
 ; EFI path only: 3 extra PDPTs of 1 GiB pages for PML4[1..3], extending the
 ; identity map to 2 TiB so high GOP framebuffers (e.g. ~1 TiB at 0xFA10000000
-; on some laptops) are mapped  -  the 512 GB PD map above does not reach them. (satoru)
+; on some laptops) are mapped - the 512 GB PD map above does not reach them. (satoru)
 alignb 4096
 global efi_hi_pdpts                      ; exported so graphics.cpp can set WC on the 1 GiB FB page
 efi_hi_pdpts:   resb 4096 * 3
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  Stack  -  in .stk (zeroed with BSS, that's fine)
+;  Stack - in .stk (zeroed with BSS, that's fine)
 ; ═══════════════════════════════════════════════════════════════════════════
 section .stk nobits alloc write
 align 16
@@ -201,7 +201,7 @@ stack_bottom:
 stack_top:
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  32-bit Entry Point  -  Multiboot hands control here
+;  32-bit Entry Point - Multiboot hands control here
 ;  State: 32-bit PM, flat 4 GB segments, paging OFF, A20 enabled,
 ;         EAX = magic, EBX = info pointer, IF=0 (interrupts disabled)
 ; ═══════════════════════════════════════════════════════════════════════════
@@ -215,7 +215,7 @@ extern kernel_bss_end
 _start:
     ; ── CRITICAL: Disable all interrupt sources immediately ──
     cli
-    cld                                     ; DF is UNDEFINED per MB spec  -  MUST clear
+    cld                                     ; DF is UNDEFINED per MB spec - MUST clear
                                             ; or rep stosq later zeroes BSS backwards!
 
     ; ── Save multiboot registers FIRST (before any AL-clobbering I/O) ──
@@ -224,7 +224,7 @@ _start:
     mov esi, eax                        ; ESI ← magic  (UNCORRUPTED)
     mov edi, ebx                        ; EDI ← info pointer
 
-    ; ── Set up a valid stack IMMEDIATELY  -  ESP is UNDEFINED per MB spec ──
+    ; ── Set up a valid stack IMMEDIATELY - ESP is UNDEFINED per MB spec ──
     ;    pushfd/popfd in the CPUID check below will fault if ESP is garbage.
     ;    .stk is inside the BSS LOAD segment, so GRUB already allocated RAM.
     mov esp, stack_top
@@ -237,7 +237,7 @@ _start:
     in al, 0x71                         ; Dummy read completes CMOS cycle
 
     ; ══════════════════════════════════════════════════════════════════════
-    ;  Initialise COM1 serial port  -  earliest possible debug channel.
+    ;  Initialise COM1 serial port - earliest possible debug channel.
     ;  115200 baud 8N1.  Works even when display shows nothing.
     ; ══════════════════════════════════════════════════════════════════════
     mov dx, COM1 + 1                    ; Interrupt Enable Register
@@ -262,14 +262,14 @@ _start:
     mov al, 0x03
     out dx, al                          ; DTR + RTS
 
-    ; ── Serial "K0\r\n"  -  _start reached, serial ready ──
+    ; ── Serial "K0\r\n" - _start reached, serial ready ──
     SERIAL_CHAR 'K'
     SERIAL_CHAR '0'
     SERIAL_CHAR 0x0D
     SERIAL_CHAR 0x0A
 
     ; ══════════════════════════════════════════════════════════════════════
-    ;  PC SPEAKER BEEP  -  audible proof-of-life, works on all PCs.
+    ;  PC SPEAKER BEEP - audible proof-of-life, works on all PCs.
     ;  No serial cable, no monitor, no framebuffer needed.
     ;  ~1000 Hz for ~200ms.
     ; ══════════════════════════════════════════════════════════════════════
@@ -310,7 +310,7 @@ _start:
     ; ══════════════════════════════════════════════════════════════════════
     ;  EARLY FRAMEBUFFER TEST (32-bit, pre-paging)
     ;  Works for BOTH Multiboot1 AND Multiboot2.
-    ;  On UEFI, VGA 0xB8000 is invisible  -  the framebuffer is the ONLY
+    ;  On UEFI, VGA 0xB8000 is invisible - the framebuffer is the ONLY
     ;  way to get visible output.  This is critical for debugging.
     ; ══════════════════════════════════════════════════════════════════════
 
@@ -365,7 +365,7 @@ _start:
 
 .do_early_fb_fill:
     ; EBX = framebuffer physical address (below 4 GB)
-    ; Write bright-magenta pixels  -  ~2 scanlines at 1024×32bpp
+    ; Write bright-magenta pixels - ~2 scanlines at 1024×32bpp
     SERIAL_CHAR 'F'
     SERIAL_CHAR 'B'
     mov ecx, 8000
@@ -417,7 +417,7 @@ _start:
     jmp .no_lm_halt
 
 .cpuid_ok:
-    ; ── Serial "K1\r\n"  -  pre-paging init complete ──
+    ; ── Serial "K1\r\n" - pre-paging init complete ──
     SERIAL_CHAR 'K'
     SERIAL_CHAR '1'
     SERIAL_CHAR 0x0D
@@ -484,7 +484,7 @@ _start:
     dec ecx
     jnz .fill_pd
 
-    ; ── Serial "K2\r\n"  -  page tables built ──
+    ; ── Serial "K2\r\n" - page tables built ──
     SERIAL_CHAR 'K'
     SERIAL_CHAR '2'
     SERIAL_CHAR 0x0D
@@ -501,7 +501,7 @@ _start:
     SERIAL_CHAR 0x0D
     SERIAL_CHAR 0x0A
 
-    ; ── Enable PAE (CR4 bit 5)  -  MUST come before CR3 per Intel SDM §9.8.5 ──
+    ; ── Enable PAE (CR4 bit 5) - MUST come before CR3 per Intel SDM §9.8.5 ──
     mov eax, cr4
     or  eax, CR4_PAE
     mov cr4, eax
@@ -528,7 +528,7 @@ _start:
     jmp 0x08:long_mode_entry
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  64-bit Entry Point  -  CPU is now in Long Mode
+;  64-bit Entry Point - CPU is now in Long Mode
 ; ═══════════════════════════════════════════════════════════════════════════
 [BITS 64]
 long_mode_entry:
@@ -591,7 +591,7 @@ long_mode_entry:
     mov dword [0xB8000], 0x0F4B0F34    ; VGA "K4"
     wbinvd
 
-    ; ── Call kernel_main(magic, mb_addr)  -  System V AMD64 ABI ──
+    ; ── Call kernel_main(magic, mb_addr) - System V AMD64 ABI ──
     mov rdi, r8                         ; arg1 = magic
     mov rsi, r9                         ; arg2 = mb_addr
     call kernel_main
@@ -603,7 +603,7 @@ long_mode_entry:
     jmp .hang
 
 ; ═══════════════════════════════════════════════════════════════════════════
-;  64-bit EFI Entry Point  -  used on UEFI x86_64 when MB2 tags 7+9 present
+;  64-bit EFI Entry Point - used on UEFI x86_64 when MB2 tags 7+9 present
 ;
 ;  GRUB stays in 64-bit long mode and jumps here directly, completely
 ;  bypassing the fragile relocator (64→32 mode switch) that crashes on
@@ -637,7 +637,7 @@ _start_efi64:
     out 0x70, al
     in al, 0x71
 
-    ; ── Initialise COM1 (115200 8N1)  -  same as 32-bit path ──
+    ; ── Initialise COM1 (115200 8N1) - same as 32-bit path ──
     mov dx, COM1 + 1
     xor al, al
     out dx, al
@@ -660,7 +660,7 @@ _start_efi64:
     mov al, 0x03
     out dx, al
 
-    ; ── Serial "K0\r\n" + "EFI64\r\n"  -  identify entry path ──
+    ; ── Serial "K0\r\n" + "EFI64\r\n" - identify entry path ──
     SERIAL_CHAR 'K'
     SERIAL_CHAR '0'
     SERIAL_CHAR 0x0D
@@ -854,7 +854,7 @@ _start_efi64:
     mov fs, ax
     mov gs, ax
 
-    ; ── ESI = magic, EDI = info pointer  -  preserved from the top ──
+    ; ── ESI = magic, EDI = info pointer - preserved from the top ──
     ;    Jump into the shared 64-bit path for SSE, PAT, stack, BSS,
     ;    serial K4/K5, and kernel_main.
     jmp long_mode_entry

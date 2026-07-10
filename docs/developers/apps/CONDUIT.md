@@ -1,12 +1,12 @@
 # Conduit
 
 `src/system/conduit.cpp` and `src/system/conduit.h` implement Conduit. (Note:
-Conduit lives entirely under `src/system/`  -  there is no `src/apps/conduit.*`.)
+Conduit lives entirely under `src/system/` - there is no `src/apps/conduit.*`.)
 
 ## 1. What Conduit is
 
 Conduit is an **event / telemetry bridge** (`ConduitBridge`) plus the GUI viewer
-that displays its events. It is not a guest terminal  -  it observes the live
+that displays its events. It is not a guest terminal - it observes the live
 system and surfaces a running dialogue of what's happening: boot/shutdown,
 package operations, GPU rendering, guest-OS switches, driver activity, and
 generic shell commands.
@@ -38,7 +38,7 @@ profile, and a short summary/detail. The event types (`ConduitEventType` in
 
 ## 4. Related files
 
-- `src/system/conduit.cpp` / `.h`  -  `ConduitBridge` event ring + classifier
-- `src/virt/hypervisor.cpp`  -  guest boot state polled for `GUEST_SWITCH` events
-- `src/packages/pkgmgr.cpp`  -  package operations that produce package events
-- `src/shell/shell.cpp`  -  calls `RecordCommand` to log executed commands
+- `src/system/conduit.cpp` / `.h` - `ConduitBridge` event ring + classifier
+- `src/virt/hypervisor.cpp` - guest boot state polled for `GUEST_SWITCH` events
+- `src/packages/pkgmgr.cpp` - package operations that produce package events
+- `src/shell/shell.cpp` - calls `RecordCommand` to log executed commands

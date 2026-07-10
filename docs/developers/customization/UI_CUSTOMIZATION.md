@@ -4,7 +4,7 @@ This document explains how to customize the Kurono OS visual appearance at runti
 
 ## 1. How customization works
 
-All visual properties  -  colors, sizes, toggles  -  are stored in a plain text file at `/etc/kurono/ui.conf` inside the KVFS filesystem. The file is read at boot and can be reloaded at any time without restarting.
+All visual properties - colors, sizes, toggles - are stored in a plain text file at `/etc/kurono/ui.conf` inside the KVFS filesystem. The file is read at boot and can be reloaded at any time without restarting.
 
 After making changes to the config file, apply them with:
 
@@ -30,10 +30,10 @@ The config file is self-documenting. Every key is listed with its default value 
 
 All color values use `0xAARRGGBB` hexadecimal:
 
-- `AA`  -  alpha (FF = fully opaque)
-- `RR`  -  red component
-- `GG`  -  green component
-- `BB`  -  blue component
+- `AA` - alpha (FF = fully opaque)
+- `RR` - red component
+- `GG` - green component
+- `BB` - blue component
 
 Example: `0xFF5C8AFF` is fully opaque blue-purple.
 
@@ -95,7 +95,7 @@ taskmgr.allow_kill = 0
 
 ### Retheme via KSS theme tokens
 The KSS styling layer reads a `theme.*` token set from the same file (these keys
-aren't in the generated default  -  add them to override the built-in theme):
+aren't in the generated default - add them to override the built-in theme):
 ```
 theme.bg      = 0xFF101014
 theme.surface = 0xFF1E1E24
@@ -128,5 +128,5 @@ The system will write a fresh default config file on the next reload.
 
 ## 7. Related documentation
 
-- `system/UI_CONFIG.md`  -  full technical reference for the UIConfig module
-- `shell/SHELL.md`  -  `kurono` command documentation
+- `system/UI_CONFIG.md` - full technical reference for the UIConfig module
+- `shell/SHELL.md` - `kurono` command documentation

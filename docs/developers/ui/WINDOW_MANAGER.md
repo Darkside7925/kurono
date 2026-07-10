@@ -58,5 +58,5 @@ All mouse events pass through the WM before reaching desktop icons. The WM check
 
 ## 7. Related files
 
-- `src/ui/desktop.cpp`  -  calls WM render and input from within DesktopEnvironment
-- `src/ui/gui.cpp`  -  drawing primitives available to all applications inside their content region
+- `src/ui/desktop.cpp` - calls WM render and input from within DesktopEnvironment
+- `src/ui/gui.cpp` - drawing primitives available to all applications inside their content region

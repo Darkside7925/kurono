@@ -3,7 +3,7 @@
 #include "../drivers/serial.h"
 #include "../proc/spinlock.h"
 
-//  KMemX pool allocator  -  see kmemx_pool.h. (satoru)
+//  KMemX pool allocator - see kmemx_pool.h. (satoru)
 //
 //  each 2mb chunk is an independent heap managed by an intrusive singly-linked
 //  free-list, sorted by address so coalescing on free is O(n) over free blocks
@@ -62,7 +62,7 @@ uint64_t Reserve(uint64_t want_bytes) {
     uint64_t f;
     g_lock.LockIrqSave(&f);
     if (g_chunk_count == 0) {
-        // first reservation  -  allocate chunks. (satoru)
+        // first reservation - allocate chunks. (satoru)
         uint32_t want_chunks = (uint32_t)((want_bytes + CHUNK_BYTES - 1) / CHUNK_BYTES);
         if (want_chunks == 0) want_chunks = 1;
         if (want_chunks > MAX_CHUNKS) want_chunks = MAX_CHUNKS;
@@ -171,7 +171,7 @@ void Free(uint32_t pool_off, uint32_t n) {
     Chunk& c = g_chunks[chunk_idx];
 
     // the actual block size: if Alloc consumed a whole block (slack < header),
-    // `need` may understate it, but coalescing tolerates that  -  we always
+    // `need` may understate it, but coalescing tolerates that - we always
     // reinsert exactly `need` and let neighbour-merge absorb adjacency. to stay
     // exact, clamp need so the block never overruns the chunk. (satoru)
     if (intra + need > CHUNK_BYTES) need = (uint32_t)CHUNK_BYTES - intra;

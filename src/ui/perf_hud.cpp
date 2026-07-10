@@ -11,7 +11,7 @@ namespace PerfHUD {
 // visibility flag; hidden by default. (satoru)
 static bool hud_visible = false;
 
-// hud colors  -  opaque dark panel to match this codebase's style. (satoru)
+// hud colors - opaque dark panel to match this codebase's style. (satoru)
 #define HUD_BG       0xFF101418       // panel background (satoru)
 #define HUD_BORDER   0xFF2A3138       // 1px frame (satoru)
 #define HUD_ACCENT   0xFF3A7BD5       // header bar (satoru)

@@ -18,9 +18,9 @@ The display manager abstracts away the differences between display backends. It 
 
 The display manager tries backends in this order:
 
-1. **VirtIO GPU**  -  if detected via `VirtIOGPU::IsDetected()`, provides 2D resource management and scanout. This is the highest quality path in VMs.
-2. **BGA**  -  Bochs Graphics Adapter fallback for QEMU/Bochs via `BGA::IsAvailable()`.
-3. **Native**  -  Intel, NVIDIA, or AMD based on GPU probe primary GPU selection. The backend is classified from the detected GPU vendor ID.
+1. **VirtIO GPU** - if detected via `VirtIOGPU::IsDetected()`, provides 2D resource management and scanout. This is the highest quality path in VMs.
+2. **BGA** - Bochs Graphics Adapter fallback for QEMU/Bochs via `BGA::IsAvailable()`.
+3. **Native** - Intel, NVIDIA, or AMD based on GPU probe primary GPU selection. The backend is classified from the detected GPU vendor ID.
 
 ## 3. Mode table
 
@@ -81,10 +81,10 @@ The display manager can enable double buffering via `EnableDoubleBuffering()`. W
 
 ## 9. Related files
 
-- `src/drivers/gpu_probe.cpp`  -  GPU detection for backend classification
-- `src/drivers/graphics.cpp`  -  framebuffer operations and swap path
-- `src/drivers/bga.cpp`  -  BGA driver
-- `src/drivers/virtio_gpu.cpp`  -  VirtIO GPU driver
-- `src/drivers/intel_gpu.cpp`  -  Intel GPU driver
-- `src/drivers/nvidia_gpu.cpp`  -  NVIDIA GPU driver
-- `src/drivers/amd_gpu.cpp`  -  AMD GPU driver
+- `src/drivers/gpu_probe.cpp` - GPU detection for backend classification
+- `src/drivers/graphics.cpp` - framebuffer operations and swap path
+- `src/drivers/bga.cpp` - BGA driver
+- `src/drivers/virtio_gpu.cpp` - VirtIO GPU driver
+- `src/drivers/intel_gpu.cpp` - Intel GPU driver
+- `src/drivers/nvidia_gpu.cpp` - NVIDIA GPU driver
+- `src/drivers/amd_gpu.cpp` - AMD GPU driver

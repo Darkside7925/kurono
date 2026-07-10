@@ -18,7 +18,7 @@ public:
         EaseIn,        // quadratic ease-in (legacy)
         EaseOut,       // quadratic ease-out (legacy)
         EaseInOut,     // quadratic ease-in-out (legacy)
-        EaseOutCubic,  // 1 - (1-t)^3  -  best for "lands softly" reveals
+        EaseOutCubic,  // 1 - (1-t)^3 - best for "lands softly" reveals
         EaseInOutQuint // strong acceleration + deceleration for panel moves
     };
 
@@ -278,7 +278,7 @@ public:
 
     void Draw() override {
         if (!visible) return;
-        // cached on the layout side  -  only re-runs when text/size/width change.
+        // cached on the layout side - only re-runs when text/size/width change.
         layout.Layout(text, font_size, w);
         layout.Draw(x, y, font_size, color, align);
     }

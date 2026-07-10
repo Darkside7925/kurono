@@ -1,4 +1,4 @@
-//  kurono os  -  virtual pci bus for guest vms
+//  kurono os - virtual pci bus for guest vms
 //  emulates pci configuration mechanism #1 (ports 0xcf8/0xcfc) and routes
 //  mmio accesses to per-device callbacks for emulated bars.
 //
@@ -46,7 +46,7 @@ constexpr uint16_t PCI_CMD_MASTER  = 0x0004;
 
 struct VPCIDevice; // fwd
 
-//  bar callbacks  -  invoked when the guest reads/writes within a bar.
+//  bar callbacks - invoked when the guest reads/writes within a bar.
 //  offset is relative to the bar's base address.
 typedef bool (*VPCIBarRead)(VPCIDevice* dev, int bar, uint32_t off,
                              uint8_t size, uint32_t& value);
@@ -85,7 +85,7 @@ struct VPCIDevice {
     const char* name;
 };
 
-//  vpci  -  virtual pci bus singleton
+//  vpci - virtual pci bus singleton
 class VPCI {
 public:
     static void Init();
@@ -95,11 +95,11 @@ public:
     // (size + flags), and the callbacks. base addresses are assigned here.
     static int RegisterDevice(VPCIDevice* dev);
 
-    // ports 0xcf8 / 0xcfc handler  -  returns true if handled
+    // ports 0xcf8 / 0xcfc handler - returns true if handled
     static bool HandlePortIO(uint16_t port, bool is_out, uint8_t size,
                               uint32_t& value);
 
-    // any mmio access in the vpci mmio window  -  returns true if a bar matches
+    // any mmio access in the vpci mmio window - returns true if a bar matches
     static bool HandleMMIO(uint64_t phys_addr, bool is_write, uint8_t size,
                             uint32_t& value);
 

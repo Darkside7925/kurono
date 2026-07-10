@@ -1,4 +1,4 @@
-//  kurono os  -  virtual device emulation implementation
+//  kurono os - virtual device emulation implementation
 //  full emulation of pic, apic, pit, hpet for vm guests
 #include "vdevices.h"
 #include "../drivers/serial.h"
@@ -30,7 +30,7 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
 
     if (is_cmd) {
         if (value & 0x10) {
-            // icw1  -  initialization sequence start
+            // icw1 - initialization sequence start
             icw1 = value;
             init_mode = true;
             icw_step = 1;
@@ -43,7 +43,7 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
             special_mask = false;
             rotate_on_eoi = false;
         } else if (value & 0x08) {
-            // ocw3  -  read irr/isr, set special mask
+            // ocw3 - read irr/isr, set special mask
             if (value & 0x02) {
                 poll_mode = (value & 0x04) != 0;
             }
@@ -51,7 +51,7 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
                 special_mask = (value & 0x20) != 0;
             }
         } else {
-            // ocw2  -  eoi commands
+            // ocw2 - eoi commands
             uint8_t eoi_type = (value >> 5) & 0x07;
             switch (eoi_type) {
                 case 1: // non-specific eoi
@@ -104,12 +104,12 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
         // data port
         if (init_mode) {
             switch (icw_step) {
-                case 1: // icw2  -  vector base
+                case 1: // icw2 - vector base
                     icw2 = value;
                     vector_base = value & 0xF8;
                     icw_step = 2;
                     break;
-                case 2: // icw3  -  cascade
+                case 2: // icw3 - cascade
                     icw3 = value;
                     cascade_mask = value;
                     if (icw1 & 0x01) { // icw4 needed?
@@ -119,7 +119,7 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
                         icw_step = 0;
                     }
                     break;
-                case 3: // icw4  -  mode
+                case 3: // icw4 - mode
                     icw4 = value;
                     auto_eoi = (value & 0x02) != 0;
                     init_mode = false;
@@ -127,7 +127,7 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
                     break;
             }
         } else {
-            // ocw1  -  write imr
+            // ocw1 - write imr
             imr = value;
         }
     }
@@ -137,7 +137,7 @@ uint8_t VirtualPIC::ReadPort(uint16_t port) {
     bool is_cmd = (port & 1) == 0;
 
     if (is_cmd) {
-        // depends on last ocw3 command  -  default to irr
+        // depends on last ocw3 command - default to irr
         if (poll_mode) {
             int irq = GetHighestPriorityIRQ();
             poll_mode = false;
@@ -374,7 +374,7 @@ void VirtualAPIC::SendIPI(uint32_t icr_lo, uint32_t icr_hi) {
     if (shorthand == 1) {
         InjectInterrupt(vector);
     }
-    // delivery mode 5 = init, 6 = sipi  -  used for ap startup
+    // delivery mode 5 = init, 6 = sipi - used for ap startup
 }
 
 void VirtualAPIC::InjectInterrupt(uint8_t vector) {
@@ -591,7 +591,7 @@ void VirtualPIT::Tick(uint32_t elapsed_us) {
             }
 
             default:
-                // modes 1, 4, 5  -  simplified
+                // modes 1, 4, 5 - simplified
                 if (c.counter > pit_ticks) {
                     c.counter -= pit_ticks;
                 } else {
@@ -818,7 +818,7 @@ bool VirtualDevices::HandlePortIO(uint16_t port, bool is_out, uint8_t size,
         return true;
     }
 
-    // elcr (edge/level control register)  -  ports 0x4d0-0x4d1
+    // elcr (edge/level control register) - ports 0x4d0-0x4d1
     if (port == 0x4D0) {
         if (is_out) master_pic.elcr = (uint8_t)value;
         else value = master_pic.elcr;
@@ -830,7 +830,7 @@ bool VirtualDevices::HandlePortIO(uint16_t port, bool is_out, uint8_t size,
         return true;
     }
 
-    // port 0x61  -  system control port (pit channel 2 gate, speaker)
+    // port 0x61 - system control port (pit channel 2 gate, speaker)
     if (port == 0x61) {
         if (is_out) {
             pit.channels[2].gate = (value & 0x01) != 0;
@@ -850,7 +850,7 @@ bool VirtualDevices::HandleMMIO(uint64_t phys_addr, bool is_write,
                                  uint8_t size, uint32_t& value) {
     (void)size;
 
-    // apic  -  0xfee00000 to 0xfee00fff
+    // apic - 0xfee00000 to 0xfee00fff
     if (phys_addr >= VAPIC_BASE_ADDR && phys_addr < VAPIC_BASE_ADDR + 0x1000) {
         uint32_t offset = (uint32_t)(phys_addr - VAPIC_BASE_ADDR);
         offset &= ~0x0F; // align to 16 bytes
@@ -859,7 +859,7 @@ bool VirtualDevices::HandleMMIO(uint64_t phys_addr, bool is_write,
         return true;
     }
 
-    // hpet  -  0xfed00000 to 0xfed003ff
+    // hpet - 0xfed00000 to 0xfed003ff
     if (phys_addr >= HPET_BASE_ADDR && phys_addr < HPET_BASE_ADDR + HPET_REG_SIZE) {
         uint32_t offset = (uint32_t)(phys_addr - HPET_BASE_ADDR);
         if (is_write) hpet.WriteReg(offset, value);

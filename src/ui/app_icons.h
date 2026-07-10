@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  flat vector app icons drawn in code (no external image assets,
+//  kurono os - flat vector app icons drawn in code (no external image assets,
 //  since the freestanding stb decoder is unreliable). a single Draw() renders a
 //  tasteful flat glyph into a size x size box using graphics primitives, scaled
 //  by `size` so it stays crisp at both ~30px (taskbar) and ~56px (desktop). the

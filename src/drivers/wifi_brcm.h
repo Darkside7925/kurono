@@ -1,26 +1,26 @@
 #pragma once
-//  kurono os  -  broadcom brcmfmac pcie "full-dongle" wifi radio driver (satoru)
+//  kurono os - broadcom brcmfmac pcie "full-dongle" wifi radio driver (satoru)
 //
 //  this implements the Ieee80211::WifiRadioOps contract for broadcom pcie wifi
-//  chips (bcm4356 / bcm4366 / bcm43602 / bcm4350 / bcm4364 / bcm4378  -  the
+//  chips (bcm4356 / bcm4366 / bcm43602 / bcm4350 / bcm4364 / bcm4378 - the
 //  "full-dongle" parts). broadcom is unlike intel/atheros/realtek: there is no
 //  on-host mac. the chip runs a proprietary arm firmware ("the dongle") and the
 //  host talks to it ONLY over message rings in host-coherent memory plus a small
 //  set of doorbell/mailbox registers. so this driver is, in order: (satoru)
 //
-//    1. backplane bring-up  -  reach the chipcommon + arm cores through the
+//    1. backplane bring-up - reach the chipcommon + arm cores through the
 //       windowed bar0 (the brcmf BAR0_WINDOW config register), read the chip id,
 //       and watchdog-reset the device out of any prior state. (satoru)
-//    2. firmware download  -  copy the firmware blob + an nvram blob into the
+//    2. firmware download - copy the firmware blob + an nvram blob into the
 //       device's on-chip ram, which is directly mapped by bar1 ("tcm"), then
 //       release the arm core and wait for the dongle to publish its shared-ram
 //       address (the "fw is up" handshake). blobs come from the kurono fs at
 //       /system/lib/firmware/brcm/. start() fails cleanly if they are absent. (satoru)
-//    3. msgbuf rings  -  parse the dongle's ring-info out of tcm, allocate the five
+//    3. msgbuf rings - parse the dongle's ring-info out of tcm, allocate the five
 //       common rings (h2d control-submit + rxpost-submit, d2h control-complete +
 //       tx-complete + rx-complete) in host coherent memory, hand their addresses
 //       to the dongle, and ring the hostready doorbell. (satoru)
-//    4. dcmd / iovars  -  every control op (channel, join, key, rssi) is a firmware
+//    4. dcmd / iovars - every control op (channel, join, key, rssi) is a firmware
 //       command (dcmd) marshalled through the control-submit ring with the reply
 //       drained from the control-complete ring. (satoru)
 //
@@ -34,7 +34,7 @@
 //  drains replies but will time out against absent hardware. each such spot is
 //  marked "scaffold:". (satoru)
 //
-//  ref: linux drivers/net/wireless/broadcom/brcm80211/brcmfmac  -  pcie.c (the
+//  ref: linux drivers/net/wireless/broadcom/brcm80211/brcmfmac - pcie.c (the
 //  full-dongle bus + backplane + fw download), chip.c (the soc backplane / chip
 //  id), commonring.c + msgbuf.c (the ring protocol + dcmd), include/brcm_hw_ids.h
 //  (the device table). code below is original kurono; no gpl text copied. (satoru)

@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  kmemx lz4  -  freestanding lz4 block-format codec for the kurono memory
+//  kmemx lz4 - freestanding lz4 block-format codec for the kurono memory
 //  compression engine (KMemX). no libc, no stl, zero heap allocation: the
 //  caller supplies every buffer (the compressor needs a hash-table scratch
 //  region, the decompressor needs none). this is a clean-room implementation

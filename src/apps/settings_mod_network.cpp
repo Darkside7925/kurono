@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: network (satoru)
+//  kurono os - settings module: network (satoru)
 //  detailed network & bluetooth page: live ethernet interface stats, a wi-fi
 //  enable toggle + scan affordance + scanned ssid list, bluetooth controller
 //  binding state + enable toggle, and a small lo/eth0 interface table. radio
@@ -9,7 +9,7 @@
 #include "../linux/linux_drivers.h"
 #include "../system/ui_config.h"
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 static bool s_wifi_enabled = false;   // persisted to net.wifi_enabled (satoru)
 static bool s_bt_enabled   = false;   // persisted to net.bt_enabled (satoru)
 
@@ -194,7 +194,7 @@ static void network_render(int x, int y, int w, int h, int scroll){
         }
     }
 
-    // scanned network list  -  each row is tappable to connect (open networks) or
+    // scanned network list - each row is tappable to connect (open networks) or
     // disconnect (the connected one). (satoru)
     Graphics::DrawString(x, ly, "Available networks:", SettingsUI::COL_HEADING, 0xFF000000);
     ly += 22;
@@ -229,7 +229,7 @@ static void network_render(int x, int y, int w, int h, int scroll){
             }
         } else {
             Graphics::DrawString(x + 12, ly,
-                                 s_wifi_enabled ? "No networks found  -  tap Scan."
+                                 s_wifi_enabled ? "No networks found - tap Scan."
                                                 : "Enable Wi-Fi to scan.",
                                  SettingsUI::COL_DIM, 0xFF000000);
             ly += 20;
@@ -261,7 +261,7 @@ static void network_render(int x, int y, int w, int h, int scroll){
         SettingsUI::Row(x, ly, "Binding:", bt_drv->name);
         ly += 22;
     }
-    // paired/discoverable state  -  no pairing api in this kernel yet. (satoru)
+    // paired/discoverable state - no pairing api in this kernel yet. (satoru)
     SettingsUI::Row(x, ly, "Paired:", "0 devices");
     ly += 22;
     SettingsUI::Row(x, ly, "Discoverable:", s_bt_enabled ? "While panel open" : "Off");
@@ -336,7 +336,7 @@ static bool network_input(int mx, int my, bool click, char key, int scroll){
         else               WiFi::Disable();
         return true;
     }
-    // scan pill (a dropdown widget reused as a button  -  either arrow rescans). (satoru)
+    // scan pill (a dropdown widget reused as a button - either arrow rescans). (satoru)
     {
         int hit = SettingsUI::DropdownHit(ctrl_x + SettingsUI::TOGGLE_W + 12, ly - 1, SCAN_W, mx, my);
         if(hit >= 0){

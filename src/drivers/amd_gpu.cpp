@@ -18,7 +18,7 @@ static void amdgpu_map_bar_window(uint64_t base, uint64_t size) {
     }
 }
 
-//  kurono os  -  amd radeon gpu driver implementation
+//  kurono os - amd radeon gpu driver implementation
 //  real pci scan, bar mapping, register access, display engine init
 
 AmdGPUInfo AmdGPU::info;
@@ -51,7 +51,7 @@ static void _scpy(char* d, const char* s, int m) {
     int i = 0; while (s[i] && i < m-1) { d[i] = s[i]; i++; } d[i] = 0;
 }
 
-//  pci scan  -  find amd gpu
+//  pci scan - find amd gpu
 bool AmdGPU::ScanPCI() {
     for (int bus = 0; bus < 256; bus++) {
         for (int dev = 0; dev < 32; dev++) {
@@ -81,7 +81,7 @@ bool AmdGPU::ScanPCI() {
                 info.function = (uint8_t)func;
                 info.revision = class_reg & 0xFF;
 
-                // BAR0  -  only accept memory BARs. I/O BARs would dereference a port range as memory.
+                // BAR0 - only accept memory BARs. I/O BARs would dereference a port range as memory.
                 uint32_t bar0_lo = pci_read32(bus, dev, func, 0x10);
                 if (bar0_lo & 1) {
                     info.bar0 = 0;
@@ -92,14 +92,14 @@ bool AmdGPU::ScanPCI() {
                         uint32_t bar0_hi = pci_read32(bus, dev, func, 0x14);
                         info.bar0 = ((uint64_t)bar0_hi << 32) | (bar0_lo & 0xFFFFFFF0);
                     }
-                    // size probe  -  restore original value before continuing
+                    // size probe - restore original value before continuing
                     pci_write32(bus, dev, func, 0x10, 0xFFFFFFFF);
                     uint32_t bar0_mask = pci_read32(bus, dev, func, 0x10) & 0xFFFFFFF0;
                     pci_write32(bus, dev, func, 0x10, bar0_lo);
                     info.bar0_size = bar0_mask ? ((uint64_t)(~bar0_mask) + 1) : 0;
                 }
 
-                // BAR2  -  VRAM aperture; same memory/IO check
+                // BAR2 - VRAM aperture; same memory/IO check
                 uint32_t bar2_lo = pci_read32(bus, dev, func, 0x18);
                 if (bar2_lo & 1) {
                     info.vram_bar = 0;
@@ -116,7 +116,7 @@ bool AmdGPU::ScanPCI() {
                 uint32_t want = cmd | 0x06;
                 if (want != cmd) pci_write32(bus, dev, func, 0x04, want);
 
-                // resizable bar capability  -  extended config space, mask 0xFC per spec
+                // resizable bar capability - extended config space, mask 0xFC per spec
                 info.resizable_bar = false;
                 uint8_t cap_ptr = pci_read32(bus, dev, func, 0x34) & 0xFC;
                 int safety = 48;
@@ -292,7 +292,7 @@ int AmdGPU::IdentifyBusWidth(uint16_t did, AmdArch arch) {
 bool AmdGPU::MapBAR() {
     if (info.bar0 == 0) return false;
 
-    // map the bar window before the first register read  -  a high 64-bit bar is
+    // map the bar window before the first register read - a high 64-bit bar is
     // not covered by the boot identity map and would #pf otherwise. (satoru)
     amdgpu_map_bar_window(info.bar0, info.bar0_size);
 
@@ -428,7 +428,7 @@ bool AmdGPU::Init() {
     _scpy(info.chip_name, IdentifyChip(info.device_id), 16);
 
     if (!MapBAR()) {
-        // still mark as detected even without mmio  -  info is valid from pci
+        // still mark as detected even without mmio - info is valid from pci
         info.detected = true;
         DetectVRAM();
         DetectClocks();

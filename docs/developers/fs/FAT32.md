@@ -4,15 +4,15 @@
 
 ## 1. What it does
 
-The FAT32 driver reads and writes FAT32 formatted partitions. It provides a block-device-agnostic interface  -  the underlying block device can be an NVMe drive or a USB mass storage device.
+The FAT32 driver reads and writes FAT32 formatted partitions. It provides a block-device-agnostic interface - the underlying block device can be an NVMe drive or a USB mass storage device.
 
 ## 2. Supported operations
 
-- `Mount(block_device)`  -  parse the FAT32 boot sector and FAT table
-- `ReadFile(path, buf, maxlen)`  -  traverse directory entries and read file clusters
-- `WriteFile(path, buf, len)`  -  allocate clusters and update FAT entries
-- `ListDir(path)`  -  enumerate directory entries
-- `MakeDir(path)`  -  create a directory entry chain
+- `Mount(block_device)` - parse the FAT32 boot sector and FAT table
+- `ReadFile(path, buf, maxlen)` - traverse directory entries and read file clusters
+- `WriteFile(path, buf, len)` - allocate clusters and update FAT entries
+- `ListDir(path)` - enumerate directory entries
+- `MakeDir(path)` - create a directory entry chain
 
 ## 3. Cluster chains
 
@@ -38,5 +38,5 @@ FAT32 LFN (Long File Name) entries are supported for reading. Files with names l
 
 ## 7. Related files
 
-- `src/drivers/nvme.cpp`  -  block device for FAT32
-- `src/fs/vfs.cpp`  -  routes FAT32 requests from VFS
+- `src/drivers/nvme.cpp` - block device for FAT32
+- `src/fs/vfs.cpp` - routes FAT32 requests from VFS

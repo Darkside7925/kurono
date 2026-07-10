@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-#  Kurono OS  -  Linux launcher (KVM).  Linux equivalent of start.ps1. (satoru)
+#  Kurono OS - Linux launcher (KVM).  Linux equivalent of start.ps1. (satoru)
 #  Builds the ISO and boots it in QEMU with a real GTK window.
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -110,7 +110,7 @@ printf "  [+] ISO: %s MB\n" "$(( $(stat -c%s "$RUN_ISO") / 1048576 ))"
 
 # ── qemu args ──
 command -v qemu-system-x86_64 >/dev/null || { echo "  [!] qemu-system-x86_64 not found"; exit 1; }
-[ -e /dev/kvm ] || echo "  [!] /dev/kvm missing  -  falling back to slow TCG emulation"
+[ -e /dev/kvm ] || echo "  [!] /dev/kvm missing - falling back to slow TCG emulation"
 
 VGA="virtio"; [ "$GPU" -eq 0 ] && VGA="std"
 [ "$GPU" -eq 1 ] && echo "  [*] display: virtio-gpu (accelerated)" || echo "  [*] display: std framebuffer"
@@ -140,23 +140,23 @@ if [ "$PERSIST" -eq 1 ]; then
       if "$MKE2FS" -q -F -O ^has_journal,^metadata_csum,^64bit -b 4096 -d "$STAGE" "$KDISK" 2>/dev/null; then
         echo "  [*] persist: created ext4 data disk $KDISK (1G)"
       else
-        echo "  [!] persist: mkfs.ext4 failed  -  disabling persistence"; PERSIST=0
+        echo "  [!] persist: mkfs.ext4 failed - disabling persistence"; PERSIST=0
       fi
       rm -rf "$STAGE"
     else
-      echo "  [!] persist: mkfs.ext4 not found  -  disabling persistence"; PERSIST=0
+      echo "  [!] persist: mkfs.ext4 not found - disabling persistence"; PERSIST=0
     fi
   fi
 fi
 
 QARGS=(
-  # -smp: the old ~8s deadlock under -smp >1 is FIXED  -  it was a scheduler bug,
+  # -smp: the old ~8s deadlock under -smp >1 is FIXED - it was a scheduler bug,
   # not an AP race (the APs never start; no SIPI is sent). the preemptive
   # scheduler + x86_64 SYSCALL-path frame switching resolved it. verified headless:
   # the desktop stays live (differing frames, 0 watchdog hangs, 0 panics) and the
   # pthread test passes under both -smp 2 and -smp 4. note the APs still park in
   # wait-for-sipi, so extra cores are present + stable but the bsp does all the
-  # scheduling  -  true multi-core task execution is still future work. (satoru)
+  # scheduling - true multi-core task execution is still future work. (satoru)
   -machine "$MACHINE" -cpu host -smp "$CPUS"
   -m "$MEM"
   -cdrom "$RUN_ISO"

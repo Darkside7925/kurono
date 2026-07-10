@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  pci configuration space access
+//  kurono os - pci configuration space access
 //  standard x86 pci via i/o ports 0xcf8 / 0xcfc
 #include "types.h"
 #include "io.h"

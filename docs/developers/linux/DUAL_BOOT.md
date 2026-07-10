@@ -31,7 +31,7 @@ The actual Linux boot execution is delegated to `src/virt/linux_boot.cpp`. The d
 
 ## 5. Related files
 
-- `src/virt/linux_boot.cpp`  -  actual guest kernel loader
-- `src/virt/hypervisor.cpp`  -  VM infrastructure
-- `src/linux/kls.cpp`  -  Linux personality for the native shell layer
-- `src/system/conduit.cpp`  -  the Conduit telemetry bridge / app surface
+- `src/virt/linux_boot.cpp` - actual guest kernel loader
+- `src/virt/hypervisor.cpp` - VM infrastructure
+- `src/linux/kls.cpp` - Linux personality for the native shell layer
+- `src/system/conduit.cpp` - the Conduit telemetry bridge / app surface

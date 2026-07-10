@@ -5,6 +5,7 @@
 #include "../fs/kvfs.h"
 #include "../kernel/time.h"
 #include "../drivers/graphics.h"     // framebuffer blit target (satoru)
+#include "../kernel/heap.h"          // per-surface shadow buffers (satoru)
 #include "../drivers/timer.h"        // pit-tick ms timestamps for frame cbs (satoru)
 #include "window_manager.h"          // bridge surfaces to wm windows (satoru)
 #include "../drivers/keyboard.h"     // Key enum -> linux evdev keycode map (satoru)
@@ -67,6 +68,14 @@ inline void clear_obj_ext(Object& o) {
     o.subsurface_parent = 0;
     o.subsurface_x      = 0;
     o.subsurface_y      = 0;
+    // free a stale shadow from a recycled slot (fresh g_clients are bss-zero,
+    // so a garbage pointer is impossible on first use). (satoru)
+    if (o.shadow) KernelHeap::Free(o.shadow);
+    o.shadow        = nullptr;
+    o.shadow_w      = 0;
+    o.shadow_h      = 0;
+    o.shadow_fmt    = 0;
+    o.shadow_filled = false;
 }
 
 void reset_client_state(Client* c, int sd) {
@@ -209,6 +218,10 @@ void destroy_obj(Client* c, uint32_t id) {
     o.wm_window = nullptr;
     o.pending_frame_cb = 0;
     o.damage.valid = false;
+    // release the shadow with the surface (a dead slot may never be reused,
+    // so waiting for clear_obj_ext would leak). (satoru)
+    if (o.shadow) { KernelHeap::Free(o.shadow); o.shadow = nullptr; }
+    o.shadow_w = 0; o.shadow_h = 0; o.shadow_filled = false;
     // Tighten object_high if we just freed the topmost slot.
     while (c->object_high > 1 && !c->objects[c->object_high - 1].in_use) {
         c->object_high--;
@@ -216,7 +229,7 @@ void destroy_obj(Client* c, uint32_t id) {
 }
 
 // Append raw bytes to per-client TX scratch.  Returns false if the buffer
-// would overflow  -  caller flushes and retries.  Header + payload are
+// would overflow - caller flushes and retries.  Header + payload are
 // always written contiguously so we never split an event across two
 // KernelInject calls.
 bool tx_append(Client* c, const uint8_t* data, int len) {
@@ -278,11 +291,11 @@ void send_display_error(Client* c, uint32_t object_id, uint32_t code,
 }
 
 // Push a frame-callback id onto this client's pending ring.  Drops the
-// oldest if full  -  better than allocating.
+// oldest if full - better than allocating.
 void push_frame_cb(Client* c, uint32_t cb_id) {
     int next = (c->frame_cb_head + 1) % WL_MAX_FRAME_CB;
     if (next == c->frame_cb_tail) {
-        // Ring full  -  drop the oldest by advancing tail.  The callback
+        // Ring full - drop the oldest by advancing tail.  The callback
         // object id stays in the client's object table; we just won't
         // ever fire it.  Cheaper than dynamic growth.
         c->frame_cb_tail = (c->frame_cb_tail + 1) % WL_MAX_FRAME_CB;
@@ -434,6 +447,11 @@ void winmap_clear(int win_id) {
 void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
                          int ox = 0, int oy = 0);
 void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin);
+// forward decls: keyboard focus emitters (defined below) so a toplevel can be
+// auto-focused on map - see the note in commit_surface. (satoru)
+void keyboard_enter(Client* c, uint32_t kbd, uint32_t surf);
+void keyboard_leave(Client* c, uint32_t kbd, uint32_t surf);
+Object* find_subsurface_role(Client* c, uint32_t surf_id);   // (satoru)
 
 // wm render callback for bridged wayland windows: repaint the full client
 // buffer into the (already chrome-drawn) content rect so the surface
@@ -450,7 +468,7 @@ void wl_render_thunk(Window* win, int x, int y, int w, int h) {
     if (!surf || surf->iface != WL_SURFACE) return;
     blit_surface_region(c, surf, win, /*use_damage=*/false);
     // a wm repaint refills the whole content rect from the parent buffer, which
-    // would re-cover any subsurface content  -  re-composite children on top.
+    // would re-cover any subsurface content - re-composite children on top.
     // forward-declared below; defined with commit_surface. (satoru)
     blit_child_subsurfaces(c, surf, win);
 }
@@ -557,19 +575,37 @@ void blit_argb(const uint8_t* src, uint32_t stride, int bw, int bh,
 void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
                          int ox, int oy) {
     if (!surf || !win) return;
-    uint32_t bid = surf->pending_buffer_id;
-    if (bid == 0) return;                       // nothing attached
-    Object* buf = find_obj(c, bid);
-    if (!buf || buf->iface != WL_BUFFER) return;
-    int bw = buf->width;
-    int bh = buf->height;
+    // source = the surface's SHADOW when it has one (the accumulated committed
+    // pixels - see update_surface_shadow); the raw pool only as a fallback for
+    // surfaces that predate their first shadow fill. the shadow path deliberately
+    // needs NO live wl_buffer object: once the client has release-events flowing
+    // (gtk) it DESTROYS released buffers, so at wm-repaint time pending_buffer_id
+    // often names a dead object - requiring it made every repaint skip the child
+    // and show the parent's black (the page rendered but never displayed). (satoru)
+    const uint8_t* base; uint32_t psize, sstride, soff, sfmt;
+    int bw, bh;
+    if (surf->shadow && surf->shadow_filled) {
+        bw = surf->shadow_w; bh = surf->shadow_h;
+        base    = surf->shadow;
+        psize   = (uint32_t)bw * (uint32_t)bh * 4u;
+        sstride = (uint32_t)bw * 4u;
+        soff    = 0;
+        sfmt    = surf->shadow_fmt;
+    } else {
+        uint32_t bid = surf->pending_buffer_id;
+        if (bid == 0) return;                   // nothing attached
+        Object* buf = find_obj(c, bid);
+        if (!buf || buf->iface != WL_BUFFER) return;
+        bw = buf->width; bh = buf->height;
+        Object* pool = find_obj(c, buf->buf_pool_id);
+        base  = (pool && pool->iface == WL_SHM_POOL) ? pool->pool_base : nullptr;
+        psize = (pool) ? pool->pool_size : 0;
+        sstride = buf->buf_stride;
+        soff    = buf->buf_offset;
+        sfmt    = buf->buf_format;
+        if (!base) return;                      // no mapping yet - nothing to draw
+    }
     if (bw <= 0 || bh <= 0) return;
-
-    // resolve the pool backing the buffer. (satoru)
-    Object* pool = find_obj(c, buf->buf_pool_id);
-    const uint8_t* base = (pool && pool->iface == WL_SHM_POOL) ? pool->pool_base : nullptr;
-    uint32_t psize = (pool) ? pool->pool_size : 0;
-    if (!base) return;                          // no mapping yet  -  nothing to draw
 
     // content rect = where the client pixels land on screen. (satoru)
     int cx = win->content_x;
@@ -590,16 +626,16 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
     }
     if (dw <= 0 || dh <= 0) return;
 
-    // bound the last byte we would touch against the pool size so a short /
-    // malformed pool can never read out of bounds. (satoru)
-    const uint8_t* src = base + buf->buf_offset
-                       + (size_t)dy * buf->buf_stride
+    // bound the last byte we would touch against the source size so a short /
+    // malformed pool (or a stale shadow) can never read out of bounds. (satoru)
+    const uint8_t* src = base + soff
+                       + (size_t)dy * sstride
                        + (size_t)dx * 4u;
-    size_t last = buf->buf_offset
-                + (size_t)(dy + dh - 1) * buf->buf_stride
+    size_t last = soff
+                + (size_t)(dy + dh - 1) * sstride
                 + (size_t)(dx + dw) * 4u;
-    if (buf->buf_stride < (uint32_t)(dx + dw) * 4u) return;   // malformed stride (satoru)
-    if (last > psize) return;                                 // out-of-bounds pool read (satoru)
+    if (sstride < (uint32_t)(dx + dw) * 4u) return;           // malformed stride (satoru)
+    if (last > psize) return;                                 // out-of-bounds source read (satoru)
 
     // effective alpha = surface alpha combined with the bridged window's
     // wm opacity, so WindowManager::SetAlpha modulates client content too.
@@ -610,7 +646,7 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
     // ox/oy shift the destination for a subsurface composited onto its parent
     // window (0,0 for a normal toplevel). the clip stays the window content rect
     // so a subsurface can't paint outside its parent. (satoru)
-    blit_argb(src, buf->buf_stride, dw, dh, buf->buf_format,
+    blit_argb(src, sstride, dw, dh, sfmt,
               cx + ox + dx, cy + oy + dy,
               cx, cy, cw, ch, (uint8_t)eff);
     if (use_damage) Graphics::MarkDirty(cx + ox + dx, cy + oy + dy, dw, dh);
@@ -640,10 +676,65 @@ void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin) {
         if (!ss.in_use || ss.iface != WL_SUBSURFACE) continue;
         if (ss.subsurface_parent != parent_surf->id) continue;
         Object* child = find_obj(c, ss.parent_surface_id);
-        if (!child || child->pending_buffer_id == 0) continue;
+        // a filled shadow is displayable even when the client has since detached
+        // or DESTROYED the committed wl_buffer (gtk destroys released buffers). (satoru)
+        if (!child) continue;
+        if (child->pending_buffer_id == 0 && !(child->shadow && child->shadow_filled)) continue;
         blit_surface_region(c, child, pwin, /*use_damage=*/false,
                             ss.subsurface_x, ss.subsurface_y);
     }
+}
+
+// copy the freshly-committed pixels (damage region, or the whole buffer on the
+// first fill / a resize) from the client buffer into the surface's SHADOW. the
+// shadow is what every blit reads, so a damage-incremental client - firefox
+// SW-WR attaches a fresh mostly-ZERO buffer each frame with only the damaged
+// strip painted - can never wipe the accumulated picture (the black-firefox
+// bug: full blits of those zero buffers blacked out the window). (satoru)
+void update_surface_shadow(Client* c, Object* surf, Object* buf) {
+    int bw = buf->width, bh = buf->height;
+    if (bw <= 0 || bh <= 0) return;
+    Object* pool = find_obj(c, buf->buf_pool_id);
+    const uint8_t* base = (pool && pool->iface == WL_SHM_POOL) ? pool->pool_base : nullptr;
+    uint32_t psize = pool ? pool->pool_size : 0;
+    if (!base) return;                          // no mapping yet - nothing to copy (satoru)
+
+    // (re)allocate on first use or resize; a resize invalidates old content. (satoru)
+    if (!surf->shadow || surf->shadow_w != bw || surf->shadow_h != bh) {
+        if (surf->shadow) KernelHeap::Free(surf->shadow);
+        surf->shadow = (uint8_t*)KernelHeap::Alloc((size_t)bw * bh * 4u);
+        surf->shadow_w = bw; surf->shadow_h = bh;
+        surf->shadow_filled = false;
+        if (!surf->shadow) { surf->shadow_w = surf->shadow_h = 0; return; }
+    }
+
+    // region to copy: full buffer until the shadow is filled once; after that
+    // honour the damage rect (a damage-less commit copies nothing - per the
+    // protocol it changed nothing). (satoru)
+    int dx = 0, dy = 0, dw = bw, dh = bh;
+    if (surf->shadow_filled) {
+        if (!surf->damage.valid) return;
+        dx = surf->damage.x; dy = surf->damage.y;
+        dw = surf->damage.w; dh = surf->damage.h;
+        if (dx < 0) { dw += dx; dx = 0; }
+        if (dy < 0) { dh += dy; dy = 0; }
+        if (dx + dw > bw) dw = bw - dx;
+        if (dy + dh > bh) dh = bh - dy;
+        if (dw <= 0 || dh <= 0) return;
+    }
+    // bound the source against the pool like the blit does. (satoru)
+    if (buf->buf_stride < (uint32_t)(dx + dw) * 4u) return;
+    size_t last = buf->buf_offset + (size_t)(dy + dh - 1) * buf->buf_stride
+                + (size_t)(dx + dw) * 4u;
+    if (last > psize) return;
+    for (int row = 0; row < dh; row++) {
+        const uint8_t* s = base + buf->buf_offset
+                         + (size_t)(dy + row) * buf->buf_stride + (size_t)dx * 4u;
+        uint8_t* d = surf->shadow + ((size_t)(dy + row) * bw + dx) * 4u;
+        memcpy(d, s, (size_t)dw * 4u);
+    }
+    surf->shadow_fmt    = buf->buf_format;
+    surf->shadow_filled = true;
 }
 
 // apply the surface's currently-attached buffer to its window on commit:
@@ -658,11 +749,22 @@ void commit_surface(Client* c, Object* surf) {
     int bw = buf->width;
     int bh = buf->height;
     if (bw <= 0 || bh <= 0) return;
+    // accumulate this commit's pixels into the shadow BEFORE any blit - all
+    // blits below (and later wm repaints) read the shadow. (satoru)
+    update_surface_shadow(c, surf, buf);
+    // wl_buffer::release (event opcode 0): the shadow now owns the pixels, so the
+    // client may reuse this buffer immediately. WITHOUT this firefox exhausts its
+    // small buffer pool after the FIRST frame and blocks forever waiting for a
+    // free buffer - the frozen-first-frame browser (empty url bar, white content,
+    // stale chrome) while paintCount kept climbing. only safe once the shadow is
+    // filled (blits no longer read the client pool). (satoru)
+    if (surf->shadow_filled)
+        send_event(c, buf->id, 0, nullptr, 0);
 
     // if this surface is a subsurface (firefox's gtk content surface, inset
     // inside the black csd toplevel), composite it ONTO the parent window at
     // its set_position offset instead of giving it its own window behind the
-    // parent  -  that separate-window path is exactly why the content drew but
+    // parent - that separate-window path is exactly why the content drew but
     // the screen stayed black. (satoru)
     Object* role = find_subsurface_role(c, surf->id);
     if (role) {
@@ -678,7 +780,7 @@ void commit_surface(Client* c, Object* surf) {
                 return;
             }
         }
-        // parent not mapped yet  -  fall through to a temporary own-window so the
+        // parent not mapped yet - fall through to a temporary own-window so the
         // content isn't lost; it re-homes onto the parent on the next commit.
         // (satoru)
     }
@@ -688,6 +790,21 @@ void commit_surface(Client* c, Object* surf) {
     if (wid < 0) return;
     Window* win = WindowManager::GetWindow(wid);
     if (!win) { surf->wm_window = nullptr; return; }
+
+    // AUTO-FOCUS this toplevel on map. firefox's CONTENT browsing context only
+    // becomes active - and thus PAINTS (PresShell::ComputeActiveness gates on
+    // bc->IsActive()) - when the window is FOCUSED. a headless boot has no
+    // pointer click to focus it, so grant keyboard focus here (paired with the
+    // xdg_toplevel ACTIVATED state). without it the chrome paints but the web
+    // content viewport stays firefox's blank canvas. gated to real toplevels
+    // (skip the tiny transient own-windows) and fired once per surface. (satoru)
+    if (c->keyboard_id != 0 && c->keyboard_focus_sid != surf->id &&
+        bw > 200 && bh > 200) {
+        if (c->keyboard_focus_sid != 0 && find_obj(c, c->keyboard_focus_sid))
+            keyboard_leave(c, c->keyboard_id, c->keyboard_focus_sid);
+        c->keyboard_focus_sid = surf->id;
+        keyboard_enter(c, c->keyboard_id, surf->id);
+    }
 
     // incremental blit of the damaged region. if no pool mapping exists yet
     // (fd transport not wired) blit_surface_region is a no-op; we still mark
@@ -1067,7 +1184,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
             // the subsurface role, parented to `parent`. gtk uses this for the
             // client-side-decoration surfaces around a firefox toplevel. we don't
             // composite sub-surfaces as a separate layer yet, but the OBJECT must
-            // exist  -  otherwise the client's later wl_subsurface requests hit an
+            // exist - otherwise the client's later wl_subsurface requests hit an
             // "invalid object" protocol error and libwayland aborts (the crash in
             // WlLogHandler right after gtk_widget_show). register the role object +
             // remember which surface it wraps; its commits already blit through the
@@ -1136,7 +1253,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
         case WL_SHM_POOL: {
             if (opcode == 0) {                    // create_buffer
                 // create_buffer(new_id, offset, width, height, stride,
-                // format)  -  no fd here. capture the geometry so commit can
+                // format) - no fd here. capture the geometry so commit can
                 // locate the pixels inside the parent pool. (satoru)
                 if (args_len < 24) return;
                 uint32_t bid    = get32(args);
@@ -1200,11 +1317,20 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 Object* tl = find_obj(c, tid);
                 if (tl) tl->parent_surface_id = obj->parent_surface_id;
                 // xdg_toplevel::configure (opcode 0): width, height, states.
+                // advertise XDG_TOPLEVEL_STATE_ACTIVATED (4) so firefox treats the
+                // window as FOCUSED/ACTIVE. without it the top-level CONTENT
+                // browsing context stays inactive, so PresShell::ComputeActiveness()
+                // returns false and the web content NEVER paints (chrome paints
+                // regardless) - the blank-content-viewport symptom. a headless boot
+                // has no pointer click to focus the window, so the activated state
+                // must come from the configure. states is a wl_array: 4-byte length
+                // then one uint32 entry. (satoru)
                 uint8_t cfg[16];
                 put32(cfg + 0, 1024);
                 put32(cfg + 4, 768);
-                put32(cfg + 8, 0);                // empty states array length
-                send_event(c, tid, 0, cfg, 12);
+                put32(cfg + 8, 4);                // states array = 4 bytes (1 entry)
+                put32(cfg + 12, 4);               // XDG_TOPLEVEL_STATE_ACTIVATED
+                send_event(c, tid, 0, cfg, 16);
                 // xdg_surface::configure (opcode 0): serial.
                 uint8_t srl[4]; put32(srl, c->serial_next++);
                 send_event(c, object_id, 0, srl, 4);
@@ -1290,7 +1416,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 c->keyboard_id = kid;
                 // wl_keyboard.keymap (opcode 0): format=1 (XKB_V1) + an fd +
                 // size. gdk/firefox mmap the fd and compile the keymap to
-                // translate the evdev codes wl_keyboard.key carries  -  without
+                // translate the evdev codes wl_keyboard.key carries - without
                 // it typing produces nothing. the fd travels as ancillary via
                 // KernelInjectMsg: the recvmsg side re-wraps the passed shm
                 // backing (the embedded compiled us keymap) as a real memfd
@@ -1362,7 +1488,7 @@ void on_data(int sd, const uint8_t* data, int len, void* user) {
     while (written < len) {
         int space = (int)sizeof(c->rx_partial) - c->rx_partial_len;
         if (space <= 0) {
-            // Buffer wedged with a partial message that can't fit  -  the
+            // Buffer wedged with a partial message that can't fit - the
             // peer is sending garbage.  Disconnect.
             drop_client(c);
             return;
@@ -1456,7 +1582,7 @@ void Init() {
 int  ListenSd() { return g_listen_sd; }
 
 // Called by the compositor render loop right after the framebuffer
-// flip completes  -  this is the place where wl_callback::done deliveries
+// flip completes - this is the place where wl_callback::done deliveries
 // land closest to vsync, which is what GTK/Qt clients use to throttle
 // their next frame.
 void DispatchPendingFrames() {
@@ -1466,7 +1592,7 @@ void DispatchPendingFrames() {
     for (int i = 0; i < WL_MAX_CLIENTS; i++) {
         Client* c = &g_clients[i];
         if (!c->in_use) continue;
-        // Liveness probe  -  KernelInject returns -1 if the sd has been
+        // Liveness probe - KernelInject returns -1 if the sd has been
         // closed beneath us (no on_disconnect callback exists).
         if (UnixSocket::KernelInject(c->sd, "", 0) < 0) {
             c->in_use = false; c->sd = -1; c->tx_len = 0;

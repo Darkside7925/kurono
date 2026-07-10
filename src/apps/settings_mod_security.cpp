@@ -1,10 +1,10 @@
-//  kurono os  -  settings module: security & users (satoru)
+//  kurono os - settings module: security & users (satoru)
 //  a detailed "Security & Users" page: the current user + role, the full user
 //  roster (UserManager), a sign-in section (auto-login toggle that persists
 //  security.autologin + a lock-screen timeout slider), the live SUPR security
 //  level/status, and the active session count. all persisted writes go through
 //  UIConfig; live identity/role/session data is read from UserManager + SUPR.
-//  the auto-login toggle records intent in UIConfig  -  the actual live mechanism
+//  the auto-login toggle records intent in UIConfig - the actual live mechanism
 //  is the `kurono.autologin` grub boot flag parsed in kurono_kernel.cpp. (satoru)
 #include "system_settings.h"
 #include "../drivers/graphics.h"
@@ -12,7 +12,7 @@
 #include "../system/user_mgmt.h"
 #include "../security/supr.h"
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 static bool s_autologin    = false;  // persisted to security.autologin (satoru)
 static int  s_lock_timeout = 5;      // minutes, persisted to security.lock_timeout_min (satoru)
 static int  s_user_count   = 0;      // UserManager roster size, from on_show (satoru)
@@ -173,7 +173,7 @@ static void security_render(int x, int y, int w, int h, int scroll){
         }
 
         // honest note: creating an account needs a username + password, and this
-        // panel has no text-entry field  -  that flow lives in the Login/Accounts UI.
+        // panel has no text-entry field - that flow lives in the Login/Accounts UI.
         // (UserManager::AddUser/RemoveUser exist but both require typed input.) (satoru)
         Graphics::DrawString(x, ly + 4, "Manage:", SettingsUI::COL_TEXT, 0xFF000000);
         Graphics::DrawString(ctrl_x, ly + 4, "Use the Login screen to add accounts",
@@ -213,12 +213,12 @@ static void security_render(int x, int y, int w, int h, int scroll){
         if(sid >= 0){
             SettingsUI::Row(x, ly, "Privilege:", supr_level_label(SUPR::GetLevel(sid)));
             ly += 22;
-            SettingsUI::Row(x, ly, "Engine:", "SUPR  -  active session");
+            SettingsUI::Row(x, ly, "Engine:", "SUPR - active session");
             ly += 22;
         } else {
             SettingsUI::Row(x, ly, "Privilege:", "Guest (no SUPR session)");
             ly += 22;
-            SettingsUI::Row(x, ly, "Engine:", "SUPR  -  no active session");
+            SettingsUI::Row(x, ly, "Engine:", "SUPR - no active session");
             ly += 22;
         }
         SettingsUI::IntToStr(SUPR::GetUserCount(), buf, 64);

@@ -1,4 +1,4 @@
-; src/userprogs/hello.asm  -  minimal x86_64 user-mode program.
+; src/userprogs/hello.asm - minimal x86_64 user-mode program.
 ;   Uses int 0x80 with i386 syscall numbers, which is the path Kurono's
 ;   kernel currently dispatches through LinuxSyscall::Dispatch.
 ;   The kernel runs user code in 64-bit long mode; 32-bit register

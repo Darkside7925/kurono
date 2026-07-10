@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  terminal emulator v2.0
+//  kurono os - terminal emulator v2.0
 //  improved: tab completion, full ansi colors, blink cursor, more shortcuts
 
 #define TERM_COLS         80

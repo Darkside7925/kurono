@@ -1,4 +1,4 @@
-//  kurono os  -  minimal RIFF/WAV parser (implementation)
+//  kurono os - minimal RIFF/WAV parser (implementation)
 #include "audio_wav.h"
 #include "../kernel/types.h"
 
@@ -67,7 +67,7 @@ ParseResult Parse(const uint8_t* buf, uint32_t len) {
             r.pcm_start = buf + off + 8;
             r.pcm_bytes = size;
             data_found = true;
-            // we can stop now  -  we have everything we need
+            // we can stop now - we have everything we need
             break;
         }
         off += 8 + size;

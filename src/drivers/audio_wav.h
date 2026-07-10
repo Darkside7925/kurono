@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  minimal RIFF/WAV parser
+//  kurono os - minimal RIFF/WAV parser
 //
 //  Supports the canonical PCM subset (format code 1):
 //    * 8-bit unsigned, 16-bit signed, 24-bit signed, 32-bit signed PCM

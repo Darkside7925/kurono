@@ -2,7 +2,7 @@
 #include "../drivers/serial.h"
 #include "audio_dma.h"
 
-//  kurono os  -  ac'97 audio codec driver implementation
+//  kurono os - ac'97 audio codec driver implementation
 //  real pci scan, mixer programming, bdl dma playback
 
 AC97Info AC97::info;
@@ -32,7 +32,7 @@ static int      g_stream_next_fill = 0;   // BDL index we'll write next
 static uint32_t g_stream_queued_bytes = 0;
 // last civ we observed in WriteRingChunk.  used to detect that the dma engine
 // advanced past one or more entries since the last refill so we can zero the
-// stale period(s) it left behind  -  an underrun must produce clean silence, not
+// stale period(s) it left behind - an underrun must produce clean silence, not
 // a replay of old bdl data (which is an audible pop/click). (satoru)
 static int      g_stream_last_civ = 0;
 
@@ -68,7 +68,7 @@ static void pci_wr(uint8_t bus, uint8_t dev, uint8_t func, uint8_t off, uint32_t
     _out32(0xCFC, v);
 }
 
-//  pci scan  -  find ac'97 controller
+//  pci scan - find ac'97 controller
 bool AC97::ScanPCI() {
     for (int bus = 0; bus < 256; bus++) {
         for (int dev = 0; dev < 32; dev++) {
@@ -107,11 +107,11 @@ bool AC97::ScanPCI() {
                 info.controller_vendor = vid;
                 info.controller_device = did;
 
-                // read bar0  -  native audio mixer registers (i/o space)
+                // read bar0 - native audio mixer registers (i/o space)
                 uint32_t bar0 = pci_rd(bus, dev, func, 0x10);
                 info.mixer_base = bar0 & 0xFFFC;  // i/o base
 
-                // read bar1  -  native audio bus master registers
+                // read bar1 - native audio bus master registers
                 uint32_t bar1 = pci_rd(bus, dev, func, 0x14);
                 info.bus_master_base = bar1 & 0xFFFC;
 
@@ -185,9 +185,9 @@ void AC97::ResetCodec() {
 //  bdl (buffer descriptor list) setup
 void AC97::SetupBDL() {
     // Take ownership of two dedicated DMA regions:
-    //   AC97_BDL  region (32 KB)  -  first 256 bytes hold the BDL itself,
+    //   AC97_BDL  region (32 KB) - first 256 bytes hold the BDL itself,
     //                              the rest is reserved scratch.
-    //   AC97_PCM  region (288 KB)  -  the per-buffer 8 KB PCM chunks.
+    //   AC97_PCM  region (288 KB) - the per-buffer 8 KB PCM chunks.
     void* bdl_region = AudioDMA::Acquire(AudioDMA::REGION_AC97_BDL, "ac97-bdl");
     void* pcm_region = AudioDMA::Acquire(AudioDMA::REGION_AC97_PCM, "ac97-pcm");
     if (!bdl_region || !pcm_region) {
@@ -200,7 +200,7 @@ void AC97::SetupBDL() {
         dma_buffer = (uint8_t*)pcm_region;
     }
 
-    // initialize bdl entries  -  each points to an 8 KB chunk.  Total ring
+    // initialize bdl entries - each points to an 8 KB chunk.  Total ring
     // is 32 * 8 KB = 256 KB which fits inside the dedicated AC97 PCM
     // region (288 KB) without overrunning into adjacent allocator areas.
     for (int i = 0; i < AC97_MAX_BDL_ENTRIES; i++) {
@@ -473,7 +473,7 @@ uint32_t AC97::WriteRingChunk(const void* data, uint32_t bytes) {
     // zero every entry the dma engine has *already played* since our last
     // refill (g_stream_last_civ .. civ-1).  the controller cycles the ring, so
     // any consumed-but-unrefilled entry would be replayed verbatim on the next
-    // wrap  -  an audible pop/click of stale period data on every underrun. blank
+    // wrap - an audible pop/click of stale period data on every underrun. blank
     // them to silence so an underrun is clean, not a crackle.  walk forward mod
     // N from last_civ up to (not including) civ; bounded to N iterations so a
     // bogus civ can never spin. N = AC97_MAX_BDL_ENTRIES = 32. (satoru)
@@ -520,7 +520,7 @@ uint32_t AC97::WriteRingChunk(const void* data, uint32_t bytes) {
 
         // Advance LVI to the entry we just filled so the controller will
         // play it.  LVI is the *last valid index* the controller may
-        // dispatch  -  the entry one before next_fill works for a 32-entry
+        // dispatch - the entry one before next_fill works for a 32-entry
         // ring where civ != next_fill.
         BMWrite8(AC97_BM_PCM_OUT + BM_LVI, (uint8_t)filled_idx);
 
@@ -538,7 +538,7 @@ uint32_t AC97::WriteRingChunk(const void* data, uint32_t bytes) {
     // calling StartDMA(). StartDMA() re-arms LVI to the last bdl entry
     // (AC97_MAX_BDL_ENTRIES-1); in streaming mode that makes RingQueuedBytes
     // report an almost-full ring forever, which wedges the mixer's
-    // back-pressure gate (QueuedFrames > 3*PERIOD) permanently shut  -  so after
+    // back-pressure gate (QueuedFrames > 3*PERIOD) permanently shut - so after
     // the very first underrun no further audio is ever mixed. that is the
     // "video/music plays but stays silent" bug. the bdl base is unchanged and
     // we already advanced LVI to the entry we just filled, so just re-arm the
@@ -559,8 +559,8 @@ uint32_t AC97::RingQueuedBytes() {
     // civ up to and including lvi.  that count is (lvi+1-civ) mod N, NOT
     // (lvi-civ) mod N.  the old (lvi-civ+N)%N was off by one and, worse, it
     // BLEW UP after an underrun: once civ wrapped one slot past a stale lvi
-    // (e.g. lvi=8, civ=9) the old math returned (8-9+32)%32 = 31  -  a nearly
-    // full ring (31*4096 = 124 kb)  -  so the mixer's back-pressure gate
+    // (e.g. lvi=8, civ=9) the old math returned (8-9+32)%32 = 31 - a nearly
+    // full ring (31*4096 = 124 kb) - so the mixer's back-pressure gate
     // (QueuedFrames > PERIOD*8) latched shut forever and never refilled again,
     // i.e. audio went silent/crackly and never recovered. with (lvi+1-civ+N)%N
     // the same case returns (8+1-9+32)%32 = 0 (empty) so the mixer resumes
@@ -617,7 +617,7 @@ void AC97::HandleIRQ() {
                         BM_STATUS_BCIS | BM_STATUS_FIFOE));
 }
 
-//  tick  -  poll-based buffer refill
+//  tick - poll-based buffer refill
 void AC97::Tick() {
     if (info.state != AC97_PLAYING) return;
 
@@ -629,7 +629,7 @@ void AC97::Tick() {
     if (status & BM_STATUS_DCH) {
         if (g_stream_live) {
             // Streaming mode: the engine stalled because we under-fed.
-            // Don't reset  -  re-kick once new chunks land.  Clear DCH ack.
+            // Don't reset - re-kick once new chunks land.  Clear DCH ack.
             BMWrite16(AC97_BM_PCM_OUT + BM_STATUS,
                       status & (BM_STATUS_LVBCI | BM_STATUS_BCIS | BM_STATUS_FIFOE));
         } else if (pcm_offset < pcm_length) {

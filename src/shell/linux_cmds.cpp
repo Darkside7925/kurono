@@ -29,7 +29,7 @@
 #include "../virt/alpine_data.h"
 #include "../virt/debian_data.h"
 
-//  linux bridge  -  posix-like commands for kurono shell
+//  linux bridge - posix-like commands for kurono shell
 
 static int _slen(const char* s) { int n=0; while (s[n]) n++; return n; }
 static void _scpy(char* d, const char* s, int m) {
@@ -355,7 +355,7 @@ static bool _http_get_plain(const char* url, char* body_out, int body_max,
         // wait on wall-clock time, not a raw iteration count. a real-internet
         // round trip is tens of ms, but the old tight 40000-iteration spin
         // burned out in a few ms and gave up (then closed the socket) before the
-        // response even arrived  -  fine under sub-ms slirp/localhost, broken
+        // response even arrived - fine under sub-ms slirp/localhost, broken
         // against a real server. keep receiving until the peer closes or no new
         // data arrives for ~10s, and pace each idle turn so the cooperative
         // scheduler still runs. (satoru)
@@ -583,11 +583,11 @@ void LinuxCmds::RegisterAll(KuronoShell* sh) {
     sh->RegisterCommand("wget",     "Download URL",            ENV_AUTO, "network",    cmd_wget);
     sh->RegisterCommand("curl",     "Transfer data",           ENV_AUTO, "network",    cmd_curl);
 
-    // linux syscall execution  -  runs real linux programs via syscall layer
+    // linux syscall execution - runs real linux programs via syscall layer
     sh->RegisterCommand("linux-exec", "Run program via Linux syscalls", ENV_AUTO, "linux", cmd_linux_exec);
     sh->RegisterCommand("syscall",    "Direct Linux syscall test",      ENV_AUTO, "linux", cmd_syscall);
 
-    // hypervisor / vm management  -  create, boot, run linux guest vms
+    // hypervisor / vm management - create, boot, run linux guest vms
     sh->RegisterCommand("vm",         "Manage virtual machines",        ENV_AUTO, "virt",  cmd_vm);
 
     // alpine linux vm management
@@ -795,7 +795,7 @@ int LinuxCmds::cmd_touch(KuronoShell* sh, int argc, const char** argv, char* out
 int LinuxCmds::cmd_cat(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: cat <file...>\n");
-    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    // heap-alloc the read buffer - 64kb on the stack overflows the 64kb kernel stack (satoru)
     unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
     if (!buf) return _sa(out, 0, mx, "cat: out of memory\n");
     int p = 0;
@@ -826,7 +826,7 @@ int LinuxCmds::cmd_head(KuronoShell* sh, int argc, const char** argv, char* out,
     }
     if (!file) return _sa(out, 0, mx, "Usage: head [-n N] <file>\n");
 
-    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    // heap-alloc the read buffer - 64kb on the stack overflows the 64kb kernel stack (satoru)
     unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
     if (!buf) return _sa(out, 0, mx, "head: out of memory\n");
     int sz = KVFS::ReadFile(file, buf, KVFS_MAX_CONTENT);
@@ -856,7 +856,7 @@ int LinuxCmds::cmd_tail(KuronoShell* sh, int argc, const char** argv, char* out,
     }
     if (!file) return _sa(out, 0, mx, "Usage: tail [-n N] <file>\n");
 
-    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    // heap-alloc the read buffer - 64kb on the stack overflows the 64kb kernel stack (satoru)
     unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
     if (!buf) return _sa(out, 0, mx, "tail: out of memory\n");
     int sz = KVFS::ReadFile(file, buf, KVFS_MAX_CONTENT);
@@ -884,7 +884,7 @@ int LinuxCmds::cmd_wc(KuronoShell* sh, int argc, const char** argv, char* out, i
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: wc <file>\n");
 
-    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    // heap-alloc the read buffer - 64kb on the stack overflows the 64kb kernel stack (satoru)
     unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
     if (!buf) return _sa(out, 0, mx, "wc: out of memory\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);
@@ -1083,7 +1083,7 @@ int LinuxCmds::cmd_sort(KuronoShell* sh, int argc, const char** argv, char* out,
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: sort <file>\n");
 
-    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    // heap-alloc the read buffer - 64kb on the stack overflows the 64kb kernel stack (satoru)
     unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
     if (!buf) return _sa(out, 0, mx, "sort: out of memory\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);
@@ -1092,7 +1092,7 @@ int LinuxCmds::cmd_sort(KuronoShell* sh, int argc, const char** argv, char* out,
         return _sa(out, 0, mx, "sort: cannot read file\n");
     }
 
-    // split into lines  -  lines[] point into buf, so keep it alive until after output (satoru)
+    // split into lines - lines[] point into buf, so keep it alive until after output (satoru)
     char* lines[256];
     int lc = 0;
     char* start = (char*)buf;
@@ -1128,7 +1128,7 @@ int LinuxCmds::cmd_uniq(KuronoShell* sh, int argc, const char** argv, char* out,
     (void)sh;
     if (argc < 2) return _sa(out, 0, mx, "Usage: uniq <file>\n");
 
-    // heap-alloc the read buffer  -  64kb on the stack overflows the 64kb kernel stack (satoru)
+    // heap-alloc the read buffer - 64kb on the stack overflows the 64kb kernel stack (satoru)
     unsigned char* buf = (unsigned char*)KernelHeap::Alloc(KVFS_MAX_CONTENT);
     if (!buf) return _sa(out, 0, mx, "uniq: out of memory\n");
     int sz = KVFS::ReadFile(argv[1], buf, KVFS_MAX_CONTENT);
@@ -1427,7 +1427,7 @@ int LinuxCmds::cmd_dmesg(KuronoShell* sh, int argc, const char** argv, char* out
     (void)argv;
     uint32_t sec = Time::GetTicks() / 1000u;
     char banner[144];
-    int bp = _sa(banner, 0, sizeof(banner), "=== mirrored serial (/kurono/var/log/serial.log)  -  uptime ");
+    int bp = _sa(banner, 0, sizeof(banner), "=== mirrored serial (/kurono/var/log/serial.log) - uptime ");
     bp = _sau(banner, bp, sizeof(banner), sec);
     bp = _sa(banner, bp, sizeof(banner), " s ===\n");
     int hint = mx > 384 ? mx - 256 : 512;
@@ -1975,7 +1975,7 @@ int LinuxCmds::cmd_iotop(KuronoShell* sh, int argc, const char** argv, char* out
     return p;
 }
 
-//  network commands (simulated  -  real nic driver would replace these)
+//  network commands (simulated - real nic driver would replace these)
 
 int LinuxCmds::cmd_ifconfig(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh; (void)argc; (void)argv;
@@ -2191,7 +2191,7 @@ int LinuxCmds::cmd_curl(KuronoShell* sh, int argc, const char** argv, char* out,
     return p;
 }
 
-//  linux-exec  -  run a program through real linux syscalls
+//  linux-exec - run a program through real linux syscalls
 //  this creates a linux process context, dispatches syscalls, and
 //  returns captured console output to the shell.
 
@@ -2223,7 +2223,7 @@ int LinuxCmds::cmd_linux_exec(KuronoShell* sh, int argc, const char** argv,
     return LinuxSyscall::RunProgram(argv[1], argc - 1, argv + 1, out, mx);
 }
 
-//  syscall  -  direct linux syscall test interface
+//  syscall - direct linux syscall test interface
 //  lets users call specific syscall numbers directly.
 
 int LinuxCmds::cmd_syscall(KuronoShell* sh, int argc, const char** argv,
@@ -2278,18 +2278,18 @@ int LinuxCmds::cmd_syscall(KuronoShell* sh, int argc, const char** argv,
     return p;
 }
 
-//  vm  -  hypervisor / virtual machine management
+//  vm - hypervisor / virtual machine management
 //  subcommands:
-//    vm status     -  show vm/hypervisor state
-//    vm create [ram_mb]  -  create a new vm
-//    vm run [max_exits]  -  enter the vm run loop
-//    vm pause      -  pause the vm
-//    vm resume     -  resume the vm
-//    vm destroy    -  destroy the vm
-//    vm serial     -  read guest serial (com1) output
-//    vm regs       -  dump guest registers
-//    vm info       -  show vm statistics
-//    vm boot-test  -  create+run a minimal guest that prints to serial
+//    vm status    - show vm/hypervisor state
+//    vm create [ram_mb] - create a new vm
+//    vm run [max_exits] - enter the vm run loop
+//    vm pause     - pause the vm
+//    vm resume    - resume the vm
+//    vm destroy   - destroy the vm
+//    vm serial    - read guest serial (com1) output
+//    vm regs      - dump guest registers
+//    vm info      - show vm statistics
+//    vm boot-test - create+run a minimal guest that prints to serial
 
 // tiny 16-bit real-mode guest code that writes "kurono vm ok\n" to com1
 // (port 0x3f8) and then hlts. this serves as a boot-test without needing
@@ -2492,7 +2492,7 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
         return p;
     }
 
-    // ── vm boot-alpine  -  boot embedded alpine linux with driver extraction
+    // ── vm boot-alpine - boot embedded alpine linux with driver extraction
     if (_seq(sub, "boot-alpine")) {
         if (!_guest_tools_enabled() || !_guest_is_alpine()) {
             return _sa(out, 0, mx, "boot-alpine: Alpine guest is not the selected Linux profile. Use Settings > System > Linux.\n");
@@ -2686,7 +2686,7 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
     return p;
 }
 
-//  cmd_alpine  -  alpine linux guest vm management
+//  cmd_alpine - alpine linux guest vm management
 //
 //  alpine               show alpine status + help
 //  alpine boot          boot alpine linux with driver extraction
@@ -2916,7 +2916,7 @@ int LinuxCmds::cmd_alpine(KuronoShell* sh, int argc, const char** argv,
         }
 
         if (alpine_count == 0) {
-            p = _sa(out, p, mx, "(none  -  boot Alpine first with 'alpine boot')\n");
+            p = _sa(out, p, mx, "(none - boot Alpine first with 'alpine boot')\n");
         } else {
             p = _sac(out, p, mx, '\n');
             p = _sai(out, p, mx, alpine_count);
@@ -2928,7 +2928,7 @@ int LinuxCmds::cmd_alpine(KuronoShell* sh, int argc, const char** argv,
     if (_seq(sub, "log")) {
         int loglen = Hypervisor::GetAlpineBootLogLen();
         if (loglen == 0) {
-            return _sa(out, 0, mx, "(no boot log  -  boot Alpine first)\n");
+            return _sa(out, 0, mx, "(no boot log - boot Alpine first)\n");
         }
         int p = 0;
         p = _sa(out, p, mx, "--- Alpine Boot Log (");
@@ -2990,7 +2990,7 @@ int LinuxCmds::cmd_alpine(KuronoShell* sh, int argc, const char** argv,
     return p;
 }
 
-//  cmd_apk  -  alpine package manager interface
+//  cmd_apk - alpine package manager interface
 //
 //  forwards apk commands to the alpine guest via serial.
 //  usage:
@@ -3059,7 +3059,7 @@ int LinuxCmds::cmd_apk(KuronoShell* sh, int argc, const char** argv,
         out[p] = 0;
         if (result[n-1] != '\n') p = _sac(out, p, mx, '\n');
     } else {
-        p = _sa(out, p, mx, "(no output from apk  -  guest may still be processing)\n");
+        p = _sa(out, p, mx, "(no output from apk - guest may still be processing)\n");
     }
     return p;
 }
@@ -3180,7 +3180,7 @@ int LinuxCmds::cmd_debian(KuronoShell* sh, int argc, const char** argv,
     if (_seq(sub, "log")) {
         int loglen = Hypervisor::GetDebianBootLogLen();
         if (loglen == 0) {
-            return _sa(out, 0, mx, "(no boot log  -  boot Debian first)\n");
+            return _sa(out, 0, mx, "(no boot log - boot Debian first)\n");
         }
         p = _sa(out, p, mx, "--- Debian Boot Log (");
         p = _sai(out, p, mx, loglen);

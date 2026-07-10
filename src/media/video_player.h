@@ -1,21 +1,21 @@
-// kurono os  -  native video player
+// kurono os - native video player
 // =================================================================
 // industrial-grade video player capable of two playback paths:
 //
-//   1. KVID native  -  guaranteed-to-work (mjpeg + s16 pcm).  the player
+//   1. KVID native - guaranteed-to-work (mjpeg + s16 pcm).  the player
 //      decodes one jpeg frame per video tick via stb_image and pushes
 //      audio samples to AudioServer's mixer for proper sync.
 //
-//   2. MP4 inspect  -  full demux, h.264/aac metadata extraction; if the
+//   2. MP4 inspect - full demux, h.264/aac metadata extraction; if the
 //      mp4 happens to contain mjpeg or kvid tracks we play those, else
 //      we display the parsed structure so the user knows exactly
 //      what's in the file.
 //
 // the player exposes a small wm-friendly api:
-//   * Open() / Close()  -  load buffer
-//   * Tick()            -  call once per frame from the main loop
-//   * Render()          -  paint into the window
-//   * Input()           -  handle clicks / keys
+//   * Open() / Close() - load buffer
+//   * Tick()           - call once per frame from the main loop
+//   * Render()         - paint into the window
+//   * Input()          - handle clicks / keys
 //
 // integrates with the new AudioServer + AudioMixer for sound output.
 #pragma once
@@ -72,7 +72,7 @@ struct State {
     // advanced (display caught up to the clock), we decode the NEXT video frame
     // into this second buffer. when the clock then crosses into it, advancing is
     // a cheap pointer swap instead of an inline jpeg decode that stalls the
-    // compositor  -  so frames land on time. (satoru)
+    // compositor - so frames land on time. (satoru)
     uint8_t* decode_buf2;
     uint32_t decode_cap2;
     int      prefetch_frame;            // frame index held in decode_buf2, -1 = none

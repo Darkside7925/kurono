@@ -32,13 +32,13 @@ hypercall number from guest `eax`). The recognized set includes: NOP/info (retur
 `"kuro"`), shutdown, reboot, an audio PCM passthrough channel (`0x11`), network
 status + packet passthrough (`0x12` / `0x14`), the 9p shared-filesystem channel
 (`0x20`, host KVFS ↔ guest), and the **KSA read-only authorization-verdict channel
-(`0x4B`)**  -  `KSA_SUB_GET_VERDICT` returns a *copy* of the latched verdict
+(`0x4B`)** - `KSA_SUB_GET_VERDICT` returns a *copy* of the latched verdict
 (completed / approved / has-hash) and never a pointer; there is no path to write an
 approval back into KSA memory from the main OS (see `security/KSA.md`).
 
 ## 5. Related files
 
-- `src/virt/hypervisor.cpp`  -  sets the host RIP to the exit handler
-- `src/virt/ept.cpp`  -  called for EPT_VIOLATION exits
-- `src/virt/vdevices.cpp`  -  I/O port handler registry
-- `src/virt/v9fs.cpp`  -  file sharing hypercall handler
+- `src/virt/hypervisor.cpp` - sets the host RIP to the exit handler
+- `src/virt/ept.cpp` - called for EPT_VIOLATION exits
+- `src/virt/vdevices.cpp` - I/O port handler registry
+- `src/virt/v9fs.cpp` - file sharing hypercall handler

@@ -1,4 +1,4 @@
-// kurono os  -  mp4 / isobmff demuxer implementation
+// kurono os - mp4 / isobmff demuxer implementation
 // see mp4_demux.h for the full feature list and design rationale.
 //
 // the implementation is intentionally a single translation unit so the
@@ -117,7 +117,7 @@ uint32_t MinU32(uint32_t a, uint32_t b) { return a < b ? a : b; }
 } // anon namespace
 
 // =========================================================================
-// box parsers  -  each parses one container or leaf box and updates state
+// box parsers - each parses one container or leaf box and updates state
 // =========================================================================
 
 namespace {
@@ -154,7 +154,7 @@ bool ParseMvhd(ParserState* st, BoxHeader& bh) {
     if (!r.U32(rate)) return false;
     if (!r.U16(volume)) return false;
     // remainder (reserved + matrix + pre_defined + next_track_id) is
-    // ignored  -  we don't need it.
+    // ignored - we don't need it.
     st->mv->timescale       = timescale;
     st->mv->duration_units  = duration;
     return true;
@@ -307,14 +307,14 @@ bool ParseStsd(ParserState* st, BoxHeader& bh) {
             if (!er.Skip(36)) return false;
         }
     } else {
-        // unknown handler  -  leave codec but don't try to interpret entry
+        // unknown handler - leave codec but don't try to interpret entry
     }
-    // remainder of the entry should be "extra boxes"  -  codec-private data
+    // remainder of the entry should be "extra boxes" - codec-private data
     return CaptureCodecPrivate(st->cur_track, er);
 }
 
 bool ParseStts(ParserState* st, BoxHeader& bh) {
-    // we don't materialise stts directly  -  defer to BuildSampleTable which
+    // we don't materialise stts directly - defer to BuildSampleTable which
     // walks all four tables together for cache efficiency.  here we just
     // make sure the box is well-formed (entry_count fits).
     (void)st;
@@ -368,7 +368,7 @@ bool ParseTrakChild(ParserState* st, BoxHeader& bh) {
         case Box::stbl: return ParseBoxList(st, bh.payload_start, bh.box_end);
         case Box::stsd: return ParseStsd(st, bh);
         case Box::stts: return ParseStts(st, bh);
-        // leaf tables we'll re-read in BuildSampleTable  -  accept silently
+        // leaf tables we'll re-read in BuildSampleTable - accept silently
         case Box::ctts: case Box::stsc: case Box::stsz: case Box::stz2:
         case Box::stco: case Box::co64: case Box::stss:
             return true;
@@ -378,7 +378,7 @@ bool ParseTrakChild(ParserState* st, BoxHeader& bh) {
 }
 
 // =========================================================================
-// sample table builder  -  combines stts + ctts + stsc + stsz + stco + stss
+// sample table builder - combines stts + ctts + stsc + stsz + stco + stss
 // =========================================================================
 
 // re-find a child box of given type inside a container box list.
@@ -567,7 +567,7 @@ bool BuildSampleTable(const uint8_t* file, uint32_t file_size,
                 s_i++;
             }
         }
-        // any uncovered tail keeps dts=0  -  best-effort
+        // any uncovered tail keeps dts=0 - best-effort
     }
 
     // ---- ctts: composition offsets (optional) ---------------------------
@@ -667,7 +667,7 @@ bool Open(const uint8_t* data, uint32_t size, Movie& mv) {
     // second pass: build per-track sample tables from stbl
     for (int i = 0; i < mv.track_count; i++) {
         if (!BuildSampleTable(data, size, (uint32_t)i, &mv.tracks[i])) {
-            // tolerate per-track failure  -  leave sample_count == 0
+            // tolerate per-track failure - leave sample_count == 0
             mv.tracks[i].samples      = nullptr;
             mv.tracks[i].sample_count = 0;
         }

@@ -1,4 +1,4 @@
-//  kurono os  -  virtual 9p filesystem (host ↔ guest shared fs)
+//  kurono os - virtual 9p filesystem (host ↔ guest shared fs)
 //
 //  implements a subset of 9p2000.l over the vmcall interface so that a
 //  guest vm can transparently access files on the host kvfs.
@@ -74,7 +74,7 @@ struct V9FS_Stat {
     char     name[64];       // basename
 };
 
-//  v9fs  -  virtual 9p filesystem handler
+//  v9fs - virtual 9p filesystem handler
 class V9FS {
 public:
     static void Init();

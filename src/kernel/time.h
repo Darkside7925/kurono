@@ -35,7 +35,7 @@ private:
     static DateTime breakdown_s(uint32_t secs);
 };
 
-// convenience alias  -  many modules use time::getticks()
+// convenience alias - many modules use time::getticks()
 struct Time {
     static inline uint32_t GetTicks() {
         return (uint32_t)(TimeManager::NowUTC().us / 1000u);

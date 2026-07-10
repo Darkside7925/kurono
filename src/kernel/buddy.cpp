@@ -1,4 +1,4 @@
-//  kurono os  -  buddy physical-memory allocator implementation
+//  kurono os - buddy physical-memory allocator implementation
 #include "buddy.h"
 #include "pmm.h"
 #include "../drivers/serial.h"
@@ -141,7 +141,7 @@ void* Buddy::AllocPages(int order) {
     // overflow guard: order beyond what fits in uint64_t pages
     if (order >= 52)       return nullptr;
     if (order > BUDDY_ORDER_MAX) {
-        // larger than our pool's max block  -  fall through to PMM contiguous.
+        // larger than our pool's max block - fall through to PMM contiguous.
         uint64_t pages = 1ull << order;
         uint64_t addr  = PMM::AllocContiguous(pages);
         if (addr) used_bytes += pages * BUDDY_PAGE_SIZE;

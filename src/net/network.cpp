@@ -44,7 +44,7 @@ static void nmemset(void* p, int v, int n) {
 }
 
 static void e1000_rx_handler(const uint8_t* data, uint16_t length) {
-    // simple packet processing  -  update interface stats
+    // simple packet processing - update interface stats
     NetworkInterface* eth = Network::GetInterface("eth0");
     if (eth) {
         eth->rx_packets++;
@@ -56,7 +56,7 @@ static void e1000_rx_handler(const uint8_t* data, uint16_t length) {
     if (length >= 14) {
         uint16_t ethertype = ((uint16_t)data[12] << 8) | data[13];
         if (ethertype == 0x0806) {
-            // arp response  -  extract sender ip and mac
+            // arp response - extract sender ip and mac
             if (length >= 42) {
                 MACAddress sender_mac;
                 for (int i = 0; i < 6; i++) sender_mac.bytes[i] = data[22 + i];
@@ -93,7 +93,7 @@ void Network::Init() {
 
     bool have_real_nic = E1000::Init();
 
-    // create eth0  -  backed by real e1000 if detected
+    // create eth0 - backed by real e1000 if detected
     NetworkInterface& eth = interfaces[interface_count++];
     ncpy(eth.name, "eth0", 16);
     eth.type = NIC_ETHERNET;
@@ -128,7 +128,7 @@ void Network::Init() {
     eth.rx_bytes = eth.tx_bytes = 0;
     eth.rx_errors = eth.tx_errors = 0;
 
-    // create wlan0  -  wifi interface (bridged through eth0 in qemu)
+    // create wlan0 - wifi interface (bridged through eth0 in qemu)
     NetworkInterface& wlan = interfaces[interface_count++];
     ncpy(wlan.name, "wlan0", 16);
     wlan.type = NIC_WIFI;
@@ -233,7 +233,7 @@ void Network::ARPAdd(IPv4Address ip, MACAddress mac) {
 }
 
 // ────────────────────────────────────────────────────────────────────
-//  /proc helpers  -  small, dependency-free string formatting so the
+//  /proc helpers - small, dependency-free string formatting so the
 //  runtime layout can publish live ARP / route tables every second.
 // ────────────────────────────────────────────────────────────────────
 namespace {
@@ -814,7 +814,7 @@ void WiFi::ProbePCIWireless() {
 
     // real wireless-nic detection: the wifi hardware layer (drivers/wifi_dev)
     // walks the pci bus, names the exact chip, maps its mmio bar, and enables
-    // bus-mastering  -  the foundation the 802.11 radio driver sits on. (satoru)
+    // bus-mastering - the foundation the 802.11 radio driver sits on. (satoru)
     if (WifiDev::Probe()) {
         const WifiDevice* d = WifiDev::Info();
         detected_link = LINK_WIFI;
@@ -934,7 +934,7 @@ bool WiFi::Scan() {
     // drive the real 802.11 stack if a vendor radio driver has registered. it
     // sweeps channels, sends probe-reqs, and parses beacons/probe-resps into our
     // WiFiNetwork[] array. with no registered radio (no vendor driver yet / no
-    // hardware) it returns 0  -  we keep an empty list rather than fake one. (satoru)
+    // hardware) it returns 0 - we keep an empty list rather than fake one. (satoru)
     if (Ieee80211::HasRadio()) {
         network_count = Ieee80211::Scan(networks, NET_MAX_WIFI_NETS);
     } else {
@@ -985,7 +985,7 @@ bool WiFi::Connect(const char* ssid, const char* password) {
         // bring the wlan0 interface up so the ip stack will route over it. the
         // link-layer + ccmp keys are established here; obtaining an ip address is
         // the dhcp client's job (the tcpip stack exposes the address setters but
-        // no dhcp client yet)  -  honest: we mark the carrier up, not an ip. (satoru)
+        // no dhcp client yet) - honest: we mark the carrier up, not an ip. (satoru)
         NetworkInterface* wlan = Network::GetInterface("wlan0");
         if (wlan) wlan->state = NIC_UP;
 

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  kernel process registry
+//  kurono os - kernel process registry
 //
 //  Owns the entry functions and spawn helper for the seven canonical
 //  kernel processes: Network, Input, Audio, GUI, Shell, Logging,

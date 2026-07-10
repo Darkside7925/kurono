@@ -1,4 +1,4 @@
-//  kurono os  -  terminal emulator v2.0
+//  kurono os - terminal emulator v2.0
 //  improvements: tab completion, extended ansi, blinking cursor, shortcuts
 #include "terminal.h"
 #include "../ui/window_manager.h"
@@ -23,7 +23,7 @@ static unsigned int T_CURSOR = 0xFF3D7DFF;  // cursor / caret (kss accent) (sato
 static unsigned int T_PROMPT = 0xFF3D7DFF;  // prompt accent (kss accent) (satoru)
 static unsigned int T_GRAY   = 0xFF8A8A92;  // dim chrome text (kss .text_dim) (satoru)
 static unsigned int T_SEL_BG = 0xFF26262B;  // selection / raised bg (kss .sel) (satoru)
-// semantic ansi palette  -  fixed, these are color *meanings* not theme chrome. (satoru)
+// semantic ansi palette - fixed, these are color *meanings* not theme chrome. (satoru)
 static const unsigned int T_GREEN    = 0xFF2ECC71;
 static const unsigned int T_RED      = 0xFFE74C3C;
 static const unsigned int T_YELLOW   = 0xFFF1C40F;
@@ -191,7 +191,7 @@ void TerminalApp::Init(){
     SetColor(T_GRAY, T_BG);
     WriteLn("                         ║");
     SetColor(T_GRAY, T_BG);
-    WriteLn("║  Powered by KuronoShell  -  76+ commands across 3 envs   ║");
+    WriteLn("║  Powered by KuronoShell - 76+ commands across 3 envs   ║");
     Write  ("║  Tab=complete  ↑↓=history  Ctrl+L=clear  Ctrl+C=cancel");
     SetColor(0xFF2980B9, T_BG);
     WriteLn("  ║");
@@ -515,7 +515,7 @@ void TerminalApp::TabComplete(){
         return;
     }
 
-    // new prefix scan  -  list kvfs children
+    // new prefix scan - list kvfs children
     scpy(tab_prefix,partial,TERM_INPUT_MAX);
     tab_match_count=0; tab_match_idx=-1;
 
@@ -803,7 +803,7 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     start_line -= scroll_offset;
     if(start_line<0) start_line=0;
 
-    // render buffer lines  -  batch consecutive same-bg cells into a single FillRect
+    // render buffer lines - batch consecutive same-bg cells into a single FillRect
     int sy=oy;
     char run_buf[TERM_COLS+1];
     for(int row=start_line; row<total_lines && sy+CELL_H<=oy+uh; row++){
@@ -960,7 +960,7 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // ctrl+l  -  clear
+    // ctrl+l - clear
     if(key==12){
         Clear();
         input_buf[0]=0; input_len=0; input_cursor=0;
@@ -968,7 +968,7 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // ctrl+shift+c  -  copy the current input line to the clipboard. shift held
+    // ctrl+shift+c - copy the current input line to the clipboard. shift held
     // distinguishes it from the plain ctrl+c cancel below. (satoru)
     if(key==3 && Keyboard::GetState().shift){
         if(input_len>0){
@@ -979,7 +979,7 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // ctrl+shift+v  -  paste clipboard text into the input line at the cursor.
+    // ctrl+shift+v - paste clipboard text into the input line at the cursor.
     // printable bytes only; a newline ends the paste without submitting. (satoru)
     if(key==22 && Keyboard::GetState().shift){
         if(ClipboardManager::HasText()){
@@ -999,7 +999,7 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // ctrl+c  -  cancel current input
+    // ctrl+c - cancel current input
     if(key==3){
         SetColor(T_RED, T_BG);
         Write("^C");
@@ -1011,16 +1011,16 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // ctrl+a  -  move to beginning of line
+    // ctrl+a - move to beginning of line
     if(key==1){ input_cursor=0; return true; }
 
-    // ctrl+e  -  move to end of line
+    // ctrl+e - move to end of line
     if(key==5){ input_cursor=input_len; return true; }
 
-    // ctrl+k  -  kill to end of line
+    // ctrl+k - kill to end of line
     if(key==11){ input_buf[input_cursor]=0; input_len=input_cursor; return true; }
 
-    // ctrl+u  -  kill to beginning of line
+    // ctrl+u - kill to beginning of line
     if(key==21){
         for(int i=0;i<input_len-input_cursor;i++)
             input_buf[i]=input_buf[input_cursor+i];
@@ -1029,7 +1029,7 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // ctrl+w  -  delete word before cursor
+    // ctrl+w - delete word before cursor
     if(key==23){
         while(input_cursor>0 && input_buf[input_cursor-1]==' '){
             for(int i=input_cursor-1;i<input_len-1;i++) input_buf[i]=input_buf[i+1];
@@ -1095,7 +1095,7 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // tab  -  tab completion via kvfs
+    // tab - tab completion via kvfs
     if(key=='\t'){
         TabComplete();
         ScrollToBottom();

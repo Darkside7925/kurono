@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: personalization (satoru)
+//  kurono os - settings module: personalization (satoru)
 //  a rich, fully-live personalization page: accent swatches (theme.accent),
 //  taskbar position/height/background, desktop icon size + wallpaper tint,
 //  window effects (animations, shadows, corner radius) and a ui font scale.
@@ -36,7 +36,7 @@ static const char* kWallNames[] = {
 };
 static const int kWallsCount = (int)(sizeof(kWalls) / sizeof(kWalls[0]));
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 static unsigned int s_accent      = 0xFF3498DB;  // theme.accent (satoru)
 static bool         s_bar_top      = false;       // taskbar.position (satoru)
 static int          s_bar_height   = 44;          // taskbar.height (satoru)
@@ -186,7 +186,7 @@ static int palette_index(const unsigned int* pal, int n, unsigned int cur){
 }
 
 // draw a horizontal row of selectable colour swatches; the selected one gets a
-// bright ring. returns nothing  -  hit-testing recomputes the same x steps. (satoru)
+// bright ring. returns nothing - hit-testing recomputes the same x steps. (satoru)
 static void draw_swatches(int x, int y, const unsigned int* pal, int n, unsigned int cur){
     for(int i = 0; i < n; i++){
         int sx = x + i * (SWATCH + SWATCH_GAP);

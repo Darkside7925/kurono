@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: power & battery (satoru)
+//  kurono os - settings module: power & battery (satoru)
 //  a detailed power page: a cpu power-plan selector mapped onto the hal
 //  cpufreq governors (applied live via CPUFreq::SetGovernor + persisted),
 //  detected p-state / clock info, a battery section (no battery driver →
@@ -38,7 +38,7 @@ static int gov_to_plan(CPUFreq::Governor g){
     }
 }
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 static int  s_plan           = 1;     // persisted to power.plan (satoru)
 static int  s_screen_timeout = 5;     // minutes, persisted to power.screen_timeout (satoru)
 static int  s_sleep_timeout  = 15;    // minutes, persisted to power.sleep_timeout (satoru)
@@ -177,7 +177,7 @@ static void power_render(int x, int y, int w, int h, int scroll){
     // ── battery ──────────────────────────────────────────────────────────
     SettingsUI::SectionHeader(x, ly, "Battery");
     ly += 26;
-    // kurono has no acpi battery driver  -  surface ac power explicitly. (satoru)
+    // kurono has no acpi battery driver - surface ac power explicitly. (satoru)
     SettingsUI::Row(x, ly, "Power Source:", "AC Power (no battery detected)");
     ly += 22;
     SettingsUI::Row(x, ly, "Status:", "Plugged In");
@@ -186,7 +186,7 @@ static void power_render(int x, int y, int w, int h, int scroll){
     // ── thermal ──────────────────────────────────────────────────────────
     SettingsUI::SectionHeader(x, ly, "Thermal");
     ly += 26;
-    // no on-die thermal sensor wired up  -  report a nominal state. (satoru)
+    // no on-die thermal sensor wired up - report a nominal state. (satoru)
     SettingsUI::Row(x, ly, "CPU Temperature:", "Normal");
     ly += 22;
     SettingsUI::Row(x, ly, "Fan Policy:", "Automatic");

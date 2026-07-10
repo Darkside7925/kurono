@@ -1,4 +1,4 @@
-// kurono os  -  denji video viewer (window wrapper around VideoPlayer)
+// kurono os - denji video viewer (window wrapper around VideoPlayer)
 // =====================================================================
 // thin app that opens a window and binds VideoPlayer::Tick/Render
 // to it.  loads the embedded denji.kvid by default.

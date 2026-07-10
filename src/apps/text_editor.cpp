@@ -1,4 +1,4 @@
-//  kurono os  -  text editor application implementation
+//  kurono os - text editor application implementation
 #include "text_editor.h"
 #include "../ui/window_manager.h"
 #include "../fs/kvfs.h"
@@ -169,7 +169,7 @@ bool TextEditorApp::SaveFile(){
 
 bool TextEditorApp::SaveFileAs(const char* path){
     // assemble content on the heap, sized to the actual document (sum of line
-    // lengths + newlines + nul), capped at the per-file ceiling  -  a big stack
+    // lengths + newlines + nul), capped at the per-file ceiling - a big stack
     // buffer overflows the GUI/shell process stack. (satoru)
     uint32_t need = 1;
     for(int i=0;i<line_count;i++) need += (uint32_t)lines[i].len + 1;
@@ -394,7 +394,7 @@ void TextEditorApp::RenderMenuBar(int x,int y,int w){
     Graphics::FillRect(x,y,w,MENU_H,ED_MENU_BG);
     Graphics::DrawLine(x,y+MENU_H,x+w,y+MENU_H,ED_BORDER);
 
-    // menu items  -  highlight the open menu
+    // menu items - highlight the open menu
     unsigned int file_clr = (menu_open_idx == 0) ? ED_SEL_BG : ED_MENU_BG;
     unsigned int edit_clr = (menu_open_idx == 1) ? ED_SEL_BG : ED_MENU_BG;
     unsigned int view_clr = (menu_open_idx == 2) ? ED_SEL_BG : ED_MENU_BG;
@@ -467,7 +467,7 @@ void TextEditorApp::RenderContent(int x,int y,int w,int h){
     int vis_rows = h / CHAR_H;
     int vis_cols = w / CHAR_W;
 
-    // ensure cursor is visible  -  set target, then ease
+    // ensure cursor is visible - set target, then ease
     if(cursor_row < target_scroll_y) target_scroll_y = cursor_row;
     if(cursor_row >= target_scroll_y + vis_rows) target_scroll_y = cursor_row - vis_rows + 1;
     if(target_scroll_y < 0) target_scroll_y = 0;
@@ -480,7 +480,7 @@ void TextEditorApp::RenderContent(int x,int y,int w,int h){
     if(cursor_col < scroll_x) scroll_x = cursor_col;
     if(cursor_col >= scroll_x + vis_cols) scroll_x = cursor_col - vis_cols + 1;
 
-    // virtualized row loop  -  only visible rows drawn
+    // virtualized row loop - only visible rows drawn
     for(int i=0;i<vis_rows && (i+scroll_y)<line_count;i++){
         int row_idx = i + scroll_y;
         if(row_idx < 0) continue;
@@ -502,7 +502,7 @@ void TextEditorApp::RenderContent(int x,int y,int w,int h){
         if(rb > 0) Graphics::DrawString(x, ry, rowbuf, ED_TEXT, 0xFF000000);
     }
 
-    // blinking cursor  -  pause-on-keypress, ms-based 500ms period
+    // blinking cursor - pause-on-keypress, ms-based 500ms period
     unsigned int now_ms = Timer::GetRealMs();
     unsigned int since_key = now_ms - last_keypress_ms;
     bool cursor_visible;
@@ -585,7 +585,7 @@ bool TextEditorApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
                     // Dispatch based on which menu was open
                     if(count == 3){  // File menu
                         if(item == 0) SaveFile();
-                        else if(item == 2) { /* Open  -  placeholder */ }
+                        else if(item == 2) { /* Open - placeholder */ }
                     } else if(count == 2){  // Edit menu
                         if(item == 0) show_line_numbers = !show_line_numbers;
                     } else {  // View menu
@@ -643,22 +643,22 @@ bool TextEditorApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         return true;
     }
 
-    // ctrl+s  -  save
+    // ctrl+s - save
     if(key==19){ SaveFile(); return true; }
 
-    // ctrl+c  -  copy selection (or current line) to the clipboard. (satoru)
+    // ctrl+c - copy selection (or current line) to the clipboard. (satoru)
     if(key==3){ CopySelection(); return true; }
 
-    // ctrl+x  -  cut selection (or current line) to the clipboard. (satoru)
+    // ctrl+x - cut selection (or current line) to the clipboard. (satoru)
     if(key==24){ CutSelection(); return true; }
 
-    // ctrl+v  -  paste clipboard text at the cursor. (satoru)
+    // ctrl+v - paste clipboard text at the cursor. (satoru)
     if(key==22){ PasteClipboard(); return true; }
 
-    // ctrl+l  -  toggle line numbers
+    // ctrl+l - toggle line numbers
     if(key==12){ show_line_numbers=!show_line_numbers; return true; }
 
-    // ctrl+g  -  go to line (just go to top as simple impl)
+    // ctrl+g - go to line (just go to top as simple impl)
     if(key==7){ cursor_row=0; cursor_col=0; return true; }
 
     // arrows

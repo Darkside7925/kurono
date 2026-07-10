@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  kpy  -  Kurono Python-subset interpreter
+ *  kpy - Kurono Python-subset interpreter
  *
  *  This is NOT CPython.  It is a tiny, honestly-named interpreter that
  *  understands enough Python syntax to validate the Kurono userspace
@@ -457,7 +457,7 @@ static char g_filebuf[16*1024];
 int main(int argc, char** argv){
     heap_init();
 
-    puts1("kpy 0.1  -  Kurono native Python-subset interpreter\n");
+    puts1("kpy 0.1 - Kurono native Python-subset interpreter\n");
 
     if(argc < 2){
         puts1("usage: kpython <script.py>  |  kpython -c \"<source>\"\n");

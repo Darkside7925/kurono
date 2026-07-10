@@ -181,7 +181,7 @@ static bool map_page_in_root_ex(uint64_t root_phys, uint64_t virt_addr,
     if (pd[p2i] & PTE_HUGE) {
         uint64_t huge_base = pd[p2i] & ~0x1FFFFFULL;
         uint64_t huge_flags = pd[p2i] & 0xFFFULL;
-        // always demote the covering 2mb huge page to a 4kb pt  -  even when
+        // always demote the covering 2mb huge page to a 4kb pt - even when
         // phys_addr already falls inside this huge page's range. previously we
         // early-returned here, which silently discarded the caller's requested
         // flags (pte_user / pte_nx / pte_pcd|pwt cache bits): every identity
@@ -281,7 +281,7 @@ static uint64_t query_mapping_in_root(uint64_t root_phys, uint64_t virt_addr) {
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT)) return 0;
     // mask to the 52-bit physical frame (bits 12-51), stripping the NX bit (63)
-    // and any other high flag bits  -  otherwise an NX (rw data) page returns a
+    // and any other high flag bits - otherwise an NX (rw data) page returns a
     // non-canonical "phys" and dereferencing it #GPs. exposed by the threading
     // path writing ptid/ctid to nx thread-stack pages via write_user_u32. (satoru)
     if (pdpt[p3i] & PTE_HUGE) {
@@ -329,7 +329,7 @@ static uint64_t query_page_flags_in_root(uint64_t root_phys, uint64_t virt_addr)
 }
 
 void KernelVMM::Init() {
-    // read current cr3  -  this is the pml4 set up by kurono_boot.asm
+    // read current cr3 - this is the pml4 set up by kurono_boot.asm
     pml4_phys = current_cr3();
 
     SerialLogger::Log("VMM: Initialized, PML4 at 0x");
@@ -449,7 +449,7 @@ bool KernelVMM::IsolateFrames(uint64_t phys_base, uint64_t count) {
         uint64_t* pte = leaf_pte_demoting(pml4_phys, va, &demoted);
         any_demoted = any_demoted || demoted;
         if (!pte) { all_ok = false; continue; }
-        *pte = 0;   // zero the leaf  -  frame is now unmapped in the main os (satoru)
+        *pte = 0;   // zero the leaf - frame is now unmapped in the main os (satoru)
     }
     // demoting a huge page invalidates 512 large-page translations; a full
     // flush is the safe way to drop any stale large-page tlb entries. (satoru)
@@ -545,7 +545,7 @@ bool KernelVMM::KmemxRestoreLeaf(uint64_t root_pml4, uint64_t virt_addr,
                                  uint64_t phys, uint64_t flags) {
     virt_addr &= ~0xFFFULL;
     uint64_t* pte = leaf_pte_nodemote(root_pml4, virt_addr);
-    if (!pte) return false;   // the leaf table must still exist (it does  -  only the leaf changed) (satoru)
+    if (!pte) return false;   // the leaf table must still exist (it does - only the leaf changed) (satoru)
     // clear any stale generation/marker; install the fresh frame + perms. (satoru)
     *pte = (phys & 0x000FFFFFFFFFF000ULL) | PTE_PRESENT | (flags & (PTE_WRITABLE |
             PTE_USER | PTE_PWT | PTE_PCD | PTE_GLOBAL | PTE_NX));
@@ -557,7 +557,7 @@ bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) 
     bool demoted = false;
     bool mapped = map_page_in_root_ex(pml4_phys, virt_addr, phys_addr, flags, &demoted);
     if (!mapped) return false;
-    // demoting a 2MB huge page invalidates 512 4KB translations  -  a single
+    // demoting a 2MB huge page invalidates 512 4KB translations - a single
     // INVLPG can leave stale large-page TLB entries behind on some CPUs.
     if (demoted) FlushTLB();
     else         InvalidatePage(virt_addr);

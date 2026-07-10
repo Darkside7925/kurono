@@ -1,4 +1,4 @@
-# kurono os  -  host-side transcoder: any video file → .kvid
+# kurono os - host-side transcoder: any video file → .kvid
 # ============================================================================
 # this script converts an arbitrary input video (mp4, mkv, mov, webm, avi ...)
 # into the kurono native KVID container so the os can play it natively

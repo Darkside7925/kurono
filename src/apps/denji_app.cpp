@@ -1,4 +1,4 @@
-// kurono os  -  denji video viewer (window glue around VideoPlayer)
+// kurono os - denji video viewer (window glue around VideoPlayer)
 // =====================================================================
 #include "denji_app.h"
 #include "../media/video_player.h"
@@ -12,7 +12,7 @@
 
 namespace DenjiApp {
 
-// global state  -  single-instance app.  the buffer it points at is the
+// global state - single-instance app.  the buffer it points at is the
 // embedded .rodata KVID asset, so its lifetime equals the kernel's.
 static VideoPlayer::State g_state;
 static int  g_win_id = -1;
@@ -107,7 +107,7 @@ static void Scpy(char* d, const char* s, int max) {
 
 void Open() {
     if (!EmbeddedMedia::HasDenjiKVID()) {
-        SerialLogger::Log("[DenjiApp] no embedded denji.kvid  -  skipping\r\n");
+        SerialLogger::Log("[DenjiApp] no embedded denji.kvid - skipping\r\n");
         return;
     }
     OpenBuffer(EmbeddedMedia::DenjiKVIDData(),

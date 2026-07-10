@@ -1,5 +1,5 @@
 ; ═══════════════════════════════════════════════════════════════════════════
-;  hello_x64.asm  -  minimal ring-3 user binary using the x86_64 SYSCALL
+;  hello_x64.asm - minimal ring-3 user binary using the x86_64 SYSCALL
 ;  instruction with Linux x86_64 syscall numbers.  Validates the
 ;  SYSCALL/SYSRET fast path that musl-built CPython will use.
 ;

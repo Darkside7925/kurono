@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  audio format conversion utilities
+//  kurono os - audio format conversion utilities
 //
 //  Given:
 //    * input  PCM in (rate_in, channels_in, bits_in)

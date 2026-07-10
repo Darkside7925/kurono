@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  KMemX internal test hooks  -  NOT part of the public engine api. these reach
+//  KMemX internal test hooks - NOT part of the public engine api. these reach
 //  the locked store/retrieve/free primitives so the headless self-test can
 //  round-trip pages through the REAL pool + metadata table without exposing
 //  those primitives to the rest of the kernel. (satoru)

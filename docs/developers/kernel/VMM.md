@@ -6,11 +6,11 @@
 
 The VMM provides page table management for the kernel. It maps physical pages (obtained from the PMM) into virtual address ranges and handles identity mappings, kernel space protection, and any explicit virtual-to-physical translations needed by drivers or security features.
 
-Note that `src/virt/vmm.cpp` is a separate file  -  that one belongs to the hypervisor subsystem and handles VM guest memory backends. The kernel VMM here is `src/kernel/vmm.cpp`.
+Note that `src/virt/vmm.cpp` is a separate file - that one belongs to the hypervisor subsystem and handles VM guest memory backends. The kernel VMM here is `src/kernel/vmm.cpp`.
 
 ## 2. Relationship with PMM
 
-The VMM calls the PMM to get physical pages when it needs to back a new page table entry. The VMM does not manage physical page lifetimes itself  -  the PMM owns that. The VMM only manages the mapping relationship.
+The VMM calls the PMM to get physical pages when it needs to back a new page table entry. The VMM does not manage physical page lifetimes itself - the PMM owns that. The VMM only manages the mapping relationship.
 
 ## 3. Initialization
 
@@ -26,6 +26,6 @@ The VMM is initialized during the core kernel bring-up phase after the PMM is re
 
 ## 5. Related files
 
-- `src/kernel/pmm.cpp`  -  physical pages backing the mappings
-- `src/kernel/kurono_kernel.cpp`  -  initialization order
-- `src/virt/vmm.cpp`  -  separate hypervisor VMM backend (do not confuse)
+- `src/kernel/pmm.cpp` - physical pages backing the mappings
+- `src/kernel/kurono_kernel.cpp` - initialization order
+- `src/virt/vmm.cpp` - separate hypervisor VMM backend (do not confuse)

@@ -2,7 +2,7 @@
 #include "../drivers/serial.h"
 #include "../proc/smp.h"   // cpu index for the cross-core pmm lock (satoru)
 
-//  physical memory manager  -  bitmap frame allocator implementation
+//  physical memory manager - bitmap frame allocator implementation
 
 // static member definitions
 uint64_t* PMM::bitmap       = nullptr;
@@ -13,7 +13,7 @@ uint64_t  PMM::used_frames  = 0;
 uint64_t  PMM::search_hint  = 0;
 
 extern "C" uint8_t kernel_start;
-extern "C" uint8_t kernel_end;       // after .boot_tables  -  safe to place bitmap here
+extern "C" uint8_t kernel_end;       // after .boot_tables - safe to place bitmap here
 
 // interrupt guard for the frame allocator. these mutators are re-entered
 // from the #pf stack-grow handler (Scheduler::TryGrowGuardPage -> AllocBytes),
@@ -21,7 +21,7 @@ extern "C" uint8_t kernel_end;       // after .boot_tables  -  safe to place bit
 // cli/sti makes each mutation atomic vs the fault path, exactly like the
 // kernel heap's HeapIrqGuard. save/restore so it nests harmlessly. (satoru)
 // since smp thread dispatch, cli alone is not enough: an ap's syscall (mmap,
-// demand-zero fault) mutates bitmap/refs concurrently with the bsp  -  the guard
+// demand-zero fault) mutates bitmap/refs concurrently with the bsp - the guard
 // is now cli + a cross-core lock, cpu-owner-recursive because the #pf
 // stack-grow re-entry above still happens on the SAME core and cli can't stop
 // exceptions (a plain spinlock would self-deadlock there). (satoru)
@@ -405,7 +405,7 @@ void PMM::Init(multiboot_info_t* mbi) {
             offset += entry->size + 4;
         }
     } else {
-        SerialLogger::Log("PMM: No mmap  -  using fallback (1MB..max_addr free)\r\n");
+        SerialLogger::Log("PMM: No mmap - using fallback (1MB..max_addr free)\r\n");
         for (uint64_t addr = 0x100000; addr < max_addr; addr += PAGE_SIZE) {
             uint64_t idx = addr / PAGE_SIZE;
             if (idx < total_frames && TestFrame(idx)) {

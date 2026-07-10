@@ -1,9 +1,9 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Kurono OS  -  Standalone EFI Loader
+ *  Kurono OS - Standalone EFI Loader
  *
  *  Bypasses GRUB's multiboot2 relocator entirely.  The kernel ELF is
  *  embedded directly in this binary (via objcopy), eliminating filesystem
- *  dependencies.  Memory is allocated with EfiLoaderCode (executable  - 
+ *  dependencies.  Memory is allocated with EfiLoaderCode (executable - 
  *  avoids NX page faults on real firmware).  Gets the framebuffer via
  *  GOP, builds a minimal Multiboot2-compatible info structure, calls
  *  ExitBootServices, and jumps directly to the kernel's 64-bit entry.
@@ -173,7 +173,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
               *(UINT32 *)ehdr->e_ident);
         goto hang;
     }
-    entry_point = ehdr->e_entry;  /* default  -  will be overridden below */
+    entry_point = ehdr->e_entry;  /* default - will be overridden below */
     Print(L"ELF entry: 0x%lx  PHs: %d\r\n", entry_point, ehdr->e_phnum);
 
     /* ── 3. Load ELF LOAD segments ─────────────────────────────────── */
@@ -285,7 +285,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
             p += (t_fb->size + 7) & ~(UINTN)7;
         }
 
-        /* Tag 6: memory map  -  convert EFI memory map to MB2 format */
+        /* Tag 6: memory map - convert EFI memory map to MB2 format */
         {
             UINTN map_size2 = 0, desc_size2;
             UINT32 desc_ver;
@@ -374,7 +374,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         status = uefi_call_wrapper(BS->ExitBootServices, 2,
                                    ImageHandle, map_key3);
         if (EFI_ERROR(status)) {
-            /* Map key changed  -  retry once */
+            /* Map key changed - retry once */
             uefi_call_wrapper(BS->GetMemoryMap, 5,
                               &map_size3, mmap3, &map_key3,
                               &desc_size3, &desc_ver3);
@@ -387,7 +387,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
      * NO MORE EFI BOOT SERVICES FROM HERE.  We're in 64-bit long mode,
      * still on EFI's page tables for the moment.  Below we install our
      * own RWX tables, copy the kernel to its fixed low addresses, then
-     * jump  -  none of that uses boot services.
+     * jump - none of that uses boot services.
      * ═══════════════════════════════════════════════════════════════ */
 
     /* ── 8. Init COM1 serial (115200 8N1) ──────────────────────────── */
@@ -411,7 +411,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
      *    replace EFI's page tables. Map 0..512 GiB identity with 1 GiB pages,
      *    present+writable, NX clear (executable). This makes the fixed low
      *    kernel range BOTH writable (for the copy below) and executable (for the
-     *    jump) no matter how the firmware mapped its own pages  -  the W^X policy
+     *    jump) no matter how the firmware mapped its own pages - the W^X policy
      *    on EFI code pages is what hung the pre-ExitBootServices copy. (satoru) */
     {
         int t;
@@ -423,7 +423,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     }
     serial_str("EFI_LOADER: RWX paging installed\r\n");
 
-    /* copy each PT_LOAD segment to its physical address. manual qword copy  - 
+    /* copy each PT_LOAD segment to its physical address. manual qword copy - 
      * CopyMem is a boot service and is invalid now. the loader image (holding
      * the embedded kernel we read FROM) sits high, clear of 0x100000.. (satoru) */
     {
@@ -441,7 +441,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     }
     serial_str("EFI_LOADER: kernel copied\r\n");
 
-    /* ── 9. PC Speaker beep  -  audible proof-of-life ───────────────── */
+    /* ── 9. PC Speaker beep - audible proof-of-life ───────────────── */
     serial_out(0x43, 0xB6);
     serial_out(0x42, 0xA9);  /* 1000 Hz low byte */
     serial_out(0x42, 0x04);  /* 1000 Hz high byte */

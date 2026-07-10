@@ -15,10 +15,10 @@ The hypervisor requires:
 - VMXON permission (CR4.VMXE set) for the VT-x path
 - Sufficient RAM for guest physical memory regions
 
-> **Honest caveat  -  nested VMX for guest boot.** The VMCS/VMCB + Linux-boot path
+> **Honest caveat - nested VMX for guest boot.** The VMCS/VMCB + Linux-boot path
 > is implemented, but actually *booting* an Alpine/Debian guest needs the host to
-> expose **nested** VT-x to Kurono. In the common dev environment  -  Kurono itself
-> running as a guest under nested KVM/QEMU  -  that nested layer is not available,
+> expose **nested** VT-x to Kurono. In the common dev environment - Kurono itself
+> running as a guest under nested KVM/QEMU - that nested layer is not available,
 > and the guest **VM-entry fails with a VMX entry error** (`hypervisor.cpp` logs
 > "VM-entry failed ... host likely doesn't support nested virt"). Guest boot is
 > therefore confirmed only where nested VMX is present. `VMM::IsNested()` reports
@@ -28,7 +28,7 @@ The hypervisor requires:
 
 ## 3. Initialization
 
-Hypervisor initialization is deferred  -  it does not run during normal Kurono boot. It is activated only when the user explicitly starts a VM. This is a deliberate decision: VT-x initialization is risky on some real laptop hardware and deferring it prevents boot failures.
+Hypervisor initialization is deferred - it does not run during normal Kurono boot. It is activated only when the user explicitly starts a VM. This is a deliberate decision: VT-x initialization is risky on some real laptop hardware and deferring it prevents boot failures.
 
 To start a VM, use the `vm` shell command (registered in `linux_cmds.cpp`, category
 `virt`):
@@ -38,7 +38,7 @@ vm run [max_exits]      # enter the VM run loop
 vm boot-alpine          # boot the embedded Alpine guest
 vm boot-test            # minimal guest that prints to serial
 ```
-(There is no `kurono vm start` command  -  `vm` is its own top-level command with
+(There is no `kurono vm start` command - `vm` is its own top-level command with
 `create` / `run` / `pause` / `resume` / `destroy` / `serial` / `regs` / `info` /
 `boot-test` / `boot-alpine` subcommands.)
 
@@ -65,8 +65,8 @@ Every VM exit calls `vmexit.cpp` which dispatches based on the exit reason. Comm
 
 ## 6. Related files
 
-- `src/virt/vmexit.cpp`  -  VM exit dispatch
-- `src/virt/ept.cpp`  -  Extended Page Tables
-- `src/virt/vmm.cpp`  -  VMM backend glue
-- `src/virt/linux_boot.cpp`  -  loads Linux into the guest
-- `src/virt/vdevices.cpp`  -  virtual devices seen by the guest
+- `src/virt/vmexit.cpp` - VM exit dispatch
+- `src/virt/ept.cpp` - Extended Page Tables
+- `src/virt/vmm.cpp` - VMM backend glue
+- `src/virt/linux_boot.cpp` - loads Linux into the guest
+- `src/virt/vdevices.cpp` - virtual devices seen by the guest

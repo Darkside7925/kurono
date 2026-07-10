@@ -1,4 +1,4 @@
-//  kurono os  -  ksa (kurono secure authorization) implementation
+//  kurono os - ksa (kurono secure authorization) implementation
 //
 //  see ksa.h for the architecture + isolation model. summary of how the
 //  security guarantees are realized here:
@@ -7,7 +7,7 @@
 //      physical region for the prompt (framebuffer + state + verdict). a
 //      dedicated EPT root is built and the region is mapped ONLY into that
 //      ept (the ksa guest-physical space). then KernelVMM::IsolateFrames()
-//      removes the region from the main-os page tables entirely  -  after this
+//      removes the region from the main-os page tables entirely - after this
 //      the main os (even ring-0 malware) has no virtual mapping to it, and
 //      QueryMapping() returns 0 for every frame.
 //
@@ -19,11 +19,11 @@
 //
 //   3. result channel: the verdict crosses back via VMCALL 0x4B
 //      (ReadVerdictForChannel) which returns a *copy*, never a pointer. the
-//      channel is read-only  -  there is no vmcall that lets the main os write
+//      channel is read-only - there is no vmcall that lets the main os write
 //      an approval into ksa memory, so a forged "yes" cannot be injected.
 //
 //  nested-vmx note: on a host where true nested vmx for the inner vm is
-//  unavailable (nested kvm under qemu  -  the common dev case), the prompt
+//  unavailable (nested kvm under qemu - the common dev case), the prompt
 //  logic runs as an ept-isolated guest *context* rather than a separately
 //  vmlaunch'd vm. IsRealNestedVM() reports which path is active. the
 //  isolation invariants above hold in BOTH cases; only the cpu-mode boundary
@@ -67,14 +67,14 @@ static EPT_PML4*  g_ksa_ept     = nullptr;
 static bool       g_isolated    = false;
 static uint32_t   g_channel_rev = 1;
 
-// a verdict latched after a prompt completes  -  what the channel returns. the
+// a verdict latched after a prompt completes - what the channel returns. the
 // host copy lives in normal kernel memory (NOT in the isolated region); it is
 // populated only by ksa's own arbiter code after reading the in-region verdict
 // through the ephemeral mapping. (satoru)
 static KSAVerdict g_last_verdict;
 
 // salted credential hash, identical scheme to supr's. we recompute here so the
-// cleartext credential never leaves the isolated region  -  only the hash does.
+// cleartext credential never leaves the isolated region - only the hash does.
 // the salt comes from supr's root/sovereign record via HashPassword. (satoru)
 static void ksa_hash_credential(const char* cred, const char* username,
                                 unsigned char* out, bool& ok) {
@@ -128,7 +128,7 @@ void KSA::Init() {
     available   = Hypervisor::IsAvailable();
     real_nested = available && VMM::IsNested() == false;  // true nested vm only when not already nested (satoru)
 
-    SerialLogger::Log("KSA: init  -  hypervisor ");
+    SerialLogger::Log("KSA: init - hypervisor ");
     SerialLogger::Log(available ? "available" : "unavailable");
     SerialLogger::Log(", prompt path=");
     SerialLogger::Log(real_nested ? "nested-vm" : "ept-isolated-context");
@@ -150,7 +150,7 @@ bool KSA::SpawnContext() {
     uint64_t pages_needed = (KSA_REGION_SZ / PAGE_SIZE);
     uint64_t over = PMM::AllocContiguous(pages_needed * 2);
     if (!over) {
-        SerialLogger::Log("KSA: spawn failed  -  no contiguous guest memory\r\n");
+        SerialLogger::Log("KSA: spawn failed - no contiguous guest memory\r\n");
         return false;
     }
     uint64_t aligned = (over + 0x1FFFFFULL) & ~0x1FFFFFULL;
@@ -176,9 +176,9 @@ bool KSA::SpawnContext() {
         EPTManager::MapRAM(g_ksa_ept, KSA_GUEST_PHYS, g_region_phys, KSA_REGION_SZ);
     }
 
-    // remove the region from the main-os page tables  -  THE isolation step.
+    // remove the region from the main-os page tables - THE isolation step.
     if (!KernelVMM::IsolateFrames(g_region_phys, KSA_REGION_SZ / PAGE_SIZE)) {
-        SerialLogger::Log("KSA: WARNING  -  IsolateFrames incomplete\r\n");
+        SerialLogger::Log("KSA: WARNING - IsolateFrames incomplete\r\n");
     }
     g_isolated = true;
 
@@ -249,11 +249,11 @@ static inline bool ksa_hit(int px, int py, int x, int y, int w, int h) {
 }
 
 // blit the isolated framebuffer onto the visible screen, centered. this is the
-// hypervisor present path  -  the main-os compositor is not involved and gets no
+// hypervisor present path - the main-os compositor is not involved and gets no
 // pointer to the isolated region; ksa copies pixel-by-pixel into the back
 // buffer. the caller composes the full frame (panel + text + buttons) THEN
-// presents once, so the text  -  which the font engine draws into the same back
-// buffer  -  actually reaches the screen. (satoru)
+// presents once, so the text - which the font engine draws into the same back
+// buffer - actually reaches the screen. (satoru)
 static void ksa_blit_panel(uint8_t* fb, const KSALayout& L) {
     int sw = Graphics::GetWidth();
     int sh = Graphics::GetHeight();
@@ -269,7 +269,7 @@ static void ksa_blit_panel(uint8_t* fb, const KSALayout& L) {
 // push the composed back buffer to the real framebuffer + the host gpu.
 // SwapBuffers only copies the dirty-region list, and the dim + panel blit go
 // through FillRectAlpha/DrawPixel which do NOT mark dirty (only the FillRect
-// buttons did  -  which is why an earlier build showed buttons over a live
+// buttons did - which is why an earlier build showed buttons over a live
 // desktop with no panel). mark the whole screen so the full composed frame is
 // flushed to the front buffer and transferred to the virtio gpu. (satoru)
 static void ksa_present() {
@@ -295,7 +295,7 @@ static void ksa_render(uint8_t* fb, const KSARequest& req, const char* typed,
     // the main-os compositor leaves a clip rect set from its last frame; our
     // per-pixel panel/dim blit goes through DrawPixel which honours the clip and
     // would otherwise be silently dropped outside it (that left the buttons
-    // visible  -  FillRect clamps instead of dropping  -  but the panel/backdrop
+    // visible - FillRect clamps instead of dropping - but the panel/backdrop
     // missing). reset to full-screen so ksa owns the whole surface. (satoru)
     Graphics::ClearClipRect();
 
@@ -389,12 +389,12 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
     RuntimeLog::LogSecurity("ksa prompt shown", req.detail ? req.detail : req.title);
     SUPR::Log(ACT_KSA_PROMPT, req.username ? req.username : "root",
               req.detail ? req.detail : "ksa prompt");
-    SerialLogger::Log("KSA: prompt up  -  secure desktop owns the screen + input\r\n");
+    SerialLogger::Log("KSA: prompt up - secure desktop owns the screen + input\r\n");
 
     // ── DISPLAY OWNERSHIP / SECURE DESKTOP ─────────────────────────────────
     // the cooperative scheduler is the lever here. this loop never calls
     // Scheduler::Yield/SleepMs, so while it runs the gui compositor process and
-    // the input process are BOTH starved  -  the main os cannot draw over the
+    // the input process are BOTH starved - the main os cannot draw over the
     // prompt, cannot read the framebuffer that ksa is presenting to, and cannot
     // pull the keystrokes/clicks (this loop is the only code polling the 8042).
     // ksa is therefore the sole owner of the screen and of input for the prompt's
@@ -447,7 +447,7 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
         }
 
         // mouse: drain motion (for button hover) and detect a click on the
-        // Approve/Deny rects. ksa polls the mouse itself  -  the paused input
+        // Approve/Deny rects. ksa polls the mouse itself - the paused input
         // process is not feeding it. (satoru)
         if (!decided) {
             Mouse::Poll();
@@ -475,9 +475,9 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
     }
 
     if (!decided) {
-        // timed out with no answer  -  fail closed (treated as a deny). (satoru)
+        // timed out with no answer - fail closed (treated as a deny). (satoru)
         approved = false;
-        SerialLogger::Log("KSA: prompt timed out  -  failing closed (deny)\r\n");
+        SerialLogger::Log("KSA: prompt timed out - failing closed (deny)\r\n");
     }
 
     // write the verdict INTO the isolated region (the in-vm result), then read
@@ -507,7 +507,7 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
         ksa_close_window();
     }
 
-    // wipe local typed buffer  -  the cleartext credential must not linger in
+    // wipe local typed buffer - the cleartext credential must not linger in
     // main-os memory. (satoru)
     for (int i = 0; i < 64; i++) typed[i] = 0;
 
@@ -551,13 +551,13 @@ bool KSA::ReadVerdictForChannel(KSAVerdict& out) {
 bool KSA::SelfTest() {
     SerialLogger::Log("KSA-SELFTEST: begin\r\n");
     if (!available) {
-        SerialLogger::Log("KSA-SELFTEST: hypervisor unavailable  -  ksa is a no-op on this host\r\n");
+        SerialLogger::Log("KSA-SELFTEST: hypervisor unavailable - ksa is a no-op on this host\r\n");
         SerialLogger::Log("KSA-SELFTEST: PASS (unavailable-and-honest)\r\n");
         return true;
     }
 
     if (!SpawnContext()) {
-        SerialLogger::Log("KSA-SELFTEST: FAIL  -  could not spawn isolated context\r\n");
+        SerialLogger::Log("KSA-SELFTEST: FAIL - could not spawn isolated context\r\n");
         return false;
     }
 
@@ -625,7 +625,7 @@ bool KSA::PromptDemo(bool want_cred) {
     SerialLogger::Log("KSA-PROMPT-DEMO: begin (want_cred=");
     SerialLogger::Log(want_cred ? "yes)\r\n" : "no)\r\n");
     if (!available) {
-        SerialLogger::Log("KSA-PROMPT-DEMO: ksa unavailable on this host  -  cannot draw the prompt\r\n");
+        SerialLogger::Log("KSA-PROMPT-DEMO: ksa unavailable on this host - cannot draw the prompt\r\n");
         return false;
     }
 

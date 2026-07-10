@@ -9,7 +9,7 @@
 // console.  Each console keeps its own scrollback buffer and ANSI cursor
 // position; consoles 1..6 are TTYs, console 7 is reserved for the GUI.
 //
-// Switching is cooperative  -  the keyboard handler calls VConsole::Switch()
+// Switching is cooperative - the keyboard handler calls VConsole::Switch()
 // which sets the active index; the next GUI frame reads the active index
 // via VConsole::Active() and renders either the framebuffer compositor
 // (tty7) or the corresponding text buffer.

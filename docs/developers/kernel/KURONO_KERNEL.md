@@ -40,7 +40,7 @@ The main loop runs indefinitely after boot. Each iteration:
 8. Updates and renders the desktop.
 9. Refreshes periodic views like Task Manager.
 
-The loop is intentionally polling-based. This is not a limitation  -  it is a deliberate architectural choice that matches the project's hardware compatibility requirements.
+The loop is intentionally polling-based. This is not a limitation - it is a deliberate architectural choice that matches the project's hardware compatibility requirements.
 
 ## 4. Emergency mode
 
@@ -58,8 +58,8 @@ If the system detects that the normal boot path is unsafe, it falls into an emer
 
 ## 6. Related files
 
-- `src/kernel/panic.cpp`  -  crash screen
-- `src/hal/hal.cpp`  -  IDT and PIC
-- `src/kernel/pmm.cpp`  -  physical memory
-- `src/kernel/heap.cpp`  -  heap allocator
-- `src/drivers/display.cpp`  -  display path selection
+- `src/kernel/panic.cpp` - crash screen
+- `src/hal/hal.cpp` - IDT and PIC
+- `src/kernel/pmm.cpp` - physical memory
+- `src/kernel/heap.cpp` - heap allocator
+- `src/drivers/display.cpp` - display path selection

@@ -1,4 +1,4 @@
-//  kurono os  -  realtek rtw pcie wifi radio driver (satoru)
+//  kurono os - realtek rtw pcie wifi radio driver (satoru)
 //  see wifi_rtw.h. implements Ieee80211::WifiRadioOps for rtl8821ce / rtl8723be
 //  / rtl8822ce / rtl8812ae. original kurono code; hardware behaviour re-derived
 //  from linux rtw88 + rtlwifi (each block cites its ref). (satoru)
@@ -16,7 +16,7 @@ namespace WifiRtw {
 
 // ── realtek register map (ref: linux rtw88 reg.h / rtlwifi/wifi.h) ──── (satoru)
 //
-//  these offsets are stable across the rtl88xx/87xx family  -  the system-control
+//  these offsets are stable across the rtl88xx/87xx family - the system-control
 //  block (0x00xx), the mac sub-system regs (0x01xx), the fifo/llt regs (0x02xx),
 //  the dma ring base regs (0x03xx-0x05xx), and the rcr/rx-filter regs. only the
 //  power-sequence *contents* and a few phy regs differ per chip. (satoru)
@@ -72,7 +72,7 @@ namespace WifiRtw {
 //  each tx queue and the rx queue has a 64-bit ring base + a host/dma index pair.
 //  the bcn/high/mgmt/vo/vi/be/bk queues map to tx priorities; rxq is the rx ring.
 //  (the rtl8723/8812 rtlwifi layout differs slightly but uses the same 0x03xx
-//  window  -  these are the rtw88 offsets, cited per-use.) (satoru)
+//  window - these are the rtw88 offsets, cited per-use.) (satoru)
 #define REG_PCIE_CTRL        0x0300
 #define REG_INT_MIG          0x0304   // interrupt migration (coalescing) (satoru)
 #define REG_BCNQ_DESA        0x0308   // beacon queue desc-ring base addr (64-bit) (satoru)
@@ -166,7 +166,7 @@ namespace WifiRtw {
 // ── tx/rx descriptor ring geometry ─────────────────────────────────── (satoru)
 //  rtw88 pci uses "tx buffer descriptors" (txbd) that point at the real tx
 //  descriptor + payload in host memory. we keep it simple: one ring per queue we
-//  actually use (mgmt for all our tx  -  probe/auth/assoc/eapol  -  and rx). a real
+//  actually use (mgmt for all our tx - probe/auth/assoc/eapol - and rx). a real
 //  driver fans data frames across vo/vi/be/bk by tid; the supplicant only needs
 //  the mgmt path until a data path exists. (satoru)
 #define RTW_RING_SZ        128         // descriptors per ring (power of two) (satoru)
@@ -288,7 +288,7 @@ static bool poll8(uint32_t off, uint8_t mask, uint8_t want, uint32_t timeout_ms)
 //  brings the mac analog + digital domains and the 8051 out of reset. (satoru)
 //
 //  the exact bytes are chip- and cut-specific; the *structure* below is the
-//  common card-enable flow shared by these parts. UNSURE entries are marked  - 
+//  common card-enable flow shared by these parts. UNSURE entries are marked - 
 //  a maintainer cross-checks them against the chip's tables.c on real hw. we
 //  model the four opcodes linux uses: WRITE (rmw a byte field), POLL (wait for a
 //  field), DELAY (us/ms), and END. (satoru)
@@ -306,7 +306,7 @@ static const PwrStep kPwrOn[] = {
     // 1. disable the power-seq register protection so the regs below take. (satoru)
     { PWR_WRITE, REG_RSV_CTRL,    0xFF, 0x00 },                 // clear rsv_ctrl lock (satoru)
     // 2. release the analog power-down: clear APFM_OFFMAC / wake from deep sleep.
-    //    APS_FSMCO bit ~ APFM_OFFMAC (off=0x0005 bit1 in linux)  -  UNSURE per chip.
+    //    APS_FSMCO bit ~ APFM_OFFMAC (off=0x0005 bit1 in linux) - UNSURE per chip.
     { PWR_WRITE, REG_APS_FSMCO+1, 0x02, 0x00 },                 // UNSURE: clear off-mac (satoru)
     { PWR_POLL,  REG_APS_FSMCO+1, 0x02, 0x00 },                 // wait until powered (satoru)
     // 3. enable the AFE: turn on the macro-block (BIT_MAC_PWR ...). (satoru)
@@ -323,7 +323,7 @@ static const PwrStep kPwrOn[] = {
     { PWR_END,   0, 0, 0 },
 };
 
-// card-disable flow (power down)  -  reverse the above into deep sleep. (satoru)
+// card-disable flow (power down) - reverse the above into deep sleep. (satoru)
 static const PwrStep kPwrOff[] = {
     { PWR_WRITE, REG_CR,          0xFF, 0x00 },                 // mac func off (satoru)
     { PWR_WRITE, REG_SYS_FUNC_EN, FEN_CPUEN, 0x00 },           // stop the 8051 (satoru)
@@ -403,7 +403,7 @@ static bool llt_init(uint8_t txpktbuf_bndy) {
 //  ref: rtw88 pci.c rtw_pci_init_tx_ring / rtw_pci_init_rx_ring. each ring needs
 //  a buffer-descriptor array + a block of per-slot payload buffers, both dma-
 //  visible. PMM::AllocBytes hands out page-aligned, identity-mapped (virt==phys)
-//  contiguous frames  -  exactly the coherent memory the dma engine needs (no
+//  contiguous frames - exactly the coherent memory the dma engine needs (no
 //  iommu on these boards; phys == the address we program). (satoru)
 static bool alloc_ring(RtwRing* r) {
     r->bd = (RtwBufDesc*)PMM::AllocBytes(sizeof(RtwBufDesc) * RTW_RING_SZ);
@@ -427,7 +427,7 @@ static bool alloc_ring(RtwRing* r) {
 }
 
 // program the ring base-address regs + reset the host/dma indices. (satoru)
-//  ref: rtw88 pci.c rtw_pci_reset_trx_ring  -  we wire the mgmt tx queue and the
+//  ref: rtw88 pci.c rtw_pci_reset_trx_ring - we wire the mgmt tx queue and the
 //  rx queue (the two the supplicant uses). bcn/vo/vi/be/bk are left at zero base;
 //  the maintainer maps the rest when a full data path lands. (satoru)
 static void program_rings() {
@@ -481,7 +481,7 @@ static const char* fw_names(RtwChip chip, int idx) {
     }
 }
 
-// load the blob bytes into the chip. `blob`/`len` already point past nothing  - 
+// load the blob bytes into the chip. `blob`/`len` already point past nothing - 
 //  we strip the realtek header here. returns true once the on-chip cpu reports
 //  init-complete. (satoru)
 static bool fw_download(const uint8_t* blob, int len) {
@@ -516,7 +516,7 @@ static bool fw_download(const uint8_t* blob, int len) {
         if (chunk > RTW_FW_PAGE_SIZE) chunk = RTW_FW_PAGE_SIZE;
         // copy the page as dwords into the mmio fw window (the chip latches it
         //  into 8051 code ram). pad the final partial page with the tail bytes
-        //  only  -  do not over-read the blob. (satoru)
+        //  only - do not over-read the blob. (satoru)
         int i = 0;
         for (; i + 4 <= chunk; i += 4) {
             uint32_t v = (uint32_t)body[off+i] | ((uint32_t)body[off+i+1] << 8) |
@@ -554,7 +554,7 @@ static bool fw_download(const uint8_t* blob, int len) {
 }
 
 // read the firmware file from the kurono fs and hand it to fw_download. tries the
-//  per-chip candidate names. returns false (cleanly) if none are present  -  this
+//  per-chip candidate names. returns false (cleanly) if none are present - this
 //  is the expected path in-tree, since the blob is not shipped. (satoru)
 static bool load_firmware_from_fs() {
     // a per-page scratch read buffer would be cleaner, but KVFS::ReadFile wants a
@@ -675,13 +675,13 @@ static bool read_efuse_mac(uint8_t out[6]) {
 
 // start(): the full bring-up. power-on seq -> mac init -> dma rings -> firmware.
 //  fails cleanly (returns false, leaves the radio quiesced) if the mmio window is
-//  dead or the firmware is absent  -  no faking association without hardware. (satoru)
+//  dead or the firmware is absent - no faking association without hardware. (satoru)
 static bool rtw_start(void* ctx) {
     RtwState* s = (RtwState*)ctx;
     if (s->started) return true;
 
     if (!s->mmio_ok) {
-        log("[rtw] start: mmio window dead  -  cannot bring up\r\n");
+        log("[rtw] start: mmio window dead - cannot bring up\r\n");
         return false;
     }
     log("[rtw] bring-up: "); log(chip_name(s->chip)); log("\r\n");
@@ -707,7 +707,7 @@ static bool rtw_start(void* ctx) {
     // 4. program the ring base-address regs + indices. (satoru)
     program_rings();
 
-    // 5. firmware download  -  required for these parts. clean fail if absent. (satoru)
+    // 5. firmware download - required for these parts. clean fail if absent. (satoru)
     if (!s->fw_loaded) {
         s->fw_loaded = load_firmware_from_fs();
         if (!s->fw_loaded) {
@@ -811,17 +811,17 @@ static bool rtw_config_bss(void* ctx, const uint8_t bssid[6], const char* ssid) 
     return true;
 }
 
-// set_key(): we do not offload crypto  -  return false so the 802.11 stack does
+// set_key(): we do not offload crypto - return false so the 802.11 stack does
 //  ccmp in software (it is designed to fall back). a maintainer can later wire
 //  the cam (content-addressable memory) key table here. (satoru)
-//  ref: rtw88 sec.c rtw_sec_write_cam  -  intentionally not implemented. (satoru)
+//  ref: rtw88 sec.c rtw_sec_write_cam - intentionally not implemented. (satoru)
 static bool rtw_set_key(void* ctx, int idx, const uint8_t* key, int key_len, int type) {
     (void)ctx; (void)idx; (void)key; (void)key_len; (void)type;
     return false;   // software ccmp (satoru)
 }
 
 // tx_frame(): enqueue one fully-formed 802.11 frame onto the mgmt tx ring. (satoru)
-//  ref: rtw88 tx.c rtw_pci_tx  -  we build the 48-byte realtek tx descriptor in
+//  ref: rtw88 tx.c rtw_pci_tx - we build the 48-byte realtek tx descriptor in
 //  front of the frame, point the buffer-descriptor at it, then bump the host
 //  index so the dma engine fetches it. (satoru)
 //
@@ -846,10 +846,10 @@ static bool rtw_tx_frame(void* ctx, const uint8_t* frame, int len) {
     d->dw[0] = ((uint32_t)len & 0xFFFF) |
                (((uint32_t)RTW_TXDESC_BYTES & 0xFF) << 16) |
                (1u << 31);
-    // dw1: QSEL  -  mgmt queue select (0x12 = mgmt high). UNSURE: qsel codes per
+    // dw1: QSEL - mgmt queue select (0x12 = mgmt high). UNSURE: qsel codes per
     //      chip; 0x12 is the common mgmt value in rtlwifi. mac-id 0. (satoru)
     d->dw[1] = (0x12u << 8);
-    // dw3: sequence  -  let hardware assign (HWSEQ_EN) by leaving the seq field 0
+    // dw3: sequence - let hardware assign (HWSEQ_EN) by leaving the seq field 0
     //      and setting the hw-seq enable hint. (satoru)
     d->dw[3] = 0;
     // dw4: use a low basic rate for mgmt (rate index 0 = 1mbps) with rate-control
@@ -875,7 +875,7 @@ static bool rtw_tx_frame(void* ctx, const uint8_t* frame, int len) {
 
 // rx_poll(): drain one frame off the rx ring if the hardware has filled a
 //  descriptor. (satoru)
-//  ref: rtw88 rx.c rtw_pci_rx_isr / rtw_rx_fill_rx_status  -  the chip writes a
+//  ref: rtw88 rx.c rtw_pci_rx_isr / rtw_rx_fill_rx_status - the chip writes a
 //  24-byte rx descriptor in front of the mpdu; we parse the length + the phy-
 //  status (for rssi) and copy out the 802.11 frame (fcs stripped). returns the
 //  frame length, 0 if nothing pending. (satoru)
@@ -987,7 +987,7 @@ bool TryRegister() {
     g_state.last_rssi = -100;
 
     log("[rtw] detected "); log(chip_name(g_state.chip));
-    log(g_state.mmio_ok ? " (mmio live)\r\n" : " (mmio DEAD  -  bring-up will fail)\r\n");
+    log(g_state.mmio_ok ? " (mmio live)\r\n" : " (mmio DEAD - bring-up will fail)\r\n");
 
     // fill the ops vtable. (satoru)
     g_ops.start         = rtw_start;

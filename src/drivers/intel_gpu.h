@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  intel integrated gpu driver
+//  kurono os - intel integrated gpu driver
 //  pci device detection, bar mapping, display pipe management
 //  supports gen 6 (sandy bridge) through gen 12.7+ (arrow/lunar lake)
 #include "../kernel/types.h"
@@ -32,9 +32,9 @@ struct IntelGPUInfo {
     uint8_t    bus, device, function;
     uint8_t    revision;
     IntelGpuGen gen;
-    uint64_t   bar0;           // gttmmaddr  -  mmio registers
+    uint64_t   bar0;           // gttmmaddr - mmio registers
     uint64_t   bar0_size;
-    uint64_t   bar2;           // gmadr  -  graphics memory aperture
+    uint64_t   bar2;           // gmadr - graphics memory aperture
     uint64_t   bar2_size;
     uint32_t   stolen_mem_mb;  // stolen memory in mb
     char       name[64];       // human-readable name
@@ -44,7 +44,7 @@ struct IntelGPUInfo {
     bool       has_3d_accel;   // render/compute engine usable for compositor
 };
 
-//  intelgpu  -  static driver interface
+//  intelgpu - static driver interface
 class IntelGPU {
 public:
     static void Init();
@@ -62,7 +62,7 @@ public:
 
     // accel capability flags for the compositor
     static bool HasHardwareAccel();
-    // best-effort hardware fill into the active scanout  -  returns false if unsupported.
+    // best-effort hardware fill into the active scanout - returns false if unsupported.
     // the dst rectangle is clamped to the active pipe's resolution.
     static bool BlitFillARGB(uint32_t color, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  window manager
+//  kurono os - window manager
 //  compositing window manager with z-ordering, drag, resize, close
 
 #define WM_MAX_WINDOWS    32
@@ -196,7 +196,7 @@ public:
     // invalidated (forcing a normal full render) the instant anything behind
     // the window could have changed. (satoru)
 
-    // true only while a left-button TITLEBAR drag (not resize) is active  - 
+    // true only while a left-button TITLEBAR drag (not resize) is active - 
     // the precondition for using the fast backdrop path. (satoru)
     static bool IsWindowDragActive();
     // true when a valid backdrop snapshot exists for the current drag. (satoru)

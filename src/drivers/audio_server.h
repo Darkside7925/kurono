@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  unified audio server (high-level API)
+//  kurono os - unified audio server (high-level API)
 //
 //  AudioServer is the single entry point apps and drivers call.  It owns
 //  the active backend (selected at boot from sb16/ac97/hda/pcspk) and
@@ -19,10 +19,10 @@ namespace AudioServer {
 
 // One-time bring-up.  Calls AudioDMA::Init(), AudioMixer::Init(), then
 // probes each registered backend in priority order:
-//   1. HDA  (preferred  -  handles QEMU intel-hda + most modern PCs)
-//   2. AC97 (mid-90s onward  -  lots of integrated chipsets)
-//   3. SB16 (legacy ISA  -  QEMU's `-device sb16`)
-//   4. PCSPK (PIT square wave  -  never fails, last resort)
+//   1. HDA  (preferred - handles QEMU intel-hda + most modern PCs)
+//   2. AC97 (mid-90s onward - lots of integrated chipsets)
+//   3. SB16 (legacy ISA - QEMU's `-device sb16`)
+//   4. PCSPK (PIT square wave - never fails, last resort)
 // The first one whose Init() returns true becomes ActiveBackend().
 void Init();
 

@@ -14,11 +14,11 @@
 // DisplayManager sets this once it selects + inits the virtio backend. (satoru)
 static bool g_present_via_virtio = false;
 
-// page directory tables from kurono_boot.asm  -  needed to remap fb caching
+// page directory tables from kurono_boot.asm - needed to remap fb caching
 extern "C" uint8_t pd_tables[];
-// pdpt from kurono_boot.asm  -  needed to add new pd tables for >16gb fbs
+// pdpt from kurono_boot.asm - needed to add new pd tables for >16gb fbs
 extern "C" uint8_t pdpt[];
-// 1 gib-page pdpts for pml4[1..3] (512 gb..2 tb) from kurono_boot.asm  -  needed to
+// 1 gib-page pdpts for pml4[1..3] (512 gb..2 tb) from kurono_boot.asm - needed to
 // set write-combining on a high efi gop framebuffer that lands in that range (satoru)
 extern "C" uint8_t efi_hi_pdpts[];
 
@@ -48,7 +48,7 @@ static void fb_copy_nt(void* dst, const void* src, size_t size) {
         *d++ = *s++; size--;
     }
 
-    // 256-byte unrolled loop  -  issues 4 wc-combine-buffer worth of stores
+    // 256-byte unrolled loop - issues 4 wc-combine-buffer worth of stores
     // per iteration to keep the memory pipeline full.
     while (size >= 256) {
         __asm__ __volatile__(
@@ -114,7 +114,7 @@ static int extra_pd_count = 0;
 // gpu memory controller on real hardware, causing a permanent black screen.
 static bool remap_fb_writecombining(uintptr_t fb_phys, size_t fb_size) {
     if (!fb_phys || !fb_size) {
-        SerialLogger::Log("Graphics: WC remap skipped  -  no FB address\r\n");
+        SerialLogger::Log("Graphics: WC remap skipped - no FB address\r\n");
         return false;
     }
 
@@ -194,11 +194,11 @@ static bool remap_fb_writecombining(uintptr_t fb_phys, size_t fb_size) {
         pages_remapped++;
     }
 
-    // full memory fence  -  ensures wc attribute is observed before any fb writes
+    // full memory fence - ensures wc attribute is observed before any fb writes
     __asm__ __volatile__("mfence" ::: "memory");
 
     if (had_overflow) {
-        SerialLogger::Log("Graphics: WARNING  -  FB region extends beyond mappable range!\r\n");
+        SerialLogger::Log("Graphics: WARNING - FB region extends beyond mappable range!\r\n");
     }
 
     SerialLogger::Log("Graphics: FB remapped ");
@@ -229,7 +229,7 @@ Graphics::DrawStats Graphics::draw_stats = {0};
 static int  g_color_filter   = 0;     // 0=off,1=protan,2=deutan,3=tritan,4=gray
 static bool g_high_contrast  = false;
 // software display brightness 10..100 (%). this backend has no panel/gamma
-// dimming, so we dim in the swapbuffers post-process pass instead  -  the
+// dimming, so we dim in the swapbuffers post-process pass instead - the
 // display settings slider now has a real effect. 100 = unmodified. (satoru)
 static int  g_brightness     = 100;
 
@@ -249,7 +249,7 @@ int Graphics::dirty_count = 0;
 bool Graphics::full_screen_dirty = false;
 uint64_t Graphics::dirty_area_total = 0;
 
-// Global UI dirty signal  -  see graphics.h. volatile: written from input /
+// Global UI dirty signal - see graphics.h. volatile: written from input /
 // app / animation paths (potentially other kernel processes) and read by
 // the GUI process each frame. A monotonically-incrementing counter lets the
 // GUI loop detect "changed since I last looked" via a snapshot compare, so a
@@ -270,7 +270,7 @@ bool Graphics::ConsumeUIDirty() {
 void Graphics::Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp) {
     if (addr == 0 || width == 0 || height == 0 || pitch == 0 ||
         bpp < 15 || bpp > 32) {
-        SerialLogger::Log("Graphics: Init rejected  -  invalid framebuffer args\r\n");
+        SerialLogger::Log("Graphics: Init rejected - invalid framebuffer args\r\n");
         return;
     }
     // any back_buffer left over from a prior config is now sized wrong; drop it.
@@ -302,7 +302,7 @@ void Graphics::Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pi
 
     fb_wc_active = remap_fb_writecombining(addr, (size_t)pitch * height);
     if (!fb_wc_active) {
-        SerialLogger::Log("Graphics: WARNING  -  WC remap FAILED, using wbinvd fallback (slower)\r\n");
+        SerialLogger::Log("Graphics: WARNING - WC remap FAILED, using wbinvd fallback (slower)\r\n");
     }
     KernelPanic::UpdateFramebuffer((uint64_t)addr, pitch, width, height, bpp);
 }
@@ -483,7 +483,7 @@ uint32_t Graphics::DetectRefreshRate() {
     uint8_t probe;
     __asm__ __volatile__("inb %1, %0" : "=a"(probe) : "Nd"((uint16_t)0x3DA));
     if (probe == 0xFF || probe == 0x00) {
-        SerialLogger::Log("Graphics: No VGA VSync (EFI?)  -  defaulting to 60 Hz\r\n");
+        SerialLogger::Log("Graphics: No VGA VSync (EFI?) - defaulting to 60 Hz\r\n");
         monitor_hz = 60;
         return 60;
     }
@@ -538,7 +538,7 @@ uint32_t Graphics::DetectRefreshRate() {
 
 bool Graphics::ShouldRender() {
     uint64_t current_time = TimeManager::NowUTC().us;
-    if (current_time < last_frame_time) return true;  // clock skew  -  render
+    if (current_time < last_frame_time) return true;  // clock skew - render
     return (current_time - last_frame_time) >= (uint64_t)target_frame_time_us;
 }
 
@@ -787,7 +787,7 @@ void Graphics::DrawPixel(int x, int y, uint32_t color) {
          (unsigned)(y - clip_y) >= (unsigned)clip_h)) return;
 
     uint8_t alpha = (color >> 24) & 0xFF;
-    if (alpha == 0) return;  // fully transparent  -  skip
+    if (alpha == 0) return;  // fully transparent - skip
     if (alpha >= 0xF0) {
         // near-opaque: treat as fully opaque (huge perf win)
         DrawPixelUnsafe(x, y, color | 0xFF000000u);
@@ -800,7 +800,7 @@ void Graphics::DrawPixel(int x, int y, uint32_t color) {
 
 void Graphics::DrawPixelUnsafe(int x, int y, uint32_t color) {
     if (!active_buffer) return;
-    // bounds check  -  "Unsafe" historically meant unchecked vs clip rect, but
+    // bounds check - "Unsafe" historically meant unchecked vs clip rect, but
     // OOB store to a wc-mapped fb can corrupt unrelated mmio (page-aligned
     // bars sit right after the fb on many gpus).
     if ((unsigned)x >= fb_width || (unsigned)y >= fb_height) return;
@@ -957,10 +957,10 @@ void Graphics::MarkDirty(int x, int y, int w, int h) {
     if (y + h > (int)fb_height) h = (int)fb_height - y;
     if (w <= 0 || h <= 0) return;
 
-    // already collapsed to full-screen for this frame  -  nothing more to track. (satoru)
+    // already collapsed to full-screen for this frame - nothing more to track. (satoru)
     if (full_screen_dirty) return;
 
-    // fast path: there's still room, just record the rect. o(1)  -  the running
+    // fast path: there's still room, just record the rect. o(1) - the running
     // area sum is kept incrementally so small-rect frames stay cheap. (satoru)
     if (dirty_count < DIRTY_REGION_CAP) {
         DirtyRegion& region = dirty_regions[dirty_count++];
@@ -972,7 +972,7 @@ void Graphics::MarkDirty(int x, int y, int w, int h) {
         dirty_area_total += (uint64_t)w * (uint64_t)h;
 
         // if accumulated damage already covers most of the screen, a per-rect
-        // partial blit buys nothing over one contiguous copy  -  collapse to a
+        // partial blit buys nothing over one contiguous copy - collapse to a
         // single full-screen damage now so the decision is deterministic, not an
         // accident of coalescing order. (satoru)
         uint64_t total = (uint64_t)fb_width * (uint64_t)fb_height;
@@ -1118,7 +1118,7 @@ uint32_t Graphics::BlendColors(uint32_t src, uint32_t dst, uint8_t alpha) {
 void Graphics::BlendPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     if (a == 0) return;
     if (a == 255) { DrawPixel(x, y, RGB(r, g, b)); return; }
-    // honour the active clip  -  without this, alpha-blended primitives (shadows,
+    // honour the active clip - without this, alpha-blended primitives (shadows,
     // translucent panels, rounded-corner AA) bled past their window. (satoru)
     if (clipping_enabled &&
         ((unsigned)(x - clip_x) >= (unsigned)clip_w ||
@@ -1171,13 +1171,13 @@ void Graphics::FillRectRounded(int x, int y, int w, int h, int r, uint32_t color
 
 void Graphics::FillRectAlpha(int x, int y, int w, int h, uint8_t a, uint32_t color) {
     if (a == 0 || w <= 0 || h <= 0) return;
-    // fully opaque  -  hand off to the 64-bit fast fill path. (satoru)
+    // fully opaque - hand off to the 64-bit fast fill path. (satoru)
     if (a == 255) { FillRect(x, y, w, h, color | 0xFF000000u); return; }
 
     // clamp once to framebuffer bounds instead of bounds-checking every
     // pixel, then blend inline. for a constant source colour the per-channel
     // src*alpha terms are loop invariants (cr/cg/cb), so the inner loop only
-    // reads the destination, blends, and writes  -  no BlendPixel call, no
+    // reads the destination, blends, and writes - no BlendPixel call, no
     // per-pixel address math. this is the hot path for window drop-shadows
     // that are redrawn every frame, so the win compounds. note: we clamp to
     // the framebuffer (not the clip rect) to exactly match the old
@@ -1300,7 +1300,7 @@ void Graphics::SetBrightness(int pct){
 }
 int  Graphics::GetBrightness(){ return g_brightness; }
 
-//  drawstring  -  convenience text renderer for desktop/app layers
+//  drawstring - convenience text renderer for desktop/app layers
 //  font size scales with resolution: 16px at 1024x768, 16px at 1080p,
 //  20px at 1440p for readable text at every density.
 void Graphics::DrawString(int x, int y, const char* s, uint32_t fg, uint32_t /*bg*/) {
@@ -1314,7 +1314,7 @@ void Graphics::DrawString(int x, int y, const char* s, uint32_t fg, uint32_t /*b
     FontTTF::DrawString(x, y, pxh, s, fg);
 }
 
-//  drawcircle  -  midpoint circle algorithm
+//  drawcircle - midpoint circle algorithm
 void Graphics::DrawCircle(int cx, int cy, int radius, uint32_t color, bool filled) {
     if (radius <= 0) { DrawPixel(cx, cy, color); return; }
 
@@ -1324,7 +1324,7 @@ void Graphics::DrawCircle(int cx, int cy, int radius, uint32_t color, bool fille
     auto hline = [&](int lx, int rx, int ly) {
         if (ly < 0 || ly >= (int)fb_height) return;
         if (rx < lx) return;
-        // FillRect-based span  -  hits the 64-bit bulk path on 32 bpp
+        // FillRect-based span - hits the 64-bit bulk path on 32 bpp
         FillRect(lx, ly, rx - lx + 1, 1, color);
     };
 

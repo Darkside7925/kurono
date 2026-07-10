@@ -314,9 +314,9 @@ int CmdKmemx(void* /*sh*/, int argc, const char** argv, char* out, int mx) {
         // same live figures honestly. (satoru)
         int p = StatusText(out, mx);
         if (argc >= 3 && arg_is(argv[2], "--firefox"))
-            p = sappend(out, p, mx, "(scope: linux runtime incl. firefox  -  per-process bucketing not yet tracked)\n");
+            p = sappend(out, p, mx, "(scope: linux runtime incl. firefox - per-process bucketing not yet tracked)\n");
         else if (argc >= 3 && arg_is(argv[2], "--guests")) {
-            p = sappend(out, p, mx, "(scope: hypervisor guests  -  registered guests: ");
+            p = sappend(out, p, mx, "(scope: hypervisor guests - registered guests: ");
             p = sappend_u(out, p, mx, 0);   // guest count is internal; 0 when none (satoru)
             p = sappend(out, p, mx, ")\n");
         }

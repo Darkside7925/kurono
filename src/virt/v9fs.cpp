@@ -1,4 +1,4 @@
-//  kurono os  -  virtual 9p filesystem implementation
+//  kurono os - virtual 9p filesystem implementation
 //  maps 9p operations to kvfs (kurono virtual file system)
 #include "v9fs.h"
 #include "guest_mem.h"
@@ -40,7 +40,7 @@ static void kpathcat(char* dst, int max, const char* parent, const char* child) 
     dst[i] = '\0';
 }
 
-//  init  -  reset all fids
+//  init - reset all fids
 
 void V9FS::Init() {
     for (int i = 0; i < V9FS_MAX_FIDS; i++) {
@@ -84,7 +84,7 @@ bool V9FS::ValidFid(int fid) {
 //  vmcall dispatch
 //
 //  register convention (intel standard: regs[0]=rax, [1]=rcx, ...):
-//    regs[0] (eax) = 0x20 (hypercall number  -  already consumed by caller)
+//    regs[0] (eax) = 0x20 (hypercall number - already consumed by caller)
 //    regs[1] (ecx) = v9fs_op sub-function
 //    regs[2] (edx) = arg0 (typically fid)
 //    regs[3] (ebx) = arg1
@@ -119,7 +119,7 @@ void V9FS::HandleVMCall(uint64_t* regs) {
     regs[0] = (uint64_t)result;
 }
 
-//  doversion  -  negotiate protocol (always succeeds)
+//  doversion - negotiate protocol (always succeeds)
 //  returns: eax = 0, ecx = max i/o size
 
 int V9FS::DoVersion(uint64_t* regs) {
@@ -130,7 +130,7 @@ int V9FS::DoVersion(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  doattach  -  attach to root ("/"), returns fid 0
+//  doattach - attach to root ("/"), returns fid 0
 //  returns: eax = 0, ecx = root fid (0)
 
 int V9FS::DoAttach(uint64_t* regs) {
@@ -148,7 +148,7 @@ int V9FS::DoAttach(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  dowalk  -  walk from src_fid along a path element, create new_fid
+//  dowalk - walk from src_fid along a path element, create new_fid
 //  edx(regs[2]) = src_fid
 //  ebx(regs[3]) = new_fid (caller chooses)
 //  edi(regs[7]) = guest phys addr of null-terminated path element
@@ -213,7 +213,7 @@ int V9FS::DoWalk(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  doopen  -  open a fid for i/o
+//  doopen - open a fid for i/o
 //  edx(regs[2]) = fid
 //  ebx(regs[3]) = mode (v9fs_oread, etc.)
 //  returns: eax = 0 on success, ecx = iounit (max transfer size)
@@ -238,7 +238,7 @@ int V9FS::DoOpen(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  doread  -  read data from an open file fid
+//  doread - read data from an open file fid
 //  edx(regs[2]) = fid
 //  ebx(regs[3]) = offset
 //  esi(regs[6]) = count (max bytes to read)
@@ -284,7 +284,7 @@ int V9FS::DoRead(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  dowrite  -  write data to an open file fid
+//  dowrite - write data to an open file fid
 //  edx(regs[2]) = fid
 //  ebx(regs[3]) = offset
 //  esi(regs[6]) = count
@@ -338,7 +338,7 @@ int V9FS::DoWrite(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  doclunk  -  release a fid (close)
+//  doclunk - release a fid (close)
 //  edx(regs[2]) = fid
 
 int V9FS::DoClunk(uint64_t* regs) {
@@ -348,7 +348,7 @@ int V9FS::DoClunk(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  dostat  -  get file/directory attributes
+//  dostat - get file/directory attributes
 //  edx(regs[2]) = fid
 //  edi(regs[7]) = guest phys addr of v9fs_stat buffer (output)
 //  returns: eax = 0 on success
@@ -389,7 +389,7 @@ int V9FS::DoStat(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  doreaddir  -  read directory entries
+//  doreaddir - read directory entries
 //  edx(regs[2]) = fid (must be a directory)
 //  ebx(regs[3]) = start index (0-based entry number)
 //  esi(regs[6]) = max entries to return
@@ -443,7 +443,7 @@ int V9FS::DoReadDir(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  docreate  -  create a file or directory under a fid
+//  docreate - create a file or directory under a fid
 //  edx(regs[2]) = parent fid (must be directory)
 //  ebx(regs[3]) = new fid to assign to created entry
 //  esi(regs[6]) = flags (bit 0 = directory, bit 1 = truncate)
@@ -495,7 +495,7 @@ int V9FS::DoCreate(uint64_t* regs) {
     return V9FS_OK;
 }
 
-//  doremove  -  delete a file or directory
+//  doremove - delete a file or directory
 //  edx(regs[2]) = fid
 //  returns: eax = 0 (fid is implicitly clunked)
 

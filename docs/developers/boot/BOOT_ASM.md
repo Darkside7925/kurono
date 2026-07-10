@@ -28,7 +28,7 @@ The Multiboot header must be within the first 8 KB of the kernel image. The link
 
 ## 5. Related files
 
-- `src/boot/kurono_linker.ld`  -  shapes the kernel image layout
-- `src/boot/multiboot_header.S`  -  Multiboot2 header
-- `src/boot/efi_loader.c`  -  EFI entry path
-- `src/kernel/kurono_kernel.cpp`  -  `kernel_main()` that boot assembly calls
+- `src/boot/kurono_linker.ld` - shapes the kernel image layout
+- `src/boot/multiboot_header.S` - Multiboot2 header
+- `src/boot/efi_loader.c` - EFI entry path
+- `src/kernel/kurono_kernel.cpp` - `kernel_main()` that boot assembly calls

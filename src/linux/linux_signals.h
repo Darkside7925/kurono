@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  linux signal system
+//  kurono os - linux signal system
 //  posix signal handling for linux processes running inside kurono.
 //  implements signal delivery, handlers, masks, and queuing.
 
@@ -107,7 +107,7 @@ struct ProcessSignalState {
     int      current_signal; // which signal is being handled
 };
 
-//  linuxsignals  -  signal management
+//  linuxsignals - signal management
 
 class LinuxSignals {
 public:
@@ -134,11 +134,11 @@ public:
     static int  SigPending(int pid_idx, LinuxSigset* set);
     static int  SigSuspend(int pid_idx, const LinuxSigset* mask);
 
-    // delivery check  -  called before returning to userspace
+    // delivery check - called before returning to userspace
     static bool HasPendingSignal(int pid_idx);
     static int  DeliverPending(int pid_idx);
 
-    // sigreturn  -  called when signal handler returns
+    // sigreturn - called when signal handler returns
     static void Sigreturn(int pid_idx);
 
     // alarm support

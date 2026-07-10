@@ -2,7 +2,7 @@
 
 #include "types.h"
 #include "../proc/scheduler.h"
-#include "../proc/smp.h"        // SMP_MAX_CPUS  -  userspace state is per-cpu now (satoru)
+#include "../proc/smp.h"        // SMP_MAX_CPUS - userspace state is per-cpu now (satoru)
 
 struct UserspaceReturnContext {
     uint64_t kernel_rsp;
@@ -37,7 +37,7 @@ public:
     // smp thread dispatch: mark a directly-resumed thread as this cpu's active
     // user process. an ap that irets into a claimed sibling thread never goes
     // through RunProcessWithArgs, and IsActive() (per-cpu) gates the syscall
-    // entry's frame save + linux-current sync AND sys_exit's switch path  -  all
+    // entry's frame save + linux-current sync AND sys_exit's switch path - all
     // of which silently no-op'd on the aps without this. (satoru)
     static void SetActiveForThisCpu(Process* p);
 

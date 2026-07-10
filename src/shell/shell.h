@@ -1,7 +1,7 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  kurono shell  -  bare-metal terminal command processor
+//  kurono shell - bare-metal terminal command processor
 
 #define SHELL_MAX_CMD    512
 #define SHELL_MAX_ARGS   32
@@ -93,7 +93,7 @@ public:
     static char conflict_cmdline[SHELL_MAX_CMD];
     static int  ResolveConflict(int choice, char* output, int max_output);
 
-    // dynamic os probing  -  pings all backends at kernel level
+    // dynamic os probing - pings all backends at kernel level
     static bool pwsh_available;
     static char alpine_cmd_cache[4096];
     static bool alpine_cmd_cached;

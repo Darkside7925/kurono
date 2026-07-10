@@ -1,4 +1,4 @@
-//  kurono os  -  flat vector app icons drawn with graphics primitives. (satoru)
+//  kurono os - flat vector app icons drawn with graphics primitives. (satoru)
 #include "app_icons.h"
 #include "kss.h"
 #include "../drivers/graphics.h"
@@ -156,7 +156,7 @@ static void draw_settings(int x,int y,int s){
     Graphics::FillCircle(cx, cy, hub, acc);
 }
 
-// browser: a globe  -  a filled circle with meridian + latitude lines. (satoru)
+// browser: a globe - a filled circle with meridian + latitude lines. (satoru)
 static void draw_browser(int x,int y,int s){
     int cx = x + s/2;
     int cy = y + s/2;
@@ -226,7 +226,7 @@ static void draw_media(int x,int y,int s){
     }
 }
 
-// home: a house  -  a roof triangle over a square body with a door. (satoru)
+// home: a house - a roof triangle over a square body with a door. (satoru)
 static void draw_home(int x,int y,int s){
     int cx = x + s/2;
     int roof_top = y + sc(s,5,28);
@@ -255,7 +255,7 @@ static void draw_home(int x,int y,int s){
     Graphics::FillRoundedRect(door_x, door_y, door_w, door_h, atleast1(sc(s,1,28)), acc);
 }
 
-// generic: a stylized app glyph  -  a rounded square with a smaller inset. (satoru)
+// generic: a stylized app glyph - a rounded square with a smaller inset. (satoru)
 static void draw_generic(int x,int y,int s){
     int bx = x + sc(s,6,28);
     int bw = s - sc(s,12,28);
@@ -282,7 +282,7 @@ void Draw(int id, int x, int y, int size){
     }
 }
 
-// case-sensitive char compare on the leading bytes  -  names come from our own
+// case-sensitive char compare on the leading bytes - names come from our own
 // fixed app/desktop tables so a short prefix test is enough. order matters:
 // more-specific prefixes (e.g. "Co" for control center, "Te"/"Ta"/"Tex") are
 // tested before broad single-letter ones. (satoru)

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  x86 port i/o inline functions
+//  kurono os - x86 port i/o inline functions
 #include <stdint.h>
 
 static inline void outb(uint16_t port, uint8_t val) {

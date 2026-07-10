@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  abstract audio backend interface
+//  kurono os - abstract audio backend interface
 //
 //  Every concrete audio backend (SB16, AC97, HDA, PC speaker) implements
 //  this interface and registers a singleton instance with the mixer via

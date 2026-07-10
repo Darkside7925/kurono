@@ -1,4 +1,4 @@
-//  kurono os  -  linux device bridge  -  implementation
+//  kurono os - linux device bridge - implementation
 
 #include "linux_devices.h"
 #include "linux_kernel.h"
@@ -403,7 +403,7 @@ void LinuxDeviceBridge::RegisterDefaults() {
         devices[idx].write = WriteNull;
     }
 
-    // /dev/tty (5, 0)  -  current terminal
+    // /dev/tty (5, 0) - current terminal
     Register("tty", "/dev/tty", LDEV_CHAR, LDEV_CLASS_TTY, 5, 0);
 
     // /dev/console (5, 1)
@@ -412,10 +412,10 @@ void LinuxDeviceBridge::RegisterDefaults() {
     // /dev/tty0 (4, 0)
     Register("tty0", "/dev/tty0", LDEV_CHAR, LDEV_CLASS_CONSOLE, 4, 0);
 
-    // /dev/ttys0 (4, 64)  -  serial port
+    // /dev/ttys0 (4, 64) - serial port
     Register("ttyS0", "/dev/ttyS0", LDEV_CHAR, LDEV_CLASS_SERIAL, 4, 64);
 
-    // /dev/fb0 (29, 0)  -  framebuffer
+    // /dev/fb0 (29, 0) - framebuffer
     idx = Register("fb0", "/dev/fb0", LDEV_CHAR, LDEV_CLASS_FRAMEBUFFER, 29, 0);
     if (idx >= 0) {
         devices[idx].read = ReadFB;
@@ -429,19 +429,19 @@ void LinuxDeviceBridge::RegisterDefaults() {
         devices[idx].read = ReadInput;
     }
 
-    // /dev/input/event0 (13, 64)  -  keyboard
+    // /dev/input/event0 (13, 64) - keyboard
     idx = Register("event0", "/dev/input/event0", LDEV_CHAR, LDEV_CLASS_INPUT_KBD, 13, 64);
     if (idx >= 0) {
         devices[idx].read = ReadInput;
     }
 
-    // /dev/sda (8, 0)  -  whole disk
+    // /dev/sda (8, 0) - whole disk
     Register("sda", "/dev/sda", LDEV_BLOCK, LDEV_CLASS_DISK, 8, 0);
 
-    // /dev/sda1 (8, 1)  -  kurono partition
+    // /dev/sda1 (8, 1) - kurono partition
     Register("sda1", "/dev/sda1", LDEV_BLOCK, LDEV_CLASS_DISK_PART, 8, 1);
 
-    // /dev/sda2 (8, 2)  -  linux partition (ext4)
+    // /dev/sda2 (8, 2) - linux partition (ext4)
     Register("sda2", "/dev/sda2", LDEV_BLOCK, LDEV_CLASS_DISK_PART, 8, 2);
 
     // /dev/loop0 (7, 0)
@@ -783,7 +783,7 @@ void LinuxDeviceBridge::DumpDevices(char* out, int max_out) {
         for (int j = i - 1; j >= 0 && p < max_out - 1; j--) out[p++] = tmp[j];
     };
 
-    put("Linux Device Bridge  -  ");
+    put("Linux Device Bridge - ");
     putd(device_count);
     put(" devices\n\n");
 

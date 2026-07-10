@@ -1,7 +1,7 @@
-//  kurono os  -  ieee 802.11 software mac implementation (satoru)
+//  kurono os - ieee 802.11 software mac implementation (satoru)
 //  see ieee80211.h. frame layer + scan/auth/assoc state machine + wpa2 4-way
 //  handshake supplicant, all driven over the WifiRadioOps vendor vtable. no
-//  register access here  -  that's the vendor driver's job. (satoru)
+//  register access here - that's the vendor driver's job. (satoru)
 //  ref: ieee 802.11-2016 §9 (frames) §12 (rsna/ccmp); linux mac80211 +
 //  wpa_supplicant for the sequence. original code. (satoru)
 
@@ -71,7 +71,7 @@ static int      g_rx_head = 0, g_rx_tail = 0;
 void DeliverRx(const uint8_t* frame, int len) {
     if (len <= 0 || len > RX_FRAME_MAX) return;
     int next = (g_rx_tail + 1) % RX_RING_SLOTS;
-    if (next == g_rx_head) return;            // ring full  -  drop (satoru)
+    if (next == g_rx_head) return;            // ring full - drop (satoru)
     i_memcpy(g_rx_ring[g_rx_tail], frame, len);
     g_rx_len[g_rx_tail] = len;
     g_rx_tail = next;
@@ -563,7 +563,7 @@ static bool do_4way() {
     int rlen4 = build_eapol_reply(reply, (uint16_t)(WPA_KEY_INFO_KEY_TYPE | WPA_KEY_INFO_MIC | WPA_KEY_INFO_SECURE),
                                   nullptr, g_replay);
     if (!send_eapol(reply, rlen4)) { log2("[80211] 4way: msg4 tx failed", nullptr); return false; }
-    log2("[80211] 4way: sent msg4  -  handshake complete", nullptr);
+    log2("[80211] 4way: sent msg4 - handshake complete", nullptr);
 
     // install the pairwise key (tk = ptk[32..47]) into the hardware crypto engine
     // (or fall back to software ccmp if the driver can't offload). (satoru)
@@ -689,7 +689,7 @@ const char* StateString() {
 // these build the ccmp nonce + aad from the negotiated tk and encrypt/decrypt a
 // payload. like real ccmp, the 6-byte packet number (pn) travels in front of the
 // ciphertext (the ccmp header carries the pn on the wire) so the rx side can
-// reconstruct the exact nonce  -  making EncryptData/DecryptData a true round-trip.
+// reconstruct the exact nonce - making EncryptData/DecryptData a true round-trip.
 // the aad here is a minimal fixed example of the masked header fields; a full
 // data path derives aad from the live frame per §12.5.3.3.3. (satoru)
 //

@@ -6,7 +6,7 @@
 
 namespace {
 
-// little-endian scalar writers  -  freestanding, no libc. (satoru)
+// little-endian scalar writers - freestanding, no libc. (satoru)
 void put_u16(uint8_t* p, uint16_t v) {
     p[0] = (uint8_t)(v & 0xFF);
     p[1] = (uint8_t)((v >> 8) & 0xFF);
@@ -92,7 +92,7 @@ bool Screenshot::CaptureToBMP(const char* kvfs_path) {
         uint8_t*       dst_row = dst_base + (size_t)y * row_bytes;
         if (bpp == 32) {
             // fb stores 0xAARRGGBB little-endian = bytes B,G,R,A; BMP 32bpp
-            // wants exactly B,G,R,A  -  straight copy with forced opaque. (satoru)
+            // wants exactly B,G,R,A - straight copy with forced opaque. (satoru)
             for (int x = 0; x < w; x++) {
                 const uint8_t* s = src_row + (size_t)x * 4u;
                 uint8_t* d = dst_row + (size_t)x * 4u;

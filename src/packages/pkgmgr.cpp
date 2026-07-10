@@ -43,7 +43,7 @@ static const int PKG_REPOSITORY_IP_FALLBACK_COUNT =
 // Repository fetch buffer: bumped from 64 KB to 16 MB so that larger
 // .tar/.tar.gz packages (and Packages indexes for big repos) round-trip
 // in a single phttp_get(). For the 108 MB Debian rootfs we still need a
-// proper streaming download  -  that's tracked separately.
+// proper streaming download - that's tracked separately.
 static const int PKG_HTTP_BUFFER_MAX = 16 * 1024 * 1024;
 
 static bool pkg_repo_synced = false;
@@ -486,7 +486,7 @@ static bool pkro_extract_archive(const uint8_t* payload, int payload_len, const 
     return true;
 }
 
-// step logging for `kpkg sync`  -  writes each HTTP milestone to the serial
+// step logging for `kpkg sync` - writes each HTTP milestone to the serial
 // console so a failed sync against kurono.satorut.com shows exactly where it
 // stopped (dns/connect/send/headers/body/done). internal only. (satoru)
 static void phttp_log(const char* msg) {
@@ -1235,7 +1235,7 @@ static bool pfetch_package_payload(Package* pkg) {
 }
 
 // ================= streaming firefox installer =====================
-// firefox ships as an ~84 mb .tar.gz / ~235 mb uncompressed .tar  -  far past
+// firefox ships as an ~84 mb .tar.gz / ~235 mb uncompressed .tar - far past
 // the 16 mb single-shot phttp_get() buffer, and the in-kernel ustar reader
 // only handles uncompressed tar. so we fetch the uncompressed tar over a long
 // streaming http recv loop and feed it through a ustar state machine that
@@ -1249,7 +1249,7 @@ static bool pfetch_package_payload(Package* pkg) {
 static const char* FF_ORIGIN_HOST = "kurono.satorut.com";
 // the -full tar is the COMPLETE package: binaries + the 88-lib closure PLUS the
 // gecko app resources (omni.ja, browser/omni.ja, application.ini, greprefs.js,
-// defaults/, fonts/) the old tar was missing  -  without these no window renders.
+// defaults/, fonts/) the old tar was missing - without these no window renders.
 // ustar layout, longest entry 51 chars (under the 100-byte name field).
 // full2: libglycin-2.so.0 is swapped for a no-tls no-op stub. firefox uses its
 // own image/decoders, not gdk-pixbuf's glycin loader, so glycin is dead weight;
@@ -1498,7 +1498,7 @@ static bool ff_stream_install() {
                 ok = !st.error && KVFS::Exists("/apps/firefox/firefox");
                 break;
             }
-            // 60s idle cap  -  the tar is big but SLIRP keeps feeding while alive.
+            // 60s idle cap - the tar is big but SLIRP keeps feeding while alive.
             if ((uint32_t)(Timer::GetTicks() - last_progress_ms) > 60000u) {
                 pset_sync_message("firefox download stalled (no data for 60s).");
                 break;
@@ -1627,7 +1627,7 @@ static void ff_finalize_install() {
 
     // the launcher's IsInstalled() gate wants a readable deps manifest at
     // /system/lib/firefox-deps.manifest. the package ships its own list at
-    // /apps/firefox/firefox-deps.manifest  -  copy it across (small text). (satoru)
+    // /apps/firefox/firefox-deps.manifest - copy it across (small text). (satoru)
     if (KVFS::Exists("/apps/firefox/firefox-deps.manifest")) {
         int sz = KVFS::GetFileSize("/apps/firefox/firefox-deps.manifest");
         if (sz > 0 && sz < 64 * 1024) {
@@ -2257,7 +2257,7 @@ int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out
         int p = 0;
         // resolve the real rootfs url + size from the published manifest rather
         // than a stale hardcoded path (the old "/dist/debian-minbase.ext4" 404s
-        //  -  the artifact lives under /packages/debian/ per manifest.json). (satoru)
+        // - the artifact lives under /packages/debian/ per manifest.json). (satoru)
         Package* dpkg = Find("debian");
         if (!dpkg && SyncRepository()) dpkg = Find("debian");
         if (!dpkg) {
@@ -2356,7 +2356,7 @@ int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out
         int p = 0;
         p = pa(out, p, mx, "Installing Firefox 140.11.0esr from ");
         p = pa(out, p, mx, FF_ORIGIN_HOST);
-        p = pa(out, p, mx, "\n(~84 MB download, ~235 MB extracted  -  this takes a while)...\n");
+        p = pa(out, p, mx, "\n(~84 MB download, ~235 MB extracted - this takes a while)...\n");
         // stream to terminal now so the user sees we started before the long
         // blocking download. (satoru)
         KuronoShell::EmitIncrementalRange(out, 0, p);

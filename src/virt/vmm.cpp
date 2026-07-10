@@ -1,4 +1,4 @@
-//  kurono os  -  virtual machine monitor implementation
+//  kurono os - virtual machine monitor implementation
 //  intel vt-x / amd-v detection, vmcs/vmcb setup, vmx lifecycle
 #include "vmm.h"
 #include "../drivers/serial.h"
@@ -11,13 +11,13 @@
 // the unmangled symbol name, and non-static so the linker can resolve it.
 extern "C" uint64_t* volatile g_vmx_guest_regs = nullptr;
 
-// same for amd svm  -  must be extern "c" for movabs in inline asm
+// same for amd svm - must be extern "c" for movabs in inline asm
 extern "C" uint64_t* volatile g_svm_guest_regs = nullptr;
 
-// vm-exit return stub  -  kept for amd-v and as a fallback.
+// vm-exit return stub - kept for amd-v and as a fallback.
 // intel vt-x now uses an inline asm label for host_rip instead.
 extern "C" void _vmm_host_return_stub() {
-    // legacy stub  -  amd svm path still references this symbol.
+    // legacy stub - amd svm path still references this symbol.
 }
 
 // helper: allocate page-aligned memory from kernel heap
@@ -55,7 +55,7 @@ uint64_t VMM::last_vm_entry_guest_cr4 = 0;
 char     VMM::vendor_string[16] = {0};
 char     VMM::hv_vendor_string[16] = {0};
 
-//  low-level cpu intrinsics  -  inline asm for x86_64
+//  low-level cpu intrinsics - inline asm for x86_64
 
 static inline void cpuid(uint32_t leaf, uint32_t& eax, uint32_t& ebx,
                           uint32_t& ecx, uint32_t& edx) {
@@ -139,7 +139,7 @@ void VMM::WriteCR4(uint64_t val) {
 
 //  initialization & detection
 
-// safe msr read  -  returns false if the msr cannot be read (e.g. #gp).
+// safe msr read - returns false if the msr cannot be read (e.g. #gp).
 // under whpx, some amd msrs are not emulated on intel hosts and vice
 // versa, so a plain rdmsr would triple-fault the guest.  we install a
 // tiny #gp handler via the idt that sets a flag and skips the faulting
@@ -158,7 +158,7 @@ bool VMM::SafeReadMSR(uint32_t msr, uint64_t& out) {
         // amd msrs (0xc000xxxx) are not emulated on intel whpx hosts
         // and will cause #gp → guest crash.
         if (msr >= 0xC0000000 && msr != 0xC0000080) {
-            // 0xc0000080 = ia32_efer  -  universally emulated
+            // 0xc0000080 = ia32_efer - universally emulated
             // all other 0xcxxxxxxx msrs (vm_cr, vm_hsave_pa, etc.) are
             // amd-specific and unsafe under whpx on intel hosts.
             SerialLogger::Log("VMM: Skipping unsafe AMD MSR 0x");
@@ -175,7 +175,7 @@ bool VMM::SafeReadMSR(uint32_t msr, uint64_t& out) {
 void VMM::DetectHypervisor() {
     uint32_t eax, ebx, ecx, edx;
 
-    // cpuid leaf 0x40000000  -  hypervisor vendor string
+    // cpuid leaf 0x40000000 - hypervisor vendor string
     cpuid(0x40000000, eax, ebx, ecx, edx);
 
     // eax = max hypervisor leaf supported
@@ -268,15 +268,15 @@ void VMM::DetectHypervisor() {
             //   actively supports nested virt.
             if (eax != 0) {
                 whpx_nested_ok = true;
-                SerialLogger::Log("VMM: WHPX NESTED VIRT SUPPORTED  -  vmrun/vmlaunch safe\r\n");
+                SerialLogger::Log("VMM: WHPX NESTED VIRT SUPPORTED - vmrun/vmlaunch safe\r\n");
             } else {
-                SerialLogger::Log("VMM: Nested leaf present but EAX=0  -  nested NOT supported\r\n");
+                SerialLogger::Log("VMM: Nested leaf present but EAX=0 - nested NOT supported\r\n");
                 SerialLogger::Log("VMM: vmrun/vmlaunch would hang or crash the VM\r\n");
             }
         } else {
             SerialLogger::Log("VMM: Max HV leaf 0x");
             SerialLogger::LogHex(max_hv_leaf);
-            SerialLogger::Log(" < 0x4000000A  -  NO nested virt\r\n");
+            SerialLogger::Log(" < 0x4000000A - NO nested virt\r\n");
             SerialLogger::Log("VMM: vmrun/vmlaunch would crash the VM (VP exit code 4)\r\n");
         }
 
@@ -359,7 +359,7 @@ void VMM::Init() {
     // check for hypervisor presence (cpuid.1.ecx bit 31)
     cpuid(1, eax, ebx, ecx, edx);
     if (ecx & CPUID_HYPERVISOR_BIT) {
-        SerialLogger::Log("VMM: Hypervisor CPUID bit set  -  probing hypervisor leaves\r\n");
+        SerialLogger::Log("VMM: Hypervisor CPUID bit set - probing hypervisor leaves\r\n");
         DetectHypervisor();
         if (nested) {
             SerialLogger::Log("VMM: Running under a hypervisor (nested virt)\r\n");
@@ -369,7 +369,7 @@ void VMM::Init() {
     // strategy:
     //   1. check vt-x cpuid bit (works on intel real hw and hyper-v intel hosts)
     //   2. check svm cpuid bit (works on amd real hw and qemu +svm)
-    //   3. under whpx: be careful with msr reads  -  intel msrs only on intel,
+    //   3. under whpx: be careful with msr reads - intel msrs only on intel,
     //      amd msrs only on amd.  whpx on intel host + qemu -cpu qemu64,+svm
     //      will expose svm cpuid bit but amd msrs are not emulated.
     //
@@ -378,7 +378,7 @@ void VMM::Init() {
     bool vtx_cpuid = DetectVTx();
     bool svm_cpuid = DetectSVM();
 
-    SerialLogger::Log("VMM: CPUID  -  VT-x: ");
+    SerialLogger::Log("VMM: CPUID - VT-x: ");
     SerialLogger::Log(vtx_cpuid ? "YES" : "no");
     SerialLogger::Log(", SVM: ");
     SerialLogger::Log(svm_cpuid ? "YES" : "no");
@@ -398,27 +398,27 @@ void VMM::Init() {
             SerialLogger::Log("\r\n");
 
             if (!(feature_control & FEATURE_CONTROL_LOCKED)) {
-                // unlocked  -  we can enable vt-x ourselves (bare metal)
-                SerialLogger::Log("VMM: Feature control unlocked  -  will lock with VMXON enabled\r\n");
+                // unlocked - we can enable vt-x ourselves (bare metal)
+                SerialLogger::Log("VMM: Feature control unlocked - will lock with VMXON enabled\r\n");
                 vtx_usable = true;
             } else if (feature_control & FEATURE_CONTROL_VMXON) {
-                // locked with vmxon enabled  -  bios enabled vt-x for us
+                // locked with vmxon enabled - bios enabled vt-x for us
                 SerialLogger::Log("VMM: VT-x enabled in BIOS/firmware\r\n");
                 vtx_usable = true;
             } else {
-                // locked with vmxon disabled  -  bios intentionally blocked vt-x
+                // locked with vmxon disabled - bios intentionally blocked vt-x
                 SerialLogger::Log("VMM: VT-x LOCKED OUT by firmware (VMXON bit clear)\r\n");
                 if (whpx_detected) {
-                    // under whpx, l0 manages vmx  -  vmxon bit in guest msr is irrelevant
-                    SerialLogger::Log("VMM: WHPX manages VMX  -  proceeding anyway\r\n");
+                    // under whpx, l0 manages vmx - vmxon bit in guest msr is irrelevant
+                    SerialLogger::Log("VMM: WHPX manages VMX - proceeding anyway\r\n");
                     vtx_usable = true;
                 } else {
                     SerialLogger::Log("VMM: Enable Intel Virtualization Technology in BIOS\r\n");
                 }
             }
         } else {
-            // can't read the msr  -  assume vt-x is available (best-effort)
-            SerialLogger::Log("VMM: Cannot read IA32_FEATURE_CONTROL  -  assuming VT-x available\r\n");
+            // can't read the msr - assume vt-x is available (best-effort)
+            SerialLogger::Log("VMM: Cannot read IA32_FEATURE_CONTROL - assuming VT-x available\r\n");
             vtx_usable = true;
         }
 
@@ -449,9 +449,9 @@ void VMM::Init() {
         // we detect svm as present (for reporting), but only mark it
         // usable if nested virt is confirmed via hyper-v cpuid.
         if (whpx_detected) {
-            SerialLogger::Log("VMM: WHPX + SVM  -  skipping VM_CR MSR check\r\n");
+            SerialLogger::Log("VMM: WHPX + SVM - skipping VM_CR MSR check\r\n");
             if (whpx_nested_ok) {
-                SerialLogger::Log("VMM: WHPX nested virt CONFIRMED  -  SVM usable\r\n");
+                SerialLogger::Log("VMM: WHPX nested virt CONFIRMED - SVM usable\r\n");
                 virt_type = VIRT_AMD_SVM;
             } else {
                 SerialLogger::Log("VMM: WHPX nested virt NOT supported by host\r\n");
@@ -460,7 +460,7 @@ void VMM::Init() {
                 virt_type = VIRT_NONE;
             }
         } else {
-            // bare metal or kvm  -  safe to read amd msrs
+            // bare metal or kvm - safe to read amd msrs
             uint64_t vm_cr = 0;
             if (SafeReadMSR(MSR_VM_CR, vm_cr)) {
                 if ((vm_cr & (1 << 4)) == 0) {
@@ -470,7 +470,7 @@ void VMM::Init() {
                     SerialLogger::Log("VMM: SVM disabled in BIOS (VM_CR.SVMDIS=1)\r\n");
                 }
             } else {
-                SerialLogger::Log("VMM: Cannot read VM_CR  -  assuming SVM available\r\n");
+                SerialLogger::Log("VMM: Cannot read VM_CR - assuming SVM available\r\n");
                 virt_type = VIRT_AMD_SVM;
             }
         }
@@ -491,7 +491,7 @@ void VMM::Init() {
         }
     }
 
-    SerialLogger::Log("VMM: Initialization complete  -  type=");
+    SerialLogger::Log("VMM: Initialization complete - type=");
     SerialLogger::Log(virt_type == VIRT_INTEL_VTX ? "VT-x" :
                       virt_type == VIRT_AMD_SVM   ? "SVM"  : "NONE");
     if (whpx_detected) SerialLogger::Log(" [WHPX]");
@@ -530,12 +530,12 @@ bool VMM::IsVTxEnabled() {
     if (!DetectVTx()) return false;
     uint64_t feature_control = 0;
     if (!SafeReadMSR(MSR_IA32_FEATURE_CONTROL, feature_control)) {
-        // cannot read the msr; under whpx this is expected  -  assume available
+        // cannot read the msr; under whpx this is expected - assume available
         return whpx_detected;
     }
     // must be locked and vmxon enabled outside smx
     if (!(feature_control & FEATURE_CONTROL_LOCKED)) {
-        // not locked  -  we could enable it by writing the msr
+        // not locked - we could enable it by writing the msr
         return true;  // potentially available
     }
     return (feature_control & FEATURE_CONTROL_VMXON) != 0;
@@ -543,7 +543,7 @@ bool VMM::IsVTxEnabled() {
 
 bool VMM::IsSVMEnabled() {
     if (!DetectSVM()) return false;
-    // under whpx, amd msrs may not be emulated  -  skip the check
+    // under whpx, amd msrs may not be emulated - skip the check
     if (whpx_detected) return true;
     uint64_t vm_cr = 0;
     if (!SafeReadMSR(MSR_VM_CR, vm_cr)) return true; // assume available
@@ -689,7 +689,7 @@ void VMM::VMWrite(uint32_t field, uint64_t value) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            SerialLogger::Log("VMM: VMWrite skipped  -  VMX not active\r\n");
+            SerialLogger::Log("VMM: VMWrite skipped - VMX not active\r\n");
         }
         (void)field;
         (void)value;
@@ -704,7 +704,7 @@ uint64_t VMM::VMRead(uint32_t field) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            SerialLogger::Log("VMM: VMRead skipped  -  VMX not active\r\n");
+            SerialLogger::Log("VMM: VMRead skipped - VMX not active\r\n");
         }
         (void)field;
         return 0;
@@ -720,7 +720,7 @@ bool VMM::VMLaunch() {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            SerialLogger::Log("VMM: VMLaunch skipped  -  VMX not active\r\n");
+            SerialLogger::Log("VMM: VMLaunch skipped - VMX not active\r\n");
         }
         return false;
     }
@@ -769,7 +769,7 @@ bool VMM::VMResume() {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            SerialLogger::Log("VMM: VMResume skipped  -  VMX not active\r\n");
+            SerialLogger::Log("VMM: VMResume skipped - VMX not active\r\n");
         }
         return false;
     }
@@ -828,17 +828,17 @@ bool VMM::SVMEnable() {
     efer |= (1 << 12);
     WriteMSR(0xC0000080, efer);
 
-    // verify the write actually took effect  - 
+    // verify the write actually took effect - 
     // some hypervisors silently ignore the svme bit
     uint64_t efer_check = ReadMSR(0xC0000080);
     if (!(efer_check & (1 << 12))) {
-        SerialLogger::Log("VMM: EFER.SVME write rejected  -  SVM not truly available\r\n");
+        SerialLogger::Log("VMM: EFER.SVME write rejected - SVM not truly available\r\n");
 
         // under whpx, this means the host doesn't support nested svm
         // (likely an intel host using qemu -cpu qemu64,+svm).
         // the cpuid bit was set by qemu but the hypervisor blocks svme.
         if (whpx_detected) {
-            SerialLogger::Log("VMM: WHPX on Intel host  -  SVM emulated in CPUID only\r\n");
+            SerialLogger::Log("VMM: WHPX on Intel host - SVM emulated in CPUID only\r\n");
             SerialLogger::Log("VMM: Falling back: will mark HW as unavailable\r\n");
             virt_type = VIRT_NONE;
         }
@@ -853,12 +853,12 @@ bool VMM::SVMEnable() {
     }
     for (int i = 0; i < 4096; i++) ((uint8_t*)hsave)[i] = 0;
 
-    // set msr_vm_hsave_pa  -  under whpx on intel this msr doesn't exist
+    // set msr_vm_hsave_pa - under whpx on intel this msr doesn't exist
     if (whpx_detected) {
         // try to write it; if it fails, svm won't work
         // (we can't easily catch #gp, so we just write and hope for the best.
         //  on a real amd host under whpx, this will succeed.)
-        SerialLogger::Log("VMM: Writing VM_HSAVE_PA under WHPX  -  may fault on Intel\r\n");
+        SerialLogger::Log("VMM: Writing VM_HSAVE_PA under WHPX - may fault on Intel\r\n");
     }
     WriteMSR(MSR_VM_HSAVE_PA, (uint64_t)(uintptr_t)hsave);
 
@@ -1005,7 +1005,7 @@ int VMM::RunVCPU(vCPU* cpu) {
         // inline asm below) can save guest gprs back to cpu->regs[].
         g_vmx_guest_regs = regs;
 
-        // register layout in regs[]  -  intel standard (modrm) ordering:
+        // register layout in regs[] - intel standard (modrm) ordering:
         //   0=rax, 1=rcx, 2=rdx, 3=rbx, 4=(rsp - in vmcs), 5=rbp,
         //   6=rsi, 7=rdi, 8=r8, 9=r9, ..., 15=r15
         // rsp and rip live in vmcs guest-state fields, not in regs[].
@@ -1042,7 +1042,7 @@ int VMM::RunVCPU(vCPU* cpu) {
             "mov 8(%%rax),  %%rcx\n\t"      // regs[1]  = rcx
             "mov 16(%%rax), %%rdx\n\t"      // regs[2]  = rdx
             "mov 24(%%rax), %%rbx\n\t"      // regs[3]  = rbx
-            // regs[4] = rsp  -  loaded by vmcs, skip
+            // regs[4] = rsp - loaded by vmcs, skip
             "mov 40(%%rax), %%rbp\n\t"      // regs[5]  = rbp
             "mov 48(%%rax), %%rsi\n\t"      // regs[6]  = rsi
             "mov 56(%%rax), %%rdi\n\t"      // regs[7]  = rdi
@@ -1079,11 +1079,11 @@ int VMM::RunVCPU(vCPU* cpu) {
             "movabs $g_vmx_guest_regs, %%rax\n\t"
             "mov (%%rax), %%rax\n\t"
 
-            // save guest gprs  -  intel standard (modrm) order
+            // save guest gprs - intel standard (modrm) order
             "mov %%rcx, 8(%%rax)\n\t"       // regs[1]  = rcx
             "mov %%rdx, 16(%%rax)\n\t"      // regs[2]  = rdx
             "mov %%rbx, 24(%%rax)\n\t"      // regs[3]  = rbx
-            // regs[4] = rsp  -  in vmcs, skip
+            // regs[4] = rsp - in vmcs, skip
             "mov %%rbp, 40(%%rax)\n\t"      // regs[5]  = rbp
             "mov %%rsi, 48(%%rax)\n\t"      // regs[6]  = rsi
             "mov %%rdi, 56(%%rax)\n\t"      // regs[7]  = rdi
@@ -1172,7 +1172,7 @@ int VMM::RunVCPU(vCPU* cpu) {
             "mov 8(%%rax),  %%rcx\n\t"      // regs[1] = rcx
             "mov 16(%%rax), %%rdx\n\t"      // regs[2] = rdx
             "mov 24(%%rax), %%rbx\n\t"      // regs[3] = rbx
-            // regs[4] = rsp  -  in vmcb, skip
+            // regs[4] = rsp - in vmcb, skip
             "mov 40(%%rax), %%rbp\n\t"      // regs[5] = rbp
             "mov 48(%%rax), %%rsi\n\t"      // regs[6] = rsi  (boot_params!)
             "mov 56(%%rax), %%rdi\n\t"      // regs[7] = rdi
@@ -1189,7 +1189,7 @@ int VMM::RunVCPU(vCPU* cpu) {
             "mov %[phys], %%rax\n\t"
             "vmrun\n\t"
             // guest rax is auto-saved to vmcb by hardware
-            // all other gprs still hold guest values  -  save them
+            // all other gprs still hold guest values - save them
 
             "push %%rax\n\t"                // save guest rax (scratch)
             "movabs $g_svm_guest_regs, %%rax\n\t"
@@ -1273,7 +1273,7 @@ void VMM::SetupVMCSControls(vCPU* cpu) {
         VMWrite(VMCS_PROC_BASED_CONTROLS2, proc2_controls);
     }
 
-    // vm-exit controls  -  must set host_addr_space_size (bit 9) for 64-bit host
+    // vm-exit controls - must set host_addr_space_size (bit 9) for 64-bit host
     uint64_t exit_msr = ReadMSR(MSR_IA32_VMX_EXIT_CTLS);
     uint32_t exit_allowed0 = (uint32_t)(exit_msr & 0xFFFFFFFF);
     uint32_t exit_allowed1 = (uint32_t)(exit_msr >> 32);
@@ -1291,12 +1291,12 @@ void VMM::SetupVMCSControls(vCPU* cpu) {
     entry_controls &= entry_allowed1;
     VMWrite(VMCS_ENTRY_CONTROLS, entry_controls);
 
-    // intercept only #db (1) and #bp (3) exceptions  -  let guest handle others
+    // intercept only #db (1) and #bp (3) exceptions - let guest handle others
     VMWrite(VMCS_EXCEPTION_BITMAP, (1 << 1) | (1 << 3));
 
-    // vmcs link pointer  -  must be all-ones when not using vmcs shadowing
+    // vmcs link pointer - must be all-ones when not using vmcs shadowing
     // this is a 64-bit vmcs field; a single vmwrite sets all 64 bits on a
-    // 64-bit host.  do not write field+1  -  that targets a different encoding.
+    // 64-bit host.  do not write field+1 - that targets a different encoding.
     VMWrite(VMCS_VMCS_LINK_PTR, 0xFFFFFFFFFFFFFFFFULL);
 
     // guest activity state = active (0)
@@ -1351,8 +1351,8 @@ void VMM::SetupVMCSHostState(vCPU* cpu) {
     VMWrite(VMCS_HOST_IA32_SYSENTER_ESP, ReadMSR(0x175));
     VMWrite(VMCS_HOST_IA32_SYSENTER_EIP, ReadMSR(0x176));
 
-    // host rip  -  point to the vm-exit return stub
-    // host rsp  -  current stack pointer
+    // host rip - point to the vm-exit return stub
+    // host rsp - current stack pointer
     uint64_t rsp_val;
     asm volatile("mov %%rsp, %0" : "=r"(rsp_val));
     VMWrite(VMCS_HOST_RSP, rsp_val);
@@ -1382,7 +1382,7 @@ void VMM::SetupVMCSGuestState(vCPU* cpu) {
     VMWrite(VMCS_GUEST_CR3, 0);
     VMWrite(VMCS_GUEST_CR4, 0);
 
-    // guest selectors  -  real mode
+    // guest selectors - real mode
     VMWrite(VMCS_GUEST_CS_SEL, 0x0000);
     VMWrite(VMCS_GUEST_CS_BASE, 0x00000000);
     VMWrite(VMCS_GUEST_CS_LIMIT, 0xFFFF);
@@ -1413,7 +1413,7 @@ void VMM::SetupVMCSGuestState(vCPU* cpu) {
     VMWrite(VMCS_GUEST_GS_LIMIT, 0);
     VMWrite(VMCS_GUEST_GS_AR, 0x10000); // unusable null segment
 
-    // tr (task register)  -  required to be present in vmcs
+    // tr (task register) - required to be present in vmcs
     VMWrite(VMCS_GUEST_TR_SEL, 0x0008);
     VMWrite(VMCS_GUEST_TR_BASE, 0x00000000);
     VMWrite(VMCS_GUEST_TR_LIMIT, 0x0067);
@@ -1454,7 +1454,7 @@ void VMM::SetupVMCBControls(vCPU* cpu) {
 
     // intercept_misc2: vmmcall must be intercepted for vmcall bridge.
     // vmrun must be intercepted (required by amd spec for nested safety).
-    // don't intercept intr/nmi  -  let guest handle them directly.
+    // don't intercept intr/nmi - let guest handle them directly.
     vmcb->intercept_misc2 = SVM_INTERCEPT2_VMRUN | SVM_INTERCEPT2_VMMCALL;
 
     // guest asid (must be non-zero)
@@ -1471,7 +1471,7 @@ void VMM::SetupVMCBGuestState(vCPU* cpu) {
     if (!cpu || !cpu->vmcb) return;
     VMCB* vmcb = cpu->vmcb;
 
-    // real mode  -  start at 0x7c00
+    // real mode - start at 0x7c00
     vmcb->cs.selector = 0x0000;
     vmcb->cs.base     = 0x00000000;
     vmcb->cs.limit    = 0xFFFF;
@@ -1487,7 +1487,7 @@ void VMM::SetupVMCBGuestState(vCPU* cpu) {
     vmcb->fs = vmcb->ss;
     vmcb->gs = vmcb->ss;
 
-    // gdt and idt  -  minimal real-mode
+    // gdt and idt - minimal real-mode
     vmcb->gdtr.base  = 0;
     vmcb->gdtr.limit = 0xFFFF;
     vmcb->idtr.base  = 0;
@@ -1507,7 +1507,7 @@ void VMM::SetupVMCBGuestState(vCPU* cpu) {
     vmcb->rax    = 0;
     vmcb->rflags = 0x00000002;
 
-    // pat  -  default value
+    // pat - default value
     vmcb->g_pat  = 0x0007040600070406ULL;
 }
 

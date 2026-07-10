@@ -15,7 +15,7 @@
 //   - rx_ring:  packets the kernel pushed in (read by userspace)
 //   - tx_ring:  packets userspace wrote (forwarded into kernel netstack)
 //
-// All buffers are statically allocated  -  no kernel heap dependency.
+// All buffers are statically allocated - no kernel heap dependency.
 
 namespace TunTap {
 
@@ -83,7 +83,7 @@ namespace TunTap {
     // true on success, false if ring full.
     bool Inject(int dev_id, const unsigned char* buf, int len);
 
-    // periodic forwarder  -  drains tx_rings into Network::SendPacket so
+    // periodic forwarder - drains tx_rings into Network::SendPacket so
     // that VPN-style userspace daemons can route through the real NIC.
     void Tick();
 

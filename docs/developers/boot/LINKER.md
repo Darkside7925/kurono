@@ -11,7 +11,7 @@ When the compiler produces object files, the linker combines them into a single 
 The linker script for Kurono defines:
 
 - The entry symbol (`_start` in the boot assembly).
-- The kernel base virtual address (usually `0xC0000000` for a higher-half kernel or `0x100000` for a lower-half design  -  check the current file for the actual value).
+- The kernel base virtual address (usually `0xC0000000` for a higher-half kernel or `0x100000` for a lower-half design - check the current file for the actual value).
 - Section placement: `.text` (code), `.rodata` (read-only data), `.data` (initialized data), `.bss` (zero-initialized data).
 - BSS boundaries so the boot assembly can zero it without hard-coding addresses.
 - The Multiboot header section so GRUB can find the magic within the first 8 KB.
@@ -25,6 +25,6 @@ The linker script for Kurono defines:
 
 ## 4. Related files
 
-- `src/boot/kurono_boot.asm`  -  uses the symbols this script exports
-- `src/boot/multiboot_header.S`  -  section placement depends on this script
-- `src/Makefile`  -  passes the linker script with `-T kurono_linker.ld`
+- `src/boot/kurono_boot.asm` - uses the symbols this script exports
+- `src/boot/multiboot_header.S` - section placement depends on this script
+- `src/Makefile` - passes the linker script with `-T kurono_linker.ld`

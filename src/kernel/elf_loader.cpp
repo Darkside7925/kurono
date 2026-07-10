@@ -85,7 +85,7 @@ static inline uint32_t ELF64_R_TYPE(uint64_t i) { return (uint32_t)(i & 0xFFFFFF
 
 constexpr uint32_t PF_X = 1;
 constexpr uint32_t PF_W = 2;
-// PF_R unused  -  read is implicit.
+// PF_R unused - read is implicit.
 
 static void log(const char* s) { SerialLogger::Log(s); }
 static void logh(const char* s, uint64_t v) {
@@ -111,7 +111,7 @@ static bool valid_elf64(const uint8_t* d, uint64_t sz) {
 // Map a single page into the process address space.  Allocates a fresh
 // physical page, copies up to `copy_len` bytes from `src` into the page,
 // zero-fills the rest, and maps it at `va` with PTE_USER|PTE_WRITABLE.
-// (NX is left disabled for now  -  we treat all user pages as RWX while
+// (NX is left disabled for now - we treat all user pages as RWX while
 // the loader stabilises.  Per-segment NX/RO can be added later by
 // honouring p_flags.)
 static bool map_one_page(Process* proc, uint64_t va,
@@ -151,7 +151,7 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
             if (ph_chk[i].p_type == PT_INTERP) { has_interp = true; break; }
         }
         if (has_interp) {
-            log("[ELF] PT_INTERP found  -  routing through ld-kurono\r\n");
+            log("[ELF] PT_INTERP found - routing through ld-kurono\r\n");
             Process* proc = Scheduler::CreateUserProcess(
                 name ? name : "userelf", eh->e_entry, 1);
             if (!proc) {
@@ -204,21 +204,21 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
             for (uint16_t i = 0; i < eh->e_phnum; i++) {
                 if (ph0[i].p_type == PT_DYNAMIC) { dynph = &ph0[i]; break; }
                 if (ph0[i].p_type == PT_INTERP) {
-                    log("[ELF] PT_INTERP present (dynamic linker required)  -  proceeding anyway\r\n");
+                    log("[ELF] PT_INTERP present (dynamic linker required) - proceeding anyway\r\n");
                 }
                 if (ph0[i].p_type == PT_TLS) {
                     logh("[ELF] PT_TLS memsz = ", ph0[i].p_memsz);
                 }
             }
             // reject any pt_load whose file range overruns the scratch buffer
-            // before we translate vaddrs through it  -  otherwise vaddr_to_scratch
+            // before we translate vaddrs through it - otherwise vaddr_to_scratch
             // could hand back a pointer past the end of `scratch`. (satoru)
             bool segments_ok = true;
             for (uint16_t j = 0; j < eh->e_phnum; j++) {
                 if (ph0[j].p_type != PT_LOAD) continue;
                 if (ph0[j].p_offset > size ||
                     ph0[j].p_filesz > size - ph0[j].p_offset) {
-                    log("[ELF] PT_LOAD file range overruns image  -  skipping relocs\r\n");
+                    log("[ELF] PT_LOAD file range overruns image - skipping relocs\r\n");
                     segments_ok = false;
                     break;
                 }
@@ -274,7 +274,7 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
                         for (uint64_t k = 0; k < count; k++) {
                             const Elf64_Rela* r = (const Elf64_Rela*)(rela_p + k * rela_ent);
                             if (ELF64_R_TYPE(r->r_info) == R_X86_64_RELATIVE) {
-                                // we store a full uint64_t at tgt  -  demand 8
+                                // we store a full uint64_t at tgt - demand 8
                                 // file-backed bytes so a reloc whose r_offset
                                 // lands in the last 1-7 bytes of a segment is
                                 // rejected instead of writing oob. (satoru)
@@ -327,7 +327,7 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
             ph[i].p_type == PT_PHDR     || ph[i].p_type == PT_GNU_RELRO ||
             ph[i].p_type == PT_INTERP   || ph[i].p_type == PT_DYNAMIC ||
             ph[i].p_type == PT_TLS) {
-            continue;  // metadata segments  -  no mapping needed here
+            continue;  // metadata segments - no mapping needed here
         }
         if (ph[i].p_type != PT_LOAD) continue;
         if (ph[i].p_memsz == 0) continue;
@@ -350,7 +350,7 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
             // proc->user_stack_top is the top-of-stack pointer (minus a
             // small redzone).  Any *other* existing mapping (notably the
             // kernel's identity map of low memory) must be overwritten
-            // with a PTE_USER entry  -  otherwise ring-3 will #PF on
+            // with a PTE_USER entry - otherwise ring-3 will #PF on
             // user/supervisor mismatch.
             uint64_t stack_top  = (proc->user_stack_top + 16 + PAGE_SIZE - 1)
                                   & ~(uint64_t)(PAGE_SIZE - 1);

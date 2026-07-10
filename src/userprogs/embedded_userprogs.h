@@ -23,13 +23,13 @@ extern "C" {
     // pthreads smoke-test blob (satoru)
     extern const uint8_t _binary_pthread_test_elf_start[]  __attribute__((weak));
     extern const uint8_t _binary_pthread_test_elf_end[]    __attribute__((weak));
-    // dynamic musl pie blob  -  first ld-kurono dynamic-load test (satoru)
+    // dynamic musl pie blob - first ld-kurono dynamic-load test (satoru)
     extern const uint8_t _binary_dyntest_elf_start[]       __attribute__((weak));
     extern const uint8_t _binary_dyntest_elf_end[]         __attribute__((weak));
-    // musl libc.so blob  -  satisfies the pie's DT_NEEDED (satoru)
+    // musl libc.so blob - satisfies the pie's DT_NEEDED (satoru)
     extern const uint8_t _binary_musl_libc_so_start[]      __attribute__((weak));
     extern const uint8_t _binary_musl_libc_so_end[]        __attribute__((weak));
-    // libfoo.so blob  -  the dyntest pie's extra dependency (satoru)
+    // libfoo.so blob - the dyntest pie's extra dependency (satoru)
     extern const uint8_t _binary_libfoo_so_start[]         __attribute__((weak));
     extern const uint8_t _binary_libfoo_so_end[]           __attribute__((weak));
 }

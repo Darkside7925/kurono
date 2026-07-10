@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  spinlock primitive (header-only)
+//  kurono os - spinlock primitive (header-only)
 //
 //  Lightweight spinlock with optional cli/sti save+restore for protecting
 //  shared kernel state under preemptive multitasking.  The lock is a
@@ -7,8 +7,8 @@
 //  cheapest atomic test-and-set on x86_64.
 //
 //  Two flavours of acquire:
-//    * Spinlock::Lock()    -  bare spin (caller already manages IF)
-//    * Spinlock::LockIrqSave(out_flags)  -  disables IF, returns prior state
+//    * Spinlock::Lock()   - bare spin (caller already manages IF)
+//    * Spinlock::LockIrqSave(out_flags) - disables IF, returns prior state
 //
 //  RAII helper SpinLockGuard automatically saves/restores rflags so that
 //  the same critical section can run with or without interrupts already
@@ -51,7 +51,7 @@ public:
     // matching UnlockIrqRestore() can correctly restore (or leave clear).
     // We snapshot rflags, disable IF, then attempt acquire; on contention
     // we briefly re-enable IF while spinning so the timer IRQ keeps
-    // firing  -  otherwise lock contention spikes scheduler latency.
+    // firing - otherwise lock contention spikes scheduler latency.
     inline void LockIrqSave(uint64_t* out_flags) {
         uint64_t flags;
         __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
@@ -85,7 +85,7 @@ public:
 
 private:
     volatile uint32_t value_;
-    volatile uint32_t owner_pid_; // diagnostic only  -  set by RAII guard
+    volatile uint32_t owner_pid_; // diagnostic only - set by RAII guard
 };
 
 // RAII helper.  Disables interrupts and acquires the spinlock on
@@ -107,7 +107,7 @@ private:
     uint64_t  flags_;
 };
 
-// RAII acquire without cli/sti  -  for long critical sections on the BSP
+// RAII acquire without cli/sti - for long critical sections on the BSP
 // where IRQ handlers must keep firing (PIT, device IRQs).  Only safe if
 // no interrupt or exception path ever tries to take the *same* lock
 // (would deadlock on re-entrancy).  Kernel-process mutual exclusion only.

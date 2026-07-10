@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  dual-boot / dual-run manager
+//  kurono os - dual-boot / dual-run manager
 //  manages running both kurono os and linux simultaneously, or booting
 //  either independently. handles grub configuration.
 //
@@ -18,12 +18,12 @@
 //  │     • user sync via userbridge                                     │
 //  │                                                                    │
 //  │  3. standalone_linux                                               │
-//  │     pure linux boot from sda2  -  kurono not loaded                  │
+//  │     pure linux boot from sda2 - kurono not loaded                  │
 //  │     • standard linux kernel + initrd                               │
 //  │     • can still access kurono partition if mounted                 │
 //  │                                                                    │
 //  │  4. standalone_kurono                                              │
-//  │     pure kurono boot  -  no linux subsystem                          │
+//  │     pure kurono boot - no linux subsystem                          │
 //  └─────────────────────────────────────────────────────────────────────┘
 
 #include "../kernel/types.h"
@@ -90,7 +90,7 @@ struct SharedDataConfig {
     bool sync_network;
 };
 
-//  dualbootmanager  -  controls boot modes and partition management
+//  dualbootmanager - controls boot modes and partition management
 
 class DualBootManager {
 public:

@@ -1,4 +1,4 @@
-//  kurono os  -  linux init system  -  implementation
+//  kurono os - linux init system - implementation
 
 #include "linux_init.h"
 #include "linux_kernel.h"
@@ -99,7 +99,7 @@ void LinuxInit::Boot() {
 
     SerialLogger::Log("\r\n");
     SerialLogger::Log("═══════════════════════════════════════════════════════════\r\n");
-    SerialLogger::Log("  Kurono Linux Subsystem  -  Booting...\r\n");
+    SerialLogger::Log("  Kurono Linux Subsystem - Booting...\r\n");
     SerialLogger::Log("═══════════════════════════════════════════════════════════\r\n");
 
     LogBoot("Starting Kurono Linux Subsystem...", true);
@@ -154,7 +154,7 @@ void LinuxInit::BootMultiUser() {
 }
 
 void LinuxInit::BootGraphical() {
-    LogBoot("Reached graphical.target  -  Kurono desktop integration active", true);
+    LogBoot("Reached graphical.target - Kurono desktop integration active", true);
     StartTarget(LTGT_GRAPHICAL);
     current_target = LTGT_GRAPHICAL;
 }
@@ -417,10 +417,10 @@ void LinuxInit::svc_networking() {
 }
 
 void LinuxInit::svc_syslog() {
-    // virtual syslog  -  writes to serial
+    // virtual syslog - writes to serial
     KVFS::Mkdirs("/var/log");
     KVFS::WriteString("/var/log/syslog",
-        "Kurono Linux  -  syslog started\n");
+        "Kurono Linux - syslog started\n");
 }
 
 void LinuxInit::svc_cron() {
@@ -429,7 +429,7 @@ void LinuxInit::svc_cron() {
 }
 
 void LinuxInit::svc_sshd() {
-    // virtual sshd  -  registers but doesn't truly listen
+    // virtual sshd - registers but doesn't truly listen
     KVFS::Mkdirs("/etc/ssh");
     KVFS::WriteString("/etc/ssh/sshd_config",
         "# Kurono SSH\n"
@@ -439,7 +439,7 @@ void LinuxInit::svc_sshd() {
 }
 
 void LinuxInit::svc_login() {
-    // login service  -  creates /etc/login.defs
+    // login service - creates /etc/login.defs
     KVFS::WriteString("/linux/etc/login.defs",
         "MAIL_DIR /var/mail\n"
         "LOG_OK_LOGINS no\n"
@@ -455,8 +455,8 @@ void LinuxInit::svc_login() {
 }
 
 void LinuxInit::svc_desktop_bridge() {
-    // desktop bridge  -  linux apps can open windows in kurono wm
-    SerialLogger::Log("[LinuxInit] Desktop bridge active  -  "
+    // desktop bridge - linux apps can open windows in kurono wm
+    SerialLogger::Log("[LinuxInit] Desktop bridge active - "
                       "Linux GUI apps integrated with Kurono WM\r\n");
 }
 
@@ -510,7 +510,7 @@ int LinuxInit::cmd_systemctl(void* sh, int argc, const char** argv,
             LinuxService* svc = FindService(sname);
             if (svc) {
                 p = li_pa(out, p, mx, svc->name);
-                p = li_pa(out, p, mx, "  -  ");
+                p = li_pa(out, p, mx, " - ");
                 p = li_pa(out, p, mx, svc->description);
                 p = li_pa(out, p, mx, "\n  State: ");
                 const char* st;
@@ -559,7 +559,7 @@ int LinuxInit::cmd_journalctl(void*, int, const char**, char* out, int mx) {
 
 void LinuxInit::DumpStatus(char* out, int max_out) {
     int p = 0;
-    p = li_pa(out, p, max_out, "Linux Init System  -  ");
+    p = li_pa(out, p, max_out, "Linux Init System - ");
     switch (state) {
         case LINIT_OFF: p = li_pa(out, p, max_out, "OFF"); break;
         case LINIT_BOOTING: p = li_pa(out, p, max_out, "BOOTING"); break;

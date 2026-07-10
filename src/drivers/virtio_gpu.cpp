@@ -1,4 +1,4 @@
-//  kurono os  -  virtio gpu driver implementation
+//  kurono os - virtio gpu driver implementation
 //  virtio pci modern device with 2d resource management
 #include "virtio_gpu.h"
 #include "../kernel/heap.h"
@@ -59,7 +59,7 @@ uint8_t VirtIOGPU::PciRead8(uint8_t offset) {
 
 // resolve a PCI BAR index to a base pointer, properly handling 64-bit and I/O
 // BARs. previous version treated I/O BARs as memory and stripped the wrong
-// alignment bits  -  this caused garbage MMIO mappings on real hardware.
+// alignment bits - this caused garbage MMIO mappings on real hardware.
 static volatile uint8_t* resolve_bar(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_idx) {
     if (bar_idx > 5) return nullptr;
     uint8_t off = 0x10 + bar_idx * 4;
@@ -69,7 +69,7 @@ static volatile uint8_t* resolve_bar(uint8_t bus, uint8_t dev, uint8_t func, uin
         outl(0xCF8, cfg);
         addr_lo = inl(0xCFC);
     }
-    if (addr_lo & 1) return nullptr; // I/O BAR  -  not usable for virtio modern config
+    if (addr_lo & 1) return nullptr; // I/O BAR - not usable for virtio modern config
     uint64_t base = (uint64_t)(addr_lo & 0xFFFFFFF0);
     uint8_t type = (addr_lo >> 1) & 0x03;
     if (type == 0x02 && bar_idx < 5) {
@@ -429,7 +429,7 @@ bool VirtIOGPU::Init() {
 
     if (!InitVirtQueue(0, &controlq)) return false;
     if (!InitVirtQueue(1, &cursorq)) {
-        // cursor queue is optional  -  free the control queue + tear down on hard fail
+        // cursor queue is optional - free the control queue + tear down on hard fail
         // but cursor failure shouldn't bring the device down. just disable cursor ops.
         cursorq.desc = nullptr;
     }
@@ -691,7 +691,7 @@ bool VirtIOGPU::PresentFramebuffer(void* pixels, uint32_t width, uint32_t height
         // two separate indirect tables: [0],[1] = xfer pair (based at &[0]);
         // [4],[5] = flush pair (based at &[4]). the `next` field of an indirect
         // descriptor is an index RELATIVE to its own table base, so the flush
-        // head's next must be 1 (-> [5]), NOT the absolute 5  -  pointing at 5 in a
+        // head's next must be 1 (-> [5]), NOT the absolute 5 - pointing at 5 in a
         // 2-entry table is out of range and makes qemu reject the chain
         // ("Desc next is 5"), which breaks the virtqueue and freezes the desktop
         // once a real display drains the queue. (satoru)
@@ -733,7 +733,7 @@ bool VirtIOGPU::PresentFramebuffer(void* pixels, uint32_t width, uint32_t height
             for (volatile int d = 0; d < 16; d++);
         }
 
-        // reclaim both descriptors regardless of success  -  otherwise the ring leaks
+        // reclaim both descriptors regardless of success - otherwise the ring leaks
         vq->desc[head_a].next = vq->free_head;
         vq->free_head = head_a;
         vq->num_free++;

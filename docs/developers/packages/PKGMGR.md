@@ -44,6 +44,6 @@ Package install and update fetch the remote payload and store it under `/kurono/
 
 ## 6. Related files
 
-- `src/packages/pkgmgr.cpp`  -  repository sync, manifest parsing, payload fetch
-- `src/net/tcpip.cpp`  -  TCP transport used by the package HTTP client
-- `src/kernel/kurono_kernel.cpp`  -  boot-time TCP stack initialization and ticking
+- `src/packages/pkgmgr.cpp` - repository sync, manifest parsing, payload fetch
+- `src/net/tcpip.cpp` - TCP transport used by the package HTTP client
+- `src/kernel/kurono_kernel.cpp` - boot-time TCP stack initialization and ticking

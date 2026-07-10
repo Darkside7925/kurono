@@ -1,4 +1,4 @@
-//  kurono os  -  kcl (kurono command language) interpreter
+//  kurono os - kcl (kurono command language) interpreter
 //
 //  a complete tree-walking scripting language. pipeline:
 //    source text -> lexer (token stream w/ line numbers)
@@ -492,7 +492,7 @@ struct Interp {
     Sink* out;        // program output (print, etc.) (satoru)
     Sink* err;        // error messages (with line numbers) (satoru)
     Env* globals;     // funcs live here so they're visible everywhere (satoru)
-    bool failed;      // hard error  -  unwind everything (satoru)
+    bool failed;      // hard error - unwind everything (satoru)
     bool ret_flag;    // a return fired (satoru)
     Value ret_val;
     bool break_flag;
@@ -565,7 +565,7 @@ static int cur_line(Interp& it, int pos) {
 // same call chain (eval_expr -> ... -> eval_atom -> eval_expr for nested parens,
 // eval_unary -> eval_unary for ---x / not not x, and exec_if -> exec_block ->
 // exec_stmt -> exec_if for nested if/while/for) recurses ~9 c++ frames per level
-// with no natural bound  -  deeply nested input would overflow the 64kb kernel
+// with no natural bound - deeply nested input would overflow the 64kb kernel
 // stack. an raii guard bumps a file-local counter on entry (safe: the
 // cooperative scheduler runs one script to completion at a time) and the
 // recursive entry points (eval_expr / eval_unary / exec_block) fail closed past
@@ -1011,7 +1011,7 @@ static void exec_while(Interp& it, Env& env, int& pos) {
     }
     if (end_pos >= 0) pos = end_pos;
     else {
-        // condition errored  -  leave pos just past the block. (satoru)
+        // condition errored - leave pos just past the block. (satoru)
         pos = cond_pos; Value c = eval_expr(it, env, pos); vfree(c);
         if (cur(it, pos) == KT_DO) pos++;
         skip_block(it, pos);
@@ -1084,7 +1084,7 @@ static void exec_for(Interp& it, Env& env, int& pos) {
     skip_block(it, pos);
 }
 
-// func name(params) ... end  -  register the body; do not execute. (satoru)
+// func name(params) ... end - register the body; do not execute. (satoru)
 static void exec_func_def(Interp& it, Env& env, int& pos) {
     int line = cur_line(it, pos);
     pos++; // 'func'
@@ -1162,7 +1162,7 @@ static void exec_ident_stmt(Interp& it, Env& env, int& pos) {
             }
             vfree(rhs); vfree(idx); return;
         }
-        // not an assignment  -  it was an expression statement; rewind & eval. (satoru)
+        // not an assignment - it was an expression statement; rewind & eval. (satoru)
         vfree(idx);
         pos = save;
         Value v = eval_expr(it, env, pos);
@@ -1203,7 +1203,7 @@ static void exec_stmt(Interp& it, Env& env, int& pos) {
         case KT_CONTINUE: pos++; it.continue_flag = true; break;
         case KT_IDENT:  exec_ident_stmt(it, env, pos); break;
         case KT_END: case KT_ELSE: case KT_ELIF:
-            // stray terminator  -  let the enclosing block handle it. (satoru)
+            // stray terminator - let the enclosing block handle it. (satoru)
             return;
         default: {
             // bare expression statement (satoru)
@@ -1222,7 +1222,7 @@ static Value call_func(Interp& it, const char* name, FuncDef& fn, Value* args, i
     if (it.recursion >= KCL_MAX_RECURSION) { raise_err2(it, line, "recursion limit exceeded in: ", name); return rv; }
     it.recursion++;
 
-    // heap-allocate the call scope  -  an Env is ~47kb, which would overflow the
+    // heap-allocate the call scope - an Env is ~47kb, which would overflow the
     // 64kb kernel stack instantly on any recursion. (satoru)
     Env* local = (Env*)KernelHeap::Alloc(sizeof(Env));
     if (!local) { raise_err(it, line, "out of memory (call scope)"); it.recursion--; return rv; }
@@ -1241,7 +1241,7 @@ static Value call_func(Interp& it, const char* name, FuncDef& fn, Value* args, i
 
     // the body may live in a different token stream (an imported file), so swap
     // the interpreter onto the function's stream for the call and restore it
-    // after  -  otherwise body_start indexes the wrong (or freed) array. (satoru)
+    // after - otherwise body_start indexes the wrong (or freed) array. (satoru)
     KCLToken* saved_toks = it.toks; int saved_count = it.count;
     if (fn.toks) { it.toks = fn.toks; it.count = fn.count; }
 
@@ -1277,7 +1277,7 @@ static double dsqrt(double x) {
 
 static unsigned long long g_rng = 0x2545F4914F6CDD1DULL;
 static unsigned long long rng_next() {
-    // xorshift64*  -  deterministic, no fpu. (satoru)
+    // xorshift64* - deterministic, no fpu. (satoru)
     g_rng ^= g_rng >> 12; g_rng ^= g_rng << 25; g_rng ^= g_rng >> 27;
     return g_rng * 0x2545F4914F6CDD1DULL;
 }
@@ -1512,7 +1512,7 @@ static void exec_import(Interp& it, Env& env, int& pos) {
     Lexer lx; lex(src, lx);
     if (!lx.ok) { lex_free(lx); KernelHeap::Free(src); raise_err(it, line, "import: lexer failure"); return; }
 
-    // retain the imported token stream + source for the rest of the run  -  any
+    // retain the imported token stream + source for the rest of the run - any
     // function it defines references this stream by index. (satoru)
     RetainedLex* rl = (RetainedLex*)KernelHeap::Alloc(sizeof(RetainedLex));
     if (!rl) { lex_free(lx); KernelHeap::Free(src); raise_err(it, line, "import: out of memory"); return; }
@@ -1534,7 +1534,7 @@ static void exec_import(Interp& it, Env& env, int& pos) {
     }
     vfree(sub.ret_val);
     it.failed = sub.failed;   // propagate hard errors (satoru)
-    // do NOT free lx/src here  -  retained above and freed at end of run. (satoru)
+    // do NOT free lx/src here - retained above and freed at end of run. (satoru)
     (void)env;
 }
 
@@ -1546,7 +1546,7 @@ static int run_source(const char* source, char* output, int max_output) {
     Lexer lx; lex(source, lx);
     if (!lx.ok) { lex_free(lx); sw(out, "kcl: out of memory tokenising script\n"); return out.len; }
 
-    // Env is ~47kb (96 binding slots), far too big for the 64kb kernel stack  - 
+    // Env is ~47kb (96 binding slots), far too big for the 64kb kernel stack - 
     // heap-allocate it (and every callee scope) so deep recursion stays cheap. (satoru)
     Env* globals = (Env*)KernelHeap::Alloc(sizeof(Env));
     if (!globals) { lex_free(lx); sw(out, "kcl: out of memory (env)\n"); return out.len; }

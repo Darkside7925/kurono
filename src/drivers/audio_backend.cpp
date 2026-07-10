@@ -1,4 +1,4 @@
-//  kurono os  -  AudioBackend default method implementations
+//  kurono os - AudioBackend default method implementations
 #include "audio_backend.h"
 #include "../kernel/types.h"
 

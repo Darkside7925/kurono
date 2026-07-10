@@ -206,7 +206,7 @@ static bool boot_get_value(const char* cmdline, const char* key, char* out, int 
     for (const char* p = cmdline; *p; p++) {
         // grub re-quotes a spaced argument around the WHOLE token
         // ("key=multi word value"), so the char before the key may be an
-        // opening quote rather than a space  -  accept it and remember it as
+        // opening quote rather than a space - accept it and remember it as
         // the value terminator so the spaces inside survive. (satoru)
         char lead_quote = 0;
         if (p != cmdline) {
@@ -654,14 +654,14 @@ static void early_fb_fill(uint64_t fb_addr, uint32_t pitch, uint32_t w, uint32_t
 }
 
 // minimal 8x8 built-in font bitmap for boot diagnostics.
-// works before any subsystem init  -  writes directly to the framebuffer.
+// works before any subsystem init - writes directly to the framebuffer.
 // this is essential for bare-metal debugging when there's no serial port.
 static uint64_t _efb_addr = 0;
 static uint32_t _efb_pitch = 0, _efb_w = 0, _efb_h = 0;
 static uint8_t  _efb_bpp = 0;
 static int _efb_cx = 4, _efb_cy = 36; // cursor position (below the color bar)
 
-// tiny 8x8 font  -  covers printable ascii 0x20-0x7e only
+// tiny 8x8 font - covers printable ascii 0x20-0x7e only
 // each char is 8 bytes (1 byte per row, msb-first)
 static const uint8_t _efb_font[95][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // ' ' (0x20)
@@ -802,7 +802,7 @@ static void early_fb_init_text(uint64_t addr, uint32_t pitch, uint32_t w, uint32
     _efb_cx = 4; _efb_cy = 36;
 }
 
-// flush the early fb writes to the display  -  tries both wbinvd and sfence
+// flush the early fb writes to the display - tries both wbinvd and sfence
 static void early_fb_flush() {
     __asm__ __volatile__("wbinvd" ::: "memory");
 }
@@ -879,8 +879,8 @@ static void convert_mb2_to_mb1(uint64_t mb_addr) {
                 mb2_compat_info.framebuffer_type   = *(uint8_t*)(tag + 29);
                 break;
             }
-            // module tags (type 3) have variable format  -  skip for now.
-            // boot loader name (type 2), etc.  -  not needed.
+            // module tags (type 3) have variable format - skip for now.
+            // boot loader name (type 2), etc. - not needed.
         }
 
         // advance to next tag (8-byte aligned)
@@ -923,7 +923,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // if booted via mb2, convert the tagged info to mb1 format so all
     // existing kernel code works unchanged.
     if (magic == 0x36d76289) {
-        SerialLogger::Log("Multiboot2 detected  -  converting to MB1 compat\r\n");
+        SerialLogger::Log("Multiboot2 detected - converting to MB1 compat\r\n");
         RuntimeLog::LogBoot("multiboot2 detected");
         convert_mb2_to_mb1(mb_addr);
         mb_addr = (uint64_t)(uintptr_t)&mb2_compat_info;
@@ -948,7 +948,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         uint32_t fh = mbi_early->framebuffer_height;
         uint8_t  fbpp = mbi_early->framebuffer_bpp;
 
-        // draw a bright green bar at top of screen (32px)  -  proves we're alive
+        // draw a bright green bar at top of screen (32px) - proves we're alive
         uint8_t* fbp = (uint8_t*)(uintptr_t)fb;
         uint32_t bpp = fbpp / 8;
         for (uint32_t y = 0; y < 32 && y < fh; y++) {
@@ -1066,7 +1066,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // serial, optionally power off. proves the engine without the gui. (satoru)
     bool boot_kmemx_test = false;
     bool boot_kmemx_poweroff = false;
-    // raw 1:1 mouse (no accel)  -  accessibility + deterministic synthetic input. (satoru)
+    // raw 1:1 mouse (no accel) - accessibility + deterministic synthetic input. (satoru)
     bool boot_mouse_raw = false;
     // setup mode: run the graphical installer / first-setup wizard instead of
     // dropping straight to the desktop. gated by the "Kurono Setup" grub entry
@@ -1254,7 +1254,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (has_early_fb) { early_fb_puts("OK\n", 0x00FF00); early_fb_flush(); }
 
     // Enable CPU security features as soon as HAL is up: SMEP (bit 20),
-    // SMAP (bit 21), UMIP (bit 11), OSXSAVE (bit 18)  -  gated by CPUID
+    // SMAP (bit 21), UMIP (bit 11), OSXSAVE (bit 18) - gated by CPUID
     // capability bits to avoid #UD on older hardware.
     {
         uint32_t eax, ebx, ecx, edx;
@@ -1323,7 +1323,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // 1000 Hz PIT: a fine tick is needed so SleepMs-based process wakeups
     // (input/cursor at ~8ms) are timely -> smooth 60fps. The ~2000 timer
     // VM-exits/sec this costs is ~0.4% cpu (negligible; the big VM-exit
-    // sources  -  input double-poll, idle non-HLT, audio polling  -  are fixed
+    // sources - input double-poll, idle non-HLT, audio polling - are fixed
     // separately). The ms clock is TSC-based regardless of tick rate. (satoru)
     Timer::Init(1000);
     TimeManager::SelectPIT(1000);
@@ -1334,7 +1334,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // delays call WaitMs() long before this used to run. Without the TSC,
     // WaitMs falls back to the polled PIT clock, which LOSES timer periods
     // under hardware hypervisors (WHPX/VMware) where each port read VM-exits
-    // and host scheduling delays the poll  -  so the "~3s" splash stretched to
+    // and host scheduling delays the poll - so the "~3s" splash stretched to
     // 15s on WHPX and minutes on VMware (the black screen after the logo).
     // CPUDetect::Init calibrates the TSC via the precise PIT ch2 one-shot. (satoru)
     CPUDetect::Init();
@@ -1345,7 +1345,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SMP::Init();
     // smp phase 2: bring up the application processors (INIT-SIPI-SIPI). each ap
     // reaches ap_entry, marks itself online, then idles until the scheduler hands
-    // it work (phase 3). a failed ap is non-fatal  -  the bsp carries on. (satoru)
+    // it work (phase 3). a failed ap is non-fatal - the bsp carries on. (satoru)
     SMP::StartAPs();
 
     // note: interrupts stay disabled. the kernel is fully polling-based
@@ -1470,7 +1470,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 early_fb_flush();
             }
 
-            // init graphics first  -  this remaps fb pages to write-combining,
+            // init graphics first - this remaps fb pages to write-combining,
             // so the subsequent test fill doesn't need wbinvd.
             Graphics::Init(fb_phys, mbi->framebuffer_width,
                           mbi->framebuffer_height, mbi->framebuffer_pitch, mbi->framebuffer_bpp);
@@ -1553,7 +1553,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
     }
 
-    // 3. bga (qemu/bochs only  -  not present on real hardware)
+    // 3. bga (qemu/bochs only - not present on real hardware)
     //    try 24bpp first (bochs rfb safe), then 32bpp (qemu preferred)
     if (!force_text_mode && !has_display) {
         bool bga_ok = false;
@@ -1592,7 +1592,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             // (0xb8000) to show diagnostic info so the user isn't staring
             // at pure black.
             vga_clear();
-            vga_puts("=== Kurono OS  -  No Graphics Framebuffer ===", 0x0C);
+            vga_puts("=== Kurono OS - No Graphics Framebuffer ===", 0x0C);
             vga_puts("\n", 0x0C);
             vga_puts("\nMultiboot flags: ", 0x0E);
             vga_puthex(mbi->flags);
@@ -1624,8 +1624,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 vga_puts("\nVBE mode:      0x", 0x0E);
                 vga_puthex(mbi->vbe_mode);
             }
-            vga_puts("\n\nSystem halted  -  reboot and try a different GRUB entry.", 0x0C);
-            // don't halt  -  let kernel continue so serial diag still works
+            vga_puts("\n\nSystem halted - reboot and try a different GRUB entry.", 0x0C);
+            // don't halt - let kernel continue so serial diag still works
         }
     }
 
@@ -1642,7 +1642,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         Graphics::SetTargetFPS(detected_hz);
         Graphics::SetRenderMode(Graphics::DOUBLE_BUFFER);
 
-        // verify display works  -  write directly to framebuffer
+        // verify display works - write directly to framebuffer
         SerialLogger::Log("Display: RenderMode=");
         SerialLogger::LogDec((int)Graphics::GetRenderMode());
         SerialLogger::Log(" backbuf=");
@@ -1824,9 +1824,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // kvfs is up now: let kdf mirror its driver log to /kurono/var/log/drivers.log. (satoru)
     KDF::EnableFileLog();
     // bring up + mount a persistent ext4 data disk (if attached) BEFORE restoring,
-    // so kvfs.img survives a reboot on a normal boot  -  not just after an install.
+    // so kvfs.img survives a reboot on a normal boot - not just after an install.
     // Installer::Init() runs much later, so do the mount here ourselves. (satoru)
-    // detect the nvme data disk  -  MountDataDisk runs NVMe::Init for us; its ext4
+    // detect the nvme data disk - MountDataDisk runs NVMe::Init for us; its ext4
     // probe just fails harmlessly on our raw persistence store. (satoru)
     Installer::MountDataDisk();
     // restore persistent kvfs state from the on-disk KFS volume if one is present;
@@ -1848,10 +1848,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         KVFS::InstallCanonicalLayout();
     }
     // headless two-boot kfs persistence test (gated by cmdline kurono.kfstest):
-    // boot 1  -  no marker present after restore  -  writes a small user-data tree
+    // boot 1 - no marker present after restore - writes a small user-data tree
     // under /home/user/.kfstest, times PersistStore::SaveTree() (the KFS format +
-    // mirror + sync), logs the byte count + ms, then powers off. boot 2  -  the same
-    // disk image  -  the restore above brings the tree back, so the marker IS present;
+    // mirror + sync), logs the byte count + ms, then powers off. boot 2 - the same
+    // disk image - the restore above brings the tree back, so the marker IS present;
     // we verify each file's content + the deep path, log PASS/FAIL + the LoadTree
     // ms, then power off. this exercises the whole KFS persist/restore loop with no
     // interactive shell, and the timing proves the multi-page-dma speed. (satoru)
@@ -1866,7 +1866,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // headless kmemx self-test (gated by cmdline kurono.kmemxtest): run the
     // lz4 + pool + metadata self-tests inline here (pmm + heap are up; no gui
     // needed), log PASS/FAIL to serial, and power off if kurono.kmemx.poweroff is
-    // set. running inline (like kfsbench) makes the test mode-independent  -  it
+    // set. running inline (like kfsbench) makes the test mode-independent - it
     // does not rely on the graphical scheduler path that hosts the kproc runner,
     // so a headless text-mode ci boot exercises it deterministically. (satoru)
     if (boot_kmemx_test) {
@@ -1988,7 +1988,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
     SerialLogger::Log("[Shell] Init...\r\n");
     KuronoShell::Init();
-    KuronoShell shell_instance;   // trivial object  -  all methods are static
+    KuronoShell shell_instance;   // trivial object - all methods are static
 
     SerialLogger::Log("[LinuxCmds] Register...\r\n");
     LinuxCmds::RegisterAll(&shell_instance);
@@ -2134,7 +2134,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                         EmbeddedUserprogs::MuslLibcData(),
                         EmbeddedUserprogs::MuslLibcSize());
         // also seed it at the PT_INTERP path so ld-kurono resolves the exe's
-        // program interpreter (/lib/ld-musl-x86_64.so.1) verbatim  -  musl's libc
+        // program interpreter (/lib/ld-musl-x86_64.so.1) verbatim - musl's libc
         // IS the dynamic linker. (satoru)
         KVFS::Mkdirs("/lib");
         KVFS::WriteFile("/lib/ld-musl-x86_64.so.1",
@@ -2195,7 +2195,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // running this animates the real on-screen accent. (satoru)
         KVFS::Mkdirs("/kurono/scripts");
         const char* accent_kj =
-            "// accent_anim.kj  -  drive a real on-screen animation from kj. (satoru)\n"
+            "// accent_anim.kj - drive a real on-screen animation from kj. (satoru)\n"
             "// ease the live desktop accent (window borders + titlebar) to a warm\n"
             "// red over 600ms, then post a toast. re-run to ease it back.\n"
             "kss.transition('window', 'accent', 600, 'outcubic');\n"
@@ -2320,7 +2320,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // boot-time smoke test: run the embedded /usr/bin/hello ELF once and
     // log the result over the serial port.  this validates the elf64
     // loader + ring-3 transition path on every boot.
-    // NOTE: boot-time smoke tests temporarily disabled  -  the post-exit
+    // NOTE: boot-time smoke tests temporarily disabled - the post-exit
     // userspace cleanup path was blocking the kernel from reaching the
     // interactive main loop.  Users can still invoke /usr/bin/hello and
     // /usr/bin/hello_x64 from the shell.
@@ -2370,7 +2370,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // Third smoke test: kpython runs /usr/share/hello.py end to end.
     // Validates argv/auxv stack, file open/read, brk/mmap heap, and the
     // full x86_64 SYSCALL loop that CPython would otherwise need.
-    // NOTE: temporarily disabled in boot path  -  kpython works on UEFI but
+    // NOTE: temporarily disabled in boot path - kpython works on UEFI but
     // crashes here on BIOS Multiboot2 due to a memory-layout collision
     // (kpython uses an address that overlaps kernel .rodata under MB2).
     // Users can still launch kpy interactively from the shell.
@@ -2398,7 +2398,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // musl-static smoke test: load /usr/bin/mhello via the real elf loader and
     // run it through RunProcessWithArgs. proven working (prints "hello from
     // static elf", rc=0), but running a ring-3 process during boot is for
-    // diagnostics only  -  gated off so normal boot reaches the desktop. flip
+    // diagnostics only - gated off so normal boot reaches the desktop. flip
     // kRunMuslSmokeTest to true to re-exercise it. (satoru)
     static const bool kRunMuslSmokeTest = false;
     if (kRunMuslSmokeTest && EmbeddedUserprogs::HasMuslHello()) {
@@ -2690,7 +2690,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     }
     KVFS::WriteString("/home/user/Music/startup.wav", "[WAV PCM 22050Hz 16-bit stereo 0:05]");
     KVFS::WriteString("/home/user/Music/notification.wav", "[WAV PCM 22050Hz 16-bit mono 0:02]");
-    // kcl sample scripts  -  kcl v2 syntax (set x = expr, for i in a..b). (satoru)
+    // kcl sample scripts - kcl v2 syntax (set x = expr, for i in a..b). (satoru)
     KVFS::WriteString("/home/user/hello.kcl", "# kcl script\nprint(\"Hello from Kurono!\")\nset x = 42\nprint(\"x =\", x)\n");
     KVFS::WriteString("/home/user/math.kcl", "# math demo\nset a = 16\nprint(\"sqrt(16) =\", sqrt(a))\nprint(\"random =\", rand(100))\n");
     KVFS::WriteString("/home/user/loop.kcl", "# loop demo\nset sum = 0\nfor i in 1..10 do\n  set sum = sum + i\nend\nprint(\"Sum 1..10 =\", sum)\n");
@@ -2722,7 +2722,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     }
 
     // 802.11i wpa2 crypto self-test (gated by kurono.wifitest): assert the wifi
-    // security core against published test vectors. needs no radio/hardware  -  it
+    // security core against published test vectors. needs no radio/hardware - it
     // proves the pmk/ptk/mic/ccmp math the supplicant relies on is byte-correct.
     // (satoru)
     if (boot_wifi_test) {
@@ -2843,10 +2843,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // First-boot detection: if we've never been installed, run the
         // graphical installer before the lockscreen.  The installer either
         // completes (and reboots into the installed system) or returns
-        // false to indicate "Live Boot"  -  in which case we fall through
+        // false to indicate "Live Boot" - in which case we fall through
         // to the lockscreen and offer Install Kurono on the desktop later.
         // Installer is launched on demand from the desktop "Install Kurono"
-        // shortcut, not auto-run on first boot  -  auto-launch left users
+        // shortcut, not auto-run on first boot - auto-launch left users
         // staring at a black installer screen with no working input.
         // Setup wizard: the "Kurono Setup" grub entry boots with kurono.setup=1
         // and lands here. run the graphical installer / first-setup flow. when
@@ -2895,7 +2895,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // virtualization is manual-only during normal boot.
     // this avoids risky msr/vmx/svm bring-up on bare-metal laptops until the
     // user explicitly requests vm features from the shell.
-    SerialLogger::Log("[VMM] Deferred  -  virtualization initializes on demand only\r\n");
+    SerialLogger::Log("[VMM] Deferred - virtualization initializes on demand only\r\n");
     VirtualDevices::Init();
     RuntimeLog::LogBoot("boot sequence complete");
 
@@ -2971,7 +2971,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[IOMMU] Detecting IOMMU...\r\n");
     IOMMU::Init();
     if (IOMMU::IsSupported() && NvidiaGPU::IsDetected()) {
-        SerialLogger::Log("[IOMMU] VT-d available  -  GPU passthrough possible\r\n");
+        SerialLogger::Log("[IOMMU] VT-d available - GPU passthrough possible\r\n");
     }
 
     // initialize amd gpu driver
@@ -3055,7 +3055,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         cli_run_shell(boot_cli_run[0] ? boot_cli_run : nullptr, boot_cli_poweroff);
     }
 
-    // smp phase 3d (TEMP  -  gate behind a cmdline token before the final commit):
+    // smp phase 3d (TEMP - gate behind a cmdline token before the final commit):
     // run this AFTER all the noisy init so an AP fault dump is clean. load
     // /usr/bin/hello, pin it to the APs (affinity excludes cpu 0), flip the
     // ap-dispatch gate; a spinning ap claims + launches it in ring-3 in parallel
@@ -3121,7 +3121,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // ── Preemptive multitasking switch-over ─────────────────────────────
     // For graphical / headless boots we hand control to the new scheduler.
     // Spawn the seven canonical kernel processes (Network/Input/Audio/GUI/
-    // Shell/Logging/Scheduler), then call Scheduler::Start()  -  this enables
+    // Shell/Logging/Scheduler), then call Scheduler::Start() - this enables
     // IRQs and never returns.  The text-only and console-realtime fallbacks
     // below still use the polling loop so emergency boot keeps working
     // even if the preemptive path is later disabled at compile time.
@@ -3139,7 +3139,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // already-running in-kernel services (klog/knet/kdbus/kwayland/kaudio)
         // as supervised units, sequences the boot targets (which start the
         // kpkg-daemon / kupdate / ksecurity workers via their start hooks), and
-        // spawns its crash monitor  -  all joining the scheduler. (satoru)
+        // spawns its crash monitor - all joining the scheduler. (satoru)
         KInit::Boot();
         // headless kinit self-tests: run off the gui loop so the bounded waits
         // never stall rendering. (satoru)
@@ -3155,8 +3155,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             KDF::SetCrashTestPoweroff(boot_kdf_poweroff);
             Scheduler::SpawnKernelProcess("kdf-selftest", kdf_selftest_entry, PRIO_LOW, 64, 32 * 1024);
         }
-        // (the kmemx self-test runs inline earlier in kernel_main  -  see the
-        //  boot_kmemx_test block near kfsbench  -  so it is mode-independent and
+        // (the kmemx self-test runs inline earlier in kernel_main - see the
+        //  boot_kmemx_test block near kfsbench - so it is mode-independent and
         //  needs no gui-path kproc here.) (satoru)
         Scheduler::Start();
         // Unreachable.
@@ -3211,7 +3211,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
 
             // forward input to desktop environment
             bool mouse_clicked = Mouse::LeftClicked();
-            bool mouse_down = Mouse::IsLeftDown(); // true while button held  -  enables dragging
+            bool mouse_down = Mouse::IsLeftDown(); // true while button held - enables dragging
 
             // drain all keyboard chars per frame to eliminate input lag
             // first call includes mouse state, subsequent calls are keyboard-only
@@ -3253,7 +3253,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 continue;  // skip render this frame, restart loop fresh
             }
 
-            // refresh task manager periodically  -  every 300 frames (~2s)
+            // refresh task manager periodically - every 300 frames (~2s)
             if (frame_counter % 300 == 0) {
                 TaskManagerApp::RefreshProcesses();
             }
@@ -3297,7 +3297,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                     s_undershoot_streak++;
                     s_overrun_streak = 0;
                     if (s_at_half_rate && s_undershoot_streak >= 120) {
-                        // sustained head-room  -  try original rate again
+                        // sustained head-room - try original rate again
                         int cfg_hz = UIConfig::Int("display.refresh_hz", 60);
                         if (cfg_hz < 24)  cfg_hz = 24;
                         if (cfg_hz > 360) cfg_hz = 360;
@@ -3317,7 +3317,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             // redraw every frame for full smoothness
             DesktopEnvironment::Render();
 
-            // fps counter update  -  using real pit-polled time
+            // fps counter update - using real pit-polled time
             frame_counter++;
             fps_counter++;
             uint32_t now_ms = Timer::GetRealMs();
@@ -3327,7 +3327,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 last_fps_ms = now_ms;
             }
 
-            // draw fps overlay  -  sleek rounded pill
+            // draw fps overlay - sleek rounded pill
             {
                 char fps_str[16] = "FPS ";
                 char num_buf[8];

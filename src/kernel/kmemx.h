@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  KMemX  -  Kurono Memory Compression Engine. (satoru)
+//  KMemX - Kurono Memory Compression Engine. (satoru)
 //
 //  compresses inactive 4kb pages across the whole os into a fixed physical pool
 //  using lz4 (see kmemx_lz4.*), so a page that has not been touched for a while
@@ -38,7 +38,7 @@ enum Pressure : uint8_t {
 // one entry per compressed page. the table is a fixed array sized at init from
 // the pool size; lookups on the fault path hash (address_space, vaddr). (satoru)
 struct PageMeta {
-    uint64_t address_space;   // owning pml4 physical (cr3)  -  0 = free slot (satoru)
+    uint64_t address_space;   // owning pml4 physical (cr3) - 0 = free slot (satoru)
     uint64_t vaddr;           // page-aligned virtual address in that space (satoru)
     uint32_t pool_off;        // byte offset of the compressed blob in the pool (satoru)
     uint16_t comp_size;       // compressed byte count (<= 4096; 4096 == stored raw) (satoru)
@@ -71,7 +71,7 @@ struct Stats {
     uint32_t compress_fail;   // pages that did not fit / declined (stored raw) (satoru)
     uint64_t ns_compress_max; // worst single-page compress time (ns) (satoru)
     uint64_t ns_decompress_max; // worst single-page decompress time (ns) (satoru)
-    uint64_t ns_decompress_min; // best single-page decompress time (ns)  -  warm path (satoru)
+    uint64_t ns_decompress_min; // best single-page decompress time (ns) - warm path (satoru)
     uint64_t ns_decompress_sum; // running sum for the mean decompress latency (satoru)
     uint64_t decomp_over_10us;  // decompressions that blew the 10us invisibility budget (satoru)
 };

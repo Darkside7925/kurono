@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: system & updates (satoru)
+//  kurono os - settings module: system & updates (satoru)
 //  a rich "System & Updates" page: an about banner with the live kurono
 //  version / kernel build / cpu brand / total memory / hostname, a software
 //  updates section (auto-update toggle + repo server + last-sync + pending
@@ -20,7 +20,7 @@
 
 static const char* KURONO_VERSION = "Kurono OS 1.0.0";
 
-// ── module state (constant-initialised statics  -  ctor-free) ─────────────────
+// ── module state (constant-initialised statics - ctor-free) ─────────────────
 static bool s_auto_update    = true;   // persisted to system.auto_update (satoru)
 static bool s_linux_enabled  = true;   // persisted to system.linux_enabled (satoru)
 static int  s_boot_profile   = 0;      // persisted to system.boot_profile, == BootMode (satoru)
@@ -185,7 +185,7 @@ static void system_render(int x, int y, int w, int h, int scroll){
     }
     ly += 22;
     SettingsUI::Row(x, ly, "Reboot Pending:",
-                    SystemUpdate::HasPendingUpdate() ? "Yes  -  restart to apply" : "No");
+                    SystemUpdate::HasPendingUpdate() ? "Yes - restart to apply" : "No");
     ly += 22;
     {
         // check-for-updates action button (a plain pill we hit-test by rect). (satoru)
@@ -375,7 +375,7 @@ static bool system_input(int mx, int my, bool click, char key, int scroll){
     }
     ly += 32;          // enable row (satoru)
 
-    // boot-profile dropdown  -  cycles through the four boot modes. (satoru)
+    // boot-profile dropdown - cycles through the four boot modes. (satoru)
     {
         int hit = SettingsUI::DropdownHit(ctrl_x, ly, CTRL_W, mx, my);
         if(hit >= 0){

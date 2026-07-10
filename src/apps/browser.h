@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  browser stub
+//  kurono os - browser stub
 //  no compatible bare-metal c++ browser exists on github.
 //  netsurf/dillo/ladybird all require libc/posix/x11.
 //  this stub replaces the old browser with a removed notice.

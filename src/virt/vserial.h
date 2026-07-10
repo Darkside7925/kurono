@@ -1,4 +1,4 @@
-//  kurono os  -  virtual serial port (8250/16550a uart) emulation
+//  kurono os - virtual serial port (8250/16550a uart) emulation
 //  full-featured com port emulation for guest vm serial i/o.
 //  supports: tx/rx fifo, interrupt generation, modem control,
 //            baud rate divisor, line/modem status, scratch register.
@@ -86,7 +86,7 @@ constexpr int UART_FIFO_SIZE     = 16;   // 16550a fifo depth
 
 constexpr int UART_OUTPUT_BUF_SIZE = 4096;
 
-//  uart fifo  -  circular buffer for tx/rx
+//  uart fifo - circular buffer for tx/rx
 struct UartFifo {
     uint8_t  data[UART_FIFO_SIZE];
     int      head;
@@ -129,7 +129,7 @@ struct UartFifo {
     }
 };
 
-//  virtualserial  -  full 16550a uart emulation
+//  virtualserial - full 16550a uart emulation
 class VirtualSerial {
 public:
     void Reset();
@@ -194,7 +194,7 @@ private:
     void     SetFIFOTrigger(uint8_t fcr_val);
 };
 
-//  com port definitions  -  up to 4 virtual serial ports
+//  com port definitions - up to 4 virtual serial ports
 constexpr uint16_t COM1_BASE = 0x3F8;
 constexpr uint16_t COM2_BASE = 0x2F8;
 constexpr uint16_t COM3_BASE = 0x3E8;

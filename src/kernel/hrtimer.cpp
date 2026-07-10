@@ -1,4 +1,4 @@
-//  kurono os  -  high-resolution timer subsystem
+//  kurono os - high-resolution timer subsystem
 //
 //  see hrtimer.h for design notes. this implementation is intentionally
 //  linear: 64 entries scanned on every Tick(). that costs ~64 cycles per

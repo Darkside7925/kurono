@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  high-resolution timer subsystem (Phase 14)
+//  kurono os - high-resolution timer subsystem (Phase 14)
 //
 //  small fixed-capacity table of one-shot timers indexed by absolute
 //  millisecond deadline. designed for kernel-internal use (deferred
@@ -15,7 +15,7 @@
 //     the original interval; cancel to stop.
 //   * `Tick()` is called by the kernel scheduler tick. it fires every
 //     timer whose deadline <= now and re-arms periodics. callbacks run
-//     in scheduler-tick context  -  keep them short.
+//     in scheduler-tick context - keep them short.
 //   * `DumpProcInfo(buf, max)` produces a human-readable snapshot
 //     compatible with linux `/proc/timer_list`.
 //

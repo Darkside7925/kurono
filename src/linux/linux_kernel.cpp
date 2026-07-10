@@ -1,4 +1,4 @@
-//  kurono os  -  linux kernel emulation layer  -  implementation
+//  kurono os - linux kernel emulation layer - implementation
 
 #include "linux_kernel.h"
 #include "linux_syscall.h"
@@ -161,7 +161,7 @@ void LinuxKernel::Tick(uint32_t now_ms) {
         load_15 = (load_15 * 99 + running_count * 100 *  1) / 100;
     }
 
-    // tick threads  -  accumulate cpu time
+    // tick threads - accumulate cpu time
     for (int i = 0; i < LINUX_MAX_THREADS; i++) {
         if (threads[i].active) threads[i].cpu_time++;
     }
@@ -792,7 +792,7 @@ int LinuxKernel::GetThreadCount() {
 
 int LinuxKernel::FutexWait(uint32_t* addr, uint32_t expected, uint32_t timeout) {
     if (!addr) return -1;
-    if (*addr != expected) return -1;  // eagain  -  value changed
+    if (*addr != expected) return -1;  // eagain - value changed
 
     // find or create futex entry
     int idx = -1;
@@ -813,7 +813,7 @@ int LinuxKernel::FutexWait(uint32_t* addr, uint32_t expected, uint32_t timeout) 
     }
     if (idx < 0) return -1;
 
-    // add current thread as waiter (simplified  -  normally blocks)
+    // add current thread as waiter (simplified - normally blocks)
     if (futexes[idx].waiter_count < LINUX_MAX_THREADS) {
         futexes[idx].waiters[futexes[idx].waiter_count++] = next_tid - 1;
     }

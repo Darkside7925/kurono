@@ -15,11 +15,11 @@ values influence each task's time quantum.
 
 The OS **does** have full ring-3 user processes: a per-CPU TSS (`TSS64` in
 `src/hal/hal.cpp`), `int 0x80` + the per-CPU `swapgs` SYSCALL fast path, and
-saved user interrupt frames. Linux user threads are preemptively switched  -  on
+saved user interrupt frames. Linux user threads are preemptively switched - on
 the boot core via the PIT IRQ, and (opt-in) on the application processors via a
 per-CPU LAPIC timer (see §5 and [SMP.md](SMP.md)). The earlier claim that "full
 preemptive user-space processes would require TSS/syscall infrastructure" is no
-longer true  -  that infrastructure is in.
+longer true - that infrastructure is in.
 
 ## 3. Process table
 
@@ -57,7 +57,7 @@ balancing. See [SMP.md](SMP.md) for the full phased state.
 
 ## 6. Related files
 
-- `src/proc/smp.cpp` / `src/boot/ap_trampoline.asm`  -  multi-core bring-up
-- `src/apps/task_manager.cpp`  -  reads process table for display
-- `src/drivers/timer.cpp`  -  timer interrupt triggers tick
-- `src/kernel/kurono_kernel.cpp`  -  calls `Scheduler::Tick()` in main loop
+- `src/proc/smp.cpp` / `src/boot/ap_trampoline.asm` - multi-core bring-up
+- `src/apps/task_manager.cpp` - reads process table for display
+- `src/drivers/timer.cpp` - timer interrupt triggers tick
+- `src/kernel/kurono_kernel.cpp` - calls `Scheduler::Tick()` in main loop

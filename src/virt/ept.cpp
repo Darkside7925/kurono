@@ -1,4 +1,4 @@
-//  kurono os  -  ept / npt implementation
+//  kurono os - ept / npt implementation
 //  extended page tables (intel) & nested page tables (amd)
 #include "ept.h"
 #include "vmm.h"
@@ -118,7 +118,7 @@ uint64_t EPTManager::BuildNCR3(NPT_PML4* pml4) {
     return (uint64_t)(uintptr_t)pml4;
 }
 
-//  ept page table walk  -  allocate intermediate levels on demand
+//  ept page table walk - allocate intermediate levels on demand
 
 // kmemx hook: a no-create leaf walk. returns the existing 4kb leaf entry pointer
 // or nullptr (absent uppers or a large-page mapping). thin wrapper over WalkEPT.
@@ -422,7 +422,7 @@ const GuestMemRegion* EPTManager::GetRegion(int idx) {
 void EPTManager::InvalidateEPT() {
     if (VMM::GetType() != VIRT_INTEL_VTX) return;
 
-    // invept  -  type 2 = global invalidation (all ept translations)
+    // invept - type 2 = global invalidation (all ept translations)
     struct {
         uint64_t eptp;
         uint64_t reserved;
@@ -488,7 +488,7 @@ bool EPTManager::HandleEPTViolation(uint64_t guest_phys, uint64_t qualification)
     for (int i = 0; i < region_count; i++) {
         if (guest_phys >= regions[i].guest_phys_start &&
             guest_phys < regions[i].guest_phys_start + regions[i].size) {
-            // known region  -  might be lazy mapping
+            // known region - might be lazy mapping
             SerialLogger::Log("EPT: GPA in region #");
             SerialLogger::LogDec(i);
             SerialLogger::Log(" type=");
@@ -497,7 +497,7 @@ bool EPTManager::HandleEPTViolation(uint64_t guest_phys, uint64_t qualification)
 
             // for mmio regions, handle the access in the virtual device layer
             if (regions[i].type == MEM_MMIO) {
-                SerialLogger::Log("EPT: MMIO access  -  delegate to vdevice\r\n");
+                SerialLogger::Log("EPT: MMIO access - delegate to vdevice\r\n");
                 return true; // handled
             }
             return false; // not a lazy-map case

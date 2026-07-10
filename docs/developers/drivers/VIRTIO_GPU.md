@@ -46,13 +46,13 @@ The host emulation is a VPCI device that:
 
 The host processes these commands:
 
-- `VIRTIO_GPU_CMD_GET_DISPLAY_INFO`  -  returns display dimensions
-- `VIRTIO_GPU_CMD_RESOURCE_CREATE_2D`  -  creates a 2D resource
-- `VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING`  -  attaches guest memory to resource
-- `VIRTIO_GPU_CMD_SET_SCANOUT`  -  sets a resource as the scanout
-- `VIRTIO_GPU_CMD_RESOURCE_FLUSH`  -  flushes resource changes
-- `VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D`  -  transfers data to host
-- `VIRTIO_GPU_CMD_RESOURCE_UNREF`  -  destroys a resource
+- `VIRTIO_GPU_CMD_GET_DISPLAY_INFO` - returns display dimensions
+- `VIRTIO_GPU_CMD_RESOURCE_CREATE_2D` - creates a 2D resource
+- `VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING` - attaches guest memory to resource
+- `VIRTIO_GPU_CMD_SET_SCANOUT` - sets a resource as the scanout
+- `VIRTIO_GPU_CMD_RESOURCE_FLUSH` - flushes resource changes
+- `VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D` - transfers data to host
+- `VIRTIO_GPU_CMD_RESOURCE_UNREF` - destroys a resource
 
 ### PresentIfDirty
 
@@ -79,7 +79,7 @@ Each descriptor can be chained via the `VIRTQ_DESC_F_NEXT` flag.
 
 ## 6. Related files
 
-- `src/drivers/display_mgr.cpp`  -  uses VirtIO GPU as a display backend
-- `src/drivers/graphics.cpp`  -  framebuffer target for scanout
-- `src/virt/hypervisor.cpp`  -  tick loop calls `PresentIfDirty()`
-- `src/virt/vpci.cpp`  -  virtual PCI device registration
+- `src/drivers/display_mgr.cpp` - uses VirtIO GPU as a display backend
+- `src/drivers/graphics.cpp` - framebuffer target for scanout
+- `src/virt/hypervisor.cpp` - tick loop calls `PresentIfDirty()`
+- `src/virt/vpci.cpp` - virtual PCI device registration

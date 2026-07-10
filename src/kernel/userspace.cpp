@@ -125,7 +125,7 @@ static size_t kstrcpy(char* dst, const char* src) {
 //   string area  : argv[i] strings, envp[i] strings, 16 random bytes,
 //                  then a "x86_64\0" string for AT_PLATFORM
 //   alignment pad
-//   auxv         : AT_PHDR (skipped  -  caller doesn't always know),
+//   auxv         : AT_PHDR (skipped - caller doesn't always know),
 //                  AT_PAGESZ=4096, AT_RANDOM=ptr, AT_PLATFORM=ptr,
 //                  AT_UID=0, AT_EUID=0, AT_GID=0, AT_EGID=0,
 //                  AT_SECURE=0, AT_NULL=0
@@ -308,15 +308,15 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
         linux_proc->task = proc;
         // relocate the brk heap above all identity-mapped physical ram. the
         // default brk window (0x08100000..0x0C000000) ALIASES low physical
-        // addresses  -  the framebuffer, kernel heap, and pmm frames all live
-        // there  -  and the kernel reaches every physical frame through the low
+        // addresses - the framebuffer, kernel heap, and pmm frames all live
+        // there - and the kernel reaches every physical frame through the low
         // identity map (phys==virt). when a user brk page is mapped at e.g. va
         // 0x83f9000 and later released, it clears that frame's identity leaf in
         // the process's private page tables, so the kernel's next identity write
         // to that physical frame (pmm zero-on-alloc) #pf'd. firefox's heap grew
-        // into that range and crashed the kernel. park brk at 24tb  -  above ram,
+        // into that range and crashed the kernel. park brk at 24tb - above ram,
         // clear of the mmap arena (16tb) and ld-kurono's aslr region (64tb+). we
-        // set it here, in an allowed file, via the public accessor  -  the default
+        // set it here, in an allowed file, via the public accessor - the default
         // is assigned in linux_syscall (a separately-owned file). (satoru)
         constexpr uint64_t HIGH_BRK_BASE = 0x0000180000000000ULL;
         constexpr uint64_t HIGH_BRK_SIZE = 0x0000000010000000ULL;  // 256mb window
@@ -336,7 +336,7 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     // *after* address-space activation so writes land in the user's
     // physical pages.  a dynamic pie is the exception: ld-kurono already
     // built its stack (with the complete auxv: at_phdr/at_base/at_entry of the
-    // loaded image) at proc->rsp, so enter there as-is  -  rebuilding would drop
+    // loaded image) at proc->rsp, so enter there as-is - rebuilding would drop
     // that auxv and break musl's tls/dynamic startup. (satoru)
     uint64_t entry_rsp;
     if (proc->flags & PROCESS_FLAG_STACK_READY) {
@@ -347,7 +347,7 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     }
 
     // enter ring-3. the tls thread pointer (fs base) is programmed INSIDE
-    // UserspaceEnter  -  after it reloads the fs selector (which on x86-64 zeroes
+    // UserspaceEnter - after it reloads the fs selector (which on x86-64 zeroes
     // fsbase) and right before iretq. a dynamic pie set proc->fs_base via
     // ld-kurono's install_main_tls; static binaries pass 0 and set their own fs
     // later via arch_prctl. resume (preempt) reprograms fs via LoadUserFrame. (satoru)

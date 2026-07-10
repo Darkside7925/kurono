@@ -1,4 +1,4 @@
-//  kurono os  -  virtual pci bus implementation
+//  kurono os - virtual pci bus implementation
 #include "vpci.h"
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
@@ -27,14 +27,14 @@ void VPCI::Init() {
 }
 
 void VPCI::Cfg16(VPCIDevice* dev, uint8_t off, uint16_t v) {
-    // bound the access  -  off near 255 would index cfg[256]/[257] past the
+    // bound the access - off near 255 would index cfg[256]/[257] past the
     // 256-byte cfg array into the rest of the struct (oob write). (satoru)
     if ((int)off + 2 > VPCI_CFG_SIZE) return;
     dev->cfg[off]     = (uint8_t)(v & 0xFF);
     dev->cfg[off + 1] = (uint8_t)((v >> 8) & 0xFF);
 }
 void VPCI::Cfg32(VPCIDevice* dev, uint8_t off, uint32_t v) {
-    // same bound  -  off near 255 would index up to cfg[258] (oob write). (satoru)
+    // same bound - off near 255 would index up to cfg[258] (oob write). (satoru)
     if ((int)off + 4 > VPCI_CFG_SIZE) return;
     dev->cfg[off]     = (uint8_t)(v & 0xFF);
     dev->cfg[off + 1] = (uint8_t)((v >> 8) & 0xFF);
@@ -65,7 +65,7 @@ int VPCI::RegisterDevice(VPCIDevice* src) {
         b.base = base;
         next_bar_base = base + b.size;
 
-        // plant bar value into cfg space  -  memory bar, optionally 64-bit prefetch
+        // plant bar value into cfg space - memory bar, optionally 64-bit prefetch
         uint32_t bar_lo = (uint32_t)(base & 0xFFFFFFF0u);
         if (b.is_64bit) bar_lo |= 0x04;       // type = 64-bit
         if (b.prefetch) bar_lo |= 0x08;       // prefetchable
@@ -119,20 +119,20 @@ void VPCI::WriteConfig(uint8_t bus, uint8_t dev, uint8_t func,
     if (!d.present || func != 0) return;
     if ((int)off + size > VPCI_CFG_SIZE) return;
 
-    // bar writes  -  handle bar size probing (write 0xFFFFFFFF, read back size mask)
+    // bar writes - handle bar size probing (write 0xFFFFFFFF, read back size mask)
     if (off >= PCI_BAR0 && off < PCI_BAR0 + 6 * 4) {
         int bar = (off - PCI_BAR0) / 4;
         VPCIBar& b = d.bars[bar];
         if (b.size != 0 && b.is_mmio) {
             if (size == 4 && value == 0xFFFFFFFFu) {
-                // size probe  -  return ~(size-1) | type bits
+                // size probe - return ~(size-1) | type bits
                 uint32_t mask = ~((uint32_t)b.size - 1u);
                 if (b.is_64bit) mask |= 0x04;
                 if (b.prefetch) mask |= 0x08;
                 Cfg32(&d, off, mask);
                 return;
             }
-            // restoration of bar to its real assignment  -  accept low bits ignored
+            // restoration of bar to its real assignment - accept low bits ignored
             uint32_t real_lo = (uint32_t)(b.base & 0xFFFFFFF0u);
             if (b.is_64bit) real_lo |= 0x04;
             if (b.prefetch) real_lo |= 0x08;

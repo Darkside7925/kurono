@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  kurono os  -  slab allocator
+//  kurono os - slab allocator
 //
 //  Layered on top of Buddy.  Each kmem_cache is a fixed-size object pool
 //  carved from one or more 4 KB or 8 KB "slabs" obtained via

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  task manager application (professional)
+//  kurono os - task manager application (professional)
 
 #include "../kernel/types.h"
 
@@ -119,7 +119,7 @@ private:
     static int mem_history[60];
     static int hist_idx;
     static int tick_counter;
-    // rows visible in the list viewport on the last render  -  used to clamp
+    // rows visible in the list viewport on the last render - used to clamp
     // wheel scrolling so the offset can't run past the end of the list. (satoru)
     static int last_list_vis;
 

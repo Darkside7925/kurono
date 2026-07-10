@@ -329,7 +329,7 @@ static int send_core(int sd, const void* buf, int len, const ControlMsg& cm) {
     if (!valid(sd) || !g_socks[sd].connected) {
         // (satoru) TEMP: this EPIPE is silent (no [usend] below). catch a firefox
         // parent->content send that fails because the inherited channel lost its
-        // `connected` flag  -  distinguishes a kernel socket bug from "never sent".
+        // `connected` flag - distinguishes a kernel socket bug from "never sent".
         SerialLogger::Log("[usend] sd="); SerialLogger::LogDec(sd);
         SerialLogger::Log(" EPIPE valid="); SerialLogger::LogDec(valid(sd) ? 1 : 0);
         SerialLogger::Log(" conn="); SerialLogger::LogDec((valid(sd) && g_socks[sd].connected) ? 1 : 0);
@@ -493,7 +493,7 @@ int Close(int sd) {
         ps.shutdown_wr = true;     // peer's writes will start failing
         ps.peer_sd = -1;
         // Leave any buffered RX data on the peer so it can drain after
-        // our close  -  connection-style EOF semantics.
+        // our close - connection-style EOF semantics.
     }
     s.in_use = false;
     return 0;
@@ -534,6 +534,17 @@ int PendingBytes(int sd) {
     return g_socks[sd].rx.avail();
 }
 
+// (satoru) TEMP diag: bytes waiting in this socket's PEER rx ring (what a write
+// to `sd` delivers). lets the poll probe tell "polled fd has no data because the
+// signaler wrote the read end and it went to the peer" apart from "nobody wrote
+// it". returns -1 if unpaired. remove before commit.
+int PeerPendingBytes(int sd) {
+    if (!valid(sd)) return -1;
+    int peer = g_socks[sd].peer_sd;
+    if (peer < 0 || peer >= UNIX_MAX_SOCKETS || !g_socks[peer].in_use) return -1;
+    return g_socks[peer].rx.avail();
+}
+
 // true when a listening socket has a connection waiting in its backlog. poll /
 // epoll must report POLLIN on a listen fd so an accept loop (e.g. firefox's
 // WaylandProxy, which listens on wayland-proxy-<pid> and forwards to wayland-0)
@@ -568,7 +579,7 @@ int KernelInject(int sd, const void* buf, int len) {
 
 // kernel→client with ancillary data: same peer routing as KernelInject but
 // the ControlMsg rides the ring frame, so the client's recvmsg installs the
-// passed backing as a real memfd (SCM_RIGHTS out of an in-kernel server  - 
+// passed backing as a real memfd (SCM_RIGHTS out of an in-kernel server - 
 // the wl_keyboard.keymap fd is the first user). (satoru)
 int KernelInjectMsg(int sd, const void* buf, int len, const ControlMsg* cm) {
     if (!valid(sd)) return -1;

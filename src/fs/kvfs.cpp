@@ -541,7 +541,7 @@ int KVFS::WriteFile_nolock(const char* path, const void* data, uint32_t len) {
         if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
         uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
-        // only free a LIVE heap block  -  node->content may be a stale/non-heap
+        // only free a LIVE heap block - node->content may be a stale/non-heap
         // pointer (deserialized image / freed elsewhere); a stray Free() trips
         // heap "bad magic" and corrupts the allocator. (satoru)
         if (node->content && KernelHeap::IsValidBlock(node->content)) KernelHeap::Free(node->content);
@@ -970,7 +970,7 @@ int KVFS::ReadString(const char* path, char* buf, int max_len) {
     return r;
 }
 
-//  persistence  -  flat depth-first binary (de)serialization (satoru)
+//  persistence - flat depth-first binary (de)serialization (satoru)
 //
 //  on-disk layout (little-endian):
 //    header { u32 magic=0x4B564653; u32 version; u32 node_count; }
@@ -1363,7 +1363,7 @@ void KVFS::BuildDefaultTree() {
     // (and in every later boot stage) resolves through the overlay. (satoru)
     InstallCanonicalLayout();
 
-    // remaining seed dirs  -  these resolve through the symlinks into /kurono. the
+    // remaining seed dirs - these resolve through the symlinks into /kurono. the
     // top-level names (/etc, /home, /var, ...) are now symlinks, so Mkdirs walks
     // through them into the real dirs. (satoru)
     const char* dirs[] = {
@@ -1406,7 +1406,7 @@ void KVFS::BuildDefaultTree() {
 }
 
 // NOTE: runs once at boot, single-threaded, BEFORE the scheduler starts.
-// Holds NO g_vfs_lock and calls the public (locked) wrappers below  -  they
+// Holds NO g_vfs_lock and calls the public (locked) wrappers below - they
 // acquire the lock without nesting. Adding a guard here would self-deadlock
 // because BuildDefaultTree() calls the locked Mkdirs()/WriteString(). (satoru)
 void KVFS::Init() {

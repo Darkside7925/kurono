@@ -1,4 +1,4 @@
-//  kurono os  -  linux signal system  -  implementation
+//  kurono os - linux signal system - implementation
 
 #include "linux_signals.h"
 #include "linux_syscall.h"
@@ -75,7 +75,7 @@ int LinuxSignals::Kill(int sender_pid, int target_pid, int signo) {
 }
 
 int LinuxSignals::TKill(int tid, int signo) {
-    // thread-specific kill  -  for now, same as process kill
+    // thread-specific kill - for now, same as process kill
     return Kill(0, tid, signo);
 }
 
@@ -253,7 +253,7 @@ int LinuxSignals::DeliverPending(int pid_idx) {
                 break;
         }
     } else if (handler != LSIG_IGN) {
-        // user handler  -  would set up signal frame on stack
+        // user handler - would set up signal frame on stack
         // for now, mark that we're in a handler
         s->in_handler = true;
         s->current_signal = signo;
@@ -264,7 +264,7 @@ int LinuxSignals::DeliverPending(int pid_idx) {
             SetBit(&s->blocked, signo);
         }
 
-        // sa_resethand  -  reset to default after delivery
+        // sa_resethand - reset to default after delivery
         if (s->handlers[signo].sa_flags & LSA_RESETHAND) {
             s->handlers[signo].sa_handler = LSIG_DFL;
         }
@@ -279,7 +279,7 @@ void LinuxSignals::Sigreturn(int pid_idx) {
     s->in_handler = false;
     s->current_signal = 0;
     // restore any blocked signals that were temporarily added
-    // (simplified  -  real kernel saves/restores the mask)
+    // (simplified - real kernel saves/restores the mask)
 }
 
 //  alarm

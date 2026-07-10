@@ -24,7 +24,7 @@ namespace {
 
 // ── engine state ─────────────────────────────────────────────────────────────
 bool      g_inited   = false;
-bool      g_enabled  = false;       // user toggle (stage 11)  -  off until enabled (satoru)
+bool      g_enabled  = false;       // user toggle (stage 11) - off until enabled (satoru)
 int       g_pool_pct = 20;          // default 20% of ram (satoru)
 int       g_threshold = 8;          // base generation threshold (satoru)
 Pressure  g_pressure = PRESS_GREEN;
@@ -65,7 +65,7 @@ int      g_guest_count = 0;
 // must not be freed back to the pool until the LAST referencing page faults in,
 // so its reference count lives here, keyed by pool_off (the blob's stable
 // handle). a small open-addressed table; only deduped extents (refs >= 2)
-// occupy an entry  -  a normal 1:1 page never touches it. (satoru)
+// occupy an entry - a normal 1:1 page never touches it. (satoru)
 struct DedupRef { uint32_t pool_off; uint32_t refs; };
 constexpr int MAX_DEDUP = 4096;
 DedupRef g_dedup[MAX_DEDUP];
@@ -115,7 +115,7 @@ static int meta_find(uint64_t as, uint64_t vaddr) {
 
 // claim a free slot for (as,vaddr); returns slot or -1 if the table is full. a
 // slot is free if address_space==0 AND pool_off==NULL (a tombstone keeps
-// address_space==0 but pool_off!=NULL... we don't tombstone  -  we backfill on
+// address_space==0 but pool_off!=NULL... we don't tombstone - we backfill on
 // delete, see meta_erase). (satoru)
 static int meta_insert(uint64_t as, uint64_t vaddr) {
     if (!g_meta) return -1;
@@ -315,7 +315,7 @@ bool Init(int pool_pct) {
 
     // ── 1) scratch + metadata FIRST, while contiguous memory is plentiful ──
     // (allocating these after the pool grabbed hundreds of 2mb chunks left no
-    //  contiguous block for the table  -  the original boot failure.) (satoru)
+    //  contiguous block for the table - the original boot failure.) (satoru)
     g_scratch_hash = (uint8_t*)PMM::AllocBytes(KMemXLZ4::SCRATCH_BYTES);
     g_scratch_comp = (uint8_t*)PMM::AllocBytes((size_t)KMemXLZ4::CompressBound(PAGE));
     g_scratch_dda  = (uint8_t*)PMM::AllocBytes(PAGE);   // dedup byte-compare A (satoru)
@@ -327,7 +327,7 @@ bool Init(int pool_pct) {
 
     // metadata table: ~1 entry per 1.5kb of the INTENDED pool, power-of-two,
     // hard-capped at META_MAX_ENTRIES so the contiguous allocation stays small
-    // (a larger pool than the cap can serve just limits concurrent live pages  - 
+    // (a larger pool than the cap can serve just limits concurrent live pages - 
     // a soft cap, never a crash). (satoru)
     uint64_t total_ram = PMM::GetTotalMemory();
     uint64_t intended_pool = (total_ram / 100) * (uint64_t)pool_pct;
@@ -373,7 +373,7 @@ bool Init(int pool_pct) {
 
     uint64_t got = (want > 0) ? KMemXPool::Reserve(want) : 0;
     if (got == 0) {
-        SerialLogger::Log("[kmemx] WARN: reserved 0 pool (low memory)  -  engine idle\r\n");
+        SerialLogger::Log("[kmemx] WARN: reserved 0 pool (low memory) - engine idle\r\n");
         // not fatal: the engine inits but compresses nothing until memory frees
         // up and SetPoolPct grows it. (satoru)
     }
@@ -542,7 +542,7 @@ bool SetPoolPct(int pct) {
     // bound the target exactly like Init: never grow so far that free ram drops
     // below POOL_HEADROOM, and never past what the metadata table can index.
     // GrowTo only ever ADDS chunks (it never shrinks), and it stops on the first
-    // failed contiguous alloc, so this can only ever cap the growth  -  on a tight
+    // failed contiguous alloc, so this can only ever cap the growth - on a tight
     // host (e.g. the 2gb headless test where the pmm reports 4gb) it keeps the
     // pool from pushing the system into oom/critical. (satoru)
     uint64_t total_ram = PMM::GetTotalMemory();
@@ -555,7 +555,7 @@ bool SetPoolPct(int pct) {
     } else {
         want = KMemXPool::TotalBytes();   // too tight to grow further (satoru)
     }
-    // never more than half of (free + what we hold)  -  same proportional cap as
+    // never more than half of (free + what we hold) - same proportional cap as
     // Init, so growing the pool can't drive the system into critical. (satoru)
     uint64_t half = free_plus_pool / 2;
     if (want > half) want = half;
@@ -584,7 +584,7 @@ void UnregisterGuest(uint64_t ept_root) {
 // ── stage 9: hypervisor guest-page compression (ept level) ──────────────────
 // the guest has zero knowledge: we compress its host-backing frame, clear the
 // ept leaf (so the next guest access faults with an ept violation), and free the
-// frame  -  exactly the native flow but at the ept layer. the page is keyed
+// frame - exactly the native flow but at the ept layer. the page is keyed
 // (ept_root, guest_phys) in the SAME pool + metadata table, tagged KMETA_GUEST.
 // only registered guests are touched; with no running guest this is inert. the
 // scan cursor round-robins guest-physical space across the mapped regions. (satoru)
@@ -647,7 +647,7 @@ int CompressGuests(int budget) {
     for (int r = 0; r < regions && taken < budget && looked < AGE_LIMIT; r++) {
         const GuestMemRegion* reg = EPTManager::GetRegion(r);
         if (!reg) continue;
-        // only normal ram is compressible  -  skip rom / mmio / reserved /
+        // only normal ram is compressible - skip rom / mmio / reserved /
         // framebuffer regions entirely (those must never be compressed). the
         // per-leaf checks in compress_guest_page are a second line of defence. (satoru)
         if (reg->type != MEM_RAM) continue;
@@ -675,7 +675,7 @@ bool HandleGuestFault(uint64_t ept_root, uint64_t guest_phys) {
     int idx = meta_find(ept_root, gpa);
     if (idx < 0 || !(g_meta[idx].flags & KMETA_GUEST)) {
         g_lock.UnlockIrqRestore(f);
-        return false;   // not ours  -  the hypervisor handles it normally (satoru)
+        return false;   // not ours - the hypervisor handles it normally (satoru)
     }
     uint32_t ept_flags = g_meta[idx].orig_pte_flags;
     g_lock.UnlockIrqRestore(f);
@@ -731,7 +731,7 @@ bool HandleGuestFaultAny(uint64_t guest_phys) {
 // resolve the page's backing frame, compress its bytes into the pool, make the
 // leaf not-present + marked, then free the original frame. the original frame's
 // bytes are identity-mapped so we read them directly from kernel context (no cr3
-// switch needed  -  kmemx runs in the kernel address space but the target page
+// switch needed - kmemx runs in the kernel address space but the target page
 // tables + frames are all identity-mapped). (satoru)
 bool CompressPage(uint64_t as, uint64_t vaddr) {
     if (!g_inited || !g_enabled) return false;
@@ -769,7 +769,7 @@ bool CompressPage(uint64_t as, uint64_t vaddr) {
     g_lock.UnlockIrqRestore(f);
 
     // free the now-spare physical frame back to the pmm (the page lives in the
-    // pool now) and flush the stale tlb entry. done OUTSIDE the lock  -  PMM has its
+    // pool now) and flush the stale tlb entry. done OUTSIDE the lock - PMM has its
     // own irq guard, and the leaf is already not-present so no one can fault it
     // into a half state. (satoru)
     PMM::FreeFrame(phys);
@@ -807,7 +807,7 @@ bool HandleFault(uint64_t fault_vaddr) {
     uint64_t f; g_lock.LockIrqSave(&f);
     int idx = meta_find(as, va);
     if (idx < 0) {
-        // the marker said compressed but the metadata is gone  -  treat as not-ours
+        // the marker said compressed but the metadata is gone - treat as not-ours
         // (another path may have restored it). free the spare frame. (satoru)
         g_lock.UnlockIrqRestore(f);
         PMM::FreeFrame(frame);
@@ -840,7 +840,7 @@ bool HandleFault(uint64_t fault_vaddr) {
         g_stats.ns_decompress_min = dt;
     g_stats.ns_decompress_sum += dt;
     if (dt > 10000) {
-        // blew the 10us invisibility budget  -  count it (per spec: normal case is
+        // blew the 10us invisibility budget - count it (per spec: normal case is
         // 2-3us). do NOT log from the hot path: SerialLogger does port i/o that
         // would itself dwarf the budget and perturb the next measurement. the
         // count is surfaced by `kmemx status` / the self-test instead. (satoru)
@@ -989,7 +989,7 @@ int DecompressAll() {
 // find compressed pages with identical content and merge them onto one shared
 // pool extent (copy-on-write: a later fault decompresses + restores the page and
 // drops the shared refcount). matches by crc32 first (cheap), then a full
-// byte-compare of the decompressed pages (crc collisions are rare but possible  - 
+// byte-compare of the decompressed pages (crc collisions are rare but possible - 
 // we must never merge non-identical pages). runs at the lowest priority inside
 // the kmemx process and is strictly bounded by `budget` merges per pass. big win
 // for libxul zero pages + musl pages shared across processes. (satoru)
@@ -1035,7 +1035,7 @@ int DedupPass(int budget) {
             if (b.crc32 != crc_a) continue;
             if (b.pool_off == a.pool_off) continue;          // already the same blob (satoru)
 
-            // crc matches  -  confirm with a full byte-compare. (satoru)
+            // crc matches - confirm with a full byte-compare. (satoru)
             if (!retrieve_compressed_locked((int)slot_b, g_scratch_ddb)) {
                 uint32_t want = b.crc32;
                 g_lock.UnlockIrqRestore(f);

@@ -1,4 +1,4 @@
-//  kurono linux subsystem  -  shared mount layer
+//  kurono linux subsystem - shared mount layer
 //  unified namespace: mounts kvfs paths into linux and ext4 paths into kurono
 #pragma once
 #include "../kernel/types.h"
@@ -7,7 +7,7 @@
 
 enum SharedMountType {
     SM_BIND = 0,       // bind mount (same source, visible in both)
-    SM_OVERLAY = 1,    // overlay  -  kvfs is lower, ext4 is upper
+    SM_OVERLAY = 1,    // overlay - kvfs is lower, ext4 is upper
     SM_SYMLINK = 2,    // symbolic link redirect
     SM_PASSTHROUGH = 3 // direct passthrough (no translation)
 };

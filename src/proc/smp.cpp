@@ -9,20 +9,20 @@
 #include "../linux/linux_syscall.h" // drain the ap process's console output (satoru)
 #include "../drivers/timer.h"     // wall-clock bound for the tlb-shootdown ack wait (satoru)
 
-//  the ap trampoline blob (flat binary, embedded via objcopy)  -  copied to phys
+//  the ap trampoline blob (flat binary, embedded via objcopy) - copied to phys
 //  0x8000 before the first SIPI. (satoru)
 extern "C" uint8_t _binary_ap_trampoline_bin_start[];
 extern "C" uint8_t _binary_ap_trampoline_bin_end[];
 
-//  switch_to.asm: pivot onto a saved InterruptFrame and iretq into ring-3  - 
+//  switch_to.asm: pivot onto a saved InterruptFrame and iretq into ring-3 - 
 //  how an ap RESUMES a claimed sibling thread. never returns. (satoru)
 extern "C" [[noreturn]] void ap_enter_user_frame(InterruptFrame* f);
 
-//  the ap dispatch loop (defined below ap_entry)  -  also the iret target the
+//  the ap dispatch loop (defined below ap_entry) - also the iret target the
 //  syscall exit path uses when an ap runs out of threads. (satoru)
 extern "C" [[noreturn]] void ap_dispatch_reenter();
 
-//  smp phase 1  -  lapic enable + cpu enumeration + per-cpu blocks. see smp.h. (satoru)
+//  smp phase 1 - lapic enable + cpu enumeration + per-cpu blocks. see smp.h. (satoru)
 
 namespace {
     //  per-cpu blocks + the apic-id -> dense-index map (apic ids can be sparse). (satoru)
@@ -43,6 +43,16 @@ namespace {
     //  tlb-shootdown ack counter: receivers increment after reloading cr3. (satoru)
     volatile uint32_t g_tlb_ack = 0;
 
+    //  flush epochs (see smp.h): start-seq bumps at broadcast entry, full-seq
+    //  latches the highest start-seq that got acks from every online peer.
+    //  senders are serialized by the callers' mmap/kls locks; receivers only
+    //  touch g_tlb_ack. (satoru)
+    volatile uint64_t g_tlb_flush_start_seq = 0;
+    volatile uint64_t g_tlb_flush_full_seq  = 0;
+    //  count of shootdowns that gave up unacked - a process-context reader can
+    //  print this; the hot path must not do serial i/o (it may be IF=0). (satoru)
+    volatile uint32_t g_tlb_flush_timeouts  = 0;
+
     inline uint64_t rdmsr(uint32_t msr) {
         uint32_t lo, hi;
         __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
@@ -62,7 +72,7 @@ namespace {
 
     const uint32_t MSR_KERNEL_GS_BASE = 0xC0000102u;
 
-    //  busy-wait  -  interrupts are disabled at this point in boot so we cannot
+    //  busy-wait - interrupts are disabled at this point in boot so we cannot
     //  sleep; spin on the (already-calibrated) tsc instead. (satoru)
     void busy_us(uint64_t us) {
         uint64_t hz = (uint64_t)CPUDetect::GetInfo().frequency.tsc_frequency;
@@ -176,7 +186,7 @@ namespace {
         while (p + 2 <= end) {
             uint8_t type = p[0];
             uint8_t len  = p[1];
-            if (len < 2) break;  // malformed  -  stop (satoru)
+            if (len < 2) break;  // malformed - stop (satoru)
             if (type == 0 && len >= 8) {         // processor local apic (satoru)
                 uint8_t apic_id = p[3];
                 uint32_t flags = *(const uint32_t*)(p + 4);
@@ -268,7 +278,7 @@ void     SMP::LapicWrite(uint32_t reg, uint32_t v){ mmio_w32(g_lapic_base + reg,
 void SMP::SetupGsBase() {
     // KERNEL_GS_BASE holds this cpu's PerCpu pointer while in user mode; the
     // SYSCALL stub does swapgs at entry to bring it into gs, reads gs:0/gs:8, and
-    // swapgs back before iretq  -  net-zero per syscall, so it permanently holds the
+    // swapgs back before iretq - net-zero per syscall, so it permanently holds the
     // per-cpu pointer. (satoru)
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)Current());
 }
@@ -287,7 +297,7 @@ void SMP::LapicEnable() {
 //  on the kernel's shared address space with this ap's own stack. phase 2 just
 //  proves the bring-up: enable the local apic, find our per-cpu block, signal
 //  online, then idle. phase 3 replaces the idle spin with a scheduler loop.
-//  no shared serial here  -  the bsp logs each core after its online flag flips,
+//  no shared serial here - the bsp logs each core after its online flag flips,
 //  so there is no cross-core console race. (satoru)
 extern "C" void ap_entry() {
     SMP::LapicEnable();
@@ -296,7 +306,7 @@ extern "C" void ap_entry() {
     PerCpu* me = SMP::Current();
     if (me) me->online = 1;
 
-    //  phase 4  -  arm a per-ap LAPIC timer (vector 0x40, periodic) so user threads
+    //  phase 4 - arm a per-ap LAPIC timer (vector 0x40, periodic) so user threads
     //  on this ap are PREEMPTED, not just cooperative. calibrate the reload count
     //  against the tsc (irqs are still off here) for a ~100 hz tick, then enable
     //  interrupts on this ap so the timer (the only irq targeted at an ap) fires.
@@ -308,7 +318,7 @@ extern "C" void ap_entry() {
         busy_us(10000);                          // 10 ms (satoru)
         uint32_t ticks_10ms = 0xFFFFFFFFu - SMP::LapicRead(0x390);
         SMP::LapicWrite(0x380, 0);              // stop (satoru)
-        // ~100 hz. (tried 1 khz to tighten thread handshakes  -  firefox stalled
+        // ~100 hz. (tried 1 khz to tighten thread handshakes - firefox stalled
         // right after its thread-spawn burst: the 10x preempt rate on the aps
         // widened a save/resume race window. back to the proven 10 ms grain.)
         // (satoru)
@@ -325,7 +335,7 @@ extern "C" void ap_entry() {
 //  the ap dispatch loop, extern so the syscall exit path can iret BACK into it
 //  (via SMP::ApIdleFrame) when this ap's last thread exits. two claim sources:
 //  1) thread resume (kurono.apthreads): pull a Ready sibling thread of a
-//     multi-threaded process and iretq into its saved frame  -  from then on the
+//     multi-threaded process and iretq into its saved frame - from then on the
 //     per-ap LAPIC timer (ApTimerPreempt) multiplexes this cpu across the ready
 //     threads, giving the process TRUE parallelism with the bsp.
 //  2) phase 3d fresh-proc launch (kurono.apsched): claim an explicitly-pinned
@@ -339,7 +349,7 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
             Process* t = Scheduler::ClaimReadyThreadForCpu(idx);
             if (t) {
                 {
-                    // claim trace  -  resumes are infrequent (an idle ap picking up a
+                    // claim trace - resumes are infrequent (an idle ap picking up a
                     // ready sibling), so this stays low-volume. (satoru)
                     uint64_t lf; g_ap_log_lock.LockIrqSave(&lf);
                     SerialLogger::Log("[apr] cpu"); SerialLogger::LogDec((int)idx);
@@ -349,14 +359,14 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
                 }
                 //  resume the thread from its saved user frame. LoadUserFrame sets
                 //  this cpu's current task, tss.rsp0 + gs:8, cr3, fs base and fpu;
-                //  the asm pivot then irets into ring-3. never returns  -  the LAPIC
+                //  the asm pivot then irets into ring-3. never returns - the LAPIC
                 //  timer preempt keeps this cpu multiplexing ready threads, and a
                 //  thread exit with nothing left claimable irets back here. (satoru)
                 InterruptFrame f;
                 if (Scheduler::LoadUserFrame(t, &f)) {
                     //  the per-cpu userspace-active gate: without it IsActive() is
                     //  false on this ap and the whole linux syscall layer no-ops
-                    //  (no frame save, no linux current, sys_exit does nothing  - 
+                    //  (no frame save, no linux current, sys_exit does nothing - 
                     //  the thread's exit loop spins forever). (satoru)
                     Userspace::SetActiveForThisCpu(t);
                     //  sync this cpu's linux current-process to the resumed thread,
@@ -366,12 +376,12 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
                     LinuxSyscall::SyncCurrentToTask(t);
                     //  ap_enter_user_frame irets WITHOUT swapgs, so set the active
                     //  gs to the thread's user gs (and park the per-cpu ptr in
-                    //  KERNEL_GS_BASE)  -  the no-swapgs form, same as the isr
+                    //  KERNEL_GS_BASE) - the no-swapgs form, same as the isr
                     //  preempt path. (satoru)
                     Scheduler::FixupGsAfterIsrSwitch();
                     ap_enter_user_frame(&f);
                 }
-                //  load failed (no saved frame?)  -  put it back. (satoru)
+                //  load failed (no saved frame?) - put it back. (satoru)
                 t->state = Process_Ready;
                 Scheduler::SetCurrentForThisCpu(nullptr);
             }
@@ -434,7 +444,7 @@ bool SMP::ApThreadSched()           { return g_ap_thread_sched; }
 
 //  ring-0 reentry frame into the dispatch loop, for the syscall exit path: the
 //  ap's current thread just exited and nothing else is claimable, so the
-//  handler's iretq must land somewhere  -  back at the top of the claim loop, on
+//  handler's iretq must land somewhere - back at the top of the claim loop, on
 //  this cpu's (currently dead) bring-up stack. IF=1 in rflags so the lapic
 //  timer + tlb ipis keep firing while the loop spins. (satoru)
 void SMP::ApIdleFrame(InterruptFrame* f) {
@@ -449,37 +459,53 @@ void SMP::ApIdleFrame(InterruptFrame* f) {
 }
 
 //  tlb shootdown. sender: pulse vector 0x41 at every other cpu (all-excluding-
-//  self shorthand) and wait  -  bounded  -  for each online peer to ack. bounded
+//  self shorthand) and wait - bounded - for each online peer to ack. bounded
 //  because a peer may briefly sit with IF=0 (a spinlock hold); the per-ap timer
 //  cr3 reload in ApTimerPreempt bounds any missed window to one tick. (satoru)
 void SMP::BroadcastTlbFlush() {
     uint32_t online = OnlineCount();
     if (online <= 1) return;
+    uint64_t seq = __atomic_add_fetch(&g_tlb_flush_start_seq, 1u, __ATOMIC_SEQ_CST);
+    uint32_t want = online - 1;
     __atomic_store_n(&g_tlb_ack, 0u, __ATOMIC_RELEASE);
     //  wait for any prior ipi to leave the icr (delivery status, bit 12). (satoru)
     for (int i = 0; i < 100000 && (LapicRead(0x300) & (1u << 12)); i++)
         __asm__ volatile("pause");
     //  fixed delivery, assert, destination shorthand 11 = all excluding self. (satoru)
     LapicWrite(0x300, (3u << 18) | (1u << 14) | 0x41u);
-    uint32_t want = online - 1;
     //  ack wait: the old ~sub-ms pause bound silently missed any peer holding
-    //  IF=0 longer than that  -  and a single serial line is an ~8.7ms ring-0
-    //  uart busy-wait with interrupts off. a peer that misses the ipi keeps a
-    //  STALE translation while the caller (mprotect/munmap) believes the flush
-    //  completed; for the jit's W^X flips that is another core executing stale
-    //  code bytes = the per-boot-random-rip #GP crashes. wait up to ~20ms wall
-    //  clock instead: covers the serial hold, still bounded so a wedged peer
-    //  cannot hang the unmap path. safe to spin here  -  waiters on the locks the
-    //  caller may hold (g_mmap_lock is a SpinLockCpuGuard, no cli) keep IF=1
-    //  and still take this very ipi while they spin. (satoru)
+    //  IF=0 longer than that - and a single serial line is an ~8.7ms ring-0
+    //  uart busy-wait. a peer that misses the ipi keeps a STALE translation
+    //  while the caller (mprotect/munmap) believes the flush completed; for the
+    //  jit's W^X flips that is another core executing stale code bytes = the
+    //  per-boot-random-rip #GP crashes, and for a recycled frame it is one
+    //  thread's writes spraying another thread's memory (the
+    //  fontconfig-string-over-stack-canary corruption). wait ~20ms wall clock;
+    //  still bounded so a wedged peer cannot hang the unmap path. this call can
+    //  itself run from an IF=0 exception context (a cow/demand-zero fault that
+    //  quarantines a frame), so do NOT retry-loop or serial-log here - that
+    //  would extend the IF=0 window and cascade OTHER cores' acks into timeout.
+    //  on success, latch the flush epoch so the quarantine may release the
+    //  frames whose ptes were cleared before this broadcast. (satoru)
     uint64_t t0 = Timer::GetRealMs64();
     for (;;) {
-        if (__atomic_load_n(&g_tlb_ack, __ATOMIC_ACQUIRE) >= want) return;
+        if (__atomic_load_n(&g_tlb_ack, __ATOMIC_ACQUIRE) >= want) {
+            uint64_t cur = __atomic_load_n(&g_tlb_flush_full_seq, __ATOMIC_ACQUIRE);
+            while (cur < seq &&
+                   !__atomic_compare_exchange_n(&g_tlb_flush_full_seq, &cur, seq,
+                                                false, __ATOMIC_SEQ_CST,
+                                                __ATOMIC_ACQUIRE)) { }
+            return;
+        }
         if (Timer::GetRealMs64() - t0 > 20) break;
         __asm__ volatile("pause");
     }
-    //  timed out  -  a peer had interrupts masked >20ms; its next timer tick
-    //  reloads cr3, so proceed rather than wedge the unmap path. (satoru)
+    //  timed out - a peer had interrupts masked >20ms; its next timer tick
+    //  reloads cr3. the epoch is NOT advanced, so the quarantine holds any
+    //  frame cleared before this broadcast until a LATER fully-acked flush - 
+    //  the stale window cannot recycle memory. counter only (no serial i/o in
+    //  this hot, possibly-IF=0 path). (satoru)
+    __atomic_fetch_add(&g_tlb_flush_timeouts, 1u, __ATOMIC_RELAXED);
 }
 
 void SMP::HandleTlbIpi() {
@@ -487,6 +513,14 @@ void SMP::HandleTlbIpi() {
     __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
     __asm__ volatile("mov %0, %%cr3" : : "r"(c3) : "memory");
     __atomic_fetch_add(&g_tlb_ack, 1u, __ATOMIC_ACQ_REL);
+}
+
+uint64_t SMP::TlbFlushStartSeq() {
+    return __atomic_load_n(&g_tlb_flush_start_seq, __ATOMIC_SEQ_CST);
+}
+
+uint64_t SMP::TlbFlushFullSeq() {
+    return __atomic_load_n(&g_tlb_flush_full_seq, __ATOMIC_SEQ_CST);
 }
 
 void SMP::StartAPs() {
@@ -502,7 +536,7 @@ void SMP::StartAPs() {
                              _binary_ap_trampoline_bin_start);
     for (uint64_t i = 0; i < sz; i++) tramp[i] = _binary_ap_trampoline_bin_start[i];
 
-    // patch area at 0x9000  -  fields the trampoline reads on its way up. (satoru)
+    // patch area at 0x9000 - fields the trampoline reads on its way up. (satoru)
     volatile uint64_t* p_cr3   = (volatile uint64_t*)(uintptr_t)0x9000;
     volatile uint8_t*  p_gdt   = (volatile uint8_t*) (uintptr_t)0x9008;
     volatile uint64_t* p_entry = (volatile uint64_t*)(uintptr_t)0x9018;

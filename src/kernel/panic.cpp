@@ -4,7 +4,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/rtc.h"
 #include "../fs/kvfs.h"
-#include "../proc/kernel_locks.h"   // g_vfs_lock  -  panic-path deadlock guard
+#include "../proc/kernel_locks.h"   // g_vfs_lock - panic-path deadlock guard
 #include "../../logo.h"
 
 namespace {
@@ -108,7 +108,7 @@ namespace {
         uint8_t g = (uint8_t)((color >> 8) & 0xFF);
         uint8_t r = (uint8_t)((color >> 16) & 0xFF);
         if (g_fb.bpp == 32) {
-            // use movnti (non-temporal 32-bit store)  -  works on wb, wc, and uc memory.
+            // use movnti (non-temporal 32-bit store) - works on wb, wc, and uc memory.
             uint32_t bgra = ((uint32_t)0xFF << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
             __asm__ __volatile__("movnti %1, (%0)" :: "r"((void*)p), "r"(bgra) : "memory");
         } else if (g_fb.bpp == 24) {
@@ -151,7 +151,7 @@ namespace {
                     row16[xx] = px16;
                 }
             }
-            // sfence after each row  -  drains wc buffer so display sees the writes
+            // sfence after each row - drains wc buffer so display sees the writes
             __asm__ __volatile__("sfence" ::: "memory");
         }
     }
@@ -480,7 +480,7 @@ namespace {
     }
 
     // pull the tail of the mirrored serial log out of kvfs (still intact at
-    // panic time  -  it is only lost on the reboot we are about to trigger). this
+    // panic time - it is only lost on the reboot we are about to trigger). this
     // is the best "recent serial lines" source available because seriallogger
     // exposes no in-memory ring buffer. returns bytes copied; sets *truncated if
     // older bytes were dropped. (satoru)
@@ -494,7 +494,7 @@ namespace {
         // takes that (non-recursive) lock, so we'd self-deadlock the dying CPU
         // and never finish the minidump. Probe with TryLock: IF is already
         // cleared by KeBugCheckEx (cli) on this uniprocessor, so if the probe
-        // succeeds nothing can grab the lock under us  -  release immediately and
+        // succeeds nothing can grab the lock under us - release immediately and
         // let the normal locked KVFS calls re-acquire. If the probe fails the
         // lock is held by the interrupted context, so skip the (best-effort)
         // serial tail rather than hang. (satoru)
@@ -553,7 +553,7 @@ namespace {
     // fault context); r8-r15 and cr0/cr3/cr4 are read live here because g_dump
     // does not carry them. (satoru)
     static void write_minidump() {
-        // live register capture  -  used for r8-r15 unconditionally, and as a
+        // live register capture - used for r8-r15 unconditionally, and as a
         // fallback for the gp regs / rsp / rbp when this is a direct
         // kebugcheckex call (no interrupt frame, so g_dump's gp regs are 0). (satoru)
         uint64_t l_rax, l_rbx, l_rcx, l_rdx, l_rsi, l_rdi, l_rbp, l_rsp;
@@ -590,7 +590,7 @@ namespace {
         d->size      = (uint32_t)sizeof(KuronoMiniDump);
         d->stop_code = g_dump.stop_code;
 
-        // timestamp from the rtc  -  self-contained cmos read. (satoru)
+        // timestamp from the rtc - self-contained cmos read. (satoru)
         RTC::Date rd; RTC::Time rt;
         if (RTC::ReadDateTime(rd, rt)) {
             d->time_valid = 1;
@@ -716,7 +716,7 @@ namespace {
 
     static void render_panic_screen() {
         if (!g_fb.valid) {
-            SerialLogger::Log("render_panic_screen: SKIPPED  -  fb not valid\r\n");
+            SerialLogger::Log("render_panic_screen: SKIPPED - fb not valid\r\n");
             return;
         }
 
@@ -827,7 +827,7 @@ namespace {
 
         draw_text(tx, ty + 306, "SYSTEM PANIC RECOVERY", title_color, 2);
 
-        // drain wc buffer + full memory fence  -  makes all pixel writes visible
+        // drain wc buffer + full memory fence - makes all pixel writes visible
         __asm__ __volatile__("sfence; mfence" ::: "memory");
 
         // issue wbinvd as an extra measure for whpx/hypervisor environments
@@ -982,7 +982,7 @@ namespace KernelPanic {
         // Persist the dump to /var/crash/last.dmp via KVFS so the next
         // boot can pick it up and present it to the user.  KVFS lives in
         // RAM, but the installer wires it through to the real disk on
-        // shutdown  -  and the dump is also visible to the in-RAM
+        // shutdown - and the dump is also visible to the in-RAM
         // /var/crash/ tree exposed via the /proc-style virtual fs.
         //
         // Use TryWriteCrashDump: this panic can fire from an exception that
@@ -1108,7 +1108,7 @@ namespace KernelPanic {
         bool written = false;
         if (KVFS::GetRoot()) {
             KVFS::Mkdirs("/var/log");
-            // KuronoMiniDump is a flat pod  -  cast away volatile for the copy; the
+            // KuronoMiniDump is a flat pod - cast away volatile for the copy; the
             // crashing kernel has long since finished writing it. (satoru)
             int r = KVFS::WriteFile(path, (const void*)(uintptr_t)MiniDump::PHYS_ADDR, copy_len);
             written = (r >= 0);
@@ -1126,7 +1126,7 @@ namespace KernelPanic {
         }
 
         // clear the magic so the dump is recovered exactly once, regardless of
-        // whether the kvfs copy succeeded  -  leaving a stale magic would re-fire
+        // whether the kvfs copy succeeded - leaving a stale magic would re-fire
         // the recovery notice on every subsequent boot. a store fence is enough
         // here: a full cache flush is only needed on the write side (which must
         // reach ram before the panic reboot). (satoru)

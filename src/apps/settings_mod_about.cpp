@@ -1,6 +1,6 @@
-//  kurono os  -  settings module: about / system (reference module #2) (satoru)
+//  kurono os - settings module: about / system (reference module #2) (satoru)
 //  read-only info rows: cpu, gpu, memory, display backend + resolution, and the
-//  kurono version string. no persisted state  -  purely informational. (satoru)
+//  kurono version string. no persisted state - purely informational. (satoru)
 #include "system_settings.h"
 #include "../drivers/graphics.h"
 #include "../drivers/display_mgr.h"
@@ -34,7 +34,7 @@ static const char* gpu_vendor_label(){
     }
 }
 
-// on_show has nothing to load  -  the probes/detect ran at boot. (satoru)
+// on_show has nothing to load - the probes/detect ran at boot. (satoru)
 static void about_on_show(){}
 
 static void about_render(int x, int y, int w, int h, int scroll){

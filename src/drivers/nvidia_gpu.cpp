@@ -1,4 +1,4 @@
-//  kurono os  -  nvidia gpu driver implementation
+//  kurono os - nvidia gpu driver implementation
 //  pci enumeration, bar mapping, register access, vt-d passthrough prep
 #include "nvidia_gpu.h"
 #include "../hal/hal.h"
@@ -127,7 +127,7 @@ uint64_t NvidiaGPU::ReadBAR(uint8_t bus, uint8_t dev, uint8_t func, uint8_t bar_
 
     if (bar_low == 0xFFFFFFFF || bar_low == 0) return 0;
 
-    // I/O BARs are not used by NVIDIA for register or framebuffer access  -  reject them
+    // I/O BARs are not used by NVIDIA for register or framebuffer access - reject them
     if (bar_low & 1) return 0;
 
     uint8_t type = (bar_low >> 1) & 0x03;
@@ -164,7 +164,7 @@ uint64_t NvidiaGPU::GetBARSize(uint8_t bus, uint8_t dev, uint8_t func, uint8_t b
     return (~mask) + 1;
 }
 
-//  pci bus scan  -  find nvidia gpu
+//  pci bus scan - find nvidia gpu
 
 bool NvidiaGPU::ProbeDevice(uint8_t bus, uint8_t dev, uint8_t func) {
     uint32_t vid_did = PciRead(bus, dev, func, PCI_VENDOR_ID);
@@ -286,7 +286,7 @@ void NvidiaGPU::IdentifyGPU() {
 
     // accel flags: NVIDIA discrete GPUs all expose hardware blit/3D engines
     // when BAR0 is mapped, but the kernel doesn't ship a command-stream
-    // submitter yet  -  surface a conservative capability for the compositor.
+    // submitter yet - surface a conservative capability for the compositor.
     gpu_info.has_2d_accel = (gpu_info.arch != ARCH_UNKNOWN);
     gpu_info.has_3d_accel = (gpu_info.arch != ARCH_UNKNOWN);
 }
@@ -404,7 +404,7 @@ bool NvidiaGPU::PrepareForPassthrough() {
     cmd &= ~(PCI_CMD_MEMORY | PCI_CMD_MASTER);
     PciWrite(gpu_info.bus, gpu_info.device, gpu_info.function, PCI_COMMAND, cmd);
 
-    // mmio is now disabled  -  clear cached base so any stray ReadReg returns 0 instead
+    // mmio is now disabled - clear cached base so any stray ReadReg returns 0 instead
     // of dereferencing a disabled region (which can fault on real hardware)
     gpu_info.bar0 = 0;
 
@@ -444,7 +444,7 @@ void NvidiaGPU::Init() {
     EnableBusMaster();
 
     if (gpu_info.bar0) {
-        // map the bar window before the first register read (GetBootDisplay)  - 
+        // map the bar window before the first register read (GetBootDisplay) - 
         // a high 64-bit bar isn't covered by the boot identity map. (satoru)
         nvgpu_map_bar_window(gpu_info.bar0, gpu_info.bar0_size);
         state = GPU_STATE_BARS_MAPPED;
@@ -525,7 +525,7 @@ void NvidiaGPU::DumpInfo(char* out, int maxo) {
 void NvidiaGPU::DumpRegisters(char* out, int maxo) {
     int p = 0;
     if (!gpu_info.bar0) {
-        p = sa(out, p, maxo, "BAR0 not mapped  -  cannot read registers\n");
+        p = sa(out, p, maxo, "BAR0 not mapped - cannot read registers\n");
         return;
     }
     p = sa(out, p, maxo, "\033[33mNVIDIA GPU Registers:\033[0m\n");

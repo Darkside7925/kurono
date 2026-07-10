@@ -1,4 +1,4 @@
-# KLS  -  Kurono Linux Shell
+# KLS - Kurono Linux Shell
 
 `src/linux/kls.cpp` and `kls.h` implement the Linux compatibility personality layer that makes Kurono's shell feel like a real Debian 13 Trixie system.
 
@@ -37,7 +37,7 @@ The full list is in `kls.cpp`.
 
 ## 3. `GetKernelVersion()`
 
-Returns `"6.12.0-kurono"`  -  the version string used in `uname` output and displayed in the About section of Settings.
+Returns `"6.12.0-kurono"` - the version string used in `uname` output and displayed in the About section of Settings.
 
 ## 4. Virtual file generation
 
@@ -45,6 +45,6 @@ KLS generates virtual `/proc` and `/etc` files dynamically. `cat /proc/cpuinfo` 
 
 ## 5. Related files
 
-- `src/linux/linux_kernel.cpp`  -  calls into KLS for syscall-level Linux personality
-- `src/apps/settings.cpp`  -  displays the kernel version from `GetKernelVersion()`
-- `src/packages/pkgmgr.cpp`  -  uses the package database from KLS
+- `src/linux/linux_kernel.cpp` - calls into KLS for syscall-level Linux personality
+- `src/apps/settings.cpp` - displays the kernel version from `GetKernelVersion()`
+- `src/packages/pkgmgr.cpp` - uses the package database from KLS

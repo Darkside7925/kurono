@@ -41,7 +41,7 @@ static bool smemeq(const void* a, const void* b, int n) {
     return true;
 }
 
-// this is a simplified hash  -  not cryptographic grade, but functional.
+// this is a simplified hash - not cryptographic grade, but functional.
 
 static void simple_hash(const unsigned char* data, int len, const unsigned char* salt, int slen_v, unsigned char* out) {
     // mix data and salt through xorshift rounds
@@ -327,7 +327,7 @@ bool SUPR::Escalate(int session_id, const char* password) {
     if (!ValidateSession(session_id)) return false;
 
     // run the full auth gate (password and/or ksa per the active policy). this
-    // is THE single escalation chokepoint  -  su/sudo and the gui all funnel here
+    // is THE single escalation chokepoint - su/sudo and the gui all funnel here
     // so the policy is enforced uniformly. (satoru)
     if (!RunEscalationGate(session_id, password, "su/sudo escalation")) {
         Log(ACT_PERMISSION_DENIED, users[sessions[session_id].user_index].username, "Escalation failed");
@@ -349,10 +349,10 @@ bool SUPR::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
 
     bool authed = false;
     if (BothAuthDisabled()) {
-        // no factor required  -  proceed, but warn + audit loudly. (satoru)
+        // no factor required - proceed, but warn + audit loudly. (satoru)
         Log(ACT_RISK_WARNING, actor, "supr escalation with both auth factors disabled");
         RuntimeLog::LogSecurity("RISK: supr escalation, no auth factor", reason);
-        SerialLogger::Log("SUPR: WARNING  -  supr escalation with BOTH auth factors disabled\r\n");
+        SerialLogger::Log("SUPR: WARNING - supr escalation with BOTH auth factors disabled\r\n");
         authed = true;
     } else {
         bool need_pw  = policy.passwd_enabled;
@@ -365,7 +365,7 @@ bool SUPR::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
             need_pw = true;   // ksa gone, password carries it (satoru)
         }
         // the shell can't read a password inline, so collect the credential +
-        // approval through the interactive ksa modal  -  available whenever the
+        // approval through the interactive ksa modal - available whenever the
         // hypervisor is, even if kvault is policy-off. want_cred when a password
         // factor is required. (satoru)
         if (!KSA::IsAvailable()) {
@@ -444,20 +444,20 @@ bool SUPR::RunEscalationGate(int session_id, const char* password, const char* r
 
     // both factors disabled => proceed but loudly warn + audit (no real check).
     if (BothAuthDisabled()) {
-        Log(ACT_RISK_WARNING, actor, "both auth factors disabled  -  proceeding");
+        Log(ACT_RISK_WARNING, actor, "both auth factors disabled - proceeding");
         RuntimeLog::LogSecurity("RISK: escalation with no auth factor", reason);
-        SerialLogger::Log("SUPR: WARNING  -  escalation with BOTH auth factors disabled\r\n");
+        SerialLogger::Log("SUPR: WARNING - escalation with BOTH auth factors disabled\r\n");
         return true;
     }
 
     bool need_pw  = policy.passwd_enabled;
-    // an unavailable ksa factor cannot be *required*  -  if policy wants kvault but
+    // an unavailable ksa factor cannot be *required* - if policy wants kvault but
     // the hypervisor isn't there, the password factor must carry it. we never
     // silently pass an unsatisfiable factor; instead we downgrade and audit. (satoru)
     bool need_ksa = policy.kvault_enabled && KSA::IsAvailable();
     if (policy.kvault_enabled && !KSA::IsAvailable()) {
         RuntimeLog::LogSecurity("ksa required by policy but unavailable", reason);
-        SerialLogger::Log("SUPR: ksa required but unavailable  -  falling back to password factor\r\n");
+        SerialLogger::Log("SUPR: ksa required but unavailable - falling back to password factor\r\n");
         if (!policy.passwd_enabled) {
             // policy wanted kvault-only but ksa is gone and passwd is off: refuse.
             Log(ACT_PERMISSION_DENIED, actor, "kvault-only policy but ksa unavailable");
@@ -483,7 +483,7 @@ bool SUPR::RunEscalationGate(int session_id, const char* password, const char* r
         req.want_cred = !need_pw;
         KSAVerdict v;
         if (!KSA::Prompt(req, v)) {
-            // ksa could not run at all  -  treat as denial of the ksa factor. (satoru)
+            // ksa could not run at all - treat as denial of the ksa factor. (satoru)
             Log(ACT_KSA_DENY, actor, "ksa prompt could not run");
             ksa_ok = false;
         } else {
@@ -577,8 +577,8 @@ bool SUPR::DisableKvault(int session_id, bool force, bool ack_risk,
         return false;
     }
 
-    // cannot disable if password auth is also disabled  -  that would leave both
-    // off  -  unless the sovereign explicitly overrides. (satoru)
+    // cannot disable if password auth is also disabled - that would leave both
+    // off - unless the sovereign explicitly overrides. (satoru)
     if (!policy.passwd_enabled && !sovereign_override) {
         set_err(err, err_max, "cannot disable ksa while password auth is off (use --sovereign-override)");
         return false;
@@ -610,7 +610,7 @@ bool SUPR::DisablePasswd(int session_id, bool ack_risk, bool sovereign_override,
     }
 
     // requires ksa to be active first; refuses if ksa is off (unless sovereign
-    // override, which would leave both off  -  and only sovereign may do that).
+    // override, which would leave both off - and only sovereign may do that).
     if (!policy.kvault_enabled) {
         if (!sovereign_override) {
             set_err(err, err_max, "cannot disable password auth unless ksa is active (use --sovereign-override)");
@@ -622,7 +622,7 @@ bool SUPR::DisablePasswd(int session_id, bool ack_risk, bool sovereign_override,
         }
         Log(ACT_SOVEREIGN_OVERRIDE, actor, "disable passwd with ksa off");
     } else if (!KSA::IsAvailable()) {
-        set_err(err, err_max, "ksa policy is on but unavailable on this host  -  refusing to disable password");
+        set_err(err, err_max, "ksa policy is on but unavailable on this host - refusing to disable password");
         return false;
     }
 
@@ -651,7 +651,7 @@ bool SUPR::PolicySelfTest() {
     // so the self-test is non-destructive. (satoru)
     int sid = current_session;
     if (sid < 0 || !sessions[sid].active) {
-        SerialLogger::Log("POLICY-SELFTEST: no active session  -  skipping\r\n");
+        SerialLogger::Log("POLICY-SELFTEST: no active session - skipping\r\n");
         return true;
     }
     SUPRAuthPolicy saved = policy;
@@ -686,7 +686,7 @@ bool SUPR::PolicySelfTest() {
     pst_check("disable-kvault refused while passwd off (no override)", !r4, all);
 
     // 5. sovereign CAN override the both-off path. promote to sovereign and
-    //    repeat scenario 4  -  should now succeed and land in both-off. (satoru)
+    //    repeat scenario 4 - should now succeed and land in both-off. (satoru)
     users[ui].level = SUPR_SOVEREIGN;
     policy.passwd_enabled = false; policy.kvault_enabled = true;
     err[0]=0;
@@ -695,7 +695,7 @@ bool SUPR::PolicySelfTest() {
     pst_check("both factors now disabled", BothAuthDisabled(), all);
 
     // 6. with both off, the escalation gate proceeds but flags the risk. it
-    //    returns true (no factor to fail)  -  the warning is audited. (satoru)
+    //    returns true (no factor to fail) - the warning is audited. (satoru)
     bool r6 = RunEscalationGate(sid, "anything", "policy-selftest");
     pst_check("both-off gate proceeds with risk warning", r6, all);
 
@@ -703,7 +703,7 @@ bool SUPR::PolicySelfTest() {
     policy.passwd_enabled = true; policy.kvault_enabled = false;
 
     // 7. SetAuthMode(both) requires ksa available; on a host without ksa it is
-    //    refused (and on one with ksa it succeeds). either outcome is correct  - 
+    //    refused (and on one with ksa it succeeds). either outcome is correct - 
     //    assert it AGREES with KSA availability. (satoru)
     err[0]=0;
     bool r7 = SetAuthMode(sid, AUTH_BOTH, /*sov*/false, err, sizeof(err));

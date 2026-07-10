@@ -18,9 +18,9 @@ After init, IRQ 0 fires at the programmed rate and the handler increments the ti
 
 ## 3. Used by
 
-- `src/kernel/time.cpp`  -  consumes the tick counter for elapsed time
-- `src/proc/scheduler.cpp`  -  preemption based on tick boundary
-- Main loop  -  advances frame timing
+- `src/kernel/time.cpp` - consumes the tick counter for elapsed time
+- `src/proc/scheduler.cpp` - preemption based on tick boundary
+- Main loop - advances frame timing
 
 ## 4. Common problems
 
@@ -32,6 +32,6 @@ After init, IRQ 0 fires at the programmed rate and the handler increments the ti
 
 ## 5. Related files
 
-- `src/hal/hal.cpp`  -  IRQ 0 registration
-- `src/kernel/time.cpp`  -  client of the tick counter
-- `src/proc/scheduler.cpp`  -  preemption client
+- `src/hal/hal.cpp` - IRQ 0 registration
+- `src/kernel/time.cpp` - client of the tick counter
+- `src/proc/scheduler.cpp` - preemption client

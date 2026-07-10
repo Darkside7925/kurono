@@ -1,10 +1,10 @@
-//  kurono os  -  virtual ide/ata disk controller implementation
+//  kurono os - virtual ide/ata disk controller implementation
 //  full pio-mode ata controller with ram-backed disk image.
 //
 //  supports:
 //    - identify device (0xec)
-//    - read sectors (0x20)  -  pio, 28-bit lba
-//    - write sectors (0x30)  -  pio, 28-bit lba
+//    - read sectors (0x20) - pio, 28-bit lba
+//    - write sectors (0x30) - pio, 28-bit lba
 //    - read verify (0x40)
 //    - cache flush (0xe7)
 //    - set features (0xef)
@@ -20,7 +20,7 @@
 #include "../kernel/types.h"
 #include "../kernel/heap.h"
 
-//  identify device  -  build the 512-byte identification data
+//  identify device - build the 512-byte identification data
 
 static void SetATAString(uint16_t* words, int start_word, int num_words,
                           const char* str) {
@@ -249,7 +249,7 @@ bool VirtualDisk::LoadImage(const uint8_t* data, uint32_t size,
     return true;
 }
 
-//  port i/o  -  write
+//  port i/o - write
 
 void VirtualDisk::WritePort(uint16_t port, uint32_t value, uint8_t size) {
     // handle data port specially (16-bit transfers)
@@ -274,7 +274,7 @@ void VirtualDisk::WritePort(uint16_t port, uint32_t value, uint8_t size) {
                 xfer_lba++;
 
                 if (xfer_sectors_left > 0) {
-                    // more sectors to write  -  reset buffer
+                    // more sectors to write - reset buffer
                     xfer_pos = 0;
                     status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
                 } else {
@@ -320,7 +320,7 @@ void VirtualDisk::WritePort(uint16_t port, uint32_t value, uint8_t size) {
 
         case ATA_PRI_COMMAND:
             if (selected_drive != 0) {
-                // only master drive exists  -  abort if slave selected
+                // only master drive exists - abort if slave selected
                 status = 0; // no drive, cleared status
                 return;
             }
@@ -349,10 +349,10 @@ void VirtualDisk::WritePort(uint16_t port, uint32_t value, uint8_t size) {
     }
 }
 
-//  port i/o  -  read
+//  port i/o - read
 
 uint32_t VirtualDisk::ReadPort(uint16_t port, uint8_t size) {
-    // data port  -  16-bit pio read
+    // data port - 16-bit pio read
     if (port == ATA_PRI_DATA) {
         uint32_t val = 0;
         if (!xfer_write && xfer_pos < xfer_len) {
@@ -480,7 +480,7 @@ void VirtualDisk::ExecuteCommand(uint8_t cmd) {
         case ATA_CMD_STANDBY:
         case ATA_CMD_IDLE:
         case ATA_CMD_SLEEP:
-            // power management  -  just report success
+            // power management - just report success
             status = ATA_SR_DRDY | ATA_SR_DSC;
             error = 0;
             RaiseIRQ();
@@ -496,7 +496,7 @@ void VirtualDisk::ExecuteCommand(uint8_t cmd) {
 
         case ATA_CMD_READ_DMA:
         case ATA_CMD_WRITE_DMA:
-            // dma not supported  -  abort
+            // dma not supported - abort
             AbortCommand(ATA_ER_ABRT);
             break;
 
@@ -509,7 +509,7 @@ void VirtualDisk::ExecuteCommand(uint8_t cmd) {
     }
 }
 
-//  identify device  -  report disk identity to guest
+//  identify device - report disk identity to guest
 
 void VirtualDisk::DoIdentify() {
     memcpy(xfer_buf, identify_data.words, ATA_SECTOR_SIZE);
@@ -522,7 +522,7 @@ void VirtualDisk::DoIdentify() {
     RaiseIRQ();
 }
 
-//  read sectors (0x20)  -  pio 28-bit lba
+//  read sectors (0x20) - pio 28-bit lba
 
 void VirtualDisk::DoReadSectors() {
     uint32_t lba = GetCurrentLBA();
@@ -554,7 +554,7 @@ void VirtualDisk::PrepareNextReadSector() {
     RaiseIRQ();
 }
 
-//  write sectors (0x30)  -  pio 28-bit lba
+//  write sectors (0x30) - pio 28-bit lba
 
 void VirtualDisk::DoWriteSectors() {
     uint32_t lba = GetCurrentLBA();
@@ -578,7 +578,7 @@ void VirtualDisk::DoWriteSectors() {
     // no irq until first sector is written
 }
 
-//  read verify (0x40)  -  verify sectors are readable, no data transfer
+//  read verify (0x40) - verify sectors are readable, no data transfer
 
 void VirtualDisk::DoReadVerify() {
     uint32_t lba = GetCurrentLBA();
@@ -606,14 +606,14 @@ void VirtualDisk::DoSetFeatures() {
 }
 
 void VirtualDisk::DoFlushCache() {
-    // ram-backed  -  nothing to flush
+    // ram-backed - nothing to flush
     status = ATA_SR_DRDY | ATA_SR_DSC;
     error = 0;
     RaiseIRQ();
 }
 
 void VirtualDisk::DoInitDevParams() {
-    // legacy chs parameter initialization  -  accept and continue
+    // legacy chs parameter initialization - accept and continue
     status = ATA_SR_DRDY | ATA_SR_DSC;
     error = 0;
     RaiseIRQ();
@@ -629,7 +629,7 @@ uint32_t VirtualDisk::GetCurrentLBA() const {
                ((uint32_t)lba_hi << 16) |
                ((uint32_t)(drive_head & 0x0F) << 24);
     } else {
-        // chs mode  -  convert to lba
+        // chs mode - convert to lba
         uint32_t cylinder = ((uint32_t)lba_hi << 8) | lba_mid;
         uint32_t head = drive_head & 0x0F;
         uint32_t sector = lba_lo; // 1-based in chs

@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  intel iwlwifi wifi radio driver (the WifiRadioOps backend) (satoru)
+//  kurono os - intel iwlwifi wifi radio driver (the WifiRadioOps backend) (satoru)
 //
 //  this is the chip-specific radio layer for intel wireless nics: ax200/ax201/
 //  ax210, wireless-ac 9560/9260/8265/8260/7265/7260, and 3165/3168. it implements
@@ -12,11 +12,11 @@
 //  layering (this is the bottom-most software layer):
 //    net/ieee80211   protocol + supplicant
 //        │  WifiRadioOps (this driver fills it)
-//    drivers/wifi_iwl  ← THIS  -  intel radio bring-up + tx/rx queues
+//    drivers/wifi_iwl  ← THIS - intel radio bring-up + tx/rx queues
 //        │  WifiDev::RegRead/RegWrite (mapped pci mmio bar)
 //    hardware (intel wifi nic)
 //
-//  ref: linux drivers/net/wireless/intel/iwlwifi  -  pcie/gen1_2/trans.c (apm + nic
+//  ref: linux drivers/net/wireless/intel/iwlwifi - pcie/gen1_2/trans.c (apm + nic
 //  init), iwl-csr.h (csr register defs), iwl-fh.h (flow-handler dma regs), iwl-
 //  prph.h (apmg power-management prph regs), fw/file.h (the .ucode tlv format),
 //  iwl-io.c (activate_nic / grab-nic-access). all code here is original kurono;

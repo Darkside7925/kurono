@@ -20,6 +20,6 @@ The guest receives an IP address from the internal bridge DHCP server. The host 
 
 ## 4. Related files
 
-- `src/virt/vdevices.cpp`  -  virtual NIC device that calls into the bridge
-- `src/net/network.cpp`  -  host network stack
-- `src/net/tcpip.cpp`  -  host TCP/IP used for masquerade
+- `src/virt/vdevices.cpp` - virtual NIC device that calls into the bridge
+- `src/net/network.cpp` - host network stack
+- `src/net/tcpip.cpp` - host TCP/IP used for masquerade

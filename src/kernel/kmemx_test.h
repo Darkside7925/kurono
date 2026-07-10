@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  kmemx self-test harness  -  runs headless at boot (gated by kurono.kmemxtest)
+//  kmemx self-test harness - runs headless at boot (gated by kurono.kmemxtest)
 //  and logs PASS/FAIL per scenario to serial so a ci run can scrape it. (satoru)
 //
 //  stage 1 gate: a byte-exact lz4 roundtrip over 1000 synthetic 4 kb pages of

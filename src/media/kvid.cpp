@@ -1,4 +1,4 @@
-// kurono os  -  kvid container
+// kurono os - kvid container
 #include "kvid.h"
 
 namespace KVID {
@@ -52,7 +52,7 @@ const uint8_t* GetFrameAudio(const File& f, uint32_t i, uint32_t* sz) {
     if (i >= f.hdr.frame_count) { *sz = 0; return nullptr; }
     const IndexEntry& e = f.index[i];
     if (e.audio_size == 0) { *sz = 0; return nullptr; }
-    // 64-bit bounds check  -  same overflow guard as the video path. (satoru)
+    // 64-bit bounds check - same overflow guard as the video path. (satoru)
     if ((uint64_t)e.audio_offset + (uint64_t)e.audio_size > f.size) { *sz = 0; return nullptr; }
     *sz = e.audio_size;
     return f.data + e.audio_offset;

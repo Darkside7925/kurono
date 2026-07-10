@@ -1,4 +1,4 @@
-//  kurono os  -  broadcom brcmfmac pcie "full-dongle" wifi radio driver (satoru)
+//  kurono os - broadcom brcmfmac pcie "full-dongle" wifi radio driver (satoru)
 //  see wifi_brcm.h for the design + honesty notes. this implements the broadcom
 //  half of the Ieee80211::WifiRadioOps contract: backplane bring-up, firmware +
 //  nvram download into the dongle, the msgbuf common-ring protocol, and the
@@ -6,7 +6,7 @@
 //
 //  ref: linux drivers/net/wireless/broadcom/brcm80211/brcmfmac/{pcie,chip,
 //  commonring,msgbuf}.c + include/{brcm_hw_ids,soc,chipcommon}.h. original
-//  kurono code  -  the register numbers + protocol layout are transcribed, no gpl
+//  kurono code - the register numbers + protocol layout are transcribed, no gpl
 //  source text is copied. (satoru)
 
 #include "wifi_brcm.h"
@@ -19,7 +19,7 @@
 #include "../proc/scheduler.h"
 #include "../fs/kvfs.h"
 
-// ── pci config-space access (mechanism 1)  -  the backplane window register lives
+// ── pci config-space access (mechanism 1) - the backplane window register lives
 //    in config space, not the bar, so we need our own config accessors. (satoru)
 static uint32_t brcm_cfg_read(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
     uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) |
@@ -59,7 +59,7 @@ static void brcm_cfg_write(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off,
 #define BRCM_ARMCR4REG_BANKIDX         0x40
 #define BRCM_ARMCR4REG_BANKPDA         0x4C
 
-// the chipcommon enumeration base on the backplane  -  chip id is at offset 0.
+// the chipcommon enumeration base on the backplane - chip id is at offset 0.
 // ref: include/soc.h SI_ENUM_BASE_DEFAULT. (satoru)
 #define BRCM_SI_ENUM_BASE              0x18000000
 #define BRCM_CID_ID_MASK               0x0000FFFF
@@ -264,7 +264,7 @@ static void blogx(const char* s, uint32_t v) {
 //  to read a core's registers you first program the backplane base into the
 //  BAR0_WINDOW config-space register; then bar0 offset 0..0xfff aliases that
 //  core. so "select a core" == set the window to core->base. we don't run the
-//  full erom core-enumeration here (chip.c)  -  for the supported parts the cores
+//  full erom core-enumeration here (chip.c) - for the supported parts the cores
 //  we need sit at fixed, well-known backplane bases. ref: pcie.c
 //  brcmf_pcie_select_core. (satoru)
 
@@ -287,7 +287,7 @@ void WifiBrcm::reg_write(uint32_t off, uint32_t v) {
     WifiDev::RegWrite(off & (BRCM_PCIE_BAR0_REG_SIZE - 1), v);
 }
 
-// ── tcm (bar1) access  -  the dongle's on-chip ram, mapped flat by bar1 ─────── (satoru)
+// ── tcm (bar1) access - the dongle's on-chip ram, mapped flat by bar1 ─────── (satoru)
 //  unlike bar0, bar1 is a *direct* (non-windowed) mapping of the device ram, so
 //  a tcm address is just an offset into the mapped bar1 window. ref: pcie.c
 //  uses memcpy_toio(devinfo->tcm + addr, ...). (satoru)
@@ -327,7 +327,7 @@ void WifiBrcm::tcm_read(uint32_t addr, void* dst, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) o[i] = s[i];
 }
 
-// ── bar mapping  -  bar0 is already mapped by WifiDev; map bar1 (the tcm) ───── (satoru)
+// ── bar mapping - bar0 is already mapped by WifiDev; map bar1 (the tcm) ───── (satoru)
 bool WifiBrcm::map_bars() {
     if (!wdev) return false;
     // bar1 is pci bar index 2 (bar0 is index 0; bar index 1 is its 64-bit high
@@ -373,7 +373,7 @@ bool WifiBrcm::map_bars() {
     return true;
 }
 
-// ── chip recognition  -  point the window at chipcommon, read the chip id ──── (satoru)
+// ── chip recognition - point the window at chipcommon, read the chip id ──── (satoru)
 bool WifiBrcm::chip_recognize() {
     backplane_window(BRCM_SI_ENUM_BASE);          // chipcommon @ 0x18000000 (satoru)
     uint32_t cid = reg_read(0);                    // chipid is at offset 0 (satoru)
@@ -394,7 +394,7 @@ bool WifiBrcm::chip_recognize() {
     case 0x4364: rambase = 0x160000; ramsize = 0x0E0000; is_cr4 = true; break; // bcm4364 (satoru)
     case 0x4378: rambase = 0x200000; ramsize = 0x350000; is_cr4 = true; break; // bcm4378 (satoru)
     default:
-        // unknown broadcom pcie part  -  we don't have its rambase. bail honestly
+        // unknown broadcom pcie part - we don't have its rambase. bail honestly
         // rather than scribble at a guessed address. (satoru)
         if (chip_id == 0 || chip_id == 0xFFFF) {
             blog("[brcm] chipcommon read failed (window/bar0 not live)\r\n");
@@ -409,7 +409,7 @@ bool WifiBrcm::chip_recognize() {
     return true;
 }
 
-// ── watchdog reset  -  bring the device to a known idle state ──────────────── (satoru)
+// ── watchdog reset - bring the device to a known idle state ──────────────── (satoru)
 //  the simplest reliable reset path: select chipcommon and write its watchdog
 //  with a small count, which resets the whole chip after that many backplane
 //  cycles. ref: pcie.c brcmf_pcie_reset_device (WRITECC32(watchdog, 4)). (satoru)
@@ -471,7 +471,7 @@ uint8_t* WifiBrcm::fs_load(const char* path, uint32_t* out_len) {
 //    2. copy the firmware image to tcm + rambase.
 //    3. zero the last word of code-ram (the fw-up handshake cell).
 //    4. copy the nvram blob to the top of code-ram (ramsize - nvram_len).
-//    5. exit download state  -  release the arm core so it starts executing.
+//    5. exit download state - release the arm core so it starts executing.
 //    6. poll the last code-ram word until the dongle stamps its shared-ram addr.
 //    7. parse the shared block.
 bool WifiBrcm::download_firmware() {
@@ -488,7 +488,7 @@ bool WifiBrcm::download_firmware() {
         blog("[brcm] firmware blob absent: ");
         blog(fwpath); blog("\r\n");
         blog("[brcm] (place brcmfmac<chip>-pcie.bin in /system/lib/firmware/brcm/)\r\n");
-        return false;          // honest clean fail  -  no firmware, no radio (satoru)
+        return false;          // honest clean fail - no firmware, no radio (satoru)
     }
     blogx("[brcm] firmware loaded, bytes ", fw_len);
 
@@ -527,7 +527,7 @@ bool WifiBrcm::download_firmware() {
         // other cr4 parts. (satoru)
         backplane_window(BRCM_SI_ENUM_BASE);   // window-relative; the cr4 core base
                                                // differs per chip and the full erom
-                                               // walk would resolve it  -  scaffold: we
+                                               // walk would resolve it - scaffold: we
                                                // rely on the fw to re-init banks. (satoru)
     }
 
@@ -555,7 +555,7 @@ bool WifiBrcm::download_firmware() {
     PMM::FreeBytes(fw, fw_len);
     if (nv) PMM::FreeBytes(nv, nv_len);
 
-    // 5. exit download state  -  release the arm so it boots the firmware. ref:
+    // 5. exit download state - release the arm so it boots the firmware. ref:
     //    pcie.c brcmf_chip_set_active(ci, resetintr). the precise core-reset
     //    register dance needs the per-chip core bases from the erom walk; we
     //    poke the documented reset vector into place and bump the watchdog off so
@@ -612,7 +612,7 @@ bool WifiBrcm::init_shared_ram(uint32_t sharedram_addr) {
 
 // ── common-ring setup ────────────────────────────────────────────────────── (satoru)
 //  for each of the five common rings we: (a) allocate a host coherent buffer of
-//  depth*item_len bytes (identity-mapped so phys == virt  -  exactly what the
+//  depth*item_len bytes (identity-mapped so phys == virt - exactly what the
 //  dongle's dma needs), (b) write its physical address + depth + item-size into
 //  the ring's slot in the tcm ring-mem array, and (c) record the tcm addresses of
 //  the shared read/write indices (we use "tcm indices" mode, so the indices live
@@ -688,7 +688,7 @@ bool WifiBrcm::setup_rings() {
     return true;
 }
 
-// ── ring doorbell  -  tell the dongle a submit ring advanced ───────────────── (satoru)
+// ── ring doorbell - tell the dongle a submit ring advanced ───────────────── (satoru)
 //  ref: pcie.c brcmf_pcie_ring_mb_ring_bell writes 1 to h2d_mailbox_0. (satoru)
 void WifiBrcm::ring_doorbell() {
     backplane_window(BRCM_SI_ENUM_BASE);   // pcie2 doorbell is window-relative; on
@@ -759,7 +759,7 @@ static uint8_t* g_ioctl_buf = nullptr;       // dcmd payload (req + reply land h
 static uint64_t g_ioctl_phys = 0;
 #define BRCM_IOCTL_BUF_SIZE  BRCM_MSGBUF_MAX_CTL_PKT_SIZE
 
-// rx buffer pool  -  the dongle dma's received frames into these after we post
+// rx buffer pool - the dongle dma's received frames into these after we post
 // them via the rxpost ring. (satoru)
 #define BRCM_RX_BUF_COUNT  16
 static uint8_t* g_rx_bufs[BRCM_RX_BUF_COUNT] = {};
@@ -784,7 +784,7 @@ static bool brcm_alloc_dma_pools() {
 }
 
 // ── post empty rx buffers to the dongle (rxpost ring) ────────────────────── (satoru)
-//  ref: msgbuf.c brcmf_msgbuf_rxbuf_data_post  -  each rxpost item hands the dongle
+//  ref: msgbuf.c brcmf_msgbuf_rxbuf_data_post - each rxpost item hands the dongle
 //  one empty buffer's physical address; the dongle later fills it + signals on the
 //  rx-complete ring. (satoru)
 void WifiBrcm::post_rx_buffers(int count) {
@@ -807,7 +807,7 @@ void WifiBrcm::post_rx_buffers(int count) {
     ring_commit(r);
 }
 
-// ── dcmd  -  issue a firmware command + await its reply ────────────────────── (satoru)
+// ── dcmd - issue a firmware command + await its reply ────────────────────── (satoru)
 //  ref: msgbuf.c brcmf_msgbuf_tx_ioctl + brcmf_msgbuf_query_dcmd. an ioctl
 //  request goes on the control-submit ring; the payload sits in g_ioctl_buf and
 //  the request carries its physical address; the reply arrives on the
@@ -843,7 +843,7 @@ bool WifiBrcm::dcmd(uint32_t cmd, void* buf, uint32_t len, bool set) {
     ring_commit(r);
 
     // await the control-complete reply for our xid. ref: msgbuf.c 2s timeout.
-    // scaffold: against absent hardware this loop times out  -  honest. (satoru)
+    // scaffold: against absent hardware this loop times out - honest. (satoru)
     uint32_t out_len = 0;
     uint32_t start = Timer::GetTicks();
     while ((uint32_t)(Timer::GetTicks() - start) < 2000u) {
@@ -918,7 +918,7 @@ int WifiBrcm::drain_rx_complete(uint8_t* out, int out_max) {
     return copied;
 }
 
-// ── iovar set  -  a named variable framed as a SET_VAR dcmd ────────────────── (satoru)
+// ── iovar set - a named variable framed as a SET_VAR dcmd ────────────────── (satoru)
 //  the payload is "name\0" followed by the value bytes. ref: fwil.c
 //  brcmf_create_iovar + brcmf_fil_iovar_data_set. (satoru)
 bool WifiBrcm::iovar_set(const char* name, const void* data, uint32_t len) {
@@ -933,10 +933,10 @@ bool WifiBrcm::iovar_set(const char* name, const void* data, uint32_t len) {
 
 // ── WifiRadioOps implementations ─────────────────────────────────────────── (satoru)
 
-// start(): the whole bring-up  -  map bar1, recognize the chip, reset it, download
+// start(): the whole bring-up - map bar1, recognize the chip, reset it, download
 // firmware + nvram, wait for the dongle, set up the rings, bring the mac "up"
 // via the BRCMF_C_UP dcmd, and seed rx buffers. returns false (cleanly) at the
-// first step that fails  -  most commonly the firmware blob being absent or the
+// first step that fails - most commonly the firmware blob being absent or the
 // dongle never answering on the ci hardware. (satoru)
 bool WifiBrcm::radio_start(void* /*ctx*/) {
     if (!wdev) return false;
@@ -990,7 +990,7 @@ bool WifiBrcm::radio_set_channel(void* /*ctx*/, int ch) {
 
 // config_bss(): point the firmware at the target ssid via the BRCMF_C_SET_SSID
 // dcmd, whose payload is a {len, ssid[32]} struct (the firmware then handles the
-// join/auth/assoc itself  -  broadcom does the mac in firmware). ref: the
+// join/auth/assoc itself - broadcom does the mac in firmware). ref: the
 // brcmf_join_params / wlc_ssid layout used with BRCMF_C_SET_SSID. (satoru)
 bool WifiBrcm::radio_config_bss(void* /*ctx*/, const uint8_t bssid[6], const char* ssid) {
     if (!rings_ready) return false;
@@ -1017,7 +1017,7 @@ bool WifiBrcm::radio_set_key(void* /*ctx*/, int idx, const uint8_t* key, int key
     // wl_wsec_key_t (abridged, matching brcmu_wifi.h field order): index, len,
     // data[32], pad..., algo, flags. the full struct is large + version-sensitive;
     // we build the leading, stable portion the firmware reads. scaffold: exact
-    // trailing fields vary by fw  -  verify against the target before trusting key
+    // trailing fields vary by fw - verify against the target before trusting key
     // offload; software ccmp is the safe fallback the stack already provides. (satoru)
     struct WlWsecKey {
         uint32_t index;
@@ -1045,7 +1045,7 @@ bool WifiBrcm::radio_set_key(void* /*ctx*/, int idx, const uint8_t* key, int key
 // accepts raw 802.11 via the tx-post header's FRAME_802_11 flag. we copy the
 // frame into a coherent buffer + post it on the control-submit ring's tx path.
 // scaffold: a complete data path also needs a tx flow-ring created per peer
-// (FLOW_RING_CREATE)  -  here we post a single best-effort tx item; honest that
+// (FLOW_RING_CREATE) - here we post a single best-effort tx item; honest that
 // full tx needs the flow-ring handshake + live firmware. ref: msgbuf.c
 // brcmf_msgbuf_tx_msg + the BRCMF_MSGBUF_PKT_FLAGS_FRAME_802_11 flag. (satoru)
 bool WifiBrcm::radio_tx_frame(void* /*ctx*/, const uint8_t* buf, int len) {
@@ -1102,7 +1102,7 @@ int WifiBrcm::radio_get_signal(void* /*ctx*/) {
 
 // load_firmware(): the WifiRadioOps hook for a stack-supplied blob. broadcom
 // sources its own firmware from the fs inside start()/download_firmware(), so
-// this is a no-op that succeeds  -  the stack does not ship broadcom firmware. (satoru)
+// this is a no-op that succeeds - the stack does not ship broadcom firmware. (satoru)
 bool WifiBrcm::radio_load_firmware(void* /*ctx*/, const uint8_t* /*blob*/, int /*len*/) {
     return true;
 }
@@ -1118,7 +1118,7 @@ bool WifiBrcm::TryRegister() {
         return false;
     }
 
-    // adopt the device (cast away const  -  we only read it, but the ops want a
+    // adopt the device (cast away const - we only read it, but the ops want a
     // mutable WifiDevice* to register). the WifiDev singleton owns the storage. (satoru)
     wdev = (WifiDevice*)info;
     blogx("[brcm] claiming broadcom wifi device id ", info->device);

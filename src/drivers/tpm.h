@@ -3,7 +3,7 @@
 
 #include "../kernel/types.h"
 
-// TPM 2.0 driver  -  talks to the TPM via the TIS (TPM Interface
+// TPM 2.0 driver - talks to the TPM via the TIS (TPM Interface
 // Specification) MMIO interface at 0xFED40000.
 //
 // TIS register map (per locality, 0x1000 bytes apart):
@@ -58,7 +58,7 @@ namespace TPM {
     };
 
     // Probe MMIO interface, request locality 0, fill DeviceInfo.  Safe
-    // to call even when no TPM is present  -  sets present=false.
+    // to call even when no TPM is present - sets present=false.
     bool   Init();
     const  DeviceInfo* Info();
 

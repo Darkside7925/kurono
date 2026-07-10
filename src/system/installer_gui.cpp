@@ -61,12 +61,12 @@ int  g_hostname_len       = 6;
 int  g_tz_idx             = 0;   // index into TIMEZONES
 bool g_pref_dark          = true;
 bool g_pref_24h           = true;
-// KMemX memory compression  -  offered as an install option, default ON
+// KMemX memory compression - offered as an install option, default ON
 // (recommended). persisted to kmemx.enabled when the install applies prefs. (satoru)
 bool g_pref_kmemx         = true;
 
 // network setup screen state (satoru). wired link is real (e1000/virtio); wifi
-// is an honest config UI with no radio to drive it yet  -  see scr_wifi.
+// is an honest config UI with no radio to drive it yet - see scr_wifi.
 char g_wifi_ssid[NET_MAX_SSID] = {0};
 int  g_wifi_ssid_len      = 0;
 char g_wifi_pw[64]        = {0};
@@ -384,7 +384,7 @@ static void scr_wifi(){
     if (g_wifi_ssid_len > 0 && draw_button(g_hit.alt_x, g_hit.alt_y, g_hit.alt_w, g_hit.alt_h, "Connect", 0xFF2ECC71, true)){
         g_wifi_attempted = true;
         WiFi::Enable();
-        // real call  -  returns false on the wired-only build; we record the result. (satoru)
+        // real call - returns false on the wired-only build; we record the result. (satoru)
         g_wifi_connected = WiFi::Connect(g_wifi_ssid, g_wifi_pw);
     }
 
@@ -527,7 +527,7 @@ static void scr_hostname(){
     // record the second checkbox's x so the click handler can tell them apart
     g_hit.alt_x = x + w/2 + 8; g_hit.alt_y = pby; g_hit.alt_w = w/2 - 8; g_hit.alt_h = 44;
 
-    // KMemX memory compression  -  a full-width option below, default on. its hit
+    // KMemX memory compression - a full-width option below, default on. its hit
     // rect is recorded in cb_y[2]. a one-line note carries the recommendation,
     // tailored by system RAM (the spec's installer disclaimer in brief). (satoru)
     int kmy = pby + 52;
@@ -672,7 +672,7 @@ namespace {
 static void scr_drivers(){
     DetectedGPU vendor = GpuDriverInstaller::DetectVendor();
     if (vendor != DGPU_NVIDIA && vendor != DGPU_AMD){
-        // nothing useful to install  -  skip straight through
+        // nothing useful to install - skip straight through
         InstallerGUI::current_screen = InstallerGUI::SCR_SUCCESS;
         return;
     }
@@ -749,7 +749,7 @@ static void scr_drivers(){
             "fetching packages, and loading the kernel module.",
             0xA0FFFFFF);
 
-        // run actually  -  this blocks per-frame is OK because Setup runs
+        // run actually - this blocks per-frame is OK because Setup runs
         // synchronously and writes to status as it goes.  We kick it off
         // exactly once.
         if (!g_drv_started){
@@ -825,7 +825,7 @@ static void install_step(){
     if (g_install_done || g_install_failed) return;
     // We need an ESP and an ext4 partition.  Run rescan first, then call the
     // existing CLI installer.  In Erase All mode, we don't yet have a real
-    // GPT writer for arbitrary disks  -  so we fall back to picking the first
+    // GPT writer for arbitrary disks - so we fall back to picking the first
     // ext4 partition produced by Installer::Init().  This still performs all
     // the real per-file deploy and keeps the UI honest about what happened.
     switch (g_install_step){
@@ -989,7 +989,7 @@ bool InstallerGUI::Run(int start_screen){
     Installer::Rescan();   // populate disks so the disk screen has live data (satoru)
     // open on the requested screen (defaults to welcome). out-of-range falls
     // back to welcome so a bad cmdline can't break the wizard. capped at the
-    // summary screen  -  the progress/success screens must be reached via the
+    // summary screen - the progress/success screens must be reached via the
     // real install button, never jumped to directly. (satoru)
     current_screen = (start_screen >= SCR_WELCOME && start_screen <= SCR_SUMMARY)
                      ? (Screen)start_screen : SCR_WELCOME;
@@ -1085,7 +1085,7 @@ bool InstallerGUI::Run(int start_screen){
                         if (point_in(mx, my, g_hit.radio_x, g_hit.radio_y[i], g_hit.radio_w, g_hit.radio_h - 6))
                             g_tz_idx = i;
                     }
-                    // dark-theme checkbox (cb_x) vs 24h checkbox (alt_x)  -  distinguished by x. (satoru)
+                    // dark-theme checkbox (cb_x) vs 24h checkbox (alt_x) - distinguished by x. (satoru)
                     if (point_in(mx, my, g_hit.cb_x,  g_hit.cb_y[0], g_hit.cb_w,  g_hit.cb_h - 6)) g_pref_dark = !g_pref_dark;
                     if (point_in(mx, my, g_hit.alt_x, g_hit.alt_y,   g_hit.alt_w, g_hit.alt_h - 6)) g_pref_24h  = !g_pref_24h;
                     // kmemx full-width checkbox (cb_y[2], full width from cb_x). (satoru)

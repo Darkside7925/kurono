@@ -1,4 +1,4 @@
-# KCL  -  Kurono Command Language
+# KCL - Kurono Command Language
 
 `src/kcl/kcl.cpp` and `kcl.h` implement a complete tree-walking scripting
 language built into Kurono. See [KCL_REFERENCE.md](KCL_REFERENCE.md) for the
@@ -47,7 +47,7 @@ Example session:
 ## 4. Registration
 
 The `kcl` command is registered by KCL itself, in `src/kcl/kcl.cpp`
-(`RegisterCommand("kcl", "Run KCL script", ENV_KURONO, "scripting", cmd_kcl)`)  - 
+(`RegisterCommand("kcl", "Run KCL script", ENV_KURONO, "scripting", cmd_kcl)`) - 
 not in `shell.cpp`'s `RegisterBuiltins()`. Its category is `"scripting"`.
 Separately, `shell.cpp` recognizes a `.kcl` path on the command line and runs it
 through `KCL::ExecFile()`.
@@ -60,8 +60,8 @@ through `KCL::ExecFile()`.
 
 ## 6. Related files
 
-- `src/kcl/kcl.cpp`, `src/kcl/kcl.h`  -  the interpreter (lexer/parser/evaluator)
-- `src/kcl/kcl_test.cpp`  -  the 11-script self-test suite (boot token `kurono.kcltest`)
-- `src/shell/shell.cpp`  -  KCL command registration + `.kcl` shell dispatch
-- `src/apps/file_manager.cpp`  -  `.kcl` double-click → run in Terminal
-- `src/fs/kvfs.cpp`  -  file operations called from KCL scripts (`read`/`write`/`exists`)
+- `src/kcl/kcl.cpp`, `src/kcl/kcl.h` - the interpreter (lexer/parser/evaluator)
+- `src/kcl/kcl_test.cpp` - the 11-script self-test suite (boot token `kurono.kcltest`)
+- `src/shell/shell.cpp` - KCL command registration + `.kcl` shell dispatch
+- `src/apps/file_manager.cpp` - `.kcl` double-click → run in Terminal
+- `src/fs/kvfs.cpp` - file operations called from KCL scripts (`read`/`write`/`exists`)

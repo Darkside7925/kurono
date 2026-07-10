@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  low-memory ISA DMA allocator
+//  kurono os - low-memory ISA DMA allocator
 //
 //  ISA DMA (used by Sound Blaster 16, AC97 BDL, floppy, etc.) requires
 //  buffers that:
@@ -12,7 +12,7 @@
 //  optionally) share this allocator instead of fighting over hardcoded
 //  physical addresses.
 //
-//  Layout (statically partitioned for determinism  -  no fragmentation):
+//  Layout (statically partitioned for determinism - no fragmentation):
 //
 //    0x00060000 .. 0x00067FFF   32 KB   SB16 single 8-bit DMA buffer
 //    0x00068000 .. 0x0006FFFF   32 KB   SB16 spare / 16-bit channel
@@ -20,7 +20,7 @@
 //                                       (BDL = first 256 B, rest is a
 //                                        small staging area for tones)
 //    0x00078000 .. 0x000BFFFF  288 KB   AC97 PCM ring (32 × 8 KB chunks)
-//    0x000C0000 .. 0x000FFFFF  256 KB   reserved for ROM / EBDA  -  DO NOT USE
+//    0x000C0000 .. 0x000FFFFF  256 KB   reserved for ROM / EBDA - DO NOT USE
 //
 //  Anything above 0x100000 belongs to the kernel image, the heap, etc.
 //  The reservation map is exposed via Mark*() helpers so the PMM can be
@@ -43,7 +43,7 @@ enum Region : uint8_t {
 struct RegionInfo {
     uint32_t phys_base;   // 32-bit physical base address
     uint32_t size;        // bytes
-    bool     in_use;      // for diagnostics only  -  regions are statically owned
+    bool     in_use;      // for diagnostics only - regions are statically owned
     const char* owner;    // debug label
 };
 

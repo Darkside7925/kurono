@@ -1,7 +1,7 @@
 #pragma once
 #include "../kernel/types.h"
 
-// system clipboard  -  single shared text buffer backed by a fixed RAM
+// system clipboard - single shared text buffer backed by a fixed RAM
 // region. bounded copies, nul-terminated, no dynamic allocation. (satoru)
 
 class ClipboardManager {
@@ -14,7 +14,7 @@ public:
     // passing nullptr clears the clipboard. (satoru)
     static void SetText(const char* s);
 
-    // current clipboard text; never null  -  empty string when nothing is
+    // current clipboard text; never null - empty string when nothing is
     // stored. valid until the next SetText/Clear. (satoru)
     static const char* GetText();
 

@@ -1,7 +1,7 @@
 #include "mp3_decoder.h"
 #include "../kernel/heap.h"
 
-//  kurono os  -  mp3 decoder implementation (mpeg-1 layer iii)
+//  kurono os - mp3 decoder implementation (mpeg-1 layer iii)
 //  real huffman decoding, imdct, dequantization, polyphase synthesis
 
 MP3DecoderState MP3Decoder::state;
@@ -23,7 +23,7 @@ static float _pow2(float x) {
 }
 
 static float _pow43(float x) {
-    // x^(4/3)  -  used in mp3 dequantization
+    // x^(4/3) - used in mp3 dequantization
     // |x|^(4/3) = |x| * |x|^(1/3)
     if (x == 0.0f) return 0.0f;
     float ax = _fabs(x);
@@ -74,28 +74,28 @@ const float MP3Decoder::ca[8] = {
 
 // pre-computed for each block type (normal, start, short, stop)
 const float MP3Decoder::imdct_win[4][36] = {
-    // type 0  -  normal block
+    // type 0 - normal block
     { 0.043619f, 0.130526f, 0.216440f, 0.300706f, 0.382683f, 0.461749f,
       0.537300f, 0.608761f, 0.675590f, 0.737277f, 0.793353f, 0.843391f,
       0.887011f, 0.923880f, 0.953717f, 0.976296f, 0.991445f, 0.999048f,
       0.999048f, 0.991445f, 0.976296f, 0.953717f, 0.923880f, 0.887011f,
       0.843391f, 0.793353f, 0.737277f, 0.675590f, 0.608761f, 0.537300f,
       0.461749f, 0.382683f, 0.300706f, 0.216440f, 0.130526f, 0.043619f },
-    // type 1  -  start block
+    // type 1 - start block
     { 0.043619f, 0.130526f, 0.216440f, 0.300706f, 0.382683f, 0.461749f,
       0.537300f, 0.608761f, 0.675590f, 0.737277f, 0.793353f, 0.843391f,
       0.887011f, 0.923880f, 0.953717f, 0.976296f, 0.991445f, 0.999048f,
       1.000000f, 1.000000f, 1.000000f, 1.000000f, 1.000000f, 1.000000f,
       0.991445f, 0.923880f, 0.793353f, 0.608761f, 0.382683f, 0.130526f,
       0.000000f, 0.000000f, 0.000000f, 0.000000f, 0.000000f, 0.000000f },
-    // type 2  -  short block (12-point window, placed ×3)
+    // type 2 - short block (12-point window, placed ×3)
     { 0.130526f, 0.382683f, 0.608761f, 0.793353f, 0.923880f, 0.991445f,
       0.991445f, 0.923880f, 0.793353f, 0.608761f, 0.382683f, 0.130526f,
       0.130526f, 0.382683f, 0.608761f, 0.793353f, 0.923880f, 0.991445f,
       0.991445f, 0.923880f, 0.793353f, 0.608761f, 0.382683f, 0.130526f,
       0.130526f, 0.382683f, 0.608761f, 0.793353f, 0.923880f, 0.991445f,
       0.991445f, 0.923880f, 0.793353f, 0.608761f, 0.382683f, 0.130526f },
-    // type 3  -  stop block
+    // type 3 - stop block
     { 0.000000f, 0.000000f, 0.000000f, 0.000000f, 0.000000f, 0.000000f,
       0.130526f, 0.382683f, 0.608761f, 0.793353f, 0.923880f, 0.991445f,
       1.000000f, 1.000000f, 1.000000f, 1.000000f, 1.000000f, 1.000000f,
@@ -154,7 +154,7 @@ int MP3Decoder::ReadBits(const uint8_t* data, int* bit_pos, int n_bits) {
         int byte_idx = (*bit_pos) >> 3;
         int bit;
         if (byte_idx < 0 || (res_avail >= 0 && byte_idx >= res_avail))
-            bit = 0;  // past end of reservoir  -  stop consuming real bytes (satoru)
+            bit = 0;  // past end of reservoir - stop consuming real bytes (satoru)
         else {
             int bit_idx = 7 - ((*bit_pos) & 7);
             bit = (data[byte_idx] >> bit_idx) & 1;
@@ -354,7 +354,7 @@ void MP3Decoder::ReadScaleFactors(const uint8_t* data, int* bit_pos, int gr, int
                     state.scalefac_s[ch][sfb][win] = ReadBits(data, bit_pos, slen2);
         }
     } else {
-        // long blocks  -  21 scale factor bands
+        // long blocks - 21 scale factor bands
         // use scfsi from side info for granule 1
         int scfsi_band[4][2] = { {0,6}, {6,11}, {11,16}, {16,21} };
         for (int band = 0; band < 4; band++) {
@@ -369,7 +369,7 @@ void MP3Decoder::ReadScaleFactors(const uint8_t* data, int* bit_pos, int gr, int
 }
 
 //  huffman decoding
-//  uses simplified linear lookup (no tree  -  avoids large static tables)
+//  uses simplified linear lookup (no tree - avoids large static tables)
 void MP3Decoder::HuffmanDecode(const uint8_t* data, int* bit_pos, int gr, int ch,
                                float* is_out) {
     GranuleInfo* g = &state.side_info.gr[gr][ch];
@@ -507,7 +507,7 @@ void MP3Decoder::Dequantize(int gr, int ch, float* is_data) {
             float exp = (float)(sf + prescale) * (g->scalefac_scale ? 2.0f : 1.0f);
             sfac = _pow2(-exp / 2.0f);
         } else {
-            // short/mixed blocks  -  use subblock gain
+            // short/mixed blocks - use subblock gain
             int win = (i - sfb_start) % 3;
             int sb_idx = (i - sfb_start < 18) ? 0 : ((i - sfb_start < 36) ? 1 : 2);
             float subgain = _pow2(-2.0f * (float)g->subblock_gain[sb_idx]);

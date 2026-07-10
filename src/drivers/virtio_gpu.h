@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  virtio gpu driver
+//  kurono os - virtio gpu driver
 //  implements virtio gpu specification for 2d/3d accelerated rendering
 //  used for guest ↔ host display bridge in virtualized environments
 #include "../kernel/types.h"

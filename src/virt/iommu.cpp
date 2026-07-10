@@ -1,4 +1,4 @@
-//  kurono os  -  intel vt-d / iommu implementation
+//  kurono os - intel vt-d / iommu implementation
 //  dma remapping for pci device passthrough (gpu passthrough to linux guests)
 #include "iommu.h"
 #include "vmm.h"
@@ -123,7 +123,7 @@ bool IOMMU::DetectAMDVi() {
         uint16_t class_sub = (cls >> 16) & 0xFFFF;
         
         if (class_sub == 0x0806) {
-            // found amd iommu  -  read bar0 for mmio base
+            // found amd iommu - read bar0 for mmio base
             addr = (1u << 31) | (0u << 16) | ((uint32_t)slot << 11) | 0x10;
             asm volatile("outl %0, %1" : : "a"(addr), "Nd"((uint16_t)0xCF8));
             uint32_t bar0;
@@ -365,7 +365,7 @@ bool IOMMU::IsDeviceAssigned(uint8_t bus, uint8_t dev, uint8_t func) {
 
 bool IOMMU::SetupIdentityDomain(uint16_t domain_id, uint64_t phys_start, uint64_t phys_size) {
     // in pass-through mode (translation type 0x02), the iommu performs
-    // identity 1:1 mapping  -  no page tables needed.
+    // identity 1:1 mapping - no page tables needed.
     // just record the domain for tracking purposes.
     (void)domain_id;
     (void)phys_start;
@@ -377,12 +377,12 @@ bool IOMMU::SetupIdentityDomain(uint16_t domain_id, uint64_t phys_start, uint64_
 
 bool IOMMU::SetupGPUPassthrough() {
     if (!IsSupported()) {
-        SerialLogger::Log("[IOMMU] VT-d not available  -  cannot passthrough GPU\r\n");
+        SerialLogger::Log("[IOMMU] VT-d not available - cannot passthrough GPU\r\n");
         return false;
     }
 
     if (!NvidiaGPU::IsDetected()) {
-        SerialLogger::Log("[IOMMU] No NVIDIA GPU detected  -  cannot passthrough\r\n");
+        SerialLogger::Log("[IOMMU] No NVIDIA GPU detected - cannot passthrough\r\n");
         return false;
     }
 
@@ -409,7 +409,7 @@ bool IOMMU::SetupGPUPassthrough() {
         return false;
     }
 
-    SerialLogger::Log("[IOMMU] GPU passthrough active  -  device assigned to domain 1\r\n");
+    SerialLogger::Log("[IOMMU] GPU passthrough active - device assigned to domain 1\r\n");
     return true;
 }
 

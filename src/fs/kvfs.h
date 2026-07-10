@@ -2,13 +2,13 @@
 #include "../kernel/types.h"
 #include "../kernel/heap.h"
 
-//  kurono virtual file system  -  full hierarchical fs with posix semantics
+//  kurono virtual file system - full hierarchical fs with posix semantics
 
 #define KVFS_MAX_NAME     64
 #define KVFS_MAX_PATH     256
 #define KVFS_MAX_CHILDREN 512   // entries per directory (TODO: make children dynamic for unbounded dirs) (satoru)
-#define KVFS_MAX_CONTENT  (64 * 1024)  // 64kb  -  shell cat/grep display chunk (stack-safe)
-#define KVFS_MAX_FILE_SIZE (4 * 1024 * 1024)  // 4mb  -  real per-file storage ceiling (satoru)
+#define KVFS_MAX_CONTENT  (64 * 1024)  // 64kb - shell cat/grep display chunk (stack-safe)
+#define KVFS_MAX_FILE_SIZE (4 * 1024 * 1024)  // 4mb - real per-file storage ceiling (satoru)
 #define KVFS_BLOCK_SIZE   4096
 
 enum KVFSNodeType : uint8_t {
@@ -164,7 +164,7 @@ enum KVFSError {
     KVFS_ERR_NO_FD = -10,
 };
 
-//  kvfs  -  main filesystem class
+//  kvfs - main filesystem class
 
 class KVFS {
 public:
@@ -180,7 +180,7 @@ public:
     static int Rmdir(const char* path);
     static int Listdir(const char* path, KVFSNode** out, int max_count);
 
-    // symlink  -  create (or replace a stale entry of) a KVFS_SYMLINK node at
+    // symlink - create (or replace a stale entry of) a KVFS_SYMLINK node at
     // `path` pointing at `target`. used to lay the compat-symlink overlay that
     // maps the old top-level names (/system /home /etc /bin /lib /tmp /proc /dev
     // /var /apps /usr/bin /usr/lib) into the canonical /kurono tree, so the ~800
@@ -190,7 +190,7 @@ public:
 
     // install the canonical /kurono/* tree + the top-level compat symlinks.
     // MUST run at the earliest fs init (called at the tail of Init() and again
-    // after a persistent-tree restore)  -  before any other code touches a path,
+    // after a persistent-tree restore) - before any other code touches a path,
     // so a later Mkdirs("/system/...") resolves THROUGH the symlink instead of
     // materialising a real /system dir. (satoru)
     static void InstallCanonicalLayout();
@@ -242,7 +242,7 @@ public:
     static int WriteString(const char* path, const char* str);
     static int ReadString(const char* path, char* buf, int max_len);
 
-    // persistence  -  flatten the whole tree to / rebuild it from a binary blob.
+    // persistence - flatten the whole tree to / rebuild it from a binary blob.
     // Serialize returns bytes written (0 on failure/overflow); Deserialize
     // returns true on success and leaves the live tree untouched on any
     // malformation. (satoru)
@@ -288,7 +288,7 @@ private:
     // bounds-checked against maxSize; returns false on overflow. persist_content
     // gates whether file BYTES are written: the tree structure is always saved,
     // but content is only kept for user-data subtrees (/home, /etc, /root) so the
-    // image stays small  -  the big re-seeded /usr binaries + sample media are
+    // image stays small - the big re-seeded /usr binaries + sample media are
     // restored as empty entries and re-filled by the boot seeding. (satoru)
     static bool SerializeNode(const KVFSNode* node, uint8_t* buffer,
                               size_t maxSize, size_t* pos, uint32_t* count,

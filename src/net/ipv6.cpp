@@ -197,7 +197,7 @@ void ProcessRx(const unsigned char* eth_frame,
     if (payload_len < (int)sizeof(ICMPv6Header)) return;
 
     // Walk extension headers (hop-by-hop, routing, destination, fragment)
-    // to find the actual upper-layer protocol. Fragments are dropped  - 
+    // to find the actual upper-layer protocol. Fragments are dropped - 
     // no reassembly buffer.
     const unsigned char* hdr_ptr =
         eth_frame + sizeof(EthernetHeader) + sizeof(IPv6Header);

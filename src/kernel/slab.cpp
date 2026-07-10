@@ -1,4 +1,4 @@
-//  kurono os  -  slab allocator implementation
+//  kurono os - slab allocator implementation
 #include "slab.h"
 #include "buddy.h"
 #include "panic.h"

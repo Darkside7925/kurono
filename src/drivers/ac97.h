@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  ac'97 audio codec driver
+//  kurono os - ac'97 audio codec driver
 //  intel ich / sis / via ac97 audio controller (pci class 04:01)
 //  supports pcm playback via bus master dma with buffer descriptor list
 #include "../kernel/types.h"
@@ -103,7 +103,7 @@ struct AC97Info {
 
 class AC97 {
 public:
-    // initialize  -  pci scan, codec reset, bdl setup
+    // initialize - pci scan, codec reset, bdl setup
     static bool Init();
     static bool IsAvailable();
 
@@ -132,7 +132,7 @@ public:
     // irq handler
     static void HandleIRQ();
 
-    // tick  -  refill buffers
+    // tick - refill buffers
     static void Tick();
 
     // streaming-mode helpers used by audio_backend_ac97.cpp.  The mixer
@@ -148,7 +148,7 @@ private:
     static bool     muted;
     static int      master_vol;
 
-    // dma buffer and bdl  -  must be in low physical memory (<4gb)
+    // dma buffer and bdl - must be in low physical memory (<4gb)
     static uint8_t* dma_buffer;     // points to physical memory
     static AC97BufferDescriptor* bdl;  // buffer descriptor list
 

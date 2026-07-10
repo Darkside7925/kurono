@@ -1,12 +1,12 @@
 #pragma once
 #include "../kernel/types.h"
 
-//  kurono raw-sector state store  -  persists a single binary blob (the serialized
+//  kurono raw-sector state store - persists a single binary blob (the serialized
 //  kvfs tree) directly to a dedicated nvme data disk, bypassing any filesystem.
 //  uses ONLY the verified nvme read/write primitives. layout: lba 0 holds a 16
 //  byte header (magic + version + length + crc32), the blob follows at byte
 //  offset 4096, written in 4096-byte (one-page) chunks because the nvme driver
-//  does single-page prp1 dma. the data disk is ours to own  -  we do not pretend
+//  does single-page prp1 dma. the data disk is ours to own - we do not pretend
 //  it is a real filesystem. (satoru)
 
 class PersistStore {
@@ -23,7 +23,7 @@ public:
     // leaving the caller's tree untouched. (satoru)
     static bool Load(uint8_t* buf, uint32_t maxlen, uint32_t* out_len);
 
-    // KFS-backed persistence  -  the real-filesystem replacement for the raw blob.
+    // KFS-backed persistence - the real-filesystem replacement for the raw blob.
     // SaveTree formats a fresh KFS volume on the nvme data disk and mirrors the
     // kvfs user-data subtrees (/home, /etc, /root) into it as real files + dirs;
     // LoadTree mounts it and restores them. (satoru)

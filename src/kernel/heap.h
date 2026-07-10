@@ -1,7 +1,7 @@
 #pragma once
 #include "types.h"
 
-//  kernel heap  -  free-list allocator with coalescing
+//  kernel heap - free-list allocator with coalescing
 //
 //  phase 1 (bootstrap): uses a small 64 kb static bss buffer.
 //  phase 2 (expanded):  after pmm is ready, expandwithpmm() allocates a

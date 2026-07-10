@@ -1,4 +1,4 @@
-//  kurono os  -  settings module: device manager (satoru)
+//  kurono os - settings module: device manager (satoru)
 //  a read-only, device-manager-style inventory of all detected hardware,
 //  grouped by class. each device renders as a two-line block: a name line with
 //  a colour-coded status word on the right, and a dim "driver  vX.Y.Z" line
@@ -21,7 +21,7 @@
 #include "../linux/linux_drivers.h"
 
 // kernel/driver build version shown when a device exposes no real version of
-// its own  -  kept consistent across the whole page. (satoru)
+// its own - kept consistent across the whole page. (satoru)
 static const char* KDRV_VERSION = "kurono 1.0.0";
 
 // ── tiny libc-free string helpers (the kernel has no libc) (satoru) ──────────
@@ -41,7 +41,7 @@ static bool dstarts(const char* s, const char* p){
 }
 
 // ── bound linux driver lookups (same descriptor table the old settings.cpp
-//    walked via find_wifi_driver)  -  gives a real name/description/version for a
+//    walked via find_wifi_driver) - gives a real name/description/version for a
 //    device that is bound to a native driver. (satoru) ────────────────────────
 static const LinuxDriver* find_driver_by_prefixes(const char* const* prefixes, int count){
     LinuxDriver* drivers = LinuxDriverFramework::GetDrivers();
@@ -411,7 +411,7 @@ static void devices_render(int x, int y, int w, int h, int scroll){
     devices_layout(x, y - scroll + PAD_TOP, w, /*draw=*/true);
 }
 
-// device manager is read-only  -  there are no interactive controls. (satoru)
+// device manager is read-only - there are no interactive controls. (satoru)
 static bool devices_input(int mx, int my, bool click, char key, int scroll){
     (void)mx; (void)my; (void)click; (void)key; (void)scroll;
     return false;

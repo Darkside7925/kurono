@@ -41,13 +41,13 @@ void Init(int initial_active) {
 
     // Welcome banner on each tty.
     const char* greet[] = {
-        "Kurono OS tty1  -  System log\r\n",
-        "Kurono OS tty2  -  Secondary console\r\n",
-        "Kurono OS tty3  -  Free console\r\n",
-        "Kurono OS tty4  -  Free console\r\n",
-        "Kurono OS tty5  -  Free console\r\n",
-        "Kurono OS tty6  -  Free console\r\n",
-        "Kurono OS tty7  -  Graphical session (Ctrl+Alt+F1..F6 to switch)\r\n",
+        "Kurono OS tty1 - System log\r\n",
+        "Kurono OS tty2 - Secondary console\r\n",
+        "Kurono OS tty3 - Free console\r\n",
+        "Kurono OS tty4 - Free console\r\n",
+        "Kurono OS tty5 - Free console\r\n",
+        "Kurono OS tty6 - Free console\r\n",
+        "Kurono OS tty7 - Graphical session (Ctrl+Alt+F1..F6 to switch)\r\n",
     };
     for (int i = 0; i < VC_COUNT; i++) WriteStr(i, greet[i]);
     if (g_active == VC_GUI) {

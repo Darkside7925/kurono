@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  gpu probe & hybrid gpu support
+//  kurono os - gpu probe & hybrid gpu support
 //  early pci scan for all display controllers (intel igpu, nvidia dgpu,
 //  amd apu/dgpu). detects optimus/powerxpress hybrid setups and identifies
 //  which gpu owns the display panel.
@@ -69,7 +69,7 @@ struct GpuInfo {
     char        desc[48];        // human-readable description
 };
 
-// probe result  -  full system gpu inventory
+// probe result - full system gpu inventory
 struct GpuProbeResult {
     GpuInfo     gpus[GPU_PROBE_MAX];
     int         count;
@@ -96,7 +96,7 @@ struct GpuProbeResult {
 #define INTEL_DSPSTRIDE_B   0x71188
 #define INTEL_DSPSURF_B     0x7119C
 
-// skl+ (gen9+) universal plane registers  -  pipe a, plane 0
+// skl+ (gen9+) universal plane registers - pipe a, plane 0
 #define INTEL_PLANE_CTL_A    0x70180  // plane control
 #define INTEL_PLANE_STRIDE_A 0x70188  // plane stride (in 64b units)
 #define INTEL_PLANE_SURF_A   0x7019C  // plane surface address (bits 31:12 → phys addr)

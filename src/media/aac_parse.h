@@ -1,14 +1,14 @@
-// kurono os  -  aac (mpeg-4 audio) bitstream metadata parser
+// kurono os - aac (mpeg-4 audio) bitstream metadata parser
 // =================================================================
 // parses the two layouts you'll actually see in the wild:
-//   * adts header (each frame self-describes  -  used in raw .aac files)
-//   * audiospecificconfig (ASC)  -  a 2..N-byte blob inside esds in mp4
+//   * adts header (each frame self-describes - used in raw .aac files)
+//   * audiospecificconfig (ASC) - a 2..N-byte blob inside esds in mp4
 //
 // gives the os profile, sample rate, channel count and frame length so
 // the player can show "AAC LC 44100 Hz stereo" and route the right
 // number of frames per period to the audio mixer.
 //
-// not a decoder  -  but is sufficient for the demuxer to feed an aac
+// not a decoder - but is sufficient for the demuxer to feed an aac
 // decoder with correct stream parameters when one becomes available.
 #pragma once
 #include "../kernel/types.h"

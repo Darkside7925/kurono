@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  control center popup (wifi / bt / volume / brightness / quick actions)
+//  kurono os - control center popup (wifi / bt / volume / brightness / quick actions)
 //  triggered by clicking the system tray cluster on the taskbar.
 
 #include "../kernel/types.h"

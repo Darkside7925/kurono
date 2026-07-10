@@ -1,4 +1,4 @@
-// kurono os  -  native video player implementation
+// kurono os - native video player implementation
 // see video_player.h.  uses stb_image for jpeg decode, the new
 // AudioServer/AudioMixer for output, and Graphics for blit.
 #include "video_player.h"
@@ -75,7 +75,7 @@ static void FreeDecodeBuf(State& st) {
     if (st.decode_buf) KernelHeap::Free(st.decode_buf);
     st.decode_buf = nullptr;
     st.decode_cap = 0;
-    // decode-ahead slot  -  released here too; Open() calls Close() first so this
+    // decode-ahead slot - released here too; Open() calls Close() first so this
     // also zero-inits the prefetch state on a freshly opened (zeroed) State. (satoru)
     if (st.decode_buf2) KernelHeap::Free(st.decode_buf2);
     st.decode_buf2 = nullptr;
@@ -288,7 +288,7 @@ void Play(State& st) {
     if (st.playing && !st.paused) return;
     uint32_t now = Timer::GetRealMs();
     if (st.paused) {
-        // resume  -  adjust play_started_ms so play_started_ms+now-pos==now
+        // resume - adjust play_started_ms so play_started_ms+now-pos==now
         st.play_started_ms = now - st.pause_remainder_ms;
     } else {
         st.play_started_ms = now - st.pos_ms;

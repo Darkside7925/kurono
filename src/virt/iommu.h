@@ -1,5 +1,5 @@
 #pragma once
-//  kurono os  -  intel vt-d / iommu support
+//  kurono os - intel vt-d / iommu support
 //  dma remapping for pci device passthrough to virtual machines
 //  enables gpu passthrough (e.g., nvidia rtx 5090 → linux guest)
 #include "../kernel/types.h"
@@ -70,7 +70,7 @@ struct DeviceAssignment {
 #define MAX_DRHD_UNITS      8
 #define MAX_DEVICE_ASSIGNS  16
 
-//  iommu  -  static driver interface for intel vt-d / amd-vi
+//  iommu - static driver interface for intel vt-d / amd-vi
 class IOMMU {
 public:
     static void Init();                             // detect & initialize iommu

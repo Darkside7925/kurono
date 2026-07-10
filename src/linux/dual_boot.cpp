@@ -1,4 +1,4 @@
-//  kurono os  -  dual-boot / dual-run manager  -  implementation
+//  kurono os - dual-boot / dual-run manager - implementation
 
 #include "dual_boot.h"
 #include "kls.h"
@@ -61,7 +61,7 @@ void DualBootManager::Init() {
     current_mode = BOOT_INTEGRATED;
     linux_partition_mounted = false;
 
-    // default shared data config  -  everything shared
+    // default shared data config - everything shared
     shared_config.share_home = true;
     shared_config.share_tmp = true;
     shared_config.share_var_log = true;
@@ -97,7 +97,7 @@ void DualBootManager::Init() {
     // detect partitions
     DetectPartitions();
 
-    SerialLogger::Log("[DualBoot] Manager initialized  -  mode: ");
+    SerialLogger::Log("[DualBoot] Manager initialized - mode: ");
     SerialLogger::Log(BootModeName(current_mode));
     SerialLogger::Log("\r\n");
 }
@@ -219,7 +219,7 @@ void DualBootManager::GenerateGRUBConfig(char* out, int max_len) {
 
     // header
     p = pa(out, p, max_len, "# ═══════════════════════════════════════════════════════\n");
-    p = pa(out, p, max_len, "#  Kurono OS  -  GRUB Configuration (auto-generated)\n");
+    p = pa(out, p, max_len, "#  Kurono OS - GRUB Configuration (auto-generated)\n");
     p = pa(out, p, max_len, "#  Dual-boot: Kurono OS + Kurono Linux\n");
     p = pa(out, p, max_len, "# ═══════════════════════════════════════════════════════\n\n");
 
@@ -456,7 +456,7 @@ void DualBootManager::BootIntegrated() {
     // step 8: alpine boot remains manual until vmx bring-up is proven
     // stable across bare-metal laptops.
     if (VMM::GetType() == VIRT_INTEL_VTX) {
-        SerialLogger::Log("[DualBoot] Intel VT-x detected  -  Alpine VM available for manual boot\r\n");
+        SerialLogger::Log("[DualBoot] Intel VT-x detected - Alpine VM available for manual boot\r\n");
     } else {
         SerialLogger::Log("[DualBoot] Alpine VM unavailable for auto-start on this platform\r\n");
     }
@@ -504,10 +504,10 @@ int DualBootManager::cmd_dualboot(void*, int argc, const char** argv,
         p = pa(out, p, mx, "Current mode: ");
         p = pa(out, p, mx, BootModeName(current_mode));
         p = pa(out, p, mx, "\n\nCommands:\n");
-        p = pa(out, p, mx, "  dualboot status      -  Show status\n");
-        p = pa(out, p, mx, "  dualboot mode <n>    -  Set boot mode (0-3)\n");
-        p = pa(out, p, mx, "  dualboot grub        -  Show GRUB config\n");
-        p = pa(out, p, mx, "  dualboot install     -  Install Linux rootfs\n");
+        p = pa(out, p, mx, "  dualboot status     - Show status\n");
+        p = pa(out, p, mx, "  dualboot mode <n>   - Set boot mode (0-3)\n");
+        p = pa(out, p, mx, "  dualboot grub       - Show GRUB config\n");
+        p = pa(out, p, mx, "  dualboot install    - Install Linux rootfs\n");
         return p;
     }
 
@@ -622,7 +622,7 @@ void DualBootManager::DumpStatus(char* out, int max_out) {
     p = pa(out, p, max_out, "\n  Linux:         ");
     p = pa(out, p, max_out, IsLinuxActive() ? "ACTIVE" : "inactive");
     p = pa(out, p, max_out, "\n  Integrated:    ");
-    p = pa(out, p, max_out, IsIntegrated() ? "YES  -  same users, files, desktop" : "NO");
+    p = pa(out, p, max_out, IsIntegrated() ? "YES - same users, files, desktop" : "NO");
     p = pa(out, p, max_out, "\n  Linux Part:    ");
     p = pa(out, p, max_out, linux_partition_mounted ? "mounted" : "not mounted");
     p = pa(out, p, max_out, "\n\n  Shared:\n");

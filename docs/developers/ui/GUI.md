@@ -35,7 +35,7 @@ The GUI layer calls `Font::DrawString(x, y, text, color)` for text output. The f
 
 ## 5. Related files
 
-- `src/drivers/graphics.cpp`  -  pixel-level backend
-- `src/ui/font.cpp`  -  text rendering
-- `src/ui/ui_elements.cpp`  -  slider, checkbox, list components
-- `src/system/ui_config.cpp`  -  color source for themed widgets
+- `src/drivers/graphics.cpp` - pixel-level backend
+- `src/ui/font.cpp` - text rendering
+- `src/ui/ui_elements.cpp` - slider, checkbox, list components
+- `src/system/ui_config.cpp` - color source for themed widgets
