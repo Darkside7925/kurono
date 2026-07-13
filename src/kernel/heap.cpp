@@ -106,6 +106,36 @@ static inline bool valid_magic(uint64_t flags) {
            m == (HEAP_MAGIC_USED & ~HEAP_BLOCK_USED);
 }
 
+// freelist link validation (linux SLAB_FREELIST_HARDENED / CONFIG_DEBUG_LIST
+// analogue). a FreeLink lives in a FREE block's payload; the documented stale-
+// writer class (a use-after-free write - "path buffers observed landing in
+// recycled blocks") can overwrite that payload with arbitrary data, and the raw
+// pointer walks below then dereference/store through garbage - observed as the
+// rip=0x3 #UD boot crash with ascii string bytes in the registers. validate
+// every link BEFORE it is dereferenced: in-bounds of a heap region, aligned,
+// header carries the free magic, size sane. on failure the caller logs and
+// truncates/leaks instead of walking garbage. bounds mirror heap_base/
+// heap_capacity because these helpers are file-static. (satoru)
+static uint8_t* g_val_base = nullptr;
+static size_t   g_val_cap  = 0;
+static uint8_t* g_val_boot = nullptr;
+static size_t   g_val_boot_cap = 0;
+
+static bool link_ok(FreeLink* l) {
+    uint8_t* p = (uint8_t*)l;
+    bool in_active = g_val_base && p >= g_val_base + HEAP_HEADER_SIZE &&
+                     p + sizeof(FreeLink) <= g_val_base + g_val_cap;
+    bool in_boot   = g_val_boot && p >= g_val_boot + HEAP_HEADER_SIZE &&
+                     p + sizeof(FreeLink) <= g_val_boot + g_val_boot_cap;
+    if (!in_active && !in_boot) return false;
+    if (((uintptr_t)p & 15) != 0) return false;   // blocks + payloads are 16-aligned (satoru)
+    HeapBlock* b = (HeapBlock*)(p - HEAP_HEADER_SIZE);
+    if (!valid_magic(b->flags) || block_used(b)) return false;
+    uint64_t cap = in_active ? (uint64_t)g_val_cap : (uint64_t)g_val_boot_cap;
+    if (b->size < HEAP_MIN_PAYLOAD || b->size > cap) return false;
+    return true;
+}
+
 static void freelist_push(HeapBlock* b) {
     FreeLink* l = (FreeLink*)((uint8_t*)b + HEAP_HEADER_SIZE);
     l->prev = nullptr;
@@ -116,9 +146,34 @@ static void freelist_push(HeapBlock* b) {
 
 static void freelist_remove(HeapBlock* b) {
     FreeLink* l = (FreeLink*)((uint8_t*)b + HEAP_HEADER_SIZE);
-    if (l->prev) l->prev->next = l->next;
-    else         g_free_head   = l->next;
-    if (l->next) l->next->prev = l->prev;
+    // validate both neighbor links before storing through them - a trampled
+    // payload would otherwise redirect these writes over live memory. on a bad
+    // link, fall back to a validated walk from the head; entries that cannot be
+    // safely unlinked are leaked (contained), never written through. (satoru)
+    bool pv = (l->prev == nullptr) || link_ok(l->prev);
+    bool nv = (l->next == nullptr) || link_ok(l->next);
+    if (pv && nv) {
+        if (l->prev) l->prev->next = l->next;
+        else         g_free_head   = l->next;
+        if (l->next) l->next->prev = l->prev;
+        l->next = l->prev = nullptr;
+        return;
+    }
+    heap_warn("Heap: freelist corrupt link in remove (healed)\r\n");
+    FreeLink* prev = nullptr;
+    for (FreeLink* it = g_free_head; it; it = it->next) {
+        if (!link_ok(it)) {   // corrupt tail: truncate the list here (leak) (satoru)
+            if (prev) prev->next = nullptr; else g_free_head = nullptr;
+            break;
+        }
+        if (it == l) {
+            FreeLink* nx = (l->next && link_ok(l->next)) ? l->next : nullptr;
+            if (prev) prev->next = nx; else g_free_head = nx;
+            if (nx) nx->prev = prev;
+            break;
+        }
+        prev = it;
+    }
     l->next = l->prev = nullptr;
 }
 
@@ -170,6 +225,10 @@ void KernelHeap::Init() {
     g_free_head = nullptr;
     freelist_push(first);
 
+    // seed the link-validation bounds (see link_ok). (satoru)
+    g_val_base = heap_base;   g_val_cap = heap_capacity;
+    g_val_boot = boot_buffer; g_val_boot_cap = BOOT_HEAP_SIZE;
+
     initialized = true;
     SerialLogger::Log("Heap: Bootstrap (64 KB BSS)\r\n");
 }
@@ -214,6 +273,7 @@ void KernelHeap::ExpandWithPMM() {
     heap_base     = new_base;
     heap_capacity = new_cap;
     expanded      = true;
+    g_val_base = heap_base; g_val_cap = heap_capacity;   // re-seed link validation bounds (satoru)
 
     // abandon the bootstrap freelist; allocations in bss remain valid because
     // their headers don't move. New allocations come from the expanded pool.
@@ -230,10 +290,19 @@ void KernelHeap::ExpandWithPMM() {
 
 HeapBlock* KernelHeap::FindFree(size_t size) {
     // first-fit over the freelist - O(k) where k = #free blocks, vs the
-    // prior O(n) over every block.
+    // prior O(n) over every block. every hop is validated (link_ok) so a
+    // trampled link is detected + truncated instead of dereferenced - the
+    // unvalidated walk here was the rip=0x3 wild-jump crash vector. (satoru)
+    FreeLink* prev = nullptr;
     for (FreeLink* l = g_free_head; l; l = l->next) {
+        if (!link_ok(l)) {
+            heap_warn("Heap: freelist corrupt link in find (truncated)\r\n");
+            if (prev) prev->next = nullptr; else g_free_head = nullptr;
+            return nullptr;
+        }
         HeapBlock* b = block_from_link(l);
         if (b->size >= size) return b;
+        prev = l;
     }
     return nullptr;
 }
