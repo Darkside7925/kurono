@@ -24,8 +24,10 @@ namespace {
     KFSSuper   g_sb;
     bool       g_mounted = false;
 
-    uint8_t*   g_bitmap = nullptr;   // in-ram free-block bitmap (satoru)
-    uint8_t*   g_inodes = nullptr;   // in-ram inode table (satoru)
+    uint8_t*   g_bitmap = nullptr;   // in-ram free-block bitmap (pmm-backed) (satoru)
+    uint8_t*   g_inodes = nullptr;   // in-ram inode table (pmm-backed) (satoru)
+    uint32_t   g_bitmap_bytes = 0;   // pmm allocation sizes for FreeBytes (satoru)
+    uint32_t   g_inodes_bytes = 0;
     uint32_t   g_next   = 0;         // bump hint for contiguous allocation (satoru)
 
     KFSStats   g_stats = {};
@@ -52,19 +54,38 @@ namespace {
     }
 
     void bit_set(uint32_t b) { if (g_bitmap) g_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7)); }
+    bool bit_get(uint32_t b) { return g_bitmap && ((g_bitmap[b >> 3] >> (b & 7)) & 1u); }
 
     //  bump-allocate `n` contiguous data blocks; returns the first, or 0 if full.
     //  on a fresh volume the hint walks straight up, so runs are contiguous and a
-    //  whole file is a single extent. (satoru)
+    //  whole file is a single extent. when the bump space is exhausted, fall back
+    //  to a first-fit scan of the bitmap: the bump path never REUSES free space,
+    //  so without the fallback a volume can report "full" while mostly free and a
+    //  big file then silently fails to write (the zombie-inode source). (satoru)
     uint32_t alloc_run(uint32_t n) {
         if (n == 0) return 0;
         if (g_next < g_sb.data_start) g_next = g_sb.data_start;
-        if ((uint64_t)g_next + n > g_sb.total_blocks) return 0;
-        uint32_t start = g_next;
-        for (uint32_t i = 0; i < n; i++) bit_set(start + i);
-        g_next += n;
-        g_sb.free_blocks -= n;
-        return start;
+        if ((uint64_t)g_next + n <= g_sb.total_blocks) {
+            uint32_t start = g_next;
+            for (uint32_t i = 0; i < n; i++) bit_set(start + i);
+            g_next += n;
+            g_sb.free_blocks -= n;
+            return start;
+        }
+        // first-fit bitmap scan for a free run of n. safe because every alloc
+        // path maintains the bitmap (bit_set above) and Mount loads it from
+        // disk, so a clear bit really is free space. (satoru)
+        uint32_t run = 0, s = 0;
+        for (uint32_t b = g_sb.data_start; b < g_sb.total_blocks; b++) {
+            if (bit_get(b)) { run = 0; continue; }
+            if (run == 0) s = b;
+            if (++run == n) {
+                for (uint32_t i = 0; i < n; i++) bit_set(s + i);
+                g_sb.free_blocks -= n;
+                return s;
+            }
+        }
+        return 0;
     }
     uint32_t alloc_block() { return alloc_run(1); }
 
@@ -367,7 +388,11 @@ namespace {
     //  as one (or a few) extents. (satoru)
     bool write_payload(KFSInode* f, const void* data, uint64_t len, KFSType t) {
         f->type = t;
-        f->size = len;
+        // stamp size LAST: stamping it up-front meant any failure below left a
+        // ZOMBIE inode (size > 0 with no covering extents) - FileSize() then
+        // reports the full size forever while ReadFile() returns -1 (the
+        // firefox cursor "short read got=-1" restore failures). (satoru)
+        f->size = 0;
         f->flags = 0; f->ext_count = 0; f->ext_overflow = 0; f->blocks = 0;
         if (len == 0) return true;
 
@@ -377,32 +402,43 @@ namespace {
             for (uint64_t i = 0; i < len; i++) f->inline_data[i] = src[i];
             for (uint64_t i = len; i < KFS_INLINE_MAX; i++) f->inline_data[i] = 0;
             f->flags |= KFS_FLAG_INLINE;
+            f->size = len;
             g_stats.inline_files++;
             return true;
         }
 
         // one contiguous run for the whole file -> a single extent + a few
-        // multi-page commands. (satoru)
+        // multi-page commands. on any failure roll the inode back to an empty
+        // (size 0) file so it can never restore as a zombie. (satoru)
         uint32_t nblocks = (uint32_t)((len + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE);
         uint32_t start = alloc_run(nblocks);
         if (!start) return false;
-        if (!ext_append(f, start, nblocks)) return false;
+        if (!ext_append(f, start, nblocks)) {
+            f->ext_count = 0; f->ext_overflow = 0; f->blocks = 0;
+            return false;
+        }
 
         const uint8_t* src = (const uint8_t*)data;
         uint32_t per = KFS_MAX_RUN_BLOCKS;
         uint64_t off = 0;
         uint32_t blk_off = 0;
+        bool ok = true;
         while (off < len) {
             uint32_t run_blocks = nblocks - blk_off; if (run_blocks > per) run_blocks = per;
             uint32_t run_bytes  = run_blocks * KFS_BLOCK_SIZE;
-            if (!ensure_bounce(run_bytes)) return false;
+            if (!ensure_bounce(run_bytes)) { ok = false; break; }
             uint64_t copy = len - off; if (copy > run_bytes) copy = run_bytes;
             for (uint64_t i = 0; i < copy; i++) g_bounce[i] = src[off + i];
             for (uint64_t i = copy; i < run_bytes; i++) g_bounce[i] = 0;   // zero-pad tail (satoru)
-            if (!wr_block(start + blk_off, run_blocks, g_bounce)) return false;
+            if (!wr_block(start + blk_off, run_blocks, g_bounce)) { ok = false; break; }
             off     += copy;
             blk_off += run_blocks;
         }
+        if (!ok) {
+            f->ext_count = 0; f->ext_overflow = 0; f->blocks = 0;   // rollback (blocks leak until next format) (satoru)
+            return false;
+        }
+        f->size = len;
         return true;
     }
 }
@@ -440,11 +476,17 @@ bool KFS::Format(uint32_t total_blocks) {
     if (sb.data_start >= total_blocks) return false;
     sb.free_blocks   = total_blocks - sb.data_start;
 
-    // (re)allocate the in-ram metadata caches. (satoru)
-    if (g_bitmap) KernelHeap::Free(g_bitmap);
-    if (g_inodes) KernelHeap::Free(g_inodes);
-    g_bitmap = (uint8_t*)KernelHeap::Alloc(sb.bitmap_blocks * KFS_BLOCK_SIZE);
-    g_inodes = (uint8_t*)KernelHeap::Alloc(sb.inode_blocks  * KFS_BLOCK_SIZE);
+    // (re)allocate the in-ram metadata caches. pmm-backed, NOT kernel-heap: the
+    // ~36 mb inode table + bitmap were prime targets for the documented stale-
+    // writer class (a use-after-free write landing inside the inode table reads
+    // back as garbage sizes/extents); pmm blocks live off the heap freelist
+    // entirely, out of that blast radius. (satoru)
+    if (g_bitmap) PMM::FreeBytes(g_bitmap, g_bitmap_bytes);
+    if (g_inodes) PMM::FreeBytes(g_inodes, g_inodes_bytes);
+    g_bitmap_bytes = sb.bitmap_blocks * KFS_BLOCK_SIZE;
+    g_inodes_bytes = sb.inode_blocks  * KFS_BLOCK_SIZE;
+    g_bitmap = (uint8_t*)PMM::AllocBytes(g_bitmap_bytes);
+    g_inodes = (uint8_t*)PMM::AllocBytes(g_inodes_bytes);
     if (!g_bitmap || !g_inodes) return false;
     for (uint32_t i = 0; i < sb.bitmap_blocks * KFS_BLOCK_SIZE; i++) g_bitmap[i] = 0;
     for (uint32_t i = 0; i < sb.inode_blocks  * KFS_BLOCK_SIZE; i++) g_inodes[i] = 0;
@@ -534,16 +576,48 @@ bool KFS::Mount() {
     }
     g_sb = *sb;
 
-    if (g_bitmap) KernelHeap::Free(g_bitmap);
-    if (g_inodes) KernelHeap::Free(g_inodes);
-    g_bitmap = (uint8_t*)KernelHeap::Alloc(g_sb.bitmap_blocks * KFS_BLOCK_SIZE);
-    g_inodes = (uint8_t*)KernelHeap::Alloc(g_sb.inode_blocks  * KFS_BLOCK_SIZE);
+    if (g_bitmap) PMM::FreeBytes(g_bitmap, g_bitmap_bytes);
+    if (g_inodes) PMM::FreeBytes(g_inodes, g_inodes_bytes);
+    g_bitmap_bytes = g_sb.bitmap_blocks * KFS_BLOCK_SIZE;
+    g_inodes_bytes = g_sb.inode_blocks  * KFS_BLOCK_SIZE;
+    g_bitmap = (uint8_t*)PMM::AllocBytes(g_bitmap_bytes);
+    g_inodes = (uint8_t*)PMM::AllocBytes(g_inodes_bytes);
     if (!g_bitmap || !g_inodes) return false;
     if (!rd_block(g_sb.bitmap_start, g_sb.bitmap_blocks, g_bitmap)) return false;
     if (!rd_block(g_sb.inode_start,  g_sb.inode_blocks,  g_inodes)) return false;
-    g_next = g_sb.data_start;
+    // start the bump hint PAST the highest used block. it used to reset to
+    // data_start here, and since the bump allocator never consults the bitmap,
+    // ANY write to a mounted (not freshly formatted) volume re-allocated blocks
+    // from data_start - silently overwriting the data of every existing file on
+    // disk. scan the just-loaded bitmap for the high-water mark instead. (satoru)
+    {
+        uint32_t hi = g_sb.data_start;
+        uint32_t bytes = (g_sb.total_blocks + 7u) / 8u;
+        for (uint32_t i = bytes; i > 0; i--) {
+            if (g_bitmap[i - 1] == 0) continue;
+            uint32_t bit = 7;
+            while (bit > 0 && !((g_bitmap[i - 1] >> bit) & 1u)) bit--;
+            hi = (i - 1) * 8u + bit + 1u;
+            break;
+        }
+        if (hi < g_sb.data_start)   hi = g_sb.data_start;
+        if (hi > g_sb.total_blocks) hi = g_sb.total_blocks;
+        g_next = hi;
+    }
     g_mounted = true;
     return true;
+}
+
+void KFS::Unmount() {
+    // drop the in-ram metadata caches - the bitmap + inode table together run
+    // ~36 mb on the 4 gb data disk and were held for the whole session after a
+    // boot restore. callers that WROTE must Sync() first; this only frees.
+    // the next Mount() re-reads everything from disk. (satoru)
+    if (!g_mounted) return;
+    if (g_bitmap) { PMM::FreeBytes(g_bitmap, g_bitmap_bytes); g_bitmap = nullptr; g_bitmap_bytes = 0; }
+    if (g_inodes) { PMM::FreeBytes(g_inodes, g_inodes_bytes); g_inodes = nullptr; g_inodes_bytes = 0; }
+    if (g_bounce) { PMM::FreeBytes(g_bounce, g_bounce_cap); g_bounce = nullptr; g_bounce_cap = 0; }
+    g_mounted = false;
 }
 
 bool KFS::Sync() {

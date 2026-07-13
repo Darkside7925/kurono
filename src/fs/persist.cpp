@@ -313,6 +313,14 @@ namespace {
                 int64_t sz = KFS::FileSize(child);
                 if (sz < 0) { KernelHeap::Free(child); continue; }
                 if (sz == 0) { KVFS::WriteFile(child, "", 0); KernelHeap::Free(child); continue; }
+                // implausible size = corrupt inode; skip loudly instead of a
+                // giant heap alloc + doomed read. (satoru)
+                if (sz > (int64_t)1024 * 1024 * 1024) {
+                    SerialLogger::Log("[persist] RESTORE implausible size, skipped ");
+                    SerialLogger::Log(child);
+                    SerialLogger::Log(" sz="); SerialLogger::LogDec((int)(sz >> 20)); SerialLogger::Log("MB\r\n");
+                    KernelHeap::Free(child); continue;
+                }
                 uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)sz);
                 if (!buf) {   // a silent skip here leaves a restored install incomplete (satoru)
                     SerialLogger::Log("[persist] RESTORE alloc FAIL "); SerialLogger::Log(child);
@@ -382,6 +390,9 @@ bool PersistStore::SaveTree() {
     KFS::SetFingerprint(cur_fp);   // stamp so the next save can short-circuit (satoru)
     bool ok = KFS::Sync();
     if (ok) SerialLogger::Log("[persist] saved kvfs user data to KFS volume (full snapshot)\r\n");
+    // the save is on disk - drop the ~36 mb of in-ram kfs metadata. the next
+    // persist op remounts on demand (kfs_ensure_mounted). (satoru)
+    KFS::Unmount();
     return ok;
 }
 
@@ -424,14 +435,29 @@ bool PersistStore::RestoreApps() {
     uint64_t t1 = Timer::GetRealMs64();
     SerialLogger::Log("[persist] restored /apps from KFS volume in ");
     SerialLogger::LogDec((int)(t1 - t0)); SerialLogger::Log(" ms\r\n");
+    // NOTE: no KFS::Unmount() here - RestoreApps runs on the firefox LAUNCH
+    // path, right before gecko's fragile multi-threaded startup, and freeing
+    // ~36 mb of heap in that window perturbs the flaky SMP bringup. the caches
+    // are released by SaveTree() (post-install) instead; a restored boot keeps
+    // them, which is a bounded one-time cost, not a leak. (satoru)
     return true;
 }
 
+// last HasPersistedFirefox() probe result (-1 = never probed). volatile: the
+// probe runs on boot-init/shell processes, the cached read on the gui. (satoru)
+static volatile int g_ff_persisted_probe = -1;
+
 bool PersistStore::HasPersistedFirefox() {
-    if (!NVMe::IsDetected()) return false;
-    if (!kfs_ensure_mounted()) return false;
+    if (!NVMe::IsDetected()) { g_ff_persisted_probe = 0; return false; }
+    if (!kfs_ensure_mounted()) { g_ff_persisted_probe = 0; return false; }
     // a non-empty firefox binary in the on-disk volume == a reusable install. (satoru)
-    return KFS::Exists("/apps/firefox/firefox") &&
-           KFS::FileSize("/apps/firefox/firefox") > 0;
+    bool have = KFS::Exists("/apps/firefox/firefox") &&
+                KFS::FileSize("/apps/firefox/firefox") > 0;
+    g_ff_persisted_probe = have ? 1 : 0;
+    return have;
+}
+
+bool PersistStore::HasPersistedFirefoxCached() {
+    return g_ff_persisted_probe == 1;
 }
 // end (satoru)
