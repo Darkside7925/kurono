@@ -131,6 +131,32 @@ void ApplyAck(NetSocket* sock, uint32_t ack_seq) {
         return;
     }
 
+    // fast-retransmit (rfc 5681): a pure dup-ack is one that does NOT advance
+    // tx_unacked while we still have unacked data outstanding. count them; on the
+    // 3rd, resend the oldest still-in_use scoreboard segment immediately instead
+    // of waiting for its rto. a NEW ack (advancing) resets the counter. (satoru)
+    if (ack_seq == sock->tx_unacked && sock->tx_seg_inflight > 0) {
+        if (ack_seq != sock->last_ack_seen) { sock->last_ack_seen = ack_seq; sock->dup_ack_cnt = 1; }
+        else if (sock->dup_ack_cnt < 255)   { sock->dup_ack_cnt++; }
+        if (sock->dup_ack_cnt == 3) {
+            // resend the oldest unacked segment on the NEXT TCPTick (same
+            // NetworkProcess loop, ~10ms) rather than its 500ms-4s rto: age its
+            // last_tx_ms past any rto so TCPTick's per-segment check fires it.
+            // (SendTCPPacket is a private TCPStack member; ApplyAck is a free
+            // helper, so we signal via the scoreboard the tick already scans.) (satoru)
+            TxDataSeg* oldest = nullptr;
+            for (int i = 0; i < TCP_SND_WND_SEGS; i++) {
+                TxDataSeg* s = &sock->tx_segs[i];
+                if (!s->in_use) continue;
+                if (!oldest || SeqBefore(s->seq, oldest->seq)) oldest = s;
+            }
+            if (oldest) oldest->last_tx_ms = Timer::GetTicks() - 5000u;   // > max rto -> fires next tick (satoru)
+        }
+        return;   // a dup-ack acks no new data - nothing below to free (satoru)
+    }
+    sock->last_ack_seen = ack_seq;
+    sock->dup_ack_cnt   = 0;
+
     sock->tx_unacked = ack_seq;
     if (sock->tx_pending && !SeqBefore(ack_seq, sock->tx_seq_end)) {
         sock->tx_pending = false;
@@ -684,17 +710,94 @@ void TCPStack::ProcessICMP(const IPv4Header* ip_hdr, const void* data, int len) 
 // the ESTABLISHED and FIN_WAIT half-close states so a peer's data is never
 // dropped after we have sent our own FIN (the http "Connection: close" path).
 // (satoru)
+// push in-order bytes into the rx ring, advancing tcp_ack by what fits.
+// returns bytes accepted. (satoru)
+static int tcp_push_inorder(NetSocket* s, uint32_t seq, const uint8_t* payload, int len) {
+    if (len <= 0) return 0;
+    int space = TCP_RX_BUFSIZE - s->rx_count;
+    int copy = len < space ? len : space;
+    if (copy <= 0) return 0;
+    tcp_ring_push(s, payload, copy);
+    s->tcp_ack = seq + (uint32_t)copy;
+    return copy;
+}
+
+// park an out-of-order segment (seq is AHEAD of tcp_ack) so it can be spliced
+// in later. dedup by exact seq; drop if the pen is full or the segment sits
+// beyond our advertised receive window (a peer that ignores the window). the
+// stored bytes are capped to one segment (TCP_MSS). (satoru)
+static void tcp_park_ooo(NetSocket* s, uint32_t seq, const uint8_t* payload, int len) {
+    if (len <= 0) return;
+    if (len > TCP_MSS) len = TCP_MSS;
+    // must stay within the receive window ahead of tcp_ack, else drop. (satoru)
+    uint32_t ahead = seq - s->tcp_ack;
+    if (ahead >= (uint32_t)TCP_RX_BUFSIZE) return;
+    for (int i = 0; i < TCP_OOO_SEGS; i++) {
+        if (s->ooo_segs[i].in_use && s->ooo_segs[i].seq == seq) return;  // already held (satoru)
+    }
+    for (int i = 0; i < TCP_OOO_SEGS; i++) {
+        if (s->ooo_segs[i].in_use) continue;
+        s->ooo_segs[i].in_use = true;
+        s->ooo_segs[i].seq    = seq;
+        s->ooo_segs[i].len    = len;
+        for (int j = 0; j < len; j++) s->ooo_segs[i].data[j] = payload[j];
+        s->ooo_count++;
+        return;
+    }
+    // pen full: drop (the peer will retransmit; better than clobbering). (satoru)
+}
+
+// after tcp_ack advances, splice any parked segments that now start at (or
+// straddle) tcp_ack, looping until nothing contiguous remains. (satoru)
+static void tcp_drain_ooo(NetSocket* s) {
+    bool progress = true;
+    while (progress && s->ooo_count > 0) {
+        progress = false;
+        for (int i = 0; i < TCP_OOO_SEGS; i++) {
+            TcpOooSeg* o = &s->ooo_segs[i];
+            if (!o->in_use) continue;
+            uint32_t end = o->seq + (uint32_t)o->len;
+            // wholly-old (already consumed): free it. (satoru)
+            if (!SeqBefore(s->tcp_ack, end)) {
+                o->in_use = false; s->ooo_count--; progress = true; continue;
+            }
+            // contiguous or overlapping the front of the gap: splice the new
+            // tail (skip bytes at/behind tcp_ack). (satoru)
+            if (!SeqAfter(o->seq, s->tcp_ack)) {
+                uint32_t skip = s->tcp_ack - o->seq;   // bytes already consumed (satoru)
+                if ((int)skip < o->len) {
+                    tcp_push_inorder(s, s->tcp_ack, o->data + skip, o->len - (int)skip);
+                }
+                o->in_use = false; s->ooo_count--; progress = true;
+            }
+        }
+    }
+}
+
+// accept a received tcp payload with FULL out-of-order reassembly. in-order
+// bytes go straight to the rx ring (then any parked segments that now fit are
+// spliced in); future bytes are parked; past bytes (duplicates) just ack.
+// returns bytes delivered in-order; sets *ack_needed whenever data arrived
+// (an out-of-order/dup segment still needs an immediate ack so the peer fast-
+// retransmits the gap). shared by ESTABLISHED + the FIN_WAIT half-close so a
+// peer's data is never dropped. (satoru)
 static int tcp_accept_rx_data(NetSocket* s, uint32_t their_seq,
                               const uint8_t* payload, int payload_len,
                               bool* ack_needed) {
     if (payload_len <= 0) return 0;
     *ack_needed = true;
-    if (their_seq != s->tcp_ack) return 0;  // out-of-order/dup: ack, don't buffer
-    int space = TCP_RX_BUFSIZE - s->rx_count;
-    int copy = payload_len < space ? payload_len : space;
-    tcp_ring_push(s, payload, copy);
-    s->tcp_ack = their_seq + (uint32_t)copy;
-    return copy;
+    if (their_seq == s->tcp_ack) {
+        int copy = tcp_push_inorder(s, their_seq, payload, payload_len);
+        tcp_drain_ooo(s);
+        return copy;
+    }
+    if (SeqAfter(their_seq, s->tcp_ack)) {
+        // future data (gap before it): park for reassembly, ack the gap. (satoru)
+        tcp_park_ooo(s, their_seq, payload, payload_len);
+        return 0;
+    }
+    // wholly-old duplicate (their_seq before tcp_ack): ack only. (satoru)
+    return 0;
 }
 
 // parse the tcp options area of a received syn/syn-ack for the rfc 1323 window
@@ -901,19 +1004,11 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
                 bool ack_needed = false;
                 int accepted_data = 0;
                 if (tcp_data_len > 0) {
-                    if (their_seq == sock->tcp_ack) {
-                        int space = TCP_RX_BUFSIZE - sock->rx_count;
-                        int copy = tcp_data_len < space ? tcp_data_len : space;
-                        tcp_ring_push(sock, tcp_data, copy);
-                        sock->tcp_ack = their_seq + (uint32_t)copy;
-                        accepted_data = copy;
-                        ack_needed = true;
-                    } else {
-                        // Out-of-order or duplicate - send a duplicate ACK
-                        // so the peer fast-retransmits. Do not advance
-                        // tcp_ack; do not buffer (no reassembly window).
-                        ack_needed = true;
-                    }
+                    // full reassembly: in-order data is buffered + drains any
+                    // parked out-of-order segments; future data is parked;
+                    // duplicates just ack. (satoru)
+                    accepted_data = tcp_accept_rx_data(sock, their_seq, tcp_data,
+                                                       tcp_data_len, &ack_needed);
                 }
                 if (tcp->flags & TCP_FLAG_ACK) {
                     ApplyAck(sock, their_ack);

@@ -240,6 +240,14 @@ struct NetSocket {
     TxDataSeg tx_segs[TCP_SND_WND_SEGS];
     int       tx_seg_inflight;   // count of in_use scoreboard slots (satoru)
 
+    // fast-retransmit (rfc 5681): the peer re-acks the same seq on every
+    // out-of-order segment it receives, so 3 dup-acks = a segment was lost
+    // WITHOUT waiting the ~500ms-4s rto. count consecutive dup-acks and, on the
+    // third, resend the oldest unacked scoreboard segment at once. this is the
+    // difference between a stalled and a smooth https transfer under any loss. (satoru)
+    uint32_t  last_ack_seen;     // the ack seq we are counting dups against (satoru)
+    uint8_t   dup_ack_cnt;       // consecutive dup-acks for last_ack_seen (satoru)
+
     // out-of-order reassembly holding pen: segments received ahead of tcp_ack
     // are parked here and spliced into the rx ring as the preceding gap fills.
     // (satoru)
