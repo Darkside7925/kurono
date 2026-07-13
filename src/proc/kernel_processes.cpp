@@ -19,6 +19,7 @@
 #include "../drivers/mouse.h"
 #include "../drivers/audio.h"
 #include "../drivers/audio_server.h"
+#include "../drivers/pulse_server.h"
 #include "../drivers/ac97.h"
 #include "../drivers/graphics.h"
 #include "../drivers/display_mgr.h"
@@ -30,11 +31,13 @@
 #include "../system/logging.h"
 #include "../ui/desktop.h"
 #include "../ui/window_manager.h"
+#include "../ui/wayland_server.h"   // route scroll to the surface under the pointer (satoru)
 #include "../ui/gui.h"   // GUI::UpdateBackbuffer for the resolution-change relayout (satoru)
 #include "../ui/perf_hud.h"
 #include "../ui/lockscreen.h"
 #include "../system/user_mgmt.h"
 #include "../apps/terminal.h"
+#include "../shell/shell.h"   // KuronoShell::Execute for detached desktop launches (satoru)
 #include "../apps/task_manager.h"
 #include "../apps/settings.h"
 #include "../ui/control_center.h"
@@ -66,6 +69,15 @@ volatile bool  g_ksa_prompt_demo_cred  = false;
 // on-screen animation (an eased accent transition) is driven through the kj host
 // bindings rather than c++. (satoru)
 volatile bool  g_kj_demo_armed = false;
+// detached shell command slot: written by desktop launchers on the gui
+// process, drained by the shell process below - no terminal window involved.
+// single slot on purpose: the shell process runs one command at a time, and a
+// second desktop launch while one is in flight should be refused, not queued
+// behind a possibly minutes-long install. (satoru)
+constexpr int  DETACHED_CMD_MAX = 256;
+char           g_detached_cmd[DETACHED_CMD_MAX] = {};
+volatile bool  g_detached_armed   = false;
+volatile bool  g_detached_running = false;
 }
 
 void ArmKsaPromptDemo(bool want_cred) {
@@ -74,6 +86,21 @@ void ArmKsaPromptDemo(bool want_cred) {
 }
 
 void ArmKjDemo() { g_kj_demo_armed = true; }
+
+uint32_t LastGuiFrameMs() { return g_last_frame_ms; }
+
+bool RunShellCommandDetached(const char* cmd) {
+    if (!cmd || !cmd[0]) return false;
+    if (g_detached_armed || g_detached_running) return false;
+    int i = 0;
+    while (cmd[i] && i < DETACHED_CMD_MAX - 1) {
+        g_detached_cmd[i] = cmd[i];
+        i++;
+    }
+    g_detached_cmd[i] = 0;
+    g_detached_armed = true;
+    return true;
+}
 
 void SetGuiAutorun(const char* cmd) {
     if (!cmd) {
@@ -131,17 +158,36 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
 [[noreturn]] static void AudioProcessEntry() {
     SerialLogger::Log("[AudioProcess] online\r\n");
     while (true) {
-        {
-            SpinLockCpuGuard guard(g_audio_lock);
-            // AudioServer::Tick() already pumps the ACTIVE backend (it calls
-            // be->Tick() via the mixer), so the direct AC97::Tick()/Audio::Tick()
-            // were redundant per-tick MMIO/PIO (extra VM-exits on VMware) - dropped.
-            AudioServer::Tick();
-        }
-        // 10ms: the mixer period is ~21ms (1024 frames @ 48kHz) with a ~170ms
-        // back-pressure buffer, so 4ms was ~4x over-polling - pure wakeups/exits
-        // that kept the cpu from ever idling (HLT) on VMware. (satoru)
+        // LockedTick owns the audio pump lock (shared with the pit backup
+        // pump + the syscall-context stream writers); the old local
+        // g_audio_lock guarded only this loop and left pulse writes racing
+        // the mixer from other cpus. (satoru)
+        AudioServer::LockedTick();
+        // pace pulse clients AFTER the pump: send REQUEST for the bytes the
+        // mixer just consumed so firefox keeps streaming (process context
+        // only - it injects into client sockets). (satoru)
+        PulseServer::Pace();
+        // 10ms: the mixer period is ~21ms (1024 frames @ 48kHz); the pit
+        // backup pump covers any gap past ~15ms, so this cadence is ample. (satoru)
         Scheduler::SleepMs(10);
+    }
+}
+
+// ── Timekeeper process: the wallclock as its own service (REALTIME) ────
+//
+//   ws1 service separation: TimeManager::AdvanceByMs used to be everyone's
+//   side job (the gui loop, PumpUI at every syscall, each blocking wait) -
+//   so editing any of those could stall the clock that ping/dns/timeouts
+//   read. this tiny process owns it instead. Timer::ElapsedSinceLast is a
+//   shared stateful baseline, so the remaining callers PARTITION the real
+//   delta with us rather than double-count: time now provably advances even
+//   if every pump is gated, and the gui/PumpUI advancing it too stays safe. (satoru)
+[[noreturn]] static void TimekeeperProcessEntry() {
+    SerialLogger::Log("[TimekeeperProcess] online\r\n");
+    while (true) {
+        uint32_t e = Timer::ElapsedSinceLast();
+        if (e > 0) TimeManager::AdvanceByMs(e);
+        Scheduler::SleepMs(5);   // 200hz clock service; the irq keeps sub-ms ticks (satoru)
     }
 }
 
@@ -192,6 +238,25 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     SerialLogger::Log("[ShellProcess] online\r\n");
     while (true) {
         TerminalApp::Tick();
+        // detached command (desktop launchers): same worker, no terminal.
+        // output is serial-only - the desktop app owns its own feedback
+        // (toast + the launched window itself). (satoru)
+        if (g_detached_armed) {
+            g_detached_armed   = false;
+            g_detached_running = true;
+            SerialLogger::Log("[detached] ");
+            SerialLogger::Log(g_detached_cmd);
+            SerialLogger::Log("\r\n");
+            static char dout[2048];
+            dout[0] = 0;
+            KuronoShell::Execute(g_detached_cmd, dout, (int)sizeof(dout));
+            if (dout[0]) {
+                SerialLogger::Log("[detached] output: ");
+                SerialLogger::Log(dout);
+                SerialLogger::Log("\r\n");
+            }
+            g_detached_running = false;
+        }
         Scheduler::SleepMs(25);   // drains an almost-always-empty command queue; 2ms was 500 idle wakeups/sec (satoru)
     }
 }
@@ -276,6 +341,22 @@ static inline bool ui_activity_active() {
             SettingsApp::PollDeferredActions();
         }
 
+        // Poll the input devices from THIS process too, not just the dedicated
+        // InputProcess. under a running firefox (4 userland threads pinned
+        // across the aps + apthreads) the cooperative InputProcess gets starved
+        // - measured: Mouse::Poll ran ONCE then never again, so the scroll wheel
+        // (and any device state the gui reads straight from Mouse::) went dead
+        // while the browser was up. the gui process is the one kernel process
+        // that demonstrably keeps getting scheduled (it paints firefox), so
+        // polling here guarantees device servicing regardless of InputProcess
+        // starvation. share g_input_lock so the two pollers never reenter the
+        // 8042 / backdoor mid-transaction on different cores. (satoru)
+        {
+            SpinLockCpuGuard guard(g_input_lock);
+            Keyboard::Poll();
+            Mouse::Poll();
+        }
+
         // Track cursor movement: any pointer motion marks the UI dirty so the
         // cursor stays responsive even on an otherwise static screen. (satoru)
         static int last_mx = -1, last_my = -1;
@@ -307,13 +388,22 @@ static inline bool ui_activity_active() {
         while (Keyboard::HasChar()) {
             kb_char = Keyboard::GetChar();
             Graphics::MarkUIDirty();
-            DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, false, false, kb_char);
+            // pass the REAL held button state, NOT false: HandleInput edge-
+            // detects mouse_down to forward wl_pointer button press/release, so
+            // a keyboard-drain call with a hardcoded false fired a spurious
+            // RELEASE mid-hold, then the next frame re-fired a DOWN = a single
+            // physical click delivered to firefox as a DOUBLE click (which on
+            // the tab strip opens a new tab). (satoru)
+            DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, Mouse::IsLeftDown(), false, kb_char);
         }
 
         if (scroll_delta != 0) {
             Graphics::MarkUIDirty();
+            // scroll goes to the surface under the pointer (see the matching
+            // note in KuronoShell::PumpUI). (satoru)
+            WaylandServer::ForwardPointerAxis(Mouse::mx, Mouse::my, 0, scroll_delta * 32);
             Window* fw = WindowManager::GetFocusedWindow();
-            if (fw && fw->input) {
+            if (fw && fw->input && !WaylandServer::IsWaylandWindow(fw->id)) {
                 fw->input(fw, 3, scroll_delta, 0);
             }
         }
@@ -325,9 +415,16 @@ static inline bool ui_activity_active() {
             const char* cmd = g_gui_autorun_cmd;
             bool open_taskmgr = (cmd[0]=='@' && cmd[1]=='t' && cmd[2]=='a' && cmd[3]=='s' &&
                                  cmd[4]=='k' && cmd[5]=='m' && cmd[6]=='g' && cmd[7]=='r' && cmd[8]==0);
+            // sentinel "@firefox": launch through the desktop's detached path
+            // (no terminal window) - the same flow the desktop icon uses. (satoru)
+            bool open_firefox = (cmd[0]=='@' && cmd[1]=='f' && cmd[2]=='i' && cmd[3]=='r' &&
+                                 cmd[4]=='e' && cmd[5]=='f' && cmd[6]=='o' && cmd[7]=='x' && cmd[8]==0);
             if (open_taskmgr) {
                 SerialLogger::Log("[gui-autorun] launching task manager\r\n");
                 DesktopEnvironment::LaunchTaskManager();
+            } else if (open_firefox) {
+                SerialLogger::Log("[gui-autorun] launching firefox (detached, no terminal)\r\n");
+                DesktopEnvironment::LaunchFirefox();
             } else {
                 SerialLogger::Log("[gui-autorun] launching terminal + queuing: ");
                 SerialLogger::Log(g_gui_autorun_cmd);
@@ -537,6 +634,8 @@ static inline bool ui_activity_active() {
 int SpawnAll() {
     // Order matters: REALTIME first so it wins ties on tier scan.
     int created = 0;
+    if (Scheduler::SpawnKernelProcess("timekeeper", TimekeeperProcessEntry,
+                                      PRIO_REALTIME, 64, 1024)) created++;
     if (Scheduler::SpawnKernelProcess("scheduler", SchedulerProcessEntry,
                                       PRIO_REALTIME, 64, 1024)) created++;
     if (Scheduler::SpawnKernelProcess("network",   NetworkProcessEntry,

@@ -87,29 +87,39 @@ static int  g_resume_us_exit[SMP_MAX_CPUS]       = {};
 // handler re-enters this layer. spins with IF untouched so the tlb-shootdown
 // ipi and timer keep being serviceable where the caller had IF=1. on a single
 // active core the lock is always uncontended. (satoru)
+// single-word lock state: 0 = free, else owner cpu index + 1. ownership and
+// the lock bit MUST be one atomic word: the old separate g_kls_owner had a
+// two-store unlock (owner=-1, then word=0) and a captured stall snapshot
+// showed the fallout - the unlocker preempted between the two stores leaves
+// word=1/owner=-1, which matches NO cpu, so all four cores spun in kls_lock
+// forever (the #PF-path spinners with IF=0) while the descheduled unlocker
+// could never be run again = the whole-box bringup wedge. with owner packed
+// into the word there is no torn window: the lock is either free or visibly
+// owned, and the recursion test is a single load. (satoru)
 static volatile uint32_t g_kls_word  = 0;
-static volatile int      g_kls_owner = -1;
 static int               g_kls_depth[SMP_MAX_CPUS] = {};
 
 static void kls_lock() {
-    int cpu = (int)SMP::CpuIndex();
-    if (g_kls_owner == cpu) { g_kls_depth[cpu]++; return; }
+    uint32_t cpu = SMP::CpuIndex();
+    if (cpu >= SMP_MAX_CPUS) cpu = 0;
+    uint32_t me = cpu + 1u;
+    if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) == me) { g_kls_depth[cpu]++; return; }
     for (;;) {
         uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(&g_kls_word, &expected, 1u, false,
+        if (__atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
         do { __asm__ __volatile__("pause" ::: "memory"); }
         while (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != 0);
     }
-    g_kls_owner = cpu;
     g_kls_depth[cpu] = 1;
 }
 
 static void kls_unlock() {
-    int cpu = (int)SMP::CpuIndex();
-    if (g_kls_owner != cpu) return;                 // never taken (bsp boot paths) (satoru)
+    uint32_t cpu = SMP::CpuIndex();
+    if (cpu >= SMP_MAX_CPUS) cpu = 0;
+    uint32_t me = cpu + 1u;
+    if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != me) return;  // never taken (bsp boot paths) (satoru)
     if (--g_kls_depth[cpu] > 0) return;             // recursive hold (satoru)
-    g_kls_owner = -1;
     __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
 }
 
@@ -118,23 +128,23 @@ static void kls_unlock() {
 // lock across a spin-until-ready loop would starve every other core's syscalls
 // (and on an ap there is no PumpUI/SleepMs to yield into). (satoru)
 static void kls_relax() {
-    int cpu = (int)SMP::CpuIndex();
-    if (g_kls_owner != cpu) {
+    uint32_t cpu = SMP::CpuIndex();
+    if (cpu >= SMP_MAX_CPUS) cpu = 0;
+    uint32_t me = cpu + 1u;
+    if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != me) {
         __asm__ __volatile__("pause" ::: "memory");
         return;
     }
     int depth = g_kls_depth[cpu];
-    g_kls_owner = -1;
     __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
     for (int i = 0; i < 128; i++) __asm__ __volatile__("pause" ::: "memory");
     for (;;) {
         uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(&g_kls_word, &expected, 1u, false,
+        if (__atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
         do { __asm__ __volatile__("pause" ::: "memory"); }
         while (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != 0);
     }
-    g_kls_owner = cpu;
     g_kls_depth[cpu] = depth;
 }
 
@@ -417,6 +427,7 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
 // cpu to a sibling user thread. (satoru)
 static bool switch_to_ready_user(InterruptFrame* frame);
 static void futex_sweep_timeouts();   // release timed-out futex waiters (satoru)
+static inline bool wake_blocked_to_ready(Process* t);   // atomic Blocked->Ready (satoru)
 
 // deschedule a user thread that is about to block in poll/ppoll: rewind its saved
 // user frame to RE-RUN the syscall on wake, mark it Blocked with a short
@@ -1396,19 +1407,11 @@ static void wake_waiting_parent(LinuxProcess* child, int child_index) {
     parent_task->waiting_for_child = false;
     parent_task->waiting_child_pid = 0;
     parent_task->waiting_status_ptr = 0;
-    {
-        // multicore: defer the ready-promotion to the next timer tick
-        // (OnTimerTick, under the sched lock) so another core cannot claim +
-        // run this task while the cpu that blocked it is still unwinding on its
-        // kernel stack (pre-iretq). single-core keeps the old immediate wake.
-        // single-owner: transition under g_sched_lock. (satoru)
-        uint64_t sf; Scheduler::StateLock(&sf);
-        if (parent_task->state == Process_Blocked) {
-            if (SMP::OnlineCount() > 1) parent_task->sleep_ticks = 1;
-            else parent_task->state = Process_Ready;
-        }
-        Scheduler::StateUnlock(sf);
-    }
+    // atomic Blocked->Ready (see wake_blocked_to_ready): the cpu that blocked
+    // the parent may still be unwinding, but on_cpu (not a deferral tick) is
+    // what gates a cross-cpu resume until its frame is released, so the wake
+    // can be immediate. (satoru)
+    if (wake_blocked_to_ready(parent_task)) parent_task->sleep_ticks = 0;
 
     Scheduler::ReapProcess(child->task);
     child->task = nullptr;
@@ -1495,6 +1498,26 @@ struct FutexWaiter {
                             // *uaddr and re-waits (lost-wake self-heal). (satoru)
 };
 FutexWaiter g_futex_waiters[FUTEX_MAX_WAITERS];  // (satoru) non-static: gdb-visible for wait-graph dump
+
+// atomically transition a task Blocked -> Ready. this is the SINGLE-OWNER-STATE
+// fix (the "light CAS" the notes prescribe): the wake path and the scheduler
+// live in two different lock domains (g_futex_lock vs g_sched_lock), so a wake
+// that merely READ state==Blocked could act on a task the scheduler had already
+// picked (set Running) - "spending" a wake on a non-blocked task and starving a
+// genuinely blocked sibling. that lost wake is the herd/bringup STALL. the CAS
+// makes the wake take effect ONLY if the task is still truly Blocked; if it
+// lost the race (already Running/Ready) the caller must NOT consume the wake,
+// so it flows to a real blocked waiter. returns true iff this call performed
+// the transition. immediate (no sleep_ticks deferral): on_cpu already stops a
+// cross-cpu resume before the owning cpu released the frame, so there is no
+// need to also delay the state flip a tick. (satoru)
+static inline bool wake_blocked_to_ready(Process* t) {
+    if (!t) return false;
+    int expect = (int)Process_Blocked;
+    return __atomic_compare_exchange_n((int*)&t->state, &expect,
+                                       (int)Process_Ready, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
 
 // translate a user futex VA to a stable cross-process key: the physical
 // page|offset backing it. two processes that MAP_SHARED the same object see the
@@ -1626,22 +1649,29 @@ static int futex_do_wake(uint64_t addr_space, uintptr_t uaddr, uint64_t phys_key
         if ((w->bitset & want) == 0) continue;
 
         if (w->task) {
-            w->task->user_frame.rax = 0;   // futex() returns 0 to the waiter
-            // single-owner: read state + write sleep_ticks/state under g_sched_lock
-            // (nested in g_futex_lock). the Blocked check and the promotion must be
-            // atomic vs the scheduler, or a task that just descheduled reads stale. (satoru)
-            uint64_t sf; Scheduler::StateLock(&sf);
-            if (w->task->state == Process_Blocked) {
-                // multicore: deferred promotion (see wake_waiting_parent);
-                // single-core wakes immediately as before. (satoru)
-                if (SMP::OnlineCount() > 1) w->task->sleep_ticks = 1;
-                else w->task->state = Process_Ready;
+            // atomic CAS Blocked->Ready. if it FAILS the task wasn't blocked
+            // (the scheduler already picked it / another waker got it), so this
+            // wake must NOT be spent here - leave the slot for a genuinely
+            // blocked waiter and move on. only a successful transition consumes
+            // the wake + retires the slot. this is the lost-wake fix that was
+            // the herd/bringup stall. (satoru)
+            if (wake_blocked_to_ready(w->task)) {
+                w->task->user_frame.rax = 0;   // futex() returns 0 to the waiter
+                w->task->sleep_ticks = 0;      // cancel any stale deferred tick (satoru)
+                w->active = false;
+                w->task   = nullptr;
+                woken++;
             }
-            Scheduler::StateUnlock(sf);
+            // CAS failed: task not Blocked. it is on its way to running anyway
+            // (a raced wake already took it), so retire the slot without
+            // counting - it is effectively already awake. (satoru)
+            else {
+                w->active = false;
+                w->task   = nullptr;
+            }
+        } else {
+            w->active = false;
         }
-        w->active = false;
-        w->task   = nullptr;
-        woken++;
     }
     return woken;
 }
@@ -1666,14 +1696,9 @@ static void futex_sweep_timeouts() {
             // re-tests *uaddr + re-waits; real timed waits get -ETIMEDOUT so poll /
             // pthread_cond_timedwait see their timeout. (satoru)
             w->task->user_frame.rax = w->repoll ? 0 : (uint64_t)(int64_t)(-110);
-            // deferred promotion (multicore) - see futex_do_wake. single-owner:
-            // nest g_sched_lock (inside the held g_futex_lock) for the transition. (satoru)
-            uint64_t sf; Scheduler::StateLock(&sf);
-            if (w->task->state == Process_Blocked) {
-                if (SMP::OnlineCount() > 1) w->task->sleep_ticks = 1;
-                else w->task->state = Process_Ready;
-            }
-            Scheduler::StateUnlock(sf);
+            // atomic Blocked->Ready (see wake_blocked_to_ready): immediate, and
+            // it no-ops harmlessly if the task is already runnable. (satoru)
+            if (wake_blocked_to_ready(w->task)) w->task->sleep_ticks = 0;
         }
         w->active = false;
         w->task   = nullptr;
@@ -1711,14 +1736,7 @@ static bool vfork_wake_parent(Process* child) {
             Process* p = g_vfork_links[i].parent;
             // deferred promotion (multicore) - see futex_do_wake. single-owner
             // state transition under g_sched_lock. (satoru)
-            if (p) {
-                uint64_t sf; Scheduler::StateLock(&sf);
-                if (p->state == Process_Blocked) {
-                    if (SMP::OnlineCount() > 1) p->sleep_ticks = 1;
-                    else p->state = Process_Ready;
-                }
-                Scheduler::StateUnlock(sf);
-            }
+            if (p && wake_blocked_to_ready(p)) p->sleep_ticks = 0;   // atomic (satoru)
             g_vfork_links[i].active = false;
             return true;
         }
@@ -2137,6 +2155,32 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
         // Standard COW path first.
         if (handle_cow_fault(task, page_base, page_flags, frame)) return true;
 
+        // pte-authoritative stale-tlb retry: if the LIVE pte already permits
+        // exactly this access (user + writable for a write), the mapping is
+        // fine and the fault can only be this core's stale tlb entry - retry
+        // after invlpg even when find_region says nothing (the region table
+        // is mutated by sibling threads' mmap/munmap on other cores and can
+        // transiently miss an address whose pte is long since valid; observed
+        // as a fatal ring-3 present-write #PF err=0x7 on an AP that killed
+        // the boot). bounded per-cpu so a genuinely wrong pte still goes
+        // fatal instead of looping. (satoru)
+        if ((frame->error_code & PFERR_USER) && (page_flags & PTE_USER) &&
+            (!(frame->error_code & PFERR_WRITE) || (page_flags & PTE_WRITABLE))) {
+            static uint64_t s_pf_retry_va[SMP_MAX_CPUS];
+            static uint32_t s_pf_retry_n[SMP_MAX_CPUS];
+            uint32_t rcpu = SMP::CpuIndex();
+            if (rcpu >= SMP_MAX_CPUS) rcpu = 0;
+            if (s_pf_retry_va[rcpu] != page_base) {
+                s_pf_retry_va[rcpu] = page_base;
+                s_pf_retry_n[rcpu]  = 0;
+            }
+            if (s_pf_retry_n[rcpu]++ < 8) {
+                KernelVMM::InvalidatePage(page_base);
+                if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame);
+                return true;
+            }
+        }
+
         // Otherwise: a user-mode access hit a present mapping that
         // didn't have PTE_USER set (typically the kernel identity map
         // covering the brk/mmap window in low physical memory).  If we
@@ -2144,7 +2188,14 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
         // by unmapping the supervisor PTE and falling through to the
         // demand-zero allocator below.
         UserMemoryRegion* r = find_region(task, frame->cr2);
-        if (!r) return false;
+        if (!r) {
+            // fatal refusal: say WHY on the way out so the [RAWEXC] boots
+            // self-identify (no region vs region-not-writable). (satoru)
+            SerialLogger::Log("[pfref] present fault, no region. pteflags=");
+            SerialLogger::LogHex((uint32_t)page_flags);
+            SerialLogger::Log("\r\n");
+            return false;
+        }
         if (!(page_flags & PTE_USER)) {
             KernelVMM::UnmapPageInAddressSpace(task->address_space, page_base, false);
             KernelVMM::InvalidatePage(page_base);
@@ -2166,6 +2217,11 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
             if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame);
             return true;
         }
+        SerialLogger::Log("[pfref] present fault refused. pteflags=");
+        SerialLogger::LogHex((uint32_t)page_flags);
+        SerialLogger::Log(" regflags=");
+        SerialLogger::LogHex((uint32_t)r->page_flags);
+        SerialLogger::Log("\r\n");
         return false;
     }
 
@@ -6464,14 +6520,6 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
         }
     }
 
-    // (satoru) [enoent] probe: firefox's chrome JS throws a repeated "I/O error NotFound"
-    // that stalls the chrome doc render (black window). log the missing path for firefox
-    // pids so we can supply the file. remove before commit.
-    if (p->pid >= 100 && p->pid < 140) {
-        SerialLogger::Log("[enoent] pid="); SerialLogger::LogDec((int)p->pid);
-        SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)flags);
-        SerialLogger::Log(" "); SerialLogger::Log(resolved); SerialLogger::Log("\r\n");
-    }
     return -2;  // enoent
 }
 
@@ -7104,24 +7152,6 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
         // straight into the caller so writes are shared (wl_shm pixel pools,
         // posix shm). (satoru)
         LinuxShmObj* shm = shm_for_fd(proc, fd);
-        // (satoru) [ssm] probe: the SharedStringMap crash = an fd-backed mmap that
-        // returns MAP_FAILED. log fd-map attempts for firefox pids with the shm
-        // resolution + fd type so the failing case (null shm / base0 / size / type)
-        // is visible. remove before commit.
-        if (proc->pid >= 100 && proc->pid < 140) {
-            LinuxFd* pf = (fd < LINUX_MAX_FDS) ? &proc->fds[fd] : nullptr;
-            SerialLogger::Log("[ssm] pid="); SerialLogger::LogDec((int)proc->pid);
-            SerialLogger::Log(" fd="); SerialLogger::LogDec(fd);
-            SerialLogger::Log(" type="); SerialLogger::LogDec(pf ? (int)pf->type : -1);
-            SerialLogger::Log(" prot="); SerialLogger::LogDec((int)prot);
-            SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)flags);
-            SerialLogger::Log(" off="); SerialLogger::LogHex((uint32_t)offset);
-            SerialLogger::Log(" len="); SerialLogger::LogHex((uint32_t)length);
-            SerialLogger::Log(" shm="); SerialLogger::LogHex((uint32_t)(uintptr_t)shm);
-            SerialLogger::Log(" base="); SerialLogger::LogHex((uint32_t)(uintptr_t)(shm?shm->base:0));
-            SerialLogger::Log(" ssz="); SerialLogger::LogHex((uint32_t)(shm?shm->size:0));
-            SerialLogger::Log("\r\n");
-        }
         if (shm && shm->base) {
             uint64_t msize = align_up_u64(length, PAGE_SIZE);
             // (satoru) THE SharedStringMap CRASH: shm->size is the exact ftruncate
@@ -7134,7 +7164,7 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             // (what actually exists); the tail page past shm->size is zero-filled. this
             // is the real, deterministic fix - the "race" was just the frozen memfd's
             // byte size happening to land on a page boundary on lucky runs. (satoru)
-            if (offset + msize > align_up_u64(shm->size, PAGE_SIZE)) { if (proc->pid>=100&&proc->pid<140) SerialLogger::Log("[ssm] -> ESIZE\r\n"); return -22; }
+            if (offset + msize > align_up_u64(shm->size, PAGE_SIZE)) return -22;
             uint64_t vbase = choose_mmap_base(task, addr, msize);
             if (!vbase) return -12;
             uint64_t pflags = page_flags_from_prot(prot);
@@ -7230,7 +7260,6 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             return (int64_t)vbase;
         }
 
-        if (proc->pid>=100&&proc->pid<140) SerialLogger::Log("[ssm] -> ENOTMMAP(-38)\r\n");
         return -38;   // other fd types are not mmappable
     }
 
@@ -7403,17 +7432,13 @@ int32_t LinuxSyscall::sys_madvise(uintptr_t addr, uint64_t length, uint32_t advi
 // the tlb. nx is handled by page_flags_from_prot: PROT_EXEC clears PTE_NX,
 // PROT_WRITE without PROT_EXEC sets it, and efer.nxe enforces it. (satoru)
 int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t prot) {
-    // (satoru) TEMP [bigprot]: trace mprotect inside the rlbox 16gb reservations
-    // (bases ~0x1exx_xxxxxxxx). gated off - 350 lines/run of serial drag in the
-    // mprotect path (which the jit hammers). remove before commit.
-    bool bigprot = false && ((uint64_t)addr >> 44) == 0x1;
-    if (bigprot) {
-        SerialLogger::Log("[bigprot] a="); SerialLogger::LogHex((uint32_t)((uint64_t)addr >> 32));
-        SerialLogger::Log(":"); SerialLogger::LogHex((uint32_t)addr);
-        SerialLogger::Log(" len="); SerialLogger::LogHex((uint32_t)length);
-        SerialLogger::Log(" prot="); SerialLogger::LogDec((int)prot);
-        SerialLogger::Log("\r\n");
-    }
+    // NOTE (ws4): the RW->RX transition here is already W^X-correct - the pte
+    // flip below sets/clears PTE_NX via page_flags_from_prot (PROT_EXEC clears
+    // NX), and SMP::BroadcastTlbFlush() is SYNCHRONOUS (it spins until every
+    // online peer acks, smp.cpp), so no core can instruction-fetch a stale
+    // writable/NX translation of freshly-jitted code. the residual firefox JIT
+    // crash (rip 0x1800...) is therefore NOT a kernel shootdown-timing bug; it
+    // is gecko-internal codegen/W^X coherency (the memfd dual-map path). (satoru)
     if (length == 0) return 0;
 
     LinuxProcess* proc = Current();
@@ -7519,10 +7544,8 @@ int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t pro
     // protection.) only reject when the range overlaps NO region AND maps no
     // live page at all -> genuinely unmapped -> enomem per posix. (satoru)
     if (!covered_any && !mapped_any) {
-        if (bigprot) SerialLogger::Log("[bigprot] -> ENOMEM\r\n");   // TEMP (satoru)
         return -12;
     }
-    if (bigprot) SerialLogger::Log("[bigprot] -> 0 ok\r\n");         // TEMP (satoru)
     return 0;
 }
 

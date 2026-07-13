@@ -8,7 +8,9 @@
 #include "../kernel/heap.h"          // per-surface shadow buffers (satoru)
 #include "../drivers/timer.h"        // pit-tick ms timestamps for frame cbs (satoru)
 #include "window_manager.h"          // bridge surfaces to wm windows (satoru)
+#include "app_icons.h"               // per-app window logo ids (satoru)
 #include "../drivers/keyboard.h"     // Key enum -> linux evdev keycode map (satoru)
+#include "../drivers/mouse.h"        // live pointer pos for the scroll thunk (satoru)
 
 namespace {
 
@@ -76,6 +78,12 @@ inline void clear_obj_ext(Object& o) {
     o.shadow_h      = 0;
     o.shadow_fmt    = 0;
     o.shadow_filled = false;
+    o.title[0]      = 0;
+    o.app_icon_hint = 0xFF;
+    o.geo_x = 0; o.geo_y = 0;
+    o.geo_w = 0; o.geo_h = 0;
+    o.input_none      = false;
+    o.region_has_rect = false;
 }
 
 void reset_client_state(Client* c, int sd) {
@@ -92,6 +100,12 @@ void reset_client_state(Client* c, int sd) {
     // input resources / focus start empty. (satoru)
     c->pointer_id          = 0;
     c->keyboard_id         = 0;
+    c->pointer_id_count    = 0;
+    c->keyboard_id_count   = 0;
+    for (int i = 0; i < Client::WL_MAX_INPUT_RES; i++) {
+        c->pointer_ids[i]  = 0;
+        c->keyboard_ids[i] = 0;
+    }
     c->pointer_focus_sid   = 0;
     c->keyboard_focus_sid  = 0;
     // Object id 1 = wl_display, always live.
@@ -211,9 +225,22 @@ void destroy_obj(Client* c, uint32_t id) {
         if (c->pointer_focus_sid  == id) c->pointer_focus_sid  = 0;
         if (c->keyboard_focus_sid == id) c->keyboard_focus_sid = 0;
     }
-    // a destroyed wl_pointer/wl_keyboard clears the client's handle. (satoru)
-    if (o.iface == WL_POINTER  && c->pointer_id  == id) c->pointer_id  = 0;
-    if (o.iface == WL_KEYBOARD && c->keyboard_id == id) c->keyboard_id = 0;
+    // a destroyed wl_pointer/wl_keyboard is removed from the broadcast list
+    // (and the legacy first-slot alias refreshed). (satoru)
+    if (o.iface == WL_POINTER) {
+        int w = 0;
+        for (int i = 0; i < c->pointer_id_count; i++)
+            if (c->pointer_ids[i] != id) c->pointer_ids[w++] = c->pointer_ids[i];
+        c->pointer_id_count = w;
+        c->pointer_id = (w > 0) ? c->pointer_ids[0] : 0;
+    }
+    if (o.iface == WL_KEYBOARD) {
+        int w = 0;
+        for (int i = 0; i < c->keyboard_id_count; i++)
+            if (c->keyboard_ids[i] != id) c->keyboard_ids[w++] = c->keyboard_ids[i];
+        c->keyboard_id_count = w;
+        c->keyboard_id = (w > 0) ? c->keyboard_ids[0] : 0;
+    }
     o.in_use = false;
     o.wm_window = nullptr;
     o.pending_frame_cb = 0;
@@ -466,11 +493,111 @@ void wl_render_thunk(Window* win, int x, int y, int w, int h) {
     if (!c) return;
     Object* surf = find_obj(c, sid);
     if (!surf || surf->iface != WL_SURFACE) return;
-    blit_surface_region(c, surf, win, /*use_damage=*/false);
+    blit_surface_region(c, surf, win, /*use_damage=*/false,
+                        -surf->geo_x, -surf->geo_y);
     // a wm repaint refills the whole content rect from the parent buffer, which
     // would re-cover any subsurface content - re-composite children on top.
     // forward-declared below; defined with commit_surface. (satoru)
     blit_child_subsurfaces(c, surf, win);
+}
+
+// input callback for bridged wayland windows: the wm delivers scroll (event 3)
+// here; wheel notches become wl_pointer.axis at the live pointer position.
+// char keypresses (event 2) are ignored - raw key edges go through ForwardKey
+// from the desktop input path, which is what gtk/firefox actually consume. (satoru)
+void wl_input_thunk(Window* win, int event, int p1, int p2) {
+    (void)win;
+    if (event == 3) {
+        // kurono wheel delta: wheel-DOWN is positive (verified empirically via
+        // qmp injection: 6x wheel-down -> [scrl] d=+2). wayland positive axis
+        // also scrolls the content down, so the sign passes straight through;
+        // ~32 px per notch reads like a native browser step. (satoru)
+        ForwardPointerAxis(Mouse::mx, Mouse::my, 0, p1 * 32);
+    } else if (event == 4) {
+        // event 4 = right-click at (p1,p2). the wm only reports the click
+        // edge, so synthesize the press+release pair gtk expects. (satoru)
+        ForwardPointerButton(p1, p2, WL_BTN_RIGHT, true);
+        ForwardPointerButton(p1, p2, WL_BTN_RIGHT, false);
+    }
+}
+
+// case-insensitive substring test for toplevel meta matching (titles and
+// app ids arrive in whatever case the client uses). (satoru)
+bool str_has_ci(const char* hay, const char* needle) {
+    if (!hay || !needle || !needle[0]) return false;
+    for (int i = 0; hay[i]; i++) {
+        int j = 0;
+        while (needle[j]) {
+            char a = hay[i + j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+            j++;
+        }
+        if (!needle[j]) return true;
+        if (!hay[i + 1]) break;
+    }
+    return false;
+}
+
+// apply xdg_toplevel.set_title / set_app_id to the toplevel's parent surface:
+// store the title (used at bridge time), resolve an app-icon hint, and if the
+// surface is already bridged push both onto the live wm window. is_app_id
+// distinguishes the two requests - an app id ("org.mozilla.firefox") is used
+// for icon resolution and as a display-name fallback, never overwriting a
+// real title. (satoru)
+void apply_toplevel_meta(Object* surf, const char* str, int len, bool is_app_id) {
+    if (!surf || !str || len <= 0) return;
+    // titles arrive as utf-8 but the wm titlebar font is ascii-only, so decode
+    // and transliterate: dashes -> '-', curly quotes -> straight, ellipsis ->
+    // '.', anything else multi-byte dropped. without this a page title like
+    // "kurono (U+2014) Nightly" renders its raw bytes as mojibake. (satoru)
+    char buf[48];
+    int n = 0;
+    for (int i = 0; i < len && n < (int)sizeof(buf) - 1; ) {
+        unsigned char b = (unsigned char)str[i];
+        if (b < 0x80) { buf[n++] = (char)b; i += 1; continue; }
+        int seq = (b >= 0xF0) ? 4 : (b >= 0xE0) ? 3 : 2;
+        if (i + seq > len) break;
+        // decode the code point (enough of it to classify punctuation). (satoru)
+        uint32_t cp = 0;
+        if (seq == 2)      cp = ((uint32_t)(b & 0x1F) << 6)  | (str[i+1] & 0x3F);
+        else if (seq == 3) cp = ((uint32_t)(b & 0x0F) << 12) | ((uint32_t)(str[i+1] & 0x3F) << 6) | (str[i+2] & 0x3F);
+        else               cp = 0;   // beyond the bmp: drop (satoru)
+        char out = 0;
+        if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212) out = '-';
+        else if (cp == 0x2018 || cp == 0x2019) out = '\'';
+        else if (cp == 0x201C || cp == 0x201D) out = '"';
+        else if (cp == 0x2026) out = '.';
+        else if (cp == 0x00A0) out = ' ';
+        if (out) buf[n++] = out;
+        i += seq;
+    }
+    buf[n] = 0;
+    if (n <= 0) return;
+    // icon hint from either request: any mention of firefox pins the logo. (satoru)
+    if (str_has_ci(buf, "firefox")) surf->app_icon_hint = (uint8_t)AppIcons::FIREFOX;
+    if (is_app_id) {
+        // display-name fallback only; a set_title wins. (satoru)
+        if (!surf->title[0] && surf->app_icon_hint == (uint8_t)AppIcons::FIREFOX) {
+            surf->title[0]='F'; surf->title[1]='i'; surf->title[2]='r';
+            surf->title[3]='e'; surf->title[4]='f'; surf->title[5]='o';
+            surf->title[6]='x'; surf->title[7]=0;
+        }
+    } else {
+        for (int i = 0; i <= n; i++) surf->title[i] = buf[i];
+    }
+    // live-update an already-bridged window so later title changes (e.g. the
+    // loaded page's title) show immediately. (satoru)
+    if (surf->wm_window) {
+        int wid = (int)(intptr_t)surf->wm_window;
+        Window* win = WindowManager::GetWindow(wid);
+        if (win) {
+            if (surf->title[0]) WindowManager::SetTitle(wid, surf->title);
+            if (surf->app_icon_hint != 0xFF) win->app_icon = (int)surf->app_icon_hint;
+            WindowManager::MarkDirty(wid);
+        }
+    }
 }
 
 // bridge a toplevel wl_surface to a wm window the first time it is
@@ -478,29 +605,41 @@ void wl_render_thunk(Window* win, int x, int y, int w, int h) {
 // window id, or -1 if no window could be created. (satoru)
 int bridge_surface_window(Client* c, Object* surf, int w, int h) {
     if (surf->wm_window) return (int)(intptr_t)surf->wm_window;
+    // size the window to the VISIBLE geometry (set_window_geometry), not the
+    // raw buffer - csd margins are cropped out of the blits. (satoru)
+    if (surf->geo_w > 0 && surf->geo_h > 0) { w = surf->geo_w; h = surf->geo_h; }
     if (w <= 0) w = 320;
     if (h <= 0) h = 240;
-    // title: use the client sd so distinct apps are distinguishable in
-    // the wm without a real xdg_toplevel.set_title path. (satoru)
-    char title[32];
+    // title: prefer the client's own xdg_toplevel.set_title (stored on the
+    // surface by apply_toplevel_meta); fall back to the client sd so distinct
+    // untitled apps stay distinguishable in the wm. (satoru)
+    char title[48];
     int t = 0;
-    const char* base = "wayland sd ";
-    while (base[t] && t < 24) { title[t] = base[t]; t++; }
-    int sd = c->sd; if (sd < 0) sd = 0;
-    // tiny itoa (satoru)
-    char num[8]; int n = 0;
-    if (sd == 0) num[n++] = '0';
-    else { int v = sd; char tmp[8]; int k = 0;
-           while (v > 0 && k < 7) { tmp[k++] = (char)('0' + v % 10); v /= 10; }
-           while (k > 0) num[n++] = tmp[--k]; }
-    for (int i = 0; i < n && t < 31; i++) title[t++] = num[i];
+    if (surf->title[0]) {
+        while (surf->title[t] && t < 47) { title[t] = surf->title[t]; t++; }
+    } else {
+        const char* base = "wayland sd ";
+        while (base[t] && t < 24) { title[t] = base[t]; t++; }
+        int sd = c->sd; if (sd < 0) sd = 0;
+        // tiny itoa (satoru)
+        char num[8]; int n = 0;
+        if (sd == 0) num[n++] = '0';
+        else { int v = sd; char tmp[8]; int k = 0;
+               while (v > 0 && k < 7) { tmp[k++] = (char)('0' + v % 10); v /= 10; }
+               while (k > 0) num[n++] = tmp[--k]; }
+        for (int i = 0; i < n && t < 47; i++) title[t++] = num[i];
+    }
     title[t] = 0;
     // -1,-1 lets the wm centre the window in the desktop area. (satoru)
     Window* win = WindowManager::CreateWindow(title, -1, -1, w, h);
     if (!win) return -1;
+    // pin the app logo resolved from set_app_id/set_title so later title
+    // changes keep it. (satoru)
+    if (surf->app_icon_hint != 0xFF) win->app_icon = (int)surf->app_icon_hint;
     // install the content render callback so wm repaints keep the client
     // pixels, and remember which surface owns this window. (satoru)
     win->render = wl_render_thunk;
+    win->input  = wl_input_thunk;      // scroll wheel -> wl_pointer.axis (satoru)
     surf->wm_window = (void*)(intptr_t)win->id;
     surf->mapped = true;
     winmap_set(win->id, c->sd, surf->id);
@@ -681,7 +820,8 @@ void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin) {
         if (!child) continue;
         if (child->pending_buffer_id == 0 && !(child->shadow && child->shadow_filled)) continue;
         blit_surface_region(c, child, pwin, /*use_damage=*/false,
-                            ss.subsurface_x, ss.subsurface_y);
+                            ss.subsurface_x - parent_surf->geo_x,
+                            ss.subsurface_y - parent_surf->geo_y);
     }
 }
 
@@ -773,8 +913,11 @@ void commit_surface(Client* c, Object* surf) {
             int pwid = (int)(intptr_t)psurf->wm_window;
             Window* pwin = WindowManager::GetWindow(pwid);
             if (pwin) {
+                // subsurface offsets are parent-SURFACE coords; the parent's
+                // geometry crop shifts them into content coords. (satoru)
                 blit_surface_region(c, surf, pwin, /*use_damage=*/true,
-                                    role->subsurface_x, role->subsurface_y);
+                                    role->subsurface_x - psurf->geo_x,
+                                    role->subsurface_y - psurf->geo_y);
                 WindowManager::MarkDirty(pwid);
                 surf->damage.valid = false;
                 return;
@@ -809,8 +952,11 @@ void commit_surface(Client* c, Object* surf) {
     // incremental blit of the damaged region. if no pool mapping exists yet
     // (fd transport not wired) blit_surface_region is a no-op; we still mark
     // the window dirty so the wm paints its chrome and, once a mapping
-    // arrives via RegisterPoolMemory(), the render thunk fills content. (satoru)
-    blit_surface_region(c, surf, win, /*use_damage=*/true);
+    // arrives via RegisterPoolMemory(), the render thunk fills content. the
+    // -geo shift crops the csd margins: buffer pixel (geo_x,geo_y) lands at
+    // content (0,0). (satoru)
+    blit_surface_region(c, surf, win, /*use_damage=*/true,
+                        -surf->geo_x, -surf->geo_y);
     // re-composite any child subsurfaces on top so the parent's fresh (black)
     // buffer doesn't cover content the client committed into a child. (satoru)
     blit_child_subsurfaces(c, surf, win);
@@ -929,15 +1075,63 @@ Object* surface_at_global(Client** out_client, int gx, int gy) {
     return best;
 }
 
-// surface-local coordinates of a global point for a bridged surface. (satoru)
+// surface-local coordinates of a global point for a bridged surface. content
+// (0,0) shows buffer pixel (geo_x,geo_y) - the csd-margin crop - so the
+// geometry offset is added back for the client's event coords. (satoru)
 inline void global_to_surface(Object* surf, int gx, int gy, int& lx, int& ly) {
     lx = gx; ly = gy;
     if (!surf || !surf->wm_window) return;
     int wid = (int)(intptr_t)surf->wm_window;
     Window* win = WindowManager::GetWindow(wid);
     if (!win) return;
-    lx = gx - win->content_x;
-    ly = gy - win->content_y;
+    lx = gx - win->content_x + surf->geo_x;
+    ly = gy - win->content_y + surf->geo_y;
+}
+
+// resolve the INPUT TARGET under a global point: the deepest surface, not just
+// the bridged toplevel. in gdk-wayland every wl_surface is its own GdkWindow
+// and input is routed per-surface by the compositor - gtk does NOT synthesize
+// crossings from toplevel coordinates into a subsurface. firefox draws its
+// whole ui (and the scrollable page) in a gtk SUBSURFACE inset inside the csd
+// toplevel, so events delivered to the toplevel never reached the widget that
+// scrolls - wheel events arrived and did nothing. descend: if the point falls
+// inside a child subsurface's rect (set_position offset relative to the
+// parent buffer, sized by its committed shadow/buffer), target the child with
+// child-local coords. (satoru)
+Object* input_target_at(Client** out_client, int gx, int gy, int& lx, int& ly) {
+    Client* fc = nullptr;
+    Object* top = surface_at_global(&fc, gx, gy);
+    if (out_client) *out_client = fc;
+    if (!top || !fc) {
+        lx = gx; ly = gy;
+        return top;
+    }
+    // toplevel-buffer coords of the point. (satoru)
+    int tx, ty;
+    global_to_surface(top, gx, gy, tx, ty);
+    lx = tx; ly = ty;
+    for (int i = 0; i < WL_MAX_OBJECTS; i++) {
+        Object& ss = fc->objects[i];
+        if (!ss.in_use || ss.iface != WL_SUBSURFACE) continue;
+        if (ss.subsurface_parent != top->id) continue;
+        Object* child = find_obj(fc, ss.parent_surface_id);
+        if (!child) continue;
+        // honor wl_surface.set_input_region: a child with an EMPTY input
+        // region is a pure output layer (firefox webrender) - input falls
+        // through it to the toplevel, which is the surface gtk actually
+        // listens on. (satoru)
+        if (child->input_none) continue;
+        int cw = 0, ch = 0;
+        if (child->shadow && child->shadow_filled) { cw = child->shadow_w; ch = child->shadow_h; }
+        else if (child->width > 0)                 { cw = child->width;    ch = child->height;   }
+        if (cw <= 0 || ch <= 0) continue;
+        int rx = tx - ss.subsurface_x;
+        int ry = ty - ss.subsurface_y;
+        if (rx < 0 || ry < 0 || rx >= cw || ry >= ch) continue;
+        lx = rx; ly = ry;
+        return child;
+    }
+    return top;
 }
 
 // wl_fixed_t is signed 24.8 fixed point: whole pixels << 8. (satoru)
@@ -984,12 +1178,69 @@ void pointer_axis(Client* c, uint32_t ptr, uint32_t time,
     put32(pl + 8, (uint32_t)to_fixed(value));
     send_event(c, ptr, 4, pl, 12);
 }
+// wl_pointer.axis_source (opcode 6, v5+): 0 = wheel. gtk classifies scroll
+// deltas by source; a wheel notch should arrive as source+discrete+axis in
+// one frame. (satoru)
+void pointer_axis_source(Client* c, uint32_t ptr) {
+    Object* po = find_obj(c, ptr);
+    if (!po || po->version < 5) return;
+    uint8_t pl[4];
+    put32(pl + 0, 0);                      // axis_source = wheel
+    send_event(c, ptr, 6, pl, 4);
+}
+// wl_pointer.axis_discrete (opcode 8, v5+): whole wheel notches. (satoru)
+void pointer_axis_discrete(Client* c, uint32_t ptr, uint32_t axis, int clicks) {
+    Object* po = find_obj(c, ptr);
+    if (!po || po->version < 5) return;
+    uint8_t pl[8];
+    put32(pl + 0, axis);
+    put32(pl + 4, (uint32_t)clicks);
+    send_event(c, ptr, 8, pl, 8);
+}
 // wl_pointer.frame (v5+) groups the preceding events into one logical
 // event; harmless to send to older clients via the same opcode only if
 // they negotiated v5, so gate on the resource version. (satoru)
 void pointer_frame(Client* c, uint32_t ptr) {
     Object* po = find_obj(c, ptr);
     if (po && po->version >= 5) send_event(c, ptr, 5, nullptr, 0);
+}
+
+// ── seat-input wrappers ───────────────────────────────────────────────
+// firefox binds the seat TWICE - gdk/gtk first, then gecko's native-layer
+// compositor - so it owns two wl_pointer / wl_keyboard resources. the OLD
+// single-slot tracking kept only the LAST bind (gecko's listener-less proxy)
+// and starved gdk = all input dead. tracking BOTH then BROADCASTING every
+// event to both looked right, but interleaving two resources' event streams
+// (p0.axis, p1.source, p0.frame, ...) without a frame between them corrupts
+// the wl_pointer v5 wheel + wl_keyboard sequences (gtk dropped keys + wheel;
+// motion + button survived by luck). so target resource [0] ONLY: the FIRST
+// seat bind is gdk (gtk initializes before gecko's native layer), and gdk is
+// the proxy that actually routes input into gecko's dom - empirically the
+// [0]-only motion reached the dom while broadcast axis/key did not. (satoru)
+inline uint32_t live_ptr(Client* c)  { return c->pointer_id_count  > 0 ? c->pointer_ids[0]  : 0; }
+inline uint32_t live_kbd(Client* c)  { return c->keyboard_id_count > 0 ? c->keyboard_ids[0] : 0; }
+
+void ptrs_enter(Client* c, uint32_t surf, int lx, int ly) {
+    uint32_t p = live_ptr(c); if (p) pointer_enter(c, p, surf, lx, ly);
+}
+void ptrs_leave(Client* c, uint32_t surf) {
+    uint32_t p = live_ptr(c); if (p) pointer_leave(c, p, surf);
+}
+void ptrs_motion(Client* c, uint32_t time, int lx, int ly) {
+    uint32_t p = live_ptr(c); if (p) pointer_motion(c, p, time, lx, ly);
+}
+void ptrs_button(Client* c, uint32_t time, uint32_t button, bool pressed) {
+    uint32_t p = live_ptr(c); if (p) pointer_button(c, p, time, button, pressed);
+}
+void ptrs_axis(Client* c, uint32_t time, uint32_t axis, int value) {
+    uint32_t p = live_ptr(c);
+    if (!p) return;
+    pointer_axis_source(c, p);
+    pointer_axis_discrete(c, p, axis, value / 32);
+    pointer_axis(c, p, time, axis, value);
+}
+void ptrs_frame(Client* c) {
+    uint32_t p = live_ptr(c); if (p) pointer_frame(c, p);
 }
 
 // ── wl_keyboard event emitters ───────────────────────────────────────
@@ -1032,6 +1283,30 @@ void keyboard_modifiers(Client* c, uint32_t kbd, uint32_t mods) {
     put32(pl + 12, 0);                     // mods_locked
     put32(pl + 16, 0);                     // group
     send_event(c, kbd, 4, pl, 20);
+}
+
+// keyboard wrappers - BROADCAST to every keyboard resource. measured: the
+// live gdk keyboard is NOT resource [0] (gecko's native layer binds a
+// keyboard before gdk does, unlike pointers where gdk is first), so [0]-only
+// sent keys to gecko's deaf proxy (kd=0). broadcasting reaches gdk whatever
+// its index, and unlike the wl_pointer v5 wheel triple the simple key +
+// modifiers events survive the cross-resource interleave (kd=4 confirmed).
+// each key is enter/key/modifiers only - no frame to desync. (satoru)
+void kbds_enter(Client* c, uint32_t surf) {
+    for (int i = 0; i < c->keyboard_id_count; i++)
+        keyboard_enter(c, c->keyboard_ids[i], surf);
+}
+void kbds_leave(Client* c, uint32_t surf) {
+    for (int i = 0; i < c->keyboard_id_count; i++)
+        keyboard_leave(c, c->keyboard_ids[i], surf);
+}
+void kbds_key(Client* c, uint32_t time, uint32_t key, bool pressed) {
+    for (int i = 0; i < c->keyboard_id_count; i++)
+        keyboard_key(c, c->keyboard_ids[i], time, key, pressed);
+}
+void kbds_modifiers(Client* c, uint32_t mods) {
+    for (int i = 0; i < c->keyboard_id_count; i++)
+        keyboard_modifiers(c, c->keyboard_ids[i], mods);
 }
 
 // Process one Wayland request.  All bounds checks must complete before
@@ -1175,7 +1450,21 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
             } else if (opcode == 1) {             // create_region(new_id)
                 if (args_len < 4) return;
                 uint32_t rid = get32(args);
-                register_obj(c, rid, WL_COMPOSITOR, obj->version);
+                // real WL_REGION objects now: add/subtract track whether the
+                // region is empty, which set_input_region reads. (previously
+                // registered as WL_COMPOSITOR, so region contents were lost.) (satoru)
+                register_obj(c, rid, WL_REGION, obj->version);
+            }
+            break;
+        }
+        case WL_REGION: {
+            // destroy=0, add=1 (x,y,w,h), subtract=2. only emptiness matters:
+            // an input region with at least one added rect accepts input. (satoru)
+            if (opcode == 0) { destroy_obj(c, object_id); break; }
+            if (opcode == 1 && args_len >= 16) {
+                int32_t rw = (int32_t)get32(args + 8);
+                int32_t rh = (int32_t)get32(args + 12);
+                if (rw > 0 && rh > 0) obj->region_has_rect = true;
             }
             break;
         }
@@ -1325,6 +1614,12 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 // has no pointer click to focus the window, so the activated state
                 // must come from the configure. states is a wl_array: 4-byte length
                 // then one uint32 entry. (satoru)
+                // ACTIVATED only. an experiment also advertising MAXIMIZED (to
+                // strip gtk's csd shadows) broke the bridge: with no decoration
+                // left to draw, gtk stopped committing a buffer to the TOPLEVEL
+                // surface, commit_surface never bridged a wm window, and firefox
+                // ran headless-invisible. the csd margins are removed by the
+                // set_window_geometry crop instead. (satoru)
                 uint8_t cfg[16];
                 put32(cfg + 0, 1024);
                 put32(cfg + 4, 768);
@@ -1334,6 +1629,20 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 // xdg_surface::configure (opcode 0): serial.
                 uint8_t srl[4]; put32(srl, c->serial_next++);
                 send_event(c, object_id, 0, srl, 4);
+            } else if (opcode == 3) {             // set_window_geometry(x,y,w,h)
+                // the visible window rect inside the surface, excluding csd
+                // shadow margins - store on the surface so blits crop to it
+                // and the bridged window is sized to the VISIBLE rect. (satoru)
+                if (args_len < 16) return;
+                Object* gsurf = find_obj(c, obj->parent_surface_id);
+                if (gsurf && gsurf->iface == WL_SURFACE) {
+                    gsurf->geo_x = (int32_t)get32(args);
+                    gsurf->geo_y = (int32_t)get32(args + 4);
+                    gsurf->geo_w = (int32_t)get32(args + 8);
+                    gsurf->geo_h = (int32_t)get32(args + 12);
+                    if (gsurf->geo_w < 0) gsurf->geo_w = 0;
+                    if (gsurf->geo_h < 0) gsurf->geo_h = 0;
+                }
             } else if (opcode == 4) {             // ack_configure
                 // no-op
             }
@@ -1342,6 +1651,17 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
         case XDG_TOPLEVEL: {
             if (opcode == 0) {                    // destroy
                 destroy_obj(c, object_id);
+            } else if (opcode == 2 || opcode == 3) {  // set_title / set_app_id
+                // wire string arg: uint32 length (includes the nul) then the
+                // bytes, padded to 4. route to the toplevel's parent surface,
+                // which owns the bridged wm window. (satoru)
+                if (args_len < 4) return;
+                uint32_t sl = get32(args);
+                if (sl == 0 || sl > (uint32_t)(args_len - 4)) break;
+                Object* psurf = find_obj(c, obj->parent_surface_id);
+                if (psurf && psurf->iface == WL_SURFACE)
+                    apply_toplevel_meta(psurf, (const char*)(args + 4),
+                                        (int)sl - 1, opcode == 3);
             }
             break;
         }
@@ -1379,6 +1699,20 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     push_frame_cb(c, cb);
                     break;
                 }
+                case 5: {                          // set_input_region(region)
+                    // region id 0 (null) = whole surface takes input (the
+                    // default). an EMPTY region = input passes through this
+                    // surface entirely - firefox's webrender output layers
+                    // set exactly that, and routing events to them sent every
+                    // click/key into a listener-less void. (satoru)
+                    if (args_len < 4) return;
+                    uint32_t rid = get32(args);
+                    if (rid == 0) { obj->input_none = false; break; }
+                    Object* reg = find_obj(c, rid);
+                    obj->input_none = (reg && reg->iface == WL_REGION)
+                                        ? !reg->region_has_rect : false;
+                    break;
+                }
                 case 6: {                          // commit
                     // apply the attached buffer: blit damaged region into
                     // the bridged window's content rect (consumes damage).
@@ -1408,12 +1742,20 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 if (args_len < 4) return;
                 uint32_t pid = get32(args);
                 if (!register_obj(c, pid, WL_POINTER, obj->version)) return;
-                c->pointer_id = pid;
+                // APPEND, never overwrite: firefox binds the seat twice (gdk +
+                // gecko native-layer) and the old last-write-wins slot sent
+                // every event to gecko's listener-less proxy - gdk never got
+                // input at all (the all-input-dead bug). (satoru)
+                if (c->pointer_id_count < Client::WL_MAX_INPUT_RES)
+                    c->pointer_ids[c->pointer_id_count++] = pid;
+                if (c->pointer_id == 0) c->pointer_id = pid;
             } else if (opcode == 1) {             // get_keyboard(new_id)
                 if (args_len < 4) return;
                 uint32_t kid = get32(args);
                 if (!register_obj(c, kid, WL_KEYBOARD, obj->version)) return;
-                c->keyboard_id = kid;
+                if (c->keyboard_id_count < Client::WL_MAX_INPUT_RES)
+                    c->keyboard_ids[c->keyboard_id_count++] = kid;
+                if (c->keyboard_id == 0) c->keyboard_id = kid;
                 // wl_keyboard.keymap (opcode 0): format=1 (XKB_V1) + an fd +
                 // size. gdk/firefox mmap the fd and compile the keymap to
                 // translate the evdev codes wl_keyboard.key carries - without
@@ -1670,79 +2012,92 @@ void RegisterPoolMemory(int sd, uint32_t pool_id,
 // ── input forwarding entry points ─────────────────────────────────────
 void ForwardPointerMotion(int gx, int gy) {
     Client* fc = nullptr;
-    Object* surf = surface_at_global(&fc, gx, gy);
+    int lx, ly;
+    // deepest surface under the point (a subsurface when the pointer is over
+    // one) - gtk routes input per-surface, so the target must be exact. (satoru)
+    Object* surf = input_target_at(&fc, gx, gy, lx, ly);
     uint32_t time = Timer::GetRealMs();
     g_now_ms = time;
 
     // first, send leave to any client that previously had pointer focus on
-    // a different surface (focus crossed out). (satoru)
+    // a different surface (focus crossed out - including crossing between a
+    // toplevel and its own subsurface). (satoru)
     for (int i = 0; i < WL_MAX_CLIENTS; i++) {
         Client* c = &g_clients[i];
-        if (!c->in_use || c->pointer_id == 0) continue;
+        if (!c->in_use || c->pointer_id_count == 0) continue;
         uint32_t prev = c->pointer_focus_sid;
         bool still = (c == fc && surf && surf->id == prev);
         if (prev != 0 && !still) {
             if (find_obj(c, prev))
-                pointer_leave(c, c->pointer_id, prev);
+                ptrs_leave(c, prev);
             c->pointer_focus_sid = 0;
-            pointer_frame(c, c->pointer_id);
+            ptrs_frame(c);
             tx_flush(c);
             if (c->fatal) drop_client(c);
         }
     }
 
-    if (!surf || !fc || fc->pointer_id == 0) return;
+    if (!surf || !fc || fc->pointer_id_count == 0) return;
 
-    int lx, ly;
-    global_to_surface(surf, gx, gy, lx, ly);
+    // stationary dedup: this forward runs every gui frame, so a parked
+    // pointer used to spam 60 identical motion events a second into the
+    // client (120 with two proxies) - pure startup poison for firefox.
+    // only emit when the position or the target surface changed. (satoru)
+    static int      s_last_gx = -1, s_last_gy = -1;
+    static uint32_t s_last_sid = 0;
+    bool moved = (gx != s_last_gx) || (gy != s_last_gy) || (surf->id != s_last_sid);
+    s_last_gx = gx; s_last_gy = gy; s_last_sid = surf->id;
 
     // enter on first crossing into this surface. (satoru)
     if (fc->pointer_focus_sid != surf->id) {
         fc->pointer_focus_sid = surf->id;
-        pointer_enter(fc, fc->pointer_id, surf->id, lx, ly);
+        ptrs_enter(fc, surf->id, lx, ly);
+        moved = true;
     }
-    pointer_motion(fc, fc->pointer_id, time, lx, ly);
-    pointer_frame(fc, fc->pointer_id);
+    if (!moved) return;
+    ptrs_motion(fc, time, lx, ly);
+    ptrs_frame(fc);
     tx_flush(fc);
     if (fc->fatal) drop_client(fc);
 }
 
 void ForwardPointerButton(int gx, int gy, int evdev_button, bool pressed) {
     Client* fc = nullptr;
-    Object* surf = surface_at_global(&fc, gx, gy);
-    if (!surf || !fc || fc->pointer_id == 0) return;
+    int lx, ly;
+    Object* surf = input_target_at(&fc, gx, gy, lx, ly);
+    if (!surf || !fc || fc->pointer_id_count == 0) return;
     uint32_t time = Timer::GetRealMs();
     g_now_ms = time;
 
-    int lx, ly;
-    global_to_surface(surf, gx, gy, lx, ly);
     // ensure the client has pointer focus before the button (a press can
     // arrive before any motion event). (satoru)
     if (fc->pointer_focus_sid != surf->id) {
+        if (fc->pointer_focus_sid != 0 && find_obj(fc, fc->pointer_focus_sid))
+            ptrs_leave(fc, fc->pointer_focus_sid);
         fc->pointer_focus_sid = surf->id;
-        pointer_enter(fc, fc->pointer_id, surf->id, lx, ly);
+        ptrs_enter(fc, surf->id, lx, ly);
     }
-    pointer_button(fc, fc->pointer_id, time, (uint32_t)evdev_button, pressed);
-    pointer_frame(fc, fc->pointer_id);
+    ptrs_button(fc, time, (uint32_t)evdev_button, pressed);
+    ptrs_frame(fc);
 
     // a press also moves keyboard focus to this surface's client, mirroring
     // click-to-focus. emit keyboard leave/enter as focus moves. (satoru)
     if (pressed) {
         for (int i = 0; i < WL_MAX_CLIENTS; i++) {
             Client* c = &g_clients[i];
-            if (!c->in_use || c->keyboard_id == 0) continue;
+            if (!c->in_use || c->keyboard_id_count == 0) continue;
             if (c == fc) continue;
             if (c->keyboard_focus_sid != 0) {
                 if (find_obj(c, c->keyboard_focus_sid))
-                    keyboard_leave(c, c->keyboard_id, c->keyboard_focus_sid);
+                    kbds_leave(c, c->keyboard_focus_sid);
                 c->keyboard_focus_sid = 0;
                 tx_flush(c);
                 if (c->fatal) drop_client(c);
             }
         }
-        if (fc->keyboard_id != 0 && fc->keyboard_focus_sid != surf->id) {
+        if (fc->keyboard_id_count != 0 && fc->keyboard_focus_sid != surf->id) {
             fc->keyboard_focus_sid = surf->id;
-            keyboard_enter(fc, fc->keyboard_id, surf->id);
+            kbds_enter(fc, surf->id);
         }
     }
     tx_flush(fc);
@@ -1751,29 +2106,75 @@ void ForwardPointerButton(int gx, int gy, int evdev_button, bool pressed) {
 
 void ForwardPointerAxis(int gx, int gy, int axis, int value) {
     Client* fc = nullptr;
-    Object* surf = surface_at_global(&fc, gx, gy);
-    if (!surf || !fc || fc->pointer_id == 0) return;
+    int lx, ly;
+    // deepest surface under the point: for firefox that is the gtk CONTENT
+    // subsurface (the page), not the csd toplevel - gtk routes input strictly
+    // per-surface, so an axis on the toplevel never scrolled the page. (satoru)
+    Object* surf = input_target_at(&fc, gx, gy, lx, ly);
+    if (!surf || !fc || fc->pointer_id_count == 0) return;
     uint32_t time = Timer::GetRealMs();
     g_now_ms = time;
-    pointer_axis(fc, fc->pointer_id, time, (uint32_t)axis, value);
-    pointer_frame(fc, fc->pointer_id);
+    // establish pointer presence on the target surface first (gtk drops axis
+    // events for a surface without pointer focus), then the v5 wheel triple:
+    // source + discrete + axis in one frame. value is in surface pixels;
+    // pointer_axis does the wl_fixed conversion (a double to_fixed once made
+    // each notch ~49000px, which gtk discarded). notch = 32px. (satoru)
+    if (fc->pointer_focus_sid != surf->id) {
+        if (fc->pointer_focus_sid != 0 && find_obj(fc, fc->pointer_focus_sid))
+            ptrs_leave(fc, fc->pointer_focus_sid);
+        fc->pointer_focus_sid = surf->id;
+        ptrs_enter(fc, surf->id, lx, ly);
+    }
+    ptrs_motion(fc, time, lx, ly);
+    ptrs_axis(fc, time, (uint32_t)axis, value);
+    ptrs_frame(fc);
     tx_flush(fc);
     if (fc->fatal) drop_client(fc);
+}
+
+bool IsWaylandWindow(int win_id) {
+    int sd; uint32_t sid;
+    return winmap_get(win_id, sd, sid);
+}
+
+int DropClientsOfPid(uint32_t pid) {
+    if (pid == 0) return 0;
+    int dropped = 0;
+    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
+        Client* c = &g_clients[i];
+        if (!c->in_use || c->sd < 0) continue;
+        UnixSocket::Credentials cr;
+        if (UnixSocket::GetPeerCred(c->sd, &cr) != 0) continue;
+        if (cr.pid != pid) continue;
+        // destroy every surface first so bridged wm windows close with the
+        // client (destroy_obj cascades window teardown + winmap cleanup). walk
+        // by index with an in_use guard: destroy_obj may shrink object_high. (satoru)
+        int high = c->object_high;
+        for (int j = 0; j < high; j++) {
+            Object& o = c->objects[j];
+            if (o.in_use && o.iface == WL_SURFACE && o.wm_window)
+                destroy_obj(c, o.id);
+        }
+        drop_client(c);
+        dropped++;
+    }
+    return dropped;
 }
 
 void ForwardKey(int key, bool pressed, uint32_t mods) {
     uint32_t evdev = key_to_evdev(key);
     uint32_t time  = Timer::GetRealMs();
     g_now_ms = time;
-    // route to whichever client currently holds keyboard focus. (satoru)
+    // route to whichever client currently holds keyboard focus, on EVERY
+    // wl_keyboard resource it created. (satoru)
     for (int i = 0; i < WL_MAX_CLIENTS; i++) {
         Client* c = &g_clients[i];
-        if (!c->in_use || c->keyboard_id == 0) continue;
+        if (!c->in_use || c->keyboard_id_count == 0) continue;
         if (c->keyboard_focus_sid == 0) continue;
         if (!find_obj(c, c->keyboard_focus_sid)) { c->keyboard_focus_sid = 0; continue; }
-        keyboard_modifiers(c, c->keyboard_id, mods);
+        kbds_modifiers(c, mods);
         if (evdev != 0)
-            keyboard_key(c, c->keyboard_id, time, evdev, pressed);
+            kbds_key(c, time, evdev, pressed);
         tx_flush(c);
         if (c->fatal) drop_client(c);
     }

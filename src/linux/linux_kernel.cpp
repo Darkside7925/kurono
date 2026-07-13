@@ -874,14 +874,10 @@ const char* LinuxKernel::GetMachine()    { return LINUX_KERNEL_MACHINE; }
 const char* LinuxKernel::GetDomainname() { return "(none)"; }
 
 int LinuxKernel::GetRandom(void* buf, uint32_t len) {
-    uint8_t* p = (uint8_t*)buf;
-    for (uint32_t i = 0; i < len; i++) {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 17;
-        rng_state ^= rng_state << 5;
-        p[i] = (uint8_t)(rng_state & 0xFF);
-    }
-    return (int)len;
+    // route to the chacha20 crng (rdseed/rdrand-keyed) so /dev/random serves
+    // the same crypto-grade stream as getrandom(2) - the old xorshift here had
+    // a static seed, so every boot's "random" was the same sequence. (satoru)
+    return (int)LinuxSyscall::GetRandomBytes(buf, (uint64_t)len);
 }
 
 int LinuxKernel::GetURandom(void* buf, uint32_t len) {
