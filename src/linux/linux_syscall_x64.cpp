@@ -31,6 +31,112 @@ extern "C" {
 
 namespace {
 
+// ── crypto-grade getrandom: chacha20 crng keyed from hardware entropy ──────
+// firefox's nss/tls cannot initialize on the old tsc-seeded lcg (every "key"
+// was predictable from boot time). this mirrors linux drivers/char/random.c:
+// a chacha20 keystream whose 256-bit key comes from rdseed (preferred) or
+// rdrand (cpuid-gated), mixed with the tsc, reseeded every 64kb of output.
+// pure integer ops - safe under -mno-sse. state is serialized by the kls lock
+// like every other syscall handler. (satoru)
+static inline uint32_t rotl32(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
+
+static void chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]) {
+    uint32_t s[16] = {
+        0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u,   // "expand 32-byte k" (satoru)
+        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+        (uint32_t)counter, (uint32_t)(counter >> 32), 0u, 0u
+    };
+    uint32_t x[16];
+    for (int i = 0; i < 16; i++) x[i] = s[i];
+    #define KQR(a,b,c,d) \
+        x[a]+=x[b]; x[d]^=x[a]; x[d]=rotl32(x[d],16); \
+        x[c]+=x[d]; x[b]^=x[c]; x[b]=rotl32(x[b],12); \
+        x[a]+=x[b]; x[d]^=x[a]; x[d]=rotl32(x[d], 8); \
+        x[c]+=x[d]; x[b]^=x[c]; x[b]=rotl32(x[b], 7);
+    for (int r = 0; r < 10; r++) {          // 20 rounds = 10 double rounds (satoru)
+        KQR(0,4, 8,12) KQR(1,5, 9,13) KQR(2,6,10,14) KQR(3,7,11,15)
+        KQR(0,5,10,15) KQR(1,6,11,12) KQR(2,7, 8,13) KQR(3,4, 9,14)
+    }
+    #undef KQR
+    for (int i = 0; i < 16; i++) out[i] = x[i] + s[i];
+}
+
+// hardware entropy, cpuid-gated. cf=1 means the value is valid. (satoru)
+static bool cpu_rdseed64(uint64_t* v) {
+    static int has = -1;
+    if (has < 0) {
+        uint32_t a, b, c, d;
+        asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7u), "c"(0u));
+        has = (b >> 18) & 1u;   // ebx bit 18 = rdseed (satoru)
+    }
+    if (!has) return false;
+    for (int t = 0; t < 32; t++) {
+        uint64_t r; uint8_t ok;
+        asm volatile("rdseed %0; setc %1" : "=r"(r), "=qm"(ok));
+        if (ok) { *v = r; return true; }
+        asm volatile("pause");
+    }
+    return false;
+}
+static bool cpu_rdrand64(uint64_t* v) {
+    static int has = -1;
+    if (has < 0) {
+        uint32_t a, b, c, d;
+        asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+        has = (c >> 30) & 1u;   // ecx bit 30 = rdrand (satoru)
+    }
+    if (!has) return false;
+    for (int t = 0; t < 32; t++) {
+        uint64_t r; uint8_t ok;
+        asm volatile("rdrand %0; setc %1" : "=r"(r), "=qm"(ok));
+        if (ok) { *v = r; return true; }
+        asm volatile("pause");
+    }
+    return false;
+}
+
+static uint64_t entropy64() {
+    uint64_t v = 0;
+    if (cpu_rdseed64(&v)) return v;
+    if (cpu_rdrand64(&v)) return v;
+    // last resort: tsc jitter folded through splitmix64 - weak, but strictly
+    // better than the old bare lcg and only reachable on hw with no rng. (satoru)
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t z = (((uint64_t)hi << 32) | lo) + 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+static int64_t crng_fill(uint8_t* dst, uint64_t n) {
+    static uint32_t key[8];
+    static uint64_t counter = 0;
+    static uint64_t since_reseed = ~0ull;   // force a seed on first use (satoru)
+    if (since_reseed >= 64 * 1024) {
+        for (int i = 0; i < 8; i += 2) {
+            uint64_t e = entropy64();
+            key[i]     ^= (uint32_t)e;
+            key[i + 1] ^= (uint32_t)(e >> 32);
+        }
+        uint32_t lo, hi;
+        asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        key[0] ^= lo; key[7] ^= hi;   // fold the clock in so two boots never share a stream (satoru)
+        since_reseed = 0;
+    }
+    uint64_t done = 0;
+    while (done < n) {
+        uint32_t block[16];
+        chacha20_block(key, counter++, block);
+        uint64_t take = n - done; if (take > 64) take = 64;
+        const uint8_t* src = (const uint8_t*)block;
+        for (uint64_t i = 0; i < take; i++) dst[done + i] = src[i];
+        done += take;
+    }
+    since_reseed += n;
+    return (int64_t)n;
+}
+
 // x86_64 → i386 syscall number translation.
 // Only values we actively support are listed; anything else returns -ENOSYS.
 struct NrMap { uint32_t x64; uint32_t i386; };
@@ -338,6 +444,13 @@ bool translate_nr(uint64_t x64_nr, uint32_t* out_i386) {
 
 }  // namespace
 
+// crypto-grade entropy shared by getrandom(2) and /dev/(u)random. delegates to
+// the file-static chacha20 crng above. (satoru)
+int64_t LinuxSyscall::GetRandomBytes(void* buf, uint64_t n) {
+    if (!buf || n == 0) return 0;
+    return crng_fill((uint8_t*)buf, n);
+}
+
 extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                                           uint64_t a0, uint64_t a1,
                                           uint64_t a2, uint64_t a3,
@@ -492,18 +605,13 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             return LinuxSyscall::Dispatch(LSYS_SET_TID_ADDRESS, a0, 0, 0, 0, 0);
         }
         case 318: {  // getrandom(void* buf, size_t buflen, uint flags)
-            // Weak entropy via TSC; fine for hash-seed bootstrap.
+            // crypto-grade chacha20 crng seeded from rdseed/rdrand (see
+            // crng_fill above). the old tsc-seeded lcg here was why firefox's
+            // nss/tls could never trust its keys. (satoru)
             uint8_t* dst = (uint8_t*)(uintptr_t)a0;
             size_t   n   = (size_t)a1;
             if (!dst || n == 0) return 0;
-            uint32_t lo, hi;
-            asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
-            uint64_t s = ((uint64_t)hi << 32) | lo;
-            for (size_t i = 0; i < n; ++i) {
-                s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-                dst[i] = (uint8_t)(s >> 33);
-            }
-            return (int64_t)n;
+            return crng_fill(dst, (uint64_t)n);
         }
         case 89: {  // readlink(path, buf, bufsiz)
             // shared resolver: /proc/self/exe, /proc/self/fd/N, kvfs symlinks, and

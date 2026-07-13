@@ -17,6 +17,10 @@
 #include "../system/kpkg_daemon.h"
 #include "../linux/ld_kurono.h"
 #include "../proc/scheduler.h"
+#include "../proc/smp.h"
+#include "../proc/kernel_processes.h"
+#include "../proc/kernel_locks.h"   // g_input_lock: shared with the input/gui pollers (satoru)
+#include "../proc/spinlock.h"
 #include "../media/embedded_media.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
@@ -43,6 +47,7 @@
 #include "../virt/pci_passthrough.h"
 #include "../drivers/mouse.h"
 #include "../drivers/keyboard.h"
+#include "../ui/wayland_server.h"   // route scroll to the surface under the pointer (satoru)
 #include "../system/input_manager.h"
 #include "../security/supr.h"   // supr policy / passwd commands (satoru)
 #include "../security/ksa.h"    // ksa status for `supr policy` (satoru)
@@ -416,6 +421,14 @@ void KuronoShell::PumpUI() {
     static uint32_t last_pump_ms = 0;
     if (reentrant) return;
 
+    // bsp only, unconditionally: several syscall-path call sites are ungated,
+    // so a firefox thread on an AP could drive this whole ui pipeline (input
+    // drain, wayland event emission, compositor, swap) CONCURRENTLY with the
+    // gui process - racing the wayland tx stream (duplicate serials, torn
+    // events gtk silently drops = input dead in firefox) and the damage/swap
+    // machinery (stale partial swaps = window-drag ghosts). (satoru)
+    if (SMP::CpuIndex() != 0) return;
+
     /* Always advance the wallclock so Time::GetTicks() (consumed by ping/DNS/etc.)
        keeps moving even while a synchronous shell command blocks the kernel
        main loop. Throttling only the heavy UI work below. */
@@ -423,10 +436,42 @@ void KuronoShell::PumpUI() {
     if (real_elapsed > 0)
         TimeManager::AdvanceByMs(real_elapsed);
 
+    // a LIVE gui process already owns input + rendering - this pump is only
+    // the stopgap for when the gui process is starved/blocked. running both
+    // is a second concurrent ui pipeline, which is exactly the race above.
+    // "live" = heartbeat stamped within 100ms (the gui loop stamps it every
+    // iteration; a blocked/starved gui goes silent for much longer). (satoru)
+    //
+    // NOTE: this returns WITHOUT yielding on purpose. PumpUI is called from the
+    // int-0x80 syscall entry (linux_syscall.cpp) while kls_lock is HELD, on
+    // every bsp syscall - yielding here would either deadlock (the scheduler
+    // could run a path that needs kls_lock) or cost a context switch per
+    // syscall. the block-and-yield discipline belongs at the specific BLOCKING
+    // wait loops (they deschedule / SleepMs after releasing kls_lock), not in
+    // this shared entry pump. (satoru)
+    {
+        uint32_t hb = KernelProcesses::LastGuiFrameMs();
+        if (hb != 0 && (uint32_t)(Timer::GetRealMs() - hb) < 100u) return;
+    }
+
     uint32_t now_ms = Timer::GetRealMs();
     if ((uint32_t)(now_ms - last_pump_ms) < 16u) return;
     last_pump_ms = now_ms;
     reentrant = true;
+
+    // poll the input DEVICES here, not just InputManager. when firefox is up
+    // this PumpUI (driven from firefox's own syscalls on the bsp) is what
+    // actually renders + services input - the dedicated InputProcess/GUIProcess
+    // kernel processes are starved by firefox's userland threads (measured:
+    // Mouse::Poll ran once then never). without polling the device here the
+    // scroll wheel (and fresh button/motion state) never reached the ring while
+    // the browser owned the screen. under g_input_lock like the other two
+    // pollers so no path ever reenters the 8042/backdoor mid-transaction. (satoru)
+    {
+        SpinLockCpuGuard guard(g_input_lock);
+        Keyboard::Poll();
+        Mouse::Poll();
+    }
 
     InputManager::Poll();
 
@@ -457,13 +502,24 @@ void KuronoShell::PumpUI() {
                                         Mouse::LeftClicked(), kb);
         while (Keyboard::HasChar()) {
             kb = Keyboard::GetChar();
-            DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, false, false, kb);
+            // real held state, not false: a hardcoded false here spuriously
+            // toggled the wl_pointer button edge mid-hold = double clicks. (satoru)
+            DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, Mouse::IsLeftDown(), false, kb);
         }
     }
 
     if (scroll_delta != 0) {
+        // scroll targets the surface under the POINTER (real-compositor
+        // behaviour), which also sidesteps a stale wm focus: firefox briefly
+        // owns two windows during its subsurface re-home, so focused_id can
+        // point at a since-closed window and GetFocusedWindow returns null -
+        // the reason wheel events reached here but never scrolled the page.
+        // route wayland windows straight to the compositor by pointer; fall
+        // back to the focused native window's handler otherwise. (satoru)
+        WaylandServer::ForwardPointerAxis(Mouse::mx, Mouse::my, 0, scroll_delta * 32);
         Window* fw = WindowManager::GetFocusedWindow();
-        if (fw && fw->input) fw->input(fw, 3, scroll_delta, 0);
+        if (fw && fw->input && !WaylandServer::IsWaylandWindow(fw->id))
+            fw->input(fw, 3, scroll_delta, 0);
     }
 
     DesktopEnvironment::Update();
@@ -1941,6 +1997,9 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         // run once an nvme data disk is attached). (satoru)
         if (PersistStore::SaveTree())
             p = sappend(out, p, mx, "firefox: install persisted to disk for next boot.\n");
+        // a fresh install (re-)enables the desktop icon, even if the user
+        // deleted a previous one; the desktop sync picks it up within a tick. (satoru)
+        UIConfig::SetInt("desktop.firefox_icon", 1, true);
     }
 
     p = sappend(out, p, mx, "firefox: launching /apps/firefox/firefox via ld-kurono...\n");
@@ -2098,12 +2157,13 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"gfx.webrender.max-partial-present-rects\", 0);\n"
             "lockPref(\"gfx.partialpresent.force\", 0);\n"
             "lockPref(\"layout.display-list.retain\", false);\n"
-            // (satoru) firefox has NO active window (activeWin=n) even when forced
-            // via Services.focus.activeWindow - the focus manager delegates to the
-            // nsWindow widget, which never gets real OS focus on this compositor.
-            // testmode lets the focus manager honor programmatic activation without
-            // real OS focus, so w.focus() can mark the window active. tests whether
-            // 'no active window' is what stops the painted content from presenting.
+            // (satoru) focusmanager.testmode stays TRUE: flipping it to false was
+            // tried 2026-07-12 (suspect for clicks never focusing the url bar)
+            // and firefox then crashed DETERMINISTICALLY during startup - null+0x10
+            // write at libxul offset ~0xA83532E, same rsp both boots, before the
+            // window ever mapped. real native-focus processing hits a null
+            // somewhere on this compositor; keep testmode until that is
+            // symbolized + fixed.
             "lockPref(\"focusmanager.testmode\", true);\n"
             // (satoru) TEMP: disable HTTP cache so the mirror page is refetched each
             // boot (the golden profile cached the old page; needed to test whether a
@@ -2195,7 +2255,15 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"network.captive-portal-service.enabled\", false);\n"
             "lockPref(\"network.dns.disablePrefetch\", true);\n"
             "lockPref(\"network.prefetch-next\", false);\n"
-            "lockPref(\"javascript.options.baselinejit\", true);\n"
+            // baseline jit DISABLED 2026-07-12 (satoru): opening a new tab spun
+            // up fresh jit compilation that null-derefs (ring-3 #PF cr2=0 err=7,
+            // rip in the 0x1800_xxx jit-code reservation - a jit codegen bug on
+            // kurono, same class as the reverted ion crash). that faulted a
+            // firefox thread on an ap and (before the ap-fault containment) took
+            // the whole os down on new-tab. interpreter-only is slower but does
+            // not emit the broken native code, so new tabs no longer crash. flip
+            // back to true once the jit W^X/codegen path is fixed. (satoru)
+            "lockPref(\"javascript.options.baselinejit\", false);\n"
             // ion tested 2026-07-06 and REVERTED (satoru): with ion=true the run
             // reached the window then died on a ring-3 #PF - a null WRITE (cr2=0
             // err=7) with rip inside the jit-code reservation (0x1800_xxxxxxxx),
@@ -2204,7 +2272,26 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // class; diagnosing ion codegen is out of scope for now. baseline
             // remains the workhorse.
             "lockPref(\"javascript.options.ion\", false);\n"
-            "lockPref(\"javascript.options.native_regexp\", true);\n"
+            // native_regexp DISABLED 2026-07-12 (satoru): with baseline+ion off,
+            // the regexp JIT was the LAST path still emitting native code into
+            // the 0x1800_xxx reservation - and it faulted the same way (ring-3
+            // #PF cr2=0, the panic-after-a-while + the crash when typing a
+            // search, since a search query compiles regexes). force the
+            // bytecode-interpreted regexp engine so NO jit codegen runs at all
+            // -> the 0x1800_xxx null-deref can never happen. slower regex, but
+            // the browser stops crashing. flip back once jit codegen is fixed. (satoru)
+            "lockPref(\"javascript.options.native_regexp\", false);\n"
+            // BASELINE INTERPRETER disabled 2026-07-12 (satoru): the panic that
+            // survived ion+baseline+native_regexp=off, at the SAME fixed rip
+            // 0x1800072F7F6D (cr2=0 null WRITE) on EVERY reload/search/new-tab,
+            // is not content-compiled code - it is the baseline INTERPRETER, a
+            // jit-generated interpreter loop firefox emits into the 0x1800_xxx
+            // reservation even with all jit COMPILERS off. it is the last thing
+            // writing native code, and its generated code null-derefs on kurono
+            // (a jit W^X/codegen bug). blinterp=false forces the pure c++
+            // bytecode interpreter - ZERO jit codegen - so 0x1800_xxx is never
+            // written or executed. slower js, but reload/search stop crashing. (satoru)
+            "lockPref(\"javascript.options.blinterp\", false);\n"
             "lockPref(\"javascript.options.asmjs\", false);\n"
             "lockPref(\"javascript.options.wasm\", false);\n"
             "lockPref(\"javascript.options.wasm_baselinejit\", false);\n"
@@ -2322,7 +2409,33 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             // blank tab and never navigated. (satoru)
             "lockPref(\"browser.aboutwelcome.enabled\", false);\n"
             "lockPref(\"browser.sessionstore.resume_from_crash\", false);\n"
-            "lockPref(\"browser.shell.checkDefaultBrowser\", false);\n";
+            "lockPref(\"browser.shell.checkDefaultBrowser\", false);\n"
+            "lockPref(\"browser.dom.window.dump.enabled\", true);\n"
+            // [KNAV] startup-page watchdog: firefox intermittently sits on
+            // about:blank instead of navigating to the cli url / homepage (an
+            // old known flake). if the selected tab is still blank and idle
+            // after startup, kick ONE load of the homepage; never touches a
+            // tab that navigated or is mid-load. (satoru)
+            "try {\n"
+            "  var KNT = ChromeUtils.importESModule('resource://gre/modules/Timer.sys.mjs');\n"
+            "  var KNAV_fired = false;\n"
+            "  KNT.setInterval(function() {\n"
+            "    try {\n"
+            "      if (KNAV_fired) return;\n"
+            "      var w = Services.wm.getMostRecentWindow('navigator:browser');\n"
+            "      if (!w || !w.gBrowser || !w.gBrowser.selectedBrowser) return;\n"
+            "      var sp = w.gBrowser.currentURI ? w.gBrowser.currentURI.spec : '';\n"
+            "      if (sp == 'about:blank' || sp == 'about:newtab') {\n"
+            "        if (w.gBrowser.webProgress && w.gBrowser.webProgress.isLoadingDocument) return;\n"
+            "        KNAV_fired = true;\n"
+            "        dump('[KNAV] blank tab after startup - kicking homepage load\\n');\n"
+            "        w.gBrowser.selectedBrowser.loadURI(\n"
+            "          Services.io.newURI('http://10.0.2.2/kurono/'),\n"
+            "          { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });\n"
+            "      } else { KNAV_fired = true; }\n"
+            "    } catch (e) { dump('[KNAV] err ' + e + '\\n'); }\n"
+            "  }, 15000);\n"
+            "} catch (e) { dump('[KNAV] init-err ' + e + '\\n'); }\n";
         KVFS::WriteFile("/apps/firefox/firefox.cfg", cfg, (uint32_t)__builtin_strlen(cfg));
         SerialLogger::Log("[ffcfg] wrote autoconfig (all helper child procs disabled)\r\n");
     }
@@ -2379,9 +2492,66 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         nullptr
     };
     for (int i = 0; prof_dirs[i]; i++) { KVFS::Mkdirs(prof_dirs[i]); KVFS::Chown(prof_dirs[i], 1000, 1000); }
+
+    // gtk settings: kurono has no xsettings daemon and no dconf, so
+    // gdk_screen_get_resolution() stays at its unset sentinel -1. gecko sizes
+    // every CHROME text run from the gtk ui font as pt * dpi / 72, so the tab
+    // label + urlbar computed to -0.1388px (= 10pt * -1 / 72) and no chrome
+    // text ever painted (content text is css-px sized and was fine). gtk falls
+    // back to this ini when no settings backend exists; gtk-xft-dpi is in
+    // 1024ths (96 dpi * 1024 = 98304) and flows through GtkSettings ->
+    // gdk_screen_set_resolution -> gecko. (satoru)
+    {
+        const char* gtkini =
+            "[Settings]\n"
+            "gtk-font-name = Sans 10\n"
+            "gtk-xft-dpi = 98304\n"
+            "gtk-xft-antialias = 1\n"
+            "gtk-xft-hinting = 1\n";
+        // every location this bundled gtk could read: user config (HOME=
+        // /home/user, no XDG_CONFIG_HOME override) + the sysconfdir candidates
+        // (its module paths resolve under /system, and kvfs also carries a
+        // plain /etc). (satoru)
+        const char* gtk_ini_dirs[] = { "/home/user/.config/gtk-3.0",
+                                       "/etc/gtk-3.0",
+                                       "/system/etc/gtk-3.0", nullptr };
+        for (int gi = 0; gtk_ini_dirs[gi]; gi++) {
+            char pth[96];
+            KVFS::Mkdirs(gtk_ini_dirs[gi]);
+            int n = 0; const char* d = gtk_ini_dirs[gi];
+            while (d[n] && n < 80) { pth[n] = d[n]; n++; }
+            const char* tail = "/settings.ini";
+            for (int k = 0; tail[k] && n < 95; k++) pth[n++] = tail[k];
+            pth[n] = 0;
+            KVFS::WriteFile(pth, gtkini, (uint32_t)__builtin_strlen(gtkini));
+        }
+        KVFS::Chown("/home/user/.config/gtk-3.0", 1000, 1000);
+        // belt and suspenders: even if this gtk never loads an ini, pin the
+        // chrome font explicitly via userChrome.css - the system-font path
+        // computed a NEGATIVE px size (10pt * dpi -1 / 72 = -0.1388px), which
+        // is why the tab label + urlbar text never painted while content text
+        // (css px sizes) was fine. enabled by the
+        // toolkit.legacyUserProfileCustomizations.stylesheets pref below. (satoru)
+        KVFS::Mkdirs("/home/user/.mozilla/firefox/kurono.default/chrome");
+        const char* uchrome =
+            "* {\n"
+            "  font-size: 13px !important;\n"
+            "  font-family: \"DejaVu Sans\" !important;\n"
+            "}\n"
+            // kurono's wm titlebar provides the window controls; firefox's own
+            // caption buttons would be a duplicate set. (satoru)
+            ".titlebar-buttonbox-container, .titlebar-spacer {\n"
+            "  display: none !important;\n"
+            "}\n";
+        KVFS::WriteFile("/home/user/.mozilla/firefox/kurono.default/chrome/userChrome.css",
+                        uchrome, (uint32_t)__builtin_strlen(uchrome));
+        KVFS::Chown("/home/user/.mozilla/firefox/kurono.default/chrome", 1000, 1000);
+    }
     {
         const char* prefs =
             "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n"
+            // load the profile's chrome/userChrome.css (the chrome font-size pin). (satoru)
+            "user_pref(\"toolkit.legacyUserProfileCustomizations.stylesheets\", true);\n"
             "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n"
             "user_pref(\"startup.homepage_welcome_url\", \"\");\n"
             "user_pref(\"startup.homepage_welcome_url.additional\", \"\");\n"
@@ -2445,7 +2615,7 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
                         iini, (uint32_t)__builtin_strlen(iini));
         KVFS::Chown("/home/user/.mozilla/firefox/installs.ini", 1000, 1000);
     }
-    // default to about:blank when autorun with no url, so firefox opens a real
+    // default to the kurono page when launched with no url, so firefox opens a real
     // (blank) browser window that proves the full chrome + content paint path. (satoru)
     const char* real_url = url ? url : "http://10.0.2.2/kurono/";
 

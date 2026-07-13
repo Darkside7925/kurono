@@ -113,7 +113,11 @@ enum TCPState {
 #define SOCK_DGRAM     2   // udp
 #define SOCK_RAW       3   // raw ip
 
-#define MAX_SOCKETS    16
+// firefox opens 6-200 concurrent connections for a single https page (parallel
+// tls handshakes + necko keep-alive pool); 16 starved that instantly and every
+// connection past the cap silently failed. 48 covers a real page. each socket's
+// 256kb rx ring dominates - 48*~260kb ~= 12mb static, fine on the 4gb vm. (satoru)
+#define MAX_SOCKETS    48
 // 256 kb rx ring (was 64 kb, was 8 kb). a 16-bit tcp window field tops out at
 // 64 kb, which caps a bulk download at 64kb/rtt with no window scaling; a real
 // (non-zero-rtt) link then sits idle most of each round trip. with rfc 1323
@@ -148,6 +152,22 @@ enum TCPState {
 // keepalive) still use the legacy single-slot tx_pending machinery below, so
 // handshake/close correctness is untouched. (satoru)
 #define TCP_SND_WND_SEGS 8
+
+// out-of-order reassembly: real internet paths reorder segments constantly,
+// and a single lost/late segment leaves later ones "out of order". the old
+// stack DROPPED every out-of-order segment (buffered nothing, just dup-acked),
+// so a large transfer over a lossy/jittery link - a tls handshake, a real web
+// page - stalled the instant one segment arrived early and never recovered
+// (this is why http-to-local-mirror worked but https to the internet failed).
+// we now hold a bounded set of future segments and splice them in as the gap
+// before them fills. 32 * 1460 = ~47 kb/socket, well within budget. (satoru)
+#define TCP_OOO_SEGS 32
+struct TcpOooSeg {
+    bool     in_use;
+    uint32_t seq;            // first sequence number of the held payload (satoru)
+    int      len;            // held byte count (satoru)
+    uint8_t  data[TCP_MSS];  // the out-of-order payload (satoru)
+};
 
 // one outstanding data segment on the send scoreboard. payload is kept so the
 // segment can be retransmitted from tcp tick on rto without the caller. (satoru)
@@ -219,6 +239,12 @@ struct NetSocket {
     // retransmitted per-segment on rto from TCPTick. (satoru)
     TxDataSeg tx_segs[TCP_SND_WND_SEGS];
     int       tx_seg_inflight;   // count of in_use scoreboard slots (satoru)
+
+    // out-of-order reassembly holding pen: segments received ahead of tcp_ack
+    // are parked here and spliced into the rx ring as the preceding gap fills.
+    // (satoru)
+    TcpOooSeg ooo_segs[TCP_OOO_SEGS];
+    int       ooo_count;         // count of in_use ooo slots (satoru)
 
     // non-blocking connect: when set, Connect() returns EINPROGRESS after
     // sending SYN and the 3-way handshake completes from TCPTick/RX (satoru)

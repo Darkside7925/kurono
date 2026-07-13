@@ -546,6 +546,11 @@ public:
     static int64_t Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             uint64_t edx, uint64_t esi, uint64_t edi);
 
+    // crypto-grade random bytes (chacha20 crng keyed from rdseed/rdrand) -
+    // the single entropy source behind getrandom(2) AND /dev/(u)random.
+    // implemented in linux_syscall_x64.cpp. (satoru)
+    static int64_t GetRandomBytes(void* buf, uint64_t n);
+
     // public so the x86_64 SYSCALL path can route mmap straight here with the
     // full 64-bit file offset (a5/r9) - the i386 dispatch drops it, which breaks
     // file-backed mmap of .so segments at non-zero offsets. (satoru)

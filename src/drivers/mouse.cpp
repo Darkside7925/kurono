@@ -478,6 +478,23 @@ void Mouse::Init() {
     
     FlushOutput();
 
+    // intellimouse handshake: a ps/2 mouse reports id 0x00 UNTIL the host asks
+    // for wheel mode with the magic sample-rate sequence 200,100,80 - only then
+    // does the id read back 0x03 and the 4th (z/wheel) packet byte start
+    // flowing. this was missing, so every boot fell back to "standard ps/2"
+    // and the scroll wheel was dead across the whole os. (satoru)
+    {
+        static const uint8_t magic[3] = { 200, 100, 80 };
+        bool seq_ok = true;
+        for (int i = 0; i < 3 && seq_ok; i++) {
+            seq_ok = SendMouseByteAwaitAck(PS2_CMD_SET_SAMPLE_RATE, 100000, 2) &&
+                     SendMouseByteAwaitAck(magic[i], 100000, 2);
+        }
+        if (!seq_ok)
+            SerialLogger::Log("Mouse: IntelliMouse handshake not acked\r\n");
+        FlushOutput();
+    }
+
     uint8_t detected_id = ReadID();
     if (detected_id == PS2_ID_STANDARD) {
         detected_id = reset_id;
@@ -1044,8 +1061,12 @@ bool Mouse::PollVMwareAbsolute() {
         if (pkt_status & VMWARE_BTN_RIGHT)  hw_buttons |= 0x02;
         if (pkt_status & VMWARE_BTN_MIDDLE) hw_buttons |= 0x04;
 
-        // Linux reports wheel as REL_WHEEL, -(s8)((u8)z).
-        int wheel = -(int)(int8_t)(pkt_z & 0xFF);
+        // wheel sign, measured against qemu's vmmouse (qmp injection): a
+        // physical wheel-DOWN arrives as pkt_z=+1, and kurono's convention is
+        // wheel-down = POSITIVE dz. the old linux-copied negation flipped it,
+        // so wheel-down scrolled UP - at the top of a page that is a no-op,
+        // which read as "scrolling is dead" in firefox. (satoru)
+        int wheel = (int)(int8_t)(pkt_z & 0xFF);
 
         if (pkt_status & VMWARE_RELATIVE_PACKET) {
             int new_x = mx + (int32_t)pkt_x;
