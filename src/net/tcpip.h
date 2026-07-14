@@ -128,7 +128,12 @@ enum TCPState {
 #define TCP_RX_BUFSIZE 262144
 #define TCP_TX_BUFSIZE 8192
 #define TCP_MSS        1460
-#define PENDING_IPV4_TX 8
+// firefox opens 6-24 connections at once; the FIRST packet to an unresolved
+// next-hop sends the arp, the rest just queue on it (linux keeps one neighbour
+// per next-hop with a shared arp_queue - net/core/neighbour.c). 8 slots
+// overflowed instantly under that storm ("pending ARP queue full" -> SendTCP
+// SYN FALSE); 32 covers a real page's parallel connects. (satoru)
+#define PENDING_IPV4_TX 32
 
 // rfc 1323 window scaling. TCP_RCV_WSCALE is the shift we advertise for OUR
 // receive window: 2^7 = 128, so a 256 kb buffer fits in the 16-bit window
