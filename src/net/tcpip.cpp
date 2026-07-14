@@ -389,6 +389,12 @@ void TCPStack::ProcessARP(const void* data, int len) {
         }
     }
 
+    // we just learned sender_ip's MAC: flush every packet queued on it AT ONCE,
+    // exactly when the resolution lands (linux neigh_update drains arp_queue on
+    // the reply) rather than waiting for the next 10ms poll. this is what makes a
+    // burst of parallel connects go out the instant the gateway answers. (satoru)
+    ServicePendingIPv4();
+
     // reply to requests for our ip
     if (ntohs(arp->opcode) == ARP_OP_REQUEST && target_ip == local_ip) {
         uint8_t frame[ETH_HLEN + sizeof(ARPHeader)];
@@ -515,6 +521,15 @@ bool TCPStack::QueuePendingIPv4(uint32_t next_hop, const void* packet, int len) 
         return true;
     }
 
+    // one probe per next-hop (linux neighbour model): if another packet is
+    // already waiting on THIS next_hop's arp, don't fire a second request - just
+    // queue behind it. only the first packet to an unresolved next-hop probes;
+    // the reply (ProcessARP) flushes the whole backlog at once. (satoru)
+    bool probe_in_flight = false;
+    for (int i = 0; i < PENDING_IPV4_TX; i++) {
+        if (pending_ipv4[i].active && pending_ipv4[i].next_hop == next_hop) { probe_in_flight = true; break; }
+    }
+
     for (int i = 0; i < PENDING_IPV4_TX; i++) {
         if (pending_ipv4[i].active) continue;
         pending_ipv4[i].active = true;
@@ -523,7 +538,7 @@ bool TCPStack::QueuePendingIPv4(uint32_t next_hop, const void* packet, int len) 
         pending_ipv4[i].last_arp_ms = Timer::GetTicks();
         pending_ipv4[i].arp_retries = 1;
         for (int j = 0; j < len; j++) pending_ipv4[i].packet[j] = bytes[j];
-        ARPRequest(next_hop);
+        if (!probe_in_flight) ARPRequest(next_hop);   // coalesce: one arp per next-hop (satoru)
         return true;
     }
 
