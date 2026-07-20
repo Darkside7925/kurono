@@ -132,6 +132,18 @@ ifneq ($(wildcard $(FONTS_TAR_BIN)),)
 MEDIA_OBJS   += $(FONTS_TAR_OBJ)
 endif
 
+# ─── NSS runtime libs (embedded via objcopy) ────────────────────────────────
+# firefox's libsoftokn3.so has DT_NEEDED libsqlite3.so.0 which the firefox tar
+# does NOT ship (its libmozsqlite3.so exports nothing), so NSS/PSM init died
+# before opening cert9.db - the "Personal Security Manager" / https blocker.
+# embed a musl-built libsqlite3.so.0, unpacked to /apps/firefox/lib at firefox
+# launch (self-heals persisted installs too). (satoru)
+NSSLIBS_TAR_BIN = $(SRC)/assets_nsslibs.tar
+NSSLIBS_TAR_OBJ = $(BUILD)/kurono_nsslibs.o
+ifneq ($(wildcard $(NSSLIBS_TAR_BIN)),)
+MEDIA_OBJS   += $(NSSLIBS_TAR_OBJ)
+endif
+
 # ─── User programs (test ELF64 binaries embedded into the kernel) ───────
 USERPROGS_DIR     = $(SRC)/userprogs
 HELLO_USER_ELF    = $(BUILD)/userprogs/hello.elf
@@ -153,6 +165,12 @@ WLSHM_OBJ         = $(BUILD)/userprogs/wl_shm_test_user_embed.o
 # pthreads smoke test (proves CLONE_THREAD + futex) (satoru)
 PTHREAD_ELF       = $(USERPROGS_DIR)/pthread_test.elf
 PTHREAD_OBJ       = $(BUILD)/userprogs/pthread_test_user_embed.o
+# signal-delivery self-test (proves rt_sigaction/procmask/sigreturn + kill). built
+# from source with musl-gcc (unlike the prebuilt .elf blobs) then embedded. (satoru)
+MUSLCC            = musl-gcc
+SIGNAL_SRC        = $(USERPROGS_DIR)/signal_test.c
+SIGNAL_ELF        = $(BUILD)/userprogs/signal_test.elf
+SIGNAL_OBJ        = $(BUILD)/userprogs/signal_test_user_embed.o
 # dynamic musl pie + its libc.so: first real exercise of the ld-kurono dynamic path (satoru)
 DYNTEST_ELF       = $(USERPROGS_DIR)/dyntest.elf
 DYNTEST_OBJ       = $(BUILD)/userprogs/dyntest_user_embed.o
@@ -162,7 +180,7 @@ MUSL_LIBC_OBJ     = $(BUILD)/userprogs/musl_libc_user_embed.o
 # library via the new file-backed mmap path (satoru)
 LIBFOO_SO         = $(USERPROGS_DIR)/libfoo.so
 LIBFOO_OBJ        = $(BUILD)/userprogs/libfoo_user_embed.o
-USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ) $(DYNTEST_OBJ) $(MUSL_LIBC_OBJ) $(LIBFOO_OBJ)
+USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ) $(SIGNAL_OBJ) $(DYNTEST_OBJ) $(MUSL_LIBC_OBJ) $(LIBFOO_OBJ)
 
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
@@ -203,6 +221,7 @@ CXX_SRCS = \
 	$(SRC)/kernel/userspace.cpp \
 	$(SRC)/kernel/elf_loader.cpp \
     $(SRC)/kernel/time.cpp \
+    $(SRC)/kernel/kvdso.cpp \
     $(SRC)/kernel/system.cpp \
 	$(SRC)/kernel/panic.cpp \
     $(SRC)/kernel/hrtimer.cpp \
@@ -399,6 +418,17 @@ KURONO_GUI_RUN ?=
 # headless self-test gates, e.g. KURONO_EXTRA_CMDLINE='kurono.kdf.test kurono.kdf.poweroff=1'.
 # (satoru)
 KURONO_EXTRA_CMDLINE ?=
+# firefox on the KLS needs AP thread-scheduling. the scheduler is cooperative
+# with no preemption on the bsp, so without this every firefox worker thread
+# (webrender compositor, rayon, ipc) timeshares cpu0 and any one that spins in
+# userspace before parking (rust parking_lot) starves the rest - the chrome main
+# wedges mid-startup and the window never paints (the boot-stall lottery). the
+# whole prior smp render/futex/migration body of work was built and validated
+# WITH kurono.apthreads=1, but the shipped grub cmdline was missing it. measured
+# on this tree: with the flag firefox progresses ~2x further into window setup
+# and 0 boots crashed; without it firefox goes quiet at ~t=66s. auto-enable it
+# whenever we launch firefox; other gui targets are unaffected. (satoru)
+KURONO_FF_APTHREADS := $(if $(findstring firefox,$(KURONO_GUI_RUN)),kurono.apthreads=1,)
 # autologin: bypass the lockscreen and boot straight to the desktop. on by
 # default so `make iso` / start.ps1 produce a desktop-booting image -- the
 # lockscreen's blocking Show() loop otherwise stalls headless/vm boots.
@@ -490,6 +520,15 @@ $(FONTS_TAR_OBJ): $(FONTS_TAR_BIN)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  kurono_fonts kurono_fonts.o && \
 	rm -f kurono_fonts
+
+# ─── Embed NSS runtime libs tar via objcopy (binary → ELF .rodata) ────────
+$(NSSLIBS_TAR_OBJ): $(NSSLIBS_TAR_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/kurono_nsslibs && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kurono_nsslibs kurono_nsslibs.o && \
+	rm -f kurono_nsslibs
 
 # ─── Embed Debian rootfs image via objcopy (binary → ELF .rodata) ───────
 $(DEBIAN_ROOTFS_OBJ): $(DEBIAN_ROOTFS_BIN)
@@ -605,6 +644,17 @@ $(PTHREAD_OBJ): $(PTHREAD_ELF)
 	  pthread_test.elf pthread_test_user_embed.o
 	rm -f $(BUILD)/userprogs/pthread_test.elf
 
+# compile the signal-delivery self-test from source (musl-static, no-pie ET_EXEC)
+# then embed it as a blob, same as the prebuilt userprogs (satoru)
+$(SIGNAL_ELF): $(SIGNAL_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(SIGNAL_OBJ): $(SIGNAL_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  signal_test.elf signal_test_user_embed.o
+
 # embed the dynamic musl pie blob (first ld-kurono dynamic-load test) (satoru)
 $(DYNTEST_OBJ): $(DYNTEST_ELF)
 	@mkdir -p $(dir $@)
@@ -686,6 +736,24 @@ $(BUILD)/kernel/elf_loader.o: $(SRC)/kernel/elf_loader.cpp
 	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
 
 $(BUILD)/hal/hal.o: $(SRC)/hal/hal.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# SerialLogger runs from EVERY context including irq + exception paths; the
+# LogHex64 string-literal buf init vectorised into movaps %xmm0,(%rsp) and
+# #GP'd on the misaligned irq stack when the futex sweep logged a wedge (the
+# p4 boot3 / p5 boot5 "graph strings on the panic stack" kernel panics). (satoru)
+$(BUILD)/drivers/serial.o: $(SRC)/drivers/serial.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# smp carries the ap timer preempt + tlb ipi handlers (isr context). (satoru)
+$(BUILD)/proc/smp.o: $(SRC)/proc/smp.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# vmm's hardened page walks now run from the futex sweep (irq context). (satoru)
+$(BUILD)/kernel/vmm.o: $(SRC)/kernel/vmm.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
 
@@ -828,7 +896,7 @@ iso: all efi
 	@echo 'menuentry "Kurono OS (Multiboot2)" {'                       >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono OS kernel (multiboot2)..."'         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",) $(KURONO_EXTRA_CMDLINE)' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",) $(KURONO_FF_APTHREADS) $(KURONO_EXTRA_CMDLINE)' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded OK. Booting..."'                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg

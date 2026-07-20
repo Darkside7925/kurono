@@ -6,6 +6,7 @@
 #include "system.h"
 #include "heap.h"
 #include "time.h"
+#include "kvdso.h"
 #include "memory_mgr.h"
 #include "buddy.h"
 #include "slab.h"
@@ -37,6 +38,7 @@
 #include "../fs/vfs.h"
 #include "../fs/kvfs.h"
 #include "../fs/persist.h"
+#include "../fs/kfs.h"         // release the boot-restore metadata caches (satoru)
 #include "../fs/kfs_bench.h"   // headless storage benchmark (kurono.kfsbench) (satoru)
 #include "../drivers/nvme.h"   // command-count stats for the kfstest speed proof (satoru)
 #include "../drivers/usb.h"
@@ -1211,6 +1213,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.apthreads=1") || boot_has_token(boot_cmdline, "kurono.apthreads")) {
             SMP::SetApThreadSched(true);
         }
+        // firefox jit tier experiment gate: kurono.ffjit=1 (blinterp) or =2
+        // (+baseline+native_regexp). default 0 = interpreter-only. (satoru)
+        {
+            char jv[8]; jv[0] = 0;
+            if (boot_get_value(boot_cmdline, "kurono.ffjit", jv, (int)sizeof(jv)) && jv[0]) {
+                int lvl = jv[0] - '0';
+                if (lvl >= 0 && lvl <= 3) KuronoShell::SetFirefoxJit(lvl);
+            }
+        }
         boot_get_value(boot_cmdline, "kurono.cli.run", boot_cli_run, (int)sizeof(boot_cli_run));
         // optional GUI autorun: open Terminal and queue a command. Used purely
         // for headless QEMU debug runs where we cannot type interactively.
@@ -1338,6 +1349,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // 15s on WHPX and minutes on VMware (the black screen after the logo).
     // CPUDetect::Init calibrates the TSC via the precise PIT ch2 one-shot. (satoru)
     CPUDetect::Init();
+
+    // allocate the userspace vdso time page now that the tsc clock is calibrated;
+    // OnTimerTick refreshes it each ms and ld-kurono maps it read-only into every
+    // process so clock_gettime/gettimeofday are served in userspace (the boot-
+    // speed fix - see kvdso.h). (satoru)
+    KernelVdso::Init();
 
     // smp phase 1: enable the local apic + enumerate the cpus (no APs started yet,
     // so this is harmless on the single-core path). (satoru)
@@ -1846,6 +1863,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // tree; re-assert the canonical /kurono dirs + compat symlinks afterward
         // so the overlay is intact regardless of what the on-disk image carried. (satoru)
         KVFS::InstallCanonicalLayout();
+        // seed the persisted-firefox probe here on the single-threaded init
+        // path (the volume is already mounted from LoadTree), so the desktop's
+        // firefox-icon sync can read the cached answer without ever touching
+        // KFS/nvme from the gui process. (satoru)
+        if (ok && PersistStore::HasPersistedFirefox())
+            SerialLogger::Log("[persist] firefox install present on data disk\r\n");
+        // NOTE: deliberately NO KFS::Unmount() here. freeing ~36 mb of kernel
+        // heap in the middle of the fragile SMP bringup window regressed boot
+        // reliability hard (6/6 no-window vs the ~50% baseline). the metadata
+        // is instead released by RestoreApps()/SaveTree(), which run well after
+        // bringup once firefox is actually using the persist volume - the ram
+        // is still reclaimed, just not during bringup. (satoru)
     }
     // headless two-boot kfs persistence test (gated by cmdline kurono.kfstest):
     // boot 1 - no marker present after restore - writes a small user-data tree
@@ -2121,6 +2150,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                         EmbeddedUserprogs::PthreadTestSize());
         SerialLogger::Log("[Userspace] /usr/bin/pthread_test registered (");
         SerialLogger::LogDec((int)EmbeddedUserprogs::PthreadTestSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    // register the signal-delivery self-test so it can prove real syscall-boundary
+    // signal delivery (rt_sigaction/procmask/sigreturn + kill). runs from the shell
+    // or an [aptest]-style launch; prints "SIGTEST PASS" to com1 on success. (satoru)
+    if (EmbeddedUserprogs::HasSignalTest()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/signal_test",
+                        EmbeddedUserprogs::SignalTestData(),
+                        EmbeddedUserprogs::SignalTestSize());
+        SerialLogger::Log("[Userspace] /usr/bin/signal_test registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::SignalTestSize());
         SerialLogger::Log(" bytes)\r\n");
     }
     // register the dynamic musl pie + its libc.so. this is the first real
@@ -3220,13 +3261,16 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, mouse_down, mouse_clicked, kb_char);
             while (Keyboard::HasChar()) {
                 kb_char = Keyboard::GetChar();
-                DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, false, false, kb_char);
+                // real held state, not false: a hardcoded false here spuriously
+                // toggled the wl_pointer button edge mid-hold = double clicks. (satoru)
+                DesktopEnvironment::HandleInput(Mouse::mx, Mouse::my, Mouse::IsLeftDown(), false, kb_char);
             }
 
-            // forward scroll to focused window
+            // forward scroll to the surface under the pointer (matches PumpUI). (satoru)
             if (scroll_delta != 0) {
+                WaylandServer::ForwardPointerAxis(Mouse::mx, Mouse::my, 0, scroll_delta * 32);
                 Window* fw = WindowManager::GetFocusedWindow();
-                if (fw && fw->input) {
+                if (fw && fw->input && !WaylandServer::IsWaylandWindow(fw->id)) {
                     fw->input(fw, 3, scroll_delta, 0); // event 3 = scroll
                 }
             }

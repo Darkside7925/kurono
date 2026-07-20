@@ -257,6 +257,7 @@ struct Process;
 #define LSYS_PIDFD_OPEN_       700
 #define LSYS_PIDFD_SEND_SIG    701
 #define LSYS_GETPRIORITY_DONE  702
+#define LSYS_FLOCK             703   // whole-file advisory lock (satoru)
 
 // AF_UNIX socket family - internal IDs.  Dispatch also accepts the
 // Linux x86_64 numbers (41..55) where they don't collide.
@@ -445,6 +446,7 @@ enum LinuxFdType {
     LFD_CONSOLE,     // stdin/stdout/stderr → terminal
     LFD_PIPE,
     LFD_DEVNULL,
+    LFD_DEVURANDOM,  // /dev/urandom + /dev/random - reads return crng bytes (satoru)
     LFD_PROC,        // /proc virtual files
     LFD_SOCKET,      // AF_UNIX socket - backend_fd = UnixSocket sd
     LFD_MEMFD,       // memfd_create - backend_fd = kvfs anon file fd
@@ -501,6 +503,14 @@ struct LinuxProcess {
     uint32_t signal_mask;
     uint32_t pending_signals;
 
+    // real signal delivery state (satoru): 64-bit pending + blocked masks.
+    // signals are delivered STRICTLY at the syscall-return boundary (no async
+    // preemption injection) by DeliverPendingSignals(). the legacy uint32
+    // signal_mask/pending_signals above are retained for source compatibility
+    // (fork/clone copy them) but the honest delivery path reads these two. (satoru)
+    uint64_t sig_pending;   // signals posted, awaiting delivery (bit = signo) (satoru)
+    uint64_t sig_blocked;   // rt_sigprocmask blocked mask (satoru)
+
     // session / process group / controlling terminal (POSIX session model)
     uint32_t sid;          // session id (0 = none)
     uint32_t pgid;         // process group id
@@ -533,6 +543,16 @@ public:
     // loop. no-op if the task has no LinuxProcess. (satoru)
     static void SyncCurrentToTask(Process* task);
     static bool HandlePageFault(InterruptFrame* frame);
+
+    // real signal delivery, called by BOTH syscall entry paths (int 0x80 and the
+    // x86_64 SYSCALL fast path) right before returning to ring-3. if a handled,
+    // unblocked signal is pending it rewrites the saved user frame to enter the
+    // handler on a freshly-built rt sigframe (siginfo + ucontext); rt_sigreturn
+    // undoes it. delivery happens ONLY at this boundary - never injected
+    // asynchronously - so a process with no registered handler is unaffected.
+    // public because the entry stubs that call it are free/extern-C functions, not
+    // members. (satoru)
+    static void DeliverPendingSignals(InterruptFrame* frame);
     // register the irq0 timer-preemption handler (round-robins user threads). (satoru)
     static void EnableTimerPreemption();
 
@@ -588,6 +608,10 @@ public:
     // binary shows exactly which numbers it still needs. rate-limited so a busy
     // poll loop on a missing nr cannot flood COM1. (satoru)
     static void LogEnosys(uint64_t nr, const char* name);
+    // x64 sleep: correct 64-bit timespec semantics + a real deschedule (Blocked
+    // + sleep_ticks promotion, ap park). called from the x64 dispatcher (case
+    // 35/230); kls-exempt path only - see task 17. (satoru)
+    static int32_t SleepMs64(uint64_t ms);
 
     // stats
     static int  ActiveProcessCount();

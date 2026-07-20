@@ -41,6 +41,10 @@ SysTime TimeManager::NowUTC() {
     SysTime r; r.us = now_us; return r;
 }
 
+uint64_t TimeManager::RealtimeBaseSeconds() {
+    return (uint64_t)boot_utc_s + (uint64_t)ntp_offset_s;
+}
+
 SysTime TimeManager::NowLocal() {
     SysTime u = NowUTC();
     int64_t off = (int64_t)tz_minutes * 60ll * 1000000ll;

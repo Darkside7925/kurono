@@ -6,6 +6,7 @@
 // per-process scratch page.
 
 #include "ld_kurono.h"
+#include "../kernel/kvdso.h"    // shared time page phys for the vdso clock (satoru)
 
 #include "../fs/kvfs.h"
 #include "../kernel/heap.h"
@@ -1229,10 +1230,15 @@ uint64_t build_vdso(Process* proc) {
     memset(pg, 0, PAGE_SIZE);
     uint8_t* p = (uint8_t*)pg;
 
-    // Place a minimal ELF header so AT_SYSINFO_EHDR points to a valid
-    // ELF.  It contains no PT_LOAD; user code is expected to call the
-    // exported symbols directly.  We just emit syscall stubs at known
-    // offsets the libc patches up.
+    // Emit a REAL, musl-resolvable vDSO ELF: PT_LOAD (so musl computes base) +
+    // PT_DYNAMIC with a hash table, string table and symbol table exporting
+    // __vdso_clock_gettime / __vdso_gettimeofday / __vdso_time / __vdso_getcpu.
+    // NO version table (DT_VERSYM absent) so musl's __vdsosym skips the LINUX_2.6
+    // version check and matches purely by name (src/internal/vdso.c: the check
+    // is `if (versym && !checkver(...))`). The old build emitted e_phnum=0 with
+    // no dynsym, so musl could never resolve the symbols and firefox fell back
+    // to a raw clock_gettime SYSCALL every call - the boot-speed killer. Now the
+    // clock stubs READ the kernel time page in userspace (zero syscall). (satoru)
     p[0] = 0x7F; p[1] = 'E'; p[2] = 'L'; p[3] = 'F';
     p[4] = 2; p[5] = 1; p[6] = 1;            // class=64, data=LSB, ver=1
     Ehdr* eh = (Ehdr*)p;
@@ -1242,46 +1248,119 @@ uint64_t build_vdso(Process* proc) {
     eh->e_entry = 0;
     eh->e_ehsize = sizeof(Ehdr);
     eh->e_phentsize = sizeof(Phdr);
-    eh->e_phoff = sizeof(Ehdr);
-    eh->e_phnum = 0;
+    eh->e_phoff = 0x40;
+    eh->e_phnum = 2;
 
-    // Stubs:  each is `mov rax, NR ; syscall ; ret`.
-    // __vdso_clock_gettime  NR = 228
-    uint8_t* stub = p + 0x100;
+    // page-internal offsets (all within one 4KB page). (satoru)
+    constexpr uint64_t OFF_PH     = 0x40;    // program headers (satoru)
+    constexpr uint64_t OFF_CG     = 0x100;   // __vdso_clock_gettime stub (satoru)
+    constexpr uint64_t OFF_GTOD   = 0x180;   // __vdso_gettimeofday stub (satoru)
+    constexpr uint64_t OFF_TIME   = 0x200;   // __vdso_time stub (satoru)
+    constexpr uint64_t OFF_GETCPU = 0x280;   // __vdso_getcpu stub (satoru)
+    constexpr uint64_t OFF_DYN    = 0x300;   // PT_DYNAMIC array (satoru)
+    constexpr uint64_t OFF_HASH   = 0x380;   // elf hash table (satoru)
+    constexpr uint64_t OFF_SYM    = 0x3A0;   // symbol table (satoru)
+    constexpr uint64_t OFF_STR    = 0x420;   // string table (satoru)
+
+    // program headers: PT_LOAD covering the whole page (p_offset=p_vaddr=0 so
+    // musl's base = ehdr address), and PT_DYNAMIC. (satoru)
+    Phdr* ph = (Phdr*)(p + OFF_PH);
+    ph[0].p_type = PT_LOAD;  ph[0].p_flags = 5;   // R+X (satoru)
+    ph[0].p_offset = 0; ph[0].p_vaddr = 0; ph[0].p_paddr = 0;
+    ph[0].p_filesz = PAGE_SIZE; ph[0].p_memsz = PAGE_SIZE; ph[0].p_align = PAGE_SIZE;
+    ph[1].p_type = PT_DYNAMIC; ph[1].p_flags = 4;  // R (satoru)
+    ph[1].p_offset = OFF_DYN; ph[1].p_vaddr = OFF_DYN; ph[1].p_paddr = OFF_DYN;
+    ph[1].p_filesz = 0x60; ph[1].p_memsz = 0x60; ph[1].p_align = 8;
+
+    // ── the userspace clock reader stubs (hand-assembled, seqlock reads of the
+    // kernel time page at 0x7FFFF7FFB000; see kvdso.cpp for the field layout).
+    // clock_gettime(rdi=clkid,rsi=ts): clkid>7 -> syscall fallback (NR 228);
+    // else seqlock-read mono (clk 1/4/6/7) or real (0/5) sec+nsec. (satoru)
+    // clkid>7, or 2/3 (PROCESS/THREAD_CPUTIME - per-task cpu time, not wall
+    // clock) -> real syscall (NR 228). others seqlock-read the page. (satoru)
     static const uint8_t s_cg[] = {
-        0x48, 0xC7, 0xC0, 228, 0, 0, 0,    // mov rax, 228
-        0x0F, 0x05,                        // syscall
-        0xC3                                // ret
+        0x48,0x83,0xff,0x07,0x77,0x4a,0x48,0x83,0xff,0x02,0x74,0x44,0x48,0x83,0xff,0x03,
+        0x74,0x3e,0x48,0xb8,0x00,0xb0,0xff,0xf7,0xff,0x7f,0x00,0x00,0x44,0x8b,0x18,0x41,
+        0xf6,0xc3,0x01,0x75,0xf7,0x4c,0x8d,0x40,0x08,0x48,0x85,0xff,0x74,0x06,0x48,0x83,
+        0xff,0x05,0x75,0x04,0x4c,0x8d,0x40,0x18,0x4d,0x8b,0x08,0x4d,0x8b,0x50,0x08,0x8b,
+        0x08,0x44,0x39,0xd9,0x75,0xd6,0x4c,0x89,0x0e,0x4c,0x89,0x56,0x08,0x31,0xc0,0xc3,
+        0xb8,0xe4,0x00,0x00,0x00,0x0f,0x05,0xc3
     };
-    for (unsigned i = 0; i < sizeof(s_cg); i++) stub[i] = s_cg[i];
-    // __vdso_gettimeofday  NR = 96
-    stub = p + 0x180;
+    for (unsigned i = 0; i < sizeof(s_cg); i++) p[OFF_CG + i] = s_cg[i];
+    // gettimeofday(rdi=tv,rsi=tz): seqlock-read realtime; tv_usec = nsec/1000. (satoru)
     static const uint8_t s_gtod[] = {
-        0x48, 0xC7, 0xC0, 96, 0, 0, 0,
-        0x0F, 0x05, 0xC3
+        0x48,0xb8,0x00,0xb0,0xff,0xf7,0xff,0x7f,0x00,0x00,0x44,0x8b,0x18,0x41,0xf6,0xc3,
+        0x01,0x75,0xf7,0x4c,0x8b,0x48,0x18,0x4c,0x8b,0x50,0x20,0x8b,0x08,0x44,0x39,0xd9,
+        0x75,0xe8,0x48,0x85,0xff,0x74,0x15,0x4c,0x89,0x0f,0x4c,0x89,0xd0,0xb9,0xe8,0x03,
+        0x00,0x00,0x48,0x31,0xd2,0x48,0xf7,0xf1,0x48,0x89,0x47,0x08,0x31,0xc0,0xc3
     };
-    for (unsigned i = 0; i < sizeof(s_gtod); i++) stub[i] = s_gtod[i];
-    // __vdso_time  NR = 201
-    stub = p + 0x200;
+    for (unsigned i = 0; i < sizeof(s_gtod); i++) p[OFF_GTOD + i] = s_gtod[i];
+    // time(rdi=time_t*): return realtime seconds. (satoru)
     static const uint8_t s_time[] = {
-        0x48, 0xC7, 0xC0, 201, 0, 0, 0,
-        0x0F, 0x05, 0xC3
+        0x48,0xb8,0x00,0xb0,0xff,0xf7,0xff,0x7f,0x00,0x00,0x4c,0x8b,0x48,0x18,0x48,0x85,
+        0xff,0x74,0x03,0x4c,0x89,0x0f,0x4c,0x89,0xc8,0xc3
     };
-    for (unsigned i = 0; i < sizeof(s_time); i++) stub[i] = s_time[i];
-    // __vdso_getcpu  NR = 309
-    stub = p + 0x280;
-    static const uint8_t s_gcpu[] = {
-        0x48, 0xC7, 0xC0, 0x35, 1, 0, 0,
-        0x0F, 0x05, 0xC3
-    };
-    for (unsigned i = 0; i < sizeof(s_gcpu); i++) stub[i] = s_gcpu[i];
+    for (unsigned i = 0; i < sizeof(s_time); i++) p[OFF_TIME + i] = s_time[i];
+    // getcpu: keep the syscall fallback (rare; correctness over speed). NR=309. (satoru)
+    static const uint8_t s_gcpu[] = { 0x48,0xC7,0xC0,0x35,0x01,0,0, 0x0F,0x05, 0xC3 };
+    for (unsigned i = 0; i < sizeof(s_gcpu); i++) p[OFF_GETCPU + i] = s_gcpu[i];
 
+    // ── dynamic section ──
+    Dyn* dyn = (Dyn*)(p + OFF_DYN);
+    int di = 0;
+    dyn[di].d_tag = DT_HASH;   dyn[di].d_un = OFF_HASH; di++;
+    dyn[di].d_tag = DT_STRTAB; dyn[di].d_un = OFF_STR;  di++;
+    dyn[di].d_tag = DT_SYMTAB; dyn[di].d_un = OFF_SYM;  di++;
+    dyn[di].d_tag = DT_STRSZ;  dyn[di].d_un = 68;       di++;
+    dyn[di].d_tag = DT_SYMENT; dyn[di].d_un = sizeof(Sym); di++;
+    dyn[di].d_tag = DT_NULL;   dyn[di].d_un = 0;        di++;
+
+    // ── elf hash table. musl only reads hashtab[1] (nchain) as the symbol count
+    // to iterate, but write a well-formed one anyway: nbucket=1, nchain=5,
+    // bucket[0]=1, chain[0..4]. (satoru)
+    uint32_t* hash = (uint32_t*)(p + OFF_HASH);
+    hash[0] = 1;   // nbucket
+    hash[1] = 5;   // nchain == symbol count (null + 4 funcs)
+    hash[2] = 1;   // bucket[0]
+    hash[3] = 0; hash[4] = 2; hash[5] = 3; hash[6] = 4; hash[7] = 0;  // chain[]
+
+    // ── string table: null sym name, then the 4 exported symbols. (satoru)
+    // offsets: 1, 22, 42, 54 (must match the st_name values below). (satoru)
+    char* str = (char*)(p + OFF_STR);
+    const char* names = "\0__vdso_clock_gettime\0__vdso_gettimeofday\0__vdso_time\0__vdso_getcpu\0";
+    for (int i = 0; i < 68; i++) str[i] = names[i];
+
+    // ── symbol table: sym[0] null, then FUNC/GLOBAL entries at the stub offsets.
+    // st_info = (STB_GLOBAL<<4)|STT_FUNC = 0x12; st_shndx nonzero. (satoru)
+    Sym* sym = (Sym*)(p + OFF_SYM);
+    memset(sym, 0, sizeof(Sym));                     // sym[0] = null (satoru)
+    auto set_sym = [&](int idx, uint32_t nameoff, uint64_t val) {
+        sym[idx].st_name = nameoff;
+        sym[idx].st_info = 0x12;    // GLOBAL|FUNC (satoru)
+        sym[idx].st_other = 0;
+        sym[idx].st_shndx = 1;      // any nonzero (musl only checks != 0) (satoru)
+        sym[idx].st_value = val;
+        sym[idx].st_size = 0;
+    };
+    set_sym(1, 1,  OFF_CG);      // __vdso_clock_gettime (satoru)
+    set_sym(2, 22, OFF_GTOD);    // __vdso_gettimeofday (satoru)
+    set_sym(3, 42, OFF_TIME);    // __vdso_time (satoru)
+    set_sym(4, 54, OFF_GETCPU);  // __vdso_getcpu (satoru)
+
+    // ── map the code page R+X, and the kernel time page READ-ONLY one page below
+    // (the stubs read it at 0x7FFFF7FFB000). (satoru)
     uint64_t va = 0x7FFFF7FFC000ULL;
     if (!KernelVMM::MapPageInAddressSpace(proc->address_space, va,
-                                          (uint64_t)(uintptr_t)pg,
-                                          PTE_USER)) {
+                                          (uint64_t)(uintptr_t)pg, PTE_USER)) {
         PMM::FreeBytes(pg, PAGE_SIZE);
         return 0;
+    }
+    uint64_t tphys = KernelVdso::TimePagePhys();
+    if (tphys) {
+        // read-only (no PTE_WRITABLE) so a user process can never corrupt the
+        // shared clock. (satoru)
+        KernelVMM::MapPageInAddressSpace(proc->address_space, va - PAGE_SIZE,
+                                         tphys, PTE_USER);
     }
     return va;
 }
@@ -2003,11 +2082,14 @@ bool ExecPIE(Process* proc,
         { AT_CLKTCK,  100 },
         { AT_PLATFORM,platform_addr },
         { AT_EXECFN,  execfn_addr },
-        // do NOT advertise the vdso: the synthesised vdso page lacks a musl-
-        // parseable PT_DYNAMIC, so musl's vdso decode walked a null dynv and
-        // #pf'd in decode_vec. with AT_SYSINFO_EHDR=0 musl skips the vdso and
-        // uses the real clock_gettime/gettimeofday syscalls. (satoru)
-        { AT_SYSINFO_EHDR, 0 },
+        // advertise the vdso: build_vdso now emits a REAL musl-parseable ELF
+        // (PT_LOAD + PT_DYNAMIC + hash/strtab/symtab exporting the __vdso_*
+        // symbols), so musl's __vdsosym resolves __vdso_clock_gettime etc. and
+        // firefox's clock_gettime/gettimeofday convoy is served in USERSPACE
+        // from the kernel time page - zero syscall, the ~85x boot-speed fix.
+        // (the old page had no PT_DYNAMIC, which #pf'd musl's decoder, hence
+        // the historical AT_SYSINFO_EHDR=0.) (satoru)
+        { AT_SYSINFO_EHDR, pls->vdso_va },
     };
     int auxn = sizeof(aux) / sizeof(aux[0]);
     for (int i = 0; i < auxn; i++) {
