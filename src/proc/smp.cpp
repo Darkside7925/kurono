@@ -555,6 +555,13 @@ void SMP::BroadcastTlbFlush() {
     __atomic_store_n(&s_bcast_lock, 0u, __ATOMIC_RELEASE);
 }
 
+// task 21: expose the silent shootdown-timeout counter so the wedge probe can
+// correlate timed-out flushes (stale peers + immediate va reuse) with the
+// lost-write wedge. (satoru)
+uint32_t SMP::TlbFlushTimeouts() {
+    return __atomic_load_n(&g_tlb_flush_timeouts, __ATOMIC_RELAXED);
+}
+
 void SMP::HandleTlbIpi() {
     uint64_t c3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(c3));

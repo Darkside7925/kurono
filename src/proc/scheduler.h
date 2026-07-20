@@ -464,4 +464,6 @@ public:
     // idle-ap maintenance: futex heal + deferred-wake promotion, called by the
     // ap dispatch loop while parked in ring-0 (task 17). (satoru)
     static void ApIdleMaint();
+    // task 21 a/b: hard-pin threads to their last cpu (kurono.pincpu=1). (satoru)
+    static void SetPinCpu(bool on);
 };
