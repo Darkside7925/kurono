@@ -1074,6 +1074,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // dropping straight to the desktop. gated by the "Kurono Setup" grub entry
     // (kurono.setup=1). the main entry stays autologin -> desktop. (satoru)
     bool boot_setup = false;
+    bool boot_kmemx_off = false;  // kurono.kmemx=0 a/b kill switch (task 20) (satoru)
     int  boot_setup_screen = 0;   // optional start screen for the setup wizard (satoru)
     char boot_cli_run[160];
     boot_cli_run[0] = 0;
@@ -1101,6 +1102,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // autologin: bypass lockscreen + first-boot wizard, land on desktop. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.autologin=1") || boot_has_token(boot_cmdline, "kurono.autologin")) {
             boot_autologin = true;
+        }
+        // kmemx a/b kill switch - parsed HERE with the other early flags: the
+        // multiboot cmdline string can be reclaimed/clobbered by the allocator
+        // inits, so a late boot_has_token on it silently fails (task 20). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kmemx=0")) {
+            boot_kmemx_off = true;
         }
         // latch the ffmpeg smoke-test flag early (see decl). (satoru)
         if (boot_has_token(boot_cmdline, "kurono.ffmpeg.test=1") || boot_has_token(boot_cmdline, "kurono.ffmpeg.test")) {
@@ -1312,6 +1319,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // owning subsystems as they come up. (satoru)
     SerialLogger::Log("[2c] KMemX::Init\r\n");
     KMemX::Init(20);
+    // kurono.kmemx=0: hard-disable the compression engine for the wedge a/b
+    // (task 20: if the pre-KX2 glib wedge vanishes with the compressor off,
+    // its free/refault path is the write-to-dead-frame source). flag parsed
+    // early - the raw cmdline string is clobbered by the allocator inits. (satoru)
+    if (boot_kmemx_off) {
+        KMemX::ForceDisable();   // survives the later ApplyConfig (satoru)
+        SerialLogger::Log("[2c] KMemX DISABLED by cmdline (kurono.kmemx=0)\r\n");
+    }
     vga_puts("Scheduler init...\n");
     SerialLogger::Log("[3] Scheduler::Init\r\n");
     Scheduler::Init();

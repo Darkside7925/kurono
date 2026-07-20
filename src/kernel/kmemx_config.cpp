@@ -51,6 +51,14 @@ void WriteConfFile() {
     KVFS::WriteString("/kurono/system/config/kmemx.conf", buf);
 }
 
+// task 20 a/b: cmdline kurono.kmemx=0 hard-disables the engine, overriding
+// the persisted kmemx.enabled config (ApplyConfig honors it below). (satoru)
+static bool g_cmdline_forced_off = false;
+void ForceDisable() {
+    g_cmdline_forced_off = true;
+    SetEnabled(false);
+}
+
 void ApplyConfig() {
     // pool size + aggressiveness first (so an enable starts with the right
     // params), then the enable bit. defaults: enabled, 20% pool, threshold 8. (satoru)
@@ -60,6 +68,7 @@ void ApplyConfig() {
     SetThreshold(thr);
 
     bool want = UIConfig::Bool("kmemx.enabled", true);
+    if (g_cmdline_forced_off) want = false;   // cmdline a/b override (satoru)
     SetEnabled(want);
 
     if (want) {

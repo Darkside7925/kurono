@@ -99,6 +99,12 @@ void SetEnabled(bool on);   // stage 11 toggle drives this (satoru)
 // (satoru)
 bool CompressPage(uint64_t as, uint64_t vaddr);
 
+// release compressed pages' spare frames, gated on a fully-acked tlb
+// shootdown (stale sibling-core translations must never alias a recycled
+// frame). called by the batch compress paths; safe to call anytime from
+// process context. (satoru)
+void FlushPendingCompressFrees();
+
 // the page-fault entry: if `vaddr` in the CURRENT address space is a compressed
 // page, decompress it back into a fresh frame, restore the pte, free the pool
 // slot + metadata, and return true (the faulting instruction is then retried).
@@ -220,6 +226,11 @@ int TokenBudget();
 // is up. logs the boot banner ("[KMemX] starting... pool=NNMB" or "[KMemX]
 // disabled by user configuration"). (satoru)
 void ApplyConfig();
+
+// cmdline kill switch (kurono.kmemx=0): disable now AND make ApplyConfig
+// keep it off regardless of the persisted kmemx.enabled. a/b probe for the
+// write-to-dead-frame wedge suspect (task 20). (satoru)
+void ForceDisable();
 
 // turn the engine ON at runtime: persist kmemx.enabled=1, mark enabled, and
 // start the worker process if not already running. returns true. (satoru)
