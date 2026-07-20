@@ -1105,6 +1105,46 @@ static uint64_t g_ftx_spur_noswitch  = 0;    // could not deschedule (undo path)
 static volatile uint32_t g_ftx_spin_pid   = 0;   // last spurious waiter (satoru)
 static volatile uint64_t g_ftx_spin_uaddr = 0;
 static void ff_dump_ff_waiters(uint64_t as);     // defined after the futex globals (satoru)
+
+// task 21b/22: USER STACK dump for every ff task - the return addresses name
+// exactly where each thread is stuck in user code (symbolize offline against
+// the [ldso] module bases + objdump). saved rsp is valid for parked/preempted
+// tasks; for a running spinner it is its last syscall-entry rsp - equally
+// useful. the LEADER (the thread whose position usually names the true
+// blocker) is dumped first. (satoru)
+static void ff_dump_stacks() {
+    uint64_t as2 = __atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED);
+    if (!as2) return;
+    for (int pass = 0; pass < 2; pass++) {
+        for (Process* p2 = Scheduler::ready_queue; p2; p2 = p2->next) {
+            if (!p2->is_user() || p2->address_space != as2) continue;
+            if ((pass == 0) != !p2->is_thread()) continue;   // leaders first (satoru)
+            SerialLogger::Log("[wstk] pid="); SerialLogger::LogDec((int)p2->pid);
+            SerialLogger::Log("=");           SerialLogger::Log(p2->name);
+            SerialLogger::Log(" s");          SerialLogger::LogDec((int)p2->state);
+            SerialLogger::Log("#");           SerialLogger::LogDec((int)p2->last_save_site);
+            SerialLogger::Log("n");           SerialLogger::LogDec((int)p2->user_frame.rax);
+            SerialLogger::Log(" rsp=");       SerialLogger::LogHex64(p2->user_frame.rsp);
+            SerialLogger::Log(" rip=");       SerialLogger::LogHex64(p2->user_frame.rip);
+            SerialLogger::Log("\r\n[wstk]");
+            uint64_t sp2 = p2->user_frame.rsp & ~7ull;
+            int shown2 = 0;
+            for (int w = 0; w < 128 && shown2 < 24; w++) {
+                uint64_t va = sp2 + (uint64_t)w * 8;
+                uint64_t ph = KernelVMM::QueryMappingInAddressSpace(as2, va);
+                if (!ph) break;
+                uint64_t qv = *(const volatile uint64_t*)(uintptr_t)ph;
+                // only CODE-looking qwords (module region) - return addrs. (satoru)
+                if (qv >= 0x100000000ull && qv < 0x800000000000ull) {
+                    SerialLogger::Log(" ");
+                    SerialLogger::LogHex64(qv);
+                    shown2++;
+                }
+            }
+            SerialLogger::Log("\r\n");
+        }
+    }
+}
 static uint64_t g_ftx_wait_eagain    = 0;    // value already changed -> -EAGAIN (satoru)
 static uint64_t g_ftx_wake_calls     = 0;    // FUTEX_WAKE entries (satoru)
 static uint64_t g_ftx_woken_total    = 0;    // waiters actually woken (satoru)
@@ -1240,34 +1280,24 @@ static void ff_meas_sample() {
                 SerialLogger::Log("+");        SerialLogger::LogHex64(e->len);
                 SerialLogger::Log("\r\n");
             }
-            // task 21b: USER STACK dump for every ff task - the return
-            // addresses name exactly where each thread is stuck in user code
-            // (symbolize offline against the [ldso] module bases). saved rsp
-            // is valid for parked/preempted tasks; for the bsp-running
-            // spinner it is its last syscall-entry rsp - equally useful. (satoru)
-            uint64_t as2 = __atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED);
-            for (Process* p2 = Scheduler::ready_queue; p2; p2 = p2->next) {
-                if (!p2->is_user() || p2->address_space != as2) continue;
-                SerialLogger::Log("[wstk] pid="); SerialLogger::LogDec((int)p2->pid);
-                SerialLogger::Log(" rsp=");       SerialLogger::LogHex64(p2->user_frame.rsp);
-                SerialLogger::Log(" rip=");       SerialLogger::LogHex64(p2->user_frame.rip);
-                SerialLogger::Log("\r\n[wstk]");
-                uint64_t sp2 = p2->user_frame.rsp & ~7ull;
-                int shown2 = 0;
-                for (int w = 0; w < 96 && shown2 < 24; w++) {
-                    uint64_t va = sp2 + (uint64_t)w * 8;
-                    uint64_t ph = KernelVMM::QueryMappingInAddressSpace(as2, va);
-                    if (!ph) break;
-                    uint64_t qv = *(const volatile uint64_t*)(uintptr_t)ph;
-                    // only CODE-looking qwords (module region) - return addrs. (satoru)
-                    if (qv >= 0x100000000ull && qv < 0x800000000000ull) {
-                        SerialLogger::Log(" ");
-                        SerialLogger::LogHex64(qv);
-                        shown2++;
-                    }
-                }
-                SerialLogger::Log("\r\n");
-            }
+            ff_dump_stacks();   // full user-stack picture (satoru)
+        }
+    }
+    // late-stall one-shots (task 22): a healthy boot paints ~17-25s, so stack
+    // dumps at t=60s and t=120s only ever capture STALL states - any shape,
+    // including the glean-parker wait where nothing spins and the spin-stable
+    // detector above never fires. (satoru)
+    {
+        static bool s_ls60 = false, s_ls120 = false;
+        if (!s_ls60 && now >= 60000) {
+            s_ls60 = true;
+            SerialLogger::Log("[latestall] t=60s\r\n");
+            ff_dump_stacks();
+        }
+        if (!s_ls120 && now >= 120000) {
+            s_ls120 = true;
+            SerialLogger::Log("[latestall] t=120s\r\n");
+            ff_dump_stacks();
         }
     }
     // task 17b: every ~5s dump each task of the firefox thread group - pid,
@@ -2178,9 +2208,11 @@ static uint32_t g_ftx_wedge_lines = 0;   // [ftxwedge] dumps emitted (capped) (s
 static inline bool wake_blocked_to_ready(Process* t) {
     if (!t) return false;
     int expect = (int)Process_Blocked;
-    return __atomic_compare_exchange_n((int*)&t->state, &expect,
-                                       (int)Process_Ready, false,
-                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    bool ok = __atomic_compare_exchange_n((int*)&t->state, &expect,
+                                          (int)Process_Ready, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    if (ok) Scheduler::NormalizeWakeVruntime(t);   // task 22 wake clamp (satoru)
+    return ok;
 }
 
 // CLAIM a blocked waiter for wakeup WITHOUT yet making it pickable: CAS
@@ -2203,7 +2235,9 @@ static inline bool wake_blocked_claim(Process* t) {
                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 }
 static inline void wake_publish_ready(Process* t) {
-    if (t) __atomic_store_n((int*)&t->state, (int)Process_Ready, __ATOMIC_RELEASE);
+    if (!t) return;
+    Scheduler::NormalizeWakeVruntime(t);   // task 22 wake clamp, BEFORE pickable (satoru)
+    __atomic_store_n((int*)&t->state, (int)Process_Ready, __ATOMIC_RELEASE);
 }
 
 // task 17b diagnostic: list this address space's active futex waiters (pid,
@@ -4465,7 +4499,19 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             uint64_t want_ms = sec * 1000ull + nsec / 1000000ull;
                             if (op == 9) {
                                 if (clock_rt) {
-                                    uint64_t real_now = TimeManager::NowUTC().us / 1000ull;
+                                    // task 22 - THE LATE-STALL FIX: the realtime "now"
+                                    // MUST come from the SAME clock the vdso serves
+                                    // userspace (base seconds + the tsc-based
+                                    // GetRealMs64). the old NowUTC() is pit-tick
+                                    // based and FALLS BEHIND the tsc under coalesced
+                                    // ticks, so want_ms (computed by userspace from
+                                    // the vdso) minus the lagged NowUTC inflated
+                                    // every CLOCK_REALTIME condvar timeout by the
+                                    // accumulated drift - firefox's Timer thread
+                                    // slept 13s+ instead of ms and the event-loop
+                                    // heartbeat died (the late-stall class). (satoru)
+                                    uint64_t real_now =
+                                        TimeManager::RealtimeBaseSeconds() * 1000ull + now;
                                     deadline_ms = now + (want_ms > real_now ? want_ms - real_now : 0);
                                 } else {
                                     deadline_ms = want_ms;  // monotonic == GetRealMs64 (satoru)
@@ -8955,10 +9001,11 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             uint64_t vbase = fixed ? (addr & ~(uint64_t)(PAGE_SIZE - 1))
                                    : choose_mmap_base(task, addr, msize);
             if (!vbase) return -12;
-            // (satoru) [libmap] logs each big .so segment map (name + base) to
-            // symbolize a stalled/faulting rip against the lib. gated off for the
-            // checkpoint; flip the guard to true when a fresh base is needed.
-            if (false && msize > 0x2000000) {  // libxul is the ~64MB one (satoru)
+            // (satoru) [libmap] logs each .so BASE map (offset-0, name + base) to
+            // symbolize a stalled/faulting rip against the lib. task 22:
+            // RE-ENABLED for every offset-0 map >64KB - the late-stall [wstk]
+            // return addresses need libxul's and every dso's base.
+            if (offset == 0 && msize > 0x10000) {
                 SerialLogger::Log("[libmap] "); SerialLogger::Log(lfd->path);
                 SerialLogger::Log(" @"); SerialLogger::LogHex((uint32_t)(vbase >> 32));
                 SerialLogger::Log(":"); SerialLogger::LogHex((uint32_t)(vbase & 0xFFFFFFFFu));
@@ -9548,15 +9595,16 @@ int32_t LinuxSyscall::sys_clock_gettime(uint32_t clk_id, uintptr_t tp) {
         return -14;
     timespec64* ts = (timespec64*)tp;
 
-    // CLOCK_REALTIME(0) / CLOCK_REALTIME_COARSE(5): wall-clock. source the
-    // microsecond utc clock (RTC unix-epoch seconds captured at boot + the
-    // monotonic uptime + the sub-ms PIT fraction) from TimeManager::NowUTC.
-    // if the RTC epoch was never set this is "boot epoch + uptime" instead,
-    // but it is still wall-clock-shaped and never jumps. (satoru)
+    // CLOCK_REALTIME(0) / CLOCK_REALTIME_COARSE(5): wall-clock. task 22: MUST
+    // be the SAME clock the vdso serves (base seconds + the tsc-based
+    // GetRealMs64), NOT the pit-tick NowUTC - the pit counter falls behind the
+    // tsc under coalesced ticks, and two realtime clocks that drift apart
+    // inflate every userspace-computed absolute deadline the kernel later
+    // compares (the firefox Timer-thread late-stall). (satoru)
     if (clk_id == 0 || clk_id == 5) {
-        uint64_t us = TimeManager::NowUTC().us;
-        ts->tv_sec  = (int64_t)(us / 1000000ull);
-        ts->tv_nsec = (int64_t)((us % 1000000ull) * 1000ull);
+        uint64_t rms = TimeManager::RealtimeBaseSeconds() * 1000ull + Timer::GetRealMs64();
+        ts->tv_sec  = (int64_t)(rms / 1000ull);
+        ts->tv_nsec = (int64_t)((rms % 1000ull) * 1000000ull);
         return 0;
     }
 

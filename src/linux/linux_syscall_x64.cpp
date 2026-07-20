@@ -21,6 +21,7 @@
 #include "../proc/smp.h"         // cpu index in the [ff] trace (satoru)
 #include "../kernel/udf.h"       // SYS_UDF_CALL -> user driver framework proxy (satoru)
 #include "../drivers/timer.h"    // GetRealMs64 for clock_nanosleep ABSTIME (satoru)
+#include "../kernel/time.h"      // RealtimeBaseSeconds for REALTIME abs targets (satoru)
 
 // Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
 // switches to, and a one-slot stash for the user rsp across that switch (every
@@ -697,8 +698,13 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             if (!ts) return 0;
             uint64_t want_ms = ts->sec * 1000ull + ts->nsec / 1000000ull;
             uint64_t ms;
-            if (a1 & 1) {   // TIMER_ABSTIME vs monotonic==GetRealMs64 (satoru)
-                uint64_t now = Timer::GetRealMs64();
+            if (a1 & 1) {   // TIMER_ABSTIME (satoru)
+                // task 22: the "now" must match the clock userspace computed the
+                // absolute target from - REALTIME (clockid 0) targets are epoch
+                // ms (vdso base + tsc), monotonic targets are GetRealMs64. (satoru)
+                uint64_t now = (a0 == 0)
+                    ? TimeManager::RealtimeBaseSeconds() * 1000ull + Timer::GetRealMs64()
+                    : Timer::GetRealMs64();
                 ms = want_ms > now ? want_ms - now : 0;
             } else {
                 ms = want_ms;
