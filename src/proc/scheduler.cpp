@@ -1136,19 +1136,28 @@ Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
 Process* Scheduler::ClaimReadyThreadForCpu(uint32_t cpu) {
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     Process* pick = nullptr;
+    Process* idle_pick = nullptr;   // task 20: SCHED_IDLE fallback (satoru)
     uint64_t cg_now = 0;   // lazy cpu.max clock, same pattern as the user pick (satoru)
     for (Process* c = ready_queue; c; c = c->next) {
         if (!c->is_user() || !c->is_thread()) continue;
         if (c->state != Process_Ready || !c->has_user_frame) continue;
-        if (c->sched_class == 3) continue;                    // idle class last (satoru)
         if (!cpu_allowed(c, cpu)) continue;
         if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
         if (c->cgroup_throttle_until_ms) {           // cpu.max pool dry? (satoru)
             if (cg_now == 0) cg_now = Timer::GetRealMs64();
             if (c->cgroup_throttle_until_ms > cg_now) continue;
         }
+        // idle class runs only when nothing else is claimable - but it MUST
+        // still run on an otherwise-idle cpu (linux SCHED_IDLE semantics).
+        // the old unconditional skip let an idle-class thread strand READY
+        // forever while aps idled (the WaylandProxy wedge suspect). (satoru)
+        if (c->sched_class == 3) {
+            if (!idle_pick || c->vruntime < idle_pick->vruntime) idle_pick = c;
+            continue;
+        }
         if (!pick || c->vruntime < pick->vruntime) pick = c;
     }
+    if (!pick) pick = idle_pick;   // an idle cpu runs SCHED_IDLE work (satoru)
     if (pick) pick->state = Process_Running;
     g_sched_lock.UnlockIrqRestore(f);
     return pick;

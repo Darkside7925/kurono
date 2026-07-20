@@ -674,17 +674,37 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             HAL::DisableInterrupts();
             return r;
         }
-        case 35: {  // nanosleep - BISECT REVERT (task 17): the exact historical
-            // route (raw dispatch to the i386 handler, 32-bit parse quirk and
-            // all - sub-second sleeps return instantly). the SleepMs64
-            // deschedule version hung firefox pre-KX2 in the glib thread-pool
-            // handshake; this form is the boot-3 behaviour that progressed.
-            // re-fix properly once the wedge is understood. (satoru)
-            return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a0, a1, 0, 0, 0);
+        case 35: {  // nanosleep - real amd64 timespec + linux-model semantics
+            // (task 20 second attempt: the earlier hang was the poll-family
+            // ring-0 ap hold, now fixed - not the sleep deschedule; and a park
+            // under kls is safe because the syscall exit path releases the
+            // lock before the iretq, poll-park-proven). sub-ms sleeps = a
+            // YIELD (hand the cpu over if a sibling is ready, return 0
+            // immediately otherwise - never oversleep a spin-backoff on the
+            // 1ms promotion granularity); ms-scale sleeps truly DESCHEDULE
+            // via SleepMs64 (Blocked + sleep_ticks promotion + ap park). (satoru)
+            struct Ts64 { uint64_t sec; uint64_t nsec; };
+            const Ts64* ts = (const Ts64*)a0;
+            if (!ts) return 0;
+            uint64_t ms = ts->sec * 1000ull + ts->nsec / 1000000ull;
+            if (ms == 0) return LinuxSyscall::Dispatch(LSYS_SCHED_YIELD, 0, 0, 0, 0, 0);
+            return LinuxSyscall::SleepMs64(ms);
         }
-        case 230: {  // clock_nanosleep(clockid, flags, req, rem) - BISECT REVERT
-            // (task 17): the exact historical route-to-nanosleep form. (satoru)
-            return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a2, a3, 0, 0, 0);
+        case 230: {  // clock_nanosleep(clockid, flags, req, rem): ABSTIME
+            // converts to relative, then the same yield/park split as 35. (satoru)
+            struct Ts64c { uint64_t sec; uint64_t nsec; };
+            const Ts64c* ts = (const Ts64c*)a2;
+            if (!ts) return 0;
+            uint64_t want_ms = ts->sec * 1000ull + ts->nsec / 1000000ull;
+            uint64_t ms;
+            if (a1 & 1) {   // TIMER_ABSTIME vs monotonic==GetRealMs64 (satoru)
+                uint64_t now = Timer::GetRealMs64();
+                ms = want_ms > now ? want_ms - now : 0;
+            } else {
+                ms = want_ms;
+            }
+            if (ms == 0) return LinuxSyscall::Dispatch(LSYS_SCHED_YIELD, 0, 0, 0, 0, 0);
+            return LinuxSyscall::SleepMs64(ms);
         }
         // stat/fstat/lstat/newfstatat must NOT route through the i386 LSYS_*
         // handlers: those fill the 32-bit `struct LinuxStat`, but an x86_64
