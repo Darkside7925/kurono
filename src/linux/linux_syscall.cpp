@@ -592,7 +592,25 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
 static bool switch_to_ready_user(InterruptFrame* frame);
 static void futex_sweep_timeouts();   // release timed-out futex waiters (satoru)
 static inline bool wake_blocked_to_ready(Process* t);   // atomic Blocked->Ready (satoru)
-static uint64_t g_poll_parked = 0;    // task 20: poll-family ap parks (printed in ffcount) (satoru)
+static uint64_t g_poll_parked  = 0;   // task 20: poll-family ap parks (printed in ffcount) (satoru)
+static uint64_t g_sleep_parked = 0;   // task 20: nanosleep ap parks (printed in ffcount) (satoru)
+
+// bsp ui pump, throttled to ~30hz. PumpUI composites a frame and the fb blit
+// (fb_copy_nt) costs tens of ms on the plain-vga path - calling it once per
+// wait-loop iteration drowned the bsp in back-to-back blits WHILE HOLDING the
+// kls (the [bspwedge] WaylandProxy 2.5s ring-0 hold), which convoyed every
+// other core's syscalls and stranded the wedge chain (glxtest waiting the
+// wayland socket, gmain, the glib pool). 30hz keeps the desktop and cursor
+// fully alive; the waits themselves pace on kls_relax/sleep instead. (satoru)
+static inline void pump_ui_throttled() {
+    if (SMP::CpuIndex() != 0) return;   // ui is bsp-only (satoru)
+    static uint64_t s_last_pump_ms = 0;
+    uint64_t nw = Timer::GetRealMs64();
+    if (nw - s_last_pump_ms >= 33) {
+        s_last_pump_ms = nw;
+        KuronoShell::PumpUI();
+    }
+}
 
 // deschedule a user thread that is about to block in poll/ppoll: rewind its saved
 // user frame to RE-RUN the syscall on wake, mark it Blocked with a short
@@ -609,8 +627,22 @@ static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
     if (!task || !current_syscall_frame) return false;
     task->user_frame.rip -= 2;                          // SYSCALL/int0x80 are both 2 bytes (satoru)
     task->user_frame.rax  = (uint64_t)(uint32_t)restart_nr;
+    // adaptive repoll cadence (task 20): a hard 2 made every parked poller
+    // restart its full syscall ~500/s - with ~40 threads that was a 6M-acquire
+    // kls storm that crawled the boot worse than the storms it replaced. an
+    // INFINITE poll (gmain's idle main-context wait, worker pools) repolls at
+    // ~8 ticks (the multi-decrementer promotion makes that ~2-4ms real - one
+    // ui frame of wakeup latency, acceptable); a timed poll wakes for its own
+    // deadline, clamped [2,16]. (satoru)
+    uint32_t rt = 2;
+    if (p->poll_blocking) {
+        uint64_t dl  = p->poll_deadline_ms;
+        uint64_t nw  = Time::GetTicks();
+        if (dl == 0xFFFFFFFFFFFFFFFFULL) rt = 8;
+        else if (dl > nw) { uint64_t r = dl - nw; rt = r > 16 ? 16 : (r < 2 ? 2 : (uint32_t)r); }
+    }
     // single-owner: state + sleep_ticks under g_sched_lock. (satoru)
-    { uint64_t sf; Scheduler::StateLock(&sf); task->state = Process_Blocked; task->sleep_ticks = 2; Scheduler::StateUnlock(sf); }
+    { uint64_t sf; Scheduler::StateLock(&sf); task->state = Process_Blocked; task->sleep_ticks = rt; Scheduler::StateUnlock(sf); }
     if (!switch_to_ready_user(current_syscall_frame)) {
         // TASK 20 (the glib-wedge core): no sibling to switch to. the old
         // in-place fallback BUSY-HELD this ap in ring-0 for the whole wait
@@ -701,7 +733,10 @@ static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
         // sampled, small sets only. (satoru)
         {
             static uint64_t _pw = 0;
-            if (false && p->pid >= 100 && p->pid < 140 && nfds <= 12 && ((++_pw & 1023) == 0)) {
+            // task 20 wedge probe: RE-ENABLED for all user pids (the glib wedge
+            // pids land in the 29-40 range this boot era) - names the fd set a
+            // parked ppoll waits on and each fd's live readiness. (satoru)
+            if (p->pid >= 20 && nfds <= 12 && ((++_pw & 4095) == 0)) {
                 SerialLogger::Log("[pw] pid="); SerialLogger::LogDec(p->pid);
                 for (uint64_t i = 0; i < nfds; i++) {
                     int wfd = fds[i].fd;
@@ -734,7 +769,7 @@ static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
             // replies / handshake completions faster than the NetworkProcess's
             // 10 ms cadence (no-op with no live inet socket). (satoru)
             LinuxNetBridge::PumpTick();
-            KuronoShell::PumpUI();
+            pump_ui_throttled();
         }
         // sleep with the kls RELEASED: readiness may depend on a sibling's
         // syscall on another core (pipe/eventfd writer), which needs this
@@ -1121,6 +1156,7 @@ static void ff_meas_sample() {
     SerialLogger::Log(" fspur=");   SerialLogger::LogDec((int)g_ftx_wait_spur);
     SerialLogger::Log(" fpark=");   SerialLogger::LogDec((int)g_ftx_wait_parked);
     SerialLogger::Log(" ppark=");   SerialLogger::LogDec((int)g_poll_parked);
+    SerialLogger::Log(" spark=");   SerialLogger::LogDec((int)g_sleep_parked);
     SerialLogger::Log(" feag=");    SerialLogger::LogDec((int)g_ftx_wait_eagain);
     SerialLogger::Log(" fwake=");   SerialLogger::LogDec((int)g_ftx_wake_calls);
     SerialLogger::Log(" fwoke=");   SerialLogger::LogDec((int)g_ftx_woken_total);
@@ -1171,6 +1207,10 @@ static void ff_meas_sample() {
             // site-1 (syscall entry) frames carry the in-flight syscall NR in
             // rax - names the syscall a ring-0-stuck ap thread is inside. (satoru)
             SerialLogger::Log("n");   SerialLogger::LogDec((int)p->user_frame.rax);
+            // class/nice/affinity: names a SCHED_IDLE or affinity strand. (satoru)
+            SerialLogger::Log("y");   SerialLogger::LogDec((int)p->sched_class);
+            SerialLogger::Log("i");   SerialLogger::LogDec((int)p->nice);
+            SerialLogger::Log("a");   SerialLogger::LogHex((uint32_t)p->cpu_affinity);
         }
         SerialLogger::Log("\r\n");
         // active futex waiters of this AS: who is parked on WHAT (defined after
@@ -2952,7 +2992,7 @@ static void LinuxInt80Entry(InterruptFrame* frame) {
     kls_lock();
     // the ui pump drives the bsp's shell/desktop - never from an ap. (satoru)
     if (SMP::CpuIndex() == 0) {
-        KuronoShell::PumpUI();
+        pump_ui_throttled();
         // starvation relief valve: a bsp user thread hammering NONBLOCKING
         // syscalls (the symbolized clock_gettime deadline-spin - IndexedDB IO
         // monopolized the bsp for 13s) never blocks, so the cooperative kernel
@@ -3073,7 +3113,19 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     // NOT held (exempt path): it just sleeps without touching kls. (satoru)
     if (SMP::CpuIndex() == 0) {
         uint64_t ls = Scheduler::LastScheduleMs();
-        if (ls && Timer::GetRealMs64() - ls > 50) kls_relax_sleep_ms(1);
+        if (ls && Timer::GetRealMs64() - ls > 50) {
+            // the donation must be REAL on the exempt path too: with the lock
+            // not held, kls_relax_sleep_ms only pause-spins (its not-owner
+            // branch) - NO Schedule ran, so the cooperative kernel (wayland
+            // server, GUIProcess, kvfs) starved forever behind an exempt
+            // futex spin and glxtest's display connect never got its greeting
+            // = the pre-KX2 wedge chain (leader waits glxtest, glxtest waits
+            // the wayland socket, wayland waits the starved bsp). dose stays
+            // valve-gated (~20/s worst case): the per-spurious SleepMs pacing
+            // experiment overdosed (8k/s) and hurt the handshake cadence. (satoru)
+            if (kls_exempt) Scheduler::SleepMs(1);
+            else            kls_relax_sleep_ms(1);
+        }
     }
 
     // amd64 syscall abi: nr in rax, args in rdi, rsi, rdx, r10, r8, r9. the
@@ -3774,7 +3826,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                                 uint64_t edx, uint64_t esi, uint64_t edi) {
     (void)esi; (void)edi;
 
-    if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();   // ui pump is bsp-only (satoru)
+    if (SMP::CpuIndex() == 0) pump_ui_throttled();   // ui pump is bsp-only (satoru)
 
     switch (eax) {
         case LSYS_EXIT:        return sys_exit(ebx);
@@ -4260,7 +4312,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                         // pump one ui frame under the lock, then sleep with the kls
                         // RELEASED: this wait legally lasts seconds, and the holder
                         // we wait on needs the kls for its OWN unlock syscall. (satoru)
-                        if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                        if (SMP::CpuIndex() == 0) pump_ui_throttled();
                         kls_relax_sleep_ms(1);
                     }
                 }
@@ -4561,7 +4613,10 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // the launcher/IO thread + correlate with [texit]. (satoru)
             {
                 LinuxProcess* _pp = Current();
-                if (false && _pp && _pp->pid >= 100 && _pp->pid < 140) {   // gated off (satoru)
+                // task 20 wedge hunt: RE-ENABLED for all user pids - the wedge
+                // snapshot shows 4 threads where good boots have 7; name every
+                // clone so the missing participant identifies itself. (satoru)
+                if (_pp && _pp->pid >= 20) {
                     SerialLogger::Log("[tnew] par="); SerialLogger::LogDec(_pp->pid);
                     SerialLogger::Log(" tid="); SerialLogger::LogDec(tid);
                     SerialLogger::Log(" flags="); SerialLogger::LogHex(flags);
@@ -4752,7 +4807,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     else if (want_w) ready_total++;
                 }
                 if (ready_total > 0 || s >= spins) break;
-                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();   // bsp-only (satoru)
+                if (SMP::CpuIndex() == 0) pump_ui_throttled();   // bsp-only (satoru)
                 else kls_relax();                                   // let other cores' syscalls flow (satoru)
             }
             return ready_total;
@@ -5025,7 +5080,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 // kernel procs; an ap releases the kls lock and breathes. (satoru)
                 if (SMP::CpuIndex() == 0) {
                     LinuxNetBridge::PumpTick();   // nic drain for inet fds in the set (satoru)
-                    KuronoShell::PumpUI();
+                    pump_ui_throttled();
                 }
                 // breathe with the kls released (see do_poll_wait). (satoru)
                 kls_relax_sleep_ms(1);
@@ -5104,7 +5159,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             char buf[512];
             uint64_t total = 0;
             while (total < cnt) {
-                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();   // bsp-only (satoru)
+                if (SMP::CpuIndex() == 0) pump_ui_throttled();   // bsp-only (satoru)
                 uint64_t chunk = cnt - total > 512 ? 512 : cnt - total;
                 // buf is a kernel stack address (64-bit under mcmodel=large) (satoru)
                 int r = sys_read(in_fd, (uintptr_t)buf, chunk);
@@ -5336,7 +5391,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             uint8_t buf[2048];
             uint32_t copied = 0;
             while (copied < len) {
-                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();   // bsp-only (satoru)
+                if (SMP::CpuIndex() == 0) pump_ui_throttled();   // bsp-only (satoru)
                 uint32_t chunk = len - copied;
                 if (chunk > sizeof(buf)) chunk = sizeof(buf);
                 // buf is a kernel stack address (64-bit under mcmodel=large) (satoru)
@@ -5525,7 +5580,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 if (Time::GetTicks() > deadline) return -35;   // -EDEADLK bound (satoru)
                 // same shape as the F_SETLKW wait: ui pump under the lock, sleep
                 // with the kls RELEASED (the flock holder's unlock needs it). (satoru)
-                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                if (SMP::CpuIndex() == 0) pump_ui_throttled();
                 kls_relax_sleep_ms(1);
             }
         }
@@ -5652,7 +5707,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                         if (Time::GetTicks() > deadline) { r = -110; break; }  // -ETIMEDOUT (satoru)
                         if (SMP::CpuIndex() == 0) {
                             LinuxNetBridge::PumpTick();
-                            KuronoShell::PumpUI();
+                            pump_ui_throttled();
                         }
                         // breathe with the kls released (see do_poll_wait). (satoru)
                         kls_relax_sleep_ms(1);
@@ -5662,7 +5717,15 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             }
             if (lp->fds[fd].type != LFD_SOCKET) return -9;
             const char* path = (const char*)(sa + 2);
-            return UnixSocket::Connect(lp->fds[fd].backend_fd, path);
+            int cr = UnixSocket::Connect(lp->fds[fd].backend_fd, path);
+            // task 20 wedge trace: unix connects are rare and the wedge boots
+            // never show the wayland server accepting - name every attempt. (satoru)
+            SerialLogger::Log("[uxconn] pid="); SerialLogger::LogDec(lp->pid);
+            SerialLogger::Log(" fd=");  SerialLogger::LogDec(fd);
+            SerialLogger::Log(" ");     SerialLogger::Log(path);
+            SerialLogger::Log(" r=");   SerialLogger::LogDec(cr);
+            SerialLogger::Log("\r\n");
+            return cr;
         }
         case LSYS_SENDTO: {
             int fd = (int)ebx;
@@ -6702,7 +6765,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         // pause(): block until a signal. with no async delivery we yield once and
         // return -EINTR so callers don't spin forever holding the cpu. (satoru)
         case LSYS_PAUSE:
-            if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+            if (SMP::CpuIndex() == 0) pump_ui_throttled();
             // breathe with the kls released - the old bsp Yield ran kernel
             // procs (which can enter the KLS for detached shell launches)
             // while still HOLDING the lock. (satoru)
@@ -7405,7 +7468,7 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                 if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
                 if (SMP::CpuIndex() == 0) {
                     LinuxNetBridge::PumpTick();            // drain the nic while we wait (satoru)
-                    KuronoShell::PumpUI();
+                    pump_ui_throttled();
                 }
                 kls_relax_sleep_ms(1);   // breathe with the kls released (satoru)
                 return -11;   // re-issued by the caller's retry (satoru)
@@ -7423,7 +7486,7 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
             int r = UnixSocket::Recv(lfd->backend_fd, dst, (int)count, 0);
             if (r == -11 && !(lfd->flags & L_O_NONBLOCK)) {
                 if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
-                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                if (SMP::CpuIndex() == 0) pump_ui_throttled();
                 kls_relax_sleep_ms(1);   // the writer we wait on needs the kls (satoru)
                 return -11;   // re-issued by the caller's retry (satoru)
             }
@@ -7450,7 +7513,7 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                 if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
                 // no sibling to run: ui pump under the lock, then breathe with
                 // the kls RELEASED - the eventfd writer we wait on needs it. (satoru)
-                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                if (SMP::CpuIndex() == 0) pump_ui_throttled();
                 kls_relax_sleep_ms(1);
                 return -11;   // frame not rewritten: re-issued by the caller's retry (satoru)
             }
@@ -9196,7 +9259,7 @@ int32_t LinuxSyscall::sys_nanosleep(uintptr_t req, uintptr_t rem) {
         if (ms > 0) {
             uint32_t start = Time::GetTicks();
             while ((Time::GetTicks() - start) < ms) {
-                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();   // bsp-only (satoru)
+                if (SMP::CpuIndex() == 0) pump_ui_throttled();   // bsp-only (satoru)
                 // drop the kls lock across the wait so a multi-second sleep on one
                 // core does not stall every other core syscalls. (satoru)
                 kls_relax();
@@ -9207,19 +9270,19 @@ int32_t LinuxSyscall::sys_nanosleep(uintptr_t req, uintptr_t rem) {
     return 0;
 }
 
-// task 17: the x64 sleep. the old route ({35,162} table entry -> sys_nanosleep)
-// parsed the amd64 timespec as TWO 32-bit fields, so tv_nsec actually read the
-// HIGH half of the 64-bit tv_sec (~always 0) and every sub-second sleep became
-// ms=0 = an instant return -> firefox's backoff/poll sleep loops turned into a
-// 10k/s syscall spin-storm that burned the cores ([ffcount] top=35). and even a
-// correct ms busy-HELD the core for the whole sleep. this entry parses the real
-// 64-bit timespec and truly DESCHEDULES: Blocked + sleep_ticks (the deferred-
-// tick promotion in PromoteDeferredWakes re-readies it), switch to another
-// thread or - on an ap with no successor - park the core exactly like the futex
-// park (same re-verify + release protocol). kls-EXEMPT (see
-// syscall_x64_kls_exempt): parking with the kls held would strand this cpu's
-// recursive depth and deadlock every other core. bsp/leader fall back to the
-// old cooperative busy-wait. (satoru)
+// task 17/20: the x64 sleep. the old route ({35,162} table entry ->
+// sys_nanosleep) parsed the amd64 timespec as TWO 32-bit fields, so tv_nsec
+// actually read the HIGH half of the 64-bit tv_sec (~always 0) and every
+// sub-second sleep became ms=0 = an instant return -> firefox's backoff/poll
+// sleep loops turned into a 10k/s syscall spin-storm ([ffcount] top=35). and
+// even a correct ms busy-HELD the core for the whole sleep. this entry truly
+// DESCHEDULES: Blocked + sleep_ticks (the deferred-tick promotion re-readies
+// it), switch to another thread or - on an ap with no successor - park the
+// core exactly like the futex/poll park. runs WITH kls held (non-exempt):
+// safe, because the park only rewrites the frame and the normal syscall exit
+// path releases kls before the iretq into the idle loop (poll-park-proven).
+// bsp/leader fall back to a pause-spin busy-wait - NEVER hlt: the bsp x64
+// syscall path runs with IF off, so a hlt here would halt the machine. (satoru)
 int32_t LinuxSyscall::SleepMs64(uint64_t ms) {
     if (ms == 0) return 0;
     if (ms > 5000) ms = 5000;   // keep the historical cap (satoru)
@@ -9249,6 +9312,7 @@ int32_t LinuxSyscall::SleepMs64(uint64_t ms) {
                 __atomic_store_n(&task->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
                 SMP::ApIdleFrame(current_syscall_frame);
                 current_frame_rewritten = true;
+                g_sleep_parked++;   // forensics (satoru)
                 return 0;
             }
         }
@@ -9260,13 +9324,17 @@ int32_t LinuxSyscall::SleepMs64(uint64_t ms) {
             Scheduler::StateUnlock(sf3);
         }
     }
-    // cooperative fallback (bsp): pump ui + hlt until elapsed. kls is NOT held
-    // here (exempt syscall); kls_relax tolerates the not-held case. (satoru)
-    uint32_t start = Time::GetTicks();
-    while ((Time::GetTicks() - start) < ms) {
-        if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+    // cooperative fallback (bsp): pump ui + pause-spin until elapsed, releasing
+    // the kls each iteration so other cores' syscalls keep flowing. NO hlt (IF
+    // is off on the bsp x64 path - a hlt would never wake). (satoru)
+    uint64_t until = Timer::GetRealMs64() + ms;
+    while (Timer::GetRealMs64() < until) {
+        if (SMP::CpuIndex() == 0) {
+            pump_ui_throttled();
+            LinuxNetBridge::PumpTick();   // keep dns/tcp flowing like do_poll_wait (satoru)
+        }
         kls_relax();
-        HAL::WaitForInterrupt();
+        for (int i = 0; i < 256; i++) __asm__ __volatile__("pause" ::: "memory");
     }
     return 0;
 }
