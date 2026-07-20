@@ -595,6 +595,21 @@ static inline bool wake_blocked_to_ready(Process* t);   // atomic Blocked->Ready
 static uint64_t g_poll_parked  = 0;   // task 20: poll-family ap parks (printed in ffcount) (satoru)
 static uint64_t g_sleep_parked = 0;   // task 20: nanosleep ap parks (printed in ffcount) (satoru)
 
+// task 21: remap RING - the serial version of this log (163 lines x ~8.7ms
+// uart in the 9-10s window) serialized the early munmap/madvise path so hard
+// the wedge vanished 6/6 (a heisen-fix, and a hint the race lives in remap
+// timing). record to memory instead (ns cost), dump once on wedge detection. (satoru)
+struct RemapEv { uint32_t t_ms; uint8_t kind; uint64_t addr; uint64_t len; };
+static RemapEv  g_remap_ring[256];
+static volatile uint32_t g_remap_head = 0;
+static inline void remap_note(uint8_t kind, uint64_t addr, uint64_t len) {
+    uint32_t h = __atomic_fetch_add(&g_remap_head, 1u, __ATOMIC_RELAXED) & 255u;
+    g_remap_ring[h].t_ms = (uint32_t)Timer::GetRealMs64();
+    g_remap_ring[h].kind = kind;   // 1=munmap 2=madv_dontneed 3=mprotect (satoru)
+    g_remap_ring[h].addr = addr;
+    g_remap_ring[h].len  = len;
+}
+
 // bsp ui pump, throttled to ~30hz. PumpUI composites a frame and the fb blit
 // (fb_copy_nt) costs tens of ms on the plain-vga path - calling it once per
 // wait-loop iteration drowned the bsp in back-to-back blits WHILE HOLDING the
@@ -1178,9 +1193,83 @@ static void ff_meas_sample() {
     SerialLogger::LogDec((int)g_ftx_spur_valchg);   SerialLogger::Log("/");
     SerialLogger::LogDec((int)g_ftx_spur_qfull);    SerialLogger::Log("/");
     SerialLogger::LogDec((int)g_ftx_spur_noswitch);
+    SerialLogger::Log(" tlbto="); SerialLogger::LogDec((int)SMP::TlbFlushTimeouts());
     SerialLogger::Log(" spin=");  SerialLogger::LogDec((int)g_ftx_spin_pid);
     SerialLogger::Log("@");       SerialLogger::LogHex64(g_ftx_spin_uaddr);
+    // task 21: resolve the spinner's wait word to PHYS + read the live RAM
+    // value each sample. a value that never changes across samples while the
+    // spinner retests = the unlock/signal store never landed anywhere the
+    // page table can see (the lost-write wedge); a phys that CHANGES between
+    // samples = the page is being remapped under the waiter. (satoru)
+    {
+        uint64_t sas = __atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED);
+        uint64_t su  = g_ftx_spin_uaddr;
+        if (sas && su) {
+            uint64_t sp = KernelVMM::QueryMappingInAddressSpace(sas, su);
+            SerialLogger::Log("p"); SerialLogger::LogHex64(sp);
+            if (sp) {
+                uint32_t sv = *(const volatile uint32_t*)(uintptr_t)sp;
+                SerialLogger::Log("v"); SerialLogger::LogHex(sv);
+            }
+        }
+    }
     SerialLogger::Log("\r\n");
+    // task 21 wedge detector: the same spin uaddr across 15 consecutive 1hz
+    // samples = the lost-write wedge. one-shot: dump the remap ring so the
+    // ranges freed around the wedge window can be matched against the wedged
+    // pages, with ZERO serial cost until the wedge is certain. (satoru)
+    {
+        static uint64_t s_prev_spin  = 0;
+        static int      s_spin_stable = 0;
+        static bool     s_ring_dumped = false;
+        uint64_t su = g_ftx_spin_uaddr;
+        if (su && su == s_prev_spin) s_spin_stable++;
+        else { s_prev_spin = su; s_spin_stable = 0; }
+        if (!s_ring_dumped && s_spin_stable >= 15) {
+            s_ring_dumped = true;
+            SerialLogger::Log("[wedgeremap] spin@");
+            SerialLogger::LogHex64(su);
+            SerialLogger::Log(" ring:\r\n");
+            uint32_t h = __atomic_load_n(&g_remap_head, __ATOMIC_RELAXED);
+            uint32_t n = h > 256 ? 256 : h;
+            for (uint32_t k = 0; k < n; k++) {
+                RemapEv* e = &g_remap_ring[(h - n + k) & 255u];
+                SerialLogger::Log("[rr] t=");  SerialLogger::LogDec((int)e->t_ms);
+                SerialLogger::Log(" k=");      SerialLogger::LogDec((int)e->kind);
+                SerialLogger::Log(" ");        SerialLogger::LogHex64(e->addr);
+                SerialLogger::Log("+");        SerialLogger::LogHex64(e->len);
+                SerialLogger::Log("\r\n");
+            }
+            // task 21b: USER STACK dump for every ff task - the return
+            // addresses name exactly where each thread is stuck in user code
+            // (symbolize offline against the [ldso] module bases). saved rsp
+            // is valid for parked/preempted tasks; for the bsp-running
+            // spinner it is its last syscall-entry rsp - equally useful. (satoru)
+            uint64_t as2 = __atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED);
+            for (Process* p2 = Scheduler::ready_queue; p2; p2 = p2->next) {
+                if (!p2->is_user() || p2->address_space != as2) continue;
+                SerialLogger::Log("[wstk] pid="); SerialLogger::LogDec((int)p2->pid);
+                SerialLogger::Log(" rsp=");       SerialLogger::LogHex64(p2->user_frame.rsp);
+                SerialLogger::Log(" rip=");       SerialLogger::LogHex64(p2->user_frame.rip);
+                SerialLogger::Log("\r\n[wstk]");
+                uint64_t sp2 = p2->user_frame.rsp & ~7ull;
+                int shown2 = 0;
+                for (int w = 0; w < 96 && shown2 < 24; w++) {
+                    uint64_t va = sp2 + (uint64_t)w * 8;
+                    uint64_t ph = KernelVMM::QueryMappingInAddressSpace(as2, va);
+                    if (!ph) break;
+                    uint64_t qv = *(const volatile uint64_t*)(uintptr_t)ph;
+                    // only CODE-looking qwords (module region) - return addrs. (satoru)
+                    if (qv >= 0x100000000ull && qv < 0x800000000000ull) {
+                        SerialLogger::Log(" ");
+                        SerialLogger::LogHex64(qv);
+                        shown2++;
+                    }
+                }
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
     // task 17b: every ~5s dump each task of the firefox thread group - pid,
     // state, sleep_ticks, on_cpu - so a stranded producer names itself. (satoru)
     static uint64_t s_last_dump_ms = 0;
@@ -2129,6 +2218,13 @@ static void ff_dump_ff_waiters(uint64_t as) {
         SerialLogger::Log(" ");  SerialLogger::LogDec((int)w->task->pid);
         SerialLogger::Log("@");  SerialLogger::LogHex64((uint64_t)w->uaddr);
         SerialLogger::Log("e");  SerialLogger::LogHex(w->expected_val);
+        // task 21: fresh-walked phys + live value so a never-changing RAM word
+        // (or a phys that shifts between dumps) is directly visible. (satoru)
+        uint64_t wp = KernelVMM::QueryMappingInAddressSpace(w->addr_space, w->uaddr);
+        SerialLogger::Log("p");  SerialLogger::LogHex64(wp);
+        if (wp) {
+            SerialLogger::Log("v"); SerialLogger::LogHex(*(const volatile uint32_t*)(uintptr_t)wp);
+        }
     }
     SerialLogger::Log("\r\n");
 }
@@ -3078,13 +3174,17 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
         if (ridx >= 0) LinuxSyscall::SetCurrent(ridx);
     }
 
-    // SFMASK cleared IF at SYSCALL entry. re-enable ONLY on the aps (so an ap
-    // inside a long handler still takes the tlb-shootdown ipi + timer). the bsp
-    // x64 path historically ran with IF off through the whole syscall; keep that
-    // on the bsp so device IRQ handlers can't re-enter a lock the syscall holds
-    // (single-core self-deadlock / reentrancy). the int 0x80 path enables IF as
-    // before. (satoru)
-    if (SMP::CpuIndex() != 0) HAL::EnableInterrupts();
+    // SFMASK cleared IF at SYSCALL entry. re-enable on EVERY cpu now (task 21):
+    // the bsp historically ran the whole syscall IF-off, which PENDED every
+    // tlb-shootdown ipi for the syscall's full duration - a long poll/futex
+    // body meant seconds of stale-tlb window on the bsp and made the 20ms
+    // bounded shootdown time out against it (tlbto=3 in the wedged boot). the
+    // original IF-off rationale (an irq re-entering a lock the syscall holds)
+    // is obsolete: every kernel lock is SpinLockGuard IrqSave (IF off while
+    // held), and the aps have run IF-on syscalls through these exact same
+    // handlers for weeks. the PIT tick handler gates on ring-3 cs so a
+    // mid-syscall tick does no scheduling on this cpu. (satoru)
+    HAL::EnableInterrupts();
 
     // task 17 forensics: count every firefox syscall nr this sample window so a
     // spin-storm names itself in [ffcount] top=. cheap: cached-AS compare + add. (satoru)
@@ -9022,6 +9122,9 @@ int32_t LinuxSyscall::sys_munmap(uintptr_t addr, uint64_t length) {
     // and failed the thread's stack teardown/setup. (satoru)
     task = region_owner(task);
 
+    // task 21 remap ring: silent record (serial here was a heisen-fix). (satoru)
+    if (ff_is_firefox(task)) remap_note(1, (uint64_t)addr, length);
+
     uint64_t start = align_down_u64(addr, PAGE_SIZE);
     uint64_t end = align_up_u64((uint64_t)addr + length, PAGE_SIZE);
     bool unmapped = false;
@@ -9041,9 +9144,19 @@ int32_t LinuxSyscall::sys_munmap(uintptr_t addr, uint64_t length) {
         unmapped = true;
     }
 
-    if (task->next_mmap_base > start) {
-        task->next_mmap_base = start;
-    }
+    // TASK 21 - THE LOST-WRITE FIX: do NOT rewind the mmap bump pointer to the
+    // freed range. the rewind handed every munmapped va back out on the very
+    // next mmap (mallocng churns single-page mmap/munmap pairs constantly), so
+    // any core still holding a pre-unmap tlb entry for that va - the shootdown
+    // is bounded (20ms give-up) and its ipi is PENDED for the whole IF-off bsp
+    // syscall window - would write through the stale entry into the OLD
+    // (quarantined) frame while every other core uses the new one. proven by
+    // the wedge forensics: the glib async-queue page had the leader's stores
+    // landing while pool-spawner's mutex-unlock store vanished -> the pre-KX2
+    // deadlock lottery. monotonic va allocation makes freed vas dead forever
+    // (a stale entry then aliases a va nobody is ever handed again): the
+    // ~85TB mmap window burns ~1GB/boot, exhaustion is not a concern. MAP_FIXED
+    // reuse (memfd freeze remap) is unaffected: same shared frames either way. (satoru)
 
     return unmapped ? 0 : -22;
 }
@@ -9070,6 +9183,12 @@ int32_t LinuxSyscall::sys_madvise(uintptr_t addr, uint64_t length, uint32_t advi
     // discard) but make FREE a data-preserving no-op (we have no swap, so "reclaim
     // later" just never happens - rss-accurate enough, correctness first). (satoru)
     if (advice != LINUX_MADV_DONTNEED) return 0;
+    // task 21 remap ring: silent record (serial here was a heisen-fix). (satoru)
+    {
+        LinuxProcess* _rp = Current();
+        if (_rp && _rp->task && ff_is_firefox(_rp->task))
+            remap_note(2, (uint64_t)addr, length);
+    }
     if (length == 0) return 0;
     // linux abi: addr MUST be page-aligned - do_madvise returns EINVAL
     // otherwise (mm/madvise.c). the old align-DOWN silently extended the

@@ -899,6 +899,18 @@ static inline bool cpu_allowed(const Process* p, uint32_t cpu) {
 // task immediately (it can't race itself), but ANOTHER cpu must wait ~2ms past
 // the release timestamp so the unwind window (microseconds, but real) has
 // passed. fresh tasks (released_ms 0) pass trivially. (satoru)
+// task 21 - DEFAULT ON (2026-07-20): HARD-PIN every user thread to the cpu it
+// last ran on - no cross-cpu resume at all. PROVEN by a/b: the pre-KX2 glib
+// wedge (the leader's mutex-unlock stores vanishing = the documented
+// migrate-and-replay corruption the 50ms grace only suppressed) fired ~50% of
+// fresh boots with migration on, and 0/6 with pinning - AND pinned boots
+// painted at 16.9s launch-to-paint vs the 56s serialized baseline, because
+// same-cpu re-picks are instant (no migration grace stalls on thousands of
+// handoffs). kurono.pincpu=0 restores migration for the root-fix hunt
+// (SaveUserFrame/LoadUserFrame completeness audit). (satoru)
+static bool g_pin_cpu = true;
+void Scheduler::SetPinCpu(bool on) { g_pin_cpu = on; }
+
 static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // cross-cpu resume guard. the SAME cpu can always re-pick its own task (it
     // can't race its own iretq). MITIGATION (2026-07-08): a genuine but
@@ -913,6 +925,7 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // fix is single-owner state (unify the futex-wake + scheduler state writes
     // under one lock / dequeue-on-block, per linux __schedule/ttwu). (satoru)
     if ((uint32_t)p->last_run_cpu == cpu) return true;
+    if (g_pin_cpu) return false;   // a/b: never resume on a different cpu (satoru)
     // frame-handoff barrier (the correctness fix): another cpu may resume p only
     // once its owning cpu RELEASE-stored on_cpu=0 (frame fully saved). ACQUIRE-load
     // pairs with that release -> never a half-saved user_frame -> no RIP=0x3/#PF. (satoru)

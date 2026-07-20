@@ -40,6 +40,12 @@ public:
 
     static uint32_t CpuCount();        // logical cpus discovered (satoru)
     static uint32_t OnlineCount();     // cpus that have marked themselves online (satoru)
+    // containment park: a cli-hlt'ed cpu can never ack a tlb ipi again, but it
+    // still counted as online - so EVERY later BroadcastTlbFlush burned its full
+    // 20ms timeout (under kls_lock for mprotect/munmap) and the flush epoch
+    // never advanced, degrading the frame quarantine for the rest of the
+    // session. call this right before parking so want-counts shrink. (satoru)
+    static void     MarkSelfOffline();
 
     static uint32_t ApicId();          // calling cpu's local apic id (reads the lapic) (satoru)
     static uint32_t CpuIndex();        // calling cpu's dense index (via the apic-id map) (satoru)
@@ -78,12 +84,24 @@ public:
     // else is claimable for this cpu. (satoru)
     static void ApIdleFrame(InterruptFrame* f);
 
+    // switch this cpu to the KERNEL address space (captured at StartAPs) if it
+    // is currently on some process's cr3. an idle/parked cpu must NEVER sit on
+    // a dead process's root: the reaper can destroy that address space and
+    // recycle its page-table frames while this cpu's walker still fetches
+    // through them (garbage kernel translations = random corruption). no-op
+    // when the kernel root was never captured or already active. (satoru)
+    static void LoadKernelCr3();
+
     // tlb shootdown: ipi (vector 0x41) every OTHER online cpu to reload cr3,
     // then wait (bounded, with re-ipi retries) for their acks. call after
     // unmapping/reprotecting user pages of an address space whose threads may
     // run on other cores; no-op with a single online cpu. (satoru)
     static void BroadcastTlbFlush();
     static void HandleTlbIpi();   // receiver side: reload cr3 + ack (satoru)
+    // count of shootdowns that gave up unacked (a peer held IF off >20ms) -
+    // each one leaves a stale peer + the unmapped va is reused immediately,
+    // the lost-write wedge suspect (task 21). (satoru)
+    static uint32_t TlbFlushTimeouts();
 
     // flush epochs for the user-frame quarantine: a freed frame is only safe to
     // reuse once a shootdown that STARTED after the frame's pte was cleared has
