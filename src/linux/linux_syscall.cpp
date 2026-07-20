@@ -1126,6 +1126,14 @@ static void ff_meas_sample() {
             SerialLogger::Log("c");   SerialLogger::LogDec((int)p->on_cpu);
             SerialLogger::Log(p->is_thread() ? "T" : "P");   // thread vs process (satoru)
             SerialLogger::Log("u");   SerialLogger::LogDec((int)p->last_run_cpu);
+            // last-SAVED user rip + save site: a rip frozen across dumps names
+            // the stuck loop (symbolize vs libxul/glib); for a Running task it
+            // is the last preempt-save, still a strong location signal. (satoru)
+            SerialLogger::Log("@");   SerialLogger::LogHex64(p->user_frame.rip);
+            SerialLogger::Log("#");   SerialLogger::LogDec((int)p->last_save_site);
+            // site-1 (syscall entry) frames carry the in-flight syscall NR in
+            // rax - names the syscall a ring-0-stuck ap thread is inside. (satoru)
+            SerialLogger::Log("n");   SerialLogger::LogDec((int)p->user_frame.rax);
         }
         SerialLogger::Log("\r\n");
         // active futex waiters of this AS: who is parked on WHAT (defined after
@@ -2233,6 +2241,11 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         task->stk_canary_valid = 0;
         g_ftx_spur_noswitch++;                     // task 17b (satoru)
         g_ftx_spin_pid = task->pid; g_ftx_spin_uaddr = (uint64_t)uaddr;
+        // NOTE (task 17, batch-proven): do NOT pace this loop with a SleepMs
+        // donation. a 1ms-per-spurious sleep on the bsp took fresh-host paint
+        // from 1/3 to 0/4 - slowing the leader's retest cadence shifts the
+        // glib pool startup handshake against it. the hot spin is ugly but the
+        // relief valve already donates when Schedule truly starves. (satoru)
         return false;
     }
     return true;
