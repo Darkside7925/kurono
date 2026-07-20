@@ -1199,6 +1199,30 @@ void Scheduler::FixupGsAfterIsrSwitch() {
 static void (*g_ap_futex_maint)() = nullptr;
 void Scheduler::SetApFutexMaintHook(void (*fn)()) { g_ap_futex_maint = fn; }
 
+// task 22 - the linux min_vruntime wake clamp: a thread that once monopolized
+// a cpu (the leader's early futex spurious-spin accrued ~13s of vruntime)
+// falls so far behind the pack that dozens of briefly-waking repoll threads
+// (whose vruntime stays frozen-low while parked) win EVERY pick - the leader
+// sat READY and unpicked for 60+ seconds = the late-stall. linux clamps a
+// waking task to cfs_rq min_vruntime minus a latency slice; mirror that: on
+// every Blocked->Ready transition, pull the waker's vruntime down to at most
+// (min over ready/running user tasks) + 24, so a wake can lag the queue head
+// by at most ~one generous slice. lock-free racy scan by design - callable
+// from any wake path with or without g_sched_lock held; an imperfect min only
+// makes the clamp slightly loose, never wrong. (satoru)
+void Scheduler::NormalizeWakeVruntime(Process* p) {
+    if (!p) return;
+    uint64_t mn = ~0ull;
+    for (Process* c = ready_queue; c; c = c->next) {
+        if (!c->is_user() || c == p) continue;
+        int st = c->state;
+        if (st != (int)Process_Ready && st != (int)Process_Running) continue;
+        if (c->vruntime < mn) mn = c->vruntime;
+    }
+    if (mn == ~0ull) return;   // nobody else runnable (satoru)
+    if (p->vruntime > mn + 24) p->vruntime = mn + 24;
+}
+
 void Scheduler::PromoteDeferredWakes() {
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     for (Process* p = ready_queue; p; p = p->next) {
@@ -1206,6 +1230,7 @@ void Scheduler::PromoteDeferredWakes() {
             if (--p->sleep_ticks == 0) {
                 p->state = Process_Ready;
                 if (p->interactive_score < 16) p->interactive_score += 2;
+                NormalizeWakeVruntime(p);   // task 22 wake clamp (satoru)
             }
         }
     }

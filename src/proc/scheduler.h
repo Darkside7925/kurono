@@ -466,4 +466,8 @@ public:
     static void ApIdleMaint();
     // task 21 a/b: hard-pin threads to their last cpu (kurono.pincpu=1). (satoru)
     static void SetPinCpu(bool on);
+    // task 22: linux-model min_vruntime clamp on wake - a woken task may lag
+    // the runnable pack by at most one slice, never by its whole spin history.
+    // lock-free racy scan; callable from any wake path. (satoru)
+    static void NormalizeWakeVruntime(Process* p);
 };
