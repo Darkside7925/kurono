@@ -592,6 +592,7 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
 static bool switch_to_ready_user(InterruptFrame* frame);
 static void futex_sweep_timeouts();   // release timed-out futex waiters (satoru)
 static inline bool wake_blocked_to_ready(Process* t);   // atomic Blocked->Ready (satoru)
+static uint64_t g_poll_parked = 0;    // task 20: poll-family ap parks (printed in ffcount) (satoru)
 
 // deschedule a user thread that is about to block in poll/ppoll: rewind its saved
 // user frame to RE-RUN the syscall on wake, mark it Blocked with a short
@@ -611,6 +612,41 @@ static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
     // single-owner: state + sleep_ticks under g_sched_lock. (satoru)
     { uint64_t sf; Scheduler::StateLock(&sf); task->state = Process_Blocked; task->sleep_ticks = 2; Scheduler::StateUnlock(sf); }
     if (!switch_to_ready_user(current_syscall_frame)) {
+        // TASK 20 (the glib-wedge core): no sibling to switch to. the old
+        // in-place fallback BUSY-HELD this ap in ring-0 for the whole wait
+        // (kls_relax_sleep_ms pause-spins on an ap) - a long ppoll (gmain's
+        // main-context pipe wait) then eats a core forever, no preempt save
+        // ever lands (ring-0), and the glib pool startup deadlocks behind the
+        // stolen core. PARK instead, exactly like the futex ap park: the frame
+        // is already a restart frame (rip rewound, rax=restart_nr), sleep_ticks
+        // =2 makes the deferred promotion our repoll waker (the idle-ap maint
+        // drives it while parked), the dispatch loop re-claims us, and the
+        // restarted syscall re-scans readiness. re-verify still-Blocked under
+        // the state lock first (a promotion may have raced) - parking a task
+        // someone already re-readied would still be picked up same-cpu, but
+        // keep the protocol identical to the futex park. bsp + non-thread
+        // keep the in-place fallback (the bsp anchors the session and pumps
+        // ui/net between scans; ClaimReadyThreadForCpu never claims leaders). (satoru)
+        if (SMP::CpuIndex() != 0 && task->is_thread()) {
+            bool park_ok = false;
+            {
+                uint64_t sf; Scheduler::StateLock(&sf);
+                if (__atomic_load_n((int*)&task->state, __ATOMIC_RELAXED) ==
+                    (int)Process_Blocked) {
+                    task->last_run_cpu = (uint8_t)SMP::CpuIndex();
+                    task->released_ms  = Scheduler::NowMs();
+                    park_ok = true;
+                }
+                Scheduler::StateUnlock(sf);
+            }
+            if (park_ok) {
+                __atomic_store_n(&task->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                SMP::ApIdleFrame(current_syscall_frame);
+                current_frame_rewritten = true;
+                g_poll_parked++;   // forensics (satoru)
+                return true;   // parked; the restart frame resumes the poll (satoru)
+            }
+        }
         uint64_t sf; Scheduler::StateLock(&sf);
         task->sleep_ticks     = 0;                      // no sibling: undo + block in-place (satoru)
         task->state           = Process_Running;
@@ -1084,6 +1120,7 @@ static void ff_meas_sample() {
     SerialLogger::Log(" fblk=");    SerialLogger::LogDec((int)g_ftx_wait_blocked);
     SerialLogger::Log(" fspur=");   SerialLogger::LogDec((int)g_ftx_wait_spur);
     SerialLogger::Log(" fpark=");   SerialLogger::LogDec((int)g_ftx_wait_parked);
+    SerialLogger::Log(" ppark=");   SerialLogger::LogDec((int)g_poll_parked);
     SerialLogger::Log(" feag=");    SerialLogger::LogDec((int)g_ftx_wait_eagain);
     SerialLogger::Log(" fwake=");   SerialLogger::LogDec((int)g_ftx_wake_calls);
     SerialLogger::Log(" fwoke=");   SerialLogger::LogDec((int)g_ftx_woken_total);
