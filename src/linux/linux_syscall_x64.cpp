@@ -20,6 +20,7 @@
 #include "../proc/scheduler.h"   // full Process def for LinuxProcess::task->exe_path (satoru)
 #include "../proc/smp.h"         // cpu index in the [ff] trace (satoru)
 #include "../kernel/udf.h"       // SYS_UDF_CALL -> user driver framework proxy (satoru)
+#include "../drivers/timer.h"    // GetRealMs64 for clock_nanosleep ABSTIME (satoru)
 
 // Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
 // switches to, and a one-slot stash for the user rsp across that switch (every
@@ -158,7 +159,10 @@ constexpr NrMap kNrMap[] = {
     { 21,  33 },  // access
     { 32,  41 },  // dup
     { 33,  63 },  // dup2
-    { 35, 162 },  // nanosleep
+    // 35 (nanosleep) is an explicit case now: the table route fed the amd64
+    // 64-bit timespec into the i386 32-bit parser (tv_nsec read the HIGH half
+    // of tv_sec = 0), so every sub-second sleep returned instantly - the 10k/s
+    // sleep-loop syscall storm. see case 35 below. (satoru)
     { 39,  20 },  // getpid
     { 60,   1 },  // exit
     { 63, 122 },  // uname
@@ -204,6 +208,13 @@ constexpr NrMap kNrMap[] = {
     { 157, LSYS_PRCTL },         // prctl PR_SET_NAME/GET_NAME (thread comm) (satoru)
     { 229, LSYS_CLOCK_GETRES },  // clock_getres
     { 234, LSYS_TGKILL },        // tgkill
+    // ── real signal delivery + a few ex-stubs now implemented (satoru) ──────────
+    { 13, LSYS_RT_SIGACTION },   // rt_sigaction (stores the handler table) (satoru)
+    { 14, LSYS_RT_SIGPROCMASK }, // rt_sigprocmask (honours block/unblock/setmask) (satoru)
+    { 15, LSYS_RT_SIGRETURN },   // rt_sigreturn (restores the sigframe) (satoru)
+    { 24, LSYS_SCHED_YIELD },    // sched_yield -> real sibling-thread yield (satoru)
+    { 73, LSYS_FLOCK },          // flock -> real whole-file advisory lock (satoru)
+    { 324, LSYS_MEMBARRIER },    // membarrier -> real cross-core barrier (satoru)
     { 332, LSYS_STATX },         // statx
     // ── socket family: x86_64 has direct socket syscalls (i386 multiplexed
     //    them through socketcall). without these, any networked / wayland /
@@ -402,25 +413,30 @@ constexpr NrMap kNrMap[] = {
 
 constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);
 
-// Stubs that just return success (0) - needed by musl/CPython startup
-// but harmless if we no-op them.  Listed by x86_64 nr.
+// Pretend-success no-op allowlist. audited: every ex-stub that has real semantics
+// now routes to a Dispatch handler via kNrMap (rt_sigaction/procmask/sigreturn,
+// sched_yield, flock, membarrier - see the block above), and 302/prlimit64 is
+// handled directly in SyscallEntryX64Handler's switch (returns -ENOSYS) so its old
+// stub entry here was dead. what remains below is genuinely a correct no-op, with
+// a per-entry justification. Listed by x86_64 nr. (satoru)
 constexpr uint32_t kStubOk[] = {
-    13,   // rt_sigaction
-    14,   // rt_sigprocmask
-    15,   // rt_sigreturn (no signals delivered, never really invoked) (satoru)
-    24,   // sched_yield (single-threaded: yield is a no-op success) (satoru)
-    73,   // flock (advisory lock pretend-success) (satoru)
-    131,  // sigaltstack
-    273,  // set_robust_list
-    324,  // membarrier (single-threaded: no-op success) (satoru)
-    334,  // rseq
-    302,  // prlimit64  (we'll fail soft)
-    // 157 (prctl) now routed to the real LSYS_PRCTL handler via kNrMap so
-    // PR_SET_NAME actually records the thread name (comm) instead of no-op'ing.
-    // the handler returns 0 for every other op, same as this stub did. (satoru)
+    131,  // sigaltstack - we deliver rt sigframes on the MAIN stack (no alternate
+          // signal stack); accepting the registration is correct because we simply
+          // ignore SS_ONSTACK. the caller keeps working. (satoru)
+    273,  // set_robust_list - the robust-futex list is a crash-cleanup optimization
+          // (the kernel walks it to release locks held by a thread that died). our
+          // futex owners are dropped on thread exit anyway, so recording the list is
+          // unnecessary; accept + ignore. (satoru)
+    334,  // rseq - restartable sequences are a per-cpu fast-path OPTIMIZATION glibc
+          // registers; musl (firefox's libc) never uses them. returning success
+          // without real rseq support is safe because the abi guarantees a correct
+          // non-accelerated fallback (we simply never restart the sequence). (satoru)
+    // 157 (prctl) is routed to the real LSYS_PRCTL handler via kNrMap so PR_SET_NAME
+    // records the thread name (comm); the handler returns 0 for every other op. (satoru)
     187,  // readahead - advisory prefetch; mozglue ReadAhead()s each .so before
           // dlopen and treated -ENOSYS as fatal, breaking XPCOMGlueLoad of the
-          // libmozgtk->libxkbcommon chain. no-op success is correct. (satoru)
+          // libmozgtk->libxkbcommon chain. no-op success is correct - the data is
+          // read on demand anyway. (satoru)
 };
 
 constexpr int kStubOkCount = sizeof(kStubOk) / sizeof(kStubOk[0]);
@@ -658,8 +674,16 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             HAL::DisableInterrupts();
             return r;
         }
-        case 230: {  // clock_nanosleep(clockid, flags, req, rem) - route to
-            // nanosleep(req, rem); clockid/flags ignored (satoru)
+        case 35: {  // nanosleep - BISECT REVERT (task 17): the exact historical
+            // route (raw dispatch to the i386 handler, 32-bit parse quirk and
+            // all - sub-second sleeps return instantly). the SleepMs64
+            // deschedule version hung firefox pre-KX2 in the glib thread-pool
+            // handshake; this form is the boot-3 behaviour that progressed.
+            // re-fix properly once the wedge is understood. (satoru)
+            return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a0, a1, 0, 0, 0);
+        }
+        case 230: {  // clock_nanosleep(clockid, flags, req, rem) - BISECT REVERT
+            // (task 17): the exact historical route-to-nanosleep form. (satoru)
             return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a2, a3, 0, 0, 0);
         }
         // stat/fstat/lstat/newfstatat must NOT route through the i386 LSYS_*

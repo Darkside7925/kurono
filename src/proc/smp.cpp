@@ -43,6 +43,11 @@ namespace {
     //  tlb-shootdown ack counter: receivers increment after reloading cr3. (satoru)
     volatile uint32_t g_tlb_ack = 0;
 
+    //  the kernel address-space root, captured in StartAPs, for LoadKernelCr3.
+    //  an idle/parked cpu switches here so it never walks a dead process's
+    //  (possibly destroyed + recycled) page tables. (satoru)
+    volatile uint64_t g_kernel_cr3 = 0;
+
     //  flush epochs (see smp.h): start-seq bumps at broadcast entry, full-seq
     //  latches the highest start-seq that got acks from every online peer.
     //  senders are serialized by the callers' mmap/kls locks; receivers only
@@ -258,6 +263,13 @@ uint32_t SMP::OnlineCount() {
     return n ? n : 1;
 }
 
+void SMP::MarkSelfOffline() {
+    // containment park (see smp.h): stop counting this cpu for tlb-ack wants
+    // and the online census - it is about to cli-hlt forever. (satoru)
+    uint32_t idx = CpuIndex();
+    if (idx < g_cpu_count) g_cpus[idx].online = 0;
+}
+
 uint32_t SMP::ApicId() {
     if (g_lapic_base == 0) return 0;
     return LapicRead(0x20) >> 24;   // local apic id register (satoru)
@@ -344,16 +356,39 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
     uint32_t idx = SMP::CpuIndex();
     Scheduler::SetCurrentForThisCpu(nullptr);   // no task on this cpu right now (satoru)
     Userspace::SetActiveForThisCpu(nullptr);    // no active user session either (satoru)
+    //  idle maintenance throttle (task 17): a parked cpu must still advance the
+    //  sleep_ticks promotions + the futex repoll heal, or threads it parked
+    //  (futex/nanosleep with no successor) oversleep until the bsp's next
+    //  cooperative Schedule (~50ms) - the promotion paths in the timer preempts
+    //  are ring-3-gated and never run while this cpu idles in ring-0 here. (satoru)
+    uint64_t last_maint_ms = 0;
     for (;;) {
+        //  never idle on a dead task's cr3: this cpu owns no task here, but its
+        //  last thread's address space may be reaped + its page tables recycled
+        //  while our walker can still fetch through them (garbage kernel
+        //  translations = random corruption). cheap: compares before writing. (satoru)
+        SMP::LoadKernelCr3();
+        {
+            uint64_t nowm = Timer::GetRealMs64();
+            if (nowm != last_maint_ms) {   // at most once per ms (satoru)
+                last_maint_ms = nowm;
+                Scheduler::ApIdleMaint();
+            }
+        }
         if (g_ap_thread_sched) {
             Process* t = Scheduler::ClaimReadyThreadForCpu(idx);
             if (t) {
-                {
-                    // claim trace - resumes are infrequent (an idle ap picking up a
-                    // ready sibling), so this stays low-volume. (satoru)
+                //  claim trace - THROTTLED: with the futex/nanosleep ap-park a
+                //  resume happens per wake (thousands/boot) and one serial line
+                //  is an ~8.7ms uart busy-wait - unthrottled this alone dragged
+                //  the boot by tens of seconds. first few + 1-per-4096. (satoru)
+                static uint32_t s_apr_n = 0;
+                uint32_t an = __atomic_add_fetch(&s_apr_n, 1u, __ATOMIC_RELAXED);
+                if (an <= 12 || (an & 4095u) == 0) {
                     uint64_t lf; g_ap_log_lock.LockIrqSave(&lf);
                     SerialLogger::Log("[apr] cpu"); SerialLogger::LogDec((int)idx);
                     SerialLogger::Log(" resume pid="); SerialLogger::LogDec((int)t->pid);
+                    SerialLogger::Log(" n="); SerialLogger::LogDec((int)an);
                     SerialLogger::Log("\r\n");
                     g_ap_log_lock.UnlockIrqRestore(lf);
                 }
@@ -465,6 +500,16 @@ void SMP::ApIdleFrame(InterruptFrame* f) {
 void SMP::BroadcastTlbFlush() {
     uint32_t online = OnlineCount();
     if (online <= 1) return;
+    //  serialize broadcasters: the kls historically serialized every caller,
+    //  but the kmemx pending-free flushes from its own kernel process, so two
+    //  rounds could share one ack counter - a peer's double-ack (collapsed
+    //  ipis) can then stand in for a peer that never flushed, falsely
+    //  advancing the proof epoch. plain exchange spin with IF ON: a waiting
+    //  broadcaster must still service + ack the holder's ipi or the holder
+    //  times out on it. (satoru)
+    static volatile uint32_t s_bcast_lock = 0;
+    while (__atomic_exchange_n(&s_bcast_lock, 1u, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
     uint64_t seq = __atomic_add_fetch(&g_tlb_flush_start_seq, 1u, __ATOMIC_SEQ_CST);
     uint32_t want = online - 1;
     __atomic_store_n(&g_tlb_ack, 0u, __ATOMIC_RELEASE);
@@ -495,6 +540,7 @@ void SMP::BroadcastTlbFlush() {
                    !__atomic_compare_exchange_n(&g_tlb_flush_full_seq, &cur, seq,
                                                 false, __ATOMIC_SEQ_CST,
                                                 __ATOMIC_ACQUIRE)) { }
+            __atomic_store_n(&s_bcast_lock, 0u, __ATOMIC_RELEASE);
             return;
         }
         if (Timer::GetRealMs64() - t0 > 20) break;
@@ -502,10 +548,11 @@ void SMP::BroadcastTlbFlush() {
     }
     //  timed out - a peer had interrupts masked >20ms; its next timer tick
     //  reloads cr3. the epoch is NOT advanced, so the quarantine holds any
-    //  frame cleared before this broadcast until a LATER fully-acked flush - 
+    //  frame cleared before this broadcast until a LATER fully-acked flush -
     //  the stale window cannot recycle memory. counter only (no serial i/o in
     //  this hot, possibly-IF=0 path). (satoru)
     __atomic_fetch_add(&g_tlb_flush_timeouts, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_bcast_lock, 0u, __ATOMIC_RELEASE);
 }
 
 void SMP::HandleTlbIpi() {
@@ -513,6 +560,15 @@ void SMP::HandleTlbIpi() {
     __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
     __asm__ volatile("mov %0, %%cr3" : : "r"(c3) : "memory");
     __atomic_fetch_add(&g_tlb_ack, 1u, __ATOMIC_ACQ_REL);
+}
+
+void SMP::LoadKernelCr3() {
+    uint64_t k = __atomic_load_n(&g_kernel_cr3, __ATOMIC_ACQUIRE);
+    if (!k) return;
+    uint64_t c3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
+    if (c3 == k) return;
+    __asm__ volatile("mov %0, %%cr3" : : "r"(k) : "memory");
 }
 
 uint64_t SMP::TlbFlushStartSeq() {
@@ -524,6 +580,14 @@ uint64_t SMP::TlbFlushFullSeq() {
 }
 
 void SMP::StartAPs() {
+    // capture the kernel root for LoadKernelCr3 BEFORE the single-cpu early
+    // return - the bsp's nested-fault park uses it too. StartAPs runs during
+    // kernel boot, so the active cr3 here IS the kernel address space. (satoru)
+    {
+        uint64_t kc3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(kc3));
+        g_kernel_cr3 = kc3;
+    }
     if (g_cpu_count <= 1) {
         SerialLogger::Log("[SMP] single cpu, no APs to start\r\n");
         return;

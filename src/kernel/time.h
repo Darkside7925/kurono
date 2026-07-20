@@ -20,6 +20,10 @@ public:
     static void MaybeSyncRTC(uint64_t now_us);
     static void ApplyNTPSeconds(uint32_t utc_s);
     static void SetAllowAdjust(bool en);
+    // realtime base in whole seconds (boot RTC epoch + ntp offset), WITHOUT the
+    // sub-second PIT port read - cheap + irq-safe for the vdso time-page tick.
+    // callers add the monotonic uptime seconds. (satoru)
+    static uint64_t RealtimeBaseSeconds();
 private:
     static uint32_t boot_utc_s;
     static uint32_t monotonic_ms;

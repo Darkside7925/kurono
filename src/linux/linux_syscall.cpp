@@ -98,20 +98,107 @@ static int  g_resume_us_exit[SMP_MAX_CPUS]       = {};
 // owned, and the recursion test is a single load. (satoru)
 static volatile uint32_t g_kls_word  = 0;
 static int               g_kls_depth[SMP_MAX_CPUS] = {};
+// (satoru) when each cpu FRESH-acquired the kls (depth 0->1), for the BSP-wedge
+// watchdog: a firefox thread that enters a syscall on the bsp, takes the kls,
+// and wedges without yielding starves the cooperative GUIProcess -> the whole
+// guest hangs (the mstate-diagnosed ~73s early-stall). the irq0 timer samples
+// this to name the wedged syscall (kls_timer_preempt). 0 = not held. (satoru)
+static volatile uint64_t g_kls_hold_start_ms[SMP_MAX_CPUS] = {};
+
+// the shared acquire spin: cas + pause, with the liveness-gated orphan-steal
+// (see the block comment in kls_lock for the full rationale). used by kls_lock,
+// kls_relax and kls_relax_sleep_ms so the gate logic exists exactly once. (satoru)
+// kls contention measurement (task 16): does the global syscall serializer's
+// spin-wait dominate the ~56s firefox boot? counted globally (firefox dominates
+// during its boot) and surfaced in [ffcount]. the clock is read ONLY on the
+// contended path so the uncontended fast path stays free. (satoru)
+static uint64_t g_kls_acq = 0;        // fresh acquires (satoru)
+static uint64_t g_kls_contended = 0;  // fresh acquires that had to spin (satoru)
+static uint64_t g_kls_spin_ms = 0;    // total wall-time spinning for the lock (satoru)
+
+static void kls_acquire_spin(uint32_t cpu, uint32_t me) {
+    (void)cpu;   // callers own the depth bookkeeping; kept for symmetry (satoru)
+    // fast path: uncontended acquire, no clock read. (satoru)
+    {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            g_kls_acq++;
+            return;
+        }
+    }
+    // contended: account it and time the spin. (satoru)
+    g_kls_acq++;
+    g_kls_contended++;
+    uint64_t spin_t0 = Timer::GetRealMs64();
+    uint64_t heal_start = 0, heal_spins = 0;
+    uint32_t last_owner = 0;
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            g_kls_spin_ms += Timer::GetRealMs64() - spin_t0;
+            return;
+        }
+        for (;;) {
+            __asm__ __volatile__("pause" ::: "memory");
+            uint32_t w = __atomic_load_n(&g_kls_word, __ATOMIC_RELAXED);
+            if (w == 0) break;                 // freed - go retry the cas (satoru)
+            // sample the clock cheaply (every 65536 spins, not every iteration). (satoru)
+            if ((++heal_spins & 0xFFFF) == 0) {
+                uint64_t now = Timer::GetRealMs64();
+                // the elapsed window measures ONE owner's hold, not this
+                // waiter's total starvation: reset whenever the lock changes
+                // hands, or heavy contention would hard-steal from an innocent
+                // fresh owner after 3s of cumulative short healthy holds. (satoru)
+                if (heal_start == 0 || w != last_owner) { heal_start = now; last_owner = w; }
+                else if (w != 0 && w != me) {
+                    // steal gate: owner cpu parked offline (containment) = provably
+                    // dead, steal after 200ms. anything else: only after the 3s hard
+                    // bound (nmi-watchdog backstop), loudly - a live steal hands the
+                    // kls serializer to two cores at once. (satoru)
+                    PerCpu* oc = ((w - 1u) < SMP_MAX_CPUS) ? SMP::ByIndex(w - 1u) : nullptr;
+                    bool owner_dead = (oc && !oc->online);
+                    bool hard_bound = (now - heal_start > 3000);
+                    if ((owner_dead && now - heal_start > 200) || hard_bound) {
+                        uint32_t victim = w;
+                        if (__atomic_compare_exchange_n(&g_kls_word, &victim, me, false,
+                                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                            if ((victim - 1u) < SMP_MAX_CPUS) g_kls_depth[victim - 1u] = 0;
+                            SerialLogger::Log(owner_dead
+                                ? "[kls] stole lock from parked-dead cpu\r\n"
+                                : "[kls] HARD steal: live owner held >3s - hunt this hold\r\n");
+                            return;
+                        }
+                        heal_start = now;      // lost the steal race - re-arm (satoru)
+                    }
+                }
+            }
+        }
+    }
+}
 
 static void kls_lock() {
     uint32_t cpu = SMP::CpuIndex();
     if (cpu >= SMP_MAX_CPUS) cpu = 0;
     uint32_t me = cpu + 1u;
     if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) == me) { g_kls_depth[cpu]++; return; }
-    for (;;) {
-        uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
-                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
-        do { __asm__ __volatile__("pause" ::: "memory"); }
-        while (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != 0);
-    }
+    // orphaned-lock self-heal, LIVENESS-GATED. the old rule stole after a flat
+    // ~200ms on the theory that "no legitimate hold is ever this long" - false:
+    // live holds past 200ms exist (the eager .so mmap copy of a 100MB+ library,
+    // a contended flock wait before it released around its sleep), and stealing
+    // from a LIVE owner puts TWO cores inside the kls body at once - fd tables,
+    // kvfs, the heap - the exact uaf-corruption class this serializer exists to
+    // prevent (a timespec-shaped value in a freed-reused block = two unserialized
+    // syscalls racing the allocator). the only PROVABLE orphan is a parked cpu:
+    // the ring-3 fault containment (hal.cpp) cli-hlt's a core forever and marks
+    // it offline, and a parked core can never kls_unlock. so: steal at 200ms
+    // ONLY from an offline owner cpu; otherwise wait out a 3s hard bound as the
+    // nmi-watchdog backstop and log loudly - a live hold that long is a real bug
+    // to hunt, not to silently unserialize. (satoru)
+    kls_acquire_spin(cpu, me);
     g_kls_depth[cpu] = 1;
+    g_kls_hold_start_ms[cpu] = Timer::GetRealMs64();   // bsp-wedge watchdog (satoru)
 }
 
 static void kls_unlock() {
@@ -120,7 +207,40 @@ static void kls_unlock() {
     uint32_t me = cpu + 1u;
     if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != me) return;  // never taken (bsp boot paths) (satoru)
     if (--g_kls_depth[cpu] > 0) return;             // recursive hold (satoru)
+    g_kls_hold_start_ms[cpu] = 0;                    // released - watchdog off (satoru)
     __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
+}
+
+// kls-exemption (task 16): 91.6% of firefox's ~228k syscalls/boot contended on
+// the global kls serializer (127s aggregate spin across 4 cores). these hot
+// syscalls carry their OWN fine-grained locking (futex -> g_futex_lock +
+// g_sched_lock + atomic CAS; sched_yield/nanosleep -> g_sched_lock) or touch NO
+// kls-protected shared state (fd table / KVFS / heap) at all (clock/getpid
+// family, now mostly vdso-served anyway). running them WITHOUT the global lock
+// lets firefox's threads execute these in parallel instead of single-file. the
+// entry keeps signal delivery serialized (takes kls only when a signal is
+// actually pending). amd64 syscall numbers. (satoru)
+// DISABLED (task 16). The exemption is the RIGHT fix - it crushed the global
+// serializer contention (klscont 208920 -> 12, spin 127s -> 2ms) and the SMP
+// oracle (pthread_test, pure futex/clone/mutex) PASSES with futex exempt. BUT
+// firefox regresses: with futex exempt (even alone) its early startup hangs
+// pre-KX2 (threads spawn, then spin ~1000 syscalls/s, never reach XPCOM init).
+// The oracle does NOT reproduce it, so firefox's real futex handshake depends on
+// an ordering/wake property that the global kls_lock was accidentally providing
+// - a LATENT Kurono futex/scheduler bug kls was masking (firefox works on Linux,
+// which has no such lock). Root-cause that (trace the pre-KX2 main-thread futex
+// wait + the missing wake/barrier) BEFORE re-enabling. Return false = full kls
+// serialization (firefox works). Flip the case back on to resume the hunt. The
+// measurement counters (g_kls_acq/contended/spin_ms in [ffcount]) stay. (satoru)
+static inline bool syscall_x64_kls_exempt(uint64_t nr) {
+    switch (nr) {
+        case 202: return true;   // futex - self-locked via g_futex_lock + wake_blocked_claim ordering (satoru)
+        // 35/230 (nanosleep) exemption + SleepMs64 deschedule REVERTED pending
+        // the glib-pool wedge bisect: boots with it hang pre-KX2 in the glib
+        // thread-pool handshake (pool-spawner WAIT-spin, gmain ring-3 spin);
+        // boots without it progress. see task 17 notes. (satoru)
+        default:  return false;  // everything else stays kls-serialized for now (satoru)
+    }
 }
 
 // fully release the kls lock, breathe, reacquire at the same depth - for the
@@ -138,19 +258,52 @@ static void kls_relax() {
     int depth = g_kls_depth[cpu];
     __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
     for (int i = 0; i < 128; i++) __asm__ __volatile__("pause" ::: "memory");
-    for (;;) {
-        uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
-                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
-        do { __asm__ __volatile__("pause" ::: "memory"); }
-        while (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != 0);
+    // same liveness-gated self-heal as kls_lock (shared spin). (satoru)
+    kls_acquire_spin(cpu, me);
+    g_kls_depth[cpu] = depth;
+}
+
+// like kls_relax but with a real ~ms breath while the lock is RELEASED - for the
+// contended-wait loops (flock, fcntl F_SETLKW) that legally spin for seconds.
+// their old shape slept WITH the lock held on the bsp (PumpUI + SleepMs under
+// kls), which (a) starved every other core's syscalls for the whole wait, (b)
+// held past the old orphan-steal threshold, handing the serializer to a second
+// core mid-body, and (c) could outright deadlock once the steal was liveness-
+// gated: the lock HOLDER waits for another process's unlock syscall, which
+// needs the kls to run. the bsp sleeps via the scheduler (timer irqs keep the
+// futex sweep alive); an ap busy-breathes on the wall clock (it has no
+// kernel-process context to sleep in). (satoru)
+static void kls_relax_sleep_ms(uint32_t ms) {
+    uint32_t cpu = SMP::CpuIndex();
+    if (cpu >= SMP_MAX_CPUS) cpu = 0;
+    uint32_t me = cpu + 1u;
+    if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != me) {
+        // not the owner (boot paths): just breathe unlocked. (satoru)
+        uint64_t until = Timer::GetRealMs64() + ms;
+        while (Timer::GetRealMs64() < until) __asm__ __volatile__("pause" ::: "memory");
+        return;
     }
+    int depth = g_kls_depth[cpu];
+    __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
+    if (cpu == 0) {
+        Scheduler::SleepMs(ms);
+    } else {
+        uint64_t until = Timer::GetRealMs64() + ms;
+        while (Timer::GetRealMs64() < until) __asm__ __volatile__("pause" ::: "memory");
+    }
+    kls_acquire_spin(cpu, me);
     g_kls_depth[cpu] = depth;
 }
 
 // futex wait-queue lock: the one kls structure ALSO touched from irq context
 // (kls_timer_preempt's sweep on the bsp), so it gets its own short lock rather
-// than the kls lock. always leaf - never take another lock under it. (satoru)
+// than the kls lock. lock order (task 17, StateLock made real): g_futex_lock ->
+// g_sched_lock is the ONLY permitted nesting (enqueue commit, park re-verify,
+// wake claim); NOTHING may take g_futex_lock while holding g_sched_lock
+// (audited: ScheduleNextUser/PromoteDeferredWakes/Claim* never touch the futex
+// queue; ApTimerPreempt runs its futex maint BEFORE taking the sched lock).
+// both guards keep IF off, so the bsp irq sweep can never interrupt a same-cpu
+// holder. (satoru)
 static Spinlock g_futex_lock;
 
 // (satoru) serialize user sys_mmap across cores. threads of one process share the
@@ -385,6 +538,12 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
             if (s >= 0 && s < TIMERFD_MAX && g_timerfd[s].expirations > 0) ready |= L_EPOLLIN;
             break;
         }
+        case LFD_SIGNALFD:
+            // signalfd is readable when a signal in its watch mask (stored in
+            // lfd->offset) is pending on the polling thread. this is what makes a
+            // glib/libevent loop's signalfd fd wake. (satoru)
+            if (p->sig_pending & lfd->offset) ready |= L_EPOLLIN;
+            break;
         case LFD_CONSOLE:
             // stdin readable when injection buffer has data; stdout/stderr
             // are always writable. caller passes interest to disambiguate. (satoru)
@@ -394,7 +553,12 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
         case LFD_KVFS:
         case LFD_EXT4:
         case LFD_PROC:
-            // regular files are always ready for read and write (satoru)
+        case LFD_DEVURANDOM:
+            // regular files + /dev/urandom are ALWAYS ready for read and write.
+            // urandom especially MUST report readable: nss softoken opens it
+            // O_NONBLOCK and poll()s for readability before seeding its rng - the
+            // default case below (writable-only) made that poll hang forever right
+            // at nss init (~27s), which looked like a boot stall. (satoru)
             ready |= L_EPOLLIN | L_EPOLLOUT;
             break;
         default:
@@ -535,10 +699,11 @@ static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
             // 10 ms cadence (no-op with no live inet socket). (satoru)
             LinuxNetBridge::PumpTick();
             KuronoShell::PumpUI();
-            Scheduler::SleepMs(1);
-        } else {
-            kls_relax();
         }
+        // sleep with the kls RELEASED: readiness may depend on a sibling's
+        // syscall on another core (pipe/eventfd writer), which needs this
+        // lock. holding it across the breath forced the 3s hard-steal. (satoru)
+        kls_relax_sleep_ms(1);
     }
 }
 
@@ -818,6 +983,157 @@ static uint64_t page_flags_from_prot(uint32_t prot) {
     return flags;
 }
 
+// ── firefox boot-speed measurement (phase 0, inert diagnostic) ──────────────
+// firefox-leader-tagged counters that attribute the ~50s launch-to-paint window
+// and answer the pivotal unknown: does firefox request executable memory via a
+// memfd DUAL-MAP (one memfd mapped RW-for-codegen + RX-for-exec, no mprotect
+// flip) or via mmap-RW-then-mprotect-RX (a per-codegen BroadcastTlbFlush storm)?
+// emitted at ~1hz as [ffcount], NEVER per-syscall - serial writes would perturb
+// the very timing we measure. all counters are plain adds on the (already
+// serialized) mmap/mprotect paths. (satoru)
+static volatile uint64_t g_ff_meas_as = 0;   // firefox's shared address space, cached once (satoru)
+static uint64_t g_ff_mmap_exec_calls = 0;    // mmap() with PROT_EXEC (satoru)
+static uint64_t g_ff_memfd_exec_maps = 0;    // memfd mapped with PROT_EXEC - the disambiguator (satoru)
+static uint64_t g_ff_memfd_dualmaps  = 0;    // a 2nd view of one memfd base with a different exec bit (satoru)
+static uint64_t g_ff_mprot_rx_calls  = 0;    // mprotect RW->RX flips (satoru)
+static uint64_t g_ff_mprot_rx_pages  = 0;
+static uint64_t g_ff_mprot_rx_ms     = 0;    // total wall time in RW->RX mprotect bodies (satoru)
+static uint64_t g_ff_mprot_flush_ms  = 0;    // total wall time in their BroadcastTlbFlush (satoru)
+static uint64_t g_ff_clock_syscalls  = 0;    // clock_gettime SYSCALLS (vdso miss) - should be ~0 (satoru)
+// task 17 wedge forensics: per-nr syscall histogram (window = one sample) so a
+// syscall spin-storm NAMES the spinning nr, + futex WAIT outcome counters so a
+// "wait that can never block" (enqueue/deschedule fails -> spurious 0 -> ring-3
+// retest loop) is directly visible vs genuinely blocked waits. plain adds,
+// printed + cleared at 1hz by ff_meas_sample. (satoru)
+static uint32_t g_ff_nr_hist[352]    = {0};  // amd64 nr -> calls this window (satoru)
+static uint64_t g_ftx_wait_calls     = 0;    // FUTEX_WAIT entries (satoru)
+static uint64_t g_ftx_wait_blocked   = 0;    // enqueued + descheduled ok (satoru)
+static uint64_t g_ftx_wait_spur      = 0;    // could not block -> spurious 0 (satoru)
+static uint64_t g_ftx_wait_parked    = 0;    // blocked by idling the ap (no successor) (satoru)
+// task 17b: WHY was the wait spurious + WHO spins. r1..r4 split fspur by cause;
+// the last-spinner sample names the pid/uaddr for the storm. (satoru)
+static uint64_t g_ftx_spur_nouphys   = 0;    // uaddr unmapped at enqueue (kmemx?) (satoru)
+static uint64_t g_ftx_spur_valchg    = 0;    // value changed under the queue lock (satoru)
+static uint64_t g_ftx_spur_qfull     = 0;    // waiter table full (satoru)
+static uint64_t g_ftx_spur_noswitch  = 0;    // could not deschedule (undo path) (satoru)
+static volatile uint32_t g_ftx_spin_pid   = 0;   // last spurious waiter (satoru)
+static volatile uint64_t g_ftx_spin_uaddr = 0;
+static void ff_dump_ff_waiters(uint64_t as);     // defined after the futex globals (satoru)
+static uint64_t g_ftx_wait_eagain    = 0;    // value already changed -> -EAGAIN (satoru)
+static uint64_t g_ftx_wake_calls     = 0;    // FUTEX_WAKE entries (satoru)
+static uint64_t g_ftx_woken_total    = 0;    // waiters actually woken (satoru)
+// tiny ring of recently-mapped shm object bases + their exec bit, to spot a
+// second mapping of the same memfd with a flipped exec bit (the dual-map). (satoru)
+static uint64_t g_ff_shm_ring_base[16] = {0};
+static uint8_t  g_ff_shm_ring_exec[16] = {0};
+static int      g_ff_shm_ring_head = 0;
+
+// is this task in the firefox thread group? caches firefox's shared address
+// space on first name match so the hot path is a single load+compare (all
+// firefox threads share one cr3). region_owner (above) walks to the tg leader. (satoru)
+static bool ff_is_firefox(Process* task) {
+    if (!task || !task->address_space) return false;
+    uint64_t as = __atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED);
+    if (as) return task->address_space == as;
+    Process* owner = region_owner(task);
+    if (!owner) return false;
+    const char* n = owner->name;
+    if (n[0]=='f'&&n[1]=='i'&&n[2]=='r'&&n[3]=='e'&&n[4]=='f'&&n[5]=='o'&&n[6]=='x'&&n[7]==0) {
+        __atomic_store_n(&g_ff_meas_as, owner->address_space, __ATOMIC_RELAXED);
+        return true;
+    }
+    return false;
+}
+// note a memfd mapping's (base, exec) and flag a dual-map when the same base is
+// seen again with a different exec bit. (satoru)
+static void ff_note_memfd_map(uint64_t base, bool exec) {
+    for (int i = 0; i < 16; i++) {
+        if (g_ff_shm_ring_base[i] == base && g_ff_shm_ring_exec[i] != (exec?1:0)) {
+            g_ff_memfd_dualmaps++;
+            break;
+        }
+    }
+    g_ff_shm_ring_base[g_ff_shm_ring_head] = base;
+    g_ff_shm_ring_exec[g_ff_shm_ring_head] = exec ? 1 : 0;
+    g_ff_shm_ring_head = (g_ff_shm_ring_head + 1) & 15;
+}
+// ~1hz [ffcount] sampler, driven from the bsp timer preempt while firefox is
+// alive. inert until a firefox address space is cached. (satoru)
+static void ff_meas_sample() {
+    if (!__atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED)) return;
+    static uint64_t s_last_ms = 0;
+    uint64_t now = Timer::GetRealMs64();
+    if (now - s_last_ms < 1000) return;
+    s_last_ms = now;
+    SerialLogger::Log("[ffcount] t="); SerialLogger::LogDec((int)now);
+    SerialLogger::Log(" mmapx=");   SerialLogger::LogDec((int)g_ff_mmap_exec_calls);
+    SerialLogger::Log(" memfdx=");  SerialLogger::LogDec((int)g_ff_memfd_exec_maps);
+    SerialLogger::Log(" dual=");    SerialLogger::LogDec((int)g_ff_memfd_dualmaps);
+    SerialLogger::Log(" mprotrx="); SerialLogger::LogDec((int)g_ff_mprot_rx_calls);
+    SerialLogger::Log(" rx_pg=");   SerialLogger::LogDec((int)g_ff_mprot_rx_pages);
+    SerialLogger::Log(" rx_ms=");   SerialLogger::LogDec((int)g_ff_mprot_rx_ms);
+    SerialLogger::Log(" flush_ms=");SerialLogger::LogDec((int)g_ff_mprot_flush_ms);
+    SerialLogger::Log(" clk=");     SerialLogger::LogDec((int)g_ff_clock_syscalls);
+    // kls global-serializer contention (task 16): acq=fresh acquires,
+    // cont=those that had to spin, spin_ms=total wall-time spinning. (satoru)
+    SerialLogger::Log(" klsacq=");  SerialLogger::LogDec((int)g_kls_acq);
+    SerialLogger::Log(" klscont="); SerialLogger::LogDec((int)g_kls_contended);
+    SerialLogger::Log(" klsspin_ms="); SerialLogger::LogDec((int)g_kls_spin_ms);
+    // futex WAIT outcomes (task 17): blocked vs spurious names a cant-block spin. (satoru)
+    SerialLogger::Log(" fw=");      SerialLogger::LogDec((int)g_ftx_wait_calls);
+    SerialLogger::Log(" fblk=");    SerialLogger::LogDec((int)g_ftx_wait_blocked);
+    SerialLogger::Log(" fspur=");   SerialLogger::LogDec((int)g_ftx_wait_spur);
+    SerialLogger::Log(" fpark=");   SerialLogger::LogDec((int)g_ftx_wait_parked);
+    SerialLogger::Log(" feag=");    SerialLogger::LogDec((int)g_ftx_wait_eagain);
+    SerialLogger::Log(" fwake=");   SerialLogger::LogDec((int)g_ftx_wake_calls);
+    SerialLogger::Log(" fwoke=");   SerialLogger::LogDec((int)g_ftx_woken_total);
+    // top-4 syscall nrs THIS window (rate view), then clear. names a spin-storm. (satoru)
+    SerialLogger::Log(" top=");
+    for (int k = 0; k < 4; k++) {
+        int best = -1; uint32_t bc = 0;
+        for (int i = 0; i < 352; i++)
+            if (g_ff_nr_hist[i] > bc) { bc = g_ff_nr_hist[i]; best = i; }
+        if (best < 0 || bc == 0) break;
+        if (k) SerialLogger::Log(",");
+        SerialLogger::LogDec(best); SerialLogger::Log(":"); SerialLogger::LogDec((int)bc);
+        g_ff_nr_hist[best] = 0;
+    }
+    for (int i = 0; i < 352; i++) g_ff_nr_hist[i] = 0;   // fresh window (satoru)
+    // task 17b: spurious-wait causes + the last spinner's identity. (satoru)
+    SerialLogger::Log(" r=");
+    SerialLogger::LogDec((int)g_ftx_spur_nouphys);  SerialLogger::Log("/");
+    SerialLogger::LogDec((int)g_ftx_spur_valchg);   SerialLogger::Log("/");
+    SerialLogger::LogDec((int)g_ftx_spur_qfull);    SerialLogger::Log("/");
+    SerialLogger::LogDec((int)g_ftx_spur_noswitch);
+    SerialLogger::Log(" spin=");  SerialLogger::LogDec((int)g_ftx_spin_pid);
+    SerialLogger::Log("@");       SerialLogger::LogHex64(g_ftx_spin_uaddr);
+    SerialLogger::Log("\r\n");
+    // task 17b: every ~5s dump each task of the firefox thread group - pid,
+    // state, sleep_ticks, on_cpu - so a stranded producer names itself. (satoru)
+    static uint64_t s_last_dump_ms = 0;
+    if (now - s_last_dump_ms >= 5000) {
+        s_last_dump_ms = now;
+        uint64_t as = __atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED);
+        SerialLogger::Log("[fftasks]");
+        int shown = 0;
+        for (Process* p = Scheduler::ready_queue; p && shown < 24; p = p->next) {
+            if (!p->is_user() || p->address_space != as) continue;
+            shown++;
+            SerialLogger::Log(" ");   SerialLogger::LogDec((int)p->pid);
+            SerialLogger::Log("=");   SerialLogger::Log(p->name);
+            SerialLogger::Log(":s");  SerialLogger::LogDec((int)p->state);
+            SerialLogger::Log("t");   SerialLogger::LogDec((int)p->sleep_ticks);
+            SerialLogger::Log("c");   SerialLogger::LogDec((int)p->on_cpu);
+            SerialLogger::Log(p->is_thread() ? "T" : "P");   // thread vs process (satoru)
+            SerialLogger::Log("u");   SerialLogger::LogDec((int)p->last_run_cpu);
+        }
+        SerialLogger::Log("\r\n");
+        // active futex waiters of this AS: who is parked on WHAT (defined after
+        // the futex globals; forward-declared above). (satoru)
+        ff_dump_ff_waiters(as);
+    }
+}
+
 // ── deferred user-frame free (smp) ──────────────────────────────────────────
 // a frame unmapped from a shared address space may still be reachable through
 // another core's stale tlb entry until that core reloads cr3 (its next thread
@@ -834,45 +1150,68 @@ static uint64_t page_flags_from_prot(uint32_t prot) {
 // that with the smp flush epochs and gate release on it (the age check stays
 // as a cheap first filter). callers all run under the kls lock, so no extra
 // locking. single-core boots bypass entirely. (satoru)
-static uint64_t g_fq_phys[4096];
-static uint64_t g_fq_ms[4096];
-static uint64_t g_fq_seq[4096];
+static constexpr int FQ_SLOTS = 16384;   // 64MB of frames in flight (satoru)
+static constexpr int FQ_MASK  = FQ_SLOTS - 1;
+static uint64_t g_fq_phys[FQ_SLOTS];
+static uint64_t g_fq_ms[FQ_SLOTS];
+static uint64_t g_fq_seq[FQ_SLOTS];
 static int g_fq_head = 0, g_fq_tail = 0;
-static void user_frame_quarantine(uint64_t phys) {
+static uint32_t g_fq_leaked = 0;         // unproven ring-full entries leaked, never freed (satoru)
+static bool g_fq_leak_logged = false;
+static void user_frame_quarantine(uint64_t phys, bool can_broadcast = true) {
     if (!phys) return;
     phys &= ~(uint64_t)(PAGE_SIZE - 1);
     if (SMP::OnlineCount() <= 1) { PMM::FreeFrame(phys); return; }
     uint64_t now = Timer::GetRealMs64();
     // a frame is provably safe to reuse once a shootdown that STARTED after its
     // pte was cleared has been fully acked (epoch advanced past its enqueue
-    // stamp). primary release rule: aged past one tick AND epoch-safe. NOTE we
-    // must never call SMP::BroadcastTlbFlush() from here - this runs from cow/
-    // demand-zero FAULT context (IF=0), and spinning there for acks would keep
-    // this core from acking everyone else's shootdown = the [tlbto] cascade.
-    // shootdowns happen on their own in the mmap/munmap/mprotect syscalls. (satoru)
+    // stamp). primary release rule: aged past one tick AND epoch-safe. NOTE
+    // can_broadcast is false from cow/demand-zero FAULT context (IF=0) - a
+    // broadcast there would spin for acks while this core can't ack anyone
+    // else's shootdown = the [tlbto] cascade. syscall-context callers pass
+    // true and may buy proof on overflow. (satoru)
     uint64_t safe_seq = SMP::TlbFlushFullSeq();
     while (g_fq_tail != g_fq_head && now - g_fq_ms[g_fq_tail] >= 4 &&
            safe_seq > g_fq_seq[g_fq_tail]) {
         PMM::FreeFrame(g_fq_phys[g_fq_tail]);
-        g_fq_tail = (g_fq_tail + 1) & 4095;
+        g_fq_tail = (g_fq_tail + 1) & FQ_MASK;
     }
-    int next = (g_fq_head + 1) & 4095;
+    int next = (g_fq_head + 1) & FQ_MASK;
     if (next == g_fq_tail) {
-        // ring full and the epoch still hasn't advanced past the oldest entry
-        // (a peer wedged with IF=0, no fully-acked flush yet). the alternative
-        // to reuse is unbounded growth; fall back to a conservative AGE bound:
-        // ~50ms is many timer ticks, by which every core has taken at least one
-        // preempt tick (each reloads cr3), so even a missed ipi is covered.
-        // still no broadcast/serial here. (satoru)
-        while (g_fq_tail != g_fq_head &&
-               (now - g_fq_ms[g_fq_tail] >= 50 || safe_seq > g_fq_seq[g_fq_tail])) {
+        // ring full mid-burst. the old fallbacks freed on a 50ms age heuristic
+        // or force-freed the oldest with NO proof - but a peer wedged IF=0 (or
+        // a host-descheduled vcpu) past the shootdown timeout can still write
+        // through its stale translation into a recycled frame: the random-
+        // victim heap spray (duration-shaped values landing in a live crossbeam
+        // channel, torn rbp spills on user stacks). release on epoch PROOF
+        // only. (satoru)
+        while (g_fq_tail != g_fq_head && safe_seq > g_fq_seq[g_fq_tail]) {
             PMM::FreeFrame(g_fq_phys[g_fq_tail]);
-            g_fq_tail = (g_fq_tail + 1) & 4095;
+            g_fq_tail = (g_fq_tail + 1) & FQ_MASK;
         }
-        if (next == g_fq_tail) {   // still full: force the single oldest (satoru)
-            PMM::FreeFrame(g_fq_phys[g_fq_tail]);
-            g_fq_tail = (g_fq_tail + 1) & 4095;
+        if (next == g_fq_tail && can_broadcast) {
+            // syscall context: buy proof now - one fully-acked broadcast makes
+            // every queued entry epoch-safe. (satoru)
+            SMP::BroadcastTlbFlush();
+            uint64_t s2 = SMP::TlbFlushFullSeq();
+            while (g_fq_tail != g_fq_head && s2 > g_fq_seq[g_fq_tail]) {
+                PMM::FreeFrame(g_fq_phys[g_fq_tail]);
+                g_fq_tail = (g_fq_tail + 1) & FQ_MASK;
+            }
         }
+        if (next == g_fq_tail) {
+            // no proof obtainable (fault context, or the broadcast timed out on
+            // a wedged peer): LEAK the oldest slot rather than free unproven -
+            // 4k lost beats one stray write into a recycled frame. (satoru)
+            g_fq_leaked++;
+            g_fq_tail = (g_fq_tail + 1) & FQ_MASK;
+        }
+    }
+    if (can_broadcast && g_fq_leaked && !g_fq_leak_logged) {
+        g_fq_leak_logged = true;
+        SerialLogger::Log("[tlbq] quarantine overflow: leaked frames=");
+        SerialLogger::LogDec((int)g_fq_leaked);
+        SerialLogger::Log(" (unproven, never freed)\r\n");
     }
     g_fq_phys[g_fq_head] = phys;
     g_fq_ms[g_fq_head]   = now;
@@ -883,18 +1222,77 @@ static void user_frame_quarantine(uint64_t phys) {
 static void unmap_user_range(Process* proc, uint64_t start, uint64_t end) {
     if (!proc || start >= end) return;
 
+    // stray-writer detector: does this unmap cover the LIVE saved rsp of a
+    // DIFFERENT thread sharing this address space? that thread's stack top is
+    // about to be freed + refaulted-to-zero under it = the STKCORRUPT
+    // pointer->0 stomp. log it (throttled) with both pids so the culprit
+    // syscall + victim are named. (satoru)
+    {
+        static uint32_t s_unmapwarn = 0;
+        if (s_unmapwarn < 12) {
+            Process* victim = Scheduler::FindStackOwnerInRange(proc->address_space, proc,
+                                                               start, end);
+            if (victim) {
+                s_unmapwarn++;
+                SerialLogger::Log("[UNMAPSTACK] unmapper pid=");
+                SerialLogger::LogDec((int)proc->pid);
+                SerialLogger::Log(" range=");
+                SerialLogger::LogHex64(start);
+                SerialLogger::Log("..");
+                SerialLogger::LogHex64(end);
+                SerialLogger::Log(" COVERS live rsp of pid=");
+                SerialLogger::LogDec((int)victim->pid);
+                SerialLogger::Log(" rsp=");
+                SerialLogger::LogHex64(victim->user_frame.rsp);
+                SerialLogger::Log(" vstate=");
+                SerialLogger::LogDec((int)victim->state);
+                SerialLogger::Log(" voncpu=");
+                SerialLogger::LogDec((int)victim->on_cpu);
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
+
     uint64_t page_start = align_down_u64(start, PAGE_SIZE);
     uint64_t page_end = align_up_u64(end, PAGE_SIZE);
     bool any = false;
     bool multi = SMP::OnlineCount() > 1;
+    uint32_t batched = 0;
+    // does this address space have another live thread whose in-use stack this
+    // range covers? if so, per-page skip the in-use stack pages (see below).
+    // the cheap pre-check avoids the per-page scheduler walk on the common case
+    // (no overlap). window: the freed range can be at most this big, so a live
+    // rsp anywhere in it makes [rsp, rsp+range] the in-use span to protect. (satoru)
+    bool guard_stack = (page_end - page_start) <= (16ULL << 20) &&
+        Scheduler::FindStackOwnerInRange(proc->address_space, proc, page_start, page_end) != nullptr;
     for (uint64_t page = page_start; page < page_end; page += PAGE_SIZE) {
         uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, page);
         if (!phys) continue;
+        // NEVER free a page that is IN-USE stack of a live (running/ready/
+        // blocked or on_cpu) thread of this address space: firefox's main
+        // thread munmaps a joined/pooled worker's stack region while the worker
+        // is still RUNNING on it (proven: [UNMAPSTACK] vstate=1 voncpu=1), which
+        // freed + refaulted-to-zero the worker's live frames -> its return
+        // address / saved regs became 0 -> the null-deref / wild-jump crash
+        // (the residual corruptor). leave those pages mapped (leak is safe; the
+        // thread keeps its stack). pages BELOW the live rsp are unused and freed
+        // normally. (satoru)
+        if (guard_stack &&
+            Scheduler::PageIsLiveStack(proc->address_space, proc, page, page_end - page_start)) {
+            continue;
+        }
         // with other cores online, unmap WITHOUT freeing and quarantine the
         // frame instead - a sibling's stale tlb entry must never alias a frame
         // the allocator has already reused. (satoru)
         KernelVMM::UnmapPageInAddressSpace(proc->address_space, page, !multi);
-        if (multi) user_frame_quarantine(phys);
+        if (multi) {
+            user_frame_quarantine(phys);
+            // linux mmu_gather discipline: a huge unmap (jemalloc purge burst,
+            // exit teardown) must not flood the quarantine ring in one syscall
+            // - flush every 2048 frames so queued entries gain epoch proof
+            // while the burst is still running. (satoru)
+            if (++batched >= 2048) { SMP::BroadcastTlbFlush(); batched = 0; }
+        }
         any = true;
         if (Scheduler::GetCurrentProcess() == proc) {
             KernelVMM::InvalidatePage(page);
@@ -1096,7 +1494,7 @@ static bool handle_demand_zero_fault(Process* task, UserMemoryRegion* region,
     if (KernelVMM::QueryMappingInAddressSpace(task->address_space, page_base)) {
         KernelVMM::InvalidatePage(page_base);
         if (frame->error_code & PFERR_USER) {
-            Scheduler::SaveUserFrame(task, frame);
+            Scheduler::SaveUserFrame(task, frame, 5);   // site 5 = page-fault resolve (satoru)
         }
         return true;
     }
@@ -1156,7 +1554,7 @@ static bool handle_demand_zero_fault(Process* task, UserMemoryRegion* region,
     // the task's saved user frame. the kernel just re-executes the faulting
     // instruction once we've mapped the page. (satoru)
     if (frame->error_code & PFERR_USER) {
-        Scheduler::SaveUserFrame(task, frame);
+        Scheduler::SaveUserFrame(task, frame, 5);   // site 5 = page-fault resolve (satoru)
     }
     return true;
 }
@@ -1179,7 +1577,8 @@ static bool handle_cow_fault(Process* task, uint64_t page_base,
             PMM::FreeFrame(new_frame);
             return false;
         }
-        user_frame_quarantine(phys);   // stale-tlb-safe deferred free (smp) (satoru)
+        // fault context (IF=0): the quarantine must not broadcast here. (satoru)
+        user_frame_quarantine(phys, false);
     } else {
         if (!KernelVMM::MapPageInAddressSpace(task->address_space, page_base, phys, new_flags)) {
             return false;
@@ -1197,7 +1596,7 @@ static bool handle_cow_fault(Process* task, uint64_t page_base,
     // iretq's into ring-0 garbage -> the firefox ppoll-switch #UD (RIP=3 CS=8).
     // mirror handle_demand_zero_fault's gate. (satoru)
     if (frame->error_code & PFERR_USER) {
-        Scheduler::SaveUserFrame(task, frame);
+        Scheduler::SaveUserFrame(task, frame, 5);   // site 5 = page-fault resolve (satoru)
     }
     return true;
 }
@@ -1349,10 +1748,68 @@ static bool switch_to_ready_user(InterruptFrame* frame) {
 // lets clone+futex threads actually time-share the cpu. (satoru)
 static uint32_t g_preempt_ticks = 0;
 static void kls_timer_preempt(InterruptFrame* frame) {
-    if (!frame || (frame->cs & 3) != 3) return;      // ring-3 user only
+    if (!frame) return;
+    // BSP-WEDGE WATCHDOG (runs BEFORE the ring-3 gate below, so it catches a
+    // RING-0 wedge). a firefox thread that takes the kls in a syscall on the bsp
+    // and wedges (spins or blocks without kls_relax) starves the cooperative
+    // GUIProcess -> the whole guest hangs silent (the mstate-diagnosed ~73s
+    // early-stall, ftxgraph showed NO relay). the irq0 timer still fires (IF=1
+    // in the syscall body), so if the bsp has held the kls in ring-0 for >2.5s,
+    // dump the wedged kernel rip + the thread once to NAME the stuck syscall.
+    // (satoru)
+    if ((frame->cs & 3) == 0) {
+        uint32_t c = SMP::CpuIndex();
+        if (c == 0 && __atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) == 1u) {
+            uint64_t hs = g_kls_hold_start_ms[0];
+            static bool s_bspwedge_logged = false;
+            if (hs && !s_bspwedge_logged &&
+                Timer::GetRealMs64() - hs > 2500) {
+                s_bspwedge_logged = true;
+                Process* wp = Scheduler::GetCurrentProcess();
+                SerialLogger::Log("[bspwedge] kls held in ring-0 >2.5s rip=");
+                SerialLogger::LogHex64(frame->rip);
+                SerialLogger::Log(" pid=");
+                SerialLogger::LogDec(wp ? (int)wp->pid : -1);
+                SerialLogger::Log(" ");
+                if (wp) SerialLogger::Log(wp->name);
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
+    if ((frame->cs & 3) != 3) return;      // ring-3 user only
     if (!Userspace::IsActive()) return;
     Process* cur = Scheduler::GetCurrentProcess();
     if (!cur || !cur->is_user()) return;
+
+    // BSP-STARVE DETECTOR: ring-3 keeps ticking here but the cooperative
+    // Schedule() loop hasn't run for >3s = a user thread monopolizing the bsp
+    // without ever blocking (pure ring-3 spin or a nonblocking-syscall loop).
+    // kernel procs (desktop, wayland, reaper) sit Ready forever and the guest
+    // looks dead - the dominant early-stall shape. name the spin rip (cap 3,
+    // 1 per starve episode) so it can be symbolized against libxul. (satoru)
+    if (SMP::CpuIndex() == 0) {
+        static int s_starve_logs = 0;
+        static uint64_t s_starve_last_log = 0;
+        uint64_t ls = Scheduler::LastScheduleMs();
+        uint64_t nowms = Timer::GetRealMs64();
+        if (ls && s_starve_logs < 3 && nowms - ls > 3000 &&
+            nowms - s_starve_last_log > 5000) {
+            s_starve_logs++;
+            s_starve_last_log = nowms;
+            SerialLogger::Log("[bspstarve] ring-3 monopolist pid=");
+            SerialLogger::LogDec(cur ? (int)cur->pid : -1);
+            SerialLogger::Log(" rip=");
+            SerialLogger::LogHex64(frame->rip);
+            SerialLogger::Log(" rsp=");
+            SerialLogger::LogHex64(frame->rsp);
+            SerialLogger::Log(" sched_idle_ms=");
+            SerialLogger::LogDec((int)(nowms - ls));
+            SerialLogger::Log("\r\n");
+        }
+        // phase-0 boot-speed measurement: emit the [ffcount] sample at ~1hz
+        // while firefox is alive. self-throttled, inert until firefox launches. (satoru)
+        ff_meas_sample();
+    }
 
     // ~1 ms timeslice (every tick): firefox's startup has MANY tight ring-3
     // spin-then-park thread-handshakes that each race; maximum preemption interleaves
@@ -1361,7 +1818,7 @@ static void kls_timer_preempt(InterruptFrame* frame) {
     // cheap vs the alternative (a wedged browser). (satoru)
     ++g_preempt_ticks;
 
-    Scheduler::SaveUserFrame(cur, frame);            // capture live regs+fs+fpu
+    Scheduler::SaveUserFrame(cur, frame, 3);         // capture live regs+fs+fpu; site 3 = bsp preempt (satoru)
     // re-ready any futex waiter whose (repoll/timeout) deadline has passed BEFORE we
     // pick the next task. without this, a thread spinning in pure ring-3 (a parking_lot
     // /rayon spin or spinlock that never enters the kernel) never triggers a sweep, so
@@ -1437,7 +1894,7 @@ constexpr int FUTEX_MAX_WAITERS = 256;  // 64->256: firefox's many threads can h
 // re-test overhead (a cheap *uaddr read + re-enqueue) is dwarfed by the win. a
 // wake that ISN'T lost still wakes immediately - this only bounds the worst
 // case. (satoru)
-constexpr uint64_t FUTEX_REPOLL_MS = 8;
+constexpr uint64_t FUTEX_REPOLL_MS = 8;   // kernel re-check cadence; the sweep now re-parks SILENTLY when *uaddr is unchanged, so this no longer fires spurious userspace wakes. 8ms self-heals a lost wake fast (a 40ms trial regressed bringup: slower lost-wake heal stalled/crashed more boots) (satoru)
 
 // ── posix byte-range file locks (fcntl F_GETLK / F_SETLK / F_SETLKW) ─────────
 // REAL advisory locks keyed by (file path hash, [start,end), owner). the old
@@ -1496,8 +1953,41 @@ struct FutexWaiter {
                             // re-poll deadline: on sweep it's released with a SPURIOUS
                             // wake (rax=0), not -ETIMEDOUT, so the caller re-tests
                             // *uaddr and re-waits (lost-wake self-heal). (satoru)
+    uint64_t  uphys;        // raw physical address of *uaddr, resolved at enqueue, so
+                            // the repoll sweep can re-check the value WITHOUT waking
+                            // userspace (a silent re-park when unchanged). (satoru)
+    uint32_t  expected_val; // the value the waiter is parked on; if *uaddr still equals
+                            // this on the repoll deadline, NO real wake was lost, so we
+                            // re-park silently instead of firing a spurious userspace
+                            // wake. the spurious wakes (every FUTEX_REPOLL_MS) were what
+                            // drove rust/crossbeam's lock-free recv into a use-after-
+                            // free race (the SW-WebRender crossbeam Receiver crash that
+                            // blocked window paint). (satoru)
+    uint64_t  fallback_ms;  // safety net: a lost FUTEX_WAKE that did NOT change *uaddr
+                            // is invisible to the silent re-poll above, so a waiter
+                            // parked this long with no value change gets ONE spurious
+                            // wake anyway to re-test in ring-3. ~250ms is far too
+                            // infrequent to re-trigger the crossbeam race (which needed
+                            // the old ~8ms cadence) but bounds any residual lost-wake
+                            // stall. reset on each fallback fire. (satoru)
+    uint64_t  park_ms;      // when the waiter parked - feeds the wedge telemetry: a
+                            // repoll waiter silently re-parked for >30s is the startup
+                            // stall signature, and the one-shot [ftxwedge] dump names
+                            // the exact futex it is stuck on. (satoru)
+    bool      wedged;       // [ftxwedge] already emitted for this park (satoru)
 };
+constexpr uint64_t FUTEX_FALLBACK_MS = 500;   // (satoru) safety-net spurious wake for NON-parker value-unchanged waiters only (parkers are spared - see the sweep); 500ms heals a lost notify fast without touching crossbeam
 FutexWaiter g_futex_waiters[FUTEX_MAX_WAITERS];  // (satoru) non-static: gdb-visible for wait-graph dump
+
+// futex telemetry - this failure surface was completely invisible before: a
+// full queue silently returned spurious 0 (a hot ring-3 spin = the crossbeam
+// uaf cadence), dead tasks' slots re-parked forever, and a wedged waiter had no
+// serial signature at all. counters only; the sweep emits the one-shot lines
+// OUTSIDE the queue lock. (satoru)
+static uint32_t g_ftx_hw = 0;            // high-water of concurrently active waiters (satoru)
+static uint32_t g_ftx_overflow = 0;      // enqueues refused: queue full (satoru)
+static uint32_t g_ftx_dead_retired = 0;  // slots retired: task died while parked (satoru)
+static uint32_t g_ftx_wedge_lines = 0;   // [ftxwedge] dumps emitted (capped) (satoru)
 
 // atomically transition a task Blocked -> Ready. this is the SINGLE-OWNER-STATE
 // fix (the "light CAS" the notes prescribe): the wake path and the scheduler
@@ -1517,6 +2007,45 @@ static inline bool wake_blocked_to_ready(Process* t) {
     return __atomic_compare_exchange_n((int*)&t->state, &expect,
                                        (int)Process_Ready, false,
                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
+// CLAIM a blocked waiter for wakeup WITHOUT yet making it pickable: CAS
+// Blocked -> Running (a transient state the picker skips, since it only picks
+// Process_Ready). the caller then writes the futex return value into the saved
+// frame and only THEN release-stores Ready (wake_publish_ready). this closes a
+// race the global kls_lock had been MASKING: futex_do_wake used to CAS straight
+// to Ready and write user_frame.rax=0 AFTER, so a picker on another core could
+// observe Ready and resume (LoadUserFrame) BEFORE the rax write landed -> the
+// woken thread returned from futex() with a STALE return value -> musl looped =
+// the pre-KX2 firefox hang once futex ran off the serialized kls path. writing
+// rax before publishing Ready makes the return value visible to any core that
+// acquire-observes Ready. only safe once the CAS proves the task was Blocked
+// (frame saved, not on a cpu), so we cannot write rax before claiming. (satoru)
+static inline bool wake_blocked_claim(Process* t) {
+    if (!t) return false;
+    int expect = (int)Process_Blocked;
+    return __atomic_compare_exchange_n((int*)&t->state, &expect,
+                                       (int)Process_Running, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+static inline void wake_publish_ready(Process* t) {
+    if (t) __atomic_store_n((int*)&t->state, (int)Process_Ready, __ATOMIC_RELEASE);
+}
+
+// task 17b diagnostic: list this address space's active futex waiters (pid,
+// uaddr, expected). racy unlocked read - values only feed a serial line. (satoru)
+static void ff_dump_ff_waiters(uint64_t as) {
+    SerialLogger::Log("[ffwait]");
+    for (int i = 0, wn = 0; i < FUTEX_MAX_WAITERS && wn < 10; i++) {
+        FutexWaiter* w = &g_futex_waiters[i];
+        if (!w->active || !w->task) continue;
+        if (w->addr_space != as) continue;
+        wn++;
+        SerialLogger::Log(" ");  SerialLogger::LogDec((int)w->task->pid);
+        SerialLogger::Log("@");  SerialLogger::LogHex64((uint64_t)w->uaddr);
+        SerialLogger::Log("e");  SerialLogger::LogHex(w->expected_val);
+    }
+    SerialLogger::Log("\r\n");
 }
 
 // translate a user futex VA to a stable cross-process key: the physical
@@ -1570,19 +2099,34 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
     // anyway, starving a genuinely blocked sibling; a lost render-thread wakeup =
     // the blank content frame). read_user_u32 is a page-table-walk read (never
     // faults), so it is safe to hold the spinlock across it. (satoru)
-    if (!uphys) return false;   // uaddr not mapped -> spurious, re-test in ring-3 (satoru)
+    if (!uphys) {
+        g_ftx_spur_nouphys++;                      // task 17b (satoru)
+        g_ftx_spin_pid = task->pid; g_ftx_spin_uaddr = (uint64_t)uaddr;
+        return false;   // uaddr not mapped -> spurious, re-test in ring-3 (satoru)
+    }
     {
         SpinLockGuard fg(g_futex_lock);
         // single load via the pre-resolved phys - NO page-table walk under the
         // lock (see the resolve above). (satoru)
         uint32_t curval = *(const volatile uint32_t*)(uintptr_t)uphys;
         if (curval != expected_val) {
+            g_ftx_spur_valchg++;                   // task 17b (satoru)
             return false;   // *uaddr changed (a wake raced in) (satoru)
         }
+        int act = 0;
         for (int i = 0; i < FUTEX_MAX_WAITERS; i++) {
-            if (!g_futex_waiters[i].active) { slot = i; break; }
+            if (!g_futex_waiters[i].active) { if (slot < 0) slot = i; }
+            else act++;
         }
-        if (slot < 0) return false;  // queue full - caller returns -EAGAIN (satoru)
+        if (slot < 0) {
+            // queue full - the caller gets a spurious 0 and hot-spins re-testing
+            // in ring-3 (the crossbeam-race cadence). count it; the sweep logs a
+            // one-shot [ftxfull] outside this lock. (satoru)
+            g_ftx_overflow++;
+            g_ftx_spur_qfull++;                    // task 17b (satoru)
+            return false;
+        }
+        if ((uint32_t)(act + 1) > g_ftx_hw) g_ftx_hw = (uint32_t)(act + 1);
         g_futex_waiters[slot].task       = task;
         g_futex_waiters[slot].addr_space = task->address_space;
         g_futex_waiters[slot].uaddr      = uaddr;
@@ -1590,6 +2134,11 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         g_futex_waiters[slot].bitset     = bitset ? bitset : 0xFFFFFFFFu;
         g_futex_waiters[slot].deadline_ms= deadline_ms;
         g_futex_waiters[slot].repoll     = repoll;
+        g_futex_waiters[slot].uphys      = uphys;          // for the silent re-poll (satoru)
+        g_futex_waiters[slot].expected_val = expected_val; // re-check value (satoru)
+        g_futex_waiters[slot].fallback_ms = (repoll ? Timer::GetRealMs64() + FUTEX_FALLBACK_MS : 0);
+        g_futex_waiters[slot].park_ms    = Timer::GetRealMs64();  // wedge telemetry (satoru)
+        g_futex_waiters[slot].wedged     = false;
         g_futex_waiters[slot].active     = true;
         // commit the blocked state WHILE STILL HOLDING THE LOCK, so the instant a
         // waker can see us in the queue we are already Blocked (never Running).
@@ -1601,7 +2150,63 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         task->user_frame.rax = 0;
     }
 
+    // parked-stack canary (stray-writer hunt): snapshot the parker's stack
+    // right above its saved rsp; LoadUserFrame verifies it on resume. PARKERS
+    // ONLY - a musl condvar waiter's on-stack node is legitimately written by
+    // siblings (the relay), which would false-positive. (satoru)
+    if (expected_val == 0xFFFFFFFFu) Scheduler::CaptureStackCanary(task);
+
     if (!switch_to_ready_user(current_syscall_frame)) {
+        // TASK 17 (the fspur livelock): with futex kls-exempt, all cores run
+        // WAITs concurrently; each core hosts one running thread, so no core
+        // ever finds another Ready thread to switch to and NOBODY can block -
+        // every WAIT spuriously returns (fspur 99.4%) and the threads livelock
+        // re-testing in ring-3 at ~10k syscalls/s. mirror linux: a waiter with
+        // no successor must still truly block - the cpu goes IDLE and the wake
+        // makes the task pickable again. on an AP running a sibling THREAD,
+        // park: stamp the release exactly like ScheduleNextUser's switch-away
+        // (last_run_cpu + released_ms under the state lock, then RELEASE-store
+        // on_cpu=0 - the frame-handoff barrier; user_frame was fully saved at
+        // syscall entry and rax preset under g_futex_lock), then iret into the
+        // ap dispatch loop (same mechanism as thread-exit). the dispatch loop
+        // re-picks this task the moment a wake readies it (same-cpu pick has no
+        // grace). the BSP keeps the spurious fallback: it anchors the whole
+        // userspace session and must never idle away its last thread; leaders
+        // (!is_thread) also keep it since ClaimReadyThreadForCpu never claims
+        // a leader. (satoru)
+        if (SMP::CpuIndex() != 0 && task->is_thread()) {
+            // commit the park ONLY if we are still the enqueued, still-Blocked
+            // waiter. the sweep (which ran inside switch_to_ready_user!) or a
+            // cross-cpu wake may have ALREADY released this task (slot retired,
+            // state Ready - or resurrected to Running by ScheduleNextUser's
+            // keep-running branch). parking then would idle the cpu with the
+            // task stranded off every queue forever. same ownership discipline
+            // as the undo below; g_futex_lock -> StateLock nesting matches the
+            // enqueue path. (satoru)
+            bool park_ok = false;
+            {
+                SpinLockGuard fg(g_futex_lock);
+                if (g_futex_waiters[slot].active && g_futex_waiters[slot].task == task) {
+                    uint64_t sf; Scheduler::StateLock(&sf);
+                    if (__atomic_load_n((int*)&task->state, __ATOMIC_RELAXED) ==
+                        (int)Process_Blocked) {
+                        task->last_run_cpu = (uint8_t)SMP::CpuIndex();
+                        task->released_ms  = Scheduler::NowMs();
+                        park_ok = true;
+                    }
+                    Scheduler::StateUnlock(sf);
+                }
+            }
+            if (park_ok) {
+                __atomic_store_n(&task->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                SMP::ApIdleFrame(current_syscall_frame);
+                current_frame_rewritten = true;
+                g_ftx_wait_parked++;   // forensics: idle-park vs switch-block (satoru)
+                return true;   // genuinely blocked; this cpu idles until a wake (satoru)
+            }
+            // raced: a wake/sweep already released us. fall through to the undo,
+            // which self-resumes and returns the spurious wake. (satoru)
+        }
         // nothing else runnable - undo the block so we don't wedge the only
         // user task off the run queue with no one left to wake it. (satoru)
         {
@@ -1623,6 +2228,11 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
             task->sleep_ticks = 0;
             Scheduler::StateUnlock(sf);
         }
+        // self-resume without a LoadUserFrame: drop the canary - the thread
+        // runs on and its stack legitimately changes. (satoru)
+        task->stk_canary_valid = 0;
+        g_ftx_spur_noswitch++;                     // task 17b (satoru)
+        g_ftx_spin_pid = task->pid; g_ftx_spin_uaddr = (uint64_t)uaddr;
         return false;
     }
     return true;
@@ -1655,9 +2265,19 @@ static int futex_do_wake(uint64_t addr_space, uintptr_t uaddr, uint64_t phys_key
             // blocked waiter and move on. only a successful transition consumes
             // the wake + retires the slot. this is the lost-wake fix that was
             // the herd/bringup stall. (satoru)
-            if (wake_blocked_to_ready(w->task)) {
+            // claim + set return value + publish, ALL under the scheduler state
+            // lock: ScheduleNextUser holds g_sched_lock for its whole body, so
+            // the transient claim state is never observable to its cur->state
+            // reads (the keep-running/re-ready branches), and any core that
+            // later acquire-observes Ready is guaranteed to see rax=0 already
+            // written (no stale-return-value resume race). lock order
+            // g_futex_lock -> g_sched_lock matches the enqueue path. (satoru)
+            uint64_t sf; Scheduler::StateLock(&sf);
+            if (wake_blocked_claim(w->task)) {
                 w->task->user_frame.rax = 0;   // futex() returns 0 to the waiter
                 w->task->sleep_ticks = 0;      // cancel any stale deferred tick (satoru)
+                wake_publish_ready(w->task);   // publish AFTER rax is written (satoru)
+                Scheduler::StateUnlock(sf);
                 w->active = false;
                 w->task   = nullptr;
                 woken++;
@@ -1666,6 +2286,7 @@ static int futex_do_wake(uint64_t addr_space, uintptr_t uaddr, uint64_t phys_key
             // (a raced wake already took it), so retire the slot without
             // counting - it is effectively already awake. (satoru)
             else {
+                Scheduler::StateUnlock(sf);
                 w->active = false;
                 w->task   = nullptr;
             }
@@ -1686,15 +2307,116 @@ static int futex_do_wake(uint64_t addr_space, uintptr_t uaddr, uint64_t phys_key
 // half-updated queue. (satoru)
 static void futex_sweep_timeouts() {
     uint64_t now = Timer::GetRealMs64();
+    // telemetry gathered under the lock, emitted after it (a serial line is an
+    // ~8.7ms uart busy-wait - never inside a spinlock other cores contend). (satoru)
+    struct { uint32_t pid; uint64_t uaddr; uint32_t exp, cur; } wedges[2];
+    int n_wedges = 0;
+    uint32_t log_full = 0, log_hw = 0;
+    // one-shot whole-queue snapshot, taken when the FIRST wedge of the boot
+    // fires: the single wedged waiter alone cannot distinguish "idle worker
+    // parked with no work" from "the startup-stall culprit" - the full park
+    // picture (who else is parked, for how long, on what) can. (satoru)
+    struct { uint32_t pid; char name[14]; uint64_t uaddr; uint32_t exp, cur; uint32_t age_s; uint32_t mstate; } graph[24];
+    int n_graph = -1;   // -1 = not taking a snapshot this sweep (satoru)
+    {
     SpinLockGuard fg(g_futex_lock);   // atomic vs cross-cpu enqueue + wake (satoru)
     for (int i = 0; i < FUTEX_MAX_WAITERS; i++) {
         FutexWaiter* w = &g_futex_waiters[i];
-        if (!w->active || w->deadline_ms == 0) continue;   // inactive / infinite (satoru)
-        if (now < w->deadline_ms) continue;                // not due yet (satoru)
+        if (!w->active) continue;
+        // retire the slot of a task that died while parked (group-kill from the
+        // fault containment / task manager / sig-9). before this, a dead parker
+        // silently re-parked every 8ms FOREVER and a few contained-crash cycles
+        // stranded enough of the 256 slots to push live threads into the
+        // queue-full spurious-spin regime. the structs are deliberately leaked
+        // by the group kill, so the state read is safe. (satoru)
         if (w->task) {
-            // repoll (originally-infinite) waiters wake SPURIOUSLY (0) so the caller
-            // re-tests *uaddr + re-waits; real timed waits get -ETIMEDOUT so poll /
-            // pthread_cond_timedwait see their timeout. (satoru)
+            // retire on a REAL terminated task AND on a recycled struct whose
+            // state reads garbage (waitpid heap-frees non-group singles; a
+            // stale slot then points at reused memory - walking its stored
+            // addr_space fed the hardened vmm walk garbage roots). (satoru)
+            unsigned st = (unsigned)w->task->state;
+            if (st >= (unsigned)Process_Terminated) {
+                w->active = false;
+                w->task   = nullptr;
+                g_ftx_dead_retired++;
+                continue;
+            }
+        }
+        if (w->deadline_ms == 0) continue;                 // infinite (satoru)
+        if (now < w->deadline_ms) continue;                // not due yet (satoru)
+        // SILENT RE-POLL: for an originally-infinite wait (repoll), re-check *uaddr in
+        // the kernel. if it STILL equals the parked value, NO wake was lost, so we
+        // must NOT wake userspace - just extend the deadline and keep the waiter
+        // parked. the old code fired a SPURIOUS wake (rax=0) here every FUTEX_REPOLL_MS
+        // whether or not anything changed; those millions of spurious wakes drove
+        // rust/crossbeam's lock-free channel recv into a use-after-free (the
+        // SW-WebRender Receiver crash that blocked the window paint). only wake when
+        // the value ACTUALLY changed (a genuinely lost FUTEX_WAKE to self-heal) or for
+        // a real timed wait (-ETIMEDOUT). low ram is identity-mapped so *uphys is a
+        // direct read. (satoru)
+        if (w->repoll) {
+            // re-resolve the word's physical backing EVERY sweep: madvise
+            // (MADV_DONTNEED) really frees + refaults anon pages, so the phys
+            // captured at enqueue can dangle at a freed, RECYCLED frame. reading
+            // recycled memory either resurrected the 8ms spurious-wake storm
+            // (the crossbeam-uaf cadence) when it churned, or froze the lost-
+            // wake self-heal dead when it happened to still equal the parked
+            // value (the permanent silent stall). a fresh walk is ~4 cached
+            // loads per due waiter. the phys_key refresh keeps cross-process
+            // (e10s MAP_SHARED) wake matching current too. (satoru)
+            uint64_t fresh = KernelVMM::QueryMappingInAddressSpace(w->addr_space, w->uaddr);
+            if (!fresh) {
+                // word page currently unmapped (madvised away, not refaulted):
+                // nothing trustworthy to compare - re-park silently; the waker's
+                // own write will fault the page back in and the next sweep sees
+                // it. (satoru)
+                w->deadline_ms = now + FUTEX_REPOLL_MS;
+                continue;
+            }
+            w->uphys    = fresh;
+            w->phys_key = fresh;
+            uint32_t cur = *(const volatile uint32_t*)(uintptr_t)w->uphys;
+            if (cur == w->expected_val) {
+                // wedge telemetry: a repoll waiter silently re-parked for >30s is
+                // the startup-stall signature. collect a one-shot dump (emitted
+                // outside the lock) naming the exact futex it is stuck on. (satoru)
+                if (!w->wedged && w->park_ms && now - w->park_ms > 30000 &&
+                    g_ftx_wedge_lines < 6 && n_wedges < 2) {
+                    w->wedged = true;
+                    g_ftx_wedge_lines++;
+                    wedges[n_wedges].pid   = w->task ? w->task->pid : 0;
+                    wedges[n_wedges].uaddr = (uint64_t)w->uaddr;
+                    wedges[n_wedges].exp   = w->expected_val;
+                    wedges[n_wedges].cur   = cur;
+                    n_wedges++;
+                    // arm the whole-queue + all-task snapshot on EACH wedge (one
+                    // per sweep, capped at 6 total by g_ftx_wedge_lines). the
+                    // first wedge lands ~t=42s (too early for a stall that only
+                    // manifests as never-paint-by-390s), but later wedges cross
+                    // 30s at t=200s/300s+, so the series brackets the whole boot
+                    // and catches the LATE post-nativeshow render wedge. (satoru)
+                    if (n_graph < 0) n_graph = 0;
+                }
+                // value unchanged: no visible wake, so re-park silently. a rust/std
+                // thread PARKER (expected_val == PARKED == 0xFFFFFFFF) changes its word
+                // to NOTIFIED on a real wake, so a lost parker wake IS caught by the
+                // value-change check above (within FUTEX_REPOLL_MS) and NEVER needs a
+                // spurious wake - and firing one there is exactly what raced crossbeam's
+                // recv into the UAF crash. so we NEVER fallback-wake a parker; only
+                // other value-unchanged waiters get the rare safety-net spurious wake
+                // (for a genuinely lost notify that didn't touch the word). (satoru)
+                bool is_parker = (w->expected_val == 0xFFFFFFFFu);
+                if (is_parker || w->fallback_ms == 0 || now < w->fallback_ms) {
+                    w->deadline_ms = now + FUTEX_REPOLL_MS;   // re-park silently (satoru)
+                    continue;
+                }
+                w->fallback_ms = now + FUTEX_FALLBACK_MS;     // armed again for next window (satoru)
+                // fall through to the spurious wake below (satoru)
+            }
+        }
+        if (w->task) {
+            // repoll waiter whose value CHANGED -> a lost wake: release spuriously (0)
+            // so the caller re-tests + proceeds. a real timed wait -> -ETIMEDOUT. (satoru)
             w->task->user_frame.rax = w->repoll ? 0 : (uint64_t)(int64_t)(-110);
             // atomic Blocked->Ready (see wake_blocked_to_ready): immediate, and
             // it no-ops harmlessly if the task is already runnable. (satoru)
@@ -1703,8 +2425,96 @@ static void futex_sweep_timeouts() {
         w->active = false;
         w->task   = nullptr;
     }
+    // the armed whole-queue snapshot: every active waiter's identity + a fresh
+    // value read, so the stall picture is complete in one dump. (satoru)
+    if (n_graph == 0) {
+        for (int i = 0; i < FUTEX_MAX_WAITERS && n_graph < 24; i++) {
+            FutexWaiter* w = &g_futex_waiters[i];
+            if (!w->active || !w->task) continue;
+            graph[n_graph].pid = w->task->pid;
+            int k = 0;
+            const char* nm = w->task->name;
+            while (nm && nm[k] && k < 13) { graph[n_graph].name[k] = nm[k]; k++; }
+            graph[n_graph].name[k] = 0;
+            graph[n_graph].uaddr = (uint64_t)w->uaddr;
+            graph[n_graph].exp   = w->expected_val;
+            uint64_t ph = KernelVMM::QueryMappingInAddressSpace(w->addr_space, w->uaddr);
+            graph[n_graph].cur   = ph ? *(const volatile uint32_t*)(uintptr_t)ph : 0xDEADDEAD;
+            graph[n_graph].age_s = w->park_ms ? (uint32_t)((now - w->park_ms) / 1000) : 0;
+            // musl condvar node.state disambiguator: a waiter parked on a musl
+            // condvar barrier (a stack word, expected value 2) has its node.state
+            // 4 bytes BELOW the barrier (waiter layout {prev,next,state,barrier,
+            // notify}, state at barrier-4 on x86_64). state==SIGNALED means the
+            // broadcast RELAY is stalled - a predecessor is wedged in
+            // pthread_mutex_lock relock and is stranding this thread at exp=2
+            // with no futex traffic; state==WAITING means it was never signaled.
+            // this is the split (per the musl futex study) that names whether a
+            // fan of exp=2 wedges is one stuck mutex holder vs a never-issued
+            // notify. only read it for the exp==2 case (a barrier word). (satoru)
+            graph[n_graph].mstate = 0xFFFFFFFFu;   // sentinel = not read (satoru)
+            if (w->expected_val == 2 && w->uaddr >= 4) {
+                uint64_t sph = KernelVMM::QueryMappingInAddressSpace(w->addr_space, w->uaddr - 4);
+                if (sph) graph[n_graph].mstate = *(const volatile uint32_t*)(uintptr_t)sph;
+            }
+            n_graph++;
+        }
+    }
+    // snapshot the counters for the one-shot lines below (outside the lock). (satoru)
+    static bool s_full_logged = false;
+    static uint32_t s_hw_logged = 0;
+    if (g_ftx_overflow && !s_full_logged) { s_full_logged = true; log_full = g_ftx_overflow; }
+    if (g_ftx_hw >= 128 && g_ftx_hw >= s_hw_logged + 64) { s_hw_logged = g_ftx_hw; log_hw = g_ftx_hw; }
+    }  // g_futex_lock released (satoru)
+    if (log_full) {
+        SerialLogger::Log("[ftxfull] waiter queue overflowed n=");
+        SerialLogger::LogDec((int)log_full); SerialLogger::Log("\r\n");
+    }
+    if (log_hw) {
+        SerialLogger::Log("[ftxhw] "); SerialLogger::LogDec((int)log_hw);
+        SerialLogger::Log("\r\n");
+    }
+    for (int i = 0; i < n_wedges; i++) {
+        SerialLogger::Log("[ftxwedge] pid="); SerialLogger::LogDec((int)wedges[i].pid);
+        SerialLogger::Log(" uaddr="); SerialLogger::LogHex64(wedges[i].uaddr);
+        SerialLogger::Log(" exp="); SerialLogger::LogHex(wedges[i].exp);
+        SerialLogger::Log(" cur="); SerialLogger::LogHex(wedges[i].cur);
+        SerialLogger::Log("\r\n");
+    }
+    for (int i = 0; i < n_graph; i++) {
+        SerialLogger::Log("[ftxgraph] pid="); SerialLogger::LogDec((int)graph[i].pid);
+        SerialLogger::Log(" "); SerialLogger::Log(graph[i].name);
+        SerialLogger::Log(" uaddr="); SerialLogger::LogHex64(graph[i].uaddr);
+        SerialLogger::Log(" exp="); SerialLogger::LogHex(graph[i].exp);
+        SerialLogger::Log(" cur="); SerialLogger::LogHex(graph[i].cur);
+        SerialLogger::Log(" age="); SerialLogger::LogDec((int)graph[i].age_s);
+        if (graph[i].mstate != 0xFFFFFFFFu) {
+            SerialLogger::Log("s mstate="); SerialLogger::LogHex(graph[i].mstate);
+            SerialLogger::Log("\r\n");
+        } else {
+            SerialLogger::Log("s\r\n");
+        }
+    }
+    if (n_graph > 0) {
+        // one-shot ALL-user-task states beside the futex graph: the graph only
+        // shows futex waiters, but a stalled MAIN thread parks via the poll/
+        // epoll deschedule path instead and was invisible - both a stalled and
+        // a healthy boot produced IDENTICAL futex graphs. state names what the
+        // non-futex threads are doing (Blocked = poll-descheduled, Ready =
+        // starved, Running = spinning). snapshot takes the sched lock itself -
+        // we are OUTSIDE g_futex_lock here. (satoru)
+        static SchedulerProcessSnapshot s_snaps[96];
+        int ns = Scheduler::GetProcessSnapshot(s_snaps, 96);
+        for (int i = 0; i < ns; i++) {
+            if (s_snaps[i].is_kernel_proc) continue;
+            SerialLogger::Log("[ftxtasks] pid="); SerialLogger::LogDec((int)s_snaps[i].pid);
+            SerialLogger::Log(" "); SerialLogger::Log(s_snaps[i].name);
+            SerialLogger::Log(" st="); SerialLogger::LogDec((int)s_snaps[i].state);
+            SerialLogger::Log(" ms="); SerialLogger::LogDec((int)s_snaps[i].cpu_ms_total);
+            SerialLogger::Log("\r\n");
+        }
+    }
 }
-}
+}  // anonymous namespace (satoru)
 
 // ── vfork / posix_spawn support ──────────────────────────────────────────────
 // firefox launches its content process with posix_spawn = clone(CLONE_VM |
@@ -1794,6 +2604,277 @@ static void ls_itoa(int v, char* out, int base) {
     out[o] = 0;
 }
 
+// (satoru) TEMP [nss*] diag probes: substring test used by the nss/psm profile-db
+// instrumentation in sys_open / ftruncate / fcntl-locks / sys_mmap. the probes hunt
+// the exact failing syscall behind firefox's NSS init failure ("Personal Security
+// Manager" / crypto-SDR GetService failure). remove before commit.
+static bool probe_has(const char* s, const char* sub) {
+    if (!s || !sub || !sub[0]) return false;
+    for (int i = 0; s[i]; i++) {
+        int j = 0;
+        while (sub[j] && s[i + j] == sub[j]) j++;
+        if (!sub[j]) return true;
+    }
+    return false;
+}
+
+// ── real signal delivery (satoru) ────────────────────────────────────────────
+// honest, synchronous, syscall-boundary signal delivery for linux binaries.
+// there is NO async injection: a pending signal fires only when the target
+// thread crosses a syscall return boundary (DeliverPendingSignals below, called
+// from both entry paths). that is a real limitation vs linux (a thread spinning
+// in pure ring-3 never sees the signal until its next syscall) but it is honest
+// and it is enough for musl's raise()/kill()/sigprocmask() round trips, which is
+// what firefox's crash handler + glib child reaping actually use. handlers are
+// SHARED per thread-group (keyed by the region_owner leader, matching linux);
+// the pending + blocked masks are per-thread on the LinuxProcess. (satoru)
+
+// kernel-side struct sigaction (x86_64): sa_handler, sa_flags, sa_restorer,
+// sa_mask(8 bytes). SIG_DFL==0, SIG_IGN==1. (satoru)
+struct LinuxSigaction { uint64_t handler; uint64_t flags; uint64_t restorer; uint64_t mask; };
+
+// SA_ flags we honour. (satoru)
+static const uint64_t L_SA_SIGINFO   = 0x00000004ull;
+static const uint64_t L_SA_RESTORER  = 0x04000000ull;
+static const uint64_t L_SA_NODEFER   = 0x40000000ull;
+static const uint64_t L_SA_RESETHAND = 0x80000000ull;
+
+// per thread-group handler table, keyed by the leader Process*. lazily claimed on
+// the first rt_sigaction. threads of one group share ONE entry. (satoru)
+struct LinuxSigGroup {
+    bool          used;
+    Process*      leader;
+    LinuxSigaction act[64];
+};
+static const int SIG_GROUP_MAX = 64;   // firefox has ~10-20 groups; plenty (satoru)
+static LinuxSigGroup g_siggroups[SIG_GROUP_MAX];
+static Spinlock      g_sig_lock;
+
+static LinuxSigGroup* sig_group_for(Process* leader, bool create) {
+    if (!leader) return nullptr;
+    SpinLockGuard g(g_sig_lock);
+    for (int i = 0; i < SIG_GROUP_MAX; i++)
+        if (g_siggroups[i].used && g_siggroups[i].leader == leader) return &g_siggroups[i];
+    if (!create) return nullptr;
+    for (int i = 0; i < SIG_GROUP_MAX; i++)
+        if (!g_siggroups[i].used) {
+            g_siggroups[i].used = true;
+            g_siggroups[i].leader = leader;
+            for (int s = 0; s < 64; s++) {
+                g_siggroups[i].act[s].handler = 0; g_siggroups[i].act[s].flags = 0;
+                g_siggroups[i].act[s].restorer = 0; g_siggroups[i].act[s].mask = 0;
+            }
+            return &g_siggroups[i];
+        }
+    return nullptr;
+}
+
+// release a group's handler table when its leader is destroyed, so a recycled
+// Process* can't inherit stale handlers. (satoru)
+static void sig_group_release(Process* leader) {
+    if (!leader) return;
+    SpinLockGuard g(g_sig_lock);
+    for (int i = 0; i < SIG_GROUP_MAX; i++)
+        if (g_siggroups[i].used && g_siggroups[i].leader == leader) {
+            g_siggroups[i].used = false; g_siggroups[i].leader = nullptr;
+        }
+}
+
+// post a pending signal bit onto a target thread (LinuxProcess). signals 1..63.
+// (satoru)
+static void sig_post(LinuxProcess* target, int sig) {
+    if (!target || sig <= 0 || sig >= 64) return;
+    __atomic_or_fetch(&target->sig_pending, (1ull << sig), __ATOMIC_SEQ_CST);
+}
+
+// signals whose DEFAULT action is "ignore" (no handler => nothing happens).
+// SIGCHLD(17) SIGCONT(18) SIGURG(23) SIGWINCH(28). everything else fatal by
+// default. (satoru)
+static bool sig_default_ignore(int sig) {
+    return sig == 17 || sig == 18 || sig == 23 || sig == 28;
+}
+
+// ensure the user page covering `va` is present in `task`'s address space,
+// allocating a zeroed, user+writable page if absent (the signal frame lands just
+// below the user rsp, in demand-zero stack territory that may not be faulted in
+// yet). (satoru)
+static bool sig_ensure_page(Process* task, uint64_t va) {
+    uint64_t pg = va & ~0xFFFULL;
+    if (KernelVMM::QueryMappingInAddressSpace(task->address_space, pg)) return true;
+    void* frame = PMM::AllocBytes(PAGE_SIZE);
+    if (!frame) return false;
+    memset(frame, 0, PAGE_SIZE);
+    uint64_t flags = PTE_USER | PTE_WRITABLE | PTE_NX;
+    if (!KernelVMM::MapPageInAddressSpace(task->address_space, pg,
+                                          (uint64_t)(uintptr_t)frame, flags)) {
+        PMM::FreeBytes(frame, PAGE_SIZE);
+        return false;
+    }
+    KernelVMM::InvalidatePage(pg);
+    return true;
+}
+
+// copy kernel bytes out to a user VA via the task's page tables (map-on-demand),
+// so it is valid regardless of which cr3 is currently active. (satoru)
+static bool sig_write_user(Process* task, uint64_t va, const void* src, uint64_t n) {
+    const uint8_t* s = (const uint8_t*)src;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t a = va + i;
+        if (!sig_ensure_page(task, a)) return false;
+        uint64_t phys = KernelVMM::QueryMappingInAddressSpace(task->address_space, a & ~0xFFFULL);
+        if (!phys) return false;
+        *(volatile uint8_t*)(uintptr_t)((phys & ~0xFFFULL) + (a & 0xFFFULL)) = s[i];
+    }
+    return true;
+}
+
+// read user bytes into a kernel buffer via the task's page tables. (satoru)
+static bool sig_read_user(Process* task, uint64_t va, void* dst, uint64_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t a = va + i;
+        uint64_t phys = KernelVMM::QueryMappingInAddressSpace(task->address_space, a & ~0xFFFULL);
+        if (!phys) return false;
+        d[i] = *(const volatile uint8_t*)(uintptr_t)((phys & ~0xFFFULL) + (a & 0xFFFULL));
+    }
+    return true;
+}
+
+// rt sigframe geometry. we build (from low to high address on the user stack):
+//   [pretcode(8)][ucontext(UC_SIZE)][siginfo(128)]
+// the handler is entered with RSP = &pretcode; its `ret` pops pretcode into RIP
+// (the restorer), leaving RSP = &ucontext, where rt_sigreturn reads it back. the
+// mcontext (sigcontext) lives at ucontext+40 with the linux x86_64 field order.
+// (satoru)
+static const int UC_MCONTEXT_OFF = 40;
+static const int UC_SIGMASK_OFF  = 40 + 256;    // after the 256-byte sigcontext (satoru)
+static const int UC_SIZE         = 40 + 256 + 128;   // + a full 128-byte sigset (satoru)
+// within-mcontext byte offsets (linux x86_64 struct sigcontext). (satoru)
+static const int MC_R8=0, MC_R9=8, MC_R10=16, MC_R11=24, MC_R12=32, MC_R13=40,
+                 MC_R14=48, MC_R15=56, MC_RDI=64, MC_RSI=72, MC_RBP=80, MC_RBX=88,
+                 MC_RDX=96, MC_RAX=104, MC_RCX=112, MC_RSP=120, MC_RIP=128,
+                 MC_EFL=136, MC_CS=144, MC_GS=146, MC_FS=148, MC_ERR=152,
+                 MC_TRAPNO=160, MC_OLDMASK=168, MC_CR2=176;
+
+// build the rt sigframe on the user stack and rewrite `frame` to enter the
+// handler. returns true if the frame was rewritten. (satoru)
+static bool sig_build_frame(InterruptFrame* frame, Process* task, int sig,
+                            const LinuxSigaction* act, uint64_t blocked_before) {
+    uint64_t sp = frame->rsp;
+    sp -= 128;                       // skip the red zone (satoru)
+    sp -= 128; uint64_t info_addr = sp;             // siginfo_t (satoru)
+    sp -= UC_SIZE; uint64_t uc_addr = sp;           // ucontext_t (satoru)
+    uc_addr &= ~0xFULL;                              // 16-align the ucontext (satoru)
+    uint64_t pretcode_addr = uc_addr - 8;            // handler entry RSP (satoru)
+
+    // siginfo: zeroed, si_signo set. (satoru)
+    uint8_t info[128]; memset(info, 0, sizeof(info));
+    *(int32_t*)&info[0] = sig;
+
+    // ucontext: zeroed, mcontext filled with the interrupted register state. (satoru)
+    uint8_t uc[UC_SIZE]; memset(uc, 0, sizeof(uc));
+    uint8_t* mc = uc + UC_MCONTEXT_OFF;
+    *(uint64_t*)(mc + MC_R8)  = frame->r8;   *(uint64_t*)(mc + MC_R9)  = frame->r9;
+    *(uint64_t*)(mc + MC_R10) = frame->r10;  *(uint64_t*)(mc + MC_R11) = frame->r11;
+    *(uint64_t*)(mc + MC_R12) = frame->r12;  *(uint64_t*)(mc + MC_R13) = frame->r13;
+    *(uint64_t*)(mc + MC_R14) = frame->r14;  *(uint64_t*)(mc + MC_R15) = frame->r15;
+    *(uint64_t*)(mc + MC_RDI) = frame->rdi;  *(uint64_t*)(mc + MC_RSI) = frame->rsi;
+    *(uint64_t*)(mc + MC_RBP) = frame->rbp;  *(uint64_t*)(mc + MC_RBX) = frame->rbx;
+    *(uint64_t*)(mc + MC_RDX) = frame->rdx;  *(uint64_t*)(mc + MC_RAX) = frame->rax;
+    *(uint64_t*)(mc + MC_RCX) = frame->rcx;  *(uint64_t*)(mc + MC_RSP) = frame->rsp;
+    *(uint64_t*)(mc + MC_RIP) = frame->rip;  *(uint64_t*)(mc + MC_EFL) = frame->rflags;
+    *(uint16_t*)(mc + MC_CS)  = (uint16_t)frame->cs;
+    *(uint64_t*)(mc + MC_OLDMASK) = blocked_before;
+    *(uint64_t*)(mc + MC_CR2) = frame->cr2;
+    *(uint64_t*)(uc + UC_SIGMASK_OFF) = blocked_before;
+
+    if (!sig_write_user(task, info_addr, info, 128)) return false;
+    if (!sig_write_user(task, uc_addr, uc, UC_SIZE)) return false;
+    uint64_t ret = act->restorer;
+    if (!sig_write_user(task, pretcode_addr, &ret, 8)) return false;
+
+    // rewrite the trap frame to call the handler: rdi=signo, rsi=&siginfo,
+    // rdx=&ucontext, rip=handler, rsp=&pretcode. (satoru)
+    frame->rdi = (uint64_t)sig;
+    frame->rsi = info_addr;
+    frame->rdx = uc_addr;
+    frame->rip = act->handler;
+    frame->rsp = pretcode_addr;
+    frame->rax = 0;
+    return true;
+}
+
+void LinuxSyscall::DeliverPendingSignals(InterruptFrame* frame) {
+    if (!frame) return;
+    if ((frame->cs & 3) != 3) return;             // only when returning to ring-3 (satoru)
+    Process* task = Scheduler::GetCurrentProcess();
+    if (!task || !task->is_user()) return;
+    LinuxProcess* p = Current();
+    if (!p) return;
+
+    uint64_t deliverable = p->sig_pending & ~p->sig_blocked;
+    if (!deliverable) return;
+
+    Process* leader = region_owner(task);
+    LinuxSigGroup* grp = sig_group_for(leader, false);
+
+    for (int sig = 1; sig < 64; sig++) {
+        if (!(deliverable & (1ull << sig))) continue;
+
+        // consume this pending bit now (delivered or defaulted). (satoru)
+        __atomic_and_fetch(&p->sig_pending, ~(1ull << sig), __ATOMIC_SEQ_CST);
+
+        // SIGKILL(9) / SIGSTOP(19) are uncatchable - always the default action. (satoru)
+        const LinuxSigaction* act = (grp && sig != 9 && sig != 19) ? &grp->act[sig] : nullptr;
+        uint64_t handler = act ? act->handler : 0;
+
+        if (handler == 0) {                       // SIG_DFL (satoru)
+            if (sig_default_ignore(sig)) continue;
+            // fatal default: linux kills the WHOLE thread group, not one thread.
+            // a lone sys_exit left the siblings running in a half-dead group
+            // (husk windows, ipc peers waiting on a corpse). mark every sibling
+            // dead + defer their reap (skip ourselves - our own sys_exit below
+            // walks the normal exit path), then terminate like exit() does. (satoru)
+            if (task) {
+                Process* gl = region_owner(task);
+                Scheduler::KillProcessGroupAsync(gl ? gl->pid : task->pid, task);
+            }
+            p->exit_code = 128 + sig;
+            p->exited = true;
+            sys_exit((uint32_t)(128 + sig));
+            return;
+        }
+        if (handler == 1) continue;               // SIG_IGN (satoru)
+        if (!act->restorer) {
+            // musl ALWAYS installs SA_RESTORER; a handler without one cannot round
+            // trip through rt_sigreturn, so decline delivery loudly rather than
+            // jump into it. (satoru)
+            SerialLogger::Log("[sig] no SA_RESTORER for handler; skipping delivery sig=");
+            SerialLogger::LogDec(sig); SerialLogger::Log("\r\n");
+            continue;
+        }
+
+        uint64_t blocked_before = p->sig_blocked;
+        if (!sig_build_frame(frame, task, sig, act, blocked_before)) {
+            SerialLogger::Log("[sig] failed to build sigframe sig=");
+            SerialLogger::LogDec(sig); SerialLogger::Log("\r\n");
+            return;
+        }
+        // block sa_mask + this signal for the duration of the handler (unless
+        // SA_NODEFER); rt_sigreturn restores blocked_before from the ucontext. (satoru)
+        uint64_t newblock = blocked_before | act->mask;
+        if (!(act->flags & L_SA_NODEFER)) newblock |= (1ull << sig);
+        p->sig_blocked = newblock;
+        // SA_RESETHAND: one-shot handler reverts to default after firing. (satoru)
+        if ((act->flags & L_SA_RESETHAND) && grp) {
+            grp->act[sig].handler = 0; grp->act[sig].flags = 0;
+            grp->act[sig].restorer = 0; grp->act[sig].mask = 0;
+        }
+        Scheduler::SaveUserFrame(task, frame, 6);   // site 6 = signal delivery (satoru)
+        return;                                   // one signal per boundary (satoru)
+    }
+}
+
 static void LinuxInt80Entry(InterruptFrame* frame) {
     if (!frame) return;
 
@@ -1804,7 +2885,7 @@ static void LinuxInt80Entry(InterruptFrame* frame) {
 
     Process* running = Scheduler::GetCurrentProcess();
     if (Userspace::IsActive() && running && running->is_user()) {
-        Scheduler::SaveUserFrame(running, frame);
+        Scheduler::SaveUserFrame(running, frame, 1);   // site 1 = syscall entry (satoru)
         // derive this cpu's linux current from the SCHEDULER current at every
         // entry: the ap timer preempt switches threads without touching the
         // linux index, so trusting the cached per-cpu index would resolve the
@@ -1820,7 +2901,18 @@ static void LinuxInt80Entry(InterruptFrame* frame) {
     // serialize the syscall body across cores; ring-3 stays parallel. (satoru)
     kls_lock();
     // the ui pump drives the bsp's shell/desktop - never from an ap. (satoru)
-    if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+    if (SMP::CpuIndex() == 0) {
+        KuronoShell::PumpUI();
+        // starvation relief valve: a bsp user thread hammering NONBLOCKING
+        // syscalls (the symbolized clock_gettime deadline-spin - IndexedDB IO
+        // monopolized the bsp for 13s) never blocks, so the cooperative kernel
+        // (kvfs, wayland, desktop, reaper) never runs and the condition the
+        // spinner waits for can never be produced = livelock. when Schedule()
+        // has starved >50ms, donate one 1ms kernel slice. kls_relax pattern -
+        // the lock is RELEASED across the sleep, per the deadlock doctrine. (satoru)
+        uint64_t ls = Scheduler::LastScheduleMs();
+        if (ls && Timer::GetRealMs64() - ls > 50) kls_relax_sleep_ms(1);
+    }
 
     // the syscall number is small, but the arg registers carry full
     // 64-bit user pointers/addresses - pass them through untruncated so a
@@ -1842,7 +2934,13 @@ static void LinuxInt80Entry(InterruptFrame* frame) {
 
         Process* current = Scheduler::GetCurrentProcess();
         if (Userspace::IsActive() && current && current->is_user()) {
-            Scheduler::SaveUserFrame(current, frame);
+            Scheduler::SaveUserFrame(current, frame, 2);   // site 2 = syscall exit (satoru)
+            // honest syscall-boundary signal delivery: if a handled, unblocked
+            // signal is pending, rewrite the frame to enter the handler. only when
+            // we did NOT switch tasks (a switch delivers on the next boundary of
+            // the switched-in thread). may itself set resume_userspace_session for
+            // a fatal default. (satoru)
+            LinuxSyscall::DeliverPendingSignals(frame);
         }
     }
 
@@ -1882,7 +2980,7 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
 
     Process* running = Scheduler::GetCurrentProcess();
     if (Userspace::IsActive() && running && running->is_user()) {
-        Scheduler::SaveUserFrame(running, frame);
+        Scheduler::SaveUserFrame(running, frame, 1);   // site 1 = syscall entry (satoru)
         // sync the linux current from the scheduler current - see the int 0x80
         // entry: an ap timer preempt switches threads without updating the
         // per-cpu linux index. (satoru)
@@ -1897,8 +2995,36 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     // (single-core self-deadlock / reentrancy). the int 0x80 path enables IF as
     // before. (satoru)
     if (SMP::CpuIndex() != 0) HAL::EnableInterrupts();
-    // serialize the syscall body across cores; ring-3 stays parallel. (satoru)
-    kls_lock();
+
+    // task 17 forensics: count every firefox syscall nr this sample window so a
+    // spin-storm names itself in [ffcount] top=. cheap: cached-AS compare + add. (satoru)
+    if (ff_is_firefox(running)) {
+        uint64_t nx = frame->rax < 351 ? frame->rax : 351;
+        g_ff_nr_hist[nx]++;
+    }
+
+    // kls-exemption (task 16): hot self-locked syscalls (futex, sched_yield,
+    // nanosleep) + no-shared-state ones (clock/getpid family) run WITHOUT the
+    // global serializer so firefox's threads execute them in PARALLEL instead
+    // of single-file (91.6% of syscalls were contending on kls). (satoru)
+    bool kls_exempt = syscall_x64_kls_exempt(frame->rax);
+    if (!kls_exempt) {
+        // serialize the syscall body across cores; ring-3 stays parallel. (satoru)
+        kls_lock();
+    }
+
+    // starvation relief valve - runs for EVERY bsp syscall, exempt or not: if it
+    // only fired for kls-holding syscalls, a firefox thread spinning in exempt
+    // futex/yield/nanosleep loops (which no longer take kls) would never trigger
+    // it, so Schedule() never runs and the cooperative kernel procs (GUIProcess,
+    // kvfs, reaper) STARVE -> firefox waits forever on something a starved kernel
+    // proc must produce = the pre-KX2 hang. donate one 1ms kernel slice when
+    // Schedule() has starved >50ms. kls_relax_sleep_ms is safe when the lock is
+    // NOT held (exempt path): it just sleeps without touching kls. (satoru)
+    if (SMP::CpuIndex() == 0) {
+        uint64_t ls = Scheduler::LastScheduleMs();
+        if (ls && Timer::GetRealMs64() - ls > 50) kls_relax_sleep_ms(1);
+    }
 
     // amd64 syscall abi: nr in rax, args in rdi, rsi, rdx, r10, r8, r9. the
     // frame captured r9 pristine (musl's clone child-fn), so clone no longer
@@ -1940,15 +3066,31 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
         frame->rax = (uint64_t)(int64_t)result;
         Process* current = Scheduler::GetCurrentProcess();
         if (Userspace::IsActive() && current && current->is_user()) {
-            Scheduler::SaveUserFrame(current, frame);
+            Scheduler::SaveUserFrame(current, frame, 2);   // site 2 = syscall exit (satoru)
+            // honest syscall-boundary signal delivery (see the int 0x80 path). the
+            // x64 stub IRETQs from this frame, so a rewritten rip/rsp/rdi.. takes
+            // effect on return. signal delivery touches the SHARED handler table
+            // so it must stay serialized: on the kls-exempt path take the lock
+            // ONLY when a signal is actually pending (rare), keeping the common
+            // exempt path fully lock-free. (satoru)
+            if (kls_exempt) {
+                LinuxProcess* lp = LinuxSyscall::Current();
+                if (lp && (lp->sig_pending & ~lp->sig_blocked)) {
+                    kls_lock();
+                    LinuxSyscall::DeliverPendingSignals(frame);
+                    kls_unlock();
+                }
+            } else {
+                LinuxSyscall::DeliverPendingSignals(frame);
+            }
         }
     }
 
     current_syscall_frame = nullptr;
 
     // release BEFORE a session unwind: HandleProcessExit longjmps away and
-    // would leave the kls lock held forever. (satoru)
-    kls_unlock();
+    // would leave the kls lock held forever. exempt syscalls never took it. (satoru)
+    if (!kls_exempt) kls_unlock();
 
     if (resume_userspace_session) {
         Userspace::HandleProcessExit(resume_userspace_exit_code);
@@ -2176,7 +3318,7 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
             }
             if (s_pf_retry_n[rcpu]++ < 8) {
                 KernelVMM::InvalidatePage(page_base);
-                if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame);
+                if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame, 5);   // site 5 (satoru)
                 return true;
             }
         }
@@ -2214,7 +3356,7 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
         if ((frame->error_code & PFERR_WRITE) && (r->page_flags & PTE_WRITABLE)) {
             KernelVMM::ProtectPageInAddressSpace(task->address_space, page_base, r->page_flags);
             KernelVMM::InvalidatePage(page_base);
-            if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame);
+            if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame, 5);   // site 5 (satoru)
             return true;
         }
         SerialLogger::Log("[pfref] present fault refused. pteflags=");
@@ -2252,7 +3394,7 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
                     if (KernelVMM::MapPageInAddressSpace(task->address_space, page_base,
                                                          (uint64_t)(uintptr_t)pg, pflags)) {
                         KernelVMM::InvalidatePage(page_base);
-                        if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame);
+                        if (frame->error_code & PFERR_USER) Scheduler::SaveUserFrame(task, frame, 5);   // site 5 (satoru)
                         return true;
                     }
                     PMM::FreeBytes(pg, PAGE_SIZE);
@@ -2384,6 +3526,9 @@ void LinuxSyscall::DestroyProcess(int pid_idx) {
             p->fds[i].open = false;
         }
     }
+    // release this task's shared signal-handler group if it was the leader (a
+    // thread being destroyed keeps the group alive for its siblings). (satoru)
+    if (p->task) sig_group_release(p->task);
     p->task = nullptr;
     p->exited = false;
     p->active = false;
@@ -2701,11 +3846,15 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return sys_getpid();
         }
         case LSYS_TGKILL: {
-            // tgkill(tgid, tid, sig) - we map to plain kill(tid, sig)
+            // tgkill(tgid, tid, sig): post the signal onto the target THREAD; it is
+            // delivered at that thread's next syscall boundary. sig 0 = existence
+            // probe. musl's raise() is tgkill(getpid(), gettid(), sig). (satoru)
             int tid = (int)ecx; int sig = (int)edx;
             for (int i = 0; i < LINUX_MAX_PROCS; i++)
                 if (procs[i].active && (int)procs[i].pid == tid){
-                    procs[i].pending_signals |= (1u << sig);
+                    if (sig == 0) return 0;
+                    if (sig < 1 || sig >= 64) return -22;
+                    sig_post(&procs[i], sig);
                     return 0;
                 }
             return -3;
@@ -2721,6 +3870,15 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 int i = 0;
                 while (i < (int)sizeof(p->name)-1 && src[i]) { p->name[i] = src[i]; i++; }
                 p->name[i] = 0;
+                // stamp the SCHEDULER task too: everything diagnostic reads
+                // task->name (the futex wait-graph dump, task manager, sched
+                // event log), and without this every firefox thread showed as
+                // "firefox" instead of its real gecko thread name. (satoru)
+                if (p->task) {
+                    int j = 0;
+                    while (j < (int)sizeof(p->task->name)-1 && p->name[j]) { p->task->name[j] = p->name[j]; j++; }
+                    p->task->name[j] = 0;
+                }
                 return 0;
             }
             if (op == 16 && ecx){
@@ -2784,6 +3942,19 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             LinuxProcess* p = Current();
             LinuxShmObj* s = shm_for_fd(p, (int)ebx);
             if (s) return shm_set_size(s, (uint64_t)ecx) ? 0 : -28;  // -ENOSPC
+            // (satoru) TEMP [nssft]: a kvfs-file ftruncate is a silent no-op here.
+            // sqlite truncates its journal/wal; a journal that stays non-empty can
+            // make sqlite treat the profile db as corrupt. log who relies on it.
+            // remove before commit.
+            if (p && p->pid >= 100 && p->pid < 140) {
+                int tfd = (int)ebx;
+                bool okfd = (tfd >= 0 && tfd < LINUX_MAX_FDS && p->fds[tfd].open);
+                SerialLogger::Log("[nssft] pid="); SerialLogger::LogDec((int)p->pid);
+                SerialLogger::Log(" fd="); SerialLogger::LogDec(tfd);
+                SerialLogger::Log(" sz="); SerialLogger::LogDec((int)ecx);
+                SerialLogger::Log(" "); SerialLogger::Log(okfd ? p->fds[tfd].path : "?");
+                SerialLogger::Log("\r\n");
+            }
             return 0;
         }
         case LSYS_MADVISE:    return sys_madvise(ebx, ecx, (uint32_t)edx);
@@ -2958,6 +4129,18 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     uint64_t en   = ln ? (st + ln) : ~0ull;           // len 0 = to eof (satoru)
                     uint64_t ph   = flock_path_hash(lfd->path);
                     Process* owner = region_owner(p->task);
+                    // (satoru) TEMP [nsslk]: trace sqlite's advisory locks on the
+                    // profile dbs (cert9/key4) - a refused lock aborts nss init.
+                    // remove before commit.
+                    if (p->pid >= 100 && p->pid < 140 && probe_has(lfd->path, ".mozilla")) {
+                        SerialLogger::Log("[nsslk] pid="); SerialLogger::LogDec((int)p->pid);
+                        SerialLogger::Log(" cmd="); SerialLogger::LogDec(cmd);
+                        SerialLogger::Log(" ty="); SerialLogger::LogDec((int)want);
+                        SerialLogger::Log(" st="); SerialLogger::LogDec((int)st);
+                        SerialLogger::Log(" ln="); SerialLogger::LogDec((int)ln);
+                        SerialLogger::Log(" "); SerialLogger::Log(lfd->path);
+                        SerialLogger::Log("\r\n");
+                    }
 
                     if (cmd == 5) {                                   // F_GETLK (satoru)
                         SpinLockGuard g(g_flock_lock);
@@ -3024,8 +4207,11 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                         }
                         if (cmd == 6) return -11;                     // -EAGAIN (satoru)
                         if (Time::GetTicks() > fl_deadline) return -35;  // -EDEADLK (satoru)
-                        if (SMP::CpuIndex() == 0) { KuronoShell::PumpUI(); Scheduler::SleepMs(1); }
-                        else kls_relax();
+                        // pump one ui frame under the lock, then sleep with the kls
+                        // RELEASED: this wait legally lasts seconds, and the holder
+                        // we wait on needs the kls for its OWN unlock syscall. (satoru)
+                        if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                        kls_relax_sleep_ms(1);
                     }
                 }
                 default: return 0;
@@ -3053,9 +4239,10 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             switch (op) {
                 case 0:   /* FUTEX_WAIT (relative timeout) */
                 case 9: { /* FUTEX_WAIT_BITSET (absolute timeout, match-any) */
+                    g_ftx_wait_calls++;   // task 17 forensics (satoru)
                     uint32_t cur = 0;
                     if (!read_user_u32(task, uaddr, &cur)) return -14;  // -EFAULT
-                    if (cur != val) return -11;  // -EAGAIN - value already changed
+                    if (cur != val) { g_ftx_wait_eagain++; return -11; }  // -EAGAIN - value already changed (satoru)
 
                     // honour the timeout (4th arg r10 == esi). NULL == wait forever;
                     // op 0's timespec is RELATIVE, op 9 (WAIT_BITSET)'s is ABSOLUTE
@@ -3094,6 +4281,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     // success the frame is rewritten and our return value is
                     // ignored. (satoru)
                     if (futex_enqueue_and_block(task, (uintptr_t)uaddr, val, 0xFFFFFFFFu, deadline_ms)) {
+                        g_ftx_wait_blocked++;   // task 17 forensics (satoru)
                         return 0;
                     }
 
@@ -3103,36 +4291,61 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     // would wedge, so return a spurious wake; the caller re-tests
                     // *uaddr in ring-3 where the timer (irq0) can preempt it once a
                     // sibling becomes ready. (satoru)
+                    g_ftx_wait_spur++;   // task 17 forensics: cant-block spin marker (satoru)
                     return 0;
                 }
                 case 1:    /* FUTEX_WAKE */
                 case 10: { /* FUTEX_WAKE_BITSET (match-any) */
                     int max = (int)val;
                     if (max < 0) max = 0x7FFFFFFF;
-                    return futex_do_wake(task->address_space, (uintptr_t)uaddr,
-                                         futex_phys_key(task, (uintptr_t)uaddr),
-                                         max, 0xFFFFFFFFu);
+                    g_ftx_wake_calls++;   // task 17 forensics (satoru)
+                    int nw = futex_do_wake(task->address_space, (uintptr_t)uaddr,
+                                           futex_phys_key(task, (uintptr_t)uaddr),
+                                           max, 0xFFFFFFFFu);
+                    g_ftx_woken_total += (nw > 0 ? (uint64_t)nw : 0);   // (satoru)
+                    return nw;
                 }
                 case 3:    /* FUTEX_REQUEUE */
                 case 4: {  /* FUTEX_CMP_REQUEUE */
                     // we don't implement true requeue to uaddr2; instead WAKE all
-                    // waiters on uaddr. the woken threads simply re-contend on the
-                    // target lock via their own FUTEX_WAIT - functionally correct
-                    // (spurious wakes are always allowed) and, crucially, this
-                    // unblocks pthread_cond_signal/broadcast, which MUSL implements
-                    // with FUTEX_REQUEUE. these were previously no-op'd below, so a
-                    // condvar broadcast never woke its waiters and gecko's startup
-                    // deadlocked - every worker + the main thread parked forever in
-                    // FUTEX_WAIT. the *uaddr==val3 compare for CMP_REQUEUE is
-                    // skipped (a spurious wake is safe). (satoru)
+                    // waiters on uaddr. VERIFIED SAFE for musl (2026-07-16 futex
+                    // deep-dive vs musl 1.2.6): musl's ONLY requeue user is the
+                    // condvar unlock_requeue relay, and its waiter accounting is
+                    // provably lost-wake-free under wake-all (each barrier word has
+                    // one waiter so wake-all==wake-one; the a_store(0) before the
+                    // syscall + our atomic value-check on re-enqueue closes the
+                    // store/wake race; _m_waiters self-accounts). musl even ships
+                    // its own wake-instead-of-requeue path (the `w` flag), so the
+                    // algorithm tolerates this by design. cost = a bounded herd on
+                    // the mutex. the *uaddr==val3 compare is skipped (musl issues
+                    // plain op 3 which linux itself passes cmpval=NULL for). (satoru)
                     return futex_do_wake(task->address_space, (uintptr_t)uaddr,
                                          futex_phys_key(task, (uintptr_t)uaddr),
                                          0x7FFFFFFF, 0xFFFFFFFFu);
                 }
-                default:
-                    // FUTEX_WAKE_OP / PI variants: accept and no-op so callers
-                    // don't see -ENOSYS mid-lock. (satoru)
+                default: {
+                    // WAKE_OP (5), LOCK_PI/UNLOCK_PI/TRYLOCK_PI (6/7/8),
+                    // WAIT/CMP_REQUEUE_PI (11/12), LOCK_PI2 (13): NOT implemented,
+                    // accept + no-op 0 so a caller mid-lock doesn't see -ENOSYS
+                    // (musl has no fallback for -ENOSYS on these). musl + rust-std
+                    // + firefox 140's crates issue NONE of these on the normal
+                    // path (verified), so this is dormant. BUT the silent 0 hides
+                    // two real holes if a future binary does hit it: WAKE_OP must
+                    // RMW *uaddr2 (a wake alone loses the write), and LOCK_PI
+                    // returning 0 = "you own it" would let TWO threads own one PI
+                    // mutex. log ONCE per distinct op so the dormant hole becomes
+                    // visible instead of silently corrupting - do NOT return
+                    // -ENOSYS. (satoru)
+                    static bool s_ftx_op_logged[16] = {};
+                    uint32_t oi = op & 0xF;
+                    if (!s_ftx_op_logged[oi]) {
+                        s_ftx_op_logged[oi] = true;
+                        SerialLogger::Log("[ftxop] unimplemented futex op=");
+                        SerialLogger::LogDec((int)op);
+                        SerialLogger::Log(" (no-op 0; WAKE_OP/PI hole - see comment)\r\n");
+                    }
                     return 0;
+                }
             }
         }
 
@@ -3273,6 +4486,11 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             tproc->exited      = false;
             tproc->task        = thread_task;
             tproc->signal_mask = parent->signal_mask;
+            // a new thread inherits the group's blocked mask and shares the
+            // group's handler table (keyed by the leader, which region_owner walks
+            // to); its own pending set starts empty. (satoru)
+            tproc->sig_blocked = parent->sig_blocked;
+            tproc->sig_pending = 0;
             ls_scpy(tproc->cwd,  parent->cwd,  sizeof(tproc->cwd));
             ls_scpy(tproc->name, parent->name, sizeof(tproc->name));
             // CLONE_FILES (0x400): the thread SHARES the leader's fd table rather
@@ -3337,15 +4555,90 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return tid;  // parent sees the child tid; the child returns 0 (frame)
         }
 
-        // Posix realtime signal stubs - accept both i386 numbering (174..)
-        // and x86_64 numbering via the LSYS_RT_SIG* synonyms.  No delivery.
-        case 174:  // i386 rt_sigaction
-        case 175:  // i386 rt_sigprocmask
-        case 173:  // i386 rt_sigreturn
-        case LSYS_RT_SIGACTION:
-        case LSYS_RT_SIGPROCMASK:
+        // rt_sigaction(sig, act, oldact, sigsetsize): store/return the per-group
+        // handler table entry. handlers are SHARED across the thread group (keyed
+        // by the region_owner leader), matching linux. the x86_64 kernel struct
+        // sigaction is { handler(8), flags(8), restorer(8), mask(8) }. (satoru)
+        case LSYS_RT_SIGACTION: {
+            int sig = (int)ebx;
+            if (sig <= 0 || sig >= 64) return -22;             // -EINVAL (satoru)
+            if (sig == 9 || sig == 19) return -22;             // SIGKILL/SIGSTOP uncatchable (satoru)
+            Process* task = Scheduler::GetCurrentProcess();
+            if (!task || !task->is_user()) return -22;
+            Process* leader = region_owner(task);
+            const LinuxSigaction* uact = (const LinuxSigaction*)(uintptr_t)ecx;
+            LinuxSigaction* uold = (LinuxSigaction*)(uintptr_t)edx;
+            LinuxSigGroup* grp = sig_group_for(leader, uact != nullptr);
+            if (uold) {
+                if (grp) *uold = grp->act[sig];
+                else { uold->handler = 0; uold->flags = 0; uold->restorer = 0; uold->mask = 0; }
+            }
+            if (uact) {
+                if (!grp) return -12;                          // -ENOMEM (table full) (satoru)
+                grp->act[sig] = *uact;
+            }
+            return 0;
+        }
+        // rt_sigprocmask(how, set, oldset, sigsetsize): honour SIG_BLOCK(0) /
+        // SIG_UNBLOCK(1) / SIG_SETMASK(2) on the per-thread blocked mask, return
+        // the old mask. SIGKILL/SIGSTOP can never be blocked. (satoru)
+        case LSYS_RT_SIGPROCMASK: {
+            int how = (int)ebx;
+            const uint64_t* uset = (const uint64_t*)(uintptr_t)ecx;
+            uint64_t* uold = (uint64_t*)(uintptr_t)edx;
+            LinuxProcess* p = Current();
+            if (!p) return -22;
+            if (uold) *uold = p->sig_blocked;
+            if (uset) {
+                uint64_t v = *uset & ~((1ull << 9) | (1ull << 19));   // never block KILL/STOP (satoru)
+                if      (how == 0) p->sig_blocked |= v;               // SIG_BLOCK (satoru)
+                else if (how == 1) p->sig_blocked &= ~v;              // SIG_UNBLOCK (satoru)
+                else if (how == 2) p->sig_blocked = v;                // SIG_SETMASK (satoru)
+                else return -22;
+            }
+            return 0;
+        }
+        // rt_sigreturn(): restore the interrupted context from the rt sigframe the
+        // delivery path wrote. the restorer entered us with RSP pointing at the
+        // ucontext (its `ret` popped the pretcode), so mcontext is at rsp+40. this
+        // completes the handler round trip. (satoru)
+        case LSYS_RT_SIGRETURN: {
+            Process* task = Scheduler::GetCurrentProcess();
+            if (!task || !task->is_user() || !current_syscall_frame) return 0;
+            uint64_t uc = current_syscall_frame->rsp;
+            uint8_t mc[256];
+            if (!sig_read_user(task, uc + UC_MCONTEXT_OFF, mc, sizeof(mc))) return 0;
+            InterruptFrame* f = current_syscall_frame;
+            f->r8  = *(uint64_t*)(mc + MC_R8);  f->r9  = *(uint64_t*)(mc + MC_R9);
+            f->r10 = *(uint64_t*)(mc + MC_R10); f->r11 = *(uint64_t*)(mc + MC_R11);
+            f->r12 = *(uint64_t*)(mc + MC_R12); f->r13 = *(uint64_t*)(mc + MC_R13);
+            f->r14 = *(uint64_t*)(mc + MC_R14); f->r15 = *(uint64_t*)(mc + MC_R15);
+            f->rdi = *(uint64_t*)(mc + MC_RDI); f->rsi = *(uint64_t*)(mc + MC_RSI);
+            f->rbp = *(uint64_t*)(mc + MC_RBP); f->rbx = *(uint64_t*)(mc + MC_RBX);
+            f->rdx = *(uint64_t*)(mc + MC_RDX); f->rax = *(uint64_t*)(mc + MC_RAX);
+            f->rcx = *(uint64_t*)(mc + MC_RCX); f->rsp = *(uint64_t*)(mc + MC_RSP);
+            f->rip = *(uint64_t*)(mc + MC_RIP);
+            // sanitize the restored rflags: keep the arithmetic/direction/overflow
+            // status bits, force IF + the reserved bit, drop TF/IOPL/NT. (satoru)
+            uint64_t efl = *(uint64_t*)(mc + MC_EFL);
+            f->rflags = (efl & 0x0000000000000CD5ull) | 0x202ull;
+            // restore the blocked mask the handler ran under. (satoru)
+            uint64_t oldmask = 0;
+            if (sig_read_user(task, uc + UC_SIGMASK_OFF, &oldmask, 8)) {
+                LinuxProcess* p = Current();
+                if (p) p->sig_blocked = oldmask;
+            }
+            Scheduler::SaveUserFrame(task, f, 9);   // site 9 = rt_sigreturn (satoru)
+            current_frame_rewritten = true;   // we rewrote the frame; keep our rax (satoru)
+            return 0;
+        }
+        // rt_sigsuspend + the i386 numbering: no honest suspend semantics yet, so
+        // report EINTR (i386 174/175/173 are only reached by a 32-bit binary; the
+        // x86_64 path uses the LSYS_RT_SIG* synonyms above). (satoru)
+        case 174:  // i386 rt_sigaction (32-bit binaries only) (satoru)
+        case 175:  // i386 rt_sigprocmask (satoru)
+        case 173:  // i386 rt_sigreturn (satoru)
         case LSYS_RT_SIGSUSPEND:
-        case LSYS_RT_SIGRETURN:
             return 0;
         // LSYS_RT_SIGPENDING moved to the Tier-7 build-out block below, where it
         // writes the process's real pending-signal mask into the user set. (satoru)
@@ -3493,15 +4786,32 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             p->fds[fd].open = true;
             return fd;
         }
-        // signalfd4: harmless stub - we have no real signal delivery, so the
-        // fd never becomes readable. accepted so setup code doesn't crash. (satoru)
+        // signalfd4(fd, mask, sizemask, flags): a real signalfd backed by the
+        // pending mechanism. the watch mask (which signals this fd drains) is stored
+        // in lfd->offset; read() drains matching pending signals as
+        // signalfd_siginfo records, poll reports EPOLLIN when one is pending. these
+        // signals should be BLOCKED by the caller (which our boundary delivery
+        // honours: a blocked signal stays pending, available to drain here). fd==-1
+        // creates a new fd; a real fd re-arms its mask. (satoru)
         case LSYS_SIGNALFD4: {
             LinuxProcess* p = Current();
             if (!p) return -1;
+            int reqfd = (int)ebx;
+            uint64_t mask = 0;
+            const uint64_t* umask = (const uint64_t*)(uintptr_t)ecx;
+            if (umask) mask = *umask;
+            if (reqfd >= 0) {
+                // re-arm an existing signalfd. (satoru)
+                if (reqfd >= LINUX_MAX_FDS || !p->fds[reqfd].open ||
+                    p->fds[reqfd].type != LFD_SIGNALFD) return -22;
+                p->fds[reqfd].offset = mask;
+                return reqfd;
+            }
             int fd = AllocFd(p);
             if (fd < 0) return -24;
             memset(&p->fds[fd], 0, sizeof(LinuxFd));
-            p->fds[fd].type = LFD_SIGNALFD;   // never reports EPOLLIN (satoru)
+            p->fds[fd].type = LFD_SIGNALFD;
+            p->fds[fd].offset = mask;   // signals this fd drains (satoru)
             p->fds[fd].open = true;
             return fd;
         }
@@ -3666,10 +4976,9 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 if (SMP::CpuIndex() == 0) {
                     LinuxNetBridge::PumpTick();   // nic drain for inet fds in the set (satoru)
                     KuronoShell::PumpUI();
-                    Scheduler::SleepMs(1);
-                } else {
-                    kls_relax();
                 }
+                // breathe with the kls released (see do_poll_wait). (satoru)
+                kls_relax_sleep_ms(1);
             }
         }
         // timerfd_settime(fd, flags, new_value, old_value): arm/disarm. The
@@ -4096,9 +5405,80 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return (int32_t)total;
         }
 
-        case LSYS_MEMBARRIER:
-        case LSYS_RSEQ:
+        // membarrier(cmd, flags): a real cross-core memory barrier. cmd 0 = QUERY
+        // reports the supported command bitmask; a real EXPEDITED/GLOBAL command
+        // forces every other cpu through a serializing point via the tlb-shootdown
+        // ipi (each target executes mov cr3 + an mfence), which satisfies the
+        // "all threads observe prior stores" contract on this smp model; the
+        // register-only commands are a no-op success. this matters for rust-std's
+        // crossbeam/seqlock fast paths (firefox) that elide their own fences by
+        // asking the kernel to fence every core. (satoru)
+        case LSYS_MEMBARRIER: {
+            int cmd = (int)ebx;
+            if (cmd == 0) return 1 | 2 | 4 | 8 | 16;   // QUERY: GLOBAL|GLOBAL_EXPEDITED|reg|PRIVATE_EXPEDITED|reg (satoru)
+            if (cmd == 4 || cmd == 16) return 0;        // REGISTER_* : nothing to track (satoru)
+            if (SMP::CpuCount() > 1) SMP::BroadcastTlbFlush();
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
             return 0;
+        }
+        case LSYS_RSEQ:
+            return 0;  // restartable sequences unsupported; benign no-op (see kStubOk note) (satoru)
+
+        // flock(fd, operation): a REAL whole-file advisory lock over the shared
+        // g_file_locks table (the same backend as fcntl byte-range locks). LOCK_EX
+        // (2) = write-lock the whole file, LOCK_SH (1) = read-lock, LOCK_UN (8) =
+        // unlock, LOCK_NB (4, OR'd) = fail fast with -EAGAIN on conflict. owner =
+        // thread-group leader, so a process's threads share the lock while distinct
+        // processes conflict. (satoru)
+        case LSYS_FLOCK: {
+            int fd = (int)ebx; int op = (int)ecx;
+            LinuxProcess* p = Current();
+            if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
+            LinuxFd* lfd = &p->fds[fd];
+            if (!lfd->path[0]) return 0;   // no backing path (socket/pipe/anon): accept (satoru)
+            uint64_t ph = flock_path_hash(lfd->path);
+            Process* owner = region_owner(p->task);
+            bool nb = (op & 4) != 0;
+            int base = op & ~4;
+            if (base == 8) { flock_drop(owner, ph); return 0; }   // LOCK_UN (satoru)
+            if (base != 1 && base != 2) return -22;               // -EINVAL (satoru)
+            int16_t want = (base == 2) ? 1 : 0;                   // EX=write / SH=read (satoru)
+            uint64_t deadline = Time::GetTicks() + 10000;         // bounded wait (satoru)
+            for (;;) {
+                {
+                    SpinLockGuard g(g_flock_lock);
+                    bool conflict = false;
+                    for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                        KFileLock* L = &g_file_locks[i];
+                        if (!L->active || L->path_hash != ph || L->owner == owner) continue;
+                        if (want == 1 || L->type == 1) { conflict = true; break; }
+                    }
+                    if (!conflict) {
+                        // replace this owner's existing flock on the file (upgrade/
+                        // downgrade in place, posix flock re-lock semantics). (satoru)
+                        for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                            KFileLock* L = &g_file_locks[i];
+                            if (L->active && L->owner == owner && L->path_hash == ph)
+                                L->active = false;
+                        }
+                        for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+                            KFileLock* L = &g_file_locks[i];
+                            if (L->active) continue;
+                            L->active = true; L->type = want; L->path_hash = ph;
+                            L->start = 0; L->end = ~0ull; L->owner = owner;
+                            return 0;
+                        }
+                        return -37;   // -ENOLCK: lock table full (satoru)
+                    }
+                }
+                if (nb) return -11;   // -EAGAIN (satoru)
+                if (Time::GetTicks() > deadline) return -35;   // -EDEADLK bound (satoru)
+                // same shape as the F_SETLKW wait: ui pump under the lock, sleep
+                // with the kls RELEASED (the flock holder's unlock needs it). (satoru)
+                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                kls_relax_sleep_ms(1);
+            }
+        }
 
         // ===== AF_UNIX socket family =================================
 
@@ -4223,10 +5603,9 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                         if (SMP::CpuIndex() == 0) {
                             LinuxNetBridge::PumpTick();
                             KuronoShell::PumpUI();
-                            Scheduler::SleepMs(1);
-                        } else {
-                            kls_relax();
                         }
+                        // breathe with the kls released (see do_poll_wait). (satoru)
+                        kls_relax_sleep_ms(1);
                     }
                 }
                 return r;
@@ -4702,7 +6081,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             uint32_t pid = (uint32_t)lp->fds[pidfd].offset;
             for (int i = 0; i < LINUX_MAX_PROCS; i++)
                 if (procs[i].active && procs[i].pid == pid) {
-                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
+                    if (sig > 0 && sig < 64) sig_post(&procs[i], sig);
                     return 0;
                 }
             return -3;  // ESRCH
@@ -4940,7 +6319,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             Process* yt2 = Scheduler::GetCurrentProcess();
             if (yt2 && current_syscall_frame) {
                 current_syscall_frame->rax = 0;                 // resume value of sched_yield (satoru)
-                Scheduler::SaveUserFrame(yt2, current_syscall_frame);
+                Scheduler::SaveUserFrame(yt2, current_syscall_frame, 7);   // site 7 = sched_yield (satoru)
                 if (switch_to_ready_user(current_syscall_frame)) return 0;
             }
             // the kernel-proc yield is bsp-only; an ap with no ready sibling just
@@ -5201,24 +6580,25 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
         }
 
         // ── Tier 7: signals ──────────────────────────────────────────────
-        // rt_sigpending(set, sigsetsize): report this process's pending mask. (satoru)
+        // rt_sigpending(set, sigsetsize): report this thread's pending mask. (satoru)
         case LSYS_RT_SIGPENDING: {
             uint64_t* set = (uint64_t*)(uintptr_t)ebx;
             LinuxProcess* lp = Current();
-            if (set) *set = lp ? lp->pending_signals : 0;
+            if (set) *set = lp ? lp->sig_pending : 0;
             return 0;
         }
-        // rt_sigtimedwait(set, info, timeout, sigsetsize): no real signal delivery
-        // path, so behave like the timeout always elapses with nothing pending. (satoru)
+        // rt_sigtimedwait(set, info, timeout, sigsetsize): no synchronous wait
+        // backend, so behave like the timeout always elapses with nothing pending. (satoru)
         case LSYS_RT_SIGTIMEDWAIT:
             return -11;  // -EAGAIN (timed out, no signal) (satoru)
         // rt_sigqueueinfo(tgid, sig, info) / rt_tgsigqueueinfo(tgid, tid, sig,
-        // info): post the signal bit to the target process. (satoru)
+        // info): post the signal onto the target, delivered at its next syscall
+        // boundary. (satoru)
         case LSYS_RT_SIGQUEUEINFO: {
             uint32_t tgid = ebx; int sig = (int)ecx;
             for (int i = 0; i < LINUX_MAX_PROCS; i++)
                 if (procs[i].active && procs[i].pid == tgid) {
-                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
+                    if (sig > 0 && sig < 64) sig_post(&procs[i], sig);
                     return 0;
                 }
             return -3;
@@ -5227,37 +6607,56 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             int tid = (int)ecx; int sig = (int)edx;
             for (int i = 0; i < LINUX_MAX_PROCS; i++)
                 if (procs[i].active && (int)procs[i].pid == tid) {
-                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
+                    if (sig > 0 && sig < 64) sig_post(&procs[i], sig);
                     return 0;
                 }
             return -3;
         }
-        // kill(pid, sig) / tkill(tid, sig): post the signal bit. pid<=0 group
-        // forms are treated as "current process". sig 0 = existence probe. (satoru)
+        // kill(pid, sig) / tkill(tid, sig): post the signal, delivered at the
+        // target's next syscall boundary. pid<=0 group forms target the current
+        // thread. sig 0 = existence probe. SIGKILL(9) to ANOTHER process is
+        // uncatchable + must terminate promptly, so route it through the scheduler's
+        // group-kill machinery; a self-SIGKILL is posted and terminates the caller
+        // at this same boundary (DeliverPendingSignals treats 9 as fatal). (satoru)
         case LSYS_KILL_:
         case LSYS_TKILL: {
             int pid = (int)ebx; int sig = (int)ecx;
             LinuxProcess* lp = Current();
-            if (pid <= 0) {  // self / process-group: target current (satoru)
-                if (lp) { if (sig > 0 && sig < 64) lp->pending_signals |= (1u << sig); return 0; }
-                return -3;
+            LinuxProcess* target = nullptr;
+            if (pid <= 0) target = lp;   // self / process-group -> current (satoru)
+            else {
+                for (int i = 0; i < LINUX_MAX_PROCS; i++)
+                    if (procs[i].active && (int)procs[i].pid == pid) { target = &procs[i]; break; }
             }
-            for (int i = 0; i < LINUX_MAX_PROCS; i++)
-                if (procs[i].active && (int)procs[i].pid == pid) {
-                    if (sig > 0 && sig < 64) procs[i].pending_signals |= (1u << sig);
-                    return 0;
-                }
-            return -3;  // ESRCH
+            if (!target) return -3;   // ESRCH (satoru)
+            if (sig == 0) return 0;   // existence probe: target exists (satoru)
+            if (sig < 1 || sig >= 64) return -22;
+            if (sig == 9 && target != lp && target->task) {
+                // uncatchable kill of another process: MARK the whole address-space
+                // group dead and DEFER the reap. the old inline KillProcessGroup
+                // quiesce-slept up to 1.6s holding kls_lock; a target member
+                // mid-syscall on another core spins on that same lock and can never
+                // leave its cpu, so the wait could only ever end via the orphan-
+                // steal unserializing the kls (two cores in the syscall body = the
+                // heap-uaf class). the async form marks the members Terminated
+                // right here (the kill takes effect now) and the scheduler kernel
+                // process reaps once every member is observably off-cpu. (satoru)
+                Process* leader = region_owner(target->task);
+                if (leader) Scheduler::KillProcessGroupAsync(leader->pid, nullptr);
+                target->exited = true; target->exit_code = -9;
+                return 0;
+            }
+            sig_post(target, sig);
+            return 0;
         }
         // pause(): block until a signal. with no async delivery we yield once and
         // return -EINTR so callers don't spin forever holding the cpu. (satoru)
         case LSYS_PAUSE:
-            if (SMP::CpuIndex() == 0) {   // the kernel-proc yield is bsp-only (satoru)
-                KuronoShell::PumpUI();
-                Scheduler::Yield();
-            } else {
-                kls_relax();
-            }
+            if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+            // breathe with the kls released - the old bsp Yield ran kernel
+            // procs (which can enter the KLS for detached shell launches)
+            // while still HOLDING the lock. (satoru)
+            kls_relax_sleep_ms(1);
             return -4;  // -EINTR (satoru)
 
         // ── Tier 8: time ─────────────────────────────────────────────────
@@ -5566,6 +6965,11 @@ int32_t LinuxSyscall::sys_fork() {
     child->task = child_task;
     child->signal_mask = parent->signal_mask;
     child->pending_signals = parent->pending_signals;
+    // posix fork: the child inherits the blocked mask but starts with an EMPTY
+    // pending set. it is a NEW thread group, so its handler table is fresh (SIG_DFL
+    // for everything) until it installs its own; exec would reset handlers anyway. (satoru)
+    child->sig_blocked = parent->sig_blocked;
+    child->sig_pending = 0;
     ls_scpy(child->cwd, parent->cwd, sizeof(child->cwd));
     ls_scpy(child->name, parent->name, sizeof(child->name));
     clone_file_descriptors(parent, child);
@@ -5745,7 +7149,14 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
     if (vfork_wake_parent(task)) {
         /* shared AS retained for the resuming vfork parent */
     } else {
-        KernelVMM::DestroyAddressSpace(old_as);
+        // straggler guard (reviewer follow-up): a sibling clone thread still
+        // live in old_as must not have its page tables freed under it. leak
+        // on any hit. (satoru)
+        if (!Scheduler::AddressSpaceLiveElsewhere(old_as, task)) {
+            KernelVMM::DestroyAddressSpace(old_as);
+        } else {
+            SerialLogger::Log("[asguard] execve leak: old as live elsewhere\r\n");
+        }
     }
 
     ls_scpy(task->exe_path, resolved, sizeof(task->exe_path));
@@ -5774,7 +7185,7 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
         __asm__ __volatile__("wrmsr" : : "c"(MSR_FS_BASE), "a"(0u), "d"(0u));
         task->fs_base = 0;
     }
-    Scheduler::SaveUserFrame(task, current_syscall_frame);
+    Scheduler::SaveUserFrame(task, current_syscall_frame, 8);   // site 8 = execve entry (satoru)
     current_frame_rewritten = true;
     return 0;
 }
@@ -5897,7 +7308,7 @@ int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t e
         __asm__ __volatile__("wrmsr" : : "c"(MSR_FS_BASE), "a"(0u), "d"(0u));
         task->fs_base = 0;
     }
-    Scheduler::SaveUserFrame(task, current_syscall_frame);
+    Scheduler::SaveUserFrame(task, current_syscall_frame, 8);   // site 8 = execve entry (satoru)
     current_frame_rewritten = true;
 
     KernelVMM::DestroyAddressSpace(old_address_space);
@@ -5944,8 +7355,9 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                 if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
                 if (SMP::CpuIndex() == 0) {
                     LinuxNetBridge::PumpTick();            // drain the nic while we wait (satoru)
-                    KuronoShell::PumpUI(); Scheduler::SleepMs(1);
-                } else kls_relax();
+                    KuronoShell::PumpUI();
+                }
+                kls_relax_sleep_ms(1);   // breathe with the kls released (satoru)
                 return -11;   // re-issued by the caller's retry (satoru)
             }
             return r;
@@ -5961,8 +7373,8 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
             int r = UnixSocket::Recv(lfd->backend_fd, dst, (int)count, 0);
             if (r == -11 && !(lfd->flags & L_O_NONBLOCK)) {
                 if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
-                if (SMP::CpuIndex() == 0) { KuronoShell::PumpUI(); Scheduler::SleepMs(1); }
-                else kls_relax();
+                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                kls_relax_sleep_ms(1);   // the writer we wait on needs the kls (satoru)
                 return -11;   // re-issued by the caller's retry (satoru)
             }
             return r;
@@ -5986,10 +7398,10 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                 // restart nr 0 = x86_64 read (musl uses SYSCALL, so the frame
                 // re-executes as an amd64 read). (satoru)
                 if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
-                // no sibling to run: cooperative wait then re-scan (bsp pumps ui;
-                // an ap breathes on the kls lock). (satoru)
-                if (SMP::CpuIndex() == 0) { KuronoShell::PumpUI(); Scheduler::SleepMs(1); }
-                else kls_relax();
+                // no sibling to run: ui pump under the lock, then breathe with
+                // the kls RELEASED - the eventfd writer we wait on needs it. (satoru)
+                if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+                kls_relax_sleep_ms(1);
                 return -11;   // frame not rewritten: re-issued by the caller's retry (satoru)
             }
             if (v == 0) return -11;   // O_NONBLOCK - genuine eagain (satoru)
@@ -6023,8 +7435,41 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
         }
 
         case LFD_DEVNULL:
-        case LFD_SIGNALFD:   // signalfd never delivers - reads as empty (satoru)
             return 0;
+
+        // signalfd read: drain the pending signals matching this fd's watch mask
+        // into signalfd_siginfo records (128 bytes each). EAGAIN when none pending.
+        // draining consumes the pending bit so it is not also handler-delivered
+        // (these are meant to be blocked signals). (satoru)
+        case LFD_SIGNALFD: {
+            if (count < 128) return -22;   // -EINVAL: buffer too small (satoru)
+            uint64_t mask = lfd->offset;
+            uint64_t avail = p->sig_pending & mask;
+            if (avail == 0) return -11;    // -EAGAIN (satoru)
+            uint64_t maxrec = count / 128;
+            int64_t written = 0;
+            uint8_t rec[128];
+            for (int sig = 1; sig < 64 && (uint64_t)(written / 128) < maxrec; sig++) {
+                if (!(avail & (1ull << sig))) continue;
+                memset(rec, 0, sizeof(rec));
+                *(uint32_t*)&rec[0] = (uint32_t)sig;   // ssi_signo (satoru)
+                memcpy((uint8_t*)dst + written, rec, 128);
+                __atomic_and_fetch(&p->sig_pending, ~(1ull << sig), __ATOMIC_SEQ_CST);
+                written += 128;
+            }
+            return (int32_t)written;
+        }
+
+        case LFD_DEVURANDOM: {
+            // /dev/urandom + /dev/random: fill from the chacha20 crng (the same
+            // source as getrandom(2)). always returns `count` bytes - urandom
+            // never blocks, and even /dev/random is non-blocking on modern linux
+            // once the pool is seeded. this is what lets NSS softoken seed its
+            // rng and finish C_Initialize. (satoru)
+            if (count == 0) return 0;
+            int64_t n = LinuxSyscall::GetRandomBytes(dst, count);
+            return (int32_t)n;
+        }
 
         case LFD_PROC: {
             // /proc virtual files generated on demand from live process state
@@ -6330,6 +7775,7 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
 
         case LFD_DEVNULL:
         case LFD_SIGNALFD:   // writes to a signalfd are meaningless; swallow (satoru)
+        case LFD_DEVURANDOM: // writing entropy to /dev/(u)random succeeds on linux (satoru)
             return (int32_t)count;
 
         default:
@@ -6413,6 +7859,19 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
         return lfd_idx;
     }
 
+    // /dev/urandom + /dev/random: reads return crypto-grade crng bytes. NSS
+    // softoken (FreeBL RNG_RNGInit) reads /dev/urandom to seed BEFORE it opens
+    // the cert/key DB; the KLS never wired these devices, so the open fell
+    // through to enoent, softoken's C_Initialize failed, NSS never inited, and
+    // firefox showed "doesn't know how to communicate with the server / Personal
+    // Security Manager" on every https load. (satoru)
+    if (ls_seq(resolved, "/system/dev/urandom") || ls_seq(resolved, "/dev/urandom") ||
+        ls_seq(resolved, "/system/dev/random")  || ls_seq(resolved, "/dev/random")) {
+        lfd->type = LFD_DEVURANDOM;
+        lfd->open = true;
+        return lfd_idx;
+    }
+
     // /proc/self/fd/N (or /proc/<pid>/fd/N): reopening an EXISTING fd by path.
     // firefox's shared-memory DupReadOnly() reopens its writable memfd this way
     // (O_RDONLY) to obtain the frozen read-only handle used by SharedStringMap /
@@ -6471,7 +7930,16 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
 
     if (flags & L_O_CREAT) {
         if (!KVFS::Exists(resolved)) {
-            KVFS::CreateFile(resolved, (uint16_t)(mode & 0777));
+            int crc = KVFS::CreateFile(resolved, (uint16_t)(mode & 0777));
+            // (satoru) TEMP [nsscr]: an O_CREAT that fails to create is invisible
+            // (falls through to enoent) - the prime cert9.db/key4.db suspect.
+            // remove before commit.
+            if (crc < 0 && p->pid >= 100 && p->pid < 140) {
+                SerialLogger::Log("[nsscr] pid="); SerialLogger::LogDec((int)p->pid);
+                SerialLogger::Log(" rc="); SerialLogger::LogDec(crc);
+                SerialLogger::Log(" "); SerialLogger::Log(resolved);
+                SerialLogger::Log("\r\n");
+            }
         }
     }
 
@@ -6494,7 +7962,28 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
             lfd->type = LFD_KVFS;
             lfd->backend_fd = kfd;
             lfd->open = true;
+            // (satoru) TEMP [nssok]: trace what nss/sqlite touches under the
+            // profile dir + /dev so the failing sibling call stands out.
+            // remove before commit.
+            if (p->pid >= 100 && p->pid < 140 &&
+                (probe_has(resolved, ".mozilla") || ls_starts(resolved, "/system/dev/"))) {
+                SerialLogger::Log("[nssok] pid="); SerialLogger::LogDec((int)p->pid);
+                SerialLogger::Log(" fd="); SerialLogger::LogDec(lfd_idx);
+                SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)flags);
+                SerialLogger::Log(" "); SerialLogger::Log(resolved);
+                SerialLogger::Log("\r\n");
+            }
             return lfd_idx;
+        }
+        // (satoru) TEMP [nsskv]: file EXISTS but KVFS::Open refused it (perms /
+        // handle table / is-dir) - that error is otherwise swallowed into enoent.
+        // remove before commit.
+        if (p->pid >= 100 && p->pid < 140) {
+            SerialLogger::Log("[nsskv] pid="); SerialLogger::LogDec((int)p->pid);
+            SerialLogger::Log(" kfd="); SerialLogger::LogDec(kfd);
+            SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)flags);
+            SerialLogger::Log(" "); SerialLogger::Log(resolved);
+            SerialLogger::Log("\r\n");
         }
     }
 
@@ -6520,6 +8009,16 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
         }
     }
 
+    // (satoru) TEMP [nssop]: the re-added open-fail probe (was [enoent], stripped
+    // in 89822b0) - log EVERY failed open for firefox pids with flags+mode so the
+    // nss/psm profile-db failure names its path. remove before commit.
+    if (p->pid >= 100 && p->pid < 140) {
+        SerialLogger::Log("[nssop] pid="); SerialLogger::LogDec((int)p->pid);
+        SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)flags);
+        SerialLogger::Log(" md="); SerialLogger::LogHex((uint32_t)mode);
+        SerialLogger::Log(" "); SerialLogger::Log(resolved);
+        SerialLogger::Log("\r\n");
+    }
     return -2;  // enoent
 }
 
@@ -6703,7 +8202,11 @@ int32_t LinuxSyscall::sys_fstat(int fd, uintptr_t statbuf) {
         return 0;
     }
 
-    if (lfd->type == LFD_DEVNULL) {
+    if (lfd->type == LFD_DEVNULL || lfd->type == LFD_DEVURANDOM ||
+        lfd->type == LFD_SIGNALFD || lfd->type == LFD_TIMERFD) {
+        // char device / anon-inode fd: a path-fallback stat would ENOENT (no
+        // kvfs node). signalfd/timerfd had read + poll wired but fstat fell
+        // through to the path lookup - the "/dev fd needs every surface" rule. (satoru)
         st->st_mode = 0020666;
         st->st_blksize = 4096;
         return 0;
@@ -6854,7 +8357,12 @@ int32_t LinuxSyscall::sys_fstat64(int fd, uintptr_t statbuf) {
 
     LinuxFd* lfd = &p->fds[fd];
 
-    if (lfd->type == LFD_CONSOLE || lfd->type == LFD_DEVNULL) {
+    if (lfd->type == LFD_CONSOLE || lfd->type == LFD_DEVNULL ||
+        lfd->type == LFD_DEVURANDOM || lfd->type == LFD_SIGNALFD ||
+        lfd->type == LFD_TIMERFD) {
+        // /dev/(u)random included: the path fallback below would ENOENT since
+        // the kvfs has no node for it - nss/softoken fstats the fd it seeds
+        // from. signalfd/timerfd are anon-inode fds with the same problem. (satoru)
         KStatInfo info;
         memset(&info, 0, sizeof(info));
         info.mode    = 0020666;   // S_IFCHR | rw-rw-rw-
@@ -7147,6 +8655,10 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
     // the timer re-scheduling the holder; no path re-enters sys_mmap under it. (satoru)
     SpinLockCpuGuard _mmap_guard(g_mmap_lock);
 
+    // phase-0 measurement: firefox mmap(PROT_EXEC) count (inert). (satoru)
+    bool ff_meas = ff_is_firefox(task);
+    if (ff_meas && (prot & LINUX_PROT_EXEC)) g_ff_mmap_exec_calls++;
+
     if (fd >= 0) {
         // (a) memfd / shared-memory objects: map the object's physical pages
         // straight into the caller so writes are shared (wl_shm pixel pools,
@@ -7169,6 +8681,14 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             if (!vbase) return -12;
             uint64_t pflags = page_flags_from_prot(prot);
             uint64_t phys0 = (uint64_t)(uintptr_t)shm->base + offset;
+            // phase-0: is firefox mapping a memfd executable, and is this a
+            // second (dual-map) view of one memfd? this is the disambiguator
+            // between a dual-map and mprotect-flip JIT. (satoru)
+            if (ff_meas) {
+                bool xbit = (prot & LINUX_PROT_EXEC) != 0;
+                if (xbit) g_ff_memfd_exec_maps++;
+                ff_note_memfd_map((uint64_t)(uintptr_t)shm->base, xbit);
+            }
             for (uint64_t o = 0; o < msize; o += PAGE_SIZE) {
                 if (!KernelVMM::MapPageInAddressSpace(task->address_space,
                                                       vbase + o, phys0 + o, pflags)) {
@@ -7203,7 +8723,18 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
         LinuxFd* lfd = (fd < LINUX_MAX_FDS) ? &proc->fds[fd] : nullptr;
         if (lfd && lfd->open && lfd->type == LFD_KVFS) {
             KVFSNode* node = KVFS::Resolve(lfd->path);
-            if (!node || node->is_dir()) return -13;          // eacces
+            if (!node || node->is_dir()) {
+                // (satoru) TEMP [nssmm]: fd-backed map refused (stale path /
+                // dir) - sqlite maps the db when mmap_size is set. remove
+                // before commit.
+                if (proc->pid >= 100 && proc->pid < 140) {
+                    SerialLogger::Log("[nssmm] pid="); SerialLogger::LogDec((int)proc->pid);
+                    SerialLogger::Log(" fd="); SerialLogger::LogDec(fd);
+                    SerialLogger::Log(" resolve-fail ");
+                    SerialLogger::Log(lfd->path); SerialLogger::Log("\r\n");
+                }
+                return -13;          // eacces
+            }
             const uint8_t* content = node->content;
             uint32_t fsize = node->size;
             uint64_t msize = align_up_u64(length, PAGE_SIZE);
@@ -7226,9 +8757,9 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             bool active = (Scheduler::GetCurrentProcess() == task);
             for (uint64_t o = 0; o < msize; o += PAGE_SIZE) {
                 uint64_t va = vbase + o;
+                uint64_t old = 0;
                 if (fixed) {
-                    uint64_t old = KernelVMM::QueryMappingInAddressSpace(task->address_space, va);
-                    if (old) user_frame_quarantine(old);   // stale-tlb-safe (smp) (satoru)
+                    old = KernelVMM::QueryMappingInAddressSpace(task->address_space, va);
                 }
                 void* pg = PMM::AllocBytes(PAGE_SIZE);
                 if (!pg) return -12;
@@ -7245,6 +8776,10 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                     PMM::FreeBytes(pg, PAGE_SIZE);
                     return -12;
                 }
+                // quarantine the displaced frame only AFTER its pte is actually
+                // replaced - stamping before the replace let a flush that
+                // started in the gap count as proof (reviewer finding). (satoru)
+                if (old) user_frame_quarantine(old);
                 if (active) KernelVMM::InvalidatePage(va);
             }
             // a fixed overlay sits inside an already-tracked reservation; only
@@ -7260,6 +8795,16 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             return (int64_t)vbase;
         }
 
+        // (satoru) TEMP [nssmm]: an mmap on a non-kvfs non-memfd fd (ext4? proc?)
+        // fails -ENOSYS here - name the fd type. remove before commit.
+        if (proc->pid >= 100 && proc->pid < 140) {
+            SerialLogger::Log("[nssmm] pid="); SerialLogger::LogDec((int)proc->pid);
+            SerialLogger::Log(" fd="); SerialLogger::LogDec(fd);
+            SerialLogger::Log(" type="); SerialLogger::LogDec(lfd ? (int)lfd->type : -1);
+            SerialLogger::Log(" unmappable ");
+            SerialLogger::Log((lfd && lfd->open) ? lfd->path : "?");
+            SerialLogger::Log("\r\n");
+        }
         return -38;   // other fd types are not mmappable
     }
 
@@ -7293,7 +8838,6 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             for (uint64_t o = 0; o < size; o += PAGE_SIZE) {
                 uint64_t va = fbase + o;
                 uint64_t old = KernelVMM::QueryMappingInAddressSpace(task->address_space, va);
-                if (old) user_frame_quarantine(old);   // stale-tlb-safe (smp) (satoru)
                 void* pg = PMM::AllocBytes(PAGE_SIZE);
                 if (!pg) return -12;
                 memset(pg, 0, PAGE_SIZE);
@@ -7302,6 +8846,9 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                     PMM::FreeBytes(pg, PAGE_SIZE);
                     return -12;
                 }
+                // quarantine only after the pte is replaced (reviewer finding:
+                // a pre-replace stamp let an in-gap flush count as proof). (satoru)
+                if (old) user_frame_quarantine(old);
                 if (active) KernelVMM::InvalidatePage(va);
             }
             // if no existing region covers the fixed range, track it so munmap and
@@ -7397,15 +8944,36 @@ int32_t LinuxSyscall::sys_munmap(uintptr_t addr, uint64_t length) {
 // memory. non-demand-zero mappings (elf text/data) are skipped: zeroing those on
 // refault would destroy code/initialized data. other advice stays a hint we ignore. (satoru)
 int32_t LinuxSyscall::sys_madvise(uintptr_t addr, uint64_t length, uint32_t advice) {
-    if (advice != LINUX_MADV_DONTNEED && advice != LINUX_MADV_FREE) return 0;
+    // (satoru) MADV_FREE and MADV_DONTNEED are NOT interchangeable, and conflating
+    // them corrupted firefox. MADV_DONTNEED = discard NOW; the caller expects the
+    // next read to return zero. MADV_FREE = the kernel MAY reclaim later, but the
+    // data MUST survive until then and the first write cancels the free - the caller
+    // (mozjemalloc, which uses MADV_FREE as its primary decommit) reuses those pages
+    // WITHOUT re-zeroing and relies on their contents staying intact. treating
+    // MADV_FREE as DONTNEED (free + refault-zero) silently wiped jemalloc's live
+    // arena metadata on reuse -> wild allocations -> a crossbeam channel pointer
+    // came back as stale/garbage (0, 10, 10^9 ns) and the SW-WebRender render thread
+    // #PF'd in Receiver::recv, so the window never painted. honour DONTNEED (real
+    // discard) but make FREE a data-preserving no-op (we have no swap, so "reclaim
+    // later" just never happens - rss-accurate enough, correctness first). (satoru)
+    if (advice != LINUX_MADV_DONTNEED) return 0;
     if (length == 0) return 0;
+    // linux abi: addr MUST be page-aligned - do_madvise returns EINVAL
+    // otherwise (mm/madvise.c). the old align-DOWN silently extended the
+    // discard up to 4095 bytes BELOW the requested range, eating live
+    // neighbor data: recently-written allocations read back as zeros (a
+    // fresh webrender thread's entry closure and the fontlist shm pointer
+    // both nulled in the same millisecond, 6ms after a thread-init madvise
+    // - the ~35s double-null crash class). length still rounds UP, exactly
+    // like linux. (satoru)
+    if (addr & (PAGE_SIZE - 1)) return -22;   // -EINVAL (satoru)
 
     LinuxProcess* proc = Current();
     Process* task = proc ? proc->task : nullptr;
     if (!task || !task->is_user()) return 0;
     task = region_owner(task);   // regions live on the thread-group leader (satoru)
 
-    uint64_t start = align_down_u64(addr, PAGE_SIZE);
+    uint64_t start = addr;
     uint64_t end = align_up_u64((uint64_t)addr + length, PAGE_SIZE);
     if (end <= start) return 0;
 
@@ -7467,6 +9035,13 @@ int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t pro
 
     uint64_t new_flags = page_flags_from_prot(prot);
 
+    // phase-0 measurement: time firefox RW->RX flips (prot = R+X, executable and
+    // non-writable = the classic W^X JIT protect). a large count with big
+    // flush_ms is the mprotect-flip-storm signature; ~0 means firefox dual-maps
+    // instead. inert. (satoru)
+    bool ff_rx = ff_is_firefox(task) && (prot & LINUX_PROT_EXEC) && !(prot & LINUX_PROT_WRITE);
+    uint64_t ff_rx_t0 = ff_rx ? Timer::GetRealMs64() : 0;
+
     // step 1: bring the region table in line so demand-zero pages that have not
     // faulted in yet get the new protection on first touch. for each active
     // region overlapping [start,end) we split off the covered span and stamp it
@@ -7524,16 +9099,28 @@ int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t pro
     // flags updated above. collect whether anything changed so we can flush. (satoru)
     bool active_cr3 = (Scheduler::GetCurrentProcess() == task);
     bool mapped_any = false;
+    uint64_t ff_rx_pages = 0;
     for (uint64_t page = start; page < end; page += PAGE_SIZE) {
         if (KernelVMM::ProtectPageInAddressSpace(task->address_space, page, new_flags)) {
             mapped_any = true;
+            ff_rx_pages++;
             if (active_cr3) KernelVMM::InvalidatePage(page);
         }
     }
     // smp: flush stale translations on the other cores running this address
     // space's sibling threads (a page just flipped ro/nx must not stay writable
     // in another core's tlb). no-op with one online cpu. (satoru)
-    if (mapped_any) SMP::BroadcastTlbFlush();
+    if (mapped_any) {
+        uint64_t ff_flush_t0 = ff_rx ? Timer::GetRealMs64() : 0;
+        SMP::BroadcastTlbFlush();
+        if (ff_rx) g_ff_mprot_flush_ms += Timer::GetRealMs64() - ff_flush_t0;
+    }
+    // phase-0: account this firefox RW->RX flip (count + pages + total ms). (satoru)
+    if (ff_rx) {
+        g_ff_mprot_rx_calls++;
+        g_ff_mprot_rx_pages += ff_rx_pages;
+        g_ff_mprot_rx_ms += Timer::GetRealMs64() - ff_rx_t0;
+    }
 
     // linux returns 0 even when the range has no backing region yet (a fresh
     // demand-zero mmap region still counts). it ALSO succeeds for a range that
@@ -7566,6 +9153,70 @@ int32_t LinuxSyscall::sys_nanosleep(uintptr_t req, uintptr_t rem) {
                 HAL::WaitForInterrupt();
             }
         }
+    }
+    return 0;
+}
+
+// task 17: the x64 sleep. the old route ({35,162} table entry -> sys_nanosleep)
+// parsed the amd64 timespec as TWO 32-bit fields, so tv_nsec actually read the
+// HIGH half of the 64-bit tv_sec (~always 0) and every sub-second sleep became
+// ms=0 = an instant return -> firefox's backoff/poll sleep loops turned into a
+// 10k/s syscall spin-storm that burned the cores ([ffcount] top=35). and even a
+// correct ms busy-HELD the core for the whole sleep. this entry parses the real
+// 64-bit timespec and truly DESCHEDULES: Blocked + sleep_ticks (the deferred-
+// tick promotion in PromoteDeferredWakes re-readies it), switch to another
+// thread or - on an ap with no successor - park the core exactly like the futex
+// park (same re-verify + release protocol). kls-EXEMPT (see
+// syscall_x64_kls_exempt): parking with the kls held would strand this cpu's
+// recursive depth and deadlock every other core. bsp/leader fall back to the
+// old cooperative busy-wait. (satoru)
+int32_t LinuxSyscall::SleepMs64(uint64_t ms) {
+    if (ms == 0) return 0;
+    if (ms > 5000) ms = 5000;   // keep the historical cap (satoru)
+    Process* task = Scheduler::GetCurrentProcess();
+    if (task && task->is_user() && current_syscall_frame) {
+        uint64_t sf; Scheduler::StateLock(&sf);
+        task->state = Process_Blocked;
+        task->sleep_ticks = (uint32_t)ms;   // promotion re-readies at 0 (satoru)
+        Scheduler::StateUnlock(sf);
+        task->user_frame.rax = 0;           // resume value of nanosleep (satoru)
+        if (switch_to_ready_user(current_syscall_frame)) return 0;
+        if (SMP::CpuIndex() != 0 && task->is_thread()) {
+            // same commit protocol as the futex park: only park if still
+            // Blocked (a promotion may have raced us back to Ready/Running). (satoru)
+            bool park_ok = false;
+            {
+                uint64_t sf2; Scheduler::StateLock(&sf2);
+                if (__atomic_load_n((int*)&task->state, __ATOMIC_RELAXED) ==
+                    (int)Process_Blocked) {
+                    task->last_run_cpu = (uint8_t)SMP::CpuIndex();
+                    task->released_ms  = Scheduler::NowMs();
+                    park_ok = true;
+                }
+                Scheduler::StateUnlock(sf2);
+            }
+            if (park_ok) {
+                __atomic_store_n(&task->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                SMP::ApIdleFrame(current_syscall_frame);
+                current_frame_rewritten = true;
+                return 0;
+            }
+        }
+        // bsp / leader / raced: resume running, fall through to the busy-wait. (satoru)
+        {
+            uint64_t sf3; Scheduler::StateLock(&sf3);
+            task->state = Process_Running;
+            task->sleep_ticks = 0;
+            Scheduler::StateUnlock(sf3);
+        }
+    }
+    // cooperative fallback (bsp): pump ui + hlt until elapsed. kls is NOT held
+    // here (exempt syscall); kls_relax tolerates the not-held case. (satoru)
+    uint32_t start = Time::GetTicks();
+    while ((Time::GetTicks() - start) < ms) {
+        if (SMP::CpuIndex() == 0) KuronoShell::PumpUI();
+        kls_relax();
+        HAL::WaitForInterrupt();
     }
     return 0;
 }
@@ -7633,11 +9284,31 @@ int32_t LinuxSyscall::sys_getdents64(int fd, uintptr_t dirp, uint64_t count) {
 }
 
 int32_t LinuxSyscall::sys_clock_gettime(uint32_t clk_id, uintptr_t tp) {
+    // phase-0 vdso proof: count firefox clock_gettime SYSCALLS. with the
+    // userspace vdso clock working, this should stay near-zero (only the
+    // cputime-clock fallbacks) - the CLOCK_MONOTONIC/REALTIME convoy is served
+    // in userspace with no syscall. surfaced in [ffcount] as clk=. (satoru)
+    if (ff_is_firefox(Scheduler::GetCurrentProcess())) g_ff_clock_syscalls++;
     // x86_64 struct timespec is { long tv_sec; long tv_nsec; } = 16 bytes;
     // both fields are 8 bytes. the old code wrote a 32-bit pair (8 bytes total)
     // which under-fills the user buffer on the x64 path. (satoru)
     struct timespec64 { int64_t tv_sec; int64_t tv_nsec; };
     if (!tp) return -14;        // -EFAULT
+    // validate the 16-byte timespec is MAPPED in the caller's own address
+    // space before the raw write - a torn tp (garbage arg register from a
+    // mixed frame) then wrote timespec-shaped values into a wild address, and
+    // an UNMAPPED tp was an uncontained KERNEL #PF -> #GP panic. one page walk
+    // (both fields share a page for any 8-aligned tp; check the +8 page too for
+    // an unaligned tp that straddles). under kls_lock the mapping can't change
+    // before the write, so validate-then-write is race-free. keeps the raw
+    // write fast on this hot syscall. (satoru)
+    Process* task = Scheduler::GetCurrentProcess();
+    if (!task || !task->is_user()) return -14;
+    if (!KernelVMM::QueryMappingInAddressSpace(task->address_space, tp & ~0xFFFULL))
+        return -14;
+    if (((tp + 15) & ~0xFFFULL) != (tp & ~0xFFFULL) &&
+        !KernelVMM::QueryMappingInAddressSpace(task->address_space, (tp + 15) & ~0xFFFULL))
+        return -14;
     timespec64* ts = (timespec64*)tp;
 
     // CLOCK_REALTIME(0) / CLOCK_REALTIME_COARSE(5): wall-clock. source the
