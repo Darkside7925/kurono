@@ -9002,10 +9002,11 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                                    : choose_mmap_base(task, addr, msize);
             if (!vbase) return -12;
             // (satoru) [libmap] logs each .so BASE map (offset-0, name + base) to
-            // symbolize a stalled/faulting rip against the lib. task 22:
-            // RE-ENABLED for every offset-0 map >64KB - the late-stall [wstk]
-            // return addresses need libxul's and every dso's base.
-            if (offset == 0 && msize > 0x10000) {
+            // symbolize a stalled/faulting rip against the lib. GATED OFF again
+            // (task 22c): 110 lines by t=18s = ~1s of uart busy-wait injected
+            // into the startup lottery window - a measurable perturbation. flip
+            // on only for a symbolization hunt, never for a measured batch.
+            if (false && offset == 0 && msize > 0x10000) {
                 SerialLogger::Log("[libmap] "); SerialLogger::Log(lfd->path);
                 SerialLogger::Log(" @"); SerialLogger::LogHex((uint32_t)(vbase >> 32));
                 SerialLogger::Log(":"); SerialLogger::LogHex((uint32_t)(vbase & 0xFFFFFFFFu));
