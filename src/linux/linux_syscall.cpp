@@ -2655,7 +2655,17 @@ static void futex_sweep_timeouts() {
             w->task->user_frame.rax = w->repoll ? 0 : (uint64_t)(int64_t)(-110);
             // atomic Blocked->Ready (see wake_blocked_to_ready): immediate, and
             // it no-ops harmlessly if the task is already runnable. (satoru)
-            if (wake_blocked_to_ready(w->task)) w->task->sleep_ticks = 0;
+            if (wake_blocked_to_ready(w->task)) {
+                w->task->sleep_ticks = 0;
+                // TASK 23b - price the idle cycle: a repoll/timeout SELF-wake
+                // costs the cycler one vruntime unit (its wake+retest+repark
+                // burns ~0.1-1ms it is never tick-charged for). a 100/s idle
+                // cycler now pays ~100/s instead of riding at frozen-low
+                // vruntime and out-picking a compute thread forever (the
+                // stranded-leader starve). REAL wakes (futex_do_wake) stay
+                // free. (satoru)
+                if (w->task->sched_class == 0) w->task->vruntime += 1;
+            }
         }
         w->active = false;
         w->task   = nullptr;
