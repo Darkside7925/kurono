@@ -1249,6 +1249,10 @@ void Scheduler::PromoteDeferredWakes() {
             if (--p->sleep_ticks == 0) {
                 p->state = Process_Ready;
                 if (p->interactive_score < 16) p->interactive_score += 2;
+                // task 23b: a deferred-tick SELF-wake (poll restart repoll,
+                // nanosleep park) prices its cycle - see the futex sweep's
+                // twin charge. real futex wakes stay free. (satoru)
+                if (p->is_user() && p->sched_class == 0) p->vruntime += 1;
             }
         }
         // (task 22c aging escalator REVERTED: it regressed the batch 2/5 -> 1/5,
