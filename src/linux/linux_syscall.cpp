@@ -3215,6 +3215,11 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr, uint64_t a0, uint64_t a1,
 // fresh parent, dispatch, then either write the result back or - if a handler
 // rewrote the frame (futex block / thread exit / clone) - leave it for the stub
 // to IRETQ into the next task. (satoru)
+// task 23f: kurono.madvlazy - zero DONTNEED pages in place (no free/remap) AND
+// spread threads to home aps. GLOBAL linkage (the anon-namespace helpers above
+// + kurono_kernel.cpp reference it via extern). default OFF (bsp-pile). (satoru)
+bool g_madv_lazy = false;
+
 extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     if (!frame) return;
 
@@ -4813,22 +4818,26 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // futex-wakes any joiner (pthread_join waits on exactly this). (satoru)
             if (flags & F_CHILD_CLEARTID) thread_task->clear_child_tid = ctid;
 
-            // setup complete - release the bsp pin so any core may run it. (satoru)
-            //
-            // TASK 23e finding (home-cpu assignment REVERTED, wedge 0/6): spreading
-            // fresh threads to home APs - even with NO cross-cpu resume - reopened
-            // the wedge. this PROVES the wedge is NOT migrate-and-replay but
-            // CROSS-CPU STORE VISIBILITY of firefox's userspace atomics: with every
-            // thread piled on the bsp (the pin default) the leader + its pool
-            // workers share ONE core, so a worker's glib-mutex UNLOCK store is
-            // always coherent with the leader's re-lock; the instant a worker runs
-            // on a different core, its unlock store is not observed by the spinning
-            // leader and the pool deadlocks. the real fix is a memory-coherency /
-            // barrier audit of the futex-wake + userspace-atomic path across cores
-            // (task 23), NOT scheduling - every placement/migration lever fails.
-            // hard pin (bsp-pile) is the wedge-free floor; its cost is load
-            // imbalance (paint-rate ceiling), recoverable only by that root fix. (satoru)
-            thread_task->cpu_affinity = 0;
+            // setup complete - release the bsp pin. by default (bsp-pile) a fresh
+            // thread's zero last_run_cpu keeps it on the bsp = wedge-free floor.
+            // under kurono.madvlazy (g_madv_lazy) spread it to a round-robin home
+            // AP: the paired lazy-madvise removes the remap that made cross-cpu
+            // stores go stale, so the spread should now be wedge-safe (task 23f). (satoru)
+            if (g_madv_lazy) {
+                static uint32_t s_home_rr = 0;
+                uint32_t online = SMP::OnlineCount();
+                if (online > 1) {
+                    uint32_t home = 1u + (__atomic_fetch_add(&s_home_rr, 1u, __ATOMIC_RELAXED)
+                                          % (online - 1));   // 1..online-1, skip bsp (satoru)
+                    if (home >= SMP_MAX_CPUS) home = 1;
+                    thread_task->cpu_affinity = (uint8_t)(1u << home);
+                    thread_task->last_run_cpu = (uint8_t)home;   // first run = home (satoru)
+                } else {
+                    thread_task->cpu_affinity = 0;
+                }
+            } else {
+                thread_task->cpu_affinity = 0;
+            }
 
             // CLONE_VFORK: suspend this parent until the child execve's or _exit's.
             // mirror the futex block - set our resume return value (the child tid),
@@ -9319,6 +9328,15 @@ int32_t LinuxSyscall::sys_madvise(uintptr_t addr, uint64_t length, uint32_t advi
     uint64_t end = align_up_u64((uint64_t)addr + length, PAGE_SIZE);
     if (end <= start) return 0;
 
+    // TASK 23f EXPERIMENT (kurono.madvlazy): make DONTNEED ZERO-IN-PLACE instead
+    // of free+remap. the free path unmaps the frame + shootdowns every peer; a
+    // MISSED shootdown leaves a storing core with a stale TLB pointing at the old
+    // frame, so a later userspace atomic store (a glib mutex unlock) lands in the
+    // dead frame and the reader on another core never sees it = the cross-cpu
+    // wedge. zeroing the SAME frame in place keeps DONTNEED's read-zero contract
+    // AND never remaps, so no shootdown is needed and no core can go stale. cost:
+    // rss is not reclaimed (no swap here anyway). gated so it can be a/b'd. (satoru)
+    extern bool g_madv_lazy;
     for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
         UserMemoryRegion* region = &task->regions[i];
         if (!region->active) continue;
@@ -9326,7 +9344,17 @@ int32_t LinuxSyscall::sys_madvise(uintptr_t addr, uint64_t length, uint32_t advi
         uint64_t os = start > region->start ? start : region->start;
         uint64_t oe = end < region->end ? end : region->end;
         if (os >= oe) continue;
-        unmap_user_range(task, os, oe);   // frees present frames; region stays -> refaults zero (satoru)
+        if (g_madv_lazy) {
+            // zero every PRESENT page in place via its phys mapping (low RAM is
+            // identity-mapped; higher user frames are reached through the phys
+            // window the vmm query returns). no unmap, no shootdown. (satoru)
+            for (uint64_t pg = os; pg < oe; pg += PAGE_SIZE) {
+                uint64_t ph = KernelVMM::QueryMappingInAddressSpace(task->address_space, pg);
+                if (ph) memset((void*)(uintptr_t)ph, 0, PAGE_SIZE);
+            }
+        } else {
+            unmap_user_range(task, os, oe);   // frees present frames; region stays -> refaults zero (satoru)
+        }
     }
     return 0;
 }

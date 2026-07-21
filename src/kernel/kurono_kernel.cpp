@@ -1076,6 +1076,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     bool boot_setup = false;
     bool boot_kmemx_off = false;  // kurono.kmemx=0 a/b kill switch (task 20) (satoru)
     bool boot_pincpu_off = false; // kurono.pincpu=0 disables the default pinning (task 21) (satoru)
+    bool boot_madvlazy = false;   // kurono.madvlazy=1 lazy-madvise + thread spread a/b (task 23f) (satoru)
     int  boot_setup_screen = 0;   // optional start screen for the setup wizard (satoru)
     char boot_cli_run[160];
     boot_cli_run[0] = 0;
@@ -1114,6 +1115,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // paint speedup); kurono.pincpu=0 restores migration for debugging. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.pincpu=0")) {
             boot_pincpu_off = true;
+        }
+        // task 23f: lazy madvise + thread spread a/b. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.madvlazy=1")) {
+            boot_madvlazy = true;
         }
         // latch the ffmpeg smoke-test flag early (see decl). (satoru)
         if (boot_has_token(boot_cmdline, "kurono.ffmpeg.test=1") || boot_has_token(boot_cmdline, "kurono.ffmpeg.test")) {
@@ -1336,6 +1341,11 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_pincpu_off) {
         Scheduler::SetPinCpu(false);
         SerialLogger::Log("[2c] cpu pinning DISABLED by cmdline (kurono.pincpu=0)\r\n");
+    }
+    if (boot_madvlazy) {
+        extern bool g_madv_lazy;
+        g_madv_lazy = true;
+        SerialLogger::Log("[2c] madvlazy + thread-spread ENABLED (kurono.madvlazy=1)\r\n");
     }
     vga_puts("Scheduler init...\n");
     SerialLogger::Log("[3] Scheduler::Init\r\n");
