@@ -7202,6 +7202,25 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
             Scheduler::MarkProcessExited(p->task, (int)code);
             wake_waiting_parent(p, current_index);
 
+            // TASK 23c - THE ENOMEM WALL: an exiting task-backed thread NEVER
+            // freed its LinuxProcess slot (only the no-task else-branch below
+            // did), so every one of the ~125+ short-lived pool threads of a
+            // churny boot leaked a procs[] slot until the 256-entry table
+            // filled, clone returned -12 ENOMEM, and firefox's thread-pool
+            // spawn retried forever (the residual kx5-freeze stall; the
+            // leader's [wstk] showed n=-12). reclaim CLONE_THREAD slots here:
+            // the join handshake is the ctid futex (already woken above), so
+            // nothing queries a thread's slot after this point. real PROCESSES
+            // keep the leak-until-waitpid semantics - their exit codes must
+            // survive for the parent's harvest. the shared CLONE_FILES fd
+            // table belongs to the leader and is NOT freed (CreateProcess
+            // allocates the reused slot a fresh one). kls serializes this
+            // against every concurrent CreateProcess. (satoru)
+            if (p->task->is_thread()) {
+                p->task = nullptr;
+                p->active = false;
+            }
+
             if (Userspace::IsActive() && current_syscall_frame) {
                 if (!switch_to_ready_user(current_syscall_frame)) {
                     if (SMP::CpuIndex() != 0) {
