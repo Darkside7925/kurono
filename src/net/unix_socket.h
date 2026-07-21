@@ -113,6 +113,7 @@ namespace UnixSocket {
     int  PendingBytes(int sd);
     int  PeerPendingBytes(int sd);       // TEMP diag: bytes in the peer's rx ring (satoru)
     bool HasPendingConnection(int sd);   // listen fd has a backlog conn -> POLLIN (satoru)
+    bool PeerClosed(int sd);             // connected peer has closed -> POLLHUP (satoru)
     int  KernelInject(int sd, const void* buf, int len);  // kernel→client
     // kernel→client with ancillary data (SCM_RIGHTS out of an in-kernel
     // server; the wl_keyboard.keymap fd path). (satoru)
