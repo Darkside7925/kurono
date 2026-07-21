@@ -1,5 +1,6 @@
 #include "unix_socket.h"
 #include "../drivers/serial.h"
+#include "../proc/scheduler.h"
 
 namespace {
 
@@ -261,6 +262,16 @@ int Connect(int sd, const char* path) {
     as.is_kernel_server = server.is_kernel_server;
     as.on_data          = server.on_data;
     as.user             = server.user;
+    // stamp the connector's identity on the server-side end so an in-kernel
+    // server (wayland) can resolve which process owns a client via
+    // GetPeerCred - connect runs in the connecting task's syscall context,
+    // so the current process IS the peer. (satoru)
+    {
+        Process* cur = Scheduler::GetCurrentProcess();
+        as.creds.pid = cur ? cur->pid : 0;
+        as.creds.uid = 1000;
+        as.creds.gid = 1000;
+    }
 
     Socket& cs = g_socks[sd];
     cs.connected = true;
@@ -471,6 +482,20 @@ int Shutdown(int sd, int how) {
     if (how == 0 || how == 2) g_socks[sd].shutdown_rd = true;
     if (how == 1 || how == 2) g_socks[sd].shutdown_wr = true;
     return 0;
+}
+
+// task 22: a stream socket/pipe end whose peer has CLOSED - Close() severed our
+// peer_sd (-1) and set shutdown_wr on us. POSIX poll must then report POLLHUP so
+// a reader waiting for data-or-eof wakes and reaps the connection instead of
+// polling forever (the glxtest child-pipe hang: firefox's parent polled the
+// exited glxtest's pipe with neither data nor HUP -> "ManageChildProcess poll
+// failed" + the StreamTransport retry storm). connected-then-severed only;
+// never-connected + listen fds are not hung up. buffered rx still drains first
+// (the caller keeps POLLIN while bytes remain). (satoru)
+bool PeerClosed(int sd) {
+    if (!valid(sd)) return false;
+    Socket& s = g_socks[sd];
+    return s.connected && s.peer_sd < 0;
 }
 
 int Retain(int sd) {

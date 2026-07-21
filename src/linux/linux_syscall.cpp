@@ -514,11 +514,15 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
             if (UnixSocket::PendingBytes(lfd->backend_fd) > 0 ||
                 UnixSocket::HasPendingConnection(lfd->backend_fd)) ready |= L_EPOLLIN;
             ready |= L_EPOLLOUT;   // our unix sockets never block on write (satoru)
+            // peer closed -> POLLHUP so a data-or-eof poller wakes + reaps the
+            // connection instead of polling forever (task 22). (satoru)
+            if (UnixSocket::PeerClosed(lfd->backend_fd)) ready |= L_EPOLLHUP;
             break;
         case LFD_PIPE:
             // pipes are socketpair-backed: same PendingBytes path (satoru)
             if (UnixSocket::PendingBytes(lfd->backend_fd) > 0) ready |= L_EPOLLIN;
             ready |= L_EPOLLOUT;
+            if (UnixSocket::PeerClosed(lfd->backend_fd)) ready |= L_EPOLLHUP;  // writer gone (satoru)
             break;
         case LFD_INET:
             // af_inet tcp/udp: the bridge's lock-free readiness (LNET_POLL*
