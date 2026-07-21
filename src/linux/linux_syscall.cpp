@@ -4814,6 +4814,20 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             if (flags & F_CHILD_CLEARTID) thread_task->clear_child_tid = ctid;
 
             // setup complete - release the bsp pin so any core may run it. (satoru)
+            //
+            // TASK 23e finding (home-cpu assignment REVERTED, wedge 0/6): spreading
+            // fresh threads to home APs - even with NO cross-cpu resume - reopened
+            // the wedge. this PROVES the wedge is NOT migrate-and-replay but
+            // CROSS-CPU STORE VISIBILITY of firefox's userspace atomics: with every
+            // thread piled on the bsp (the pin default) the leader + its pool
+            // workers share ONE core, so a worker's glib-mutex UNLOCK store is
+            // always coherent with the leader's re-lock; the instant a worker runs
+            // on a different core, its unlock store is not observed by the spinning
+            // leader and the pool deadlocks. the real fix is a memory-coherency /
+            // barrier audit of the futex-wake + userspace-atomic path across cores
+            // (task 23), NOT scheduling - every placement/migration lever fails.
+            // hard pin (bsp-pile) is the wedge-free floor; its cost is load
+            // imbalance (paint-rate ceiling), recoverable only by that root fix. (satoru)
             thread_task->cpu_affinity = 0;
 
             // CLONE_VFORK: suspend this parent until the child execve's or _exit's.
