@@ -2452,22 +2452,33 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         task->stk_canary_valid = 0;
         g_ftx_spur_noswitch++;                     // task 17b (satoru)
         g_ftx_spin_pid = task->pid; g_ftx_spin_uaddr = (uint64_t)uaddr;
-        // NOTE (task 17, batch-proven): do NOT pace this loop with a SleepMs
-        // donation. a 1ms-per-spurious sleep on the bsp took fresh-host paint
-        // from 1/3 to 0/4 - slowing the leader's retest cadence shifts the
-        // glib pool startup handshake against it. the hot spin is ugly but the
-        // relief valve already donates when Schedule truly starves. (satoru)
-        // TASK 23 - targeted spin pricing: a spurious cant-block WAIT is PURE
-        // burnt cpu (the caller re-tests and re-waits at ~8k/s), yet the
-        // per-switch vruntime charge never sees it (ring-0 ticks skip the
-        // preempt), so a spinner monopolized its cpu for FREE while a
-        // preempted mutex HOLDER with banked ring-3 vruntime waited 20+
-        // minutes of catchup = the eternal glib wedge. charge 1 unit per
-        // spurious return - only the spin pays (a blanket per-syscall charge
-        // taxed the startup-syscall-heavy leader and regressed 0/6), and an
-        // 8k/s spinner now pays ~8000/s so the holder wins the pick back in
-        // well under a second. (satoru)
-        if (task->sched_class == 0) task->vruntime += 1;
+        // TASK 23 - THE BSP IN-KERNEL FUTEX BLOCK (the wedge fix): an AP with no
+        // successor PARKS (above); the BSP cannot (it anchors the cooperative
+        // kernel), so historically it returned spurious and musl re-called
+        // futex_wait at ~9000/s = a ring-0 spin that starves the cooperative
+        // kernel AND never lets the mutex handoff converge (fspur 2.2M, the
+        // pre-KX2 wedge whenever threads spread off the bsp). instead, block
+        // IN-KERNEL like do_poll_wait: re-read *uaddr each ~1ms, running PumpUI +
+        // the cooperative scheduler (GUIProcess, the AP wakers) between checks,
+        // and return the instant the word CHANGES (the unlock the waiter is
+        // waiting for) - or after a bounded window so a genuinely lost wake
+        // still self-heals via the normal repoll. this is a TRUE block woken by
+        // the real value change, NOT the fixed-sleep pacing that regressed
+        // (that slept even when progress was available and returned to ring-3
+        // to re-syscall); here we never leave the kernel until the word moves.
+        // bsp only; futex is kls-exempt so no lock is held (SleepMs yields to
+        // the cooperative kernel safely). (satoru)
+        if (SMP::CpuIndex() == 0 && uphys) {
+            const volatile uint32_t* w = (const volatile uint32_t*)(uintptr_t)uphys;
+            // ~48ms cap (48 x 1ms): far longer than a converging handshake step,
+            // short enough that a truly lost wake heals promptly. (satoru)
+            for (int it = 0; it < 48; it++) {
+                if (*w != expected_val) break;        // the word moved - go re-test (satoru)
+                KuronoShell::PumpUI();                // keep the desktop + cursor alive (satoru)
+                Scheduler::SleepMs(1);                // yield to kernel procs + AP wakers (satoru)
+            }
+        }
+        if (task->sched_class == 0) task->vruntime += 1;   // spin pricing (satoru)
         return false;
     }
     return true;
