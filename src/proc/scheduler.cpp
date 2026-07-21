@@ -941,7 +941,12 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // migrated thread can lose its store, not just the sub-ms case. the wedge
     // stays dead only with zero migration. the paint-rate ceiling (load
     // imbalance of pinned handshake partners) must be recovered by the deep
-    // single-owner-state root fix (safe migration), not by relaxing the pin. (satoru)
+    // single-owner-state root fix (safe migration), not by relaxing the pin.
+    //
+    // (task 23d first-run placement REVERTED: letting a never-run thread be
+    // claimed by any cpu REOPENED the wedge 0/6 - even a fresh thread's first
+    // run on an ap exposes the migrate-and-replay corruption once it later
+    // blocks+resumes. bsp-piling is the price of the wedge-free state.) (satoru)
     if (g_pin_cpu) return false;
     // migration grace: a small window after a cpu releases a task before ANOTHER
     // cpu may resume it, on top of the on_cpu frame barrier above. NOTE
