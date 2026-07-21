@@ -2457,6 +2457,17 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         // from 1/3 to 0/4 - slowing the leader's retest cadence shifts the
         // glib pool startup handshake against it. the hot spin is ugly but the
         // relief valve already donates when Schedule truly starves. (satoru)
+        // TASK 23 - targeted spin pricing: a spurious cant-block WAIT is PURE
+        // burnt cpu (the caller re-tests and re-waits at ~8k/s), yet the
+        // per-switch vruntime charge never sees it (ring-0 ticks skip the
+        // preempt), so a spinner monopolized its cpu for FREE while a
+        // preempted mutex HOLDER with banked ring-3 vruntime waited 20+
+        // minutes of catchup = the eternal glib wedge. charge 1 unit per
+        // spurious return - only the spin pays (a blanket per-syscall charge
+        // taxed the startup-syscall-heavy leader and regressed 0/6), and an
+        // 8k/s spinner now pays ~8000/s so the holder wins the pick back in
+        // well under a second. (satoru)
+        if (task->sched_class == 0) task->vruntime += 1;
         return false;
     }
     return true;
@@ -3307,6 +3318,10 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
         Process* current = Scheduler::GetCurrentProcess();
         if (Userspace::IsActive() && current && current->is_user()) {
             Scheduler::SaveUserFrame(current, frame, 2);   // site 2 = syscall exit (satoru)
+            // (task 23: the blanket per-10-syscalls ring-0 charge REGRESSED the
+            // batch 0/6 - startup is syscall-heavy, so it taxed the LEADER
+            // hardest and inverted the imbalance. the targeted charge lives on
+            // the SPURIOUS-return path instead, see the futex fallback.) (satoru)
             // honest syscall-boundary signal delivery (see the int 0x80 path). the
             // x64 stub IRETQs from this frame, so a rewritten rip/rsp/rdi.. takes
             // effect on return. signal delivery touches the SHARED handler table
