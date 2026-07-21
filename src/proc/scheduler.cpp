@@ -911,6 +911,10 @@ static inline bool cpu_allowed(const Process* p, uint32_t cpu) {
 static bool g_pin_cpu = true;
 void Scheduler::SetPinCpu(bool on) { g_pin_cpu = on; }
 
+// cached pack-min vruntime, refreshed by every pick scan (racy by design -
+// a tick-stale min only loosens the vruntime clamps slightly). task 22b. (satoru)
+static volatile uint64_t g_pack_min_vr = 0;
+
 static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // cross-cpu resume guard. the SAME cpu can always re-pick its own task (it
     // can't race its own iretq). MITIGATION (2026-07-08): a genuine but
@@ -925,11 +929,20 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // fix is single-owner state (unify the futex-wake + scheduler state writes
     // under one lock / dequeue-on-block, per linux __schedule/ttwu). (satoru)
     if ((uint32_t)p->last_run_cpu == cpu) return true;
-    if (g_pin_cpu) return false;   // a/b: never resume on a different cpu (satoru)
     // frame-handoff barrier (the correctness fix): another cpu may resume p only
     // once its owning cpu RELEASE-stored on_cpu=0 (frame fully saved). ACQUIRE-load
     // pairs with that release -> never a half-saved user_frame -> no RIP=0x3/#PF. (satoru)
     if (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE) != 0) return false;
+    // HARD PINNING (task 22c): never resume on a different cpu. soft pinning (a
+    // 40ms migration window for aged-Ready threads, to rebalance the render
+    // handshake) was tried and REOPENED the glib mutex wedge (soft1 batch:
+    // pool-0 + pool-1 both stuck on one mutex, exp=cur=2, no holder = the
+    // leader's unlock store vanished) - proof that ANY cross-cpu resume of a
+    // migrated thread can lose its store, not just the sub-ms case. the wedge
+    // stays dead only with zero migration. the paint-rate ceiling (load
+    // imbalance of pinned handshake partners) must be recovered by the deep
+    // single-owner-state root fix (safe migration), not by relaxing the pin. (satoru)
+    if (g_pin_cpu) return false;
     // migration grace: a small window after a cpu releases a task before ANOTHER
     // cpu may resume it, on top of the on_cpu frame barrier above. NOTE
     // (2026-07-10): the boot-lottery STALL this grace was thought to "mask" was
@@ -994,8 +1007,14 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     };
     Process* best = nullptr;
     Process* fifo = nullptr;
+    uint64_t scan_min = ~0ull;   // pack-min refresh (task 22b) (satoru)
     for (Process* c = Scheduler::ready_queue; c; c = c->next) {
-        if (!c->is_user() || c->state != Process_Ready || !c->has_user_frame) continue;
+        if (!c->is_user()) continue;
+        // pack-min: track Ready AND Running cfs tasks regardless of this cpu's
+        // eligibility - the clamps compare against the whole pack. (satoru)
+        if ((c->state == Process_Ready || c->state == Process_Running) &&
+            c->sched_class == 0 && c->vruntime < scan_min) scan_min = c->vruntime;
+        if (c->state != Process_Ready || !c->has_user_frame) continue;
         if (!cpu_allowed(c, cpu)) continue;
         if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
         if (cg_throttled(c)) continue;               // cpu.max pool dry (satoru)
@@ -1006,6 +1025,8 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
         if (c->sched_class == 3) continue;                       // IDLE last
         if (!best || c->vruntime < best->vruntime) best = c;
     }
+    if (scan_min != ~0ull)
+        __atomic_store_n(&g_pack_min_vr, scan_min, __ATOMIC_RELAXED);
     if (fifo) return fifo;
     if (best) return best;
 
@@ -1064,7 +1085,7 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
             int nn = cur->nice; if (nn < -20) nn = -20; if (nn > 19) nn = 19;
             uint32_t ww = kNiceW[nn + 20];
             cur->vruntime += (1024u * 1024u) / (ww ? ww : 1);
-            cur->state = Process_Ready;
+            cur->state = Process_Ready;   // (task 22c: runner cap reverted, see NormalizeWakeVruntime) (satoru)
         }
         Process* cand = pick_next_user_nolock(cur, cpu);
         if (cand && cand != cur) {
@@ -1211,16 +1232,14 @@ void Scheduler::SetApFutexMaintHook(void (*fn)()) { g_ap_futex_maint = fn; }
 // from any wake path with or without g_sched_lock held; an imperfect min only
 // makes the clamp slightly loose, never wrong. (satoru)
 void Scheduler::NormalizeWakeVruntime(Process* p) {
-    if (!p) return;
-    uint64_t mn = ~0ull;
-    for (Process* c = ready_queue; c; c = c->next) {
-        if (!c->is_user() || c == p) continue;
-        int st = c->state;
-        if (st != (int)Process_Ready && st != (int)Process_Running) continue;
-        if (c->vruntime < mn) mn = c->vruntime;
-    }
-    if (mn == ~0ull) return;   // nobody else runnable (satoru)
-    if (p->vruntime > mn + 24) p->vruntime = mn + 24;
+    // task 22c: REVERTED to a no-op. BOTH clamp variants regressed the batch
+    // (one-sided fin1: the repoll herd woke at pack-min forever and preempted
+    // the compute-bound leader into a crawl; two-sided + runner cap fin2:
+    // still kx5-frozen) vs the clamp-free pin1 batch (2/5 paint at 16-18s).
+    // the stranded-READY starvation is handled by the aging escalator in
+    // PromoteDeferredWakes instead: a Ready-but-unpicked task decays toward
+    // the pack until it wins a pick - no wake-path coupling, no herd effects. (satoru)
+    (void)p;
 }
 
 void Scheduler::PromoteDeferredWakes() {
@@ -1230,9 +1249,12 @@ void Scheduler::PromoteDeferredWakes() {
             if (--p->sleep_ticks == 0) {
                 p->state = Process_Ready;
                 if (p->interactive_score < 16) p->interactive_score += 2;
-                NormalizeWakeVruntime(p);   // task 22 wake clamp (satoru)
             }
         }
+        // (task 22c aging escalator REVERTED: it regressed the batch 2/5 -> 1/5,
+        // same failure mode as the vruntime clamps - any continuous vruntime
+        // meddling perturbs the pick order and starves the running thread. the
+        // scheduler is left as the clean pin1 form.) (satoru)
     }
     g_sched_lock.UnlockIrqRestore(f);
 }
