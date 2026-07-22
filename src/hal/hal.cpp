@@ -144,6 +144,13 @@ void HAL::InitGDT() {
     }
     system_tss.rsp0 = (uint64_t)(uintptr_t)(privilege_stack + sizeof(privilege_stack));
     system_tss.ist1 = system_tss.rsp0;
+    // dedicated double-fault stack: a #DF caused by a bad/overflowed kernel rsp
+    // pushes its frame onto that same bad rsp when ist=0, so the handler never
+    // runs and the machine silently triple-faults (the unreported lottery
+    // boots). ist2 gives vector 8 a known-good stack so the raw fault report
+    // always makes it out. (satoru)
+    alignas(16) static uint8_t bsp_df_stack[8192];
+    system_tss.ist2 = (uint64_t)(uintptr_t)(bsp_df_stack + sizeof(bsp_df_stack));
     system_tss.iomap_base = sizeof(TSS64);
     BuildTSSDescriptor((uint64_t)(uintptr_t)&system_tss, sizeof(TSS64) - 1);
 
@@ -177,6 +184,8 @@ void HAL::InitGDT() {
 alignas(16) static GDTDescriptor ap_gdt[SMP_MAX_CPUS][GDT_ENTRY_COUNT];
 static TSS64 ap_tss[SMP_MAX_CPUS];
 alignas(16) static uint8_t ap_priv_stack[SMP_MAX_CPUS][16384];
+// per-ap double-fault stacks (ist2), mirroring the bsp's - see InitGDT. (satoru)
+alignas(16) static uint8_t ap_df_stack[SMP_MAX_CPUS][8192];
 
 void HAL::SetupAPCpuState() {
     uint32_t cpu = SMP::CpuIndex();
@@ -188,6 +197,7 @@ void HAL::SetupAPCpuState() {
     for (size_t i = 0; i < sizeof(TSS64); i++) ((uint8_t*)t)[i] = 0;
     t->rsp0 = (uint64_t)(uintptr_t)(ap_priv_stack[cpu] + sizeof(ap_priv_stack[cpu]));
     t->ist1 = t->rsp0;
+    t->ist2 = (uint64_t)(uintptr_t)(ap_df_stack[cpu] + sizeof(ap_df_stack[cpu]));
     t->iomap_base = sizeof(TSS64);
 
     // 16-byte tss descriptor into gdt slots 5,6 (same layout as BuildTSSDescriptor). (satoru)
@@ -415,6 +425,182 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             }
         }
 
+        // ---- raw fatal-fault dump, BEFORE any lock/buffer/mirror. ----
+        // the pretty dump below goes through SerialLogger (per-cpu line buffer +
+        // cross-core lock + RuntimeLog mirror) and g_exc_dump_lock; if the fault
+        // interrupted any of that machinery, or the dump path faults again, the
+        // report dies with the machine (observed: a boot whose serial ends mid
+        // "!!! EXCEPTION: Page Faul" and nothing after - the lottery boots were
+        // fatal faults whose reports never made it out). so first push the
+        // essentials to the uart with raw outb: no locks, no line buffer, no
+        // mirror, bounded tx wait. a nested fault during the dump raw-reports
+        // and parks the cpu instead of recursing into a silent triple fault. (satoru)
+        static volatile uint8_t s_exc_in_dump[SMP_MAX_CPUS] = {};
+        {
+            uint32_t mycpu = SMP::CpuIndex();
+            if (mycpu >= SMP_MAX_CPUS) mycpu = 0;
+            auto raw_putc = [](char ch) {
+                for (int t = 0; t < 100000; t++) {
+                    if (HAL::InByte(0x3F8 + 5) & 0x20) break;
+                }
+                HAL::OutByte(0x3F8, (uint8_t)ch);
+            };
+            auto raw_str = [&](const char* s) { while (*s) raw_putc(*s++); };
+            auto raw_hex = [&](uint64_t v) {
+                const char* hx = "0123456789ABCDEF";
+                raw_str("0x");
+                for (int i = 60; i >= 0; i -= 4) raw_putc(hx[(v >> i) & 0xF]);
+            };
+            if (s_exc_in_dump[mycpu]) {
+                // nested fault while dumping: report raw + park, never recurse. (satoru)
+                raw_str("\r\n[RAWEXC] NESTED vec="); raw_hex(vec);
+                raw_str(" rip="); raw_hex(frame->rip);
+                raw_str(" cr2="); raw_hex(frame->cr2);
+                raw_str(" cpu="); raw_hex(mycpu);
+                raw_str("\r\n");
+                // a parked cpu can never ack a tlb ipi - drop it from the online
+                // census or every later flush burns its 20ms timeout. and never
+                // park on a dead group's cr3 (reaper recycles its tables). (satoru)
+                SMP::LoadKernelCr3();
+                SMP::MarkSelfOffline();
+                for (;;) __asm__ __volatile__("cli; hlt");
+            }
+            s_exc_in_dump[mycpu] = 1;
+            raw_str("\r\n[RAWEXC] vec="); raw_hex(vec);
+            raw_str(" rip="); raw_hex(frame->rip);
+            raw_str(" err="); raw_hex(frame->error_code);
+            if (vec == 14) { raw_str(" cr2="); raw_hex(frame->cr2); }
+            raw_str(" cs="); raw_hex(frame->cs);
+            raw_str(" rsp="); raw_hex(frame->rsp);
+            raw_str(" cpu="); raw_hex(mycpu);
+            raw_str("\r\n");
+            // torn-frame forensics for the ring-3 crossbeam class: the callee-
+            // saved regs + which save path this thread RESUMED from + a window
+            // of its user stack. the stack reads go through the page-table walk
+            // (identity-mapped phys), NEVER a user-va deref - this raw path
+            // must not re-fault. cap 2 dumps per boot. (satoru)
+            if ((frame->cs & 3) == 3) {
+                static volatile uint32_t s_ff_dumps = 0;
+                if (s_ff_dumps < 2) {
+                    s_ff_dumps++;
+                    raw_str("[RAWEXC2] rbx="); raw_hex(frame->rbx);
+                    raw_str(" rbp="); raw_hex(frame->rbp);
+                    raw_str(" r15="); raw_hex(frame->r15);
+                    raw_str(" rax="); raw_hex(frame->rax);
+                    raw_str(" r12="); raw_hex(frame->r12);
+                    raw_str(" r13="); raw_hex(frame->r13);
+                    raw_str(" r14="); raw_hex(frame->r14);
+                    raw_str("\r\n");
+                    Process* ft = Scheduler::GetCurrentProcess();
+                    if (ft && ft->is_user()) {
+                        raw_str("[RAWEXC2] savesite="); raw_hex(ft->last_save_site);
+                        raw_str(" saveseq="); raw_hex(ft->save_seq);
+                        raw_str(" oncpu="); raw_hex(ft->on_cpu);
+                        raw_str(" lastcpu="); raw_hex(ft->last_run_cpu);
+                        raw_str("\r\n");
+                        uint64_t sbase = frame->rsp & ~7ULL;   // a torn rsp may be unaligned (satoru)
+                        // wrong-generation probe (agent rec #5): the PHYS frame
+                        // of the fault-rsp page - the join key against kmemx/
+                        // quarantine serial events for the lost-dirty-store
+                        // stale-restore hypothesis. (satoru)
+                        raw_str("[RAWEXC2] rspphys=");
+                        raw_hex(KernelVMM::QueryMappingInAddressSpace(
+                            ft->address_space, sbase & ~0xFFFULL));
+                        raw_str("\r\n");
+                        // qi from -16: the crossbeam fault fires INSTANTLY after
+                        // the epilogue pops, so [rsp-0x28] (closure saved-r12) and
+                        // [rsp-0x70] (wait_until saved-rbp) still hold what was
+                        // popped - the one-boot H3 discriminator (agent rec #1).
+                        // if [rsp-0x28]==0xA in MEMORY the spill slot itself was
+                        // corrupted; if it holds the correct TLS pointer, the
+                        // registers did not come from these pops. (satoru)
+                        for (int qi = -16; qi <= 13; qi++) {
+                            uint64_t va = sbase + (uint64_t)qi * 8;
+                            if ((va & 0xFFFULL) > 0xFF8ULL) continue;   // never straddle a page (satoru)
+                            uint64_t ph = KernelVMM::QueryMappingInAddressSpace(
+                                ft->address_space, va & ~0xFFFULL);
+                            raw_str("[RAWEXC2] stk+"); raw_hex((uint64_t)(qi * 8));
+                            raw_str("=");
+                            if (ph) raw_hex(*(volatile uint64_t*)(uintptr_t)
+                                            ((ph & ~0xFFFULL) | (va & 0xFFFULL)));
+                            else raw_str("unmapped");
+                            raw_str("\r\n");
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── CONTAIN A RING-3 FAULT NOW, before the pretty dump. ──────────────
+        // the pretty dump below dereferences the FAULTING process's user memory
+        // (its tcb + user stack) to diagnose. on a corrupt/mid-teardown address
+        // space - exactly the state firefox's jit null-deref leaves - those
+        // derefs FAULT AGAIN inside this handler -> #DF -> panic (the reload /
+        // search / new-tab reboot). a ring-3 fault must never take the kernel
+        // down, and we already have the essential info (the raw [RAWEXC] line
+        // above), so handle it here with ZERO further user-memory access. the
+        // raw [RAWEXC] already emitted; disarm the nested-dump guard and leave
+        // panic-raw off since we are surviving. (satoru)
+        if ((frame->cs & 3) == 3) {
+            { uint32_t mc = SMP::CpuIndex(); if (mc >= SMP_MAX_CPUS) mc = 0; s_exc_in_dump[mc] = 0; }
+            SerialLogger::Log("[usrflt] ring-3 fault contained (no os panic)\r\n");
+            // bsp: longjmp back to the RunProcessWithArgs launcher (SIGSEGV
+            // semantics). no-op + returns on an ap (no launcher context). (satoru)
+            Userspace::HandleProcessExit(139);
+            // ap fell through: kill the WHOLE faulting address-space group so no
+            // sibling resumes the bad jit code on another core, then PARK this
+            // cpu. the #PF ISR stub cannot cleanly task-switch (its epilogue
+            // restores the faulting regs), so we do NOT try - we just stop this
+            // core. the other cores + scheduler keep the os + desktop alive.
+            // lightweight kill: remove-from-ready + set-terminated only, no
+            // reap/quiesce/sleep - safe here since ring-3 held no kernel lock. (satoru)
+            {
+                Process* dead = Scheduler::GetCurrentProcess();
+                if (dead && dead->is_user()) {
+                    Process* grp[64];
+                    int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, 64);
+                    for (int i = 0; i < gn; i++) Scheduler::MarkProcessExited(grp[i], 139);
+                    if (gn == 0) { Scheduler::MarkProcessExited(dead, 139); grp[0] = dead; gn = 1; }
+                    Scheduler::SetCurrentForThisCpu(nullptr);
+                    // release this task's frame ownership: the normal release
+                    // store never runs on a parked cpu, and a stuck on_cpu=1
+                    // makes the deferred reaper's off-check fail forever. the
+                    // frame is dead (this cpu never resumes it). (satoru)
+                    __atomic_store_n(&dead->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                    // PIN this thread's kernel stack (leak it): this cpu parks
+                    // ON that stack (tss.rsp0), and with current cleared the
+                    // reaper sees the group quiesced and would free it - then
+                    // an NMI on the parked core pushes into recycled memory,
+                    // and the recycler's zeroing smashes whoever owns it next
+                    // (the rip=0x3 zeroed-kernel-frame class). 64k per
+                    // contained crash, the cpu is lost anyway. (satoru)
+                    dead->kernel_stack_top = 0;
+                    // do NOT QueueDeferredReap here: this runs INSIDE the #PF
+                    // handler on the ap, and taking g_reap_lock + writing the
+                    // shared table from that fragile context escalated a
+                    // contained crossbeam fault into a #DF -> panic (hg_r2).
+                    // the group is marked Terminated, so the futex sweep still
+                    // retires its waiter slots (state >= Terminated) - the leak
+                    // fix survives; only the struct/address-space reclaim is
+                    // skipped (the original, proven-safe leak). single stores
+                    // only past this point. (satoru)
+                }
+                SerialLogger::Log("[usrflt] group killed, cpu parked\r\n");
+                // drop from the online census: a parked cpu never acks tlb ipis,
+                // and counting it made every later flush time out at 20ms. park
+                // on the KERNEL root - the killed group's tables get reaped. (satoru)
+                SMP::LoadKernelCr3();
+                SMP::MarkSelfOffline();
+                for (;;) __asm__ __volatile__("cli; hlt");
+            }
+        }
+
+        // the whole pretty dump below runs in panic-raw serial mode: direct
+        // uart writes, no per-cpu line buffer, no cross-core serial lock, no
+        // RuntimeLog mirror. an observed lottery boot wedged the entire box
+        // here - this core blocked in the log machinery (irqs off) while a
+        // sibling core spun waiting for our tlb-shootdown ack. (satoru)
+        SerialLogger::SetPanicRaw(true);
         // serialize the whole dump so a fault on an application processor isn't
         // interleaved char-by-char with bsp serial output. unlocked before
         // HandleProcessExit (which longjmps and would never release it). user
@@ -524,7 +710,50 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         // still panics as before. (satoru -- task #24)
         if ((frame->cs & 3) == 3) {
             SerialLogger::Log("Terminating faulting user process (SIGSEGV).\r\n");
-            Userspace::HandleProcessExit(139);  // 128 + SIGSEGV; does not return
+            // the raw-dump nested guard stays armed through the pretty dump so a
+            // fault inside it parks with a report; this path survives (longjmp
+            // back to the launcher), so disarm for the next fault and restore
+            // normal buffered serial. (satoru)
+            { uint32_t mc = SMP::CpuIndex(); if (mc >= SMP_MAX_CPUS) mc = 0; s_exc_in_dump[mc] = 0; }
+            SerialLogger::SetPanicRaw(false);
+            Userspace::HandleProcessExit(139);  // 128 + SIGSEGV; longjmps on the bsp launcher
+            // still here = an AP-DISPATCHED user thread faulted: this cpu has no
+            // launcher longjmp context. a ring-3 fault must NEVER panic the whole
+            // kernel (observed: firefox's jit null-derefs on new-tab - cr2=0,
+            // rip in the 0x1800_xxx jit reservation - on cpu1-3). the #PF ISR
+            // STUB cannot cleanly switch tasks: its epilogue restores the
+            // faulting task's regs, so an earlier attempt to rewrite *frame +
+            // iretq into another task DOUBLE-FAULTED (the reboot the user hit).
+            // so instead: mark the WHOLE faulting address-space group terminated
+            // (lightweight - remove-from-ready + set state, no reap/quiesce/
+            // sleep, safe in this isr context since ring-3 held no kernel lock)
+            // so no sibling resumes the bad code on another core, then PARK this
+            // cpu. we lose one core until reboot but the other cores + scheduler
+            // keep the os + desktop alive - vastly better than a panic. the real
+            // cure is stopping the jit crash (baseline jit off in firefox.cfg). (satoru)
+            {
+                Process* dead = Scheduler::GetCurrentProcess();
+                if (dead && dead->is_user()) {
+                    Process* grp[64];
+                    int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, 64);
+                    for (int i = 0; i < gn; i++) Scheduler::MarkProcessExited(grp[i], 139);
+                    if (gn == 0) { Scheduler::MarkProcessExited(dead, 139); grp[0] = dead; gn = 1; }
+                    Scheduler::SetCurrentForThisCpu(nullptr);
+                    // frame release + offline census only - NOT QueueDeferredReap
+                    // (see the other ap park site: locking a shared table from
+                    // this #PF-handler context #DF'd). group stays Terminated ->
+                    // futex sweep still retires its slots. single stores. (satoru)
+                    __atomic_store_n(&dead->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                    // pin (leak) the stack this cpu parks on - see the usrflt
+                    // park site. (satoru)
+                    dead->kernel_stack_top = 0;
+                    SerialLogger::Log("[apfault] ring-3 fault contained: group killed, cpu parked\r\n");
+                    // park on the KERNEL root, not the killed group's cr3. (satoru)
+                    SMP::LoadKernelCr3();
+                    SMP::MarkSelfOffline();
+                    for (;;) __asm__ __volatile__("cli; hlt");
+                }
+            }
         }
         // kernel-mode fault diagnostic: dump cr3 + walk the page tables for cr2
         // so we can see whether the identity (or user) mapping is present in the
@@ -615,6 +844,11 @@ void HAL::InitIDT() {
     for (int i = 0; i < 48; i++) {
         idt_set(i, isr_stub_table[i]);
     }
+
+    // double fault on its own known-good stack (ist2, per-cpu in the tss). with
+    // ist=0 a #DF caused by a bad kernel rsp pushes onto that same bad rsp, the
+    // handler never runs, and the box silently triple-faults with no report. (satoru)
+    idt_set(8, isr_stub_table[8], 2, 0);
 
     // user-mode syscall trap gate (int 0x80).
     idt_set(0x80, (uint64_t)(uintptr_t)&isr_stub_128, 0, 3);
@@ -955,6 +1189,74 @@ static uintptr_t acpi_find_fadt() {
     }
     return 0;
 }
+
+// locate the dsdt from the fadt: DSDT (32-bit) at offset 40, or X_DSDT (64-bit)
+// at offset 140 on a long-enough fadt. returns 0 if neither resolves. (satoru)
+static uintptr_t acpi_find_dsdt(uintptr_t fadt) {
+    if (!fadt) return 0;
+    const AcpiSDTHeader* fh = (const AcpiSDTHeader*)fadt;
+    uint32_t dsdt32 = *(const uint32_t*)(fadt + 40);
+    if (dsdt32) return (uintptr_t)dsdt32;
+    if (fh->length >= 148) {
+        uint64_t x_dsdt = 0;
+        const uint8_t* src = (const uint8_t*)(fadt + 140);
+        uint8_t* dst = (uint8_t*)&x_dsdt;
+        for (int b = 0; b < 8; b++) dst[b] = src[b];
+        if (x_dsdt) return (uintptr_t)x_dsdt;
+    }
+    return 0;
+}
+
+// read one small AML integer element from an _Sx package: BytePrefix(0x0A)+byte,
+// ZeroOp(0x00), OneOp(0x01), or a bare byte. advances *pp past it. (satoru)
+static uint8_t aml_read_small_int(const uint8_t** pp) {
+    const uint8_t* p = *pp;
+    uint8_t op = *p++;
+    uint8_t v;
+    if      (op == 0x0A) { v = *p++; }   // BytePrefix (satoru)
+    else if (op == 0x00) { v = 0; }      // ZeroOp (satoru)
+    else if (op == 0x01) { v = 1; }      // OneOp (satoru)
+    else                 { v = op; }     // already the raw value (satoru)
+    *pp = p;
+    return v;
+}
+
+// scan the dsdt aml for Name(_S3, Package(){SLP_TYPa, SLP_TYPb, ...}) and extract
+// the two sleep-type values. this is the ACPICA-free pattern hobby kernels use:
+// no full aml interpreter, just a byte scan for the "_S3_" NameOp package. returns
+// true and fills *a/*b on success. (satoru)
+static bool acpi_parse_s3(uintptr_t dsdt, uint8_t* a, uint8_t* b) {
+    if (!dsdt) return false;
+    const AcpiSDTHeader* dh = (const AcpiSDTHeader*)dsdt;
+    if (!acpi_sig_eq(dh->signature, "DSDT")) return false;
+    uint32_t len = dh->length;
+    if (len < sizeof(AcpiSDTHeader) + 8) return false;
+    const uint8_t* start = (const uint8_t*)(dsdt + sizeof(AcpiSDTHeader));
+    const uint8_t* end   = (const uint8_t*)(dsdt + len);
+    for (const uint8_t* p = start; p + 8 < end; p++) {
+        if (!(p[0] == '_' && p[1] == 'S' && p[2] == '3' && p[3] == '_')) continue;
+        // must be a NameOp (0x08), optionally with a RootChar '\' before the name.
+        // (satoru)
+        bool is_name = (p > start && p[-1] == 0x08) ||
+                       (p > start + 1 && p[-1] == 0x5C && p[-2] == 0x08);
+        if (!is_name) continue;
+        const uint8_t* pkg = p + 4;
+        if (*pkg != 0x12) continue;          // PackageOp (satoru)
+        pkg++;
+        uint8_t lead = *pkg;                  // PkgLength encoding (satoru)
+        int nfollow = lead >> 6;
+        pkg += 1 + nfollow;                   // skip PkgLength bytes (satoru)
+        pkg++;                                // skip NumElements (satoru)
+        // two small-ints can consume up to 4 bytes (two BytePrefix pairs), so
+        // require all 4 in range - pkg+2 let a byteprefix pair read 1 byte past
+        // the dsdt end. (satoru)
+        if (pkg + 4 > end) return false;
+        *a = aml_read_small_int(&pkg);        // SLP_TYPa (satoru)
+        *b = aml_read_small_int(&pkg);        // SLP_TYPb (satoru)
+        return true;
+    }
+    return false;
+}
 }  // namespace
 
 bool HAL::Suspend() {
@@ -969,20 +1271,52 @@ bool HAL::Suspend() {
         return false;
     }
     uint32_t pm1a_cnt = *(const uint32_t*)(fadt + 64);
+    uint32_t pm1b_cnt = *(const uint32_t*)(fadt + 68);   // 0 if the platform has no PM1b (satoru)
     log_hex("HAL: FADT located, PM1a_CNT_BLK = ", pm1a_cnt);
 
-    // step 2 (blocked): the s3 sleep type written to pm1a_cnt (slp_typa,
-    // bits 10-12) is not stored in the fadt. it lives in the dsdt as the
-    // aml object \_s3, e.g. Name(_S3, Package(){5,5,0,0}). recovering it
-    // safely requires walking and decoding the dsdt's aml bytecode, which
-    // needs a real aml interpreter this kernel does not have. writing a
-    // guessed slp_typ (or skipping it) would either silently fail to sleep
-    // or, worse, trigger an undefined hardware transition. (satoru)
-    // TODO (satoru): requires ACPI FADT/DSDT parse for SLP_TYPx - decode the
-    // \_S3 AML package in the DSDT to obtain SLP_TYPa/SLP_TYPb before we can
-    // write (SLP_TYPa << 10) | SLP_EN to PM1a_CNT_BLK and enter S3.
-    SerialLogger::Log("HAL: Suspend aborted - SLP_TYP for S3 requires DSDT AML parse (not implemented)\r\n");
-    (void)pm1a_cnt;
+    // step 2 (implemented): the s3 sleep type (slp_typa/b, bits 10-12 of the pm1
+    // control register) is not in the fadt - it lives in the dsdt as the aml
+    // object \_S3, e.g. Name(_S3, Package(){SLP_TYPa, SLP_TYPb, 0, 0}). we scan
+    // the dsdt bytes for that "_S3_" NameOp package and pull the two bytes out
+    // (the ACPICA-free path hobby kernels use); no full aml interpreter. under
+    // qemu these values are the well-known SLP_TYP=1. (satoru)
+    uintptr_t dsdt = acpi_find_dsdt(fadt);
+    if (!dsdt) {
+        SerialLogger::Log("HAL: Suspend aborted - no DSDT reachable from the FADT\r\n");
+        return false;
+    }
+    uint8_t slp_typa = 0, slp_typb = 0;
+    if (!acpi_parse_s3(dsdt, &slp_typa, &slp_typb)) {
+        SerialLogger::Log("HAL: Suspend aborted - no \\_S3 package found in the DSDT\r\n");
+        return false;
+    }
+    if (!pm1a_cnt) {
+        SerialLogger::Log("HAL: Suspend aborted - FADT PM1a_CNT_BLK is null\r\n");
+        return false;
+    }
+    log_hex("HAL: S3 SLP_TYPa = ", slp_typa);
+    log_hex("HAL: S3 SLP_TYPb = ", slp_typb);
+
+    // step 3: quiesce (best effort) and enter S3 by writing (SLP_TYP << 10) |
+    // SLP_EN to the pm1 control register(s). SLP_EN is bit 13. we mask irqs first;
+    // a FULL device quiesce (stopping DMA engines, saving controller state) and a
+    // real resume-context restore are out of scope - on this kernel S3 wake is a
+    // FRESH BOOT (the firmware re-enters the bootloader), which is honest for a
+    // suspend that has no saved-state resume path yet. (satoru)
+    const uint16_t SLP_EN = (uint16_t)(1u << 13);
+    uint16_t val_a = (uint16_t)(((uint32_t)(slp_typa & 0x7) << 10) | SLP_EN);
+    SerialLogger::Log("HAL: entering S3 (wake = fresh boot; no resume-context restore)\r\n");
+    DisableInterrupts();
+    OutWord((uint16_t)pm1a_cnt, val_a);
+    if (pm1b_cnt) {
+        uint16_t val_b = (uint16_t)(((uint32_t)(slp_typb & 0x7) << 10) | SLP_EN);
+        OutWord((uint16_t)pm1b_cnt, val_b);
+    }
+    // spin briefly to give the transition time to take; if we are still executing
+    // after that, the sleep did not happen (e.g. the platform rejected it). (satoru)
+    for (volatile int i = 0; i < 1000000; i++) __asm__ __volatile__("pause");
+    EnableInterrupts();
+    SerialLogger::Log("HAL: Suspend - S3 transition did not take (platform rejected SLP_EN)\r\n");
     return false;
 }
 

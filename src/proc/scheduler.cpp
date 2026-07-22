@@ -624,7 +624,10 @@ void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame,
 
     // hash the callee-saved regs (stray-writer hunt): these must survive a
     // save/restore pair untouched, so a mismatch at LoadUserFrame proves a
-    // kernel stray-write into this heap-resident user_frame. (satoru)
+    // kernel stray-write into this heap-resident user_frame. NOT rip/rsp/rax:
+    // park sites legitimately rewind rip/rax on the saved frame AFTER the save
+    // (the restart-frame protocol), so folding those in would false-positive
+    // on every parked poll/futex. callee-saved only, by design. (satoru)
     proc->frame_csum = frame->rbx ^ (frame->rbp * 0x9E3779B97F4A7C15ull)
                      ^ (frame->r12 << 1) ^ (frame->r13 >> 1)
                      ^ (frame->r14 * 3) ^ (frame->r15 + 0xD1B54A32D192ED03ull);
@@ -823,16 +826,19 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
                     nv |= (uint64_t)now[q + b] << (b * 8);
                 }
                 if (ov == nv) continue;
-                // a REAL firefox userspace pointer is >= 0x180000000000 (libxul
-                // ~26TB, thread stacks ~47TB); state words like 0x2_00000000 sit
-                // far below that. the corruptor's signature is such a pointer
-                // becoming a TINY value (return addr -> 0x3, rbx ptr -> 0xA) or
-                // a high-half stomp (low 32 survive). that precisely excludes
-                // legit sync-word transitions. (satoru)
-                bool ov_ptr    = ov >= 0x180000000000ull;
+                // forensics-agent finding: the 0x180000000000 pointer floor made
+                // this tripwire BLIND to the boot layout firefox actually has -
+                // the crossbeam crash's victim values are a ~5.9TB stack/tls
+                // pointer (0x05653F...) and a heap ctx (0x34C0...), both below
+                // the old floor, so every hit was classified "legit" + dropped.
+                // a real pointer on this layout is anything >= 4GB (state words
+                // and counters live below 0x1_00000000); the halfstomp arm needs
+                // no floor at all (low-32 identical + high-32 changed is already
+                // a corruption signature, never a sync-word transition). (satoru)
+                bool ov_ptr    = ov >= 0x100000000ull;
                 bool nv_small  = nv < 0x1000ull;
                 bool halfstomp = (ov & 0xFFFFFFFFull) == (nv & 0xFFFFFFFFull) &&
-                                 (ov >> 32) != (nv >> 32) && ov >= 0x180000000000ull;
+                                 (ov >> 32) != (nv >> 32);
                 if (!((ov_ptr && nv_small) || halfstomp)) continue; // filter legit writes (satoru)
                 if (!corrupt) {
                     corrupt = true; s_canary_dumps++;
