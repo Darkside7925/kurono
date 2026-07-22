@@ -998,6 +998,22 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
 // fallback). a thread already Running on another core has state != Ready, so it
 // is skipped here; that, plus marking the winner Running under the SAME lock, is
 // what stops two cores grabbing one thread. (satoru)
+// task 25: directed wake-next hand-off. when a thread wakes another (futex_wake,
+// an fd readiness wakeup, a parent/child wake) and then blocks/reschedules, the
+// woken thread should run NEXT on this cpu - linux's wakeup baton-pass makes the
+// target run in ~33us; kurono otherwise leaves it Ready for the vruntime picker,
+// which on the cooperative bsp (where the whole thread group piles under hard
+// pin) can be many ms and hundreds of hops = the paint crawl. one-shot per cpu
+// (cleared on consume), and gated by all the normal eligibility checks, so it
+// only reorders a pick that was already legal - never a fairness hazard like the
+// (reverted) continuous vruntime clamps. (satoru)
+static Process* g_wake_next[SMP_MAX_CPUS] = {};
+void Scheduler::NoteWakeNext(Process* woken) {
+    if (!woken) return;
+    uint32_t c = SMP::CpuIndex();
+    if (c < SMP_MAX_CPUS) g_wake_next[c] = woken;
+}
+
 static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     if (!Scheduler::ready_queue) return nullptr;
     // cgroup cpu.max: skip a task whose bandwidth pool is exhausted until its
@@ -1010,6 +1026,19 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
         if (cg_now == 0) cg_now = Timer::GetRealMs64();
         return c->cgroup_throttle_until_ms > cg_now;
     };
+    // wake-next hand-off: if this cpu just woke a thread, run it now. (satoru)
+    if (cpu < SMP_MAX_CPUS) {
+        Process* wn = g_wake_next[cpu];
+        if (wn) {
+            g_wake_next[cpu] = nullptr;
+            if (wn != after && wn->is_user() && wn->state == Process_Ready &&
+                wn->has_user_frame && cpu_allowed(wn, cpu) &&
+                cross_run_grace_ok(wn, cpu) && !cg_throttled(wn) &&
+                wn->sched_class != 3) {
+                return wn;
+            }
+        }
+    }
     Process* best = nullptr;
     Process* fifo = nullptr;
     uint64_t scan_min = ~0ull;   // pack-min refresh (task 22b) (satoru)
