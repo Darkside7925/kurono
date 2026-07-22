@@ -470,4 +470,7 @@ public:
     // the runnable pack by at most one slice, never by its whole spin history.
     // lock-free racy scan; callable from any wake path. (satoru)
     static void NormalizeWakeVruntime(Process* p);
+    // task 25: directed wake-next hand-off - the thread this cpu just woke runs
+    // next on it (linux wakeup baton-pass). called from every wake site. (satoru)
+    static void NoteWakeNext(Process* woken);
 };

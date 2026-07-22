@@ -679,6 +679,32 @@ static void poll_unregister(Process* task) {
     for (int i = 0; i < POLL_REG_MAX; i++)
         if (g_pollreg[i].task == task) { g_pollreg[i].task = nullptr; return; }
 }
+// epoll variant: register from a raw fd list (the epoll instance's watch set),
+// so an epoll_pwait waiter (firefox's IPC I/O threads) is also woken the instant
+// a watched fd goes readable. same table + semantics as poll_register. (satoru)
+static void poll_register_fdlist(Process* task, LinuxProcess* p, const int* fds, int nfds) {
+    if (!task || !p || !fds) return;
+    SpinLockGuard g(g_pollreg_lock);
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < POLL_REG_MAX; i++) {
+        if (g_pollreg[i].task == task) { slot = i; break; }
+        if (!g_pollreg[i].task && free_slot < 0) free_slot = i;
+    }
+    if (slot < 0) slot = free_slot;
+    if (slot < 0) return;
+    PollReg* r = &g_pollreg[slot];
+    r->task = task; r->nkeys = 0; r->wildcard = false;
+    for (int i = 0; i < nfds; i++) {
+        if (fds[i] < 0) continue;
+        uint32_t k = poll_fd_key(p, fds[i]);
+        if (!k) continue;
+        if (r->nkeys >= 16) { r->wildcard = true; break; }
+        bool dup = false;
+        for (int j = 0; j < r->nkeys; j++) if (r->keys[j] == k) { dup = true; break; }
+        if (!dup) r->keys[r->nkeys++] = k;
+    }
+    if (r->nkeys == 0 && !r->wildcard) r->task = nullptr;
+}
 // a producer made object `key` readable: wake every poll waiter covering it.
 // same atomic Blocked->Ready + sleep_ticks=0 as PromoteDeferredWakes. (satoru)
 static void poll_wake_key(uint32_t key) {
@@ -2326,7 +2352,7 @@ static inline bool wake_blocked_to_ready(Process* t) {
     bool ok = __atomic_compare_exchange_n((int*)&t->state, &expect,
                                           (int)Process_Ready, false,
                                           __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
-    if (ok) Scheduler::NormalizeWakeVruntime(t);   // task 22 wake clamp (satoru)
+    if (ok) { Scheduler::NormalizeWakeVruntime(t); Scheduler::NoteWakeNext(t); }   // task 22/25 (satoru)
     return ok;
 }
 
@@ -2353,6 +2379,7 @@ static inline void wake_publish_ready(Process* t) {
     if (!t) return;
     Scheduler::NormalizeWakeVruntime(t);   // task 22 wake clamp, BEFORE pickable (satoru)
     __atomic_store_n((int*)&t->state, (int)Process_Ready, __ATOMIC_RELEASE);
+    Scheduler::NoteWakeNext(t);             // task 25 directed hand-off (satoru)
 }
 
 // task 17b diagnostic: list this address space's active futex waiters (pid,
@@ -5367,7 +5394,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                         n++;
                     }
                 }
-                if (n > 0) { p->poll_blocking = false; return n; }
+                if (n > 0) { p->poll_blocking = false; poll_unregister(p->task); return n; }
                 // [epw] probe: firefox epoll found NOTHING ready -> dump the watch set
                 // with each fd's type + interest + current readiness, so we can see
                 // the wedged IO/launcher thread's wakeup fd (a pipe/eventfd that
@@ -5389,17 +5416,26 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                         SerialLogger::Log("\r\n");
                     }
                 }
-                if (timeout == 0) { p->poll_blocking = false; return 0; }   // non-blocking pass (satoru)
+                if (timeout == 0) { p->poll_blocking = false; poll_unregister(p->task); return 0; }   // non-blocking (satoru)
                 uint64_t now = Time::GetTicks();
                 if (!p->poll_blocking) {                                    // first block: arm deadline (satoru)
                     p->poll_blocking    = true;
                     p->poll_deadline_ms = (timeout < 0) ? 0xFFFFFFFFFFFFFFFFULL
                                                         : now + (uint64_t)timeout;
                 }
-                if (now >= p->poll_deadline_ms) { p->poll_blocking = false; return 0; }  // timed out (satoru)
+                if (now >= p->poll_deadline_ms) { p->poll_blocking = false; poll_unregister(p->task); return 0; }  // timed out (satoru)
+                // task 25: register the epoll watch set so a producer wakes this
+                // waiter (the IPC I/O thread) when a watched fd goes readable. (satoru)
+                {
+                    int wfds[EPOLL_MAX_WATCH]; int wn = 0;
+                    for (int w = 0; w < EPOLL_MAX_WATCH; w++)
+                        if (es->watch[w].used) wfds[wn++] = es->watch[w].fd;
+                    poll_register_fdlist(p->task, p, wfds, wn);
+                }
                 // hand the cpu to a sibling user thread; re-issue epoll_wait (232) on
                 // wake (epoll_pwait shares the first four args, so 232 restarts both). (satoru)
                 if (poll_try_deschedule(p, 232)) return 0;   // switched; return ignored
+                poll_unregister(p->task);   // bsp in-place: not parked, drop the reg (satoru)
                 // no sibling: cooperative in-place wait -- bsp pumps ui + yields to
                 // kernel procs; an ap releases the kls lock and breathes. (satoru)
                 if (SMP::CpuIndex() == 0) {
