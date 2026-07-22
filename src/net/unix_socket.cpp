@@ -2,6 +2,10 @@
 #include "../drivers/serial.h"
 #include "../proc/scheduler.h"
 
+// task 25: file-scope (visible to both the anon-namespace ring writers and the
+// UnixSocket-namespace setter) proactive poll-wakeup hook. (satoru)
+static void (*g_data_ready_cb)(int sd) = nullptr;
+
 namespace {
 
 using namespace UnixSocket;
@@ -58,6 +62,11 @@ struct Socket {
 
 Socket g_socks[UNIX_MAX_SOCKETS];
 
+// task 25: proactive poll-readiness wakeup hook. the linux-syscall layer
+// registers a callback that wakes any poll/ppoll waiter parked on a socket sd
+// the instant data lands in that sd's rx ring - event-driven like linux's fd
+// wait-queue, instead of the poller's ~8ms sleep_ticks re-scan. fired with the
+// sd whose rx RECEIVED data (the reader's own sd). (satoru)
 int alloc_sd() {
     for (int i = 0; i < UNIX_MAX_SOCKETS; i++) {
         if (!g_socks[i].in_use) {
@@ -198,6 +207,10 @@ void Init() {
     SerialLogger::LogDec(UNIX_MAX_SOCKETS);
     SerialLogger::Log(" sd slots\r\n");
 }
+
+// task 25: expose the setter in the UnixSocket namespace (matches the header
+// decl); g_data_ready_cb is the file-scope static defined at the top. (satoru)
+void SetDataReadyHook(void (*cb)(int sd)) { g_data_ready_cb = cb; }
 
 int Create(SockType type) {
     int sd = alloc_sd();
@@ -411,6 +424,10 @@ static int send_core(int sd, const void* buf, int len, const ControlMsg& cm) {
         }
         g_pending_ctrl_valid[peer] = false;
     }
+    // task 25: a user peer's data now sits in its rx ring for it to poll/recv -
+    // wake any poll waiter parked on it NOW (a kernel-server peer drained
+    // synchronously above, so it has no poller to wake). (satoru)
+    if (w > 0 && !ps.is_kernel_server && g_data_ready_cb) g_data_ready_cb(peer);
     return w;
 }
 
@@ -597,9 +614,13 @@ int KernelInject(int sd, const void* buf, int len) {
     int peer = s.peer_sd;
     if (s.connected && valid(peer)) {
         Socket& ps = g_socks[peer];
-        return ring_write(ps.rx, (const uint8_t*)buf, len, nullptr, ps.type);
+        int w = ring_write(ps.rx, (const uint8_t*)buf, len, nullptr, ps.type);
+        if (w > 0 && g_data_ready_cb) g_data_ready_cb(peer);   // wake the client poller (satoru)
+        return w;
     }
-    return ring_write(s.rx, (const uint8_t*)buf, len, nullptr, s.type);
+    int w = ring_write(s.rx, (const uint8_t*)buf, len, nullptr, s.type);
+    if (w > 0 && g_data_ready_cb) g_data_ready_cb(sd);
+    return w;
 }
 
 // kernel→client with ancillary data: same peer routing as KernelInject but
@@ -612,9 +633,13 @@ int KernelInjectMsg(int sd, const void* buf, int len, const ControlMsg* cm) {
     int peer = s.peer_sd;
     if (s.connected && valid(peer)) {
         Socket& ps = g_socks[peer];
-        return ring_write(ps.rx, (const uint8_t*)buf, len, cm, ps.type);
+        int w = ring_write(ps.rx, (const uint8_t*)buf, len, cm, ps.type);
+        if (w > 0 && g_data_ready_cb) g_data_ready_cb(peer);   // wake the client poller (satoru)
+        return w;
     }
-    return ring_write(s.rx, (const uint8_t*)buf, len, cm, s.type);
+    int w = ring_write(s.rx, (const uint8_t*)buf, len, cm, s.type);
+    if (w > 0 && g_data_ready_cb) g_data_ready_cb(sd);
+    return w;
 }
 
 int ActiveCount() {
