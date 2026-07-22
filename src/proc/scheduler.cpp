@@ -1490,6 +1490,11 @@ void Scheduler::DestroyProcess(Process* proc) {
     proc->reaped = 1;
     proc->state  = Process_Terminated;
     if (g_live_proc_count > 0) g_live_proc_count--;   // free a live-task slot (satoru)
+    // task 25 reviewer finding 1: a wake-next slot may still hold this proc (an
+    // idle ap stashed it, never picked). clear every match BEFORE the free or
+    // the fast path derefs recycled heap (the documented rip=0x3 seed). (satoru)
+    for (uint32_t wi = 0; wi < SMP_MAX_CPUS; wi++)
+        if (g_wake_next[wi] == proc) g_wake_next[wi] = nullptr;
     // freeing the struct while a cpu still unwinds on it hands the heap a block
     // that gets recycled instantly (path buffers were observed landing in it) -
     // the cpu then iretq's through ascii garbage (#UD/#GP with string-data

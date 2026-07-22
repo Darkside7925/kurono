@@ -621,6 +621,7 @@ struct PollReg {
     Process* task;
     uint16_t nkeys;
     bool     wildcard;        // fd-set too big to enumerate: wake on ANY readiness (satoru)
+    bool     pending;         // producer fired in the pre-park window; parker must re-scan (satoru)
     uint32_t keys[16];
 };
 static constexpr int POLL_REG_MAX = 192;
@@ -645,10 +646,32 @@ static uint32_t poll_fd_key(LinuxProcess* p, int fd) {
 // register the current poll waiter's fd-set so a producer can wake it. only the
 // wakeable backend types are recorded; if none are, no registration (that poll
 // legitimately relies on the timer). (satoru)
+static void poll_unregister(Process* task) {
+    if (!task) return;
+    SpinLockGuard g(g_pollreg_lock);
+    for (int i = 0; i < POLL_REG_MAX; i++)
+        if (g_pollreg[i].task == task) { g_pollreg[i].task = nullptr; return; }
+}
 static void poll_register(Process* task, LinuxProcess* p, const void* fdsp, uint64_t nfds) {
     if (!task || !p || !fdsp) return;
     struct LinuxPollfd { int fd; int16_t events; int16_t revents; } __attribute__((packed));
     const LinuxPollfd* fds = (const LinuxPollfd*)fdsp;
+    // task 25 reviewer nit: compute the key set BEFORE taking the lock - fds is
+    // USER memory and a lazy page there would #PF inside a cli spinlock section.
+    // (the readiness scan just touched every entry, but keep the invariant.) (satoru)
+    uint32_t keys[16]; int nkeys = 0; bool wildcard = false;
+    for (uint64_t i = 0; i < nfds; i++) {
+        if (fds[i].fd < 0) continue;
+        uint32_t k = poll_fd_key(p, fds[i].fd);
+        if (!k) continue;
+        if (nkeys >= 16) { wildcard = true; break; }
+        // dedup (a set often repeats an fd) (satoru)
+        bool dup = false;
+        for (int j = 0; j < nkeys; j++) if (keys[j] == k) { dup = true; break; }
+        if (!dup) keys[nkeys++] = k;
+    }
+    // nothing wakeable and not wildcard -> plain timer poll; drop any prior reg. (satoru)
+    if (nkeys == 0 && !wildcard) { poll_unregister(task); return; }
     SpinLockGuard g(g_pollreg_lock);
     // find our existing slot or a free one (one reg per task). (satoru)
     int slot = -1, free_slot = -1;
@@ -659,25 +682,24 @@ static void poll_register(Process* task, LinuxProcess* p, const void* fdsp, uint
     if (slot < 0) slot = free_slot;
     if (slot < 0) return;   // table full: fall back to the timer (satoru)
     PollReg* r = &g_pollreg[slot];
-    r->task = task; r->nkeys = 0; r->wildcard = false;
-    for (uint64_t i = 0; i < nfds; i++) {
-        if (fds[i].fd < 0) continue;
-        uint32_t k = poll_fd_key(p, fds[i].fd);
-        if (!k) continue;
-        if (r->nkeys >= 16) { r->wildcard = true; break; }
-        // dedup (a set often repeats an fd) (satoru)
-        bool dup = false;
-        for (int j = 0; j < r->nkeys; j++) if (r->keys[j] == k) { dup = true; break; }
-        if (!dup) r->keys[r->nkeys++] = k;
-    }
-    // nothing wakeable and not wildcard -> release the slot (pure timer poll). (satoru)
-    if (r->nkeys == 0 && !r->wildcard) r->task = nullptr;
+    r->task = task; r->wildcard = wildcard; r->pending = false;
+    r->nkeys = (uint16_t)nkeys;
+    for (int j = 0; j < nkeys; j++) r->keys[j] = keys[j];
 }
-static void poll_unregister(Process* task) {
-    if (!task) return;
+// task 25 reviewer finding 3: consume a producer wake that fired in the window
+// between poll_register and the Blocked commit (its CAS found us still Running
+// and could not deliver). returns true if one was pending - the parker must
+// undo the park and re-scan readiness NOW instead of sleeping out the timer. (satoru)
+static bool poll_consume_pending(Process* task) {
+    if (!task) return false;
     SpinLockGuard g(g_pollreg_lock);
-    for (int i = 0; i < POLL_REG_MAX; i++)
-        if (g_pollreg[i].task == task) { g_pollreg[i].task = nullptr; return; }
+    for (int i = 0; i < POLL_REG_MAX; i++) {
+        if (g_pollreg[i].task == task) {
+            if (g_pollreg[i].pending) { g_pollreg[i].task = nullptr; return true; }
+            return false;
+        }
+    }
+    return false;
 }
 // epoll variant: register from a raw fd list (the epoll instance's watch set),
 // so an epoll_pwait waiter (firefox's IPC I/O threads) is also woken the instant
@@ -693,7 +715,7 @@ static void poll_register_fdlist(Process* task, LinuxProcess* p, const int* fds,
     if (slot < 0) slot = free_slot;
     if (slot < 0) return;
     PollReg* r = &g_pollreg[slot];
-    r->task = task; r->nkeys = 0; r->wildcard = false;
+    r->task = task; r->nkeys = 0; r->wildcard = false; r->pending = false;
     for (int i = 0; i < nfds; i++) {
         if (fds[i] < 0) continue;
         uint32_t k = poll_fd_key(p, fds[i]);
@@ -719,8 +741,14 @@ static void poll_wake_key(uint32_t key) {
         if (wake_blocked_to_ready(r->task)) {
             r->task->sleep_ticks = 0;   // re-pick on the next slot, not the timer (satoru)
             g_poll_wakes++;
+            r->task = nullptr;          // delivered; the poll re-registers if it re-parks (satoru)
+        } else {
+            // task 25 reviewer finding 3: the waiter registered but has not yet
+            // committed Blocked (pre-park window). do NOT retire the reg - mark
+            // it pending; poll_consume_pending after the Blocked commit undoes
+            // the park so the event is not lost to the timer backstop. (satoru)
+            r->pending = true;
         }
-        r->task = nullptr;             // retire; the poll re-registers if it re-parks (satoru)
     }
 }
 // producer entry points (fd-type-specific keys). called from the write paths. (satoru)
@@ -791,6 +819,18 @@ static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
     }
     // single-owner: state + sleep_ticks under g_sched_lock. (satoru)
     { uint64_t sf; Scheduler::StateLock(&sf); task->state = Process_Blocked; task->sleep_ticks = rt; Scheduler::StateUnlock(sf); }
+    // task 25 reviewer finding 3: a producer may have fired between our
+    // poll_register and the Blocked commit above - its CAS could not deliver
+    // (we were still Running) and left a pending mark. consume it: undo the
+    // park and let do_poll_wait re-scan readiness NOW, not on the timer. (satoru)
+    if (poll_consume_pending(task)) {
+        uint64_t sf; Scheduler::StateLock(&sf);
+        task->sleep_ticks = 0;
+        task->state       = Process_Running;
+        Scheduler::StateUnlock(sf);
+        task->user_frame.rip += 2;
+        return false;   // caller loops and re-scans; the event is ready (satoru)
+    }
     if (!switch_to_ready_user(current_syscall_frame)) {
         // TASK 20 (the glib-wedge core): no sibling to switch to. the old
         // in-place fallback BUSY-HELD this ap in ring-0 for the whole wait
@@ -7366,6 +7406,14 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
 
         if (p->task) {
             int current_index = current_proc;
+
+            // task 25 reviewer finding 2: retire any armed poll registration NOW.
+            // an exiting waiter that parked with a live reg (fatal-signal exit,
+            // group kill) would otherwise leave a stale PollReg.task; after the
+            // waitpid reap frees the struct, a producer on the recycled sd would
+            // CAS-write into freed heap (uaf writer). also stops slot leakage in
+            // the 192-entry table. (satoru)
+            poll_unregister(p->task);
 
             // clone child_cleartid: a thread exiting must zero *clear_child_tid
             // and futex-wake it so a joiner blocked in pthread_join wakes up.
