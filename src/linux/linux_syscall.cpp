@@ -599,6 +599,109 @@ static inline bool wake_blocked_to_ready(Process* t);   // atomic Blocked->Ready
 static uint64_t g_poll_parked  = 0;   // task 20: poll-family ap parks (printed in ffcount) (satoru)
 static uint64_t g_sleep_parked = 0;   // task 20: nanosleep ap parks (printed in ffcount) (satoru)
 
+// ── TASK 25: proactive poll/epoll readiness wakeup (event-driven fd wakes) ────
+// THE agent-diagnosed rate fix (both the linux-trace and kurono-log analyses
+// converged): Kurono's poll wait is TIMER-driven where linux is EVENT-driven.
+// A parked poll/ppoll waiter is only re-readied by the periodic sleep_ticks
+// decrement (~2-16ms), so a producer that makes an fd readable (an eventfd
+// write, unix-socket data, a timerfd firing) does NOT wake the poller - every
+// startup handshake hop (the wayland get_registry gate, gmain's eventfd, the
+// IPC channels) pays that timer tax hundreds of times = the ~25x paint crawl
+// lottery. linux wakes the fd wait-queue FROM THE WRITER in ~33us. Mirror that:
+// a parked poll waiter registers the backend objects its fd-set covers; a
+// producer calls poll_wake_key() to do the SAME atomic Blocked->Ready +
+// sleep_ticks=0 the sleep_ticks promotion would (just now, not in 8ms). the
+// sleep_ticks repoll stays as a backstop. SAME-CPU wake (pin-safe: it only
+// moves a Blocked->Ready flip earlier - never touches the cross-cpu frame
+// handoff), and a bug degrades to a harmless spurious re-scan that re-parks -
+// never corruption. key = (type<<24 | backend_id): 1=eventfd slot, 2=unix sd
+// (the READER's own sd; a writer wakes its peer's sd), 3=timerfd slot. (satoru)
+static Spinlock g_pollreg_lock;
+struct PollReg {
+    Process* task;
+    uint16_t nkeys;
+    bool     wildcard;        // fd-set too big to enumerate: wake on ANY readiness (satoru)
+    uint32_t keys[16];
+};
+static constexpr int POLL_REG_MAX = 192;
+static PollReg  g_pollreg[POLL_REG_MAX];
+static uint64_t g_poll_wakes = 0;   // forensics: proactive poll wakeups delivered (satoru)
+
+static inline uint32_t poll_obj_key(uint8_t type, int id) {
+    return ((uint32_t)type << 24) | ((uint32_t)id & 0x00FFFFFFu);
+}
+// map a firefox fd to the backend object a producer would signal, or 0. (satoru)
+static uint32_t poll_fd_key(LinuxProcess* p, int fd) {
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return 0;
+    LinuxFd* lfd = &p->fds[fd];
+    switch (lfd->type) {
+        case LFD_EVENTFD: return poll_obj_key(1, lfd->backend_fd);
+        case LFD_SOCKET:
+        case LFD_PIPE:    return poll_obj_key(2, lfd->backend_fd);
+        case LFD_TIMERFD: return poll_obj_key(3, lfd->backend_fd);
+        default:          return 0;   // regular files / stubs stay on the timer (satoru)
+    }
+}
+// register the current poll waiter's fd-set so a producer can wake it. only the
+// wakeable backend types are recorded; if none are, no registration (that poll
+// legitimately relies on the timer). (satoru)
+static void poll_register(Process* task, LinuxProcess* p, const void* fdsp, uint64_t nfds) {
+    if (!task || !p || !fdsp) return;
+    struct LinuxPollfd { int fd; int16_t events; int16_t revents; } __attribute__((packed));
+    const LinuxPollfd* fds = (const LinuxPollfd*)fdsp;
+    SpinLockGuard g(g_pollreg_lock);
+    // find our existing slot or a free one (one reg per task). (satoru)
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < POLL_REG_MAX; i++) {
+        if (g_pollreg[i].task == task) { slot = i; break; }
+        if (!g_pollreg[i].task && free_slot < 0) free_slot = i;
+    }
+    if (slot < 0) slot = free_slot;
+    if (slot < 0) return;   // table full: fall back to the timer (satoru)
+    PollReg* r = &g_pollreg[slot];
+    r->task = task; r->nkeys = 0; r->wildcard = false;
+    for (uint64_t i = 0; i < nfds; i++) {
+        if (fds[i].fd < 0) continue;
+        uint32_t k = poll_fd_key(p, fds[i].fd);
+        if (!k) continue;
+        if (r->nkeys >= 16) { r->wildcard = true; break; }
+        // dedup (a set often repeats an fd) (satoru)
+        bool dup = false;
+        for (int j = 0; j < r->nkeys; j++) if (r->keys[j] == k) { dup = true; break; }
+        if (!dup) r->keys[r->nkeys++] = k;
+    }
+    // nothing wakeable and not wildcard -> release the slot (pure timer poll). (satoru)
+    if (r->nkeys == 0 && !r->wildcard) r->task = nullptr;
+}
+static void poll_unregister(Process* task) {
+    if (!task) return;
+    SpinLockGuard g(g_pollreg_lock);
+    for (int i = 0; i < POLL_REG_MAX; i++)
+        if (g_pollreg[i].task == task) { g_pollreg[i].task = nullptr; return; }
+}
+// a producer made object `key` readable: wake every poll waiter covering it.
+// same atomic Blocked->Ready + sleep_ticks=0 as PromoteDeferredWakes. (satoru)
+static void poll_wake_key(uint32_t key) {
+    if (!key) return;
+    SpinLockGuard g(g_pollreg_lock);
+    for (int i = 0; i < POLL_REG_MAX; i++) {
+        PollReg* r = &g_pollreg[i];
+        if (!r->task) continue;
+        bool hit = r->wildcard;
+        if (!hit) for (int j = 0; j < r->nkeys; j++) if (r->keys[j] == key) { hit = true; break; }
+        if (!hit) continue;
+        if (wake_blocked_to_ready(r->task)) {
+            r->task->sleep_ticks = 0;   // re-pick on the next slot, not the timer (satoru)
+            g_poll_wakes++;
+        }
+        r->task = nullptr;             // retire; the poll re-registers if it re-parks (satoru)
+    }
+}
+// producer entry points (fd-type-specific keys). called from the write paths. (satoru)
+static inline void poll_wake_eventfd(int slot)  { poll_wake_key(poll_obj_key(1, slot)); }
+static inline void poll_wake_unixsd(int reader_sd) { poll_wake_key(poll_obj_key(2, reader_sd)); }
+static inline void poll_wake_timerfd(int slot)  { poll_wake_key(poll_obj_key(3, slot)); }
+
 // task 21: remap RING - the serial version of this log (163 lines x ~8.7ms
 // uart in the 9-10s window) serialized the early munmap/madvise path so hard
 // the wedge vanished 6/6 (a heisen-fix, and a hint the race lives in remap
@@ -745,7 +848,7 @@ static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
             uint32_t r = fd_readiness(p, fds[i].fd, interest);
             if (r) { fds[i].revents = (int16_t)(uint16_t)r; ready_total++; }
         }
-        if (ready_total > 0) { p->poll_blocking = false; return ready_total; }
+        if (ready_total > 0) { p->poll_blocking = false; poll_unregister(p->task); return ready_total; }
         // [pw] probe: a firefox poll/ppoll found NOTHING ready -> dump its pollfd set
         // (fd/type/interest/readiness) so we can see the launcher/MessageLoop thread's
         // wakeup fd (a pipe/eventfd that should read ready after a cross-thread post).
@@ -769,16 +872,23 @@ static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
                 SerialLogger::Log("\r\n");
             }
         }
-        if (timeout_ms == 0) { p->poll_blocking = false; return 0; }   // non-blocking pass (satoru)
+        if (timeout_ms == 0) { p->poll_blocking = false; poll_unregister(p->task); return 0; }   // non-blocking pass (satoru)
         uint64_t now = Time::GetTicks();
         if (!p->poll_blocking) {                                       // first block: arm deadline (satoru)
             p->poll_blocking    = true;
             p->poll_deadline_ms = (timeout_ms < 0) ? 0xFFFFFFFFFFFFFFFFULL
                                                    : now + (uint64_t)timeout_ms;
         }
-        if (now >= p->poll_deadline_ms) { p->poll_blocking = false; return 0; }  // timed out (satoru)
+        if (now >= p->poll_deadline_ms) { p->poll_blocking = false; poll_unregister(p->task); return 0; }  // timed out (satoru)
+        // task 25: register this waiter's fd-set so a producer that makes any of
+        // its fds readable wakes it NOW (event-driven) instead of the sleep_ticks
+        // timer. must be set BEFORE the deschedule so a wake between here and the
+        // park is not lost (the deschedule commits Blocked under the state lock;
+        // a producer's Blocked->Ready CAS then either lands or no-ops). (satoru)
+        poll_register(p->task, p, fds, nfds);
         // hand the cpu to a sibling user thread; this poll re-runs when we wake (satoru)
         if (poll_try_deschedule(p, restart_nr)) return 0;   // switched; return value ignored
+        poll_unregister(p->task);   // bsp in-place fallback: not parked, drop the reg (satoru)
         // no sibling to switch to: cooperative in-place wait, then re-scan. on the
         // bsp that means pumping the ui + yielding to kernel procs; on an ap there
         // are no kernel procs and no ui - release the kls lock so the other cores'
@@ -1216,6 +1326,7 @@ static void ff_meas_sample() {
     SerialLogger::Log(" fpark=");   SerialLogger::LogDec((int)g_ftx_wait_parked);
     SerialLogger::Log(" ppark=");   SerialLogger::LogDec((int)g_poll_parked);
     SerialLogger::Log(" spark=");   SerialLogger::LogDec((int)g_sleep_parked);
+    SerialLogger::Log(" pwake=");   SerialLogger::LogDec((int)g_poll_wakes);   // task 25 (satoru)
     SerialLogger::Log(" feag=");    SerialLogger::LogDec((int)g_ftx_wait_eagain);
     SerialLogger::Log(" fwake=");   SerialLogger::LogDec((int)g_ftx_wake_calls);
     SerialLogger::Log(" fwoke=");   SerialLogger::LogDec((int)g_ftx_woken_total);
@@ -3542,6 +3653,10 @@ void LinuxSyscall::Init() {
     stdin_head = 0;
     stdin_tail = 0;
     HAL::RegisterSystemCallHandler(LinuxInt80Entry);
+    // task 25: wire unix-socket data delivery to the proactive poll wakeup, so a
+    // poll/ppoll waiter parked on a socket wakes the instant data arrives in its
+    // rx ring (the wayland/dbus/IPC handshakes) instead of on the ~8ms timer. (satoru)
+    UnixSocket::SetDataReadyHook(poll_wake_unixsd);
     SerialLogger::Log("[LinuxSyscall] Initialized\r\n");
 }
 
@@ -8103,9 +8218,15 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
                 g_eventfd[s].counter = 0xFFFFFFFFFFFFFFFEULL;
             else
                 g_eventfd[s].counter += add;
+            // task 25: the eventfd is now readable - wake any poll/ppoll/epoll
+            // waiter parked on it NOW (event-driven, like linux waking the fd
+            // wait-queue from the writer), instead of the ~8ms sleep_ticks timer.
+            // this is glib's GMainContext wakeup + chromium's MessagePump + the
+            // IPC channel wakeups - the hot startup handshake path. (satoru)
+            poll_wake_eventfd(s);
             // [evw] trace the MessagePump wakeup write so we can see whether the
             // launcher's wakeup eventfd is being signaled. (satoru)
-            if (p->pid >= 100 && p->pid < 140) {
+            if (false && p->pid >= 100 && p->pid < 140) {   // gated: task 25 covers it (satoru)
                 SerialLogger::Log("[evw] pid="); SerialLogger::LogDec(p->pid);
                 SerialLogger::Log(" fd="); SerialLogger::LogDec(fd);
                 SerialLogger::Log(" cnt="); SerialLogger::LogDec((int)g_eventfd[s].counter);
