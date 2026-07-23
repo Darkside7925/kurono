@@ -598,6 +598,7 @@ static void futex_sweep_timeouts();   // release timed-out futex waiters (satoru
 static inline bool wake_blocked_to_ready(Process* t);   // atomic Blocked->Ready (satoru)
 static uint64_t g_poll_parked  = 0;   // task 20: poll-family ap parks (printed in ffcount) (satoru)
 static uint64_t g_sleep_parked = 0;   // task 20: nanosleep ap parks (printed in ffcount) (satoru)
+static bool     g_yprot_trap   = false;  // task 27: yield-page write-protect trap (dormant; hunt only) (satoru)
 
 // ── TASK 25: proactive poll/epoll readiness wakeup (event-driven fd wakes) ────
 // THE agent-diagnosed rate fix (both the linux-trace and kurono-log analyses
@@ -3836,6 +3837,15 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
         ~KlsGuard() { kls_unlock(); }
     } _kls_guard;
 
+    // task 27 THE TRAP: a WRITE fault on a parked thread's write-protected
+    // fingerprint page = the corruptor caught red-handed. logs [YWRITE] with
+    // the writer's rip, restores RW, and retries the store. checked FIRST so
+    // no other handler (cow, demand-zero) misreads the armed page. (satoru)
+    if ((frame->error_code & 0x2) &&
+        Scheduler::YProtCheckFault(task->address_space, frame->cr2, frame->rip)) {
+        return true;
+    }
+
     // A KERNEL-mode fault (PFERR_USER clear) on a user address occurs when the
     // kernel itself touches not-yet-faulted demand-zero user memory on behalf of a
     // syscall -- e.g. mremap's memcpy into the freshly (lazily) mmap'd destination
@@ -5020,6 +5030,48 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     // kernel may touch these user pages directly. (satoru)
                     memcpy((void*)(uintptr_t)fresh_sp, (const void*)(uintptr_t)child_stack, VF_WIN);
                     eff_child_stack = fresh_sp;
+                }
+            }
+
+            // task 27 THE TERMINAL ROOT CAUSE (two-threads-one-stack, proven by
+            // the [YWRITE] trap): musl caches an exited/retired thread's stack+tcb
+            // and hands it to clone() for a new thread. the kernel does NOT place
+            // clone-provided stacks, so the task-26 mmap guards never see them - a
+            // stale still-schedulable sibling on that stack = two live threads on
+            // one stack, each stomping the other's sched_yield return (the cr2=0xA
+            // crash). detect it here + report the stale owner's STATE (so we know
+            // if force-reap is safe or if the owner is genuinely live). measure
+            // first - do NOT reap a possibly-live compositor blind. (satoru)
+            // task 27 THE FIX (two-threads-one-stack, proven by the [YWRITE]
+            // trap): musl reuses a retired thread's stack SLOT for this new
+            // thread. if a still-schedulable sibling occupies the EXACT SAME
+            // slot (user_stack_top match - not the 156KB-spaced neighbors the
+            // rsp-range probe false-flagged), musl has decided that sibling is
+            // dead (it cleared its ctid, else it would not reuse the slot) but
+            // the kernel never reaped it - so it lingers Ready/Blocked and, if
+            // ever resumed, runs its stale frame on THIS thread's stack = the
+            // cr2=0xA corruptor. reap it now: it is dead to userspace (no joiner
+            // waits - ctid cleared), so removing it from the run queue is safe
+            // and eliminates the two-live-threads invariant at the source. this
+            // reaps the EXACT-slot occupant only, never a live neighbor. (satoru)
+            {
+                Process* stale = Scheduler::LiveSiblingWithStackTop(
+                    parent_task->address_space, eff_child_stack);
+                if (stale && stale != parent_task) {
+                    static uint32_t s_cc_logs = 0;
+                    if (s_cc_logs < 16) {
+                        s_cc_logs++;
+                        SerialLogger::Log("[CLONECLASH] reap slot=");
+                        SerialLogger::LogHex64(eff_child_stack);
+                        SerialLogger::Log(" stale=");
+                        SerialLogger::LogDec((int)stale->pid);
+                        SerialLogger::Log(" st=");
+                        SerialLogger::LogDec((int)stale->state);
+                        SerialLogger::Log(" oncpu=");
+                        SerialLogger::LogDec((int)stale->on_cpu);
+                        SerialLogger::Log("\r\n");
+                    }
+                    Scheduler::MarkProcessExited(stale, 0);   // Terminate + dequeue (satoru)
                 }
             }
 
@@ -6950,7 +7002,19 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     }
                 }
                 Scheduler::SaveUserFrame(yt2, current_syscall_frame, 7);   // site 7 = sched_yield (satoru)
+                // task 27 THE TRAP (write-protect the fingerprint page across the
+                // park to catch a cross-thread writer red-handed): it proved the
+                // two-threads-one-stack mechanism [YWRITE], job done. now DORMANT
+                // - the per-park fault+shootdown perturbs the boot lottery, and a
+                // clean paint-rate measurement needs it off. re-enable by setting
+                // g_yprot_trap=1 for a future hunt. (satoru)
+                if (g_yprot_trap && yt2->yret_seq && Scheduler::YProtArm(yt2))
+                    SMP::BroadcastTlbFlush();
                 if (switch_to_ready_user(current_syscall_frame)) return 0;
+                if (yt2->yprot_armed) {   // no sibling: we keep running - disarm (satoru)
+                    Scheduler::YProtDisarm(yt2);
+                    SMP::BroadcastTlbFlush();
+                }
             }
             // the kernel-proc yield is bsp-only; an ap with no ready sibling just
             // returns to the caller (it re-yields on its next spin). (satoru)
