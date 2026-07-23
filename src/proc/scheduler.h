@@ -245,6 +245,7 @@ struct Process {
     uint64_t yret_phys;
     uint32_t yret_seq;
     uint32_t last_load_seq;   // save_seq of the frame this task last RESUMED from (satoru)
+    uint8_t  yprot_armed;     // task 27 trap: fingerprint page is write-protected (satoru)
 
     // task 28: lazily stamped by the picker when first seen Ready; cleared on
     // every successful pick. >64ms of Ready-unpicked = the starvation override
@@ -500,4 +501,13 @@ public:
     // task 27: is phys a parked thread's fingerprinted yield-return page?
     // kernel copy paths probe their write destinations with this. (satoru)
     static Process* PhysIsParkedYieldStack(uint64_t phys);
+    // task 27: a live sibling on the SAME musl stack slot as `top` (the exact
+    // reuse discriminator for the two-threads-one-stack corruptor). (satoru)
+    static Process* LiveSiblingWithStackTop(uint64_t as, uint64_t top);
+    // task 27 THE TRAP: write-protect the fingerprinted page across the park;
+    // a user writer faults into [YWRITE] red-handed. arm at the site-7 save,
+    // auto-disarm at the resume verify; the fault hook restores RW + retries. (satoru)
+    static bool YProtArm(Process* p);
+    static void YProtDisarm(Process* p);
+    static bool YProtCheckFault(uint64_t as, uint64_t fault_va, uint64_t rip);
 };

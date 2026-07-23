@@ -714,6 +714,57 @@ static int canary_read_user(Process* p, uint64_t va, uint8_t* dst, int n) {
 // destinations - a hit means a kernel-side write is about to land in a live
 // parked stack (the surviving corruption channel). racy read-only walk under
 // the lock; page-granular. (satoru)
+// task 27 THE TRAP (see scheduler.h). stack pages are demand-zero anon
+// PRESENT|USER|WRITABLE|NX; arming drops WRITABLE, disarm/fault restore it. (satoru)
+static volatile uint32_t g_yprot_count = 0;
+bool Scheduler::YProtArm(Process* p) {
+    if (!p || !p->yret_va || !p->address_space) return false;
+    uint64_t page = p->yret_va & ~0xFFFULL;
+    if (!KernelVMM::ProtectPageInAddressSpace(p->address_space, page,
+            PTE_PRESENT | PTE_USER | PTE_NX)) return false;
+    p->yprot_armed = 1;
+    __atomic_add_fetch(&g_yprot_count, 1, __ATOMIC_RELAXED);
+    return true;
+}
+static void yprot_disarm(Process* p) {
+    if (!p || !p->yprot_armed) return;
+    p->yprot_armed = 0;
+    __atomic_sub_fetch(&g_yprot_count, 1, __ATOMIC_RELAXED);
+    KernelVMM::ProtectPageInAddressSpace(p->address_space,
+        p->yret_va & ~0xFFFULL, PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX);
+    if (p->address_space == KernelVMM::GetCurrentAddressSpace())
+        KernelVMM::InvalidatePage(p->yret_va & ~0xFFFULL);
+}
+void Scheduler::YProtDisarm(Process* p) { yprot_disarm(p); }
+bool Scheduler::YProtCheckFault(uint64_t as, uint64_t fault_va, uint64_t rip) {
+    if (__atomic_load_n(&g_yprot_count, __ATOMIC_RELAXED) == 0) return false;
+    uint64_t page = fault_va & ~0xFFFULL;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* hit = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (!p->yprot_armed || p->address_space != as) continue;
+        if ((p->yret_va & ~0xFFFULL) == page) { hit = p; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    if (!hit) return false;
+    static uint32_t s_yw_logs = 0;
+    if (s_yw_logs < 12) {
+        s_yw_logs++;
+        Process* w = GetCurrentProcess();
+        SerialLogger::Log("[YWRITE] writer=");
+        SerialLogger::LogDec(w ? (int)w->pid : -1);
+        SerialLogger::Log(" rip=");
+        SerialLogger::LogHex64(rip);
+        SerialLogger::Log(" victim=");
+        SerialLogger::LogDec((int)hit->pid);
+        SerialLogger::Log(" va=");
+        SerialLogger::LogHex64(fault_va);
+        SerialLogger::Log("\r\n");
+    }
+    yprot_disarm(hit);   // restore RW; the faulting store retries + lands (satoru)
+    return true;
+}
+
 Process* Scheduler::PhysIsParkedYieldStack(uint64_t phys) {
     phys &= ~0xFFFULL;
     if (!phys) return nullptr;
@@ -723,6 +774,24 @@ Process* Scheduler::PhysIsParkedYieldStack(uint64_t phys) {
         if (p->reaped || !p->is_user() || !p->has_user_frame) continue;
         if (p->state == Process_Terminated && !p->on_cpu) continue;
         if (p->yret_phys && (p->yret_phys & ~0xFFFULL) == phys) { hit = p; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return hit;
+}
+
+// task 27: a live sibling occupying the SAME musl stack slot (user_stack_top
+// within a page of `top`). the exact reuse discriminator - immune to parked
+// depth and the 156KB neighbor spacing that fooled the rsp-range probe. (satoru)
+Process* Scheduler::LiveSiblingWithStackTop(uint64_t as, uint64_t top) {
+    if (!as || !top) return nullptr;
+    uint64_t tp = top & ~0xFFFULL;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* hit = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->reaped || !p->is_user() || !p->has_user_frame) continue;
+        if (p->address_space != as || !p->user_stack_top) continue;
+        if (p->state == Process_Terminated && !p->on_cpu) continue;
+        if ((p->user_stack_top & ~0xFFFULL) == tp) { hit = p; break; }
     }
     g_sched_lock.UnlockIrqRestore(f);
     return hit;
@@ -804,6 +873,7 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     // already stamped save-side. also stamp last_load_seq at EVERY load so the
     // RAWEXC2 dump can tell a stale resume (load_seq != save_seq). (satoru)
     proc->last_load_seq = proc->save_seq;
+    if (proc->yprot_armed) yprot_disarm(proc);   // task 27 trap: RW back before resume (satoru)
     if (proc->last_save_site == 7 && proc->yret_seq != 0 &&
         proc->yret_seq == proc->save_seq && proc->yret_va) {
         uint64_t nv = 0;
