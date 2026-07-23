@@ -7,6 +7,7 @@
 // static member definitions
 uint64_t* PMM::bitmap       = nullptr;
 uint16_t* PMM::refs         = nullptr;
+uint8_t*  PMM::mapped_bits  = nullptr;   // task 26: 1 bit/frame - a USER leaf pte points here (satoru)
 uint64_t  PMM::bitmap_size  = 0;
 uint64_t  PMM::total_frames = 0;
 uint64_t  PMM::used_frames  = 0;
@@ -108,12 +109,51 @@ uint64_t PMM::FindFreeFrame() {
     return ~0ULL;
 }
 
+// task 26 free-while-mapped guard: a frame with a live USER leaf pte must never
+// be re-handed by the allocator - that is the proven crossbeam stack corruptor
+// (a live parked stack's frame freed-while-mapped, recycled as another thread's
+// stack; both push through their own ptes into one page). set/cleared by the
+// vmm leaf writers; checked at alloc. (satoru)
+void PMM::MarkFrameMapped(uint64_t phys_addr, bool m) {
+    if (!mapped_bits) return;
+    uint64_t idx = phys_addr / PAGE_SIZE;
+    if (idx >= total_frames) return;
+    if (m) __atomic_fetch_or (&mapped_bits[idx >> 3], (uint8_t)(1u << (idx & 7)), __ATOMIC_RELAXED);
+    else   __atomic_fetch_and(&mapped_bits[idx >> 3], (uint8_t)~(1u << (idx & 7)), __ATOMIC_RELAXED);
+}
+bool PMM::IsFrameMapped(uint64_t phys_addr) {
+    if (!mapped_bits) return false;
+    uint64_t idx = phys_addr / PAGE_SIZE;
+    if (idx >= total_frames) return false;
+    return (mapped_bits[idx >> 3] >> (idx & 7)) & 1;
+}
+
 uint64_t PMM::AllocFrame() {
     PmmIrqGuard _g;
-    uint64_t idx = FindFreeFrame();
-    if (idx == ~0ULL) {
-        SerialLogger::Log("PMM: OUT OF MEMORY!\r\n");
-        return 0;
+    // task 26: refuse to hand out a frame that still has a live USER leaf pte
+    // pointing at it (a free-while-mapped escaped into the free pool). log the
+    // event - it names the guilty free path - leak the flagged frame, and pick
+    // another. bounded retries; the leak is 4k per real event. (satoru)
+    uint64_t idx;
+    for (int tries = 0; ; tries++) {
+        idx = FindFreeFrame();
+        if (idx == ~0ULL) {
+            SerialLogger::Log("PMM: OUT OF MEMORY!\r\n");
+            return 0;
+        }
+        if (!mapped_bits || tries >= 8 ||
+            !((mapped_bits[idx >> 3] >> (idx & 7)) & 1)) break;
+        static uint32_t s_dbl_logs = 0;
+        if (s_dbl_logs < 8) {
+            s_dbl_logs++;
+            SerialLogger::Log("[DBLMAP] phys=");
+            SerialLogger::LogHex64(idx * PAGE_SIZE);
+            SerialLogger::Log(" refct=");
+            SerialLogger::LogDec((int)refs[idx]);
+            SerialLogger::Log(" free-while-mapped frame quarantined\r\n");
+        }
+        SetFrame(idx);   // leak it: mark used, never hand out (satoru)
+        used_frames++;
     }
     SetFrame(idx);
     refs[idx] = 1;
@@ -375,6 +415,13 @@ void PMM::Init(multiboot_info_t* mbi) {
     uint8_t*  rp   = (uint8_t*)refs;
     for (uint64_t i = rq << 3; i < refs_bytes; i++) rp[i] = 0;
 
+    // task 26 free-while-mapped guard: the mapped bit array lives right after
+    // refs; its frames are reserved with the refs reservation below (the loop
+    // rounds refs_end up to mapped_end). (satoru)
+    mapped_bits = (uint8_t*)refs + refs_bytes;
+    uint64_t mapped_bytes = (total_frames + 7) / 8;
+    for (uint64_t i = 0; i < mapped_bytes; i++) mapped_bits[i] = 0;
+
     SerialLogger::Log("PMM: Bitmap at 0x");
     SerialLogger::LogHex((uint64_t)bitmap);
     SerialLogger::Log(", ");
@@ -445,8 +492,10 @@ void PMM::Init(multiboot_info_t* mbi) {
             used_frames++;
         }
     }
+    // reservation extended past refs to cover the mapped bit array too. (satoru)
+    uint64_t meta_end = (uint64_t)mapped_bits + (total_frames + 7) / 8;
     for (uint64_t addr = refs_start & ~(PAGE_SIZE - 1);
-         addr < refs_end; addr += PAGE_SIZE) {
+         addr < meta_end; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
         if (idx < total_frames && !TestFrame(idx)) {
             SetFrame(idx);

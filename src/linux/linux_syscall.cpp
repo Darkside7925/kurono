@@ -1604,7 +1604,8 @@ static void user_frame_quarantine(uint64_t phys, bool can_broadcast = true) {
     g_fq_head = next;
 }
 
-static void unmap_user_range(Process* proc, uint64_t start, uint64_t end) {
+static void unmap_user_range(Process* proc, uint64_t start, uint64_t end,
+                             uint64_t* kept_lo = nullptr, uint64_t* kept_hi = nullptr) {
     if (!proc || start >= end) return;
 
     // stray-writer detector: does this unmap cover the LIVE saved rsp of a
@@ -1664,6 +1665,17 @@ static void unmap_user_range(Process* proc, uint64_t start, uint64_t end) {
         // normally. (satoru)
         if (guard_stack &&
             Scheduler::PageIsLiveStack(proc->address_space, proc, page, page_end - page_start)) {
+            // task 26 (the two-threads-one-stack corruptor): report the exact
+            // kept span to the munmap caller so JUST that span stays claimed in
+            // the region table. keeping the pages but trimming the region left
+            // a table hole choose_mmap_base handed to the next thread's stack -
+            // two threads then executed on one stack and coherently rewrote
+            // each other's return addresses (the proven cr2=0xA recv crash +
+            // the vanished-unlock wedge). (v1 leaked the WHOLE overlap region,
+            // which zero-refaulted legitimately-freed pages and regressed
+            // paint 0/8 - keep the span PRECISE.) (satoru)
+            if (kept_lo && page < *kept_lo) *kept_lo = page;
+            if (kept_hi && page > *kept_hi) *kept_hi = page;
             continue;
         }
         // with other cores online, unmap WITHOUT freeing and quarantine the
@@ -1754,7 +1766,66 @@ static uint64_t choose_mmap_base(Process* task, uint64_t requested, uint64_t len
         // cross-thread: never hand back a range a SIBLING thread (same cr3, own
         // regions[]) already owns -- that collision gave two thread stacks one
         // address and corrupted control flow under the futex storm. (satoru)
-        if (!region_overlaps_cross_thread(task, base, base + length)) return base;
+        bool clash = region_overlaps_cross_thread(task, base, base + length);
+        // task 26 BELT (the two-threads-one-stack corruptor): even if the region
+        // table says free, never hand out a range holding a live sibling's
+        // in-use stack - a munmap'd-but-kept live stack leaves exactly that
+        // hole (root-fixed at the munmap site, guarded here against any second
+        // source of region loss). STRICT containment only - the v1 256KB
+        // margin rejected legitimate allocations next to every packed thread
+        // stack (3+ consecutive rejections per small mmap) and regressed paint
+        // 0/8; the proven crash had the victim's rsp INSIDE the reused range. (satoru)
+        if (!clash) {
+            Process* victim = Scheduler::FindStackOwnerInRange(
+                task->address_space, nullptr, base, base + length);
+            if (victim) {
+                static uint32_t s_reuse_logs = 0;
+                if (s_reuse_logs < 12) {
+                    s_reuse_logs++;
+                    SerialLogger::Log("[STKREUSE] victim=");
+                    SerialLogger::LogDec((int)victim->pid);
+                    SerialLogger::Log(" base=");
+                    SerialLogger::LogHex64(base);
+                    SerialLogger::Log(" len=");
+                    SerialLogger::LogHex64(length);
+                    SerialLogger::Log("\r\n");
+                }
+                clash = true;
+            }
+        }
+        // task 26 v4 (the phys-same reuse riddle): NEVER hand out a range that
+        // still has PRESENT ptes - the region table said free but the pages are
+        // live (a kept-pages/freed-va hole from ANY source: munmap keeps, mremap,
+        // exit teardown). the fix3 crashes showed a squatter on frames that were
+        // never freed with NO [stkkeep] for that va - this catches + blocks the
+        // hand-out at the one choke point every auto-placed mmap crosses, and
+        // the log attributes the source. full scan for stack-sized ranges,
+        // sampled for big ones. (satoru)
+        if (!clash) {
+            uint64_t stride = (length <= (256ull << 10)) ? PAGE_SIZE
+                              : align_up_u64(length / 32, PAGE_SIZE);
+            for (uint64_t o = 0; o < length; o += stride) {
+                uint64_t pv = base + o;
+                if (KernelVMM::QueryMappingInAddressSpace(task->address_space, pv)) {
+                    static uint32_t s_clash_logs = 0;
+                    if (s_clash_logs < 12) {
+                        s_clash_logs++;
+                        SerialLogger::Log("[MMAPCLASH] pid=");
+                        SerialLogger::LogDec((int)task->pid);
+                        SerialLogger::Log(" base=");
+                        SerialLogger::LogHex64(base);
+                        SerialLogger::Log(" len=");
+                        SerialLogger::LogHex64(length);
+                        SerialLogger::Log(" presentva=");
+                        SerialLogger::LogHex64(pv);
+                        SerialLogger::Log("\r\n");
+                    }
+                    clash = true;
+                    break;
+                }
+            }
+        }
+        if (!clash) return base;
         base = align_up_u64(base + length + PAGE_SIZE, PAGE_SIZE);
     }
     return 0;
@@ -6832,6 +6903,23 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             Process* yt2 = Scheduler::GetCurrentProcess();
             if (yt2 && current_syscall_frame) {
                 current_syscall_frame->rax = 0;                 // resume value of sched_yield (satoru)
+                // [YRET] save-side fingerprint (the lost-store hunt): the qword
+                // at [user rsp+8] is the yield-return address the caller's CALL
+                // just pushed. record value + backing phys + seq; LoadUserFrame
+                // re-verifies at the paired resume. page-walk read only. (satoru)
+                {
+                    uint64_t yva = current_syscall_frame->rsp + 8;
+                    uint64_t yv  = 0;
+                    if (read_user_u64(yt2, yva, &yv)) {
+                        yt2->yret_va   = yva;
+                        yt2->yret_val  = yv;
+                        yt2->yret_phys = KernelVMM::QueryMappingInAddressSpace(
+                            yt2->address_space, yva & ~0xFFFULL);
+                        yt2->yret_seq  = yt2->save_seq + 1;   // the seq SaveUserFrame is about to stamp (satoru)
+                    } else {
+                        yt2->yret_seq = 0;   // unreadable: disarm this cycle (satoru)
+                    }
+                }
                 Scheduler::SaveUserFrame(yt2, current_syscall_frame, 7);   // site 7 = sched_yield (satoru)
                 if (switch_to_ready_user(current_syscall_frame)) return 0;
             }
@@ -7415,6 +7503,19 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
             // the 192-entry table. (satoru)
             poll_unregister(p->task);
 
+            // task 26 v3: release a deferred stack-range munmap. a sibling
+            // munmapped this thread's in-use stack while it was live; the va +
+            // pages were kept until now. re-run the unmap as the dying thread -
+            // PageIsLiveStack excludes the caller, so the pages free properly
+            // and the kept region trims away. (satoru)
+            if (p->task->stk_unmap_start && p->task->stk_unmap_end > p->task->stk_unmap_start) {
+                uint64_t us = p->task->stk_unmap_start;
+                uint64_t ue = p->task->stk_unmap_end;
+                p->task->stk_unmap_start = 0;
+                p->task->stk_unmap_end   = 0;
+                sys_munmap(us, ue - us);
+            }
+
             // clone child_cleartid: a thread exiting must zero *clear_child_tid
             // and futex-wake it so a joiner blocked in pthread_join wakes up.
             // the write goes through this task's (shared) address space. (satoru)
@@ -7484,6 +7585,13 @@ int32_t LinuxSyscall::sys_fork() {
     if (!parent || !parent_task || !parent_task->is_user() || !current_syscall_frame) {
         return -38;
     }
+
+    // [fork] timestamp (the lost-store hunt): a fork demotes the parent's live
+    // ptes to cow+ro; a [YRET] phys-changed event bracketed by this line names
+    // the cow generation swap as the mechanism. (satoru)
+    SerialLogger::Log("[fork] pid="); SerialLogger::LogDec(parent->pid);
+    SerialLogger::Log(" t="); SerialLogger::LogDec((int)Timer::GetRealMs64());
+    SerialLogger::Log("\r\n");
 
     Process* child_task = Scheduler::CloneUserProcess(parent_task);
     if (!child_task) return -12;
@@ -9472,9 +9580,52 @@ int32_t LinuxSyscall::sys_munmap(uintptr_t addr, uint64_t length) {
         uint64_t overlap_end = end < region->end ? end : region->end;
         if (overlap_start >= overlap_end) continue;
 
-        unmap_user_range(task, overlap_start, overlap_end);
+        // task 26 ROOT FIX v2: capture the region's identity BEFORE the trim
+        // (the trim mutates it), unmap with kept-span tracking, trim normally,
+        // then re-claim JUST the kept live-stack span as a fresh region so
+        // choose_mmap_base can never hand those pages' VAs to a new thread
+        // (two threads then time-share one stack = the cr2=0xA corruptor).
+        // freed pages outside the kept span release their VA normally - v1
+        // leaked the whole overlap and regressed paint 0/8. (satoru)
+        uint64_t keep_pf = region->page_flags;
+        uint32_t keep_fl = region->flags;
+        uint64_t kept_lo = ~0ull, kept_hi = 0;
+        unmap_user_range(task, overlap_start, overlap_end, &kept_lo, &kept_hi);
         if (!split_or_trim_region(task, region, overlap_start, overlap_end)) {
             return -12;
+        }
+        if (kept_lo != ~0ull) {
+            uint64_t span_end = kept_hi + PAGE_SIZE;
+            if (!add_region(task, kept_lo, span_end, keep_pf, keep_fl)) {
+                SerialLogger::Log("[stkkeep] REGION TABLE FULL - va hole open\r\n");
+            }
+            // task 26 v3: DEFER the release to the victim's exit instead of
+            // leaking forever (the permanent leak shifted allocation placement
+            // for the rest of the boot and tilted the startup lottery early).
+            // record the span on the victim; sys_exit re-runs the munmap as
+            // the dying thread, whose own pages are then unprotected, so va +
+            // frames release properly ms later. (satoru)
+            Process* victim = Scheduler::FindStackOwnerInRange(
+                task->address_space, task, kept_lo, span_end);
+            if (victim) {
+                if (victim->stk_unmap_start == 0 || kept_lo < victim->stk_unmap_start)
+                    victim->stk_unmap_start = kept_lo;
+                if (span_end > victim->stk_unmap_end)
+                    victim->stk_unmap_end = span_end;
+            }
+            static uint32_t s_keep_logs = 0;
+            if (s_keep_logs < 12) {
+                s_keep_logs++;
+                SerialLogger::Log("[stkkeep] pid=");
+                SerialLogger::LogDec((int)(task ? task->pid : 0));
+                SerialLogger::Log(" kept=");
+                SerialLogger::LogHex64(kept_lo);
+                SerialLogger::Log("..");
+                SerialLogger::LogHex64(span_end);
+                SerialLogger::Log(" victim=");
+                SerialLogger::LogDec(victim ? (int)victim->pid : 0);
+                SerialLogger::Log("\r\n");
+            }
         }
         unmapped = true;
     }

@@ -9,6 +9,7 @@
 #include "../drivers/cpu_detect.h"
 #include "../proc/spinlock.h"
 #include "../proc/scheduler.h"
+#include "../proc/smp.h"          // tlb shootdown before freeing a compressed page's frame (satoru)
 #include "../virt/ept.h"          // ept leaf walk for hypervisor guest-page compression (satoru)
 
 //  KMemX engine core. stage 2: pool + flat metadata table + stats + the
@@ -438,6 +439,15 @@ bool IsCompressible(uint64_t as, uint64_t vaddr) {
     // already compressed? (a not-present pte would already have failed the query,
     // but guard anyway against a double-take.) (satoru)
     if (meta_find(as, vaddr) >= 0) return false;
+    // task 26 (the PROVEN crossbeam ret-through-stale-slot crash): never
+    // compress a page inside a LIVE thread's stack window. the compressor
+    // snapshots content with no owner-cpu shootdown; a parked owner that
+    // resumes keeps storing through its still-cached translation, and the
+    // eventual refault serves the park-era snapshot back - the thread's ret
+    // then pops a previous cycle's return address (lost stores; the rip=0x3 /
+    // cr2=0xA class). stacks are the hottest victims (the recv spin yield
+    // parks with the stack page idle-looking) and cheap to skip. (satoru)
+    if (Scheduler::PageIsLiveStack(as, nullptr, vaddr, 64ull << 10)) return false;
     return true;
 }
 
@@ -727,6 +737,102 @@ bool HandleGuestFaultAny(uint64_t guest_phys) {
     return false;
 }
 
+// ── stale-tlb-safe deferred free for compressed pages ────────────────────────
+// CompressPage used to PMM::FreeFrame the page's frame IMMEDIATELY with only a
+// local invlpg (and only when the kmemx process' own as matched - i.e. never,
+// kmemx runs in the kernel as). a sibling core of the OWNING process could
+// still hold the translation cached and keep WRITING through it into the
+// freed-then-recycled frame: the random-victim heap spray (the crossbeam-
+// channel UAF class), at a 10ms scan cadence. frames now park here until ONE
+// fully-acked broadcast shootdown proves no core holds a stale entry; free
+// only on proof, retry next flush otherwise. single-core frees directly. (satoru)
+struct CFreeEnt {
+    uint64_t phys, seq;   // frame + TlbFlushStartSeq proof stamp (satoru)
+    uint64_t as, va;      // for the verify-or-undo pass; va=0 -> free-only (satoru)
+    int      slot;        // meta slot at queue time (re-verified at flush) (satoru)
+};
+static CFreeEnt g_cfree[64];
+static int g_cfree_n = 0;
+void FlushPendingCompressFrees() {
+    if (g_cfree_n <= 0) return;
+    if (SMP::OnlineCount() <= 1) {
+        for (int i = 0; i < g_cfree_n; i++) PMM::FreeFrame(g_cfree[i].phys);
+        g_cfree_n = 0;
+        return;
+    }
+    SMP::BroadcastTlbFlush();
+    // free ONLY frames whose stamp the full-ack epoch has passed: a flush that
+    // STARTED after the pte clear (stamp) and fully acked. a coarse before/
+    // after compare could ride a CONCURRENT broadcaster's flush that started
+    // BEFORE our pte clears - false proof (reviewer finding). keep the rest
+    // parked for the next flush. (satoru)
+    uint64_t safe = SMP::TlbFlushFullSeq();
+    int keep = 0;
+    for (int i = 0; i < g_cfree_n; i++) {
+        if (safe > g_cfree[i].seq) {
+            // task 26 VERIFY-OR-UNDO (the proven lost-store corruptor): the
+            // snapshot was taken BEFORE any shootdown, so a stale-tlb owner
+            // may have kept storing into this frame after it. the epoch now
+            // proves no cpu holds the translation -> the frame is immutable ->
+            // re-crc it. a mismatch means the pool copy is STALE: serving it
+            // back at refault LOSES the owner's stores (the crossbeam ret-
+            // through-stale-slot crash; the glib vanished-unlock-store wedge).
+            // undo: restore the original frame into the leaf, drop the copy.
+            // no tlb flush needed on undo - the epoch proved no cpu caches
+            // this va, so the next touch page-walks the now-present pte. (satoru)
+            bool undone = false;
+            if (g_cfree[i].va) {
+                uint64_t f2; g_lock.LockIrqSave(&f2);
+                int s = g_cfree[i].slot;
+                if (s >= 0 && meta_find(g_cfree[i].as, g_cfree[i].va) == s) {
+                    uint32_t now_crc = KMemXLZ4::Crc32(
+                        (const uint8_t*)(uintptr_t)g_cfree[i].phys, PAGE);
+                    if (now_crc != g_meta[s].crc32) {
+                        KernelVMM::KmemxRestoreLeaf(g_cfree[i].as, g_cfree[i].va,
+                                                    g_cfree[i].phys,
+                                                    g_meta[s].orig_pte_flags);
+                        free_slot_locked(s);
+                        undone = true;
+                        static uint32_t s_undo_logs = 0;
+                        if (s_undo_logs < 16) {
+                            s_undo_logs++;
+                            SerialLogger::Log("[kmxundo] as=");
+                            SerialLogger::LogHex64(g_cfree[i].as);
+                            SerialLogger::Log(" va=");
+                            SerialLogger::LogHex64(g_cfree[i].va);
+                            SerialLogger::Log("\r\n");
+                        }
+                    }
+                }
+                g_lock.UnlockIrqRestore(f2);
+            }
+            if (!undone) PMM::FreeFrame(g_cfree[i].phys);
+        } else {
+            g_cfree[keep] = g_cfree[i];
+            keep++;
+        }
+    }
+    g_cfree_n = keep;
+}
+static void queue_compress_free(uint64_t phys, uint64_t as, uint64_t va, int slot) {
+    if (SMP::OnlineCount() <= 1) { PMM::FreeFrame(phys); return; }
+    if (g_cfree_n >= 64) FlushPendingCompressFrees();
+    if (g_cfree_n >= 64) {
+        // still full after a failed broadcast: leak one frame rather than
+        // free unproven - 4k lost beats a stray write into a recycled frame.
+        // (the dropped entry also skips its verify; the leaked frame stays
+        // live for any stale-tlb writer, which is the safe direction.) (satoru)
+        g_cfree_n--;
+        for (int i = 0; i < g_cfree_n; i++) g_cfree[i] = g_cfree[i + 1];
+    }
+    g_cfree[g_cfree_n].phys = phys;
+    g_cfree[g_cfree_n].seq  = SMP::TlbFlushStartSeq();
+    g_cfree[g_cfree_n].as   = as;
+    g_cfree[g_cfree_n].va   = va;
+    g_cfree[g_cfree_n].slot = slot;
+    g_cfree_n++;
+}
+
 // ── stage 5/6: compress one page ─────────────────────────────────────────────
 // resolve the page's backing frame, compress its bytes into the pool, make the
 // leaf not-present + marked, then free the original frame. the original frame's
@@ -768,11 +874,13 @@ bool CompressPage(uint64_t as, uint64_t vaddr) {
     if (dt > g_stats.ns_compress_max) g_stats.ns_compress_max = dt;
     g_lock.UnlockIrqRestore(f);
 
-    // free the now-spare physical frame back to the pmm (the page lives in the
-    // pool now) and flush the stale tlb entry. done OUTSIDE the lock - PMM has its
-    // own irq guard, and the leaf is already not-present so no one can fault it
-    // into a half state. (satoru)
-    PMM::FreeFrame(phys);
+    // park the now-spare physical frame for a PROOF-GATED free (see
+    // queue_compress_free above): a sibling core of the owning process may
+    // still hold this translation cached, so the frame must not recycle until
+    // a fully-acked shootdown. done OUTSIDE the lock - PMM has its own irq
+    // guard, and the leaf is already not-present so no one can fault it into
+    // a half state. (satoru)
+    queue_compress_free(phys, as, vaddr, slot);   // + verify-or-undo identity (satoru)
     if (as == KernelVMM::GetCurrentAddressSpace()) KernelVMM::InvalidatePage(vaddr);
     return true;
 }
@@ -900,6 +1008,9 @@ int ScanAndCompress(int budget) {
     // than thousands of INVLPGs and the aged pages span many ranges. only needed
     // when we actually aged pages in the active address space. cheap + safe. (satoru)
     if (aged > 0) KernelVMM::FlushTLB();
+    // one shootdown covers every page this batch compressed; frames free only
+    // on proof. (satoru)
+    FlushPendingCompressFrees();
     return taken;
 }
 
@@ -966,6 +1077,7 @@ int CompressProcess(uint32_t pid) {
             if (CompressPage(as, va)) taken++;
         }
     }
+    FlushPendingCompressFrees();   // proof-gated frame release (satoru)
     return taken;
 }
 

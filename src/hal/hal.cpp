@@ -498,6 +498,15 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                         raw_str(" oncpu="); raw_hex(ft->on_cpu);
                         raw_str(" lastcpu="); raw_hex(ft->last_run_cpu);
                         raw_str("\r\n");
+                        // [YRET] decode row: the save-side fingerprint of the
+                        // yield-return slot + which save this task last resumed
+                        // from (loadseq != saveseq = stale resume). (satoru)
+                        raw_str("[RAWEXC2] loadseq="); raw_hex(ft->last_load_seq);
+                        raw_str(" yseq="); raw_hex(ft->yret_seq);
+                        raw_str(" yva="); raw_hex(ft->yret_va);
+                        raw_str(" yval="); raw_hex(ft->yret_val);
+                        raw_str(" yphys="); raw_hex(ft->yret_phys);
+                        raw_str("\r\n");
                         uint64_t sbase = frame->rsp & ~7ULL;   // a torn rsp may be unaligned (satoru)
                         // wrong-generation probe (agent rec #5): the PHYS frame
                         // of the fault-rsp page - the join key against kmemx/

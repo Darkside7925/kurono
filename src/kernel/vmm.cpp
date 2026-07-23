@@ -1,9 +1,26 @@
 #include "vmm.h"
 #include "../drivers/serial.h"
+#include "../proc/cgroup.h"     // memory.max charge on user page maps (satoru)
+#include "../proc/scheduler.h"  // current task -> charging cgroup (satoru)
+#include "pmm.h"                // ram top - the hardened walks bound every table deref (satoru)
 
 //  virtual memory manager implementation (x86_64 4-level paging)
 
 uint64_t KernelVMM::pml4_phys = 0;
+
+// cgroup memory.max chokepoint. every user page (PTE_USER) mapped into a
+// per-process address space passes through MapPage*/MapRange*InAddressSpace,
+// so charging here covers the mmap / brk / demand-zero / stack paths without
+// touching the syscall layer. the charge lands on the CURRENT task's cgroup
+// (linux memcg charges the allocating task) but is recorded in a ledger keyed
+// by the address-space root, so frees and teardown always uncharge the right
+// account no matter which task performs them. tasks outside any cgroup
+// (cgroup_id 0 - everything except kinit service units) short-circuit inside
+// ChargeUserPages at zero cost. (satoru)
+static inline uint32_t current_cgroup_id() {
+    Process* cur = Scheduler::GetCurrentProcess();
+    return cur ? cur->cgroup_id : 0;
+}
 
 // since we're identity-mapped, phys == virt for anything below 16gb
 static inline uint64_t* phys_to_virt(uint64_t phys) {
@@ -65,6 +82,9 @@ static void free_user_tree(uint64_t table_phys, int level) {
         if (level > 1 && !(entry & PTE_HUGE)) {
             free_user_tree(child_phys, level - 1);
         } else if (!(entry & PTE_HUGE)) {
+            // task 26 guard: the leaf pte dies with this tree - clear the
+            // mapped bit so the freed frame is re-handable. (satoru)
+            PMM::MarkFrameMapped(child_phys, false);
             PMM::FreeFrame(child_phys);
         }
     }
@@ -216,29 +236,35 @@ static bool map_page_in_root(uint64_t root_phys, uint64_t virt_addr,
     return map_page_in_root_ex(root_phys, virt_addr, phys_addr, flags, nullptr);
 }
 
-static void unmap_page_in_root(uint64_t root_phys, uint64_t virt_addr, bool free_frame) {
+// returns true when a PRESENT user (PTE_USER) frame was actually freed, so
+// the callers can uncharge the cgroup memory ledger by exactly the pages that
+// really went back to the pmm. (satoru)
+static bool unmap_page_in_root(uint64_t root_phys, uint64_t virt_addr, bool free_frame) {
     virt_addr &= ~0xFFFULL;
 
     uint64_t* pml4 = phys_to_virt(root_phys);
     uint16_t p4i = pml4_index(virt_addr);
-    if (!(pml4[p4i] & PTE_PRESENT)) return;
+    if (!(pml4[p4i] & PTE_PRESENT)) return false;
 
     uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
     uint16_t p3i = pdpt_index(virt_addr);
-    if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return;
+    if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return false;
 
     uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
     uint16_t p2i = pd_index(virt_addr);
-    if (!(pd[p2i] & PTE_PRESENT) || (pd[p2i] & PTE_HUGE)) return;
+    if (!(pd[p2i] & PTE_PRESENT) || (pd[p2i] & PTE_HUGE)) return false;
 
     uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
     uint16_t p1i = pt_index(virt_addr);
-    if (!(pt[p1i] & PTE_PRESENT)) return;
+    if (!(pt[p1i] & PTE_PRESENT)) return false;
 
+    bool user_freed = false;
     if (free_frame) {
         PMM::FreeFrame(pt[p1i] & ~0xFFFULL);
+        user_freed = (pt[p1i] & PTE_USER) != 0;
     }
     pt[p1i] = 0;
+    return user_freed;
 }
 
 // rewrite the protection bits of an existing 4kb leaf pte in place, keeping the
@@ -273,11 +299,24 @@ static bool protect_page_in_root(uint64_t root_phys, uint64_t virt_addr,
 }
 
 static uint64_t query_mapping_in_root(uint64_t root_phys, uint64_t virt_addr) {
+    // HARDENED walk: the futex sweep re-walks PARKED waiters' address spaces
+    // every 8ms, and a stale root (task struct recycled or address space
+    // destroyed while a stale waiter slot survived) hands this walk freed,
+    // reused table frames whose garbage "entries" decode to wild pointers -
+    // dereferencing one #GP'd the kernel from the sweep's irq context (the
+    // p4 boot3 panic; the dump stack was full of ftxgraph strings). bound the
+    // root and every next-level table to real, identity-mapped ram before
+    // touching it - a garbage entry then reads as "not mapped", never as a
+    // wild deref. (satoru)
+    uint64_t ram_top = PMM::GetTotalMemory();
+    if (!root_phys || (root_phys & 0xFFFULL) || root_phys >= ram_top) return 0;
     uint64_t* pml4 = phys_to_virt(root_phys);
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return 0;
 
-    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint64_t pdpt_phys = pml4[p4i] & ~0xFFFULL & 0x000FFFFFFFFFF000ULL;
+    if (pdpt_phys >= ram_top) return 0;
+    uint64_t* pdpt = phys_to_virt(pdpt_phys);
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT)) return 0;
     // mask to the 52-bit physical frame (bits 12-51), stripping the NX bit (63)
@@ -288,14 +327,18 @@ static uint64_t query_mapping_in_root(uint64_t root_phys, uint64_t virt_addr) {
         return (pdpt[p3i] & 0x000FFFFFC0000000ULL) | (virt_addr & 0x3FFFFFFFULL);
     }
 
-    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint64_t pd_phys = pdpt[p3i] & ~0xFFFULL & 0x000FFFFFFFFFF000ULL;
+    if (pd_phys >= ram_top) return 0;
+    uint64_t* pd = phys_to_virt(pd_phys);
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT)) return 0;
     if (pd[p2i] & PTE_HUGE) {
         return (pd[p2i] & 0x000FFFFFFFE00000ULL) | (virt_addr & 0x1FFFFFULL);
     }
 
-    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint64_t pt_phys = pd[p2i] & ~0xFFFULL & 0x000FFFFFFFFFF000ULL;
+    if (pt_phys >= ram_top) return 0;
+    uint64_t* pt = phys_to_virt(pt_phys);
     uint16_t p1i = pt_index(virt_addr);
     if (!(pt[p1i] & PTE_PRESENT)) return 0;
 
@@ -303,25 +346,35 @@ static uint64_t query_mapping_in_root(uint64_t root_phys, uint64_t virt_addr) {
 }
 
 static uint64_t query_page_flags_in_root(uint64_t root_phys, uint64_t virt_addr) {
+    // same hardening as query_mapping_in_root: never deref a table pointer
+    // outside real ram (stale roots / recycled frames feed garbage here). (satoru)
+    uint64_t ram_top = PMM::GetTotalMemory();
+    if (!root_phys || (root_phys & 0xFFFULL) || root_phys >= ram_top) return 0;
     uint64_t* pml4 = phys_to_virt(root_phys);
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return 0;
 
-    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint64_t pdpt_phys = pml4[p4i] & ~0xFFFULL & 0x000FFFFFFFFFF000ULL;
+    if (pdpt_phys >= ram_top) return 0;
+    uint64_t* pdpt = phys_to_virt(pdpt_phys);
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT)) return 0;
     if (pdpt[p3i] & PTE_HUGE) {
         return pdpt[p3i] & (0xFFFULL | PTE_NX);
     }
 
-    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint64_t pd_phys = pdpt[p3i] & ~0xFFFULL & 0x000FFFFFFFFFF000ULL;
+    if (pd_phys >= ram_top) return 0;
+    uint64_t* pd = phys_to_virt(pd_phys);
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT)) return 0;
     if (pd[p2i] & PTE_HUGE) {
         return pd[p2i] & (0xFFFULL | PTE_NX);
     }
 
-    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint64_t pt_phys = pd[p2i] & ~0xFFFULL & 0x000FFFFFFFFFF000ULL;
+    if (pt_phys >= ram_top) return 0;
+    uint64_t* pt = phys_to_virt(pt_phys);
     uint16_t p1i = pt_index(virt_addr);
     if (!(pt[p1i] & PTE_PRESENT)) return 0;
 
@@ -388,6 +441,11 @@ void KernelVMM::DestroyAddressSpace(uint64_t root_pml4) {
         free_user_tree(entry & ~0xFFFULL, 3);
         pml4[index] = 0;
     }
+
+    // settle the cgroup memory ledger: everything this space still had
+    // charged is uncharged in one shot, so a dying service unit's memcg
+    // balance returns to zero. (satoru)
+    Cgroup::ReleaseAddressSpace(root_pml4);
 
     PMM::FreeFrame(root_pml4);
 }
@@ -532,6 +590,7 @@ bool KernelVMM::KmemxMarkCompressed(uint64_t root_pml4, uint64_t virt_addr,
     // rewrite as NOT-present + the kmemx marker. the frame is the caller's to
     // free once the bytes are safely in the pool. (satoru)
     *pte = PTE_KMEMX_COMPRESSED;
+    PMM::MarkFrameMapped(e & 0x000FFFFFFFFFF000ULL, false);   // task 26 guard (satoru)
     return true;
 }
 
@@ -549,6 +608,7 @@ bool KernelVMM::KmemxRestoreLeaf(uint64_t root_pml4, uint64_t virt_addr,
     // clear any stale generation/marker; install the fresh frame + perms. (satoru)
     *pte = (phys & 0x000FFFFFFFFFF000ULL) | PTE_PRESENT | (flags & (PTE_WRITABLE |
             PTE_USER | PTE_PWT | PTE_PCD | PTE_GLOBAL | PTE_NX));
+    PMM::MarkFrameMapped(phys & 0x000FFFFFFFFFF000ULL, true);   // task 26 guard (satoru)
     if (root_pml4 == current_cr3()) InvalidatePage(virt_addr);
     return true;
 }
@@ -566,9 +626,29 @@ bool KernelVMM::MapPage(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) 
 
 bool KernelVMM::MapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                       uint64_t phys_addr, uint64_t flags) {
+    // cgroup memory.max: charge a user page before it lands. a failed charge
+    // fails the map, which the mmap/demand-zero callers surface as OOM - the
+    // enforcement linux delivers via memcg. kernel-root maps are exempt. (satoru)
+    bool charged = false;
+    if ((flags & PTE_USER) && root_pml4 != pml4_phys) {
+        if (!Cgroup::ChargeUserPages(root_pml4, current_cgroup_id(), PAGE_SIZE))
+            return false;
+        charged = true;
+    }
+    // task 26 free-while-mapped guard: replacing a present user leaf must clear
+    // the OLD frame's mapped bit before the new frame's is set. (satoru)
+    uint64_t old_phys = (flags & PTE_USER)
+        ? QueryMappingInAddressSpace(root_pml4, virt_addr & ~0xFFFULL) : 0;
     bool demoted = false;
     bool mapped = map_page_in_root_ex(root_pml4, virt_addr, phys_addr, flags, &demoted);
-    if (!mapped) return false;
+    if (!mapped) {
+        if (charged) Cgroup::UnchargeUserPages(root_pml4, PAGE_SIZE);
+        return false;
+    }
+    if (flags & PTE_USER) {
+        if (old_phys) PMM::MarkFrameMapped(old_phys & ~0xFFFULL, false);
+        PMM::MarkFrameMapped(phys_addr & ~0xFFFULL, true);
+    }
     if (root_pml4 == current_cr3()) {
         if (demoted) FlushTLB();
         else         InvalidatePage(virt_addr);
@@ -583,7 +663,13 @@ void KernelVMM::UnmapPage(uint64_t virt_addr, bool free_frame) {
 
 void KernelVMM::UnmapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                         bool free_frame) {
-    unmap_page_in_root(root_pml4, virt_addr, free_frame);
+    // task 26 free-while-mapped guard: clear the frame's mapped bit as the pte
+    // goes away. read BEFORE the unmap (the leaf is gone after). (satoru)
+    uint64_t old_phys = QueryMappingInAddressSpace(root_pml4, virt_addr & ~0xFFFULL);
+    bool user_freed = unmap_page_in_root(root_pml4, virt_addr, free_frame);
+    if (old_phys) PMM::MarkFrameMapped(old_phys & ~0xFFFULL, false);
+    if (user_freed && root_pml4 != pml4_phys)
+        Cgroup::UnchargeUserPages(root_pml4, PAGE_SIZE);   // memory.max ledger (satoru)
     if (root_pml4 == current_cr3()) InvalidatePage(virt_addr);
 }
 
@@ -625,6 +711,16 @@ bool KernelVMM::MapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
     // overflow guard
     if (pages > (1ULL << 40)) return false;
 
+    // cgroup memory.max: charge the whole user range up front (one ledger
+    // round-trip) and refund it wholesale if the map fails part-way. (satoru)
+    bool charged = false;
+    if ((flags & PTE_USER) && root_pml4 != pml4_phys) {
+        if (!Cgroup::ChargeUserPages(root_pml4, current_cgroup_id(),
+                                     pages * PAGE_SIZE))
+            return false;
+        charged = true;
+    }
+
     for (uint64_t i = 0; i < pages; i++) {
         if (!map_page_in_root(root_pml4, virt_base + i * PAGE_SIZE,
                               phys_base + i * PAGE_SIZE, flags)) {
@@ -633,6 +729,7 @@ bool KernelVMM::MapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
                 unmap_page_in_root(root_pml4, virt_base + j * PAGE_SIZE, false);
             }
             invalidate_range_if_current(root_pml4, virt_base, i);
+            if (charged) Cgroup::UnchargeUserPages(root_pml4, pages * PAGE_SIZE);
             return false;
         }
     }
@@ -650,9 +747,14 @@ void KernelVMM::UnmapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
     virt_base &= ~0xFFFULL;
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages > (1ULL << 40)) return;
+    uint64_t user_freed_pages = 0;
     for (uint64_t i = 0; i < pages; i++) {
-        unmap_page_in_root(root_pml4, virt_base + i * PAGE_SIZE, free_frames);
+        if (unmap_page_in_root(root_pml4, virt_base + i * PAGE_SIZE, free_frames))
+            user_freed_pages++;
     }
+    // one ledger uncharge for the whole range (one lock take, not per page) (satoru)
+    if (user_freed_pages && root_pml4 != pml4_phys)
+        Cgroup::UnchargeUserPages(root_pml4, user_freed_pages * PAGE_SIZE);
     invalidate_range_if_current(root_pml4, virt_base, pages);
 }
 
