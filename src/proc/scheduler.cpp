@@ -150,6 +150,10 @@ static uint32_t g_live_proc_count = 0;
 // LinuxProcess slot. (satoru)
 static constexpr uint32_t MAX_LIVE_PROCS = 256;  // 64->256 to match LINUX_MAX_PROCS (firefox thread/proc count) (satoru)
 
+// cfs pack minimum vruntime - refreshed by every pick scan; read by the wake
+// clamps and the task-28 clone debt cap. (satoru)
+static volatile uint64_t g_pack_min_vr = 0;
+
 static void init_process_common(Process* proc, const char* name, uint32_t priority) {
     memset(proc, 0, sizeof(Process));
     proc->pid = Scheduler::next_pid++;
@@ -541,7 +545,15 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
     // (satoru) start the child at the parent's vruntime, not 0. with the cfs charge
     // now applied in ScheduleNextUser, a vruntime-0 child would otherwise monopolize
     // the cpu until it caught up to its already-accumulated siblings. (satoru)
-    proc->vruntime = parent->vruntime;
+    // task 28: but CAP the inherited debt at pack-min + one slice. a leader
+    // 10s+ behind the repoll herd spawned children who inherited the whole
+    // lag and crawled 12s between their first trace points (the kx5 69-110
+    // early-stall). the child starts fresh-ish without monopolizing. (satoru)
+    {
+        uint64_t pv = parent->vruntime;
+        uint64_t cap = __atomic_load_n(&g_pack_min_vr, __ATOMIC_RELAXED) + 24;
+        proc->vruntime = (pv > cap) ? cap : pv;
+    }
 
     // clone_settls: store the thread's tls as its saved fs base so LoadUserFrame
     // installs it when this thread is switched in. do NOT wrmsr here - the
@@ -695,6 +707,25 @@ static int canary_read_user(Process* p, uint64_t va, uint8_t* dst, int n) {
         got += chunk;
     }
     return got;
+}
+
+// task 27 (the identity-map writer hunt): does phys back a PARKED thread's
+// fingerprinted yield-return page? kernel copy paths call this on their write
+// destinations - a hit means a kernel-side write is about to land in a live
+// parked stack (the surviving corruption channel). racy read-only walk under
+// the lock; page-granular. (satoru)
+Process* Scheduler::PhysIsParkedYieldStack(uint64_t phys) {
+    phys &= ~0xFFFULL;
+    if (!phys) return nullptr;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* hit = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->reaped || !p->is_user() || !p->has_user_frame) continue;
+        if (p->state == Process_Terminated && !p->on_cpu) continue;
+        if (p->yret_phys && (p->yret_phys & ~0xFFFULL) == phys) { hit = p; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return hit;
 }
 
 Process* Scheduler::FindStackOwnerInRange(uint64_t as, Process* exclude,
@@ -980,7 +1011,7 @@ void Scheduler::SetPinCpu(bool on) { g_pin_cpu = on; }
 
 // cached pack-min vruntime, refreshed by every pick scan (racy by design -
 // a tick-stale min only loosens the vruntime clamps slightly). task 22b. (satoru)
-static volatile uint64_t g_pack_min_vr = 0;
+// (moved to the top of the file - the clone debt cap at :550 needs it) (satoru)
 
 static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // cross-cpu resume guard. the SAME cpu can always re-pick its own task (it
@@ -1108,6 +1139,15 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     }
     Process* best = nullptr;
     Process* fifo = nullptr;
+    // task 28 (the early-stall crawl): bounded pick-time starvation override.
+    // the leader accrues vruntime debt vs the frozen-low repoll herd and sits
+    // Ready-unpicked for 10-130s (the kx5 69-110 crawl, ~10/13 stalls). unlike
+    // the reverted wake-clamps this mutates NO vruntime and has no herd
+    // coupling: a Ready cfs task unpicked for >64ms simply wins the next pick.
+    // ready_since_ms is stamped lazily right here and cleared by the caller on
+    // every successful pick. (satoru)
+    Process* starved = nullptr;
+    uint64_t now_ms = 0;
     uint64_t scan_min = ~0ull;   // pack-min refresh (task 22b) (satoru)
     for (Process* c = Scheduler::ready_queue; c; c = c->next) {
         if (!c->is_user()) continue;
@@ -1124,11 +1164,17 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
             continue;
         }
         if (c->sched_class == 3) continue;                       // IDLE last
+        if (now_ms == 0) now_ms = Scheduler::NowMs();
+        if (c->ready_since_ms == 0) c->ready_since_ms = now_ms;
+        else if (now_ms - c->ready_since_ms > 64 &&
+                 (!starved || c->ready_since_ms < starved->ready_since_ms))
+            starved = c;
         if (!best || c->vruntime < best->vruntime) best = c;
     }
     if (scan_min != ~0ull)
         __atomic_store_n(&g_pack_min_vr, scan_min, __ATOMIC_RELAXED);
     if (fifo) return fifo;
+    if (starved) return starved;   // oldest neglected first (task 28) (satoru)
     if (best) return best;
 
     // Final fallback: round-robin starting after `after`.
@@ -1191,6 +1237,7 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
         Process* cand = pick_next_user_nolock(cur, cpu);
         if (cand && cand != cur) {
             cand->state = Process_Running;
+            cand->ready_since_ms = 0;   // task 28: picked - clear the starvation stamp (satoru)
             next = cand;
             // finish_task: we are switching AWAY from cur. its user_frame is fully
             // saved by now (preempt SaveUserFrame ran before this call; a blocking
@@ -1293,7 +1340,10 @@ Process* Scheduler::ClaimReadyThreadForCpu(uint32_t cpu) {
         if (!pick || c->vruntime < pick->vruntime) pick = c;
     }
     if (!pick) pick = idle_pick;   // an idle cpu runs SCHED_IDLE work (satoru)
-    if (pick) pick->state = Process_Running;
+    if (pick) {
+        pick->state = Process_Running;
+        pick->ready_since_ms = 0;   // task 28: picked - clear the starvation stamp (satoru)
+    }
     g_sched_lock.UnlockIrqRestore(f);
     return pick;
 }

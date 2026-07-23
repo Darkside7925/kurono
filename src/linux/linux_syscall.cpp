@@ -1041,6 +1041,27 @@ static void clone_file_descriptors(const LinuxProcess* parent, LinuxProcess* chi
     }
 }
 
+// task 27 (the identity-map writer hunt): probe a kernel-side write dest
+// against every PARKED thread's fingerprinted yield-return page. a hit that is
+// not the current thread writing its own stack = the surviving corruption
+// channel caught in the act. cap 12 logs. (satoru)
+static inline void idwrite_probe(uint64_t phys, uint64_t user_addr, int site) {
+    Process* hit = Scheduler::PhysIsParkedYieldStack(phys);
+    if (!hit || hit == Scheduler::GetCurrentProcess() || hit->on_cpu) return;
+    static uint32_t s_idw_logs = 0;
+    if (s_idw_logs >= 12) return;
+    s_idw_logs++;
+    SerialLogger::Log("[IDWRITE] site=");
+    SerialLogger::LogDec(site);
+    SerialLogger::Log(" victim=");
+    SerialLogger::LogDec((int)hit->pid);
+    SerialLogger::Log(" va=");
+    SerialLogger::LogHex64(user_addr);
+    SerialLogger::Log(" phys=");
+    SerialLogger::LogHex64(phys);
+    SerialLogger::Log("\r\n");
+}
+
 static bool write_user_u32(Process* proc, uint64_t user_addr, uint32_t value) {
     if (!proc || !proc->is_user() || !user_addr) return false;
     if ((user_addr & 0xFFFULL) > PAGE_SIZE - sizeof(uint32_t)) return false;
@@ -1048,6 +1069,7 @@ static bool write_user_u32(Process* proc, uint64_t user_addr, uint32_t value) {
     uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, user_addr);
     if (!phys) return false;
 
+    idwrite_probe(phys, user_addr, 1);   // task 27 (satoru)
     *(uint32_t*)(uintptr_t)phys = value;
     return true;
 }
@@ -4056,6 +4078,13 @@ void LinuxSyscall::DestroyProcess(int pid_idx) {
         if (p->fds[i].open) {
             if (p->fds[i].type == LFD_EXT4)
                 Ext4::Close(p->fds[i].backend_fd);
+            // task 28: sever sockets/pipes at process death too - a dead
+            // child's pipe must deliver POLLHUP to its parent NOW, not after
+            // the parent's 4s poll timeout (the glxtest tax). refcounted, so
+            // shared fds only sever on the last holder. (satoru)
+            else if ((p->fds[i].type == LFD_SOCKET || p->fds[i].type == LFD_PIPE) &&
+                     p->fds[i].backend_fd >= 0)
+                UnixSocket::Close(p->fds[i].backend_fd);
             // kvfs fds closed similarly
             p->fds[i].open = false;
         }
@@ -7503,6 +7532,35 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
             // the 192-entry table. (satoru)
             poll_unregister(p->task);
 
+            // task 28: sever this process's sockets/pipes AT EXIT, linux
+            // exit_files semantics - NOT at reap. the reap happens only when
+            // the parent waitpids, which for the glxtest child is AFTER the
+            // parent's 4s pipe poll timed out - the hup must land the moment
+            // the child dies so the poll returns NOW. gate on fd-table
+            // OWNERSHIP, not is_thread(): a vfork/CLONE_VM child is flagged
+            // thread (shared AS) but owns a COPIED fd table (no CLONE_FILES,
+            // clone path :5080) and must sweep; a pthread ALIASES the
+            // leader's table (:5078) and must not. refcounted, so shared
+            // ends only sever on the last holder. (satoru)
+            {
+                bool table_shared = false;
+                for (int oi = 0; oi < LINUX_MAX_PROCS; oi++) {
+                    LinuxProcess* op = GetProcess(oi);
+                    if (!op || op == p || !op->active) continue;
+                    if (op->fds == p->fds) { table_shared = true; break; }
+                }
+                if (!table_shared) {
+                    for (int i = 0; i < LINUX_MAX_FDS; i++) {
+                        if (p->fds[i].open &&
+                            (p->fds[i].type == LFD_SOCKET || p->fds[i].type == LFD_PIPE) &&
+                            p->fds[i].backend_fd >= 0) {
+                            UnixSocket::Close(p->fds[i].backend_fd);
+                            p->fds[i].open = false;
+                        }
+                    }
+                }
+            }
+
             // task 26 v3: release a deferred stack-range munmap. a sibling
             // munmapped this thread's in-use stack while it was live; the va +
             // pages were kept until now. re-run the unmap as the dying thread -
@@ -8710,6 +8768,14 @@ int32_t LinuxSyscall::sys_close(int fd) {
         // startup + a browsing session can't exhaust it without reclaim. (satoru)
         LinuxShmObj* s = shm_slot(lfd->backend_fd);
         if (s) __atomic_sub_fetch(&s->refcount, 1, __ATOMIC_SEQ_CST);
+    } else if (lfd->type == LFD_SOCKET || lfd->type == LFD_PIPE) {
+        // task 28 (the 4s glxtest tax): actually SEVER the socket/pipe on close.
+        // the fd was bare-flipped before, so the peer never saw the hangup and
+        // a reader polling a dead child's pipe burned the full poll timeout
+        // (firefox's glxtest = 4000ms on EVERY boot). Close() is refcounted
+        // (fork/dup Retain), so the sever fires only on the last alias; the
+        // peer's parked poller is woken NOW via the data-ready hook. (satoru)
+        if (lfd->backend_fd >= 0) UnixSocket::Close(lfd->backend_fd);
     }
     lfd->open = false;
     return 0;
