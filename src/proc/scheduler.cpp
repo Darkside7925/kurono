@@ -766,6 +766,67 @@ void Scheduler::CaptureStackCanary(Process* proc) {
 bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     if (!proc || !frame || !proc->is_user() || !proc->has_user_frame) return false;
 
+    // [YRET] load-side verify (the lost-store hunt): if this is the site-7 save
+    // we fingerprinted, re-read the yield-return slot + its backing phys and
+    // compare. value-changed + phys-changed = generation swap while parked;
+    // value-changed + phys-same = an in-place writer; value-wrong-at-save was
+    // already stamped save-side. also stamp last_load_seq at EVERY load so the
+    // RAWEXC2 dump can tell a stale resume (load_seq != save_seq). (satoru)
+    proc->last_load_seq = proc->save_seq;
+    if (proc->last_save_site == 7 && proc->yret_seq != 0 &&
+        proc->yret_seq == proc->save_seq && proc->yret_va) {
+        uint64_t nv = 0;
+        int got = canary_read_user(proc, proc->yret_va, (uint8_t*)&nv, 8);
+        uint64_t nphys = KernelVMM::QueryMappingInAddressSpace(
+            proc->address_space, proc->yret_va & ~0xFFFULL);
+        if (got == 8 && (nv != proc->yret_val || nphys != proc->yret_phys)) {
+            static uint32_t s_yret_dumps = 0;
+            if (s_yret_dumps < 12) {
+                s_yret_dumps++;
+                SerialLogger::Log("[YRET] pid=");
+                SerialLogger::LogDec((int)proc->pid);
+                SerialLogger::Log(" seq=");
+                SerialLogger::LogDec((int)proc->save_seq);
+                SerialLogger::Log(" val ");
+                SerialLogger::LogHex64(proc->yret_val);
+                SerialLogger::Log(" -> ");
+                SerialLogger::LogHex64(nv);
+                SerialLogger::Log(" phys ");
+                SerialLogger::LogHex64(proc->yret_phys);
+                SerialLogger::Log(" -> ");
+                SerialLogger::LogHex64(nphys);
+                SerialLogger::Log("\r\n");
+                // task 26 v4 frame-alias probe: is the SAME physical frame also
+                // mapped at ANOTHER live thread's stack va (a pmm/quarantine
+                // frame double-hand, not a va double-hand)? reverse-scan every
+                // live sibling's stack window for a va resolving to nphys - a
+                // hit names the alias partner directly. (satoru)
+                uint64_t f2; g_sched_lock.LockIrqSave(&f2);
+                for (Process* q = ready_queue; q; q = q->next) {
+                    if (q == proc || q->reaped || !q->is_user() || !q->has_user_frame) continue;
+                    // cross-AS too: a frame freed from one process while still
+                    // mapped, recycled into a forked child's stack, aliases
+                    // across address spaces. (satoru)
+                    uint64_t qr = q->user_frame.rsp & ~0xFFFULL;
+                    for (int64_t off = -(64ll << 10); off <= (8ll << 10); off += 0x1000) {
+                        uint64_t qva = qr + (uint64_t)off;
+                        uint64_t qp = KernelVMM::QueryMappingInAddressSpace(
+                            q->address_space, qva);
+                        if (qp && (qp & ~0xFFFULL) == (nphys & ~0xFFFULL)) {
+                            SerialLogger::Log("[ALIAS] pid=");
+                            SerialLogger::LogDec((int)q->pid);
+                            SerialLogger::Log(" va=");
+                            SerialLogger::LogHex64(qva);
+                            SerialLogger::Log(" maps same frame\r\n");
+                        }
+                    }
+                }
+                g_sched_lock.UnlockIrqRestore(f2);
+            }
+        }
+        proc->yret_seq = 0;   // one-shot per save (satoru)
+    }
+
     // saved-frame integrity verify: recompute the callee-saved hash from the
     // (possibly stomped) stored user_frame. a mismatch = a stray kernel write
     // corrupted this heap-resident frame between save and resume - the writer's

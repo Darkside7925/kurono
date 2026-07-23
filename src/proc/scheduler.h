@@ -235,6 +235,25 @@ struct Process {
     uint64_t frame_csum;
     uint8_t  frame_csum_valid;
 
+    // [YRET] instrument (the lost-store hunt): at a site-7 sched_yield save,
+    // fingerprint the just-pushed yield-return slot ([user rsp+8]) - value +
+    // backing phys + the save_seq it belongs to. LoadUserFrame re-verifies at
+    // the paired resume; any mismatch names the mechanism (stale-tlb split
+    // view / generation swap / in-place writer / stale resume). (satoru)
+    uint64_t yret_va;
+    uint64_t yret_val;
+    uint64_t yret_phys;
+    uint32_t yret_seq;
+    uint32_t last_load_seq;   // save_seq of the frame this task last RESUMED from (satoru)
+
+    // task 26 v3 (two-threads-one-stack): a sibling munmapped THIS thread's
+    // in-use stack range while it was live; the pages + va were kept (claimed)
+    // and the munmap DEFERRED here - sys_exit re-runs it as this thread (whose
+    // own pages are then no longer protected), releasing va + frames properly.
+    // 0 = none pending. (satoru)
+    uint64_t stk_unmap_start;
+    uint64_t stk_unmap_end;
+
     bool is_user() const { return (flags & PROCESS_FLAG_USER) != 0; }
     bool is_thread() const { return (flags & PROCESS_FLAG_THREAD) != 0; }
 };
