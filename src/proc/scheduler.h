@@ -246,6 +246,11 @@ struct Process {
     uint32_t yret_seq;
     uint32_t last_load_seq;   // save_seq of the frame this task last RESUMED from (satoru)
 
+    // task 28: lazily stamped by the picker when first seen Ready; cleared on
+    // every successful pick. >64ms of Ready-unpicked = the starvation override
+    // wins the pick (the early-stall crawl fix). (satoru)
+    uint64_t ready_since_ms;
+
     // task 26 v3 (two-threads-one-stack): a sibling munmapped THIS thread's
     // in-use stack range while it was live; the pages + va were kept (claimed)
     // and the munmap DEFERRED here - sys_exit re-runs it as this thread (whose
@@ -492,4 +497,7 @@ public:
     // task 25: directed wake-next hand-off - the thread this cpu just woke runs
     // next on it (linux wakeup baton-pass). called from every wake site. (satoru)
     static void NoteWakeNext(Process* woken);
+    // task 27: is phys a parked thread's fingerprinted yield-return page?
+    // kernel copy paths probe their write destinations with this. (satoru)
+    static Process* PhysIsParkedYieldStack(uint64_t phys);
 };

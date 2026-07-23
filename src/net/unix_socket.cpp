@@ -531,11 +531,17 @@ int Close(int sd) {
     if (s.refs > 1) { s.refs--; return 0; }
     s.refs = 0;
     if (s.peer_sd >= 0 && valid(s.peer_sd)) {
-        Socket& ps = g_socks[s.peer_sd];
+        int peer = s.peer_sd;
+        Socket& ps = g_socks[peer];
         ps.shutdown_wr = true;     // peer's writes will start failing
         ps.peer_sd = -1;
         // Leave any buffered RX data on the peer so it can drain after
         // our close - connection-style EOF semantics.
+        // task 28: the peer is now hung up (POLLHUP) - wake its parked
+        // poller NOW so a reader polling a dead child's pipe sees the eof
+        // immediately instead of burning its full poll timeout (the 4s
+        // glxtest tax on every firefox boot). (satoru)
+        if (g_data_ready_cb) g_data_ready_cb(peer);
     }
     s.in_use = false;
     return 0;
