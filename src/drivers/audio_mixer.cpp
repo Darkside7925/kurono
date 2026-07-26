@@ -282,6 +282,15 @@ void SetVolume(StreamID id, int v) {
     if (v < 0) v = 0; if (v > 100) v = 100;
     g_streams[id].volume_pct = v;
 }
+
+void SetPaused(StreamID id, bool paused) {
+    if (id < 0 || id >= MAX_STREAMS) return;
+    Stream* s = &g_streams[id];
+    // only flip between the two live playback states; fading/draining
+    // streams are already on their way out. (satoru)
+    if (paused  && s->state == STREAM_PLAYING) s->state = STREAM_PAUSED;
+    if (!paused && s->state == STREAM_PAUSED)  s->state = STREAM_PLAYING;
+}
 int GetVolume(StreamID id) {
     if (id < 0 || id >= MAX_STREAMS) return 0;
     return g_streams[id].volume_pct;
@@ -347,7 +356,11 @@ uint32_t Tick() {
     // every period meant an I/O-port read storm (each is a VM exit under
     // VMware) that stole cpu from the gui/input tiers and caused microstutter.
     // the gate below uses the cached queue depth (cheap, no port I/O). (satoru)
-    if (be->QueuedFrames() > PERIOD_FRAMES * 10) return 0;   // ~213ms; matches AudioServer::Tick (satoru)
+    // 6 periods (~128ms): the pit-timer backup pump in Scheduler::Tick makes
+    // pump gaps structurally impossible past a few ms, so the old 10-period
+    // (~213ms) anti-starvation cushion is no longer needed - shorter queue =
+    // tighter a/v sync with the same underrun safety. matches AudioServer::Tick. (satoru)
+    if (be->QueuedFrames() > PERIOD_FRAMES * 6) return 0;
 
     static int64_t  accum[PERIOD_FRAMES * INTERNAL_CHANNELS];
     static int16_t  output[PERIOD_FRAMES * INTERNAL_CHANNELS];

@@ -9,6 +9,7 @@
 #include "../kernel/pmm.h"   // drag-backdrop buffer alloc/free (satoru)
 #include "kss.h"             // motion tokens + live (scriptable) accent (satoru)
 #include "ui_elements.h"     // Animation::LerpColor for the traffic-light ease (satoru)
+#include "app_icons.h"       // per-window app logo in the titlebar (satoru)
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define WM_LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -307,6 +308,7 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->last_w = w; win->last_h = h;
     win->had_last = false;
     win->monitor_id = 0;
+    win->app_icon = -1;               // derive from title unless pinned (satoru)
 
     UpdateContentArea(win);
     UpdateWindowMonitor(win);   // assign to the output under its center (satoru)
@@ -391,6 +393,22 @@ void WindowManager::Minimize(int id) {
     win->state = WIN_MINIMIZED;
     win->visible = false;
     win->had_last = false;
+}
+
+void WindowManager::Unminimize(int id) {
+    Window* win = GetWindow(id);
+    if (!win || win->state != WIN_MINIMIZED) return;
+    win->state   = WIN_NORMAL;
+    win->visible = true;
+    win->dirty   = true;
+    win->had_last = false;
+    if (comp_animations_enabled && !comp_reduced_motion &&
+        comp_anim_duration_ms > 0) {
+        win->anim_kind        = 4;            // restore ease-in from the anchor (satoru)
+        win->anim_start_ms    = Timer::GetRealMs();
+        win->anim_duration_ms = (unsigned short)comp_anim_duration_ms;
+    }
+    wm_damage(win->x, win->y, win->w, win->h);
 }
 
 void WindowManager::Maximize(int id) {
@@ -977,7 +995,14 @@ void WindowManager::RenderShadow(Window* win) {
 
 void WindowManager::RenderTitlebar(Window* win) {
     bool focused = win->focused;
-    uint32_t bg       = focused ? COL_TITLE_FOCUSED : COL_TITLE_BG;
+    // ease the titlebar color across focus changes instead of snapping - the
+    // tween engine keeps its own state per window; damage the strip while the
+    // ease runs so the partial-present path keeps painting it. (satoru)
+    uint32_t bg_target = focused ? COL_TITLE_FOCUSED : COL_TITLE_BG;
+    uint32_t bg = KSS::Anim::Color(KSS::Motion::Id((uint32_t)win->id, 0x31u),
+                                   bg_target, KSS::Motion::Micro, KSS::Motion::Std);
+    if (bg != bg_target)
+        wm_damage(win->x, win->y, win->w, WM_TITLEBAR_H + 1);
     uint32_t text_col = focused ? COL_TITLE_TEXT    : COL_TITLE_TEXT_DIM;
     int wx = win->x, wy = win->y, ww = win->w;
 
@@ -1070,6 +1095,14 @@ void WindowManager::RenderTitlebar(Window* win) {
         if (title_x < title_area_start) title_x = title_area_start;
         Graphics::PushClipRect(title_area_start, wy,
                               title_area_end - title_area_start, WM_TITLEBAR_H);
+        // app logo just left of the title: pinned id first (wayland set_app_id),
+        // else derived from the title text; skip the generic placeholder so
+        // plain windows stay clean. (satoru)
+        int gid = (win->app_icon >= 0) ? win->app_icon
+                                       : AppIcons::IdForName(win->title);
+        if (gid != AppIcons::GENERIC && title_x - 22 >= title_area_start) {
+            AppIcons::Draw(gid, title_x - 22, wy + (WM_TITLEBAR_H - 16) / 2, 16);
+        }
         Graphics::DrawString(title_x, wy + (WM_TITLEBAR_H - 12) / 2, draw, text_col, 0x00000000);
         Graphics::PopClipRect();
     }

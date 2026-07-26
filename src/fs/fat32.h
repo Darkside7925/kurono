@@ -31,6 +31,16 @@ public:
     static int  WriteFile(const char* path, const void* data, uint32_t len);
     static bool Exists(const char* path);
 
+    // read side (the live mount consumer - shell `mount`/`fls`/`fcat`) (satoru)
+    // returns the file's byte size, or -1 if missing / not a file. (satoru)
+    static int  GetFileSize(const char* path);
+    // reads up to max_len bytes of the file into buf, following the cluster
+    // chain. returns bytes read or -1. (satoru)
+    static int  ReadFile(const char* path, void* buf, uint32_t max_len);
+    // renders one line per entry ("NAME  <DIR>|size") of the directory at
+    // path into out (nul-terminated). returns chars written or -1. (satoru)
+    static int  ListDir(const char* path, char* out, int max_out);
+
 private:
     static bool mounted;
     static Fat32BlockRead blk_read;
@@ -92,7 +102,10 @@ private:
     static uint32_t AllocCluster();
     static int  ClearCluster(uint32_t cluster);
     static int  FindPath(const char* path, uint32_t* parent_cluster, char short_name[11], uint32_t* found_cluster, uint8_t* found_attr, bool want_parent_only);
-    static int  FindEntryInDir(uint32_t dir_cluster, const char short_name[11], uint32_t* found_cluster, uint8_t* found_attr, uint32_t* found_entry_cluster, uint32_t* found_entry_offset);
+    static int  FindEntryInDir(uint32_t dir_cluster, const char short_name[11], uint32_t* found_cluster, uint8_t* found_attr, uint32_t* found_entry_cluster, uint32_t* found_entry_offset, uint32_t* found_size = nullptr);
+    // locate path's dir entry and report first cluster / attr / size. returns
+    // 0 on hit, 1 on missing, -1 on error. root reports attr=DIRECTORY. (satoru)
+    static int  StatPath(const char* path, uint32_t* first_cluster, uint8_t* attr, uint32_t* size);
     static int  AddEntryToDir(uint32_t dir_cluster, const char short_name[11], uint8_t attr, uint32_t first_cluster, uint32_t file_size);
     static int  CreateDir(uint32_t parent_cluster, const char short_name[11], uint32_t* new_cluster_out);
     static int  EnsureDirPath(const char* path, uint32_t* dir_cluster_out);

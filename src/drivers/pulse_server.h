@@ -38,6 +38,14 @@ namespace PulseServer {
 
     void Init();
 
+    // client pacing pass: for every live playback stream, send a
+    // PA_COMMAND_REQUEST for the bytes the mixer consumed since the last
+    // pass (real pulseaudio drives clients exactly this way - without the
+    // requests, libpulse writes its initial prebuf and then waits forever,
+    // which is why firefox audio stalled after the first fraction of a
+    // second). called from the audio kernel process, never irq. (satoru)
+    void Pace();
+
     int  ListenSd();
     int  ClientCount();
     int  StreamCount();

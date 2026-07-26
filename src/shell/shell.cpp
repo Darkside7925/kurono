@@ -416,6 +416,11 @@ bool KuronoShell::IsCommandCancelRequested() {
     return g_shell_cancel_requested;
 }
 
+// firefox jit tier (kurono.ffjit=N on the boot cmdline). (satoru)
+static int g_ff_jit_level = 0;
+void KuronoShell::SetFirefoxJit(int level) { g_ff_jit_level = level; }
+int  KuronoShell::GetFirefoxJit()          { return g_ff_jit_level; }
+
 void KuronoShell::PumpUI() {
     static bool reentrant = false;
     static uint32_t last_pump_ms = 0;
@@ -1920,6 +1925,17 @@ extern "C" {
     extern const unsigned char _binary_kurono_fonts_start[];
     extern const unsigned char _binary_kurono_fonts_end[];
 }
+// embedded nss runtime libs (Makefile objcopy of assets_nsslibs.tar); unpacked
+// to /apps/firefox/lib at firefox launch. the firefox tar ships libsoftokn3.so
+// with DT_NEEDED libsqlite3.so.0 but NO libsqlite3 anywhere (libmozsqlite3.so
+// exports zero dynamic symbols), so softoken's dlopen failed, NSS/PSM never
+// initialized, and every https connection died with the "Personal Security
+// Manager" error before cert9.db was even opened. a musl-built libsqlite3.so.0
+// satisfies the dep; extraction at launch also heals persisted installs. (satoru)
+extern "C" {
+    extern const unsigned char _binary_kurono_nsslibs_start[];
+    extern const unsigned char _binary_kurono_nsslibs_end[];
+}
 
 int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
@@ -2052,6 +2068,21 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         SerialLogger::Log(" dejavu="); SerialLogger::LogDec(KVFS::Exists("/system/fonts/DejaVuSans.ttf") ? 1 : 0);
         SerialLogger::Log("\r\n");
         if (fok) p = sappend(out, p, mx, "firefox: unpacked DejaVu fonts.\n");
+    }
+
+    // unpack the embedded nss runtime libs (libsqlite3.so.0) into
+    // /apps/firefox/lib - the loader's second search dir, next to the other nss
+    // .so files - so libsoftokn3.so's DT_NEEDED resolves and NSS/PSM can
+    // initialize (the https "Personal Security Manager" fix). runs every launch
+    // so a persisted install from before this fix heals itself. (satoru)
+    {
+        int nl_len = (int)(_binary_kurono_nsslibs_end - _binary_kurono_nsslibs_start);
+        bool nok = PackageManager::ExtractTar((const char*)_binary_kurono_nsslibs_start, nl_len, "/apps/firefox");
+        SerialLogger::Log("[ffnss] len="); SerialLogger::LogDec(nl_len);
+        SerialLogger::Log(" extract="); SerialLogger::LogDec(nok ? 1 : 0);
+        SerialLogger::Log(" sqlite="); SerialLogger::LogDec(KVFS::Exists("/apps/firefox/lib/libsqlite3.so.0") ? 1 : 0);
+        SerialLogger::Log("\r\n");
+        if (nok) p = sappend(out, p, mx, "firefox: unpacked NSS runtime libs.\n");
     }
 
     // pin gecko's compositor into the parent process (software webrender) and
@@ -2304,7 +2335,14 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"javascript.options.mem.gc_compacting\", false);\n"
             "lockPref(\"javascript.options.mem.gc_max_empty_chunk_count\", 10000);\n"
             "lockPref(\"javascript.options.mem.gc_min_empty_chunk_count\", 10000);\n"
-            "lockPref(\"javascript.options.mem.log\", true);\n"
+            // (satoru) BOOT-SPEED phase 1: mem.log=true routed every GC to stderr
+            // -> serial. with non-generational GC (below) forcing frequent startup
+            // GCs, that is a per-GC ring-0 serial write starving the cooperative
+            // scheduler (same mechanism as the mozlog flood above). the phase-0
+            // [ffcount] measurement proved the boot cost is interpreter+GC compute,
+            // not W^X, so cutting this self-inflicted serial load is a direct win.
+            // was true (a diagnostic); off for normal boots. (satoru)
+            "lockPref(\"javascript.options.mem.log\", false);\n"
             // RE-ENABLED generational + incremental GC (satoru): these were forced
             // OFF for the old single-core cooperative scheduler to dodge nursery
             // minor-GC mprotect churn. but non-generational forces EVERY allocation
@@ -2430,13 +2468,58 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "        KNAV_fired = true;\n"
             "        dump('[KNAV] blank tab after startup - kicking homepage load\\n');\n"
             "        w.gBrowser.selectedBrowser.loadURI(\n"
-            "          Services.io.newURI('http://10.0.2.2/kurono/'),\n"
+            "          Services.io.newURI('KNAV_TARGET_URL'),\n"
             "          { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });\n"
             "      } else { KNAV_fired = true; }\n"
             "    } catch (e) { dump('[KNAV] err ' + e + '\\n'); }\n"
             "  }, 15000);\n"
             "} catch (e) { dump('[KNAV] init-err ' + e + '\\n'); }\n";
-        KVFS::WriteFile("/apps/firefox/firefox.cfg", cfg, (uint32_t)__builtin_strlen(cfg));
+        // splice the SESSION'S target url into the knav kick: with a fixed
+        // mirror url here, a blank-tab flake on an https test boot silently
+        // turned the run into a mirror test - the watchdog must retry the url
+        // this launch actually asked for. (satoru)
+        {
+            static char cfgbuf[24576];   // the cfg literal is ~10-16kb; headroom so the splice can never truncate prefs (satoru)
+            const char* knav_url = (argc >= 2 && argv[1]) ? argv[1] : "http://10.0.2.2/kurono/";
+            const char* pat = "KNAV_TARGET_URL";
+            int o = 0;
+            for (const char* s = cfg; *s && o < (int)sizeof(cfgbuf) - 1; ) {
+                bool hit = true;
+                for (int k = 0; pat[k]; k++) { if (s[k] != pat[k]) { hit = false; break; } }
+                if (hit) {
+                    for (const char* u = knav_url; *u && o < (int)sizeof(cfgbuf) - 1; u++) cfgbuf[o++] = *u;
+                    s += __builtin_strlen(pat);
+                } else {
+                    cfgbuf[o++] = *s++;
+                }
+            }
+            // jit re-enable experiment (kurono.ffjit=N): the historical jit
+            // crashes (fixed-rip null-faults in the 0x1800_xxx reservation)
+            // predate the madvise align-down fix + the tlb-quarantine proof-only
+            // release - both real corruptors that zeroed/sprayed live jit pages.
+            // a later lockPref wins, so append overrides instead of editing the
+            // literal. level 1 = blinterp, 2 = +baseline+native_regexp. (satoru)
+            int jl = KuronoShell::GetFirefoxJit();
+            if (jl >= 1) {
+                const char* j1 = "lockPref(\"javascript.options.blinterp\", true);\n";
+                for (const char* s = j1; *s && o < (int)sizeof(cfgbuf) - 1; s++) cfgbuf[o++] = *s;
+            }
+            if (jl >= 2) {
+                const char* j2 =
+                    "lockPref(\"javascript.options.baselinejit\", true);\n"
+                    "lockPref(\"javascript.options.native_regexp\", true);\n";
+                for (const char* s = j2; *s && o < (int)sizeof(cfgbuf) - 1; s++) cfgbuf[o++] = *s;
+            }
+            cfgbuf[o] = 0;
+            KVFS::WriteFile("/apps/firefox/firefox.cfg", cfgbuf, (uint32_t)o);
+            if (jl > 0) {
+                SerialLogger::Log("[ffcfg] jit level=");
+                SerialLogger::LogDec(jl);
+                SerialLogger::Log(" (blinterp");
+                if (jl >= 2) SerialLogger::Log("+baseline+regexp");
+                SerialLogger::Log(")\r\n");
+            }
+        }
         SerialLogger::Log("[ffcfg] wrote autoconfig (all helper child procs disabled)\r\n");
     }
 

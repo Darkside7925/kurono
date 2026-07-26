@@ -146,15 +146,16 @@ int build_argv(const char* exec, char* store, int store_max,
     return argc;
 }
 
-// apply CPUQuota + LimitNOFILE to a freshly-loaded process unit. MemoryMax is
-// NOT applied here, it is enforced by continuous polling in Tick() (a kill on
-// breach) which works for both in-kernel test services and process units; the
-// cgroup memory.max charge hook only catches KernelHeap allocs and would miss a
-// user-space mmap, so the poll-and-kill is the reliable enforcement. CPUQuota is
-// mapped onto a per-service cgroup cpu.weight (a percent over 100 scales the
-// weight up, under 100 down) and the pid is attached. LimitNOFILE is recorded +
-// logged (the fd-table cap is enforced by the linux fd allocator per-process;
-// see the docs for the enforcement point). every decision is logged. (satoru)
+// apply CPUQuota + LimitNOFILE to a freshly-loaded process unit. MemoryMax now
+// has TWO enforcement layers: the poll-and-kill in Tick() (kill on breach,
+// works for in-kernel test services too) plus the cgroup memory.max charge at
+// the vmm user-page chokepoint (MapPage*InAddressSpace fails the map when the
+// charge would exceed memory.max, so a user mmap/brk sees real OOM). CPUQuota
+// is applied twice as well: as a proportional cpu.weight (percent over 100
+// scales the weight up, under 100 down) AND as an absolute cpu.max bandwidth
+// quota the scheduler tick charges + throttles against. LimitNOFILE is
+// recorded + logged (the fd-table cap is enforced by the linux fd allocator
+// per-process). every decision is logged. (satoru)
 void apply_runtime_limits(KService* svc, Process* p) {
     if (!svc || !p) return;
     if (svc->limits.cpu_quota_pct > 0) {
@@ -169,6 +170,13 @@ void apply_runtime_limits(KService* svc, Process* p) {
         if (cg) {
             Cgroup::EnableController(cg, Cgroup::CTRL_CPU | Cgroup::CTRL_MEMORY);
             Cgroup::SetCpuWeight(cg, w);
+            // absolute bandwidth too: CPUQuota=N% -> cpu.max "N*1000 100000"
+            // (N% of a 100ms period). the scheduler tick charges the member
+            // tasks against this pool and throttles them when it drains, so
+            // the quota is a hard cap now, not just a proportional share.
+            // (satoru)
+            Cgroup::SetCpuMax(cg, (uint64_t)svc->limits.cpu_quota_pct * 1000ULL,
+                              100000ULL);
             if (svc->limits.memory_max_kb)
                 Cgroup::SetMemoryMax(cg, (uint64_t)svc->limits.memory_max_kb * 1024ULL);
             Cgroup::Attach(cg, p->pid);

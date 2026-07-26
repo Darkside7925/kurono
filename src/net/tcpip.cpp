@@ -1,5 +1,6 @@
 #include "tcpip.h"
 #include "ipv6.h"
+#include "netfilter.h"           // packet-filter hooks on the ipv4 datapath (satoru)
 #include "../drivers/e1000.h"
 #include "../drivers/serial.h"
 #include "../drivers/timer.h"
@@ -25,6 +26,44 @@ static void slog(const char* s){ SerialLogger::Log(s); }
 static inline void net_wait_one_ms() {
     Scheduler::SleepMs(1);
 }
+
+// ---- netfilter glue (satoru) ------------------------------------------------
+// map an ipv4 protocol byte onto the netfilter match enum. unknown protocols
+// evaluate as PROTO_ANY so they only match wildcard-proto rules. (satoru)
+static inline Netfilter::MatchProto nf_proto(uint8_t ip_proto) {
+    switch (ip_proto) {
+        case IP_PROTO_ICMP: return Netfilter::PROTO_ICMP;
+        case IP_PROTO_TCP:  return Netfilter::PROTO_TCP;
+        case IP_PROTO_UDP:  return Netfilter::PROTO_UDP;
+        default:            return Netfilter::PROTO_ANY;
+    }
+}
+
+// pull src/dst ports off a tcp/udp transport header (both keep the two port
+// words first, network order). anything else reports port 0. (satoru)
+static inline void nf_ports(uint8_t ip_proto, const uint8_t* l4, int l4_len,
+                            uint16_t* sport, uint16_t* dport) {
+    *sport = 0; *dport = 0;
+    if ((ip_proto == IP_PROTO_TCP || ip_proto == IP_PROTO_UDP) && l4 && l4_len >= 4) {
+        *sport = (uint16_t)(((uint16_t)l4[0] << 8) | l4[1]);
+        *dport = (uint16_t)(((uint16_t)l4[2] << 8) | l4[3]);
+    }
+}
+
+// rate-limited drop log: first 4 drops verbatim, then one line per 256 so a
+// flood being firewalled can't melt the serial console. (satoru)
+static void slognum(int v);   // defined below; needed here (satoru)
+static void nf_log_drop(const char* where) {
+    static uint32_t s_nf_drops = 0;
+    uint32_t n = ++s_nf_drops;
+    if (n <= 4 || (n & 0xFFu) == 0) {
+        slog("[NF] drop @");
+        slog(where);
+        slog(" total=");
+        slognum((int)n);
+    }
+}
+// ---- end netfilter glue (satoru) --------------------------------------------
 
 // copy `n` bytes from `src` into the socket rx ring at rx_tail, advancing
 // rx_tail (mod TCP_RX_BUFSIZE) and rx_count. uses at most two bulk memcpy spans
@@ -463,6 +502,36 @@ bool TCPStack::SendIPv4(uint32_t dst_ip, uint8_t proto, const void* payload, int
         stats.errors_tx++;
         return false;
     }
+
+    // netfilter egress: OUTPUT then POSTROUTING, evaluated before the frame is
+    // even built. `payload` starts with the transport header, so the ports come
+    // straight off it. a filtered packet is silently discarded (never reaches
+    // the wire) and the caller sees a tx failure - the tcp retransmit machinery
+    // treats it like a black-holing firewall, which is exactly what it is. the
+    // IsEngaged gate keeps this free when no rules are configured. (satoru)
+    if (Netfilter::IsEngaged()) {
+        Netfilter::MatchProto mp = nf_proto(proto);
+        uint16_t sport, dport;
+        nf_ports(proto, (const uint8_t*)payload, len, &sport, &dport);
+        uint32_t plen = (uint32_t)(sizeof(IPv4Header) + (uint32_t)len);
+        Netfilter::Action act = Netfilter::Evaluate(
+            Netfilter::HOOK_OUTPUT, mp, local_ip, dst_ip, sport, dport,
+            nullptr, "eth0", plen);
+        if (act == Netfilter::NF_DROP || act == Netfilter::NF_REJECT) {
+            stats.dropped++;
+            nf_log_drop("OUTPUT");
+            return false;
+        }
+        act = Netfilter::Evaluate(
+            Netfilter::HOOK_POSTROUTING, mp, local_ip, dst_ip, sport, dport,
+            nullptr, "eth0", plen);
+        if (act == Netfilter::NF_DROP || act == Netfilter::NF_REJECT) {
+            stats.dropped++;
+            nf_log_drop("POSTROUTING");
+            return false;
+        }
+    }
+
     static int s_send_log = 0;
     if (s_send_log++ < 10) {
         slog("[IPv4:TX] dst=");
@@ -649,6 +718,36 @@ void TCPStack::ProcessIPv4(const void* data, int len) {
     if (total_len < ihl || total_len > len) total_len = len;
     int payload_len = total_len - ihl;
     if (payload_len < 0) payload_len = 0;
+
+    // netfilter ingress: PREROUTING then INPUT. this stack never forwards, so
+    // every accepted packet is a local delivery - FORWARD is unreachable by
+    // construction. the IsEngaged gate keeps this a single load per packet
+    // while no rules/policies are configured, preserving the firefox path.
+    // REJECT is honoured as a silent drop for now (no icmp-unreach emitter on
+    // the rx path); counters still update inside Evaluate. (satoru)
+    if (Netfilter::IsEngaged()) {
+        Netfilter::MatchProto mp = nf_proto(ip->protocol);
+        uint16_t sport, dport;
+        nf_ports(ip->protocol, payload, payload_len, &sport, &dport);
+        uint32_t sip = ntohl(ip->src_ip);
+        uint32_t dip = ntohl(ip->dst_ip);
+        Netfilter::Action act = Netfilter::Evaluate(
+            Netfilter::HOOK_PREROUTING, mp, sip, dip, sport, dport,
+            "eth0", nullptr, (uint32_t)total_len);
+        if (act == Netfilter::NF_DROP || act == Netfilter::NF_REJECT) {
+            stats.dropped++;
+            nf_log_drop("PREROUTING");
+            return;
+        }
+        act = Netfilter::Evaluate(
+            Netfilter::HOOK_INPUT, mp, sip, dip, sport, dport,
+            "eth0", nullptr, (uint32_t)total_len);
+        if (act == Netfilter::NF_DROP || act == Netfilter::NF_REJECT) {
+            stats.dropped++;
+            nf_log_drop("INPUT");
+            return;
+        }
+    }
 
     // verbose: first ~10 IPv4 packets
     static int s_ipv4_log = 0;

@@ -51,7 +51,7 @@ namespace Netfilter {
     struct Rule {
         bool         active;
         MatchProto   proto;          // PROTO_ANY = match all
-        uint32_t     src_ip;         // network order, 0 = any
+        uint32_t     src_ip;         // host order ((a<<24)|(b<<16)|(c<<8)|d), 0 = any (satoru)
         uint32_t     src_mask;       // 0 = match exact / any
         uint32_t     dst_ip;
         uint32_t     dst_mask;
@@ -80,8 +80,10 @@ namespace Netfilter {
     void Flush(Hook h);
     void SetPolicy(Hook h, Action policy);
 
-    // Evaluate a packet against a hook.  Inputs are in network byte order.
-    // Returns the action to take.  Hits update rule pkt/byte counters.
+    // Evaluate a packet against a hook.  Inputs are in HOST byte order (the
+    // tcp/ip stack works host-order internally after ntohl/ntohs; rules are
+    // stored the same way so range/mask matches are meaningful). Returns the
+    // action to take.  Hits update rule pkt/byte counters. (satoru)
     Action Evaluate(Hook h,
                     MatchProto proto,
                     uint32_t   src_ip,
@@ -99,6 +101,12 @@ namespace Netfilter {
     bool ShouldDropOutput(MatchProto proto, uint32_t src, uint32_t dst,
                           uint16_t sport, uint16_t dport,
                           const char* out_if, uint32_t pkt_len);
+
+    // fast-path gate for the datapath: false while every chain is empty AND
+    // every default policy is ACCEPT, so the rx/tx hot paths skip Evaluate
+    // entirely (a single global load per packet). recomputed on any rule or
+    // policy mutation. (satoru)
+    bool IsEngaged();
 
     Chain* GetChain(Hook h);
 }

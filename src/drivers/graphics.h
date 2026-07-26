@@ -32,6 +32,9 @@ public:
 
     static void Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp);
     static void ReinitForResolution(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp);
+    // resync the compositor to the live bga hardware geometry after a host
+    // window resize; true if a resync happened (caller relayouts). (satoru)
+    static bool SyncToHardwareGeometry();
     static void InitAdvanced(); // initialize with display controller
     static void SetRenderMode(RenderMode mode);
     static RenderMode GetRenderMode();

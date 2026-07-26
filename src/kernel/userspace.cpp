@@ -351,7 +351,13 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     // fsbase) and right before iretq. a dynamic pie set proc->fs_base via
     // ld-kurono's install_main_tls; static binaries pass 0 and set their own fs
     // later via arch_prctl. resume (preempt) reprograms fs via LoadUserFrame. (satoru)
+    // mark the launcher return context LIVE across UserspaceEnter: a fault-exit
+    // on THIS cpu may UserspaceResume back to here. cleared right after so a
+    // later fault on this same cpu (now running a dispatched thread with no
+    // launcher frame) can't longjmp through a stale context. (satoru)
+    u.return_context_valid = true;
     int exit_code = UserspaceEnter(proc->rip, entry_rsp, &u.return_context, proc->fs_base);
+    u.return_context_valid = false;
 
     KernelVMM::ActivateAddressSpace(u.kernel_address_space);
     if (u.previous_process && u.previous_process->is_user()) {
@@ -372,6 +378,18 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
 void Userspace::HandleProcessExit(int exit_code) {
     UserspaceCpuState& u = cpu();
     if (!u.active_process) return;
+
+    // ONLY longjmp back to the launcher if this cpu actually HAS a live launcher
+    // frame. an AP running a dispatched thread (ap_enter_user_frame) set
+    // active_process but never ran RunProcessWithArgs, so return_context is
+    // ZERO - UserspaceResume on it restored rip=0/rsp=0 and, already inside the
+    // #PF handler, that second null-jump faulted into a #DF (rip=0 rsp=0), the
+    // ap firefox-crash kernel panic. return instead so the caller (hal.cpp ap
+    // containment) marks the group + parks this cpu. (satoru)
+    if (!u.return_context_valid) {
+        Scheduler::MarkProcessExited(u.active_process, exit_code);
+        return;
+    }
 
     Scheduler::MarkProcessExited(u.active_process, exit_code);
     KernelVMM::ActivateAddressSpace(u.kernel_address_space);

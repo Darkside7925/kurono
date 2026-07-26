@@ -54,6 +54,12 @@ static inline void serial_outb(uint16_t port, uint8_t val) {
     __asm__ __volatile__("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
+// monotonic boot-ms source for the line timestamps, wired by the kernel once
+// the scheduler clock runs (lines print without a stamp until then). kept as
+// a function pointer so serial.cpp needs no scheduler include. (satoru)
+static uint64_t (*g_ser_now_ms)() = nullptr;
+void SerialLogger::SetTimestampSource(uint64_t (*now_ms)()) { g_ser_now_ms = now_ms; }
+
 static void serial_flush_line(uint32_t cpu) {
     int n = g_ser_linelen[cpu];
     if (n <= 0) return;
@@ -69,6 +75,18 @@ static void serial_flush_line(uint32_t cpu) {
         }
         g_ser_lock_owner = me;
     }
+    // per-line boot-ms timestamp prefix "[NNNNNN] " - turns every existing
+    // probe line into a startup-profiling data point for ~10 extra chars. (satoru)
+    if (g_ser_now_ms) {
+        uint64_t ms = g_ser_now_ms();
+        char digits[12]; int nd = 0;
+        if (ms == 0) digits[nd++] = '0';
+        while (ms > 0 && nd < 12) { digits[nd++] = (char)('0' + (ms % 10)); ms /= 10; }
+        wait_tx_ready(); serial_outb(0x3F8, '[');
+        while (nd > 0) { wait_tx_ready(); serial_outb(0x3F8, (uint8_t)digits[--nd]); }
+        wait_tx_ready(); serial_outb(0x3F8, ']');
+        wait_tx_ready(); serial_outb(0x3F8, ' ');
+    }
     for (int i = 0; i < n; i++) {
         wait_tx_ready();
         serial_outb(0x3F8, (uint8_t)g_ser_linebuf[cpu][i]);
@@ -80,8 +98,23 @@ static void serial_flush_line(uint32_t cpu) {
     g_ser_linelen[cpu] = 0;
 }
 
+// panic-raw mode (see serial.h): direct uart writes, no locks/buffers/mirror. (satoru)
+static volatile bool g_ser_panic_raw = false;
+void SerialLogger::SetPanicRaw(bool on) { g_ser_panic_raw = on; }
+
 void SerialLogger::Log(const char* s) {
     const char* start = s;
+    if (g_ser_panic_raw) {
+        // fatal-dump path: straight to the wire, BOUNDED tx wait, touch no
+        // shared state at all - never block on another core's lock. (satoru)
+        while (*s) {
+            for (int t = 0; t < 100000; t++) {
+                if (inb(0x3F8 + 5) & 0x20) break;
+            }
+            serial_outb(0x3F8, (uint8_t)*s++);
+        }
+        return;
+    }
     if (!g_serial_quiet) {
         uint32_t cpu = SMP::CpuIndex();
         if (cpu >= SMP_MAX_CPUS) cpu = 0;
@@ -104,6 +137,26 @@ void SerialLogger::LogHex(uint32_t n) {
         buf[i] = hex[n & 0xF];
         n >>= 4;
     }
+    Log(buf);
+}
+
+void SerialLogger::LogHex64(uint64_t n) {
+    // full 16-digit form: LogHex(uint32_t) silently truncated 64-bit user
+    // addresses in diagnostics (a futex uaddr printed as 0x0B3AC628 when the
+    // real address was 0x18000B3AC628).
+    // byte-wise init ON PURPOSE: drivers/ compiles WITHOUT -mno-sse, and the
+    // original string-literal init emitted a movaps that #GP'd on the
+    // misaligned irq stack when the futex sweep logged a wedge (the p4/p5
+    // "graph strings on the panic stack" kernel panics - it was THIS, not the
+    // page walk). do not "clean this up" into an initializer. (satoru)
+    const char* hex = "0123456789ABCDEF";
+    char buf[19];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 17; i >= 2; i--) {
+        buf[i] = (char)hex[n & 0xF];
+        n >>= 4;
+    }
+    buf[18] = 0;
     Log(buf);
 }
 
