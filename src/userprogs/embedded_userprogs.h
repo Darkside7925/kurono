@@ -23,6 +23,9 @@ extern "C" {
     // pthreads smoke-test blob (satoru)
     extern const uint8_t _binary_pthread_test_elf_start[]  __attribute__((weak));
     extern const uint8_t _binary_pthread_test_elf_end[]    __attribute__((weak));
+    // signal-delivery self-test blob (satoru)
+    extern const uint8_t _binary_signal_test_elf_start[]   __attribute__((weak));
+    extern const uint8_t _binary_signal_test_elf_end[]     __attribute__((weak));
     // dynamic musl pie blob - first ld-kurono dynamic-load test (satoru)
     extern const uint8_t _binary_dyntest_elf_start[]       __attribute__((weak));
     extern const uint8_t _binary_dyntest_elf_end[]         __attribute__((weak));
@@ -123,6 +126,18 @@ inline const uint8_t* PthreadTestData() { return _binary_pthread_test_elf_start;
 inline uint32_t PthreadTestSize() {
     return (uint32_t)((uintptr_t)_binary_pthread_test_elf_end -
                       (uintptr_t)_binary_pthread_test_elf_start);
+}
+
+// signal-delivery self-test accessors (satoru)
+inline bool HasSignalTest() {
+    return _binary_signal_test_elf_start != nullptr &&
+           _binary_signal_test_elf_end   != nullptr &&
+           +_binary_signal_test_elf_end > +_binary_signal_test_elf_start;
+}
+inline const uint8_t* SignalTestData() { return _binary_signal_test_elf_start; }
+inline uint32_t SignalTestSize() {
+    return (uint32_t)((uintptr_t)_binary_signal_test_elf_end -
+                      (uintptr_t)_binary_signal_test_elf_start);
 }
 
 // dynamic musl pie accessors (satoru)

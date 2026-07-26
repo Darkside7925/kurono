@@ -30,4 +30,17 @@ namespace KernelProcesses {
     // script once, so a real on-screen animation is driven through the kj host
     // bindings (kss.transition/kss.set/ui.notify). (satoru)
     void ArmKjDemo();
+
+    // queue a shell command to run on the Shell kernel-process WITHOUT a
+    // terminal window (desktop launchers, e.g. the firefox icon). output goes
+    // to serial only. single slot: returns false if a previous detached
+    // command is still queued or running. (satoru)
+    bool RunShellCommandDetached(const char* cmd);
+
+    // last Timer::GetRealMs() the gui process stamped at its loop top - the
+    // graphics-loop heartbeat. PumpUI reads it to decide whether a live gui
+    // process already owns input + rendering (fresh heartbeat -> PumpUI must
+    // NOT run a second concurrent ui pipeline; that raced the wayland event
+    // stream and the compositor from another cpu). (satoru)
+    uint32_t LastGuiFrameMs();
 }

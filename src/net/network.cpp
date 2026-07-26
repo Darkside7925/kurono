@@ -444,8 +444,8 @@ static const DNSEntry dns_cache[] = {
     {"router",             192, 168, 1, 1},
     {"google.com",         142, 250, 80, 46},
     {"www.google.com",     142, 250, 80, 46},
-    {"example.com",        93, 184, 216, 34},
-    {"www.example.com",    93, 184, 216, 34},
+    {"example.com",        93, 184, 215, 14},   // moved off 216.34 in 2024 (satoru)
+    {"www.example.com",    93, 184, 215, 14},
     {"github.com",         140, 82, 121, 3},
     {"www.github.com",     140, 82, 121, 3},
     {"cloudflare.com",     104, 16, 132, 229},
@@ -867,6 +867,12 @@ const char* WiFi::WirelessChipName() {
 bool WiFi::IsLinkUp() {
     if (!link_probed) ProbePCIWireless();
     if (detected_link == LINK_WIFI)     return state == WIFI_CONNECTED;
+    // a detected WIRED nic IS a live link (this is the common case under
+    // qemu's emulated e1000). the old code only treated LINK_WIFI as "up",
+    // so with ethernet the taskbar + settings showed DISCONNECTED even though
+    // networking fully worked, and SignalBars() returned 0 (its ethernet=4
+    // path was unreachable behind this check). (satoru)
+    if (detected_link == LINK_ETHERNET) return E1000::IsDetected();
     return false;
 }
 

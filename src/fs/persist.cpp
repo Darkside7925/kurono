@@ -328,6 +328,16 @@ namespace {
                     KernelHeap::Free(child); continue;
                 }
                 int64_t got = KFS::ReadFile(child, buf, (uint64_t)sz);
+                // a transient read failure here silently killed whole boots
+                // (omni.ja got=-1 -> "Couldn't load XPCOM." -> firefox exit
+                // 255, seen ~1/25 boots). the image is a fresh golden copy so
+                // the data is good - retry before declaring it lost. (satoru)
+                for (int rt = 0; rt < 3 && got != sz; rt++) {
+                    SerialLogger::Log("[persist] RESTORE retry ");
+                    SerialLogger::LogDec(rt + 1);
+                    SerialLogger::Log(" "); SerialLogger::Log(child); SerialLogger::Log("\r\n");
+                    got = KFS::ReadFile(child, buf, (uint64_t)sz);
+                }
                 if (got == sz) {
                     KVFS::WriteFile(child, buf, (uint32_t)sz);
                 } else {   // a truncated restore is silent corruption -- surface it (satoru)

@@ -20,6 +20,7 @@ enum Id {
     TASKS,
     MEDIA,
     HOME,
+    FIREFOX,
     GENERIC
 };
 

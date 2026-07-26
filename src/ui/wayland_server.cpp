@@ -934,6 +934,24 @@ void commit_surface(Client* c, Object* surf) {
     Window* win = WindowManager::GetWindow(wid);
     if (!win) { surf->wm_window = nullptr; return; }
 
+    // first-paint serial marker: until now a paint was only provable by a qmp
+    // screenshot (KW:NativeShow comes from the firefox image and fires before
+    // any pixels hit the compositor). a big toplevel commit reaching here = a
+    // real client window with content on screen, so the reliability harness
+    // can classify PAINT vs STALL from serial alone. first few commits only. (satoru)
+    {
+        static int s_kwpaint_lines = 0;
+        if (s_kwpaint_lines < 4 && bw > 400 && bh > 300) {
+            s_kwpaint_lines++;
+            UnixSocket::Credentials kcr;
+            uint32_t kpid = (UnixSocket::GetPeerCred(c->sd, &kcr) == 0) ? kcr.pid : 0;
+            SerialLogger::Log("[KWPAINT] pid="); SerialLogger::LogDec((int)kpid);
+            SerialLogger::Log(" "); SerialLogger::LogDec(bw);
+            SerialLogger::Log("x"); SerialLogger::LogDec(bh);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
     // AUTO-FOCUS this toplevel on map. firefox's CONTENT browsing context only
     // becomes active - and thus PAINTS (PresShell::ComputeActiveness gates on
     // bc->IsActive()) - when the window is FOCUSED. a headless boot has no

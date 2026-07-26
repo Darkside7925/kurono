@@ -8,6 +8,7 @@
 #include "../kernel/panic.h"
 #include "../ui/font.h"
 #include "virtio_gpu.h"   // accelerated present path (satoru)
+#include "bga.h"          // live hardware geometry for the resize self-heal (satoru)
 
 // when the virtio-gpu backend is active, fb_addr is a guest-ram resource
 // backing that must be transferred + flushed to the host after each frame.
@@ -314,6 +315,31 @@ void Graphics::ReinitForResolution(uintptr_t addr, uint32_t width, uint32_t heig
     if (wanted == DOUBLE_BUFFER || wanted == TRIPLE_BUFFER) {
         SetRenderMode(wanted);
     }
+}
+
+// resize self-heal: when the host resizes the qemu window the bga reprograms
+// its mode registers, but if the guest's res-sync path is starved (firefox
+// pinning every core) the compositor keeps blitting at the OLD pitch into the
+// NEW-stride scanout = the diagonal-tear garbage the user saw. read the LIVE
+// bga geometry every render; if it drifted from our cached fb_*, reinit +
+// realloc the backbuffer + full-dirty so the very next frame matches the
+// hardware. runs on whatever process renders, so starvation can't leave a
+// torn frame on screen. returns true if a resync happened (caller relayouts
+// the desktop). std-vga/bga only; virtio-gpu owns its own present size. (satoru)
+bool Graphics::SyncToHardwareGeometry() {
+    if (!BGA::available || !BGA::framebuffer) return false;
+    uint32_t hw_w = BGA::width, hw_h = BGA::height, hw_pitch = BGA::pitch;
+    uint8_t  hw_bpp = (uint8_t)BGA::bpp;
+    if (hw_w == 0 || hw_h == 0 || hw_pitch == 0) return false;
+    if (hw_w == fb_width && hw_h == fb_height && hw_pitch == fb_pitch &&
+        (uintptr_t)BGA::framebuffer == (uintptr_t)fb_addr) {
+        return false;   // in sync (satoru)
+    }
+    SerialLogger::Log("Graphics: hardware geometry drift - resyncing compositor\r\n");
+    ReinitForResolution((uintptr_t)BGA::framebuffer, hw_w, hw_h, hw_pitch, hw_bpp);
+    full_screen_dirty = true;
+    MarkUIDirty();
+    return true;
 }
 
 void Graphics::InitAdvanced() {

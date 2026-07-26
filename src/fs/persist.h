@@ -42,5 +42,11 @@ public:
     // true if the on-disk KFS volume has a populated /apps/firefox (so a lazy
     // RestoreApps would bring a usable install back without a re-download). (satoru)
     static bool HasPersistedFirefox();
+
+    // memory-only read of the last HasPersistedFirefox() answer (false if it
+    // never ran). the gui process uses this for the desktop firefox icon so it
+    // never touches KFS/nvme itself - the probe is seeded once at boot, right
+    // after LoadTree, on the single-threaded init path. (satoru)
+    static bool HasPersistedFirefoxCached();
 };
 // end (satoru)

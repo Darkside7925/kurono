@@ -68,6 +68,13 @@ public:
     static void RequestCommandCancel();
     static bool IsCommandCancelRequested();
 
+    // firefox jit tier from the boot cmdline (kurono.ffjit=N): 0 = interpreter
+    // only (default, the historical safe mode), 1 = blinterp, 2 = +baseline+
+    // native_regexp. the launch code appends matching lockPref overrides to
+    // firefox.cfg (a later lockPref wins). (satoru)
+    static void SetFirefoxJit(int level);
+    static int  GetFirefoxJit();
+
     // command registration
     static void RegisterCommand(const char* name, const char* desc,
                                 CmdEnvironment env, const char* category,

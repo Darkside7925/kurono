@@ -255,6 +255,26 @@ static void draw_home(int x,int y,int s){
     Graphics::FillRoundedRect(door_x, door_y, door_w, door_h, atleast1(sc(s,1,28)), acc);
 }
 
+// firefox: the fox-wrapping-a-globe mark, flattened to three discs. a full
+// orange disc is the fox body; a warm yellow cap on its upper-left rim hints
+// the flame gradient; a deep indigo disc inset toward the lower-left is the
+// globe, leaving an orange crescent that thickens over the top and right
+// (the fox wrap). a small orange nub over the top-right rim breaks the ring
+// so it reads as the fox head diving over the globe. (satoru)
+static void draw_firefox(int x,int y,int s){
+    int cx = x + s/2;
+    int cy = y + s/2;
+    int R  = sc(s,11,28);
+    // fox body (satoru)
+    Graphics::FillCircle(cx, cy, R, 0xFFFF7139);
+    // flame highlight cap (satoru)
+    Graphics::FillCircle(cx - sc(s,4,28), cy - sc(s,7,28), sc(s,4,28), 0xFFFFB53A);
+    // globe, inset down-left so the crescent is thick at the top-right (satoru)
+    Graphics::FillCircle(cx - sc(s,1,28), cy + sc(s,1,28), sc(s,8,28), 0xFF2C2E6E);
+    // fox head nub over the top-right rim (satoru)
+    Graphics::FillCircle(cx + sc(s,4,28), cy - sc(s,6,28), sc(s,3,28), 0xFFFF7139);
+}
+
 // generic: a stylized app glyph - a rounded square with a smaller inset. (satoru)
 static void draw_generic(int x,int y,int s){
     int bx = x + sc(s,6,28);
@@ -278,6 +298,7 @@ void Draw(int id, int x, int y, int size){
         case TASKS:      draw_tasks(x,y,size);       break;
         case MEDIA:      draw_media(x,y,size);       break;
         case HOME:       draw_home(x,y,size);        break;
+        case FIREFOX:    draw_firefox(x,y,size);     break;
         default:         draw_generic(x,y,size);     break;
     }
 }
@@ -303,6 +324,10 @@ int IdForName(const char* n){
     if (pfx(n,"Co"))  return SETTINGS;
     if (pfx(n,"Cal")) return CALCULATOR;   // calculator (satoru)
     if (pfx(n,"Ca"))  return CALCULATOR;   // generic 'Ca' still a calculator (satoru)
+    // firefox before the broad "Fi" files test; window titles may carry the
+    // full "Mozilla Firefox" (or "<page> - Mozilla Firefox") form. (satoru)
+    if (pfx(n,"Firef")) return FIREFOX;
+    if (pfx(n,"Moz"))   return FIREFOX;
     if (pfx(n,"Fi"))  return FILES;        // files / file browser (satoru)
     if (pfx(n,"Ed"))  return EDITOR;       // editor (satoru)
     if (pfx(n,"Se"))  return SETTINGS;     // settings (satoru)

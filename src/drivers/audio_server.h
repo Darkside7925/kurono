@@ -15,6 +15,9 @@
 #include "audio_mixer.h"
 #include "audio_backend.h"
 
+// fwd decl only (../proc/spinlock.h) - callers of PumpLock() include it. (satoru)
+class Spinlock;
+
 namespace AudioServer {
 
 // One-time bring-up.  Calls AudioDMA::Init(), AudioMixer::Init(), then
@@ -65,6 +68,28 @@ void     DrainStream(AudioMixer::StreamID id);
 
 // Per-tick pump.  Called from the kernel main loop.
 void Tick();
+
+// preferred pump entry: takes the audio lock, pumps, and (optionally) runs
+// the pulse pacing pass. the dedicated audio kernel process calls this. (satoru)
+void LockedTick();
+
+// starvation-proof backup pump for the pit timer path (Scheduler::Tick on
+// the bsp): if the audio process has not pumped recently AND the lock is
+// free, run one pump inline. try-lock only - never spins in irq context,
+// and skips harmlessly if the interrupted context holds the lock. this is
+// the moral equivalent of alsa's period interrupt: the dma ring can no
+// longer drain just because the cooperative pump got starved. (satoru)
+void TickFromTimer();
+
+// pause/resume a stream (pulse CORK) under the audio lock. (satoru)
+void PauseStream(AudioMixer::StreamID id, bool paused);
+
+// the pump lock itself, for the one caller that must compose several
+// per-stream reads/writes atomically: pulse's Pace() pass pairs its
+// liveness check + GetStats + request accounting against stream closes
+// arriving in client syscall context on other cpus. everything else
+// should use the locked wrappers above instead. (satoru)
+Spinlock& PumpLock();
 
 // Diagnostics.
 struct ServerStatus {

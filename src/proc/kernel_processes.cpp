@@ -202,6 +202,10 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     while (true) {
         HRTimer::Tick();
         Scheduler::ServiceSleepQueue();
+        // deferred group reaps (sig-9 from the kls syscall body, hal fault
+        // containment, sync quiesce timeouts): reap each queued group once its
+        // members are all off-cpu. never sleeps - one check per heartbeat. (satoru)
+        Scheduler::DrainDeferredReaps();
         // 50ms: IRQ0 already calls wake_due_processes() every tick, so this is a
         // backup heartbeat. 1ms was 1000 redundant wakeups/sec that kept the cpu
         // from idling (HLT) - the main VMware host-CPU burn. (satoru)

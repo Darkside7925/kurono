@@ -8,7 +8,7 @@
 #define WM_MIN_WIDTH      140
 #define WM_MIN_HEIGHT     100
 #define WM_SHADOW_SIZE      6
-#define WM_CORNER_RADIUS   10
+#define WM_CORNER_RADIUS   12
 
 enum WindowState {
     WIN_CLOSED = 0,
@@ -96,6 +96,13 @@ struct Window {
     // a window belongs to the monitor whose rect contains its center; the
     // wm recomputes this on move/resize. defaults to 0 (primary). (satoru)
     int monitor_id;
+
+    // app icon id (AppIcons::Id) shown in the titlebar + taskbar button.
+    // -1 = none pinned: the renderers derive one from the title text. set
+    // explicitly by the wayland bridge (xdg_toplevel.set_app_id) so a
+    // client whose title changes (e.g. firefox page titles) keeps its
+    // own logo. (satoru)
+    int app_icon;
 };
 
 class WindowManager {
@@ -114,6 +121,10 @@ public:
 
     // window ops
     static void Minimize(int id);
+    // bring a minimized window back at its OWN rect (Restore() is the
+    // un-maximize path and rewrites the rect from the maximize save). plays
+    // the restore animation and makes the window visible again. (satoru)
+    static void Unminimize(int id);
     static void Maximize(int id);
     static void Restore(int id);
     static void ToggleMaximize(int id);

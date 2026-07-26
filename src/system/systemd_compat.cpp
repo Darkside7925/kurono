@@ -607,7 +607,36 @@ int CmdSystemctl(void* sh, int argc, const char** argv, char* out, int mx) {
     else if (sc_eq(action, "stop"))                                 rc = KInit::StopService(kname);
     else if (sc_eq(action, "restart") || sc_eq(action, "reload-or-restart") ||
              sc_eq(action, "try-restart"))                          rc = KInit::RestartService(kname);
-    else if (sc_eq(action, "reload"))                             { rc = 0; verb = "reload"; }  // kinit has no SIGHUP reload; treat as no-op success (satoru)
+    else if (sc_eq(action, "reload")) {
+        // real reload: re-parse the unit's source .service (if one was seeded
+        // under /run/systemd/system) -> regenerate its .kservice via the same
+        // converter, otherwise just re-scan the .kservice dir; then apply the new
+        // config by restarting the unit if it is currently up (kinit has no in-
+        // place SIGHUP reload, so a restart is the honest way to apply changes).
+        // (satoru)
+        verb = "reload";
+        char spath[256]; int sp = 0;
+        sp = sc_cat(spath, sp, (int)sizeof(spath), "/run/systemd/system/");
+        sp = sc_cat(spath, sp, (int)sizeof(spath), kname);
+        sp = sc_cat(spath, sp, (int)sizeof(spath), ".service");
+        static char rbuf[4096];
+        int got = KVFS::ReadFile(spath, rbuf, (uint32_t)sizeof(rbuf) - 1);
+        if (got > 0) {
+            rbuf[got] = 0;
+            char ufile[KINIT_NAME_LEN + 16]; int up = 0;
+            up = sc_cat(ufile, up, (int)sizeof(ufile), kname);
+            up = sc_cat(ufile, up, (int)sizeof(ufile), ".service");
+            InstallServiceUnit(ufile, rbuf, got);   // regenerates the .kservice + KInit::Reload() (satoru)
+        } else {
+            KInit::Reload();                          // no .service source: re-scan .kservice dir (satoru)
+        }
+        // re-resolve after reload; restart to apply if the unit is running. (satoru)
+        KInit::KService* rs = find_unit(unit);
+        if (rs && (rs->state == KInit::KSVC_RUNNING || rs->state == KInit::KSVC_STARTING))
+            rc = KInit::RestartService(kname);
+        else
+            rc = 0;
+    }
     else if (sc_eq(action, "enable"))                               rc = KInit::EnableService(kname);
     else if (sc_eq(action, "disable"))                              rc = KInit::DisableService(kname);
     else {
@@ -734,20 +763,83 @@ int CmdLoginctl(void* sh, int argc, const char** argv, char* out, int mx) {
     const char* action = (argc >= 2) ? argv[1] : "list-sessions";
 
     if (sc_eq(action, "list-sessions") || sc_eq(action, "list")) {
+        // enumerate the SUPR security engine's live sessions instead of a fixed
+        // row: each active session's real (uid, user, seat, tty). (satoru)
         p = sc_cat(out, p, mx, "SESSION  UID USER   SEAT  TTY\n");
-        p = sc_cat(out, p, mx, "      1 1000 ");
-        p = sc_cat(out, p, mx, user);
-        for (int k = sc_len(user); k < 6; k++) p = sc_cat(out, p, mx, " ");
-        p = sc_cat(out, p, mx, " seat0 tty1\n\n1 sessions listed.\n");
+        SUPRUser* users = SUPR::GetUsers();
+        int un = SUPR::GetUserCount();
+        int count = 0;
+        for (int i = 0; i < SUPR_MAX_SESSIONS; i++) {
+            SUPRSession* s = SUPR::GetSession(i);
+            if (!s || !s->active) continue;
+            const char* uname = user; uint32_t uid = 1000;
+            if (users && s->user_index >= 0 && s->user_index < un) {
+                uname = users[s->user_index].username;
+                uid   = (uint32_t)users[s->user_index].uid;
+            }
+            const char* tty = s->tty[0] ? s->tty : "tty1";
+            p = sc_cat_u(out, p, mx, (uint32_t)(i + 1));
+            p = sc_cat(out, p, mx, "  ");
+            p = sc_cat_u(out, p, mx, uid);
+            p = sc_cat(out, p, mx, " ");
+            p = sc_cat(out, p, mx, uname);
+            for (int k = sc_len(uname); k < 6; k++) p = sc_cat(out, p, mx, " ");
+            p = sc_cat(out, p, mx, " seat0 ");
+            p = sc_cat(out, p, mx, tty);
+            p = sc_cat(out, p, mx, "\n");
+            count++;
+        }
+        if (count == 0) {
+            // no SUPR session (e.g. before login / bare autologin): show the
+            // effective default so a probe still gets a valid answer. (satoru)
+            p = sc_cat(out, p, mx, "      1 1000 ");
+            p = sc_cat(out, p, mx, user);
+            for (int k = sc_len(user); k < 6; k++) p = sc_cat(out, p, mx, " ");
+            p = sc_cat(out, p, mx, " seat0 tty1\n");
+            count = 1;
+        }
+        p = sc_cat(out, p, mx, "\n");
+        p = sc_cat_u(out, p, mx, (uint32_t)count);
+        p = sc_cat(out, p, mx, " sessions listed.\n");
         return p;
     }
     if (sc_eq(action, "list-seats")) {
         return sc_cat(out, 0, mx, "SEAT\nseat0\n\n1 seats listed.\n");
     }
     if (sc_eq(action, "list-users")) {
-        p = sc_cat(out, p, mx, "  UID USER\n 1000 ");
-        p = sc_cat(out, p, mx, user);
-        p = sc_cat(out, p, mx, "\n\n1 users listed.\n");
+        // one row per distinct uid across the live SUPR sessions. (satoru)
+        p = sc_cat(out, p, mx, "  UID USER\n");
+        SUPRUser* users = SUPR::GetUsers();
+        int un = SUPR::GetUserCount();
+        uint32_t seen_uid[SUPR_MAX_SESSIONS]; int nseen = 0;
+        int count = 0;
+        for (int i = 0; i < SUPR_MAX_SESSIONS; i++) {
+            SUPRSession* s = SUPR::GetSession(i);
+            if (!s || !s->active) continue;
+            const char* uname = user; uint32_t uid = 1000;
+            if (users && s->user_index >= 0 && s->user_index < un) {
+                uname = users[s->user_index].username;
+                uid   = (uint32_t)users[s->user_index].uid;
+            }
+            bool dup = false;
+            for (int k = 0; k < nseen; k++) if (seen_uid[k] == uid) { dup = true; break; }
+            if (dup) continue;
+            if (nseen < SUPR_MAX_SESSIONS) seen_uid[nseen++] = uid;
+            p = sc_cat_u(out, p, mx, uid);
+            p = sc_cat(out, p, mx, " ");
+            p = sc_cat(out, p, mx, uname);
+            p = sc_cat(out, p, mx, "\n");
+            count++;
+        }
+        if (count == 0) {
+            p = sc_cat(out, p, mx, " 1000 ");
+            p = sc_cat(out, p, mx, user);
+            p = sc_cat(out, p, mx, "\n");
+            count = 1;
+        }
+        p = sc_cat(out, p, mx, "\n");
+        p = sc_cat_u(out, p, mx, (uint32_t)count);
+        p = sc_cat(out, p, mx, " users listed.\n");
         return p;
     }
     if (sc_eq(action, "session-status") || sc_eq(action, "show-session")) {

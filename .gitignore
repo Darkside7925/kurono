@@ -45,6 +45,17 @@ qmp_*.py
 NOTES.md
 kpkg-daemon-freeze-fix.diff
 
+# capability audit + worklist from the two-agent explorer/skeptic pass. local
+# reference only, regenerable, not part of the tracked os tree (satoru)
+/CAPABILITIES.md
+/NEEDTODO.md
+
+# claude code local tooling: subagents, plans, worktrees. NEVER commit - these are
+# ai instruction files, and keeping them out of the repo stops a malicious PR from
+# injecting behaviour through them (and keeps the tooling private). CLAUDE.md lives
+# at the repo root and is intentionally NOT under here, so it is still tracked. (satoru)
+/.claude/
+
 # feature brainstorm/planning workspace (libraries vendored here; not for the repo) (satoru)
 feats/
 

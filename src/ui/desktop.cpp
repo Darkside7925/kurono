@@ -6,6 +6,7 @@
 #include "../system/screenshot.h"
 #include "wayland_server.h"
 #include "perf_hud.h"
+#include "gui.h"   // GUI::UpdateBackbuffer for the resize self-heal relayout (satoru)
 #include "../drivers/graphics.h"
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
@@ -33,6 +34,9 @@
 #include "../apps/task_manager.h"
 #include "../apps/browser.h"
 #include "../apps/media_player.h"
+#include "../apps/firefox_launcher.h"   // install-state gate for the firefox icon (satoru)
+#include "../fs/persist.h"              // persisted-install gate for the firefox icon (satoru)
+#include "../proc/kernel_processes.h"   // detached shell launch (no terminal) (satoru)
 #include "../proc/scheduler.h"
 #include "../hal/hal.h"
 
@@ -433,13 +437,27 @@ void Taskbar::RenderTaskButtons(){
         if (x + bw > max_x) break;                 // ran out of room
         bool focused = (focused_id == w->id);
 
+        // eased hover: a soft rounded highlight fades in and the icon lifts
+        // 2px, through the shared kss tween engine so the motion matches the
+        // rest of the desktop (and keeps the render gate open mid-ease). (satoru)
+        bool hov = (Mouse::mx >= x && Mouse::mx < x + bw &&
+                    Mouse::my >= y_pos && Mouse::my < y_pos + TASKBAR_HEIGHT);
+        float ht = KSS::Anim::Float(KSS::Motion::Id((uint32_t)w->id, 0x40u),
+                                    hov ? 1.0f : 0.0f,
+                                    KSS::Motion::Micro, KSS::Motion::Std);
+        int lift = (int)(ht * 2.0f + 0.5f);
         if(focused){
-            Graphics::FillRoundedRect(x, y_pos+6, bw, TASKBAR_HEIGHT-12, 6, 0xFF222240);
-            // active underline indicator
-            Graphics::FillRect(x+8, y_pos+TASKBAR_HEIGHT-4, bw-16, 3, COL_START_BTN);
+            Graphics::FillRoundedRect(x, y_pos+5, bw, TASKBAR_HEIGHT-10, 9, 0xFF23233F);
+        } else if(ht > 0.01f){
+            uint32_t hbg = Animation::LerpColor(COL_TASKBAR, 0xFF32324E,
+                                                (int)(ht * 255.0f));
+            Graphics::FillRoundedRect(x, y_pos+5, bw, TASKBAR_HEIGHT-10, 9, hbg);
         }
 
-        // app icon - colored rounded square with a flat vector glyph (satoru)
+        // app icon - colored rounded square with a flat vector glyph. a pinned
+        // app_icon (wayland set_app_id, survives page-title changes) wins over
+        // the title-derived id. (satoru)
+        int gid = (w->app_icon >= 0) ? w->app_icon : AppIcons::IdForName(w->title);
         unsigned int ic = 0xFF3498DB;
         char c0 = w->title[0];
         if(c0=='T') ic = 0xFF2ECC71;
@@ -450,14 +468,22 @@ void Taskbar::RenderTaskButtons(){
         else if(c0=='E') ic = 0xFFE74C3C;
         else if(c0=='B') ic = 0xFF3498DB;
         else if(c0=='M') ic = 0xFFE91E63;
+        // firefox: dark night-sky tile so the orange fox mark pops. (satoru)
+        if(gid == AppIcons::FIREFOX) ic = 0xFF14103C;
 
-        Graphics::FillRoundedRect(x+6, y_pos+10, bw-12, TASKBAR_HEIGHT-20, 5, ic);
-        // vector glyph mapped from the window title (the title carries the app
-        // name, so IdForName picks the right icon). inset inside the tile. (satoru)
         int tile = TASKBAR_HEIGHT-20;
+        Graphics::FillRoundedRect(x+6, y_pos+10 - lift, bw-12, tile, 5, ic);
         int gpad = tile / 6;
-        AppIcons::Draw(AppIcons::IdForName(w->title),
-                       x+6 + gpad, y_pos+10 + gpad, tile - gpad*2);
+        AppIcons::Draw(gid, x+6 + gpad, y_pos+10 - lift + gpad, tile - gpad*2);
+
+        // dock-style state indicator: focused = a wide accent pill, other open
+        // windows = a small dot (dimmed when minimized). (satoru)
+        if(focused){
+            Graphics::FillRoundedRect(x + bw/2 - 8, y_pos+TASKBAR_HEIGHT-5, 16, 3, 2, COL_START_BTN);
+        } else {
+            unsigned int dot = (w->state==WIN_MINIMIZED) ? 0xFF4A4A66 : 0xFF8A8AB0;
+            Graphics::FillRoundedRect(x + bw/2 - 2, y_pos+TASKBAR_HEIGHT-5, 4, 3, 2, dot);
+        }
 
         x += bw + gap;
     }
@@ -997,8 +1023,20 @@ bool Taskbar::HandleClick(int mx,int my){
             if(!w || w->state==WIN_CLOSED) continue;
             if(x + bw > max_x) break;
             if(mx>=x && mx<x+bw){
-                if(w->state==WIN_MINIMIZED) w->state=WIN_NORMAL;
-                WindowManager::BringToFront(w->id);
+                // minimized -> restore (the old direct state write left
+                // visible=false, so the window never came back); focused ->
+                // minimize (standard taskbar toggle); else raise + focus
+                // (BringToFront alone never moved keyboard focus). (satoru)
+                if(w->state==WIN_MINIMIZED){
+                    WindowManager::Unminimize(w->id);
+                    WindowManager::Focus(w->id);
+                    WindowManager::BringToFront(w->id);
+                } else if(WindowManager::GetFocusedIndex() == w->id){
+                    WindowManager::Minimize(w->id);
+                } else {
+                    WindowManager::Focus(w->id);
+                    WindowManager::BringToFront(w->id);
+                }
                 return true;
             }
             x += bw + gap2;
@@ -1324,7 +1362,29 @@ void Desktop::RefreshFiles(){
             AddOrUpdateDesktopFile(desktop_dir->children[child_index]);
         }
     }
+    SyncFirefoxIcon();
     last_file_sync_ms = Timer::GetRealMs();
+}
+
+void Desktop::SyncFirefoxIcon(){
+    // present when firefox is installed in the live tree OR a persisted
+    // install sits on the nvme disk (the lazy /apps restore means the live
+    // tree is empty on a restored boot until first launch), unless the user
+    // deleted the icon. the persisted answer is the boot-seeded CACHE only -
+    // this runs on the gui process, which must never touch KFS/nvme (the
+    // shell process may be mid-restore on the same volume). (satoru)
+    bool user_wants = UIConfig::Int("desktop.firefox_icon", 1) != 0;
+    bool installed  = FirefoxLauncher::IsInstalled();
+    bool present = installed || PersistStore::HasPersistedFirefoxCached();
+    int idx = FindIconByPath("/apps/firefox/firefox");
+    if(present && user_wants && idx < 0 && icon_count < DESKTOP_MAX_ICONS){
+        AddIcon("Firefox", "/apps/firefox/firefox", 2);
+        PlaceIcon(icon_count - 1);
+        Graphics::MarkUIDirty();
+    } else if((!present || !user_wants) && idx >= 0){
+        DropIconAt(idx);
+        Graphics::MarkUIDirty();
+    }
 }
 
 void Desktop::ArrangeIcons(){
@@ -1343,16 +1403,8 @@ void Desktop::ArrangeIcons(){
     }
 }
 
-void Desktop::RemoveIcon(int index){
+void Desktop::DropIconAt(int index){
     if(index<0 || index>=icon_count) return;
-    if(IsDesktopFileIcon(&icons[index])){
-        const char* p = icons[index].path;
-        if(KVFS::IsDir(p)){
-            KVFS::Rmdir(p);
-        } else if(KVFS::IsFile(p)){
-            KVFS::Unlink(p);
-        }
-    }
     // shift remaining icons (and their hover phases) down one slot.
     for(int i=index;i<icon_count-1;i++){
         icons[i]=icons[i+1];
@@ -1369,6 +1421,23 @@ void Desktop::RemoveIcon(int index){
     else if(icon_hover_target>index) icon_hover_target--;
     if(hovered_icon==index) hovered_icon=-1;
     else if(hovered_icon>index) hovered_icon--;
+}
+
+void Desktop::RemoveIcon(int index){
+    if(index<0 || index>=icon_count) return;
+    if(IsDesktopFileIcon(&icons[index])){
+        const char* p = icons[index].path;
+        if(KVFS::IsDir(p)){
+            KVFS::Rmdir(p);
+        } else if(KVFS::IsFile(p)){
+            KVFS::Unlink(p);
+        }
+    }
+    // deleting the firefox app icon is a persisted user choice - it stays
+    // gone across boots until a fresh install re-enables it. (satoru)
+    if(icons[index].icon_type==2 && starts_with(icons[index].path,"/apps/firefox/"))
+        UIConfig::SetInt("desktop.firefox_icon", 0, true);
+    DropIconAt(index);
     RefreshFiles();
     FileManagerApp::NotifyFilesystemChanged("/home/user/Desktop");
 }
@@ -1688,6 +1757,9 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     const char* nm = ic->name;
     if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') {
         ic_top=0xFF34D058; ic_bot=0xFF1E8C3A;
+    } else if(nm[0]=='F' && nm[1]=='i' && nm[2]=='r') {
+        // firefox: dark night-sky tile so the fox mark pops. (satoru)
+        ic_top=0xFF1E1852; ic_bot=0xFF0E0A30;
     } else if(nm[0]=='F' && nm[1]=='i') {
         ic_top=0xFFFFA726; ic_bot=0xFFE08A1E;
     } else if(nm[0]=='C' && nm[1]=='o') {
@@ -1937,7 +2009,9 @@ void Desktop::HandleDoubleClick(int mx,int my){
 
     // launch app based on icon name (prefix matching)
     const char* nm = icons[idx].name;
-    if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') DesktopEnvironment::LaunchTerminal();
+    // firefox before the broad 'F' files test. (satoru)
+    if(nm[0]=='F' && nm[1]=='i' && nm[2]=='r') DesktopEnvironment::LaunchFirefox();
+    else if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') DesktopEnvironment::LaunchTerminal();
     else if(nm[0]=='T' && nm[1]=='a') DesktopEnvironment::LaunchTaskManager();
     else if(nm[0]=='T' && nm[1]=='e' && nm[2]=='x') DesktopEnvironment::LaunchTextEditor();
     else if(nm[0]=='F') DesktopEnvironment::LaunchFileBrowser();
@@ -2031,6 +2105,16 @@ static bool de_drag_backdrop_safe(){
 // control center, toasts. shared by the normal path and the drag-backdrop
 // capture (which first arms the wm to omit the dragged window). (satoru)
 static void de_render_full(){
+    // resize self-heal FIRST, before any drawing: if the host resized the
+    // qemu window the bga changed mode but a starved gui res-sync may not
+    // have caught it, leaving the compositor blitting at the old pitch (the
+    // diagonal-tear garbage). resync here on whatever process is rendering,
+    // and relayout the desktop to the new size so this frame is correct. (satoru)
+    if (Graphics::SyncToHardwareGeometry()) {
+        GUI::UpdateBackbuffer();
+        DesktopEnvironment::Init(Graphics::GetWidth(), Graphics::GetHeight());
+        Graphics::MarkUIDirty();
+    }
     Desktop::Render();
     WindowManager::RenderAll();
     // pump queued wayland frame callbacks once per composited frame so clients
@@ -2097,6 +2181,36 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         if (mouse_down != wl_prev_left) {
             WaylandServer::ForwardPointerButton(mx, my, WaylandServer::WL_BTN_LEFT, mouse_down);
             wl_prev_left = mouse_down;
+        }
+    }
+
+    // raw key edges -> wayland, only while a bridged wayland window (firefox)
+    // holds wm focus: gtk/gecko consume wl_keyboard key events with evdev
+    // codes, not the kurono char pipeline (which wayland windows ignore - the
+    // reason typing in firefox did nothing). scanning the key-state table for
+    // edges each frame is ~120 loads; modifiers ride along on every edge. (satoru)
+    {
+        Window* kfw = WindowManager::GetFocusedWindow();
+        static bool wlk_prev[KEY_WAKE + 1] = {};
+        if (kfw && kfw->state != WIN_CLOSED && WaylandServer::IsWaylandWindow(kfw->id)) {
+            const KeyboardState& kst = Keyboard::GetState();
+            uint32_t wmods = (kst.shift ? WaylandServer::WL_MOD_SHIFT : 0u) |
+                             (kst.ctrl  ? WaylandServer::WL_MOD_CTRL  : 0u) |
+                             (kst.alt   ? WaylandServer::WL_MOD_ALT   : 0u) |
+                             (kst.super ? WaylandServer::WL_MOD_META  : 0u);
+            for (int k = 1; k <= (int)KEY_WAKE; k++) {
+                bool dn = Keyboard::IsKeyDown((Key)k);
+                if (dn != wlk_prev[k]) {
+                    WaylandServer::ForwardKey(k, dn, wmods);
+                    wlk_prev[k] = dn;
+                }
+            }
+        } else {
+            // focus left the wayland window: release anything still latched so
+            // gtk never sees a stuck key. (satoru)
+            for (int k = 1; k <= (int)KEY_WAKE; k++) {
+                if (wlk_prev[k]) { WaylandServer::ForwardKey(k, false, 0); wlk_prev[k] = false; }
+            }
         }
     }
 
@@ -2365,6 +2479,23 @@ void DesktopEnvironment::LaunchBrowser(){
 }
 void DesktopEnvironment::LaunchMediaPlayer(){
     MediaPlayerApp::Open();
+}
+void DesktopEnvironment::LaunchFirefox(){
+    // run the full `firefox` shell flow (lazy restore / install / exec) on the
+    // shell kernel-process, detached - no terminal window. the gui thread only
+    // queues + toasts; firefox's own wayland window appears when gecko maps
+    // its toplevel. (satoru)
+    bool installed = FirefoxLauncher::IsInstalled();
+    if(!KernelProcesses::RunShellCommandDetached("firefox")){
+        NotificationManager::Post("Firefox",
+            "Already starting - give it a moment.",
+            NotificationManager::ICON_INFO, 4000);
+        return;
+    }
+    NotificationManager::Post("Firefox",
+        installed ? "Starting Firefox..."
+                  : "Setting up Firefox - first launch takes a minute...",
+        NotificationManager::ICON_INFO, 6000);
 }
 
 // session control --------------------------------------------------------

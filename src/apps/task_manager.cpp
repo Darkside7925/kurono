@@ -4,6 +4,7 @@
 #include "media_player.h"
 #include "../ui/desktop.h"
 #include "../ui/window_manager.h"
+#include "../ui/wayland_server.h"
 #include "../drivers/graphics.h"
 #include "../drivers/bga.h"
 #include "../drivers/cpu_detect.h"
@@ -19,6 +20,7 @@
 #include "../kernel/pmm.h"
 #include "../proc/scheduler.h"
 #include "../fs/kvfs.h"
+#include "../fs/persist.h"
 #include "../net/network.h"
 #include "../system/logging.h"
 
@@ -292,6 +294,22 @@ static int tm_linux_heap_kb(const LinuxProcess* lp){
     return (int)(bytes / 1024ULL);
 }
 
+// transient action feedback shown in the status bar ("real replies"): the
+// last kill/restart outcome plus when it happened, so the user sees what the
+// action actually did instead of a silent list refresh. (satoru)
+static char     g_tm_action_msg[96] = {0};
+static uint32_t g_tm_action_ms      = 0;
+
+static void tm_set_action_msg(const char* verb,const char* name,const char* extra){
+    g_tm_action_msg[0] = 0;
+    sapp(g_tm_action_msg, verb, 96);
+    sapp(g_tm_action_msg, name, 96);
+    if(extra) sapp(g_tm_action_msg, extra, 96);
+    g_tm_action_ms = Time::GetTicks();
+}
+
+static const int TM_KILL_GROUP_MAX = 64;
+
 static bool tm_terminate_scheduler_process(const TMProcess* proc){
     if(!proc || proc->pid <= 0 || proc->source_kind != TM_PROC_SCHED) return false;
 
@@ -301,17 +319,79 @@ static bool tm_terminate_scheduler_process(const TMProcess* proc){
     Process* current = Scheduler::GetCurrentProcess();
     if(Userspace::IsActive() && current && current->pid == task->pid) return false;
 
-    int linux_idx = tm_find_linux_process_index_by_task_pid(proc->pid);
-    Scheduler::MarkProcessExited(task, -9);
-    if(linux_idx >= 0){
-        LinuxProcess* linux_proc = LinuxSyscall::GetProcess(linux_idx);
-        if(linux_proc){
-            linux_proc->exit_code = -9;
-            linux_proc->exited = true;
-        }
-        LinuxSyscall::DestroyProcess(linux_idx);
+    // kernel tasks ARE the os (gui, input, kvfs, net...) - ending one bricks
+    // the session, so the ui refuses instead of letting the kill crash. (satoru)
+    if(!task->is_user()){
+        tm_set_action_msg("Protected: ", proc->name, " is a kernel process");
+        return false;
     }
-    Scheduler::DestroyProcess(task);
+
+    // user process: end the WHOLE address-space group (leader + threads).
+    // killing one thread and freeing the shared address space under the
+    // siblings still running on other cores crashed the entire os. collect
+    // the linux-side records first (the mapping needs live task pointers),
+    // quiesce + reap via the scheduler, then release the linux records and
+    // drop the dead client's windows so the kill visibly closes the app. (satoru)
+    uint32_t member_pids[TM_KILL_GROUP_MAX];
+    int      linux_idx[TM_KILL_GROUP_MAX];
+    uint32_t linux_pid_at[TM_KILL_GROUP_MAX];
+    int      idx_count = 0;
+    // pids only, copied under the scheduler lock - the raw Process* variant
+    // could hand back pointers a concurrent DestroyProcess heap-frees before
+    // we read them. (satoru)
+    int n = Scheduler::CollectAddressSpacePids(task->pid, member_pids, TM_KILL_GROUP_MAX);
+    if(n <= 0) return false;
+    for(int i=0;i<n;i++){
+        int li = tm_find_linux_process_index_by_task_pid((int)member_pids[i]);
+        if(li >= 0 && idx_count < TM_KILL_GROUP_MAX){
+            LinuxProcess* lp0 = LinuxSyscall::GetProcess(li);
+            linux_pid_at[idx_count] = lp0 ? lp0->pid : 0;   // revalidation stamp (satoru)
+            linux_idx[idx_count++] = li;
+        }
+    }
+
+    int kr = Scheduler::KillProcessGroup(task->pid);
+    if(kr == 0){
+        tm_set_action_msg("Failed to end ", proc->name, nullptr);
+        return false;
+    }
+    if(kr == 2){
+        // quiesce timed out: the group is marked dead and queued for the
+        // deferred reaper, but a member may still be finishing a syscall on
+        // another core - destroying its fd tables NOW would be a teardown uaf.
+        // mark the linux records exited and leave the destroy to a later kill
+        // attempt / the records simply staying exited. (satoru)
+        for(int i=0;i<idx_count;i++){
+            LinuxProcess* linux_proc = LinuxSyscall::GetProcess(linux_idx[i]);
+            if(linux_proc && linux_proc->pid == linux_pid_at[i]){
+                linux_proc->exit_code = -9;
+                linux_proc->exited = true;
+            }
+        }
+        tm_set_action_msg("Ending ", proc->name, " (deferred)");
+        return true;
+    }
+
+    for(int i=0;i<idx_count;i++){
+        LinuxProcess* linux_proc = LinuxSyscall::GetProcess(linux_idx[i]);
+        // revalidate: the slot can be recycled by an unrelated exec while the
+        // kill drained (up to 1.6s) - destroying a recycled slot killed the
+        // wrong process's records. (satoru)
+        if(!linux_proc || linux_proc->pid != linux_pid_at[i]) continue;
+        linux_proc->exit_code = -9;
+        linux_proc->exited = true;
+        LinuxSyscall::DestroyProcess(linux_idx[i]);
+    }
+    for(int i=0;i<n;i++) WaylandServer::DropClientsOfPid(member_pids[i]);
+
+    if(n > 1){
+        char extra[32] = " (";
+        char nb[12]; int_to_str(n, nb, 12);
+        sapp(extra, nb, 32); sapp(extra, " threads)", 32);
+        tm_set_action_msg("Ended: ", proc->name, extra);
+    } else {
+        tm_set_action_msg("Ended: ", proc->name, nullptr);
+    }
     return true;
 }
 
@@ -423,30 +503,26 @@ bool TaskManagerApp::IsOpen(){
 }
 
 void TaskManagerApp::InitServices(){
+    // real kernel tasks from the live scheduler - name, real pid, real state -
+    // instead of the old hardcoded placeholder table (fake pids, everything
+    // pinned "Running"). refreshed every Tick alongside the process list. (satoru)
     service_count = 0;
-    static const struct { const char* name; const char* status; const char* type; int pid; } svc[] = {
-        {"kthread",      "Running", "Kernel",  2},
-        {"scheduler",    "Running", "Kernel",  3},
-        {"irq/timer",    "Running", "Kernel",  4},
-        {"irq/keyboard", "Running", "Kernel",  5},
-        {"irq/mouse",    "Running", "Kernel",  6},
-        {"bga_display",  "Running", "Kernel",  7},
-        {"kvfs",         "Running", "System",  10},
-        {"network",      "Running", "System",  11},
-        {"supr",         "Running", "System",  12},
-        {"pkgmgr",       "Running", "System",  13},
-        {"window_mgr",   "Running", "System",  14},
-        {"shell",        "Running", "User",    20},
-        {"desktop",      "Running", "User",    21},
-        {"lockscreen",   "Stopped", "User",    0},
-    };
-    int n = 14;
-    for(int i=0;i<n&&service_count<32;i++){
-        scpy(services[service_count].name, svc[i].name, 32);
-        scpy(services[service_count].status, svc[i].status, 12);
-        scpy(services[service_count].type, svc[i].type, 16);
-        services[service_count].pid = svc[i].pid;
-        service_count++;
+    SchedulerProcessSnapshot snaps[TM_MAX_PROCS];
+    int cnt = Scheduler::GetProcessSnapshot(snaps, TM_MAX_PROCS - 1);
+    for(int i=0;i<cnt && service_count<32;i++){
+        const SchedulerProcessSnapshot& s = snaps[i];
+        if(s.pid == 0) continue;                                  // idle task (satoru)
+        if((s.flags & PROCESS_FLAG_USER) != 0) continue;          // user procs live on Processes (satoru)
+        TMService* sv = &services[service_count++];
+        scpy(sv->name, s.name[0] ? s.name : "ktask", 32);
+        if(s.state == Process_Running || s.state == Process_Ready)
+            scpy(sv->status, "Running", 12);
+        else if(s.state == Process_Terminated)
+            scpy(sv->status, "Stopped", 12);
+        else
+            scpy(sv->status, "Sleeping", 12);
+        scpy(sv->type, s.is_kernel_proc ? "Kernel" : "System", 16);
+        sv->pid = (int)s.pid;
     }
 }
 
@@ -459,6 +535,7 @@ void TaskManagerApp::Tick(){
     last_refresh_ms = now;
     tick_counter++;
     RefreshProcesses();
+    InitServices();   // services mirror the live kernel tasks (satoru)
 }
 
 // scroll the list on the active tab. positive delta = scroll toward the end.
@@ -496,6 +573,22 @@ void TaskManagerApp::RefreshProcesses(){
     int snapshot_count = Scheduler::GetProcessSnapshot(snapshots, TM_MAX_PROCS - 1);
     int total_busy_cpu = 0;
 
+    // per-snapshot cpu% first (threads included), so thread activity can roll
+    // up into its leader row and the overall figure counts every task. (satoru)
+    static int cpu_pcts[TM_MAX_PROCS];
+    for(int i=0;i<snapshot_count && i<TM_MAX_PROCS;i++){
+        const SchedulerProcessSnapshot& snap = snapshots[i];
+        int sample_idx = tm_find_cpu_sample(snap.pid);
+        uint64_t prev_ticks = snap.cpu_ticks_total;
+        if(g_tm_cpu_samples_ready && sample_idx >= 0){
+            prev_ticks = g_tm_cpu_samples[sample_idx].cpu_ticks_total;
+        }
+        uint64_t delta_ticks = 0;
+        if(snap.cpu_ticks_total >= prev_ticks) delta_ticks = snap.cpu_ticks_total - prev_ticks;
+        cpu_pcts[i] = g_tm_cpu_samples_ready ? tm_cpu_pct_from_ticks(delta_ticks, elapsed_ms) : 0;
+        if(snap.pid != 0) total_busy_cpu += cpu_pcts[i];
+    }
+
     for(int i=0;i<snapshot_count && proc_count<TM_MAX_PROCS-1;i++){
         const SchedulerProcessSnapshot& snap = snapshots[i];
         // skip the kernel idle task (pid 0): the scheduler charges it a tick
@@ -503,15 +596,10 @@ void TaskManagerApp::RefreshProcesses(){
         // a process the user cares about. idle is reflected in the overall cpu
         // figure on the performance tab instead. (satoru)
         if(snap.pid == 0) continue;
-        int sample_idx = tm_find_cpu_sample(snap.pid);
-        uint64_t prev_ticks = snap.cpu_ticks_total;
-        if(g_tm_cpu_samples_ready && sample_idx >= 0){
-            prev_ticks = g_tm_cpu_samples[sample_idx].cpu_ticks_total;
-        }
-
-        uint64_t delta_ticks = 0;
-        if(snap.cpu_ticks_total >= prev_ticks) delta_ticks = snap.cpu_ticks_total - prev_ticks;
-        int cpu_pct = g_tm_cpu_samples_ready ? tm_cpu_pct_from_ticks(delta_ticks, elapsed_ms) : 0;
+        // clone threads fold into their leader's row (real thread counts +
+        // summed cpu below) instead of appearing as duplicate processes. (satoru)
+        if(snap.flags & PROCESS_FLAG_THREAD) continue;
+        int cpu_pct = (i < TM_MAX_PROCS) ? cpu_pcts[i] : 0;
 
         // a scheduler task may also be a linux/user process - if so, take its
         // real command name and add its heap to the rss. user processes are
@@ -523,15 +611,37 @@ void TaskManagerApp::RefreshProcesses(){
         p->pid = (int)snap.pid;
         if(lp && lp->name[0]) scpy(p->name, lp->name, 32);
         else                  scpy(p->name, snap.name[0] ? snap.name : "process", 32);
-        p->cpu_pct = cpu_pct;
         // per-process memory: the scheduler snapshot already accounts kernel
         // stack + user stack + mapped regions (rss-style). for user processes
         // fold in the heap (brk) so the figure is meaningful, not just the
         // stack. kernel tasks keep their committed kernel-stack cost. (satoru)
         int mem_kb = (int)snap.memory_kb;
         if(lp) mem_kb += tm_linux_heap_kb(lp);
-        p->mem_kb = tm_max(4, mem_kb);
         p->threads = 1;
+        // real thread count for user processes: the address-space group size
+        // (leader + clone threads); the siblings' cpu + memory roll up here. (satoru)
+        if(is_user){
+            // pids copied under the scheduler lock - reading grp[g]->pid after
+            // the pointer variant returned raced a concurrent DestroyProcess
+            // heap-free (uaf read of a recycled block). (satoru)
+            uint32_t gpids[TM_KILL_GROUP_MAX];
+            int gn = Scheduler::CollectAddressSpacePids(snap.pid, gpids, TM_KILL_GROUP_MAX);
+            if(gn > 1){
+                p->threads = gn;
+                for(int g=0; g<gn; g++){
+                    uint32_t gpid = gpids[g];
+                    if(gpid == snap.pid) continue;
+                    for(int s2=0; s2<snapshot_count && s2<TM_MAX_PROCS; s2++){
+                        if(snapshots[s2].pid != gpid) continue;
+                        cpu_pct += cpu_pcts[s2];
+                        mem_kb  += (int)snapshots[s2].memory_kb;
+                        break;
+                    }
+                }
+            }
+        }
+        p->cpu_pct = tm_clamp(cpu_pct, 0, 100);
+        p->mem_kb = tm_max(4, mem_kb);
         tm_format_process_state(snap.state, p->state, 12);
         // label kernel vs user clearly (shown in the Details "User" column). (satoru)
         scpy(p->user, is_user ? "user" : "kernel", 16);
@@ -548,7 +658,6 @@ void TaskManagerApp::RefreshProcesses(){
         // is_kernel_proc drives the kernel-stack telemetry column; treat any
         // non-user task as kernel so the column populates correctly. (satoru)
         p->is_kernel_proc = snap.is_kernel_proc || !is_user;
-        total_busy_cpu += cpu_pct;
     }
 
     tm_store_cpu_samples(snapshots, snapshot_count);
@@ -571,7 +680,7 @@ void TaskManagerApp::RefreshProcesses(){
 
     uptime_sec = (int)(Scheduler::NowMs() / 1000ULL);
     disk_read_kb = (int)(KVFS::DiskUsage("/") / 1024);
-    disk_write_kb = (int)(KernelHeap::GetFree() / 1024);
+    disk_write_kb = 0;   // no real disk-write counter exists; pane shows honest fields (satoru)
 
     // record history
     cpu_history[hist_idx % 60] = tm_clamp(cpu_usage, 0, 100);
@@ -821,21 +930,18 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     Graphics::DrawString(x+half_w+28, ly+110, freeln, TM_DIM, 0xFF000000);
     ly += 150;
 
-    // disk pane: a touch taller (80) so the usage bar sits BELOW the read/write
-    // lines instead of being drawn on top of "Read:" like before. (satoru)
+    // disk pane: honest figures only - real kvfs usage plus whether a real
+    // nvme persist store exists. the old pane showed kernel-heap free
+    // mislabeled as "disk free" and a usage bar scaled against the heap. (satoru)
     Graphics::FillRoundedRect(x+8, ly, half_w, 80, 6, TM_PANEL);
     Graphics::DrawString(x+16, ly+6, "Disk", TM_ORANGE, 0xFF000000);
-    char dio[32]="Used: "; int_to_str(disk_read_kb,t2,12); sapp(dio,t2,32); sapp(dio," KB",32);
+    char dio[40]="Used: ";
+    if(disk_read_kb >= 1024){ int_to_str(disk_read_kb/1024,t2,12); sapp(dio,t2,40); sapp(dio," MB (kvfs)",40); }
+    else { int_to_str(disk_read_kb,t2,12); sapp(dio,t2,40); sapp(dio," KB (kvfs)",40); }
     Graphics::DrawString(x+16, ly+24, dio, TM_DIM, 0xFF000000);
-    scpy(dio,"Free: ",32); int_to_str(disk_write_kb,t2,12); sapp(dio,t2,32); sapp(dio," KB",32);
+    scpy(dio,"Store: ",40);
+    sapp(dio, PersistStore::Available() ? "NVMe present" : "none", 40);
     Graphics::DrawString(x+16, ly+40, dio, TM_DIM, 0xFF000000);
-    // usage bar, full pane width, on its own row clear of the text. (satoru)
-    int disk_total_kb = (int)(KernelHeap::GetTotal() / 1024);
-    int disk_pct = (disk_read_kb * 100) / (disk_total_kb > 0 ? disk_total_kb : 1);
-    disk_pct = tm_clamp(disk_pct, 0, 100);
-    int dbw = half_w - 24;
-    Graphics::FillRoundedRect(x+16, ly+58, dbw, 10, 4, TM_GRAPH_BG);
-    if(disk_pct > 0) Graphics::FillRoundedRect(x+16, ly+58, dbw*disk_pct/100, 10, 4, TM_ORANGE);
 
     Graphics::FillRoundedRect(x+half_w+20, ly, half_w, 80, 6, TM_PANEL);
     Graphics::DrawString(x+half_w+28, ly+6, "Network", TM_CYAN, 0xFF000000);
@@ -944,10 +1050,10 @@ void TaskManagerApp::RenderDetails(int x,int y,int w,int h){
         Graphics::DrawString(x+D_THR, ry+2,num,TM_DIM,0xFF000000);
         int_to_str(p->priority,num,12);
         Graphics::DrawString(x+D_PRI, ry+2,num,TM_DIM,0xFF000000);
-        int_to_str(p->io_read_kb,num,12);
-        Graphics::DrawString(x+D_IOR, ry+2,num,TM_DIM,0xFF000000);
-        int_to_str(p->io_write_kb,num,12);
-        Graphics::DrawString(x+D_IOW, ry+2,num,TM_DIM,0xFF000000);
+        // no per-process io accounting exists in the kernel yet - show an
+        // honest dash instead of a fake zero. (satoru)
+        Graphics::DrawString(x+D_IOR, ry+2,"-",TM_DIM,0xFF000000);
+        Graphics::DrawString(x+D_IOW, ry+2,"-",TM_DIM,0xFF000000);
     }
 }
 
@@ -1011,9 +1117,12 @@ void TaskManagerApp::RenderServices(int x,int y,int w,int h){
         if(i%2) Graphics::FillRect(x,ry,w,ROW_H,TM_ROW_ALT);
 
         Graphics::DrawString(x+8,  ry+2, services[i].name, TM_TEXT, 0xFF000000);
-        bool running = (services[i].status[0]=='R');
-        Graphics::FillCircle(x+184, ry+10, 3, running ? TM_GREEN : TM_RED);
-        Graphics::DrawString(x+192, ry+2, services[i].status, running ? TM_GREEN : TM_RED, 0xFF000000);
+        // green = running, yellow = sleeping/blocked, red = stopped. (satoru)
+        unsigned int sc = TM_RED;
+        if(services[i].status[0]=='R') sc = TM_GREEN;
+        else if(services[i].status[0]=='S' && services[i].status[1]=='l') sc = TM_YELLOW;
+        Graphics::FillCircle(x+184, ry+10, 3, sc);
+        Graphics::DrawString(x+192, ry+2, services[i].status, sc, 0xFF000000);
         Graphics::DrawString(x+280, ry+2, services[i].type, TM_DIM, 0xFF000000);
         if(services[i].pid > 0){
             char num[8]; int_to_str(services[i].pid, num, 8);
@@ -1027,6 +1136,17 @@ void TaskManagerApp::RenderServices(int x,int y,int w,int h){
 void TaskManagerApp::RenderStatusBar(int x,int y,int w){
     Graphics::FillRect(x,y,w,20,TM_STATUS);
     Graphics::DrawLine(x,y,x+w,y,TM_BORDER);
+
+    // action feedback owns the bar for a few seconds after a kill/restart so
+    // the user sees the real outcome, not just a silently refreshed list. (satoru)
+    if(g_tm_action_msg[0]){
+        uint32_t now = Time::GetTicks();
+        if(now - g_tm_action_ms < 5000){
+            Graphics::DrawString(x+8,y+3,g_tm_action_msg,TM_YELLOW,0xFF000000);
+            return;
+        }
+        g_tm_action_msg[0] = 0;
+    }
 
     char info[128]={0};
     char n[8];
