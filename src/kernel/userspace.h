@@ -23,6 +23,13 @@ struct UserspaceCpuState {
     Process* active_process;
     int      active_linux_process;
     UserspaceReturnContext return_context;
+    // true ONLY while this cpu is inside a RunProcessWithArgs launcher frame
+    // (return_context holds a live UserspaceEnter save point). an AP that
+    // RESUMES a dispatched thread via ap_enter_user_frame sets active_process
+    // but NEVER inits return_context, so a fault-exit that blindly
+    // UserspaceResume'd it longjmp'd through a zero context -> rip=0/rsp=0 ->
+    // #DF (the ap firefox-crash panic). HandleProcessExit checks this. (satoru)
+    bool     return_context_valid;
 };
 
 extern "C" int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext* ctx,

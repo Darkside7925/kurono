@@ -327,7 +327,7 @@ void FAT32::InsertDirCache(const char* path, uint32_t cluster) {
     dir_cache[victim].lru = ++dir_cache_clock;
 }
 
-int FAT32::FindEntryInDir(uint32_t dir_cluster, const char short_name[11], uint32_t* found_cluster, uint8_t* found_attr, uint32_t* found_entry_cluster, uint32_t* found_entry_offset) {
+int FAT32::FindEntryInDir(uint32_t dir_cluster, const char short_name[11], uint32_t* found_cluster, uint8_t* found_attr, uint32_t* found_entry_cluster, uint32_t* found_entry_offset, uint32_t* found_size) {
     uint32_t cluster = dir_cluster;
     uint32_t cl_sz = cluster_size;
     uint32_t guard = 0;
@@ -345,6 +345,7 @@ int FAT32::FindEntryInDir(uint32_t dir_cluster, const char short_name[11], uint3
                 if (found_attr) *found_attr = de->attr;
                 if (found_entry_cluster) *found_entry_cluster = cluster;
                 if (found_entry_offset) *found_entry_offset = off;
+                if (found_size) *found_size = de->file_size;   // for the read path (satoru)
                 return 0;
             }
         }
@@ -671,3 +672,110 @@ int FAT32::WriteFile(const char* path, const void* data, uint32_t len) {
     FlushCache();
     return r;
 }
+
+// ---- read side (the live mount consumer) (satoru) ---------------------------
+
+int FAT32::StatPath(const char* path, uint32_t* first_cluster, uint8_t* attr, uint32_t* size) {
+    if (!mounted || !path || path[0] != '/') return -1;
+    // root is a synthetic directory entry (satoru)
+    if (path_len_norm(path) <= 1) {
+        if (first_cluster) *first_cluster = root_cluster;
+        if (attr) *attr = FAT32_ATTR_DIRECTORY;
+        if (size) *size = 0;
+        return 0;
+    }
+    uint32_t parent = 0;
+    char short_name[11];
+    int r = FindPath(path, &parent, short_name, nullptr, nullptr, true);
+    if (r != 0) return r;
+    uint32_t fc = 0; uint8_t at = 0; uint32_t sz = 0;
+    r = FindEntryInDir(parent, short_name, &fc, &at, nullptr, nullptr, &sz);
+    if (r != 0) return r;
+    if (first_cluster) *first_cluster = fc;
+    if (attr) *attr = at;
+    if (size) *size = sz;
+    return 0;
+}
+
+int FAT32::GetFileSize(const char* path) {
+    uint8_t at = 0; uint32_t sz = 0;
+    if (StatPath(path, nullptr, &at, &sz) != 0) return -1;
+    if (at & FAT32_ATTR_DIRECTORY) return -1;
+    return (int)sz;
+}
+
+int FAT32::ReadFile(const char* path, void* buf, uint32_t max_len) {
+    if (!mounted || !buf) return -1;
+    uint32_t fc = 0; uint8_t at = 0; uint32_t sz = 0;
+    if (StatPath(path, &fc, &at, &sz) != 0) return -1;
+    if (at & FAT32_ATTR_DIRECTORY) return -1;
+    uint32_t want = sz < max_len ? sz : max_len;
+    uint8_t* dst = (uint8_t*)buf;
+    uint32_t done = 0;
+    uint32_t cluster = fc;
+    uint32_t guard = 0;
+    // walk the cluster chain, copying at most one cluster per hop; the byte
+    // cache underneath turns this into 4k device reads. (satoru)
+    while (done < want && IsClusterValid(cluster)) {
+        if (guard++ > total_clusters + 2) return -1;   // cyclic fat chain (satoru)
+        uint32_t chunk = want - done;
+        if (chunk > cluster_size) chunk = cluster_size;
+        if (ReadBytes(ClusterOffset(cluster), chunk, dst + done) != 0) return -1;
+        done += chunk;
+        if (done >= want) break;
+        uint32_t next = ReadFAT(cluster);
+        if (next >= FAT32_EOC || next == FAT32_BAD || next < 2) break;
+        cluster = next;
+    }
+    return (int)done;
+}
+
+int FAT32::ListDir(const char* path, char* out, int max_out) {
+    if (!mounted || !out || max_out < 2) return -1;
+    uint32_t fc = 0; uint8_t at = 0;
+    if (StatPath(path, &fc, &at, nullptr) != 0) return -1;
+    if (!(at & FAT32_ATTR_DIRECTORY)) return -1;
+    uint32_t cluster = (fc >= 2) ? fc : root_cluster;   // ".." to root stores 0 (satoru)
+    int p = 0;
+    // uses scratch2 so nothing that ran inside StatPath (scratch) is live. (satoru)
+    uint32_t guard = 0;
+    while (IsClusterValid(cluster)) {
+        if (guard++ > total_clusters + 2) break;
+        if (ReadCluster(cluster, scratch2) != 0) { out[p] = 0; return -1; }
+        for (uint32_t off = 0; off < cluster_size; off += 32) {
+            FAT32DirEntry* de = (FAT32DirEntry*)(scratch2 + off);
+            uint8_t marker = (uint8_t)de->name[0];
+            if (is_end(marker)) { out[p] = 0; return p; }
+            if (is_deleted(marker) || is_lfn(de->attr)) continue;
+            if (de->attr & FAT32_ATTR_VOLUME_ID) continue;
+            // 8.3 -> "NAME.EXT" one line per entry (satoru)
+            for (int i = 0; i < 8 && de->name[i] != ' '; i++) {
+                if (p < max_out - 1) out[p++] = de->name[i];
+            }
+            if (de->name[8] != ' ') {
+                if (p < max_out - 1) out[p++] = '.';
+                for (int i = 8; i < 11 && de->name[i] != ' '; i++) {
+                    if (p < max_out - 1) out[p++] = de->name[i];
+                }
+            }
+            if (p < max_out - 1) out[p++] = ' ';
+            if (p < max_out - 1) out[p++] = ' ';
+            if (de->attr & FAT32_ATTR_DIRECTORY) {
+                const char* d = "<DIR>";
+                for (int i = 0; d[i]; i++) if (p < max_out - 1) out[p++] = d[i];
+            } else {
+                char t[12]; int ti = 0; uint32_t v = de->file_size;
+                if (v == 0) t[ti++] = '0';
+                while (v && ti < 12) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+                while (ti) { char c2 = t[--ti]; if (p < max_out - 1) out[p++] = c2; }
+            }
+            if (p < max_out - 1) out[p++] = '\n';
+        }
+        uint32_t next = ReadFAT(cluster);
+        if (next >= FAT32_EOC || next == FAT32_BAD || next < 2) break;
+        cluster = next;
+    }
+    out[p] = 0;
+    return p;
+}
+// ---- end read side (satoru) --------------------------------------------------

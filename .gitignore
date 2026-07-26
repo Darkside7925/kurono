@@ -45,6 +45,11 @@ qmp_*.py
 NOTES.md
 kpkg-daemon-freeze-fix.diff
 
+# capability audit + worklist from the two-agent explorer/skeptic pass. local
+# reference only, regenerable, not part of the tracked os tree (satoru)
+/CAPABILITIES.md
+/NEEDTODO.md
+
 # feature brainstorm/planning workspace (libraries vendored here; not for the repo) (satoru)
 feats/
 

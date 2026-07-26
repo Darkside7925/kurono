@@ -93,6 +93,17 @@
 #define USB_HID_KEYBOARD   1
 #define USB_HID_MOUSE      2
 
+// mass-storage class bulk-only transport (bot) constants (satoru)
+#define USB_MSC_CLASS      0x08
+#define USB_MSC_PROTO_BOT  0x50
+#define USB_MSC_REQ_RESET  0xFF   // bulk-only mass storage reset (satoru)
+#define USB_MSC_REQ_GETLUN 0xFE   // get max lun (satoru)
+#define USB_CBW_SIG        0x43425355u   // "USBC" (satoru)
+#define USB_CSW_SIG        0x53425355u   // "USBS" (satoru)
+// bounce buffer for bulk data stages: 32kb aligned to 32kb so a single normal
+// trb never crosses a 64kb boundary (xhci data-buffer rule) (satoru)
+#define USB_BULK_BOUNCE    32768
+
 #define USB_MAX_DEVICES    16
 #define USB_MAX_PORTS      16
 
@@ -168,6 +179,30 @@ struct USBDeviceRuntime {
     uint8_t     intr_ep_id;        // xhci dci / doorbell target (satoru)
     uint8_t     intr_interval;     // bInterval from the endpoint descriptor (satoru)
     bool        intr_armed;        // a Normal trb is queued and awaiting completion (satoru)
+
+    // bulk in/out endpoint state for mass-storage (bot) devices. rings are
+    // allocated only when the config descriptor exposes a bulk pair. (satoru)
+    xHCI_TRB*   bulk_in_ring;
+    int         bulk_in_idx;
+    bool        bulk_in_cycle;
+    xHCI_TRB*   bulk_out_ring;
+    int         bulk_out_idx;
+    bool        bulk_out_cycle;
+    uint8_t     bulk_in_ep;        // endpoint address (0x8N) (satoru)
+    uint8_t     bulk_out_ep;       // endpoint address (0x0N) (satoru)
+    uint8_t     bulk_in_dci;       // xhci dci: in ep N -> 2N+1 (satoru)
+    uint8_t     bulk_out_dci;      // xhci dci: out ep N -> 2N (satoru)
+    uint16_t    bulk_in_mps;
+    uint16_t    bulk_out_mps;
+    uint8_t*    bulk_bounce;       // 32kb/32kb-aligned dma bounce buffer (satoru)
+
+    // bot / scsi state (valid when is_msd) (satoru)
+    bool        is_msd;
+    bool        msd_ready;         // inquiry + read-capacity succeeded (satoru)
+    uint8_t     msd_lun;
+    uint32_t    msd_tag;           // cbw tag counter (satoru)
+    uint64_t    msd_blocks;        // total lba count from read capacity (satoru)
+    uint32_t    msd_block_size;    // bytes per lba (satoru)
 };
 
 class USB {
@@ -192,9 +227,24 @@ public:
                                 uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                                 void* data);
 
-    // bulk transfers
-    static bool BulkRead(int device, uint8_t endpoint, void* buffer, int length);
+    // bulk transfers. endpoint is the usb endpoint ADDRESS (0x8N = in, 0x0N =
+    // out) and must match one of the device's configured bulk endpoints.
+    // synchronous: builds a normal trb, rings the doorbell and waits for the
+    // transfer event. out_transferred (optional) reports the actual byte
+    // count (short packets are legal on bulk-in). (satoru)
+    static bool BulkRead(int device, uint8_t endpoint, void* buffer, int length,
+                         int* out_transferred = nullptr);
     static bool BulkWrite(int device, uint8_t endpoint, const void* buffer, int length);
+
+    // mass-storage (bulk-only transport, scsi) - populated automatically when
+    // a class-08 protocol-50 interface is configured during enumeration. a
+    // usb stick shows up here as a readable block device. (satoru)
+    static int      MsdFirstDevice();            // first ready msd index or -1 (satoru)
+    static bool     MsdIsReady(int device);
+    static uint64_t MsdBlocks(int device);       // capacity in lbas (satoru)
+    static uint32_t MsdBlockSize(int device);    // bytes per lba (satoru)
+    static bool     MsdRead(int device, uint64_t lba, uint32_t count, void* buf);
+    static bool     MsdWrite(int device, uint64_t lba, uint32_t count, const void* buf);
 
     // hid interrupt polling - call periodically (e.g. from the input poll
     // loop, ~1 khz) to drain transfer-completion + port-change events and
@@ -266,6 +316,13 @@ private:
     static void ArmInterrupt(int idx);
     static void DispatchReport(int idx, const uint8_t* report, int len);
     static void ParseReportDescriptor(int idx, const uint8_t* rpt, int len);
+
+    // bulk / mass-storage internals (satoru)
+    static bool BulkTransferEP(int idx, bool dir_in, void* data, int len,
+                               int* out_transferred);
+    static bool MsdCommand(int idx, const uint8_t* cb, int cb_len, bool dir_in,
+                           void* data, uint32_t data_len, uint32_t* out_residue);
+    static bool MsdInit(int idx);
 
     // input-context accessors: stride-correct pointers into input_ctx (satoru)
     static uint32_t* InputControlCtx(int idx);   // input control context (satoru)

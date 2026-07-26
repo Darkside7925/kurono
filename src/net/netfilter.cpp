@@ -32,6 +32,24 @@ namespace {
 namespace {
     uint32_t g_eval_count[Netfilter::HOOK_COUNT] = {0};
 
+    // datapath fast-gate: true only when some chain has a rule or a non-ACCEPT
+    // policy. the packet paths read this once per packet and skip Evaluate
+    // while it is false, so an unconfigured firewall costs one load. (satoru)
+    bool g_engaged = false;
+
+    void recompute_engaged() {
+        bool e = false;
+        for (int i = 0; i < Netfilter::HOOK_COUNT; i++) {
+            Netfilter::Chain* c = Netfilter::GetChain((Netfilter::Hook)i);
+            if (!c) continue;
+            if (c->rule_count > 0 || c->default_policy != Netfilter::NF_ACCEPT) {
+                e = true;
+                break;
+            }
+        }
+        g_engaged = e;
+    }
+
     void resort_chain(Netfilter::Chain& c) {
         // Insertion sort by descending pkt_count. Keep ordering stable for
         // equal counters so user-defined precedence is preserved as a
@@ -59,8 +77,11 @@ void Init() {
             g_chains[i].rules[r].active = false;
         }
     }
+    recompute_engaged();
     SerialLogger::Log("Netfilter: 5 hooks initialized (PRE/IN/FWD/OUT/POST), policy=ACCEPT\r\n");
 }
+
+bool IsEngaged() { return g_engaged; }
 
 Chain* GetChain(Hook h) {
     if (h >= HOOK_COUNT) return nullptr;
@@ -70,6 +91,7 @@ Chain* GetChain(Hook h) {
 void SetPolicy(Hook h, Action policy) {
     if (h >= HOOK_COUNT) return;
     g_chains[h].default_policy = policy;
+    recompute_engaged();
 }
 
 int AddRule(Hook h, const Rule& r) {
@@ -81,6 +103,7 @@ int AddRule(Hook h, const Rule& r) {
     c.rules[idx].active     = true;
     c.rules[idx].pkt_count  = 0;
     c.rules[idx].byte_count = 0;
+    recompute_engaged();
     return idx;
 }
 
@@ -92,6 +115,7 @@ bool DeleteRule(Hook h, int index) {
     for (int i = index; i < c.rule_count - 1; i++) c.rules[i] = c.rules[i + 1];
     c.rule_count--;
     c.rules[c.rule_count].active = false;
+    recompute_engaged();
     return true;
 }
 
@@ -101,6 +125,7 @@ void Flush(Hook h) {
     for (int r = 0; r < NF_MAX_RULES_PER_HOOK; r++) {
         g_chains[h].rules[r].active = false;
     }
+    recompute_engaged();
 }
 
 Action Evaluate(Hook h,

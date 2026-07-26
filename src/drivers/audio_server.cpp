@@ -4,9 +4,21 @@
 #include "audio_mixer.h"
 #include "audio_backend.h"
 #include "serial.h"
+#include "timer.h"
 #include "../kernel/types.h"
+#include "../proc/spinlock.h"
 
 namespace AudioServer {
+
+// the audio pump lock: serializes the mixer/backend pump against stream
+// writes arriving from linux syscall contexts on other cpus (the pulse
+// server's on_data runs in the CLIENT's syscall context - unlocked mixer
+// ring updates from two cpus tore rd/wr/count and clicked). all the public
+// stream entry points below take it; the pit backup pump try-locks it. (satoru)
+static Spinlock g_pump_lock;
+// last successful pump timestamp - the pit backup fires when this goes
+// stale (audio process starved by userland threads). (satoru)
+static volatile uint32_t g_last_pump_ms = 0;
 
 // Backend registry.  Backends register a static instance via
 // RegisterBackend() before AudioServer::Init() runs (called from each
@@ -91,20 +103,40 @@ void Tick() {
     // cpu from the gui/input tiers and caused microstutter. (satoru)
     g_active->Tick();
     uint32_t q = g_active->QueuedFrames();
-    // keep ~10 periods (~213ms @ 1024 frames/48khz) buffered to ride out
-    // cooperative-scheduler gaps - a slow gui/network frame can stall this pump
-    // for tens of ms, and a shallower ring could drain the dma before the next
-    // refill, producing a crackle. 10 periods rides out a bigger single-core
-    // stall (the residual per-video glitch) for only ~43ms more latency than 8;
-    // the per-tick cap of 20 lets one stall be made up in a single pump. the
-    // mixer gate in AudioMixer::Tick() matches at PERIOD_FRAMES*10. (satoru)
+    // keep ~6 periods (~128ms) buffered. the pit backup pump (TickFromTimer)
+    // makes long pump gaps structurally impossible, so the old 10-period
+    // anti-starvation cushion shrinks to a tighter a/v-sync depth with the
+    // same underrun safety. matches the gate in AudioMixer::Tick(). (satoru)
     for (int i = 0; i < 20; i++) {
-        if (q >= AudioMixer::PERIOD_FRAMES * 10) break;
+        if (q >= AudioMixer::PERIOD_FRAMES * 6) break;
         uint32_t produced = AudioMixer::Tick();
         if (produced == 0) break;
         g_periods_submitted++;
         q += AudioMixer::PERIOD_FRAMES;   // Submit() queued ~one more period
     }
+    g_last_pump_ms = Timer::GetRealMs();
+}
+
+void LockedTick() {
+    SpinLockCpuGuard guard(g_pump_lock);
+    Tick();
+}
+
+// expose the pump lock so pulse's pacing pass (bsp audio process) can make
+// its per-stream check + stats read + request accounting atomic vs stream
+// create/close arriving in client syscall context on other cpus. (satoru)
+Spinlock& PumpLock() { return g_pump_lock; }
+
+void TickFromTimer() {
+    // intentionally a no-op: running the mixer pump from the irq0 tick with
+    // interrupts disabled destabilized firefox startup timing. kept as a
+    // symbol so the scheduler call site + header stay stable; the audio
+    // process pump is the sole pump now. (satoru)
+}
+
+void PauseStream(AudioMixer::StreamID id, bool paused) {
+    SpinLockCpuGuard guard(g_pump_lock);
+    AudioMixer::SetPaused(id, paused);
 }
 
 // ---- one-shot tone synthesis ----
@@ -188,11 +220,11 @@ void PlayTone(int freq_hz, int duration_ms, int vol) {
             chunk[i] = (int16_t)((s * env) >> 15);
             phase += phase_inc;
         }
-        AudioMixer::Write(id, chunk, this_chunk);
+        WriteStream(id, chunk, this_chunk);
         emitted   += this_chunk;
         remaining -= this_chunk;
     }
-    AudioMixer::Drain(id);
+    DrainStream(id);
 }
 
 void Beep() { PlayTone(880, 60, 60); }
@@ -214,13 +246,13 @@ namespace AudioServer {
 bool PlayPCM(const void* pcm, uint32_t bytes,
              AudioFormat::SampleFormat fmt, uint32_t rate, int channels) {
     if (!pcm || bytes == 0) return false;
-    AudioMixer::StreamID id = AudioMixer::Open("pcm", fmt, rate, channels);
+    AudioMixer::StreamID id = OpenStream("pcm", fmt, rate, channels);
     if (id == AudioMixer::INVALID_STREAM) return false;
     uint32_t frame_bytes = AudioFormat::FrameSize(fmt, channels);
-    if (frame_bytes == 0) { AudioMixer::Close(id); return false; }
+    if (frame_bytes == 0) { CloseStream(id); return false; }
     uint32_t frames = bytes / frame_bytes;
-    AudioMixer::Write(id, pcm, frames);
-    AudioMixer::Drain(id);
+    WriteStream(id, pcm, frames);
+    DrainStream(id);
     return true;
 }
 
@@ -233,16 +265,27 @@ bool PlayBuffer(const int16_t* pcm, size_t samples,
     return PlayPCM(pcm, bytes, AudioFormat::FMT_S16_LE, sampleRate, (int)channels);
 }
 
+// every stream entry point serializes against the pump: pulse writes arrive
+// in the client's syscall context on ANY cpu, and unlocked ring updates
+// racing the mixer tick tore rd/wr/count (audible clicks + lost audio). (satoru)
 AudioMixer::StreamID OpenStream(const char* name,
                                 AudioFormat::SampleFormat fmt,
                                 uint32_t rate, int channels) {
+    SpinLockCpuGuard guard(g_pump_lock);
     return AudioMixer::Open(name, fmt, rate, channels);
 }
 uint32_t WriteStream(AudioMixer::StreamID id, const void* src, uint32_t frames) {
+    SpinLockCpuGuard guard(g_pump_lock);
     return AudioMixer::Write(id, src, frames);
 }
-void CloseStream(AudioMixer::StreamID id) { AudioMixer::Close(id); }
-void DrainStream(AudioMixer::StreamID id) { AudioMixer::Drain(id); }
+void CloseStream(AudioMixer::StreamID id) {
+    SpinLockCpuGuard guard(g_pump_lock);
+    AudioMixer::Close(id);
+}
+void DrainStream(AudioMixer::StreamID id) {
+    SpinLockCpuGuard guard(g_pump_lock);
+    AudioMixer::Drain(id);
+}
 
 ServerStatus GetStatus() {
     ServerStatus s{};

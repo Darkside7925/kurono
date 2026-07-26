@@ -154,6 +154,11 @@ public:
     static void ArrangeIcons();
     static void RefreshFiles();
     static void RemoveIcon(int index);            // delete icon + backing file
+    // keep the firefox app icon in sync with its install state: present when
+    // installed (or persisted on disk) unless the user deleted it
+    // (desktop.firefox_icon=0; a fresh install re-enables). called from Init
+    // and the periodic RefreshFiles sync. (satoru)
+    static void SyncFirefoxIcon();
     static bool CreateFolderInteractive();        // "new folder n"
     static bool CreateFileInteractive();          // "new file n.txt"
     static void ReloadFromConfig();               // reapply uiconfig sizes/colors
@@ -235,6 +240,9 @@ private:
     static int  IconAt(int mx, int my);
     static int  FindIconByPath(const char* path);
     static bool IsDesktopFileIcon(const DesktopIcon* icon);
+    // pure array removal (shift + index fixups), shared by RemoveIcon and the
+    // state-driven syncs; touches no backing files and no persisted flags. (satoru)
+    static void DropIconAt(int index);
     static void AddOrUpdateDesktopFile(KVFSNode* node);
     static void PlaceIcon(int index);
     static void ClampIcon(int index);
@@ -261,6 +269,10 @@ public:
     static void LaunchTaskManager();
     static void LaunchBrowser();
     static void LaunchMediaPlayer();
+    // firefox: runs the `firefox` shell command detached on the shell
+    // kernel-process (restore/install/exec), so no terminal window opens;
+    // feedback is a toast + the firefox window itself. (satoru)
+    static void LaunchFirefox();
 
     // session control
     static void RequestLogout();
