@@ -27,6 +27,7 @@
 #include "../drivers/e1000.h"
 #include "../net/network.h"
 #include "../net/tcpip.h"
+#include "../linux/linux_netbridge.h"   // task 30: wake inet pollers after the nic drain (satoru)
 #include "../system/input_manager.h"
 #include "../system/logging.h"
 #include "../ui/desktop.h"
@@ -135,6 +136,9 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
                 E1000::Poll();
             }
         }
+        // task 30: hand the drained rx to any parked poller NOW (outside the
+        // net lock - the wake takes the pollreg lock and must not nest). (satoru)
+        LinuxNetBridge::WakeRxPollers();
         Scheduler::SleepMs(10);   // RX latency-tolerant; 1ms over-polled an idle NIC (satoru)
     }
 }

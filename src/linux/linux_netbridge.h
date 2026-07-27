@@ -181,6 +181,9 @@ public:
     static void Retain(int sockfd);            // dup/fork refcount bump
     static int  RxAvail(int sockfd);           // ioctl(FIONREAD)
     static void PumpTick();                    // rate-limited TCPStack::Tick (bsp only)
+    // task 30: wake pollers parked on sockets that now have rx/hup, and settle
+    // connect state. called right after the nic drain. (satoru)
+    static void WakeRxPollers();
 
     static void InitInterfaces();
     static LinuxNetInterface* GetInterface(const char* name);

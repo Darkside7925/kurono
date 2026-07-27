@@ -37,6 +37,16 @@ char LinuxSyscall::stdin_buf[STDIN_BUF_SIZE];
 int  LinuxSyscall::stdin_head = 0;
 int  LinuxSyscall::stdin_tail = 0;
 
+// task 29 (boot speed): the uart busy-waits ~23.6us PER BYTE (serial.cpp), so the
+// firefox debug probes cost real wall-clock - ~77KB emitted per boot = ~1.8s, of
+// which ~90% is temp forensics ([nssop]/[nssok]/[nsslk]/[nssft]/[seal]/[tnew]/
+// [fftasks]/[ffwait]). they are gated on this and default OFF; kurono.fftrace=1
+// turns them back on for a hunt. [ffcount], the K*: phase markers and [KWPAINT]
+// stay unconditional (the harness classifies on them, only ~5KB). GLOBAL linkage
+// and defined BEFORE the anon namespace so both the probes and kurono_kernel.cpp
+// (via extern) bind to this one object. (satoru)
+bool g_fftrace = false;
+
 namespace {
 constexpr uint64_t EXEC_STACK_BYTES = 16 * 1024;
 constexpr int EXEC_MAX_ARGC = 16;
@@ -599,6 +609,13 @@ static inline bool wake_blocked_to_ready(Process* t);   // atomic Blocked->Ready
 static uint64_t g_poll_parked  = 0;   // task 20: poll-family ap parks (printed in ffcount) (satoru)
 static uint64_t g_sleep_parked = 0;   // task 20: nanosleep ap parks (printed in ffcount) (satoru)
 static bool     g_yprot_trap   = false;  // task 27: yield-page write-protect trap (dormant; hunt only) (satoru)
+// task 29 (boot speed): the uart busy-waits ~23.6us PER BYTE (serial.cpp), so the
+// firefox debug probes cost real wall-clock: ~77KB emitted per boot = ~1.8s, of
+// which ~90% is the temp forensics below. gate them behind kurono.fftrace=1 so a
+// normal boot pays nothing and a hunt can turn them all back on. [ffcount], the
+// K*: phase markers and [KWPAINT] stay unconditional (the harness classifies on
+// them and they are only ~5KB). the definition is at the top of this file,
+// before the anonymous namespace (see g_fftrace there). (satoru)
 
 // ── TASK 25: proactive poll/epoll readiness wakeup (event-driven fd wakes) ────
 // THE agent-diagnosed rate fix (both the linux-trace and kurono-log analyses
@@ -641,6 +658,11 @@ static uint32_t poll_fd_key(LinuxProcess* p, int fd) {
         case LFD_SOCKET:
         case LFD_PIPE:    return poll_obj_key(2, lfd->backend_fd);
         case LFD_TIMERFD: return poll_obj_key(3, lfd->backend_fd);
+        // task 30: inet sockets were missing here, so a poller waiting on tcp
+        // rx only ever learned about data from the 2-16 tick timer backstop -
+        // ~10ms+ added to every round trip once bytes actually flow. the nic
+        // rx path wakes this key (see poll_wake_inet). (satoru)
+        case LFD_INET:    return poll_obj_key(4, lfd->backend_fd);
         default:          return 0;   // regular files / stubs stay on the timer (satoru)
     }
 }
@@ -756,6 +778,7 @@ static void poll_wake_key(uint32_t key) {
 static inline void poll_wake_eventfd(int slot)  { poll_wake_key(poll_obj_key(1, slot)); }
 static inline void poll_wake_unixsd(int reader_sd) { poll_wake_key(poll_obj_key(2, reader_sd)); }
 static inline void poll_wake_timerfd(int slot)  { poll_wake_key(poll_obj_key(3, slot)); }
+static inline void poll_wake_inet(int sd)       { poll_wake_key(poll_obj_key(4, sd)); }
 
 // task 21: remap RING - the serial version of this log (163 lines x ~8.7ms
 // uart in the 9-10s window) serialized the early munmap/madvise path so hard
@@ -1507,7 +1530,7 @@ static void ff_meas_sample() {
     // task 17b: every ~5s dump each task of the firefox thread group - pid,
     // state, sleep_ticks, on_cpu - so a stranded producer names itself. (satoru)
     static uint64_t s_last_dump_ms = 0;
-    if (now - s_last_dump_ms >= 5000) {
+    if (g_fftrace && now - s_last_dump_ms >= 5000) {   // task 29: uart cost (satoru)
         s_last_dump_ms = now;
         uint64_t as = __atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED);
         SerialLogger::Log("[fftasks]");
@@ -2519,6 +2542,7 @@ static inline void wake_publish_ready(Process* t) {
 // task 17b diagnostic: list this address space's active futex waiters (pid,
 // uaddr, expected). racy unlocked read - values only feed a serial line. (satoru)
 static void ff_dump_ff_waiters(uint64_t as) {
+    if (!g_fftrace) return;   // task 29: uart cost (satoru)
     SerialLogger::Log("[ffwait]");
     for (int i = 0, wn = 0; i < FUTEX_MAX_WAITERS && wn < 10; i++) {
         FutexWaiter* w = &g_futex_waiters[i];
@@ -3502,6 +3526,11 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr, uint64_t a0, uint64_t a1,
 // spread threads to home aps. GLOBAL linkage (the anon-namespace helpers above
 // + kurono_kernel.cpp reference it via extern). default OFF (bsp-pile). (satoru)
 bool g_madv_lazy = false;
+// task 30: GLOBAL-linkage shim so the net bridge (linux_netbridge.cpp) can wake
+// a poller parked on an inet socket right after the nic drain, instead of it
+// waiting out the 2-16 tick timer backstop. defined here (outside the anon
+// namespace) but forwards to the anon-namespace wake helper. (satoru)
+void LinuxSyscallPollWakeInet(int backend_sd) { poll_wake_inet(backend_sd); }
 
 extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     if (!frame) return;
@@ -4519,7 +4548,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // sqlite truncates its journal/wal; a journal that stays non-empty can
             // make sqlite treat the profile db as corrupt. log who relies on it.
             // remove before commit.
-            if (p && p->pid >= 100 && p->pid < 140) {
+            if (g_fftrace && p && p->pid >= 100 && p->pid < 140) {
                 int tfd = (int)ebx;
                 bool okfd = (tfd >= 0 && tfd < LINUX_MAX_FDS && p->fds[tfd].open);
                 SerialLogger::Log("[nssft] pid="); SerialLogger::LogDec((int)p->pid);
@@ -4657,7 +4686,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // Freeze() calls; if it returns !=0 the freeze fails -> SharedStringMap
             // ctor MOZ_RELEASE_ASSERT(result.isOk()) line 48. log the fd/open state +
             // return so the flaky freeze failure is visible. remove before commit.
-            if (p && p->pid >= 100 && p->pid < 140 && (cmd == 1033 || cmd == 1034)) {
+            if (g_fftrace && p && p->pid >= 100 && p->pid < 140 && (cmd == 1033 || cmd == 1034)) {
                 SerialLogger::Log("[seal] pid="); SerialLogger::LogDec((int)p->pid);
                 SerialLogger::Log(" fd="); SerialLogger::LogDec(fd);
                 SerialLogger::Log(" cmd="); SerialLogger::LogDec(cmd);
@@ -4705,7 +4734,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     // (satoru) TEMP [nsslk]: trace sqlite's advisory locks on the
                     // profile dbs (cert9/key4) - a refused lock aborts nss init.
                     // remove before commit.
-                    if (p->pid >= 100 && p->pid < 140 && probe_has(lfd->path, ".mozilla")) {
+                    if (g_fftrace && p->pid >= 100 && p->pid < 140 && probe_has(lfd->path, ".mozilla")) {
                         SerialLogger::Log("[nsslk] pid="); SerialLogger::LogDec((int)p->pid);
                         SerialLogger::Log(" cmd="); SerialLogger::LogDec(cmd);
                         SerialLogger::Log(" ty="); SerialLogger::LogDec((int)want);
@@ -5141,7 +5170,7 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 // task 20 wedge hunt: RE-ENABLED for all user pids - the wedge
                 // snapshot shows 4 threads where good boots have 7; name every
                 // clone so the missing participant identifies itself. (satoru)
-                if (_pp && _pp->pid >= 20) {
+                if (g_fftrace && _pp && _pp->pid >= 20) {
                     SerialLogger::Log("[tnew] par="); SerialLogger::LogDec(_pp->pid);
                     SerialLogger::Log(" tid="); SerialLogger::LogDec(tid);
                     SerialLogger::Log(" flags="); SerialLogger::LogHex(flags);
@@ -8741,7 +8770,7 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
             // (satoru) TEMP [nssok]: trace what nss/sqlite touches under the
             // profile dir + /dev so the failing sibling call stands out.
             // remove before commit.
-            if (p->pid >= 100 && p->pid < 140 &&
+            if (g_fftrace && p->pid >= 100 && p->pid < 140 &&
                 (probe_has(resolved, ".mozilla") || ls_starts(resolved, "/system/dev/"))) {
                 SerialLogger::Log("[nssok] pid="); SerialLogger::LogDec((int)p->pid);
                 SerialLogger::Log(" fd="); SerialLogger::LogDec(lfd_idx);
@@ -8788,7 +8817,7 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
     // (satoru) TEMP [nssop]: the re-added open-fail probe (was [enoent], stripped
     // in 89822b0) - log EVERY failed open for firefox pids with flags+mode so the
     // nss/psm profile-db failure names its path. remove before commit.
-    if (p->pid >= 100 && p->pid < 140) {
+    if (g_fftrace && p->pid >= 100 && p->pid < 140) {
         SerialLogger::Log("[nssop] pid="); SerialLogger::LogDec((int)p->pid);
         SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)flags);
         SerialLogger::Log(" md="); SerialLogger::LogHex((uint32_t)mode);

@@ -254,6 +254,28 @@ int LinuxNetBridge::Connect(int sockfd, const LinuxSockaddrIn* addr) {
 // sample a connecting socket's state without blocking: 0 once established,
 // -EINPROGRESS while the handshake runs, else the connect error. transitions
 // the bridge state so later Send/Recv see CONNECTED. (satoru)
+// TASK 30 - THE PAGE-LOAD BUG. the tcp handshake completes inside ProcessTCP
+// (tcpip.cpp), which touches only the NetSocket - it never advances THIS
+// bridge's LinuxSocket.state. the only thing that settled CONNECTING ->
+// CONNECTED was ConnectPoll, whose sole caller is the BLOCKING-connect
+// emulation. firefox's sockets are non-blocking, so the bridge stayed
+// CONNECTING forever on a fully established connection, and Getpeername's
+// state gate returned -ENOTCONN. NSS calls getpeername as the FIRST step of
+// ssl_BeginClientHandshake (ssl_GetPeerInfo), so the ClientHello was never
+// written: no bytes out, nothing for the server to answer, and every fetch
+// failed with NetworkError 15-50ms after ESTABLISHED. (the HPUX11 #ifdef in
+// NSS's sslcon.c exists for exactly this "ENOTCONN after successful
+// non-blocking connect" quirk - we were reproducing an HP-UX bug.)
+// settle on every OBSERVATION, not just the first Send/Recv. single-word
+// store on a path Send/Recv already mutate unlocked; IsWritable is the
+// existing lock-free read - no new lock ordering. (satoru)
+static inline void lnb_settle(LinuxSocket* s) {
+    if (s && s->type == LSOCK_STREAM && s->state == LSOCK_CONNECTING &&
+        TCPStack::IsWritable(s->kurono_socket)) {
+        s->state = LSOCK_CONNECTED;
+    }
+}
+
 int LinuxNetBridge::ConnectPoll(int sockfd) {
     LinuxSocket* s = GetSocket(sockfd);
     if (!s) return -9;
@@ -448,6 +470,7 @@ void LinuxNetBridge::Retain(int sockfd) {
 uint32_t LinuxNetBridge::Readiness(int sockfd) {
     LinuxSocket* s = GetSocket(sockfd);
     if (!s) return LNET_POLLERR | LNET_POLLHUP;
+    lnb_settle(s);   // task 30: poll is an observation point too (satoru)
 
     uint32_t r = 0;
     int ks = s->kurono_socket;
@@ -476,6 +499,7 @@ uint32_t LinuxNetBridge::Readiness(int sockfd) {
 int LinuxNetBridge::SockError(int sockfd) {
     LinuxSocket* s = GetSocket(sockfd);
     if (!s) return 9;                                    // EBADF as a value (satoru)
+    lnb_settle(s);   // task 30: SO_ERROR is the connect-completion check (satoru)
     int e = TCPStack::GetSockError(s->kurono_socket);
     if (e == TCP_EINPROGRESS) return 0;                  // still in progress = no error (satoru)
     return e;
@@ -490,6 +514,24 @@ int LinuxNetBridge::RxAvail(int sockfd) {
 // rate-limited network pump for the bsp's poll/epoll wait loops: beats the
 // NetworkProcess's 10ms cadence during dns/handshake/tls bursts. no-ops
 // when no inet socket is live so non-network workloads pay nothing. (satoru)
+// task 30: after the nic drain, wake any poller parked on a socket that now has
+// rx data (or a hangup). without this an inet poller only learned about data on
+// the 2-16 tick timer backstop, adding ~10ms+ to every round trip. also settles
+// the connect state so a poll that races the handshake sees CONNECTED. the wake
+// itself is the same same-cpu Blocked->Ready flip the timer would do. (satoru)
+extern void LinuxSyscallPollWakeInet(int backend_sd);
+void LinuxNetBridge::WakeRxPollers() {
+    for (int i = 0; i < LNET_MAX_SOCKETS; i++) {
+        LinuxSocket* s = &sockets[i];
+        if (!s->active) continue;
+        lnb_settle(s);
+        if (TCPStack::RxAvailable(s->kurono_socket) > 0 ||
+            TCPStack::IsPeerClosed(s->kurono_socket)) {
+            LinuxSyscallPollWakeInet(i);
+        }
+    }
+}
+
 void LinuxNetBridge::PumpTick() {
     if (socket_count <= 0) return;
     static uint32_t last_ms = 0;
@@ -558,7 +600,9 @@ bool LinuxNetBridge::IsNonblocking(int sockfd) {
 
 int LinuxNetBridge::Getpeername(int sockfd, LinuxSockaddrIn* addr) {
     LinuxSocket* s = GetSocket(sockfd);
-    if (!s || s->state != LSOCK_CONNECTED || !addr) return -1;
+    if (!s || !addr) return -1;
+    lnb_settle(s);   // task 30: the handshake landed in the net tick (satoru)
+    if (s->state != LSOCK_CONNECTED) return -1;
     addr->sin_family = LAF_INET;
     addr->sin_addr = Htonl(s->remote_addr);
     addr->sin_port = Htons(s->remote_port);
