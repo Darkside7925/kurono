@@ -3541,6 +3541,38 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     resume_userspace_exit_code = 0;
 
     Process* running = Scheduler::GetCurrentProcess();
+
+    // ── task 31: mremap stack-probe FAST PATH ────────────────────────────────
+    // musl's pthread_getattr_np measures the main stack by walking it with
+    // mremap(p, PAGE, 2*PAGE, 0) ONE PAGE AT A TIME - 8MB/4KB = 2048 iterations,
+    // and firefox does it TWICE per boot (measured: top=25:2054 in [ffcount],
+    // ~470ms per walk, ~825ms total). the non-MAYMOVE body is pure arithmetic on
+    // task->user_stack_top: it cannot block, switch, fault, allocate, or touch
+    // any shared state. so answer it HERE, before the site-1 frame save (frame
+    // copy + rdmsr + 512-byte fxsave), the 256-slot find_process_index scan, and
+    // the kls acquire - that per-syscall overhead IS the cost. runs BEFORE
+    // HAL::EnableInterrupts() below (fully IF-off, cannot be preempted); writes
+    // rax and returns exactly like the normal !current_frame_rewritten exit.
+    // logic identical to the LSYS_MREMAP case: shrink/same -> old_addr, ENOMEM
+    // inside the stack so the probe keeps walking, EFAULT past the base so it
+    // TERMINATES. (satoru)
+    if (frame->rax == 25 && !(frame->r10 & 1u) && running && running->is_user()) {
+        uint64_t old_addr = frame->rdi, old_sz = frame->rsi, new_sz = frame->rdx;
+        if (new_sz != 0) {
+            if (new_sz <= old_sz) {            // shrink/same: in place (satoru)
+                frame->rax = old_addr;
+                return;
+            }
+            uint64_t stk_top = running->user_stack_top;
+            uint64_t base = stk_top
+                ? (((stk_top + PAGE_SIZE) & ~(uint64_t)(PAGE_SIZE - 1)) - (8ULL * 1024 * 1024))
+                : (0x40200000ULL - (8ULL * 1024 * 1024));
+            frame->rax = (uint64_t)(int64_t)((old_addr < base) ? -14 : -12);
+            if (ff_is_firefox(running)) g_ff_nr_hist[25]++;   // keep top= honest (satoru)
+            return;
+        }
+    }
+
     if (Userspace::IsActive() && running && running->is_user()) {
         Scheduler::SaveUserFrame(running, frame, 1);   // site 1 = syscall entry (satoru)
         // sync the linux current from the scheduler current - see the int 0x80

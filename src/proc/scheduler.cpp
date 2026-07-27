@@ -784,14 +784,22 @@ Process* Scheduler::PhysIsParkedYieldStack(uint64_t phys) {
 // depth and the 156KB neighbor spacing that fooled the rsp-range probe. (satoru)
 Process* Scheduler::LiveSiblingWithStackTop(uint64_t as, uint64_t top) {
     if (!as || !top) return nullptr;
-    uint64_t tp = top & ~0xFFFULL;
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     Process* hit = nullptr;
+    // a RECYCLED musl stack slot does not come back at a byte-identical top -
+    // the tcb/guard layout shifts it by a few KB - so a page-exact compare
+    // (v1) never fired even though the [YWRITE] trap proved the collision is
+    // real. musl packs thread stacks ~156KB apart, so a 16KB window is an
+    // order of magnitude below the neighbour spacing: it catches "this is the
+    // same slot handed back" without ever flagging the thread next door. (satoru)
+    const uint64_t REUSE_WIN = 16ull << 10;
     for (Process* p = ready_queue; p; p = p->next) {
         if (p->reaped || !p->is_user() || !p->has_user_frame) continue;
         if (p->address_space != as || !p->user_stack_top) continue;
         if (p->state == Process_Terminated && !p->on_cpu) continue;
-        if ((p->user_stack_top & ~0xFFFULL) == tp) { hit = p; break; }
+        uint64_t d = (p->user_stack_top > top) ? (p->user_stack_top - top)
+                                               : (top - p->user_stack_top);
+        if (d < REUSE_WIN) { hit = p; break; }
     }
     g_sched_lock.UnlockIrqRestore(f);
     return hit;
