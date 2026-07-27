@@ -1075,6 +1075,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // (kurono.setup=1). the main entry stays autologin -> desktop. (satoru)
     bool boot_setup = false;
     bool boot_kmemx_off = false;  // kurono.kmemx=0 a/b kill switch (task 20) (satoru)
+    bool boot_fftrace = false;    // kurono.fftrace=1 re-enables the ff debug probes (task 29) (satoru)
     bool boot_pincpu_off = false; // kurono.pincpu=0 disables the default pinning (task 21) (satoru)
     bool boot_madvlazy = false;   // kurono.madvlazy=1 lazy-madvise + thread spread a/b (task 23f) (satoru)
     int  boot_setup_screen = 0;   // optional start screen for the setup wizard (satoru)
@@ -1115,6 +1116,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // paint speedup); kurono.pincpu=0 restores migration for debugging. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.pincpu=0")) {
             boot_pincpu_off = true;
+        }
+        // task 29: kurono.fftrace=1 re-enables the firefox debug probes. they
+        // are OFF by default because the uart busy-waits ~23.6us per byte, so
+        // the ~70KB they emit costs ~1.5s of every boot. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.fftrace=1")) {
+            boot_fftrace = true;
         }
         // task 23f: lazy madvise + thread spread a/b. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.madvlazy=1")) {
@@ -1337,6 +1344,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_kmemx_off) {
         KMemX::ForceDisable();   // survives the later ApplyConfig (satoru)
         SerialLogger::Log("[2c] KMemX DISABLED by cmdline (kurono.kmemx=0)\r\n");
+    }
+    // task 29: the firefox debug probes are OFF by default (the uart busy-waits
+    // ~23.6us/byte, so their ~70KB cost ~1.5s of every boot). (satoru)
+    if (boot_fftrace) {
+        extern bool g_fftrace;   // linux_syscall.cpp (satoru)
+        g_fftrace = true;
+        SerialLogger::Log("[2c] firefox debug probes ON (kurono.fftrace=1)\r\n");
     }
     if (boot_pincpu_off) {
         Scheduler::SetPinCpu(false);
