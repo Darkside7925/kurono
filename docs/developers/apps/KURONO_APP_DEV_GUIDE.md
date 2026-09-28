@@ -1,23 +1,23 @@
-# Kurono App Development Guide
+# Kurono app development
 
-## Overview
+Kurono apps are written in KCL, the Kurono Command Language, a scripting language embedded in the
+kernel. They ship as `.kro` files, Kurono Runtime Objects.
 
-Kurono OS apps are built using **KCL** (Kurono Command Language), a lightweight scripting language embedded in the kernel. Apps are packaged as **.kro** files (Kurono Runtime Objects).
+What's in here:
 
-This guide covers:
-1. KCL language reference
-2. Creating a .kro app
-3. Packaging and distribution
-4. Available builtins and system calls
+1. the KCL language reference
+2. creating a `.kro` app
+3. packaging and distribution
+4. the builtins and system calls you can call
 
 ---
 
-## 1. KCL Language Reference
+## KCL language reference
 
 KCL is a tree-walking interpreted language with typed values (int, float, string,
 bool, list, none). See **[../kcl/KCL.md](../kcl/KCL.md)** and
 **[../kcl/KCL_REFERENCE.md](../kcl/KCL_REFERENCE.md)** for the authoritative
-grammar - the summary below matches the real `src/kcl/kcl.cpp` parser.
+grammar, the summary below matches the real `src/kcl/kcl.cpp` parser.
 
 ### Variables
 
@@ -69,7 +69,7 @@ The real stdlib (`call_builtin` in `kcl.cpp`):
 `append` / `remove`).
 
 > Note: `pow`, `clamp`, `time`, and constants like `PI` / `VERSION` / `OS` /
-> `TRUE` / `FALSE` are **not** part of KCL - earlier versions of this guide listed
+> `TRUE` / `FALSE` are **not** part of KCL, earlier versions of this guide listed
 > them but they do not exist in the interpreter.
 
 ### Shell Execution
@@ -102,7 +102,7 @@ String: strings are enclosed in `"double"` or `'single'` quotes
 
 ---
 
-## 2. Creating a .kro App
+## Creating a .kro App
 
 ### Directory Structure
 
@@ -126,7 +126,7 @@ set app_entry = "main.kcl"
 ```
 
 (The package manager reads `app_entry` from `manifest.kcl`; it defaults to
-`main.kcl` - see `pkgmgr.cpp`.)
+`main.kcl`, see `pkgmgr.cpp`.)
 
 ### main.kcl (entry point)
 
@@ -163,7 +163,7 @@ This installs the archive into `/apps/<app_name>/` and then runs the manifest en
 
 ---
 
-## 3. .kro File Format
+## .kro File Format
 
 A `.kro` file is a simple binary archive:
 
@@ -184,7 +184,7 @@ Entry format:
 
 ---
 
-## 4. App Lifecycle
+## App Lifecycle
 
 1. **Development**: Write KCL scripts in a directory structure
 2. **Package**: Run `kropack.ps1` to create the .kro file
@@ -194,7 +194,7 @@ Entry format:
 
 ---
 
-## 5. System Integration
+## System Integration
 
 ### File I/O (via shell)
 ```
@@ -220,7 +220,7 @@ exec "taskmgr"                                 # Open task manager
 
 ---
 
-## 6. Advanced: Functions
+## Advanced: Functions
 
 ```
 func greet(name)
@@ -236,7 +236,7 @@ which runs *shell* commands).
 
 ---
 
-## 7. Debugging
+## Debugging
 
 ```
 # Print variable values
@@ -245,11 +245,11 @@ print("x = " + str(x))
 
 KCL reports parse/runtime errors with line numbers and never crashes the OS, so
 the fastest debugging loop is `kcl -c "<snippet>"` in the terminal. (There is no
-built-in `time()` / `DEBUG` facility - use serial logs or `print` checkpoints.)
+built-in `time()` / `DEBUG` facility, use serial logs or `print` checkpoints.)
 
 ---
 
-## 8. Best Practices
+## Best Practices
 
 1. **Mind the limits**: a script source is capped at 65536 bytes and 8192 tokens
    (`KCL_MAX_SCRIPT` / `KCL_MAX_TOKENS`); recursion depth is 20, params per func 8,

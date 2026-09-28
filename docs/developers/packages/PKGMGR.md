@@ -1,49 +1,49 @@
-# Package Manager
+# Package manager
 
-`src/packages/pkgmgr.cpp` and `pkgmgr.h` implement the Kurono package manager.
+`src/packages/pkgmgr.cpp` and `pkgmgr.h`.
 
-## 1. What it does
+Keeps a local package catalog and can sync repository metadata over plain HTTP from
+`kurono.satorut.com`. Each package carries a version, size, dependency list and remote payload
+path, and install/remove/update requests run against that.
 
-The package manager maintains a local package catalog and can now sync repository metadata over plain HTTP from `kurono.satorut.com`. It tracks known packages with version, size, dependency, and remote payload path information, and processes install/remove/update requests.
+## The database
 
-## 2. Package database
+Populated at boot from an embedded list, refreshable from a remote `Packages` index. An entry
+has name, installed version, latest repo version, installed size in KB, dependency list,
+description and repo payload path.
 
-The package database is populated at boot from an embedded list and can be refreshed from a remote `Packages` index. Each package entry has:
+The boot-time list gives sane defaults for the core packages. After a successful sync, the
+remote index overwrites `latest_version`, `Filename` and the description.
 
-- Name
-- Installed version
-- Latest repository version
-- Installed size (KB)
-- Dependency list
-- Description
-- Repository payload path
+## apt
 
-The boot-time list provides sane defaults for Kurono core packages. After a successful sync, repository metadata overwrites `latest_version`, `Filename`, and description fields from the remote index.
+The `apt` command delegates here:
 
-## 3. `apt` interface
-
-The `apt` command in the shell delegates to the package manager:
-
-| Command | Action |
+| Command | Does |
 | --- | --- |
-| `apt install <pkg>` | Mark as installed, resolve deps |
-| `apt remove <pkg>` | Mark as removed |
-| `apt update` | Refresh package list |
-| `apt upgrade` | Upgrade all installed packages |
-| `apt list` | List all known packages |
-| `apt search <term>` | Search by name |
-| `apt show <pkg>` | Show package details |
+| `apt install <pkg>` | mark installed, resolve deps |
+| `apt remove <pkg>` | mark removed |
+| `apt update` | refresh the package list |
+| `apt upgrade` | upgrade everything installed |
+| `apt list` | list known packages |
+| `apt search <term>` | search by name |
+| `apt show <pkg>` | package details |
 
-## 4. Network interaction
+## Network
 
-`update` performs a real HTTP GET against `kurono.satorut.com` and tries a small set of `Packages` index paths. If the sync succeeds, installed packages can be updated when the repository advertises a newer version and a payload `Filename`.
+`update` does a real HTTP GET against `kurono.satorut.com`, trying a small set of `Packages`
+index paths. If the sync works, installed packages get updated when the repository advertises
+a newer version and a payload `Filename`.
 
-## 5. Limitations
+## Limits
 
-Package install and update fetch the remote payload and store it under `/kurono/packages/<name>/payload.pkg`, but they do not yet unpack archives or apply filesystem-level post-install scripts. The current implementation is a real network-backed package fetch path, not a full archive/extraction pipeline.
+Install and update fetch the remote payload and store it under
+`/kurono/packages/<name>/payload.pkg`, but they don't unpack archives or run filesystem-level
+post-install scripts yet. It's a real network-backed fetch path, not a full archive and
+extraction pipeline.
 
-## 6. Related files
+## Files
 
-- `src/packages/pkgmgr.cpp` - repository sync, manifest parsing, payload fetch
-- `src/net/tcpip.cpp` - TCP transport used by the package HTTP client
-- `src/kernel/kurono_kernel.cpp` - boot-time TCP stack initialization and ticking
+- `src/packages/pkgmgr.cpp` repo sync, manifest parsing, payload fetch
+- `src/net/tcpip.cpp` the TCP transport the HTTP client uses
+- `src/kernel/kurono_kernel.cpp` boot-time TCP stack init and ticking

@@ -1,16 +1,14 @@
-# First Steps
+# First steps
 
-This is the shortest practical introduction to the repository.
+Shortest path to not being lost.
 
-## 1. Know the project size
+## The repo is not small
 
-The live repository is not small.
+`src/` is about 130,000 lines of freestanding C++17, NASM and C. Raw `wc -l` says
+~337,000, but ~207,000 of that is wallpaper pixel data in `src/ui/`. Not code. So
+don't read it top to bottom. Read the control files, then follow one route at a time.
 
-The source tree under `src/` is approximately 130,000 lines of hand-written freestanding C++17, NASM assembly, and C. (A raw `wc -l` reports far more - around 337,000 - but ~207,000 of that is the two pre-decoded raw-RGBA wallpaper headers in `src/ui/`, which are embedded image data, not code.)
-
-That means the right strategy is not reading everything in random order. The right strategy is reading the control files first.
-
-## 2. Read these files first
+## Read these seven first
 
 1. `README.md`
 2. `docs/README.md`
@@ -20,58 +18,44 @@ That means the right strategy is not reading everything in random order. The rig
 6. `src/ui/window_manager.cpp`
 7. `src/kernel/panic.cpp`
 
-## 3. Understand the project as five routes
+## Five routes
 
-### Route 1
+Boot. Firmware or bootloader state goes in, core services come up, the display gets
+accepted, input attaches, main loop starts.
 
-Boot route.
+Desktop. Desktop shell, taskbar, window manager and apps render into the framebuffer.
 
-Firmware or bootloader state enters the kernel, core services come online, display is accepted, input is attached, and the main loop starts.
+Command. The shell parses a line, works out which environment owns it, forwards it to
+the subsystem or guest backend that implements it.
 
-### Route 2
+Storage. Runtime filesystem is built in memory. The installer can also read real disks
+and deploy boot payloads and layouts onto partitions.
 
-Desktop route.
+Virtualization. A shell command builds a VM, loads an embedded guest kernel, enters
+the hypervisor loop.
 
-The desktop shell, taskbar, window manager, and applications render into the framebuffer.
+## Don't, on day one
 
-### Route 3
+- don't read every driver file
+- don't start in the archived folders
+- don't assume a Unix or Windows process model everywhere. A lot of this is
+  lighter-weight and poll-based.
+- don't assume a graphics bug is in the app layer. Most display problems start in
+  boot, framebuffer ownership or cache policy.
 
-Command route.
+## Do, on day one
 
-The shell parses a line, decides which environment owns it, and forwards execution to the correct subsystem or guest backend.
+1. build it once
+2. read the developer boot doc once
+3. keep the file map open
+4. pick one route and stay in it until it makes sense
 
-### Route 4
+## Good things to chase first
 
-Storage route.
-
-The runtime filesystem is built in memory, while the installer can inspect real disks and deploy boot payloads and layouts to supported partitions.
-
-### Route 5
-
-Virtualization route.
-
-A shell command can build a virtual machine, load an embedded guest kernel, and enter the hypervisor execution loop.
-
-## 4. What not to do on day one
-
-1. Do not start by reading every driver file.
-2. Do not start in archived folders.
-3. Do not assume a familiar Unix or Windows process model everywhere; some systems are lighter weight or polling based.
-4. Do not assume a graphics bug is inside the app layer; many display issues begin in boot, framebuffer ownership, or cache policy.
-
-## 5. What to do on day one
-
-1. Build the project once.
-2. Read the developer boot document once.
-3. Keep the file map open.
-4. Pick one route and stay inside it until it makes sense.
-
-## 6. Good first investigation topics
-
-1. How the shell chooses between Linux, Windows, and Kurono commands.
-2. How the desktop search box launches apps.
-3. How the panic screen gets a framebuffer even when the desktop is dead.
-4. How the GPU probe detects hybrid graphics and validates the framebuffer address.
-5. How the Wayland compositor speaks the wire protocol and bridges to the window manager.
-6. How the installer discovers disks and partitions.
-7. How `vm boot-alpine` crosses from shell command into the hypervisor.
+- how the shell picks between Linux, Windows and Kurono commands
+- how the desktop search box launches apps
+- how the panic screen gets a framebuffer when the desktop is already dead
+- how the GPU probe detects hybrid graphics and validates the framebuffer address
+- how the Wayland compositor speaks the wire protocol and bridges to the WM
+- how the installer finds disks and partitions
+- how `vm boot-alpine` goes from a shell command into the hypervisor

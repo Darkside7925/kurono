@@ -1,36 +1,39 @@
-# Hybrid GPU & NVIDIA Optimus - Bare-Metal OS Developer Guide
+# Hybrid GPU and NVIDIA Optimus
 
-> **Target hardware**: MSI Thin 15 B13VE - Intel i5-13420H (Raptor Lake, UHD Graphics) + NVIDIA RTX 4050 Laptop (Ada Lovelace AD107). Muxless Optimus design.
+Notes for bare-metal OS development on a hybrid laptop.
 
-> **Target OS**: Kurono OS - boots via GRUB Multiboot1, receives framebuffer from bootloader, runs in 64-bit long mode.
+Target hardware: MSI Thin 15 B13VE, Intel i5-13420H (Raptor Lake, UHD Graphics) plus NVIDIA RTX 4050
+Laptop (Ada Lovelace AD107). Muxless Optimus.
+
+Target OS: Kurono, booting via GRUB Multiboot1, framebuffer from the bootloader, 64-bit long mode.
 
 ---
 
 ## Table of Contents
 
-1. [NVIDIA Optimus Architecture](#1-nvidia-optimus-architecture)
-2. [UEFI GOP and Optimus](#2-uefi-gop-and-optimus)
-3. [Common Failure Modes (Black Screen)](#3-common-failure-modes-black-screen)
-4. [PCI Device Detection](#4-pci-device-detection)
-5. [Intel iGPU Framebuffer (BAR Layout & Registers)](#5-intel-igpu-framebuffer-bar-layout--registers)
-6. [NVIDIA GPU Framebuffer (BAR Layout)](#6-nvidia-gpu-framebuffer-bar-layout)
-7. [Muxless vs Muxed vs Advanced Optimus](#7-muxless-vs-muxed-vs-advanced-optimus)
-8. [What Linux Does](#8-what-linux-does)
-9. [Solutions for Bare-Metal OS Developers](#9-solutions-for-bare-metal-os-developers)
-10. [MSI Thin 15 B13VE Specifics](#10-msi-thin-15-b13ve-specifics)
-11. [AMD Hybrid Graphics (PowerXpress / Enduro)](#11-amd-hybrid-graphics-powerxpress--enduro)
-12. [Apple Silicon / ARM Considerations](#12-apple-silicon--arm-considerations)
-13. [Code Patterns for Kurono OS](#13-code-patterns-for-kurono-os)
+1. [NVIDIA Optimus Architecture](#nvidia-optimus-architecture)
+2. [UEFI GOP and Optimus](#uefi-gop-and-optimus)
+3. [Common Failure Modes (Black Screen)](#common-failure-modes-black-screen)
+4. [PCI Device Detection](#pci-device-detection)
+5. [Intel iGPU Framebuffer (BAR Layout & Registers)](#intel-igpu-framebuffer-bar-layout--registers)
+6. [NVIDIA GPU Framebuffer (BAR Layout)](#nvidia-gpu-framebuffer-bar-layout)
+7. [Muxless vs Muxed vs Advanced Optimus](#muxless-vs-muxed-vs-advanced-optimus)
+8. [What Linux Does](#what-linux-does)
+9. [Solutions for Bare-Metal OS Developers](#solutions-for-bare-metal-os-developers)
+10. [MSI Thin 15 B13VE Specifics](#msi-thin-15-b13ve-specifics)
+11. [AMD Hybrid Graphics (PowerXpress / Enduro)](#amd-hybrid-graphics-powerxpress--enduro)
+12. [Apple Silicon / ARM Considerations](#apple-silicon--arm-considerations)
+13. [Code Patterns for Kurono OS](#code-patterns-for-kurono-os)
 
 ---
 
-## 1. NVIDIA Optimus Architecture
+## NVIDIA Optimus Architecture
 
-### 1.1 What Is Optimus?
+### What Is Optimus?
 
 NVIDIA Optimus is a **hybrid GPU power management technology** that pairs an Intel (or AMD) integrated GPU (iGPU) with an NVIDIA discrete GPU (dGPU). The goal is battery life: the dGPU powers down when not needed, and the iGPU handles display output.
 
-### 1.2 Muxless Optimus - How It Works
+### Muxless Optimus: How It Works
 
 On virtually all modern Optimus laptops (2013+), the design is **muxless**:
 
@@ -64,32 +67,32 @@ On virtually all modern Optimus laptops (2013+), the design is **muxless**:
 
 5. **The iGPU's display controller scans out the framebuffer to the panel**. The iGPU's display pipe reads from its framebuffer (in system RAM / stolen memory) and sends pixel data to the LCD.
 
-### 1.3 What This Means for a Bare-Metal OS
+### What This Means for a Bare-Metal OS
 
 When GRUB or UEFI gives you a framebuffer address via Multiboot:
 
 - **That address points to the iGPU's framebuffer**, NOT the dGPU's VRAM.
 - The iGPU's display engine is already configured (by firmware) to scan out from that address.
-- **Writing pixels to that address makes them appear on screen** - because the iGPU hardware is continuously reading from it.
+- **Writing pixels to that address makes them appear on screen**, because the iGPU hardware is continuously reading from it.
 - The NVIDIA dGPU is typically powered down or in a low-power state. It is **irrelevant** for basic display output.
 - **You do NOT need the NVIDIA GPU to display anything on the laptop screen.** The Intel iGPU alone is sufficient.
 
 ---
 
-## 2. UEFI GOP and Optimus
+## UEFI GOP and Optimus
 
-### 2.1 Which GPU Does UEFI GOP Initialize?
+### Which GPU Does UEFI GOP Initialize?
 
 On muxless Optimus laptops:
 
 - **UEFI GOP initializes the Intel iGPU**. Period.
 - The UEFI firmware contains an Intel GOP driver (embedded in the UEFI ROM or loaded from the Intel VBIOS option ROM).
 - The NVIDIA dGPU either:
-  - Has its own VBIOS/GOP driver loaded (for external displays), or
-  - Is left uninitialized / in a low-power state.
+ , Has its own VBIOS/GOP driver loaded (for external displays), or
+ , Is left uninitialized / in a low-power state.
 - **The GOP framebuffer address reported by UEFI is always the iGPU's framebuffer.**
 
-### 2.2 What Framebuffer Address Does GOP Report?
+### What Framebuffer Address Does GOP Report?
 
 The EFI Graphics Output Protocol reports:
 
@@ -98,36 +101,36 @@ EFI_GRAPHICS_OUTPUT_PROTOCOL.Mode->FrameBufferBase = <physical address>
 EFI_GRAPHICS_OUTPUT_PROTOCOL.Mode->FrameBufferSize = <size in bytes>
 ```
 
-This address is the **iGPU's stolen memory aperture** - a region of system RAM that Intel reserves for GPU use. On modern Intel GPUs:
+This address is the **iGPU's stolen memory aperture**, a region of system RAM that Intel reserves for GPU use. On modern Intel GPUs:
 
-- Typically in the range `0x80000000` - `0xFFFFFFFF` (below 4 GB) or sometimes above 4 GB.
+- Typically in the range `0x80000000` to `0xFFFFFFFF` (below 4 GB) or sometimes above 4 GB.
 - The exact address is configured by the firmware in the iGPU's PCI BARs and the Graphics Stolen Memory Base Register (BDSM/BGSM).
-- This is **identity-mapped** by the firmware - `physical address == address you write to`.
+- This is **identity-mapped** by the firmware, `physical address == address you write to`.
 
-### 2.3 GRUB Multiboot1 and the Framebuffer
+### GRUB Multiboot1 and the Framebuffer
 
 When GRUB boots a Multiboot1 kernel with `set gfxpayload=1920x1080x32`:
 
 1. GRUB calls UEFI GOP (or VBE on legacy BIOS) to set the mode.
-2. GRUB stores the framebuffer info in the Multiboot Info Structure (offset 88 - 100):
-   - `framebuffer_addr` (uint64_t at offset 88) - the physical base address
-   - `framebuffer_pitch` (uint32_t at offset 96) - bytes per scanline
-   - `framebuffer_width` (uint32_t at offset 100)
-   - `framebuffer_height` (uint32_t at offset 104)
-   - `framebuffer_bpp` (uint8_t at offset 108)
-   - `framebuffer_type` (uint8_t at offset 109) - 1 = RGB, 2 = text
+2. GRUB stores the framebuffer info in the Multiboot Info Structure (offset 88 to 100):
+  , `framebuffer_addr` (uint64_t at offset 88), the physical base address
+  , `framebuffer_pitch` (uint32_t at offset 96), bytes per scanline
+  , `framebuffer_width` (uint32_t at offset 100)
+  , `framebuffer_height` (uint32_t at offset 104)
+  , `framebuffer_bpp` (uint8_t at offset 108)
+  , `framebuffer_type` (uint8_t at offset 109), 1 = RGB, 2 = text
 3. **This framebuffer address comes from the iGPU's GOP driver** on Optimus laptops.
 4. Your kernel reads this and writes pixels. It works because the iGPU display engine is scanning out from this address.
 
 ---
 
-## 3. Common Failure Modes (Black Screen)
+## Common Failure Modes (Black Screen)
 
-### 3.1 "I Get a Black Screen on My Optimus Laptop"
+### "I Get a Black Screen on My Optimus Laptop"
 
 Common causes, from most to least likely:
 
-#### A. Framebuffer Caching (MOST COMMON - Your OS Already Handles This!)
+#### A. Framebuffer Caching (MOST COMMON: Your OS Already Handles This!)
 
 **Problem**: The framebuffer physical address is in MMIO space (uncacheable by default). With identity mapping and Write-Back (WB) caching, CPU writes go to the CPU cache but **never reach the GPU's memory controller**.
 
@@ -170,7 +173,7 @@ Triggers:
 
 #### D. Writing to the Wrong GPU's VRAM
 
-**Problem**: If you accidentally write to the NVIDIA dGPU's BAR1 (VRAM aperture) instead of the iGPU's framebuffer, those pixels go to the dGPU's VRAM - which is **not connected to the display**.
+**Problem**: If you accidentally write to the NVIDIA dGPU's BAR1 (VRAM aperture) instead of the iGPU's framebuffer, those pixels go to the dGPU's VRAM, which is **not connected to the display**.
 
 **Symptom**: Your writes succeed (no fault), but nothing appears on screen.
 
@@ -187,8 +190,8 @@ dGPU BAR1 (VRAM): typically above 0x100000000 (>4GB) or a separate PCI MMIO rang
 **Problem**: Something disabled the iGPU's display pipe or plane after boot.
 
 This can happen if:
-- You write 0 to DSPCNTR (Display Plane Control) - disables the plane
-- You write 0 to PIPECONF - disables the pipe
+- You write 0 to DSPCNTR (Display Plane Control), disables the plane
+- You write 0 to PIPECONF to disables the pipe
 - You issue a GPU reset via GDRST (Graphics Device Reset)
 
 **Solution**: Don't write to Intel GPU registers unless you understand the full modeset sequence. If you need to check the current state, READ the registers but don't WRITE them.
@@ -206,9 +209,9 @@ This can happen if:
 
 ---
 
-## 4. PCI Device Detection
+## PCI Device Detection
 
-### 4.1 PCI Configuration Space Layout
+### PCI Configuration Space Layout
 
 Every PCI device has a 256-byte configuration space (or 4096 bytes for PCIe extended config):
 
@@ -244,9 +247,9 @@ Offset  Size  Field
 0x3F    1     Max Latency
 ```
 
-### 4.2 Reading Class Code (Offset 0x08 - 0x0B)
+### Reading Class Code (Offset 0x08: 0x0B)
 
-The class code is a 3-byte value at offset 0x09 - 0x0B:
+The class code is a 3-byte value at offset 0x09 to 0x0B:
 
 ```
 Offset 0x0B: Class Code      (e.g., 0x03 = Display Controller)
@@ -260,7 +263,7 @@ So `(PCI::Read32(bus, dev, func, 0x08) >> 8) & 0xFFFFFF` gives `ClassCode:Subcla
 
 **VGA Controllers**: Class = `0x03`, Subclass = `0x00` → combined `0x0300xx`
 
-### 4.3 PCI Bus Enumeration Code Pattern
+### PCI Bus Enumeration Code Pattern
 
 ```cpp
 // Scan all PCI buses for VGA controllers (class 0x0300)
@@ -309,14 +312,14 @@ void ScanForGPUs() {
 }
 ```
 
-### 4.4 Typical PCI IDs for GPUs
+### Typical PCI IDs for GPUs
 
 #### Intel Integrated Graphics
 
 | Vendor ID | Device ID | Name | Generation |
 |-----------|-----------|------|------------|
 | `0x8086` | `0xA780` | RPL-S UHD 770 | Raptor Lake (13th gen) |
-| `0x8086` | `0xA788` | RPL-H UHD Graphics | Raptor Lake (13th gen) - **your i5-13420H** |
+| `0x8086` | `0xA788` | RPL-H UHD Graphics | Raptor Lake (13th gen), **your i5-13420H** |
 | `0x8086` | `0xA789` | RPL-H UHD Graphics | Raptor Lake (13th gen) |
 | `0x8086` | `0x4680` | ADL-S UHD 770 | Alder Lake (12th gen) |
 | `0x8086` | `0x46A6` | ADL-P Iris Xe | Alder Lake (12th gen) |
@@ -333,7 +336,7 @@ All Intel iGPUs share vendor `0x8086` and class code `0x0300` (VGA compatible co
 
 | Vendor ID | Device ID | Name | Architecture |
 |-----------|-----------|------|-------------|
-| `0x10DE` | `0x2860` | RTX 4050 Laptop | Ada Lovelace (AD107) - **your GPU** |
+| `0x10DE` | `0x2860` | RTX 4050 Laptop | Ada Lovelace (AD107), **your GPU** |
 | `0x10DE` | `0x2684` | RTX 4090 | Ada Lovelace (AD102) |
 | `0x10DE` | `0x2704` | RTX 4080 | Ada Lovelace (AD103) |
 | `0x10DE` | `0x2786` | RTX 4070 | Ada Lovelace (AD104) |
@@ -363,9 +366,9 @@ This is a deliberate firmware distinction. When enumerating GPUs, check for both
 
 ---
 
-## 5. Intel iGPU Framebuffer (BAR Layout & Registers)
+## Intel iGPU Framebuffer (BAR Layout & Registers)
 
-### 5.1 PCI BAR Layout
+### PCI BAR Layout
 
 Intel integrated GPUs have the following BAR layout:
 
@@ -390,7 +393,7 @@ BAR4 (offset 0x20): I/O Base (legacy, rarely used)
 
 **Note**: BAR0 and BAR2 are typically **64-bit BARs**, so BAR0 occupies offsets 0x10+0x14, and BAR2 occupies 0x18+0x1C.
 
-### 5.2 Key MMIO Registers (via BAR0)
+### Key MMIO Registers (via BAR0)
 
 These registers control the display pipeline. All offsets are relative to BAR0 base.
 
@@ -411,7 +414,7 @@ VBLANK              0x60010         0x61010         0x62010
 VSYNC               0x60014         0x61014         0x62014
 ```
 
-#### Display Plane Registers (Gen9+ / Skylake and later - "Universal Planes")
+#### Display Plane Registers (Gen9+ / Skylake and later: "Universal Planes")
 
 Starting from Skylake (Gen9), Intel uses a new plane register layout:
 
@@ -426,7 +429,7 @@ PLANE_OFFSET            0x701A4             0x711A4
 PLANE_POS               0x7018C             0x7118C
 ```
 
-#### Older Generations (Haswell, Broadwell - Gen7.5/Gen8)
+#### Older Generations (Haswell, Broadwell: Gen7.5/Gen8)
 
 ```
 Register        Pipe A          Pipe B
@@ -473,7 +476,7 @@ Bit 21:     Pipe state (read-only, 1 = active)
             If this reads 0, the pipe is disabled - nothing is being scanned out.
 ```
 
-### 5.3 Reading the Active Framebuffer Address
+### Reading the Active Framebuffer Address
 
 To find what address the iGPU is currently displaying from:
 
@@ -509,9 +512,9 @@ bool VerifyFramebufferAddress(uint64_t multiboot_fb, uint64_t bar0_base) {
 }
 ```
 
-### 5.4 Graphics Stolen Memory
+### Graphics Stolen Memory
 
-Intel iGPUs use "stolen memory" - a region of system RAM reserved by the BIOS for GPU use. The CPU cannot use this memory for general allocation. The framebuffer lives in stolen memory.
+Intel iGPUs use "stolen memory", a region of system RAM reserved by the BIOS for GPU use. The CPU cannot use this memory for general allocation. The framebuffer lives in stolen memory.
 
 The base of stolen memory is stored in:
 - **BDSM** (Base Data of Stolen Memory): PCI config offset `0x5C` on the Host Bridge (bus 0, device 0, function 0)
@@ -528,9 +531,9 @@ uint32_t GetStolenMemoryBase() {
 
 ---
 
-## 6. NVIDIA GPU Framebuffer (BAR Layout)
+## NVIDIA GPU Framebuffer (BAR Layout)
 
-### 6.1 PCI BAR Layout
+### PCI BAR Layout
 
 NVIDIA GPUs have a consistent BAR layout across generations:
 
@@ -555,7 +558,7 @@ BAR5 (offset 0x24): NV_RAMIN - Instance memory / PRAMIN aperture
     Used for page tables, channel descriptors, etc.
 ```
 
-### 6.2 Key NVIDIA MMIO Registers (via BAR0)
+### Key NVIDIA MMIO Registers (via BAR0)
 
 Documented by the nouveau project (envytools):
 
@@ -596,7 +599,7 @@ Bit 0: PFIFO, Bit 12: PGRAPH, etc.
 Writing 0 disables engines; writing back enables them.
 ```
 
-### 6.3 Nouveau / Envytools Documentation
+### Nouveau / Envytools Documentation
 
 The `envytools` project (https://envytools.readthedocs.io/) is the primary reference for NVIDIA GPU registers. Key resources:
 
@@ -607,7 +610,7 @@ The `envytools` project (https://envytools.readthedocs.io/) is the primary refer
 
 For Ada Lovelace (AD10x), much of the register space is similar to Turing/Ampere but with newer engine blocks. Nouveau support for Ada is limited.
 
-### 6.4 Why You Should NOT Use NVIDIA BAR1 for Display
+### Why You Should NOT Use NVIDIA BAR1 for Display
 
 On muxless Optimus:
 - BAR1 maps to NVIDIA VRAM (GDDR6)
@@ -618,9 +621,9 @@ On muxless Optimus:
 
 ---
 
-## 7. Muxless vs Muxed vs Advanced Optimus
+## Muxless vs Muxed vs Advanced Optimus
 
-### 7.1 Muxless Optimus (Most Common - Your MSI Laptop)
+### Muxless Optimus (Most Common: Your MSI Laptop)
 
 ```
 LCD ←── eDP ←── Intel iGPU display engine
@@ -642,7 +645,7 @@ External ports (HDMI/DP/USB-C):
 - dGPU can be fully powered off (D3cold) when not rendering
 - **For bare-metal OS**: Just use the iGPU. Ignore the NVIDIA GPU for display.
 
-### 7.2 Muxed Optimus (Rare, Older Laptops 2010 - 2014)
+### Muxed Optimus (Rare, Older Laptops 2010: 2014)
 
 ```
 LCD ←── eDP ←── [MUX Chip] ←─┬── Intel iGPU
@@ -655,7 +658,7 @@ LCD ←── eDP ←── [MUX Chip] ←─┬── Intel iGPU
 - Switching GPUs causes a brief screen blank
 - **For bare-metal OS**: Check ACPI `_DSM` methods for GPU switching. The firmware may boot with either GPU.
 
-### 7.3 Advanced Optimus / Dynamic Display Switch (DDS)
+### Advanced Optimus / Dynamic Display Switch (DDS)
 
 ```
 LCD ←── eDP ←── [Software-Controlled MUX] ←─┬── Intel iGPU
@@ -669,7 +672,7 @@ LCD ←── eDP ←── [Software-Controlled MUX] ←─┬── Intel iGPU
 - The MUX is controlled via ACPI `_DSM` methods on the dGPU
 - **For bare-metal OS**: Since Advanced Optimus defaults to muxless mode at boot, the iGPU framebuffer is still the correct one to use. Switching to dGPU mode requires implementing the full ACPI _DSM calls and NVIDIA display initialization.
 
-### 7.4 How to Detect Which Type You Have
+### How to Detect Which Type You Have
 
 ```cpp
 enum OptimusType {
@@ -713,26 +716,26 @@ OptimusType DetectOptimusType() {
 
 ---
 
-## 8. What Linux Does
+## What Linux Does
 
-### 8.1 Boot Sequence on Optimus
+### Boot Sequence on Optimus
 
 1. **UEFI GOP** sets up framebuffer via Intel iGPU
 2. **GRUB** uses `efifb`/`simplefb` from GOP framebuffer
-3. **Linux early boot** uses `efifb`/`simplefb` driver - just writes to the GOP framebuffer address
+3. **Linux early boot** uses `efifb`/`simplefb` driver, just writes to the GOP framebuffer address
 4. **`i915` driver loads** for Intel iGPU:
-   - Performs full KMS (Kernel Mode Setting) modesetting
-   - Takes over the display pipe from firmware
-   - Allocates its own framebuffer in stolen memory or GTT
-   - Programs display pipe registers (DSPSURF, DSPCNTR, PIPECONF, etc.)
-   - Registers DRM framebuffer device (`/dev/dri/card0`)
+  , Performs full KMS (Kernel Mode Setting) modesetting
+  , Takes over the display pipe from firmware
+  , Allocates its own framebuffer in stolen memory or GTT
+  , Programs display pipe registers (DSPSURF, DSPCNTR, PIPECONF, etc.)
+  , Registers DRM framebuffer device (`/dev/dri/card0`)
 5. **`nouveau` or `nvidia` driver loads** for NVIDIA dGPU:
-   - Maps BAR0 (MMIO) and BAR1 (VRAM)
-   - Initializes GPU engine (PFIFO, PGRAPH, etc.)
-   - Does NOT touch display - the dGPU has no connected outputs on muxless
-   - Registers as a "render-only" DRM device (`/dev/dri/renderD128`)
+  , Maps BAR0 (MMIO) and BAR1 (VRAM)
+  , Initializes GPU engine (PFIFO, PGRAPH, etc.)
+  , Does NOT touch display, the dGPU has no connected outputs on muxless
+  , Registers as a "render-only" DRM device (`/dev/dri/renderD128`)
 
-### 8.2 Key Linux Subsystems
+### Key Linux Subsystems
 
 #### DRM/KMS (Direct Rendering Manager / Kernel Mode Setting)
 
@@ -771,13 +774,13 @@ DRI_PRIME=1 ./application
 __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./application
 ```
 
-### 8.3 The `i915` Driver
+### The `i915` Driver
 
 The Intel iGPU driver. Key source files (Linux kernel):
-- `drivers/gpu/drm/i915/display/intel_display.c` - modesetting
-- `drivers/gpu/drm/i915/display/intel_fb.c` - framebuffer management
-- `drivers/gpu/drm/i915/gt/intel_ggtt.c` - Graphics Global Translation Table
-- `drivers/gpu/drm/i915/i915_reg.h` - ALL register definitions (invaluable reference!)
+- `drivers/gpu/drm/i915/display/intel_display.c`, modesetting
+- `drivers/gpu/drm/i915/display/intel_fb.c`, framebuffer management
+- `drivers/gpu/drm/i915/gt/intel_ggtt.c`, Graphics Global Translation Table
+- `drivers/gpu/drm/i915/i915_reg.h`, ALL register definitions (invaluable reference!)
 
 The `i915_reg.h` file contains thousands of register definitions. Key ones:
 
@@ -790,7 +793,7 @@ The `i915_reg.h` file contains thousands of register definitions. Key ones:
 #define _PIPEBCONF   0x71008   /* Pipe B Config */
 ```
 
-### 8.4 Implications for Kurono OS
+### Implications for Kurono OS
 
 **You don't need to replicate what Linux does.** Linux performs full KMS modesetting because it needs to:
 - Change resolutions dynamically
@@ -799,16 +802,16 @@ The `i915_reg.h` file contains thousands of register definitions. Key ones:
 - Support GPU acceleration and compositing
 
 For a bare-metal OS that just needs pixels on screen:
-1. **Use the GRUB-provided framebuffer** - it's already set up correctly by the iGPU firmware
-2. **Don't reinitialize the display pipeline** - the firmware already did it
-3. **Mark the framebuffer as Write-Combining** - you already do this
-4. **Use non-temporal stores for buffer operations** - you already do this
+1. **Use the GRUB-provided framebuffer**, it's already set up correctly by the iGPU firmware
+2. **Don't reinitialize the display pipeline**, the firmware already did it
+3. **Mark the framebuffer as Write-Combining**, you already do this
+4. **Use non-temporal stores for buffer operations**, you already do this
 
 ---
 
-## 9. Solutions for Bare-Metal OS Developers
+## Solutions for Bare-Metal OS Developers
 
-### 9.1 The Golden Rule
+### The Golden Rule
 
 > **Don't fight the firmware. Use what it gives you.**
 
@@ -821,7 +824,7 @@ On Optimus laptops, the simplest and most reliable approach:
 5. Write pixels
 6. Done
 
-### 9.2 Defensive Framebuffer Initialization
+### Defensive Framebuffer Initialization
 
 ```cpp
 bool InitFramebufferSafe(multiboot_info_t* mbi) {
@@ -891,7 +894,7 @@ bool InitFramebufferSafe(multiboot_info_t* mbi) {
 }
 ```
 
-### 9.3 Checklist: Why Is My Screen Black?
+### Checklist: Why Is My Screen Black?
 
 ```
 □ Is the multiboot magic correct (0x2BADB002)?
@@ -910,7 +913,7 @@ bool InitFramebufferSafe(multiboot_info_t* mbi) {
 □ Check serial output - does the framebuffer address look reasonable?
 ```
 
-### 9.4 Advanced: Re-reading the Framebuffer If It Becomes Stale
+### Advanced: Re-reading the Framebuffer If It Becomes Stale
 
 In rare cases, the firmware framebuffer address may become invalid (e.g., after a GPU fault or if the firmware used a temporary buffer). Here's how to recover:
 
@@ -955,7 +958,7 @@ uint64_t RecoverFramebufferAddress() {
 }
 ```
 
-### 9.5 ACPI Methods for Display Detection
+### ACPI Methods for Display Detection
 
 If you have an ACPI parser, you can use standard ACPI methods to detect connected displays:
 
@@ -968,9 +971,9 @@ These are defined in the ACPI spec §B.4 (Display-Specific Methods) and require 
 
 ---
 
-## 10. MSI Thin 15 B13VE Specifics
+## MSI Thin 15 B13VE Specifics
 
-### 10.1 Hardware Configuration
+### Hardware Configuration
 
 | Component | Detail |
 |-----------|--------|
@@ -980,13 +983,13 @@ These are defined in the ACPI spec §B.4 (Display-Specific Methods) and require 
 | iGPU PCI Class | `0x0300` (VGA Compatible Controller) |
 | dGPU | NVIDIA GeForce RTX 4050 Laptop (6GB GDDR6) |
 | dGPU PCI ID | `10DE:2860` (AD107) |
-| dGPU PCI Class | `0x0302` (3D Controller) - **NOT 0x0300** |
+| dGPU PCI Class | `0x0302` (3D Controller), **NOT 0x0300** |
 | Display | 15.6" FHD (1920x1080), connected via eDP to iGPU |
-| Optimus Type | **Muxless** - no MUX chip |
+| Optimus Type | **Muxless**, no MUX chip |
 | HDMI Port | Routed through NVIDIA dGPU (common on MSI laptops) |
 | USB-C/DP | If present, may route through iGPU or dGPU (check `lspci`) |
 
-### 10.2 PCI Topology (Expected)
+### PCI Topology (Expected)
 
 ```
 00:00.0 Host Bridge: Intel Corporation Raptor Lake-H [8086:A700]
@@ -994,9 +997,9 @@ These are defined in the ACPI spec §B.4 (Display-Specific Methods) and require 
 01:00.0 3D controller: NVIDIA Corporation AD107M [GeForce RTX 4050] [10DE:2860]
 ```
 
-Note bus `01` for the NVIDIA GPU - it's behind a PCIe bridge.
+Note bus `01` for the NVIDIA GPU, it's behind a PCIe bridge.
 
-### 10.3 Framebuffer Behavior
+### Framebuffer Behavior
 
 On this laptop:
 - UEFI firmware initializes Intel UHD Graphics via GOP
@@ -1005,7 +1008,7 @@ On this laptop:
 - The NVIDIA RTX 4050 is **irrelevant for the internal display**
 - External HDMI may require NVIDIA driver initialization (not needed for basic OS work)
 
-### 10.4 Expected Multiboot Info Values
+### Expected Multiboot Info Values
 
 When booting at 1920x1080x32:
 ```
@@ -1018,7 +1021,7 @@ framebuffer_bpp:    32
 framebuffer_type:   1 (RGB direct color)
 ```
 
-### 10.5 BIOS/UEFI Settings That Affect Display
+### BIOS/UEFI Settings That Affect Display
 
 MSI BIOS settings to check:
 - **Graphics Configuration → Optimus**: Should be "MSHybrid" (default). "Discrete Only" may not work on muxless designs.
@@ -1028,16 +1031,16 @@ MSI BIOS settings to check:
 
 ---
 
-## 11. AMD Hybrid Graphics (PowerXpress / Enduro)
+## AMD Hybrid Graphics (PowerXpress / Enduro)
 
-### 11.1 Overview
+### Overview
 
 AMD's equivalent to Optimus has gone through several names:
-- **ATI PowerXpress** (2008 - 2012) - muxed design
-- **AMD Enduro** (2012 - 2015) - muxless, similar to Optimus
-- **AMD SmartShift** (2020+) - dynamic power sharing between AMD APU + AMD dGPU
+- **ATI PowerXpress** (2008 to 2012), muxed design
+- **AMD Enduro** (2012 to 2015), muxless, similar to Optimus
+- **AMD SmartShift** (2020+), dynamic power sharing between AMD APU + AMD dGPU
 
-### 11.2 Architecture
+### Architecture
 
 ```
 Scenario 1: AMD APU + NVIDIA dGPU
@@ -1050,7 +1053,7 @@ Scenario 3: Intel CPU + AMD dGPU (rare in laptops, common on older models)
   LCD ←── Intel iGPU ←── (render copy) ←── AMD dGPU
 ```
 
-### 11.3 Key Differences from NVIDIA Optimus
+### Key Differences from NVIDIA Optimus
 
 | Aspect | NVIDIA Optimus | AMD Enduro |
 |--------|---------------|------------|
@@ -1061,20 +1064,20 @@ Scenario 3: Intel CPU + AMD dGPU (rare in laptops, common on older models)
 | Power control | ACPI _DSM | ACPI _ATPX |
 | MUX control | ACPI _DSM | ACPI _ATPX |
 
-### 11.4 AMD APU Display Registers
+### AMD APU Display Registers
 
 AMD APUs (Ryzen integrated graphics) use the DCN (Display Core Next) display engine:
 
 - BAR0: MMIO registers (including display engine)
 - The framebuffer is in system memory (GART/GTT mapped)
 - Display pipe registers are in BAR0 at offsets like:
-  - CRTC: `0x1B9C0` - `0x1B9FF` (varies by DCN version)
-  - Hub control: `0x0E00` - `0x0FFF` (HUBP - Hub Pipeline)
-  - Surface address: programmed via HUBP registers
+ , CRTC: `0x1B9C0`, `0x1B9FF` (varies by DCN version)
+ , Hub control: `0x0E00`, `0x0FFF` (HUBP, Hub Pipeline)
+ , Surface address: programmed via HUBP registers
   
 AMD's register documentation is largely undocumented publicly. The `amdgpu` kernel driver source (`drivers/gpu/drm/amd/display/dc/`) is the best reference.
 
-### 11.5 For Bare-Metal OS Developers
+### For Bare-Metal OS Developers
 
 The approach is identical to Intel Optimus:
 1. Use the UEFI GOP framebuffer from the APU
@@ -1084,9 +1087,9 @@ The approach is identical to Intel Optimus:
 
 ---
 
-## 12. Apple Silicon / ARM Considerations
+## Apple Silicon / ARM Considerations
 
-### 12.1 Apple Silicon (M1/M2/M3/M4)
+### Apple Silicon (M1/M2/M3/M4)
 
 Apple Silicon Macs have a fundamentally different GPU architecture:
 
@@ -1098,29 +1101,29 @@ Apple Silicon Macs have a fundamentally different GPU architecture:
 
 **For OS developers**: Apple Silicon requires completely custom display initialization. No PCI, no VBE, no standard UEFI. See the Asahi Linux project for documentation.
 
-### 12.2 Qualcomm Snapdragon (ARM Windows Laptops)
+### Qualcomm Snapdragon (ARM Windows Laptops)
 
 - GPU: Qualcomm Adreno (integrated)
 - Display: Qualcomm DPU (Display Processing Unit)
 - Framebuffer: Via UEFI GOP (if compliant) or DT-defined
 - Hybrid GPU: Not applicable (single GPU)
 
-### 12.3 NVIDIA Tegra (Jetson, Nintendo Switch)
+### NVIDIA Tegra (Jetson, Nintendo Switch)
 
 - GPU: NVIDIA GPU on SoC (shared memory with CPU)
 - Display: NVIDIA DC (Display Controller), not the same as desktop display engine
 - Framebuffer: Through DRM/KMS in Linux, or Tegra-specific register programming
-- No Optimus - single GPU
+- No Optimus, single GPU
 
 **Bottom line for ARM**: Each SoC vendor has a completely different display subsystem. There is no universal "PCI VGA" or "UEFI GOP" guarantee. Stick with x86 if you want standards-based display initialization.
 
 ---
 
-## 13. Code Patterns for Kurono OS
+## Code Patterns for Kurono OS
 
 This section provides concrete code that integrates with your existing Kurono OS architecture.
 
-### 13.1 GPU Enumeration Extension
+### GPU Enumeration Extension
 
 Add to your existing PCI scanning:
 
@@ -1173,7 +1176,7 @@ private:
 };
 ```
 
-### 13.2 Reading 64-bit BARs
+### Reading 64-bit BARs
 
 ```cpp
 // Read a 64-bit BAR (handles the two-DWORD encoding)
@@ -1198,7 +1201,7 @@ static uint64_t ReadBAR64(uint8_t bus, uint8_t dev, uint8_t func, int bar_index)
 }
 ```
 
-### 13.3 Intel iGPU Framebuffer Verification
+### Intel iGPU Framebuffer Verification
 
 ```cpp
 // Verify that the Multiboot framebuffer address matches the Intel iGPU's
@@ -1246,7 +1249,7 @@ bool VerifyIntelFBAddress(uint64_t multiboot_fb_addr) {
 }
 ```
 
-### 13.4 Complete Intel iGPU Register Map Reference
+### Complete Intel iGPU Register Map Reference
 
 For OS developers who need to read/debug Intel GPU state. All offsets relative to BAR0.
 
@@ -1310,7 +1313,7 @@ PWR_WELL_CTL        0x45400     (power well control)
 FUSE_STATUS         0x42000     (fuse strap status, tells number of pipes)
 ```
 
-### 13.5 Debugging Framebuffer Issues via Serial
+### Debugging Framebuffer Issues via Serial
 
 Add this diagnostic function to dump all relevant display state:
 
@@ -1471,34 +1474,34 @@ void DumpDisplayDiagnostics(uint64_t mb_fb_addr, uint32_t mb_fb_width,
 ## References
 
 1. **Intel Open Source HD Graphics Programmer's Reference** (PRM)
-   - Volume 12: Display Engine
-   - Available at: https://01.org/linuxgraphics/documentation
-   - Contains ALL register definitions for Gen9+ display engine
+  , Volume 12: Display Engine
+  , Available at: https://01.org/linuxgraphics/documentation
+  , Contains ALL register definitions for Gen9+ display engine
 
-2. **Envytools** - NVIDIA GPU documentation project
-   - https://envytools.readthedocs.io/
-   - Register database: `rnndb/` directory
+2. **Envytools**, NVIDIA GPU documentation project
+  , https://envytools.readthedocs.io/
+  , Register database: `rnndb/` directory
 
 3. **Linux kernel source**
-   - `drivers/gpu/drm/i915/i915_reg.h` - Intel register definitions
-   - `drivers/gpu/drm/i915/display/` - Intel display pipeline code
-   - `drivers/gpu/drm/nouveau/` - NVIDIA open-source driver
-   - `drivers/gpu/drm/amd/display/dc/` - AMD display core
+  , `drivers/gpu/drm/i915/i915_reg.h`, Intel register definitions
+  , `drivers/gpu/drm/i915/display/`, Intel display pipeline code
+  , `drivers/gpu/drm/nouveau/`, NVIDIA open-source driver
+  , `drivers/gpu/drm/amd/display/dc/`, AMD display core
 
 4. **Multiboot Specification**
-   - https://www.gnu.org/software/grub/manual/multiboot/multiboot.html
-   - Framebuffer fields at offset 88 - 109
+  , https://www.gnu.org/software/grub/manual/multiboot/multiboot.html
+  , Framebuffer fields at offset 88 to 109
 
-5. **UEFI Specification** - Graphics Output Protocol (GOP)
-   - Chapter 12.9: Graphics Output Protocol
+5. **UEFI Specification**, Graphics Output Protocol (GOP)
+  , Chapter 12.9: Graphics Output Protocol
 
-6. **PCI Local Bus Specification** - Configuration space layout
-   - Class codes: Appendix D
+6. **PCI Local Bus Specification**, Configuration space layout
+  , Class codes: Appendix D
 
 7. **OSDev Wiki**
-   - https://wiki.osdev.org/Intel_HD_Graphics
-   - https://wiki.osdev.org/PCI
-   - https://wiki.osdev.org/NVIDIA
+  , https://wiki.osdev.org/Intel_HD_Graphics
+  , https://wiki.osdev.org/PCI
+  , https://wiki.osdev.org/NVIDIA
 
 ---
 

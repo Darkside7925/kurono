@@ -1,27 +1,34 @@
-# Extended Page Tables (EPT)
+# EPT
 
-`src/virt/ept.cpp` and `ept.h` implement Intel EPT and AMD NPT (Nested Page Tables) for guest memory isolation.
+`src/virt/ept.cpp` and `ept.h`. Intel EPT and AMD NPT, the second level of address
+translation for guests.
 
-## 1. What EPT does
+When a guest touches a physical address, EPT translates guest physical to host physical.
+Without it the hypervisor would have to trap every guest page table change, which is
+painfully slow. With it, the hardware does the work.
 
-EPT provides a second level of address translation for virtual machines. When a guest accesses a physical address, EPT translates that guest physical address to a real host physical address. Without EPT, the hypervisor would have to intercept every single guest page table modification - very slow. With EPT, the hardware handles most translations in hardware.
+## Shape
 
-## 2. Structure
+Four levels: EPT PML4, EPDPT, EPD, EPT. 512 entries each. Leaf entries map a 4KB guest
+physical page to a host physical page.
 
-The EPT uses a four-level page table: EPT PML4 → EPDPT → EPD → EPT. Each level has 512 entries. Leaf entries map a 4 KB guest physical page frame to a host physical page.
+Permissions are the read/write/execute bits in each entry. Violations raise an
+EPT_VIOLATION VM exit.
 
-Page permissions are encoded in each entry: read, write, and execute bits. Violations cause EPT_VIOLATION VM exits.
+## Initial mapping
 
-## 3. Building the initial mapping
+At VM create time the hypervisor calls `EPT::BuildIdentityMap(guest_phys_base, size)` to
+identity-map the guest RAM allocation, so the guest sees flat contiguous physical memory
+starting at 0.
 
-At VM create time, the hypervisor calls `EPT::BuildIdentityMap(guest_phys_base, size)` to create an identity-mapped region covering the guest RAM allocation. This lets the guest see a flat contiguous physical address space starting at 0.
+## Violations
 
-## 4. EPT violation handling
+If the guest touches a guest physical address with no mapping, EPT_VIOLATION fires. The
+`vmexit.cpp` handler calls `EPT::MapPage(gpa, hpa, perms)` to add it and re-enters the
+guest. Device MMIO ranges get mapped on demand this way.
 
-When the guest accesses a guest physical address not covered by the current EPT, an EPT_VIOLATION VM exit fires. The `vmexit.cpp` handler calls `EPT::MapPage(gpa, hpa, perms)` to add the mapping and re-enters the guest. This on-demand mapping is used for device MMIO ranges.
+## Files
 
-## 5. Related files
-
-- `src/virt/hypervisor.cpp` - creates and holds the EPT pointer
-- `src/virt/vmexit.cpp` - calls EPT on EPT_VIOLATION exits
-- `src/virt/guest_mem.cpp` - allocates host physical pages for guest RAM
+- `src/virt/hypervisor.cpp` creates and holds the EPT pointer
+- `src/virt/vmexit.cpp` calls into EPT on EPT_VIOLATION
+- `src/virt/guest_mem.cpp` allocates host physical pages for guest RAM

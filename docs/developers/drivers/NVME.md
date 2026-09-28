@@ -1,39 +1,44 @@
-# NVMe Driver
+# NVMe
 
-`src/drivers/nvme.cpp` and `nvme.h` implement an NVMe storage driver for PCIe SSD access.
+`src/drivers/nvme.cpp` and `nvme.h`. PCIe SSD storage.
 
-## 1. What it does
+1. finds controllers on PCI (class 0x01, subclass 0x08)
+2. maps the MMIO BAR
+3. creates admin and I/O submission/completion queue pairs
+4. Identify commands to discover namespaces
+5. `ReadSectors` and `WriteSectors` for the filesystem layer
 
-NVMe (Non-Volatile Memory Express) is the standard interface for modern PCIe SSDs. The driver:
+## Queues
 
-1. Detects NVMe controllers on the PCI bus (class 0x01, subclass 0x08).
-2. Maps the controller's MMIO BAR.
-3. Creates admin and I/O submission/completion queue pairs.
-4. Issues Identify commands to discover namespaces.
-5. Exposes `ReadSectors` and `WriteSectors` for the filesystem layer.
+Paired SQ/CQ. Commands go on the SQ, the doorbell gets rung, the CQ gets polled for
+completions. Simpler than interrupt-driven completion, and it fits the polling
+architecture.
 
-## 2. Queue model
+## Where it's used
 
-NVMe uses paired submission and completion queues (SQ/CQ). The driver places commands on the SQ, rings the doorbell register, and polls the CQ for completions. This is simpler than interrupt-driven completion but works for the current polling architecture.
+Block access for the FAT32 and ext4 layers, and it's the device under KFS reboot
+persistence (see [KFS.md](../fs/KFS.md)). Read and write are verified end to end.
 
-## 3. Use in the OS
+`NVMe::Read` and `Write` do multi-page DMA. For a contiguous buffer they build `prp2`:
+the second page directly, or a PRP-list page naming pages 2 to N. That lifts the old 4KB
+per command cap to about 2MB. The PRP builder is offset-aware, so any identity-mapped
+buffer works as a DMA target (stack, heap, PMM), not only page-aligned ones. Read and
+Write also chunk internally at `MaxTransferBytes()`, which is `min(PRP-list cap,
+controller MDTS)`. Going past the controller's MDTS gets rejected with `sc=0x02` (invalid
+field), so bigger transfers get split without the caller knowing.
 
-The NVMe driver provides block device access for the FAT32 / ext4 layers and backs **reboot persistence** (it's the block device under **KFS** - see [KFS.md](../fs/KFS.md)). Read/write are verified end-to-end.
+## When it breaks
 
-`NVMe::Read`/`Write` do **multi-page DMA**: for a contiguous buffer they build `prp2` (the 2nd page directly, or a PRP-list page naming the 2nd..Nth pages), lifting the old 4 KB-per-command cap to ~2 MB. The PRP builder is offset-aware, so any identity-mapped buffer (stack / heap / PMM) can be a DMA target, not just page-aligned ones. Read/Write also **chunk internally** at `MaxTransferBytes() = min(PRP-list cap, controller MDTS)` - exceeding the controller's MDTS is rejected with `sc=0x02` (invalid field), so larger transfers are split transparently.
-
-## 4. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Controller not found | PCI scan missing NVMe class code |
-| `Version 0.0.0` / never enables | 64-bit BAR base is in BAR1 (qemu puts it above 4 GB under `-m 4G`); read BAR1's high bits + map the register window |
-| Enable timeout | admin/IO queues + DMA buffers must be 4 KB page-aligned (`PMM::AllocBytes`), not 16-byte `KernelHeap` |
-| **Every command times out** | the completion-phase read must be `volatile` - the controller DMA-writes the CQE, and a plain read gets hoisted out of the poll loop. This one was why nothing ever completed. |
-| Commands time out | Queue doorbell not written correctly |
-| Data corruption | Cache coherence issue; flush before read-back |
+| controller not found | PCI scan missing the NVMe class code |
+| `Version 0.0.0`, never enables | the 64-bit BAR base is in BAR1 (qemu puts it above 4GB under `-m 4G`), so read BAR1's high bits and map the register window |
+| enable timeout | admin/I/O queues and DMA buffers must be 4KB page aligned (`PMM::AllocBytes`), not 16-byte `KernelHeap` |
+| every command times out | the completion-phase read must be `volatile`. The controller DMA-writes the CQE and a plain read gets hoisted out of the poll loop. This one is why nothing ever completed. |
+| commands time out | doorbell not written correctly |
+| data corruption | cache coherence, flush before read-back |
 
-## 5. Related files
+## Files
 
-- `src/fs/fat32.cpp` - filesystem that uses block device reads
-- `src/fs/vfs.cpp` - VFS layer that routes to block devices
+- `src/fs/fat32.cpp` reads blocks through this
+- `src/fs/vfs.cpp` routes to block devices

@@ -1,54 +1,53 @@
-# Display Setup
+# Display setup
 
-`src/drivers/display.cpp` and `display.h` handle display mode selection and framebuffer acquisition. `src/drivers/display_mgr.cpp` provides the multi-backend display manager.
+`src/drivers/display.cpp` and `display.h` pick a display mode and get a framebuffer.
+`src/drivers/display_mgr.cpp` is the multi-backend manager on top of it.
 
-## 1. Role
+The display driver doesn't draw anything. Its job is to work out what hardware is there
+and hand a usable pixel buffer to the rest of the system.
 
-The display driver is responsible for finding a usable framebuffer and handing it to the graphics backend. It does not draw anything itself. Its job is to figure out what hardware is present and get a pixel buffer the rest of the system can use.
+## Framebuffer sources, in order
 
-The display manager (`display_mgr.cpp`) provides a multi-backend abstraction that routes to BGA, VirtIO GPU, Intel, NVIDIA, or AMD based on GPU probe results. It exposes runtime mode switching, EDID reading, DPI scaling, gamma/brightness, and VSync control.
+1. Multiboot framebuffer: GRUB hands it over from EFI GOP on real hardware. On hybrid
+   laptops the GPU probe validates the address.
+2. VBE linear framebuffer: from BIOS-era bootloaders, covers most legacy hardware.
+3. BGA, which is QEMU and VirtualBox.
 
-## 2. Priority order
+Once one is accepted, the display manager picks a backend from the GPU probe results and
+passes the address, dimensions and pitch to the graphics driver.
 
-The driver tries framebuffer sources in priority order:
+## Backend order
 
-1. **Multiboot framebuffer** - provided by GRUB via EFI GOP on real hardware. The GPU probe validates the address on hybrid GPU laptops.
-2. **VBE linear framebuffer** - provided by BIOS-era bootloaders. Works on most legacy hardware.
-3. **BGA (Bochs Graphics Adapter)** - used in virtual machines (QEMU, VirtualBox).
+1. VirtIO GPU, if detected. 2D resource management plus scanout, the best path in a VM.
+2. BGA, for QEMU/Bochs.
+3. Native: Intel, NVIDIA or AMD, whichever the GPU probe called primary.
 
-Once a source is accepted, the display manager selects the appropriate backend based on the GPU probe results and hands the framebuffer address, dimensions, and pitch to the graphics driver.
+## Panic
 
-## 3. Backend selection
+After a mode is set, the display driver tells panic the framebuffer parameters, so a
+later crash draws in the right place.
 
-The display manager tries backends in this order:
+## Modes
 
-1. **VirtIO GPU** - if detected, provides 2D resource management and scanout (highest quality in VMs)
-2. **BGA** - Bochs Graphics Adapter fallback for QEMU/Bochs
-3. **Native** - Intel, NVIDIA, or AMD based on GPU probe primary GPU selection
+10 predefined modes, 640x480 up to 3840x2160, switchable at runtime through
+`SetResolution()`. A settings change goes through here, which re-initialises and tells
+the rest of the system.
 
-## 4. Panic framebuffer update
+## When it breaks
 
-After the display driver establishes a mode, it informs the panic subsystem of the framebuffer parameters. This keeps the panic crash renderer synchronized so that if the system crashes later, the crash screen draws to the correct location.
-
-## 5. Mode switching
-
-The display manager provides 10 predefined modes from 640x480 through 3840x2160. Runtime mode switching is supported via `SetResolution()`. When the OS needs to change resolution after boot (for example, from a settings change), the display manager handles the re-initialization and notifies the rest of the system.
-
-## 6. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Screen stays black | No framebuffer source found; check bootloader config or GPU probe |
-| Correct boot but wrong resolution | VBE mode selection picking wrong index or EDID not read |
-| Works in VM but not real hardware | BGA only; GPU probe and VBE not set up |
-| Black screen on Optimus laptop | GRUB framebuffer points to wrong GPU; GPU probe validation failed |
-| Resolution changes crash | Panic framebuffer not updated after mode switch |
+| screen stays black | no framebuffer source, check bootloader config and the GPU probe |
+| boots at the wrong resolution | VBE picked the wrong mode index, or EDID wasn't read |
+| works in a VM but not on metal | BGA only, the GPU probe and VBE never got set up |
+| black screen on an Optimus laptop | the GRUB framebuffer points at the wrong GPU, probe validation failed |
+| a resolution change crashes | panic's framebuffer wasn't updated after the switch |
 
-## 7. Related files
+## Files
 
-- `src/drivers/display_mgr.cpp` - multi-backend display manager
-- `src/drivers/gpu_probe.cpp` - GPU detection and hybrid topology
-- `src/drivers/graphics.cpp` - receives framebuffer parameters
-- `src/drivers/bga.cpp` - BGA path for virtual machines
-- `src/drivers/virtio_gpu.cpp` - VirtIO GPU path
-- `src/kernel/panic.cpp` - framebuffer update target
+- `src/drivers/display_mgr.cpp` multi-backend display manager
+- `src/drivers/gpu_probe.cpp` GPU detection and hybrid topology
+- `src/drivers/graphics.cpp` where the framebuffer parameters end up
+- `src/drivers/bga.cpp` the VM path
+- `src/drivers/virtio_gpu.cpp` the VirtIO path
+- `src/kernel/panic.cpp` the framebuffer update target

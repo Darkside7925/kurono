@@ -1,31 +1,33 @@
-# Virtual Memory Manager
+# VMM (kernel side)
 
-`src/kernel/vmm.cpp` and `vmm.h` handle virtual address space mappings at the kernel level.
+`src/kernel/vmm.cpp` and `vmm.h`. Page tables for the kernel. Maps PMM pages into
+virtual ranges, handles identity maps, kernel space protection, and the
+virt-to-phys translations drivers and security code ask for.
 
-## 1. What it does
+Not `src/virt/vmm.cpp`. That one is the hypervisor's guest memory backend. Different
+file, easy to open the wrong one.
 
-The VMM provides page table management for the kernel. It maps physical pages (obtained from the PMM) into virtual address ranges and handles identity mappings, kernel space protection, and any explicit virtual-to-physical translations needed by drivers or security features.
+## With the PMM
 
-Note that `src/virt/vmm.cpp` is a separate file - that one belongs to the hypervisor subsystem and handles VM guest memory backends. The kernel VMM here is `src/kernel/vmm.cpp`.
+The VMM asks the PMM for pages to back new page table entries. It doesn't own page
+lifetimes, the PMM does. The VMM owns the mapping, nothing else.
 
-## 2. Relationship with PMM
+## Init
 
-The VMM calls the PMM to get physical pages when it needs to back a new page table entry. The VMM does not manage physical page lifetimes itself - the PMM owns that. The VMM only manages the mapping relationship.
+During core bring-up, after the PMM is up. `kurono_boot.asm` throws together a
+minimal identity map just to reach `kernel_main`, then `vmm.cpp` takes over and
+builds the real kernel page tables.
 
-## 3. Initialization
+## When it breaks
 
-The VMM is initialized during the core kernel bring-up phase after the PMM is ready. The early boot code in `kurono_boot.asm` establishes a minimal identity-mapped configuration to reach `kernel_main`. After that, the VMM in `vmm.cpp` takes over and sets up the final kernel page tables.
-
-## 4. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Page fault in kernel code | Missing or incorrect mapping |
-| DMA address collision | Driver used virtual address instead of physical |
-| Corruption in high memory | Kernel image mapping overlapping a driver region |
+| page fault in kernel code | missing or wrong mapping |
+| DMA address collision | driver used a virtual address where a physical one was needed |
+| corruption in high memory | kernel image mapping overlapping a driver region |
 
-## 5. Related files
+## Files
 
-- `src/kernel/pmm.cpp` - physical pages backing the mappings
-- `src/kernel/kurono_kernel.cpp` - initialization order
-- `src/virt/vmm.cpp` - separate hypervisor VMM backend (do not confuse)
+- `src/kernel/pmm.cpp` the physical pages behind the mappings
+- `src/kernel/kurono_kernel.cpp` init order
+- `src/virt/vmm.cpp` the hypervisor VMM, don't mix them up

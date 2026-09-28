@@ -1,35 +1,38 @@
-# Input Manager
+# Input manager
 
-`src/system/input_manager.cpp` and `input_manager.h` aggregate keyboard and mouse events from their hardware drivers and route them to the focused window or shell.
+`src/system/input_manager.cpp` and `input_manager.h`. Collects keyboard and mouse events
+from the drivers and routes them to the focused window or the shell.
 
-## 1. Role
+It's the bridge between hardware drivers and the UI. The drivers post raw events, this reads
+them, does any preprocessing, and calls the right handler.
 
-The input manager is the bridge between the hardware drivers (keyboard, mouse) and the UI. The hardware drivers post raw event data; the input manager reads it, applies any preprocessing, and calls the right handler.
-
-## 2. Keyboard flow
-
-```
-HAL IRQ 1 → keyboard.cpp (translate scan code) → post to key queue
-Main loop → InputManager::PollKeyboard() → KuronoShell or DesktopEnvironment
-```
-
-The main loop calls `InputManager::PollKeyboard()` each iteration. That function drains the key queue and passes each character to `DesktopEnvironment::HandleInput()`. The desktop environment routes it to the focused window's input callback.
-
-## 3. Mouse flow
+## Keyboard
 
 ```
-HAL IRQ 12 → mouse.cpp (assemble packet, update position) → post delta/button event
-Main loop → InputManager::PollMouse() → DesktopEnvironment
+HAL IRQ 1 -> keyboard.cpp (translate scan code) -> key queue
+main loop -> InputManager::PollKeyboard() -> KuronoShell or DesktopEnvironment
 ```
 
-The split-trigger model means: IRQs queue events, the main loop drains them. This keeps IRQ handlers minimal and avoids re-entrant UI code.
+The main loop calls `PollKeyboard()` each iteration. It drains the queue into
+`DesktopEnvironment::HandleInput()`, which routes to the focused window's input callback.
 
-## 4. Cursor position
+## Mouse
 
-The input manager maintains the global cursor position. The desktop renderer queries this to draw the cursor sprite at the right location each frame.
+```
+HAL IRQ 12 -> mouse.cpp (assemble packet, update position) -> delta/button event
+main loop -> InputManager::PollMouse() -> DesktopEnvironment
+```
 
-## 5. Related files
+Split-trigger: IRQs queue, the main loop drains. That keeps IRQ handlers minimal and stops
+UI code being re-entered.
 
-- `src/drivers/keyboard.cpp` - keyboard event source
-- `src/drivers/mouse.cpp` - mouse event source
-- `src/ui/desktop.cpp` - `HandleInput()` consumer
+## Cursor
+
+The input manager owns the global cursor position. The desktop renderer reads it to draw the
+sprite each frame.
+
+## Files
+
+- `src/drivers/keyboard.cpp` keyboard event source
+- `src/drivers/mouse.cpp` mouse event source
+- `src/ui/desktop.cpp` the `HandleInput()` consumer

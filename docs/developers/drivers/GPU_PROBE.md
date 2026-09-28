@@ -1,27 +1,30 @@
-# GPU Probe
+# GPU probe
 
-`src/drivers/gpu_probe.cpp` and `gpu_probe.h` scan the PCI bus for GPU devices, detect hybrid topologies, and validate framebuffer addresses.
+`src/drivers/gpu_probe.cpp` and `gpu_probe.h`. Scans PCI for GPUs, works out the hybrid
+topology, validates the framebuffer address.
 
-## 1. What it does
+This is step one of display init on real hardware:
 
-GPU probing is the first step in display initialization on real hardware. The probe:
+1. walk PCI looking for class code 0x03 (display controller)
+2. match the vendor ID against known vendors
+3. read BAR0 (MMIO registers) and BAR2 (VRAM aperture)
+4. classify the topology: single, Optimus muxless, Optimus MUX, PowerXpress, dual
+   discrete, or virtual
+5. hand out roles (primary, secondary, virtual)
+6. on Intel iGPU systems, read DSPSURF to validate the active framebuffer address
+7. hand off to the vendor driver: NVIDIA, AMD or Intel
+8. fall back to BGA or VirtIO GPU on virtual hardware
 
-1. Iterates PCI devices looking for class code 0x03 (display controller).
-2. For each found device, matches the vendor ID against known vendors.
-3. Reads PCI BAR0 (MMIO registers) and BAR2 (VRAM aperture) for each GPU.
-4. Classifies the system topology as single GPU, Optimus (muxless or MUX), PowerXpress, dual discrete, or virtual.
-5. Assigns roles (primary, secondary, virtual) to each GPU based on topology.
-6. On Intel iGPU systems, reads the DSPSURF (display surface) register to validate the active framebuffer address.
-7. Delegates to the appropriate vendor driver: NVIDIA, AMD, or Intel.
-8. Falls back to the BGA or VirtIO GPU path on virtual hardware.
+## Why a probe layer
 
-## 2. Why a probe layer
+Without it, the kernel would blindly try every vendor's init sequence. The probe works out
+what's there before anything touches hardware.
 
-Without a probe step, the kernel would need to try every vendor's initialization sequence blindly. The probe gives the system a chance to identify what is present before doing anything potentially destructive to the hardware.
+On Optimus and PowerXpress laptops this matters, because the framebuffer address GRUB
+reported can point at the wrong GPU. The probe reads Intel's DSPSURF register and fixes
+it.
 
-On hybrid GPU laptops (Optimus, PowerXpress), the probe is critical because the GRUB-reported framebuffer address may point to the wrong GPU. The probe validates the address by reading the Intel DSPSURF register and corrects it if necessary.
-
-## 3. Detection table
+## Vendors
 
 | Vendor ID | Vendor | Driver |
 | --- | --- | --- |
@@ -33,37 +36,39 @@ On hybrid GPU laptops (Optimus, PowerXpress), the probe is critical because the 
 | 0x15AD | VMware | `bga.cpp` |
 | 0x1B36 | Red Hat QXL | `bga.cpp` |
 
-## 4. Topology classification
+## Topologies
 
-The probe classifies the system into one of these topologies:
+- `GPU_TOPO_SINGLE`: one GPU
+- `GPU_TOPO_OPTIMUS_MUXLESS`: Intel iGPU plus NVIDIA dGPU, no mux, the panel is wired to
+  the iGPU only
+- `GPU_TOPO_OPTIMUS_MUX`: same but with a mux, either GPU can drive the panel
+- `GPU_TOPO_POWERXPRESS`: AMD APU plus an AMD or NVIDIA discrete GPU
+- `GPU_TOPO_DUAL_DISCRETE`: two discrete GPUs
+- `GPU_TOPO_VIRTUAL`: hypervisor with a virtual GPU
 
-- **GPU_TOPO_SINGLE**: Single GPU (desktop or single-GPU laptop)
-- **GPU_TOPO_OPTIMUS_MUXLESS**: Intel iGPU + NVIDIA dGPU, no mux switch (panel wired to iGPU only)
-- **GPU_TOPO_OPTIMUS_MUX**: Intel iGPU + NVIDIA dGPU with MUX switch (either GPU can drive panel)
-- **GPU_TOPO_POWERXPRESS**: AMD APU + AMD/NVIDIA discrete GPU
-- **GPU_TOPO_DUAL_DISCRETE**: Two discrete GPUs (workstation)
-- **GPU_TOPO_VIRTUAL**: Running under hypervisor with virtual GPU
+On muxless Optimus the NVIDIA part is class 0x0302 (3D controller, not VGA) and can't
+drive the display, so the Intel iGPU is the primary display device.
 
-On muxless Optimus systems, the NVIDIA dGPU is class 0x0302 (3D controller, not VGA) and cannot drive the display. The probe identifies the Intel iGPU as the primary display device.
+## Framebuffer validation
 
-## 5. Framebuffer validation
+On Intel systems the probe reads DSPSURF out of BAR0 for the real active framebuffer
+address, and corrects the GRUB value if they disagree, which is the Optimus case.
 
-On systems with an Intel iGPU, the probe reads the DSPSURF register from BAR0 to determine the actual active framebuffer address. If this differs from the GRUB-reported address (which can happen on Optimus laptops), the kernel corrects it before initializing graphics.
+Register offsets:
+- `INTEL_DSPSURF_A` (0x7019C), pipe A
+- `INTEL_DSPSURF_B` (0x7119C), pipe B
+- `INTEL_PLANE_SURF_A` (0x7019C), Skylake and later universal plane
 
-The relevant Intel register offsets are:
-- `INTEL_DSPSURF_A` (0x7019C) for pipe A
-- `INTEL_DSPSURF_B` (0x7119C) for pipe B
-- `INTEL_PLANE_SURF_A` (0x7019C) for Skylake+ universal plane
+## Limits
 
-## 6. Limitations
+It can identify hardware. It can't do full KMS-style modesetting. The goal is a usable
+framebuffer, not full GPU access. No 3D.
 
-The GPU probe can identify hardware but cannot perform a full modesetting (KMS-style) initialization. The focus is on getting a usable framebuffer rather than full GPU feature access. 3D acceleration is not implemented.
+## Files
 
-## 7. Related files
-
-- `src/drivers/nvidia_gpu.cpp` - NVIDIA support
-- `src/drivers/amd_gpu.cpp` - AMD support
-- `src/drivers/intel_gpu.cpp` - Intel support
-- `src/drivers/virtio_gpu.cpp` - VirtIO GPU path
-- `src/drivers/bga.cpp` - BGA fallback for QEMU
-- `src/drivers/display_mgr.cpp` - backend selection based on probe results
+- `src/drivers/nvidia_gpu.cpp`
+- `src/drivers/amd_gpu.cpp`
+- `src/drivers/intel_gpu.cpp`
+- `src/drivers/virtio_gpu.cpp`
+- `src/drivers/bga.cpp`
+- `src/drivers/display_mgr.cpp` picks a backend from the probe results

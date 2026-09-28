@@ -1,29 +1,29 @@
-# UI Configuration System
+# UI config
 
-`src/system/ui_config.cpp` and `ui_config.h` provide the runtime configuration engine that drives all visual customization in Kurono.
+`src/system/ui_config.cpp` and `ui_config.h`. The runtime config engine behind all the visual
+customisation.
 
-## 1. What it is
+A static class backed by a plain key=value file at `/etc/kurono/ui.conf` in KVFS. Reads it at
+boot, caches the entries, exposes typed accessors. Any subsystem that wants a user-configurable
+colour, size or toggle reads from here instead of hardcoding the value.
 
-UIConfig is a static class backed by a plain key=value file at `/etc/kurono/ui.conf` in KVFS. It reads that file at boot, caches the entries, and exposes typed accessors. Any subsystem that wants a user-configurable color, size, or toggle reads it from UIConfig rather than hardcoding the value.
+## File format
 
-## 2. Config file format
-
-The file uses a simple line-oriented format:
+Line oriented:
 
 ```
 key = value    # optional comment
 ```
 
-Rules:
-- Keys and values are separated by `=`.
-- `#` starts a comment; everything after it is ignored.
-- Whitespace around `=` and at line ends is trimmed.
-- Blank lines are allowed.
-- Colors are `0xAARRGGBB` hex (no quotes).
-- Integers are plain decimal.
-- Booleans are `0` or `1` (also `true`/`false`, `yes`/`no`, `on`/`off`).
+- keys and values split on `=`
+- `#` starts a comment, everything after it is ignored
+- whitespace around `=` and at line ends is trimmed
+- blank lines are fine
+- colours are `0xAARRGGBB` hex, no quotes
+- integers are plain decimal
+- booleans are `0` or `1`, and also `true`/`false`, `yes`/`no`, `on`/`off`
 
-## 3. Available configuration keys
+## Keys
 
 ### Taskbar
 | Key | Default | Type |
@@ -54,7 +54,7 @@ Rules:
 | `desktop.icon_margin_y` | 20 | int |
 | `desktop.allow_edit` | 1 | bool |
 
-### Context Menu
+### Context menu
 | Key | Default | Type |
 | --- | --- | --- |
 | `ctxmenu.bg` | 0xFF121228 | color |
@@ -63,7 +63,7 @@ Rules:
 | `ctxmenu.item_h` | 30 | int |
 | `ctxmenu.width` | 180 | int |
 
-### Window Manager
+### Window manager
 | Key | Default | Type |
 | --- | --- | --- |
 | `window.titlebar_height` | 36 | int |
@@ -77,39 +77,38 @@ Rules:
 | `window.min_btn` | 0xFFFFBD2E | color |
 | `window.max_btn` | 0xFF28C840 | color |
 
-### Task Manager
+### Task manager
 | Key | Default | Type |
 | --- | --- | --- |
 | `taskmgr.row_h` | 20 | int |
 | `taskmgr.allow_kill` | 1 | bool |
 
-### Display (frame pacing)
+### Display frame pacing
 | Key | Default | Type |
 | --- | --- | --- |
 | `display.refresh_hz` | 60 | int |
-| `display.vsync` | 1 | bool (paces frames to `refresh_hz`) |
-| `display.adaptive_sync` | 1 | bool (drop to half rate on budget overrun) |
+| `display.vsync` | 1 | bool, paces frames to `refresh_hz` |
+| `display.adaptive_sync` | 1 | bool, drops to half rate on budget overrun |
 
-### Compositor (shadows + animation)
+### Compositor shadows and animation
 | Key | Default | Type |
 | --- | --- | --- |
 | `compositor.shadow_enabled` | 1 | bool |
-| `compositor.shadow_radius` | 8 | int (0..16 layers) |
-| `compositor.shadow_opacity` | 60 | int (0..100 percent) |
+| `compositor.shadow_radius` | 8 | int, 0 to 16 layers |
+| `compositor.shadow_opacity` | 60 | int, 0 to 100 percent |
 | `compositor.shadow_during_drag` | 0 | bool |
 | `compositor.window_animations` | 1 | bool |
-| `compositor.animation_speed_ms` | 90 | int (0 = instant) |
-| `compositor.window_alpha` | 255 | int (0..255) |
+| `compositor.animation_speed_ms` | 90 | int, 0 for instant |
+| `compositor.window_alpha` | 255 | int, 0 to 255 |
 | `compositor.frosted_titlebar` | 1 | bool |
-| `compositor.reduced_motion` | 0 | bool (1 disables all animations) |
+| `compositor.reduced_motion` | 0 | bool, 1 disables all animations |
 
-### KSS theme tokens (`theme.*`)
+### KSS theme tokens
 
-The KSS styling layer (`src/ui/kss.cpp`) reads its theme token set from the same
-`ui.conf` via `UIConfig::Color(...)` - these keys are **not written into the
-generated default file** (KSS supplies built-in defaults shown below), but adding
-them to `ui.conf` overrides the theme. All are `0xAARRGGBB` colors except the
-metric tokens (`theme.radius`, `theme.pad`, plain ints).
+The KSS styling layer (`src/ui/kss.cpp`) reads its theme tokens from the same `ui.conf` through
+`UIConfig::Color(...)`. These keys are not written into the generated default file, since KSS has
+built-in defaults, but adding them to `ui.conf` overrides the theme. All are `0xAARRGGBB` except
+the metric tokens, which are plain ints.
 
 | Key | Default | Notes |
 | --- | --- | --- |
@@ -122,25 +121,28 @@ metric tokens (`theme.radius`, `theme.pad`, plain ints).
 | `theme.text_dim` | 0xFF9A9AA2 | dim text |
 | `theme.heading` | 0xFFF0F0F2 | heading text |
 | `theme.border` | 0xFF3A3A40 | borders |
-| `theme.accent` / `theme.on` / `theme.off` / `theme.track` / `theme.white` / `theme.shadow` | (built-in) | accent, toggle on/off, slider track, white, shadow |
-| `theme.radius` / `theme.pad` | (built-in ints) | corner radius / padding metrics |
+| `theme.accent`, `theme.on`, `theme.off`, `theme.track`, `theme.white`, `theme.shadow` | built-in | accent, toggle on/off, slider track, white, shadow |
+| `theme.radius`, `theme.pad` | built-in ints | corner radius, padding metrics |
 
-## 4. Applying changes at runtime
+## Applying changes
 
-Edit `/etc/kurono/ui.conf` using the text editor, then run:
+Edit `/etc/kurono/ui.conf`, then:
 
 ```
 kurono reload
 ```
 
-This calls `UIConfig::Reload()`, bumps the version counter, and calls `DesktopEnvironment::ReloadFromConfig()` which propagates the new values to the taskbar, desktop, and window manager immediately.
+That calls `UIConfig::Reload()`, bumps the version counter, and calls
+`DesktopEnvironment::ReloadFromConfig()`, which pushes the new values at the taskbar, desktop and
+window manager straight away.
 
-## 5. Default file
+## The default file
 
-If the config file does not exist on boot, UIConfig writes the complete default file with all keys documented. Modifying the generated file is the recommended starting point for customization.
+If the config file doesn't exist at boot, UIConfig writes the complete default file with every
+key documented. Modifying the generated file is the recommended starting point.
 
-## 6. Related files
+## Files
 
-- `src/ui/desktop.cpp` - `ReloadFromConfig()` for taskbar and desktop
-- `src/shell/shell.cpp` - `kurono reload`, `kurono config` commands
-- `src/fs/kvfs.cpp` - file read/write backing
+- `src/ui/desktop.cpp` `ReloadFromConfig()` for taskbar and desktop
+- `src/shell/shell.cpp` `kurono reload` and `kurono config`
+- `src/fs/kvfs.cpp` the file read/write backing

@@ -1,138 +1,147 @@
-# Boot to Desktop
+# Boot to desktop
 
-This document explains the live path from firmware handoff to the Kurono desktop.
+The live path from firmware handoff to the desktop.
 
-## 1. Boot entry and early machine state
+## Entry
 
-The boot chain begins in `src/boot`.
+The boot chain starts in `src/boot`. `kurono_boot.asm` and `multiboot_header.S` establish the
+loader contract, `kurono_linker.ld` shapes the image, and the assembly side prepares the early
+environment and hands off to C++.
 
-`kurono_boot.asm` and `multiboot_header.S` establish the loader contract. The linker script in `kurono_linker.ld` shapes the kernel image. The assembly side prepares the early environment and hands off into the C++ kernel.
+Two entry paths: Multiboot and the EFI loader. What matters for the rest of the system is
+simple. By the time `kernel_main()` starts, the kernel expects a valid boot information
+structure and 64-bit mode.
 
-Kurono supports a Multiboot path and an EFI loader path. The important point for the rest of the system is simple: by the time `kernel_main()` starts, the kernel expects to have a valid boot information structure and to be in 64 bit mode.
+## kurono_kernel.cpp is the real coordinator
 
-## 2. The real boot coordinator
+The whole high-level boot sequence lives in `src/kernel/kurono_kernel.cpp`. Not a stub, it's
+the project's boot script written in C++.
 
-The entire high level boot sequence lives in `src/kernel/kurono_kernel.cpp`.
+It starts with four jobs:
 
-That file is not a stub and not a placeholder. It is the project's boot script in C++ form.
+1. bring up serial logging
+2. normalise Multiboot2 input into the older Multiboot1-compatible structure when needed
+3. init panic early, so crash rendering has a framebuffer path
+4. try early VGA text and early framebuffer diagnostics before the big runtime is online
 
-The kernel starts by doing four jobs immediately.
+That's why this file is the first thing to read when something fails before the desktop shows
+up.
 
-1. It brings up serial logging.
-2. It normalizes Multiboot2 input into the older Multiboot1 compatible structure when needed.
-3. It initializes the panic subsystem early so crash rendering has a framebuffer path.
-4. It attempts early VGA text and early framebuffer diagnostics before the larger runtime is online.
-
-This is why `kurono_kernel.cpp` is the first file to read when something fails before the desktop appears.
-
-## 3. Core system bring up
-
-After boot validation, the kernel initializes the core services in a practical order.
+## Core bring-up order
 
 1. HAL
-2. Memory manager
-3. Scheduler
+2. memory manager
+3. scheduler
 4. VFS
-5. Test suite
-6. Timer and timekeeping
-7. Display path
-8. Input path
-9. Filesystem population and subsystem registration
-10. Desktop and main loop
+5. the test suite
+6. timer and timekeeping
+7. display path
+8. input path
+9. filesystem population and subsystem registration
+10. desktop, then the main loop
 
-The project is intentionally conservative here. Many later systems depend on earlier ones already working, so the sequence matters.
+Conservative on purpose. Plenty of later systems assume the earlier ones already work, so the
+sequence matters.
 
-## 4. Panic system placement
+## Panic sits early
 
-The panic system is initialized before the main display stack is fully online.
+Panic comes up before the display stack is fully online. That matters. If graphics fails
+later, panic already learned the framebuffer details from boot services, so it has a better
+chance of drawing. It also keeps the VGA fallback and the hard reboot path.
 
-That decision is important.
+## Display, in tiers
 
-If graphics fails later, the panic subsystem still has a better chance of drawing a crash screen because it already learned the framebuffer details from boot services. The panic path also keeps a VGA fallback and a hard reboot path.
+1. the bootloader or GOP framebuffer first
+2. VBE details where available
+3. BGA for virtual hardware
 
-## 5. Display path
+Before accepting anything, the kernel runs `GpuProbe::ScanAll()` to find every display
+controller on PCI. That's what makes hybrid laptops work: the probe spots Intel iGPU, NVIDIA
+dGPU, AMD APU/dGPU and virtual GPUs (QEMU, VMware, VirtIO), and classifies the topology as
+Optimus (muxless or MUX), PowerXpress, dual discrete or single.
 
-Kurono tries the display in tiers.
+On Optimus laptops the GRUB-reported framebuffer address can point at the wrong GPU. The probe
+validates it by reading Intel's DSPSURF (display surface) register out of MMIO BAR0, and
+corrects it before graphics init if it doesn't match the live surface.
 
-1. It prefers the bootloader or GOP supplied framebuffer.
-2. It can fall back to VBE details when available.
-3. It can use BGA in virtual hardware cases.
+Once a path is accepted, the display manager picks a backend (BGA, VirtIO GPU, Intel, NVIDIA
+or AMD) from the probe results. The graphics layer takes over framebuffer operations with a
+write-combining remap through PAT, so cached writes don't vanish on real hardware. Panic's
+framebuffer metadata gets updated so crash rendering tracks the live mode.
 
-Before accepting any framebuffer, the kernel runs `GpuProbe::ScanAll()` to detect all display controllers on the PCI bus. This is critical for hybrid GPU laptops. The probe identifies Intel iGPU, NVIDIA dGPU, AMD APU/dGPU, and virtual GPUs (QEMU, VMware, VirtIO). It classifies the topology as Optimus (muxless or MUX), PowerXpress, dual discrete, or single GPU.
+The Wayland compositor comes up after graphics is ready. It listens on
+`/system/run/user/1000/wayland-0` and advertises the standard libwayland globals. It runs
+in-kernel, not as a separate userspace process.
 
-On Optimus laptops, the GRUB-reported framebuffer address may point to the wrong GPU. The GPU probe validates the address by reading the Intel DSPSURF (display surface) register from MMIO BAR0. If the address does not match the actual active surface, the kernel corrects it before initializing graphics.
+That layering is why the project can show an early boot image and later a desktop on the same
+hardware without a full modesetting implementation.
 
-Once a display path is accepted, the display manager selects the backend (BGA, VirtIO GPU, Intel, NVIDIA, or AMD) based on the GPU probe results. The graphics layer takes over framebuffer operations with write-combining remap via PAT to ensure cached writes do not disappear on real hardware. The panic framebuffer metadata is updated so crash rendering tracks the live mode.
+## Input
 
-The Wayland compositor initializes after the graphics layer is ready. It listens at `/system/run/user/1000/wayland-0` and advertises the standard libwayland globals. The compositor runs in-kernel rather than as a separate user-space process.
+Keyboard and mouse come up around the display phase, because the desktop and the emergency
+shell both need them.
 
-This layered approach is why the project can show both an early boot image and a later desktop on the same hardware without a complete modesetting implementation.
+Laptop hardware is touchy here. The keyboard and touchpad usually share a fragile 8042 or
+embedded-controller path, so the init order is a real compatibility concern, not a cosmetic
+preference. The flow is: init keyboard, init the PS/2 auxiliary path, re-arm the keyboard,
+then attach the input manager.
 
-## 6. Input path
+## Filesystem and runtime layout
 
-The boot code brings up the keyboard and mouse around the display phase because the desktop and emergency shells both depend on them.
+Once the machine is interactive, the kernel builds the live runtime layout. `KVFS::Init()`
+creates the in-memory tree the desktop, shell, logs and demo files use. Runtime logging mirrors
+boot and system events into the filesystem, so the machine can inspect itself after boot. Then
+it populates the familiar locations: `/home/user`, `/etc`, `/tmp`, `/var/log`, `/usr/bin`.
 
-The important operational detail is that laptop hardware is touchy. The keyboard and touchpad often share a fragile 8042 or embedded controller path. That is why the initialization order has been treated as a real compatibility concern rather than a cosmetic preference.
+## Shell and subsystem registration
 
-The current flow initializes keyboard support, initializes the PS/2 auxiliary path, then re-arms the keyboard before the input manager is attached.
+The shell comes up before the desktop starts normal life. The kernel registers Linux commands,
+Windows commands, installer commands, package manager commands, KCL, the Linux integration
+pieces and other subsystem surfaces while it's still in the boot phase. The shell is not a late
+plugin, it's part of bring-up.
 
-## 7. Filesystem and runtime layout
+## Linux and virtualization
 
-Once the machine is interactive, the kernel builds the live runtime layout.
+Kurono's Linux subsystem and Kurono's hypervisor are related but not the same thing.
 
-`KVFS::Init()` creates the in memory filesystem tree used by the desktop, shell, logs, and demo files. Runtime logging mirrors boot and system events into the filesystem so the machine can inspect itself after boot.
+`src/linux` is a personality and syscall environment implemented by the native kernel. `src/virt`
+is a separate machine route that boots embedded Linux guests.
 
-The kernel then populates familiar locations such as `/home/user`, `/etc`, `/tmp`, `/var/log`, and `/usr/bin`.
+Normal boot defers the risky virtualization hardware bring-up until you explicitly ask for VM
+features. That's a deliberate safety choice for real laptops, not an omission.
 
-## 8. Shell and subsystem registration
+## Desktop
 
-The shell is initialized before the desktop begins normal life.
+Once the system services are ready, `DesktopEnvironment::Init()` sets up the desktop, taskbar,
+icons, windows and launch surfaces. The apps live in `src/apps`, but the desktop owns the
+interaction model that decides when they open and how they get events.
 
-The kernel registers Linux commands, Windows commands, installer commands, package manager commands, KCL, Linux integration pieces, and other subsystem surfaces while it is still in the boot phase. In other words, the shell is not a late plugin. It is part of the system bring up process.
+## The main loop
 
-## 9. Linux and virtualization policy
+`kurono_kernel.cpp`'s main loop is the heartbeat. Every iteration does a practical set of work.
 
-Kurono's Linux subsystem and Kurono's hypervisor are related but not identical.
+1. advance time from the PIT
+2. drain deferred settings work
+3. tick audio
+4. poll the NIC if there is one
+5. poll input
+6. tick the scheduler
+7. drain mouse events
+8. drain keyboard characters
+9. hand both to the desktop
+10. update and render the desktop
+11. refresh the task manager and other periodic views
 
-The Linux subsystem inside `src/linux` is a personality and syscall environment implemented by the native kernel.
+Mostly polling. That choice shows up everywhere, from timer handling to input, and it's one of
+the strongest themes in the repo.
 
-The hypervisor inside `src/virt` is a separate machine route that can boot embedded Linux guests.
+## Emergency mode
 
-Normal boot defers risky virtualization hardware bring up until the user explicitly asks for VM features. This is a deliberate safety choice for real laptops and not an omission.
+The same kernel can boot into an emergency recovery profile: a smaller runtime, a VGA-oriented
+shell path, only the services needed for diagnosis, and command access even when the desktop
+route isn't safe.
 
-## 10. Desktop bring up
-
-After the system services are ready, `DesktopEnvironment::Init()` sets up the desktop, taskbar, icons, windows, and launch surfaces. The applications themselves live in `src/apps`, but the desktop owns the interaction model that decides when they open and how they receive events.
-
-## 11. The main loop
-
-The main loop in `kurono_kernel.cpp` is the live heartbeat of the operating system.
-
-Every iteration performs a practical set of work.
-
-1. Advance time from PIT measurements.
-2. Poll deferred settings work.
-3. Tick audio.
-4. Poll the NIC when present.
-5. Poll input.
-6. Tick the scheduler.
-7. Drain mouse events.
-8. Drain keyboard characters.
-9. Hand both into the desktop environment.
-10. Update and render the desktop.
-11. Refresh task manager and other periodic views.
-
-The kernel stays mostly polling based. That design decision shows up everywhere from timer handling to input and is one of the strongest themes in the entire repository.
-
-## 12. Emergency mode
-
-The same kernel can boot into an emergency recovery profile.
-
-In that mode, the system prepares a smaller runtime, uses a VGA oriented shell path, registers the minimal services needed for diagnosis, and keeps command access available even if the desktop route is not safe.
-
-## 13. Practical debugging advice
-
-When the boot path fails, the fastest inspection order is usually the following.
+## When boot fails, look here
 
 1. `src/kernel/kurono_kernel.cpp`
 2. `src/kernel/panic.cpp`
@@ -142,4 +151,4 @@ When the boot path fails, the fastest inspection order is usually the following.
 6. `src/drivers/keyboard.cpp`
 7. `src/drivers/mouse.cpp`
 
-That order matches the real bring up chain and usually saves time.
+That order matches the real bring-up chain and usually saves time.

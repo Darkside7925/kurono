@@ -1,17 +1,19 @@
-# KVFS - Kernel Virtual Filesystem
+# KVFS
 
-`src/fs/kvfs.cpp` and `kvfs.h` implement the in-memory virtual filesystem that is the primary storage mechanism in Kurono.
+`src/fs/kvfs.cpp` and `kvfs.h`. The in-memory filesystem, and the main storage thing in
+Kurono.
 
-## 1. What KVFS is
+A path tree living in RAM, rebuilt fresh every boot. User-data subtrees persist anyway,
+because they get mirrored to KFS, a real on-disk filesystem (see [KFS.md](KFS.md)).
+Ramdisk with a POSIX-path interface, KFS for the backing store.
 
-KVFS is an in-memory key-value filesystem organized as a path tree. It lives in RAM and is populated fresh on every boot, but its user-data subtrees now **persist across reboots** by being mirrored to **KFS**, a real on-disk filesystem (see [KFS.md](KFS.md)). Think of it as a ramdisk with a POSIX-path interface; KFS is its on-disk backing store.
+The shell, desktop, settings, text editor and config system all use it. Unless something
+explicitly wants FAT32 or ext4, file access is KVFS.
 
-KVFS is the filesystem that the shell, the desktop, the settings app, the text editor, and the config system all use. Unless explicitly using FAT32 or ext4, all file operations go through KVFS.
-
-## 2. API
+## API
 
 ```cpp
-// Create and write
+// create and write
 KVFS::Mkdir(path)                          // create directory
 KVFS::Mkdirs(path)                         // create directory tree (follows symlinks)
 KVFS::Symlink(path, target)                // create/repoint a symlink node
@@ -19,22 +21,25 @@ KVFS::InstallCanonicalLayout()             // lay the /kurono tree + compat syml
 KVFS::WriteString(path, content)           // write file from string
 KVFS::WriteBytes(path, buf, len)           // write file from buffer
 
-// Read
-KVFS::ReadString(path, buf, maxlen)        // read file to buffer, returns bytes read
+// read
+KVFS::ReadString(path, buf, maxlen)        // read to buffer, returns bytes read
 KVFS::ReadBytes(path, buf, maxlen)         // binary read
 
-// Query
-KVFS::Exists(path)                         // true if file or directory exists
-KVFS::IsDir(path)                          // true if directory
-KVFS::List(path)                           // list directory entries
+// query
+KVFS::Exists(path)
+KVFS::IsDir(path)
+KVFS::List(path)                           // directory entries
 
-// Delete
-KVFS::Delete(path)                         // delete file or empty directory
+// delete
+KVFS::Delete(path)                         // file or empty directory
 ```
 
-## 3. Initial population & the canonical path layout
+## The canonical tree
 
-KVFS uses a **single canonical tree rooted at `/kurono`** plus a thin **compat-symlink overlay** at the old top-level names. Everything Kurono-native lives under `/kurono`; the bare names (`/system`, `/home`, `/etc`, `/bin`, `/lib`, `/tmp`, `/proc`, `/dev`, `/var`, `/apps`, `/usr/bin`, `/usr/lib`) are **symlinks** into it. This keeps the ~800 hardcoded path references across the codebase resolving while collapsing the old `/system` vs `/kurono/system` split.
+One real tree at `/kurono`, plus a thin compat-symlink overlay at the old top-level names.
+Kurono-native things live under `/kurono`, the bare names are symlinks into it. That keeps the
+~800 hardcoded path references in the codebase resolving while collapsing the old `/system`
+vs `/kurono/system` split.
 
 ```
 /
@@ -45,11 +50,11 @@ KVFS uses a **single canonical tree rooted at `/kurono`** plus a thin **compat-s
     ├── apps/      installed native kurono apps (bin, lib)
     ├── user/      all user data (home/user/{Desktop,Documents,...}, shared)
     ├── packages/  kpkg state
-    ├── runtime/   live state (proc, dev, tmp, sockets) - conceptually cleared on boot
+    ├── runtime/   live state (proc, dev, tmp, sockets), conceptually cleared on boot
     └── var/{log,lib,updates,state}
 
 compat symlinks at the root (resolved through intermediate components):
-  /system  -> /kurono/system          /home    -> /kurono/user/home
+  /system  -> /kurono/system           /home    -> /kurono/user/home
   /etc     -> /kurono/system/config    /bin     -> /kurono/system/bin
   /lib     -> /kurono/linux/compat     /usr/bin -> /kurono/linux/compat/bin
   /usr/lib -> /kurono/linux/compat/lib /tmp     -> /kurono/runtime/tmp
@@ -58,34 +63,47 @@ compat symlinks at the root (resolved through intermediate components):
   /windows -> /kurono/windows
 ```
 
-The canonical roots are centralized as macros in `src/system/kpaths.h` (`KP_SYSTEM_ROOT`, `KP_LINUX_COMPAT`, `KP_USER_HOME`, `KP_RUNTIME`, ...). The tree and the symlinks are installed by `KVFS::InstallCanonicalLayout()`, which runs at the **very start** of `BuildDefaultTree()` (i.e. inside `KVFS::Init()`, before any other code touches a path) and again after a persistent-tree restore. Because `KVFS::Resolve` and `KVFS::Mkdirs` both follow symlinks in intermediate path components (16-hop budget), a later `Mkdirs("/system/lib/x")` or `WriteFile("/etc/hostname")` resolves *through* the symlink into the real `/kurono` dir instead of materialising a stray real `/system` or `/etc` at the root.
+The roots are macros in `src/system/kpaths.h` (`KP_SYSTEM_ROOT`, `KP_LINUX_COMPAT`,
+`KP_USER_HOME`, `KP_RUNTIME`, and the rest). `KVFS::InstallCanonicalLayout()` installs the
+tree and the symlinks. It runs at the very start of `BuildDefaultTree()`, so inside
+`KVFS::Init()` before anything else touches a path, and again after a persistent-tree
+restore.
 
-The shell commands, the desktop icon system, the config system, the dynamic linker (ld-kurono searches `/system/lib`), and the logging subsystem (`/kurono/var/log`) all rely on this layout.
+`KVFS::Resolve` and `KVFS::Mkdirs` follow symlinks in intermediate path components, 16 hops
+max. So a later `Mkdirs("/system/lib/x")` or `WriteFile("/etc/hostname")` lands in the real
+`/kurono` directory instead of materialising a stray real `/system` or `/etc` at the root.
 
-## 4. Persistence
+Shell commands, the desktop icons, the config system, ld-kurono (it searches `/system/lib`)
+and logging (`/kurono/var/log`) all lean on this layout.
 
-KVFS persists across reboots through **KFS**, a real on-disk filesystem (see [KFS.md](KFS.md)), via `PersistStore::SaveTree` / `LoadTree` (`src/fs/persist.cpp`). On a clean shutdown / reboot - and on demand via the `persisttest` shell command - `SaveTree` formats a fresh KFS volume on the NVMe data disk and **mirrors the user-data subtrees (`/home`, `/etc`, `/root`) into it as real files + directories**. At boot, `LoadTree` mounts the volume and walks it back into KVFS, before the boot seeding re-fills the large `/usr` binaries.
+## Persistence
 
-As of the KFS **v2** (extent-based) overhaul the old per-file size cap
-(`KFS_MAX_FILE`) is **gone** - `SaveTree` now mirrors whatever KVFS holds, limited
-only by free disk space (see [KFS.md](KFS.md) §10). The re-seeded `/usr` binaries
-are still skipped on save because the boot seeding re-creates them, not because of
-a size limit. Because the snapshot is a real filesystem, a future `kfs-fuse`
-driver could mount the volume on Linux and browse the files directly. (The earlier
-opaque raw-sector blob store still exists as `PersistStore::Save`/`Load` but is no
-longer the path persistence takes.)
+Across reboots it goes through KFS (see [KFS.md](KFS.md)), via `PersistStore::SaveTree` and
+`LoadTree` in `src/fs/persist.cpp`. On a clean shutdown or reboot, and on demand from the
+`persisttest` shell command, `SaveTree` formats a fresh KFS volume on the NVMe data disk and
+mirrors the user-data subtrees (`/home`, `/etc`, `/root`) into it as real files and
+directories. At boot, `LoadTree` mounts the volume and walks it back into KVFS, before the
+boot seeding refills the big `/usr` binaries.
 
-## 5. Limitations
+KFS v2, the extent-based one, killed the old per-file cap (`KFS_MAX_FILE`). `SaveTree` now
+mirrors whatever KVFS holds, limited only by free disk space (see [KFS.md](KFS.md)). The
+re-seeded `/usr` binaries are still skipped on save because boot seeding recreates them, not
+because of a size limit. Since the snapshot is a real filesystem, a future `kfs-fuse` driver
+could mount the volume on Linux and browse the files directly. (The older opaque raw-sector
+blob store still exists as `PersistStore::Save` and `Load`, but nothing takes that path any
+more.)
+
+## Limitations
 
 | Limitation | Note |
 | --- | --- |
-| Permissions advisory | POSIX-style mode bits are stored, but the single-address-space kernel does not yet enforce them across all callers |
-| No hard links | Path is the only way to identify a file (symlinks *are* supported - see §3) |
-| RAM-resident live tree | The live tree lives in RAM, so total live size is bounded by the kernel heap |
-| Selective persistence | The runtime tree is rebuilt fresh each boot, but the user-data subtrees (`/home`, `/etc`, `/root`) persist across reboot through KFS (§4); the re-seeded `/usr` binaries are regenerated at boot rather than stored. There is no longer a per-file size cap on what persists (the v1 `KFS_MAX_FILE` limit was removed in KFS v2) |
+| permissions are advisory | mode bits are stored, but the single-address-space kernel doesn't enforce them across all callers |
+| no hard links | the path is the only way to identify a file, symlinks are supported |
+| live tree lives in RAM | total live size is bounded by the kernel heap |
+| selective persistence | the runtime tree is rebuilt every boot, but `/home`, `/etc` and `/root` come back through KFS and the `/usr` binaries are regenerated. No per-file cap any more |
 
-## 6. Related files
+## Files
 
-- `src/fs/vfs.cpp` - generic VFS layer that routes calls to KVFS or FAT32
-- `src/system/ui_config.cpp` - reads `/etc/kurono/ui.conf` from KVFS
-- `src/ui/desktop.cpp` - reads/writes `/home/user/Desktop/` entries
+- `src/fs/vfs.cpp` the routing layer in front of KVFS or FAT32
+- `src/system/ui_config.cpp` reads `/etc/kurono/ui.conf` out of KVFS
+- `src/ui/desktop.cpp` reads and writes `/home/user/Desktop/`

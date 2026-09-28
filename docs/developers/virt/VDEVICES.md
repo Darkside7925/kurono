@@ -1,31 +1,32 @@
-# Virtual Devices
+# Virtual devices
 
-`src/virt/vdevices.cpp` and `vdevices.h` implement the virtual hardware devices presented to the Linux guest VM.
+`src/virt/vdevices.cpp` and `vdevices.h`. The virtual hardware the Linux guest sees.
 
-## 1. Device list
-
-| Device | Description |
+| Device | What |
 | --- | --- |
-| **VirtIO NIC** | Virtual Ethernet, bridged to Kurono's E1000 via LinuxNetBridge |
-| **VirtIO Block** | Virtual disk backed by `src/virt/vdisk.cpp` |
-| **VirtIO Console** | Serial terminal device, backed by `src/virt/vserial.cpp` |
-| **VirtIO 9P** | Shared filesystem, backed by `src/virt/v9fs.cpp` |
-| **i8042 stub** | Keyboard/mouse input for the guest |
-| **PIT stub** | Timer interrupt for the guest |
-| **VGA/VBE** | Framebuffer for the guest display if needed |
+| VirtIO NIC | virtual Ethernet, bridged to Kurono's E1000 through LinuxNetBridge |
+| VirtIO Block | virtual disk backed by `src/virt/vdisk.cpp` |
+| VirtIO Console | serial terminal, backed by `src/virt/vserial.cpp` |
+| VirtIO 9P | shared filesystem, backed by `src/virt/v9fs.cpp` |
+| i8042 stub | keyboard and mouse for the guest |
+| PIT stub | timer interrupt for the guest |
+| VGA/VBE | framebuffer for the guest if it wants one |
 
-## 2. Device registration
+## Registration
 
-Each device registers its I/O port range and/or MMIO range at init time. When the guest performs an I/O access that triggers a VM exit, `vmexit.cpp` calls `VDevices::HandleIO(port, dir, value)` which dispatches to the matching device handler.
+Each device registers its I/O port range and/or MMIO range at init. When a guest access
+triggers a VM exit, `vmexit.cpp` calls `VDevices::HandleIO(port, dir, value)`, which
+dispatches to the matching handler.
 
-## 3. VirtIO protocol
+## VirtIO
 
-VirtIO devices communicate with the guest driver via descriptor rings (virtqueues). The host (Kurono) processes virtqueue entries and returns results. The standard VirtIO 1.0 transport over MMIO or PCI is used.
+Devices talk to the guest driver over descriptor rings (virtqueues). The host side
+processes the entries and returns results. Standard VirtIO 1.0 transport over MMIO or PCI.
 
-## 4. Related files
+## Files
 
-- `src/virt/vmexit.cpp` - I/O dispatch into this module
-- `src/virt/vdisk.cpp` - block device backend
-- `src/virt/vserial.cpp` - serial backend (Conduit terminal)
-- `src/virt/v9fs.cpp` - filesystem sharing backend
-- `src/linux/linux_netbridge.cpp` - NIC bridge
+- `src/virt/vmexit.cpp` I/O dispatch into this module
+- `src/virt/vdisk.cpp` block device backend
+- `src/virt/vserial.cpp` serial backend, the Conduit terminal
+- `src/virt/v9fs.cpp` filesystem sharing backend
+- `src/linux/linux_netbridge.cpp` NIC bridge

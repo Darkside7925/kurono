@@ -1,70 +1,33 @@
-# Project Tour
+# Project tour
 
-This document is the friendly source tree walk.
+Where things live.
 
-## 1. Top level
+## Repo root
 
-At the repository root, the files that matter most to a newcomer are these.
+What you actually need:
 
 1. `README.md`
 2. `STATUS.md`
-3. `start.sh` (Linux/KVM launcher - the path used day to day) / `start.ps1` (Windows/WHPX)
+3. `start.sh` (Linux/KVM, what I use) and `start.ps1` (Windows/WHPX)
 4. `docs/`
 5. `src/`
 
-## 2. The source tree at a glance
+## What each `src/` folder owns
 
-### `src/boot`
+- `src/boot` gets the machine into a sane execution state
+- `src/kernel` boot order, crash handling, core types, time, low-level memory
+- `src/hal` interrupts, reboot, the low-level CPU and PIC surface
+- `src/drivers` hardware
+- `src/ui` desktop shell, window system, in-kernel Wayland compositor
+- `src/apps` the built-in programs
+- `src/shell` command parsing and routing
+- `src/fs` the virtual filesystem model
+- `src/net` the TCP/IP stack
+- `src/linux` the Linux personality
+- `src/virt` hypervisor and virtual machines
+- `src/system` glue: input manager, installer logic, runtime logging
 
-This folder gets the machine into the right execution state.
-
-### `src/kernel`
-
-This folder owns boot order, crash handling, core types, time, and low level memory helpers.
-
-### `src/hal`
-
-This folder owns interrupts, reboot, and the low level CPU and PIC facing surface.
-
-### `src/drivers`
-
-This folder owns hardware.
-
-### `src/ui`
-
-This folder owns the desktop shell, window system, and the in-kernel Wayland compositor.
-
-### `src/apps`
-
-This folder owns the built in programs.
-
-### `src/shell`
-
-This folder owns command parsing and command execution routing.
-
-### `src/fs`
-
-This folder owns the virtual filesystem model.
-
-### `src/net`
-
-This folder owns the TCP IP stack.
-
-### `src/linux`
-
-This folder owns the Linux style subsystem inside Kurono.
-
-### `src/virt`
-
-This folder owns the hypervisor and virtual machines.
-
-### `src/system`
-
-This folder owns glue services such as input management, installer logic, and runtime logging.
-
-## 3. The files most people actually live in
-
-For a lot of work, the real center of gravity is this smaller set.
+## Files people actually live in
 
 1. `src/kernel/kurono_kernel.cpp`
 2. `src/kernel/panic.cpp`
@@ -79,9 +42,7 @@ For a lot of work, the real center of gravity is this smaller set.
 11. `src/virt/hypervisor.cpp`
 12. `src/linux/linux_syscall.cpp`
 
-## 4. If the goal is desktop work
-
-Read these first.
+## Desktop work
 
 1. `src/ui/desktop.cpp`
 2. `src/ui/window_manager.cpp`
@@ -90,9 +51,7 @@ Read these first.
 5. `src/apps/settings.cpp`
 6. `src/system/input_manager.cpp`
 
-## 5. If the goal is shell work
-
-Read these first.
+## Shell work
 
 1. `src/shell/shell.cpp`
 2. `src/shell/linux_cmds.cpp`
@@ -100,9 +59,7 @@ Read these first.
 4. `src/kcl/kcl.cpp`
 5. `src/system/installer.cpp`
 
-## 6. If the goal is boot or hardware work
-
-Read these first.
+## Boot or hardware work
 
 1. `src/boot/kurono_boot.asm`
 2. `src/kernel/kurono_kernel.cpp`
@@ -111,9 +68,7 @@ Read these first.
 5. `src/drivers/display.cpp`
 6. `src/drivers/graphics.cpp`
 
-## 7. If the goal is virtualization work
-
-Read these first.
+## Virtualization work
 
 1. `src/virt/hypervisor.cpp`
 2. `src/virt/vmm.cpp`
@@ -121,9 +76,7 @@ Read these first.
 4. `src/virt/vdevices.cpp`
 5. `src/virt/linux_boot.cpp`
 
-## 8. If the goal is storage or installation work
-
-Read these first.
+## Storage or installer work
 
 1. `src/system/installer.cpp`
 2. `src/fs/vfs.cpp`
@@ -132,10 +85,8 @@ Read these first.
 5. `src/linux/ext4.cpp`
 6. `src/drivers/nvme.cpp`
 
-## 9. The project personality
+## Not a toy
 
-Kurono is not pretending to be a tiny teaching kernel anymore.
-
-It behaves more like an operating system laboratory where the desktop, shell, driver, installer, Linux personality, and hypervisor all coexist in one codebase.
-
-That is why the docs are split by routes and audience instead of by one linear manual.
+Stopped being a teaching kernel a while back. It's an OS lab: desktop, shell,
+drivers, installer, Linux personality and hypervisor all in one tree. That's why the
+docs are split by route instead of being one manual.

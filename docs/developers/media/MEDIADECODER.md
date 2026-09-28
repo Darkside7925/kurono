@@ -1,45 +1,42 @@
-# Media Decoder
+# Media decoder
 
-`src/media/mediadecoder.cpp` and `mediadecoder.h` implement image and media decoding for the Kurono UI.
+`src/media/mediadecoder.cpp` and `mediadecoder.h`. Image and media decoding for the UI.
 
-## 1. What it decodes
+Decodes PNG (wallpapers, icons, the media player's image view), JPEG and BMP, and passes raw
+pixel buffers straight through. Output is a `MediaDecoder::Image` with width, height and a
+`uint32_t*` pixel buffer in `0xAARRGGBB`.
 
-The media decoder handles:
+## In the UI
 
-- **PNG** images - decoded for wallpapers, icons, and the media player image display
-- **JPEG** images - decoded for photo viewing
-- **BMP** images - simple uncompressed format support
-- **Raw pixel buffers** - pass-through for pre-decoded data
+Wallpaper:
 
-The decoded result is a `MediaDecoder::Image` struct containing width, height, and a `uint32_t*` pixel buffer in `0xAARRGGBB` format.
-
-## 2. Usage in the UI
-
-Desktop wallpaper:
 ```cpp
 MediaDecoder::Image img = MediaDecoder::DecodeFile(path);
 Desktop::SetWallpaperImage(img);
 ```
 
-The desktop caches the decoded pixel data and blits it as the background each frame.
+The desktop caches the decoded pixels and blits them as the background each frame. The media
+player uses the same decoder for album art and images in its playlist.
 
-The media player app also uses the decoder to show embedded album art and image files in its playlist.
+## Codec registry
 
-## 3. Codec registry
+`src/media/codec.cpp` holds the registry. The decoder picks a codec by file extension or
+magic bytes. Adding a format means adding a registry entry.
 
-`src/media/codec.cpp` maintains a registry of available codecs. The decoder queries the registry by file extension or magic bytes to select the right decoder. Adding support for a new format means registering a new codec entry.
+## MP3
 
-## 4. MP3 decoding
+`src/media/mp3_decoder.cpp` is separate from image decoding. It reads MP3 frames, decodes
+them to PCM and hands the output to the audio driver. A lightweight fixed-point decoder,
+aimed at embedded use.
 
-`src/media/mp3_decoder.cpp` handles MP3 audio decoding (separate from image decoding). It reads MP3 frames, decodes them to PCM, and feeds the output to the audio driver. The implementation is a lightweight fixed-point decoder suited to embedded use.
+## Third party
 
-## 5. Third-party components
+`src/third_party` holds glue around the embedded public-domain decoders (stb_image and
+friends). Header-only or minimal builds.
 
-`src/third_party` contains glue around embedded third-party libraries used by the decoder (likely `stb_image` or equivalent public domain decoders). These are headeronly or minimal builds.
+## Files
 
-## 6. Related files
-
-- `src/ui/desktop.cpp` - `SetWallpaperImage()` consumer
-- `src/apps/media_player.cpp` - audio and image display consumer
-- `src/media/mp3_decoder.cpp` - audio decode companion
-- `src/drivers/audio.cpp` - PCM output from MP3 decode
+- `src/ui/desktop.cpp` the `SetWallpaperImage()` consumer
+- `src/apps/media_player.cpp` audio and image consumer
+- `src/media/mp3_decoder.cpp` audio decode companion
+- `src/drivers/audio.cpp` where the PCM ends up

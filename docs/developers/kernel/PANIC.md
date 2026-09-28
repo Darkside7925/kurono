@@ -1,49 +1,48 @@
-# Panic and Crash Screen
+# Panic and the crash screen
 
-`src/kernel/panic.cpp` and `panic.h` implement the crash handler that runs when the kernel detects an unrecoverable error.
+`src/kernel/panic.cpp` and `panic.h`. What runs when the kernel hits a state it can't
+continue from: an exception with no handler, a null pointer in a critical path, a
+failed assert.
 
-## 1. Purpose
+The panic path stops the current context, draws a crash screen, optionally puts the
+fault on serial, then halts or triggers a timed reboot.
 
-When the kernel hits a state it cannot continue from - a CPU exception with no handler, a null pointer in a critical path, an assert failure - it calls the panic path. The panic path:
+## It comes up early
 
-1. Stops the current execution context.
-2. Draws a crash screen to the framebuffer.
-3. Optionally logs the fault to the serial port.
-4. Halts the CPU or triggers a timed reboot.
+Panic init runs before the full display stack. Deliberate. If the graphics driver dies
+later in boot, panic already has the framebuffer address from the bootloader's GOP or
+linear framebuffer handoff, so it can still draw a screen with the driver broken.
 
-## 2. Early initialization
+That ordering is one of the more load-bearing decisions in the boot sequence. Don't
+move panic init later without knowing why it sits there.
 
-The panic system is initialized *before* the main display stack is fully online. This is deliberate. If the graphics driver fails later during boot, the panic code already has the framebuffer address from the bootloader's GOP or linear framebuffer handoff. It can still render a crash screen even when the driver is broken.
+## What goes on the screen
 
-This is one of the more important design decisions in the boot order. Do not move panic initialization later without understanding this dependency.
+- a coloured header with "KURONO PANIC" or similar
+- the fault type or assert message
+- register state, if the fault came out of an exception handler
+- a pointer to the serial log for detail
 
-## 3. Panic screen content
+## VGA fallback
 
-The crash screen typically shows:
+If even the framebuffer path is unavailable, panic falls back to VGA text mode. That
+covers boot dying before any graphics existed.
 
-- A colored header bar with a message ("KURONO PANIC" or similar).
-- The fault type or assertion message.
-- Register state if the fault came from a CPU exception handler.
-- A suggestion to check the serial log for more detail.
+## Reset
 
-## 4. VGA fallback
+After the screen, panic waits a moment then either halts or resets through the 8042 or
+the ACPI reset register. Which one is adjustable in the source.
 
-If even the framebuffer path is unavailable, the panic path has a VGA text-mode fallback. This handles the case where boot fails before any graphics is established.
+## When it breaks
 
-## 5. Hard reboot path
-
-After displaying the crash screen, the panic path waits briefly and then either halts or triggers a hardware reset through the 8042 or the ACPI reset register. The behavior can be adjusted in the panic source.
-
-## 6. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Crash screen is black or garbled | Framebuffer address wrong at panic init time |
-| No crash screen at all | Panic init ran before display or VGA not available |
-| Reboot loop after crash | Hard reboot triggered before the user can read the screen |
+| crash screen black or garbled | framebuffer address was wrong at panic init |
+| no crash screen at all | panic init ran before display, or there's no VGA |
+| reboot loop | the reset fired before anyone could read the screen |
 
-## 7. Related files
+## Files
 
-- `src/kernel/kurono_kernel.cpp` - early panic init placement
-- `src/hal/hal.cpp` - CPU exception handlers that feed into panic
-- `src/drivers/display.cpp` - framebuffer setup that panic depends on
+- `src/kernel/kurono_kernel.cpp` where panic init sits in the boot order
+- `src/hal/hal.cpp` exception handlers that feed into panic
+- `src/drivers/display.cpp` the framebuffer setup panic depends on

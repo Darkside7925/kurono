@@ -1,44 +1,41 @@
 # Conduit
 
-`src/system/conduit.cpp` and `src/system/conduit.h` implement Conduit. (Note:
-Conduit lives entirely under `src/system/` - there is no `src/apps/conduit.*`.)
+`src/system/conduit.cpp` and `conduit.h`. Note it lives in `src/system/`, there is no
+`src/apps/conduit.*`.
 
-## 1. What Conduit is
+Conduit is an event and telemetry bridge (`ConduitBridge`) plus the GUI viewer that
+shows the events. Not a guest terminal. It watches the live system and surfaces a
+running dialogue: boot and shutdown, package operations, GPU rendering, guest-OS
+switches, driver activity, plain shell commands.
 
-Conduit is an **event / telemetry bridge** (`ConduitBridge`) plus the GUI viewer
-that displays its events. It is not a guest terminal - it observes the live
-system and surfaces a running dialogue of what's happening: boot/shutdown,
-package operations, GPU rendering, guest-OS switches, driver activity, and
-generic shell commands.
+## Event model
 
-## 2. The event model
+`ConduitBridge` keeps a fixed ring of `ConduitEvent` records (`CONDUIT_MAX_EVENTS`).
+Each has a sequence number, a `ConduitEventType`, the Linux guest profile it relates
+to, and a short summary and detail.
 
-`ConduitBridge` keeps a fixed ring of `ConduitEvent` records (`CONDUIT_MAX_EVENTS`),
-each with a sequence number, a `ConduitEventType`, the relevant Linux guest
-profile, and a short summary/detail. The event types (`ConduitEventType` in
-`conduit.h`) are:
+Event types (`ConduitEventType` in `conduit.h`): `SYSTEM_BOOT`, `BOOT_SEQUENCE`,
+`SHUTDOWN`, `PACKAGE_INSTALL`, `PACKAGE_UPDATE`, `PACKAGE_REMOVE`, `GPU_RENDER`,
+`WIFI_DRIVER`, `AUDIO_DRIVER`, `RAM_WARNING`, `NVIDIA_FAULT`, `GUEST_SWITCH`,
+`GENERIC_COMMAND`.
 
-`SYSTEM_BOOT`, `BOOT_SEQUENCE`, `SHUTDOWN`, `PACKAGE_INSTALL`, `PACKAGE_UPDATE`,
-`PACKAGE_REMOVE`, `GPU_RENDER`, `WIFI_DRIVER`, `AUDIO_DRIVER`, `RAM_WARNING`,
-`NVIDIA_FAULT`, `GUEST_SWITCH`, and `GENERIC_COMMAND`.
-
-## 3. API
+## API
 
 | Function | Role |
 | --- | --- |
-| `ConduitBridge::Init()` | initialize the ring; push the first boot event |
-| `PollSystemState()` | sample live system state (guest boot status, etc.) and emit change events |
-| `RecordCommand(cmdline)` | classify a shell command (`classify_command`) and record it as an event |
-| `Consume(after_seq, out, max)` | pull events newer than a sequence number (the viewer's read path) |
-| `GetLatestSeq()` | the most recent sequence number |
+| `ConduitBridge::Init()` | set up the ring, push the first boot event |
+| `PollSystemState()` | sample live state (guest boot status and so on), emit change events |
+| `RecordCommand(cmdline)` | classify a shell command with `classify_command`, record it |
+| `Consume(after_seq, out, max)` | pull events newer than a sequence number, the viewer's read path |
+| `GetLatestSeq()` | latest sequence number |
 
-`classify_command` inspects a command line and maps it onto an event type (e.g.
-`kpkg`/`apt` → a package event, GPU commands → `GPU_RENDER`, a guest launch →
-`GUEST_SWITCH`).
+`classify_command` reads a command line and maps it to an event type. `kpkg` and `apt`
+become package events, GPU commands become `GPU_RENDER`, a guest launch becomes
+`GUEST_SWITCH`.
 
-## 4. Related files
+## Files
 
-- `src/system/conduit.cpp` / `.h` - `ConduitBridge` event ring + classifier
-- `src/virt/hypervisor.cpp` - guest boot state polled for `GUEST_SWITCH` events
-- `src/packages/pkgmgr.cpp` - package operations that produce package events
-- `src/shell/shell.cpp` - calls `RecordCommand` to log executed commands
+- `src/system/conduit.cpp` / `.h` the `ConduitBridge` ring and classifier
+- `src/virt/hypervisor.cpp` guest boot state, polled for `GUEST_SWITCH`
+- `src/packages/pkgmgr.cpp` package operations that raise events
+- `src/shell/shell.cpp` calls `RecordCommand` for executed commands

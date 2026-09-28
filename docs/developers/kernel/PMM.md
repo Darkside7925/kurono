@@ -1,39 +1,40 @@
-# Physical Memory Manager
+# PMM
 
-`src/kernel/pmm.cpp` and `pmm.h` implement the physical memory allocator that underpins everything in Kurono that needs RAM.
+`src/kernel/pmm.cpp` and `pmm.h`. Physical frame allocator. Tracks which page
+frames are free and hands them out. Everything above it needs it: the heap, the
+VMM, any DMA driver.
 
-## 1. What it does
+## Init
 
-The PMM tracks which physical page frames are available and hands them out on demand. It is the lowest layer of the memory system. Nothing in the heap, VMM, or any allocating driver works without a functioning PMM.
+Right after HAL bring-up in `kurono_kernel.cpp`. Reads the Multiboot memory map,
+builds a free-page bitmap (or list) over the usable RAM. The kernel image, the
+Multiboot info region and anything else the bootloader marked reserved get excluded
+first.
 
-## 2. Initialization
+## Interface
 
-The PMM is initialized in `kurono_kernel.cpp` immediately after HAL bring-up. It reads the Multiboot memory map to identify usable RAM regions and constructs a free-page bitmap or list over them.
+Alloc and free physical pages. You get a physical address back, and you map it
+yourself before you touch it.
 
-The kernel image itself, the Multiboot info region, and any reserved areas described by the bootloader are excluded from usable memory before the allocator opens for business.
+It does not zero pages. Want zeroed memory? Do it yourself or go through the heap.
 
-## 3. Interface
+## Constraints
 
-The PMM exposes allocation and freeing of physical pages. Callers receive a physical address and are responsible for mapping that page into a virtual address space before accessing it.
+- no virtual memory dependency. Physical addresses only, because the VMM depends on
+  it.
+- no heap dependency. Its own structures live in physical memory reserved at init.
+- has to be up before any DMA driver, or anything that allocates.
 
-The PMM does not zero pages before returning them. If a caller needs zeroed memory it must do so itself or use the heap allocator, which adds that layer.
+## When it breaks
 
-## 4. Design constraints
-
-- No virtual memory dependency. The PMM must work with only physical addresses because VMM depends on it.
-- No heap dependency. The PMM's own data structures are placed in a region of physical memory reserved at initialization time.
-- Must be initialized before any device driver that does DMA or any kernel structure that needs dynamic memory.
-
-## 5. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Heap allocation fails at boot | PMM did not reserve enough pages or Multiboot map was wrong |
-| Crash when a driver init runs | Driver called heap/PMM before kernel memory is ready |
-| Physical address conflicts | PMM region exclusion logic missed a reserved area |
+| heap alloc fails at boot | not enough reserved pages, or a bad Multiboot map |
+| crash in driver init | driver asked for memory before kernel memory was ready |
+| physical address conflicts | exclusion logic missed a reserved area |
 
-## 6. Related files
+## Files
 
-- `src/kernel/heap.cpp` - heap built on top of PMM
-- `src/kernel/vmm.cpp` - virtual address mapping that uses PMM pages
-- `src/kernel/kurono_kernel.cpp` - initialization order
+- `src/kernel/heap.cpp` the heap on top of this
+- `src/kernel/vmm.cpp` maps the pages this hands out
+- `src/kernel/kurono_kernel.cpp` init order

@@ -1,37 +1,36 @@
-# Timer Driver
+# Timer (PIT)
 
-`src/drivers/timer.cpp` and `timer.h` control the x86 PIT (Programmable Interval Timer).
+`src/drivers/timer.cpp` and `timer.h`. The 8253/8254 PIT.
 
-## 1. What it does
+Channel 0, fixed rate (100 to 1000 Hz). Every interrupt bumps the kernel tick counter
+and `time.cpp` turns ticks into milliseconds.
 
-The timer driver programs Channel 0 of the 8253/8254 PIT to fire at a fixed rate (typically 100 - 1000 Hz). Each interrupt advances the kernel tick counter. The time module converts those ticks to milliseconds.
+## Init
 
-## 2. Initialization
+After the HAL has the IDT up. Three steps:
 
-Timer initialization happens after HAL sets up the IDT. The driver:
+1. work out the reload value from the frequency and the PIT's 1.193182 MHz input
+2. write it to channel 0
+3. register the IRQ 0 handler with the HAL
 
-1. Calculates the reload value from the desired frequency and the PIT's 1.193182 MHz input clock.
-2. Writes the reload value to the PIT's channel 0 registers.
-3. Registers the IRQ 0 handler with the HAL.
+Then IRQ 0 fires at that rate and the handler advances the tick counter.
 
-After init, IRQ 0 fires at the programmed rate and the handler increments the tick counter.
+## Who uses it
 
-## 3. Used by
+- `src/kernel/time.cpp` for elapsed time
+- `src/proc/scheduler.cpp` for preemption on tick boundaries
+- the main loop, for frame pacing
 
-- `src/kernel/time.cpp` - consumes the tick counter for elapsed time
-- `src/proc/scheduler.cpp` - preemption based on tick boundary
-- Main loop - advances frame timing
+## When it breaks
 
-## 4. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Time runs too fast or slow | Reload value calculated wrong for chosen frequency |
-| No timer ticks | IRQ 0 not registered or PIT ports not accessible |
-| Scheduler not preempting | Timer IRQ not reaching the scheduler callback |
+| time runs fast or slow | reload value miscalculated for the frequency |
+| no ticks at all | IRQ 0 not registered, or the PIT ports aren't reachable |
+| scheduler never preempts | the timer IRQ isn't reaching the scheduler callback |
 
-## 5. Related files
+## Files
 
-- `src/hal/hal.cpp` - IRQ 0 registration
-- `src/kernel/time.cpp` - client of the tick counter
-- `src/proc/scheduler.cpp` - preemption client
+- `src/hal/hal.cpp` IRQ 0 registration
+- `src/kernel/time.cpp` tick consumer
+- `src/proc/scheduler.cpp` preemption consumer

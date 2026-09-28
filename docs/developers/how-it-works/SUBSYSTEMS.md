@@ -1,315 +1,247 @@
 # Subsystems
 
-This document describes the live subsystems in the repository and the job each one performs.
+What's in the tree and what each piece does.
 
-## 1. Boot
+## Boot (`src/boot`)
 
-Folder: `src/boot`
-
-Purpose: enter the kernel correctly, define the image layout, and bridge bootloader state into the runtime.
-
-Important files:
+Get into the kernel correctly, define the image layout, bridge bootloader state into the runtime.
 
 | File | Role |
 | --- | --- |
-| `efi_loader.c` | Standalone EFI loader path |
-| `kurono_boot.asm` | Early assembly entry and setup |
+| `efi_loader.c` | standalone EFI loader path |
+| `kurono_boot.asm` | early assembly entry and setup |
 | `multiboot_header.S` | Multiboot contract |
-| `kurono_linker.ld` | Kernel image layout |
+| `kurono_linker.ld` | kernel image layout |
 
-## 2. Kernel core
+## Kernel core (`src/kernel`)
 
-Folder: `src/kernel`
-
-Purpose: own boot sequencing, panic flow, low level types, time, memory helpers, PCI discovery helpers, and system level coordination.
-
-Important files:
+Boot sequencing, panic flow, low-level types, time, memory helpers, PCI discovery helpers, system
+coordination.
 
 | File | Role |
 | --- | --- |
-| `kurono_kernel.cpp` | High level boot sequence and main loop |
-| `panic.cpp` | BSOD path, crash screen rendering, reboot path |
-| `time.cpp` | timekeeping and calendar functions |
+| `kurono_kernel.cpp` | high-level boot sequence and main loop |
+| `panic.cpp` | BSOD path, crash screen, reboot |
+| `time.cpp` | timekeeping and calendar |
 | `types.*` | foundational types |
-| `system.*` | core system helper layer |
-| `pmm.cpp` | physical memory management |
-| `vmm.cpp` | virtual memory management support |
+| `system.*` | core system helpers |
+| `pmm.cpp` | physical memory |
+| `vmm.cpp` | virtual memory support |
 | `heap.cpp` | heap allocator |
 | `multiboot.h` | boot structure contract |
 | `pci.h` | PCI probing helpers |
 
-## 3. HAL
+## HAL (`src/hal`)
 
-Folder: `src/hal`
-
-Purpose: low level interrupt setup, port I/O, reboot, PIC handling, and exception dispatch.
-
-The HAL is where the CPU meets the operating system policy.
-
-Important files:
+Low-level interrupt setup, port I/O, reboot, PIC handling, exception dispatch. This is where the CPU
+meets OS policy.
 
 | File | Role |
 | --- | --- |
 | `hal.cpp` | IDT, PIC, exception route, reboot route |
-| `isr_stubs.asm` in build chain | assembly stubs feeding the C handler |
+| `isr_stubs.asm` | assembly stubs feeding the C handler |
 
-## 4. Drivers
+## Drivers (`src/drivers`)
 
-Folder: `src/drivers`
+Real and virtual devices. Broad, because the project covers framebuffer graphics, audio, storage,
+USB, NICs, GPUs, serial, timer, RTC and input.
 
-Purpose: talk to real or virtual devices.
+### Display and graphics
 
-This folder is broad because the project covers framebuffer graphics, audio, storage, USB, NICs, GPUs, serial, timer, RTC, and input.
+`display.*`, `graphics.*`, `bga.*`, `display_mgr.*`, `virtio_gpu.*`, `gpu_probe.*`, `intel_gpu.*`,
+`nvidia_gpu.*`, `amd_gpu.*`. Framebuffer primitives, mode handling, display detection, GPU probing,
+vendor paths.
 
-The main driver groups are these.
+`gpu_probe` scans PCI for class 0x03 devices, identifies vendors, classifies hybrid topologies
+(Optimus, PowerXpress), and validates framebuffer addresses on Optimus laptops by reading Intel
+DSPSURF registers.
 
-### 4.1 Display and graphics
+`display_mgr` is the multi-backend layer: BGA, VirtIO GPU, Intel, NVIDIA or AMD based on the probe
+results, with 10 predefined modes, runtime switching, EDID reading, DPI scaling, gamma/brightness
+and VSync.
 
-`display.*`, `graphics.*`, `bga.*`, `display_mgr.*`, `virtio_gpu.*`, `gpu_probe.*`, `intel_gpu.*`, `nvidia_gpu.*`, `amd_gpu.*`
+`graphics` has the drawing primitives with double/triple buffering, SSE2 non-temporal store swaps,
+write-combining remap, dirty region tracking, frame pacing, blend modes and accessibility colour
+filters.
 
-These files own framebuffer primitives, mode handling, display detection, GPU probing, and hardware specific paths.
+### Input
 
-GPU probe scans the PCI bus for class 0x03 devices, identifies vendors, classifies hybrid topologies (Optimus, PowerXpress), and validates framebuffer addresses on Optimus laptops by reading Intel DSPSURF registers.
+`keyboard.*`, `mouse.*`, `usb.*`. PS/2 keyboard, PS/2 mouse and touchpad-style packet handling, USB
+controller support.
 
-Display manager provides a multi-backend abstraction that routes to BGA, VirtIO GPU, Intel, NVIDIA, or AMD based on GPU probe results. It exposes 10 predefined modes, runtime mode switching, EDID reading, DPI scaling, gamma/brightness, and VSync control.
+### Time and platform
 
-Graphics provides the framebuffer drawing primitives with double/triple buffering, SSE2 non-temporal store swaps, write-combining remap, dirty region tracking, frame pacing, blend modes, and accessibility color filters.
+`timer.*`, `rtc.*`, `serial.*`, `cpu_detect.*`. Periodic timing, wall clock reads, serial logging,
+CPUID feature reporting.
 
-### 4.2 Input
+### Storage and network
 
-`keyboard.*`, `mouse.*`, `usb.*`
+`nvme.*`, `e1000.*`. Disk and NIC transport, with the installer and the higher network stack sitting
+on top.
 
-These files own PS/2 keyboard handling, PS/2 mouse and touchpad style packet handling, and USB controller support.
+### Audio
 
-### 4.3 Time and platform support
+`audio.*`, `ac97.*`, `hda.*`. Tone generation, DMA playback routes, controller-specific logic.
 
-`timer.*`, `rtc.*`, `serial.*`, `cpu_detect.*`
+## UI (`src/ui`)
 
-These files own periodic timing, wall clock reads, serial logging, and CPUID feature reporting.
-
-### 4.4 Storage and network
-
-`nvme.*`, `e1000.*`
-
-These files own disk transport and NIC transport. Installer code and higher network stack code sit on top of them.
-
-### 4.5 Audio
-
-`audio.*`, `ac97.*`, `hda.*`
-
-These files own tone generation, DMA playback routes, and controller specific audio logic.
-
-## 5. UI
-
-Folder: `src/ui`
-
-Purpose: render the desktop shell and route user interaction at the presentation layer.
-
-Important files:
+Desktop shell and interaction routing at the presentation layer.
 
 | File | Role |
 | --- | --- |
 | `desktop.cpp` | taskbar, desktop icons, launcher flow, input entry point |
 | `window_manager.cpp` | window lifetime, focus, drag, resize, render ordering |
-| `gui.cpp` | lower level drawing and layout helpers |
-| `font.cpp`, `text_layout.cpp` | text rendering support |
+| `gui.cpp` | lower-level drawing and layout helpers |
+| `font.cpp`, `text_layout.cpp` | text rendering |
 | `lockscreen.cpp` | lock screen flow |
-| `file_browser.cpp` | browser style UI support |
+| `file_browser.cpp` | browser-style UI support |
 | `ui_elements.cpp` | reusable UI drawing pieces |
 
-## 6. Applications
+## Apps (`src/apps`)
 
-Folder: `src/apps`
-
-Purpose: built in desktop programs.
-
-Current application set:
+The built-in desktop programs.
 
 | File pair | Role |
 | --- | --- |
 | `terminal.*` | shell host window |
 | `file_manager.*` | filesystem browser |
-| `calculator.*` | calculator UI |
+| `calculator.*` | calculator |
 | `text_editor.*` | editor window |
 | `settings.*` | settings and resolution flow |
 | `task_manager.*` | process and system inspection |
-| `browser.*` | browser placeholder and shell |
-| `media_player.*` | media viewing and playback surface |
-| `conduit.*` | special system application and VM facing UX |
+| `browser.*` | browser placeholder |
+| `media_player.*` | media viewing and playback |
+| `conduit.*` | system app and VM-facing UX |
 
-## 7. Shell
+## Shell (`src/shell`)
 
-Folder: `src/shell`
-
-Purpose: parse commands, manage command registration, resolve conflicts, switch environments, and route execution to the right subsystem or guest backend.
-
-Important files:
+Parse commands, manage registration, resolve conflicts, switch environments, and route execution to
+the right subsystem or guest backend.
 
 | File | Role |
 | --- | --- |
-| `shell.cpp` | parser, registry, command execution, pipe logic |
-| `linux_cmds.cpp` | Linux style commands |
-| `windows_cmds.cpp` | Windows style commands |
+| `shell.cpp` | parser, registry, execution, pipe logic |
+| `linux_cmds.cpp` | Linux-style commands |
+| `windows_cmds.cpp` | Windows-style commands |
 
-## 8. Filesystems
+## Filesystems (`src/fs` plus parts of `src/system`)
 
-Folders: `src/fs` and parts of `src/system`
-
-Purpose: expose the in memory runtime filesystem, FAT32 handling, and install target generation.
-
-Important files:
+The in-memory runtime filesystem, FAT32 handling, install target generation.
 
 | File | Role |
 | --- | --- |
 | `vfs.*` | generic virtual filesystem surface |
-| `kvfs.*` | in memory runtime filesystem |
-| `fat32.*` | ESP facing FAT32 support |
+| `kvfs.*` | in-memory runtime filesystem |
+| `fat32.*` | ESP-facing FAT32 |
 | `linux/ext4.*` | ext4 parsing and install target logic |
 
-## 9. Networking
+## Networking (`src/net`)
 
-Folder: `src/net`
-
-Purpose: provide Ethernet, ARP, IPv4, ICMP, UDP, TCP, sockets, and interface management.
-
-Important files:
+Ethernet, ARP, IPv4, ICMP, UDP, TCP, sockets and interface management.
 
 | File | Role |
 | --- | --- |
 | `network.*` | interface model, socket surface, WiFi facade |
 | `tcpip.*` | protocol machinery and packet work |
 
-## 10. Linux subsystem
+## Linux subsystem (`src/linux`)
 
-Folder: `src/linux`
-
-Purpose: provide a Linux like execution personality inside Kurono itself.
-
-This is not the same thing as booting a guest VM.
-
-Important files:
+A Linux-like execution personality inside Kurono. Not the same thing as booting a guest VM.
 
 | File | Role |
 | --- | --- |
 | `linux_kernel.*` | Linux personality core |
 | `linux_syscall.*` | syscall entry and dispatch |
 | `linux_signals.*` | signal model |
-| `linux_devices.*` | device node behavior |
-| `linux_init.*` | init and service style logic |
+| `linux_devices.*` | device node behaviour |
+| `linux_init.*` | init and service-style logic |
 | `dual_boot.*` | integrated Linux boot coordination |
-| `linux_netbridge.*` | network bridge between worlds |
-| `shared_mount.*` | shared filesystem view logic |
-| `user_bridge.*` | user facing bridge helpers |
+| `linux_netbridge.*` | network bridge between the two worlds |
+| `shared_mount.*` | shared filesystem view |
+| `user_bridge.*` | user-facing bridge helpers |
 | `ext4.*` | ext4 support |
-| `kls.*` | Linux side shell helpers |
+| `kls.*` | Linux-side shell helpers |
 | `linux_drivers.*` | Linux driver integration surface |
 
-## 11. Virtualization
+## Virtualization (`src/virt`)
 
-Folder: `src/virt`
-
-Purpose: own the type 1 hypervisor, VM creation, guest memory, virtual devices, guest boot paths, and VM exit processing.
-
-Important files:
+The type-1 hypervisor, VM creation, guest memory, virtual devices, guest boot and VM exit
+processing.
 
 | File | Role |
 | --- | --- |
-| `hypervisor.*` | top level VM lifecycle manager |
+| `hypervisor.*` | top-level VM lifecycle |
 | `vmm.*` | virtualization hardware abstraction |
-| `ept.*` | EPT and NPT mapping logic |
+| `ept.*` | EPT and NPT mapping |
 | `vmexit.*` | VM exit decode and policy |
 | `vdevices.*` | PIC, APIC, PIT, HPET and other virtual devices |
 | `vserial.*` | virtual COM1 |
 | `vdisk.*` | virtual disk |
 | `guest_mem.*` | guest RAM setup |
 | `linux_boot.*` | guest Linux load path |
-| `iommu.*` | VT d and AMD Vi related work |
-| `v9fs.*` | shared file protocol work |
-| `alpine_data.h`, `debian_data.h` | embedded guest payload data |
+| `iommu.*` | VT-d and AMD-Vi work |
+| `v9fs.*` | shared file protocol |
+| `alpine_data.h`, `debian_data.h` | embedded guest payloads |
 
-## 12. System services
+## System services (`src/system`)
 
-Folder: `src/system`
-
-Purpose: bind subsystems together into usable operating system services.
-
-Important files:
+Binds subsystems together into usable OS services.
 
 | File | Role |
 | --- | --- |
 | `input_manager.*` | input device registration and keyboard callback route |
-| `logging.*` | runtime logging (boot/system/serial/network/security/crash) |
-| `kpaths.h` | the canonical `/kurono` on-disk path layout (single source of truth) |
-| `installer.*` / `installer_gui.*` | disk discovery + deployment planning; graphical setup wizard |
-| `runtime_layout.*` | Linux runtime layout seeder (`/system` tree, firefox.env) |
+| `logging.*` | runtime logging: boot, system, serial, network, security, crash |
+| `kpaths.h` | the canonical `/kurono` on-disk path layout, single source of truth |
+| `installer.*`, `installer_gui.*` | disk discovery and deployment planning, plus the graphical wizard |
+| `runtime_layout.*` | Linux runtime layout seeder, the `/system` tree and firefox.env |
 | `dbus_server.*` | D-Bus session bus daemon |
-| `system_update.*` | boot-time staged-rootfs / update flow |
+| `system_update.*` | boot-time staged rootfs and update flow |
 | `ui_config.*` | `/etc/kurono/ui.conf` theme tokens |
 | `user_mgmt.*` | user data and account services |
-| `conduit.*` | system bridge logic (also the GUI Conduit app) |
+| `conduit.*` | system bridge logic, also the GUI Conduit app |
 
-## 13. Security
+## Security (`src/security`)
 
-Folder: `src/security`
+Privilege management and escalation policy: `supr.*` (the SUPR engine, roles, auth policy, the
+`supr <cmd>` sudo-style reroute) and `ksa.*` (hypervisor-backed authorization prompts in an
+EPT-isolated region, see `security/KSA.md`).
 
-Purpose: privilege management and escalation policy.
+## Packages (`src/packages`)
 
-Files: `supr.*` (the SUPR privilege engine, roles, auth policy, the `supr <cmd>`
-sudo-style reroute) and `ksa.*` (KSA - hypervisor-backed authorization prompts in
-an EPT-isolated region; see `security/KSA.md`).
+The package manager surface: `pkgmgr.*`.
 
-## 14. Packages
+## Scripting (`src/kcl`, `src/apps`)
 
-Folder: `src/packages`
+In-OS scripting languages:
 
-Purpose: package manager surface.
+- `kcl/kcl.*` KCL, the Kurono Command Language, a tree-walking interpreter
+- `apps/kj.*` KJ, Kurono JavaScript, a freestanding JS-subset interpreter exposed as the `kj` and
+  `node` commands, with `kss` and `ui` host bindings
 
-Main file: `pkgmgr.*`
+## Process scheduling (`src/proc`)
 
-## 15. Scripting
+Process objects, queue handling, tick-based progression, execution bookkeeping and multi-core
+bring-up: `scheduler.*` (the cross-core ready-queue lock and per-CPU pick), `smp.*` (LAPIC, MADT
+parse, AP bring-up, per-CPU blocks, see `proc/SMP.md`), `kernel_processes.*` (built-in kernel
+processes), `cgroup.*` (cgroups v2).
 
-Folders: `src/kcl` and `src/apps`
+## Media and third-party glue (`src/media`, `src/third_party`)
 
-Purpose: in-OS scripting languages.
+Image and audio parsing, glue for the embedded decoders, and the media helpers the UI and apps use.
 
-- `kcl/kcl.*` - KCL (Kurono Command Language), a tree-walking interpreter.
-- `apps/kj.*` - KJ (Kurono JavaScript), a freestanding JS-subset interpreter
-  exposed as the `kj` / `node` commands, with `kss`/`ui` host bindings.
+## Tests (`src/tests`)
 
-## 16. Process scheduling
+Boot-time validation and system sanity checks: `test_suite.*`.
 
-Folder: `src/proc`
+## The practical rule
 
-Purpose: process objects, queue handling, tick-based progression, execution
-bookkeeping, and multi-core bring-up.
+Most bugs here are not single-file bugs. They're route bugs crossing at least two layers:
 
-Files: `scheduler.*` (the cross-core ready-queue lock + per-CPU pick), `smp.*`
-(LAPIC, MADT parse, AP bring-up, per-CPU blocks; see `proc/SMP.md`),
-`kernel_processes.*` (built-in kernel processes), `cgroup.*` (cgroups v2).
+1. a display failure usually crosses boot, graphics and panic
+2. an input failure usually crosses kernel boot order, keyboard, mouse and desktop routing
+3. a command failure usually crosses shell registration, subsystem registration during boot, and
+   the target subsystem implementation
+4. a VM boot failure usually crosses shell command plumbing, hypervisor lifecycle, guest memory,
+   VMCS or VMCB setup, and virtual devices
 
-## 17. Media and third party glue
-
-Folders: `src/media` and `src/third_party`
-
-Purpose: image and audio parsing, glue code for embedded third party decoders, and media side helpers consumed by the UI and apps.
-
-## 18. Tests
-
-Folder: `src/tests`
-
-Purpose: boot time validation and system sanity checks.
-
-Main file: `test_suite.*`
-
-## 19. The practical subsystem rule
-
-Most bugs in Kurono are not single file bugs. They are route bugs crossing at least two layers.
-
-Typical examples are these.
-
-1. A display failure often crosses boot, graphics, and panic.
-2. An input failure often crosses kernel boot order, keyboard, mouse, and desktop routing.
-3. A command failure often crosses shell registration, subsystem registration during boot, and the target subsystem implementation.
-4. A VM boot failure often crosses shell command plumbing, hypervisor lifecycle, guest memory, VMCS or VMCB setup, and virtual devices.
-
-That is why the routing documents matter as much as the folder map.
+That's why the routing docs matter as much as the folder map.
