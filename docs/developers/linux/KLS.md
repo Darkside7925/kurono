@@ -1,23 +1,21 @@
-# KLS - Kurono Linux Shell
+# KLS
 
-`src/linux/kls.cpp` and `kls.h` implement the Linux compatibility personality layer that makes Kurono's shell feel like a real Debian 13 Trixie system.
+`src/linux/kls.cpp` and `kls.h`. The Linux personality layer that makes the Kurono shell look
+like a Debian 13 Trixie box.
 
-## 1. What it does
+It supplies the detailed Linux-alike data on top of the basic shell commands:
 
-KLS (Kurono Linux Shell) provides the detailed Linux-alike data layer. It supplements the basic shell commands with realistic system information that matches a Debian 13 Trixie installation:
-
-- A full package database of 30+ packages with Trixie-era versions
-- Kernel version string: `6.12.0-kurono`
-- `uname -a` output matching current Trixie
-- `/etc/os-release` content with `VERSION_ID=13` and `VERSION_CODENAME=trixie`
+- a package database of 30+ packages with Trixie-era versions
+- kernel string `6.12.0-kurono`
+- `uname -a` output that matches current Trixie
+- `/etc/os-release` with `VERSION_ID=13` and `VERSION_CODENAME=trixie`
 - `lsb_release -a` output
 - `/proc/version` and `/proc/cpuinfo` generation
-- `dpkg -l` package listing
-- `dpkg --get-selections` output
+- `dpkg -l` and `dpkg --get-selections` output
 
-## 2. Package version accuracy
+## Package versions
 
-All package versions in KLS were updated to Debian 13 Trixie (released 2025/2026) equivalents:
+All updated to Debian 13 Trixie equivalents:
 
 | Package | Version |
 | --- | --- |
@@ -35,16 +33,17 @@ All package versions in KLS were updated to Debian 13 Trixie (released 2025/2026
 
 The full list is in `kls.cpp`.
 
-## 3. `GetKernelVersion()`
+## GetKernelVersion()
 
-Returns `"6.12.0-kurono"` - the version string used in `uname` output and displayed in the About section of Settings.
+Returns `"6.12.0-kurono"`. That's the string in `uname` output and in Settings, About.
 
-## 4. Virtual file generation
+## Virtual files
 
-KLS generates virtual `/proc` and `/etc` files dynamically. `cat /proc/cpuinfo` returns text derived from the live `CPUDetect` results. `cat /etc/os-release` returns Trixie-accurate content.
+KLS generates the `/proc` and `/etc` files dynamically. `cat /proc/cpuinfo` is built from live
+`CPUDetect` results, and `cat /etc/os-release` returns Trixie-accurate content.
 
-## 5. Related files
+## Files
 
-- `src/linux/linux_kernel.cpp` - calls into KLS for syscall-level Linux personality
-- `src/apps/settings.cpp` - displays the kernel version from `GetKernelVersion()`
-- `src/packages/pkgmgr.cpp` - uses the package database from KLS
+- `src/linux/linux_kernel.cpp` calls into KLS for syscall-level Linux personality
+- `src/apps/settings.cpp` shows the kernel version from `GetKernelVersion()`
+- `src/packages/pkgmgr.cpp` uses the package database from KLS

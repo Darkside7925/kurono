@@ -1,33 +1,37 @@
-# Heap Allocator
+# Kernel heap
 
-`src/kernel/heap.cpp` and `heap.h` implement the kernel heap that provides `malloc`/`free` style dynamic allocation throughout Kurono.
+`src/kernel/heap.cpp` and `heap.h`. This is malloc/free for kernel C++ code, so it
+sits behind `new`/`delete` and every runtime-sized allocation. It's sandwiched
+between the PMM (raw pages) and everything above.
 
-## 1. Role
+## Init
 
-The heap is the memory layer that all kernel C++ code uses when it calls `new`, `delete`, or any routine that needs variable-sized allocation at runtime. It sits between the PMM (which gives out raw pages) and all higher-level code.
+After the PMM, in `kurono_kernel.cpp`. Asks the PMM for a first chunk of pages,
+keeps them in a free list, asks for more when it runs dry. Which means the PMM has
+to still be alive later on.
 
-## 2. Initialization
+## Who uses it
 
-The heap is initialized after PMM in `kurono_kernel.cpp`. It requests an initial region of physical pages from the PMM and manages them internally with a free-list or bookkeeping structure.
+Driver structs that aren't known at compile time. Window manager windows. File
+manager and terminal buffers. Basically every container in the tree.
 
-If the heap runs out of its initial region it can request additional pages from the PMM. The PMM must still be functional at that point.
+## If you find a corruption here
 
-## 3. Usage in the codebase
+The freelist is intrusive: free blocks hold their own list links. So one stray write
+into a freed block wrecks the walk. `heap.cpp` validates every link (`link_ok`,
+SLAB_FREELIST_HARDENED style). If serial prints `Heap: freelist corrupt`, a real
+use-after-free writer is loose. Hunt it. Don't silence it. The big caches (KFS
+bitmap and inode, around 36MB) live in the PMM on purpose, not here.
 
-- Driver data structures that are not known at compile time.
-- Window manager window allocations.
-- File manager and terminal buffers.
-- Any STL-like container used by the OS code.
+## When it breaks
 
-## 4. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Triple fault after heap init | PMM not initialized before heap |
-| `new` returns null | Heap exhausted; increase initial region |
-| Corruption after large alloc | Heap bookkeeping overwritten by caller |
+| triple fault right after heap init | PMM wasn't up before the heap |
+| `new` returns null | heap is exhausted, raise the first region |
+| corruption after a big alloc | caller wrote past its own block |
 
-## 5. Related files
+## Files
 
-- `src/kernel/pmm.cpp` - raw page source for the heap
-- `src/kernel/memory_mgr.h` - higher level memory manager declarations
+- `src/kernel/pmm.cpp` where the pages come from
+- `src/kernel/memory_mgr.h` higher level memory declarations

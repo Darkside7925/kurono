@@ -1,26 +1,23 @@
-# Calculator App
+# Calculator
 
-`src/apps/calculator.cpp` and `calculator.h` implement a desktop calculator.
+`src/apps/calculator.cpp` and `calculator.h`. Keypad plus a small expression
+evaluator.
 
-## 1. What it does
+Does `+`, `-`, `*`, `/`, parentheses, order of operations, decimals, backspace and
+CE/C. Takes keyboard entry as well as button clicks.
 
-The calculator is a simple expression evaluator with a numeric keypad UI. It supports:
+## How it evaluates
 
-- Basic arithmetic: `+`, `-`, `*`, `/`
-- Parentheses and order of operations
-- Decimal input
-- Backspace and clear (CE/C)
-- Keyboard number entry in addition to button clicks
+Input accumulates as a string. Hit `=` and a recursive descent parser evaluates it.
+Results print with up to 10 significant digits.
 
-## 2. Expression evaluation
+## Input
 
-Input is accumulated as a string. When `=` is pressed, the expression string is evaluated by a small recursive descent parser. Results are displayed with up to 10 significant digits.
+Button clicks are hit-tested against the button grid. Keyboard digits and operators
+come through the same key dispatch the terminal uses, in the window manager's input
+routing.
 
-## 3. Input handling
+## Files
 
-Button clicks are hit-tested against the button grid. Keyboard digits and operators are handled by the terminal-style key dispatch path in the window manager's input routing.
-
-## 4. Related files
-
-- `src/ui/gui.cpp` - button rendering
-- `src/ui/desktop.cpp` - `LaunchCalculator()` entry point
+- `src/ui/gui.cpp` button rendering
+- `src/ui/desktop.cpp` `LaunchCalculator()` entry point

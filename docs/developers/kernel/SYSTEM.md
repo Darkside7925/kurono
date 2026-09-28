@@ -1,25 +1,26 @@
-# System Helpers
+# system.cpp
 
-`src/kernel/system.cpp` and `system.h` provide kernel-level utility functions that are too fundamental for a single module but do not belong in the HAL, PMM, or heap.
+`src/kernel/system.cpp` and `system.h`. The low-level utility stuff that doesn't
+belong in the HAL, the PMM or the heap.
 
-## 1. What is here
+In here:
 
-Typical contents include:
+- `memcpy`, `memset`, `memmove`. The kernel needs these before any libc exists.
+- string helpers: `strlen`, `strcpy`, `strcmp`, `snprintf`-style formatting
+- whatever else unrelated subsystems need
 
-- Low-level memory copy and fill (`memcpy`, `memset`, `memmove`) that the kernel uses before libc is available.
-- String manipulation helpers (`strlen`, `strcpy`, `strcmp`, `snprintf`-style formatting) that avoid pulling in the full C standard library.
-- Any other utility that multiple unrelated subsystems need.
+## Why not libc
 
-## 2. Why not use libc
+We don't link a C library. Anything libc would normally give us gets written here (or
+in a similar utility file), and the implementations are minimal on purpose. Just
+enough to be correct on the target.
 
-The kernel does not link a standard C library. Any function the OS needs that would normally come from libc must either be written here or in a similar utility module. The implementations in `system.cpp` are intentionally minimal - just enough to work correctly on the known target architecture.
+## Rules
 
-## 3. Rules
+- don't call the heap or KVFS from here. These have to work before those exist.
+- don't duplicate what's already in `types.h` or `io.h`.
 
-- Do not call OS services like the heap or KVFS from inside `system.cpp`. These helpers must work before those subsystems exist.
-- Do not duplicate functions already in `types.h` or `io.h`.
+## Files
 
-## 4. Related files
-
-- `src/kernel/types.h` - primitive types used by these helpers
-- `src/kernel/heap.cpp` - heap allocator that relies on `memset`/`memcpy` from here at initialization time
+- `src/kernel/types.h` the primitives these helpers use
+- `src/kernel/heap.cpp` heap init calls `memset`/`memcpy` from here

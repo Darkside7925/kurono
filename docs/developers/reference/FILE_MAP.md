@@ -1,10 +1,10 @@
-# File Map
+# File map
 
-This is the working inventory for the live project tree.
+Where does a given responsibility live right now. That's the one question this answers.
 
-It is meant to answer one practical question quickly: *where does a given responsibility live right now?*
+Most of it is tables, and they're deliberately boring: path on the left, what it does on the right.
 
-## 1. Top level repository map
+## Top level repository map
 
 | Path | Role |
 | --- | --- |
@@ -21,7 +21,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `src/` | live source tree |
 | `tools/` | utility scripts |
 
-## 2. `src/boot`
+## `src/boot`
 
 | File | Role |
 | --- | --- |
@@ -31,7 +31,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `kurono_linker.ld` | main linker script |
 | `multiboot_header.S` | Multiboot header |
 
-## 3. `src/kernel`
+## `src/kernel`
 
 | File | Role |
 | --- | --- |
@@ -62,7 +62,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `vmm.cpp` | virtual memory or mapping support at kernel layer |
 | `vmm.h` | VMM declarations |
 
-## 4. `src/hal`
+## `src/hal`
 
 | File | Role |
 | --- | --- |
@@ -72,7 +72,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `isr_stubs.asm` | ISR entry stubs |
 | `syscall_entry.asm` | SYSCALL/`int 0x80` entry (per-CPU swapgs path) |
 
-## 5. `src/drivers`
+## `src/drivers`
 
 | File | Role |
 | --- | --- |
@@ -128,7 +128,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `virtio_gpu.cpp` | VirtIO GPU path |
 | `virtio_gpu.h` | VirtIO GPU interface |
 
-## 6. `src/ui`
+## `src/ui`
 
 | File | Role |
 | --- | --- |
@@ -159,7 +159,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `window_manager.cpp` | window manager implementation |
 | `window_manager.h` | window manager interface |
 
-## 7. `src/apps`
+## `src/apps`
 
 > Note: the GUI `conduit` app/interface lives in `src/system/` (`conduit.cpp`/`conduit.h`), not `src/apps/`. Earlier revisions of this map listed it here.
 
@@ -190,7 +190,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `text_editor.h` | text editor interface |
 | `README.md` | app notes |
 
-## 8. `src/shell`
+## `src/shell`
 
 | File | Role |
 | --- | --- |
@@ -201,7 +201,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `windows_cmds.cpp` | Windows style commands |
 | `windows_cmds.h` | Windows command declarations |
 
-## 9. `src/fs`
+## `src/fs`
 
 | File | Role |
 | --- | --- |
@@ -209,7 +209,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `fat32.h` | FAT32 declarations |
 | `kvfs.cpp` | in memory virtual filesystem (runtime fs) |
 | `kvfs.h` | KVFS declarations |
-| `kfs.cpp` | Kurono File System - on-disk persistence filesystem |
+| `kfs.cpp` | Kurono File System, on-disk persistence filesystem |
 | `kfs.h` | KFS on-disk format spec + declarations |
 | `kfs_bench.cpp` / `kfs_bench.h` | KFS benchmark (`kurono.kfsbench`) |
 | `persist.cpp` | persistence layer (mirrors KVFS user data into KFS) |
@@ -217,7 +217,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `vfs.cpp` | generic VFS layer |
 | `vfs.h` | VFS declarations |
 
-## 10. `src/net`
+## `src/net`
 
 | File | Role |
 | --- | --- |
@@ -234,7 +234,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `unix_socket.cpp` | AF_UNIX sockets + `SCM_RIGHTS` fd-passing |
 | `unix_socket.h` | AF_UNIX declarations |
 
-## 11. `src/proc`
+## `src/proc`
 
 | File | Role |
 | --- | --- |
@@ -249,7 +249,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `spinlock.h` / `kernel_locks.h` | `lock cmpxchg` spinlocks |
 | `switch_to.asm` | context-switch assembly |
 
-## 12. `src/security`
+## `src/security`
 
 | File | Role |
 | --- | --- |
@@ -258,14 +258,14 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `ksa.cpp` | Kurono Secure Authorization (hypervisor-backed prompts) |
 | `ksa.h` | KSA declarations |
 
-## 13. `src/packages`
+## `src/packages`
 
 | File | Role |
 | --- | --- |
 | `pkgmgr.cpp` | package manager |
 | `pkgmgr.h` | package manager declarations |
 
-## 14. `src/kcl`
+## `src/kcl`
 
 | File | Role |
 | --- | --- |
@@ -273,7 +273,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `kcl.h` | KCL declarations |
 | `kcl_test.cpp` / `kcl_test.h` | KCL self-test suite (`kurono.kcltest`, 11/11) |
 
-## 15. `src/system`
+## `src/system`
 
 | File | Role |
 | --- | --- |
@@ -298,7 +298,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `user_mgmt.h` | user management declarations |
 | `vconsole.cpp` / `vconsole.h` | virtual consoles |
 
-## 16. `src/linux`
+## `src/linux`
 
 | File | Role |
 | --- | --- |
@@ -330,7 +330,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `user_bridge.cpp` | user bridge logic |
 | `user_bridge.h` | user bridge declarations |
 
-## 17. `src/virt`
+## `src/virt`
 
 | File | Role |
 | --- | --- |
@@ -362,7 +362,7 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `vserial.cpp` | virtual serial |
 | `vserial.h` | virtual serial declarations |
 
-## 18. `src/media`
+## `src/media`
 
 | File | Role |
 | --- | --- |
@@ -379,18 +379,18 @@ It is meant to answer one practical question quickly: *where does a given respon
 | `mp4_demux.cpp` / `mp4_demux.h` | MP4 demuxer |
 | `video_player.cpp` / `video_player.h` | `VideoPlayer` decode/playback core |
 
-## 19. `src/tests`
+## `src/tests`
 
 | File | Role |
 | --- | --- |
 | `test_suite.cpp` | boot time tests |
 | `test_suite.h` | test declarations |
 
-## 20. `src/third_party`
+## `src/third_party`
 
 This folder carries the glue layer around embedded third party components used by the media and font stack (`stb_image`, `stb_truetype`, and their `*_glue.cpp` wrappers).
 
-## 21. `src/userprogs`
+## `src/userprogs`
 
 Userspace test programs (cross-compiled with musl-gcc / NASM) embedded into the kernel image and launched by shell commands. Built ELF artifacts are tracked alongside their sources.
 
@@ -407,7 +407,7 @@ Userspace test programs (cross-compiled with musl-gcc / NASM) embedded into the 
 | `user.ld` | userspace linker script |
 | `embedded_userprogs.h` | generated table of embedded user programs |
 
-## 22. Fast lookup guide
+## Fast lookup guide
 
 If the question is about one of the subjects below, the first file to open should usually be this one.
 

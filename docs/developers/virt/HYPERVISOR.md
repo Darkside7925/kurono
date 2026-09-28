@@ -1,72 +1,71 @@
 # Hypervisor
 
-`src/virt/hypervisor.cpp` and `hypervisor.h` implement the Kurono Type-1 style hypervisor using Intel VT-x (VMX).
+`src/virt/hypervisor.cpp` and `hypervisor.h`. The Type-1 style hypervisor, on Intel VT-x
+(VMX).
 
-## 1. What it is
+A hardware-accelerated VMM built into the kernel. It uses VMX to create and run guests, and
+the main use case is booting a Debian guest inside Kurono without a reboot.
 
-The hypervisor is a hardware-accelerated virtual machine monitor built into the Kurono kernel. It uses Intel VT-x VMX instructions to create and run guest virtual machines. The primary use case is booting a Debian Linux guest inside Kurono without a reboot.
+## What it needs
 
-## 2. Prerequisites
+- Intel VMX (`CPUDetect::HasVMX()`) or AMD-V/SVM. Both detection and enable paths exist,
+  EPT on Intel and NPT on AMD.
+- VMXON permission, CR4.VMXE set, for the VT-x path
+- enough RAM for the guest's physical memory
 
-The hypervisor requires:
+> The honest caveat: the VMCS/VMCB and Linux-boot path are implemented, but actually booting
+> an Alpine/Debian guest needs the host to expose **nested** VT-x to Kurono. In the usual dev
+> environment, Kurono itself running as a guest under nested KVM/QEMU, that layer is not
+> available and VM-entry fails with a VMX entry error (`hypervisor.cpp` logs "VM-entry
+> failed ... host likely doesn't support nested virt"). So guest boot is only confirmed where
+> nested VMX exists. `VMM::IsNested()` reports the situation at boot. Same constraint sits
+> behind KSA's nested-VM-vs-EPT-isolated-context fallback, see
+> [../security/KSA.md](../security/KSA.md).
 
-- Intel VMX (`CPUDetect::HasVMX()`) **or** AMD-V/SVM detection (both detection +
-  enable paths exist; EPT on Intel / NPT on AMD)
-- VMXON permission (CR4.VMXE set) for the VT-x path
-- Sufficient RAM for guest physical memory regions
+## Init is deferred
 
-> **Honest caveat - nested VMX for guest boot.** The VMCS/VMCB + Linux-boot path
-> is implemented, but actually *booting* an Alpine/Debian guest needs the host to
-> expose **nested** VT-x to Kurono. In the common dev environment - Kurono itself
-> running as a guest under nested KVM/QEMU - that nested layer is not available,
-> and the guest **VM-entry fails with a VMX entry error** (`hypervisor.cpp` logs
-> "VM-entry failed ... host likely doesn't support nested virt"). Guest boot is
-> therefore confirmed only where nested VMX is present. `VMM::IsNested()` reports
-> the situation at boot. This is the same constraint behind KSA's
-> nested-VM-vs-EPT-isolated-context fallback (see
-> [../security/KSA.md](../security/KSA.md) §3).
+Hypervisor init does not run during normal boot. It happens when you explicitly start a VM.
+On purpose: VT-x init is risky on some real laptop hardware, and deferring it keeps boot
+from failing.
 
-## 3. Initialization
+Start one with the `vm` command, registered in `linux_cmds.cpp` with category `virt`:
 
-Hypervisor initialization is deferred - it does not run during normal Kurono boot. It is activated only when the user explicitly starts a VM. This is a deliberate decision: VT-x initialization is risky on some real laptop hardware and deferring it prevents boot failures.
-
-To start a VM, use the `vm` shell command (registered in `linux_cmds.cpp`, category
-`virt`):
 ```
 vm create [ram_mb]      # create a VM
 vm run [max_exits]      # enter the VM run loop
 vm boot-alpine          # boot the embedded Alpine guest
 vm boot-test            # minimal guest that prints to serial
 ```
-(There is no `kurono vm start` command - `vm` is its own top-level command with
-`create` / `run` / `pause` / `resume` / `destroy` / `serial` / `regs` / `info` /
-`boot-test` / `boot-alpine` subcommands.)
 
-## 4. VMCS setup
+There is no `kurono vm start`. `vm` is its own top-level command with `create`, `run`,
+`pause`, `resume`, `destroy`, `serial`, `regs`, `info`, `boot-test` and `boot-alpine`.
 
-The VM Control Structure (VMCS) is the data structure Intel VMX uses to define guest and host machine state. The hypervisor initializes VMCS fields for:
+## VMCS
 
-- Guest register set (RIP, RSP, CR0, CR3, CR4, segment descriptors)
-- Host save state (kernel registers to restore on VM exit)
-- VM execution controls (pin-based, processor-based, exit/entry controls)
-- EPT (Extended Page Tables) pointer for guest memory mapping
+The VMCS is the structure VMX uses to describe guest and host machine state. The hypervisor
+sets up:
 
-## 5. VM exits
+- guest register set: RIP, RSP, CR0, CR3, CR4, segment descriptors
+- host save state, the kernel registers to restore on exit
+- execution controls: pin-based, processor-based, exit and entry
+- the EPT pointer for guest memory
 
-Every VM exit calls `vmexit.cpp` which dispatches based on the exit reason. Common exit reasons handled:
+## Exits
 
-| Exit reason | Handler |
+Every exit goes to `vmexit.cpp`, which dispatches on the reason:
+
+| Reason | Handler |
 | --- | --- |
-| CPUID | Return emulated values |
-| I/O port access | Forward to virtual device |
-| EPT violation | Map missing guest page |
-| RDMSR/WRMSR | Return/absorb MSR value |
-| HLT | Guest idled; yield |
+| CPUID | return emulated values |
+| I/O port access | forward to the virtual device |
+| EPT violation | map the missing guest page |
+| RDMSR/WRMSR | return or absorb the MSR value |
+| HLT | guest idled, yield |
 
-## 6. Related files
+## Files
 
-- `src/virt/vmexit.cpp` - VM exit dispatch
-- `src/virt/ept.cpp` - Extended Page Tables
-- `src/virt/vmm.cpp` - VMM backend glue
-- `src/virt/linux_boot.cpp` - loads Linux into the guest
-- `src/virt/vdevices.cpp` - virtual devices seen by the guest
+- `src/virt/vmexit.cpp` exit dispatch
+- `src/virt/ept.cpp` extended page tables
+- `src/virt/vmm.cpp` backend glue
+- `src/virt/linux_boot.cpp` loads Linux into the guest
+- `src/virt/vdevices.cpp` what the guest sees as hardware

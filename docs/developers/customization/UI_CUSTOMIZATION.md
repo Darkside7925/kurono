@@ -1,81 +1,68 @@
-# UI Customization Guide
+# Customising the UI
 
-This document explains how to customize the Kurono OS visual appearance at runtime using the configuration system.
-
-## 1. How customization works
-
-All visual properties - colors, sizes, toggles - are stored in a plain text file at `/etc/kurono/ui.conf` inside the KVFS filesystem. The file is read at boot and can be reloaded at any time without restarting.
-
-After making changes to the config file, apply them with:
+All the visual properties (colours, sizes, toggles) live in a plain text file at
+`/etc/kurono/ui.conf` in KVFS. Read at boot, reloadable any time.
 
 ```
 kurono reload
 ```
 
-This command calls `UIConfig::Reload()` which re-reads the file and propagates new values to the taskbar, desktop, window manager, and all other themed components immediately.
+`UIConfig::Reload()` re-reads the file and pushes the new values at the taskbar, desktop,
+window manager and everything else themed.
 
-## 2. Editing the config file
-
-Open the text editor from the terminal:
+## Editing it
 
 ```
 edit /etc/kurono/ui.conf
 ```
 
-Or from the Settings app → Appearance section.
+Or Settings, Appearance section. The file documents itself: every key is listed with its
+default and a comment.
 
-The config file is self-documenting. Every key is listed with its default value and a comment explaining what it controls.
+## Colour format
 
-## 3. Color format
+`0xAARRGGBB`. AA is alpha (FF is opaque), then red, green, blue. Example `0xFF5C8AFF` is a
+fully opaque blue-purple.
 
-All color values use `0xAARRGGBB` hexadecimal:
+## Useful keys
 
-- `AA` - alpha (FF = fully opaque)
-- `RR` - red component
-- `GG` - green component
-- `BB` - blue component
-
-Example: `0xFF5C8AFF` is fully opaque blue-purple.
-
-## 4. Quick reference: most useful keys
-
-### Change the taskbar color
+Taskbar colour:
 ```
 taskbar.bg = 0xFF1A1A2E
 taskbar.top_edge = 0xFF3A3A50
 ```
 
-### Move the taskbar to the top
+Move the taskbar to the top:
 ```
 taskbar.position = top
 ```
 
-### Hide taskbar elements you don't use
+Hide bits you don't use:
 ```
 taskbar.show_search = 0
 taskbar.show_battery = 0
 ```
 
-### Change the desktop background color
+Desktop background:
 ```
 desktop.bg = 0xFF0A1020
 ```
 
-### Make icons larger
+Bigger icons:
 ```
 desktop.icon_size = 72
 desktop.icon_spacing_x = 120
 desktop.icon_spacing_y = 130
 ```
 
-### Change the context menu style
+Context menu:
 ```
 ctxmenu.bg = 0xFF0F0F20
 ctxmenu.border = 0xFF8844FF
 ctxmenu.text = 0xFFFFFFFF
 ```
 
-### Change window chrome colors
+Window chrome:
 ```
 window.title_bg = 0xFF101020
 window.close_btn = 0xFFCC3333
@@ -83,50 +70,41 @@ window.min_btn = 0xFFCCAA00
 window.max_btn = 0xFF00AA44
 ```
 
-### Disable desktop file editing
+Turn off desktop file editing:
 ```
 desktop.allow_edit = 0
 ```
 
-### Disable Task Manager kill/restart
+Turn off task manager kill/restart:
 ```
 taskmgr.allow_kill = 0
 ```
 
-### Retheme via KSS theme tokens
-The KSS styling layer reads a `theme.*` token set from the same file (these keys
-aren't in the generated default - add them to override the built-in theme):
+Retheme through KSS tokens. These aren't in the generated default, add them yourself to
+override the built-in theme:
 ```
 theme.bg      = 0xFF101014
 theme.surface = 0xFF1E1E24
 theme.accent  = 0xFF5C8AFF
 theme.text    = 0xFFF0F0F2
 ```
-See `system/UI_CONFIG.md` for the full `theme.*` / `compositor.*` / `display.*`
-key list.
 
-## 5. Applying changes on the fly
+`system/UI_CONFIG.md` has the full `theme.*`, `compositor.*` and `display.*` list.
 
-After editing and saving the config file:
+## Applying it
 
-```
-kurono reload
-```
+Save, then `kurono reload`. No reboot. Colours, sizes and toggles all apply.
 
-No reboot needed. Changes to colors, sizes, and toggles all apply the moment reload completes.
-
-## 6. Resetting to defaults
-
-Delete the config file and reload:
+## Back to defaults
 
 ```
 rm /etc/kurono/ui.conf
 kurono reload
 ```
 
-The system will write a fresh default config file on the next reload.
+It writes a fresh default file on the next reload.
 
-## 7. Related documentation
+## More
 
-- `system/UI_CONFIG.md` - full technical reference for the UIConfig module
-- `shell/SHELL.md` - `kurono` command documentation
+- `system/UI_CONFIG.md` full config reference
+- `shell/SHELL.md` the `kurono` command

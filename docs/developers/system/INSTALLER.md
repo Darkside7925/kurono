@@ -1,78 +1,68 @@
 # Installer
 
-`src/system/installer.cpp` / `installer.h` implement the disk-installer engine
-(disk scan, partition inspection, deployment planning, FAT32/ext4 staging), and
-`src/system/installer_gui.cpp` / `installer_gui.h` implement the **graphical
-installer / first-setup wizard** drawn on top of it.
+`src/system/installer.cpp` / `installer.h` is the disk-installer engine: disk scan, partition
+inspection, deployment planning, FAT32/ext4 staging. `src/system/installer_gui.cpp` /
+`installer_gui.h` is the graphical installer and first-setup wizard drawn on top of it.
 
-## 1. What it does
+## Three ways in
 
-The installer provides a step-by-step flow to install (or first-time-configure)
-Kurono. There are three ways in:
-
-- **The "Kurono Setup" GRUB entry** - a *dedicated* boot menu entry (generated in
-  `src/Makefile`) that boots `kurono.setup=1` and drops straight into the
-  graphical wizard. `kurono_kernel.cpp` parses the `kurono.setup` token (and an
-  optional `kurono.setup.screen=N` to open on a specific screen) and calls
-  `InstallerGUI::Run()`. **The installer is never the default boot** - the normal
-  **"Kurono OS (Multiboot2)"** entry boots straight to the desktop
-  (`kurono.autologin=1`), so a first boot can't strand the user on a black
-  installer screen before input is up.
-- **The desktop "Install Kurono" shortcut** - launches the same `InstallerGUI`.
-- **The shell `installer` command** - runs the text-mode disk scan / plan / install
-  path of the engine.
+- the "Kurono Setup" GRUB entry. A dedicated boot menu entry, generated in `src/Makefile`, that
+  boots `kurono.setup=1` and goes straight into the wizard. `kurono_kernel.cpp` parses the token
+  (plus an optional `kurono.setup.screen=N` to open on a specific screen) and calls
+  `InstallerGUI::Run()`. The installer is never the default boot: the normal "Kurono OS
+  (Multiboot2)" entry boots to the desktop with `kurono.autologin=1`, so a first boot can't
+  strand you on a black installer screen before input is up.
+- the desktop "Install Kurono" shortcut, which launches the same `InstallerGUI`
+- the shell `installer` command, which runs the engine's text-mode scan, plan and install path
 
 ```
 installer
 ```
 
-## 2. Wizard screens (`InstallerGUI::Screen`)
+## Wizard screens
 
-The graphical wizard walks these screens in order (the `SCR_*` enum in
-`installer_gui.h`):
+The `SCR_*` enum in `installer_gui.h`, in order:
 
-1. **Welcome**
-2. **Language**
-3. **Keyboard**
-4. **Network** - the wired link is probed live (carrier + DHCP address shown via
-   `src/net/network.h`); offers Wi-Fi config.
-5. **Wi-Fi** - records SSID/password into `/etc/network`. **Honest caveat:** there
-   is no radio driver in this build - only e1000 / virtio-net *wired* links work;
-   the Wi-Fi screen is an honest config UI with nothing to drive.
-6. **Disk** - enumerate NVMe disks, pick a target.
-7. **Partition mode** - GPT/ESP layout planning.
-8. **Filesystem**
-9. **User** - administrator account.
-10. **Hostname** - hostname + basic preferences.
-11. **Guests** - optional Linux guests / packages: **Debian (minbase)**, **Alpine
-    Linux**, **Python 3**. The Debian/Alpine selections reuse the
-    `kpkg install debian` + boot-time system-update reboot flow.
-12. **Summary → Confirm → Progress → Drivers → Success → Live-exit.**
+1. Welcome
+2. Language
+3. Keyboard
+4. Network: the wired link gets probed live (carrier and DHCP address shown), and it offers
+   Wi-Fi config
+5. Wi-Fi: records SSID and password into `/etc/network`. Honest caveat: there is no radio
+   driver in this build, only e1000 and virtio-net wired links work. The Wi-Fi screen is a
+   config UI with nothing driving it yet.
+6. Disk: enumerate NVMe disks, pick a target
+7. Partition mode: GPT/ESP layout planning
+8. Filesystem
+9. User: administrator account
+10. Hostname: hostname plus basic preferences
+11. Guests: optional Linux guests and packages, Debian (minbase), Alpine Linux, Python 3. The
+    Debian and Alpine picks reuse the `kpkg install debian` plus boot-time system-update reboot
+    flow.
+12. Summary, Confirm, Progress, Drivers, Success, Live-exit
 
-Provisioning (user, hostname, prefs, `/etc/network`, the guest queue) is written
-through KVFS, so the wizard works even when there is no ext4 target - it can run
-as a first-setup pass on the live system, not only as a disk install.
+Provisioning (user, hostname, prefs, `/etc/network`, the guest queue) is written through KVFS,
+so the wizard works even with no ext4 target. It can run as a first-setup pass on the live
+system, not only as a disk install.
 
-## 3. Dual boot awareness
+## Dual boot
 
-The disk installer detects existing OS installations on the target and can add
-GRUB entries for them. It also offers to install the Debian rootfs for the
-integrated Linux boot feature (the `kpkg install debian` + system-update path).
+The disk installer detects existing OS installations on the target and can add GRUB entries for
+them. It also offers to install the Debian rootfs for the integrated Linux boot feature, which is
+the `kpkg install debian` plus system-update path.
 
-## 4. Shell integration
+## Shell command
 
-The `installer` shell command is registered in `src/system/installer.cpp`
-(`RegisterCommand("installer", cmd_installer, ...)`, *not* in `shell.cpp`'s
-`RegisterBuiltins()`) and runs the engine's terminal-driven scan / plan / install
-mode. The graphical wizard runs the same underlying engine through
-`InstallerGUI`.
+`installer` is registered in `src/system/installer.cpp`, not in `shell.cpp`'s
+`RegisterBuiltins()`, and runs the engine's terminal-driven scan, plan and install mode. The
+graphical wizard runs the same engine through `InstallerGUI`.
 
-## 5. Related files
+## Files
 
-- `src/system/installer_gui.cpp` / `.h` - the graphical wizard (`SCR_*` screens, `Run()`)
-- `src/system/installer.cpp` / `.h` - disk-installer engine + `installer` command
-- `src/kernel/kurono_kernel.cpp` - `kurono.setup` / `kurono.setup.screen` token gate
-- `src/Makefile` - `grub.cfg` generation incl. the "Kurono Setup" entry
-- `src/linux/dual_boot.cpp` - dual boot configuration written during install
-- `src/drivers/nvme.cpp` - disk access for installation
-- `src/fs/fat32.cpp` - FAT32 ESP creation
+- `src/system/installer_gui.cpp` / `.h` the wizard, `SCR_*` screens and `Run()`
+- `src/system/installer.cpp` / `.h` the engine and the `installer` command
+- `src/kernel/kurono_kernel.cpp` the `kurono.setup` and `kurono.setup.screen` gate
+- `src/Makefile` `grub.cfg` generation, including the "Kurono Setup" entry
+- `src/linux/dual_boot.cpp` dual boot config written during install
+- `src/drivers/nvme.cpp` disk access for installation
+- `src/fs/fat32.cpp` FAT32 ESP creation

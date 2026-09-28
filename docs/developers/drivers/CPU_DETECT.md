@@ -1,35 +1,35 @@
-# CPU Detection
+# CPU detection
 
-`src/drivers/cpu_detect.cpp` and `cpu_detect.h` run CPUID to discover processor features.
+`src/drivers/cpu_detect.cpp` and `cpu_detect.h`. Runs CPUID and caches the answers.
 
-## 1. What it does
+It pulls out:
 
-The CPU detect module executes the `CPUID` instruction to query the processor for:
+- vendor string (GenuineIntel, AuthenticAMD and friends)
+- brand string
+- feature flags from ECX/EDX on the basic and extended leaves
+- SSE, SSE2, AVX, AVX2, AES-NI presence
+- the hypervisor presence bit
+- physical and logical core counts
 
-- Vendor string (GenuineIntel, AuthenticAMD, etc.)
-- Brand string (human-readable model name)
-- Feature flags in ECX/EDX for basic CPUID and extended leaves
-- SSE, SSE2, AVX, AVX2, AES-NI availability
-- Hypervisor presence bit
-- Physical and logical core counts
+## When it runs
 
-## 2. When it runs
+Early boot, in `kurono_kernel.cpp`. Results get cached, so anything can call
+`CPUDetect::Get()` later.
 
-CPU detection runs during early boot in `kurono_kernel.cpp`. The results are cached in the module and available to any code that calls `CPUDetect::Get()`.
+## Who reads it
 
-## 3. Uses in the codebase
+- the hypervisor, which checks VMX/SVM before trying to bring up virtualization
+- the media decoder, which takes SIMD paths when SSE2 is there
+- the task manager's CPU info
+- `kurono info` in the shell
 
-- The hypervisor checks for VMX/SVM support before attempting to bring up virtualization hardware.
-- The media decoder can use SIMD paths if SSE2 is present.
-- The Task Manager's CPU info tab displays the vendor string and feature set.
-- The `kurono info` shell command reports CPU features.
+## The hypervisor bit
 
-## 4. Hypervisor detection
+CPUID leaf 1, ECX bit 31, says the CPU is inside a VM. Kurono uses it to change
+behaviour, for example preferring the BGA display path.
 
-The hypervisor presence bit (CPUID ECX bit 31 on leaf 1) indicates that the processor is running inside a virtual machine. Kurono uses this to adjust behavior - for example, preferring the BGA display path when a hypervisor is detected.
+## Files
 
-## 5. Related files
-
-- `src/virt/hypervisor.cpp` - checks for VMX support before init
-- `src/apps/task_manager.cpp` - displays CPU info
-- `src/shell/shell.cpp` - `kurono info` command reports CPU features
+- `src/virt/hypervisor.cpp` checks VMX before init
+- `src/apps/task_manager.cpp` shows CPU info
+- `src/shell/shell.cpp` `kurono info` reports the feature set

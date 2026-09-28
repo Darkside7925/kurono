@@ -1,29 +1,29 @@
-# Core Types
+# types.h
 
-`src/kernel/types.h` and `types.cpp` define the foundational type aliases and size-safe primitives used across the entire codebase.
+`src/kernel/types.h` and `types.cpp`. The foundational aliases the whole tree agrees
+on.
 
-## 1. What is here
+What's in it:
 
-The types header provides the single canonical location for:
+- fixed-width ints: `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`, `int32_t` and friends
+- `size_t`, `ptrdiff_t`, `uintptr_t` for pointer arithmetic
+- `bool`, if the compiler isn't handing us one
+- anything else the OS uses everywhere
 
-- Fixed-width integer aliases (`uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`, `int32_t`, etc.)
-- `size_t`, `ptrdiff_t`, and `uintptr_t` for pointer arithmetic
-- `bool` if not available through the compiler
-- Any other primitive that the OS uses everywhere without pulling in a large standard library header
+## Why it exists
 
-## 2. Why this exists
+No libc, so `<stdint.h>` and `<stddef.h>` style definitions have to come from
+somewhere in the tree. This is that somewhere. Include it anywhere you touch numeric
+types, pointer widths or booleans. Most files get it transitively anyway.
 
-The kernel does not link against a standard C library. That means `<stdint.h>` and `<stddef.h>` style definitions need to come from somewhere inside the project. `types.h` is that somewhere.
+## Rules
 
-Every file that uses numeric types, pointer widths, or boolean values should include `types.h`. Most files get it transitively through other headers that already include it.
+- new project-wide aliases go here
+- no logic, no functions, no heavy macros. It's a type-definition file.
+- don't include OS headers from here. It has to stay includable from everything,
+  including assembly glue headers.
 
-## 3. Rules for types.h
+## Files
 
-- Add new type aliases here when they need to be available project-wide.
-- Do not add logic, functions, or heavy macros here. It is a type-definition file only.
-- Do not include OS-specific headers from here. It must be includable from everything including assembly glue headers.
-
-## 4. Related files
-
-- `src/kernel/kurono_kernel.cpp` - includes types transitively through almost every header
-- `src/kernel/io.h` - I/O port helpers that use the types defined here
+- `src/kernel/kurono_kernel.cpp` gets types transitively through nearly every header
+- `src/kernel/io.h` port helpers using these types

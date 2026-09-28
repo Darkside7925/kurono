@@ -1,44 +1,43 @@
-# VM Exit Handling
+# VM exits
 
-`src/virt/vmexit.cpp` and `vmexit.h` implement the dispatch logic for all VM exits.
+`src/virt/vmexit.cpp` and `vmexit.h`. Dispatch for every VM exit.
 
-## 1. What VM exits are
+A VM exit is what happens when the guest does something the hypervisor has to handle:
+hardware saves guest state into the VMCS and transfers control to the host instruction
+pointer. This file is the first code that runs at that point.
 
-Every time the guest CPU encounters an instruction or event that the hypervisor needs to handle, the hardware performs a VM exit: it saves guest state to the VMCS and transfers control to the hypervisor's host instruction pointer. `vmexit.cpp` is the first code that runs in that situation.
+The reason comes out of the VMCS `VM_EXIT_REASON` field, and a table maps it to a handler:
 
-## 2. Exit reason dispatch
-
-The exit reason is read from the VMCS `VM_EXIT_REASON` field. The dispatch table maps exit reasons to handlers:
-
-| Exit reason code | Name | Handler summary |
+| Reason | Name | Handler |
 | --- | --- | --- |
-| 10 | CPUID | Return emulated CPU info |
-| 12 | HLT | Guest halted; yield to host |
-| 18 | VMCALL | Hypercall processing |
-| 28 | Control register access | Emulate CR0/CR3/CR4 writes |
-| 30 | I/O instruction | Forward to virtual devices |
-| 31 | RDMSR | Return MSR value |
-| 32 | WRMSR | Absorb or emulate MSR write |
-| 48 | EPT violation | Map missing guest page |
+| 10 | CPUID | return emulated CPU info |
+| 12 | HLT | guest halted, yield to host |
+| 18 | VMCALL | hypercall processing |
+| 28 | control register access | emulate CR0/CR3/CR4 writes |
+| 30 | I/O instruction | forward to virtual devices |
+| 31 | RDMSR | return MSR value |
+| 32 | WRMSR | absorb or emulate the write |
+| 48 | EPT violation | map the missing guest page |
 
-## 3. I/O forwarding
+## I/O forwarding
 
-I/O port accesses from the guest are forwarded to `vdevices.cpp` which checks a port-to-device mapping table. Each virtual device registers its I/O ports at init time and provides read/write handlers.
+Guest port accesses go to `vdevices.cpp`, which keeps a port-to-device table. Every virtual
+device registers its ports at init and provides read/write handlers.
 
-## 4. Hypercalls
+## Hypercalls
 
-Guest software can request hypervisor services via `VMCALL` (the handler reads the
-hypercall number from guest `eax`). The recognized set includes: NOP/info (returns
-`"kuro"`), shutdown, reboot, an audio PCM passthrough channel (`0x11`), network
-status + packet passthrough (`0x12` / `0x14`), the 9p shared-filesystem channel
-(`0x20`, host KVFS ↔ guest), and the **KSA read-only authorization-verdict channel
-(`0x4B`)** - `KSA_SUB_GET_VERDICT` returns a *copy* of the latched verdict
-(completed / approved / has-hash) and never a pointer; there is no path to write an
-approval back into KSA memory from the main OS (see `security/KSA.md`).
+Guest software asks for hypervisor services with `VMCALL`. The handler reads the hypercall
+number out of guest `eax`. What's recognised: NOP/info returning `"kuro"`, shutdown, reboot,
+an audio PCM passthrough channel (`0x11`), network status and packet passthrough (`0x12` and
+`0x14`), the 9p shared-filesystem channel (`0x20`, host KVFS to guest), and the KSA
+read-only authorization-verdict channel (`0x4B`). That last one, `KSA_SUB_GET_VERDICT`,
+returns a copy of the latched verdict (completed, approved, has-hash) and never a pointer.
+There is no path to write an approval back into KSA memory from the main OS, see
+`security/KSA.md`.
 
-## 5. Related files
+## Files
 
-- `src/virt/hypervisor.cpp` - sets the host RIP to the exit handler
-- `src/virt/ept.cpp` - called for EPT_VIOLATION exits
-- `src/virt/vdevices.cpp` - I/O port handler registry
-- `src/virt/v9fs.cpp` - file sharing hypercall handler
+- `src/virt/hypervisor.cpp` sets the host RIP to this handler
+- `src/virt/ept.cpp` for EPT_VIOLATION
+- `src/virt/vdevices.cpp` the port handler registry
+- `src/virt/v9fs.cpp` the file sharing hypercall

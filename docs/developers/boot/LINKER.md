@@ -1,30 +1,33 @@
-# Linker Script
+# Linker script
 
-`src/boot/kurono_linker.ld` controls how the kernel image is laid out in memory.
+`src/boot/kurono_linker.ld`. Decides how the kernel image is laid out in memory.
 
-## 1. What a linker script does
+Object files go in, one binary comes out, and this script says where each section lands,
+what the load address is, and where the entry point is.
 
-When the compiler produces object files, the linker combines them into a single binary. The linker script tells the linker exactly where each section of that binary should land in memory, what the load address is, and where the kernel entry point lives.
+## What it actually sets
 
-## 2. What is defined here
+- `OUTPUT_FORMAT(elf64-x86-64)` and `ENTRY(_start)`, the boot assembly entry
+- the base at `. = 0x100000`, so this is a lower-half kernel
+- `/DISCARD/` on `*(.note*)`, `*(.comment)` and `*(.eh_frame)`, so the Multiboot header
+  ends up as the very first data in the file
+- section placement: `.text` with `*(.mboot)` and `*(.multiboot)` first, then `.rodata`,
+  `.init_array`, `.data`, `.bss`
+- `kernel_start`
+- the `.init_array` span, `__init_array_start` to `__init_array_end`, which
+  `RunGlobalConstructors()` walks early in boot. Lose it and static-init registrations
+  never run, so the subsystem that registered itself looks like it doesn't exist.
+- BSS boundaries, so boot asm can zero it without hard-coded addresses
 
-The linker script for Kurono defines:
+## When it's wrong
 
-- The entry symbol (`_start` in the boot assembly).
-- The kernel base virtual address (usually `0xC0000000` for a higher-half kernel or `0x100000` for a lower-half design - check the current file for the actual value).
-- Section placement: `.text` (code), `.rodata` (read-only data), `.data` (initialized data), `.bss` (zero-initialized data).
-- BSS boundaries so the boot assembly can zero it without hard-coding addresses.
-- The Multiboot header section so GRUB can find the magic within the first 8 KB.
+- GRUB rejects the image if the Multiboot header isn't in the first 8KB
+- boot asm can't find the BSS boundaries if those symbols aren't exported
+- C++ global constructors don't run if `.init_array` is missing
+- physical/virtual address confusion if the LMA/VMA split is off
 
-## 3. Things that break if the linker script is wrong
+## Files
 
-- GRUB rejects the image if the Multiboot header is not in the first 8 KB.
-- The boot assembly fails to find BSS boundaries if those symbols are not exported.
-- C++ global constructors do not run if `.init_array` is not included.
-- Physical vs virtual address confusion if the LMA/VMA split is wrong.
-
-## 4. Related files
-
-- `src/boot/kurono_boot.asm` - uses the symbols this script exports
-- `src/boot/multiboot_header.S` - section placement depends on this script
-- `src/Makefile` - passes the linker script with `-T kurono_linker.ld`
+- `src/boot/kurono_boot.asm` uses the symbols this exports
+- `src/boot/multiboot_header.S` placement depends on this
+- `src/Makefile` passes it with `-T kurono_linker.ld`

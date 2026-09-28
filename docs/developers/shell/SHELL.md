@@ -1,55 +1,54 @@
 # Shell
 
-`src/shell/shell.cpp` and `shell.h` implement the Kurono shell core: command parsing, history, tab completion, and the command registry.
+`src/shell/shell.cpp` and `shell.h`. The shell core: parsing, history, tab completion and
+the command registry.
 
-## 1. Architecture
+It is not a process. It's a library the terminal app and the emergency boot shell both call
+into. Characters arrive through `KuronoShell::Input(char)`, lines get assembled, commands
+get dispatched.
 
-The shell is not a separate process - it is a library that the terminal app and the emergency boot shell both call into. The shell receives characters through `KuronoShell::Input(char)`, assembles lines, and dispatches to registered commands.
+## Command registry
 
-## 2. Command registry
+`RegisterCommand(name, description, env_flags, category, handler_fn)`. `env_flags` decides
+which runtime environments (desktop, emergency, KCL, and so on) can see the command.
 
-Commands are registered with `RegisterCommand(name, description, env_flags, category, handler_fn)`. The `env_flags` field controls which runtime environments (desktop, emergency, KCL, etc.) each command is visible in.
+The Kurono-native built-ins register in `RegisterBuiltins()`, called from
+`KuronoShell::Init()`. Plenty of commands register themselves from their own subsystem
+instead: `src/shell/linux_cmds.cpp` and `windows_cmds.cpp` (the Linux and Windows
+surfaces), `src/apps/kj.cpp` (`kj`, `node`), `src/kcl/kcl.cpp` (`kcl`),
+`src/apps/python_interp.cpp` (`python`, `py`), `src/packages/pkgmgr.cpp` (`kpkg` and
+friends), `src/system/installer.cpp` (`installer`), `src/net/network.cpp`,
+`src/shell/shell.cpp` (the `firefox` command, which auto-installs the package then launches
+it through `LdKurono::ExecPIE`), and `src/linux/*`. About 154 distinct commands in total,
+counting `RegisterCommand` call sites across the tree.
 
-The Kurono-native built-ins are registered in `RegisterBuiltins()` (called from
-`KuronoShell::Init()`), but many commands are registered by *their own*
-subsystems: `src/shell/linux_cmds.cpp` and `windows_cmds.cpp` (the Linux/Windows
-surfaces), `src/apps/kj.cpp` (`kj`/`node`), `src/kcl/kcl.cpp` (`kcl`),
-`src/apps/python_interp.cpp` (`python`/`py`), `src/packages/pkgmgr.cpp` (`kpkg`
-and friends), `src/system/installer.cpp` (`installer`), `src/net/network.cpp`,
-`src/shell/shell.cpp` (the `firefox` command - auto-installs the package then
-launches it via `LdKurono::ExecPIE`), `src/linux/*`, etc. In total ~154 distinct
-commands are registered (counting `RegisterCommand` call sites across the tree).
+The `kurono` group:
 
-The `kurono` command group provides:
+- `kurono reload` reload `/etc/kurono/ui.conf` and apply it live
+- `kurono info` OS version, CPU and memory summary
+- `kurono config` print the config file
 
-- `kurono reload` - reload `/etc/kurono/ui.conf` and apply live
-- `kurono info` - show OS version, CPU, and memory summary
-- `kurono config` - print the current config file contents
+## Line editing
 
-## 3. Line editing
+Backspace and delete, left/right arrows inside the line, up/down for history, and tab
+completion against the registry.
 
-The shell supports:
+## Output
 
-- Backspace and delete
-- Left/right arrow for cursor movement within the line
-- Up/down arrow for command history recall
-- Tab completion against the command registry
+Commands write with `KuronoShell::Print(str)` and `KuronoShell::Println(str)`. The terminal
+drains that queue and renders it. Emergency mode uses the same queue with a VGA text
+renderer.
 
-## 4. Output system
+## Categories
 
-Commands write output via `KuronoShell::Print(str)` and `KuronoShell::Println(str)`. The terminal app reads this output queue and renders it. The same output queue is used in emergency mode with a VGA text renderer.
+`category` groups commands in `help`. The strings actually passed to `RegisterCommand` across
+the tree: `builtin`, `filesystem`, `text`, `system`, `network`, `package`, `linux`, `virt`,
+`security`, `media`, `lang`, `scripting`.
 
-## 5. Command categories
+## Files
 
-The `category` field groups commands for the `help` command output. The category
-strings actually passed to `RegisterCommand` across the tree are: `builtin`,
-`filesystem`, `text`, `system`, `network`, `package`, `linux`, `virt`,
-`security`, `media`, `lang`, and `scripting`.
-
-## 6. Related files
-
-- `src/apps/terminal.cpp` - terminal that calls `KuronoShell::Input()`
-- `src/shell/linux_cmds.cpp` - Linux-style commands (ls, cat, pwd, etc.)
-- `src/shell/windows_cmds.cpp` - Windows-style commands (dir, type, etc.)
-- `src/system/ui_config.cpp` - used by `kurono config` and `kurono reload`
-- `src/ui/desktop.cpp` - `ReloadFromConfig()` called from `kurono reload`
+- `src/apps/terminal.cpp` calls `KuronoShell::Input()`
+- `src/shell/linux_cmds.cpp` Linux-style commands
+- `src/shell/windows_cmds.cpp` Windows-style commands
+- `src/system/ui_config.cpp` behind `kurono config` and `kurono reload`
+- `src/ui/desktop.cpp` `ReloadFromConfig()`, called from `kurono reload`

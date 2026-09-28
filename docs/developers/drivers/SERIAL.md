@@ -1,44 +1,42 @@
-# Serial Logger
+# Serial
 
-`src/drivers/serial.cpp` and `serial.h` implement COM1 serial output used for kernel debug logging.
+`src/drivers/serial.cpp` and `serial.h`. COM1 output, the kernel debug log.
 
-## 1. Purpose
+Only channel that works before the framebuffer is up. Comes up first in
+`kurono_kernel.cpp` and it's the last thing still talking when everything else has
+fallen over. Chasing a boot hang? This is where you look.
 
-The serial logger is the only output channel available before the framebuffer is initialized. It is the first thing brought up in `kurono_kernel.cpp` and the last thing still working when everything else has failed.
+## How it works
 
-If you need to debug a boot hang, the serial port is where to look.
+Sets up the first COM UART at 0x3F8 (115200) and gives you three calls:
 
-## 2. How it works
+- `SerialLogger::Log(const char*)` null-terminated string
+- `SerialLogger::LogDec(int)` decimal
+- `SerialLogger::LogHex(uint32_t)` hex
 
-The driver initializes the first COM UART (0x3F8) at boot with a standard baud rate (typically 115200). It provides simple log functions:
+All polled, no interrupts. On purpose: no dependency on the interrupt
+infrastructure, so it's still safe to call from the panic path.
 
-- `SerialLogger::Log(const char*)` - write a null-terminated string
-- `SerialLogger::LogDec(int)` - write a decimal integer
-- `SerialLogger::LogHex(uint32_t)` - write a hex value
+## Reading it
 
-All log calls are synchronous (polling, no interrupts). This avoids any dependency on the interrupt infrastructure and makes the logger safe to call from the panic path.
+`-serial stdio`, or point a serial terminal at it:
 
-## 3. Receiving output
-
-Connect a serial terminal or use QEMU's `-serial stdio` option to see serial output.
-
-In QEMU:
 ```
 qemu-system-x86_64 -cdrom kurono.iso -serial stdio
 ```
 
-This streams all serial output to the QEMU window. Boot logs, shell activity, and crash info all appear here.
+Boot phases, shell activity, crash info. All of it comes out here.
 
-## 4. What gets logged
+## What actually gets logged
 
-- Every major boot phase transition.
-- UIConfig load results.
-- KVFS file operations.
-- Panic messages (duplicated to serial in addition to the screen).
-- Driver initialization results.
+- every major boot phase transition
+- UIConfig load results
+- KVFS file operations
+- panic messages, duplicated to serial as well as the screen
+- driver init results
 
-## 5. Related files
+## Files
 
-- `src/kernel/kurono_kernel.cpp` - serial is the very first init call
-- `src/kernel/panic.cpp` - writes panic info to serial
-- `src/system/ui_config.cpp` - writes config load results to serial
+- `src/kernel/kurono_kernel.cpp` serial is the very first init call
+- `src/kernel/panic.cpp` writes panic info to serial
+- `src/system/ui_config.cpp` writes config load results to serial

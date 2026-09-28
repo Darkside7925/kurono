@@ -1,41 +1,41 @@
-# GUI Drawing Helpers
+# GUI helpers
 
-`src/ui/gui.cpp` and `gui.h` provide higher-level UI drawing primitives built on top of the graphics driver.
+`src/ui/gui.cpp` and `gui.h`. Widget-level drawing, built on top of the graphics driver.
 
-## 1. What is here
+The graphics driver gives you pixels, lines and rectangles. This layer gives you:
 
-Where the graphics driver provides raw geometric primitives (pixels, lines, rectangles), the GUI layer provides widget-level components:
+- rounded rectangles and panels, with optional shadows
+- buttons, in normal, hover and pressed states
+- text labels with left, centre or right alignment
+- progress bars
+- dividers and separators
+- scroll indicators
+- input field backgrounds
 
-- Rounded rectangles and panels with optional shadows
-- Buttons (normal, hover, pressed states)
-- Text labels with alignment (left, center, right)
-- Progress bars
-- Dividers and separators
-- Scroll indicators
-- Input field backgrounds
-
-## 2. Relationship with other UI files
+## Where it sits
 
 | File | Level |
 | --- | --- |
-| `graphics.cpp` | pixel/geometric primitives |
+| `graphics.cpp` | pixel and geometric primitives |
 | `font.cpp` | glyph rendering |
 | `gui.cpp` | widget-level components |
-| `ui_elements.cpp` | reusable higher-level components (sliders, checkboxes, etc.) |
+| `ui_elements.cpp` | reusable higher-level pieces: sliders, checkboxes and so on |
 
-Every application calls into `gui.cpp` or `ui_elements.cpp` for its UI rendering rather than calling `graphics.cpp` directly.
+Apps call `gui.cpp` or `ui_elements.cpp` for their rendering, not `graphics.cpp` directly.
 
-## 3. Color conventions
+## Colours
 
-All colors are passed as `uint32_t` in `0xAARRGGBB` format. Color values for general UI come from `UIConfig` where configurable. Applications that need themed colors should read from `UIConfig` so that `kurono reload` updates them live.
+`uint32_t` in `0xAARRGGBB`. General UI colours come from `UIConfig` where they're
+configurable, and themed code should read from there so `kurono reload` updates it live.
 
-## 4. Font integration
+## Fonts
 
-The GUI layer calls `Font::DrawString(x, y, text, color)` for text output. The font is a built-in bitmap font. Unicode beyond basic ASCII is not currently supported.
+`Font::DrawString(x, y, text, color)` with a built-in bitmap font. No Unicode beyond basic
+ASCII.
 
-## 5. Related files
+## Files
 
-- `src/drivers/graphics.cpp` - pixel-level backend
-- `src/ui/font.cpp` - text rendering
-- `src/ui/ui_elements.cpp` - slider, checkbox, list components
-- `src/system/ui_config.cpp` - color source for themed widgets
+- `src/drivers/graphics.cpp` the pixel backend
+- `src/ui/font.cpp` text rendering
+- `src/ui/ui_elements.cpp` slider, checkbox and list components
+- `src/system/ui_config.cpp` the colour source for themed widgets

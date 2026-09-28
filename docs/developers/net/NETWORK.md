@@ -1,94 +1,84 @@
-# Network Stack
+# Network stack
 
-`src/net/network.cpp` / `network.h` and `src/net/tcpip.cpp` / `tcpip.h` implement
-Kurono's custom TCP/IP stack - a real from-scratch stack on top of the E1000 NIC,
-not a host-guest shortcut.
+`src/net/network.cpp` / `network.h` and `src/net/tcpip.cpp` / `tcpip.h`. A real from-scratch
+TCP/IP stack on top of the E1000, not a host-guest shortcut.
 
-## 1. Architecture
+## Two files at the core
 
-The network stack is a two-file core.
+**`network.cpp`** does Ethernet II framing and reception from the E1000 driver, ARP
+resolution, and the interface-management layer. It's the boundary between hardware and
+protocol.
 
-**`network.cpp`** - Ethernet II framing and reception from the E1000 driver, ARP
-resolution, and the interface-management layer. It is the boundary between
-hardware and protocol.
+**`tcpip.cpp`** does IPv4, ICMP, UDP and TCP on top of those frames. Around them:
+`ipv6.cpp` for IPv6, `netfilter.cpp` for the packet-filter pipeline, `tuntap.cpp` for Tun/Tap,
+and `unix_socket.cpp` for AF_UNIX local sockets.
 
-**`tcpip.cpp`** - IPv4, ICMP, UDP, and TCP on top of the frames `network.cpp`
-provides. Surrounding files add IPv6 (`ipv6.cpp`), the packet-filter pipeline
-(`netfilter.cpp`), the Tun/Tap subsystem (`tuntap.cpp`), and AF_UNIX local sockets
-(`unix_socket.cpp`).
+## Protocols
 
-## 2. Supported protocols
-
-| Protocol | Status |
+| Protocol | State |
 | --- | --- |
-| Ethernet II | Frame encapsulation + parsing |
-| ARP | Request/reply, 32-entry cache |
-| IPv4 | Header build/parse, **inbound checksum validation** with drop logs |
-| IPv6 | Stack present, echo + neighbor-discovery plumbing |
-| ICMP | Echo request/reply (ping) with RTT measurement |
-| UDP | Send/receive, `SendTo` / `RecvFrom` |
-| TCP | Full **11-state machine** (`CLOSED` → `TIME_WAIT`), 3-way handshake, FIN teardown |
+| Ethernet II | frame encapsulation and parsing |
+| ARP | request/reply, 32-entry cache |
+| IPv4 | header build/parse, inbound checksum validation with explicit drop logs |
+| IPv6 | stack present, echo and neighbour-discovery plumbing |
+| ICMP | echo request/reply with RTT measurement |
+| UDP | send/receive, `SendTo` and `RecvFrom` |
+| TCP | full 11-state machine (`CLOSED` to `TIME_WAIT`), 3-way handshake, FIN teardown |
 | DNS | UDP-based resolver |
-| DHCP | DISCOVER/OFFER/REQUEST/ACK; obtains IP at boot |
+| DHCP | DISCOVER/OFFER/REQUEST/ACK, gets an IP at boot |
 
-**Correctness note:** Internet checksums are computed from network-order bytes
-(IPv4 + TCP pseudo-header, covering the real TCP header length including options),
-and inbound IPv4/TCP checksums are validated with explicit serial drop logs - the
-fix for the earlier "ARP works but TCP stalls" behavior.
+On checksums: computed from network-order bytes, IPv4 plus the TCP pseudo-header, covering
+the real TCP header length including options. Inbound IPv4 and TCP checksums are validated
+with explicit serial drop logs. That was the fix for the old "ARP works but TCP stalls"
+behaviour.
 
-## 3. DHCP at boot
+## DHCP
 
-On startup, if an E1000 NIC is detected, the stack sends a DHCP DISCOVER. The
-assigned IP, gateway, and DNS server are stored and used for subsequent
-connections. Routing is configurable via `SetIP` / `SetSubnetMask` / `SetGateway`
-/ `SetDNS`.
+At startup, if there's an E1000, the stack sends a DISCOVER. The assigned IP, gateway and DNS
+server get stored and used from then on. Routing is configurable through `SetIP`,
+`SetSubnetMask`, `SetGateway` and `SetDNS`.
 
-## 4. Socket API and limits
+## Sockets
 
-A BSD-style socket interface is provided:
+BSD-style: `Socket()`, `Bind()`, `Connect()`, `Listen()`, `Accept()`, `Send()`, `Recv()`,
+`Close()`. Types are `SOCK_STREAM` (TCP), `SOCK_DGRAM` (UDP) and `SOCK_RAW`.
 
-```cpp
-Socket(), Bind(), Connect(), Listen(), Accept(), Send(), Recv(), Close()
-```
-
-Socket types: `SOCK_STREAM` (TCP), `SOCK_DGRAM` (UDP), `SOCK_RAW`. Limits: up to
-16 sockets, 8 KB RX/TX buffers, 1460-byte MSS. A `NetStats` struct tracks
+Limits: 16 sockets, 8KB RX/TX buffers, 1460-byte MSS. A `NetStats` struct tracks
 per-protocol RX/TX/error/drop counters.
 
-## 5. HTTP today
+## HTTP
 
-`curl <url>` is the working HTTP path end to end - verified by fetching real pages
-off `example.com` and Wikipedia over tap+NAT. The fixes that got it working were a
-recv loop that no longer gives up early, the `FIN_WAIT` half-close path, and
-ephemeral-port selection. (The OS's `curl` is HTTP-only - no TLS.) The GUI
-"Browser" tile is a placeholder; see the README's browser note.
+`curl <url>` is the working path end to end, verified fetching real pages off example.com and
+Wikipedia over tap+NAT. What got it there: a recv loop that stopped giving up early, the
+`FIN_WAIT` half-close path, and ephemeral port selection. `curl` is HTTP only, no TLS. The GUI
+Browser tile is a placeholder, see the README's browser note.
 
-## 6. Packet filtering (netfilter)
+## netfilter
 
-`netfilter.cpp` provides a 5-hook pipeline (`PRE_ROUTING`, `LOCAL_IN`, `FORWARD`,
-`LOCAL_OUT`, `POST_ROUTING`) with a table+chain+rule model and `ACCEPT` / `DROP` /
-`REJECT` verdicts, matching on IPv4 src/dst, port ranges, protocol, and interface.
-It is wired into the `tcpip.cpp` send/receive paths.
+`netfilter.cpp` is a 5-hook pipeline (`PRE_ROUTING`, `LOCAL_IN`, `FORWARD`, `LOCAL_OUT`,
+`POST_ROUTING`) with a table/chain/rule model and `ACCEPT`, `DROP` and `REJECT` verdicts,
+matching on IPv4 src/dst, port ranges, protocol and interface. It's wired into the
+`tcpip.cpp` send and receive paths.
 
-## 7. Logging
+## Logging
 
-The TCP stack calls `RuntimeLog::LogNetwork` (`/kurono/var/log/network.log`) on
-connection establishment and RST. See [../system/LOGGING.md](../system/LOGGING.md).
+The stack calls `RuntimeLog::LogNetwork` (`/kurono/var/log/network.log`) on connection
+establishment and RST. See [../system/LOGGING.md](../system/LOGGING.md).
 
-## 8. Common problems
+## When it breaks
 
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| No network at boot | E1000 not detected on PCI bus |
-| DHCP fails | No DHCP server on the network segment |
-| `ping` no response | ARP not resolving gateway MAC |
-| TCP stalls under double-NAT | Run with single-NAT (`-netdev user` under KVM); WSL's double-NAT drops guest TCP |
+| no network at boot | no E1000 on the PCI bus |
+| DHCP fails | no DHCP server on that segment |
+| `ping` gets nothing back | ARP isn't resolving the gateway MAC |
+| TCP stalls under double-NAT | run single-NAT (`-netdev user` under KVM). WSL's double-NAT drops guest TCP |
 
-## 9. Related files
+## Files
 
-- `src/drivers/e1000.cpp` - Ethernet frame source
-- `src/net/tcpip.cpp` / `network.cpp` - IPv4/ICMP/UDP/TCP + Ethernet/ARP
-- `src/net/ipv6.cpp` - IPv6 stack
-- `src/net/netfilter.cpp` - packet-filter pipeline
-- `src/net/unix_socket.cpp` - AF_UNIX sockets + `SCM_RIGHTS` fd-passing
-- `src/shell/linux_cmds.cpp` - `ping`, `ifconfig`, `ip`, `ss`, `curl`, `wget`
+- `src/drivers/e1000.cpp` Ethernet frame source
+- `src/net/tcpip.cpp`, `network.cpp` IPv4/ICMP/UDP/TCP plus Ethernet/ARP
+- `src/net/ipv6.cpp` IPv6
+- `src/net/netfilter.cpp` the filter pipeline
+- `src/net/unix_socket.cpp` AF_UNIX plus `SCM_RIGHTS` fd passing
+- `src/shell/linux_cmds.cpp` `ping`, `ifconfig`, `ip`, `ss`, `curl`, `wget`

@@ -1,31 +1,26 @@
-# Window Manager
+# Window manager
 
-`src/ui/window_manager.cpp` and `window_manager.h` implement the floating window system.
+`src/ui/window_manager.cpp` and `window_manager.h`. The floating window system.
 
-## 1. What it provides
+Every open window has a title bar with close, minimize and maximize buttons, a content area
+the owning app renders into, drag-to-move and resize handles, and a place in the focus stack.
 
-The window manager (WM) maintains a list of open windows. Each window has:
+## Lifecycle
 
-- A title bar with close, minimize, and maximize buttons.
-- A content area that the owning application renders into.
-- Drag-to-move and resize handles.
-- Z-order (focus stack).
+1. an app calls a launch function on `DesktopEnvironment`, e.g. `LaunchTerminal()`
+2. that creates a window through the WM with a title, initial position and size
+3. the WM assigns a window ID and puts it on the stack
+4. each frame the WM calls the app's `Render(win, x, y, w, h)` with the content region
+5. close gets clicked, the WM removes the window and calls the app's cleanup path
 
-## 2. Window lifecycle
+## Order
 
-1. An application calls a launch function in `DesktopEnvironment` (e.g., `LaunchTerminal()`).
-2. The launch function creates a new window via the WM with a title, initial position, and size.
-3. The WM assigns a window ID and adds it to the stack.
-4. Each frame the WM calls the application's `Render(win, x, y, w, h)` callback with the content region.
-5. When the close button is clicked, the WM removes the window and calls the application's cleanup path.
+Rendered back to front in Z-order, focused window on top. Clicking a window that isn't on top
+brings it forward.
 
-## 3. Rendering order
+## Title bar colours
 
-Windows are rendered in Z-order from back to front. The focused window is always on top. Clicking a window that is not on top brings it to the front.
-
-## 4. Title bar aesthetics
-
-Title bar colors come from UIConfig:
+From UIConfig:
 
 | Key | Default |
 | --- | --- |
@@ -38,25 +33,26 @@ Title bar colors come from UIConfig:
 | `window.min_btn` | 0xFFFFBD2E |
 | `window.max_btn` | 0xFF28C840 |
 
-## 5. Keyboard and mouse routing
+## Input
 
-All mouse events pass through the WM before reaching desktop icons. The WM checks hit areas in the following order:
+Every mouse event passes through the WM before desktop icons see anything. Hit areas get
+checked in this order:
 
-1. Title bar drag
-2. Close / minimize / maximize buttons
-3. Resize handles
-4. Content area (forwarded to application)
+1. title bar drag
+2. close / minimize / maximize buttons
+3. resize handles
+4. content area, forwarded to the app
 
-## 6. Common problems
+## When it breaks
 
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| Windows can't be moved | Drag state not set; check `HandleClick` in WM |
-| Wrong app gets clicks | Z-order not updated on focus click |
-| Close button does nothing | Application callback not returning clean state |
-| Rendering artifacts | Clip region not applied before application render |
+| windows won't move | drag state never set, look at `HandleClick` in the WM |
+| the wrong app gets clicks | Z-order not updated on the focus click |
+| close does nothing | the app callback didn't return clean state |
+| rendering artifacts | no clip region applied before the app render |
 
-## 7. Related files
+## Files
 
-- `src/ui/desktop.cpp` - calls WM render and input from within DesktopEnvironment
-- `src/ui/gui.cpp` - drawing primitives available to all applications inside their content region
+- `src/ui/desktop.cpp` calls WM render and input from inside DesktopEnvironment
+- `src/ui/gui.cpp` what apps have available inside their content region

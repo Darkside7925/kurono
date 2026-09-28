@@ -68,7 +68,7 @@ allocated block carries no header, so blob bytes are not stolen by allocator
 overhead.
 
 Pool sizing is bounded so it can never drive the system into OOM: the target is
-`min(pool_pct% of RAM, free - 256 MB headroom, half of free RAM, table
+`min(pool_pct% of RAM, free, 256 MB headroom, half of free RAM, table
 capacity)`. Default 20% of RAM, configurable 10-40%.
 
 ### The metadata table

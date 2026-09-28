@@ -1,28 +1,23 @@
-# VFS - Virtual Filesystem Interface
+# VFS
 
-`src/fs/vfs.cpp` and `vfs.h` implement the generic filesystem routing layer.
+`src/fs/vfs.cpp` and `vfs.h`. The routing layer in front of the filesystem backends.
 
-## 1. What it does
+One path-based interface that routes to KVFS, FAT32 or ext4, so callers don't have to
+know which filesystem they're on.
 
-The VFS provides a unified path-based interface that routes I/O requests to the appropriate backend: KVFS, FAT32, or ext4.
+## Mounts
 
-Without the VFS, every piece of code that does file I/O would need to know which filesystem to call directly. The VFS removes that coupling and lets the OS support multiple filesystems simultaneously.
+Path prefix to backend, longest prefix wins:
 
-## 2. Mount points
-
-The VFS uses mount points to map path prefixes to filesystem backends:
-
-| Mount path | Backend |
+| Mount | Backend |
 | --- | --- |
 | `/` | KVFS (default) |
-| `/mnt/fat` | FAT32 (if NVMe/USB mounted) |
-| `/mnt/ext4` | ext4 (if Linux partition mounted) |
+| `/mnt/fat` | FAT32, if an NVMe or USB volume is mounted |
+| `/mnt/ext4` | ext4, if a Linux partition is mounted |
 
-Route selection is done by longest prefix match.
+## Interface
 
-## 3. Interface
-
-The VFS exposes the same operations as KVFS but routes them through the mount table:
+Same operations as KVFS, routed through the mount table:
 
 ```cpp
 VFS::Open(path, flags)
@@ -35,12 +30,13 @@ VFS::Mkdir(path)
 VFS::Delete(path)
 ```
 
-## 4. Current usage
+## Honest status
 
-Most of the OS still calls KVFS directly because the VFS layer was added to support future expansion. New code should prefer the VFS interface so it benefits from the mount system automatically.
+Most of the OS still calls KVFS directly. This layer went in for future expansion, so
+new code should go through VFS and get the mount handling for free.
 
-## 5. Related files
+## Files
 
-- `src/fs/kvfs.cpp` - primary backend
-- `src/fs/fat32.cpp` - FAT32 backend
-- `src/linux/ext4.cpp` - ext4 backend for Linux partitions
+- `src/fs/kvfs.cpp` the primary backend
+- `src/fs/fat32.cpp` FAT32 backend
+- `src/linux/ext4.cpp` ext4 backend for Linux partitions

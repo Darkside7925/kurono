@@ -1,63 +1,72 @@
-# Desktop and Taskbar
+# Desktop and taskbar
 
-`src/ui/desktop.cpp` and `desktop.h` implement the desktop environment: the taskbar, start menu, desktop icons, right-click context menu, and the outermost event routing layer.
+`src/ui/desktop.cpp` and `desktop.h`. The desktop environment: taskbar, start menu, desktop
+icons, right-click context menu, and the outermost event routing.
 
-## 1. Architecture overview
+## Three classes
 
-Three classes cooperate to produce the desktop.
+**`Taskbar`** draws the bar (bottom or top) with the start button, running window buttons, the
+system tray (clock, battery, Wi-Fi, volume) and the search bar.
 
-**`Taskbar`** - renders the bottom (or top) bar with the start button, running window buttons, system tray (clock, battery, Wi-Fi, volume), and the search bar.
+**`Desktop`** draws the background, wallpaper or gradient, places icons, and handles
+double-click to launch and right-click for menus.
 
-**`Desktop`** - renders the desktop background (wallpaper or gradient), manages icon placement, handles double-click to launch and right-click for context menus.
+**`DesktopEnvironment`** owns both. All input goes through
+`DesktopEnvironment::HandleInput()`, and the main loop calls
+`DesktopEnvironment::Update()` and `Render()`.
 
-**`DesktopEnvironment`** - the coordinator that owns both Taskbar and Desktop. All input routes through `DesktopEnvironment::HandleInput()`. The main loop calls `DesktopEnvironment::Update()` and `DesktopEnvironment::Render()`.
+## Icons
 
-## 2. Icons
+`DesktopIcon` structs in a fixed array, `DESKTOP_MAX_ICONS = 32`. Each one has a name, path,
+position, type flag and selection state.
 
-Icons are `DesktopIcon` structs stored in a fixed array (`DESKTOP_MAX_ICONS = 32`). Each icon has a name, path, position, type flag, and selection state.
+`Desktop::ArrangeIcons()` lays them out in a grid from the top-left margin using the spacing
+values from `UIConfig`. Call it again after adding or removing an icon and the grid resizes.
 
-`Desktop::ArrangeIcons()` places icons in a grid starting from the top-left margin, using the spacing values from `UIConfig`. Calling `ArrangeIcons()` again after adding or removing icons resizes the grid.
+## Context menu
 
-## 3. Context menu
+Right-click the desktop. Two modes:
 
-Right-clicking the desktop opens a context menu. The menu has two modes:
+- empty space: New Folder, New File, Refresh, Settings
+- on an icon: Open, Delete, Refresh, Properties
 
-- **Empty space**: New Folder, New File, Refresh, Settings
-- **Icon targeted**: Open, Delete, Refresh, Properties
+`context_menu_target` records which icon was right-clicked, -1 for empty space.
+`RenderContextMenu()` draws the menu from config colours and sizes, and `HandleClick()` checks
+whether a menu is open before processing any other click.
 
-The `context_menu_target` field records which icon was right-clicked (-1 for empty space). `RenderContextMenu()` draws the menu using config-driven colors and sizes. `HandleClick()` checks whether a context menu is open before processing any other click.
+## Creating and deleting
 
-## 4. Creating and deleting files and folders
-
-`Desktop::CreateFolderInteractive()` creates "New Folder N" in KVFS at `/home/user/Desktop/`. Each call increments `new_folder_counter`. The new icon appears immediately.
-
+`Desktop::CreateFolderInteractive()` makes "New Folder N" in KVFS under `/home/user/Desktop/`,
+bumping `new_folder_counter` each time, and the icon shows up immediately.
 `Desktop::CreateFileInteractive()` does the same for "New File N.txt".
 
-`Desktop::RemoveIcon(int)` removes an icon from the array, deletes the backing KVFS entry, and calls `ArrangeIcons()`.
+`Desktop::RemoveIcon(int)` drops the icon, deletes the KVFS entry, and re-arranges.
 
-## 5. Taskbar configuration
+## Taskbar config
 
-All taskbar visual properties and toggles are read from `UIConfig` at init time and after `kurono reload`. The relevant keys are:
+Everything visual is read from `UIConfig` at init and again after `kurono reload`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `taskbar.height` | 44 | Bar height in pixels |
+| `taskbar.height` | 44 | bar height in pixels |
 | `taskbar.position` | bottom | `bottom` or `top` |
-| `taskbar.bg` | 0xFF0C0C14 | Background color |
-| `taskbar.text` | 0xFFBBBBCC | Text color |
-| `taskbar.show_clock` | 1 | Show the clock |
-| `taskbar.show_search` | 1 | Show the search bar |
+| `taskbar.bg` | 0xFF0C0C14 | background colour |
+| `taskbar.text` | 0xFFBBBBCC | text colour |
+| `taskbar.show_clock` | 1 | show the clock |
+| `taskbar.show_search` | 1 | show the search bar |
 
-Call `Taskbar::ReloadFromConfig()` to apply changes at runtime without rebooting.
+`Taskbar::ReloadFromConfig()` applies it live, no reboot.
 
-## 6. Wallpaper
+## Wallpaper
 
-`Desktop::SetWallpaper(color)` sets a solid or gradient wallpaper color. `Desktop::SetWallpaperImage(img)` sets a pixel-art scale image. The rendered wallpaper is cached in `gradient_cache` and blitted whole-frame for performance.
+`Desktop::SetWallpaper(color)` for a solid or gradient colour,
+`Desktop::SetWallpaperImage(img)` for a scaled image. The rendered result is cached in
+`gradient_cache` and blitted whole-frame, because redrawing it every frame is too slow.
 
-## 7. Related files
+## Files
 
-- `src/system/ui_config.cpp` - config source for all visual settings
-- `src/ui/window_manager.cpp` - window layer rendered above the desktop
-- `src/ui/wayland_server.cpp` - in-kernel Wayland compositor that can bridge to the window manager
-- `src/fs/kvfs.cpp` - KVFS used for desktop file creation and deletion
-- `src/apps/settings.cpp` - launched from the context menu's Settings item
+- `src/system/ui_config.cpp` the config source for all of it
+- `src/ui/window_manager.cpp` the window layer above the desktop
+- `src/ui/wayland_server.cpp` the in-kernel compositor that can bridge to the WM
+- `src/fs/kvfs.cpp` desktop file create and delete
+- `src/apps/settings.cpp` launched from the context menu's Settings item

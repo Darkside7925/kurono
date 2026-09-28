@@ -1,30 +1,20 @@
-# Display Manager
+# Display manager
 
-`src/drivers/display_mgr.cpp` and `display_mgr.h` provide a multi-backend display manager that routes to BGA, VirtIO GPU, Intel, NVIDIA, or AMD based on GPU probe results.
+`src/drivers/display_mgr.cpp` and `display_mgr.h`. Routes display work to BGA, VirtIO
+GPU, Intel, NVIDIA or AMD based on what the GPU probe found.
 
-## 1. What it does
+One API for mode selection, runtime mode switching, EDID reading, DPI scaling, gamma and
+brightness, VSync (off, on, adaptive) and double buffering.
 
-The display manager abstracts away the differences between display backends. It provides a unified API for:
+## Backend order
 
-- Mode selection (10 predefined modes from 640x480 through 3840x2160)
-- Runtime mode switching
-- EDID reading
-- DPI scaling
-- Gamma and brightness control
-- VSync control (off, on, adaptive)
-- Double buffering
+1. VirtIO GPU, if `VirtIOGPU::IsDetected()`. 2D resources and scanout, best quality in a
+   VM.
+2. BGA, if `BGA::IsAvailable()`.
+3. Native: Intel, NVIDIA or AMD, whichever the GPU probe called primary. Classified from
+   the vendor ID.
 
-## 2. Backend selection
-
-The display manager tries backends in this order:
-
-1. **VirtIO GPU** - if detected via `VirtIOGPU::IsDetected()`, provides 2D resource management and scanout. This is the highest quality path in VMs.
-2. **BGA** - Bochs Graphics Adapter fallback for QEMU/Bochs via `BGA::IsAvailable()`.
-3. **Native** - Intel, NVIDIA, or AMD based on GPU probe primary GPU selection. The backend is classified from the detected GPU vendor ID.
-
-## 3. Mode table
-
-The display manager exposes 10 predefined modes:
+## Modes
 
 | Mode | Resolution |
 | --- | --- |
@@ -39,52 +29,48 @@ The display manager exposes 10 predefined modes:
 | 8 | 2560x1440 |
 | 9 | 3840x2160 |
 
-## 4. VirtIO GPU backend
+## VirtIO GPU path
 
-When VirtIO GPU is selected, the display manager:
+1. `VirtIOGPU::GetDisplayInfo(0, &w, &h)` for the native resolution, 1920x1080 if that
+   fails
+2. allocate a framebuffer from the kernel heap
+3. `VirtIOGPU::CreateResource2D(w, h, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM)`
+4. `VirtIOGPU::AttachBacking()`
+5. `VirtIOGPU::SetScanout()`
 
-1. Calls `VirtIOGPU::GetDisplayInfo(0, &w, &h)` to get the native resolution (defaults to 1920x1080 if unavailable).
-2. Allocates a framebuffer from the kernel heap.
-3. Creates a 2D resource via `VirtIOGPU::CreateResource2D(w, h, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM)`.
-4. Attaches the backing store via `VirtIOGPU::AttachBacking()`.
-5. Sets the scanout via `VirtIOGPU::SetScanout()`.
+## BGA path
 
-## 5. BGA backend
+1. read width, height and BPP from the BGA driver
+2. pitch is `width * (bpp / 8)`
+3. framebuffer address from `BGA::GetFramebuffer()`
+4. match the resolution against the mode table
 
-When BGA is selected, the display manager:
+## Native path
 
-1. Reads BGA width, height, and BPP from the BGA driver.
-2. Calculates pitch as `width * (bpp / 8)`.
-3. Gets the framebuffer address from `BGA::GetFramebuffer()`.
-4. Matches the resolution to the mode table.
+Uses the native graphics framebuffer the kernel already has, classified from the GPU
+probe results.
 
-## 6. Native backend
+## Double buffering
 
-When a native GPU is selected (Intel, NVIDIA, AMD), the display manager uses the native graphics framebuffer provided by the kernel. The backend is classified from the GPU probe results.
+`EnableDoubleBuffering()` allocates a back buffer from the kernel heap. `SwapBuffers()`
+blasts it to the framebuffer with SSE2 non-temporal stores, and on VirtIO GPU it calls
+`VirtIOGPU::PresentFramebuffer()` afterwards.
 
-## 7. Double buffering
+## When it breaks
 
-The display manager can enable double buffering via `EnableDoubleBuffering()`. When enabled:
-
-- A back buffer is allocated from the kernel heap.
-- `SwapBuffers()` uses SSE2 non-temporal stores to blast the back buffer to the framebuffer.
-- For VirtIO GPU, `VirtIOGPU::PresentFramebuffer()` is called after the swap.
-
-## 8. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| No display backend selected | GPU probe failed or no compatible backend found |
-| VirtIO GPU mode switch fails | Resource allocation failed or scanout set failed |
-| BGA mode switch fails | BAR0 not programmed or I/O port write failed |
-| Double buffering not working | Back buffer allocation failed or WC remap issue |
+| no backend selected | GPU probe failed, or nothing compatible was found |
+| VirtIO GPU mode switch fails | resource allocation or scanout set failed |
+| BGA mode switch fails | BAR0 not programmed, or the port write failed |
+| double buffering does nothing | back buffer allocation failed, or the WC remap didn't take |
 
-## 9. Related files
+## Files
 
-- `src/drivers/gpu_probe.cpp` - GPU detection for backend classification
-- `src/drivers/graphics.cpp` - framebuffer operations and swap path
-- `src/drivers/bga.cpp` - BGA driver
-- `src/drivers/virtio_gpu.cpp` - VirtIO GPU driver
-- `src/drivers/intel_gpu.cpp` - Intel GPU driver
-- `src/drivers/nvidia_gpu.cpp` - NVIDIA GPU driver
-- `src/drivers/amd_gpu.cpp` - AMD GPU driver
+- `src/drivers/gpu_probe.cpp` detection and backend classification
+- `src/drivers/graphics.cpp` framebuffer operations and the swap path
+- `src/drivers/bga.cpp`
+- `src/drivers/virtio_gpu.cpp`
+- `src/drivers/intel_gpu.cpp`
+- `src/drivers/nvidia_gpu.cpp`
+- `src/drivers/amd_gpu.cpp`

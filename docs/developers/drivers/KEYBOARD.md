@@ -1,36 +1,40 @@
-# Keyboard Driver
+# Keyboard
 
-`src/drivers/keyboard.cpp` and `keyboard.h` implement PS/2 keyboard support.
+`src/drivers/keyboard.cpp` and `keyboard.h`. PS/2 keyboard.
 
-## 1. What it does
+Talks to the 8042 controller for scan codes, translates them to logical keys, posts them
+to a software queue the input manager drains every frame.
 
-The keyboard driver communicates with the 8042 PS/2 controller to receive scan codes from an attached keyboard. It translates scan codes to logical key values and posts them to a software queue that the input manager drains each frame.
+## Init
 
-## 2. Initialization
+Registers IRQ 1 with the HAL during bring-up, enables the keyboard port on the 8042,
+sets the LED state. On real laptops the 8042 is fragile: the driver re-arms the keyboard
+after the PS/2 aux (mouse) port comes up, because some controllers drop keyboard state
+during auxiliary bring-up.
 
-The driver registers an IRQ 1 handler with the HAL during kernel bring-up. It programs the 8042 to enable the keyboard port and sets an LED state. On real laptop hardware, the 8042 initialization is fragile - the driver re-arms the keyboard after the PS/2 auxiliary (mouse) port is initialized because some controllers drop keyboard state during auxiliary bring-up.
+## Scan codes
 
-## 3. Scan code translation
+Raw codes map through a logical key table. Extended codes, the 0xE0 prefix, are handled.
+That covers arrows, Home, End, Delete and the numpad extras.
 
-Raw scan codes are converted to a logical key table. The driver handles extended scan codes (0xE0 prefix) for keys like arrow keys, Home, End, Delete, and the numpad extras.
+The table is US QWERTY. Other layouts mean editing the table in `keyboard.cpp`.
 
-The current translation table covers a standard US QWERTY layout. Extending it for other layouts requires modifying the table in `keyboard.cpp`.
+## Queue
 
-## 4. Key queue
+Translated characters go into a small circular buffer. The main loop drains it into the
+focused window or the desktop's input handler.
 
-Translated key characters are placed in a small circular buffer. The main loop drains this buffer and passes characters to the currently focused window or the desktop's input handler.
+## When it breaks
 
-## 5. Common problems
-
-| Problem | Likely cause |
+| Symptom | Cause |
 | --- | --- |
-| No keyboard input | IRQ 1 not registered or 8042 init failure |
-| Garbled keys | Scan code set mismatch (Set 1 vs Set 2) |
-| Missed keystrokes | Buffer overflow if queue not drained fast enough |
-| Laptop touchpad interfering | PS/2 aux init order; keyboard needs re-arm |
+| no keyboard input | IRQ 1 not registered, or 8042 init failed |
+| garbled keys | scan code set mismatch, Set 1 vs Set 2 |
+| missed keystrokes | queue overflow, it isn't being drained fast enough |
+| laptop touchpad fights the keyboard | PS/2 aux init order, the keyboard needs re-arming |
 
-## 6. Related files
+## Files
 
-- `src/hal/hal.cpp` - IRQ registration
-- `src/drivers/mouse.cpp` - PS/2 auxiliary path that can affect keyboard
-- `src/system/input_manager.cpp` - consumer of the keyboard queue
+- `src/hal/hal.cpp` IRQ registration
+- `src/drivers/mouse.cpp` the aux path that can disturb the keyboard
+- `src/system/input_manager.cpp` drains the keyboard queue

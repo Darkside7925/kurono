@@ -1,65 +1,69 @@
-# Kernel Core
+# kurono_kernel.cpp
 
-`src/kernel/kurono_kernel.cpp` is the boot coordinator and main loop for the entire OS. It is the most important single file in the project.
+The boot coordinator and main loop for the whole OS. Most important single file in the
+project.
 
-## 1. What this file is
+Not a stub. The live C++ equivalent of a kernel boot script. Everything Kurono
+initialises, registers and runs goes through it. Hunting a boot-time problem? Start
+here.
 
-This is not a minimal stub. It is the live C++ equivalent of a kernel boot script. Everything that Kurono initializes, registers, and runs flows through here. If you are hunting down a boot-time problem, start here.
+## Boot order
 
-## 2. Boot sequence overview
+The order is deliberate. Change it without understanding the dependencies and it will
+crash.
 
-The kernel performs initialization in a deliberate fixed order. Changing that order without understanding the dependencies will likely produce a crash.
+1. serial logging, so everything after it has somewhere to go
+2. Multiboot2 info normalised when needed
+3. panic, early, so crash rendering has a framebuffer even if graphics dies later
+4. HAL: IDT, PIC, interrupts
+5. PMM, built from the Multiboot memory map
+6. heap, on top of the PMM
+7. scheduler
+8. KVFS
+9. UIConfig, from `/etc/kurono/ui.conf`
+10. timer and RTC
+11. the display path: GOP, then VBE, falling back to BGA
+12. keyboard and mouse
+13. shell plus every subsystem command registration
+14. desktop, then icons
+15. main loop
 
-1. Serial logging is brought up so all subsequent debug output has a path out.
-2. Multiboot2 info is normalized to a compatible structure when needed.
-3. Panic is initialized early so crash rendering has a framebuffer path even if the graphics driver fails later.
-4. HAL (IDT, PIC, interrupts) is initialized.
-5. Physical memory manager (PMM) is set up from the Multiboot memory map.
-6. Heap allocator is initialized on top of PMM.
-7. Scheduler is started.
-8. KVFS virtual filesystem is initialized.
-9. UIConfig is loaded from `/etc/kurono/ui.conf`.
-10. Timer and RTC are started.
-11. Display path is chosen (GOP > VBE > BGA fallback).
-12. Input path (keyboard, mouse) is initialized.
-13. Shell and all subsystem commands are registered.
-14. Desktop environment is initialized and icons are placed.
-15. Main loop begins.
+## Main loop
 
-## 3. Main loop
+Runs forever after boot. Every pass:
 
-The main loop runs indefinitely after boot. Each iteration:
+1. advance time from the PIT
+2. drain deferred settings work
+3. tick audio output
+4. poll the E1000 if there is one
+5. poll the input queue
+6. tick the scheduler
+7. push mouse and keyboard events into the desktop
+8. update and render the desktop
+9. refresh periodic views like the task manager
 
-1. Advances time via PIT measurements.
-2. Polls deferred settings work.
-3. Ticks audio output.
-4. Polls the E1000 NIC if present.
-5. Polls the input queue.
-6. Ticks the scheduler.
-7. Drains mouse and keyboard events into the desktop.
-8. Updates and renders the desktop.
-9. Refreshes periodic views like Task Manager.
+Polling on purpose. Not a limitation, it's what the hardware compatibility story needs.
 
-The loop is intentionally polling-based. This is not a limitation - it is a deliberate architectural choice that matches the project's hardware compatibility requirements.
+## Emergency mode
 
-## 4. Emergency mode
+If the normal boot path looks unsafe, it drops into an emergency profile: VGA text
+shell, minimum services, no desktop. Useful for diagnosing hardware failures before the
+GPU is ready.
 
-If the system detects that the normal boot path is unsafe, it falls into an emergency profile. This profile uses a VGA text shell, registers only the minimum services needed for diagnosis, and skips the desktop entirely. Useful for diagnosing hardware failures before the GPU is ready.
-
-## 5. Common failure points
+## Where it falls over
 
 | Symptom | Most likely cause |
 | --- | --- |
-| Black screen before shell appears | HAL or IDT setup failure |
-| Crash before desktop | PMM, heap, or display path |
-| No keyboard response | 8042/PS2 init order |
-| Fonts wrong or missing | Font init before display ready |
-| Freezes in main loop | Timer or scheduler not ticking |
+| black screen before the shell | HAL or IDT setup failure |
+| crash before the desktop | PMM, heap, or the display path |
+| no keyboard response | 8042/PS2 init order |
+| fonts wrong or missing | font init ran before display was ready |
+| freeze in the main loop | timer or scheduler stopped ticking |
 
-## 6. Related files
+## Files
 
-- `src/kernel/panic.cpp` - crash screen
-- `src/hal/hal.cpp` - IDT and PIC
-- `src/kernel/pmm.cpp` - physical memory
-- `src/kernel/heap.cpp` - heap allocator
-- `src/drivers/display.cpp` - display path selection
+- `src/kernel/panic.cpp` crash screen
+- `src/hal/hal.cpp` IDT and PIC
+- `src/kernel/pmm.cpp` physical memory
+- `src/kernel/heap.cpp` heap allocator
+- `src/drivers/display.cpp` display path selection

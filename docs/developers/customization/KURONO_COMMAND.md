@@ -1,20 +1,18 @@
-# `kurono` Shell Command
+# The `kurono` command
 
-The `kurono` command is the primary system control interface in the Kurono shell. It provides runtime management operations that affect the running OS without requiring a reboot.
+The main system control surface in the shell. Runtime management without a reboot.
 
-## 1. Subcommands
+## `kurono reload`
 
-### `kurono reload`
+Re-reads `/etc/kurono/ui.conf` out of KVFS and pushes the values at the live desktop:
 
-Re-reads `/etc/kurono/ui.conf` from KVFS and applies all current values to the live desktop environment. This includes:
+- taskbar colours, height, position and visibility toggles
+- desktop background colour, icon size and spacing
+- context menu colours and dimensions
+- window manager chrome colours and sizes
+- task manager row height and feature flags
 
-- Taskbar colors, height, position, and visibility toggles
-- Desktop background color, icon size and spacing
-- Context menu colors and dimensions
-- Window manager chrome colors and sizes
-- Task Manager row height and feature flags
-
-After reload completes, the screen refreshes with the new settings immediately.
+The screen refreshes immediately after.
 
 ```
 $ kurono reload
@@ -23,9 +21,7 @@ $ kurono reload
 [Taskbar] config reloaded
 ```
 
-### `kurono info`
-
-Prints a summary of the running system:
+## `kurono info`
 
 ```
 $ kurono info
@@ -39,29 +35,24 @@ Uptime:    0d 00:03:14
 UIConfig:  version 3  /  42 entries loaded
 ```
 
-### `kurono config`
+## `kurono config`
 
-Prints the full current contents of `/etc/kurono/ui.conf`:
+Dumps the current `/etc/kurono/ui.conf`.
 
-```
-$ kurono config
-# ═════════════════════════════════════════
-#  Kurono OS - UI configuration
-...
-```
+## `kurono vm start` and `kurono vm stop`
 
-### `kurono vm start` / `kurono vm stop`
+Starts or stops the Debian guest through the hypervisor. Wants Intel VMX.
 
-Starts or stops the Debian Linux guest via the hypervisor. Requires Intel VMX support.
+## Where it lives
 
-## 2. How it is implemented
+Registered in `KuronoShell::RegisterBuiltins()` in `src/shell/shell.cpp` and handled by
+`ShellBuiltins::cmd_kurono()`, which parses the first argument as a subcommand.
 
-The `kurono` command is registered in `KuronoShell::RegisterBuiltins()` in `src/shell/shell.cpp`. The handler is `ShellBuiltins::cmd_kurono()`. It parses the first argument as a subcommand and dispatches accordingly.
+`reload` calls `DesktopEnvironment::ReloadFromConfig()`, which runs `UIConfig::Reload()`
+then `Taskbar::ReloadFromConfig()` and `Desktop::ReloadFromConfig()`.
 
-`reload` calls `DesktopEnvironment::ReloadFromConfig()` which calls `UIConfig::Reload()` then `Taskbar::ReloadFromConfig()` and `Desktop::ReloadFromConfig()`.
+## More
 
-## 3. Related documentation
-
-- `customization/UI_CUSTOMIZATION.md` - how to use reload in practice
-- `system/UI_CONFIG.md` - UIConfig technical reference
-- `shell/SHELL.md` - shell architecture
+- `customization/UI_CUSTOMIZATION.md` how to actually use reload
+- `system/UI_CONFIG.md` the config reference
+- `shell/SHELL.md` shell architecture

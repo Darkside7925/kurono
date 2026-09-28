@@ -1,74 +1,80 @@
-# Task Manager
+# Task manager
 
-`src/apps/task_manager.cpp` and `task_manager.h` implement the Task Manager application.
+`src/apps/task_manager.cpp` and `task_manager.h`. Five tabs (`TMTab`):
+`TM_PROCESSES`, `TM_PERFORMANCE`, `TM_DETAILS`, `TM_SERVICES`, `TM_WINDOWS`.
 
-## 1. What it shows
+## Processes
 
-The Task Manager has **five tabs** (`TMTab`: `TM_PROCESSES`, `TM_PERFORMANCE`,
-`TM_DETAILS`, `TM_SERVICES`, `TM_WINDOWS`).
+Sortable list. Each row has PID, name, CPU%, memory, thread count, state, user and
+priority. Rows are labelled kernel vs user. A user (Linux) process's memory is
+RSS-style: its mapped regions plus its `brk` heap, not a made-up per-process number.
 
-**Processes** - a sortable list of running processes. Each row shows PID, name,
-CPU%, memory, thread count, state, user, and priority. Rows are **labelled kernel
-vs user**; a user (Linux) process's memory is computed RSS-style (its mapped
-regions plus its `brk` heap), not a fabricated per-process figure.
+## Performance
 
-**Performance** - real-time graphs for CPU and memory usage with history plots,
-plus uptime, core count, and network I/O. **Memory is real physical RAM
-accounting from the PMM** (`PMM::GetTotalMemory()` / `GetFreeMemory()` → total /
-used / free) with a separate **kernel-heap** sub-total
-(`KernelHeap::GetTotal/Used/Free`) - *not* a sum of per-process `mem_kb`. The
-**uptime is monotonic** via `Scheduler::NowMs()` (boot-relative); the old
-wall-clock-derived path produced a nonsensical "899-hour" uptime and is gone.
+Live CPU and memory graphs with history, plus uptime, core count and network I/O.
 
-**Details** - detailed view of the selected process including I/O counters and full state.
+Memory here is real. `PMM::GetTotalMemory()` and `GetFreeMemory()` give total, used
+and free, with a separate kernel-heap sub-total from
+`KernelHeap::GetTotal/Used/Free`. Not a sum of per-process `mem_kb`.
 
-**Services** - list of Kurono system services with name, PID, type (Kernel/System/User), and running status.
+Uptime is monotonic off `Scheduler::NowMs()` (boot-relative). The old wall-clock
+version produced a nonsense "899 hour" uptime and is gone.
 
-**Windows** - open window-manager windows get their **own tab** now; they are
-**no longer listed as processes** (a window is its WM record + framebuffer, not a
-scheduler task). Rows here can be closed/restarted via the action menu, mapping
-onto `WindowManager::CloseWindow`.
+## Details
 
-## 2. Process list
+Everything on the selected process, including I/O counters and full state.
 
-The process list is populated by `RefreshProcesses()`, which reads the kernel's
-scheduler/process table (and the Linux-process records for richer command names +
-`brk` heap size). Windows are intentionally excluded - they live in the Windows
-tab. The list supports sorting by column (Name, PID, CPU, Memory) ascending or
-descending; click the column header to toggle. Column geometry was reworked to
-fix earlier column-collision layout bugs, and the window is taller (560×500) so
-the Performance panes and process rows fit without clipping.
+## Services
 
-## 3. Kill and Restart
+Kurono services with name, PID, type (kernel/system/user) and running status.
 
-Clicking a process row selects it. Clicking the same row again opens the action popup menu:
+## Windows
 
-- **Kill** - removes the process from the list immediately. On real hardware this sends SIGKILL.
-- **Restart** - resets the process's CPU usage and state back to a running condition.
+Open WM windows get their own tab now, they are no longer listed as processes. A
+window is a WM record plus a framebuffer, not a scheduler task. Rows here can be closed
+or restarted from the action menu, which lands on `WindowManager::CloseWindow`.
 
-The kill/restart feature can be disabled by setting `taskmgr.allow_kill = 0` in `/etc/kurono/ui.conf`.
+## The process list
 
-## 4. Performance graphs
+`RefreshProcesses()` fills it from the kernel scheduler/process table, plus the Linux
+process records for better command names and `brk` size. Windows are excluded on
+purpose, they live in the Windows tab. Sort by Name, PID, CPU or Memory, click the
+header to flip direction. Column geometry got reworked to fix the old column
+collisions, and the window is taller now (560x500) so the Performance panes and process
+rows fit without clipping.
 
-`Tick()` is called each frame from the main loop. It advances the 60-sample history ring buffer and updates the live CPU and memory counters. `RenderPerformance()` draws the graph area using the history values.
+## Kill and restart
 
-## 5. Opening the Task Manager
+Click a row to select, click the same row again for the action menu:
 
-The start menu, the keyboard shortcut Ctrl+Shift+Esc (when implemented), and `DesktopEnvironment::LaunchTaskManager()` all open the same window. Only one instance is open at a time.
+- Kill: drops it from the list immediately. On real hardware it sends SIGKILL.
+- Restart: resets CPU usage and state back to running.
 
-## 6. UIConfig keys
+Turn the whole thing off with `taskmgr.allow_kill = 0` in `/etc/kurono/ui.conf`.
+
+## Graphs
+
+`Tick()` runs every frame from the main loop. It advances a 60-sample history ring and
+updates the live CPU and memory counters. `RenderPerformance()` draws from the history.
+
+## Opening it
+
+Start menu, `DesktopEnvironment::LaunchTaskManager()`, and Ctrl+Shift+Esc when that
+gets wired up. One instance at a time.
+
+## UIConfig keys
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `taskmgr.row_h` | 20 | Row height in process list |
-| `taskmgr.allow_kill` | 1 | Enables Kill/Restart action menu |
+| `taskmgr.row_h` | 20 | row height in the process list |
+| `taskmgr.allow_kill` | 1 | enables the Kill/Restart action menu |
 
-## 7. Related files
+## Files
 
-- `src/apps/task_manager.cpp` / `.h` - the app
-- `src/proc/scheduler.cpp` - process table source + `Scheduler::NowMs()` (uptime/CPU clock)
-- `src/kernel/pmm.cpp` - `PMM::GetTotalMemory/GetFreeMemory` (real RAM accounting)
-- `src/kernel/heap.cpp` - `KernelHeap::GetTotal/Used/Free` (kernel-heap sub-total)
-- `src/ui/window_manager.cpp` - Windows-tab rows + `CloseWindow`
-- `src/system/ui_config.cpp` - `taskmgr.*` configuration
-- `src/ui/desktop.cpp` - `LaunchTaskManager()` entry point
+- `src/apps/task_manager.cpp` / `.h` the app
+- `src/proc/scheduler.cpp` process table plus `Scheduler::NowMs()`
+- `src/kernel/pmm.cpp` `PMM::GetTotalMemory/GetFreeMemory`, real RAM numbers
+- `src/kernel/heap.cpp` `KernelHeap::GetTotal/Used/Free`, kernel heap sub-total
+- `src/ui/window_manager.cpp` Windows-tab rows and `CloseWindow`
+- `src/system/ui_config.cpp` the `taskmgr.*` keys
+- `src/ui/desktop.cpp` `LaunchTaskManager()` entry point
