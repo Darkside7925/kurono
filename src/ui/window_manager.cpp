@@ -307,6 +307,7 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->last_w = w; win->last_h = h;
     win->had_last = false;
     win->monitor_id = 0;
+    win->app_icon = -1;               // derive from title unless pinned (satoru)
 
     UpdateContentArea(win);
     UpdateWindowMonitor(win);   // assign to the output under its center (satoru)

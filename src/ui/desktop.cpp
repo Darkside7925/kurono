@@ -33,6 +33,8 @@
 #include "../apps/task_manager.h"
 #include "../apps/browser.h"
 #include "../apps/media_player.h"
+#include "../apps/firefox_launcher.h"   // install check for LaunchFirefox (satoru)
+#include "../proc/kernel_processes.h"   // detached shell launch (no terminal) (satoru)
 #include "../proc/scheduler.h"
 #include "../hal/hal.h"
 
@@ -2365,6 +2367,23 @@ void DesktopEnvironment::LaunchBrowser(){
 }
 void DesktopEnvironment::LaunchMediaPlayer(){
     MediaPlayerApp::Open();
+}
+void DesktopEnvironment::LaunchFirefox(){
+    // run the full `firefox` shell flow (lazy restore / install / exec) on the
+    // shell kernel-process, detached - no terminal window. the gui thread only
+    // queues + toasts; firefox's own wayland window appears when gecko maps
+    // its toplevel. (satoru)
+    bool installed = FirefoxLauncher::IsInstalled();
+    if(!KernelProcesses::RunShellCommandDetached("firefox")){
+        NotificationManager::Post("Firefox",
+            "Already starting - give it a moment.",
+            NotificationManager::ICON_INFO, 4000);
+        return;
+    }
+    NotificationManager::Post("Firefox",
+        installed ? "Starting Firefox..."
+                  : "Setting up Firefox - first launch takes a minute...",
+        NotificationManager::ICON_INFO, 6000);
 }
 
 // session control --------------------------------------------------------

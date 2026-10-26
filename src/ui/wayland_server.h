@@ -72,6 +72,7 @@ namespace WaylandServer {
         WL_CALLBACK           = 19,
         WL_SHM_POOL           = 20,
         WL_SUBSURFACE         = 21,
+        WL_REGION             = 22,
     };
 
     struct DamageRect {
@@ -124,6 +125,30 @@ namespace WaylandServer {
         int32_t  shadow_w, shadow_h;
         uint32_t shadow_fmt;     // wl_shm format of the shadow pixels (satoru)
         bool     shadow_filled;  // first full copy done - partial copies valid after (satoru)
+        // for wl_surface: window title from xdg_toplevel.set_title (stored on
+        // the toplevel's parent surface, since the surface owns the bridged wm
+        // window) plus an app-icon id resolved from set_app_id/set_title so the
+        // wm titlebar + taskbar can show the app's own logo. 0xFF = no hint. (satoru)
+        char     title[48];
+        uint8_t  app_icon_hint;
+        // for wl_surface: xdg_surface.set_window_geometry - the visible window
+        // rect within the surface buffer (excludes csd shadow margins). blits
+        // shift by -geo_x/-geo_y and the window is sized geo_w x geo_h, so the
+        // margins never paint (they showed as a black band around firefox).
+        // geo_w == 0 means never set (use the full buffer). (satoru)
+        int32_t  geo_x, geo_y;
+        int32_t  geo_w, geo_h;
+        // wl_surface.set_input_region: true when the client set an EMPTY
+        // input region = "input passes through me". firefox's webrender
+        // output subsurfaces do exactly this - they are pure output layers
+        // with no event listener, so pointer/keyboard events targeted at
+        // them vanish inside the client (the every-input-dead-in-firefox
+        // bug). hit-testing must skip such surfaces and fall through to the
+        // real gtk toplevel underneath. (satoru)
+        bool     input_none;
+        // for WL_REGION objects: whether any wl_region.add arrived - an
+        // empty region on set_input_region is the pass-through marker. (satoru)
+        bool     region_has_rect;
     };
 
     struct Client {
@@ -142,9 +167,21 @@ namespace WaylandServer {
         uint32_t serial_next;
         bool     fatal;          // protocol error - drop on next dispatch
 
-        // input: ids of the wl_pointer / wl_keyboard resources this client
-        // created via wl_seat.get_pointer / get_keyboard (0 = none). a
-        // single seat is assumed so we track one of each. (satoru)
+        // input: ids of ALL wl_pointer / wl_keyboard resources this client
+        // created via wl_seat.get_pointer / get_keyboard. firefox binds the
+        // seat TWICE (gtk/gdk once, gecko's native-layer compositor once) and
+        // the old single-slot tracking kept only the LAST bind - every input
+        // event then went to gecko's listener-less proxy and gdk never saw a
+        // thing (the all-input-dead-in-firefox bug). a real compositor
+        // broadcasts each event to every resource of the seat. slot 0 kept as
+        // pointer_id/keyboard_id aliases via helpers in the cpp. (satoru)
+        static const int WL_MAX_INPUT_RES = 8;
+        uint32_t pointer_ids[WL_MAX_INPUT_RES];
+        int      pointer_id_count;
+        uint32_t keyboard_ids[WL_MAX_INPUT_RES];
+        int      keyboard_id_count;
+        // legacy single-id views: first live resource (0 = none). still used
+        // by the quick has-a-pointer checks. (satoru)
         uint32_t pointer_id;
         uint32_t keyboard_id;
         // id of the wl_surface currently holding pointer / keyboard focus
@@ -186,8 +223,21 @@ namespace WaylandServer {
     // the wire; mods is a shift/ctrl/alt/meta bitmask. (satoru)
     void ForwardPointerMotion(int gx, int gy);
     void ForwardPointerButton(int gx, int gy, int evdev_button, bool pressed);
+    // axis 0 = vertical scroll; value is in surface pixels (converted to
+    // wl_fixed on the wire). positive scrolls the content down. (satoru)
     void ForwardPointerAxis(int gx, int gy, int axis, int value);
     void ForwardKey(int key, bool pressed, uint32_t mods);
+
+    // true when the wm window id belongs to a bridged wayland surface - the
+    // desktop input path uses this to route raw key edges to ForwardKey
+    // instead of the kurono char pipeline. (satoru)
+    bool IsWaylandWindow(int win_id);
+
+    // drop every client whose socket peer is the given (killed) process:
+    // closes its bridged wm windows and frees the client slot, so a task
+    // manager kill visibly closes the app instead of leaving a frozen husk
+    // on screen. returns the number of clients dropped. (satoru)
+    int DropClientsOfPid(uint32_t pid);
 
     // Linux evdev button codes for ForwardPointerButton(). (satoru)
     static const int WL_BTN_LEFT   = 0x110;
