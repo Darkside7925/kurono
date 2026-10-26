@@ -78,6 +78,9 @@ void  SetVolume(StreamID id, int volume_0_to_100);
 int   GetVolume(StreamID id);
 void  SetPan   (StreamID id, int pan_minus100_to_100);    // -100=L, +100=R
 void  SetMute  (StreamID id, bool mute);
+// pause/resume playback without dropping the ring (pulse CORK): a paused
+// stream keeps accepting Write()s but the mixer stops pulling from it. (satoru)
+void  SetPaused(StreamID id, bool paused);
 bool  IsActive (StreamID id);
 StreamState GetState(StreamID id);
 StreamStats GetStats(StreamID id);

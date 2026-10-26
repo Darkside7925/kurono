@@ -96,6 +96,13 @@ struct Window {
     // a window belongs to the monitor whose rect contains its center; the
     // wm recomputes this on move/resize. defaults to 0 (primary). (satoru)
     int monitor_id;
+
+    // app icon id (AppIcons::Id) shown in the titlebar + taskbar button.
+    // -1 = none pinned: the renderers derive one from the title text. set
+    // explicitly by the wayland bridge (xdg_toplevel.set_app_id) so a
+    // client whose title changes (e.g. firefox page titles) keeps its
+    // own logo. (satoru)
+    int app_icon;
 };
 
 class WindowManager {
