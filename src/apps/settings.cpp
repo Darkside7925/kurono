@@ -285,7 +285,7 @@ static void DoApplyResolution(int idx) {
     Taskbar::Init(w, h);
 
     // update wm desktop area for new resolution (exclude taskbar)
-    WindowManager::SetDesktopArea(0, 0, w, h - 44);
+    Taskbar::ApplyDesktopArea();
 
     // reopen settings so user can see the new resolution applied
     SettingsApp::Open();

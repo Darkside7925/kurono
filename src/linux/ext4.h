@@ -295,8 +295,17 @@ public:
     static uint32_t BlockSize();
     static const char* VolumeName();
 
+    // true when Mount() dropped the write callback because the filesystem had a
+    // dirty journal and this driver has no replay. callers should surface this
+    // rather than let a write silently fail. (satoru)
+    static bool IsReadOnlyForced();
+
 private:
     static bool           mounted;
+    // set when Mount() dropped the write callback because the fs had a dirty
+    // journal and this driver has no replay. exposed so callers can say WHY a
+    // write was refused instead of just failing. (satoru)
+    static bool           read_only_forced;
     static Ext4Superblock  sb;
     static Ext4BlockRead   blk_read;
     static Ext4BlockWrite  blk_write;

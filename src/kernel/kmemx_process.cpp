@@ -1,4 +1,6 @@
 #include "kmemx.h"
+#include "kmemx_pool.h"
+#include "pmm.h"
 #include "../proc/scheduler.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
@@ -48,6 +50,105 @@ inline bool compositor_busy() {
     return Graphics::UIDirtyCount() > 0;
 }
 
+// ── scheduling-latency (jitter) instrument ──────────────────────────────────
+// this worker asks for a 10ms sleep, so the gap between consecutive ticks is a
+// direct probe of how long the cooperative scheduler made it wait. AVERAGE
+// tick rate is a bad detector: it came out identical (81/sec) with and without
+// the blocking virtio present, because the average absorbs a 1.17ms stall into
+// the existing ~2.3ms of slop. the TAIL is where a non-yielding busy-poll must
+// show up, so track the worst gap and how many gaps blow past a threshold.
+// reported in kilocycles (divide by the cpu MHz that boot logs). (satoru)
+static inline uint64_t kx_rdtsc() {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static uint64_t g_gap_max = 0;      // worst inter-tick gap, cycles (satoru)
+static uint64_t g_gap_sum = 0;
+static uint32_t g_gap_n   = 0;
+static uint32_t g_gap_over = 0;     // gaps > ~15ms at 2.9GHz (satoru)
+
+// periodic telemetry. the engine kept every number it measures inside a struct
+// that only the interactive shell + settings ever read, so a headless boot
+// batch could never answer "is the engine reaching pages at all". this dumps
+// the live counters to serial so a boot log alone tells the whole story:
+// pool occupancy (is the 512mb reservation earning its keep), the real
+// compression ratio, the fault-path latency band, and the pmm frames actually
+// in use. one line per interval, no floats (compiler code is -mno-sse). (satoru)
+void log_stats(uint32_t tick) {
+    const Stats& s = GetStats();
+    uint64_t pool_total = KMemXPool::TotalBytes();
+    uint64_t used_mb = (PMM::GetUsedFrames() * 4096ULL) / (1024 * 1024);
+    uint64_t free_mb = (PMM::GetFreeFrames() * 4096ULL) / (1024 * 1024);
+    uint64_t mean_ns = s.pages_out ? (s.ns_decompress_sum / s.pages_out) : 0;
+
+    // RAW tick count, not tick/100. the worker sleeps 10ms per tick, so this is
+    // a direct high-resolution measure of how much bsp time the cooperative
+    // scheduler actually gave it (100/sec = perfect). the old tick/100 print
+    // quantised to 100 ticks, which buried effects smaller than ~3 ticks/sec -
+    // exactly the size of the effect being measured. (satoru)
+    // jitter first - it is the point of this line now. (satoru)
+    SerialLogger::Log("[kxjit] gapmax_kcyc=");
+    SerialLogger::LogDec((int)(g_gap_max / 1000));
+    SerialLogger::Log(" gapmean_kcyc=");
+    SerialLogger::LogDec((int)(g_gap_n ? (g_gap_sum / g_gap_n / 1000) : 0));
+    SerialLogger::Log(" over15ms=");
+    SerialLogger::LogDec((int)g_gap_over);
+    SerialLogger::Log(" samples=");
+    SerialLogger::LogDec((int)g_gap_n);
+    // starvation-valve telemetry: did the user-task donation fire, and did it
+    // hand a slice over? a persisting stall with donate_ok=0 means the >50ms
+    // trigger never tripped, which is a different bug from "donated and it did
+    // not help". (satoru)
+    {
+        uint64_t dc = 0, dok = 0, dnone = 0;
+        Scheduler::GetDonateStats(&dc, &dok, &dnone);
+        SerialLogger::Log(" donate=");
+        SerialLogger::LogDec((int)dc);
+        SerialLogger::Log("/ok=");
+        SerialLogger::LogDec((int)dok);
+        SerialLogger::Log("/gated=");
+        SerialLogger::LogDec((int)dnone);
+    }
+    SerialLogger::Log("\r\n");
+
+    SerialLogger::Log("[kmxstat] tick=");
+    SerialLogger::LogDec((int)tick);
+    SerialLogger::Log(" live=");
+    SerialLogger::LogDec((int)s.live_pages);
+    SerialLogger::Log(" poolkb=");
+    SerialLogger::LogDec((int)(s.pool_used / 1024));
+    SerialLogger::Log("/");
+    SerialLogger::LogDec((int)(pool_total / 1024));
+    SerialLogger::Log(" ratiox100=");
+    SerialLogger::LogDec(RatioX100());
+    SerialLogger::Log(" in=");
+    SerialLogger::LogDec((int)s.pages_in);
+    SerialLogger::Log(" out=");
+    SerialLogger::LogDec((int)s.pages_out);
+    SerialLogger::Log(" flt=");
+    SerialLogger::LogDec((int)s.faults_served);
+    SerialLogger::Log(" raw=");
+    SerialLogger::LogDec((int)s.compress_fail);
+    SerialLogger::Log(" dedup=");
+    SerialLogger::LogDec((int)s.dedup_saved);
+    SerialLogger::Log(" dns_min/mean/max=");
+    SerialLogger::LogDec((int)s.ns_decompress_min);
+    SerialLogger::Log("/");
+    SerialLogger::LogDec((int)mean_ns);
+    SerialLogger::Log("/");
+    SerialLogger::LogDec((int)s.ns_decompress_max);
+    SerialLogger::Log(" over10us=");
+    SerialLogger::LogDec((int)s.decomp_over_10us);
+    SerialLogger::Log(" press=");
+    SerialLogger::Log(PressureName(CurrentPressure()));
+    SerialLogger::Log(" pmm_used_mb=");
+    SerialLogger::LogDec((int)used_mb);
+    SerialLogger::Log(" pmm_free_mb=");
+    SerialLogger::LogDec((int)free_mb);
+    SerialLogger::Log("\r\n");
+}
+
 [[noreturn]] void kmemx_process_entry() {
     SerialLogger::Log("[KMemX] compression engine process online\r\n");
     uint32_t tick = 0;
@@ -56,6 +157,28 @@ inline bool compositor_busy() {
         // process consumes no cpu between ticks. (satoru)
         Scheduler::SleepMs(10);
         tick++;
+        {
+            // sample the gap this tick actually took. skip the first sample
+            // (no previous timestamp) and any absurd one from a clock reset.
+            // (satoru)
+            static uint64_t s_last = 0;
+            uint64_t now = kx_rdtsc();
+            if (s_last) {
+                uint64_t gap = now - s_last;
+                if (gap < (1ULL << 40)) {
+                    if (gap > g_gap_max) g_gap_max = gap;
+                    g_gap_sum += gap;
+                    g_gap_n++;
+                    if (gap > 43000000ULL) g_gap_over++;   // ~15ms @2.9GHz (satoru)
+                }
+            }
+            s_last = now;
+        }
+
+        // telemetry BEFORE the early-outs below: a disabled engine or a busy
+        // compositor must still report, otherwise the quietest boots (exactly
+        // the ones worth explaining) produce no data at all. (satoru)
+        if (tick == 50 || (tick % 500) == 0) log_stats(tick);
 
         if (!IsEnabled()) continue;          // disabled -> idle, no scanning (satoru)
 

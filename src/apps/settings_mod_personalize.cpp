@@ -10,6 +10,7 @@
 #include "../ui/desktop.h"            // taskbar / desktop reloadfromconfig + setwallpaper (satoru)
 #include "../ui/window_manager.h"     // compositor reloadfromconfig (satoru)
 #include "settings.h"                 // SettingsApp::state.font_scale is the live font consumer (satoru)
+#include "../ui/style.h"              // modern / classic ui style (satoru)
 
 // ── shared palettes ─────────────────────────────────────────────────────────
 // accent choices mirror the legacy settings app so a user's pick lines up with
@@ -254,6 +255,16 @@ static void personalize_render(int x, int y, int w, int h, int scroll){
     int ly = y - scroll + 8;
     char buf[48];
 
+    // ── appearance: modern (inter, menu bar + dock) or classic ──────────
+    SettingsUI::SectionHeader(x, ly, "Appearance");
+    ly += 26;
+    Graphics::DrawString(x, ly + 4, "Style:", SettingsUI::COL_TEXT, 0xFF000000);
+    SettingsUI::Dropdown(cx, ly, DROP_W, UIStyle::Modern() ? "Modern" : "Classic");
+    ly += 30;
+    Graphics::DrawString(x, ly + 4, "Icons:", SettingsUI::COL_TEXT, 0xFF000000);
+    SettingsUI::Dropdown(cx, ly, DROP_W, UIStyle::MinimalIcons() ? "Minimal" : "Colorful");
+    ly += 34;
+
     // ── accent colour ────────────────────────────────────────────────────
     SettingsUI::SectionHeader(x, ly, "Accent Color");
     ly += 26;
@@ -369,6 +380,22 @@ static bool personalize_input(int mx, int my, bool click, char key, int scroll){
     int cx = CTRL_X;
     int ly = -scroll + 8;
 
+    // appearance header + style dropdown: flips the whole shell live. (satoru)
+    ly += 26;
+    if(SettingsUI::DropdownHit(cx, ly, DROP_W, mx, my) >= 0){
+        UIStyle::Set(!UIStyle::Modern());
+        DesktopEnvironment::ReloadFromConfig();
+        return true;
+    }
+    ly += 30;
+    // icon set (modern style only draws the artwork, classic keeps its own).
+    if(SettingsUI::DropdownHit(cx, ly, DROP_W, mx, my) >= 0){
+        UIStyle::SetMinimalIcons(!UIStyle::MinimalIcons());
+        DesktopEnvironment::ReloadFromConfig();
+        return true;
+    }
+    ly += 34;
+
     // accent header + swatch row. (satoru)
     ly += 26;
     {
@@ -460,6 +487,7 @@ static bool personalize_input(int mx, int my, bool click, char key, int scroll){
 // total content height for the scrollbar (sum of row advances + tail). (satoru)
 static int personalize_content_height(){
     return 8
+         + 26 + 30 + 34                     // appearance (satoru)
          + 26 + 38 + 30                     // accent (satoru)
          + 26 + 30 + 32 + 40                // taskbar (satoru)
          + 26 + 32 + 30 + 30                // desktop (satoru)

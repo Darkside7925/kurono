@@ -152,6 +152,10 @@ public:
     //  bitmap + inode table into ram for fast operation. (satoru)
     static bool Mount();
     static bool IsMounted();
+    //  free the in-ram metadata caches (~36 mb on the 4 gb data disk) and mark
+    //  unmounted. writers must Sync() first; a later Mount() re-reads from
+    //  disk. (satoru)
+    static void Unmount();
     //  flush all dirty metadata to disk (call after a batch of writes). (satoru)
     static bool Sync();
 

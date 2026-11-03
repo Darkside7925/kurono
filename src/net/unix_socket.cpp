@@ -1,5 +1,10 @@
 #include "unix_socket.h"
 #include "../drivers/serial.h"
+#include "../proc/scheduler.h"
+
+// task 25: file-scope (visible to both the anon-namespace ring writers and the
+// UnixSocket-namespace setter) proactive poll-wakeup hook. (satoru)
+static void (*g_data_ready_cb)(int sd) = nullptr;
 
 namespace {
 
@@ -57,6 +62,11 @@ struct Socket {
 
 Socket g_socks[UNIX_MAX_SOCKETS];
 
+// task 25: proactive poll-readiness wakeup hook. the linux-syscall layer
+// registers a callback that wakes any poll/ppoll waiter parked on a socket sd
+// the instant data lands in that sd's rx ring - event-driven like linux's fd
+// wait-queue, instead of the poller's ~8ms sleep_ticks re-scan. fired with the
+// sd whose rx RECEIVED data (the reader's own sd). (satoru)
 int alloc_sd() {
     for (int i = 0; i < UNIX_MAX_SOCKETS; i++) {
         if (!g_socks[i].in_use) {
@@ -121,6 +131,9 @@ int ring_write(Ring& r, const uint8_t* data, int len, const ControlMsg* cm,
     if (type != UNIX_SOCK_STREAM) {
         if (r.frame_head - r.frame_tail >= Ring::FRAME_RING) return 0;
     }
+    // stream: only fd-carrying writes get a frame, and never drop one. (satoru)
+    bool stream_fds = type == UNIX_SOCK_STREAM && cm && cm->passed_fd_count > 0;
+    if (stream_fds && r.frame_head - r.frame_tail >= Ring::FRAME_RING) return 0;
     int can = r.free();
     if (can <= 0) return 0;
     if (len > can) len = can;
@@ -138,15 +151,13 @@ int ring_write(Ring& r, const uint8_t* data, int len, const ControlMsg* cm,
         if (cm) r.frames[fi].cmsg = *cm;
         else    r.frames[fi].cmsg = {};
         r.frame_head++;
-    } else if (cm && (cm->passed_fd_count > 0 || cm->creds_valid)) {
-        // Stream: attach cmsg only when there is something to deliver.
-        if (r.frame_head - r.frame_tail < Ring::FRAME_RING) {
-            uint32_t fi = r.frame_head % Ring::FRAME_RING;
-            r.frames[fi].offset = off;
-            r.frames[fi].length = (uint32_t)len;
-            r.frames[fi].cmsg = *cm;
-            r.frame_head++;
-        }
+    } else if (stream_fds) {
+        // stream offset is the absolute byte position: the fds ride with it. (satoru)
+        uint32_t fi = r.frame_head % Ring::FRAME_RING;
+        r.frames[fi].offset = r.head;
+        r.frames[fi].length = (uint32_t)len;
+        r.frames[fi].cmsg = *cm;
+        r.frame_head++;
     }
     r.head += (uint32_t)len;
     return len;
@@ -167,14 +178,30 @@ int ring_read(Ring& r, uint8_t* out, int max, ControlMsg* cm, SockType type) {
         r.frame_tail++;
     } else {
         if (n > max) n = max;
-        consume = n;
-        if (cm && r.frame_head != r.frame_tail) {
+        if (cm) *cm = {};
+        // linux semantics: fds arrive with the read holding their first byte,
+        // and a read never runs into the next fd-carrying write. (satoru)
+        if (r.frame_head != r.frame_tail) {
             uint32_t fi = r.frame_tail % Ring::FRAME_RING;
-            *cm = r.frames[fi].cmsg;
-            r.frame_tail++;
-        } else if (cm) {
-            *cm = {};
+            int lead = (int)(r.frames[fi].offset - r.tail);
+            if (lead <= 0) {
+                const ControlMsg& fc = r.frames[fi].cmsg;
+                if (cm) *cm = fc;
+                else {
+                    // plain read: the fds are discarded - drop their in-flight refs. (satoru)
+                    for (int k = 0; k < fc.passed_fd_count; k++)
+                        if (fc.passed_is_socket[k]) Close(fc.passed_sd[k]);
+                }
+                r.frame_tail++;
+                if (r.frame_head != r.frame_tail) {
+                    int next = (int)(r.frames[r.frame_tail % Ring::FRAME_RING].offset - r.tail);
+                    if (next > 0 && n > next) n = next;
+                }
+            } else if (n > lead) {
+                n = lead;
+            }
         }
+        consume = n;
     }
     uint32_t off = r.tail % UNIX_RING_BYTES;
     int first = (int)(UNIX_RING_BYTES - off);
@@ -187,6 +214,13 @@ int ring_read(Ring& r, uint8_t* out, int max, ControlMsg* cm, SockType type) {
     return n;
 }
 
+// room for another write: linux-style hysteresis (a quarter ring) so a full
+// writer isn't woken for every few bytes the reader drains. (satoru)
+inline bool ring_room(const Ring& r) {
+    return r.free() >= UNIX_RING_BYTES / 4 &&
+           r.frame_head - r.frame_tail < (uint32_t)Ring::FRAME_RING;
+}
+
 }  // namespace
 
 namespace UnixSocket {
@@ -197,6 +231,10 @@ void Init() {
     SerialLogger::LogDec(UNIX_MAX_SOCKETS);
     SerialLogger::Log(" sd slots\r\n");
 }
+
+// task 25: expose the setter in the UnixSocket namespace (matches the header
+// decl); g_data_ready_cb is the file-scope static defined at the top. (satoru)
+void SetDataReadyHook(void (*cb)(int sd)) { g_data_ready_cb = cb; }
 
 int Create(SockType type) {
     int sd = alloc_sd();
@@ -261,6 +299,16 @@ int Connect(int sd, const char* path) {
     as.is_kernel_server = server.is_kernel_server;
     as.on_data          = server.on_data;
     as.user             = server.user;
+    // stamp the connector's identity on the server-side end so an in-kernel
+    // server (wayland) can resolve which process owns a client via
+    // GetPeerCred - connect runs in the connecting task's syscall context,
+    // so the current process IS the peer. (satoru)
+    {
+        Process* cur = Scheduler::GetCurrentProcess();
+        as.creds.pid = cur ? cur->pid : 0;
+        as.creds.uid = 1000;
+        as.creds.gid = 1000;
+    }
 
     Socket& cs = g_socks[sd];
     cs.connected = true;
@@ -356,6 +404,11 @@ static int send_core(int sd, const void* buf, int len, const ControlMsg& cm) {
     if (ps.shutdown_rd) return -32;
     int w = ring_write(ps.rx, (const uint8_t*)buf, len, &cm, s.type);
     if (w == 0 && len > 0) return -11;  // EAGAIN
+    // a passed socket stays referenced while in flight: the sender may close its
+    // copy before the receiver installs it. recvmsg adopts the ref. (satoru)
+    if (!ps.is_kernel_server)
+        for (int k = 0; k < cm.passed_fd_count; k++)
+            if (cm.passed_is_socket[k]) Retain(cm.passed_sd[k]);
     if (ps.is_kernel_server && ps.on_data && w > 0) {
         // (satoru) TEMP [sc] guard+diag for the firefox sibling-sendmsg #UD: a
         // kernel-server peer whose on_data is a garbage pointer (e.g. 3) means this
@@ -400,6 +453,10 @@ static int send_core(int sd, const void* buf, int len, const ControlMsg& cm) {
         }
         g_pending_ctrl_valid[peer] = false;
     }
+    // task 25: a user peer's data now sits in its rx ring for it to poll/recv -
+    // wake any poll waiter parked on it NOW (a kernel-server peer drained
+    // synchronously above, so it has no poller to wake). (satoru)
+    if (w > 0 && !ps.is_kernel_server && g_data_ready_cb) g_data_ready_cb(peer);
     return w;
 }
 
@@ -463,7 +520,15 @@ int Recv(int sd, void* buf, int len, int flags, ControlMsg* cmsg) {
     if (!valid(sd)) return -1;
     Socket& s = g_socks[sd];
     if (s.shutdown_rd) return 0;
-    return ring_read(s.rx, (uint8_t*)buf, len, cmsg, s.type);
+    bool was_full = !ring_room(s.rx);
+    int n = ring_read(s.rx, (uint8_t*)buf, len, cmsg, s.type);
+    // drained back below the mark: wake the writer parked on epollout. (satoru)
+    if (n > 0 && was_full && ring_room(s.rx) && valid(s.peer_sd) && g_data_ready_cb)
+        g_data_ready_cb(s.peer_sd);
+    // empty ring is eof only once the peer is gone, else eagain. firefox ipc
+    // reads until eagain and took the old 0 as the content process hanging up. (satoru)
+    if (n == 0 && len > 0 && s.connected && s.peer_sd >= 0) return -11;
+    return n;
 }
 
 int Shutdown(int sd, int how) {
@@ -471,6 +536,20 @@ int Shutdown(int sd, int how) {
     if (how == 0 || how == 2) g_socks[sd].shutdown_rd = true;
     if (how == 1 || how == 2) g_socks[sd].shutdown_wr = true;
     return 0;
+}
+
+// task 22: a stream socket/pipe end whose peer has CLOSED - Close() severed our
+// peer_sd (-1) and set shutdown_wr on us. POSIX poll must then report POLLHUP so
+// a reader waiting for data-or-eof wakes and reaps the connection instead of
+// polling forever (the glxtest child-pipe hang: firefox's parent polled the
+// exited glxtest's pipe with neither data nor HUP -> "ManageChildProcess poll
+// failed" + the StreamTransport retry storm). connected-then-severed only;
+// never-connected + listen fds are not hung up. buffered rx still drains first
+// (the caller keeps POLLIN while bytes remain). (satoru)
+bool PeerClosed(int sd) {
+    if (!valid(sd)) return false;
+    Socket& s = g_socks[sd];
+    return s.connected && s.peer_sd < 0;
 }
 
 int Retain(int sd) {
@@ -489,11 +568,17 @@ int Close(int sd) {
     if (s.refs > 1) { s.refs--; return 0; }
     s.refs = 0;
     if (s.peer_sd >= 0 && valid(s.peer_sd)) {
-        Socket& ps = g_socks[s.peer_sd];
+        int peer = s.peer_sd;
+        Socket& ps = g_socks[peer];
         ps.shutdown_wr = true;     // peer's writes will start failing
         ps.peer_sd = -1;
         // Leave any buffered RX data on the peer so it can drain after
         // our close - connection-style EOF semantics.
+        // task 28: the peer is now hung up (POLLHUP) - wake its parked
+        // poller NOW so a reader polling a dead child's pipe sees the eof
+        // immediately instead of burning its full poll timeout (the 4s
+        // glxtest tax on every firefox boot). (satoru)
+        if (g_data_ready_cb) g_data_ready_cb(peer);
     }
     s.in_use = false;
     return 0;
@@ -534,6 +619,23 @@ int PendingBytes(int sd) {
     return g_socks[sd].rx.avail();
 }
 
+bool Writable(int sd) {
+    if (!valid(sd)) return true;   // the write itself reports the error (satoru)
+    Socket& s = g_socks[sd];
+    if (!s.connected || !valid(s.peer_sd)) return true;
+    Socket& ps = g_socks[s.peer_sd];
+    return ps.is_kernel_server || ring_room(ps.rx);
+}
+
+uint32_t EventSeq(int sd) {
+    if (!valid(sd)) return 0;
+    Socket& s = g_socks[sd];
+    uint32_t q = s.rx.head + (uint32_t)s.backlog_head * 0x9E3779B1u;   // data in, connections (satoru)
+    if (valid(s.peer_sd)) q += g_socks[s.peer_sd].rx.tail;             // peer drained: writable (satoru)
+    else if (s.connected) q ^= 0x80000000u;                            // peer gone (satoru)
+    return q;
+}
+
 // (satoru) TEMP diag: bytes waiting in this socket's PEER rx ring (what a write
 // to `sd` delivers). lets the poll probe tell "polled fd has no data because the
 // signaler wrote the read end and it went to the peer" apart from "nobody wrote
@@ -572,9 +674,13 @@ int KernelInject(int sd, const void* buf, int len) {
     int peer = s.peer_sd;
     if (s.connected && valid(peer)) {
         Socket& ps = g_socks[peer];
-        return ring_write(ps.rx, (const uint8_t*)buf, len, nullptr, ps.type);
+        int w = ring_write(ps.rx, (const uint8_t*)buf, len, nullptr, ps.type);
+        if (w > 0 && g_data_ready_cb) g_data_ready_cb(peer);   // wake the client poller (satoru)
+        return w;
     }
-    return ring_write(s.rx, (const uint8_t*)buf, len, nullptr, s.type);
+    int w = ring_write(s.rx, (const uint8_t*)buf, len, nullptr, s.type);
+    if (w > 0 && g_data_ready_cb) g_data_ready_cb(sd);
+    return w;
 }
 
 // kernel→client with ancillary data: same peer routing as KernelInject but
@@ -587,9 +693,13 @@ int KernelInjectMsg(int sd, const void* buf, int len, const ControlMsg* cm) {
     int peer = s.peer_sd;
     if (s.connected && valid(peer)) {
         Socket& ps = g_socks[peer];
-        return ring_write(ps.rx, (const uint8_t*)buf, len, cm, ps.type);
+        int w = ring_write(ps.rx, (const uint8_t*)buf, len, cm, ps.type);
+        if (w > 0 && g_data_ready_cb) g_data_ready_cb(peer);   // wake the client poller (satoru)
+        return w;
     }
-    return ring_write(s.rx, (const uint8_t*)buf, len, cm, s.type);
+    int w = ring_write(s.rx, (const uint8_t*)buf, len, cm, s.type);
+    if (w > 0 && g_data_ready_cb) g_data_ready_cb(sd);
+    return w;
 }
 
 int ActiveCount() {

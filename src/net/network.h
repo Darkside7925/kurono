@@ -162,6 +162,9 @@ public:
     // packet i/o
     static bool SendPacket(const char* ifname, const unsigned char* data, int len);
     static int  RecvPacket(const char* ifname, unsigned char* data, int max_len);
+    // re-read the physical link of eth0 and update its up/down state, so a link
+    // that comes up late (autoneg takes seconds on real hardware) is noticed. (satoru)
+    static void RefreshLink();
 
     // ip helpers
     static IPv4Address MakeIP(unsigned char a, unsigned char b, unsigned char c, unsigned char d);

@@ -113,6 +113,13 @@ namespace UnixSocket {
     int  PendingBytes(int sd);
     int  PeerPendingBytes(int sd);       // TEMP diag: bytes in the peer's rx ring (satoru)
     bool HasPendingConnection(int sd);   // listen fd has a backlog conn -> POLLIN (satoru)
+    bool Writable(int sd);               // peer ring has room -> POLLOUT (satoru)
+    uint32_t EventSeq(int sd);           // activity counter for epollet edges (satoru)
+    bool PeerClosed(int sd);             // connected peer has closed -> POLLHUP (satoru)
+    // task 25: register a callback invoked with a socket sd the instant data
+    // lands in its rx ring, so the linux layer can wake a poll waiter parked on
+    // it immediately (event-driven fd wakeup) instead of on the ~8ms timer. (satoru)
+    void SetDataReadyHook(void (*cb)(int sd));
     int  KernelInject(int sd, const void* buf, int len);  // kernel→client
     // kernel→client with ancillary data (SCM_RIGHTS out of an in-kernel
     // server; the wl_keyboard.keymap fd path). (satoru)

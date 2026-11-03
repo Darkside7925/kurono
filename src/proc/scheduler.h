@@ -80,6 +80,12 @@ struct UserMemoryRegion {
     uint64_t page_flags;
     uint32_t flags;
     bool     active;
+    // task 32 (boot speed): what file/offset backs this reservation, so a later
+    // MAP_FIXED overlay of the SAME bytes (musl re-maps every PT_LOAD over the
+    // whole-image map) can keep the frame instead of re-alloc+re-copying it.
+    // file_off_base == ~0ull means "not file backed". (satoru)
+    const void* file_node;
+    uint64_t    file_off_base;
 };
 
 constexpr uint32_t PROCESS_FLAG_NONE = 0;
@@ -113,6 +119,12 @@ struct Process {
     // Treated as opaque: the asm helper writes/reads this field directly
     // and the C++ side just plumbs it.  Zero on a fresh process.
     uint64_t saved_rsp;
+    // NOTE: do NOT add fields to this struct casually. Inserting two here
+    // (seed_entry/kp_ran, for the RIP=0x3 hunt) produced a NEW deterministic
+    // "#GP rip=0x100BD4 err=0x6F90" on the APs - 4 boots in 20, and zero in the
+    // same run without them - and took paint from 45% to 0%. Something depends
+    // on this layout or on the struct's size. Whatever you are instrumenting,
+    // do it in a side table, not in here. (satoru)
 
     // Adaptive kernel stack metadata (zero-initialised for legacy user
     // processes that use the old fixed allocator).
@@ -202,6 +214,64 @@ struct Process {
     uint64_t gs_base;
     alignas(16) uint8_t fpu_state[512];
 
+    // torn-frame forensics (TAIL fields - appended so stale .o offsets survive
+    // the makefile's missing header deps; a full rebuild is still the rule):
+    // which code path last saved this task's user_frame (1=int80 entry 2=int80
+    // exit 3=bsp preempt 4=ap preempt 5=fault 6=signal 7=sched_yield 8=execve
+    // 0=other) + a running save counter. the contained ring-3 fault dump prints
+    // them - at fault time they name the save the faulting thread RESUMED from
+    // (the crossbeam rbx=0xA mixed-frame hunt). (satoru)
+    uint8_t  last_save_site;
+    uint32_t save_seq;
+
+    // parked-stack canary (the residual stray-writer hunt): a snapshot of
+    // [saved user rsp, rsp+256) captured when a PARKER-style futex waiter
+    // (expected 0xFFFFFFFF - std/crossbeam parkers, whose stacks nothing
+    // legitimately touches while parked) blocks; verified at the next
+    // LoadUserFrame. any diff = a stray write into a parked thread's stack,
+    // and the changed qwords (old vs new) fingerprint the writer. musl
+    // condvar waiters (exp=2) are NOT canaried - siblings legitimately write
+    // their on-stack wait nodes. (satoru)
+    uint8_t  stk_canary[256];
+    uint64_t stk_canary_rsp;
+    uint16_t stk_canary_len;
+    uint8_t  stk_canary_valid;
+
+    // saved-frame integrity check (the deeper stray-writer hunt): a hash of the
+    // CALLEE-SAVED regs (rbx/rbp/r12-r15) captured at SaveUserFrame and verified
+    // at LoadUserFrame. those regs CANNOT legitimately change between a save and
+    // its paired restore (no kernel path rewrites them - only caller-saved rax/
+    // rcx/... get syscall-return values). a mismatch = a stray KERNEL write into
+    // this Process' user_frame in the heap (e.g. a recycled-struct or cross-task
+    // frame write) - the rbx=0xA crossbeam signature. (satoru)
+    uint64_t frame_csum;
+    uint8_t  frame_csum_valid;
+
+    // [YRET] instrument (the lost-store hunt): at a site-7 sched_yield save,
+    // fingerprint the just-pushed yield-return slot ([user rsp+8]) - value +
+    // backing phys + the save_seq it belongs to. LoadUserFrame re-verifies at
+    // the paired resume; any mismatch names the mechanism (stale-tlb split
+    // view / generation swap / in-place writer / stale resume). (satoru)
+    uint64_t yret_va;
+    uint64_t yret_val;
+    uint64_t yret_phys;
+    uint32_t yret_seq;
+    uint32_t last_load_seq;   // save_seq of the frame this task last RESUMED from (satoru)
+    uint8_t  yprot_armed;     // task 27 trap: fingerprint page is write-protected (satoru)
+
+    // task 28: lazily stamped by the picker when first seen Ready; cleared on
+    // every successful pick. >64ms of Ready-unpicked = the starvation override
+    // wins the pick (the early-stall crawl fix). (satoru)
+    uint64_t ready_since_ms;
+
+    // task 26 v3 (two-threads-one-stack): a sibling munmapped THIS thread's
+    // in-use stack range while it was live; the pages + va were kept (claimed)
+    // and the munmap DEFERRED here - sys_exit re-runs it as this thread (whose
+    // own pages are then no longer protected), releasing va + frames properly.
+    // 0 = none pending. (satoru)
+    uint64_t stk_unmap_start;
+    uint64_t stk_unmap_end;
+
     bool is_user() const { return (flags & PROCESS_FLAG_USER) != 0; }
     bool is_thread() const { return (flags & PROCESS_FLAG_THREAD) != 0; }
 };
@@ -249,7 +319,8 @@ public:
     static void MarkProcessExited(Process* proc, int exit_code);
     static Process* WaitForChild(Process* parent, uint32_t child_pid, int* exit_code);
     static bool WaitForProcess(Process* proc, int* exit_code);
-    static void SaveUserFrame(Process* proc, const InterruptFrame* frame);
+    static void SaveUserFrame(Process* proc, const InterruptFrame* frame,
+                              uint8_t save_site = 0);
     static bool LoadUserFrame(Process* proc, InterruptFrame* frame);
     // single-owner state: task->state and sleep_ticks are written ONLY under
     // g_sched_lock. the futex layer (a separate g_futex_lock domain) nests these
@@ -261,6 +332,8 @@ public:
     static void StateUnlock(uint64_t flags);
     static Process* GetNextRunnableUser(Process* after);
     static bool ScheduleNextUser(InterruptFrame* frame);
+    // true once the running user thread has had its slice on this cpu (restarts it). (satoru)
+    static bool SliceExpired();
     // atomically claim a Ready user thread this cpu may run (smp phase 3d: the
     // application-processor dispatch loop calls this to bootstrap a thread). marks
     // the winner Running under the scheduler lock so no two cores claim one
@@ -292,11 +365,42 @@ public:
     static void FixupGsAfterIsrSwitch();
     static void ReapProcess(Process* proc);
     static void DestroyProcess(Process* proc);
+    // is this address space still live on any cpu or in any non-terminated
+    // task other than `exclude`? callers that destroy an address space use
+    // this to defer/leak instead of freeing live page tables (execve old-as
+    // guard). (satoru)
+    static bool AddressSpaceLiveElsewhere(uint64_t as, Process* exclude);
     static void Schedule();
     static void Yield();
     static void Sleep(uint32_t ticks);
     static void Exit();
     static void Tick(); // called by timer interrupt
+    // last time the cooperative Schedule() loop ran - the bsp-starve detector
+    // reads this from the timer isr to catch a ring-3 monopolist. (satoru)
+    static uint64_t LastScheduleMs();
+    // when the cooperative KERNEL-PROC scheduler last handed over the cpu. this
+    // is the clock the starvation valve must watch: LastScheduleMs() tracks the
+    // USER-thread picker, which IRQ0 refreshes every tick and so never goes
+    // stale enough to trip a >50ms trigger. (satoru)
+    static uint64_t LastKernelSwitchMs();
+    // kurono.donate=0. lets the A/B run one binary on both arms. (satoru)
+    static void SetDonateEnabled(bool on);
+    static bool DonateEnabled();
+    // capture the parked-stack canary for a PARKER futex waiter (see the
+    // Process fields). called by the futex block path right after the block
+    // commits; verified inside LoadUserFrame on the next resume. (satoru)
+    static void CaptureStackCanary(Process* proc);
+    // find a live user task in address space `as` (other than `exclude`) whose
+    // saved rsp falls in [start,end) - the unmap-overlaps-live-stack detector.
+    // returns null if none. (satoru)
+    static Process* FindStackOwnerInRange(uint64_t as, Process* exclude,
+                                          uint64_t start, uint64_t end);
+    // is page `pg` (page-aligned) at or above the saved rsp of a LIVE thread in
+    // address space `as` (other than `exclude`), within `window` bytes of that
+    // rsp? i.e. is it IN-USE stack the kernel must not free out from under a
+    // running thread. (satoru)
+    static bool PageIsLiveStack(uint64_t as, Process* exclude, uint64_t pg,
+                                uint64_t window);
 
     // ── Preemptive multitasking API ────────────────────────────────────
     // Spawn a long-running kernel-mode process backed by an adaptive
@@ -317,6 +421,18 @@ public:
     // timeslice without any sleep deadline.
     static void SleepMs(uint32_t ms);
     static void YieldNow();
+
+    // donate a slice from a USER task (ring-0 syscall context, bsp only) to the
+    // cooperative kernel processes. SleepMs/YieldNow both early-return for a
+    // non-kernel caller, so without this there is NO way to run a kernel proc
+    // from user context - which is the starvation livelock that stalls ~50% of
+    // boots. CALLER MUST HAVE RELEASED THE KLS LOCK. Returns true if a slice
+    // was actually donated. See the block comment in scheduler.cpp. (satoru)
+    static bool DonateToKernelProcs(uint32_t ms);
+    // donation telemetry: (valve fired, slice handed over, nothing runnable).
+    // a null stall result with ok==0 means the trigger never tripped, which is
+    // a different bug from "donated and it did not help". (satoru)
+    static void GetDonateStats(uint64_t* calls, uint64_t* ok, uint64_t* none);
 
     // Service the sleep queue.  Called from the PIT IRQ0 hook (and from
     // any process via Yield) - wakes any process whose deadline has
@@ -354,6 +470,38 @@ public:
     static Process* FindProcessByPid(uint32_t pid);
     static int GetProcessSnapshot(SchedulerProcessSnapshot* out, int max_count);
 
+    // collect every live user task sharing pid's address space (the thread
+    // group: leader + clone threads). returns the count written to out. (satoru)
+    static int CollectAddressSpaceGroup(uint32_t pid, Process** out, int max);
+    // pid-only variant: copies the pids out UNDER the scheduler lock. callers
+    // that only need identities must use this - raw Process* from the pointer
+    // variant can be heap-freed by a concurrent DestroyProcess the instant the
+    // lock drops (the task-manager refresh uaf). (satoru)
+    static int CollectAddressSpacePids(uint32_t pid, uint32_t* out, int max);
+    // safely end an entire user thread group under smp: mark every member
+    // terminated, wait until no cpu still runs any of them, then free kernel
+    // stacks + the shared address space. the Process structs are deliberately
+    // leaked (futex waiter slots may still hold raw pointers; a stray wake's
+    // CAS fails harmlessly on a Terminated struct but corrupts a recycled
+    // one). returns 0 if pid is unknown, not a user task, or the group
+    // contains the calling task; 1 = quiesced + reaped; 2 = marked dead but a
+    // cpu never let go in time - the group went to the DEFERRED reaper, so the
+    // caller must NOT tear per-process records down yet. (satoru)
+    static int KillProcessGroup(uint32_t pid);
+    // mark the group dead NOW and hand the quiesce+reap to the deferred reaper.
+    // never sleeps - safe from the kls syscall body (the sync form quiesce-
+    // slept under kls_lock while a target member spun on that same lock, an
+    // unwinnable wait). `skip` is exempted (a fatal-signal self-exit whose own
+    // exit path handles it). (satoru)
+    static bool KillProcessGroupAsync(uint32_t pid, Process* skip);
+    // bookkeeping-only enqueue of already-Terminated members for a later reap;
+    // isr-safe (the hal fault containment queues from the #pf handler). (satoru)
+    static void QueueDeferredReap(Process** members, int n);
+    // retry-per-call, never-sleeping drain: reap each queued group once every
+    // member is observably off every cpu. runs from the scheduler kernel
+    // process heartbeat. (satoru)
+    static void DrainDeferredReaps();
+
     // Phase 14: load average + cpu affinity ----------------------------
     // 1m, 5m, 15m EMAs of run-queue length, scaled FIXED_1 = 1<<11.
     static void     GetLoadAverage(uint32_t out_fixed[3]);
@@ -372,4 +520,28 @@ public:
     // the linux futex sweep (futex_sweep_timeouts). (satoru)
     static void PromoteDeferredWakes();
     static void SetApFutexMaintHook(void (*fn)());
+    // idle-ap maintenance: futex heal + deferred-wake promotion, called by the
+    // ap dispatch loop while parked in ring-0 (task 17). (satoru)
+    static void ApIdleMaint();
+    // task 21 a/b: hard-pin threads to their last cpu (kurono.pincpu=1). (satoru)
+    static void SetPinCpu(bool on);
+    // task 22: linux-model min_vruntime clamp on wake - a woken task may lag
+    // the runnable pack by at most one slice, never by its whole spin history.
+    // lock-free racy scan; callable from any wake path. (satoru)
+    static void NormalizeWakeVruntime(Process* p);
+    // task 25: directed wake-next hand-off - the thread this cpu just woke runs
+    // next on it (linux wakeup baton-pass). called from every wake site. (satoru)
+    static void NoteWakeNext(Process* woken);
+    // task 27: is phys a parked thread's fingerprinted yield-return page?
+    // kernel copy paths probe their write destinations with this. (satoru)
+    static Process* PhysIsParkedYieldStack(uint64_t phys);
+    // task 27: a live sibling on the SAME musl stack slot as `top` (the exact
+    // reuse discriminator for the two-threads-one-stack corruptor). (satoru)
+    static Process* LiveSiblingWithStackTop(uint64_t as, uint64_t top);
+    // task 27 THE TRAP: write-protect the fingerprinted page across the park;
+    // a user writer faults into [YWRITE] red-handed. arm at the site-7 save,
+    // auto-disarm at the resume verify; the fault hook restores RW + retries. (satoru)
+    static bool YProtArm(Process* p);
+    static void YProtDisarm(Process* p);
+    static bool YProtCheckFault(uint64_t as, uint64_t fault_va, uint64_t rip);
 };

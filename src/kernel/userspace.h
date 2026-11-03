@@ -9,6 +9,15 @@ struct UserspaceReturnContext {
     uint64_t resume_rip;
     int32_t exit_code;
     uint32_t reserved;
+    // this cpu's PER-CPU gs base, captured in UserspaceEnter before the gs
+    // SELECTOR load zeroes gsbase. loading a segment selector on x86-64 resets
+    // that segment's base to the descriptor base (0) - already handled for fs,
+    // but gs was missed, and .resume_from_user zeroed it again on the way back.
+    // the result: after ONE process exited, the kernel ran with no per-cpu gs,
+    // so the NEXT process's first syscall swapgs'd to 0 and syscall_entry_x64
+    // read its kernel rsp out of low memory (rsp=0xF000FF53F000E2C3, bios rom)
+    // -> #DF. offset 24; the asm hardcodes it. (satoru)
+    uint64_t percpu_gs_base;
 } __attribute__((packed));
 
 // per-cpu user-execution context. smp phase 3d: each cpu (the bsp and every
@@ -23,6 +32,13 @@ struct UserspaceCpuState {
     Process* active_process;
     int      active_linux_process;
     UserspaceReturnContext return_context;
+    // true ONLY while this cpu is inside a RunProcessWithArgs launcher frame
+    // (return_context holds a live UserspaceEnter save point). an AP that
+    // RESUMES a dispatched thread via ap_enter_user_frame sets active_process
+    // but NEVER inits return_context, so a fault-exit that blindly
+    // UserspaceResume'd it longjmp'd through a zero context -> rip=0/rsp=0 ->
+    // #DF (the ap firefox-crash panic). HandleProcessExit checks this. (satoru)
+    bool     return_context_valid;
 };
 
 extern "C" int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext* ctx,

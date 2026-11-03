@@ -1,4 +1,5 @@
 #include "mouse.h"
+#include "hwinfo.h"   // input event counters for the boot log (satoru)
 #include "graphics.h"
 #include "serial.h"
 #include "../ui/gui.h"
@@ -377,7 +378,9 @@ static uint16_t vbox_find_request_port() {
     for (uint16_t bus = 0; bus < 256; bus++) {
         for (uint8_t dev = 0; dev < 32; dev++) {
             for (uint8_t func = 0; func < 8; func++) {
-                if (PCI::GetVendor((uint8_t)bus, dev, func) != VBOX_PCI_VENDOR_ID) {
+                uint16_t vbx_ven = PCI::GetVendor((uint8_t)bus, dev, func);
+                if (vbx_ven == 0xFFFF && func == 0) break;   // empty slot: skip 7 functions (satoru)
+                if (vbx_ven != VBOX_PCI_VENDOR_ID) {
                     continue;
                 }
                 if (PCI::GetDevice((uint8_t)bus, dev, func) != VBOX_VMMDEV_DEVICE_ID) {
@@ -730,6 +733,7 @@ void Mouse::InitVMwareIntegration() {
 
 // SPSC ring push. Drops on overflow rather than corrupting the reader.
 void Mouse::RingPush(const Mouse::Event& e) {
+    HwInfo::NoteMouseEvent();   // bare-metal input diagnostics (satoru)
     uint16_t h = __atomic_load_n(&ev_head, __ATOMIC_RELAXED);
     uint16_t t = __atomic_load_n(&ev_tail, __ATOMIC_ACQUIRE);
     uint16_t next = (uint16_t)((h + 1) & 255);
@@ -847,6 +851,7 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
 // emits, keeping the codebase convention of "dy positive = up" in events and
 // moving the cursor with down-positive screen coordinates (satoru).
 void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
+    HwInfo::NoteUsbMouse();   // bare-metal input diagnostics (satoru)
     if (!report || len < 3) return;
 
     perf_stats.packets_processed++;

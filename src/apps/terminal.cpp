@@ -7,11 +7,14 @@
 #include "../drivers/graphics.h"
 #include "../drivers/timer.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/serial.h"
 #include "../fs/kvfs.h"
 #include "../system/logging.h"
 #include "../system/clipboard.h"
 #include "../ui/kss.h"
 #include "../ui/font.h"
+#include "vt.h"
+#include "../linux/kpty.h"
 
 // theme chrome colors. seeded from the kss tokens at init so the terminal
 // matches the system black/grey palette; the background and primary text
@@ -49,6 +52,7 @@ static int   CELL_H   = 20;
 static const int PAD_X = 8;   // inner left/right padding (px) (satoru)
 static const int PAD_Y = 6;   // inner top/bottom padding (px) (satoru)
 static bool  metrics_ready = false;
+bool g_kbtest = false;   // kurono.kbtest=1: mirror "echo KBT" lines to serial for the keystroke harness (satoru)
 
 // pull theme chrome from kss; safe to call repeatedly. (satoru)
 static void TermSyncTheme(){
@@ -65,13 +69,27 @@ static void TermSyncTheme(){
 // "M" gives the widest typical advance so every glyph fits its cell without
 // the old cramped overlap; height = px size + leading. (satoru)
 static void EnsureMetrics(){
-    if(metrics_ready) return;
-    cell_pxh = KSS::BodyPx();        // matches graphics' 16px body base (satoru)
-    if(cell_pxh < 8.0f) cell_pxh = 16.0f;
-    int mw = FontTTF::ok ? FontTTF::Measure(cell_pxh, "M") : 0;
-    if(mw <= 0) mw = (int)(cell_pxh * 0.5f + 0.5f);  // sane fallback (satoru)
+    // re-measure when the ui style flips between smooth and pixel text.
+    static bool metrics_ok = false;
+    if(metrics_ready && metrics_ok == FontTTF::ok) return;
+    metrics_ok = FontTTF::ok;
+    float base_pxh = KSS::BodyPx();  // matches graphics' 16px body base (satoru)
+    if(base_pxh < 8.0f) base_pxh = 16.0f;
+    cell_pxh = base_pxh;
+    int mw = 8;
+    if(FontTTF::ok){
+        // the scrollback is a fixed TERM_COLS grid that the window shows at 8 px
+        // per column, so size the mono face to an 8 px advance. a wider cell
+        // left fewer visible columns than the wrap width and clipped the tail
+        // of every long line. (satoru)
+        for(int k = 0; k < 3; k++){
+            int m = FontTTF::MeasureMono(cell_pxh, "M");
+            if(m <= 0 || m == 8) break;
+            cell_pxh = cell_pxh * 8.0f / (float)m;
+        }
+    }
     CELL_W = mw;
-    CELL_H = (int)(cell_pxh * 1.30f + 0.5f);         // ~30% leading (satoru)
+    CELL_H = (int)(base_pxh * 1.30f + 0.5f);         // ~30% leading (satoru)
     if(CELL_W < 4)  CELL_W = 4;
     if(CELL_H < 10) CELL_H = 10;
     metrics_ready = true;
@@ -92,8 +110,9 @@ static void TermDrawRun(int sx, int sy, const char* s, unsigned int fg, bool bol
     int gy = sy + (CELL_H - (int)cell_pxh) / 2;
     if(gy < sy) gy = sy;
     if(FontTTF::ok){
-        FontTTF::DrawString(sx, gy, cell_pxh, s, draw_fg);
-        if(bold) FontTTF::DrawString(sx+1, gy, cell_pxh, s, draw_fg); // faux-bold (satoru)
+        // monospace face so every glyph lands on its cell. (satoru)
+        FontTTF::DrawMono(sx, gy, cell_pxh, s, draw_fg);
+        if(bold) FontTTF::DrawMono(sx+1, gy, cell_pxh, s, draw_fg); // faux-bold (satoru)
     } else {
         // bitmap fallback path (no ttf): route through graphics' string draw. (satoru)
         Graphics::DrawString(sx, gy, s, draw_fg, T_BG);
@@ -113,6 +132,13 @@ static bool seq(const char* a,const char* b){
     if(!a||!b)return false;
     while(*a&&*b){if(*a!=*b)return false;a++;b++;}
     return *a==0&&*b==0;}
+
+// pty mode state (satoru)
+static Vt   g_vt;
+static bool g_pty_mode = false;
+static int  g_pty_off = 0;          // lines scrolled back into the emulator history
+static int  g_term_wid = -1;
+static bool g_in_exec = false;      // a shell command is running on behalf of the terminal
 
 TermLine     TerminalApp::buffer[TERM_SCROLL_BK];
 int          TerminalApp::buf_count     = 0;
@@ -216,7 +242,10 @@ int TerminalApp::Open(){
     RuntimeLog::LogAppEvent("terminal", "open");
     KuronoShell::SetOutputChunkCallback(TerminalShellChunkSink, nullptr);
     // create window via wm
-    int wid = WindowManager::CreateWindow("Terminal", -1, -1, 648, 432,
+    // 80 columns x 8 px + 2 x PAD_X + the 1 px borders = 658: wide enough for
+    // the whole TERM_COLS grid (648 showed 78 and clipped the last two
+    // characters of every full line). (satoru)
+    int wid = WindowManager::CreateWindow("Terminal", -1, -1, 660, 432,
         (WindowRenderFunc)[](Window* w,int cx,int cy,int cw,int ch){
             TerminalApp::Render(w,cx,cy,cw,ch);
         },
@@ -224,6 +253,7 @@ int TerminalApp::Open(){
             if(ev==1) TerminalApp::Input(w,p1,p2,true,0);
             else if(ev==2) TerminalApp::Input(w,0,0,false,(char)p1);
             else if(ev==3) {
+                if(TerminalApp::PtyActive()){ TerminalApp::PtyScroll(p1); return; }
                 // scroll event: p1 = scroll delta (positive = scroll up).
                 // Stage on target; the next paint eases scroll_offset toward it.
                 int max_scroll = TerminalApp::buf_count > 25 ? TerminalApp::buf_count - 25 : 0;
@@ -235,6 +265,7 @@ int TerminalApp::Open(){
             }
         }
     );
+    g_term_wid = wid;
     return wid;
 }
 
@@ -659,6 +690,14 @@ void TerminalApp::ExecuteInput(){
     NewLine();
     scpy(pending_cmd, input_buf, TERM_INPUT_MAX);
     command_pending = true;
+    // test hook: only lines starting "echo KBT" are mirrored to serial so a
+    // harness can diff typed vs received bytes; real commands (api keys) never are.
+    // off by default - a normal boot never copies typed text to serial or the disk log;
+    // boot with kurono.kbtest=1 to enable it. (satoru)
+    if(g_kbtest && input_len>=8 && input_buf[0]=='e' && input_buf[1]=='c' && input_buf[2]=='h' && input_buf[3]=='o' &&
+       input_buf[4]==' ' && input_buf[5]=='K' && input_buf[6]=='B' && input_buf[7]=='T'){
+        SerialLogger::Log("[kbt] "); SerialLogger::Log(input_buf); SerialLogger::Log("\r\n");
+    }
 
     // reset input immediately while the command is pending
     input_buf[0]=0; input_len=0; input_cursor=0;
@@ -673,7 +712,9 @@ void TerminalApp::Tick(){
 
     char output[SHELL_OUTPUT_BUF];
     output[0]=0;
+    g_in_exec = true;
     KuronoShell::Execute(pending_cmd, output, SHELL_OUTPUT_BUF);
+    g_in_exec = false;
     pending_cmd[0]=0;
 
     bool streamed = KuronoShell::TakeIncrementalOutputUsed();
@@ -755,8 +796,11 @@ void TerminalApp::RenderCell(int sx,int sy,TermCell* cell){
     }
 }
 
+static void RenderPty(void* win_ptr,int cx,int cy,int cw,int ch);
+
 void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     (void)win_ptr;
+    if(g_pty_mode){ RenderPty(win_ptr,cx,cy,cw,ch); return; }
 
     // keep theme + grid metrics current (font may finish loading after init,
     // and the theme can be re-themed live). (satoru)
@@ -891,17 +935,38 @@ void TerminalApp::Render(void* win_ptr,int cx,int cy,int cw,int ch){
     }
 
     // The input cursor blinks on a time-driven 500ms cycle. When this terminal
-    // is the focused window, self-sustain frames so the blink stays a clean
-    // square wave instead of jittering on the 250ms gate fallback grid. Scoped
-    // to focus so a background terminal still lets the GUI idle. (review fix)
-    if (win_ptr && ((Window*)win_ptr)->focused) Graphics::MarkUIDirty();
+    // is the focused window, ask for a frame at the next blink edge so the blink
+    // stays a clean square wave instead of jittering on the 250ms fallback grid.
+    // (this used to mark the ui dirty every frame, which kept a focused terminal
+    // redrawing the whole desktop at full rate - starving whatever it launched.)
+    if (win_ptr && ((Window*)win_ptr)->focused) {
+        uint32_t phase = (now_ms - last_keypress_ms) % 500;
+        Graphics::RequestFrameAt(now_ms + (500 - phase));
+    }
 }
 
 //  input callback
+// terminal char path counters for [hb]: 0 chars in, 1 typed into the line,
+// 2 typed ahead while a command ran, 3 enter lost while busy (satoru)
+volatile uint32_t g_termdbg[4] = {0};
+
 bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     (void)win_ptr; (void)mx; (void)my; (void)clicked;
 
     if(key==0) return false;
+    __atomic_add_fetch(&g_termdbg[0], 1, __ATOMIC_RELAXED);
+    // pty mode: keys arrive as raw key events through PtyKeyEvent (arrows, ctrl, alt),
+    // so the char path must not double-send. (satoru)
+    if(g_pty_mode) return true;
+    // the char queue carries plain letters even with ctrl held, so the line editor's
+    // ctrl codes (c u a e k l w, ctrl+shift+c/v) never arrived: map ctrl+letter here. (satoru)
+    {
+        const KeyboardState& ks = Keyboard::GetState();
+        if(ks.ctrl && !ks.alt){
+            char lc = (key>='A' && key<='Z') ? (char)(key+32) : key;
+            if(lc>='a' && lc<='z') key = (char)(lc-'a'+1);
+        }
+    }
     last_keypress_ms = Timer::GetRealMs();
     if(command_pending || command_running){
         if(key==3){
@@ -923,8 +988,10 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
             input_len++;
             input_cursor++;
             input_buf[input_len]=0;
+            __atomic_add_fetch(&g_termdbg[2], 1, __ATOMIC_RELAXED);
             return true;
         }
+        if(key=='\n' || key=='\r') __atomic_add_fetch(&g_termdbg[3], 1, __ATOMIC_RELAXED);
         if((key==8 || key==127) && input_cursor>0){
             for(int i=input_cursor-1;i<input_len-1;i++)
                 input_buf[i]=input_buf[i+1];
@@ -1044,48 +1111,48 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
     }
 
     // up arrow (escape sequence or raw code 0x48)
-    if(key==(char)0x48){
+    if(key==(char)0x90){
         HistoryUp();
         ScrollToBottom();
         return true;
     }
     // down arrow
-    if(key==(char)0x50){
+    if(key==(char)0x91){
         HistoryDown();
         ScrollToBottom();
         return true;
     }
     // left arrow
-    if(key==(char)0x4B){
+    if(key==(char)0x92){
         if(input_cursor>0) input_cursor--;
         return true;
     }
     // right arrow
-    if(key==(char)0x4D){
+    if(key==(char)0x93){
         if(input_cursor<input_len) input_cursor++;
         return true;
     }
 
     // home
-    if(key==(char)0x47){ input_cursor=0; return true; }
+    if(key==(char)0x94){ input_cursor=0; return true; }
     // end
-    if(key==(char)0x4F){ input_cursor=input_len; return true; }
+    if(key==(char)0x95){ input_cursor=input_len; return true; }
     // page up
-    if(key==(char)0x49){
+    if(key==(char)0x96){
         scroll_offset+=10;
         int ms=(buf_count>25?buf_count-25:0);
         if(scroll_offset>ms) scroll_offset=ms;
         return true;
     }
     // page down
-    if(key==(char)0x51){
+    if(key==(char)0x97){
         scroll_offset-=10;
         if(scroll_offset<0) scroll_offset=0;
         return true;
     }
 
     // delete
-    if(key==(char)0x53){
+    if(key==(char)0x98){
         if(input_cursor<input_len){
             for(int i=input_cursor;i<input_len-1;i++)
                 input_buf[i]=input_buf[i+1];
@@ -1112,9 +1179,418 @@ bool TerminalApp::Input(void* win_ptr,int mx,int my,bool clicked,char key){
         input_cursor++;
         input_buf[input_len]=0;
         tab_match_count=0; // reset tab on new char
+        __atomic_add_fetch(&g_termdbg[1], 1, __ATOMIC_RELAXED);
         ScrollToBottom();
         return true;
     }
 
     return false;
 }
+
+//  pty mode: vt100 screen wired to a kpty session (satoru)
+
+// arms as "URDL" digits: 0 none, 1 light, 2 heavy, 3 double. covers u+2500..257f. (satoru)
+static const char* const BOX_MIXED[64] = {
+    "0110","0210","0120","0220","0011","0012","0021","0022","1100","1200","2100","2200","1001","1002","2001","2002",
+    "1110","1210","2110","1120","2120","2210","1220","2220","1011","1012","2011","1021","2021","2012","1022","2022",
+    "0111","0112","0211","0212","0121","0122","0221","0222","1101","1102","1201","1202","2101","2102","2201","2202",
+    "1111","1112","1211","1212","2111","1121","2121","2112","2211","1122","1221","2212","1222","2122","2221","2222"
+};
+static const char* const BOX_DBL[29] = {
+    "0303","3030","0310","0130","0330","0013","0031","0033","1300","3100","3300","1003","3001","3003",
+    "1310","3130","3330","1013","3031","3033","0313","0131","0333","1303","3101","3303","1313","3131","3333"
+};
+
+static bool BoxArms(unsigned int cp, const char** out){
+    static const char* const L = "0101"; static const char* const V = "1010";
+    static const char* const HL = "0202"; static const char* const HV = "2020";
+    if(cp>=0x250C && cp<=0x254B){ *out = BOX_MIXED[cp-0x250C]; return true; }
+    if(cp>=0x2550 && cp<=0x256C){ *out = BOX_DBL[cp-0x2550]; return true; }
+    switch(cp){
+    case 0x2500: case 0x2504: case 0x2508: case 0x254C: *out = L; return true;
+    case 0x2501: case 0x2505: case 0x2509: case 0x254D: *out = HL; return true;
+    case 0x2502: case 0x2506: case 0x250A: case 0x254E: *out = V; return true;
+    case 0x2503: case 0x2507: case 0x250B: case 0x254F: *out = HV; return true;
+    case 0x256D: *out = "0110"; return true;
+    case 0x256E: *out = "0011"; return true;
+    case 0x256F: *out = "1001"; return true;
+    case 0x2570: *out = "1100"; return true;
+    case 0x2574: *out = "0001"; return true;
+    case 0x2575: *out = "1000"; return true;
+    case 0x2576: *out = "0100"; return true;
+    case 0x2577: *out = "0010"; return true;
+    case 0x2578: *out = "0002"; return true;
+    case 0x2579: *out = "2000"; return true;
+    case 0x257A: *out = "0200"; return true;
+    case 0x257B: *out = "0020"; return true;
+    case 0x257C: *out = "0201"; return true;
+    case 0x257D: *out = "1020"; return true;
+    case 0x257E: *out = "0102"; return true;
+    case 0x257F: *out = "2010"; return true;
+    default: return false;
+    }
+}
+
+static unsigned int BlendRGB(unsigned int a, unsigned int b, int num /*0..8 of a*/){
+    unsigned int r=(((a>>16)&255)*num + ((b>>16)&255)*(8-num))/8;
+    unsigned int g=(((a>>8)&255)*num + ((b>>8)&255)*(8-num))/8;
+    unsigned int bl=((a&255)*num + (b&255)*(8-num))/8;
+    return 0xFF000000u|(r<<16)|(g<<8)|bl;
+}
+
+// draw box-drawing and block-element glyphs procedurally so they join across cells
+// without depending on the font having them. returns false if cp is not handled. (satoru)
+static bool DrawBlockGlyph(int x,int y,unsigned int cp,unsigned int fg,unsigned int bg){
+    const int W=CELL_W, H=CELL_H;
+    if(cp>=0x2580 && cp<=0x259F){
+        if(cp==0x2580){ Graphics::FillRect(x,y,W,H/2,fg); return true; }
+        if(cp>=0x2581 && cp<=0x2588){ int h=H*(int)(cp-0x2580)/8; Graphics::FillRect(x,y+H-h,W,h,fg); return true; }
+        if(cp>=0x2589 && cp<=0x258F){ int w=W*(int)(0x2590-cp)/8; if(w<1) w=1; Graphics::FillRect(x,y,w,H,fg); return true; }
+        if(cp==0x2590){ Graphics::FillRect(x+W/2,y,W-W/2,H,fg); return true; }
+        if(cp>=0x2591 && cp<=0x2593){ Graphics::FillRect(x,y,W,H,BlendRGB(fg,bg,(int)(cp-0x2590)*2)); return true; }
+        if(cp==0x2594){ Graphics::FillRect(x,y,W,H/8>0?H/8:1,fg); return true; }
+        if(cp==0x2595){ Graphics::FillRect(x+W-W/8-1,y,W/8+1,H,fg); return true; }
+        static const unsigned char Q[10]={4,8,1,13,9,7,11,2,6,14};   // ul=1 ur=2 ll=4 lr=8 (satoru)
+        unsigned char m=Q[cp-0x2596];
+        int hw=W/2, hh=H/2;
+        if(m&1) Graphics::FillRect(x,y,hw,hh,fg);
+        if(m&2) Graphics::FillRect(x+hw,y,W-hw,hh,fg);
+        if(m&4) Graphics::FillRect(x,y+hh,hw,H-hh,fg);
+        if(m&8) Graphics::FillRect(x+hw,y+hh,W-hw,H-hh,fg);
+        return true;
+    }
+    const char* a=nullptr;
+    if(!(cp>=0x2500 && cp<=0x257F) || !BoxArms(cp,&a)) return false;
+    int cxm=x+W/2, cym=y+H/2;
+    for(int k=0;k<4;k++){            // 0 up, 1 right, 2 down, 3 left
+        int w=a[k]-'0';
+        if(w==0) continue;
+        int t=(w==2)?2:1;
+        int offs[2]={0,0}; int cnt=1;
+        if(w==3){ offs[0]=-2; offs[1]=1; cnt=2; t=1; }
+        for(int i=0;i<cnt;i++){
+            int o=offs[i];
+            if(k==0||k==2){
+                int lx=cxm-(t>1?1:0)+o;
+                int y0=(k==0)?y:cym-1, y1=(k==0)?cym+1:y+H;
+                Graphics::FillRect(lx,y0,t,y1-y0,fg);
+            } else {
+                int ly=cym-(t>1?1:0)+o;
+                int x0=(k==3)?x:cxm-1, x1=(k==3)?cxm+1:x+W;
+                Graphics::FillRect(x0,ly,x1-x0,t,fg);
+            }
+        }
+    }
+    return true;
+}
+
+static int Utf8Enc(unsigned int cp,char* o){
+    if(cp<0x80){ o[0]=(char)cp; o[1]=0; return 1; }
+    if(cp<0x800){ o[0]=(char)(0xC0|(cp>>6)); o[1]=(char)(0x80|(cp&63)); o[2]=0; return 2; }
+    if(cp<0x10000){ o[0]=(char)(0xE0|(cp>>12)); o[1]=(char)(0x80|((cp>>6)&63)); o[2]=(char)(0x80|(cp&63)); o[3]=0; return 3; }
+    o[0]=(char)(0xF0|(cp>>18)); o[1]=(char)(0x80|((cp>>12)&63)); o[2]=(char)(0x80|((cp>>6)&63)); o[3]=(char)(0x80|(cp&63)); o[4]=0; return 4;
+}
+
+static const VtCell* PtyRowPtr(int r){
+    int off=g_pty_off;
+    int hn=g_vt.HistCount();
+    if(off>hn) off=hn;
+    int v=hn-off+r;
+    if(v<hn) return g_vt.HistLine(hn-1-v);
+    return &g_vt.Cell(v-hn,0);
+}
+
+static void RenderPty(void* win_ptr,int cx,int cy,int cw,int ch){
+    TermSyncTheme();
+    EnsureMetrics();
+    g_vt.SetDefaults(T_FG,T_BG);
+    int ox=cx+PAD_X, oy=cy+PAD_Y;
+    int cols=(cw-2*PAD_X)/CELL_W, rows=(ch-2*PAD_Y)/CELL_H;
+    if(cols<20) cols=20; if(cols>VT_MAXC) cols=VT_MAXC;
+    if(rows<4) rows=4;   if(rows>VT_MAXR) rows=VT_MAXR;
+    if(cols!=g_vt.Cols() || rows!=g_vt.Rows()){
+        g_vt.Resize(cols,rows);
+        Kpty::Resize(cols,rows);
+    }
+    // drain program output into the emulator, then send back what it asked for (satoru)
+    {
+        uint8_t buf[2048];
+        int total=0, n;
+        while(total<(1<<17) && (n=Kpty::MasterRead(buf,sizeof(buf)))>0){ g_vt.Feed(buf,n); total+=n; }
+        uint8_t rep[256];
+        int rn;
+        while((rn=g_vt.TakeReply(rep,sizeof(rep)))>0) Kpty::MasterWrite(rep,rn);
+        if(Kpty::MasterHasData()) Graphics::MarkUIDirty();   // more than one frame's worth (satoru)
+    }
+    Graphics::FillRect(cx,cy,cw,ch,T_BG);
+    int hn=g_vt.HistCount();
+    if(g_pty_off>hn) g_pty_off=hn;
+    for(int r=0;r<rows;r++){
+        const VtCell* row=PtyRowPtr(r);
+        if(!row) continue;
+        int sy=oy+r*CELL_H;
+        // backgrounds, batched by colour
+        int c=0;
+        while(c<cols){
+            unsigned int bg=row[c].bg, fg=row[c].fg;
+            if(row[c].attr&VA_INVERSE) bg=fg;
+            if(bg==T_BG){ c++; continue; }
+            int s=c;
+            while(c<cols){
+                unsigned int b2=row[c].bg, f2=row[c].fg;
+                if(row[c].attr&VA_INVERSE) b2=f2;
+                if(b2!=bg) break;
+                c++;
+            }
+            Graphics::FillRect(ox+s*CELL_W,sy,(c-s)*CELL_W,CELL_H,bg);
+        }
+        // glyphs: ascii runs batched by colour, everything else per cell (satoru)
+        c=0;
+        while(c<cols){
+            const VtCell& k=row[c];
+            unsigned int cp=k.cp;
+            if(cp==0||cp==' '||cp==0xFFFFFFFFu||(k.attr&VA_HIDDEN)){ c++; continue; }
+            unsigned int fg=k.fg, bg=k.bg;
+            if(k.attr&VA_INVERSE){ unsigned int t=fg; fg=bg; bg=t; }
+            if(k.attr&VA_DIM) fg=BlendRGB(fg,bg,5);
+            bool bold=(k.attr&VA_BOLD)!=0;
+            if(cp<0x80){
+                // one glyph per cell: the font's fractional advance drifts away from the
+                // 8 px grid over a long run (a 118 column row ended ~30 px too far right
+                // and clipped), so every cell is placed on the grid. (satoru)
+                char s1[2]={(char)cp,0};
+                TermDrawRun(ox+c*CELL_W,sy,s1,fg,bold);
+                c++;
+                continue;
+            }
+            int x=ox+c*CELL_W;
+            if(!DrawBlockGlyph(x,sy,cp,fg,bg)){
+                char u[8]; Utf8Enc(cp,u);
+                TermDrawRun(x,sy,u,fg,bold);
+            }
+            c++;
+        }
+        // underline / strike
+        for(int cc=0;cc<cols;cc++){
+            unsigned char at=row[cc].attr;
+            if(!(at&(VA_UNDER|VA_STRIKE))) continue;
+            unsigned int fg=(at&VA_INVERSE)?row[cc].bg:row[cc].fg;
+            if(at&VA_UNDER) Graphics::FillRect(ox+cc*CELL_W,sy+CELL_H-3,CELL_W,1,fg);
+            if(at&VA_STRIKE) Graphics::FillRect(ox+cc*CELL_W,sy+CELL_H/2,CELL_W,1,fg);
+        }
+    }
+    // cursor: steady block with the glyph redrawn inverted (satoru)
+    if(g_vt.CursorVisible() && g_pty_off==0){
+        int r=g_vt.CurRow(), c=g_vt.CurCol();
+        if(r>=0 && r<rows && c>=0 && c<cols){
+            int x=ox+c*CELL_W, y=oy+r*CELL_H;
+            bool foc = win_ptr && ((Window*)win_ptr)->focused;
+            if(foc){
+                Graphics::FillRect(x,y,CELL_W,CELL_H,T_CURSOR);
+                const VtCell& k=g_vt.Cell(r,c);
+                if(k.cp>' ' && k.cp!=0xFFFFFFFFu){
+                    if(k.cp<0x80){ char s[2]={(char)k.cp,0}; TermDrawRun(x,y,s,T_BG,(k.attr&VA_BOLD)!=0); }
+                    else if(!DrawBlockGlyph(x,y,k.cp,T_BG,T_CURSOR)){ char u[8]; Utf8Enc(k.cp,u); TermDrawRun(x,y,u,T_BG,false); }
+                }
+            } else {
+                Graphics::FillRect(x,y,CELL_W,1,T_CURSOR); Graphics::FillRect(x,y+CELL_H-1,CELL_W,1,T_CURSOR);
+                Graphics::FillRect(x,y,1,CELL_H,T_CURSOR); Graphics::FillRect(x+CELL_W-1,y,1,CELL_H,T_CURSOR);
+            }
+        }
+    }
+}
+
+bool TerminalApp::PtyActive(){ return g_pty_mode; }
+
+bool TerminalApp::PtyBegin(){
+    if(!g_in_exec || g_term_wid<0 || g_pty_mode) return false;
+    Window* w=WindowManager::GetWindow(g_term_wid);
+    if(!w || w->state==WIN_CLOSED) return false;
+    TermSyncTheme();
+    EnsureMetrics();
+    // a tui wants room: grow the window to most of the screen (satoru)
+    int sw=Graphics::GetWidth(), sh=Graphics::GetHeight();
+    int nw=sw-60, nh=sh-110;
+    if(nw>1000) nw=1000;
+    if(nh>700) nh=700;
+    if(nw>w->w || nh>w->h){
+        WindowManager::ResizeWindow(g_term_wid, nw>w->w?nw:w->w, nh>w->h?nh:w->h);
+        w=WindowManager::GetWindow(g_term_wid);
+        int nx=(sw-w->w)/2, ny=36;
+        if(nx<0) nx=0;
+        WindowManager::MoveWindow(g_term_wid, nx, ny);
+    }
+    int cols=(w->content_w-2*PAD_X)/CELL_W, rows=(w->content_h-2*PAD_Y)/CELL_H;
+    if(cols<20) cols=80; if(cols>VT_MAXC) cols=VT_MAXC;
+    if(rows<4) rows=24;  if(rows>VT_MAXR) rows=VT_MAXR;
+    g_vt.Init(cols,rows,T_FG,T_BG);
+    g_pty_off=0;
+    Kpty::Begin(cols,rows);
+    g_pty_mode=true;
+    Graphics::MarkUIDirty();
+    return true;
+}
+
+static char PtyAscii(unsigned int cp){
+    if(cp==0||cp==0xFFFFFFFFu) return ' ';
+    if(cp<0x80) return (char)cp;
+    if(cp>=0x2500 && cp<=0x257F){
+        if(cp==0x2500||cp==0x2501||cp==0x2550) return '-';
+        if(cp==0x2502||cp==0x2503||cp==0x2551) return '|';
+        return '+';
+    }
+    if(cp>=0x2580 && cp<=0x259F) return '#';
+    return '?';
+}
+
+void TerminalApp::PtyEnd(){
+    if(!g_pty_mode) return;
+    Kpty::End();
+    {   // final drain so nothing the program printed on its way out is lost (satoru)
+        uint8_t buf[2048]; int n;
+        while((n=Kpty::MasterRead(buf,sizeof(buf)))>0) g_vt.Feed(buf,n);
+    }
+    g_pty_mode=false;
+    // keep what was on screen: copy the visible main screen into the normal scrollback (satoru)
+    if(!g_vt.AltScreen()){
+        if(cursor_col>0) NewLine();
+        int last=-1;
+        for(int r=0;r<g_vt.Rows();r++)
+            for(int c=0;c<g_vt.Cols();c++){ unsigned int cp=g_vt.Cell(r,c).cp; if(cp!=0 && cp!=' ') { last=r; break; } }
+        SetColor(T_FG,T_BG);
+        for(int r=0;r<=last;r++){
+            int len=g_vt.Cols();
+            while(len>0){ unsigned int cp=g_vt.Cell(r,len-1).cp; if(cp!=0 && cp!=' ') break; len--; }
+            for(int c=0;c<len;c++) WriteChar(PtyAscii(g_vt.Cell(r,c).cp));
+            NewLine();
+        }
+    }
+    ScrollToBottom();
+    Graphics::MarkUIDirty();
+}
+
+void TerminalApp::PtyScroll(int delta){
+    g_pty_off += (delta>0)?3:(delta<0?-3:0);
+    if(g_pty_off<0) g_pty_off=0;
+    if(g_pty_off>g_vt.HistCount()) g_pty_off=g_vt.HistCount();
+    Graphics::MarkUIDirty();
+}
+
+void TerminalApp::PtyPoll(){
+    if(!g_pty_mode) return;
+    Window* w=WindowManager::GetWindow(g_term_wid);
+    if(!w || w->state==WIN_CLOSED) { if(!Kpty::Hungup()) Kpty::Hangup(); }
+}
+
+static int PtyCsi(uint8_t* o,int n,int num,char fin,int mod,bool app){
+    o[n++]=0x1B;
+    if(mod>1){ o[n++]='['; if(num==0) o[n++]='1'; else { if(num>=10){ o[n++]=(char)('0'+num/10); } o[n++]=(char)('0'+num%10); } o[n++]=';'; o[n++]=(char)('0'+mod); o[n++]=fin; return n; }
+    if(num==0){ o[n++]=app?'O':'['; o[n++]=fin; return n; }
+    o[n++]='['; if(num>=10) o[n++]=(char)('0'+num/10); o[n++]=(char)('0'+num%10); o[n++]=fin; return n;
+}
+
+void TerminalApp::PtyKeyEvent(int key,bool shift,bool ctrl,bool alt){
+    Window* fw=WindowManager::GetFocusedWindow();
+    if(!fw || fw->id!=g_term_wid) return;
+    Key k=(Key)key;
+    // ctrl+alt+m: maximize / restore the terminal window from the keyboard (satoru)
+    if(k==KEY_M && ctrl && alt){ WindowManager::ToggleMaximize(g_term_wid); return; }
+    if(!g_pty_mode){
+        // the plain shell line editor: arrows, home/end, paging and delete arrive as key
+        // events (the char queue never carries them) and map to the codes Input() expects.
+        char code=0;
+        switch(k){
+        case KEY_UP: code=(char)0x90; break;    case KEY_DOWN: code=(char)0x91; break;
+        case KEY_LEFT: code=(char)0x92; break;  case KEY_RIGHT: code=(char)0x93; break;
+        case KEY_HOME: code=(char)0x94; break;  case KEY_END: code=(char)0x95; break;
+        case KEY_PAGEUP: code=(char)0x96; break; case KEY_PAGEDOWN: code=(char)0x97; break;
+        case KEY_DELETE: code=(char)0x98; break;
+        default: break;
+        }
+        if(code) Input(nullptr,0,0,false,code);
+        return;
+    }
+    if(Kpty::Hungup()) return;
+    uint8_t o[64]; int n=0;
+    int mod=1+(shift?1:0)+(alt?2:0)+(ctrl?4:0);
+    bool app=g_vt.AppCursorKeys();
+    if(alt && k==KEY_TAB) return;                 // desktop alt-tab (satoru)
+    if(k==KEY_LSHIFT||k==KEY_RSHIFT||k==KEY_LCTRL||k==KEY_RCTRL||k==KEY_LALT||k==KEY_RALT||
+       k==KEY_LSUPER||k==KEY_RSUPER||k==KEY_CAPSLOCK||k==KEY_NUMLOCK||k==KEY_SCROLLLOCK) return;
+    last_keypress_ms=Timer::GetRealMs();
+    // scrollback paging does not reach the program (satoru)
+    if(shift && !ctrl && !alt && (k==KEY_PAGEUP||k==KEY_PAGEDOWN)){
+        PtyScroll(k==KEY_PAGEUP?1:-1); return;
+    }
+    // paste (ctrl+shift+v), bracketed when the program asked for it (satoru)
+    if(ctrl && shift && k==KEY_V){
+        if(ClipboardManager::HasText()){
+            const char* s=ClipboardManager::GetText();
+            if(g_vt.BracketedPaste()) Kpty::MasterWrite((const uint8_t*)"\x1b[200~",6);
+            uint8_t cb[256]; int cn=0; int total=0;
+            for(int i=0;s[i]&&total<8192;i++,total++){
+                uint8_t ch=(uint8_t)s[i];
+                if(ch=='\n') ch='\r';
+                else if(ch<0x20 && ch!='\t' && ch!='\r') continue;
+                cb[cn++]=ch;
+                if(cn==(int)sizeof(cb)){ Kpty::MasterWrite(cb,cn); cn=0; }
+            }
+            if(cn) Kpty::MasterWrite(cb,cn);
+            if(g_vt.BracketedPaste()) Kpty::MasterWrite((const uint8_t*)"\x1b[201~",6);
+        }
+        g_pty_off=0; return;
+    }
+    if(ctrl && shift && k==KEY_C) return;
+    g_pty_off=0;
+    switch(k){
+    case KEY_UP:    n=PtyCsi(o,n,0,'A',mod,app); break;
+    case KEY_DOWN:  n=PtyCsi(o,n,0,'B',mod,app); break;
+    case KEY_RIGHT: n=PtyCsi(o,n,0,'C',mod,app); break;
+    case KEY_LEFT:  n=PtyCsi(o,n,0,'D',mod,app); break;
+    case KEY_HOME:  n=PtyCsi(o,n,0,'H',mod,app); break;
+    case KEY_END:   n=PtyCsi(o,n,0,'F',mod,app); break;
+    case KEY_INSERT:   n=PtyCsi(o,n,2,'~',mod,false); break;
+    case KEY_DELETE:   n=PtyCsi(o,n,3,'~',mod,false); break;
+    case KEY_PAGEUP:   n=PtyCsi(o,n,5,'~',mod,false); break;
+    case KEY_PAGEDOWN: n=PtyCsi(o,n,6,'~',mod,false); break;
+    case KEY_F1: case KEY_F2: case KEY_F3: case KEY_F4: {
+        char fin=(char)('P'+(k-KEY_F1));
+        if(mod>1) n=PtyCsi(o,n,0,fin,mod,false); else { o[n++]=0x1B; o[n++]='O'; o[n++]=(uint8_t)fin; }
+        break;
+    }
+    case KEY_F5: n=PtyCsi(o,n,15,'~',mod,false); break;
+    case KEY_F6: n=PtyCsi(o,n,17,'~',mod,false); break;
+    case KEY_F7: n=PtyCsi(o,n,18,'~',mod,false); break;
+    case KEY_F8: n=PtyCsi(o,n,19,'~',mod,false); break;
+    case KEY_F9: n=PtyCsi(o,n,20,'~',mod,false); break;
+    case KEY_F10: n=PtyCsi(o,n,21,'~',mod,false); break;
+    case KEY_F11: n=PtyCsi(o,n,23,'~',mod,false); break;
+    case KEY_F12: n=PtyCsi(o,n,24,'~',mod,false); break;
+    case KEY_ENTER: case KEY_KP_ENTER: if(alt) o[n++]=0x1B; o[n++]='\r'; break;
+    case KEY_BACKSPACE: if(alt) o[n++]=0x1B; o[n++]=ctrl?0x08:0x7F; break;
+    case KEY_TAB: if(shift){ o[n++]=0x1B; o[n++]='['; o[n++]='Z'; } else { if(alt) o[n++]=0x1B; o[n++]='\t'; } break;
+    case KEY_ESC: o[n++]=0x1B; break;
+    default: {
+        char c=Keyboard::KeyToChar(k,shift,Keyboard::GetState().caps_lock);
+        if(!c) return;
+        unsigned char u=(unsigned char)c;
+        if(ctrl){
+            if(u>='a'&&u<='z') u=(unsigned char)(u-'a'+1);
+            else if(u>='A'&&u<='Z') u=(unsigned char)(u-'A'+1);
+            else if(u=='['||u=='{') u=27;
+            else if(u=='\\'||u=='|') u=28;
+            else if(u==']'||u=='}') u=29;
+            else if(u=='^'||u=='6') u=30;
+            else if(u=='_'||u=='-'||u=='/') u=31;
+            else if(u=='@'||u=='2'||u==' ') u=0;
+            else return;
+        }
+        if(alt) o[n++]=0x1B;
+        o[n++]=u;
+        break;
+    }
+    }
+    if(n>0) Kpty::MasterWrite(o,n);
+}
+
+// end (satoru)

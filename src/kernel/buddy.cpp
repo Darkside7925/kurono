@@ -84,7 +84,12 @@ int Buddy::OrderForBytes(uint64_t bytes) {
 
 bool Buddy::Init() {
     // Pool size capped to whatever PMM can give us in one contiguous chunk.
-    uint64_t want_pages = BUDDY_POOL_BYTES / BUDDY_PAGE_SIZE;
+    // scale with ram (1/32, 8 mb floor): the fixed 256 mb pool was the single
+    // biggest boot reservation, which a 512 mb machine cannot afford. (satoru)
+    uint64_t want_bytes = PMM::GetTotalMemory() / 32;
+    if (want_bytes > BUDDY_POOL_BYTES) want_bytes = BUDDY_POOL_BYTES;
+    if (want_bytes < BUDDY_POOL_MIN_BYTES) want_bytes = BUDDY_POOL_MIN_BYTES;
+    uint64_t want_pages = want_bytes / BUDDY_PAGE_SIZE;
     uint64_t base = 0;
     while (want_pages > 1024) {
         base = PMM::AllocContiguous(want_pages);

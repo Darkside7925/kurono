@@ -3,6 +3,7 @@
 
 #include "e1000.h"
 #include "serial.h"
+#include "igc.h"   // fallback backend: i225/i226/82576 behind the same E1000:: api (satoru)
 #include "../kernel/heap.h"
 
 // static member definitions
@@ -26,6 +27,10 @@ uint32_t E1000::rx_bytes = 0;
 uint32_t E1000::rx_missed = 0;
 
 static const uint16_t E1000_MAX_TX_FRAME = 1518;
+
+// true when no e1000 exists but an igc/igb nic is bound; every public E1000::
+// call then forwards to Igc so tcpip/network keep one nic api. (satoru)
+static bool g_use_igc = false;
 
 static inline void outl(uint16_t port, uint32_t val) {
     __asm__ __volatile__("outl %0, %1" : : "a"(val), "Nd"(port));
@@ -246,9 +251,12 @@ bool E1000::Init() {
     tx_count = rx_count = tx_bytes = rx_bytes = 0;
     packet_handler = nullptr;
 
+    g_use_igc = false;
     SerialLogger::Log("[E1000] Scanning PCI bus...\r\n");
     if (!ScanPCI()) {
         SerialLogger::Log("[E1000] No E1000 NIC found\r\n");
+        // no e1000: try the igc/igb driver (real i226 laptop, qemu igb) (satoru)
+        if (Igc::Init()) { g_use_igc = true; return true; }
         return false;
     }
 
@@ -301,14 +309,16 @@ bool E1000::Init() {
     return true;
 }
 
-bool E1000::IsDetected() { return detected; }
+bool E1000::IsDetected() { return g_use_igc ? Igc::IsDetected() : detected; }
 
 bool E1000::IsLinkUp() {
+    if (g_use_igc) return Igc::IsLinkUp();
     if (!detected) return false;
     return (ReadReg(E1000_STATUS) & (1 << 1)) != 0;
 }
 
 void E1000::GetMAC(uint8_t out[6]) {
+    if (g_use_igc) { Igc::GetMAC(out); return; }
     for (int i = 0; i < 6; i++) out[i] = mac[i];
 }
 
@@ -327,6 +337,7 @@ void E1000::ReclaimTx() {
 }
 
 bool E1000::Send(const uint8_t* data, uint16_t length) {
+    if (g_use_igc) return Igc::Send(data, length);
     if (!detected || !data || length == 0 || length > E1000_MAX_TX_FRAME) {
         SerialLogger::Log("[E1000:TX] reject: bad params or no NIC\r\n");
         return false;
@@ -410,6 +421,7 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
 }
 
 void E1000::Poll() {
+    if (g_use_igc) { Igc::Poll(); return; }
     if (!detected) return;
 
     // accumulate the missed-packets count (clear-on-read in hw). a non-zero
@@ -479,11 +491,12 @@ void E1000::Poll() {
 }
 
 void E1000::SetPacketHandler(E1000_PacketHandler handler) {
+    Igc::SetPacketHandler(handler);   // same signature; harmless when igc is unused (satoru)
     packet_handler = handler;
 }
 
-uint32_t E1000::GetTxCount() { return tx_count; }
-uint32_t E1000::GetRxCount() { return rx_count; }
-uint32_t E1000::GetTxBytes() { return tx_bytes; }
-uint32_t E1000::GetRxBytes() { return rx_bytes; }
-uint32_t E1000::GetRxMissed() { return rx_missed; }
+uint32_t E1000::GetTxCount() { return g_use_igc ? Igc::GetTxCount() : tx_count; }
+uint32_t E1000::GetRxCount() { return g_use_igc ? Igc::GetRxCount() : rx_count; }
+uint32_t E1000::GetTxBytes() { return g_use_igc ? Igc::GetTxBytes() : tx_bytes; }
+uint32_t E1000::GetRxBytes() { return g_use_igc ? Igc::GetRxBytes() : rx_bytes; }
+uint32_t E1000::GetRxMissed() { return g_use_igc ? Igc::GetRxMissed() : rx_missed; }

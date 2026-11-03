@@ -45,6 +45,12 @@ qmp_*.py
 NOTES.md
 kpkg-daemon-freeze-fix.diff
 
+# capability audit + worklist. local
+# reference only, regenerable, not part of the tracked os tree (satoru)
+/CAPABILITIES.md
+/NEEDTODO.md
+
+
 # feature brainstorm/planning workspace (libraries vendored here; not for the repo) (satoru)
 feats/
 
@@ -88,3 +94,18 @@ feats/
 
 # stray ssh public keys  -  never commit key material of any kind (satoru)
 ssh-key-*
+
+# KLD: the vendored linux tree is upstream + reproducible from KLD_KERNEL_VERSION
+# via kld/tools/fetch_linux.sh, so it is not committed (61MB of headers).
+third_party/linux-*/
+kld/build/
+kld/lx_emul/shim-include/generated/
+kld/lx_emul/shim-include/asm/
+# the KLD container is build output of kld/Makefile, staged for embedding
+src/userprogs/kld_*.elf
+# prebuilt third-party test blob for kurono.bbtest=1 (currently a musl ntfsfix), not source
+src/userprogs/busybox.elf
+# built recovery toolbox tar (scratchpad/build_rtools.sh), not source
+src/userprogs/recovery_tools.tar
+# packet captures written by the qemu test scripts
+*.pcap

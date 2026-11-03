@@ -113,6 +113,24 @@ public:
     static bool Write(uint64_t lba, uint32_t count, const void* buffer);
     static bool Flush();
 
+    // bare-metal write guard. when on, every nvme write is refused unless it
+    // falls entirely inside the one allowed lba window (the gpt partition named
+    // KURONO). no window = no writes at all. ahci honours the same switch. this
+    // is what keeps a real machine's windows/linux disk safe from the persist
+    // store, which otherwise formats the whole first nvme disk. (satoru)
+    static void SetWriteGuard(bool on);
+    // -1 auto (guard any non-qemu controller), 0 never guard, 1 always. (satoru)
+    static void SetGuardPolicy(int p);
+    static int  GuardPolicy();
+    static bool WriteGuardOn();
+    static void SetWriteWindow(uint64_t lba_lo, uint64_t lba_end);
+    // optional second writable range (the kfs file next to the log file). (satoru)
+    static void SetWriteWindow2(uint64_t lba_lo, uint64_t lba_end);
+    static bool GetWriteWindow(uint64_t* lba_lo, uint64_t* lba_end);
+    static uint64_t GuardDenied();
+    // true while any read/write is in flight (the boot-log hook backs off). (satoru)
+    static bool Busy();
+
     static uint64_t GetCapacityLBA();
     static uint32_t GetLBASize();
     static uint32_t GetMaxTransferBlocks();

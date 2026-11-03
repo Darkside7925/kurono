@@ -6,7 +6,10 @@ SECTIONS
     /* Discard notes so .mboot is the very first data in the file */
     /DISCARD/ : { *(.note*) *(.comment) *(.eh_frame) }
 
-    . = 0x100000;
+    /* KERNEL_BASE (--defsym) moves the whole image above a fixed-address user
+       image; claude code is an ET_EXEC linked at 0x200000 and would otherwise
+       overlay the identity-mapped kernel. default is the classic 1 MiB. (satoru) */
+    . = DEFINED(KERNEL_BASE) ? KERNEL_BASE : 0x100000;
     kernel_start = .;
     
     .text BLOCK(4K) : ALIGN(4K)

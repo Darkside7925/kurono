@@ -6,7 +6,8 @@
 //  kernel heap - segregated free-list allocator with coalescing
 //
 //  phase 1: 64 kb bootstrap buffer (in bss - always available)
-//  phase 2: pmm-backed region - up to 50% of physical ram
+//  phase 2: pmm-backed region sized to a quarter of ram, grown on demand by
+//           adding more pmm regions when an allocation does not fit
 //
 //  Each block has a HeapBlock header followed by `size` bytes of payload.
 //  Free blocks store a doubly-linked-list pointer pair in the payload
@@ -116,22 +117,38 @@ static inline bool valid_magic(uint64_t flags) {
 // header carries the free magic, size sane. on failure the caller logs and
 // truncates/leaks instead of walking garbage. bounds mirror heap_base/
 // heap_capacity because these helpers are file-static. (satoru)
-static uint8_t* g_val_base = nullptr;
-static size_t   g_val_cap  = 0;
 static uint8_t* g_val_boot = nullptr;
 static size_t   g_val_boot_cap = 0;
 
+// active heap regions. before expansion the only region is the bootstrap
+// buffer; ExpandWithPMM installs region 0 and heap_grow appends more when an
+// allocation does not fit. blocks never span regions, so coalescing and
+// link validation are bounded by the region a block lives in. (satoru)
+#define HEAP_MAX_REGIONS 32
+static uint8_t* g_reg_base[HEAP_MAX_REGIONS];
+static size_t   g_reg_cap[HEAP_MAX_REGIONS];
+static int      g_reg_count = 0;
+static size_t   g_total_cap = 0;
+static bool     g_growing   = false;   // blocks re-entrant growth from a nested alloc
+
+static int region_of(const uint8_t* p) {
+    for (int i = 0; i < g_reg_count; i++)
+        if (p >= g_reg_base[i] && p < g_reg_base[i] + g_reg_cap[i]) return i;
+    return -1;
+}
+
 static bool link_ok(FreeLink* l) {
     uint8_t* p = (uint8_t*)l;
-    bool in_active = g_val_base && p >= g_val_base + HEAP_HEADER_SIZE &&
-                     p + sizeof(FreeLink) <= g_val_base + g_val_cap;
+    int r = region_of(p);
+    bool in_active = r >= 0 && p >= g_reg_base[r] + HEAP_HEADER_SIZE &&
+                     p + sizeof(FreeLink) <= g_reg_base[r] + g_reg_cap[r];
     bool in_boot   = g_val_boot && p >= g_val_boot + HEAP_HEADER_SIZE &&
                      p + sizeof(FreeLink) <= g_val_boot + g_val_boot_cap;
     if (!in_active && !in_boot) return false;
     if (((uintptr_t)p & 15) != 0) return false;   // blocks + payloads are 16-aligned (satoru)
     HeapBlock* b = (HeapBlock*)(p - HEAP_HEADER_SIZE);
     if (!valid_magic(b->flags) || block_used(b)) return false;
-    uint64_t cap = in_active ? (uint64_t)g_val_cap : (uint64_t)g_val_boot_cap;
+    uint64_t cap = in_active ? (uint64_t)g_reg_cap[r] : (uint64_t)g_val_boot_cap;
     if (b->size < HEAP_MIN_PAYLOAD || b->size > cap) return false;
     return true;
 }
@@ -226,8 +243,9 @@ void KernelHeap::Init() {
     freelist_push(first);
 
     // seed the link-validation bounds (see link_ok). (satoru)
-    g_val_base = heap_base;   g_val_cap = heap_capacity;
     g_val_boot = boot_buffer; g_val_boot_cap = BOOT_HEAP_SIZE;
+    g_reg_base[0] = heap_base; g_reg_cap[0] = heap_capacity;
+    g_reg_count = 1; g_total_cap = heap_capacity;
 
     initialized = true;
     SerialLogger::Log("Heap: Bootstrap (64 KB BSS)\r\n");
@@ -239,17 +257,16 @@ void KernelHeap::ExpandWithPMM() {
 
     uint64_t total_phys = PMM::GetTotalMemory();
 
-    uint64_t target = total_phys / 2;
-    // cap the eager heap grab at 2 gb. it used to be 1 gb, but the firefox
-    // closure stores ~235 mb in kvfs as one contiguous heap block per file
-    // (libxul alone is a 174 mb block); 1 gb left too little headroom once the
-    // desktop+kvfs metadata are accounted for and the streamed install
-    // fragmented the pool. on a 4 gb vm total_phys/2 = 2 gb, which still leaves
-    // ~2 gb in the raw pmm frame pool for demand-paged user brk/mmap/stacks.
-    // (satoru)
+    // start at a quarter of ram and grow on demand (heap_grow). this used to
+    // grab half of ram up front, with no way to grow, so it had to be sized for
+    // the firefox closure (~235 mb in kvfs, libxul alone a 174 mb block) on every
+    // boot. the desktop needs ~40 mb of heap, so on a 512 mb machine the eager
+    // half starved everything else. (satoru)
+    uint64_t target = total_phys / 4;
     const uint64_t MAX_HEAP = 2ULL * 1024 * 1024 * 1024;
     const uint64_t MIN_HEAP = 32ULL * 1024 * 1024;
     if (target > MAX_HEAP) target = MAX_HEAP;
+    if (target < MIN_HEAP) target = MIN_HEAP;
 
     void* big = nullptr;
     while (target >= MIN_HEAP) {
@@ -273,7 +290,8 @@ void KernelHeap::ExpandWithPMM() {
     heap_base     = new_base;
     heap_capacity = new_cap;
     expanded      = true;
-    g_val_base = heap_base; g_val_cap = heap_capacity;   // re-seed link validation bounds (satoru)
+    g_reg_base[0] = heap_base; g_reg_cap[0] = heap_capacity;   // re-seed link validation bounds (satoru)
+    g_reg_count = 1; g_total_cap = heap_capacity;
 
     // abandon the bootstrap freelist; allocations in bss remain valid because
     // their headers don't move. New allocations come from the expanded pool.
@@ -286,6 +304,50 @@ void KernelHeap::ExpandWithPMM() {
     SerialLogger::Log(" MB (PMM-backed, ");
     SerialLogger::LogDec((uint32_t)(total_phys / (1024*1024)));
     SerialLogger::Log(" MB physical RAM detected)\r\n");
+    LogMemReport("heap-up");
+}
+
+// add a pmm region big enough for a `need`-byte block. grows geometrically
+// (half the current heap, at least 16 mb) so the region count stays small, and
+// falls back to just what the request needs when ram is tight. called with the
+// heap lock held; the lock order heap -> pmm matches the existing heap ->
+// serial warning path, and pmm never calls back into the heap. (satoru)
+static bool heap_grow(size_t need) {
+    if (g_growing || g_reg_count >= HEAP_MAX_REGIONS) return false;
+    const size_t ALIGN = 2ULL * 1024 * 1024;
+    size_t min_chunk = need + HEAP_HEADER_SIZE + HEAP_MIN_PAYLOAD;
+    if (min_chunk < need) return false;
+    min_chunk = (min_chunk + ALIGN - 1) & ~(ALIGN - 1);
+    size_t chunk = g_total_cap / 2;
+    if (chunk < 16ULL * 1024 * 1024) chunk = 16ULL * 1024 * 1024;
+    chunk = (chunk + ALIGN - 1) & ~(ALIGN - 1);
+    if (chunk < min_chunk) chunk = min_chunk;
+
+    g_growing = true;
+    void* mem = nullptr;
+    for (;;) {
+        mem = PMM::AllocBytes(chunk);
+        if (mem || chunk == min_chunk) break;
+        chunk /= 2;
+        if (chunk < min_chunk) chunk = min_chunk;
+    }
+    if (mem) {
+        HeapBlock* first = (HeapBlock*)mem;
+        first->size = chunk - HEAP_HEADER_SIZE;
+        mark_free(first);
+        g_reg_base[g_reg_count] = (uint8_t*)mem;
+        g_reg_cap[g_reg_count]  = chunk;
+        g_reg_count++;
+        g_total_cap += chunk;
+        freelist_push(first);
+        SerialLogger::Log("Heap: grew by ");
+        SerialLogger::LogDec((uint32_t)(chunk / (1024 * 1024)));
+        SerialLogger::Log(" MB (total ");
+        SerialLogger::LogDec((uint32_t)(g_total_cap / (1024 * 1024)));
+        SerialLogger::Log(" MB)\r\n");
+    }
+    g_growing = false;
+    return mem != nullptr;
 }
 
 HeapBlock* KernelHeap::FindFree(size_t size) {
@@ -324,6 +386,7 @@ void* KernelHeap::Alloc(size_t size) {
     if (size < HEAP_MIN_PAYLOAD) size = HEAP_MIN_PAYLOAD;
 
     HeapBlock* block = FindFree(size);
+    if (!block && expanded && heap_grow(size)) block = FindFree(size);
     if (!block) {
         heap_warn("Heap: OOM!\r\n");
         return nullptr;
@@ -351,7 +414,8 @@ void KernelHeap::Free(void* ptr) {
 
     uint8_t* data = (uint8_t*)ptr;
 
-    bool in_active = (data >= heap_base && data < heap_base + heap_capacity);
+    int region = region_of(data);
+    bool in_active = region >= 0;
     bool in_boot   = expanded &&
                      (data >= boot_buffer && data < boot_buffer + BOOT_CAPACITY);
     if (!in_active && !in_boot) return;
@@ -378,15 +442,15 @@ void KernelHeap::Free(void* ptr) {
 
     mark_free(block);
 
-    // only coalesce within the active heap region; bootstrap fragments after
+    // only coalesce within the block's own region; bootstrap fragments after
     // expansion stay isolated.
-    uint8_t* p = (uint8_t*)block;
-    if (p < heap_base || p >= heap_base + heap_capacity) {
+    if (!in_active) {
         // no freelist insertion for boot-region frees post-expansion
         return;
     }
 
-    uint8_t* heap_end = heap_base + heap_capacity;
+    uint8_t* region_base = g_reg_base[region];
+    uint8_t* heap_end    = region_base + g_reg_cap[region];
 
     // forward coalesce - O(1) via footer
     while (true) {
@@ -401,7 +465,7 @@ void KernelHeap::Free(void* ptr) {
 
     // backward coalesce - O(1) via previous footer
     while (true) {
-        HeapBlock* p2 = prev_block(heap_base, block);
+        HeapBlock* p2 = prev_block(region_base, block);
         if (!p2 || block_used(p2)) break;
         freelist_remove(p2);
         p2->size += HEAP_HEADER_SIZE + block->size;
@@ -455,27 +519,28 @@ void KernelHeap::Reset() {
 }
 
 size_t KernelHeap::GetTotal() {
-    return heap_capacity;
+    return g_total_cap;
 }
 
 size_t KernelHeap::GetUsed() {
     HeapIrqGuard _g;   // interrupt-safe: walk must not race an IRQ-context alloc (satoru)
     size_t used = 0;
-    uint8_t* ptr = heap_base;
-    uint8_t* end = heap_base + heap_capacity;
-
-    while (ptr + HEAP_HEADER_SIZE <= end) {
-        HeapBlock* block = (HeapBlock*)ptr;
-        if (!valid_magic(block->flags)) break;
-        if (block_used(block)) used += block->size;
-        ptr += HEAP_HEADER_SIZE + block->size;
-        if (block->size == 0) break;
+    for (int r = 0; r < g_reg_count; r++) {
+        uint8_t* ptr = g_reg_base[r];
+        uint8_t* end = g_reg_base[r] + g_reg_cap[r];
+        while (ptr + HEAP_HEADER_SIZE <= end) {
+            HeapBlock* block = (HeapBlock*)ptr;
+            if (!valid_magic(block->flags)) break;
+            if (block_used(block)) used += block->size;
+            ptr += HEAP_HEADER_SIZE + block->size;
+            if (block->size == 0) break;
+        }
     }
     return used;
 }
 
 size_t KernelHeap::GetFree() {
-    size_t total = heap_capacity;
+    size_t total = g_total_cap;
     size_t used  = GetUsed();
     return total > used + HEAP_HEADER_SIZE ? total - used - HEAP_HEADER_SIZE : 0;
 }
@@ -484,7 +549,23 @@ bool KernelHeap::IsValidBlock(void* ptr) {
     if (!ptr) return false;
     HeapIrqGuard _g;
     uint8_t* data = (uint8_t*)ptr;
-    if (data < heap_base + HEAP_HEADER_SIZE || data >= heap_base + heap_capacity) return false;
+    int r = region_of(data);
+    if (r < 0 || data < g_reg_base[r] + HEAP_HEADER_SIZE) return false;
     HeapBlock* block = (HeapBlock*)(data - HEAP_HEADER_SIZE);
     return valid_magic(block->flags) && block_used(block);
+}
+
+void KernelHeap::LogMemReport(const char* tag) {
+    const uint64_t MB = 1024 * 1024;
+    SerialLogger::Log("[memrep] ");
+    SerialLogger::Log(tag);
+    SerialLogger::Log(" ram=");
+    SerialLogger::LogDec((uint32_t)(PMM::GetTotalMemory() / MB));
+    SerialLogger::Log("MB pmm_free=");
+    SerialLogger::LogDec((uint32_t)(PMM::GetFreeMemory() / MB));
+    SerialLogger::Log("MB heap_used=");
+    SerialLogger::LogDec((uint32_t)(GetUsed() / MB));
+    SerialLogger::Log("MB heap_total=");
+    SerialLogger::LogDec((uint32_t)(GetTotal() / MB));
+    SerialLogger::Log("MB\r\n");
 }

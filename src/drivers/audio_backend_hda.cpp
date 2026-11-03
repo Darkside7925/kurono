@@ -45,6 +45,8 @@ public:
     }
     int  GetMasterVolume() const override { return master_vol_; }
 
+    bool Idle(bool first) override { return ready_ && HDAudio::ScrubIdle(first); }
+
     void Tick() override {
         queued_frames_ = HDAudio::RingQueuedBytes() / 4;
     }

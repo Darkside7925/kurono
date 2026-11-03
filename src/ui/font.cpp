@@ -5,11 +5,33 @@
 #include "../drivers/serial.h"
 
 extern "C" int tt_init_from_memory(const unsigned char* data, int size);
-extern "C" unsigned char* tt_raster(unsigned int codepoint, float pixel_height, int* w, int* h, int* xoff, int* yoff, int* xadvance);
 extern "C" void tt_free_bitmap(unsigned char* p);
-extern "C" int tt_get_kern(unsigned int c1, unsigned int c2);
+extern "C" int tt_init_face(int face, const unsigned char* data, int size);
+extern "C" unsigned char* tt_raster_face(int face, unsigned int codepoint, float pixel_height,
+                                         int* w, int* h, int* xoff, int* yoff, int* xadvance_26_6);
+extern "C" int tt_kern_face(int face, unsigned int c1, unsigned int c2, float pixel_height);
+extern "C" int tt_ascent_face(int face, float pixel_height);
+extern "C" int tt_has_glyph(int face, unsigned int codepoint);
+
+static int DrawStringFallback(int x, int y, float pxh, const char* str, uint32_t color);
 
 bool FontTTF::ok = false;
+static bool g_loaded[3] = { false, false, false };
+static bool g_active = true;
+
+// coverage contrast curve: stb rasterizes linear coverage with no hinting, which
+// reads thin and washed out at ui sizes on a dark theme. lift mid-tones
+// (roughly coverage^0.8) so strokes look solid without going pixel-hard.
+// (satoru)
+static unsigned char g_gamma[256];
+static bool g_gamma_ready = false;
+static void build_gamma() {
+    for (int i = 0; i < 256; i++) {
+        int v = i + (i * (255 - i)) / 340;
+        g_gamma[i] = (unsigned char)(v > 255 ? 255 : v);
+    }
+    g_gamma_ready = true;
+}
 FontTTF::CacheSlot FontTTF::caches[FontTTF::MAX_CACHE_SLOTS];
 int FontTTF::current_cache_index = 0;
 
@@ -74,9 +96,41 @@ void FontTTF::EvictSlot(CacheSlot* slot) {
 void FontTTF::Init(const uint8_t* data, int size) {
     SerialLogger::Log("FontTTF: Init called with size "); SerialLogger::LogDec(size); SerialLogger::Log("\r\n");
     FlushCache();
-    ok = tt_init_from_memory(data, size) != 0;
-    if (ok) SerialLogger::Log("FontTTF: Init OK\r\n");
+    g_loaded[0] = tt_init_face(0, data, size) != 0;
+    ok = g_loaded[0] && g_active;
+    if (g_loaded[0]) SerialLogger::Log("FontTTF: Init OK\r\n");
     else SerialLogger::Log("FontTTF: Init FAILED\r\n");
+}
+
+void FontTTF::InitBold(const uint8_t* data, int size) {
+    FlushCache();
+    g_loaded[1] = tt_init_face(1, data, size) != 0;
+    SerialLogger::Log(g_loaded[1] ? "FontTTF: bold face OK\r\n" : "FontTTF: bold face FAILED\r\n");
+}
+
+void FontTTF::InitMono(const uint8_t* data, int size) {
+    FlushCache();
+    g_loaded[2] = tt_init_face(2, data, size) != 0;
+    SerialLogger::Log(g_loaded[2] ? "FontTTF: mono face OK\r\n" : "FontTTF: mono face FAILED\r\n");
+}
+
+bool FontTTF::Loaded() { return g_loaded[0]; }
+bool FontTTF::HasMono() { return g_loaded[2]; }
+
+int FontTTF::DrawMono(int x, int top, float pxh, const char* s, uint32_t color) {
+    if (!ok || !s) return DrawStringFallback(x, top, pxh, s, color);
+    int face = g_loaded[2] ? 2 : 0;
+    return DrawFace(face, x, top + tt_ascent_face(face, pxh), pxh, s, color);
+}
+
+int FontTTF::MeasureMono(float pxh, const char* s) {
+    if (!ok) return Measure(pxh, s);
+    return MeasureFace(g_loaded[2] ? 2 : 0, pxh, s);
+}
+
+void FontTTF::SetActive(bool active) {
+    g_active = active;
+    ok = g_loaded[0] && g_active;
 }
 
 void FontTTF::FlushCache() {
@@ -87,15 +141,17 @@ void FontTTF::FlushCache() {
     }
 }
 
-FontTTF::CacheSlot* FontTTF::GetCache(float size) {
+FontTTF::CacheSlot* FontTTF::GetCache(float size, int face) {
+    if (face > 0 && !g_loaded[face]) face = 0;
     for (int i = 0; i < MAX_CACHE_SLOTS; i++) {
-        if (caches[i].active && size_eq(caches[i].size, size)) return &caches[i];
+        if (caches[i].active && caches[i].face == face && size_eq(caches[i].size, size)) return &caches[i];
     }
     for (int i = 0; i < MAX_CACHE_SLOTS; i++) {
         if (!caches[i].active) {
             EvictSlot(&caches[i]);
             caches[i].active = true;
             caches[i].size = size;
+            caches[i].face = face;
             return &caches[i];
         }
     }
@@ -106,6 +162,7 @@ FontTTF::CacheSlot* FontTTF::GetCache(float size) {
     EvictSlot(slot);
     slot->active = true;
     slot->size = size;
+    slot->face = face;
     return slot;
 }
 
@@ -136,15 +193,20 @@ FontTTF::Glyph* FontTTF::LookupOrLoad(CacheSlot* cache, unsigned int cp, float p
     }
 
     if (!g->valid) {
+        // advances are 26.6 fixed point so layout keeps sub-pixel precision.
         int gw = 0, gh = 0, xo = 0, yo = 0, ad = 0;
-        unsigned char* bmp = tt_raster(cp, pxh, &gw, &gh, &xo, &yo, &ad);
-        if (!bmp && cp != REPLACEMENT_CP && cp != '?') {
+        unsigned char* bmp = tt_raster_face(cache->face, cp, pxh, &gw, &gh, &xo, &yo, &ad);
+        if (!bmp && cp != REPLACEMENT_CP && cp != '?' && !tt_has_glyph(cache->face, cp)) {
             // missing-glyph fallback: rasterize '?' and use its advance
-            bmp = tt_raster('?', pxh, &gw, &gh, &xo, &yo, &ad);
+            bmp = tt_raster_face(cache->face, '?', pxh, &gw, &gh, &xo, &yo, &ad);
         }
         if (ad <= 0) {
             // last-resort advance so the pen still moves
-            ad = (int)(pxh * 0.5f + 0.5f);
+            ad = (int)(pxh * 0.5f * 64.0f + 0.5f);
+        }
+        if (bmp) {
+            if (!g_gamma_ready) build_gamma();
+            for (int k = 0; k < gw * gh; k++) bmp[k] = g_gamma[bmp[k]];
         }
         g->codepoint = cp;
         g->bitmap = bmp;
@@ -157,6 +219,7 @@ FontTTF::Glyph* FontTTF::LookupOrLoad(CacheSlot* cache, unsigned int cp, float p
 }
 
 static int DrawStringFallback(int x, int y, float pxh, const char* str, uint32_t color) {
+    if (!str) return 0;
     int scale = (int)(pxh / 16.0f + 0.5f);
     if (scale < 1) scale = 1;
     int char_w = 8 * scale;
@@ -227,13 +290,35 @@ int FontTTF::DrawString(int x, int y, float pxh, const char* s, uint32_t color) 
     if (!ok || !s) {
         return DrawStringFallback(x, y, pxh, s ? s : "", color);
     }
+    return DrawFace(0, x, y, pxh, s, color);
+}
 
-    CacheSlot* cache = GetCache(pxh);
+int FontTTF::DrawPixel(int x, int y, float pxh, const char* s, uint32_t color) {
+    return DrawStringFallback(x, y, pxh, s, color);
+}
+
+int FontTTF::Ascent(float pxh, bool bold) {
+    return tt_ascent_face(bold && g_loaded[1] ? 1 : 0, pxh);
+}
+
+int FontTTF::DrawText(int x, int top, float pxh, const char* s, uint32_t color, bool bold) {
+    if (!ok || !s) return DrawStringFallback(x, top, pxh, s, color);
+    int face = bold && g_loaded[1] ? 1 : 0;
+    return DrawFace(face, x, top + tt_ascent_face(face, pxh), pxh, s, color);
+}
+
+int FontTTF::MeasureText(float pxh, const char* s, bool bold) {
+    if (!ok) return Measure(pxh, s);
+    return MeasureFace(bold && g_loaded[1] ? 1 : 0, pxh, s);
+}
+
+int FontTTF::DrawFace(int face, int x, int y, float pxh, const char* s, uint32_t color) {
+    CacheSlot* cache = GetCache(pxh, face);
     const uint8_t r = (color >> 16) & 0xFF;
     const uint8_t g = (color >> 8) & 0xFF;
     const uint8_t b = color & 0xFF;
     const int startx = x;
-    int penx = x;
+    int pen26 = x * 64;
     const int peny = y;
 
     unsigned int prev_cp = 0;
@@ -249,16 +334,10 @@ int FontTTF::DrawString(int x, int y, float pxh, const char* s, uint32_t color) 
 
         Glyph* gl = LookupOrLoad(cache, cp, pxh);
 
-        if (prev_cp) {
-            int kern = tt_get_kern(prev_cp, cp);
-            if (kern) {
-                float scale_kern = pxh / 1000.0f; // small empirical scale; harmless when table absent
-                penx += (int)(kern * scale_kern);
-            }
-        }
+        if (prev_cp) pen26 += tt_kern_face(cache->face, prev_cp, cp, pxh);
 
         if (gl->bitmap && gl->w > 0 && gl->h > 0) {
-            const int ox = penx + gl->xoff;
+            const int ox = ((pen26 + 32) >> 6) + gl->xoff;
             const int oy = peny + gl->yoff;
             const int gw = gl->w;
             const int gh = gl->h;
@@ -268,10 +347,10 @@ int FontTTF::DrawString(int x, int y, float pxh, const char* s, uint32_t color) 
             }
         }
 
-        penx += gl->advance;
+        pen26 += gl->advance;
         prev_cp = cp;
     }
-    return penx - startx;
+    return ((pen26 + 32) >> 6) - startx;
 }
 
 void FontTTF::DrawStringCenter(int cx, int y, float pxh, const char* s, uint32_t color) {
@@ -289,8 +368,13 @@ int FontTTF::Measure(float pxh, const char* s) {
         return w;
     }
 
-    CacheSlot* cache = GetCache(pxh);
-    int penx = 0;
+    return MeasureFace(0, pxh, s);
+}
+
+int FontTTF::MeasureFace(int face, float pxh, const char* s) {
+    if (!s) return 0;
+    CacheSlot* cache = GetCache(pxh, face);
+    int pen26 = 0;
     unsigned int prev_cp = 0;
     const char* p = s;
     while (*p) {
@@ -301,15 +385,9 @@ int FontTTF::Measure(float pxh, const char* s) {
         if (cp == 0) break;
 
         Glyph* gl = LookupOrLoad(cache, cp, pxh);
-        if (prev_cp) {
-            int kern = tt_get_kern(prev_cp, cp);
-            if (kern) {
-                float scale_kern = pxh / 1000.0f;
-                penx += (int)(kern * scale_kern);
-            }
-        }
-        penx += gl->advance;
+        if (prev_cp) pen26 += tt_kern_face(cache->face, prev_cp, cp, pxh);
+        pen26 += gl->advance;
         prev_cp = cp;
     }
-    return penx;
+    return (pen26 + 32) >> 6;
 }

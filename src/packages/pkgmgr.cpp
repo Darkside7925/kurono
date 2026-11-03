@@ -12,6 +12,8 @@
 #include "../system/kpkg_daemon.h"   // background (non-blocking) install routing (satoru)
 #include "../virt/debian_data.h"
 #include "../ui/notification.h"
+#include "../drivers/disklog.h"   // FIREFOX.TAR root file install source (satoru)
+#include "../kernel/pmm.h"
 
 Package PackageManager::packages[PKG_MAX_PACKAGES];
 int PackageManager::package_count = 0;
@@ -1286,13 +1288,13 @@ static bool ff_map_entry(const char* name, char* out, int out_max) {
     return p > 0;
 }
 
-static void ff_progress(int bytes_done, int total) {
+// running count only: the package size changes between firefox builds and the
+// stream does not carry a total, so a fixed "of N MB" went past 100%. (satoru)
+static void ff_progress(int bytes_done) {
     char line[96];
     int lp = 0;
     lp = pa(line, lp, sizeof(line), "[kpkg] firefox: ");
     lp = pai(line, lp, sizeof(line), (unsigned int)(bytes_done / (1024 * 1024)));
-    lp = pa(line, lp, sizeof(line), " / ");
-    lp = pai(line, lp, sizeof(line), (unsigned int)(total / (1024 * 1024)));
     lp = pa(line, lp, sizeof(line), " MB extracted...\n");
     KuronoShell::EmitIncrementalRange(line, 0, lp);
 }
@@ -1393,7 +1395,7 @@ static void ff_tar_feed(FfTarState* st, const uint8_t* data, int len) {
                         st->error = true;
                     } else {
                         st->files++;
-                        ff_progress(st->bytes_extracted, 235 * 1024 * 1024);
+                        ff_progress(st->bytes_extracted);
                     }
                     KernelHeap::Free(st->body);
                     st->body = nullptr;
@@ -1412,9 +1414,75 @@ static void ff_tar_feed(FfTarState* st, const uint8_t* data, int len) {
     }
 }
 
+// kurono.ffmirror=a.b.c.d on the cmdline swaps the download origin ip (test
+// mirrors); 0 keeps the real origin. kurono.ffnolocal=1 skips the partition
+// file below. (satoru)
+uint32_t g_ff_origin_override = 0;
+bool g_ff_nolocal = false;
+
+// install from the root file FIREFOX.TAR on the KURONO fat32 partition (no
+// network needed, the laptop's ethernet is unproven). read only; the whole tar
+// is read into one pmm block then fed through the same ustar state machine as
+// the download. returns 1 installed, 0 file absent (fall back to the network),
+// -1 file present but the install failed (do NOT silently re-download). (satoru)
+static int ff_local_install() {
+    static const char F83[11] = { 'F','I','R','E','F','O','X',' ','T','A','R' };
+    uint64_t sz = 0;
+    int rc = DiskLog::StatRootFile(F83, &sz);
+    if (rc != 0) {
+        phttp_log_num("firefox: no FIREFOX.TAR on KURONO partition, rc ", rc);
+        return 0;
+    }
+    if (sz < (1ull << 20) || sz > 0xF0000000ull) {
+        pset_sync_message("FIREFOX.TAR on the KURONO partition has an implausible size.");
+        return -1;
+    }
+    phttp_log_num("firefox: FIREFOX.TAR found, MB ", (int)(sz >> 20));
+    uint64_t alloc = (sz + 4095) & ~4095ull;
+    uint8_t* buf = (uint8_t*)PMM::AllocBytes((size_t)alloc);
+    if (!buf) { pset_sync_message("Not enough free memory to load FIREFOX.TAR."); return -1; }
+    uint32_t t0 = Timer::GetTicks();
+    phttp_log("firefox: [fftl] FIREFOX.TAR read start");
+    rc = DiskLog::ReadRootFile(F83, buf, alloc, nullptr);
+    if (rc != 0) {
+        PMM::FreeBytes(buf, (size_t)alloc);
+        pset_sync_message(DiskLog::RootFileMsg(rc));
+        return -1;
+    }
+    phttp_log_num("firefox: [fftl] FIREFOX.TAR read end, ms ", (int)(Timer::GetTicks() - t0));
+    phttp_log("firefox: [fftl] extract start");
+    if (KVFS::Exists("/apps/firefox")) KVFS::RmTree("/apps/firefox");
+    KVFS::Mkdirs("/apps/firefox");
+    FfTarState st;
+    memset(&st, 0, sizeof(st));
+    uint64_t off = 0;
+    while (off < sz && !st.error) {
+        uint64_t n = sz - off;
+        if (n > (1u << 20)) n = (1u << 20);
+        ff_tar_feed(&st, buf + off, (int)n);
+        off += n;
+        if (KuronoShell::IsCommandCancelRequested()) { st.error = true; break; }
+    }
+    if (st.body) KernelHeap::Free(st.body);
+    PMM::FreeBytes(buf, (size_t)alloc);
+    if (st.error || !KVFS::Exists("/apps/firefox/firefox")) {
+        pset_sync_message("FIREFOX.TAR did not contain a usable firefox/firefox.");
+        return -1;
+    }
+    phttp_log("firefox: [fftl] extract end");
+    phttp_log_num("firefox: FIREFOX.TAR entries extracted ", st.files);
+    phttp_log_num("firefox: FIREFOX.TAR install ms ", (int)(Timer::GetTicks() - t0));
+    return 1;
+}
+
 static bool ff_stream_install() {
+    if (!g_ff_nolocal) {
+        int lr = ff_local_install();
+        if (lr == 1) return true;
+        if (lr < 0) return false;
+    }
     if (!TCPStack::IsUp()) {
-        pset_sync_message("TCP/IP stack unavailable for firefox download.");
+        pset_sync_message("No FIREFOX.TAR on the KURONO partition and no network: copy FIREFOX.TAR to the KURONO partition root.");
         return false;
     }
 
@@ -1422,9 +1490,9 @@ static bool ff_stream_install() {
     if (sock < 0) { pset_sync_message("No free TCP socket for firefox download."); return false; }
 
     phttp_log("firefox: connecting to origin");
-    if (!TCPStack::Connect(sock, FF_ORIGIN_IP, 80)) {
+    if (!TCPStack::Connect(sock, g_ff_origin_override ? g_ff_origin_override : FF_ORIGIN_IP, 80)) {
         TCPStack::Close(sock);
-        pset_sync_message("TCP connect to the firefox origin failed.");
+        pset_sync_message("No FIREFOX.TAR on the KURONO partition and the download failed: copy FIREFOX.TAR to the KURONO partition root.");
         return false;
     }
 
@@ -2356,7 +2424,7 @@ int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out
         int p = 0;
         p = pa(out, p, mx, "Installing Firefox 140.11.0esr from ");
         p = pa(out, p, mx, FF_ORIGIN_HOST);
-        p = pa(out, p, mx, "\n(~84 MB download, ~235 MB extracted - this takes a while)...\n");
+        p = pa(out, p, mx, "\n(~275 MB download - this takes a while)...\n");
         // stream to terminal now so the user sees we started before the long
         // blocking download. (satoru)
         KuronoShell::EmitIncrementalRange(out, 0, p);

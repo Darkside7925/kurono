@@ -8,6 +8,7 @@
 enum InstallerDiskType : uint8_t {
     INST_DISK_NONE = 0,
     INST_DISK_NVME = 1,
+    INST_DISK_SATA = 2,   // ahci-attached; enumerated via BlockDev (satoru)
 };
 
 enum InstallerPartScheme : uint8_t {

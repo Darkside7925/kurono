@@ -56,6 +56,13 @@ public:
     // The mixer calls Tick() before deciding to Submit().
     virtual void Tick() {}
 
+    // Called by the server on ticks where no stream is active, after the last
+    // stream ended. `first` is true on the first call of an idle spell. A
+    // cyclic-DMA backend uses it to blank the ring as the engine passes over it,
+    // so stale audio is not replayed forever. Return true while more calls are
+    // needed; once it returns false the server stops touching the hardware. (satoru)
+    virtual bool Idle(bool first) { (void)first; return false; }
+
     // Optional: write a one-line diagnostic string into `out` (caller
     // owns the buffer).  Default impl writes the name.
     virtual void Describe(char* out, int max_len) const;

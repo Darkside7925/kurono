@@ -48,12 +48,17 @@ namespace LinuxCmds {
     int cmd_date(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_free(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_mount(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
+    // live fat32 volume access (mount fat32 [usb|nvme] / umount / fls / fcat) (satoru)
+    int cmd_umount(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
+    int cmd_fls(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
+    int cmd_fcat(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_dmesg(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_journal(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_lspci(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_lsmod(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_drivers(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_lsblk(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
+    int cmd_blkid(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_lsusb(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_lscpu(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
     int cmd_modprobe(KuronoShell* sh, int argc, const char** argv, char* out, int mx);

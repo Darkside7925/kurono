@@ -13,6 +13,8 @@ static uint32_t e4_now_secs() {
 }
 
 bool           Ext4::mounted = false;
+bool           Ext4::read_only_forced = false;
+bool Ext4::IsReadOnlyForced() { return read_only_forced; }
 Ext4Superblock Ext4::sb;
 Ext4BlockRead  Ext4::blk_read = nullptr;
 Ext4BlockWrite Ext4::blk_write = nullptr;
@@ -100,6 +102,38 @@ int Ext4::Mount(Ext4BlockRead read_fn, Ext4BlockWrite write_fn,
         SerialLogger::LogHex(sb.s_magic);
         SerialLogger::Log("\r\n");
         return -2;
+    }
+
+    // ── dirty-journal guard: REFUSE a writable mount on an unclean fs ───────
+    // this driver has no journal replay (no jbd2, no recovery pass). that is
+    // survivable read-only, but writing to a filesystem with pending journal
+    // transactions is actively destructive: linux replays that journal on its
+    // next boot ON TOP of whatever we wrote, interleaving stale metadata with
+    // ours and producing cross-linked files and orphaned inodes. a machine that
+    // just kernel-panicked - the exact machine a rescue tool is pointed at -
+    // has a dirty journal on essentially every filesystem, so this is the
+    // common case, not the edge case.
+    //
+    // s_state bit 0 (EXT4_VALID_FS) clear means "not cleanly unmounted";
+    // s_feature_incompat bit 2 (NEEDS_RECOVERY) means the journal has entries
+    // to replay. either one makes writes unsafe, so drop to read-only by
+    // dropping the write callback rather than failing the mount - a rescue user
+    // still wants to READ a broken disk. (satoru)
+    constexpr uint16_t EXT4_VALID_FS          = 0x0001;
+    constexpr uint32_t EXT4_FEATURE_INCOMPAT_RECOVER = 0x0004;
+    bool unclean = !(sb.s_state & EXT4_VALID_FS) ||
+                   (sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER);
+    if (unclean && blk_write) {
+        SerialLogger::Log("[ext4] UNCLEAN filesystem (s_state=");
+        SerialLogger::LogHex(sb.s_state);
+        SerialLogger::Log(" incompat=");
+        SerialLogger::LogHex(sb.s_feature_incompat);
+        SerialLogger::Log(") - mounting READ-ONLY; no journal replay, writing "
+                          "would corrupt it\r\n");
+        blk_write = nullptr;
+        read_only_forced = true;
+    } else {
+        read_only_forced = false;
     }
 
     // s_log_block_size is attacker-controlled; a large value overflows the

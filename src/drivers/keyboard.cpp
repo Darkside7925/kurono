@@ -1,7 +1,9 @@
 #include "keyboard.h"
+#include "hwinfo.h"   // input event counters for the boot log (satoru)
 #include "serial.h"
 #include "audio.h"
 #include "timer.h"
+#include "../hal/hal.h"
 #include "../system/input_manager.h" // include inputmanager for layouts
 #include "../system/vconsole.h"
 
@@ -13,8 +15,15 @@ char Keyboard::buf[256];
 Keyboard::KeyCallback Keyboard::callback = nullptr;
 bool Keyboard::keys[256] = {0};
 bool Keyboard::prev_keys[256] = {0};
-static uint8_t usb_prev_reports[16][8] = {{0}};
+static uint8_t usb_prev_reports[64][8] = {{0}};
 static bool set2_break_prefix = false;
+
+// input-path loss counters, printed by the [hb] heartbeat (satoru)
+//  0 enqueue drops  1 max ms between polls  2 max bytes drained in one poll
+//  3 chars enqueued 4 callback key-downs    5 irq1 drains (satoru)
+volatile uint32_t g_kbdbg[8] = {0};
+// >0 while a command/ack exchange reads port 0x60 itself: the irq1 handler must not steal the ack (satoru)
+static volatile int g_kb_irq_hold = 0;
 
 // Single-byte controller responses that arrive after init commands and must
 // not be re-interpreted as scancodes.
@@ -141,6 +150,10 @@ static Key usb_hid_usage_to_key(uint8_t usage) {
     }
 }
 
+// boot-time 8042 facts for the one-shot [kbdiag] log: [0] command byte readable,
+// [1] the byte, [2] keyboard answered the enable command, [3] its reply (0xFA = ack) (satoru)
+volatile uint32_t g_kbdiag_init[4] = {0, 0, 0, 0};
+
 void Keyboard::Init() {
     for(int i=0; i<256; i++) { keys[i] = false; prev_keys[i] = false; }
     state = {false, false, false, false, false, false, false, {0}};
@@ -201,8 +214,10 @@ void Keyboard::Init() {
     // keyboard clock entirely. that was the dead-keyboard bug on
     // qemu/whpx. (satoru)
     if (kb_wait_output_full()) {
-        (void)kb_in(0x60);
+        uint8_t ack = kb_in(0x60);
+        g_kbdiag_init[2] = 1; g_kbdiag_init[3] = ack;   // [kbdiag]: did the ps/2 keyboard answer 0xF4 (satoru)
     }
+    g_kbdiag_init[0] = have_ccb ? 1 : 0; g_kbdiag_init[1] = ccb;
 
     // skip typematic/led programming during early init.
     // some laptop ec / i8042 implementations misbehave when we send extra
@@ -220,6 +235,7 @@ void Keyboard::SetLEDs(bool num_lock, bool caps_lock, bool scroll_lock) {
 }
 
 void Keyboard::UpdateLEDs() {
+    __atomic_add_fetch(&g_kb_irq_hold, 1, __ATOMIC_ACQUIRE);
     uint8_t led_byte = 0;
     if (state.scroll_lock) led_byte |= 0x01;
     if (state.num_lock) led_byte |= 0x02;
@@ -263,10 +279,12 @@ void Keyboard::UpdateLEDs() {
     } else {
         SerialLogger::Log("Keyboard: LED update failed\r\n");
     }
+    __atomic_sub_fetch(&g_kb_irq_hold, 1, __ATOMIC_RELEASE);
 }
 
 void Keyboard::SetRepeatRate(uint8_t rate, uint8_t delay) {
     // rate: 0-31 (30 cps to 2 cps), delay: 0-3 (250ms to 1000ms)
+    __atomic_add_fetch(&g_kb_irq_hold, 1, __ATOMIC_ACQUIRE);
     uint8_t data = (delay & 0x03) << 5;
     data |= rate & 0x1F;
     
@@ -304,6 +322,7 @@ void Keyboard::SetRepeatRate(uint8_t rate, uint8_t delay) {
         SerialLogger::LogHex(data);
         SerialLogger::Log(")\r\n");
     }
+    __atomic_sub_fetch(&g_kb_irq_hold, 1, __ATOMIC_RELEASE);
 }
 
 void Keyboard::EnableTypematic(bool enable) {
@@ -375,14 +394,14 @@ void Keyboard::FlushBuffers() {
 
 // usb hid support stubs
 void Keyboard::InitUSB() {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 64; i++) {
         for (int j = 0; j < 8; j++) usb_prev_reports[i][j] = 0;
     }
     SerialLogger::Log("Keyboard: USB HID support initialized\r\n");
 }
 
 bool Keyboard::AddUSBDevice(uint8_t device_id) {
-    if (device_id < 16) {
+    if (device_id < 64) {
         for (int i = 0; i < 8; i++) usb_prev_reports[device_id][i] = 0;
     }
     SerialLogger::Log("Keyboard: USB device ");
@@ -392,7 +411,7 @@ bool Keyboard::AddUSBDevice(uint8_t device_id) {
 }
 
 void Keyboard::RemoveUSBDevice(uint8_t device_id) {
-    if (device_id < 16) {
+    if (device_id < 64) {
         for (int i = 0; i < 8; i++) usb_prev_reports[device_id][i] = 0;
     }
     SerialLogger::Log("Keyboard: USB device ");
@@ -401,7 +420,8 @@ void Keyboard::RemoveUSBDevice(uint8_t device_id) {
 }
 
 void Keyboard::ProcessUSBReport(uint8_t device_id, const uint8_t* report, size_t length) {
-    if (!report || length < 8 || device_id >= 16) return;
+    HwInfo::NoteUsbKeyboard();   // bare-metal input diagnostics (satoru)
+    if (!report || length < 8 || device_id >= 64) return;
 
     uint8_t* prev = usb_prev_reports[device_id];
 
@@ -458,17 +478,78 @@ void Keyboard::ProcessUSBReport(uint8_t device_id, const uint8_t* report, size_t
     for (int i = 0; i < 8; i++) prev[i] = report[i];
 }
 
+// raw scancode ring between the 8042 and Poll(). the irq1 handler fills it the moment a key
+// arrives, so a stalled cooperative poll loop (measured: up to ~1s gaps) no longer lets the
+// controller's tiny queue overflow and drop keys; Poll() drains it in order. producers (the
+// irq and Poll's own hardware read) are serialised by g_sc_prod_lock; the lone consumer is
+// Poll() under g_input_lock. (satoru)
+static constexpr uint32_t KB_SC_RING = 512;
+static volatile uint8_t  g_sc_ring[KB_SC_RING];
+static volatile uint32_t g_sc_head = 0, g_sc_tail = 0;
+static volatile bool     g_sc_prod_lock = false;
+
+static inline uint8_t kb_inb(uint16_t p) { uint8_t r; __asm__ __volatile__("inb %1, %0" : "=a"(r) : "Nd"(p)); return r; }
+
+// move keyboard bytes (not mouse bytes) from the 8042 into the ring; caller holds the
+// producer lock. returns how many bytes it moved. (satoru)
+static uint32_t kb_hw_to_ring() {
+    uint32_t n = 0;
+    for (int i = 0; i < 64; i++) {
+        uint8_t st = kb_inb(0x64);
+        if (!(st & 0x01)) break;
+        if (st & 0x20) break;   // mouse byte: Mouse::Poll owns it
+        uint8_t sc = kb_inb(0x60);
+        uint32_t h = __atomic_load_n(&g_sc_head, __ATOMIC_RELAXED);
+        uint32_t t = __atomic_load_n(&g_sc_tail, __ATOMIC_ACQUIRE);
+        if (h - t >= KB_SC_RING) { __atomic_add_fetch(&g_kbdbg[0], 1, __ATOMIC_RELAXED); continue; }
+        g_sc_ring[h % KB_SC_RING] = sc;
+        __atomic_store_n(&g_sc_head, h + 1, __ATOMIC_RELEASE);
+        n++;
+    }
+    return n;
+}
+
+static void kb_irq1(InterruptFrame*) {
+    if (__atomic_load_n(&g_kb_irq_hold, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_test_and_set(&g_sc_prod_lock, __ATOMIC_ACQUIRE)) return;   // Poll is mid-read and will finish the drain
+    if (kb_hw_to_ring()) __atomic_add_fetch(&g_kbdbg[5], 1, __ATOMIC_RELAXED);
+    __atomic_clear(&g_sc_prod_lock, __ATOMIC_RELEASE);
+}
+
 void Keyboard::Poll() {
+    // arm irq-time capture only now: init-time code (mouse init reads the 8042 config byte)
+    // must keep sole use of port 0x60 until the input loop is running. (satoru)
+    static bool s_irq_armed = false;
+    if (!s_irq_armed) { s_irq_armed = true; HAL::RegisterIRQHandler(1, kb_irq1); }
+    HwInfo::NotePoll();   // proves the input loop is still running (satoru)
     // copy current to prev BEFORE we mutate keys[] from this drain - that way
     // IsKeyPressed() reflects the edges that landed during this exact tick.
     for(int i=0; i<256; i++) prev_keys[i] = keys[i];
 
-    int loop_limit = 128;
+    {   // gap between polls: a long gap lets the 8042/qemu queue (16 bytes) overflow (satoru)
+        static uint32_t s_last_poll_ms = 0;
+        uint32_t nowp = (uint32_t)Timer::GetRealMs();
+        uint32_t gap = nowp - s_last_poll_ms;
+        s_last_poll_ms = nowp;
+        if (gap < 100000 && gap > g_kbdbg[1]) g_kbdbg[1] = gap;
+    }
+    // pull whatever the 8042 holds into the scancode ring (irqs off so the irq1 handler on
+    // this cpu cannot interleave), then run the ring - which also holds every byte the irq1
+    // handler captured while nothing was polling. (satoru)
+    {
+        uint64_t fl; __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(fl) : : "memory");
+        while (__atomic_test_and_set(&g_sc_prod_lock, __ATOMIC_ACQUIRE)) __asm__ __volatile__("pause");
+        uint32_t n = kb_hw_to_ring();
+        __atomic_clear(&g_sc_prod_lock, __ATOMIC_RELEASE);
+        if (fl & 0x200) __asm__ __volatile__("sti" : : : "memory");
+        if (n > g_kbdbg[2]) g_kbdbg[2] = n;
+    }
+    int loop_limit = 512;
     while (loop_limit-- > 0) {
-        uint8_t st = Status();
-        if (!(st & 0x01)) break;
-        if (st & 0x20) break; // mouse data
-        uint8_t sc = In(0x60);
+        uint32_t t = __atomic_load_n(&g_sc_tail, __ATOMIC_RELAXED);
+        if (t == __atomic_load_n(&g_sc_head, __ATOMIC_ACQUIRE)) break;
+        uint8_t sc = g_sc_ring[t % KB_SC_RING];
+        __atomic_store_n(&g_sc_tail, t + 1, __ATOMIC_RELEASE);
         HandleScancode(sc);
     }
 
@@ -525,7 +606,8 @@ void Keyboard::Enqueue(char c) {
     uint8_t t = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
     uint8_t next = (uint8_t)(h + 1);
     // Drop on overflow rather than overwriting unread data.
-    if (next == t) return;
+    if (next == t) { __atomic_add_fetch(&g_kbdbg[0], 1, __ATOMIC_RELAXED); return; }
+    __atomic_add_fetch(&g_kbdbg[3], 1, __ATOMIC_RELAXED);
     buf[h] = c;
     __atomic_store_n(&head, next, __ATOMIC_RELEASE);
 }
@@ -592,6 +674,7 @@ static Key ScancodeSet2ToKey(uint8_t sc, bool e0) {
 }
 
 void Keyboard::HandleScancode(uint8_t sc) {
+    HwInfo::NoteScancode(sc);   // bare-metal input diagnostics (satoru)
     // Drain the Pause/Break multi-byte sequence (E1 1D 45 E1 9D C5). We
     // already counted the E1 below; just swallow the remainder.
     if (g_pause_seq_remaining > 0) {
@@ -609,9 +692,13 @@ void Keyboard::HandleScancode(uint8_t sc) {
     }
 
     // Single-byte controller responses - swallow without touching state.
-    if (sc == KB_RESP_ACK || sc == KB_RESP_NAK ||
-        sc == KB_RESP_BAT_OK || sc == KB_RESP_BAT_FAIL ||
-        sc == KB_RESP_ECHO) {
+    // in set 1, 0xaa is also the left-shift release: only treat it as bat-ok
+    // when shift isn't held (and not after e0), else shift sticks. (satoru)
+    bool bat_ok = sc == KB_RESP_BAT_OK &&
+                  (g_active_set == ScancodeSet::SET2 ||
+                   (!keys[(int)KEY_LSHIFT] && !e0_prefix));
+    if (sc == KB_RESP_ACK || sc == KB_RESP_NAK || bat_ok ||
+        sc == KB_RESP_BAT_FAIL || sc == KB_RESP_ECHO) {
         return;
     }
 

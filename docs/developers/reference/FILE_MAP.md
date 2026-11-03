@@ -15,7 +15,6 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 | `create_working_boot.ps1` | boot media helper |
 | `build_iso.ps1` | ISO helper script |
 | `build_debian_rootfs.ps1` | Debian guest rootfs build helper |
-| `fix_conflicts.py` | maintenance utility |
 | `logo.h` | embedded logo pixels |
 | `docs/` | project documentation |
 | `src/` | live source tree |

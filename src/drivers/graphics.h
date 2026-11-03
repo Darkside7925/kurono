@@ -32,6 +32,9 @@ public:
 
     static void Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp);
     static void ReinitForResolution(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp);
+    // resync the compositor to the live bga hardware geometry after a host
+    // window resize; true if a resync happened (caller relayouts). (satoru)
+    static bool SyncToHardwareGeometry();
     static void InitAdvanced(); // initialize with display controller
     static void SetRenderMode(RenderMode mode);
     static RenderMode GetRenderMode();
@@ -44,6 +47,16 @@ public:
     static uint32_t GetTargetFrameTimeMs();  // frame budget in ms (1000/hz) for adaptive gui pacing (satoru)
     static void SetVirtioPresent(bool on);   // DisplayManager enables this for the accelerated backend (satoru)
     static void PresentVirtioIfActive();     // gui loop calls after SwapBuffers; pushes the frame to the host gpu (satoru)
+    // record the damage box of the frame just swapped so the virtio transfer can
+    // upload only that region instead of the whole screen. set by SwapBuffers
+    // before it clears the dirty list. (satoru)
+    static void SetPresentDamage(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
+    // force every present to transfer the WHOLE screen, as full-screen content
+    // (video, games, animation) naturally does. the damage-aware path makes an
+    // idle desktop's transfer tiny, which hides how expensive a real present
+    // is - this reproduces the heavy case. (satoru)
+    static void SetForceFullPresent(bool on);
     static uint32_t DetectRefreshRate();  // measure via vsync timing, fallback 60 hz
     static uint32_t GetMonitorHz();       // last detected monitor refresh rate
     static bool IsFramebufferWC();        // true if fb is write-combining (bare-metal safe)
@@ -117,6 +130,11 @@ public:
     static void     MarkUIDirty();
     static uint32_t UIDirtyCount();        // current value (no clear)
     static bool     ConsumeUIDirty();      // true if dirty since last call; clears
+    static void*    LastUIDirtyCaller();   // return address of the latest MarkUIDirty
+    // ask for one frame at real time `ms` (e.g. a cursor blink edge) without
+    // marking the ui dirty every frame until then. the gui loop polls it.
+    static void     RequestFrameAt(uint32_t ms);
+    static bool     ConsumeFrameDue(uint32_t now_ms);
 
     // information
     static int GetWidth();

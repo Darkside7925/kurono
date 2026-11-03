@@ -40,6 +40,10 @@ public:
     static size_t GetFree();
     static size_t GetTotal();
 
+    // one-line "[memrep] <tag> ..." serial summary of pmm + heap use, for
+    // tracking boot-time memory cost at fixed milestones. (satoru)
+    static void LogMemReport(const char* tag);
+
 private:
     static void Coalesce(HeapBlock* block);
     static HeapBlock* FindFree(size_t size);

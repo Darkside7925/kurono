@@ -10,6 +10,7 @@
 #include "../drivers/serial.h"
 #include "../proc/smp.h"     // one i/o queue per cpu core; route by calling cpu (satoru)
 #include "../proc/spinlock.h"  // serialize cores that share an sq when cpus > queues (satoru)
+#include "../proc/scheduler.h" // wall-clock NowMs for the controller ready wait (satoru)
 #include <string.h>
 
 //  ── kdf migration (satoru) ──────────────────────────────────────────────────
@@ -121,10 +122,19 @@ bool NVMe::KdfInit() {
     SerialLogger::Log("[NVMe] Scanning PCI for NVMe controllers...\r\n");
 
     // pci scan: class 01h (mass storage), subclass 08h (nvme), progif 02h
-    // walk bus 0 looking for nvme device
+    // walk EVERY bus. this used to scan bus 0 only, which is where qemu puts
+    // its nvme - but on real hardware the ssd sits behind a pcie root port on
+    // a secondary bus (the owner's laptop: 00:01.0 -> nvme at bus N), so
+    // bare metal never found the disk and every boot said "nvme init failed".
+    // (satoru)
+    for (int bus = 0; bus < 256; bus++)
     for (int dev = 0; dev < 32; dev++) {
         for (int func = 0; func < 8; func++) {
-            uint32_t addr = (1u << 31) | (0 << 16) | (dev << 11) | (func << 8);
+            uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) | (dev << 11) | (func << 8);
+            if (func == 0) {   // empty slot: skip the other 7 functions (satoru)
+                HAL::OutLong(0xCF8, addr);
+                if ((HAL::InLong(0xCFC) & 0xFFFF) == 0xFFFF) break;
+            }
             HAL::OutLong(0xCF8, addr | 0x08); // class/subclass register
             uint32_t class_reg = HAL::InLong(0xCFC);
             uint8_t base_class = (class_reg >> 24) & 0xFF;
@@ -159,7 +169,7 @@ bool NVMe::KdfInit() {
                 bar0 = (volatile uint8_t*)bar_win;
 
                 SerialLogger::Log("[NVMe] Controller found at PCI ");
-                SerialLogger::LogDec(0); SerialLogger::Log(":");
+                SerialLogger::LogDec(bus); SerialLogger::Log(":");
                 SerialLogger::LogDec(dev); SerialLogger::Log(".");
                 SerialLogger::LogDec(func);
                 SerialLogger::Log(" BAR0=");
@@ -283,12 +293,24 @@ bool NVMe::Init() {
 }
 
 bool NVMe::WaitReady(bool expected, int timeout_ms) {
-    for (int i = 0; i < timeout_ms * 10; i++) {
+    // wall-clock wait, not an iteration count: the old loop was ~100 ms on a
+    // fast cpu, fine for qemu but far short of a real ssd, which may take up
+    // to CAP.TO x 500 ms to (re)enable. honour whichever is longer. the
+    // iteration cap only matters if the clock is not ticking yet. (satoru)
+    uint64_t to = (ReadReg64(NVME_REG_CAP) >> 24) & 0xFF;
+    uint64_t limit = (uint64_t)timeout_ms;
+    if (to * 500 > limit) limit = to * 500;
+    uint64_t t0 = Scheduler::NowMs();
+    for (uint64_t i = 0; i < limit * 2000ull; i++) {
         uint32_t csts = ReadReg(NVME_REG_CSTS);
         if (!!(csts & NVME_CSTS_RDY) == expected) return true;
-        // small delay
+        if (csts == 0xFFFFFFFFu) return false;           // device gone / bar unmapped (satoru)
+        if (Scheduler::NowMs() - t0 >= limit) break;
         for (volatile int j = 0; j < 1000; j++) {}
     }
+    SerialLogger::Log("[NVMe] WaitReady timeout, wanted RDY=");
+    SerialLogger::LogDec(expected ? 1 : 0);
+    SerialLogger::Log(" after "); SerialLogger::LogDec((int)limit); SerialLogger::Log(" ms\r\n");
     return false;
 }
 
@@ -344,6 +366,20 @@ bool NVMe::Identify() {
     SerialLogger::Log("[NVMe] Model: ");
     SerialLogger::Log(info.model);
     SerialLogger::Log("\r\n");
+
+    // a controller that is not qemu's virtual one is a real disk with someone's
+    // data on it. guard it no matter what the cmdline said, so a lost or empty
+    // cmdline can never leave a real ssd writable. only an explicit
+    // kurono.diskguard=0 (SetGuardPolicy(0)) skips this. (satoru)
+    {
+        const char q[4] = { 'Q', 'E', 'M', 'U' };
+        bool is_qemu = true;
+        for (int i = 0; i < 4; i++) if (info.model[i] != q[i]) { is_qemu = false; break; }
+        if (!is_qemu && NVMe::GuardPolicy() != 0 && !NVMe::WriteGuardOn()) {
+            NVMe::SetWriteGuard(true);
+            SerialLogger::Log("[diskguard] ON: real nvme controller, read-only outside the KURONO partition\r\n");
+        }
+    }
 
     // now identify namespace 1 to get capacity
     memset(id_buf, 0, 4096);
@@ -460,6 +496,37 @@ bool NVMe::SubmitAdminCmd(NVMeSQE* cmd, NVMeCQE* result) {
     return PollCompletion(&admin_queue, result);
 }
 
+// a slow command must not be given up on early: linux waits 30 s by default. about 5-10 s of
+// spinning here. a completion that arrives after we gave up stays in the cq, and the next
+// command would take it as its own and return before its data landed, leaving the queue off
+// by one for good. so count what we abandoned and consume it before the next submit. (satoru)
+static const int NVME_CQ_SPINS = 50000000;
+static uint16_t g_q_stale[NVME_MAX_QUEUES + 2];
+
+static bool nvme_drain_stale(NVMeQueuePair* qp, void (*ring)(uint32_t, uint32_t)) {
+    uint16_t& stale = g_q_stale[qp->qid];
+    while (stale > 0) {
+        bool got = false;
+        for (int t = 0; t < NVME_CQ_SPINS && !got; t++) {
+            uint16_t st = *(volatile uint16_t*)&qp->cq[qp->cq_head].status;
+            if ((st & 1) == qp->cq_phase) got = true;
+            else for (volatile int j = 0; j < 100; j++) {}
+        }
+        if (!got) {
+            SerialLogger::Log("[NVMe] queue still has abandoned commands, refusing io q=");
+            SerialLogger::LogDec((int)qp->qid); SerialLogger::Log("\r\n");
+            return false;
+        }
+        qp->cq_head++;
+        if (qp->cq_head >= qp->depth) { qp->cq_head = 0; qp->cq_phase ^= 1; }
+        ring(NVME_REG_SQ0TDBL + (qp->qid * 2 + 1) * 4, qp->cq_head);
+        stale--;
+        SerialLogger::Log("[NVMe] consumed a late completion q=");
+        SerialLogger::LogDec((int)qp->qid); SerialLogger::Log("\r\n");
+    }
+    return true;
+}
+
 bool NVMe::SubmitIOCmd(int qid, NVMeSQE* cmd, NVMeCQE* result) {
     if (qid < 0 || qid >= io_queue_count || qid >= NVME_MAX_QUEUES) return false;
     NVMeQueuePair* qp = &io_queues[qid];
@@ -467,6 +534,7 @@ bool NVMe::SubmitIOCmd(int qid, NVMeSQE* cmd, NVMeCQE* result) {
 
     // serialize cores that share this sq (cpus > queues). (satoru)
     SpinLockCpuGuard g(g_io_q_lock[qid]);
+    if (!nvme_drain_stale(qp, WriteReg)) return false;
 
     uint16_t tail = qp->sq_tail;
     qp->sq[tail] = *cmd;
@@ -481,7 +549,7 @@ bool NVMe::SubmitIOCmd(int qid, NVMeSQE* cmd, NVMeCQE* result) {
 }
 
 bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
-    for (int timeout = 0; timeout < 100000; timeout++) {
+    for (int timeout = 0; timeout < NVME_CQ_SPINS; timeout++) {
         NVMeCQE* cqe = &qp->cq[qp->cq_head];
         // VOLATILE read: the controller dma-writes this completion. a plain read
         // gets hoisted out of the loop by the compiler, so we spin on the stale
@@ -514,6 +582,7 @@ bool NVMe::PollCompletion(NVMeQueuePair* qp, NVMeCQE* result) {
         }
         for (volatile int j = 0; j < 100; j++) {} // spin
     }
+    g_q_stale[qp->qid]++;
     // diag: completion never appeared. dump the raw cqe at cq_head - if it's all
     // zero the controller wrote nothing (didn't fetch/process the command); if it
     // has data the phase bit / slot is being misread. (satoru)
@@ -617,7 +686,7 @@ bool NVMe::ReapCompletions(NVMeQueuePair* qp, int n) {
     int reaped = 0;
     while (reaped < n) {
         bool got = false;
-        for (int timeout = 0; timeout < 200000 && !got; timeout++) {
+        for (int timeout = 0; timeout < NVME_CQ_SPINS && !got; timeout++) {
             NVMeCQE* cqe = &qp->cq[qp->cq_head];
             // VOLATILE: the controller dma-writes the completion (see PollCompletion). (satoru)
             uint16_t st = *(volatile uint16_t*)&cqe->status;
@@ -631,6 +700,7 @@ bool NVMe::ReapCompletions(NVMeQueuePair* qp, int n) {
                     SerialLogger::Log("[NVMe] batch cmd ERR q=");
                     SerialLogger::LogDec((int)qp->qid);
                     SerialLogger::Log(" sc=0x"); SerialLogger::LogHex(sc); SerialLogger::Log("\r\n");
+                    g_q_stale[qp->qid] += (uint16_t)(n - reaped - 1);
                     return false;
                 }
                 got = true;
@@ -640,6 +710,7 @@ bool NVMe::ReapCompletions(NVMeQueuePair* qp, int n) {
             }
         }
         if (!got) {
+            g_q_stale[qp->qid] += (uint16_t)(n - reaped);
             SerialLogger::Log("[NVMe] batch reap TIMEOUT q=");
             SerialLogger::LogDec((int)qp->qid);
             SerialLogger::Log(" reaped="); SerialLogger::LogDec(reaped);
@@ -663,6 +734,7 @@ bool NVMe::SubmitIOBatch(int qid, uint8_t opcode, uint64_t lba, uint32_t count, 
     // pages (g_batch_prp[qid][..]), both of which two cores would otherwise
     // corrupt concurrently. uncontended for a core on its own queue. (satoru)
     SpinLockCpuGuard g(g_io_q_lock[qid]);
+    if (!nvme_drain_stale(qp, WriteReg)) return false;
     uint32_t lbasz = GetLBASize();
     uint32_t per = MaxTransferBytes() / lbasz; if (!per) per = 1;
     if (!ensure_batch_prp(qid)) return false;
@@ -705,14 +777,73 @@ static int nvme_pick_queue(int io_queue_count) {
     return (int)(idx % (uint32_t)io_queue_count);
 }
 
+// i/o in flight on any cpu. the eager boot-log hook checks it so a line logged
+// from inside an nvme command (an error path, holding a queue lock) never
+// re-enters the driver from the logger. (satoru)
+static volatile int g_nvme_busy = 0;
+bool NVMe::Busy() { return __atomic_load_n(&g_nvme_busy, __ATOMIC_ACQUIRE) != 0; }
+
 bool NVMe::Read(uint64_t lba, uint32_t count, void* buffer) {
     if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
-    return SubmitIOBatch(nvme_pick_queue(io_queue_count), NVME_IO_READ, lba, count, (uint8_t*)buffer);
+    __atomic_add_fetch(&g_nvme_busy, 1, __ATOMIC_ACQ_REL);
+    bool ok = SubmitIOBatch(nvme_pick_queue(io_queue_count), NVME_IO_READ, lba, count, (uint8_t*)buffer);
+    __atomic_sub_fetch(&g_nvme_busy, 1, __ATOMIC_ACQ_REL);
+    return ok;
 }
+
+// write guard state. the window is [lo, end) in device lbas; end == 0 means
+// no window, so a guarded disk is fully read-only. (satoru)
+static volatile bool     g_wguard     = false;
+static volatile uint64_t g_wwin_lo    = 0;
+static volatile uint64_t g_wwin_end   = 0;
+static volatile uint64_t g_wdenied    = 0;
+static volatile uint64_t g_wwin2_lo   = 0;   // second window, end == 0 means none (satoru)
+static volatile uint64_t g_wwin2_end  = 0;
+
+static volatile int g_wguard_policy = -1;   // -1 auto, 0 forced off, 1 forced on (satoru)
+void NVMe::SetGuardPolicy(int p) { g_wguard_policy = p; }
+int NVMe::GuardPolicy() { return g_wguard_policy; }
+void NVMe::SetWriteGuard(bool on) { g_wguard = on; }
+bool NVMe::WriteGuardOn() { return g_wguard; }
+void NVMe::SetWriteWindow(uint64_t lba_lo, uint64_t lba_end) {
+    g_wwin_lo = lba_lo;
+    g_wwin_end = (lba_end > lba_lo) ? lba_end : 0;
+}
+void NVMe::SetWriteWindow2(uint64_t lba_lo, uint64_t lba_end) {
+    g_wwin2_lo = lba_lo;
+    g_wwin2_end = (lba_end > lba_lo) ? lba_end : 0;
+}
+bool NVMe::GetWriteWindow(uint64_t* lba_lo, uint64_t* lba_end) {
+    if (lba_lo) *lba_lo = g_wwin_lo;
+    if (lba_end) *lba_end = g_wwin_end;
+    return g_wwin_end != 0;
+}
+uint64_t NVMe::GuardDenied() { return g_wdenied; }
 
 bool NVMe::Write(uint64_t lba, uint32_t count, const void* buffer) {
     if (!detected || !buffer || count == 0 || io_queue_count == 0) return false;
-    return SubmitIOBatch(nvme_pick_queue(io_queue_count), NVME_IO_WRITE, lba, count, (uint8_t*)(uintptr_t)buffer);
+    if (g_wguard) {
+        uint64_t end = g_wwin_end;
+        bool inside = end != 0 && lba >= g_wwin_lo && lba + count <= end && lba + count > lba;
+        uint64_t end2 = g_wwin2_end;
+        if (!inside && end2 != 0 && lba >= g_wwin2_lo && lba + count <= end2 && lba + count > lba) inside = true;
+        if (!inside) {
+            // log the first few refusals so a bare-metal log shows who tried. (satoru)
+            uint64_t n = __atomic_add_fetch(&g_wdenied, 1, __ATOMIC_RELAXED);
+            if (n <= 8) {
+                SerialLogger::Log("[diskguard] REFUSED nvme write lba=");
+                SerialLogger::LogHex64(lba);
+                SerialLogger::Log(" count=");
+                SerialLogger::LogDec((int)count);
+                SerialLogger::Log("\r\n");
+            }
+            return false;
+        }
+    }
+    __atomic_add_fetch(&g_nvme_busy, 1, __ATOMIC_ACQ_REL);
+    bool ok = SubmitIOBatch(nvme_pick_queue(io_queue_count), NVME_IO_WRITE, lba, count, (uint8_t*)(uintptr_t)buffer);
+    __atomic_sub_fetch(&g_nvme_busy, 1, __ATOMIC_ACQ_REL);
+    return ok;
 }
 
 bool NVMe::Flush() {

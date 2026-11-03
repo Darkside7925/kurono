@@ -13,6 +13,11 @@
 #include "../linux/linux_syscall.h"
 #include "../apps/denji_app.h"
 #include "../apps/firefox_launcher.h"
+#include "../system/claude_host.h"
+#include "../drivers/disklog.h"
+#include "../drivers/usb.h"
+#include "../drivers/hwinfo.h"
+#include "../apps/terminal.h"
 #include "../packages/pkgmgr.h"
 #include "../system/kpkg_daemon.h"
 #include "../linux/ld_kurono.h"
@@ -23,6 +28,9 @@
 #include "../proc/spinlock.h"
 #include "../media/embedded_media.h"
 #include "../drivers/serial.h"
+#include "../drivers/hda.h"
+#include "../drivers/audio_server.h"
+#include "../drivers/usb_audio.h"
 #include "../drivers/graphics.h"
 #include "../drivers/gpu_probe.h"
 #include "../drivers/nvidia_gpu.h"
@@ -35,6 +43,7 @@
 #include "../ui/notification.h"
 #include "../kernel/time.h"
 #include "../drivers/timer.h"
+#include "../linux/linux_netbridge.h"
 // Note: PumpUI must advance TimeManager so wallclock-based loops
 // (Time::GetTicks via TimeManager::monotonic_ms) don't freeze while a
 // shell command blocks the kernel main loop.
@@ -416,6 +425,12 @@ bool KuronoShell::IsCommandCancelRequested() {
     return g_shell_cancel_requested;
 }
 
+extern "C" void ff_main_ring_dump();
+// firefox jit tier (kurono.ffjit=N on the boot cmdline). (satoru)
+static int g_ff_jit_level = 0;
+void KuronoShell::SetFirefoxJit(int level) { g_ff_jit_level = level; }
+int  KuronoShell::GetFirefoxJit()          { return g_ff_jit_level; }
+
 void KuronoShell::PumpUI() {
     static bool reentrant = false;
     static uint32_t last_pump_ms = 0;
@@ -471,6 +486,27 @@ void KuronoShell::PumpUI() {
         SpinLockCpuGuard guard(g_input_lock);
         Keyboard::Poll();
         Mouse::Poll();
+        // usb hid is only read by InputProcess, which starves while a ring-3 program owns the
+        // bsp: on a machine whose keyboard and mouse are usb (real laptops) input went dead
+        // the moment claude or firefox started. ps/2 hid this in the vm. (satoru)
+        USB::PollHID();
+    }
+
+    // the same starvation stops the audio pump and the log worker. (satoru)
+    AudioServer::LockedTick();
+    {
+        static uint32_t s_last_flush_ms = 0;
+        static uint32_t s_pumps = 0;
+        s_pumps++;
+        if ((uint32_t)(now_ms - s_last_flush_ms) >= 5000u) {
+            SerialLogger::Log("[pump] ui pumps in last window ");
+            SerialLogger::LogDec((int)s_pumps);
+            SerialLogger::Log("\r\n");
+            s_pumps = 0;
+            s_last_flush_ms = now_ms;
+            HwInfo::Heartbeat();
+            DiskLog::Flush();
+        }
     }
 
     InputManager::Poll();
@@ -522,11 +558,39 @@ void KuronoShell::PumpUI() {
             fw->input(fw, 3, scroll_delta, 0);
     }
 
+    // the NetworkProcess is starved the same way as the gui loop once firefox
+    // owns the bsp; drain the nic here too so packet rx keeps a ~16ms latency.
+    LinuxNetBridge::PumpTick();
+    // the gui loop is starved while firefox owns the bsp, so the stall
+    // diagnostic ring is dumped from here too (it paces itself to 20s).
+    ff_main_ring_dump();
     DesktopEnvironment::Update();
+    // damage-gated like the gui loop. this pump runs inside the syscalls of
+    // whatever is on the bsp (firefox, once it is up) with kls_lock held, so a
+    // frame drawn here is time that app loses. it used to draw a full frame at
+    // up to 60fps whenever the gui heartbeat looked stale - which it always
+    // does once the app keeps the bsp busy - so under emulation the desktop
+    // took nearly the whole core. now: draw on damage, a requested frame
+    // deadline, or a live animation/drag; otherwise only a slow fallback
+    // (clock), spaced at 8x the last pumped frame's cost and at least 1s.
     if (Graphics::ShouldRender()) {
-        DesktopEnvironment::Render();
-        Mouse::DrawAt(Mouse::mx, Mouse::my);
-        Graphics::SwapBuffers();
+        static uint32_t s_pump_cost_ms = 0, s_pump_last_ms = 0;
+        uint32_t t = Timer::GetRealMs();
+        bool want = Graphics::ConsumeUIDirty();
+        if (Graphics::ConsumeFrameDue(t)) want = true;
+        if (WindowManager::HasActiveAnimations() || WindowManager::IsDragging()) want = true;
+        static int s_pump_mx = -1, s_pump_my = -1;   // the cursor is drawn per frame
+        if (Mouse::mx != s_pump_mx || Mouse::my != s_pump_my) {
+            s_pump_mx = Mouse::mx; s_pump_my = Mouse::my; want = true;
+        }
+        uint32_t fb = s_pump_cost_ms * 8 > 1000u ? s_pump_cost_ms * 8 : 1000u;
+        if (want || (uint32_t)(t - s_pump_last_ms) >= fb) {
+            s_pump_last_ms = t;
+            DesktopEnvironment::Render();
+            Mouse::DrawAt(Mouse::mx, Mouse::my);
+            Graphics::SwapBuffers();
+            s_pump_cost_ms = Timer::GetRealMs() - t;
+        }
     }
 
     reentrant = false;
@@ -977,6 +1041,15 @@ int KuronoShell::RunViaPwsh(const char* cmdline, char* output, int max_output) {
     return p;
 }
 
+// recovery toolbox command names (see cmd_rtool) (satoru)
+static const char* const RTOOL_NAMES[] = {
+    "ntfsfix", "ntfsinfo", "ntfsls", "ntfscat", "ntfsclone", "ntfsundelete",
+    "ntfsresize", "ntfslabel", "ntfscluster", "ntfscmp", "mkntfs",
+    "e2fsck", "debugfs", "dumpe2fs", "tune2fs", "resize2fs",
+    "fsck.fat", "fatlabel", "testdisk", "photorec", "chntpw", "reged",
+    "busybox", nullptr
+};
+
 namespace ShellBuiltins {
     int cmd_crash(KuronoShell*, int, const char**, char*, int);
     int cmd_gpu(KuronoShell*, int, const char**, char*, int);
@@ -986,12 +1059,16 @@ namespace ShellBuiltins {
     int cmd_poweroff(KuronoShell*, int, const char**, char*, int);
     int cmd_suspend(KuronoShell*, int, const char**, char*, int);
     int cmd_ffmpeg(KuronoShell*, int, const char**, char*, int);
+    int cmd_rtool(KuronoShell*, int, const char**, char*, int);
+    int cmd_recovery(KuronoShell*, int, const char**, char*, int);
+    int cmd_audio(KuronoShell*, int, const char**, char*, int);
     int cmd_wltest(KuronoShell*, int, const char**, char*, int);
     int cmd_pthtest(KuronoShell*, int, const char**, char*, int);
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
     int cmd_persisttest(KuronoShell*, int, const char**, char*, int);
     int cmd_supr(KuronoShell*, int, const char**, char*, int);
     int cmd_firefox(KuronoShell*, int, const char**, char*, int);
+    int cmd_claude(KuronoShell*, int, const char**, char*, int);
 }
 
 void KuronoShell::RegisterBuiltins() {
@@ -999,9 +1076,14 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("help",     "Show available commands",     ENV_KURONO, "builtin", cmd_help);
     RegisterCommand("denji",    "Open Denji video player",     ENV_KURONO, "media",   cmd_denji);
     RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
+    RegisterCommand("recovery", "Rescue entry point: drives, toolbox, ai", ENV_AUTO, "recovery", cmd_recovery);
+    RegisterCommand("audio",    "Audio status / restart / test tone", ENV_AUTO, "system", cmd_audio);
+    for (int i = 0; RTOOL_NAMES[i]; i++)
+        RegisterCommand(RTOOL_NAMES[i], "Recovery toolbox (static linux binary)", ENV_AUTO, "recovery", cmd_rtool);
     RegisterCommand("wltest",   "Run the wl_shm wayland render test", ENV_AUTO, "media", cmd_wltest);
     RegisterCommand("pthtest",  "Run the pthreads (clone+futex) smoke test", ENV_AUTO, "media", cmd_pthtest);
     RegisterCommand("firefox",  "Launch Firefox (installs it first if needed)", ENV_AUTO, "apps", cmd_firefox);
+    RegisterCommand("claude",   "Run Claude Code (loads the CLAUDE file from the KURONO partition)", ENV_AUTO, "apps", cmd_claude);
     RegisterCommand("persisttest","Test kvfs persistence across reboot", ENV_AUTO, "system", cmd_persisttest);
     RegisterCommand("playvideo","Play the imported video (ssstik)", ENV_AUTO, "media",  cmd_playvideo);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
@@ -1011,6 +1093,7 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("clear",    "Clear terminal",              ENV_KURONO, "builtin", cmd_clear);
     RegisterCommand("echo",     "Print text",                  ENV_KURONO, "builtin", cmd_echo);
     RegisterCommand("set",      "Set variable",                ENV_KURONO, "builtin", cmd_set);
+    RegisterCommand("export",   "Set variable (NAME=value)",   ENV_AUTO,   "builtin", cmd_set);
     RegisterCommand("alias",    "Set command alias",           ENV_KURONO, "builtin", cmd_alias);
     RegisterCommand("history",  "Show command history",        ENV_KURONO, "builtin", cmd_history);
     RegisterCommand("exit",     "Exit shell",                  ENV_KURONO, "builtin", cmd_exit);
@@ -1842,6 +1925,285 @@ int cmd_ffmpeg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
     return p;
 }
 
+// recovery toolbox - musl-static rescue tools unpacked to /system/bin at boot
+// from the embedded recovery_tools.tar. every name here is a shell command that
+// runs /system/bin/<name> (linux /usr/bin/<name>) as a real ring-3 linux process and returns its
+// stdout/stderr, same mechanism as cmd_ffmpeg above. (satoru)
+int cmd_rtool(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (argc < 1 || !argv[0]) return 0;
+    char path[64] = "/system/bin/";
+    int pl = 12;
+    for (int i = 0; argv[0][i] && pl < 63; i++) path[pl++] = argv[0][i];
+    path[pl] = 0;
+    if (!KVFS::Exists(path)) {
+        int p = sappend(out, 0, mx, argv[0]);
+        return sappend(out, p, mx, ": not in this build (no recovery toolbox embedded)\n");
+    }
+    if (!Userspace::IsReady()) Userspace::Init();
+    Process* proc = ElfLoader::LoadELF64FromVFS(path, argv[0]);
+    if (!proc) {
+        int p = sappend(out, 0, mx, argv[0]);
+        return sappend(out, p, mx, ": failed to load binary\n");
+    }
+    const char* av[40];
+    int n = 0;
+    for (int i = 0; i < argc && n < 39; i++) av[n++] = argv[i];
+    av[n] = nullptr;
+    bool pty = TerminalApp::PtyBegin();   // interactive tools (busybox sh) get a real tty (satoru)
+    const char* envp[] = { "PATH=/system/bin:/usr/bin", "HOME=/root", "TMPDIR=/tmp",
+                           pty ? "TERM=xterm-256color" : "TERM=dumb", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    if (pty) TerminalApp::PtyEnd();
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    p = sappend(out, p, mx, "[");
+    p = sappend(out, p, mx, argv[0]);
+    p = sappend(out, p, mx, " exited ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, "]\n");
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// `audio [status|restart|tone]` - hd audio diagnostics. restart re-runs the
+// controller + codec bring-up without a reboot. (satoru)
+int cmd_audio(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    int p = 0;
+    const char* sub = (argc >= 2) ? argv[1] : "status";
+    bool usb_active = (AudioServer::ActiveBackend() != nullptr) &&
+                      AudioServer::ActiveBackend() == AudioServer::FindBackend("usbaudio");
+    if (sub[0] == 'u' && sub[1] == 's' && sub[2] == 'e') {
+        // audio use hda|usb - pick the backend by hand (also stops hotplug auto-switching) (satoru)
+        const char* want = (argc >= 3) ? argv[2] : "";
+        const char* be = (want[0] == 'u') ? "usbaudio" : (want[0] == 'h') ? "hda" : nullptr;
+        if (!be) return sappend(out, p, mx, "usage: audio use hda|usb\n");
+        UsbAudio::NoteUserChoice();
+        bool ok = AudioServer::UseBackend(be);
+        p = sappend(out, p, mx, ok ? "audio: now using " : "audio: could not switch to ");
+        p = sappend(out, p, mx, be);
+        p = sappend(out, p, mx, ok ? "\n" : " (not present or failed, see serial)\n");
+        usb_active = ok && be[0] == 'u';
+    } else if (sub[0] == 'r') {
+        bool ok;
+        if (usb_active) {
+            ok = UsbAudio::Restart();
+            p = sappend(out, p, mx, ok ? "audio: usb audio restarted\n" : "audio: usb audio restart FAILED (see serial [usbaudio] log)\n");
+        } else {
+            ok = HDAudio::Restart();
+            p = sappend(out, p, mx, ok ? "audio: hd audio restarted\n" : "audio: restart FAILED (see serial [hda] log)\n");
+        }
+    } else if (sub[0] == 't') {
+        // short on purpose: PlayTone does not pace itself against the mixer
+        // stream ring, so anything much past ~0.3 s is truncated (satoru)
+        AudioServer::PlayTone(440, 300, 70);
+        p = sappend(out, p, mx, "audio: played 440 Hz 300 ms tone\n");
+    } else if (sub[0] != 's') {
+        return sappend(out, p, mx, "usage: audio [status|restart|tone|use hda|usb]\n");
+    }
+    static char buf[1536];
+    p = sappend(out, p, mx, "backend: ");
+    p = sappend(out, p, mx, AudioServer::ActiveBackendName());
+    p = sappend(out, p, mx, "\n");
+    if (UsbAudio::Present()) {
+        UsbAudio::Describe(buf, (int)sizeof(buf));
+        p = sappend(out, p, mx, buf);
+    }
+    if (!usb_active) {
+        HDAudio::DumpInfo(buf, (int)sizeof(buf));
+        p = sappend(out, p, mx, buf);
+    }
+    return p;
+}
+
+// `recovery` - the rescue entry point. bare: shows the drives, the os and the
+// toolbox. `recovery ai <question>` hands the question to the deepseek agent
+// (dsai), which inspects the machine through the read-only /dev/kshell gate.
+// (satoru)
+int cmd_recovery(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    int p = 0;
+    if (argc >= 2 && argv[1][0] == 'a' && argv[1][1] == 'i' && argv[1][2] == 0) {
+        if (!KVFS::Exists("/usr/bin/dsai"))
+            return sappend(out, 0, mx, "recovery: ai client not in this build\n");
+        if (!Userspace::IsReady()) Userspace::Init();
+        Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/dsai", "dsai");
+        if (!proc) return sappend(out, 0, mx, "recovery: failed to load dsai\n");
+        // join the rest of the line into one prompt argument (satoru)
+        static char prompt[1024];
+        int q = 0;
+        for (int i = 2; i < argc; i++) {
+            for (int k = 0; argv[i][k] && q < 1022; k++) prompt[q++] = argv[i][k];
+            if (i + 1 < argc && q < 1022) prompt[q++] = ' ';
+        }
+        prompt[q] = 0;
+        if (q == 0) {
+            const char* d = "Inspect the drives and filesystems on this machine and "
+                            "report anything that looks damaged or unbootable.";
+            for (; d[q] && q < 1022; q++) prompt[q] = d[q];
+            prompt[q] = 0;
+        }
+        const char* av[] = { "dsai", prompt, nullptr };
+        const char* envp[] = { "PATH=/usr/bin", "HOME=/root",
+                               "DSAI_MODEL=deepseek-v4-flash", nullptr };
+        LinuxSyscall::ClearConsoleOutput();
+        int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+        p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+        if (p < 0) p = 0;
+        out[p] = 0;
+        p = sappend(out, p, mx, "[recovery ai exited ");
+        p = sappend_int(out, p, mx, rc);
+        p = sappend(out, p, mx, "]\n");
+        Scheduler::DestroyProcess(proc);
+        return p;
+    }
+
+    p = sappend(out, p, mx, "=== kurono recovery ===\n\n-- system --\n");
+    p += KuronoShell::Execute("kurono:uname -a", out + p, mx - p - 1);
+    p = sappend(out, p, mx, "\n-- drives --\n");
+    p += KuronoShell::Execute("lsblk", out + p, mx - p - 1);
+    p = sappend(out, p, mx, "\n-- toolbox (/usr/bin) --\n");
+    int shown = 0;
+    for (int i = 0; RTOOL_NAMES[i]; i++) {
+        char path[64] = "/system/bin/";
+        int pl = 12;
+        for (int k = 0; RTOOL_NAMES[i][k] && pl < 63; k++) path[pl++] = RTOOL_NAMES[i][k];
+        path[pl] = 0;
+        if (!KVFS::Exists(path)) continue;
+        p = sappend(out, p, mx, RTOOL_NAMES[i]);
+        p = sappend(out, p, mx, (++shown % 6) ? "  " : "\n");
+    }
+    if (!shown) p = sappend(out, p, mx, "(none embedded)");
+    p = sappend(out, p, mx,
+        "\n\nusage:\n"
+        "  ntfsfix /dev/sda1          repair common ntfs damage, schedule chkdsk\n"
+        "  ntfsfix -d /dev/sda1       clear the ntfs dirty flag\n"
+        "  ntfsinfo -f -m /dev/sda1   ntfs volume details\n"
+        "  e2fsck -n /dev/sda2        check an ext2/3/4 filesystem (read-only)\n"
+        "  fsck.fat -n /dev/sda3      check a fat/efi partition (read-only)\n"
+        "  testdisk /list             list disks and partition tables\n"
+        "  photorec /d /tmp/rec /cmd /dev/sda search   carve lost files\n"
+        "  chntpw -l <SAM>            list windows accounts\n"
+        "  recovery ai <question>     ask the ai to diagnose this machine\n");
+    return p;
+}
+
+// `claude [args]` - runs the real, unmodified claude code cli (linux x64 musl, ~300 mb). the
+// binary is NOT in the kernel image: it is the root file CLAUDE on the fat32 partition labelled
+// KURONO, read (never written) into memory on first use and exposed as /usr/bin/claude.
+// env for the process comes from shell variables (ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY,
+// ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL) and from NAME=value lines in /etc/claude.env, both set
+// at runtime by the user - nothing is baked into the image. HOME is /home/user, which the
+// persistent store (SaveTree) keeps, so ~/.claude survives a reboot. this runs claude to
+// completion and prints its output when it ends (no pty yet), so use `claude -p "..."`. (satoru)
+int cmd_claude(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    static char args[480];
+    static char env[480];
+    int n = 0;
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        bool sp = false;
+        for (int k = 0; a[k]; k++) if (a[k] == ' ') sp = true;
+        if (n + 3 + (int)__builtin_strlen(a) >= (int)sizeof(args)) break;
+        if (n) args[n++] = ' ';
+        if (sp) args[n++] = '\'';
+        for (int k = 0; a[k]; k++) args[n++] = (a[k] == '\'') ? '"' : a[k];
+        if (sp) args[n++] = '\'';
+    }
+    args[n] = 0;
+    int e = 0;
+    static const char* const NAMES[] = { "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                                         "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_MODEL", "HTTPS_PROXY", "HTTP_PROXY", nullptr };
+    for (int i = 0; NAMES[i]; i++) {
+        const char* v = KuronoShell::GetVar(NAMES[i]);
+        if (!v || !*v) continue;
+        int nl = (int)__builtin_strlen(NAMES[i]), vl = (int)__builtin_strlen(v);
+        bool sp = false;
+        for (int k = 0; k < vl; k++) if (v[k] == ' ') sp = true;
+        if (sp || e + nl + vl + 2 >= (int)sizeof(env)) continue;
+        for (int k = 0; k < nl; k++) env[e++] = NAMES[i][k];
+        env[e++] = '=';
+        for (int k = 0; k < vl; k++) env[e++] = v[k];
+        env[e++] = ' ';
+    }
+    // NAME=value lines, no spaces in values: /etc/claude.env, then the root file CLAUDE.ENV on the
+    // KURONO partition (read only, the owner's own choice to keep a token there). exported shell
+    // variables came first so they win. the values are never logged. (satoru)
+    for (int src = 0; src < 2; src++) {
+        static char file[400];
+        static const char ENV_83[11] = { 'C','L','A','U','D','E',' ',' ','E','N','V' };
+        int fl = 0;
+        if (src == 0) {
+            fl = KVFS::ReadFile("/etc/claude.env", file, sizeof(file) - 1);
+        } else {
+            uint64_t fsz = 0;
+            if (DiskLog::StatRootFile(ENV_83, &fsz) == 0 && fsz > 0 && fsz < sizeof(file) &&
+                DiskLog::ReadRootFile(ENV_83, file, sizeof(file) - 1, nullptr) == 0)
+                fl = (int)fsz;
+        }
+        if (fl > 0) {
+            file[fl] = 0;
+            int ls = 0;
+            for (int k = 0; k <= fl; k++) {
+                if (file[k] == '\n' || file[k] == '\r' || file[k] == 0) {
+                    file[k] = 0;
+                    const char* ln = file + ls;
+                    int ll = (int)__builtin_strlen(ln);
+                    bool eq = false, sp = false;
+                    for (int q = 0; q < ll; q++) { if (ln[q] == '=') eq = true; if (ln[q] == ' ') sp = true; }
+                    // a NAME already in env (exported variable, or an earlier file) wins: the
+                    // process takes the first match, and a duplicate here used to beat a typed export. (satoru)
+                    bool dup = false;
+                    if (eq) {
+                        int nl2 = 0;
+                        while (nl2 < ll && ln[nl2] != '=') nl2++;
+                        for (int s0 = 0; s0 < e && !dup; ) {
+                            int s1 = s0;
+                            while (s1 < e && env[s1] != ' ') s1++;
+                            if (s1 - s0 > nl2 && env[s0 + nl2] == '=') {
+                                bool same = true;
+                                for (int q = 0; q < nl2; q++) if (env[s0 + q] != ln[q]) { same = false; break; }
+                                if (same) dup = true;
+                            }
+                            s0 = s1 + 1;
+                        }
+                    }
+                    if (ll > 2 && ln[0] != '#' && eq && !sp && !dup && e + ll + 1 < (int)sizeof(env)) {
+                        for (int q = 0; q < ll; q++) env[e++] = ln[q];
+                        env[e++] = ' ';
+                    }
+                    ls = k + 1;
+                }
+            }
+        }
+    }
+    env[e] = 0;
+    char msg[256];
+    msg[0] = 0;
+    LinuxSyscall::ClearConsoleOutput();
+    // from the desktop terminal, run attached to a pty: the terminal becomes a vt100
+    // screen, keys go to claude's stdin, output is shown live (satoru)
+    bool pty = TerminalApp::PtyBegin();
+    int rc = ClaudeHost::Run(args, env, msg, sizeof(msg));
+    if (pty) TerminalApp::PtyEnd();
+    // keep ~/.claude (config, sessions, history) across a reboot: write the user-data
+    // trees (/home, /etc, /root) to the persistent KFS volume now, not only at shutdown. no-op
+    // without a writable KURONO.KFS; only that file is ever written. (satoru)
+    if (rc >= 0 && PersistStore::Available()) PersistStore::SaveTree();
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    if (rc < 0 || (msg[0] && msg[0] != 'o')) {
+        p = sappend(out, p, mx, msg[0] ? msg : "claude: could not start");
+        p = sappend(out, p, mx, "\n");
+    }
+    return p;
+}
+
 // run the embedded wl_shm wayland test client as a real ring-3 linux process.
 // proves the compositor's shared-memory render path (memfd -> mmap -> SCM_RIGHTS
 // -> wl_shm pool -> buffer -> commit). run it from a desktop terminal to see a
@@ -1917,13 +2279,59 @@ extern "C" {
 // own fonts dir is unreliable here (fontconfig never surfaced them); /system/fonts
 // is fontconfig's primary <dir> so this is the dependable path. (satoru)
 extern "C" {
-    extern const unsigned char _binary_kurono_fonts_start[];
-    extern const unsigned char _binary_kurono_fonts_end[];
+    extern const unsigned char _binary_kurono_fonts_start[] __attribute__((weak));
+    extern const unsigned char _binary_kurono_fonts_end[]   __attribute__((weak));
 }
+// embedded nss runtime libs (Makefile objcopy of assets_nsslibs.tar); unpacked
+// to /apps/firefox/lib at firefox launch. the firefox tar ships libsoftokn3.so
+// with DT_NEEDED libsqlite3.so.0 but NO libsqlite3 anywhere (libmozsqlite3.so
+// exports zero dynamic symbols), so softoken's dlopen failed, NSS/PSM never
+// initialized, and every https connection died with the "Personal Security
+// Manager" error before cert9.db was even opened. a musl-built libsqlite3.so.0
+// satisfies the dep; extraction at launch also heals persisted installs. (satoru)
+extern "C" {
+    extern const unsigned char _binary_kurono_nsslibs_start[];
+    extern const unsigned char _binary_kurono_nsslibs_end[];
+}
+
+// embedded icu common data (Makefile objcopy of assets/icu/icudt78l.dat).
+// weak so a build without the file still links.
+extern "C" {
+    extern const unsigned char _binary_kurono_icudt_start[] __attribute__((weak));
+    extern const unsigned char _binary_kurono_icudt_end[]   __attribute__((weak));
+}
+// embedded gdk-pixbuf 2.42 (Makefile objcopy of assets/gdk-pixbuf); weak like
+// the icu data.
+extern "C" {
+    extern const unsigned char _binary_kurono_pixbuf_start[] __attribute__((weak));
+    extern const unsigned char _binary_kurono_pixbuf_end[]   __attribute__((weak));
+}
+
+// a minimal shared-mime-info database: gio's g_content_type_guess, which
+// gdk-pixbuf uses to pick a loader, needs one, and the package ships none.
+// without it no image type is recognised (gtk's resource icons have no file
+// name to go by), so gtk aborts on its first icon. magic + globs2 cover the
+// formats the built-in loaders decode.
+static const unsigned char kMimeMagic[] = { 0x4d, 0x49, 0x4d, 0x45, 0x2d, 0x4d, 0x61, 0x67, 0x69, 0x63, 0x00, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x70, 0x6e, 0x67, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x08, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x6a, 0x70, 0x65, 0x67, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x03, 0xff, 0xd8, 0xff, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x67, 0x69, 0x66, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x04, 0x47, 0x49, 0x46, 0x38, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x62, 0x6d, 0x70, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x02, 0x42, 0x4d, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x76, 0x6e, 0x64, 0x2e, 0x6d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66, 0x74, 0x2e, 0x69, 0x63, 0x6f, 0x6e, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00, 0x0a };
+static const char kMimeGlobs2[] =
+    "50:image/png:*.png\n"
+    "50:image/jpeg:*.jpg\n"
+    "50:image/jpeg:*.jpeg\n"
+    "50:image/jpeg:*.jpe\n"
+    "50:image/gif:*.gif\n"
+    "50:image/bmp:*.bmp\n"
+    "50:image/vnd.microsoft.icon:*.ico\n"
+    ;
 
 int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
+    SerialLogger::Log("[fftl] cmd_firefox enter\r\n");   // launch timeline marker (satoru)
+    // write every log line to disk as printed until the first window paints (the
+    // wayland first-paint marker turns it back off), so a freeze mid launch still
+    // leaves a log that is current up to the last line. (satoru)
+    if (DiskLog::Ready()) { DiskLog::SetEager(true); SerialLogger::Log("[fftl] eager disk log ON until first paint\r\n"); }
     if (!Userspace::IsReady()) Userspace::Init();
+    SerialLogger::Log("[fftl] userspace ready\r\n");
 
     const char* url = (argc >= 2) ? argv[1] : nullptr;
 
@@ -1934,7 +2342,10 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     // connect). if firefox is not in the live tree yet but a usable install is on
     // the persist disk, restore it NOW -- at launch, the desktop already running,
     // matching the working install path's memory+timing. (satoru)
-    if (!FirefoxLauncher::IsInstalled() && PersistStore::HasPersistedFirefox()) {
+    bool ff_installed_now = FirefoxLauncher::IsInstalled();
+    SerialLogger::Log("[fftl] IsInstalled checked\r\n");
+    if (!ff_installed_now && PersistStore::HasPersistedFirefox()) {
+        SerialLogger::Log("[fftl] HasPersistedFirefox yes\r\n");
         p = sappend(out, p, mx, "firefox: restoring persisted install from disk...\n");
         PersistStore::RestoreApps();
         // IsInstalled() also gates on /system/lib/firefox-deps.manifest, which
@@ -1995,7 +2406,10 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         // persist the fresh install (/apps/firefox) so the next boot restores it
         // from nvme instead of re-downloading + re-extracting it (saves ~145s per
         // run once an nvme data disk is attached). (satoru)
-        if (PersistStore::SaveTree())
+        SerialLogger::Log("[fftl] SaveTree start\r\n");
+        bool saved_ok = PersistStore::SaveTree();
+        SerialLogger::Log(saved_ok ? "[fftl] SaveTree end ok\r\n" : "[fftl] SaveTree end FAILED\r\n");
+        if (saved_ok)
             p = sappend(out, p, mx, "firefox: install persisted to disk for next boot.\n");
         // a fresh install (re-)enables the desktop icon, even if the user
         // deleted a previous one; the desktop sync picks it up within a tick. (satoru)
@@ -2044,7 +2458,9 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     // unpack the embedded DejaVu TTFs into /system/fonts (fontconfig's primary
     // <dir>, where it definitely scans) so gecko finds a usable default font and
     // does not abort with zero font families. mirrors the xkb unpack above. (satoru)
-    {
+    // assets_fonts.tar is gitignored, so a clean clone links without the blob;
+    // the weak symbols are then null and there is nothing to unpack.
+    if (_binary_kurono_fonts_start && _binary_kurono_fonts_end) {
         int fonts_len = (int)(_binary_kurono_fonts_end - _binary_kurono_fonts_start);
         bool fok = PackageManager::ExtractTar((const char*)_binary_kurono_fonts_start, fonts_len, "/system/fonts");
         SerialLogger::Log("[fffont] len="); SerialLogger::LogDec(fonts_len);
@@ -2052,6 +2468,58 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         SerialLogger::Log(" dejavu="); SerialLogger::LogDec(KVFS::Exists("/system/fonts/DejaVuSans.ttf") ? 1 : 0);
         SerialLogger::Log("\r\n");
         if (fok) p = sappend(out, p, mx, "firefox: unpacked DejaVu fonts.\n");
+    }
+
+    // write the icu data where ICU_DATA (envp below) points. the package ships
+    // only alpine's stub libicudata, so without this u_init fails and gecko
+    // MOZ_CRASHes in JS init ("ICU4CLibrary::Initialize() failed"). the file
+    // borrows the embedded bytes rather than copying 3 MB.
+    if (_binary_kurono_icudt_start && _binary_kurono_icudt_end &&
+        !KVFS::Exists("/apps/firefox/icudt78l.dat")) {
+        uint32_t icu_len = (uint32_t)(_binary_kurono_icudt_end - _binary_kurono_icudt_start);
+        int r = KVFS::WriteFileStatic("/apps/firefox/icudt78l.dat", _binary_kurono_icudt_start, icu_len);
+        SerialLogger::Log("[fficu] len="); SerialLogger::LogDec((int)icu_len);
+        SerialLogger::Log(" ok="); SerialLogger::LogDec(r == 0 ? 1 : 0);
+        SerialLogger::Log("\r\n");
+    }
+
+    // replace the package's gdk-pixbuf 2.44 with the embedded 2.42. 2.44 sends
+    // every decode through glycin, which this package stubs out, so no png
+    // loads and gtk aborts on its first icon ("Unrecognized image file
+    // format"). 2.42 decodes png/jpeg itself. done every launch, since a
+    // reinstall or restore brings the package copy back.
+    if (_binary_kurono_pixbuf_start && _binary_kurono_pixbuf_end &&
+        KVFS::Exists("/apps/firefox/lib/libgdk_pixbuf-2.0.so.0")) {
+        uint32_t pb_len = (uint32_t)(_binary_kurono_pixbuf_end - _binary_kurono_pixbuf_start);
+        int r = KVFS::WriteFileStatic("/apps/firefox/lib/libgdk_pixbuf-2.0.so.0",
+                                      _binary_kurono_pixbuf_start, pb_len);
+        SerialLogger::Log("[ffpixbuf] len="); SerialLogger::LogDec((int)pb_len);
+        SerialLogger::Log(" ok="); SerialLogger::LogDec(r == 0 ? 1 : 0);
+        SerialLogger::Log("\r\n");
+    }
+
+    // the mime database gio reads from $XDG_DATA_DIRS/mime (envp below).
+    {
+        KVFS::Mkdirs("/apps/firefox/share/mime");
+        int a = KVFS::WriteFile("/apps/firefox/share/mime/magic", kMimeMagic, sizeof(kMimeMagic));
+        int b = KVFS::WriteFile("/apps/firefox/share/mime/globs2", kMimeGlobs2, sizeof(kMimeGlobs2) - 1);
+        SerialLogger::Log("[ffmime] ok="); SerialLogger::LogDec(a == 0 && b == 0 ? 1 : 0);
+        SerialLogger::Log("\r\n");
+    }
+
+    // unpack the embedded nss runtime libs (libsqlite3.so.0) into
+    // /apps/firefox/lib - the loader's second search dir, next to the other nss
+    // .so files - so libsoftokn3.so's DT_NEEDED resolves and NSS/PSM can
+    // initialize (the https "Personal Security Manager" fix). runs every launch
+    // so a persisted install from before this fix heals itself. (satoru)
+    {
+        int nl_len = (int)(_binary_kurono_nsslibs_end - _binary_kurono_nsslibs_start);
+        bool nok = PackageManager::ExtractTar((const char*)_binary_kurono_nsslibs_start, nl_len, "/apps/firefox");
+        SerialLogger::Log("[ffnss] len="); SerialLogger::LogDec(nl_len);
+        SerialLogger::Log(" extract="); SerialLogger::LogDec(nok ? 1 : 0);
+        SerialLogger::Log(" sqlite="); SerialLogger::LogDec(KVFS::Exists("/apps/firefox/lib/libsqlite3.so.0") ? 1 : 0);
+        SerialLogger::Log("\r\n");
+        if (nok) p = sappend(out, p, mx, "firefox: unpacked NSS runtime libs.\n");
     }
 
     // pin gecko's compositor into the parent process (software webrender) and
@@ -2304,7 +2772,14 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"javascript.options.mem.gc_compacting\", false);\n"
             "lockPref(\"javascript.options.mem.gc_max_empty_chunk_count\", 10000);\n"
             "lockPref(\"javascript.options.mem.gc_min_empty_chunk_count\", 10000);\n"
-            "lockPref(\"javascript.options.mem.log\", true);\n"
+            // (satoru) BOOT-SPEED phase 1: mem.log=true routed every GC to stderr
+            // -> serial. with non-generational GC (below) forcing frequent startup
+            // GCs, that is a per-GC ring-0 serial write starving the cooperative
+            // scheduler (same mechanism as the mozlog flood above). the phase-0
+            // [ffcount] measurement proved the boot cost is interpreter+GC compute,
+            // not W^X, so cutting this self-inflicted serial load is a direct win.
+            // was true (a diagnostic); off for normal boots. (satoru)
+            "lockPref(\"javascript.options.mem.log\", false);\n"
             // RE-ENABLED generational + incremental GC (satoru): these were forced
             // OFF for the old single-core cooperative scheduler to dodge nursery
             // minor-GC mprotect churn. but non-generational forces EVERY allocation
@@ -2410,33 +2885,38 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"browser.aboutwelcome.enabled\", false);\n"
             "lockPref(\"browser.sessionstore.resume_from_crash\", false);\n"
             "lockPref(\"browser.shell.checkDefaultBrowser\", false);\n"
-            "lockPref(\"browser.dom.window.dump.enabled\", true);\n"
-            // [KNAV] startup-page watchdog: firefox intermittently sits on
-            // about:blank instead of navigating to the cli url / homepage (an
-            // old known flake). if the selected tab is still blank and idle
-            // after startup, kick ONE load of the homepage; never touches a
-            // tab that navigated or is mid-load. (satoru)
-            "try {\n"
-            "  var KNT = ChromeUtils.importESModule('resource://gre/modules/Timer.sys.mjs');\n"
-            "  var KNAV_fired = false;\n"
-            "  KNT.setInterval(function() {\n"
-            "    try {\n"
-            "      if (KNAV_fired) return;\n"
-            "      var w = Services.wm.getMostRecentWindow('navigator:browser');\n"
-            "      if (!w || !w.gBrowser || !w.gBrowser.selectedBrowser) return;\n"
-            "      var sp = w.gBrowser.currentURI ? w.gBrowser.currentURI.spec : '';\n"
-            "      if (sp == 'about:blank' || sp == 'about:newtab') {\n"
-            "        if (w.gBrowser.webProgress && w.gBrowser.webProgress.isLoadingDocument) return;\n"
-            "        KNAV_fired = true;\n"
-            "        dump('[KNAV] blank tab after startup - kicking homepage load\\n');\n"
-            "        w.gBrowser.selectedBrowser.loadURI(\n"
-            "          Services.io.newURI('http://10.0.2.2/kurono/'),\n"
-            "          { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });\n"
-            "      } else { KNAV_fired = true; }\n"
-            "    } catch (e) { dump('[KNAV] err ' + e + '\\n'); }\n"
-            "  }, 15000);\n"
-            "} catch (e) { dump('[KNAV] init-err ' + e + '\\n'); }\n";
-        KVFS::WriteFile("/apps/firefox/firefox.cfg", cfg, (uint32_t)__builtin_strlen(cfg));
+            "lockPref(\"browser.dom.window.dump.enabled\", true);\n";
+        {
+            static char cfgbuf[24576];   // the cfg literal is ~10-16kb; headroom for the jit overrides (satoru)
+            int o = 0;
+            for (const char* s = cfg; *s && o < (int)sizeof(cfgbuf) - 1; ) cfgbuf[o++] = *s++;
+            // jit re-enable experiment (kurono.ffjit=N): the historical jit
+            // crashes (fixed-rip null-faults in the 0x1800_xxx reservation)
+            // predate the madvise align-down fix + the tlb-quarantine proof-only
+            // release - both real corruptors that zeroed/sprayed live jit pages.
+            // a later lockPref wins, so append overrides instead of editing the
+            // literal. level 1 = blinterp, 2 = +baseline+native_regexp. (satoru)
+            int jl = KuronoShell::GetFirefoxJit();
+            if (jl >= 1) {
+                const char* j1 = "lockPref(\"javascript.options.blinterp\", true);\n";
+                for (const char* s = j1; *s && o < (int)sizeof(cfgbuf) - 1; s++) cfgbuf[o++] = *s;
+            }
+            if (jl >= 2) {
+                const char* j2 =
+                    "lockPref(\"javascript.options.baselinejit\", true);\n"
+                    "lockPref(\"javascript.options.native_regexp\", true);\n";
+                for (const char* s = j2; *s && o < (int)sizeof(cfgbuf) - 1; s++) cfgbuf[o++] = *s;
+            }
+            cfgbuf[o] = 0;
+            KVFS::WriteFile("/apps/firefox/firefox.cfg", cfgbuf, (uint32_t)o);
+            if (jl > 0) {
+                SerialLogger::Log("[ffcfg] jit level=");
+                SerialLogger::LogDec(jl);
+                SerialLogger::Log(" (blinterp");
+                if (jl >= 2) SerialLogger::Log("+baseline+regexp");
+                SerialLogger::Log(")\r\n");
+            }
+        }
         SerialLogger::Log("[ffcfg] wrote autoconfig (all helper child procs disabled)\r\n");
     }
 
@@ -2627,6 +3107,8 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         // to the binary at the gre dir, system lib closure under lib/. (satoru)
         "LD_LIBRARY_PATH=/apps/firefox:/apps/firefox/lib:/system/lib:/system/lib/kurono:/apps/lib",
         "XDG_RUNTIME_DIR=/system/run/user/1000",
+        // gio finds the mime database written above under <dir>/mime.
+        "XDG_DATA_DIRS=/apps/firefox/share",
         "WAYLAND_DISPLAY=wayland-0",
         // xkbcommon data root: we unpacked the xkeyboard-config tree here above,
         // so gdk builds its default keymap instead of aborting at seat init. (satoru)
@@ -2721,9 +3203,11 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     };
 
     uint64_t entry = 0, rsp = 0;
+    SerialLogger::Log("[fftl] exec start (ExecPIE)\r\n");
     bool ok = LdKurono::ExecPIE(proc, image, (uint64_t)fsz, "/apps/firefox/firefox",
                                 av, envp, 1000, 1000, &entry, &rsp);
     KernelHeap::Free(image);
+    SerialLogger::Log(ok ? "[fftl] exec ExecPIE done ok\r\n" : "[fftl] exec ExecPIE FAILED\r\n");
     if (!ok) {
         p = sappend(out, p, mx, "firefox: ld-kurono ExecPIE failed (see serial for which lib/reloc).\n");
         Scheduler::DestroyProcess(proc);

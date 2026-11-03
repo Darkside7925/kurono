@@ -148,7 +148,7 @@ struct KVFSFileDesc {
     bool open;
 };
 
-#define KVFS_MAX_FDS 64
+#define KVFS_MAX_FDS 1024   // global open-file table (was 64: tool-running sessions leaked it dry) (satoru)
 
 enum KVFSError {
     KVFS_OK = 0,
@@ -198,6 +198,11 @@ public:
     // file operations
     static int CreateFile(const char* path, uint16_t mode = 0644);
     static int WriteFile(const char* path, const void* data, uint32_t len);
+    // point a file at read-only data that outlives it (an embedded kernel blob)
+    // instead of copying it onto the heap. content_capacity 0 marks it borrowed:
+    // every write path already reallocates when capacity is short, so the first
+    // write copies it out, and Free() ignores the non-heap pointer. (satoru)
+    static int WriteFileStatic(const char* path, const void* data, uint32_t len);
     static int AppendFile(const char* path, const void* data, uint32_t len);
     static int ReadFile(const char* path, void* buf, uint32_t max_len);
     static int Unlink(const char* path);

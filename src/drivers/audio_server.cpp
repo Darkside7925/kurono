@@ -3,10 +3,23 @@
 #include "audio_dma.h"
 #include "audio_mixer.h"
 #include "audio_backend.h"
+#include "usb_audio.h"
 #include "serial.h"
+#include "timer.h"
 #include "../kernel/types.h"
+#include "../proc/spinlock.h"
 
 namespace AudioServer {
+
+// the audio pump lock: serializes the mixer/backend pump against stream
+// writes arriving from linux syscall contexts on other cpus (the pulse
+// server's on_data runs in the CLIENT's syscall context - unlocked mixer
+// ring updates from two cpus tore rd/wr/count and clicked). all the public
+// stream entry points below take it; the pit backup pump try-locks it. (satoru)
+static Spinlock g_pump_lock;
+// last successful pump timestamp - the pit backup fires when this goes
+// stale (audio process starved by userland threads). (satoru)
+static volatile uint32_t g_last_pump_ms = 0;
 
 // Backend registry.  Backends register a static instance via
 // RegisterBackend() before AudioServer::Init() runs (called from each
@@ -17,10 +30,24 @@ static AudioBackend* g_backends[kMaxBackends] = {};
 static int           g_backend_count          = 0;
 static AudioBackend* g_active                  = nullptr;
 static uint64_t      g_periods_submitted       = 0;
+static bool          g_idle_pending            = false;   // backend still blanking its ring (satoru)
+static bool          g_idle_first              = true;
+static uint32_t      g_stat_prev_ms            = 0;   // last pump time with streams live (satoru)
+static uint32_t      g_stat_max_gap            = 0;
+static uint32_t      g_stat_calls              = 0;
+
+// pump cadence since the last call: how many pumps ran and the longest gap between two
+// of them while a stream was open. read-and-reset. (satoru)
+void PumpStats(uint32_t* calls, uint32_t* max_gap_ms) {
+    if (calls) *calls = g_stat_calls;
+    if (max_gap_ms) *max_gap_ms = g_stat_max_gap;
+    g_stat_calls = 0; g_stat_max_gap = 0; g_stat_prev_ms = 0;
+}
 
 // Stable priority by name - earlier in the list wins.
 static int BackendPriority(const char* name) {
     if (!name) return 99;
+    if (name[0] == 'u' && name[1] == 's' && name[2] == 'b') return -1;   // a plugged usb dac wins over hda (satoru)
     if (name[0] == 'h' && name[1] == 'd' && name[2] == 'a') return 0;
     if (name[0] == 'a' && name[1] == 'c' && name[2] == '9') return 1;
     if (name[0] == 's' && name[1] == 'b' && name[2] == '1') return 2;
@@ -38,6 +65,42 @@ void RegisterBackend(AudioBackend* be) {
 }
 
 AudioBackend* ActiveBackend() { return g_active; }
+
+// a backend that was just switched away from keeps getting Idle() calls until it has
+// blanked its ring, so it does not replay stale audio when it is selected again (satoru)
+static AudioBackend* g_scrub_be    = nullptr;
+static bool          g_scrub_first = false;
+
+static bool name_eq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+AudioBackend* FindBackend(const char* name) {
+    for (int i = 0; i < g_backend_count; i++) if (name_eq(g_backends[i]->Name(), name)) return g_backends[i];
+    return nullptr;
+}
+
+// make `name` the active backend at run time (audio use, usb hotplug). the new
+// backend is brought up first, outside the pump lock (usb needs control transfers);
+// the swap itself is under the lock. the old backend stays initialised. (satoru)
+bool UseBackend(const char* name) {
+    AudioBackend* nb = FindBackend(name);
+    if (!nb) return false;
+    if (!nb->IsReady()) {
+        if (!nb->Init() || !nb->IsReady()) {
+            SerialLogger::Log("[AudioServer] UseBackend: "); SerialLogger::Log(name); SerialLogger::Log(" not usable\r\n");
+            return false;
+        }
+    }
+    SpinLockCpuGuard guard(g_pump_lock);
+    AudioBackend* old = g_active;
+    if (old == nb) return true;
+    g_active = nb;
+    g_idle_pending = false; g_idle_first = true;
+    if (old && old->IsReady()) { g_scrub_be = old; g_scrub_first = true; }
+    SerialLogger::Log("[AudioServer] Active backend now: "); SerialLogger::Log(nb->Name()); SerialLogger::Log("\r\n");
+    return true;
+}
 const char* ActiveBackendName() { return g_active ? g_active->Name() : "(none)"; }
 
 void Init() {
@@ -71,19 +134,46 @@ void Init() {
             SerialLogger::Log(" @ ");
             SerialLogger::LogDec((int)be->SampleRate());
             SerialLogger::Log(" Hz\r\n");
+            UsbAudio::NoteAudioUp();
             return;
         }
     }
+    UsbAudio::NoteAudioUp();
     SerialLogger::Log("[AudioServer] No usable audio backend!\r\n");
 }
 
 void Tick() {
     if (!g_active) return;
+    if (g_scrub_be) {
+        bool more = g_scrub_be->Idle(g_scrub_first);
+        g_scrub_first = false;
+        if (!more) g_scrub_be = nullptr;
+    }
     // nothing playing -> touch NO audio hardware. polling the backend's status
     // / DMA-position registers on every 10ms tick while silent was pure VM-exit
     // overhead on VMware (each in/out traps). the DMA engine idles fine and the
     // next OpenStream re-kicks it. (satoru)
-    if (AudioMixer::ActiveStreamCount() == 0) return;
+    if (AudioMixer::ActiveStreamCount() == 0) {
+        g_stat_prev_ms = 0;
+        // streams just ended: let a cyclic-dma backend blank its ring (a bounded
+        // number of ticks) instead of replaying the last ~0.7 s forever. (satoru)
+        if (g_idle_pending) {
+            g_idle_pending = g_active->Idle(g_idle_first);
+            g_idle_first = false;
+        }
+        return;
+    }
+    g_idle_pending = true;
+    g_idle_first = true;
+    {   // pump cadence stats (calls + longest gap while streams were live) for the audiotest gate (satoru)
+        uint32_t nowp = Timer::GetRealMs();
+        if (g_stat_prev_ms) {
+            uint32_t gap = nowp - g_stat_prev_ms;
+            if (gap > g_stat_max_gap) g_stat_max_gap = gap;
+        }
+        g_stat_prev_ms = nowp;
+        g_stat_calls++;
+    }
     // refresh the backend's hardware queue depth + run codec housekeeping
     // ONCE here (a single I/O-port read), then mix against a LOCAL estimate so
     // the loop does zero further port I/O. reading the hardware queue on every
@@ -91,20 +181,40 @@ void Tick() {
     // cpu from the gui/input tiers and caused microstutter. (satoru)
     g_active->Tick();
     uint32_t q = g_active->QueuedFrames();
-    // keep ~10 periods (~213ms @ 1024 frames/48khz) buffered to ride out
-    // cooperative-scheduler gaps - a slow gui/network frame can stall this pump
-    // for tens of ms, and a shallower ring could drain the dma before the next
-    // refill, producing a crackle. 10 periods rides out a bigger single-core
-    // stall (the residual per-video glitch) for only ~43ms more latency than 8;
-    // the per-tick cap of 20 lets one stall be made up in a single pump. the
-    // mixer gate in AudioMixer::Tick() matches at PERIOD_FRAMES*10. (satoru)
+    // keep ~6 periods (~128ms) buffered. the pit backup pump (TickFromTimer)
+    // makes long pump gaps structurally impossible, so the old 10-period
+    // anti-starvation cushion shrinks to a tighter a/v-sync depth with the
+    // same underrun safety. matches the gate in AudioMixer::Tick(). (satoru)
     for (int i = 0; i < 20; i++) {
-        if (q >= AudioMixer::PERIOD_FRAMES * 10) break;
+        if (q >= AudioMixer::PERIOD_FRAMES * 6) break;
         uint32_t produced = AudioMixer::Tick();
         if (produced == 0) break;
         g_periods_submitted++;
         q += AudioMixer::PERIOD_FRAMES;   // Submit() queued ~one more period
     }
+    g_last_pump_ms = Timer::GetRealMs();
+}
+
+void LockedTick() {
+    SpinLockCpuGuard guard(g_pump_lock);
+    Tick();
+}
+
+// expose the pump lock so pulse's pacing pass (bsp audio process) can make
+// its per-stream check + stats read + request accounting atomic vs stream
+// create/close arriving in client syscall context on other cpus. (satoru)
+Spinlock& PumpLock() { return g_pump_lock; }
+
+void TickFromTimer() {
+    // intentionally a no-op: running the mixer pump from the irq0 tick with
+    // interrupts disabled destabilized firefox startup timing. kept as a
+    // symbol so the scheduler call site + header stay stable; the audio
+    // process pump is the sole pump now. (satoru)
+}
+
+void PauseStream(AudioMixer::StreamID id, bool paused) {
+    SpinLockCpuGuard guard(g_pump_lock);
+    AudioMixer::SetPaused(id, paused);
 }
 
 // ---- one-shot tone synthesis ----
@@ -188,11 +298,11 @@ void PlayTone(int freq_hz, int duration_ms, int vol) {
             chunk[i] = (int16_t)((s * env) >> 15);
             phase += phase_inc;
         }
-        AudioMixer::Write(id, chunk, this_chunk);
+        WriteStream(id, chunk, this_chunk);
         emitted   += this_chunk;
         remaining -= this_chunk;
     }
-    AudioMixer::Drain(id);
+    DrainStream(id);
 }
 
 void Beep() { PlayTone(880, 60, 60); }
@@ -214,13 +324,13 @@ namespace AudioServer {
 bool PlayPCM(const void* pcm, uint32_t bytes,
              AudioFormat::SampleFormat fmt, uint32_t rate, int channels) {
     if (!pcm || bytes == 0) return false;
-    AudioMixer::StreamID id = AudioMixer::Open("pcm", fmt, rate, channels);
+    AudioMixer::StreamID id = OpenStream("pcm", fmt, rate, channels);
     if (id == AudioMixer::INVALID_STREAM) return false;
     uint32_t frame_bytes = AudioFormat::FrameSize(fmt, channels);
-    if (frame_bytes == 0) { AudioMixer::Close(id); return false; }
+    if (frame_bytes == 0) { CloseStream(id); return false; }
     uint32_t frames = bytes / frame_bytes;
-    AudioMixer::Write(id, pcm, frames);
-    AudioMixer::Drain(id);
+    WriteStream(id, pcm, frames);
+    DrainStream(id);
     return true;
 }
 
@@ -233,16 +343,27 @@ bool PlayBuffer(const int16_t* pcm, size_t samples,
     return PlayPCM(pcm, bytes, AudioFormat::FMT_S16_LE, sampleRate, (int)channels);
 }
 
+// every stream entry point serializes against the pump: pulse writes arrive
+// in the client's syscall context on ANY cpu, and unlocked ring updates
+// racing the mixer tick tore rd/wr/count (audible clicks + lost audio). (satoru)
 AudioMixer::StreamID OpenStream(const char* name,
                                 AudioFormat::SampleFormat fmt,
                                 uint32_t rate, int channels) {
+    SpinLockCpuGuard guard(g_pump_lock);
     return AudioMixer::Open(name, fmt, rate, channels);
 }
 uint32_t WriteStream(AudioMixer::StreamID id, const void* src, uint32_t frames) {
+    SpinLockCpuGuard guard(g_pump_lock);
     return AudioMixer::Write(id, src, frames);
 }
-void CloseStream(AudioMixer::StreamID id) { AudioMixer::Close(id); }
-void DrainStream(AudioMixer::StreamID id) { AudioMixer::Drain(id); }
+void CloseStream(AudioMixer::StreamID id) {
+    SpinLockCpuGuard guard(g_pump_lock);
+    AudioMixer::Close(id);
+}
+void DrainStream(AudioMixer::StreamID id) {
+    SpinLockCpuGuard guard(g_pump_lock);
+    AudioMixer::Drain(id);
+}
 
 ServerStatus GetStatus() {
     ServerStatus s{};

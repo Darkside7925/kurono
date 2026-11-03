@@ -7,8 +7,10 @@
 // static member definitions
 uint64_t* PMM::bitmap       = nullptr;
 uint16_t* PMM::refs         = nullptr;
+uint8_t*  PMM::mapped_bits  = nullptr;   // task 26: 1 bit/frame - a USER leaf pte points here (satoru)
 uint64_t  PMM::bitmap_size  = 0;
 uint64_t  PMM::total_frames = 0;
+uint64_t  PMM::usable_frames = 0;
 uint64_t  PMM::used_frames  = 0;
 uint64_t  PMM::search_hint  = 0;
 
@@ -108,12 +110,51 @@ uint64_t PMM::FindFreeFrame() {
     return ~0ULL;
 }
 
+// task 26 free-while-mapped guard: a frame with a live USER leaf pte must never
+// be re-handed by the allocator - that is the proven crossbeam stack corruptor
+// (a live parked stack's frame freed-while-mapped, recycled as another thread's
+// stack; both push through their own ptes into one page). set/cleared by the
+// vmm leaf writers; checked at alloc. (satoru)
+void PMM::MarkFrameMapped(uint64_t phys_addr, bool m) {
+    if (!mapped_bits) return;
+    uint64_t idx = phys_addr / PAGE_SIZE;
+    if (idx >= total_frames) return;
+    if (m) __atomic_fetch_or (&mapped_bits[idx >> 3], (uint8_t)(1u << (idx & 7)), __ATOMIC_RELAXED);
+    else   __atomic_fetch_and(&mapped_bits[idx >> 3], (uint8_t)~(1u << (idx & 7)), __ATOMIC_RELAXED);
+}
+bool PMM::IsFrameMapped(uint64_t phys_addr) {
+    if (!mapped_bits) return false;
+    uint64_t idx = phys_addr / PAGE_SIZE;
+    if (idx >= total_frames) return false;
+    return (mapped_bits[idx >> 3] >> (idx & 7)) & 1;
+}
+
 uint64_t PMM::AllocFrame() {
     PmmIrqGuard _g;
-    uint64_t idx = FindFreeFrame();
-    if (idx == ~0ULL) {
-        SerialLogger::Log("PMM: OUT OF MEMORY!\r\n");
-        return 0;
+    // task 26: refuse to hand out a frame that still has a live USER leaf pte
+    // pointing at it (a free-while-mapped escaped into the free pool). log the
+    // event - it names the guilty free path - leak the flagged frame, and pick
+    // another. bounded retries; the leak is 4k per real event. (satoru)
+    uint64_t idx;
+    for (int tries = 0; ; tries++) {
+        idx = FindFreeFrame();
+        if (idx == ~0ULL) {
+            SerialLogger::Log("PMM: OUT OF MEMORY!\r\n");
+            return 0;
+        }
+        if (!mapped_bits || tries >= 8 ||
+            !((mapped_bits[idx >> 3] >> (idx & 7)) & 1)) break;
+        static uint32_t s_dbl_logs = 0;
+        if (s_dbl_logs < 8) {
+            s_dbl_logs++;
+            SerialLogger::Log("[DBLMAP] phys=");
+            SerialLogger::LogHex64(idx * PAGE_SIZE);
+            SerialLogger::Log(" refct=");
+            SerialLogger::LogDec((int)refs[idx]);
+            SerialLogger::Log(" free-while-mapped frame quarantined\r\n");
+        }
+        SetFrame(idx);   // leak it: mark used, never hand out (satoru)
+        used_frames++;
     }
     SetFrame(idx);
     refs[idx] = 1;
@@ -337,8 +378,12 @@ void PMM::Init(multiboot_info_t* mbi) {
 
         while (offset < mmap_end) {
             MultibootMmapEntry* entry = (MultibootMmapEntry*)(uintptr_t)offset;
+            // size the bitmap from usable ram only. reserved entries (bios,
+            // pci hole, qemu's ~1tb hypertransport range on amd hosts) used to
+            // push max_addr straight to the 16gb cap on every machine, so the
+            // os thought it had 16gb and paid 8mb of refcounts for it. (satoru)
             uint64_t region_end = entry->base_addr + entry->length;
-            if (region_end > max_addr) max_addr = region_end;
+            if (entry->type == 1 && region_end > max_addr) max_addr = region_end;
             offset += entry->size + 4;
         }
     } else if (mbi->flags & (1 << 0)) {
@@ -375,6 +420,13 @@ void PMM::Init(multiboot_info_t* mbi) {
     uint8_t*  rp   = (uint8_t*)refs;
     for (uint64_t i = rq << 3; i < refs_bytes; i++) rp[i] = 0;
 
+    // task 26 free-while-mapped guard: the mapped bit array lives right after
+    // refs; its frames are reserved with the refs reservation below (the loop
+    // rounds refs_end up to mapped_end). (satoru)
+    mapped_bits = (uint8_t*)refs + refs_bytes;
+    uint64_t mapped_bytes = (total_frames + 7) / 8;
+    for (uint64_t i = 0; i < mapped_bytes; i++) mapped_bits[i] = 0;
+
     SerialLogger::Log("PMM: Bitmap at 0x");
     SerialLogger::LogHex((uint64_t)bitmap);
     SerialLogger::Log(", ");
@@ -399,6 +451,7 @@ void PMM::Init(multiboot_info_t* mbi) {
                     if (idx < total_frames && TestFrame(idx)) {
                         ClearFrame(idx);
                         used_frames--;
+                        usable_frames++;
                     }
                 }
             }
@@ -411,6 +464,7 @@ void PMM::Init(multiboot_info_t* mbi) {
             if (idx < total_frames && TestFrame(idx)) {
                 ClearFrame(idx);
                 used_frames--;
+                usable_frames++;
             }
         }
     }
@@ -433,6 +487,20 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
     }
 
+    // a kernel linked high (KURONO_KERNEL_BASE) leaves 1 MiB .. kernel_start free
+    // for a fixed-address user image (claude is an ET_EXEC at 0x200000). the kernel
+    // reaches every frame through the identity map, which that user image overlays
+    // in its own page tables, so the pmm must never hand those frames out. (satoru)
+    if (kern_start_phys >= 0x4000000ULL) {
+        for (uint64_t addr = 0x100000; addr < (kern_start_phys & ~(PAGE_SIZE - 1)); addr += PAGE_SIZE) {
+            uint64_t idx = addr / PAGE_SIZE;
+            if (idx < total_frames && !TestFrame(idx)) {
+                SetFrame(idx);
+                used_frames++;
+            }
+        }
+    }
+
     uint64_t bm_start = (uint64_t)bitmap;
     uint64_t bm_end   = bm_start + bitmap_bytes;
     uint64_t refs_start = (uint64_t)refs;
@@ -445,8 +513,10 @@ void PMM::Init(multiboot_info_t* mbi) {
             used_frames++;
         }
     }
+    // reservation extended past refs to cover the mapped bit array too. (satoru)
+    uint64_t meta_end = (uint64_t)mapped_bits + (total_frames + 7) / 8;
     for (uint64_t addr = refs_start & ~(PAGE_SIZE - 1);
-         addr < refs_end; addr += PAGE_SIZE) {
+         addr < meta_end; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
         if (idx < total_frames && !TestFrame(idx)) {
             SetFrame(idx);
@@ -480,5 +550,7 @@ void PMM::Init(multiboot_info_t* mbi) {
     SerialLogger::LogHex(used_frames);
     SerialLogger::Log(" Free=");
     SerialLogger::LogHex(total_frames - used_frames);
-    SerialLogger::Log("\r\n");
+    SerialLogger::Log(" Usable=");
+    SerialLogger::LogDec((uint32_t)(usable_frames * PAGE_SIZE / (1024 * 1024)));
+    SerialLogger::Log("MB\r\n");
 }

@@ -9,6 +9,12 @@
 #include "../kernel/pmm.h"   // drag-backdrop buffer alloc/free (satoru)
 #include "kss.h"             // motion tokens + live (scriptable) accent (satoru)
 #include "ui_elements.h"     // Animation::LerpColor for the traffic-light ease (satoru)
+#include "wm_motion.h"       // spring/bezier curves + snapshot blitter (satoru)
+#include "desktop.h"         // Taskbar tile rect/colour for the motion origin (satoru)
+#include "style.h"           // modern vs classic chrome (satoru)
+#include "modern_draw.h"     // anti-aliased modern window chrome (satoru)
+#include "font.h"
+#include "app_icons.h"       // per-window app logo in the titlebar (satoru)
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define WM_LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -34,6 +40,14 @@ static int  comp_anim_duration_ms     = 180;   // open/close fade+scale, percept
 static int  comp_default_alpha        = 255;
 static bool comp_frosted_titlebar     = true;
 static bool comp_reduced_motion       = false;
+
+// window motion lengths in design-ms (see "window motion" below). (satoru)
+static const int WM_OPEN_MS  = 660;   // 40 ms tile dip + 620 ms spring settle
+static const int WM_CLOSE_MS = 340;   // inhale, fold to titlebar, pill sinks
+static const int WM_MIN_MS   = 560;   // 198 ms row stagger + 360 ms pour
+static const int WM_UNMIN_MS = 900;   // 80 ms press + 198 ms stagger + 620 ms spring
+static unsigned short wm_motion_dur(int design_ms);
+static void wm_snap_release(Window* win);
 
 // Drag throttle. Updated by ReloadFromConfig() from display.refresh_hz.
 // 0 means "no throttle"; otherwise per-frame minimum gap in ms.
@@ -234,6 +248,8 @@ void WindowManager::Init(int sw, int sh) {
         windows[i].state = WIN_CLOSED;
         windows[i].id = 0;
         windows[i].anim_kind = 0;
+        windows[i].snap_px = nullptr;
+        windows[i].catch_kind = 0;
         windows[i].had_last = false;
         windows[i].visible = false;
         windows[i].focused = false;
@@ -294,10 +310,16 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->user_data = nullptr;
     win->dirty = true;
 
-    // compositor: open-from-nothing animation, default alpha
+    // compositor: grow out of the taskbar tile, default alpha
     win->anim_kind        = comp_animations_enabled && !comp_reduced_motion ? 1 : 0;
     win->anim_start_ms    = Timer::GetRealMs();
-    win->anim_duration_ms = (unsigned short)comp_anim_duration_ms;
+    win->anim_duration_ms = wm_motion_dur(WM_OPEN_MS);
+    wm_snap_release(win);
+    win->open_ox          = -1;       // resolved from the tile on the first frame
+    win->open_oy          = -1;
+    win->open_tint        = COL_WIN_BG;
+    win->catch_kind       = 0;
+    win->catch_ms         = 0;
     win->alpha            = (unsigned char)comp_default_alpha;
     win->anchor_x         = (short)(x + w / 2);
     win->anchor_y         = (short)(screen_height - 22);
@@ -307,6 +329,7 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->last_w = w; win->last_h = h;
     win->had_last = false;
     win->monitor_id = 0;
+    win->app_icon = -1;               // derive from title unless pinned (satoru)
 
     UpdateContentArea(win);
     UpdateWindowMonitor(win);   // assign to the output under its center (satoru)
@@ -329,10 +352,11 @@ void WindowManager::CloseWindow(int id) {
         comp_anim_duration_ms > 0 && win->anim_kind != 2) {
         win->anim_kind        = 2;            // close
         win->anim_start_ms    = Timer::GetRealMs();
-        win->anim_duration_ms = (unsigned short)comp_anim_duration_ms;
+        win->anim_duration_ms = wm_motion_dur(WM_CLOSE_MS);
         return;
     }
     wm_damage_window(win);
+    wm_snap_release(win);
     win->state = WIN_CLOSED;
     win->visible = false;
     win->had_last = false;
@@ -352,6 +376,7 @@ void WindowManager::CloseAll() {
             windows[i].visible = false;
             windows[i].had_last = false;
             windows[i].anim_kind = 0;
+            wm_snap_release(&windows[i]);
         }
     }
     focused_id = -1;
@@ -381,16 +406,50 @@ void WindowManager::Minimize(int id) {
     if (!win) return;
     if (comp_animations_enabled && !comp_reduced_motion &&
         comp_anim_duration_ms > 0 && win->anim_kind != 3) {
-        // defer hide until minimize animation completes
+        // defer hide until the pour into the taskbar tile completes; the tile
+        // catches the window 300 ms in, as the first rows arrive.
+        unsigned int now = Timer::GetRealMs();
         win->anim_kind        = 3;
-        win->anim_start_ms    = Timer::GetRealMs();
-        win->anim_duration_ms = (unsigned short)comp_anim_duration_ms;
+        win->anim_start_ms    = now;
+        win->anim_duration_ms = wm_motion_dur(WM_MIN_MS);
+        win->catch_kind       = 1;
+        win->catch_ms         = now + wm_motion_dur(300);
         return;
     }
     wm_damage_window(win);
     win->state = WIN_MINIMIZED;
     win->visible = false;
     win->had_last = false;
+}
+
+void WindowManager::Unminimize(int id) {
+    Window* win = GetWindow(id);
+    if (!win) return;
+    bool animate = comp_animations_enabled && !comp_reduced_motion && comp_anim_duration_ms > 0;
+    unsigned int now = Timer::GetRealMs();
+    win->state   = WIN_NORMAL;
+    win->visible = true;
+    win->dirty   = true;
+    win->had_last = false;
+    if (animate && win->snap_px) {
+        // rise out of the tile from the snapshot minimize kept.
+        win->anim_kind        = 5;
+        win->anim_start_ms    = now;
+        win->anim_duration_ms = wm_motion_dur(WM_UNMIN_MS);
+        win->catch_kind       = 2;
+        win->catch_ms         = now;
+    } else if (animate) {
+        // minimized without a capture (animations were off): grow like an open.
+        win->anim_kind        = 1;
+        win->anim_start_ms    = now;
+        win->anim_duration_ms = wm_motion_dur(WM_OPEN_MS);
+        win->open_ox = win->open_oy = -1;
+    } else {
+        win->anim_kind = 0;
+        wm_snap_release(win);
+    }
+    UpdateContentArea(win);
+    wm_damage_window(win);
 }
 
 void WindowManager::Maximize(int id) {
@@ -977,15 +1036,28 @@ void WindowManager::RenderShadow(Window* win) {
 
 void WindowManager::RenderTitlebar(Window* win) {
     bool focused = win->focused;
-    uint32_t bg       = focused ? COL_TITLE_FOCUSED : COL_TITLE_BG;
+    // ease the titlebar color across focus changes instead of snapping - the
+    // tween engine keeps its own state per window; damage the strip while the
+    // ease runs so the partial-present path keeps painting it. (satoru)
+    uint32_t bg_target = focused ? COL_TITLE_FOCUSED : COL_TITLE_BG;
+    uint32_t bg = KSS::Anim::Color(KSS::Motion::Id((uint32_t)win->id, 0x31u),
+                                   bg_target, KSS::Motion::Micro, KSS::Motion::Std);
+    if (bg != bg_target)
+        wm_damage(win->x, win->y, win->w, WM_TITLEBAR_H + 1);
     uint32_t text_col = focused ? COL_TITLE_TEXT    : COL_TITLE_TEXT_DIM;
     int wx = win->x, wy = win->y, ww = win->w;
 
-    // titlebar background with rounded top corners
-    Graphics::FillRoundedRect(wx, wy, ww, WM_TITLEBAR_H, WM_CORNER_RADIUS, bg);
-    Graphics::FillRect(wx, wy + WM_CORNER_RADIUS, ww, WM_TITLEBAR_H - WM_CORNER_RADIUS, bg);
+    // modern: a unified titlebar - same surface as the body (already drawn by
+    // RenderWindowBody), set off by a hairline instead of a darker strip.
+    // (satoru)
+    const bool modern = UIStyle::Modern();
+    if (!modern) {
+        // titlebar background with rounded top corners
+        Graphics::FillRoundedRect(wx, wy, ww, WM_TITLEBAR_H, WM_CORNER_RADIUS, bg);
+        Graphics::FillRect(wx, wy + WM_CORNER_RADIUS, ww, WM_TITLEBAR_H - WM_CORNER_RADIUS, bg);
+    }
 
-    if (focused) {
+    if (focused && !modern) {
         for (int row = 0; row < 4; row++) {
             uint8_t a = (uint8_t)(30 - row * 6);
             if (ww > 2)
@@ -994,7 +1066,8 @@ void WindowManager::RenderTitlebar(Window* win) {
         }
     }
 
-    Graphics::FillRect(wx, wy + WM_TITLEBAR_H, ww, 1, COL_SEPARATOR);
+    if (modern) Graphics::FillRectAlpha(wx + 1, wy + WM_TITLEBAR_H, ww - 2, 1, 22, 0xFFFFFFFFu);
+    else        Graphics::FillRect(wx, wy + WM_TITLEBAR_H, ww, 1, COL_SEPARATOR);
 
     int btn_y = wy + WM_TITLEBAR_H / 2;
     const int btn_r = 6;
@@ -1022,7 +1095,8 @@ void WindowManager::RenderTitlebar(Window* win) {
                                                  : base[i], KSS::Motion::Micro, KSS::Motion::Std);
             int r = btn_r + (int)(lift * 2.0f + 0.5f);
             if (pressing && hov) r -= 1;            // tactile press-dip (satoru)
-            Graphics::FillCircle(cx[i], btn_y, r, fill);
+            if (modern) MDraw::Circle(cx[i], btn_y, r, fill, focused ? 255 : 110);
+            else        Graphics::FillCircle(cx[i], btn_y, r, fill);
             // a button is still in motion until its lift settles to fully on/off;
             // that's the cheap per-frame "is the hover ease running" signal. (satoru)
             if ((hov && lift < 0.999f) || (!hov && lift > 0.001f)) moving = true;
@@ -1065,12 +1139,24 @@ void WindowManager::RenderTitlebar(Window* win) {
         } else if (len > max_chars) {
             len = max_chars;
         }
-        int title_w = len * 8;
-        int title_x = title_area_start + (title_area_end - title_area_start - title_w) / 2;
+        // modern: semibold title centred on the whole window (as on macos),
+        // measured with the real font; classic keeps the 8px grid. (satoru)
+        int title_w = modern ? FontTTF::MeasureText(15.0f, draw, true) : len * 8;
+        int title_x = modern ? wx + (ww - title_w) / 2
+                             : title_area_start + (title_area_end - title_area_start - title_w) / 2;
         if (title_x < title_area_start) title_x = title_area_start;
         Graphics::PushClipRect(title_area_start, wy,
                               title_area_end - title_area_start, WM_TITLEBAR_H);
-        Graphics::DrawString(title_x, wy + (WM_TITLEBAR_H - 12) / 2, draw, text_col, 0x00000000);
+        // app logo just left of the title: pinned id first (wayland set_app_id),
+        // else derived from the title text; skip the generic placeholder so
+        // plain windows stay clean. (satoru)
+        int gid = (win->app_icon >= 0) ? win->app_icon
+                                       : AppIcons::IdForName(win->title);
+        if (gid != AppIcons::GENERIC && title_x - 22 >= title_area_start) {
+            AppIcons::Draw(gid, title_x - 22, wy + (WM_TITLEBAR_H - 16) / 2, 16);
+        }
+        if (modern) FontTTF::DrawText(title_x, wy + (WM_TITLEBAR_H - 18) / 2, 15.0f, draw, text_col, true);
+        else        Graphics::DrawString(title_x, wy + (WM_TITLEBAR_H - 12) / 2, draw, text_col, 0x00000000);
         Graphics::PopClipRect();
     }
 
@@ -1082,6 +1168,65 @@ void WindowManager::RenderTitlebar(Window* win) {
 // Compute the animation phase (0..256, fixed-point Q8) for a window.
 // Returns 256 (= 1.0) if no animation is active or animation has
 // completed.  Used by Render() to drive the per-window post-pass.
+// ── window motion (designs: "Kurono motion drafts") ─────────────────
+// all times below are design-milliseconds at the default 180 ms animation
+// speed setting; compositor.animation_speed_ms scales them proportionally.
+// (satoru)
+static int wm_speed_q8() {
+    int s = (comp_anim_duration_ms * 256) / 180;
+    if (s < 64) s = 64;
+    if (s > 1024) s = 1024;
+    return s;
+}
+
+static unsigned short wm_motion_dur(int design_ms) {
+    return (unsigned short)((design_ms * wm_speed_q8()) / 256);
+}
+
+// elapsed design-ms since the window's animation started.
+static int wm_motion_t(const Window* win, unsigned int now) {
+    return (int)(((long long)(now - win->anim_start_ms) * 256) / wm_speed_q8());
+}
+
+static WMMotion::Snapshot wm_snap(const Window* win) {
+    WMMotion::Snapshot s;
+    s.px = win->snap_px; s.w = win->snap_w; s.h = win->snap_h;
+    return s;
+}
+
+static void wm_snap_release(Window* win) {
+    WMMotion::Snapshot s = wm_snap(win);
+    WMMotion::Release(s);
+    win->snap_px = nullptr; win->snap_w = win->snap_h = 0;
+}
+
+// capture the window as just drawn into the frame being composed.
+static void wm_snap_capture(Window* win) {
+    WMMotion::Snapshot s = wm_snap(win);
+    WMMotion::Capture(s, win->x, win->y, win->w, win->h, WM_CORNER_RADIUS);
+    win->snap_px = s.px; win->snap_w = s.w; win->snap_h = s.h;
+}
+
+// the window's taskbar tile centre + size; falls back to the bottom edge under
+// the window if it has no button showing.
+static void wm_tile_target(const Window* win, int scr_h, int& cx, int& cy, int& tw, int& th) {
+    int tx, ty;
+    if (Taskbar::WindowTileRect(win->id, tx, ty, tw, th)) {
+        cx = tx + tw / 2; cy = ty + th / 2;
+    } else {
+        tw = 28; th = 24;
+        cx = win->x + win->w / 2; cy = scr_h - 22;
+    }
+}
+
+static void wm_damage_union(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+    int x0 = ax < bx ? ax : bx, y0 = ay < by ? ay : by;
+    int x1 = ax + aw > bx + bw ? ax + aw : bx + bw;
+    int y1 = ay + ah > by + bh ? ay + ah : by + bh;
+    const int m = WM_SHADOW_SIZE + 12;
+    wm_damage(x0 - m, y0 - m, (x1 - x0) + 2 * m, (y1 - y0) + 2 * m);
+}
+
 static int wm_anim_phase_q8(const Window* win, unsigned int now) {
     if (win->anim_kind == 0 || win->anim_duration_ms == 0) return 256;
     unsigned int elapsed = now - win->anim_start_ms;
@@ -1100,42 +1245,6 @@ static int wm_ease_q8(int p_q8) {
     int v = 256 - inv3;
     if (v < 0) v = 0; else if (v > 256) v = 256;
     return v;
-}
-
-// open/close scale: draw the window CHROME (rounded body + titlebar strip +
-// border) scaled toward its own center by factor s_q8 (Q8, 0..256). content
-// callbacks draw at fixed coords so they're skipped while scaling - the body
-// snaps to full size + real content the instant the phase completes, which is
-// the cheap-but-honest "pop / zoom" the task asks for (fade is layered on top
-// by the caller's dim overlay). returns the scaled rect via out_* so the caller
-// can fade exactly that footprint. (satoru)
-static void wm_render_scaled_chrome(const Window* win, int s_q8, bool focused,
-                                    int& ox, int& oy, int& ow, int& oh) {
-    if (s_q8 < 24)  s_q8 = 24;            // floor so a closing/opening win is still visible
-    if (s_q8 > 256) s_q8 = 256;
-    int cx = win->x + win->w / 2;
-    int cy = win->y + win->h / 2;
-    int sw = (win->w * s_q8) >> 8;
-    int sh = (win->h * s_q8) >> 8;
-    if (sw < 8) sw = 8;
-    if (sh < 8) sh = 8;
-    int sx = cx - sw / 2;
-    int sy = cy - sh / 2;
-    // proportionally smaller corner radius so the rounding reads right at scale.
-    int r = (WM_CORNER_RADIUS * s_q8) >> 8;
-    if (r < 2) r = 2;
-    uint32_t border = focused ? wm_get_accent() : COL_BORDER;
-    Graphics::FillRoundedRect(sx, sy, sw, sh, r, win->bg_color);
-    // a thin titlebar-coloured strip across the top so the scaled card reads as a
-    // window, not a plain box. (satoru)
-    if (win->has_titlebar) {
-        int tb = (WM_TITLEBAR_H * s_q8) >> 8;
-        if (tb < 4) tb = 4;
-        if (tb > sh) tb = sh;
-        Graphics::FillRoundedRect(sx, sy, sw, tb, r, COL_TITLE_BG);
-    }
-    Graphics::DrawRect(sx, sy, sw, sh, border);
-    ox = sx; oy = sy; ow = sw; oh = sh;
 }
 
 void WindowManager::Render() {
@@ -1230,25 +1339,35 @@ void WindowManager::Render() {
         int p_vis = (kind == 2 || kind == 3) ? (256 - p) : p;
         if (kind == 0) p_vis = 256;
 
-        // For minimize/restore we draw a shrinking outline that
-        // travels toward the taskbar anchor instead of rendering the
-        // full window content.  This is the cheap-but-honest way to
-        // give a "fly to taskbar" effect without a real per-window
-        // framebuffer.
-        if (WM_UNLIKELY(kind == 3 && p_raw < 256)) {
-            int q = 256 - p;                       // 256..0
-            int ax = win->x + win->w / 2, ay = screen_height - 22;  // live anchor, not stale create-time (satoru)
-            int rx = win->x + ((ax - win->x) * (256 - q)) / 256;
-            int ry = win->y + ((ay - win->y) * (256 - q)) / 256;
-            int rw = (win->w * q) / 256;
-            int rh = (win->h * q) / 256;
-            if (rw < 4)  rw = 4;
-            if (rh < 4)  rh = 4;
-            unsigned int outline = 0xFF000000u | (win->focused ? 0x6C8CFFu : 0x303050u);
-            Graphics::DrawRect(rx, ry, rw, rh, outline);
-            unsigned int fa = (unsigned int)(p_vis / 4);  // 0..64
-            Graphics::FillRectAlpha(rx + 1, ry + 1, rw - 2, rh - 2, (uint8_t)fa, 0xFF101020u);
-            wm_damage(rx, ry, rw, rh);
+        // window motion. minimize (3) and unminimize (5) pour into and out of
+        // the taskbar tile, so RenderMotionOverlay() draws them after the
+        // taskbar; here minimize only captures its snapshot on the first
+        // frame (that frame still shows the whole window). (satoru)
+        if (WM_UNLIKELY((kind == 3 || kind == 5) && p_raw < 256)) {
+            if (kind == 3 && !win->snap_px) {
+                RenderWindowBody(win, (!dragging || comp_shadow_during_drag));
+                wm_snap_capture(win);
+            }
+            wm_damage(win->x - WM_SHADOW_SIZE, win->y - WM_SHADOW_SIZE,
+                      win->w + 2*WM_SHADOW_SIZE, win->h + 2*WM_SHADOW_SIZE);
+            win->dirty = false;
+            continue;
+        }
+        if (WM_UNLIKELY(kind == 1 && p_raw < 256)) {
+            RenderOpenMotion(win, wm_motion_t(win, now));
+            win->dirty = false;
+            continue;
+        }
+        if (WM_UNLIKELY(kind == 2 && p_raw < 256)) {
+            if (!win->snap_px) {
+                // first close frame: draw the window as it stands and keep it.
+                RenderWindowBody(win, (!dragging || comp_shadow_during_drag));
+                wm_snap_capture(win);
+                wm_damage(win->x - WM_SHADOW_SIZE, win->y - WM_SHADOW_SIZE,
+                          win->w + 2*WM_SHADOW_SIZE, win->h + 2*WM_SHADOW_SIZE);
+            } else {
+                RenderCloseMotion(win, wm_motion_t(win, now));
+            }
             win->dirty = false;
             continue;
         }
@@ -1264,32 +1383,6 @@ void WindowManager::Render() {
             unsigned int outline = 0xFF6C8CFFu;
             Graphics::DrawRect(rx, ry, rw, rh, outline);
             wm_damage(rx, ry, rw, rh);
-            win->dirty = false;
-            continue;
-        }
-
-        // ── open/close fade+scale ────────────────────────────────────
-        // while an OPEN (1) or CLOSE (2) animation is in flight we draw a
-        // scaled chrome card (grow on open, shrink on close) toward the
-        // window center and fade it, instead of the full body. this is the
-        // visible "pop/zoom" half of the kss motion combo; the body snaps to
-        // full size + live content at phase end. minimize/restore already have
-        // their own fly-to-taskbar paths above, so they never reach here. (satoru)
-        if (WM_UNLIKELY((kind == 1 || kind == 2) && p_raw < 256)) {
-            // scale: open 0.78 -> 1.00 (p_vis 0..256), close 1.00 -> 0.78.
-            // map p_vis (256=full) to s_q8 in [200, 256]. (satoru)
-            int s_q8 = 200 + (p_vis * 56) / 256;
-            int sx, sy, sw, sh;
-            wm_render_scaled_chrome(win, s_q8, win->focused, sx, sy, sw, sh);
-            int combined = (int)win->alpha * p_vis / 256;
-            if (combined < 255) {
-                unsigned int dim = (unsigned int)(255 - combined);
-                if (kind == 1 && dim > 110) dim = 110;   // never start fully black
-                Graphics::FillRectAlpha(sx, sy, sw, sh, (uint8_t)dim, 0xFF000000u);
-            }
-            // keep repainting the scaled footprint (plus a margin) until done.
-            wm_damage(win->x - WM_SHADOW_SIZE, win->y - WM_SHADOW_SIZE,
-                      win->w + 2*WM_SHADOW_SIZE, win->h + 2*WM_SHADOW_SIZE);
             win->dirty = false;
             continue;
         }
@@ -1344,14 +1437,21 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
         wm_damage(win->x + win->w - 1, win->y, 1, win->h);
     }
 
-    // full body background with rounded corners
-    Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color);
+    // full body background with rounded corners (anti-aliased in modern)
+    if (UIStyle::Modern())
+        MDraw::RoundRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color, 255);
+    else
+        Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color);
 
     // titlebar (draws over the top portion)
     if (win->has_titlebar) RenderTitlebar(win);
 
-    // subtle border
-    Graphics::DrawRect(win->x, win->y, win->w, win->h, border);
+    // border: a faint hairline in modern (focus reads from the traffic lights
+    // and shadow), the accent outline in classic.
+    if (UIStyle::Modern())
+        MDraw::RoundOutline(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, 0xFFFFFFFFu, win->focused ? 46 : 26);
+    else
+        Graphics::DrawRect(win->x, win->y, win->w, win->h, border);
 
     // content (clipped to content area so text doesn't bleed outside when the
     // user shrinks the window below the content's natural size)
@@ -1834,11 +1934,265 @@ bool WindowManager::HasActiveAnimations() {
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         const Window* w = &windows[i];
         if (w->state == WIN_CLOSED) continue;
+        // a taskbar tile catch outlives the minimize that triggered it.
+        if (w->catch_kind && (int)(now - w->catch_ms) < (int)wm_motion_dur(520)) return true;
         if (w->anim_kind == 0) continue;
         if (w->anim_duration_ms == 0) continue;
         if ((now - w->anim_start_ms) < w->anim_duration_ms) return true;
     }
     return false;
+}
+
+// ── window motion renderers ─────────────────────────────────────────
+using WMMotion::Lerp;
+using WMMotion::Bezier;
+
+// open: the taskbar tile becomes the window. four independent springs drive
+// the rect (y lags x, so it arcs up out of the taskbar; width and height each
+// overshoot once), the tile's colour hands off to the window's, and the real
+// titlebar and content fade in at full size, clipped to the growing rect, so
+// nothing is resampled. (satoru)
+void WindowManager::RenderOpenMotion(Window* win, int t) {
+    const int fx = win->x, fy = win->y, fw = win->w, fh = win->h;
+    if (win->open_ox < 0) {
+        int cx, cy, tw, th;
+        wm_tile_target(win, screen_height, cx, cy, tw, th);
+        win->open_ox   = (short)cx;
+        win->open_oy   = (short)cy;
+        win->open_tint = Taskbar::WindowTileColor(win->title);
+    }
+    const int ts = t - 40;                     // the tile dips first
+    int qx = WMMotion::Spring(WMMotion::SPRING_OPEN_X, ts, 620);
+    int qy = WMMotion::Spring(WMMotion::SPRING_OPEN_Y, ts, 620);
+    int qw = WMMotion::Spring(WMMotion::SPRING_OPEN_W, ts, 620);
+    int qh = WMMotion::Spring(WMMotion::SPRING_OPEN_H, ts, 620);
+    int cw = Lerp(28, fw, qw), ch = Lerp(24, fh, qh);
+    if (cw < 4) cw = 4;
+    if (ch < 4) ch = 4;
+    int rx = Lerp(win->open_ox, fx + fw / 2, qx) - cw / 2;
+    int ry = Lerp(win->open_oy, fy + fh / 2, qy) - ch / 2;
+    int rad = Lerp(6, WM_CORNER_RADIUS, Bezier(0.0f, 0.0f, 0.58f, 1.0f, ts, 220));
+    int tint_q = Bezier(0.0f, 0.0f, 0.58f, 1.0f, t - 50, 170);
+    uint32_t body  = WMMotion::MixColor(win->open_tint, win->bg_color, tint_q);
+    uint32_t bar   = WMMotion::MixColor(win->open_tint, COL_TITLE_BG, tint_q);
+    uint32_t edge  = WMMotion::MixColor(win->open_tint, win->focused ? wm_get_accent() : COL_BORDER, tint_q);
+
+    // the shadow deepens as the window lifts away from the taskbar.
+    int lift = Bezier(0.0f, 0.0f, 0.58f, 1.0f, t - 60, 420);
+    WMMotion::FillRoundAlpha(rx - 6, ry + 4, cw + 12, ch + 14, rad + 6, 0xFF000000u, 10 + ((30 * lift) >> 12));
+    WMMotion::FillRoundAlpha(rx - 2, ry + 2, cw + 4, ch + 6, rad + 2, 0xFF000000u, 16 + ((40 * lift) >> 12));
+
+    Graphics::FillRoundedRect(rx, ry, cw, ch, rad, body);
+    if (win->has_titlebar && ch > WM_TITLEBAR_H + rad) {
+        Graphics::FillRoundedRect(rx, ry, cw, WM_TITLEBAR_H + rad, rad, bar);
+        Graphics::FillRect(rx, ry + WM_TITLEBAR_H, cw, rad, body);
+    }
+
+    // real titlebar + content, fixed at their final place, revealed by the
+    // growing rect and faded up from the surface colour.
+    int fade = Bezier(0.0f, 0.0f, 0.58f, 1.0f, t - 200, 180);
+    if (fade > 0) {
+        int veil = 255 - ((255 * fade) >> 12);
+        int ix0 = rx > fx ? rx : fx, iy0 = ry > fy ? ry : fy;
+        int ix1 = rx + cw < fx + fw ? rx + cw : fx + fw;
+        int iy1 = ry + ch < fy + fh ? ry + ch : fy + fh;
+        if (win->has_titlebar) {
+            int ty1 = fy + WM_TITLEBAR_H < iy1 ? fy + WM_TITLEBAR_H : iy1;
+            if (ix1 > ix0 && ty1 > iy0) {
+                Graphics::PushClipRect(ix0, iy0, ix1 - ix0, ty1 - iy0);
+                RenderTitlebar(win);
+                Graphics::PopClipRect();
+                if (veil > 0) Graphics::FillRectAlpha(ix0, iy0, ix1 - ix0, ty1 - iy0, (uint8_t)veil, COL_TITLE_BG);
+            }
+        }
+        if (win->render && win->content_w > 0 && win->content_h > 0) {
+            int cx0 = win->content_x > ix0 ? win->content_x : ix0;
+            int cy0 = win->content_y > iy0 ? win->content_y : iy0;
+            int cx1 = win->content_x + win->content_w < ix1 ? win->content_x + win->content_w : ix1;
+            int cy1 = win->content_y + win->content_h < iy1 ? win->content_y + win->content_h : iy1;
+            if (cx1 > cx0 && cy1 > cy0) {
+                Graphics::PushClipRect(cx0, cy0, cx1 - cx0, cy1 - cy0);
+                win->render(win, win->content_x, win->content_y, win->content_w, win->content_h);
+                Graphics::PopClipRect();
+                if (veil > 0) Graphics::FillRectAlpha(cx0, cy0, cx1 - cx0, cy1 - cy0, (uint8_t)veil, win->bg_color);
+            }
+        }
+    }
+    Graphics::DrawRect(rx, ry, cw, ch, edge);
+
+    int tcx, tcy, tw, th;
+    wm_tile_target(win, screen_height, tcx, tcy, tw, th);
+    wm_damage_union(fx, fy, fw, fh, rx, ry, cw, ch);
+    wm_damage_union(tcx - tw, tcy - th, tw * 2, th * 2, rx, ry, cw, ch);
+}
+
+// close: fold, then let go. a 1.2% inhale, the body folds up into its own
+// titlebar while the content slides up and out, then the titlebar contracts
+// to a pill and sinks away. drawn from the close-time snapshot. (satoru)
+void WindowManager::RenderCloseMotion(Window* win, int t) {
+    WMMotion::Snapshot snap = wm_snap(win);
+    const int w = snap.w, h = snap.h;
+    const int TB = win->has_titlebar ? WM_TITLEBAR_H : 0;
+    const int cx = win->x + w / 2, cy = win->y + h / 2;
+
+    int s = 4096;                                           // inhale scale, Q12
+    if (t < 70) s += (49 * Bezier(0.2f, 0.8f, 0.3f, 1.0f, t, 70)) >> 12;
+    else        s += 49 - ((49 * Bezier(0.6f, 0.0f, 0.4f, 1.0f, t - 70, 150)) >> 12);
+    int fold   = Bezier(0.7f, 0.0f, 0.25f, 1.0f, t - 60, 160);
+    int exit_q = Bezier(0.5f, 0.0f, 0.75f, 0.0f, t - 60, 110);
+    int pill_q = Bezier(0.5f, 0.0f, 0.75f, 0.0f, t - 200, 140);
+
+    int ws  = (w * s) >> 12;
+    int xs  = cx - ws / 2;
+    int ys  = cy - ((h * s) >> 13);
+    int fh  = Lerp(h, TB, fold);
+    int fhs = (fh * s) >> 12;
+    int tbs = (TB * s) >> 12;
+
+    // the shadow swells with the inhale, then collapses with the fold.
+    int shade = t < 70 ? 40 + ((20 * Bezier(0.2f, 0.8f, 0.3f, 1.0f, t, 70)) >> 12)
+                       : 60 - ((56 * Bezier(0.0f, 0.0f, 1.0f, 1.0f, t - 70, 170)) >> 12);
+    if (shade > 0 && t < 220)
+        WMMotion::FillRoundAlpha(xs - 6, ys + 6, ws + 12, fhs + 12, WM_CORNER_RADIUS + 6, 0xFF000000u, shade);
+
+    if (t < 200 || TB == 0) {
+        Graphics::FillRoundedRect(xs, ys, ws, fhs, WM_CORNER_RADIUS, win->bg_color);
+        if (TB > 0) WMMotion::Blit(snap, 0, 0, w, TB, xs, ys, ws, tbs, 255);
+        int u = (26 * exit_q) >> 12;
+        int src_y = TB + u;
+        int vis = fh - TB;
+        if (vis > h - src_y) vis = h - src_y;
+        int ca = 255 - ((255 * exit_q) >> 12);
+        if (vis > 0 && ca > 0)
+            WMMotion::Blit(snap, 0, src_y, w, vis, xs, ys + tbs, ws, (vis * s) >> 12, ca);
+    } else {
+        if (fhs > tbs) Graphics::FillRect(xs, ys + tbs, ws, fhs - tbs, win->bg_color);
+        int pw = Lerp(ws, 96, pill_q);
+        int px = cx - pw / 2;
+        int py = ys + ((10 * pill_q) >> 12);
+        int pr = Lerp(WM_CORNER_RADIUS, tbs / 2, pill_q);
+        int pa = 255 - ((255 * pill_q) >> 12);
+        WMMotion::FillRoundAlpha(px, py, pw, tbs, pr, COL_TITLE_BG, pa);
+        int text_a = 255 - ((255 * Bezier(0.0f, 0.0f, 1.0f, 1.0f, t - 200, 60)) >> 12);
+        if (text_a > pa) text_a = pa;
+        if (text_a > 0) WMMotion::Blit(snap, 0, 0, w, TB, px, py, pw, tbs, text_a);
+    }
+    wm_damage(win->x - WM_SHADOW_SIZE - 12, win->y - WM_SHADOW_SIZE - 12,
+              w + 2 * (WM_SHADOW_SIZE + 12), h + 2 * (WM_SHADOW_SIZE + 12));
+}
+
+// minimize pours the window into its taskbar tile; unminimize (rising) plays
+// the same row table backwards. the snapshot is cut into 6 px rows; each row
+// falls on one curve while narrowing toward the tile on a faster one, and the
+// rows are staggered, which bends the sides into a funnel. rising rows travel
+// on the open y-spring, so each lands with a slight overshoot. staggered rows
+// drift apart as they fall, so each row is stretched down to meet the next:
+// the window stays one continuous ribbon instead of separate slats. (satoru)
+void WindowManager::RenderPourMotion(Window* win, int t, bool rising) {
+    WMMotion::Snapshot snap = wm_snap(win);
+    const int w = snap.w, h = snap.h;
+    const int SH = 6;
+    const int MAX_ROWS = 256;
+    int n = (h + SH - 1) / SH;
+    if (n > MAX_ROWS) n = MAX_ROWS;
+    if (n < 2) n = 2;
+    int rows_sh = (h + n - 1) / n;               // source rows per strip
+    int tcx, tcy, tw, th;
+    wm_tile_target(win, screen_height, tcx, tcy, tw, th);
+    const int scx = win->x + w / 2;
+    const int fy_q12 = (th * 4096) / (h > 0 ? h : 1);       // final row squash
+
+    static int s_cx[MAX_ROWS], s_top[MAX_ROWS], s_w[MAX_ROWS], s_h[MAX_ROWS], s_a[MAX_ROWS];
+    for (int i = 0; i < n; i++) {
+        s_a[i] = -1;
+        int sy0 = i * rows_sh;
+        if (sy0 >= h) break;
+        int shi = h - sy0 < rows_sh ? h - sy0 : rows_sh;
+        int scy = win->y + sy0 + shi / 2;
+        int d = rising ? (i * 198) / (n - 1) : ((n - 1 - i) * 198) / (n - 1);
+        int dcx, dcy, dw, dh_q12, alpha;
+        if (!rising) {
+            int pi = t - d;
+            if (pi < 0) pi = 0;
+            if (pi > 360) pi = 360;
+            int fq = Bezier(0.7f, 0.0f, 0.35f, 1.0f, pi, 360);
+            int nq = Bezier(0.3f, 0.0f, 0.15f, 1.0f, pi, 360);
+            dcx = Lerp(scx, tcx, nq);
+            dcy = Lerp(scy, tcy, fq);
+            dw  = Lerp(w, tw, nq);
+            dh_q12 = shi * Lerp(4096, fy_q12, fq);
+            alpha = pi < 295 ? 255 : (255 * (360 - pi)) / 65;
+        } else {
+            int pi = t - 80 - d;
+            if (pi < 0) continue;
+            int yq = WMMotion::Spring(WMMotion::SPRING_OPEN_Y, pi, 620);
+            int wq = Bezier(0.85f, 0.0f, 0.7f, 1.0f, pi, 360);
+            dcy = Lerp(tcy, scy, yq);
+            dcx = Lerp(tcx, scx, wq);
+            dw  = Lerp(tw, w, wq);
+            dh_q12 = shi * Lerp(fy_q12, 4096, yq);
+            alpha = pi < 65 ? (255 * pi) / 65 : 255;
+        }
+        int dh = (dh_q12 + 2048) >> 12;
+        if (dh < 1) dh = 1;
+        if (dw < 1) dw = 1;
+        s_cx[i] = dcx; s_top[i] = dcy - dh / 2; s_w[i] = dw; s_h[i] = dh; s_a[i] = alpha;
+    }
+    for (int i = 0; i < n; i++) {
+        if (s_a[i] < 0) continue;
+        int sy0 = i * rows_sh;
+        int shi = h - sy0 < rows_sh ? h - sy0 : rows_sh;
+        int dh = s_h[i];
+        if (i + 1 < n && s_a[i + 1] >= 0) {
+            int gap = s_top[i + 1] - s_top[i];
+            if (gap > dh) dh = gap;
+        }
+        WMMotion::Blit(snap, 0, sy0, w, shi, s_cx[i] - s_w[i] / 2, s_top[i], s_w[i], dh, s_a[i]);
+    }
+    wm_damage_union(win->x, win->y, w, h, tcx - tw, tcy - th, tw * 2, th * 2);
+}
+
+void WindowManager::RenderMotionOverlay() {
+    unsigned int now = Timer::GetRealMs();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        Window* w = &windows[i];
+        if (w->state == WIN_CLOSED || !w->snap_px) continue;
+        if (w->anim_kind != 3 && w->anim_kind != 5) continue;
+        if ((now - w->anim_start_ms) >= w->anim_duration_ms) continue;
+        RenderPourMotion(w, wm_motion_t(w, now), w->anim_kind == 5);
+    }
+}
+
+bool WindowManager::TaskbarCatch(int win_id, int tx, int ty, int tw, int th,
+                                 int& sx_q8, int& sy_q8, int& flash) {
+    Window* w = GetWindow(win_id);
+    if (!w || !w->catch_kind) return false;
+    unsigned int now = Timer::GetRealMs();
+    int el = (int)(now - w->catch_ms);
+    if (el < 0) return false;                      // the rows have not arrived yet
+    int t = (el * 256) / wm_speed_q8();
+    flash = 0;
+    if (w->catch_kind == 1) {
+        // minimize landing: squash wide and short, then spring back.
+        if (t < 40) {
+            int q = Bezier(0.0f, 0.0f, 0.58f, 1.0f, t, 40);
+            sx_q8 = Lerp(256, 287, q); sy_q8 = Lerp(256, 215, q);
+        } else if (t < 460) {
+            int q = WMMotion::Spring(WMMotion::SPRING_ICON, t - 40, 420);
+            sx_q8 = Lerp(287, 256, q); sy_q8 = Lerp(215, 256, q);
+        } else { w->catch_kind = 0; return false; }
+        if (t >= 20 && t < 260) flash = (115 * (260 - t)) / 240;
+    } else {
+        // restore press: dip, then spring back past rest.
+        int sc;
+        if (t < 70) sc = Lerp(256, 220, Bezier(0.0f, 0.0f, 0.58f, 1.0f, t, 70));
+        else if (t < 490) sc = Lerp(220, 256, WMMotion::Spring(WMMotion::SPRING_ICON, t - 70, 420));
+        else { w->catch_kind = 0; return false; }
+        sx_q8 = sy_q8 = sc;
+        if (t >= 40 && t < 260) flash = (115 * (260 - t)) / 220;
+    }
+    wm_damage(tx - 6, ty - 6, tw + 12, th + 12);
+    return true;
 }
 
 WMAction WindowManager::GetCurrentAction() {
@@ -2076,6 +2430,7 @@ void WindowManager::TickAnimations() {
             case 1:  /* open  */ break;          // already visible
             case 2:  /* close */
                 wm_damage_window(w);
+                wm_snap_release(w);
                 w->state = WIN_CLOSED;
                 w->visible = false;
                 w->had_last = false;
@@ -2086,13 +2441,17 @@ void WindowManager::TickAnimations() {
                     current_action = WM_NONE;
                 }
                 break;
-            case 3:  /* minimize */
+            case 3:  /* minimize: keep the snapshot for the restore */
                 wm_damage_window(w);
                 w->state = WIN_MINIMIZED;
                 w->visible = false;
                 w->had_last = false;
                 break;
             case 4:  /* restore */ break;
+            case 5:  /* unminimize */
+                wm_damage_window(w);
+                wm_snap_release(w);
+                break;
             default: break;
         }
     }

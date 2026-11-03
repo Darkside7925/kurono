@@ -2,12 +2,15 @@
 #include "spinlock.h"
 #include "kernel_locks.h"
 #include "smp.h"            // per-cpu current process for application processors (satoru)
+#include "cgroup.h"         // cpu.max bandwidth charge on the tick paths (satoru)
 #include "../kernel/heap.h"
 #include "../kernel/vmm.h"
 #include "../kernel/pmm.h"
 #include "../kernel/hrtimer.h"
+#include "../kernel/kvdso.h"    // userspace vdso time page tick (satoru)
 #include "../kernel/panic.h"
 #include "../drivers/serial.h"
+#include "../drivers/audio_server.h"
 #include "../drivers/timer.h"   // TSC ms clock for sleep deadlines (satoru)
 #include "../hal/hal.h"
 #include "../system/logging.h"
@@ -83,6 +86,40 @@ static inline uint8_t prio_tier_for_safe(Process* p) {
     return (p->prio_tier < PRIO_TIER_COUNT) ? p->prio_tier : (uint8_t)PRIO_NORMAL;
 }
 
+// cgroup cpu.max bandwidth charge, shared by every tick path (kernel-proc PIT
+// tick, cooperative Tick, ap user preempt). drains the task's local slice
+// cache (cgroup_quota_left_us) first; when it runs dry, acquires a fresh slice
+// from the cgroup's per-period pool and, if the pool is exhausted, stamps
+// cgroup_throttle_until_ms so the pick loops park the task until the period
+// refills. tasks outside any cgroup (cgroup_id 0 - everything but kinit
+// service units today) exit on the first compare, so the hot path cost is one
+// load. throttle deadlines use Timer::GetRealMs64, the same clock
+// pick_next_kernel already compares against. (satoru)
+static const uint64_t CG_CPU_SLICE_US = 5000;   // cfs-bandwidth style local slice (satoru)
+static void cgroup_charge_cpu(Process* p, uint64_t used_us) {
+    if (!p || p->cgroup_id == 0 || used_us == 0) return;
+    if (!Cgroup::CpuHasQuota(p->cgroup_id)) return;
+    if (p->cgroup_quota_left_us >= used_us) {
+        p->cgroup_quota_left_us -= used_us;
+        return;
+    }
+    uint64_t need = used_us - p->cgroup_quota_left_us;
+    p->cgroup_quota_left_us = 0;
+    uint64_t want = need > CG_CPU_SLICE_US ? need : CG_CPU_SLICE_US;
+    uint64_t until = 0;
+    uint64_t got = Cgroup::CpuAcquireSlice(p->cgroup_id, want,
+                                           Timer::GetRealMs64(), &until);
+    if (got >= need) {
+        p->cgroup_quota_left_us = got - need;
+        p->cgroup_throttle_until_ms = 0;
+    } else {
+        // the period pool is dry (or could not cover the debt): park until
+        // the earliest instant every exhausted ancestor refills. (satoru)
+        p->cgroup_quota_left_us = 0;
+        p->cgroup_throttle_until_ms = until;
+    }
+}
+
 static void init_user_frame(Process* proc, uint64_t rip, uint64_t rsp) {
     memset(&proc->user_frame, 0, sizeof(proc->user_frame));
     proc->user_frame.rip = rip;
@@ -112,6 +149,10 @@ static uint32_t g_live_proc_count = 0;
 // size (LINUX_MAX_PROCS=64) since every schedulable user task pairs with a
 // LinuxProcess slot. (satoru)
 static constexpr uint32_t MAX_LIVE_PROCS = 256;  // 64->256 to match LINUX_MAX_PROCS (firefox thread/proc count) (satoru)
+
+// cfs pack minimum vruntime - refreshed by every pick scan; read by the wake
+// clamps and the task-28 clone debt cap. (satoru)
+static volatile uint64_t g_pack_min_vr = 0;
 
 static void init_process_common(Process* proc, const char* name, uint32_t priority) {
     memset(proc, 0, sizeof(Process));
@@ -423,6 +464,10 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
     proc->rbp = parent->rbp;
     proc->rsp = parent->rsp;
     proc->user_stack_top = parent->user_stack_top;
+    // a fork stays in its parent's cgroup (v2 semantics); nice carries the
+    // cpu.weight mapping with it. (satoru)
+    proc->cgroup_id = parent->cgroup_id;
+    proc->nice = parent->nice;
 
     proc->address_space = KernelVMM::CloneAddressSpace(parent->address_space);
     if (!proc->address_space) {
@@ -470,6 +515,10 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
     init_process_common(proc, parent->name, parent->priority);
     // user + thread: shares the address space, must not free it on exit (satoru)
     proc->flags = PROCESS_FLAG_USER | PROCESS_FLAG_THREAD;
+    // threads live in their creator's cgroup; inherit the weight-derived nice
+    // too so the whole group runs at one cfs rate. (satoru)
+    proc->cgroup_id = parent->cgroup_id;
+    proc->nice = parent->nice;
 
     // share the parent's address space verbatim - same pml4 phys / cr3 (satoru)
     proc->address_space = parent->address_space;
@@ -496,7 +545,15 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
     // (satoru) start the child at the parent's vruntime, not 0. with the cfs charge
     // now applied in ScheduleNextUser, a vruntime-0 child would otherwise monopolize
     // the cpu until it caught up to its already-accumulated siblings. (satoru)
-    proc->vruntime = parent->vruntime;
+    // task 28: but CAP the inherited debt at pack-min + one slice. a leader
+    // 10s+ behind the repoll herd spawned children who inherited the whole
+    // lag and crawled 12s between their first trace points (the kx5 69-110
+    // early-stall). the child starts fresh-ish without monopolizing. (satoru)
+    {
+        uint64_t pv = parent->vruntime;
+        uint64_t cap = __atomic_load_n(&g_pack_min_vr, __ATOMIC_RELAXED) + 24;
+        proc->vruntime = (pv > cap) ? cap : pv;
+    }
 
     // clone_settls: store the thread's tls as its saved fs base so LoadUserFrame
     // installs it when this thread is switched in. do NOT wrmsr here - the
@@ -513,7 +570,11 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
 }
 
 void Scheduler::MarkProcessExited(Process* proc, int exit_code) {
-    if (!proc || proc->reaped) return;
+    // reaped==1 = fully reaped (struct may be freed): never touch. reaped==2 =
+    // DEFERRED (queued, still valid): the drain re-asserts Terminated on these
+    // if a member re-blocked from its own kernel path, so allow the re-mark -
+    // guarding on the truthy `reaped` blocked it and could leak the group. (satoru)
+    if (!proc || proc->reaped == 1) return;
 
     proc->exit_code = exit_code;
     proc->state = Process_Terminated;
@@ -561,14 +622,45 @@ extern "C" void* sched_current_task_raw() {
     return (void*)Scheduler::GetCurrentProcess();
 }
 
-void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame) {
+void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame,
+                              uint8_t save_site) {
     if (!proc || !frame || !proc->is_user()) return;
 
     proc->user_frame = *frame;
     proc->has_user_frame = true;
+    proc->last_save_site = save_site;   // torn-frame forensics (satoru)
+    proc->save_seq++;
     proc->rip = (uintptr_t)frame->rip;
     proc->rsp = (uintptr_t)frame->rsp;
     proc->rbp = (uintptr_t)frame->rbp;
+
+    // hash the callee-saved regs (stray-writer hunt): these must survive a
+    // save/restore pair untouched, so a mismatch at LoadUserFrame proves a
+    // kernel stray-write into this heap-resident user_frame. NOT rip/rsp/rax:
+    // park sites legitimately rewind rip/rax on the saved frame AFTER the save
+    // (the restart-frame protocol), so folding those in would false-positive
+    // on every parked poll/futex. callee-saved only, by design. (satoru)
+    proc->frame_csum = frame->rbx ^ (frame->rbp * 0x9E3779B97F4A7C15ull)
+                     ^ (frame->r12 << 1) ^ (frame->r13 >> 1)
+                     ^ (frame->r14 * 3) ^ (frame->r15 + 0xD1B54A32D192ED03ull);
+    proc->frame_csum_valid = 1;
+
+    // stack canary for DESCHEDULING saves: sites 3=bsp-preempt 4=ap-preempt
+    // 5=page-fault 7=sched_yield are all points where the thread stops running
+    // and won't touch its own stack until the paired resume - so its stack
+    // must be frozen. capture a window; LoadUserFrame verifies. NOT sites 1/2
+    // (a syscall legitimately writes its own stack buffers) or 6 (signal
+    // delivery writes the stack). parkers are captured separately (they save
+    // at site 1 then block). (satoru)
+    if (save_site == 3 || save_site == 4 || save_site == 5 || save_site == 7) {
+        CaptureStackCanary(proc);
+    } else {
+        // sites 1/2 (syscall entry/exit - the body may write its own stack)
+        // and 6 (signal delivery writes a frame onto the stack) invalidate any
+        // stale canary so they can't false-positive at the next resume. a
+        // parker re-captures explicitly right after its site-1 save. (satoru)
+        proc->stk_canary_valid = 0;
+    }
 
     // capture this task's live tls (fs base) + x87/sse state so a switch to a
     // sibling thread doesn't clobber them. fxsave/rdmsr are explicit asm (safe
@@ -585,22 +677,376 @@ void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame) {
 // g_sched_lock nested inside is safe because no path takes g_sched_lock then
 // g_futex_lock (verified). LockIrqSave nests correctly: with IF already off the
 // inner acquire captures off and the inner release leaves it off. (satoru)
-// Step 1 (single-owner state) is intentionally a NO-OP. it IS needed for state
-// integrity (no-op'ing it lets a fresh proc's state tear -> two cpus run its
-// main(), the oracle "double-start"), BUT taking g_sched_lock on EVERY futex wake
-// STALLS firefox at about:blank (measured: KDOC stuck) and spikes boot stalls - 
-// firefox does enormous futex traffic. Step 3's on_cpu frame-handoff barrier is
-// the actual corruption fix; the +50ms grace masks the residual state-tear. a
-// proper Step 1 needs LIGHT (atomic CAS) state protection, not this global lock - 
-// left as no-op until then. the call sites (Scheduler::StateLock/Unlock in the
-// futex paths) are harmless no-ops. (satoru)
-void Scheduler::StateLock(uint64_t* out_flags)  { if (out_flags) *out_flags = 0; }
-void Scheduler::StateUnlock(uint64_t flags)     { (void)flags; }
+// Step 1 (single-owner state) is REAL again (task 17). it was no-op'd because
+// taking g_sched_lock on every futex wake stalled firefox - but that measurement
+// was made when every wake ALSO held the global kls serializer, so one wake
+// spinning here convoyed EVERY syscall on all cores. futex is now kls-EXEMPT:
+// a wake briefly spinning on g_sched_lock blocks nothing but the futex path,
+// and measured wake/block rates (~200/s + ~125/s) are trivial next to the
+// per-tick ScheduleNextUser acquisitions. the real lock is REQUIRED now: the
+// waker's claim (wake_blocked_claim) and the ap futex-park's blocked re-verify
+// must be mutually exclusive with ScheduleNextUser's cur->state reads, or the
+// keep-running branch resurrects a claimed/parked task (stranded-Running wedge,
+// stale-rax resume). (satoru)
+void Scheduler::StateLock(uint64_t* out_flags)  { g_sched_lock.LockIrqSave(out_flags); }
+void Scheduler::StateUnlock(uint64_t flags)     { g_sched_lock.UnlockIrqRestore(flags); }
+
+// read up to n bytes of user memory via the page-table walk (identity-mapped
+// phys) - never a user-va deref, so this can run from the isr resume path.
+// stops at the first unmapped page; returns bytes copied. (satoru)
+static int canary_read_user(Process* p, uint64_t va, uint8_t* dst, int n) {
+    int got = 0;
+    while (got < n) {
+        uint64_t a  = va + (uint64_t)got;
+        uint64_t ph = KernelVMM::QueryMappingInAddressSpace(p->address_space, a & ~0xFFFULL);
+        if (!ph) break;
+        int chunk = (int)(0x1000 - (a & 0xFFFULL));
+        if (chunk > n - got) chunk = n - got;
+        const uint8_t* src = (const uint8_t*)(uintptr_t)((ph & ~0xFFFULL) | (a & 0xFFFULL));
+        for (int i = 0; i < chunk; i++) dst[got + i] = src[i];
+        got += chunk;
+    }
+    return got;
+}
+
+// task 27 (the identity-map writer hunt): does phys back a PARKED thread's
+// fingerprinted yield-return page? kernel copy paths call this on their write
+// destinations - a hit means a kernel-side write is about to land in a live
+// parked stack (the surviving corruption channel). racy read-only walk under
+// the lock; page-granular. (satoru)
+// task 27 THE TRAP (see scheduler.h). stack pages are demand-zero anon
+// PRESENT|USER|WRITABLE|NX; arming drops WRITABLE, disarm/fault restore it. (satoru)
+static volatile uint32_t g_yprot_count = 0;
+bool Scheduler::YProtArm(Process* p) {
+    if (!p || !p->yret_va || !p->address_space) return false;
+    uint64_t page = p->yret_va & ~0xFFFULL;
+    if (!KernelVMM::ProtectPageInAddressSpace(p->address_space, page,
+            PTE_PRESENT | PTE_USER | PTE_NX)) return false;
+    p->yprot_armed = 1;
+    __atomic_add_fetch(&g_yprot_count, 1, __ATOMIC_RELAXED);
+    return true;
+}
+static void yprot_disarm(Process* p) {
+    if (!p || !p->yprot_armed) return;
+    p->yprot_armed = 0;
+    __atomic_sub_fetch(&g_yprot_count, 1, __ATOMIC_RELAXED);
+    KernelVMM::ProtectPageInAddressSpace(p->address_space,
+        p->yret_va & ~0xFFFULL, PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX);
+    if (p->address_space == KernelVMM::GetCurrentAddressSpace())
+        KernelVMM::InvalidatePage(p->yret_va & ~0xFFFULL);
+}
+void Scheduler::YProtDisarm(Process* p) { yprot_disarm(p); }
+bool Scheduler::YProtCheckFault(uint64_t as, uint64_t fault_va, uint64_t rip) {
+    if (__atomic_load_n(&g_yprot_count, __ATOMIC_RELAXED) == 0) return false;
+    uint64_t page = fault_va & ~0xFFFULL;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* hit = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (!p->yprot_armed || p->address_space != as) continue;
+        if ((p->yret_va & ~0xFFFULL) == page) { hit = p; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    if (!hit) return false;
+    static uint32_t s_yw_logs = 0;
+    if (s_yw_logs < 12) {
+        s_yw_logs++;
+        Process* w = GetCurrentProcess();
+        SerialLogger::Log("[YWRITE] writer=");
+        SerialLogger::LogDec(w ? (int)w->pid : -1);
+        SerialLogger::Log(" rip=");
+        SerialLogger::LogHex64(rip);
+        SerialLogger::Log(" victim=");
+        SerialLogger::LogDec((int)hit->pid);
+        SerialLogger::Log(" va=");
+        SerialLogger::LogHex64(fault_va);
+        SerialLogger::Log("\r\n");
+    }
+    yprot_disarm(hit);   // restore RW; the faulting store retries + lands (satoru)
+    return true;
+}
+
+Process* Scheduler::PhysIsParkedYieldStack(uint64_t phys) {
+    phys &= ~0xFFFULL;
+    if (!phys) return nullptr;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* hit = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->reaped || !p->is_user() || !p->has_user_frame) continue;
+        if (p->state == Process_Terminated && !p->on_cpu) continue;
+        if (p->yret_phys && (p->yret_phys & ~0xFFFULL) == phys) { hit = p; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return hit;
+}
+
+// task 27: a live sibling occupying the SAME musl stack slot (user_stack_top
+// within a page of `top`). the exact reuse discriminator - immune to parked
+// depth and the 156KB neighbor spacing that fooled the rsp-range probe. (satoru)
+Process* Scheduler::LiveSiblingWithStackTop(uint64_t as, uint64_t top) {
+    if (!as || !top) return nullptr;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* hit = nullptr;
+    // a RECYCLED musl stack slot does not come back at a byte-identical top -
+    // the tcb/guard layout shifts it by a few KB - so a page-exact compare
+    // (v1) never fired even though the [YWRITE] trap proved the collision is
+    // real. musl packs thread stacks ~156KB apart, so a 16KB window is an
+    // order of magnitude below the neighbour spacing: it catches "this is the
+    // same slot handed back" without ever flagging the thread next door. (satoru)
+    const uint64_t REUSE_WIN = 16ull << 10;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->reaped || !p->is_user() || !p->has_user_frame) continue;
+        if (p->address_space != as || !p->user_stack_top) continue;
+        if (p->state == Process_Terminated && !p->on_cpu) continue;
+        uint64_t d = (p->user_stack_top > top) ? (p->user_stack_top - top)
+                                               : (top - p->user_stack_top);
+        if (d < REUSE_WIN) { hit = p; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return hit;
+}
+
+Process* Scheduler::FindStackOwnerInRange(uint64_t as, Process* exclude,
+                                          uint64_t start, uint64_t end) {
+    if (!as) return nullptr;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* hit = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p == exclude || p->reaped || !p->is_user()) continue;
+        if (p->address_space != as || !p->has_user_frame) continue;
+        // only a GENUINELY LIVE thread matters: a Terminated (exited, not yet
+        // reaped) thread will never be resumed, so freeing its stack is fine -
+        // UNLESS a cpu still has it on_cpu (mid-exit, pre-iretq). so flag
+        // non-Terminated OR still-on_cpu threads. that distinguishes the real
+        // bug (a schedulable thread's stack freed under it) from a benign
+        // free of a dead thread's stack. (satoru)
+        if (p->state == Process_Terminated && !p->on_cpu) continue;
+        uint64_t rsp = p->user_frame.rsp;
+        if (rsp >= start && rsp < end) { hit = p; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return hit;
+}
+
+bool Scheduler::PageIsLiveStack(uint64_t as, Process* exclude, uint64_t pg,
+                                uint64_t window) {
+    if (!as) return false;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    bool hit = false;
+    for (Process* p = ready_queue; p && !hit; p = p->next) {
+        if (p == exclude || p->reaped || !p->is_user() || !p->has_user_frame) continue;
+        if (p->address_space != as) continue;
+        if (p->state == Process_Terminated && !p->on_cpu) continue;
+        uint64_t rsp = p->user_frame.rsp & ~0xFFFULL;
+        // ON_CPU victim (running on ANOTHER core right now): its saved
+        // user_frame.rsp is STALE - the live rsp is in that core's register and
+        // has moved arbitrarily far BELOW the saved value (a musl worker with a
+        // deep call chain uses far more than a 16KB margin). we cannot bound the
+        // live rsp, so protect the ENTIRE window at/below the saved rsp: the
+        // range firefox is freeing IS this thread's own stack, so leaking all of
+        // it is correct and does NOT hit the parked-thread reuse the 16KB margin
+        // guards (this crash was on_cpu victims - vstate=1 voncpu=1). (satoru)
+        if (p->on_cpu) {
+            uint64_t lo = (rsp > window) ? rsp - window : 0;
+            if (pg >= lo && pg < rsp + window) { hit = true; break; }
+            continue;
+        }
+        // PARKED victim (Ready/Blocked, not on_cpu): the saved rsp IS the live
+        // rsp (it is not executing), so the in-use stack is exactly [rsp,
+        // rsp+window). below rsp is unused and firefox reuses it - protecting a
+        // below-rsp margin regressed paint 6/10 -> 1/5 by starving that reuse.
+        // protect at/above rsp plus a small grow-race band. (satoru)
+        uint64_t lo = (rsp > (16ull << 10)) ? rsp - (16ull << 10) : 0;
+        if (pg >= lo && pg < rsp + window) hit = true;
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return hit;
+}
+
+void Scheduler::CaptureStackCanary(Process* proc) {
+    if (!proc || !proc->is_user() || !proc->has_user_frame) return;
+    uint64_t rsp = proc->user_frame.rsp & ~7ULL;
+    proc->stk_canary_rsp   = rsp;
+    proc->stk_canary_len   = (uint16_t)canary_read_user(proc, rsp, proc->stk_canary,
+                                                        (int)sizeof(proc->stk_canary));
+    proc->stk_canary_valid = proc->stk_canary_len ? 1 : 0;
+}
+
+// per-cpu start of the running user thread's slice; set on every load. (satoru)
+static uint64_t g_slice_start_ms[SMP_MAX_CPUS];
+static constexpr uint64_t USER_SLICE_MS = 10;
+
+bool Scheduler::SliceExpired() {
+    uint32_t cpu = SMP::CpuIndex() % SMP_MAX_CPUS;
+    uint64_t now = NowMs();
+    if (now - g_slice_start_ms[cpu] < USER_SLICE_MS) return false;
+    g_slice_start_ms[cpu] = now;
+    return true;
+}
 
 bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     if (!proc || !frame || !proc->is_user() || !proc->has_user_frame) return false;
 
+    // [YRET] load-side verify (the lost-store hunt): if this is the site-7 save
+    // we fingerprinted, re-read the yield-return slot + its backing phys and
+    // compare. value-changed + phys-changed = generation swap while parked;
+    // value-changed + phys-same = an in-place writer; value-wrong-at-save was
+    // already stamped save-side. also stamp last_load_seq at EVERY load so the
+    // RAWEXC2 dump can tell a stale resume (load_seq != save_seq). (satoru)
+    proc->last_load_seq = proc->save_seq;
+    if (proc->yprot_armed) yprot_disarm(proc);   // task 27 trap: RW back before resume (satoru)
+    if (proc->last_save_site == 7 && proc->yret_seq != 0 &&
+        proc->yret_seq == proc->save_seq && proc->yret_va) {
+        uint64_t nv = 0;
+        int got = canary_read_user(proc, proc->yret_va, (uint8_t*)&nv, 8);
+        uint64_t nphys = KernelVMM::QueryMappingInAddressSpace(
+            proc->address_space, proc->yret_va & ~0xFFFULL);
+        if (got == 8 && (nv != proc->yret_val || nphys != proc->yret_phys)) {
+            static uint32_t s_yret_dumps = 0;
+            if (s_yret_dumps < 12) {
+                s_yret_dumps++;
+                SerialLogger::Log("[YRET] pid=");
+                SerialLogger::LogDec((int)proc->pid);
+                SerialLogger::Log(" seq=");
+                SerialLogger::LogDec((int)proc->save_seq);
+                SerialLogger::Log(" val ");
+                SerialLogger::LogHex64(proc->yret_val);
+                SerialLogger::Log(" -> ");
+                SerialLogger::LogHex64(nv);
+                SerialLogger::Log(" phys ");
+                SerialLogger::LogHex64(proc->yret_phys);
+                SerialLogger::Log(" -> ");
+                SerialLogger::LogHex64(nphys);
+                SerialLogger::Log("\r\n");
+                // task 26 v4 frame-alias probe: is the SAME physical frame also
+                // mapped at ANOTHER live thread's stack va (a pmm/quarantine
+                // frame double-hand, not a va double-hand)? reverse-scan every
+                // live sibling's stack window for a va resolving to nphys - a
+                // hit names the alias partner directly. (satoru)
+                uint64_t f2; g_sched_lock.LockIrqSave(&f2);
+                for (Process* q = ready_queue; q; q = q->next) {
+                    if (q == proc || q->reaped || !q->is_user() || !q->has_user_frame) continue;
+                    // cross-AS too: a frame freed from one process while still
+                    // mapped, recycled into a forked child's stack, aliases
+                    // across address spaces. (satoru)
+                    uint64_t qr = q->user_frame.rsp & ~0xFFFULL;
+                    for (int64_t off = -(64ll << 10); off <= (8ll << 10); off += 0x1000) {
+                        uint64_t qva = qr + (uint64_t)off;
+                        uint64_t qp = KernelVMM::QueryMappingInAddressSpace(
+                            q->address_space, qva);
+                        if (qp && (qp & ~0xFFFULL) == (nphys & ~0xFFFULL)) {
+                            SerialLogger::Log("[ALIAS] pid=");
+                            SerialLogger::LogDec((int)q->pid);
+                            SerialLogger::Log(" va=");
+                            SerialLogger::LogHex64(qva);
+                            SerialLogger::Log(" maps same frame\r\n");
+                        }
+                    }
+                }
+                g_sched_lock.UnlockIrqRestore(f2);
+            }
+        }
+        proc->yret_seq = 0;   // one-shot per save (satoru)
+    }
+
+    // saved-frame integrity verify: recompute the callee-saved hash from the
+    // (possibly stomped) stored user_frame. a mismatch = a stray kernel write
+    // corrupted this heap-resident frame between save and resume - the writer's
+    // fingerprint is the changed reg. cap 6 dumps/boot. (satoru)
+    if (proc->frame_csum_valid) {
+        proc->frame_csum_valid = 0;
+        uint64_t now = proc->user_frame.rbx ^ (proc->user_frame.rbp * 0x9E3779B97F4A7C15ull)
+                     ^ (proc->user_frame.r12 << 1) ^ (proc->user_frame.r13 >> 1)
+                     ^ (proc->user_frame.r14 * 3) ^ (proc->user_frame.r15 + 0xD1B54A32D192ED03ull);
+        if (now != proc->frame_csum) {
+            static uint32_t s_fs_dumps = 0;
+            if (s_fs_dumps < 6) {
+                s_fs_dumps++;
+                SerialLogger::Log("[FRAMESTOMP] pid=");
+                SerialLogger::LogDec((int)proc->pid);
+                SerialLogger::Log(" savesite=");
+                SerialLogger::LogDec((int)proc->last_save_site);
+                SerialLogger::Log(" rbx=");    SerialLogger::LogHex64(proc->user_frame.rbx);
+                SerialLogger::Log(" rbp=");    SerialLogger::LogHex64(proc->user_frame.rbp);
+                SerialLogger::Log(" r12=");    SerialLogger::LogHex64(proc->user_frame.r12);
+                SerialLogger::Log(" r13=");    SerialLogger::LogHex64(proc->user_frame.r13);
+                SerialLogger::Log(" r14=");    SerialLogger::LogHex64(proc->user_frame.r14);
+                SerialLogger::Log(" r15=");    SerialLogger::LogHex64(proc->user_frame.r15);
+                SerialLogger::Log(" rip=");    SerialLogger::LogHex64(proc->user_frame.rip);
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
+
+    // parked-stack canary verify (the residual stray-writer hunt): a parker's
+    // stack must be byte-identical across its park. any diff = the corruptor
+    // caught in the act - dump the changed qwords (old -> new) as the writer's
+    // fingerprint. one check per park (cleared below), cap 4 dumps/boot. (satoru)
+    if (proc->stk_canary_valid) {
+        proc->stk_canary_valid = 0;
+        static uint32_t s_canary_dumps = 0;
+        uint8_t now[sizeof(proc->stk_canary)];
+        int n = canary_read_user(proc, proc->stk_canary_rsp, now, (int)proc->stk_canary_len);
+        if (n == (int)proc->stk_canary_len && s_canary_dumps < 12) {
+            bool diff = false;
+            for (int i = 0; i < n; i++) {
+                if (now[i] != proc->stk_canary[i]) { diff = true; break; }
+            }
+            (void)diff;
+            // classify each changed qword. a legitimate cross-thread write
+            // (crossbeam delivering into a receiver's stack waiter node) writes
+            // a POINTER or a state token. the CORRUPTOR's signature - the one
+            // the crashes show - is a valid POINTER being clobbered by a SMALL
+            // non-pointer (return address -> 0x3, rbx ptr -> 0xA) OR a
+            // high-half stomp (low 32 bits survive, high 32 change). only
+            // report qwords matching that, so the noise of legit deliveries is
+            // filtered out. (satoru)
+            bool corrupt = false;
+            for (int q = 0; q + 8 <= n; q += 8) {
+                uint64_t ov = 0, nv = 0;
+                for (int b = 0; b < 8; b++) {
+                    ov |= (uint64_t)proc->stk_canary[q + b] << (b * 8);
+                    nv |= (uint64_t)now[q + b] << (b * 8);
+                }
+                if (ov == nv) continue;
+                // forensics finding: the 0x180000000000 pointer floor made
+                // this tripwire BLIND to the boot layout firefox actually has -
+                // the crossbeam crash's victim values are a ~5.9TB stack/tls
+                // pointer (0x05653F...) and a heap ctx (0x34C0...), both below
+                // the old floor, so every hit was classified "legit" + dropped.
+                // a real pointer on this layout is anything >= 4GB (state words
+                // and counters live below 0x1_00000000); the halfstomp arm needs
+                // no floor at all (low-32 identical + high-32 changed is already
+                // a corruption signature, never a sync-word transition). (satoru)
+                bool ov_ptr    = ov >= 0x100000000ull;
+                bool nv_small  = nv < 0x1000ull;
+                bool halfstomp = (ov & 0xFFFFFFFFull) == (nv & 0xFFFFFFFFull) &&
+                                 (ov >> 32) != (nv >> 32);
+                if (!((ov_ptr && nv_small) || halfstomp)) continue; // filter legit writes (satoru)
+                if (!corrupt) {
+                    corrupt = true; s_canary_dumps++;
+                    SerialLogger::Log("[STKCORRUPT] pid=");
+                    SerialLogger::LogDec((int)proc->pid);
+                    SerialLogger::Log(" rsp=");
+                    SerialLogger::LogHex64(proc->stk_canary_rsp);
+                    SerialLogger::Log(" site=");
+                    SerialLogger::LogDec((int)proc->last_save_site);
+                    SerialLogger::Log(" saveseq=");
+                    SerialLogger::LogHex((uint32_t)proc->save_seq);
+                    SerialLogger::Log("\r\n");
+                }
+                SerialLogger::Log("[STKCORRUPT] +");
+                SerialLogger::LogHex((uint32_t)q);
+                SerialLogger::Log(" ");
+                SerialLogger::LogHex64(ov);
+                SerialLogger::Log(" -> ");
+                SerialLogger::LogHex64(nv);
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
+
     SetCurrentForThisCpu(proc);   // per-cpu: bsp global / ap PerCpu.current (satoru)
+    g_slice_start_ms[SMP::CpuIndex() % SMP_MAX_CPUS] = NowMs();
     proc->last_run_cpu = (uint8_t)SMP::CpuIndex();   // cross-cpu resume grace (satoru)
     // frame is now live on THIS cpu - mark on_cpu so no other cpu resumes it
     // until we save + release it. plain store: this cpu is the sole writer, and
@@ -642,6 +1088,22 @@ static inline bool cpu_allowed(const Process* p, uint32_t cpu) {
 // task immediately (it can't race itself), but ANOTHER cpu must wait ~2ms past
 // the release timestamp so the unwind window (microseconds, but real) has
 // passed. fresh tasks (released_ms 0) pass trivially. (satoru)
+// task 21 - DEFAULT ON (2026-07-20): HARD-PIN every user thread to the cpu it
+// last ran on - no cross-cpu resume at all. PROVEN by a/b: the pre-KX2 glib
+// wedge (the leader's mutex-unlock stores vanishing = the documented
+// migrate-and-replay corruption the 50ms grace only suppressed) fired ~50% of
+// fresh boots with migration on, and 0/6 with pinning - AND pinned boots
+// painted at 16.9s launch-to-paint vs the 56s serialized baseline, because
+// same-cpu re-picks are instant (no migration grace stalls on thousands of
+// handoffs). kurono.pincpu=0 restores migration for the root-fix hunt
+// (SaveUserFrame/LoadUserFrame completeness audit). (satoru)
+static bool g_pin_cpu = true;
+void Scheduler::SetPinCpu(bool on) { g_pin_cpu = on; }
+
+// cached pack-min vruntime, refreshed by every pick scan (racy by design -
+// a tick-stale min only loosens the vruntime clamps slightly). task 22b. (satoru)
+// (moved to the top of the file - the clone debt cap at :550 needs it) (satoru)
+
 static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // cross-cpu resume guard. the SAME cpu can always re-pick its own task (it
     // can't race its own iretq). MITIGATION (2026-07-08): a genuine but
@@ -660,16 +1122,63 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // once its owning cpu RELEASE-stored on_cpu=0 (frame fully saved). ACQUIRE-load
     // pairs with that release -> never a half-saved user_frame -> no RIP=0x3/#PF. (satoru)
     if (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE) != 0) return false;
-    // TIME-DECAYED migration grace. 50ms masks the SMP-bringup fragility (its own
-    // campaign) - but held forever it STARVES firefox: released_ms is re-stamped
-    // every slice, so each cpu forms an eligibility island that keeps re-running
-    // its residents while the ENTIRE ready render pipeline (Renderer/WRWorkers/
-    // SwComposite/SceneBuilder - all st=Ready on=-1 in the loaded-page FWG dump)
-    // waits 50ms per migration hop and the content never finishes rasterizing.
-    // after the fragile bringup window, drop to 2ms so ready threads rebalance at
-    // real speed. (satoru)
+    // HARD PINNING (task 22c): never resume on a different cpu. soft pinning (a
+    // 40ms migration window for aged-Ready threads, to rebalance the render
+    // handshake) was tried and REOPENED the glib mutex wedge (soft1 batch:
+    // pool-0 + pool-1 both stuck on one mutex, exp=cur=2, no holder = the
+    // leader's unlock store vanished) - proof that ANY cross-cpu resume of a
+    // migrated thread can lose its store, not just the sub-ms case. the wedge
+    // stays dead only with zero migration. the paint-rate ceiling (load
+    // imbalance of pinned handshake partners) must be recovered by the deep
+    // single-owner-state root fix (safe migration), not by relaxing the pin.
+    //
+    // (task 23d first-run placement REVERTED: letting a never-run thread be
+    // claimed by any cpu REOPENED the wedge 0/6 - even a fresh thread's first
+    // run on an ap exposes the migrate-and-replay corruption once it later
+    // blocks+resumes. bsp-piling is the price of the wedge-free state.) (satoru)
+    if (g_pin_cpu) return false;
+    // migration grace: a small window after a cpu releases a task before ANOTHER
+    // cpu may resume it, on top of the on_cpu frame barrier above. NOTE
+    // (2026-07-10): the boot-lottery STALL this grace was thought to "mask" was
+    // actually a futex LOST WAKE, now fixed by the atomic Blocked->Ready CAS in
+    // the futex layer. the corruption the long grace suppresses is rapid
+    // migrate-and-replay of a BRIEFLY-blocked thread - which only pays off when
+    // the home cpu is actually free to re-pick it within a tick. (satoru)
+    //
+    // home-aware grace (2026-07-11, the firefox startup-latency fix): the old
+    // flat 50ms-for-90s wait made every cross-cpu handoff of firefox's startup
+    // threads stall up to 50ms even when the home cpu was BUSY running another
+    // task - thousands of handoffs = the 100-300s map crawl that ended exactly
+    // at the 90s knee. keep the long suppression ONLY while the home cpu is
+    // free (idle or already holding this task - it will re-pick immediately,
+    // exactly the case the mitigation wants); when the home cpu is occupied by
+    // a DIFFERENT task the thread must migrate to make progress, so only the
+    // short unwind window applies. validated with the futex-torture oracle. (satoru)
+    //
+    // NOTE (2026-07-12): an A/B (nvme-persist firefox boots, matched) showed this
+    // grace is NOT the cause of the RIP=0x3 #UD boot crash: flat-50ms crashed 3/3,
+    // home-aware 2/3 - both heavy. every crash lands right after the persist
+    // RESTORE of a bogus-4.69MB firefox cursor file (KFS FileSize wrong) failing
+    // with got=-1, on the bsp (cpu0), before firefox even maps. the real trigger
+    // is the persist/KFS large-read path, not this grace - so it is left as the
+    // faster home-aware form. see persist.cpp restore_subtree + kfs FileSize. (satoru)
+    // NOTE (2026-07-16): the 90s knee is GONE. the migration-replay race above
+    // is unfixed and only SUPPRESSED by the 50ms grace - and the old knee
+    // switched suppression off at 90s, exactly when window formation + paint
+    // run. every residual window-formation crash observed landed post-90s
+    // (95.6s, ~170s), with torn-frame signatures (an rsp whose high dword came
+    // from another value). the home-aware form already removed the latency
+    // cost that motivated the knee (a busy home cpu migrates after 2ms), so
+    // suppression now stays on for the whole run: home free -> 50ms hold-off
+    // (home re-picks immediately, no real latency), home busy -> 2ms migrate. (satoru)
     uint64_t now = Scheduler::NowMs();
-    uint64_t g   = (now < 90000) ? 50 : 2;
+    uint64_t g = 2;
+    {
+        PerCpu* home = SMP::ByIndex((uint32_t)p->last_run_cpu);
+        Process* home_cur = home ? home->current : nullptr;
+        bool home_busy_elsewhere = home_cur && home_cur != p;
+        if (!home_busy_elsewhere) g = 50;
+    }
     return now > p->released_ms + g;
 }
 
@@ -678,22 +1187,85 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
 // fallback). a thread already Running on another core has state != Ready, so it
 // is skipped here; that, plus marking the winner Running under the SAME lock, is
 // what stops two cores grabbing one thread. (satoru)
+// task 25: directed wake-next hand-off. when a thread wakes another (futex_wake,
+// an fd readiness wakeup, a parent/child wake) and then blocks/reschedules, the
+// woken thread should run NEXT on this cpu - linux's wakeup baton-pass makes the
+// target run in ~33us; kurono otherwise leaves it Ready for the vruntime picker,
+// which on the cooperative bsp (where the whole thread group piles under hard
+// pin) can be many ms and hundreds of hops = the paint crawl. one-shot per cpu
+// (cleared on consume), and gated by all the normal eligibility checks, so it
+// only reorders a pick that was already legal - never a fairness hazard like the
+// (reverted) continuous vruntime clamps. (satoru)
+static Process* g_wake_next[SMP_MAX_CPUS] = {};
+void Scheduler::NoteWakeNext(Process* woken) {
+    if (!woken) return;
+    uint32_t c = SMP::CpuIndex();
+    if (c < SMP_MAX_CPUS) g_wake_next[c] = woken;
+}
+
 static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     if (!Scheduler::ready_queue) return nullptr;
+    // cgroup cpu.max: skip a task whose bandwidth pool is exhausted until its
+    // period refills. the stamp is 0 for every task outside a quota'd cgroup,
+    // so the common case is a single compare per candidate; the clock is read
+    // once per pick and only when some candidate carries a stamp. (satoru)
+    uint64_t cg_now = 0;
+    auto cg_throttled = [&](Process* c) -> bool {
+        if (c->cgroup_throttle_until_ms == 0) return false;
+        if (cg_now == 0) cg_now = Timer::GetRealMs64();
+        return c->cgroup_throttle_until_ms > cg_now;
+    };
+    // wake-next hand-off: if this cpu just woke a thread, run it now. (satoru)
+    if (cpu < SMP_MAX_CPUS) {
+        Process* wn = g_wake_next[cpu];
+        if (wn) {
+            g_wake_next[cpu] = nullptr;
+            if (wn != after && wn->is_user() && wn->state == Process_Ready &&
+                wn->has_user_frame && cpu_allowed(wn, cpu) &&
+                cross_run_grace_ok(wn, cpu) && !cg_throttled(wn) &&
+                wn->sched_class != 3) {
+                return wn;
+            }
+        }
+    }
     Process* best = nullptr;
     Process* fifo = nullptr;
+    // task 28 (the early-stall crawl): bounded pick-time starvation override.
+    // the leader accrues vruntime debt vs the frozen-low repoll herd and sits
+    // Ready-unpicked for 10-130s (the kx5 69-110 crawl, ~10/13 stalls). unlike
+    // the reverted wake-clamps this mutates NO vruntime and has no herd
+    // coupling: a Ready cfs task unpicked for >64ms simply wins the next pick.
+    // ready_since_ms is stamped lazily right here and cleared by the caller on
+    // every successful pick. (satoru)
+    Process* starved = nullptr;
+    uint64_t now_ms = 0;
+    uint64_t scan_min = ~0ull;   // pack-min refresh (task 22b) (satoru)
     for (Process* c = Scheduler::ready_queue; c; c = c->next) {
-        if (!c->is_user() || c->state != Process_Ready || !c->has_user_frame) continue;
+        if (!c->is_user()) continue;
+        // pack-min: track Ready AND Running cfs tasks regardless of this cpu's
+        // eligibility - the clamps compare against the whole pack. (satoru)
+        if ((c->state == Process_Ready || c->state == Process_Running) &&
+            c->sched_class == 0 && c->vruntime < scan_min) scan_min = c->vruntime;
+        if (c->state != Process_Ready || !c->has_user_frame) continue;
         if (!cpu_allowed(c, cpu)) continue;
         if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
+        if (cg_throttled(c)) continue;               // cpu.max pool dry (satoru)
         if (c->sched_class == 1 || c->sched_class == 2) {       // FIFO/RR
             if (!fifo || c->priority < fifo->priority) fifo = c;
             continue;
         }
         if (c->sched_class == 3) continue;                       // IDLE last
+        if (now_ms == 0) now_ms = Scheduler::NowMs();
+        if (c->ready_since_ms == 0) c->ready_since_ms = now_ms;
+        else if (now_ms - c->ready_since_ms > 64 &&
+                 (!starved || c->ready_since_ms < starved->ready_since_ms))
+            starved = c;
         if (!best || c->vruntime < best->vruntime) best = c;
     }
+    if (scan_min != ~0ull)
+        __atomic_store_n(&g_pack_min_vr, scan_min, __ATOMIC_RELAXED);
     if (fifo) return fifo;
+    if (starved) return starved;   // oldest neglected first (task 28) (satoru)
     if (best) return best;
 
     // Final fallback: round-robin starting after `after`.
@@ -701,12 +1273,12 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     for (Process* cursor = start; cursor; cursor = cursor->next)
         if (cursor->is_user() && cursor->state == Process_Ready &&
             cursor->has_user_frame && cpu_allowed(cursor, cpu) &&
-            cross_run_grace_ok(cursor, cpu))
+            cross_run_grace_ok(cursor, cpu) && !cg_throttled(cursor))
             return cursor;
     for (Process* cursor = Scheduler::ready_queue; cursor && cursor != start; cursor = cursor->next)
         if (cursor->is_user() && cursor->state == Process_Ready &&
             cursor->has_user_frame && cpu_allowed(cursor, cpu) &&
-            cross_run_grace_ok(cursor, cpu))
+            cross_run_grace_ok(cursor, cpu) && !cg_throttled(cursor))
             return cursor;
     return nullptr;
 }
@@ -751,11 +1323,12 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
             int nn = cur->nice; if (nn < -20) nn = -20; if (nn > 19) nn = 19;
             uint32_t ww = kNiceW[nn + 20];
             cur->vruntime += (1024u * 1024u) / (ww ? ww : 1);
-            cur->state = Process_Ready;
+            cur->state = Process_Ready;   // (task 22c: runner cap reverted, see NormalizeWakeVruntime) (satoru)
         }
         Process* cand = pick_next_user_nolock(cur, cpu);
         if (cand && cand != cur) {
             cand->state = Process_Running;
+            cand->ready_since_ms = 0;   // task 28: picked - clear the starvation stamp (satoru)
             next = cand;
             // finish_task: we are switching AWAY from cur. its user_frame is fully
             // saved by now (preempt SaveUserFrame ran before this call; a blocking
@@ -836,15 +1409,32 @@ Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
 Process* Scheduler::ClaimReadyThreadForCpu(uint32_t cpu) {
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     Process* pick = nullptr;
+    Process* idle_pick = nullptr;   // task 20: SCHED_IDLE fallback (satoru)
+    uint64_t cg_now = 0;   // lazy cpu.max clock, same pattern as the user pick (satoru)
     for (Process* c = ready_queue; c; c = c->next) {
         if (!c->is_user() || !c->is_thread()) continue;
         if (c->state != Process_Ready || !c->has_user_frame) continue;
-        if (c->sched_class == 3) continue;                    // idle class last (satoru)
         if (!cpu_allowed(c, cpu)) continue;
         if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
+        if (c->cgroup_throttle_until_ms) {           // cpu.max pool dry? (satoru)
+            if (cg_now == 0) cg_now = Timer::GetRealMs64();
+            if (c->cgroup_throttle_until_ms > cg_now) continue;
+        }
+        // idle class runs only when nothing else is claimable - but it MUST
+        // still run on an otherwise-idle cpu (linux SCHED_IDLE semantics).
+        // the old unconditional skip let an idle-class thread strand READY
+        // forever while aps idled (the WaylandProxy wedge suspect). (satoru)
+        if (c->sched_class == 3) {
+            if (!idle_pick || c->vruntime < idle_pick->vruntime) idle_pick = c;
+            continue;
+        }
         if (!pick || c->vruntime < pick->vruntime) pick = c;
     }
-    if (pick) pick->state = Process_Running;
+    if (!pick) pick = idle_pick;   // an idle cpu runs SCHED_IDLE work (satoru)
+    if (pick) {
+        pick->state = Process_Running;
+        pick->ready_since_ms = 0;   // task 28: picked - clear the starvation stamp (satoru)
+    }
     g_sched_lock.UnlockIrqRestore(f);
     return pick;
 }
@@ -872,6 +1462,28 @@ void Scheduler::FixupGsAfterIsrSwitch() {
 static void (*g_ap_futex_maint)() = nullptr;
 void Scheduler::SetApFutexMaintHook(void (*fn)()) { g_ap_futex_maint = fn; }
 
+// task 22 - the linux min_vruntime wake clamp: a thread that once monopolized
+// a cpu (the leader's early futex spurious-spin accrued ~13s of vruntime)
+// falls so far behind the pack that dozens of briefly-waking repoll threads
+// (whose vruntime stays frozen-low while parked) win EVERY pick - the leader
+// sat READY and unpicked for 60+ seconds = the late-stall. linux clamps a
+// waking task to cfs_rq min_vruntime minus a latency slice; mirror that: on
+// every Blocked->Ready transition, pull the waker's vruntime down to at most
+// (min over ready/running user tasks) + 24, so a wake can lag the queue head
+// by at most ~one generous slice. lock-free racy scan by design - callable
+// from any wake path with or without g_sched_lock held; an imperfect min only
+// makes the clamp slightly loose, never wrong. (satoru)
+void Scheduler::NormalizeWakeVruntime(Process* p) {
+    // task 22c: REVERTED to a no-op. BOTH clamp variants regressed the batch
+    // (one-sided fin1: the repoll herd woke at pack-min forever and preempted
+    // the compute-bound leader into a crawl; two-sided + runner cap fin2:
+    // still kx5-frozen) vs the clamp-free pin1 batch (2/5 paint at 16-18s).
+    // the stranded-READY starvation is handled by the aging escalator in
+    // PromoteDeferredWakes instead: a Ready-but-unpicked task decays toward
+    // the pack until it wins a pick - no wake-path coupling, no herd effects. (satoru)
+    (void)p;
+}
+
 void Scheduler::PromoteDeferredWakes() {
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     for (Process* p = ready_queue; p; p = p->next) {
@@ -879,10 +1491,29 @@ void Scheduler::PromoteDeferredWakes() {
             if (--p->sleep_ticks == 0) {
                 p->state = Process_Ready;
                 if (p->interactive_score < 16) p->interactive_score += 2;
+                // task 23b: a deferred-tick SELF-wake (poll restart repoll,
+                // nanosleep park) prices its cycle - see the futex sweep's
+                // twin charge. real futex wakes stay free. (satoru)
+                if (p->is_user() && p->sched_class == 0) p->vruntime += 1;
             }
         }
+        // (task 22c aging escalator REVERTED: it regressed the batch 2/5 -> 1/5,
+        // same failure mode as the vruntime clamps - any continuous vruntime
+        // meddling perturbs the pick order and starves the running thread. the
+        // scheduler is left as the clean pin1 form.) (satoru)
     }
     g_sched_lock.UnlockIrqRestore(f);
+}
+
+// idle-ap maintenance (task 17): the ap dispatch loop calls this (throttled to
+// ~1ms) so a cpu parked in ring-0 still advances the sleep_ticks promotions and
+// the futex repoll/timeout heal - the timer-preempt paths that normally run
+// these are ring-3-gated and never fire while the cpu idles in the dispatch
+// loop. cooperative ring-0 context, no locks held: same safety argument as the
+// ApTimerPreempt call sites. (satoru)
+void Scheduler::ApIdleMaint() {
+    if (g_ap_futex_maint) g_ap_futex_maint();   // linux futex repoll/timeout sweep
+    PromoteDeferredWakes();                      // sleep_ticks -> Ready
 }
 
 void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
@@ -895,11 +1526,17 @@ void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
     // threads live when the bsp main thread is itself blocked. (satoru)
     if (g_ap_futex_maint) g_ap_futex_maint();   // linux futex repoll/timeout sweep
     PromoteDeferredWakes();                      // sleep_ticks -> Ready
+    // cgroup cpu.max: charge the interrupted user thread one lapic-timer
+    // period (~1ms) of bandwidth. a throttled thread goes back to Ready below
+    // and the pick loops skip it until its cgroup pool refills. cgroup_id is 0
+    // for everything but kinit service units, so this is one load normally.
+    // (satoru)
+    if (cur->cgroup_id) cgroup_charge_cpu(cur, 1000);
     // save the interrupted thread's full state, then switch to the next runnable
     // user thread for this cpu. ScheduleNextUser rewrites *frame in place; the
     // ISR's iretq resumes whatever it picks. the threads of one process share cr3,
     // so no address-space switch is needed. (satoru)
-    SaveUserFrame(cur, frame);
+    SaveUserFrame(cur, frame, 4);   // site 4 = ap preempt (satoru)
     if (ScheduleNextUser(frame)) {
         // isr path (no swapgs on iret): fix up gs so the resumed thread's user
         // gs is active and KERNEL_GS_BASE holds the per-cpu ptr. (satoru)
@@ -912,6 +1549,63 @@ void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
         __asm__ __volatile__("mov %%cr3, %0" : "=r"(c3));
         __asm__ __volatile__("mov %0, %%cr3" : : "r"(c3) : "memory");
     }
+}
+
+// bsp-starve heartbeat (see Schedule). volatile: read from the timer isr. (satoru)
+static volatile uint64_t g_last_schedule_ms = 0;
+uint64_t Scheduler::LastScheduleMs() { return g_last_schedule_ms; }
+
+// does any OTHER live task still share this task's address space? checks every
+// cpu's current plus the whole task list under the sched lock. destroying an
+// address space that a straggler sibling could still be resumed into hands the
+// allocator its page tables + frames while a core can still walk them = the
+// wild-rip / zeroed-frame corruption class. a false positive just leaks one
+// address space - always the safe direction. (satoru)
+static bool as_live_elsewhere(Process* proc) {
+    if (!proc || !proc->address_space) return false;
+    uint64_t as = proc->address_space;
+    uint32_t me = SMP::CpuIndex();
+    for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+        PerCpu* pc = SMP::ByIndex(ci);
+        if (!pc || !pc->current) continue;
+        // any task of this address space live on another cpu blocks the
+        // destroy - INCLUDING proc itself still current on a different cpu
+        // (mid-exit pre-iretq, its cr3 loaded there). only this cpu's own
+        // ownership of proc is fine (the self-reap path switches to the
+        // kernel root before destroying). (satoru)
+        if (pc->current == proc) {
+            if (ci != me) return true;
+            continue;
+        }
+        if (pc->current->address_space == as) return true;
+    }
+    bool live = false;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    for (Process* p = Scheduler::ready_queue; p; p = p->next) {
+        if (p == proc || p->reaped || !p->is_user()) continue;
+        if (p->state == Process_Terminated) continue;
+        if (p->address_space == as) { live = true; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return live;
+}
+
+bool Scheduler::AddressSpaceLiveElsewhere(uint64_t as, Process* exclude) {
+    if (!as) return false;
+    for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+        PerCpu* pc = SMP::ByIndex(ci);
+        if (pc && pc->current && pc->current != exclude &&
+            pc->current->address_space == as) return true;
+    }
+    bool live = false;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    for (Process* p = Scheduler::ready_queue; p; p = p->next) {
+        if (p == exclude || p->reaped || !p->is_user()) continue;
+        if (p->state == Process_Terminated) continue;
+        if (p->address_space == as) { live = true; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return live;
 }
 
 void Scheduler::ReapProcess(Process* proc) {
@@ -967,9 +1661,28 @@ void Scheduler::DestroyProcess(Process* proc) {
     if (proc->is_user()) {
         // a thread shares its parent's address space + user stack - only the
         // process that owns the address space may tear it down. tearing it down
-        // from a thread would unmap the parent and every sibling. (satoru)
+        // from a thread would unmap the parent and every sibling. and NEVER
+        // while a straggler sibling is still live in it (a parked worker the
+        // group kill missed): the freed page tables recycle under a task the
+        // futex sweep can still resume -> wild-rip corruption. leak instead. (satoru)
         if (proc->address_space && !proc->is_thread()) {
-            KernelVMM::DestroyAddressSpace(proc->address_space);
+            // self-reap (sys_exit -> wake_waiting_parent -> ReapProcess runs on
+            // the DYING task's own cpu): this cpu's cr3 IS the address space
+            // about to be destroyed - a kernel tlb miss in the window before
+            // HandleProcessExit's kernel-as switch would walk freed tables.
+            // switch to the kernel root FIRST (reviewer finding). (satoru)
+            {
+                uint64_t cur3;
+                __asm__ __volatile__("mov %%cr3, %0" : "=r"(cur3));
+                if (cur3 == proc->address_space) SMP::LoadKernelCr3();
+            }
+            if (!as_live_elsewhere(proc)) {
+                KernelVMM::DestroyAddressSpace(proc->address_space);
+            } else {
+                SerialLogger::Log("[asguard] leak: as still live elsewhere pid=");
+                SerialLogger::LogDec((int)proc->pid);
+                SerialLogger::Log("\r\n");
+            }
         }
         if (proc->kernel_stack_top && !ctx_live) {
             // never free the kernel stack a cpu is still EXECUTING ON (a thread
@@ -985,14 +1698,334 @@ void Scheduler::DestroyProcess(Process* proc) {
     proc->reaped = 1;
     proc->state  = Process_Terminated;
     if (g_live_proc_count > 0) g_live_proc_count--;   // free a live-task slot (satoru)
+    // task 25 reviewer finding 1: a wake-next slot may still hold this proc (an
+    // idle ap stashed it, never picked). clear every match BEFORE the free or
+    // the fast path derefs recycled heap (the documented rip=0x3 seed). (satoru)
+    for (uint32_t wi = 0; wi < SMP_MAX_CPUS; wi++)
+        if (g_wake_next[wi] == proc) g_wake_next[wi] = nullptr;
     // freeing the struct while a cpu still unwinds on it hands the heap a block
-    // that gets recycled instantly (path buffers were observed landing in it) - 
+    // that gets recycled instantly (path buffers were observed landing in it) -
     // the cpu then iretq's through ascii garbage (#UD/#GP with string-data
     // registers). leak it in the live cases, same tradeoff as the stack. (satoru)
     if (!ctx_live) KernelHeap::Free(proc);
 }
 
+// ── thread-group kill (task manager "end task") ──────────────────────────
+// killing one task of a multi-threaded user process and freeing its address
+// space while sibling threads still executed in it on other cores took the
+// whole os down. the safe order: mark EVERY member of the address-space
+// group terminated, wait until no cpu still owns any member (the ap preempt
+// tick drops them within a few ms), re-assert the terminated state (a member
+// that was mid futex-block can have re-stored Blocked from its own kernel
+// path while draining), and only then free kernel stacks + the shared
+// address space. the Process structs are deliberately LEAKED: futex waiter
+// slots and per-cpu grace bookkeeping may still hold raw pointers, and the
+// CAS wake path fails harmlessly on a Terminated struct but corrupts the
+// heap on a freed-and-recycled one. (satoru)
+
+// release one quiesced group member: stacks + (for the owner) the address
+// space, bookkeeping, but never the struct itself. reaped semantics: 1 = fully
+// reaped (double-free guard, blocks everything); 2 = DEFERRED sentinel - the
+// member sits in g_deferred_reaps, so ReapProcess/DestroyProcess (waitpid,
+// wake_waiting_parent) must NOT free the struct or tear the address space out
+// from under the drain - only THIS reap, from the drain, may proceed on it. (satoru)
+// the user task currently parked inside a slice donation, or null. declared up
+// here (rather than beside the donation code) because reap_group_member below
+// must be able to see it - both blocks are the same unnamed namespace. full
+// rationale lives with DonateToKernelProcs. (satoru)
+Process* g_donor          = nullptr;
+uint64_t g_donor_until_ms = 0;
+
+static void reap_group_member(Process* m) {
+    if (!m || m->reaped == 1) return;
+    sched_log_process_event(m, "killed", "thread-group kill (task manager)");
+    remove_from_ready_queue(m);
+    if (m->parent) {
+        unlink_child(m->parent, m);
+        m->parent = nullptr;
+        m->parent_pid = 0;
+    }
+    Process* child = m->first_child;
+    while (child) {
+        child->parent = nullptr;
+        child->parent_pid = 0;
+        Process* next_child = child->next_sibling;
+        child->next_sibling = nullptr;
+        child = next_child;
+    }
+    m->first_child = nullptr;
+    // NEVER free the kernel stack of the task parked in a slice donation: its
+    // suspended perform_switch frame lives on that stack and it will be resumed
+    // from it. Freeing it hands the pages to PMM, another allocation overwrites
+    // the saved frame, and the resume pops a garbage return address - which is
+    // exactly the RIP=0x3 SMP-resume class this codebase has already paid for
+    // twice. Leak it, per the same doctrine as the struct below. (satoru)
+    if (m->kernel_stack_top && m != g_donor) {
+        uint64_t kbase = m->kernel_stack_top - KERNEL_STACK_BYTES;
+        PMM::FreeBytes((void*)(uintptr_t)kbase, KERNEL_STACK_BYTES);
+        m->kernel_stack_top = 0;
+    }
+    if (m->address_space && !m->is_thread()) {
+        // same straggler guard as DestroyProcess: the quiesce wait can time out
+        // (kr==2 give-up) with a member still resumable - leak, never free live
+        // page tables. (satoru)
+        if (!as_live_elsewhere(m)) {
+            KernelVMM::DestroyAddressSpace(m->address_space);
+        } else {
+            SerialLogger::Log("[asguard] group-reap leak: as live elsewhere pid=");
+            SerialLogger::LogDec((int)m->pid);
+            SerialLogger::Log("\r\n");
+        }
+    }
+    m->address_space = 0;
+    m->reaped = 1;
+    m->state  = Process_Terminated;
+    if (g_live_proc_count > 0) g_live_proc_count--;
+    // struct intentionally not freed - see the block comment above. (satoru)
+}
+
+int Scheduler::CollectAddressSpaceGroup(uint32_t pid, Process** out, int max) {
+    if (!out || max <= 0) return 0;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* leader = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->pid == pid && !p->reaped) { leader = p; break; }
+    }
+    int n = 0;
+    if (leader && leader->is_user() && leader->address_space) {
+        uint64_t as = leader->address_space;
+        for (Process* p = ready_queue; p && n < max; p = p->next) {
+            if (!p->is_user() || p->reaped) continue;
+            if (p->address_space != as) continue;
+            out[n++] = p;
+        }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return n;
+}
+
+int Scheduler::CollectAddressSpacePids(uint32_t pid, uint32_t* out, int max) {
+    // identity-only variant: pids are copied out while the lock is held, so the
+    // caller never dereferences a Process* a concurrent DestroyProcess may have
+    // heap-freed the instant the lock dropped. (satoru)
+    if (!out || max <= 0) return 0;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    Process* leader = nullptr;
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->pid == pid && !p->reaped) { leader = p; break; }
+    }
+    int n = 0;
+    if (leader && leader->is_user() && leader->address_space) {
+        uint64_t as = leader->address_space;
+        for (Process* p = ready_queue; p && n < max; p = p->next) {
+            if (!p->is_user() || p->reaped) continue;
+            if (p->address_space != as) continue;
+            out[n++] = p->pid;
+        }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return n;
+}
+
+// ── deferred group reaps ─────────────────────────────────────────────────
+// a group kill from the KLS syscall body (sig-9) must not quiesce-wait: it
+// held kls_lock while sleeping, and a target member mid-syscall on another
+// core spins on that same lock and can never get off its cpu - an unwinnable
+// wait that either deadlocked or forced the old orphan-steal to unserialize
+// the kls. instead the killer only MARKS the group dead and queues it here;
+// DrainDeferredReaps (scheduler kernel process, no kls, never sleeps) reaps a
+// group once every member is observably off every cpu, retrying per call.
+// the same queue also un-leaks the hal fault-containment kills and the sync
+// path's quiesce-timeout groups, which previously leaked forever. (satoru)
+struct DeferredReap { Process* members[64]; int n; uint32_t attempts; bool active; };
+static DeferredReap g_deferred_reaps[8];
+static Spinlock g_reap_lock;
+
+void Scheduler::QueueDeferredReap(Process** members, int n) {
+    if (!members || n <= 0) return;
+    if (n > 64) n = 64;
+    uint64_t f; g_reap_lock.LockIrqSave(&f);
+    for (int e = 0; e < 8; e++) {
+        DeferredReap* r = &g_deferred_reaps[e];
+        if (r->active) continue;
+        for (int i = 0; i < n; i++) {
+            r->members[i] = members[i];
+            // deferred sentinel (see reap_group_member): a waitpid /
+            // wake_waiting_parent ReapProcess on a queued member must not
+            // heap-free the struct or destroy the shared address space while
+            // this table still points at it (and while siblings may still be
+            // on-cpu) - that was a drain-side uaf write, the exact freelist-
+            // corruptor class. reaped=2 makes those paths no-op; only the
+            // drain's reap_group_member accepts it. (satoru)
+            if (members[i] && members[i]->reaped == 0) members[i]->reaped = 2;
+        }
+        r->n = n;
+        r->attempts = 0;
+        r->active = true;
+        g_reap_lock.UnlockIrqRestore(f);
+        return;
+    }
+    g_reap_lock.UnlockIrqRestore(f);
+    // table full: the members are already marked dead + dequeued, so this
+    // degrades to the old behavior (leak) rather than blocking the caller. (satoru)
+    sched_log_process_event(members[0], "kill-group",
+                            "deferred-reap table full - leaked group resources");
+}
+
+bool Scheduler::KillProcessGroupAsync(uint32_t pid, Process* skip) {
+    Process* members[64];
+    int n = CollectAddressSpaceGroup(pid, members, 64);
+    if (n <= 0) return false;
+    Process* self = GetCurrentProcess();
+    if (!skip) {
+        for (int i = 0; i < n; i++) {
+            if (members[i] == self) return false;   // refuse killing our own group (satoru)
+        }
+    }
+    // compact out the exempted task (a fatal-signal self-exit: its own exit
+    // syscall walks the normal teardown). (satoru)
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (members[i] != skip) members[m++] = members[i];
+    }
+    if (m <= 0) return false;
+    for (int i = 0; i < m; i++) MarkProcessExited(members[i], -9);
+    QueueDeferredReap(members, m);
+    return true;
+}
+
+int Scheduler::KillProcessGroup(uint32_t pid) {
+    Process* members[64];
+    int n = CollectAddressSpaceGroup(pid, members, 64);
+    if (n <= 0) return 0;
+
+    Process* self = GetCurrentProcess();
+    for (int i = 0; i < n; i++) {
+        if (members[i] == self) return 0;   // refuse killing our own group (satoru)
+    }
+
+    // mark + drain, repeated: a member blocked in a futex when first marked
+    // can re-store Blocked from its own kernel path and even get CAS-woken
+    // back to Ready before it leaves the cpu, so re-mark until the whole
+    // group reads Terminated while simultaneously off every cpu. (satoru)
+    bool quiesced = false;
+    for (int attempt = 0; attempt < 4 && !quiesced; attempt++) {
+        for (int i = 0; i < n; i++) MarkProcessExited(members[i], -9);
+
+        uint64_t deadline = NowMs() + 400;
+        while (NowMs() < deadline) {
+            bool off = true;
+            for (int i = 0; i < n && off; i++) {
+                Process* m = members[i];
+                if (m->on_cpu) off = false;
+                if (m->state != Process_Terminated) off = false;
+                if (current_process == m) off = false;   // bsp current is tracked separately (satoru)
+                for (uint32_t ci = 0; ci < SMP::CpuCount() && off; ci++) {
+                    PerCpu* pc = SMP::ByIndex(ci);
+                    if (pc && pc->current == m) off = false;
+                }
+            }
+            if (off) { quiesced = true; break; }
+            SleepMs(2);   // let the ap preempt ticks move the members off (satoru)
+        }
+    }
+
+    if (!quiesced) {
+        // a core never let go - hand the group to the deferred reaper instead
+        // of leaking it forever, and tell the caller (return 2) NOT to tear
+        // per-process records down under a still-executing member. (satoru)
+        sched_log_process_event(members[0], "kill-group",
+                                "drain timeout - deferred to reaper");
+        QueueDeferredReap(members, n);
+        return 2;
+    }
+
+    // reap threads first, the address-space owner last, so the shared space
+    // is only torn down once nothing else in the group exists. (satoru)
+    for (int i = 0; i < n; i++) {
+        if (members[i]->is_thread()) reap_group_member(members[i]);
+    }
+    for (int i = 0; i < n; i++) {
+        if (!members[i]->is_thread()) reap_group_member(members[i]);
+    }
+    return 1;
+}
+
+void Scheduler::DrainDeferredReaps() {
+    for (int e = 0; e < 8; e++) {
+        Process* local[64];
+        int n = 0;
+        {
+            // short bookkeeping hold only: copy the entry out. content is
+            // stable outside the lock - this drain is the single consumer
+            // (one kernel process), and the queue never reuses an active
+            // slot. holding an irq-off lock across MarkProcessExited was a
+            // multi-ms irq blackout (its RuntimeLog line appends to kvfs). (satoru)
+            uint64_t f; g_reap_lock.LockIrqSave(&f);
+            DeferredReap* r = &g_deferred_reaps[e];
+            if (!r->active) { g_reap_lock.UnlockIrqRestore(f); continue; }
+            for (int i = 0; i < r->n; i++) local[i] = r->members[i];
+            n = r->n;
+            g_reap_lock.UnlockIrqRestore(f);
+        }
+        if (n <= 0) continue;
+        // re-assert terminated: a member mid futex-block can re-store Blocked
+        // from its own kernel path (same reason the sync path re-marks per
+        // attempt). (satoru)
+        for (int i = 0; i < n; i++) {
+            if (local[i] && local[i]->state != Process_Terminated)
+                MarkProcessExited(local[i], -9);
+        }
+        bool off = true;
+        for (int i = 0; i < n && off; i++) {
+            Process* m = local[i];
+            if (!m) continue;
+            if (m->on_cpu) off = false;
+            if (m->state != Process_Terminated) off = false;
+            if (current_process == m) off = false;
+            for (uint32_t ci = 0; ci < SMP::CpuCount() && off; ci++) {
+                PerCpu* pc = SMP::ByIndex(ci);
+                if (pc && pc->current == m) off = false;
+            }
+        }
+        if (!off) {
+            // not yet - retry on a later heartbeat; give up (leak, the old
+            // behavior) only after ~5 minutes of a core never letting go. the
+            // give-up log uses the LOCAL snapshot, not the (now reusable)
+            // table slot. (satoru)
+            bool gave_up = false;
+            {
+                uint64_t f; g_reap_lock.LockIrqSave(&f);
+                DeferredReap* r = &g_deferred_reaps[e];
+                if (r->active && ++r->attempts > 6000) { r->active = false; gave_up = true; }
+                g_reap_lock.UnlockIrqRestore(f);
+            }
+            if (gave_up)
+                sched_log_process_event(local[0], "kill-group",
+                                        "deferred reap gave up - leaked group resources");
+            continue;
+        }
+        {
+            uint64_t f; g_reap_lock.LockIrqSave(&f);
+            g_deferred_reaps[e].active = false;
+            g_reap_lock.UnlockIrqRestore(f);
+        }
+        // reap OUTSIDE the bookkeeping lock (address-space teardown + pmm frees
+        // are long); threads first, the address-space owner last. (satoru)
+        for (int i = 0; i < n; i++) {
+            if (local[i] && local[i]->is_thread()) reap_group_member(local[i]);
+        }
+        for (int i = 0; i < n; i++) {
+            if (local[i] && !local[i]->is_thread()) reap_group_member(local[i]);
+        }
+    }
+}
+
 void Scheduler::Schedule() {
+    // heartbeat for the bsp-starve detector (kls_timer_preempt): if this stamp
+    // goes stale while ring-3 keeps ticking, a user thread is monopolizing the
+    // bsp and the cooperative kernel (desktop, wayland, reaper) is starved. (satoru)
+    g_last_schedule_ms = Timer::GetRealMs64();
     // hold the cross-core scheduler lock for the whole pick: an application
     // processor may be removing a just-exited user thread from ready_queue at the
     // same time. SpinLockGuard does cli + lock and releases on every return path.
@@ -1066,6 +2099,10 @@ void Scheduler::Tick() {
             if (n > 19) n = 19;
             uint32_t w = nice_weight[n + 20];
             cur->vruntime += (1024u * 1024u) / (w ? w : 1);
+
+            // cgroup cpu.max: one cooperative tick approximates 1ms of cpu.
+            // no-op for tasks outside a cgroup. (satoru)
+            if (cur->cgroup_id) cgroup_charge_cpu(cur, 1000);
 
             // Decay interactivity under sustained CPU burn.
             if (cur->interactive_score > 0 && (cur->cpu_ticks_total & 0x3) == 0) {
@@ -1435,6 +2472,20 @@ static void seed_kernel_stack(Process* proc, KernelProcessEntry entry) {
     proc->saved_rsp = (uint64_t)(uintptr_t)sp;
 }
 
+// offset from saved_rsp to the seeded return-address slot. saved_rsp points at
+// the r15 slot (high-72); the entry sits at high-16. verified against
+// switch_to.asm: it pushes rflags then rbp,rbx,r12,r13,r14,r15 on top of the
+// return address its own `call` already pushed, so the resume layout is
+// byte-identical to the seed and this offset holds for EVERY parked kernel
+// frame, run or not. (satoru)
+constexpr uint64_t SEED_RET_OFF = 56;
+
+// who perform_switch is currently switching TO. the asm-side return-address
+// guard runs after the stack pivot and has no way to know this, so stash it
+// here for the reporter. bsp-only cooperative switching, so a plain global is
+// adequate; it is forensics, not control flow. (satoru)
+static Process* g_switch_victim = nullptr;
+
 // Find the next runnable kernel process using a priority-tiered round
 // robin.  We always prefer the highest tier with a Ready/Running task
 // _other than `after`_, falling back to `after` only if literally no
@@ -1442,7 +2493,70 @@ static void seed_kernel_stack(Process* proc, KernelProcessEntry entry) {
 // (e.g. GUI calling YieldNow without sleeping) actually hand off to
 // lower tiers; otherwise the picker would loop on the same process and
 // LOW tier would starve forever.
+// ── the donor slot (see DonateToKernelProcs) ────────────────────────────────
+// a USER task parked inside a slice donation. it is deliberately NOT in
+// g_kernel_procs[]: putting it there lets wake_due_processes() flip it to
+// Process_Ready, and pick_next_user_nolock() asks only for Ready +
+// has_user_frame - so the USER picker would re-dispatch it to RING 3 while its
+// kernel stack sat parked mid-perform_switch. It would then re-enter the kernel
+// on that same stack, overwrite the parked frame, and the switch back would pop
+// a garbage return address. Two schedulers must never own one task.
+//
+// HONESTY NOTE: that is a code-inspection hazard, NOT an observed one. The
+// first cut did enrol in the array and a boot did die with a ring-0 #UD at
+// RIP=0x3 - but the donation in that build was gated on `kstack.high`, which is
+// the zeroed {} for every user task, so it had rejected 100% of calls and could
+// not have caused anything. That panic was pre-existing (it is the documented
+// SMP-resume class). Do not cite it as evidence for this design.
+//
+// Out of the array the parked state is only ever Sleeping or Running, never
+// Ready, so the user picker cannot see it. bsp-only and one-at-a-time, hence a
+// single slot. g_donor / g_donor_until_ms are declared above reap_group_member,
+// which needs them to avoid freeing a parked donor's kernel stack. (satoru)
+
+// ── the kernel-proc heartbeat ───────────────────────────────────────────────
+// stamped by perform_switch, i.e. every time the COOPERATIVE kernel-proc
+// scheduler actually hands the cpu to a kernel process.
+//
+// this exists because the starvation valve was watching LastScheduleMs(), which
+// Schedule() stamps - and Schedule() is the USER-thread picker, driven from
+// IRQ0 every tick. It is therefore never more than a few ms stale, so the
+// valve's ">50ms" trigger could not fire even while the kernel procs were being
+// starved 250x (measured: the kmemx worker took 49 slices in 120s against a
+// designed 100/sec, mean gap 228ms on a 10ms sleep, worst ~5s). Two different
+// schedulers; the valve was reading the wrong one's clock, which is why a
+// stalling boot logged donate=0 with the starvation plainly visible. (satoru)
+static uint64_t g_last_kswitch_ms = 0;
+// rate limit: while starved the trigger is true on EVERY syscall, and firefox
+// issues thousands per second. Ungated that hands the bsp to the kernel procs
+// wholesale and starves firefox instead - the failure mode the earlier
+// per-spurious-SleepMs pacing experiment hit at 8k/s. One donation per 10ms
+// restores exactly the cadence the kernel procs were designed for (~100/sec)
+// and caps the cost at ~10% of bsp time. (satoru)
+static uint64_t g_last_donate_ms  = 0;
+static uint64_t g_donate_gated    = 0;
+// DEFAULT OFF, and that is the measured result, not caution. Pooled n=31 with
+// donation vs n=32 without (same binary, flag only):
+//     paint 71% vs 75%,  stall 0% vs 3%,  crash 8 vs 7,  panic 1 vs 0
+// Statistically identical on every outcome. The donation DOES do its job - mean
+// kernel-proc gap 66ms vs 226ms, a 3.4x win - but that never converts into a
+// paint, so it is pure added risk in a scheduler where every extra switch path
+// has historically cost days. What actually fixed the stall (47% -> ~2% across
+// both arms) was the g_last_kswitch_ms trigger correction plus deleting the
+// valve's harmful 1ms sleep. Keep this code behind the flag for future work;
+// `kurono.donate=1` enables it. (satoru)
+static bool     g_donate_enabled  = false;
+
 static Process* pick_next_kernel(Process* after) {
+    // hand the slice back as soon as the donation deadline passes - FIRST, not
+    // as a fallback: a busy kernel-proc set would otherwise never return to the
+    // user task and the syscall would hang. this bounds the donation to `ms`
+    // plus one kernel-proc slice. (satoru)
+    if (g_donor && g_donor != after && !g_donor->reaped &&
+        g_donor->state == Process_Sleeping && g_donor_until_ms <= now_ms()) {
+        return g_donor;
+    }
+
     if (g_kernel_proc_count == 0) return nullptr;
 
     int start = 0;
@@ -1534,11 +2648,45 @@ static void wake_due_processes() {
 static void perform_switch(Process* prev, Process* next) {
     if (!next || prev == next) return;
 
+    // the kernel-proc heartbeat. only stamp for a real kernel proc: switching
+    // BACK to a donation donor is a user task and must not look like the
+    // cooperative kernel having run. (satoru)
+    if (next->is_kernel_proc) g_last_kswitch_ms = now_ms();
+
+    // ── seeded-frame guard (the ring-0 RIP=0x3 corruptor) ───────────────────
+    // Only meaningful before the task's first run, when we know exactly what
+    // the frame must contain. Catching it HERE turns an unattributable #UD at
+    // RIP=0x3 - which kills the boot and names nothing - into a serial line
+    // naming the victim, and repairing the slot lets the boot continue so the
+    // rest of the run is still measurable. The repair is deliberately not a
+    // "fix": whatever wrote there still wrote there, and the log says so.
+    // (satoru)
+    // this applies to EVERY parked kernel frame, not just seeded ones:
+    // scheduler_switch_to pushes r15,r14,r13,r12,rbx,rbp,rflags on top of the
+    // return address its own `call` already pushed, so the layout it resumes
+    // from is byte-identical to seed_kernel_stack's and the return address is
+    // always at saved_rsp+56.
+    //
+    // Nothing below 1MB is kernel text (that range is real-mode/BIOS), so a
+    // return slot under it is unambiguously garbage - and 0x3, 0x0 and 0xA are
+    // precisely the values this corruptor has produced across sessions. Zero
+    // false positives by construction. (satoru)
+    // record who we are about to switch to, so the asm-side guard (which has no
+    // access to any of this) can name the victim if the return slot goes bad in
+    // the window between here and its `ret`. (satoru)
+    g_switch_victim = next;
+
     Scheduler::current_process = next;
     next->state = Process_Running;
     next->timeslice_ms_left = timeslice_for(next);
     g_need_resched = false;
-    HAL::SetKernelStack(next->kstack.high);
+    // TSS.RSP0 must be the stack that task's next ring-3 -> ring-0 entry will
+    // land on. kernel procs run on kstack.high; a USER task (only ever seen here
+    // as a donation donor) runs on kernel_stack_top, and its kstack is the
+    // all-zero {} every non-SpawnKernelProcess task gets. loading kstack.high
+    // for one would point RSP0 at address 0. (satoru)
+    HAL::SetKernelStack(next->is_kernel_proc ? next->kstack.high
+                                             : next->kernel_stack_top);
 
     if (prev) {
         if (prev->state == Process_Running) prev->state = Process_Ready;
@@ -1550,9 +2698,104 @@ static void perform_switch(Process* prev, Process* next) {
 
 } // namespace
 
+// called from switch_to.asm the instant before a `ret` would jump to a
+// sub-1MB address. This is the corruptor's crime scene: dump who was being
+// resumed and, crucially, the memory AROUND the clobbered slot - the
+// neighbouring words are what identify the writer, since a stray struct write
+// leaves its other fields beside the damage. Does not return; the asm halts. (satoru)
+extern "C" void kp_ret_corrupt_report(uint64_t bad_value, uint64_t slot_va) {
+    SerialLogger::Log("\r\n[RETCORRUPT] about to ret to ");
+    SerialLogger::LogHex64(bad_value);
+    SerialLogger::Log(" from slot ");
+    SerialLogger::LogHex64(slot_va);
+    Process* v = g_switch_victim;
+    if (v) {
+        SerialLogger::Log("\r\n[RETCORRUPT] victim=");
+        SerialLogger::Log(v->name);
+        SerialLogger::Log(" pid=");
+        SerialLogger::LogDec((int)v->pid);
+        SerialLogger::Log(" is_kproc=");
+        SerialLogger::LogDec((int)v->is_kernel_proc);
+        SerialLogger::Log(" state=");
+        SerialLogger::LogDec((int)v->state);
+        SerialLogger::Log(" saved_rsp=");
+        SerialLogger::LogHex64(v->saved_rsp);
+        SerialLogger::Log(" kstack.low=");
+        SerialLogger::LogHex64(v->kstack.low);
+        SerialLogger::Log(" kstack.high=");
+        SerialLogger::LogHex64(v->kstack.high);
+    }
+    // 16 words either side of the damage. (satoru)
+    SerialLogger::Log("\r\n[RETCORRUPT] window:");
+    const volatile uint64_t* p = (const volatile uint64_t*)(uintptr_t)slot_va;
+    for (int i = -16; i <= 16; i++) {
+        if ((i & 3) == 0) {
+            SerialLogger::Log("\r\n  ");
+            SerialLogger::LogHex64((uint64_t)(uintptr_t)(p + i));
+            SerialLogger::Log(":");
+        }
+        SerialLogger::Log(i == 0 ? " >>" : " ");
+        SerialLogger::LogHex64(p[i]);
+    }
+    SerialLogger::Log("\r\n[RETCORRUPT] halted (guard fired BEFORE the wild jump)\r\n");
+}
+
+// called from isr_stubs.asm the instant before an `iretq` would return to a
+// sub-page-0 RIP. This is the corruptor's real crime scene: the switch-frame
+// guard proved the damage is NOT in a context-switch frame, and CS=0x8 says the
+// return goes back into kernel mode - so what got clobbered is a saved
+// interrupt frame sitting on a kernel stack. Dump the frame and its
+// neighbourhood; a stray struct write leaves its other fields beside the
+// damage, which is what names the writer. Does not return. (satoru)
+extern "C" void kp_iret_corrupt_report(uint64_t bad_rip, uint64_t frame_va,
+                                       uint64_t saved_cs) {
+    SerialLogger::Log("\r\n[IRETCORRUPT] rip=");
+    SerialLogger::LogHex64(bad_rip);
+    SerialLogger::Log(" cs=");
+    SerialLogger::LogHex64(saved_cs);
+    SerialLogger::Log(" frame=");
+    SerialLogger::LogHex64(frame_va);
+    SerialLogger::Log(" cpu=");
+    SerialLogger::LogDec((int)SMP::CpuIndex());
+    Process* c = Scheduler::current_process;
+    if (c) {
+        SerialLogger::Log("\r\n[IRETCORRUPT] current=");
+        SerialLogger::Log(c->name);
+        SerialLogger::Log(" pid=");
+        SerialLogger::LogDec((int)c->pid);
+        SerialLogger::Log(" is_kproc=");
+        SerialLogger::LogDec((int)c->is_kernel_proc);
+        SerialLogger::Log(" kstack.low=");
+        SerialLogger::LogHex64(c->kstack.low);
+        SerialLogger::Log(" kstack.high=");
+        SerialLogger::LogHex64(c->kstack.high);
+        SerialLogger::Log(" kernel_stack_top=");
+        SerialLogger::LogHex64(c->kernel_stack_top);
+    }
+    SerialLogger::Log("\r\n[IRETCORRUPT] window:");
+    const volatile uint64_t* p = (const volatile uint64_t*)(uintptr_t)frame_va;
+    for (int i = -20; i <= 12; i++) {
+        if ((i & 3) == 0) {
+            SerialLogger::Log("\r\n  ");
+            SerialLogger::LogHex64((uint64_t)(uintptr_t)(p + i));
+            SerialLogger::Log(":");
+        }
+        SerialLogger::Log(i == 0 ? " >>" : " ");
+        SerialLogger::LogHex64(p[i]);
+    }
+    SerialLogger::Log("\r\n[IRETCORRUPT] halted BEFORE the wild jump\r\n");
+}
+
 bool Scheduler::IsPreemptiveKernelSchedulerActive() {
     return g_preemptive_active;
 }
+
+// defined out here, not beside g_last_kswitch_ms: that variable lives in the
+// file's anonymous namespace, and a Scheduler:: member cannot be defined
+// inside one. (satoru)
+uint64_t Scheduler::LastKernelSwitchMs() { return g_last_kswitch_ms; }
+void Scheduler::SetDonateEnabled(bool on) { g_donate_enabled = on; }
+bool Scheduler::DonateEnabled() { return g_donate_enabled; }
 
 uint64_t Scheduler::NowMs() {
     return g_sched_now_ms;
@@ -1589,6 +2832,10 @@ Process* Scheduler::SpawnKernelProcess(const char* name,
 }
 
 [[noreturn]] void Scheduler::Start() {
+    // the scheduler clock is live from here - stamp every serial line with
+    // boot-ms so the log doubles as a startup profile. (satoru)
+    SerialLogger::SetTimestampSource(&Scheduler::NowMs);
+
     Process* first = pick_next_kernel(nullptr);
     if (!first) {
         kp_serial_log("[Sched] FATAL: Start() with no kernel processes\r\n");
@@ -1643,6 +2890,14 @@ void Scheduler::SleepMs(uint32_t ms) {
         while (prev->state == Process_Sleeping) {
             HAL::WaitForInterrupt();
             wake_due_processes();
+            // another kernel proc may have come due while we idle for our own (possibly
+            // seconds-long) sleep: hand it the cpu instead of making it wait for ours.
+            // measured: input polling stalled 5000ms behind a 5s sleeper. (satoru)
+            IrqGuard g2;
+            if (prev->state == Process_Sleeping) {
+                Process* n2 = pick_next_kernel(prev);
+                if (n2) { perform_switch(prev, n2); return; }
+            }
         }
         prev->state = Process_Running;
         return;
@@ -1650,6 +2905,154 @@ void Scheduler::SleepMs(uint32_t ms) {
 
     IrqGuard g;
     perform_switch(prev, next);
+}
+
+// ── the starvation fix: let a USER task donate a slice to the kernel procs ──
+//
+// THE BUG THIS FIXES (measured: 10/20 boots STALL, the single largest failure
+// class). A firefox thread on the bsp hammering non-blocking syscalls never
+// blocks, so the cooperative kernel processes - GUIProcess above all - never
+// run, and the render handshake the thread is waiting for can never be
+// produced. Livelock.
+//
+// The relief valve already existed but was a NO-OP, because both SleepMs() and
+// YieldNow() early-return for a non-kernel-proc caller: from user syscall
+// context there was literally no way to give a kernel process cpu time. The
+// valve just HLT'd for 1ms and changed nothing.
+//
+// WHY A NAIVE SWITCH DOES NOT WORK: pick_next_kernel() only ever walks
+// g_kernel_procs[], so switching a user task away would leave nothing able to
+// pick it BACK - the syscall would hang forever. That is almost certainly why
+// the guard was there in the first place.
+//
+// THE FIX: park the user task in a dedicated donor slot (g_donor) and switch to
+// a kernel proc on its own kernel stack. pick_next_kernel() returns the donor
+// the moment its deadline passes, so the next kernel proc to call
+// SleepMs/YieldNow hands the slice straight back and we resume right here.
+// Return latency is bounded by `ms` plus one kernel-proc slice, which is fine
+// for a valve that only fires after >50ms of starvation.
+//
+// WHY A SLOT AND NOT g_kernel_procs[]: the first cut DID enrol the task in that
+// array, and it panicked. wake_due_processes() walks the array and flips a due
+// sleeper to Process_Ready - and the USER picker asks only for Ready +
+// has_user_frame, so it re-dispatched the very same task to ring 3 while its
+// kernel stack sat parked mid-perform_switch. The task re-entered the kernel on
+// that stack, overwrote the parked frame, and the switch back popped garbage:
+// ring-0 #UD at RIP=0x3. Two schedulers must never own one task. Out of the
+// array its state is only ever Sleeping or Running, never Ready, so the user
+// picker cannot see it.
+//
+// PRECONDITIONS THE CALLER MUST HONOUR: bsp only, ring-0 syscall context, and
+// the kls lock RELEASED (a donated-to kernel proc that needs the kls would
+// otherwise deadlock against us - the deadlock doctrine in CLAUDE.md).
+// Returns true if a slice was actually donated. (satoru)
+// donation telemetry. if a stall persists after this fix, the FIRST question is
+// whether the valve fired at all - a null result with donate_ok==0 means the
+// >50ms starvation trigger never tripped, which is a completely different bug
+// from "donation happened and did not help". (satoru)
+static uint64_t g_donate_calls = 0;   // valve fired (satoru)
+static uint64_t g_donate_ok    = 0;   // a slice was actually handed over (satoru)
+static uint64_t g_donate_none  = 0;   // nothing runnable to donate to (satoru)
+
+void Scheduler::GetDonateStats(uint64_t* calls, uint64_t* ok, uint64_t* none) {
+    if (calls) *calls = g_donate_calls;
+    if (ok)    *ok    = g_donate_ok;
+    // report the rate-limited count as `none`'s companion via the same slot the
+    // caller prints: gated dwarfs everything else once the valve works, and it
+    // is the number that says the trigger is live. (satoru)
+    if (none)  *none  = g_donate_gated;
+}
+
+bool Scheduler::DonateToKernelProcs(uint32_t ms) {
+    // count at the TOP so `calls` means "the valve got here". calls-ok-none is
+    // then exactly the number rejected by the guards below, which is what tells
+    // a "never fired" stall apart from a "fired and did not help" one. (satoru)
+    g_donate_calls++;
+    if (!g_donate_enabled) return false;           // kurono.donate=0 (satoru)
+    if (!g_preemptive_active) return false;
+    Process* me = current_process;
+    if (!me || me->is_kernel_proc) return false;   // kernel procs use SleepMs
+    if (me->reaped) return false;
+    // the stack we are actually running on. NOT kstack.high - that is the
+    // kernel-proc-only field and is the zeroed {} for every user task, so
+    // gating on it silently rejected 100% of donations and the valve never
+    // fired at all. (satoru)
+    if (!me->kernel_stack_top) return false;
+    if (g_donor) return false;                     // one donation at a time (satoru)
+    {
+        uint64_t t = now_ms();
+        if (t - g_last_donate_ms < 10) { g_donate_gated++; return false; }
+        g_last_donate_ms = t;
+    }
+
+    Process* next = nullptr;
+    {
+        IrqGuard g;
+        // claim the slot, then sleep. Sleeping (not Ready) is what keeps the
+        // user picker from ever seeing us while we are parked. (satoru)
+        uint64_t t = now_ms();
+        me->sleep_start_ms  = t;
+        me->sleep_until_ms  = t + (ms ? ms : 1);
+        me->state           = Process_Sleeping;
+        g_donor             = me;
+        g_donor_until_ms    = me->sleep_until_ms;
+        // pass `me` as `after` so the picker's own donor fast-path cannot hand
+        // us straight back to ourselves. (satoru)
+        next = pick_next_kernel(me);
+        if (!next || next == me) {
+            // nothing runnable to donate to: undo cleanly and tell the caller,
+            // so it can fall back to the old breathe-and-continue. (satoru)
+            g_donor    = nullptr;
+            me->state  = Process_Running;
+            g_donate_none++;
+            return false;
+        }
+    }
+
+    // ── vector/tls bracket ──────────────────────────────────────────────────
+    // scheduler_switch_to saves callee-saved GPRs and rflags, nothing else -
+    // which is fine between kernel procs but NOT when switching away from a
+    // user task mid-syscall, whose x87/sse registers are live and unsaved. The
+    // kernel is built -mno-sse, but hand-written asm is not: GUIProcess's
+    // framebuffer copy uses SSE directly, so donating a slice to it would
+    // silently corrupt firefox's xmm state and its tls if anything touched the
+    // fs base. SaveUserFrame/LoadUserFrame bracket every sibling switch for
+    // exactly this reason (scheduler.cpp:672 / :1050); the donation is a
+    // sibling switch too, so it takes the same bracket. (satoru)
+    constexpr uint32_t MSR_FS_BASE_DON = 0xC0000100;
+    uint32_t fs_lo, fs_hi;
+    __asm__ __volatile__("rdmsr" : "=a"(fs_lo), "=d"(fs_hi) : "c"(MSR_FS_BASE_DON));
+    __asm__ __volatile__("fxsave %0" : "=m"(me->fpu_state));
+
+    {
+        IrqGuard g;
+        perform_switch(me, next);
+    }
+
+    // ── resumed: a kernel proc handed the slice back. release the slot. ─────
+    __asm__ __volatile__("fxrstor %0" : : "m"(me->fpu_state));
+    __asm__ __volatile__("wrmsr" : : "a"(fs_lo), "d"(fs_hi), "c"(MSR_FS_BASE_DON));
+
+    {
+        IrqGuard g;
+        g_donor    = nullptr;
+        me->state  = Process_Running;
+    }
+    g_donate_ok++;
+    // one-shot proof-of-life for the first few real donations. the [kxjit] dump
+    // that normally carries these counters rides on the kmemx worker, which is
+    // exactly the process being starved - on a boot that dies early it never
+    // prints at all, so "did the valve fire" was unanswerable. log it from here
+    // instead, where it cannot be starved out. capped so it can never become
+    // its own serial flood. (satoru)
+    if (g_donate_ok <= 3) {
+        kp_serial_log("[donate] handed a slice to the kernel procs, ok=");
+        SerialLogger::LogDec((int)g_donate_ok);
+        kp_serial_log(" gated=");
+        SerialLogger::LogDec((int)g_donate_gated);
+        kp_serial_log("\r\n");
+    }
+    return true;
 }
 
 void Scheduler::YieldNow() {
@@ -1669,6 +3072,11 @@ void Scheduler::ServiceSleepQueue() {
 
 void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     g_sched_now_ms += ms_elapsed;
+    // refresh the userspace vdso time page (seqlock write, no heap/kvfs/port-io
+    // -> irq-safe, same discipline as the g_sched_now_ms bump above). this is
+    // what lets firefox's clock_gettime convoy read time in userspace with zero
+    // syscall (the ~85x boot-speed fix). (satoru)
+    KernelVdso::Tick();
     // NOTE: HRTimer::Tick() is intentionally NOT called here. It fires periodic
     // callbacks INLINE, and the only one (proc_refresh -> RuntimeLayout::
     // RefreshProc) writes /proc files via KVFS -> KernelHeap. Running that from
@@ -1679,6 +3087,15 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     // wake_due_processes() stays (it only flips process states, no heap/KVFS).
     // (satoru)
     wake_due_processes();
+
+    // NOTE (2026-07-12): a starvation-proof audio refill was tried here
+    // (AudioServer::TickFromTimer) but running the FULL mixer pump - static
+    // 16KB accumulator, EQ, limiter, resample, backend mmio/port io - inline
+    // in this irq0 handler with interrupts disabled stole enough irq-context
+    // time to wreck firefox's startup futex timing (boot crash/no-map rate
+    // shot up). the audio kernel process pump + the shorter 6-period gate are
+    // the actual anti-crackle fixes; the timer backup is NOT worth
+    // destabilizing the whole scheduler tick. left out on purpose. (satoru)
 
     // re-ready descheduled user-thread pollers. poll_try_deschedule parks a
     // blocking poll as Process_Blocked + sleep_ticks and relies on a periodic
@@ -1712,6 +3129,15 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     if (!p || !p->is_kernel_proc) return;
 
     p->cpu_ms_total += ms_elapsed;
+
+    // cgroup cpu.max: charge this slice against the process's bandwidth pool;
+    // when it throttles, ask for a resched so pick_next_kernel (which already
+    // skips tasks whose cgroup_throttle_until_ms is in the future) can hand
+    // the cpu to someone else at the next safe point. (satoru)
+    if (p->cgroup_id) {
+        cgroup_charge_cpu(p, (uint64_t)ms_elapsed * 1000ull);
+        if (p->cgroup_throttle_until_ms > Timer::GetRealMs64()) g_need_resched = true;
+    }
 
     // CPU-burn decay of interactivity.  A long-running compute task
     // gradually loses its interactive_score, so when an interactive task

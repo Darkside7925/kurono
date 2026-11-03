@@ -403,6 +403,11 @@ void LinuxDeviceBridge::RegisterDefaults() {
         devices[idx].write = WriteNull;
     }
 
+    // /dev/kshell (5, 200) - rescue-agent command channel. the real read/write
+    // behaviour lives in linux_syscall.cpp (LFD_DEVKSHELL); this entry only
+    // makes it visible to anything that enumerates /dev. (satoru)
+    Register("kshell", "/dev/kshell", LDEV_CHAR, LDEV_CLASS_TTY, 5, 200);
+
     // /dev/tty (5, 0) - current terminal
     Register("tty", "/dev/tty", LDEV_CHAR, LDEV_CLASS_TTY, 5, 0);
 

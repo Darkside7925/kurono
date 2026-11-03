@@ -4,6 +4,49 @@
 #include "../kernel/heap.h"
 #include "../kernel/io.h"
 #include "../kernel/vmm.h"   // map the high 64-bit bar before dereferencing it (satoru)
+#include "serial.h"          // [vgtime] present-phase instrument (satoru)
+
+// present-phase timing instrument. the present costs ~4.2ms/frame (measured:
+// caps virtio at ~236fps vs ~2030fps on the plain framebuffer) but we do not
+// know WHERE that goes - submit cost, the host's transfer, or the flush. a
+// naive async restructure was already tried and made things WORSE, so measure
+// the phases before restructuring again. split reported: build+submit, then
+// the wait for the FIRST completion (the transfer - once that retires the host
+// owns a copy and the guest backing is free to overwrite), then the extra wait
+// for the SECOND (the flush/display). (satoru)
+static inline uint64_t vg_rdtsc() {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// ── async present state (one frame in flight) ───────────────────────────────
+// the present submits and returns; DrainPresent() retires the frame just
+// before the compositor next writes the framebuffer. exactly one frame may be
+// outstanding, so the ring can never grow and the descriptors are always
+// reclaimed. (satoru)
+static bool     s_present_inflight = false;
+static uint16_t s_present_expected = 0;
+static uint16_t s_present_head_a   = 0;
+static uint16_t s_present_head_b   = 0;
+static uint64_t s_present_submit_cycles = 0;
+// ASYNC BY DEFAULT (kurono.vgsync=1 restores the blocking present).
+// the present submits and returns; DrainPresent() collects it at the top of
+// Graphics::SwapBuffers, immediately before the first write to fb_addr.
+//
+// MEASURED, and the useful metric was NOT throughput. present cost drops
+// 1169us -> 52us (22x), but fps is unchanged at the 60fps cap, unchanged with
+// full-screen transfers, and unchanged with host headroom - because the 1.17ms
+// is not idle latency the guest could reclaim, it is qemu doing real work on
+// the same physical cpus (composite measured 2.58ms -> 3.7ms, cancelling it).
+//
+// the win is LATENCY. a 1.17ms non-yielding busy-poll blocks every other
+// cooperative kernel process. probing with the kmemx worker's 10ms sleep, the
+// gap it actually gets: sync 10.69ms vs async 10.52ms mean over ~3000 samples,
+// two runs per arm, no overlap between arms. that is a 24% cut in scheduling
+// overshoot (685us -> 522us), and worst-case gaps trend lower too. on a
+// cooperative scheduler that is the property that matters. (satoru)
+static bool     s_present_sync = false;
 
 bool VirtIOGPU::detected = false;
 volatile uint8_t* VirtIOGPU::bar0 = nullptr;
@@ -640,7 +683,74 @@ bool VirtIOGPU::MoveCursor(uint32_t scanout, uint32_t x, uint32_t y) {
 }
 
 bool VirtIOGPU::PresentFramebuffer(void* pixels, uint32_t width, uint32_t height) {
+    return PresentFramebufferRect(pixels, width, height, 0, 0, width, height);
+}
+
+void VirtIOGPU::SetSyncPresent(bool on) { s_present_sync = on; }
+
+void VirtIOGPU::DrainPresent() {
+    if (!s_present_inflight) return;
+    VirtQueue* vq = &controlq;
+    uint64_t t0 = vg_rdtsc();
+    for (int i = 0; i < 2000000; i++) {
+        __asm__ volatile("mfence" ::: "memory");
+        if ((int16_t)(vq->used->idx - s_present_expected) >= 0) {
+            vq->last_used_idx = s_present_expected;
+            break;
+        }
+        for (volatile int d = 0; d < 16; d++);
+    }
+    uint64_t waited = vg_rdtsc() - t0;
+    // reclaim regardless of timeout - a leaked descriptor pair would wedge the
+    // ring, which is worse than a dropped frame. (satoru)
+    vq->desc[s_present_head_a].next = vq->free_head;
+    vq->free_head = s_present_head_a;
+    vq->num_free++;
+    vq->desc[s_present_head_b].next = vq->free_head;
+    vq->free_head = s_present_head_b;
+    vq->num_free++;
+    s_present_inflight = false;
+
+    // prove the overlap actually works: `waitdrain` is what is LEFT of the
+    // transfer wait after the compositor's work overlapped it. it was 1127us
+    // synchronously; if async is doing its job this is ~0. (satoru)
+    static uint32_t s_n = 0;
+    static uint64_t s_sub = 0, s_wait = 0;
+    s_sub  += s_present_submit_cycles;
+    s_wait += waited;
+    if (++s_n >= 120) {
+        SerialLogger::Log("[vgtime] per-frame kcycles submit=");
+        SerialLogger::LogDec((int)(s_sub / s_n / 1000));
+        SerialLogger::Log(" waitdrain=");
+        SerialLogger::LogDec((int)(s_wait / s_n / 1000));
+        SerialLogger::Log(" n=");
+        SerialLogger::LogDec((int)s_n);
+        SerialLogger::Log("\r\n");
+        s_n = 0; s_sub = 0; s_wait = 0;
+    }
+}
+
+// PERF NOTE (measured 2026-07-27): the virtio present's synchronous wait below
+// is ~4.2ms/frame and caps this backend at ~236fps, while the plain framebuffer
+// path does ~2030fps - the "accelerated" backend is 8.6x SLOWER, and the cost
+// is the host ROUND-TRIP, not the pixels. an async restructure (submit here,
+// retire at the top of the next present) was implemented and measured: it made
+// things slightly WORSE (~210fps), because one frame of overlap only hides the
+// composite. the real fix needs multiple frames genuinely in flight, i.e. more
+// than one scanout resource to write into, plus an interrupt/fence instead of a
+// busy-poll. see the memory note framerate-virtio-is-the-bottleneck. (satoru)
+
+bool VirtIOGPU::PresentFramebufferRect(void* pixels, uint32_t width, uint32_t height,
+                                       uint32_t dx, uint32_t dy,
+                                       uint32_t dw, uint32_t dh) {
     if (!detected || !pixels) return false;
+    uint64_t t_present_start = vg_rdtsc();   // [vgtime] phase instrument (satoru)
+    // clamp the damage box; a degenerate one means "everything". (satoru)
+    if (dw == 0 || dh == 0 || dx >= width || dy >= height) {
+        dx = 0; dy = 0; dw = width; dh = height;
+    }
+    if (dx + dw > width)  dw = width  - dx;
+    if (dy + dh > height) dh = height - dy;
 
     if (fb_resource_id == 0) {
         fb_resource_id = CreateResource2D(width, height, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM);
@@ -663,21 +773,38 @@ bool VirtIOGPU::PresentFramebuffer(void* pixels, uint32_t width, uint32_t height
     // and only poll for the final used-idx update. saves one notify-and-wait
     // round trip per frame, which is the dominant cost at 60+ Hz.
     if (s_indirect_supported && s_indirect_table && controlq.num_free >= 2) {
-        VirtGPU_TransferToHost2D xfer = {};
+        // MUST be persistent: the present is async, so the host reads these
+        // command buffers AFTER we return. as stack locals they would be a
+        // use-after-scope and the host would build the frame from whatever
+        // reused that stack. safe as file-scope because exactly one frame is
+        // ever in flight and the only caller is the gui loop under g_fb_lock.
+        // (satoru)
+        static VirtGPU_TransferToHost2D xfer;
+        static VirtGPU_ResourceFlush    flush;
+        static VirtGPU_CtrlHdr          resp_xfer;
+        static VirtGPU_CtrlHdr          resp_flush;
+        xfer = {};
         xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
-        xfer.rect.width = width;
-        xfer.rect.height = height;
-        xfer.offset = 0;
+        xfer.rect.x = dx;
+        xfer.rect.y = dy;
+        xfer.rect.width = dw;
+        xfer.rect.height = dh;
+        // offset is where THIS rect's pixels start inside the attached backing,
+        // not the rect origin - the backing is one linear width-strided buffer.
+        // a sub-rect transfer with offset 0 would upload the wrong rows. (satoru)
+        xfer.offset = ((uint64_t)dy * (uint64_t)width + (uint64_t)dx) * 4ull;
         xfer.resource_id = fb_resource_id;
 
-        VirtGPU_ResourceFlush flush = {};
+        flush = {};
         flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-        flush.rect.width = width;
-        flush.rect.height = height;
+        flush.rect.x = dx;
+        flush.rect.y = dy;
+        flush.rect.width = dw;
+        flush.rect.height = dh;
         flush.resource_id = fb_resource_id;
 
-        VirtGPU_CtrlHdr resp_xfer = {};
-        VirtGPU_CtrlHdr resp_flush = {};
+        resp_xfer = {};
+        resp_flush = {};
 
         VirtQueue* vq = &controlq;
 
@@ -721,26 +848,35 @@ bool VirtIOGPU::PresentFramebuffer(void* pixels, uint32_t width, uint32_t height
         __asm__ volatile("mfence" ::: "memory");
         NotifyQueue(0);
 
-        uint16_t expected = (uint16_t)(vq->last_used_idx + 2);
-        bool ok = false;
-        for (int i = 0; i < 2000000; i++) {
-            __asm__ volatile("mfence" ::: "memory");
-            if ((int16_t)(vq->used->idx - expected) >= 0) {
-                vq->last_used_idx = expected;
-                ok = true;
-                break;
-            }
-            for (volatile int d = 0; d < 16; d++);
-        }
-
-        // reclaim both descriptors regardless of success - otherwise the ring leaks
-        vq->desc[head_a].next = vq->free_head;
-        vq->free_head = head_a;
-        vq->num_free++;
-        vq->desc[head_b].next = vq->free_head;
-        vq->free_head = head_b;
-        vq->num_free++;
-        return ok;
+        // MEASURED: making this async (submit here, retire at the top of the
+        // next present) did NOT help - virtio went ~236fps -> ~210fps. one
+        // frame of overlap only hides the COMPOSITE (~0.5ms at fpsbench
+        // rates) while the host round-trip is ~4.2ms, so there is nothing to
+        // overlap with and the bookkeeping costs a little. the win needs
+        // several frames genuinely in flight, which needs more than one
+        // scanout resource to write into - a real change, not a reordering.
+        // keeping the simple synchronous wait until that exists. (satoru)
+        // ASYNC: do not wait here. MEASURED phase split (2883MHz, fpsbench):
+        // submit 38us, wait-for-transfer 1127us, wait-for-flush 4.5us. the
+        // whole cost is the transfer wait, and the compositor spends ~1.9ms
+        // building the NEXT frame before it touches this buffer again - which
+        // is longer than the 1.13ms wait. so hand the frame to the host and
+        // let DrainPresent() collect it at the top of the next SwapBuffers,
+        // by which point it is already done and the wait costs ~0.
+        //
+        // an earlier attempt put the drain at the top of the next PRESENT,
+        // which does NOT work: that is after the composite AND after the copy
+        // into this buffer, i.e. too late to be safe and too early to be free.
+        // the drain has to sit immediately before the first write to the
+        // framebuffer. (satoru)
+        s_present_inflight = true;
+        s_present_expected = (uint16_t)(vq->last_used_idx + 2);
+        s_present_head_a   = head_a;
+        s_present_head_b   = head_b;
+        s_present_submit_cycles = vg_rdtsc() - t_present_start;
+        // a/b arm: drain right here to reproduce the old blocking behaviour. (satoru)
+        if (s_present_sync) DrainPresent();
+        return true;
     }
 
     if (!TransferToHost2D(fb_resource_id, 0, 0, width, height)) return false;

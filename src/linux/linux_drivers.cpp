@@ -1143,9 +1143,9 @@ void ProcFS::UpdateNetDev() {
 
 void ProcFS::UpdateMounts() {
     KVFS::WriteString("/proc/mounts",
-        "/dev/sda1 / kvfs rw,relatime 0 0\n"
-        "/dev/sda2 /linux ext4 rw,relatime 0 0\n"
-        "/dev/sda3 /shared ext4 rw,relatime 0 0\n"
+        // no /dev/sd* lines: linux programs never have those mounted, and a
+        // repair tool that sees its target here refuses to touch it. (satoru)
+        "kvfs / kvfs rw,relatime 0 0\n"
         "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
         "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
         "devtmpfs /dev devtmpfs rw,nosuid,size=5242880k,nr_inodes=1310720,mode=755 0 0\n"

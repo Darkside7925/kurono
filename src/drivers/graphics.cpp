@@ -8,6 +8,7 @@
 #include "../kernel/panic.h"
 #include "../ui/font.h"
 #include "virtio_gpu.h"   // accelerated present path (satoru)
+#include "bga.h"          // live hardware geometry for the resize self-heal (satoru)
 
 // when the virtio-gpu backend is active, fb_addr is a guest-ram resource
 // backing that must be transferred + flushed to the host after each frame.
@@ -258,7 +259,28 @@ uint64_t Graphics::dirty_area_total = 0;
 static volatile uint32_t g_ui_dirty = 1;          // start dirty: paint frame 0
 static uint32_t          g_ui_dirty_seen = 0;
 
-void Graphics::MarkUIDirty()        { g_ui_dirty++; }
+// return address of the most recent MarkUIDirty caller, for the gui loop's
+// [gui] report (finds whoever keeps an idle desktop redrawing).
+static void* g_ui_dirty_from = nullptr;
+__attribute__((noinline)) void Graphics::MarkUIDirty() {
+    g_ui_dirty_from = __builtin_return_address(0);
+    g_ui_dirty++;
+}
+void* Graphics::LastUIDirtyCaller() { return g_ui_dirty_from; }
+
+// earliest pending frame deadline (real ms), 0 = none.
+static volatile uint32_t g_frame_at = 0;
+void Graphics::RequestFrameAt(uint32_t ms) {
+    if (ms == 0) ms = 1;
+    uint32_t cur = g_frame_at;
+    if (cur == 0 || (int32_t)(ms - cur) < 0) g_frame_at = ms;
+}
+bool Graphics::ConsumeFrameDue(uint32_t now_ms) {
+    uint32_t at = g_frame_at;
+    if (at == 0 || (int32_t)(now_ms - at) < 0) return false;
+    g_frame_at = 0;
+    return true;
+}
 uint32_t Graphics::UIDirtyCount()   { return g_ui_dirty; }
 bool Graphics::ConsumeUIDirty() {
     uint32_t cur = g_ui_dirty;
@@ -314,6 +336,31 @@ void Graphics::ReinitForResolution(uintptr_t addr, uint32_t width, uint32_t heig
     if (wanted == DOUBLE_BUFFER || wanted == TRIPLE_BUFFER) {
         SetRenderMode(wanted);
     }
+}
+
+// resize self-heal: when the host resizes the qemu window the bga reprograms
+// its mode registers, but if the guest's res-sync path is starved (firefox
+// pinning every core) the compositor keeps blitting at the OLD pitch into the
+// NEW-stride scanout = the diagonal-tear garbage the user saw. read the LIVE
+// bga geometry every render; if it drifted from our cached fb_*, reinit +
+// realloc the backbuffer + full-dirty so the very next frame matches the
+// hardware. runs on whatever process renders, so starvation can't leave a
+// torn frame on screen. returns true if a resync happened (caller relayouts
+// the desktop). std-vga/bga only; virtio-gpu owns its own present size. (satoru)
+bool Graphics::SyncToHardwareGeometry() {
+    if (!BGA::available || !BGA::framebuffer) return false;
+    uint32_t hw_w = BGA::width, hw_h = BGA::height, hw_pitch = BGA::pitch;
+    uint8_t  hw_bpp = (uint8_t)BGA::bpp;
+    if (hw_w == 0 || hw_h == 0 || hw_pitch == 0) return false;
+    if (hw_w == fb_width && hw_h == fb_height && hw_pitch == fb_pitch &&
+        (uintptr_t)BGA::framebuffer == (uintptr_t)fb_addr) {
+        return false;   // in sync (satoru)
+    }
+    SerialLogger::Log("Graphics: hardware geometry drift - resyncing compositor\r\n");
+    ReinitForResolution((uintptr_t)BGA::framebuffer, hw_w, hw_h, hw_pitch, hw_bpp);
+    full_screen_dirty = true;
+    MarkUIDirty();
+    return true;
 }
 
 void Graphics::InitAdvanced() {
@@ -457,13 +504,38 @@ uint32_t Graphics::GetTargetFrameTimeMs() {
 
 void Graphics::SetVirtioPresent(bool on) { g_present_via_virtio = on; }
 
+// damage bounds of the frame SwapBuffers just wrote, kept for the virtio
+// present that follows it. SwapBuffers already computes a dirty-rect list and
+// only copies those rows, then calls ClearDirtyRegions() - so by the time
+// PresentVirtioIfActive runs the damage is gone and the host transfer had no
+// choice but to re-upload the whole screen (8.3mb at 1080p) for even a cursor
+// move. capture the union box before it is cleared and hand it to the transfer,
+// which already takes x/y/w/h. a full-frame swap sets the box to the screen, so
+// the worst case is exactly the old behaviour. (satoru)
+static uint32_t g_pres_x = 0, g_pres_y = 0, g_pres_w = 0, g_pres_h = 0;
+static bool g_force_full_present = false;
+void Graphics::SetForceFullPresent(bool on) { g_force_full_present = on; }
+void Graphics::SetPresentDamage(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    g_pres_x = x; g_pres_y = y; g_pres_w = w; g_pres_h = h;
+}
+
 // push the just-swapped frame to the host gpu. called by the gui loop right
 // after SwapBuffers when the virtio-gpu backend is active; a no-op otherwise so
 // the bga/std-vga present path is unchanged. PresentFramebuffer pipelines the
 // transfer + flush into the virtqueue (one notify per frame). (satoru)
 void Graphics::PresentVirtioIfActive() {
     if (!g_present_via_virtio || !fb_addr) return;
-    VirtIOGPU::PresentFramebuffer((void*)fb_addr, fb_width, fb_height);
+    // upload only the damaged box. a zero/unset box means "whole screen" so any
+    // path that swaps without recording damage still behaves as before. (satoru)
+    uint32_t dx = g_pres_x, dy = g_pres_y, dw = g_pres_w, dh = g_pres_h;
+    if (g_force_full_present) { dx = 0; dy = 0; dw = fb_width; dh = fb_height; }
+    if (dw == 0 || dh == 0 || dx >= fb_width || dy >= fb_height) {
+        dx = 0; dy = 0; dw = fb_width; dh = fb_height;
+    }
+    if (dx + dw > fb_width)  dw = fb_width  - dx;
+    if (dy + dh > fb_height) dh = fb_height - dy;
+    VirtIOGPU::PresentFramebufferRect((void*)fb_addr, fb_width, fb_height,
+                                      dx, dy, dw, dh);
 }
 
 uint32_t Graphics::GetMonitorHz() {
@@ -605,6 +677,13 @@ static void blit_filtered_row(uint8_t* dst_row, const uint8_t* src_row, int x, i
 
 void Graphics::SwapBuffers() {
     if (render_mode == SINGLE_BUFFER) return;
+    // the virtio present is ASYNC: it hands the frame to the host and returns
+    // without waiting. this is the last safe moment to collect it - everything
+    // below writes into fb_addr, which is the very buffer the host reads. the
+    // compositor has just spent ~1.9ms building the frame, which is longer
+    // than the ~1.13ms transfer, so this drain normally costs nothing. no-op
+    // unless a present is actually outstanding. (satoru)
+    if (g_present_via_virtio) VirtIOGPU::DrainPresent();
     if (!back_buffer || !fb_addr) return;
 
     const uint32_t bytes_per_pixel = fb_bpp / 8;
@@ -648,6 +727,12 @@ void Graphics::SwapBuffers() {
             }
         }
         __asm__ __volatile__("sfence" ::: "memory");
+        // this path has its own dirty handling and returns early. it MUST still
+        // publish a damage box or the virtio present would reuse the PREVIOUS
+        // frame's box and upload the wrong region. take the whole screen: the
+        // accessibility tone-map is the rare path, and correctness beats the
+        // upload saving here. (satoru)
+        SetPresentDamage(0, 0, fb_width, fb_height);
         ClearDirtyRegions();
         return;
     }
@@ -668,6 +753,10 @@ void Graphics::SwapBuffers() {
         uint64_t total_pixels = (uint64_t)fb_width * (uint64_t)fb_height;
 
         if (active_rects > 0 && dirty_pixels < (total_pixels * 3 / 5)) {
+            // union box of everything we actually copy, for the virtio present
+            // that follows (see SetPresentDamage). accumulated from the CLIPPED
+            // rects so it can never exceed the screen. (satoru)
+            int bx0 = (int)fb_width, by0 = (int)fb_height, bx1 = 0, by1 = 0;
             for (int i = 0; i < dirty_count; i++) {
                 if (!dirty_regions[i].active) continue;
                 int rx = dirty_regions[i].x;
@@ -680,6 +769,10 @@ void Graphics::SwapBuffers() {
                 if (rx + rw > (int)fb_width)  rw = (int)fb_width  - rx;
                 if (ry + rh > (int)fb_height) rh = (int)fb_height - ry;
                 if (rw <= 0 || rh <= 0) continue;
+                if (rx < bx0) bx0 = rx;
+                if (ry < by0) by0 = ry;
+                if (rx + rw > bx1) bx1 = rx + rw;
+                if (ry + rh > by1) by1 = ry + rh;
 
                 size_t region_bytes = (size_t)rw * bytes_per_pixel;
                 size_t col_off = (size_t)rx * bytes_per_pixel;
@@ -689,6 +782,11 @@ void Graphics::SwapBuffers() {
                 }
             }
             __asm__ __volatile__("sfence" ::: "memory");
+            if (bx1 > bx0 && by1 > by0)
+                SetPresentDamage((uint32_t)bx0, (uint32_t)by0,
+                                 (uint32_t)(bx1 - bx0), (uint32_t)(by1 - by0));
+            else
+                SetPresentDamage(0, 0, fb_width, fb_height);
             ClearDirtyRegions();
             return;
         }
@@ -708,6 +806,8 @@ void Graphics::SwapBuffers() {
     }
 
     __asm__ __volatile__("sfence" ::: "memory");
+    // full-frame swap: the host must re-read everything, same as before. (satoru)
+    SetPresentDamage(0, 0, fb_width, fb_height);
     ClearDirtyRegions();
 }
 
@@ -1311,7 +1411,9 @@ void Graphics::DrawString(int x, int y, const char* s, uint32_t fg, uint32_t /*b
     if (SettingsApp::state.font_scale > 1) {
         pxh *= (float)SettingsApp::state.font_scale;
     }
-    FontTTF::DrawString(x, y, pxh, s, fg);
+    // top-left line box like the pixel font: the modern style draws inter,
+    // the classic style (FontTTF inactive) keeps the 8x16 pixel font. (satoru)
+    FontTTF::DrawText(x, y, pxh, s, fg);
 }
 
 //  drawcircle - midpoint circle algorithm

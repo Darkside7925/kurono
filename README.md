@@ -1,911 +1,145 @@
-# Kurono OS
+# Kurono
 
-A bare-metal x86_64 operating system with a hybrid kernel that combines a native desktop OS, a Linux-compatible syscall/runtime layer, a Windows command environment, a package/update pipeline, and a Type 1 hypervisor into one bootable image.
+An x86_64 operating system I'm writing from scratch in freestanding C++17 and assembly. It has its own kernel, drivers, filesystem, TCP/IP stack, compositing desktop and scripting language, plus a Linux syscall layer good enough to run real, unmodified Linux programs. There's no Linux kernel underneath and no libc in the kernel.
 
-Built from scratch in freestanding C++17 and x86 assembly - no libc in the kernel, no borrowed POSIX runtime under the kernel, and no existing host kernel reused as the core OS. Kurono boots and runs on real x86_64 hardware - it boots as a Multiboot2 ELF kernel, also produces standalone EFI loaders, supports emergency recovery boot, can deploy onto FAT32/ext4 installer targets, and ships both Alpine and Debian guest paths. QEMU/KVM (and WHPX on Windows) is the day-to-day development, iteration, and CI environment; bare metal is the target.
+The two programs I judge it by are Firefox 140 and the Claude Code CLI. Both are the stock binaries, and both run on it in QEMU. On my actual laptop (Legion Pro 7, Core Ultra 7 255HX) both start, but they're slow and they stall, and I'm working on that.
 
-> **19 core hardware drivers (+ a new wireless-NIC hardware layer) - 150+ shell commands across the Kurono / Linux / Windows environments - full TCP/IP stack - in-kernel ELF64 dynamic linker (ld-kurono) - a Linux syscall runtime with real concurrent threads/futex, epoll, mprotect W^X and SCM_RIGHTS fd-passing - an in-kernel Wayland compositor that renders real musl-compiled Wayland clients on screen - PulseAudio/D-Bus runtime services - multi-backend display manager (BGA, VirtIO GPU, Intel, NVIDIA, AMD) - hybrid GPU topology detection (Optimus, PowerXpress) - emergency EFI boot - installer stack - Alpine VM - Debian on-demand rootfs and update pipeline**
-
-> **Security note:** Kurono recently went through a whole-OS security audit (~68 issues triaged; **~20 confirmed memory-safety bugs fixed and merged so far, more in progress**): integer-overflow heap overflows in the media codecs (AAC/FLAC/WAV/MP3/MP4), two remotely-triggerable D-Bus stack overflows, a 9p (v9fs) guest→host VM-escape, GPU 64-bit-BAR mapping bugs, "trust-the-on-disk-data" bugs in ext4/KFS/NVMe, interpreter recursion/overflow bugs (KCL/KJ), and a shell 64 KB-stack→heap fix. This was a real hardening pass, but Kurono is **not** "production-ready" or "bug-free"; the audit is ongoing and there are known open issues. See *Security Hardening* below.
-
-> **On the browser question:** Kurono does *not* ship a cut-down toy browser, and the GUI "Browser" tile is a deliberate placeholder. The real answer is **Firefox on the Linux runtime**, and it now **renders a real web page on the Kurono desktop**. A full Firefox 140.11.0esr (musl + Wayland, 174 MB `libxul.so`, software WebRender) boots in-process across the secondary cores, loads a real profile, runs BrowserGlue and the services JS, navigates to a page over the in-kernel TCP/IP stack, and its software-WebRender content path actually **paints the page** - a dark GitHub-style repo page with its full README text, laid out and composited through the in-kernel compositor. Getting from "the chrome paints" to "the page paints" took three real kernel fixes, each a bug Firefox just happened to be the first program brutal enough to expose: an **SMP frame-handoff barrier** that killed a cross-core context corruption (a thread migrating between cores read a half-saved register frame - the `RIP=0x3` wild-jump / userspace `#PF` that was crashing roughly 3 of every 4 boots), sending **`wl_buffer::release`** so Firefox's SW-WR doesn't exhaust its buffer pool and freeze after the first frame, and a **per-surface shadow buffer** in the compositor so a damage-incremental client (which attaches a fresh mostly-empty buffer each frame and only paints the changed strip) can't wipe the window to black. Honest caveats: the page *content* renders, but the browser *chrome* text (tab title, URL bar) is still not painting, and boot is slow and flaky - there's an SMP-bringup stall lottery I haven't closed yet - so a rendered page is a good-boot thing, not an every-boot guarantee. `curl <url>` is still the dependable scripted-HTTP path.
-
-> **Project status & why a lot of features land at once:** Kurono is a solo, long-running project. Most of its subsystems were built up over time in a local `feats/` tree on my development machine. A large part of the feature set already exists there, it just isn't all polished, debugged, or cleanly wired together yet. What you see landing in this repo is an active **stabilization & release phase**: I'm debugging those long-built pieces and pushing them out as each one becomes solid, which is why many features arrive in a short window rather than trickling in one at a time. A lot of the OS is "built and *almost* working", functional with rough edges and real bugs being actively fixed (see the honest caveats throughout this README). It is **not** a daily driver yet; treat it as an ambitious, fast-moving work-in-progress where most of the hard parts already exist and the remaining work is largely debugging and finishing.
+> **Status:** early, and moving fast. It boots on real hardware now, but it's only been tested on one real machine. About 30% of what I'm working on isn't pushed yet (multi-monitor and UI scaling are in there), and I expect it in a few days. Don't run it on a computer you care about without reading [the write guard](#the-write-guard).
 
 ---
 
-## Quick Start
+## What it can do
 
-I moved the whole thing onto Linux (KVM), so this is the path I actually use day to day:
+| | In QEMU | On my laptop |
+| --- | --- | --- |
+| UEFI boot to desktop | yes | yes |
+| SMP | up to 20 CPUs tested | 8 of 20 cores (default cap) |
+| USB keyboard and mouse | yes | yes |
+| NVMe | yes | yes |
+| Ethernet | e1000, 82576, I225/I226 | I226-V at 1 Gbps with DHCP |
+| Intel HD Audio | yes | ALC287, but the speakers need an amp driver Kurono doesn't have |
+| USB audio | UAC1 | AirPods Max over USB-C (UAC2) |
+| Files that survive a reboot | yes | yes |
+| Claude Code, full interface | yes | answers, but stalls for minutes |
+| Firefox 140 | painted in every recent test boot | opens, but very slow, then freezes |
+| Multiple monitors | not pushed yet | no |
+| Wi-Fi | no | no |
+| GPU acceleration | no | no |
+
+### The desktop
+
+Kurono has its own compositor and window manager, with animated windows, a dock, a menu bar, and an original icon set. It also has an in-kernel Wayland compositor, which is how Firefox gets on screen.
+
+Built-in apps: Terminal, File Manager, Text Editor, Calculator, Media Player, Task Manager, and Settings. The terminal is a real vt100 emulator on a real pty, so full-screen programs work in it: colors, alternate screen, scroll regions, resize and all.
+
+### Running Linux programs
+
+Kurono implements the Linux syscall ABI in the kernel and has its own ELF64 dynamic linker, `ld-kurono`. Threads and futexes, epoll, pidfd, inotify, ptys, Unix sockets with fd passing, and close-on-exec all behave enough like Linux for real software:
+
+- **Firefox 140 ESR** (musl + Wayland, 174 MB `libxul.so`), with content processes, across several cores.
+- **Claude Code**, the stock `linux-x64-musl` build with no patches. It's a 300 MB fixed-address executable that sits right where the kernel used to live, so the kernel now links itself above it.
+- **Stock Debian `busybox-static`** and other prebuilt glibc and musl binaries.
+
+Getting there is mostly finding everything your kernel gets subtly wrong. See [bugs worth reading about](#bugs-worth-reading-about).
+
+### Everything else in the box
+
+- **Kernel:** hybrid design, a driver framework (KDF), 8 core scheduler with per-CPU timers, and KMemX, a memory compressor (built and tested, but real boots don't compress anything yet).
+- **Storage:** KFS, my own on-disk filesystem, plus ext4 and FAT32 support, NVMe, AHCI and USB mass storage.
+- **Networking:** a from-scratch TCP/IP stack with DHCP, window scaling and out-of-order reassembly.
+- **Audio:** a mixer and audio server, a PulseAudio-compatible server for Linux apps, HD Audio, USB audio.
+- **Languages:** KCL, Kurono's scripting language, plus small built-in Python and JavaScript interpreters.
+- **Shell:** 150+ commands across Kurono, Linux and Windows-flavored environments.
+- **Packages:** `kpkg`, with a boot-time update flow.
+- **Hypervisor:** a Type 1 stack with VT-x and AMD-V support. It needs VT-x or AMD-V exposed to Kurono, so inside most VMs that means nested virtualization. I haven't tried it on my laptop.
+
+---
+
+## Building and running
+
+Everything builds on Linux. I use Debian 13, and WSL Debian on Windows works too. You need a C++ toolchain, NASM, `musl-gcc` (`musl-tools`), `gnu-efi`, `grub-mkrescue` and `xorriso`.
 
 ```bash
-# build the iso + boot it (KVM, virtio-gpu, audio, USB): one command
-./start.sh
-
-# don't rebuild, just boot the existing iso
-./start.sh --no-build
-
-# clean rebuild then boot
-./start.sh --clean
-
-# plain framebuffer instead of the accelerated virtio-gpu
-./start.sh --std
-
-# boot the UEFI path instead of BIOS
-./start.sh --uefi
-
-# gdb stub on localhost:1234
-./start.sh --debug
+cd src && make iso -j8 KURONO_KERNEL_BASE=0x14000000
 ```
 
-> multi-core: boot **`-smp 4`** (what `start.sh` defaults to). all cores boot and run kernel code in parallel, real AP bring-up (INIT-SIPI-SIPI), a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, and a per-CPU current task are in. the old ">1 core deadlocks the desktop" bug is gone. And the **secondary cores now run real ring-3 Linux user processes in parallel with the desktop**: the per-CPU rewrite (cross-core ready-queue lock + atomic per-CPU claim, a per-CPU user-execution context replacing the old single-active-process model, per-CPU syscall state) is done, and an application processor has been shown launching `/usr/bin/mhello`, running it, and exiting 0 while the desktop rendered untouched. It's opt-in (`./start.sh --apsched`); the default boot parks the APs exactly as before. And the APs are now **preemptive**: each arms a per-CPU LAPIC timer that time-slices the user threads it runs, instead of only switching cooperatively at syscalls. Running `clone` sibling threads across cores and load balancing are the next step. See [docs/developers/proc/SMP.md](docs/developers/proc/SMP.md).
+That gives you `build/kurono.iso` and the UEFI loader, `build/isodir/boot/kurono_efi.efi`.
 
-If you're still on Windows the old WHPX launcher works too:
+`KURONO_KERNEL_BASE` links the kernel above Claude Code's fixed load address. Leave it off for the classic low link, which still boots on 512 MB of RAM. Make doesn't notice when only this flag changes, so delete `build/kurono_base.elf` and `build/kurono.elf` when you switch.
 
-```powershell
-# Build ISO and launch with the default QEMU profile
-.\start.ps1
-
-# Launch the existing ISO without rebuilding
-.\start.ps1 -NoBuild
-
-# Clean, rebuild, and launch
-.\start.ps1 -Clean
-
-# Launch with a GDB stub on localhost:1234
-.\start.ps1 -Debug
-
-# Boot with OVMF UEFI firmware instead of SeaBIOS
-.\start.ps1 -UEFI
-
-# Use KVM on Linux hosts
-.\start.ps1 -KVM
-
-# Bare-metal-style host CPU pass-through path (Linux/KVM hosts)
-.\start.ps1 -BareMetal
-
-# Override guest RAM
-.\start.ps1 -Memory 12G
-```
+Run it in QEMU:
 
 ```bash
-# Build only from WSL
-wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make'
-
-# Build the bootable ISO only
-wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make iso'
-
-# Fallback run path without hardware acceleration
-wsl bash -lc 'cd /mnt/c/Users/genie/OS/src && make run-noaccel'
+qemu-system-x86_64 -enable-kvm -cpu host -smp 8 -m 8G -boot d \
+  -cdrom build/kurono.iso \
+  -netdev user,id=n0 -device e1000,netdev=n0 \
+  -device qemu-xhci -device usb-kbd -device usb-mouse
 ```
 
-`start.ps1` currently builds by invoking `make iso` inside WSL from `src/`, then launches the generated `build/kurono.iso`. There is no `-NoAccel` switch in the current PowerShell launcher; the non-accelerated path is the `make run-noaccel` target.
+Keep `-boot d`: with a second disk attached, QEMU otherwise tries to boot the disk and you get a black screen. Kurono doesn't boot on `-M q35`.
 
-### GRUB boot menu
+### On real hardware
 
-`make iso` generates the GRUB menu (defined in `src/Makefile`). On UEFI it defaults
-to the EFI loader; on BIOS it defaults to the Multiboot2 kernel. The entries are:
+This isn't an installer. It's how I run it, and it assumes you're comfortable with partitions and a boot manager.
 
-- **Kurono OS (EFI Direct)**: chainload the standalone EFI loader
-- **Kurono OS (Emergency EFI)**: chainload the emergency EFI loader
-- **Kurono OS (Multiboot2)**: the normal kernel boot (BIOS default), straight to the desktop
-- **Kurono Setup**: boots `kurono.setup=1` and runs the graphical installer / first-setup wizard
-- **Kurono OS (Emergency Multiboot2)**: text-mode emergency kernel
-- **Kurono OS (CLI Multiboot2)**: the headless/CLI boot profile (`KURONO_BOOT_PROFILE=cli`)
-- **Kurono OS (Multiboot1)**: Multiboot1 fallback
-- **Kurono OS (Debug, GRUB verbose)**: verbose GRUB diagnostics
-- **Kurono OS (Text Mode, no framebuffer)** / **(gfxpayload=keep)**: display fallbacks
+1. Make a FAT32 partition and name it `KURONO` in the GPT. Kurono looks for exactly one partition with that name.
+2. Copy `kurono_efi.efi` to `EFI\BOOT\BOOTX64.EFI` on it.
+3. Put these in its root:
 
-> **Installer / first-run setup.** The graphical installer (a real disk-install
-> wizard: language → keyboard → **network/Wi-Fi** → disk → partition → filesystem →
-> **guest-OS install (Debian/etc.)** → user → summary → progress) has its own
-> dedicated **"Kurono Setup"** GRUB entry (`kurono.setup=1`); the normal entry
-> boots straight to the desktop. It can also be launched on demand from the
-> desktop **"Install Kurono"** shortcut or the shell `installer` command. It is
-> never the default boot, so it can't strand a first-boot user on a black
-> installer screen before input is up. See
-> [docs/developers/system/INSTALLER.md](docs/developers/system/INSTALLER.md).
+| File | What | Size |
+| --- | --- | --- |
+| `KURONO.LOG` | zero-filled, the boot log streams into it | 16 MB |
+| `KURONO.KFS` | zero-filled, your persistent files; must be contiguous | 3 GB is plenty |
+| `FIREFOX.TAR` | optional, the Firefox package, so it installs with no network | about 350 MB |
+| `CLAUDE` | optional, `package/claude` from `@anthropic-ai/claude-code-linux-x64-musl` | about 300 MB |
+| `CLAUDE.ENV` | optional, `CLAUDE_CODE_OAUTH_TOKEN=...` or `ANTHROPIC_API_KEY=...` | small |
 
----
+`CLAUDE.ENV` is plain text, and anything that can read that partition can read it. You can `export` the variable in Kurono's terminal instead.
 
-## Current Snapshot
+Boot it from your firmware's menu or a boot manager. If something breaks, the log is sitting in `KURONO.LOG`, and you can read it from any other OS.
 
-- **Architecture:** x86_64 bare metal, Multiboot2 kernel, standalone EFI loader, emergency EFI loader
-- **Implementation:** freestanding C++17 + NASM assembly
-- **Kernel model:** custom kernel, HAL, drivers, filesystem, shell, Linux runtime, hypervisor, and in-kernel Wayland compositor
-- **Primary build artifacts:**
-  - `build/kurono.elf`
-  - `build/kurono_base.elf`
-  - `build/kurono.iso`
-  - `build/boot/kurono_efi.efi`
-  - `build/boot/kurono_emergency.efi`
-  - `iso/kurono.iso`
-- **Default QEMU profile:** 10 GB RAM, 4 vCPUs, `-serial stdio`, Intel E1000 networking, SB16 + AC97 + Intel HDA audio, WHPX on Windows, KVM on Linux
-- **What boots today:** graphical desktop with compositing window manager, lock screen, package manager, updater UI, Linux subsystem, installer, in-kernel Wayland compositor accepting real Wayland clients, and emergency recovery paths. The hypervisor's Alpine/Debian guest-boot path is implemented, but **booting a Linux guest needs the host to expose nested VT-x to Kurono**: under plain nested KVM (Kurono itself a guest) the guest VM-entry currently fails (VMX entry error), so guest boot is verified only where nested VMX is available (see *Known Limitations*)
+### The write guard
+
+On real hardware, Kurono refuses every disk write outside the files on its own `KURONO` partition, on NVMe, SATA and USB storage alike. It turns on by itself for UEFI boots and for any disk that isn't QEMU's. The only way to turn it off is `kurono.diskguard=0`. It exists because a test build could otherwise have formatted my real SSD.
 
 ---
 
-## Recent Updates
+## Bugs worth reading about
 
-### Latest (July 2026): Firefox renders a real web page + an SMP correctness hardening pass
-
-Getting Firefox from "full Wayland handshake" to **a rendered web page on the desktop** turned into the most productive kernel-debugging stretch this project has had. Every one of these is a genuine, reusable kernel fix that Firefox merely happened to be the first program brutal enough to expose:
-
-- **Firefox paints a real web page.** It navigates to a page over the in-kernel TCP/IP stack and its software-WebRender content path lays out and paints the document - a dark GitHub-style repo page with its full README text - composited through the in-kernel compositor. Three fixes got it from "the chrome paints" to "the page paints":
-  - **SMP frame-handoff barrier (the corruption fix).** A thread that migrated between cores could be resumed on a second core while the first was still mid-save of its register frame, so it ran on a **half-saved `user_frame`** - corrupt registers, which showed up as a `RIP=0x3` wild-jump `#UD` and, deeper into boot, a userspace `#PF`, crashing roughly 3 of every 4 Firefox boots. I built a standalone raw-futex torture test (`src/userprogs/pthread_test.c`) that reproduces the corruption in ~60s without Firefox (the same binary is 300/300 clean on native Linux, so it's a real Kurono bug, not a test artifact), then fixed it with an `on_cpu` frame-handoff barrier modelled on Linux's `finish_task`: the owning core release-stores `on_cpu=0` only *after* it has saved the frame, and another core acquire-loads it before resuming, so a half-saved frame is never read. Firefox boot crash rate went 75% -> 0.
-  - **`wl_buffer::release` (the frozen-browser fix).** The compositor never sent buffer-release events, so Firefox's SW-WR exhausted its small buffer pool after the *first* frame and blocked forever waiting for a free buffer - a frozen browser with an empty URL bar. The compositor now copies the committed pixels and releases the buffer, so rendering keeps flowing.
-  - **Per-surface shadow buffer (the black-window fix).** A damage-incremental client like Firefox attaches a fresh, mostly-empty buffer each frame and only paints the changed strip; blitting the raw attached buffer therefore wiped the window to black every frame. The compositor now keeps a per-surface shadow, accumulates each commit's damage region into it, and blits from the shadow - so the window shows the whole accumulated picture (and survives GTK destroying the buffers it has released).
-- **Firefox renders its complete browser chrome.** Tab strip, +new-tab, back/forward/reload, focused URL bar, bookmark star, account/extensions/hamburger menus, window controls - composited by the in-kernel compositor via **`wl_subsurface` compositing** (GTK renders the browser UI into a 973x743 content subsurface inset inside a 1025x795 CSD toplevel; the compositor now composites child subsurfaces onto the parent at their `set_position` offsets). Runs **single-process** (e10s off - the old "e10s IPC is the blocker" framing is obsolete) with its threads dispatched across the secondary cores (`kurono.apthreads=1`, `-smp 4`).
-- **SMP futex waiter-slot ownership fix.** Two abort paths in the futex wait cleared their waiter slot *unconditionally*; under SMP a cross-CPU `FUTEX_WAKE` could consume the slot and a different thread re-enqueue into the same index inside that window, so the blind clear destroyed the new owner's entry and left that thread blocked forever with no slot and no deadline - the long-standing "startup stalls at thread-init, no crash" heisenbug. Both sites now verify slot ownership before clearing.
-- **TLB shootdown that actually waits.** `SMP::BroadcastTlbFlush` gave up its ack-wait in sub-millisecond time "because a peer may briefly hold IF=0" - but one serial line is an ~8.7 ms ring-0 UART busy-wait with interrupts off, so under serial load a core could keep executing **stale instruction translations after the JIT's W^X `mprotect` flips**, producing per-boot-random wild-jump `#GP`s inside SpiderMonkey's JIT pages. The ack-wait is now a 20 ms wall-clock bound (safe: waiters on the mmap lock keep IF=1 and still take the IPI).
-- **Process-reap use-after-free.** `DestroyProcess` freed the `Process` struct even when a CPU was still unwinding on it (its own exit syscall, or a cross-CPU reap racing the exiting core's final iretq); the heap block got recycled instantly and the CPU then iretq'd through whatever landed there. Register dumps full of ASCII path bytes were the giveaway. The struct and kernel stack now leak (bounded, rare) whenever the task context is still live on any CPU.
-- **The serial-log mirror was corrupting the kernel.** Every serial line was synchronously appended into KVFS (`/kurono/var/log/serial.log`) from *any* context - including timer IRQs and, fatally, the `#PF`/`#GP` exception-dump path. Because the log, VFS, and heap locks are all CPU-owner-*recursive*, a fault taken while one was already held re-entered a half-mutated KVFS tree and heap free-list on the same core and wrote log text straight over live blocks. This single mechanism was behind a whole family of "register dump full of `serial.l`/`/kurono/` ASCII" corruptions and the `#PF`-dump → nested-fault → triple-fault reboot cascades. `RuntimeLog::MirrorSerial` now only stages into a fixed static ring from whatever context it runs in; the `LoggingProcess` kernel-process is the *only* thing that moves that ring into KVFS, from safe process context. **Rule going forward: never add serial logging to an exception or heap path without this deferral.**
-- **`readlink` on an existing non-symlink** was returning `-ENOENT` (a stale workaround for a long-fixed startup deadlock). That broke musl's `realpath()` → Rust's `fs::canonicalize()` → rkv/kvstore for *every existing directory*, so Firefox's chrome init spammed ~95 uncaught "I/O error: NotFound" JS exceptions per boot and wedged several startup services. Now returns the POSIX-correct `-EINVAL` for a real non-symlink node, `-ENOENT` only when the path truly doesn't exist; the exception storm drops to near-zero.
-- **Real `fcntl` byte-range locks.** `F_GETLK`/`F_SETLK`/`F_SETLKW` were an always-grant stub, so two SQLite connections could both hold an "exclusive" WAL lock, SQLite detected the inconsistency, and failed with `SQLITE_PROTOCOL` in retry loops - wedging both the Places DB init and, worse, NSS's `cert9.db` open, which is the *first* thing Firefox's socket thread does. There is now a real advisory-lock table keyed by `(path-hash, [start,end), owner=thread-group leader)`; `F_SETLKW` yields with a bounded wait, and a close drops the process's locks on that file (POSIX semantics SQLite's VFS is built on).
-- **`read`/`write` on socket and pipe fds.** `sys_read`/`sys_write` had no `LFD_SOCKET`/`LFD_PIPE` case and fell straight through to `-EBADF`. NSPR's `PollableEvent` - the mechanism Firefox's socket thread uses to wake its poll loop - self-tests by `write()`ing one end of a pipe; that `-EBADF` made it tear the event down and run wake-less, so the socket thread serviced no dispatched runnables (and no page ever loaded). Both syscalls now route socket/pipe fds through the AF_UNIX backend, with the read side using the same cooperative deschedule-and-retry discipline as the inet path.
-- **Firefox launch config** (`src/shell/shell.cpp`): a duplicate `browser.startup.homepage` `lockPref` (the later `about:blank`/`page=0` pair was silently overriding the real homepage set earlier in the same generated `firefox.cfg`) is reconciled, and navigation is driven directly from a privileged autoconfig snippet once chrome startup finishes - so a boot actually targets a page instead of sitting on a blank tab.
-
-> **Honest status of the Firefox work:** the page *content* renders - screenshotted, repeatable on a good boot - and the kernel fixes above stand on their own regardless of Firefox (the `on_cpu` frame-handoff barrier fixes a real SMP corruption that would bite any threaded workload). What's still not there: the browser *chrome* text (tab title, URL bar) doesn't paint yet, and boot is slow and flaky - there's an SMP-bringup stall lottery I haven't closed, so a rendered page is a good-boot outcome, not an every-boot guarantee. `curl <url>` is still the dependable scripted-HTTP path.
-
-- **KMemX transparently compresses inactive memory across the whole OS** (`src/kernel/kmemx*.{h,cpp}`, `docs/developers/kernel/KMEMX.md`). Cold 4 KB pages are LZ4-compressed into a fixed physical pool (~1.5-2 KB each instead of 4 KB) and decompressed back on the page fault that next touches them, so the same RAM runs more apps.
-  - **Page aging** uses a 4-bit generation counter parked in spare PTE bits (an LRU clock off the hardware Accessed bit). A dedicated CPU-capped kernel-process (10 ms tick, **token bucket of 1-16 pages/tick by memory pressure** so CPU stays at 1-5%) compresses pages past the threshold, yielding to the compositor when frames are pending so it is invisible.
-  - **The fault path** decompresses a page back into a fresh frame, **CRC32-verifies it (mismatch = kernel panic, never wrong bytes)**, and restores the leaf. Latency on an idle host: **~1.9 us warm / ~3.9 us mean / ~8.2 us max, 0 over the 10 us budget** (a hand-written SSE2 `movdqu` wildcopy + slice-by-8 CRC32 cut the mean from ~12 us). The LZ4 codec is clean-room, freestanding, **zero-allocation on the hot path**.
-  - **Adaptive pressure** (green/yellow/orange/red/critical) integrates with kinit (compress guests at orange+, stop launching services at red, shed lowest-priority services at critical). **KSM-style dedup** with COW refcounting merges identical pages. **Guest VM pages** are compressed at the hypervisor EPT level.
-  - **User-facing:** an enable/disable toggle + disclaimers (`kmemx.enabled`, default on), a Kurono Setup installer option, a Settings -> System -> Memory Compression panel (toggle + pool-size + aggressiveness sliders), and a `kmemx` shell command (status/stats/pressure/compress/decompress/flush/config/enable/disable/benchmark).
-  - **Verified headless** (`kurono.kmemxtest`, `-m 2G`, KVM): **SUMMARY 7/7** - 1000-page LZ4 roundtrip byte-exact (cross-checked vs an independent reference decoder + 2M-op metadata-table fuzz + 500k-op pool fuzz on the host), pool alloc/coalesce, 1000-page store/retrieve through the real pool, PTE aging, an end-to-end compress -> real `#PF` -> decompress cycle (64/64 byte-exact), and dedup (no leak/double-free). **Honest:** the full-system targets (Firefox 500 MB -> 50 MB, guests -70%) are aspirational and need those workloads booted under the engine; the native pipeline they ride on is fully verified, but the EPT guest path can't be exercised headless without a running guest (built + wired, unverified end-to-end). Ratios: ~157:1 zero pages, ~45:1 structured, ~2.2:1 over the mixed corpus.
-
-### hybrid-kernel driver model (KDF / UDF / IRP / KExec)
-
-- **A Windows-NT-style hybrid kernel driver model so a driver can crash without taking down the OS.** Performance-critical subsystems (VMM/PMM/scheduler/compositor/NVMe data path/TCP) stay in ring 0; drivers move into isolation tiers.
-  - **KDF (Kernel Driver Framework, `src/kernel/kdf.{h,cpp}`, `docs/developers/kernel/KDF.md`)**, the ring-0+ sandbox. A kernel driver still runs in ring 0, but every DMA buffer (`KDF::AllocDMA`) and MMIO window (`KDF::MapMMIO`) it gets is fenced by **unmapped guard pages** in a dedicated higher-half VA window. An out-of-bounds dereference faults into a guard page; the kernel `#PF` path quarantines the region, regdumps, logs to `/kurono/var/log/drivers.log`, reports to kinit, and `longjmp`s the faulting op back to its `RunGuarded` call-site instead of panicking. kinit restarts the driver (backoff + 5-in-60s). **NVMe is migrated**, measured **879 MB/s write, 1082 MB/s read, 35.5k 4K IOPS** under KDF (hot path untouched).
-  - **UDF (User Driver Framework, `src/kernel/udf.{h,cpp}`, `docs/developers/kernel/UDF.md`)**, the ring-3 tier. A user-mode driver reaches hardware only through a kernel `UDFProxy` via the new **`SYS_UDF_CALL`** syscall; a crashed ring-3 driver cannot touch kernel memory and is restarted by kinit.
-  - **IRP** (`src/kernel/irp.*`), stackable async I/O request packets (NVMe registers as the `nvme0` block device). **KExec** (`src/kernel/kexec.*`), an NT-style executive facade (Mm/Ps/Io/Se/Cm).
-  - **Verified headless** with `kurono.kdf.test` (`-smp 4`): **`KDF-SELFTEST: 3/3 OVERALL PASS`**, a deliberately-faulted driver's guard-page overrun is caught, the kernel keeps running, and kinit restarts the driver. Shell: `hwfw`. **Honest:** KDF is VMM guard-page isolation, **not** full address-space separation; UDF adds ~10-15 µs/call; only NVMe is migrated so far; no ring-3 UDF *driver* ships yet (framework + syscall are real).
-
-### security hardening pass + wireless-NIC hardware layer
-
-- **Whole-OS security audit (~68 issues triaged, ~20 memory-safety bugs fixed + merged, more in progress).** This was a deliberate hardening pass, not a cosmetic one. Fixed so far:
-  - **Media codecs:** integer-overflow-into-heap-overflow bugs in the AAC, FLAC, WAV (8-bit decode + duration divide-by-zero), and MP4 paths, plus an MP3 `ReadBits` out-of-bounds read and an MP4 box-recursion stack overflow, these are reachable by simply opening a malformed media file.
-  - **D-Bus:** two remotely-triggerable stack overflows in the session-bus server (`ListNames` reply body and `send_method_return` header/body writes now bounded).
-  - **Hypervisor / guest boundary:** a 9p (`v9fs`) **guest→host VM-escape**: the handlers translated only the start of a guest buffer, then copied `count`/`sizeof(stat)` bytes sequentially past it; a malicious guest could read/write host memory. Also bounded the virtual-PCI config writes and a virtio-GPU `TransferToHost` out-of-range rect.
-  - **GPU:** 64-bit BAR mapping bugs (the GPU and HDA drivers dereferenced a BAR before mapping the full 64-bit address) fixed.
-  - **Storage (trust-the-on-disk-data):** ext4 superblock / directory-entry / extent-header validation (zero blocks-per-group divide-by-zero, `rec_len` walk, `Mkdir` null-deref, extent-count clamp), a KFS superblock validator on mount, and an NVMe shared-submission-queue serialization + untrusted-shift clamp.
-  - **Interpreters:** KCL `*` (string-repeat) integer overflow and KCL/KJ parser+eval recursion-depth caps (a deep script could overflow the kernel stack); same string-repeat overflow fixed in the mini-Python interpreter; KJ `val_to_str` recursion capped.
-  - **Shell:** `cat`/`head`/`tail`/`wc`/`sort`/`uniq` (Linux) and `type` (Windows) moved their 64 KB read buffers off the kernel stack onto the heap.
-  - Plus loader/network bounds fixes (ELF `RELATIVE` reloc target, `kls` PT_LOAD range check, `ProcIndex` parent copy bound, guest-framebuffer blit clip, a VMM huge-page flag-drop bug).
-  - **Honest framing:** ~20 of ~68 found are fixed; the rest (including remaining concurrency/perf items) are still open. This moved the safety floor a lot. It does **not** make the OS bug-free.
-- **Real wireless-NIC hardware layer (`drivers/wifi_dev`).** Kurono now actually *finds and identifies* the WiFi card: a PCI-bus walk for wireless network controllers, exact chip identification (Intel Wi-Fi 6 AX200/AX210/AX211/AX201 + Wireless-AC 9560/8265/7260, Atheros AR9xxx + Qualcomm QCA988x/QCA6174/QCA9377, Realtek RTL88xx/87xx, Broadcom BCM43xx), 64-bit MMIO BAR mapping, and PCI bus-master enable, the hardware foundation a radio driver sits on. **What this is *not* (yet):** there is no association. The shared 802.11 MAC (scan/auth/assoc) + WPA2 software stack is **in progress**, and the per-vendor radio/firmware drivers are the next phase and need **real hardware** to bring up (QEMU emulates no WiFi NIC). The desktop tray and the setup wizard report the detected chip but stay honest that the link isn't up. **WiFi is detected and identified; it does not connect yet.**
-
-### June 2026: moved to Linux + made the desktop actually usable
-
-Ditched Windows/WHPX and got Kurono building and booting on Linux under KVM. It's way faster and it quietly fixed a pile of networking + input pain that WHPX was causing. Wrote a `start.sh` so booting is one command now.
-
-- **Boot doesn't hang anymore.** The desktop was coming up black, turned out the large-model BSS section wasn't being zeroed, so a bunch of pointers were straight-up garbage. Fixed it in the linker script. The old SMP race that froze the desktop ~8s in is also fixed, `-smp 4` is the default now and all cores boot and run kernel code in parallel.
-- **Reboot persistence on a real filesystem + multi-core bring-up.** KVFS state now survives a reboot through **KFS**: a from-scratch inode-based on-disk filesystem (the NVMe driver was dead until a missing `volatile` on the completion poll was fixed; it now does multi-page DMA via a PRP list). The user-data tree is stored as real files + dirs, not a blob. And the secondary cores are genuinely up: INIT-SIPI-SIPI bring-up, a per-CPU swapgs SYSCALL path, per-CPU GDT/TSS, per-CPU current task. The **per-CPU scheduling foundation** for running user threads on them then landed, a cross-core ready-queue lock + atomic per-CPU claim, a per-CPU user-execution context (replacing the single-active-process model), and per-CPU syscall state, all verified non-regressing under `-smp 4` (desktop renders, no faults). And the AP dispatch loop now **enters ring-3 on the secondary cores**: opt-in via `./start.sh --apsched`, an application processor was shown launching `/usr/bin/mhello`, running its syscalls, and exiting 0 in parallel with the desktop; the APs are then made **preemptive** with a per-CPU LAPIC timer. Spreading a process's `clone` threads across multiple cores and load balancing are the remaining steps. See [docs/developers/proc/SMP.md](docs/developers/proc/SMP.md).
-- **A real Linux GUI client renders through the in-kernel Wayland compositor.** This is the milestone the rest of the runtime was building toward. The userspace layer grew the pieces a real GUI app actually blocks on: preemptive concurrent threads (`clone`/`CLONE_THREAD`) backed by a real `futex` (the multithreaded pthread gate passes), `epoll`/`poll`, `mprotect` with W^X enforcement, `memfd`/file-backed `mmap`, and `SCM_RIGHTS` fd-passing end to end. With those in place, a Wayland client compiled with **musl-gcc** (`wl_shm_test`, embedded in the kernel and launched by the `wltest` command) connects to the compositor over the AF_UNIX socket, fd-passes a `wl_shm` buffer, and the compositor blits its pixels into a real window-manager window with damage tracking and forwards pointer input back to it. That's the whole `wl_shm` + `xdg-shell` render path working, not just the wire protocol. (Keyboard-to-client forwarding is the next wire-up.)
-- **Firefox runs a full Wayland client handshake against the in-kernel compositor.** A real **Firefox 140.11.0esr** is built against **musl** (clang/lld, `--disable-jit`, `cairo-gtk3-wayland`), `firefox`/`firefox-bin` plus a 174 MB `libxul.so` Gecko engine, build rc=0. On-device `ld-kurono` resolves libxul's full `.so` closure, loads and relocates it (130 MB+) at a multi-terabyte base, and XPCOM + Gecko run; from there the runtime was driven all the way through a complete Wayland bringup: firefox connects to the compositor, its WaylandProxy forwards `get_registry`, it binds all 9 globals, and it runs `wl_compositor.create_surface` then a `wl_shm` buffer pool then `wl_seat` (get_pointer/get_keyboard) then `wl_output`, verified headless with **0 faults and 0 protocol errors**. Six fixes on branch `feat/firefox-poll-deschedule` got it there (cooperative poll/ppoll that yields a blocked user thread; clone region-table sharing; accepted-socket `on_data`; a shared CLONE_FILES fd table + listen-socket POLLIN + the `OnTimerTick` user-thread poll re-ready + `ioctl(FIONREAD)`; the compositor's `iface_id_of` exact-name match + bind-id assignment + initial global events). The remaining blocker before a **rendered window** is a bind-id desync (firefox's `wl_registry.bind` carries no object-id on the wire, so the compositor's id guess diverges from firefox's allocation and input setup hangs), *not* e10s and *not* an address-space limit (the old `<4 GB` user-pointer ABI cap is **gone**; user mappings span the full canonical 64-bit user range). This is the concrete rebuttal to "a freestanding OS can't have a browser."
-- **Networking actually works.** curl/HTTP goes end to end now, fixed a recv loop that gave up way too early, the FIN_WAIT half-close path, and ephemeral port selection. Pulled real pages off example.com and wikipedia over tap+NAT. Throughput then improved: TCP send went from stop-and-wait to a **fixed multi-segment send window**, and the ~1 ms network wait loops now yield instead of busy-spinning.
-- **USB works over xHCI.** keyboard, mouse, and tablet all enumerate and report now (the DMA structs just needed proper page alignment). The tablet gives accurate absolute cursor positioning, which is also how I drive it headless.
-- **Killed the bugs that made the desktop unusable:**
-  - top taskbar was eating *every* click, you literally couldn't use anything. Now only the bar itself grabs clicks; everything else passes through.
-  - Sign Out / Lock froze the whole machine (the lock screen never yielded, so USB input went dead). Fixed.
-  - dragging a window left ghost trails, added a real clip stack so nothing paints outside its own window.
-  - calculator clicks did nothing and right-click in Files was broken, both were window-local vs global coordinate mixups. Fixed.
-- **UI glow-up.** Built a little theme system (KSS) so everything themes the same way instead of every app hardcoding its own colors. Settings and the Control Center are black/grey + modern now, the start button uses the actual boot logo instead of a hand-drawn "K", and a bunch of off-center text (it assumed 8px-per-char on a proportional font) got fixed.
-
-### May 2026
-
-- **Runtime stability and diagnostics**
-  - Fixed Internet checksum generation so IPv4/TCP checksums are calculated from network-order bytes instead of host-order 16-bit words.
-  - Added inbound IPv4 and TCP checksum validation with explicit serial drop logs, which is the right fix for the earlier "ARP works but TCP stalls" behavior.
-  - Fixed TCP checksum coverage to include the real TCP header length, including TCP options.
-  - Replaced the hottest 32bpp video render path with direct active-framebuffer writes instead of per-pixel `DrawPixel()` calls.
-  - Added bounded `VideoPlayer` decode and frame-advance logs for Denji/KVID debugging.
-  - Improved CPU topology fallback so multi-vCPU QEMU guests keep reporting multiple cores even when richer topology leaves are missing.
-  - `/proc/cpuinfo` is now synthesized from `CPUDetect::GetInfo()` rather than stale hardcoded placeholders.
-  - The legacy headless QEMU boot helper now also launches with 4 vCPUs to match the main launcher.
-
-- **Debian delivery and update pipeline**
-  - The large Debian rootfs is no longer embedded in the default ISO.
-  - `kpkg install debian [nvidia|amd|auto|none]` downloads `debian-minbase.ext4` from the package server, stages it to disk, writes a pending-update marker, and prompts for reboot.
-  - The boot-time `SystemUpdate` screen verifies the staged rootfs, boots Debian inside the hypervisor (where nested VMX is available, see *Known Limitations*), updates apt sources, runs `apt-get update`, optionally installs vendor GPU drivers, and then continues to the desktop.
-  - The default build keeps `EMBED_DEBIAN=0`; offline embedding remains available via `make EMBED_DEBIAN=1`.
-
-- **Distribution and export changes**
-  - `make iso` now produces both `build/kurono.iso` and the copied export artifact `iso/kurono.iso`.
-  - The default ISO remains much smaller by moving bulky Debian payloads to runtime download/install flow.
-
-### April 2026
-
-- **In-kernel ELF64 dynamic linker (`ld-kurono`)**
-  - PT_INTERP handoff from the ELF loader
-  - PIE ASLR in the user address range
-  - recursive `DT_NEEDED` resolution with SONAME deduplication
-  - GNU hash and SYSV hash lookup
-  - 24 x86_64 relocation types handled
-  - `PT_GNU_RELRO` enforcement
-  - static TLS support
-  - vDSO page built at `0x7FFFF7FFC000` (currently **not advertised** to the loader, `AT_SYSINFO_EHDR=0`: because the synthesized page lacks a musl-parseable `PT_DYNAMIC`, so musl falls back to plain `syscall`s)
-  - full SysV auxv construction
-  - constructor trampoline for `DT_INIT` / `DT_INIT_ARRAY`
-  - `dlopen`, `dlsym`, `dlclose`, `dlvsym`, `dladdr`, `dlerror`
-  - `LD_DEBUG`, `LD_PRELOAD`, and `r_debug` rendezvous support
-
-- **Linux userspace runtime plumbing**
-  - Runtime layout seeder under `/system`
-  - Wayland compositor socket at `/system/run/user/1000/wayland-0`
-  - PulseAudio-compatible server at `/system/run/user/1000/pulse/native`
-  - D-Bus session bus at `/system/run/user/1000/bus`
-  - AF_UNIX sockets with `SCM_RIGHTS`, abstract namespace, and peer credentials
-  - Firefox launcher path built on top of the Linux exec/syscall/runtime stack
-
-- **Kernel platform services**
-  - cgroups v2 hierarchy
-  - TPM 2.0 support over CRB and FIFO interfaces
-  - netfilter hook pipeline wired into the TCP/IP stack
-  - CPUFreq governors and P-state control
-  - demand paging, copy-on-write, and scheduler-backed process cloning
-  - real `fork`, `waitpid`, and `execve` flow
-
-- **Recovery and deployment**
-  - Emergency EFI boot flow and GRUB recovery entries
-  - Dedicated **"Kurono Setup"** GRUB entry (`kurono.setup=1`) that runs the
-    graphical installer / first-setup wizard; the main entry still boots
-    straight to the desktop (`kurono.autologin=1`)
-  - Installer subsystem for GPT/MBR inspection and deployment
-  - Guided setup wizard: language, keyboard, **network/Wi-Fi**, disk,
-    filesystem, **administrator account**, **hostname + timezone + prefs**, and
-    **optional Linux guests** (Debian / Alpine / Python) that reuse the
-    `kpkg install debian` + system-update reboot flow
-  - FAT32 ESP-safe write path
-  - ext4 target layout generation and payload staging
+- **The disk driver gave up too early.** NVMe reads timed out after a few tens of milliseconds. The late completion stayed in the queue, the next read took it as its own and returned before its data arrived, and the queue stayed off by one forever. It showed up as a "broken FAT chain" on a healthy disk.
+- **USB input only worked when nothing was running.** A background kernel task read USB keyboards and mice, and it starved the moment a program took over the CPU. All my tests typed through PS/2, so it only showed up on the real laptop, as a frozen OS.
+- **One sleep loop broke sound and typing.** A kernel task sleeping for 5 seconds held up every other task that came due. That overflowed the keyboard queue and ran audio at 7% speed.
+- **Exiting a process corrupted memory.** Teardown freed the shared vDSO time page, so everything after the first exit was running on borrowed time. That was Bun's random crashes.
+- **`sysinfo` used the 32-bit layout on x64.** Total RAM read as 0, so Bun's garbage collector ran nonstop. Fixing it took startup from 3 minutes to 6 seconds.
+- **A kernel pointer leaked in `%rdx`.** The SysV ABI says that register is the exit handler, so every glibc binary called into kernel memory on exit.
+- **`socketpair()` gave both ends the same fd,** which is why Firefox's content process kept dying after navigation.
+- **A missing `volatile` meant no NVMe command ever completed.** The compiler hoisted the completion check out of the polling loop.
 
 ---
 
-## Feature Overview
-
-### Boot and Kernel Foundation
-
-- Multiboot2 boot path with long-mode x86_64 bring-up
-- GDT, IDT, PIC remap, ISR stubs, syscall entry, and userspace return stubs
-- Physical memory manager, virtual memory manager, buddy allocator, slab allocator, and large static kernel heap
-- Round-robin scheduler and kernel task/process tracking
-- PIT-backed timing at 1000 Hz with wait helpers and frame pacing
-- Kernel panic path and boot-time kernel test suite
-- Ring-3 entry support, per-process kernel stacks, saved user interrupt frames, and `int 0x80` syscall dispatch
-- Demand-zero heap and `mmap` regions, page-fault recovery, copy-on-write fork cloning, and `munmap` region splitting
-- User/kernel handoff for built-in user programs and PIE binaries launched through `ld-kurono`
-
-### Display, Desktop, and Input
-
-- **Display backends:** BGA (QEMU/Bochs), VirtIO GPU (2D resource management, scanout), Intel iGPU, NVIDIA dGPU, AMD GPU, selected via GPU probe at boot
-- **GPU probe:** early PCI scan for all display controllers (class 0x03), hybrid topology detection (Optimus muxless/MUX, PowerXpress, dual discrete, virtual), framebuffer address validation via Intel DSPSURF register read
-- **Display manager:** 10 predefined modes from 640x480 through 3840x2160, runtime mode switching, EDID reading, DPI scaling, gamma/brightness, VSync modes (off/on/adaptive)
-- **Graphics driver:** double/triple buffering with SSE2 non-temporal store swap path, write-combining framebuffer remap via PAT, dirty region tracking (16 rectangles), frame pacing with FPS measurement, blend modes (alpha/additive/multiply), accessibility color-blindness filters
-- **Wayland compositor:** in-kernel server listening at `/system/run/user/1000/wayland-0`, speaks the real libwayland wire protocol, advertises `wl_compositor` v5, `xdg_wm_base` v3, `wl_seat` v7, `zwp_linux_dmabuf_v1` v3, and 5 other globals (9 in total: also `wl_subcompositor`, `wl_shm`, `wl_output`, `wl_data_device_manager`, `zxdg_decoration_manager_v1`). It goes past the wire protocol: an `xdg_toplevel` surface becomes a real window-manager window, the client's `wl_shm` buffer (fd-passed via `SCM_RIGHTS`) is blitted into that window's framebuffer rect with damage tracking, and pointer enter/leave/motion/button events are forwarded back to the focused client, verified with a real **musl-compiled** Wayland client (`wl_shm_test`, run via `wltest`). Keyboard-to-client forwarding is implemented but not yet wired into the input loop; `zwp_linux_dmabuf` GPU buffers are advertised but only `wl_shm` software buffers are composited today
-- **Window manager:** compositing WM with z-ordering, server-side decorations (titlebar, 1px border, 10px corner radius, drop shadows), 8-direction resize, drag, minimize/maximize/close, per-window alpha, smooth-step animation (open/close/minimize/restore with taskbar fly-to effect), configurable shadow and animation settings
-- **Desktop environment:** wallpaper (image or midnight-blue gradient), desktop icons with context menus, taskbar with start button/search/task icons/system tray/audio popup/clock, Alt-Tab window cycling
-- Boot splash with logo and animated loading feedback
-- 7 virtual consoles with the GUI running on `tty7`
-- Lock screen with password flow and first-run setup wizard
-- PS/2 keyboard and PS/2 mouse input paths, including packet resync and VirtualBox-friendly handling improvements
-
-### Built-in Apps and Interactive Tools
-
-| Component | Surface | Description |
-|-----------|---------|-------------|
-| Terminal v2.0 | GUI app | ANSI colors, cwd-aware prompt, Tab completion, 1024-entry deduplicated history, Ctrl+A/E/K/U/W, blinking cursor, scrollback |
-| File Manager | GUI app | KVFS browser with icon and list views |
-| Calculator | GUI app | Basic arithmetic keypad |
-| Text Editor | GUI app | KVFS file create/load/save |
-| Media Player v2.0 | GUI app | video/audio playback UI, codec badges, metadata caching, decode buffer, FPS overlay, audio routing across SB16/AC97/HDA |
-| Denji | GUI app / shell command | windowed KVID/JPEG playback wrapper around `VideoPlayer` for the bundled Denji media asset |
-| Settings | GUI app | 12-tab settings UI (Display, Sound, Network, Storage, Power, Personalize, Security, Packages, Updates, System, About, Accessibility), incl. a real Updates tab |
-| Task Manager | GUI app | overhauled tabbed UI (Processes / Performance / Services / Details): sortable process columns, per-process kill, a live CPU-history graph, honest RAM accounting straight from the PMM, plus disk/network counters and auto-refresh |
-| Firefox Launcher | runtime app path | real `execve` of `/apps/firefox/firefox` through the Linux syscall/runtime layer (seeded `/system`, `firefox.env`, `LD_LIBRARY_PATH` from the runtime layout). A real Firefox 140.11.0esr (musl, Wayland, software WebRender) loads its 174 MB libxul closure via `ld-kurono`, runs a real profile across the secondary cores, and **composites its full browser chrome** through the compositor's subsurface path; reliable page rendering is the remaining step |
-| Conduit | GUI app | event-dialogue viewer backed by `ConduitBridge` telemetry for system, package, GPU, guest, and command events |
-| Mini Python 3 | shell/runtime | built-in `python` / `python3` interpreter with file, `-c`, and `-e` execution |
-| KJ (Kurono JavaScript) | shell/runtime | built-in `kj` / `node` JS-subset interpreter (var/let/const, closures, objects, arrays, `Math.*`) with file + `-c` execution; host bindings drive the KSS styling/animation layer |
-| Browser (placeholder) | GUI app | a deliberate placeholder tile, `curl <url>` is today's dependable HTTP path. The real browser strategy is **Firefox on the Linux runtime** (cross-compiled against musl + Wayland; now **compositing its real browser chrome** on the desktop, with reliable page rendering the last step, see the Firefox Launcher row), not a cut-down freestanding engine |
-
-### Hybrid Shell and Command Environments
-
-KuronoShell is a registry-driven shell that can execute native Kurono commands, Linux-style commands, Windows-style commands, KCL scripts, and guest-management commands from one terminal surface.
-
-- **Environment model**
-  - `switch kurono`
-  - `switch linux`
-  - `switch windows`
-  - `bash`
-  - `cmd`
-
-- **Conflict handling**
-  - When a command exists in more than one environment, the shell presents a numbered resolver instead of silently choosing the wrong implementation.
-
-- **Cross-environment piping**
-  - Example: `linux:ls /home | windows:findstr user`
-
-- **Prompt model**
-  - Linux-style `User@host:cwd$`
-  - Windows-style `C:\>`
-  - Kurono-native interactive prompt
-
-#### Kurono-native commands
-
-- Core shell:
-  - `help`, `version`, `env`, `switch`, `clear`, `echo`, `set`, `alias`, `history`, `exit`
-- System control:
-  - `reboot`, `shutdown`, `restart`, `sysinfo`, `crash`, `kurono`
-- Identity and session:
-  - `whoami`, `uname`, `hostname`, `date`, `uptime`, `pwd`
-- Runtime and advanced:
-  - `usermode`, `gpu`, `vgpu`, `denji`, `codecs`
-- Linux and Windows bridging:
-  - `bash`, `linux`, `cmd`
-- Guest and toolchain bridging:
-  - `alpine`, `ffmpeg`, `ffprobe`, `apk`, `pwsh-setup`, `pwsh`, `powershell`
-- Package and language commands:
-  - `kpkg`, `install`, `remove`, `update`, `search`, `list`, `pkginfo`, `python`, `python3`
-
-#### Linux command surface
-
-The Linux environment exposes a real command set backed by kernel drivers and live runtime data rather than fixed strings.
-
-- Filesystem and text:
-  - `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch`, `cat`, `head`, `tail`, `wc`, `chmod`, `stat`, `df`, `du`, `ln`, `find`, `grep`, `which`, `tee`, `sort`, `uniq`, `tr`
-- System and diagnostics:
-  - `ps`, `kill`, `free`, `mount`, `dmesg`, `lspci`, `lsmod`, `drivers`, `lsblk`, `lsusb`, `lscpu`, `modprobe`, `modinfo`, `insmod`, `rmmod`, `dmidecode`, `hwinfo`, `top`, `iotop`, `uname`, `uptime`, `whoami`, `hostname`, `date`
-- Networking:
-  - `ifconfig`, `ip`, `ss`, `ping`, `wget`, `curl`
-- Linux runtime and guests:
-  - `linux-exec`, `syscall`, `vm`, `alpine`, `apk`, `debian`, `apt`
-
-#### Windows command surface
-
-- `dir`, `copy`, `move`, `del`, `type`, `md`, `rd`, `ren`, `cls`
-- `findstr`, `tasklist`, `taskkill`, `systeminfo`, `ipconfig`, `ver`, `tree`, `attrib`, `chkdsk`
-
-### Package Management and Update Flow
-
-Kurono ships both a native package manager and guest-aware update flows.
-
-- **Native package commands**
-  - `kpkg install <package>`
-  - `kpkg remove <package>`
-  - `kpkg update`
-  - `kpkg search <term>`
-  - `kpkg list`
-  - `pkginfo <package>`
-
-- **Repository sync**
-  - HTTP-backed sync against `kurono.satorut.com`
-  - Settings > Updates can perform real repository fetches and show pending update counts
-
-- **Debian guest provisioning**
-  - `kpkg install debian`
-  - Optional GPU hint: `nvidia`, `amd`, `auto`, or `none`
-  - Download target: `/var/lib/kurono/debian-rootfs.ext4`
-  - Pending marker: `/var/lib/kurono/pending-update`
-  - Boot-time updater verifies the rootfs, boots Debian, refreshes apt sources, runs `apt-get update`, optionally installs guest GPU drivers, then returns to the desktop
-
-- **GPU setup path**
-  - `kpkg setup <target>` hands off to the guest GPU driver installer
-  - Installer UI can kick off Alpine guest driver setup immediately or defer it to Settings > Updates or `kpkg setup alpine-auto`
-
-- **Build-time guest payload policy**
-  - Alpine guest kernel/initramfs are embedded when present
-  - Debian rootfs is external by default and only embedded when `EMBED_DEBIAN=1`
-
-### Media and Codec Stack
-
-- Image decoding via stb-based PNG/JPEG/WebP glue
-- Audio codec registry with WAV, MP3, AAC-LC, FLAC, MP4, and H.264 parse surfaces
-- MP4 demuxing and H.264/AAC parser plumbing
-- KVID container/player path for bundled video playback
-- Cached video metadata to avoid repeated file reads during playback
-- Enlarged decode buffers and faster direct blit path for 32bpp targets
-- Audio routing across SB16, AC97, HDA, and fallback backends
-- `ffmpeg` and `ffprobe` helper commands through Alpine where heavier media tooling is needed
-
-### Hardware Drivers
-
-Kurono currently ships 19 core hardware drivers plus additional kernel services layered on top of them. A new wireless-NIC hardware layer (`drivers/wifi_dev`) detects and identifies WiFi cards (see the WiFi row below and *Networking*).
-
-| Driver / Subsystem | Details |
-|--------------------|---------|
-| GPU Probe | early PCI scan, hybrid topology (Optimus/PowerXpress), framebuffer address validation |
-| BGA | Bochs Graphics Adapter, PCI BAR0 programming, 32bpp LFB, multi-resolution |
-| VirtIO GPU | 2D resource management, scanout, virtqueue control/cursor queues, B8G8R8X8 format |
-| Display Manager | 10-mode table, multi-backend routing (BGA/VirtIO/Intel/NVIDIA/AMD), EDID, DPI scaling |
-| Graphics | double/triple buffering, NT-store swap, WC remap, dirty rects, blend modes, color filters |
-| Wayland Server | in-kernel compositor, libwayland wire protocol, 9 globals, xdg_toplevel bridge |
-| NVIDIA GPU | PCI detection, BAR mapping, VRAM query, passthrough preparation |
-| AMD GPU | vendor detection, BAR0 MMIO, VRAM, arch ID, CU/clock/temp/fan/power reporting |
-| Intel GPU | iGPU detection, generation identification, display surface register read |
-| NVMe | admin + I/O queues, identify, read/write/flush |
-| USB / xHCI | USB 3/2/1 host control, port enumeration, control/bulk transfers |
-| Intel HD Audio | codec probing, CORB/RIRB, DMA playback |
-| SB16 | ISA DMA audio, tones, buffers, master volume |
-| AC97 | PCI DMA audio, NAM/NABM control, 48 kHz PCM, parallel operation with SB16 |
-| CPU Detect | CPUID vendor/brand/model/family/features/topology reporting |
-| Intel E1000 | PCI NIC init, descriptor rings, MAC readout, link status |
-| WiFi (hardware layer) | PCI detect of wireless NICs + exact chip ID (Intel AX2xx/9xxx/8xxx/7xxx, Atheros/QCA, Realtek, Broadcom), 64-bit MMIO BAR map, bus-master enable. **Hardware-detect only**: 802.11 MAC + WPA2 software stack in progress, per-vendor radio drivers next; no association yet (and QEMU has no WiFi NIC) |
-| PS/2 Keyboard | scancodes, compatibility init, event drain |
-| PS/2 Mouse | polling, DPI scaling, packet re-sync, burst compatibility |
-| PIT Timer | 1000 Hz timing and wait helpers |
-| Serial | COM1 kernel logging |
-| RTC | time/date for shell and taskbar |
-
-Additional kernel platform services wired into the current tree include TPM 2.0, CPUFreq, netfilter, AF_UNIX sockets, PulseAudio server, D-Bus session bus, and the in-kernel Wayland compositor.
-
-### Networking
-
-Kurono includes a real custom TCP/IP stack instead of a guest-host shortcut.
-
-- **Link layer**
-  - Ethernet II framing
-  - ARP request/reply and 32-entry cache
-  - Wired NIC: Intel E1000 (`eth0`). Wireless: the `wifi_dev` hardware layer detects + identifies the WiFi chip (Intel/Atheros/Realtek/Broadcom) and maps its BAR, but the 802.11/WPA2 stack is still in progress, **WiFi does not associate yet**, so the live link is e1000 / virtio-net only
-
-- **Internet layer**
-  - IPv4 header build and parse
-  - Receive-side checksum validation
-  - Routing configuration for IP, subnet, gateway, and DNS
-  - IPv6 stack with echo and neighbor-discovery plumbing
-
-- **Transport layer**
-  - ICMP ping with RTT measurement
-  - UDP send/receive and `SendTo` / `RecvFrom`
-  - TCP with all 11 classic states from `CLOSED` through `TIME_WAIT`
-  - Correct TCP pseudo-header checksum generation and validation
-
-- **Socket API**
-  - `Socket()`, `Bind()`, `Connect()`, `Listen()`, `Accept()`, `Send()`, `Recv()`, `Close()`
-  - Socket types: `SOCK_STREAM`, `SOCK_DGRAM`, `SOCK_RAW`
-
-- **Limits and telemetry**
-  - Up to 16 sockets
-  - 8 KB RX/TX buffers
-  - 1460-byte MSS
-  - Per-protocol RX/TX/error/drop statistics
-
-- **Policy and filtering**
-  - 5-hook netfilter pipeline with `PRE_ROUTING`, `LOCAL_IN`, `FORWARD`, `LOCAL_OUT`, `POST_ROUTING`
-  - Rule matching by IPv4 src/dst, ports, protocol, and interface
-
-- **Guest and bridge support**
-  - E1000-backed `eth0`
-  - Tun/Tap subsystem initialization path
-  - QEMU SLIRP host forwarding from host port 8080 to guest port 80
-
-### Linux Subsystem and Userspace Runtime
-
-This is more than a command shim. Kurono has an in-kernel Linux compatibility/runtime layer with real process, memory, fd, and syscall handling.
-
-- **Syscall layer**
-  - 280 `LSYS_*` syscall numbers defined; 304 handler arms in `src/linux/linux_syscall.cpp`
-  - the **whole x86_64 ABI completeness list (Tier 1-11) is now reachable** from the amd64 `SYSCALL` fast path: 231 amd64 numbers are wired through the translation table (`kNrMap` in `src/linux/linux_syscall_x64.cpp`), plus a stub-ok set and the direct-handled numbers. No spec syscall returns a blind `-ENOSYS` anymore. The file/io, identity (uid/gid/pgrp/sid), scheduler (affinity/nice/policy), memory-query (`mremap`/`mincore`/`statfs`), and signal-post families are real; the sandbox/namespace/advisory/NUMA/xattr families are contract-stubs (the value real Linux returns when the feature is unavailable); only `ptrace` (non-TRACEME), `add_key`, `request_key` are honest `-ENOSYS`. Full per-syscall table: `docs/developers/linux/SYSCALLS.md`
-  - core handlers include `read`, `write`, `open`, `close`, `lseek`, `brk`, `fork`, `waitpid`, `execve`, `stat`, `fstat`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `unlink`, `dup`, `dup2`/`dup3`, `ioctl`, `writev`/`readv`/`preadv`/`pwritev`, `mmap`/`mremap`, `munmap`, `nanosleep`, `getdents64`, `clock_gettime`, `clone3`, `pidfd_open`/`pidfd_send_signal`, `copy_file_range`, `sched_setaffinity`, the full uid/gid identity family, and more
-  - the syscalls a real GUI app actually blocks on are implemented for real, not stubbed: `futex` (FUTEX_WAIT/WAKE), `clone`/`CLONE_THREAD`, `epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait2`, `poll`/`ppoll`, `mprotect` (W^X with region splitting), `memfd_create`, file-backed `mmap`, and `sendmsg`/`recvmsg`/`sendmmsg`/`recvmmsg` carrying `SCM_RIGHTS`
-  - a permanent rate-limited `[kls] ENOSYS nr=<n>` serial trace on every unimplemented hit gives a strace-equivalent audit; a `kurono.klstest` boot path drives a per-tier self-test (30/30 PASS headless), and the musl dynamic-linker path (`kurono.dyntest`) still resolves libc and runs to `rc=0` after the build-out
-
-- **Process model**
-  - Up to 16 Linux processes
-  - 64 file descriptors per process
-  - Parent/child tracking
-  - Saved interrupt-frame and user-context state
-  - Scheduler-backed ring-3 tasks
-
-- **Threads and concurrency**
-  - `clone`/`CLONE_THREAD` threads sharing one address space
-  - a real `futex` (FUTEX_WAIT/WAKE) for blocking and wakeups
-  - preemptive switching on the user-thread path, verified by a multithreaded pthread gate test (a two-thread counter reliably reaches 2000)
-  - `epoll`/`poll` event loops backed by eventfd, timerfd, and sockets
-
-- **Memory model**
-  - Lazy `brk`
-  - Anonymous `mmap`
-  - Copy-on-write address-space cloning
-  - Recoverable user page faults
-  - Full 64-bit user address space, `mmap`/`brk` and PIE load bases span the canonical user range up to `USER_SPACE_TOP` (`0x0000_7FFF_FFFF_FFFF`), not a sub-4 GB window; the syscall ABI widens pointers/lengths/offsets to 64-bit so a high (multi-TB) PIE mapping round-trips intact (the kernel still identity-maps low physical memory for its *own* access, that is a physical-mapping detail, not a user-pointer limit)
-
-- **Proc/sys identity**
-  - Reports as `Linux 6.8.0-kurono`
-  - `/proc`, `/sys`, TTY/PTY, and proc-style generated files
-
-- **Runtime layout seeding**
-  - Approximately 120 directories under `/system`
-  - Generated config files under `/system/etc`
-  - Generated proc/sys content under `/system/proc` and `/system/sys`
-  - Per-user runtime directories under `/system/run/user/1000`
-
-- **IPC and session services**
-  - AF_UNIX socket table with `STREAM`, `DGRAM`, and `SEQPACKET`
-  - `SCM_RIGHTS` file descriptor passing, exercised end to end: a Wayland client fd-passes its `wl_shm` buffer to the compositor, which maps and composites it
-  - D-Bus session bus
-  - PulseAudio-compatible server
-  - Wayland compositor socket, a real musl-compiled client (`wl_shm_test`) connects, renders, and receives pointer input through it
-
-- **Dynamic linking**
-  - `ld-kurono` interpreter path for PIE userspace binaries
-  - `dlopen` family support
-  - TLS, RELRO, auxv, vDSO, and constructor handling
-
-- **kinit - service and init manager** (`src/system/kinit.*`, `docs/developers/system/KINIT.md`)
-  - Supervises two honestly-distinct unit kinds: **in-kernel units** (`klog`, `knet`, `kdbus`, `kwayland`, `kaudio`, adopted as the already-running in-kernel subsystems with periodic health probes) and **isolated Linux process units** spawned via fork/exec, each driven by its own supervisor kernel-process so the blocking `RunProcessWithArgs` never freezes the desktop
-  - Dependency-sequenced boot targets: `kernel.target → network.target → dbus.target → desktop.target → user.target`
-  - Crash monitor: exponential restart backoff (2s → 4s → 8s ... capped at 60s), a service is marked `failed` after 5 crashes in 60s, and a *critical* service (kdbus/kwayland) failure raises a desktop notification
-  - `.kservice` unit files under `/kurono/system/services/` (`[Service]` + `[Capabilities]` INI), capability gating at spawn via SUPR, and an audit log at `/kurono/var/log/services.log`
-  - `kinit status | start | stop | restart | enable | disable | logs | reload`
-  - **kpkg-daemon** moves the package download/extract loop into a worker kernel-process so a GUI/`kpkg install --daemon` install never blocks the desktop (progress via a polled status + an `org.kurono.Pkg` D-Bus signal); plus `kupdate` (pending-update poller) and `ksecurity` (periodic SUPR/KSA policy self-test). Honest scope: this is non-blocking *isolation*, not a download-throughput change
-
-- **Commands and launchers**
-  - `linux-exec`
-  - `syscall`
-  - `usermode`
-  - Firefox launcher runtime path
-
-### Virtualization
-
-Kurono includes a Type 1 hypervisor stack designed for Linux guest boot and device virtualization.
-
-- **CPU virtualization**
-  - Intel VT-x and AMD-V detection
-  - VMXON / VMXOFF and SVM enable/disable
-  - VMCS and VMCB management
-
-- **Memory virtualization**
-  - EPT on Intel and NPT on AMD
-  - 2 MB and 1 GB large-page support
-  - Guest physical memory layout, E820 tables, BDA/IVT setup, and MMIO regions
-
-- **Device virtualization**
-  - Virtual PIC, APIC, PIT, HPET, serial, IDE disk, and guest memory plumbing
-  - Guest serial bridge into the Kurono shell
-
-- **Guest lifecycle**
-  - `CreateVM`, `RunVM`, `PauseVM`, `ResumeVM`, `DestroyVM`
-  - Per-cycle VM run helpers
-  - VMCALL support for NOP, info, shutdown, reboot, GPU/audio/net/9p bridges,
-    and the **KSA read-only authorization-verdict channel** (`0x4B`)
-
-- **KSA secure-authorization context** (see Security section)
-  - EPT-isolated prompt region carved from physical memory and unmapped from the
-    main-OS page tables; used to back hypervisor-arbitrated privilege prompts
-
-- **Linux guest boot**
-  - bzImage parser and Linux boot protocol v2.15
-  - boot params, cmdline, and initrd load support
-
-- **Shipped guest profiles**
-  - Alpine Linux guest boot through embedded `vmlinuz-virt` and `initramfs-virt`
-  - Debian rootfs staging and post-install/update boot flow
-
-- **IOMMU and passthrough**
-  - Intel VT-d and AMD-Vi plumbing
-  - PCI passthrough support and GPU passthrough-oriented paths
-
-- **Correctness work already landed**
-  - VMCS link pointer fixes
-  - 64-bit EPT pointer writes
-  - VM-exit control correctness
-  - guest CR0 fixed-bit compliance
-  - aligned allocation cleanup
-  - 64-bit I/O and MSR bitmap addressing
-
-### Recovery, Installation, and Deployment
-
-- GRUB ISO boot with multiple entries, including normal, **Kurono Setup**, debug, text-mode, and emergency paths
-  - the first/default entry boots straight to the desktop (`kurono.autologin=1`)
-  - the **"Kurono Setup"** entry boots with `kurono.setup=1` and runs the
-    graphical installer / first-setup wizard before the desktop
-- Standalone normal EFI and emergency EFI loaders
-- Emergency shell for minimal recovery when the desktop path is unavailable
-- Graphical setup wizard: language, keyboard, network (wired + an honest Wi-Fi
-  config screen, no radio driver in this build, e1000/virtio-net wired only),
-  disk, filesystem, administrator account, hostname/timezone/preferences, and
-  optional Linux guests (Debian/Alpine/Python)
-- Installer shell/UI workflow for disk scan, partition inspection, and deployment planning
-- GPT and MBR partition parsing over NVMe-backed targets
-- FAT32 EFI System Partition detection and safe file deployment
-- ext4 target layout generation for `/system`, `/etc`, `/boot`, and `/apps`
-- Embedded deployment payloads:
-  - kernel
-  - normal EFI loader
-  - emergency EFI loader
-  - fallback `BOOTX64.EFI`
-- Two-stage build (`kurono_base.elf` then final `kurono.elf`) so installable payloads can be embedded in the shipping kernel
-
-### Security, Users, Scripting, and Filesystem
-
-- **Security Hardening (audit pass, ongoing)**
-  - A whole-OS audit triaged **~68 issues**; **~20 confirmed memory-safety bugs are fixed and merged**, with more still in progress. Highlights, all backed by commits in the tree:
-    - **Media-codec heap overflows** from 32-bit integer overflows in AAC / FLAC / WAV / MP3 / MP4 decode + parse paths (reachable by opening a malformed file), plus an MP4 box-recursion stack overflow.
-    - **Two remotely-triggerable D-Bus stack overflows** in the session-bus server (`ListNames` and `send_method_return` now write bounded into their stack buffers).
-    - A **9p (`v9fs`) guest→host VM-escape**: `DoRead`/`DoWrite`/`DoStat`/`DoReadDir` translated only the *start* of a guest buffer then walked past it into host memory, now bounds-checked. Hardened alongside virtual-PCI config-write bounds and a virtio-GPU out-of-range transfer rect.
-    - **GPU/HDA 64-bit BAR** mapping bugs (BAR dereferenced before the full 64-bit address was mapped).
-    - **ext4 / KFS / NVMe "trust-the-on-disk-data" bugs**: ext4 superblock + directory-entry + extent-header validation, KFS superblock validation on mount, NVMe submission-queue serialization + untrusted-shift clamp.
-    - **Interpreter bugs**: KCL `*` string-repeat overflow, KCL/KJ parser+eval recursion-depth caps, KJ `val_to_str` recursion cap, and the same string-repeat overflow in mini-Python.
-    - **Shell**: the 64 KB read buffers in `cat`/`head`/`tail`/`wc`/`sort`/`uniq`/`type` moved off the kernel stack onto the heap.
-  - **This does not make Kurono bug-free or production-ready.** Roughly 20 of ~68 are resolved; the rest (including some concurrency/perf issues) are open and tracked.
-
-- **SUPR privilege system**
-  - privilege escalation with timeout
-  - audit logging
-  - Guest/User/Admin/Root/Sovereign roles
-  - salted password hashing
-
-- **KSA: Kurono Secure Authorization (hypervisor-backed privilege prompts)**
-  - Kurono's answer to Windows UAC, but the prompt is rendered and arbitrated
-    inside a hypervisor-isolated region the main OS has **no page-table mapping
-    into**. Ring-0 malware in the main OS can't read it or auto-approve it
-  - the verdict (approve/deny + salted credential hash) crosses back through a
-    single **read-only** VMCALL channel (`0x4B`); there is no path to inject a
-    forged approval from the main OS
-  - auth policy via `supr policy --auth=passwd|kvault|both`; disabling either
-    factor needs explicit acknowledgement, and disabling *both* requires
-    `--sovereign-override` (Sovereign role only), all changes audited even when
-    KSA is off
-  - on a host without nested VMX (e.g. Kurono under KVM/QEMU) the prompt runs as
-    an **EPT-isolated guest context** rather than a separately launched VM; the
-    memory-isolation and read-only-channel guarantees still hold and are proven
-    by a runtime self-test (`kurono.ksa.test=1` / `supr selftest`). See
-    `docs/developers/security/KSA.md`.
-
-- **User management**
-  - multiple users
-  - groups
-  - home directories
-  - runtime session tracking
-
-- **KCL** (Kurono Command Language), a complete tree-walking scripting language
-  - typed values: int, float, string, bool, list, none (real doubles)
-  - variables (`set x = 10`), arithmetic, string concat, comparisons, boolean logic (`and`/`or`/`not`)
-  - control flow: `if` / `elif` / `else` / `end`, `while`, `for x in a..b` and `for x in <list/string>`
-  - functions with parameters, return values, and recursion (`func name(args) ... end`)
-  - lists: literals `[1, 2, 3]`, indexing (incl. negative), `append` / `remove` / `len`
-  - imports (`import lib.kcl`) and `#` comments / shebang (`#!/kcl`)
-  - stdlib builtins: `print` `input` `len` `str` `int` `float` `sqrt` `rand` `abs` `min` `max` `type` `read` `write` `exists` `exec` `sleep` `upper` `lower`
-  - run via `kcl script.kcl`, `kcl -c "code"`, a `.kcl` shebang, or double-click in the File Manager
-  - errors are reported with line numbers and never crash the OS
-
-- **KJ** (Kurono JavaScript), a freestanding JavaScript-subset interpreter for scripting the desktop
-  - lexer + recursive-descent parser → AST, then a tree-walking evaluator over a tagged value type (undefined / null / bool / number(double) / string / array / object / function-closure). No libc, no STL.
-  - `var` / `let` / `const`, `function` declarations + expressions with **closures**, `return`
-  - objects `{ k: v }` with dot + bracket access/assignment + nested + methods; arrays `[..]` with index, `.length`, `.push`/`.pop`, `for..of`
-  - arithmetic `+ - * / %`, comparisons `== != === !== < > <= >=`, `&& || !`, ternary `?:`, prefix/postfix `++ --`, `typeof`, string concat, `// /* */` comments
-  - `if`/`else`, `while`, classic `for(;;)`, `break`/`continue`; `Math.{floor,ceil,round,abs,sqrt,sin,cos,min,max,pow,random}`, `Math.PI`
-  - **host bindings** so scripts drive the live UI: `console.log`, `kss.set/get/transition/keyframes/play` (drives the KSS stylesheet/animation layer), `ui.notify`
-  - run via `kj file.js`, `kj -c "code"`, or `KJ::Execute()` from C++; errors are captured (never crash the OS)
-  - verified by an 11-test self-test suite (`kurono.kjtest`, 11/11 PASS headless) covering every feature plus the KSS bindings
-
-- **KSS** (Kurono Style Sheet), theme tokens **plus** a scriptable styling/animation layer
-  - theme token set (colors + metrics) overridable from `/etc/kurono/ui.conf`
-  - a `Sheet` layer: named style rules (selectors like `button:hover`) with a property bag (bg/fg/border/accent/shadow + radius/pad/border-width/font/opacity/scale/translate), per-property **transitions** that ease automatically on value change, and named **keyframe** tracks the compositor samples per frame
-  - an `Anim` tween engine (eased float/color tweens keyed by stable id) wired into the keep-rendering gate so motion never stalls mid-flight
-  - live animations: window open/close **fade + scale**, notification slide-in/out, control-center panel slide, button hover/focus color transitions, all driven per-frame by the compositor
-
-- **KVFS**
-  - in-memory virtual filesystem
-  - directories, files, symlinks, devices, pipes, mountpoints
-  - POSIX-style permissions
-  - common file operations across shell and apps
-  - one **canonical tree under `/kurono`** (`system`, `linux`, `windows`, `apps`, `user`, `packages`, `runtime`, `var`); the old top-level names are **compat symlinks** into it (`/system -> /kurono/system`, `/home -> /kurono/user/home`, `/etc -> /kurono/system/config`, `/bin`, `/lib`, `/usr/{bin,lib}`, `/tmp`, `/proc`, `/dev`, `/var`, `/apps`, `/windows`), installed at the earliest fs init by `KVFS::InstallCanonicalLayout()` and centralized in `src/system/kpaths.h` (see `docs/developers/fs/KVFS.md`)
-  - pre-seeded `/home`, `/etc`, `/tmp`, `/var/log`, `/usr/bin` (all resolving through the overlay)
-
-- **ext4 and FAT32**
-  - ext4 parsing for the Linux layer and installer targets
-  - FAT32 write path focused on ESP deployment rather than general desktop storage
-
----
-
-## Architecture
-
-```text
-Kurono OS
-+-- Boot and Kernel Core
-|   +-- Multiboot2 / EFI loaders
-|   +-- PMM / VMM / scheduler / syscall entry
-|   +-- Ring-3 userspace path
-|   +-- Demand paging + copy-on-write
-|
-+-- Desktop and Native UX
-|   +-- GPU probe / display manager / graphics driver
-|   +-- Wayland compositor (in-kernel, wire protocol)
-|   +-- Window manager (compositing, animations, shadows)
-|   +-- Lock screen / desktop / taskbar / settings
-|   +-- Terminal / media / file manager / task manager
-|
-+-- Shell and Runtime Surfaces
-|   +-- Kurono-native command set
-|   +-- Linux command environment
-|   +-- Windows command environment
-|   +-- KCL scripting
-|   +-- Mini Python 3
-|
-+-- Networking
-|   +-- Ethernet / ARP / IPv4 / IPv6
-|   +-- ICMP / UDP / TCP
-|   +-- Netfilter hooks
-|   +-- AF_UNIX sockets
-|
-+-- Linux Compatibility Runtime
-|   +-- Syscall layer
-|   +-- /system runtime layout
-|   +-- Wayland / Pulse / D-Bus
-|   +-- ld-kurono dynamic linker
-|
-+-- Virtualization
-|   +-- VT-x / AMD-V
-|   +-- EPT / NPT
-|   +-- Virtual devices
-|   +-- Alpine guest boot
-|   +-- Debian guest staging/update path
-|
-+-- Installation and Recovery
-|   +-- Emergency EFI boot
-|   +-- Installer
-|   +-- FAT32 ESP deployment
-|   +-- ext4 target layout generation
-|
-+-- Storage and Security
-    +-- KVFS
-    +-- ext4 parser
-    +-- SUPR
-    +-- package manager
-```
-
-### Source Layout
-
-```text
-src/
-  boot/         x86_64 Multiboot entry, EFI loader, linker scripts, early boot
-  kernel/       heap, PMM, VMM, buddy/slab allocators, ELF loader, panic, time
-  hal/          interrupts, syscall entry, cpufreq hooks, architecture glue
-  drivers/      display, audio, storage, NIC, TPM, GPU, input, runtime daemons
-  ui/           desktop, taskbar, window manager, font, lock screen, Wayland compositor
-  apps/         terminal, media player, file manager, settings, task manager, etc.
-  shell/        KuronoShell plus Linux and Windows command environments
-  fs/           VFS, KVFS, FAT32
-  net/          TCP/IP, netfilter, IPv6, Tun/Tap, AF_UNIX
-  linux/        syscall layer, ext4, init, signals, ld-kurono, dual-boot runtime
-  virt/         VMM, EPT/NPT, guest memory, vdevices, guest boot, passthrough
-  security/     SUPR privilege system
-  kcl/          Kurono Command Language
-  packages/     kpkg package manager
-  proc/         scheduler and cgroups
-  media/        codecs, demuxers, parsers, video player
-  system/       installer, update UI, runtime layout, logging, user management
-  tests/        kernel test suite
-  third_party/  stb_image, stb_truetype glue
-```
-
-### Top-Level Layout
-
-```text
-OS/
-  Alpine/       embedded Alpine guest assets
-  build/        kernel, ISO, EFI, and intermediate outputs
-  iso/          copied ISO export artifact
-  src/          full kernel and subsystem source tree
-  tools/        helper scripts and QEMU utilities
-  start.ps1     Windows/WSL build-and-launch entry point
-  STATUS.md     detailed implementation status log
-  README.md     project overview
-  LICENSE       GNU GPL v2
-```
-
----
-
-## Building from Source
-
-### Prerequisites
-
-- Windows host with WSL, or a Linux host directly
-- x86_64-elf cross toolchain, or native `g++ -m64` fallback
-- NASM
-- `grub-mkrescue` and `xorriso` for ISO creation
-- `gnu-efi` headers and libraries for EFI loader builds
-- QEMU
-
-### Common Make Targets
-
-Run these from `src/` in an environment that has the required toolchain and matching QEMU backend available:
-
-```bash
-make                 # Build the kernel ELF
-make iso             # Build ISO + copy to ../iso/kurono.iso
-make run             # ISO boot under QEMU with the WHPX-oriented profile
-make run-noaccel     # Kernel boot under QEMU without acceleration
-make run-kvm         # Kernel boot under QEMU with KVM
-make run-passthrough GPU_BDF=01:00.0
-make debug           # Kernel boot with GDB stub on :1234
-make clean           # Remove build output
-```
-
-### Build Outputs
-
-- `build/kurono.elf`
-- `build/kurono_base.elf`
-- `build/kurono.iso`
-- `iso/kurono.iso`
-- `build/boot/kurono_efi.efi`
-- `build/boot/kurono_emergency.efi`
-
-### Guest Payload Options
-
-```bash
-# Default: Debian rootfs is NOT embedded
-make iso
-
-# Offline / self-contained ISO with Debian rootfs embedded
-make EMBED_DEBIAN=1 iso
-```
-
-Alpine guest assets are linked when `Alpine/vmlinuz-virt` and `Alpine/initramfs-virt` are present. Debian rootfs embedding is opt-in because it significantly increases the ISO size.
-
----
-
-## QEMU Profile
-
-### Default launcher behavior (`start.ps1`)
-
-- Builds by calling `make iso` in WSL
-- Launches `build/kurono.iso`
-- Allocates 10 GB RAM by default
-- Exposes 4 vCPUs
-- Uses `-serial stdio`
-- Attaches:
-  - SB16
-  - Intel HDA + HDA duplex codec
-  - AC97
-  - Intel E1000
-- Uses SLIRP networking with `hostfwd=tcp::8080-:80`
-- Uses DirectSound on native Windows QEMU or PulseAudio on WSLg-backed QEMU
-- Selects:
-  - `qemu64,+vmx` on Intel WHPX hosts
-  - `qemu64,+svm` on AMD WHPX hosts
-  - `-cpu host` on KVM paths
-- Supports OVMF UEFI via `-UEFI`
-
-### Makefile run targets
-
-- `make run`
-  - ISO boot
-  - WHPX-oriented accelerator profile
-  - 4 vCPUs
-  - VGA std
-  - E1000 + SB16 + virtio-balloon
-- `make run-noaccel`
-  - direct kernel boot
-  - no accelerator
-- `make run-kvm`
-  - direct kernel boot
-  - `-cpu host`
-  - KVM
-  - Q35 machine
-- `make run-passthrough`
-  - direct kernel boot
-  - VFIO GPU passthrough path
-  - `GPU_BDF` override
-
----
-
-## Known Limitations
-
-- The Wayland compositor renders real clients, an `xdg_toplevel` surface becomes a managed window and its `wl_shm` buffer (fd-passed via `SCM_RIGHTS`) is blitted to the framebuffer with damage tracking, and pointer input is forwarded to the focused client (proven with a real musl-compiled client, `wl_shm_test`). The remaining gaps are **keyboard**-to-client forwarding (the handler exists but isn't wired into the input loop) and `zwp_linux_dmabuf` GPU buffers (only `wl_shm` software buffers are composited today).
-- Live desktop storage is KVFS-first and RAM-backed, but it now **persists across reboot through KFS**: a from-scratch inode-based on-disk filesystem on the NVMe data disk. The user-data subtrees (`/home`, `/etc`, `/root`) are stored as real files + directories and restored at boot. KVFS stays the runtime fs; KFS is the on-disk persistence layer (not yet a fully mounted root).
-- The Linux syscall layer supports the full canonical 64-bit user address space, the old sub-4 GB pointer-ABI constraint has been lifted, and PIE binaries (e.g. Firefox's libxul) load and run at multi-terabyte addresses with their pointers/lengths/offsets round-tripping intact. (The kernel still identity-maps low physical memory for its own access; that is a physical-mapping detail, not a user-address limit.)
-- Dynamic musl PIEs load and run from disk through `ld-kurono` (resolving their full `.so` closure, up to and including Firefox's libxul), alongside static built-in programs from the program table; running an *arbitrary* large disk-resident binary still depends on staging its complete dependency set.
-- USB host-controller work is present, but full USB HID interrupt transfer polling is not complete.
-- NVIDIA GPU detection and passthrough preparation exist, but BGA remains the primary display device and NVIDIA is not yet the default native desktop renderer.
-- ext4 write support is still partial; sparse allocation and full directory-growth handling are not complete.
-- FAT32 support is focused on EFI System Partition deployment rather than full long-filename desktop storage workloads.
-- Hardware-assisted virtualization depends on the host exposing VT-x or AMD-V to Kurono. The Type-1 hypervisor + Linux-boot-protocol path is implemented, but **booting an Alpine/Debian guest requires *nested* VMX to be exposed to Kurono**. In the common dev environment, Kurono itself running as a guest under nested KVM/QEMU, that nested layer is not available, and the guest VM-entry fails with a VMX entry error; guest boot is therefore confirmed only where nested VMX is present. (This is the same constraint behind KSA's nested-VM-vs-EPT-isolated-context fallback, see the Security section.)
-- Firefox now **paints its real browser chrome** (tab strip, URL bar, navigation controls, menus) on the Kurono desktop, composited through the in-kernel compositor's `wl_subsurface` path; it runs **single-process** (e10s off), so the old "e10s multiprocess IPC" framing is obsolete. What is *not* yet guaranteed on every boot is a **rendered web page**: navigation reaches necko, but the socket thread's poll-wakeup delivery is the active fix, and some boots hit startup/render-timing flakiness. A real **Firefox 140.11.0esr** is cross-compiled against **musl** (`cairo-gtk3-wayland`, software WebRender, 174 MB libxul), the Linux runtime provides what it targets (pthreads/`futex`, `epoll`/`poll`, `mprotect` W^X, real `fcntl` locks, AF_UNIX + `SCM_RIGHTS`, subsurface compositing), and on-device `ld-kurono` loads libxul's full `.so` closure. The GUI "Browser" tile stays a placeholder until the page render is reliable; `curl <url>` is the dependable HTTP path today.
-
----
+## What's next
+
+- Multi-monitor and UI scaling, in the unpushed part
+- Intel display driver, for real second-screen output
+- GPU acceleration, Intel first (a plan, nothing built yet)
+- Giving kernel background tasks their own core, so programs can't starve them
+- All 20 cores. The scheduler's affinity mask stops at 8 today
+- Faster Firefox startup. It's about 30 s in a VM, and most of that is Firefox waiting on something
+- Wi-Fi. The BE200 needs firmware and a huge stack, so this is a long way off
+
+## Layout
+
+| Path | What |
+| --- | --- |
+| `src/kernel/`, `src/proc/`, `src/hal/` | kernel core, scheduler, SMP, ACPI |
+| `src/linux/` | Linux syscall layer, `ld-kurono`, pty, sockets |
+| `src/drivers/` | NVMe, AHCI, xHCI, USB audio, HD Audio, I226, e1000 and more |
+| `src/net/` | TCP/IP, DHCP |
+| `src/fs/` | KFS, KVFS, persistence |
+| `src/ui/`, `src/apps/` | compositor, window manager, terminal, apps |
+| `src/boot/` | boot code and the UEFI loader |
+| `docs/` | developer docs |
 
 ## License
 
-Kurono OS is licensed under the GNU General Public License v2. See [LICENSE](LICENSE) for the full text.
+GPL v2. See [LICENSE](LICENSE).

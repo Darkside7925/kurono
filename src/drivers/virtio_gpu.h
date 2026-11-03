@@ -201,6 +201,23 @@ public:
 
     // full framebuffer update (convenience)
     static bool PresentFramebuffer(void* pixels, uint32_t width, uint32_t height);
+    // present only a damaged sub-rect of the framebuffer. the compositor already
+    // knows which rows it touched, so uploading the whole screen every frame was
+    // pure waste (8.3mb at 1080p for a cursor move). dx/dy/dw/dh are in pixels
+    // and must be clipped to width/height by the caller. (satoru)
+    static bool PresentFramebufferRect(void* pixels, uint32_t width, uint32_t height,
+                                       uint32_t dx, uint32_t dy,
+                                       uint32_t dw, uint32_t dh);
+
+    // block until an outstanding async present has finished reading the guest
+    // framebuffer, then reclaim its ring descriptors. MUST be called before
+    // anything writes to the framebuffer again. no-op when nothing is in
+    // flight, so it is cheap to call unconditionally. (satoru)
+    static void DrainPresent();
+
+    // kurono.vgsync=1: force the old synchronous present (drain immediately
+    // after submit) so the async win can be A/B'd from one binary. (satoru)
+    static void SetSyncPresent(bool on);
 
     static void DumpInfo(char* out, int max_len);
 

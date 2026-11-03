@@ -50,6 +50,27 @@ public:
     // open/close animation (phase not yet settled). (satoru)
     static bool IsAnimating();
 
+    // a window's taskbar tile (its app-icon square) in screen pixels, laid out
+    // exactly as Render() draws it: the window manager's open/minimize/restore
+    // motion starts from or lands on it. false if the window has no button
+    // showing (closed, or the strip ran out of room). (satoru)
+    static bool WindowTileRect(int win_id, int& x, int& y, int& w, int& h);
+    static uint32_t WindowTileColor(const char* title);
+
+    // modern style: a menu bar across the top and a floating dock at the
+    // bottom instead of the single bar. TopInset() is the height the menu bar
+    // reserves (0 in classic); ApplyDesktopArea() hands the free area between
+    // bar and dock to the window manager. (satoru)
+    static int  TopInset();
+    static void ApplyDesktopArea();
+    static int  ClockHour24() { return clock_h; }
+    static int  ClockHour12() { int h = clock_h % 12; return h ? h : 12; }
+    static int  ClockMinute() { return clock_m; }
+    static int  ClockDom()    { return clock_dom; }
+    static int  ClockMon()    { return clock_mon; }
+    static int  ClockDow()    { return clock_dow; }
+    static float DockScale(int i) { return (i >= 0 && i < 24) ? dock_scale[i] : 0.0f; }
+
     // notification area
     static void SetClock(int h, int m);
     static void SetBattery(int percent);
@@ -130,6 +151,15 @@ public:
     static uint32_t PinnedLaunchMs(int i){ return (i >= 0 && i < 8) ? pinned_launch_ms[i] : 0; }
 
 private:
+    static void RenderModern();
+    static bool HandleClickModern(int mx, int my);
+    static void TickModern(uint32_t delta_ms, int mx, int my);
+    static void RenderMenuBar();
+    static void RenderDock();
+    static void RenderStartMenuModern();
+    static int  clock_dow;
+    static float dock_scale[24];
+    static int  dock_mouse_x, dock_mouse_y;
     static void StartMenuSet(bool open);
     static void VolumePopupSet(bool open);
     static void RenderStartButton();
@@ -154,6 +184,11 @@ public:
     static void ArrangeIcons();
     static void RefreshFiles();
     static void RemoveIcon(int index);            // delete icon + backing file
+    // keep the firefox app icon in sync with its install state: present when
+    // installed (or persisted on disk) unless the user deleted it
+    // (desktop.firefox_icon=0; a fresh install re-enables). called from Init
+    // and the periodic RefreshFiles sync. (satoru)
+    static void SyncFirefoxIcon();
     static bool CreateFolderInteractive();        // "new folder n"
     static bool CreateFileInteractive();          // "new file n.txt"
     static void ReloadFromConfig();               // reapply uiconfig sizes/colors
@@ -235,6 +270,9 @@ private:
     static int  IconAt(int mx, int my);
     static int  FindIconByPath(const char* path);
     static bool IsDesktopFileIcon(const DesktopIcon* icon);
+    // pure array removal (shift + index fixups), shared by RemoveIcon and the
+    // state-driven syncs; touches no backing files and no persisted flags. (satoru)
+    static void DropIconAt(int index);
     static void AddOrUpdateDesktopFile(KVFSNode* node);
     static void PlaceIcon(int index);
     static void ClampIcon(int index);
@@ -261,6 +299,10 @@ public:
     static void LaunchTaskManager();
     static void LaunchBrowser();
     static void LaunchMediaPlayer();
+    // firefox: runs the `firefox` shell command detached on the shell
+    // kernel-process (restore/install/exec), so no terminal window opens;
+    // feedback is a toast + the firefox window itself. (satoru)
+    static void LaunchFirefox();
 
     // session control
     static void RequestLogout();

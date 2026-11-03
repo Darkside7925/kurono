@@ -15,11 +15,17 @@
 
 #include "linux_syscall.h"
 #include "../drivers/serial.h"
+#include "../drivers/timer.h"
 #include "../hal/hal.h"
 #include "../kernel/userspace.h"
 #include "../proc/scheduler.h"   // full Process def for LinuxProcess::task->exe_path (satoru)
 #include "../proc/smp.h"         // cpu index in the [ff] trace (satoru)
 #include "../kernel/udf.h"       // SYS_UDF_CALL -> user driver framework proxy (satoru)
+#include "../kernel/kld_broker.h" // SYS_KLD_CALL -> linux-driver container pci broker (satoru)
+#include "../drivers/timer.h"    // GetRealMs64 for clock_nanosleep ABSTIME (satoru)
+#include "../kernel/time.h"      // RealtimeBaseSeconds for REALTIME abs targets (satoru)
+#include "../kernel/pmm.h"       // sysinfo ram totals (satoru)
+#include "uaccess.h"             // AccessOk for sysinfo (satoru)
 
 // Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
 // switches to, and a one-slot stash for the user rsp across that switch (every
@@ -158,7 +164,10 @@ constexpr NrMap kNrMap[] = {
     { 21,  33 },  // access
     { 32,  41 },  // dup
     { 33,  63 },  // dup2
-    { 35, 162 },  // nanosleep
+    // 35 (nanosleep) is an explicit case now: the table route fed the amd64
+    // 64-bit timespec into the i386 32-bit parser (tv_nsec read the HIGH half
+    // of tv_sec = 0), so every sub-second sleep returned instantly - the 10k/s
+    // sleep-loop syscall storm. see case 35 below. (satoru)
     { 39,  20 },  // getpid
     { 60,   1 },  // exit
     { 63, 122 },  // uname
@@ -191,6 +200,7 @@ constexpr NrMap kNrMap[] = {
     {  57, LSYS_FORK },          // fork -> COW CloneUserProcess (firefox spawns content procs) (satoru)
     {  58, LSYS_FORK },          // vfork -> aliased to fork (no parent-suspend yet) (satoru)
     {  59, LSYS_EXECVE },        // execve -> sys_execve (firefox child re-execs) (satoru)
+    { 247, LSYS_WAITID },        // waitid (satoru)
     {  61, LSYS_WAITPID },       // wait4 -> sys_waitpid (rusage ignored; parent reaps children) (satoru)
     {  97, LSYS_GETRLIMIT },     // getrlimit -> existing rlimit handler (satoru)
     { 302, LSYS_PRLIMIT64 },     // prlimit64 -> existing rlimit handler (satoru)
@@ -204,6 +214,13 @@ constexpr NrMap kNrMap[] = {
     { 157, LSYS_PRCTL },         // prctl PR_SET_NAME/GET_NAME (thread comm) (satoru)
     { 229, LSYS_CLOCK_GETRES },  // clock_getres
     { 234, LSYS_TGKILL },        // tgkill
+    // ── real signal delivery + a few ex-stubs now implemented (satoru) ──────────
+    { 13, LSYS_RT_SIGACTION },   // rt_sigaction (stores the handler table) (satoru)
+    { 14, LSYS_RT_SIGPROCMASK }, // rt_sigprocmask (honours block/unblock/setmask) (satoru)
+    { 15, LSYS_RT_SIGRETURN },   // rt_sigreturn (restores the sigframe) (satoru)
+    { 24, LSYS_SCHED_YIELD },    // sched_yield -> real sibling-thread yield (satoru)
+    { 73, LSYS_FLOCK },          // flock -> real whole-file advisory lock (satoru)
+    { 324, LSYS_MEMBARRIER },    // membarrier -> real cross-core barrier (satoru)
     { 332, LSYS_STATX },         // statx
     // ── socket family: x86_64 has direct socket syscalls (i386 multiplexed
     //    them through socketcall). without these, any networked / wayland /
@@ -287,6 +304,7 @@ constexpr NrMap kNrMap[] = {
     { 125, LSYS_CAPGET },
     { 126, LSYS_CAPSET },
     { 127, LSYS_RT_SIGPENDING },
+    { 130, LSYS_RT_SIGSUSPEND },   // rt_sigsuspend (satoru)
     { 128, LSYS_RT_SIGTIMEDWAIT },
     { 129, LSYS_RT_SIGQUEUEINFO },
     { 135, LSYS_PERSONALITY },
@@ -349,6 +367,10 @@ constexpr NrMap kNrMap[] = {
     { 265, LSYS_LINKAT },
     { 266, LSYS_SYMLINKAT },
     { 268, LSYS_FCHMODAT },
+    { 90, LSYS_CHMOD },       // chmod(path, mode) (satoru)
+    { 91, LSYS_FCHMOD },      // fchmod(fd, mode) (satoru)
+    { 92, LSYS_CHOWN_PATH },       // chown(path, uid, gid) (satoru)
+    { 94, LSYS_CHOWN_PATH },       // lchown(path, uid, gid) (satoru)
     { 269, LSYS_FACCESSAT },
     { 272, LSYS_UNSHARE },
     { 275, LSYS_SPLICE },
@@ -402,25 +424,30 @@ constexpr NrMap kNrMap[] = {
 
 constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);
 
-// Stubs that just return success (0) - needed by musl/CPython startup
-// but harmless if we no-op them.  Listed by x86_64 nr.
+// Pretend-success no-op allowlist. audited: every ex-stub that has real semantics
+// now routes to a Dispatch handler via kNrMap (rt_sigaction/procmask/sigreturn,
+// sched_yield, flock, membarrier - see the block above), and 302/prlimit64 is
+// handled directly in SyscallEntryX64Handler's switch (returns -ENOSYS) so its old
+// stub entry here was dead. what remains below is genuinely a correct no-op, with
+// a per-entry justification. Listed by x86_64 nr. (satoru)
 constexpr uint32_t kStubOk[] = {
-    13,   // rt_sigaction
-    14,   // rt_sigprocmask
-    15,   // rt_sigreturn (no signals delivered, never really invoked) (satoru)
-    24,   // sched_yield (single-threaded: yield is a no-op success) (satoru)
-    73,   // flock (advisory lock pretend-success) (satoru)
-    131,  // sigaltstack
-    273,  // set_robust_list
-    324,  // membarrier (single-threaded: no-op success) (satoru)
-    334,  // rseq
-    302,  // prlimit64  (we'll fail soft)
-    // 157 (prctl) now routed to the real LSYS_PRCTL handler via kNrMap so
-    // PR_SET_NAME actually records the thread name (comm) instead of no-op'ing.
-    // the handler returns 0 for every other op, same as this stub did. (satoru)
+    131,  // sigaltstack - we deliver rt sigframes on the MAIN stack (no alternate
+          // signal stack); accepting the registration is correct because we simply
+          // ignore SS_ONSTACK. the caller keeps working. (satoru)
+    273,  // set_robust_list - the robust-futex list is a crash-cleanup optimization
+          // (the kernel walks it to release locks held by a thread that died). our
+          // futex owners are dropped on thread exit anyway, so recording the list is
+          // unnecessary; accept + ignore. (satoru)
+    334,  // rseq - restartable sequences are a per-cpu fast-path OPTIMIZATION glibc
+          // registers; musl (firefox's libc) never uses them. returning success
+          // without real rseq support is safe because the abi guarantees a correct
+          // non-accelerated fallback (we simply never restart the sequence). (satoru)
+    // 157 (prctl) is routed to the real LSYS_PRCTL handler via kNrMap so PR_SET_NAME
+    // records the thread name (comm); the handler returns 0 for every other op. (satoru)
     187,  // readahead - advisory prefetch; mozglue ReadAhead()s each .so before
           // dlopen and treated -ENOSYS as fatal, breaking XPCOMGlueLoad of the
-          // libmozgtk->libxkbcommon chain. no-op success is correct. (satoru)
+          // libmozgtk->libxkbcommon chain. no-op success is correct - the data is
+          // read on demand anyway. (satoru)
 };
 
 constexpr int kStubOkCount = sizeof(kStubOk) / sizeof(kStubOk[0]);
@@ -451,13 +478,293 @@ int64_t LinuxSyscall::GetRandomBytes(void* buf, uint64_t n) {
     return crng_fill((uint8_t*)buf, n);
 }
 
+// last 32 syscalls of firefox's main thread (linux pid 100). the gui loop
+// dumps them every 20s, so a stalled main thread shows what it is blocked in -
+// a thread blocked for good makes no more syscalls, so it can't dump itself.
+struct FfmRec { uint32_t nr; uint64_t a0, a1, a2; };
+static FfmRec g_ffm_ring[32];
+static volatile uint32_t g_ffm_head = 0;
+
+extern bool g_fftrace;
+extern "C" void ff_main_ring_dump() {
+    if (!g_fftrace) return;
+    static uint32_t s_last = 0;
+    uint32_t tn = Timer::GetRealMs();
+    if (tn - s_last < 20000u) return;
+    s_last = tn;
+    uint32_t head = g_ffm_head;
+    if (head == 0) return;
+    SerialLogger::Log("[ffmain] n="); SerialLogger::LogDec((int)head);
+    uint32_t start = head > 32 ? head - 32 : 0;
+    for (uint32_t i = start; i < head; i++) {
+        const FfmRec& r = g_ffm_ring[i & 31];
+        SerialLogger::Log(" ");  SerialLogger::LogDec((int)r.nr);
+        SerialLogger::Log("("); SerialLogger::LogHex((uint32_t)r.a0);
+        SerialLogger::Log(","); SerialLogger::LogHex((uint32_t)r.a1);
+        SerialLogger::Log(","); SerialLogger::LogHex((uint32_t)r.a2);
+        SerialLogger::Log(")");
+    }
+    SerialLogger::Log("\r\n");
+}
+
+static int64_t SyscallEntryX64Inner(uint64_t nr,
+                                    uint64_t a0, uint64_t a1,
+                                    uint64_t a2, uint64_t a3,
+                                    uint64_t a4, uint64_t a5);
+
+// kurono.sctrace=1: low-noise strace. logs the first call of every syscall
+// number and the first time each (number, errno) pair comes back negative, so
+// a big foreign binary shows exactly which syscalls fail and how. (satoru)
+bool g_sctrace = false;
+static uint64_t g_sc_t0 = 0;           // per-call tsc stamp (best effort; SMP races only blur the stats) (satoru)
+static uint64_t g_sc_cyc[512];
+uint64_t g_sctrace_after_ms = 0;  // kurono.sctrace.ms=N: with sctrace=2, only after N ms uptime (satoru)
+int g_sctrace_minpid = 0;      // kurono.sctrace.pid=N: with sctrace=2, only pids >= N (satoru)
+bool g_sctrace_all = false;   // kurono.sctrace=2: log EVERY syscall on entry (capped) (satoru)
 extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                                           uint64_t a0, uint64_t a1,
                                           uint64_t a2, uint64_t a3,
                                           uint64_t a4, uint64_t a5) {
+    if (g_sctrace_all) {
+        static int nall = 0;
+        LinuxProcess* lq0 = LinuxSyscall::Current();
+        if (nall < 20000 && (int)(lq0 ? lq0->pid : 0) >= g_sctrace_minpid &&
+            (g_sctrace_after_ms == 0 || Timer::GetRealMs64() >= g_sctrace_after_ms)) {
+            nall++;
+            LinuxProcess* lq = lq0;
+            SerialLogger::Log("[sa] pid="); SerialLogger::LogDec(lq ? (int)lq->pid : -1);
+            SerialLogger::Log(" nr="); SerialLogger::LogDec((int)nr);
+            SerialLogger::Log(" "); SerialLogger::LogHex64(a0);
+            SerialLogger::Log(" "); SerialLogger::LogHex64(a1);
+            SerialLogger::Log(" "); SerialLogger::LogHex64(a2);
+            SerialLogger::Log("\r\n");
+        }
+    }
+    if (g_sctrace && nr < 512) {
+        // hot-syscall census every 3 s, printed from the syscall path itself so it still
+        // shows when the cooperative kernel is starved by a spinning user thread. (satoru)
+        static uint32_t hot[512];
+        uint64_t* hot_cyc = g_sc_cyc;
+        static uint64_t last_ms = 0;
+        static uint64_t la0[512], la1[512], la2[512];
+        static int lpid[512];
+        hot[nr]++; la0[nr] = a0; la1[nr] = a1; la2[nr] = a2;
+        g_sc_t0 = __builtin_ia32_rdtsc();
+        { LinuxProcess* lh = LinuxSyscall::Current(); lpid[nr] = lh ? (int)lh->pid : -1; }
+        uint64_t now = Timer::GetRealMs64();
+        if (last_ms == 0) last_ms = now;
+        if (now - last_ms >= 3000) {
+            last_ms = now;
+            for (int k = 0; k < 4; k++) {
+                int best = -1; uint32_t bc = 0;
+                for (int i = 0; i < 512; i++) if (hot[i] > bc) { bc = hot[i]; best = i; }
+                if (best < 0 || bc < 50) break;
+                SerialLogger::Log("[sc] hot avg_us="); SerialLogger::LogDec((int)(hot_cyc[best] / bc / 2882));
+                SerialLogger::Log("[sc] hot nr="); SerialLogger::LogDec(best);
+                SerialLogger::Log(" n="); SerialLogger::LogDec((int)bc);
+                SerialLogger::Log(" pid="); SerialLogger::LogDec(lpid[best]);
+                SerialLogger::Log(" a0="); SerialLogger::LogHex64(la0[best]);
+                SerialLogger::Log(" a1="); SerialLogger::LogHex64(la1[best]);
+                SerialLogger::Log(" a2="); SerialLogger::LogHex64(la2[best]);
+                SerialLogger::Log("\r\n");
+                hot[best] = 0;
+            }
+            for (int i = 0; i < 512; i++) { hot[i] = 0; hot_cyc[i] = 0; }
+        }
+    }
+    int64_t r = SyscallEntryX64Inner(nr, a0, a1, a2, a3, a4, a5);
+    if (g_sctrace && nr < 512 && g_sc_t0) { g_sc_cyc[nr] += __builtin_ia32_rdtsc() - g_sc_t0; g_sc_t0 = 0; }
+    // [op] every open/openat result (capped), with the path - one line per file the runtime
+    // touches. (satoru)
+    if (g_sctrace && (nr == 2 || nr == 257)) {
+        static int nop = 0;
+        uint64_t pp = (nr == 2) ? a0 : a1;
+        if (nop < 400 && pp > 0x1000) {
+            nop++;
+            LinuxProcess* lo = LinuxSyscall::Current();
+            SerialLogger::Log("[op] pid="); SerialLogger::LogDec(lo ? (int)lo->pid : -1);
+            SerialLogger::Log(" ret="); SerialLogger::LogDec((int)r);
+            SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)(nr == 2 ? a1 : a2));
+            SerialLogger::Log(" ");
+            const char* s = (const char*)(uintptr_t)pp;
+            for (int k = 0; k < 90 && s[k]; k++) { char c[2] = { s[k], 0 }; SerialLogger::Log(c); }
+            SerialLogger::Log("\r\n");
+        }
+    }
+    // [rd] first returns of read() on each fd number per boot, with the fd's type and path,
+    // so a spinning reader shows what it is spinning on. (satoru)
+    if (g_sctrace && nr == 0 && a0 < 64) {
+        static uint8_t seen_rd[64][3];   // [fd][0=pos,1=zero,2=neg] (satoru)
+        int cls = r > 0 ? 0 : (r == 0 ? 1 : 2);
+        static int rd_extra = 0;
+        LinuxProcess* lx = LinuxSyscall::Current();
+        bool thr = lx && lx->pid >= 104 && cls == 1 && rd_extra < 4;
+        if (!seen_rd[a0][cls] || thr) {
+            seen_rd[a0][cls] = 1;
+            if (thr) rd_extra++;
+            LinuxProcess* lr = LinuxSyscall::Current();
+            SerialLogger::Log("[rd] pid="); SerialLogger::LogDec(lr ? (int)lr->pid : -1);
+            SerialLogger::Log(" fd="); SerialLogger::LogDec((int)a0);
+            SerialLogger::Log(" ret="); SerialLogger::LogDec((int)r);
+            if (lr && lr->fds[a0].open) {
+                SerialLogger::Log(" type="); SerialLogger::LogDec((int)lr->fds[a0].type);
+                SerialLogger::Log(" path="); SerialLogger::Log(lr->fds[a0].path);
+            }
+            if (lr && cls == 1) {   // dump the first 12 fd types + backend ids for a zero-returning read (satoru)
+                SerialLogger::Log(" tab=");
+                for (int k = 0; k < 12; k++) {
+                    SerialLogger::LogDec(lr->fds[k].open ? (int)lr->fds[k].type : -1);
+                    SerialLogger::Log(":"); SerialLogger::LogDec(lr->fds[k].backend_fd); SerialLogger::Log(" ");
+                }
+                SerialLogger::Log("fdsptr="); SerialLogger::LogHex64((uint64_t)(uintptr_t)lr->fds);
+            }
+            SerialLogger::Log("\r\n");
+        }
+    }
+    // epoll visibility for event-loop runtimes (bun/node/libuv): every epoll_ctl and the
+    // first returns of epoll_wait/pwait/pwait2. (satoru)
+    if (g_sctrace && (nr == 233 || nr == 232 || nr == 281 || nr == 441)) {
+        static int nep = 0;
+        if (nep < 600) {
+            if (nr == 233) {
+                nep++;
+                uint32_t ev = 0; if (a3) ev = *(const uint32_t*)(uintptr_t)a3;
+                SerialLogger::Log("[ep] ctl epfd="); SerialLogger::LogDec((int)a0);
+                SerialLogger::Log(" op="); SerialLogger::LogDec((int)a1);
+                SerialLogger::Log(" fd="); SerialLogger::LogDec((int)a2);
+                SerialLogger::Log(" ev="); SerialLogger::LogHex((uint32_t)ev);
+                SerialLogger::Log(" ret="); SerialLogger::LogDec((int)r);
+                SerialLogger::Log("\r\n");
+            } else if (r > 0 && a1) {
+                static int nret = 0;
+                if (nret < 400) {
+                    nret++; nep++;
+                    const uint32_t* e = (const uint32_t*)(uintptr_t)a1;
+                    SerialLogger::Log("[ep] wait nr="); SerialLogger::LogDec((int)nr);
+                    SerialLogger::Log(" n="); SerialLogger::LogDec((int)r);
+                    SerialLogger::Log(" ev0="); SerialLogger::LogHex(e[0]);
+                    SerialLogger::Log(" data0="); SerialLogger::LogHex(e[1]);
+                    SerialLogger::Log(" timeout="); SerialLogger::LogHex64(nr == 441 ? 0 : a3);
+                    SerialLogger::Log("\r\n");
+                }
+            }
+        }
+    }
+    if (g_sctrace && nr < 512) {
+        static uint8_t seen_nr[512];
+        static uint8_t seen_err[512][17];     // 17 bytes = 136 errno bits (satoru)
+        static int nlog = 0;
+        LinuxProcess* lp = LinuxSyscall::Current();
+        int pid = lp ? (int)lp->pid : -1;
+        if (!seen_nr[nr] && nlog < 1500) {
+            seen_nr[nr] = 1; nlog++;
+            SerialLogger::Log("[sc] first nr="); SerialLogger::LogDec((int)nr);
+            SerialLogger::Log(" pid="); SerialLogger::LogDec(pid);
+            SerialLogger::Log(" a0="); SerialLogger::LogHex64(a0);
+            SerialLogger::Log(" a1="); SerialLogger::LogHex64(a1);
+            SerialLogger::Log(" a2="); SerialLogger::LogHex64(a2);
+            SerialLogger::Log(" ret="); SerialLogger::LogHex64((uint64_t)r);
+            SerialLogger::Log("\r\n");
+        }
+        if (r < 0 && r >= -135) {
+            uint32_t e = (uint32_t)(-r);
+            if (!(seen_err[nr][e >> 3] & (1u << (e & 7))) && nlog < 1500) {
+                seen_err[nr][e >> 3] |= (uint8_t)(1u << (e & 7)); nlog++;
+                SerialLogger::Log("[sc] fail nr="); SerialLogger::LogDec((int)nr);
+                SerialLogger::Log(" err="); SerialLogger::LogDec((int)e);
+                SerialLogger::Log(" pid="); SerialLogger::LogDec(pid);
+                SerialLogger::Log(" a0="); SerialLogger::LogHex64(a0);
+                SerialLogger::Log(" a1="); SerialLogger::LogHex64(a1);
+                SerialLogger::Log(" a2="); SerialLogger::LogHex64(a2);
+                // show the path argument of failing path syscalls (the pointer was already
+                // dereferenced by the handler, so it is readable). (satoru)
+                {
+                    uint64_t pp = 0;
+                    switch (nr) {
+                        case 2: case 4: case 6: case 21: case 80: case 82: case 83: case 84: case 86:
+                        case 87: case 88: case 89: case 90: case 92: case 94: case 132: case 137: pp = a0; break;
+                        case 257: case 258: case 259: case 262: case 263: case 264: case 267: case 268:
+                        case 269: case 280: case 332: case 437: pp = a1; break;
+                        default: break;
+                    }
+                    if (pp > 0x1000 && e != 14) {
+                        SerialLogger::Log(" path=\"");
+                        const char* s = (const char*)(uintptr_t)pp;
+                        for (int k = 0; k < 96 && s[k]; k++) { char c[2] = { s[k], 0 }; SerialLogger::Log(c); }
+                        SerialLogger::Log("\"");
+                    }
+                }
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
+    return r;
+}
+
+static int64_t SyscallEntryX64Inner(uint64_t nr,
+                                    uint64_t a0, uint64_t a1,
+                                    uint64_t a2, uint64_t a3,
+                                    uint64_t a4, uint64_t a5) {
     // a5 is the user's real r9 (the frame handler reads it straight from the
     // InterruptFrame). only mmap (below) needs it - the 6th arg is its file
     // offset; everything else ignores it. (satoru)
+
+    // [exec] kurono.sctrace: show the argv of every execve (first 6 words, 120 chars each). (satoru)
+    if (g_sctrace && nr == 59 && a1 > 0x1000) {
+        static int nex = 0;
+        if (nex < 40) {
+            nex++;
+            const uint64_t* av = (const uint64_t*)(uintptr_t)a1;
+            SerialLogger::Log("[exec] ");
+            if (a0 > 0x1000) { const char* pth = (const char*)(uintptr_t)a0; for (int k = 0; k < 80 && pth[k]; k++) { char c[2] = { pth[k], 0 }; SerialLogger::Log(c); } }
+            for (int w = 0; w < 6 && av[w]; w++) {
+                SerialLogger::Log(" | ");
+                const char* s = (const char*)(uintptr_t)av[w];
+                for (int k = 0; k < 160 && s[k]; k++) { char c[2] = { (s[k] == '\n') ? ' ' : s[k], 0 }; SerialLogger::Log(c); }
+            }
+            SerialLogger::Log("\r\n");
+        }
+    }
+    // dirfd-relative *at() calls: rewrite to an AT_FDCWD call on dirfd's own path. (satoru)
+    // the rewritten path lives in this call's own stack frame (it used to be a shared static
+    // ring reused across cpus, so a blocked call could see its path overwritten), and the
+    // user path is copied with the uaccess primitive so a bad pointer is EFAULT, not a
+    // kernel fault. (satoru)
+    char at_final[320];
+    if ((nr == 257 || nr == 258 || nr == 259 || nr == 262 || nr == 263 || nr == 267 || nr == 268 ||
+         nr == 269 || nr == 280 || nr == 332 || nr == 437) && (int)a0 != -100 && a1 > 0x1000) {
+        LinuxProcess* ld = LinuxSyscall::Current();
+        int dfd = (int)a0;
+        if (ld && dfd >= 0 && dfd < LINUX_MAX_FDS && ld->fds[dfd].open && ld->fds[dfd].path[0]) {
+            char rel[300];
+            int64_t rl = UAccess::StrNCopyFromUser(rel, a1, sizeof(rel));
+            if (rl < 0) return -14;                                  // EFAULT (satoru)
+            if (rl >= (int64_t)sizeof(rel) - 1) return -36;          // ENAMETOOLONG (satoru)
+            if (rel[0] != '/') {
+                char* b = at_final;
+                int n = 0;
+                const char* base = ld->fds[dfd].path;
+                while (base[n] && n < 250) { b[n] = base[n]; n++; }
+                if (rel[0]) {
+                    if (n == 0 || b[n - 1] != '/') b[n++] = '/';
+                    if (n + (int)rl > 318) return -36;               // would not fit (satoru)
+                    for (int k = 0; rel[k]; k++) b[n++] = rel[k];
+                }
+                b[n] = 0;
+                a1 = (uint64_t)(uintptr_t)b;
+                a0 = (uint64_t)(int64_t)-100;
+            }
+        }
+    }
+
+    // [ffmain] record the main thread's syscalls (see ff_main_ring_dump).
+    {
+        LinuxProcess* lpm = LinuxSyscall::Current();
+        if (lpm && lpm->pid == 100) {
+            g_ffm_ring[g_ffm_head & 31] = { (uint32_t)nr, a0, a1, a2 };
+            g_ffm_head++;
+        }
+    }
 
     // (satoru) TEMP [ff]: trace the firefox worker tasks (kurono pids 100..139;
     // getpid()=28 is the tgid, not the task pid) to localize the paint stall.
@@ -649,6 +956,31 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             return LinuxSyscall::Dispatch(316 /*LSYS_RENAMEAT2*/, 0, a0, 0, a1, 0);
         case 264: // renameat(oldfd, oldpath, newfd, newpath): a1=old, a3=new
             return LinuxSyscall::Dispatch(316 /*LSYS_RENAMEAT2*/, 0, a1, 0, a3, 0);
+        // link/symlink: the old non-at forms. firefox's profile lock calls
+        // link(); without these it got ENOSYS and never got past startup.
+        // linkat handler reads old=ecx, new=esi; symlinkat target=ebx, link=edx.
+        case 95: {  // umask(mask): returns the previous mask. kvfs does not
+            // apply it to new files; keeping the value just answers callers
+            // (gecko sets and restores it) instead of handing them -ENOSYS.
+            static uint32_t g_umask = 022;
+            uint32_t old = g_umask;
+            g_umask = (uint32_t)a0 & 0777;
+            return old;
+        }
+        case 93:  // fchown(fd, uid, gid): kvfs ownership is path-based and
+            // everything here runs as one user; accept it like chown does.
+            return 0;
+        case 98: {  // getrusage(who, struct rusage*): no per-task accounting
+            // here; report zeros (144-byte struct) rather than ENOSYS.
+            uint8_t* ru = (uint8_t*)(uintptr_t)a1;
+            if (!ru) return -14;
+            for (int i = 0; i < 144; i++) ru[i] = 0;
+            return 0;
+        }
+        case 86:  // link(oldpath, newpath)
+            return LinuxSyscall::Dispatch(LSYS_LINKAT, 0, a0, 0, a1, 0);
+        case 88:  // symlink(target, linkpath)
+            return LinuxSyscall::Dispatch(LSYS_SYMLINKAT, a0, 0, a1, 0, 0);
         case 19: {   // readv(fd, iovec*, iovcnt) - no i386 equivalent in the
             // dispatch table (only writev/#20 is mapped), so handle it directly.
             // the iovec pointer (a1) may live above 4gb in a pie process, so pass
@@ -658,9 +990,42 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             HAL::DisableInterrupts();
             return r;
         }
-        case 230: {  // clock_nanosleep(clockid, flags, req, rem) - route to
-            // nanosleep(req, rem); clockid/flags ignored (satoru)
-            return LinuxSyscall::Dispatch(LSYS_NANOSLEEP, a2, a3, 0, 0, 0);
+        case 35: {  // nanosleep - real amd64 timespec + linux-model semantics
+            // (task 20 second attempt: the earlier hang was the poll-family
+            // ring-0 ap hold, now fixed - not the sleep deschedule; and a park
+            // under kls is safe because the syscall exit path releases the
+            // lock before the iretq, poll-park-proven). sub-ms sleeps = a
+            // YIELD (hand the cpu over if a sibling is ready, return 0
+            // immediately otherwise - never oversleep a spin-backoff on the
+            // 1ms promotion granularity); ms-scale sleeps truly DESCHEDULE
+            // via SleepMs64 (Blocked + sleep_ticks promotion + ap park). (satoru)
+            struct Ts64 { uint64_t sec; uint64_t nsec; };
+            const Ts64* ts = (const Ts64*)a0;
+            if (!ts) return 0;
+            uint64_t ms = ts->sec * 1000ull + ts->nsec / 1000000ull;
+            if (ms == 0) return LinuxSyscall::Dispatch(LSYS_SCHED_YIELD, 0, 0, 0, 0, 0);
+            return LinuxSyscall::SleepMs64(ms);
+        }
+        case 230: {  // clock_nanosleep(clockid, flags, req, rem): ABSTIME
+            // converts to relative, then the same yield/park split as 35. (satoru)
+            struct Ts64c { uint64_t sec; uint64_t nsec; };
+            const Ts64c* ts = (const Ts64c*)a2;
+            if (!ts) return 0;
+            uint64_t want_ms = ts->sec * 1000ull + ts->nsec / 1000000ull;
+            uint64_t ms;
+            if (a1 & 1) {   // TIMER_ABSTIME (satoru)
+                // task 22: the "now" must match the clock userspace computed the
+                // absolute target from - REALTIME (clockid 0) targets are epoch
+                // ms (vdso base + tsc), monotonic targets are GetRealMs64. (satoru)
+                uint64_t now = (a0 == 0)
+                    ? TimeManager::RealtimeBaseSeconds() * 1000ull + Timer::GetRealMs64()
+                    : Timer::GetRealMs64();
+                ms = want_ms > now ? want_ms - now : 0;
+            } else {
+                ms = want_ms;
+            }
+            if (ms == 0) return LinuxSyscall::Dispatch(LSYS_SCHED_YIELD, 0, 0, 0, 0, 0);
+            return LinuxSyscall::SleepMs64(ms);
         }
         // stat/fstat/lstat/newfstatat must NOT route through the i386 LSYS_*
         // handlers: those fill the 32-bit `struct LinuxStat`, but an x86_64
@@ -695,8 +1060,35 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             return r;
         }
         // statx (332) falls through to the kNrMap translation → LSYS_STATX.
-        case 302: {  // prlimit64 - fail soft.
-            return -38;
+        case 302: {  // prlimit64(pid, resource, new, old): the i386 handler fills 64-bit rlims
+            // for the old pointer; the fail-soft ENOSYS made runtimes (bun) guess. (satoru)
+            return LinuxSyscall::Dispatch(LSYS_PRLIMIT64, a0, a1, a2, a3, a4);
+        }
+        case 63: {   // uname: the shared i386 handler says "i686"; an x64 caller must see x86_64 (satoru)
+            int64_t r = LinuxSyscall::Dispatch(LSYS_UNAME, a0, 0, 0, 0, 0);
+            if (r == 0) {
+                static const char m[] = "x86_64";
+                if (UAccess::CopyToUser(a0 + __builtin_offsetof(LinuxUtsname, machine), m, sizeof(m)) != 0) return -14;
+            }
+            return r;
+        }
+        case 99: {   // sysinfo(struct sysinfo*): the LP64 layout has 8-byte fields; the shared i386
+            // handler wrote 4-byte fields so totalram read back as 0 and every runtime that sizes
+            // its heap from ram (bun/jsc: ramSize()) believed the machine had no memory and
+            // garbage collected non-stop. (satoru)
+            uint64_t* si = (uint64_t*)(uintptr_t)a0;
+            if (!si || !UAccess::AccessOk(a0, 112)) return -14;
+            for (int i = 0; i < 14; i++) si[i] = 0;
+            uint64_t total = PMM::GetPhysTop();
+            uint64_t freeb = PMM::GetFreeMemory();
+            if (total > 0x4000000000ull) total = 0x4000000000ull;
+            if (freeb > total) freeb = total;
+            si[0] = Timer::GetRealMs64() / 1000;      // uptime (satoru)
+            si[4] = total;                            // totalram, mem_unit = 1 (satoru)
+            si[5] = freeb;                            // freeram (satoru)
+            *(uint16_t*)&si[10] = (uint16_t)LinuxSyscall::ActiveProcessCount();   // procs (satoru)
+            *(uint32_t*)&si[13] = 1;                  // mem_unit (satoru)
+            return 0;
         }
         // ── KDF/UDF hybrid-kernel addition (satoru) ─────────────────────────────
         // SYS_UDF_CALL: the user driver framework entry. a ring-3 udf driver
@@ -709,6 +1101,21 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
         case 0x4B554446: {
             HAL::EnableInterrupts();
             int64_t r = UDF::Call((uint32_t)a0, a1, a2, a3, a4);
+            HAL::DisableInterrupts();
+            return r;
+        }
+        // SYS_KLD_CALL ("KLDB"): the kernel half of the linux-driver
+        // compatibility layer. An UNTRUSTED ring-3 container running unmodified
+        // upstream driver code reaches hardware only through here. The ABI is
+        // scalars-only on purpose - no user pointer crosses this boundary,
+        // because the syscall layer has no copy_from_user/access_ok yet and a
+        // pointer-taking broker op would be a privilege-escalation surface.
+        // Access is per-container grant-gated; see kld_broker.h. (satoru)
+        case 0x4B4C4442: {
+            HAL::EnableInterrupts();
+            Process* cur = Scheduler::GetCurrentProcess();
+            int64_t r = KldBroker::Call(cur ? (int)cur->pid : -1,
+                                        (uint32_t)a0, a1, a2, a3, a4);
             HAL::DisableInterrupts();
             return r;
         }

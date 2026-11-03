@@ -4,6 +4,8 @@
 #include "../shell/shell.h"
 #include "../drivers/serial.h"
 #include "../drivers/e1000.h"
+#include "../drivers/igc.h"
+#include "dhcp.h"
 #include "../drivers/wifi_dev.h"    // real wireless nic detection + bar mapping (satoru)
 #include "../drivers/wifi_iwl.h"    // per-vendor radio drivers (phase 2) (satoru)
 #include "../drivers/wifi_ath.h"
@@ -50,6 +52,9 @@ static void e1000_rx_handler(const uint8_t* data, uint16_t length) {
         eth->rx_packets++;
         eth->rx_bytes += length;
     }
+
+    // dhcp replies (udp dport 68) belong to the dhcp client, not the tcp stack (satoru)
+    if (Dhcp::OnFrame(data, length)) return;
 
     // todo: parse ethernet frame, dispatch to ip/arp/etc.
     // for now, arp responses and dhcp would be processed here
@@ -107,7 +112,8 @@ void Network::Init() {
         eth.gateway = MakeIP(10, 0, 2, 2);
         eth.dns = MakeIP(10, 0, 2, 3);
         eth.state = E1000::IsLinkUp() ? NIC_UP : NIC_DOWN;
-        SerialLogger::Log("Network: eth0 backed by real E1000 NIC\r\n");
+        SerialLogger::Log("Network: eth0 backed by real NIC (e1000 or igc/igb), link ");
+        SerialLogger::Log(eth.state == NIC_UP ? "up\r\n" : "down (will be re-checked)\r\n");
         RuntimeLog::LogNetwork(eth.state == NIC_UP ? "link up" : "link down",
                                "eth0 (e1000)");
     } else {
@@ -352,6 +358,17 @@ bool Network::SendPacket(const char* ifname, const unsigned char* data, int len)
     return sent || (iface->type == NIC_LOOPBACK);
 }
 
+void Network::RefreshLink() {
+    if (!E1000::IsDetected()) return;
+    NetworkInterface* eth = GetInterface("eth0");
+    if (!eth || eth->type != NIC_ETHERNET) return;
+    NICState want = E1000::IsLinkUp() ? NIC_UP : NIC_DOWN;
+    if (want == eth->state) return;
+    eth->state = want;
+    SerialLogger::Log(want == NIC_UP ? "Network: eth0 link came up\r\n" : "Network: eth0 link went down\r\n");
+    RuntimeLog::LogNetwork(want == NIC_UP ? "link up" : "link down", "eth0");
+}
+
 int Network::RecvPacket(const char* ifname, unsigned char* data, int max_len) {
     NetworkInterface* iface = GetInterface(ifname);
     if (!iface || iface->state != NIC_UP) return -1;
@@ -444,8 +461,8 @@ static const DNSEntry dns_cache[] = {
     {"router",             192, 168, 1, 1},
     {"google.com",         142, 250, 80, 46},
     {"www.google.com",     142, 250, 80, 46},
-    {"example.com",        93, 184, 216, 34},
-    {"www.example.com",    93, 184, 216, 34},
+    {"example.com",        93, 184, 215, 14},   // moved off 216.34 in 2024 (satoru)
+    {"www.example.com",    93, 184, 215, 14},
     {"github.com",         140, 82, 121, 3},
     {"www.github.com",     140, 82, 121, 3},
     {"cloudflare.com",     104, 16, 132, 229},
@@ -867,6 +884,12 @@ const char* WiFi::WirelessChipName() {
 bool WiFi::IsLinkUp() {
     if (!link_probed) ProbePCIWireless();
     if (detected_link == LINK_WIFI)     return state == WIFI_CONNECTED;
+    // a detected WIRED nic IS a live link (this is the common case under
+    // qemu's emulated e1000). the old code only treated LINK_WIFI as "up",
+    // so with ethernet the taskbar + settings showed DISCONNECTED even though
+    // networking fully worked, and SignalBars() returned 0 (its ethernet=4
+    // path was unreachable behind this check). (satoru)
+    if (detected_link == LINK_ETHERNET) return E1000::IsDetected();
     return false;
 }
 

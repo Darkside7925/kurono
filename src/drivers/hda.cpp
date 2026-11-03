@@ -6,6 +6,7 @@
 #include "../kernel/heap.h"
 #include "../kernel/io.h"
 #include "../kernel/vmm.h"   // map the (possibly high 64-bit) bar0 before deref (satoru)
+#include "serial.h"
 
 bool HDAudio::detected = false;
 volatile uint8_t* HDAudio::bar0 = nullptr;
@@ -83,7 +84,7 @@ void HDAudio::DelayUs(uint32_t us) {
     uint32_t start = Read32(HDA_WALCLK);
     // probe whether the wall clock is actually ticking. (satoru)
     bool ticking = false;
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 16; i++) {      // 16 mmio reads is ample at 24 mhz (satoru)
         if (Read32(HDA_WALCLK) != start) { ticking = true; break; }
     }
     if (!ticking) {
@@ -94,7 +95,10 @@ void HDAudio::DelayUs(uint32_t us) {
         return;
     }
     const uint32_t target = us * 24u;   // 24 ticks per microsecond. (satoru)
-    while ((Read32(HDA_WALCLK) - start) < target) {
+    // iteration cap as well as the clock limit: if the wall clock stalls
+    // mid-wait this still terminates (>=24 ticks pass per us on any real read rate). (satoru)
+    uint32_t cap = us * 32u + 4096u;
+    while ((Read32(HDA_WALCLK) - start) < target && cap--) {
         __asm__ __volatile__("pause");
     }
 }
@@ -102,8 +106,615 @@ void HDAudio::DelayUs(uint32_t us) {
 // millisecond wait via the pit timer (accurate and irq/cadence independent
 // through Timer::WaitMs). used for the longer analog/charge-pump settles. (satoru)
 void HDAudio::DelayMs(uint32_t ms) {
-    Timer::WaitMs(ms);
+    DelayUs(ms * 1000u);   // wall clock based, no dependency on the pit being alive (satoru)
 }
+
+// ---------------------------------------------------------------------------
+//  controller bring-up, codec scan and generic output path programming.
+//  modelled on linux sound/hda (controllers/intel.c azx_init_pci, core/
+//  controller.c snd_hdac_bus_reset_link, common/ generic parser) and logged
+//  with an [hda] prefix so one boot log diagnoses real hardware. every wait is
+//  iteration capped as well as clock limited. (satoru)
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int kMaxW    = 256;   // nids are 8 bit
+constexpr int kMaxConn = 16;
+
+struct HdaW {
+    uint8_t  present;
+    uint8_t  type;
+    uint8_t  nconn;
+    uint8_t  conn[kMaxConn];
+    uint32_t wcap;
+    uint32_t pincap;
+    uint32_t cfg;
+    uint32_t ampo;      // effective output amp caps (0 = none)
+    uint32_t ampi;      // effective input amp caps (0 = none)
+};
+HdaW g_w[kMaxW];
+
+struct HdaCodec {
+    int      cad;
+    uint32_t vendor, subsys, rev;
+    int      afg;
+    int      n_dac_a, n_pin_a, n_dac_d, n_pin_d;
+};
+HdaCodec g_ci[HDA_MAX_CODECS];
+
+struct HdaPath {
+    uint8_t nodes[8];   // pin first, dac last
+    uint8_t idx[8];     // connection index chosen at each node
+    int     n;
+    int     pin;
+    int     dev;        // default device of the pin
+};
+HdaPath g_paths[8];
+int     g_npaths = 0;
+int     g_dacs[8];
+int     g_dac_steps[8];
+int     g_ndacs = 0;
+bool    g_digital = false;
+int     g_chosen = -1;
+
+bool g_dead = false;       // bus gave up after repeated verb timeouts
+int  g_fail = 0;           // consecutive timeouts
+int  g_timeouts = 0;       // total timeouts this bring-up
+
+struct HdaCand {
+    uint8_t  bus, dev, fn;
+    uint16_t ven, did;
+    uint32_t subsys, cls;
+    uint64_t bar;
+};
+HdaCand g_cand;
+bool    g_have_cand = false;
+uint32_t g_gcap = 0;
+
+void LS(const char* s) { SerialLogger::Log(s); }
+void LX(uint32_t v)    { SerialLogger::LogHex(v); }
+void LD(int v)         { SerialLogger::LogDec(v); }
+
+uint32_t cfg_r32(int b, int d, int f, int off) {
+    outl(0xCF8, 0x80000000u | ((uint32_t)b << 16) | ((uint32_t)d << 11) | ((uint32_t)f << 8) | (uint32_t)(off & 0xFC));
+    return inl(0xCFC);
+}
+void cfg_w32(int b, int d, int f, int off, uint32_t v) {
+    outl(0xCF8, 0x80000000u | ((uint32_t)b << 16) | ((uint32_t)d << 11) | ((uint32_t)f << 8) | (uint32_t)(off & 0xFC));
+    outl(0xCFC, v);
+}
+// byte / word config access through the 0xcf8 window (data port + low offset bits), as
+// linux pci_read/write_config_byte/word. a dword write to 0x78 would also write back the
+// neighbouring DEVSTS half, whose bits are write-1-to-clear. (satoru)
+uint16_t cfg_r16(int b, int d, int f, int off) {
+    outl(0xCF8, 0x80000000u | ((uint32_t)b << 16) | ((uint32_t)d << 11) | ((uint32_t)f << 8) | (uint32_t)(off & 0xFC));
+    return inw((uint16_t)(0xCFC + (off & 2)));
+}
+void cfg_w16(int b, int d, int f, int off, uint16_t v) {
+    outl(0xCF8, 0x80000000u | ((uint32_t)b << 16) | ((uint32_t)d << 11) | ((uint32_t)f << 8) | (uint32_t)(off & 0xFC));
+    outw((uint16_t)(0xCFC + (off & 2)), v);
+}
+uint8_t cfg_r8(int b, int d, int f, int off) {
+    outl(0xCF8, 0x80000000u | ((uint32_t)b << 16) | ((uint32_t)d << 11) | ((uint32_t)f << 8) | (uint32_t)(off & 0xFC));
+    return inb((uint16_t)(0xCFC + (off & 3)));
+}
+void cfg_w8(int b, int d, int f, int off, uint8_t v) {
+    outl(0xCF8, 0x80000000u | ((uint32_t)b << 16) | ((uint32_t)d << 11) | ((uint32_t)f << 8) | (uint32_t)(off & 0xFC));
+    outb((uint16_t)(0xCFC + (off & 3)), v);
+}
+
+} // namespace
+
+struct HdaImpl {
+    static uint32_t Param(int cad, int nid, int p) {
+        uint32_t r = 0;
+        if (!HDAudio::SendVerb(HDA_VERB(cad, nid, HDA_VERB_GET_PARAM, p), &r)) return 0;
+        return r;
+    }
+    // 12-bit verb with 8-bit payload (get/set 0xFxx / 0x7xx) (satoru)
+    static uint32_t Get(int cad, int nid, uint32_t verb, uint32_t payload) {
+        uint32_t r = 0;
+        if (!HDAudio::SendVerb(HDA_VERB(cad, nid, verb, payload), &r)) return 0;
+        return r;
+    }
+    static void Set(int cad, int nid, uint32_t verb, uint32_t payload) {
+        uint32_t r = 0;
+        HDAudio::SendVerb(HDA_VERB(cad, nid, verb, payload), &r);
+    }
+    // 4-bit verb with 16-bit payload (amp, format, coef) (satoru)
+    static uint32_t Get4(int cad, int nid, uint32_t verb4, uint32_t payload) {
+        uint32_t r = 0;
+        if (!HDAudio::SendVerb(HDA_VERB4(cad, nid, verb4, payload), &r)) return 0;
+        return r;
+    }
+    static void Set4(int cad, int nid, uint32_t verb4, uint32_t payload) {
+        uint32_t r = 0;
+        HDAudio::SendVerb(HDA_VERB4(cad, nid, verb4, payload), &r);
+    }
+
+    // ---- controller discovery ------------------------------------------
+    static int FindControllers(HdaCand* out, int max) {
+        int n = 0;
+        for (int bus = 0; bus < 256; bus++) {
+            for (int dev = 0; dev < 32; dev++) {
+                // function 0 absent => whole slot absent (skips 7 reads per slot) (satoru)
+                if ((cfg_r32(bus, dev, 0, 0) & 0xFFFF) == 0xFFFF) continue;
+                for (int fn = 0; fn < 8; fn++) {
+                    uint32_t id = cfg_r32(bus, dev, fn, 0);
+                    if ((id & 0xFFFF) == 0xFFFF) continue;
+                    uint32_t cls = cfg_r32(bus, dev, fn, 8);
+                    if (((cls >> 24) & 0xFF) != 0x04 || ((cls >> 16) & 0xFF) != 0x03) continue;
+                    uint32_t bar_lo = cfg_r32(bus, dev, fn, 0x10);
+                    if (bar_lo & 1) continue;                    // io bar, not hda mmio
+                    uint64_t bar = (uint64_t)(bar_lo & ~0xFu);
+                    if (((bar_lo >> 1) & 0x3) == 0x2)            // 64-bit bar: high half in bar1
+                        bar |= ((uint64_t)cfg_r32(bus, dev, fn, 0x14) << 32);
+                    if (n >= max) continue;
+                    out[n].bus = bus; out[n].dev = dev; out[n].fn = fn;
+                    out[n].ven = id & 0xFFFF; out[n].did = id >> 16;
+                    out[n].subsys = cfg_r32(bus, dev, fn, 0x2C);
+                    out[n].cls = cls;
+                    out[n].bar = bar;
+                    n++;
+                }
+            }
+        }
+        // intel first, nvidia (gpu hdmi) last: never pick the gpu function over the
+        // pch one when both exist. (satoru)
+        for (int i = 1; i < n; i++) {
+            for (int j = i; j > 0; j--) {
+                int ra = Rank(out[j - 1].ven), rb = Rank(out[j].ven);
+                if (rb < ra) { HdaCand t = out[j - 1]; out[j - 1] = out[j]; out[j] = t; }
+                else break;
+            }
+        }
+        return n;
+    }
+    static int Rank(uint16_t ven) { return ven == 0x8086 ? 0 : (ven == 0x10DE ? 2 : 1); }
+
+    // intel extended multilink capability (hda link power), cf. sound/hda/core/
+    // ext/controller.c. only touches link 0 and only when it reports powered off. (satoru)
+    static void MlLinkUp() {
+        uint32_t off = HDAudio::Read32(0x14) & 0xFFFF;
+        for (int i = 0; i < 16 && off >= 0x40 && off < 0xF000 && (off & 3) == 0; i++) {
+            uint32_t hdr = HDAudio::Read32(off);
+            uint32_t id = (hdr >> 16) & 0xFFF;
+            if (id == 2) {
+                uint32_t lcap = HDAudio::Read32(off + 0x40);
+                uint32_t lctl = HDAudio::Read32(off + 0x44);
+                LS("[hda] ml cap @"); LX(off); LS(" links="); LD((int)(HDAudio::Read32(off + 4) & 0x1F) + 1);
+                LS(" lcap0="); LX(lcap); LS(" lctl0="); LX(lctl);
+                if (!(lctl & (1u << 23))) {
+                    HDAudio::Write32(off + 0x44, lctl | (1u << 16));      // SPA
+                    for (int k = 0; k < 200; k++) {
+                        if (HDAudio::Read32(off + 0x44) & (1u << 23)) break;   // CPA
+                        HDAudio::DelayUs(50);
+                    }
+                    LS(" -> lctl0="); LX(HDAudio::Read32(off + 0x44));
+                }
+                LS("\r\n");
+                return;
+            }
+            off = hdr & 0xFFFF;
+        }
+    }
+
+    // reset the link and wait for codecs to announce themselves (statests).
+    // timing from snd_hdac_bus_reset_link: >=100us in reset, >=540us after. (satoru)
+    static bool ResetLink() {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            uint32_t gctl = HDAudio::Read32(HDA_GCTL);
+            if (gctl & HDA_GCTL_CRST) HDAudio::Write16(HDA_STATESTS, 0x7FFF);
+            HDAudio::Write32(HDA_GCTL, gctl & ~(uint32_t)HDA_GCTL_CRST);
+            int w0 = 0;
+            for (; w0 < 2000; w0++) {
+                if (!(HDAudio::Read32(HDA_GCTL) & HDA_GCTL_CRST)) break;
+                HDAudio::DelayUs(10);
+            }
+            HDAudio::DelayUs(600);
+            HDAudio::Write32(HDA_GCTL, HDAudio::Read32(HDA_GCTL) | HDA_GCTL_CRST);
+            int w1 = 0;
+            for (; w1 < 2000; w1++) {
+                if (HDAudio::Read32(HDA_GCTL) & HDA_GCTL_CRST) break;
+                HDAudio::DelayUs(10);
+            }
+            HDAudio::DelayUs(1500);
+            uint16_t sm = 0;
+            int w2 = 0;
+            for (; w2 < 120; w2++) {
+                sm = HDAudio::Read16(HDA_STATESTS) & 0x7FFF;
+                if (sm) break;
+                HDAudio::DelayUs(1000);
+            }
+            LS("[hda] reset try="); LD(attempt); LS(" gctl="); LX(HDAudio::Read32(HDA_GCTL));
+            LS(" statests="); LX(sm); LS(" waits(in,out,codec)="); LD(w0); LS(","); LD(w1); LS(","); LD(w2);
+            LS("\r\n");
+            if (!(HDAudio::Read32(HDA_GCTL) & HDA_GCTL_CRST)) continue;
+            if (sm) return true;
+        }
+        return false;
+    }
+
+    // ---- codec scan -----------------------------------------------------
+    static int ReadConn(int cad, int nid, HdaW& w) {
+        uint32_t cl = Param(cad, nid, HDA_PARAM_CONN_LEN);
+        int len = cl & 0x7F;
+        bool lng = (cl & 0x80) != 0;
+        w.nconn = 0;
+        if (len == 0) return 0;
+        int per = lng ? 2 : 4, bits = lng ? 16 : 8;
+        uint32_t emask = lng ? 0xFFFFu : 0xFFu, rbit = lng ? 0x8000u : 0x80u, idmask = lng ? 0x7FFFu : 0x7Fu;
+        int prev = 0, n = 0;
+        for (int i = 0; i < len && n < kMaxConn; i += per) {
+            uint32_t r = Get(cad, nid, HDA_VERB_GET_CONNLIST, i);
+            for (int k = 0; k < per && i + k < len && n < kMaxConn; k++) {
+                uint32_t e = (r >> (k * bits)) & emask;
+                int id = (int)(e & idmask);
+                if ((e & rbit) && prev) {
+                    for (int m = prev + 1; m <= id && n < kMaxConn; m++) w.conn[n++] = (uint8_t)m;
+                } else {
+                    w.conn[n++] = (uint8_t)id;
+                }
+                prev = id;
+            }
+        }
+        w.nconn = (uint8_t)n;
+        return len;
+    }
+
+    static void Power(int cad, int nid, bool wait) {
+        Set(cad, nid, HDA_VERB_SET_POWER, 0x00);
+        if (!wait) return;
+        for (int i = 0; i < 20; i++) {
+            uint32_t r = Get(cad, nid, 0xF05, 0);
+            if (((r >> 4) & 0xF) == 0) break;      // PS-Act == D0
+            HDAudio::DelayUs(500);
+        }
+    }
+
+    static const char* TypeName(int t) {
+        switch (t) {
+            case 0: return "DAC"; case 1: return "ADC"; case 2: return "MIX"; case 3: return "SEL";
+            case 4: return "PIN"; case 5: return "PWR"; case 6: return "VOL"; case 7: return "BEEP";
+            default: return "VEN";
+        }
+    }
+
+    // scan one codec's audio function group into g_w. returns false if no afg. (satoru)
+    static bool Scan(int cad, HdaCodec& ci, bool verbose) {
+        for (int i = 0; i < kMaxW; i++) g_w[i].present = 0;
+        ci.cad = cad;
+        ci.vendor = Param(cad, 0, HDA_PARAM_VENDOR_ID);
+        ci.rev = Param(cad, 0, 0x02);
+        ci.afg = HDAudio::FindAFG(cad);
+        ci.subsys = 0; ci.n_dac_a = ci.n_pin_a = ci.n_dac_d = ci.n_pin_d = 0;
+        if (verbose) {
+            LS("[hda] codec cad="); LD(cad); LS(" vendor="); LX(ci.vendor); LS(" rev="); LX(ci.rev);
+        }
+        if (ci.afg < 0) { if (verbose) LS(" no-audio-fg\r\n"); return false; }
+        Power(cad, ci.afg, true);
+        ci.subsys = Get(cad, ci.afg, 0xF20, 0);
+        uint32_t nc = Param(cad, ci.afg, HDA_PARAM_NODE_COUNT);
+        int start = (nc >> 16) & 0xFF, count = nc & 0xFF;
+        uint32_t afg_ao = Param(cad, ci.afg, HDA_PARAM_AMP_OUT_CAP);
+        uint32_t afg_ai = Param(cad, ci.afg, HDA_PARAM_AMP_IN_CAP);
+        if (verbose) {
+            LS(" subsys="); LX(ci.subsys); LS(" afg="); LX(ci.afg); LS(" nodes="); LX(start); LS("+"); LD(count);
+            LS(" pcm="); LX(Param(cad, ci.afg, 0x0A)); LS(" fmts="); LX(Param(cad, ci.afg, 0x0B));
+            LS(" afg_ao="); LX(afg_ao); LS(" afg_ai="); LX(afg_ai); LS("\r\n");
+        }
+        for (int n = 0; n < count; n++) {
+            int nid = start + n;
+            if (nid >= kMaxW) break;
+            HdaW& w = g_w[nid];
+            w.wcap = Param(cad, nid, HDA_PARAM_AUDIO_WIDGET);
+            w.type = (w.wcap >> 20) & 0xF;
+            w.present = 1;
+            w.pincap = 0; w.cfg = 0; w.nconn = 0;
+            bool digital = (w.wcap & 0x200) != 0;
+            w.ampo = (w.wcap & 4) ? ((w.wcap & 8) ? Param(cad, nid, HDA_PARAM_AMP_OUT_CAP) : afg_ao) : 0;
+            w.ampi = (w.wcap & 2) ? ((w.wcap & 8) ? Param(cad, nid, HDA_PARAM_AMP_IN_CAP) : afg_ai) : 0;
+            int clen = 0;
+            if (w.wcap & 0x100) clen = ReadConn(cad, nid, w);
+            if (w.type == HDA_WIDGET_PIN) {
+                w.pincap = Param(cad, nid, HDA_PARAM_PIN_CAP);
+                w.cfg = Get(cad, nid, HDA_VERB_GET_CONFIG_DEF, 0);
+                if (w.pincap & 0x10) {
+                    int conn = (w.cfg >> 30) & 3, dev = (w.cfg >> 20) & 0xF;
+                    if (conn != 1) {
+                        if (dev <= 2) ci.n_pin_a++;
+                        else if (dev == 4 || dev == 5) ci.n_pin_d++;
+                    }
+                }
+            } else if (w.type == HDA_WIDGET_AUDIO_OUT) {
+                if (digital) ci.n_dac_d++; else ci.n_dac_a++;
+            }
+            if (verbose) {
+                LS("[hda]  n"); LX(nid); LS(" "); LS(TypeName(w.type)); LS(" wcap="); LX(w.wcap);
+                if (w.type == HDA_WIDGET_PIN) { LS(" pc="); LX(w.pincap); LS(" cfg="); LX(w.cfg); }
+                if (w.ampo) { LS(" ao="); LX(w.ampo); }
+                if (w.ampi) { LS(" ai="); LX(w.ampi); }
+                if (clen) {
+                    LS(" cn="); LD(clen); LS(":");
+                    for (int k = 0; k < w.nconn; k++) { if (k) LS(","); LX(w.conn[k]); }
+                }
+                LS("\r\n");
+            }
+        }
+        return true;
+    }
+
+    // ---- generic output path (cf. sound/hda/common/auto_parser + generic) ---
+    static bool Walk(int nid, int depth, bool digital, bool avoid_used, HdaPath& p) {
+        HdaW& w = g_w[nid];
+        p.nodes[depth] = (uint8_t)nid;
+        p.n = depth + 1;
+        if (w.type == HDA_WIDGET_AUDIO_OUT) {
+            if (((w.wcap & 0x200) != 0) != digital) return false;
+            if (avoid_used) {
+                for (int i = 0; i < g_ndacs; i++) if (g_dacs[i] == nid) return false;
+            }
+            return true;
+        }
+        if (depth >= 6) return false;
+        if (w.type != HDA_WIDGET_PIN && w.type != HDA_WIDGET_AUDIO_MIX && w.type != HDA_WIDGET_AUDIO_SEL)
+            return false;
+        for (int i = 0; i < w.nconn; i++) {
+            int c = w.conn[i];
+            if (!g_w[c].present || g_w[c].type == HDA_WIDGET_PIN) continue;
+            p.idx[depth] = (uint8_t)i;
+            if (Walk(c, depth + 1, digital, avoid_used, p)) return true;
+        }
+        return false;
+    }
+
+    static uint32_t AmpPayload(bool out, int idx, uint32_t cap, bool mute) {
+        uint32_t ofs = cap & 0x7F, steps = (cap >> 8) & 0x7F;
+        uint32_t g = ofs;                      // 0 dB step
+        if (g > steps) g = steps;
+        uint32_t v = (out ? 0x8000u : 0x4000u) | 0x3000u;   // set out|in, left+right
+        if (!out) v |= ((uint32_t)idx & 0xF) << 8;
+        if (mute) v |= 0x80;
+        return v | g;
+    }
+    static uint32_t AmpRead(int cad, int nid, bool out, int idx) {
+        return Get4(cad, nid, 0xB, (out ? 0xA000u : 0x2000u) | (out ? 0u : ((uint32_t)idx & 0xF)));
+    }
+
+    static int PinSense(int cad, int nid, uint32_t pincap) {
+        if (!(pincap & 0x4)) return -1;               // no presence detect
+        if (pincap & 0x2) { Set(cad, nid, 0x709, 0); HDAudio::DelayUs(1000); }   // trigger required
+        return (int)((Get(cad, nid, 0xF09, 0) >> 31) & 1);
+    }
+
+    // coefficient helpers: only used for the documented alc287 headphone sequence (satoru)
+    static uint32_t CoefRead(int cad, int nid, int idx) {
+        Set4(cad, nid, 0x5, idx);
+        return Get4(cad, nid, 0xC, 0);
+    }
+    static void CoefUpdate(int cad, int nid, int idx, uint32_t mask, uint32_t bits) {
+        uint32_t v = CoefRead(cad, nid, idx);
+        Set4(cad, nid, 0x5, idx);
+        Set4(cad, nid, 0x4, (v & ~mask) | bits);
+    }
+
+    static bool BuildPaths(const HdaCodec& ci, bool digital, bool verbose) {
+        int cad = ci.cad;
+        g_npaths = 0; g_ndacs = 0; g_digital = digital;
+        for (int nid = 0; nid < kMaxW && g_npaths < 8; nid++) {
+            HdaW& w = g_w[nid];
+            if (!w.present || w.type != HDA_WIDGET_PIN || !(w.pincap & 0x10)) continue;
+            int conn = (w.cfg >> 30) & 3, dev = (w.cfg >> 20) & 0xF;
+            if (conn == 1) continue;                        // no physical connection
+            bool ok = digital ? (dev == 4 || dev == 5) : (dev <= 2);
+            if (!ok) continue;
+            HdaPath p; p.pin = nid; p.dev = dev; p.n = 0;
+            bool found = Walk(nid, 0, digital, true, p);
+            if (!found) found = Walk(nid, 0, digital, false, p);
+            if (!found) {
+                if (verbose) { LS("[hda] no dac path for pin "); LX(nid); LS("\r\n"); }
+                continue;
+            }
+            g_paths[g_npaths++] = p;
+            int dac = p.nodes[p.n - 1];
+            bool have = false;
+            for (int i = 0; i < g_ndacs; i++) if (g_dacs[i] == dac) have = true;
+            if (!have && g_ndacs < 8) { g_dac_steps[g_ndacs] = (g_w[dac].ampo >> 8) & 0x7F; g_dacs[g_ndacs++] = dac; }
+        }
+        if (g_npaths == 0) return false;
+
+        // program every path: power, connection select, amps, pin control, eapd. (satoru)
+        for (int pi = 0; pi < g_npaths; pi++) {
+            HdaPath& p = g_paths[pi];
+            for (int k = 0; k < p.n; k++) {
+                int nid = p.nodes[k];
+                HdaW& w = g_w[nid];
+                Power(cad, nid, (w.wcap & 0x400) != 0);
+                bool is_dac = (w.type == HDA_WIDGET_AUDIO_OUT);
+                if (!is_dac && w.nconn > 1 && (w.type == HDA_WIDGET_PIN || w.type == HDA_WIDGET_AUDIO_SEL))
+                    Set(cad, nid, HDA_VERB_SET_CONNSEL, p.idx[k]);
+                if (!is_dac && w.ampi) Set4(cad, nid, 0x3, AmpPayload(false, p.idx[k], w.ampi, false));
+                if (w.ampo)            Set4(cad, nid, 0x3, AmpPayload(true, 0, w.ampo, false));
+            }
+            HdaW& pw = g_w[p.pin];
+            uint32_t pctl = 0x40;                                       // OUT_EN
+            if (p.dev == 2 && (pw.pincap & 0x8)) pctl |= 0x80;          // HP_EN where the pin has an hp amp
+            Set(cad, p.pin, HDA_VERB_SET_PINCTL, pctl);
+            if (pw.pincap & 0x10000) Set(cad, p.pin, HDA_VERB_SET_EAPDBTL, 0x02);
+        }
+        HDAudio::DelayUs(2000);
+
+        if (verbose) {
+            for (int pi = 0; pi < g_npaths; pi++) {
+                HdaPath& p = g_paths[pi];
+                HdaW& pw = g_w[p.pin];
+                LS("[hda] path pin="); LX(p.pin); LS(" dev="); LD(p.dev); LS(" sense="); LD(PinSense(cad, p.pin, pw.pincap));
+                LS(" chain=");
+                for (int k = 0; k < p.n; k++) { if (k) LS(">"); LX(p.nodes[k]); }
+                LS(" pinctl="); LX(Get(cad, p.pin, 0xF07, 0));
+                LS(" eapd="); LX(Get(cad, p.pin, 0xF0C, 0));
+                LS(" csel="); LX(Get(cad, p.pin, HDA_VERB_GET_CONNSEL, 0));
+                LS(" pwr="); LX(Get(cad, p.pin, 0xF05, 0));
+                for (int k = 0; k < p.n; k++) {
+                    HdaW& w = g_w[p.nodes[k]];
+                    if (w.ampo) { LS(" ao"); LX(p.nodes[k]); LS("="); LX(AmpRead(cad, p.nodes[k], true, 0)); }
+                    if (w.ampi && w.type != HDA_WIDGET_AUDIO_OUT) { LS(" ai"); LX(p.nodes[k]); LS("="); LX(AmpRead(cad, p.nodes[k], false, p.idx[k])); }
+                }
+                LS("\r\n");
+            }
+        }
+        return true;
+    }
+
+    // documented alc287 headphone power sequence, from alc225_init() in
+    // sound/hda/codecs/realtek/alc269.c (alc287 skips alc285_hp_init). only runs
+    // when a headphone is actually sensed on the jack. coefs 0x57/4 and 0x20/0x4a
+    // are the same ones linux touches there; nothing else is poked. (satoru)
+    static void Alc287Hp(int cad) {
+        for (int pi = 0; pi < g_npaths; pi++) {
+            HdaPath& p = g_paths[pi];
+            if (p.dev != 2) continue;
+            if (PinSense(cad, p.pin, g_w[p.pin].pincap) != 1) continue;
+            LS("[hda] alc287 hp plugged on pin "); LX(p.pin); LS(": running alc225_init hp sequence\r\n");
+            CoefUpdate(cad, 0x57, 0x04, 0x0007, 0x1);          // low power
+            Set(cad, p.pin, HDA_VERB_SET_PINCTL, 0x40);
+            HDAudio::DelayUs(75000);
+            Set4(cad, p.pin, 0x3, 0xB000);                      // AMP_OUT_UNMUTE
+            HDAudio::DelayUs(75000);
+            CoefUpdate(cad, 0x20, 0x4a, 3u << 10, 0);
+            CoefUpdate(cad, 0x57, 0x04, 0x0007, 0x4);          // high power
+            return;
+        }
+    }
+
+    // ---- one controller, start to finish ---------------------------------
+    static bool BringUp(const HdaCand& c) {
+        HDAudio::detected = false;
+        HDAudio::codec_count = 0;
+        HDAudio::output_nid = -1; HDAudio::pin_nid = -1;
+        g_dead = false; g_fail = 0; g_timeouts = 0; g_chosen = -1; g_npaths = 0; g_ndacs = 0;
+        g_cand = c; g_have_cand = true;
+        HDAudio::bar0 = nullptr;
+
+        LS("[hda] controller "); LD(c.bus); LS(":"); LD(c.dev); LS("."); LD(c.fn);
+        LS(" ven="); LX(c.ven); LS(" dev="); LX(c.did); LS(" subsys="); LX(c.subsys);
+        LS(" class="); LX(c.cls >> 8); LS(" bar="); SerialLogger::LogHex64(c.bar); LS("\r\n");
+        if (c.bar == 0) { LS("[hda] FAIL bar unassigned\r\n"); return false; }
+
+        uint64_t start = c.bar & ~0xFFFULL;
+        for (uint64_t p = start; p < start + 0x10000ULL; p += 0x1000ULL)
+            KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
+        HDAudio::bar0 = (volatile uint8_t*)(uintptr_t)c.bar;
+
+        // memory space + bus master; mask to the low 16 bits so the status
+        // half (write-1-to-clear) is not written back. (satoru)
+        uint32_t cmd = cfg_r32(c.bus, c.dev, c.fn, 0x04);
+        cfg_w32(c.bus, c.dev, c.fn, 0x04, (cmd & 0xFFFF) | 0x6);
+        if (c.ven == 0x8086) {
+            // azx_init_pci: clear TCSEL bits 0-2 (pci 0x44) and enable snooping
+            // (clear NSNPEN, devc bit 11 at 0x78). (satoru)
+            // same widths as linux azx_init_pci: a byte read-modify-write at 0x44 (TCSEL) and a
+            // 16-bit one at 0x78 (DEVC), so the neighbouring config bytes (and the write-1-to-
+            // clear DEVSTS half at 0x7a) are never written back. (satoru)
+            uint8_t t = cfg_r8(c.bus, c.dev, c.fn, 0x44);
+            cfg_w8(c.bus, c.dev, c.fn, 0x44, (uint8_t)(t & ~0x7u));
+            uint16_t devc = cfg_r16(c.bus, c.dev, c.fn, 0x78);
+            LS("[hda] pci cmd="); LX(cmd & 0xFFFF); LS(" tcsel="); LX(t); LS(" devc="); LX(devc);
+            if (devc & (1u << 11)) { cfg_w16(c.bus, c.dev, c.fn, 0x78, (uint16_t)(devc & ~(1u << 11))); LS(" -> snoop enabled"); }
+            LS("\r\n");
+        }
+
+        g_gcap = HDAudio::Read16(HDA_GCAP);
+        LS("[hda] gcap="); LX(g_gcap); LS(" vmaj.vmin="); LD(HDAudio::Read8(HDA_VMAJ)); LS("."); LD(HDAudio::Read8(HDA_VMIN));
+        LS(" oss="); LD((g_gcap >> 12) & 0xF); LS(" iss="); LD((g_gcap >> 8) & 0xF);
+        LS(" 64ok="); LD(g_gcap & 1); LS(" gctl(pre)="); LX(HDAudio::Read32(HDA_GCTL));
+        LS(" statests(pre)="); LX(HDAudio::Read16(HDA_STATESTS)); LS("\r\n");
+        if (g_gcap == 0xFFFF || g_gcap == 0) { LS("[hda] FAIL mmio reads dead\r\n"); return false; }
+
+        MlLinkUp();
+        if (!ResetLink()) { LS("[hda] FAIL no codec after link reset\r\n"); return false; }
+
+        g_gcap = HDAudio::Read16(HDA_GCAP);
+        int num_oss = (g_gcap >> 12) & 0xF, num_iss = (g_gcap >> 8) & 0xF;
+        if (num_oss == 0) { LS("[hda] FAIL no output streams\r\n"); return false; }
+        HDAudio::stream_base = 0x80 + num_iss * 0x20;
+
+        if (!HDAudio::InitCorbRirb()) { LS("[hda] FAIL corb/rirb\r\n"); return false; }
+
+        // scan every codec on the link and prefer one with an analog function
+        // group over hdmi. (satoru)
+        uint16_t sm = HDAudio::Read16(HDA_STATESTS) & 0x7FFF;
+        int nco = 0;
+        for (int cad = 0; cad < 15 && nco < HDA_MAX_CODECS && !g_dead; cad++) {
+            if (!(sm & (1 << cad))) continue;
+            HdaCodec& ci = g_ci[nco];
+            Scan(cad, ci, true);
+            HDAudio::codec_vendors[nco] = ci.vendor;
+            nco++;
+        }
+        HDAudio::codec_count = nco;
+        if (nco == 0 || g_dead) { LS("[hda] FAIL no codec answered\r\n"); return false; }
+
+        bool digital = false;
+        for (int i = 0; i < nco && g_chosen < 0; i++)
+            if (g_ci[i].afg >= 0 && g_ci[i].n_dac_a > 0 && g_ci[i].n_pin_a > 0) g_chosen = i;
+        if (g_chosen < 0) {
+            for (int i = 0; i < nco && g_chosen < 0; i++)
+                if (g_ci[i].afg >= 0 && g_ci[i].n_dac_d > 0 && g_ci[i].n_pin_d > 0) { g_chosen = i; digital = true; }
+        }
+        if (g_chosen < 0) { LS("[hda] FAIL no codec has a usable output function\r\n"); return false; }
+        HdaCodec ci = g_ci[g_chosen];
+        LS("[hda] chosen codec cad="); LD(ci.cad); LS(digital ? " (digital/hdmi fallback)" : " (analog)"); LS("\r\n");
+
+        // rescan quietly to restore the widget table of the chosen codec, then
+        // program the paths. (satoru)
+        Scan(ci.cad, ci, false);
+        HDAudio::codec_addr = ci.cad;
+        if (!BuildPaths(ci, digital, true)) { LS("[hda] FAIL no output pin reaches a dac\r\n"); return false; }
+        HDAudio::output_nid = g_dacs[0];
+        HDAudio::pin_nid = g_paths[0].pin;
+        if (ci.vendor == 0x10EC0287) {
+            Alc287Hp(ci.cad);
+            if (ci.subsys == 0x17AA3906) {
+                LS("[hda] NOTE: ALC287 subsys 17aa3906 - the internal speakers are driven by an external I2C smart amp (Awinic); "
+                   "no HDA verb can enable it, so only the headphone jack is expected to sound. speaker pins are still driven in case the amp is enabled.\r\n");
+            }
+        }
+        if (g_timeouts) { LS("[hda] verb timeouts during bring-up: "); LD(g_timeouts); LS("\r\n"); }
+
+        // dma structures (allocated once; restart reuses them) and the 64-bit
+        // check: without 64ok the controller cannot reach heap above 4 GB. (satoru)
+        if (!HDAudio::bdl_raw) {
+            HDAudio::bdl_raw = KernelHeap::Alloc(4096 + 128);
+            if (!HDAudio::bdl_raw) return false;
+            HDAudio::bdl = (HDA_BDL_Entry*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)HDAudio::bdl_raw, 128);
+        }
+        if (!HDAudio::dma_buffer) {
+            int pages_needed = (HDA_BUFFER_SIZE + 4095) / 4096;
+            void* dma_raw = (void*)KernelHeap::Alloc(pages_needed * 4096 + 128);
+            if (!dma_raw) return false;
+            HDAudio::dma_buffer = (void*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)dma_raw, 128);
+        }
+        uint64_t top = (uint64_t)(uintptr_t)HDAudio::dma_buffer + HDA_BUFFER_SIZE;
+        LS("[hda] dma buf="); SerialLogger::LogHex64((uint64_t)(uintptr_t)HDAudio::dma_buffer);
+        LS(" bdl="); SerialLogger::LogHex64((uint64_t)(uintptr_t)HDAudio::bdl);
+        LS(" corb="); SerialLogger::LogHex64((uint64_t)(uintptr_t)HDAudio::corb);
+        LS(" rirb="); SerialLogger::LogHex64((uint64_t)(uintptr_t)HDAudio::rirb); LS("\r\n");
+        if (!(g_gcap & 1) && (top >> 32)) {
+            LS("[hda] FAIL controller lacks 64-bit dma but buffers sit above 4 GB\r\n");
+            return false;
+        }
+        uint8_t* buf_ptr = (uint8_t*)HDAudio::dma_buffer;
+        for (int i = 0; i < HDA_BDL_ENTRIES; i++) {
+            HDAudio::bdl[i].address = (uint64_t)(uintptr_t)(buf_ptr + i * 4096);
+            HDAudio::bdl[i].length = 4096;
+            HDAudio::bdl[i].ioc = (i == HDA_BDL_ENTRIES - 1) ? 1 : 0;
+        }
+        HDAudio::SetupOutputStream();
+        HDAudio::detected = true;
+        return true;
+    }
+};
 
 bool HDAudio::Init() {
     detected = false;
@@ -111,194 +722,68 @@ bool HDAudio::Init() {
     output_nid = -1;
     pin_nid = -1;
 
-    // scan pci for intel hda controller (class 04:03:xx)
-    uint64_t found_bar0 = 0;
-    uint8_t found_bus = 0, found_dev = 0, found_func = 0;
-    bool found = false;
-
-    for (int bus = 0; bus < 256 && !found; bus++) {
-        for (int dev = 0; dev < 32 && !found; dev++) {
-            for (int func = 0; func < 8 && !found; func++) {
-                uint32_t addr = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8);
-
-                outl(0xCF8, addr | 0x00);
-                uint32_t vendor_device = inl(0xCFC);
-                if ((vendor_device & 0xFFFF) == 0xFFFF) continue;
-
-                outl(0xCF8, addr | 0x08);
-                uint32_t class_reg = inl(0xCFC);
-                uint8_t base_class = (class_reg >> 24) & 0xFF;
-                uint8_t sub_class = (class_reg >> 16) & 0xFF;
-
-                // hda: class=04, subclass=03
-                if (base_class == 0x04 && sub_class == 0x03) {
-                    outl(0xCF8, addr | 0x10);
-                    uint32_t bar_lo = inl(0xCFC);
-                    if (bar_lo & 1) continue; // i/o bar - not mmio, skip (satoru)
-                    found_bar0 = (uint64_t)(bar_lo & ~0xFu);
-                    // 64-bit bar (type bits 10b): high dword lives in bar1.
-                    // truncating to 32 bits would yield a bogus base when qemu
-                    // places it above 4gb. (satoru)
-                    if (((bar_lo >> 1) & 0x3) == 0x2) {
-                        outl(0xCF8, addr | 0x14);
-                        found_bar0 |= ((uint64_t)inl(0xCFC) << 32);
-                    }
-                    found_bus = bus;
-                    found_dev = dev;
-                    found_func = func;
-                    found = true;
-                }
-            }
-        }
+    HdaCand cands[4];
+    int n = HdaImpl::FindControllers(cands, 4);
+    LS("[hda] found "); LD(n); LS(" hd audio controller(s)\r\n");
+    for (int i = 0; i < n; i++) {
+        if (HdaImpl::BringUp(cands[i])) return true;
+        LS("[hda] controller failed, trying next\r\n");
     }
+    return false;
+}
 
-    if (!found) return false;
-
-    // map the bar window as uncached mmio before any register access - a
-    // 64-bit bar can sit above the boot identity map, so Write32/Read32 below
-    // would #pf otherwise. mirrors nvme.cpp / virtio_gpu.cpp; 64kb covers the
-    // controller regs + stream descriptors, idempotent. (satoru)
-    {
-        uint64_t start = found_bar0 & ~0xFFFULL;
-        for (uint64_t p = start; p < start + 0x10000ULL; p += 0x1000ULL) {
-            KernelVMM::MapPage(p, p, PTE_PRESENT | PTE_WRITABLE | PTE_PCD);
-        }
-    }
-
-    bar0 = (volatile uint8_t*)(uintptr_t)found_bar0;
-
-    // enable bus mastering and memory space
-    uint32_t cmd_addr = (1 << 31) | (found_bus << 16) | (found_dev << 11) | (found_func << 8) | 0x04;
-    outl(0xCF8, cmd_addr);
-    uint32_t pci_cmd = inl(0xCFC);
-    pci_cmd |= (1 << 1) | (1 << 2); // memory space + bus master
-    outl(0xCF8, cmd_addr);
-    outl(0xCFC, pci_cmd);
-
-    // reset controller. note: at this point the link clock (and thus the wall
-    // clock) is held in reset, so DelayUs falls back to its volatile spin; once
-    // crst is asserted below the wall clock starts and DelayUs is exact. (satoru)
-    Write32(HDA_GCTL, 0); // de-assert crst
-    for (int i = 0; i < 100000; i++) {
-        if (!(Read32(HDA_GCTL) & HDA_GCTL_CRST)) break;
-        DelayUs(10);
-    }
-
-    // hold reset briefly so the codec link fully quiesces. (satoru)
-    DelayUs(500);
-
-    // assert crst to bring controller out of reset
-    Write32(HDA_GCTL, HDA_GCTL_CRST);
-    for (int i = 0; i < 100000; i++) {
-        if (Read32(HDA_GCTL) & HDA_GCTL_CRST) break;
-        DelayUs(10);
-    }
-
-    // the spec requires >=521us after crst before the codecs are addressable
-    // (the bus needs 25 frames to come up); wait generously so STATESTS is
-    // populated before we probe. (satoru)
-    DelayUs(1000);
-
-    // read capabilities
-    uint16_t gcap = Read16(HDA_GCAP);
-    int num_oss = (gcap >> 12) & 0xF;  // number of output streams
-    int num_iss = (gcap >> 8) & 0xF;   // number of input streams
-    (void)num_iss;
-
-    if (num_oss == 0) return false;
-
-    // calculate first output stream descriptor base
-    // input streams come first, then output streams
-    // each stream descriptor is 0x20 bytes, starting at offset 0x80
-    stream_base = 0x80 + num_iss * 0x20;
-
-    // init corb/rirb
-    if (!InitCorbRirb()) return false;
-
-    // probe codecs
-    if (!ProbeCodecs()) return false;
-
-    // find output path in first codec
-    for (int c = 0; c < codec_count; c++) {
-        if (FindOutputPath(c)) {
-            codec_addr = c;
-            break;
-        }
-    }
-
-    // allocate bdl with 128-byte alignment (hda spec requirement for the buffer
-    // descriptor list; KernelHeap only guarantees 16-byte so over-allocate and
-    // align up). real controllers fault or mis-dma an unaligned bdl. (satoru)
-    bdl_raw = KernelHeap::Alloc(4096 + 128);
-    if (!bdl_raw) return false;
-    bdl = (HDA_BDL_Entry*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)bdl_raw, 128);
-
-    // allocate dma buffer (multiple pages). align the base to 128 bytes so every
-    // bdl entry's sample-buffer address is 128-byte aligned as the spec requires
-    // (entries sit at 4096-byte offsets, so a 128-aligned base keeps them all
-    // aligned). over-allocate by 128 for the alignment slack. (satoru)
-    int pages_needed = (HDA_BUFFER_SIZE + 4095) / 4096;
-    void* dma_raw = (void*)KernelHeap::Alloc(pages_needed * 4096 + 128);
-    if (!dma_raw) return false;
-    dma_buffer = (void*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)dma_raw, 128);
-
-    // set up bdl entries
-    uint8_t* buf_ptr = (uint8_t*)dma_buffer;
-    for (int i = 0; i < HDA_BDL_ENTRIES; i++) {
-        bdl[i].address = (uint64_t)(uintptr_t)(buf_ptr + i * 4096);
-        bdl[i].length = 4096;
-        bdl[i].ioc = (i == HDA_BDL_ENTRIES - 1) ? 1 : 0;
-    }
-
-    // set up output stream
-    SetupOutputStream();
-
-    detected = true;
+// re-initialise the controller and codecs without a reboot ("audio restart"). the
+// backend object stays registered; stream_live is dropped first so the mixer's
+// WriteRing calls return 0 while the link is down. (satoru)
+bool HDAudio::Restart() {
+    if (!g_have_cand) return false;
+    LS("[hda] restart requested\r\n");
+    if (detected) Stop();
+    detected = false;
+    if (!HdaImpl::BringUp(g_cand)) { LS("[hda] restart FAILED\r\n"); return false; }
+    if (!SetFormat(current_format.sample_rate, current_format.bits, current_format.channels)) return false;
+    if (!StartStream()) { LS("[hda] restart FAILED (stream)\r\n"); return false; }
+    SetVolume(volume);
+    LS("[hda] restart ok\r\n");
     return true;
 }
 
 bool HDAudio::InitCorbRirb() {
-    // determine corb size
+    // sizes: pick the largest supported ring (spec sizecap bits 6/5/4) (satoru)
     uint8_t corbsz = Read8(HDA_CORBSIZE);
     if (corbsz & 0x40) { corb_size = 256; Write8(HDA_CORBSIZE, 0x02); }
     else if (corbsz & 0x20) { corb_size = 16; Write8(HDA_CORBSIZE, 0x01); }
     else { corb_size = 2; Write8(HDA_CORBSIZE, 0x00); }
 
-    // determine rirb size
     uint8_t rirbsz = Read8(HDA_RIRBSIZE);
     if (rirbsz & 0x40) { rirb_size = 256; Write8(HDA_RIRBSIZE, 0x02); }
     else if (rirbsz & 0x20) { rirb_size = 16; Write8(HDA_RIRBSIZE, 0x01); }
     else { rirb_size = 2; Write8(HDA_RIRBSIZE, 0x00); }
 
-    // allocate corb (array of uint32_t verbs), 128-byte aligned per spec.
-    // KernelHeap only guarantees 16-byte alignment so over-allocate and align
-    // the usable pointer up; keep corb_raw for completeness. real controllers
-    // require 128-byte alignment for the corb/rirb dma rings. (satoru)
-    corb_raw = KernelHeap::Alloc(4096 + 128);
-    if (!corb_raw) return false;
-    corb = (uint32_t*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)corb_raw, 128);
-    for (int i = 0; i < corb_size; i++) corb[i] = 0;
+    // 128-byte aligned rings; allocated once, reused on restart. (satoru)
+    if (!corb_raw) {
+        corb_raw = KernelHeap::Alloc(4096 + 128);
+        if (!corb_raw) return false;
+        corb = (uint32_t*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)corb_raw, 128);
+    }
+    if (!rirb_raw) {
+        rirb_raw = KernelHeap::Alloc(4096 + 128);
+        if (!rirb_raw) return false;
+        rirb = (uint64_t*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)rirb_raw, 128);
+    }
+    for (int i = 0; i < corb_size; i++) ((volatile uint32_t*)corb)[i] = 0;
+    for (int i = 0; i < rirb_size; i++) ((volatile uint64_t*)rirb)[i] = 0;
 
-    // allocate rirb (array of {uint32_t response, uint32_t response_ex}), also
-    // 128-byte aligned. (satoru)
-    rirb_raw = KernelHeap::Alloc(4096 + 128);
-    if (!rirb_raw) return false;
-    rirb = (uint64_t*)(uintptr_t)hda_align_up((uint64_t)(uintptr_t)rirb_raw, 128);
-    for (int i = 0; i < rirb_size; i++) rirb[i] = 0;
-
-    // stop corb/rirb
     Write8(HDA_CORBCTL, 0);
     Write8(HDA_RIRBCTL, 0);
     DelayUs(100);
 
-    // set corb base address - full 64-bit phys (identity-mapped: phys==virt),
-    // upper half must not be hardcoded to 0 or a heap address >4 gb would be
-    // truncated and the controller would dma the wrong page. (satoru)
+    // full 64-bit bases (heap can sit above 4 GB) (satoru)
     uint64_t corb_phys = (uint64_t)(uintptr_t)corb;
     Write32(HDA_CORBLBASE, (uint32_t)(corb_phys & 0xFFFFFFFFu));
     Write32(HDA_CORBUBASE, (uint32_t)(corb_phys >> 32));
 
-    // reset corb read pointer
+    // corb read pointer reset: set bit 15, wait for it to read 1, clear, wait for 0
     Write16(HDA_CORBRP, (1 << 15));
     for (int i = 0; i < 1000; i++) {
         if (Read16(HDA_CORBRP) & (1 << 15)) break;
@@ -309,107 +794,70 @@ bool HDAudio::InitCorbRirb() {
         if (!(Read16(HDA_CORBRP) & (1 << 15))) break;
         DelayUs(10);
     }
-
-    // reset corb write pointer
     Write16(HDA_CORBWP, 0);
 
-    // set rirb base address - full 64-bit phys, same upper-half fix as corb
-    // above so a >4 gb heap allocation is addressed correctly. (satoru)
     uint64_t rirb_phys = (uint64_t)(uintptr_t)rirb;
     Write32(HDA_RIRBLBASE, (uint32_t)(rirb_phys & 0xFFFFFFFFu));
     Write32(HDA_RIRBUBASE, (uint32_t)(rirb_phys >> 32));
 
-    // reset rirb write pointer, then sync our software read pointer to whatever
-    // the hardware write pointer reads back so the two start equal. otherwise a
-    // stale hardware RIRBWP (it does not necessarily clear to 0 on the wp-reset
-    // strobe) would make WaitRIRB think a response is already pending and read a
-    // garbage slot for the very first verb. (satoru)
     Write16(HDA_RIRBWP, (1 << 15));
     DelayUs(10);
     rirb_rp = Read16(HDA_RIRBWP) & 0xFF;
 
-    // clear any latched rirb status (response-int bit0, overrun bit2) so the
-    // status register doesn't start out wedged. (satoru)
     Write8(HDA_RIRBSTS, (1 << 0) | (1 << 2));
-
-    // set rintcnt - one response per interrupt. (satoru)
+    Write8(HDA_CORBSTS, 0x01);
     Write16(HDA_RINTCNT, 1);
 
-    // start corb and rirb
     Write8(HDA_CORBCTL, HDA_CORBCTL_RUN);
     Write8(HDA_RIRBCTL, HDA_RIRBCTL_RUN | HDA_RIRBCTL_INT);
     DelayUs(50);
-
     return true;
 }
 
 bool HDAudio::SendVerb(uint32_t verb, uint32_t* response) {
-    // drop any stale responses by resyncing our software read pointer to the
-    // current hardware write pointer before issuing. this guarantees WaitRIRB
-    // only returns the response to *this* verb, not a leftover from a previous
-    // command whose response we never consumed. (satoru)
+    if (g_dead || !bar0 || !corb || !rirb) return false;
+    // resync our read pointer so only this verb's response is returned (satoru)
     rirb_rp = Read16(HDA_RIRBWP) & 0xFF;
 
-    // advance corb write pointer from the hardware value (+1) and post the verb
-    // into that slot, then publish the new write pointer. (satoru)
     uint16_t wp = Read16(HDA_CORBWP) & 0xFF;
     wp = (wp + 1) % corb_size;
-    corb[wp] = verb;
+    ((volatile uint32_t*)corb)[wp] = verb;
+    __asm__ __volatile__("mfence" ::: "memory");
     Write16(HDA_CORBWP, wp);
 
-    return WaitRIRB(response, 5000);
-}
-
-bool HDAudio::WaitRIRB(uint32_t* response, int timeout) {
-    for (int i = 0; i < timeout * 100; i++) {
-        uint16_t wp = Read16(HDA_RIRBWP) & 0xFF;
-
-        // the controller writes a response THEN bumps RIRBWP to point AT the
-        // slot it just filled. so when our read pointer differs from the
-        // hardware write pointer, the next unread entry is at (rirb_rp+1):
-        // advance first, then read that slot. (the old code read rirb[rirb_rp]
-        // after advancing too, but never resynced on send and never cleared
-        // status, so it drifted and wedged.) (satoru)
-        if (rirb_rp != wp) {
-            int next = (rirb_rp + 1) % rirb_size;
-            rirb_rp = next;
-            uint64_t entry = rirb[next];
-            // low 32 bits = response, high 32 = response_ex (codec addr etc.).
-            if (response) *response = (uint32_t)(entry & 0xFFFFFFFFu);
-
-            // clear the rirb status (response-int bit0 + overrun bit2) so the
-            // status register never stays latched and wedges later reads. (satoru)
-            Write8(HDA_RIRBSTS, (1 << 0) | (1 << 2));
-            return true;
-        }
-        DelayUs(1);
+    if (WaitRIRB(response, 0)) { g_fail = 0; return true; }
+    g_timeouts++;
+    g_fail++;
+    if (g_timeouts <= 6) { LS("[hda] verb timeout "); LX(verb); LS("\r\n"); }
+    if (g_fail >= 6) {
+        g_dead = true;
+        LS("[hda] codec link not responding - giving up on verbs\r\n");
     }
     return false;
 }
 
-bool HDAudio::ProbeCodecs() {
-    codec_count = 0;
-    uint16_t statests = Read16(HDA_STATESTS);
-
-    for (int cad = 0; cad < HDA_MAX_CODECS && codec_count < HDA_MAX_CODECS; cad++) {
-        if (!(statests & (1 << cad))) continue;
-
-        // get vendor/device id
-        uint32_t verb = HDA_VERB(cad, 0, HDA_VERB_GET_PARAM, HDA_PARAM_VENDOR_ID);
-        uint32_t resp = 0;
-        if (SendVerb(verb, &resp)) {
-            codec_vendors[codec_count] = resp;
-            codec_count++;
+bool HDAudio::WaitRIRB(uint32_t* response, int timeout) {
+    (void)timeout;
+    // bounded by iteration count (3000 x ~3us ~= 9 ms) so a dead link can never
+    // hang the caller, whether or not any clock is ticking. (satoru)
+    for (int i = 0; i < 3000; i++) {
+        uint16_t wp = Read16(HDA_RIRBWP) & 0xFF;
+        while (rirb_rp != wp) {
+            int next = (rirb_rp + 1) % rirb_size;
+            rirb_rp = next;
+            __asm__ __volatile__("" ::: "memory");
+            uint64_t entry = ((volatile uint64_t*)rirb)[next];
+            Write8(HDA_RIRBSTS, (1 << 0) | (1 << 2));
+            if ((entry >> 32) & 0x10) continue;          // unsolicited, not ours
+            if (response) *response = (uint32_t)(entry & 0xFFFFFFFFu);
+            return true;
         }
+        DelayUs(3);
     }
-
-    return codec_count > 0;
+    return false;
 }
 
-// locate the audio function group node on codec `cad`. don't assume it's node
-// 1: read the root node (0) node-count param to get the function-group range,
-// then query each group's function-group-type and return the one whose type is
-// 0x01 (audio fg). returns -1 if none. (satoru)
+// locate the audio function group node on codec `cad`. (satoru)
 int HDAudio::FindAFG(int cad) {
     uint32_t resp = 0;
     SendVerb(HDA_VERB(cad, 0, HDA_VERB_GET_PARAM, HDA_PARAM_NODE_COUNT), &resp);
@@ -424,144 +872,6 @@ int HDAudio::FindAFG(int cad) {
     return -1;
 }
 
-bool HDAudio::FindOutputPath(int cad) {
-    uint32_t resp = 0;
-
-    // discover the audio function group rather than hardcoding nid 1. (satoru)
-    int afg = FindAFG(cad);
-    if (afg < 0) return false;
-
-    // (a) power the afg to D0 and let it settle before touching widgets. (satoru)
-    SendVerb(HDA_VERB(cad, afg, HDA_VERB_SET_POWER, 0x00), &resp);
-    DelayUs(150);
-
-    // enumerate the widgets under the afg.
-    SendVerb(HDA_VERB(cad, afg, HDA_VERB_GET_PARAM, HDA_PARAM_NODE_COUNT), &resp);
-    int start_nid = (resp >> 16) & 0xFF;
-    int num_nodes = resp & 0xFF;
-
-    // (b) pick the best output pin and the dac it routes to. score pins by their
-    // configuration default so a connected line-out/speaker/headphone wins over
-    // an unconnected internal pin. record the dac's CONNECTION INDEX on the pin
-    // (SET_CONNSEL takes the list index, not the node id). (satoru)
-    int best_pin = -1, best_dac = -1, best_index = 0;
-    int best_score = -1;
-    uint32_t best_pincap = 0;
-
-    for (int n = 0; n < num_nodes && n < HDA_MAX_NODES; n++) {
-        int nid = start_nid + n;
-
-        uint32_t wcap = 0;
-        SendVerb(HDA_VERB(cad, nid, HDA_VERB_GET_PARAM, HDA_PARAM_AUDIO_WIDGET), &wcap);
-        uint8_t wtype = (wcap >> 20) & 0xF;     // widget type [23:20]
-        if (wtype != HDA_WIDGET_PIN) continue;
-
-        // output-capable pin? (pin caps bit 4) (satoru)
-        uint32_t pincap = 0;
-        SendVerb(HDA_VERB(cad, nid, HDA_VERB_GET_PARAM, HDA_PARAM_PIN_CAP), &pincap);
-        if (!(pincap & (1 << 4))) continue;
-
-        // resolve a dac via this pin's connection list. read the list length,
-        // then walk the entries (short form: 4 nids per response) and find an
-        // entry whose widget type is AUDIO_OUTPUT. (satoru)
-        uint32_t connlen_param = 0;
-        SendVerb(HDA_VERB(cad, nid, HDA_VERB_GET_PARAM, HDA_PARAM_CONN_LEN), &connlen_param);
-        int list_len = connlen_param & 0x7F;        // long-form bit is [7]; assume short. (satoru)
-        if (list_len <= 0) continue;
-        if (list_len > 16) list_len = 16;
-
-        int dac_nid = -1, dac_index = -1;
-        for (int ci = 0; ci < list_len; ci++) {
-            uint32_t cl = 0;
-            // each GET_CONNECTION_LIST response holds 4 short-form entries; the
-            // payload is the starting index (rounded to the group of 4). (satoru)
-            SendVerb(HDA_VERB(cad, nid, HDA_VERB_GET_CONNLIST, ci & ~0x3), &cl);
-            int entry = (cl >> ((ci & 0x3) * 8)) & 0xFF;
-            if (entry == 0) continue;
-            uint32_t ewcap = 0;
-            SendVerb(HDA_VERB(cad, entry, HDA_VERB_GET_PARAM, HDA_PARAM_AUDIO_WIDGET), &ewcap);
-            if (((ewcap >> 20) & 0xF) == HDA_WIDGET_AUDIO_OUT) {
-                dac_nid = entry;
-                dac_index = ci;
-                break;
-            }
-        }
-        if (dac_nid < 0) continue;
-
-        // score by configuration default (verb 0xF1C): port-connectivity [31:30]
-        // (2 == "no physical connection" => worst) and default-device [23:20]
-        // (line-out / speaker / headphone are preferred outputs). (satoru)
-        uint32_t cfg = 0;
-        SendVerb(HDA_VERB(cad, nid, HDA_VERB_GET_CONFIG_DEF, 0), &cfg);
-        int port_conn = (cfg >> 30) & 0x3;
-        int def_dev   = (cfg >> 20) & 0xF;
-
-        int score = 0;
-        if (port_conn != 0x1) score += 4;       // 0x1 = no connection (jack absent) (satoru)
-        // default-device: 0=line-out, 1=speaker, 2=hp-out are the real outputs.
-        if (def_dev == 0x0 || def_dev == 0x1 || def_dev == 0x2) score += 8;
-
-        if (score > best_score) {
-            best_score   = score;
-            best_pin     = nid;
-            best_dac     = dac_nid;
-            best_index   = dac_index;
-            best_pincap  = pincap;
-        }
-    }
-
-    if (best_pin < 0 || best_dac < 0) return false;
-
-    output_nid = best_dac;
-    pin_nid    = best_pin;
-
-    // (c) power the dac and the pin to D0, each followed by a settle. (satoru)
-    SendVerb(HDA_VERB(cad, best_dac, HDA_VERB_SET_POWER, 0x00), &resp);
-    DelayUs(150);
-    SendVerb(HDA_VERB(cad, best_pin, HDA_VERB_SET_POWER, 0x00), &resp);
-    DelayUs(150);
-
-    // (d) route the pin to the dac via the connection INDEX (not the node id).
-    // without this SET_CONNSEL the codec graph has no path from converter to
-    // jack and silently drops every sample. (satoru)
-    SendVerb(HDA_VERB(cad, best_pin, HDA_VERB_SET_CONNSEL, best_index & 0xFF), &resp);
-
-    // (e) read the dac's output-amp capabilities to size the gain. num steps is
-    // bits [14:8] of the amp-out-cap param; full-scale gain == numSteps. (satoru)
-    uint32_t ampcap = 0;
-    SendVerb(HDA_VERB(cad, best_dac, HDA_VERB_GET_PARAM, HDA_PARAM_AMP_OUT_CAP), &ampcap);
-    uint32_t num_steps = (ampcap >> 8) & 0x7F;
-    uint32_t gain = num_steps ? num_steps : 0x7F;   // fall back to max if unreported (satoru)
-    if (gain > 0x7F) gain = 0x7F;
-
-    // (f) unmute + set gain. the amp payload is a 16-bit field; build the full
-    // dword as a 4-bit verb (0x3): (cad<<28)|(nid<<20)|(0x3<<16)|payload. this
-    // is bit-identical to HDA_VERB(cad,nid,0x300,payload), so either spelling
-    // works; HDA_VERB4 keeps the spec verb id explicit. (satoru)
-    //   dac output amp:  set-output(15) | left(13) | right(12) | unmute(¬11) | gain
-    uint32_t dac_amp = (1u << 15) | (1u << 13) | (1u << 12) | (gain & 0x7F);
-    SendVerb(HDA_VERB4(cad, best_dac, HDA_VERB_SET_AMP_GAIN4, dac_amp), &resp);
-    //   pin input amp:   set-input(14) | left(13) | right(12) | unmute | max gain
-    uint32_t pin_amp = (1u << 14) | (1u << 13) | (1u << 12) | 0x7F;
-    SendVerb(HDA_VERB4(cad, best_pin, HDA_VERB_SET_AMP_GAIN4, pin_amp), &resp);
-
-    // (g) enable pin output; also drive the headphone amp if the pin advertises
-    // headphone-drive capability (pin caps bit 3). (satoru)
-    uint32_t pinctl = (1u << 6);                 // OUT_EN
-    if (best_pincap & (1 << 3)) pinctl |= (1u << 7);  // HP_EN
-    SendVerb(HDA_VERB(cad, best_pin, HDA_VERB_SET_PINCTL, pinctl), &resp);
-
-    // (h) if the pin supports EAPD (pin caps bit 16), enable it (bit1) - many
-    // consumer codecs keep the external amp / charge pump powered down until
-    // EAPD is asserted. then wait for the analog stage to settle. (satoru)
-    if (best_pincap & (1 << 16)) {
-        SendVerb(HDA_VERB(cad, best_pin, HDA_VERB_SET_EAPDBTL, 0x02), &resp);
-    }
-    DelayMs(10);
-
-    return true;
-}
-
 uint16_t HDAudio::EncodeFormat(uint32_t sample_rate, uint8_t bits, uint8_t channels) {
     uint16_t fmt = 0;
 
@@ -571,7 +881,7 @@ uint16_t HDAudio::EncodeFormat(uint32_t sample_rate, uint8_t bits, uint8_t chann
         case 11025: fmt |= (0x03 << 8) | (1 << 14); break; // 44100 / 4
         case 16000: fmt |= (0x02 << 8); break; // 48000 / 3
         case 22050: fmt |= (0x01 << 8) | (1 << 14); break; // 44100 / 2
-        case 32000: fmt |= (0x03 << 11) | (0x02 << 8); break; // 48000 * 2/3
+        case 32000: fmt |= (0x01 << 11) | (0x02 << 8); break; // 48000 * 2/3: mult field 1 (x2), div field 2 (/3) (satoru)
         case 44100: fmt |= (1 << 14); break; // 44100 base
         case 48000: fmt |= 0; break; // 48000 base
         case 88200: fmt |= (1 << 14) | (1 << 11); break; // 44100 * 2
@@ -600,56 +910,48 @@ uint16_t HDAudio::EncodeFormat(uint32_t sample_rate, uint8_t bits, uint8_t chann
 bool HDAudio::SetupOutputStream() {
     if (!bdl || !dma_buffer) return false;
 
-    // reset stream - assert SRST and wait for the controller to acknowledge by
-    // reading the bit back as 1 (calibrated waits so the settle survives -O2). (satoru)
+    // stream reset: assert SRST, wait for it to read back 1, clear, wait for 0
     Write8(stream_base + HDA_SD_CTL, HDA_SD_CTL_SRST);
     for (int i = 0; i < 1000; i++) {
         if (Read8(stream_base + HDA_SD_CTL) & HDA_SD_CTL_SRST) break;
         DelayUs(10);
     }
-
-    // clear reset and wait for the bit to read back as 0 before reprogramming. (satoru)
     Write8(stream_base + HDA_SD_CTL, 0);
     for (int i = 0; i < 1000; i++) {
         if (!(Read8(stream_base + HDA_SD_CTL) & HDA_SD_CTL_SRST)) break;
         DelayUs(10);
     }
 
-    // set stream format
     uint16_t fmt = EncodeFormat(current_format.sample_rate, current_format.bits, current_format.channels);
     Write16(stream_base + HDA_SD_FMT, fmt);
 
-    // set bdl address - program the full 64-bit physical base, low half in
-    // sdbdpl and high half in sdbdpu.  the kernel is identity-mapped (phys ==
-    // virt, see vmm.cpp) so the bdl's physical address is just its pointer.
-    // we cannot borrow audiodma::acquire here: those four low-memory regions
-    // are statically owned by sb16/ac97 and are far too small for hda's 128 kb
-    // cyclic buffer + bdl.  hardcoding sdbdpu = 0 (the old code) truncated any
-    // heap address >4 gb and would corrupt dma on real 64-bit machines; the
-    // bdl entry addresses themselves are already full 64-bit. (satoru)
     uint64_t bdl_phys = (uint64_t)(uintptr_t)bdl;
     Write32(stream_base + HDA_SD_BDPL, (uint32_t)(bdl_phys & 0xFFFFFFFFu));
     Write32(stream_base + HDA_SD_BDPU, (uint32_t)(bdl_phys >> 32));
-
-    // set cyclic buffer length
     Write32(stream_base + HDA_SD_CBL, HDA_BUFFER_SIZE);
-
-    // set last valid index
     Write16(stream_base + HDA_SD_LVI, HDA_BDL_ENTRIES - 1);
 
-    // set stream number (use stream 1) in ctl bits [23:20]
-    uint32_t ctl = Read32(stream_base + HDA_SD_CTL);
-    ctl &= ~(0xF << 20);
-    ctl |= (1 << 20); // stream number 1
-    Write32(stream_base + HDA_SD_CTL, ctl);
+    // stream tag 1 in ctl bits [23:20]; write only the upper control byte so the
+    // sts byte (write-1-to-clear) is untouched. (satoru)
+    Write8(stream_base + HDA_SD_CTL + 2, (uint8_t)(1 << 4));
+    Write8(stream_base + HDA_SD_STS, 0x1C);           // clear stale fifoe/dese/bcis
 
-    // configure dac to use stream 1, channel 0
-    if (output_nid >= 0) {
+    // every dac that a path uses listens to stream 1 channel 0 with this format,
+    // so all output pins (hp, speaker, line) play the same signal. (satoru)
+    for (int i = 0; i < g_ndacs; i++) {
         uint32_t resp;
-        SendVerb(HDA_VERB(codec_addr, output_nid, HDA_VERB_SET_CONVCTRL, (1 << 4) | 0), &resp);
-        SendVerb(HDA_VERB(codec_addr, output_nid, HDA_VERB_SET_FORMAT, fmt), &resp);
+        SendVerb(HDA_VERB(codec_addr, g_dacs[i], HDA_VERB_SET_CONVCTRL, (1 << 4) | 0), &resp);
+        SendVerb(HDA_VERB(codec_addr, g_dacs[i], HDA_VERB_SET_FORMAT, fmt), &resp);
+        if (g_digital) SendVerb(HDA_VERB(codec_addr, g_dacs[i], 0x70D, 0x01), &resp);   // digital converter enable
     }
-
+    LS("[hda] stream fmt="); LX(fmt); LS(" sd_base="); LX(stream_base);
+    for (int i = 0; i < g_ndacs && i < 4; i++) {
+        uint32_t f = 0, s = 0;
+        SendVerb(HDA_VERB4(codec_addr, g_dacs[i], 0xA, 0), &f);
+        SendVerb(HDA_VERB(codec_addr, g_dacs[i], 0xF06, 0), &s);
+        LS(" dac"); LX(g_dacs[i]); LS(" fmt="); LX(f); LS(" strm="); LX(s);
+    }
+    LS("\r\n");
     return true;
 }
 
@@ -726,9 +1028,28 @@ bool HDAudio::StartStream() {
     // wraparound notification.
     for (int i = 0; i < HDA_BDL_ENTRIES; i++) bdl[i].ioc = 1;
 
-    uint32_t ctl = Read32(stream_base + HDA_SD_CTL);
-    ctl |= HDA_SD_CTL_RUN | HDA_SD_CTL_IOCE;
-    Write32(stream_base + HDA_SD_CTL, ctl);
+    // set RUN via the low control byte only (the sts byte is write-1-to-clear)
+    Write8(stream_base + HDA_SD_CTL, (uint8_t)(HDA_SD_CTL_RUN | HDA_SD_CTL_IOCE));
+
+    // prove the dma engine is really consuming the buffer: sample the link
+    // position over ~24 ms (bounded, wall-clock based). if it never moves the
+    // stream is dead - stop it and fail so the audio server falls back. (satoru)
+    uint32_t l0 = Read32(stream_base + HDA_SD_LPIB);
+    uint32_t lmax = l0;
+    bool moved = false;
+    LS("[hda] stream start lpib0="); LX(l0);
+    for (int i = 1; i <= 24; i++) {
+        DelayUs(1000);
+        uint32_t l = Read32(stream_base + HDA_SD_LPIB);
+        if (l != l0) { moved = true; if (l > lmax) lmax = l; }
+        if (i == 1 || i == 5 || i == 12 || i == 24) { LS(" +"); LD(i); LS("ms="); LX(l); }
+    }
+    LS(" sts="); LX(Read8(stream_base + HDA_SD_STS)); LS(" wall="); LX(Read32(HDA_WALCLK)); LS("\r\n");
+    if (!moved) {
+        Write8(stream_base + HDA_SD_CTL, 0);
+        LS("[hda] FAIL stream position did not advance - falling back\r\n");
+        return false;
+    }
 
     playing = true;
     g_hda_stream_live = true;
@@ -815,22 +1136,53 @@ uint32_t HDAudio::RingQueuedBytes() {
 
 uint32_t HDAudio::RingChunkBytes() { return 4096; }
 
+// blank the ring once the mixer stops feeding it. the controller loops the cyclic
+// buffer forever, so without this the last ~0.7 s of audio repeats until the next
+// sound (measured in the qemu wav capture). first call: zero the free region
+// [write_ptr, lpib). later calls: zero whatever the engine has passed since the
+// last call. stops after one full lap of link position, at which point the whole
+// ring is silent and the server quits touching the hardware. (satoru)
+static uint32_t g_scrub_pos  = 0;
+static uint32_t g_scrub_left = 0;
+
+bool HDAudio::ScrubIdle(bool first) {
+    if (!g_hda_stream_live || !dma_buffer) return false;
+    uint8_t* b = (uint8_t*)dma_buffer;
+    uint32_t lpib = Read32(stream_base + HDA_SD_LPIB) % HDA_BUFFER_SIZE;
+    if (first) {
+        uint32_t n = (lpib + HDA_BUFFER_SIZE - g_hda_write_ptr) % HDA_BUFFER_SIZE;
+        if (n == 0) n = HDA_BUFFER_SIZE;            // caught up: nothing queued
+        uint32_t p = g_hda_write_ptr;
+        for (uint32_t i = 0; i < n; i++) { b[p] = 0; if (++p == HDA_BUFFER_SIZE) p = 0; }
+        g_scrub_pos = lpib;
+        g_scrub_left = HDA_BUFFER_SIZE;
+        return true;
+    }
+    uint32_t adv = (lpib + HDA_BUFFER_SIZE - g_scrub_pos) % HDA_BUFFER_SIZE;
+    uint32_t p = g_scrub_pos;
+    for (uint32_t i = 0; i < adv; i++) { b[p] = 0; if (++p == HDA_BUFFER_SIZE) p = 0; }
+    g_scrub_pos = lpib;
+    g_scrub_left = (adv >= g_scrub_left) ? 0 : (g_scrub_left - adv);
+    return g_scrub_left != 0;
+}
+
 bool HDAudio::IsPlaying() { return playing; }
 
 void HDAudio::SetVolume(uint8_t vol) {
     volume = vol;
-    if (detected && output_nid >= 0) {
-        // update amplifier gain
-        uint32_t resp;
-        // output amp, left+right, gain = vol/4 (max 63 steps typically)
-        uint32_t gain = vol >> 2;
-        if (gain > 63) gain = 63;
-        uint32_t amp_val = (1u << 15) | (1u << 13) | (1u << 12) | gain; // output, L+R, unmute
-        // proper SET_AMP_GAIN (4-bit verb 0x3 + 16-bit payload) on dac + pin.
-        // the old form masked the payload to 8 bits and corrupted the verb. (satoru)
-        SendVerb(HDA_VERB(codec_addr, output_nid, HDA_VERB_SET_AMP_GAIN, amp_val), &resp);
-        if (pin_nid >= 0)
-            SendVerb(HDA_VERB(codec_addr, pin_nid, HDA_VERB_SET_AMP_GAIN, amp_val), &resp);
+    if (detected && g_ndacs > 0) {
+        // scale across each dac's real step count (read from its amp caps), not
+        // a fixed 63, so the top of the slider is the codec's 0 dB point. the pin
+        // and mixer amps stay at the unmuted 0 dB set during path programming. (satoru)
+        for (int i = 0; i < g_ndacs; i++) {
+            uint32_t steps = (uint32_t)g_dac_steps[i];
+            if (steps == 0) continue;
+            uint32_t gain = ((uint32_t)vol * steps) / 255u;
+            uint32_t amp_val = (1u << 15) | (1u << 13) | (1u << 12) | (gain & 0x7F);
+            if (vol == 0) amp_val |= 0x80;   // mute at zero
+            uint32_t resp;
+            SendVerb(HDA_VERB4(codec_addr, g_dacs[i], HDA_VERB_SET_AMP_GAIN4, amp_val), &resp);
+        }
     }
 }
 
@@ -886,6 +1238,25 @@ void HDAudio::DumpInfo(char* out, int max_len) {
     append("  Volume: "); append_num(volume); append("/255\n");
     append("  Playing: "); append(playing ? "Yes" : "No"); append("\n");
     append("  Buffer: "); append_num(HDA_BUFFER_SIZE); append(" bytes\n");
+
+    // controller location, chosen codec, every driven output path, live position (satoru)
+    append("  Controller: "); append_num(g_cand.bus); append(":"); append_num(g_cand.dev);
+    append("."); append_num(g_cand.fn); append(" ven=0x"); append_hex(g_cand.ven, 4);
+    append(" dev=0x"); append_hex(g_cand.did, 4); append("\n");
+    append("  Codec addr: "); append_num(codec_addr); append("  verb timeouts: "); append_num(g_timeouts);
+    append(g_dead ? "  (link gave up)\n" : "\n");
+    for (int i = 0; i < g_npaths; i++) {
+        append("  Path "); append_num(i); append(": pin 0x"); append_hex(g_paths[i].pin, 2);
+        append(" dev="); append_num(g_paths[i].dev); append(" chain=");
+        for (int k = 0; k < g_paths[i].n; k++) {
+            if (k) append(">");
+            append_hex(g_paths[i].nodes[k], 2);
+        }
+        append("\n");
+    }
+    append("  Stream: "); append(g_hda_stream_live ? "live" : "stopped");
+    append("  LPIB="); append_num(Read32(stream_base + HDA_SD_LPIB));
+    append("  writeptr="); append_num(g_hda_write_ptr); append("\n");
 
     out[pos] = 0;
 }

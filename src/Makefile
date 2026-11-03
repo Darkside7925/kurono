@@ -132,6 +132,59 @@ ifneq ($(wildcard $(FONTS_TAR_BIN)),)
 MEDIA_OBJS   += $(FONTS_TAR_OBJ)
 endif
 
+# ─── NSS runtime libs (embedded via objcopy) ────────────────────────────────
+# firefox's libsoftokn3.so has DT_NEEDED libsqlite3.so.0 which the firefox tar
+# does NOT ship (its libmozsqlite3.so exports nothing), so NSS/PSM init died
+# before opening cert9.db - the "Personal Security Manager" / https blocker.
+# embed a musl-built libsqlite3.so.0, unpacked to /apps/firefox/lib at firefox
+# launch (self-heals persisted installs too). (satoru)
+NSSLIBS_TAR_BIN = $(SRC)/assets_nsslibs.tar
+NSSLIBS_TAR_OBJ = $(BUILD)/kurono_nsslibs.o
+ifneq ($(wildcard $(NSSLIBS_TAR_BIN)),)
+MEDIA_OBJS   += $(NSSLIBS_TAR_OBJ)
+endif
+
+
+# ─── ICU common data (embedded via objcopy) ───────────────────────────────
+# firefox links alpine's system icu, whose libicudata is a stub; without the
+# real icudt78l.dat u_init fails and gecko MOZ_CRASHes with "ICU4CLibrary::
+# Initialize() failed". written to /apps/firefox at firefox launch.
+ICU_DAT_BIN = $(SRC)/assets/icu/icudt78l.dat
+ICU_DAT_OBJ = $(BUILD)/kurono_icudt.o
+ifneq ($(wildcard $(ICU_DAT_BIN)),)
+MEDIA_OBJS  += $(ICU_DAT_OBJ)
+endif
+
+# ─── gdk-pixbuf 2.42 (embedded via objcopy) ───────────────────────────────
+# the firefox package's gdk-pixbuf 2.44 decodes through a stubbed-out glycin,
+# so gtk aborts on its first icon. 2.42 has png/jpeg built in; written over the
+# package copy at firefox launch. see assets/gdk-pixbuf/README.txt.
+PIXBUF_BIN = $(SRC)/assets/gdk-pixbuf/libgdk_pixbuf-2.0.so.0
+PIXBUF_OBJ = $(BUILD)/kurono_pixbuf.o
+ifneq ($(wildcard $(PIXBUF_BIN)),)
+MEDIA_OBJS += $(PIXBUF_OBJ)
+endif
+
+# ─── Inter UI typeface (embedded via objcopy) ─────────────────────────────
+# the modern ui style renders all text with inter regular + semibold through
+# the stb_truetype engine. sil open font license 1.1, see assets/fonts/OFL.txt.
+# (satoru)
+INTER_REG_BIN  = $(SRC)/assets/fonts/Inter-Regular.otf
+INTER_SEMI_BIN = $(SRC)/assets/fonts/Inter-SemiBold.otf
+INTER_REG_OBJ  = $(BUILD)/inter_regular.o
+INTER_SEMI_OBJ = $(BUILD)/inter_semibold.o
+MEDIA_OBJS    += $(INTER_REG_OBJ) $(INTER_SEMI_OBJ)
+# dejavu sans mono for the terminal grid (bitstream vera license, see
+# assets/fonts/LICENSE-DejaVu.txt). (satoru)
+MONO_BIN       = $(SRC)/assets/fonts/DejaVuSansMono.ttf
+MONO_OBJ       = $(BUILD)/dejavu_mono.o
+MEDIA_OBJS    += $(MONO_OBJ)
+# modern app icon artwork: 128 px premultiplied bitmaps rasterized from
+# assets/icons/*.svg by tools/icons/icons_to_blob.py. (satoru)
+ICONS_BIN      = $(SRC)/assets/icons/modern_icons.bin
+ICONS_OBJ      = $(BUILD)/modern_icons.o
+MEDIA_OBJS    += $(ICONS_OBJ)
+
 # ─── User programs (test ELF64 binaries embedded into the kernel) ───────
 USERPROGS_DIR     = $(SRC)/userprogs
 HELLO_USER_ELF    = $(BUILD)/userprogs/hello.elf
@@ -153,6 +206,48 @@ WLSHM_OBJ         = $(BUILD)/userprogs/wl_shm_test_user_embed.o
 # pthreads smoke test (proves CLONE_THREAD + futex) (satoru)
 PTHREAD_ELF       = $(USERPROGS_DIR)/pthread_test.elf
 PTHREAD_OBJ       = $(BUILD)/userprogs/pthread_test_user_embed.o
+# signal-delivery self-test (proves rt_sigaction/procmask/sigreturn + kill). built
+# from source with musl-gcc (unlike the prebuilt .elf blobs) then embedded. (satoru)
+MUSLCC            = musl-gcc
+SIGNAL_SRC        = $(USERPROGS_DIR)/signal_test.c
+SIGNAL_ELF        = $(BUILD)/userprogs/signal_test.elf
+IRQLAT_SRC        = $(USERPROGS_DIR)/irqlat.c
+IRQLAT_ELF        = $(BUILD)/userprogs/irqlat.elf
+IRQLAT_OBJ        = $(BUILD)/userprogs/irqlat_user_embed.o
+UATEST_SRC        = $(USERPROGS_DIR)/uatest.c
+UATEST_ELF        = $(BUILD)/userprogs/uatest.elf
+UATEST_OBJ        = $(BUILD)/userprogs/uatest_user_embed.o
+KSHTEST_SRC       = $(USERPROGS_DIR)/kshtest.c
+KSHTEST_ELF       = $(BUILD)/userprogs/kshtest.elf
+KSHTEST_OBJ       = $(BUILD)/userprogs/kshtest_user_embed.o
+# third-party linux binary smoke test (kurono.bbtest=1). a prebuilt static
+# busybox: the point is that we did NOT compile it, so it exercises the kls
+# syscall surface the way a real recovery tool would. (satoru)
+BBOX_ELF          = $(USERPROGS_DIR)/busybox.elf
+# optional: the blob is not committed, so a fresh clone links without it (satoru)
+BBOX_OBJ          = $(if $(wildcard $(BBOX_ELF)),$(BUILD)/userprogs/busybox_user_embed.o,)
+# ai recovery client. links the vendored musl bearssl; see
+# src/third_party/bearssl/README.md for why debian's copy cannot be used. (satoru)
+BEARSSL_DIR       = $(SRC)/third_party/bearssl
+DSAI_SRC          = $(USERPROGS_DIR)/dsai.c
+DSAI_ELF          = $(BUILD)/userprogs/dsai.elf
+DSAI_OBJ          = $(if $(wildcard $(DSAI_SRC)),$(BUILD)/userprogs/dsai_user_embed.o,)
+# optional api key baked into the image at /system/etc/deepseek.key.
+# DELIBERATELY EMPTY BY DEFAULT - opt in per build with
+#   make iso DSAI_KEY_FILE=/var/tmp/deepseek.key
+# pointing this at a real path by default would silently embed a live
+# credential in every iso built on a machine that happens to have the file.
+# (satoru)
+DSAI_KEY_FILE    ?=
+DSAI_KEY_OBJ      = $(if $(wildcard $(DSAI_KEY_FILE)),$(BUILD)/userprogs/dsai_key_embed.o,)
+# recovery toolbox: a ustar of musl-static rescue tools, unpacked to /usr/bin
+# at boot. built by scratchpad/build_rtools.sh; optional like the other blobs. (satoru)
+RTOOLS_TAR        = $(USERPROGS_DIR)/recovery_tools.tar
+RTOOLS_OBJ        = $(if $(wildcard $(RTOOLS_TAR)),$(BUILD)/userprogs/recovery_tools_embed.o,)
+KLDE1K_ELF        = $(USERPROGS_DIR)/kld_e1000e.elf
+# optional: build output of kld/Makefile, only linked when present (satoru)
+KLDE1K_OBJ        = $(if $(wildcard $(KLDE1K_ELF)),$(BUILD)/userprogs/kld_e1000e_user_embed.o,)
+SIGNAL_OBJ        = $(BUILD)/userprogs/signal_test_user_embed.o
 # dynamic musl pie + its libc.so: first real exercise of the ld-kurono dynamic path (satoru)
 DYNTEST_ELF       = $(USERPROGS_DIR)/dyntest.elf
 DYNTEST_OBJ       = $(BUILD)/userprogs/dyntest_user_embed.o
@@ -162,7 +257,29 @@ MUSL_LIBC_OBJ     = $(BUILD)/userprogs/musl_libc_user_embed.o
 # library via the new file-backed mmap path (satoru)
 LIBFOO_SO         = $(USERPROGS_DIR)/libfoo.so
 LIBFOO_OBJ        = $(BUILD)/userprogs/libfoo_user_embed.o
-USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ) $(DYNTEST_OBJ) $(MUSL_LIBC_OBJ) $(LIBFOO_OBJ)
+USERPROG_OBJS     = $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ) $(SIGNAL_OBJ) $(IRQLAT_OBJ) $(UATEST_OBJ) $(KSHTEST_OBJ) $(BBOX_OBJ) $(DSAI_OBJ) $(DSAI_KEY_OBJ) $(RTOOLS_OBJ) $(KLDE1K_OBJ) $(DYNTEST_OBJ) $(MUSL_LIBC_OBJ) $(LIBFOO_OBJ)
+
+# ─── KURONO_SLIM=1: drop the big optional blobs from the kernel image ──────
+# MEASURED 2026-07-27: 72% of boot (21.4s of 29.7s wall) is grub loading the
+# kernel BEFORE the cpu runs a single instruction. .text is only 2.2MB - the
+# image is 79MB because ~52MB of assets are objcopy'd into .rodata, and grub
+# loads every PT_LOAD byte at ~3.7MB/s over qemu's atapi pio path.
+#
+# everything dropped here is declared __attribute__((weak)) with a Has*()
+# null-guard at its use site (embedded_media.h, embedded_userprogs.h,
+# alpine_data.h), so the link succeeds and the features degrade gracefully
+# rather than breaking:
+#   demo videos     ~12.9MB  media player finds no clip
+#   alpine guest    ~22.9MB  hypervisor has no built-in guest image
+#   kpython          ~8.3MB  no built-in python interpreter
+# fonts / xkb / nss libs are deliberately KEPT - firefox needs them.
+# (satoru)
+ifeq ($(KURONO_SLIM),1)
+MEDIA_OBJS    := $(filter-out $(DENJI_MP4_OBJ) $(DENJI_KVID_OBJ) $(SSSTIK_MP4_OBJ) $(SSSTIK_KVID_OBJ),$(MEDIA_OBJS))
+ALPINE_OBJS   :=
+DEBIAN_OBJS   :=
+USERPROG_OBJS := $(filter-out $(KPY_OBJ),$(USERPROG_OBJS))
+endif
 
 # ─── Flags ────────────────────────────────────────────────────────────────
 CXXFLAGS = -std=c++17 -ffreestanding -O2 -Wall -Wextra -fno-exceptions \
@@ -198,11 +315,13 @@ CXX_SRCS = \
     $(SRC)/kernel/kdf.cpp \
     $(SRC)/kernel/kdf_test.cpp \
     $(SRC)/kernel/udf.cpp \
+    $(SRC)/kernel/kld_broker.cpp \
     $(SRC)/kernel/irp.cpp \
     $(SRC)/kernel/kexec.cpp \
 	$(SRC)/kernel/userspace.cpp \
 	$(SRC)/kernel/elf_loader.cpp \
     $(SRC)/kernel/time.cpp \
+    $(SRC)/kernel/kvdso.cpp \
     $(SRC)/kernel/system.cpp \
 	$(SRC)/kernel/panic.cpp \
     $(SRC)/kernel/hrtimer.cpp \
@@ -242,6 +361,9 @@ CXX_SRCS = \
     $(SRC)/ui/gui.cpp \
     $(SRC)/ui/lockscreen.cpp \
     $(SRC)/ui/window_manager.cpp \
+    $(SRC)/ui/wm_motion.cpp \
+    $(SRC)/ui/style.cpp \
+    $(SRC)/ui/modern_draw.cpp \
     $(SRC)/ui/desktop.cpp \
     $(SRC)/ui/control_center.cpp \
     $(SRC)/ui/file_browser.cpp \
@@ -281,6 +403,7 @@ CXX_SRCS = \
 	$(SRC)/system/kinit_kservice.cpp \
 	$(SRC)/system/systemd_compat.cpp \
 	$(SRC)/system/kpkg_daemon.cpp \
+	$(SRC)/system/claude_host.cpp \
 	$(SRC)/system/kdaemons.cpp \
 	$(SRC)/system/installer.cpp \
 	$(SRC)/system/installer_gui.cpp \
@@ -291,6 +414,9 @@ CXX_SRCS = \
     $(SRC)/tests/test_suite.cpp \
     $(SRC)/linux/kls.cpp \
     $(SRC)/linux/linux_syscall.cpp \
+    $(SRC)/linux/kpty.cpp \
+    $(SRC)/apps/vt.cpp \
+    $(SRC)/linux/uaccess.cpp \
     $(SRC)/linux/linux_syscall_x64.cpp \
     $(SRC)/linux/ext4.cpp \
     $(SRC)/linux/shared_mount.cpp \
@@ -322,13 +448,19 @@ CXX_SRCS = \
     $(SRC)/drivers/nvidia_gpu.cpp \
     $(SRC)/drivers/intel_gpu.cpp \
     $(SRC)/drivers/e1000.cpp \
+    $(SRC)/drivers/igc.cpp \
     $(SRC)/drivers/wifi_dev.cpp \
     $(SRC)/drivers/wifi_rtw.cpp \
     $(SRC)/drivers/wifi_ath.cpp \
     $(SRC)/drivers/wifi_iwl.cpp \
     $(SRC)/drivers/wifi_brcm.cpp \
     $(SRC)/drivers/nvme.cpp \
+    $(SRC)/drivers/blockdev.cpp \
+    $(SRC)/drivers/ahci.cpp \
+    $(SRC)/drivers/disklog.cpp \
+    $(SRC)/drivers/hwinfo.cpp \
     $(SRC)/drivers/usb.cpp \
+    $(SRC)/drivers/usb_audio.cpp \
     $(SRC)/drivers/hda.cpp \
     $(SRC)/drivers/virtio_gpu.cpp \
     $(SRC)/drivers/display_mgr.cpp \
@@ -354,6 +486,7 @@ CXX_SRCS = \
     $(SRC)/media/kvid.cpp \
     $(SRC)/media/video_player.cpp \
     $(SRC)/net/tcpip.cpp \
+    $(SRC)/net/dhcp.cpp \
     $(SRC)/net/tuntap.cpp \
     $(SRC)/net/ipv6.cpp \
     $(SRC)/net/netfilter.cpp \
@@ -399,6 +532,17 @@ KURONO_GUI_RUN ?=
 # headless self-test gates, e.g. KURONO_EXTRA_CMDLINE='kurono.kdf.test kurono.kdf.poweroff=1'.
 # (satoru)
 KURONO_EXTRA_CMDLINE ?=
+# firefox on the KLS needs AP thread-scheduling. the scheduler is cooperative
+# with no preemption on the bsp, so without this every firefox worker thread
+# (webrender compositor, rayon, ipc) timeshares cpu0 and any one that spins in
+# userspace before parking (rust parking_lot) starves the rest - the chrome main
+# wedges mid-startup and the window never paints (the boot-stall lottery). the
+# whole prior smp render/futex/migration body of work was built and validated
+# WITH kurono.apthreads=1, but the shipped grub cmdline was missing it. measured
+# on this tree: with the flag firefox progresses ~2x further into window setup
+# and 0 boots crashed; without it firefox goes quiet at ~t=66s. auto-enable it
+# whenever we launch firefox; other gui targets are unaffected. (satoru)
+KURONO_FF_APTHREADS := $(if $(findstring firefox,$(KURONO_GUI_RUN)),kurono.apthreads=1,)
 # autologin: bypass the lockscreen and boot straight to the desktop. on by
 # default so `make iso` / start.ps1 produce a desktop-booting image -- the
 # lockscreen's blocking Show() loop otherwise stalls headless/vm boots.
@@ -440,11 +584,15 @@ all: dirs $(KERNEL)
 # expands prerequisites at parse time). (satoru)
 AP_TRAMP_OBJ = $(BUILD)/boot/ap_trampoline.o
 
+# KURONO_KERNEL_BASE=0x14000000 links the kernel above the 0x200000..0x12e1d000 span of the
+# claude code binary (a fixed-address ET_EXEC). unset = the classic 0x100000. (satoru)
+KBASE_LDFLAG = $(if $(KURONO_KERNEL_BASE),-Wl$(comma)--defsym$(comma)KERNEL_BASE=$(KURONO_KERNEL_BASE),)
+comma := ,
 $(KERNEL_BASE): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS) $(AP_TRAMP_OBJ)
-	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld -nostdlib -o $@ $^ -lgcc
+	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld $(KBASE_LDFLAG) -nostdlib -o $@ $^ -lgcc
 
 $(KERNEL): $(ALL_OBJS) $(ALPINE_OBJS) $(DEBIAN_OBJS) $(MEDIA_OBJS) $(USERPROG_OBJS) $(AP_TRAMP_OBJ) $(INSTALLER_PAYLOAD_OBJS)
-	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld -nostdlib -o $@ $^ -lgcc
+	$(CXX) $(CXXFLAGS) -no-pie -T $(SRC)/boot/kurono_linker.ld $(KBASE_LDFLAG) -nostdlib -o $@ $^ -lgcc
 
 # ─── AP trampoline: flat 16/32/64-bit blob (nasm -f bin) embedded via objcopy ──
 # runs at physical 0x8000 after SIPI; copied there at runtime by SMP::StartAPs. (satoru)
@@ -490,6 +638,66 @@ $(FONTS_TAR_OBJ): $(FONTS_TAR_BIN)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  kurono_fonts kurono_fonts.o && \
 	rm -f kurono_fonts
+
+# ─── Embed NSS runtime libs tar via objcopy (binary → ELF .rodata) ────────
+$(NSSLIBS_TAR_OBJ): $(NSSLIBS_TAR_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/kurono_nsslibs && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kurono_nsslibs kurono_nsslibs.o && \
+	rm -f kurono_nsslibs
+
+# ─── Embed the ICU data via objcopy (binary → ELF .rodata) ────────────────
+$(ICU_DAT_OBJ): $(ICU_DAT_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/kurono_icudt && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kurono_icudt kurono_icudt.o && \
+	rm -f kurono_icudt
+
+# ─── Embed gdk-pixbuf 2.42 via objcopy (binary → ELF .rodata) ─────────────
+$(PIXBUF_OBJ): $(PIXBUF_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/kurono_pixbuf && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kurono_pixbuf kurono_pixbuf.o && \
+	rm -f kurono_pixbuf
+
+# ─── Embed the Inter faces via objcopy (binary → ELF .rodata) ─────────────
+$(INTER_REG_OBJ): $(INTER_REG_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/inter_regular_otf && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  inter_regular_otf inter_regular.o && \
+	rm -f inter_regular_otf
+
+$(INTER_SEMI_OBJ): $(INTER_SEMI_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/inter_semibold_otf && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  inter_semibold_otf inter_semibold.o && \
+	rm -f inter_semibold_otf
+
+$(MONO_OBJ): $(MONO_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/dejavu_mono_ttf && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  dejavu_mono_ttf dejavu_mono.o && \
+	rm -f dejavu_mono_ttf
+
+$(ICONS_OBJ): $(ICONS_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/modern_icons_bin && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  modern_icons_bin modern_icons.o && \
+	rm -f modern_icons_bin
 
 # ─── Embed Debian rootfs image via objcopy (binary → ELF .rodata) ───────
 $(DEBIAN_ROOTFS_OBJ): $(DEBIAN_ROOTFS_BIN)
@@ -605,6 +813,97 @@ $(PTHREAD_OBJ): $(PTHREAD_ELF)
 	  pthread_test.elf pthread_test_user_embed.o
 	rm -f $(BUILD)/userprogs/pthread_test.elf
 
+# compile the signal-delivery self-test from source (musl-static, no-pie ET_EXEC)
+# then embed it as a blob, same as the prebuilt userprogs (satoru)
+$(SIGNAL_ELF): $(SIGNAL_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(SIGNAL_OBJ): $(SIGNAL_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  signal_test.elf signal_test_user_embed.o
+
+# compile + embed the userspace wake-latency probe (kurono.irqlat) - the KLD
+# phase-0 go/no-go instrument. musl-static no-pie, same shape as signal_test. (satoru)
+$(IRQLAT_ELF): $(IRQLAT_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(IRQLAT_OBJ): $(IRQLAT_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents 	  irqlat.elf irqlat_user_embed.o
+
+# embed the KLD driver container (kurono.kld=1). built separately by kld/Makefile
+# against the pinned linux tree; this only wraps the prebuilt binary. (satoru)
+$(KLDE1K_OBJ): $(KLDE1K_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/kld_e1000e.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents 	  kld_e1000e.elf kld_e1000e_user_embed.o
+	rm -f $(BUILD)/userprogs/kld_e1000e.elf
+
+# compile + embed the user-pointer validation regression test (kurono.uatest=1).
+# proves uaccess actually rejects a kernel pointer rather than dereferencing it. (satoru)
+$(UATEST_ELF): $(UATEST_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(UATEST_OBJ): $(UATEST_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  uatest.elf uatest_user_embed.o
+
+# compile + embed the /dev/kshell gate (kurono.kshtest=1). proves the rescue
+# agent's command channel runs a diagnostic AND refuses a destructive one - the
+# kernel-side whitelist is a security boundary, so it needs a regression. (satoru)
+$(KSHTEST_ELF): $(KSHTEST_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(KSHTEST_OBJ): $(KSHTEST_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kshtest.elf kshtest_user_embed.o
+
+$(RTOOLS_OBJ): $(RTOOLS_TAR)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/recovery_tools.tar
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  recovery_tools.tar recovery_tools_embed.o
+	rm -f $(BUILD)/userprogs/recovery_tools.tar
+
+$(BBOX_OBJ): $(BBOX_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/busybox.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  busybox.elf busybox_user_embed.o
+
+# compile + embed the ai recovery client (kurono.dsai=1). musl-static against
+# the vendored bearssl. -idirafter for BOTH include paths: a plain -I/usr/include
+# jumps ahead of musl's own headers and you compile glibc's stdint.h against
+# musl's libc. (satoru)
+$(DSAI_ELF): $(DSAI_SRC) $(USERPROGS_DIR)/ds_tas.h
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $< \
+	  -idirafter $(BEARSSL_DIR)/inc -idirafter /usr/include \
+	  $(BEARSSL_DIR)/libbearssl.a
+$(DSAI_OBJ): $(DSAI_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  dsai.elf dsai_user_embed.o
+
+# wrap the api key as its own blob. built ONLY when DSAI_KEY_FILE exists, so
+# the default image contains no key at all. (satoru)
+$(BUILD)/userprogs/dsai_key_embed.o: $(DSAI_KEY_FILE)
+	@mkdir -p $(dir $@)
+	cp $(DSAI_KEY_FILE) $(BUILD)/userprogs/dsai_key.bin
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  dsai_key.bin dsai_key_embed.o
+	rm -f $(BUILD)/userprogs/dsai_key.bin
+
 # embed the dynamic musl pie blob (first ld-kurono dynamic-load test) (satoru)
 $(DYNTEST_OBJ): $(DYNTEST_ELF)
 	@mkdir -p $(dir $@)
@@ -686,6 +985,24 @@ $(BUILD)/kernel/elf_loader.o: $(SRC)/kernel/elf_loader.cpp
 	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
 
 $(BUILD)/hal/hal.o: $(SRC)/hal/hal.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# SerialLogger runs from EVERY context including irq + exception paths; the
+# LogHex64 string-literal buf init vectorised into movaps %xmm0,(%rsp) and
+# #GP'd on the misaligned irq stack when the futex sweep logged a wedge (the
+# p4 boot3 / p5 boot5 "graph strings on the panic stack" kernel panics). (satoru)
+$(BUILD)/drivers/serial.o: $(SRC)/drivers/serial.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# smp carries the ap timer preempt + tlb ipi handlers (isr context). (satoru)
+$(BUILD)/proc/smp.o: $(SRC)/proc/smp.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
+
+# vmm's hardened page walks now run from the futex sweep (irq context). (satoru)
+$(BUILD)/kernel/vmm.o: $(SRC)/kernel/vmm.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -mno-sse -mno-mmx -c $< -o $@
 
@@ -828,7 +1145,7 @@ iso: all efi
 	@echo 'menuentry "Kurono OS (Multiboot2)" {'                       >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono OS kernel (multiboot2)..."'         >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",) $(KURONO_EXTRA_CMDLINE)' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono_base.elf $(if $(filter 1,$(KURONO_AUTOLOGIN)),kurono.autologin=1,) $(if $(strip $(KURONO_GUI_RUN)),kurono.gui.run="$(KURONO_GUI_RUN)",) $(KURONO_FF_APTHREADS) $(KURONO_EXTRA_CMDLINE)' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Kernel loaded OK. Booting..."'                     >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg

@@ -1,4 +1,6 @@
 #include "installer.h"
+#include "../drivers/blockdev.h"   // scan every disk, not just nvme (satoru)
+#include "../drivers/ahci.h"       // sata probe, registers into BlockDev (satoru)
 #include "../drivers/nvme.h"
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
@@ -152,6 +154,23 @@ static void utf16le_to_ascii(char* out, int mx, const uint16_t* in, int in_chars
     out[p] = 0;
 }
 
+// which BlockDev index the partition scan is currently walking. the fs probe
+// below used to call NVMe:: directly, which is why a sata disk enumerated zero
+// partitions even once ahci registered it. (satoru)
+// udev's partition-naming rule: a "p" separator only when the disk name already
+// ends in a digit. nvme0n1 -> nvme0n1p1, but sda -> sda1, NOT sdap1. appending
+// "p" unconditionally produced "sdap1" on the first sata run. (satoru)
+static void part_sep(char* name, int cap) {
+    int n = 0;
+    while (name[n] && n < cap - 1) n++;
+    if (n > 0 && name[n - 1] >= '0' && name[n - 1] <= '9' && n < cap - 1) {
+        name[n++] = 'p';
+        name[n] = 0;
+    }
+}
+
+static int g_scan_dev = -1;
+
 static InstallerFsType detect_fs_type(uint64_t start_lba, uint32_t sector_size, char* label, int label_mx, bool* esp_hint) {
     uint8_t* buf = (uint8_t*)KernelHeap::Alloc(sector_size * 4);
     if (!buf) return INST_FS_UNKNOWN;
@@ -159,7 +178,7 @@ static InstallerFsType detect_fs_type(uint64_t start_lba, uint32_t sector_size, 
     if (esp_hint) *esp_hint = false;
 
     InstallerFsType type = INST_FS_UNKNOWN;
-    if (NVMe::Read(start_lba, 4, buf)) {
+    if (BlockDev::Read(g_scan_dev, start_lba, 4, buf)) {
         bool sig = (buf[510] == 0x55 && buf[511] == 0xAA);
         bool fat32 = false;
         if (sig) {
@@ -353,28 +372,53 @@ void Installer::Rescan() {
     disk_count = 0;
     part_count = 0;
 
+    // probe both storage drivers, then walk whatever registered. this used to
+    // hardcode a single nvme disk, so a machine with a sata ssd reported "no
+    // supported disks" even though the gpt parser below was perfectly capable
+    // of reading it. (satoru)
     if (!NVMe::IsDetected()) NVMe::Init();
-    if (!NVMe::IsDetected()) {
+    if (NVMe::IsDetected() && !BlockDev::FindByName("nvme0n1")) {
+        BlockDevice nb = {};
+        s_cpy(nb.name, "nvme0n1", sizeof(nb.name));
+        s_cpy(nb.driver, "nvme", sizeof(nb.driver));
+        s_cpy(nb.model, NVMe::GetInfo().model, sizeof(nb.model));
+        nb.capacity_lba = NVMe::GetCapacityLBA();
+        nb.sector_size  = NVMe::GetLBASize() ? NVMe::GetLBASize() : 512;
+        nb.ctx   = nullptr;
+        nb.read  = [](void*, uint64_t lba, uint32_t cnt, void* b)       { return NVMe::Read(lba, cnt, b); };
+        nb.write = [](void*, uint64_t lba, uint32_t cnt, const void* b) { return NVMe::Write(lba, cnt, b); };
+        nb.flush = [](void*) { return NVMe::Flush(); };
+        BlockDev::Register(nb);
+    }
+    Ahci::Init();
+
+    if (BlockDev::Count() == 0) {
         SerialLogger::Log("[Installer] No supported disks detected\r\n");
         return;
     }
 
+    for (int bd = 0; bd < BlockDev::Count() && disk_count < INSTALLER_MAX_DISKS; bd++) {
+    BlockDevice* bdev = BlockDev::Get(bd);
+    if (!bdev) continue;
+    g_scan_dev = bd;
+
     InstallerDiskInfo* d = &disks[disk_count++];
+    const int this_disk = disk_count - 1;
     d->present = true;
-    d->type = INST_DISK_NVME;
-    s_cpy(d->name, "nvme0n1", sizeof(d->name));
-    s_cpy(d->driver, "nvme", sizeof(d->driver));
-    s_cpy(d->model, NVMe::GetInfo().model, sizeof(d->model));
-    d->total_lba = NVMe::GetCapacityLBA();
-    d->sector_size = NVMe::GetLBASize() ? NVMe::GetLBASize() : 512;
+    d->type = (bdev->driver[0] == 'n') ? INST_DISK_NVME : INST_DISK_SATA;
+    s_cpy(d->name, bdev->name, sizeof(d->name));
+    s_cpy(d->driver, bdev->driver, sizeof(d->driver));
+    s_cpy(d->model, bdev->model, sizeof(d->model));
+    d->total_lba = bdev->capacity_lba;
+    d->sector_size = bdev->sector_size ? bdev->sector_size : 512;
     d->scheme = INST_SCHEME_UNKNOWN;
     d->has_esp = false;
 
     uint8_t* lba0 = (uint8_t*)KernelHeap::Alloc(d->sector_size * 4);
-    if (!lba0) return;
-    if (!NVMe::Read(0, 4, lba0)) {
+    if (!lba0) continue;
+    if (!BlockDev::Read(bd, 0, 4, lba0)) {
         KernelHeap::Free(lba0);
-        return;
+        continue;
     }
 
     bool mbr_sig = (lba0[510] == 0x55 && lba0[511] == 0xAA);
@@ -399,14 +443,14 @@ void Installer::Rescan() {
             if (entry_buf) {
                 for (uint32_t ei = 0; ei < max_entries && part_count < INSTALLER_MAX_PARTITIONS; ei++) {
                     uint64_t entry_lba = gh->partition_entries_lba + (ei / entries_per_lba);
-                    if (!NVMe::Read(entry_lba, 1, entry_buf)) break;
+                    if (!BlockDev::Read(bd, entry_lba, 1, entry_buf)) break;
                     GPTPartitionEntry* pe = (GPTPartitionEntry*)(entry_buf + (ei % entries_per_lba) * entry_size);
                     if (guid_is_zero(pe->type_guid) || pe->first_lba == 0 || pe->last_lba < pe->first_lba) continue;
 
                     InstallerPartitionInfo* p = &parts[part_count];
                     memset(p, 0, sizeof(*p));
                     p->present = true;
-                    p->disk_index = 0;
+                    p->disk_index = this_disk;
                     p->part_index = part_count;
                     p->scheme = INST_SCHEME_GPT;
                     p->start_lba = pe->first_lba;
@@ -415,7 +459,8 @@ void Installer::Rescan() {
                     p->size_bytes = p->sector_count * d->sector_size;
                     memcpy(p->type_guid, pe->type_guid, 16);
                     utf16le_to_ascii(p->label, sizeof(p->label), pe->name, 36);
-                    s_cpy(p->name, "nvme0n1p", sizeof(p->name));
+                    s_cpy(p->name, d->name, sizeof(p->name));
+            part_sep(p->name, sizeof(p->name));
                     char idx[8]; idx[0] = 0; int ip = 0; uint32_t n = ei + 1; char rev[8]; int rn = 0; while (n && rn < 7) { rev[rn++] = (char)('0' + (n % 10)); n /= 10; } if (rn == 0) rev[rn++] = '0'; while (rn > 0 && ip < 7) idx[ip++] = rev[--rn]; idx[ip] = 0; s_cat(p->name, idx, sizeof(p->name));
                     p->esp = mem_eq(pe->type_guid, GPT_EFI_SYSTEM_GUID, 16);
                     p->bootable = p->esp;
@@ -440,7 +485,7 @@ void Installer::Rescan() {
             InstallerPartitionInfo* p = &parts[part_count];
             memset(p, 0, sizeof(*p));
             p->present = true;
-            p->disk_index = 0;
+            p->disk_index = this_disk;
             p->part_index = part_count;
             p->scheme = INST_SCHEME_MBR;
             p->mbr_type = mbr[i].type;
@@ -448,7 +493,8 @@ void Installer::Rescan() {
             p->sector_count = mbr[i].sector_count;
             p->last_lba = p->start_lba + p->sector_count - 1;
             p->size_bytes = p->sector_count * d->sector_size;
-            s_cpy(p->name, "nvme0n1p", sizeof(p->name));
+            s_cpy(p->name, d->name, sizeof(p->name));
+            part_sep(p->name, sizeof(p->name));
             char one[2]; one[0] = (char)('1' + i); one[1] = 0; s_cat(p->name, one, sizeof(p->name));
             p->bootable = (mbr[i].status == 0x80);
             p->esp = (mbr[i].type == 0xEF);
@@ -463,7 +509,14 @@ void Installer::Rescan() {
     }
 
     KernelHeap::Free(lba0);
-    SerialLogger::Log("[Installer] Disk scan complete\r\n");
+    }  // per-device loop (satoru)
+
+    g_scan_dev = -1;
+    SerialLogger::Log("[Installer] Disk scan complete: ");
+    SerialLogger::LogDec(disk_count);
+    SerialLogger::Log(" disk(s), ");
+    SerialLogger::LogDec(part_count);
+    SerialLogger::Log(" partition(s)\r\n");
 }
 
 int Installer::GetDiskCount() { return disk_count; }

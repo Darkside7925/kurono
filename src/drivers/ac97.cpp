@@ -74,7 +74,9 @@ bool AC97::ScanPCI() {
         for (int dev = 0; dev < 32; dev++) {
             for (int func = 0; func < 8; func++) {
                 uint32_t id = pci_rd(bus, dev, func, 0x00);
-                if (id == 0xFFFFFFFF) continue;
+                // function 0 absent => the whole slot is absent: skip the other 7 functions
+                // (65536 -> ~10k config reads, each a port-io vm exit under qemu) (satoru)
+                if (id == 0xFFFFFFFF) { if (func == 0) break; continue; }
 
                 uint16_t vid = id & 0xFFFF;
                 uint16_t did = (id >> 16) & 0xFFFF;

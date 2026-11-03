@@ -13,6 +13,8 @@ class PersistStore {
 public:
     // true if a usable nvme block device is present. (satoru)
     static bool Available();
+    // one line: where the store lives or why it is unavailable. (satoru)
+    static void Describe(char* out, int cap);
 
     // write the blob (any length up to the disk size) + a committing header.
     // returns false if no device / write failed. (satoru)
@@ -42,5 +44,11 @@ public:
     // true if the on-disk KFS volume has a populated /apps/firefox (so a lazy
     // RestoreApps would bring a usable install back without a re-download). (satoru)
     static bool HasPersistedFirefox();
+
+    // memory-only read of the last HasPersistedFirefox() answer (false if it
+    // never ran). the gui process uses this for the desktop firefox icon so it
+    // never touches KFS/nvme itself - the probe is seeded once at boot, right
+    // after LoadTree, on the single-threaded init path. (satoru)
+    static bool HasPersistedFirefoxCached();
 };
 // end (satoru)

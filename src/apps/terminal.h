@@ -45,6 +45,17 @@ public:
     static void SetColor(unsigned int fg, unsigned int bg);
     static void SetBold(bool b);
 
+    // pty mode (satoru): while a ring-3 program (claude, busybox sh) runs from a shell
+    // command, the terminal is a vt100 screen wired to a kpty session. PtyBegin is called
+    // on the shell thread from inside the command; the window input path feeds the
+    // master side and Render drains program output into the emulator.
+    static bool PtyBegin();
+    static void PtyEnd();
+    static bool PtyActive();
+    static void PtyKeyEvent(int key, bool shift, bool ctrl, bool alt);
+    static void PtyPoll();
+    static void PtyScroll(int delta);
+
     // scroll state (public for wm scroll event forwarding)
     static int buf_count;
     static int scroll_offset;

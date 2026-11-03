@@ -74,7 +74,7 @@ struct mb2_tag_fb {
 struct mb2_tag_cmdline {
     UINT32 type;          /* 1 */
     UINT32 size;
-    char   string[64];    /* boot cmdline, e.g. "efi kurono.autologin=1" (satoru) */
+    char   string[256];   /* boot cmdline, e.g. "efi kurono.autologin=1" + boot entry args (satoru) */
 };
 struct mb2_tag_mmap_entry {
     UINT64 addr;
@@ -140,6 +140,68 @@ static UINTN ascii_len(const char *s) {
     return n;
 }
 
+/* the final cmdline: KURONO_EFI_CMDLINE, then whatever the boot manager passed
+ * as load options (opencore Misc->Entries "Arguments"). lets a bare-metal boot
+ * flip kernel flags from the opencore config without rebuilding the loader.
+ * non-ascii chars are dropped; total length is capped to fit the mb2 tag. (satoru) */
+static char efi_cmdline[240];
+
+static const char *build_cmdline(EFI_HANDLE image) {
+    const char *base = KURONO_EFI_CMDLINE;
+    UINTN n = 0;
+    while (base[n] && n < sizeof(efi_cmdline) - 1) { efi_cmdline[n] = base[n]; n++; }
+    efi_cmdline[n] = 0;
+
+    EFI_LOADED_IMAGE *li = NULL;
+    EFI_STATUS st = uefi_call_wrapper(BS->HandleProtocol, 3, image,
+                                      &LoadedImageProtocol, (void **)&li);
+    if (EFI_ERROR(st) || !li || !li->LoadOptions || li->LoadOptionsSize < 2)
+        return efi_cmdline;
+    CHAR16 *opt = (CHAR16 *)li->LoadOptions;
+    UINTN chars = li->LoadOptionsSize / 2;
+    if (n < sizeof(efi_cmdline) - 1) efi_cmdline[n++] = ' ';
+    for (UINTN i = 0; i < chars && opt[i] && n < sizeof(efi_cmdline) - 1; i++) {
+        CHAR16 c = opt[i];
+        if (c >= 0x20 && c < 0x7F) efi_cmdline[n++] = (char)c;
+        else if (c == '\t') efi_cmdline[n++] = ' ';
+    }
+    efi_cmdline[n] = 0;
+    return efi_cmdline;
+}
+
+/* copy a cmdline for DISPLAY with the value of kurono.claude.env replaced by <redacted>:
+ * that value carries credentials and must not reach the screen or serial. the real tag
+ * given to the kernel is never touched. (satoru) */
+static char redacted_cmdline[sizeof(efi_cmdline) + 32];
+
+static const char *redact_cmdline(const char *in) {
+    static const char key[] = "kurono.claude.env=";
+    static const char rep[] = "kurono.claude.env=<redacted>";
+    UINTN n = 0, klen = sizeof(key) - 1;
+    const char *p = in;
+    while (*p && n < sizeof(redacted_cmdline) - sizeof(rep)) {
+        int at_start = (p == in) || p[-1] == ' ' || p[-1] == '"' || p[-1] == '\'';
+        int match = at_start;
+        for (UINTN k = 0; match && k < klen; k++) if (p[k] != key[k]) match = 0;
+        if (match) {
+            char lead = (p != in && (p[-1] == '"' || p[-1] == '\'')) ? p[-1] : 0;
+            char quote = lead;
+            for (UINTN k = 0; k < sizeof(rep) - 1; k++) redacted_cmdline[n++] = rep[k];
+            p += klen;
+            if (*p == '"' || *p == '\'') { quote = *p; p++; }
+            while (*p) {
+                if (quote) { if (*p == quote) break; }
+                else if (*p == ' ') break;
+                p++;
+            }
+            continue;
+        }
+        redacted_cmdline[n++] = *p++;
+    }
+    redacted_cmdline[n] = 0;
+    return redacted_cmdline;
+}
+
 /* ── EFI Entry Point ─────────────────────────────────────────────────── */
 
 EFI_STATUS
@@ -157,9 +219,10 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 
     /* ── 0. Initialise gnu-efi library ──────────────────────────────── */
     InitializeLib(ImageHandle, SystemTable);
+    mb2_cmdline = build_cmdline(ImageHandle);
 
     Print(L"\r\n=== Kurono OS EFI Loader ===\r\n");
-    Print(L"Cmdline: %a\r\n", mb2_cmdline);
+    Print(L"Cmdline: %a\r\n", redact_cmdline(mb2_cmdline));
 
     /* ── 1. Use embedded kernel data ────────────────────────────────── */
     elf_buf  = _binary_kurono_elf_start;
@@ -262,9 +325,61 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         UINTN cmd_len = ascii_len(mb2_cmdline);
         t_cmd->type = 1;
         t_cmd->size = (UINT32)(8 + cmd_len + 1);
-        CopyMem(t_cmd->string, mb2_cmdline, cmd_len);
+        /* plain loop, not gnu-efi CopyMem: 3.0.18 declares it EFIAPI (ms abi)
+         * and this build calls it sysv, so the args land in the wrong
+         * registers and NOTHING is copied. that is why every efi boot has
+         * had an empty cmdline (no autologin, no kernel flags). (satoru) */
+        for (UINTN ci = 0; ci < cmd_len; ci++) t_cmd->string[ci] = mb2_cmdline[ci];
         t_cmd->string[cmd_len] = 0;
         p += (t_cmd->size + 7) & ~(UINTN)7;
+
+        /* Tag 12: efi64 system table pointer (marks an efi boot for the kernel) */
+        {
+            UINT32 *t12 = (UINT32 *)p;
+            t12[0] = 12;
+            t12[1] = 16;
+            *(UINT64 *)(p + 8) = (UINT64)(UINTN)SystemTable;
+            p += 16;
+        }
+
+        /* Tag 15 / 14: acpi rsdp copied out of the efi configuration table. uefi
+         * has no legacy 0xe0000 rsdp, so without this the kernel never finds the
+         * madt. prefer the acpi 2.0 entry, fall back to 1.0. plain loops, not
+         * gnu-efi CompareGuid/CopyMem (abi mismatch in this build). (satoru) */
+        {
+            /* EFI_ACPI_20_TABLE_GUID 8868e871-e4f1-11d3-bc22-0080c73c8881 */
+            static const UINT8 g20[16] = { 0x71,0xe8,0x68,0x88, 0xf1,0xe4, 0xd3,0x11,
+                                           0xbc,0x22, 0x00,0x80,0xc7,0x3c,0x88,0x81 };
+            /* EFI_ACPI_TABLE_GUID eb9d2d30-2d88-11d3-9a16-0090273fc14d */
+            static const UINT8 g10[16] = { 0x30,0x2d,0x9d,0xeb, 0x88,0x2d, 0xd3,0x11,
+                                           0x9a,0x16, 0x00,0x90,0x27,0x3f,0xc1,0x4d };
+            UINT8 *rsdp20 = NULL, *rsdp10 = NULL;
+            UINTN nct = SystemTable->NumberOfTableEntries;
+            for (UINTN ti = 0; ti < nct; ti++) {
+                UINT8 *vg = (UINT8 *)&SystemTable->ConfigurationTable[ti].VendorGuid;
+                int m20 = 1, m10 = 1;
+                for (int gi = 0; gi < 16; gi++) {
+                    if (vg[gi] != g20[gi]) m20 = 0;
+                    if (vg[gi] != g10[gi]) m10 = 0;
+                }
+                if (m20 && !rsdp20) rsdp20 = (UINT8 *)SystemTable->ConfigurationTable[ti].VendorTable;
+                if (m10 && !rsdp10) rsdp10 = (UINT8 *)SystemTable->ConfigurationTable[ti].VendorTable;
+            }
+            UINT8 *rs = rsdp20 ? rsdp20 : rsdp10;
+            if (rs) {
+                UINTN rlen = 20;
+                UINT32 ttype = 14;
+                if (rs[15] >= 2) { rlen = 36; ttype = 15; }
+                UINT32 *th = (UINT32 *)p;
+                th[0] = ttype;
+                th[1] = (UINT32)(8 + rlen);
+                for (UINTN ri = 0; ri < rlen; ri++) p[8 + ri] = rs[ri];
+                p += (8 + rlen + 7) & ~(UINTN)7;
+                Print(L"ACPI RSDP at 0x%lx rev %d (mb2 tag %d)\r\n", (UINT64)(UINTN)rs, (int)rs[15], (int)ttype);
+            } else {
+                Print(L"WARN: no ACPI RSDP in EFI configuration table\r\n");
+            }
+        }
 
         /* Tag 8: framebuffer */
         if (fb_addr) {
@@ -303,6 +418,64 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
             uefi_call_wrapper(BS->GetMemoryMap, 5,
                               &map_size2, mmap2, &map_key2,
                               &desc_size2, &desc_ver);
+
+            /* a kernel linked high lands wherever that address falls on this
+             * machine. refuse before ExitBootServices if the span is not plain
+             * ram or would overwrite this loader or its stack, so the failure
+             * is a message and a way back to the boot menu, not corruption.
+             * a low kernel only warns: 0x100000 is known good. (satoru) */
+            {
+                UINT64 ks = ~0ULL, ke = 0, covered = 0;
+                Elf64_Phdr *gp = (Elf64_Phdr *)(elf_buf + ehdr->e_phoff);
+                for (int g = 0; g < ehdr->e_phnum; g++, gp++) {
+                    if (gp->p_type != PT_LOAD) continue;
+                    if (gp->p_paddr < ks) ks = gp->p_paddr;
+                    if (gp->p_paddr + gp->p_memsz > ke) ke = gp->p_paddr + gp->p_memsz;
+                }
+                for (UINTN j = 0; j < map_size2 / desc_size2; j++) {
+                    EFI_MEMORY_DESCRIPTOR *d =
+                        (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mmap2 + j * desc_size2);
+                    UINT64 ds = d->PhysicalStart, de = ds + d->NumberOfPages * 4096ULL;
+                    if (d->Type != EfiConventionalMemory && d->Type != EfiBootServicesCode &&
+                        d->Type != EfiBootServicesData && d->Type != EfiLoaderCode &&
+                        d->Type != EfiLoaderData)
+                        continue;
+                    if (de > ks && ds < ke)
+                        covered += (de < ke ? de : ke) - (ds > ks ? ds : ks);
+                }
+                UINT64 ls = (UINT64)(UINTN)elf_buf, le = ls + elf_size, here;
+                UINT64 bi = (UINT64)(UINTN)boot_info_buf;
+                if (bi < ls) ls = bi;
+                if (bi + sizeof(boot_info_buf) > le) le = bi + sizeof(boot_info_buf);
+                __asm__ volatile("mov %%rsp, %0" : "=r"(here));
+                int bad_ram = covered != ke - ks;
+                int bad_self = (le > ks && ls < ke) || (here >= ks && here < ke);
+                if (bad_ram || bad_self) {
+                    Print(L"Kernel span %lx-%lx: %a\r\n", ks, ke,
+                          bad_ram ? "not all usable ram" : "overlaps the loader or its stack");
+                    /* overlapping the copy source (kernel image in this loader), the boot
+                     * info buffer or the stack would corrupt the copy no matter where the
+                     * kernel is linked, so that always refuses; "not all usable ram" stays
+                     * a warning for a low kernel (0x100000 is known good). (satoru) */
+                    if (bad_self || ks >= 0x1000000ULL) {
+                        Print(L"Refusing to load this build here.\r\n");
+                        goto hang;
+                    }
+                }
+            }
+
+            /* the converted map must fit what is left of the fixed boot info buffer
+             * (tag header + 24 bytes per entry + the end tag), or it would run off the
+             * end of boot_info_buf. (satoru) */
+            {
+                UINTN need = 16 + (map_size2 / desc_size2) * 24 + 8;
+                UINTN used = (UINTN)(p - boot_info_buf);
+                if (used + need > sizeof(boot_info_buf)) {
+                    Print(L"Memory map too large for the boot info buffer (%u entries, %u bytes free)\r\n",
+                          (UINT32)(map_size2 / desc_size2), (UINT32)(sizeof(boot_info_buf) - used));
+                    goto hang;
+                }
+            }
 
             struct mb2_tag_mmap *t_mmap = (struct mb2_tag_mmap *)p;
             t_mmap->type = 6;
@@ -403,7 +576,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     serial_hex(entry_point);
     serial_str("\r\n");
     serial_str("EFI_LOADER: cmdline=");
-    serial_str(mb2_cmdline);
+    serial_str(redact_cmdline(mb2_cmdline));
     serial_str("\r\n");
 
     /* ── 7b. Install our own RWX identity page tables, then copy the kernel ──
@@ -456,6 +629,11 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     }
 
     serial_str("EFI_LOADER: beep done, jumping\r\n");
+    /* echo the cmdline AS STORED in the tag, right before the jump, so a lost
+     * cmdline can be pinned to the loader or the kernel side. (satoru) */
+    serial_str("EFI_LOADER: tag cmdline=");
+    serial_str(redact_cmdline((const char *)(boot_info_buf + 16)));
+    serial_str("\r\n");
 
     /* ── 10. Jump to kernel's 64-bit entry ─────────────────────────── */
     /*    _start_efi64 expects: EAX = MB2 magic, EBX = info pointer.   */

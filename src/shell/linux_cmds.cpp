@@ -15,12 +15,16 @@
 #include "../drivers/bga.h"
 #include "../drivers/graphics.h"
 #include "../drivers/nvme.h"
+#include "../drivers/blockdev.h"  // real disk list for lsblk/blkid (satoru)
+#include "../linux/ext4.h"        // mount ext4 partitions by name (satoru)
 #include "../drivers/usb.h"
 #include "../drivers/hda.h"
 #include "../drivers/virtio_gpu.h"
 #include "../drivers/display_mgr.h"
 #include "../net/network.h"
 #include "../net/tcpip.h"
+#include "../fs/fat32.h"           // live fat32 mount (mount/fls/fcat) (satoru)
+#include "../system/installer.h"   // partition scan for mount fat32 nvme (satoru)
 #include "../system/logging.h"
 #include "../linux/linux_syscall.h"
 #include "../linux/linux_drivers.h"
@@ -560,13 +564,17 @@ void LinuxCmds::RegisterAll(KuronoShell* sh) {
     sh->RegisterCommand("uniq",     "Unique lines",            ENV_AUTO, "text",       cmd_uniq);
     sh->RegisterCommand("tr",       "Translate chars",         ENV_AUTO, "text",       cmd_tr);
     sh->RegisterCommand("free",     "Memory usage",            ENV_AUTO, "system",     cmd_free);
-    sh->RegisterCommand("mount",    "Show mounts",             ENV_AUTO, "system",     cmd_mount);
+    sh->RegisterCommand("mount",    "Show mounts / mount fat32 [usb|nvme]", ENV_AUTO, "system", cmd_mount);
+    sh->RegisterCommand("umount",   "Unmount the fat32 volume",             ENV_AUTO, "system", cmd_umount);
+    sh->RegisterCommand("fls",      "List a mounted fat32 directory",       ENV_AUTO, "filesystem", cmd_fls);
+    sh->RegisterCommand("fcat",     "Dump a file from the fat32 volume",    ENV_AUTO, "filesystem", cmd_fcat);
     sh->RegisterCommand("dmesg",    "Serial log tail (/kurono/var/log/serial.log)", ENV_AUTO, "system", cmd_dmesg);
     sh->RegisterCommand("journal",  "KVFS log tail viewer",                     ENV_AUTO, "system", cmd_journal);
     sh->RegisterCommand("lspci",    "List PCI devices",        ENV_AUTO, "system",     cmd_lspci);
     sh->RegisterCommand("lsmod",    "List loaded drivers",     ENV_AUTO, "system",     cmd_lsmod);
     sh->RegisterCommand("drivers",  "Driver status summary",   ENV_AUTO, "system",     cmd_drivers);
     sh->RegisterCommand("lsblk",    "List block devices",      ENV_AUTO, "system",     cmd_lsblk);
+    sh->RegisterCommand("blkid",    "Identify partitions",     ENV_AUTO, "system",     cmd_blkid);
     sh->RegisterCommand("lsusb",    "List USB devices",        ENV_AUTO, "system",     cmd_lsusb);
     sh->RegisterCommand("lscpu",    "CPU architecture info",   ENV_AUTO, "system",     cmd_lscpu);
     sh->RegisterCommand("modprobe", "Load kernel module",      ENV_AUTO, "system",     cmd_modprobe);
@@ -1411,14 +1419,312 @@ int LinuxCmds::cmd_journal(KuronoShell* sh, int argc, const char** argv, char* o
     return lc_kvfs_tail_into_out(log_path, out, mx, hint, banner);
 }
 
+// ---- live fat32 mount plumbing (satoru) --------------------------------------
+// the fat32 driver is block-device agnostic (byte-offset callbacks); this
+// wires it to a real backing store so `mount fat32` gives a browsable volume:
+// nvme (the esp / any fat partition found by the installer's scanner) or a
+// usb mass-storage stick (the new bot path in drivers/usb.cpp). (satoru)
+enum LcFatBacking { LC_FAT_NONE = 0, LC_FAT_NVME = 1, LC_FAT_USB = 2 };
+static LcFatBacking g_fat_backing = LC_FAT_NONE;
+static uint64_t g_fat_part_lba = 0;      // partition start lba (display) (satoru)
+static int g_fat_usb_dev = -1;
+
+// byte-granular nvme access through a sector bounce (same shape as the
+// installer's callbacks, kept local so this file stays self-contained). (satoru)
+static bool lc_nvme_bytes(uint64_t off, uint32_t len, void* buf, bool write) {
+    if (!NVMe::IsDetected() || !buf || len == 0) return false;
+    uint32_t ss = NVMe::GetLBASize(); if (!ss) ss = 512;
+    uint64_t first = off / ss;
+    uint64_t last  = (off + (uint64_t)len - 1) / ss;
+    uint32_t sectors = (uint32_t)(last - first + 1);
+    uint8_t* tmp = (uint8_t*)KernelHeap::Alloc(sectors * ss);
+    if (!tmp) return false;
+    bool ok = NVMe::Read(first, sectors, tmp);
+    if (ok) {
+        uint32_t in = (uint32_t)(off % ss);
+        if (write) {
+            const uint8_t* s = (const uint8_t*)buf;
+            for (uint32_t i = 0; i < len; i++) tmp[in + i] = s[i];
+            ok = NVMe::Write(first, sectors, tmp);
+            if (ok) NVMe::Flush();
+        } else {
+            uint8_t* d = (uint8_t*)buf;
+            for (uint32_t i = 0; i < len; i++) d[i] = tmp[in + i];
+        }
+    }
+    KernelHeap::Free(tmp);
+    return ok;
+}
+static int lc_fat_nvme_read(uint64_t off, uint32_t len, void* buf, void*) {
+    return lc_nvme_bytes(off, len, buf, false) ? 0 : -1;
+}
+static int lc_fat_nvme_write(uint64_t off, uint32_t len, const void* buf, void*) {
+    return lc_nvme_bytes(off, len, (void*)buf, true) ? 0 : -1;
+}
+
+// byte-granular usb mass-storage access through a block bounce (satoru)
+static bool lc_usb_bytes(uint64_t off, uint32_t len, void* buf, bool write) {
+    int dev = g_fat_usb_dev;
+    if (!USB::MsdIsReady(dev) || !buf || len == 0) return false;
+    uint32_t bs = USB::MsdBlockSize(dev); if (!bs) return false;
+    uint64_t first = off / bs;
+    uint64_t last  = (off + (uint64_t)len - 1) / bs;
+    uint32_t blocks = (uint32_t)(last - first + 1);
+    uint8_t* tmp = (uint8_t*)KernelHeap::Alloc(blocks * bs);
+    if (!tmp) return false;
+    bool ok = USB::MsdRead(dev, first, blocks, tmp);
+    if (ok) {
+        uint32_t in = (uint32_t)(off % bs);
+        if (write) {
+            const uint8_t* s = (const uint8_t*)buf;
+            for (uint32_t i = 0; i < len; i++) tmp[in + i] = s[i];
+            ok = USB::MsdWrite(dev, first, blocks, tmp);
+        } else {
+            uint8_t* d = (uint8_t*)buf;
+            for (uint32_t i = 0; i < len; i++) d[i] = tmp[in + i];
+        }
+    }
+    KernelHeap::Free(tmp);
+    return ok;
+}
+static int lc_fat_usb_read(uint64_t off, uint32_t len, void* buf, void*) {
+    return lc_usb_bytes(off, len, buf, false) ? 0 : -1;
+}
+static int lc_fat_usb_write(uint64_t off, uint32_t len, const void* buf, void*) {
+    return lc_usb_bytes(off, len, (void*)buf, true) ? 0 : -1;
+}
+
+// find a fat partition start on a usb stick: whole-disk fat first (Mount
+// validates the bpb), then the mbr partition table's fat-type entries. (satoru)
+static bool lc_mount_fat_usb(int dev, uint64_t* out_lba) {
+    g_fat_usb_dev = dev;
+    uint32_t bs = USB::MsdBlockSize(dev);
+    if (!bs) return false;
+    if (FAT32::Mount(lc_fat_usb_read, lc_fat_usb_write, nullptr, 0) == 0) {
+        *out_lba = 0;
+        return true;
+    }
+    uint8_t* mbr = (uint8_t*)KernelHeap::Alloc(bs);
+    if (!mbr) return false;
+    bool ok = false;
+    if (USB::MsdRead(dev, 0, 1, mbr) && bs >= 512 &&
+        mbr[510] == 0x55 && mbr[511] == 0xAA) {
+        for (int i = 0; i < 4 && !ok; i++) {
+            const uint8_t* e = mbr + 446 + i * 16;
+            uint8_t ptype = e[4];
+            uint32_t start = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                             ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+            if (!start) continue;
+            // fat16/fat32 mbr partition ids (satoru)
+            if (ptype == 0x0B || ptype == 0x0C || ptype == 0x0E || ptype == 0x06) {
+                if (FAT32::Mount(lc_fat_usb_read, lc_fat_usb_write, nullptr,
+                                 (uint64_t)start * bs) == 0) {
+                    *out_lba = start;
+                    ok = true;
+                }
+            }
+        }
+    }
+    KernelHeap::Free(mbr);
+    return ok;
+}
+
+// ── mount an arbitrary partition by name (the rescue primitive) ────────────
+// the existing `mount fat32 [usb|nvme]` could only ever reach a fat volume on
+// one of two hardcoded backings. A rescue tool has to open whatever partition
+// the user points at, on whatever disk, with whatever filesystem is on it - so
+// this resolves a name like "sda2" through the real partition scan and hands
+// the right driver a BlockDev-backed byte callback. (satoru)
+static int g_mnt_bdev = -1;
+
+static int lc_bd_read(uint64_t off, uint32_t len, void* buf, void* ctx) {
+    (void)ctx;
+    return BlockDev::ReadBytes(g_mnt_bdev, off, len, buf) ? 0 : -1;
+}
+static int lc_bd_write(uint64_t off, uint32_t len, const void* buf, void* ctx) {
+    (void)ctx;
+    return BlockDev::WriteBytes(g_mnt_bdev, off, len, buf) ? 0 : -1;
+}
+
 int LinuxCmds::cmd_mount(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
-    (void)sh; (void)argc; (void)argv;
+    (void)sh;
     int p = 0;
+
+    // mount <partition>  e.g. `mount sda2` - resolve through the partition scan
+    // and dispatch on the detected filesystem. (satoru)
+    if (argc >= 2 && !_seq(argv[1], "fat32")) {
+        InstallerPartitionInfo* target = nullptr;
+        for (int i = 0; i < Installer::GetPartitionCount(); i++) {
+            InstallerPartitionInfo* pt = Installer::GetPartition(i);
+            if (pt && pt->present && _seq(pt->name, argv[1])) { target = pt; break; }
+        }
+        if (!target) {
+            p = _sa(out, p, mx, "mount: no such partition: ");
+            p = _sa(out, p, mx, argv[1]);
+            p = _sa(out, p, mx, "\nrun `lsblk` to list them\n");
+            return p;
+        }
+        InstallerDiskInfo* dk = Installer::GetDisk(target->disk_index);
+        if (!dk) return _sa(out, 0, mx, "mount: partition has no backing disk\n");
+
+        // resolve the disk name back to a block device index. (satoru)
+        int bd = -1;
+        for (int i = 0; i < BlockDev::Count(); i++) {
+            BlockDevice* b = BlockDev::Get(i);
+            if (b && _seq(b->name, dk->name)) { bd = i; break; }
+        }
+        if (bd < 0) return _sa(out, 0, mx, "mount: backing disk not in block registry\n");
+
+        g_mnt_bdev = bd;
+        uint64_t off = target->start_lba * (uint64_t)dk->sector_size;
+
+        if (target->fs_type == INST_FS_EXT4) {
+            if (Ext4::Mount(lc_bd_read, lc_bd_write, nullptr, off) != 0)
+                return _sa(out, 0, mx, "mount: ext4 mount failed (bad superblock?)\n");
+            p = _sa(out, p, mx, "mounted ext4: ");
+            p = _sa(out, p, mx, target->name);
+            // surface the read-only downgrade rather than letting the user
+            // discover it when a write silently fails. (satoru)
+            if (Ext4::IsReadOnlyForced()) {
+                p = _sa(out, p, mx, "  [READ-ONLY: unclean fs, journal not replayed]");
+            }
+            p = _sa(out, p, mx, "\nbrowse with: els /   ecat /FILE\n");
+            return p;
+        }
+        if (target->fs_type == INST_FS_FAT32 || target->esp) {
+            if (FAT32::Mount(lc_bd_read, lc_bd_write, nullptr, off) != 0)
+                return _sa(out, 0, mx, "mount: fat32 mount failed (bad bpb?)\n");
+            g_fat_backing = LC_FAT_NVME;
+            g_fat_part_lba = target->start_lba;
+            p = _sa(out, p, mx, "mounted fat32: ");
+            p = _sa(out, p, mx, target->name);
+            p = _sa(out, p, mx, "\nbrowse with: fls /   fcat /FILE\n");
+            return p;
+        }
+        p = _sa(out, p, mx, "mount: unrecognised filesystem on ");
+        p = _sa(out, p, mx, target->name);
+        p = _sa(out, p, mx, " (not ext4 or fat32)\n");
+        return p;
+    }
+
+    // mount fat32 [usb|nvme] [start_lba] - attach a real fat volume (satoru)
+    if (argc >= 2 && _seq(argv[1], "fat32")) {
+        if (FAT32::IsMounted() && g_fat_backing != LC_FAT_NONE) {
+            return _sa(out, 0, mx, "mount: fat32 already mounted (umount first)\n");
+        }
+        const char* dev = (argc >= 3) ? argv[2] : "auto";
+        bool try_usb  = _seq(dev, "usb")  || _seq(dev, "auto");
+        bool try_nvme = _seq(dev, "nvme") || _seq(dev, "auto");
+
+        if (try_usb) {
+            int mdev = USB::MsdFirstDevice();
+            if (mdev >= 0) {
+                uint64_t lba = 0;
+                if (lc_mount_fat_usb(mdev, &lba)) {
+                    g_fat_backing = LC_FAT_USB;
+                    g_fat_part_lba = lba;
+                    p = _sa(out, p, mx, "mounted fat32 from usb msd @ lba ");
+                    p = _sau(out, p, mx, (unsigned int)lba);
+                    p = _sa(out, p, mx, "\nbrowse with: fls /   fcat /FILE\n");
+                    _log_runtime_event("mount", "fat32-mounted", "usb mass storage");
+                    return p;
+                }
+            }
+            if (_seq(dev, "usb"))
+                return _sa(out, 0, mx, "mount: no fat32 volume on a usb mass-storage device\n");
+        }
+
+        if (try_nvme) {
+            // explicit lba wins; otherwise the installer's partition scanner
+            // finds the esp / first fat partition. (satoru)
+            uint64_t lba = 0;
+            bool have_lba = false;
+            if (argc >= 4) { lba = (uint64_t)_atoi(argv[3]); have_lba = true; }
+            uint32_t ss = NVMe::GetLBASize(); if (!ss) ss = 512;
+            if (!have_lba) {
+                Installer::Rescan();
+                for (int i = 0; i < Installer::GetPartitionCount(); i++) {
+                    InstallerPartitionInfo* part = Installer::GetPartition(i);
+                    if (!part || !part->present) continue;
+                    if (part->fs_type == INST_FS_FAT32 || part->esp) {
+                        lba = part->start_lba;
+                        have_lba = true;
+                        break;
+                    }
+                }
+            }
+            if (have_lba &&
+                FAT32::Mount(lc_fat_nvme_read, lc_fat_nvme_write, nullptr,
+                             lba * ss) == 0) {
+                g_fat_backing = LC_FAT_NVME;
+                g_fat_part_lba = lba;
+                p = _sa(out, p, mx, "mounted fat32 from nvme @ lba ");
+                p = _sau(out, p, mx, (unsigned int)lba);
+                p = _sa(out, p, mx, "\nbrowse with: fls /   fcat /FILE\n");
+                _log_runtime_event("mount", "fat32-mounted", "nvme partition");
+                return p;
+            }
+            return _sa(out, 0, mx, "mount: no mountable fat32 volume found\n"
+                                   "usage: mount fat32 [usb|nvme] [start_lba]\n");
+        }
+        return _sa(out, 0, mx, "usage: mount fat32 [usb|nvme] [start_lba]\n");
+    }
+
     p = _sa(out, p, mx, "kvfs on / type kvfs (rw)\n");
     p = _sa(out, p, mx, "tmpfs on /tmp type tmpfs (rw)\n");
     p = _sa(out, p, mx, "devfs on /dev type devfs (rw)\n");
     p = _sa(out, p, mx, "procfs on /proc type procfs (ro)\n");
+    if (FAT32::IsMounted() && g_fat_backing != LC_FAT_NONE) {
+        p = _sa(out, p, mx, g_fat_backing == LC_FAT_USB
+                            ? "fat32 on (fls/fcat) type vfat (rw) [usb msd @ lba "
+                            : "fat32 on (fls/fcat) type vfat (rw) [nvme @ lba ");
+        p = _sau(out, p, mx, (unsigned int)g_fat_part_lba);
+        p = _sa(out, p, mx, "]\n");
+    }
     return p;
+}
+
+int LinuxCmds::cmd_umount(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    if (!FAT32::IsMounted() || g_fat_backing == LC_FAT_NONE) {
+        return _sa(out, 0, mx, "umount: no fat32 volume mounted\n");
+    }
+    FAT32::Unmount();   // flushes the write-back cache first (satoru)
+    g_fat_backing = LC_FAT_NONE;
+    g_fat_usb_dev = -1;
+    _log_runtime_event("mount", "fat32-unmounted", nullptr);
+    return _sa(out, 0, mx, "fat32 volume unmounted (cache flushed)\n");
+}
+
+int LinuxCmds::cmd_fls(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (!FAT32::IsMounted() || g_fat_backing == LC_FAT_NONE) {
+        return _sa(out, 0, mx, "fls: mount a volume first (mount fat32)\n");
+    }
+    const char* path = (argc > 1) ? argv[1] : "/";
+    int n = FAT32::ListDir(path, out, mx);
+    if (n < 0) return _sa(out, 0, mx, "fls: no such directory on the fat volume\n");
+    if (n == 0) return _sa(out, 0, mx, "(empty)\n");
+    return n;
+}
+
+int LinuxCmds::cmd_fcat(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (!FAT32::IsMounted() || g_fat_backing == LC_FAT_NONE) {
+        return _sa(out, 0, mx, "fcat: mount a volume first (mount fat32)\n");
+    }
+    if (argc < 2) return _sa(out, 0, mx, "usage: fcat /PATH/FILE\n");
+    int sz = FAT32::GetFileSize(argv[1]);
+    if (sz < 0) return _sa(out, 0, mx, "fcat: no such file on the fat volume\n");
+    int want = sz < mx - 1 ? sz : mx - 1;
+    int n = FAT32::ReadFile(argv[1], out, (uint32_t)want);
+    if (n < 0) return _sa(out, 0, mx, "fcat: read error\n");
+    out[n] = 0;
+    if (n < sz) {
+        // note the truncation honestly rather than pretending eof (satoru)
+        n = _sa(out, n, mx, "\n[fcat: truncated]\n");
+    }
+    return n;
 }
 
 int LinuxCmds::cmd_dmesg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
@@ -1544,27 +1850,122 @@ int LinuxCmds::cmd_drivers(KuronoShell* sh, int argc, const char** argv, char* o
 
 //  extended driver/hardware introspection commands
 
+// print a size in MiB or GiB. integer only - the kernel is built -mno-sse.
+// (satoru)
+static int _sz(char* out, int p, int mx, uint64_t bytes) {
+    uint64_t mib = bytes / (1024ull * 1024ull);
+    if (mib >= 1024) { p = _sa64(out, p, mx, mib / 1024); p = _sa(out, p, mx, "G"); }
+    else             { p = _sa64(out, p, mx, mib);        p = _sa(out, p, mx, "M"); }
+    return p;
+}
+
+static const char* _fsname(InstallerFsType t) {
+    switch (t) {
+        case INST_FS_FAT32: return "fat32";
+        case INST_FS_EXT4:  return "ext4";
+        default:            return "-";
+    }
+}
+
+// pad to a column so the table lines up without printf width specifiers. (satoru)
+static int _pad(char* out, int p, int mx, int from, int width) {
+    for (int i = p - from; i < width && p < mx - 1; i++) out[p++] = ' ';
+    return p;
+}
+
 int LinuxCmds::cmd_lsblk(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh; (void)argc; (void)argv;
     int p = 0;
-    p = _sa(out, p, mx, "NAME    MAJ:MIN RM   SIZE RO TYPE MOUNTPOINT\n");
-    if (NVMe::IsDetected()) {
-        uint64_t cap = NVMe::GetCapacityLBA();
-        uint32_t lba = NVMe::GetLBASize();
-        uint64_t mb = (cap * lba) / (1024 * 1024);
-        p = _sa(out, p, mx, "nvme0n1 259:0    0  ");
-        p = _sa64(out, p, mx, mb);
-        p = _sa(out, p, mx, "M  0 disk\n");
-        p = _sa(out, p, mx, "|-nvme0n1p1          0  ");
-        p = _sa64(out, p, mx, mb > 64 ? mb - 64 : mb);
-        p = _sa(out, p, mx, "M  0 part /\n");
-    } else {
-        p = _sa(out, p, mx, "sda      8:0    0   256M  0 disk\n");
-        p = _sa(out, p, mx, "|-sda1   8:1    0   200M  0 part /\n");
-        p = _sa(out, p, mx, "|-sda2   8:2    0    56M  0 part /home\n");
+
+    // this used to print a HARDCODED partition table - an invented nvme0n1p1
+    // mounted at "/", and a fabricated sda1//sda2 at "/" and "/home" whenever no
+    // nvme was present. On a rescue tool that is worse than useless: it shows the
+    // user partitions that do not exist and mountpoints that were never checked.
+    // Everything below is read from the block registry and the real gpt/mbr scan.
+    // (satoru)
+    if (BlockDev::Count() == 0) {
+        return _sa(out, p, mx, "no block devices detected\n");
     }
-    p = _sa(out, p, mx, "sr0     11:0    1  1024M  0 rom\n");
-    p = _sa(out, p, mx, "kvfs     0:1    0     4M  0 virt /\n");
+
+    p = _sa(out, p, mx, "NAME         SIZE  TYPE  FS      LABEL\n");
+
+    for (int i = 0; i < BlockDev::Count(); i++) {
+        BlockDevice* d = BlockDev::Get(i);
+        if (!d) continue;
+        int row = p;
+        p = _sa(out, p, mx, d->name);
+        p = _pad(out, p, mx, row, 13);
+        p = _sz(out, p, mx, d->capacity_lba * d->sector_size);
+        p = _pad(out, p, mx, row, 19);
+        p = _sa(out, p, mx, "disk  -       ");
+        p = _sa(out, p, mx, d->model[0] ? d->model : "");
+        p = _sa(out, p, mx, "\n");
+
+        // partitions belonging to this disk, matched by the installer's disk
+        // index rather than by guessing from the name. (satoru)
+        for (int j = 0; j < Installer::GetPartitionCount(); j++) {
+            InstallerPartitionInfo* pt = Installer::GetPartition(j);
+            if (!pt || !pt->present) continue;
+            InstallerDiskInfo* pd = Installer::GetDisk(pt->disk_index);
+            if (!pd || !_seq(pd->name, d->name)) continue;
+
+            int prow = p;
+            p = _sa(out, p, mx, "|-");
+            p = _sa(out, p, mx, pt->name);
+            p = _pad(out, p, mx, prow, 13);
+            p = _sz(out, p, mx, pt->size_bytes);
+            p = _pad(out, p, mx, prow, 19);
+            p = _sa(out, p, mx, "part  ");
+            int frow = p;
+            p = _sa(out, p, mx, _fsname(pt->fs_type));
+            p = _pad(out, p, mx, frow, 8);
+            p = _sa(out, p, mx, pt->label[0] ? pt->label : "-");
+            if (pt->esp) p = _sa(out, p, mx, "  [ESP]");
+            p = _sa(out, p, mx, "\n");
+        }
+    }
+    return p;
+}
+
+// blkid - per-partition identity. the type guid is what actually distinguishes
+// an esp from a linux root, so print it rather than guessing from the label.
+// (satoru)
+int LinuxCmds::cmd_blkid(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    int p = 0;
+    if (Installer::GetPartitionCount() == 0) {
+        return _sa(out, p, mx, "no partitions found (run `lsblk` first, or no disks attached)\n");
+    }
+    for (int j = 0; j < Installer::GetPartitionCount(); j++) {
+        InstallerPartitionInfo* pt = Installer::GetPartition(j);
+        if (!pt || !pt->present) continue;
+        p = _sa(out, p, mx, "/dev/");
+        p = _sa(out, p, mx, pt->name);
+        p = _sa(out, p, mx, ": TYPE=\"");
+        p = _sa(out, p, mx, _fsname(pt->fs_type));
+        p = _sa(out, p, mx, "\"");
+        if (pt->label[0]) {
+            p = _sa(out, p, mx, " LABEL=\"");
+            p = _sa(out, p, mx, pt->label);
+            p = _sa(out, p, mx, "\"");
+        }
+        p = _sa(out, p, mx, " SCHEME=");
+        p = _sa(out, p, mx, pt->scheme == INST_SCHEME_GPT ? "gpt" : "mbr");
+        if (pt->scheme == INST_SCHEME_GPT) {
+            p = _sa(out, p, mx, " PARTTYPE=");
+            static const char* hex = "0123456789abcdef";
+            for (int b = 0; b < 16 && p < mx - 3; b++) {
+                out[p++] = hex[(pt->type_guid[b] >> 4) & 0xF];
+                out[p++] = hex[pt->type_guid[b] & 0xF];
+            }
+        } else {
+            p = _sa(out, p, mx, " MBRTYPE=0x");
+            static const char* hex2 = "0123456789abcdef";
+            if (p < mx - 3) { out[p++] = hex2[(pt->mbr_type >> 4) & 0xF]; out[p++] = hex2[pt->mbr_type & 0xF]; }
+        }
+        if (pt->esp) p = _sa(out, p, mx, " ESP");
+        p = _sa(out, p, mx, "\n");
+    }
     return p;
 }
 

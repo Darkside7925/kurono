@@ -5,6 +5,7 @@
 #include "../drivers/rtc.h"
 #include "../fs/kvfs.h"
 #include "../proc/kernel_locks.h"   // g_vfs_lock - panic-path deadlock guard
+#include "../drivers/disklog.h"    // save the log to KURONO.LOG before the reboot (satoru)
 #include "../../logo.h"
 
 namespace {
@@ -91,6 +92,12 @@ namespace {
         const uint32_t level_assert = (1u << 14);
         const uint32_t trigger_edge = 0u;
         const uint32_t shorthand_all_but_self = (3u << 18);
+        if (apic_base & (1ULL << 10)) {
+            // x2apic (locked on): the mmio window is dead, the icr is msr 0x830 (satoru)
+            uint64_t v = delivery_mode_nmi | level_assert | trigger_edge | shorthand_all_but_self;
+            asm volatile("wrmsr" : : "a"((uint32_t)v), "d"((uint32_t)(v >> 32)), "c"(0x830u));
+            return;
+        }
         mmio_write32(icr_low, delivery_mode_nmi | level_assert | trigger_edge | shorthand_all_but_self);
     }
 
@@ -835,6 +842,9 @@ namespace {
     }
 
     [[noreturn]] static void reboot_or_halt() {
+        // bare metal has no serial port: get the log (panic dump included) onto
+        // the kurono partition before the auto reboot wipes the screen. (satoru)
+        DiskLog::PanicFlush();
         for (uint32_t secs = 5; secs > 0; secs--) {
             render_panic_status(secs);
             busy_delay(32000000);

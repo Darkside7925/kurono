@@ -18,6 +18,17 @@ namespace KernelProcesses {
     void SetGuiAutorun(const char* cmd);
     const char* GuiAutorun();
 
+    // how long the gui process waits after coming up before it fires the
+    // autorun. the default grace is pure dead time on the launch-to-paint
+    // clock, so kurono.fastrun=1 shrinks it for the startup-latency work.
+    // must be called before SpawnAll(). (satoru)
+    void SetAutorunDelayMs(uint32_t ms);
+
+    // kurono.fpsbench=1: make the gui loop composite every iteration with no
+    // frame pacing, so the [fps] serial line measures the render+present
+    // pipeline rather than the damage gate. must be set before SpawnAll(). (satoru)
+    void SetFpsBench(int mode);
+
     // arm a one-shot interactive ksa prompt demo (kurono.ksa.prompt boot gate).
     // once the desktop has presented a few frames the GUI process calls
     // KSA::PromptDemo() once, so a headless screendump can capture the real
@@ -30,4 +41,17 @@ namespace KernelProcesses {
     // script once, so a real on-screen animation is driven through the kj host
     // bindings (kss.transition/kss.set/ui.notify). (satoru)
     void ArmKjDemo();
+
+    // queue a shell command to run on the Shell kernel-process WITHOUT a
+    // terminal window (desktop launchers, e.g. the firefox icon). output goes
+    // to serial only. single slot: returns false if a previous detached
+    // command is still queued or running. (satoru)
+    bool RunShellCommandDetached(const char* cmd);
+
+    // last Timer::GetRealMs() the gui process stamped at its loop top - the
+    // graphics-loop heartbeat. PumpUI reads it to decide whether a live gui
+    // process already owns input + rendering (fresh heartbeat -> PumpUI must
+    // NOT run a second concurrent ui pipeline; that raced the wayland event
+    // stream and the compositor from another cpu). (satoru)
+    uint32_t LastGuiFrameMs();
 }

@@ -554,6 +554,24 @@ int KVFS::WriteFile_nolock(const char* path, const void* data, uint32_t len) {
     return KVFS_OK;
 }
 
+int KVFS::WriteFileStatic(const char* path, const void* data, uint32_t len) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    if (!data || len == 0) return WriteFile_nolock(path, data, len);
+    KVFSNode* node = Resolve_nolock(path);
+    if (!node) {
+        int r = CreateFile_nolock(path);
+        if (r != KVFS_OK) return r;
+        node = Resolve_nolock(path);
+        if (!node) return KVFS_ERR_NOT_FOUND;
+    }
+    if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    if (node->content && KernelHeap::IsValidBlock(node->content)) KernelHeap::Free(node->content);
+    node->content = (uint8_t*)data;
+    node->content_capacity = 0;
+    node->size = len;
+    return KVFS_OK;
+}
+
 int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
     SpinLockCpuGuard guard(g_vfs_lock);
     KVFSNode* node = Resolve_nolock(path);
@@ -564,6 +582,17 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
     // region freed elsewhere), reading or Free()ing it would feed garbage and
     // trip heap "bad magic" -> allocator corruption (the 63x-at-boot symptom).
     // drop it and start fresh. valid content is untouched. (satoru)
+    // borrowed (WriteFileStatic) content is valid but read-only: copy it out
+    // before appending rather than dropping it as stale. (satoru)
+    if (node->content && node->content_capacity == 0 && node->size > 0 &&
+        !KernelHeap::IsValidBlock(node->content)) {
+        uint32_t cap = kvfs_grow_cap(0, node->size + len);
+        uint8_t* own = (uint8_t*)KernelHeap::Alloc(cap);
+        if (!own) return KVFS_ERR_NO_MEM;
+        kmemcpy(own, node->content, node->size);
+        node->content = own;
+        node->content_capacity = cap;
+    }
     if (node->content && !KernelHeap::IsValidBlock(node->content)) {
         node->content = nullptr;
         node->content_capacity = 0;

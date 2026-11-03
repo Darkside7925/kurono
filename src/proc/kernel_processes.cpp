@@ -11,6 +11,7 @@
 #include "spinlock.h"
 #include "kernel_locks.h"
 #include "../kernel/types.h"
+#include "../kernel/heap.h"
 #include "../kernel/hrtimer.h"
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
@@ -25,8 +26,11 @@
 #include "../drivers/display_mgr.h"
 #include "../drivers/usb.h"
 #include "../drivers/e1000.h"
+#include "../system/ui_config.h"
 #include "../net/network.h"
+#include "../net/dhcp.h"
 #include "../net/tcpip.h"
+#include "../linux/linux_netbridge.h"   // task 30: wake inet pollers after the nic drain (satoru)
 #include "../system/input_manager.h"
 #include "../system/logging.h"
 #include "../ui/desktop.h"
@@ -102,6 +106,19 @@ bool RunShellCommandDetached(const char* cmd) {
     return true;
 }
 
+// autorun grace in ms; overridden by kurono.fastrun=1 before SpawnAll(). (satoru)
+static uint32_t g_autorun_delay_ms = 2000u;
+void SetAutorunDelayMs(uint32_t ms) { g_autorun_delay_ms = ms; }
+
+// kurono.fpsbench=1: forced-render benchmark mode (see the gate in the gui
+// loop). off by default - it pegs a core on purpose. (satoru)
+// 0 = off, 1 = forced render with NO pacing (max pipeline throughput),
+// 2 = forced render but KEEP the 60fps pacer - the realistic desktop case,
+// where the point is not throughput but how much bsp time the present
+// leaves for everything else. (satoru)
+static int g_fps_bench = 0;
+void SetFpsBench(int mode) { g_fps_bench = mode; }
+
 void SetGuiAutorun(const char* cmd) {
     if (!cmd) {
         g_gui_autorun_cmd[0] = 0;
@@ -135,6 +152,11 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
                 E1000::Poll();
             }
         }
+        // task 30: hand the drained rx to any parked poller NOW (outside the
+        // net lock - the wake takes the pollreg lock and must not nest). (satoru)
+        LinuxNetBridge::WakeRxPollers();
+        Network::RefreshLink();   // pick up a late link-up/down on the real nic (satoru)
+        Dhcp::Tick();             // lease acquisition, restarts itself on every link-up (satoru)
         Scheduler::SleepMs(10);   // RX latency-tolerant; 1ms over-polled an idle NIC (satoru)
     }
 }
@@ -202,6 +224,10 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     while (true) {
         HRTimer::Tick();
         Scheduler::ServiceSleepQueue();
+        // deferred group reaps (sig-9 from the kls syscall body, hal fault
+        // containment, sync quiesce timeouts): reap each queued group once its
+        // members are all off-cpu. never sleeps - one check per heartbeat. (satoru)
+        Scheduler::DrainDeferredReaps();
         // 50ms: IRQ0 already calls wake_due_processes() every tick, so this is a
         // backup heartbeat. 1ms was 1000 redundant wakeups/sec that kept the cpu
         // from idling (HLT) - the main VMware host-CPU burn. (satoru)
@@ -261,24 +287,30 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     }
 }
 
+extern "C" void ff_main_ring_dump();
+
 namespace {
 // Is anything that must keep rendering continuously currently live?
 // While ANY of these holds, the damage-gated loop renders every frame so a
 // missed MarkUIDirty() can never freeze an in-flight animation or video.
 // Conservative by design: when unsure, return true (render). (satoru)
+// which source last kept the loop rendering (0 = none), for the [gui] line.
+static int g_active_why = 0;
 static inline bool ui_activity_active() {
-    if (WindowManager::IsDragging())            return true;  // live drag/resize
-    if (WindowManager::HasActiveAnimations())   return true;  // open/close/min/max
-    if (Taskbar::IsAnimating())                 return true;  // menus/popups/cursor
-    if (Desktop::IsAnimating())                 return true;  // icon hover-pop fade
-    if (ControlCenter::IsAnimating())           return true;  // panel slide+fade
-    if (KSS::Anim::Active())                     return true;  // kss tween engine in flight
-    if (KSS::Sheet::Active())                    return true;  // kss keyframe track playing
-    if (NotificationManager::ActiveCount() > 0) return true;  // toasts in/hold/out
-    if (MediaPlayerApp::IsOpen())               return true;  // audio/video surface
-    if (DenjiApp::IsOpen())                     return true;  // kvid playback frames
-    if (TaskManagerApp::IsOpen())               return true;  // live perf graphs/list
-    return false;
+    int w = 0;
+    if (WindowManager::IsDragging())            w = 1;   // live drag/resize
+    else if (WindowManager::HasActiveAnimations()) w = 2; // open/close/min/max
+    else if (Taskbar::IsAnimating())            w = 3;   // menus/popups/cursor
+    else if (Desktop::IsAnimating())            w = 4;   // icon hover-pop fade
+    else if (ControlCenter::IsAnimating())      w = 5;   // panel slide+fade
+    else if (KSS::Anim::Active())               w = 6;   // kss tween engine in flight
+    else if (KSS::Sheet::Active())              w = 7;   // kss keyframe track playing
+    else if (NotificationManager::ActiveCount() > 0) w = 8; // toasts in/hold/out
+    else if (MediaPlayerApp::IsOpen())          w = 9;   // audio/video surface
+    else if (DenjiApp::IsOpen())                w = 10;  // kvid playback frames
+    else if (TaskManagerApp::IsOpen())          w = 11;  // live perf graphs/list
+    g_active_why = w;
+    return w != 0;
 }
 } // namespace
 
@@ -304,7 +336,7 @@ static inline bool ui_activity_active() {
     // past session init. (a 1s + rendered-frame gate variant was flaky: an
     // idle dirty-driven desktop can render too few frames to ever pass the
     // gate.) (satoru)
-    uint32_t autorun_target_ms = Timer::GetTicks() + 2000u;
+    uint32_t autorun_target_ms = Timer::GetTicks() + g_autorun_delay_ms;
 
     while (true) {
         // stamp the graphics-loop heartbeat for the watchdog before any work,
@@ -355,6 +387,7 @@ static inline bool ui_activity_active() {
             SpinLockCpuGuard guard(g_input_lock);
             Keyboard::Poll();
             Mouse::Poll();
+            USB::PollHID();   // inputprocess starves here for usb devices too (satoru)
         }
 
         // Track cursor movement: any pointer motion marks the UI dirty so the
@@ -491,6 +524,7 @@ static inline bool ui_activity_active() {
         if (frame_counter % 300 == 0) {
             TaskManagerApp::RefreshProcesses();
         }
+        if (frame_counter == 300) KernelHeap::LogMemReport("desktop");
 
         // Frame pacing to ~60fps. Timer::GetRealMs() is now sourced from the
         // PIT-IRQ scheduler clock (see timer.cpp GetRealMs), so it advances
@@ -506,15 +540,51 @@ static inline bool ui_activity_active() {
         // or (c) the ~250ms safety fallback is due (drives the clock/blink and
         // bounds any missed dirty source to a 250ms delay, never a permanent
         // freeze). (satoru)
-        constexpr uint32_t FALLBACK_MS = 250u;
+        // the fallback is a safety net, not a refresh rate: keep it to at most
+        // ~20% of the cpu by spacing it at 4x the last frame's cost. on real
+        // hardware a frame is a few ms and this stays 250ms; under emulation a
+        // full frame can take ~300ms, and a fixed 250ms fallback kept an idle
+        // desktop drawing 100% of the time, starving apps on the same core.
+        static uint32_t s_frame_cost_ms = 0;
+        const uint32_t FALLBACK_MS = s_frame_cost_ms * 4 > 250u ? s_frame_cost_ms * 4 : 250u;
         // advance the kss tween engine first so animated values progress and the
         // Active() check inside ui_activity_active() reflects in-flight tweens. then
         // advance the stylesheet keyframe layer against that same clock. (satoru)
         KSS::Anim::Tick(Timer::GetRealMs());
         KSS::Sheet::Tick();
+        ff_main_ring_dump();   // firefox main-thread syscall ring, self-paced to 20s
         bool dirty    = Graphics::ConsumeUIDirty();
+        if (Graphics::ConsumeFrameDue(Timer::GetRealMs())) dirty = true;
         bool active   = ui_activity_active();
         bool fallback = (Timer::GetRealMs() - last_render_ms) >= FALLBACK_MS;
+        // kurono.fpsbench=1: composite every iteration and skip the frame
+        // pacer, so [fps] measures the RENDER+PRESENT PIPELINE instead of the
+        // damage gate. without this an idle desktop legitimately reports ~4fps
+        // (the 250ms fallback) and any rendering change looks like noise. bench
+        // only - it deliberately pegs a core. (satoru)
+        if (g_fps_bench) { dirty = true; active = true; }
+        // every 60 rendered frames, say what drove them: how many were dirty,
+        // animation-driven (and by what), or the 250ms fallback. a desktop that
+        // should be idle but renders flat out shows up here.
+        {
+            static uint32_t n_dirty = 0, n_active = 0, n_fallback = 0, t0 = 0;
+            if (dirty || active || fallback) {
+                if (dirty) n_dirty++; else if (active) n_active++; else n_fallback++;
+                if (n_dirty + n_active + n_fallback >= 60) {
+                    uint32_t now = Timer::GetRealMs();
+                    SerialLogger::Log("[gui] 60 frames in "); SerialLogger::LogDec((int)(now - t0));
+                    SerialLogger::Log("ms last_cost="); SerialLogger::LogDec((int)s_frame_cost_ms);
+                    SerialLogger::Log("ms dirty="); SerialLogger::LogDec((int)n_dirty);
+                    SerialLogger::Log(" active="); SerialLogger::LogDec((int)n_active);
+                    SerialLogger::Log(" why="); SerialLogger::LogDec(g_active_why);
+                    SerialLogger::Log(" fallback="); SerialLogger::LogDec((int)n_fallback);
+                    SerialLogger::Log(" lastdirty=0x");
+                    SerialLogger::LogHex((uint32_t)(uintptr_t)Graphics::LastUIDirtyCaller());
+                    SerialLogger::Log("\r\n");
+                    n_dirty = n_active = n_fallback = 0; t0 = now;
+                }
+            }
+        }
         if (dirty || active) last_activity_ms = Timer::GetRealMs();
         if (!dirty && !active && !fallback) {
             // Nothing to draw. The old code BUSY-YIELDED here while "recently
@@ -539,7 +609,10 @@ static inline bool ui_activity_active() {
         // pace to the SELECTED refresh rate (display.refresh_hz -> Graphics
         // target fps), not a hardcoded 60; busy-yield on the tsc clock so
         // whpx/vmware timer coalescing can't stretch the frame. (satoru)
-        uint32_t frame_budget_ms = Graphics::GetTargetFrameTimeMs();
+        // modes 1 and 3 are UNCAPPED (max throughput); mode 2 keeps the 60fps
+        // pacer. mode 3 additionally forces a full-screen transfer. (satoru)
+        uint32_t frame_budget_ms = (g_fps_bench == 1 || g_fps_bench == 3)
+                                       ? 0u : Graphics::GetTargetFrameTimeMs();
         while (Timer::GetRealMs() - last_render_ms < frame_budget_ms) Scheduler::YieldNow();
         last_render_ms = Timer::GetRealMs();
 
@@ -557,31 +630,53 @@ static inline bool ui_activity_active() {
             frame_counter++;
             fps_counter++;
             uint32_t now_ms = Timer::GetRealMs();
+            static bool show_fps = false;
             if (now_ms - last_fps_ms >= 1000) {
                 displayed_fps = fps_counter;
                 fps_counter = 0;
                 last_fps_ms = now_ms;
+                show_fps = UIConfig::Bool("ui.fps", false);
+                // the 1hz [fps] serial mirror is for the fpsbench harness
+                // only, so a default boot stays quiet. (satoru)
+                if (g_fps_bench) {
+                    // mirror the framerate to serial. it was screen-only, so a
+                    // headless boot (which is how every harness here measures)
+                    // could not see the compositor's framerate at all - making any
+                    // rendering/acceleration change unmeasurable. NOTE this counts
+                    // COMPOSITED frames and the loop is damage-gated, so an idle
+                    // desktop legitimately reports a low number: it is "frames
+                    // actually painted", not a benchmark of the pipeline. throttled
+                    // to 1hz by the enclosing branch. (satoru)
+                    SerialLogger::Log("[fps] ");
+                    SerialLogger::LogDec((int)displayed_fps);
+                    SerialLogger::Log(" frames/s t=");
+                    SerialLogger::LogDec((int)(now_ms / 1000u));
+                    SerialLogger::Log("s\r\n");
+                }
             }
 
-            // FPS pill overlay - preserved verbatim from kernel_main.
-            char fps_str[16] = "FPS ";
-            char num_buf[8];
-            int val = (int)displayed_fps;
-            if (val == 0) { num_buf[0] = '0'; num_buf[1] = 0; }
-            else {
-                char tmp[8]; int n = 0;
-                while (val > 0 && n < 7) { tmp[n++] = '0' + (val % 10); val /= 10; }
-                for (int i = 0; i < n; i++) num_buf[i] = tmp[n - 1 - i];
-                num_buf[n] = 0;
+            // fps pill, off unless ui.fps=on (f12 hud shows it too) (satoru)
+            if (show_fps) {
+                char fps_str[16] = "FPS ";
+                char num_buf[8];
+                int val = (int)displayed_fps;
+                if (val == 0) { num_buf[0] = '0'; num_buf[1] = 0; }
+                else {
+                    char tmp[8]; int n = 0;
+                    while (val > 0 && n < 7) { tmp[n++] = '0' + (val % 10); val /= 10; }
+                    for (int i = 0; i < n; i++) num_buf[i] = tmp[n - 1 - i];
+                    num_buf[n] = 0;
+                }
+                int si = 4;
+                for (int i = 0; num_buf[i] && si < 14; i++) fps_str[si++] = num_buf[i];
+                fps_str[si] = 0;
+                int sw = Graphics::GetWidth();
+                int pill_w = si * 8 + 16;
+                int tx = sw - pill_w - 6;
+                int py = 6 + Taskbar::TopInset();    // below the modern menu bar (satoru)
+                Graphics::FillRoundedRect(tx, py, pill_w, 22, 11, 0xB0101020);
+                Graphics::DrawString(tx + 8, py + 4, fps_str, 0xFF00E676, 0xFF000000);
             }
-            int si = 4;
-            for (int i = 0; num_buf[i] && si < 14; i++) fps_str[si++] = num_buf[i];
-            fps_str[si] = 0;
-            int sw = Graphics::GetWidth();
-            int pill_w = si * 8 + 16;
-            int tx = sw - pill_w - 6;
-            Graphics::FillRoundedRect(tx, 6, pill_w, 22, 11, 0xB0101020);
-            Graphics::DrawString(tx + 8, 10, fps_str, 0xFF00E676, 0xFF000000);
 
             // performance hud overlay (toggle with f12). (satoru)
             PerfHUD::Render(displayed_fps, displayed_fps ? 1000u / displayed_fps : 0u);
@@ -590,6 +685,7 @@ static inline bool ui_activity_active() {
             Graphics::SwapBuffers();
             Graphics::PresentVirtioIfActive();   // push the frame to the host gpu when accelerated (no-op otherwise) (satoru)
         }
+        s_frame_cost_ms = Timer::GetRealMs() - last_render_ms;
 
         // Hand the CPU back so the other tiers progress.
         Scheduler::YieldNow();

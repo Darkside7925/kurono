@@ -93,8 +93,19 @@
 #define USB_HID_KEYBOARD   1
 #define USB_HID_MOUSE      2
 
+// mass-storage class bulk-only transport (bot) constants (satoru)
+#define USB_MSC_CLASS      0x08
+#define USB_MSC_PROTO_BOT  0x50
+#define USB_MSC_REQ_RESET  0xFF   // bulk-only mass storage reset (satoru)
+#define USB_MSC_REQ_GETLUN 0xFE   // get max lun (satoru)
+#define USB_CBW_SIG        0x43425355u   // "USBC" (satoru)
+#define USB_CSW_SIG        0x53425355u   // "USBS" (satoru)
+// bounce buffer for bulk data stages: 32kb aligned to 32kb so a single normal
+// trb never crosses a 64kb boundary (xhci data-buffer rule) (satoru)
+#define USB_BULK_BOUNCE    32768
+
 #define USB_MAX_DEVICES    16
-#define USB_MAX_PORTS      16
+#define USB_MAX_PORTS      32   // pch xhci on the owner laptop has 26 (satoru)
 
 // transfer ring length (in trbs) for ep0 and interrupt endpoints (satoru)
 #define USB_RING_TRBS      64
@@ -168,6 +179,88 @@ struct USBDeviceRuntime {
     uint8_t     intr_ep_id;        // xhci dci / doorbell target (satoru)
     uint8_t     intr_interval;     // bInterval from the endpoint descriptor (satoru)
     bool        intr_armed;        // a Normal trb is queued and awaiting completion (satoru)
+
+    // bulk in/out endpoint state for mass-storage (bot) devices. rings are
+    // allocated only when the config descriptor exposes a bulk pair. (satoru)
+    xHCI_TRB*   bulk_in_ring;
+    int         bulk_in_idx;
+    bool        bulk_in_cycle;
+    xHCI_TRB*   bulk_out_ring;
+    int         bulk_out_idx;
+    bool        bulk_out_cycle;
+    uint8_t     bulk_in_ep;        // endpoint address (0x8N) (satoru)
+    uint8_t     bulk_out_ep;       // endpoint address (0x0N) (satoru)
+    uint8_t     bulk_in_dci;       // xhci dci: in ep N -> 2N+1 (satoru)
+    uint8_t     bulk_out_dci;      // xhci dci: out ep N -> 2N (satoru)
+    uint16_t    bulk_in_mps;
+    uint16_t    bulk_out_mps;
+    uint8_t*    bulk_bounce;       // 32kb/32kb-aligned dma bounce buffer (satoru)
+
+    // bot / scsi state (valid when is_msd) (satoru)
+    bool        is_msd;
+    bool        msd_ready;         // inquiry + read-capacity succeeded (satoru)
+    uint8_t     msd_lun;
+    uint32_t    msd_tag;           // cbw tag counter (satoru)
+    uint64_t    msd_blocks;        // total lba count from read capacity (satoru)
+    uint32_t    msd_block_size;    // bytes per lba (satoru)
+
+    // usb audio: set while parsing the first 256 bytes of the config when an
+    // audio-class interface is seen (the audio driver then does its own full
+    // descriptor read). isoch endpoint state is owned by IsoOpen/IsoClose. (satoru)
+    bool        has_audio;
+    xHCI_TRB*   iso_ring;          // USB_ISO_RING_TRBS trbs, last one is the link (satoru)
+    int         iso_idx;           // next trb to fill (satoru)
+    bool        iso_cycle;
+    uint8_t     iso_dci;           // 0 = no isoch endpoint configured (satoru)
+    uint8_t     iso_ep_addr;
+    uint8_t     cfg_value;         // configuration last selected with SET_CONFIGURATION, 0 = none (satoru)
+};
+
+// isoch transfer ring: one page = 256 trbs (255 usable + link) (satoru)
+#define USB_ISO_RING_TRBS  256
+#define TRB_ISOCH          5
+#define TRB_ISO_SIA        (1u << 31)   // start isoch asap (satoru)
+#define USB_MAX_CTL        4            // xhci controllers driven at once (satoru)
+
+// everything one xhci controller owns. the usb driver used to hold this as
+// static members (one controller); it now lives in one of these per controller
+// and USB::S points at the one being operated on. controller 0 is the one the
+// driver always drove (most root ports); extra controllers are brought up after
+// it and polled in turn. (satoru)
+struct XhciState {
+    bool x_detected;
+    volatile uint8_t* x_bar0;
+    uint32_t x_cap_length;
+    uint32_t x_max_ports;
+    uint32_t x_max_slots;
+    USBDeviceInfo x_devices[USB_MAX_DEVICES];
+    USBDeviceRuntime x_runtime[USB_MAX_DEVICES];
+    int x_device_count;
+    uint32_t x_ctx_stride;
+    volatile uint8_t* x_erst_erdp_seg;
+    xHCI_TRB* x_cmd_ring;
+    xHCI_TRB* x_event_ring;
+    uint64_t* x_dcbaa;
+    int x_cmd_ring_idx;
+    bool x_cmd_cycle;
+    int x_event_ring_idx;
+    bool x_event_ccs;
+    // pci identity, for logs (satoru)
+    uint8_t  pci_bus, pci_dev, pci_func;
+    uint16_t pci_vid, pci_did;
+    uint32_t intr_done[USB_MAX_DEVICES];   // interrupt-in transfers that completed (kbdiag) (satoru)
+    uint32_t intr_err[USB_MAX_DEVICES];
+};
+
+// what the usb audio class driver needs to know about one isoch endpoint (satoru)
+struct UsbIsoParams {
+    uint8_t  ep_addr;          // 0x0N = out (satoru)
+    uint16_t max_packet;       // wMaxPacketSize bits 10:0
+    uint8_t  burst;            // hs: additional transactions per uframe; ss: bMaxBurst
+    uint8_t  mult;             // ss companion mult
+    uint8_t  b_interval;       // raw bInterval
+    uint32_t bytes_per_interval; // max esit payload
+    uint32_t avg_bytes;        // typical td length
 };
 
 class USB {
@@ -192,9 +285,24 @@ public:
                                 uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                                 void* data);
 
-    // bulk transfers
-    static bool BulkRead(int device, uint8_t endpoint, void* buffer, int length);
+    // bulk transfers. endpoint is the usb endpoint ADDRESS (0x8N = in, 0x0N =
+    // out) and must match one of the device's configured bulk endpoints.
+    // synchronous: builds a normal trb, rings the doorbell and waits for the
+    // transfer event. out_transferred (optional) reports the actual byte
+    // count (short packets are legal on bulk-in). (satoru)
+    static bool BulkRead(int device, uint8_t endpoint, void* buffer, int length,
+                         int* out_transferred = nullptr);
     static bool BulkWrite(int device, uint8_t endpoint, const void* buffer, int length);
+
+    // mass-storage (bulk-only transport, scsi) - populated automatically when
+    // a class-08 protocol-50 interface is configured during enumeration. a
+    // usb stick shows up here as a readable block device. (satoru)
+    static int      MsdFirstDevice();            // first ready msd index or -1 (satoru)
+    static bool     MsdIsReady(int device);
+    static uint64_t MsdBlocks(int device);       // capacity in lbas (satoru)
+    static uint32_t MsdBlockSize(int device);    // bytes per lba (satoru)
+    static bool     MsdRead(int device, uint64_t lba, uint32_t count, void* buf);
+    static bool     MsdWrite(int device, uint64_t lba, uint32_t count, const void* buf);
 
     // hid interrupt polling - call periodically (e.g. from the input poll
     // loop, ~1 khz) to drain transfer-completion + port-change events and
@@ -209,31 +317,54 @@ public:
 
     static void DumpInfo(char* out, int max_len);
 
+    // ---- more than one controller + the usb audio class driver's view (satoru) ----
+    // a gid names a device on any controller: controller * USB_MAX_DEVICES + index.
+    static int  ControllerCount();
+    static bool GidValid(int gid);
+    static const USBDeviceInfo*    GidInfo(int gid);
+    static const USBDeviceRuntime* GidRuntime(int gid);
+    // control transfer on a gid; a stalled control pipe is recovered (reset
+    // endpoint + set tr dequeue) so one unsupported request cannot kill ep0.
+    static bool GidControl(int gid, uint8_t bmRequestType, uint8_t bRequest,
+                           uint16_t wValue, uint16_t wIndex, uint16_t wLength, void* data);
+    // fetch configuration descriptor number `index` (whole block, up to cap bytes)
+    static bool GidGetConfig(int gid, int index, uint8_t* buf, int cap, int* out_len);
+    // deconfigure the slot's endpoints (hid interrupt etc) then SET_CONFIGURATION
+    static bool GidSetConfig(int gid, uint8_t config_value);
+    // isoch endpoint: allocate ring + endpoint context and Configure Endpoint.
+    // out_period_us is the service interval. IsoClose drops it again.
+    static bool IsoOpen(int gid, const UsbIsoParams& p, uint32_t* out_period_us);
+    static void IsoClose(int gid);
+    // queue ONE isoch td (single trb, sia set) of len bytes at data (identity
+    // mapped, must not cross a 64k boundary). false when the ring is full.
+    static bool IsoQueue(int gid, const void* data, uint32_t len, bool ioc);
+    static void IsoKick(int gid);                       // ring the endpoint doorbell
+    static uint32_t IsoEpState(int gid);                // endpoint context state 0..4
+    static bool IsoRecover(int gid);                    // reset + set tr dequeue after an error
+    // callbacks into the audio driver: isoch transfer events (from PollHID) and
+    // attach/detach of a device that has an audio interface.
+    typedef void (*IsoEventFn)(int gid, uint64_t trb_ptr, uint8_t cc, uint32_t residual);
+    typedef void (*AudioAttachFn)(int gid, bool attach);
+    typedef void (*AudioServiceFn)();
+    static void SetAudioHooks(IsoEventFn ev, AudioAttachFn att, AudioServiceFn svc);
+
+    // one-shot [kbdiag] line group: usb keyboards bound + interrupt completions (satoru)
+    static void LogKbDiag();
+    // [usbports] every controller, every port, raw portsc, even when empty (satoru)
+    static void LogAllPorts();
+
 private:
-    static bool detected;
-    static volatile uint8_t* bar0;
-    static uint32_t cap_length;
-    static uint32_t max_ports;
-    static uint32_t max_slots;
-
-    static USBDeviceInfo devices[USB_MAX_DEVICES];
-    static USBDeviceRuntime runtime[USB_MAX_DEVICES];
-    static int device_count;
-
-    // context geometry: 64 bytes unless HCCPARAMS1.CSZ says 64-bit contexts,
-    // in which case every context is 64 bytes already; ctx_stride is the byte
-    // distance between consecutive contexts in the input/device context block.
-    static uint32_t ctx_stride;
-    static volatile uint8_t* erst_erdp_seg; // current erdp segment base (satoru)
-
-    // ring buffers
-    static xHCI_TRB* cmd_ring;
-    static xHCI_TRB* event_ring;
-    static uint64_t* dcbaa;
-    static int cmd_ring_idx;
-    static bool cmd_cycle;
-    static int event_ring_idx;
-    static bool event_ccs;
+    static XhciState* S;                       // controller being operated on (satoru)
+    static XhciState  g_xs[USB_MAX_CTL];
+    static int        g_nctl;
+    static bool BringUp(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar_lo, uint32_t bar_hi,
+                        uint32_t ports, bool secondary);
+    static void PollOne(int ctl);
+    static void ProbeSecondaries();
+    static int  GidCtl(int gid) { return gid / USB_MAX_DEVICES; }
+    static int  GidIdx(int gid) { return gid % USB_MAX_DEVICES; }
+    static bool RecoverEp(int idx, uint8_t dci, xHCI_TRB* ring, int ring_idx, bool cycle);
+    static void ForeignEvent(const xHCI_TRB& ev);   // a transfer event nobody waited for (satoru)
 
     static uint32_t ReadCap(uint32_t offset);
     static uint32_t ReadOp(uint32_t offset);
@@ -266,6 +397,13 @@ private:
     static void ArmInterrupt(int idx);
     static void DispatchReport(int idx, const uint8_t* report, int len);
     static void ParseReportDescriptor(int idx, const uint8_t* rpt, int len);
+
+    // bulk / mass-storage internals (satoru)
+    static bool BulkTransferEP(int idx, bool dir_in, void* data, int len,
+                               int* out_transferred);
+    static bool MsdCommand(int idx, const uint8_t* cb, int cb_len, bool dir_in,
+                           void* data, uint32_t data_len, uint32_t* out_residue);
+    static bool MsdInit(int idx);
 
     // input-context accessors: stride-correct pointers into input_ctx (satoru)
     static uint32_t* InputControlCtx(int idx);   // input control context (satoru)

@@ -23,6 +23,29 @@ extern "C" {
     // pthreads smoke-test blob (satoru)
     extern const uint8_t _binary_pthread_test_elf_start[]  __attribute__((weak));
     extern const uint8_t _binary_pthread_test_elf_end[]    __attribute__((weak));
+    // signal-delivery self-test blob (satoru)
+    extern const uint8_t _binary_kld_e1000e_elf_start[]    __attribute__((weak));
+    extern const uint8_t _binary_kld_e1000e_elf_end[]      __attribute__((weak));
+    extern const uint8_t _binary_uatest_elf_start[]        __attribute__((weak));
+    // /dev/kshell gate blob (kurono.kshtest=1) (satoru)
+    extern const uint8_t _binary_kshtest_elf_start[]       __attribute__((weak));
+    // prebuilt static busybox - third-party linux binary smoke test (satoru)
+    extern const uint8_t _binary_busybox_elf_start[]       __attribute__((weak));
+    extern const uint8_t _binary_busybox_elf_end[]         __attribute__((weak));
+    // ai recovery client + optional baked api key (kurono.dsai=1) (satoru)
+    extern const uint8_t _binary_dsai_elf_start[]          __attribute__((weak));
+    extern const uint8_t _binary_dsai_elf_end[]            __attribute__((weak));
+    extern const uint8_t _binary_dsai_key_bin_start[]      __attribute__((weak));
+    extern const uint8_t _binary_dsai_key_bin_end[]        __attribute__((weak));
+    // recovery toolbox: a ustar of musl-static rescue tools (satoru)
+    extern const uint8_t _binary_recovery_tools_tar_start[] __attribute__((weak));
+    extern const uint8_t _binary_recovery_tools_tar_end[]   __attribute__((weak));
+    extern const uint8_t _binary_kshtest_elf_end[]         __attribute__((weak));
+    extern const uint8_t _binary_uatest_elf_end[]          __attribute__((weak));
+    extern const uint8_t _binary_irqlat_elf_start[]        __attribute__((weak));
+    extern const uint8_t _binary_irqlat_elf_end[]          __attribute__((weak));
+    extern const uint8_t _binary_signal_test_elf_start[]   __attribute__((weak));
+    extern const uint8_t _binary_signal_test_elf_end[]     __attribute__((weak));
     // dynamic musl pie blob - first ld-kurono dynamic-load test (satoru)
     extern const uint8_t _binary_dyntest_elf_start[]       __attribute__((weak));
     extern const uint8_t _binary_dyntest_elf_end[]         __attribute__((weak));
@@ -123,6 +146,114 @@ inline const uint8_t* PthreadTestData() { return _binary_pthread_test_elf_start;
 inline uint32_t PthreadTestSize() {
     return (uint32_t)((uintptr_t)_binary_pthread_test_elf_end -
                       (uintptr_t)_binary_pthread_test_elf_start);
+}
+
+// signal-delivery self-test accessors (satoru)
+inline bool HasSignalTest() {
+    return _binary_signal_test_elf_start != nullptr &&
+           _binary_signal_test_elf_end   != nullptr &&
+           +_binary_signal_test_elf_end > +_binary_signal_test_elf_start;
+}
+inline const uint8_t* SignalTestData() { return _binary_signal_test_elf_start; }
+inline uint32_t SignalTestSize() {
+    return (uint32_t)((uintptr_t)_binary_signal_test_elf_end -
+                      (uintptr_t)_binary_signal_test_elf_start);
+}
+
+// userspace wake-latency probe accessors (kurono.irqlat) (satoru)
+inline bool HasIrqLat() {
+    return _binary_irqlat_elf_start != nullptr &&
+           _binary_irqlat_elf_end   != nullptr &&
+           +_binary_irqlat_elf_end > +_binary_irqlat_elf_start;
+}
+inline const uint8_t* IrqLatData() { return _binary_irqlat_elf_start; }
+inline uint32_t IrqLatSize() {
+    return (uint32_t)((uintptr_t)_binary_irqlat_elf_end -
+                      (uintptr_t)_binary_irqlat_elf_start);
+}
+
+// KLD driver-container accessors (kurono.kld=1) (satoru)
+inline bool HasKldE1000e() {
+    return _binary_kld_e1000e_elf_start != nullptr &&
+           _binary_kld_e1000e_elf_end   != nullptr &&
+           +_binary_kld_e1000e_elf_end > +_binary_kld_e1000e_elf_start;
+}
+inline const uint8_t* KldE1000eData() { return _binary_kld_e1000e_elf_start; }
+inline uint32_t KldE1000eSize() {
+    return (uint32_t)((uintptr_t)_binary_kld_e1000e_elf_end -
+                      (uintptr_t)_binary_kld_e1000e_elf_start);
+}
+
+// user-pointer validation test accessors (kurono.uatest=1) (satoru)
+inline bool HasUaTest() {
+    return _binary_uatest_elf_start != nullptr &&
+           _binary_uatest_elf_end   != nullptr &&
+           +_binary_uatest_elf_end > +_binary_uatest_elf_start;
+}
+inline const uint8_t* UaTestData() { return _binary_uatest_elf_start; }
+inline uint32_t UaTestSize() {
+    return (uint32_t)((uintptr_t)_binary_uatest_elf_end -
+                      (uintptr_t)_binary_uatest_elf_start);
+}
+
+// /dev/kshell gate accessors (kurono.kshtest=1) (satoru)
+inline bool HasKshTest() {
+    return _binary_kshtest_elf_start != nullptr &&
+           _binary_kshtest_elf_end   != nullptr &&
+           +_binary_kshtest_elf_end > +_binary_kshtest_elf_start;
+}
+inline const uint8_t* KshTestData() { return _binary_kshtest_elf_start; }
+inline uint32_t KshTestSize() {
+    return (uint32_t)((uintptr_t)_binary_kshtest_elf_end -
+                      (uintptr_t)_binary_kshtest_elf_start);
+}
+
+// busybox accessors (kurono.bbtest=1) (satoru)
+inline bool HasBusybox() {
+    return _binary_busybox_elf_start != nullptr &&
+           _binary_busybox_elf_end   != nullptr &&
+           +_binary_busybox_elf_end > +_binary_busybox_elf_start;
+}
+inline const uint8_t* BusyboxData() { return _binary_busybox_elf_start; }
+inline uint32_t BusyboxSize() {
+    return (uint32_t)((uintptr_t)_binary_busybox_elf_end -
+                      (uintptr_t)_binary_busybox_elf_start);
+}
+
+// ai recovery client accessors (kurono.dsai=1) (satoru)
+inline bool HasDsai() {
+    return _binary_dsai_elf_start != nullptr &&
+           _binary_dsai_elf_end   != nullptr &&
+           +_binary_dsai_elf_end > +_binary_dsai_elf_start;
+}
+inline const uint8_t* DsaiData() { return _binary_dsai_elf_start; }
+inline uint32_t DsaiSize() {
+    return (uint32_t)((uintptr_t)_binary_dsai_elf_end -
+                      (uintptr_t)_binary_dsai_elf_start);
+}
+// the api key blob is absent from a default build - HasDsaiKey() is the
+// only thing that should ever gate reading it. (satoru)
+inline bool HasDsaiKey() {
+    return _binary_dsai_key_bin_start != nullptr &&
+           _binary_dsai_key_bin_end   != nullptr &&
+           +_binary_dsai_key_bin_end > +_binary_dsai_key_bin_start;
+}
+inline const uint8_t* DsaiKeyData() { return _binary_dsai_key_bin_start; }
+inline uint32_t DsaiKeySize() {
+    return (uint32_t)((uintptr_t)_binary_dsai_key_bin_end -
+                      (uintptr_t)_binary_dsai_key_bin_start);
+}
+
+// recovery toolbox accessors - absent unless the tar was staged at build (satoru)
+inline bool HasRecoveryTools() {
+    return _binary_recovery_tools_tar_start != nullptr &&
+           _binary_recovery_tools_tar_end   != nullptr &&
+           +_binary_recovery_tools_tar_end > +_binary_recovery_tools_tar_start;
+}
+inline const uint8_t* RecoveryToolsData() { return _binary_recovery_tools_tar_start; }
+inline uint32_t RecoveryToolsSize() {
+    return (uint32_t)((uintptr_t)_binary_recovery_tools_tar_end -
+                      (uintptr_t)_binary_recovery_tools_tar_start);
 }
 
 // dynamic musl pie accessors (satoru)

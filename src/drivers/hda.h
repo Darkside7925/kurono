@@ -122,7 +122,7 @@ struct HDAStreamFormat {
     uint8_t  channels;      // 1=mono, 2=stereo
 };
 
-#define HDA_MAX_CODECS   4
+#define HDA_MAX_CODECS   15   // statests has 15 codec address bits (satoru)
 #define HDA_MAX_NODES    32
 #define HDA_BDL_ENTRIES  32
 #define HDA_BUFFER_SIZE  (HDA_BDL_ENTRIES * 4096)  // 128kb
@@ -131,6 +131,10 @@ class HDAudio {
 public:
     static bool Init();
     static bool IsDetected();
+
+    // re-run controller + codec bring-up and restart the stream without a
+    // reboot ("audio restart"). (satoru)
+    static bool Restart();
 
     // codec info
     static int  GetCodecCount();
@@ -161,7 +165,13 @@ public:
     static uint32_t RingQueuedBytes();
     static uint32_t RingChunkBytes();
 
+    // idle housekeeping: blank the cyclic buffer behind the dma position so a
+    // stopped mixer does not leave the controller replaying stale samples.
+    // returns true while another call is needed. (satoru)
+    static bool     ScrubIdle(bool first);
+
 private:
+    friend struct HdaImpl;   // bring-up / codec scan helpers in hda.cpp (satoru)
     static bool detected;
     static volatile uint8_t* bar0;
 
@@ -215,9 +225,7 @@ private:
     static bool WaitRIRB(uint32_t* response, int timeout);
 
     // codec discovery
-    static bool ProbeCodecs();
     static int  FindAFG(int cad);          // locate the audio function group node (satoru)
-    static bool FindOutputPath(int cad);
 
     // stream setup
     static uint16_t EncodeFormat(uint32_t sample_rate, uint8_t bits, uint8_t channels);

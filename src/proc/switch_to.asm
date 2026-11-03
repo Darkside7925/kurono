@@ -50,7 +50,30 @@ scheduler_switch_to:
     pop  rbx
     pop  rbp
     popfq
+    ; ── last-instant return-address guard (the ring-0 RIP=0x3 corruptor) ──
+    ; A C-side check in perform_switch fired ZERO times across 20 boots while a
+    ; RIP=0x3 #UD still happened, which proves the slot is clean at check time
+    ; and garbage by the time we get here: another cpu writes it inside that
+    ; window. Checking HERE narrows the window to these two instructions, the
+    ; tightest it can be without a hardware watchpoint. Nothing below 1MB is
+    ; kernel text (that range is real-mode/BIOS), so this cannot false-positive.
+    ; Falls through to `ret` on the overwhelmingly common good path: one cmp and
+    ; a not-taken branch per switch. (satoru)
+    cmp  qword [rsp], 0x100000
+    jb   .ret_corrupt
     ret
+.ret_corrupt:
+    ; hand the forensics to C while the evidence is still live. rdi = the bad
+    ; value we were about to jump to, rsi = the stack slot it came from. does
+    ; not return. (satoru)
+    mov  rdi, [rsp]
+    mov  rsi, rsp
+    extern kp_ret_corrupt_report
+    call kp_ret_corrupt_report
+.hang:
+    cli
+    hlt
+    jmp  .hang
 
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  void scheduler_jump_to(uint64_t saved_rsp);

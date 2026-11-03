@@ -8,7 +8,7 @@
 #define WM_MIN_WIDTH      140
 #define WM_MIN_HEIGHT     100
 #define WM_SHADOW_SIZE      6
-#define WM_CORNER_RADIUS   10
+#define WM_CORNER_RADIUS   12
 
 enum WindowState {
     WIN_CLOSED = 0,
@@ -66,7 +66,8 @@ struct Window {
     bool dirty;
 
     // ── compositor: per-window animation + opacity ────────────────────
-    // anim_kind: 0=none, 1=open, 2=close, 3=minimize, 4=restore.
+    // anim_kind: 0=none, 1=open, 2=close, 3=minimize, 4=restore (from
+    // maximized), 5=unminimize (rise out of the taskbar tile).
     // anim_start_ms is in Timer::GetRealMs() units; phase = clamp01
     // ((now - start) / duration).  CLOSE / MINIMIZE animations defer
     // the actual state transition until phase reaches 1.0 so the
@@ -77,6 +78,18 @@ struct Window {
     unsigned char anim_kind;
     unsigned char alpha;            // 0..255
     short anchor_x, anchor_y;       // taskbar target for minimize anim
+
+    // motion state (see ui/wm_motion.h). close/minimize/unminimize draw from
+    // a one-time capture of the window's pixels; minimize keeps it so the
+    // restore needs no new capture. open grows out of the taskbar tile at
+    // open_ox/open_oy in its colour. catch_* drives the tile's squash/press
+    // spring: 1 = minimize landing, 2 = restore press. (satoru)
+    unsigned int* snap_px;
+    int snap_w, snap_h;
+    short open_ox, open_oy;
+    unsigned int open_tint;
+    unsigned int catch_ms;
+    unsigned char catch_kind;
 
     // titlebar traffic-light hover/press: which button the pointer is over
     // (0=close,1=min,2=max, -1=none) and the ms timestamp of the last press so
@@ -96,6 +109,13 @@ struct Window {
     // a window belongs to the monitor whose rect contains its center; the
     // wm recomputes this on move/resize. defaults to 0 (primary). (satoru)
     int monitor_id;
+
+    // app icon id (AppIcons::Id) shown in the titlebar + taskbar button.
+    // -1 = none pinned: the renderers derive one from the title text. set
+    // explicitly by the wayland bridge (xdg_toplevel.set_app_id) so a
+    // client whose title changes (e.g. firefox page titles) keeps its
+    // own logo. (satoru)
+    int app_icon;
 };
 
 class WindowManager {
@@ -114,6 +134,8 @@ public:
 
     // window ops
     static void Minimize(int id);
+    // bring a minimized window back with the rise-from-tile motion. (satoru)
+    static void Unminimize(int id);
     static void Maximize(int id);
     static void Restore(int id);
     static void ToggleMaximize(int id);
@@ -183,6 +205,16 @@ public:
     // The damage-gated GUI loop forces continuous rendering while this holds
     // so animations never stall mid-flight. (satoru)
     static bool HasActiveAnimations();
+
+    // minimize/unminimize pour into and out of the taskbar, so they draw in a
+    // pass after the taskbar instead of inside Render(). (satoru)
+    static void RenderMotionOverlay();
+
+    // the taskbar asks how to draw a window's tile: scale (Q8, 256 = rest)
+    // and a white flash alpha, given the tile rect so the wm can keep it
+    // damaged. false when the tile is at rest. (satoru)
+    static bool TaskbarCatch(int win_id, int tx, int ty, int tw, int th,
+                             int& sx_q8, int& sy_q8, int& flash);
     static WMAction GetCurrentAction();
 
     // ── cached-desktop snapshot during a window drag ──────────────────
@@ -258,6 +290,11 @@ private:
     static bool mouse_is_down;
 
     static void RenderTitlebar(Window* win);
+    // window motion renderers; t is design-ms since the animation began.
+    // (satoru)
+    static void RenderOpenMotion(Window* win, int t);
+    static void RenderCloseMotion(Window* win, int t);
+    static void RenderPourMotion(Window* win, int t, bool rising);
     static void RenderShadow(Window* win);
     // draw one settled (non-animated) window: optional shadow, body, titlebar,
     // border and content. shared by the main z-order loop and the dragged-only

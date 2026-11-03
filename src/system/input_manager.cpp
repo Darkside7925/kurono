@@ -1,4 +1,7 @@
 #include "input_manager.h"
+#include "../ui/window_manager.h"
+#include "../ui/wayland_server.h"
+#include "../apps/terminal.h"
 #include "../drivers/serial.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
@@ -11,6 +14,9 @@ KeyLayout InputManager::current_layout = KeyLayout::QWERTY_US;
 Key InputManager::last_key = KEY_UNKNOWN;
 bool InputManager::last_key_pressed = false;
 int InputManager::last_device_id = -1;
+
+// event ring drop count [0] and key-downs queued [1], shown in [hb] (satoru)
+volatile uint32_t g_imdbg[4] = {0};
 
 namespace {
 constexpr int IM_MAX_SUBSCRIBERS = 16;
@@ -36,7 +42,8 @@ bool push_event(int device_id, Key key, bool pressed) {
     uint32_t h = __atomic_load_n(&g_ev_head, __ATOMIC_RELAXED);
     uint32_t t = __atomic_load_n(&g_ev_tail, __ATOMIC_ACQUIRE);
     uint32_t next = (h + 1) % IM_EVENT_RING;
-    if (next == (t % IM_EVENT_RING)) return false;
+    if (next == (t % IM_EVENT_RING)) { __atomic_add_fetch(&g_imdbg[0], 1, __ATOMIC_RELAXED); return false; }
+    if (pressed) __atomic_add_fetch(&g_imdbg[1], 1, __ATOMIC_RELAXED);
     g_events[h % IM_EVENT_RING] = {device_id, key, pressed};
     __atomic_store_n(&g_ev_head, next, __ATOMIC_RELEASE);
     return true;
@@ -155,6 +162,18 @@ void InputManager::Poll() {
     // doubled the 8042 status-port reads + VMware backdoor probes (every one a
     // VM-exit) for zero benefit. This now only drains the event ring. (satoru)
 
+    // keys forwarded to a wayland window; released if focus leaves it. (satoru)
+    TerminalApp::PtyPoll();   // hang up a pty session whose window was closed (satoru)
+    static bool s_wl_down[KEY_WAKE + 1] = {};
+    static int  s_wl_win = -1;
+    Window* fw = WindowManager::GetFocusedWindow();
+    int wl_win = (fw && fw->state != WIN_CLOSED && WaylandServer::IsWaylandWindow(fw->id)) ? fw->id : -1;
+    if (wl_win != s_wl_win) {
+        for (int k = 1; k <= (int)KEY_WAKE; k++)
+            if (s_wl_down[k]) { WaylandServer::ForwardKey(k, false, 0); s_wl_down[k] = false; }
+        s_wl_win = wl_win;
+    }
+
     // Drain pending key events onto the routing fabric.
     ImEvent ev;
     while (pop_event(ev)) {
@@ -163,6 +182,26 @@ void InputManager::Poll() {
         last_device_id = ev.device_id;
         if (ev.pressed) OnKeyDown(ev.device_id, ev.key);
         else            OnKeyUp(ev.device_id, ev.key);
+        // modifiers from the event stream itself, not the driver's latest state,
+        // so queued events keep their own shift/ctrl. (satoru)
+        static bool s_held[KEY_WAKE + 1] = {};
+        int k = (int)ev.key;
+        if (k > 0 && k <= (int)KEY_WAKE) s_held[k] = ev.pressed;
+        // a terminal running a pty program gets raw key events (arrows, ctrl, alt) (satoru)
+        if (ev.pressed)
+            TerminalApp::PtyKeyEvent(k, s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT],
+                                     s_held[KEY_LCTRL] || s_held[KEY_RCTRL],
+                                     s_held[KEY_LALT] || s_held[KEY_RALT]);
+        // raw key edges -> the focused wayland client (gtk reads evdev keys). (satoru)
+        if (wl_win >= 0) {
+            uint32_t mods = 0;
+            if (s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT]) mods |= WaylandServer::WL_MOD_SHIFT;
+            if (s_held[KEY_LCTRL]  || s_held[KEY_RCTRL])  mods |= WaylandServer::WL_MOD_CTRL;
+            if (s_held[KEY_LALT]   || s_held[KEY_RALT])   mods |= WaylandServer::WL_MOD_ALT;
+            if (s_held[KEY_LSUPER] || s_held[KEY_RSUPER]) mods |= WaylandServer::WL_MOD_META;
+            WaylandServer::ForwardKey(k, ev.pressed, mods);
+            if (k > 0 && k <= (int)KEY_WAKE) s_wl_down[k] = ev.pressed;
+        }
     }
 
     SyncUSBHIDDevices();

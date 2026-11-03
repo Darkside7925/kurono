@@ -32,14 +32,41 @@ static_assert(__builtin_offsetof(PerCpu, user_rsp_save) == 0,
 static_assert(__builtin_offsetof(PerCpu, kernel_rsp) == 8,
               "syscall stub reads the kernel rsp at gs:8 (satoru)");
 
+//  acpi root pointer handed over by the bootloader (multiboot2 tag 14/15, built
+//  by the uefi loader from the efi configuration table). uefi has no legacy
+//  0xe0000 rsdp, so without this the madt is invisible there. the rsdp is
+//  copied into kernel-owned static memory; Rsdp() returns its address or 0. (satoru)
+namespace BootAcpi {
+    void     SetRsdp(const uint8_t* src, uint32_t avail);  // validates + copies (satoru)
+    void     SetEfiBoot();                                 // mb2 tag 12 seen (satoru)
+    uint64_t Rsdp();
+    bool     IsEfiBoot();
+}
+
 class SMP {
 public:
+    // cap on cpus registered (kurono.maxcpus=N). 0 = default policy (8 on efi
+    // boots, SMP_MAX_CPUS otherwise). call before Init. (satoru)
+    static void SetMaxCpus(uint32_t n);
+    // kurono.x2apictest=1: force the bsp into x2apic first so the disable path runs;
+    // =2: also treat x2apic as hardware-locked so the msr-driven lapic path runs. (satoru)
+    static void SetX2apicTest(int mode);
+    // kurono.madttest=1: parse a fabricated madt (type 0 + type 9 + dup + hotplug +
+    // id>=255) and log the verdict; touches no real cpu state. (satoru)
+    static void SelfTestMadt();
+
     // bsp-side: enable the lapic, parse topology, register the bsp as cpu 0. safe
     // to call even on a single-core machine (it just registers the bsp). (satoru)
     static void Init();
 
     static uint32_t CpuCount();        // logical cpus discovered (satoru)
     static uint32_t OnlineCount();     // cpus that have marked themselves online (satoru)
+    // containment park: a cli-hlt'ed cpu can never ack a tlb ipi again, but it
+    // still counted as online - so EVERY later BroadcastTlbFlush burned its full
+    // 20ms timeout (under kls_lock for mprotect/munmap) and the flush epoch
+    // never advanced, degrading the frame quarantine for the rest of the
+    // session. call this right before parking so want-counts shrink. (satoru)
+    static void     MarkSelfOffline();
 
     static uint32_t ApicId();          // calling cpu's local apic id (reads the lapic) (satoru)
     static uint32_t CpuIndex();        // calling cpu's dense index (via the apic-id map) (satoru)
@@ -78,12 +105,24 @@ public:
     // else is claimable for this cpu. (satoru)
     static void ApIdleFrame(InterruptFrame* f);
 
+    // switch this cpu to the KERNEL address space (captured at StartAPs) if it
+    // is currently on some process's cr3. an idle/parked cpu must NEVER sit on
+    // a dead process's root: the reaper can destroy that address space and
+    // recycle its page-table frames while this cpu's walker still fetches
+    // through them (garbage kernel translations = random corruption). no-op
+    // when the kernel root was never captured or already active. (satoru)
+    static void LoadKernelCr3();
+
     // tlb shootdown: ipi (vector 0x41) every OTHER online cpu to reload cr3,
     // then wait (bounded, with re-ipi retries) for their acks. call after
     // unmapping/reprotecting user pages of an address space whose threads may
     // run on other cores; no-op with a single online cpu. (satoru)
     static void BroadcastTlbFlush();
     static void HandleTlbIpi();   // receiver side: reload cr3 + ack (satoru)
+    // count of shootdowns that gave up unacked (a peer held IF off >20ms) -
+    // each one leaves a stale peer + the unmapped va is reused immediately,
+    // the lost-write wedge suspect (task 21). (satoru)
+    static uint32_t TlbFlushTimeouts();
 
     // flush epochs for the user-frame quarantine: a freed frame is only safe to
     // reuse once a shootdown that STARTED after the frame's pte was cleared has

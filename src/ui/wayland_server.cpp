@@ -2,15 +2,32 @@
 #include "../net/unix_socket.h"
 #include "xkb_keymap_us.h"        // compiled us keymap for wl_keyboard.keymap (satoru)
 #include "../drivers/serial.h"
+#include "../drivers/disklog.h"       // eager log off at first paint (satoru)
 #include "../fs/kvfs.h"
 #include "../kernel/time.h"
 #include "../drivers/graphics.h"     // framebuffer blit target (satoru)
 #include "../kernel/heap.h"          // per-surface shadow buffers (satoru)
+#include "../kernel/pmm.h"           // page-aligned keymap backing
 #include "../drivers/timer.h"        // pit-tick ms timestamps for frame cbs (satoru)
 #include "window_manager.h"          // bridge surfaces to wm windows (satoru)
 #include "app_icons.h"               // per-app window logo ids (satoru)
 #include "../drivers/keyboard.h"     // Key enum -> linux evdev keycode map (satoru)
 #include "../drivers/mouse.h"        // live pointer pos for the scroll thunk (satoru)
+
+// the client mmaps the keymap fd from offset 0, and a memfd maps whole pages
+// from its base, so the backing must start on a page. the embedded array does
+// not, and clients read the bytes in front of it ("unexpected non-ASCII
+// character"). copy it once into page-aligned memory shared by every client.
+static const uint8_t* keymap_backing() {
+    static uint8_t* page = nullptr;
+    if (!page) {
+        uint8_t* p = (uint8_t*)PMM::AllocBytes(g_xkb_keymap_us_len);
+        if (!p) return g_xkb_keymap_us;
+        for (uint32_t i = 0; i < g_xkb_keymap_us_len; i++) p[i] = g_xkb_keymap_us[i];
+        page = p;
+    }
+    return page;
+}
 
 namespace {
 
@@ -633,6 +650,10 @@ int bridge_surface_window(Client* c, Object* surf, int w, int h) {
     // -1,-1 lets the wm centre the window in the desktop area. (satoru)
     Window* win = WindowManager::CreateWindow(title, -1, -1, w, h);
     if (!win) return -1;
+    SerialLogger::Log("[wl] window "); SerialLogger::LogDec(win->id);
+    SerialLogger::Log(" '"); SerialLogger::Log(title); SerialLogger::Log("' ");
+    SerialLogger::LogDec(w); SerialLogger::Log("x"); SerialLogger::LogDec(h);
+    SerialLogger::Log("\r\n");
     // pin the app logo resolved from set_app_id/set_title so later title
     // changes keep it. (satoru)
     if (surf->app_icon_hint != 0xFF) win->app_icon = (int)surf->app_icon_hint;
@@ -913,6 +934,13 @@ void commit_surface(Client* c, Object* surf) {
             int pwid = (int)(intptr_t)psurf->wm_window;
             Window* pwin = WindowManager::GetWindow(pwid);
             if (pwin) {
+                // re-homed: drop the temporary own-window (stray dock entry). (satoru)
+                if (surf->wm_window) {
+                    int twid = (int)(intptr_t)surf->wm_window;
+                    WindowManager::CloseWindow(twid);
+                    winmap_clear(twid);
+                    surf->wm_window = nullptr;
+                }
                 // subsurface offsets are parent-SURFACE coords; the parent's
                 // geometry crop shifts them into content coords. (satoru)
                 blit_surface_region(c, surf, pwin, /*use_damage=*/true,
@@ -933,6 +961,30 @@ void commit_surface(Client* c, Object* surf) {
     if (wid < 0) return;
     Window* win = WindowManager::GetWindow(wid);
     if (!win) { surf->wm_window = nullptr; return; }
+
+    // first-paint serial marker: until now a paint was only provable by a qmp
+    // screenshot (KW:NativeShow comes from the firefox image and fires before
+    // any pixels hit the compositor). a big toplevel commit reaching here = a
+    // real client window with content on screen, so the reliability harness
+    // can classify PAINT vs STALL from serial alone. first few commits only. (satoru)
+    {
+        static int s_kwpaint_lines = 0;
+        if (s_kwpaint_lines < 4 && bw > 400 && bh > 300) {
+            if (s_kwpaint_lines == 0) {
+                // first window painted: the eager disk log (turned on at firefox launch) has
+                // done its job, hand back to the 1 s worker. (satoru)
+                SerialLogger::Log("[fftl] first window painted, eager disk log OFF\r\n");
+                DiskLog::SetEager(false);
+            }
+            s_kwpaint_lines++;
+            UnixSocket::Credentials kcr;
+            uint32_t kpid = (UnixSocket::GetPeerCred(c->sd, &kcr) == 0) ? kcr.pid : 0;
+            SerialLogger::Log("[KWPAINT] pid="); SerialLogger::LogDec((int)kpid);
+            SerialLogger::Log(" "); SerialLogger::LogDec(bw);
+            SerialLogger::Log("x"); SerialLogger::LogDec(bh);
+            SerialLogger::Log("\r\n");
+        }
+    }
 
     // AUTO-FOCUS this toplevel on map. firefox's CONTENT browsing context only
     // becomes active - and thus PAINTS (PresShell::ComputeActiveness gates on
@@ -1603,6 +1655,8 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 if (args_len < 4) return;
                 uint32_t tid = get32(args);
                 register_obj(c, tid, XDG_TOPLEVEL, obj->version);
+                SerialLogger::Log("[wl] get_toplevel sd="); SerialLogger::LogDec(c->sd);
+                SerialLogger::Log("\r\n");
                 Object* tl = find_obj(c, tid);
                 if (tl) tl->parent_surface_id = obj->parent_surface_id;
                 // xdg_toplevel::configure (opcode 0): width, height, states.
@@ -1775,7 +1829,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     UnixSocket::ControlMsg kcm = {};
                     kcm.passed_fd_count   = 1;
                     kcm.passed_fds[0]     = 1;              // sender-fd slot, unused (satoru)
-                    kcm.passed_shm_base[0] = (uint64_t)(uintptr_t)g_xkb_keymap_us;
+                    kcm.passed_shm_base[0] = (uint64_t)(uintptr_t)keymap_backing();
                     kcm.passed_shm_size[0] = g_xkb_keymap_us_len;
                     if (UnixSocket::KernelInjectMsg(c->sd, km, 16, &kcm) < 0)
                         c->fatal = true;

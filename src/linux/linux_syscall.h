@@ -16,6 +16,7 @@ struct Process;
 #define LSYS_OPEN            5
 #define LSYS_CLOSE           6
 #define LSYS_WAITPID         7
+#define LSYS_WAITID        284
 #define LSYS_CREAT           8
 #define LSYS_LINK            9
 #define LSYS_UNLINK         10
@@ -257,6 +258,8 @@ struct Process;
 #define LSYS_PIDFD_OPEN_       700
 #define LSYS_PIDFD_SEND_SIG    701
 #define LSYS_GETPRIORITY_DONE  702
+#define LSYS_CHOWN_PATH        7003  // chown/lchown(path) (satoru)
+#define LSYS_FLOCK             703   // whole-file advisory lock (satoru)
 
 // AF_UNIX socket family - internal IDs.  Dispatch also accepts the
 // Linux x86_64 numbers (41..55) where they don't collide.
@@ -445,6 +448,9 @@ enum LinuxFdType {
     LFD_CONSOLE,     // stdin/stdout/stderr → terminal
     LFD_PIPE,
     LFD_DEVNULL,
+    LFD_DEVURANDOM,  // /dev/urandom + /dev/random - reads return crng bytes (satoru)
+    LFD_DEVKSHELL,   // /dev/kshell - write a diagnostic cmdline, read its output (satoru)
+    LFD_BLOCKDEV,    // /dev/sda, /dev/sda1, /dev/nvme0n1p1 - raw block access (satoru)
     LFD_PROC,        // /proc virtual files
     LFD_SOCKET,      // AF_UNIX socket - backend_fd = UnixSocket sd
     LFD_MEMFD,       // memfd_create - backend_fd = kvfs anon file fd
@@ -501,6 +507,14 @@ struct LinuxProcess {
     uint32_t signal_mask;
     uint32_t pending_signals;
 
+    // real signal delivery state (satoru): 64-bit pending + blocked masks.
+    // signals are delivered STRICTLY at the syscall-return boundary (no async
+    // preemption injection) by DeliverPendingSignals(). the legacy uint32
+    // signal_mask/pending_signals above are retained for source compatibility
+    // (fork/clone copy them) but the honest delivery path reads these two. (satoru)
+    uint64_t sig_pending;   // signals posted, awaiting delivery (bit = signo) (satoru)
+    uint64_t sig_blocked;   // rt_sigprocmask blocked mask (satoru)
+
     // session / process group / controlling terminal (POSIX session model)
     uint32_t sid;          // session id (0 = none)
     uint32_t pgid;         // process group id
@@ -533,6 +547,16 @@ public:
     // loop. no-op if the task has no LinuxProcess. (satoru)
     static void SyncCurrentToTask(Process* task);
     static bool HandlePageFault(InterruptFrame* frame);
+
+    // real signal delivery, called by BOTH syscall entry paths (int 0x80 and the
+    // x86_64 SYSCALL fast path) right before returning to ring-3. if a handled,
+    // unblocked signal is pending it rewrites the saved user frame to enter the
+    // handler on a freshly-built rt sigframe (siginfo + ucontext); rt_sigreturn
+    // undoes it. delivery happens ONLY at this boundary - never injected
+    // asynchronously - so a process with no registered handler is unaffected.
+    // public because the entry stubs that call it are free/extern-C functions, not
+    // members. (satoru)
+    static void DeliverPendingSignals(InterruptFrame* frame);
     // register the irq0 timer-preemption handler (round-robins user threads). (satoru)
     static void EnableTimerPreemption();
 
@@ -543,6 +567,8 @@ public:
     // binary loaded above 4gb must round-trip its pointers intact), and
     // the return value is widened so a >4gb mmap result is not truncated
     // or sign-mangled on the way back to userspace (satoru)
+    static int64_t DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
+                                 uint64_t edx, uint64_t esi, uint64_t edi);
     static int64_t Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             uint64_t edx, uint64_t esi, uint64_t edi);
 
@@ -588,6 +614,10 @@ public:
     // binary shows exactly which numbers it still needs. rate-limited so a busy
     // poll loop on a missing nr cannot flood COM1. (satoru)
     static void LogEnosys(uint64_t nr, const char* name);
+    // x64 sleep: correct 64-bit timespec semantics + a real deschedule (Blocked
+    // + sleep_ticks promotion, ap park). called from the x64 dispatcher (case
+    // 35/230); kls-exempt path only - see task 17. (satoru)
+    static int32_t SleepMs64(uint64_t ms);
 
     // stats
     static int  ActiveProcessCount();
@@ -601,6 +631,10 @@ public:
     static bool StdinReadable();
 
     static void InjectStdin(const char* data, int len);
+    // post a signal to the thread-group leaders of a process group (tty ^C, SIGWINCH, hangup). (satoru)
+    static void SignalGroup(int pgid, int sig);
+    // working directory the NEXT CreateProcess gives its process (consumed once); "" clears. (satoru)
+    static void SetNextProcessCwd(const char* cwd);
 
     // creates a process, runs the named builtin, and returns output
     static int  RunProgram(const char* name, int argc, const char** argv,
@@ -644,6 +678,7 @@ private:
     static int32_t sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode);
     static int32_t sys_close(int fd);
     static int32_t sys_waitpid(uint32_t pid, uintptr_t status, uint32_t options);
+    static int32_t sys_waitid(int idtype, int32_t id, uint64_t infop, uint32_t options);
     static int32_t sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t envp);
     static int32_t sys_lseek(int fd, int32_t offset, uint32_t whence);
     static int64_t sys_brk(uintptr_t addr);

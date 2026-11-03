@@ -6,6 +6,7 @@
 #include "../system/screenshot.h"
 #include "wayland_server.h"
 #include "perf_hud.h"
+#include "gui.h"   // GUI::UpdateBackbuffer for the resize self-heal relayout (satoru)
 #include "../drivers/graphics.h"
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
@@ -29,10 +30,16 @@
 #include "../apps/text_editor.h"
 #include "../apps/settings.h"
 #include "../apps/system_settings.h"   // new modular settings app (satoru)
+#include "style.h"
+#include "modern_draw.h"
+#include "font.h"
 #include "../shell/shell.h"
 #include "../apps/task_manager.h"
 #include "../apps/browser.h"
 #include "../apps/media_player.h"
+#include "../apps/firefox_launcher.h"   // install-state gate for the firefox icon (satoru)
+#include "../fs/persist.h"              // persisted-install gate for the firefox icon (satoru)
+#include "../proc/kernel_processes.h"   // detached shell launch (no terminal) (satoru)
 #include "../proc/scheduler.h"
 #include "../hal/hal.h"
 
@@ -100,6 +107,15 @@ static inline float approach(float x, float target, float rate_per_ms, uint32_t 
     return clamp01(x);
 }
 
+// modern style geometry: menu bar height, dock icon size/padding and the gap
+// between the dock and the screen edge. (satoru)
+static const int MBAR_H       = 28;
+static const int MDOCK_ICON   = 46;
+static const int MDOCK_PAD    = 9;
+static const int MDOCK_GAP    = 8;
+static const int MDOCK_BOTTOM = 8;
+static const int MDOCK_H      = MDOCK_ICON + MDOCK_PAD * 2;
+
 //  taskbar
 int  Taskbar::screen_width    = 0;
 int  Taskbar::screen_height   = 0;
@@ -151,6 +167,10 @@ uint32_t Taskbar::pinned_launch_ms[8]       = {0,0,0,0,0,0,0,0};
 // of the Timer include). (satoru)
 void Taskbar::PinnedLaunched(int i){ if (i >= 0 && i < 8) pinned_launch_ms[i] = Timer::GetRealMs(); }
 uint32_t Taskbar::search_cursor_t0_ms       = 0;
+int      Taskbar::clock_dow                 = 0;
+float    Taskbar::dock_scale[24]            = {0};
+int      Taskbar::dock_mouse_x              = -1;
+int      Taskbar::dock_mouse_y              = -1;
 
 void Taskbar::ReloadFromConfig(){
     cfg_height          = UIConfig::Int  ("taskbar.height",          TASKBAR_HEIGHT);
@@ -168,7 +188,9 @@ void Taskbar::ReloadFromConfig(){
     cfg_position_top    = (pos && (pos[0]=='t'||pos[0]=='T'));
 
     // recompute y position from current screen size + cfg height
-    if(cfg_position_top){
+    if(UIStyle::Modern()){
+        y_pos = screen_height - MDOCK_BOTTOM - MDOCK_H;     // top of the dock
+    } else if(cfg_position_top){
         y_pos = 10;
     } else {
         y_pos = screen_height - cfg_height - 10;
@@ -223,7 +245,12 @@ void Taskbar::Init(int sw,int sh){
     for (int i = 0; i < 8; i++) { pinned_hover_phase[i] = 0.0f; pinned_launch_ms[i] = 0; }
 }
 
-int Taskbar::GetHeight(){ return TASKBAR_HEIGHT + 10; }
+int Taskbar::GetHeight(){ return UIStyle::Modern() ? MDOCK_H + MDOCK_BOTTOM : TASKBAR_HEIGHT + 10; }
+int Taskbar::TopInset(){ return UIStyle::Modern() ? MBAR_H : 0; }
+void Taskbar::ApplyDesktopArea(){
+    int top = TopInset();
+    WindowManager::SetDesktopArea(0, top, screen_width, screen_height - top - GetHeight());
+}
 int Taskbar::GetY(){ return y_pos; }
 
 void Taskbar::SetClock(int h,int m){ clock_h=h; clock_m=m; }
@@ -249,6 +276,16 @@ static inline int tb_popup_y(int h, int gap, int lift){
     if(Taskbar::cfg_position_top)
         return Taskbar::y_pos + TASKBAR_HEIGHT + gap - lift;
     return Taskbar::y_pos - h - gap + lift;
+}
+
+// start menu / volume popup origins. classic floats them off the bar; modern
+// drops them down from the menu bar (the logo, and the speaker icon). render,
+// hit-test and drag all go through these so they stay in lockstep. (satoru)
+static int mbar_vol_cx();
+static void tb_start_menu_xy(int h, int lift, int& x, int& y){
+    if(UIStyle::Modern()){ x = 8; y = MBAR_H + 6 - lift; return; }
+    x = tb_bar_x() + 6;
+    y = tb_popup_y(h, 8, lift);
 }
 
 // Quick-launch pinned apps.  Order = leftmost first.  Letter is the
@@ -289,6 +326,18 @@ static inline int tb_vol_x()          { return tb_bat_x()      - TB_VOL_W - 6; }
 static inline int tb_net_x()          { return tb_vol_x()      - TB_NET_W - 6; }
 static inline int tb_bell_x()         { return tb_net_x()      - TB_BELL_W - 6; }
 static inline int tb_cluster_left()   { return tb_bell_x() - 4; }
+
+// the modern dock's items: pinned apps, a divider, then one tile per open
+// window. kind 0 = pinned, 1 = window, 2 = divider. (satoru)
+struct DockItem { int kind; int pin; int win_id; int icon; int x; int size; };
+static const int DOCK_MAX = 24;
+static int dock_build(DockItem* it, int& bg_x, int& bg_w, bool scaled);
+
+static void tb_volume_popup_xy(int h, int lift, int& x, int& y){
+    if(UIStyle::Modern()){ x = mbar_vol_cx() - 26; y = MBAR_H + 6 - lift; return; }
+    x = tb_vol_x() - 52/2 + TB_VOL_W/2;
+    y = tb_popup_y(h, 8, lift);
+}
 
 void Taskbar::RenderStartButton(){
     // K logo button, anchored to the floating bar's left edge.
@@ -433,34 +482,452 @@ void Taskbar::RenderTaskButtons(){
         if (x + bw > max_x) break;                 // ran out of room
         bool focused = (focused_id == w->id);
 
+        // eased hover: a soft rounded highlight fades in and the icon lifts
+        // 2px, through the shared kss tween engine so the motion matches the
+        // rest of the desktop (and keeps the render gate open mid-ease). (satoru)
+        bool hov = (Mouse::mx >= x && Mouse::mx < x + bw &&
+                    Mouse::my >= y_pos && Mouse::my < y_pos + TASKBAR_HEIGHT);
+        float ht = KSS::Anim::Float(KSS::Motion::Id((uint32_t)w->id, 0x40u),
+                                    hov ? 1.0f : 0.0f,
+                                    KSS::Motion::Micro, KSS::Motion::Std);
+        int lift = (int)(ht * 2.0f + 0.5f);
         if(focused){
-            Graphics::FillRoundedRect(x, y_pos+6, bw, TASKBAR_HEIGHT-12, 6, 0xFF222240);
-            // active underline indicator
-            Graphics::FillRect(x+8, y_pos+TASKBAR_HEIGHT-4, bw-16, 3, COL_START_BTN);
+            Graphics::FillRoundedRect(x, y_pos+5, bw, TASKBAR_HEIGHT-10, 9, 0xFF23233F);
+        } else if(ht > 0.01f){
+            uint32_t hbg = Animation::LerpColor(COL_TASKBAR, 0xFF32324E,
+                                                (int)(ht * 255.0f));
+            Graphics::FillRoundedRect(x, y_pos+5, bw, TASKBAR_HEIGHT-10, 9, hbg);
         }
 
-        // app icon - colored rounded square with a flat vector glyph (satoru)
-        unsigned int ic = 0xFF3498DB;
-        char c0 = w->title[0];
-        if(c0=='T') ic = 0xFF2ECC71;
-        else if(c0=='F') ic = 0xFFF39C12;
-        else if(c0=='C' && w->title[1]=='o') ic = 0xFF5C8AFF;
-        else if(c0=='C') ic = 0xFF9B59B6;
-        else if(c0=='S') ic = 0xFF607D8B;
-        else if(c0=='E') ic = 0xFFE74C3C;
-        else if(c0=='B') ic = 0xFF3498DB;
-        else if(c0=='M') ic = 0xFFE91E63;
+        // app icon - colored rounded square with a flat vector glyph. a pinned
+        // app_icon (wayland set_app_id, survives page-title changes) wins over
+        // the title-derived id. (satoru)
+        int gid = (w->app_icon >= 0) ? w->app_icon : AppIcons::IdForName(w->title);
+        unsigned int ic = WindowTileColor(w->title);
+        // firefox: dark night-sky tile so the orange fox mark pops. (satoru)
+        if(gid == AppIcons::FIREFOX) ic = 0xFF14103C;
 
-        Graphics::FillRoundedRect(x+6, y_pos+10, bw-12, TASKBAR_HEIGHT-20, 5, ic);
-        // vector glyph mapped from the window title (the title carries the app
-        // name, so IdForName picks the right icon). inset inside the tile. (satoru)
-        int tile = TASKBAR_HEIGHT-20;
+        // the window manager's minimize landing / restore press squashes and
+        // springs the tile about its centre and flashes it. (satoru)
+        int tw = bw-12, th = TASKBAR_HEIGHT-20;
+        int tx = x+6, ty = y_pos+10 - lift;
+        int sx_q8 = 256, sy_q8 = 256, flash = 0;
+        if (WindowManager::TaskbarCatch(w->id, tx, ty, tw, th, sx_q8, sy_q8, flash)) {
+            int nw = (tw * sx_q8) >> 8, nh = (th * sy_q8) >> 8;
+            tx += (tw - nw) / 2; ty += (th - nh) / 2;
+            tw = nw; th = nh;
+        }
+        Graphics::FillRoundedRect(tx, ty, tw, th, 5, ic);
+        int tile = th < tw ? th : tw;
         int gpad = tile / 6;
-        AppIcons::Draw(AppIcons::IdForName(w->title),
-                       x+6 + gpad, y_pos+10 + gpad, tile - gpad*2);
+        AppIcons::Draw(gid, tx + (tw - tile) / 2 + gpad, ty + (th - tile) / 2 + gpad, tile - gpad*2);
+        if (flash > 0) Graphics::FillRectAlpha(tx, ty, tw, th, (uint8_t)flash, 0xFFFFFFFFu);
+
+        // dock-style state indicator: focused = a wide accent pill, other open
+        // windows = a small dot (dimmed when minimized). (satoru)
+        if(focused){
+            Graphics::FillRoundedRect(x + bw/2 - 8, y_pos+TASKBAR_HEIGHT-5, 16, 3, 2, COL_START_BTN);
+        } else {
+            unsigned int dot = (w->state==WIN_MINIMIZED) ? 0xFF4A4A66 : 0xFF8A8AB0;
+            Graphics::FillRoundedRect(x + bw/2 - 2, y_pos+TASKBAR_HEIGHT-5, 4, 3, 2, dot);
+        }
 
         x += bw + gap;
     }
+}
+
+uint32_t Taskbar::WindowTileColor(const char* title){
+    if (UIStyle::Modern()) return MDraw::AppTileColor(AppIcons::IdForName(title));
+    unsigned int ic = 0xFF3498DB;
+    char c0 = title[0];
+    if(c0=='T') ic = 0xFF2ECC71;
+    else if(c0=='F') ic = 0xFFF39C12;
+    else if(c0=='C' && title[1]=='o') ic = 0xFF5C8AFF;
+    else if(c0=='C') ic = 0xFF9B59B6;
+    else if(c0=='S') ic = 0xFF607D8B;
+    else if(c0=='E') ic = 0xFFE74C3C;
+    else if(c0=='B') ic = 0xFF3498DB;
+    else if(c0=='M') ic = 0xFFE91E63;
+    return ic;
+}
+
+bool Taskbar::WindowTileRect(int win_id, int& tx, int& ty, int& tw, int& th){
+    if (UIStyle::Modern()) {
+        DockItem it[DOCK_MAX];
+        int bg_x, bg_w;
+        int n = dock_build(it, bg_x, bg_w, true);
+        for (int i = 0; i < n; i++) {
+            if (it[i].kind != 1 || it[i].win_id != win_id) continue;
+            tw = th = it[i].size;
+            tx = it[i].x;
+            ty = y_pos + MDOCK_PAD + MDOCK_ICON - it[i].size;
+            return true;
+        }
+        return false;
+    }
+    // mirrors the window-button layout in Render() and HandleClick().
+    int wcount = 0, slot = -1;
+    Window* wlist = WindowManager::GetWindows();
+    for(int i=0;i<WM_MAX_WINDOWS;i++){
+        if(wlist[i].state==WIN_CLOSED) continue;
+        if(wlist[i].id==win_id) slot = wcount;
+        wcount++;
+    }
+    if(slot < 0) return false;
+    int bw = 40, gap = 4;
+    int total_w = wcount * bw + (wcount > 1 ? (wcount-1)*gap : 0);
+    int center = tb_bar_x() + tb_bar_w() / 2;
+    int x = center - total_w / 2;
+    int min_x = tb_search_x() + tb_search_w() + 12;
+    int max_x = tb_cluster_left() - 8;
+    if (x < min_x) x = min_x;
+    x += slot * (bw + gap);
+    if (x + bw > max_x) return false;
+    tx = x + 6; ty = y_pos + 10;
+    tw = bw - 12; th = TASKBAR_HEIGHT - 20;
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  modern style: menu bar + floating dock (satoru)
+// ═══════════════════════════════════════════════════════════════════════
+
+static const char* const k_dow[7]  = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+static const char* const k_mon[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+static const float MBAR_TEXT_PX = 15.5f;           // ~13 px em, macos menu bar size
+
+static float mfsqrt(float v){
+    if (!(v > 0.0f)) return 0.0f;
+    union { float f; uint32_t u; } c; c.f = v; c.u = 0x1fbd1df5u + (c.u >> 1);
+    float x = c.f;
+    for (int i = 0; i < 3; i++) x = 0.5f * (x + v / x);
+    return x;
+}
+
+// anti-aliased arc on the right side of (cx, cy): the speaker's sound waves.
+static void m_arc(int cx, int cy, float r, float thick, uint32_t c, int alpha){
+    int R = (int)(r + thick) + 1;
+    for (int y = cy - R; y <= cy + R; y++)
+        for (int x = cx; x <= cx + R; x++) {
+            float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            if (dx <= 0.0f || (dy < 0 ? -dy : dy) > dx * 1.15f) continue;
+            float d = mfsqrt(dx * dx + dy * dy) - r;
+            if (d < 0) d = -d;
+            float cov = thick * 0.5f + 0.5f - d;
+            if (cov <= 0.0f) continue;
+            if (cov > 1.0f) cov = 1.0f;
+            MDraw::RoundRect(x, y, 1, 1, 0, c, (int)(alpha * cov));
+        }
+}
+
+// menu bar layout, right to left: clock, control center, battery, volume,
+// network. shared by render and hit-test.
+struct MBarLayout { int clock_x, clock_w, cc_x, bat_x, vol_x, net_x; };
+static void mbar_clock_text(char* out, int mx){
+    int h12 = Taskbar::ClockHour12();
+    char tb[8]; int_to_str(h12, tb, 8);
+    char mm[4]; mm[0] = (char)('0' + Taskbar::ClockMinute() / 10); mm[1] = (char)('0' + Taskbar::ClockMinute() % 10); mm[2] = 0;
+    char dom[4]; int_to_str(Taskbar::ClockDom(), dom, 4);
+    out[0] = 0;
+    int dw = Taskbar::ClockDow(); if (dw < 0 || dw > 6) dw = 0;
+    int mo = Taskbar::ClockMon() - 1; if (mo < 0 || mo > 11) mo = 0;
+    sapp(out, k_dow[dw], mx); sapp(out, " ", mx); sapp(out, dom, mx); sapp(out, " ", mx);
+    sapp(out, k_mon[mo], mx); sapp(out, "   ", mx); sapp(out, tb, mx); sapp(out, ":", mx);
+    sapp(out, mm, mx); sapp(out, Taskbar::ClockHour24() < 12 ? " AM" : " PM", mx);
+}
+static MBarLayout mbar_layout(){
+    MBarLayout L;
+    char clk[40]; mbar_clock_text(clk, 40);
+    L.clock_w = FontTTF::MeasureText(MBAR_TEXT_PX, clk);
+    L.clock_x = Taskbar::screen_width - 14 - L.clock_w;
+    L.cc_x    = L.clock_x - 14 - 18;
+    L.bat_x   = L.cc_x - 14 - 25;
+    L.vol_x   = L.bat_x - 12 - 20;
+    L.net_x   = L.vol_x - 12 - 18;
+    return L;
+}
+static int mbar_vol_cx(){ MBarLayout L = mbar_layout(); return L.vol_x + 10; }
+
+static int dock_build(DockItem* it, int& bg_x, int& bg_w, bool scaled){
+    int n = 0;
+    for (int i = 0; i < TB_PINNED_COUNT && n < DOCK_MAX; i++) {
+        it[n].kind = 0; it[n].pin = i; it[n].win_id = -1;
+        it[n].icon = AppIcons::IdForName(tb_pinned[i].name); n++;
+    }
+    Window* wl = WindowManager::GetWindows();
+    bool any = false;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) if (wl[i].state != WIN_CLOSED) { any = true; break; }
+    if (any && n < DOCK_MAX) { it[n].kind = 2; it[n].pin = -1; it[n].win_id = -1; it[n].icon = -1; n++; }
+    for (int i = 0; i < WM_MAX_WINDOWS && n < DOCK_MAX; i++) {
+        if (wl[i].state == WIN_CLOSED) continue;
+        it[n].kind = 1; it[n].pin = -1; it[n].win_id = wl[i].id;
+        it[n].icon = AppIcons::IdForName(wl[i].title); n++;
+    }
+    int total = MDOCK_PAD * 2;
+    for (int i = 0; i < n; i++) {
+        float sc = scaled ? 1.0f + Taskbar::DockScale(i) : 1.0f;
+        it[i].size = it[i].kind == 2 ? 1 : (int)(MDOCK_ICON * sc + 0.5f);
+        total += it[i].size + (i ? MDOCK_GAP : 0);
+    }
+    bg_w = total;
+    bg_x = (Taskbar::screen_width - total) / 2;
+    int x = bg_x + MDOCK_PAD;
+    for (int i = 0; i < n; i++) { it[i].x = x; x += it[i].size + MDOCK_GAP; }
+    return n;
+}
+
+static void m_logo(int x, int y, int h){
+    const int LBX0 = 97, LBY0 = 80, LBW = 99, LBH = 141;   // emblem bbox in logo_data
+    int lw = (h * LBW) / LBH;
+    for (int dy = 0; dy < h; dy++){
+        int sy = LBY0 + (dy * LBH) / h;
+        for (int dx = 0; dx < lw; dx++){
+            int sx = LBX0 + (dx * LBW) / lw;
+            uint32_t p = logo_data[sy * LOGO_WIDTH + sx];
+            uint8_t a = (p >> 24) & 0xFF;
+            if (a < 10) continue;
+            Graphics::BlendPixel(x + dx, y + dy, 0xF2, 0xF3, 0xF8, a);
+        }
+    }
+}
+
+void Taskbar::RenderMenuBar(){
+    const int sw = screen_width;
+    // translucent bar over the wallpaper with a hairline underneath.
+    Graphics::FillRectAlpha(0, 0, sw, MBAR_H, 150, 0xFF0E0F17);
+    Graphics::FillRectAlpha(0, MBAR_H - 1, sw, 1, 40, 0xFFFFFFFF);
+    if (start_menu_open) MDraw::RoundRect(6, 3, 34, MBAR_H - 6, 6, 0xFFFFFFFF, 40);
+    m_logo(15, 6, MBAR_H - 12);
+
+    Window* fw = WindowManager::GetFocusedWindow();
+    const char* app = (fw && fw->state != WIN_MINIMIZED) ? fw->title : "Kurono";
+    FontTTF::DrawText(50, 5, MBAR_TEXT_PX, app, 0xFFF2F3F8, true);
+
+    MBarLayout L = mbar_layout();
+    const uint32_t ink = 0xFFE8EAF2;
+    int cy = MBAR_H / 2;
+
+    // network: four rising bars (ethernet shows them all lit)
+    {
+        bool up = WiFi::IsLinkUp();
+        int bars = WiFi::DetectedLink() == WiFi::LINK_ETHERNET ? 4 : WiFi::SignalBars();
+        for (int i = 0; i < 4; i++) {
+            int bh = 4 + i * 3;
+            int a = (up && i < bars) ? 255 : 70;
+            MDraw::RoundRect(L.net_x + i * 5, cy + 6 - bh, 3, bh, 1, ink, a);
+        }
+    }
+    // volume: speaker with sound waves
+    {
+        bool muted = Audio::IsAvailable() ? Audio::IsMuted() : false;
+        int vx = L.vol_x, a = muted ? 110 : 255;
+        MDraw::RoundRect(vx, cy - 3, 4, 6, 1, ink, a);
+        for (int k = 0; k < 5; k++) MDraw::RoundRect(vx + 4 + k, cy - 3 - k, 1, 6 + 2 * k, 0, ink, a);
+        if (!muted) { m_arc(vx + 9, cy, 4.0f, 1.4f, ink, 255); m_arc(vx + 9, cy, 7.5f, 1.4f, ink, 200); }
+        else Graphics::DrawLine(vx + 11, cy - 4, vx + 18, cy + 4, 0xFFFF6B6B);
+    }
+    // battery
+    {
+        int bx = L.bat_x, by = cy - 6;
+        MDraw::RoundOutline(bx, by, 22, 12, 3, ink, 170);
+        MDraw::RoundRect(bx + 23, by + 4, 2, 4, 1, ink, 170);
+        int fill = (battery_pct * 18) / 100; if (fill < 2) fill = 2;
+        MDraw::RoundRect(bx + 2, by + 2, fill, 8, 2, battery_pct > 20 ? ink : 0xFFFF6B6B, 255);
+    }
+    // control center: two stacked toggles
+    {
+        int x = L.cc_x;
+        MDraw::RoundRect(x, cy - 7, 18, 6, 3, ink, 120); MDraw::Circle(x + 13, cy - 4, 3, ink, 255);
+        MDraw::RoundRect(x, cy + 1, 18, 6, 3, ink, 120); MDraw::Circle(x + 5,  cy + 4, 3, ink, 255);
+    }
+    char clk[40]; mbar_clock_text(clk, 40);
+    FontTTF::DrawText(L.clock_x, 5, MBAR_TEXT_PX, clk, 0xFFF2F3F8);
+}
+
+void Taskbar::RenderDock(){
+    DockItem it[DOCK_MAX];
+    int bg_x, bg_w;
+    int n = dock_build(it, bg_x, bg_w, true);
+    int dock_y = y_pos;
+    int base_bottom = dock_y + MDOCK_PAD + MDOCK_ICON;
+
+    MDraw::Shadow(bg_x, dock_y, bg_w, MDOCK_H, 18, 6, 4, 120);
+    MDraw::RoundRect(bg_x, dock_y, bg_w, MDOCK_H, 18, 0xFF2A2B38, 0xFF1A1B24, 170);
+    MDraw::RoundOutline(bg_x, dock_y, bg_w, MDOCK_H, 18, 0xFFFFFFFF, 40);
+
+    Window* wl = WindowManager::GetWindows();
+    uint32_t now = Timer::GetRealMs();
+    int hover = -1;
+    for (int i = 0; i < n; i++) {
+        DockItem& d = it[i];
+        if (d.kind == 2) {
+            Graphics::FillRectAlpha(d.x, dock_y + 12, 1, MDOCK_H - 24, 60, 0xFFFFFFFF);
+            continue;
+        }
+        int sz = d.size, tx = d.x, ty = base_bottom - sz;
+        // launch bounce: a pinned app hops while its window opens.
+        if (d.kind == 0) {
+            uint32_t lms = PinnedLaunchMs(d.pin);
+            if (lms && now - lms < 700) {
+                float e = (float)(now - lms) / 700.0f;
+                float hop = e < 0.5f ? (1.0f - (1.0f - e * 2) * (1.0f - e * 2)) : (1.0f - (e - 0.5f) * 2) * (1.0f - (e - 0.5f) * 2);
+                ty -= (int)(hop * 14.0f + 0.5f);
+                Graphics::MarkDirty(tx - 4, dock_y - 40, sz + 8, MDOCK_H + 40);
+            }
+        }
+        // window tiles take the minimize catch / restore press from the wm.
+        int sx_q8 = 256, sy_q8 = 256, flash = 0;
+        if (d.kind == 1 && WindowManager::TaskbarCatch(d.win_id, tx, ty, sz, sz, sx_q8, sy_q8, flash)) {
+            int nw = (sz * sx_q8) >> 8, nh = (sz * sy_q8) >> 8;
+            MDraw::AppTile(d.icon, tx + (sz - nw) / 2, ty + (sz - nh), nw < nh ? nw : nh);
+            if (flash > 0) MDraw::RoundRect(tx + (sz - nw) / 2, ty + (sz - nh), nw, nh, (nw * 23) / 100, 0xFFFFFFFF, flash);
+        } else {
+            MDraw::AppTile(d.icon, tx, ty, sz);
+        }
+        // running dot
+        bool running = d.kind == 1;
+        if (d.kind == 0)
+            for (int w = 0; w < WM_MAX_WINDOWS && !running; w++)
+                if (wl[w].state != WIN_CLOSED && wl[w].title[0] == tb_pinned[d.pin].glyph) running = true;
+        if (running) MDraw::Circle(d.x + d.size / 2, dock_y + MDOCK_H - 4, 2, 0xFFE8EAF2, 220);
+        if (dock_mouse_y >= dock_y - 4 && dock_mouse_x >= d.x && dock_mouse_x < d.x + d.size + MDOCK_GAP) hover = i;
+    }
+    // tooltip above the hovered tile
+    if (hover >= 0 && it[hover].kind != 2) {
+        const char* label = "";
+        if (it[hover].kind == 0) label = tb_pinned[it[hover].pin].name;
+        else { Window* w = WindowManager::GetWindow(it[hover].win_id); if (w) label = w->title; }
+        int tw = FontTTF::MeasureText(14.0f, label);
+        int cx = it[hover].x + it[hover].size / 2;
+        int ty = base_bottom - it[hover].size - 34;
+        MDraw::Shadow(cx - tw / 2 - 10, ty, tw + 20, 24, 8, 3, 2, 70);
+        MDraw::RoundRect(cx - tw / 2 - 10, ty, tw + 20, 24, 8, 0xFF2C2D3A, 235);
+        MDraw::RoundOutline(cx - tw / 2 - 10, ty, tw + 20, 24, 8, 0xFFFFFFFF, 30);
+        FontTTF::DrawText(cx - tw / 2, ty + 4, 14.0f, label, 0xFFF2F3F8);
+    }
+    Graphics::MarkDirty(bg_x - 40, dock_y - 60, bg_w + 80, MDOCK_H + 70);
+}
+
+void Taskbar::RenderStartMenuModern(){
+    if(!start_menu_open && start_menu_phase <= 0.01f) return;
+    float t  = ease_in_out_cubic(start_menu_phase);
+    int full_h = START_MENU_H;
+    int lift   = (int)((1.0f - t) * 12.0f);
+    int mx0, my0;
+    tb_start_menu_xy(full_h, lift, mx0, my0);
+    int alpha = (int)(t * 255.0f);
+    MDraw::Shadow(mx0, my0, START_MENU_W, full_h, 14, 8, 6, (int)(t * 110));
+    MDraw::RoundRect(mx0, my0, START_MENU_W, full_h, 14, 0xFF262734, 0xFF1C1D27, alpha * 240 / 255);
+    MDraw::RoundOutline(mx0, my0, START_MENU_W, full_h, 14, 0xFFFFFFFF, alpha * 36 / 255);
+    Graphics::MarkDirty(mx0 - 12, my0 - 12, START_MENU_W + 24, full_h + 30);
+    if (t < 0.55f) return;
+    int ta = (int)((t - 0.55f) / 0.45f * 255.0f);
+    uint32_t ink = MDraw::Mix(0xFF1C1D27, 0xFFF2F3F8, ta), sub = MDraw::Mix(0xFF1C1D27, 0xFF9AA0B8, ta);
+    FontTTF::DrawText(mx0 + 16, my0 + 12, 17.0f, "Kurono", ink, true);
+    FontTTF::DrawText(mx0 + 16, my0 + 32, 14.0f, "v1.0", sub);
+    Graphics::FillRectAlpha(mx0 + 14, my0 + 50, START_MENU_W - 28, 1, ta / 5, 0xFFFFFFFF);
+    static const char* items[] = {
+        "Terminal", "File Browser", "Calculator", "Text Editor", "Browser", "Media Player",
+        "Settings", "Task Manager", "---", "Restart Shell", "Sign Out", "Shut Down",
+    };
+    static const int icons[] = {
+        AppIcons::TERMINAL, AppIcons::FILES, AppIcons::CALCULATOR, AppIcons::EDITOR,
+        AppIcons::BROWSER,  AppIcons::MEDIA, AppIcons::SETTINGS,   AppIcons::TASKS, -1, -1, -1, -1,
+    };
+    int iy = my0 + 56;
+    for (int i = 0; i < 12; i++) {
+        if (items[i][0] == '-') { Graphics::FillRectAlpha(mx0 + 14, iy + 6, START_MENU_W - 28, 1, ta / 5, 0xFFFFFFFF); iy += 12; continue; }
+        if (dock_mouse_x >= mx0 + 6 && dock_mouse_x < mx0 + START_MENU_W - 6 && dock_mouse_y >= iy && dock_mouse_y < iy + 32)
+            MDraw::RoundRect(mx0 + 6, iy + 1, START_MENU_W - 12, 30, 7, 0xFF5C8AFF, ta * 200 / 255);
+        if (icons[i] >= 0) {
+            MDraw::AppTile(icons[i], mx0 + 14, iy + 4, 24);
+            FontTTF::DrawText(mx0 + 48, iy + 8, 15.0f, items[i], ink);
+        } else {
+            FontTTF::DrawText(mx0 + 18, iy + 8, 15.0f, items[i], i == 11 ? MDraw::Mix(0xFF1C1D27, 0xFFFF8A8A, ta) : ink);
+        }
+        iy += 32;
+    }
+}
+
+void Taskbar::RenderModern(){
+    RenderMenuBar();
+    RenderDock();
+    RenderStartMenuModern();
+    RenderVolumePopup();
+}
+
+void Taskbar::TickModern(uint32_t delta_ms, int mx, int my){
+    dock_mouse_x = mx; dock_mouse_y = my;
+    // magnification follows the pointer along the dock and glides with a
+    // first-order lag, so tiles swell and settle rather than snap.
+    DockItem it[DOCK_MAX];
+    int bg_x, bg_w;
+    int n = dock_build(it, bg_x, bg_w, false);
+    bool near = my >= y_pos - 12 && my < screen_height && mx >= bg_x - 30 && mx < bg_x + bg_w + 30;
+    float k = (float)delta_ms / 90.0f; if (k > 1.0f) k = 1.0f;
+    for (int i = 0; i < DOCK_MAX; i++) {
+        float target = 0.0f;
+        if (near && i < n && it[i].kind != 2) {
+            float d = (float)(mx - (it[i].x + it[i].size / 2)) / (float)MDOCK_ICON;
+            if (d < 0) d = -d;
+            float tt = 1.0f - d / 2.3f;
+            if (tt > 0.0f) target = 0.40f * tt * tt * (3.0f - 2.0f * tt);
+        }
+        dock_scale[i] += (target - dock_scale[i]) * k;
+        if (dock_scale[i] < 0.001f && target == 0.0f) dock_scale[i] = 0.0f;
+    }
+}
+
+bool Taskbar::HandleClickModern(int mx, int my){
+    // menu bar
+    if (my < MBAR_H) {
+        if (mx < 44) { VolumePopupSet(false); StartMenuSet(!start_menu_open); return true; }
+        MBarLayout L = mbar_layout();
+        if (mx >= L.vol_x - 4 && mx < L.vol_x + 24) {
+            VolumePopupSet(!volume_popup_open);
+            StartMenuSet(false);
+            if (volume_popup_open && Audio::IsAvailable()) volume_slider_val = Audio::GetMasterVolume();
+            return true;
+        }
+        if (mx >= L.net_x - 6) {
+            ControlCenter::ToggleAt(mx < screen_width - 200 ? mx : screen_width - 190, MBAR_H + 8 + 460 + 8);
+            VolumePopupSet(false); StartMenuSet(false);
+            return true;
+        }
+        StartMenuSet(false); VolumePopupSet(false);
+        return true;
+    }
+    // dock
+    DockItem it[DOCK_MAX];
+    int bg_x, bg_w;
+    int n = dock_build(it, bg_x, bg_w, true);
+    if (my >= y_pos && mx >= bg_x && mx < bg_x + bg_w) {
+        StartMenuSet(false); VolumePopupSet(false);
+        for (int i = 0; i < n; i++) {
+            if (it[i].kind == 2 || mx < it[i].x - MDOCK_GAP / 2 || mx >= it[i].x + it[i].size + MDOCK_GAP / 2) continue;
+            if (it[i].kind == 0) {
+                PinnedLaunched(it[i].pin);
+                tb_pinned[it[i].pin].launch();
+                return true;
+            }
+            Window* w = WindowManager::GetWindow(it[i].win_id);
+            if (!w) return true;
+            if (w->state == WIN_MINIMIZED || w->anim_kind == 3) {
+                WindowManager::Unminimize(w->id);
+                WindowManager::BringToFront(w->id);
+            } else if (WindowManager::GetFocusedWindow() == w) {
+                WindowManager::Minimize(w->id);
+            } else {
+                WindowManager::BringToFront(w->id);
+            }
+            return true;
+        }
+        return true;
+    }
+    StartMenuSet(false);
+    VolumePopupSet(false);
+    return false;
 }
 
 void Taskbar::RenderClock(){
@@ -586,8 +1053,8 @@ void Taskbar::RenderStartMenu(){
 
     // left-aligned off the k button (which is anchored to the floating bar) - 
     // above the bar when docked bottom, below it when docked top. (satoru)
-    int mx0 = tb_bar_x() + 6;
-    int my0 = tb_popup_y(draw_h, 8, lift);
+    int mx0, my0;
+    tb_start_menu_xy(draw_h, lift, mx0, my0);
 
     // shadow
     Graphics::FillRoundedRect(mx0+6, my0+6, START_MENU_W, draw_h, 14, 0xFF040408);
@@ -661,6 +1128,7 @@ void Taskbar::RenderStartMenu(){
 }
 
 void Taskbar::Render(){
+    if (UIStyle::Modern()) { RenderModern(); return; }
     int bx = tb_bar_x();
     int by = tb_bar_y();
     int bw = tb_bar_w();
@@ -753,12 +1221,10 @@ void Taskbar::RenderVolumePopup(){
     if(!volume_popup_open && volume_popup_phase <= 0.01f) return;
     float t = ease_in_out_cubic(volume_popup_phase);
 
-    int vol_x = tb_vol_x();
-
     int pop_w = 52, pop_h_full = 180;
     int pop_h = (int)(pop_h_full * (0.5f + 0.5f * t) + 0.5f);
-    int pop_x = vol_x - pop_w/2 + TB_VOL_W/2;
-    int pop_y = tb_popup_y(pop_h, 8, (int)((1.0f - t) * 10.0f));
+    int pop_x, pop_y;
+    tb_volume_popup_xy(pop_h, (int)((1.0f - t) * 10.0f), pop_x, pop_y);
 
     // shadow + background
     Graphics::FillRoundedRect(pop_x+4, pop_y+4, pop_w, pop_h, 8, 0xFF060610);
@@ -809,9 +1275,8 @@ void Taskbar::RenderVolumePopup(){
 bool Taskbar::HandleClick(int mx,int my){
     if(volume_popup_open && volume_popup_phase > 0.5f){
         int pop_w = 52, pop_h = 180;
-        int vol_icon_x2 = tb_vol_x();
-        int pop_x = vol_icon_x2 - pop_w/2 + TB_VOL_W/2;
-        int pop_y = tb_popup_y(pop_h, 8, 0);
+        int pop_x, pop_y;
+        tb_volume_popup_xy(pop_h, 0, pop_x, pop_y);
 
         if(mx>=pop_x && mx<pop_x+pop_w && my>=pop_y && my<pop_y+pop_h){
             if(my < pop_y + 32){
@@ -836,11 +1301,12 @@ bool Taskbar::HandleClick(int mx,int my){
     // bottom dock (my < y_pos), below it for a top dock. handle those clicks
     // here; bar-row clicks fall through to the widgets below. (satoru)
     bool off_bar = cfg_position_top ? (my >= y_pos + TASKBAR_HEIGHT) : (my < y_pos);
+    if (UIStyle::Modern()) off_bar = true;     // menus hang off the menu bar
     if(off_bar){
         // start menu handling
         if(start_menu_open){
-            int mx0 = tb_bar_x() + 6;
-            int my0 = tb_popup_y(START_MENU_H, 8, 0);
+            int mx0, my0;
+            tb_start_menu_xy(START_MENU_H, 0, mx0, my0);
             if(mx>=mx0 && mx<mx0+START_MENU_W && my>=my0 && my<my0+START_MENU_H){
                 int iy = my0 + 56;
                 static const int nit = 12;
@@ -871,7 +1337,10 @@ bool Taskbar::HandleClick(int mx,int my){
                 return true;
             }
             StartMenuSet(false);
+            // a click on the logo while the menu is open just closes it.
+            if (UIStyle::Modern() && my < MBAR_H && mx < 44) return true;
         }
+        if (UIStyle::Modern()) return HandleClickModern(mx, my);
         // search results click
         if(search_active && search_buf[0]){
             // check if click is in search results area
@@ -997,8 +1466,20 @@ bool Taskbar::HandleClick(int mx,int my){
             if(!w || w->state==WIN_CLOSED) continue;
             if(x + bw > max_x) break;
             if(mx>=x && mx<x+bw){
-                if(w->state==WIN_MINIMIZED) w->state=WIN_NORMAL;
-                WindowManager::BringToFront(w->id);
+                // minimized -> restore (the old direct state write left
+                // visible=false, so the window never came back); focused ->
+                // minimize (standard taskbar toggle); else raise + focus
+                // (BringToFront alone never moved keyboard focus). (satoru)
+                if(w->state==WIN_MINIMIZED || w->anim_kind==3){
+                    WindowManager::Unminimize(w->id);
+                    WindowManager::Focus(w->id);
+                    WindowManager::BringToFront(w->id);
+                } else if(WindowManager::GetFocusedIndex() == w->id){
+                    WindowManager::Minimize(w->id);
+                } else {
+                    WindowManager::Focus(w->id);
+                    WindowManager::BringToFront(w->id);
+                }
                 return true;
             }
             x += bw + gap2;
@@ -1049,11 +1530,13 @@ void Taskbar::Update(){
     clock_mon = dt.mon;
     clock_dom = dt.dom;
     clock_year = dt.year;
+    clock_dow = dt.dow;
 }
 
 void Taskbar::Tick(uint32_t delta_ms, int mx, int my){
     if (delta_ms == 0) delta_ms = 1;
     if (delta_ms > 100) delta_ms = 100;   // ignore huge stalls
+    if (UIStyle::Modern()) TickModern(delta_ms, mx, my);
 
     // ── Start menu phase (220 ms open, 160 ms close) ──────────────────
     {
@@ -1093,6 +1576,9 @@ void Taskbar::Tick(uint32_t delta_ms, int mx, int my){
 }
 
 bool Taskbar::IsAnimating(){
+    // dock magnification glides in and out.
+    if (UIStyle::Modern())
+        for (int i = 0; i < 24; i++) if (dock_scale[i] > 0.003f) return true;
     // open popups animate; closing ones keep a decaying phase until ~0.
     if (start_menu_open   || start_menu_phase   > 0.01f) return true;
     if (volume_popup_open || volume_popup_phase > 0.01f) return true;
@@ -1238,7 +1724,7 @@ void Desktop::ClampIcon(int index){
     if(index<0 || index>=icon_count) return;
     int icon_sz = cfg_icon_size;
     int min_x = 4;
-    int min_y = 4;
+    int min_y = 4 + Taskbar::TopInset();
     int max_x = screen_width - icon_sz - 8;
     int max_y = Taskbar::GetY() - icon_sz - 26;
     if(max_x < min_x) max_x = min_x;
@@ -1254,7 +1740,7 @@ void Desktop::PlaceIcon(int index){
     int desktop_bottom = Taskbar::GetY() - 20;
     if(desktop_bottom <= 0) desktop_bottom = screen_height - Taskbar::GetHeight();
     for(int slot_x=cfg_margin_x;slot_x<screen_width-cfg_icon_size;slot_x+=cfg_spacing_x){
-        for(int slot_y=cfg_margin_y;slot_y<desktop_bottom-cfg_icon_size;slot_y+=cfg_spacing_y){
+        for(int slot_y=cfg_margin_y+Taskbar::TopInset();slot_y<desktop_bottom-cfg_icon_size;slot_y+=cfg_spacing_y){
             bool occupied=false;
             for(int other_index=0;other_index<icon_count;other_index++){
                 if(other_index==index) continue;
@@ -1324,12 +1810,34 @@ void Desktop::RefreshFiles(){
             AddOrUpdateDesktopFile(desktop_dir->children[child_index]);
         }
     }
+    SyncFirefoxIcon();
     last_file_sync_ms = Timer::GetRealMs();
+}
+
+void Desktop::SyncFirefoxIcon(){
+    // present when firefox is installed in the live tree OR a persisted
+    // install sits on the nvme disk (the lazy /apps restore means the live
+    // tree is empty on a restored boot until first launch), unless the user
+    // deleted the icon. the persisted answer is the boot-seeded CACHE only -
+    // this runs on the gui process, which must never touch KFS/nvme (the
+    // shell process may be mid-restore on the same volume). (satoru)
+    bool user_wants = UIConfig::Int("desktop.firefox_icon", 1) != 0;
+    bool installed  = FirefoxLauncher::IsInstalled();
+    bool present = installed || PersistStore::HasPersistedFirefoxCached();
+    int idx = FindIconByPath("/apps/firefox/firefox");
+    if(present && user_wants && idx < 0 && icon_count < DESKTOP_MAX_ICONS){
+        AddIcon("Firefox", "/apps/firefox/firefox", 2);
+        PlaceIcon(icon_count - 1);
+        Graphics::MarkUIDirty();
+    } else if((!present || !user_wants) && idx >= 0){
+        DropIconAt(idx);
+        Graphics::MarkUIDirty();
+    }
 }
 
 void Desktop::ArrangeIcons(){
     int gx = cfg_margin_x;
-    int gy = cfg_margin_y;
+    int gy = cfg_margin_y + Taskbar::TopInset();
     int tb_h = Taskbar::cfg_height;
     int col_h = screen_height - tb_h - cfg_margin_y - 40;
     for(int i=0;i<icon_count;i++){
@@ -1337,22 +1845,14 @@ void Desktop::ArrangeIcons(){
         icons[i].y = gy;
         gy += cfg_spacing_y;
         if(gy > col_h){
-            gy = cfg_margin_y;
+            gy = cfg_margin_y + Taskbar::TopInset();
             gx += cfg_spacing_x;
         }
     }
 }
 
-void Desktop::RemoveIcon(int index){
+void Desktop::DropIconAt(int index){
     if(index<0 || index>=icon_count) return;
-    if(IsDesktopFileIcon(&icons[index])){
-        const char* p = icons[index].path;
-        if(KVFS::IsDir(p)){
-            KVFS::Rmdir(p);
-        } else if(KVFS::IsFile(p)){
-            KVFS::Unlink(p);
-        }
-    }
     // shift remaining icons (and their hover phases) down one slot.
     for(int i=index;i<icon_count-1;i++){
         icons[i]=icons[i+1];
@@ -1369,6 +1869,23 @@ void Desktop::RemoveIcon(int index){
     else if(icon_hover_target>index) icon_hover_target--;
     if(hovered_icon==index) hovered_icon=-1;
     else if(hovered_icon>index) hovered_icon--;
+}
+
+void Desktop::RemoveIcon(int index){
+    if(index<0 || index>=icon_count) return;
+    if(IsDesktopFileIcon(&icons[index])){
+        const char* p = icons[index].path;
+        if(KVFS::IsDir(p)){
+            KVFS::Rmdir(p);
+        } else if(KVFS::IsFile(p)){
+            KVFS::Unlink(p);
+        }
+    }
+    // deleting the firefox app icon is a persisted user choice - it stays
+    // gone across boots until a fresh install re-enables it. (satoru)
+    if(icons[index].icon_type==2 && starts_with(icons[index].path,"/apps/firefox/"))
+        UIConfig::SetInt("desktop.firefox_icon", 0, true);
+    DropIconAt(index);
     RefreshFiles();
     FileManagerApp::NotifyFilesystemChanged("/home/user/Desktop");
 }
@@ -1678,6 +2195,29 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     int lift = (int)(hover_t * 3.0f + 0.5f);
     iy -= lift;
 
+    // modern: gradient app tile and a smooth label with a soft shadow instead
+    // of the boxed pixel-font caption. (satoru)
+    if (UIStyle::Modern()) {
+        int gid = ic->icon_type == 1 ? AppIcons::FILES
+                : ic->icon_type == 0 ? AppIcons::EDITOR
+                : AppIcons::IdForName(ic->name);
+        int label_y = ic->y + icon_sz + 6;
+        int lw = FontTTF::MeasureText(14.0f, ic->name);
+        int span = lw > icon_sz + 20 ? icon_sz + 20 : lw;
+        if (ic->selected)
+            MDraw::RoundRect(ix - 8, iy - 6, icon_sz + 16, icon_sz + 32, 10, 0xFFFFFFFF, 46);
+        MDraw::AppTile(gid, ix, iy, icon_sz);
+        char lbl[24]; scpy(lbl, ic->name, 20);
+        int tx = ix + icon_sz / 2 - span / 2;
+        if (ic->selected)
+            MDraw::RoundRect(tx - 5, label_y - 1, span + 10, 19, 5, 0xFF2F64E8, 230);
+        Graphics::PushClipRect(tx - 2, label_y - 2, span + 4, 22);
+        FontTTF::DrawText(tx + 1, label_y + 1, 14.0f, lbl, 0xFF000000);
+        FontTTF::DrawText(tx, label_y, 14.0f, lbl, 0xFFF4F5FA);
+        Graphics::PopClipRect();
+        return;
+    }
+
     // selection highlight - glowing aura
     if(ic->selected){
         Graphics::FillRoundedRect(ix-6, iy-6, icon_sz+12, icon_sz+26, 8, cfg_col_icon_sel);
@@ -1688,6 +2228,9 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     const char* nm = ic->name;
     if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') {
         ic_top=0xFF34D058; ic_bot=0xFF1E8C3A;
+    } else if(nm[0]=='F' && nm[1]=='i' && nm[2]=='r') {
+        // firefox: dark night-sky tile so the fox mark pops. (satoru)
+        ic_top=0xFF1E1852; ic_bot=0xFF0E0A30;
     } else if(nm[0]=='F' && nm[1]=='i') {
         ic_top=0xFFFFA726; ic_bot=0xFFE08A1E;
     } else if(nm[0]=='C' && nm[1]=='o') {
@@ -1937,7 +2480,9 @@ void Desktop::HandleDoubleClick(int mx,int my){
 
     // launch app based on icon name (prefix matching)
     const char* nm = icons[idx].name;
-    if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') DesktopEnvironment::LaunchTerminal();
+    // firefox before the broad 'F' files test. (satoru)
+    if(nm[0]=='F' && nm[1]=='i' && nm[2]=='r') DesktopEnvironment::LaunchFirefox();
+    else if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') DesktopEnvironment::LaunchTerminal();
     else if(nm[0]=='T' && nm[1]=='a') DesktopEnvironment::LaunchTaskManager();
     else if(nm[0]=='T' && nm[1]=='e' && nm[2]=='x') DesktopEnvironment::LaunchTextEditor();
     else if(nm[0]=='F') DesktopEnvironment::LaunchFileBrowser();
@@ -2003,12 +2548,13 @@ void Desktop::Update(int mx,int my,bool mouse_down,bool clicked){
 
 //  desktopenvironment
 void DesktopEnvironment::Init(int sw,int sh){
+    UIStyle::Apply();
     WindowManager::Init(sw, sh);
     Desktop::Init(sw, sh);
     Taskbar::Init(sw, sh);
     ControlCenter::Init(sw, sh);
     // adjust wm desktop area to exclude taskbar
-    WindowManager::SetDesktopArea(0, 0, sw, sh - Taskbar::GetHeight());
+    Taskbar::ApplyDesktopArea();
 }
 
 // true when the scene behind a dragged window is "clean" enough that a cached
@@ -2031,12 +2577,25 @@ static bool de_drag_backdrop_safe(){
 // control center, toasts. shared by the normal path and the drag-backdrop
 // capture (which first arms the wm to omit the dragged window). (satoru)
 static void de_render_full(){
+    // resize self-heal FIRST, before any drawing: if the host resized the
+    // qemu window the bga changed mode but a starved gui res-sync may not
+    // have caught it, leaving the compositor blitting at the old pitch (the
+    // diagonal-tear garbage). resync here on whatever process is rendering,
+    // and relayout the desktop to the new size so this frame is correct. (satoru)
+    if (Graphics::SyncToHardwareGeometry()) {
+        GUI::UpdateBackbuffer();
+        DesktopEnvironment::Init(Graphics::GetWidth(), Graphics::GetHeight());
+        Graphics::MarkUIDirty();
+    }
     Desktop::Render();
     WindowManager::RenderAll();
     // pump queued wayland frame callbacks once per composited frame so clients
     // are released to submit their next buffer. (satoru)
     WaylandServer::DispatchPendingFrames();
     Taskbar::Render();
+    // minimize/restore pour into and out of the taskbar tile, so it draws
+    // over the taskbar rather than sliding under it. (satoru)
+    WindowManager::RenderMotionOverlay();
     ControlCenter::Render();
     // toasts render topmost so they sit above every panel. (satoru)
     NotificationManager::Render();
@@ -2099,6 +2658,8 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
             wl_prev_left = mouse_down;
         }
     }
+
+    // wayland key forwarding lives in InputManager::Poll (event-driven). (satoru)
 
     // alt-tab: cycle focus through visible windows by id (rough z-order proxy).
     // we want true z-order but the current z_order field changes only on Focus(),
@@ -2224,7 +2785,8 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         if(Taskbar::volume_popup_open && Taskbar::volume_slider_dragging){
             // use same popup position calculation as rendervolumepopup
             int pop_h = 180;
-            int pop_y = tb_popup_y(pop_h, 8, 0);
+            int pop_x_unused, pop_y;
+            tb_volume_popup_xy(pop_h, 0, pop_x_unused, pop_y);
             int track_y = pop_y + 36;
             int track_h = 110;
             int rel = track_y + track_h - my;
@@ -2321,7 +2883,9 @@ void DesktopEnvironment::Update(){
 
 void DesktopEnvironment::ReloadFromConfig(){
     UIConfig::Reload();
+    UIStyle::Apply();
     Taskbar::ReloadFromConfig();
+    Taskbar::ApplyDesktopArea();
     Desktop::ReloadFromConfig();
     WindowManager::ReloadFromConfig();
     Graphics::MarkUIDirty();          // colors/layout/wallpaper may have changed
@@ -2361,10 +2925,29 @@ void DesktopEnvironment::LaunchTaskManager(){
     TaskManagerApp::Open();
 }
 void DesktopEnvironment::LaunchBrowser(){
-    BrowserApp::Open();
+    // the browser is firefox on the linux runtime; the old placeholder tile
+    // app is no longer reachable from the shell. (satoru)
+    LaunchFirefox();
 }
 void DesktopEnvironment::LaunchMediaPlayer(){
     MediaPlayerApp::Open();
+}
+void DesktopEnvironment::LaunchFirefox(){
+    // run the full `firefox` shell flow (lazy restore / install / exec) on the
+    // shell kernel-process, detached - no terminal window. the gui thread only
+    // queues + toasts; firefox's own wayland window appears when gecko maps
+    // its toplevel. (satoru)
+    bool installed = FirefoxLauncher::IsInstalled();
+    if(!KernelProcesses::RunShellCommandDetached("firefox")){
+        NotificationManager::Post("Firefox",
+            "Already starting - give it a moment.",
+            NotificationManager::ICON_INFO, 4000);
+        return;
+    }
+    NotificationManager::Post("Firefox",
+        installed ? "Starting Firefox..."
+                  : "Setting up Firefox - first launch takes a minute...",
+        NotificationManager::ICON_INFO, 6000);
 }
 
 // session control --------------------------------------------------------

@@ -161,7 +161,33 @@ isr_common:
     ; Remove vector number and error code from stack
     add  rsp, 16
 
+    ; ── return-frame guard (the ring-0 RIP=0x3 corruptor) ──
+    ; A guard two instructions before scheduler_switch_to's `ret` fired ZERO
+    ; times across 20 boots while FOUR of them still died at RIP=0x3 with
+    ; CS=0x8, which rules the context switch out entirely. CS=0x8 means the
+    ; faulting return went INTO kernel mode, and this iretq is the kernel's
+    ; return path - so the corrupted thing is the saved interrupt frame on some
+    ; kernel stack, not a switch frame.
+    ;
+    ; Layout here: [rsp]=RIP, +8=CS, +16=RFLAGS, +24=RSP, +32=SS. Page 0 is
+    ; never mapped in either ring, so a RIP below 0x1000 is unambiguously
+    ; garbage and this is safe for ring-3 returns too (firefox is PIE-mapped
+    ; high). Catches 0x3, 0x0 and 0xA - every value this corruptor has produced.
+    ; (satoru)
+    cmp  qword [rsp], 0x1000
+    jb   .frame_corrupt
     iretq
+.frame_corrupt:
+    ; rdi = bad rip, rsi = frame address, rdx = saved cs. does not return.
+    mov  rdi, [rsp]
+    mov  rsi, rsp
+    mov  rdx, [rsp + 8]
+    extern kp_iret_corrupt_report
+    call kp_iret_corrupt_report
+.frame_hang:
+    cli
+    hlt
+    jmp  .frame_hang
 
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  ISR stub table - array of 48 function pointers for C to index

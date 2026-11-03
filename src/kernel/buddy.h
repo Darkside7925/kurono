@@ -10,7 +10,7 @@
 //  is split down recursively; on free, buddies are coalesced upward.
 //
 //  Memory itself is still owned by PMM; the buddy allocator borrows
-//  `BUDDY_POOL_BYTES` (default 256 MB) of contiguous frames at Init()
+//  ram/32 (8 MB .. `BUDDY_POOL_BYTES` = 256 MB) of contiguous frames at Init()
 //  and manages them privately.  Frees outside that pool fall back to
 //  PMM::FreeFrame().  This makes it side-by-side with the existing
 //  bitmap allocator instead of replacing it (safer migration path).
@@ -19,6 +19,7 @@
 
 #define BUDDY_ORDER_MAX     11      // 2^11 pages = 2048 = 8 MB
 #define BUDDY_POOL_BYTES    (256ull * 1024ull * 1024ull)
+#define BUDDY_POOL_MIN_BYTES (8ull * 1024ull * 1024ull)
 #define BUDDY_PAGE_SIZE     4096ull
 
 struct BuddyBlock {

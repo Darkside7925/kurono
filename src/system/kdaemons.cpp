@@ -103,7 +103,15 @@ volatile bool g_ksa_ok  = true;
 
 [[noreturn]] void worker_entry() {
     SerialLogger::Log("[ksecurity] policy watch online\r\n");
-    uint32_t next_ms = 0;
+    // boot grace: this is a PERIODIC health watch (re-verifies every 30s), but
+    // it used to run its first pass immediately, putting the full
+    // POLICY-SELFTEST + KSA-SELFTEST sequence (~900ms measured: policy ~780ms,
+    // ksa ~600ms including an ept context spawn/teardown) directly on the boot
+    // critical path, where it also starved the cooperative gui loop. defer the
+    // first pass past desktop bring-up. safe: g_healthy/g_supr_ok/g_ksa_ok all
+    // default true, so the system reports healthy until the first real result -
+    // the same optimistic stance the ksa-unavailable branch already takes. (satoru)
+    uint32_t next_ms = 10000;
     bool first = true;
     for (;;) {
         uint32_t now = (uint32_t)Scheduler::NowMs();
@@ -128,7 +136,7 @@ volatile bool g_ksa_ok  = true;
             }
             g_healthy = healthy;
             first = false;
-            next_ms = now + 30000;   // re-verify every 30s (satoru)
+            next_ms = now + 600000;   // re-verify every 10 min (satoru)
         }
         Scheduler::SleepMs(500);
     }

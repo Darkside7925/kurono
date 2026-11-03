@@ -43,6 +43,11 @@ namespace {
     //  tlb-shootdown ack counter: receivers increment after reloading cr3. (satoru)
     volatile uint32_t g_tlb_ack = 0;
 
+    //  the kernel address-space root, captured in StartAPs, for LoadKernelCr3.
+    //  an idle/parked cpu switches here so it never walks a dead process's
+    //  (possibly destroyed + recycled) page tables. (satoru)
+    volatile uint64_t g_kernel_cr3 = 0;
+
     //  flush epochs (see smp.h): start-seq bumps at broadcast entry, full-seq
     //  latches the highest start-seq that got acks from every online peer.
     //  senders are serialized by the callers' mmap/kls locks; receivers only
@@ -72,6 +77,46 @@ namespace {
 
     const uint32_t MSR_KERNEL_GS_BASE = 0xC0000102u;
 
+    //  x2apic handling, modelled on linux arch/x86/kernel/apic/apic.c. firmware that
+    //  hands over with IA32_APIC_BASE.EXTD (bit 10) set kills the xapic mmio window, so
+    //  every LapicRead/Write (ids, eoi, ipis, timer) hit dead memory. g_x2apic means
+    //  "locked in x2apic mode": the lapic is then driven through the 0x800 msr block. (satoru)
+    bool     g_x2apic = false;
+    int      g_x2apic_test = 0;         // kurono.x2apictest=1: force x2apic on first; =2: also pretend it is locked (satoru)
+    uint32_t g_icr_hi = 0;              // xapic-style icr high half, folded into msr 0x830 (satoru)
+    bool     g_lapic_dead = false;      // apic left globally disabled and could not be fixed (satoru)
+
+    inline void cpuid_ex(uint32_t leaf, uint32_t sub, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
+        __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
+    }
+
+    //  linux x2apic_hw_locked: ARCH_CAPABILITIES (msr 0x10a, cpuid.7.0:edx[29]) bit 21 says
+    //  IA32_XAPIC_DISABLE_STATUS (msr 0xbd) exists; its bit 0 = legacy xapic permanently off. (satoru)
+    bool x2apic_hw_locked() {
+        uint32_t a, b, c, d;
+        cpuid_ex(0, 0, &a, &b, &c, &d);
+        if (a < 7) return false;
+        cpuid_ex(7, 0, &a, &b, &c, &d);
+        if (!(d & (1u << 29))) return false;
+        if (!(rdmsr(0x10A) & (1ULL << 21))) return false;
+        return (rdmsr(0xBD) & 1ULL) != 0;
+    }
+
+    //  linux __x2apic_disable: both enable bits off, then xapic only. result: 0 = was not
+    //  in x2apic mode, 1 = switched back to xapic and verified, 2 = locked (stays x2apic),
+    //  3 = write did not take (apic state unknown). (satoru)
+    int x2apic_to_xapic() {
+        uint64_t m = rdmsr(0x1B);
+        if (!(m & (1ULL << 10))) return 0;
+        if (x2apic_hw_locked()) return 2;
+        wrmsr(0x1B, m & ~((1ULL << 10) | (1ULL << 11)));
+        wrmsr(0x1B, m & ~(1ULL << 10));
+        uint64_t r = rdmsr(0x1B);
+        if (r & (1ULL << 10)) return 3;
+        if (!(r & (1ULL << 11))) return 3;
+        return 1;
+    }
+
     //  busy-wait - interrupts are disabled at this point in boot so we cannot
     //  sleep; spin on the (already-calibrated) tsc instead. (satoru)
     void busy_us(uint64_t us) {
@@ -79,7 +124,15 @@ namespace {
         if (hz < 1000000ULL) hz = 2000000000ULL;   // ~2ghz fallback (satoru)
         uint64_t ticks = (hz / 1000000ULL) * us;
         uint64_t start = rdtsc();
-        while (rdtsc() - start < ticks) __asm__ volatile("pause");
+        // iteration cap too: a stuck/miscalibrated tsc must not hang boot (satoru)
+        uint64_t cap = us * 4000ULL + 1000ULL;
+        while (rdtsc() - start < ticks && cap--) __asm__ volatile("pause");
+    }
+
+    //  wait (bounded) for the previous ipi to leave the icr (delivery status, bit 12). (satoru)
+    void icr_idle() {
+        for (int i = 0; i < 100000 && (SMP::LapicRead(0x300) & (1u << 12)); i++)
+            __asm__ volatile("pause");
     }
 
     inline uint32_t mmio_r32(uint64_t addr) {
@@ -134,32 +187,70 @@ namespace {
         return 0;
     }
 
-    //  locate the madt ("APIC") via the rsdt (acpi 1.0) or xsdt (acpi 2.0+). (satoru)
+    //  boot-provided rsdp copy (see BootAcpi in smp.h) + the maxcpus request. (satoru)
+    uint8_t  g_boot_rsdp[64];
+    uint32_t g_boot_rsdp_len = 0;
+    bool     g_boot_efi = false;
+    uint32_t g_max_cpus_req = 0;
+
+    //  the kernel identity map covers 0..512 GiB (kurono_boot.asm, 2 MiB pages), so
+    //  acpi memory is read in place; refuse anything outside it (never fault). (satoru)
+    const uint64_t ACPI_MAP_LIMIT = 512ULL << 30;
+
+    //  a sane, mapped sdt: header inside the identity map, length plausible. (satoru)
+    const AcpiSdt* sdt_at(uint64_t phys) {
+        if (!phys || phys + sizeof(AcpiSdt) > ACPI_MAP_LIMIT) return nullptr;
+        const AcpiSdt* t = (const AcpiSdt*)(uintptr_t)phys;
+        if (t->length < sizeof(AcpiSdt) || t->length > (16u << 20)) return nullptr;
+        if (phys + t->length > ACPI_MAP_LIMIT) return nullptr;
+        return t;
+    }
+
+    //  locate the madt ("APIC") via the rsdt (acpi 1.0) or xsdt (acpi 2.0+), logging
+    //  every table signature found (handy for later i2c/hid work). (satoru)
     const AcpiSdt* find_madt(uint64_t rsdp_phys) {
         const uint8_t* rsdp = (const uint8_t*)(uintptr_t)rsdp_phys;
         uint8_t revision = rsdp[15];
-        if (revision >= 2) {
-            uint64_t xsdt = *(const uint64_t*)(rsdp + 24);
-            const AcpiSdt* x = (const AcpiSdt*)(uintptr_t)xsdt;
-            if (!x) return nullptr;
-            uint32_t n = (x->length - sizeof(AcpiSdt)) / 8;
-            const uint64_t* ptrs = (const uint64_t*)((const uint8_t*)x + sizeof(AcpiSdt));
-            for (uint32_t i = 0; i < n; i++) {
-                const AcpiSdt* t = (const AcpiSdt*)(uintptr_t)ptrs[i];
-                if (t && sig4(t->signature, "APIC")) return t;
-            }
-        } else {
-            uint32_t rsdt = *(const uint32_t*)(rsdp + 16);
-            const AcpiSdt* r = (const AcpiSdt*)(uintptr_t)rsdt;
-            if (!r) return nullptr;
-            uint32_t n = (r->length - sizeof(AcpiSdt)) / 4;
-            const uint32_t* ptrs = (const uint32_t*)((const uint8_t*)r + sizeof(AcpiSdt));
-            for (uint32_t i = 0; i < n; i++) {
-                const AcpiSdt* t = (const AcpiSdt*)(uintptr_t)ptrs[i];
-                if (t && sig4(t->signature, "APIC")) return t;
+        uint64_t xsdt_phys = (revision >= 2) ? *(const uint64_t*)(rsdp + 24) : 0;
+        uint32_t rsdt_phys = *(const uint32_t*)(rsdp + 16);
+        const AcpiSdt* madt = nullptr;
+        const AcpiSdt* root = xsdt_phys ? sdt_at(xsdt_phys) : nullptr;
+        bool wide = root != nullptr;
+        if (!root) root = sdt_at(rsdt_phys);   // no/invalid xsdt: fall back to rsdt (satoru)
+        SerialLogger::Log("[ACPI] rev "); SerialLogger::LogDec(revision);
+        SerialLogger::Log(" xsdt "); SerialLogger::LogHex64(xsdt_phys);
+        SerialLogger::Log(" rsdt "); SerialLogger::LogHex64(rsdt_phys);
+        SerialLogger::Log(wide ? " (using xsdt)\r\n" : (root ? " (using rsdt)\r\n" : " (no usable root table)\r\n"));
+        if (!root) return nullptr;
+        uint32_t esz = wide ? 8 : 4;
+        uint32_t n = (root->length - sizeof(AcpiSdt)) / esz;
+        const uint8_t* ptrs = (const uint8_t*)root + sizeof(AcpiSdt);
+        SerialLogger::Log("[ACPI] tables ("); SerialLogger::LogDec((int)n); SerialLogger::Log("):");
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t tp = wide ? *(const uint64_t*)(ptrs + i * 8) : *(const uint32_t*)(ptrs + i * 4);
+            const AcpiSdt* t = sdt_at(tp);
+            if (!t) { SerialLogger::Log(" ????"); continue; }
+            char sg[6] = { (char)t->signature[0], (char)t->signature[1],
+                           (char)t->signature[2], (char)t->signature[3], 0, 0 };
+            SerialLogger::Log(" "); SerialLogger::Log(sg);
+            if (!madt && sig4(t->signature, "APIC")) {
+                if (checksum((const uint8_t*)t, t->length) != 0)
+                    SerialLogger::Log("(bad-csum)");   // linux warns and uses it too (satoru)
+                madt = t;
             }
         }
-        return nullptr;
+        SerialLogger::Log("\r\n");
+        return madt;
+    }
+
+    //  candidate apic ids from the madt, in table order (bsp first), deduped. (satoru)
+    uint32_t g_cand[256];
+    uint32_t g_cand_n = 0;
+    uint32_t g_cand_skipped = 0;     // unreachable (>=255) or not-enabled entries (satoru)
+
+    void add_candidate(uint32_t id) {
+        for (uint32_t i = 0; i < g_cand_n; i++) if (g_cand[i] == id) return;
+        if (g_cand_n < 256) g_cand[g_cand_n++] = id;
     }
 
     void register_cpu(uint32_t apic_id) {
@@ -177,25 +268,91 @@ namespace {
         if (apic_id < 256) g_apicid_to_index[apic_id] = (int)idx;
     }
 
-    //  walk madt processor-local-apic entries (type 0); register each enabled core.
-    //  the bsp (its own apic id) is registered first so it always gets index 0. (satoru)
-    void enumerate_from_madt(const AcpiSdt* madt, uint32_t bsp_apic) {
-        register_cpu(bsp_apic);
+    //  walk madt entries: type 0 (processor local apic) and type 9 (processor local
+    //  x2apic), as linux acpi_parse_lapic / acpi_parse_x2apic do. flags bit0 =
+    //  enabled, bit1 = online-capable. like linux, a core that is only
+    //  online-capable (not enabled) is a hotplug slot: counted, never started at
+    //  boot. the xapic mmio ipi path reaches ids 0..254 only, so larger x2apic ids
+    //  are skipped (logged), never sent a bad ipi. results land in g_cand[]. (satoru)
+    void parse_madt(const AcpiSdt* madt, uint32_t bsp_apic) {
+        add_candidate(bsp_apic);
+        uint32_t n0 = 0, n9 = 0, hot = 0, big = 0;
         const uint8_t* p = (const uint8_t*)madt + sizeof(AcpiSdt) + 8;  // skip lapic addr + flags (satoru)
         const uint8_t* end = (const uint8_t*)madt + madt->length;
         while (p + 2 <= end) {
             uint8_t type = p[0];
             uint8_t len  = p[1];
-            if (len < 2) break;  // malformed - stop (satoru)
-            if (type == 0 && len >= 8) {         // processor local apic (satoru)
-                uint8_t apic_id = p[3];
-                uint32_t flags = *(const uint32_t*)(p + 4);
-                if (flags & 1)                    // bit0 = enabled (satoru)
-                    register_cpu(apic_id);
+            if (len < 2 || p + len > end) break;  // malformed - stop (satoru)
+            uint32_t id = 0xFFFFFFFFu, flags = 0;
+            bool have = false;
+            if (type == 0 && len >= 8) {            // processor local apic (satoru)
+                id = p[3]; flags = *(const uint32_t*)(p + 4);
+                if (id == 0xFF) id = 0xFFFFFFFFu;   // 0xff = broadcast, not a cpu (satoru)
+                have = true; n0++;
+            } else if (type == 9 && len >= 16) {    // processor local x2apic (satoru)
+                id = *(const uint32_t*)(p + 4); flags = *(const uint32_t*)(p + 8);
+                have = true; n9++;
+            }
+            if (have && id != 0xFFFFFFFFu) {
+                if (flags & 1) {
+                    if (id >= 255) { big++; g_cand_skipped++; }   // xapic cannot address it (satoru)
+                    else add_candidate(id);
+                } else if (flags & 2) { hot++; g_cand_skipped++; }
             }
             p += len;
         }
+        SerialLogger::Log("[SMP] madt entries: type0="); SerialLogger::LogDec((int)n0);
+        SerialLogger::Log(" type9="); SerialLogger::LogDec((int)n9);
+        SerialLogger::Log(" usable="); SerialLogger::LogDec((int)g_cand_n);
+        SerialLogger::Log(" hotplug-only="); SerialLogger::LogDec((int)hot);
+        SerialLogger::Log(" id>=255-skipped="); SerialLogger::LogDec((int)big);
+        SerialLogger::Log("\r\n");
     }
+}
+
+void BootAcpi::SetRsdp(const uint8_t* src, uint32_t avail) {
+    if (!src || avail < 20 || !sig8(src, "RSD PTR ") || checksum(src, 20) != 0) return;
+    uint32_t len = 20;
+    uint8_t rev = src[15];
+    bool v2 = false;
+    if (rev >= 2 && avail >= 36) {
+        uint32_t l = *(const uint32_t*)(src + 20);
+        if (l >= 36 && l <= sizeof(g_boot_rsdp) && l <= avail && checksum(src, l) == 0) { len = l; v2 = true; }
+    }
+    for (uint32_t i = 0; i < sizeof(g_boot_rsdp); i++) g_boot_rsdp[i] = i < len ? src[i] : 0;
+    if (!v2 && rev >= 2) {              // bad extended part: present it as a v1 rsdp (satoru)
+        g_boot_rsdp[8]  = (uint8_t)(g_boot_rsdp[8] + rev);
+        g_boot_rsdp[15] = 0;
+    }
+    g_boot_rsdp_len = len;
+}
+void     BootAcpi::SetEfiBoot() { g_boot_efi = true; }
+uint64_t BootAcpi::Rsdp()       { return g_boot_rsdp_len ? (uint64_t)(uintptr_t)g_boot_rsdp : 0; }
+bool     BootAcpi::IsEfiBoot()  { return g_boot_efi; }
+void     SMP::SetMaxCpus(uint32_t n) { g_max_cpus_req = n; }
+void     SMP::SetX2apicTest(int mode) { g_x2apic_test = mode; }
+
+void SMP::SelfTestMadt() {
+    alignas(8) static uint8_t t[128];
+    for (unsigned i = 0; i < sizeof(t); i++) t[i] = 0;
+    uint8_t* p = t + sizeof(AcpiSdt) + 8;
+    auto lapic = [&](uint8_t id, uint32_t fl) { p[0] = 0; p[1] = 8; p[2] = id; p[3] = id; *(uint32_t*)(p + 4) = fl; p += 8; };
+    auto x2 = [&](uint32_t id, uint32_t fl) { p[0] = 9; p[1] = 16; *(uint32_t*)(p + 4) = id; *(uint32_t*)(p + 8) = fl; p += 16; };
+    lapic(0, 1);        // bsp (satoru)
+    x2(300, 1);         // unreachable by xapic: skipped (satoru)
+    x2(20, 1);          // usable (satoru)
+    x2(21, 2);          // online-capable only: hotplug, skipped (satoru)
+    lapic(0, 1);        // duplicate (satoru)
+    x2(5, 1);           // usable (satoru)
+    lapic(9, 0);        // disabled: skipped silently (satoru)
+    ((AcpiSdt*)t)->length = (uint32_t)(p - t);
+    uint32_t sn = g_cand_n, ss = g_cand_skipped;
+    g_cand_n = 0; g_cand_skipped = 0;
+    parse_madt((const AcpiSdt*)t, 0);
+    bool ok = g_cand_n == 3 && g_cand[0] == 0 && g_cand[1] == 20 && g_cand[2] == 5 && g_cand_skipped == 2;
+    SerialLogger::Log(ok ? "[SMP] madt selftest PASS (expect usable=3 hotplug=1 big=1)\r\n"
+                         : "[SMP] madt selftest FAIL\r\n");
+    g_cand_n = sn; g_cand_skipped = ss;
 }
 
 void SMP::Init() {
@@ -207,16 +364,97 @@ void SMP::Init() {
 
     // lapic mmio base from ia32_apic_base (msr 0x1b), masked to the page. (satoru)
     uint64_t apic_base_msr = rdmsr(0x1B);
+
+    // kurono.x2apictest=1: put the bsp into x2apic mode first, so the disable path below can
+    // be exercised without firmware that does it. xapic -> x2apic is the legal transition. (satoru)
+    if (g_x2apic_test) {
+        uint32_t a, b, c, d;
+        cpuid_ex(1, 0, &a, &b, &c, &d);
+        if ((c & (1u << 21)) && (apic_base_msr & (1ULL << 11)) && !(apic_base_msr & (1ULL << 10))) {
+            wrmsr(0x1B, apic_base_msr | (1ULL << 10));
+            apic_base_msr = rdmsr(0x1B);
+            SerialLogger::Log("[SMP] x2apictest: forced x2apic on, apic_base now ");
+            SerialLogger::LogHex64(apic_base_msr); SerialLogger::Log("\r\n");
+        } else {
+            SerialLogger::Log("[SMP] x2apictest: cpu cannot enter x2apic here, nothing forced\r\n");
+        }
+    }
+
+    // firmware-enabled x2apic: switch back to xapic BEFORE any lapic mmio access (as linux
+    // __x2apic_disable). if the hardware locks x2apic on, drive the lapic via msrs instead. (satoru)
+    if (apic_base_msr & (1ULL << 10)) {
+        SerialLogger::Log("[SMP] x2apic enabled by firmware, apic_base "); SerialLogger::LogHex64(apic_base_msr);
+        SerialLogger::Log("\r\n");
+        int xr = (g_x2apic_test == 2) ? 2 : x2apic_to_xapic();   // =2 exercises the locked (msr driven) path (satoru)
+        apic_base_msr = rdmsr(0x1B);
+        if (xr == 1) {
+            SerialLogger::Log("[SMP] x2apic disabled, back in xapic mode, apic_base now ");
+            SerialLogger::LogHex64(apic_base_msr); SerialLogger::Log("\r\n");
+        } else if (xr == 2) {
+            g_x2apic = true;
+            SerialLogger::Log("[SMP] !!! x2apic is LOCKED on (legacy xapic disabled by hardware): "
+                              "driving the lapic through msrs, single cpu only\r\n");
+        } else {
+            g_lapic_dead = true;
+            SerialLogger::Log("[SMP] !!! x2apic disable did not take, apic_base "); SerialLogger::LogHex64(apic_base_msr);
+            SerialLogger::Log(": lapic unusable, single cpu only\r\n");
+        }
+    }
     g_lapic_base = apic_base_msr & 0xFFFFF000ULL;
     if (g_lapic_base == 0) g_lapic_base = 0xFEE00000ULL;
 
-    LapicEnable();
-    uint32_t bsp_apic = ApicId();
+    if (!g_lapic_dead) LapicEnable();
+    uint32_t bsp_apic = g_lapic_dead ? 0 : ApicId();
 
-    uint64_t rsdp = find_rsdp();
+    SerialLogger::Log("[SMP] apic_base msr "); SerialLogger::LogHex64(apic_base_msr);
+    SerialLogger::Log(g_x2apic ? " (x2apic mode, msr access)\r\n"
+                               : ((apic_base_msr & (1ULL << 10)) ? " (x2apic mode ON)\r\n" : " (xapic mode)\r\n"));
+    {   // hybrid part? leaf 0x1a reports the calling core's type (0x20 atom, 0x40 core). (satoru)
+        uint32_t a, b, c, d;
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0u), "c"(0u));
+        if (a >= 0x1A) {
+            __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x1Au), "c"(0u));
+            if (a >> 24) {
+                SerialLogger::Log("[SMP] hybrid cpu, bsp core type ");
+                SerialLogger::Log((a >> 24) == 0x40 ? "P (core)\r\n" : "E (atom)\r\n");
+            }
+        }
+    }
+
+    // acpi root: the bootloader-provided rsdp first (the only source on uefi),
+    // then the legacy bios scan. (satoru)
+    uint64_t rsdp = BootAcpi::Rsdp();
+    bool rsdp_boot = rsdp != 0;
+    if (rsdp) {
+        SerialLogger::Log(BootAcpi::IsEfiBoot() ? "[ACPI] rsdp from efi at " : "[ACPI] rsdp from boot tag at ");
+        SerialLogger::LogHex64(rsdp); SerialLogger::Log("\r\n");
+    } else {
+        rsdp = find_rsdp();
+        if (rsdp) { SerialLogger::Log("[ACPI] rsdp from legacy scan at "); SerialLogger::LogHex64(rsdp); SerialLogger::Log("\r\n"); }
+        else SerialLogger::Log("[ACPI] no rsdp found\r\n");
+    }
+    (void)rsdp_boot;
     const AcpiSdt* madt = rsdp ? find_madt(rsdp) : nullptr;
+
+    // cpu cap: explicit kurono.maxcpus wins; else 8 on efi boots (real hardware has
+    // only ever run stably with few cores); bios/qemu paths stay uncapped. (satoru)
+    uint32_t cap = SMP_MAX_CPUS;
+    bool cap_default = false;
+    if (g_max_cpus_req) cap = g_max_cpus_req;
+    else if (BootAcpi::IsEfiBoot()) { cap = 8; cap_default = true; }
+    if (cap > SMP_MAX_CPUS) cap = SMP_MAX_CPUS;
+    if (cap < 1) cap = 1;
+    if (g_x2apic || g_lapic_dead) cap = 1;   // aps cannot be brought up without a usable xapic path (satoru)
+
+    uint32_t available = 0;
     if (madt) {
-        enumerate_from_madt(madt, bsp_apic);
+        parse_madt(madt, bsp_apic);
+        available = g_cand_n;
+        register_cpu(bsp_apic);
+        // madt order: on hybrid parts firmware lists the p-cores first, so first-listed
+        // prefers them (leaf 0x1a is only readable on the cpu itself). (satoru)
+        for (uint32_t i = 0; i < g_cand_n && g_cpu_count < cap; i++)
+            if (g_cand[i] != bsp_apic) register_cpu(g_cand[i]);
         SerialLogger::Log("[SMP] MADT found: ");
     } else {
         // fallback: trust the cpuid logical-core count, assume sequential apic ids
@@ -224,7 +462,8 @@ void SMP::Init() {
         register_cpu(bsp_apic);
         int n = CPUDetect::GetThreadCount();
         if (n < 1) n = 1;
-        for (int id = 0; id < n && g_cpu_count < SMP_MAX_CPUS; id++)
+        available = (uint32_t)n;
+        for (int id = 0; id < n && g_cpu_count < cap; id++)
             if ((uint32_t)id != bsp_apic) register_cpu((uint32_t)id);
         SerialLogger::Log("[SMP] no MADT, cpuid fallback: ");
     }
@@ -248,6 +487,13 @@ void SMP::Init() {
         SerialLogger::LogDec((int)g_cpus[i].apic_id);
         SerialLogger::Log("\r\n");
     }
+    if (available > g_cpu_count) {
+        SerialLogger::Log("[SMP] capped at "); SerialLogger::LogDec((int)cap);
+        SerialLogger::Log(cap_default ? " (default on efi; kurono.maxcpus=N overrides), " : " (kurono.maxcpus), ");
+        SerialLogger::LogDec((int)available); SerialLogger::Log(" available\r\n");
+    }
+    if (available > SMP_MAX_CPUS)
+        SerialLogger::Log("[SMP] WARNING: more cpus than SMP_MAX_CPUS, extra ignored\r\n");
 }
 
 uint32_t SMP::CpuCount() { return g_cpu_count ? g_cpu_count : 1; }
@@ -258,8 +504,16 @@ uint32_t SMP::OnlineCount() {
     return n ? n : 1;
 }
 
+void SMP::MarkSelfOffline() {
+    // containment park (see smp.h): stop counting this cpu for tlb-ack wants
+    // and the online census - it is about to cli-hlt forever. (satoru)
+    uint32_t idx = CpuIndex();
+    if (idx < g_cpu_count) g_cpus[idx].online = 0;
+}
+
 uint32_t SMP::ApicId() {
-    if (g_lapic_base == 0) return 0;
+    if (g_lapic_base == 0 || g_lapic_dead) return 0;
+    if (g_x2apic) return LapicRead(0x20);   // x2apic id msr is the full 32 bits (satoru)
     return LapicRead(0x20) >> 24;   // local apic id register (satoru)
 }
 
@@ -272,8 +526,23 @@ uint32_t SMP::CpuIndex() {
 PerCpu* SMP::Current()            { return &g_cpus[CpuIndex()]; }
 PerCpu* SMP::ByIndex(uint32_t i)  { return (i < g_cpu_count) ? &g_cpus[i] : nullptr; }
 
-uint32_t SMP::LapicRead(uint32_t reg)             { return mmio_r32(g_lapic_base + reg); }
-void     SMP::LapicWrite(uint32_t reg, uint32_t v){ mmio_w32(g_lapic_base + reg, v); }
+uint32_t SMP::LapicRead(uint32_t reg) {
+    if (g_lapic_dead) return 0;
+    if (g_x2apic) return reg == 0x310 ? 0u : (uint32_t)rdmsr(0x800u + (reg >> 4));
+    return mmio_r32(g_lapic_base + reg);
+}
+void SMP::LapicWrite(uint32_t reg, uint32_t v) {
+    if (g_lapic_dead) return;
+    if (g_x2apic) {
+        // x2apic folds the two xapic icr halves into one 64-bit msr (0x830), destination in
+        // bits 63:32 instead of 31:24 of the high half. (satoru)
+        if (reg == 0x310) { g_icr_hi = v; return; }
+        if (reg == 0x300) { wrmsr(0x830, ((uint64_t)(g_icr_hi >> 24) << 32) | v); g_icr_hi = 0; return; }
+        wrmsr(0x800u + (reg >> 4), v);
+        return;
+    }
+    mmio_w32(g_lapic_base + reg, v);
+}
 
 void SMP::SetupGsBase() {
     // KERNEL_GS_BASE holds this cpu's PerCpu pointer while in user mode; the
@@ -300,6 +569,10 @@ void SMP::LapicEnable() {
 //  no shared serial here - the bsp logs each core after its online flag flips,
 //  so there is no cross-core console race. (satoru)
 extern "C" void ap_entry() {
+    // match the bsp's mode before the first lapic mmio access: an ap that comes out of
+    // INIT-SIPI with x2apic still on (firmware left it) would hit the dead window. no
+    // serial here (shared console); the bsp reports the outcome via the online flag. (satoru)
+    (void)x2apic_to_xapic();
     SMP::LapicEnable();
     HAL::SetupAPCpuState();  // own gdt+tss, shared idt, per-core syscall msrs (satoru)
     SMP::SetupGsBase();      // KERNEL_GS_BASE -> this ap's PerCpu (after the gs reload) (satoru)
@@ -344,16 +617,39 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
     uint32_t idx = SMP::CpuIndex();
     Scheduler::SetCurrentForThisCpu(nullptr);   // no task on this cpu right now (satoru)
     Userspace::SetActiveForThisCpu(nullptr);    // no active user session either (satoru)
+    //  idle maintenance throttle (task 17): a parked cpu must still advance the
+    //  sleep_ticks promotions + the futex repoll heal, or threads it parked
+    //  (futex/nanosleep with no successor) oversleep until the bsp's next
+    //  cooperative Schedule (~50ms) - the promotion paths in the timer preempts
+    //  are ring-3-gated and never run while this cpu idles in ring-0 here. (satoru)
+    uint64_t last_maint_ms = 0;
     for (;;) {
+        //  never idle on a dead task's cr3: this cpu owns no task here, but its
+        //  last thread's address space may be reaped + its page tables recycled
+        //  while our walker can still fetch through them (garbage kernel
+        //  translations = random corruption). cheap: compares before writing. (satoru)
+        SMP::LoadKernelCr3();
+        {
+            uint64_t nowm = Timer::GetRealMs64();
+            if (nowm != last_maint_ms) {   // at most once per ms (satoru)
+                last_maint_ms = nowm;
+                Scheduler::ApIdleMaint();
+            }
+        }
         if (g_ap_thread_sched) {
             Process* t = Scheduler::ClaimReadyThreadForCpu(idx);
             if (t) {
-                {
-                    // claim trace - resumes are infrequent (an idle ap picking up a
-                    // ready sibling), so this stays low-volume. (satoru)
+                //  claim trace - THROTTLED: with the futex/nanosleep ap-park a
+                //  resume happens per wake (thousands/boot) and one serial line
+                //  is an ~8.7ms uart busy-wait - unthrottled this alone dragged
+                //  the boot by tens of seconds. first few + 1-per-4096. (satoru)
+                static uint32_t s_apr_n = 0;
+                uint32_t an = __atomic_add_fetch(&s_apr_n, 1u, __ATOMIC_RELAXED);
+                if (an <= 12 || (an & 4095u) == 0) {
                     uint64_t lf; g_ap_log_lock.LockIrqSave(&lf);
                     SerialLogger::Log("[apr] cpu"); SerialLogger::LogDec((int)idx);
                     SerialLogger::Log(" resume pid="); SerialLogger::LogDec((int)t->pid);
+                    SerialLogger::Log(" n="); SerialLogger::LogDec((int)an);
                     SerialLogger::Log("\r\n");
                     g_ap_log_lock.UnlockIrqRestore(lf);
                 }
@@ -465,6 +761,16 @@ void SMP::ApIdleFrame(InterruptFrame* f) {
 void SMP::BroadcastTlbFlush() {
     uint32_t online = OnlineCount();
     if (online <= 1) return;
+    //  serialize broadcasters: the kls historically serialized every caller,
+    //  but the kmemx pending-free flushes from its own kernel process, so two
+    //  rounds could share one ack counter - a peer's double-ack (collapsed
+    //  ipis) can then stand in for a peer that never flushed, falsely
+    //  advancing the proof epoch. plain exchange spin with IF ON: a waiting
+    //  broadcaster must still service + ack the holder's ipi or the holder
+    //  times out on it. (satoru)
+    static volatile uint32_t s_bcast_lock = 0;
+    while (__atomic_exchange_n(&s_bcast_lock, 1u, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
     uint64_t seq = __atomic_add_fetch(&g_tlb_flush_start_seq, 1u, __ATOMIC_SEQ_CST);
     uint32_t want = online - 1;
     __atomic_store_n(&g_tlb_ack, 0u, __ATOMIC_RELEASE);
@@ -495,6 +801,7 @@ void SMP::BroadcastTlbFlush() {
                    !__atomic_compare_exchange_n(&g_tlb_flush_full_seq, &cur, seq,
                                                 false, __ATOMIC_SEQ_CST,
                                                 __ATOMIC_ACQUIRE)) { }
+            __atomic_store_n(&s_bcast_lock, 0u, __ATOMIC_RELEASE);
             return;
         }
         if (Timer::GetRealMs64() - t0 > 20) break;
@@ -502,10 +809,18 @@ void SMP::BroadcastTlbFlush() {
     }
     //  timed out - a peer had interrupts masked >20ms; its next timer tick
     //  reloads cr3. the epoch is NOT advanced, so the quarantine holds any
-    //  frame cleared before this broadcast until a LATER fully-acked flush - 
+    //  frame cleared before this broadcast until a LATER fully-acked flush -
     //  the stale window cannot recycle memory. counter only (no serial i/o in
     //  this hot, possibly-IF=0 path). (satoru)
     __atomic_fetch_add(&g_tlb_flush_timeouts, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_bcast_lock, 0u, __ATOMIC_RELEASE);
+}
+
+// task 21: expose the silent shootdown-timeout counter so the wedge probe can
+// correlate timed-out flushes (stale peers + immediate va reuse) with the
+// lost-write wedge. (satoru)
+uint32_t SMP::TlbFlushTimeouts() {
+    return __atomic_load_n(&g_tlb_flush_timeouts, __ATOMIC_RELAXED);
 }
 
 void SMP::HandleTlbIpi() {
@@ -513,6 +828,15 @@ void SMP::HandleTlbIpi() {
     __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
     __asm__ volatile("mov %0, %%cr3" : : "r"(c3) : "memory");
     __atomic_fetch_add(&g_tlb_ack, 1u, __ATOMIC_ACQ_REL);
+}
+
+void SMP::LoadKernelCr3() {
+    uint64_t k = __atomic_load_n(&g_kernel_cr3, __ATOMIC_ACQUIRE);
+    if (!k) return;
+    uint64_t c3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
+    if (c3 == k) return;
+    __asm__ volatile("mov %0, %%cr3" : : "r"(k) : "memory");
 }
 
 uint64_t SMP::TlbFlushStartSeq() {
@@ -524,6 +848,14 @@ uint64_t SMP::TlbFlushFullSeq() {
 }
 
 void SMP::StartAPs() {
+    // capture the kernel root for LoadKernelCr3 BEFORE the single-cpu early
+    // return - the bsp's nested-fault park uses it too. StartAPs runs during
+    // kernel boot, so the active cr3 here IS the kernel address space. (satoru)
+    {
+        uint64_t kc3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(kc3));
+        g_kernel_cr3 = kc3;
+    }
     if (g_cpu_count <= 1) {
         SerialLogger::Log("[SMP] single cpu, no APs to start\r\n");
         return;
@@ -555,6 +887,7 @@ void SMP::StartAPs() {
 
     const uint8_t vector = 0x08;   // 0x8000 >> 12 (satoru)
     const uint32_t STACK_SZ = 16 * 1024;
+    int consecutive_fail = 0;
 
     for (uint32_t i = 1; i < g_cpu_count; i++) {
         void* stk = PMM::AllocBytes(STACK_SZ);
@@ -569,25 +902,45 @@ void SMP::StartAPs() {
 
         uint32_t apic = g_cpus[i].apic_id;
 
-        // INIT-SIPI-SIPI (intel mp init protocol). assert INIT, wait 10ms, then
-        // two STARTUP IPIs ~200us apart carrying the trampoline vector. (satoru)
+        // INIT-SIPI-SIPI as linux wakeup_secondary_cpu_via_init: level INIT assert,
+        // icr idle, 10ms, level INIT deassert, icr idle, then two STARTUPs (300us
+        // then 200us after each, icr idle between). every wait is bounded by a
+        // pause-iteration cap as well as the tsc. (satoru)
         LapicWrite(0x310, apic << 24);
-        LapicWrite(0x300, 0x4500);          // INIT, assert, edge (satoru)
+        LapicWrite(0x300, 0xC500);          // INIT, level, assert (satoru)
+        icr_idle();
         busy_us(10000);
+        LapicWrite(0x310, apic << 24);
+        LapicWrite(0x300, 0x8500);          // INIT, level, deassert (satoru)
+        icr_idle();
         for (int s = 0; s < 2; s++) {
             LapicWrite(0x310, apic << 24);
             LapicWrite(0x300, 0x4600 | vector);  // STARTUP + trampoline vector (satoru)
+            busy_us(300);
+            icr_idle();
             busy_us(200);
         }
 
-        // wait for the ap to flip its online flag (~100ms budget). (satoru)
-        int tries = 100;
+        // wait for the ap to flip its online flag. hybrid parts can take a good
+        // while to come out of a deep c-state: 500ms budget, then give up on this
+        // one (it is left offline: never counted, scheduled or waited on by a
+        // tlb shootdown). (satoru)
+        int tries = 500;
         while (!g_cpus[i].online && tries-- > 0) busy_us(1000);
 
         SerialLogger::Log("[SMP] cpu"); SerialLogger::LogDec((int)i);
         SerialLogger::Log(g_cpus[i].online ? " online (apic " : " FAILED to start (apic ");
         SerialLogger::LogDec((int)apic);
+        SerialLogger::Log(", type ");
+        SerialLogger::Log(apic < 255 ? "lapic" : "x2apic");
         SerialLogger::Log(")\r\n");
+        // a dead madt or a dead trampoline fails every ap the same way: stop after
+        // a few in a row instead of burning 500ms each. (satoru)
+        if (g_cpus[i].online) consecutive_fail = 0;
+        else if (++consecutive_fail >= 4) {
+            SerialLogger::Log("[SMP] 4 aps in a row failed - not trying the rest\r\n");
+            break;
+        }
     }
 
     SerialLogger::Log("[SMP] "); SerialLogger::LogDec((int)OnlineCount());

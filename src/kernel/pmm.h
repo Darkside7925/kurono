@@ -33,6 +33,10 @@ public:
 
     // increment the reference count of an allocated frame.
     static void RetainFrame(uint64_t phys_addr);
+    // task 26 free-while-mapped guard: vmm leaf writers mark frames that have a
+    // live USER pte; AllocFrame refuses to re-hand such a frame ([DBLMAP]). (satoru)
+    static void MarkFrameMapped(uint64_t phys_addr, bool m);
+    static bool IsFrameMapped(uint64_t phys_addr);
 
     // inspect the current reference count of a frame.
     static uint32_t GetFrameRefCount(uint64_t phys_addr);
@@ -52,10 +56,16 @@ public:
     static void  FreeContiguous(uint64_t phys_addr, uint64_t count);
 
     // statistics
-    static uint64_t GetTotalFrames()  { return total_frames; }
-    static uint64_t GetUsedFrames()   { return used_frames; }
+    // total/used count usable ram only. the bitmap also spans the holes
+    // between usable regions (pci hole, acpi, bios); those frames are pinned
+    // as used forever and are left out here, so a 512mb machine reports
+    // ~512mb instead of the bitmap range. (satoru)
+    static uint64_t GetTotalFrames()  { return usable_frames; }
+    static uint64_t GetUsedFrames()   { return used_frames - (total_frames - usable_frames); }
     static uint64_t GetFreeFrames()   { return total_frames - used_frames; }
-    static uint64_t GetTotalMemory()  { return total_frames * PAGE_SIZE; }
+    static uint64_t GetTotalMemory()  { return usable_frames * PAGE_SIZE; }
+    // top of ram (bitmap range). bound for identity-mapped frames, not GetTotalMemory. (satoru)
+    static uint64_t GetPhysTop()      { return total_frames * PAGE_SIZE; }
     static uint64_t GetFreeMemory()   { return GetFreeFrames() * PAGE_SIZE; }
 
     // test whether a frame is allocated
@@ -71,8 +81,10 @@ private:
 
     static uint64_t* bitmap;          // bitmap array (1 bit per frame)
     static uint16_t* refs;            // reference count per frame
+    static uint8_t*  mapped_bits;     // task 26: 1 bit/frame, live user pte (satoru)
     static uint64_t  bitmap_size;     // number of uint64_t entries in bitmap
-    static uint64_t  total_frames;
+    static uint64_t  total_frames;    // bitmap range (highest usable frame + 1)
+    static uint64_t  usable_frames;   // frames the firmware reported as usable ram
     static uint64_t  used_frames;
     static uint64_t  search_hint;     // next-fit starting index
 };

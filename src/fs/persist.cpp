@@ -1,5 +1,6 @@
 #include "persist.h"
 #include "../drivers/nvme.h"
+#include "../drivers/disklog.h"
 #include "../drivers/timer.h"
 #include "../kernel/pmm.h"
 #include "../kernel/heap.h"
@@ -45,12 +46,41 @@ namespace {
     }
 }
 
+// where the store lives. unguarded (qemu raw disk, relbatch): the whole disk from
+// lba 0, exactly as before. guarded (real hardware): ONLY the preallocated
+// contiguous KURONO.KFS file, and the raw kps blob (lba 0) is refused outright. (satoru)
+namespace {
+    bool kfs_target(uint64_t* base_lba, uint64_t* blocks4k) {
+        if (!NVMe::IsDetected()) return false;
+        if (!NVMe::WriteGuardOn()) { *base_lba = 0; *blocks4k = 0; return true; }
+        uint64_t lba = 0, bytes = 0;
+        if (!DiskLog::KfsFile(&lba, &bytes)) return false;
+        *base_lba = lba; *blocks4k = bytes / 4096u;
+        return *blocks4k >= 64;
+    }
+    bool blob_ok() { return NVMe::IsDetected() && !NVMe::WriteGuardOn(); }
+}
+
 bool PersistStore::Available() {
-    return NVMe::IsDetected();
+    uint64_t b, n;
+    return kfs_target(&b, &n);
+}
+
+void PersistStore::Describe(char* out, int cap) {
+    if (!out || cap < 2) return;
+    int p = 0;
+    auto app = [&](const char* s) { while (*s && p < cap - 1) out[p++] = *s++; out[p] = 0; };
+    auto dec = [&](uint64_t v) { char t[24]; int k = 0; if (!v) t[k++] = '0'; while (v) { t[k++] = (char)('0' + v % 10); v /= 10; } while (k && p < cap - 1) out[p++] = t[--k]; out[p] = 0; };
+    out[0] = 0;
+    uint64_t lba = 0, blocks = 0;
+    if (!NVMe::IsDetected()) { app("unavailable (no nvme)"); return; }
+    if (!NVMe::WriteGuardOn()) { app("raw disk store from lba 0 (write guard off)"); return; }
+    if (!kfs_target(&lba, &blocks)) { app("unavailable (guarded disk): "); app(DiskLog::KfsStatus()); return; }
+    app("KFS volume on KURONO.KFS lba "); dec(lba); app(" size "); dec(blocks * 4096u >> 20); app(" MB");
 }
 
 bool PersistStore::Save(const uint8_t* blob, uint32_t len) {
-    if (!NVMe::IsDetected() || !blob || len == 0) return false;
+    if (!blob_ok() || !blob || len == 0) return false;
 
     const uint32_t per      = lbas_per_page();
     const uint64_t data_lba  = KPS_DATA_OFF / NVMe::GetLBASize();  // 4096/512 = 8 (satoru)
@@ -99,7 +129,7 @@ bool PersistStore::Save(const uint8_t* blob, uint32_t len) {
 
 bool PersistStore::Load(uint8_t* buf, uint32_t maxlen, uint32_t* out_len) {
     if (out_len) *out_len = 0;
-    if (!NVMe::IsDetected() || !buf) return false;
+    if (!blob_ok() || !buf) return false;
 
     const uint32_t per      = lbas_per_page();
     const uint64_t data_lba  = KPS_DATA_OFF / NVMe::GetLBASize();
@@ -148,12 +178,18 @@ bool PersistStore::Load(uint8_t* buf, uint32_t maxlen, uint32_t* out_len) {
 //  instead of one opaque blob. (satoru)
 namespace {
     bool kfs_rd(uint64_t block, uint32_t count, void* buf, void*) {
+        uint64_t base, n;
+        if (!kfs_target(&base, &n)) return false;
+        if (n && (block >= n || (uint64_t)count > n - block)) return false;   // past the file end (satoru)
         uint32_t per = 4096u / NVMe::GetLBASize();
-        return NVMe::Read(block * per, count * per, buf);
+        return NVMe::Read(base + block * per, count * per, buf);
     }
     bool kfs_wr(uint64_t block, uint32_t count, const void* buf, void*) {
+        uint64_t base, n;
+        if (!kfs_target(&base, &n)) return false;
+        if (n && (block >= n || (uint64_t)count > n - block)) return false;   // past the file end (satoru)
         uint32_t per = 4096u / NVMe::GetLBASize();
-        return NVMe::Write(block * per, count * per, buf);
+        return NVMe::Write(base + block * per, count * per, buf);
     }
 
     void path_join(char* out, int cap, const char* dir, const char* name) {
@@ -200,6 +236,14 @@ namespace {
             // whatever KVFS holds. (satoru)
             if (sz < 0) return;
             if (sz == 0) { KFS::WriteFile(path, "", 0); return; }
+            // a plain in-memory file: write straight from the node's own buffer. the old
+            // path copied every file into a temp heap block first (a 174 MB one for
+            // libxul), and that big alloc + free right before firefox started corrupted
+            // the ready queue (fresh install boots died 7/7). (satoru)
+            if (node && node->type == KVFS_FILE && node->content && !node->dev_read && node->size == (uint32_t)sz) {
+                KFS::WriteFile(path, node->content, (uint64_t)(uint32_t)sz);
+                return;
+            }
             uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)sz);
             if (!buf) return;
             if (KVFS::ReadFile(path, buf, (uint32_t)sz) == sz)
@@ -328,6 +372,16 @@ namespace {
                     KernelHeap::Free(child); continue;
                 }
                 int64_t got = KFS::ReadFile(child, buf, (uint64_t)sz);
+                // a transient read failure here silently killed whole boots
+                // (omni.ja got=-1 -> "Couldn't load XPCOM." -> firefox exit
+                // 255, seen ~1/25 boots). the image is a fresh golden copy so
+                // the data is good - retry before declaring it lost. (satoru)
+                for (int rt = 0; rt < 3 && got != sz; rt++) {
+                    SerialLogger::Log("[persist] RESTORE retry ");
+                    SerialLogger::LogDec(rt + 1);
+                    SerialLogger::Log(" "); SerialLogger::Log(child); SerialLogger::Log("\r\n");
+                    got = KFS::ReadFile(child, buf, (uint64_t)sz);
+                }
                 if (got == sz) {
                     KVFS::WriteFile(child, buf, (uint32_t)sz);
                 } else {   // a truncated restore is silent corruption -- surface it (satoru)
@@ -352,6 +406,10 @@ namespace {
     //  metadata region. (satoru)
     uint32_t kfs_disk_blocks() {
         uint64_t blocks = NVMe::GetCapacityLBA() * (uint64_t)NVMe::GetLBASize() / KFS_BLOCK_SIZE;
+        {   // guarded: the volume is exactly the KURONO.KFS file (satoru)
+            uint64_t fb, fn;
+            if (NVMe::WriteGuardOn()) { if (!kfs_target(&fb, &fn)) return 0; blocks = fn; }
+        }
         // budget ~9 bytes of metadata cache per block (bitmap 1/8 B + inode 8 B);
         // 512 MB / 9 ≈ 59.6 M blocks ≈ 228 GB addressable before we clamp. (satoru)
         const uint64_t MAX_BLOCKS = 59000000ull;
@@ -362,8 +420,9 @@ namespace {
     }
 }
 
+
 bool PersistStore::SaveTree() {
-    if (!NVMe::IsDetected()) return false;
+    if (!PersistStore::Available()) return false;
     KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
 
     // layer 6 - INCREMENTAL save. fingerprint the current user-data set; if a
@@ -397,7 +456,7 @@ bool PersistStore::SaveTree() {
 }
 
 bool PersistStore::LoadTree() {
-    if (!NVMe::IsDetected()) return false;
+    if (!PersistStore::Available()) return false;
     KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
     if (!KFS::Mount()) return false;
     // restore the small user-data subtrees at boot. /apps is DELIBERATELY skipped
@@ -424,9 +483,12 @@ static bool kfs_ensure_mounted() {
 }
 
 bool PersistStore::RestoreApps() {
-    if (!NVMe::IsDetected()) return false;
+    if (!PersistStore::Available()) return false;
+    SerialLogger::Log("[fftl] RestoreApps: available\r\n");   // launch timeline (satoru)
     if (!kfs_ensure_mounted()) return false;
+    SerialLogger::Log("[fftl] RestoreApps: mounted\r\n");
     if (!KFS::Exists("/apps")) return false;
+    SerialLogger::Log("[fftl] RestoreApps: /apps exists\r\n");
     // already restored this boot? a populated /apps/firefox means RestoreApps ran
     // (or the install path created it), so don't re-read 288 mb. (satoru)
     if (KVFS::IsDir("/apps") && KVFS::Exists("/apps/firefox/firefox")) return true;
@@ -448,7 +510,7 @@ bool PersistStore::RestoreApps() {
 static volatile int g_ff_persisted_probe = -1;
 
 bool PersistStore::HasPersistedFirefox() {
-    if (!NVMe::IsDetected()) { g_ff_persisted_probe = 0; return false; }
+    if (!PersistStore::Available()) { g_ff_persisted_probe = 0; return false; }
     if (!kfs_ensure_mounted()) { g_ff_persisted_probe = 0; return false; }
     // a non-empty firefox binary in the on-disk volume == a reusable install. (satoru)
     bool have = KFS::Exists("/apps/firefox/firefox") &&
