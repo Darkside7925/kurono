@@ -34,6 +34,10 @@ and deploy boot payloads and layouts onto partitions.
 Virtualization. A shell command builds a VM, loads an embedded guest kernel, enters
 the hypervisor loop.
 
+Apps. A kui app (calculator, editor, files, ...) is either a kernel window or a ring-3
+program, depending on `kurono.r3apps`. Same source, two backends. See
+`developers/kui.md`.
+
 ## Don't, on day one
 
 - don't read every driver file
@@ -59,3 +63,4 @@ the hypervisor loop.
 - how the Wayland compositor speaks the wire protocol and bridges to the WM
 - how the installer finds disks and partitions
 - how `vm boot-alpine` goes from a shell command into the hypervisor
+- how the admin approval prompt (KSA) gets drawn outside the main kernel's control

@@ -1,5 +1,6 @@
 //  kurono os - taskbar & desktop environment implementation
 #include "desktop.h"
+#include "boot_anim.h"
 #include "../../logo.h"
 #include "control_center.h"
 #include "notification.h"
@@ -8,6 +9,7 @@
 #include "perf_hud.h"
 #include "gui.h"   // GUI::UpdateBackbuffer for the resize self-heal relayout (satoru)
 #include "../drivers/graphics.h"
+#include "../drivers/outputs.h"   // multi-monitor: menu bar/dock/icons live on the primary output (satoru)
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
 #include "../drivers/keyboard.h"
@@ -25,8 +27,12 @@
 #include "kss.h"                      // motion tokens for shared animation feel (satoru)
 #include "ui_elements.h"             // Animation easing/spring helpers (satoru)
 #include "../apps/terminal.h"
+#include "../apps/alpine_term.h"   // (satoru)
+#include "../apps/settings_linux.h"   // linux tile + guest app tiles (satoru)
+#include "../virt/vm_host.h"   // (satoru)
 #include "../apps/file_manager.h"
 #include "../apps/calculator.h"
+#include "../kui/kui_kernel.h"   // kui apps (satoru)
 #include "../apps/text_editor.h"
 #include "../apps/settings.h"
 #include "../apps/system_settings.h"   // new modular settings app (satoru)
@@ -42,6 +48,7 @@
 #include "../proc/kernel_processes.h"   // detached shell launch (no terminal) (satoru)
 #include "../proc/scheduler.h"
 #include "../hal/hal.h"
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
 
 static const unsigned int COL_TASKBAR      = 0xFF0C0C14;
 static const unsigned int COL_TASKBAR_TOP  = 0xFF2A2A40;
@@ -302,6 +309,7 @@ static const PinnedApp tb_pinned[] = {
     { "Terminal", 'T', 0xFF2ECC71, &DesktopEnvironment::LaunchTerminal    },
     { "Editor",   'E', 0xFFE74C3C, &DesktopEnvironment::LaunchTextEditor  },
     { "Browser",  'B', 0xFF3498DB, &DesktopEnvironment::LaunchBrowser     },
+    { "Alpine",   'A', 0xFF0D597F, &DesktopEnvironment::LaunchAlpine      },   // linux vm (satoru)
 };
 static const int TB_PINNED_COUNT = (int)(sizeof(tb_pinned)/sizeof(tb_pinned[0]));
 static const int TB_PIN_SZ       = 30;
@@ -331,6 +339,9 @@ static inline int tb_cluster_left()   { return tb_bell_x() - 4; }
 // window. kind 0 = pinned, 1 = window, 2 = divider. (satoru)
 struct DockItem { int kind; int pin; int win_id; int icon; int x; int size; };
 static const int DOCK_MAX = 24;
+// where each dock tile's magnification is heading, so IsAnimating can tell a
+// glide in progress from a pointer resting over the dock. (satoru)
+static float g_dock_target[DOCK_MAX] = {0};
 static int dock_build(DockItem* it, int& bg_x, int& bg_w, bool scaled);
 
 static void tb_volume_popup_xy(int h, int lift, int& x, int& y){
@@ -652,8 +663,15 @@ static int mbar_vol_cx(){ MBarLayout L = mbar_layout(); return L.vol_x + 10; }
 static int dock_build(DockItem* it, int& bg_x, int& bg_w, bool scaled){
     int n = 0;
     for (int i = 0; i < TB_PINNED_COUNT && n < DOCK_MAX; i++) {
+        // linux turned off in settings: no Alpine tile (satoru)
+        if (tb_pinned[i].launch == &DesktopEnvironment::LaunchAlpine && !LinuxSettings::ShowLinuxTile()) continue;
         it[n].kind = 0; it[n].pin = i; it[n].win_id = -1;
         it[n].icon = AppIcons::IdForName(tb_pinned[i].name); n++;
+    }
+    // guest apps pinned in settings > linux, kind 3 (pin = their index) (satoru)
+    for (int i = 0; i < LinuxSettings::DockAppCount() && n < DOCK_MAX; i++) {
+        it[n].kind = 3; it[n].pin = i; it[n].win_id = -1;
+        it[n].icon = AppIcons::GENERIC; n++;   // guest names would match native prefixes (satoru)
     }
     Window* wl = WindowManager::GetWindows();
     bool any = false;
@@ -769,10 +787,18 @@ void Taskbar::RenderDock(){
         // launch bounce: a pinned app hops while its window opens.
         if (d.kind == 0) {
             uint32_t lms = PinnedLaunchMs(d.pin);
-            if (lms && now - lms < 700) {
-                float e = (float)(now - lms) / 700.0f;
-                float hop = e < 0.5f ? (1.0f - (1.0f - e * 2) * (1.0f - e * 2)) : (1.0f - (e - 0.5f) * 2) * (1.0f - (e - 0.5f) * 2);
-                ty -= (int)(hop * 14.0f + 0.5f);
+            if (lms && now - lms < 900) {
+                // two hops, the second smaller, like a ball settling: |sin| under
+                // a decaying envelope (satoru)
+                float t = (float)(now - lms);
+                float ph = t / 380.0f * 3.14159265f;
+                float sn = ph - 3.14159265f * (float)(int)(ph / 3.14159265f);   // fold to 0..pi (satoru)
+                float x2 = (sn - 1.5707963f) * (sn - 1.5707963f);
+                float hs = 1.0f - x2 / 2.0f * (1.0f - x2 / 12.0f * (1.0f - x2 / 30.0f));   // sin via cos(x - pi/2) (satoru)
+                if (hs < 0.0f) hs = 0.0f;
+                float env = t < 380.0f ? 1.0f : (t < 760.0f ? 0.42f : 0.0f);
+                float hop = hs * env;
+                ty -= (int)(hop * 18.0f + 0.5f);
                 Graphics::MarkDirty(tx - 4, dock_y - 40, sz + 8, MDOCK_H + 40);
             }
         }
@@ -797,6 +823,7 @@ void Taskbar::RenderDock(){
     if (hover >= 0 && it[hover].kind != 2) {
         const char* label = "";
         if (it[hover].kind == 0) label = tb_pinned[it[hover].pin].name;
+        else if (it[hover].kind == 3) label = LinuxSettings::DockAppName(it[hover].pin);   // (satoru)
         else { Window* w = WindowManager::GetWindow(it[hover].win_id); if (w) label = w->title; }
         int tw = FontTTF::MeasureText(14.0f, label);
         int cx = it[hover].x + it[hover].size / 2;
@@ -876,6 +903,7 @@ void Taskbar::TickModern(uint32_t delta_ms, int mx, int my){
         }
         dock_scale[i] += (target - dock_scale[i]) * k;
         if (dock_scale[i] < 0.001f && target == 0.0f) dock_scale[i] = 0.0f;
+        g_dock_target[i] = target;
     }
 }
 
@@ -891,7 +919,7 @@ bool Taskbar::HandleClickModern(int mx, int my){
             return true;
         }
         if (mx >= L.net_x - 6) {
-            ControlCenter::ToggleAt(mx < screen_width - 200 ? mx : screen_width - 190, MBAR_H + 8 + 460 + 8);
+            ControlCenter::ToggleAt(mx, MBAR_H + 4);
             VolumePopupSet(false); StartMenuSet(false);
             return true;
         }
@@ -911,6 +939,7 @@ bool Taskbar::HandleClickModern(int mx, int my){
                 tb_pinned[it[i].pin].launch();
                 return true;
             }
+            if (it[i].kind == 3) { LinuxSettings::LaunchDockApp(it[i].pin); return true; }   // (satoru)
             Window* w = WindowManager::GetWindow(it[i].win_id);
             if (!w) return true;
             if (w->state == WIN_MINIMIZED || w->anim_kind == 3) {
@@ -1328,7 +1357,8 @@ bool Taskbar::HandleClick(int mx,int my){
                             case 10: DesktopEnvironment::RequestLogout(); break;
                             // shutdown: halt the machine like the shell's
                             // `shutdown` builtin (no acpi power-off here). (satoru)
-                            case 11: HAL::DisableInterrupts(); HAL::Halt(); break;
+                            // the shutdown film plays first and halts at its end (satoru)
+                            case 11: if (!BootAnim::StartShutdown(1)) { HAL::DisableInterrupts(); HAL::Halt(); } break;
                         }
                         return true;
                     }
@@ -1577,18 +1607,28 @@ void Taskbar::Tick(uint32_t delta_ms, int mx, int my){
 
 bool Taskbar::IsAnimating(){
     // dock magnification glides in and out.
+    // "animating" means a value is still travelling to its target, not that it
+    // is non-zero: a pointer resting on the dock or a pinned icon used to keep
+    // the gui loop rendering at the full refresh rate forever (60 fps idle at
+    // 60 hz, 240 at 240). (satoru)
     if (UIStyle::Modern())
-        for (int i = 0; i < 24; i++) if (dock_scale[i] > 0.003f) return true;
+        for (int i = 0; i < 24; i++) {
+            float d = dock_scale[i] - g_dock_target[i];
+            if (d > 0.003f || d < -0.003f) return true;
+        }
     // open popups animate; closing ones keep a decaying phase until ~0.
     if (start_menu_open   || start_menu_phase   > 0.01f) return true;
     if (volume_popup_open || volume_popup_phase > 0.01f) return true;
     // hover-lift on pinned icons eases out after the pointer leaves.
-    for (int i = 0; i < TB_PINNED_COUNT && i < 8; i++)
-        if (pinned_hover_phase[i] > 0.01f) return true;
+    for (int i = 0; i < TB_PINNED_COUNT && i < 8; i++) {
+        float t = (i == pinned_hover_target) ? 1.0f : 0.0f;
+        float d = pinned_hover_phase[i] - t;
+        if (d > 0.01f || d < -0.01f) return true;
+    }
     // a launch bounce is in flight until ~Motion::Window after the tap. (satoru)
     uint32_t now = Timer::GetRealMs();
     for (int i = 0; i < TB_PINNED_COUNT && i < 8; i++)
-        if (pinned_launch_ms[i] && (now - pinned_launch_ms[i]) < KSS::Motion::Window) return true;
+        if (pinned_launch_ms[i] && (now - pinned_launch_ms[i]) < (UIStyle::Modern() ? 900u : (uint32_t)KSS::Motion::Window)) return true;   // the dock's two-hop bounce (satoru)
     // blinking search cursor needs periodic repaint while typing.
     if (search_active) return true;
     return false;
@@ -1932,7 +1972,7 @@ void Desktop::SetWallpaper(unsigned int c){
     wallpaper_color=c;
     have_image_wallpaper = false;
     if (gradient_cache) {
-        PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
+        TaskMem::UnchargeFrames(gradient_cache); PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
         gradient_cache = nullptr;
         gradient_cache_bytes = 0;
         gradient_cache_h = 0;
@@ -1948,9 +1988,9 @@ bool Desktop::ScaleWallpaperCache(int w, int h){
     if (!wallpaper_src || wallpaper_src_w <= 0 || wallpaper_src_h <= 0) return false;
     if (w <= 0 || h <= 0) return false;
 
-    if (gradient_cache) { PMM::FreeBytes(gradient_cache, gradient_cache_bytes); gradient_cache = nullptr; }
+    if (gradient_cache) { TaskMem::UnchargeFrames(gradient_cache); PMM::FreeBytes(gradient_cache, gradient_cache_bytes); gradient_cache = nullptr; }
     size_t bytes = (size_t)w * (size_t)h * sizeof(uint32_t);
-    gradient_cache = (uint32_t*)PMM::AllocBytes(bytes);
+    gradient_cache = (uint32_t*)PMM::AllocBytes(bytes); TaskMem::ChargeFrames(gradient_cache, bytes);
     if (!gradient_cache) { gradient_cache_bytes = 0; gradient_cache_h = 0; have_image_wallpaper = false; return false; }
     gradient_cache_bytes = bytes;
     gradient_cache_h = h;
@@ -1975,16 +2015,19 @@ bool Desktop::ScaleWallpaperCache(int w, int h){
     return true;
 }
 
+static uint32_t g_wp_gen = 1;   // bumped when the wallpaper pixels change (secondary outputs repaint) (satoru)
+
 void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
+    g_wp_gen++;
     if (!img.valid || !img.data || img.width <= 0 || img.height <= 0) {
         have_image_wallpaper = false;
         if (wallpaper_src) {
-            PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes);
+            TaskMem::UnchargeFrames(wallpaper_src); PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes);
             wallpaper_src = nullptr; wallpaper_src_bytes = 0;
             wallpaper_src_w = 0; wallpaper_src_h = 0;
         }
         if (gradient_cache) {
-            PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
+            TaskMem::UnchargeFrames(gradient_cache); PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
             gradient_cache = nullptr;
             gradient_cache_bytes = 0;
             gradient_cache_h = 0;
@@ -1997,8 +2040,8 @@ void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
     // later resolution change (the display backend may finalize a different mode
     // after boot, e.g. virtio-gpu coming up at 1080p). (satoru)
     size_t src_bytes = (size_t)img.width * (size_t)img.height * 4u;
-    if (wallpaper_src) { PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes); wallpaper_src = nullptr; }
-    wallpaper_src = (uint8_t*)PMM::AllocBytes(src_bytes);
+    if (wallpaper_src) { TaskMem::UnchargeFrames(wallpaper_src); PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes); wallpaper_src = nullptr; }
+    wallpaper_src = (uint8_t*)PMM::AllocBytes(src_bytes); TaskMem::ChargeFrames(wallpaper_src, src_bytes);
     if (!wallpaper_src) { wallpaper_src_bytes = 0; have_image_wallpaper = false; return; }
     memcpy(wallpaper_src, img.data, src_bytes);
     wallpaper_src_bytes = src_bytes;
@@ -2016,6 +2059,13 @@ void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
 // decode + apply one of the embedded builtin wallpapers (0 = primary, 1 =
 // secondary). used by the settings personalization page to switch the wallpaper
 // live, and at boot to honour the persisted desktop.wallpaper_index. (satoru)
+const uint8_t* Desktop::BuiltinWallpaperRGBA(int idx, int* w, int* h){
+    if (idx == 1) { if (w) *w = (int)wallpaper2_rgba_w; if (h) *h = (int)wallpaper2_rgba_h; return wallpaper2_rgba_data; }
+    if (w) *w = (int)wallpaper_rgba_w;
+    if (h) *h = (int)wallpaper_rgba_h;
+    return wallpaper_rgba_data;
+}
+
 bool Desktop::ApplyBuiltinWallpaper(int idx){
     // the builtin wallpapers are embedded as pre-decoded raw rgba (decoded on the
     // host) so we never run the freestanding image decoder on them -- it corrupts
@@ -2037,6 +2087,122 @@ bool Desktop::ApplyBuiltinWallpaper(int idx){
     return true;
 }
 
+// multi-monitor: every output except the primary shows its own copy of the
+// wallpaper (nearest-scaled when its size differs from the primary's cache).
+// with wallpaper damage-only the cache is blitted only under the frame's
+// damaged rects; full is forced when the cache, wallpaper or output set
+// changed. an idle secondary screen then costs no blit and no present at all.
+// (satoru)
+static bool g_wp_painted = false;
+static uint32_t g_wp_painted_gen = 0;
+static uint32_t g_wp_painted_color = 0;
+static bool g_wp_painted_img = false;
+static const uint32_t* g_wp_painted_cache = nullptr;
+static int g_wp_painted_w = 0, g_wp_painted_h = 0;
+
+static bool desk_wallpaper_needs_full(int w, int h, uint32_t color, bool img, const uint32_t* cache) {
+    if (!Graphics::WallpaperDamageOnly()) return true;
+    return !g_wp_painted || g_wp_painted_w != w || g_wp_painted_h != h ||
+           g_wp_painted_gen != g_wp_gen || g_wp_painted_color != color ||
+           g_wp_painted_img != img || g_wp_painted_cache != cache;
+}
+
+static void desk_wallpaper_mark_painted(int w, int h, uint32_t color, bool img, const uint32_t* cache) {
+    g_wp_painted = true;
+    g_wp_painted_w = w;
+    g_wp_painted_h = h;
+    g_wp_painted_gen = g_wp_gen;
+    g_wp_painted_color = color;
+    g_wp_painted_img = img;
+    g_wp_painted_cache = cache;
+}
+
+// blit the cached wallpaper into the render target: the whole screen after a
+// cache/wallpaper change (which also marks full damage), otherwise only the
+// rows and columns the frame actually damaged. an untouched wallpaper costs
+// no memory traffic at all. (satoru)
+static void desk_wallpaper_primary(const uint32_t* cache, int w, int h, bool full) {
+    if (!cache || w <= 0 || h <= 0) return;
+    uint8_t* buf = Graphics::GetBackBuffer();
+    if (!buf) return;
+    uint32_t pitch = Graphics::GetPitch();
+    if (full) {
+        size_t row_bytes = (size_t)w * 4;
+        for (int y = 0; y < h; y++)
+            memcpy(buf + (size_t)y * pitch, cache + (size_t)y * w, row_bytes);
+        Graphics::MarkDirty(0, 0, w, h);
+        return;
+    }
+    Graphics::Rect rr[32];
+    int n = Graphics::GetDirtyRects(rr, 32);
+    for (int i = 0; i < n; i++) {
+        int x0 = rr[i].x, y0 = rr[i].y;
+        int x1 = x0 + rr[i].w, y1 = y0 + rr[i].h;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > w) x1 = w;
+        if (y1 > h) y1 = h;
+        if (x1 <= x0 || y1 <= y0) continue;
+        size_t off = (size_t)x0 * 4;
+        size_t len = (size_t)(x1 - x0) * 4;
+        for (int y = y0; y < y1; y++)
+            memcpy(buf + (size_t)y * pitch + off, cache + (size_t)y * w + x0, len);
+    }
+}
+
+static void desk_wallpaper_secondary(const uint32_t* cache, int cw, int ch, uint32_t color, bool full) {
+    if (!cache || !Outputs::Multi() || cw <= 0 || ch <= 0) return;
+    uint8_t* buf = Graphics::GetBackBuffer();
+    if (!buf) return;
+    uint32_t pitch = Graphics::GetPitch();
+    static uint32_t last_sig = 0;
+    uint32_t sig = g_wp_gen * 2654435761u ^ (uint32_t)(uintptr_t)cache ^ color ^
+                   ((uint32_t)cw * 131u + (uint32_t)ch * 17u);
+    for (int i = 1; i < Outputs::Total(); i++) {
+        const Output* o = Outputs::Get(i);
+        if (!o) continue;
+        sig = sig * 31u + (uint32_t)(o->connected ? (o->x + 7 * o->y + 13 * o->w + 17 * o->h) : 0);
+    }
+    bool force = full || !Graphics::WallpaperDamageOnly() || sig != last_sig;
+    last_sig = sig;
+    if (!force) {
+        Graphics::Rect rr[32];
+        int n = Graphics::GetDirtyRects(rr, 32);
+        if (!n) return;
+        for (int i = 1; i < Outputs::Total(); i++) {
+            const Output* o = Outputs::Get(i);
+            if (!o || !o->connected || o->w <= 0 || o->h <= 0) continue;
+            for (int r = 0; r < n; r++) {
+                int x0 = rr[r].x > o->x ? rr[r].x : o->x;
+                int y0 = rr[r].y > o->y ? rr[r].y : o->y;
+                int x1 = rr[r].x + rr[r].w < o->x + o->w ? rr[r].x + rr[r].w : o->x + o->w;
+                int y1 = rr[r].y + rr[r].h < o->y + o->h ? rr[r].y + rr[r].h : o->y + o->h;
+                if (x1 <= x0 || y1 <= y0) continue;
+                for (int y = y0; y < y1; y++) {
+                    int sy = (int)(((long long)(y - o->y) * ch) / o->h);
+                    const uint32_t* src = cache + (size_t)sy * cw;
+                    uint32_t* dst = (uint32_t*)(buf + (size_t)y * pitch) + x0;
+                    for (int x = x0; x < x1; x++)
+                        dst[x - x0] = src[(int)(((long long)(x - o->x) * cw) / o->w)];
+                }
+            }
+        }
+        return;
+    }
+    for (int i = 1; i < Outputs::Total(); i++) {
+        const Output* o = Outputs::Get(i);
+        if (!o || !o->connected || o->w <= 0 || o->h <= 0) continue;
+        for (int y = 0; y < o->h; y++) {
+            uint32_t* d = (uint32_t*)(buf + (size_t)(o->y + y) * pitch) + o->x;
+            int sy = (int)(((long long)y * ch) / o->h);
+            const uint32_t* src = cache + (size_t)sy * cw;
+            if (o->w == cw) { memcpy(d, src, (size_t)cw * 4); continue; }
+            for (int x = 0; x < o->w; x++) d[x] = src[(int)(((long long)x * cw) / o->w)];
+        }
+        Graphics::MarkDirty(o->x, o->y, o->w, o->h);
+    }
+}
+
 void Desktop::RenderWallpaper(){
     int h = screen_height;
     if (h <= 0) return;
@@ -2050,7 +2216,7 @@ void Desktop::RenderWallpaper(){
         if (wallpaper_src) {
             ScaleWallpaperCache(w, h);
         } else {
-            PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
+            TaskMem::UnchargeFrames(gradient_cache); PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
             gradient_cache = nullptr;
             gradient_cache_bytes = 0;
             gradient_cache_h = 0;
@@ -2058,18 +2224,30 @@ void Desktop::RenderWallpaper(){
         }
     }
 
+    // the software cursor is painted outside RenderWallpaper, so make sure the
+    // wallpaper repaints under wherever it was last drawn. without this a
+    // damage-only pass can leave stale arrows behind on real hardware. (satoru)
+    Mouse::DamageLastSoftware();
+    // a moving/animated window marks its old footprint while it renders, which
+    // is after this wallpaper pass: damage the last painted rects here too so
+    // the old pixels are repainted in the frame they moved. (satoru)
+    if (Graphics::WallpaperDamageOnly()) WindowManager::CollectLastPaintedDamage();
+    // arm the scanned-vs-back crc check once the damage-only path is really
+    // exercised, so a missed damage case disables it instead of corrupting the
+    // screen. skipped while zero-copy owns the present path. (satoru)
+    static bool s_wp_check_armed = false;
+    if (Graphics::WallpaperDamageOnly() && !Graphics::ZeroCopyActive() && !s_wp_check_armed) {
+        s_wp_check_armed = true;
+        Graphics::ArmSelfCheck(Graphics::SELFCHECK_WPDAMAGE, 24);
+    }
+
     // if we have an image wallpaper, skip procedural generation
     if (have_image_wallpaper && gradient_cache && gradient_cache_h == h) {
         // fast blit image wallpaper - row-wise memcpy for maximum throughput
-        uint8_t* buf = Graphics::GetBackBuffer();
-        if (!buf) buf = Graphics::GetBuffer();
-        uint32_t pitch = Graphics::GetPitch();
-        uint32_t row_bytes = (uint32_t)w * 4;
-        for (int y = 0; y < h; y++) {
-            memcpy(buf + y * pitch, gradient_cache + y * w, row_bytes);
-        }
-        // mark full desktop area dirty so swapbuffers copies it
-        Graphics::MarkDirty(0, 0, w, h);
+        bool full = desk_wallpaper_needs_full(w, h, wallpaper_color, have_image_wallpaper, gradient_cache);
+        desk_wallpaper_primary(gradient_cache, w, h, full);
+        desk_wallpaper_secondary(gradient_cache, w, h, wallpaper_color, full);
+        desk_wallpaper_mark_painted(w, h, wallpaper_color, have_image_wallpaper, gradient_cache);
         return;
     }
 
@@ -2078,9 +2256,9 @@ void Desktop::RenderWallpaper(){
         // allocate full screen cache (w * h pixels)
         int total = w * h;
         if (!gradient_cache || gradient_cache_h != h) {
-            if (gradient_cache) { PMM::FreeBytes(gradient_cache, gradient_cache_bytes); gradient_cache = nullptr; }
+            if (gradient_cache) { TaskMem::UnchargeFrames(gradient_cache); PMM::FreeBytes(gradient_cache, gradient_cache_bytes); gradient_cache = nullptr; }
             size_t bytes = (size_t)total * sizeof(uint32_t);
-            gradient_cache = (uint32_t*)PMM::AllocBytes(bytes);
+            gradient_cache = (uint32_t*)PMM::AllocBytes(bytes); TaskMem::ChargeFrames(gradient_cache, bytes);
             gradient_cache_bytes = bytes;
         }
         gradient_cache_h = h;
@@ -2175,15 +2353,11 @@ void Desktop::RenderWallpaper(){
     }
 
     // fast blit: row-wise memcpy from cache to back buffer
-    uint8_t* buf = Graphics::GetBackBuffer();
-    if (!buf) buf = Graphics::GetBuffer();
-    uint32_t pitch = Graphics::GetPitch();
-    uint32_t row_bytes = (uint32_t)w * 4;
-    for (int y = 0; y < h; y++) {
-        memcpy(buf + y * pitch, gradient_cache + y * w, row_bytes);
-    }
     // mark full desktop area dirty so swapbuffers copies it to the framebuffer
-    Graphics::MarkDirty(0, 0, w, h);
+    bool full = desk_wallpaper_needs_full(w, h, wallpaper_color, have_image_wallpaper, gradient_cache);
+    desk_wallpaper_primary(gradient_cache, w, h, full);
+    desk_wallpaper_secondary(gradient_cache, w, h, wallpaper_color, full);
+    desk_wallpaper_mark_painted(w, h, wallpaper_color, have_image_wallpaper, gradient_cache);
 }
 
 void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
@@ -2313,6 +2487,20 @@ void Desktop::RenderContextMenu(){
     uint32_t e = Timer::GetRealMs() - context_menu_open_ms;
     float t = (e >= KSS::Motion::Window) ? 1.0f
                                          : Animation::EaseMs(e, KSS::Motion::Window, Animation::EaseOutCubic);
+    if (UIStyle::Modern()) {
+        // the shared shell menu: glass panel, accent hover pill, "Delete" in red (satoru)
+        const char* mi[8];
+        for (int i = 0; i < nit && i < 8; i++) mi[i] = items[i];
+        if (on_icon && nit > 2) mi[2] = "!Delete";
+        int hv = -1;
+        if (Mouse::mx >= context_menu_x && Mouse::mx < context_menu_x + mw && Mouse::my >= context_menu_y + 6) {
+            hv = (Mouse::my - context_menu_y - 6) / ih;
+            if (hv >= nit) hv = -1;
+        }
+        MDraw::Menu(context_menu_x, context_menu_y, mw, 6, ih, mi, nit, hv, t);
+        Graphics::MarkDirty(context_menu_x - 30, context_menu_y - 30, mw + 60, mh + 70);
+        return;
+    }
     int draw_h = (int)(mh * (0.62f + 0.38f * t) + 0.5f);   // grow 62% -> 100% height
     if (draw_h < 8) draw_h = 8;
 
@@ -2376,8 +2564,13 @@ bool Desktop::IsAnimating(){
     // hover-pop lift eases in/out over ~160ms; keep rendering until settled
     // so the lift never freezes mid-transition once the pointer comes to
     // rest on (or just off) an icon. mirrors Taskbar::IsAnimating(). (satoru)
-    for (int i = 0; i < icon_count && i < DESKTOP_MAX_ICONS; i++)
-        if (icon_hover_phase[i] > 0.01f) return true;
+    // settled at the target (fully lifted under a resting pointer, or fully
+    // down) is not animating; only a phase still in transit is. (satoru)
+    for (int i = 0; i < icon_count && i < DESKTOP_MAX_ICONS; i++) {
+        float t = (i == icon_hover_target) ? 1.0f : 0.0f;
+        float d = icon_hover_phase[i] - t;
+        if (d > 0.01f || d < -0.01f) return true;
+    }
     // context menu fade+scale-in needs continuous frames until it settles. (satoru)
     if (context_menu_open && (Timer::GetRealMs() - context_menu_open_ms) < KSS::Motion::Window)
         return true;
@@ -2470,7 +2663,9 @@ void Desktop::HandleDoubleClick(int mx,int my){
     drag_icon=-1;
 
     if(icons[idx].icon_type==0){
-        TextEditorApp::OpenFile(icons[idx].path);
+        // ring 3 when kurono.r3apps asks for texteditor (the path is its argv[1]), else the same (satoru)
+        // in-kernel editor through the launcher choice. (satoru)
+        KuiKernel::OpenArg("texteditor", icons[idx].path);
         return;
     }
     if(icons[idx].icon_type==1){
@@ -2549,12 +2744,37 @@ void Desktop::Update(int mx,int my,bool mouse_down,bool clicked){
 //  desktopenvironment
 void DesktopEnvironment::Init(int sw,int sh){
     UIStyle::Apply();
+    // multi-monitor: the window manager spans the whole virtual desktop but the
+    // menu bar, dock, desktop icons and control center belong to the primary
+    // output only. one screen: psw/psh == sw/sh, nothing changes. (satoru)
+    int psw = sw, psh = sh;
+    if (Outputs::Multi()) {
+        const Output* po = Outputs::Get(0);
+        if (po && po->connected && po->w > 0 && po->h > 0) { psw = po->w; psh = po->h; }
+    }
     WindowManager::Init(sw, sh);
-    Desktop::Init(sw, sh);
-    Taskbar::Init(sw, sh);
-    ControlCenter::Init(sw, sh);
+    Desktop::Init(psw, psh);
+    Taskbar::Init(psw, psh);
+    ControlCenter::Init(psw, psh);
     // adjust wm desktop area to exclude taskbar
     Taskbar::ApplyDesktopArea();
+}
+
+void DesktopEnvironment::Relayout(int sw, int sh, const int* old_x, const int* old_y, int swap_a, int swap_b){
+    int psw = sw, psh = sh;
+    if (Outputs::Multi()) {
+        const Output* po = Outputs::Get(0);
+        if (po && po->connected && po->w > 0 && po->h > 0) { psw = po->w; psh = po->h; }
+    }
+    WindowManager::SetScreenSize(sw, sh);
+    Desktop::Init(psw, psh);
+    if (GUI::wallpaper.valid) Desktop::SetWallpaperImage(GUI::wallpaper);
+    Taskbar::Init(psw, psh);
+    ControlCenter::Init(psw, psh);
+    Taskbar::ApplyDesktopArea();
+    if (old_x && old_y) WindowManager::RelocateForOutputs(old_x, old_y, swap_a, swap_b);
+    WindowManager::ClampAllToDesktop();
+    Graphics::MarkUIDirty();
 }
 
 // true when the scene behind a dragged window is "clean" enough that a cached
@@ -2576,6 +2796,14 @@ static bool de_drag_backdrop_safe(){
 // compose the full desktop once: wallpaper + icons, every window, taskbar,
 // control center, toasts. shared by the normal path and the drag-backdrop
 // capture (which first arms the wm to omit the dragged window). (satoru)
+// a settled full screen window in front owns the whole output: no menu bar,
+// no dock (super+f or the window menu brings them back). (satoru)
+static bool de_fullscreen_front(){
+    Window* fw = WindowManager::GetFocusedWindow();
+    return fw && fw->state == WIN_FULLSCREEN && fw->fx_mode == 0 && fw->visible &&
+           fw->y <= 0 && fw->h >= Graphics::GetHeight();   // only when it covers the output (satoru)
+}
+
 static void de_render_full(){
     // resize self-heal FIRST, before any drawing: if the host resized the
     // qemu window the bga changed mode but a starved gui res-sync may not
@@ -2589,13 +2817,18 @@ static void de_render_full(){
     }
     Desktop::Render();
     WindowManager::RenderAll();
+    // the drag snap target tints the target region over the windows, as the
+    // common desktop shells do, so it stays visible under the dragged card. (satoru)
+    WindowManager::RenderSnapPreview();
     // pump queued wayland frame callbacks once per composited frame so clients
     // are released to submit their next buffer. (satoru)
     WaylandServer::DispatchPendingFrames();
-    Taskbar::Render();
+    if (!de_fullscreen_front()) Taskbar::Render();
     // minimize/restore pour into and out of the taskbar tile, so it draws
     // over the taskbar rather than sliding under it. (satoru)
     WindowManager::RenderMotionOverlay();
+    // the alt-tab card deck floats above the dock and the motion overlay. (satoru)
+    WindowManager::RenderTabSwitcher();
     ControlCenter::Render();
     // toasts render topmost so they sit above every panel. (satoru)
     NotificationManager::Render();
@@ -2638,6 +2871,9 @@ static uint32_t last_click_time_ms = 0;
 static int last_click_x = -1, last_click_y = -1;
 
 void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,char key){
+    // the control center owns the keyboard and printable text while it is open. (satoru)
+    if (ControlCenter::HandleChar(key)) key = 0;
+    ControlCenter::HandleMouse(mx, my, mouse_down);
     // Delta-time bookkeeping for all UI animations.
     uint32_t now_ms  = Timer::GetRealMs();
     uint32_t delta_ms = (de_last_frame_ms == 0) ? 16 : (now_ms - de_last_frame_ms);
@@ -2660,35 +2896,12 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
     }
 
     // wayland key forwarding lives in InputManager::Poll (event-driven). (satoru)
-
     // alt-tab: cycle focus through visible windows by id (rough z-order proxy).
     // we want true z-order but the current z_order field changes only on Focus(),
     // so a stable id-cycle gives a consistent round-trip.
-    {
-        const KeyboardState& ks = Keyboard::GetState();
-        if (ks.alt && Keyboard::IsKeyPressed(KEY_TAB)) {
-            int cur = WindowManager::GetFocusedIndex();
-            Window* ws = WindowManager::GetWindows();
-            // gather candidate ids - iterate the full slot array since
-            // closed slots can sit between live windows.
-            int cand[WM_MAX_WINDOWS]; int nc = 0;
-            for (int i = 0; i < WM_MAX_WINDOWS; i++) {
-                Window* w = &ws[i];
-                if (w->state == WIN_CLOSED || !w->visible || w->state == WIN_MINIMIZED)
-                    continue;
-                cand[nc++] = w->id;
-            }
-            if (nc > 1) {
-                int idx = 0;
-                for (int i = 0; i < nc; i++) if (cand[i] == cur) { idx = i; break; }
-                int next = cand[(idx + 1) % nc];
-                WindowManager::Focus(next);
-                WindowManager::BringToFront(next);
-            } else if (nc == 1) {
-                WindowManager::Focus(cand[0]);
-            }
-        }
-    }
+    // gather candidate ids - iterate the full slot array since
+    // closed slots can sit between live windows.
+    // the live switcher now steps these from InputManager::Poll. (satoru)
 
     // printscreen: capture a timestamped screenshot on the press edge only so a
     // held key fires once. (satoru)
@@ -2724,6 +2937,14 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
             else if (snap_d) WindowManager::SnapFocused(3); // restore (satoru)
         }
         snap_was = snap_now;
+        // super+f: full screen toggle for the focused window (satoru)
+        static bool fs_was = false;
+        bool fs_now = kss.super && Keyboard::IsKeyPressed(KEY_F);
+        if (fs_now && !fs_was) {
+            Window* fw = WindowManager::GetFocusedWindow();
+            if (fw) WindowManager::ToggleFullscreen(fw->id);
+        }
+        fs_was = fs_now;
     }
 
     // right-click handling - forward event 4 to focused window
@@ -2739,7 +2960,7 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
            mx >= fw->content_x && mx < fw->content_x + fw->content_w &&
            my >= fw->content_y && my < fw->content_y + fw->content_h) {
             if(fw->input){
-                fw->input(fw, 4, mx, my);  // event 4 = right-click
+                { TaskMem::WindowScope _tms(fw->id); fw->input(fw, 4, mx, my); }  // event 4 = right-click
             }
         } else {
             // desktop right-click
@@ -2772,7 +2993,7 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         }
 
         // taskbar gets next priority
-        if(Taskbar::HandleClick(mx,my)) return;
+        if(!de_fullscreen_front() && Taskbar::HandleClick(mx,my)) return;
         // then window manager
         if(WindowManager::HandleMouseDown(mx,my)) return;
         // desktop: single click selects/drags, double click opens
@@ -2806,6 +3027,13 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
     }
     Desktop::Update(mx,my,mouse_down,clicked);
     // forward keyboard input to focused window or search
+    // super+letter and alt+tab are shell shortcuts: the raw char queue still
+    // produces their character, so drop it before an app can take it. (satoru)
+    {
+        const KeyboardState& kbs = Keyboard::GetState();
+        if (key && kbs.super && key >= 32 && key < 127) key = 0;
+        if (key && kbs.alt && (key == '\t' || key == 27)) key = 0;
+    }
     if(key){
         // if search is active, route keys there
         if(Taskbar::search_active){
@@ -2865,7 +3093,7 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
         } else {
             Window* fw = WindowManager::GetFocusedWindow();
             if(fw && fw->input){
-                fw->input(fw, 2, (int)key, 0); // event 2 = keypress
+                { TaskMem::WindowScope _tms(fw->id); fw->input(fw, 2, (int)key, 0); } // event 2 = keypress
             }
         }
     }
@@ -2873,6 +3101,8 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
 
 void DesktopEnvironment::Update(){
     Taskbar::Update();
+    KuiKernel::Pump();   // kui apps: timers, frame requests, focus edges, closed windows (satoru)
+    TaskManagerApp::DebugKillTick();   // no-op unless kurono.tmkill=1 (satoru)
     // Shell commands are drained by ShellProcess when the preemptive
     // scheduler is running; calling Tick here would still run Execute on
     // the GUI thread and freeze the desktop + mouse.
@@ -2894,35 +3124,33 @@ void DesktopEnvironment::ReloadFromConfig(){
 void DesktopEnvironment::LaunchTerminal(){
     TerminalApp::Open();
 }
+void DesktopEnvironment::LaunchAlpine(){
+    // linux turned off in settings: show the linux page instead (satoru)
+    if (!VMHost::Enabled()) { LinuxSettings::OpenPage(); return; }
+    AlpineTerminal::Open();   // starts the vm too when it is off (satoru)
+}
 void DesktopEnvironment::LaunchFileBrowser(){
-    FileManagerApp::Open();
+    // a kui app now: ring 3 (/system/apps/files) when kurono.r3apps asks for it and the ELF is there,
+    // else the same source built into the kernel. (satoru)
+    KuiKernel::Open("files");
 }
 void DesktopEnvironment::LaunchCalculator(){
-    Calculator::Init(0, 0);
-    Calculator::SetActive(true);
-    int wid = WindowManager::CreateWindow("Calculator", -1, -1, 200, 250,
-        (WindowRenderFunc)[](Window* w, int cx, int cy, int cw, int ch) {
-            (void)w;
-            Calculator::SetPosition(cx, cy);
-            Calculator::SetSize(cw, ch);
-            Calculator::Draw();
-        },
-        (WindowInputFunc)[](Window* w, int ev, int p1, int p2) {
-            (void)w;
-            if (ev == 1) Calculator::Input(p1, p2, true, 0);
-            else if (ev == 2) Calculator::Input(0, 0, false, (char)p1);
-        }
-    );
-    (void)wid;
+    // a kui app: ring 3 (/system/apps/calculator) when kurono.r3apps / ui.conf apps.ring3 asks for
+    // it and a launcher is free, else the same source built into the kernel. (satoru)
+    if (KuiKernel::LaunchRing3("calculator")) return;
+    TaskMem::AppScope _tms(TaskMem::APP_CALC);   // kurono.taskmem=1: charge to the app (satoru)
+    kui_launch_calculator();
 }
 void DesktopEnvironment::LaunchTextEditor(){
-    TextEditorApp::Open();
+    // ring 3 (/system/apps/texteditor) when wanted, else the in-kernel kui build (satoru)
+    KuiKernel::Open("texteditor");
 }
 void DesktopEnvironment::LaunchSettings(){
     SystemSettings::Open();   // route to the new modular settings ui (satoru)
 }
 void DesktopEnvironment::LaunchTaskManager(){
-    TaskManagerApp::Open();
+    // ring 3 (/system/apps/taskmgr) when wanted, else the in-kernel kui build (satoru)
+    KuiKernel::Open("taskmgr");
 }
 void DesktopEnvironment::LaunchBrowser(){
     // the browser is firefox on the linux runtime; the old placeholder tile
@@ -2930,13 +3158,28 @@ void DesktopEnvironment::LaunchBrowser(){
     LaunchFirefox();
 }
 void DesktopEnvironment::LaunchMediaPlayer(){
-    MediaPlayerApp::Open();
+    // ring 3 (/system/apps/denji) when wanted, else the in-kernel video library. (satoru)
+    KuiKernel::Open("denji");
 }
 void DesktopEnvironment::LaunchFirefox(){
     // run the full `firefox` shell flow (lazy restore / install / exec) on the
     // shell kernel-process, detached - no terminal window. the gui thread only
     // queues + toasts; firefox's own wayland window appears when gecko maps
     // its toplevel. (satoru)
+    // one firefox: while it is open, the dock or menu brings its window forward
+    // instead of starting a second instance on the same profile (that one hit
+    // the profile lock, or under sched=2 was refused with nothing on screen). (satoru)
+    {
+        Window* ws = WindowManager::GetWindows();
+        for (int i = 0; ws && i < WM_MAX_WINDOWS; i++) {
+            Window* w = &ws[i];
+            if (w->state == WIN_CLOSED || w->app_icon != (int)AppIcons::FIREFOX) continue;
+            if (!WaylandServer::IsWaylandWindow(w->id)) continue;
+            if (w->state == WIN_MINIMIZED) WindowManager::Unminimize(w->id);
+            WindowManager::Focus(w->id);
+            return;
+        }
+    }
     bool installed = FirefoxLauncher::IsInstalled();
     if(!KernelProcesses::RunShellCommandDetached("firefox")){
         NotificationManager::Post("Firefox",

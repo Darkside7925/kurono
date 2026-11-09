@@ -11,7 +11,8 @@
 // not a decoder - but is sufficient for the demuxer to feed an aac
 // decoder with correct stream parameters when one becomes available.
 #pragma once
-#include "../kernel/types.h"
+#include <stdint.h>
+#include <stddef.h>
 
 namespace AAC {
 

@@ -8,6 +8,9 @@
 #define FM_MAX_HISTORY   16
 #define FM_SEARCH_MAX    48
 #define FM_RECENT_MAX    16
+#define FM_CLIP_MAX      64     // items one cut/copy can hold (satoru)
+#define FM_JOB_MAX       128    // files one paste or trash expands into (satoru)
+#define FM_DRIVE_MAX     8      // mounts shown in the sidebar drives group (satoru)
 
 struct FMEntry {
     char name[FM_NAME_MAX];
@@ -42,12 +45,21 @@ struct FMTab {
     bool show_hidden;
     char search[FM_SEARCH_MAX];
     int  search_cursor;
+    bool search_edit;       // the search field has the keyboard (satoru)
     bool address_edit;      // true when typing a path in the address bar
+    bool address_fresh;     // first typed key replaces the shown path (satoru)
     char address_buf[FM_MAX_PATH];
     int  address_cursor;
     FMViewMode view_mode; 
+    unsigned char sel[FM_MAX_ENTRIES];   // multi selection, indexed like the entries (satoru)
+    int  sel_count;
+    int  sel_anchor;        // shift-click and shift-arrow origin (satoru)
     bool used; // wthr ths tab slot is in use
 };
+
+struct FMInst;   // one per Files window, defined in file_manager.cpp (satoru)
+class FMApp;     // the toolkit handler of one window, defined in file_manager.cpp (satoru)
+namespace kui { class AppHandler; class Window; class Canvas; }   // src/kui/kui.h (satoru)
 
 class FileManagerApp {
 public:
@@ -57,10 +69,11 @@ public:
     static void NotifyFilesystemChanged(const char* path);
     static int  win_id;
 
-    // window callbacks
-    static void Render(void* win, int x, int y, int w, int h);
-    static bool Input(void* win, int mx, int my, bool clicked, char key);
+    // window callbacks, called by FMApp (the kui handler) with the window's state selected (satoru)
+    static void Render(kui::Window& win, kui::Canvas& c);
+    static bool Input(kui::Window& win, int mx, int my, bool clicked, int key);   // key: ascii or a kui::Key, -4 = right click (satoru)
     static void Scroll(int dz);   // mouse-wheel scroll of the active pane (satoru)
+    static kui::AppHandler* Make(const char* nav);   // new window state in a free slot, nullptr when full (satoru)
 
     // trash subsystem
     static void EnsureTrashDir();
@@ -76,45 +89,19 @@ public:
     static void CloseTab(int idx);
 
 private:
-    // tabs
-    static FMTab tabs[FM_MAX_TABS];
-    static int   tab_count;
-    static int   active_tab;        // left pane active tab
-    static int   active_tab_right;  // right pane active tab (when dual-pane)
-    static bool  dual_pane;
-    static int   focused_pane;      // 0=left, 1=right
-
-    // entry buffers (one per pane)
-    static FMEntry entries_l[FM_MAX_ENTRIES];
-    static FMEntry entries_r[FM_MAX_ENTRIES];
-    static int     entry_count_l;
-    static int     entry_count_r;
+    // per-window state (tabs, panes, menus, rename) lives in an FMInst defined in
+    // file_manager.cpp; Select() points cur at the one a callback is for. the
+    // clipboard and the recent list below are shared by all windows. (satoru)
+    static FMInst* cur;
+    friend class FMApp;
 
     // clipboard
-    static char clipboard_path[FM_MAX_PATH];
-    static char clipboard_name[FM_NAME_MAX];
+    // clipboard: one or more items, so cut/copy of a multi selection works (satoru)
+    static char clipboard_paths[FM_CLIP_MAX][FM_MAX_PATH];
+    static char clipboard_names[FM_CLIP_MAX][FM_NAME_MAX];
+    static int  clipboard_count;
     static bool clipboard_has_item;
     static bool clipboard_cut;       // true = move on paste
-
-    // context menu
-    static bool context_menu_open;
-    static int  context_menu_x, context_menu_y;
-    static int  context_menu_pane;
-    static int  context_menu_idx;
-
-    // properties dialog
-    static bool properties_open;
-    static char properties_path[FM_MAX_PATH];
-
-    // sort menu
-    static bool sort_menu_open;
-
-    // rename inline
-    static bool rename_mode;
-    static int  rename_pane;
-    static int  rename_target;
-    static char rename_buf[FM_NAME_MAX];
-    static int  rename_cursor;
 
     // recent
     static char recent[FM_RECENT_MAX][FM_MAX_PATH];
@@ -138,7 +125,13 @@ private:
     static void      CreateFolderPane(int pane);
     static void      CreateFilePane(int pane);
     static void      CopyEntryPane(int pane, int idx, bool cut);
+    static void      CopySelection(int pane, int idx, bool cut);   // multi-item clip fill (satoru)
     static void      PastePane(int pane);
+    static void      StartTrashSelection(int pane);
+    static void      StartRestore(const char* path);
+    static bool      JobsActive();
+    static void      PumpJobs(kui::Window* w);
+    static void      CancelJobs();
 
     // rendering
     static void RenderToolbar(int x, int y, int w);
@@ -151,9 +144,22 @@ private:
     static void RenderFileColumns(int pane, int x, int y, int w, int h);
     static void RenderStatusBar(int x, int y, int w);
     static void RenderEntryIcon(int x, int y, int sz, FMEntry* e);
+    static bool DrawEntryIcon(int pane, int idx, int x, int y, int sz);   // image thumb or glyph (satoru)
     static void RenderContextMenu(int ox, int oy);
     static void RenderSortMenu(int ox, int oy);
     static void RenderProperties(int cx, int cy, int cw, int ch);
+    static void RenderOpenWith(int cx, int cy, int cw, int ch);
+    static void RenderProgress(int cx, int cy, int cw, int ch);
+
+    // multi selection (satoru)
+    static bool HasSel(int pane, int idx);
+    static int  SelCount(int pane);
+    static void SelClear(int pane);
+    static void SelAll(int pane);
+    static void SelToggle(int pane, int idx);
+    static void SelRange(int pane, int from, int to);
+    static void SelSetOne(int pane, int idx);
+    static void SelRemapAfterSort(int pane, char (*names)[FM_NAME_MAX], int n);
 
     // hit testing helpers
     static int HitTestEntry(int pane, int rel_x, int rel_y, int pane_w, int pane_h);

@@ -404,7 +404,10 @@ void fu_read_range(uint8_t ch) {
     g_dev.vmin = g_dev.vmax = g_dev.vres = 0;
     uint16_t widx = (uint16_t)((g_dev.fu_id << 8) | g_dev.cfg.ac_iface);
     if (g_dev.cfg.ver == 2) {
-        uint8_t b[2 + 6 * 4];
+        // uac2 volume is a 2-byte control, so its RANGE parameter block is
+        // wNumSubRanges + wMIN + wMAX + wRES = 8 bytes. asking for more made the
+        // device stall ep0 (code 6) and left the range at 0..0 (no volume). (satoru)
+        uint8_t b[2 + 3 * 2];
         ua_zero(b, sizeof(b));
         if (ctl_in(0xA1, 0x02, (uint16_t)((2 << 8) | ch), widx, b, sizeof(b)) && le16(b) >= 1) {
             g_dev.vmin = (int16_t)le16(b + 2); g_dev.vmax = (int16_t)le16(b + 4); g_dev.vres = (int16_t)le16(b + 6);

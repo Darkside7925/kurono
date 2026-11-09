@@ -4,6 +4,7 @@
 #include "linux_syscall.h"
 #include "shared_mount.h"
 #include "../kernel/heap.h"
+#include "../kernel/memacct.h"   // real meminfo (satoru)
 #include "../kernel/time.h"
 #include "../proc/scheduler.h"
 #include "../drivers/serial.h"
@@ -292,30 +293,8 @@ int LinuxKernel::GenUptime(char* buf, int mx, void*) {
 }
 
 int LinuxKernel::GenMeminfo(char* buf, int mx, void*) {
-    uint32_t total = GetTotalMemory();     // kb
-    uint32_t free_mem = GetFreeMemory();   // kb
-    uint32_t used = total - free_mem;
-    uint32_t cached = free_mem / 4;
-    uint32_t buffers = free_mem / 8;
-
-    int p = 0;
-    p = PutKB(buf, p, mx, "MemTotal",        total);
-    p = PutKB(buf, p, mx, "MemFree",         free_mem);
-    p = PutKB(buf, p, mx, "MemAvailable",    free_mem + cached);
-    p = PutKB(buf, p, mx, "Buffers",         buffers);
-    p = PutKB(buf, p, mx, "Cached",          cached);
-    p = PutKB(buf, p, mx, "SwapCached",      0);
-    p = PutKB(buf, p, mx, "Active",          used / 2);
-    p = PutKB(buf, p, mx, "Inactive",        used / 2);
-    p = PutKB(buf, p, mx, "SwapTotal",       0);
-    p = PutKB(buf, p, mx, "SwapFree",        0);
-    p = PutKB(buf, p, mx, "Dirty",           0);
-    p = PutKB(buf, p, mx, "Writeback",       0);
-    p = PutKB(buf, p, mx, "AnonPages",       used / 3);
-    p = PutKB(buf, p, mx, "Mapped",          used / 4);
-    p = PutKB(buf, p, mx, "Shmem",           0);
-    p = PutKB(buf, p, mx, "Slab",            1024);
-    return p;
+    // real pmm numbers; the old body derived cached/buffers/anon as fractions of free ram. (satoru)
+    return MemAcct::FormatMeminfo(buf, mx);
 }
 
 int LinuxKernel::GenCpuinfo(char* buf, int mx, void*) {
@@ -461,8 +440,12 @@ int LinuxKernel::GenPidStatus(char* buf, int mx, void* ctx) {
     p = PutDec(buf, p, mx, (int)proc->gid);
     p = PutStr(buf, p, mx, "\t");
     p = PutDec(buf, p, mx, (int)proc->egid);
-    p = PutStr(buf, p, mx, "\nVmSize:\t4096 kB\n");
-    p = PutStr(buf, p, mx, "VmRSS:\t2048 kB\n");
+    // real rss from the page-table walk (the lines were fixed 4096 / 2048 kB literals). (satoru)
+    MemAcct::SpaceMem sm = {0, 0, 0, 0};
+    if (proc->task && proc->task->address_space) MemAcct::QuerySpace(proc->task->address_space, 1000, &sm);
+    p = PutStr(buf, p, mx, "\nVmRSS:\t");
+    p = PutDec(buf, p, mx, (int)sm.rss_kb);
+    p = PutStr(buf, p, mx, " kB\n");
     p = PutStr(buf, p, mx, "Threads:\t1\n");
     return p;
 }

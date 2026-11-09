@@ -6,13 +6,13 @@
 //
 //  the executive is the clean, named service layer the rest of the kernel + the
 //  driver frameworks (kdf/udf) call into, instead of reaching into vmm/pmm/
-//  scheduler/supr internals directly. it groups the core services into five
+//  scheduler/ken internals directly. it groups the core services into five
 //  namespaces mirroring nt:
 //
 //    KExec::Memory   (Mm)  - page + contiguous allocation, map/unmap, query
 //    KExec::Process  (Ps)  - current pid, spawn a kernel worker, yield/sleep
 //    KExec::IO       (Io)  - post an irp (routes to the IRP executive)
-//    KExec::Security (Se)  - capability / privilege checks (routes to SUPR)
+//    KExec::Security (Se)  - capability / privilege checks (routes to KEN)
 //    KExec::Config   (Cm)  - a tiny key/value config store (the "registry")
 //
 //  HONEST SCOPE: this is a facade. it does not replace the subsystems; it gives
@@ -50,12 +50,12 @@ namespace IO {
     int64_t  WriteBlocks(const char* device, uint64_t lba, uint32_t count, const void* buf);
 }
 
-// ── Se: security (routes to SUPR) ─────────────────────────────────────────────
+// ── Se: security (routes to KEN) ─────────────────────────────────────────────
 namespace Security {
     enum Cap { CAP_NETWORK = 1, CAP_FILESYSTEM = 2, CAP_GUI = 4, CAP_HARDWARE = 8 };
     // is the current session permitted `cap` right now? (satoru)
     bool     CheckCapability(uint32_t cap);
-    // current privilege level (0=guest,1=user,2=admin/root) from SUPR. (satoru)
+    // current privilege level (0=guest,1=user,2=admin/root) from KEN. (satoru)
     int      CurrentLevel();
 }
 

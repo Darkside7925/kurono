@@ -1,7 +1,11 @@
 #include "notification.h"
 #include "ui_elements.h"          // animation easing helpers (satoru)
 #include "../drivers/graphics.h"
+#include "../drivers/outputs.h"   // toasts stay on the primary output (satoru)
 #include "../drivers/timer.h"
+#include "style.h"                 // modern vs classic toasts (satoru)
+#include "modern_draw.h"          // shared shell surfaces (satoru)
+#include "desktop.h"              // Taskbar::TopInset: toasts sit under the menu bar (satoru)
 
 // fixed storage - no heap, lives in bss. (satoru)
 NotificationManager::Toast NotificationManager::toasts[NotificationManager::MAX_TOASTS];
@@ -65,8 +69,14 @@ const char* NotificationManager::GlyphFor(IconType t) {
     }
 }
 
+static bool g_dnd = false;
+
+void NotificationManager::SetDoNotDisturb(bool on) { g_dnd = on; }
+bool NotificationManager::DoNotDisturb() { return g_dnd; }
+
 void NotificationManager::Post(const char* title, const char* body, int icon_type, uint32_t duration_ms) {
     EnsureInit();
+    if (g_dnd) return;   // focus mode: silent, nothing stacks up. (satoru)
 
     IconType icon = ICON_INFO;
     if (icon_type >= ICON_INFO && icon_type <= ICON_ERROR) icon = (IconType)icon_type;
@@ -144,10 +154,53 @@ void NotificationManager::Render() {
     Tick();
 
     int screen_w = Graphics::GetWidth();
+    // multi-monitor: toasts slide in at the primary output's right edge (satoru)
+    if (Outputs::Multi()) {
+        const Output* po = Outputs::Get(0);
+        if (po && po->connected && po->w > 0) screen_w = po->x + po->w;
+    }
     if (screen_w <= 0) return;
     const int rest_x = screen_w - CARD_W - MARGIN_X;   // settled left edge (satoru)
     const int off_x  = screen_w + 8;                   // fully off-screen right
     uint32_t now = Timer::GetRealMs();
+
+    if (UIStyle::Modern()) {
+        // modern: glass cards under the menu bar that glide in a short way
+        // from the right while fading in, and drift back out. the stack
+        // closes up smoothly when one leaves. (satoru)
+        const int MW = 344, MH = 66, MG = 10;
+        const int mrest = screen_w - MW - 14;
+        int top = Taskbar::TopInset() + 12;
+        float slot_y = 0.0f;
+        for (int i = 0; i < MAX_TOASTS; i++) {
+            Toast& tt = toasts[i];
+            if (!tt.used) continue;
+            uint32_t age = now - tt.born_ms;
+            float p = 1.0f;          // presence 0..1 (satoru)
+            float dx = 0.0f;
+            if (tt.phase == PHASE_IN) {
+                float e = Animation::EaseMs(age, SLIDE_MS, Animation::EaseOutCubic);
+                p = e;
+                // a little overshoot as it settles, from 56 px out (satoru)
+                float bt = Animation::Clamp01((float)age / (float)SLIDE_MS) - 1.0f;
+                float b = 1.0f + 2.2f * bt * bt * bt + 1.2f * bt * bt;   // ease-out-back (satoru)
+                dx = 56.0f * (1.0f - b);
+            } else if (tt.phase == PHASE_OUT) {
+                float e = Animation::EaseMs(age, SLIDE_MS, Animation::EaseInOut);
+                p = 1.0f - e;
+                dx = 40.0f * e;
+            }
+            int a = (int)(255.0f * Animation::Clamp01(p));
+            int ty = top + (int)(slot_y + 0.5f);
+            int kind = tt.icon == ICON_SUCCESS ? 1 : tt.icon == ICON_WARNING ? 2 : tt.icon == ICON_ERROR ? 3 : 0;
+            MDraw::Toast(mrest + (int)dx, ty, MW, MH, kind, tt.title, tt.body, a);
+            Graphics::MarkDirty(mrest - 30, ty - 30, MW + 90, MH + 70);
+            // a leaving card gives its slot back as it fades, so the ones
+            // below slide up instead of jumping (satoru)
+            slot_y += (float)(MH + MG) * (tt.phase == PHASE_OUT ? Animation::Clamp01(p) : 1.0f);
+        }
+        return;
+    }
 
     // stack live cards top-down in slot order. (satoru)
     int row = 0;

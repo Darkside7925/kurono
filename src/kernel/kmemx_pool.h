@@ -26,7 +26,8 @@ constexpr uint32_t MAX_CHUNKS  = 512;                   // up to 1gb pool (sator
 // no-op here (SetPoolPct handles safe shrink). (satoru)
 uint64_t Reserve(uint64_t want_bytes);
 
-// total reserved + currently-allocated byte counts. (satoru)
+// total reserved + currently-allocated byte counts. ChunkCount is the number
+// of chunks currently reserved (holes left by a release are not counted). (satoru)
 uint64_t TotalBytes();
 uint64_t UsedBytes();
 uint32_t ChunkCount();
@@ -46,7 +47,23 @@ void Free(uint32_t pool_off, uint32_t n);
 void* Ptr(uint32_t pool_off);
 
 // grow the arena by reserving more chunks up to `want_bytes` total. (satoru)
+// the pool is adaptive now: it starts empty and the engine grows it in 2mb
+// chunks under memory pressure. a chunk slot freed by ReleaseEmpty becomes a
+// hole that the next grow refills, so pool offsets of live blobs never move.
+// the pmm allocation runs outside the pool lock. (satoru)
 uint64_t GrowTo(uint64_t want_bytes);
+
+// detach up to `max_chunks` WHOLLY EMPTY chunks (highest slot first) while
+// keeping at least `keep_bytes` reserved, and hand their bases back in
+// `bases_out` (room for max_chunks entries). the caller returns them with
+// PMM::FreeContiguous(base, CHUNK_BYTES / 4096) after dropping its locks.
+// a detached chunk is unreachable by Alloc/Ptr/Free before this returns.
+// returns the number of chunks detached. (satoru)
+int ReleaseEmpty(int max_chunks, uint64_t keep_bytes, uint64_t* bases_out);
+
+// true if `phys` lies inside a currently reserved pool chunk. lockless read of
+// the chunk bases; used by the never-compress check. (satoru)
+bool Contains(uint64_t phys);
 
 // largest single allocation the arena can currently satisfy (diagnostic). (satoru)
 uint32_t LargestFree();

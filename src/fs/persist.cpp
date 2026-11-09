@@ -440,12 +440,25 @@ bool PersistStore::SaveTree() {
         }
     }
 
+    // an installed claude code exists only on the volume after a reboot and the
+    // format below would erase it: bring it back into pmm first so the /opt
+    // root writes it out again. (satoru)
+    if (KFS::IsMounted() && KFS::Exists("/opt/claude/claude")) {
+        KVFSNode* on = KVFS::Resolve("/opt/claude/claude");
+        if (!on || !on->content) {
+            if (!PersistStore::ClaudeImage(nullptr, nullptr, true))
+                SerialLogger::Log("[persist] WARNING: could not keep /opt/claude across this save\r\n");
+        }
+    }
+
     uint32_t blocks = kfs_disk_blocks();
     if (!blocks || !KFS::Format(blocks)) return false;
     // /apps persists too so a large installed package (e.g. firefox in
-    // /apps/firefox) survives reboot and isn't re-downloaded every boot. (satoru)
-    const char* roots[4] = { "/home", "/etc", "/root", "/apps" };
-    for (int i = 0; i < 4; i++) if (KVFS::Exists(roots[i])) save_subtree(roots[i]);
+    // /apps/firefox) survives reboot and isn't re-downloaded every boot. /opt
+    // carries claude code (kpkg install claude), saved from its borrowed
+    // buffer without a heap copy. (satoru)
+    const char* roots[5] = { "/home", "/etc", "/root", "/apps", "/opt" };
+    for (int i = 0; i < 5; i++) if (KVFS::Exists(roots[i])) save_subtree(roots[i]);
     KFS::SetFingerprint(cur_fp);   // stamp so the next save can short-circuit (satoru)
     bool ok = KFS::Sync();
     if (ok) SerialLogger::Log("[persist] saved kvfs user data to KFS volume (full snapshot)\r\n");
@@ -521,5 +534,44 @@ bool PersistStore::HasPersistedFirefox() {
 
 bool PersistStore::HasPersistedFirefoxCached() {
     return g_ff_persisted_probe == 1;
+}
+
+bool PersistStore::ClaudeImage(const uint8_t** buf, uint64_t* len, bool load) {
+    static const char* path = "/opt/claude/claude";
+    KVFSNode* n = KVFS::Resolve(path);
+    if (n && n->type == KVFS_FILE && n->content && n->size >= 4096) {
+        if (buf) *buf = n->content;
+        if (len) *len = n->size;
+        return true;
+    }
+    if (!PersistStore::Available()) return false;
+    if (!kfs_ensure_mounted()) return false;
+    int64_t sz = KFS::FileSize(path);
+    if (sz < 4096 || sz > (int64_t)0xF0000000ll) return false;
+    if (!load) return true;
+    uint64_t alloc = ((uint64_t)sz + 4095) & ~4095ull;
+    uint8_t* mem = (uint8_t*)PMM::AllocBytes((size_t)alloc);
+    if (!mem) { SerialLogger::Log("[persist] claude: no contiguous memory for the image\r\n"); return false; }
+    uint64_t t0 = Timer::GetRealMs64();
+    int64_t got = KFS::ReadFile(path, mem, (uint64_t)sz);
+    if (got != sz) {
+        SerialLogger::Log("[persist] claude: short read from the volume\r\n");
+        PMM::FreeBytes(mem, (size_t)alloc);
+        return false;
+    }
+    KVFS::Mkdirs("/opt/claude");
+    if (KVFS::WriteFileStatic(path, mem, (uint32_t)sz) != 0) {
+        PMM::FreeBytes(mem, (size_t)alloc);
+        return false;
+    }
+    KVFS::Chmod(path, 0755);
+    SerialLogger::Log("[persist] claude: restored ");
+    SerialLogger::LogDec((int)(sz >> 20));
+    SerialLogger::Log(" MB from the volume in ");
+    SerialLogger::LogDec((int)(Timer::GetRealMs64() - t0));
+    SerialLogger::Log(" ms\r\n");
+    if (buf) *buf = mem;
+    if (len) *len = (uint64_t)sz;
+    return true;
 }
 // end (satoru)

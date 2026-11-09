@@ -21,7 +21,7 @@
 #include "../kernel/elf_loader.h"
 #include "../kernel/userspace.h"
 #include "../linux/linux_syscall.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
 #include "../security/ksa.h"
 #include "../ui/notification.h"
 #include "../shell/shell.h"
@@ -354,7 +354,7 @@ KInkernelHook g_kdf_start_entry[KINIT_MAX_KDF_DRIVERS] = {
 static_assert(KINIT_MAX_KDF_DRIVERS == 16, "kdf trampoline table must match KINIT_MAX_KDF_DRIVERS");
 
 // capability gate: a process unit that asks for a capability it cannot have is
-// refused at spawn. for now we gate on the active supr level: a service that
+// refused at spawn. for now we gate on the active ken level: a service that
 // wants no elevated capability always passes; one requesting filesystem/network
 // requires at least a logged-in user session. this is intentionally light (the
 // in-kernel units already run privileged) but it is REAL: a disabled or
@@ -364,9 +364,9 @@ bool capability_gate(const KService* svc) {
     if (svc->kind != KUNIT_PROCESS && svc->kind != KUNIT_ONESHOT) return true;
     bool wants_priv = svc->caps.network || svc->caps.filesystem;
     if (!wants_priv) return true;
-    int sid = SUPR::GetCurrentSession();
-    SUPRLevel lvl = (sid >= 0) ? SUPR::GetLevel(sid) : SUPR_GUEST;
-    bool ok = (lvl >= SUPR_USER);
+    int sid = KEN::GetCurrentSession();
+    KENLevel lvl = (sid >= 0) ? KEN::GetLevel(sid) : KEN_GUEST;
+    bool ok = (lvl >= KEN_USER);
     char detail[96];
     int p = 0;
     p = ki_cat(detail, p, (int)sizeof(detail), "net=");
@@ -1806,7 +1806,7 @@ void register_builtins() {
     RegisterInkernel("kupdate", "Update checker", KTGT_USER,
                      start_kupd, noop_stop, health_kupd, "kpkg-daemon",
                      KRESTART_ON_FAILURE, 5000, false);
-    RegisterInkernel("ksecurity", "KSA + supr policy watch", KTGT_USER,
+    RegisterInkernel("ksecurity", "KSA + ken policy watch", KTGT_USER,
                      start_ksec, noop_stop, health_ksec, "kdbus",
                      KRESTART_ON_FAILURE, 2000, false);
 }
@@ -2241,10 +2241,10 @@ int Analyze(char* out, int mx) {
 }
 
 // ── runtime capability sandboxing (satoru) ───────────────────────────────────
-// enforce a service's declared [Capabilities] at RUNTIME via SUPR. an in-kernel
+// enforce a service's declared [Capabilities] at RUNTIME via KEN. an in-kernel
 // service calls this before a privileged op; a process unit can route a request
 // here too. the decision combines (1) what the .kservice GRANTED the unit and
-// (2) the live SUPR session level (a guest/disabled session cannot exercise a
+// (2) the live KEN session level (a guest/disabled session cannot exercise a
 // privileged capability even if the unit declared it). every denial is audited.
 // this is enforced at the points documented in KINIT.md. (satoru)
 bool CheckCapability(const char* service, uint32_t cap) {
@@ -2264,12 +2264,12 @@ bool CheckCapability(const char* service, uint32_t cap) {
         return false;
     }
 
-    // (2) for the privileged capabilities, require a live logged-in SUPR session.
+    // (2) for the privileged capabilities, require a live logged-in KEN session.
     // gui is not privileged (any session may draw). (satoru)
     if (cap == KCAP_NETWORK || cap == KCAP_FILESYSTEM) {
-        int sid = SUPR::GetCurrentSession();
-        SUPRLevel lvl = (sid >= 0) ? SUPR::GetLevel(sid) : SUPR_GUEST;
-        if (lvl < SUPR_USER) {
+        int sid = KEN::GetCurrentSession();
+        KENLevel lvl = (sid >= 0) ? KEN::GetLevel(sid) : KEN_GUEST;
+        if (lvl < KEN_USER) {
             LogEvent("cap-deny", service, "no privileged session");
             RuntimeLog::LogSecurity("kinit runtime capability denied (session)", service);
             return false;

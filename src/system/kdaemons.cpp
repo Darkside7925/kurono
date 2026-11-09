@@ -4,7 +4,7 @@
 #include "kinit.h"
 #include "logging.h"
 #include "../packages/pkgmgr.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
 #include "../security/ksa.h"
 #include "../ui/notification.h"
 #include "../proc/scheduler.h"
@@ -98,7 +98,7 @@ namespace KSecurity {
 namespace {
 volatile bool g_started = false;
 volatile bool g_healthy = true;
-volatile bool g_supr_ok = true;
+volatile bool g_ken_ok = true;
 volatile bool g_ksa_ok  = true;
 
 [[noreturn]] void worker_entry() {
@@ -108,7 +108,7 @@ volatile bool g_ksa_ok  = true;
     // POLICY-SELFTEST + KSA-SELFTEST sequence (~900ms measured: policy ~780ms,
     // ksa ~600ms including an ept context spawn/teardown) directly on the boot
     // critical path, where it also starved the cooperative gui loop. defer the
-    // first pass past desktop bring-up. safe: g_healthy/g_supr_ok/g_ksa_ok all
+    // first pass past desktop bring-up. safe: g_healthy/g_ken_ok/g_ksa_ok all
     // default true, so the system reports healthy until the first real result -
     // the same optimistic stance the ksa-unavailable branch already takes. (satoru)
     uint32_t next_ms = 10000;
@@ -116,21 +116,21 @@ volatile bool g_ksa_ok  = true;
     for (;;) {
         uint32_t now = (uint32_t)Scheduler::NowMs();
         if (now >= next_ms) {
-            bool supr_ok = SUPR::PolicySelfTest();
+            bool ken_ok = KEN::PolicySelfTest();
             // ksa self-test only meaningful where the nested-vm secure path is
             // available; treat an unavailable ksa as healthy (not a failure) so
             // a plain qemu boot doesn't flag a security alert. (satoru)
             bool ksa_ok = KSA::IsAvailable() ? KSA::SelfTest() : true;
-            g_supr_ok = supr_ok;
+            g_ken_ok = ken_ok;
             g_ksa_ok  = ksa_ok;
-            bool healthy = supr_ok && ksa_ok;
+            bool healthy = ken_ok && ksa_ok;
             if (!healthy && (first || g_healthy)) {
                 // transitioned to unhealthy -> alert. (satoru)
                 NotificationManager::Post("ksecurity", "policy self-test FAILED",
                                           NotificationManager::ICON_ERROR, 6000);
                 KInit::LogEvent("policy-selftest-fail", "ksecurity",
-                                supr_ok ? "ksa" : "supr");
-                RuntimeLog::LogSecurity("ksecurity policy self-test failed", supr_ok ? "ksa" : "supr");
+                                ken_ok ? "ksa" : "ken");
+                RuntimeLog::LogSecurity("ksecurity policy self-test failed", ken_ok ? "ksa" : "ken");
             } else if (first) {
                 KInit::LogEvent("policy-selftest-ok", "ksecurity", nullptr);
             }
@@ -156,7 +156,7 @@ int Cmd(void* sh, int argc, const char** argv, char* out, int mx) {
     int p = 0;
     auto cat = [&](const char* s){ while (*s && p < mx-1) out[p++]=*s++; out[p]=0; };
     cat("ksecurity policy watch:\n");
-    cat("  supr policy self-test: "); cat(g_supr_ok ? "ok\n" : "FAILED\n");
+    cat("  ken policy self-test: "); cat(g_ken_ok ? "ok\n" : "FAILED\n");
     cat("  ksa  self-test:        ");
     if (!KSA::IsAvailable()) cat("n/a (no nested-vm secure path)\n");
     else cat(g_ksa_ok ? "ok\n" : "FAILED\n");
@@ -165,7 +165,7 @@ int Cmd(void* sh, int argc, const char** argv, char* out, int mx) {
 
 void RegisterShellCommands(void* shell) {
     Shell* sh = (Shell*)shell;
-    if (sh) sh->RegisterCommand("ksecurity", Cmd, "KSA + supr policy watch");
+    if (sh) sh->RegisterCommand("ksecurity", Cmd, "KSA + ken policy watch");
 }
 }  // namespace KSecurity
 

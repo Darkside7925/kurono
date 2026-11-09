@@ -10,6 +10,20 @@
 // must be extern "c" so the inline asm 'movabs $g_vmx_guest_regs' finds
 // the unmangled symbol name, and non-static so the linker can resolve it.
 extern "C" uint64_t* volatile g_vmx_guest_regs = nullptr;
+// guest x87/sse state. vm entry and exit do not switch it, and every host
+// function that runs between exits (memcpy, the scheduler's fxrstor on a
+// switch) clobbers xmm registers, so linux userspace in the guest saw its
+// vector registers change under it. the entry asm fxrstors this image right
+// before vmresume and fxsaves it right after the exit; the host image is
+// saved and restored around that. (satoru)
+extern "C" { alignas(16) uint8_t g_vmx_guest_fx[512]; }
+alignas(16) static uint8_t g_vmx_host_fx[512];
+void VMM::ResetGuestFPU() {
+    for (int i = 0; i < 512; i++) g_vmx_guest_fx[i] = 0;
+    *(uint16_t*)(g_vmx_guest_fx + 0) = 0x037F;      // fcw: all exceptions masked
+    *(uint32_t*)(g_vmx_guest_fx + 24) = 0x1F80;     // mxcsr power-on value
+    *(uint32_t*)(g_vmx_guest_fx + 28) = 0x0000FFFF; // mxcsr_mask
+}
 
 // same for amd svm - must be extern "c" for movabs in inline asm
 extern "C" uint64_t* volatile g_svm_guest_regs = nullptr;
@@ -503,6 +517,64 @@ bool VMM::IsSupported() { return virt_type != VIRT_NONE; }
 bool VMM::IsNested() { return nested; }
 uint32_t VMM::GetLastVMInstructionError() { return last_vm_instr_error; }
 uint64_t VMM::GetLastVMEntryGuestRip() { return last_vm_entry_guest_rip; }
+
+// vmx does not save or load these on entry/exit (sdm vol 3c 27.3 / 28.5 only
+// cover efer, pat, debugctl, sysenter, fs/gs base). the host kernel keeps its
+// per-cpu pointer in kernel_gs_base and its syscall entry in lstar, so the
+// guest values are swapped in around vmlaunch/vmresume by hand (satoru)
+static const uint32_t g_switched_msr_ids[5] = {
+    0xC0000102, 0xC0000081, 0xC0000082, 0xC0000083, 0xC0000084
+};
+static uint64_t g_guest_switched_msr[5] = { 0, 0, 0, 0, 0 };
+
+uint64_t* VMM::GuestSwitchedMSR(uint32_t msr) {
+    for (int i = 0; i < 5; i++) {
+        if (g_switched_msr_ids[i] == msr) return &g_guest_switched_msr[i];
+    }
+    return nullptr;
+}
+
+static void LogCtl(const char* name, uint32_t field, uint32_t msr) {
+    uint64_t allowed = 0;
+    VMM::SafeReadMSR(msr, allowed);
+    uint32_t val = (uint32_t)VMM::VMRead(field);
+    uint32_t a0 = (uint32_t)allowed, a1 = (uint32_t)(allowed >> 32);
+    SerialLogger::Log("VMM:   ");
+    SerialLogger::Log(name);
+    SerialLogger::Log("=0x");
+    SerialLogger::LogHex(val);
+    SerialLogger::Log(" allowed0=0x");
+    SerialLogger::LogHex(a0);
+    SerialLogger::Log(" allowed1=0x");
+    SerialLogger::LogHex(a1);
+    if ((val & a0) != a0 || (val & ~a1) != 0) SerialLogger::Log(" <-- VIOLATES");
+    SerialLogger::Log("\r\n");
+}
+
+// dump every control the sdm 26.2.1 checks so an error 7 names its field (satoru)
+void VMM::DumpVMXControlDiag() {
+    uint64_t basic = 0;
+    SafeReadMSR(MSR_IA32_VMX_BASIC, basic);
+    bool tru = (basic >> 55) & 1;
+    LogCtl("pin", VMCS_PIN_BASED_CONTROLS, tru ? MSR_IA32_VMX_TRUE_PINBASED : MSR_IA32_VMX_PINBASED_CTLS);
+    LogCtl("proc", VMCS_PROC_BASED_CONTROLS, tru ? MSR_IA32_VMX_TRUE_PROCBASED : MSR_IA32_VMX_PROCBASED_CTLS);
+    LogCtl("proc2", VMCS_PROC_BASED_CONTROLS2, MSR_IA32_VMX_PROCBASED_CTLS2);
+    LogCtl("exit", VMCS_EXIT_CONTROLS, tru ? MSR_IA32_VMX_TRUE_EXIT : MSR_IA32_VMX_EXIT_CTLS);
+    LogCtl("entry", VMCS_ENTRY_CONTROLS, tru ? MSR_IA32_VMX_TRUE_ENTRY : MSR_IA32_VMX_ENTRY_CTLS);
+    uint64_t cap = 0;
+    SafeReadMSR(MSR_IA32_VMX_EPT_VPID_CAP, cap);
+    SerialLogger::Log("VMM:   eptp=0x");
+    SerialLogger::LogHex(VMRead(VMCS_EPT_POINTER));
+    SerialLogger::Log(" ept_cap=0x");
+    SerialLogger::LogHex(cap);
+    SerialLogger::Log(" msr_bitmap=0x");
+    SerialLogger::LogHex(VMRead(VMCS_MSR_BITMAP_ADDR));
+    SerialLogger::Log(" io_a=0x");
+    SerialLogger::LogHex(VMRead(VMCS_IO_BITMAP_A));
+    SerialLogger::Log(" link=0x");
+    SerialLogger::LogHex(VMRead(VMCS_VMCS_LINK_PTR));
+    SerialLogger::Log("\r\n");
+}
 uint64_t VMM::GetLastVMEntryGuestCr0() { return last_vm_entry_guest_cr0; }
 uint64_t VMM::GetLastVMEntryGuestCr4() { return last_vm_entry_guest_cr4; }
 bool VMM::IsWHPX() { return whpx_detected; }
@@ -1001,9 +1073,22 @@ int VMM::RunVCPU(vCPU* cpu) {
         uint64_t* regs = cpu->regs;
         uint64_t result;
 
+        // a vm exit loads rflags=0x2 (sdm 28.5.3), so the old code came back
+        // with interrupts off for good. keep them off across the msr swap and
+        // restore the caller's if afterwards; a host irq that caused an
+        // external-interrupt exit is taken right at the popf (satoru)
+        uint64_t host_flags;
+        asm volatile("pushfq; popq %0; cli" : "=r"(host_flags) : : "memory");
+        uint64_t host_msr[5];
+        for (int i = 0; i < 5; i++) {
+            host_msr[i] = ReadMSR(g_switched_msr_ids[i]);
+            WriteMSR(g_switched_msr_ids[i], g_guest_switched_msr[i]);
+        }
+
         // set up the global pointer so the vm-exit handler (label 3 in the
         // inline asm below) can save guest gprs back to cpu->regs[].
         g_vmx_guest_regs = regs;
+        asm volatile("fxsave %0" : "=m"(g_vmx_host_fx) : : "memory"); // (satoru)
 
         // register layout in regs[] - intel standard (modrm) ordering:
         //   0=rax, 1=rcx, 2=rdx, 3=rbx, 4=(rsp - in vmcs), 5=rbp,
@@ -1033,6 +1118,10 @@ int VMM::RunVCPU(vCPU* cpu) {
             // would invalidate rbp-relative memory operands and the
             // register holding %[regs].
             "test %[launch], %[launch]\n\t"
+
+            // guest fpu/sse in place last, so no host code runs on it (satoru)
+            "movabs $g_vmx_guest_fx, %%rax\n\t"
+            "fxrstor (%%rax)\n\t"
 
             // %[regs] is in a callee-saved register chosen by gcc.
             // we must copy it to rax before loading guest gprs, because
@@ -1099,6 +1188,8 @@ int VMM::RunVCPU(vCPU* cpu) {
             // recover guest rax from the stack and save it
             "pop %%rcx\n\t"                 // guest rax
             "mov %%rcx, 0(%%rax)\n\t"       // regs[0]  = rax
+            "movabs $g_vmx_guest_fx, %%rcx\n\t"   // guest fpu/sse out (satoru)
+            "fxsave (%%rcx)\n\t"
 
             "xor %%eax, %%eax\n\t"          // rax = 0 (success)
             // fall through to label 4
@@ -1111,11 +1202,27 @@ int VMM::RunVCPU(vCPU* cpu) {
             "pop %%rbp\n\t"
             "pop %%rbx\n\t"
 
-            : "=a"(result)
+            // early-clobber: without '&' gcc put [launch] in rax, which the
+            // asm overwrites with the host_rip label before the test, so
+            // every entry was a vmlaunch and the second one failed (satoru)
+            : "=&a"(result)
             : [regs] "r"(regs), [launch] "r"(launch_val)
             : "rcx", "rdx", "rdi", "rsi",
               "r8", "r9", "r10", "r11", "cc", "memory"
         );
+
+        asm volatile("fxrstor %0" : : "m"(g_vmx_host_fx) : "memory"); // (satoru)
+        for (int i = 0; i < 5; i++) {
+            g_guest_switched_msr[i] = ReadMSR(g_switched_msr_ids[i]);
+            WriteMSR(g_switched_msr_ids[i], host_msr[i]);
+        }
+        asm volatile("pushq %0; popfq" : : "r"(host_flags) : "memory", "cc");
+        // a caller running with interrupts off (the kurono.cli=1 boot shell runs
+        // before the scheduler, with if=0) never takes the host interrupt that
+        // caused an external-interrupt exit, so every following entry exited at
+        // once: the "interrupt storm". give it a one-instruction window. (satoru)
+        if (result == 0 && !(host_flags & 0x200) && (VMRead(VMCS_EXIT_REASON) & 0xFFFF) == 1)
+            asm volatile("sti; nop; cli" : : : "memory");
 
         if (result != 0) {
             uint64_t err_code = VMRead(VMCS_VM_INSTR_ERROR);
@@ -1132,6 +1239,7 @@ int VMM::RunVCPU(vCPU* cpu) {
             SerialLogger::Log(" guest_cr4=0x");
             SerialLogger::LogHex(last_vm_entry_guest_cr4);
             SerialLogger::Log("\r\n");
+            if (err_code == 7 || err_code == 8) DumpVMXControlDiag();
             cpu->exit_reason = 0xFFFFFFFF;
             return -1;
         }
@@ -1140,6 +1248,31 @@ int VMM::RunVCPU(vCPU* cpu) {
         cpu->exit_reason = VMRead(VMCS_EXIT_REASON);
         cpu->exit_qualification = VMRead(VMCS_EXIT_QUALIFICATION);
 
+        // an exit in the middle of event delivery (idt-vectoring info valid,
+        // sdm 28.2.4) must have that event re-injected or it is lost (satoru)
+        {
+            uint32_t vinfo = (uint32_t)VMRead(0x4408);
+            if (vinfo & (1u << 31)) {
+                VMWrite(VMCS_ENTRY_INT_INFO, vinfo & ~(1u << 12));
+                if (vinfo & (1u << 11)) VMWrite(VMCS_ENTRY_EXCEPTION_ERROR, VMRead(0x440A));
+                uint32_t t = (vinfo >> 8) & 7;
+                if (t == 4 || t == 5 || t == 6)
+                    VMWrite(VMCS_ENTRY_INSTR_LENGTH, VMRead(VMCS_EXIT_INSTR_LENGTH));
+            }
+        }
+
+        if (cpu->exit_reason & 0x80000000u) {
+            // vm-entry failure while loading guest state (sdm 26.8): the
+            // caller sees a negative value and used to stop silently (satoru)
+            last_vm_instr_error = cpu->exit_reason;
+            SerialLogger::Log("VMM: VM entry failed on guest state, exit_reason=0x");
+            SerialLogger::LogHex(cpu->exit_reason);
+            SerialLogger::Log(" qual=0x");
+            SerialLogger::LogHex64(cpu->exit_qualification);
+            SerialLogger::Log("\r\n");
+            DumpVCPUState(cpu);
+            return -1;
+        }
         if (!cpu->launched) cpu->launched = true;
         return (int)cpu->exit_reason;
 
@@ -1242,8 +1375,14 @@ int VMM::RunVCPU(vCPU* cpu) {
 void VMM::SetupVMCSControls(vCPU* cpu) {
     (void)cpu;
 
+    // sdm a.2: when ia32_vmx_basic bit 55 is set, the true_* msrs give the real
+    // allowed-0 bits. the legacy msrs report cr3-load/store and invlpg exiting
+    // as must-be-1, which made every kpti cr3 switch a vm exit (satoru)
+    uint64_t basic_msr = ReadMSR(MSR_IA32_VMX_BASIC);
+    bool use_true = (basic_msr >> 55) & 1;
+
     // read allowed pin-based controls
-    uint64_t pin_msr = ReadMSR(MSR_IA32_VMX_PINBASED_CTLS);
+    uint64_t pin_msr = ReadMSR(use_true ? MSR_IA32_VMX_TRUE_PINBASED : MSR_IA32_VMX_PINBASED_CTLS);
     uint32_t pin_allowed0 = (uint32_t)(pin_msr & 0xFFFFFFFF);
     uint32_t pin_allowed1 = (uint32_t)(pin_msr >> 32);
     uint32_t pin_controls = PIN_EXTERNAL_INT_EXIT | PIN_NMI_EXIT;
@@ -1252,7 +1391,7 @@ void VMM::SetupVMCSControls(vCPU* cpu) {
     VMWrite(VMCS_PIN_BASED_CONTROLS, pin_controls);
 
     // primary processor-based controls
-    uint64_t proc_msr = ReadMSR(MSR_IA32_VMX_PROCBASED_CTLS);
+    uint64_t proc_msr = ReadMSR(use_true ? MSR_IA32_VMX_TRUE_PROCBASED : MSR_IA32_VMX_PROCBASED_CTLS);
     uint32_t proc_allowed0 = (uint32_t)(proc_msr & 0xFFFFFFFF);
     uint32_t proc_allowed1 = (uint32_t)(proc_msr >> 32);
     uint32_t proc_controls = PROC_HLT_EXIT | PROC_IO_EXIT | PROC_SECONDARY_CONTROLS
@@ -1274,25 +1413,29 @@ void VMM::SetupVMCSControls(vCPU* cpu) {
     }
 
     // vm-exit controls - must set host_addr_space_size (bit 9) for 64-bit host
-    uint64_t exit_msr = ReadMSR(MSR_IA32_VMX_EXIT_CTLS);
+    uint64_t exit_msr = ReadMSR(use_true ? MSR_IA32_VMX_TRUE_EXIT : MSR_IA32_VMX_EXIT_CTLS);
     uint32_t exit_allowed0 = (uint32_t)(exit_msr & 0xFFFFFFFF);
     uint32_t exit_allowed1 = (uint32_t)(exit_msr >> 32);
     uint32_t exit_controls = VM_EXIT_HOST_ADDR_SPACE_SIZE; // 64-bit host
+    // without these the guest runs on the host efer (lme/nxe/sce set) and its
+    // own wrmsr efer goes nowhere, so the 64-bit switch in startup_32 breaks (satoru)
+    exit_controls |= VM_EXIT_SAVE_EFER | VM_EXIT_LOAD_EFER;
     exit_controls |= exit_allowed0;
     exit_controls &= exit_allowed1;
     VMWrite(VMCS_EXIT_CONTROLS, exit_controls);
 
     // vm-entry controls
-    uint64_t entry_msr = ReadMSR(MSR_IA32_VMX_ENTRY_CTLS);
+    uint64_t entry_msr = ReadMSR(use_true ? MSR_IA32_VMX_TRUE_ENTRY : MSR_IA32_VMX_ENTRY_CTLS);
     uint32_t entry_allowed0 = (uint32_t)(entry_msr & 0xFFFFFFFF);
     uint32_t entry_allowed1 = (uint32_t)(entry_msr >> 32);
-    uint32_t entry_controls = 0;
+    uint32_t entry_controls = VM_ENTRY_LOAD_EFER; // (satoru)
     entry_controls |= entry_allowed0;
     entry_controls &= entry_allowed1;
     VMWrite(VMCS_ENTRY_CONTROLS, entry_controls);
 
-    // intercept only #db (1) and #bp (3) exceptions - let guest handle others
-    VMWrite(VMCS_EXCEPTION_BITMAP, (1 << 1) | (1 << 3));
+    // no exception intercepts: linux patches text with int3 all the time and
+    // the guest handles #db/#bp itself (satoru)
+    VMWrite(VMCS_EXCEPTION_BITMAP, 0);
 
     // vmcs link pointer - must be all-ones when not using vmcs shadowing
     // this is a 64-bit vmcs field; a single vmwrite sets all 64 bits on a
@@ -1350,6 +1493,7 @@ void VMM::SetupVMCSHostState(vCPU* cpu) {
     VMWrite(VMCS_HOST_IA32_SYSENTER_CS, ReadMSR(0x174) & 0xFFFF);
     VMWrite(VMCS_HOST_IA32_SYSENTER_ESP, ReadMSR(0x175));
     VMWrite(VMCS_HOST_IA32_SYSENTER_EIP, ReadMSR(0x176));
+    VMWrite(VMCS_HOST_IA32_EFER, ReadMSR(0xC0000080)); // restored by exit load-efer (satoru)
 
     // host rip - point to the vm-exit return stub
     // host rsp - current stack pointer
@@ -1435,6 +1579,7 @@ void VMM::SetupVMCSGuestState(vCPU* cpu) {
     VMWrite(VMCS_GUEST_RIP, 0x7C00);
     VMWrite(VMCS_GUEST_RSP, 0x7000);
     VMWrite(VMCS_GUEST_RFLAGS, 0x00000002);  // bit 1 always set
+    VMWrite(VMCS_GUEST_IA32_EFER, 0); // guest starts with long mode off (satoru)
 }
 
 //  vmcb setup (amd-v / svm)
@@ -1547,6 +1692,38 @@ void VMM::DumpVCPUState(vCPU* cpu) {
         SerialLogger::Log("\r\n");
         SerialLogger::Log("  Guest CR0: ");
         SerialLogger::LogHex(VMRead(VMCS_GUEST_CR0));
+        SerialLogger::Log("\r\n");
+        // full 64-bit state for long-mode guests (satoru)
+        static const struct { const char* n; uint32_t f; } kf[] = {
+            {"rip", VMCS_GUEST_RIP}, {"rsp", VMCS_GUEST_RSP}, {"rflags", VMCS_GUEST_RFLAGS},
+            {"cr3", VMCS_GUEST_CR3}, {"cr4", VMCS_GUEST_CR4}, {"efer", VMCS_GUEST_IA32_EFER},
+            {"cs", VMCS_GUEST_CS_SEL}, {"cs_ar", VMCS_GUEST_CS_AR}, {"ss", VMCS_GUEST_SS_SEL},
+            {"ss_ar", VMCS_GUEST_SS_AR}, {"gs_base", VMCS_GUEST_GS_BASE},
+            {"gdtr", VMCS_GUEST_GDTR_BASE}, {"gdtr_lim", VMCS_GUEST_GDTR_LIMIT},
+            {"idtr", VMCS_GUEST_IDTR_BASE}, {"idtr_lim", VMCS_GUEST_IDTR_LIMIT},
+            {"tr_ar", VMCS_GUEST_TR_AR}, {"idt_vec_info", 0x4408}, {"idt_vec_err", 0x440A},
+            {"exit_int_info", VMCS_EXIT_INT_INFO}, {"entry_ctl", VMCS_ENTRY_CONTROLS},
+            {"entry_int_info", VMCS_ENTRY_INT_INFO}, {"intr_state", VMCS_GUEST_INTERRUPTIBILITY},
+            {"activity", VMCS_GUEST_ACTIVITY}, {"cr0_shadow", VMCS_CR0_READ_SHADOW},
+            {"cr4_shadow", VMCS_CR4_READ_SHADOW},
+        };
+        for (auto& k : kf) {
+            SerialLogger::Log("  ");
+            SerialLogger::Log(k.n);
+            SerialLogger::Log("=0x");
+            SerialLogger::LogHex64(VMRead(k.f));
+            SerialLogger::Log("\r\n");
+        }
+        static const char* gn[16] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                     "r8","r9","r10","r11","r12","r13","r14","r15"};
+        for (int i = 0; i < 16; i++) {
+            if (i == 4) continue;
+            SerialLogger::Log("  ");
+            SerialLogger::Log(gn[i]);
+            SerialLogger::Log("=0x");
+            SerialLogger::LogHex64(cpu->regs[i]);
+            SerialLogger::Log((i % 4 == 3) ? "\r\n" : "");
+        }
         SerialLogger::Log("\r\n");
     } else if (cpu->type == VIRT_AMD_SVM && cpu->vmcb) {
         SerialLogger::Log("  Guest RIP: ");

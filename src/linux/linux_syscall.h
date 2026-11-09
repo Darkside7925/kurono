@@ -462,6 +462,9 @@ enum LinuxFdType {
     LFD_TIMERFD,     // timerfd - backend_fd = timerfd table slot (satoru)
     LFD_SIGNALFD,    // signalfd - harmless stub, never fires (satoru)
     LFD_INET,        // AF_INET tcp/udp - backend_fd = LinuxNetBridge slot (satoru)
+    LFD_PTY_MASTER,  // /dev/ptmx - backend_fd = kpty pair index (satoru)
+    LFD_DEVKEXEC,    // /dev/kexec - the terminal exec bridge, backend_fd = launcher slot + 1 (satoru)
+    LFD_PTY_SLAVE,   // /dev/pts/N and a terminal's stdio - backend_fd = kpty pair index (satoru)
 };
 
 // memfd seal bits live alongside the LinuxFd so fcntl can interrogate.
@@ -536,7 +539,10 @@ public:
     // create a new linux process context
     static int  CreateProcess(const char* name, uint32_t uid, uint32_t gid);
     static void DestroyProcess(int pid_idx);
+    // free slots of terminated + reaped tasks (killed groups never exit). (satoru)
+    static int  ReapDeadSlots();
     static LinuxProcess* GetProcess(int pid_idx);
+    static void PostSignalIdx(int pid_idx, int sig);   // set a pending signal (task manager foreground end-task) (satoru)
     static LinuxProcess* Current();
     static int  GetCurrentIndex();
     static void SetCurrent(int pid_idx);
@@ -546,7 +552,45 @@ public:
     // is null on that cpu and syscalls (mremap stack-probe, etc.) misbehave in a
     // loop. no-op if the task has no LinuxProcess. (satoru)
     static void SyncCurrentToTask(Process* task);
+    // take / drop the global syscall-layer serializer (kls) from kernel code
+    // outside a syscall. sched=2's detached launcher creates and destroys
+    // LinuxProcess slots from a kernel proc while other cpus run syscall bodies
+    // that walk the same table. never sleep while holding it. (satoru)
+    // kurono.klsprof=1: per-syscall kls hold/contention profile, [klsprof] every 10 s. (satoru)
+    static void SetKlsProf(bool on);
+    static void SetKlsGlobal(bool on);    // kurono.kls=global: no kls elision, the old single lock (a/b) (satoru)
+    static void SetSchedTrace(bool on);   // kurono.schedtrace=1 [stasks]/[swait] dumps (satoru)
+    // sched=2: a parked waiter whose whole fd set is producer-woken gets a long timer
+    // backstop instead of the 2-16 tick repoll; kurono.schedpoll=0 turns it off. (satoru)
+    static void SetPollLongWait(bool on);
+    static void SetSwitchStrict(bool on);   // kurono.schedswitch=0 restores the stranding contract (a/b) (satoru)
+    static void FinishIrqKills();   // sched=2: heartbeat side of the async fatal signals (satoru)
+    static void ReapTick();   // sched=2: retire exited threads from the scheduler heartbeat (satoru)
+    static void LayerLock();
+    static void LayerUnlock();
+    // admin gate: fully release / re-take the kls around a blocking security
+    // prompt. returns the depth released so it can be restored exactly. used
+    // only from the admin gate, which runs inside a syscall body. (satoru)
+    static int  KlsDropAll();
+    static void KlsRestore(int depth);
+    // sched=2: release the LinuxProcess records of a dead group's members that
+    // never ran their own sys_exit (group kill, fault containment). caller holds
+    // LayerLock. returns how many were released. (satoru)
+    static int ReleaseDeadGroupRecords(const Process* leader, uint64_t as);
     static bool HandlePageFault(InterruptFrame* frame);
+    // crash census diagnostics (satoru): a silent per-address-space module map
+    // (every file-backed offset-0 image map + ld-kurono's own loads), so a user
+    // fault or a wedge snapshot can name module+offset instead of a raw va.
+    static void NoteModule(uint64_t as, uint64_t base, uint64_t len, const char* name);
+    static void ResetFirefoxCache();   // relaunch: forget the old firefox address space (satoru)
+    // print "name+0xoff" for va in as (or the raw va). safe from the #pf path:
+    // reads only kernel tables. (satoru)
+    static void LogSymAddr(uint64_t as, uint64_t va);
+    // one user fault, symbolized: thread, rip, stack return addresses, and a
+    // gecko MOZ_CRASH reason when the bytes before rip are the crash sequence. (satoru)
+    static void DumpUserFault(Process* task, uint64_t rip, uint64_t rsp, uint64_t cr2);
+    // every thread of an address space: name, state, rip + stack, symbolized. (satoru)
+    static void DumpThreadsSymbolized(uint64_t as, const char* why);
 
     // real signal delivery, called by BOTH syscall entry paths (int 0x80 and the
     // x86_64 SYSCALL fast path) right before returning to ring-3. if a handled,
@@ -621,6 +665,9 @@ public:
 
     // stats
     static int  ActiveProcessCount();
+    static int  ActiveRegionCount(Process* p);   // inline + extension regions (item 10) (satoru)
+    static void CensusCounts(int* recs_active, int* recs_exited,
+                             int* shm_slots, uint64_t* shm_bytes);   // kurono.memcensus=1 (satoru)
 
     static bool HasConsoleOutput();
     static int  ReadConsoleOutput(char* buf, int max_len);
@@ -633,6 +680,29 @@ public:
     static void InjectStdin(const char* data, int len);
     // post a signal to the thread-group leaders of a process group (tty ^C, SIGWINCH, hangup). (satoru)
     static void SignalGroup(int pgid, int sig);
+    // pty table support (kpty.cpp calls these). PtyWake: kind 0 = the slave side became
+    // readable, 1 = the master side did. TtyHangupSession: the controlling tty of session
+    // `sid` hung up (SIGHUP then SIGCONT to the session). (satoru)
+    static void PtyWake(int t, int kind);
+    static void TtyHangupSession(int sid);
+    // kurono.pty=0 keeps the old single-session console (LFD_CONSOLE + capture ring) for a/b. (satoru)
+    static void SetPtyLegacy(bool legacy);
+    static bool PtyLegacy();
+    static void SetPtyTrace(bool on);   // kurono.ptytrace=1 (satoru)
+    // where the NEXT program the calling kernel proc launches gets its stdio: a Terminal
+    // window's pair, which also becomes the program's controlling tty. -1 clears. a
+    // launch with no pair and no console capture gets /dev/null-like console fds, a new
+    // session and no controlling tty (the desktop launch). (satoru)
+    static void SetTerminalTty(int t);
+    static int  TerminalTty();
+    // the exec bridge: while a launcher kernel proc runs a built-in for a terminal's shell, its
+    // programs get that pair as stdio (no session change, no ctty). -1 clears. (satoru)
+    static void SetBridgeTty(int t);
+    static int  BridgeTty();
+    // a kernel-side exit hook: the session leader's tty is released (disassociate_ctty). (satoru)
+    static void SessionLeaderExit(int pid_idx);
+    // sessions and job control, for the gui side: processes alive in a session. (satoru)
+    static int  SessionMembers(int sid);
     // working directory the NEXT CreateProcess gives its process (consumed once); "" clears. (satoru)
     static void SetNextProcessCwd(const char* cwd);
 

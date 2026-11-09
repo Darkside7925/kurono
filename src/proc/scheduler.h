@@ -74,6 +74,12 @@ enum UserMemoryRegionFlags : uint32_t {
 // 28 bytes; 4096 -> ~114 kb/process (heap-allocated, so this is fine). (satoru)
 constexpr int PROCESS_MAX_USER_REGIONS = 4096;
 
+// most thread-group members one group kill handles in one pass; matches the
+// 256 the scheduler's kill/reap paths use. the #pf containment in hal.cpp used
+// a literal 64 while firefox with a few tabs runs ~80-120 threads, so members
+// past 64 kept running on an address space about to be freed. (satoru)
+constexpr int SCHED_GROUP_MAX = 256;
+
 struct UserMemoryRegion {
     uint64_t start;
     uint64_t end;
@@ -98,6 +104,11 @@ constexpr uint32_t PROCESS_FLAG_THREAD = 1 << 1;
 // ExecPIE for a dynamic pie - so the runner must enter at proc->rsp as-is and
 // must NOT rebuild the stack (that would drop ld-kurono's complete auxv). (satoru)
 constexpr uint32_t PROCESS_FLAG_STACK_READY = 1 << 2;
+// sched=2: this non-thread task (a detached leader or a finished fork child) is
+// fully built and may be claimed + resumed + parked by any application
+// processor, exactly like a clone thread. a bit in the existing flags word, so
+// struct Process keeps its size and layout. (satoru)
+constexpr uint32_t PROCESS_FLAG_AP_OK = 1 << 3;
 
 struct Process {
     uint32_t pid;
@@ -284,12 +295,14 @@ struct SchedulerProcessSnapshot {
     uint32_t flags;
     uint64_t cpu_ticks_total;
     uint32_t memory_kb;
+    uint64_t address_space;      // cr3 of the task (0 for kernel tasks): lets the task manager walk its page tables for rss (satoru)
     int nice;
     uint8_t sched_class;
     uint8_t  prio_tier;          // PRIO_REALTIME..PRIO_LOW
     uint32_t stack_kb;           // current committed kernel stack size
     uint32_t stack_cap_kb;       // hard ceiling
     uint32_t cpu_ms_total;       // wall-time charged to this process
+    uint32_t parent_pid;         // scheduler pid of the parent (kernel task /proc) (satoru)
     uint32_t stack_grow_count;   // adaptive growths so far
     bool     is_kernel_proc;
 };
@@ -343,6 +356,7 @@ public:
     // dispatch loop runs it via Userspace::RunProcessWithArgs). marks it Running
     // under the lock; returns null if none is allowed on this cpu. (satoru)
     static Process* ClaimFreshUserForCpu(uint32_t cpu);
+    static void EndApLaunch(uint32_t cpu);   // agent_sched_10 (satoru)
     // claim a Ready sibling THREAD (clone with a saved user frame) this cpu may
     // RESUME - the smp thread-dispatch path. an ap pulls a ready thread of a
     // multi-threaded process (cpu_affinity 0 = any cpu) and irets into its saved
@@ -448,6 +462,15 @@ public:
     // CR2 falls in a kernel process's guard zone.  Returns true if the
     // fault was a legitimate stack grow and was satisfied.
     static bool TryGrowGuardPage(uint64_t cr2);
+    // kernel-proc stack guard (see alloc_adaptive_stack): a genuinely unmapped
+    // page below every kernel proc stack; kurono.kstackguard=1, default on under
+    // sched=2. call before the first SpawnKernelProcess. KstackCensus prints the
+    // high-water marks from the heartbeat. (satoru)
+    static void SetKstackGuard(bool on);
+    static void KstackCensus();
+    // #DF path: an overflow whose #PF push itself faulted arrives as a double
+    // fault with cr2 = the guard; name the proc there too. (satoru)
+    static bool KstackGuardHit(uint64_t cr2);
 
     // Diagnostic: walks all kernel processes and dumps a summary line
     // (name, tier, stack KB / cap KB, CPU%) into the supplied buffer.
@@ -463,12 +486,26 @@ public:
     
     // performance monitoring
     static uint32_t GetProcessCount();
+    static uint32_t LiveTaskCount();   // the live-task cap counter (MAX_LIVE_PROCS) (satoru)
+    // a CLONE_THREAD task that left through sys_exit: it no longer counts toward
+    // the live-task cap. nothing reaped exited threads, so the cap counter only
+    // ever grew; firefox churns pool threads, and once it reached 256 every
+    // clone() failed (MOZ_CRASH(pthread_create failed), "Failed to create IPC
+    // I/O Thread", glean "Unable to spawn"). drops the count, marks the task
+    // reaped and frees its kernel stack once no cpu can land on it; the struct
+    // stays leaked as before, and retirements stop after 1024 to bound that
+    // leak. returns false (retry later) while a cpu may still run it. (satoru)
+    static bool RetireExitedThread(Process* t);
     static const char* GetCurrentProcessName();
     static Process* GetCurrentProcess();
     // set the calling cpu's current task (bsp global / ap PerCpu.current). (satoru)
     static void SetCurrentForThisCpu(Process* p);
     static Process* FindProcessByPid(uint32_t pid);
     static int GetProcessSnapshot(SchedulerProcessSnapshot* out, int max_count);
+    // one task by scheduler pid, copied under g_sched_lock (short). (satoru)
+    static int GetProcessSnapshotByPid(uint32_t pid, SchedulerProcessSnapshot* out);
+    // every non-user task's scheduler pid, copied under g_sched_lock. (satoru)
+    static int CollectKernelTaskPids(uint32_t* out, int max);
 
     // collect every live user task sharing pid's address space (the thread
     // group: leader + clone threads). returns the count written to out. (satoru)
@@ -496,11 +533,14 @@ public:
     static bool KillProcessGroupAsync(uint32_t pid, Process* skip);
     // bookkeeping-only enqueue of already-Terminated members for a later reap;
     // isr-safe (the hal fault containment queues from the #pf handler). (satoru)
+    // pid of any live (unreaped) user task in this address space, or 0. (satoru)
+    static uint32_t FindLivePidInAddressSpace(uint64_t as);
     static void QueueDeferredReap(Process** members, int n);
     // retry-per-call, never-sleeping drain: reap each queued group once every
     // member is observably off every cpu. runs from the scheduler kernel
     // process heartbeat. (satoru)
     static void DrainDeferredReaps();
+    static void drain_deferred_reaps_locked();   // DrainDeferredReaps body, one consumer at a time (satoru)
 
     // Phase 14: load average + cpu affinity ----------------------------
     // 1m, 5m, 15m EMAs of run-queue length, scaled FIXED_1 = 1<<11.
@@ -525,6 +565,59 @@ public:
     static void ApIdleMaint();
     // task 21 a/b: hard-pin threads to their last cpu (kurono.pincpu=1). (satoru)
     static void SetPinCpu(bool on);
+    // ── sched=2 (kurono.sched=2) ───────────────────────────────────────────
+    // the new smp scheduling mode. everything below is a no-op / old behavior
+    // when it is off, which is the default. call before SMP::Init. (satoru)
+    static void SetSchedMode(int mode);
+    static bool SchedV2();
+    // kurono.schedrel=0 (a/b only): keep sched=2 but publish on_cpu=0 at the
+    // pick, the old early release, so one binary can test the hand-off. (satoru)
+    static void SetDeferredRelease(bool on);
+    // kurono.schedlaunch=0 (a/b only): keep sched=2 but launch programs the old
+    // way (ring 3 on the calling bsp kernel proc). DetachedLaunch() is the gate. (satoru)
+    static void SetDetachedLaunch(bool on);
+    static bool DetachedLaunch();
+    // sched=2: sched_getaffinity reports every online cpu (musl's cpu count and
+    // rust's available_parallelism read it). kurono.schedcpus=0 restores the
+    // old one-cpu answer for an a/b. (satoru)
+    static void SetReportAllCpus(bool on);
+    static bool ReportAllCpus();
+    // finish_task_switch for kurono's iret model. the cpu that stops running a
+    // user task is still executing on that task's kernel stack until it irets
+    // away, so on_cpu must not drop to 0 yet: another cpu resuming the task
+    // would push its next entry frame onto the very stack being unwound. under
+    // sched=2 ReleaseOnCpu only queues the task in a per-cpu pending slot;
+    // FinishSwitch publishes on_cpu=0 once this cpu's rsp is outside the task's
+    // kernel stack. every place that used to store on_cpu=0 calls ReleaseOnCpu;
+    // every kernel entry calls FinishSwitch. old mode: immediate store. (satoru)
+    static void ReleaseOnCpu(Process* p);
+    static void FinishSwitch();
+    // may an application processor claim/resume/park this task? clone threads
+    // always; under sched=2 also tasks marked PROCESS_FLAG_AP_OK. (satoru)
+    static bool ApResumable(const Process* p);
+    // sched=2: mark a fully built non-thread task resumable by the aps (the
+    // caller has already made it Ready). (satoru)
+    static void MarkApResumable(Process* p);
+    // sched=2: wake one halted application processor so a task that just
+    // became runnable is picked up now instead of at that cpu's next timer
+    // tick. no-op in the old mode (the aps poll there). (satoru)
+    static void KickIdleCpu();
+    static bool CpuMayRun(const Process* p, uint32_t cpu);
+    static bool IsCurrentAnywhere(const Process* p);   // current on some cpu (satoru)   // affinity + sched=2 partition (satoru)
+    // sched=2 asynchronous delivery: at every ring-3 interrupt on an ap (the
+    // lapic tick, the resched ipi) a pending signal or a kill is acted on, so a
+    // program spinning in ring 3 can be interrupted / killed. the linux layer
+    // provides the delivery. KickTaskCpu sends the ipi to the cpu running t. (satoru)
+    static void SetIrqSignalHook(bool (*pending)(Process* t), bool (*deliver)(InterruptFrame* frame));
+    static bool ApUserIrqCheck(InterruptFrame* frame);
+    static void KickTaskCpu(Process* t);
+    // sched=2: called right before a reaped task's struct is freed, so the linux
+    // layer can drop every raw pointer it holds to it. (satoru)
+    static void SetTaskFreeHook(void (*fn)(Process*), bool (*referenced)(Process*));
+    // sched=2 reap census: structs freed, waiting in the free-later ring, leaked (ring full). (satoru)
+    static void ReapStats(uint64_t* freed, int* pending, uint64_t* leaked);
+    // diagnostic: the cpu whose deferred-release slot still holds p, or -1. (satoru)
+    static int DebugReleasePendingCpu(const Process* p);
     // task 22: linux-model min_vruntime clamp on wake - a woken task may lag
     // the runnable pack by at most one slice, never by its whole spin history.
     // lock-free racy scan; callable from any wake path. (satoru)

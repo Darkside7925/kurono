@@ -220,7 +220,9 @@ struct NetSocket {
     uint32_t snd_wnd;       // peer's advertised window, de-scaled to bytes (satoru)
 
     // receive buffer
-    uint8_t  rx_buf[TCP_RX_BUFSIZE];
+    // receive ring, TCP_RX_BUFSIZE bytes. allocated the first time this slot is
+    // used and kept for reuse, so 48 idle slots no longer pin 12 mb at boot. (satoru)
+    uint8_t* rx_buf;
     int      rx_head;
     int      rx_tail;
     int      rx_count;
@@ -269,6 +271,18 @@ struct NetSocket {
     uint32_t last_activity_ms;   // last time we saw rx or tx on this socket (satoru)
     uint32_t keepalive_last_ms;  // when the last keepalive probe went out (satoru)
     uint8_t  keepalive_probes;   // count of unanswered probes so far (satoru)
+
+    // rfc 6298 round-trip estimator. one measurement is in flight at a time;
+    // retransmitted segments are not sampled (karn), and the rto is srtt plus
+    // four times the mean deviation, clamped to a sane range. (satoru)
+    uint32_t srtt_ms;
+    uint32_t rttvar_ms;
+    uint32_t rto_ms;             // current smoothed rto (satoru)
+    uint32_t rtt_seq;            // seq whose ack completes the sample (satoru)
+    uint32_t rtt_sent_ms;        // when rtt_seq was sent (satoru)
+    bool     rtt_valid;          // have at least one sample (satoru)
+    bool     rtt_pending;        // a measurement is in flight (satoru)
+    uint8_t  rtt_logs;           // rate limit for the rto diagnostic (satoru)
 };
 
 // errno-style codes surfaced via TCPStack::GetSockError (satoru)
@@ -300,6 +314,11 @@ struct NetStats {
     uint32_t dropped;
 };
 
+// optional ipv4 receive hook (the vm nat). it sees each valid, unfragmented
+// ipv4 packet before local delivery and returns true when it consumed it.
+// must not block; it can run on any cpu. (satoru)
+extern bool (*volatile g_tcpip_ipv4_rx_hook)(const void* ip_packet, int len);
+
 class TCPStack {
 public:
     static bool Init();
@@ -314,6 +333,12 @@ public:
     static uint32_t GetSubnetMask();
     static uint32_t GetGateway();
     static const uint8_t* GetMAC();
+    // a backend whose mac is only known after boot (the kld container) sets it here. (satoru)
+    static void SetMAC(const uint8_t m[6]);
+    static uint32_t GetDNS();   // (satoru)
+    // send a complete, already checksummed ipv4 packet (the vm nat in
+    // virt/vnet.cpp): next hop, arp and the nic as SendIPv4 would. (satoru)
+    static bool SendRawIPv4(const void* packet, int len);
 
     // ip helpers
     static uint32_t MakeIP(uint8_t a, uint8_t b, uint8_t c, uint8_t d);
@@ -408,7 +433,7 @@ private:
     static void ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len);
     static bool SendTCP(NetSocket* sock, uint8_t flags, const void* data, int len);
     static bool SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, int len,
-                              uint32_t seq, bool track_pending);
+                              uint32_t seq, bool track_pending, bool allow_rtt_sample = true);
     static uint32_t TCPSeqAdvance(uint8_t flags, int len);
     static void TCPTick();
 

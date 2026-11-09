@@ -50,23 +50,47 @@ public:
     static void Init();
     static bool IsReady();
     static bool IsActive();
+    // which cpu holds a live RunProcessWithArgs launcher frame for p, or -1.
+    // the sched=2 partition keeps such a leader on that cpu. (satoru)
+    static int SessionCpuOf(const Process* p);
+    // the rsp an ap's idle loop may use when this cpu holds a live
+    // RunProcessWithArgs launcher frame (the kurono.apsched path): just below
+    // that frame, so the loop never overwrites it. 0 = no session here. (satoru)
+    static uint64_t SessionIdleRsp(uint32_t cpu);
+    // sched=2: the waiting launcher (a kernel proc) asks this probe whether the
+    // user cancelled (ctrl+c in the terminal) and kills the program if so. only
+    // the registered owner proc is cancelled - a desktop launcher is not. owner
+    // nullptr = any waiter; the probe itself answers per caller (the terminal
+    // workers' per-context cancel flag). (satoru)
+    static void SetCancelProbe(Process* owner, bool (*probe)());
     // smp thread dispatch: mark a directly-resumed thread as this cpu's active
     // user process. an ap that irets into a claimed sibling thread never goes
     // through RunProcessWithArgs, and IsActive() (per-cpu) gates the syscall
     // entry's frame save + linux-current sync AND sys_exit's switch path - all
     // of which silently no-op'd on the aps without this. (satoru)
     static void SetActiveForThisCpu(Process* p);
+    // this cpu's userspace session root (the process RunProcessWithArgs entered),
+    // or nullptr. the task manager must not quiesce + reap that group from inside
+    // the session; it ends it through the signal path instead. (satoru)
+    static Process* ActiveProcess();
 
     static Process* CreateDemoProcess();
     static int RunProcess(Process* proc);
     // Same as RunProcess but pushes argc/argv/envp/auxv onto the user
     // stack before entering ring 3.  argv and envp are NULL-terminated
     // arrays of C strings (envp may be nullptr to mean empty env).
+    // uid/gid default to 0 (kernel-internal runners and test programs). the
+    // app launch paths pass 1000 so ordinary ring-3 programs are normal users
+    // and go through the admin gate for privileged operations. (satoru)
     static int RunProcessWithArgs(Process* proc, const char* const* argv,
-                                  const char* const* envp);
+                                  const char* const* envp,
+                                  uint32_t uid = 0, uint32_t gid = 0);
     static void HandleProcessExit(int exit_code);
 
 private:
+    // sched=2 detached launch (see RunProcessWithArgs). (satoru)
+    static int RunDetached(Process* proc, const char* const* argv,
+                           const char* const* envp, uint32_t uid, uint32_t gid);
     static bool MapUserPage(Process* proc, uint64_t virt_addr, const void* data,
                             size_t len, uint64_t flags);
 

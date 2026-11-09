@@ -23,13 +23,22 @@
 //
 //  reference: intel sdm vol 3c chapters 23-33, amd apm vol 2 chapter 15
 #include "hypervisor.h"
+#include "../system/kasset.h"
 #include "../kernel/types.h"
 #include "../kernel/heap.h"
 #include "../drivers/serial.h"
+#include "../drivers/timer.h"
 #include "../linux/linux_drivers.h"
 #include "../shell/shell.h"
 #include "vpci.h"
 #include "virtio_gpu_host.h"
+#include "virtio_dev.h"
+#include "vblk.h"
+#include "vcon.h"
+#include "vnet.h"
+#include "vm_host.h"
+#include "../proc/scheduler.h"
+#include "../drivers/disklog.h"
 #include "pci_passthrough.h"
 
 // helper: allocate aligned memory from kernel heap
@@ -50,6 +59,12 @@ static void HVFreeAligned(void* aligned) {
 
 static void _auto_setup_alpine_userland();
 
+// rolling tail of guest serial text, see NoteGuestText (satoru)
+static char g_guest_tail[192];
+static int  g_guest_tail_len = 0;
+static bool g_guest_prompt_seen = false;
+static bool g_guest_panic_seen = false;
+
 VMState      Hypervisor::vm_state      = VM_STATE_UNINITIALIZED;
 VMConfig     Hypervisor::config;
 vCPU*        Hypervisor::vcpu          = nullptr;
@@ -62,6 +77,9 @@ uint8_t*     Hypervisor::io_bitmap_a   = nullptr;
 uint8_t*     Hypervisor::io_bitmap_b   = nullptr;
 uint8_t*     Hypervisor::msr_bitmap    = nullptr;
 VMStats      Hypervisor::stats;
+bool         Hypervisor::guest_halted      = false;
+bool         Hypervisor::reboot_requested  = false;
+void*        Hypervisor::owner_proc        = nullptr;
 bool         Hypervisor::alpine_booted     = false;
 char         Hypervisor::alpine_boot_log[8192];
 int          Hypervisor::alpine_boot_log_len = 0;
@@ -194,6 +212,8 @@ bool Hypervisor::IsAvailable() {
 //  createvm - set up a new virtual machine
 
 bool Hypervisor::CreateVM(const VMConfig& cfg) {
+    if (ForeignCaller()) return false;   // (satoru)
+
     if (vm_state != VM_STATE_UNINITIALIZED && vm_state != VM_STATE_DESTROYED) {
         SerialLogger::Log("Hypervisor: VM already exists\r\n");
         return false;
@@ -212,6 +232,9 @@ bool Hypervisor::CreateVM(const VMConfig& cfg) {
         return false;
     }
 
+    VMM::ResetGuestFPU();               // (satoru)
+    VMExitHandler::ResetGuestClock();
+    VMExitHandler::ResetLogBudget();
     if (hw_available) {
         vcpu = VMM::CreateVCPU();
         if (!vcpu) {
@@ -248,8 +271,19 @@ bool Hypervisor::CreateVM(const VMConfig& cfg) {
 
 //  destroyvm - tear down and free all vm resources
 
+// the background vm host's stop request, used when another thread wants the
+// vm gone while the host owns it (satoru)
+void (*g_hv_foreign_destroy)() = nullptr;
+
 void Hypervisor::DestroyVM() {
+    if (ForeignCaller()) {
+        SerialLogger::Log("Hypervisor: DestroyVM from outside the vm host, asking it to stop\r\n");
+        if (g_hv_foreign_destroy) g_hv_foreign_destroy();
+        return;
+    }
     SerialLogger::Log("Hypervisor: Destroying VM...\r\n");
+    VNet::Shutdown();               // (satoru)
+    DiskLog::DisarmGuestImage();
 
     if (vcpu) {
         if (hw_available && vcpu->type != VIRT_NONE) {
@@ -379,7 +413,8 @@ bool Hypervisor::SetupMSRBitmap() {
     uint32_t tsc_byte = 0x10 / 8;
     uint32_t tsc_bit  = 0x10 % 8;
     msr_bitmap[tsc_byte] &= ~(1 << tsc_bit);               // read pass-through
-    msr_bitmap[0x800 + tsc_byte] &= ~(1 << tsc_bit);       // write pass-through
+    // writes still exit: without tsc offsetting a guest wrmsr would move the
+    // host's own tsc, which is the host scheduler clock (satoru)
 
     // write msr bitmap address to vmcs
     if (VMM::GetType() == VIRT_INTEL_VTX && vcpu && vcpu->vmcs) {
@@ -438,16 +473,14 @@ bool Hypervisor::SetupEPT() {
                                (uint64_t)(uintptr_t)rom, (uint32_t)GUEST_ROM_SIZE);
         }
 
-        // map high ram (1 mb+)
-        uint8_t* high_ram = GuestMemoryManager::GetHighRAM();
-        uint32_t high_size = GuestMemoryManager::GetHighRAMSize();
-        if (high_ram && high_size > 0) {
-            EPTManager::MapRAM(ept_root, GUEST_HIGH_RAM_START,
-                               (uint64_t)(uintptr_t)high_ram, high_size);
-            EPTManager::AddRegion({GUEST_HIGH_RAM_START,
-                                   (uint64_t)(uintptr_t)high_ram,
-                                   high_size, MEM_RAM, true, true, true});
+        // map high ram (1 mb+), one ept range per host-contiguous chunk (satoru)
+        for (uint32_t ci = 0; ci < GuestMemoryManager::GetHighChunkCount(); ci++) {
+            uint64_t cgpa = 0; uint8_t* chost = nullptr; uint32_t csz = 0;
+            if (!GuestMemoryManager::GetHighChunk(ci, &cgpa, &chost, &csz)) break;
+            EPTManager::MapRAM(ept_root, cgpa, (uint64_t)(uintptr_t)chost, csz);
         }
+        EPTManager::AddRegion({GUEST_HIGH_RAM_START, 0, GuestMemoryManager::GetHighRAMSize(),
+                               MEM_RAM, true, true, true});
 
         // map lapic mmio (0xfee00000)
         EPTManager::AddRegion({GUEST_LAPIC_BASE, 0, 0x1000, MEM_MMIO,
@@ -484,11 +517,10 @@ bool Hypervisor::SetupEPT() {
                 NPT_PRESENT | NPT_WRITE | NPT_USER);
         }
 
-        uint8_t* high_ram = GuestMemoryManager::GetHighRAM();
-        uint32_t high_size = GuestMemoryManager::GetHighRAMSize();
-        if (high_ram) {
-            EPTManager::MapGuestPhysicalNPT(npt_root, GUEST_HIGH_RAM_START,
-                (uint64_t)(uintptr_t)high_ram, high_size,
+        for (uint32_t ci = 0; ci < GuestMemoryManager::GetHighChunkCount(); ci++) {   // (satoru)
+            uint64_t cgpa = 0; uint8_t* chost = nullptr; uint32_t csz = 0;
+            if (!GuestMemoryManager::GetHighChunk(ci, &cgpa, &chost, &csz)) break;
+            EPTManager::MapGuestPhysicalNPT(npt_root, cgpa, (uint64_t)(uintptr_t)chost, csz,
                 NPT_PRESENT | NPT_WRITE | NPT_USER);
         }
 
@@ -523,7 +555,9 @@ bool Hypervisor::SetupDevices() {
 
     // virtual pci bus + virtio-gpu host device
     VPCI::Init();
-    if (!VirtIOGPUHost::Init()) {
+    VirtioResetAll();
+    VirtIOGPUHost::ForgetRegistration();
+    if (config.enable_gpu && !VirtIOGPUHost::Init()) {
         SerialLogger::Log("Hypervisor: VirtIOGPUHost init failed (non-fatal)\r\n");
     }
     PCIPassthrough::Init();
@@ -596,8 +630,26 @@ void Hypervisor::ConfigureGuestProtectedMode(uint32_t entry_point,
         }
         VMM::VMWrite(VMCS_GUEST_CR0, cr0);
         VMM::VMWrite(VMCS_CR0_READ_SHADOW, 0x00000031);
+        // host owns the cr0 fixed-1 bits (ne) so a guest write that clears
+        // them traps instead of #gp'ing in non-root mode (sdm 25.3) (satoru)
+        {
+            uint64_t f0 = 0;
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR0_FIXED0, f0);
+            VMM::VMWrite(VMCS_CR0_GUEST_HOST_MASK, f0 & ~((1ULL << 0) | (1ULL << 31)));
+        }
         VMM::VMWrite(VMCS_GUEST_CR3, 0);
-        VMM::VMWrite(VMCS_GUEST_CR4, 0);
+        // sdm 26.3.1.1: guest cr4 must obey ia32_vmx_cr4_fixed0, which has
+        // vmxe set. cr4=0 is an invalid guest state. keep the fixed bits in
+        // the real cr4, owned by the host, and show the guest 0 (satoru)
+        {
+            uint64_t f0 = 0, f1 = ~0ULL;
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED0, f0);
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED1, f1);
+            VMM::VMWrite(VMCS_GUEST_CR4, f0 & f1);
+            VMM::VMWrite(VMCS_CR4_GUEST_HOST_MASK, f0 | ~f1);
+            VMM::VMWrite(VMCS_CR4_READ_SHADOW, 0);
+        }
+        VMM::VMWrite(VMCS_GUEST_IA32_EFER, 0); // (satoru)
 
         // cs: selector 0x10, flat code segment, 32-bit, dpl 0
         VMM::VMWrite(VMCS_GUEST_CS_SEL, 0x0010);
@@ -763,6 +815,8 @@ void Hypervisor::ConfigureGuestProtectedMode(uint32_t entry_point,
 //  runvm - main execution loop
 
 VMState Hypervisor::RunVM(uint32_t max_exits) {
+    if (ForeignCaller()) return vm_state;   // (satoru)
+
     if (vm_state != VM_STATE_CREATED) {
         SerialLogger::Log("Hypervisor: Cannot run - VM not ready\r\n");
         return vm_state;
@@ -776,6 +830,19 @@ VMState Hypervisor::RunVM(uint32_t max_exits) {
             SerialLogger::Log("Hypervisor: vCPU setup failed\r\n");
             vm_state = VM_STATE_CRASHED;
             return vm_state;
+        }
+        // createvm wrote the eptp and the bitmap addresses before vmxon and
+        // vmptrld, so vmwrite dropped them (no current vmcs). the eptp stayed 0,
+        // whose page-walk length field (bits 5:3) is not 3, which sdm 26.2.1.1
+        // rejects with error 7 "invalid control field". write them into the
+        // now-current vmcs (satoru)
+        if (vcpu->type == VIRT_INTEL_VTX) {
+            if (ept_root) VMM::VMWrite(VMCS_EPT_POINTER, EPTManager::BuildEPTP(ept_root));
+            if (io_bitmap_a) VMM::VMWrite(VMCS_IO_BITMAP_A, (uint64_t)(uintptr_t)io_bitmap_a);
+            if (io_bitmap_b) VMM::VMWrite(VMCS_IO_BITMAP_B, (uint64_t)(uintptr_t)io_bitmap_b);
+            if (msr_bitmap) VMM::VMWrite(VMCS_MSR_BITMAP_ADDR, (uint64_t)(uintptr_t)msr_bitmap);
+            for (uint32_t m = 0xC0000081; m <= 0xC0000084; m++) *VMM::GuestSwitchedMSR(m) = 0;
+            *VMM::GuestSwitchedMSR(0xC0000102) = 0;
         }
     }
 
@@ -836,6 +903,8 @@ VMState Hypervisor::RunVM(uint32_t max_exits) {
 //  runonecycle - single vm-entry → vm-exit → handle cycle
 
 VMState Hypervisor::RunOneCycle() {
+    if (ForeignCaller()) return vm_state;   // (satoru)
+
     if (!vcpu) return VM_STATE_CRASHED;
 
     stats.run_cycles++;
@@ -884,10 +953,38 @@ VMState Hypervisor::RunOneCycle() {
 
 //  processvmexit - dispatch vm-exit to handlers
 
+static uint32_t HVApicId() {
+    uint32_t a, b, c, d;
+    asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    return b >> 24;
+}
+
+uint32_t g_hv_reason_hist[80];
+
 VMState Hypervisor::ProcessVMExit() {
     if (!vcpu) return VM_STATE_CRASHED;
 
     stats.total_exits++;
+    { extern uint32_t g_hv_reason_hist[80]; g_hv_reason_hist[(vcpu->exit_reason & 0xFFFF) % 80]++; }
+    // trace the first exits so a bring-up failure names its exit (satoru)
+    static uint32_t traced = 0;
+    if (stats.total_exits <= 1) traced = 0;
+    if (traced < 300 && (vcpu->exit_reason & 0xFFFF) != 1 && (vcpu->exit_reason & 0xFFFF) != 30 && (vcpu->exit_reason & 0xFFFF) != 12 && vcpu->type == VIRT_INTEL_VTX) {
+        traced++;
+        SerialLogger::Log("[vmx] exit#");
+        SerialLogger::LogDec((int)stats.total_exits);
+        SerialLogger::Log(" reason=0x");
+        SerialLogger::LogHex(vcpu->exit_reason);
+        SerialLogger::Log(" qual=0x");
+        SerialLogger::LogHex(vcpu->exit_qualification);
+        SerialLogger::Log(" rip=0x");
+        SerialLogger::LogHex64(VMM::VMRead(VMCS_GUEST_RIP));
+        SerialLogger::Log(" rax=0x");
+        SerialLogger::LogHex64(vcpu->regs[0]);
+        SerialLogger::Log(" apic=");
+        SerialLogger::LogDec((int)HVApicId());
+        SerialLogger::Log("\r\n");
+    }
 
     VMExitAction action;
     if (vcpu->type == VIRT_INTEL_VTX) {
@@ -978,6 +1075,12 @@ bool Hypervisor::HandleGuestIO(uint16_t port, bool is_out, uint8_t size,
         return true;
     }
 
+    // reboot: keyboard controller pulse (0x64 <- 0xfe) or the reset control
+    // register (0xcf9 <- 0x06/0x0e), linux's acpi=off reboot paths (satoru)
+    if (port == 0x64 && is_out && (value & 0xFF) == 0xFE) { NoteRebootRequest(); return true; }
+    if (port == 0xCF9 && is_out && (value & 0x04)) { NoteRebootRequest(); return true; }
+    if (port == 0xCF9) { if (!is_out) value = 0; return true; }
+
     // unhandled
     return false;
 }
@@ -1057,10 +1160,36 @@ bool Hypervisor::InjectException(uint8_t vector, bool has_error,
 }
 
 void Hypervisor::CheckAndInjectPendingIRQs() {
-    // check virtual devices for pending irqs
-    int irq = VirtualDevices::GetPendingIRQ();
-    if (irq >= 0) {
-        InjectInterrupt((uint8_t)irq);
+    // the old code acked the pic first and dropped the irq when the guest had
+    // if=0, so the guest lost most timer ticks. peek first; if the guest
+    // cannot take it, ask for an interrupt-window exit (sdm 26.7.5) (satoru)
+    if (vcpu && vcpu->type == VIRT_INTEL_VTX) {
+        VirtualPIC& m = VirtualDevices::GetMasterPIC();
+        // cascade: a pending slave request drives master line 2, which
+        // nothing did before, so irqs 8-15 were never delivered (satoru)
+        if (VirtualDevices::GetSlavePIC().GetHighestPriorityIRQ() >= 0) m.SetIRQ(2, true);
+        int hi = m.GetHighestPriorityIRQ();
+        bool pending = hi >= 0 && (hi != 2 || VirtualDevices::GetSlavePIC().GetHighestPriorityIRQ() >= 0);
+        if (pending) {
+            VMM::VMPtrLoad(vcpu->vmcs);
+            uint64_t rflags = VMM::VMRead(VMCS_GUEST_RFLAGS);
+            uint64_t intr = VMM::VMRead(VMCS_GUEST_INTERRUPTIBILITY);
+            uint64_t inj = VMM::VMRead(VMCS_ENTRY_INT_INFO);
+            bool can = (rflags & (1 << 9)) && !(intr & 3) && !(inj & (1u << 31));
+            if (!can) {
+                if (!(inj & (1u << 31)))
+                    VMM::VMWrite(VMCS_PROC_BASED_CONTROLS,
+                                 VMM::VMRead(VMCS_PROC_BASED_CONTROLS) | PROC_INT_WINDOW_EXIT);
+            } else {
+                int irq = VirtualDevices::GetPendingIRQ();
+                if (irq >= 0) InjectInterrupt((uint8_t)irq);
+            }
+        }
+    } else {
+        int irq = VirtualDevices::GetPendingIRQ();
+        if (irq >= 0) {
+            InjectInterrupt((uint8_t)irq);
+        }
     }
 
     // check serial port irq
@@ -1094,6 +1223,7 @@ void Hypervisor::TickDevices() {
     // guest forgot to ring the doorbell, then present any dirty scanout.
     VirtIOGPUHost::ProcessQueues();
     VirtIOGPUHost::PresentIfDirty();
+    VirtioPollAll();    // doorbell-less work from the guest (satoru)
 }
 
 //  pause / resume
@@ -1166,6 +1296,8 @@ int Hypervisor::DrainSerialOutput(char* buf, int max, int max_cycles) {
 //  bootalpine - one-call boot of embedded alpine linux guest vm
 
 bool Hypervisor::BootAlpine() {
+    if (IsOwned()) return false;   // the background vm host has the vm (satoru)
+
     if (!alpine_data_available()) {
         SerialLogger::Log("Hypervisor: Alpine kernel/initramfs not embedded\r\n");
         return false;
@@ -1189,7 +1321,7 @@ bool Hypervisor::BootAlpine() {
     cfg.timer_tick_us = 1000;
     cfg.cmdline       = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
                         "root=/dev/ram0 rw init=/sbin/init nokaslr noapic "
-                        "nosmp noacpi";
+                        "nolapic nosmp noacpi"; // (satoru)
 
     if (!CreateVM(cfg)) {
         SerialLogger::Log("Hypervisor: Failed to create VM for Alpine\r\n");
@@ -1219,9 +1351,61 @@ bool Hypervisor::BootAlpine() {
     return (final_state != VM_STATE_CRASHED);
 }
 
+// with no console up yet, the guest's printk text still sits in its ram.
+// find "Linux version" in guest memory and print the readable text after it,
+// so an early guest panic is visible in the host log (satoru)
+static void DumpGuestPrintkText() {
+    uint8_t* ram = GuestMemoryManager::GetHighRAM();
+    uint32_t sz = GuestMemoryManager::GetHighRAMSize();
+    if (!ram || sz < 64) return;
+    static const char pat[] = "Linux version 6";
+    const uint32_t pl = sizeof(pat) - 1;
+    int hits = 0;
+    for (uint32_t i = 0; i + pl < sz; i++) {
+        if (ram[i] != 'L' || memcmp(ram + i, pat, pl) != 0) continue;
+        // the first hit is usually linux_banner in .rodata, the log copy
+        // comes later; dump up to four hits (satoru)
+        if (++hits > 4) break;
+        SerialLogger::Log("[guestlog] at gpa 0x");
+        SerialLogger::LogHex64((uint64_t)i + GUEST_HIGH_RAM_START);
+        SerialLogger::Log(":\r\n");
+        char line[160];
+        int ln = 0, printed = 0;
+        bool gap = false;
+        for (uint32_t j = i; j < sz && printed < 5000; j++) {
+            uint8_t c = ram[j];
+            if (c >= 0x20 && c < 0x7F) {
+                if (gap && ln > 0) {
+                    line[ln] = 0;
+                    SerialLogger::Log("[guestlog] ");
+                    SerialLogger::Log(line);
+                    SerialLogger::Log("\r\n");
+                    ln = 0;
+                }
+                gap = false;
+                line[ln++] = (char)c;
+                printed++;
+                if (ln >= (int)sizeof(line) - 1) {
+                    line[ln] = 0;
+                    SerialLogger::Log("[guestlog] ");
+                    SerialLogger::Log(line);
+                    SerialLogger::Log("\r\n");
+                    ln = 0;
+                }
+            } else {
+                gap = true;
+            }
+        }
+        i += pl;
+    }
+    SerialLogger::Log("[guestlog] scan done\r\n");
+}
+
 //  bootalpinewithextraction - boot alpine, capture boot log, extract drivers
 
 bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
+    if (IsOwned()) return false;   // (satoru)
+
     if (!alpine_data_available()) {
         SerialLogger::Log("Hypervisor: Alpine kernel/initramfs not embedded\r\n");
         return false;
@@ -1258,7 +1442,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
         cfg.timer_tick_us = 10000;
         cfg.cmdline       = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
                             "root=/dev/ram0 rw init=/sbin/init nokaslr noapic "
-                            "nosmp noacpi";
+                            "nolapic nosmp noacpi"; // (satoru)
 
         bool hw_ok = false;
         if (CreateVM(cfg)) {
@@ -1276,11 +1460,16 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
                     // real vt-x with frequent timer/serial exits. if the vm
                     // is still alive but hasn't emitted serial yet, continue
                     // incrementally rather than treating that as failure.
+                    // keep running until the guest reaches a shell prompt or
+                    // panics, not just until its first serial byte (satoru)
+                    g_guest_tail_len = 0;
+                    g_guest_prompt_seen = false;
+                    g_guest_panic_seen = false;
                     uint32_t extra_budget = max_boot_exits;
-                    if (extra_budget < 250000) extra_budget = 250000;
+                    if (extra_budget < 6000000) extra_budget = 6000000;
                     uint32_t used_budget = 0;
                     while ((st == VM_STATE_RUNNING || st == VM_STATE_PAUSED) &&
-                           alpine_boot_log_len == 0 &&
+                           !g_guest_prompt_seen && !g_guest_panic_seen &&
                            used_budget < extra_budget) {
                         uint32_t step = 25000;
                         if (extra_budget - used_budget < step) {
@@ -1311,6 +1500,7 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
                     SerialLogger::Log(", captured ");
                     SerialLogger::LogDec(alpine_boot_log_len);
                     SerialLogger::Log(" bytes of boot log\r\n");
+                    if (!g_guest_prompt_seen) DumpGuestPrintkText(); // (satoru)
 
                     if (st == VM_STATE_RUNNING || st == VM_STATE_PAUSED) {
                         alpine_booted = true;
@@ -1394,126 +1584,169 @@ bool Hypervisor::BootAlpineWithExtraction(uint32_t max_boot_exits) {
 
 //  bootdebianwithextraction - boot embedded debian ext4 rootfs guest
 
-bool Hypervisor::BootDebianWithExtraction(uint32_t max_boot_exits) {
-    if (!alpine_kernel_data() || alpine_kernel_size() == 0) {
-        SerialLogger::Log("Hypervisor: Shared Linux kernel not embedded\r\n");
-        return false;
-    }
-    if (!debian_rootfs_available()) {
-        SerialLogger::Log("Hypervisor: Debian rootfs not embedded\r\n");
-        return false;
-    }
+static void PumpGuestConsole(VirtualSerial& ser, char* keep, int& keep_len, int keep_max);
 
+void Hypervisor::SetOwner(void* proc) { owner_proc = proc; }
+
+uint64_t Hypervisor::GuestRIP() {
+    if (!vcpu || vcpu->type != VIRT_INTEL_VTX || ForeignCaller()) return 0;
+    if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) return 0;
+    return VMM::VMRead(VMCS_GUEST_RIP);
+}
+
+// true when the vm belongs to the background host and the caller is not its
+// thread: that caller must not touch the vmcs (it lives on the host's cpu and
+// is in the middle of a run) (satoru)
+bool Hypervisor::ForeignCaller() {
+    if (!owner_proc) return false;
+    return (void*)Scheduler::GetCurrentProcess() != owner_proc;
+}
+
+bool Hypervisor::PrepareLinuxGuest(const LinuxGuestSpec& spec) {
+    if (!spec.kernel || !spec.kernel_size || !spec.initrd || !spec.initrd_size) {
+        SerialLogger::Log("Hypervisor: guest kernel / initramfs missing\r\n");
+        return false;
+    }
+    guest_halted = false;
+    reboot_requested = false;
+    if (vm_state != VM_STATE_UNINITIALIZED && vm_state != VM_STATE_DESTROYED) DestroyVM();
+    Init();
+    hw_available = VMM::IsSupported();
+    if (!hw_available) {
+        SerialLogger::Log("Hypervisor: linux guests need vt-x\r\n");
+        return false;
+    }
+    VMConfig cfg;
+    cfg.SetDefaults();
+    cfg.ram_mb        = spec.ram_mb ? spec.ram_mb : 1024;
+    cfg.disk_size_mb  = 0;
+    cfg.enable_serial = true;     // com1 stays for earlyprintk / debug consoles
+    cfg.enable_disk   = false;
+    cfg.enable_apic   = true;
+    cfg.enable_gpu    = spec.gpu;
+    cfg.timer_tick_us = 1000;
+    cfg.cmdline       = spec.cmdline;
+    if (!CreateVM(cfg)) { SerialLogger::Log("Hypervisor: CreateVM failed\r\n"); return false; }
+    if (GuestMemoryManager::GetTotalRAM() < (cfg.ram_mb - 1) * 1024u * 1024u) {
+        SerialLogger::Log("Hypervisor: not enough host memory for the guest\r\n");
+        DestroyVM();
+        return false;
+    }
+    // virtio devices, one legacy pic line each (satoru)
+    GuestConsole::ResetRings(0);
+    GuestConsole::ResetRings(1);
+    GuestConsole::ResetRings(2);
+    GuestConsole::ResetRings(3);
+    GuestConsole::Init(0, 5, "virtio-console");
+    GuestConsole::Init(1, 3, "virtio-console-agent");
+    GuestConsole::Init(2, 11, "virtio-console-wayland");   // wayland bridge channel (satoru)
+    GuestConsole::Init(3, 7, "virtio-console-audio");      // guest pulse pcm channel (satoru)
+    if (spec.disk_bytes) VBlk::Init(spec.disk_lba, spec.disk_bytes, 10, spec.disk_id);
+    if (spec.net) VNet::Init(9);
+    if (!LoadLinuxKernel(spec.kernel, spec.kernel_size, spec.cmdline) || !LoadInitrd(spec.initrd, spec.initrd_size)) {
+        SerialLogger::Log("Hypervisor: failed to load the guest kernel / initramfs\r\n");
+        DestroyVM();
+        return false;
+    }
+    // first entry: vmcs setup + protected-mode entry state; one exit leaves
+    // the vm RUNNING for RunSlice (satoru)
+    RunVM(1);
+    return vm_state == VM_STATE_RUNNING || vm_state == VM_STATE_PAUSED;
+}
+
+bool Hypervisor::DebianPrepare() {
+    // debian's own cloud kernel + a small initramfs (DEBKERN.BIN / DEBINIT.BIN
+    // on the kurono partition); the rootfs DEBIAN.IMG behind virtio-blk. (satoru)
+    static const char deb83[11] = { 'D','E','B','I','A','N',' ',' ','I','M','G' };
+    LinuxGuestSpec sp = {};
+    sp.name = "debian";
+    sp.kernel = KAsset::Data("DEBKERN BIN", nullptr, nullptr);
+    sp.kernel_size = KAsset::Size("DEBKERN BIN", nullptr, nullptr);
+    sp.initrd = KAsset::Data("DEBINIT BIN", nullptr, nullptr);
+    sp.initrd_size = KAsset::Size("DEBINIT BIN", nullptr, nullptr);
+    sp.cmdline = "console=hvc0 rdinit=/init kroot=/dev/vda nokaslr noapic nolapic nosmp acpi=off";
+    sp.ram_mb = 768;
+    DiskLog::ArmGuestImage(deb83, &sp.disk_lba, &sp.disk_bytes);
+    sp.disk_id = "kurono-debian";
+    sp.net = true;
     debian_boot_log_len = 0;
     debian_boot_log[0] = 0;
     debian_booted = false;
+    linux_guest_profile = LINUX_GUEST_DEBIAN;
+    return PrepareLinuxGuest(sp);
+}
 
-    SerialLogger::Log("Hypervisor: BootDebianWithExtraction starting\r\n");
+static bool GuestIrqPending() {
+    return VirtualDevices::GetMasterPIC().GetHighestPriorityIRQ() >= 0 ||
+           VirtualDevices::GetSlavePIC().GetHighestPriorityIRQ() >= 0;
+}
 
-    if (vm_state != VM_STATE_UNINITIALIZED &&
-        vm_state != VM_STATE_DESTROYED) {
-        DestroyVM();
-    }
-    Init();
-    hw_available = VMM::IsSupported();
+// real-time device ticking: the guest's timers advance by elapsed host time
+// (kvm-clock's tsc base), and the virtio devices are serviced (satoru)
+static uint64_t g_slice_last_us = 0;
 
-    if (!hw_available) {
-        SerialLogger::Log("Hypervisor: Debian requires hardware virtualization\r\n");
-        // provide diagnostic boot log
-        const char* diag =
-            "[kurono] Debian boot failed - no hardware virtualization.\n"
-            "[kurono] VT-x/AMD-V was not detected on this system.\n"
-            "[kurono] Enable Intel VT-x or AMD-V in BIOS, or run\n"
-            "[kurono] Kurono on hardware that supports it.\n";
-        int di = 0;
-        while (diag[di] && di < (int)sizeof(debian_boot_log) - 1) {
-            debian_boot_log[di] = diag[di];
-            di++;
+VMState Hypervisor::RunSlice(uint32_t budget_us, bool* idle) {
+    if (idle) *idle = false;
+    if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) return vm_state;
+    vm_state = VM_STATE_RUNNING;
+    uint64_t t0 = VMExitHandler::GuestClockNs() / 1000;
+    if (g_slice_last_us == 0 || t0 < g_slice_last_us) g_slice_last_us = t0;
+    for (;;) {
+        uint64_t now = VMExitHandler::GuestClockNs() / 1000;
+        if (now - g_slice_last_us >= 250) {
+            uint64_t d = now - g_slice_last_us;
+            if (d > 100000) d = 100000;             // do not replay a long stall as a tick storm
+            g_slice_last_us = now;
+            stats.tick_count++;
+            VirtualDevices::Tick((uint32_t)d);
+            if (config.enable_serial) serial.Tick((uint32_t)d);
+            if (config.enable_gpu) {
+                VirtIOGPUHost::ProcessQueues();
+                VirtIOGPUHost::PresentIfDirty();
+            }
+            GuestConsole::Poll(0);
+            GuestConsole::Poll(1);
+            GuestConsole::Poll(2);
+            GuestConsole::Poll(3);
+            VNet::Poll();
+            VirtioPollAll();
         }
-        debian_boot_log[di] = 0;
-        debian_boot_log_len = di;
-        return false;
-    }
-
-    uint32_t rootfs_size = debian_rootfs_size();
-    uint32_t rootfs_mb = (rootfs_size + (1024 * 1024 - 1)) / (1024 * 1024);
-    uint32_t disk_mb = rootfs_mb + 64;
-    if (disk_mb < 256) disk_mb = 256;
-
-    VMConfig cfg;
-    cfg.SetDefaults();
-    cfg.ram_mb        = 256;
-    cfg.disk_size_mb  = disk_mb;
-    cfg.enable_serial = true;
-    cfg.enable_disk   = true;
-    cfg.enable_apic   = true;
-    cfg.timer_tick_us = 10000;
-    cfg.cmdline       = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
-                        "root=/dev/sda rw rootfstype=ext4 init=/sbin/init "
-                        "systemd.unit=multi-user.target nokaslr noapic "
-                        "nosmp noacpi";
-
-    if (!CreateVM(cfg)) {
-        SerialLogger::Log("Hypervisor: Failed to create VM for Debian\r\n");
-        return false;
-    }
-
-    if (!disk.LoadImage(debian_rootfs_data(), rootfs_size, 0)) {
-        SerialLogger::Log("Hypervisor: Failed to load embedded Debian rootfs\r\n");
-        DestroyVM();
-        return false;
-    }
-
-    if (!LoadLinuxKernel(alpine_kernel_data(), alpine_kernel_size(), cfg.cmdline)) {
-        SerialLogger::Log("Hypervisor: Failed to load shared Linux kernel for Debian\r\n");
-        DestroyVM();
-        return false;
-    }
-
-    VMState st = RunVM(max_boot_exits);
-    uint32_t extra_budget = max_boot_exits;
-    if (extra_budget < 250000) extra_budget = 250000;
-    uint32_t used_budget = 0;
-    while ((st == VM_STATE_RUNNING || st == VM_STATE_PAUSED) &&
-           debian_boot_log_len == 0 &&
-           used_budget < extra_budget) {
-        uint32_t step = 25000;
-        if (extra_budget - used_budget < step) step = extra_budget - used_budget;
-        if (step == 0) break;
-        st = RunDebianCycles(step);
-        used_budget += step;
-    }
-
-    if (serial.HasOutput()) {
-        int n = serial.ReadOutput(debian_boot_log, (int)sizeof(debian_boot_log) - 1);
-        if (n > 0) {
-            debian_boot_log_len = n;
-            debian_boot_log[n] = 0;
+        if (guest_halted) {
+            if (!GuestIrqPending()) {
+                // hlt with interrupts off never wakes: linux's poweroff path
+                // (no acpi here) ends exactly like that (satoru)
+                if (vcpu && vcpu->type == VIRT_INTEL_VTX &&
+                    !(VMM::VMRead(VMCS_GUEST_RFLAGS) & (1u << 9))) {
+                    vm_state = VM_STATE_HALTED;
+                    break;
+                }
+                if (idle) *idle = true;
+                break;
+            }
+            guest_halted = false;
         }
+        vm_state = RunOneCycle();
+        if (reboot_requested) { reboot_requested = false; vm_state = VM_STATE_REBOOTING; }
+        if (vm_state != VM_STATE_RUNNING) break;
+        if (VMExitHandler::GuestClockNs() / 1000 - t0 >= budget_us) break;
     }
+    return vm_state;
+}
 
-    SerialLogger::Log("Hypervisor: Debian boot phase complete, state=");
-    SerialLogger::LogDec(st);
-    SerialLogger::Log(", captured ");
-    SerialLogger::LogDec(debian_boot_log_len);
-    SerialLogger::Log(" bytes of boot log\r\n");
-
-    if (st == VM_STATE_RUNNING || st == VM_STATE_PAUSED || debian_boot_log_len > 0) {
-        debian_booted = true;
-        return true;
+bool Hypervisor::BootDebianWithExtraction(uint32_t max_boot_exits) {
+    (void)max_boot_exits;
+    if (IsOwned()) return false;    // the background vm host has it (satoru)
+    if (!DebianPrepare()) return false;
+    // synchronous variant: run for a while and capture the console (satoru)
+    uint64_t t0 = Timer::GetRealMs64();
+    while (vm_state == VM_STATE_RUNNING && Timer::GetRealMs64() - t0 < 20000) {
+        bool idle = false;
+        RunSlice(4000, &idle);
+        PumpGuestConsole(serial, debian_boot_log, debian_boot_log_len, (int)sizeof(debian_boot_log));
+        KuronoShell::PumpUI();
     }
-
-    // write diagnostic into boot log so user sees why it failed
-    if (debian_boot_log_len == 0) {
-        int di = 0;
-        FillGenericVMEntryFailureDiag(debian_boot_log, di,
-                                      (int)sizeof(debian_boot_log),
-                                      "Debian");
-        debian_boot_log[di] = 0;
-        debian_boot_log_len = di;
-    }
-    DestroyVM();
-    return false;
+    debian_booted = vm_state == VM_STATE_RUNNING;
+    return debian_booted;
 }
 
 // bootalpinesoftware - removed
@@ -1920,7 +2153,35 @@ int Hypervisor::ExtractAlpineDrivers() {
 
 //  runalpinecycles - incremental alpine vm execution
 
+// rolling tail of guest serial text, so the boot loop can stop at a shell
+// prompt or a panic instead of at the first byte of output (satoru)
+
+static bool TailHas(const char* s) {
+    int n = 0;
+    while (s[n]) n++;
+    for (int i = 0; i + n <= g_guest_tail_len; i++) {
+        if (memcmp(g_guest_tail + i, s, n) == 0) return true;
+    }
+    return false;
+}
+
+static void NoteGuestText(const char* t, int n) {
+    for (int i = 0; i < n; i++) {
+        if (g_guest_tail_len == (int)sizeof(g_guest_tail)) {
+            memmove(g_guest_tail, g_guest_tail + 64, sizeof(g_guest_tail) - 64);
+            g_guest_tail_len -= 64;
+        }
+        g_guest_tail[g_guest_tail_len++] = t[i];
+    }
+    if (TailHas("login:") || TailHas(" # ") || TailHas("/ #") || TailHas("~ #"))
+        g_guest_prompt_seen = true;
+    if (TailHas("Kernel panic") || TailHas("end Kernel panic"))
+        g_guest_panic_seen = true;
+}
+
 VMState Hypervisor::RunAlpineCycles(uint32_t max_exits) {
+    if (ForeignCaller()) return vm_state;   // (satoru)
+
     if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) {
         return vm_state;
     }
@@ -1939,20 +2200,47 @@ VMState Hypervisor::RunAlpineCycles(uint32_t max_exits) {
         if (remain > 0) {
             int n = serial.ReadOutput(alpine_boot_log + alpine_boot_log_len, remain);
             if (n > 0) {
+                NoteGuestText(alpine_boot_log + alpine_boot_log_len, n); // (satoru)
                 alpine_boot_log_len += n;
                 alpine_boot_log[alpine_boot_log_len] = 0;
             }
         } else {
             // boot log full - just drain and discard
             char discard[256];
-            serial.ReadOutput(discard, (int)sizeof(discard) - 1);
+            int n;
+            while ((n = serial.ReadOutput(discard, (int)sizeof(discard) - 1)) > 0)
+                NoteGuestText(discard, n); // (satoru)
         }
     }
 
     return vm_state;
 }
 
+// mirror the guest console to the host serial log, one "[g] " line at a time,
+// and keep the tail in the boot log buffer for the shell commands. (satoru)
+static void PumpGuestConsole(VirtualSerial& ser, char* keep, int& keep_len, int keep_max) {
+    static char line[256]; static int ll = 0;
+    char buf[256];
+    while (ser.HasOutput()) {
+        int n = ser.ReadOutput(buf, (int)sizeof(buf) - 1);
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) {
+            char c = buf[i];
+            if (keep_len < keep_max - 1) { keep[keep_len++] = c; keep[keep_len] = 0; }
+            if (c == '\r') continue;
+            if (c == '\n' || ll >= (int)sizeof(line) - 2) {
+                line[ll] = 0;
+                SerialLogger::Log("[g] "); SerialLogger::Log(line); SerialLogger::Log("\r\n");
+                ll = 0;
+                if (c != '\n') line[ll++] = c;
+            } else line[ll++] = c;
+        }
+    }
+}
+
 VMState Hypervisor::RunDebianCycles(uint32_t max_exits) {
+    if (ForeignCaller()) return vm_state;   // (satoru)
+
     if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) {
         return vm_state;
     }
@@ -1965,19 +2253,7 @@ VMState Hypervisor::RunDebianCycles(uint32_t max_exits) {
         if (i % 100 == 0) TickDevices();
     }
 
-    if (serial.HasOutput()) {
-        int remain = (int)sizeof(debian_boot_log) - debian_boot_log_len - 1;
-        if (remain > 0) {
-            int n = serial.ReadOutput(debian_boot_log + debian_boot_log_len, remain);
-            if (n > 0) {
-                debian_boot_log_len += n;
-                debian_boot_log[debian_boot_log_len] = 0;
-            }
-        } else {
-            char discard[256];
-            serial.ReadOutput(discard, (int)sizeof(discard) - 1);
-        }
-    }
+    PumpGuestConsole(serial, debian_boot_log, debian_boot_log_len, (int)sizeof(debian_boot_log));
 
     return vm_state;
 }
@@ -1985,6 +2261,13 @@ VMState Hypervisor::RunDebianCycles(uint32_t max_exits) {
 //  alpineexec - send command to guest, run cycles, capture output
 
 int Hypervisor::AlpineExec(const char* cmd, char* out_buf, int out_max) {
+    // the background vm: the command goes through its guest agent. never from
+    // the vm thread itself, which would wait on its own output (satoru)
+    if (IsOwned()) {
+        if (!ForeignCaller() || !cmd || !out_buf || out_max <= 0) return 0;
+        int n = VMHost::Exec(cmd, out_buf, out_max + 1, 600000);
+        return n < 0 ? 0 : n;
+    }
     if (!cmd || out_max <= 0) return 0;
 
     if (vm_state != VM_STATE_RUNNING) return 0;
@@ -2040,6 +2323,7 @@ int Hypervisor::AlpineExec(const char* cmd, char* out_buf, int out_max) {
 }
 
 int Hypervisor::DebianExec(const char* cmd, char* out_buf, int out_max) {
+    if (IsOwned()) return 0;   // the background vm host has the vm (satoru)
     if (!cmd || out_max <= 0) return 0;
     if (vm_state != VM_STATE_RUNNING) return 0;
 
@@ -2086,7 +2370,11 @@ int Hypervisor::DebianExec(const char* cmd, char* out_buf, int out_max) {
 
 //  alpine state accessors
 
-bool Hypervisor::IsAlpineBooted() { return alpine_booted; }
+// the background alpine vm counts as booted once its agent answers (satoru)
+bool Hypervisor::IsAlpineBooted() {
+    if (IsOwned()) return VMHost::AgentReady() && VMHost::DistroName()[0] == 'a';
+    return alpine_booted;
+}
 const char* Hypervisor::GetAlpineBootLog() { return alpine_boot_log; }
 int Hypervisor::GetAlpineBootLogLen() { return alpine_boot_log_len; }
 bool Hypervisor::IsDebianBooted() { return debian_booted; }

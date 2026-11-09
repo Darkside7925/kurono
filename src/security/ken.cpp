@@ -1,22 +1,22 @@
-#include "supr.h"
+#include "ken.h"
 #include "ksa.h"                  // hypervisor-backed auth factor (satoru)
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
 #include "../system/logging.h"   // mirror the audit trail to /kurono/var/log/security.log (satoru)
 
-//  supr security engine implementation
+//  ken security engine implementation
 
-SUPRUser SUPR::users[SUPR_MAX_USERS];
-int SUPR::user_count = 0;
-SUPRSession SUPR::sessions[SUPR_MAX_SESSIONS];
-int SUPR::current_session = -1;
-SUPRAuditEntry SUPR::audit_log[SUPR_MAX_LOG];
-int SUPR::audit_count = 0;
-unsigned int SUPR::rng_state = 0x12345678;
+KENUser KEN::users[KEN_MAX_USERS];
+int KEN::user_count = 0;
+KENSession KEN::sessions[KEN_MAX_SESSIONS];
+int KEN::current_session = -1;
+KENAuditEntry KEN::audit_log[KEN_MAX_LOG];
+int KEN::audit_count = 0;
+unsigned int KEN::rng_state = 0x12345678;
 // default policy: password prompt only (--auth=passwd), per spec. the ksa
-// factor is opt-in via `supr policy --auth=kvault|both`. (satoru)
-SUPRAuthPolicy SUPR::policy = { /*passwd*/ true, /*kvault*/ false };
+// factor is opt-in via `ken policy --auth=kvault|both`. (satoru)
+KENAuthPolicy KEN::policy = { /*passwd*/ true, /*kvault*/ false };
 
 static int slen(const char* s) { int n=0; while (s[n]) n++; return n; }
 static void scpy(char* d, const char* s, int m) {
@@ -83,20 +83,20 @@ static void simple_hash(const unsigned char* data, int len, const unsigned char*
     }
 }
 
-void SUPR::Init() {
+void KEN::Init() {
     user_count = 0;
     audit_count = 0;
     current_session = -1;
     rng_state = Time::GetTicks() ^ 0xDEADBEEF;
 
-    for (int i = 0; i < SUPR_MAX_SESSIONS; i++) {
+    for (int i = 0; i < KEN_MAX_SESSIONS; i++) {
         sessions[i].active = false;
     }
 
     // create default users
-    CreateUser("root", "root", SUPR_ROOT);
-    CreateUser("user", "user", SUPR_USER);
-    CreateUser("guest", "", SUPR_GUEST);
+    CreateUser("root", "root", KEN_ROOT);
+    CreateUser("user", "user", KEN_USER);
+    CreateUser("guest", "", KEN_GUEST);
 
     // set root home
     if (user_count >= 1) {
@@ -121,15 +121,15 @@ void SUPR::Init() {
     // bring up the ksa (kurono secure authorization) factor. this probes the
     // hypervisor; if unavailable, ksa reports so and policy degrades to the
     // password factor. default policy stays passwd-only until the user opts
-    // into kvault via `supr policy`. (satoru)
+    // into kvault via `ken policy`. (satoru)
     KSA::Init();
 
-    Log(ACT_LOGIN, "system", "SUPR security engine initialized");
-    SerialLogger::Log("SUPR: Security engine initialized\r\n");
+    Log(ACT_LOGIN, "system", "KEN security engine initialized");
+    SerialLogger::Log("KEN: Security engine initialized\r\n");
 }
 
-void SUPR::GenerateSalt(unsigned char* salt_out) {
-    for (int i = 0; i < SUPR_SALT_LEN; i++) {
+void KEN::GenerateSalt(unsigned char* salt_out) {
+    for (int i = 0; i < KEN_SALT_LEN; i++) {
         rng_state ^= rng_state << 13;
         rng_state ^= rng_state >> 17;
         rng_state ^= rng_state << 5;
@@ -137,15 +137,15 @@ void SUPR::GenerateSalt(unsigned char* salt_out) {
     }
 }
 
-void SUPR::HashPassword(const char* password, const unsigned char* salt, unsigned char* hash_out) {
-    simple_hash((const unsigned char*)password, slen(password), salt, SUPR_SALT_LEN, hash_out);
+void KEN::HashPassword(const char* password, const unsigned char* salt, unsigned char* hash_out) {
+    simple_hash((const unsigned char*)password, slen(password), salt, KEN_SALT_LEN, hash_out);
 }
 
-bool SUPR::CreateUser(const char* username, const char* password, SUPRLevel level) {
-    if (user_count >= SUPR_MAX_USERS) return false;
+bool KEN::CreateUser(const char* username, const char* password, KENLevel level) {
+    if (user_count >= KEN_MAX_USERS) return false;
     if (FindUser(username)) return false;
 
-    SUPRUser& u = users[user_count];
+    KENUser& u = users[user_count];
     scpy(u.username, username, 32);
     u.level = level;
     u.locked = false;
@@ -171,13 +171,13 @@ bool SUPR::CreateUser(const char* username, const char* password, SUPRLevel leve
     return true;
 }
 
-bool SUPR::DeleteUser(const char* username) {
+bool KEN::DeleteUser(const char* username) {
     for (int i = 0; i < user_count; i++) {
         if (seq(users[i].username, username)) {
             Log(ACT_DELETE_USER, username, "User deleted");
             // shift remaining
             for (int j = i; j < user_count - 1; j++) {
-                smemcpy(&users[j], &users[j + 1], sizeof(SUPRUser));
+                smemcpy(&users[j], &users[j + 1], sizeof(KENUser));
             }
             user_count--;
             return true;
@@ -186,14 +186,14 @@ bool SUPR::DeleteUser(const char* username) {
     return false;
 }
 
-bool SUPR::ChangePassword(const char* username, const char* old_pwd, const char* new_pwd) {
-    SUPRUser* u = FindUser(username);
+bool KEN::ChangePassword(const char* username, const char* old_pwd, const char* new_pwd) {
+    KENUser* u = FindUser(username);
     if (!u) return false;
 
     // verify old password
-    unsigned char hash[SUPR_HASH_LEN];
+    unsigned char hash[KEN_HASH_LEN];
     HashPassword(old_pwd, u->salt, hash);
-    if (!smemeq(hash, u->pwd_hash, SUPR_HASH_LEN)) {
+    if (!smemeq(hash, u->pwd_hash, KEN_HASH_LEN)) {
         Log(ACT_PERMISSION_DENIED, username, "Wrong old password");
         return false;
     }
@@ -205,34 +205,34 @@ bool SUPR::ChangePassword(const char* username, const char* old_pwd, const char*
     return true;
 }
 
-bool SUPR::LockUser(const char* username) {
-    SUPRUser* u = FindUser(username);
+bool KEN::LockUser(const char* username) {
+    KENUser* u = FindUser(username);
     if (!u) return false;
     u->locked = true;
     Log(ACT_PERMISSION_DENIED, username, "Account locked");
     return true;
 }
 
-bool SUPR::UnlockUser(const char* username) {
-    SUPRUser* u = FindUser(username);
+bool KEN::UnlockUser(const char* username) {
+    KENUser* u = FindUser(username);
     if (!u) return false;
     u->locked = false;
     u->failed_attempts = 0;
     return true;
 }
 
-SUPRUser* SUPR::FindUser(const char* username) {
+KENUser* KEN::FindUser(const char* username) {
     for (int i = 0; i < user_count; i++) {
         if (seq(users[i].username, username)) return &users[i];
     }
     return nullptr;
 }
 
-int SUPR::GetUserCount() { return user_count; }
-SUPRUser* SUPR::GetUsers() { return users; }
+int KEN::GetUserCount() { return user_count; }
+KENUser* KEN::GetUsers() { return users; }
 
-int SUPR::Authenticate(const char* username, const char* password) {
-    SUPRUser* u = FindUser(username);
+int KEN::Authenticate(const char* username, const char* password) {
+    KENUser* u = FindUser(username);
     if (!u) {
         Log(ACT_FAIL_LOGIN, username, "Unknown user");
         return -1;
@@ -244,10 +244,10 @@ int SUPR::Authenticate(const char* username, const char* password) {
     }
 
     // check password
-    unsigned char hash[SUPR_HASH_LEN];
+    unsigned char hash[KEN_HASH_LEN];
     HashPassword(password, u->salt, hash);
 
-    if (!smemeq(hash, u->pwd_hash, SUPR_HASH_LEN)) {
+    if (!smemeq(hash, u->pwd_hash, KEN_HASH_LEN)) {
         u->failed_attempts++;
         if (u->failed_attempts >= 5) {
             u->locked = true;
@@ -260,7 +260,7 @@ int SUPR::Authenticate(const char* username, const char* password) {
 
     // find free session
     int sid = -1;
-    for (int i = 0; i < SUPR_MAX_SESSIONS; i++) {
+    for (int i = 0; i < KEN_MAX_SESSIONS; i++) {
         if (!sessions[i].active) { sid = i; break; }
     }
     if (sid == -1) return -1;
@@ -279,8 +279,8 @@ int SUPR::Authenticate(const char* username, const char* password) {
     return sid;
 }
 
-void SUPR::Logout(int session_id) {
-    if (session_id < 0 || session_id >= SUPR_MAX_SESSIONS) return;
+void KEN::Logout(int session_id) {
+    if (session_id < 0 || session_id >= KEN_MAX_SESSIONS) return;
     if (!sessions[session_id].active) return;
 
     int ui = sessions[session_id].user_index;
@@ -290,8 +290,8 @@ void SUPR::Logout(int session_id) {
     if (current_session == session_id) current_session = -1;
 }
 
-bool SUPR::ValidateSession(int session_id) {
-    if (session_id < 0 || session_id >= SUPR_MAX_SESSIONS) return false;
+bool KEN::ValidateSession(int session_id) {
+    if (session_id < 0 || session_id >= KEN_MAX_SESSIONS) return false;
     if (!sessions[session_id].active) return false;
 
     // check timeout
@@ -307,15 +307,15 @@ bool SUPR::ValidateSession(int session_id) {
     return true;
 }
 
-SUPRSession* SUPR::GetSession(int session_id) {
-    if (session_id < 0 || session_id >= SUPR_MAX_SESSIONS) return nullptr;
+KENSession* KEN::GetSession(int session_id) {
+    if (session_id < 0 || session_id >= KEN_MAX_SESSIONS) return nullptr;
     return &sessions[session_id];
 }
 
-int SUPR::GetCurrentSession() { return current_session; }
-void SUPR::SetCurrentSession(int sid) { current_session = sid; }
+int KEN::GetCurrentSession() { return current_session; }
+void KEN::SetCurrentSession(int sid) { current_session = sid; }
 
-bool SUPR::CheckPermission(int session_id, SUPRLevel required) {
+bool KEN::CheckPermission(int session_id, KENLevel required) {
     if (!ValidateSession(session_id)) return false;
     int ui = sessions[session_id].user_index;
     if (users[ui].level >= required) return true;
@@ -323,7 +323,7 @@ bool SUPR::CheckPermission(int session_id, SUPRLevel required) {
     return false;
 }
 
-bool SUPR::Escalate(int session_id, const char* password) {
+bool KEN::Escalate(int session_id, const char* password) {
     if (!ValidateSession(session_id)) return false;
 
     // run the full auth gate (password and/or ksa per the active policy). this
@@ -335,14 +335,14 @@ bool SUPR::Escalate(int session_id, const char* password) {
     }
 
     // temporarily elevate (for this session)
-    SUPRUser* root = FindUser("root");
+    KENUser* root = FindUser("root");
     if (!root) return false;
     sessions[session_id].user_index = (int)(root - users);
     Log(ACT_ESCALATE, "root", "Escalation granted");
     return true;
 }
 
-bool SUPR::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
+bool KEN::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
     if (out_saved_user) *out_saved_user = -1;
     if (!ValidateSession(session_id)) return false;
     const char* actor = users[sessions[session_id].user_index].username;
@@ -350,9 +350,9 @@ bool SUPR::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
     bool authed = false;
     if (BothAuthDisabled()) {
         // no factor required - proceed, but warn + audit loudly. (satoru)
-        Log(ACT_RISK_WARNING, actor, "supr escalation with both auth factors disabled");
-        RuntimeLog::LogSecurity("RISK: supr escalation, no auth factor", reason);
-        SerialLogger::Log("SUPR: WARNING - supr escalation with BOTH auth factors disabled\r\n");
+        Log(ACT_RISK_WARNING, actor, "ken escalation with both auth factors disabled");
+        RuntimeLog::LogSecurity("RISK: ken escalation, no auth factor", reason);
+        SerialLogger::Log("KEN: WARNING - ken escalation with BOTH auth factors disabled\r\n");
         authed = true;
     } else {
         bool need_pw  = policy.passwd_enabled;
@@ -368,26 +368,26 @@ bool SUPR::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
         // approval through the interactive ksa modal - available whenever the
         // hypervisor is, even if kvault is policy-off. want_cred when a password
         // factor is required. (satoru)
-        if (!KSA::IsAvailable()) {
-            Log(ACT_PERMISSION_DENIED, actor, "no interactive auth path for supr");
+        if (!KSA::PromptUsable()) {
+            Log(ACT_PERMISSION_DENIED, actor, "no interactive auth path for ken");
             return false;
         }
         KSARequest req;
-        req.title    = "Privilege Escalation (supr)";
+        req.title    = "Privilege Escalation (ken)";
         req.detail   = reason ? reason : "An action requires elevated rights.";
         req.username = "root";
         req.want_cred = need_pw;
         KSAVerdict v;
         if (!KSA::Prompt(req, v) || !v.approved) {
-            Log(ACT_KSA_DENY, actor, "supr escalation denied at prompt");
+            Log(ACT_KSA_DENY, actor, "ken escalation denied at prompt");
             return false;
         }
         bool ok = true;
         if (need_pw) {
-            SUPRUser* root_u = FindUser("root");
+            KENUser* root_u = FindUser("root");
             ok = root_u && v.have_cred_hash &&
-                 smemeq(v.cred_hash, root_u->pwd_hash, SUPR_HASH_LEN);
-            if (!ok) Log(ACT_PERMISSION_DENIED, actor, "supr password factor failed");
+                 smemeq(v.cred_hash, root_u->pwd_hash, KEN_HASH_LEN);
+            if (!ok) Log(ACT_PERMISSION_DENIED, actor, "ken password factor failed");
         }
         (void)need_ksa;   // the ksa factor IS the approval, already required above (satoru)
         authed = ok;
@@ -395,50 +395,50 @@ bool SUPR::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
     if (!authed) return false;
 
     // elevate the session to root for the duration of the command. (satoru)
-    SUPRUser* root = FindUser("root");
+    KENUser* root = FindUser("root");
     if (!root) return false;
     if (out_saved_user) *out_saved_user = sessions[session_id].user_index;
     sessions[session_id].user_index = (int)(root - users);
-    Log(ACT_ESCALATE, actor, reason ? reason : "supr escalation");
+    Log(ACT_ESCALATE, actor, reason ? reason : "ken escalation");
     return true;
 }
 
-void SUPR::SudoEnd(int session_id, int saved_user) {
+void KEN::SudoEnd(int session_id, int saved_user) {
     if (!ValidateSession(session_id)) return;
-    if (saved_user >= 0 && saved_user < SUPR_MAX_USERS)
+    if (saved_user >= 0 && saved_user < KEN_MAX_USERS)
         sessions[session_id].user_index = saved_user;
 }
 
-SUPRLevel SUPR::GetLevel(int session_id) {
-    if (!ValidateSession(session_id)) return SUPR_GUEST;
+KENLevel KEN::GetLevel(int session_id) {
+    if (!ValidateSession(session_id)) return KEN_GUEST;
     return users[sessions[session_id].user_index].level;
 }
 
 // ── auth policy / ksa wiring ───────────────────────────────────────────
 
-bool SUPR::IsPasswdEnabled() { return policy.passwd_enabled; }
-bool SUPR::IsKvaultEnabled() { return policy.kvault_enabled; }
-SUPRAuthPolicy SUPR::GetPolicy() { return policy; }
-bool SUPR::BothAuthDisabled() { return !policy.passwd_enabled && !policy.kvault_enabled; }
+bool KEN::IsPasswdEnabled() { return policy.passwd_enabled; }
+bool KEN::IsKvaultEnabled() { return policy.kvault_enabled; }
+KENAuthPolicy KEN::GetPolicy() { return policy; }
+bool KEN::BothAuthDisabled() { return !policy.passwd_enabled && !policy.kvault_enabled; }
 
-SUPRAuthMode SUPR::GetAuthMode() {
+KENAuthMode KEN::GetAuthMode() {
     if (policy.passwd_enabled && policy.kvault_enabled) return AUTH_BOTH;
     if (policy.kvault_enabled) return AUTH_KVAULT;
     return AUTH_PASSWD;   // passwd-only, or (degenerate) both-off treated as passwd surface (satoru)
 }
 
-bool SUPR::VerifyEscalationPassword(const char* password) {
+bool KEN::VerifyEscalationPassword(const char* password) {
     // accept the credential of any root/sovereign account. (satoru)
     for (int i = 0; i < user_count; i++) {
-        if (users[i].level < SUPR_ROOT) continue;
-        unsigned char hash[SUPR_HASH_LEN];
+        if (users[i].level < KEN_ROOT) continue;
+        unsigned char hash[KEN_HASH_LEN];
         HashPassword(password ? password : "", users[i].salt, hash);
-        if (smemeq(hash, users[i].pwd_hash, SUPR_HASH_LEN)) return true;
+        if (smemeq(hash, users[i].pwd_hash, KEN_HASH_LEN)) return true;
     }
     return false;
 }
 
-bool SUPR::RunEscalationGate(int session_id, const char* password, const char* reason) {
+bool KEN::RunEscalationGate(int session_id, const char* password, const char* reason) {
     if (!ValidateSession(session_id)) return false;
     const char* actor = users[sessions[session_id].user_index].username;
 
@@ -446,7 +446,7 @@ bool SUPR::RunEscalationGate(int session_id, const char* password, const char* r
     if (BothAuthDisabled()) {
         Log(ACT_RISK_WARNING, actor, "both auth factors disabled - proceeding");
         RuntimeLog::LogSecurity("RISK: escalation with no auth factor", reason);
-        SerialLogger::Log("SUPR: WARNING - escalation with BOTH auth factors disabled\r\n");
+        SerialLogger::Log("KEN: WARNING - escalation with BOTH auth factors disabled\r\n");
         return true;
     }
 
@@ -457,7 +457,7 @@ bool SUPR::RunEscalationGate(int session_id, const char* password, const char* r
     bool need_ksa = policy.kvault_enabled && KSA::IsAvailable();
     if (policy.kvault_enabled && !KSA::IsAvailable()) {
         RuntimeLog::LogSecurity("ksa required by policy but unavailable", reason);
-        SerialLogger::Log("SUPR: ksa required but unavailable - falling back to password factor\r\n");
+        SerialLogger::Log("KEN: ksa required but unavailable - falling back to password factor\r\n");
         if (!policy.passwd_enabled) {
             // policy wanted kvault-only but ksa is gone and passwd is off: refuse.
             Log(ACT_PERMISSION_DENIED, actor, "kvault-only policy but ksa unavailable");
@@ -490,9 +490,9 @@ bool SUPR::RunEscalationGate(int session_id, const char* password, const char* r
             ksa_ok = v.approved;
             // when ksa is the sole credential collector, verify its hash too.
             if (ksa_ok && req.want_cred) {
-                SUPRUser* root = FindUser("root");
+                KENUser* root = FindUser("root");
                 ksa_ok = root && v.have_cred_hash &&
-                         smemeq(v.cred_hash, root->pwd_hash, SUPR_HASH_LEN);
+                         smemeq(v.cred_hash, root->pwd_hash, KEN_HASH_LEN);
                 if (!ksa_ok) Log(ACT_PERMISSION_DENIED, actor, "ksa credential mismatch");
             }
         }
@@ -507,7 +507,7 @@ static void set_err(char* err, int err_max, const char* msg) {
     int i = 0; while (msg[i] && i < err_max - 1) { err[i] = msg[i]; i++; } err[i] = 0;
 }
 
-bool SUPR::SetAuthMode(int session_id, SUPRAuthMode mode, bool sovereign_override,
+bool KEN::SetAuthMode(int session_id, KENAuthMode mode, bool sovereign_override,
                        char* err, int err_max) {
     if (!ValidateSession(session_id)) { set_err(err, err_max, "invalid session"); return false; }
     const char* actor = users[sessions[session_id].user_index].username;
@@ -528,7 +528,7 @@ bool SUPR::SetAuthMode(int session_id, SUPRAuthMode mode, bool sovereign_overrid
             set_err(err, err_max, "refusing to disable both factors without --sovereign-override");
             return false;
         }
-        if (GetLevel(session_id) != SUPR_SOVEREIGN) {
+        if (GetLevel(session_id) != KEN_SOVEREIGN) {
             set_err(err, err_max, "--sovereign-override requires the sovereign role");
             return false;
         }
@@ -550,7 +550,7 @@ bool SUPR::SetAuthMode(int session_id, SUPRAuthMode mode, bool sovereign_overrid
     return true;
 }
 
-bool SUPR::EnableKvault(int session_id, char* err, int err_max) {
+bool KEN::EnableKvault(int session_id, char* err, int err_max) {
     if (!ValidateSession(session_id)) { set_err(err, err_max, "invalid session"); return false; }
     if (!KSA::IsAvailable()) { set_err(err, err_max, "ksa unavailable on this host"); return false; }
     policy.kvault_enabled = true;
@@ -559,7 +559,7 @@ bool SUPR::EnableKvault(int session_id, char* err, int err_max) {
     return true;
 }
 
-bool SUPR::EnablePasswd(int session_id, char* err, int err_max) {
+bool KEN::EnablePasswd(int session_id, char* err, int err_max) {
     if (!ValidateSession(session_id)) { set_err(err, err_max, "invalid session"); return false; }
     policy.passwd_enabled = true;
     Log(ACT_POLICY_CHANGE, users[sessions[session_id].user_index].username, "passwd enabled");
@@ -567,7 +567,7 @@ bool SUPR::EnablePasswd(int session_id, char* err, int err_max) {
     return true;
 }
 
-bool SUPR::DisableKvault(int session_id, bool force, bool ack_risk,
+bool KEN::DisableKvault(int session_id, bool force, bool ack_risk,
                          bool sovereign_override, char* err, int err_max) {
     if (!ValidateSession(session_id)) { set_err(err, err_max, "invalid session"); return false; }
     const char* actor = users[sessions[session_id].user_index].username;
@@ -584,7 +584,7 @@ bool SUPR::DisableKvault(int session_id, bool force, bool ack_risk,
         return false;
     }
     if (!policy.passwd_enabled && sovereign_override) {
-        if (GetLevel(session_id) != SUPR_SOVEREIGN) {
+        if (GetLevel(session_id) != KEN_SOVEREIGN) {
             set_err(err, err_max, "--sovereign-override requires the sovereign role");
             return false;
         }
@@ -599,7 +599,7 @@ bool SUPR::DisableKvault(int session_id, bool force, bool ack_risk,
     return true;
 }
 
-bool SUPR::DisablePasswd(int session_id, bool ack_risk, bool sovereign_override,
+bool KEN::DisablePasswd(int session_id, bool ack_risk, bool sovereign_override,
                          char* err, int err_max) {
     if (!ValidateSession(session_id)) { set_err(err, err_max, "invalid session"); return false; }
     const char* actor = users[sessions[session_id].user_index].username;
@@ -616,7 +616,7 @@ bool SUPR::DisablePasswd(int session_id, bool ack_risk, bool sovereign_override,
             set_err(err, err_max, "cannot disable password auth unless ksa is active (use --sovereign-override)");
             return false;
         }
-        if (GetLevel(session_id) != SUPR_SOVEREIGN) {
+        if (GetLevel(session_id) != KEN_SOVEREIGN) {
             set_err(err, err_max, "--sovereign-override requires the sovereign role");
             return false;
         }
@@ -642,7 +642,7 @@ static void pst_check(const char* name, bool cond, bool& all) {
     if (!cond) all = false;
 }
 
-bool SUPR::PolicySelfTest() {
+bool KEN::PolicySelfTest() {
     SerialLogger::Log("POLICY-SELFTEST: begin\r\n");
     bool all = true;
     char err[160];
@@ -654,16 +654,16 @@ bool SUPR::PolicySelfTest() {
         SerialLogger::Log("POLICY-SELFTEST: no active session - skipping\r\n");
         return true;
     }
-    SUPRAuthPolicy saved = policy;
+    KENAuthPolicy saved = policy;
     int ui = sessions[sid].user_index;
-    SUPRLevel saved_level = users[ui].level;
+    KENLevel saved_level = users[ui].level;
 
     // start from a known state: passwd on, kvault off (the default). (satoru)
     policy.passwd_enabled = true; policy.kvault_enabled = false;
 
     // 1. a non-sovereign cannot use --sovereign-override. promote to root only
     //    (not sovereign) and try to disable passwd with ksa off + override. (satoru)
-    users[ui].level = SUPR_ROOT;
+    users[ui].level = KEN_ROOT;
     err[0]=0;
     bool r1 = DisablePasswd(sid, /*ack*/true, /*sov*/true, err, sizeof(err));
     pst_check("non-sovereign override refused", !r1, all);
@@ -687,7 +687,7 @@ bool SUPR::PolicySelfTest() {
 
     // 5. sovereign CAN override the both-off path. promote to sovereign and
     //    repeat scenario 4 - should now succeed and land in both-off. (satoru)
-    users[ui].level = SUPR_SOVEREIGN;
+    users[ui].level = KEN_SOVEREIGN;
     policy.passwd_enabled = false; policy.kvault_enabled = true;
     err[0]=0;
     bool r5 = DisableKvault(sid, /*force*/true, /*ack*/true, /*sov*/true, err, sizeof(err));
@@ -724,8 +724,8 @@ bool SUPR::PolicySelfTest() {
     return all;
 }
 
-void SUPR::Log(SUPRAction action, const char* username, const char* detail) {
-    int idx = audit_count % SUPR_MAX_LOG;
+void KEN::Log(KENAction action, const char* username, const char* detail) {
+    int idx = audit_count % KEN_MAX_LOG;
     audit_log[idx].action = action;
     scpy(audit_log[idx].username, username, 32);
     scpy(audit_log[idx].detail, detail, 64);
@@ -736,12 +736,12 @@ void SUPR::Log(SUPRAction action, const char* username, const char* detail) {
     RuntimeLog::LogSecurity(detail && *detail ? detail : "event", username);
 }
 
-int SUPR::GetAuditLog(SUPRAuditEntry* entries, int max_entries) {
-    int total = audit_count < SUPR_MAX_LOG ? audit_count : SUPR_MAX_LOG;
-    int start = audit_count > SUPR_MAX_LOG ? audit_count - SUPR_MAX_LOG : 0;
+int KEN::GetAuditLog(KENAuditEntry* entries, int max_entries) {
+    int total = audit_count < KEN_MAX_LOG ? audit_count : KEN_MAX_LOG;
+    int start = audit_count > KEN_MAX_LOG ? audit_count - KEN_MAX_LOG : 0;
     int count = 0;
     for (int i = start; i < audit_count && count < max_entries; i++) {
-        smemcpy(&entries[count++], &audit_log[i % SUPR_MAX_LOG], sizeof(SUPRAuditEntry));
+        smemcpy(&entries[count++], &audit_log[i % KEN_MAX_LOG], sizeof(KENAuditEntry));
     }
     return count;
 }

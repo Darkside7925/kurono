@@ -9,6 +9,7 @@
 //  auto-read bit). nothing here issues an nvm/flash/eeprom write or update. (satoru)
 
 #include "igc.h"
+#include "e1000.h"   // nic command falls back to the e1000 when no igc is bound (satoru)
 #include "serial.h"
 #include "../kernel/kdf.h"
 #include "../proc/scheduler.h"
@@ -972,6 +973,17 @@ int Igc::Status(char* out, int mx) {
 static int cmd_nic(KuronoShell* /*sh*/, int argc, const char** argv, char* out, int mx) {
     bool restart = false;
     if (argc >= 2 && argv[1] && argv[1][0] == 'r') restart = true;
+    if (!Igc::IsDetected() && E1000::IsDetected()) {
+        // plain e1000 (qemu, older boards): same verbs, e1000 backend (satoru)
+        int p = 0;
+        if (restart) p = OutCat(out, p, mx, E1000::Restart() ? "nic restart: ok\n" : "nic restart: FAILED\n");
+        p = OutCat(out, p, mx, "e1000 ");
+        p = OutCat(out, p, mx, E1000::IsLinkUp() ? "link up" : "link down");
+        p = OutCat(out, p, mx, "\n  tx "); p = OutDec(out, p, mx, E1000::GetTxCount());
+        p = OutCat(out, p, mx, " pkts  rx "); p = OutDec(out, p, mx, E1000::GetRxCount());
+        p = OutCat(out, p, mx, " pkts  rx-missed "); p = OutDec(out, p, mx, E1000::GetRxMissed());
+        return OutCat(out, p, mx, "\n");
+    }
     if (restart) {
         bool ok = Igc::Restart();
         int p = OutCat(out, 0, mx, ok ? "nic restart: ok\n" : "nic restart: FAILED\n");

@@ -252,8 +252,8 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 
 | File | Role |
 | --- | --- |
-| `supr.cpp` | privilege system + auth policy + escalation gate |
-| `supr.h` | privilege declarations |
+| `ken.cpp` | privilege system + auth policy + escalation gate |
+| `ken.h` | privilege declarations |
 | `ksa.cpp` | Kurono Secure Authorization (hypervisor-backed prompts) |
 | `ksa.h` | KSA declarations |
 
@@ -427,6 +427,6 @@ If the question is about one of the subjects below, the first file to open shoul
 | Dynamic-linker / PIE-load issue | `src/linux/ld_kurono.cpp` and `src/kernel/elf_loader.cpp` |
 | Network issue | `src/net/tcpip.cpp` |
 | Multi-core / AP issue | `src/proc/smp.cpp` and `src/proc/scheduler.cpp` |
-| Privilege / auth-prompt issue | `src/security/supr.cpp` and `src/security/ksa.cpp` |
+| Privilege / auth-prompt issue | `src/security/ken.cpp` and `src/security/ksa.cpp` |
 | Persistence / on-disk fs issue | `src/fs/persist.cpp` and `src/fs/kfs.cpp` |
 | Canonical path / symlink issue | `src/system/kpaths.h` and `src/fs/kvfs.cpp` |

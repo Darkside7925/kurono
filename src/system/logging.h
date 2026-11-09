@@ -14,7 +14,7 @@ namespace RuntimeLog {
     void LogBoot(const char* message);
     // network events - connect / disconnect / link state / errors. (satoru)
     void LogNetwork(const char* event, const char* detail = nullptr);
-    // security events - supr escalations, ksa prompts, grants/denials. (satoru)
+    // security events - ken escalations, ksa prompts, grants/denials. (satoru)
     void LogSecurity(const char* event, const char* detail = nullptr);
     // crash / panic record - appended to /kurono/var/log/crash/<n>.log. (satoru)
     void LogCrash(const char* summary, const char* detail = nullptr);

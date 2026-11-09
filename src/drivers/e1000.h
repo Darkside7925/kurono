@@ -120,6 +120,13 @@ public:
     static bool Init();           // scan pci, map mmio, init descriptors
     static bool IsDetected();     // was an e1000 found on pci?
     static bool IsLinkUp();       // is the link active?
+    // re-run the reset + ring bring-up on the already mapped device, keeping the
+    // packet handler and counters (`kdrv reload nic`). forwards to igc when that
+    // is the bound nic. (satoru)
+    static bool Restart();
+    // switch the receiver and transmitter off and stop polling (`kdrv unload nic`).
+    // e1000 only; returns false for igc/igb. Restart() brings it back. (satoru)
+    static bool Stop();
     
     // mac address
     static void GetMAC(uint8_t mac[6]);

@@ -53,16 +53,16 @@
 #define VMCS_GUEST_CS_BASE          0x6808
 #define VMCS_GUEST_CS_LIMIT         0x4802
 #define VMCS_GUEST_CS_AR            0x4816
-#define VMCS_GUEST_SS_BASE          0x680C
+#define VMCS_GUEST_SS_BASE          0x680A  // sdm appendix b: es 6806 cs 6808 ss 680a ds 680c fs 680e (satoru)
 #define VMCS_GUEST_SS_LIMIT         0x4804
 #define VMCS_GUEST_SS_AR            0x4818
-#define VMCS_GUEST_DS_BASE          0x680E
+#define VMCS_GUEST_DS_BASE          0x680C
 #define VMCS_GUEST_DS_LIMIT         0x4806
 #define VMCS_GUEST_DS_AR            0x481A
 #define VMCS_GUEST_ES_BASE          0x6806
 #define VMCS_GUEST_ES_LIMIT         0x4800
 #define VMCS_GUEST_ES_AR            0x4814
-#define VMCS_GUEST_FS_BASE          0x680A
+#define VMCS_GUEST_FS_BASE          0x680E
 #define VMCS_GUEST_FS_LIMIT         0x4808
 #define VMCS_GUEST_FS_AR            0x481C
 #define VMCS_GUEST_GS_BASE          0x6810
@@ -85,6 +85,10 @@
 #define VMCS_ENTRY_EXCEPTION_ERROR  0x4018
 #define VMCS_ENTRY_INSTR_LENGTH     0x401A
 #define VMCS_MSR_BITMAP_ADDR        0x2004
+#define VMCS_CR0_GUEST_HOST_MASK    0x6000  // (satoru)
+#define VMCS_CR4_GUEST_HOST_MASK    0x6002  // (satoru)
+#define VMCS_GUEST_IA32_EFER        0x2806  // (satoru)
+#define VMCS_HOST_IA32_EFER         0x2C02  // (satoru)
 
 // host state
 #define VMCS_HOST_CS_SEL            0x0C02
@@ -171,6 +175,9 @@
 #define VM_EXIT_ACK_INT_ON_EXIT      (1 << 15)
 
 #define VM_ENTRY_IA32E_MODE          (1 << 9)    // guest enters ia-32e (64-bit)
+#define VM_ENTRY_LOAD_EFER           (1 << 15)   // load guest ia32_efer on entry (satoru)
+#define VM_EXIT_SAVE_EFER            (1 << 20)   // save guest ia32_efer on exit (satoru)
+#define VM_EXIT_LOAD_EFER            (1 << 21)   // load host ia32_efer on exit (satoru)
 #define PROC2_VIRT_INT_DELIVERY     (1 << 9)
 
 #define EXIT_REASON_EXCEPTION_NMI   0
@@ -414,6 +421,8 @@ public:
     static vCPU*  CreateVCPU();
     static void   DestroyVCPU(vCPU* cpu);
     static bool   SetupVCPU(vCPU* cpu);
+    // power-on x87/sse image for the guest, swapped in around every entry (satoru)
+    static void   ResetGuestFPU();
     static int    RunVCPU(vCPU* cpu); // returns exit reason
 
     static void   SetupVMCSGuestState(vCPU* cpu);
@@ -430,6 +439,10 @@ public:
     static uint64_t GetLastVMEntryGuestRip();
     static uint64_t GetLastVMEntryGuestCr0();
     static uint64_t GetLastVMEntryGuestCr4();
+    // guest copies of msrs that vmx does not switch (kernel_gs_base, star,
+    // lstar, cstar, sfmask). returns nullptr for any other msr (satoru)
+    static uint64_t* GuestSwitchedMSR(uint32_t msr);
+    static void   DumpVMXControlDiag();
 
     static bool   IsWHPX();            // running under hyper-v / whpx?
     static bool   IsWHPXNestedOk();    // whpx actually supports nested virt?

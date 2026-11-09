@@ -6,7 +6,7 @@
 //  ┌──────────────────────────────────────────────────────────────────┐
 //  │                     kurono os kernel                             │
 //  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐│
-//  │  │  kvfs    │  │ graphics │  │  supr    │  │  window manager  ││
+//  │  │  kvfs    │  │ graphics │  │  ken    │  │  window manager  ││
 //  │  │(shared)  │  │  (host)  │  │(shared)  │  │   (host)         ││
 //  │  └────┬─────┘  └──────────┘  └────┬─────┘  └──────────────────┘│
 //  │       │                            │                             │
@@ -25,7 +25,7 @@
 //  └──────────────────────────────────────────────────────────────────┘
 //
 //  key design principles:
-//  1. same users: supr users === linux /etc/passwd entries
+//  1. same users: ken users === linux /etc/passwd entries
 //  2. same files: kvfs and ext4 share /home, /tmp, /var
 //  3. independent: linux can boot standalone or inside kurono
 //  4. dual boot:  grub chainloads either kurono kernel or linux kernel
@@ -91,7 +91,7 @@ struct KLSPackage {
 struct KLSConfig {
     bool share_home;       // /home shared between kurono and linux
     bool share_tmp;        // /tmp shared
-    bool share_users;      // supr users synced to /etc/passwd
+    bool share_users;      // ken users synced to /etc/passwd
     bool auto_mount_ext4;  // auto-mount linux partition
     bool enable_x11;       // x11 forwarding to kurono wm (future)
 
@@ -132,8 +132,8 @@ public:
     static void SyncFilesystems();
 
     // user synchronization
-    static void SyncUsersToLinux();     // supr → /etc/passwd,shadow
-    static void SyncUsersFromLinux();   // /etc/passwd → supr
+    static void SyncUsersToLinux();     // ken → /etc/passwd,shadow
+    static void SyncUsersFromLinux();   // /etc/passwd → ken
     static void SyncSingleUser(const char* username);
 
     // linux rootfs management

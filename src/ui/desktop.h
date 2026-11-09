@@ -197,6 +197,8 @@ public:
     static void SetWallpaper(unsigned int color);
     static void SetWallpaperImage(const MediaDecoder::Image& img);
     static bool ApplyBuiltinWallpaper(int idx);   // 0 = primary, 1 = secondary embedded png (satoru)
+    // the embedded wallpaper pixels (rgba bytes), for previews such as settings thumbnails. (satoru)
+    static const uint8_t* BuiltinWallpaperRGBA(int idx, int* w, int* h);
 
     // true while any desktop-icon hover-pop is still easing (~160ms). The
     // damage-gated GUI loop renders continuously while this holds so the
@@ -285,6 +287,10 @@ public:
 class DesktopEnvironment {
 public:
     static void Init(int screen_w, int screen_h);
+    // soft relayout for a ui scale / output change: unlike Init it keeps every
+    // window open. old_x/old_y (per output slot, may be null) + swap_a/swap_b let
+    // windows follow their screen across an arrangement change. (satoru)
+    static void Relayout(int screen_w, int screen_h, const int* old_x, const int* old_y, int swap_a, int swap_b);
     static void Render();
     static void HandleInput(int mx, int my, bool mouse_down, bool clicked, char key);
     static void Update();
@@ -292,6 +298,7 @@ public:
 
     // app launchers
     static void LaunchTerminal();
+    static void LaunchAlpine();      // the alpine linux vm terminal (satoru)
     static void LaunchFileBrowser();
     static void LaunchCalculator();
     static void LaunchTextEditor();

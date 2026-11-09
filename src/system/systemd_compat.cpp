@@ -13,7 +13,7 @@
 #include "kpaths.h"
 #include "../fs/kvfs.h"
 #include "../drivers/serial.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
 #include "../shell/shell.h"
 
 namespace SystemdCompat {
@@ -142,12 +142,12 @@ void resolve_kinit_name(const char* unit, char* out, int mx) {
 
 // ── the current login user (for loginctl) (satoru) ───────────────────────────
 const char* current_user() {
-    int sid = SUPR::GetCurrentSession();
+    int sid = KEN::GetCurrentSession();
     if (sid >= 0) {
-        SUPRSession* sess = SUPR::GetSession(sid);
+        KENSession* sess = KEN::GetSession(sid);
         if (sess && sess->active) {
-            SUPRUser* users = SUPR::GetUsers();
-            int n = SUPR::GetUserCount();
+            KENUser* users = KEN::GetUsers();
+            int n = KEN::GetUserCount();
             if (users && sess->user_index >= 0 && sess->user_index < n)
                 return users[sess->user_index].username;
         }
@@ -763,14 +763,14 @@ int CmdLoginctl(void* sh, int argc, const char** argv, char* out, int mx) {
     const char* action = (argc >= 2) ? argv[1] : "list-sessions";
 
     if (sc_eq(action, "list-sessions") || sc_eq(action, "list")) {
-        // enumerate the SUPR security engine's live sessions instead of a fixed
+        // enumerate the KEN security engine's live sessions instead of a fixed
         // row: each active session's real (uid, user, seat, tty). (satoru)
         p = sc_cat(out, p, mx, "SESSION  UID USER   SEAT  TTY\n");
-        SUPRUser* users = SUPR::GetUsers();
-        int un = SUPR::GetUserCount();
+        KENUser* users = KEN::GetUsers();
+        int un = KEN::GetUserCount();
         int count = 0;
-        for (int i = 0; i < SUPR_MAX_SESSIONS; i++) {
-            SUPRSession* s = SUPR::GetSession(i);
+        for (int i = 0; i < KEN_MAX_SESSIONS; i++) {
+            KENSession* s = KEN::GetSession(i);
             if (!s || !s->active) continue;
             const char* uname = user; uint32_t uid = 1000;
             if (users && s->user_index >= 0 && s->user_index < un) {
@@ -790,7 +790,7 @@ int CmdLoginctl(void* sh, int argc, const char** argv, char* out, int mx) {
             count++;
         }
         if (count == 0) {
-            // no SUPR session (e.g. before login / bare autologin): show the
+            // no KEN session (e.g. before login / bare autologin): show the
             // effective default so a probe still gets a valid answer. (satoru)
             p = sc_cat(out, p, mx, "      1 1000 ");
             p = sc_cat(out, p, mx, user);
@@ -807,14 +807,14 @@ int CmdLoginctl(void* sh, int argc, const char** argv, char* out, int mx) {
         return sc_cat(out, 0, mx, "SEAT\nseat0\n\n1 seats listed.\n");
     }
     if (sc_eq(action, "list-users")) {
-        // one row per distinct uid across the live SUPR sessions. (satoru)
+        // one row per distinct uid across the live KEN sessions. (satoru)
         p = sc_cat(out, p, mx, "  UID USER\n");
-        SUPRUser* users = SUPR::GetUsers();
-        int un = SUPR::GetUserCount();
-        uint32_t seen_uid[SUPR_MAX_SESSIONS]; int nseen = 0;
+        KENUser* users = KEN::GetUsers();
+        int un = KEN::GetUserCount();
+        uint32_t seen_uid[KEN_MAX_SESSIONS]; int nseen = 0;
         int count = 0;
-        for (int i = 0; i < SUPR_MAX_SESSIONS; i++) {
-            SUPRSession* s = SUPR::GetSession(i);
+        for (int i = 0; i < KEN_MAX_SESSIONS; i++) {
+            KENSession* s = KEN::GetSession(i);
             if (!s || !s->active) continue;
             const char* uname = user; uint32_t uid = 1000;
             if (users && s->user_index >= 0 && s->user_index < un) {
@@ -824,7 +824,7 @@ int CmdLoginctl(void* sh, int argc, const char** argv, char* out, int mx) {
             bool dup = false;
             for (int k = 0; k < nseen; k++) if (seen_uid[k] == uid) { dup = true; break; }
             if (dup) continue;
-            if (nseen < SUPR_MAX_SESSIONS) seen_uid[nseen++] = uid;
+            if (nseen < KEN_MAX_SESSIONS) seen_uid[nseen++] = uid;
             p = sc_cat_u(out, p, mx, uid);
             p = sc_cat(out, p, mx, " ");
             p = sc_cat(out, p, mx, uname);

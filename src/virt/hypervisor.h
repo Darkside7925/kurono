@@ -46,6 +46,7 @@ struct VMConfig {
     bool     enable_serial;     // enable virtual com1
     bool     enable_disk;       // enable virtual ide disk
     bool     enable_apic;       // enable virtual apic
+    bool     enable_gpu;        // virtio-gpu framebuffer window (satoru)
     uint32_t timer_tick_us;     // virtual timer tick interval (microseconds)
     const char* cmdline;        // kernel command line
 
@@ -57,10 +58,27 @@ struct VMConfig {
         enable_disk    = true;
         enable_apic    = true;
         timer_tick_us  = 1000; // 1 ms
+        enable_gpu     = true; // (satoru)
         cmdline        = "console=ttyS0 earlyprintk=serial,ttyS0,115200 "
                          "root=/dev/sda rw init=/bin/sh nokaslr noapic "
                          "nosmp noacpi";
     }
+};
+
+// a linux guest for PrepareLinuxGuest (satoru)
+struct LinuxGuestSpec {
+    const char*    name;            // "alpine"
+    const uint8_t* kernel;          // bzimage
+    uint32_t       kernel_size;
+    const uint8_t* initrd;
+    uint32_t       initrd_size;
+    const char*    cmdline;
+    uint32_t       ram_mb;
+    uint64_t       disk_lba;        // virtio-blk backing (nvme extent), 0 bytes = none
+    uint64_t       disk_bytes;
+    const char*    disk_id;
+    bool           net;             // virtio-net + nat
+    bool           gpu;             // virtio-gpu window
 };
 
 struct VMStats {
@@ -116,8 +134,30 @@ public:
     // linuxdriverframework.
     static int  ExtractAlpineDrivers();
 
-    // run the alpine vm for n more exits (incremental execution).
-    // returns the vm state after running.
+    // ---- background vm host support (see vm_host.cpp) (satoru)
+    // create a linux vm from spec (kernel, initramfs, cmdline, ram, virtio disk,
+    // console and net) and set up its first entry; does not run it. must be
+    // called on the thread that will run the vm. (satoru)
+    static bool PrepareLinuxGuest(const struct LinuxGuestSpec& spec);
+    // the debian guest spec (DEBKERN.BIN / DEBINIT.BIN / DEBIAN.IMG) (satoru)
+    static bool DebianPrepare();
+    // run the guest for about budget_us of real time. time passes inside the
+    // guest as it does outside (devices tick by elapsed host time); an idle
+    // (hlt, nothing pending) guest returns early with *idle set so the host
+    // thread can sleep. a guest that halts with interrupts off has powered
+    // off: the state becomes VM_STATE_HALTED. (satoru)
+    static VMState RunSlice(uint32_t budget_us, bool* idle);
+    // hlt exit hook
+    static void NoteHalt() { guest_halted = true; }
+    // reboot request from the guest (keyboard controller / port 0xcf9) (satoru)
+    static void NoteRebootRequest() { reboot_requested = true; }
+    // the background vm host owns the vm: legacy synchronous entry points
+    // (BootAlpine*, AlpineExec, DebianExec, the vm shell subcommands ...) and
+    // any other thread must keep their hands off it. (satoru)
+    static void SetOwner(void* proc);
+    static bool ForeignCaller();
+    static bool IsOwned() { return owner_proc != nullptr; }
+    static uint64_t GuestRIP();     // owner thread only (satoru)
     static VMState RunAlpineCycles(uint32_t max_exits);
     static VMState RunDebianCycles(uint32_t max_exits);
 
@@ -203,6 +243,9 @@ private:
 
     static VMStats   stats;
 
+    static bool      guest_halted;
+    static bool      reboot_requested;
+    static void*     owner_proc;
     static bool      alpine_booted;
     static char      alpine_boot_log[8192];
     static int       alpine_boot_log_len;

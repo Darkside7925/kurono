@@ -19,13 +19,20 @@ What you actually need:
 - `src/hal` interrupts, reboot, the low-level CPU and PIC surface
 - `src/drivers` hardware
 - `src/ui` desktop shell, window system, in-kernel Wayland compositor
-- `src/apps` the built-in programs
+- `src/apps` the built-in programs (many also build as ring-3 kui programs)
 - `src/shell` command parsing and routing
 - `src/fs` the virtual filesystem model
 - `src/net` the TCP/IP stack
 - `src/linux` the Linux personality
 - `src/virt` hypervisor and virtual machines
-- `src/system` glue: input manager, installer logic, runtime logging
+- `src/system` glue: input manager, installer logic, runtime logging, clipboard, the
+  settings service
+- `src/kui` the app toolkit (kui) and the launcher for ring-3 apps
+- `src/security` ken (privilege engine), KSA (hypervisor-backed approval prompt) and the
+  admin gate
+- `src/proc` scheduler and SMP
+- `src/packages` the package manager
+- `src/userprogs` small ring-3 test programs and embedded prebuilt tools
 
 ## Files people actually live in
 

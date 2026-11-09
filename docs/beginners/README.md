@@ -1,27 +1,31 @@
 # Beginners
 
-So you want to understand this thing without drowning in hardware details on day
-one.
+So you want to understand this thing, or just try it, without drowning in hardware
+details on day one. Good. Here is the order I'd go in.
 
 ## Read in this order
 
-1. `FIRST_STEPS.md`
-2. `PROJECT_TOUR.md`
-3. `BUILD_AND_RUN.md`
+1. `what-is-kurono.md` what it is, what works, what doesn't
+2. `try-in-a-vm.md` run it in QEMU (zero risk to your machine)
+3. `boot-on-hardware.md` only after the VM works, and only if you want to
+4. `faq.md` quick answers
+5. `FIRST_STEPS.md` and `PROJECT_TOUR.md` if you want to read the source
+6. `BUILD_AND_RUN.md` building it yourself
 
-## What this is
+## Short version
 
-A bare-metal x86_64 OS with a desktop, built-in apps, a mixed shell (Kurono, Linux,
-Windows), a Linux-compatible syscall layer, a VM stack, an installer, and a lot of
-drivers.
+Kurono is a bare-metal x86_64 OS with its own desktop, its own apps, a shell, a lot of
+drivers, a Linux-compatible syscall layer (it runs unmodified Firefox and BusyBox), and a
+small hypervisor that runs Alpine Linux. It boots on a real laptop, not just in an
+emulator.
 
-Sounds huge. It isn't, once you cut it into routes:
+It sounds huge. It gets a lot less scary once you cut it into routes:
 
 1. how it boots
 2. how the desktop shows up
 3. how the shell is wired
-4. which folders matter first
-5. how to build and test it without wrecking your machine
+4. how Linux programs run on top
+5. how apps are built (the kui toolkit)
 
 ## Four files that explain most of it
 
@@ -29,4 +33,4 @@ Sounds huge. It isn't, once you cut it into routes:
 - `src/shell/shell.cpp` for the command story
 - `src/ui/desktop.cpp` and `src/ui/window_manager.cpp` for the UI story
 
-Get those four and the rest of the tree stops looking random.
+Get those and the rest of the tree stops looking random.

@@ -1,7 +1,14 @@
 #pragma once
 //  kurono os - task manager application (professional)
 
+#if !defined(KUI_BACKEND_WAYLAND)
 #include "../kernel/types.h"
+#else
+#include <stdint.h>
+#include <stddef.h>
+#endif
+namespace kui { class Window; class Canvas; }   // src/kui/kui.h (satoru)
+class TMApp;   // the toolkit handler of the window, defined in task_manager.cpp (satoru)
 
 #define TM_MAX_PROCS 64
 #define TM_MAX_WINDOWS_ROWS 32
@@ -25,13 +32,15 @@ enum TMSortCol {
 enum TMProcessSource {
     TM_PROC_SCHED = 0,
     TM_PROC_IDLE  = 1,
+    TM_PROC_SYNTH = 2,   // kurono.taskmem=1 rows with no task of their own: a built-in app, kernel (shared). never killable (satoru)
 };
 
 struct TMProcess {
     int  pid;
     char name[32];
     int  cpu_pct;     // 0-100
-    int  mem_kb;
+    int  mem_kb;      // resident set: user = present pages from the page tables, kernel task = kernel stack (satoru)
+    int  shared_kb;   // part of mem_kb that is MAP_SHARED / memfd memory (satoru)
     int  threads;
     char state[12];   // running, sleeping, stopped, zombie
     char user[16];
@@ -69,11 +78,16 @@ struct TMService {
 
 class TaskManagerApp {
 public:
+    // kurono.tmkill=1 headless test: ends the first user process named
+    // "claude" through the same path as the End task button, then reports
+    // whether it left the list and whether the shell runs a new command. (satoru)
+    static void DebugKillTick();
     static void Init();
     static int  Open();
 
-    static void Render(void* win, int x, int y, int w, int h);
-    static bool Input(void* win, int mx, int my, bool clicked, char key);
+    // window callbacks, called by TMApp (the kui handler). Input's key is ascii or a kui::Key, -4 = right click (satoru)
+    static void Render(kui::Window& win, kui::Canvas& c);
+    static bool Input(kui::Window& win, int mx, int my, bool clicked, int key);
     // scroll the active list by `delta` wheel notches (positive = down). (satoru)
     static void Scroll(int delta);
 
@@ -86,7 +100,8 @@ public:
     static bool IsOpen();
 
 private:
-    static int win_id;        // wm window id, -1 when closed
+    friend class TMApp;
+    static int win_id;        // 1 while a window is open, -1 when closed (the toolkit hides the wm window id) (satoru)
     static TMTab current_tab;
     static TMProcess procs[TM_MAX_PROCS];
     static int proc_count;

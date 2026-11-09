@@ -68,7 +68,7 @@ u64 lx_uptime_ns(void)
 
 // keep the jiffies DATA symbol (lx_data.c) tracking real time. Anything that
 // reads jiffies for a timeout comparison depends on it advancing. (satoru)
-static void lx_jiffies_update(void)
+void lx_jiffies_update(void)
 {
     jiffies = INITIAL_JIFFIES + (unsigned long)(lx_uptime_ns() / (1000000000ull / HZ));
 }
@@ -105,17 +105,29 @@ void __ndelay(unsigned long nsecs)
 // real nanosleep so the container yields the cpu instead of spinning. measured
 // ring-3 poll/nanosleep wake latency on Kurono is sub-millisecond at p99, so
 // these are accurate enough for device bring-up. (satoru)
+//
+// Kurono turns a sub-millisecond nanosleep into a plain yield and truncates
+// longer ones to whole milliseconds, so a sleep can return EARLY. A driver that
+// asked for usleep_range(50, 100) after poking a register must not get 0 us,
+// so: sleep the whole milliseconds, then yield-spin out the remainder against
+// the clock. Never shorter than asked. (satoru)
 static void lx_nanosleep_ns(u64 ns)
 {
-    struct lx_timespec req;
-    long ret;
-    req.tv_sec  = (long)(ns / 1000000000ull);
-    req.tv_nsec = (long)(ns % 1000000000ull);
-    __asm__ __volatile__("syscall"
-                         : "=a"(ret)
-                         : "a"(35L) /* SYS_nanosleep */, "D"(&req), "S"(0L)
-                         : "rcx", "r11", "memory");
-    (void)ret;
+    u64 end = lx_uptime_ns() + ns;
+    if (ns >= 1000000ull) {
+        struct lx_timespec req;
+        long ret;
+        u64 ms_part = ns - (ns % 1000000ull);
+        req.tv_sec  = (long)(ms_part / 1000000000ull);
+        req.tv_nsec = (long)(ms_part % 1000000000ull);
+        __asm__ __volatile__("syscall"
+                             : "=a"(ret)
+                             : "a"(35L) /* SYS_nanosleep */, "D"(&req), "S"(0L)
+                             : "rcx", "r11", "memory");
+        (void)ret;
+    }
+    while (lx_uptime_ns() < end)
+        lx_os_yield();
 }
 
 void msleep(unsigned int msecs)
@@ -217,6 +229,23 @@ int get_device_system_crosststamp(int (*get_time_fn)(ktime_t *, struct system_co
 {
     (void)get_time_fn; (void)ctx; (void)history; (void)xtstamp;
     return -ENODEV;
+}
+
+// ── jiffies conversions (kernel/time/time.c) ────────────────────────────────
+// HZ is 1000 in the pinned config, so these are exact. (satoru)
+unsigned int jiffies_to_usecs(const unsigned long j)
+{
+    return (unsigned int)(j * (USEC_PER_SEC / HZ));
+}
+
+unsigned long __usecs_to_jiffies(const unsigned int u)
+{
+    return (u + (USEC_PER_SEC / HZ) - 1) / (USEC_PER_SEC / HZ);
+}
+
+unsigned long __msecs_to_jiffies(const unsigned int m)
+{
+    return (unsigned long)m * HZ / MSEC_PER_SEC;
 }
 
 // end (satoru)

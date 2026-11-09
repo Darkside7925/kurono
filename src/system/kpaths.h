@@ -73,7 +73,7 @@
 #define KP_LOG_SYSTEM    "/kurono/var/log/system.log"      // general system events (satoru)
 #define KP_LOG_SERIAL    "/kurono/var/log/serial.log"      // mirror of the serial console (satoru)
 #define KP_LOG_NETWORK   "/kurono/var/log/network.log"     // connect/disconnect/errors (satoru)
-#define KP_LOG_SECURITY  "/kurono/var/log/security.log"    // supr escalations, ksa prompts (satoru)
+#define KP_LOG_SECURITY  "/kurono/var/log/security.log"    // ken escalations, ksa prompts (satoru)
 #define KP_LOG_CRASH_DIR "/kurono/var/log/crash"           // kernel panics + minidumps (satoru)
 #define KP_LOG_APPS_DIR  "/kurono/var/log/apps"            // per-app logs (satoru)
 #define KP_LOG_PROC_DIR  "/kurono/var/log/processes"       // per-kernel-process logs (satoru)

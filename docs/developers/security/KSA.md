@@ -4,8 +4,8 @@
 UAC to but backed by the hypervisor so that malware with ring-0 access in the
 main OS still cannot touch the prompt, read its memory, or auto-approve it.
 
-KSA is an *auth factor* that plugs into the existing SUPR privilege engine (see
-`SUPR.md`). When a privilege escalation is requested, SUPR runs an **escalation
+KSA is an *auth factor* that plugs into the existing KEN privilege engine (see
+`KEN.md`). When a privilege escalation is requested, KEN runs an **escalation
 gate** that may require a password, a KSA prompt, or both, according to the
 active auth policy.
 
@@ -50,7 +50,7 @@ authorization decision *outside* that compromised domain:
    sub-function `KSA_SUB_GET_VERDICT`. The handler in `src/virt/vmexit.cpp`
    returns a *copy* of the latched verdict (completed / approved / has-hash), 
    never a pointer, and the credential hash itself is consumed only in-kernel by
-   SUPR, never exposed over the channel.
+   KEN, never exposed over the channel.
 6. **Teardown.** The region is wiped (credential residue destroyed),
    re-revealed, and freed.
 
@@ -73,24 +73,24 @@ inner `VMLAUNCH` would also put a CPU privilege boundary between the main OS and
 the prompt's *execution*, not just its memory. On bare metal with nested VMX (or
 on the host hypervisor), KSA takes the `nested-vm` path automatically.
 
-## Auth policy (`supr policy`)
+## Auth policy (`ken policy`)
 
-The policy tracks two independent factors (`SUPRAuthPolicy`): `passwd_enabled`
+The policy tracks two independent factors (`KENAuthPolicy`): `passwd_enabled`
 and `kvault_enabled`. The effective mode is derived from them.
 
 | Command | Effect |
 | --- | --- |
-| `supr policy` | show current policy + KSA status |
-| `supr policy --auth=passwd` | password prompt only (**default**) |
-| `supr policy --auth=kvault` | KSA prompt only |
-| `supr policy --auth=both` | require both (max security) |
-| `supr policy kvault enable` / `... passwd enable` | turn a factor on |
-| `supr passwd` | change password, **no KSA involved**, normal flow |
-| `supr selftest` | run the KSA isolation self-test (logs to serial) |
+| `ken policy` | show current policy + KSA status |
+| `ken policy --auth=passwd` | password prompt only (**default**) |
+| `ken policy --auth=kvault` | KSA prompt only |
+| `ken policy --auth=both` | require both (max security) |
+| `ken policy kvault enable` / `... passwd enable` | turn a factor on |
+| `ken passwd` | change password, **no KSA involved**, normal flow |
+| `ken selftest` | run the KSA isolation self-test (logs to serial) |
 
 Disabling KSA:
 ```
-supr policy kvault disable --force --acknowledge-risk
+ken policy kvault disable --force --acknowledge-risk
 ```
 - requires `--force --acknowledge-risk`;
 - refuses if password auth is also off, unless `--sovereign-override`;
@@ -98,7 +98,7 @@ supr policy kvault disable --force --acknowledge-risk
 
 Disabling password:
 ```
-supr policy --auth=kvault --disable-passwd --acknowledge-risk
+ken policy --auth=kvault --disable-passwd --acknowledge-risk
 ```
 - requires `--acknowledge-risk`;
 - requires KSA to be active first (refuses if KSA is off, unless
@@ -108,7 +108,7 @@ supr policy --auth=kvault --disable-passwd --acknowledge-risk
 
 - **Neither factor can be silently fully disabled.** Landing in "both off"
   always requires `--sovereign-override`.
-- **`--sovereign-override` is gated to the Sovereign role** (`SUPR_SOVEREIGN`,
+- **`--sovereign-override` is gated to the Sovereign role** (`KEN_SOVEREIGN`,
   the root-equivalent owner added for this) and is itself audited.
 - If both factors are somehow off, **every** escalation calls
   `RunEscalationGate` which logs a risk warning (`ACT_RISK_WARNING` +
@@ -128,8 +128,8 @@ supr policy --auth=kvault --disable-passwd --acknowledge-risk
 
 ## Escalation gate
 
-`SUPR::Escalate()` (su/sudo and the GUI funnel here) calls
-`SUPR::RunEscalationGate(session, password, reason)`, the single chokepoint:
+`KEN::Escalate()` (ken/sudo and the GUI funnel here) calls
+`KEN::RunEscalationGate(session, password, reason)`, the single chokepoint:
 
 1. if both factors off → log risk warning, proceed;
 2. else require the password factor and/or the KSA factor per policy;
@@ -139,7 +139,7 @@ supr policy --auth=kvault --disable-passwd --acknowledge-risk
 
 ## Verification (runtime self-test)
 
-Boot with `kurono.ksa.test=1` (or run `supr selftest`). The self-test spawns the
+Boot with `kurono.ksa.test=1` (or run `ken selftest`). The self-test spawns the
 isolated context and asserts, logging each result to serial:
 
 ```
@@ -154,7 +154,7 @@ KSA-SELFTEST: OVERALL PASS
 ```
 
 The policy/loophole state machine is also exercised
-(`SUPR::PolicySelfTest()`), covering: non-sovereign override refused;
+(`KEN::PolicySelfTest()`), covering: non-sovereign override refused;
 disable-passwd refused while KSA off; disable-kvault refused without
 force/ack; disable-kvault refused while passwd off; sovereign override; both-off
 risk warning; `auth=both` gated on KSA availability; password verification.
@@ -226,10 +226,10 @@ the prompt closes.
 
 ## Files
 - `src/security/ksa.{cpp,h}`, KSA module (spawn / isolate / prompt / channel / self-test / `PromptDemo`)
-- `src/security/supr.{cpp,h}`, auth policy, escalation gate, Sovereign role, audit actions
+- `src/security/ken.{cpp,h}`, auth policy, escalation gate, Sovereign role, audit actions
 - `src/kernel/vmm.{cpp,h}`, `IsolateFrames` / `RevealFrames` isolation primitives
 - `src/virt/vmexit.cpp`, VMCALL `0x4B` read-only result channel
 - `src/virt/ept.cpp`, `hypervisor.cpp`, EPT root + hardware-virt detection
-- `src/shell/shell.cpp`, the `supr` command
+- `src/shell/shell.cpp`, the `ken` command
 - `src/kernel/kurono_kernel.cpp`, `kurono.ksa.test` self-test + `kurono.ksa.prompt` interactive demo gates
 - `src/proc/kernel_processes.cpp`, GUI process fires the armed `KSA::PromptDemo()` once the desktop is up

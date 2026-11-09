@@ -362,6 +362,58 @@ bool IntelGPU::IsPowerWellEnabled() {
     return (ctl & 0x02) != 0;  // bit 1 = power well state
 }
 
+// ── panel backlight (best effort) ─────────────────────────────────────────
+// two register layouts exist on the chips this driver knows: the north
+// display pair (BLC_PWM_CTL2/CTL, used from skylake through most soc parts)
+// and the pch pair (BLC_PWM_PCH_CTL1/CTL2). both carry frequency in the high
+// half of the duty register and duty in the low half, with the enable bit in
+// the companion register. we probe for one that is already enabled and
+// nonzero, then only rewrite the duty field - never the frequency or the
+// enable/polarity bits - so a wrong guess cannot disable a live panel. (satoru)
+namespace {
+struct BlPair { uint32_t duty_reg, enable_reg; };
+static const BlPair kBlPairs[] = {
+    { 0x48254, 0x48250 },   // north display (skl..adl)
+    { 0xC8254, 0xC8250 },   // pch display
+};
+static int  g_bl_pair = -1;
+static int  g_bl_pct  = -1;
+}
+
+bool IntelGPU::SetBacklightPercent(int pct) {
+    if (!gpu_info.detected || !gpu_info.bar0) return false;
+    if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+    if (g_bl_pair < 0) {
+        for (int i = 0; i < (int)(sizeof(kBlPairs) / sizeof(kBlPairs[0])); i++) {
+            uint32_t duty = ReadReg(kBlPairs[i].duty_reg);
+            uint32_t en   = ReadReg(kBlPairs[i].enable_reg);
+            uint32_t freq = (duty >> 16) & 0xFFFF;
+            if (freq != 0 && (en & 0x80000000u)) { g_bl_pair = i; break; }
+        }
+    }
+    if (g_bl_pair < 0) return false;
+    const BlPair& p = kBlPairs[g_bl_pair];
+    uint32_t old = ReadReg(p.duty_reg);
+    uint32_t freq = (old >> 16) & 0xFFFF;
+    if (freq == 0) return false;
+    uint32_t value = (uint32_t)(((uint64_t)freq * (uint32_t)pct) / 100u);
+    WriteReg(p.duty_reg, (freq << 16) | (value & 0xFFFF));
+    g_bl_pct = pct;
+    return true;
+}
+
+int IntelGPU::GetBacklightPercent() {
+    if (!gpu_info.detected || !gpu_info.bar0 || g_bl_pair < 0) return -1;
+    const BlPair& p = kBlPairs[g_bl_pair];
+    uint32_t v = ReadReg(p.duty_reg);
+    uint32_t freq = (v >> 16) & 0xFFFF;
+    uint32_t duty = v & 0xFFFF;
+    if (!freq) return -1;
+    int pct = (int)(((uint64_t)duty * 100u) / freq);
+    if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+    return pct;
+}
+
 bool IntelGPU::HasHardwareAccel() {
     return gpu_info.detected && gpu_info.bar0 != 0 && gpu_info.has_2d_accel;
 }

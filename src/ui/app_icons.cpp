@@ -318,6 +318,7 @@ int IdForName(const char* n){
     if (!n || !n[0]) return GENERIC;
     // terminal vs task manager vs text editor all start with 'T'. (satoru)
     if (pfx(n,"Ter")) return TERMINAL;
+    if (pfx(n,"Alp")) return TERMINAL;     // the alpine vm terminal (satoru)
     if (pfx(n,"Tas")) return TASKS;
     if (pfx(n,"Tex")) return EDITOR;
     // "Control" (control panel/center window title) maps to settings. (satoru)

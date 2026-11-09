@@ -22,28 +22,31 @@ struct TermLine {
     int len;
 };
 
+struct TermInst;   // one per Terminal window, defined in terminal.cpp (satoru)
+
 class TerminalApp {
 public:
+    /** global setup (theme, grid metrics); per-window state is made by Open(). */
     static void Init();
-    static int  Open();
+    // kurono.termsh=1: every window starts busybox sh on its pty and reaches kernel built-ins through /dev/kexec (satoru)
+    static void SetShellMode(bool on);
+    static int  Open();          // ring 3 when kurono.r3apps asks for it, else the kernel build (satoru)
+    static int  OpenKernel();    // the in-kernel build only (scripts, fallback) (satoru)
     static void Tick();
+    // sched=2: body of terminal worker kernel proc `slot` (0..3): runs one window's
+    // queued command, so windows run commands concurrently. (satoru)
+    static void WorkerTick(int slot);
     static bool IsBusy();
-    /** Programmatic command injection (e.g. GUI autorun). */
+    /** Programmatic command injection (e.g. GUI autorun): targets the window opened last. */
     static void EnqueueCommand(const char* cmd);
 
     // window callbacks
     static void Render(void* win, int cx, int cy, int cw, int ch);
     static bool Input(void* win, int mx, int my, bool clicked, char key);
 
-    // terminal writing api
-    static void Write(const char* text);
-    /** Raw bytes for cooperative shell streaming (no ANSI parse). */
+    /** Raw bytes for cooperative shell streaming (no ANSI parse). Goes to the
+        window whose command the shell thread is running. */
     static void EmitShellChunk(const char* data, int len);
-    static void WriteChar(char c);
-    static void WriteLn(const char* text);
-    static void Clear();
-    static void SetColor(unsigned int fg, unsigned int bg);
-    static void SetBold(bool b);
 
     // pty mode (satoru): while a ring-3 program (claude, busybox sh) runs from a shell
     // command, the terminal is a vt100 screen wired to a kpty session. PtyBegin is called
@@ -55,57 +58,25 @@ public:
     static void PtyKeyEvent(int key, bool shift, bool ctrl, bool alt);
     static void PtyPoll();
     static void PtyScroll(int delta);
-
-    // scroll state (public for wm scroll event forwarding)
-    static int buf_count;
-    static int scroll_offset;
+    static void PastePrimary();   // middle click: primary selection into the focused terminal (satoru)
 
 private:
-    static TermLine buffer[TERM_SCROLL_BK];
-    static int cursor_row;
-    static int cursor_col;
-    static unsigned int cur_fg;
-    static unsigned int cur_bg;
-    static bool cur_bold;
-
-    // input line
-    static char input_buf[TERM_INPUT_MAX];
-    static int  input_len;
-    static int  input_cursor;
-
-    // command history
-    static char history[TERM_HIST_MAX][TERM_INPUT_MAX];
-    static int  hist_count;
-    static int  hist_pos;
-    static char hist_saved[TERM_INPUT_MAX]; // saves in-progress input during history nav
-
-    // tab completion
-    static char tab_matches[TERM_TAB_MAX][TERM_INPUT_MAX];
-    static int  tab_match_count;
-    static int  tab_match_idx;
-    static char tab_prefix[TERM_INPUT_MAX];
-
-    // shell integration
-    static bool shell_ready;
-    static char prompt[128];
-    static bool command_pending;
-    static bool command_running;
-    static char pending_cmd[TERM_INPUT_MAX];
-
-    // aesthetic state
-    static unsigned int blink_timer;       // milliseconds for cursor blink
-    static unsigned int last_keypress_ms;  // for cursor blink pause-on-type
-    static int          smooth_scroll_q16; // reserved for future sub-line easing
-    static int          target_scroll_offset; // smoothed-toward integer offset
-
-    static void ExecuteInput();
-    static void HistoryUp();
-    static void HistoryDown();
-    static void NewLine();
-    static void ScrollToBottom();
+    // per-window state lives in a TermInst (see terminal.cpp); the private helpers
+    // below take the instance they act on. (satoru)
+    static void InitInst(TermInst* S);
+    static void ExecuteInput(TermInst* S);
+    static void RunQueued(TermInst* S, int worker);   // sched=2 worker or the shell proc (satoru)
+    static void HistoryUp(TermInst* S);
+    static void HistoryDown(TermInst* S);
+    static void NewLine(TermInst* S);
+    static void ScrollToBottom(TermInst* S);
     static void RenderCell(int sx, int sy, TermCell* cell);
-    static void WritePrompt();
-    static void TabComplete();
-    static void HandleAnsiEscape(const char* seq, int len);
-    static int  WriteAnsiEscaped(const char* text, int start);
+    static void WritePrompt(TermInst* S);
+    static void TabComplete(TermInst* S);
+    static void Write(TermInst* S, const char* text);
+    static void WriteChar(TermInst* S, char c);
+    static void WriteLn(TermInst* S, const char* text);
+    static void Clear(TermInst* S);
+    static void SetColor(TermInst* S, unsigned int fg, unsigned int bg);
+    static void SetBold(TermInst* S, bool b);
 };

@@ -126,6 +126,8 @@ public:
     static void SetWriteWindow(uint64_t lba_lo, uint64_t lba_end);
     // optional second writable range (the kfs file next to the log file). (satoru)
     static void SetWriteWindow2(uint64_t lba_lo, uint64_t lba_end);
+    // third writable range: the running vm's disk image (ALPINE.IMG ...). (satoru)
+    static void SetWriteWindow3(uint64_t lba_lo, uint64_t lba_end);
     static bool GetWriteWindow(uint64_t* lba_lo, uint64_t* lba_end);
     static uint64_t GuardDenied();
     // true while any read/write is in flight (the boot-log hook backs off). (satoru)

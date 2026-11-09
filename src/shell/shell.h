@@ -55,6 +55,10 @@ public:
     static void ProcessLine(const char* line, char* output, int max_output);
     static int Execute(const char* cmdline, char* output, int max_output);
     static void PumpUI();
+    // modal variant: runs the same pump while a ksa prompt owns the screen,
+    // routing input to the prompt and drawing it over the desktop. used by the
+    // bsp syscall waiter, which cannot run the gui kernel process. (satoru)
+    static void PumpModalUI();
 
     // Incremental output (GUI responsiveness): sinks copy bytes from handlers into the terminal.
     static void SetOutputChunkCallback(ShellOutputChunkCallback fn, void* udata);
@@ -67,6 +71,12 @@ public:
     static void ClearCommandCancel();
     static void RequestCommandCancel();
     static bool IsCommandCancelRequested();
+    // sched=2 concurrent terminals: each terminal worker kernel proc gets its own
+    // cancel flag and incremental-output latch, so ctrl+c in one window and one
+    // window's streamed output never touch another window's command. the calls
+    // above act on the calling worker's context once it registered. (satoru)
+    static void RegisterWorkerContext();
+    static void RequestCommandCancelFor(void* worker_kproc);
 
     // firefox jit tier from the boot cmdline (kurono.ffjit=N): 0 = interpreter
     // only (default, the historical safe mode), 1 = blinterp, 2 = +baseline+

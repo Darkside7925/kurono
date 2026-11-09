@@ -23,24 +23,25 @@ long lx_broker_call(unsigned int op, unsigned long a0, unsigned long a1,
                     unsigned long a2, unsigned long a3)
 {
     long ret;
-    register unsigned long r10 __asm__("r10") = a3;
+    register unsigned long r10 __asm__("r10") = a2;
+    register unsigned long r8  __asm__("r8")  = a3;
     __asm__ __volatile__("syscall"
                          : "=a"(ret)
                          : "a"(LX_SYS_KLD_CALL),
                            "D"((unsigned long)op),
                            "S"(a0),
                            "d"(a1),
-                           "r"(r10)
+                           "r"(r10),
+                           "r"(r8)
                          : "rcx", "r11", "memory");
-    (void)a2;
     return ret;
 }
 
-// NOTE on the register mapping: the x86_64 syscall ABI passes args in
-// rdi, rsi, rdx, r10, r8, r9. Kurono's SYS_KLD_CALL case reads them as
-// (op, a0, a1, a2, a3) = (rdi, rsi, rdx, r10, r8), so the 4-arg ops used here
-// map to rdi/rsi/rdx/r10. A 5th argument would need r8 and is not used yet.
-// (satoru)
+// register mapping: the x86_64 syscall ABI passes rdi, rsi, rdx, r10, r8, r9
+// and Kurono's SYS_KLD_CALL case reads them as (op, a0, a1, a2, a3). THE FIRST
+// VERSION OF THIS WRAPPER put a3 in r10 and dropped a2 entirely, so every
+// 4-argument op (pci_write_config_*) sent the value as the width and garbage as
+// the value. reads worked, which is why it went unnoticed. (satoru)
 
 int lx_broker_available(void)
 {
@@ -73,6 +74,16 @@ long lx_broker_bar(unsigned int bdf, unsigned int idx)
 long lx_broker_enable(unsigned int bdf)
 {
     return lx_broker_call(LX_KLD_OP_PCI_ENABLE, bdf, 0, 0, 0);
+}
+
+long lx_broker_disable(unsigned int bdf)
+{
+    return lx_broker_call(LX_KLD_OP_PCI_DISABLE, bdf, 0, 0, 0);
+}
+
+long lx_broker_bar_size(unsigned int bdf, unsigned int idx)
+{
+    return lx_broker_call(LX_KLD_OP_PCI_BAR_SIZE, bdf, idx, 0, 0);
 }
 
 // end (satoru)

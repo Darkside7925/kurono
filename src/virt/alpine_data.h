@@ -8,6 +8,7 @@
 //  build: see the alpine_* rules in src/makefile.
 #pragma once
 #include <stdint.h>
+#include "../system/kasset.h"   // guest images load on demand (satoru)
 
 //
 // objcopy names them after the input filename with non-identifier chars
@@ -30,24 +31,22 @@ extern "C" {
 }
 
 static inline uint32_t alpine_kernel_size() {
-    return (uint32_t)((uintptr_t)_binary_vmlinuz_virt_end -
-                      (uintptr_t)_binary_vmlinuz_virt_start);
+    return KAsset::Size("ALPKERN BIN", _binary_vmlinuz_virt_start, _binary_vmlinuz_virt_end);   // (satoru)
 }
 
 static inline uint32_t alpine_initramfs_size() {
-    return (uint32_t)((uintptr_t)_binary_initramfs_virt_end -
-                      (uintptr_t)_binary_initramfs_virt_start);
+    return KAsset::Size("ALPINIT BIN", _binary_initramfs_virt_start, _binary_initramfs_virt_end);   // (satoru)
 }
 
 static inline const uint8_t* alpine_kernel_data() {
-    return _binary_vmlinuz_virt_start;
+    return KAsset::Data("ALPKERN BIN", _binary_vmlinuz_virt_start, _binary_vmlinuz_virt_end);   // (satoru)
 }
 
 static inline const uint8_t* alpine_initramfs_data() {
-    return _binary_initramfs_virt_start;
+    return KAsset::Data("ALPINIT BIN", _binary_initramfs_virt_start, _binary_initramfs_virt_end);   // (satoru)
 }
 
 static inline bool alpine_data_available() {
-    return _binary_vmlinuz_virt_start != nullptr &&
-           _binary_initramfs_virt_start != nullptr;
+    return KAsset::Has("ALPKERN BIN", _binary_vmlinuz_virt_start, _binary_vmlinuz_virt_end) &&
+           KAsset::Has("ALPINIT BIN", _binary_initramfs_virt_start, _binary_initramfs_virt_end);   // (satoru)
 }

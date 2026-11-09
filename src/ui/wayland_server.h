@@ -37,6 +37,7 @@
 // compositor binary.
 
 namespace WaylandServer {
+    void DumpProtocolTrace();   // kurono.wltrace=1 ring dump (satoru)
 
     static const int WL_MAX_CLIENTS  = 16;
     static const int WL_MAX_OBJECTS  = 256;
@@ -73,6 +74,15 @@ namespace WaylandServer {
         WL_SHM_POOL           = 20,
         WL_SUBSURFACE         = 21,
         WL_REGION             = 22,
+        XDG_POSITIONER        = 23,   // (satoru)
+        XDG_POPUP             = 24,   // (satoru)
+        WL_DATA_DEVICE        = 25,   // (satoru)
+        WL_DATA_SOURCE        = 26,   // (satoru)
+        WL_DATA_OFFER         = 27,   // (satoru)
+        ZWP_PRIMARY_MGR       = 28,   // (satoru)
+        ZWP_PRIMARY_DEVICE    = 29,   // (satoru)
+        ZWP_PRIMARY_SOURCE    = 30,   // (satoru)
+        ZWP_PRIMARY_OFFER     = 31,   // (satoru)
     };
 
     struct DamageRect {
@@ -101,6 +111,7 @@ namespace WaylandServer {
         // a kernel-visible mapping; nullptr means "not yet mappable". (satoru)
         const uint8_t* pool_base;
         uint32_t       pool_size;
+        uint32_t       pool_map_size;   // bytes really mapped at pool_base; resize never exceeds it (satoru)
         // for wl_buffer: geometry into its parent pool. (satoru)
         uint32_t buf_pool_id;
         uint32_t buf_offset;
@@ -110,6 +121,13 @@ namespace WaylandServer {
         // applied on the next commit, plus the attach hotspot offset and a
         // per-surface alpha (0..255, 255 = opaque). (satoru)
         uint32_t pending_buffer_id;
+        // set by wl_surface.attach, consumed by the next commit: only a commit
+        // that follows an attach reads a buffer. a commit without one (gecko
+        // commits subsurface state that way) used to re-read pending_buffer_id,
+        // which by then could name a destroyed buffer whose id libwayland had
+        // reused for ANOTHER surface's buffer: firefox's page surface turned
+        // into a copy of the menu panel on a black field. (satoru)
+        bool     attach_pending;
         int32_t  attach_x, attach_y;
         uint8_t  surf_alpha;
         bool     mapped;         // true once bridged to a wm window. (satoru)
@@ -149,6 +167,35 @@ namespace WaylandServer {
         // for WL_REGION objects: whether any wl_region.add arrived - an
         // empty region on set_input_region is the pass-through marker. (satoru)
         bool     region_has_rect;
+        // for wl_surface: the xdg_popup role. firefox menus (and gtk combo /
+        // dropdown lists) are xdg_popups; with no role support their content
+        // landed in a stray centred window. popup_obj = live xdg_popup id (0 =
+        // no popup role), popup_parent_sid = the parent wl_surface (toplevel or
+        // popup), popup_x/y/w/h = configured geometry relative to the parent's
+        // window geometry, popup_seq = stacking order. on the XDG_POPUP object
+        // itself popup_xs is its xdg_surface (the configure target). (satoru)
+        uint32_t popup_obj;
+        uint32_t popup_parent_sid;
+        int32_t  popup_x, popup_y, popup_w, popup_h;
+        uint32_t popup_xs;
+        uint32_t popup_seq;
+        bool     popup_grab;
+        // for XDG_POSITIONER objects: the placement rules from set_size,
+        // set_anchor_rect, set_anchor, set_gravity, set_constraint_adjustment
+        // and set_offset. (satoru)
+        int32_t  pos_w, pos_h;
+        int32_t  pos_ax, pos_ay, pos_aw, pos_ah;
+        int32_t  pos_ox, pos_oy;
+        uint32_t pos_anchor, pos_gravity, pos_cadj;
+        // for a toplevel wl_surface: xdg_toplevel.set_parent's parent surface (a
+        // dialog is placed over it), and the client's last committed window size,
+        // so a client that resizes itself resizes its wm window. (satoru)
+        uint32_t tl_parent_sid;
+        int32_t  tl_last_w, tl_last_h;
+        // last size this server configured (wm resize/maximize sends a new one),
+        // and when a titlebar close was last asked of the client (0 = never). (satoru)
+        int32_t  tl_cfg_w, tl_cfg_h;
+        uint32_t tl_close_ms;
     };
 
     struct Client {
@@ -188,6 +235,18 @@ namespace WaylandServer {
         // for this client, so we can emit leave before the next enter. (satoru)
         uint32_t pointer_focus_sid;
         uint32_t keyboard_focus_sid;
+        // data device resources (wl_data_device / zwp_primary_selection_device)
+        // and the selection offer object currently announced to each. (satoru)
+        static const int WL_MAX_DATA_DEV = 4;
+        uint32_t data_device_ids[WL_MAX_DATA_DEV];
+        int      data_device_count;
+        uint32_t primary_device_ids[WL_MAX_DATA_DEV];
+        int      primary_device_count;
+        uint32_t clip_offer_id;
+        uint32_t primary_offer_id;
+        // dense server-created id sequence for data offers (libwayland requires
+        // 0xff000000, 0xff000001, ... per client). (satoru)
+        uint32_t clip_server_id_next;
     };
 
     void Init();
@@ -228,16 +287,39 @@ namespace WaylandServer {
     void ForwardPointerAxis(int gx, int gy, int axis, int value);
     void ForwardKey(int key, bool pressed, uint32_t mods);
 
+    // a native app changed the system clipboard / primary selection: offer
+    // the new mime set to every wayland data device. called by the clipboard
+    // manager hook, never from inside its lock. (satoru)
+    void NotifySystemClipboardChanged(bool primary);
+
+    // resolve a selection offer announced to the client on compositor-side
+    // socket `sd` and return a heap copy of the stored payload. used by the
+    // alpine wayland bridge for a guest data_offer.receive. (satoru)
+    bool ClipboardGetForOffer(int sd, uint32_t offer_id, const char* mime,
+                              uint8_t** out, uint32_t* out_len);
+
     // true when the wm window id belongs to a bridged wayland surface - the
     // desktop input path uses this to route raw key edges to ForwardKey
     // instead of the kurono char pipeline. (satoru)
     bool IsWaylandWindow(int win_id);
+
+    // the wm focused a window (click, dock, alt-tab, a new window): if it is a
+    // bridged wayland window its client gets keyboard focus, and only it. (satoru)
+    void NotifyWmFocus(int win_id);
+
+    // the user closed a bridged wayland window (titlebar button, menu): ask the
+    // client with xdg_toplevel.close and keep the window until it goes. returns
+    // false (the wm closes it itself) for a native window, a surface with no
+    // toplevel role, or a second close within 5 s of the first (a hung client). (satoru)
+    bool RequestClose(int win_id);
 
     // drop every client whose socket peer is the given (killed) process:
     // closes its bridged wm windows and frees the client slot, so a task
     // manager kill visibly closes the app instead of leaving a frozen husk
     // on screen. returns the number of clients dropped. (satoru)
     int DropClientsOfPid(uint32_t pid);
+    // same for one connection, by the server-side socket sd (the vm bridge) (satoru)
+    int DropClientOfSd(int sd);
 
     // Linux evdev button codes for ForwardPointerButton(). (satoru)
     static const int WL_BTN_LEFT   = 0x110;

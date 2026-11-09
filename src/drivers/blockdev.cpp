@@ -6,6 +6,9 @@
 
 BlockDevice BlockDev::s_devs[BLOCKDEV_MAX] = {};
 int         BlockDev::s_count = 0;
+// statistics side table (BlockDevice layout is unchanged). (satoru)
+static uint64_t s_reads[BLOCKDEV_MAX], s_sectors_read[BLOCKDEV_MAX];
+static uint64_t s_writes[BLOCKDEV_MAX], s_sectors_written[BLOCKDEV_MAX];
 
 namespace {
 
@@ -65,7 +68,14 @@ int BlockDev::Register(const BlockDevice& dev) {
     SerialLogger::Log(" driver=");
     SerialLogger::Log(dev.driver);
     SerialLogger::Log(" sectors=");
-    SerialLogger::LogDec((int)dev.capacity_lba);
+    // capacity_lba is 64-bit; printing it through int() wrapped large disks to
+    // a negative count in the boot log. (satoru)
+    {
+        char capbuf[24];
+        int cp = 0;
+        bd_num(capbuf, &cp, sizeof(capbuf), dev.capacity_lba);
+        SerialLogger::Log(capbuf);
+    }
     SerialLogger::Log(" ssz=");
     SerialLogger::LogDec((int)dev.sector_size);
     SerialLogger::Log("\r\n");
@@ -95,7 +105,12 @@ bool BlockDev::Read(int idx, uint64_t lba, uint32_t count, void* buf) {
     // (satoru)
     if (lba >= d->capacity_lba) return false;
     if (lba + count > d->capacity_lba) return false;
-    return d->read(d->ctx, lba, count, buf);
+    bool ok = d->read(d->ctx, lba, count, buf);
+    if (ok) {
+        s_reads[idx]++;
+        s_sectors_read[idx] += count * (d->sector_size ? d->sector_size / 512u : 1u);
+    }
+    return ok;
 }
 
 bool BlockDev::Write(int idx, uint64_t lba, uint32_t count, const void* buf) {
@@ -104,7 +119,12 @@ bool BlockDev::Write(int idx, uint64_t lba, uint32_t count, const void* buf) {
     if (!d->write) return false;                  // read-only device (satoru)
     if (lba >= d->capacity_lba) return false;
     if (lba + count > d->capacity_lba) return false;
-    return d->write(d->ctx, lba, count, buf);
+    bool ok = d->write(d->ctx, lba, count, buf);
+    if (ok) {
+        s_writes[idx]++;
+        s_sectors_written[idx] += count * (d->sector_size ? d->sector_size / 512u : 1u);
+    }
+    return ok;
 }
 
 bool BlockDev::Flush(int idx) {
@@ -170,6 +190,14 @@ bool BlockDev::WriteBytes(int idx, uint64_t byte_off, uint32_t len, const void* 
     }
     KernelHeap::Free(bounce);
     return ok;
+}
+
+void BlockDev::GetStats(int idx, uint64_t* reads, uint64_t* sectors_read,
+                        uint64_t* writes, uint64_t* sectors_written) {
+    if (reads) *reads = (idx >= 0 && idx < BLOCKDEV_MAX) ? s_reads[idx] : 0;
+    if (sectors_read) *sectors_read = (idx >= 0 && idx < BLOCKDEV_MAX) ? s_sectors_read[idx] : 0;
+    if (writes) *writes = (idx >= 0 && idx < BLOCKDEV_MAX) ? s_writes[idx] : 0;
+    if (sectors_written) *sectors_written = (idx >= 0 && idx < BLOCKDEV_MAX) ? s_sectors_written[idx] : 0;
 }
 
 void BlockDev::Describe(int idx, char* out, int max_len) {

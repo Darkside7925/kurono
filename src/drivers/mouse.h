@@ -20,6 +20,11 @@ public:
     static void SetInvertScroll(bool inv);
     static void GetPosition(int& x, int& y);
     static void DrawAt(int x, int y);
+    // software cursor footprint damage: the damage-gated compositor must repaint
+    // what the arrow uncovered before the new position is drawn. the hardware
+    // cursor path never needs this. (satoru)
+    static void DamageCursor(int x, int y);
+    static void DamageLastSoftware();
     static void SetRawMode(bool enable);  // 1:1 pointer, no accel (satoru)
     static int mx, my;
     

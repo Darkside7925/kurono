@@ -22,6 +22,13 @@ void TestFree(uint64_t as, uint64_t vaddr);
 // number of live compressed entries. (satoru)
 uint32_t TestMetaLive();
 
+// adaptive pool hooks: grow by `chunks` through the real grow path (logged,
+// cap-bounded), give every empty chunk back through the real release path,
+// and read-and-clear the "a store found the pool full" flag. (satoru)
+uint64_t TestGrowPool(uint32_t chunks);
+int      TestReleasePool();
+bool     TestTakePoolStarved();
+
 }  // namespace KMemX
 
 // end (satoru)

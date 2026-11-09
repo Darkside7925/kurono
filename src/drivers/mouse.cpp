@@ -1,10 +1,13 @@
 #include "mouse.h"
 #include "hwinfo.h"   // input event counters for the boot log (satoru)
 #include "graphics.h"
+#include "outputs.h"   // multi-monitor cursor travel (satoru)
+#include "intel_accel.h"   // hardware cursor plane, kurono.igpu.accel=1 (satoru)
 #include "serial.h"
 #include "../ui/gui.h"
 #include "../kernel/pci.h"
 #include "../kernel/time.h"
+#include "../ui/ui_diag.h"
 
 int Mouse::mx, Mouse::my, Mouse::lastx, Mouse::lasty;
 bool Mouse::auto_draw = true;
@@ -748,6 +751,7 @@ void Mouse::RingPush(const Mouse::Event& e) {
 // the tablet places the cursor at an absolute position instead of being
 // mis-decoded as a 3-byte relative boot mouse. (satoru)
 void Mouse::ProcessUSBAbsReport(const uint8_t* report, int len) {
+    HwInfo::NoteUsbMouse();   // absolute tablet reports count as usb mouse input (satoru)
     if (!report || len < 5) return;
     uint8_t hw = 0;
     if (report[0] & 0x01) hw |= 0x01;   // left
@@ -766,6 +770,7 @@ void Mouse::ProcessUSBAbsReport(const uint8_t* report, int len) {
 
 void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int wheel_delta) {
     perf_stats.packets_processed++;
+    Mouse::Show();   // any host pointer sample means the cursor is live (satoru)
 
     int w = Graphics::GetWidth();
     int h = Graphics::GetHeight();
@@ -773,6 +778,7 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
     if (h <= 0) h = 1;
     if (new_x < 0) new_x = 0; else if (new_x >= w) new_x = w - 1;
     if (new_y < 0) new_y = 0; else if (new_y >= h) new_y = h - 1;
+    Outputs::Constrain(&new_x, &new_y);   // stay inside a live output (satoru)
 
     int old_x = mx;
     int old_y = my;
@@ -794,10 +800,16 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
     buttons = new_buttons;
 
     if (rel_dx || rel_dy) {
+        Mouse::Show();   // a live pointer implies a visible cursor (usb-only laptops) (satoru)
+        UiDiag::NoteMotion();
         lastx = old_x;
         lasty = old_y;
         mx = new_x;
         my = new_y;
+        // move the hardware cursor from the input path, not the compositor:
+        // an idle damage-gated gui loop can sleep 16 ms, and the pointer must
+        // not inherit that cadence (kurono.igpu.accel=1). (satoru)
+        if (cursor_visible && IntelAccel::Enabled()) IntelAccel::CursorUpdate(mx, my);
         if (cursor_visible && auto_draw) {
             ClearAt(lastx, lasty);
             DrawAt(mx, my);
@@ -855,6 +867,7 @@ void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
     if (!report || len < 3) return;
 
     perf_stats.packets_processed++;
+    Mouse::Show();   // a usb hid mouse is a valid pointer even with no ps/2 (satoru)
 
     uint8_t hw_buttons = 0;
     if (report[0] & 0x01) hw_buttons |= 0x01; // left
@@ -897,14 +910,20 @@ void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
     int new_my = my + m_dy_down;              // down-positive (satoru)
     if (new_mx < 0) new_mx = 0; else if (new_mx > w - 1) new_mx = w - 1;
     if (new_my < 0) new_my = 0; else if (new_my > h - 1) new_my = h - 1;
+    Outputs::Constrain(&new_mx, &new_my);   // stay inside a live output (satoru)
     int delivered_dx = new_mx - mx;
     int delivered_dy_up = my - new_my;         // event convention: + = up (satoru)
     mx = new_mx; my = new_my;
+    if (cursor_visible && IntelAccel::Enabled()) IntelAccel::CursorUpdate(mx, my);
     if (cursor_visible && auto_draw && (delivered_dx || delivered_dy_up)) {
         ClearAt(lastx, lasty);
         DrawAt(mx, my);
     }
 
+    if (delivered_dx || delivered_dy_up) {
+        Mouse::Show();
+        UiDiag::NoteMotion();
+    }
     uint64_t ts = TimeManager::NowUTC().us;
     if (delivered_dx || delivered_dy_up) {
         Event e{};
@@ -1511,13 +1530,19 @@ void Mouse::Poll() {
 
             int new_mx = (int)target_x;
             int new_my = (int)target_y;
+            Outputs::Constrain(&new_mx, &new_my);   // stay inside a live output (satoru)
             int delivered_dx = new_mx - mx;
             int delivered_dy = my - new_my; // positive = up, mirrors PS/2 convention
             mx = new_mx;
             my = new_my;
+            if (cursor_visible && IntelAccel::Enabled()) IntelAccel::CursorUpdate(mx, my);
             if (cursor_visible && auto_draw && (delivered_dx || delivered_dy)) {
                 ClearAt(lastx, lasty);
                 DrawAt(mx, my);
+            }
+            if (delivered_dx || delivered_dy) {
+                Mouse::Show();
+                UiDiag::NoteMotion();
             }
             uint64_t ts = TimeManager::NowUTC().us;
             if (delivered_dx || delivered_dy) {
@@ -1750,9 +1775,44 @@ void Mouse::FlushOutput() { for (int i = 0; i < 2048; i++) { uint8_t st = In(0x6
 
 uint32_t Mouse::BgAt(int x, int y) { (void)x; (void)y; return 0xFF000000; }
 
-void Mouse::ClearAt(int x, int y) { GUI::DrawRegion(x, y, 12, 16); }
+// last position the software cursor was drawn at, so a damage-only wallpaper
+// pass can repaint under it even if the input loop missed the old rect. (satoru)
+static int g_sw_cur_x = -1, g_sw_cur_y = -1;
+
+void Mouse::DamageCursor(int x, int y) {
+    // a real pointing device now always marks cursor_visible on its first
+    // report (Mouse::Show in the input handlers), so this gate can no longer
+    // hide the damage on a usb-only machine where the ps/2 port is dead. (satoru)
+    if (!cursor_visible) return;
+    Graphics::MarkDirty(x - 1, y - 1, 14, 18);
+    UiDiag::NoteCursorDamage();
+}
+
+void Mouse::DamageLastSoftware() {
+    if (g_sw_cur_x < 0) return;
+    DamageCursor(g_sw_cur_x, g_sw_cur_y);
+}
+
+void Mouse::ClearAt(int x, int y) {
+    // a hardware cursor is not in the framebuffer, so there is nothing to
+    // erase; hiding it is enough. when it is not active this stays the old
+    // software restore. (satoru)
+    if (IntelAccel::CursorUpdate(-1, -1)) { g_sw_cur_x = g_sw_cur_y = -1; return; }
+    DamageCursor(x, y);
+    GUI::DrawRegion(x, y, 12, 16);
+    if (g_sw_cur_x >= x - 1 && g_sw_cur_x <= x + 13 && g_sw_cur_y >= y - 1 && g_sw_cur_y <= y + 17)
+        g_sw_cur_x = g_sw_cur_y = -1;
+}
 
 void Mouse::DrawAt(int x, int y) {
+    // the intel display engine can own the pointer as a hardware plane. the
+    // hook only exists when kurono.igpu.accel=1 and a self-test passed, so
+    // with the flag off this changes nothing. (satoru)
+    if (IntelAccel::Enabled()) {
+        if (!cursor_visible) { IntelAccel::CursorVisible(false); return; }
+        if (IntelAccel::CursorUpdate(x, y)) { g_sw_cur_x = g_sw_cur_y = -1; return; }
+    }
+    if (!cursor_visible) return;
     static const uint8_t cursor_bitmap[16][12] = {
         {1,1,0,0,0,0,0,0,0,0,0,0},
         {1,2,1,0,0,0,0,0,0,0,0,0},
@@ -1779,6 +1839,11 @@ void Mouse::DrawAt(int x, int y) {
             else if (p == 2) Graphics::DrawPixel(x+cx, y+cy, 0xFFFFFFFF);
         }
     }
+    UiDiag::NoteCursorDraw();
+    if (g_sw_cur_x >= 0 && (g_sw_cur_x != x || g_sw_cur_y != y)) DamageCursor(g_sw_cur_x, g_sw_cur_y);
+    DamageCursor(x, y);
+    g_sw_cur_x = x;
+    g_sw_cur_y = y;
 }
 
 bool Mouse::LeftClicked() { bool r = left_clicked; left_clicked = false; return r; }
@@ -1799,8 +1864,8 @@ Mouse::Event Mouse::GetEvent() {
     __atomic_store_n(&ev_tail, (uint16_t)((t + 1) & 255), __ATOMIC_RELEASE);
     return e;
 }
-void Mouse::Show() { if (!cursor_visible) { cursor_visible = true; if(auto_draw) DrawAt(mx, my); } }
-void Mouse::Hide() { if (cursor_visible) { cursor_visible = false; if(auto_draw) ClearAt(mx, my); } }
+void Mouse::Show() { if (!cursor_visible) { cursor_visible = true; IntelAccel::CursorVisible(true); if(auto_draw) DrawAt(mx, my); } }
+void Mouse::Hide() { if (cursor_visible) { cursor_visible = false; IntelAccel::CursorVisible(false); if(auto_draw) ClearAt(mx, my); } }
 void Mouse::SetSpeed(uint16_t mul) { speed_mul = mul ? mul : 1; }
 void Mouse::SetInvertScroll(bool inv) { invert_scroll = inv; }
 void Mouse::GetPosition(int& x, int& y) { x = mx; y = my; }

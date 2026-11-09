@@ -2,6 +2,7 @@
 #include "pmm.h"
 #include "../drivers/serial.h"
 #include "../proc/smp.h"   // cpu index for the cross-core heap lock (satoru)
+#include "taskmem.h"       // kurono.taskmem=1 per-task accounting hooks (satoru)
 
 //  kernel heap - segregated free-list allocator with coalescing
 //
@@ -70,9 +71,10 @@ static volatile int      g_heap_lock_owner = -1;
 struct HeapIrqGuard {
     uint64_t flags;
     bool nested;
+    int cpu;   // kept for the taskmem owner lookup (satoru)
     HeapIrqGuard() {
         __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-        int cpu = (int)SMP::CpuIndex();
+        cpu = (int)SMP::CpuIndex();
         if (g_heap_lock_owner == cpu) { nested = true; return; }
         nested = false;
         for (;;) {
@@ -369,8 +371,61 @@ HeapBlock* KernelHeap::FindFree(size_t size) {
     return nullptr;
 }
 
+// kurono.memcensus=1: a side table of live allocations (pointer -> caller
+// return address + size), so the census can name who holds the heap. off (null)
+// on a normal boot; maintained under the heap's own guard. open addressing with
+// tombstones; when it fills, further allocations go uncounted. (satoru)
+struct HeapCensusSlot { uint64_t ptr; uint32_t site; uint32_t size; };
+static HeapCensusSlot* g_hc = nullptr;
+static constexpr uint32_t HC_CAP = 1u << 17;          // 2 mb of slots (satoru)
+static constexpr uint64_t HC_TOMB = 1;
+static uint32_t g_hc_overflow = 0;
+static inline uint32_t hc_hash(uint64_t p) { return (uint32_t)((p >> 4) * 2654435761u) & (HC_CAP - 1); }
+static void hc_add(void* ptr, size_t size, void* ra) {
+    if (!g_hc || !ptr) return;
+    uint64_t p = (uint64_t)(uintptr_t)ptr;
+    uint32_t h = hc_hash(p);
+    for (uint32_t i = 0; i < 64; i++) {
+        HeapCensusSlot& s = g_hc[(h + i) & (HC_CAP - 1)];
+        if (s.ptr == 0 || s.ptr == HC_TOMB) {
+            s.ptr = p; s.site = (uint32_t)(uintptr_t)ra;
+            s.size = size > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)size;
+            return;
+        }
+    }
+    g_hc_overflow++;
+}
+static void hc_del(void* ptr) {
+    if (!g_hc || !ptr) return;
+    uint64_t p = (uint64_t)(uintptr_t)ptr;
+    uint32_t h = hc_hash(p);
+    for (uint32_t i = 0; i < 64; i++) {
+        HeapCensusSlot& s = g_hc[(h + i) & (HC_CAP - 1)];
+        if (s.ptr == p) { s.ptr = HC_TOMB; return; }
+        if (s.ptr == 0) return;
+    }
+}
+void KernelHeap::CensusEnable() {
+    if (g_hc) return;
+    g_hc = (HeapCensusSlot*)PMM::AllocBytes(sizeof(HeapCensusSlot) * HC_CAP);   // zeroed (satoru)
+}
+uint32_t KernelHeap::CensusCapacity() { return g_hc ? HC_CAP : 0; }
+uint32_t KernelHeap::CensusOverflow() { return g_hc_overflow; }
+bool KernelHeap::CensusEntry(uint32_t i, uint32_t* site, uint32_t* size) {
+    if (!g_hc || i >= HC_CAP) return false;
+    uint64_t p = g_hc[i].ptr;
+    if (p == 0 || p == HC_TOMB) return false;
+    *site = g_hc[i].site; *size = g_hc[i].size;
+    return true;
+}
+
 void* KernelHeap::Alloc(size_t size) {
+    return AllocFrom(size, __builtin_return_address(0));
+}
+
+void* KernelHeap::AllocFrom(size_t size, void* site) {
     HeapIrqGuard _g;   // interrupt-safe: blocks IRQ-context re-entry (satoru)
+    size_t asked = size;
     if (!initialized) Init();
     if (size == 0) size = 1;
     // reserve the trailing 8-byte boundary-tag footer OUTSIDE the caller's
@@ -405,7 +460,10 @@ void* KernelHeap::Alloc(size_t size) {
     }
 
     mark_used(block);
-    return (void*)((uint8_t*)block + HEAP_HEADER_SIZE);
+    void* out = (void*)((uint8_t*)block + HEAP_HEADER_SIZE);
+    hc_add(out, asked, site);
+    if (TaskMem::g_on) TaskMem::OnHeapAlloc(out, block->size, (uint32_t)_g.cpu);   // owner side table, no header change (satoru)
+    return out;
 }
 
 void KernelHeap::Free(void* ptr) {
@@ -433,12 +491,16 @@ void KernelHeap::Free(void* ptr) {
         heap_warn("Heap: Double free (ignored)\r\n");
         return;
     }
+    hc_del(ptr);
     // sanity check: header size matches footer
     uint64_t fsz = *footer_of(block) & ~(1ULL << 63);
     if (fsz != block->size) {
         heap_warn("Heap: Free() corrupt footer (ignored)\r\n");
         return;
     }
+    // charge back to the block's original owner. bootstrap blocks freed after
+    // expansion were never in the enable-time baseline, so they are skipped. (satoru)
+    if (in_active && TaskMem::g_on) TaskMem::OnHeapFree(ptr, block->size);
 
     mark_free(block);
 
@@ -500,7 +562,7 @@ void* KernelHeap::Realloc(void* ptr, size_t new_size) {
     if (want < HEAP_MIN_PAYLOAD) want = HEAP_MIN_PAYLOAD;
     if (old_size >= want) return ptr;
 
-    void* new_ptr = Alloc(new_size);
+    void* new_ptr = AllocFrom(new_size, __builtin_return_address(0));
     if (!new_ptr) return nullptr;
 
     size_t copy_size = old_size < new_size ? (size_t)old_size : new_size;
@@ -510,6 +572,11 @@ void* KernelHeap::Realloc(void* ptr, size_t new_size) {
 
     Free(ptr);
     return new_ptr;
+}
+
+void KernelHeap::LockedCall(void (*fn)(void*), void* arg) {
+    HeapIrqGuard _g;   // same guard as Alloc/Free: serialized with every heap op (satoru)
+    fn(arg);
 }
 
 void KernelHeap::Reset() {

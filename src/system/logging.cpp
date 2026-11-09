@@ -183,7 +183,7 @@ void RuntimeLog::InitFilesystem() {
         "  system.log   - general runtime events\n"
         "  serial.log   - mirrored serial/driver/kernel console\n"
         "  network.log  - connect/disconnect/link/errors\n"
-        "  security.log - supr escalations, ksa prompts, grants/denials\n"
+        "  security.log - ken escalations, ksa prompts, grants/denials\n"
         "  crash/       - kernel panics + minidumps\n"
         "  apps/<app>.log         - per-app activity\n"
         "  processes/<pid>_<name>.log - per-process lifecycle\n");

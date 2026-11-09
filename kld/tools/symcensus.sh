@@ -27,6 +27,8 @@ if [ ! -d "$BUILD" ]; then
 fi
 
 DRV_OBJS=$(find "$BUILD/driver" -name '*.o' 2>/dev/null)
+# imported upstream cores (unmodified linux .c files linked into the family)
+CORE_OBJS=$(find "$BUILD/core" -name '*.o' 2>/dev/null || true)
 # hand-written shim only: everything in emul EXCEPT the generated stubs
 EMUL_HAND=$(find "$BUILD/emul" -name '*.o' 2>/dev/null | grep -v 'lx_stubs_gen' || true)
 
@@ -73,13 +75,22 @@ else
   : > "$TMP/stubs"
 fi
 
-comm -12 "$TMP/needed" "$TMP/handdef" > "$TMP/impl"
-comm -23 "$TMP/needed" "$TMP/handdef" > "$TMP/rest"
+# symbols the driver needs that an imported upstream core provides (satoru)
+if [ -n "$CORE_OBJS" ]; then
+  nm --defined-only $CORE_OBJS 2>/dev/null | awk '{print $3}' | sort -u > "$TMP/coredef"
+else
+  : > "$TMP/coredef"
+fi
+comm -12 "$TMP/needed" "$TMP/coredef" > "$TMP/bycore"
+comm -23 "$TMP/needed" "$TMP/coredef" > "$TMP/needed2"
+comm -12 "$TMP/needed2" "$TMP/handdef" > "$TMP/impl"
+comm -23 "$TMP/needed2" "$TMP/handdef" > "$TMP/rest"
 comm -12 "$TMP/rest"   "$TMP/stubs"   > "$TMP/stubbed"
 comm -23 "$TMP/rest"   "$TMP/stubs"   > "$TMP/missing"
 
 NEED=$(wc -l < "$TMP/needed")
 IMPL=$(wc -l < "$TMP/impl")
+CORE=$(wc -l < "$TMP/bycore")
 STUB=$(wc -l < "$TMP/stubbed")
 MISS=$(wc -l < "$TMP/missing")
 
@@ -87,11 +98,12 @@ echo "======================================================"
 echo " KLD symbol census"
 echo "======================================================"
 echo "  external symbols needed : $NEED"
-echo "  IMPLEMENTED (real)      : $IMPL"
+echo "  IMPLEMENTED (shim, real): $IMPL"
+echo "  IMPORTED CORE (upstream): $CORE"
 echo "  STUBBED (aborts)        : $STUB   <- phase 2 work queue"
 echo "  MISSING (no provider)   : $MISS   <- will NOT link"
 if [ "$NEED" -gt 0 ]; then
-  echo "  real coverage           : $(( IMPL * 100 / NEED ))%"
+  echo "  real coverage           : $(( (IMPL + CORE) * 100 / NEED ))%"
 fi
 echo
 
@@ -114,6 +126,7 @@ fi
 cp "$TMP/missing" "$BUILD/census_missing.txt" 2>/dev/null || true
 cp "$TMP/stubbed" "$BUILD/census_stubbed.txt" 2>/dev/null || true
 cp "$TMP/impl"    "$BUILD/census_impl.txt"    2>/dev/null || true
+cp "$TMP/bycore"  "$BUILD/census_core.txt"    2>/dev/null || true
 cp "$TMP/needed"  "$BUILD/census_needed.txt"  2>/dev/null || true
 
 # CI rule from the doc: fail the build when a symbol is MISSING (unprovided),

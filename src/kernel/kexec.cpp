@@ -11,7 +11,7 @@
 #include "irp.h"
 #include "../drivers/serial.h"
 #include "../proc/scheduler.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
 
 namespace KExec {
 
@@ -94,19 +94,19 @@ int64_t WriteBlocks(const char* device, uint64_t lba, uint32_t count, const void
 }
 }  // namespace IO
 
-// ── Se: security via SUPR ─────────────────────────────────────────────────────
+// ── Se: security via KEN ─────────────────────────────────────────────────────
 namespace Security {
 int CurrentLevel() {
-    int sid = SUPR::GetCurrentSession();
+    int sid = KEN::GetCurrentSession();
     if (sid < 0) return 0;                   // no session = guest (satoru)
-    return (int)SUPR::GetLevel(sid);
+    return (int)KEN::GetLevel(sid);
 }
 bool CheckCapability(uint32_t cap) {
     int lvl = CurrentLevel();
     // hardware access requires admin; net/fs/gui require at least a logged-in
     // user; this mirrors kinit's capability gate, centralized here. (satoru)
-    if (cap & CAP_HARDWARE) return lvl >= (int)SUPR_ADMIN;
-    return lvl >= (int)SUPR_USER;
+    if (cap & CAP_HARDWARE) return lvl >= (int)KEN_ADMIN;
+    return lvl >= (int)KEN_USER;
 }
 }  // namespace Security
 

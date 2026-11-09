@@ -75,10 +75,10 @@ extern "C" size_t strlen(const char* s) {
 extern "C" void __cxa_pure_virtual() { while(1); }
 
 void* operator new(size_t size) { 
-    return KernelHeap::Alloc(size);
+    return KernelHeap::AllocFrom(size, __builtin_return_address(0));   // census site = the new expression (satoru)
 }
 void* operator new[](size_t size) { 
-    return KernelHeap::Alloc(size);
+    return KernelHeap::AllocFrom(size, __builtin_return_address(0));   // census site = the new expression (satoru)
 }
 void operator delete(void* p) { 
     KernelHeap::Free(p);

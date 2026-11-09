@@ -1,5 +1,6 @@
 #pragma once
 #include "../kernel/types.h"
+#include "../system/kasset.h"   // demo videos load on demand (satoru)
 
 //  embedded media assets - linked via objcopy from binary files
 //
@@ -22,19 +23,20 @@ extern "C" {
 
 namespace EmbeddedMedia {
 
+// true only when the demo videos are linked in; on-demand copies are not
+// preloaded into /home at boot (they would cost ~33 mb of ram up front). (satoru)
+inline bool VideosLinked() { return KAsset::Linked(_binary_denji_kvid_start, _binary_denji_kvid_end) ||
+                                    KAsset::Linked(_binary_ssstik_kvid_start, _binary_ssstik_kvid_end); }
 inline bool HasDenjiMP4() {
-    return _binary_denji_mp4_start != nullptr &&
-           _binary_denji_mp4_end   != nullptr &&
-           +_binary_denji_mp4_end > +_binary_denji_mp4_start;
+    return KAsset::Has("DENJI   MP4", _binary_denji_mp4_start, _binary_denji_mp4_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 inline const uint8_t* DenjiMP4Data() {
-    return _binary_denji_mp4_start;
+    return KAsset::Data("DENJI   MP4", _binary_denji_mp4_start, _binary_denji_mp4_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 inline uint32_t DenjiMP4Size() {
-    return (uint32_t)((uintptr_t)_binary_denji_mp4_end -
-                      (uintptr_t)_binary_denji_mp4_start);
+    return KAsset::Size("DENJI   MP4", _binary_denji_mp4_start, _binary_denji_mp4_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 // the playable native version (transcoded host-side via
@@ -42,42 +44,33 @@ inline uint32_t DenjiMP4Size() {
 // actually decodes; the .mp4 above is preserved for the demuxer
 // to inspect its real metadata.
 inline bool HasDenjiKVID() {
-    return _binary_denji_kvid_start != nullptr &&
-           _binary_denji_kvid_end   != nullptr &&
-           +_binary_denji_kvid_end > +_binary_denji_kvid_start;
+    return KAsset::Has("DENJI   KVD", _binary_denji_kvid_start, _binary_denji_kvid_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 inline const uint8_t* DenjiKVIDData() {
-    return _binary_denji_kvid_start;
+    return KAsset::Data("DENJI   KVD", _binary_denji_kvid_start, _binary_denji_kvid_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 inline uint32_t DenjiKVIDSize() {
-    return (uint32_t)((uintptr_t)_binary_denji_kvid_end -
-                      (uintptr_t)_binary_denji_kvid_start);
+    return KAsset::Size("DENJI   KVD", _binary_denji_kvid_start, _binary_denji_kvid_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 // user-imported ssstik.mp4 (original) - preserved for inspection/transcode (satoru)
 inline bool HasSsstikMP4() {
-    return _binary_ssstik_mp4_start != nullptr &&
-           _binary_ssstik_mp4_end   != nullptr &&
-           +_binary_ssstik_mp4_end > +_binary_ssstik_mp4_start;
+    return KAsset::Has("SSSTIK  MP4", _binary_ssstik_mp4_start, _binary_ssstik_mp4_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
-inline const uint8_t* SsstikMP4Data() { return _binary_ssstik_mp4_start; }
+inline const uint8_t* SsstikMP4Data() { return KAsset::Data("SSSTIK  MP4", _binary_ssstik_mp4_start, _binary_ssstik_mp4_end); }   // on-demand asset (satoru)
 inline uint32_t SsstikMP4Size() {
-    return (uint32_t)((uintptr_t)_binary_ssstik_mp4_end -
-                      (uintptr_t)_binary_ssstik_mp4_start);
+    return KAsset::Size("SSSTIK  MP4", _binary_ssstik_mp4_start, _binary_ssstik_mp4_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 // user-imported ssstik.kvid (playable native form) (satoru)
 inline bool HasSsstikKVID() {
-    return _binary_ssstik_kvid_start != nullptr &&
-           _binary_ssstik_kvid_end   != nullptr &&
-           +_binary_ssstik_kvid_end > +_binary_ssstik_kvid_start;
+    return KAsset::Has("SSSTIK  KVD", _binary_ssstik_kvid_start, _binary_ssstik_kvid_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
-inline const uint8_t* SsstikKVIDData() { return _binary_ssstik_kvid_start; }
+inline const uint8_t* SsstikKVIDData() { return KAsset::Data("SSSTIK  KVD", _binary_ssstik_kvid_start, _binary_ssstik_kvid_end); }   // on-demand asset (satoru)
 inline uint32_t SsstikKVIDSize() {
-    return (uint32_t)((uintptr_t)_binary_ssstik_kvid_end -
-                      (uintptr_t)_binary_ssstik_kvid_start);
+    return KAsset::Size("SSSTIK  KVD", _binary_ssstik_kvid_start, _binary_ssstik_kvid_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 } // namespace embeddedmedia

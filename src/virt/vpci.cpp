@@ -19,6 +19,21 @@ void VPCI::Init() {
     device_count   = 0;
     next_bar_base  = VPCI_MMIO_BASE;
     cfg_address    = 0;
+    // a host bridge at 00:00.0 (i440fx ids). linux without acpi only trusts
+    // conf1 after it finds a host bridge or a vga device on bus 0
+    // (pci_sanity_check); with no virtio-gpu the guest saw "no pci" (satoru)
+    {
+        VPCIDevice hb = {};
+        hb.name = "host-bridge";
+        Cfg16(&hb, PCI_VENDOR_ID, 0x8086);
+        Cfg16(&hb, PCI_DEVICE_ID, 0x1237);
+        Cfg8(&hb, PCI_REVISION_ID, 0x02);
+        Cfg8(&hb, PCI_SUBCLASS, 0x00);
+        Cfg8(&hb, PCI_CLASS, 0x06);
+        hb.cfg[PCI_INT_PIN] = 0xFF;   // RegisterDevice leaves a nonzero pin alone
+        RegisterDevice(&hb);
+        devices[0].cfg[PCI_INT_PIN] = 0;
+    }
     SerialLogger::Log("VPCI: virtual pci bus initialized (mmio window 0x");
     SerialLogger::LogHex((uint32_t)VPCI_MMIO_BASE);
     SerialLogger::Log(" - 0x");
@@ -120,6 +135,9 @@ void VPCI::WriteConfig(uint8_t bus, uint8_t dev, uint8_t func,
     if ((int)off + size > VPCI_CFG_SIZE) return;
 
     // bar writes - handle bar size probing (write 0xFFFFFFFF, read back size mask)
+    // no expansion rom: keep the rom bar reading 0 so sizing finds nothing (satoru)
+    if (off >= 0x30 && off < 0x34) return;
+
     if (off >= PCI_BAR0 && off < PCI_BAR0 + 6 * 4) {
         int bar = (off - PCI_BAR0) / 4;
         VPCIBar& b = d.bars[bar];

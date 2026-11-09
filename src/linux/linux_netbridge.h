@@ -179,6 +179,7 @@ public:
     static uint32_t Readiness(int sockfd);     // LNET_POLL* bitmask, lock-free reads
     static int  SockError(int sockfd);         // getsockopt(SO_ERROR) value, clears on read
     static void Retain(int sockfd);            // dup/fork refcount bump
+    static bool DropRef(int sockfd);           // release a ref unless it is the last (kls does that one) (satoru)
     static int  RxAvail(int sockfd);           // ioctl(FIONREAD)
     static void PumpTick();                    // rate-limited TCPStack::Tick (bsp only)
     // task 30: wake pollers parked on sockets that now have rx/hup, and settle
@@ -195,6 +196,9 @@ public:
     static int  Resolve(const char* hostname, uint32_t* ip_out);
     static void SetDNS(uint32_t primary, uint32_t secondary);
     static void GetDNS(uint32_t* primary, uint32_t* secondary);
+    // pull address / mask / gateway / dns from the kernel eth0 and refresh
+    // /etc/resolv.conf when the lease changed. called after dhcp ticks. (satoru)
+    static void RefreshFromKernel();
 
     static void Ifconfig(char* out, int max_out);
     static void IpAddr(char* out, int max_out);

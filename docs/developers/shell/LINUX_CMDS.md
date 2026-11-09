@@ -31,9 +31,10 @@ What a Linux user would expect:
 | `alpine`, `apk`, `debian` | guest package and management bridges |
 
 Two things people get wrong here. `echo` is not a Linux command, it's a Kurono-native
-builtin registered in `shell.cpp` with `ENV_KURONO`. And there is no `sudo`. Privilege
-escalation is the native `supr` command: `supr <cmd>` runs something elevated, see
-[../security/SUPR.md](../security/SUPR.md).
+builtin registered in `shell.cpp` with `ENV_KURONO`. Privilege escalation is the native
+`ken` command: `ken <cmd>` runs something elevated, see
+[../security/KEN.md](../security/KEN.md). The hidden `sudo` and `supr` aliases route to the
+same handler.
 
 `linux_cmds.cpp` registers 63 distinct commands. The table above is a representative
 subset, not the full list.

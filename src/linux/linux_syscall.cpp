@@ -1,9 +1,13 @@
 //  kurono os - linux syscall abi translation layer - implementation
 //  intercepts int 0x80 and translates linux syscalls to kurono operations
 
+#include "../kernel/memcensus.h"   // region table profile on exhaustion (census builds) (satoru)
+#include "../ui/wayland_server.h"   // census protocol trace dump (satoru)
 #include "uaccess.h"   // validated user-pointer access (satoru)
 #include "linux_syscall.h"
+#include "../system/ktools.h"   // kdrv: agent-caller flag for /dev/kshell (satoru)
 #include "kpty.h"
+#include "../proc/kernel_processes.h"   // the terminal exec bridge (satoru)
 #include "ext4.h"
 #include "kls.h"
 #include "ld_kurono.h"          // ExecPIE for x86_64 dynamic execve (firefox content procs) (satoru)
@@ -15,7 +19,9 @@
 #include "../kernel/time.h"
 #include "../drivers/timer.h"
 #include "../drivers/serial.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
+#include "../security/admin.h"   // privilege gate for ring-3 actions (satoru)
+#include "../security/ksa.h"     // secure-desktop flag for the syscall ui pump (satoru)
 #include "../net/unix_socket.h"
 #include "linux_netbridge.h"      // af_inet tcp/udp bridge over the kurono stack (satoru)
 #include "../shell/shell.h"
@@ -23,7 +29,12 @@
 #include "../system/installer.h"    // partition table for /dev/sda1 style names (satoru)
 #include "../system/logging.h"
 #include "../proc/smp.h"          // per-cpu syscall-entry scratch (smp phase 3d) (satoru)
+#include "../drivers/cpu_detect.h"  // tsc frequency for the kls profile (satoru)
 #include "../proc/spinlock.h"     // futex-queue + kls locks (smp thread dispatch) (satoru)
+#include "../kernel/memacct.h"     // real rss / meminfo for /proc and sysinfo (satoru)
+#include "../kernel/taskmem.h"     // per-task kernel heap for /proc/<pid>/status (satoru)
+#include "../drivers/nvme.h"       // /proc/diskstats counters (satoru)
+#include "../net/network.h"        // live /proc/net/dev counters (satoru)
 
 LinuxProcess LinuxSyscall::procs[LINUX_MAX_PROCS];
 int LinuxSyscall::current_proc_cpu[SMP_MAX_CPUS] = {};
@@ -50,6 +61,12 @@ int  LinuxSyscall::stdin_tail = 0;
 // and defined BEFORE the anon namespace so both the probes and kurono_kernel.cpp
 // (via extern) bind to this one object. (satoru)
 bool g_fftrace = false;
+volatile bool g_wltrace = false;        // kurono.wltrace=1 wayland protocol trace (satoru)
+extern uint32_t g_retire_pending_dbg;
+static Process* g_retire_ring[512];
+static uint64_t g_retire_ms[512];
+static uint32_t g_retire_n = 0;
+volatile uint32_t g_ffsnap_secs = 0;   // kurono.ffsnap=N census snapshots (satoru)
 extern bool g_sctrace;
 static inline bool g_sctrace_dbg() { return g_sctrace; }
 bool g_cc_nokvfs_destroy = false;   // kurono.cc.nokvfs=1: a/b switch for the exit-time kvfs close (satoru)
@@ -58,7 +75,15 @@ bool g_cc_nopidfd = false;          // kurono.cc.nopidfd=1: a/b switch for the r
 namespace {
 constexpr uint64_t EXEC_STACK_BYTES = 16 * 1024;
 constexpr int EXEC_MAX_ARGC = 16;
-constexpr uint64_t USER_MMAP_BASE = 0x20000000ULL;
+// the arena an EXEC'd image starts from. it was still 0x20000000 here after the scheduler's
+// constant moved to 16 tb (see proc/scheduler.cpp: the low range is the kernel identity map,
+// present in every address space). an exec'd child (claude's bash, find, ripgrep, firefox's
+// content processes) began its arena at 512 mb, and its first mmap crawled the whole identity
+// map 40 kb at a time through choose_mmap_base's present-pte check - ~35 s per process with
+// 4 gb of ram, minutes with the laptop's ram: "claude freezes on find". same base as a fresh
+// process now. (satoru)
+constexpr uint64_t USER_MMAP_BASE = 0x0000100000000000ULL;
+constexpr uint64_t USER_MMAP_BASE_I386 = 0x20000000ULL;   // the i386 exec path keeps the old low arena (satoru)
 // the mmap arena still grows up from USER_MMAP_BASE, but the ceiling is
 // the canonical user-space top rather than the old sub-4gb cap. a pie
 // binary placed above 4gb by ld-kurono can now request (or be handed)
@@ -134,6 +159,14 @@ static uint64_t g_kls_acq = 0;        // fresh acquires (satoru)
 static uint64_t g_kls_contended = 0;  // fresh acquires that had to spin (satoru)
 static uint64_t g_kls_spin_ms = 0;    // total wall-time spinning for the lock (satoru)
 
+// sched=2: the bsp's kernel procs (input, audio, the gui) now take kls for their
+// work too, and an unfair cas loses to up to 19 aps hammering syscalls - the
+// services would starve behind ring-3 programs again, just one level down. a
+// waiting bsp raises this flag and contended aps hold off their cas until it
+// has had its turn, which bounds the bsp's wait to the current holder's
+// critical section. old mode: never raised. (satoru)
+static volatile uint32_t g_kls_bsp_wants = 0;
+
 static void kls_acquire_spin(uint32_t cpu, uint32_t me) {
     (void)cpu;   // callers own the depth bookkeeping; kept for symmetry (satoru)
     // fast path: uncontended acquire, no clock read. (satoru)
@@ -149,19 +182,27 @@ static void kls_acquire_spin(uint32_t cpu, uint32_t me) {
     g_kls_acq++;
     g_kls_contended++;
     uint64_t spin_t0 = Timer::GetRealMs64();
+    bool bsp_prio = Scheduler::SchedV2();
+    if (bsp_prio && me == 1u) __atomic_store_n(&g_kls_bsp_wants, 1u, __ATOMIC_RELEASE);
     uint64_t heal_start = 0, heal_spins = 0;
     uint32_t last_owner = 0;
     for (;;) {
         uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
+        bool yield_to_bsp = bsp_prio && me != 1u &&
+                            __atomic_load_n(&g_kls_bsp_wants, __ATOMIC_ACQUIRE);
+        if (!yield_to_bsp &&
+            __atomic_compare_exchange_n(&g_kls_word, &expected, me, false,
                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            if (bsp_prio && me == 1u) __atomic_store_n(&g_kls_bsp_wants, 0u, __ATOMIC_RELEASE);
             g_kls_spin_ms += Timer::GetRealMs64() - spin_t0;
             return;
         }
         for (;;) {
             __asm__ __volatile__("pause" ::: "memory");
             uint32_t w = __atomic_load_n(&g_kls_word, __ATOMIC_RELAXED);
-            if (w == 0) break;                 // freed - go retry the cas (satoru)
+            if (w == 0 && !(bsp_prio && me != 1u &&
+                            __atomic_load_n(&g_kls_bsp_wants, __ATOMIC_ACQUIRE)))
+                break;                         // freed - go retry the cas (satoru)
             // sample the clock cheaply (every 65536 spins, not every iteration). (satoru)
             if ((++heal_spins & 0xFFFF) == 0) {
                 uint64_t now = Timer::GetRealMs64();
@@ -182,10 +223,28 @@ static void kls_acquire_spin(uint32_t cpu, uint32_t me) {
                         uint32_t victim = w;
                         if (__atomic_compare_exchange_n(&g_kls_word, &victim, me, false,
                                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                            if (bsp_prio && me == 1u) __atomic_store_n(&g_kls_bsp_wants, 0u, __ATOMIC_RELEASE);
+                            int vdepth = (victim - 1u) < SMP_MAX_CPUS ? g_kls_depth[victim - 1u] : -1;
                             if ((victim - 1u) < SMP_MAX_CPUS) g_kls_depth[victim - 1u] = 0;
                             SerialLogger::Log(owner_dead
                                 ? "[kls] stole lock from parked-dead cpu\r\n"
                                 : "[kls] HARD steal: live owner held >3s - hunt this hold\r\n");
+                            {
+                                uint32_t vc = victim - 1u;
+                                PerCpu* vp = (vc < SMP_MAX_CPUS) ? SMP::ByIndex(vc) : nullptr;
+                                Process* vt = vp ? vp->current : nullptr;
+                                SerialLogger::Log("[kls] victim cpu="); SerialLogger::LogDec((int)vc);
+                                SerialLogger::Log(" ctx="); SerialLogger::LogDec(-1);
+                                SerialLogger::Log(" task="); SerialLogger::LogDec(vt ? (int)vt->pid : -1);
+                                SerialLogger::Log(" kproc="); SerialLogger::LogDec(vt ? (int)vt->is_kernel_proc : -1);
+                                SerialLogger::Log(" name="); SerialLogger::Log(vt ? vt->name : "-");
+                                SerialLogger::Log(" depth="); SerialLogger::LogDec(vdepth);
+                                SerialLogger::Log(" held_ms="); SerialLogger::LogDec(vc < SMP_MAX_CPUS && g_kls_hold_start_ms[vc] ? (int)(now - g_kls_hold_start_ms[vc]) : -1);
+                                SerialLogger::Log(" nr="); SerialLogger::LogDec(vt ? (int)vt->user_frame.rax : -1);
+                                SerialLogger::Log(" urip="); SerialLogger::LogHex64(vt ? vt->user_frame.rip : 0);
+                                SerialLogger::Log(" wants="); SerialLogger::LogDec((int)g_kls_bsp_wants);
+                                SerialLogger::Log("\r\n");
+                            }
                             return;
                         }
                         heal_start = now;      // lost the steal race - re-arm (satoru)
@@ -196,11 +255,62 @@ static void kls_acquire_spin(uint32_t cpu, uint32_t me) {
     }
 }
 
+// ── kls profile (kurono.klsprof=1): per syscall number, how often the global
+// serializer was taken, how long it was held, the worst hold, and how long the
+// acquirer spun for it. the "who" is the per-cpu kls_ctx the entry gates set
+// (amd64 nr 0..KP_NR-1; KP_FAULT = ring-3 page fault, KP_KPROC = a bsp kernel
+// proc's LayerLock section, KP_OTHER = anything else). all accumulation happens
+// WHILE the lock is held, so plain adds are race-free. side tables only. (satoru)
+constexpr int KP_NR = 352, KP_FAULT = 352, KP_KPROC = 353, KP_OTHER = 354, KP_SLOTS = 355;
+bool g_klsprof = false;
+static uint16_t g_kls_ctx[SMP_MAX_CPUS];
+static uint64_t g_kls_t0[SMP_MAX_CPUS];
+static uint16_t g_kls_held_ctx[SMP_MAX_CPUS];
+static uint64_t g_kp_cnt[KP_SLOTS], g_kp_hold[KP_SLOTS], g_kp_max[KP_SLOTS], g_kp_spin[KP_SLOTS];
+static inline uint64_t kp_tsc() { uint32_t lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+// result classes for the hot waiters (read 0, poll 7, epoll_wait 232, ppoll
+// 271, nanosleep 35, recvmsg 47): 0 = >0, 1 = ==0, 2 = -EAGAIN, 3 = other <0,
+// 4 = frame rewritten (parked / restarted / switched). read also by fd type. (satoru)
+static uint64_t g_kp_res[6][5];
+static uint64_t g_kp_rdtype[24][5];
+static inline int kp_hot(uint64_t nr) {
+    switch (nr) { case 0: return 0; case 7: return 1; case 232: return 2; case 271: return 3; case 35: return 4; case 47: return 5; }
+    return -1;
+}
+static inline void kls_set_ctx(uint64_t nr) {
+    uint32_t c = SMP::CpuIndex(); if (c >= SMP_MAX_CPUS) c = 0;
+    g_kls_ctx[c] = (uint16_t)(nr < (uint64_t)KP_SLOTS ? nr : (uint64_t)KP_OTHER);
+}
+
+// a relax drops the lock mid-body: close the hold there and reopen it after the
+// re-acquire, so the profile counts only time actually held. (satoru)
+static inline void kp_pause(uint32_t cpu) {
+    if (!g_klsprof || !g_kls_t0[cpu]) return;
+    uint64_t h = kp_tsc() - g_kls_t0[cpu];
+    uint16_t x = g_kls_held_ctx[cpu];
+    g_kp_hold[x] += h; if (h > g_kp_max[x]) g_kp_max[x] = h;
+    g_kls_t0[cpu] = 0;
+}
+static inline void kp_resume(uint32_t cpu) { if (g_klsprof) g_kls_t0[cpu] = kp_tsc(); }
+
 static void kls_lock() {
     uint32_t cpu = SMP::CpuIndex();
     if (cpu >= SMP_MAX_CPUS) cpu = 0;
     uint32_t me = cpu + 1u;
     if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) == me) { g_kls_depth[cpu]++; return; }
+    if (g_klsprof) {
+        uint64_t a = kp_tsc();
+        kls_acquire_spin(cpu, me);
+        uint64_t b = kp_tsc();
+        uint16_t x = g_kls_ctx[cpu];
+        if (x >= KP_SLOTS) x = KP_OTHER;
+        g_kls_held_ctx[cpu] = x;
+        g_kp_spin[x] += b - a;
+        g_kls_t0[cpu] = b;
+        g_kls_depth[cpu] = 1;
+        g_kls_hold_start_ms[cpu] = Timer::GetRealMs64();
+        return;
+    }
     // orphaned-lock self-heal, LIVENESS-GATED. the old rule stole after a flat
     // ~200ms on the theory that "no legitimate hold is ever this long" - false:
     // live holds past 200ms exist (the eager .so mmap copy of a 100MB+ library,
@@ -226,7 +336,83 @@ static void kls_unlock() {
     if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != me) return;  // never taken (bsp boot paths) (satoru)
     if (--g_kls_depth[cpu] > 0) return;             // recursive hold (satoru)
     g_kls_hold_start_ms[cpu] = 0;                    // released - watchdog off (satoru)
+    if (g_klsprof && g_kls_t0[cpu]) {
+        uint64_t h = kp_tsc() - g_kls_t0[cpu];
+        uint16_t x = g_kls_held_ctx[cpu];
+        g_kp_cnt[x]++; g_kp_hold[x] += h; if (h > g_kp_max[x]) g_kp_max[x] = h;
+        g_kls_t0[cpu] = 0;
+    }
     __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
+}
+
+static bool kls_held_here() {
+    uint32_t c = SMP::CpuIndex(); if (c >= SMP_MAX_CPUS) c = 0;
+    return __atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) == c + 1u;
+}
+// set by the x64 entry for a syscall it runs without kls through kls_elide (not for the
+// always-exempt futex family). a body that finds, after the gate looked, that it needs kls
+// (the fd turned out to be a file, an inet socket, or SCM_RIGHTS traffic is involved) takes it
+// itself with a KlsRescue, released when the scope ends. (satoru)
+static bool g_kls_elided[SMP_MAX_CPUS];
+static inline bool elided_here() { uint32_t c = SMP::CpuIndex(); return g_kls_elided[c < SMP_MAX_CPUS ? c : 0]; }
+struct KlsRescue {
+    bool taken = false;
+    void take() { if (!taken && !kls_held_here()) { kls_lock(); taken = true; } }
+    void takeIf(bool cond) { if (cond) take(); }
+    ~KlsRescue() { if (taken) kls_unlock(); }
+};
+static void inet_put(int sd) {
+    if (!LinuxNetBridge::DropRef(sd)) { KlsRescue kr; kr.take(); LinuxNetBridge::Close(sd); }
+}
+// one [klsprof] line pair every 10 s: totals, then the top 12 contexts by hold
+// time as nr:count:hold_ms:max_us:spin_ms. (satoru)
+static void kls_prof_dump() {
+    if (!g_klsprof) return;
+    static uint64_t s_last = 0;
+    uint64_t now = Timer::GetRealMs64();
+    if (now - s_last < 10000) return;
+    s_last = now;
+    uint64_t f = CPUDetect::GetInfo().frequency.tsc_frequency;
+    uint64_t per_us = f >= 1000000ull ? f / 1000000ull : 1;
+    uint64_t th = 0, ts = 0, tc = 0;
+    for (int i = 0; i < KP_SLOTS; i++) { th += g_kp_hold[i]; ts += g_kp_spin[i]; tc += g_kp_cnt[i]; }
+    SerialLogger::Log("[klsprof] t="); SerialLogger::LogDec((int)now);
+    SerialLogger::Log(" acq="); SerialLogger::LogDec((int)tc);
+    SerialLogger::Log(" hold_ms="); SerialLogger::LogDec((int)(th / per_us / 1000));
+    SerialLogger::Log(" spin_ms="); SerialLogger::LogDec((int)(ts / per_us / 1000));
+    SerialLogger::Log(" top:");
+    bool used[KP_SLOTS] = {};
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < KP_SLOTS; i++)
+            if (!used[i] && g_kp_cnt[i] && (best < 0 || g_kp_hold[i] + g_kp_spin[i] > g_kp_hold[best] + g_kp_spin[best])) best = i;
+        if (best < 0) break;
+        used[best] = true;
+        SerialLogger::Log(" ");
+        if (best == KP_FAULT) SerialLogger::Log("pf");
+        else if (best == KP_KPROC) SerialLogger::Log("kproc");
+        else if (best == KP_OTHER) SerialLogger::Log("other");
+        else SerialLogger::LogDec(best);
+        SerialLogger::Log(":"); SerialLogger::LogDec((int)g_kp_cnt[best]);
+        SerialLogger::Log(":"); SerialLogger::LogDec((int)(g_kp_hold[best] / per_us / 1000));
+        SerialLogger::Log(":"); SerialLogger::LogDec((int)(g_kp_max[best] / per_us));
+        SerialLogger::Log(":"); SerialLogger::LogDec((int)(g_kp_spin[best] / per_us / 1000));
+    }
+    SerialLogger::Log("\r\n");
+    static const char* const HN[6] = { "read", "poll", "epoll", "ppoll", "nsleep", "recvmsg" };
+    SerialLogger::Log("[klsprof] res(>0/0/eagain/err/parked):");
+    for (int h = 0; h < 6; h++) {
+        SerialLogger::Log(" "); SerialLogger::Log(HN[h]); SerialLogger::Log("=");
+        for (int k = 0; k < 5; k++) { if (k) SerialLogger::Log("/"); SerialLogger::LogDec((int)g_kp_res[h][k]); }
+    }
+    SerialLogger::Log(" | read by fdtype:");
+    for (int t = 0; t < 24; t++) {
+        uint64_t tot = 0; for (int k = 0; k < 5; k++) tot += g_kp_rdtype[t][k];
+        if (!tot) continue;
+        SerialLogger::Log(" t"); SerialLogger::LogDec(t); SerialLogger::Log("=");
+        for (int k = 0; k < 5; k++) { if (k) SerialLogger::Log("/"); SerialLogger::LogDec((int)g_kp_rdtype[t][k]); }
+    }
+    SerialLogger::Log("\r\n");
 }
 
 // kls-exemption (task 16): 91.6% of firefox's ~228k syscalls/boot contended on
@@ -274,11 +460,13 @@ static void kls_relax() {
         return;
     }
     int depth = g_kls_depth[cpu];
+    kp_pause(cpu);
     __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
     for (int i = 0; i < 128; i++) __asm__ __volatile__("pause" ::: "memory");
     // same liveness-gated self-heal as kls_lock (shared spin). (satoru)
     kls_acquire_spin(cpu, me);
     g_kls_depth[cpu] = depth;
+    kp_resume(cpu);
 }
 
 // like kls_relax but with a real ~ms breath while the lock is RELEASED - for the
@@ -296,12 +484,22 @@ static void kls_relax_sleep_ms(uint32_t ms) {
     if (cpu >= SMP_MAX_CPUS) cpu = 0;
     uint32_t me = cpu + 1u;
     if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) != me) {
+        // an elided syscall on the bsp (poll, pipe/socket reads run without kls) must still give the
+        // cooperative kernel procs their slice, they are the producers it waits on: same donation as
+        // the entry valve's exempt arm. when there is nothing to donate (donation is default off)
+        // fall back to a real hlt sleep, not a no-op: otherwise the in-kernel wait loops that call
+        // this (do_poll_wait's bsp fallback) spin the whole bsp at full speed. (satoru)
+        if (cpu == 0 && g_kls_elided[0]) {
+            if (!Scheduler::DonateToKernelProcs(ms)) Scheduler::SleepMs(ms);
+            return;
+        }
         // not the owner (boot paths): just breathe unlocked. (satoru)
         uint64_t until = Timer::GetRealMs64() + ms;
         while (Timer::GetRealMs64() < until) __asm__ __volatile__("pause" ::: "memory");
         return;
     }
     int depth = g_kls_depth[cpu];
+    kp_pause(cpu);
     __atomic_store_n(&g_kls_word, 0u, __ATOMIC_RELEASE);
     if (cpu == 0) {
         // THE STARVATION FIX. Scheduler::SleepMs() early-returns for a
@@ -320,6 +518,7 @@ static void kls_relax_sleep_ms(uint32_t ms) {
     }
     kls_acquire_spin(cpu, me);
     g_kls_depth[cpu] = depth;
+    kp_resume(cpu);
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +552,7 @@ static void kls_relax_sleep_ms(uint32_t ms) {
 
 struct KShellSession {
     bool     used;
+    uint32_t seq;        // open order, so the oldest session can be recycled (satoru)
     int      out_len;
     int      out_pos;
     char     cmd[KSHELL_CMD_MAX];
@@ -362,7 +562,8 @@ struct KShellSession {
 static KShellSession g_kshell[KSHELL_SESSIONS];
 
 // inspection only. a rescue agent reads to diagnose; repairs go through the
-// operator at the console, not through this pipe. (satoru)
+// operator at the console, not through this pipe. (satoru) the one exception
+// is the kdrv/ksys block at the end of the list, see its comment. (satoru)
 // EVERY NAME HERE IS A COMMAND THE SHELL ACTUALLY REGISTERS - checked against
 // RegisterCommand() in shell/. an earlier version listed plausible linux tools
 // (file, findmnt, netstat, smartctl) that do not exist here, and the agent
@@ -386,20 +587,39 @@ static const char* const KSHELL_ALLOWED[] = {
     "whoami", "hostname", "date", "pwd", "env", "which", "help",
     // network configuration (read-only; no egress tools, see above)
     "ifconfig", "ip", "ipconfig", "ss",
+    // driver control + diagnostics for the claude agent running on this machine
+    // (satoru). these are allowed ON PURPOSE even though some change state: the
+    // owner wants the agent to be able to reload a nic or audio driver and read
+    // the machine's health. what keeps them safe is inside kdrv itself, not in
+    // this list: it refuses the storage driver holding KURONO.LOG / KURONO.KFS,
+    // the display path, the timer and interrupt core, the usb host and ps/2 input,
+    // and from here it also refuses unloading the nic or usb input, which would
+    // cut the agent's own lifeline. none of them can write to a disk, nic nvm or
+    // firmware, or reformat anything; "start" only brings up a built-in driver
+    // and there is no way to load a new binary. nic and audio are the older
+    // status/restart commands with the same limits. (satoru)
+    "kdrv", "ksys", "nic", "audio",
     nullptr
 };
 
+static uint32_t g_kshell_seq = 0;
+
+// a process that exits without closing its session (a script that never runs
+// `exec 3>&-`) would otherwise leak the slot for good and a later open would fail
+// with EMFILE, so when every slot is taken the oldest one is recycled. (satoru)
 static int kshell_alloc() {
+    int pick = -1;
     for (int i = 0; i < KSHELL_SESSIONS; i++) {
-        if (!g_kshell[i].used) {
-            g_kshell[i].used = true;
-            g_kshell[i].out_len = 0;
-            g_kshell[i].out_pos = 0;
-            g_kshell[i].cmd[0] = 0;
-            return i;
-        }
+        if (!g_kshell[i].used) { pick = i; break; }
+        if (pick < 0 || (int32_t)(g_kshell[i].seq - g_kshell[pick].seq) < 0) pick = i;
     }
-    return -1;
+    if (pick < 0) return -1;
+    g_kshell[pick].used = true;
+    g_kshell[pick].seq = ++g_kshell_seq;
+    g_kshell[pick].out_len = 0;
+    g_kshell[pick].out_pos = 0;
+    g_kshell[pick].cmd[0] = 0;
+    return pick;
 }
 
 static void kshell_free(int slot) {
@@ -475,7 +695,9 @@ static void kshell_run(int slot) {
 
     // drop kls_lock across the command - see constraint 2 above (satoru)
     kls_relax();
+    KTools::SetAgentCaller(true);   // kdrv refuses the self-cutting actions for this caller (satoru)
     int n = KuronoShell::Execute(s->cmd, s->out, KSHELL_OUT_MAX - 1);
+    KTools::SetAgentCaller(false);
     if (n < 0) n = 0;
     if (n > KSHELL_OUT_MAX - 1) n = KSHELL_OUT_MAX - 1;
     s->out[n] = 0;
@@ -678,11 +900,17 @@ struct EpollWatch {
     uint32_t et_ready;  // epollet: readiness and activity seq at the last scan (satoru)
     uint32_t et_seq;
     bool     disarmed;  // epolloneshot: reported once, silent until epoll_ctl MOD (satoru)
+    uint32_t gen;       // bumped by every ADD/MOD/DEL: a wait's write-back only applies to the watch it saw (satoru)
 };
 struct EpollState {
+    Spinlock   lk;      // watch table: epoll_ctl, the scan's state updates, create/close (satoru)
+    uint32_t   sgen;    // bumped when the slot is allocated: a wait in flight on a closed epfd notices a reused slot (satoru)
     bool       used;
     EpollWatch watch[EPOLL_MAX_WATCH];
 };
+// what one epoll_wait pass copies out of the table under the lock, so fd_readiness (which may take
+// other locks, even kls) and the user-memory writes run with no epoll lock held. (satoru)
+struct EpSnap { int idx; int fd; uint32_t events; uint64_t data; uint32_t et_ready, et_seq; bool disarmed; uint32_t gen; };
 static EpollState g_epoll[EPOLL_MAX];
 
 static int eventfd_alloc() {
@@ -712,7 +940,9 @@ static int timerfd_alloc() {
 static int epoll_alloc() {
     for (int i = 0; i < EPOLL_MAX; i++)
         if (!g_epoll[i].used) {
+            SpinLockGuard eg(g_epoll[i].lk);
             g_epoll[i].used = true;
+            g_epoll[i].sgen++;
             for (int w = 0; w < EPOLL_MAX_WATCH; w++) g_epoll[i].watch[w].used = false;
             return i;
         }
@@ -799,26 +1029,29 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
             // readable when there are bytes OR (for a listen fd) a pending
             // connection -- the latter is what wakes firefox's WaylandProxy
             // accept loop so it forwards get_registry to wayland-0. (satoru)
-            if (UnixSocket::PendingBytes(lfd->backend_fd) > 0 ||
-                UnixSocket::HasPendingConnection(lfd->backend_fd)) ready |= L_EPOLLIN;
-            // a full peer ring makes the write eagain: epollout only with room, or
-            // firefox's ipc writer spun on epoll_pwait. (satoru)
-            if (UnixSocket::Writable(lfd->backend_fd)) ready |= L_EPOLLOUT;
-            // peer closed -> POLLHUP so a data-or-eof poller wakes + reaps the
-            // connection instead of polling forever (task 22). (satoru)
-            if (UnixSocket::PeerClosed(lfd->backend_fd)) ready |= L_EPOLLHUP;
+            // (one locked pass of the socket layer now: bytes or a pending connection -> in;
+            // room in the peer ring -> out, a full ring makes the write eagain and firefox's
+            // ipc writer spun on epoll_pwait; peer closed -> hup so a data-or-eof poller
+            // wakes + reaps the connection (task 22).) (satoru)
+            { uint32_t ur = UnixSocket::Readiness(lfd->backend_fd);
+              if (ur & UnixSocket::UN_READY_IN)  ready |= L_EPOLLIN;
+              if (ur & UnixSocket::UN_READY_OUT) ready |= L_EPOLLOUT;
+              if (ur & UnixSocket::UN_READY_HUP) ready |= L_EPOLLHUP; }
             break;
         case LFD_PIPE:
-            // pipes are socketpair-backed: same PendingBytes path (satoru)
-            if (UnixSocket::PendingBytes(lfd->backend_fd) > 0) ready |= L_EPOLLIN;
-            if (UnixSocket::Writable(lfd->backend_fd)) ready |= L_EPOLLOUT;
-            if (UnixSocket::PeerClosed(lfd->backend_fd)) ready |= L_EPOLLHUP;  // writer gone (satoru)
+            // pipes are socketpair-backed: same readiness (satoru)
+            { uint32_t ur = UnixSocket::Readiness(lfd->backend_fd);
+              if (ur & UnixSocket::UN_READY_IN)  ready |= L_EPOLLIN;
+              if (ur & UnixSocket::UN_READY_OUT) ready |= L_EPOLLOUT;
+              if (ur & UnixSocket::UN_READY_HUP) ready |= L_EPOLLHUP; }  // writer gone (satoru)
             break;
         case LFD_INET:
+            { // (the settle below is a single-word CONNECTING->CONNECTED store, idempotent, safe unlocked) (satoru)
             // af_inet tcp/udp: the bridge's lock-free readiness (LNET_POLL*
             // values match L_EPOLL*). this is what wakes firefox's non-blocking
             // connect (POLLOUT on established, ERR|HUP on refused). (satoru)
             ready |= LinuxNetBridge::Readiness(lfd->backend_fd);
+            }
             break;
         case LFD_EVENTFD: {
             int s = lfd->backend_fd;
@@ -827,6 +1060,7 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
             break;
         }
         case LFD_TIMERFD: {
+            KlsRescue kls_rescue; kls_rescue.takeIf(elided_here());   // timerfd_tick advances the timer (satoru)
             int s = lfd->backend_fd;
             timerfd_tick(s);
             if (s >= 0 && s < TIMERFD_MAX && g_timerfd[s].expirations > 0) ready |= L_EPOLLIN;
@@ -845,6 +1079,20 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
             ready |= L_EPOLLOUT;
             if (Kpty::Active() && Kpty::Hungup()) ready |= L_EPOLLHUP;
             break;
+        case LFD_PTY_SLAVE: {
+            int pt = lfd->backend_fd;
+            if (Kpty::SlaveReadable(pt)) ready |= L_EPOLLIN;
+            if (Kpty::SlaveWritable(pt)) ready |= L_EPOLLOUT;
+            if (Kpty::Hungup(pt)) ready |= L_EPOLLHUP;
+            break;
+        }
+        case LFD_PTY_MASTER: {
+            int pt = lfd->backend_fd;
+            if (Kpty::MasterReadable(pt)) ready |= L_EPOLLIN;
+            ready |= L_EPOLLOUT;
+            if (Kpty::Hungup(pt) || Kpty::MasterSlaveGone(pt)) ready |= L_EPOLLHUP;
+            break;
+        }
         case LFD_KVFS:
         case LFD_EXT4:
         case LFD_PROC:
@@ -890,6 +1138,7 @@ static uint32_t fd_readiness(LinuxProcess* p, int fd, uint32_t interest) {
 // fwd decl: defined further down. poll's cooperative block uses it to hand the
 // cpu to a sibling user thread. (satoru)
 static bool switch_to_ready_user(InterruptFrame* frame);
+static int g_switch_mode = -1;   // -1 = strict under sched=2 only; see switch_to_ready_user (satoru)
 // user-visible pids/tids are linuxprocess pids (what fork, kill and wait use),
 // not scheduler pids. (satoru)
 static uint32_t lpid_of_task(Process* t) {
@@ -956,6 +1205,7 @@ struct PollReg {
     uint16_t nkeys;
     bool     wildcard;        // fd-set too big to enumerate: wake on ANY readiness (satoru)
     bool     pending;         // producer fired in the pre-park window; parker must re-scan (satoru)
+    bool     covered;         // sched=2: every fd in the set has a producer wake (see poll_fd_covered) (satoru)
     uint32_t keys[16];
 };
 static constexpr int POLL_REG_MAX = 192;
@@ -979,9 +1229,36 @@ static uint32_t poll_fd_key(LinuxProcess* p, int fd) {
         // ~10ms+ added to every round trip once bytes actually flow. the nic
         // rx path wakes this key (see poll_wake_inet). (satoru)
         case LFD_INET:    return poll_obj_key(4, lfd->backend_fd);
+        case LFD_PTY_SLAVE:  return poll_obj_key(5, lfd->backend_fd);   // kpty: slave readable (satoru)
+        case LFD_PTY_MASTER: return poll_obj_key(6, lfd->backend_fd);   // kpty: master readable (satoru)
         default:          return 0;   // regular files / stubs stay on the timer (satoru)
     }
 }
+// sched=2 wait-storm fix: is readiness of this fd, for these events, always
+// announced by a producer wake (poll_wake_key)? if every fd of a parked waiter
+// is, the timer backstop is only a safety net and can be long - the 2-16 tick
+// backstop re-ran ~15k parked syscalls/s in a firefox boot, each one a kls
+// acquisition (the [klsprof] measurement). uncovered: timerfds (no expiry
+// wake), inet sockets waiting for POLLOUT (connect completion has no wake),
+// and every type with no producer at all. events = 0 means "any". (satoru)
+static bool poll_fd_covered(LinuxProcess* p, int fd, uint32_t events) {
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return false;
+    switch (p->fds[fd].type) {
+        case LFD_EVENTFD:
+        case LFD_SOCKET:
+        case LFD_PIPE:    return true;
+        case LFD_INET:    return events != 0 && !(events & 0x4u);   // POLLOUT/EPOLLOUT (satoru)
+        case LFD_PTY_SLAVE:
+        case LFD_PTY_MASTER: return events != 0 && !(events & 0x4u);   // readable wakes; a full ring does not (satoru)
+        default:          return false;
+    }
+}
+static bool g_poll_longwait = true;   // kurono.schedpoll=0 keeps the short backstop (satoru)
+// the task whose poll registration this cpu made for the wait it is parking now.
+// a registration left over from an earlier wait must not lengthen an unrelated
+// later one (reviewer finding). (satoru)
+static Process* g_reg_fresh[SMP_MAX_CPUS];
+
 // register the current poll waiter's fd-set so a producer can wake it. only the
 // wakeable backend types are recorded; if none are, no registration (that poll
 // legitimately relies on the timer). (satoru)
@@ -999,6 +1276,11 @@ static void poll_register(Process* task, LinuxProcess* p, const void* fdsp, uint
     // USER memory and a lazy page there would #PF inside a cli spinlock section.
     // (the readiness scan just touched every entry, but keep the invariant.) (satoru)
     uint32_t keys[16]; int nkeys = 0; bool wildcard = false;
+    bool covered = true;
+    for (uint64_t i = 0; i < nfds; i++) {
+        if (fds[i].fd < 0) continue;
+        if (!poll_fd_covered(p, fds[i].fd, (uint32_t)(uint16_t)fds[i].events)) covered = false;
+    }
     for (uint64_t i = 0; i < nfds; i++) {
         if (fds[i].fd < 0) continue;
         uint32_t k = poll_fd_key(p, fds[i].fd);
@@ -1022,6 +1304,8 @@ static void poll_register(Process* task, LinuxProcess* p, const void* fdsp, uint
     if (slot < 0) return;   // table full: fall back to the timer (satoru)
     PollReg* r = &g_pollreg[slot];
     r->task = task; r->wildcard = wildcard; r->pending = false;
+    r->covered = covered;
+    { uint32_t c = SMP::CpuIndex(); if (c < SMP_MAX_CPUS) g_reg_fresh[c] = task; }
     r->nkeys = (uint16_t)nkeys;
     for (int j = 0; j < nkeys; j++) r->keys[j] = keys[j];
 }
@@ -1040,10 +1324,32 @@ static bool poll_consume_pending(Process* task) {
     }
     return false;
 }
+static bool poll_reg_covered(Process* task) {
+    if (!task) return false;
+    SpinLockGuard g(g_pollreg_lock);
+    for (int i = 0; i < POLL_REG_MAX; i++)
+        if (g_pollreg[i].task == task) return g_pollreg[i].covered && !g_pollreg[i].pending;
+    return false;
+}
+// sched=2: a signal posted to a parked poller wakes it, so it takes the signal
+// (EINTR or the handler) now instead of at the backstop. (satoru)
+static void poll_wake_task(Process* task) {
+    if (!task) return;
+    SpinLockGuard g(g_pollreg_lock);
+    for (int i = 0; i < POLL_REG_MAX; i++) {
+        PollReg* r = &g_pollreg[i];
+        if (r->task != task) continue;
+        if (wake_blocked_to_ready(task)) { task->sleep_ticks = 0; g_poll_wakes++; r->task = nullptr; }
+        else r->pending = true;
+        return;
+    }
+}
+
 // epoll variant: register from a raw fd list (the epoll instance's watch set),
 // so an epoll_pwait waiter (firefox's IPC I/O threads) is also woken the instant
 // a watched fd goes readable. same table + semantics as poll_register. (satoru)
-static void poll_register_fdlist(Process* task, LinuxProcess* p, const int* fds, int nfds) {
+static void poll_register_fdlist(Process* task, LinuxProcess* p, const int* fds, int nfds,
+                                 const uint32_t* events = nullptr) {
     if (!task || !p || !fds) return;
     SpinLockGuard g(g_pollreg_lock);
     int slot = -1, free_slot = -1;
@@ -1055,6 +1361,12 @@ static void poll_register_fdlist(Process* task, LinuxProcess* p, const int* fds,
     if (slot < 0) return;
     PollReg* r = &g_pollreg[slot];
     r->task = task; r->nkeys = 0; r->wildcard = false; r->pending = false;
+    r->covered = true;
+    for (int i = 0; i < nfds; i++)
+        if (fds[i] >= 0 && !poll_fd_covered(p, fds[i], events ? events[i] : 0x1u)) r->covered = false;
+    {   // this registration belongs to the wait that is about to park (satoru)
+        uint32_t c = SMP::CpuIndex(); if (c < SMP_MAX_CPUS) g_reg_fresh[c] = task;
+    }
     for (int i = 0; i < nfds; i++) {
         if (fds[i] < 0) continue;
         uint32_t k = poll_fd_key(p, fds[i]);
@@ -1100,13 +1412,14 @@ static inline void poll_wake_inet(int sd)       { poll_wake_key(poll_obj_key(4, 
 // uart in the 9-10s window) serialized the early munmap/madvise path so hard
 // the wedge vanished 6/6 (a heisen-fix, and a hint the race lives in remap
 // timing). record to memory instead (ns cost), dump once on wedge detection. (satoru)
-struct RemapEv { uint32_t t_ms; uint8_t kind; uint64_t addr; uint64_t len; };
-static RemapEv  g_remap_ring[256];
+struct RemapEv { uint32_t t_ms; uint8_t kind; uint64_t as; uint64_t addr; uint64_t len; };
+static RemapEv  g_remap_ring[512];
 static volatile uint32_t g_remap_head = 0;
-static inline void remap_note(uint8_t kind, uint64_t addr, uint64_t len) {
-    uint32_t h = __atomic_fetch_add(&g_remap_head, 1u, __ATOMIC_RELAXED) & 255u;
+static inline void remap_note(uint8_t kind, uint64_t as, uint64_t addr, uint64_t len) {
+    uint32_t h = __atomic_fetch_add(&g_remap_head, 1u, __ATOMIC_RELAXED) & 511u;
     g_remap_ring[h].t_ms = (uint32_t)Timer::GetRealMs64();
-    g_remap_ring[h].kind = kind;   // 1=munmap 2=madv_dontneed 3=mprotect (satoru)
+    g_remap_ring[h].kind = kind;   // 1=munmap 2=madv_dontneed 3=mprotect 4=mmap 5=mapfixed 6=brk (satoru)
+    g_remap_ring[h].as   = as;
     g_remap_ring[h].addr = addr;
     g_remap_ring[h].len  = len;
 }
@@ -1120,6 +1433,10 @@ static inline void remap_note(uint8_t kind, uint64_t addr, uint64_t len) {
 // fully alive; the waits themselves pace on kls_relax/sleep instead. (satoru)
 static inline void pump_ui_throttled() {
     if (SMP::CpuIndex() != 0) return;   // ui is bsp-only (satoru)
+    // a modal normally owns the screen, but the syscall pump is the fallback
+    // compositor when the gui process is starved: PumpUI routes input to the
+    // prompt and draws it over the desktop in that case. (satoru)
+    if (KSA::SecureDesktopActive() && !KSA::ModalActive()) return;
     static uint64_t s_last_pump_ms = 0;
     uint64_t nw = Timer::GetRealMs64();
     if (nw - s_last_pump_ms >= 33) {
@@ -1151,11 +1468,23 @@ static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
     // ui frame of wakeup latency, acceptable); a timed poll wakes for its own
     // deadline, clamped [2,16]. (satoru)
     uint32_t rt = 2;
+    // sched=2: a waiter whose whole set is producer-woken keeps the timer only
+    // as a safety net: 250 ticks, or its own deadline. (satoru)
+    uint32_t cap = 16, inf = 8;
+    {
+        uint32_t c = SMP::CpuIndex(); if (c >= SMP_MAX_CPUS) c = 0;
+        bool fresh = (g_reg_fresh[c] == task);
+        g_reg_fresh[c] = nullptr;
+        if (Scheduler::SchedV2() && g_poll_longwait && fresh && poll_reg_covered(task)) { cap = 250; inf = 250; }
+    }
+    if (restart_nr == 61) rt = 10;   // a parked wait4 re-checks every few ticks, not every other one (satoru)
     if (p->poll_blocking) {
         uint64_t dl  = p->poll_deadline_ms;
         uint64_t nw  = Time::GetTicks();
-        if (dl == 0xFFFFFFFFFFFFFFFFULL) rt = 8;
-        else if (dl > nw) { uint64_t r = dl - nw; rt = r > 16 ? 16 : (r < 2 ? 2 : (uint32_t)r); }
+        if (dl == 0xFFFFFFFFFFFFFFFFULL) rt = inf;
+        else if (dl > nw) { uint64_t r = dl - nw; rt = r > cap ? cap : (r < 2 ? 2 : (uint32_t)r); }
+    } else if (cap > 16 && (restart_nr == 0 || restart_nr == 45 || restart_nr == 47)) {
+        rt = inf;   // a blocking read/recv on a covered fd (unix_recv_wait) (satoru)
     }
     // single-owner: state + sleep_ticks under g_sched_lock. (satoru)
     { uint64_t sf; Scheduler::StateLock(&sf); task->state = Process_Blocked; task->sleep_ticks = rt; Scheduler::StateUnlock(sf); }
@@ -1187,7 +1516,7 @@ static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
         // keep the protocol identical to the futex park. bsp + non-thread
         // keep the in-place fallback (the bsp anchors the session and pumps
         // ui/net between scans; ClaimReadyThreadForCpu never claims leaders). (satoru)
-        if (SMP::CpuIndex() != 0 && task->is_thread()) {
+        if (SMP::CpuIndex() != 0 && Scheduler::ApResumable(task)) {
             bool park_ok = false;
             {
                 uint64_t sf; Scheduler::StateLock(&sf);
@@ -1200,7 +1529,7 @@ static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
                 Scheduler::StateUnlock(sf);
             }
             if (park_ok) {
-                __atomic_store_n(&task->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                Scheduler::ReleaseOnCpu(task);   // sched=2 defers until off this stack (satoru)
                 SMP::ApIdleFrame(current_syscall_frame);
                 current_frame_rewritten = true;
                 g_poll_parked++;   // forensics (satoru)
@@ -1222,6 +1551,13 @@ static bool poll_try_deschedule(LinuxProcess* p, int restart_nr) {
 // with every thread pinned to the bsp (firefox's main thread hung on glxtest). (satoru)
 static int32_t unix_recv_wait(LinuxProcess* p, int fd, int restart_nr) {
     poll_register_fdlist(p->task, p, &fd, 1);
+    // data (or a hangup) that landed before the registration woke nobody: look once more, and
+    // if there is something, run the read again at once instead of parking on it. (satoru)
+    if (current_syscall_frame && fd_readiness(p, fd, L_EPOLLIN | L_EPOLLHUP)) {
+        poll_unregister(p->task);
+        current_syscall_frame->rip -= 2;
+        return restart_nr;
+    }
     if (poll_try_deschedule(p, restart_nr)) return 0;   // switched; frame rewritten (satoru)
     poll_unregister(p->task);   // not parked (satoru)
     if (SMP::CpuIndex() == 0) pump_ui_throttled();
@@ -1235,6 +1571,15 @@ static int32_t unix_recv_wait(LinuxProcess* p, int fd, int restart_nr) {
 // set around a plain read(): nested sys_read callers (readv, sendfile, splice)
 // must not rewind the frame, it would restart read with their args. (satoru)
 static bool g_read_direct[SMP_MAX_CPUS] = {};
+
+// is a signal this thread can take pending? mirrors the deliverable mask the
+// syscall boundary uses (pending & ~blocked). an in-place wait must leave on it:
+// End Task's SIGKILL is a pending bit, not a wake, so without this the bsp
+// poller sat in its own loop until the timeout and the kill looked stuck. (satoru)
+static inline bool poll_signal_deliverable(const LinuxProcess* p) {
+    if (!p) return false;
+    return (__atomic_load_n(&p->sig_pending, __ATOMIC_ACQUIRE) & ~p->sig_blocked) != 0;
+}
 
 // shared poll/ppoll wait. scan readiness; if nothing is ready, hand the cpu to a
 // sibling user thread and re-run this syscall on wake, until an fd is ready or the
@@ -1317,9 +1662,29 @@ static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
         // park is not lost (the deschedule commits Blocked under the state lock;
         // a producer's Blocked->Ready CAS then either lands or no-ops). (satoru)
         poll_register(p->task, p, fds, nfds);
+        // re-scan once now that the registration is visible: a producer on another cpu runs
+        // WITHOUT kls (pipe/socket writes), so one that fired between the scan above and the
+        // registration found no waiter to wake and would otherwise be picked up only by the
+        // timer backstop. linux does the same (prepare_to_wait, then re-check the condition). (satoru)
+        {
+            bool again = false;
+            for (uint64_t i = 0; i < nfds && !again; i++) {
+                if (fds[i].fd < 0) continue;
+                uint32_t interest = (uint32_t)(uint16_t)fds[i].events | L_EPOLLERR | L_EPOLLHUP;
+                if (fd_readiness(p, fds[i].fd, interest)) again = true;
+            }
+            if (again) { poll_unregister(p->task); continue; }
+        }
         // hand the cpu to a sibling user thread; this poll re-runs when we wake (satoru)
         if (poll_try_deschedule(p, restart_nr)) return 0;   // switched; return value ignored
-        poll_unregister(p->task);   // bsp in-place fallback: not parked, drop the reg (satoru)
+        // a signal this thread can take ends the wait at once (EINTR). the parked
+        // ap path above is already woken by sig_post under sched=2; the in-place
+        // fallback is not, so check here before sleeping again. (satoru)
+        if (poll_signal_deliverable(p)) {
+            p->poll_blocking = false;
+            poll_unregister(p->task);
+            return -4;   // -EINTR; the syscall boundary delivers the signal (satoru)
+        }
         // no sibling to switch to: cooperative in-place wait, then re-scan. on the
         // bsp that means pumping the ui + yielding to kernel procs; on an ap there
         // are no kernel procs and no ui - release the kls lock so the other cores'
@@ -1330,7 +1695,16 @@ static int do_poll_wait(LinuxProcess* p, void* fdsp, uint64_t nfds,
             // 10 ms cadence (no-op with no live inet socket). (satoru)
             LinuxNetBridge::PumpTick();
             pump_ui_throttled();
+            // sleep, do not spin. kls_relax_sleep_ms releases the kls (elided poll
+            // holds none) and hlt/donates for the slice, so an idle single-threaded
+            // leader no longer burns the bsp in ring-0. keep the registration live
+            // through the sleep: a producer's wake sets pending, so drop it and
+            // re-scan now instead of waiting out the timer. (satoru)
+            kls_relax_sleep_ms(1);
+            poll_consume_pending(p->task);
+            continue;
         }
+        poll_unregister(p->task);   // ap in-place fallback: not parked, drop the reg (satoru)
         // sleep with the kls RELEASED: readiness may depend on a sibling's
         // syscall on another core (pipe/eventfd writer), which needs this
         // lock. holding it across the breath forced the 3s hard-steal. (satoru)
@@ -1360,21 +1734,382 @@ static void kvfs_release(int b) {
     KVFS::Close(b);
 }
 
+// pty fds count their open ends in the pair: the slave refs decide when a master read sees
+// the hangup, the master refs when the slave is hung up. (satoru)
+static inline bool lfd_is_pty(const LinuxFd* f) { return f->type == LFD_PTY_MASTER || f->type == LFD_PTY_SLAVE; }
+// fds with no zero-copy path: sendfile/splice/copy_file_range answer EINVAL and the caller reads (satoru)
+static inline bool lfd_no_zcopy(const LinuxFd* f) { return f->type == LFD_PTY_MASTER || f->type == LFD_PTY_SLAVE || f->type == LFD_DEVKEXEC; }
+static void pty_fd_retain(const LinuxFd* f) {
+    if (f->backend_fd < 0) return;
+    if (f->type == LFD_PTY_MASTER) Kpty::MasterRef(f->backend_fd, 1); else Kpty::SlaveRef(f->backend_fd, 1);
+}
+static void pty_fd_release(const LinuxFd* f) {
+    if (f->backend_fd < 0) return;
+    if (f->type == LFD_PTY_MASTER) Kpty::MasterRef(f->backend_fd, -1); else Kpty::SlaveRef(f->backend_fd, -1);
+}
+
 static void retain_dup_backend(const LinuxFd* f) {
     if (!f || f->backend_fd < 0) return;
+    if (lfd_is_pty(f)) { pty_fd_retain(f); return; }
     if (f->type == LFD_KVFS) { kvfs_retain(f->backend_fd); return; }
     if (f->type == LFD_SOCKET || f->type == LFD_PIPE) UnixSocket::Retain(f->backend_fd);
     else if (f->type == LFD_INET) LinuxNetBridge::Retain(f->backend_fd);
 }
 
-static void clone_file_descriptors(const LinuxProcess* parent, LinuxProcess* child) {
-    for (int fd = 0; fd < LINUX_MAX_FDS; fd++) {
-        child->fds[fd].open = false;
-        if (!parent->fds[fd].open) continue;
+static LinuxFd g_dead_fds[LINUX_MAX_FDS];   // all closed: a destroyed slot points here (satoru)
 
-        const LinuxFd* src = &parent->fds[fd];
+// ── per-table fd lock (the files_struct->file_lock of linux, step 2 of the kls split) ──
+// every fd table now sits behind a 64 byte header holding its own spinlock and a
+// reservation bitmap. the lock covers what must be atomic against another cpu that is
+// NOT inside kls: claiming a free slot (AllocFd, dup), clearing a slot (close), the
+// flag read-modify-writes of fcntl and the fork-time copy. a slot a syscall has
+// allocated but not yet filled is marked in the bitmap so a second allocator cannot
+// pick it; the marks belong to the allocating linux record (not to a cpu) and are
+// dropped when that syscall returns (fd_rsv_release), which also covers early-error
+// returns that never fill the slot. the header is found from the table pointer, so
+// LinuxProcess did not grow and CLONE_FILES sharing is unchanged. a table is never
+// freed at once (fdt_free parks it in a graveyard for 2 s): an elided dup or fcntl on
+// another cpu may still be inside the lock when the last holder is destroyed, the
+// role the refcount on files_struct plays in linux. lock order: kls -> fd table lock
+// -> reservation list lock; nothing under the fd lock may take kls. (satoru)
+struct FdTabHdr {
+    Spinlock lock;
+    uint32_t rsv[LINUX_MAX_FDS / 32];
+    uint8_t  pad[64 - sizeof(Spinlock) - (LINUX_MAX_FDS / 32) * 4];
+};
+static_assert(sizeof(FdTabHdr) == 64, "fd table header must stay 64 bytes");
+static FdTabHdr g_dead_hdr;
+static inline FdTabHdr* fdt_hdr(LinuxFd* f) {
+    return f == g_dead_fds ? &g_dead_hdr : (FdTabHdr*)((uint8_t*)f - sizeof(FdTabHdr));
+}
+static LinuxFd* fdt_alloc() {
+    size_t sz = sizeof(FdTabHdr) + sizeof(LinuxFd) * LINUX_MAX_FDS;
+    uint8_t* m = (uint8_t*)KernelHeap::Alloc(sz);
+    if (!m) return nullptr;
+    memset(m, 0, sz);
+    return (LinuxFd*)(m + sizeof(FdTabHdr));
+}
+// graveyard: the memory of a destroyed table stays valid, and shows every fd closed (the exit
+// path clears them), until it is 2 s old. (satoru)
+struct FdGrave { LinuxFd* tab; uint64_t ms; };
+static constexpr int FD_GRAVE_N = 32;
+static FdGrave g_fd_grave[FD_GRAVE_N];
+static Spinlock g_fd_grave_lock;
+// a table nobody ever saw (CreateProcess's fresh one, replaced by the leader's at CLONE_FILES) goes at once. (satoru)
+static void fdt_free_unseen(LinuxFd* f) {
+    if (f && f != g_dead_fds) KernelHeap::Free((uint8_t*)f - sizeof(FdTabHdr));
+}
+static void fdt_free(LinuxFd* f) {
+    if (!f || f == g_dead_fds) return;
+    uint64_t now = Timer::GetRealMs64();
+    LinuxFd* out[FD_GRAVE_N + 1]; int nout = 0;
+    {
+        SpinLockGuard g(g_fd_grave_lock);
+        int freeslot = -1, oldest = 0;
+        for (int i = 0; i < FD_GRAVE_N; i++) {
+            if (g_fd_grave[i].tab && now - g_fd_grave[i].ms >= 2000) { out[nout++] = g_fd_grave[i].tab; g_fd_grave[i].tab = nullptr; }
+            if (!g_fd_grave[i].tab) { if (freeslot < 0) freeslot = i; }
+            else if (g_fd_grave[i].ms < g_fd_grave[oldest].ms || !g_fd_grave[oldest].tab) oldest = i;
+        }
+        if (freeslot < 0) { out[nout++] = g_fd_grave[oldest].tab; freeslot = oldest; }   // full: the oldest goes now (satoru)
+        g_fd_grave[freeslot].tab = f; g_fd_grave[freeslot].ms = now;
+    }
+    for (int i = 0; i < nout; i++) KernelHeap::Free((uint8_t*)out[i] - sizeof(FdTabHdr));
+}
+// reservations, by owner: a linux record index (a syscall's own thread) or, for kernel code
+// with no record, LINUX_MAX_PROCS + cpu. (satoru)
+struct FdRsv { LinuxFd* tab; int16_t idx; };
+static constexpr int FD_RSV_MAX = 8;
+static constexpr int FD_RSV_OWNERS = LINUX_MAX_PROCS + SMP_MAX_CPUS;
+static FdRsv    g_fd_rsv[FD_RSV_OWNERS][FD_RSV_MAX];
+static volatile uint8_t g_fd_rsv_n[FD_RSV_OWNERS];
+static Spinlock g_fd_rsv_lock;
+static inline int fd_owner() {
+    int o = LinuxSyscall::GetCurrentIndex();
+    if (o >= 0 && o < LINUX_MAX_PROCS) return o;
+    uint32_t c = SMP::CpuIndex();
+    return LINUX_MAX_PROCS + (int)(c < SMP_MAX_CPUS ? c : 0);
+}
+// drop an owner's reservations. a slot that was filled stays open; one that was not
+// becomes free again. (satoru)
+static void fd_rsv_release(int owner) {
+    if (owner < 0 || owner >= FD_RSV_OWNERS || !g_fd_rsv_n[owner]) return;
+    FdRsv mine[FD_RSV_MAX]; int n;
+    {
+        SpinLockGuard g(g_fd_rsv_lock);
+        n = g_fd_rsv_n[owner];
+        for (int i = 0; i < n; i++) mine[i] = g_fd_rsv[owner][i];
+        g_fd_rsv_n[owner] = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        FdTabHdr* h = fdt_hdr(mine[i].tab);
+        SpinLockGuard g(h->lock);
+        h->rsv[mine[i].idx >> 5] &= ~(1u << (mine[i].idx & 31));
+    }
+}
+// first free, unreserved slot >= minfd, reserved for the caller. h->lock must be held. (satoru)
+static int fd_alloc_locked(LinuxFd* t, FdTabHdr* h, int minfd) {
+    if (minfd < 0) minfd = 0;
+    int owner = fd_owner();
+    for (int i = minfd; i < LINUX_MAX_FDS; i++) {
+        if (t[i].open || (h->rsv[i >> 5] & (1u << (i & 31)))) continue;
+        SpinLockGuard g(g_fd_rsv_lock);
+        if (g_fd_rsv_n[owner] >= FD_RSV_MAX) {
+            // never happens (a syscall allocates at most 2, recvmsg up to 32 but fills each at
+            // once): forget the oldest mark, its slot is filled by now. (satoru)
+            FdRsv& o = g_fd_rsv[owner][0];
+            if (o.tab == t) h->rsv[o.idx >> 5] &= ~(1u << (o.idx & 31));
+            for (int k = 1; k < FD_RSV_MAX; k++) g_fd_rsv[owner][k - 1] = g_fd_rsv[owner][k];
+            g_fd_rsv_n[owner]--;
+        }
+        h->rsv[i >> 5] |= 1u << (i & 31);
+        g_fd_rsv[owner][g_fd_rsv_n[owner]] = { t, (int16_t)i };
+        g_fd_rsv_n[owner]++;
+        return i;
+    }
+    return -1;
+}
+
+// dup, F_DUPFD and F_DUPFD_CLOEXEC: find the slot, copy the source and take the backend
+// reference in one fd-lock section, so a close of the source on another cpu cannot slip
+// between the copy and the reference (the fget/fput rule of linux). (satoru)
+static int32_t fd_dup_locked(LinuxProcess* p, int oldfd, int minfd, bool cloexec) {
+    LinuxFd* t = p->fds;
+    FdTabHdr* h = fdt_hdr(t);
+    SpinLockGuard g(h->lock);
+    if (oldfd < 0 || oldfd >= LINUX_MAX_FDS || !t[oldfd].open) return -9;
+    int n = fd_alloc_locked(t, h, minfd);
+    if (n < 0) return -24;
+    memcpy(&t[n], &t[oldfd], sizeof(LinuxFd));
+    if (cloexec) t[n].flags |= 0x80000u; else t[n].flags &= ~0x80000u;   // O_CLOEXEC; a dup never inherits it (satoru)
+    // aliased backends are refcounted so either fd's close is safe (satoru)
+    retain_dup_backend(&t[n]);
+    return n;
+}
+
+// ── unix sockets and pipes without kls (step 3 of the split) ────────────────────────────
+// a pipe is a unix socketpair, so one set of helpers serves both. read/write/recv/send pin the
+// socket the way linux fget() pins a struct file: the fd lookup and a reference on the
+// backend happen in one fd-lock section, the reference is dropped when the call is done, so a
+// close() on another cpu cannot free the socket (or hand its slot to a new one) under a
+// transfer in progress. the transfer itself goes through a kernel bounce buffer, because the
+// socket layer copies under its own irq-off spinlock and a user page fault there would wedge. (satoru)
+struct SockRef { int sd; uint32_t flags; };
+static bool fd_get_sock(LinuxProcess* p, int fd, SockRef* out) {
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS) return false;
+    SpinLockGuard g(fdt_hdr(p->fds)->lock);
+    LinuxFd* f = &p->fds[fd];
+    if (!f->open || (f->type != LFD_SOCKET && f->type != LFD_PIPE) || f->backend_fd < 0) return false;
+    UnixSocket::Retain(f->backend_fd);
+    out->sd = f->backend_fd;
+    out->flags = f->flags;
+    return true;
+}
+static inline void fd_put_sock(int sd) { UnixSocket::Close(sd); }
+// the same pin for af_inet fds. dropping the LAST reference tears the bridge slot down, which
+// the bridge table only tolerates under kls, so that rare case (the fd was closed while the
+// call was running) takes it. (satoru)
+struct InetRef { int sd; uint32_t flags; };
+static bool fd_get_inet(LinuxProcess* p, int fd, InetRef* out) {
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS) return false;
+    SpinLockGuard g(fdt_hdr(p->fds)->lock);
+    LinuxFd* f = &p->fds[fd];
+    if (!f->open || f->type != LFD_INET || f->backend_fd < 0) return false;
+    LinuxNetBridge::Retain(f->backend_fd);
+    out->sd = f->backend_fd;
+    out->flags = f->flags;
+    return true;
+}
+static void inet_put(int sd);   // after kls_held_here, below (satoru)
+struct InetGuard { int sd; ~InetGuard() { inet_put(sd); } };
+// write(2) / send(2) of a user buffer on an inet socket, in 4 KB pieces through a kernel buffer, for as long
+// as the stack takes whole pieces: a tcp write used to move up to the send window (~11 KB) in one call and
+// callers such as writev only cope with a short count when it is really short. a datagram (<= 1472) is one
+// piece. (satoru)
+static int inet_send_user(int sd, const uint8_t* src, uint64_t count, const LinuxSockaddrIn* pd, int flags) {
+    uint8_t kb[4096];
+    uint64_t done = 0;
+    do {
+        uint64_t n = count - done; if (n > sizeof(kb)) n = sizeof(kb);
+        memcpy(kb, src + done, (size_t)n);
+        int r = pd ? LinuxNetBridge::Sendto(sd, kb, (int)n, flags, pd) : LinuxNetBridge::Send(sd, kb, (int)n, 0);
+        if (r < 0) return done ? (int)done : r;
+        done += (uint64_t)r;
+        if ((uint64_t)r < n) break;
+    } while (done < count);
+    return (int)done;
+}
+// type of an fd without pinning anything: the elision gate only needs a hint, the body re-checks. (satoru)
+static int fd_peek_type(LinuxProcess* p, int fd, int* backend) {
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS) return -1;
+    SpinLockGuard g(fdt_hdr(p->fds)->lock);
+    if (!p->fds[fd].open) return -1;
+    if (backend) *backend = p->fds[fd].backend_fd;
+    return (int)p->fds[fd].type;
+}
+// one send of kernel memory; a send into an in-kernel server (wayland, pulse, dbus) runs that
+// server's handler and needs kls, so it is retried holding it. (satoru)
+static int unix_send_k(int sd, const void* kb, int n, const UnixSocket::ControlMsg* cm) {
+    int r = cm ? UnixSocket::SendMsg(sd, kb, n, 0, cm) : UnixSocket::Send(sd, kb, n, 0);
+    if (r == UnixSocket::UNIX_NEED_KLS) {
+        kls_lock();
+        r = cm ? UnixSocket::SendMsg(sd, kb, n, 0, cm) : UnixSocket::Send(sd, kb, n, 0);
+        kls_unlock();
+    }
+    return r;
+}
+// write(2) / send(2) of a user buffer. a stream goes out in 4 KB pieces (a short write is legal;
+// a write of PIPE_BUF or less stays one piece); a datagram is one message. (satoru)
+static int unix_send_user(int sd, const uint8_t* src, uint64_t count) {
+    if (UnixSocket::IsStream(sd)) {
+        uint8_t kb[4096];
+        uint64_t done = 0;
+        while (done < count) {
+            uint64_t n = count - done; if (n > sizeof(kb)) n = sizeof(kb);
+            memcpy(kb, src + done, n);
+            int r = unix_send_k(sd, kb, (int)n, nullptr);
+            if (r < 0) return done ? (int)done : r;
+            done += (uint64_t)r;
+            if ((uint64_t)r < n) break;
+        }
+        return (int)done;
+    }
+    if (count <= 8192) {
+        uint8_t kb[8192];
+        memcpy(kb, src, count);
+        return unix_send_k(sd, kb, (int)count, nullptr);
+    }
+    uint8_t* big = (uint8_t*)KernelHeap::Alloc(count);
+    if (!big) return -12;
+    memcpy(big, src, count);
+    int r = unix_send_k(sd, big, (int)count, nullptr);
+    KernelHeap::Free(big);
+    return r;
+}
+// read(2) / recv(2) into a user buffer: kernel bounce, then the copy-out with no lock held. a stream
+// keeps pulling 4 KB pieces while the ring has more (bounded), a datagram is one message. (satoru)
+static int unix_recv_user(int sd, uint8_t* dst, uint64_t count) {
+    uint8_t kb[4096];
+    bool stream = UnixSocket::IsStream(sd);
+    if (!stream && count > sizeof(kb)) {
+        // a datagram is read whole or truncated by the receiver's buffer, never by our bounce size. (satoru)
+        uint64_t cap = count < (uint64_t)UnixSocket::UNIX_RING_BYTES ? count : (uint64_t)UnixSocket::UNIX_RING_BYTES;
+        uint8_t* big = (uint8_t*)KernelHeap::Alloc(cap);
+        if (!big) return -12;
+        int r = UnixSocket::Recv(sd, big, (int)cap, 0);
+        if (r > 0) memcpy(dst, big, (size_t)r);
+        KernelHeap::Free(big);
+        return r;
+    }
+    uint64_t done = 0;
+    for (int iter = 0; iter < 64 && (iter == 0 || done < count); iter++) {
+        uint64_t want = count - done; if (want > sizeof(kb)) want = sizeof(kb);
+        int r = UnixSocket::Recv(sd, kb, (int)want, 0);
+        if (r <= 0) return done ? (int)done : r;
+        memcpy(dst + done, kb, (size_t)r);
+        done += (uint64_t)r;
+        if (!stream || (uint64_t)r < want) break;
+    }
+    return (int)done;
+}
+
+// ── kls split (kurono.kls=global forces the old single lock for a/b) ─────────
+// syscalls whose whole state is covered by an object lock of their own run without
+// the global serializer, the way linux dropped the big kernel lock one family at a
+// time. decided per call at entry, from the arguments, by kls_elide below. every
+// family listed there must be safe against the kls-holding syscalls that run at the
+// same time on other cpus, because kls no longer excludes it from them. (satoru)
+static bool g_kls_global = false;
+static inline bool kls_elide(const InterruptFrame* frame) {
+    if (g_kls_global) return false;
+    switch (frame->rax) {
+        case 32:   // dup: slot claim + backend reference under the fd table lock (satoru)
+        case 22: case 293: case 53:   // pipe, pipe2, socketpair: fd slots reserved, socket layer locks itself (satoru)
+            return true;
+        // read/write family on pipes and unix sockets: the socket layer locks itself, the fd is
+        // pinned like fget, the copy goes through a kernel bounce. a send into an in-kernel
+        // server (wayland, pulse, dbus) still takes kls, it runs the server's handler. (satoru)
+        case 0: case 19: case 45: case 47:       // read, readv, recvfrom, recvmsg
+        case 1: case 20: case 44: case 46: {     // write, writev, sendto, sendmsg
+            LinuxProcess* p = LinuxSyscall::Current();
+            int bk = -1;
+            int ty = fd_peek_type(p, (int)frame->rdi, &bk);
+            if (ty == LFD_INET) return true;   // bridge calls lock the stack themselves (satoru)
+            if (ty != LFD_SOCKET && ty != LFD_PIPE) return false;
+            uint64_t n = frame->rax;
+            if (n == 1 || n == 20 || n == 44 || n == 46) return !UnixSocket::NeedsKlsToSend(bk);
+            return true;
+        }
+        // poll/ppoll over pipes, unix sockets, eventfds and plain files: readiness is read from
+        // objects that lock themselves (unix_socket.cpp) or are plain words (eventfd counters), the
+        // wait goes through the poll registry with its own lock, and the register-then-rescan in
+        // do_poll_wait covers producers that no longer hold kls. a set holding anything else
+        // (inet, timerfd, console, epoll, signalfd) keeps kls. (satoru)
+        case 7: case 271: {
+            uint64_t nfds = frame->rsi;
+            if (nfds == 0 || nfds > 64) return false;
+            if (!UAccess::AccessOk(frame->rdi, nfds * 8)) return false;
+            LinuxProcess* p = LinuxSyscall::Current();
+            const int32_t* ufd = (const int32_t*)frame->rdi;
+            for (uint64_t i = 0; i < nfds; i++) {
+                int32_t fd = ufd[i * 2];            // struct pollfd { int fd; short events, revents; }
+                if (fd < 0) continue;
+                int ty = fd_peek_type(p, fd, nullptr);
+                switch (ty) {
+                    case LFD_SOCKET: case LFD_PIPE: case LFD_EVENTFD: case LFD_INET:
+                    case LFD_KVFS: case LFD_EXT4: case LFD_PROC: case LFD_DEVNULL:
+                    case LFD_DEVURANDOM: case LFD_DEVKSHELL: case LFD_BLOCKDEV:
+                    case -1:                        // closed: the scan reports POLLERR (satoru)
+                        break;
+                    default: return false;
+                }
+            }
+            return true;
+        }
+        // epoll_wait (232), epoll_ctl (233), epoll_pwait (281): the watch table has a lock of its own, the
+        // scan copies it out and computes readiness with no lock held (readiness of a watched timerfd takes
+        // kls itself). (satoru)
+        case 232: case 233: case 281: {
+            LinuxProcess* p = LinuxSyscall::Current();
+            return fd_peek_type(p, (int)frame->rdi, nullptr) == LFD_EPOLL;
+        }
+        case 72:   // fcntl: only the fd-flag and dup commands; locks (F_SETLK..) keep kls (satoru)
+            { uint64_t c = frame->rsi; return c <= 4 || c == 1030; }
+        default:
+            return false;
+    }
+}
+
+static void clone_file_descriptors(const LinuxProcess* parent, LinuxProcess* child) {
+    // phase 1, under the parent's fd lock: snapshot the table and take the shared backend
+    // references. an elided dup/close/fcntl on a sibling thread (CLONE_FILES) can no longer
+    // tear a slot under the copy, or close a socket between the copy and its reference. (satoru)
+    {
+        SpinLockGuard fg(fdt_hdr(parent->fds)->lock);
+        for (int fd = 0; fd < LINUX_MAX_FDS; fd++) {
+            LinuxFd* dst = &child->fds[fd];
+            const LinuxFd* src = &parent->fds[fd];
+            dst->open = false;
+            if (!src->open) continue;
+            memcpy(dst, src, sizeof(LinuxFd));
+            // parent + child now both reference the SAME global unix-socket sd
+            // (backend_fd copied verbatim). count the inherited reference so the
+            // parent's standard post-fork close of the child's socketpair end
+            // doesn't sever its own still-live ipc end -- the root of the firefox
+            // e10s busy-spin (child replies had nowhere to land). (satoru)
+            if (src->type == LFD_SOCKET || src->type == LFD_PIPE) UnixSocket::Retain(dst->backend_fd);
+            // same aliasing story for af_inet: bump the bridge refcount so
+            // either side's close doesn't tear down the shared stack socket.
+            // (satoru)
+            else if (src->type == LFD_INET) LinuxNetBridge::Retain(dst->backend_fd);
+            else if (lfd_is_pty(src)) pty_fd_retain(dst);
+        }
+    }
+    // phase 2: the child's private copy, no lock needed.
+    for (int fd = 0; fd < LINUX_MAX_FDS; fd++) {
         LinuxFd* dst = &child->fds[fd];
-        memcpy(dst, src, sizeof(LinuxFd));
+        if (!dst->open) continue;
+        const LinuxFd* src = dst;
 
         // epoll/eventfd/timerfd/signalfd reference GLOBAL kernel slots (g_epoll/
         // g_eventfd/g_timerfd), not per-process state. a plain memcpy makes the
@@ -1390,25 +2125,14 @@ static void clone_file_descriptors(const LinuxProcess* parent, LinuxProcess* chi
             continue;
         }
 
-        if (src->type == LFD_SOCKET || src->type == LFD_PIPE) {
-            // parent + child now both reference the SAME global unix-socket sd
-            // (backend_fd copied verbatim). count the inherited reference so the
-            // parent's standard post-fork close of the child's socketpair end
-            // doesn't sever its own still-live ipc end -- the root of the firefox
-            // e10s busy-spin (child replies had nowhere to land). (satoru)
-            UnixSocket::Retain(dst->backend_fd);
-            continue;
-        }
-
-        if (src->type == LFD_INET) {
-            // same aliasing story for af_inet: bump the bridge refcount so
-            // either side's close doesn't tear down the shared stack socket.
-            // (satoru)
-            LinuxNetBridge::Retain(dst->backend_fd);
-            continue;
-        }
-
         if (src->type == LFD_KVFS) {
+            // a directory (or path-only) fd has no kvfs file handle: getdents/fstat/
+            // fchdir/"/proc/self/fd/N" go by lfd->path. KVFS::Open refuses dirs, so the
+            // reopen below closed every inherited directory fd in a fork child - bun
+            // spawns claude's ripgrep with cwd "/proc/self/fd/N" (the search root it
+            // holds open), the child's chdir hit a closed fd -> ENOTDIR -> exit 127, and
+            // every Glob/Grep failed. keep it as is. (satoru)
+            if (src->backend_fd < 0) continue;
             int backend = KVFS::Open(src->path, kvfs_open_flags(src->flags));
             if (backend < 0) {
                 dst->open = false;
@@ -1566,6 +2290,150 @@ static Process* region_owner(Process* p) {
 static Process*          g_fr_cache_owner[SMP_MAX_CPUS] = {};
 static UserMemoryRegion* g_fr_cache_region[SMP_MAX_CPUS] = {};
 
+// item 10 (firefox OOM abort with 1.5 gb free): the region table is 4096 slots
+// inline in struct Process, and firefox's main process fills it ~110 s into a
+// tabs session (2900 live maps <= 64 kb, only 14 mergeable pairs: genuinely
+// separate mappings; linux allows 65530). every further mmap failed ENOMEM and
+// moz_xmalloc aborted. struct Process must not grow (a field added there once
+// caused a deterministic #GP, and threads would each carry the cost), so a full
+// table gets extension chunks of 4096 slots from the heap, owned here, up to 7
+// (32768 regions). chunks are never reallocated or moved while their owner
+// lives, so the lock-free readers (the fault path) never see freed memory. an
+// owner is the table's Process plus its pid and address space; execve and the
+// address space's destruction release the chunks. (satoru)
+static constexpr int REXT_CHUNK      = PROCESS_MAX_USER_REGIONS;
+static constexpr int REXT_MAX_CHUNKS = 7;
+static constexpr int REXT_OWNERS     = 32;
+struct RegionExt {
+    Process*          owner;
+    uint32_t          pid;
+    uint64_t          as;
+    int               nchunks;
+    UserMemoryRegion* chunk[REXT_MAX_CHUNKS];
+};
+static RegionExt g_rext[REXT_OWNERS];
+static Spinlock  g_rext_lock;
+static uint32_t  g_rext_chunks_live = 0;   // census / log (satoru)
+
+static RegionExt* rext_find(Process* p) {
+    if (!p) return nullptr;
+    for (int i = 0; i < REXT_OWNERS; i++) {
+        RegionExt* e = &g_rext[i];
+        if (__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE) == p &&
+            e->pid == p->pid && e->as == p->address_space) return e;
+    }
+    return nullptr;
+}
+static inline int region_limit(const RegionExt* e) {
+    return PROCESS_MAX_USER_REGIONS +
+           (e ? __atomic_load_n(&e->nchunks, __ATOMIC_ACQUIRE) * REXT_CHUNK : 0);
+}
+static inline UserMemoryRegion* region_at(Process* p, RegionExt* e, int i) {
+    if (i < PROCESS_MAX_USER_REGIONS) return &p->regions[i];
+    i -= PROCESS_MAX_USER_REGIONS;
+    return &e->chunk[i / REXT_CHUNK][i % REXT_CHUNK];
+}
+// drop the per-cpu find_region cache entries that point into this owner's
+// chunks, so a cached pointer never outlives the chunk. (satoru)
+static void rext_forget_cache(const RegionExt* e) {
+    for (int cpu = 0; cpu < SMP_MAX_CPUS; cpu++) {
+        UserMemoryRegion* c = g_fr_cache_region[cpu];
+        if (!c) continue;
+        for (int k = 0; k < e->nchunks; k++) {
+            if (c >= e->chunk[k] && c < e->chunk[k] + REXT_CHUNK) {
+                g_fr_cache_owner[cpu] = nullptr;
+                g_fr_cache_region[cpu] = nullptr;
+                break;
+            }
+        }
+    }
+}
+static void rext_free_entry(RegionExt* e) {
+    UserMemoryRegion* chunks[REXT_MAX_CHUNKS];
+    int n;
+    {
+        SpinLockGuard _g(g_rext_lock);
+        if (!e->owner) return;
+        n = e->nchunks;
+        for (int c = 0; c < n; c++) chunks[c] = e->chunk[c];
+        rext_forget_cache(e);
+        __atomic_store_n(&e->owner, (Process*)nullptr, __ATOMIC_RELEASE);
+        e->nchunks = 0; e->pid = 0; e->as = 0;
+        for (int c = 0; c < REXT_MAX_CHUNKS; c++) e->chunk[c] = nullptr;
+        g_rext_chunks_live -= (uint32_t)n;
+    }
+    for (int c = 0; c < n; c++) KernelHeap::Free(chunks[c]);
+}
+// execve: the old image's regions are gone with the old address space. (satoru)
+static void rext_release_owner(Process* p) {
+    for (int i = 0; i < REXT_OWNERS; i++)
+        if (__atomic_load_n(&g_rext[i].owner, __ATOMIC_ACQUIRE) == p) rext_free_entry(&g_rext[i]);
+}
+// address space teardown (KernelVMM hook): its tables die with it. (satoru)
+static void rext_release_as(uint64_t root) {
+    for (int i = 0; i < REXT_OWNERS; i++)
+        if (__atomic_load_n(&g_rext[i].owner, __ATOMIC_ACQUIRE) && g_rext[i].as == root)
+            rext_free_entry(&g_rext[i]);
+}
+// a fresh zeroed chunk for p's table; null when the 7-chunk cap or the owner
+// table is reached. the chunk is published before nchunks, so a reader that
+// sees the new count also sees the pointer. (satoru)
+static UserMemoryRegion* rext_grow(Process* p) {
+    UserMemoryRegion* fresh = (UserMemoryRegion*)KernelHeap::Alloc(sizeof(UserMemoryRegion) * REXT_CHUNK);
+    if (!fresh) return nullptr;
+    memset(fresh, 0, sizeof(UserMemoryRegion) * REXT_CHUNK);
+    RegionExt* e = nullptr;
+    {
+        SpinLockGuard _g(g_rext_lock);
+        for (int i = 0; i < REXT_OWNERS && !e; i++) {
+            RegionExt* x = &g_rext[i];
+            if (x->owner == p && x->pid == p->pid && x->as == p->address_space) e = x;
+        }
+        if (!e) {
+            for (int i = 0; i < REXT_OWNERS && !e; i++) {
+                RegionExt* x = &g_rext[i];
+                if (!x->owner) {
+                    x->pid = p->pid; x->as = p->address_space; x->nchunks = 0;
+                    __atomic_store_n(&x->owner, p, __ATOMIC_RELEASE);
+                    e = x;
+                }
+            }
+        }
+        if (e && e->nchunks < REXT_MAX_CHUNKS) {
+            e->chunk[e->nchunks] = fresh;
+            __atomic_store_n(&e->nchunks, e->nchunks + 1, __ATOMIC_RELEASE);
+            g_rext_chunks_live++;
+            fresh = nullptr;   // published (satoru)
+        }
+    }
+    if (fresh) { KernelHeap::Free(fresh); return nullptr; }
+    static uint32_t s_logs = 0;
+    if (e->nchunks == 1) MemCensus::RegionTableFull(p);   // profile at the first extension (census builds) (satoru)
+    if (s_logs < 8) {
+        s_logs++;
+        SerialLogger::Log("[region] table extended pid=");
+        SerialLogger::LogDec((int)p->pid);
+        SerialLogger::Log(" chunks=");
+        SerialLogger::LogDec(e->nchunks);
+        SerialLogger::Log(" slots=");
+        SerialLogger::LogDec(region_limit(e));
+        SerialLogger::Log("\r\n");
+    }
+    return e->chunk[e->nchunks - 1];
+}
+// fork: the child's inline table is a copy of the parent's (CloneUserProcess);
+// give it a copy of the chunks too. (satoru)
+static bool rext_copy(Process* from, Process* to) {
+    RegionExt* src = rext_find(from);
+    if (!src || !to) return true;
+    int n = __atomic_load_n(&src->nchunks, __ATOMIC_ACQUIRE);
+    for (int c = 0; c < n; c++) {
+        UserMemoryRegion* dst = rext_grow(to);
+        if (!dst) return false;
+        memcpy(dst, src->chunk[c], sizeof(UserMemoryRegion) * REXT_CHUNK);
+    }
+    return true;
+}
 static UserMemoryRegion* find_region(Process* proc, uint64_t addr) {
     proc = region_owner(proc);
     if (!proc) return nullptr;
@@ -1576,8 +2444,9 @@ static UserMemoryRegion* find_region(Process* proc, uint64_t addr) {
         if (c && c->active && addr >= c->start && addr < c->end) return c;
     }
 
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        UserMemoryRegion* region = &proc->regions[i];
+    RegionExt* rx = rext_find(proc);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        UserMemoryRegion* region = region_at(proc, rx, i);
         if (!region->active) continue;
         if (addr >= region->start && addr < region->end) {
             if (cpu < SMP_MAX_CPUS) { g_fr_cache_owner[cpu] = proc; g_fr_cache_region[cpu] = region; }
@@ -1591,8 +2460,9 @@ static UserMemoryRegion* find_region_by_flag(Process* proc, uint32_t flag) {
     proc = region_owner(proc);
     if (!proc) return nullptr;
 
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        UserMemoryRegion* region = &proc->regions[i];
+    RegionExt* rx = rext_find(proc);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        UserMemoryRegion* region = region_at(proc, rx, i);
         if (region->active && (region->flags & flag)) return region;
     }
     return nullptr;
@@ -1602,18 +2472,21 @@ static UserMemoryRegion* find_free_region_slot(Process* proc) {
     proc = region_owner(proc);
     if (!proc) return nullptr;
 
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        if (!proc->regions[i].active) return &proc->regions[i];
+    RegionExt* rx = rext_find(proc);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        UserMemoryRegion* r = region_at(proc, rx, i);
+        if (!r->active) return r;
     }
-    return nullptr;
+    return rext_grow(proc);   // item 10: every slot in use (satoru)
 }
 
 static bool region_overlaps(Process* proc, uint64_t start, uint64_t end) {
     proc = region_owner(proc);
     if (!proc) return false;
 
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        const UserMemoryRegion* region = &proc->regions[i];
+    RegionExt* rx = rext_find(proc);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        const UserMemoryRegion* region = region_at(proc, rx, i);
         if (!region->active) continue;
         if (start < region->end && end > region->start) return true;
     }
@@ -1625,8 +2498,9 @@ static UserMemoryRegion* add_region(Process* proc, uint64_t start, uint64_t end,
     proc = region_owner(proc);
     if (!proc || start >= end) return nullptr;
 
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        UserMemoryRegion* region = &proc->regions[i];
+    RegionExt* rx = rext_find(proc);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        UserMemoryRegion* region = region_at(proc, rx, i);
         if (!region->active) continue;
         if (region->page_flags != page_flags || region->flags != flags) continue;
 
@@ -1649,10 +2523,11 @@ static UserMemoryRegion* add_region(Process* proc, uint64_t start, uint64_t end,
         if (!s_region_full_warned) {
             s_region_full_warned = true;
             SerialLogger::Log("[region] TABLE FULL (");
-            SerialLogger::LogDec(PROCESS_MAX_USER_REGIONS);
-            SerialLogger::Log(" slots) owner pid=");
+            SerialLogger::LogDec(PROCESS_MAX_USER_REGIONS * (1 + REXT_MAX_CHUNKS));
+            SerialLogger::Log(" slots incl. extension) owner pid=");
             SerialLogger::LogDec((int)proc->pid);
-            SerialLogger::Log(" -> mmap ENOMEM (raise PROCESS_MAX_USER_REGIONS)\r\n");
+            SerialLogger::Log(" -> mmap ENOMEM\r\n");
+            MemCensus::RegionTableFull(proc);   // no-op unless kurono.memcensus=1 (satoru)
         }
         return nullptr;
     }
@@ -1790,13 +2665,43 @@ static void ff_note_memfd_map(uint64_t base, bool exec) {
     g_ff_shm_ring_head = (g_ff_shm_ring_head + 1) & 15;
 }
 // [ffcount] sampler: 1hz with fftrace, else every 10s. inert until firefox runs. (satoru)
+static void ff_snap_tick() {
+    // kurono.ffsnap=N: every N s, a symbolized snapshot of every thread of the
+    // newest live firefox group (a relaunch has a new address space). (satoru)
+    if (!g_ffsnap_secs) return;
+    static uint64_t s_next = 0;
+    uint64_t now = Timer::GetRealMs64();
+    if (now < s_next) return;
+    s_next = now + (uint64_t)g_ffsnap_secs * 1000;
+    uint64_t as = 0; uint32_t best = 0; int guard = 0;
+    for (Process* q = Scheduler::ready_queue; q && guard < 2048; q = q->next, guard++) {
+        if (!q->is_user() || q->is_thread() || q->reaped) continue;
+        const char* n = q->name;
+        if (n[0]=='f'&&n[1]=='i'&&n[2]=='r'&&n[3]=='e'&&n[4]=='f'&&n[5]=='o'&&n[6]=='x'&&n[7]==0 &&
+            q->pid >= best) { best = q->pid; as = q->address_space; }
+    }
+    if (as) LinuxSyscall::DumpThreadsSymbolized(as, "periodic");
+    if (g_wltrace && now > 20000) WaylandServer::DumpProtocolTrace();   // ring, once (satoru)
+}
+
 static void ff_meas_sample() {
+    ff_snap_tick();
     if (!__atomic_load_n(&g_ff_meas_as, __ATOMIC_RELAXED)) return;
     static uint64_t s_last_ms = 0;
     uint64_t now = Timer::GetRealMs64();
     if (now - s_last_ms < (g_fftrace ? 1000u : 10000u)) return;
     s_last_ms = now;
     SerialLogger::Log("[ffcount] t="); SerialLogger::LogDec((int)now);
+    {   // census: task / slot pressure (no task-list walk from this irq path):
+        // capctr = the scheduler's live-task cap counter (256 max), slots = active
+        // linux process slots (256 max), retire_q = exited threads waiting to
+        // give their cap slot back. (satoru)
+        int slots = 0;
+        for (int i = 0; i < LINUX_MAX_PROCS; i++) if (LinuxSyscall::GetProcess(i)) slots++;
+        SerialLogger::Log(" slots="); SerialLogger::LogDec(slots);
+        SerialLogger::Log(" capctr="); SerialLogger::LogDec((int)Scheduler::LiveTaskCount());
+        { SerialLogger::Log(" retire_q="); SerialLogger::LogDec((int)g_retire_pending_dbg); }
+    }
     SerialLogger::Log(" mmapx=");   SerialLogger::LogDec((int)g_ff_mmap_exec_calls);
     SerialLogger::Log(" memfdx=");  SerialLogger::LogDec((int)g_ff_memfd_exec_maps);
     SerialLogger::Log(" dual=");    SerialLogger::LogDec((int)g_ff_memfd_dualmaps);
@@ -1877,9 +2782,9 @@ static void ff_meas_sample() {
             SerialLogger::LogHex64(su);
             SerialLogger::Log(" ring:\r\n");
             uint32_t h = __atomic_load_n(&g_remap_head, __ATOMIC_RELAXED);
-            uint32_t n = h > 256 ? 256 : h;
+            uint32_t n = h > 512 ? 512 : h;
             for (uint32_t k = 0; k < n; k++) {
-                RemapEv* e = &g_remap_ring[(h - n + k) & 255u];
+                RemapEv* e = &g_remap_ring[(h - n + k) & 511u];
                 SerialLogger::Log("[rr] t=");  SerialLogger::LogDec((int)e->t_ms);
                 SerialLogger::Log(" k=");      SerialLogger::LogDec((int)e->kind);
                 SerialLogger::Log(" ");        SerialLogger::LogHex64(e->addr);
@@ -2186,8 +3091,27 @@ static bool region_overlaps_cross_thread(Process* proc, uint64_t start, uint64_t
 static uint64_t choose_mmap_base(Process* task, uint64_t requested, uint64_t length) {
     uint64_t base = requested ? align_down_u64(requested, PAGE_SIZE)
                               : align_up_u64(task->next_mmap_base, PAGE_SIZE);
+    // a base inside the kernel identity map [0, IDENTITY_CEIL_BYTES) can never be handed
+    // out: every va there is a present supervisor identity page, and the vmm refuses a user
+    // leaf over it outside the pmm's overlay windows. firefox's randomized mmap HINTS (js gc
+    // chunks, ~0x2200000000) landed there and probed upward a step at a time ([MMAPCLASH]
+    // x12 per boot, holding kls). move such a base above the ceiling in one step; a hint
+    // inside an overlay window keeps the old path. (satoru)
+    // an i386 image (its arena is USER_MMAP_BASE_I386, below 4 gb) cannot take the hoist: a
+    // 32-bit eax truncates any address above 4 gb. and every va below 4 gb is identity map,
+    // where the vmm refuses a user leaf (the mmap would "succeed" and the first touch fault).
+    // so outside the overlay windows a 32-bit map has nowhere to go: fail it cleanly
+    // (0 -> ENOMEM) instead of returning a pointer the caller truncates (merge review 11-07
+    // finding 1). (satoru)
+    const bool compat32 = task->next_mmap_base < (1ull << 32);
+    const bool in_overlay = PMM::IsUserOverlayRange(base, align_up_u64(base + length, PAGE_SIZE));
+    if (base < PMM::IDENTITY_CEIL_BYTES && !in_overlay) {
+        if (compat32) return 0;
+        base = PMM::IDENTITY_CEIL_BYTES;
+    }
+    const uint64_t limit = compat32 ? (1ull << 32) : USER_MMAP_LIMIT;
 
-    while (base + length <= USER_MMAP_LIMIT) {
+    while (base + length <= limit) {
         // cross-thread: never hand back a range a SIBLING thread (same cr3, own
         // regions[]) already owns -- that collision gave two thread stacks one
         // address and corrupted control flow under the futex storm. (satoru)
@@ -2231,7 +3155,12 @@ static uint64_t choose_mmap_base(Process* task, uint64_t requested, uint64_t len
                               : align_up_u64(length / 32, PAGE_SIZE);
             for (uint64_t o = 0; o < length; o += stride) {
                 uint64_t pv = base + o;
-                if (KernelVMM::QueryMappingInAddressSpace(task->address_space, pv)) {
+                // only a USER page is a clash: a fresh address space still carries the supervisor
+                // identity map of low ram, which made every candidate from 0x20000000 up "present"
+                // and kept this loop (under kls) busy for 3 s on the first mmap of every exec'd
+                // process. (satoru)
+                if (KernelVMM::QueryMappingInAddressSpace(task->address_space, pv) &&
+                    (KernelVMM::QueryPageFlagsInAddressSpace(task->address_space, pv) & PTE_USER)) {
                     static uint32_t s_clash_logs = 0;
                     if (s_clash_logs < 12) {
                         s_clash_logs++;
@@ -2295,6 +3224,13 @@ struct LinuxShmObj {
     uint64_t size;
     int      refcount;
     bool     used;
+    // item 6 (memfd backing never freed): an object whose backing was handed to
+    // another process or the compositor over SCM_RIGHTS is pinned (the receiver
+    // and the compositor's pool hold the bare base, uncounted); a slot that only
+    // re-wraps such a base is borrowed and never frees it. everything else is
+    // released once no open fd names the slot (shm_maybe_release). (satoru)
+    bool     pinned;
+    bool     borrowed;
 };
 // (satoru) firefox creates HUNDREDS of memfds during startup (every SharedStringMap =
 // prefs/font-list snapshot, every wl_shm pixel pool, every graphics buffer) and close()
@@ -2317,6 +3253,8 @@ static int shm_alloc_slot() {
             g_linux_shm[i].base = nullptr;
             g_linux_shm[i].size = 0;
             g_linux_shm[i].refcount = 1;
+            g_linux_shm[i].pinned = false;
+            g_linux_shm[i].borrowed = false;
             return i;
         }
     }
@@ -2331,6 +3269,37 @@ static LinuxShmObj* shm_for_fd(LinuxProcess* p, int fd) {
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS) return nullptr;
     if (!p->fds[fd].open || p->fds[fd].type != LFD_MEMFD) return nullptr;
     return shm_slot(p->fds[fd].backend_fd);
+}
+
+// item 6: does any open fd of any live process still name memfd slot `slot`?
+// a scan instead of the object refcount, because fork, exit and most dup paths
+// never maintained that count (fork copies fds without a reference, exit closes
+// them without dropping one). user mappings are not holders: each mapping owns a
+// reference on every frame it maps, so a mapped-then-closed memfd stays valid
+// until it is unmapped. (satoru)
+static bool shm_slot_referenced(int slot);
+static uint32_t g_shm_released = 0;
+static uint64_t g_shm_released_kb = 0;
+static void shm_maybe_release(int slot) {
+    LinuxShmObj* s = shm_slot(slot);
+    if (!s || s->pinned) return;
+    if (shm_slot_referenced(slot)) return;
+    uint8_t* base = nullptr;
+    uint64_t size = 0;
+    bool own = false;
+    {
+        SpinLockGuard _g(g_shm_lock);
+        if (!s->used || s->pinned) return;
+        base = s->base; size = s->size; own = !s->borrowed;
+        s->used = false; s->base = nullptr; s->size = 0;
+    }
+    // drops the object's own reference on each frame; frames a mapping still
+    // holds survive until that mapping goes. (satoru)
+    if (own && base && size) {
+        PMM::FreeBytes(base, (size_t)size);
+        g_shm_released++;
+        g_shm_released_kb += size >> 10;
+    }
 }
 // grow a memfd's backing to at least `size` bytes; first ftruncate wins (satoru)
 static bool shm_set_size(LinuxShmObj* s, uint64_t size) {
@@ -2612,10 +3581,36 @@ static bool switch_to_ready_user(InterruptFrame* frame) {
     futex_sweep_timeouts();  // re-ready any timed-out futex waiters before picking next (satoru)
     if (!Scheduler::ScheduleNextUser(frame)) return false;
 
-    int next_idx = find_process_index_by_task(Scheduler::GetCurrentProcess());
-    if (next_idx < 0) return false;
-
-    LinuxSyscall::SetCurrent(next_idx);
+    // THE PHASE-A STALL (futex torture, every arm): ScheduleNextUser has ALREADY
+    // switched by now - next is Running, this cpu's current, on_cpu=1, and its
+    // frame is loaded into *frame. returning false here told the caller "no
+    // switch", so a futex/poll parker iret'd into the idle loop (next stranded:
+    // Running, on_cpu=1, on no cpu) or undid its own park and resumed with the
+    // OTHER task's frame (the old task stranded Running, on_cpu=0). both shapes
+    // were caught live by the sched=2 [stasks] dump. a switch must always be
+    // reported as one; a task whose linux record is momentarily unresolvable
+    // just runs with no linux current until its next syscall entry re-syncs it
+    // (both gates re-derive it from the scheduler current). (satoru)
+    Process* nt = Scheduler::GetCurrentProcess();
+    int next_idx = find_process_index_by_task(nt);
+    if (next_idx < 0) {
+        static uint32_t s_noidx = 0;
+        if (s_noidx++ < 8) {
+            SerialLogger::Log("[switch] picked pid=");
+            SerialLogger::LogDec(nt ? (int)nt->pid : -1);
+            SerialLogger::Log(" has no linux record\r\n");
+        }
+        // strict by default under sched=2; kurono.schedswitch=1 turns it on in
+        // the old mode too, =0 turns it off under sched=2 (a/b). (satoru)
+        bool strict = g_switch_mode == 1 || (g_switch_mode < 0 && Scheduler::SchedV2());
+        if (!strict) return false;
+        // never leave this cpu's linux current on the task we switched AWAY
+        // from: a null Current() is safe, the old task's record is not. the
+        // entry gates re-resolve it after taking kls. (satoru)
+        LinuxSyscall::SetCurrent(-1);
+    } else {
+        LinuxSyscall::SetCurrent(next_idx);
+    }
     current_frame_rewritten = true;
     return true;
 }
@@ -2726,6 +3721,61 @@ static void kls_timer_preempt(InterruptFrame* frame) {
     if (next_idx >= 0) LinuxSyscall::SetCurrent(next_idx);
 }
 
+// item 7 (dead thread records left behind): a process killed with SIGKILL takes
+// its threads down without their own sys_exit, so their records stayed active
+// (3 per killed 3-thread child, until the 256-slot table filled). when the
+// parent reaps the leader, release the dead threads of that group. a thread
+// belongs to the group when its parent chain leads to the leader; each record is
+// detached from the shared fd table first, so the leader's own destroy below is
+// the last holder and closes and frees the table normally. (satoru)
+static void release_dead_thread_records(LinuxProcess* leader_rec) {
+    Process* leader = leader_rec ? leader_rec->task : nullptr;
+    if (!leader) return;
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* lp = LinuxSyscall::GetProcess(i);
+        Process* t = lp ? lp->task : nullptr;
+        if (!t || lp == leader_rec || t == leader || !t->is_thread()) continue;
+        if (t->state != Process_Terminated) continue;
+        // old mode: a killed thread is never switched away through the hand-off, so its
+        // on_cpu stays 1 forever and this release never happened there - the record kept
+        // pointing at the task, the reaper's free-later ring saw it referenced and never
+        // freed the ~200 KB struct (3 per killed churn child; the ring overflowed). there,
+        // "not current on any cpu" is the proof instead. (satoru)
+        if (Scheduler::SchedV2() ? __atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) != 0
+                                 : Scheduler::IsCurrentAnywhere(t)) continue;
+        Process* q = t;
+        for (int g = 0; q && q->is_thread() && g < 64; g++) q = q->parent;
+        bool member = (q == leader);
+        if (!member) {
+            // the deferred group reaper may already have unlinked the dead threads (their
+            // parent chain is gone): fall back to the linux records' ppid chain. (satoru)
+            LinuxProcess* r = lp;
+            for (int g = 0; r && g < 64 && !member; g++) {
+                if (r->ppid == leader_rec->pid) { member = true; break; }
+                LinuxProcess* up = nullptr;
+                for (int k = 0; k < LINUX_MAX_PROCS && !up; k++) {
+                    LinuxProcess* c = LinuxSyscall::GetProcess(k);
+                    if (c && c != r && c->pid == r->ppid && c->task && c->task->is_thread()) up = c;
+                }
+                r = up;
+            }
+        }
+        if (!member) continue;
+        if (lp->fds == leader_rec->fds) lp->fds = g_dead_fds;
+        lp->exited = true;
+        LinuxSyscall::DestroyProcess(i);
+    }
+}
+
+// the wait(2) status word for a recorded exit code. a task killed by the kill
+// paths is recorded as -sig (-9); report it as WIFSIGNALED(sig), not as a
+// normal exit with code 137 (memory agent finding). 128+sig stays a normal exit:
+// a voluntary exit(130) must not read as a signal death. (satoru)
+static uint32_t wait_status_of(int code) {
+    if (code <= -2 && code > -64) return (uint32_t)(-code) & 0x7FU;   // -1 = "no code recorded" (satoru)
+    return ((uint32_t)code & 0xFFU) << 8;
+}
+
 static void wake_waiting_parent(LinuxProcess* child, int child_index) {
     if (!child || !child->task || !child->task->parent) return;
 
@@ -2737,8 +3787,7 @@ static void wake_waiting_parent(LinuxProcess* child, int child_index) {
     }
 
     if (parent_task->waiting_status_ptr) {
-        write_user_u32(parent_task, parent_task->waiting_status_ptr,
-                       ((uint32_t)child->exit_code & 0xFFU) << 8);
+        write_user_u32(parent_task, parent_task->waiting_status_ptr, wait_status_of(child->exit_code));
     }
 
     parent_task->user_frame.rax = child->pid;
@@ -2751,6 +3800,7 @@ static void wake_waiting_parent(LinuxProcess* child, int child_index) {
     // can be immediate. (satoru)
     if (wake_blocked_to_ready(parent_task)) parent_task->sleep_ticks = 0;
 
+    release_dead_thread_records(child);
     Scheduler::ReapProcess(child->task);
     child->task = nullptr;
     LinuxSyscall::DestroyProcess(child_index);
@@ -2792,6 +3842,13 @@ struct KFileLock {
     uint64_t path_hash;
     uint64_t start, end;    // [start,end); end==~0ull means to-eof (satoru)
     Process* owner;
+    // the owner's fd table: shared by every CLONE_FILES thread of one process,
+    // so "some live task still holds this table" == "the lock owner is alive". a
+    // crashed or group-killed process never runs close(), so without this its
+    // locks outlived it and the next firefox found its own profile .parentlock
+    // held -> "firefox is already running" (the 'Close Firefox' dialog on every
+    // relaunch after a crash). (satoru)
+    const LinuxFd* owner_fds;
 };
 constexpr int KFILE_LOCK_SLOTS = 256;
 static KFileLock g_file_locks[KFILE_LOCK_SLOTS];
@@ -2806,6 +3863,33 @@ static uint64_t flock_path_hash(const char* s) {
 // drop every lock `owner` holds on `path_hash` - posix close semantics (any
 // close of a file drops the process's locks on it; sqlite's unix vfs is built
 // around exactly this behaviour). (satoru)
+// posix releases a process's record locks when it dies. kurono's group kill
+// and fault containment never run close(), so treat a lock as released once no
+// live task holds the owner's fd table. caller holds g_flock_lock. (satoru)
+// see the KFileLock note. a slot counts as a live holder only while its task
+// is not terminated: killed threads keep their slots (they never run sys_exit),
+// so the slot alone proves nothing. legacy locks with no table stay held. (satoru)
+static bool flock_owner_alive(const KFileLock* L) {
+    if (!L->owner_fds) return true;
+    for (int q = 0; q < LINUX_MAX_PROCS; q++) {
+        const LinuxProcess* lp = LinuxSyscall::GetProcess(q);
+        if (!lp || lp->exited || lp->fds != L->owner_fds) continue;
+        Process* t = lp->task;
+        if (!t) return true;   // a task-less slot is mid setup or exit: be conservative (satoru)
+        if (t->state != Process_Terminated && !t->reaped) return true;
+    }
+    return false;
+}
+
+// item 6: the fd table `fds` is being freed: drop every lock keyed by it. (satoru)
+static void flock_release_table(const LinuxFd* fds) {
+    SpinLockGuard g(g_flock_lock);
+    for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
+        KFileLock* L = &g_file_locks[i];
+        if (L->active && L->owner_fds == fds) L->active = false;
+    }
+}
+
 static void flock_drop(Process* owner, uint64_t path_hash) {
     SpinLockGuard g(g_flock_lock);
     for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
@@ -3068,7 +4152,7 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
         // userspace session and must never idle away its last thread; leaders
         // (!is_thread) also keep it since ClaimReadyThreadForCpu never claims
         // a leader. (satoru)
-        if (SMP::CpuIndex() != 0 && task->is_thread()) {
+        if (SMP::CpuIndex() != 0 && Scheduler::ApResumable(task)) {
             // commit the park ONLY if we are still the enqueued, still-Blocked
             // waiter. the sweep (which ran inside switch_to_ready_user!) or a
             // cross-cpu wake may have ALREADY released this task (slot retired,
@@ -3092,7 +4176,7 @@ static bool futex_enqueue_and_block(Process* task, uintptr_t uaddr,
                 }
             }
             if (park_ok) {
-                __atomic_store_n(&task->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                Scheduler::ReleaseOnCpu(task);   // sched=2 defers until off this stack (satoru)
                 SMP::ApIdleFrame(current_syscall_frame);
                 current_frame_rewritten = true;
                 g_ftx_wait_parked++;   // forensics: idle-park vs switch-block (satoru)
@@ -3624,12 +4708,362 @@ static void sig_group_release(Process* leader) {
 static bool     g_ss_valid[LINUX_MAX_PROCS];
 static uint64_t g_ss_old[LINUX_MAX_PROCS];
 
+static void job_continue_group(LinuxProcess* target);   // SIGCONT takes effect when it is sent (satoru)
+
 // post a pending signal bit onto a target thread (LinuxProcess). signals 1..63.
 // (satoru)
 static void sig_post(LinuxProcess* target, int sig) {
     if (!target || sig <= 0 || sig >= 64) return;
     __atomic_or_fetch(&target->sig_pending, (1ull << sig), __ATOMIC_SEQ_CST);
+    if (sig == 18) job_continue_group(target);
+    if (Scheduler::SchedV2() && target->task) {
+        poll_wake_task(target->task);
+        Scheduler::KickTaskCpu(target->task);   // a ring-3 spinner takes it now (satoru)
+    }
 }
+
+// ======= sessions, controlling terminals and job control (satoru) =======
+// the pty table (kpty.cpp) owns each tty's controlling session and foreground group; a
+// process's controlling tty is the pair whose session is the process's own session, so
+// setsid() drops it by itself. what lives here: the launch context of a kernel proc (where
+// its next program's stdio goes), setsid/setpgid rules, tty signal delivery to ONE group,
+// stop/continue and the wait4 reports for it. follows drivers/tty/tty_jobctrl.c and
+// kernel/sys.c semantics. (satoru)
+
+static bool g_ptytrace = false;             // kurono.ptytrace=1 (satoru)
+static bool g_pty_legacy = false;           // kurono.pty=0: the old single-session console (satoru)
+bool LinuxSyscall::PtyLegacy() { return g_pty_legacy; }
+void LinuxSyscall::SetPtyLegacy(bool legacy) { g_pty_legacy = legacy; if (legacy == false) {} }
+void LinuxSyscall::SetPtyTrace(bool on) { g_ptytrace = on; }
+
+static inline int lp_slot_of(const LinuxProcess* p) { return p ? (int)p->pid - 100 : -1; }
+
+static LinuxProcess* lp_find_pid(int pid) {
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* q = LinuxSyscall::GetProcess(i);
+        if (q && q->active && (int)q->pid == pid) return q;
+    }
+    return nullptr;
+}
+
+// the launch context of one kernel proc: its Terminal window's pair (term) and the console
+// capture pair (cap) the shell builtins read their program's output from. (satoru)
+struct LaunchCtx { Process* who; int term; int cap; int bridge; };
+static LaunchCtx g_launch[16];
+static Spinlock  g_launch_lock;
+static LaunchCtx* launch_find(Process* who, bool create) {
+    if (!who) return nullptr;
+    SpinLockGuard g(g_launch_lock);
+    for (int i = 0; i < 16; i++) if (g_launch[i].who == who) return &g_launch[i];
+    if (!create) return nullptr;
+    for (int i = 0; i < 16; i++) if (!g_launch[i].who) {
+        g_launch[i].who = who; g_launch[i].term = -1; g_launch[i].cap = -1; g_launch[i].bridge = -1;
+        return &g_launch[i];
+    }
+    return nullptr;
+}
+void LinuxSyscall::SetTerminalTty(int t) {
+    LaunchCtx* c = launch_find(Scheduler::GetCurrentProcess(), t >= 0);
+    if (c) c->term = t;
+}
+void LinuxSyscall::SetBridgeTty(int t) {
+    LaunchCtx* c = launch_find(Scheduler::GetCurrentProcess(), t >= 0);
+    if (c) c->bridge = t;
+}
+int LinuxSyscall::BridgeTty() {
+    LaunchCtx* c = launch_find(Scheduler::GetCurrentProcess(), false);
+    return c ? c->bridge : -1;
+}
+int LinuxSyscall::TerminalTty() {
+    LaunchCtx* c = launch_find(Scheduler::GetCurrentProcess(), false);
+    return c ? c->term : -1;
+}
+
+static void std_fd_pty(LinuxFd* f, int t, int which) {
+    static const char* names[3] = { "/dev/stdin", "/dev/stdout", "/dev/stderr" };
+    f->type = LFD_PTY_SLAVE;
+    f->backend_fd = t;
+    (void)names;
+    { char num[16]; ls_itoa(t, num, 10); f->path[0] = 0; ls_cat(f->path, "/dev/pts/", (int)sizeof(f->path)); ls_cat(f->path, num, (int)sizeof(f->path)); }   // readlink /proc/self/fd/N names the tty (satoru)
+    f->flags = L_O_RDWR;
+    f->offset = 0;
+    f->open = true;
+}
+
+// a program a KERNEL proc launches starts a new session of its own (setsid), so no tty
+// signal can ever reach it by accident. what it gets for stdio: its Terminal window's pair
+// (which then becomes its controlling tty), else the calling proc's console capture pair,
+// else the serial-only console (the desktop launch: no tty at all). (satoru)
+static void apply_launch_ctx(LinuxProcess* p) {
+    if (g_pty_legacy) return;
+    Process* me = Scheduler::GetCurrentProcess();
+    if (!me || !me->is_kernel_proc) return;       // a fork/clone from a user task inherits (satoru)
+    p->sid = p->pid; p->pgid = p->pid; p->is_session_leader = true; p->ctty_pgrp = -1;
+    LaunchCtx* c = launch_find(me, false);
+    int t = -1; bool ctty = false;
+    if (c) {
+        if (c->term >= 0 && Kpty::Valid(c->term)) { t = c->term; ctty = true; }
+        else if (c->bridge >= 0 && Kpty::Valid(c->bridge)) t = c->bridge;   // the exec bridge: stdio only (satoru)
+        else if (c->cap >= 0 && Kpty::Valid(c->cap)) t = c->cap;
+    }
+    if (t < 0) return;
+    for (int i = 0; i < 3; i++) std_fd_pty(&p->fds[i], t, i);
+    Kpty::SlaveRef(t, 3);
+    if (ctty) {
+        Kpty::SetSession(t, (int)p->sid, (int)p->pgid);
+        p->ctty_pgrp = (int)p->pgid;
+    }
+}
+
+// console capture: a per-kernel-proc pty pair replaces the one global ring, so two terminals'
+// commands can never clear or mix each other's output. (satoru)
+bool LinuxSyscall::HasConsoleOutput() {
+    if (g_pty_legacy) return console_head != console_tail;
+    LaunchCtx* c = launch_find(Scheduler::GetCurrentProcess(), false);
+    return c && c->cap >= 0 && Kpty::MasterHasData(c->cap);
+}
+int LinuxSyscall::ReadConsoleOutput(char* buf, int max_len) {
+    if (g_pty_legacy) {
+        int read = 0;
+        while (read < max_len && console_head != console_tail) {
+            buf[read++] = console_buf[console_tail];
+            console_tail = (console_tail + 1) % CONSOLE_BUF_SIZE;
+        }
+        return read;
+    }
+    LaunchCtx* c = launch_find(Scheduler::GetCurrentProcess(), false);
+    if (!c || c->cap < 0 || max_len <= 0) return 0;
+    return Kpty::MasterRead(c->cap, (uint8_t*)buf, max_len);
+}
+void LinuxSyscall::ClearConsoleOutput() {
+    if (g_pty_legacy) { console_head = 0; console_tail = 0; return; }
+    LaunchCtx* c = launch_find(Scheduler::GetCurrentProcess(), true);
+    if (!c) { console_head = 0; console_tail = 0; return; }
+    if (c->cap < 0 || !Kpty::Valid(c->cap)) c->cap = Kpty::Alloc(80, 25, Kpty::F_CAPTURE);
+    else Kpty::Reset(c->cap, 80, 25);
+}
+
+// ---- process groups and sessions ----
+
+// is any live process in group `pgid` a member of session `sid`? (satoru)
+static bool pgrp_in_session(int pgid, int sid) {
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* q = LinuxSyscall::GetProcess(i);
+        if (q && q->active && !q->exited && (int)q->pgid == pgid && (int)q->sid == sid) return true;
+    }
+    return false;
+}
+// POSIX 2.2.2.52: a group is orphaned when no member has a parent in another group of the
+// same session. (satoru)
+static bool pgrp_orphaned(int pgid) {
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* m = LinuxSyscall::GetProcess(i);
+        if (!m || !m->active || m->exited || (int)m->pgid != pgid) continue;
+        LinuxProcess* par = lp_find_pid((int)m->ppid);
+        if (par && !par->exited && (int)par->pgid != pgid && par->sid == m->sid) return false;
+    }
+    return true;
+}
+
+int LinuxSyscall::SessionMembers(int sid) {
+    int n = 0;
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* q = &procs[i];
+        if (q->active && !q->exited && (int)q->sid == sid && !(q->task && q->task->is_thread())) n++;
+    }
+    return n;
+}
+
+// ---- job control: stop / continue ----
+// a stopped thread group sits Blocked (sleep_ticks 0: no timer wake) on the saved syscall-exit
+// frame of each thread; SIGCONT and SIGKILL are the only ways out. a thread parks at its next
+// syscall boundary (DeliverPendingSignals), which is where every signal is taken here. (satoru)
+static uint8_t g_job_stopped[LINUX_MAX_PROCS];   // this record's thread group is stopped (satoru)
+static uint8_t g_job_stopsig[LINUX_MAX_PROCS];   // leader record: the stop signal (satoru)
+static uint8_t g_job_report[LINUX_MAX_PROCS];    // leader record: 1 stop not yet waited for, 2 continue (satoru)
+static uint8_t g_wait_opts[LINUX_MAX_PROCS];     // a blocked wait4's options, by the parent's record (satoru)
+static const uint64_t STOP_SIGS_MASK = (1ull << 19) | (1ull << 20) | (1ull << 21) | (1ull << 22);
+
+static int job_leader_slot(LinuxProcess* p) {
+    int best = lp_slot_of(p);
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* q = LinuxSyscall::GetProcess(i);
+        if (q && q->active && q->fds == p->fds && q->task && !q->task->is_thread()) return i;
+    }
+    return best;
+}
+
+// tell a parent blocked in wait4(WUNTRACED/WCONTINUED) that a child changed state: its wait is
+// re-run (rip back onto the syscall instruction) and finds the report. (satoru)
+static void job_notify_parent(LinuxProcess* leader) {
+    LinuxProcess* par = lp_find_pid((int)leader->ppid);
+    if (!par || !par->task) return;
+    Process* pt = par->task;
+    int ps = lp_slot_of(par);
+    if (ps < 0 || ps >= LINUX_MAX_PROCS) return;
+    if (!pt->waiting_for_child || !(g_wait_opts[ps] & (2 | 8))) return;
+    if (pt->waiting_child_pid != 0 && pt->waiting_child_pid != leader->pid) return;
+    pt->waiting_for_child = false;
+    pt->waiting_child_pid = 0;
+    pt->waiting_status_ptr = 0;
+    pt->user_frame.rip -= 2;
+    pt->user_frame.rax = 61;                    // wait4 (satoru)
+    if (wake_blocked_to_ready(pt)) pt->sleep_ticks = 0;
+    Scheduler::KickIdleCpu();
+}
+
+static void job_stop_group(LinuxProcess* p, int sig) {
+    int ls = job_leader_slot(p);
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* q = LinuxSyscall::GetProcess(i);
+        if (q && q->active && !q->exited && q->fds == p->fds) g_job_stopped[i] = 1;
+    }
+    if (ls >= 0 && ls < LINUX_MAX_PROCS) {
+        g_job_stopsig[ls] = (uint8_t)sig;
+        g_job_report[ls] = 1;
+        LinuxProcess* lead = LinuxSyscall::GetProcess(ls);
+        if (lead) job_notify_parent(lead);
+    }
+}
+
+// SIGCONT takes effect when it is SENT (prepare_signal in linux): every thread of the group
+// is released, and stop signals still pending are discarded. (satoru)
+static void job_continue_group(LinuxProcess* target) {
+    if (!target) return;
+    bool any = false;
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* q = LinuxSyscall::GetProcess(i);
+        if (!q || !q->active || q->fds != target->fds) continue;
+        __atomic_and_fetch(&q->sig_pending, ~STOP_SIGS_MASK, __ATOMIC_SEQ_CST);
+        if (g_job_stopped[i]) {
+            g_job_stopped[i] = 0;
+            any = true;
+            if (q->task && wake_blocked_to_ready(q->task)) q->task->sleep_ticks = 0;
+        }
+    }
+    if (any) {
+        Scheduler::KickIdleCpu();
+        int ls = job_leader_slot(target);
+        if (ls >= 0 && ls < LINUX_MAX_PROCS) {
+            g_job_report[ls] = 2;
+            LinuxProcess* lead = LinuxSyscall::GetProcess(ls);
+            if (lead) job_notify_parent(lead);
+        }
+    }
+}
+
+// park the calling thread (its syscall-exit frame is already saved) until its group is
+// continued. true: the cpu switched away, `frame` now belongs to another task. false: ran in
+// place (no one else to run) and the group is no longer stopped. (satoru)
+static bool job_park_current(LinuxProcess* p, InterruptFrame* frame) {
+    Process* task = p ? p->task : nullptr;
+    int slot = lp_slot_of(p);
+    if (!task || slot < 0 || slot >= LINUX_MAX_PROCS || !frame) return false;
+    for (;;) {
+        { uint64_t sf; Scheduler::StateLock(&sf); task->state = Process_Blocked; task->sleep_ticks = 0; Scheduler::StateUnlock(sf); }
+        if (!g_job_stopped[slot]) {      // SIGCONT landed before the Blocked commit: undo (satoru)
+            uint64_t sf; Scheduler::StateLock(&sf);
+            task->state = Process_Running; task->sleep_ticks = 0;
+            Scheduler::StateUnlock(sf);
+            return false;
+        }
+        if (switch_to_ready_user(frame)) return true;
+        if (SMP::CpuIndex() != 0 && Scheduler::ApResumable(task)) {
+            bool park_ok = false;
+            {
+                uint64_t sf; Scheduler::StateLock(&sf);
+                if (__atomic_load_n((int*)&task->state, __ATOMIC_RELAXED) == (int)Process_Blocked) {
+                    task->last_run_cpu = (uint8_t)SMP::CpuIndex();
+                    task->released_ms  = Scheduler::NowMs();
+                    park_ok = true;
+                }
+                Scheduler::StateUnlock(sf);
+            }
+            if (park_ok) {
+                Scheduler::ReleaseOnCpu(task);
+                SMP::ApIdleFrame(frame);
+                current_frame_rewritten = true;
+                return true;
+            }
+        }
+        // nobody else to run: wait in place (the bsp of the old mode), pumping the desktop so
+        // the keyboard that will send SIGCONT keeps working. (satoru)
+        { uint64_t sf; Scheduler::StateLock(&sf); task->state = Process_Running; task->sleep_ticks = 0; Scheduler::StateUnlock(sf); }
+        while (g_job_stopped[slot]) {
+            if (SMP::CpuIndex() == 0) pump_ui_throttled();
+            kls_relax_sleep_ms(2);
+            if (task->state == Process_Terminated) return false;
+        }
+        return false;
+    }
+}
+
+// __tty_check_change: a background process of the tty's session that reads (SIGTTIN) or sets
+// its state (SIGTTOU) is stopped; an ignored/blocked signal lets the call through (EIO for a
+// read), an orphaned group gets EIO. returns 0 to proceed, -5 EIO, or 1 = "signal posted:
+// restart the call after the stop". (satoru)
+static bool sig_ignored_or_blocked(LinuxProcess* p, int sig) {
+    if (p->sig_blocked & (1ull << sig)) return true;
+    Process* leader = p->task ? region_owner(p->task) : nullptr;
+    LinuxSigGroup* g = leader ? sig_group_for(leader, false) : nullptr;
+    return g && g->act[sig].handler == 1;
+}
+static int tty_check_change(LinuxProcess* p, int t, int sig) {
+    if (g_pty_legacy || !Kpty::Valid(t)) return 0;
+    if (Kpty::SessionOf(t) != (int)p->sid || p->sid == 0) return 0;
+    int fg = Kpty::ForegroundPgrp(t);
+    if (fg > 0 && (int)p->pgid != fg) {
+        if (sig_ignored_or_blocked(p, sig)) return sig == 21 ? -5 : 0;
+        if (pgrp_orphaned((int)p->pgid)) return -5;
+        LinuxSyscall::SignalGroup((int)p->pgid, sig);
+        return 1;
+    }
+    return 0;
+}
+
+// ---- tty signal fan-out ----
+
+// the controlling tty of `sid` went away: SIGHUP then SIGCONT to every process of the
+// session (the leader is what linux signals; the rest cover a shell that exits without
+// hanging its jobs up). (satoru)
+void LinuxSyscall::TtyHangupSession(int sid) {
+    if (sid <= 0) return;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+            LinuxProcess* q = &procs[i];
+            if (!q->active || q->exited || (int)q->sid != sid) continue;
+            if (q->task && q->task->is_thread()) continue;
+            sig_post(q, pass == 0 ? 1 : 18);     // SIGHUP, then SIGCONT (satoru)
+        }
+    }
+}
+
+// a session leader exiting releases its controlling tty and hangs up the foreground group
+// (disassociate_ctty(on_exit)). (satoru)
+void LinuxSyscall::SessionLeaderExit(int pid_idx) {
+    if (g_pty_legacy || pid_idx < 0 || pid_idx >= LINUX_MAX_PROCS) return;
+    LinuxProcess* p = &procs[pid_idx];
+    if (!p->is_session_leader || p->sid != p->pid) return;
+    int t = Kpty::FindBySession((int)p->sid);
+    if (t < 0) return;
+    int fg = Kpty::ForegroundPgrp(t);
+    Kpty::ClearSession(t);
+    if (fg > 0) {
+        for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+            LinuxProcess* q = &procs[i];
+            if (!q->active || q->exited || i == pid_idx || (int)q->pgid != fg) continue;
+            if (q->task && q->task->is_thread()) continue;
+            sig_post(q, 1);
+            sig_post(q, 18);
+        }
+    }
+}
+
+// poll wake for a pty object: kind 0 = slave readable, 1 = master readable (satoru)
+void LinuxSyscall::PtyWake(int t, int kind) {
+    poll_wake_key(poll_obj_key(kind == 0 ? 5 : 6, t));
+}
+
 
 // signals whose DEFAULT action is "ignore" (no handler => nothing happens).
 // SIGCHLD(17) SIGCONT(18) SIGURG(23) SIGWINCH(28). everything else fatal by
@@ -3756,6 +5190,12 @@ void LinuxSyscall::DeliverPendingSignals(InterruptFrame* frame) {
     LinuxProcess* p = Current();
     if (!p) return;
 
+    // a stopped thread group parks every thread at its next syscall boundary (satoru)
+    {
+        int js = lp_slot_of(p);
+        if (js >= 0 && js < LINUX_MAX_PROCS && g_job_stopped[js] && job_park_current(p, frame)) return;
+    }
+
     uint64_t deliverable = p->sig_pending & ~p->sig_blocked;
     if (!deliverable) return;
 
@@ -3784,6 +5224,14 @@ void LinuxSyscall::DeliverPendingSignals(InterruptFrame* frame) {
 
         if (handler == 0) {                       // SIG_DFL (satoru)
             if (sig_default_ignore(sig)) continue;
+            // SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU: the default action stops the thread group. the
+            // tty stops are ignored in an orphaned group (nobody could continue it). (satoru)
+            if (sig >= 19 && sig <= 22) {
+                if (sig != 19 && pgrp_orphaned((int)p->pgid)) continue;
+                job_stop_group(p, sig);
+                if (job_park_current(p, frame)) return;
+                continue;
+            }
             // fatal default: linux kills the WHOLE thread group, not one thread.
             // a lone sys_exit left the siblings running in a half-dead group
             // (husk windows, ipc peers waiting on a corpse). mark every sibling
@@ -3831,6 +5279,7 @@ void LinuxSyscall::DeliverPendingSignals(InterruptFrame* frame) {
 
 static void LinuxInt80Entry(InterruptFrame* frame) {
     if (!frame) return;
+    Scheduler::FinishSwitch();   // sched=2: publish on_cpu for the task this cpu left (satoru)
 
     current_syscall_frame = frame;
     current_frame_rewritten = false;
@@ -3936,9 +5385,24 @@ bool g_madv_lazy = false;
 // waiting out the 2-16 tick timer backstop. defined here (outside the anon
 // namespace) but forwards to the anon-namespace wake helper. (satoru)
 void LinuxSyscallPollWakeInet(int backend_sd) { poll_wake_inet(backend_sd); }
+void LinuxSyscall::SetKlsGlobal(bool on) { g_kls_global = on; }
+void LinuxSyscall::SetKlsProf(bool on) { g_klsprof = on; }   // kurono.klsprof=1 (satoru)
+void LinuxSyscall::SetPollLongWait(bool on) { g_poll_longwait = on; }   // kurono.schedpoll=0 (satoru)
+void LinuxSyscall::SetSwitchStrict(bool on) { g_switch_mode = on ? 1 : 0; }   // kurono.schedswitch=0/1 (satoru)
+// kld broker: wake futex waiters parked on a PHYSICAL word (a broker-owned
+// doorbell page mapped into a driver container). matches by phys key only, so
+// it needs no address space. takes only irq-save spinlocks (g_futex_lock ->
+// g_sched_lock), so the msi isr may call it. (satoru)
+int LinuxSyscallFutexWakePhys(uint64_t phys_key, int max) {
+    if (!phys_key) return 0;
+    return futex_do_wake(0, 0, phys_key, max, 0xFFFFFFFFu);
+}
 
 extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     if (!frame) return;
+    // sched=2: we entered from ring 3 on the running task's stack, so the task
+    // this cpu switched away from last is provably off-stack now. (satoru)
+    Scheduler::FinishSwitch();
 
     current_syscall_frame      = frame;
     current_frame_rewritten    = false;
@@ -3946,6 +5410,7 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     resume_userspace_exit_code = 0;
 
     Process* running = Scheduler::GetCurrentProcess();
+    bool x64_resync = false;   // sched=2: record not resolvable at entry, retry under kls (satoru)
 
     // ── task 31: mremap stack-probe FAST PATH ────────────────────────────────
     // musl's pthread_getattr_np measures the main stack by walking it with
@@ -3985,6 +5450,7 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
         // per-cpu linux index. (satoru)
         int ridx = find_process_index_by_task(running);
         if (ridx >= 0) LinuxSyscall::SetCurrent(ridx);
+        else if (Scheduler::SchedV2()) { LinuxSyscall::SetCurrent(-1); x64_resync = true; }
     }
 
     // SFMASK cleared IF at SYSCALL entry. re-enable on EVERY cpu now (task 21):
@@ -4011,9 +5477,20 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     // global serializer so firefox's threads execute them in PARALLEL instead
     // of single-file (91.6% of syscalls were contending on kls). (satoru)
     bool kls_exempt = syscall_x64_kls_exempt(frame->rax);
+    bool kls_elided = false;
+    if (!kls_exempt && LinuxSyscall::Current() && kls_elide(frame)) { kls_exempt = true; kls_elided = true; }
+    { uint32_t ec = SMP::CpuIndex(); g_kls_elided[ec < SMP_MAX_CPUS ? ec : 0] = kls_elided; }
+    if (g_klsprof) kls_set_ctx(frame->rax < (uint64_t)KP_NR ? frame->rax : (uint64_t)KP_OTHER);
     if (!kls_exempt) {
         // serialize the syscall body across cores; ring-3 stays parallel. (satoru)
         kls_lock();
+    }
+    // sched=2: a record that did not exist at entry (a clone still building it
+    // when this thread was picked) is looked up again now that kls - which
+    // clone holds while building it - is ours. (satoru)
+    if (x64_resync && !kls_exempt) {
+        int ridx2 = find_process_index_by_task(running);
+        if (ridx2 >= 0) LinuxSyscall::SetCurrent(ridx2);
     }
 
     // starvation relief valve - runs for EVERY bsp syscall, exempt or not: if it
@@ -4096,10 +5573,24 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     // frame captured r9 pristine (musl's clone child-fn), so clone no longer
     // needs the g_user_syscall_*_save shim. (satoru)
     uint64_t _nr_dbg = frame->rax;
+    int kp_fdtype = -1;
+    if (g_klsprof && _nr_dbg == 0) {
+        LinuxProcess* rp = LinuxSyscall::Current();
+        int rfd = (int)frame->rdi;
+        if (rp && rfd >= 0 && rfd < LINUX_MAX_FDS && rp->fds[rfd].open) kp_fdtype = (int)rp->fds[rfd].type;
+    }
     int64_t result = SyscallEntryX64Handler(
         frame->rax,
         frame->rdi, frame->rsi, frame->rdx,
         frame->r10, frame->r8,  frame->r9);
+    if (g_klsprof) {
+        int h = kp_hot(_nr_dbg);
+        if (h >= 0) {
+            int k = current_frame_rewritten ? 4 : result > 0 ? 0 : result == 0 ? 1 : result == -11 ? 2 : 3;
+            __atomic_add_fetch(&g_kp_res[h][k], 1u, __ATOMIC_RELAXED);
+            if (h == 0 && kp_fdtype >= 0 && kp_fdtype < 24) __atomic_add_fetch(&g_kp_rdtype[kp_fdtype][k], 1u, __ATOMIC_RELAXED);
+        }
+    }
 
     // (satoru) TEMP [eag]: log EAGAIN (-11) returns for firefox pids so we can see
     // which fd/syscall the sw_compositor WouldBlock-panics on. remove before commit.
@@ -4167,6 +5658,19 @@ extern "C" void SyscallEntryX64FrameHandler(InterruptFrame* frame) {
     // release BEFORE a session unwind: HandleProcessExit longjmps away and
     // would leave the kls lock held forever. exempt syscalls never took it. (satoru)
     if (!kls_exempt) kls_unlock();
+    if (Scheduler::SchedV2()) {   // leak detector: a syscall must leave this cpu not owning kls. (satoru)
+        uint32_t lc = SMP::CpuIndex(); if (lc >= SMP_MAX_CPUS) lc = 0;
+        if (__atomic_load_n(&g_kls_word, __ATOMIC_RELAXED) == lc + 1u) {
+            static uint32_t s_leak = 0;
+            if (s_leak++ < 6) {
+                SerialLogger::Log("[kls] LEAK after nr="); SerialLogger::LogDec((int)_nr_dbg);
+                SerialLogger::Log(" depth="); SerialLogger::LogDec(g_kls_depth[lc]);
+                SerialLogger::Log(" exempt="); SerialLogger::LogDec((int)kls_exempt);
+                SerialLogger::Log(" cpu="); SerialLogger::LogDec((int)lc);
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
 
     if (resume_userspace_session) {
         Userspace::HandleProcessExit(resume_userspace_exit_code);
@@ -4327,6 +5831,8 @@ int LinuxSyscall::SelfTest() {
 //  init
 
 void LinuxSyscall::Init() {
+    Kpty::Init();   // pair 0 = the legacy single session (satoru)
+    KernelVMM::SetAddressSpaceDestroyHook(rext_release_as);   // item 10 (satoru)
     for (int i = 0; i < LINUX_MAX_PROCS; i++) {
         procs[i].active = false;
         procs[i].pid = 0;
@@ -4341,6 +5847,7 @@ void LinuxSyscall::Init() {
     // poll/ppoll waiter parked on a socket wakes the instant data arrives in its
     // rx ring (the wayland/dbus/IPC handshakes) instead of on the ~8ms timer. (satoru)
     UnixSocket::SetDataReadyHook(poll_wake_unixsd);
+    UnixSocket::SetKlsHeldHook(kls_held_here);   // sends into in-kernel servers need kls (satoru)
     SerialLogger::Log("[LinuxSyscall] Initialized\r\n");
 }
 
@@ -4355,10 +5862,27 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
     // lock like a syscall body; recursion-safe when the faulting access was the
     // kernel's own (a syscall already holding the lock touched lazy user
     // memory). raii so every return path below releases. (satoru)
+    // sched=2: a ring-3 fault arrives through an interrupt gate with IF=0 and used
+    // to spin on kls that way. the kls holder is very often inside
+    // BroadcastTlbFlush waiting for this very cpu's ack, which an IF=0 spinner
+    // can never send - every such flush burned its full 20ms timeout (sampled:
+    // the holder in BroadcastTlbFlush, five cpus in kls_acquire_spin, firefox
+    // startup 4-10x slower once threads spread over the aps). wait for the lock
+    // with interrupts ON - ring 3 held no kernel lock, so taking the tlb ipi or a
+    // tick here is safe - then go back to IF=0 for the handler body. (satoru)
     struct KlsGuard {
-        KlsGuard()  { kls_lock(); }
+        explicit KlsGuard(bool irq_on_wait) {
+            if (g_klsprof) kls_set_ctx(KP_FAULT);
+            if (irq_on_wait) {
+                __asm__ __volatile__("sti" ::: "memory");
+                kls_lock();
+                __asm__ __volatile__("cli" ::: "memory");
+            } else {
+                kls_lock();
+            }
+        }
         ~KlsGuard() { kls_unlock(); }
-    } _kls_guard;
+    } _kls_guard(Scheduler::SchedV2() && (frame->cs & 3) == 3);
 
     // task 27 THE TRAP: a WRITE fault on a parked thread's write-protected
     // fingerprint page = the corruptor caught red-handed. logs [YWRITE] with
@@ -4376,7 +5900,12 @@ bool LinuxSyscall::HandlePageFault(InterruptFrame* frame) {
     // registered user region covers cr2; a genuine kernel bug faults outside any
     // region and still returns false here (-> panics, as before). (satoru)
     if (!(frame->error_code & PFERR_USER) && !find_region(task, frame->cr2)) {
-        return false;
+        // shared-cow exec images live outside the region table (ld-kurono maps
+        // them directly). a syscall writing a user buffer in such a page must
+        // still resolve to a private copy instead of panicking the kernel. (satoru)
+        uint64_t pf = KernelVMM::QueryPageFlagsInAddressSpace(
+            task->address_space, align_down_u64(frame->cr2, PAGE_SIZE));
+        if (!(pf & PTE_USER) || !(pf & PTE_COW)) return false;
     }
 
     uint64_t page_base = align_down_u64(frame->cr2, PAGE_SIZE);
@@ -4530,18 +6059,77 @@ void LinuxSyscall::SetNextProcessCwd(const char* cwd) {
     g_next_cwd[i] = 0;
 }
 
+// free the linux slots of tasks a group kill or fault containment already
+// terminated and reaped. those tasks never run sys_exit, so their slots stayed
+// active forever: a crashed firefox (~80 threads) leaked ~80 of the 256 slots,
+// and two crashes later clone() returned ENOMEM -> gecko
+// MOZ_CRASH(pthread_create failed) on the next launch. reaped==1 is set only
+// after the group is off every cpu and its kernel stacks are gone, and group
+// kills leak the Process structs, so reading task->state here is safe. (satoru)
+// exited threads waiting to give their live-task cap slot back once they are
+// off every cpu (Scheduler::RetireExitedThread). swept from clone. (satoru)
+uint32_t g_retire_pending_dbg = 0;   // census: exits waiting to retire (satoru)
+static void retire_sweep();
+static void retire_note(Process* t) {
+    if (!t) return;
+    if (g_retire_n >= 512) retire_sweep();
+    if (g_retire_n < 512) { g_retire_ms[g_retire_n] = Timer::GetRealMs64(); g_retire_ring[g_retire_n++] = t; }
+    g_retire_pending_dbg = g_retire_n;
+}
+static void retire_sweep() {
+    // 50 ms after its exit syscall a thread is long off its cpu (the exit path
+    // is microseconds); RetireExitedThread still refuses any cpu's current. (satoru)
+    uint64_t now = Timer::GetRealMs64();
+    for (uint32_t i = 0; i < g_retire_n; ) {
+        if (now - g_retire_ms[i] >= 50 && Scheduler::RetireExitedThread(g_retire_ring[i])) {
+            --g_retire_n;
+            g_retire_ring[i] = g_retire_ring[g_retire_n];
+            g_retire_ms[i] = g_retire_ms[g_retire_n];
+        } else i++;
+    }
+    g_retire_pending_dbg = g_retire_n;
+}
+
+// sched=2 heartbeat (the scheduler kernel proc, under its kls section): retire
+// exited threads even when no clone comes along to sweep them. (satoru)
+void LinuxSyscall::ReapTick() {
+    if (!Scheduler::SchedV2()) return;
+    retire_sweep();
+}
+
+int LinuxSyscall::ReapDeadSlots() {
+    int freed = 0;
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* p = &procs[i];
+        if (!p->active || !p->task || i == current_proc) continue;
+        Process* t = p->task;
+        // threads only: a killed process slot keeps its exit status for the
+        // parent's wait, and a launcher's leader slot is torn down by the
+        // launcher itself (userspace.cpp) - reclaiming it here could hand the
+        // index out twice. (satoru)
+        if (!t->is_thread()) continue;
+        if (t->state != Process_Terminated || t->reaped != 1) continue;
+        DestroyProcess(i);
+        freed++;
+    }
+    return freed;
+}
+
 int LinuxSyscall::CreateProcess(const char* name, uint32_t uid, uint32_t gid) {
+    bool swept = false;
+    retire_sweep();   // exited threads give back their live-task cap slots (satoru)
+retry_slot:
     for (int i = 0; i < LINUX_MAX_PROCS; i++) {
         if (!procs[i].active) {
             LinuxProcess* p = &procs[i];
             memset(p, 0, sizeof(LinuxProcess));
+            AdminGate::ForgetProcess(i);   // a reused slot never inherits a grant (satoru)
             // heap-allocate this slot's fd table (the struct now holds a pointer, not
             // an inline array). a CLONE_FILES thread re-points this at its leader's
             // table below so threads share fds. NOTE: not freed on exit yet -- a
             // small bounded leak; refcounted free is a follow-up. (satoru)
-            p->fds = (LinuxFd*)KernelHeap::Alloc(sizeof(LinuxFd) * LINUX_MAX_FDS);
+            p->fds = fdt_alloc();   // header + table, see FdTabHdr (satoru)
             if (!p->fds) return -1;
-            memset(p->fds, 0, sizeof(LinuxFd) * LINUX_MAX_FDS);
             p->pid = (uint32_t)(i + 100);  // linux pids start at 100
             LinuxProcess* parent = Current();
             p->ppid = parent ? parent->pid : 1;
@@ -4578,6 +6166,8 @@ int LinuxSyscall::CreateProcess(const char* name, uint32_t uid, uint32_t gid) {
             for (int j = 0; j < LINUX_MAX_FDS; j++)
                 p->fds[j].open = false;
             InitStdFds(p);
+            g_job_stopped[i] = 0; g_job_stopsig[i] = 0; g_job_report[i] = 0; g_wait_opts[i] = 0;
+            apply_launch_ctx(p);   // a kernel proc's launch: new session, terminal / capture stdio (satoru)
 
             SerialLogger::Log("[LinuxSyscall] Created process: ");
             SerialLogger::Log(name);
@@ -4599,6 +6189,7 @@ int LinuxSyscall::CreateProcess(const char* name, uint32_t uid, uint32_t gid) {
             return i;
         }
     }
+    if (!swept) { swept = true; if (ReapDeadSlots() > 0) goto retry_slot; }   // (satoru)
     return -1;
 }
 
@@ -4620,9 +6211,14 @@ void LinuxSyscall::DestroyProcess(int pid_idx) {
     for (int q = 0; q < LINUX_MAX_PROCS; q++)
         if (q != pid_idx && procs[q].active && procs[q].fds == p->fds) { fds_shared = true; break; }
 
+    // item 6: memfd slots this table held, checked for release once it is gone. (satoru)
+    int memfd_slots[LINUX_MAX_FDS];
+    int memfd_n = 0;
     // close all fds
-    for (int i = 0; i < LINUX_MAX_FDS; i++) {
+    for (int i = 0; p->fds && p->fds != g_dead_fds && i < LINUX_MAX_FDS; i++) {
         if (p->fds[i].open) {
+            if (p->fds[i].type == LFD_MEMFD && !fds_shared)
+                memfd_slots[memfd_n++] = p->fds[i].backend_fd;
             // kvfs handles used to leak at exit: the table is global (every process), so a
             // tool-running session ran it dry. release them here. (satoru)
             if (p->fds[i].type == LFD_KVFS && p->fds[i].backend_fd >= 0 && !fds_shared && !g_cc_nokvfs_destroy)
@@ -4636,6 +6232,8 @@ void LinuxSyscall::DestroyProcess(int pid_idx) {
             else if ((p->fds[i].type == LFD_SOCKET || p->fds[i].type == LFD_PIPE) &&
                      p->fds[i].backend_fd >= 0)
                 UnixSocket::Close(p->fds[i].backend_fd);
+            else if (lfd_is_pty(&p->fds[i]) && !fds_shared)
+                pty_fd_release(&p->fds[i]);
             // kvfs fds closed similarly
             p->fds[i].open = false;
         }
@@ -4647,11 +6245,57 @@ void LinuxSyscall::DestroyProcess(int pid_idx) {
     p->exited = false;
     p->active = false;
     if (current_proc == pid_idx) current_proc = -1;
+    // item 6 (72 kb per process, never freed): the last holder of an fd table
+    // frees it. the slot then points at an all-closed static table rather than
+    // at freed memory, so a late reader of a dead slot sees no open fds; fcntl
+    // locks keyed by the table pointer are dropped first so a reused address can
+    // never inherit them. (satoru)
+    if (!fds_shared && p->fds && p->fds != g_dead_fds) {
+        flock_release_table(p->fds);
+        fdt_free(p->fds);
+        p->fds = g_dead_fds;
+    }
+    for (int i = 0; i < memfd_n; i++) shm_maybe_release(memfd_slots[i]);
+}
+
+void LinuxSyscall::LayerLock()   { if (g_klsprof) kls_set_ctx(KP_KPROC); kls_lock(); }
+void LinuxSyscall::LayerUnlock() { fd_rsv_release(fd_owner()); kls_unlock(); }
+
+// admin gate support: release every recursive level this cpu holds, then put
+// them back. only used around a human-scale modal, never on a hot path. (satoru)
+int LinuxSyscall::KlsDropAll() {
+    int d = 0;
+    while (d < 64 && kls_held_here()) { kls_unlock(); d++; }
+    return d;
+}
+void LinuxSyscall::KlsRestore(int depth) {
+    for (int i = 0; i < depth && i < 64; i++) kls_lock();
+}
+
+int LinuxSyscall::ReleaseDeadGroupRecords(const Process* leader, uint64_t as) {
+    int n = 0;
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* p = &procs[i];
+        Process* t = p->active ? p->task : nullptr;
+        if (!t || t == leader || t->state != Process_Terminated) continue;
+        if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) continue;
+        // a member still carries the group's address space; a member the group
+        // reaper already released has address_space 0 and reaped 1. (satoru)
+        bool member = (as && t->address_space == as) || (t->address_space == 0 && t->reaped == 1);
+        if (!member) continue;
+        p->exited = true;
+        DestroyProcess(i);
+        n++;
+    }
+    return n;
 }
 
 LinuxProcess* LinuxSyscall::GetProcess(int pid_idx) {
     if (pid_idx < 0 || pid_idx >= LINUX_MAX_PROCS) return nullptr;
     return procs[pid_idx].active ? &procs[pid_idx] : nullptr;
+}
+void LinuxSyscall::PostSignalIdx(int pid_idx, int sig) {
+    if (pid_idx >= 0 && pid_idx < LINUX_MAX_PROCS && procs[pid_idx].active) sig_post(&procs[pid_idx], sig);
 }
 
 LinuxProcess* LinuxSyscall::Current() {
@@ -4680,13 +6324,253 @@ void LinuxSyscall::SyncCurrentToTask(Process* task) {
 // heal, so AP-parked render/rayon threads are released even while the bsp main
 // thread is itself blocked. same ring-3-only safety as kls_timer_preempt.
 // (satoru)
-static void kls_ap_futex_maint() {
-    futex_sweep_timeouts();
+// kurono.schedtrace=1: every 3 s, one [stasks] line with every user task's
+// scheduler state, plus [swait] with the active futex waiters - so a stranded
+// thread (Ready but never picked, Blocked with no waker, on_cpu stuck) names
+// itself. diagnostic only. (satoru)
+bool g_schedtrace = false;
+static void sched_trace_dump() {
+    static uint64_t s_last = 0;
+    uint64_t now = Timer::GetRealMs64();
+    if (now - s_last < 3000) return;
+    s_last = now;
+    // snapshot under the scheduler lock, print afterwards: the walk must not
+    // race a reap, and the serial output must not run with the lock held. (satoru)
+    struct Row { uint32_t pid; uint8_t st, c, u, a, h, x; int8_t r, q; uint32_t t, f, n, v, ls; uint64_t rip; };
+    static Row rows[48];
+    static int cur[SMP_MAX_CPUS];
+    int nr = 0;
+    {
+        uint64_t sf; Scheduler::StateLock(&sf);
+        for (Process* p = Scheduler::ready_queue; p && nr < 48; p = p->next) {
+            if (!p->is_user()) continue;
+            Row& w = rows[nr++];
+            int oncpu = -1;
+            for (uint32_t c = 0; c < SMP::CpuCount(); c++) { PerCpu* pc = SMP::ByIndex(c); if (pc && pc->current == p) oncpu = (int)c; }
+            w.pid = p->pid; w.st = (uint8_t)p->state; w.t = p->sleep_ticks; w.c = p->on_cpu; w.r = (int8_t)oncpu;
+            w.u = p->last_run_cpu; w.q = (int8_t)Scheduler::DebugReleasePendingCpu(p); w.a = p->cpu_affinity;
+            w.f = p->flags; w.n = (uint32_t)p->user_frame.rax; w.h = p->has_user_frame; w.x = (uint8_t)p->last_save_site;
+            w.v = p->save_seq; w.ls = p->last_load_seq; w.rip = p->user_frame.rip;
+        }
+        for (uint32_t c = 0; c < SMP::CpuCount() && c < SMP_MAX_CPUS; c++) {
+            PerCpu* pc = SMP::ByIndex(c);
+            cur[c] = pc && pc->current ? (int)pc->current->pid : -1;
+        }
+        Scheduler::StateUnlock(sf);
+    }
+    SerialLogger::Log("[stasks] t="); SerialLogger::LogDec((int)now);
+    for (int i = 0; i < nr; i++) {
+        Row& w = rows[i];
+        SerialLogger::Log(" "); SerialLogger::LogDec((int)w.pid);
+        SerialLogger::Log(":s"); SerialLogger::LogDec(w.st);
+        SerialLogger::Log("t"); SerialLogger::LogDec((int)w.t);
+        SerialLogger::Log("c"); SerialLogger::LogDec(w.c);
+        SerialLogger::Log("r"); SerialLogger::LogDec(w.r);
+        SerialLogger::Log("u"); SerialLogger::LogDec(w.u);
+        SerialLogger::Log("q"); SerialLogger::LogDec(w.q);
+        SerialLogger::Log("a"); SerialLogger::LogHex(w.a);
+        SerialLogger::Log("f"); SerialLogger::LogHex(w.f);
+        SerialLogger::Log("n"); SerialLogger::LogDec((int)w.n);
+        SerialLogger::Log("h"); SerialLogger::LogDec(w.h);
+        SerialLogger::Log("x"); SerialLogger::LogDec(w.x);
+        SerialLogger::Log("v"); SerialLogger::LogDec((int)w.v);
+        SerialLogger::Log("/"); SerialLogger::LogDec((int)w.ls);
+        SerialLogger::Log("@"); SerialLogger::LogHex64(w.rip);
+    }
+    SerialLogger::Log("\r\n");
+    SerialLogger::Log("[scpus]");
+    for (uint32_t c = 0; c < SMP::CpuCount() && c < SMP_MAX_CPUS; c++) {
+        SerialLogger::Log(" c"); SerialLogger::LogDec((int)c);
+        SerialLogger::Log("="); SerialLogger::LogDec(cur[c]);
+        SerialLogger::Log(SMP::DebugIdle(c) ? "h" : "");
+    }
+    SerialLogger::Log("\r\n");
+    // waiter table: copy under the futex lock, print after. (satoru)
+    struct WRow { uint32_t pid, uaddr, e; bool rp; int32_t d; };
+    static WRow wr[48];
+    int wn = 0;
+    {
+        SpinLockGuard fg(g_futex_lock);
+        for (int i = 0; i < FUTEX_MAX_WAITERS && wn < 48; i++) {
+            FutexWaiter* w = &g_futex_waiters[i];
+            if (!w->active || !w->task) continue;
+            wr[wn++] = { w->task->pid, (uint32_t)w->uaddr, w->expected_val, w->repoll,
+                         (int32_t)(w->deadline_ms ? (int64_t)(w->deadline_ms - now) : -1) };
+        }
+    }
+    SerialLogger::Log("[swait]");
+    for (int i = 0; i < wn; i++) {
+        SerialLogger::Log(" "); SerialLogger::LogDec((int)wr[i].pid);
+        SerialLogger::Log("@"); SerialLogger::LogHex(wr[i].uaddr);
+        SerialLogger::Log("e"); SerialLogger::LogHex(wr[i].e);
+        SerialLogger::Log(wr[i].rp ? "R" : "");
+        SerialLogger::Log("d"); SerialLogger::LogDec((int)wr[i].d);
+    }
+    SerialLogger::Log("\r\n");
 }
 
+// sched=2 asynchronous fatal signals (Scheduler::ApUserIrqCheck, ring-3
+// interrupt on an ap, i.e. a program spinning without syscalls). only FATAL
+// defaults are taken here: a handler entered at an arbitrary instruction would
+// need the fpu/sse state and DF saved in the sigframe, which this sigframe
+// does not carry, so handled signals stay at the syscall boundary. no kls is
+// taken in interrupt context: the group is killed right here through the
+// scheduler (exactly like kill -9 of another process: KillProcessGroupAsync),
+// and the linux record is marked exited (-sig, so wait() sees WIFSIGNALED) by
+// the scheduler heartbeat under its kls section (linux_irq_kill_finish). an
+// earlier version took kls with a trylock and lost to the busy parent's
+// syscalls for seconds. (satoru)
+struct IrqKill { Process* leader; int sig; };
+static IrqKill  g_irqkill[64];
+static int      g_irqkill_n = 0;
+static Spinlock g_irqkill_lock;
+
+static bool linux_irq_sig_pending(Process* task) {
+    if (!task) return false;
+    int idx = find_process_index_by_task(task);
+    LinuxProcess* p = LinuxSyscall::GetProcess(idx);
+    return p && p->task == task && (__atomic_load_n(&p->sig_pending, __ATOMIC_ACQUIRE) & ~p->sig_blocked);
+}
+static bool linux_irq_signal(InterruptFrame* frame) {
+    (void)frame;
+    Process* task = Scheduler::GetCurrentProcess();
+    if (!task) return false;
+    int idx = find_process_index_by_task(task);
+    LinuxProcess* p = LinuxSyscall::GetProcess(idx);
+    if (!p || p->task != task) return false;
+    uint64_t deliverable = __atomic_load_n(&p->sig_pending, __ATOMIC_ACQUIRE) & ~p->sig_blocked;
+    Process* leader = region_owner(task);
+    LinuxSigGroup* grp = sig_group_for(leader, false);   // racy read of the table: ok, one word per signal (satoru)
+    int fatal = 0;
+    for (int sig = 1; sig < 64 && !fatal; sig++) {
+        if (!(deliverable & (1ull << sig))) continue;
+        uint64_t h = (grp && sig != 9 && sig != 19) ? grp->act[sig].handler : 0;
+        if (h == 0 && !sig_default_ignore(sig)) fatal = sig;
+    }
+    if (!fatal || vfork_is_child(task)) return false;   // a vfork child: leave it to the syscall path (satoru)
+    __atomic_and_fetch(&p->sig_pending, ~(1ull << fatal), __ATOMIC_SEQ_CST);
+    {
+        SpinLockGuard g(g_irqkill_lock);
+        if (g_irqkill_n < 64) { g_irqkill[g_irqkill_n].leader = leader ? leader : task; g_irqkill[g_irqkill_n].sig = fatal; g_irqkill_n++; }
+    }
+    Scheduler::KillProcessGroupAsync(leader ? leader->pid : task->pid, nullptr);
+    static uint32_t s_n = 0;
+    if (s_n++ < 8) {
+        SerialLogger::Log("[sig] fatal signal "); SerialLogger::LogDec(fatal);
+        SerialLogger::Log(" taken at interrupt by pid="); SerialLogger::LogDec((int)task->pid);
+        SerialLogger::Log("\r\n");
+    }
+    return true;
+}
+// heartbeat, under kls: finish the linux side of the kills taken above. (satoru)
+static void linux_irq_kill_finish() {
+    IrqKill local[64]; int n = 0;
+    {
+        SpinLockGuard g(g_irqkill_lock);
+        for (int i = 0; i < g_irqkill_n; i++) local[n++] = g_irqkill[i];
+        g_irqkill_n = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        int idx = find_process_index_by_task(local[i].leader);
+        LinuxProcess* lp = LinuxSyscall::GetProcess(idx);
+        if (!lp || lp->task != local[i].leader || lp->exited) continue;
+        lp->exit_code = -local[i].sig;
+        lp->exited = true;
+    }
+}
+
+void LinuxSyscall::FinishIrqKills() { if (Scheduler::SchedV2()) linux_irq_kill_finish(); }
+
+// sched=2: Scheduler is about to free t's struct. no table may keep pointing
+// at it: a killed task can still own futex waiter slots (the sweep reads
+// w->task->state), a poll registration, a vfork link. (satoru)
+static void linux_task_free_hook(Process* t) {
+    {
+        SpinLockGuard fg(g_futex_lock);
+        for (int i = 0; i < FUTEX_MAX_WAITERS; i++)
+            if (g_futex_waiters[i].task == t) { g_futex_waiters[i].active = false; g_futex_waiters[i].task = nullptr; }
+    }
+    poll_unregister(t);
+    for (int i = 0; i < 16; i++)
+        if (g_vfork_links[i].active && (g_vfork_links[i].child == t || g_vfork_links[i].parent == t))
+            g_vfork_links[i].active = false;
+    // keyed by the Process*: a struct recycled at the same address must not
+    // inherit the dead one's handlers or file locks (reviewer finding). (satoru)
+    sig_group_release(t);
+    {
+        SpinLockGuard lg(g_flock_lock);
+        for (int i = 0; i < KFILE_LOCK_SLOTS; i++)
+            if (g_file_locks[i].active && g_file_locks[i].owner == t) g_file_locks[i].active = false;
+    }
+    for (uint32_t c = 0; c < SMP_MAX_CPUS; c++)
+        if (g_fr_cache_owner[c] == t) g_fr_cache_owner[c] = nullptr;
+}
+// sched=2: does a linux record still point at t (a zombie the parent has not
+// harvested yet)? then its struct must outlive the harvest. (satoru)
+static bool linux_task_referenced(Process* t) {
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* lp = LinuxSyscall::GetProcess(i);
+        if (lp && lp->task == t) return true;
+    }
+    return false;
+}
+
+static void kls_ap_futex_maint() {
+    futex_sweep_timeouts();
+    // sched=2: the bsp never runs ring 3, so the [ffcount] sample it used to emit
+    // from kls_timer_preempt would go silent; cpu1 emits it instead. (satoru)
+    if (Scheduler::SchedV2() && SMP::CpuIndex() == 1) { ff_meas_sample(); kls_prof_dump(); if (g_schedtrace) sched_trace_dump(); }
+}
+void LinuxSyscall::SetSchedTrace(bool on) { g_schedtrace = on; }   // kurono.schedtrace=1 (satoru)
+
 void LinuxSyscall::EnableTimerPreemption() {
+    Scheduler::SetTaskFreeHook(linux_task_free_hook, linux_task_referenced);   // sched=2 reaping (satoru)
+    Scheduler::SetIrqSignalHook(linux_irq_sig_pending, linux_irq_signal);   // sched=2 async fatal signals (satoru)
     HAL::RegisterIRQHandler(0, kls_timer_preempt);
     Scheduler::SetApFutexMaintHook(kls_ap_futex_maint);
+}
+
+namespace {   // same anonymous namespace as the shm table (satoru)
+static bool shm_slot_referenced(int slot) {
+    for (int q = 0; q < LINUX_MAX_PROCS; q++) {
+        const LinuxProcess* lp = LinuxSyscall::GetProcess(q);
+        if (!lp || !lp->fds || lp->fds == g_dead_fds) continue;
+        for (int fd = 0; fd < LINUX_MAX_FDS; fd++) {
+            const LinuxFd* f = &lp->fds[fd];
+            if (f->open && f->type == LFD_MEMFD && f->backend_fd == slot) return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+// read-only counters for the kurono.memcensus=1 leak census: linux process
+// records (active, and active but already exited) and memfd objects (slots in
+// use and the bytes behind them). unlocked: a racy snapshot is fine. (satoru)
+void LinuxSyscall::CensusCounts(int* recs_active, int* recs_exited,
+                                int* shm_slots, uint64_t* shm_bytes) {
+    int a = 0, e = 0, n = 0;
+    uint64_t b = 0;
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        if (!procs[i].active) continue;
+        a++;
+        if (procs[i].exited) e++;
+    }
+    for (int i = 0; i < LINUX_SHM_SLOTS; i++) {
+        if (!g_linux_shm[i].used) continue;
+        n++;
+        b += g_linux_shm[i].size;
+    }
+    *recs_active = a; *recs_exited = e; *shm_slots = n; *shm_bytes = b;
+}
+
+// total active regions of p's table, inline plus chunks (census). (satoru)
+int LinuxSyscall::ActiveRegionCount(Process* p) {
+    if (!p) return 0;
+    RegionExt* rx = rext_find(p);
+    int n = 0;
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) if (region_at(p, rx, i)->active) n++;
+    return n;
 }
 
 int LinuxSyscall::ActiveProcessCount() {
@@ -4697,10 +6581,9 @@ int LinuxSyscall::ActiveProcessCount() {
 }
 
 int LinuxSyscall::AllocFd(LinuxProcess* p) {
-    for (int i = 0; i < LINUX_MAX_FDS; i++) {
-        if (!p->fds[i].open) return i;
-    }
-    return -1;
+    FdTabHdr* h = fdt_hdr(p->fds);
+    SpinLockGuard g(h->lock);
+    return fd_alloc_locked(p->fds, h, 0);
 }
 
 void LinuxSyscall::InitStdFds(LinuxProcess* p) {
@@ -4865,12 +6748,29 @@ static const uint32_t L_FD_CLOEXEC = 0x80000u;
 bool g_nocloexec = false;   // kurono.nocloexec=1: execve keeps every fd (the old behaviour) (satoru)
 
 static inline void fd_mark_cloexec(LinuxProcess* p, int fd) {
-    if (p && fd >= 0 && fd < LINUX_MAX_FDS && p->fds[fd].open) p->fds[fd].flags |= L_FD_CLOEXEC;
+    if (!p || fd < 0 || fd >= LINUX_MAX_FDS) return;
+    SpinLockGuard g(fdt_hdr(p->fds)->lock);   // an elided F_SETFD may be rewriting the same flag word (satoru)
+    if (p->fds[fd].open) p->fds[fd].flags |= L_FD_CLOEXEC;
 }
 
 int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
                                uint64_t edx, uint64_t esi, uint64_t edi) {
+    int rsv_owner = fd_owner();   // taken now: a park switches the cpu to another thread before we return (satoru)
     int64_t r = DispatchInner(eax, ebx, ecx, edx, esi, edi);
+    fd_rsv_release(rsv_owner);   // slots this call reserved but never filled go back to the pool (satoru)
+    if (g_ptytrace && !(eax == LSYS_WAITPID && r == 0) && (eax == LSYS_SETPGID || eax == LSYS_SETSID || eax == LSYS_WAITPID || eax == LSYS_KILL_)) {
+        LinuxProcess* tp = Current();
+        static uint32_t tn = 0;
+        if (tp && tp->pid >= 100 && tn++ < 400) {   // job control trace (satoru)
+            SerialLogger::Log("[jc] pid="); SerialLogger::LogDec((int)tp->pid);
+            SerialLogger::Log(eax == LSYS_SETPGID ? " setpgid" : eax == LSYS_SETSID ? " setsid" : eax == LSYS_WAITPID ? " wait4" : " kill");
+            SerialLogger::Log(" a="); SerialLogger::LogDec((int)ebx);
+            SerialLogger::Log(" b="); SerialLogger::LogDec((int)ecx);
+            SerialLogger::Log(" c="); SerialLogger::LogHex((uint32_t)edx);
+            SerialLogger::Log(" r="); SerialLogger::LogDec((int)r);
+            SerialLogger::Log("\r\n");
+        }
+    }
     if (r < 0) return r;
     switch (eax) {
     case LSYS_EPOLL_CREATE1: case LSYS_INOTIFY_INIT1:
@@ -4895,11 +6795,29 @@ int64_t LinuxSyscall::Dispatch(uint64_t eax, uint64_t ebx, uint64_t ecx,
     return r;
 }
 
+// a normal user may only set its effective uid to its current uid; any change
+// (notably setuid(0)) is an explicit sudo-style request and goes through the
+// admin gate. this also closes the old hole where setuid(0) simply worked. (satoru)
+static bool admin_identity_change(LinuxProcess* lp, uint32_t new_euid) {
+    if (!lp) return true;
+    if (new_euid == (uint32_t)-1 || new_euid == lp->euid || lp->euid == 0) return true;
+    return AdminGate::Authorize("change process identity", "setuid to a different account");
+}
+
 int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                                 uint64_t edx, uint64_t esi, uint64_t edi) {
     (void)esi; (void)edi;
 
-    if (SMP::CpuIndex() == 0) pump_ui_throttled();   // ui pump is bsp-only (satoru)
+    if (SMP::CpuIndex() == 0) {
+        pump_ui_throttled();   // ui pump is bsp-only (satoru)
+        // a SIGKILL the pump just posted to this very thread (task manager end
+        // task) is taken at this boundary: return -EINTR before a blocking
+        // syscall can park the thread and sit on the kill for its whole timeout.
+        // the syscall exit delivers it through the fatal-signal path. (satoru)
+        LinuxProcess* kp = Current();
+        if (kp && (kp->sig_pending & ~kp->sig_blocked & (1ull << 9)) && eax != LSYS_EXIT && eax != LSYS_EXIT_GROUP)
+            return -4;
+    }
 
     switch (eax) {
         case LSYS_EXIT:        return sys_exit(ebx);
@@ -4959,9 +6877,12 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_SETSID: {
             LinuxProcess* p = Current();
             if (!p) return -1;
-            // setsid() fails if caller is already a process-group leader
-            if (p->pgid == p->pid && p->is_session_leader && p->sid == p->pid) {
-                // already a session leader
+            // setsid() fails if the caller already leads a process group (ksys_setsid: a process
+            // whose pid names an existing group). kurono.pty=0 keeps the old lenient answer. (satoru)
+            if (!g_pty_legacy) {
+                if (p->pgid == p->pid) return -1;       // EPERM (satoru)
+                for (int qi = 0; qi < LINUX_MAX_PROCS; qi++)
+                    if (procs[qi].active && !procs[qi].exited && &procs[qi] != p && procs[qi].pgid == p->pid) return -1;
             }
             p->sid = p->pid;
             p->pgid = p->pid;
@@ -4987,12 +6908,24 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_SETPGID: {
             int target_pid = (int)ebx;
             int new_pgid   = (int)ecx;
+            LinuxProcess* me = Current();
             LinuxProcess* p = nullptr;
-            if (target_pid == 0) p = Current();
+            if (target_pid == 0) p = me;
             else for (int i = 0; i < LINUX_MAX_PROCS; i++)
                 if (procs[i].active && (int)procs[i].pid == target_pid){ p = &procs[i]; break; }
             if (!p) return -3;
             if (new_pgid == 0) new_pgid = (int)p->pid;
+            if (new_pgid < 0) return -22;
+            if (!g_pty_legacy && me) {
+                // kernel/sys.c setpgid: the caller or one of its children, never a session leader,
+                // same session, and the group must be the target's own pid or exist in the session. (satoru)
+                if (p != me && p->ppid != me->pid) return -3;          // ESRCH
+                if (p->is_session_leader && p->sid == p->pid) return -1;   // EPERM
+                if (p != me && p->sid != me->sid) return -1;
+                if (new_pgid != (int)p->pid && !pgrp_in_session(new_pgid, (int)p->sid)) return -1;
+            }
+            for (int qi = 0; qi < LINUX_MAX_PROCS; qi++)
+                if (procs[qi].active && procs[qi].fds == p->fds) procs[qi].pgid = (uint32_t)new_pgid;
             p->pgid = (uint32_t)new_pgid;
             return 0;
         }
@@ -5079,8 +7012,13 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             uint32_t* si = (uint32_t*)(uintptr_t)ebx;
             si[0] = Time::GetTicks() / 1000;
             si[1] = si[2] = si[3] = 0;          // load averages
-            si[4] = (uint32_t)(10ull * 1024 * 1024 * 1024 / 4096);  // 10 GB / mem_unit
-            si[5] = si[4] / 2;                  // freeram (rough)
+            {   // real ram from the pmm in 4 kb units (was a fixed 10 gb with half free); capped so the u32 field cannot wrap (satoru)
+                uint64_t tp = PMM::GetTotalMemory() / 4096, fp = PMM::GetFreeMemory() / 4096;
+                if (tp > 0xFFFFFFFFull) tp = 0xFFFFFFFFull;
+                if (fp > tp) fp = tp;
+                si[4] = (uint32_t)tp;
+                si[5] = (uint32_t)fp;
+            }
             si[6] = si[7] = 0;
             si[8] = si[9] = 0;
             si[10] = (uint32_t)ActiveProcessCount();
@@ -5260,7 +7198,8 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return sys_mkdir(ecx, edx);
         }
         case LSYS_UNLINKAT: {
-            // ignore flags (AT_REMOVEDIR not supported)
+            // honour at_removedir before the file unlink (satoru)
+            if (edx & 0x200) return sys_rmdir(ecx);
             return sys_unlink(ecx);
         }
         case LSYS_FSTATAT: {
@@ -5291,23 +7230,23 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             switch (cmd) {
                 case 0:  // F_DUPFD
                 case 1030: { // F_DUPFD_CLOEXEC
-                    for (int i = (int)arg; i < LINUX_MAX_FDS; i++) {
-                        if (!p->fds[i].open) {
-                            memcpy(&p->fds[i], lfd, sizeof(LinuxFd));
-                            if (cmd == 1030) p->fds[i].flags |= L_FD_CLOEXEC;
-                            else             p->fds[i].flags &= ~L_FD_CLOEXEC;
-                            retain_dup_backend(&p->fds[i]);
-                            return i;
-                        }
-                    }
-                    return -24;
+                    if ((int)arg < 0 || (int)arg >= LINUX_MAX_FDS) return -22;
+                    return fd_dup_locked(p, fd, (int)arg, cmd == 1030);
                 }
-                case 1:  return (lfd->flags & L_FD_CLOEXEC) ? 1 : 0;   // F_GETFD
-                case 2:                                                // F_SETFD
-                    if (arg & 1) lfd->flags |= L_FD_CLOEXEC; else lfd->flags &= ~L_FD_CLOEXEC;
+                // the flag word is read-modify-written under the fd lock: these four run
+                // without kls (see kls_elide). (satoru)
+                case 1: case 2: case 3: case 4: {
+                    SpinLockGuard fg(fdt_hdr(p->fds)->lock);
+                    if (!lfd->open) return -9;
+                    if (cmd == 1) return (lfd->flags & L_FD_CLOEXEC) ? 1 : 0;   // F_GETFD
+                    if (cmd == 2) {                                             // F_SETFD
+                        if (arg & 1) lfd->flags |= L_FD_CLOEXEC; else lfd->flags &= ~L_FD_CLOEXEC;
+                        return 0;
+                    }
+                    if (cmd == 3) return (int32_t)(lfd->flags & ~L_FD_CLOEXEC);   // F_GETFL
+                    lfd->flags = (arg & ~L_FD_CLOEXEC) | (lfd->flags & L_FD_CLOEXEC);   // F_SETFL
                     return 0;
-                case 3:  return (int32_t)(lfd->flags & ~L_FD_CLOEXEC);   // F_GETFL
-                case 4:  lfd->flags = (arg & ~L_FD_CLOEXEC) | (lfd->flags & L_FD_CLOEXEC); return 0;   // F_SETFL
+                }
                 case 5: case 6: case 7: {   // F_GETLK / F_SETLK / F_SETLKW - REAL locks (satoru)
                     // struct flock (x86_64): i16 l_type; i16 l_whence; pad;
                     // i64 l_start; i64 l_len; i32 l_pid. sqlite always uses
@@ -5343,6 +7282,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             KFileLock* L = &g_file_locks[i];
                             if (!L->active || L->path_hash != ph || L->owner == owner) continue;
                             if (L->start >= en || L->end <= st) continue;   // no overlap (satoru)
+                            if (!flock_owner_alive(L)) { L->active = false; continue; }   // dead owner (satoru)
                             if (want == 1 || L->type == 1) {          // would conflict (satoru)
                                 *fl_type  = L->type;                  // F_RDLCK/F_WRLCK (satoru)
                                 *fl_start = (int64_t)L->start;
@@ -5378,6 +7318,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                                 KFileLock* L = &g_file_locks[i];
                                 if (!L->active || L->path_hash != ph || L->owner == owner) continue;
                                 if (L->start >= en || L->end <= st) continue;
+                                if (!flock_owner_alive(L)) { L->active = false; continue; }   // dead owner (satoru)
                                 if (want == 1 || L->type == 1) { conflict = true; break; }
                             }
                             if (!conflict) {
@@ -5394,7 +7335,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                                     if (L->active) continue;
                                     L->active = true; L->type = want;
                                     L->path_hash = ph; L->start = st; L->end = en;
-                                    L->owner = owner;
+                                    L->owner = owner; L->owner_fds = p->fds;
                                     return 0;
                                 }
                                 return -37;                           // -ENOLCK table full (satoru)
@@ -5709,6 +7650,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             }
 
             // spawn the schedulable thread task that shares parent_task's cr3. (satoru)
+            retire_sweep();   // give exited threads' cap slots back first (satoru)
             Process* thread_task = Scheduler::CreateUserThread(
                 parent_task, eff_child_stack, tls, (flags & F_SETTLS) != 0);
             if (!thread_task) return -11;  // -EAGAIN (out of task slots)
@@ -5759,7 +7701,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // on this; without it the proxy can't see GTK's connection). drop the
             // fresh table CreateProcess just allocated and alias the parent's. (satoru)
             if (flags & 0x400u) {
-                if (tproc->fds) KernelHeap::Free(tproc->fds);
+                if (tproc->fds) fdt_free_unseen(tproc->fds);
                 tproc->fds = parent->fds;
             } else {
                 clone_file_descriptors(parent, tproc);
@@ -5816,6 +7758,9 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             } else {
                 thread_task->cpu_affinity = 0;
             }
+            // sched=2: the new thread just became claimable; wake a halted ap for
+            // it now instead of leaving it to the next 10ms lapic tick. (satoru)
+            if (Scheduler::SchedV2()) Scheduler::KickIdleCpu();
 
             // CLONE_VFORK: suspend this parent until the child execve's or _exit's.
             // mirror the futex block - set our resume return value (the child tid),
@@ -6027,7 +7972,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             int slot = epoll_alloc();
             if (slot < 0) return -24;
             int fd = AllocFd(p);
-            if (fd < 0) { g_epoll[slot].used = false; return -24; }
+            if (fd < 0) { SpinLockGuard eg(g_epoll[slot].lk); g_epoll[slot].used = false; return -24; }
             memset(&p->fds[fd], 0, sizeof(LinuxFd));
             p->fds[fd].type = LFD_EPOLL;
             p->fds[fd].backend_fd = slot;
@@ -6180,6 +8125,11 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 SerialLogger::Log("\r\n");
             }
             const int EPOLL_CTL_ADD = 1, EPOLL_CTL_DEL = 2, EPOLL_CTL_MOD = 3;
+            // the user event is copied before the lock: a page fault under it would need kls. (satoru)
+            LinuxEpollEvent lev = {}; const bool have_ev = ev != nullptr;
+            if (have_ev) lev = *ev;
+            SpinLockGuard epg(es->lk);
+            if (!es->used) return -22;
             // find an existing watch for this fd (satoru)
             int found = -1;
             for (int w = 0; w < EPOLL_MAX_WATCH; w++)
@@ -6187,26 +8137,29 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             if (op == EPOLL_CTL_DEL) {
                 if (found < 0) return -2;   // enoent (satoru)
                 es->watch[found].used = false;
+                es->watch[found].gen++;
                 return 0;
             }
             if (op == EPOLL_CTL_MOD) {
                 if (found < 0) return -2;
-                if (!ev) return -14;        // efault (satoru)
-                es->watch[found].events = ev->events;
-                es->watch[found].data   = ev->data;
+                if (!have_ev) return -14;   // efault (satoru)
+                es->watch[found].events = lev.events;
+                es->watch[found].data   = lev.data;
+                es->watch[found].gen++;
                 es->watch[found].et_ready = 0;   // re-armed: report current readiness (satoru)
                 es->watch[found].disarmed = false;
                 return 0;
             }
             if (op == EPOLL_CTL_ADD) {
                 if (found >= 0) return -17; // eexist (satoru)
-                if (!ev) return -14;
+                if (!have_ev) return -14;
                 for (int w = 0; w < EPOLL_MAX_WATCH; w++) {
                     if (!es->watch[w].used) {
                         es->watch[w].used   = true;
                         es->watch[w].fd     = tfd;
-                        es->watch[w].events = ev->events;
-                        es->watch[w].data   = ev->data;
+                        es->watch[w].events = lev.events;
+                        es->watch[w].data   = lev.data;
+                        es->watch[w].gen++;
                         es->watch[w].et_ready = 0;
                         es->watch[w].disarmed = false;
                         es->watch[w].et_seq   = fd_event_seq(p, tfd);
@@ -6246,30 +8199,73 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // main thread it had just FUTEX_WAKE'd (the WaitableEvent in
             // base::Thread::StartWithOptions), so the main thread stayed Ready-but-
             // never-run and NS_InitXPCOM never returned. (satoru)
+            uint32_t sgen0;
+            { SpinLockGuard epg(es->lk); sgen0 = es->sgen; }
             for (;;) {
                 int n = 0;
-                for (int w = 0; w < EPOLL_MAX_WATCH && n < maxevents; w++) {
-                    if (!es->watch[w].used) continue;
-                    if (es->watch[w].disarmed) continue;   // epolloneshot already fired (satoru)
-                    uint32_t interest = es->watch[w].events | L_EPOLLERR | L_EPOLLHUP;
-                    uint32_t r = fd_readiness(p, es->watch[w].fd, interest);
+                // one pass: copy the table under the epoll lock, compute readiness with no lock held,
+                // then apply the edge/oneshot state under it as a CLAIM: only if the watch is still the
+                // one that was copied (same fd, events and generation) and nobody else moved its edge
+                // state or fired its oneshot meanwhile. a loser drops the event, the winner reports it,
+                // so two threads waiting on one epfd cannot both deliver it. then the events are stored
+                // into the user array. (satoru)
+                EpSnap sn[EPOLL_MAX_WATCH]; int ns = 0;
+                {
+                    SpinLockGuard epg(es->lk);
+                    if (!es->used || es->sgen != sgen0) { p->poll_blocking = false; poll_unregister(p->task); return -22; }
+                    for (int w = 0; w < EPOLL_MAX_WATCH; w++)
+                        if (es->watch[w].used)
+                            sn[ns++] = { w, es->watch[w].fd, es->watch[w].events, es->watch[w].data,
+                                         es->watch[w].et_ready, es->watch[w].et_seq, es->watch[w].disarmed,
+                                         es->watch[w].gen };
+                }
+                struct EpCand { int k; uint32_t r, sq; };
+                EpCand cand[EPOLL_MAX_WATCH]; int nc = 0;
+                int reportable = 0;
+                for (int k = 0; k < ns && reportable < maxevents; k++) {
+                    const EpSnap& s = sn[k];
+                    if (s.disarmed) continue;   // epolloneshot already fired (satoru)
+                    uint32_t interest = s.events | L_EPOLLERR | L_EPOLLHUP;
+                    uint32_t r = fd_readiness(p, s.fd, interest);
                     // epollet: report only a fresh edge, else mio's undrained
                     // waker eventfd spun epoll_pwait ~30k/s. (satoru)
-                    if (es->watch[w].events & L_EPOLLET) {
-                        uint32_t sq = fd_event_seq(p, es->watch[w].fd);
-                        bool edge = (r & ~es->watch[w].et_ready) || sq != es->watch[w].et_seq;
-                        es->watch[w].et_ready = r;
-                        es->watch[w].et_seq   = sq;
-                        if (!edge) r = 0;
+                    uint32_t sq = 0;
+                    uint32_t report = r;
+                    if (s.events & L_EPOLLET) {
+                        sq = fd_event_seq(p, s.fd);
+                        bool edge = (r & ~s.et_ready) || sq != s.et_seq;
+                        if (!edge) report = 0;
                     }
-                    if (r) {
-                        out[n].events = r;
-                        out[n].data   = es->watch[w].data;
-                        n++;
-                        if (es->watch[w].events & L_EPOLLONESHOT) es->watch[w].disarmed = true;
+                    cand[nc++] = { k, r, sq };
+                    if (report) reportable++;
+                }
+                LinuxEpollEvent loc[EPOLL_MAX_WATCH];
+                {
+                    SpinLockGuard epg(es->lk);
+                    for (int c = 0; c < nc; c++) {
+                        const EpSnap& s = sn[cand[c].k];
+                        EpollWatch& W = es->watch[s.idx];
+                        if (!W.used || W.fd != s.fd || W.events != s.events || W.gen != s.gen) continue;   // deleted/changed meanwhile (satoru)
+                        bool report = cand[c].r != 0;
+                        if (s.events & L_EPOLLET) {
+                            if (W.et_ready != s.et_ready || W.et_seq != s.et_seq) continue;   // another waiter took this edge (satoru)
+                            bool edge = (cand[c].r & ~s.et_ready) || cand[c].sq != s.et_seq;
+                            W.et_ready = cand[c].r;
+                            W.et_seq   = cand[c].sq;
+                            if (!edge) report = false;
+                        }
+                        if (!report) continue;
+                        if (s.events & L_EPOLLONESHOT) {
+                            if (W.disarmed) continue;                                          // already fired (satoru)
+                            W.disarmed = true;
+                        }
+                        if (n < maxevents) { loc[n].events = cand[c].r; loc[n].data = s.data; n++; }
                     }
                 }
-                if (n > 0) { p->poll_blocking = false; poll_unregister(p->task); return n; }
+                if (n > 0) {
+                    for (int i = 0; i < n; i++) out[i] = loc[i];
+                    p->poll_blocking = false; poll_unregister(p->task); return n;
+                }
                 // [epw] probe: firefox epoll found NOTHING ready -> dump the watch set
                 // with each fd's type + interest + current readiness, so we can see
                 // the wedged IO/launcher thread's wakeup fd (a pipe/eventfd that
@@ -6302,14 +8298,48 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 // task 25: register the epoll watch set so a producer wakes this
                 // waiter (the IPC I/O thread) when a watched fd goes readable. (satoru)
                 {
-                    int wfds[EPOLL_MAX_WATCH]; int wn = 0;
-                    for (int w = 0; w < EPOLL_MAX_WATCH; w++)
-                        if (es->watch[w].used) wfds[wn++] = es->watch[w].fd;
-                    poll_register_fdlist(p->task, p, wfds, wn);
+                    int wfds[EPOLL_MAX_WATCH]; uint32_t wev[EPOLL_MAX_WATCH]; int wn = 0;
+                    {
+                        SpinLockGuard epg(es->lk);
+                        for (int w = 0; w < EPOLL_MAX_WATCH; w++)
+                            if (es->watch[w].used) { wev[wn] = es->watch[w].events; wfds[wn++] = es->watch[w].fd; }
+                    }
+                    // the watch's real events: an EPOLLOUT inet watch has no
+                    // producer wake and must keep the short backstop. (satoru)
+                    poll_register_fdlist(p->task, p, wfds, wn, wev);
+                }
+                // same re-check as do_poll_wait: a pipe/socket producer runs without kls, so an
+                // event between the scan above and this registration must not wait for the
+                // backstop. edge-triggered watches count only a fresh edge, as in the scan. (satoru)
+                {
+                    bool again = false;
+                    EpSnap rs[EPOLL_MAX_WATCH]; int nrs = 0;
+                    {
+                        SpinLockGuard epg(es->lk);
+                        for (int w = 0; w < EPOLL_MAX_WATCH; w++)
+                            if (es->watch[w].used && !es->watch[w].disarmed)
+                                rs[nrs++] = { w, es->watch[w].fd, es->watch[w].events, 0,
+                                              es->watch[w].et_ready, es->watch[w].et_seq, false, es->watch[w].gen };
+                    }
+                    for (int k = 0; k < nrs && !again; k++) {
+                        uint32_t rr = fd_readiness(p, rs[k].fd, rs[k].events | L_EPOLLERR | L_EPOLLHUP);
+                        if (!rr) continue;
+                        if (rs[k].events & L_EPOLLET)
+                            again = (rr & ~rs[k].et_ready) || fd_event_seq(p, rs[k].fd) != rs[k].et_seq;
+                        else again = true;
+                    }
+                    if (again) { poll_unregister(p->task); continue; }
                 }
                 // hand the cpu to a sibling user thread; re-issue epoll_wait (232) on
                 // wake (epoll_pwait shares the first four args, so 232 restarts both). (satoru)
                 if (poll_try_deschedule(p, 232)) return 0;   // switched; return ignored
+                // same signal exit as do_poll_wait: a deliverable signal must not
+                // wait out the epoll timeout (End Task on a single-threaded app). (satoru)
+                if (poll_signal_deliverable(p)) {
+                    p->poll_blocking = false;
+                    poll_unregister(p->task);
+                    return -4;   // -EINTR (satoru)
+                }
                 poll_unregister(p->task);   // bsp in-place: not parked, drop the reg (satoru)
                 // no sibling: cooperative in-place wait -- bsp pumps ui + yields to
                 // kernel procs; an ap releases the kls lock and breathes. (satoru)
@@ -6393,7 +8423,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 // 0 here read as EOF, so `busybox cat` on the terminal ended at once. (satoru)
                 LinuxProcess* sp = Current();
                 if (sp && in_fd >= 0 && in_fd < LINUX_MAX_FDS && sp->fds[in_fd].open &&
-                    sp->fds[in_fd].type == LFD_CONSOLE) return -22;
+                    (sp->fds[in_fd].type == LFD_CONSOLE || lfd_no_zcopy(&sp->fds[in_fd]))) return -22;
             }
             if (off) {
                 uint32_t* off_p = (uint32_t*)off;
@@ -6414,8 +8444,11 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return (int32_t)total;
         }
         case LSYS_SPLICE:
-        case LSYS_TEE:
+        case LSYS_TEE: {
+            LinuxProcess* sp = Current();   // a tty end is EINVAL, callers fall back to read/write (satoru)
+            for (int sfd = (int)ebx; sp && sfd >= 0 && sfd < LINUX_MAX_FDS && sp->fds[sfd].open && lfd_no_zcopy(&sp->fds[sfd]); sfd = -1) return -22;
             return 0;
+        }
 
         case LSYS_FALLOCATE: {
             // grow a memfd's backing for posix_fallocate-sized shm pools. wayland's
@@ -6448,6 +8481,8 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             char ro[256], rn[256];
             ResolvePath(oldp, ro, sizeof(ro), p);
             ResolvePath(newp, rn, sizeof(rn), p);
+            if ((AdminGate::PathNeedsElevation(ro) || AdminGate::PathNeedsElevation(rn)) &&
+                !AdminGate::AuthorizePathWrite(rn, "rename")) return -1;
             KVFS::Unlink(rn);                        // replace an existing target (satoru)
             if (KVFS::Move(ro, rn) == KVFS_OK) return 0;
             return -2;   // -ENOENT (source missing / move failed)
@@ -6513,9 +8548,11 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             return 0;
         }
         case LSYS_SETHOSTNAME: {
+            if (!AdminGate::AuthorizePathWrite("/etc/hostname", "set hostname")) return -1;
             const char* p = (const char*)(uintptr_t)ebx;
             uint32_t n = ecx;
             char hn[64]; if (n >= sizeof(hn)) n = sizeof(hn) - 1;
+            if (!p || !UAccess::AccessOk((uint64_t)(uintptr_t)p, n)) return -14;   // -EFAULT
             for (uint32_t i = 0; i < n; i++) hn[i] = p[i];
             hn[n] = 0;
             KVFS::WriteString("/etc/hostname", hn);
@@ -6631,6 +8668,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             if (!lp) return -9;
             if (fd_in < 0 || fd_in >= LINUX_MAX_FDS) return -9;
             if (fd_out < 0 || fd_out >= LINUX_MAX_FDS) return -9;
+            if ((lp->fds[fd_in].open && lfd_no_zcopy(&lp->fds[fd_in])) || (lp->fds[fd_out].open && lfd_no_zcopy(&lp->fds[fd_out]))) return -22;
             uint8_t buf[2048];
             uint32_t copied = 0;
             while (copied < len) {
@@ -6733,6 +8771,14 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         // single-address-space build we just memcpy.
         case LSYS_PROCESS_VM_READV:
         case LSYS_PROCESS_VM_WRITEV: {
+            // cross-process memory access is a privileged debug operation. the
+            // backend only resolves the caller's address space, but gate the
+            // request anyway so a future real implementation cannot regress. (satoru)
+            LinuxProcess* plp = Current();
+            int target_pid = (int)ebx;
+            if (plp && target_pid > 0 && target_pid != (int)plp->pid &&
+                !AdminGate::Authorize("process memory", "read/write another process memory"))
+                return -1;
             LinuxIovec* liov = (LinuxIovec*)(uintptr_t)ecx;
             uint32_t lcnt    = edx;
             LinuxIovec* riov = (LinuxIovec*)(uintptr_t)esi;
@@ -6806,6 +8852,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     for (int i = 0; i < KFILE_LOCK_SLOTS; i++) {
                         KFileLock* L = &g_file_locks[i];
                         if (!L->active || L->path_hash != ph || L->owner == owner) continue;
+                        if (!flock_owner_alive(L)) { L->active = false; continue; }   // dead owner (satoru)
                         if (want == 1 || L->type == 1) { conflict = true; break; }
                     }
                     if (!conflict) {
@@ -6821,6 +8868,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             if (L->active) continue;
                             L->active = true; L->type = want; L->path_hash = ph;
                             L->start = 0; L->end = ~0ull; L->owner = owner;
+                            L->owner_fds = p->fds;
                             return 0;
                         }
                         return -37;   // -ENOLCK: lock table full (satoru)
@@ -6999,12 +9047,18 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // the connected remote. esi carries the flags (MSG_DONTWAIT ok - 
             // the bridge never blocks anyway). (satoru)
             if (lp->fds[fd].type == LFD_INET) {
+                // pinned, and the payload goes through a kernel buffer: the bridge copies under the net
+                // lock (a leaf lock) and a user page fault there would need kls. a tcp write may be
+                // short, a datagram over 1472 bytes is refused whatever the clamp. (satoru)
+                InetRef ir;
+                if (len < 0 || !fd_get_inet(lp, fd, &ir)) return -9;
+                InetGuard in_guard{ir.sd};
+                if (!UAccess::AccessOk((uintptr_t)buf, (uint64_t)len)) return -14;
                 const uint8_t* dsa = (const uint8_t*)(uintptr_t)edi;
                 LinuxSockaddrIn dsin;
                 LinuxSockaddrIn* pd = nullptr;
                 if (dsa) { memcpy(&dsin, dsa, sizeof(dsin)); pd = &dsin; }
-                int sr = LinuxNetBridge::Sendto(lp->fds[fd].backend_fd, buf, len,
-                                                (int)esi, pd);
+                int sr = inet_send_user(ir.sd, (const uint8_t*)buf, (uint64_t)len, pd, (int)esi);
                 if (false) {   // [inet] sendto trace, flip to watch
                     SerialLogger::Log("[inet] sendto fd="); SerialLogger::LogDec(fd);
                     SerialLogger::Log(" len="); SerialLogger::LogDec(len);
@@ -7013,8 +9067,14 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 }
                 return sr;
             }
-            if (lp->fds[fd].type != LFD_SOCKET) return -9;
-            return UnixSocket::Send(lp->fds[fd].backend_fd, buf, len, 0);
+            {
+                SockRef sr;
+                if (len < 0 || !fd_get_sock(lp, fd, &sr)) return -9;
+                if (!UAccess::AccessOk((uintptr_t)buf, (uint64_t)len)) { fd_put_sock(sr.sd); return -14; }
+                int r = unix_send_user(sr.sd, (const uint8_t*)buf, (uint64_t)len);
+                fd_put_sock(sr.sd);
+                return r;
+            }
         }
         case LSYS_SENDMSG: {
             // sendmsg(fd, const struct msghdr*, flags): gather the iov payload
@@ -7029,10 +9089,13 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // (SCM_RIGHTS is a unix-domain concept). msg_name, when set on a
             // udp socket, is the datagram destination. (satoru)
             if (lp->fds[fd].type == LFD_INET) {
+                InetRef ir;
+                if (!fd_get_inet(lp, fd, &ir)) return -9;
+                InetGuard in_guard{ir.sd};
                 const uint8_t* nm  = *(const uint8_t* const*)(m + 0);   // msg_name
                 const uint8_t* iv  = *(const uint8_t* const*)(m + 16);
                 uint64_t ivl       = *(const uint64_t*)(m + 24);
-                static uint8_t s_inet_tx[8192];
+                uint8_t s_inet_tx[8192];   // a static before the kls split (satoru)
                 int tot = 0;
                 for (uint64_t i = 0; iv && i < ivl && tot < (int)sizeof(s_inet_tx); i++) {
                     const uint8_t* ib = *(const uint8_t* const*)(iv + i * 16);
@@ -7043,18 +9106,21 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 LinuxSockaddrIn dsin;
                 LinuxSockaddrIn* pd = nullptr;
                 if (nm) { memcpy(&dsin, nm, sizeof(dsin)); pd = &dsin; }
-                return LinuxNetBridge::Sendto(lp->fds[fd].backend_fd,
+                return LinuxNetBridge::Sendto(ir.sd,
                                               s_inet_tx, tot, (int)edx, pd);
             }
-            if (lp->fds[fd].type != LFD_SOCKET) return -9;
+            SockRef sr;
+            if (!fd_get_sock(lp, fd, &sr)) return -9;
+            struct SrGuard { int sd; ~SrGuard() { fd_put_sock(sd); } } sr_guard{sr.sd};   // dropped on every return (satoru)
             const uint8_t* iov = *(const uint8_t* const*)(m + 16);  // msg_iov
             uint64_t iovlen    = *(const uint64_t*)(m + 24);        // msg_iovlen
             const uint8_t* ctl = *(const uint8_t* const*)(m + 32);  // msg_control
             uint64_t ctllen    = *(const uint64_t*)(m + 40);        // msg_controllen
 
-            // gather iov into a static scratch (cooperative single-cpu: safe;
-            // libwayland flushes are <= one 4 KB connection buffer). (satoru)
-            static uint8_t s_sendmsg_buf[8192];
+            // gather iov into a stack scratch (libwayland flushes are <= one 4 KB
+            // connection buffer). it was a static before the kls split, which a
+            // second cpu would overwrite. (satoru)
+            uint8_t s_sendmsg_buf[8192];
             int total = 0;
             for (uint64_t i = 0; iov && i < iovlen &&
                                  total < (int)sizeof(s_sendmsg_buf); i++) {
@@ -7067,6 +9133,12 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
 
             // parse the control buffer for SCM_RIGHTS fd arrays. (satoru)
             UnixSocket::ControlMsg cm = {};
+            // passing fds touches the memfd table (pinned flag, shm lookups): kls. every passed
+            // unix socket is pinned for the call, so a close on another cpu cannot free it before the
+            // send takes its own in-flight reference. (satoru)
+            KlsRescue scm_rescue; scm_rescue.takeIf(elided_here() && ctl && ctllen >= 16);
+            int scm_pins[UnixSocket::UNIX_MAX_PASSED_FD]; int scm_npins = 0;
+            struct PinDrop { int* p; int* n; ~PinDrop() { for (int i = 0; i < *n; i++) fd_put_sock(p[i]); } } pin_drop{scm_pins, &scm_npins};
             if (ctl && ctllen >= 16) {
                 uint64_t off = 0;
                 while (off + 16 <= ctllen) {
@@ -7084,6 +9156,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             cm.passed_fds[idx] = pfd;
                             LinuxShmObj* s = shm_for_fd(lp, pfd);
                             if (s && s->base) {
+                                s->pinned = true;   // receivers hold the bare base (satoru)
                                 cm.passed_shm_base[idx] = (uint64_t)(uintptr_t)s->base;
                                 cm.passed_shm_size[idx] = s->size;
                             } else if (pfd >= 0 && pfd < LINUX_MAX_FDS &&
@@ -7093,8 +9166,12 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                                 // the fork server): record the global sd so the
                                 // receiver aliases the SAME socket, refcounted, not a
                                 // /dev/null placeholder. (satoru)
-                                cm.passed_sd[idx] = lp->fds[pfd].backend_fd;
-                                cm.passed_is_socket[idx] = true;
+                                SockRef pr;
+                                if (fd_get_sock(lp, pfd, &pr)) {
+                                    cm.passed_sd[idx] = pr.sd;
+                                    cm.passed_is_socket[idx] = true;
+                                    scm_pins[scm_npins++] = pr.sd;
+                                }
                                 if (false) {   // [scmTX] gated off (satoru)
                                     SerialLogger::Log("[scmTX] pass sock sd="); SerialLogger::LogDec(lp->fds[pfd].backend_fd);
                                     SerialLogger::Log(" by pid="); SerialLogger::LogDec(lp ? (int)lp->pid : -1); SerialLogger::Log("\r\n");
@@ -7105,8 +9182,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                     off += (clen + 7) & ~7ULL;   // CMSG_ALIGN
                 }
             }
-            return UnixSocket::SendMsg(lp->fds[fd].backend_fd,
-                                       s_sendmsg_buf, total, 0, &cm);
+            return unix_send_k(sr.sd, s_sendmsg_buf, total, &cm);
         }
         case LSYS_RECVFROM: {
             // raw recv: ecx is a plain buffer, no msghdr/cmsg parsing. (satoru)
@@ -7121,9 +9197,17 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // -EAGAIN when empty; blocking emulation stays in sys_read-style
             // callers (the resolver polls first). (satoru)
             if (lp->fds[fd].type == LFD_INET) {
+                InetRef ir;
+                if (len < 0 || !fd_get_inet(lp, fd, &ir)) return -9;
+                InetGuard in_guard{ir.sd};
+                int n = len > 4096 ? 4096 : len;
+                if (!UAccess::AccessOk((uintptr_t)buf, (uint64_t)n)) return -14;
+                uint8_t kb[4096];
                 LinuxSockaddrIn ssin;
-                int r = LinuxNetBridge::Recvfrom(lp->fds[fd].backend_fd, buf, len,
+                memset(&ssin, 0, sizeof(ssin));   // a tcp recvfrom never fills it (satoru)
+                int r = LinuxNetBridge::Recvfrom(ir.sd, kb, n,
                                                  (int)esi, &ssin);
+                if (r > 0) memcpy(buf, kb, (size_t)r);
                 if (r >= 0 && edi) {
                     write_sin((uint8_t*)(uintptr_t)edi,
                               LinuxNetBridge::Ntohl(ssin.sin_addr),
@@ -7137,9 +9221,12 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 }
                 return r;
             }
-            if (lp->fds[fd].type != LFD_SOCKET) return -9;
-            int r = UnixSocket::Recv(lp->fds[fd].backend_fd, buf, len, 0);
-            if (r == -11 && !(lp->fds[fd].flags & L_O_NONBLOCK) && !(esi & 0x40))   // MSG_DONTWAIT (satoru)
+            SockRef sr;
+            if (len < 0 || !fd_get_sock(lp, fd, &sr)) return -9;
+            if (!UAccess::AccessOk((uintptr_t)buf, (uint64_t)len)) { fd_put_sock(sr.sd); return -14; }
+            int r = unix_recv_user(sr.sd, (uint8_t*)buf, (uint64_t)len);
+            fd_put_sock(sr.sd);
+            if (r == -11 && !(sr.flags & L_O_NONBLOCK) && !(esi & 0x40))   // MSG_DONTWAIT (satoru)
                 return unix_recv_wait(lp, fd, 45);
             return r;
         }
@@ -7159,16 +9246,20 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // cmsg for inet - zero msg_controllen so the caller doesn't parse
             // stale bytes. (satoru)
             if (lp->fds[fd].type == LFD_INET) {
+                InetRef ir;
+                if (!fd_get_inet(lp, fd, &ir)) return -9;
+                InetGuard in_guard{ir.sd};
                 uint8_t* nm      = *(uint8_t* const*)(m + 0);       // msg_name
                 uint8_t* iv      = *(uint8_t* const*)(m + 16);
                 uint64_t ivl     = *(const uint64_t*)(m + 24);
-                static uint8_t s_inet_rx[8192];
+                uint8_t s_inet_rx[8192];   // a static before the kls split (satoru)
                 int want = 0;
                 for (uint64_t i = 0; iv && i < ivl; i++)
                     want += (int)*(const uint64_t*)(iv + i * 16 + 8);
                 if (want > (int)sizeof(s_inet_rx)) want = (int)sizeof(s_inet_rx);
                 LinuxSockaddrIn ssin;
-                int r = LinuxNetBridge::Recvfrom(lp->fds[fd].backend_fd,
+                memset(&ssin, 0, sizeof(ssin));
+                int r = LinuxNetBridge::Recvfrom(ir.sd,
                                                  s_inet_rx, want, (int)edx, &ssin);
                 if (false) {   // [inet] recvmsg trace, flip to watch
                     SerialLogger::Log("[inet] recvmsg fd="); SerialLogger::LogDec(fd);
@@ -7187,7 +9278,9 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                 *(uint64_t*)(m + 40) = 0;                       // msg_controllen = 0 (satoru)
                 return r;
             }
-            if (lp->fds[fd].type != LFD_SOCKET) return -9;
+            SockRef sr;
+            if (!fd_get_sock(lp, fd, &sr)) return -9;
+            struct SrGuard { int sd; ~SrGuard() { fd_put_sock(sd); } } sr_guard{sr.sd};   // dropped on every return (satoru)
             uint8_t* iov     = *(uint8_t* const*)(m + 16);      // msg_iov
             uint64_t iovlen  = *(const uint64_t*)(m + 24);      // msg_iovlen
             uint8_t* ctl     = *(uint8_t* const*)(m + 32);      // msg_control
@@ -7195,16 +9288,15 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
 
             // total room the caller offered across all iov segments - bound to
             // scratch so a cooperative single-cpu copy stays safe. (satoru)
-            static uint8_t s_recvmsg_buf[8192];
+            uint8_t s_recvmsg_buf[8192];   // a static before the kls split (satoru)
             uint64_t want = 0;
             for (uint64_t i = 0; iov && i < iovlen; i++)
                 want += *(const uint64_t*)(iov + i * 16 + 8);
             if (want > sizeof(s_recvmsg_buf)) want = sizeof(s_recvmsg_buf);
 
             UnixSocket::ControlMsg cm = {};
-            int got = UnixSocket::Recv(lp->fds[fd].backend_fd,
-                                       s_recvmsg_buf, (int)want, 0, &cm);
-            if (got == -11 && !(lp->fds[fd].flags & L_O_NONBLOCK) && !(edx & 0x40))   // MSG_DONTWAIT (satoru)
+            int got = UnixSocket::Recv(sr.sd, s_recvmsg_buf, (int)want, 0, &cm);
+            if (got == -11 && !(sr.flags & L_O_NONBLOCK) && !(edx & 0x40))   // MSG_DONTWAIT (satoru)
                 return unix_recv_wait(lp, fd, 47);
             if (got < 0) return got;
 
@@ -7226,6 +9318,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             // re-create a real shm fd that maps the SAME pages; otherwise install a
             // closeable placeholder (full cross-process aliasing of pipes/sockets
             // is a follow-up). (satoru)
+            KlsRescue install_rescue; install_rescue.takeIf(elided_here() && cm.passed_fd_count > 0);   // memfd table (satoru)
             if (cm.passed_fd_count > 0) {
                 int n = cm.passed_fd_count;
                 if (n > UnixSocket::UNIX_MAX_PASSED_FD)
@@ -7266,6 +9359,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
                             if (slot >= 0) {
                                 g_linux_shm[slot].base = (uint8_t*)(uintptr_t)cm.passed_shm_base[k];
                                 g_linux_shm[slot].size = cm.passed_shm_size[k];
+                                g_linux_shm[slot].borrowed = true;   // the sender's object owns the backing (satoru)
                                 lp->fds[nf].type = LFD_MEMFD;
                                 lp->fds[nf].backend_fd = slot;
                             } else {
@@ -7579,6 +9673,18 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             if (pid == 0 && lp && lp->task) pid = lp->task->pid;
             else if (pid) pid = task_pid_of_lpid(pid);
             uint8_t m = mask[0] ? mask[0] : 0x1;
+            // sched=2: a mask covering every online cpu (the usual "undo a pin")
+            // or one naming only cpus past 7 cannot fit the 8-bit field; store
+            // 0xFF, which the sched=2 picker reads as "any cpu". (satoru)
+            if (Scheduler::ReportAllCpus()) {
+                uint32_t size = ecx, n = SMP::CpuCount(), have = 0;
+                for (uint32_t c = 0; c < n && c / 8 < size; c++)
+                    if ((mask[c / 8] >> (c % 8)) & 1u) have++;
+                if (have == n || mask[0] == 0 || mask[0] == 0xFF) m = 0xFF;
+                // cpu 0 is the kernel-services cpu and runs no user task under
+                // sched=2: a pin to it alone would never run (review finding). (satoru)
+                if ((m & 0xFEu) == 0) m = 0xFF;
+            }
             return Scheduler::SetAffinity(pid, m) == 0 ? 0 : -3;
         }
         // sched_getaffinity(pid, cpusetsize, mask): write the task's affinity
@@ -7592,6 +9698,23 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             else if (pid) pid = task_pid_of_lpid(pid);
             uint8_t m = 0;
             if (Scheduler::GetAffinity(pid, &m) != 0) return -3;
+            if (Scheduler::ReportAllCpus() && (m == 0 || m == 0xFF)) {
+                // sched=2: user tasks really run on every online cpu, so say so.
+                // musl's sysconf(_SC_NPROCESSORS_ONLN) and rust's
+                // available_parallelism count these bits; the old "0x1" made
+                // every program size its thread pools for ONE cpu. (satoru)
+                // cpus 1..n-1: the bsp runs no user task in sched=2, so a pool
+                // pinning a worker per reported bit must not get bit 0. (satoru)
+                uint32_t n = SMP::CpuCount();
+                for (uint32_t i = 0; i < size; i++) {
+                    uint32_t lo = i * 8;
+                    uint8_t b = 0;
+                    for (uint32_t k = 0; k < 8; k++)
+                        if (lo + k < n && lo + k != 0) b |= (uint8_t)(1u << k);
+                    mask[i] = b;
+                }
+                return (int32_t)size;
+            }
             if (m == 0) m = 0x1;
             for (uint32_t i = 0; i < size; i++) mask[i] = (i == 0) ? m : 0;
             return (int32_t)size;
@@ -7802,11 +9925,15 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             char ro[256], rn[256];
             ResolvePath(oldp, ro, sizeof(ro), lp);
             ResolvePath(newp, rn, sizeof(rn), lp);
+            if (AdminGate::PathNeedsElevation(rn) &&
+                !AdminGate::AuthorizePathWrite(rn, "link")) return -1;
             // link never replaces: lock-file schemes rely on EEXIST to tell
             // who won. (satoru)
             if (!KVFS::Exists(ro)) return -2;
             if (KVFS::Exists(rn))  return -17;
-            return KVFS::Copy(ro, rn) == 0 ? 0 : -2;
+            if (KVFS::Copy(ro, rn) != 0) return -2;
+            if (lp) KVFS::Chown(rn, (uint16_t)lp->euid, (uint16_t)lp->egid);   // creator owns the link (satoru)
+            return 0;
         }
         // symlinkat(target, newdirfd, linkpath): create a real kvfs symlink. (satoru)
         case LSYS_SYMLINKAT: {
@@ -7816,7 +9943,11 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             LinuxProcess* lp = Current();
             char rl[256];
             ResolvePath(linkp, rl, sizeof(rl), lp);
-            return KVFS::Symlink(rl, target) == 0 ? 0 : -2;
+            if (AdminGate::PathNeedsElevation(rl) &&
+                !AdminGate::AuthorizePathWrite(rl, "symlink")) return -1;
+            if (KVFS::Symlink(rl, target) != 0) return -2;
+            if (lp) KVFS::Chown(rl, (uint16_t)lp->euid, (uint16_t)lp->egid);   // creator owns the symlink (satoru)
+            return 0;
         }
         // chmod(path, mode) / fchmod(fd, mode): kvfs keeps the mode on the node. fchmod
         // resolves through the path the fd was opened with. (satoru)
@@ -7826,6 +9957,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             LinuxProcess* lp = Current();
             char rp[256];
             ResolvePath(path, rp, sizeof(rp), lp);
+            if (!AdminGate::AuthorizePathWrite(rp, "chmod")) return -1;
             return KVFS::Chmod(rp, (uint16_t)(ecx & 07777)) == 0 ? 0 : -2;
         }
         case LSYS_FCHMOD: {
@@ -7834,6 +9966,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             if (!lp || fd < 0 || fd >= LINUX_MAX_FDS || !lp->fds[fd].open) return -9;
             LinuxFd* lf = &lp->fds[fd];
             if (lf->type != LFD_KVFS || !lf->path[0]) return 0;   // pipes, sockets, ttys: nothing to record (satoru)
+            if (!AdminGate::AuthorizePathWrite(lf->path, "fchmod")) return -1;
             KVFS::Chmod(lf->path, (uint16_t)(ecx & 07777));
             return 0;
         }
@@ -7845,6 +9978,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             LinuxProcess* lp = Current();
             char rp[256];
             ResolvePath(path, rp, sizeof(rp), lp);
+            if (!AdminGate::AuthorizePathWrite(rp, "chown")) return -1;
             return KVFS::Exists(rp) ? 0 : -2;
         }
         // fchmodat(dirfd, path, mode, flags): resolve + chmod through kvfs. (satoru)
@@ -8081,8 +10215,12 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         // boundary. (satoru)
         case LSYS_RT_SIGQUEUEINFO: {
             uint32_t tgid = ebx; int sig = (int)ecx;
+            LinuxProcess* lp = Current();
             for (int i = 0; i < LINUX_MAX_PROCS; i++)
                 if (procs[i].active && procs[i].pid == tgid) {
+                    if (lp && &procs[i] != lp && procs[i].uid != lp->euid &&
+                        !AdminGate::Authorize("kill process", "queue a signal to another user's process"))
+                        return -1;
                     if (sig > 0 && sig < 64) sig_post(&procs[i], sig);
                     return 0;
                 }
@@ -8090,8 +10228,12 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         }
         case LSYS_RT_TGSIGQUEUEINFO: {
             int tid = (int)ecx; int sig = (int)edx;
+            LinuxProcess* lp = Current();
             for (int i = 0; i < LINUX_MAX_PROCS; i++)
                 if (procs[i].active && (int)procs[i].pid == tid) {
+                    if (lp && &procs[i] != lp && procs[i].uid != lp->euid &&
+                        !AdminGate::Authorize("kill process", "queue a signal to another user's process"))
+                        return -1;
                     if (sig > 0 && sig < 64) sig_post(&procs[i], sig);
                     return 0;
                 }
@@ -8108,12 +10250,50 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
             int pid = (int)ebx; int sig = (int)ecx;
             LinuxProcess* lp = Current();
             LinuxProcess* target = nullptr;
+            // kill(2) group forms: 0 = the caller's process group, -1 = every process but the
+            // caller, < -1 = group -pid. a job-control shell signals its jobs this way. (satoru)
+            if (eax == LSYS_KILL_ && pid <= 0 && lp && sig >= 0 && sig < 64) {
+                int pg = pid == 0 ? (int)lp->pgid : (pid == -1 ? -1 : -pid);
+                int hits = 0;
+                // a normal user may only signal processes of its own uid; a
+                // group signal that reaches a different uid needs approval. (satoru)
+                bool foreign = false;
+                for (int qi = 0; qi < LINUX_MAX_PROCS; qi++) {
+                    LinuxProcess* q = &procs[qi];
+                    if (!q->active || q->exited) continue;
+                    if (q->task && q->task->is_thread()) continue;
+                    if (pg == -1 ? (q == lp) : ((int)q->pgid != pg)) continue;
+                    if (q != lp && q->uid != lp->euid) foreign = true;
+                }
+                if (foreign && !AdminGate::Authorize("kill process", "signal a process owned by another user"))
+                    return -1;
+                for (int qi = 0; qi < LINUX_MAX_PROCS; qi++) {
+                    LinuxProcess* q = &procs[qi];
+                    if (!q->active || q->exited) continue;
+                    if (q->task && q->task->is_thread()) continue;
+                    if (pg == -1 ? (q == lp) : ((int)q->pgid != pg)) continue;
+                    hits++;
+                    if (sig == 0) continue;
+                    if (sig == 9 && q != lp && q->task) {
+                        Process* ql = region_owner(q->task);
+                        if (ql) Scheduler::KillProcessGroupAsync(ql->pid, nullptr);
+                        q->exited = true; q->exit_code = -9;
+                    } else {
+                        sig_post(q, sig);
+                    }
+                }
+                return hits ? 0 : -3;
+            }
             if (pid <= 0) target = lp;   // self / process-group -> current (satoru)
             else {
                 for (int i = 0; i < LINUX_MAX_PROCS; i++)
                     if (procs[i].active && (int)procs[i].pid == pid) { target = &procs[i]; break; }
             }
             if (!target) return -3;   // ESRCH (satoru)
+            // killing a process you do not own needs administrator approval. (satoru)
+            if (lp && target != lp && target->uid != lp->euid &&
+                !AdminGate::Authorize("kill process", "signal a process owned by another user"))
+                return -1;
             if (sig == 0) return 0;   // existence probe: target exists (satoru)
             if (sig < 1 || sig >= 64) return -22;
             if (sig == 9 && target != lp && target->task) {
@@ -8186,7 +10366,10 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         // sane constants. (satoru)
         case LSYS_SETUID_: {
             LinuxProcess* lp = Current();
-            if (lp) { lp->uid = ebx; lp->euid = ebx; }
+            if (lp) {
+                if (!admin_identity_change(lp, (uint32_t)ebx)) return -1;
+                lp->uid = ebx; lp->euid = ebx;
+            }
             return 0;
         }
         case LSYS_SETGID_: {
@@ -8197,6 +10380,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_SETREUID_: {
             LinuxProcess* lp = Current();
             if (lp) {
+                if ((int)ecx != -1 && !admin_identity_change(lp, (uint32_t)ecx)) return -1;
                 if ((int)ebx != -1) lp->uid = ebx;
                 if ((int)ecx != -1) lp->euid = ecx;
             }
@@ -8213,6 +10397,7 @@ int64_t LinuxSyscall::DispatchInner(uint64_t eax, uint64_t ebx, uint64_t ecx,
         case LSYS_SETRESUID: {
             LinuxProcess* lp = Current();
             if (lp) {
+                if ((int)ecx != -1 && !admin_identity_change(lp, (uint32_t)ecx)) return -1;
                 if ((int)ebx != -1) lp->uid  = ebx;
                 if ((int)ecx != -1) lp->euid = ecx;
             }
@@ -8371,6 +10556,7 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
     if (p) {
         p->exit_code = (int)code;
         p->exited = true;
+        SessionLeaderExit((int)(p - procs));   // a leader exiting releases its tty (satoru)
         SerialLogger::Log("[LinuxSyscall] Process exited: ");
         SerialLogger::LogDec((int)code);
         SerialLogger::Log(" pid="); SerialLogger::LogDec(p->pid);   // [texit] which thread (satoru)
@@ -8410,6 +10596,10 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
                             (p->fds[i].type == LFD_SOCKET || p->fds[i].type == LFD_PIPE) &&
                             p->fds[i].backend_fd >= 0) {
                             UnixSocket::Close(p->fds[i].backend_fd);
+                            p->fds[i].open = false;
+                        }
+                        else if (p->fds[i].open && lfd_is_pty(&p->fds[i])) {
+                            pty_fd_release(&p->fds[i]);
                             p->fds[i].open = false;
                         }
                     }
@@ -8463,7 +10653,11 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
             // table belongs to the leader and is NOT freed (CreateProcess
             // allocates the reused slot a fresh one). kls serializes this
             // against every concurrent CreateProcess. (satoru)
+            Process* exiting_task = p->task;   // sched=2 stack hand-off below (satoru)
             if (p->task->is_thread()) {
+                // and give its live-task cap slot back (the cap counter leaked one
+                // per exited thread until clone() failed). (satoru)
+                retire_note(p->task);
                 p->task = nullptr;
                 p->active = false;
             }
@@ -8476,6 +10670,11 @@ int32_t LinuxSyscall::sys_exit(uint32_t code) {
                         // SESSION belongs to the bsp (its RunProcessWithArgs
                         // context) - unwinding it from an ap would longjmp across
                         // cores. (satoru)
+                        // sched=2: the dead task's on_cpu used to stay 1 forever
+                        // here; queue it so FinishSwitch publishes 0 once this cpu
+                        // is in the dispatch loop, which lets a reaper free its
+                        // kernel stack safely. old mode: unchanged. (satoru)
+                        if (Scheduler::SchedV2()) Scheduler::ReleaseOnCpu(exiting_task);
                         SMP::ApIdleFrame(current_syscall_frame);
                         current_frame_rewritten = true;
                     } else {
@@ -8508,9 +10707,17 @@ int32_t LinuxSyscall::sys_fork() {
 
     Process* child_task = Scheduler::CloneUserProcess(parent_task);
     if (!child_task) return -12;
+    // item 10: CloneUserProcess copied the inline region table; copy the
+    // extension chunks before the child can fault on one of those ranges. (satoru)
+    if (!rext_copy(parent_task, child_task)) {
+        rext_release_owner(child_task);
+        Scheduler::DestroyProcess(child_task);
+        return -12;
+    }
 
     int child_idx = CreateProcess(parent->name, parent->uid, parent->gid);
     if (child_idx < 0) {
+        rext_release_owner(child_task);
         Scheduler::DestroyProcess(child_task);
         return -12;
     }
@@ -8536,6 +10743,13 @@ int32_t LinuxSyscall::sys_fork() {
     // for everything) until it installs its own; exec would reset handlers anyway. (satoru)
     child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;
+    {   // posix: signals the parent ignores stay ignored in the child (and across exec); a job
+        // control shell ignores SIGTTOU/SIGTSTP/SIGTTIN and its children's tcsetpgrp relies on it. (satoru)
+        Process* pl = region_owner(parent_task);
+        LinuxSigGroup* pg = pl ? sig_group_for(pl, false) : nullptr;
+        LinuxSigGroup* cg = pg ? sig_group_for(child_task, true) : nullptr;
+        if (cg) for (int sn = 1; sn < 64; sn++) if (pg->act[sn].handler == 1) cg->act[sn].handler = 1;
+    }
     ls_scpy(child->cwd, parent->cwd, sizeof(child->cwd));
     ls_scpy(child->name, parent->name, sizeof(child->name));
     clone_file_descriptors(parent, child);
@@ -8544,6 +10758,14 @@ int32_t LinuxSyscall::sys_fork() {
     child_task->rip = (uintptr_t)child_task->user_frame.rip;
     child_task->rsp = (uintptr_t)child_task->user_frame.rsp;
     child_task->rbp = (uintptr_t)child_task->user_frame.rbp;
+
+    // sched=2: the child is fully built (slot, fds, rax=0) only now, so only now
+    // may an application processor claim it. it then runs, blocks and exits on
+    // the aps like a thread instead of waiting for the parent's cpu. (satoru)
+    if (Scheduler::SchedV2()) {
+        Scheduler::MarkApResumable(child_task);
+        Scheduler::KickIdleCpu();
+    }
 
     return (int32_t)child->pid;
 }
@@ -8562,6 +10784,7 @@ static bool is_group_child(LinuxProcess* c, LinuxProcess* caller, Process* ctask
 // waitid(P_ALL/P_PID, id, infop, WEXITED[|WNOHANG|WNOWAIT]). firefox's child
 // watcher uses it; ENOSYS made it declare every content process dead. (satoru)
 int32_t LinuxSyscall::sys_waitid(int idtype, int32_t id, uint64_t infop, uint32_t options) {
+    if (!Scheduler::SchedV2()) Scheduler::DrainDeferredReaps();   // see sys_waitpid (satoru)
     const uint32_t W_NOHANG = 1, W_EXITED = 4, W_NOWAIT = 0x01000000;
     LinuxProcess* caller = Current();
     Process* ctask = Scheduler::GetCurrentProcess();
@@ -8583,17 +10806,18 @@ int32_t LinuxSyscall::sys_waitid(int idtype, int32_t id, uint64_t infop, uint32_
             if (!c->exited || !c->task) continue;
             if (infop) {
                 // siginfo_t: signo, errno, code, pad, pid, uid, status (satoru)
-                bool killed = c->exit_code > 128 && c->exit_code < 160;   // 128+sig (satoru)
+                bool killed = (c->exit_code > 128 && c->exit_code < 160) || (c->exit_code <= -2 && c->exit_code > -64);   // 128+sig or -sig (satoru)
                 write_user_u32(ctask, infop + 0,  17);                 // SIGCHLD
                 write_user_u32(ctask, infop + 4,  0);
                 write_user_u32(ctask, infop + 8,  killed ? 2u : 1u);   // CLD_KILLED / CLD_EXITED
                 write_user_u32(ctask, infop + 12, 0);
                 write_user_u32(ctask, infop + 16, c->pid);
                 write_user_u32(ctask, infop + 20, c->uid);
-                write_user_u32(ctask, infop + 24, killed ? (uint32_t)(c->exit_code - 128)
+                write_user_u32(ctask, infop + 24, killed ? (wait_status_of(c->exit_code) & 0x7Fu)
                                                          : ((uint32_t)c->exit_code & 0xFFu));
             }
             if (!(options & W_NOWAIT)) {
+                release_dead_thread_records(c);
                 Scheduler::ReapProcess(c->task);
                 c->task = nullptr;
                 DestroyProcess(i);
@@ -8610,11 +10834,214 @@ int32_t LinuxSyscall::sys_waitid(int idtype, int32_t id, uint64_t infop, uint32_
     }
 }
 
+// crash census diagnostics (satoru)
+// a silent module map: every image a process maps (musl's whole-image offset-0
+// map of each .so, plus ld-kurono's own loads) is recorded here without a serial
+// line, so a fault or a wedge snapshot can print module+offset. the old
+// [libmap] serial line cost ~1s of uart time per launch; this costs a store. (satoru)
+namespace {
+struct ModMapEnt { uint64_t as, base, len; char name[40]; };
+constexpr int MODMAP_SLOTS = 512;
+ModMapEnt g_modmap[MODMAP_SLOTS];
+uint32_t  g_modmap_head = 0;
+Spinlock  g_modmap_lock;
+
+const ModMapEnt* modmap_find(uint64_t as, uint64_t va) {
+    // newest first: an address space recycled for a later launch must resolve
+    // against the newest image map, not a stale one. (satoru)
+    for (uint32_t k = 0; k < MODMAP_SLOTS; k++) {
+        uint32_t i = (g_modmap_head + MODMAP_SLOTS - 1 - k) % MODMAP_SLOTS;
+        const ModMapEnt* e = &g_modmap[i];
+        if (e->len && e->as == as && va >= e->base && va < e->base + e->len) return e;
+    }
+    return nullptr;
+}
+
+bool user_peek64(uint64_t as, uint64_t va, uint64_t* out) {
+    if ((va & 7) || va >= 0x800000000000ull) return false;
+    uint64_t ph = KernelVMM::QueryMappingInAddressSpace(as, va);
+    if (!ph || ph >= PMM::GetPhysTop()) return false;
+    *out = *(const volatile uint64_t*)(uintptr_t)ph;
+    return true;
+}
+
+bool user_peek(uint64_t as, uint64_t va, void* out, int n) {
+    uint8_t* o = (uint8_t*)out;
+    if (va >= 0x800000000000ull || va + (uint64_t)n > 0x800000000000ull) return false;   // user half only (satoru)
+    for (int i = 0; i < n; i++) {
+        uint64_t ph = KernelVMM::QueryMappingInAddressSpace(as, va + (uint64_t)i);
+        if (!ph || ph >= PMM::GetPhysTop()) return false;
+        o[i] = *(const volatile uint8_t*)(uintptr_t)ph;
+    }
+    return true;
+}
+
+// scan the user stack for code-looking qwords that land inside a recorded
+// module and print them symbolized. -O2 gecko has no frame pointers, so a raw
+// scan is the only unwinder available here; stale frames show up too. (satoru)
+void log_stack_syms(uint64_t as, uint64_t rsp, int max_words, int max_hits) {
+    uint64_t sp = rsp & ~7ull;
+    int hits = 0;
+    for (int w = 0; w < max_words && hits < max_hits; w++) {
+        uint64_t v = 0;
+        if (!user_peek64(as, sp + (uint64_t)w * 8, &v)) break;
+        if (v < 0x10000ull || v >= 0x800000000000ull) continue;
+        const ModMapEnt* e = modmap_find(as, v);
+        if (!e) continue;
+        SerialLogger::Log(" ");
+        SerialLogger::Log(e->name);
+        SerialLogger::Log("+");
+        SerialLogger::LogHex64(v - e->base);
+        hits++;
+    }
+}
+}  // namespace (satoru)
+
+// the firefox address-space cache is per launch: a relaunch gets a new address
+// space, and a stale cache made it "not firefox" for every gate. the firefox
+// launcher clears it when its instance is gone. (satoru)
+void LinuxSyscall::ResetFirefoxCache() {
+    __atomic_store_n(&g_ff_meas_as, (uint64_t)0, __ATOMIC_RELAXED);
+}
+
+void LinuxSyscall::NoteModule(uint64_t as, uint64_t base, uint64_t len, const char* name) {
+    if (!as || !len || !name) return;
+    uint64_t f; g_modmap_lock.LockIrqSave(&f);
+    ModMapEnt* e = &g_modmap[g_modmap_head % MODMAP_SLOTS];
+    g_modmap_head = (g_modmap_head + 1) % MODMAP_SLOTS;
+    e->as = as; e->base = base; e->len = len;
+    // keep the basename only (satoru)
+    const char* b = name;
+    for (const char* q = name; *q; q++) if (*q == '/') b = q + 1;
+    int k = 0;
+    while (b[k] && k < (int)sizeof(e->name) - 1) { e->name[k] = b[k]; k++; }
+    e->name[k] = 0;
+    g_modmap_lock.UnlockIrqRestore(f);
+}
+
+void LinuxSyscall::LogSymAddr(uint64_t as, uint64_t va) {
+    const ModMapEnt* e = modmap_find(as, va);
+    if (e) { SerialLogger::Log(e->name); SerialLogger::Log("+"); SerialLogger::LogHex64(va - e->base); }
+    else SerialLogger::LogHex64(va);
+}
+
+void LinuxSyscall::DumpUserFault(Process* task, uint64_t rip, uint64_t rsp, uint64_t cr2) {
+    if (!task) return;
+    uint64_t as = task->address_space;
+    SerialLogger::Log("[ffault] pid="); SerialLogger::LogDec((int)task->pid);
+    SerialLogger::Log(" thr="); SerialLogger::Log(task->name);
+    SerialLogger::Log(" rip="); LogSymAddr(as, rip);
+    SerialLogger::Log(" cr2="); SerialLogger::LogHex64(cr2);
+    SerialLogger::Log("\r\n");
+    // address-space history: the region covering cr2 (if any) and the recent
+    // mmap/munmap/mprotect/brk events that touched the chunk around cr2. a
+    // fault at an address no region covers names the event that removed it or
+    // proves it was never mapped. (satoru)
+    if (cr2 < 0x800000000000ull) {
+        UserMemoryRegion* fr = find_region(task, cr2);
+        SerialLogger::Log("[ffault] reg=");
+        if (fr) {
+            SerialLogger::LogHex64(fr->start); SerialLogger::Log("-"); SerialLogger::LogHex64(fr->end);
+            SerialLogger::Log(" pf="); SerialLogger::LogHex((uint32_t)fr->page_flags);
+            SerialLogger::Log(" fl="); SerialLogger::LogHex((uint32_t)fr->flags);
+        } else {
+            SerialLogger::Log("none");
+        }
+        uint64_t clo = (cr2 & ~0xFFFFFull) - 0x100000ull;
+        uint64_t chi = (cr2 & ~0xFFFFFull) + 0x200000ull;
+        uint32_t rh = __atomic_load_n(&g_remap_head, __ATOMIC_RELAXED);
+        uint32_t rn = rh > 512 ? 512 : rh;
+        bool hdr = false;
+        for (uint32_t k = 0; k < rn; k++) {
+            RemapEv* e = &g_remap_ring[(rh - rn + k) & 511u];
+            if (e->as != as || !e->len) continue;
+            if (e->addr + e->len <= clo || e->addr >= chi) continue;
+            if (!hdr) { SerialLogger::Log("\r\n[ffring]"); hdr = true; }
+            SerialLogger::Log(" "); SerialLogger::LogDec((int)e->kind);
+            SerialLogger::Log(":"); SerialLogger::LogHex64(e->addr);
+            SerialLogger::Log("+"); SerialLogger::LogHex64(e->len);
+        }
+    }
+    SerialLogger::Log("\r\n[ffault] stk");
+    log_stack_syms(as, rsp, 512, 20);
+    SerialLogger::Log("\r\n");
+    // gecko's MOZ_CRASH: `mov gMozCrashReason@GOT(%rip),%rcx; mov %rax,(%rcx);
+    // xor %eax,%eax; mov $line,%ecx` right before the null store at rip. the
+    // reason string pointer is in rax at the fault, but only the frame has it,
+    // so read it back through the got slot. (satoru)
+    if (cr2 < 0x1000) {
+        // rust panics end in RustMozCrash: `mov gMozCrashReason@GOT(%rip),%rax;
+        // mov %rdx,(%rax); movslq %esi,%rax; xor %ecx,%ecx` then the null store
+        // at rip. the reason is the formatted panic message. (satoru)
+        uint8_t rc[15];
+        if (user_peek(as, rip - 15, rc, 15) &&
+            rc[0] == 0x48 && rc[1] == 0x8B && rc[2] == 0x05 &&
+            rc[7] == 0x48 && rc[8] == 0x89 && rc[9] == 0x10 &&
+            rc[13] == 0x31 && rc[14] == 0xC9) {
+            int32_t disp = (int32_t)(rc[3] | rc[4] << 8 | rc[5] << 16 | (uint32_t)rc[6] << 24);
+            uint64_t got = rip - 15 + 7 + (int64_t)disp, var = 0, str = 0;
+            char msg[200];
+            int n = 0;
+            if (user_peek(as, got, &var, 8) && user_peek(as, var, &str, 8) && str) {
+                while (n < (int)sizeof(msg) - 1 && user_peek(as, str + n, &msg[n], 1) && msg[n]) n++;
+            }
+            msg[n] = 0;
+            SerialLogger::Log("[ffault] RUST PANIC: ");
+            SerialLogger::Log(msg);
+            SerialLogger::Log("\r\n");
+        }
+        uint8_t code[17];
+        if (user_peek(as, rip - 17, code, 17) &&
+            code[0] == 0x48 && code[1] == 0x8B && code[2] == 0x0D &&
+            code[7] == 0x48 && code[8] == 0x89 && code[9] == 0x01 &&
+            code[10] == 0x31 && code[11] == 0xC0 && code[12] == 0xB9) {
+            int32_t disp = (int32_t)(code[3] | code[4] << 8 | code[5] << 16 | (uint32_t)code[6] << 24);
+            uint32_t line = code[13] | code[14] << 8 | code[15] << 16 | (uint32_t)code[16] << 24;
+            uint64_t got = rip - 17 + 7 + (int64_t)disp, var = 0, str = 0;
+            char msg[200];
+            int n = 0;
+            if (user_peek(as, got, &var, 8) && user_peek(as, var, &str, 8) && str) {
+                while (n < (int)sizeof(msg) - 1 && user_peek(as, str + n, &msg[n], 1) && msg[n]) n++;
+            }
+            msg[n] = 0;
+            SerialLogger::Log("[ffault] MOZ_CRASH line ");
+            SerialLogger::LogDec((int)line);
+            SerialLogger::Log(": ");
+            SerialLogger::Log(msg);
+            SerialLogger::Log("\r\n");
+        }
+    }
+}
+
+void LinuxSyscall::DumpThreadsSymbolized(uint64_t as, const char* why) {
+    if (!as) return;
+    SerialLogger::Log("[ffsnap] begin "); SerialLogger::Log(why ? why : "");
+    SerialLogger::Log("\r\n");
+    int guard = 0;
+    for (Process* p2 = Scheduler::ready_queue; p2 && guard < 512; p2 = p2->next, guard++) {
+        if (!p2->is_user() || p2->address_space != as) continue;
+        SerialLogger::Log("[ffsnap] pid="); SerialLogger::LogDec((int)p2->pid);
+        SerialLogger::Log(" "); SerialLogger::Log(p2->name);
+        SerialLogger::Log(" st="); SerialLogger::LogDec((int)p2->state);
+        SerialLogger::Log(" nr="); SerialLogger::LogDec((int)p2->user_frame.rax);
+        SerialLogger::Log(" rip="); LogSymAddr(as, p2->user_frame.rip);
+        SerialLogger::Log(" |");
+        log_stack_syms(as, p2->user_frame.rsp, 384, 14);
+        SerialLogger::Log("\r\n");
+    }
+    SerialLogger::Log("[ffsnap] end\r\n");
+}
+
 int32_t LinuxSyscall::sys_exit_group(uint32_t code) {
     // exit_group ends the WHOLE thread group. a runtime that parks helper threads (bun's
     // watcher, http and work pool threads) used to leave them alive after main exited, so the
     // launcher never got its exit code back. kill the siblings the way the fatal-signal path
-    // does and then take the normal single-thread exit. firefox keeps the old behavior. (satoru)
+    // does and then take the normal single-thread exit. (satoru)
+    // firefox too: it used to be exempt, so quitting firefox (main thread ->
+    // exit_group) left ~60 threads running with the main thread gone. the
+    // launcher never returned, the profile lock stayed held, and 60 s later
+    // gecko's shutdown watchdog (nsTerminator RunWatchdog) MOZ_CRASHed the
+    // remains - and every relaunch inside that minute hit "Close Firefox". (satoru)
     {
         Process* task = Scheduler::GetCurrentProcess();
         // a CLONE_VM|CLONE_VFORK child (posix_spawn / vfork, e.g. a shell whose command failed
@@ -8622,7 +11049,7 @@ int32_t LinuxSyscall::sys_exit_group(uint32_t code) {
         // group walk below would kill the parent and all its threads. linux's exit_group only
         // ends the caller's own thread group, so a pending vfork child just exits itself and
         // sys_exit wakes the parent. (satoru)
-        if (task && task->is_user() && !ff_is_firefox(task) && !vfork_is_child(task)) {
+        if (task && task->is_user() && !vfork_is_child(task)) {
             Process* gl = region_owner(task);
             if (Scheduler::KillProcessGroupAsync(gl ? gl->pid : task->pid, task) &&
                 gl && gl != task) {
@@ -8644,7 +11071,14 @@ int32_t LinuxSyscall::sys_exit_group(uint32_t code) {
 }
 
 int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uintptr_t status, uint32_t options) {
-    (void)options;
+    // old mode: a SIGKILLed child's group is only MARKED dead and queued for the deferred
+    // reaper (KillProcessGroupAsync), and that reaper is the scheduler kernel process - which
+    // the parent itself starves while it owns the bsp. the queued address spaces kept the
+    // parent's copy-on-write frames shared, so every later write by the parent COPIED them:
+    // churn's kill-then-write loop drained a 512 mb machine in one round (+128 MB of cow copies,
+    // 4 dead groups' address spaces alive, PMM OUT OF MEMORY). the waiter reaps what is ready
+    // first. sched=2 keeps the kernel procs on a bsp that runs no user task. (satoru)
+    if (!Scheduler::SchedV2()) Scheduler::DrainDeferredReaps();
 
     LinuxProcess* parent = Current();
     Process* parent_task = Scheduler::GetCurrentProcess();
@@ -8660,13 +11094,25 @@ int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uintptr_t status, uint32_t optio
         if (!any_child && child->pid != (uint32_t)requested_pid) continue;
 
         found_child = true;
+        // WUNTRACED / WCONTINUED: a stopped (or continued) child is reported once (satoru)
+        if (!child->exited && child->task) {
+            int cs = lp_slot_of(child);
+            if (cs >= 0 && cs < LINUX_MAX_PROCS && g_job_report[cs] &&
+                ((g_job_report[cs] == 1 && (options & 2u)) || (g_job_report[cs] == 2 && (options & 8u)))) {
+                if (status)
+                    write_user_u32(parent_task, status, g_job_report[cs] == 1 ? (((uint32_t)g_job_stopsig[cs] << 8) | 0x7fu) : 0xffffu);
+                g_job_report[cs] = 0;
+                return (int32_t)child->pid;
+            }
+        }
         if (!child->exited || !child->task) continue;
 
         if (status) {
-            write_user_u32(parent_task, status, ((uint32_t)child->exit_code & 0xFFU) << 8);
+            write_user_u32(parent_task, status, wait_status_of(child->exit_code));
         }
 
         int32_t child_pid = (int32_t)child->pid;
+        release_dead_thread_records(child);
         Scheduler::ReapProcess(child->task);
         child->task = nullptr;
         DestroyProcess(i);
@@ -8674,8 +11120,10 @@ int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uintptr_t status, uint32_t optio
     }
 
     if (!found_child) return -10;
+    if (options & 1u) return 0;                 // WNOHANG: nothing to report yet (satoru)
     if (!current_syscall_frame) return -11;
 
+    { int pslot = lp_slot_of(parent); if (pslot >= 0 && pslot < LINUX_MAX_PROCS) g_wait_opts[pslot] = (uint8_t)options; }
     parent_task->waiting_for_child = true;
     parent_task->waiting_child_pid = any_child ? 0 : (uint32_t)requested_pid;
     parent_task->waiting_status_ptr = status;
@@ -8686,7 +11134,16 @@ int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uintptr_t status, uint32_t optio
         parent_task->waiting_for_child = false;
         parent_task->waiting_child_pid = 0;
         parent_task->waiting_status_ptr = 0;
-        return -11;
+        // no other thread to run: a blocking wait used to fail with EAGAIN here, which a shell
+        // takes for "no child to wait for" (a job-control shell then reads the tty from the
+        // background). park on the restart frame like a blocking read: the wait is re-run every
+        // few ticks until a child changes state. (satoru)
+        if (poll_try_deschedule(parent, 61)) return 0;
+        if (SMP::CpuIndex() == 0) pump_ui_throttled();
+        kls_relax_sleep_ms(1);
+        if (!current_syscall_frame) return -11;
+        current_syscall_frame->rip -= 2;
+        return 61;
     }
 
     return 0;
@@ -8698,12 +11155,25 @@ int32_t LinuxSyscall::sys_waitpid(uint32_t pid, uintptr_t status, uint32_t optio
 // still-active old AS first, then rewrite the syscall frame to the new entry.
 // mirrors the i386 static path but for elf64 dynamic binaries. (satoru)
 static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_t envp_u,
-                                LinuxProcess* proc, Process* task) {
+                                LinuxProcess* proc, Process* task,
+                                const char* const* pre = nullptr, int npre = 0) {
     int fsz = KVFS::GetFileSize(resolved);
     if (fsz <= 0) return -2;
-    uint8_t* image = (uint8_t*)KernelHeap::Alloc((uint32_t)fsz);
+    // a big image the vfs only borrows (WriteFileStatic: claude's 300 mb binary
+    // re-exec'd as its embedded ripgrep) is loaded in place. copying it meant a
+    // 300 mb kernel heap block plus a 300 mb copy under the vfs lock on every
+    // rg call. ExecPIE copies the segments out, nothing keeps the pointer. (satoru)
+    const uint8_t* borrowed = nullptr;
+    if (fsz >= (16 << 20)) {
+        KVFSNode* bn = KVFS::Resolve(resolved);
+        if (bn && bn->is_file() && bn->content && bn->content_capacity == 0 &&
+            bn->size == (uint32_t)fsz && !KernelHeap::IsValidBlock(bn->content))
+            borrowed = bn->content;
+    }
+    uint8_t* image = borrowed ? (uint8_t*)borrowed : (uint8_t*)KernelHeap::Alloc((uint32_t)fsz);
     if (!image) return -12;
-    if (KVFS::ReadFile(resolved, image, (uint32_t)fsz) != fsz) { KernelHeap::Free(image); return -2; }
+    auto drop_image = [&]() { if (!borrowed) KernelHeap::Free(image); };
+    if (!borrowed && KVFS::ReadFile(resolved, image, (uint32_t)fsz) != fsz) { drop_image(); return -2; }
 
     // copy argv/envp out of the caller's address space (still active here). (satoru)
     char* abuf = (char*)KernelHeap::Alloc(16384);
@@ -8711,7 +11181,7 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
     const char** av = (const char**)KernelHeap::Alloc(128 * sizeof(char*));
     const char** ev = (const char**)KernelHeap::Alloc(256 * sizeof(char*));
     if (!abuf || !ebuf || !av || !ev) {
-        KernelHeap::Free(image);
+        drop_image();
         if (abuf) KernelHeap::Free(abuf);
         if (ebuf) KernelHeap::Free(ebuf);
         if (av) KernelHeap::Free((void*)av);
@@ -8719,17 +11189,27 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
         return -12;
     }
     copy_user_strv(task, (uint64_t)argv_u, abuf, 16384, av, 127);
+    if (npre > 0) {
+        // #! script: the interpreter and the script path replace argv[0] (satoru)
+        int an = 0; while (av[an]) an++;
+        int keep = an > 0 ? an - 1 : 0;
+        if (keep + npre > 126) keep = 126 - npre;
+        for (int k = keep; k > 0; k--) av[npre + k - 1] = av[k];
+        for (int k = 0; k < npre; k++) av[k] = pre[k];
+        av[npre + keep] = nullptr;
+    }
     copy_user_strv(task, (uint64_t)envp_u, ebuf, 16384, ev, 255);
 
     uint64_t old_as = task->address_space;
     uint64_t new_as = KernelVMM::CreateAddressSpace();
     if (!new_as) {
-        KernelHeap::Free(image); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
+        drop_image(); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
         KernelHeap::Free((void*)av); KernelHeap::Free((void*)ev);
         return -12;
     }
     task->address_space = new_as;
     memset(task->regions, 0, sizeof(task->regions));
+    rext_release_owner(task);   // item 10: the old image's extension chunks (satoru)
     task->next_mmap_base = USER_MMAP_BASE;
     // ACTIVATE new_as BEFORE ExecPIE so the loader's stack/segment writes land in
     // the new address space, not the still-active OLD one. for a vfork child the
@@ -8755,7 +11235,7 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
             task->address_space = old_as;
             KernelVMM::ActivateAddressSpace(old_as);
             KernelVMM::DestroyAddressSpace(new_as);
-            KernelHeap::Free(image); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
+            drop_image(); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
             KernelHeap::Free((void*)av); KernelHeap::Free((void*)ev);
             return -12;
         }
@@ -8767,7 +11247,7 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
         }
         task->user_stack_top = U_STACK_TOP - 16;
         // RESERVE the main-thread stack in the region table. without this the
-        // mmap arena (choose_mmap_base grows up from USER_MMAP_BASE=0x20000000)
+        // mmap arena (choose_mmap_base grows up from USER_MMAP_BASE, 16 tb since sched_11)
         // eventually reaches 0x3fa00000 and, seeing no region there, hands the
         // range to a fresh clone thread's stack mmap -> the font-info loader
         // thread's cmapdata buffer wrote straight through the chrome main
@@ -8788,8 +11268,8 @@ static int32_t execve_dynamic64(const char* resolved, uintptr_t argv_u, uintptr_
 
     uint64_t entry = 0, rsp = 0;
     bool ok = LdKurono::ExecPIE(task, image, (uint64_t)fsz, resolved, av, ev,
-                                proc->uid, proc->gid, &entry, &rsp);
-    KernelHeap::Free(image); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
+                                proc->uid, proc->gid, &entry, &rsp, borrowed != nullptr);
+    drop_image(); KernelHeap::Free(abuf); KernelHeap::Free(ebuf);
     KernelHeap::Free((void*)av); KernelHeap::Free((void*)ev);
     if (!ok) {
         SerialLogger::Log("execve: ld-kurono failed to load dynamic image\r\n");
@@ -8858,6 +11338,32 @@ int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t e
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), proc);
 
+    // #! script: exec the interpreter with the script as its first argument. /bin/sh, ash and
+    // bash mean the embedded busybox (argv[0] "sh"). (satoru)
+    {
+        char hb[96]; int hn = KVFS::ReadFile(resolved, hb, 95);
+        if (hn >= 3 && hb[0] == '#' && hb[1] == '!') {
+            hb[hn < 95 ? hn : 95] = 0;
+            int a = 2; while (hb[a] == ' ') a++;
+            int b = a; while (hb[b] && hb[b] != ' ' && hb[b] != '\n' && hb[b] != '\r') b++;
+            hb[b] = 0;
+            static char interp[96], scr[256];
+            ls_scpy(interp, hb + a, sizeof(interp));
+            ls_scpy(scr, path, sizeof(scr));
+            const char* base = interp; for (int k = 0; interp[k]; k++) if (interp[k] == '/') base = interp + k + 1;
+            const char* run = interp; const char* av0 = base;
+            if (ls_seq(base, "sh") || ls_seq(base, "ash") || ls_seq(base, "bash")) { run = "/system/bin/busybox"; av0 = "sh"; }
+            const char* pre[2] = { av0, scr };
+            char rres[256]; ResolvePath(run, rres, sizeof(rres), proc);
+            int32_t er = execve_dynamic64(rres, argv, envp, proc, task, pre, 2);
+            if (er == 0 && !g_nocloexec) {
+                for (int cfd = 0; cfd < LINUX_MAX_FDS; cfd++)
+                    if (proc->fds[cfd].open && (proc->fds[cfd].flags & L_FD_CLOEXEC)) sys_close(cfd);
+            }
+            return er;
+        }
+    }
+
     // x86_64 dynamic ELF (firefox re-execs /proc/self/exe for content procs):
     // route through ld-kurono ExecPIE. is_valid_exec_elf below only accepts i386
     // static ELFs, so an elf64 execve would otherwise be rejected. (satoru)
@@ -8886,7 +11392,9 @@ int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t e
     }
     if (size <= 0 || !is_valid_exec_elf(image, (uint32_t)size)) {
         KernelHeap::Free(image);
-        return -2;
+        // an existing file that is not an elf is ENOEXEC: a shell then runs it as a script
+        // (the terminal bridge stubs in /system/bin rely on it). (satoru)
+        return size > 0 ? -8 : -2;
     }
 
     uint64_t new_address_space = KernelVMM::CreateAddressSpace();
@@ -8931,7 +11439,8 @@ int32_t LinuxSyscall::sys_execve(uintptr_t filename, uintptr_t argv, uintptr_t e
     task->waiting_child_pid = 0;
     task->waiting_status_ptr = 0;
     memset(task->regions, 0, sizeof(task->regions));
-    task->next_mmap_base = USER_MMAP_BASE;
+    rext_release_owner(task);   // item 10: the old image's extension chunks (satoru)
+    task->next_mmap_base = USER_MMAP_BASE_I386;   // a 32-bit image needs its maps below 4 gb (satoru)
 
     proc->brk_base = brk_end;
     proc->brk_current = brk_end;
@@ -9004,6 +11513,855 @@ static bool user_span_valid(Process* t, uint64_t ptr, uint64_t len) {
     return true;
 }
 
+// ======= pty fd I/O, tty ioctls and the devpts opens (satoru) =======
+// the master (/dev/ptmx) and slave (/dev/pts/N, a terminal's stdio, /dev/tty) fds all land
+// here; backend_fd is the kpty pair index. mirrors drivers/tty/pty.c, tty_io.c (tty_ioctl,
+// tty_open) and tty_jobctrl.c. (satoru)
+
+static int32_t pty_restart(int nr) {
+    if (!current_syscall_frame) return -4;
+    current_syscall_frame->rip -= 2;      // re-issue the syscall once the stop ends (satoru)
+    return nr;
+}
+
+static int32_t pty_read(LinuxProcess* p, LinuxFd* lfd, int fd, uintptr_t buf, uint64_t count) {
+    int t = lfd->backend_fd;
+    bool master = lfd->type == LFD_PTY_MASTER;
+    if (!Kpty::Valid(t)) return 0;
+    uint8_t* dst = (uint8_t*)buf;
+    if (!master) {
+        int ck = tty_check_change(p, t, 21);                    // SIGTTIN (satoru)
+        if (ck != 0 && g_ptytrace) {
+            SerialLogger::Log("[pty] read check pid="); SerialLogger::LogDec((int)p->pid);
+            SerialLogger::Log(" ck="); SerialLogger::LogDec(ck);
+            SerialLogger::Log(" pgid="); SerialLogger::LogDec((int)p->pgid);
+            SerialLogger::Log(" fg="); SerialLogger::LogDec(Kpty::ForegroundPgrp(t));
+            SerialLogger::Log("\r\n");
+        }
+        if (ck < 0) return ck;
+        if (ck > 0) return g_read_direct[SMP::CpuIndex()] ? pty_restart(0) : -4;
+    }
+    uint8_t kb[1024];
+    int want = (int)(count > sizeof(kb) ? sizeof(kb) : count);
+    if (want > 0 && !user_span_valid(p->task, buf, (uint64_t)want)) return -14;
+    int r;
+    if (master) {
+        r = Kpty::MasterRead(t, kb, want);
+        if (r == 0 && want > 0) r = Kpty::MasterSlaveGone(t) || Kpty::Hungup(t) ? -5 : -11;   // eio when the slave closed (satoru)
+    } else {
+        r = Kpty::SlaveRead(t, kb, want);
+    }
+    if (g_ptytrace && r <= 0 && r != -11) {
+        static uint32_t rn = 0;
+        if (rn++ < 60) {
+            SerialLogger::Log("[pty] read pid="); SerialLogger::LogDec((int)p->pid);
+            SerialLogger::Log(" r="); SerialLogger::LogDec(r);
+            SerialLogger::Log(master ? " master" : " slave");
+            SerialLogger::Log(" hup="); SerialLogger::LogDec(Kpty::Hungup(t) ? 1 : 0);
+            KTermios tt; Kpty::GetTermios(t, &tt);
+            SerialLogger::Log(" lflag="); SerialLogger::LogHex(tt.c_lflag);
+            SerialLogger::Log(" vmin="); SerialLogger::LogDec(tt.c_cc[6]);
+            SerialLogger::Log("\r\n");
+        }
+    }
+    if (r > 0) for (int bi = 0; bi < r; bi++) dst[bi] = kb[bi];
+    if (r == -11 && !(lfd->flags & L_O_NONBLOCK) && g_read_direct[SMP::CpuIndex()]) {
+        // a pending signal must end the wait: an interactive shell's read has to
+        // return EINTR on ctrl+c, not re-issue forever inside the kernel. (satoru)
+        if (poll_signal_deliverable(p)) return -4;              // -EINTR (satoru)
+        poll_register_fdlist(p->task, p, &fd, 1);
+        if (poll_try_deschedule(p, 0)) return 0;                // switched; frame rewritten (satoru)
+        poll_unregister(p->task);
+        if (SMP::CpuIndex() == 0) pump_ui_throttled();
+        kls_relax_sleep_ms(1);
+        if (!current_syscall_frame) return -11;
+        current_syscall_frame->rip -= 2;
+        return 0;                                               // re-issue read in place (rax = nr 0) (satoru)
+    }
+    return r;
+}
+
+static int32_t pty_write(LinuxProcess* p, LinuxFd* lfd, uintptr_t buf, uint64_t count) {
+    int t = lfd->backend_fd;
+    bool master = lfd->type == LFD_PTY_MASTER;
+    if (!Kpty::Valid(t)) return -5;
+    const uint8_t* src = (const uint8_t*)buf;
+    if (!user_span_valid(p->task, buf, count)) return -14;
+    if (!master) {
+        KTermios tio; Kpty::GetTermios(t, &tio);
+        if (tio.c_lflag & 0x100u) {                             // TOSTOP: a background write is SIGTTOU (satoru)
+            int ck = tty_check_change(p, t, 22);
+            if (ck < 0) return ck;
+            if (ck > 0) return pty_restart(1);
+        }
+    }
+    uint8_t kb[1024];
+    uint64_t done = 0, t0 = Timer::GetRealMs64();
+    while (done < count) {
+        uint64_t chunk = count - done; if (chunk > sizeof(kb)) chunk = sizeof(kb);
+        for (uint64_t bi = 0; bi < chunk; bi++) kb[bi] = src[done + bi];
+        int r;
+        if (!master && Kpty::IsCapture(t)) {
+            // a console capture still shows on serial, as the old ring did (satoru)
+            for (uint64_t bi = 0; bi < chunk; bi++) { char sc[2] = { (char)kb[bi], 0 }; SerialLogger::Log(sc); }
+        }
+        if (master) {
+            if (Kpty::Hungup(t)) return done ? (int32_t)done : -5;
+            Kpty::MasterWrite(t, kb, (int)chunk);
+            r = (int)chunk;
+        } else {
+            r = Kpty::SlaveWrite(t, kb, (int)chunk);
+            if (r == -5) return done ? (int32_t)done : -5;      // hung up (satoru)
+        }
+        if (r > 0) { done += (uint64_t)r; t0 = Timer::GetRealMs64(); continue; }
+        if (lfd->flags & L_O_NONBLOCK) return done ? (int32_t)done : -11;
+        // a full ring blocks the writer while the master drains it; after 4 s with no reader the
+        // rest is dropped so a stuck terminal can never wedge a program for good. (satoru)
+        if (Timer::GetRealMs64() - t0 > 4000) break;
+        if (SMP::CpuIndex() == 0) pump_ui_throttled();
+        kls_relax_sleep_ms(2);
+    }
+    return (int32_t)count;
+}
+
+// open slave side of pair t on the free fd `lfd`, becoming the caller's controlling tty
+// the way tty_open_proc_set_tty does. (satoru)
+static void pty_attach_slave(LinuxProcess* p, LinuxFd* lfd, int t, uint32_t flags, const char* path) {
+    lfd->type = LFD_PTY_SLAVE;
+    lfd->backend_fd = t;
+    lfd->flags = flags;
+    lfd->offset = 0;
+    ls_scpy(lfd->path, path, sizeof(lfd->path));
+    lfd->open = true;
+    Kpty::SlaveRef(t, 1);
+    const uint32_t O_NOCTTY_ = 0x100;
+    if (!(flags & O_NOCTTY_) && p->is_session_leader && p->sid == p->pid &&
+        Kpty::FindBySession((int)p->sid) < 0 && Kpty::SessionOf(t) == 0 && !Kpty::Hungup(t) &&
+        (flags & 3u) != L_O_WRONLY) {
+        Kpty::SetSession(t, (int)p->sid, (int)p->pgid);
+        p->ctty_pgrp = (int)p->pgid;
+    }
+}
+
+static void pts_path(int t, char* out, int mx) {
+    char num[16]; ls_itoa(t, num, 10);
+    out[0] = 0; ls_cat(out, "/dev/pts/", mx); ls_cat(out, num, mx);
+}
+
+// the tty ioctls. t < 0: the console has no pair (cooked 80x25 defaults, writes accepted). (satoru)
+static int32_t tty_ioctl(LinuxProcess* p, LinuxFd* lfd, int t, bool master, uint32_t cmd, uint64_t arg) {
+    bool live = t >= 0 && Kpty::Valid(t);
+    switch (cmd) {
+    case 0x5401u: {                           // TCGETS
+        KTermios tio;
+        if (live) Kpty::GetTermios(t, &tio); else Kpty::DefaultTermios(&tio);
+        if (!arg || UAccess::CopyToUser(arg, &tio, sizeof(tio)) != 0) return -14;
+        return 0;
+    }
+    case 0x5402u: case 0x5403u: case 0x5404u: {   // TCSETS / TCSETSW / TCSETSF
+        KTermios tio;
+        if (!arg || UAccess::CopyFromUser(&tio, arg, sizeof(tio)) != 0) return -14;
+        if (live && !master) {
+            int ck = tty_check_change(p, t, 22);                  // SIGTTOU (satoru)
+            if (ck < 0) return ck == -5 ? -25 : ck;
+            if (ck > 0) return pty_restart(16);
+        }
+        if (live) Kpty::SetTermios(t, &tio, cmd == 0x5404u ? 2 : (cmd == 0x5403u ? 1 : 0));
+        return 0;
+    }
+    case 0x5413u: {                           // TIOCGWINSZ
+        KWinsize w = { 25, 80, 0, 0 };
+        if (live) Kpty::GetWinsize(t, &w);
+        if (!arg || UAccess::CopyToUser(arg, &w, sizeof(w)) != 0) return -14;
+        return 0;
+    }
+    case 0x5414u: {                           // TIOCSWINSZ
+        KWinsize w;
+        if (!arg || UAccess::CopyFromUser(&w, arg, sizeof(w)) != 0) return -14;
+        if (live) Kpty::SetWinsize(t, &w);    // SIGWINCH to this tty's foreground group (satoru)
+        return 0;
+    }
+    case 0x540Fu: {                           // TIOCGPGRP
+        int32_t pg = live ? Kpty::ForegroundPgrp(t) : 0;
+        if (!master && live && !g_pty_legacy && Kpty::SessionOf(t) != (int)p->sid) return -25;   // not our ctty (satoru)
+        if (pg <= 0 && !master) pg = (int32_t)p->pgid;
+        if (!arg || UAccess::CopyToUser(arg, &pg, sizeof(pg)) != 0) return -14;
+        return 0;
+    }
+    case 0x5410u: {                           // TIOCSPGRP
+        int32_t pg = 0;
+        if (!arg || UAccess::CopyFromUser(&pg, arg, sizeof(pg)) != 0) return -14;
+        if (pg < 0) return -22;
+        if (!live) return pg > 0 ? 0 : -22;
+        if (g_pty_legacy) { if (pg > 0) Kpty::SetForegroundPgrp(t, pg); return pg > 0 ? 0 : -22; }
+        if (!master) {
+            int ck = tty_check_change(p, t, 22);
+            if (ck == -5) return -25;
+            if (ck < 0) return ck;
+            if (ck > 0) return pty_restart(16);
+        }
+        if (Kpty::SessionOf(t) != (int)p->sid || p->sid == 0) return -25;   // ENOTTY (satoru)
+        if (!pgrp_in_session(pg, (int)p->sid)) return lp_find_pid(pg) ? -1 : -3;   // EPERM / ESRCH (satoru)
+        Kpty::SetForegroundPgrp(t, pg);
+        return 0;
+    }
+    case 0x5429u: {                           // TIOCGSID
+        if (live && !g_pty_legacy && !master && Kpty::SessionOf(t) != (int)p->sid) return -25;
+        int32_t sid = live && !g_pty_legacy ? Kpty::SessionOf(t) : (int32_t)p->sid;
+        if (!arg || UAccess::CopyToUser(arg, &sid, sizeof(sid)) != 0) return -14;
+        return 0;
+    }
+    case 0x540Eu: {                           // TIOCSCTTY (tiocsctty)
+        if (!live || g_pty_legacy) return 0;
+        if (p->is_session_leader && Kpty::SessionOf(t) == (int)p->sid && p->sid != 0) return 0;
+        if (!p->is_session_leader || p->sid != p->pid || Kpty::FindBySession((int)p->sid) >= 0) return -1;   // EPERM (satoru)
+        if (Kpty::SessionOf(t) != 0) {
+            if (arg == 1 && p->euid == 0) Kpty::ClearSession(t);   // steal it (satoru)
+            else return -1;
+        }
+        Kpty::SetSession(t, (int)p->sid, (int)p->pgid);
+        p->ctty_pgrp = (int)p->pgid;
+        return 0;
+    }
+    case 0x5422u: {                           // TIOCNOTTY (disassociate_ctty(0))
+        if (!live || g_pty_legacy) return 0;
+        if (!master && Kpty::SessionOf(t) != (int)p->sid) return -25;
+        if (p->is_session_leader && p->sid == p->pid) {
+            int fg = Kpty::ForegroundPgrp(t);
+            Kpty::ClearSession(t);
+            if (fg > 0) { LinuxSyscall::SignalGroup(fg, 1); LinuxSyscall::SignalGroup(fg, 18); }
+        }
+        p->ctty_pgrp = -1;
+        return 0;
+    }
+    case 0x541Bu: {                           // FIONREAD / TIOCINQ
+        int32_t n = live ? (master ? Kpty::MasterAvail(t) : Kpty::SlaveAvail(t)) : 0;
+        if (!arg || UAccess::CopyToUser(arg, &n, sizeof(n)) != 0) return -14;
+        return 0;
+    }
+    case 0x5411u: case 0x5424u: {             // TIOCOUTQ / TIOCGETD
+        int32_t z = 0;
+        if (arg) UAccess::CopyToUser(arg, &z, sizeof(z));
+        return 0;
+    }
+    case 0x540Bu:                             // TCFLSH: 0 input, 1 output, 2 both
+        if (live && (arg == 0 || arg == 2)) Kpty::FlushInput(t);
+        if (live && (arg == 1 || arg == 2)) Kpty::FlushOutput(t);
+        return 0;
+    case 0x5450u: lfd->flags &= ~L_FD_CLOEXEC; return 0;     // FIONCLEX (satoru)
+    case 0x5451u: lfd->flags |= L_FD_CLOEXEC; return 0;      // FIOCLEX (satoru)
+    case 0x5409u: case 0x540Au:               // TCSBRK / TCXONC
+    case 0x540Cu: case 0x540Du:               // TIOCEXCL / TIOCNXCL
+    case 0x5420u:                             // TIOCPKT
+        return 0;
+    // ---- the pty master only ----
+    case 0x80045430u: {                       // TIOCGPTN: the number N of /dev/pts/N
+        if (!master || !live) return -25;
+        int32_t n = t;
+        if (!arg || UAccess::CopyToUser(arg, &n, sizeof(n)) != 0) return -14;
+        return 0;
+    }
+    case 0x40045431u: {                       // TIOCSPTLCK (unlockpt)
+        if (!master || !live) return -25;
+        int32_t v = 0;
+        if (!arg || UAccess::CopyFromUser(&v, arg, sizeof(v)) != 0) return -14;
+        Kpty::SetLocked(t, v != 0);
+        return 0;
+    }
+    case 0x80045439u: {                       // TIOCGPTLCK
+        if (!master || !live) return -25;
+        int32_t v = Kpty::Locked(t) ? 1 : 0;
+        if (!arg || UAccess::CopyToUser(arg, &v, sizeof(v)) != 0) return -14;
+        return 0;
+    }
+    case 0x5441u: {                           // TIOCGPTPEER: an fd on the slave, no /dev/pts lookup
+        if (!master || !live) return -25;
+        int nfd;
+        { FdTabHdr* ah = fdt_hdr(p->fds); SpinLockGuard ag(ah->lock); nfd = fd_alloc_locked(p->fds, ah, 0); }
+        if (nfd < 0) return -24;
+        LinuxFd* nf = &p->fds[nfd];
+        memset(nf, 0, sizeof(LinuxFd));
+        char path[32]; pts_path(t, path, sizeof(path));
+        pty_attach_slave(p, nf, t, (uint32_t)arg | 0x100u, path);
+        return nfd;
+    }
+    default: break;
+    }
+    return -25;                               // ENOTTY (satoru)
+}
+
+// ---- real memory numbers for /proc and sysinfo (satoru) ----
+// bytes of live memfd / wl_shm objects (the "Shmem" line). unlocked read of the
+// slot table: display only, a torn size just shifts the figure by one object. (satoru)
+uint64_t linux_shm_total_bytes() {
+    uint64_t sum = 0;
+    for (int i = 0; i < LINUX_SHM_SLOTS; i++)
+        if (g_linux_shm[i].used && !g_linux_shm[i].borrowed) sum += g_linux_shm[i].size;
+    return sum;
+}
+
+// virtual size of a process in kb: the active mmap regions (including the
+// extension chunks, read lock-free like find_region) plus the brk window and the
+// 8 mb main stack, which are not region-table entries. never below the resident
+// size, which a real vm size cannot be. (satoru)
+static uint64_t linux_vm_size_kb(LinuxProcess* lp, uint32_t rss_kb) {
+    if (!lp || !lp->task) return rss_kb;
+    Process* owner = region_owner(lp->task);
+    uint64_t bytes = 0;
+    if (owner) {
+        RegionExt* rx = rext_find(owner);
+        for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+            const UserMemoryRegion* r = region_at(owner, rx, i);
+            if (r->active && r->end > r->start) bytes += r->end - r->start;
+        }
+    }
+    if (lp->brk_current > lp->brk_base && lp->brk_current - lp->brk_base < (1ULL << 40)) bytes += lp->brk_current - lp->brk_base;
+    if (lp->task->user_stack_top) bytes += 8ULL * 1024 * 1024;
+    uint64_t kb = bytes / 1024;
+    return kb < rss_kb ? rss_kb : kb;
+}
+
+// ---- /proc process namespace (satoru) ----
+// user-visible process/task ids are the LinuxProcess pids (index + 100, so
+// 100..355); a kernel task is exposed under its scheduler pid while that is
+// below 100, else 1000 + scheduler pid, so the two id spaces never overlap. (satoru)
+static uint32_t proc_display_pid(uint32_t spid) {
+    return spid < 100u ? spid : 1000u + spid;
+}
+static bool proc_sched_pid_for(uint32_t dpid, uint32_t* spid) {
+    if (dpid == 0) return false;
+    if (dpid < 100u)  { *spid = dpid;         return true; }
+    if (dpid >= 1000u){ *spid = dpid - 1000u; return true; }
+    return false;   // 100..999 is the linux pid namespace
+}
+
+static LinuxProcess* proc_lp_by_pid(uint32_t pid) {
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* q = LinuxSyscall::GetProcess(i);
+        if (q && q->active && !q->exited && q->pid == pid) return q;
+    }
+    return nullptr;
+}
+
+static uint32_t proc_group_lpid(LinuxProcess* lp) {
+    if (!lp) return 0;
+    if (!lp->task) return lp->pid;
+    Process* leader = region_owner(lp->task);
+    return leader ? lpid_of_task(leader) : lp->pid;
+}
+
+static bool proc_parse_u32(const char** pp, uint32_t* v) {
+    const char* c = *pp;
+    if (*c < '0' || *c > '9') return false;
+    uint32_t n = 0; int nd = 0;
+    while (*c >= '0' && *c <= '9' && nd < 10) { n = n * 10u + (uint32_t)(*c - '0'); c++; nd++; }
+    *pp = c; *v = n;
+    return nd > 0;
+}
+
+// one /proc target: a linux process (leader or thread) or a kernel task. the
+// scheduler snapshot is copied here, under its short lock, so formatting never
+// touches a Process* that could be reaped underneath us. (satoru)
+struct ProcRef {
+    bool ok;
+    bool kernel;
+    bool has_task;
+    bool has_snap;
+    uint32_t top_pid;      // pid named by the directory
+    uint32_t shown_pid;    // pid reported in stat/status (the tid for task/<tid>)
+    uint32_t tid;
+    uint32_t spid;         // scheduler pid of the selected task
+    LinuxProcess* lp;
+    SchedulerProcessSnapshot snap;
+    const char* leaf;      // remainder after /proc/<pid>[/task/<tid>]
+};
+
+static bool proc_resolve(const char* path, LinuxProcess* curp, ProcRef* r) {
+    memset(r, 0, sizeof(*r));
+    const char* c = path;
+    if (ls_starts(c, "/system/proc")) c += 7;
+    if (!ls_starts(c, "/proc")) return false;
+    c += 5;
+    if (*c == '/') c++;
+    if (*c == 0) { r->ok = true; r->leaf = c; return true; }
+
+    if (ls_starts(c, "self") && (c[4] == 0 || c[4] == '/')) {
+        if (!curp || !curp->task) return false;
+        r->lp = curp; r->kernel = false;
+        r->top_pid = curp->pid; r->shown_pid = curp->pid;
+        r->spid = curp->task->pid;
+        c += 4;
+    } else {
+        uint32_t pid = 0;
+        if (!proc_parse_u32(&c, &pid)) return false;
+        if (*c != 0 && *c != '/') return false;
+        r->top_pid = pid; r->shown_pid = pid;
+        if (pid >= 100u && pid < 1000u) {
+            LinuxProcess* lp = proc_lp_by_pid(pid);
+            if (!lp || !lp->task) return false;
+            r->lp = lp; r->kernel = false; r->spid = lp->task->pid;
+        } else {
+            uint32_t spid = 0;
+            if (!proc_sched_pid_for(pid, &spid)) return false;
+            SchedulerProcessSnapshot s;
+            if (!Scheduler::GetProcessSnapshotByPid(spid, &s)) return false;
+            if (s.flags & PROCESS_FLAG_USER) return false;   // user tasks live in the linux id space
+            r->kernel = true; r->spid = spid; r->snap = s; r->has_snap = true;
+        }
+    }
+    if (*c == '/') c++;
+    r->leaf = c;
+
+    if (ls_starts(c, "task") && (c[4] == 0 || c[4] == '/')) {
+        c += 4; if (*c == '/') c++;
+        uint32_t tid = 0;
+        if (!proc_parse_u32(&c, &tid)) return false;
+        if (*c != 0 && *c != '/') return false;
+        if (*c == '/') c++;
+        r->has_task = true; r->tid = tid; r->shown_pid = tid; r->leaf = c;
+        if (r->kernel) {
+            if (tid != r->top_pid) return false;
+            r->shown_pid = r->top_pid;
+        } else {
+            LinuxProcess* tl = proc_lp_by_pid(tid);
+            if (!tl || !tl->task) return false;
+            if (proc_group_lpid(tl) != proc_group_lpid(r->lp)) return false;
+            r->lp = tl; r->spid = tl->task->pid;
+        }
+    }
+    if (!r->kernel) {
+        SchedulerProcessSnapshot s;
+        if (Scheduler::GetProcessSnapshotByPid(r->spid, &s)) { r->snap = s; r->has_snap = true; }
+    }
+    r->ok = true;
+    return true;
+}
+
+static bool proc_group(const ProcRef& r) {
+    if (r.kernel) return false;
+    if (r.has_task) return false;
+    return !(r.lp && r.lp->task && r.lp->task->is_thread());
+}
+
+static void proc_cpu_ms(const ProcRef& r, bool group, uint64_t* user_ms, uint64_t* sys_ms) {
+    *user_ms = 0; *sys_ms = 0;
+    if (r.kernel) { hal_pid_cpu_ms(r.spid, user_ms, sys_ms, nullptr); return; }
+    if (!r.lp || !r.lp->task) return;
+    if (!group) { hal_pid_cpu_ms(r.lp->task->pid, user_ms, sys_ms, nullptr); return; }
+    uint32_t pids[64];
+    int n = Scheduler::CollectAddressSpacePids(r.lp->task->pid, pids, 64);
+    if (n <= 0) { hal_pid_cpu_ms(r.lp->task->pid, user_ms, sys_ms, nullptr); return; }
+    for (int i = 0; i < n; i++) {
+        uint64_t u = 0, s = 0;
+        hal_pid_cpu_ms(pids[i], &u, &s, nullptr);
+        *user_ms += u; *sys_ms += s;
+    }
+}
+
+static int proc_thread_count(const ProcRef& r, bool group) {
+    if (r.kernel || !group || !r.lp || !r.lp->task) return 1;
+    uint32_t pids[64];
+    int n = Scheduler::CollectAddressSpacePids(r.lp->task->pid, pids, 64);
+    return n > 0 ? n : 1;
+}
+
+static void proc_taskmem_kb(const ProcRef& r, bool group, uint64_t* heap_kb, uint64_t* frames_kb, uint64_t* peak_kb) {
+    *heap_kb = 0; *frames_kb = 0; *peak_kb = 0;
+    if (!TaskMem::On()) return;
+    if (r.kernel) {
+        TaskMem::Row row;
+        if (TaskMem::GetForPid(r.spid, &row)) {
+            *heap_kb = row.heap_bytes >> 10;
+            *frames_kb = row.frame_bytes >> 10;
+            *peak_kb = row.peak_bytes >> 10;
+        }
+        return;
+    }
+    if (!r.lp || !r.lp->task) return;
+    uint32_t pids[64];
+    int n = 1; pids[0] = r.lp->task->pid;
+    if (group) { int gn = Scheduler::CollectAddressSpacePids(r.lp->task->pid, pids, 64); if (gn > 0) n = gn; }
+    for (int i = 0; i < n; i++) {
+        TaskMem::Row row;
+        if (TaskMem::GetForPid(pids[i], &row)) {
+            *heap_kb += row.heap_bytes >> 10;
+            *frames_kb += row.frame_bytes >> 10;
+            *peak_kb += row.peak_bytes >> 10;
+        }
+    }
+}
+
+static char proc_state_char(const ProcRef& r) {
+    if (!r.has_snap) return 'R';
+    switch (r.snap.state) {
+        case Process_Running:    return 'R';
+        case Process_Ready:      return 'R';
+        case Process_Sleeping:   return 'S';
+        case Process_Blocked:    return 'S';
+        case Process_Terminated: return 'Z';
+        default:                 return '?';
+    }
+}
+static const char* proc_state_word(char c) {
+    switch (c) {
+        case 'R': return "running";
+        case 'S': return "sleeping";
+        case 'T': return "stopped";
+        case 'Z': return "zombie";
+        default:  return "unknown";
+    }
+}
+
+struct ProcBuf {
+    char* b; int n; int mx;
+};
+static void pb_s(ProcBuf* w, const char* s) {
+    if (!s) return;
+    while (*s && w->n < w->mx - 1) w->b[w->n++] = *s++;
+    w->b[w->n] = 0;
+}
+static void pb_u(ProcBuf* w, uint64_t v) {
+    char t[24]; int n = 0;
+    do { t[n++] = (char)('0' + (v % 10)); v /= 10; } while (v && n < 23);
+    while (n > 0 && w->n < w->mx - 1) w->b[w->n++] = t[--n];
+    w->b[w->n] = 0;
+}
+static void pb_i(ProcBuf* w, int64_t v) {
+    if (v < 0) { pb_s(w, "-"); pb_u(w, (uint64_t)(-v)); }
+    else pb_u(w, (uint64_t)v);
+}
+static void pb_hex(ProcBuf* w, uint64_t v) {
+    static const char hx[] = "0123456789abcdef";
+    char t[17]; int n = 0;
+    if (v == 0) { pb_s(w, "0"); return; }
+    while (v && n < 16) { t[n++] = hx[v & 0xF]; v >>= 4; }
+    while (n > 0 && w->n < w->mx - 1) w->b[w->n++] = t[--n];
+    w->b[w->n] = 0;
+}
+
+// memory of the named target. user: the process page tables. kernel: its
+// committed kernel stack; the task heap is reported separately. (satoru)
+static void proc_mem(const ProcRef& r, bool group, uint32_t* rss_kb, uint32_t* shared_kb, uint32_t* pt_kb, uint64_t* vsize_kb) {
+    *rss_kb = 0; *shared_kb = 0; *pt_kb = 0; *vsize_kb = 0;
+    if (r.kernel) {
+        *rss_kb = r.has_snap ? r.snap.stack_kb : 0;
+        return;
+    }
+    if (!r.lp || !r.lp->task) return;
+    MemAcct::SpaceMem sm = {0, 0, 0, 0};
+    if (r.lp->task->address_space) MemAcct::QuerySpace(r.lp->task->address_space, 1000, &sm);
+    *rss_kb = sm.rss_kb;
+    *shared_kb = sm.shared_kb;
+    *pt_kb = sm.pt_kb;
+    *vsize_kb = linux_vm_size_kb(r.lp, sm.rss_kb);
+    (void)group;   // threads share the address space
+}
+
+static int proc_format_status(const ProcRef& r, char* out, int mx) {
+    ProcBuf w{out, 0, mx};
+    bool group = proc_group(r);
+    uint64_t web = 0, wfr = 0, wpk = 0;
+    proc_taskmem_kb(r, group, &web, &wfr, &wpk);
+    uint32_t rss = 0, shr = 0, pt = 0; uint64_t vs = 0;
+    proc_mem(r, group, &rss, &shr, &pt, &vs);
+
+    const char* name = r.kernel ? (r.has_snap && r.snap.name[0] ? r.snap.name : "ktask")
+                                : (r.lp && r.lp->name[0] ? r.lp->name : "process");
+    char st = proc_state_char(r);
+    uint32_t tgid = r.kernel ? r.top_pid
+                   : (r.lp && r.lp->task && r.lp->task->is_thread() ? proc_group_lpid(r.lp) : r.shown_pid);
+    uint32_t ppid = r.kernel ? (r.has_snap ? r.snap.parent_pid : 0) : (r.lp ? r.lp->ppid : 0);
+    uint32_t uid = r.kernel ? 0 : (r.lp ? r.lp->uid : 0);
+    uint32_t gid = r.kernel ? 0 : (r.lp ? r.lp->gid : 0);
+    uint32_t euid = r.kernel ? 0 : (r.lp ? r.lp->euid : 0);
+    uint32_t egid = r.kernel ? 0 : (r.lp ? r.lp->egid : 0);
+
+    pb_s(&w, "Name:\t");   pb_s(&w, name);  pb_s(&w, "\n");
+    pb_s(&w, "Umask:\t0022\n");
+    pb_s(&w, "State:\t");  { char sc[2] = { st, 0 }; pb_s(&w, sc); }
+    pb_s(&w, " (");        pb_s(&w, proc_state_word(st)); pb_s(&w, ")\n");
+    pb_s(&w, "Tgid:\t");   pb_u(&w, tgid);  pb_s(&w, "\n");
+    pb_s(&w, "Ngid:\t0\n");
+    pb_s(&w, "Pid:\t");    pb_u(&w, r.shown_pid); pb_s(&w, "\n");
+    pb_s(&w, "PPid:\t");   pb_u(&w, ppid);  pb_s(&w, "\n");
+    pb_s(&w, "TracerPid:\t0\n");
+    pb_s(&w, "Uid:\t");    pb_u(&w, uid); pb_s(&w, "\t"); pb_u(&w, euid);
+    pb_s(&w, "\t");        pb_u(&w, euid); pb_s(&w, "\t"); pb_u(&w, euid); pb_s(&w, "\n");
+    pb_s(&w, "Gid:\t");    pb_u(&w, gid); pb_s(&w, "\t"); pb_u(&w, egid);
+    pb_s(&w, "\t");        pb_u(&w, egid); pb_s(&w, "\t"); pb_u(&w, egid); pb_s(&w, "\n");
+    pb_s(&w, "FDSize:\t256\nGroups:\t0\n");
+    pb_s(&w, "VmSize:\t"); pb_u(&w, vs); pb_s(&w, " kB\n");
+    pb_s(&w, "VmRSS:\t");  pb_u(&w, rss); pb_s(&w, " kB\n");
+    pb_s(&w, "RssAnon:\t"); pb_u(&w, rss >= shr ? rss - shr : 0); pb_s(&w, " kB\n");
+    pb_s(&w, "RssShmem:\t"); pb_u(&w, shr); pb_s(&w, " kB\n");
+    pb_s(&w, "VmPTE:\t");  pb_u(&w, pt); pb_s(&w, " kB\n");
+    pb_s(&w, "Threads:\t"); pb_u(&w, (uint64_t)proc_thread_count(r, group)); pb_s(&w, "\n");
+    pb_s(&w, "SigQ:\t0/16384\n");
+    // kurono-specific lines: the task manager reads these to show the same
+    // kernel stack / taskmem columns as the in-kernel one. (satoru)
+    pb_s(&w, "KuronoKernelTask:\t"); pb_u(&w, r.kernel ? 1 : 0); pb_s(&w, "\n");
+    pb_s(&w, "KuronoSchedPid:\t");   pb_u(&w, r.spid); pb_s(&w, "\n");
+    pb_s(&w, "KuronoState:\t");     pb_u(&w, r.has_snap ? (uint64_t)r.snap.state : 0ull); pb_s(&w, "\n");
+    if (r.has_snap) {
+        pb_s(&w, "KuronoPriority:\t"); pb_u(&w, r.snap.priority); pb_s(&w, "\n");
+        pb_s(&w, "KuronoNice:\t");     pb_i(&w, r.snap.nice); pb_s(&w, "\n");
+        pb_s(&w, "KuronoPrioTier:\t"); pb_u(&w, r.snap.prio_tier); pb_s(&w, "\n");
+        pb_s(&w, "KuronoStack:\t");    pb_u(&w, r.snap.stack_kb); pb_s(&w, " kB\n");
+        pb_s(&w, "KuronoStackCap:\t"); pb_u(&w, r.snap.stack_cap_kb); pb_s(&w, " kB\n");
+        pb_s(&w, "KuronoStackGrows:\t"); pb_u(&w, r.snap.stack_grow_count); pb_s(&w, "\n");
+        pb_s(&w, "KuronoCpuMs:\t");    pb_u(&w, r.snap.cpu_ms_total); pb_s(&w, " ms\n");
+    }
+    pb_s(&w, "KuronoTaskHeap:\t");   pb_u(&w, web); pb_s(&w, " kB\n");
+    pb_s(&w, "KuronoTaskFrames:\t"); pb_u(&w, wfr); pb_s(&w, " kB\n");
+    pb_s(&w, "KuronoTaskHeapPeak:\t"); pb_u(&w, wpk); pb_s(&w, " kB\n");
+    return w.n;
+}
+
+static int proc_format_statm(const ProcRef& r, char* out, int mx) {
+    ProcBuf w{out, 0, mx};
+    bool group = proc_group(r);
+    uint32_t rss = 0, shr = 0, pt = 0; uint64_t vs = 0;
+    proc_mem(r, group, &rss, &shr, &pt, &vs);
+    uint64_t vsp = (vs * 1024ull) / 4096ull;
+    uint64_t rsp = (uint64_t)(rss + 3) / 4ull;
+    uint64_t shp = (uint64_t)(shr + 3) / 4ull;
+    pb_u(&w, vsp); pb_s(&w, " "); pb_u(&w, rsp); pb_s(&w, " "); pb_u(&w, shp);
+    pb_s(&w, " 0 0 "); pb_u(&w, vsp); pb_s(&w, " 0\n");
+    return w.n;
+}
+
+static int proc_format_stat(const ProcRef& r, char* out, int mx) {
+    ProcBuf w{out, 0, mx};
+    bool group = proc_group(r);
+    uint32_t rss = 0, shr = 0, pt = 0; uint64_t vs = 0;
+    proc_mem(r, group, &rss, &shr, &pt, &vs);
+    uint64_t ums = 0, sms = 0;
+    proc_cpu_ms(r, group, &ums, &sms);
+    uint64_t utime = ums / 10ull;   // USER_HZ = 100
+    uint64_t stime = sms / 10ull;
+
+    const char* name = r.kernel ? (r.has_snap && r.snap.name[0] ? r.snap.name : "ktask")
+                                : (r.lp && r.lp->name[0] ? r.lp->name : "process");
+    char stc = proc_state_char(r);
+    uint32_t ppid = r.kernel ? (r.has_snap ? r.snap.parent_pid : 0) : (r.lp ? r.lp->ppid : 0);
+    uint32_t pgrp = r.kernel ? 0 : (r.lp ? r.lp->pgid : 0);
+    uint32_t sid  = r.kernel ? 0 : (r.lp ? r.lp->sid : 0);
+    int32_t tpgid = r.kernel ? -1 : (r.lp ? r.lp->ctty_pgrp : -1);
+    uint32_t flags = r.kernel ? 0x00200000u : 0;   // PF_KTHREAD
+    int nicev = r.has_snap ? r.snap.nice : 0;
+    uint32_t prio = (uint32_t)(20 + nicev);
+    uint32_t nthreads = (uint32_t)proc_thread_count(r, group);
+    uint64_t vsize_b = r.kernel ? 0ull : vs * 1024ull;
+    uint64_t rss_pages = (uint64_t)rss / 4ull;
+    int exit_code = (!r.kernel && r.lp && r.lp->exited) ? r.lp->exit_code : 0;
+
+    pb_u(&w, r.shown_pid); pb_s(&w, " ("); pb_s(&w, name); pb_s(&w, ") ");
+    { char sc[2] = { stc, 0 }; pb_s(&w, sc); } pb_s(&w, " ");
+    pb_u(&w, ppid);   pb_s(&w, " ");
+    pb_u(&w, pgrp);   pb_s(&w, " ");
+    pb_u(&w, sid);    pb_s(&w, " ");
+    pb_u(&w, 0);      pb_s(&w, " ");         // tty_nr
+    pb_i(&w, tpgid);  pb_s(&w, " ");
+    pb_u(&w, flags);  pb_s(&w, " ");
+    pb_u(&w, 0); pb_s(&w, " ");              // minflt
+    pb_u(&w, 0); pb_s(&w, " ");              // cminflt
+    pb_u(&w, 0); pb_s(&w, " ");              // majflt
+    pb_u(&w, 0); pb_s(&w, " ");              // cmajflt
+    pb_u(&w, utime); pb_s(&w, " ");
+    pb_u(&w, stime); pb_s(&w, " ");
+    pb_u(&w, 0); pb_s(&w, " ");              // cutime
+    pb_u(&w, 0); pb_s(&w, " ");              // cstime
+    pb_u(&w, prio);  pb_s(&w, " ");
+    pb_i(&w, nicev); pb_s(&w, " ");
+    pb_u(&w, nthreads); pb_s(&w, " ");
+    pb_u(&w, 0); pb_s(&w, " ");              // itrealvalue
+    pb_u(&w, 0); pb_s(&w, " ");              // starttime
+    pb_u(&w, vsize_b); pb_s(&w, " ");
+    pb_u(&w, rss_pages); pb_s(&w, " ");
+    pb_u(&w, ~0ull); pb_s(&w, " ");          // rsslim
+    pb_u(&w, 0); pb_s(&w, " ");              // startcode
+    pb_u(&w, 0); pb_s(&w, " ");              // endcode
+    pb_u(&w, 0); pb_s(&w, " ");              // startstack
+    pb_u(&w, 0); pb_s(&w, " ");              // kstkesp
+    pb_u(&w, 0); pb_s(&w, " ");              // kstkeip
+    pb_u(&w, 0); pb_s(&w, " ");              // signal
+    pb_u(&w, 0); pb_s(&w, " ");              // blocked
+    pb_u(&w, 0); pb_s(&w, " ");              // sigignore
+    pb_u(&w, 0); pb_s(&w, " ");              // sigcatch
+    pb_u(&w, 0); pb_s(&w, " ");              // wchan
+    pb_u(&w, 0); pb_s(&w, " ");              // nswap
+    pb_u(&w, 0); pb_s(&w, " ");              // cnswap
+    pb_u(&w, 17); pb_s(&w, " ");             // exit_signal (SIGCHLD)
+    pb_u(&w, 0); pb_s(&w, " ");              // processor
+    pb_u(&w, 0); pb_s(&w, " ");              // rt_priority
+    pb_u(&w, 0); pb_s(&w, " ");              // policy
+    pb_u(&w, 0); pb_s(&w, " ");              // delayacct_blkio_ticks
+    pb_u(&w, 0); pb_s(&w, " ");              // guest_time
+    pb_u(&w, 0); pb_s(&w, " ");              // cguest_time
+    pb_u(&w, 0); pb_s(&w, " ");              // start_data
+    pb_u(&w, 0); pb_s(&w, " ");              // end_data
+    pb_u(&w, 0); pb_s(&w, " ");              // start_brk
+    pb_u(&w, 0); pb_s(&w, " ");              // arg_start
+    pb_u(&w, 0); pb_s(&w, " ");              // arg_end
+    pb_u(&w, 0); pb_s(&w, " ");              // env_start
+    pb_u(&w, 0); pb_s(&w, " ");              // env_end
+    pb_i(&w, exit_code); pb_s(&w, "\n");
+    return w.n;
+}
+
+
+// /proc/stat from the scheduler's per-cpu millisecond accounting. USER_HZ is
+// 100, so a millisecond converts to a tick with *100/1000 (rounded down). (satoru)
+static int proc_format_sys_stat(char* out, int mx) {
+    ProcBuf w{out, 0, mx};
+    const uint64_t HZ = 100;
+    uint32_t ncpu = SMP::CpuCount();
+    if (ncpu < 1) ncpu = 1;
+    if (ncpu > 16) ncpu = 16;
+    uint64_t au = 0, as = 0, ai = 0, at = 0;
+    for (uint32_t c = 0; c < ncpu; c++) {
+        uint64_t total = g_cpu_total_ms[c] * HZ / 1000ull;
+        uint64_t user  = g_cpu_user_ms[c]  * HZ / 1000ull;
+        uint64_t sys   = g_cpu_sys_ms[c]   * HZ / 1000ull;
+        if (total < user + sys) total = user + sys;
+        uint64_t idle = total - user - sys;
+        au += user; as += sys; ai += idle; at += total;
+        pb_s(&w, "cpu"); pb_u(&w, c); pb_s(&w, " ");
+        pb_u(&w, user); pb_s(&w, " 0 "); pb_u(&w, sys); pb_s(&w, " ");
+        pb_u(&w, idle); pb_s(&w, " 0 0 0 0 0 0\n");
+    }
+    pb_s(&w, "cpu ");
+    pb_u(&w, au); pb_s(&w, " 0 "); pb_u(&w, as); pb_s(&w, " ");
+    pb_u(&w, ai); pb_s(&w, " 0 0 0 0 0 0\n");
+    pb_s(&w, "intr 0\nctxt 0\n");
+    pb_s(&w, "btime "); pb_u(&w, (uint64_t)TimeManager::RealtimeBaseSeconds()); pb_s(&w, "\n");
+    pb_s(&w, "processes "); pb_u(&w, (uint64_t)Scheduler::next_pid); pb_s(&w, "\n");
+    pb_s(&w, "procs_running 1\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0\n");
+    (void)at;
+    return w.n;
+}
+
+static int proc_format_uptime(char* out, int mx) {
+    ProcBuf w{out, 0, mx};
+    uint64_t ms = Timer::GetRealMs64();
+    uint32_t ncpu = SMP::CpuCount(); if (ncpu < 1) ncpu = 1; if (ncpu > 16) ncpu = 16;
+    uint64_t idle_ms = 0, total_ms = 0;
+    for (uint32_t c = 0; c < ncpu; c++) {
+        uint64_t t = g_cpu_total_ms[c];
+        uint64_t u = g_cpu_user_ms[c] + g_cpu_sys_ms[c];
+        total_ms += t;
+        if (t > u) idle_ms += t - u;
+    }
+    (void)total_ms;
+    pb_u(&w, ms / 1000ull); pb_s(&w, "."); pb_u(&w, (ms % 1000ull) / 10ull); pb_s(&w, " ");
+    pb_u(&w, idle_ms / 1000ull); pb_s(&w, "."); pb_u(&w, (idle_ms % 1000ull) / 10ull); pb_s(&w, "\n");
+    return w.n;
+}
+
+// /proc/diskstats: nvme goes through the controller's own counters (filesystems
+// and the persist layer call NVMe:: directly), everything else through the
+// generic block layer's per-device counters. (satoru)
+static void pb_disk_line(ProcBuf* w, uint32_t major, uint32_t minor, const char* name,
+                         uint64_t reads, uint64_t sectors_read,
+                         uint64_t writes, uint64_t sectors_written) {
+    pb_u(w, major); pb_s(w, " "); pb_u(w, minor); pb_s(w, " "); pb_s(w, name);
+    pb_s(w, " "); pb_u(w, reads);  pb_s(w, " 0 "); pb_u(w, sectors_read);
+    pb_s(w, " 0 "); pb_u(w, writes); pb_s(w, " 0 "); pb_u(w, sectors_written);
+    pb_s(w, " 0 0 0 0\n");
+}
+static int proc_format_diskstats(char* out, int mx) {
+    ProcBuf w{out, 0, mx};
+    int n = BlockDev::Count();
+    for (int i = 0; i < n; i++) {
+        BlockDevice* d = BlockDev::Get(i);
+        if (!d || !d->present || !d->name[0]) continue;
+        uint64_t reads = 0, sr = 0, writes = 0, sw = 0;
+        BlockDev::GetStats(i, &reads, &sr, &writes, &sw);
+        uint32_t major = 8;   // scsi/sata disk major
+        if (ls_starts(d->name, "nvme")) {
+            major = 259;
+            if (NVMe::IsDetected()) {
+                reads = NVMe::GetReadCount();
+                writes = NVMe::GetWriteCount();
+                sr = NVMe::GetBytesRead() / 512ull;
+                sw = NVMe::GetBytesWritten() / 512ull;
+            }
+        }
+        pb_disk_line(&w, major, (uint32_t)i, d->name, reads, sr, writes, sw);
+    }
+    if (n == 0 && NVMe::IsDetected()) {
+        pb_disk_line(&w, 259, 0, "nvme0n1", NVMe::GetReadCount(),
+                     NVMe::GetBytesRead() / 512ull, NVMe::GetWriteCount(),
+                     NVMe::GetBytesWritten() / 512ull);
+    }
+    return w.n;
+}
+
+// live /proc/net/dev, the same counters the in-kernel task manager reads. (satoru)
+static int proc_format_netdev(char* out, int mx) {
+    ProcBuf w{out, 0, mx};
+    pb_s(&w, "Inter-|   Receive                                                |  Transmit\n"
+             " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    int n = Network::GetInterfaceCount();
+    NetworkInterface* ifs = Network::GetInterfaces();
+    for (int i = 0; i < n; i++) {
+        NetworkInterface* ni = &ifs[i];
+        if (!ni->name[0]) continue;
+        pb_s(&w, "  "); pb_s(&w, ni->name); pb_s(&w, ": ");
+        pb_u(&w, ni->rx_bytes); pb_s(&w, " "); pb_u(&w, ni->rx_packets); pb_s(&w, " ");
+        pb_u(&w, ni->rx_errors); pb_s(&w, " 0 0 0 0 0 ");
+        pb_u(&w, ni->tx_bytes); pb_s(&w, " "); pb_u(&w, ni->tx_packets); pb_s(&w, " ");
+        pb_u(&w, ni->tx_errors); pb_s(&w, " 0 0 0 0 0\n");
+    }
+    return w.n;
+}
+
+static const char* const k_proc_leaf_files[] = {
+    "status", "stat", "statm", "cmdline", "comm", "exe", "cwd", "task"
+};
+static const uint8_t k_proc_leaf_types[] = { 8, 8, 8, 8, 8, 8, 8, 4 };
+
+
+// stat of a synthesized /proc entry. returns true when the path is ours
+// (directory or virtual file); false lets the kvfs/ext4 lookup handle static
+// /proc files such as /proc/cpuinfo. (satoru)
+static bool proc_stat_path(const char* resolved, uint32_t* mode, uint64_t* ino, uint64_t* size) {
+    const char* pp = resolved;
+    if (ls_starts(pp, "/system/proc")) pp += 7;
+    if (!ls_starts(pp, "/proc")) return false;
+    if (ls_seq(pp, "/proc") || ls_seq(pp, "/proc/")) {
+        *mode = 0040555; *ino = 0x70000000ull; *size = 0; return true;
+    }
+    // the task directory itself has no <tid> leaf, so proc_resolve rejects it. (satoru)
+    const char* tpos = nullptr;
+    for (const char* q = pp; *q; q++)
+        if (ls_starts(q, "/task") && (q[5] == 0 || q[5] == '/')) tpos = q;
+    if (tpos && (tpos[5] == 0 || (tpos[5] == '/' && tpos[6] == 0))) {
+        char base[256];
+        int bl = (int)(tpos - pp);
+        if (bl <= 0 || bl >= (int)sizeof(base)) return false;
+        memcpy(base, pp, (size_t)bl); base[bl] = 0;
+        ProcRef r;
+        if (!proc_resolve(base, LinuxSyscall::Current(), &r)) return false;
+        *mode = 0040555; *ino = 0x71000000ull | ((uint64_t)r.top_pid << 4) | 1ull; *size = 0;
+        return true;
+    }
+    ProcRef r;
+    if (!proc_resolve(pp, LinuxSyscall::Current(), &r)) return false;
+    if (!r.leaf || r.leaf[0] == 0) {
+        *mode = 0040555; *ino = 0x71000000ull | ((uint64_t)r.shown_pid << 4); *size = 0;
+        return true;
+    }
+    int n = (int)(sizeof(k_proc_leaf_files) / sizeof(k_proc_leaf_files[0]));
+    for (int i = 0; i < n; i++) {
+        if (ls_seq(r.leaf, k_proc_leaf_files[i])) {
+            *mode = 0100444; *ino = 0x72000000ull | ((uint64_t)r.shown_pid << 8) | (uint64_t)i;
+            *size = 0; return true;
+        }
+    }
+    return false;
+}
+
 int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9; // ebadf
@@ -9018,7 +12376,13 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
     if (!UAccess::AccessOk(buf, count)) return -14;   // -EFAULT
     uint8_t* dst = (uint8_t*)buf;
 
-    switch (lfd->type) {
+    // the type is read once: the elision gate saw a pipe or unix socket, but the fd may have
+    // been closed and reused as a file since; anything else needs kls, taken here. (satoru)
+    const LinuxFdType rty = lfd->type;
+    KlsRescue kls_rescue;
+    kls_rescue.takeIf(elided_here() && rty != LFD_SOCKET && rty != LFD_PIPE && rty != LFD_INET);
+
+    switch (rty) {
         case LFD_CONSOLE: {
             // a kpty session makes the console a real tty: line discipline, blocking
             // reads, eof on hangup. a blocking read with nothing queued parks and
@@ -9053,6 +12417,39 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
             return (int32_t)read;
         }
 
+        case LFD_PTY_SLAVE:
+        case LFD_PTY_MASTER:
+            return pty_read(p, lfd, fd, buf, count);
+
+        case LFD_DEVKEXEC: {
+            // wait for the bridged built-in to finish, then end of file (satoru)
+            int bpair = p->sid ? Kpty::FindBySession((int)p->sid) : -1;
+            if (g_ptytrace) {
+                static uint32_t kn = 0;
+                if (kn++ < 40) {
+                    SerialLogger::Log("[kexec] read pid="); SerialLogger::LogDec((int)p->pid);
+                    SerialLogger::Log(" sid="); SerialLogger::LogDec((int)p->sid);
+                    SerialLogger::Log(" pair="); SerialLogger::LogDec(bpair);
+                    SerialLogger::Log(" busy="); SerialLogger::LogDec(bpair >= 0 && KernelProcesses::BridgeBusy(bpair) ? 1 : 0);
+                    SerialLogger::Log("\r\n");
+                }
+            }
+            if (bpair >= 0 && KernelProcesses::BridgeBusy(bpair)) {
+                if (g_ptytrace) { SerialLogger::Log("[kexec] park flags="); SerialLogger::LogHex(lfd->flags); SerialLogger::Log(" direct="); SerialLogger::LogDec(g_read_direct[SMP::CpuIndex()] ? 1 : 0); SerialLogger::Log("\r\n"); }
+                if (poll_signal_deliverable(p)) return -4;   // ctrl+c must reach the shell (satoru)
+                if (!(lfd->flags & L_O_NONBLOCK) && g_read_direct[SMP::CpuIndex()]) {
+                    if (poll_try_deschedule(p, 0)) { if (g_ptytrace) SerialLogger::Log("[kexec] switched\r\n"); return 0; }
+                    if (g_ptytrace) SerialLogger::Log("[kexec] inplace\r\n");
+                    kls_relax_sleep_ms(2);
+                    if (!current_syscall_frame) return -11;
+                    current_syscall_frame->rip -= 2;
+                    return 0;
+                }
+                return -11;
+            }
+            return 0;
+        }
+
         case LFD_KVFS: {
             int r = KVFS::Read(lfd->backend_fd, dst, (uint32_t)count);
             if (r > 0) lfd->offset += r;
@@ -9069,8 +12466,16 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
         // via plain read() as often as recv(). a BLOCKING socket waits with the
         // eventfd discipline below (deschedule or breathe + retry). (satoru)
         case LFD_INET: {
-            int r = LinuxNetBridge::Recv(lfd->backend_fd, dst, (int)count, 0);
-            if (r == -11 && !(lfd->flags & L_O_NONBLOCK)) {
+            InetRef ir;
+            if (!fd_get_inet(p, fd, &ir)) return -9;
+            // pinned, received into a kernel buffer, copied out with no net lock held. a read may
+            // return less than asked, which tcp allows. (satoru)
+            uint8_t kb[4096];
+            int want = count > sizeof(kb) ? (int)sizeof(kb) : (int)count;
+            int r = LinuxNetBridge::Recv(ir.sd, kb, want, 0);
+            if (r > 0) memcpy(dst, kb, (size_t)r);
+            inet_put(ir.sd);
+            if (r == -11 && !(ir.flags & L_O_NONBLOCK)) {
                 if (poll_try_deschedule(p, 0)) return 0;   // switched; frame rewritten (satoru)
                 if (SMP::CpuIndex() == 0) {
                     LinuxNetBridge::PumpTick();            // drain the nic while we wait (satoru)
@@ -9089,8 +12494,11 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
         // inet path. (satoru)
         case LFD_SOCKET:
         case LFD_PIPE: {
-            int r = UnixSocket::Recv(lfd->backend_fd, dst, (int)count, 0);
-            if (r == -11 && !(lfd->flags & L_O_NONBLOCK) && g_read_direct[SMP::CpuIndex()])
+            SockRef sr;
+            if (!fd_get_sock(p, fd, &sr)) return -9;
+            int r = unix_recv_user(sr.sd, dst, count);
+            fd_put_sock(sr.sd);
+            if (r == -11 && !(sr.flags & L_O_NONBLOCK) && g_read_direct[SMP::CpuIndex()])
                 return unix_recv_wait(p, fd, 0);
             return r;
         }
@@ -9224,21 +12632,13 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
         }
 
         case LFD_PROC: {
-            // /proc virtual files generated on demand from live process state
-            char procdata[1024];
+            // /proc virtual files generated on demand from live process state. every
+            // numeric directory is synthesized (linux pids for user tasks, scheduler
+            // pids for kernel tasks); static /proc files still come from kvfs. (satoru)
+            char procdata[4096];
             int plen = 0;
+            bool handled = false;
             LinuxProcess* curp = Current();
-
-            // helpers (local lambdas would be nicer but we're freestanding)
-            #define PROC_APPEND(s) do { \
-                int _n = ls_slen(s); \
-                if (plen + _n < (int)sizeof(procdata)) { \
-                    memcpy(procdata + plen, s, _n); plen += _n; \
-                } \
-            } while(0)
-            #define PROC_APPEND_INT(v) do { \
-                char _ib[16]; ls_itoa((int)(v), _ib, 10); PROC_APPEND(_ib); \
-            } while(0)
 
             // The path may be either /proc/... (legacy) or /system/proc/...
             // (post-translation).  Strip the /system prefix once if present so
@@ -9248,35 +12648,55 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
             // [procrd] (fftrace): sampled proc-file reads. (satoru)
             { static uint64_t s_pr=0; if(g_fftrace && ((++s_pr)&0x3)==0){ SerialLogger::Log("[procrd] curp="); SerialLogger::LogHex((uint64_t)(uintptr_t)curp); SerialLogger::Log(" "); SerialLogger::Log(pp); SerialLogger::Log("\r\n"); } }
 
-            if (ls_starts(pp, "/proc/self/status") && curp) {
-                PROC_APPEND("Name:\t");      PROC_APPEND(curp->name); PROC_APPEND("\n");
-                PROC_APPEND("State:\tR (running)\n");
-                PROC_APPEND("Tgid:\t");      PROC_APPEND_INT(curp->pid);  PROC_APPEND("\n");
-                PROC_APPEND("Ngid:\t0\n");
-                PROC_APPEND("Pid:\t");       PROC_APPEND_INT(curp->pid);  PROC_APPEND("\n");
-                PROC_APPEND("PPid:\t");      PROC_APPEND_INT(curp->ppid); PROC_APPEND("\n");
-                PROC_APPEND("TracerPid:\t0\n");
-                PROC_APPEND("Uid:\t");       PROC_APPEND_INT(curp->uid);
-                PROC_APPEND("\t");           PROC_APPEND_INT(curp->euid);
-                PROC_APPEND("\t");           PROC_APPEND_INT(curp->euid);
-                PROC_APPEND("\t");           PROC_APPEND_INT(curp->euid); PROC_APPEND("\n");
-                PROC_APPEND("Gid:\t");       PROC_APPEND_INT(curp->gid);
-                PROC_APPEND("\t");           PROC_APPEND_INT(curp->egid);
-                PROC_APPEND("\t");           PROC_APPEND_INT(curp->egid);
-                PROC_APPEND("\t");           PROC_APPEND_INT(curp->egid); PROC_APPEND("\n");
-                PROC_APPEND("VmSize:\t");    PROC_APPEND_INT((curp->brk_current - curp->brk_base)/1024); PROC_APPEND(" kB\n");
-                PROC_APPEND("VmRSS:\t");     PROC_APPEND_INT((curp->brk_current - curp->brk_base)/1024); PROC_APPEND(" kB\n");
-                PROC_APPEND("Threads:\t1\n");
-                PROC_APPEND("SigQ:\t0/16384\n");
-                PROC_APPEND("Sid:\t");       PROC_APPEND_INT(curp->sid);  PROC_APPEND("\n");
-            } else if (ls_starts(pp, "/proc/self/cmdline") && curp) {
-                // single-arg cmdline = process name, NUL-terminated
-                PROC_APPEND(curp->name);
-                if (plen + 1 < (int)sizeof(procdata)) procdata[plen++] = 0;
-            } else if (ls_starts(pp, "/proc/self/comm") && curp) {
-                PROC_APPEND(curp->name); PROC_APPEND("\n");
-            } else if (ls_starts(pp, "/proc/self/maps") && curp) {
-                char hex[24];
+            if (ls_seq(pp, "/proc/stat")) {
+                plen = proc_format_sys_stat(procdata, (int)sizeof(procdata));
+                handled = true;
+            } else if (ls_seq(pp, "/proc/diskstats")) {
+                plen = proc_format_diskstats(procdata, (int)sizeof(procdata));
+                handled = true;
+            } else if (ls_seq(pp, "/proc/net/dev")) {
+                plen = proc_format_netdev(procdata, (int)sizeof(procdata));
+                handled = true;
+            } else if (ls_seq(pp, "/proc/uptime")) {
+                plen = proc_format_uptime(procdata, (int)sizeof(procdata));
+                handled = true;
+            } else if (ls_seq(pp, "/proc/meminfo")) {
+                // live from the pmm every read (the boot-time kvfs copy was a fixed 2 gb / 8 gb / 10 gb literal). (satoru)
+                plen = MemAcct::FormatMeminfo(procdata, (int)sizeof(procdata));
+                // kurono extras: the task manager's memory split. (satoru)
+                MemAcct::SysMem m; MemAcct::QuerySystem(&m);
+                ProcBuf w{procdata, plen, (int)sizeof(procdata)};
+                pb_s(&w, "KuronoHeapArena:\t"); pb_u(&w, m.heap_arena_kb); pb_s(&w, " kB\n");
+                pb_s(&w, "KuronoKmemx:\t");     pb_u(&w, m.kmemx_pool_kb); pb_s(&w, " kB\n");
+                pb_s(&w, "KuronoInstalledRam:\t"); pb_u(&w, m.installed_kb); pb_s(&w, " kB\n");
+                plen = w.n;
+                handled = true;
+            } else if (ls_seq(pp, "/proc/mounts") || ls_seq(pp, "/proc/self/mounts")) {
+                // honest mount table: nothing on /dev/sd* or nvme is mounted
+                // by linux programs, so fsck/ntfsfix may safely open them.
+                // the old boot-time copy claimed /dev/sda1 was root, which
+                // would make every repair tool refuse the disk. (satoru)
+                ProcBuf w{procdata, 0, (int)sizeof(procdata)};
+                pb_s(&w, "kvfs / kvfs rw,relatime 0 0\n"
+                         "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+                         "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
+                         "devtmpfs /dev devtmpfs rw,nosuid,mode=755 0 0\n"
+                         "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n");
+                plen = w.n;
+                handled = true;
+            } else if (ls_seq(pp, "/proc/filesystems")) {
+                ProcBuf w{procdata, 0, (int)sizeof(procdata)};
+                pb_s(&w, "nodev\tproc\n"
+                         "nodev\tsysfs\n"
+                         "nodev\tdevtmpfs\n"
+                         "nodev\ttmpfs\n"
+                         "\text4\n"
+                         "\tfat32\n"
+                         "\tkvfs\n");
+                plen = w.n;
+                handled = true;
+            } else if (ls_seq(pp, "/proc/self/maps") && curp) {
+                ProcBuf w{procdata, 0, (int)sizeof(procdata)};
                 // [stack] MUST be present: musl's pthread_getattr_np (main-thread
                 // path) scans /proc/self/maps for the line whose range contains the
                 // current SP to derive the stack base/size. with only [heap] here,
@@ -9287,58 +12707,63 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                 if (stk_top) {
                     uint64_t stk_top_pg = (stk_top + PAGE_SIZE) & ~(uint64_t)(PAGE_SIZE - 1);
                     uint64_t stk_base   = stk_top_pg - (8ULL * 1024 * 1024);
-                    ls_itoa((int)stk_base, hex, 16);   PROC_APPEND(hex); PROC_APPEND("-");
-                    ls_itoa((int)stk_top_pg, hex, 16); PROC_APPEND(hex);
-                    PROC_APPEND(" rw-p 00000000 00:00 0                          [stack]\n");
+                    pb_hex(&w, stk_base); pb_s(&w, "-"); pb_hex(&w, stk_top_pg);
+                    pb_s(&w, " rw-p 00000000 00:00 0                          [stack]\n");
                     // (satoru) TEMP probe: confirm the dynamic /proc/self/maps handler is hit
                     // + the exact [stack] line it emits (vs the mremap-probe walk addresses).
                     SerialLogger::Log("[pmaps] gen stk="); SerialLogger::LogHex(stk_base);
                     SerialLogger::Log("-"); SerialLogger::LogHex(stk_top_pg); SerialLogger::Log("\r\n");
                 }
                 // anonymous heap region (satoru)
-                ls_itoa((int)curp->brk_base, hex, 16);
-                PROC_APPEND(hex); PROC_APPEND("-");
-                ls_itoa((int)curp->brk_current, hex, 16);
-                PROC_APPEND(hex);
-                PROC_APPEND(" rw-p 00000000 00:00 0                          [heap]\n");
-            } else if (ls_starts(pp, "/proc/self/exe") && curp) {
-                // prefer the real recorded exec path (e.g. /apps/firefox/firefox)
-                // so gecko anchors its app dir correctly; fall back to the old
-                // synthesized /system/bin/<name> when no path was recorded. (satoru)
-                if (curp->task && curp->task->exe_path[0]) {
-                    PROC_APPEND(curp->task->exe_path);
-                } else {
-                    PROC_APPEND("/system/bin/"); PROC_APPEND(curp->name);
-                }
-            } else if (ls_starts(pp, "/proc/self/cwd") && curp) {
-                PROC_APPEND(curp->cwd);
-            } else if (ls_starts(pp, "/proc/self/stat") && curp) {
-                // Minimal /proc/self/stat: "pid (name) state ppid pgid sid ..."
-                PROC_APPEND_INT(curp->pid); PROC_APPEND(" (");
-                PROC_APPEND(curp->name); PROC_APPEND(") R ");
-                PROC_APPEND_INT(curp->ppid); PROC_APPEND(" ");
-                PROC_APPEND_INT(curp->pgid); PROC_APPEND(" ");
-                PROC_APPEND_INT(curp->sid); PROC_APPEND(" 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n");
-            } else if (ls_starts(pp, "/proc/mounts") ||
-                       ls_starts(pp, "/proc/self/mounts")) {
-                // honest mount table: nothing on /dev/sd* or nvme is mounted
-                // by linux programs, so fsck/ntfsfix may safely open them.
-                // the old boot-time copy claimed /dev/sda1 was root, which
-                // would make every repair tool refuse the disk. (satoru)
-                PROC_APPEND("kvfs / kvfs rw,relatime 0 0\n"
-                            "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
-                            "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
-                            "devtmpfs /dev devtmpfs rw,nosuid,mode=755 0 0\n"
-                            "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n");
-            } else if (ls_starts(pp, "/proc/filesystems")) {
-                PROC_APPEND("nodev\tproc\n"
-                            "nodev\tsysfs\n"
-                            "nodev\tdevtmpfs\n"
-                            "nodev\ttmpfs\n"
-                            "\text4\n"
-                            "\tfat32\n"
-                            "\tkvfs\n");
+                pb_hex(&w, curp->brk_base); pb_s(&w, "-"); pb_hex(&w, curp->brk_current);
+                pb_s(&w, " rw-p 00000000 00:00 0                          [heap]\n");
+                plen = w.n;
+                handled = true;
             } else {
+                ProcRef ref;
+                if (proc_resolve(pp, curp, &ref) && ref.leaf && ref.leaf[0]) {
+                    const char* leaf = ref.leaf;
+                    if (ls_seq(leaf, "status")) {
+                        plen = proc_format_status(ref, procdata, (int)sizeof(procdata));
+                        handled = true;
+                    } else if (ls_seq(leaf, "stat")) {
+                        plen = proc_format_stat(ref, procdata, (int)sizeof(procdata));
+                        handled = true;
+                    } else if (ls_seq(leaf, "statm")) {
+                        plen = proc_format_statm(ref, procdata, (int)sizeof(procdata));
+                        handled = true;
+                    } else if (ls_seq(leaf, "cmdline")) {
+                        // kthreads have an empty cmdline, exactly like linux. (satoru)
+                        ProcBuf w{procdata, 0, (int)sizeof(procdata)};
+                        if (!ref.kernel && ref.lp) {
+                            pb_s(&w, ref.lp->name);
+                            if (w.n + 1 < w.mx) w.b[w.n++] = 0;
+                            w.b[w.n] = 0;
+                        }
+                        plen = w.n; handled = true;
+                    } else if (ls_seq(leaf, "comm")) {
+                        ProcBuf w{procdata, 0, (int)sizeof(procdata)};
+                        if (ref.kernel) pb_s(&w, ref.has_snap && ref.snap.name[0] ? ref.snap.name : "ktask");
+                        else if (ref.lp) pb_s(&w, ref.lp->name);
+                        pb_s(&w, "\n");
+                        plen = w.n; handled = true;
+                    } else if (ls_seq(leaf, "exe")) {
+                        ProcBuf w{procdata, 0, (int)sizeof(procdata)};
+                        if (!ref.kernel && ref.lp) {
+                            if (ref.lp->task && ref.lp->task->exe_path[0]) pb_s(&w, ref.lp->task->exe_path);
+                            else { pb_s(&w, "/system/bin/"); pb_s(&w, ref.lp->name); }
+                        }
+                        plen = w.n; handled = true;
+                    } else if (ls_seq(leaf, "cwd")) {
+                        ProcBuf w{procdata, 0, (int)sizeof(procdata)};
+                        if (ref.kernel) pb_s(&w, "/");
+                        else if (ref.lp) pb_s(&w, ref.lp->cwd);
+                        plen = w.n; handled = true;
+                    }
+                }
+            }
+
+            if (!handled) {
                 // Fall back to the KVFS-backed copy populated by ProcFS at boot
                 // (e.g. /proc/cpuinfo, /proc/meminfo, /proc/version, /proc/uptime,
                 //  /proc/loadavg, /proc/mounts, /proc/net/dev). Re-open lazily.
@@ -9359,16 +12784,15 @@ int32_t LinuxSyscall::sys_read(int fd, uintptr_t buf, uint64_t count) {
                     if (r > 0) { lfd->offset += (uint64_t)r; return r; }
                     return 0;
                 }
+                return 0;
             }
             // honour offset for repeated reads (so cat/strings see EOF)
             int avail = plen - (int)lfd->offset;
             if (avail <= 0) return 0;
             int n = (int)count < avail ? (int)count : avail;
-            memcpy(dst, procdata + lfd->offset, n);
+            memcpy(dst, procdata + (int)lfd->offset, n);
             lfd->offset += n;
             return n;
-            #undef PROC_APPEND
-            #undef PROC_APPEND_INT
         }
 
         default:
@@ -9447,6 +12871,9 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
     // info-leak half of the same hole. (satoru)
     if (!UAccess::AccessOk(buf, count)) return -14;   // -EFAULT
     const uint8_t* src = (const uint8_t*)buf;
+    const LinuxFdType wty = lfd->type;   // read once, see sys_read (satoru)
+    KlsRescue kls_rescue;
+    kls_rescue.takeIf(elided_here() && wty != LFD_SOCKET && wty != LFD_PIPE && wty != LFD_INET);
 
     // (satoru) firefox bring-up: this build has MOZ_LOG compiled in (MOZ_LOGGING_ENABLED=1)
     // and env MOZ_LOG=all:0 does NOT silence the default Debug-level modules. with
@@ -9467,7 +12894,7 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
         }
     }
 
-    switch (lfd->type) {
+    switch (wty) {
         case LFD_CONSOLE: {
             // kpty session: bytes go to the terminal (master side), through the
             // output processing of the line discipline. a full ring blocks the writer
@@ -9493,12 +12920,14 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
                 }
                 return (int32_t)count;
             }
-            // stdout/stderr → capture to console ring buffer + serial
+            // stdout/stderr → capture to console ring buffer + serial. the ring is the old
+            // single-session path (kurono.pty=0); a program with a pty or capture pair never
+            // gets here, and the serial-only console no longer fills a ring nobody reads. (satoru)
             for (uint64_t i = 0; i < count; i++) {
                 char c = (char)src[i];
                 // write to capture buffer
                 int next = (console_head + 1) % CONSOLE_BUF_SIZE;
-                if (next != console_tail) {
+                if (g_pty_legacy && next != console_tail) {
                     console_buf[console_head] = c;
                     console_head = next;
                 }
@@ -9509,7 +12938,39 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
             return (int32_t)count;
         }
 
+        case LFD_PTY_SLAVE:
+        case LFD_PTY_MASTER:
+            return pty_write(p, lfd, buf, count);
+
+        case LFD_DEVKEXEC: {
+            char line[256];
+            uint64_t n = count < sizeof(line) - 1 ? count : sizeof(line) - 1;
+            if (!user_span_valid(p->task, buf, n)) return -14;
+            for (uint64_t i = 0; i < n; i++) line[i] = (char)src[i];
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) n--;
+            line[n] = 0;
+            if (n == 0) return (int32_t)count;
+            if (line[0] == '!') {                          // "!cancel" (satoru)
+                int cp = p->sid ? Kpty::FindBySession((int)p->sid) : -1;
+                if (cp >= 0) KernelProcesses::BridgeCancel(cp);
+                return (int32_t)count;
+            }
+            // a ring-3 shell can ask the kernel to run a built-in. privileged
+            // builtins (package install, reboot, mounts, driver ops, system
+            // settings) need approval; `sudo <cmd>` and `ken <cmd>` route
+            // through the ken gate themselves. (satoru)
+            if (AdminGate::ShellCommandNeedsElevation(line) &&
+                !AdminGate::Authorize("terminal command", line))
+                return -1;   // -EPERM
+            int pair = p->sid ? Kpty::FindBySession((int)p->sid) : -1;
+            int slot = pair >= 0 ? KernelProcesses::RunShellCommandBridge(line, pair) : -1;
+            if (slot < 0) return -16;                      // EBUSY: no tty or every launcher busy (satoru)
+            return (int32_t)count;
+        }
+
         case LFD_KVFS: {
+            if (AdminGate::PathNeedsElevation(lfd->path) &&
+                !AdminGate::AuthorizePathWrite(lfd->path, "write")) return -1;
             mozlog_probe(p, lfd, src, count);   // (satoru) TEMP capture MOZ_LOG file writes
             int r = KVFS::Write(lfd->backend_fd, src, (uint32_t)count);
             if (r > 0) lfd->offset += r;
@@ -9517,6 +12978,8 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
         }
 
         case LFD_EXT4: {
+            if (AdminGate::PathNeedsElevation(lfd->path) &&
+                !AdminGate::AuthorizePathWrite(lfd->path, "write")) return -1;
             mozlog_probe(p, lfd, src, count);   // (satoru) TEMP capture MOZ_LOG file writes
             int r = Ext4::Write(lfd->backend_fd, src, (uint32_t)count);
             if (r > 0) lfd->offset += r;
@@ -9525,8 +12988,13 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
 
         // af_inet tcp/udp: send through the bridge. -EAGAIN passes through - 
         // necko writes are poll-driven, the caller retries on POLLOUT. (satoru)
-        case LFD_INET:
-            return LinuxNetBridge::Send(lfd->backend_fd, src, (int)count, 0);
+        case LFD_INET: {
+            InetRef ir;
+            if (!fd_get_inet(p, fd, &ir)) return -9;
+            int r = inet_send_user(ir.sd, src, count, nullptr, 0);
+            inet_put(ir.sd);
+            return r;
+        }
 
         // unix sockets + pipes: plain write() must work, not just send() - this
         // case was MISSING and every write() on a socket/pipe fd fell through to
@@ -9535,8 +13003,13 @@ int32_t LinuxSyscall::sys_write(int fd, uintptr_t buf, uint64_t count) {
         // it tear the event down and the socket thread ran wake-less forever
         // (transports queued, zero AF_INET traffic, page loads hung). (satoru)
         case LFD_SOCKET:
-        case LFD_PIPE:
-            return UnixSocket::Send(lfd->backend_fd, src, (int)count, 0);
+        case LFD_PIPE: {
+            SockRef sr;
+            if (!fd_get_sock(p, fd, &sr)) return -9;
+            int r = unix_send_user(sr.sd, src, count);
+            fd_put_sock(sr.sd);
+            return r;
+        }
 
         // eventfd write: adds an 8-byte value to the counter, making the fd
         // readable (EPOLLIN). this is how glib's main loop wakes its epoll. an
@@ -9703,6 +13176,47 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
         return lfd_idx;
     }
 
+    // /dev/kexec: the terminal exec bridge. a line written to it runs a kernel built-in for the
+    // caller's terminal; a read waits until it finished; "!cancel" kills it. (satoru)
+    if (!g_pty_legacy && (ls_seq(resolved, "/system/dev/kexec") || ls_seq(resolved, "/dev/kexec"))) {
+        lfd->type = LFD_DEVKEXEC;
+        lfd->backend_fd = 0;
+        lfd->open = true;
+        return lfd_idx;
+    }
+    // /dev/ptmx: a new pty pair, this fd is its master (locked until unlockpt) (satoru)
+    if (!g_pty_legacy && (ls_seq(resolved, "/system/dev/ptmx") || ls_seq(resolved, "/dev/ptmx"))) {
+        int pt = Kpty::Alloc(80, 25, Kpty::F_VISIBLE | Kpty::F_LOCKED | Kpty::F_USERMASTER);
+        if (pt < 0) { lfd->open = false; return -23; }   // ENFILE (satoru)
+        lfd->type = LFD_PTY_MASTER;
+        lfd->backend_fd = pt;
+        lfd->open = true;
+        return lfd_idx;
+    }
+    // /dev/pts/N: the slave side of pair N (devpts). a session leader without a controlling tty
+    // gets this one unless it passed O_NOCTTY. (satoru)
+    if (!g_pty_legacy) {
+        const char* q = nullptr;
+        if (ls_starts(resolved, "/system/dev/pts/")) q = resolved + 16;
+        else if (ls_starts(resolved, "/dev/pts/")) q = resolved + 9;
+        if (q && *q >= '0' && *q <= '9') {
+            int n = 0;
+            while (*q >= '0' && *q <= '9' && n < 1000) n = n * 10 + (*q++ - '0');
+            if (*q == 0) {
+                if (!Kpty::Visible(n)) { lfd->open = false; return -2; }
+                if (Kpty::Locked(n)) { lfd->open = false; return -5; }
+                pty_attach_slave(p, lfd, n, flags, resolved + (resolved[1] == 's' ? 7 : 0));
+                return lfd_idx;
+            }
+        }
+    }
+    // /dev/tty: the caller's controlling tty (its session's pair); ENXIO without one (satoru)
+    if (!g_pty_legacy && (ls_seq(resolved, "/system/dev/tty") || ls_seq(resolved, "/dev/tty"))) {
+        int pt = p->sid ? Kpty::FindBySession((int)p->sid) : -1;
+        if (pt < 0) { lfd->open = false; return -6; }
+        pty_attach_slave(p, lfd, pt, flags | 0x100u, "/dev/tty");
+        return lfd_idx;
+    }
     // /dev/tty + /dev/console: the controlling terminal, i.e. the console fd type. (satoru)
     if (ls_seq(resolved, "/system/dev/tty") || ls_seq(resolved, "/dev/tty") ||
         ls_seq(resolved, "/system/dev/console") || ls_seq(resolved, "/dev/console")) {
@@ -9741,6 +13255,13 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
             if (!has_slash) {
                 int slot = blkfd_open_name(devname);
                 if (slot >= 0) {
+                    // raw block access needs administrator approval. this is
+                    // checked before the fd is handed out, so a normal user
+                    // cannot dd over the disk even via a recovery tool. (satoru)
+                    if (!AdminGate::Authorize("raw block device", resolved)) {
+                        lfd->open = false;
+                        return -1;   // -EPERM
+                    }
                     lfd->type = LFD_BLOCKDEV;
                     lfd->backend_fd = slot;
                     lfd->offset = 0;
@@ -9811,6 +13332,16 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
         return lfd_idx;
     }
 
+    // writes/creates under a system root need administrator approval. checked
+    // here (after the device/proc special cases) so the prompt never fires for
+    // /dev/null, ptys, /proc/self/fd or a read-only open. (satoru)
+    if (((flags & 3) != 0 || (flags & 0x40) || (flags & 0x200)) &&
+        AdminGate::PathNeedsElevation(resolved) &&
+        !AdminGate::AuthorizePathWrite(resolved, "open for write")) {
+        lfd->open = false;
+        return -1;   // -EPERM
+    }
+
     // try kvfs first
     uint8_t kvfs_flags = 0;
     if ((flags & 3) == L_O_RDONLY) kvfs_flags = 1;
@@ -9821,6 +13352,7 @@ int32_t LinuxSyscall::sys_open(uintptr_t pathname, uint32_t flags, uint32_t mode
     if (flags & L_O_CREAT) {
         if (!KVFS::Exists(resolved)) {
             int crc = KVFS::CreateFile(resolved, (uint16_t)(mode & 0777));
+            if (crc == 0) KVFS::Chown(resolved, (uint16_t)p->euid, (uint16_t)p->egid);   // creator owns a new file (satoru)
             // (satoru) TEMP [nsscr]: an O_CREAT that fails to create is invisible
             // (falls through to enoent) - the prime cert9.db/key4.db suspect.
             // remove before commit.
@@ -9916,7 +13448,19 @@ int32_t LinuxSyscall::sys_close(int fd) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
 
-    LinuxFd* lfd = &p->fds[fd];
+    // take the slot out of the table first, under the fd lock, and finish the close on a
+    // private copy: an exempt reader that looks fd up afterwards sees it closed, and one
+    // that pinned the backend before this point keeps its own reference. (satoru)
+    LinuxFd snap;
+    {
+        FdTabHdr* fh = fdt_hdr(p->fds);
+        SpinLockGuard fg(fh->lock);
+        if (!p->fds[fd].open) return -9;
+        snap = p->fds[fd];
+        p->fds[fd].open = false;
+    }
+    LinuxFd* lfd = &snap;
+    int memfd_slot = -1;   // item 6: release check once this fd is gone (satoru)
     // posix: closing ANY fd of a file drops the process's byte-range locks on
     // it. sqlite's unix vfs is designed around exactly this, so honour it. (satoru)
     if ((lfd->type == LFD_KVFS || lfd->type == LFD_EXT4) && lfd->path[0])
@@ -9927,7 +13471,7 @@ int32_t LinuxSyscall::sys_close(int fd) {
     // bounded tables don't leak across a long-lived process (satoru)
     else if (lfd->type == LFD_EPOLL) {
         int s = lfd->backend_fd;
-        if (s >= 0 && s < EPOLL_MAX) g_epoll[s].used = false;
+        if (s >= 0 && s < EPOLL_MAX) { SpinLockGuard eg(g_epoll[s].lk); g_epoll[s].used = false; }
     } else if (lfd->type == LFD_EVENTFD) {
         int s = lfd->backend_fd;
         if (s >= 0 && s < EVENTFD_MAX) g_eventfd[s].used = false;
@@ -9935,7 +13479,16 @@ int32_t LinuxSyscall::sys_close(int fd) {
         int s = lfd->backend_fd;
         if (s >= 0 && s < TIMERFD_MAX) g_timerfd[s].used = false;
     } else if (lfd->type == LFD_DEVKSHELL) {
-        kshell_free(lfd->backend_fd);
+        // a shell redirect (`echo cmd >&3`) dup2s the session fd onto 0/1 and closes
+        // that copy again. the slot only goes back to the pool when no other fd in
+        // this process still names it; freeing on the first close threw the command's
+        // output away before the caller could read it. (satoru)
+        bool others = false;
+        for (int i = 0; i < LINUX_MAX_FDS; i++) {
+            if (&p->fds[i] != lfd && p->fds[i].open && p->fds[i].type == LFD_DEVKSHELL &&
+                p->fds[i].backend_fd == lfd->backend_fd) { others = true; break; }
+        }
+        if (!others) kshell_free(lfd->backend_fd);
     } else if (lfd->type == LFD_BLOCKDEV) {
         blkfd_free(lfd->backend_fd);
     } else if (lfd->type == LFD_INET) {
@@ -9950,6 +13503,9 @@ int32_t LinuxSyscall::sys_close(int fd) {
         // startup + a browsing session can't exhaust it without reclaim. (satoru)
         LinuxShmObj* s = shm_slot(lfd->backend_fd);
         if (s) __atomic_sub_fetch(&s->refcount, 1, __ATOMIC_SEQ_CST);
+        memfd_slot = lfd->backend_fd;
+    } else if (lfd_is_pty(lfd)) {
+        pty_fd_release(lfd);
     } else if (lfd->type == LFD_SOCKET || lfd->type == LFD_PIPE) {
         // task 28 (the 4s glxtest tax): actually SEVER the socket/pipe on close.
         // the fd was bare-flipped before, so the peer never saw the hangup and
@@ -9959,7 +13515,7 @@ int32_t LinuxSyscall::sys_close(int fd) {
         // peer's parked poller is woken NOW via the data-ready hook. (satoru)
         if (lfd->backend_fd >= 0) UnixSocket::Close(lfd->backend_fd);
     }
-    lfd->open = false;
+    if (memfd_slot >= 0) shm_maybe_release(memfd_slot);
     return 0;
 }
 
@@ -10002,12 +13558,58 @@ int64_t LinuxSyscall::sys_brk(uintptr_t addr) {
     if (addr > p->brk_max) return (int64_t)p->brk_current;
     if (addr < p->brk_base) return (int64_t)p->brk_current;
 
+    // same lock as mmap/munmap: the heap region and the range check below
+    // must not race a sibling's map. (satoru)
+    SpinLockCpuGuard _brk_guard(g_mmap_lock);
+    // linux semantics: the break never grows over another mapping. it did here,
+    // silently: the heap was demand-mapped over whatever sat above it (the
+    // libraries, see the MAP_FIXED note in sys_mmap) and malloc metadata
+    // overwrote libstdc++'s hash table. refuse instead; musl's malloc then
+    // falls back to mmap. (satoru)
+    if (addr > p->brk_current && p->task && p->task->is_user()) {
+        uint64_t gs = align_up_u64(p->brk_current, PAGE_SIZE);
+        uint64_t ge = align_up_u64(addr, PAGE_SIZE);
+        if (gs < align_up_u64(p->brk_base, PAGE_SIZE)) gs = align_up_u64(p->brk_base, PAGE_SIZE);
+        // the heap region itself may already reach past the break (page
+        // rounding of the last brk): only what lies above it is new. (satoru)
+        UserMemoryRegion* hr = find_region_by_flag(p->task, USER_REGION_HEAP);
+        if (hr && hr->active && hr->end > gs) gs = hr->end;
+        if (ge > gs) {
+            bool hit = region_overlaps_cross_thread(p->task, gs, ge);
+            uint64_t stride = (ge - gs <= (1ull << 20)) ? PAGE_SIZE : align_up_u64((ge - gs) / 256, PAGE_SIZE);
+            for (uint64_t v = gs; !hit && v < ge; v += stride) {
+                if (KernelVMM::QueryMappingInAddressSpace(p->task->address_space, v) &&
+                    (KernelVMM::QueryPageFlagsInAddressSpace(p->task->address_space, v) & PTE_USER))
+                    hit = true;
+            }
+            if (hit) {
+                static int s_brk_logs = 0;
+                if (s_brk_logs < 4) {
+                    s_brk_logs++;
+                    SerialLogger::Log("[brk] growth refused, range is mapped: ");
+                    SerialLogger::LogHex64(gs); SerialLogger::Log("..");
+                    SerialLogger::LogHex64(ge);
+                    UserMemoryRegion* br = find_region(p->task, gs);
+                    if (br) {
+                        SerialLogger::Log(" by region "); SerialLogger::LogHex64(br->start);
+                        SerialLogger::Log("-"); SerialLogger::LogHex64(br->end);
+                        SerialLogger::Log(" flags="); SerialLogger::LogHex64(br->flags);
+                    }
+                    SerialLogger::Log("\r\n");
+                }
+                return (int64_t)p->brk_current;
+            }
+        }
+    }
+
     if (p->task && p->task->is_user()) {
         if (!ensure_heap_region(p, p->task, addr)) {
             return (int64_t)p->brk_current;
         }
     }
 
+    if (p->task && p->task->is_user() && ff_is_firefox(p->task))
+        remap_note(6, p->task->address_space, (uint64_t)p->brk_current, addr);
     p->brk_current = addr;
     return (int64_t)addr;
 }
@@ -10073,6 +13675,19 @@ int32_t LinuxSyscall::sys_stat(uintptr_t pathname, uintptr_t statbuf) {
     LinuxStat* st = (LinuxStat*)statbuf;
     memset(st, 0, sizeof(LinuxStat));
 
+    // synthesized /proc entries have no kvfs node. (satoru)
+    {
+        uint32_t pm = 0; uint64_t pi = 0, ps = 0;
+        if (proc_stat_path(resolved, &pm, &pi, &ps)) {
+            st->st_ino = (uint32_t)pi;
+            st->st_mode = pm;
+            st->st_nlink = 1;
+            st->st_size = (uint32_t)ps;
+            st->st_blksize = 4096;
+            return 0;
+        }
+    }
+
     // try kvfs
     KVFSNode* node = KVFS::Resolve(resolved);
     if (node) {
@@ -10122,7 +13737,7 @@ int32_t LinuxSyscall::sys_fstat(int fd, uintptr_t statbuf) {
 
     LinuxFd* lfd = &p->fds[fd];
 
-    if (lfd->type == LFD_CONSOLE) {
+    if (lfd->type == LFD_CONSOLE || lfd_is_pty(lfd)) {
         st->st_mode = 0020666;  // character device
         st->st_blksize = 1024;
         return 0;
@@ -10232,6 +13847,22 @@ static bool blkdev_path_exists(const char* resolved) {
 static int gather_stat_path(const char* resolved, KStatInfo* out) {
     memset(out, 0, sizeof(*out));
 
+    // /dev/pts/N and /dev/ptmx: character devices, inode 3000+N / 2999 like the fstat of the fd
+    // (glibc ttyname compares the two). (satoru)
+    {
+        const char* q = nullptr;
+        if (ls_starts(resolved, "/system/dev/pts/")) q = resolved + 16;
+        else if (ls_starts(resolved, "/dev/pts/")) q = resolved + 9;
+        if (q && *q >= '0' && *q <= '9') {
+            int n = 0;
+            while (*q >= '0' && *q <= '9' && n < 1000) n = n * 10 + (*q++ - '0');
+            if (*q == 0 && Kpty::Visible(n)) {
+                out->ino = (uint64_t)(3000 + n); out->mode = 0020620; out->nlink = 1; out->blksize = 1024;
+                return 0;
+            }
+        }
+    }
+
     // block devices first: there is no kvfs node for /dev/sda1, and a tool that
     // cannot STAT the device never gets as far as opening it. ntfs-3g's
     // ntfs_check_if_mounted() stats the path, so ntfsfix reported "Volume is
@@ -10258,6 +13889,15 @@ static int gather_stat_path(const char* resolved, KStatInfo* out) {
                     return 0;
                 }
             }
+        }
+    }
+
+    {
+        uint32_t pm = 0; uint64_t pi = 0, ps = 0;
+        if (proc_stat_path(resolved, &pm, &pi, &ps)) {
+            out->ino = pi; out->mode = pm; out->nlink = 1; out->size = ps;
+            out->blksize = 4096; out->blocks = 0;
+            return 0;
         }
     }
 
@@ -10361,7 +14001,7 @@ int32_t LinuxSyscall::sys_fstat64(int fd, uintptr_t statbuf) {
         fill_stat64((LinuxStat64*)statbuf, &info);
         return 0;
     }
-    if (lfd->type == LFD_CONSOLE || lfd->type == LFD_DEVNULL ||
+    if (lfd->type == LFD_CONSOLE || lfd_is_pty(lfd) || lfd->type == LFD_DEVNULL ||
         lfd->type == LFD_DEVURANDOM || lfd->type == LFD_DEVKSHELL ||
         lfd->type == LFD_BLOCKDEV || lfd->type == LFD_SIGNALFD ||
         lfd->type == LFD_TIMERFD) {
@@ -10373,6 +14013,7 @@ int32_t LinuxSyscall::sys_fstat64(int fd, uintptr_t statbuf) {
         info.mode    = 0020666;   // S_IFCHR | rw-rw-rw-
         info.nlink   = 1;
         info.blksize = (lfd->type == LFD_CONSOLE) ? 1024 : 4096;
+        if (lfd->type == LFD_PTY_SLAVE) { info.ino = (uint64_t)(3000 + lfd->backend_fd); info.mode = 0020620; }   // matches the /dev/pts/N stat (satoru)
         fill_stat64((LinuxStat64*)statbuf, &info);
         return 0;
     }
@@ -10535,9 +14176,16 @@ int32_t LinuxSyscall::sys_mkdir(uintptr_t pathname, uint32_t mode) {
     const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
+    if (!AdminGate::AuthorizePathWrite(resolved, "mkdir")) return -1;
 
     int r = KVFS::Mkdir(resolved, (uint16_t)(mode & 0777));
-    if (r == 0) return 0;
+    if (r == 0) {
+        // a new directory belongs to its creator, as on linux. kvfs nodes start
+        // with uid 0, and runtimes that check their temp/cache dir owner (claude
+        // code refuses a /tmp/claude-<uid> owned by another uid) broke on it. (satoru)
+        KVFS::Chown(resolved, (uint16_t)p->euid, (uint16_t)p->egid);
+        return 0;
+    }
 
     if (Ext4::IsMounted()) {
         r = Ext4::Mkdir(resolved, (uint16_t)(mode & 0777));
@@ -10577,6 +14225,7 @@ int32_t LinuxSyscall::sys_rmdir(uintptr_t pathname) {
     const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
+    if (!AdminGate::AuthorizePathWrite(resolved, "rmdir")) return -1;
 
     if (KVFS::Rmdir(resolved) == 0) return 0;
     if (Ext4::IsMounted() && Ext4::Rmdir(resolved) == 0) return 0;
@@ -10589,6 +14238,7 @@ int32_t LinuxSyscall::sys_unlink(uintptr_t pathname) {
     const char* path = (const char*)pathname;
     char resolved[256];
     ResolvePath(path, resolved, sizeof(resolved), p);
+    if (!AdminGate::AuthorizePathWrite(resolved, "unlink")) return -1;
 
     if (KVFS::Unlink(resolved) == 0) return 0;
     if (Ext4::IsMounted() && Ext4::Unlink(resolved) == 0) return 0;
@@ -10613,14 +14263,7 @@ int32_t LinuxSyscall::sys_dup(int oldfd) {
     if (!p || oldfd < 0 || oldfd >= LINUX_MAX_FDS || !p->fds[oldfd].open)
         return -9;
 
-    int newfd = AllocFd(p);
-    if (newfd < 0) return -24;
-
-    memcpy(&p->fds[newfd], &p->fds[oldfd], sizeof(LinuxFd));
-    p->fds[newfd].flags &= ~L_FD_CLOEXEC;   // a dup never inherits close-on-exec (satoru)
-    // aliased backends are refcounted so either fd's close is safe (satoru)
-    retain_dup_backend(&p->fds[newfd]);
-    return newfd;
+    return fd_dup_locked(p, oldfd, 0, false);
 }
 
 int32_t LinuxSyscall::sys_dup2(int oldfd, int newfd) {
@@ -10630,13 +14273,21 @@ int32_t LinuxSyscall::sys_dup2(int oldfd, int newfd) {
     if (newfd < 0 || newfd >= LINUX_MAX_FDS) return -9;
     if (oldfd == newfd) return newfd;   // linux: no-op, never close it (satoru)
 
-    if (p->fds[newfd].open) {
-        sys_close(newfd);
+    // close the target, then claim it and copy in one fd-lock section; if another cpu
+    // took the slot in between (an exempt dup or open), close it again and retry. (satoru)
+    LinuxFd* t = p->fds;
+    FdTabHdr* h = fdt_hdr(t);
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (t[newfd].open) sys_close(newfd);
+        SpinLockGuard g(h->lock);
+        if (!t[oldfd].open) return -9;
+        if (t[newfd].open || (h->rsv[newfd >> 5] & (1u << (newfd & 31)))) continue;
+        memcpy(&t[newfd], &t[oldfd], sizeof(LinuxFd));
+        t[newfd].flags &= ~L_FD_CLOEXEC;
+        retain_dup_backend(&t[newfd]);
+        return newfd;
     }
-    memcpy(&p->fds[newfd], &p->fds[oldfd], sizeof(LinuxFd));
-    p->fds[newfd].flags &= ~L_FD_CLOEXEC;
-    retain_dup_backend(&p->fds[newfd]);
-    return newfd;
+    return -16;   // -EBUSY: lost the race for the slot eight times (satoru)
 }
 
 int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint64_t arg) {
@@ -10680,72 +14331,34 @@ int32_t LinuxSyscall::sys_ioctl(int fd, uint32_t cmd, uint64_t arg) {
         }
     }
 
-    // the console fds are the slave side of a tty: termios, window size, foreground
-    // process group and friends. with no kpty session these answer with a cooked
-    // 80x25 default (so isatty() and tcgetattr() work), writes are accepted. (satoru)
+    // the console fds are the slave side of the old single-session tty (kurono.pty=0) or, with no
+    // session, a cooked 80x25 default (so isatty() and tcgetattr() work, writes are accepted).
+    // a pty fd (master or slave) goes to the same tty ioctl code with its own pair. (satoru)
     if (lfd->type == LFD_CONSOLE) {
-        switch (cmd) {
-        case 0x5401u: {                           // TCGETS
-            KTermios t;
-            if (Kpty::Active()) Kpty::GetTermios(&t); else Kpty::DefaultTermios(&t);
-            if (!arg || UAccess::CopyToUser(arg, &t, sizeof(t)) != 0) return -14;
+        int32_t r = tty_ioctl(p, lfd, Kpty::Active() ? Kpty::LEGACY : -1, false, cmd, arg);
+        if (r != -25) return r;
+    } else if (lfd_is_pty(lfd)) {
+        if (cmd == 0x5421u) {                      // FIONBIO
+            uint32_t v = 0;
+            if (arg && p->task) read_user_u32(p->task, arg, &v);
+            if (v) lfd->flags |= L_O_NONBLOCK; else lfd->flags &= ~(uint32_t)L_O_NONBLOCK;
             return 0;
         }
-        case 0x5402u: case 0x5403u: case 0x5404u: {   // TCSETS / TCSETSW / TCSETSF
-            KTermios t;
-            if (!arg || UAccess::CopyFromUser(&t, arg, sizeof(t)) != 0) return -14;
-            if (Kpty::Active()) Kpty::SetTermios(&t, cmd == 0x5404u ? 2 : (cmd == 0x5403u ? 1 : 0));
-            return 0;
+        int32_t pr = tty_ioctl(p, lfd, lfd->backend_fd, lfd->type == LFD_PTY_MASTER, cmd, arg);
+        if (pr < 0 && g_ptytrace) {   // kurono.ptytrace=1: failing tty ioctls (satoru)
+            static uint32_t pn = 0;
+            if (pn++ < 80) {
+                SerialLogger::Log("[pty] ioctl pid="); SerialLogger::LogDec((int)p->pid);
+                SerialLogger::Log(" cmd="); SerialLogger::LogHex(cmd);
+                SerialLogger::Log(" ret="); SerialLogger::LogDec(pr);
+                SerialLogger::Log(" sid="); SerialLogger::LogDec((int)p->sid);
+                SerialLogger::Log(" pgid="); SerialLogger::LogDec((int)p->pgid);
+                SerialLogger::Log(" ttysid="); SerialLogger::LogDec(Kpty::SessionOf(lfd->backend_fd));
+                SerialLogger::Log(" fg="); SerialLogger::LogDec(Kpty::ForegroundPgrp(lfd->backend_fd));
+                SerialLogger::Log("\r\n");
+            }
         }
-        case 0x5413u: {                           // TIOCGWINSZ
-            KWinsize w = { 25, 80, 0, 0 };
-            if (Kpty::Active()) Kpty::GetWinsize(&w);
-            if (!arg || UAccess::CopyToUser(arg, &w, sizeof(w)) != 0) return -14;
-            return 0;
-        }
-        case 0x5414u: {                           // TIOCSWINSZ
-            KWinsize w;
-            if (!arg || UAccess::CopyFromUser(&w, arg, sizeof(w)) != 0) return -14;
-            if (Kpty::Active()) Kpty::SetWinsize(&w);
-            return 0;
-        }
-        case 0x540Fu: {                           // TIOCGPGRP
-            int32_t pg = Kpty::Active() ? Kpty::ForegroundPgrp() : 0;
-            if (pg <= 0) pg = (int32_t)p->pgid;
-            if (!arg || UAccess::CopyToUser(arg, &pg, sizeof(pg)) != 0) return -14;
-            return 0;
-        }
-        case 0x5410u: {                           // TIOCSPGRP
-            int32_t pg = 0;
-            if (!arg || UAccess::CopyFromUser(&pg, arg, sizeof(pg)) != 0) return -14;
-            if (pg <= 0) return -22;
-            if (Kpty::Active()) Kpty::SetForegroundPgrp(pg);
-            return 0;
-        }
-        case 0x5429u: {                           // TIOCGSID
-            int32_t sid = (int32_t)p->sid;
-            if (!arg || UAccess::CopyToUser(arg, &sid, sizeof(sid)) != 0) return -14;
-            return 0;
-        }
-        case 0x541Bu: {                           // FIONREAD / TIOCINQ
-            int32_t n = Kpty::Active() ? Kpty::SlaveAvail() : 0;
-            if (!arg || UAccess::CopyToUser(arg, &n, sizeof(n)) != 0) return -14;
-            return 0;
-        }
-        case 0x5411u: case 0x5424u: {             // TIOCOUTQ / TIOCGETD
-            int32_t z = 0;
-            if (arg) UAccess::CopyToUser(arg, &z, sizeof(z));
-            return 0;
-        }
-        case 0x540Bu:                             // TCFLSH: 0 input, 1 output, 2 both
-            if (Kpty::Active() && (arg == 0 || arg == 2)) Kpty::FlushInput();
-            return 0;
-        case 0x540Eu: case 0x5422u:               // TIOCSCTTY / TIOCNOTTY
-        case 0x5409u: case 0x540Au:               // TCSBRK / TCXONC
-        case 0x5450u: case 0x5451u:               // FIONCLEX / FIOCLEX
-            return 0;
-        default: break;
-        }
+        return pr;
     }
 
     // FIONREAD: bytes available to read without blocking. firefox's wayland
@@ -10826,6 +14439,8 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             uint64_t vbase = choose_mmap_base(task, addr, msize);
             if (!vbase) return -12;
             uint64_t pflags = page_flags_from_prot(prot);
+            // MAP_SHARED (0x01): mark the ptes so fork keeps them shared. (satoru)
+            if (flags & 0x01) pflags |= PTE_SHARED;
             uint64_t phys0 = (uint64_t)(uintptr_t)shm->base + offset;
             // phase-0: is firefox mapping a memfd executable, and is this a
             // second (dual-map) view of one memfd? this is the disambiguator
@@ -10846,7 +14461,11 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                 // instead of freeing the object's live backing. without this,
                 // remapping after an unmap read REUSED frames = garbage in the
                 // shared string/font maps (the AssignLiteral MOZ_CRASH). (satoru)
-                if (SMP::OnlineCount() > 1) PMM::RetainFrame(phys0 + o);
+                // always, not only with other cores online: the single-cpu
+                // munmap and exit teardown now free nx leaves too (they were
+                // silently skipped, which is the only reason the borrowed view
+                // never freed the object's backing there). (satoru)
+                PMM::RetainFrame(phys0 + o);
             }
             // tracked so munmap works; not demand-zero (pages already mapped). (satoru)
             add_region(task, vbase, vbase + msize, pflags, USER_REGION_MMAP);
@@ -10855,6 +14474,7 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                     KernelVMM::InvalidatePage(vbase + o);
             }
             task->next_mmap_base = vbase + msize;
+            if (ff_is_firefox(task)) remap_note(4, task->address_space, vbase, msize);
             return (int64_t)vbase;
         }
 
@@ -10957,12 +14577,15 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
                 // task 32: remember what file/offset backs this reservation so a
                 // later MAP_FIXED overlay of the same bytes can skip the copy. (satoru)
                 if (nr) { nr->file_node = (const void*)node; nr->file_off_base = offset; }
+                // silent census module map: the whole-image map of every .so (satoru)
+                if (offset == 0 && msize > 0x10000) NoteModule(task->address_space, vbase, msize, lfd->path);
                 task->next_mmap_base = vbase + msize;
             } else {
                 // smp: the overlay REPLACED live translations - flush the other
                 // cores so a sibling can't keep writing the displaced frames. (satoru)
                 SMP::BroadcastTlbFlush();
             }
+            if (ff_is_firefox(task)) remap_note(fixed ? 5 : 4, task->address_space, vbase, msize);
             return (int64_t)vbase;
         }
 
@@ -11027,10 +14650,17 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
             // is (splitting it is what caused the desync). (satoru)
             if (!region_overlaps(task, fbase, fbase + size))
                 add_region(task, fbase, fbase + size, page_flags, USER_REGION_MMAP);
-            if (task->next_mmap_base < fbase + size) task->next_mmap_base = fbase + size;
+            // a fixed map inside the brk window must not drag the arena there:
+            // musl's malloc puts a MAP_FIXED guard page at the initial break, and
+            // that bump placed every later library and anonymous map inside the
+            // 256 mb heap window, right where brk grows - the heap then grew over
+            // libstdc++ (firefox died on heavy sites). (satoru)
+            bool in_brk_win = proc && fbase < proc->brk_max && fbase + size > proc->brk_base;
+            if (!in_brk_win && task->next_mmap_base < fbase + size) task->next_mmap_base = fbase + size;
             // smp: the fixed overlay replaced live translations - flush the other
             // cores so a sibling can't keep using the displaced frames. (satoru)
             SMP::BroadcastTlbFlush();
+            if (ff_is_firefox(task)) remap_note(5, task->address_space, fbase, size);
             return (int64_t)fbase;
         }
     }
@@ -11054,6 +14684,7 @@ int64_t LinuxSyscall::sys_mmap(uintptr_t addr, uint64_t length, uint32_t prot,
     }
 
     task->next_mmap_base = base + size;
+    if (ff_is_firefox(task)) remap_note(4, task->address_space, base, size);
     // base may sit above 4gb; return the full 64-bit address (satoru)
     return (int64_t)base;
 }
@@ -11081,14 +14712,15 @@ int32_t LinuxSyscall::sys_munmap(uintptr_t addr, uint64_t length) {
     task = region_owner(task);
 
     // task 21 remap ring: silent record (serial here was a heisen-fix). (satoru)
-    if (ff_is_firefox(task)) remap_note(1, (uint64_t)addr, length);
+    if (ff_is_firefox(task)) remap_note(1, task->address_space, (uint64_t)addr, length);
 
     uint64_t start = align_down_u64(addr, PAGE_SIZE);
     uint64_t end = align_up_u64((uint64_t)addr + length, PAGE_SIZE);
     bool unmapped = false;
 
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        UserMemoryRegion* region = &task->regions[i];
+    RegionExt* rx = rext_find(task);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        UserMemoryRegion* region = region_at(task, rx, i);
         if (!region->active) continue;
 
         uint64_t overlap_start = start > region->start ? start : region->start;
@@ -11188,7 +14820,7 @@ int32_t LinuxSyscall::sys_madvise(uintptr_t addr, uint64_t length, uint32_t advi
     {
         LinuxProcess* _rp = Current();
         if (_rp && _rp->task && ff_is_firefox(_rp->task))
-            remap_note(2, (uint64_t)addr, length);
+            remap_note(2, _rp->task->address_space, (uint64_t)addr, length);
     }
     if (length == 0) return 0;
     // linux abi: addr MUST be page-aligned - do_madvise returns EINVAL
@@ -11219,8 +14851,9 @@ int32_t LinuxSyscall::sys_madvise(uintptr_t addr, uint64_t length, uint32_t advi
     // AND never remaps, so no shootdown is needed and no core can go stale. cost:
     // rss is not reclaimed (no swap here anyway). gated so it can be a/b'd. (satoru)
     extern bool g_madv_lazy;
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        UserMemoryRegion* region = &task->regions[i];
+    RegionExt* rx = rext_find(task);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        UserMemoryRegion* region = region_at(task, rx, i);
         if (!region->active) continue;
         if (!(region->flags & USER_REGION_DEMAND_ZERO)) continue;   // anon only (satoru)
         uint64_t os = start > region->start ? start : region->start;
@@ -11286,6 +14919,7 @@ int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t pro
     if (end > USER_SPACE_TOP + 1) return -22;      // outside the user half
 
     uint64_t new_flags = page_flags_from_prot(prot);
+    if (ff_is_firefox(task)) remap_note(3, task->address_space, addr, length);
 
     // phase-0 measurement: time firefox RW->RX flips (prot = R+X, executable and
     // non-writable = the classic W^X JIT protect). a large count with big
@@ -11302,8 +14936,9 @@ int32_t LinuxSyscall::sys_mprotect(uintptr_t addr, uint64_t length, uint32_t pro
     // [start,end) (empty overlap -> skipped on re-scan) and a covered slot we
     // create already carries new_flags (re-stamp is idempotent). (satoru)
     bool covered_any = false;
-    for (int i = 0; i < PROCESS_MAX_USER_REGIONS; i++) {
-        UserMemoryRegion* region = &task->regions[i];
+    RegionExt* rx = rext_find(task);
+    for (int i = 0, rn = region_limit(rx); i < rn; i++) {
+        UserMemoryRegion* region = region_at(task, rx, i);
         if (!region->active) continue;
 
         uint64_t os = start > region->start ? start : region->start;
@@ -11438,7 +15073,7 @@ int32_t LinuxSyscall::SleepMs64(uint64_t ms) {
         Scheduler::StateUnlock(sf);
         task->user_frame.rax = 0;           // resume value of nanosleep (satoru)
         if (switch_to_ready_user(current_syscall_frame)) return 0;
-        if (SMP::CpuIndex() != 0 && task->is_thread()) {
+        if (SMP::CpuIndex() != 0 && Scheduler::ApResumable(task)) {
             // same commit protocol as the futex park: only park if still
             // Blocked (a promotion may have raced us back to Ready/Running). (satoru)
             bool park_ok = false;
@@ -11453,7 +15088,7 @@ int32_t LinuxSyscall::SleepMs64(uint64_t ms) {
                 Scheduler::StateUnlock(sf2);
             }
             if (park_ok) {
-                __atomic_store_n(&task->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+                Scheduler::ReleaseOnCpu(task);   // sched=2 defers until off this stack (satoru)
                 SMP::ApIdleFrame(current_syscall_frame);
                 current_frame_rewritten = true;
                 g_sleep_parked++;   // forensics (satoru)
@@ -11483,14 +15118,153 @@ int32_t LinuxSyscall::SleepMs64(uint64_t ms) {
     return 0;
 }
 
+// one dirent for the synthesized /proc directories. returns its record length,
+// or 0 when the caller's buffer is full. (satoru)
+static int proc_put_dirent(uint8_t* buf, uint32_t pos, uint64_t count,
+                           const char* name, uint8_t type, uint64_t ino, uint64_t off) {
+    int nl = ls_slen(name);
+    if (nl > 255) nl = 255;
+    uint16_t reclen = (uint16_t)(19 + nl + 1 + 7) & ~7;
+    if (pos + reclen > count) return 0;
+    LinuxDirent64* de = (LinuxDirent64*)(buf + pos);
+    de->d_ino = ino;
+    de->d_type = type;
+    memcpy(de->d_name, name, nl);
+    de->d_name[nl] = 0;
+    de->d_reclen = reclen;
+    de->d_off = off;
+    return reclen;
+}
+
+// synthesized numeric /proc tree: /proc, /proc/<pid>, /proc/<pid>/task and
+// /proc/<pid>/task/<tid>. every other path still lists kvfs. (satoru)
+static int proc_getdents_lfd(LinuxFd* lfd, uint8_t* buf, uint64_t count) {
+    const char* pp = lfd->path;
+    if (ls_starts(pp, "/system/proc")) pp += 7;
+
+    // root: kvfs static children first, then one directory per process. (satoru)
+    if (ls_seq(pp, "/proc") || ls_seq(pp, "/proc/")) {
+        KVFSNode* node = KVFS::Resolve("/system/proc");
+        int static_n = (node && node->is_dir()) ? node->child_count : 0;
+        uint32_t pids[LINUX_MAX_PROCS + 64];
+        int np = 0;
+        for (int i = 0; i < LINUX_MAX_PROCS && np < LINUX_MAX_PROCS; i++) {
+            LinuxProcess* q = LinuxSyscall::GetProcess(i);
+            if (!q || !q->active || q->exited) continue;
+            if (q->task && q->task->is_thread()) continue;   // threads live under /proc/<pid>/task
+            pids[np++] = q->pid;
+        }
+        uint32_t kp[64];
+        int nk = Scheduler::CollectKernelTaskPids(kp, 64);
+        for (int i = 0; i < nk && np < LINUX_MAX_PROCS + 63; i++) pids[np++] = proc_display_pid(kp[i]);
+
+        int total = static_n + np;
+        int idx = (int)lfd->offset;
+        uint32_t pos = 0;
+        while (idx < total && pos + 280 < count) {
+            if (idx < static_n) {
+                KVFSNode* child = node->children[idx];
+                if (!child) { idx++; lfd->offset = (uint64_t)idx; continue; }
+                uint8_t ty = child->is_dir() ? 4 : child->type == KVFS_SYMLINK ? 10 :
+                             child->type == KVFS_DEVICE ? 2 : child->type == KVFS_PIPE ? 1 : 8;
+                int rl = proc_put_dirent(buf, pos, count, child->name, ty,
+                                         (uint64_t)(uintptr_t)child, (uint64_t)(idx + 1));
+                if (!rl) break;
+                pos += (uint32_t)rl;
+            } else {
+                char nb[16];
+                { int v = (int)pids[idx - static_n], n = 0; char t[16];
+                  if (v == 0) t[n++] = '0';
+                  while (v > 0) { t[n++] = (char)('0' + v % 10); v /= 10; }
+                  int k = 0; while (n > 0) nb[k++] = t[--n]; nb[k] = 0; }
+                int rl = proc_put_dirent(buf, pos, count, nb, 4,
+                                         (uint64_t)pids[idx - static_n], (uint64_t)(idx + 1));
+                if (!rl) break;
+                pos += (uint32_t)rl;
+            }
+            idx++;
+            lfd->offset = (uint64_t)idx;
+        }
+        return (int)pos;
+    }
+
+    // find a /task component, so the directory itself can be listed even when
+    // its <tid> child does not resolve as a complete leaf path. (satoru)
+    const char* tpos = nullptr;
+    for (const char* q = pp; *q; q++) {
+        if (ls_starts(q, "/task") && (q[5] == 0 || q[5] == '/')) tpos = q;
+    }
+    if (tpos && (tpos[5] == 0 || (tpos[5] == '/' && tpos[6] == 0))) {
+        char base[256];
+        int bl = (int)(tpos - pp);
+        if (bl <= 0 || bl >= (int)sizeof(base)) return 0;
+        memcpy(base, pp, (size_t)bl); base[bl] = 0;
+        ProcRef ref;
+        if (!proc_resolve(base, LinuxSyscall::Current(), &ref)) return 0;
+        uint32_t tids[LINUX_MAX_PROCS];
+        int nt = 0;
+        if (ref.kernel) {
+            tids[nt++] = ref.top_pid;
+        } else if (ref.lp) {
+            uint32_t gl = proc_group_lpid(ref.lp);
+            for (int i = 0; i < LINUX_MAX_PROCS && nt < LINUX_MAX_PROCS; i++) {
+                LinuxProcess* q = LinuxSyscall::GetProcess(i);
+                if (!q || !q->active || q->exited || !q->task) continue;
+                if (proc_group_lpid(q) != gl) continue;
+                tids[nt++] = q->pid;
+            }
+        }
+        int idx = (int)lfd->offset;
+        uint32_t pos = 0;
+        while (idx < nt && pos + 280 < count) {
+            char nb[16]; int v = (int)tids[idx], n = 0; char t[16];
+            if (v == 0) t[n++] = '0';
+            while (v > 0) { t[n++] = (char)('0' + v % 10); v /= 10; }
+            int k = 0; while (n > 0) nb[k++] = t[--n]; nb[k] = 0;
+            int rl = proc_put_dirent(buf, pos, count, nb, 4, (uint64_t)tids[idx], (uint64_t)(idx + 1));
+            if (!rl) break;
+            pos += (uint32_t)rl;
+            idx++; lfd->offset = (uint64_t)idx;
+        }
+        return (int)pos;
+    }
+
+    ProcRef ref;
+    if (!proc_resolve(pp, LinuxSyscall::Current(), &ref)) return 0;
+    if (!ref.leaf || ref.leaf[0]) return 0;   // a leaf file, not a directory
+
+    int nfiles = (int)(sizeof(k_proc_leaf_files) / sizeof(k_proc_leaf_files[0]));
+    int idx = (int)lfd->offset;
+    uint32_t pos = 0;
+    while (idx < nfiles && pos + 280 < count) {
+        int rl = proc_put_dirent(buf, pos, count, k_proc_leaf_files[idx],
+                                 k_proc_leaf_types[idx],
+                                 (uint64_t)((ref.shown_pid << 8) | (uint32_t)idx),
+                                 (uint64_t)(idx + 1));
+        if (!rl) break;
+        pos += (uint32_t)rl;
+        idx++; lfd->offset = (uint64_t)idx;
+    }
+    return (int)pos;
+}
+
 int32_t LinuxSyscall::sys_getdents64(int fd, uintptr_t dirp, uint64_t count) {
     LinuxProcess* p = Current();
     if (!p || fd < 0 || fd >= LINUX_MAX_FDS || !p->fds[fd].open) return -9;
+
+    // the dirent stream is written straight into the caller's buffer, so a
+    // kernel address here would have the kernel write its own memory on the
+    // process's behalf. the synthesized /proc tree made this path much larger.
+    // (satoru)
+    if (!UAccess::AccessOk(dirp, count)) return -14;   // -EFAULT
 
     LinuxFd* lfd = &p->fds[fd];
     uint8_t* buf = (uint8_t*)dirp;
     uint32_t pos = 0;
 
+    if (lfd->type == LFD_PROC) {
+        return (int32_t)proc_getdents_lfd(lfd, buf, count);
+    }
     if (lfd->type == LFD_KVFS) {
         KVFSNode* node = KVFS::Resolve(lfd->path);
         if (!node || !node->is_dir()) return -20;
@@ -11512,7 +15286,11 @@ int32_t LinuxSyscall::sys_getdents64(int fd, uintptr_t dirp, uint64_t count) {
 
             LinuxDirent64* de = (LinuxDirent64*)(buf + pos);
             de->d_ino = (uint64_t)(uintptr_t)child;
-            de->d_type = child->is_dir() ? 4 : 8;
+            // the real node type: devices and symlinks listed as DT_REG made recursive
+            // searches (ripgrep, grep -r) open /dev/tty, /dev/kshell, /dev/urandom as
+            // plain files and block or read forever. (satoru)
+            de->d_type = child->is_dir() ? 4 : child->type == KVFS_SYMLINK ? 10 :
+                         child->type == KVFS_DEVICE ? 2 : child->type == KVFS_PIPE ? 1 : 8;
             int nl = ls_slen(child->name);
             memcpy(de->d_name, child->name, nl);
             de->d_name[nl] = 0;
@@ -11646,10 +15424,6 @@ int32_t LinuxSyscall::sys_set_thread_area(uintptr_t u_info) {
 
 //  console output capture - read syscall output back into the shell
 
-bool LinuxSyscall::HasConsoleOutput() {
-    return console_head != console_tail;
-}
-
 bool LinuxSyscall::StdinReadable() {
     if (Kpty::Active()) return Kpty::SlaveReadable();
     return stdin_head != stdin_tail;
@@ -11667,19 +15441,6 @@ void LinuxSyscall::SignalGroup(int pgid, int sig) {
     }
 }
 
-int LinuxSyscall::ReadConsoleOutput(char* buf, int max_len) {
-    int read = 0;
-    while (read < max_len && console_head != console_tail) {
-        buf[read++] = console_buf[console_tail];
-        console_tail = (console_tail + 1) % CONSOLE_BUF_SIZE;
-    }
-    return read;
-}
-
-void LinuxSyscall::ClearConsoleOutput() {
-    console_head = 0;
-    console_tail = 0;
-}
 
 //  stdin injection - push data from shell into linux process stdin
 

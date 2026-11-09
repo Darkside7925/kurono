@@ -1,15 +1,18 @@
 #include "claude_host.h"
 #include "../drivers/disklog.h"
 #include "../drivers/serial.h"
+#include "../fs/persist.h"
 #include "../drivers/timer.h"
 #include "../fs/kvfs.h"
 #include "../kernel/pmm.h"
+#include "../kernel/heap.h"   // IsValidBlock: borrowed image vs heap copy (satoru)
 #include "../kernel/userspace.h"
 #include "../linux/ld_kurono.h"
 #include "../linux/linux_syscall.h"
 #include "../proc/scheduler.h"
 #include "claude_shim.inc"
 #include "claude_cabundle.inc"
+#include "claude_skill.inc"
 
 extern "C" uint8_t kernel_start;
 extern "C" uint8_t kernel_end;
@@ -19,7 +22,15 @@ extern "C" uint8_t kernel_end;
 // (WriteFileStatic), the same trick the embedded blobs use. (satoru)
 
 namespace {
-    const char* const CLAUDE_PATH = "/usr/bin/claude";
+    // the vfs path the binary lives at, and the one /proc/self/exe reports. it
+    // must be a path a linux program can open back: guest /usr/bin/x is
+    // translated to vfs /system/bin/x, so a binary registered at vfs
+    // /usr/bin/claude reported an exe path that resolved nowhere. claude code
+    // runs its embedded ripgrep by exec'ing process.execPath with argv0 "rg",
+    // so every rg call (Grep, Glob, the file index) died at execve with exit
+    // 127. /system/bin passes through untranslated, and guest /usr/bin/claude
+    // and /bin/claude land on it too. (satoru)
+    const char* const CLAUDE_PATH = "/system/bin/claude";
     // fat 8.3 root entry name, space padded. a windows copy of a file called
     // "claude" with no extension lands here. (satoru)
     const char CLAUDE_83[11] = { 'C','L','A','U','D','E',' ',' ',' ',' ',' ' };
@@ -66,14 +77,37 @@ namespace {
     }
 }
 
+void ClaudeHost::AdoptImage(uint8_t* buf, uint64_t len) {
+    g_image = buf;
+    g_image_len = len;
+}
+
 bool ClaudeHost::EnsureLoaded(char* msg, int msgmax) {
     if (g_image && KVFS::Exists(CLAUDE_PATH)) { put(msg, msgmax, "ok"); return true; }
+    // a copy installed by `kpkg install claude` (downloaded from anthropic and
+    // sha256-checked at install time) comes first. after a reboot it is brought
+    // back from the persistent volume into one pmm block, no heap copy. (satoru)
+    {
+        const uint8_t* img = nullptr;
+        uint64_t ilen = 0;
+        if (PersistStore::ClaudeImage(&img, &ilen, true) && img && ilen >= 4096 &&
+            img[0] == 0x7F && img[1] == 'E' && img[2] == 'L' && img[3] == 'F') {
+            KVFS::Mkdirs("/system/bin");
+            if (KVFS::WriteFileStatic(CLAUDE_PATH, img, (uint32_t)ilen) == 0) {
+                KVFS::Chmod(CLAUDE_PATH, 0755);
+                g_image = (uint8_t*)img; g_image_len = ilen;
+                SerialLogger::Log("[claude] using the kpkg-installed copy (/opt/claude)\r\n");
+                put(msg, msgmax, "ok");
+                return true;
+            }
+        }
+    }
     uint64_t sz = 0;
     int rc = DiskLog::StatRootFile(CLAUDE_83, &sz);
     if (rc != 0) {
         char buf[200];
         int n = 0;
-        const char* a = "claude: cannot open CLAUDE on the KURONO partition: ";
+        const char* a = "claude: not installed (run: kpkg install claude). no CLAUDE file on the KURONO partition either: ";
         while (a[n] && n < 120) { buf[n] = a[n]; n++; }
         const char* r = DiskLog::RootFileMsg(rc);
         for (int k = 0; r[k] && n < 198; k++) buf[n++] = r[k];
@@ -106,10 +140,10 @@ bool ClaudeHost::EnsureLoaded(char* msg, int msgmax) {
         put(msg, msgmax, "claude: CLAUDE is not an ELF file (wrong file copied?)");
         return false;
     }
-    KVFS::Mkdirs("/usr/bin");
+    KVFS::Mkdirs("/system/bin");
     if (KVFS::WriteFileStatic(CLAUDE_PATH, buf, (uint32_t)sz) != 0) {
         PMM::FreeBytes(buf, (size_t)alloc);
-        put(msg, msgmax, "claude: could not register /usr/bin/claude in the vfs");
+        put(msg, msgmax, "claude: could not register /system/bin/claude in the vfs");
         return false;
     }
     KVFS::Chmod(CLAUDE_PATH, 0755);
@@ -123,9 +157,13 @@ bool ClaudeHost::EnsureLoaded(char* msg, int msgmax) {
 
 int ClaudeHost::Run(const char* args_line, const char* env_extra, char* msg, int msgmax) {
     if (!Userspace::IsReady()) Userspace::Init();
+    // the kurono skill: how to inspect and repair this machine. it is ours, not the user's, so
+    // it is rewritten every launch to stay current; vfs only, never a disk. (satoru)
+    KVFS::Mkdirs("/home/user/.claude/skills/kurono");
+    KVFS::WriteFileStatic("/home/user/.claude/skills/kurono/SKILL.md", (const uint8_t*)kKuronoSkill, (uint32_t)(sizeof(kKuronoSkill) - 1));
     if (!EnsureLoaded(msg, msgmax)) return -10;
     KVFSNode* node = KVFS::Resolve(CLAUDE_PATH);
-    if (!node || !node->content || node->size < 4096) { put(msg, msgmax, "claude: /usr/bin/claude has no content"); return -11; }
+    if (!node || !node->content || node->size < 4096) { put(msg, msgmax, "claude: /system/bin/claude has no content"); return -11; }
 
     // claude is an ET_EXEC at a fixed low address. the kernel is identity mapped
     // and runs on the process's own page tables, so a user image that overlays the
@@ -194,7 +232,8 @@ int ClaudeHost::Run(const char* args_line, const char* env_extra, char* msg, int
             "- Tools: `/system/bin` has busybox plus disk tools (ntfs tools, e2fsprogs, dosfstools, testdisk, photorec, chntpw). Run `ls /system/bin`.\n"
             "- Disks show up as `/dev/sda`, `/dev/nvme0n1p2` and so on.\n"
             "- Your home is `/home/user`. It is saved across reboots when a KURONO partition is present.\n"
-            "- Kurono's own desktop terminal commands (`audio`, `nic`, `recovery`, `kpkg`, `help`) belong to its built-in shell. They do not exist in your Bash tool.\n\n"
+            "- Kurono's own desktop terminal commands (`audio`, `nic`, `recovery`, `kpkg`, `help`) belong to its built-in shell. They do not exist in your Bash tool.\n"
+            "- To inspect or repair Kurono itself (drivers, logs, hardware, network, audio), use the `kurono` skill at `/home/user/.claude/skills/kurono/SKILL.md`. It explains `kdrv` and `ksys`, which you reach through `/dev/kshell`.\n\n"
             "## Rules on this machine\n\n"
             "On real hardware a write guard blocks disk writes outside the KURONO partition, so a failed write to a disk may be that guard rather than a bad disk. Say so instead of retrying. "
             "Some syscalls and /proc and /sys entries are missing or partial, so if a normal Linux command misbehaves, consider that Kurono may not implement it yet.\n";
@@ -241,7 +280,11 @@ int ClaudeHost::Run(const char* args_line, const char* env_extra, char* msg, int
     Process* proc = Scheduler::CreateUserProcess("claude", 0, 1);
     if (!proc) { put(msg, msgmax, "claude: CreateUserProcess failed"); return -12; }
     uint64_t entry = 0, rsp = 0;
-    if (!LdKurono::ExecPIE(proc, node->content, node->size, CLAUDE_PATH, av, ev, 0, 0, &entry, &rsp)) {
+    // /system/bin/claude is always WriteFileStatic (borrowed, content_capacity
+    // 0), so the loader can parse and map from it directly; copying 300 mb per
+    // tool-search child is what made concurrent Glob/Grep runs exhaust memory. (satoru)
+    bool persistent = node->content_capacity == 0 && !KernelHeap::IsValidBlock(node->content);
+    if (!LdKurono::ExecPIE(proc, node->content, node->size, CLAUDE_PATH, av, ev, 0, 0, &entry, &rsp, persistent)) {
         Scheduler::DestroyProcess(proc);
         put(msg, msgmax, "claude: ld-kurono could not map the binary (see serial)");
         return -13;
@@ -254,7 +297,7 @@ int ClaudeHost::Run(const char* args_line, const char* env_extra, char* msg, int
     // start in the home directory (claude refuses to trust "/" by default); the linux
     // process is created inside RunProcessWithArgs and takes this once. (satoru)
     LinuxSyscall::SetNextProcessCwd("/home/user");
-    int rc = Userspace::RunProcessWithArgs(proc, av, ev);
+    int rc = Userspace::RunProcessWithArgs(proc, av, ev, 1000, 1000);   // user program, not root (satoru)
     LinuxSyscall::SetNextProcessCwd("");
     Scheduler::DestroyProcess(proc);
     put(msg, msgmax, "ok");

@@ -120,6 +120,8 @@ public:
     static uint32_t FrameCount();
 
     static bool IsRegistered();
+    // vpci is rebuilt for every vm, so the device must register again (satoru)
+    static void ForgetRegistration() { registered = false; }
 
 private:
     static VPCIDevice         dev;

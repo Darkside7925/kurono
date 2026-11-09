@@ -92,6 +92,110 @@
 #define USB_HID_NONE       0
 #define USB_HID_KEYBOARD   1
 #define USB_HID_MOUSE      2
+#define USB_HID_HUB        3
+
+// usb hub class (usb 2.0 chapter 11, usb 3.x chapter 10) (satoru)
+#define USB_CLASS_HUB             0x09
+#define USB_DESC_HUB              0x29
+#define USB_DESC_HUB_SS           0x2A
+#define USB_HUB_PROTO_FS          0
+#define USB_HUB_PROTO_HS_SINGLE   1
+#define USB_HUB_PROTO_HS_MULTI    2
+#define USB_HUB_PROTO_SS          3
+#define USB_HUB_REQ_SET_DEPTH     0x0C
+#define USB_HUB_REQ_CLEAR_TT      0x08
+#define USB_HUB_REQ_RESET_TT      0x09
+#define USB_HUB_FEAT_C_HUB_LOCAL_POWER 0
+#define USB_HUB_FEAT_C_HUB_OVERCURRENT 1
+#define USB_HUB_FEAT_PORT_ENABLE         1
+#define USB_HUB_FEAT_PORT_RESET          4
+#define USB_HUB_FEAT_PORT_LINK_STATE     5
+#define USB_HUB_FEAT_PORT_POWER          8
+#define USB_HUB_FEAT_C_PORT_CONNECTION   16
+#define USB_HUB_FEAT_C_PORT_ENABLE       17
+#define USB_HUB_FEAT_C_PORT_SUSPEND      18
+#define USB_HUB_FEAT_C_PORT_OVER_CURRENT 19
+#define USB_HUB_FEAT_C_PORT_RESET        20
+#define USB_HUB_FEAT_C_PORT_LINK_STATE   25
+#define USB_HUB_FEAT_C_PORT_CONFIG_ERROR 26
+#define USB_HUB_FEAT_BH_PORT_RESET       28
+#define USB_HUB_FEAT_C_BH_PORT_RESET     29
+#define USB_HUB_PORT_CONNECTION  0x0001
+#define USB_HUB_PORT_ENABLE      0x0002
+#define USB_HUB_PORT_SUSPEND     0x0004
+#define USB_HUB_PORT_OVER_CURRENT 0x0008
+#define USB_HUB_PORT_RESET       0x0010
+#define USB_HUB_PORT_POWER       0x0100
+#define USB_HUB_PORT_LOW_SPEED   0x0200
+#define USB_HUB_PORT_HIGH_SPEED  0x0400
+#define USB_HUB_PORT_LINK_STATE  0x01E0
+#define USB_HUB_SS_PORT_POWER    0x0200
+#define USB_HUB_SS_PORT_SPEED    0x1C00
+#define USB_HUB_PORT_C_CONNECTION  0x0001
+#define USB_HUB_PORT_C_ENABLE      0x0002
+#define USB_HUB_PORT_C_SUSPEND     0x0004
+#define USB_HUB_PORT_C_OVER_CURRENT 0x0008
+#define USB_HUB_PORT_C_RESET       0x0010
+#define USB_HUB_PORT_C_LINK_STATE  0x0040
+#define USB_HUB_PORT_C_CONFIG_ERROR 0x0080
+#define USB_HUB_PORT_C_BH_RESET    0x0020
+#define USB_HUB_SS_LS_U0           0x0000
+// xhci route strings have one 4 bit nibble per tier, so a tier carries at
+// most 15 ports; deeper chains than this cannot be described to the xhc. (satoru)
+#define USB_HUB_MAX_ROUTE_PORTS    15
+#define USB_MAX_HUB_DEPTH          6
+
+// one parsed hid report layout (report protocol decoding) (satoru)
+struct UsbHidField {
+    bool     valid;
+    bool     relative;
+    uint16_t off;        // bit offset inside the report data (after the id byte) (satoru)
+    uint8_t  size;       // bits (satoru)
+    int32_t  lmin;
+    int32_t  lmax;
+};
+
+struct UsbHidLayout {
+    bool        used;
+    uint8_t     id;          // report id, 0 = reports carry no id byte (satoru)
+    uint8_t     kind;        // collection hint: 1 keyboard, 2 mouse (satoru)
+    UsbHidField x, y, wheel;
+    uint16_t    btn_off;
+    uint8_t     btn_count;
+    uint16_t    mod_off;
+    uint8_t     mod_count;
+    uint16_t    key_off;
+    uint16_t    key_count;
+    uint8_t     key_size;
+    bool        has_mouse;
+    bool        has_kbd;
+};
+
+struct xHCI_TRB;   // defined below; the endpoint struct only stores pointers (satoru)
+
+// one interrupt-in endpoint on a device. hid devices may expose several
+// (gaming mice: mouse + macro keyboard, combo keyboards), and a hub's status
+// change endpoint uses the same transport. (satoru)
+struct UsbIntrEp {
+    bool        used;
+    uint8_t     role;        // USB_HID_KEYBOARD / _MOUSE / _HUB (satoru)
+    uint8_t     iface;       // interface number the endpoint belongs to (satoru)
+    uint8_t     ep_addr;     // endpoint address incl. 0x80 in-direction (satoru)
+    uint8_t     ep_id;       // xhci dci / doorbell target (satoru)
+    uint8_t     interval;    // bInterval from the endpoint descriptor (satoru)
+    bool        boot;        // interface offers the boot protocol (satoru)
+
+    xHCI_TRB*   ring;
+    int         idx;
+    bool        cycle;
+    uint8_t*    buf;
+    int         buf_len;
+    bool        armed;
+    UsbHidLayout hid[4];     // report ids parsed from this interface (satoru)
+    int         hid_n;
+};
+
+#define USB_MAX_INTR_EPS   4
 
 // mass-storage class bulk-only transport (bot) constants (satoru)
 #define USB_MSC_CLASS      0x08
@@ -154,9 +258,33 @@ struct USBDeviceInfo {
 struct USBDeviceRuntime {
     bool        in_use;
     uint8_t     slot;
-    uint8_t     port;
+    uint8_t     port;              // root hub port, 0 based (satoru)
     uint8_t     speed;
     uint8_t     hid_type;          // USB_HID_KEYBOARD / _MOUSE / _NONE (satoru)
+
+    // topology: devices live on a root port or behind a hub port. route is the
+    // xhci route string (one 4 bit hub port nibble per tier), depth 1 = root
+    // port, parent is the runtime index of the parent hub (0xff = root). (satoru)
+    uint8_t     depth;
+    uint8_t     parent;
+    uint8_t     parent_port;       // 1 based port on the parent hub (satoru)
+    uint32_t    route;
+    uint8_t     tt_hub_slot;       // transaction translator hub slot id, 0 = none (satoru)
+    uint8_t     tt_port;           // 1 based port on the tt hub (satoru)
+    bool        tt_mtt;            // multi-tt hub: mtt bit in the slot context (satoru)
+
+    // hub state (valid while is_hub) (satoru)
+    bool        is_hub;
+    bool        hub_ss;            // superspeed hub (usb 3 protocol) (satoru)
+    bool        hub_multi_tt;
+    uint8_t     hub_ports;
+    uint8_t     hub_ttt;           // tt think time index 0..3 (satoru)
+    uint16_t    hub_chars;         // wHubCharacteristics (satoru)
+    uint16_t    hub_pwr_good;      // bPwrOn2PwrGood, in 2 ms units (satoru)
+    uint32_t    hub_pending;       // bitmap of ports with a pending change, bit n = port n (satoru)
+    bool        hub_hub_status;    // the hub itself has a status change pending (satoru)
+    bool        hub_dirty;         // needs a service pass in PollOne (satoru)
+    uint32_t    hub_next_poll;     // ms of the next fallback port scan (satoru)
 
     // device context (output) + input context (for address/config commands).
     // xhci writes the device context; we own the input context. each is a
@@ -170,15 +298,9 @@ struct USBDeviceRuntime {
     bool        ep0_cycle;
 
     // interrupt-in transfer ring + its completion buffer.
-    xHCI_TRB*   intr_ring;
-    int         intr_idx;
-    bool        intr_cycle;
-    uint8_t*    intr_buf;
-    int         intr_buf_len;      // bytes we re-arm per interrupt transfer (satoru)
-    uint8_t     intr_ep_addr;      // endpoint address incl. 0x80 in-direction (satoru)
-    uint8_t     intr_ep_id;        // xhci dci / doorbell target (satoru)
-    uint8_t     intr_interval;     // bInterval from the endpoint descriptor (satoru)
-    bool        intr_armed;        // a Normal trb is queued and awaiting completion (satoru)
+    // one entry per hid interface or hub status endpoint. (satoru)
+    UsbIntrEp   intr[USB_MAX_INTR_EPS];
+    uint8_t     n_intr;
 
     // bulk in/out endpoint state for mass-storage (bot) devices. rings are
     // allocated only when the config descriptor exposes a bulk pair. (satoru)
@@ -250,6 +372,7 @@ struct XhciState {
     uint16_t pci_vid, pci_did;
     uint32_t intr_done[USB_MAX_DEVICES];   // interrupt-in transfers that completed (kbdiag) (satoru)
     uint32_t intr_err[USB_MAX_DEVICES];
+    uint32_t root_pending;                 // root ports with a status change seen inside a wait (satoru)
 };
 
 // what the usb audio class driver needs to know about one isoch endpoint (satoru)
@@ -348,6 +471,10 @@ public:
     typedef void (*AudioServiceFn)();
     static void SetAudioHooks(IsoEventFn ev, AudioAttachFn att, AudioServiceFn svc);
 
+    // hid report-layout parser self test (kurono.usbtest=1): boot keyboard,
+    // absolute tablet and a report-id high-dpi mouse. (satoru)
+    static bool SelfTest();
+
     // one-shot [kbdiag] line group: usb keyboards bound + interrupt completions (satoru)
     static void LogKbDiag();
     // [usbports] every controller, every port, raw portsc, even when empty (satoru)
@@ -385,18 +512,41 @@ private:
     // enumeration / configuration helpers (satoru)
     static bool AddressDevice(int idx);
     static bool ConfigureDevice(int idx, const uint8_t* dev_desc);
+    static bool EnumerateDeviceAt(int root_port, uint32_t route, uint8_t depth,
+                                  uint8_t parent, uint8_t parent_port, uint8_t speed);
     static bool EnumeratePort(int port);
     static void TeardownDevice(int idx);
+
+    // hub class (usb 2.0 chapter 11) (satoru)
+    static bool HubStart(int idx);
+    static bool HubReadDescriptor(int idx, const USBDeviceDescriptor* dd);
+    static bool HubGetPortStatus(int idx, uint8_t port, uint16_t* status, uint16_t* change);
+    static bool HubSetPortFeature(int idx, uint8_t port, uint16_t feature);
+    static bool HubClearPortFeature(int idx, uint8_t port, uint16_t feature);
+    static bool HubResetPort(int idx, uint8_t port, uint8_t* out_speed);
+    static bool HubPortBringup(int idx, uint8_t port, uint16_t status);
+    static void HubPortChanged(int idx, uint8_t port);
+    static void HubServiceOne(int idx);
+    static void ServiceHubs();
+    static void DispatchHubReport(int idx, int epi, const uint8_t* report, int len);
+    static void HubClearTt(int idx, uint8_t ep_addr, uint8_t xfer_type);
+    static int  FindHubChild(int hubidx, uint8_t port);
+    static int  FindRootDeviceByPort(uint8_t port);
+
     static int  FindDeviceBySlot(uint8_t slot);
-    static int  FindDeviceByPort(uint8_t port);
 
     // ep0 control + interrupt transfer-ring primitives (satoru)
     static bool ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
                                   uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                                   void* data);
-    static void ArmInterrupt(int idx);
-    static void DispatchReport(int idx, const uint8_t* report, int len);
-    static void ParseReportDescriptor(int idx, const uint8_t* rpt, int len);
+    static void ArmIntrEp(int idx, int epi);
+    static void ArmAllInterrupts(int idx);
+    static void NotePortStatus(const xHCI_TRB& ev);
+    static void ServiceRootPorts();
+    static int  FindIntrEp(int idx, uint8_t ep_id);
+    static void HandleIntrCompletion(int idx, int epi, uint8_t cc, uint32_t residual);
+    static void DispatchHidReport(int idx, int epi, const uint8_t* report, int len);
+    static bool ParseHidLayout(const uint8_t* rpt, int len, UsbHidLayout* out, int* out_n);
 
     // bulk / mass-storage internals (satoru)
     static bool BulkTransferEP(int idx, bool dir_in, void* data, int len,

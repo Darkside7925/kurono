@@ -17,7 +17,7 @@
 #include "../linux/linux_drivers.h"
 #include "../net/network.h"
 #include "../net/tcpip.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
 #include "../packages/pkgmgr.h"
 #include "../kernel/heap.h"
 #include "../system/logging.h"
@@ -31,6 +31,8 @@
 #include "../drivers/timer.h"     // Timer::GetRealMs for tab/modal transitions (satoru)
 #include "../ui/kss.h"            // shared motion tokens (satoru)
 #include "../ui/ui_elements.h"    // Animation easing helpers (satoru)
+#include "../ui/frame_pacer.h"    // refresh rate goes through the pacer (satoru)
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
 
 static const unsigned int S_BG       = 0xFF1A1A2E;
 static const unsigned int S_SIDEBAR  = 0xFF16213E;
@@ -274,8 +276,8 @@ static void DoApplyResolution(int idx) {
     if (fb) memset(fb, 0, (uint32_t)w * h * 4);
 
     // apply the current refresh rate target
-    if (SettingsApp::state.refresh_rate > 0)
-        Graphics::SetTargetFPS((uint32_t)SettingsApp::state.refresh_rate);
+    // the frame pacer owns the rate; a resolution change keeps it. (satoru)
+    Graphics::SetTargetFPS(FramePacer::CurrentHz());
 
     // reinit desktop/taskbar for new screen size + re-scale wallpaper
     Desktop::Init(w, h);
@@ -300,7 +302,7 @@ void SettingsApp::PollDeferredActions() {
 }
 
 static void ApplyRefreshRate(int hz) {
-    if (hz > 0) Graphics::SetTargetFPS((uint32_t)hz);
+    if (hz > 0) FramePacer::SetMode((uint32_t)hz);   // fixed cap through the pacer (satoru)
 }
 
 static const unsigned int kAccentPalette[8] = {
@@ -404,6 +406,7 @@ void SettingsApp::Init(){
 }
 
 int SettingsApp::Open(){
+    TaskMem::AppScope _tms(TaskMem::APP_SETTINGS);   // kurono.taskmem=1: charge to the app (satoru)
     Init();
     RuntimeLog::LogAppEvent("settings", "open");
     int wid = WindowManager::CreateWindow("Settings", -1, -1, 580, 460,
@@ -1562,6 +1565,21 @@ bool SettingsApp::HandlePowerInput(int rx, int ry, int pw, int ph){
 }
 
 //  personalization
+// ui scale helpers: the percent steps the compositor supports. the actual change is
+// requested here and applied by the gui loop (see Graphics::RequestUIScale). (satoru)
+static const int k_ui_steps[4] = {100, 125, 150, 200};
+static int ui_scale_pct(){ return Graphics::GetUIScale(); }
+static void ui_scale_step(int dir){
+    int cur = Graphics::GetUIScale(), idx = 0;
+    for(int i=0;i<4;i++) if(k_ui_steps[i] <= cur) idx = i;
+    idx += dir;
+    if(idx < 0) idx = 0;
+    if(idx > 3) idx = 3;
+    UIConfig::SetInt("display.ui_scale", k_ui_steps[idx], true);
+    UIConfig::Save();
+    Graphics::RequestUIScale(k_ui_steps[idx]);
+}
+
 void SettingsApp::RenderPersonalize(int x,int y,int w,int h){
     (void)h;
     int ly=y+12;
@@ -1629,7 +1647,7 @@ void SettingsApp::RenderPersonalize(int x,int y,int w,int h){
 
     // ui scale
     Graphics::DrawString(x+12,ly,"UI Scale:",S_TEXT,0xFF000000);
-    char fs[8]; int_to_str(state.font_scale,fs,8); sapp(fs,"x",8);
+    char fs[8]; int_to_str(ui_scale_pct(),fs,8); sapp(fs,"%",8);
     Graphics::FillRoundedRect(x+140,ly-2,20,20,4,S_ACCENT);
     Graphics::DrawString(x+144,ly,"<",S_WHITE,0xFF000000);
     Graphics::DrawString(x+168,ly,fs,S_WHITE,0xFF000000);
@@ -1688,10 +1706,10 @@ bool SettingsApp::HandlePersonalizeInput(int rx,int ry,int pw,int ph){
         }
     }
     ly+=28;
-    // font scale
+    // ui scale: whole interface, stepped 100/125/150/200 % (satoru)
     if(ry>=ly && ry<ly+20){
-        if(rx>=140 && rx<160){if(state.font_scale>1)state.font_scale--;return true;}
-        if(rx>=pw-50 && rx<pw-30){if(state.font_scale<3)state.font_scale++;return true;}
+        if(rx>=140 && rx<160){ui_scale_step(-1);return true;}
+        if(rx>=pw-50 && rx<pw-30){ui_scale_step(1);return true;}
     }
     return false;
 }

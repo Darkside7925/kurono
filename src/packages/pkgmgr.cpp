@@ -14,6 +14,13 @@
 #include "../ui/notification.h"
 #include "../drivers/disklog.h"   // FIREFOX.TAR root file install source (satoru)
 #include "../kernel/pmm.h"
+#include "../fs/persist.h"           // claude install: volume store (satoru)
+#include "../kernel/userspace.h"     // kfetch runs as a ring 3 helper (satoru)
+#include "../kernel/elf_loader.h"
+#include "../linux/linux_syscall.h"
+#include "../proc/scheduler.h"
+#include "../system/claude_host.h"
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 frame charges (satoru)
 
 Package PackageManager::packages[PKG_MAX_PACKAGES];
 int PackageManager::package_count = 0;
@@ -769,6 +776,9 @@ static void sha_init(sha256_ctx* c) {
 }
 static void sha_update(sha256_ctx* c, const uint8_t* d, int n) {
     c->bits += (uint64_t)n * 8u;
+    // whole blocks straight from the input: hashing a 330 mb binary one byte at a
+    // time through the staging buffer was the slow part. (satoru)
+    while (n >= 64 && c->buf_len == 0) { sha_compress(c, d); d += 64; n -= 64; }
     while (n > 0) {
         int take = 64 - c->buf_len;
         if (take > n) take = n;
@@ -1429,7 +1439,9 @@ static int ff_local_install() {
     static const char F83[11] = { 'F','I','R','E','F','O','X',' ','T','A','R' };
     uint64_t sz = 0;
     int rc = DiskLog::StatRootFile(F83, &sz);
-    if (rc != 0) {
+    // an empty FIREFOX.TAR counts as absent (StatRootFile now reports empty
+    // files as present), so the network fallback still runs. (satoru)
+    if (rc != 0 || sz == 0) {
         phttp_log_num("firefox: no FIREFOX.TAR on KURONO partition, rc ", rc);
         return 0;
     }
@@ -1439,13 +1451,13 @@ static int ff_local_install() {
     }
     phttp_log_num("firefox: FIREFOX.TAR found, MB ", (int)(sz >> 20));
     uint64_t alloc = (sz + 4095) & ~4095ull;
-    uint8_t* buf = (uint8_t*)PMM::AllocBytes((size_t)alloc);
+    uint8_t* buf = (uint8_t*)PMM::AllocBytes((size_t)alloc); TaskMem::ChargeFrames(buf, (size_t)alloc);
     if (!buf) { pset_sync_message("Not enough free memory to load FIREFOX.TAR."); return -1; }
     uint32_t t0 = Timer::GetTicks();
     phttp_log("firefox: [fftl] FIREFOX.TAR read start");
     rc = DiskLog::ReadRootFile(F83, buf, alloc, nullptr);
     if (rc != 0) {
-        PMM::FreeBytes(buf, (size_t)alloc);
+        TaskMem::UnchargeFrames(buf); PMM::FreeBytes(buf, (size_t)alloc);
         pset_sync_message(DiskLog::RootFileMsg(rc));
         return -1;
     }
@@ -1464,7 +1476,7 @@ static int ff_local_install() {
         if (KuronoShell::IsCommandCancelRequested()) { st.error = true; break; }
     }
     if (st.body) KernelHeap::Free(st.body);
-    PMM::FreeBytes(buf, (size_t)alloc);
+    TaskMem::UnchargeFrames(buf); PMM::FreeBytes(buf, (size_t)alloc);
     if (st.error || !KVFS::Exists("/apps/firefox/firefox")) {
         pset_sync_message("FIREFOX.TAR did not contain a usable firefox/firefox.");
         return -1;
@@ -1738,7 +1750,7 @@ void PackageManager::AddDefaultPackages() {
     add("kurono-desktop",   "1.0.0", "Desktop environment",           "core",    PKG_INSTALLED, 512);
     add("kvfs",             "1.0.0", "Virtual filesystem",            "core",    PKG_INSTALLED, 64);
     add("kcl",              "1.0.0", "Kurono Command Language",       "core",    PKG_INSTALLED, 96);
-    add("supr-security",    "1.0.0", "SUPR security engine",          "core",    PKG_INSTALLED, 48);
+    add("ken-security",    "1.0.0", "KEN security engine",          "core",    PKG_INSTALLED, 48);
     add("linux-bridge",     "1.0.0", "Linux command compatibility",   "compat",  PKG_INSTALLED, 128);
     add("windows-bridge",   "1.0.0", "Windows command compatibility", "compat",  PKG_INSTALLED, 128);
 
@@ -1749,6 +1761,7 @@ void PackageManager::AddDefaultPackages() {
     add("rtc-driver",       "1.0.0", "CMOS RTC driver",               "drivers", PKG_INSTALLED, 8);
     add("serial-driver",    "1.0.0", "COM1 serial driver",            "drivers", PKG_INSTALLED, 8);
 
+    add("claude",           "-",     "Claude Code (Anthropic official release)", "apps", PKG_AVAILABLE, 319000);
     add("calculator",       "1.0.0", "Calculator application",        "apps",    PKG_INSTALLED, 32);
     add("file-browser",     "1.0.0", "File browser application",      "apps",    PKG_INSTALLED, 48);
     add("terminal",         "1.0.0", "Terminal emulator",             "apps",    PKG_INSTALLED, 64);
@@ -1899,7 +1912,497 @@ void PackageManager::Init() {
     SerialLogger::Log("PkgMgr: Initialized\r\n");
 }
 
+// ================= claude code installer ===========================
+// `kpkg install claude` pulls anthropic's own release of claude code straight
+// from anthropic's release storage (downloads.claude.ai), the same way their
+// install.sh does: latest -> manifest.json -> binary, then the sha256 from the
+// manifest must match before anything is installed. NOTHING of claude code is
+// mirrored on a kurono server, bundled in the repo or embedded in the iso.
+// the in-kernel http client is plain http only, so the https transfer is done
+// by /usr/bin/kfetch (ring 3, musl + bearssl, see userprogs/kfetch.c). the
+// kernel owns the memory and the hash: the binary is pulled in 16 mb ranges
+// straight into one physical buffer through a vfs sink node, so there is no
+// heap copy and no 330 mb file ever grows through kvfs. no token, login or
+// credential is read, sent or logged by any of this. (satoru)
+static const char* CL_BASE     = "https://downloads.claude.ai/claude-code-releases";
+static const char* CL_PLATFORM = "linux-x64-musl";   // the libc kurono's launcher runs (satoru)
+static const char* CL_OPT_BIN  = "/opt/claude/claude";
+static const char* CL_RUN_BIN  = "/system/bin/claude";
+static const char* CL_MARKER   = "/etc/kpkg/claude.version";
+static const char* CL_SINK     = "/system/tmp/kpkg-sink";
+static const uint64_t CL_RANGE = 16ull << 20;
+
+static bool g_cl_changed = false;        // the last InstallClaude call really installed something (satoru)
+static uint8_t* g_cl_sink = nullptr;     // physical buffer the sink node fills (satoru)
+static uint64_t g_cl_sink_cap = 0;
+static uint64_t g_cl_sink_base = 0;      // file offset of the range being fetched (satoru)
+static uint64_t g_cl_sink_hi = 0;        // highest byte written + 1 in this range (satoru)
+
+// vfs write hook of the sink node. it runs inside KVFS::Write, so it only
+// copies; progress and ui work happen on the kpkg thread between ranges. (satoru)
+static int cl_sink_write(KVFSNode*, uint32_t off, uint32_t len, const uint8_t* buf) {
+    uint64_t at = g_cl_sink_base + off;
+    if (!g_cl_sink || at + len > g_cl_sink_cap) return KVFS_ERR_NO_MEM;
+    for (uint32_t i = 0; i < len; i++) g_cl_sink[at + i] = buf[i];
+    if (at + len > g_cl_sink_hi) g_cl_sink_hi = at + len;
+    return (int)len;
+}
+
+static void cl_say(const char* s) {
+    SerialLogger::Log("[kpkg] claude: ");
+    SerialLogger::Log(s);
+    SerialLogger::Log("\r\n");
+    char b[220];
+    int n = pa(b, 0, sizeof(b), s);
+    n = pac(b, n, sizeof(b), '\n');
+    KuronoShell::EmitIncrementalRange(b, 0, n);
+}
+
+static void cl_say_mb(const char* what, uint64_t done, uint64_t total) {
+    char b[160];
+    int n = pa(b, 0, sizeof(b), what);
+    n = pai(b, n, sizeof(b), (unsigned int)(done >> 20));
+    n = pa(b, n, sizeof(b), " / ");
+    n = pai(b, n, sizeof(b), (unsigned int)(total >> 20));
+    n = pa(b, n, sizeof(b), " MB (");
+    n = pai(b, n, sizeof(b), total ? (unsigned int)(done * 100 / total) : 0u);
+    n = pa(b, n, sizeof(b), "%)");
+    cl_say(b);
+}
+
+// run /usr/bin/kfetch once. returns its exit code (0 ok), or -1 if it could not
+// start. console output (its only chatter) lands in why for the error message. (satoru)
+static int cl_run_kfetch(const char* range, const char* url, const char* outpath,
+                         char* why, int why_max) {
+    if (why && why_max > 0) why[0] = 0;
+    if (!KVFS::Exists("/usr/bin/kfetch")) return -1;
+    if (!Userspace::IsReady()) Userspace::Init();
+    Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/kfetch", "kfetch");
+    if (!proc) return -1;
+    const char* av[8];
+    int ac = 0;
+    av[ac++] = "kfetch";
+    av[ac++] = "-q";
+    if (range) { av[ac++] = "-r"; av[ac++] = range; }
+    av[ac++] = url;
+    av[ac++] = outpath;
+    av[ac] = nullptr;
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/root", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    if (why && why_max > 1) {
+        int n = LinuxSyscall::ReadConsoleOutput(why, why_max - 1);
+        if (n < 0) n = 0;
+        why[n] = 0;
+        // keep it to one tidy line
+        for (int i = 0; i < n; i++) if (why[i] == '\n' || why[i] == '\r') why[i] = ' ';
+    }
+    Scheduler::DestroyProcess(proc);
+    return rc;
+}
+
+static const char* cl_kfetch_reason(int rc) {
+    switch (rc) {
+        case -1: return "the kfetch helper is not in this build";
+        case 2:  return "kfetch got a bad url";
+        case 3:  return "could not resolve or connect to downloads.claude.ai (is the network up?)";
+        case 4:  return "tls handshake with downloads.claude.ai failed (check the clock)";
+        case 5:  return "downloads.claude.ai answered with an http error";
+        case 6:  return "the download was cut short";
+        default: return "the download helper failed";
+    }
+}
+
+// small text download into buf (nul terminated). returns length or -1. (satoru)
+static int cl_fetch_small(const char* url, char* buf, int max, char* why, int why_max) {
+    static const char* tmp = "/system/tmp/kpkg-claude.txt";
+    KVFS::Mkdirs("/system/tmp");
+    KVFS::Unlink(tmp);
+    int rc = cl_run_kfetch(nullptr, url, tmp, why, why_max);
+    if (rc != 0) { KVFS::Unlink(tmp); pset_sync_message(cl_kfetch_reason(rc)); return -1; }
+    int n = KVFS::ReadFile(tmp, buf, (uint32_t)(max - 1));
+    KVFS::Unlink(tmp);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    return n;
+}
+
+static bool cl_is_version(const char* s) {
+    // ^[0-9]+\.[0-9]+\.[0-9]+ then only url-safe version suffix characters (satoru)
+    int i = 0, parts = 0;
+    while (parts < 3) {
+        int d = 0;
+        while (s[i] >= '0' && s[i] <= '9') { i++; d++; }
+        if (!d) return false;
+        parts++;
+        if (parts < 3) { if (s[i] != '.') return false; i++; }
+    }
+    for (; s[i]; i++) {
+        char c = s[i];
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  c == '.' || c == '-' || c == '+';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// pull "checksum" (64 lowercase hex) and "size" out of platforms[CL_PLATFORM]
+// without a json library: find the platform key, then stay inside its object. (satoru)
+static bool cl_manifest_entry(const char* js, char hex[65], uint64_t* size) {
+    char key[40];
+    int kn = pa(key, 0, sizeof(key), "\"");
+    kn = pa(key, kn, sizeof(key), CL_PLATFORM);
+    kn = pa(key, kn, sizeof(key), "\"");
+    int ki = -1;
+    for (int i = 0; js[i]; i++) {
+        bool m = true;
+        for (int k = 0; k < kn; k++) if (js[i + k] != key[k]) { m = false; break; }
+        if (m) { ki = i + kn; break; }
+    }
+    if (ki < 0) return false;
+    const char* p = js + ki;
+    while (*p && *p != '{') p++;
+    if (*p != '{') return false;
+    const char* end = p;
+    while (*end && *end != '}') end++;
+    hex[0] = 0; *size = 0;
+    for (const char* q = p; q < end; q++) {
+        if (q[0] == '"' && q[1] == 'c' && q[2] == 'h' && q[3] == 'e' && q[4] == 'c' && q[5] == 'k' &&
+            q[6] == 's' && q[7] == 'u' && q[8] == 'm' && q[9] == '"') {
+            const char* v = q + 10;
+            while (v < end && *v != '"') v++;
+            if (v >= end) return false;
+            v++;
+            int n = 0;
+            while (v + n < end && n < 64 && ((v[n] >= '0' && v[n] <= '9') || (v[n] >= 'a' && v[n] <= 'f'))) { hex[n] = v[n]; n++; }
+            if (n != 64 || v[n] != '"') return false;
+            hex[64] = 0;
+        } else if (q[0] == '"' && q[1] == 's' && q[2] == 'i' && q[3] == 'z' && q[4] == 'e' && q[5] == '"') {
+            const char* v = q + 6;
+            while (v < end && (*v == ' ' || *v == ':' || *v == '\t' || *v == '\r' || *v == '\n')) v++;
+            uint64_t s = 0; int d = 0;
+            while (v < end && *v >= '0' && *v <= '9') { s = s * 10 + (uint64_t)(*v - '0'); v++; d++; }
+            if (d) *size = s;
+        }
+    }
+    return hex[0] && *size;
+}
+
+// the marker holds "<version> <sha256> <size>\n". version is what is installed. (satoru)
+static bool cl_read_marker(char ver[16], char hex[65], uint64_t* size) {
+    char b[200];
+    int n = KVFS::ReadFile(CL_MARKER, b, sizeof(b) - 1);
+    if (n <= 0) return false;
+    b[n] = 0;
+    int i = 0, o = 0;
+    while (b[i] && b[i] != ' ' && o < 15) ver[o++] = b[i++];
+    ver[o] = 0;
+    while (b[i] == ' ') i++;
+    o = 0;
+    while (b[i] && b[i] != ' ' && o < 64) hex[o++] = b[i++];
+    hex[o] = 0;
+    while (b[i] == ' ') i++;
+    uint64_t s = 0;
+    while (b[i] >= '0' && b[i] <= '9') { s = s * 10 + (uint64_t)(b[i] - '0'); i++; }
+    *size = s;
+    return ver[0] != 0;
+}
+
+void PackageManager::RefreshClaudeState() {
+    Package* pkg = FindOrCreate("claude");
+    if (!pkg) return;
+    char ver[16], hex[65]; uint64_t sz = 0;
+    if (cl_read_marker(ver, hex, &sz)) {
+        pcpy(pkg->version, ver, (int)sizeof(pkg->version));
+        pcpy(pkg->latest_version, ver, (int)sizeof(pkg->latest_version));
+        pcpy(pkg->sha256, hex, (int)sizeof(pkg->sha256));
+        pkg->state = PKG_INSTALLED;
+    } else if (pkg->state == PKG_INSTALLED) {
+        pkg->state = PKG_AVAILABLE;
+    }
+    pcpy(pkg->description, "Claude Code (Anthropic official release)", PKG_MAX_DESC);
+    pcpy(pkg->category, "apps", (int)sizeof(pkg->category));
+}
+
+bool PackageManager::InstallClaude(const char* channel, bool only_if_newer) {
+    g_cl_changed = false;
+    RefreshClaudeState();
+    if (!channel || !channel[0]) channel = "latest";
+    if (!TCPStack::IsUp()) { pset_sync_message("The network is not up yet; try again in a moment."); return false; }
+    if (!KVFS::Exists("/usr/bin/kfetch")) {
+        pset_sync_message("This build has no kfetch helper (needs musl-gcc at build time).");
+        return false;
+    }
+
+    char why[300];
+    char url[260];
+    char ver[64];
+
+    // 1. which version. a pinned x.y.z skips the lookup, like install.sh. (satoru)
+    if (cl_is_version(channel)) {
+        pcpy(ver, channel, (int)sizeof(ver));
+    } else if (peq(channel, "latest") || peq(channel, "stable")) {
+        cl_say("checking the newest release at downloads.claude.ai ...");
+        int u = pa(url, 0, sizeof(url), CL_BASE);
+        u = pac(url, u, sizeof(url), '/');
+        u = pa(url, u, sizeof(url), channel);
+        char vb[64];
+        int n = cl_fetch_small(url, vb, sizeof(vb), why, sizeof(why));
+        if (n < 0) return false;
+        int a = 0, e = n;
+        while (a < e && (vb[a] == ' ' || vb[a] == '\r' || vb[a] == '\n' || vb[a] == '\t')) a++;
+        while (e > a && (vb[e - 1] == ' ' || vb[e - 1] == '\r' || vb[e - 1] == '\n' || vb[e - 1] == '\t')) e--;
+        if (e - a <= 0 || e - a >= (int)sizeof(ver)) { pset_sync_message("downloads.claude.ai returned no version."); return false; }
+        for (int i = 0; i < e - a; i++) ver[i] = vb[a + i];
+        ver[e - a] = 0;
+        // an html error page or anything else that is not a version stops here (satoru)
+        if (!cl_is_version(ver)) {
+            pset_sync_message("downloads.claude.ai returned something that is not a version number.");
+            return false;
+        }
+    } else {
+        pset_sync_message("Usage: kpkg install claude [latest|stable|X.Y.Z]");
+        return false;
+    }
+
+    // 2. already there?
+    char have_ver[16], have_hex[65]; uint64_t have_sz = 0;
+    bool have = cl_read_marker(have_ver, have_hex, &have_sz) &&
+                PersistStore::ClaudeImage(nullptr, nullptr, false);
+    if (have && peq(have_ver, ver)) {
+        char b[120];
+        int n = pa(b, 0, sizeof(b), "Claude Code ");
+        n = pa(b, n, sizeof(b), ver);
+        n = pa(b, n, sizeof(b), " is already installed and current.");
+        pset_sync_message(b);
+        cl_say(b);
+        return true;
+    }
+    if (only_if_newer && !have) {
+        pset_sync_message("Claude Code is not installed; run: kpkg install claude");
+        return false;
+    }
+    {
+        char b[160];
+        int n = pa(b, 0, sizeof(b), "version ");
+        n = pa(b, n, sizeof(b), ver);
+        if (have) { n = pa(b, n, sizeof(b), " (installed: "); n = pa(b, n, sizeof(b), have_ver); n = pac(b, n, sizeof(b), ')'); }
+        cl_say(b);
+    }
+
+    // 3. manifest: platform entry with the sha256 and the size. (satoru)
+    int u = pa(url, 0, sizeof(url), CL_BASE);
+    u = pac(url, u, sizeof(url), '/');
+    u = pa(url, u, sizeof(url), ver);
+    u = pa(url, u, sizeof(url), "/manifest.json");
+    static char manifest[6000];
+    int mn = cl_fetch_small(url, manifest, sizeof(manifest), why, sizeof(why));
+    if (mn < 0) return false;
+    char want_hex[65]; uint64_t want_size = 0;
+    if (!cl_manifest_entry(manifest, want_hex, &want_size)) {
+        pset_sync_message("The release manifest has no linux-x64-musl entry (or it is malformed).");
+        return false;
+    }
+    if (want_size < (64ull << 20) || want_size > (1024ull << 20)) {
+        pset_sync_message("The manifest size for the binary is implausible; refusing.");
+        return false;
+    }
+    {
+        char b[160];
+        int n = pa(b, 0, sizeof(b), "platform ");
+        n = pa(b, n, sizeof(b), CL_PLATFORM);
+        n = pa(b, n, sizeof(b), ", ");
+        n = pai(b, n, sizeof(b), (unsigned int)(want_size >> 20));
+        n = pa(b, n, sizeof(b), " MB, sha256 ");
+        for (int i = 0; i < 16; i++) n = pac(b, n, sizeof(b), want_hex[i]);
+        n = pa(b, n, sizeof(b), "...");
+        cl_say(b);
+    }
+
+    // 4. one physical buffer for the whole binary, filled range by range. (satoru)
+    uint64_t alloc = (want_size + 4095) & ~4095ull;
+    uint8_t* buf = (uint8_t*)PMM::AllocBytes((size_t)alloc); TaskMem::ChargeFrames(buf, (size_t)alloc);
+    if (!buf) { pset_sync_message("Not enough free memory for the Claude Code binary."); return false; }
+
+    KVFS::Mkdirs("/system/tmp");
+    KVFS::Unlink(CL_SINK);
+    KVFS::CreateFile(CL_SINK);
+    KVFSNode* sink = KVFS::Resolve(CL_SINK);
+    if (!sink) { TaskMem::UnchargeFrames(buf); PMM::FreeBytes(buf, (size_t)alloc); pset_sync_message("Could not create the download sink."); return false; }
+    g_cl_sink = buf; g_cl_sink_cap = want_size; g_cl_sink_base = 0; g_cl_sink_hi = 0;
+    sink->dev_write = cl_sink_write;
+
+    u = pa(url, 0, sizeof(url), CL_BASE);
+    u = pac(url, u, sizeof(url), '/');
+    u = pa(url, u, sizeof(url), ver);
+    u = pac(url, u, sizeof(url), '/');
+    u = pa(url, u, sizeof(url), CL_PLATFORM);
+    u = pa(url, u, sizeof(url), "/claude");
+
+    cl_say("downloading from downloads.claude.ai (https) ...");
+    bool ok = true;
+    uint64_t t0 = Timer::GetRealMs64();
+    uint64_t next_report = 0;
+    for (uint64_t first = 0; first < want_size && ok; first += CL_RANGE) {
+        uint64_t last = first + CL_RANGE - 1;
+        if (last >= want_size) last = want_size - 1;
+        char rng[48];
+        int r = pai(rng, 0, sizeof(rng), (unsigned int)first);
+        r = pac(rng, r, sizeof(rng), '-');
+        r = pai(rng, r, sizeof(rng), (unsigned int)last);
+        int rc = -2;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (KuronoShell::IsCommandCancelRequested()) { rc = -3; break; }
+            g_cl_sink_base = first; g_cl_sink_hi = 0;
+            rc = cl_run_kfetch(rng, url, CL_SINK, why, sizeof(why));
+            if (rc == 0 && g_cl_sink_hi == last + 1) break;
+            if (rc == 0) rc = 6;     // exit 0 but the range did not land whole (satoru)
+            SerialLogger::Log("[kpkg] claude: range failed, retrying: ");
+            SerialLogger::Log(why);
+            SerialLogger::Log("\r\n");
+            if (!g_kpkg_bg_install) KuronoShell::PumpUI();
+        }
+        if (rc != 0) {
+            pset_sync_message(rc == -3 ? "Install interrupted (Ctrl+C)." : cl_kfetch_reason(rc));
+            ok = false;
+            break;
+        }
+        if (first >= next_report || last + 1 == want_size) {
+            cl_say_mb("downloaded ", last + 1, want_size);
+            next_report = first + (48ull << 20);
+        }
+        if (!g_kpkg_bg_install) KuronoShell::PumpUI();
+    }
+    sink->dev_write = nullptr;
+    KVFS::Unlink(CL_SINK);
+    g_cl_sink = nullptr;
+    if (!ok) { TaskMem::UnchargeFrames(buf); PMM::FreeBytes(buf, (size_t)alloc); return false; }
+    {
+        uint64_t ms = Timer::GetRealMs64() - t0;
+        char b[120];
+        int n = pa(b, 0, sizeof(b), "download took ");
+        n = pai(b, n, sizeof(b), (unsigned int)(ms / 1000));
+        n = pa(b, n, sizeof(b), " s");
+        cl_say(b);
+    }
+
+    // 5. verify. the hash is computed here in the kernel over the buffer, not
+    // taken from the helper; a mismatch installs nothing. (satoru)
+    cl_say("verifying sha256 ...");
+    sha256_ctx sc;
+    sha_init(&sc);
+    for (uint64_t off = 0; off < want_size; ) {
+        uint64_t n = want_size - off;
+        if (n > (8ull << 20)) n = 8ull << 20;
+        sha_update(&sc, buf + off, (int)n);
+        off += n;
+        if (!g_kpkg_bg_install) KuronoShell::PumpUI();
+    }
+    uint8_t dg[32];
+    char got_hex[65];
+    sha_final(&sc, dg);
+    sha_hex(dg, got_hex);
+    if (!peq(got_hex, want_hex)) {
+        SerialLogger::Log("[kpkg] claude: sha256 MISMATCH got ");
+        SerialLogger::Log(got_hex);
+        SerialLogger::Log(" want ");
+        SerialLogger::Log(want_hex);
+        SerialLogger::Log("\r\n");
+        TaskMem::UnchargeFrames(buf); PMM::FreeBytes(buf, (size_t)alloc);
+        pset_sync_message("Checksum verification failed: the download does not match the release manifest. Nothing was installed.");
+        return false;
+    }
+    if (buf[0] != 0x7F || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F') {
+        TaskMem::UnchargeFrames(buf); PMM::FreeBytes(buf, (size_t)alloc);
+        pset_sync_message("The verified download is not an ELF file; nothing was installed.");
+        return false;
+    }
+    cl_say("sha256 matches the release manifest");
+
+    // 6. install. both vfs nodes borrow the one buffer (no copy). /opt/claude
+    // is what the volume store saves, /system/bin/claude is what the launcher
+    // runs. an older image from this boot is left allocated: a claude that is
+    // running may still be mapped from it, and it is released at reboot. (satoru)
+    KVFS::Mkdirs("/opt/claude");
+    KVFS::Mkdirs("/system/bin");
+    if (KVFS::WriteFileStatic(CL_OPT_BIN, buf, (uint32_t)want_size) != KVFS_OK ||
+        KVFS::WriteFileStatic(CL_RUN_BIN, buf, (uint32_t)want_size) != KVFS_OK) {
+        pset_sync_message("Could not register the binary in the vfs.");
+        return false;
+    }
+    KVFS::Chmod(CL_OPT_BIN, 0755);
+    KVFS::Chmod(CL_RUN_BIN, 0755);
+    ClaudeHost::AdoptImage(buf, want_size);
+
+    KVFS::Mkdirs("/etc/kpkg");
+    KVFS::Unlink("/etc/kpkg/claude.removed");
+    {
+        char m[200];
+        int n = pa(m, 0, sizeof(m), ver);
+        n = pac(m, n, sizeof(m), ' ');
+        n = pa(m, n, sizeof(m), want_hex);
+        n = pac(m, n, sizeof(m), ' ');
+        n = pai(m, n, sizeof(m), (unsigned int)want_size);
+        n = pac(m, n, sizeof(m), '\n');
+        KVFS::WriteString(CL_MARKER, m);
+    }
+
+    bool was_installed = have;
+    Package* pkg = FindOrCreate("claude");
+    if (pkg) {
+        char vshort[16];
+        pcpy(vshort, ver, (int)sizeof(vshort));
+        pcpy(pkg->version, vshort, (int)sizeof(pkg->version));
+        pcpy(pkg->latest_version, vshort, (int)sizeof(pkg->latest_version));
+        pcpy(pkg->sha256, want_hex, (int)sizeof(pkg->sha256));
+        pcpy(pkg->description, "Claude Code (Anthropic official release)", PKG_MAX_DESC);
+        pcpy(pkg->category, "apps", (int)sizeof(pkg->category));
+        pkg->size = (unsigned int)(want_size >> 10);
+        pkg->state = PKG_INSTALLED;
+        if (!was_installed) pregister_installed(pkg);
+    }
+
+    // 7. persist so it survives a reboot (the marker under /etc also changes
+    // the volume fingerprint, so the save is never skipped as "unchanged"). (satoru)
+    if (PersistStore::Available()) {
+        cl_say("saving to the persistent store ...");
+        if (PersistStore::SaveTree() && PersistStore::ClaudeImage(nullptr, nullptr, false)) {
+            cl_say("saved; it will still be here after a reboot");
+        } else {
+            cl_say("could not save to the persistent store; it is installed for this boot only");
+        }
+    } else {
+        cl_say("no persistent store on this boot; it is installed for this boot only");
+    }
+    pset_sync_message("Claude Code installed from downloads.claude.ai.");
+    g_cl_changed = true;
+    return true;
+}
+
+bool PackageManager::RemoveClaude() {
+    RefreshClaudeState();
+    static const uint8_t gone[1] = { 0 };
+    bool had = KVFS::Exists(CL_MARKER) || PersistStore::ClaudeImage(nullptr, nullptr, false);
+    if (!had) { pset_sync_message("Claude Code is not installed."); return false; }
+    // point both nodes at a 1 byte static so the volume store saves "empty" and
+    // the buffer can go; the nodes are kept, not unlinked, because freeing a
+    // borrowed buffer through a node is not safe. (satoru)
+    KVFS::Mkdirs("/opt/claude");
+    KVFS::WriteFileStatic(CL_OPT_BIN, gone, 1);
+    KVFS::WriteFileStatic(CL_RUN_BIN, gone, 1);
+    ClaudeHost::AdoptImage(nullptr, 0);
+    KVFS::Unlink(CL_MARKER);
+    KVFS::Mkdirs("/etc/kpkg");
+    KVFS::WriteString("/etc/kpkg/claude.removed", "removed\n");   // changes the volume fingerprint (satoru)
+    Package* pkg = FindOrCreate("claude");
+    if (pkg) pkg->state = PKG_AVAILABLE;
+    if (PersistStore::Available()) PersistStore::SaveTree();
+    pset_sync_message("Claude Code removed.");
+    return true;
+}
+
 bool PackageManager::Install(const char* name) {
+    if (peq(name, "claude")) return InstallClaude("latest", false);
     // firefox ships as a ~235 mb tar that must be STREAMED (the generic buffered
     // path below caps at 16 mb), then finalized (launcher symlinks + deps
     // manifest) and registered. route it here so non-shell callers -- notably the
@@ -2038,6 +2541,7 @@ bool PackageManager::InstallKro(const char* path, char* app_name_out, int app_na
 }
 
 bool PackageManager::Remove(const char* name) {
+    if (peq(name, "claude")) return RemoveClaude();
     Package* pkg = Find(name);
     if (!pkg || pkg->state != PKG_INSTALLED) return false;
     if (peq(pkg->category, "core")) return false;
@@ -2292,6 +2796,51 @@ int PackageManager::cmd_install(void* sh, int argc, const char** argv, char* out
     const char* name = argv[1];
     if (peq(argv[0], "kpkg") && argc >= 3) name = argv[2];
 
+    // claude code: anthropic's own release over https (kfetch), never from a
+    // kurono server. `kpkg update claude` only acts on an installed copy. (satoru)
+    if (peq(name, "claude")) {
+        bool kp = peq(argv[0], "kpkg");
+        bool upd = kp && argc >= 3 && (peq(argv[1], "update") || peq(argv[1], "upgrade"));
+        bool rem = kp && argc >= 3 && (peq(argv[1], "remove") || peq(argv[1], "uninstall"));
+        const char* chan = "latest";
+        int ci = kp ? 3 : 2;
+        if (argc > ci && argv[ci][0] != '-') chan = argv[ci];
+        int p = 0;
+        if (rem) {
+            if (RemoveClaude()) return pa(out, 0, mx, "\xE2\x9C\x93 Claude Code removed.\n");
+            p = pa(out, 0, mx, "\xE2\x9C\x97 ");
+            p = pa(out, p, mx, GetLastSyncMessage());
+            return pac(out, p, mx, '\n');
+        }
+        p = pa(out, p, mx, upd ? "Updating Claude Code from Anthropic's release storage (downloads.claude.ai)\n"
+                               : "Installing Claude Code from Anthropic's release storage (downloads.claude.ai)\n");
+        KuronoShell::EmitIncrementalRange(out, 0, p);
+        bool ok = InstallClaude(chan, upd);
+        SerialLogger::Log(ok ? "[kpkg] claude: done: " : "[kpkg] claude: FAILED: ");
+        SerialLogger::Log(GetLastSyncMessage());
+        SerialLogger::Log("\r\n");
+        Package* cp = Find("claude");
+        p = 0;
+        if (ok && !g_cl_changed) {
+            // already current: the stream above said so, nothing more to print (satoru)
+        } else if (ok) {
+            p = pa(out, p, mx, "\xE2\x9C\x93 ");
+            p = pa(out, p, mx, GetLastSyncMessage());
+            p = pa(out, p, mx, "\n  Claude Code ");
+            if (cp) p = pa(out, p, mx, cp->version);
+            p = pa(out, p, mx, " is ready: run  claude --version  or  claude\n");
+            p = pa(out, p, mx, "  Log in yourself on first run; kpkg never reads or stores your credentials.\n");
+        } else {
+            p = pa(out, p, mx, "\xE2\x9C\x97 ");
+            p = pa(out, p, mx, GetLastSyncMessage());
+            p = pac(out, p, mx, '\n');
+        }
+        // the terminal drops the returned text once anything was streamed, so the
+        // closing message goes through the stream too. (satoru)
+        KuronoShell::EmitIncrementalRange(out, 0, p);
+        return p;
+    }
+
     if (pends_with(name, ".kro") && KVFS::Exists(name)) {
         char app_name[PKG_MAX_NAME];
         char entry_path[KVFS_MAX_PATH];
@@ -2498,6 +3047,21 @@ int PackageManager::cmd_remove(void* sh, int argc, const char** argv, char* out,
 int PackageManager::cmd_update(void* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     int p = 0;
+    // claude code updates straight from anthropic, not from the kurono repo, so
+    // it must not wait for (or fail with) the repository sync below. (satoru)
+    if (argc >= 2 && peq(argv[1], "claude")) {
+        p = pa(out, p, mx, "Updating Claude Code from Anthropic's release storage (downloads.claude.ai)\n");
+        KuronoShell::EmitIncrementalRange(out, 0, p);
+        bool ok = InstallClaude(argc >= 3 ? argv[2] : "latest", true);
+        p = 0;
+        if (!ok || g_cl_changed) {
+            p = pa(out, 0, mx, ok ? "\xE2\x9C\x93 " : "\xE2\x9C\x97 ");
+            p = pa(out, p, mx, GetLastSyncMessage());
+            p = pac(out, p, mx, '\n');
+        }
+        KuronoShell::EmitIncrementalRange(out, 0, p);   // see cmd_install: streamed text hides the return (satoru)
+        return p;
+    }
     p = pa(out, p, mx, "Syncing repository from ");
     p = pa(out, p, mx, PKG_REPOSITORY_HOST);
     p = pa(out, p, mx, "...\n");
@@ -2546,6 +3110,7 @@ int PackageManager::cmd_search(void* sh, int argc, const char** argv, char* out,
     (void)sh;
     if (argc < 2) return pa(out, 0, mx, "Usage: search <term>\n");
 
+    RefreshClaudeState();
     Package* results[32];
     int count = Search(argv[1], results, 32);
 
@@ -2577,6 +3142,7 @@ int PackageManager::cmd_list(void* sh, int argc, const char** argv, char* out, i
     (void)sh;
     bool installed_only = true;
     if (argc >= 2 && peq(argv[1], "--all")) installed_only = false;
+    RefreshClaudeState();
 
     int p = 0;
     p = pa(out, p, mx, "╔═══════════════════════════════════════════════════════╗\n");
@@ -2609,6 +3175,7 @@ int PackageManager::cmd_info(void* sh, int argc, const char** argv, char* out, i
     (void)sh;
     if (argc < 2) return pa(out, 0, mx, "Usage: pkginfo <package>\n");
 
+    if (peq(argv[1], "claude")) RefreshClaudeState();
     Package* pkg = Find(argv[1]);
     if (!pkg) return pa(out, 0, mx, "Package not found\n");
 

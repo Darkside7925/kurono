@@ -130,6 +130,61 @@ bool Screenshot::CaptureToBMP(const char* kvfs_path) {
     return rc >= 0;
 }
 
+bool Screenshot::CaptureScaledToBMP(const char* kvfs_path, int max_dim) {
+    if (!kvfs_path || max_dim < 16) return false;
+    uint8_t* fb = Graphics::GetBackBuffer();
+    int      w  = Graphics::GetWidth();
+    int      h  = Graphics::GetHeight();
+    uint32_t pitch = Graphics::GetPitch();
+    if (!fb || w <= 0 || h <= 0 || pitch == 0) return false;
+    int dw = w, dh = h;
+    if (w >= h && w > max_dim) { dw = max_dim; dh = (h * max_dim) / w; }
+    else if (h > max_dim)      { dh = max_dim; dw = (w * max_dim) / h; }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    const uint32_t row_bytes = (uint32_t)dw * 4u;
+    const uint32_t pixel_bytes = row_bytes * (uint32_t)dh;
+    const uint32_t total = BMP_HDR_SIZE + pixel_bytes;
+    uint8_t* out = (uint8_t*)KernelHeap::Alloc(total);
+    if (!out) return false;
+    out[0] = 'B'; out[1] = 'M';
+    put_u32(out + 2,  total);
+    put_u16(out + 6,  0);
+    put_u16(out + 8,  0);
+    put_u32(out + 10, BMP_HDR_SIZE);
+    uint8_t* ih = out + BMP_FILE_HDR;
+    put_u32(ih + 0,  BMP_INFO_HDR);
+    put_u32(ih + 4,  (uint32_t)dw);
+    put_u32(ih + 8,  (uint32_t)dh);
+    put_u16(ih + 12, 1);
+    put_u16(ih + 14, 32);
+    put_u32(ih + 16, 0);
+    put_u32(ih + 20, pixel_bytes);
+    put_u32(ih + 24, 2835);
+    put_u32(ih + 28, 2835);
+    put_u32(ih + 32, 0);
+    put_u32(ih + 36, 0);
+    uint8_t* dst_base = out + BMP_HDR_SIZE;
+    for (int y = 0; y < dh; y++) {
+        int sy = (int)(((int64_t)(h - 1 - y) * h) / dh);
+        if (sy < 0) sy = 0;
+        if (sy >= h) sy = h - 1;
+        const uint8_t* src_row = fb + (size_t)sy * pitch;
+        uint8_t* dst_row = dst_base + (size_t)y * row_bytes;
+        for (int x = 0; x < dw; x++) {
+            int sx = (int)(((int64_t)x * w) / dw);
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w - 1;
+            const uint8_t* s = src_row + (size_t)sx * 4u;
+            uint8_t* d = dst_row + (size_t)x * 4u;
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 0xFF;
+        }
+    }
+    int rc = KVFS::WriteFile(kvfs_path, out, total);
+    KernelHeap::Free(out);
+    return rc >= 0;
+}
+
 bool Screenshot::CaptureTimestamped() {
     // build "/home/user/screenshot_<ms>.bmp" from the monotonic clock. (satoru)
     char path[64];

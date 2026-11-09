@@ -4,6 +4,7 @@
 #include "../proc/scheduler.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
+#include "../drivers/timer.h"     // wall-clock telemetry cadence (satoru)
 
 //  KMemX dedicated compression kernel-process (stage 4). (satoru)
 //
@@ -178,12 +179,38 @@ void log_stats(uint32_t tick) {
         // telemetry BEFORE the early-outs below: a disabled engine or a busy
         // compositor must still report, otherwise the quietest boots (exactly
         // the ones worth explaining) produce no data at all. (satoru)
-        if (tick == 50 || (tick % 500) == 0) log_stats(tick);
+        // while the adaptive pool holds chunks (or pressure is up) also report
+        // every ~5s of wall time: the worker is often starved far below its
+        // nominal 100 ticks/s, so tick-based telemetry alone could miss a whole
+        // grow/compress/shrink cycle. (satoru)
+        {
+            static uint32_t s_last_log_ms = 0;
+            uint32_t now_ms = Timer::GetRealMs();
+            bool busy_pool = KMemXPool::TotalBytes() > 0 || CurrentPressure() >= PRESS_YELLOW;
+            if (tick == 50 || (tick % 500) == 0 ||
+                (busy_pool && (uint32_t)(now_ms - s_last_log_ms) >= 5000u)) {
+                log_stats(tick);
+                s_last_log_ms = now_ms;
+            }
+        }
 
-        if (!IsEnabled()) continue;          // disabled -> idle, no scanning (satoru)
+        if (!IsEnabled()) {
+            // disabled -> idle, no scanning. still let the pool policy hand
+            // back any chunk that drained after the engine went off. (satoru)
+            if (KMemXPool::TotalBytes() > 0 && (tick % 100) == 0) MaintainPool(CurrentPressure());
+            continue;
+        }
 
         // (1) refresh pressure from live free ram. (satoru)
         Pressure p = UpdatePressure();
+
+        // adaptive pool: grow under pressure, shrink after it clears, reclaim
+        // orphans. (satoru)
+        MaintainPool(p);
+
+        // compress only under pressure. at green the pool is meant to drain
+        // and go back to the pmm, so no new pages are taken into it. (satoru)
+        if (p == PRESS_GREEN) continue;
 
         // (3) never compete with a render: if frames are pending, skip this tick.
         // under green/yellow we are extra polite; under red/critical memory

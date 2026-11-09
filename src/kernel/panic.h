@@ -120,6 +120,14 @@ namespace KernelPanic {
                                    const char* file   = nullptr,
                                    uint32_t    line   = 0);
 
+    // display restore hook: runs at the very top of a bugcheck, before the
+    // panic renderer touches the framebuffer. a driver that redirected the
+    // display engine to another surface registers here so the original scanout
+    // is back before the panic screen is drawn. must be mmio only: no locks,
+    // no allocation, no logging. pass nullptr to clear. (satoru)
+    typedef void (*DisplayRestoreHook)();
+    void SetDisplayRestoreHook(DisplayRestoreHook fn);
+
     // called from isr for cpu exceptions.
     [[noreturn]] void BugCheckFromInterrupt(InterruptFrame* frame,
                                             const char* exception_name);

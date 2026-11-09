@@ -59,7 +59,7 @@ public:
 
     // true if the active prompt path is a real nested vm (vmlaunch'd) vs the
     // ept-isolated context fallback. purely informational / for the docs and
-    // the `supr policy` status line. (satoru)
+    // the `ken policy` status line. (satoru)
     static bool IsRealNestedVM();
 
     // spawn the isolated context, render the prompt, drive input, tear the
@@ -74,6 +74,28 @@ public:
     // page tables, and (b) the verdict only crosses via the channel. logs
     // every check to serial. returns true if all invariants held. (satoru)
     static bool SelfTest();
+
+    // the admin gate uses this: is there any usable prompt path? ksa is
+    // available on a hypervisor host; without one Prompt() draws the secure
+    // desktop fallback (no isolation, but a blocking modal the main os cannot
+    // click through). (satoru)
+    static bool PromptUsable();
+
+    // true while an authorization modal owns input. the input process and the
+    // syscall-side UI pump stand down; the gui process does NOT stop - it hosts
+    // the modal (renders the overlay, pumps usb/ps2 input) so the desktop
+    // keeps rendering behind the prompt. (satoru)
+    static bool SecureDesktopActive();
+
+    // true while a prompt is accepting input + being composited by the gui.
+    // the gui loop calls the two hooks below whenever this is set. (satoru)
+    static bool ModalActive();
+    static bool ModalGuiHosted();        // gui process runs the modal (vs self-pumped)
+    static void RenderPromptOverlay();   // draw onto the current back buffer
+    static void PumpPromptInput();       // drain rings, hover/click, timeout
+
+    // test/tuning hook: kurono.ksa.timeout=<seconds>. default 60. (satoru)
+    static void SetPromptTimeoutMs(uint32_t ms);
 
     // interactive render-path verification - used by the boot gate
     // kurono.ksa.prompt. runs the REAL KSA::Prompt() with a sample request so

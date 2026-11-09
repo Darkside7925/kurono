@@ -16,10 +16,17 @@ namespace DiskLog {
     // the preallocated contiguous KURONO.KFS extent (device lba, bytes), valid
     // after Init(). false if missing or fragmented; KfsStatus() says why. (satoru)
     bool KfsFile(uint64_t* lba, uint64_t* bytes);
+    // guest vm disk images in the partition root (8.3 name, e.g. "ALPINE  IMG"):
+    // 0 = found (extent out), 1 missing, 2 fragmented, 3 misaligned. (satoru)
+    int  GuestImage(const char* name83, uint64_t* lba, uint64_t* bytes);
+    // make that image writable (third nvme guard window) for a starting vm (satoru)
+    bool ArmGuestImage(const char* name83, uint64_t* lba, uint64_t* bytes);
+    void DisarmGuestImage();
     const char* KfsStatus();
     // read-only access to a named file in the KURONO fat32 root (8.3 name, 11
     // chars space padded). follows the fat chain, so a fragmented file works.
-    // never writes. StatRootFile returns the exact byte size; ReadRootFile
+    // never writes. StatRootFile returns the exact byte size (an empty file
+    // is present with size 0, callers that need data check sz > 0); ReadRootFile
     // streams the whole file into dst (identity mapped ram, cap bytes). both
     // return 0 on success; RootFileMsg(code) is a human readable reason. (satoru)
     typedef void (*RootFileProgress)(uint64_t done, uint64_t total);

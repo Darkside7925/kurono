@@ -6,9 +6,7 @@
 // through bounds-checked Reader helpers which return false on overflow;
 // callers are expected to early-exit on false to keep the code linear.
 #include "mp4_demux.h"
-#include "../kernel/heap.h"
-#include "../system/logging.h"
-#include "../drivers/serial.h"
+#include "mplat.h"
 
 namespace MP4 {
 
@@ -459,7 +457,7 @@ bool BuildSampleTable(const uint8_t* file, uint32_t file_size,
     if (sample_count == 0) return true;
     if (sample_count > 0x00ffffffu) return false; // sanity cap
 
-    Sample* samples = (Sample*)KernelHeap::Alloc(sizeof(Sample) * sample_count);
+    Sample* samples = (Sample*)MPlat::Alloc(sizeof(Sample) * sample_count);
     if (!samples) return false;
     for (uint32_t i = 0; i < sample_count; i++) {
         samples[i] = Sample{};
@@ -468,7 +466,7 @@ bool BuildSampleTable(const uint8_t* file, uint32_t file_size,
             samples[i].size = sample_size_default;
         } else {
             uint32_t sz;
-            if (!rsz.U32(sz)) { KernelHeap::Free(samples); return false; }
+            if (!rsz.U32(sz)) { MPlat::Free(samples); return false; }
             samples[i].size = sz;
         }
     }
@@ -478,19 +476,19 @@ bool BuildSampleTable(const uint8_t* file, uint32_t file_size,
     const uint8_t* co_p = co64 ? co64_p : stco_p;
     uint32_t co_size    = co64 ? co64_size : stco_size;
     Reader rco{file, co_p + co_size, co_p};
-    if (!ReadFullBoxHeader(&rco, &v, &f)) { KernelHeap::Free(samples); return false; }
+    if (!ReadFullBoxHeader(&rco, &v, &f)) { MPlat::Free(samples); return false; }
     uint32_t chunk_count;
-    if (!rco.U32(chunk_count)) { KernelHeap::Free(samples); return false; }
-    if (chunk_count == 0) { KernelHeap::Free(samples); return true; }
+    if (!rco.U32(chunk_count)) { MPlat::Free(samples); return false; }
+    if (chunk_count == 0) { MPlat::Free(samples); return true; }
 
-    uint64_t* chunk_off = (uint64_t*)KernelHeap::Alloc(sizeof(uint64_t) * chunk_count);
-    if (!chunk_off) { KernelHeap::Free(samples); return false; }
+    uint64_t* chunk_off = (uint64_t*)MPlat::Alloc(sizeof(uint64_t) * chunk_count);
+    if (!chunk_off) { MPlat::Free(samples); return false; }
     for (uint32_t i = 0; i < chunk_count; i++) {
         if (co64) {
-            uint64_t o; if (!rco.U64(o)) { KernelHeap::Free(samples); KernelHeap::Free(chunk_off); return false; }
+            uint64_t o; if (!rco.U64(o)) { MPlat::Free(samples); MPlat::Free(chunk_off); return false; }
             chunk_off[i] = o;
         } else {
-            uint32_t o; if (!rco.U32(o)) { KernelHeap::Free(samples); KernelHeap::Free(chunk_off); return false; }
+            uint32_t o; if (!rco.U32(o)) { MPlat::Free(samples); MPlat::Free(chunk_off); return false; }
             chunk_off[i] = o;
         }
     }
@@ -499,10 +497,10 @@ bool BuildSampleTable(const uint8_t* file, uint32_t file_size,
     // each entry (first_chunk, samples_per_chunk, sample_description_index)
     // applies to all chunks from first_chunk until the next entry's first.
     Reader rsc{file, stsc_p + stsc_size, stsc_p};
-    if (!ReadFullBoxHeader(&rsc, &v, &f)) { KernelHeap::Free(samples); KernelHeap::Free(chunk_off); return false; }
+    if (!ReadFullBoxHeader(&rsc, &v, &f)) { MPlat::Free(samples); MPlat::Free(chunk_off); return false; }
     uint32_t stsc_entries;
     if (!rsc.U32(stsc_entries) || stsc_entries == 0) {
-        KernelHeap::Free(samples); KernelHeap::Free(chunk_off); return false;
+        MPlat::Free(samples); MPlat::Free(chunk_off); return false;
     }
 
     // walk stsc to assign each sample its (chunk_index, intra_chunk_idx)
@@ -612,14 +610,14 @@ bool BuildSampleTable(const uint8_t* file, uint32_t file_size,
             samples[i].is_keyframe = true;
     }
 
-    KernelHeap::Free(chunk_off);
+    MPlat::Free(chunk_off);
     tr->samples      = samples;
     tr->sample_count = sample_count;
     return true;
 
 fail:
-    KernelHeap::Free(samples);
-    KernelHeap::Free(chunk_off);
+    MPlat::Free(samples);
+    MPlat::Free(chunk_off);
     return false;
 }
 
@@ -678,7 +676,7 @@ bool Open(const uint8_t* data, uint32_t size, Movie& mv) {
 void Close(Movie& mv) {
     for (int i = 0; i < mv.track_count; i++) {
         if (mv.tracks[i].samples) {
-            KernelHeap::Free(mv.tracks[i].samples);
+            MPlat::Free(mv.tracks[i].samples);
             mv.tracks[i].samples      = nullptr;
             mv.tracks[i].sample_count = 0;
         }
@@ -746,40 +744,40 @@ const char* HandlerName(uint32_t fourcc) {
 }
 
 void DumpToSerial(const Movie& mv) {
-    SerialLogger::Log("[MP4] dump: tracks=");
-    SerialLogger::LogDec(mv.track_count);
-    SerialLogger::Log(" timescale=");
-    SerialLogger::LogDec((int)mv.timescale);
-    SerialLogger::Log(" duration_ms=");
-    SerialLogger::LogDec((int)DurationMs(mv));
-    SerialLogger::Log("\r\n");
+    MPlat::Log("[MP4] dump: tracks=");
+    MPlat::LogDec(mv.track_count);
+    MPlat::Log(" timescale=");
+    MPlat::LogDec((int)mv.timescale);
+    MPlat::Log(" duration_ms=");
+    MPlat::LogDec((int)DurationMs(mv));
+    MPlat::Log("\r\n");
     for (int i = 0; i < mv.track_count; i++) {
         const Track& t = mv.tracks[i];
-        SerialLogger::Log("[MP4]  track ");
-        SerialLogger::LogDec(i);
-        SerialLogger::Log(": id=");
-        SerialLogger::LogDec((int)t.track_id);
-        SerialLogger::Log(" kind=");
-        SerialLogger::Log(HandlerName(t.handler));
-        SerialLogger::Log(" codec=");
-        SerialLogger::Log(CodecName(t.codec));
-        SerialLogger::Log(" samples=");
-        SerialLogger::LogDec((int)t.sample_count);
+        MPlat::Log("[MP4]  track ");
+        MPlat::LogDec(i);
+        MPlat::Log(": id=");
+        MPlat::LogDec((int)t.track_id);
+        MPlat::Log(" kind=");
+        MPlat::Log(HandlerName(t.handler));
+        MPlat::Log(" codec=");
+        MPlat::Log(CodecName(t.codec));
+        MPlat::Log(" samples=");
+        MPlat::LogDec((int)t.sample_count);
         if (t.kind == TRACK_VIDEO) {
-            SerialLogger::Log(" ");
-            SerialLogger::LogDec(t.video.width);
-            SerialLogger::Log("x");
-            SerialLogger::LogDec(t.video.height);
+            MPlat::Log(" ");
+            MPlat::LogDec(t.video.width);
+            MPlat::Log("x");
+            MPlat::LogDec(t.video.height);
         } else if (t.kind == TRACK_AUDIO) {
-            SerialLogger::Log(" ");
-            SerialLogger::LogDec(t.audio.sample_rate);
-            SerialLogger::Log("Hz x");
-            SerialLogger::LogDec(t.audio.channels);
-            SerialLogger::Log("ch ");
-            SerialLogger::LogDec(t.audio.sample_size);
-            SerialLogger::Log("-bit");
+            MPlat::Log(" ");
+            MPlat::LogDec(t.audio.sample_rate);
+            MPlat::Log("Hz x");
+            MPlat::LogDec(t.audio.channels);
+            MPlat::Log("ch ");
+            MPlat::LogDec(t.audio.sample_size);
+            MPlat::Log("-bit");
         }
-        SerialLogger::Log("\r\n");
+        MPlat::Log("\r\n");
     }
 }
 

@@ -1,5 +1,6 @@
 #include "tcpip.h"
 #include "ipv6.h"
+#include "dhcp.h"          // lease kept alive even when the network kproc starves (satoru)
 #include "netfilter.h"           // packet-filter hooks on the ipv4 datapath (satoru)
 #include "../drivers/e1000.h"
 #include "../drivers/serial.h"
@@ -132,6 +133,9 @@ uint8_t TCPStack::mac[6] = {};
 
 ARPEntry TCPStack::arp_cache[ARP_CACHE_SIZE] = {};
 NetSocket TCPStack::sockets[MAX_SOCKETS] = {};
+// per-slot receive rings, allocated lazily in Socket() and never freed: the slot
+// struct is wiped with {} on reuse, so the buffer lives here instead. (satoru)
+static uint8_t* g_rx_slot_buf[MAX_SOCKETS] = {};
 NetStats TCPStack::stats = {};
 PendingIPv4Frame TCPStack::pending_ipv4[PENDING_IPV4_TX] = {};
 
@@ -164,6 +168,58 @@ bool BytesEqual(const uint8_t* a, const uint8_t* b, int len) {
     return true;
 }
 
+// rfc 6298 default initial rto is 1s; we clamp the smoothed value to 200ms at
+// the low end (a fast lan should not wait a second to retransmit) and 8s at
+// the high end (a dead peer should be torn down in bounded time). (satoru)
+static uint32_t TcpRtoBase(const NetSocket* s) {
+    uint32_t rto = s->rto_ms ? s->rto_ms : 1000u;
+    if (rto < 200u) rto = 200u;
+    if (rto > 8000u) rto = 8000u;
+    return rto;
+}
+
+static uint32_t TcpRtoFor(const NetSocket* s, uint32_t retries) {
+    uint32_t rto = TcpRtoBase(s);
+    uint32_t shift = retries > 4u ? 4u : retries;
+    uint64_t v = (uint64_t)rto << shift;
+    if (v > 8000u) v = 8000u;
+    return (uint32_t)v;
+}
+
+// one rtt sample per acked measurement; retransmitted segments never feed the
+// estimator (karn's rule), and an ack that does not cover rtt_seq is ignored.
+// (satoru)
+static void TcpRttSample(NetSocket* s, uint32_t now_ms) {
+    if (!s || !s->rtt_pending) return;
+    uint32_t sample = now_ms - s->rtt_sent_ms;
+    s->rtt_pending = false;
+    if (sample == 0) sample = 1;
+    if (sample > 60000u) sample = 60000u;
+    if (!s->rtt_valid) {
+        s->srtt_ms = sample;
+        s->rttvar_ms = sample / 2;
+        s->rtt_valid = true;
+    } else {
+        int32_t d = (int32_t)s->srtt_ms - (int32_t)sample;
+        if (d < 0) d = -d;
+        s->rttvar_ms = (3u * s->rttvar_ms + (uint32_t)d) / 4u;
+        s->srtt_ms = (7u * s->srtt_ms + sample) / 8u;
+    }
+    uint32_t rto = s->srtt_ms + 4u * s->rttvar_ms;
+    if (rto < 200u) rto = 200u;
+    if (rto > 8000u) rto = 8000u;
+    s->rto_ms = rto;
+    if (s->rtt_logs < 2) {
+        s->rtt_logs++;
+        slog("[TCP] rtt sample ");
+        slognum((int)sample);
+        slog("[TCP] srtt ");
+        slognum((int)s->srtt_ms);
+        slog("[TCP] rto ");
+        slognum((int)s->rto_ms);
+    }
+}
+
 void ApplyAck(NetSocket* sock, uint32_t ack_seq) {
     if (!sock) return;
     if (SeqBefore(ack_seq, sock->tx_unacked) || SeqAfter(ack_seq, sock->tcp_seq)) {
@@ -189,12 +245,26 @@ void ApplyAck(NetSocket* sock, uint32_t ack_seq) {
                 if (!s->in_use) continue;
                 if (!oldest || SeqBefore(s->seq, oldest->seq)) oldest = s;
             }
-            if (oldest) oldest->last_tx_ms = Timer::GetTicks() - 5000u;   // > max rto -> fires next tick (satoru)
+            if (oldest) {
+                // the fast retransmit invalidates any rtt sample for this
+                // segment (karn), so drop the pending measurement. (satoru)
+                if (sock->rtt_pending &&
+                    oldest->seq + (uint32_t)oldest->len == sock->rtt_seq) {
+                    sock->rtt_pending = false;
+                }
+                oldest->last_tx_ms = Timer::GetTicks() - 5000u;   // > max rto -> fires next tick (satoru)
+            }
         }
         return;   // a dup-ack acks no new data - nothing below to free (satoru)
     }
     sock->last_ack_seen = ack_seq;
     sock->dup_ack_cnt   = 0;
+
+    // an advancing ack that covers the outstanding measurement completes the
+    // round-trip sample before the segment is freed below. (satoru)
+    if (sock->rtt_pending && !SeqBefore(ack_seq, sock->rtt_seq)) {
+        TcpRttSample(sock, Timer::GetTicks());
+    }
 
     sock->tx_unacked = ack_seq;
     if (sock->tx_pending && !SeqBefore(ack_seq, sock->tx_seq_end)) {
@@ -339,7 +409,10 @@ void TCPStack::SetDNS(uint32_t dns) { dns_server = dns; }
 uint32_t TCPStack::GetIP() { return local_ip; }
 uint32_t TCPStack::GetSubnetMask() { return subnet_mask; }
 uint32_t TCPStack::GetGateway() { return gateway; }
+uint32_t TCPStack::GetDNS() { return dns_server; }   // (satoru)
+bool (*volatile g_tcpip_ipv4_rx_hook)(const void* ip_packet, int len) = nullptr;   // (satoru)
 const uint8_t* TCPStack::GetMAC() { return mac; }
+void TCPStack::SetMAC(const uint8_t m[6]) { for (int i = 0; i < 6; i++) mac[i] = m[i]; }   // (satoru)
 
 bool TCPStack::ARPLookup(uint32_t ip, uint8_t* mac_out) {
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
@@ -576,6 +649,18 @@ bool TCPStack::SendIPv4(uint32_t dst_ip, uint8_t proto, const void* payload, int
     return SendEthernet(dst_mac, ETH_TYPE_IPV4, pkt, sizeof(IPv4Header) + len);
 }
 
+// a prebuilt packet from the vm nat: route it like SendIPv4 does (satoru)
+bool TCPStack::SendRawIPv4(const void* packet, int len) {
+    if (!packet || len < (int)sizeof(IPv4Header) || len > ETH_MTU) return false;
+    const IPv4Header* ip = (const IPv4Header*)packet;
+    uint32_t dst_ip = ntohl(ip->dst_ip);
+    uint32_t next_hop = dst_ip;
+    if ((dst_ip & subnet_mask) != (local_ip & subnet_mask)) next_hop = gateway;
+    uint8_t dst_mac[6];
+    if (!ARPLookup(next_hop, dst_mac)) return QueuePendingIPv4(next_hop, packet, len);
+    return SendEthernet(dst_mac, ETH_TYPE_IPV4, packet, len);
+}
+
 bool TCPStack::QueuePendingIPv4(uint32_t next_hop, const void* packet, int len) {
     if (!packet || len <= 0 || len > ETH_MTU) {
         stats.errors_tx++;
@@ -718,6 +803,12 @@ void TCPStack::ProcessIPv4(const void* data, int len) {
     if (total_len < ihl || total_len > len) total_len = len;
     int payload_len = total_len - ihl;
     if (payload_len < 0) payload_len = 0;
+
+    // the vm nat takes replies to its own translations first (satoru)
+    {
+        bool (*hook)(const void*, int) = g_tcpip_ipv4_rx_hook;
+        if (hook && hook(data, total_len)) return;
+    }
 
     // netfilter ingress: PREROUTING then INPUT. this stack never forwards, so
     // every accepted packet is a local delivery - FORWARD is unreachable by
@@ -1252,7 +1343,7 @@ uint32_t TCPStack::TCPSeqAdvance(uint8_t flags, int len) {
 }
 
 bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, int len,
-                             uint32_t seq, bool track_pending) {
+                             uint32_t seq, bool track_pending, bool allow_rtt_sample) {
     if (!sock) return false;
     // room for the fixed header + a 4-byte window-scale option (only on syn) +
     // a full mss of payload. (satoru)
@@ -1340,6 +1431,16 @@ bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, i
             }
         }
     }
+
+    // arm one rtt measurement for data / syn when none is in flight. the seq
+    // recorded is the one whose cumulative ack completes the sample. retransmits
+    // pass allow_rtt_sample=false (karn). (satoru)
+    if (allow_rtt_sample && !sock->rtt_pending &&
+        (len > 0 || (flags & TCP_FLAG_SYN))) {
+        sock->rtt_seq = seq + TCPSeqAdvance(flags, len);
+        sock->rtt_sent_ms = Timer::GetTicks();
+        sock->rtt_pending = true;
+    }
     return true;
 }
 
@@ -1426,7 +1527,12 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
 int TCPStack::Socket(int type) {
     for (int i = 0; i < MAX_SOCKETS; i++) {
         if (!sockets[i].active) {
+            if (!g_rx_slot_buf[i]) {
+                g_rx_slot_buf[i] = (uint8_t*)KernelHeap::Alloc(TCP_RX_BUFSIZE);
+                if (!g_rx_slot_buf[i]) return -1;   // out of memory: no socket (satoru)
+            }
             sockets[i] = {};
+            sockets[i].rx_buf = g_rx_slot_buf[i];
             sockets[i].active = true;
             sockets[i].type = type;
             sockets[i].local_ip = local_ip;
@@ -1470,6 +1576,9 @@ bool TCPStack::Connect(int sock, uint32_t ip, uint16_t port) {
         s->tcp_ack = 0;
         s->tx_unacked = s->tcp_seq;
         s->tcp_state = TCP_SYN_SENT;
+        // fresh rtt estimator for this connection. (satoru)
+        s->srtt_ms = 0; s->rttvar_ms = 0; s->rto_ms = 1000;
+        s->rtt_valid = false; s->rtt_pending = false; s->rtt_logs = 0;
         // seed keepalive/activity clocks so an idle ESTABLISHED socket has a
         // sane baseline the moment the handshake finishes (satoru)
         s->last_activity_ms = Timer::GetTicks();
@@ -1926,6 +2035,11 @@ void TCPStack::Tick() {
 
     // tcp timer processing
     TCPTick();
+
+    // the network kernel process is starved by firefox, but every syscall path
+    // (and the gui watchdog) drives TCPStack::Tick, so stepping dhcp here keeps
+    // discover/renew/rebind alive exactly when traffic is flowing. (satoru)
+    Dhcp::Tick();
 }
 
 void TCPStack::TCPTick() {
@@ -1934,9 +2048,9 @@ void TCPStack::TCPTick() {
     for (int i = 0; i < MAX_SOCKETS; i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_STREAM) continue;
         if (sockets[i].tx_pending) {
-            // Exponential backoff: 500ms * 2^retries, capped at 4s.
-            uint32_t rto_ms = 500u << (sockets[i].tx_retries < 4 ? sockets[i].tx_retries : 4);
-            if (rto_ms > 4000u) rto_ms = 4000u;
+            // smoothed rto from the rtt estimator, exponentially backed off per
+            // retry and capped at 8s. (satoru)
+            uint32_t rto_ms = TcpRtoFor(&sockets[i], sockets[i].tx_retries);
             if ((uint32_t)(now_ms - sockets[i].tx_last_tx_ms) >= rto_ms) {
                 if (sockets[i].tx_retries >= 6) {
                     slog("[TCP] retransmit budget exhausted\r\n");
@@ -1945,9 +2059,18 @@ void TCPStack::TCPTick() {
                     sockets[i].active = false;
                     continue;
                 }
+                // a retransmitted segment cannot yield an rtt sample (karn). (satoru)
+                if (sockets[i].rtt_pending &&
+                    sockets[i].rtt_seq == sockets[i].tx_seq_base + 1u) {
+                    sockets[i].rtt_pending = false;
+                }
                 SendTCPPacket(&sockets[i], sockets[i].tx_flags,
                               sockets[i].tx_len > 0 ? sockets[i].tx_buf : nullptr,
-                              sockets[i].tx_len, sockets[i].tx_seq_base, false);
+                              sockets[i].tx_len, sockets[i].tx_seq_base, false, false);
+                if (sockets[i].tx_retries < 3) {
+                    slog("[TCP] ctl retransmit rto ");
+                    slognum((int)rto_ms);
+                }
                 sockets[i].tx_retries++;
                 sockets[i].tx_last_tx_ms = now_ms;
             }
@@ -1964,16 +2087,29 @@ void TCPStack::TCPTick() {
         for (int k = 0; k < TCP_SND_WND_SEGS; k++) {
             TxDataSeg* seg = &sockets[i].tx_segs[k];
             if (!seg->in_use) continue;
-            uint32_t rto_ms = 500u << (seg->retries < 4 ? seg->retries : 4);
-            if (rto_ms > 4000u) rto_ms = 4000u;
+            uint32_t rto_ms = TcpRtoFor(&sockets[i], seg->retries);
             if ((uint32_t)(now_ms - seg->last_tx_ms) < rto_ms) continue;
             if (seg->retries >= 6) {
                 slog("[TCP] data retransmit budget exhausted\r\n");
                 conn_dead = true;
                 break;
             }
+            // karn: a retransmit invalidates the pending sample when it is for
+            // the measured sequence. (satoru)
+            if (sockets[i].rtt_pending &&
+                seg->seq + (uint32_t)seg->len == sockets[i].rtt_seq) {
+                sockets[i].rtt_pending = false;
+            }
+            if (seg->retries < 3) {
+                slog("[TCP] retransmit seq ");
+                slognum((int)(seg->seq & 0xFFFFu));
+                slog("[TCP] rto ");
+                slognum((int)rto_ms);
+                slog("[TCP] try ");
+                slognum((int)seg->retries + 1);
+            }
             SendTCPPacket(&sockets[i], TCP_FLAG_ACK | TCP_FLAG_PSH,
-                          seg->data, seg->len, seg->seq, false);
+                          seg->data, seg->len, seg->seq, false, false);
             seg->retries++;
             seg->last_tx_ms = now_ms;
         }

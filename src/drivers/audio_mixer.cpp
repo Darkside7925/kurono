@@ -3,7 +3,9 @@
 #include "audio_backend.h"
 #include "audio_format.h"
 #include "serial.h"
+#include "timer.h"
 #include "../kernel/types.h"
+#include "../proc/scheduler.h"
 
 namespace AudioMixer {
 
@@ -30,6 +32,16 @@ struct Stream {
     int32_t  fade_gain;        // q15, 32768 == 1.0
     int32_t  fade_total;
     int32_t  fade_remaining;
+
+    // who opened the slot and when, for the slot-owner dump when the table
+    // is full: the scheduler pid of the opening task (a pulse client's
+    // thread, the desktop for the media player, 0 before the scheduler). (satoru)
+    uint32_t owner_pid;
+    uint32_t open_ms;
+    // bumped on every open; the StreamID handed out is slot + MAX_STREAMS *
+    // gen, so a stale id (a close after the slot was freed and reused) no
+    // longer hits the new owner's stream. (satoru)
+    uint32_t gen;
 
     MixSample ring[STREAM_RING_FRAMES * INTERNAL_CHANNELS];
     uint32_t  rd;
@@ -105,6 +117,9 @@ void Init() {
         g_streams[i].fade_total = 0;
         g_streams[i].fade_remaining = 0;
         g_streams[i].stats = {};
+        g_streams[i].owner_pid = 0;
+        g_streams[i].open_ms = 0;
+        g_streams[i].gen = 0;
     }
     for (int c = 0; c < INTERNAL_CHANNELS; c++) {
         g_lp_state_low[c]  = 0;
@@ -122,11 +137,75 @@ void Init() {
     SerialLogger::Log(" Hz stereo\r\n");
 }
 
+// resolve a StreamID to its live slot, or nullptr if the id is invalid or
+// stale (its slot was freed and handed to another opener since). (satoru)
+static Stream* Lookup(StreamID id) {
+    if (id < 0) return nullptr;
+    int slot = id % MAX_STREAMS;
+    Stream* s = &g_streams[slot];
+    if ((uint32_t)(id / MAX_STREAMS) != s->gen) return nullptr;
+    return s;
+}
+
+static void FreeSlot(Stream* s) {
+    if (s->state == STREAM_FREE) return;
+    s->state = STREAM_FREE;
+    s->count = 0;
+    s->rd = s->wr = 0;
+    g_active_count--;
+}
+
 static int FindFreeSlot() {
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (g_streams[i].state == STREAM_FREE) return i;
     }
+    // table full: a fading or draining stream is already on its way out
+    // (its owner gave it up), so a live open wins over its tail. this is
+    // what keeps the table usable when the backend stops pulling, because
+    // only Tick() retires those states. (satoru)
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        StreamState st = g_streams[i].state;
+        if (st == STREAM_FADING || st == STREAM_DRAINING) {
+            FreeSlot(&g_streams[i]);
+            return i;
+        }
+    }
     return -1;
+}
+
+static char StateChar(StreamState st) {
+    switch (st) {
+        case STREAM_PLAYING:  return 'P';
+        case STREAM_PAUSED:   return 'Z';
+        case STREAM_FADING:   return 'F';
+        case STREAM_DRAINING: return 'D';
+        default:              return '-';
+    }
+}
+
+// one line naming every slot holder, logged when an open finds the table
+// full: slot:name/pid/state/age_s/ring_frames. (satoru)
+static void DumpOwnersLine() {
+    uint32_t now = Timer::GetRealMs();
+    SerialLogger::Log("[AudioMixer] slots full:");
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        Stream* s = &g_streams[i];
+        if (s->state == STREAM_FREE) continue;
+        char st[2] = { StateChar(s->state), 0 };
+        SerialLogger::Log(" ");
+        SerialLogger::LogDec(i);
+        SerialLogger::Log(":");
+        SerialLogger::Log(s->name);
+        SerialLogger::Log("/");
+        SerialLogger::LogDec((int)s->owner_pid);
+        SerialLogger::Log("/");
+        SerialLogger::Log(st);
+        SerialLogger::Log("/");
+        SerialLogger::LogDec((int)((now - s->open_ms) / 1000));
+        SerialLogger::Log("s/");
+        SerialLogger::LogDec((int)s->count);
+    }
+    SerialLogger::Log("\r\n");
 }
 
 static void CopyName(Stream* s, const char* name) {
@@ -144,11 +223,24 @@ StreamID Open(const char* name, AudioFormat::SampleFormat fmt,
     }
     int slot = FindFreeSlot();
     if (slot < 0) {
+        // rate-limited to one dump a second: a retry loop would otherwise
+        // flood the log with the same table. (satoru)
+        static uint32_t s_last_dump_ms = 0;
+        uint32_t now = Timer::GetRealMs();
         SerialLogger::Log("[AudioMixer] Open(): no free slots\r\n");
+        if (s_last_dump_ms == 0 || now - s_last_dump_ms >= 1000) {
+            s_last_dump_ms = now ? now : 1;
+            DumpOwnersLine();
+        }
         return INVALID_STREAM;
     }
     Stream* s = &g_streams[slot];
     CopyName(s, name);
+    {
+        Process* cur = Scheduler::GetCurrentProcess();
+        s->owner_pid = cur ? (uint32_t)cur->pid : 0;
+        s->open_ms   = Timer::GetRealMs();
+    }
     s->state          = STREAM_PLAYING;
     s->src_fmt        = fmt;
     s->src_rate       = sample_rate;
@@ -170,13 +262,20 @@ StreamID Open(const char* name, AudioFormat::SampleFormat fmt,
     s->rd = s->wr = s->count = 0;
     s->stats = {};
     g_active_count++;
-    return slot;
+    // keep the id positive and in int range; gen 0 is never handed out. (satoru)
+    s->gen = (s->gen % 0x7FFFFFu) + 1;
+    return slot + MAX_STREAMS * (int)s->gen;
 }
 
 void Close(StreamID id) {
-    if (id < 0 || id >= MAX_STREAMS) return;
-    Stream* s = &g_streams[id];
+    Stream* s = Lookup(id);
+    if (!s) return;
     if (s->state == STREAM_FREE) return;
+    // nothing queued means nothing to fade: free now. the fade used to count
+    // down only by frames actually played, so closing a stream whose ring was
+    // empty (paused, underrun under load, a seek drag) left it FADING forever
+    // and leaked the slot - 16 of those and every open failed. (satoru)
+    if (s->count == 0) { FreeSlot(s); return; }
     int32_t fade_frames = static_cast<int32_t>((INTERNAL_RATE * 5) / 1000);
     s->state          = STREAM_FADING;
     s->fade_total     = fade_frames;
@@ -184,16 +283,26 @@ void Close(StreamID id) {
     s->fade_gain      = 32768;
 }
 
+int CloseOwnedBy(uint32_t pid) {
+    if (pid == 0) return 0;
+    int n = 0;
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        Stream* s = &g_streams[i];
+        if (s->state != STREAM_FREE && s->owner_pid == pid) { FreeSlot(s); n++; }
+    }
+    return n;
+}
+
 void Drain(StreamID id) {
-    if (id < 0 || id >= MAX_STREAMS) return;
-    Stream* s = &g_streams[id];
+    Stream* s = Lookup(id);
+    if (!s) return;
     if (s->state == STREAM_FREE) return;
     s->state = STREAM_DRAINING;
 }
 
 uint32_t Write(StreamID id, const void* src, uint32_t frames) {
-    if (id < 0 || id >= MAX_STREAMS || !src || frames == 0) return 0;
-    Stream* s = &g_streams[id];
+    Stream* s = Lookup(id);
+    if (!s || !src || frames == 0) return 0;
     if (s->state == STREAM_FREE || s->state == STREAM_FADING ||
         s->state == STREAM_DRAINING) return 0;
 
@@ -278,43 +387,50 @@ uint32_t Write(StreamID id, const void* src, uint32_t frames) {
 }
 
 void SetVolume(StreamID id, int v) {
-    if (id < 0 || id >= MAX_STREAMS) return;
+    Stream* s = Lookup(id);
+    if (!s) return;
     if (v < 0) v = 0; if (v > 100) v = 100;
-    g_streams[id].volume_pct = v;
+    s->volume_pct = v;
 }
 
 void SetPaused(StreamID id, bool paused) {
-    if (id < 0 || id >= MAX_STREAMS) return;
-    Stream* s = &g_streams[id];
+    Stream* s = Lookup(id);
+    if (!s) return;
     // only flip between the two live playback states; fading/draining
     // streams are already on their way out. (satoru)
     if (paused  && s->state == STREAM_PLAYING) s->state = STREAM_PAUSED;
     if (!paused && s->state == STREAM_PAUSED)  s->state = STREAM_PLAYING;
 }
 int GetVolume(StreamID id) {
-    if (id < 0 || id >= MAX_STREAMS) return 0;
-    return g_streams[id].volume_pct;
+    Stream* s = Lookup(id);
+    if (!s) return 0;
+    return s->volume_pct;
 }
 void SetPan(StreamID id, int p) {
-    if (id < 0 || id >= MAX_STREAMS) return;
+    Stream* s = Lookup(id);
+    if (!s) return;
     if (p < -100) p = -100; if (p > 100) p = 100;
-    g_streams[id].pan = p;
+    s->pan = p;
 }
 void SetMute(StreamID id, bool m) {
-    if (id < 0 || id >= MAX_STREAMS) return;
-    g_streams[id].muted = m;
+    Stream* s = Lookup(id);
+    if (!s) return;
+    s->muted = m;
 }
 bool IsActive(StreamID id) {
-    if (id < 0 || id >= MAX_STREAMS) return false;
-    return g_streams[id].state != STREAM_FREE;
+    Stream* s = Lookup(id);
+    if (!s) return false;
+    return s->state != STREAM_FREE;
 }
 StreamState GetState(StreamID id) {
-    if (id < 0 || id >= MAX_STREAMS) return STREAM_FREE;
-    return g_streams[id].state;
+    Stream* s = Lookup(id);
+    if (!s) return STREAM_FREE;
+    return s->state;
 }
 StreamStats GetStats(StreamID id) {
-    if (id < 0 || id >= MAX_STREAMS) return {};
-    return g_streams[id].stats;
+    Stream* s = Lookup(id);
+    if (!s) return {};
+    return s->stats;
 }
 
 void SetMasterVolume(int v) { if (v<0)v=0; if(v>100)v=100; g_master_volume = v; }
@@ -342,8 +458,9 @@ int  ActiveStreamCount() {
     return n;
 }
 const char* StreamName(StreamID id) {
-    if (id < 0 || id >= MAX_STREAMS) return "";
-    return g_streams[id].name;
+    Stream* s = Lookup(id);
+    if (!s) return "";
+    return s->name;
 }
 
 uint32_t Tick() {
@@ -434,18 +551,15 @@ uint32_t Tick() {
             consumed += run;
         }
 
+        // the fade is a span of time, not of played frames: a period has
+        // elapsed whether or not the ring had samples for it, so an
+        // underrun can no longer pin a closing stream in FADING. (satoru)
         if (s->state == STREAM_FADING) {
-            s->fade_remaining -= (int32_t)avail;
-            if (s->fade_remaining <= 0) {
-                s->state = STREAM_FREE;
-                g_active_count--;
-            }
+            s->fade_remaining -= (int32_t)PERIOD_FRAMES;
+            if (s->fade_remaining <= 0 || s->count == 0) FreeSlot(s);
         }
 
-        if (s->state == STREAM_DRAINING && s->count == 0) {
-            s->state = STREAM_FREE;
-            g_active_count--;
-        }
+        if (s->state == STREAM_DRAINING && s->count == 0) FreeSlot(s);
     }
 
     // Master gain + optional EQ + optional limiter + s16 encode.
@@ -497,6 +611,13 @@ void Dump() {
         SerialLogger::LogDec(i);
         SerialLogger::Log("] ");
         SerialLogger::Log(s->name);
+        SerialLogger::Log(" pid=");
+        SerialLogger::LogDec((int)s->owner_pid);
+        {
+            char st[2] = { StateChar(s->state), 0 };
+            SerialLogger::Log(" st=");
+            SerialLogger::Log(st);
+        }
         SerialLogger::Log("  vol=");
         SerialLogger::LogDec(s->volume_pct);
         SerialLogger::Log(" rate=");

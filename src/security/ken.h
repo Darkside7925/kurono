@@ -1,23 +1,23 @@
 #pragma once
-//  kurono os - supr security engine
+//  kurono os - ken security engine
 //  user auth, sessions, audit logging, permissions
 
-#define SUPR_MAX_USERS     16
-#define SUPR_MAX_SESSIONS   8
-#define SUPR_MAX_LOG       128
-#define SUPR_SALT_LEN       8
-#define SUPR_HASH_LEN      32
-#define SUPR_MAX_GROUPS     8
+#define KEN_MAX_USERS     16
+#define KEN_MAX_SESSIONS   8
+#define KEN_MAX_LOG       128
+#define KEN_SALT_LEN       8
+#define KEN_HASH_LEN      32
+#define KEN_MAX_GROUPS     8
 
-enum SUPRLevel {
-    SUPR_GUEST     = 0,
-    SUPR_USER      = 1,
-    SUPR_ADMIN     = 2,
-    SUPR_ROOT      = 3,
-    SUPR_SOVEREIGN = 4   // root-equivalent owner; only role allowed --sovereign-override (satoru)
+enum KENLevel {
+    KEN_GUEST     = 0,
+    KEN_USER      = 1,
+    KEN_ADMIN     = 2,
+    KEN_ROOT      = 3,
+    KEN_SOVEREIGN = 4   // root-equivalent owner; only role allowed --sovereign-override (satoru)
 };
 
-enum SUPRAction {
+enum KENAction {
     ACT_LOGIN = 0,  ACT_LOGOUT,  ACT_FAIL_LOGIN,
     ACT_CREATE_USER, ACT_DELETE_USER, ACT_CHANGE_PWD,
     ACT_ESCALATE, ACT_FILE_ACCESS, ACT_EXEC_CMD,
@@ -28,7 +28,7 @@ enum SUPRAction {
 };
 
 // auth policy - which factors a privilege escalation must satisfy. (satoru)
-enum SUPRAuthMode {
+enum KENAuthMode {
     AUTH_PASSWD = 0,   // password prompt only (default)
     AUTH_KVAULT = 1,   // ksa hypervisor prompt only
     AUTH_BOTH   = 2    // require both (max security)
@@ -36,27 +36,27 @@ enum SUPRAuthMode {
 
 // the persisted auth policy. both factors are tracked independently so the
 // policy layer can detect (and block) the "both disabled" loophole. (satoru)
-struct SUPRAuthPolicy {
+struct KENAuthPolicy {
     bool passwd_enabled;   // password factor required for escalation
     bool kvault_enabled;   // ksa hypervisor factor required for escalation
 };
 
-struct SUPRUser {
+struct KENUser {
     char username[32];
-    unsigned char pwd_hash[SUPR_HASH_LEN];
-    unsigned char salt[SUPR_SALT_LEN];
-    SUPRLevel level;
+    unsigned char pwd_hash[KEN_HASH_LEN];
+    unsigned char salt[KEN_SALT_LEN];
+    KENLevel level;
     char home[64];
     char shell[32];
     bool locked;
     int  failed_attempts;
     int  uid;
     int  gid;
-    char groups[SUPR_MAX_GROUPS][16];
+    char groups[KEN_MAX_GROUPS][16];
     int  group_count;
 };
 
-struct SUPRSession {
+struct KENSession {
     int  user_index;
     bool active;
     unsigned int login_time;
@@ -65,46 +65,46 @@ struct SUPRSession {
     char tty[16];
 };
 
-struct SUPRAuditEntry {
-    SUPRAction action;
+struct KENAuditEntry {
+    KENAction action;
     char username[32];
     char detail[64];
     unsigned int timestamp;
 };
 
-class SUPR {
+class KEN {
 public:
     static void Init();
 
     // user management
-    static bool CreateUser(const char* username, const char* password, SUPRLevel level);
+    static bool CreateUser(const char* username, const char* password, KENLevel level);
     static bool DeleteUser(const char* username);
     static bool ChangePassword(const char* username, const char* old_pwd, const char* new_pwd);
     static bool LockUser(const char* username);
     static bool UnlockUser(const char* username);
-    static SUPRUser* FindUser(const char* username);
+    static KENUser* FindUser(const char* username);
     static int  GetUserCount();
-    static SUPRUser* GetUsers();
+    static KENUser* GetUsers();
 
     // authentication
     static int  Authenticate(const char* username, const char* password);  // returns session id or -1
     static void Logout(int session_id);
     static bool ValidateSession(int session_id);
-    static SUPRSession* GetSession(int session_id);
+    static KENSession* GetSession(int session_id);
     static int  GetCurrentSession();
     static void SetCurrentSession(int sid);
 
     // authorization
-    static bool CheckPermission(int session_id, SUPRLevel required);
+    static bool CheckPermission(int session_id, KENLevel required);
     static bool Escalate(int session_id, const char* password);  // su/sudo
-    static SUPRLevel GetLevel(int session_id);
+    static KENLevel GetLevel(int session_id);
 
     // ── auth policy (ksa) ──────────────────────────────────────────────
     // the active policy is derived from the two independent factors below.
-    static SUPRAuthMode GetAuthMode();          // derived: passwd/kvault/both
+    static KENAuthMode GetAuthMode();          // derived: passwd/kvault/both
     static bool IsPasswdEnabled();
     static bool IsKvaultEnabled();
-    static SUPRAuthPolicy GetPolicy();
+    static KENAuthPolicy GetPolicy();
 
     // verify a credential against root/sovereign without mutating the session.
     // used by the escalation gate as the password factor. (satoru)
@@ -118,7 +118,7 @@ public:
     static bool RunEscalationGate(int session_id, const char* password,
                                   const char* reason);
 
-    // sudo-style escalation for `supr <cmd>`: a line-based shell command can't
+    // sudo-style escalation for `ken <cmd>`: a line-based shell command can't
     // prompt for a password inline, so this runs the policy gate collecting the
     // credential/approval through the interactive ksa modal (available whenever
     // the hypervisor is, even if kvault is policy-off - it's just the secure
@@ -130,7 +130,7 @@ public:
     // policy mutation - these enforce the loophole rules and audit. each
     // returns true on success.  err (optional) receives a human reason on
     // failure. sovereign_override gates the dangerous "disable both" path.
-    static bool SetAuthMode(int session_id, SUPRAuthMode mode,
+    static bool SetAuthMode(int session_id, KENAuthMode mode,
                             bool sovereign_override, char* err, int err_max);
     static bool DisableKvault(int session_id, bool force, bool ack_risk,
                               bool sovereign_override, char* err, int err_max);
@@ -149,20 +149,20 @@ public:
     static bool PolicySelfTest();
 
     // audit
-    static void Log(SUPRAction action, const char* username, const char* detail);
-    static int  GetAuditLog(SUPRAuditEntry* entries, int max_entries);
+    static void Log(KENAction action, const char* username, const char* detail);
+    static int  GetAuditLog(KENAuditEntry* entries, int max_entries);
 
     // hash
     static void HashPassword(const char* password, const unsigned char* salt, unsigned char* hash_out);
     static void GenerateSalt(unsigned char* salt_out);
 
 private:
-    static SUPRUser users[SUPR_MAX_USERS];
+    static KENUser users[KEN_MAX_USERS];
     static int user_count;
-    static SUPRSession sessions[SUPR_MAX_SESSIONS];
+    static KENSession sessions[KEN_MAX_SESSIONS];
     static int current_session;
-    static SUPRAuditEntry audit_log[SUPR_MAX_LOG];
+    static KENAuditEntry audit_log[KEN_MAX_LOG];
     static int audit_count;
     static unsigned int rng_state;
-    static SUPRAuthPolicy policy;   // active auth policy (satoru)
+    static KENAuthPolicy policy;   // active auth policy (satoru)
 };

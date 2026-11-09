@@ -1,5 +1,5 @@
 //  kurono linux subsystem - user bridge
-//  bidirectional user synchronization between supr and linux
+//  bidirectional user synchronization between ken and linux
 #pragma once
 #include "../kernel/types.h"
 
@@ -7,13 +7,13 @@
 #define UB_SYNC_INTERVAL     30000   // ms between auto-syncs
 
 enum UBSyncDirection {
-    UB_SUPR_TO_LINUX = 0,
-    UB_LINUX_TO_SUPR = 1,
+    UB_KEN_TO_LINUX = 0,
+    UB_LINUX_TO_KEN = 1,
     UB_BIDIRECTIONAL = 2
 };
 
 enum UBConflictPolicy {
-    UB_SUPR_WINS = 0,      // supr data takes precedence
+    UB_KEN_WINS = 0,      // ken data takes precedence
     UB_LINUX_WINS = 1,     // linux /etc/passwd wins
     UB_NEWEST_WINS = 2,    // most recently modified wins
     UB_MANUAL = 3          // flag conflict for manual resolution
@@ -21,9 +21,9 @@ enum UBConflictPolicy {
 
 struct UBMappedUser {
     char     username[32];
-    int      supr_uid;      // uid in supr
+    int      ken_uid;      // uid in ken
     int      linux_uid;     // uid in linux /etc/passwd
-    int      supr_gid;
+    int      ken_gid;
     int      linux_gid;
     char     home[64];      // shared home directory
     char     shell[32];     // preferred shell
@@ -61,7 +61,7 @@ public:
     // query
     static UBMappedUser* FindMapped(const char* username);
     static int GetLinuxUID(const char* username);
-    static int GetSUPRUID(int linux_uid);
+    static int GetKENUID(int linux_uid);
     static UBMappedUser* GetMappedUsers();
     static int GetMappedCount();
 

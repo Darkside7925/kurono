@@ -1,4 +1,5 @@
 #include "smp.h"
+#include "../ui/boot_anim.h"
 #include "../drivers/serial.h"
 #include "../drivers/cpu_detect.h"
 #include "../kernel/pmm.h"
@@ -39,6 +40,19 @@ namespace {
     //  thread-dispatch gate (kurono.apthreads): aps also resume ready sibling
     //  threads, giving a multi-threaded process true parallelism. (satoru)
     volatile bool g_ap_thread_sched = false;
+
+    //  sched=2: per-cpu "halted in the dispatch loop" flags, set under cli right
+    //  before sti;hlt and claimed (cas 1->0) by the waker that sends the ipi. (satoru)
+    volatile uint8_t g_cpu_idle[SMP_MAX_CPUS] = {};
+    //  sched=2: CpuIndex via IA32_TSC_AUX (rdtscp). (satoru)
+    volatile bool g_tscaux = false;
+    //  sched=2 tlb acks: each cpu records the broadcast round it flushed for
+    //  (read BEFORE its cr3 reload, so a recorded round always means a flush that
+    //  came after that round's pte changes). a late ack from an old round can no
+    //  longer be counted toward a new one, which the shared counter allowed once
+    //  halted cpus ack late. (satoru)
+    volatile uint64_t g_tlb_acked_seq[SMP_MAX_CPUS] = {};
+    const uint32_t MSR_TSC_AUX = 0xC0000103u;
 
     //  tlb-shootdown ack counter: receivers increment after reloading cr3. (satoru)
     volatile uint32_t g_tlb_ack = 0;
@@ -441,7 +455,9 @@ void SMP::Init() {
     uint32_t cap = SMP_MAX_CPUS;
     bool cap_default = false;
     if (g_max_cpus_req) cap = g_max_cpus_req;
-    else if (BootAcpi::IsEfiBoot()) { cap = 8; cap_default = true; }
+    // sched=2 lifts the efi default: every cpu the madt lists, up to
+    // SMP_MAX_CPUS. kurono.maxcpus still wins. (satoru)
+    else if (BootAcpi::IsEfiBoot() && !Scheduler::SchedV2()) { cap = 8; cap_default = true; }
     if (cap > SMP_MAX_CPUS) cap = SMP_MAX_CPUS;
     if (cap < 1) cap = 1;
     if (g_x2apic || g_lapic_dead) cap = 1;   // aps cannot be brought up without a usable xapic path (satoru)
@@ -518,6 +534,14 @@ uint32_t SMP::ApicId() {
 }
 
 uint32_t SMP::CpuIndex() {
+    if (g_tscaux) {
+        // tsc_aux holds index+1 once this cpu programmed it; 0 = not yet (an ap
+        // in its first instructions), fall back to the lapic. (satoru)
+        uint32_t lo, hi, aux;
+        __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+        (void)lo; (void)hi;
+        if (aux && aux <= g_cpu_count) return aux - 1;
+    }
     uint32_t id = ApicId();
     if (id < 256 && g_apicid_to_index[id] >= 0) return (uint32_t)g_apicid_to_index[id];
     return 0;  // unknown -> treat as bsp (satoru)
@@ -574,6 +598,14 @@ extern "C" void ap_entry() {
     // serial here (shared console); the bsp reports the outcome via the online flag. (satoru)
     (void)x2apic_to_xapic();
     SMP::LapicEnable();
+    // sched=2 fast CpuIndex: program this cpu's tsc_aux = index+1 BEFORE anything
+    // calls CpuIndex (SetupAPCpuState does, right below). the index comes from
+    // the lapic map directly. (satoru)
+    if (g_tscaux) {
+        uint32_t aid = SMP::ApicId();
+        int ix = (aid < 256) ? g_apicid_to_index[aid] : -1;
+        wrmsr(MSR_TSC_AUX, ix >= 0 ? (uint64_t)(ix + 1) : 0);
+    }
     HAL::SetupAPCpuState();  // own gdt+tss, shared idt, per-core syscall msrs (satoru)
     SMP::SetupGsBase();      // KERNEL_GS_BASE -> this ap's PerCpu (after the gs reload) (satoru)
     PerCpu* me = SMP::Current();
@@ -615,6 +647,9 @@ extern "C" void ap_entry() {
 //     never-entered user process and run it via RunProcessWithArgs. (satoru)
 extern "C" [[noreturn]] void ap_dispatch_reenter() {
     uint32_t idx = SMP::CpuIndex();
+    // sched=2: drop the last task's cr3 before current goes null - a launcher
+    // that sees this cpu idle may destroy that address space at once. (satoru)
+    if (Scheduler::SchedV2()) SMP::LoadKernelCr3();
     Scheduler::SetCurrentForThisCpu(nullptr);   // no task on this cpu right now (satoru)
     Userspace::SetActiveForThisCpu(nullptr);    // no active user session either (satoru)
     //  idle maintenance throttle (task 17): a parked cpu must still advance the
@@ -629,6 +664,18 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
         //  while our walker can still fetch through them (garbage kernel
         //  translations = random corruption). cheap: compares before writing. (satoru)
         SMP::LoadKernelCr3();
+        // sched=2: this loop runs on the ap's own bring-up stack, so any task the
+        // cpu just left (park, exit, kill divert) is off-stack now - publish its
+        // on_cpu=0 so another cpu may resume or reap it. (satoru)
+        Scheduler::FinishSwitch();
+        // sched=2: point this cpu's rsp0 / ist1 / gs:8 back at its own stack (its
+        // bring-up state). they still named the kernel stack of the last task it
+        // ran, which kept a reaped task's stack from ever being freed - and an
+        // interrupt through ist1 would have landed on a freed stack. (satoru)
+        if (Scheduler::SchedV2()) { PerCpu* mc = SMP::Current(); if (mc && mc->kernel_stack_top && !Userspace::SessionIdleRsp(idx)) HAL::SetKernelStack(mc->kernel_stack_top); }
+        // boot animation job: one ap draws the emblem while the bsp boots; it
+        // returns here once the gui process takes the screen over. (satoru)
+        if (BootAnim::ApPending()) BootAnim::ApService();
         {
             uint64_t nowm = Timer::GetRealMs64();
             if (nowm != last_maint_ms) {   // at most once per ms (satoru)
@@ -638,6 +685,22 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
         }
         if (g_ap_thread_sched) {
             Process* t = Scheduler::ClaimReadyThreadForCpu(idx);
+            // (the apsched fresh-launch source below still polls, so it keeps the
+            // old spin when that gate is on.) (satoru)
+            if (!t && Scheduler::SchedV2() && !g_ap_user_sched) {
+                // sched=2 idle: publish "halted" with interrupts off, look once
+                // more, then sti;hlt (the sti shadow makes the pair atomic, so a
+                // kick that lands after the flag is set wakes the hlt instead of
+                // being taken before it). the lapic tick still wakes us every
+                // 10ms for the idle maintenance above. (satoru)
+                __asm__ volatile("cli" ::: "memory");
+                __atomic_store_n(&g_cpu_idle[idx], (uint8_t)1, __ATOMIC_SEQ_CST);
+                t = Scheduler::ClaimReadyThreadForCpu(idx);
+                if (!t) __asm__ volatile("sti; hlt" ::: "memory");
+                __atomic_store_n(&g_cpu_idle[idx], (uint8_t)0, __ATOMIC_RELEASE);
+                __asm__ volatile("sti" ::: "memory");
+                if (!t) continue;
+            }
             if (t) {
                 //  claim trace - THROTTLED: with the futex/nanosleep ap-park a
                 //  resume happens per wake (thousands/boot) and one serial line
@@ -659,7 +722,12 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
                 //  timer preempt keeps this cpu multiplexing ready threads, and a
                 //  thread exit with nothing left claimable irets back here. (satoru)
                 InterruptFrame f;
-                if (Scheduler::LoadUserFrame(t, &f)) {
+                //  a kill that landed after the claim dropped the lock: do not enter it. only
+                //  here - ScheduleNextUser has already released its cur before it loads, so a
+                //  false from LoadUserFrame there would leave cur running unowned (the review
+                //  11-07 early return did exactly that; one firefox #GP). (satoru)
+                if (__atomic_load_n((int*)&t->state, __ATOMIC_ACQUIRE) != (int)Process_Terminated &&
+                    Scheduler::LoadUserFrame(t, &f)) {
                     //  the per-cpu userspace-active gate: without it IsActive() is
                     //  false on this ap and the whole linux syscall layer no-ops
                     //  (no frame save, no linux current, sys_exit does nothing - 
@@ -678,7 +746,11 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
                     ap_enter_user_frame(&f);
                 }
                 //  load failed (no saved frame?) - put it back. (satoru)
-                t->state = Process_Ready;
+                {   // put it back - unless a kill landed meanwhile (audit 11-07 #1) (satoru)
+                    int st = (int)Process_Running;
+                    __atomic_compare_exchange_n((int*)&t->state, &st, (int)Process_Ready, false,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                }
                 Scheduler::SetCurrentForThisCpu(nullptr);
             }
         }
@@ -695,6 +767,7 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
                     g_ap_log_lock.UnlockIrqRestore(f);
                 }
                 int rc = Userspace::RunProcessWithArgs(t, nullptr, nullptr);
+                Scheduler::EndApLaunch(idx);   // agent_sched_10 (satoru)
                 {
                     uint64_t f; g_ap_log_lock.LockIrqSave(&f);
                     // drain what the user program printed (proves it ran on this ap). (satoru)
@@ -732,6 +805,80 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
     }
 }
 
+void SMP::EnableFastCpuIndex() {
+    if (!Scheduler::SchedV2()) return;
+    uint32_t a, b, c, d;
+    cpuid_ex(0x80000000u, 0, &a, &b, &c, &d);
+    if (a < 0x80000001u) return;
+    cpuid_ex(0x80000001u, 0, &a, &b, &c, &d);
+    if (!(d & (1u << 27))) {   // no rdtscp (satoru)
+        SerialLogger::Log("[sched2] no rdtscp, CpuIndex stays on the lapic\r\n");
+        return;
+    }
+    wrmsr(MSR_TSC_AUX, 1);   // the bsp is index 0 (satoru)
+    g_tscaux = true;
+    SerialLogger::Log("[sched2] CpuIndex via tsc_aux (rdtscp)\r\n");
+}
+
+// send one fixed ipi to a cpu by dense index. cli across the two icr writes so
+// an interrupt on this cpu cannot slip its own icr write in between, and wait
+// for delivery before returning so the next icr user (a tlb broadcast) never
+// overwrites a pending send. (satoru)
+static void send_fixed_ipi(uint32_t idx, uint8_t vec) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    icr_idle();
+    SMP::LapicWrite(0x310, g_cpus[idx].apic_id << 24);
+    SMP::LapicWrite(0x300, (1u << 14) | vec);   // fixed, assert, physical (satoru)
+    icr_idle();
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+bool SMP::DebugIdle(uint32_t idx) { return idx < SMP_MAX_CPUS && g_cpu_idle[idx]; }
+
+void SMP::KickCpu(uint32_t idx) {
+    if (!Scheduler::SchedV2() || idx >= g_cpu_count || idx == CpuIndex() || !g_cpus[idx].online) return;
+    send_fixed_ipi(idx, 0x42);
+}
+
+void SMP::KickOneIdle() {
+    if (!Scheduler::SchedV2() || g_cpu_count < 2) return;
+    static volatile uint32_t s_rr = 0;
+    uint32_t me = CpuIndex();
+    uint32_t start = __atomic_fetch_add(&s_rr, 1u, __ATOMIC_RELAXED);
+    for (uint32_t k = 0; k < g_cpu_count; k++) {
+        uint32_t c = 1u + (start + k) % (g_cpu_count - 1u);   // aps only (satoru)
+        if (c == me || !g_cpus[c].online) continue;
+        uint8_t one = 1;
+        if (!__atomic_compare_exchange_n(&g_cpu_idle[c], &one, (uint8_t)0, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+        send_fixed_ipi(c, 0x42);
+        return;
+    }
+}
+
+// like KickOneIdle, but only an idle ap that may run `p` (affinity, the clone pin, a
+// leader's session cpu): waking one that cannot claim it just re-halts it while the cpu
+// that could sleeps to its next 10 ms tick (audit 11-07 #5). no eligible idle ap = no
+// kick (a busy eligible cpu picks it up at its next pick; the bsp handles itself). (satoru)
+void SMP::KickIdleFor(const Process* p) {
+    if (!p) { KickOneIdle(); return; }
+    if (!Scheduler::SchedV2() || g_cpu_count < 2) return;
+    static volatile uint32_t s_rr2 = 0;
+    uint32_t me = CpuIndex();
+    uint32_t start = __atomic_fetch_add(&s_rr2, 1u, __ATOMIC_RELAXED);
+    for (uint32_t k = 0; k < g_cpu_count; k++) {
+        uint32_t c = 1u + (start + k) % (g_cpu_count - 1u);   // aps only (satoru)
+        if (c == me || !g_cpus[c].online) continue;
+        if (!Scheduler::CpuMayRun(p, c)) continue;
+        uint8_t one = 1;
+        if (!__atomic_compare_exchange_n(&g_cpu_idle[c], &one, (uint8_t)0, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+        send_fixed_ipi(c, 0x42);
+        return;
+    }
+}
+
 void SMP::SetApUserSched(bool on) { g_ap_user_sched = on; }
 bool SMP::ApUserSched()           { return g_ap_user_sched; }
 
@@ -751,6 +898,13 @@ void SMP::ApIdleFrame(InterruptFrame* f) {
     f->cs     = (uint64_t)GDT_KERNEL_CODE_SELECTOR;
     f->ss     = (uint64_t)GDT_KERNEL_DATA_SELECTOR;
     f->rsp    = me ? me->kernel_stack_top : 0;
+    // THE lockB rip=0x1 CRASH: under kurono.apsched the leader's
+    // RunProcessWithArgs launcher runs ON this ap's own stack (the dispatch loop
+    // called it). when a sibling thread exits or parks here, the cpu irets into
+    // the dispatch loop at the TOP of that same stack and overwrites the live
+    // launcher frame; the leader's later exit longjmps through the wreck. run
+    // the loop below the launcher frame instead. (satoru)
+    if (uint64_t srsp = Userspace::SessionIdleRsp(CpuIndex())) f->rsp = srsp;
     f->rflags = 0x202ULL;
 }
 
@@ -758,9 +912,51 @@ void SMP::ApIdleFrame(InterruptFrame* f) {
 //  self shorthand) and wait - bounded - for each online peer to ack. bounded
 //  because a peer may briefly sit with IF=0 (a spinlock hold); the per-ap timer
 //  cr3 reload in ApTimerPreempt bounds any missed window to one tick. (satoru)
+// sched=2 broadcast: a cpu halted in its dispatch loop sits on the kernel cr3
+// (LoadKernelCr3 runs before every idle check) and holds no user translation, so
+// it needs no flush - linux's lazy-tlb idea. waiting for halted vcpus to wake and
+// ack was the main cost of every munmap/mprotect once idle aps halt (sampled:
+// the kls holder in BroadcastTlbFlush while every other cpu spun on kls). a cpu
+// counts as done when it acked this round OR is observed halted. (satoru)
+static void broadcast_tlb_flush_v2() {
+    static volatile uint32_t s_bcast_lock2 = 0;
+    while (__atomic_exchange_n(&s_bcast_lock2, 1u, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+    uint64_t seq = __atomic_add_fetch(&g_tlb_flush_start_seq, 1u, __ATOMIC_SEQ_CST);
+    uint32_t me = SMP::CpuIndex();
+    for (int i = 0; i < 100000 && (SMP::LapicRead(0x300) & (1u << 12)); i++)
+        __asm__ volatile("pause");
+    SMP::LapicWrite(0x300, (3u << 18) | (1u << 14) | 0x41u);
+    uint64_t t0 = Timer::GetRealMs64();
+    for (;;) {
+        bool all = true;
+        for (uint32_t c = 0; c < g_cpu_count && all; c++) {
+            if (c == me || !g_cpus[c].online) continue;
+            if (__atomic_load_n(&g_tlb_acked_seq[c], __ATOMIC_ACQUIRE) >= seq) continue;
+            if (__atomic_load_n(&g_cpu_idle[c], __ATOMIC_ACQUIRE)) continue;
+            all = false;
+        }
+        if (all) {
+            uint64_t cur = __atomic_load_n(&g_tlb_flush_full_seq, __ATOMIC_ACQUIRE);
+            while (cur < seq &&
+                   !__atomic_compare_exchange_n(&g_tlb_flush_full_seq, &cur, seq,
+                                                false, __ATOMIC_SEQ_CST,
+                                                __ATOMIC_ACQUIRE)) { }
+            break;
+        }
+        if (Timer::GetRealMs64() - t0 > 20) {
+            __atomic_fetch_add(&g_tlb_flush_timeouts, 1u, __ATOMIC_RELAXED);
+            break;
+        }
+        __asm__ volatile("pause");
+    }
+    __atomic_store_n(&s_bcast_lock2, 0u, __ATOMIC_RELEASE);
+}
+
 void SMP::BroadcastTlbFlush() {
     uint32_t online = OnlineCount();
     if (online <= 1) return;
+    if (Scheduler::SchedV2()) { broadcast_tlb_flush_v2(); return; }
     //  serialize broadcasters: the kls historically serialized every caller,
     //  but the kmemx pending-free flushes from its own kernel process, so two
     //  rounds could share one ack counter - a peer's double-ack (collapsed
@@ -824,6 +1020,18 @@ uint32_t SMP::TlbFlushTimeouts() {
 }
 
 void SMP::HandleTlbIpi() {
+    if (Scheduler::SchedV2()) {
+        uint64_t s = __atomic_load_n(&g_tlb_flush_start_seq, __ATOMIC_ACQUIRE);
+        uint64_t c3v;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(c3v));
+        __asm__ volatile("mov %0, %%cr3" : : "r"(c3v) : "memory");
+        uint32_t me = CpuIndex();
+        if (me < SMP_MAX_CPUS) {
+            uint64_t old = __atomic_load_n(&g_tlb_acked_seq[me], __ATOMIC_RELAXED);
+            if (s > old) __atomic_store_n(&g_tlb_acked_seq[me], s, __ATOMIC_RELEASE);
+        }
+        return;
+    }
     uint64_t c3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
     __asm__ volatile("mov %0, %%cr3" : : "r"(c3) : "memory");

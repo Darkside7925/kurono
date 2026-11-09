@@ -17,6 +17,7 @@ public:
     static bool IsWebP(const uint8_t* p, size_t n);
     static Image DecodeRaw(uint32_t data_addr);
     static Image DecodeModule(uint32_t start, uint32_t end);
+    static Image DecodeMemory(const uint8_t* data, size_t size);   // png/jpeg in a buffer (satoru)
     static void DrawImage(const Image& img, int x, int y);
     static void DrawImageScaled(const Image& img, int x, int y, int tw, int th);
     static void DrawImageScaledAlpha(const Image& img, int x, int y, int tw, int th, uint8_t alpha_mul);

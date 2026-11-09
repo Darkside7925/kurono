@@ -4,7 +4,7 @@ An x86_64 operating system I'm writing from scratch in freestanding C++17 and as
 
 The two programs I judge it by are Firefox 140 and the Claude Code CLI. Both are the stock binaries, and both run on it in QEMU. On my actual laptop (Legion Pro 7, Core Ultra 7 255HX) both start, but they're slow and they stall, and I'm working on that.
 
-> **Status:** early, and moving fast. It boots on real hardware now, but it's only been tested on one real machine. About 30% of what I'm working on isn't pushed yet (multi-monitor and UI scaling are in there), and I expect it in a few days. Don't run it on a computer you care about without reading [the write guard](#the-write-guard).
+> **Status:** this is part 2 of the Kurono Kintsugi update, and it isn't the last part. I'm pushing what works now. Some of it is held back because it didn't go as planned, mainly GPU acceleration, which is still off by default while I test it on real hardware. It's only been tested on one real machine. Don't run it on a computer you care about without reading [the write guard](#the-write-guard).
 
 ---
 
@@ -13,18 +13,28 @@ The two programs I judge it by are Firefox 140 and the Claude Code CLI. Both are
 | | In QEMU | On my laptop |
 | --- | --- | --- |
 | UEFI boot to desktop | yes | yes |
-| SMP | up to 20 CPUs tested | 8 of 20 cores (default cap) |
-| USB keyboard and mouse | yes | yes |
+| SMP | up to 20 CPUs tested | 8 cores by default, all 20 with `kurono.sched=2` |
+| USB keyboard and mouse | yes, also behind hubs | yes (hub support is new, still testing) |
 | NVMe | yes | yes |
 | Ethernet | e1000, 82576, I225/I226 | I226-V at 1 Gbps with DHCP |
 | Intel HD Audio | yes | ALC287, but the speakers need an amp driver Kurono doesn't have |
 | USB audio | UAC1 | AirPods Max over USB-C (UAC2) |
 | Files that survive a reboot | yes | yes |
 | Claude Code, full interface | yes | answers, but stalls for minutes |
-| Firefox 140 | painted in every recent test boot | opens, but very slow, then freezes |
-| Multiple monitors | not pushed yet | no |
+| Firefox 140 | painted in every recent test boot | works, loads sites, still slow on heavy ones |
+| Multiple monitors | yes | internal panel + DP monitor on the Intel GPU |
 | Wi-Fi | no | no |
-| GPU acceleration | no | no |
+| GPU acceleration | flag only, off by default | held back, still testing |
+
+### New in Kintsugi part 2
+
+- **Apps as separate programs.** Calculator, Text Editor, Files, Task Manager, Media Player, the video player, Terminal and Settings can run as their own ring-3 programs (`kurono.r3apps=...`), so a crashing app can't take the OS down with it. The in-kernel versions are still there as a fallback.
+- **New apps and UI:** a rewritten Text Editor (tabs, syntax highlighting, regex find), a new Control Center, a better Files app, window snapping and Alt+Tab.
+- **One clipboard everywhere:** Kurono apps, Firefox and other Wayland apps, XWayland and Alpine apps, with a Super+V history.
+- **`ken` and KSA:** `ken` is Kurono's sudo. Admin actions go through KSA, an approval prompt that runs in an isolated hypervisor context so other programs can't fake or click it.
+- **All cores:** `kurono.sched=2` runs the scheduler across every CPU.
+- **Real `/proc`** for every task, kernel ones included, so `ps`, `top` and the Task Manager show real numbers.
+- **USB hubs**, network reliability fixes (DHCP renew, DNS fallback, TCP retransmit) and a lot of bug fixes.
 
 ### The desktop
 
@@ -44,14 +54,14 @@ Getting there is mostly finding everything your kernel gets subtly wrong. See [b
 
 ### Everything else in the box
 
-- **Kernel:** hybrid design, a driver framework (KDF), 8 core scheduler with per-CPU timers, and KMemX, a memory compressor (built and tested, but real boots don't compress anything yet).
+- **Kernel:** hybrid design, a driver framework (KDF), an SMP scheduler (8 cores by default, all of them with `kurono.sched=2`) with per-CPU timers, and KMemX, a memory compressor (built and tested, but real boots don't compress anything yet).
 - **Storage:** KFS, my own on-disk filesystem, plus ext4 and FAT32 support, NVMe, AHCI and USB mass storage.
 - **Networking:** a from-scratch TCP/IP stack with DHCP, window scaling and out-of-order reassembly.
 - **Audio:** a mixer and audio server, a PulseAudio-compatible server for Linux apps, HD Audio, USB audio.
 - **Languages:** KCL, Kurono's scripting language, plus small built-in Python and JavaScript interpreters.
 - **Shell:** 150+ commands across Kurono, Linux and Windows-flavored environments.
 - **Packages:** `kpkg`, with a boot-time update flow.
-- **Hypervisor:** a Type 1 stack with VT-x and AMD-V support. It needs VT-x or AMD-V exposed to Kurono, so inside most VMs that means nested virtualization. I haven't tried it on my laptop.
+- **Hypervisor:** a Type 1 stack with VT-x and AMD-V support. It boots Alpine Linux, and Alpine apps can show up on Kurono's desktop. Debian is still being tested. Inside most VMs it needs nested virtualization.
 
 ---
 
@@ -119,11 +129,10 @@ On real hardware, Kurono refuses every disk write outside the files on its own `
 
 ## What's next
 
-- Multi-monitor and UI scaling, in the unpushed part
-- Intel display driver, for real second-screen output
-- GPU acceleration, Intel first (a plan, nothing built yet)
-- Giving kernel background tasks their own core, so programs can't starve them
-- All 20 cores. The scheduler's affinity mask stops at 8 today
+- GPU acceleration on Intel. It's in this push behind flags (`kurono.igpu.accel=1`, `kurono.igpu.zerocopy=1`, `kurono.wpdamage=1`), but it's off by default until it's solid on real hardware
+- Moving more of the system out of the kernel: audio and networking next
+- KLD, so more unmodified Linux drivers run in sandboxes
+- KMemX actually compressing memory in real boots, and a much lower idle RAM use
 - Faster Firefox startup. It's about 30 s in a VM, and most of that is Firefox waiting on something
 - Wi-Fi. The BE200 needs firmware and a huge stack, so this is a long way off
 

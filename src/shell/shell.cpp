@@ -1,9 +1,11 @@
 #include "shell.h"
+#include "../system/kasset.h"   // on-demand assets (satoru)
 #include "linux_cmds.h"
 #include "windows_cmds.h"
 #include "../system/conduit.h"
 #include "../system/ui_config.h"
 #include "../ui/desktop.h"
+#include "../ui/boot_anim.h"
 #include "../fs/kvfs.h"
 #include "../fs/persist.h"
 #include "../linux/ext4.h"
@@ -27,12 +29,18 @@
 #include "../proc/kernel_locks.h"   // g_input_lock: shared with the input/gui pollers (satoru)
 #include "../proc/spinlock.h"
 #include "../media/embedded_media.h"
+#include "../userprogs/embedded_userprogs.h"   // ffmpeg on-demand symbols (satoru)
 #include "../drivers/serial.h"
 #include "../drivers/hda.h"
 #include "../drivers/audio_server.h"
 #include "../drivers/usb_audio.h"
 #include "../drivers/graphics.h"
+#include "../drivers/outputs.h"   // `display` command (satoru)
 #include "../drivers/gpu_probe.h"
+#include "../drivers/intel_display_probe.h"   // `gpuprobe` (satoru)
+#include "../drivers/intel_dp_aux.h"          // `gpuaux` (satoru)
+#include "../drivers/intel_modeset.h"         // `gpumode` (satoru)
+#include "../drivers/intel_accel.h"           // `gpuaccel` + hardware cursor pump hook (satoru)
 #include "../drivers/nvidia_gpu.h"
 #include "../drivers/amd_gpu.h"
 #include "../drivers/intel_gpu.h"
@@ -58,9 +66,14 @@
 #include "../drivers/keyboard.h"
 #include "../ui/wayland_server.h"   // route scroll to the surface under the pointer (satoru)
 #include "../system/input_manager.h"
-#include "../security/supr.h"   // supr policy / passwd commands (satoru)
-#include "../security/ksa.h"    // ksa status for `supr policy` (satoru)
+#include "../security/ken.h"   // ken policy / passwd commands (satoru)
+#include "../security/ksa.h"    // ksa status for `ken policy` (satoru)
 #include "../kcl/kcl.h"
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
+// test rig globals, defined in hal/hal.cpp (satoru)
+extern volatile uint32_t g_ffcrash_secs;
+extern volatile uint64_t g_ffcrash_as, g_ffcrash_at;
+extern volatile int g_ffreopen_left;
 
 //  kurono shell implementation
 
@@ -113,6 +126,9 @@ static bool sstart(const char* s, const char* prefix) {
 static bool should_show_guest_command(const char* name) {
     bool enabled = Hypervisor::IsLinuxGuestEnabled();
     LinuxGuestProfile profile = Hypervisor::GetLinuxGuestProfile();
+
+    // ken's aliases stay callable but are not advertised in the help list. (satoru)
+    if (seq(name, "supr") || seq(name, "sudo")) return false;
 
     if (seq(name, "alpine") || seq(name, "apk") || seq(name, "ffmpeg") ||
         seq(name, "ffprobe") || seq(name, "pwsh-setup")) {
@@ -400,10 +416,31 @@ void KuronoShell::ClearOutputChunkCallback() {
     g_shell_chunk_udata = nullptr;
 }
 
+// sched=2 per-worker shell context (see shell.h). (satoru)
+struct ShellWorkerCtx { void* kproc; volatile bool cancel; bool inc_used; };
+static ShellWorkerCtx g_shctx[8];
+static ShellWorkerCtx* shctx_cur() {
+    if (!Scheduler::SchedV2()) return nullptr;
+    void* me = (void*)Scheduler::GetCurrentProcess();
+    if (!me) return nullptr;
+    for (int i = 0; i < 8; i++) if (g_shctx[i].kproc == me) return &g_shctx[i];
+    return nullptr;
+}
+void KuronoShell::RegisterWorkerContext() {
+    void* me = (void*)Scheduler::GetCurrentProcess();
+    if (!me || shctx_cur()) return;
+    for (int i = 0; i < 8; i++)
+        if (!g_shctx[i].kproc) { g_shctx[i].cancel = false; g_shctx[i].inc_used = false; g_shctx[i].kproc = me; return; }
+}
+void KuronoShell::RequestCommandCancelFor(void* worker_kproc) {
+    for (int i = 0; i < 8; i++) if (worker_kproc && g_shctx[i].kproc == worker_kproc) g_shctx[i].cancel = true;
+}
+
 void KuronoShell::EmitIncrementalRange(const char* buf, int from, int to_exclusive) {
     if (!g_shell_chunk_cb || !buf || from >= to_exclusive || to_exclusive < from)
         return;
-    g_shell_incremental_used = true;
+    if (ShellWorkerCtx* c = shctx_cur()) c->inc_used = true;
+    else g_shell_incremental_used = true;
     constexpr int kChunk = 256;
     while (from < to_exclusive) {
         int n = to_exclusive - from;
@@ -414,14 +451,22 @@ void KuronoShell::EmitIncrementalRange(const char* buf, int from, int to_exclusi
 }
 
 bool KuronoShell::TakeIncrementalOutputUsed() {
+    if (ShellWorkerCtx* c = shctx_cur()) { bool u = c->inc_used; c->inc_used = false; return u; }
     bool used = g_shell_incremental_used;
     g_shell_incremental_used = false;
     return used;
 }
 
-void KuronoShell::ClearCommandCancel() { g_shell_cancel_requested = false; }
-void KuronoShell::RequestCommandCancel() { g_shell_cancel_requested = true; }
+void KuronoShell::ClearCommandCancel() {
+    if (ShellWorkerCtx* c = shctx_cur()) { c->cancel = false; return; }
+    g_shell_cancel_requested = false;
+}
+void KuronoShell::RequestCommandCancel() {
+    if (ShellWorkerCtx* c = shctx_cur()) { c->cancel = true; return; }
+    g_shell_cancel_requested = true;
+}
 bool KuronoShell::IsCommandCancelRequested() {
+    if (ShellWorkerCtx* c = shctx_cur()) return c->cancel;
     return g_shell_cancel_requested;
 }
 
@@ -430,6 +475,11 @@ extern "C" void ff_main_ring_dump();
 static int g_ff_jit_level = 0;
 void KuronoShell::SetFirefoxJit(int level) { g_ff_jit_level = level; }
 int  KuronoShell::GetFirefoxJit()          { return g_ff_jit_level; }
+
+// set only for the duration of PumpModalUI(): lets the pump run while a ksa
+// prompt is up and makes it route input to the prompt instead of the desktop.
+// (satoru)
+static bool g_pump_modal = false;
 
 void KuronoShell::PumpUI() {
     static bool reentrant = false;
@@ -443,6 +493,11 @@ void KuronoShell::PumpUI() {
     // events gtk silently drops = input dead in firefox) and the damage/swap
     // machinery (stale partial swaps = window-drag ghosts). (satoru)
     if (SMP::CpuIndex() != 0) return;
+    // a modal normally stands the generic pump down; the modal's own waiter
+    // uses PumpModalUI() to opt back in, and a starved gui lets this shared
+    // pump composite + service the modal as the fallback. (satoru)
+    if (KSA::SecureDesktopActive() && !g_pump_modal && !KSA::ModalActive()) return;
+    TaskMem::UiScope _tmui;   // kurono.taskmem=1: desktop work riding another task's syscall is the gui's (satoru)
 
     /* Always advance the wallclock so Time::GetTicks() (consumed by ping/DNS/etc.)
        keeps moving even while a synchronous shell command blocks the kernel
@@ -464,7 +519,7 @@ void KuronoShell::PumpUI() {
     // syscall. the block-and-yield discipline belongs at the specific BLOCKING
     // wait loops (they deschedule / SleepMs after releasing kls_lock), not in
     // this shared entry pump. (satoru)
-    {
+    if (!g_pump_modal) {
         uint32_t hb = KernelProcesses::LastGuiFrameMs();
         if (hb != 0 && (uint32_t)(Timer::GetRealMs() - hb) < 100u) return;
     }
@@ -509,7 +564,13 @@ void KuronoShell::PumpUI() {
         }
     }
 
-    InputManager::Poll();
+    // while a ksa modal is up the devices still feed the shared rings, but the
+    // prompt consumes them - not the desktop behind it. (satoru)
+    bool modal = KSA::ModalActive();
+    if (!modal) InputManager::Poll();
+    if (modal) {
+        KSA::PumpPromptInput();
+    } else {
 
     int scroll_delta = 0;
     while (Mouse::HasEvent()) {
@@ -555,7 +616,9 @@ void KuronoShell::PumpUI() {
         WaylandServer::ForwardPointerAxis(Mouse::mx, Mouse::my, 0, scroll_delta * 32);
         Window* fw = WindowManager::GetFocusedWindow();
         if (fw && fw->input && !WaylandServer::IsWaylandWindow(fw->id))
-            fw->input(fw, 3, scroll_delta, 0);
+            { TaskMem::WindowScope _tms(fw->id); fw->input(fw, 3, scroll_delta, 0); }
+    }
+
     }
 
     // the NetworkProcess is starved the same way as the gui loop once firefox
@@ -573,27 +636,44 @@ void KuronoShell::PumpUI() {
     // took nearly the whole core. now: draw on damage, a requested frame
     // deadline, or a live animation/drag; otherwise only a slow fallback
     // (clock), spaced at 8x the last pumped frame's cost and at least 1s.
-    if (Graphics::ShouldRender()) {
+    if (g_pump_modal || Graphics::ShouldRender()) {
         static uint32_t s_pump_cost_ms = 0, s_pump_last_ms = 0;
         uint32_t t = Timer::GetRealMs();
         bool want = Graphics::ConsumeUIDirty();
         if (Graphics::ConsumeFrameDue(t)) want = true;
         if (WindowManager::HasActiveAnimations() || WindowManager::IsDragging()) want = true;
+        if (KSA::ModalActive()) want = true;   // hover/typed echo, fallback or not (satoru)
         static int s_pump_mx = -1, s_pump_my = -1;   // the cursor is drawn per frame
         if (Mouse::mx != s_pump_mx || Mouse::my != s_pump_my) {
-            s_pump_mx = Mouse::mx; s_pump_my = Mouse::my; want = true;
+            // the hardware cursor plane moves without a frame when the intel
+            // accel stage owns it (kurono.igpu.accel=1). (satoru)
+            if (!IntelAccel::CursorUpdate(Mouse::mx, Mouse::my)) {
+                want = true;
+                // software cursor: repaint under the old and new footprint. (satoru)
+                if (s_pump_mx >= 0) Mouse::DamageCursor(s_pump_mx, s_pump_my);
+                Mouse::DamageCursor(Mouse::mx, Mouse::my);
+            }
+            s_pump_mx = Mouse::mx; s_pump_my = Mouse::my;
         }
         uint32_t fb = s_pump_cost_ms * 8 > 1000u ? s_pump_cost_ms * 8 : 1000u;
         if (want || (uint32_t)(t - s_pump_last_ms) >= fb) {
             s_pump_last_ms = t;
             DesktopEnvironment::Render();
+            if (KSA::ModalActive()) KSA::RenderPromptOverlay();   // modal over the live desktop (satoru)
             Mouse::DrawAt(Mouse::mx, Mouse::my);
+            BootAnim::Composite();   // boot animation overlay, no-op when done (satoru)
             Graphics::SwapBuffers();
             s_pump_cost_ms = Timer::GetRealMs() - t;
         }
     }
 
     reentrant = false;
+}
+
+void KuronoShell::PumpModalUI() {
+    g_pump_modal = true;
+    PumpUI();
+    g_pump_modal = false;
 }
 
 int KuronoShell::Execute(const char* cmdline, char* output, int max_output) {
@@ -1053,6 +1133,11 @@ static const char* const RTOOL_NAMES[] = {
 namespace ShellBuiltins {
     int cmd_crash(KuronoShell*, int, const char**, char*, int);
     int cmd_gpu(KuronoShell*, int, const char**, char*, int);
+    int cmd_gpuprobe(KuronoShell*, int, const char**, char*, int);
+    int cmd_gpuaux(KuronoShell*, int, const char**, char*, int);
+    int cmd_gpumode(KuronoShell*, int, const char**, char*, int);
+    int cmd_gpuaccel(KuronoShell*, int, const char**, char*, int);
+    int cmd_display(KuronoShell*, int, const char**, char*, int);
     int cmd_kurono(KuronoShell*, int, const char**, char*, int);
     int cmd_screenshot(KuronoShell*, int, const char**, char*, int);
     int cmd_cpufreq(KuronoShell*, int, const char**, char*, int);
@@ -1063,10 +1148,11 @@ namespace ShellBuiltins {
     int cmd_recovery(KuronoShell*, int, const char**, char*, int);
     int cmd_audio(KuronoShell*, int, const char**, char*, int);
     int cmd_wltest(KuronoShell*, int, const char**, char*, int);
+    int cmd_kapp(KuronoShell*, int, const char**, char*, int);   // kui/kui_launch.cpp (satoru)
     int cmd_pthtest(KuronoShell*, int, const char**, char*, int);
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
     int cmd_persisttest(KuronoShell*, int, const char**, char*, int);
-    int cmd_supr(KuronoShell*, int, const char**, char*, int);
+    int cmd_ken(KuronoShell*, int, const char**, char*, int);
     int cmd_firefox(KuronoShell*, int, const char**, char*, int);
     int cmd_claude(KuronoShell*, int, const char**, char*, int);
 }
@@ -1081,6 +1167,7 @@ void KuronoShell::RegisterBuiltins() {
     for (int i = 0; RTOOL_NAMES[i]; i++)
         RegisterCommand(RTOOL_NAMES[i], "Recovery toolbox (static linux binary)", ENV_AUTO, "recovery", cmd_rtool);
     RegisterCommand("wltest",   "Run the wl_shm wayland render test", ENV_AUTO, "media", cmd_wltest);
+    RegisterCommand("kapp",     "Run a ring-3 kui app from /system/apps", ENV_AUTO, "media", cmd_kapp);   // (satoru)
     RegisterCommand("pthtest",  "Run the pthreads (clone+futex) smoke test", ENV_AUTO, "media", cmd_pthtest);
     RegisterCommand("firefox",  "Launch Firefox (installs it first if needed)", ENV_AUTO, "apps", cmd_firefox);
     RegisterCommand("claude",   "Run Claude Code (loads the CLAUDE file from the KURONO partition)", ENV_AUTO, "apps", cmd_claude);
@@ -1102,6 +1189,11 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("restart",  "Restart shell",                ENV_KURONO, "builtin", cmd_restart);
     RegisterCommand("crash",    "Trigger kernel panic test",  ENV_KURONO, "system",  cmd_crash);
     RegisterCommand("gpu",      "Show GPU information",        ENV_KURONO, "system",  cmd_gpu);
+    RegisterCommand("gpuprobe", "Read-only Intel display register report", ENV_AUTO, "system", cmd_gpuprobe);
+    RegisterCommand("gpuaux",   "Intel DP AUX report: DPCD + EDID of attached sinks", ENV_AUTO, "system", cmd_gpuaux);
+    RegisterCommand("gpumode",  "Intel external DP on pipe B: status | light [hz] | off", ENV_AUTO, "system", cmd_gpumode);
+    RegisterCommand("gpuaccel", "Intel display acceleration: status | on | off | test", ENV_AUTO, "system", cmd_gpuaccel);
+    RegisterCommand("display",  "List / arrange display outputs", ENV_KURONO, "system",  cmd_display);
     RegisterCommand("sysinfo",  "System information",           ENV_KURONO, "builtin", cmd_sysinfo);
 
     // shell switch commands
@@ -1123,8 +1215,13 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("pwd",       "Print working directory",      ENV_KURONO, "filesystem",cmd_pwd);
     RegisterCommand("usermode",  "Run ring-3 demo process",      ENV_KURONO, "system",  cmd_usermode);
 
-    // ksa / supr - hypervisor-backed privilege prompts + auth policy. (satoru)
-    RegisterCommand("supr",      "Privilege & auth policy (KSA)", ENV_KURONO, "security", cmd_supr);
+    // ksa / ken - hypervisor-backed privilege prompts + auth policy. (satoru)
+    RegisterCommand("ken",      "Privilege & auth policy (KSA)", ENV_KURONO, "security", cmd_ken);
+    // sudo-style aliases: `sudo <command>` and the superseded `supr <command>`
+    // run it through the ken approval gate. ENV_AUTO so the terminal's bridge
+    // stubs exist. help hides both alias spellings. (satoru)
+    RegisterCommand("sudo",      "Run a command with administrator approval", ENV_AUTO, "security", cmd_ken);
+    RegisterCommand("supr",      "Hidden alias for ken", ENV_AUTO, "security", cmd_ken);
 
     // alpine vm bridge commands - embed alpine into shell
     RegisterCommand("alpine",   "Run command in Alpine VM",     ENV_KURONO, "system",  cmd_alpine);
@@ -1433,6 +1530,133 @@ int cmd_crash(KuronoShell* sh, int argc, const char** argv, char* out, int maxo)
     return p; // unreachable for real crashes
 }
 
+// display: list outputs and arrange them. changes are queued to the gui loop. (satoru)
+//   display                 list outputs
+//   display on|off N        switch output N on or off (never output 0)
+//   display primary N       make output N the primary (menu bar, dock, icons)
+//   display swap A B        exchange two outputs in the left-to-right order
+//   display layout h|v      lay outputs out horizontally or vertically
+//   display scale [PCT]     show / set the ui scale (100 125 150 200)
+int cmd_display(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh;
+    int p = 0;
+    auto num_arg = [&](int i) -> int {
+        if (i >= argc || !argv[i] || argv[i][0] < '0' || argv[i][0] > '9') return -1;
+        int v = 0; for (const char* c = argv[i]; *c >= '0' && *c <= '9'; c++) v = v * 10 + (*c - '0');
+        return v;
+    };
+    if (argc >= 2 && seq(argv[1], "scale")) {
+        int v = num_arg(2);
+        if (v < 0) {
+            p = sappend(out, p, maxo, "ui scale: "); p = sappend_int(out, p, maxo, Graphics::GetUIScale());
+            p = sappend(out, p, maxo, "%\nlogical "); p = sappend_int(out, p, maxo, Graphics::GetWidth());
+            p = sappend(out, p, maxo, "x"); p = sappend_int(out, p, maxo, Graphics::GetHeight());
+            p = sappend(out, p, maxo, "\n");
+        } else if (v < 100 || v > 300) {
+            p = sappend(out, p, maxo, "scale must be 100..300 (steps 100 125 150 200)\n");
+        } else {
+            Graphics::RequestUIScale(v);
+            p = sappend(out, p, maxo, "ui scale requested: "); p = sappend_int(out, p, maxo, v);
+            p = sappend(out, p, maxo, "%\n");
+        }
+        return 0;
+    }
+    if (argc >= 2 && !seq(argv[1], "list")) {
+        bool multi = Graphics::MultiActive();
+        if (!multi) { p = sappend(out, p, maxo, "multi-monitor is not active (single output)\n"); return 1; }
+        int a = num_arg(2), b = num_arg(3);
+        if (seq(argv[1], "on") && a >= 0)            Graphics::RequestOutputOp(1, a, 0);
+        else if (seq(argv[1], "off") && a > 0)       Graphics::RequestOutputOp(2, a, 0);
+        else if (seq(argv[1], "primary") && a > 0)   Graphics::RequestOutputOp(3, a, 0);
+        else if (seq(argv[1], "swap") && a >= 0 && b >= 0) Graphics::RequestOutputOp(6, a, b);
+        else if (seq(argv[1], "layout") && argc >= 3 && (argv[2][0] == 'h' || argv[2][0] == 'v'))
+            Graphics::RequestOutputOp(argv[2][0] == 'h' ? 4 : 5, 0, 0);
+        else { p = sappend(out, p, maxo, "usage: display [list] | on N | off N | primary N | swap A B | layout h|v | scale [PCT]\n"); return 1; }
+        p = sappend(out, p, maxo, "queued; applied at the next frame\n");
+        return 0;
+    }
+    p = sappend(out, p, maxo, "outputs: "); p = sappend_int(out, p, maxo, Outputs::Connected());
+    p = sappend(out, p, maxo, " connected, ui scale "); p = sappend_int(out, p, maxo, Graphics::GetUIScale());
+    p = sappend(out, p, maxo, "%, desktop "); p = sappend_int(out, p, maxo, Graphics::GetWidth());
+    p = sappend(out, p, maxo, "x"); p = sappend_int(out, p, maxo, Graphics::GetHeight());
+    p = sappend(out, p, maxo, Outputs::Vertical() ? " (vertical)\n" : " (horizontal)\n");
+    if (!Graphics::MultiActive()) {
+        p = sappend(out, p, maxo, "  #0 single framebuffer, primary\n");
+        return 0;
+    }
+    for (int i = 0; i < Outputs::Total(); i++) {
+        const Output* o = Outputs::Get(i);
+        if (!o) continue;
+        p = sappend(out, p, maxo, "  #"); p = sappend_int(out, p, maxo, i);
+        p = sappend(out, p, maxo, " "); p = sappend(out, p, maxo, o->name);
+        p = sappend(out, p, maxo, o->connected ? " on  " : " off ");
+        p = sappend(out, p, maxo, i == 0 ? "primary " : "        ");
+        p = sappend(out, p, maxo, "at "); p = sappend_int(out, p, maxo, o->x);
+        p = sappend(out, p, maxo, ","); p = sappend_int(out, p, maxo, o->y);
+        p = sappend(out, p, maxo, " logical "); p = sappend_int(out, p, maxo, o->w);
+        p = sappend(out, p, maxo, "x"); p = sappend_int(out, p, maxo, o->h);
+        p = sappend(out, p, maxo, " hw "); p = sappend_int(out, p, maxo, o->pw);
+        p = sappend(out, p, maxo, "x"); p = sappend_int(out, p, maxo, o->ph);
+        p = sappend(out, p, maxo, " pitch "); p = sappend_int(out, p, maxo, (int)o->pitch);
+        p = sappend(out, p, maxo, o->swap_rb ? " rgb" : " bgr");
+        p = sappend(out, p, maxo, "\n");
+    }
+    return 0;
+}
+
+// re-runs the stage 0 intel display probe: same [igpu] lines into the
+// serial log and into the terminal. read-only. (satoru)
+int cmd_gpuprobe(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    return IntelDisplayProbe::Run(out, maxo);
+}
+
+// re-runs the stage 1 dp aux probe (dpcd + edid reads, no modeset): the
+// [igpu-aux] lines go to the serial log and the terminal. when stage 0 has
+// no usable engine on record it reruns that first (serial only). (satoru)
+int cmd_gpuaux(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh; (void)argc; (void)argv;
+    if (!IntelDisplayProbe::Mmio()) IntelDisplayProbe::Run(nullptr, 0);
+    return IntelDpAux::Run(out, maxo);
+}
+
+// stage 2: `gpumode status`, `gpumode light [hz]` (light the external dp
+// sink stage 1 found, edid timing nearest hz at the native resolution,
+// default 60), `gpumode off`. [igpu-mode] lines go to the serial log and
+// the terminal. (satoru)
+int cmd_gpumode(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh;
+    const char* sub = argc >= 2 ? argv[1] : "status";
+    auto eq = [](const char* a, const char* b) { while (*a && *a == *b) { a++; b++; } return *a == *b; };
+    if (!IntelDisplayProbe::Mmio()) IntelDisplayProbe::Run(nullptr, 0);
+    if (eq(sub, "light")) {
+        uint32_t hz = 0;
+        if (argc >= 3) for (const char* c = argv[2]; *c >= '0' && *c <= '9'; c++) hz = hz * 10 + (uint32_t)(*c - '0');
+        return IntelModeset::Light(out, maxo, hz);
+    }
+    if (eq(sub, "off")) return IntelModeset::Off(out, maxo);
+    if (eq(sub, "status")) return IntelModeset::Status(out, maxo);
+    int p = sappend(out, 0, maxo, "usage: gpumode status | light [hz] | off\n");
+    return p;
+}
+
+// stage 3a: intel hardware cursor plane. status | on | off | test. the `on`
+// and `test` subcommands run the same self-test the boot flag does, with the
+// same rollback, and log [igpu-accel] lines to serial and to the terminal.
+// (satoru)
+int cmd_gpuaccel(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh;
+    const char* sub = argc >= 2 ? argv[1] : "status";
+    auto eq = [](const char* a, const char* b) { while (*a && *a == *b) { a++; b++; } return *a == *b; };
+    if (eq(sub, "on") || eq(sub, "test")) {
+        int p = IntelAccel::Enable(out, maxo);
+        return p;
+    }
+    if (eq(sub, "off")) return IntelAccel::Off(out, maxo);
+    if (eq(sub, "status")) return IntelAccel::Status(out, maxo);
+    return sappend(out, 0, maxo, "usage: gpuaccel status | on | off | test\n");
+}
+
 int cmd_gpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = 0;
@@ -1609,9 +1833,22 @@ static void persist_kvfs() {
     PersistStore::SaveTree();
 }
 
+// shutdown film (ui/boot_anim): the gui loop plays the boot animation in
+// reverse while this command waits, bounded so a stuck display can never
+// block the power-off. a no-op when animations are off. (satoru)
+static void play_shutdown_film() {
+    if (!BootAnim::StartShutdown(0)) return;
+    uint64_t t0 = Timer::GetRealMs64();
+    while (!BootAnim::ShutdownDone() && Timer::GetRealMs64() - t0 < 9000u) {
+        KuronoShell::PumpUI();
+        Scheduler::SleepMs(10);
+    }
+}
+
 int cmd_reboot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Rebooting...\n");
+    play_shutdown_film();
     persist_kvfs();   // save desktop fs before reboot (satoru)
     HAL::Reboot();
     return p;
@@ -1620,6 +1857,7 @@ int cmd_reboot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
 int cmd_shutdown(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Shutting down...\n");
+    play_shutdown_film();
     persist_kvfs();   // save desktop fs before power-off (satoru)
     HAL::PowerOff();          // acpi/emulator soft power-off; does not return (satoru)
     return p;
@@ -1718,6 +1956,7 @@ int cmd_cpufreq(KuronoShell* sh, int argc, const char** argv, char* out, int max
 int cmd_poweroff(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Powering off...\n");
+    play_shutdown_film();
     persist_kvfs();
     HAL::PowerOff();
     return p;
@@ -1894,6 +2133,7 @@ int cmd_usermode(KuronoShell* sh, int argc, const char** argv, char* out, int ma
 int cmd_ffmpeg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     if (!Userspace::IsReady()) Userspace::Init();
+    KAsset::EnsureVfsFile("/usr/bin/ffmpeg", "FFMPEG  ELF", _binary_ffmpeg_elf_start, _binary_ffmpeg_elf_end);   // on demand (satoru)
     if (!KVFS::Exists("/usr/bin/ffmpeg")) {
         return sappend(out, 0, mx, "ffmpeg: /usr/bin/ffmpeg not present in this build\n");
     }
@@ -1910,7 +2150,7 @@ int cmd_ffmpeg(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
     const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", "TMPDIR=/tmp", nullptr };
 
     LinuxSyscall::ClearConsoleOutput();
-    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);   // user program (satoru)
     int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
     if (p < 0) p = 0;
     out[p] = 0;
@@ -1951,10 +2191,17 @@ int cmd_rtool(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     for (int i = 0; i < argc && n < 39; i++) av[n++] = argv[i];
     av[n] = nullptr;
     bool pty = TerminalApp::PtyBegin();   // interactive tools (busybox sh) get a real tty (satoru)
+    bool from_user = LinuxSyscall::BridgeTty() >= 0;   // launched by a ring-3 shell (satoru)
+    // the terminal's own shell is `busybox sh`; it must run as the normal user
+    // so everything typed into it is unprivileged and sudo is the way up. other
+    // recovery tools launched by a kernel gate (rtest) stay privileged. (satoru)
+    bool term_shell = (seq(argv[0], "busybox") && argc > 1 &&
+                       (seq(argv[1], "sh") || seq(argv[1], "-sh")));
     const char* envp[] = { "PATH=/system/bin:/usr/bin", "HOME=/root", "TMPDIR=/tmp",
                            pty ? "TERM=xterm-256color" : "TERM=dumb", nullptr };
     LinuxSyscall::ClearConsoleOutput();
-    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    uint32_t rtool_uid = (from_user || term_shell) ? 1000u : 0u;
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, rtool_uid, rtool_uid);
     if (pty) TerminalApp::PtyEnd();
     int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
     if (p < 0) p = 0;
@@ -2050,7 +2297,7 @@ int cmd_recovery(KuronoShell* sh, int argc, const char** argv, char* out, int mx
         const char* envp[] = { "PATH=/usr/bin", "HOME=/root",
                                "DSAI_MODEL=deepseek-v4-flash", nullptr };
         LinuxSyscall::ClearConsoleOutput();
-        int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+        int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);   // user program (satoru)
         p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
         if (p < 0) p = 0;
         out[p] = 0;
@@ -2093,7 +2340,7 @@ int cmd_recovery(KuronoShell* sh, int argc, const char** argv, char* out, int mx
 
 // `claude [args]` - runs the real, unmodified claude code cli (linux x64 musl, ~300 mb). the
 // binary is NOT in the kernel image: it is the root file CLAUDE on the fat32 partition labelled
-// KURONO, read (never written) into memory on first use and exposed as /usr/bin/claude.
+// KURONO, read (never written) into memory on first use and exposed as /system/bin/claude (guest /usr/bin/claude).
 // env for the process comes from shell variables (ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY,
 // ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL) and from NAME=value lines in /etc/claude.env, both set
 // at runtime by the user - nothing is baked into the image. HOME is /home/user, which the
@@ -2223,7 +2470,7 @@ int cmd_wltest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
                            "XDG_RUNTIME_DIR=/system/run/user/1000",
                            "WAYLAND_DISPLAY=wayland-0", nullptr };
     LinuxSyscall::ClearConsoleOutput();
-    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);   // user program (satoru)
     int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
     if (p < 0) p = 0;
     out[p] = 0;
@@ -2250,7 +2497,7 @@ int cmd_pthtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     const char* av[] = { "pthread_test", nullptr };
     const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
     LinuxSyscall::ClearConsoleOutput();
-    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);   // user program (satoru)
     int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
     if (p < 0) p = 0;
     out[p] = 0;
@@ -2313,6 +2560,132 @@ extern "C" {
 // name to go by), so gtk aborts on its first icon. magic + globs2 cover the
 // formats the built-in loaders decode.
 static const unsigned char kMimeMagic[] = { 0x4d, 0x49, 0x4d, 0x45, 0x2d, 0x4d, 0x61, 0x67, 0x69, 0x63, 0x00, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x70, 0x6e, 0x67, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x08, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x6a, 0x70, 0x65, 0x67, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x03, 0xff, 0xd8, 0xff, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x67, 0x69, 0x66, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x04, 0x47, 0x49, 0x46, 0x38, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x62, 0x6d, 0x70, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x02, 0x42, 0x4d, 0x0a, 0x5b, 0x35, 0x30, 0x3a, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x76, 0x6e, 0x64, 0x2e, 0x6d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66, 0x74, 0x2e, 0x69, 0x63, 0x6f, 0x6e, 0x5d, 0x0a, 0x3e, 0x30, 0x3d, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00, 0x0a };
+// gschemas.compiled for gtk3's org.gtk.Settings.{FileChooser,ColorChooser,Debug,
+// EmojiChooser} (glib-compile-schemas 2.84 from the gtk3 schema xml). the firefox
+// package ships no gsettings schemas, and gtk's file chooser (open file, save page
+// as, a download's "save as") g_error()s "No GSettings schemas are installed" -
+// a breakpoint trap that killed firefox. gio reads it from
+// $XDG_DATA_DIRS/glib-2.0/schemas. (satoru)
+static const unsigned char kGSchemasCompiled[] = {
+    0x47, 0x56, 0x61, 0x72, 0x69, 0x61, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00,
+    0xac, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x61, 0x04, 0x0c, 0x93, 0x03, 0x00, 0x00, 0x00,
+    0xac, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x48, 0x00, 0xc8, 0x00, 0x00, 0x00, 0xc8, 0x02, 0x00, 0x00, 0xc0, 0x5b, 0x50, 0x3e,
+    0x03, 0x00, 0x00, 0x00, 0x30, 0x06, 0x00, 0x00, 0x1d, 0x00, 0x48, 0x00, 0x50, 0x06, 0x00, 0x00, 0xc8, 0x06, 0x00, 0x00,
+    0x75, 0xae, 0xde, 0x0c, 0x03, 0x00, 0x00, 0x00, 0x5a, 0x07, 0x00, 0x00, 0x1d, 0x00, 0x48, 0x00, 0x78, 0x07, 0x00, 0x00,
+    0xd4, 0x07, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x25, 0x08, 0x00, 0x00, 0x00, 0x00, 0x4c, 0x00,
+    0x28, 0x08, 0x00, 0x00, 0x38, 0x08, 0x00, 0x00, 0xb5, 0x5a, 0xe1, 0xbc, 0x03, 0x00, 0x00, 0x00, 0x38, 0x08, 0x00, 0x00,
+    0x16, 0x00, 0x48, 0x00, 0x50, 0x08, 0x00, 0x00, 0xc8, 0x08, 0x00, 0x00, 0x6f, 0x72, 0x67, 0x2e, 0x67, 0x74, 0x6b, 0x2e,
+    0x53, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x2e, 0x46, 0x69, 0x6c, 0x65, 0x43, 0x68, 0x6f, 0x6f, 0x73, 0x65, 0x72,
+    0x00, 0x00, 0x00, 0x28, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
+    0x0d, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
+    0x8a, 0x22, 0x43, 0x70, 0x11, 0x00, 0x00, 0x00, 0xc8, 0x02, 0x00, 0x00, 0x0c, 0x00, 0x76, 0x00, 0xd8, 0x02, 0x00, 0x00,
+    0x0a, 0x03, 0x00, 0x00, 0xdf, 0xc2, 0x53, 0x05, 0x11, 0x00, 0x00, 0x00, 0x0a, 0x03, 0x00, 0x00, 0x0f, 0x00, 0x76, 0x00,
+    0x20, 0x03, 0x00, 0x00, 0x25, 0x03, 0x00, 0x00, 0x50, 0x35, 0x5b, 0x51, 0x11, 0x00, 0x00, 0x00, 0x25, 0x03, 0x00, 0x00,
+    0x0d, 0x00, 0x76, 0x00, 0x38, 0x03, 0x00, 0x00, 0x7a, 0x03, 0x00, 0x00, 0x89, 0xf2, 0xc0, 0x80, 0x11, 0x00, 0x00, 0x00,
+    0x7a, 0x03, 0x00, 0x00, 0x10, 0x00, 0x76, 0x00, 0x90, 0x03, 0x00, 0x00, 0x95, 0x03, 0x00, 0x00, 0xd9, 0xa1, 0x01, 0x08,
+    0x11, 0x00, 0x00, 0x00, 0x95, 0x03, 0x00, 0x00, 0x0b, 0x00, 0x76, 0x00, 0xa0, 0x03, 0x00, 0x00, 0xd6, 0x03, 0x00, 0x00,
+    0x7f, 0xe6, 0x22, 0x4f, 0x11, 0x00, 0x00, 0x00, 0xd6, 0x03, 0x00, 0x00, 0x0b, 0x00, 0x76, 0x00, 0xe8, 0x03, 0x00, 0x00,
+    0xed, 0x03, 0x00, 0x00, 0x07, 0xd1, 0x18, 0x94, 0x11, 0x00, 0x00, 0x00, 0xed, 0x03, 0x00, 0x00, 0x0c, 0x00, 0x76, 0x00,
+    0x00, 0x04, 0x00, 0x00, 0x2a, 0x04, 0x00, 0x00, 0xfd, 0xcc, 0xd8, 0xec, 0x11, 0x00, 0x00, 0x00, 0x2a, 0x04, 0x00, 0x00,
+    0x0b, 0x00, 0x76, 0x00, 0x38, 0x04, 0x00, 0x00, 0x82, 0x04, 0x00, 0x00, 0xc1, 0x5a, 0x17, 0x0f, 0x11, 0x00, 0x00, 0x00,
+    0x82, 0x04, 0x00, 0x00, 0x0e, 0x00, 0x76, 0x00, 0x90, 0x04, 0x00, 0x00, 0x95, 0x04, 0x00, 0x00, 0xdf, 0x84, 0xcf, 0x05,
+    0x11, 0x00, 0x00, 0x00, 0x95, 0x04, 0x00, 0x00, 0x0f, 0x00, 0x76, 0x00, 0xa8, 0x04, 0x00, 0x00, 0xb7, 0x04, 0x00, 0x00,
+    0xc0, 0x7d, 0x7e, 0x0b, 0xff, 0xff, 0xff, 0xff, 0xb7, 0x04, 0x00, 0x00, 0x05, 0x00, 0x76, 0x00, 0xc0, 0x04, 0x00, 0x00,
+    0xe2, 0x04, 0x00, 0x00, 0xac, 0xc4, 0x80, 0xae, 0x11, 0x00, 0x00, 0x00, 0xe2, 0x04, 0x00, 0x00, 0x0d, 0x00, 0x76, 0x00,
+    0xf0, 0x04, 0x00, 0x00, 0xf8, 0x04, 0x00, 0x00, 0x08, 0x27, 0xe4, 0xf8, 0x11, 0x00, 0x00, 0x00, 0xf8, 0x04, 0x00, 0x00,
+    0x0b, 0x00, 0x76, 0x00, 0x08, 0x05, 0x00, 0x00, 0x52, 0x05, 0x00, 0x00, 0x85, 0xad, 0x8c, 0x62, 0x11, 0x00, 0x00, 0x00,
+    0x52, 0x05, 0x00, 0x00, 0x0b, 0x00, 0x76, 0x00, 0x60, 0x05, 0x00, 0x00, 0x6f, 0x05, 0x00, 0x00, 0xec, 0xc2, 0x37, 0xd4,
+    0x11, 0x00, 0x00, 0x00, 0x6f, 0x05, 0x00, 0x00, 0x16, 0x00, 0x76, 0x00, 0x88, 0x05, 0x00, 0x00, 0x8d, 0x05, 0x00, 0x00,
+    0x76, 0x62, 0x27, 0x10, 0x11, 0x00, 0x00, 0x00, 0x8d, 0x05, 0x00, 0x00, 0x0a, 0x00, 0x76, 0x00, 0x98, 0x05, 0x00, 0x00,
+    0xd6, 0x05, 0x00, 0x00, 0xd0, 0x4f, 0xea, 0xb9, 0x11, 0x00, 0x00, 0x00, 0xd6, 0x05, 0x00, 0x00, 0x10, 0x00, 0x76, 0x00,
+    0xe8, 0x05, 0x00, 0x00, 0xed, 0x05, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xed, 0x05, 0x00, 0x00,
+    0x00, 0x00, 0x4c, 0x00, 0xf0, 0x05, 0x00, 0x00, 0x30, 0x06, 0x00, 0x00, 0x73, 0x74, 0x61, 0x72, 0x74, 0x75, 0x70, 0x2d,
+    0x6d, 0x6f, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x72, 0x65, 0x63, 0x65, 0x6e, 0x74, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0x72, 0x65, 0x63, 0x65, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0x63, 0x77, 0x64, 0x00, 0x00, 0x00, 0xff, 0x07, 0x00, 0x28, 0x73, 0x28, 0x79, 0x61, 0x75, 0x29, 0x29, 0x6c, 0x61,
+    0x73, 0x74, 0x2d, 0x66, 0x6f, 0x6c, 0x64, 0x65, 0x72, 0x2d, 0x75, 0x72, 0x69, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x28, 0x73, 0x29, 0x6c, 0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2d, 0x6d, 0x6f, 0x64, 0x65, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x70, 0x61, 0x74, 0x68, 0x2d, 0x62, 0x61, 0x72, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0x70, 0x61, 0x74, 0x68, 0x2d, 0x62, 0x61, 0x72, 0x00, 0x00, 0xff, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0x66, 0x69, 0x6c, 0x65, 0x6e, 0x61, 0x6d, 0x65, 0x2d, 0x65, 0x6e, 0x74, 0x72, 0x79, 0x00, 0x00, 0x00, 0x00, 0xff,
+    0x09, 0x00, 0x28, 0x73, 0x28, 0x79, 0x61, 0x75, 0x29, 0x29, 0x73, 0x68, 0x6f, 0x77, 0x2d, 0x73, 0x69, 0x7a, 0x65, 0x2d,
+    0x63, 0x6f, 0x6c, 0x75, 0x6d, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x28, 0x62, 0x29, 0x64, 0x61, 0x74,
+    0x65, 0x2d, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x72, 0x65, 0x67, 0x75, 0x6c, 0x61, 0x72, 0x00, 0x65, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0x72, 0x65, 0x67, 0x75, 0x6c, 0x61, 0x72, 0x00, 0x00, 0x00, 0xff, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0x77, 0x69, 0x74, 0x68, 0x2d, 0x74, 0x69, 0x6d, 0x65, 0x00, 0xff, 0x08, 0x00, 0x28, 0x73, 0x28, 0x79, 0x61, 0x75,
+    0x29, 0x29, 0x73, 0x68, 0x6f, 0x77, 0x2d, 0x68, 0x69, 0x64, 0x64, 0x65, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x28, 0x62, 0x29, 0x63, 0x6c, 0x6f, 0x63, 0x6b, 0x2d, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x32, 0x34, 0x68, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x32, 0x34, 0x68,
+    0x00, 0x00, 0x00, 0xff, 0x01, 0x00, 0x00, 0x00, 0xff, 0x31, 0x32, 0x68, 0x00, 0x00, 0x00, 0xff, 0x04, 0x00, 0x28, 0x73,
+    0x28, 0x79, 0x61, 0x75, 0x29, 0x29, 0x74, 0x79, 0x70, 0x65, 0x2d, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x00, 0x00, 0x00,
+    0x63, 0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0x6d, 0x69, 0x6d, 0x65, 0x00, 0x00, 0xff, 0x01, 0x00, 0x00, 0x00, 0xff, 0x64, 0x65, 0x73, 0x63, 0x72, 0x69, 0x70,
+    0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0xff, 0x02, 0x00, 0x00, 0x00, 0xff, 0x63, 0x61, 0x74, 0x65, 0x67, 0x6f, 0x72,
+    0x79, 0x00, 0x00, 0xff, 0x09, 0x00, 0x28, 0x73, 0x28, 0x79, 0x61, 0x75, 0x29, 0x29, 0x65, 0x78, 0x70, 0x61, 0x6e, 0x64,
+    0x2d, 0x66, 0x6f, 0x6c, 0x64, 0x65, 0x72, 0x73, 0x00, 0x00, 0x28, 0x62, 0x29, 0x77, 0x69, 0x6e, 0x64, 0x6f, 0x77, 0x2d,
+    0x70, 0x6f, 0x73, 0x69, 0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x28, 0x28, 0x69, 0x69, 0x29, 0x29, 0x2e, 0x70, 0x61, 0x74, 0x68, 0x00, 0x00, 0x00, 0x00, 0x2f, 0x6f, 0x72, 0x67,
+    0x2f, 0x67, 0x74, 0x6b, 0x2f, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x2f, 0x66, 0x69, 0x6c, 0x65, 0x2d, 0x63,
+    0x68, 0x6f, 0x6f, 0x73, 0x65, 0x72, 0x2f, 0x00, 0x00, 0x73, 0x73, 0x69, 0x64, 0x65, 0x62, 0x61, 0x72, 0x2d, 0x77, 0x69,
+    0x64, 0x74, 0x68, 0x00, 0x94, 0x00, 0x00, 0x00, 0x00, 0x28, 0x69, 0x29, 0x73, 0x6f, 0x72, 0x74, 0x2d, 0x63, 0x6f, 0x6c,
+    0x75, 0x6d, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6e, 0x61, 0x6d, 0x65, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0x6e, 0x61, 0x6d, 0x65, 0x00, 0x00, 0xff, 0x01, 0x00, 0x00, 0x00, 0xff, 0x73, 0x69, 0x7a,
+    0x65, 0x00, 0x00, 0xff, 0x02, 0x00, 0x00, 0x00, 0xff, 0x74, 0x79, 0x70, 0x65, 0x00, 0x00, 0xff, 0x03, 0x00, 0x00, 0x00,
+    0xff, 0x6d, 0x6f, 0x64, 0x69, 0x66, 0x69, 0x65, 0x64, 0x00, 0x00, 0xff, 0x05, 0x00, 0x28, 0x73, 0x28, 0x79, 0x61, 0x75,
+    0x29, 0x29, 0x77, 0x69, 0x6e, 0x64, 0x6f, 0x77, 0x2d, 0x73, 0x69, 0x7a, 0x65, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x28, 0x28, 0x69, 0x69, 0x29, 0x29, 0x73, 0x6f, 0x72, 0x74, 0x2d, 0x64, 0x69, 0x72, 0x65,
+    0x63, 0x74, 0x6f, 0x72, 0x69, 0x65, 0x73, 0x2d, 0x66, 0x69, 0x72, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x62,
+    0x29, 0x73, 0x6f, 0x72, 0x74, 0x2d, 0x6f, 0x72, 0x64, 0x65, 0x72, 0x00, 0x61, 0x73, 0x63, 0x65, 0x6e, 0x64, 0x69, 0x6e,
+    0x67, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x61, 0x73, 0x63, 0x65, 0x6e, 0x64, 0x69,
+    0x6e, 0x67, 0x00, 0xff, 0x01, 0x00, 0x00, 0x00, 0xff, 0x64, 0x65, 0x73, 0x63, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x00,
+    0x00, 0x00, 0x00, 0xff, 0x0a, 0x00, 0x28, 0x73, 0x28, 0x79, 0x61, 0x75, 0x29, 0x29, 0x73, 0x68, 0x6f, 0x77, 0x2d, 0x74,
+    0x79, 0x70, 0x65, 0x2d, 0x63, 0x6f, 0x6c, 0x75, 0x6d, 0x6e, 0x00, 0x00, 0x01, 0x00, 0x28, 0x62, 0x29, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x05, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x0e, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x0d, 0x00, 0x00, 0x00, 0x6f, 0x72, 0x67, 0x2e, 0x67, 0x74, 0x6b, 0x2e, 0x53, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73,
+    0x2e, 0x43, 0x6f, 0x6c, 0x6f, 0x72, 0x43, 0x68, 0x6f, 0x6f, 0x73, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0xc0, 0x7d, 0x7e, 0x0b, 0xff, 0xff, 0xff, 0xff, 0xc8, 0x06, 0x00, 0x00, 0x05, 0x00, 0x76, 0x00, 0xd0, 0x06, 0x00, 0x00,
+    0xf3, 0x06, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xf3, 0x06, 0x00, 0x00, 0x00, 0x00, 0x4c, 0x00,
+    0xf4, 0x06, 0x00, 0x00, 0xfc, 0x06, 0x00, 0x00, 0x5a, 0xe7, 0x65, 0x4f, 0x01, 0x00, 0x00, 0x00, 0xfc, 0x06, 0x00, 0x00,
+    0x0e, 0x00, 0x76, 0x00, 0x10, 0x07, 0x00, 0x00, 0x42, 0x07, 0x00, 0x00, 0x1f, 0xa6, 0x62, 0xcc, 0x01, 0x00, 0x00, 0x00,
+    0x42, 0x07, 0x00, 0x00, 0x0d, 0x00, 0x76, 0x00, 0x50, 0x07, 0x00, 0x00, 0x5a, 0x07, 0x00, 0x00, 0x2e, 0x70, 0x61, 0x74,
+    0x68, 0x00, 0x00, 0x00, 0x2f, 0x6f, 0x72, 0x67, 0x2f, 0x67, 0x74, 0x6b, 0x2f, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67,
+    0x73, 0x2f, 0x63, 0x6f, 0x6c, 0x6f, 0x72, 0x2d, 0x63, 0x68, 0x6f, 0x6f, 0x73, 0x65, 0x72, 0x2f, 0x00, 0x00, 0x73, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x73, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x65, 0x64, 0x2d, 0x63, 0x6f, 0x6c,
+    0x6f, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x28, 0x28, 0x62, 0x64, 0x64, 0x64, 0x64, 0x29, 0x29, 0x63, 0x75,
+    0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x63, 0x6f, 0x6c, 0x6f, 0x72, 0x73, 0x00, 0x00, 0x28, 0x61, 0x28, 0x64, 0x64, 0x64, 0x64,
+    0x29, 0x29, 0x6f, 0x72, 0x67, 0x2e, 0x67, 0x74, 0x6b, 0x2e, 0x53, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x2e, 0x45,
+    0x6d, 0x6f, 0x6a, 0x69, 0x43, 0x68, 0x6f, 0x6f, 0x73, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00, 0x28, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xc0, 0x7d, 0x7e, 0x0b, 0xff, 0xff, 0xff, 0xff,
+    0xd4, 0x07, 0x00, 0x00, 0x05, 0x00, 0x76, 0x00, 0xe0, 0x07, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x03, 0x08, 0x00, 0x00, 0x00, 0x00, 0x4c, 0x00, 0x04, 0x08, 0x00, 0x00, 0x08, 0x08, 0x00, 0x00,
+    0x67, 0x0c, 0xcb, 0x1d, 0x01, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, 0x00, 0x0c, 0x00, 0x76, 0x00, 0x18, 0x08, 0x00, 0x00,
+    0x25, 0x08, 0x00, 0x00, 0x2e, 0x70, 0x61, 0x74, 0x68, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2f, 0x6f, 0x72, 0x67,
+    0x2f, 0x67, 0x74, 0x6b, 0x2f, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x2f, 0x65, 0x6d, 0x6f, 0x6a, 0x69, 0x2d,
+    0x63, 0x68, 0x6f, 0x6f, 0x73, 0x65, 0x72, 0x2f, 0x00, 0x00, 0x73, 0x00, 0x02, 0x00, 0x00, 0x00, 0x72, 0x65, 0x63, 0x65,
+    0x6e, 0x74, 0x2d, 0x65, 0x6d, 0x6f, 0x6a, 0x69, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x61, 0x28, 0x28, 0x61, 0x75, 0x73,
+    0x73, 0x29, 0x75, 0x29, 0x29, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x6f, 0x72, 0x67, 0x2e, 0x67, 0x74, 0x6b, 0x2e, 0x53, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73,
+    0x2e, 0x44, 0x65, 0x62, 0x75, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xc0, 0x7d, 0x7e, 0x0b, 0xff, 0xff, 0xff, 0xff,
+    0xc8, 0x08, 0x00, 0x00, 0x05, 0x00, 0x76, 0x00, 0xd0, 0x08, 0x00, 0x00, 0xeb, 0x08, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xeb, 0x08, 0x00, 0x00, 0x00, 0x00, 0x4c, 0x00, 0xec, 0x08, 0x00, 0x00, 0xf4, 0x08, 0x00, 0x00,
+    0xc1, 0xae, 0x3e, 0xd0, 0x01, 0x00, 0x00, 0x00, 0xf4, 0x08, 0x00, 0x00, 0x1b, 0x00, 0x76, 0x00, 0x10, 0x09, 0x00, 0x00,
+    0x15, 0x09, 0x00, 0x00, 0x1f, 0x31, 0xb2, 0xbd, 0x01, 0x00, 0x00, 0x00, 0x15, 0x09, 0x00, 0x00, 0x11, 0x00, 0x76, 0x00,
+    0x28, 0x09, 0x00, 0x00, 0x2d, 0x09, 0x00, 0x00, 0x2e, 0x70, 0x61, 0x74, 0x68, 0x00, 0x00, 0x00, 0x2f, 0x6f, 0x72, 0x67,
+    0x2f, 0x67, 0x74, 0x6b, 0x2f, 0x73, 0x65, 0x74, 0x74, 0x69, 0x6e, 0x67, 0x73, 0x2f, 0x64, 0x65, 0x62, 0x75, 0x67, 0x2f,
+    0x00, 0x00, 0x73, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x65, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x2d, 0x69,
+    0x6e, 0x73, 0x70, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x2d, 0x6b, 0x65, 0x79, 0x62, 0x69, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x00,
+    0x00, 0x00, 0x28, 0x62, 0x29, 0x69, 0x6e, 0x73, 0x70, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x2d, 0x77, 0x61, 0x72, 0x6e, 0x69,
+    0x6e, 0x67, 0x00, 0x00, 0x01, 0x00, 0x28, 0x62, 0x29,
+};
 static const char kMimeGlobs2[] =
     "50:image/png:*.png\n"
     "50:image/jpeg:*.jpg\n"
@@ -2323,8 +2696,29 @@ static const char kMimeGlobs2[] =
     "50:image/vnd.microsoft.icon:*.ico\n"
     ;
 
+// sched=2: launches no longer queue behind one shell, so a relaunch (dock icon,
+// terminal, the ffreopen rig) could start a second firefox on the same profile
+// while the first runs. one instance at a time: the second launch is refused
+// while the first is anywhere between cmd_firefox entry and its exit. (satoru)
+static volatile int g_ff_instance = 0;
+struct FfInstanceGuard {
+    bool held = false;
+    bool take() {
+        if (!Scheduler::SchedV2()) return true;
+        int z = 0;
+        held = __atomic_compare_exchange_n(&g_ff_instance, &z, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        return held;
+    }
+    ~FfInstanceGuard() { if (held) __atomic_store_n(&g_ff_instance, 0, __ATOMIC_RELEASE); }
+};
+
 int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
+    FfInstanceGuard ff_one;
+    if (!ff_one.take()) {
+        SerialLogger::Log("[fftl] firefox already running - second launch refused\r\n");
+        return sappend(out, 0, mx, "firefox: already running\n");
+    }
     SerialLogger::Log("[fftl] cmd_firefox enter\r\n");   // launch timeline marker (satoru)
     // write every log line to disk as printed until the first window paints (the
     // wayland first-paint marker turns it back off), so a freeze mid launch still
@@ -2507,6 +2901,15 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
         SerialLogger::Log("\r\n");
     }
 
+    // gsettings schemas for gtk's file chooser (see kGSchemasCompiled). (satoru)
+    {
+        KVFS::Mkdirs("/apps/firefox/share/glib-2.0/schemas");
+        int g = KVFS::WriteFile("/apps/firefox/share/glib-2.0/schemas/gschemas.compiled",
+                                kGSchemasCompiled, sizeof(kGSchemasCompiled));
+        SerialLogger::Log("[ffschemas] ok="); SerialLogger::LogDec(g == 0 ? 1 : 0);
+        SerialLogger::Log("\r\n");
+    }
+
     // unpack the embedded nss runtime libs (libsqlite3.so.0) into
     // /apps/firefox/lib - the loader's second search dir, next to the other nss
     // .so files - so libsoftokn3.so's DT_NEEDED resolves and NSS/PSM can
@@ -2667,6 +3070,13 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"media.rdd-process.enabled\", false);\n"
             "lockPref(\"network.process.enabled\", false);\n"
             "lockPref(\"media.utility-process.enabled\", false);\n"
+            // and the last one still launched: opaque-response-blocking's JS
+            // validator starts a "utility" JSOracle child on the first page load
+            // (KX2:AsyncLaunch type=utility, ~5 s in, every boot). it exits at
+            // once here, but the fork() behind it turns every writable parent
+            // page copy-on-write while ~100 threads run. no fork, no window for
+            // lost stores. rev 2e36c464 StaticPrefList.yaml:2025. (satoru)
+            "lockPref(\"browser.opaqueResponseBlocking.javascriptValidator\", false);\n"
             // the FORK SERVER is itself a child process launched early via
             // GeckoChildProcessHost; kurono can't fork+exec a fresh subprocess, so
             // LaunchAndWaitForProcessHandle() blocks the main thread forever (the
@@ -2845,6 +3255,15 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
             "lockPref(\"logging.textrun\", 0);\n"
             "lockPref(\"logging.textrunui\", 0);\n"
             "lockPref(\"logging.textperf\", 0);\n"
+            // (satoru) and cubeb's: modules default ON in this build, so
+            // CubebUtils::InitLibrary started cubeb's async logger thread. an
+            // exit() before media shutdown (the "Close Firefox" profile dialog,
+            // a remote-instance handoff) then destroyed the still-joinable
+            // std::thread in ~cubeb_async_logger -> std::terminate -> abort
+            // ("terminate called without an active exception", the laptop's
+            // reopen death at firefox!mozalloc_abort). rev 2e36c464
+            // dom/media/CubebUtils.cpp:744, media/libcubeb/src/cubeb_log.cpp:142.
+            "lockPref(\"logging.cubeb\", 0);\n"
             // kurono has no working outbound network for firefox; the remote
             // startup services (RemoteSettings sync, region lookup, Normandy,
             // safebrowsing, telemetry, captive-portal, connectivity) then retry
@@ -3218,14 +3637,37 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     proc->flags |= PROCESS_FLAG_STACK_READY;
 
     LinuxSyscall::ClearConsoleOutput();
-    int rc = Userspace::RunProcessWithArgs(proc, av, envp);
+    {   // test rig: arm the one-shot crash (kurono.ffcrash=S) (satoru)
+        if (g_ffcrash_secs) {
+            g_ffcrash_at = Scheduler::NowMs() + (uint64_t)g_ffcrash_secs * 1000;
+            g_ffcrash_as = proc->address_space;
+            g_ffcrash_secs = 0;
+        }
+    }
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);   // browser runs as the user (satoru)
     int q = LinuxSyscall::ReadConsoleOutput(out + p, mx - 1 - p);
     if (q > 0) p += q;
     out[p] = 0;
     p = sappend(out, p, mx, "\nfirefox: process returned (code ");
     p = sappend_int(out, p, mx, rc);
     p = sappend(out, p, mx, ") - see serial for ld-kurono module bases + any fault.\n");
+    // a crash only marks the faulting thread: kill + reap the rest of the group
+    // before the owner goes, or it keeps running in the old address space and that
+    // space is leaked. the dead leader is already off ready_queue, so find a live
+    // member by address space. a no-op if none is left. (satoru)
+    {
+        uint32_t live = Scheduler::FindLivePidInAddressSpace(proc->address_space);
+        if (live) {
+            int kr = Scheduler::KillProcessGroup(live);
+            SerialLogger::Log("[ffexit] killed leftover group via pid ");
+            SerialLogger::LogDec((int)live);
+            SerialLogger::Log(" rc ");
+            SerialLogger::LogDec(kr);
+            SerialLogger::Log("\r\n");
+        }
+    }
     Scheduler::DestroyProcess(proc);
+    LinuxSyscall::ResetFirefoxCache();   // the next launch is a new address space (satoru)
     return p;
 }
 
@@ -3236,8 +3678,7 @@ int cmd_playvideo(KuronoShell* sh, int argc, const char** argv, char* out, int m
     if (!EmbeddedMedia::HasSsstikKVID()) {
         return sappend(out, 0, mx, "playvideo: no imported video in this build\n");
     }
-    DenjiApp::OpenBuffer(EmbeddedMedia::SsstikKVIDData(),
-                         EmbeddedMedia::SsstikKVIDSize(), "ssstik.mp4");
+    DenjiApp::OpenSample(1);   // loads SSSTIK.KVD on demand and plays it (satoru)
     return sappend(out, 0, mx, "playvideo: opening imported video (ssstik.mp4)...\n");
 }
 
@@ -3545,13 +3986,13 @@ int cmd_kurono(KuronoShell*, int argc, const char** argv, char* out, int maxo) {
     return p;
 }
 
-// argv flag helpers for `supr`. (satoru)
-static bool supr_has_flag(int argc, const char** argv, const char* flag) {
+// argv flag helpers for `ken`. (satoru)
+static bool ken_has_flag(int argc, const char** argv, const char* flag) {
     for (int i = 1; i < argc; i++) if (seq(argv[i], flag)) return true;
     return false;
 }
 // match "--auth=VALUE" → returns VALUE or nullptr. (satoru)
-static const char* supr_auth_value(int argc, const char** argv) {
+static const char* ken_auth_value(int argc, const char** argv) {
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         const char* pre = "--auth=";
@@ -3561,23 +4002,23 @@ static const char* supr_auth_value(int argc, const char** argv) {
     return nullptr;
 }
 
-//  supr - kurono privilege / auth policy control.
-//    supr policy                     show current policy + ksa status
-//    supr policy --auth=passwd|kvault|both [--sovereign-override]
-//    supr policy kvault disable --force --acknowledge-risk [--sovereign-override]
-//    supr policy kvault enable
-//    supr policy --auth=kvault --disable-passwd --acknowledge-risk
-//    supr policy passwd enable
-//    supr passwd                     change password (no ksa; normal flow)
-//    supr selftest                   run the ksa isolation self-test (logs to serial)
+//  ken - kurono privilege / auth policy control.
+//    ken policy                     show current policy + ksa status
+//    ken policy --auth=passwd|kvault|both [--sovereign-override]
+//    ken policy kvault disable --force --acknowledge-risk [--sovereign-override]
+//    ken policy kvault enable
+//    ken policy --auth=kvault --disable-passwd --acknowledge-risk
+//    ken policy passwd enable
+//    ken passwd                     change password (no ksa; normal flow)
+//    ken selftest                   run the ksa isolation self-test (logs to serial)
 //  every policy mutation is audited (even when ksa is disabled). (satoru)
-int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh;
     int p = 0;
-    int sid = SUPR::GetCurrentSession();
+    int sid = KEN::GetCurrentSession();
 
     if (argc < 2) {
-        p = sappend(out, p, maxo, "usage: supr policy | supr passwd | supr selftest\n");
+        p = sappend(out, p, maxo, "usage: ken policy | ken passwd | ken selftest\n");
         return p;
     }
 
@@ -3593,29 +4034,29 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
 
     if (seq(sub, "passwd")) {
         // normal password-change flow - NO ksa involvement, per spec. (satoru)
-        p = sappend(out, p, maxo, "supr passwd: interactive password change is GUI/login-driven.\n");
+        p = sappend(out, p, maxo, "ken passwd: interactive password change is GUI/login-driven.\n");
         p = sappend(out, p, maxo, "(no ksa involved; uses the standard password flow)\n");
         return p;
     }
 
     if (seq(sub, "policy")) {
-        bool sov   = supr_has_flag(argc, argv, "--sovereign-override");
-        bool force = supr_has_flag(argc, argv, "--force");
-        bool ack   = supr_has_flag(argc, argv, "--acknowledge-risk");
+        bool sov   = ken_has_flag(argc, argv, "--sovereign-override");
+        bool force = ken_has_flag(argc, argv, "--force");
+        bool ack   = ken_has_flag(argc, argv, "--acknowledge-risk");
         char err[160]; err[0] = 0;
 
         // kvault enable/disable subforms. (satoru)
         if (argc >= 3 && seq(argv[2], "kvault")) {
             if (argc >= 4 && seq(argv[3], "disable")) {
-                bool ok = SUPR::DisableKvault(sid, force, ack, sov, err, sizeof(err));
+                bool ok = KEN::DisableKvault(sid, force, ack, sov, err, sizeof(err));
                 p = sappend(out, p, maxo, ok ? "ksa (kvault) disabled.\n" : "refused: ");
                 if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
-                if (ok && SUPR::BothAuthDisabled())
+                if (ok && KEN::BothAuthDisabled())
                     p = sappend(out, p, maxo, "WARNING: both auth factors are now disabled.\n");
                 return p;
             }
             if (argc >= 4 && seq(argv[3], "enable")) {
-                bool ok = SUPR::EnableKvault(sid, err, sizeof(err));
+                bool ok = KEN::EnableKvault(sid, err, sizeof(err));
                 p = sappend(out, p, maxo, ok ? "ksa (kvault) enabled.\n" : "refused: ");
                 if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
                 return p;
@@ -3623,7 +4064,7 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
         }
         if (argc >= 3 && seq(argv[2], "passwd")) {
             if (argc >= 4 && seq(argv[3], "enable")) {
-                bool ok = SUPR::EnablePasswd(sid, err, sizeof(err));
+                bool ok = KEN::EnablePasswd(sid, err, sizeof(err));
                 p = sappend(out, p, maxo, ok ? "password auth enabled.\n" : "refused: ");
                 if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
                 return p;
@@ -3631,12 +4072,12 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
         }
 
         // --disable-passwd (requires ksa active). (satoru)
-        if (supr_has_flag(argc, argv, "--disable-passwd")) {
-            bool ok = SUPR::DisablePasswd(sid, ack, sov, err, sizeof(err));
+        if (ken_has_flag(argc, argv, "--disable-passwd")) {
+            bool ok = KEN::DisablePasswd(sid, ack, sov, err, sizeof(err));
             // also apply any --auth= mode given alongside (e.g. --auth=kvault).
-            const char* mode = supr_auth_value(argc, argv);
+            const char* mode = ken_auth_value(argc, argv);
             if (ok && mode && seq(mode, "kvault")) {
-                char e2[160]; e2[0]=0; SUPR::EnableKvault(sid, e2, sizeof(e2));
+                char e2[160]; e2[0]=0; KEN::EnableKvault(sid, e2, sizeof(e2));
             }
             p = sappend(out, p, maxo, ok ? "password auth disabled.\n" : "refused: ");
             if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
@@ -3644,29 +4085,29 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
         }
 
         // --auth=mode. (satoru)
-        const char* mode = supr_auth_value(argc, argv);
+        const char* mode = ken_auth_value(argc, argv);
         if (mode) {
-            SUPRAuthMode m;
+            KENAuthMode m;
             if (seq(mode, "passwd")) m = AUTH_PASSWD;
             else if (seq(mode, "kvault")) m = AUTH_KVAULT;
             else if (seq(mode, "both")) m = AUTH_BOTH;
-            else { p = sappend(out, p, maxo, "supr: --auth must be passwd|kvault|both\n"); return p; }
-            bool ok = SUPR::SetAuthMode(sid, m, sov, err, sizeof(err));
+            else { p = sappend(out, p, maxo, "ken: --auth must be passwd|kvault|both\n"); return p; }
+            bool ok = KEN::SetAuthMode(sid, m, sov, err, sizeof(err));
             p = sappend(out, p, maxo, ok ? "auth policy set.\n" : "refused: ");
             if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
-            if (ok && SUPR::BothAuthDisabled())
+            if (ok && KEN::BothAuthDisabled())
                 p = sappend(out, p, maxo, "WARNING: both auth factors are now disabled.\n");
             return p;
         }
 
         // no mutation → show status. (satoru)
-        p = sappend(out, p, maxo, "KSA / SUPR auth policy\n");
+        p = sappend(out, p, maxo, "KSA / KEN auth policy\n");
         p = sappend(out, p, maxo, "  password factor: ");
-        p = sappend(out, p, maxo, SUPR::IsPasswdEnabled() ? "ENABLED\n" : "disabled\n");
+        p = sappend(out, p, maxo, KEN::IsPasswdEnabled() ? "ENABLED\n" : "disabled\n");
         p = sappend(out, p, maxo, "  kvault (ksa)   : ");
-        p = sappend(out, p, maxo, SUPR::IsKvaultEnabled() ? "ENABLED\n" : "disabled\n");
+        p = sappend(out, p, maxo, KEN::IsKvaultEnabled() ? "ENABLED\n" : "disabled\n");
         p = sappend(out, p, maxo, "  effective mode : ");
-        SUPRAuthMode em = SUPR::GetAuthMode();
+        KENAuthMode em = KEN::GetAuthMode();
         p = sappend(out, p, maxo, em == AUTH_BOTH ? "both\n" : (em == AUTH_KVAULT ? "kvault\n" : "passwd\n"));
         p = sappend(out, p, maxo, "  ksa available  : ");
         p = sappend(out, p, maxo, KSA::IsAvailable() ? "yes" : "no (hypervisor not present)");
@@ -3675,35 +4116,35 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
         p = sappend(out, p, maxo, KSA::IsAvailable()
             ? (KSA::IsRealNestedVM() ? "nested VM\n" : "EPT-isolated context (nested-virt fallback)\n")
             : "n/a\n");
-        if (SUPR::BothAuthDisabled())
+        if (KEN::BothAuthDisabled())
             p = sappend(out, p, maxo, "  WARNING: both auth factors disabled - escalations show a risk warning.\n");
         return p;
     }
 
-    // ── sudo-style reroute: `supr <cmd> [args]` runs <cmd> elevated. (satoru)
+    // ── sudo-style reroute: `ken <cmd> [args]` runs <cmd> elevated. (satoru)
     // shell builtins can't meaningfully run elevated (they mutate shell state),
     // and whoami is informational; everything else goes through the auth gate.
     if (seq(sub, "cd") || seq(sub, "clear") || seq(sub, "history") ||
         seq(sub, "linux") || seq(sub, "cmd") || seq(sub, "exit")) {
-        p = sappend(out, p, maxo, "supr: '");
+        p = sappend(out, p, maxo, "ken: '");
         p = sappend(out, p, maxo, sub);
         p = sappend(out, p, maxo, "' is a shell builtin - run it directly (elevation doesn't apply).\n");
         return p;
     }
     if (seq(sub, "whoami")) {
-        // supr whoami reports the elevated identity. (satoru)
+        // ken whoami reports the elevated identity. (satoru)
         p = sappend(out, p, maxo, "root\n");
         return p;
     }
     // a guest may not escalate. (satoru)
-    if (SUPR::GetLevel(sid) <= SUPR_GUEST) {
-        p = sappend(out, p, maxo, "supr: permission denied - your role may not escalate.\n");
+    if (KEN::GetLevel(sid) <= KEN_GUEST) {
+        p = sappend(out, p, maxo, "ken: permission denied - your role may not escalate.\n");
         return p;
     }
     // the target must exist before we bother prompting. (satoru)
     ShellCommand* target = KuronoShell::FindCommand(sub);
     if (!target || !target->handler) {
-        p = sappend(out, p, maxo, "supr: command not found: ");
+        p = sappend(out, p, maxo, "ken: command not found: ");
         p = sappend(out, p, maxo, sub);
         p = sappend_char(out, p, maxo, '\n');
         return p;
@@ -3715,14 +4156,14 @@ int cmd_supr(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) 
     rp = sappend(reason, rp, (int)sizeof(reason), sub);
     rp = sappend(reason, rp, (int)sizeof(reason), "' as root");
     int saved_user = -1;
-    if (!SUPR::SudoBegin(sid, reason, &saved_user)) {
-        p = sappend(out, p, maxo, "supr: authentication failed - not running '");
+    if (!KEN::SudoBegin(sid, reason, &saved_user)) {
+        p = sappend(out, p, maxo, "ken: authentication failed - not running '");
         p = sappend(out, p, maxo, sub);
         p = sappend(out, p, maxo, "'.\n");
         return p;
     }
     int wrote = target->handler(sh, argc - 1, argv + 1, out + p, maxo - p);
-    SUPR::SudoEnd(sid, saved_user);
+    KEN::SudoEnd(sid, saved_user);
     if (wrote > 0) p += wrote;
     return p;
 }

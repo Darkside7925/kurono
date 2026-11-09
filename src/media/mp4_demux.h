@@ -33,9 +33,10 @@
 //   we parse once at Open() and cache everything.  the underlying byte
 //   buffer is borrowed (not copied), so the caller must keep it alive
 //   for the lifetime of the demuxer.  all sample-table arrays are
-//   heap-allocated via KernelHeap and freed in Close().
+//   heap-allocated via MPlat and freed in Close().
 #pragma once
-#include "../kernel/types.h"
+#include <stdint.h>
+#include <stddef.h>
 
 namespace MP4 {
 

@@ -799,6 +799,8 @@ static volatile uint64_t g_wwin_end   = 0;
 static volatile uint64_t g_wdenied    = 0;
 static volatile uint64_t g_wwin2_lo   = 0;   // second window, end == 0 means none (satoru)
 static volatile uint64_t g_wwin2_end  = 0;
+static volatile uint64_t g_wwin3_lo   = 0;   // third window: the running vm's guest disk file (satoru)
+static volatile uint64_t g_wwin3_end  = 0;
 
 static volatile int g_wguard_policy = -1;   // -1 auto, 0 forced off, 1 forced on (satoru)
 void NVMe::SetGuardPolicy(int p) { g_wguard_policy = p; }
@@ -812,6 +814,10 @@ void NVMe::SetWriteWindow(uint64_t lba_lo, uint64_t lba_end) {
 void NVMe::SetWriteWindow2(uint64_t lba_lo, uint64_t lba_end) {
     g_wwin2_lo = lba_lo;
     g_wwin2_end = (lba_end > lba_lo) ? lba_end : 0;
+}
+void NVMe::SetWriteWindow3(uint64_t lba_lo, uint64_t lba_end) {
+    g_wwin3_lo = lba_lo;
+    g_wwin3_end = (lba_end > lba_lo) ? lba_end : 0;
 }
 bool NVMe::GetWriteWindow(uint64_t* lba_lo, uint64_t* lba_end) {
     if (lba_lo) *lba_lo = g_wwin_lo;
@@ -827,6 +833,8 @@ bool NVMe::Write(uint64_t lba, uint32_t count, const void* buffer) {
         bool inside = end != 0 && lba >= g_wwin_lo && lba + count <= end && lba + count > lba;
         uint64_t end2 = g_wwin2_end;
         if (!inside && end2 != 0 && lba >= g_wwin2_lo && lba + count <= end2 && lba + count > lba) inside = true;
+        uint64_t end3 = g_wwin3_end;
+        if (!inside && end3 != 0 && lba >= g_wwin3_lo && lba + count <= end3 && lba + count > lba) inside = true;
         if (!inside) {
             // log the first few refusals so a bare-metal log shows who tried. (satoru)
             uint64_t n = __atomic_add_fetch(&g_wdenied, 1, __ATOMIC_RELAXED);

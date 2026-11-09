@@ -8,6 +8,7 @@
 #include "panic.h"
 #include "../drivers/serial.h"
 #include "../drivers/cpu_detect.h"
+#include "../drivers/timer.h"     // adaptive pool hysteresis clock (satoru)
 #include "../proc/spinlock.h"
 #include "../proc/scheduler.h"
 #include "../proc/smp.h"          // tlb shootdown before freeing a compressed page's frame (satoru)
@@ -32,6 +33,19 @@ int       g_threshold = 8;          // base generation threshold (satoru)
 Pressure  g_pressure = PRESS_GREEN;
 Stats     g_stats;
 Spinlock  g_lock;                   // protects the metadata table (satoru)
+
+// ── adaptive pool state ──────────────────────────────────────────────────────
+// the pool starts empty and grows only under pressure (MaintainPool). a store
+// that finds the pool full sets g_pool_starved so the next tick grows. (satoru)
+bool      g_lowram_off   = false;   // below the ram floor: fully off (satoru)
+bool      g_pool_starved = false;
+uint32_t  g_last_press_ms = 0;      // last tick that saw yellow or worse (satoru)
+uint32_t  g_last_grow_ms  = 0;
+uint32_t  g_last_gc_ms    = 0;
+constexpr uint64_t KMEMX_MIN_RAM = 240ULL * 1024 * 1024;   // ~256mb floor, minus firmware holes (satoru)
+// an entry whose address space looked dead at one gc pass; freed if it still
+// looks dead at the next one. (satoru)
+constexpr uint16_t KMETA_ORPHAN = 1 << 4;
 
 // ── flat metadata table (open-addressed hash on (as,vaddr)) ─────────────────
 // sized at init to ~ (pool_bytes / 1500) entries (avg blob ~1.5kb) rounded up to
@@ -197,6 +211,9 @@ static inline uint64_t tsc_to_ns(uint64_t cycles) {
 // and the self-test call it. caller holds g_lock. (satoru)
 static int store_compressed_locked(uint64_t as, uint64_t vaddr,
                                     const uint8_t* src, uint32_t pte_flags) {
+    // the tables can be released while the engine is off; a racing caller
+    // that passed its unlocked enabled check must find nothing here. (satoru)
+    if (!g_meta || !g_scratch_comp || !g_scratch_hash) return -1;
     uint32_t crc = KMemXLZ4::Crc32(src, PAGE);
     int csz = KMemXLZ4::Compress(src, PAGE, g_scratch_comp,
                                  KMemXLZ4::CompressBound(PAGE), g_scratch_hash);
@@ -215,7 +232,7 @@ static int store_compressed_locked(uint64_t as, uint64_t vaddr,
     }
 
     uint32_t off = KMemXPool::Alloc(blob_len);
-    if (off == KMEMX_POOL_NULL) return -1;   // pool full (satoru)
+    if (off == KMEMX_POOL_NULL) { g_pool_starved = true; return -1; }   // pool full: grow next tick (satoru)
 
     int slot = meta_insert(as, vaddr);
     if (slot < 0) { KMemXPool::Free(off, blob_len); return -1; }   // table full (satoru)
@@ -305,19 +322,20 @@ static void free_slot_locked(int idx) {
 // pool is sized against *current free* memory with headroom so it can never
 // starve the heap/buddy/the rest of the kernel of contiguous frames. (satoru)
 constexpr uint32_t META_MAX_ENTRIES = 256 * 1024;   // 256k entries (~10mb @ 40b) (satoru)
-constexpr uint64_t POOL_HEADROOM    = 256ULL * 1024 * 1024;  // leave >=256mb free (satoru)
 
-bool Init(int pool_pct) {
-    if (g_inited) return true;
-    if (pool_pct < 10) pool_pct = 10;
-    if (pool_pct > 40) pool_pct = 40;
-    g_pool_pct = pool_pct;
+// the pool is no longer reserved at boot. the table is sized to the pool CAP
+// (pct of ram) and the pool grows toward that cap only under pressure. the
+// headroom scales with ram so a small machine can still compress when it is
+// short of memory (a fixed 256mb floor meant a 1gb box could never grow the
+// pool exactly when it needed to). (satoru)
+static uint64_t pool_headroom(uint64_t total_ram) {
+    uint64_t h = total_ram / 32;                       // ~3% of ram (satoru)
+    if (h < 16ULL * 1024 * 1024) h = 16ULL * 1024 * 1024;
+    return h;
+}
 
-    for (int i = 0; i < (int)(sizeof(Stats) / 8); i++) ((uint64_t*)&g_stats)[i] = 0;
-
-    // ── 1) scratch + metadata FIRST, while contiguous memory is plentiful ──
-    // (allocating these after the pool grabbed hundreds of 2mb chunks left no
-    //  contiguous block for the table - the original boot failure.) (satoru)
+// allocate the metadata table + scratch. caller holds nothing. (satoru)
+static bool alloc_tables(int pool_pct) {
     g_scratch_hash = (uint8_t*)PMM::AllocBytes(KMemXLZ4::SCRATCH_BYTES);
     g_scratch_comp = (uint8_t*)PMM::AllocBytes((size_t)KMemXLZ4::CompressBound(PAGE));
     g_scratch_dda  = (uint8_t*)PMM::AllocBytes(PAGE);   // dedup byte-compare A (satoru)
@@ -327,20 +345,24 @@ bool Init(int pool_pct) {
         return false;
     }
 
-    // metadata table: ~1 entry per 1.5kb of the INTENDED pool, power-of-two,
-    // hard-capped at META_MAX_ENTRIES so the contiguous allocation stays small
-    // (a larger pool than the cap can serve just limits concurrent live pages - 
-    // a soft cap, never a crash). (satoru)
+    // metadata table: ~1 entry per 2kb of the pool CAP, rounded DOWN to a power
+    // of two (rounding up doubled it on most machines), hard-capped at
+    // META_MAX_ENTRIES so the contiguous allocation stays small. the table can
+    // index cap/2kb blobs; at the ~1.5kb mean blob it is the soft limit on live
+    // pages, never a crash. (satoru)
     uint64_t total_ram = PMM::GetTotalMemory();
     uint64_t intended_pool = (total_ram / 100) * (uint64_t)pool_pct;
-    uint32_t entries = (uint32_t)(intended_pool / 1500);
+    uint32_t entries = (uint32_t)(intended_pool / 2048);
     if (entries < 1024) entries = 1024;
     if (entries > META_MAX_ENTRIES) entries = META_MAX_ENTRIES;
-    g_meta_cap = next_pow2(entries);
+    uint32_t cap = next_pow2(entries);
+    if (cap > entries && cap > 1024) cap >>= 1;
+    g_meta_cap = cap;
     g_meta_mask = g_meta_cap - 1;
     g_meta = (PageMeta*)PMM::AllocBytes((size_t)g_meta_cap * sizeof(PageMeta));
     if (!g_meta) {
         SerialLogger::Log("[kmemx] FATAL: could not allocate metadata table\r\n");
+        g_meta_cap = 0; g_meta_mask = 0;
         return false;
     }
     for (uint32_t i = 0; i < g_meta_cap; i++) {
@@ -348,48 +370,43 @@ bool Init(int pool_pct) {
         g_meta[i].vaddr = 0;
         g_meta[i].pool_off = KMEMX_POOL_NULL;
     }
+    return true;
+}
 
-    // ── 2) reserve the pool LAST, bounded so it leaves headroom ──
-    // never reserve so much that fewer than POOL_HEADROOM bytes stay free, and
-    // never exceed what the metadata table can index (entries * ~max-blob). the
-    // chunk loop also stops on the first failed contiguous alloc, so on a tight
-    // host we keep whatever chunks we got rather than starving the kernel. (satoru)
-    uint64_t free_bytes = PMM::GetFreeMemory();
-    uint64_t want = intended_pool;
-    if (free_bytes > POOL_HEADROOM) {
-        uint64_t max_safe = free_bytes - POOL_HEADROOM;
-        if (want > max_safe) want = max_safe;
-    } else {
-        want = 0;   // memory too tight to compress safely (satoru)
+bool Init(int pool_pct) {
+    if (g_inited) return true;
+    if (pool_pct < 10) pool_pct = 10;
+    if (pool_pct > 40) pool_pct = 40;
+    g_pool_pct = pool_pct;
+
+    // below ~256mb of ram the engine stays fully off: no table, no pool. (satoru)
+    if (PMM::GetTotalMemory() < KMEMX_MIN_RAM) {
+        if (!g_lowram_off) {
+            SerialLogger::Log("[kmemx] off: ram below 256MB, nothing reserved\r\n");
+        }
+        g_lowram_off = true;
+        return false;
     }
-    // and never take more than HALF of currently-free ram, so the heap + apps +
-    // guests have ample room to grow afterwards without immediately driving the
-    // pressure system to red/critical. (the pmm can over-report total ram on some
-    // hosts, so sizing off free + this proportional cap is the safe rule.) (satoru)
-    uint64_t half_free = free_bytes / 2;
-    if (want > half_free) want = half_free;
-    // also bound by table capacity (avg blob ~2kb -> entries*2kb of pool is
-    // the most we could ever fill). (satoru)
-    uint64_t table_bound = (uint64_t)g_meta_cap * 2048ULL;
-    if (want > table_bound) want = table_bound;
 
-    uint64_t got = (want > 0) ? KMemXPool::Reserve(want) : 0;
-    if (got == 0) {
-        SerialLogger::Log("[kmemx] WARN: reserved 0 pool (low memory) - engine idle\r\n");
-        // not fatal: the engine inits but compresses nothing until memory frees
-        // up and SetPoolPct grows it. (satoru)
+    static bool s_stats_zeroed = false;
+    if (!s_stats_zeroed) {
+        for (int i = 0; i < (int)(sizeof(Stats) / 8); i++) ((uint64_t*)&g_stats)[i] = 0;
+        s_stats_zeroed = true;
     }
-    g_stats.pool_bytes = got;
 
-    // never-compress: kmemx's own pool + metadata + scratch (do not compress the
-    // thing that holds the compressed pages!). the rest of the never-list is
-    // registered by the owning subsystems via ReserveNeverCompress. (satoru)
-    ReserveNeverCompress((uint64_t)(uintptr_t)g_meta,
-                         (uint64_t)g_meta_cap * sizeof(PageMeta), "kmemx.meta");
-    ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_hash, KMemXLZ4::SCRATCH_BYTES, "kmemx.scratch");
-    ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_comp, (uint64_t)KMemXLZ4::CompressBound(PAGE), "kmemx.scratch2");
-    ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_dda, PAGE, "kmemx.dedupA");
-    ReserveNeverCompress((uint64_t)(uintptr_t)g_scratch_ddb, PAGE, "kmemx.dedupB");
+    // scratch + metadata only. (allocating these while contiguous memory is
+    // plentiful is why Init runs early in boot.) (satoru)
+    if (!alloc_tables(pool_pct)) {
+        ReleaseResources();
+        return false;
+    }
+    g_stats.pool_bytes = KMemXPool::TotalBytes();
+
+    // kmemx's own memory (pool chunks, table, scratch) is excluded from
+    // compression by a dynamic check in IsCompressible, not by never-list
+    // entries: chunks come and go at runtime and the 64-slot list must stay
+    // free for the dma rings / framebuffer / ept ranges other subsystems
+    // register. (satoru)
 
     // pre-warm the fault hot path: build the crc32 table + cache the tsc freq now
     // (one-time costs that would otherwise land on the FIRST decompression fault
@@ -399,12 +416,31 @@ bool Init(int pool_pct) {
     timing_prewarm();
 
     g_inited = true;
-    SerialLogger::Log("[kmemx] initialized: pool=");
-    SerialLogger::LogDec((int)(got / (1024 * 1024)));
-    SerialLogger::Log("MB meta_entries=");
+    SerialLogger::Log("[kmemx] initialized: pool=0MB (adaptive, cap=");
+    SerialLogger::LogDec((int)(PoolCapBytes() / (1024 * 1024)));
+    SerialLogger::Log("MB) meta_entries=");
     SerialLogger::LogDec((int)g_meta_cap);
+    SerialLogger::Log(" meta_kb=");
+    SerialLogger::LogDec((int)(((uint64_t)g_meta_cap * sizeof(PageMeta)) / 1024));
     SerialLogger::Log("\r\n");
     return true;
+}
+
+bool IsLowRamOff() { return g_lowram_off; }
+
+// is `phys` memory the engine itself owns (pool chunk, table, scratch)? (satoru)
+static bool engine_owns(uint64_t phys) {
+    if (KMemXPool::Contains(phys)) return true;
+    uint64_t m = (uint64_t)(uintptr_t)g_meta;
+    if (m && phys >= m && phys < m + (uint64_t)g_meta_cap * sizeof(PageMeta)) return true;
+    const uint64_t sb[4] = { (uint64_t)(uintptr_t)g_scratch_hash, (uint64_t)(uintptr_t)g_scratch_comp,
+                             (uint64_t)(uintptr_t)g_scratch_dda,  (uint64_t)(uintptr_t)g_scratch_ddb };
+    const uint64_t sl[4] = { (uint64_t)KMemXLZ4::SCRATCH_BYTES, (uint64_t)KMemXLZ4::CompressBound(PAGE),
+                             (uint64_t)PAGE, (uint64_t)PAGE };
+    for (int i = 0; i < 4; i++) {
+        if (sb[i] && phys >= (sb[i] & ~0xFFFULL) && phys < sb[i] + sl[i]) return true;
+    }
+    return false;
 }
 
 bool IsInitialized() { return g_inited; }
@@ -433,10 +469,21 @@ bool IsCompressible(uint64_t as, uint64_t vaddr) {
     uint64_t phys = KernelVMM::QueryMappingInAddressSpace(as, vaddr);
     if (phys == 0) return false;
     phys &= ~0xFFFULL;
-    // never-compress physical ranges (dma rings, framebuffer, ept, our pool). (satoru)
+    // never-compress physical ranges (dma rings, framebuffer, ept). (satoru)
     for (int i = 0; i < g_never_count; i++) {
         if (phys >= g_never[i].base && phys < g_never[i].end) return false;
     }
+    // kmemx's own memory, checked live so chunks added or released at runtime
+    // are always covered without spending never-list slots. (satoru)
+    if (engine_owns(phys)) return false;
+    // only ordinary ram frames with exactly one owner. a frame outside the pmm
+    // range or not marked used is mmio / a firmware hole / a bar-backed
+    // framebuffer (whether or not anyone registered it); a frame with refcount
+    // != 1 is shared (fork cow, shm) or pmm-reserved (refcount 0). compressing
+    // a shared frame would hand one mapping a private copy on refault and drop
+    // the cow marker bits, which kmemx does not save. (satoru)
+    if (phys >= PMM::GetPhysTop() || !PMM::IsFrameUsed(phys)) return false;
+    if (PMM::GetFrameRefCount(phys) != 1) return false;
     // already compressed? (a not-present pte would already have failed the query,
     // but guard anyway against a double-take.) (satoru)
     if (meta_find(as, vaddr) >= 0) return false;
@@ -549,35 +596,238 @@ bool ShouldShedServices() {
     return g_enabled && g_pressure >= PRESS_CRITICAL;
 }
 
-bool SetPoolPct(int pct) {
-    if (pct < 10) pct = 10;
-    if (pct > 40) pct = 40;
-    g_pool_pct = pct;
-    // bound the target exactly like Init: never grow so far that free ram drops
-    // below POOL_HEADROOM, and never past what the metadata table can index.
-    // GrowTo only ever ADDS chunks (it never shrinks), and it stops on the first
-    // failed contiguous alloc, so this can only ever cap the growth - on a tight
-    // host (e.g. the 2gb headless test where the pmm reports 4gb) it keeps the
-    // pool from pushing the system into oom/critical. (satoru)
+uint64_t PoolCapBytes() {
+    if (!g_meta) return 0;
     uint64_t total_ram = PMM::GetTotalMemory();
-    uint64_t want = (total_ram / 100) * (uint64_t)pct;
-    // include what we already hold so "free" reflects post-reservation memory. (satoru)
-    uint64_t free_plus_pool = PMM::GetFreeMemory() + KMemXPool::TotalBytes();
-    if (free_plus_pool > POOL_HEADROOM) {
-        uint64_t max_safe = free_plus_pool - POOL_HEADROOM;
+    uint64_t want = (total_ram / 100) * (uint64_t)g_pool_pct;
+    // "free" includes what the pool already holds, so the cap does not shrink
+    // just because the pool itself grew. (satoru)
+    uint64_t held = KMemXPool::TotalBytes();
+    uint64_t free_plus_pool = PMM::GetFreeMemory() + held;
+    uint64_t headroom = pool_headroom(total_ram);
+    if (free_plus_pool > headroom) {
+        uint64_t max_safe = free_plus_pool - headroom;
         if (want > max_safe) want = max_safe;
     } else {
-        want = KMemXPool::TotalBytes();   // too tight to grow further (satoru)
+        want = held;   // too tight to grow further (satoru)
     }
-    // never more than half of (free + what we hold) - same proportional cap as
-    // Init, so growing the pool can't drive the system into critical. (satoru)
+    // never more than half of (free + held), so growing the pool can never be
+    // what drives the system into critical. (satoru)
     uint64_t half = free_plus_pool / 2;
     if (want > half) want = half;
     uint64_t table_bound = (uint64_t)g_meta_cap * 2048ULL;
     if (want > table_bound) want = table_bound;
-    uint64_t got = KMemXPool::GrowTo(want);
+    uint64_t arena_bound = (uint64_t)KMemXPool::MAX_CHUNKS * KMemXPool::CHUNK_BYTES;
+    if (want > arena_bound) want = arena_bound;
+    return want;
+}
+
+// hand wholly empty chunks back to the pmm, keeping at least `keep` bytes.
+// the chunks are kernel identity-mapped memory that no user pte ever points
+// at (the compressed blobs are copied in and out under g_lock), so no cpu can
+// hold a translation that aliases them and no tlb shootdown is involved; the
+// stale-tlb rule (proof-gated frees) applies to the USER frames, which still
+// go through queue_compress_free. detach happens under g_lock so no store,
+// fault or dedup can be inside a chunk while it leaves. returns chunks freed.
+// (satoru)
+static int release_empty_chunks(uint64_t keep, const char* why) {
+    uint64_t bases[16];
+    int total = 0;
+    for (;;) {
+        uint64_t f; g_lock.LockIrqSave(&f);
+        int n = KMemXPool::ReleaseEmpty(16, keep, bases);
+        g_stats.pool_bytes = KMemXPool::TotalBytes();
+        g_lock.UnlockIrqRestore(f);
+        for (int i = 0; i < n; i++) PMM::FreeContiguous(bases[i], KMemXPool::CHUNK_BYTES / 4096);
+        total += n;
+        if (n < 16) break;
+    }
+    if (total > 0) {
+        SerialLogger::Log("[kmemx-pool] shrink -");
+        SerialLogger::LogDec(total * (int)(KMemXPool::CHUNK_BYTES / (1024 * 1024)));
+        SerialLogger::Log("MB -> pool=");
+        SerialLogger::LogDec((int)(KMemXPool::TotalBytes() / (1024 * 1024)));
+        SerialLogger::Log("MB used_kb=");
+        SerialLogger::LogDec((int)(KMemXPool::UsedBytes() / 1024));
+        SerialLogger::Log(" (");
+        SerialLogger::Log(why);
+        SerialLogger::Log(")\r\n");
+    }
+    return total;
+}
+
+// grow the pool by `chunks` 2mb chunks, bounded by the cap. returns bytes
+// added. (satoru)
+static uint64_t grow_pool(uint32_t chunks, const char* why) {
+    if (!g_meta) return 0;
+    uint64_t before = KMemXPool::TotalBytes();
+    uint64_t cap = PoolCapBytes();
+    uint64_t target = before + (uint64_t)chunks * KMemXPool::CHUNK_BYTES;
+    if (target > cap) target = cap;
+    // whole chunks only: GrowTo rounds UP, so a cap that is not a chunk
+    // multiple must be rounded down here or it would be exceeded. (satoru)
+    target -= target % KMemXPool::CHUNK_BYTES;
+    if (target <= before) return 0;
+    uint64_t got = KMemXPool::GrowTo(target);
     g_stats.pool_bytes = got;
+    if (got > before) {
+        SerialLogger::Log("[kmemx-pool] grow +");
+        SerialLogger::LogDec((int)((got - before) / (1024 * 1024)));
+        SerialLogger::Log("MB -> pool=");
+        SerialLogger::LogDec((int)(got / (1024 * 1024)));
+        SerialLogger::Log("MB cap=");
+        SerialLogger::LogDec((int)(cap / (1024 * 1024)));
+        SerialLogger::Log("MB used_kb=");
+        SerialLogger::LogDec((int)(KMemXPool::UsedBytes() / 1024));
+        SerialLogger::Log(" (");
+        SerialLogger::Log(why);
+        SerialLogger::Log(")\r\n");
+    }
+    return got > before ? got - before : 0;
+}
+
+bool SetPoolPct(int pct) {
+    if (pct < 10) pct = 10;
+    if (pct > 40) pct = 40;
+    g_pool_pct = pct;
+    // the pct is now a CAP, not a reservation: nothing is allocated here. a
+    // pool already above the new cap gives back its empty chunks. (satoru)
+    uint64_t cap = PoolCapBytes();
+    if (KMemXPool::TotalBytes() > cap) release_empty_chunks(cap, "cap lowered");
+    g_stats.pool_bytes = KMemXPool::TotalBytes();
     return true;
+}
+
+// ── orphan reclaim ──────────────────────────────────────────────────────────
+// a process that exits (or munmaps) while some of its pages sit compressed
+// leaves its entries behind: nothing in the teardown path tells kmemx, so the
+// blobs would pin their chunks forever and the pool could never shrink. this
+// pass frees entries whose address space no live task owns. an entry must
+// look dead at TWO passes (~2s apart) before it goes, so a task between
+// queue states is never mistaken for a dead one. guest (ept) entries are left
+// alone. page tables are never walked here (a dead space's tables may already
+// be recycled). (satoru)
+static int gc_orphans() {
+    if (!g_meta || g_meta_live == 0) return 0;
+    struct AsLive { uint64_t as; bool live; };
+    AsLive cache[16];
+    int ncache = 0;
+    int freed = 0, marked = 0;
+    for (uint32_t i = 0; i < g_meta_cap; i++) {
+        // unlocked candidate peek; everything is re-checked under the lock. (satoru)
+        PageMeta* tbl = g_meta;
+        if (!tbl) break;
+        if (tbl[i].pool_off == KMEMX_POOL_NULL) continue;
+        if (tbl[i].flags & KMETA_GUEST) continue;
+        uint64_t as = tbl[i].address_space;
+        if (as == 0) continue;
+        bool live = true;
+        int c = 0;
+        for (; c < ncache; c++) if (cache[c].as == as) { live = cache[c].live; break; }
+        if (c == ncache) {
+            // bounded work: past 16 distinct spaces this pass, assume live and
+            // leave the rest for a later pass. (satoru)
+            if (ncache >= 16) continue;
+            live = Scheduler::AddressSpaceLiveElsewhere(as, nullptr);
+            cache[ncache].as = as; cache[ncache].live = live; ncache++;
+        }
+        uint64_t f; g_lock.LockIrqSave(&f);
+        if (g_meta && g_meta[i].pool_off != KMEMX_POOL_NULL && g_meta[i].address_space == as &&
+            !(g_meta[i].flags & KMETA_GUEST)) {
+            if (live) {
+                g_meta[i].flags &= (uint16_t)~KMETA_ORPHAN;
+            } else if (g_meta[i].flags & KMETA_ORPHAN) {
+                free_slot_locked((int)i);
+                freed++;
+                // meta_erase may have shifted a later entry into slot i. (satoru)
+                if (i > 0) i--;
+            } else {
+                g_meta[i].flags |= KMETA_ORPHAN;
+                marked++;
+            }
+        }
+        g_lock.UnlockIrqRestore(f);
+    }
+    if (freed > 0) {
+        SerialLogger::Log("[kmemx] orphan reclaim: freed=");
+        SerialLogger::LogDec(freed);
+        SerialLogger::Log(" marked=");
+        SerialLogger::LogDec(marked);
+        SerialLogger::Log(" live=");
+        SerialLogger::LogDec((int)g_meta_live);
+        SerialLogger::Log("\r\n");
+    }
+    return freed;
+}
+
+void MaintainPool(Pressure p) {
+    if (!g_inited || !g_meta) return;
+    uint32_t now = Timer::GetRealMs();
+    const uint64_t CHUNK = KMemXPool::CHUNK_BYTES;
+    const uint64_t GROW_SLACK = 256ULL * 1024;   // grow when < 256kb of the pool is free (satoru)
+    const uint32_t GROW_GAP_MS = 100;            // at most one grow per 100ms (satoru)
+    const uint32_t SHRINK_AFTER_MS = 5000;       // green this long before chunks go back (satoru)
+    const uint32_t GC_GAP_MS = 2000;
+
+    if (p >= PRESS_YELLOW) g_last_press_ms = now;
+
+    uint64_t total = KMemXPool::TotalBytes();
+    uint64_t used  = KMemXPool::UsedBytes();
+    bool near_full = (total == 0) || (total - used < GROW_SLACK) || g_pool_starved;
+    if (g_enabled && p >= PRESS_YELLOW && near_full &&
+        (uint32_t)(now - g_last_grow_ms) >= GROW_GAP_MS) {
+        g_last_grow_ms = now;
+        g_pool_starved = false;
+        grow_pool(p >= PRESS_RED ? 4u : 1u, PressureName(p));
+    }
+
+    if ((uint32_t)(now - g_last_gc_ms) >= GC_GAP_MS) {
+        g_last_gc_ms = now;
+        gc_orphans();
+    }
+
+    // shrink: pressure has been green for a while (or the engine is off) and
+    // some chunks are empty. no page is decompressed to make room; chunks drain
+    // naturally as pages fault back in or their processes exit. (satoru)
+    if (total > 0 && (!g_enabled ||
+        (p == PRESS_GREEN && (uint32_t)(now - g_last_press_ms) >= SHRINK_AFTER_MS))) {
+        release_empty_chunks(0, g_enabled ? "pressure cleared" : "engine off");
+    }
+    (void)CHUNK;
+}
+
+void ReleaseResources() {
+    // pool first: every empty chunk goes back. a chunk still holding a blob
+    // (a page compressed before the engine went off) stays until it drains.
+    // (satoru)
+    release_empty_chunks(0, "release");
+    uint64_t f; g_lock.LockIrqSave(&f);
+    bool drop_tables = (g_meta_live == 0) && (KMemXPool::TotalBytes() == 0);
+    PageMeta* meta = nullptr; uint32_t meta_cap = 0;
+    uint8_t *sh = nullptr, *sc = nullptr, *sa = nullptr, *sb = nullptr;
+    if (drop_tables) {
+        meta = g_meta; meta_cap = g_meta_cap;
+        sh = g_scratch_hash; sc = g_scratch_comp; sa = g_scratch_dda; sb = g_scratch_ddb;
+        g_meta = nullptr; g_meta_cap = 0; g_meta_mask = 0;
+        g_scratch_hash = g_scratch_comp = g_scratch_dda = g_scratch_ddb = nullptr;
+        g_inited = false;
+    }
+    g_lock.UnlockIrqRestore(f);
+    if (!drop_tables) return;
+    // the table + scratch are kernel-only identity memory, read and written
+    // under g_lock; nothing user-mapped, so a plain pmm free is the right path.
+    // (satoru)
+    if (meta) PMM::FreeBytes(meta, (size_t)meta_cap * sizeof(PageMeta));
+    if (sh) PMM::FreeBytes(sh, KMemXLZ4::SCRATCH_BYTES);
+    if (sc) PMM::FreeBytes(sc, (size_t)KMemXLZ4::CompressBound(PAGE));
+    if (sa) PMM::FreeBytes(sa, PAGE);
+    if (sb) PMM::FreeBytes(sb, PAGE);
+    g_stats.pool_bytes = 0;
+    if (meta) {
+        SerialLogger::Log("[kmemx] released: pool=0MB meta_kb=");
+        SerialLogger::LogDec((int)(((uint64_t)meta_cap * sizeof(PageMeta)) / 1024));
+        SerialLogger::Log(" + scratch (engine off)\r\n");
+    }
 }
 
 void RegisterGuest(uint64_t ept_root, const char* name) {
@@ -1031,6 +1281,7 @@ static int DecompressMatching(uint64_t as, bool all) {
     // responsive). (satoru)
     for (uint32_t i = 0; i < g_meta_cap; i++) {
         uint64_t f; g_lock.LockIrqSave(&f);
+        if (!g_meta || i >= g_meta_cap) { g_lock.UnlockIrqRestore(f); break; }   // tables released (satoru)
         PageMeta& m = g_meta[i];
         if (m.pool_off == KMEMX_POOL_NULL) { g_lock.UnlockIrqRestore(f); continue; }
         if (!all && m.address_space != as) { g_lock.UnlockIrqRestore(f); continue; }
@@ -1078,7 +1329,14 @@ int CompressProcess(uint32_t pid) {
         const UserMemoryRegion& reg = p->regions[r];
         if (!reg.active || reg.end <= reg.start) continue;
         for (uint64_t va = reg.start; va < reg.end; va += PAGE) {
-            if (CompressPage(as, va)) taken++;
+            if (CompressPage(as, va)) { taken++; continue; }
+            // an explicit compress grows the adaptive pool on demand, within
+            // the cap; stop when the cap is reached. (satoru)
+            if (g_pool_starved) {
+                g_pool_starved = false;
+                if (grow_pool(4u, "compress cmd") == 0) { r = PROCESS_MAX_USER_REGIONS; break; }
+                if (CompressPage(as, va)) taken++;
+            }
         }
     }
     FlushPendingCompressFrees();   // proof-gated frame release (satoru)
@@ -1120,6 +1378,7 @@ int DedupPass(int budget) {
     uint32_t scanned = 0;
 
     uint64_t f; g_lock.LockIrqSave(&f);
+    if (!g_meta || !g_scratch_dda || !g_scratch_ddb) { g_lock.UnlockIrqRestore(f); return 0; }   // tables released (satoru)
     uint32_t i = g_dedup_cursor & g_meta_mask;
     while (scanned < SCAN && merged < budget) {
         scanned++;
@@ -1209,6 +1468,9 @@ void TestFree(uint64_t as, uint64_t vaddr) {
     g_lock.UnlockIrqRestore(f);
 }
 uint32_t TestMetaLive() { return g_meta_live; }
+uint64_t TestGrowPool(uint32_t chunks) { return grow_pool(chunks, "test"); }
+int      TestReleasePool() { return release_empty_chunks(0, "test"); }
+bool     TestTakePoolStarved() { bool s = g_pool_starved; g_pool_starved = false; return s; }
 
 }  // namespace KMemX
 

@@ -62,6 +62,18 @@ MediaDecoder::Image MediaDecoder::DecodeModule(uint32_t start, uint32_t end) {
     return img;
 }
 
+MediaDecoder::Image MediaDecoder::DecodeMemory(const uint8_t* data, size_t size) {
+    Image img = {0,0,0,false,0,false};
+    if (!data || size < 8) return img;
+    if (!IsPNG(data, size) && !IsJPEG(data, size)) return img;
+    int w=0,h=0,comp=0;
+    stbi_uc* rgba = stbi_load_from_memory(data, (int)size, &w, &h, &comp, 4);
+    if (!rgba) return img;
+    img.width = w; img.height = h; img.data = (uint8_t*)rgba;
+    img.valid = true; img.order = 0; img.owns = true;
+    return img;
+}
+
 void MediaDecoder::DrawImage(const Image& img, int x, int y) {
     if (!img.valid) return;
 

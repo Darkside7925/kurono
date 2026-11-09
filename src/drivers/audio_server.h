@@ -33,6 +33,11 @@ void Init();
 void          RegisterBackend(AudioBackend* be);
 AudioBackend* ActiveBackend();
 const char*   ActiveBackendName();
+// registry walk for the control center's output picker. BackendAt returns
+// nullptr past the end; entries include backends that are registered but not
+// currently initialised (IsReady false). (satoru)
+int           BackendCount();
+AudioBackend* BackendAt(int index);
 // look a registered backend up by its Name(), and switch to it at run time
 // (brings it up if needed). used by `audio use` and usb hotplug. (satoru)
 AudioBackend* FindBackend(const char* name);
@@ -69,6 +74,8 @@ AudioMixer::StreamID OpenStream(const char* name,
 uint32_t WriteStream(AudioMixer::StreamID id, const void* src, uint32_t frames);
 void     CloseStream(AudioMixer::StreamID id);
 void     DrainStream(AudioMixer::StreamID id);
+// locked AudioMixer::CloseOwnedBy: drop every stream a gone process opened. (satoru)
+int      ReleaseStreamsOf(uint32_t pid);
 
 // Per-tick pump.  Called from the kernel main loop.
 void Tick();

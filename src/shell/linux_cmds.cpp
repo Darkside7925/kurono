@@ -1,4 +1,6 @@
 #include "linux_cmds.h"
+#include "../virt/vm_host.h"   // (satoru)
+#include "../apps/alpine_term.h"
 #include "../fs/kvfs.h"
 #include "../kernel/time.h"
 #include "../drivers/timer.h"
@@ -128,7 +130,8 @@ static LinuxDriver* _find_bt_driver() {
     return _find_bound_driver_by_prefixes(prefixes, (int)(sizeof(prefixes) / sizeof(prefixes[0])));
 }
 static bool _guest_tools_enabled() {
-    return Hypervisor::IsLinuxGuestEnabled();
+    // settings > linux "use linux" off disables the guest commands too (satoru)
+    return Hypervisor::IsLinuxGuestEnabled() && VMHost::Enabled();
 }
 static bool _guest_is_alpine() {
     return Hypervisor::GetLinuxGuestProfile() == LINUX_GUEST_ALPINE;
@@ -2711,6 +2714,16 @@ static const uint8_t tiny_guest_code[] = {
     'K','U','R','O','N','O',' ','V','M',' ','O','K','\r','\n',0
 };
 
+// alpine exec / apk: through the background vm's guest agent when it is up,
+// else the old synchronous serial path (satoru)
+static int _guest_exec(const char* cmd, char* out, int max) {
+    if (VMHost::AgentReady()) {
+        int n = VMHost::Exec(cmd, out, max + 1, 600000);
+        return n < 0 ? 0 : n;
+    }
+    return Hypervisor::AlpineExec(cmd, out, max);
+}
+
 int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
                        char* out, int mx) {
     (void)sh;
@@ -2733,12 +2746,22 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
         if (_guest_tools_enabled() && _guest_is_debian())
             p = _sa(out, p, mx, "  boot-debian  Boot embedded Debian minbase guest\n");
         p = _sa(out, p, mx, "  boot-test    Create+run minimal test guest\n");
+        p = _sa(out, p, mx, "\nBackground Linux VM:\n");
+        p = _sa(out, p, mx, "  start [alpine|debian] [MB]  Boot the guest in the background\n");
+        p = _sa(out, p, mx, "  stop | kill  Clean poweroff / immediate stop\n");
+        p = _sa(out, p, mx, "  term         Open the Alpine terminal window\n");
+        p = _sa(out, p, mx, "  state        Guest state, disk, network counters\n");
+        p = _sa(out, p, mx, "  log [bytes]  Tail of the guest console\n");
+        p = _sa(out, p, mx, "  send <text>  Type a line into the guest console\n");
+        p = _sa(out, p, mx, "  agent <cmd>  Send a command to the guest agent\n");
+        p = _sa(out, p, mx, "  run <cmd>    Start a guest program (GUI apps open as Kurono windows)\n");
         return p;
     }
 
     const char* sub = argv[1];
 
     if (_seq(sub, "status")) {
+        if (Hypervisor::IsOwned()) return VMHost::Status(out, mx);   // the background vm (satoru)
         int p = 0;
         p = _sa(out, p, mx, "Hypervisor Status\n");
         p = _sa(out, p, mx, "  Hardware: ");
@@ -2780,7 +2803,25 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
         return p;
     }
 
+    // settings > linux turned off: the linux vm commands refuse (satoru)
+    if (!VMHost::Enabled() && (_seq(sub, "run") || _seq(sub, "start") || _seq(sub, "term")))
+        return _sa(out, 0, mx, "vm: Linux is turned off. Turn it on in Settings > Linux.\n");
+    if (_seq(sub, "run") && Hypervisor::IsOwned()) {   // the background vm is up: start a guest program (satoru)
+        char line[180]; int li = 0;
+        const char* pre = "run ";
+        while (*pre) line[li++] = *pre++;
+        for (int a = 2; a < argc && li < 170; a++) {
+            if (a > 2) line[li++] = ' ';
+            for (const char* w = argv[a]; *w && li < 175; w++) line[li++] = *w;
+        }
+        line[li] = 0;
+        if (argc < 3) return _sa(out, 0, mx, "usage: vm run <command>\n");
+        if (!VMHost::AgentReady()) return _sa(out, 0, mx, "vm: guest agent not connected (vm start first)\n");
+        VMHost::AgentSend(line);
+        return _sa(out, 0, mx, "vm: started in the guest\n");
+    }
     if (_seq(sub, "create")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         if (Hypervisor::GetState() != VM_STATE_UNINITIALIZED &&
             Hypervisor::GetState() != VM_STATE_DESTROYED) {
             return _sa(out, 0, mx, "vm: VM already exists. Use 'vm destroy' first.\n");
@@ -2810,6 +2851,7 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
     }
 
     if (_seq(sub, "run")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         if (Hypervisor::GetState() != VM_STATE_CREATED &&
             Hypervisor::GetState() != VM_STATE_PAUSED) {
             return _sa(out, 0, mx, "vm run: no VM ready. Use 'vm create' first.\n");
@@ -2845,16 +2887,19 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
     }
 
     if (_seq(sub, "pause")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         Hypervisor::PauseVM();
         return _sa(out, 0, mx, "VM paused\n");
     }
 
     if (_seq(sub, "resume")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         Hypervisor::ResumeVM();
         return _sa(out, 0, mx, "VM resumed\n");
     }
 
     if (_seq(sub, "destroy")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         Hypervisor::DestroyVM();
         return _sa(out, 0, mx, "VM destroyed\n");
     }
@@ -2872,6 +2917,7 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
     }
 
     if (_seq(sub, "regs")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         Hypervisor::DumpGuestRegs();
         return _sa(out, 0, mx, "(register dump sent to serial log)\n");
     }
@@ -2895,8 +2941,9 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
 
     // ── vm boot-alpine - boot embedded alpine linux with driver extraction
     if (_seq(sub, "boot-alpine")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         if (!_guest_tools_enabled() || !_guest_is_alpine()) {
-            return _sa(out, 0, mx, "boot-alpine: Alpine guest is not the selected Linux profile. Use Settings > System > Linux.\n");
+            return _sa(out, 0, mx, "boot-alpine: Alpine guest is not the selected Linux profile. Use Settings > Linux.\n");
         }
         int p = 0;
 
@@ -2948,16 +2995,87 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
         return p;
     }
 
+    // ---- background linux vm (see virt/vm_host.cpp) (satoru)
+    if (_seq(sub, "start")) {
+        int distro = VMHost::DISTRO_ALPINE;
+        uint32_t ram = 0;
+        for (int a = 2; a < argc; a++) {
+            if (_seq(argv[a], "debian")) distro = VMHost::DISTRO_DEBIAN;
+            else if (_seq(argv[a], "alpine")) distro = VMHost::DISTRO_ALPINE;
+            else ram = (uint32_t)_atoi(argv[a]);
+        }
+        if (!Hypervisor::IsAvailable() && !VMM::IsSupported()) return _sa(out, 0, mx, "vm: no hardware virtualization (vt-x) on this machine\n");
+        if (distro == VMHost::DISTRO_DEBIAN) Hypervisor::SetLinuxGuestProfile(LINUX_GUEST_DEBIAN);
+        bool ok = VMHost::Start(distro, ram);
+        if (!ok && VMHost::GetState() == VMHost::VMH_FAILED) {
+            int q = _sa(out, 0, mx, "vm: ");
+            q = _sa(out, q, mx, VMHost::LastError());
+            return _sa(out, q, mx, "\n");
+        }
+        int p = _sa(out, 0, mx, ok ? "vm: starting " : "vm: already running: ");
+        p = _sa(out, p, mx, distro == VMHost::DISTRO_DEBIAN ? "debian" : "alpine");
+        return _sa(out, p, mx, ok ? " in the background (vm status, vm log, open the Alpine terminal)\n" : "\n");
+    }
+    if (_seq(sub, "stop")) { VMHost::Stop(); return _sa(out, 0, mx, "vm: shutting the guest down\n"); }
+    if (_seq(sub, "term")) { AlpineTerminal::Open(); return _sa(out, 0, mx, "vm: Alpine terminal opened\n"); }
+    if (_seq(sub, "kill")) { VMHost::Kill(); return _sa(out, 0, mx, "vm: guest killed\n"); }
+    if (_seq(sub, "state")) { return VMHost::Status(out, mx); }
+    if (_seq(sub, "log")) {
+        // the tail of the guest console (default 4 kb) (satoru)
+        int want = (argc > 2) ? _atoi(argv[2]) : 4096;
+        if (want < 64) want = 64;
+        if (want > mx - 64) want = mx - 64;
+        uint64_t head = VMHost::ConsoleHead();
+        uint64_t cur = head > (uint64_t)want ? head - (uint64_t)want : 0;
+        static char tmp[8192];
+        int p = 0, n;
+        while (p < mx - 64 && (n = VMHost::ConsoleRead(&cur, tmp, (int)sizeof(tmp))) > 0) {
+            for (int i = 0; i < n && p < mx - 64; i++) {
+                char c = tmp[i];
+                if (c == '\r' || c == 0x1B) continue;
+                out[p++] = c;
+            }
+        }
+        out[p] = 0;
+        return p;
+    }
+    if (_seq(sub, "send")) {      // type a line into the guest console (satoru)
+        char line[240]; int li = 0;
+        for (int a = 2; a < argc && li < 230; a++) {
+            if (a > 2) line[li++] = ' ';
+            for (const char* w = argv[a]; *w && li < 235; w++) line[li++] = *w;
+        }
+        line[li++] = '\n';
+        VMHost::ConsoleWrite(line, li);
+        return _sa(out, 0, mx, "sent\n");
+    }
+    if (_seq(sub, "agent")) {     // one line to the guest agent (satoru)
+        char line[180]; int li = 0;
+        for (int a = 2; a < argc && li < 170; a++) {
+            if (a > 2) line[li++] = ' ';
+            for (const char* w = argv[a]; *w && li < 175; w++) line[li++] = *w;
+        }
+        line[li] = 0;
+        if (!VMHost::AgentReady()) return _sa(out, 0, mx, "vm: guest agent not connected\n");
+        VMHost::AgentSend(line);
+        char last[160]; VMHost::AgentLastLine(last, sizeof(last));
+        int p = _sa(out, 0, mx, "sent; last agent reply: ");
+        p = _sa(out, p, mx, last);
+        return _sa(out, p, mx, "\n");
+    }
+    if (_seq(sub, "mirror")) {
+        bool on = argc > 2 && _seq(argv[2], "on");
+        VMHost::SetLogMirror(on);
+        return _sa(out, 0, mx, on ? "vm: guest console mirrored to the serial log\n" : "vm: console mirror off\n");
+    }
+
     if (_seq(sub, "boot-debian")) {
-        if (!_guest_tools_enabled() || !_guest_is_debian()) {
-            return _sa(out, 0, mx, "boot-debian: Debian guest is not the selected Linux profile. Use Settings > System > Linux.\n");
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
+        if (!_guest_tools_enabled()) {
+            return _sa(out, 0, mx, "boot-debian: Linux guest tools are disabled. Use Settings > Linux.\n");
         }
+        Hypervisor::SetLinuxGuestProfile(LINUX_GUEST_DEBIAN);   // (satoru)
         int p = 0;
-        if (!debian_rootfs_available()) {
-            p = _sa(out, p, mx, "boot-debian: Embedded Debian rootfs not found.\n");
-            p = _sa(out, p, mx, "Build it with 'make debian-rootfs' and rebuild Kurono first.\n");
-            return p;
-        }
 
         uint32_t max_exits = 250000;
         if (argc > 2) max_exits = (uint32_t)_atoi(argv[2]);
@@ -2986,6 +3104,7 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
     }
 
     if (_seq(sub, "boot-test")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         int p = 0;
 
         // initialize hypervisor if needed
@@ -3104,10 +3223,10 @@ int LinuxCmds::cmd_alpine(KuronoShell* sh, int argc, const char** argv,
     (void)sh;
 
     if (!_guest_tools_enabled()) {
-        return _sa(out, 0, mx, "Alpine guest is disabled. Enable Linux Guest Integration in Settings > System > Linux.\n");
+        return _sa(out, 0, mx, "Alpine guest is disabled. Enable Linux Guest Integration in Settings > Linux.\n");
     }
     if (!_guest_is_alpine()) {
-        return _sa(out, 0, mx, "Alpine guest is not selected. Switch the Linux distro back to Alpine in Settings > System > Linux.\n");
+        return _sa(out, 0, mx, "Alpine guest is not selected. Switch the Linux distro back to Alpine in Settings > Linux.\n");
     }
 
     if (argc < 2) {
@@ -3139,6 +3258,7 @@ int LinuxCmds::cmd_alpine(KuronoShell* sh, int argc, const char** argv,
     const char* sub = argv[1];
 
     if (_seq(sub, "boot")) {
+        if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
         int p = 0;
         if (Hypervisor::IsAlpineBooted()) {
             return _sa(out, 0, mx, "Alpine is already booted. Use 'alpine shutdown' first.\n");
@@ -3217,8 +3337,8 @@ int LinuxCmds::cmd_alpine(KuronoShell* sh, int argc, const char** argv,
     }
 
     if (_seq(sub, "exec")) {
-        if (!Hypervisor::IsAlpineBooted() ||
-            Hypervisor::GetState() != VM_STATE_RUNNING) {
+        if ((!VMHost::AgentReady() && (!Hypervisor::IsAlpineBooted() ||
+            Hypervisor::GetState() != VM_STATE_RUNNING))) {
             return _sa(out, 0, mx, "Alpine VM not running. Use 'alpine boot' first.\n");
         }
         if (argc < 3) {
@@ -3241,7 +3361,7 @@ int LinuxCmds::cmd_alpine(KuronoShell* sh, int argc, const char** argv,
         p = _sac(out, p, mx, '\n');
 
         char result[4096];
-        int n = Hypervisor::AlpineExec(cmd_buf, result, (int)sizeof(result) - 1);
+        int n = _guest_exec(cmd_buf, result, (int)sizeof(result) - 1);
         if (n > 0) {
             result[n] = 0;
             int copy = n;
@@ -3410,11 +3530,11 @@ int LinuxCmds::cmd_apk(KuronoShell* sh, int argc, const char** argv,
         return _sa(out, 0, mx, "apk: Linux guest integration is disabled.\n");
     }
     if (!_guest_is_alpine()) {
-        return _sa(out, 0, mx, "apk: Alpine is not the selected guest profile. Switch back in Settings > System > Linux.\n");
+        return _sa(out, 0, mx, "apk: Alpine is not the selected guest profile. Switch back in Settings > Linux.\n");
     }
 
-    if (!Hypervisor::IsAlpineBooted() ||
-        Hypervisor::GetState() != VM_STATE_RUNNING) {
+    if ((!VMHost::AgentReady() && (!Hypervisor::IsAlpineBooted() ||
+        Hypervisor::GetState() != VM_STATE_RUNNING))) {
         return _sa(out, 0, mx, "Alpine VM not running. Use 'alpine boot' first.\n");
     }
 
@@ -3451,7 +3571,7 @@ int LinuxCmds::cmd_apk(KuronoShell* sh, int argc, const char** argv,
     p = _sac(out, p, mx, '\n');
 
     char result[4096];
-    int n = Hypervisor::AlpineExec(cmd_buf, result, (int)sizeof(result) - 1);
+    int n = _guest_exec(cmd_buf, result, (int)sizeof(result) - 1);
     if (n > 0) {
         result[n] = 0;
         int copy = n;
@@ -3470,10 +3590,10 @@ int LinuxCmds::cmd_debian(KuronoShell* sh, int argc, const char** argv,
     (void)sh;
 
     if (!_guest_tools_enabled()) {
-        return _sa(out, 0, mx, "Debian guest is disabled. Enable Linux Guest Integration in Settings > System > Linux.\n");
+        return _sa(out, 0, mx, "Debian guest is disabled. Enable Linux Guest Integration in Settings > Linux.\n");
     }
     if (!_guest_is_debian()) {
-        return _sa(out, 0, mx, "Debian guest is not selected. Switch the Linux distro to Debian in Settings > System > Linux.\n");
+        return _sa(out, 0, mx, "Debian guest is not selected. Switch the Linux distro to Debian in Settings > Linux.\n");
     }
 
     const char* sub = argc > 1 ? argv[1] : "status";
@@ -3642,7 +3762,7 @@ int LinuxCmds::cmd_apt(KuronoShell* sh, int argc, const char** argv,
         return _sa(out, 0, mx, "apt: Linux guest integration is disabled.\n");
     }
     if (!_guest_is_debian()) {
-        return _sa(out, 0, mx, "apt: Debian is not the selected guest profile. Switch it in Settings > System > Linux.\n");
+        return _sa(out, 0, mx, "apt: Debian is not the selected guest profile. Switch it in Settings > Linux.\n");
     }
     if (!debian_rootfs_available()) {
         return _sa(out, 0, mx, "apt: Debian rootfs is not embedded yet. Build it first with 'make debian-rootfs'.\n");

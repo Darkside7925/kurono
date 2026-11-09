@@ -1,12 +1,17 @@
 #include "input_manager.h"
+#include "../ui/control_center.h"   // shell keyboard owner (satoru)
+#include "../kui/kui_kernel.h"   // kui key edges (satoru)
 #include "../ui/window_manager.h"
 #include "../ui/wayland_server.h"
+#include "../ui/clipboard_ui.h"
 #include "../apps/terminal.h"
+#include "../apps/system_settings.h"   // SystemSettings::KeyEvent (satoru)
 #include "../drivers/serial.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/mouse.h"
 #include "../drivers/usb.h"
 #include "../fs/vfs.h"
+#include "../apps/alpine_term.h"   // the alpine vm terminal takes raw keys (satoru)
 
 KeyboardDevice InputManager::devices[8];
 int InputManager::device_count = 0;
@@ -186,14 +191,71 @@ void InputManager::Poll() {
         // so queued events keep their own shift/ctrl. (satoru)
         static bool s_held[KEY_WAKE + 1] = {};
         int k = (int)ev.key;
+        bool was_held = (k > 0 && k <= (int)KEY_WAKE) ? s_held[k] : false;   // auto-repeat check (satoru)
         if (k > 0 && k <= (int)KEY_WAKE) s_held[k] = ev.pressed;
+        // an open control center owns every key edge (its own focus/wifi field). (satoru)
+        if (ControlCenter::HandleKeyEvent(k, s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT],
+                                          s_held[KEY_LCTRL] || s_held[KEY_RCTRL],
+                                          s_held[KEY_LALT] || s_held[KEY_RALT], ev.pressed))
+            continue;
+        // super+v: clipboard history popup. the key press never reaches the app. (satoru)
+        bool clip_consumed = false;
+        if (ev.pressed && !was_held && k == (int)KEY_V &&
+            (s_held[KEY_LSUPER] || s_held[KEY_RSUPER])) {
+            ClipboardUI::Toggle();
+            clip_consumed = true;
+        }
+        // while the popup is open it owns the keyboard (esc, arrows, enter). (satoru)
+        if (ClipboardUI::IsOpen() &&
+            ClipboardUI::KeyEvent(k, s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT],
+                                  s_held[KEY_LCTRL] || s_held[KEY_RCTRL],
+                                  s_held[KEY_LALT] || s_held[KEY_RALT]))
+            clip_consumed = true;
+        if (clip_consumed) continue;
+        // super+d: show desktop. consumed so the focused app never sees it. (satoru)
+        if (ev.pressed && !was_held && k == (int)KEY_D &&
+            (s_held[KEY_LSUPER] || s_held[KEY_RSUPER])) {
+            WindowManager::ToggleShowDesktop();
+            continue;
+        }
+        // alt+tab drives the live switcher. tab steps are consumed; releasing
+        // alt commits the selection. esc cancels. (satoru)
+        if (k == (int)KEY_TAB && (s_held[KEY_LALT] || s_held[KEY_RALT])) {
+            if (ev.pressed && !was_held)
+                WindowManager::AltTabStep(s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT]);
+            continue;
+        }
+        if (ev.pressed && !was_held && k == (int)KEY_ESC &&
+            WindowManager::IsTabSwitcherOpen()) {
+            WindowManager::AltTabCancel();
+            continue;
+        }
+        if (!ev.pressed && was_held && (k == (int)KEY_LALT || k == (int)KEY_RALT) &&
+            WindowManager::IsTabSwitcherOpen()) {
+            WindowManager::AltTabFinish();
+        }
         // a terminal running a pty program gets raw key events (arrows, ctrl, alt) (satoru)
         if (ev.pressed)
             TerminalApp::PtyKeyEvent(k, s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT],
                                      s_held[KEY_LCTRL] || s_held[KEY_RCTRL],
                                      s_held[KEY_LALT] || s_held[KEY_RALT]);
+        if (ev.pressed)
+            AlpineTerminal::KeyEvent(k, s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT],
+                                     s_held[KEY_LCTRL] || s_held[KEY_RCTRL],
+                                     s_held[KEY_LALT] || s_held[KEY_RALT]);   // (satoru)
+        // a focused kui window takes the keys the char queue never carries, and key ups (satoru)
+        KuiKernel::KeyEvent(k, ev.pressed, s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT],
+                            s_held[KEY_LCTRL] || s_held[KEY_RCTRL],
+                            s_held[KEY_LALT] || s_held[KEY_RALT]);
+        // settings takes arrows / esc / tab / paging when it has focus (satoru)
+        if (ev.pressed)
+            SystemSettings::KeyEvent(k, s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT],
+                                     s_held[KEY_LCTRL] || s_held[KEY_RCTRL],
+                                     s_held[KEY_LALT] || s_held[KEY_RALT]);
         // raw key edges -> the focused wayland client (gtk reads evdev keys). (satoru)
-        if (wl_win >= 0) {
+        // alt+tab belongs to the desktop, not to the wayland app under it (satoru)
+        bool alt_tab_key = (k == (int)KEY_TAB) && (s_held[KEY_LALT] || s_held[KEY_RALT]);
+        if (wl_win >= 0 && !alt_tab_key) {
             uint32_t mods = 0;
             if (s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT]) mods |= WaylandServer::WL_MOD_SHIFT;
             if (s_held[KEY_LCTRL]  || s_held[KEY_RCTRL])  mods |= WaylandServer::WL_MOD_CTRL;
@@ -314,6 +376,32 @@ void InputManager::OnKeyDown(int device_id, Key key) {
     last_key = key;
     last_key_pressed = true;
     last_device_id = device_id;
+    // /input.log append. this is process context (Poll or the boot self-test),
+    // never the irq path, and the ramdisk write is bounded to 16k, so it can
+    // not stall the interrupt-time capture. the boot self-test reads this
+    // back to prove both device ids reach the routing layer. (satoru)
+    {
+        FileNode* f = VFS::Open("/input.log");
+        if (f) {
+            char msg[48];
+            int n = 0;
+            const char* p = "KEY DEV:";
+            while (*p && n < 40) msg[n++] = *p++;
+            int v = device_id < 0 ? 0 : device_id;
+            char rev[8];
+            int rn = 0;
+            if (v == 0) rev[rn++] = '0';
+            while (v > 0 && rn < 7) { rev[rn++] = (char)('0' + (v % 10)); v /= 10; }
+            while (rn > 0 && n < 44) msg[n++] = rev[--rn];
+            const char* m = " CHAR:";
+            while (*m && n < 44) msg[n++] = *m++;
+            const KeyboardState& st = Keyboard::GetState();
+            char c = Keyboard::KeyToChar(key, st.shift, st.caps_lock);
+            msg[n++] = (c >= 32 && c <= 126) ? c : '?';
+            msg[n++] = '\n';
+            VFS::Write(f, f->size, (uint32_t)n, (uint8_t*)msg);
+        }
+    }
     dispatch_to_focus(device_id, key, true);
 }
 

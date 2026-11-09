@@ -642,8 +642,10 @@ uintptr_t GpuProbe::ValidateFramebuffer(uintptr_t mb_fb_addr, uint32_t width,
 
         // read plane stride for debugging
         uint32_t stride = IntelReadMMIO(primary.bar0, INTEL_DSPSTRIDE_A);
+        // DSPSTRIDE_A is in 64-byte units on the display engine, like the idisp
+        // probe prints it; show the byte stride so the pitch check is readable. (satoru)
         SerialLogger::Log("[GpuProbe] Intel DSPSTRIDE_A = ");
-        SerialLogger::LogDec(stride);
+        SerialLogger::LogDec((int)(stride * 64));
         SerialLogger::Log(" bytes (expected ");
         SerialLogger::LogDec(pitch);
         SerialLogger::Log(")\r\n");

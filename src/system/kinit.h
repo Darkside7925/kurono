@@ -24,7 +24,7 @@
 //  features: boot targets (dependency-sequenced stages), a crash monitor with
 //  exponential backoff (2s,4s,8s..max 60s; 5 crashes/60s -> failed + alert;
 //  critical kdbus/kwayland failures raise a desktop notification), capability
-//  gating at spawn (network/filesystem/gui via supr/ksa), and an audit log of
+//  gating at spawn (network/filesystem/gui via ken/ksa), and an audit log of
 //  every start/stop/crash/restart to /kurono/var/log/services.log. (satoru)
 
 namespace KInit {
@@ -81,7 +81,7 @@ enum KTarget : uint8_t {
 };
 
 // capability grants parsed from the [Capabilities] section. enforced at spawn
-// via supr/ksa; an in-kernel unit ignores them (it already runs in the kernel)
+// via ken/ksa; an in-kernel unit ignores them (it already runs in the kernel)
 // but they are recorded + logged for honesty. (satoru)
 struct KCapabilities {
     bool network;      // may use the network stack (satoru)
@@ -259,7 +259,7 @@ int Analyze(char* out, int mx);
 uint32_t BootElapsedMs();
 
 // ── runtime capability sandboxing (satoru) ───────────────────────────────────
-// enforce a service's [Capabilities] at RUNTIME (not only at spawn) via SUPR:
+// enforce a service's [Capabilities] at RUNTIME (not only at spawn) via KEN:
 // returns true if the calling service is permitted the requested capability now.
 // an in-kernel service calls this before a privileged operation; a denied call is
 // audited. CAP_* select the capability. (satoru)

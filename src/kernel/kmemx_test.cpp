@@ -18,6 +18,14 @@ namespace {
 
 constexpr int PAGE = 4096;
 
+// scratch va window for the tests that map real frames into the kernel root.
+// it used to be 0x5_0000_0000 (20 gb), inside the identity map: harmless while
+// the pmm stopped at 16 gb, but now that ram above 16 gb is managed, remapping
+// that va would hide (and on unmap, unmap) a live kernel frame from every
+// address space. a higher-half pml4 slot nothing else uses (kdf is at
+// 0xFFFFC000_00000000) keeps the tests off real ram. (satoru)
+constexpr uint64_t TEST_VA_BASE = 0xFFFFD00000000000ULL;
+
 // a tiny deterministic prng (xorshift32) so every run produces the same pages
 // and a failure is reproducible. (satoru)
 struct Rng {
@@ -414,9 +422,9 @@ static bool test_vmm_aging() {
     uint64_t as = KernelVMM::GetCurrentAddressSpace();
     uint64_t frame = PMM::AllocFrame();
     if (!frame) { SerialLogger::Log("KMEMX-TEST: vmm_aging FAIL (no frame)\r\n"); return false; }
-    // pick a VA far from anything mapped: 0x5_0000_0000 (20gb) is above the
-    // identity map's hot region; MapPage builds the tables on demand. (satoru)
-    uint64_t va = 0x500000000ULL;
+    // pick a VA far from anything mapped: the higher-half scratch window, clear
+    // of the identity map; MapPage builds the tables on demand. (satoru)
+    uint64_t va = TEST_VA_BASE;
     if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE)) {
         SerialLogger::Log("KMEMX-TEST: vmm_aging FAIL (map)\r\n");
         PMM::FreeFrame(frame);
@@ -497,7 +505,7 @@ static bool test_fault_roundtrip() {
     for (int i = 0; i < COUNT; i++) {
         uint64_t frame = PMM::AllocFrame();
         if (!frame) break;
-        uint64_t va = 0x510000000ULL + (uint64_t)i * 0x2000ULL;   // spaced scratch VAs (satoru)
+        uint64_t va = TEST_VA_BASE + 0x10000000ULL + (uint64_t)i * 0x2000ULL;   // spaced scratch VAs (satoru)
         if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE)) { PMM::FreeFrame(frame); fail++; continue; }
 
         // fill with a known pattern (kind cycles for variety). (satoru)
@@ -641,6 +649,115 @@ static bool test_dedup() {
     return fail == 0;
 }
 
+// ── adaptive pool: grow, release empty chunks, refill holes ─────────────────
+// grows the arena by two chunks, parks a blob in the lowest chunk, releases
+// every empty chunk above the starting size, and checks: the released chunks
+// are gone (Contains false, totals back), the parked blob still reads back
+// intact, and a regrow refills the freed slots. (satoru)
+static bool test_pool_adaptive() {
+    if (!KMemX::IsInitialized()) {
+        SerialLogger::Log("KMEMX-TEST: pool_adaptive FAIL (engine not inited)\r\n");
+        return false;
+    }
+    KMemXPool::ResetForTest();
+    const uint64_t CH = KMemXPool::CHUNK_BYTES;
+    uint64_t t0 = KMemXPool::TotalBytes();
+    int fail = 0;
+    uint64_t t1 = KMemXPool::GrowTo(t0 + 2 * CH);
+    if (t1 != t0 + 2 * CH) fail |= 1;
+    uint32_t off = KMemXPool::Alloc(1000);
+    uint8_t* p = (uint8_t*)KMemXPool::Ptr(off);
+    if (!p) fail |= 2;
+    else for (int i = 0; i < 1000; i++) p[i] = (uint8_t)(i * 13 + 7);
+    uint64_t bases[16];
+    int n = KMemXPool::ReleaseEmpty(16, t0, bases);
+    if (n != 2 || KMemXPool::TotalBytes() != t0) fail |= 4;
+    for (int i = 0; i < n; i++) {
+        if (KMemXPool::Contains(bases[i])) fail |= 8;
+        PMM::FreeContiguous(bases[i], CH / 4096);
+    }
+    p = (uint8_t*)KMemXPool::Ptr(off);
+    if (!p) fail |= 16;
+    else for (int i = 0; i < 1000; i++) if (p[i] != (uint8_t)(i * 13 + 7)) { fail |= 32; break; }
+    KMemXPool::Free(off, 1000);
+    uint64_t t2 = KMemXPool::GrowTo(t0 + CH);
+    if (t2 != t0 + CH) fail |= 64;
+    n = KMemXPool::ReleaseEmpty(16, t0, bases);
+    for (int i = 0; i < n; i++) PMM::FreeContiguous(bases[i], CH / 4096);
+    if (KMemXPool::TotalBytes() != t0 || KMemXPool::UsedBytes() != 0) fail |= 128;
+    SerialLogger::Log(fail ? "KMEMX-TEST: pool_adaptive FAIL mask=" : "KMEMX-TEST: pool_adaptive PASS mask=");
+    SerialLogger::LogDec(fail);
+    SerialLogger::Log("\r\n");
+    return fail == 0;
+}
+
+// ── adaptive pool, full cycle through the real engine paths ─────────────────
+// start from an EMPTY pool, map 1500 patterned pages, compress every one with
+// CompressPage (growing the pool chunk by chunk through the real grow path
+// whenever a store finds it full), touch every page so the real #pf path
+// decompresses + crc-checks it, then hand every chunk back through the real
+// release path. the pool must end at 0 and every byte must match. (satoru)
+static bool test_adaptive_cycle() {
+    if (!KMemX::IsInitialized() || !KMemX::IsEnabled()) {
+        SerialLogger::Log("KMEMX-TEST: adaptive_cycle FAIL (engine off)\r\n");
+        return false;
+    }
+    KMemX::TestReleasePool();
+    uint64_t as = KernelVMM::GetCurrentAddressSpace();
+    const int COUNT = 1500;
+    static uint32_t crcs[COUNT];
+    static bool mapped[COUNT];
+    int fail = 0, compressed = 0, grows = 0, verified = 0;
+    uint64_t pool0 = KMemXPool::TotalBytes();
+    for (int i = 0; i < COUNT; i++) {
+        mapped[i] = false;
+        uint64_t frame = PMM::AllocFrame();
+        if (!frame) break;
+        uint64_t va = TEST_VA_BASE + 0x20000000ULL + (uint64_t)i * 0x1000ULL;
+        if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE)) { PMM::FreeFrame(frame); fail++; continue; }
+        mapped[i] = true;
+        uint8_t* p = (uint8_t*)(uintptr_t)va;
+        make_page(p, i, 0xADA9u + (uint32_t)i * 2654435761u);
+        crcs[i] = KMemXLZ4::Crc32(p, PAGE);
+        for (int a = 0; a < 16; a++) KernelVMM::KmemxAgeLeaf(as, va);
+        bool ok = KMemX::CompressPage(as, va);
+        if (!ok && KMemX::TestTakePoolStarved()) {
+            if (KMemX::TestGrowPool(1) > 0) grows++;
+            ok = KMemX::CompressPage(as, va);
+        }
+        if (ok) compressed++;
+    }
+    KMemX::FlushPendingCompressFrees();
+    uint64_t pool_peak = KMemXPool::TotalBytes();
+    uint32_t live_peak = KMemX::TestMetaLive();
+    uint64_t used_peak = KMemXPool::UsedBytes();
+    for (int i = 0; i < COUNT; i++) {
+        if (!mapped[i]) continue;
+        uint64_t va = TEST_VA_BASE + 0x20000000ULL + (uint64_t)i * 0x1000ULL;
+        uint32_t c = KMemXLZ4::Crc32((const uint8_t*)(uintptr_t)va, PAGE);   // touch -> #pf -> decompress (satoru)
+        if (c != crcs[i]) fail++; else verified++;
+        KernelVMM::UnmapPage(va, true);
+    }
+    uint32_t live_after = KMemX::TestMetaLive();
+    int released = KMemX::TestReleasePool();
+    uint64_t pool_end = KMemXPool::TotalBytes();
+    if (pool0 != 0 || compressed < COUNT / 2 || grows == 0 || live_after != 0 || pool_end != 0) fail++;
+    SerialLogger::Log(fail ? "KMEMX-TEST: adaptive_cycle FAIL" : "KMEMX-TEST: adaptive_cycle PASS");
+    log_kv(" pool_start_kb=", (int)(pool0 / 1024));
+    log_kv(" compressed=", compressed);
+    log_kv(" grows=", grows);
+    log_kv(" pool_peak_kb=", (int)(pool_peak / 1024));
+    log_kv(" used_peak_kb=", (int)(used_peak / 1024));
+    log_kv(" live_peak=", (int)live_peak);
+    log_kv(" verified=", verified);
+    log_kv(" live_after=", (int)live_after);
+    log_kv(" released_chunks=", released);
+    log_kv(" pool_end_kb=", (int)(pool_end / 1024));
+    log_kv(" fail=", fail);
+    SerialLogger::Log("\r\n");
+    return fail == 0;
+}
+
 int RunAll() {
     SerialLogger::Log("KMEMX-TEST: starting\r\n");
     int pass = 0, total = 0;
@@ -653,6 +770,15 @@ int RunAll() {
     // primitives are live. init with the default 20% pool if not already up. (satoru)
     if (!KMemX::IsInitialized()) KMemX::Init(KMemX::PoolPct());
     KMemX::SetEnabled(true);
+    // the pool is adaptive and starts empty; the tests need a few chunks to
+    // exercise it. the worker's shrink path returns them once the boot runs
+    // green. (satoru)
+    if (KMemX::IsInitialized() && KMemXPool::TotalBytes() < 16ULL * 1024 * 1024) {
+        KMemXPool::GrowTo(16ULL * 1024 * 1024);
+        SerialLogger::Log("KMEMX-TEST: test pool grown to ");
+        SerialLogger::LogDec((int)(KMemXPool::TotalBytes() / (1024 * 1024)));
+        SerialLogger::Log("MB\r\n");
+    }
     total++; if (test_pool_allocator())            pass++;
     total++; if (test_pool_store_retrieve_1000())  pass++;
 
@@ -664,6 +790,10 @@ int RunAll() {
 
     // stage 10: ksm-style dedup with cow refcounting. (satoru)
     total++; if (test_dedup())                     pass++;
+
+    // adaptive pool grow / release / hole refill. (satoru)
+    total++; if (test_pool_adaptive())             pass++;
+    total++; if (test_adaptive_cycle())            pass++;
 
     SerialLogger::Log("KMEMX-TEST: SUMMARY ");
     SerialLogger::LogDec(pass);

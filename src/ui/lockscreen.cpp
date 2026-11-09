@@ -11,6 +11,8 @@
 //     strength meter, prefs (timezone/language/accent/auto-login), summary
 
 #include "lockscreen.h"
+#include "boot_anim.h"
+#include "../drivers/outputs.h"   // lock ui sits on the primary output (satoru)
 #include "../drivers/graphics.h"
 #include "../drivers/rtc.h"
 #include "../drivers/timer.h"
@@ -965,11 +967,19 @@ static void tick_animations(int dt){
 
 // ---------------------------------------------------- MAIN LOOP
 void LockScreen::Show(){
+    // a boot without autologin ends its boot film on this screen (satoru)
+    BootAnim::GuiTakeover();
     Keyboard::FlushBuffers();
     UserManager::Init();
     InputManager::Init();
     g_w = Graphics::GetWidth();
     g_h = Graphics::GetHeight();
+    // multi-monitor: the lock ui is laid out on the primary output, not centred
+    // across the seam of the virtual desktop. (satoru)
+    if (Outputs::Multi()) {
+        const Output* po = Outputs::Get(0);
+        if (po && po->connected && po->w > 0 && po->h > 0) { g_w = po->w; g_h = po->h; }
+    }
 
     // hard-reset all transient state so re-entering Show() never carries
     // over a half-finished animation or stale buffers.
@@ -1238,7 +1248,8 @@ void LockScreen::Show(){
         // change so keystrokes feel instantaneous. We track "dirty" cheaply by
         // any keypress, click, state change, or an active animation.
         bool any_anim = (g_step_anim_t > 0) || (g_shake_t > 0) || (g_clock_pulse_t > 0)
-                        || (current_state == FADE_OUT) || (g_fade_raw < 1.0f && current_state != IDLE);
+                        || (current_state == FADE_OUT) || (g_fade_raw < 1.0f && current_state != IDLE)
+                        || BootAnim::Active();
         // also dirty whenever any per-dot pop animation is still ticking
         if (!any_anim){
             for (int i = 0; i < 64 && !any_anim; i++){
@@ -1257,9 +1268,15 @@ void LockScreen::Show(){
             if (current_state == SHAKE && g_shake_total > 0){
                 // smooth decaying sine-like shake using cubic easing on remaining time
                 float remain = (float)g_shake_t / (float)g_shake_total;
-                float amp = 10.0f * remain;
-                int phase = (g_shake_total - g_shake_t) / 30;
-                shake = (phase % 2 == 0) ? -(int)amp : (int)amp;
+                // damped sine, ~3.5 swings over the shake, decaying with the
+                // square of the time left; replaces the 30 ms square wave (satoru)
+                float el = (float)(g_shake_total - g_shake_t);
+                float ph = el * (6.2831853f / 90.0f);
+                ph -= 6.2831853f * (float)(int)(ph / 6.2831853f);
+                float x = ph > 3.14159265f ? ph - 6.2831853f : ph;
+                float s = x * (1.27323954f - 0.40528473f * (x < 0.0f ? -x : x));   // fast sine (satoru)
+                float amp = 11.0f * remain * remain;
+                shake = (int)(s * amp + (s >= 0.0f ? 0.5f : -0.5f));
             }
 
             switch (current_state){
@@ -1284,6 +1301,7 @@ void LockScreen::Show(){
             GUI::DrawDesktop();
 
             Mouse::DrawAt(mx, my);
+            BootAnim::Composite();   // boot film tail over the lock screen (satoru)
             Graphics::SwapBuffers();
         }
 

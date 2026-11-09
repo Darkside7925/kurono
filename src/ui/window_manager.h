@@ -7,7 +7,8 @@
 #define WM_BORDER_W        1
 #define WM_MIN_WIDTH      140
 #define WM_MIN_HEIGHT     100
-#define WM_SHADOW_SIZE      6
+// damage margin around a window: covers the soft shadow (blur + offset). (satoru)
+#define WM_SHADOW_SIZE     44
 #define WM_CORNER_RADIUS   12
 
 enum WindowState {
@@ -24,6 +25,8 @@ enum WMAction {
     WM_RESIZE_TL, WM_RESIZE_TR, WM_RESIZE_BL, WM_RESIZE_BR,
     WM_RESIZE_T, WM_RESIZE_B, WM_RESIZE_L, WM_RESIZE_R
 };
+
+#include "wm_motion.h"   // WMMotion::Spring1 for the per-window motion state (satoru)
 
 // forward declaration
 class Window;
@@ -110,6 +113,33 @@ struct Window {
     // wm recomputes this on move/resize. defaults to 0 (primary). (satoru)
     int monitor_id;
 
+    // spring motion (compositor.motion = spring, the default). the window's
+    // real geometry changes at once (input never waits on an animation); what
+    // is drawn eases toward it. fx_mode: 0 none, 1 open, 2 close, 3 minimize
+    // (genie into the dock tile), 4 restore from the tile, 5 geometry morph
+    // (maximize, restore, snap, full screen). every spring is solved in closed
+    // form on the real clock, and a new action retargets the springs where
+    // they are, so a reversed action continues from the current state.
+    // (satoru)
+    WMMotion::Spring1 fx_sc, fx_op, fx_gn, fx_el;   // scale, opacity, genie, focus elevation (satoru)
+    WMMotion::Spring1 fx_r[4];                      // morph: visual x, y, w, h (satoru)
+    unsigned long long fx_us;                       // last spring step (us) (satoru)
+    unsigned char fx_mode;
+    bool fx_rect;           // fx_r drives the drawn rect (satoru)
+    bool fx_cap;            // capture snap_px at the real geometry this frame (satoru)
+    bool fx_need_old;       // morph: capture the old geometry first (satoru)
+    bool fx_caught;         // minimize: the dock tile catch has fired (satoru)
+    bool fx_o_tb;           // morph: old geometry had a titlebar (satoru)
+    int  fx_ox, fx_oy, fx_ow, fx_oh;                // morph: old geometry (satoru)
+    unsigned int* fx_old_px;                        // morph: old snapshot (satoru)
+    int  fx_old_w, fx_old_h;
+    float fx_d0;            // morph: distance at the start, for the crossfade (satoru)
+    int  fx_bx0, fx_by0, fx_bx1, fx_by1;            // last painted bounds (damage) (satoru)
+    // full screen (WindowManager::ToggleFullscreen): geometry to come back to. (satoru)
+    int  fs_x, fs_y, fs_w, fs_h;
+    unsigned char fs_prev_state;
+    bool fs_prev_tb;
+
     // app icon id (AppIcons::Id) shown in the titlebar + taskbar button.
     // -1 = none pinned: the renderers derive one from the title text. set
     // explicitly by the wayland bridge (xdg_toplevel.set_app_id) so a
@@ -129,6 +159,7 @@ public:
     static void CloseWindow(int id);
     static void CloseAll();
     static void DestroyWindow(int id);
+    static void UserCloseWindow(int id);   // titlebar/menu close: asks a wayland client first (satoru)
     static Window* GetWindow(int id);
     static Window* GetFocusedWindow();
 
@@ -139,6 +170,12 @@ public:
     static void Maximize(int id);
     static void Restore(int id);
     static void ToggleMaximize(int id);
+    // full screen: no titlebar, the whole output (over the menu bar and dock),
+    // square corners. toggles back to the previous geometry. (satoru)
+    static void ToggleFullscreen(int id);
+    // an app moved/resized its window itself (e.g. its own full screen mode):
+    // morph the drawn window from the old rect instead of jumping. (satoru)
+    static void AnimateGeometry(int id, int ox, int oy, int ow, int oh, bool old_titlebar);
     // ── window snapping ───────────────────────────────────────────────
     // snap a window to a screen region within the wm desktop area (taskbar
     // excluded, reusing the maximize bounds). edge codes:
@@ -148,6 +185,30 @@ public:
     static void SnapWindow(int win_id, int edge);
     // snap the currently focused window. (satoru)
     static void SnapFocused(int edge);
+    // while a titlebar drag is near an output edge or corner, tint the snap
+    // target over the composed frame. called after the window pass. (satoru)
+    static void RenderSnapPreview();
+
+    // ── alt-tab switcher ──────────────────────────────────────────────
+    // one step per tab press; backward selects the previous card. the panel
+    // stays up while alt is held and commits the selected window on release.
+    // (satoru)
+    static void AltTabStep(bool backward);
+    static void AltTabFinish();
+    static void AltTabCancel();
+    static bool IsTabSwitcherOpen();
+    // draw the live-thumbnail switcher above the taskbar and motion overlay. (satoru)
+    static void RenderTabSwitcher();
+
+    // ── show desktop (super+d) ────────────────────────────────────────
+    // minimize every ordinary window, or bring the ones this action hid back.
+    // (satoru)
+    static void ToggleShowDesktop();
+    static bool IsShowDesktop();
+
+    // pin a stable per-app key for geometry memory once a client reports its
+    // app id. wayland sets the icon right before the first frame. (satoru)
+    static void SetAppIcon(int id, int icon);
     static void BringToFront(int id);
     static void Focus(int id);
     static void SetTitle(int id, const char* title);
@@ -155,6 +216,11 @@ public:
     static void ResizeWindow(int id, int w, int h);
     static void SetVisible(int id, bool visible);
     static void MarkDirty(int id);
+    // damage the last painted footprint of every window that moved or is mid
+    // animation, plus the last spring-visual bounds. called at the top of the
+    // frame by the damage-only wallpaper path so it repaints the old pixels
+    // before the window draws at its new place. (satoru)
+    static void CollectLastPaintedDamage();
 
     // ── multi-monitor ─────────────────────────────────────────────────
     // Which output a window currently lives on (by center point). (satoru)
@@ -163,6 +229,16 @@ public:
     // offset within the old monitor where it fits. No-op if the index is
     // invalid or there is only one monitor. (satoru)
     static void MoveWindowToMonitor(int win_id, int monitor_index);
+    // virtual desktop resized (output layout / on-off / primary change). windows
+    // follow their output: shifted by the output's origin delta, or pulled onto
+    // the primary when their output went away. old_x/old_y are indexed by output
+    // slot; swap_a/swap_b (>=0) say two slots exchanged identity. (satoru)
+    static void SetScreenSize(int w, int h);
+    static void RelocateForOutputs(const int* old_x, const int* old_y, int swap_a, int swap_b);
+    // after the desktop got a new logical size (ui scale / output change): keep
+    // every window open, refit maximized ones, pull the rest inside their output's
+    // work area. (satoru)
+    static void ClampAllToDesktop();
 
     // ── window context menu (right-click on the titlebar) ─────────────
     // Minimal self-contained popup menu. HandleRightClick opens it when the
@@ -289,12 +365,19 @@ private:
     static bool prev_mouse_down;
     static bool mouse_is_down;
 
+    static bool ApplySavedGeometry(Window* win, const char* key);
+    static void ApplySnap(Window* win, int edge, int dx, int dy, int dw, int dh);
     static void RenderTitlebar(Window* win);
     // window motion renderers; t is design-ms since the animation began.
     // (satoru)
     static void RenderOpenMotion(Window* win, int t);
     static void RenderCloseMotion(Window* win, int t);
     static void RenderPourMotion(Window* win, int t, bool rising);
+    // spring motion: draw a window from its snapshot(s) at the eased visual
+    // rect, scale and opacity; capture a clean premultiplied snapshot. (satoru)
+    static void RenderFxWindow(Window* win);
+    static bool FxCapture(Window* win, int x, int y, int w, int h, bool titlebar,
+                          unsigned int** px, int* pw, int* ph);
     static void RenderShadow(Window* win);
     // draw one settled (non-animated) window: optional shadow, body, titlebar,
     // border and content. shared by the main z-order loop and the dragged-only

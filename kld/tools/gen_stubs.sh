@@ -31,6 +31,9 @@ BUILD="${1:-build}"
 OUT="${2:-$BUILD/lx_stubs_gen.c}"
 
 DRV_OBJS=$(find "$BUILD/driver" -name '*.o' 2>/dev/null)
+# imported upstream cores: their undefined symbols need providers too, and
+# their definitions provide for the driver. (satoru)
+CORE_OBJS=$(find "$BUILD/core" -name '*.o' 2>/dev/null || true)
 # (2) hand-written emul only - never the generated stub object
 EMUL_HAND=$(find "$BUILD/emul" -name '*.o' 2>/dev/null | grep -v 'lx_stubs_gen' || true)
 
@@ -42,13 +45,13 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-nm --undefined-only $DRV_OBJS 2>/dev/null \
+nm --undefined-only $DRV_OBJS $CORE_OBJS 2>/dev/null \
   | awk '$1=="U"{print $2}' | sort -u > "$TMP/needed"
 
 {
   [ -n "$EMUL_HAND" ] && nm --defined-only $EMUL_HAND 2>/dev/null | awk '{print $3}'
   # (1) intra-driver definitions
-  nm --defined-only $DRV_OBJS 2>/dev/null | awk '{print $3}'
+  nm --defined-only $DRV_OBJS $CORE_OBJS 2>/dev/null | awk '{print $3}'
   # (3) libc + compiler builtins
   printf '%s\n' memcpy memset memmove memcmp strlen strcmp strncmp strcpy strncpy \
                 strchr strrchr strstr strnlen snprintf vsnprintf sprintf printf \

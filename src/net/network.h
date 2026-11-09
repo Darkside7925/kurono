@@ -2,6 +2,8 @@
 //  kurono os - network stack & wifi driver
 //  bare-metal nic abstraction + basic tcp/ip
 
+#include "../kernel/types.h"
+
 #define NET_MAX_INTERFACES  4
 #define NET_ARP_TABLE_SIZE 32
 #define NET_PACKET_SIZE  1518
@@ -194,6 +196,9 @@ public:
 
     // dns
     static bool Resolve(const char* hostname, IPv4Address* out);
+    // lease-provided resolver pair, tried primary then secondary. (satoru)
+    static void SetDNSServers(uint32_t primary, uint32_t secondary);
+    static void GetDNSServers(uint32_t* primary, uint32_t* secondary);
 
 private:
     static NetworkInterface interfaces[NET_MAX_INTERFACES];
@@ -218,6 +223,11 @@ public:
     static bool Scan();
     static bool Connect(const char* ssid, const char* password);
     static bool Disconnect();
+    // auto-rejoin after a lost/deauthenticated link, with capped backoff. called
+    // from the network process loop. (satoru)
+    static void Tick();
+    static void SetAutoReconnect(bool on);
+    static bool AutoReconnect();
 
     static WiFiState GetState();
     static WiFiNetwork* GetNetworks();
@@ -251,4 +261,13 @@ private:
     static bool       link_probed;
     static void SimulateNetworks();
     static void ProbePCIWireless();
+    static bool ConnectInternal(const char* ssid, const char* password, bool notify);
+    static void DropLink(const char* why);
+    static bool auto_reconnect;
+    static char saved_ssid[NET_MAX_SSID];
+    static char saved_pass[64];
+    static bool have_saved;
+    static uint32_t reconnect_at_ms;
+    static uint32_t reconnect_backoff_ms;
+    static uint8_t  reconnect_tries;
 };

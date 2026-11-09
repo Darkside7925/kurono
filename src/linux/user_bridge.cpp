@@ -1,8 +1,8 @@
 //  kurono linux subsystem - user bridge implementation
-//  bidirectional supr ↔ linux user synchronization
+//  bidirectional ken ↔ linux user synchronization
 
 #include "user_bridge.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
 #include "../fs/kvfs.h"
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
@@ -14,7 +14,7 @@ static void GenerateLinuxUserFiles();
 UBMappedUser    UserBridge::mapped[UB_MAX_MAPPED_USERS];
 int             UserBridge::mapped_count = 0;
 UBSyncDirection UserBridge::direction = UB_BIDIRECTIONAL;
-UBConflictPolicy UserBridge::conflict_policy = UB_SUPR_WINS;
+UBConflictPolicy UserBridge::conflict_policy = UB_KEN_WINS;
 bool            UserBridge::auto_sync = true;
 uint32_t        UserBridge::last_auto_sync = 0;
 
@@ -54,7 +54,7 @@ void UserBridge::Init() {
     mapped_count = 0;
     memset(mapped, 0, sizeof(mapped));
     direction = UB_BIDIRECTIONAL;
-    conflict_policy = UB_SUPR_WINS;
+    conflict_policy = UB_KEN_WINS;
     auto_sync = true;
     last_auto_sync = 0;
 
@@ -110,7 +110,6 @@ void UserBridge::ParsePasswdLine(const char* line, char* user, int* uid, int* gi
                 break;
         }
         line++;
-        pos++;
     }
 }
 
@@ -134,11 +133,11 @@ int UserBridge::ParsePasswdUID(const char* line) {
 UBSyncResult UserBridge::SyncToLinux() {
     UBSyncResult result = {0, 0, 0, 0, true};
 
-    SUPRUser* users = SUPR::GetUsers();
-    int ucount = SUPR::GetUserCount();
+    KENUser* users = KEN::GetUsers();
+    int ucount = KEN::GetUserCount();
 
     for (int i = 0; i < ucount; i++) {
-        SUPRUser* su = &users[i];
+        KENUser* su = &users[i];
         UBMappedUser* mu = FindMapped(su->username);
 
         if (!mu) {
@@ -147,10 +146,10 @@ UBSyncResult UserBridge::SyncToLinux() {
             mu = &mapped[mapped_count++];
             memset(mu, 0, sizeof(UBMappedUser));
             ub_scpy(mu->username, su->username, sizeof(mu->username));
-            mu->supr_uid = su->uid > 0 ? su->uid : 1000 + i;
-            mu->linux_uid = mu->supr_uid;  // same uid by default
-            mu->supr_gid = su->gid > 0 ? su->gid : 1000 + i;
-            mu->linux_gid = mu->supr_gid;
+            mu->ken_uid = su->uid > 0 ? su->uid : 1000 + i;
+            mu->linux_uid = mu->ken_uid;  // same uid by default
+            mu->ken_gid = su->gid > 0 ? su->gid : 1000 + i;
+            mu->linux_gid = mu->ken_gid;
 
             // build home dir path
             ub_scpy(mu->home, "/home/", sizeof(mu->home));
@@ -167,17 +166,17 @@ UBSyncResult UserBridge::SyncToLinux() {
         } else {
             // existing mapping - update if changed
             bool changed = false;
-            if (su->uid > 0 && su->uid != mu->supr_uid) {
-                mu->supr_uid = su->uid;
+            if (su->uid > 0 && su->uid != mu->ken_uid) {
+                mu->ken_uid = su->uid;
                 changed = true;
             }
-            if (su->gid > 0 && su->gid != mu->supr_gid) {
-                mu->supr_gid = su->gid;
+            if (su->gid > 0 && su->gid != mu->ken_gid) {
+                mu->ken_gid = su->gid;
                 changed = true;
             }
             if (changed) {
-                mu->linux_uid = mu->supr_uid;
-                mu->linux_gid = mu->supr_gid;
+                mu->linux_uid = mu->ken_uid;
+                mu->linux_gid = mu->ken_gid;
                 mu->last_sync = Time::GetTicks();
                 result.users_updated++;
             }
@@ -226,11 +225,13 @@ UBSyncResult UserBridge::SyncFromLinux() {
         ParsePasswdLine(tmp, username, &uid, &gid, home, shell, 32);
 
         // only import regular users (uid >= 1000)
-        if (uid >= 1000 && username[0]) {
-            // check if this user exists in supr
-            if (!SUPR::FindUser(username)) {
-                // create in supr
-                SUPR::CreateUser(username, "kurono", SUPR_USER);
+        // nobody/nogroup (65534) are kernel conventions, not accounts to
+        // recreate in ken. (satoru)
+        if (uid >= 1000 && uid < 65534 && username[0]) {
+            // check if this user exists in ken
+            if (!KEN::FindUser(username)) {
+                // create in ken
+                KEN::CreateUser(username, "kurono", KEN_USER);
                 result.users_added++;
 
                 SerialLogger::Log("[UserBridge] Imported from Linux: ");
@@ -254,11 +255,11 @@ UBSyncResult UserBridge::SyncFromLinux() {
                 mu->last_sync = Time::GetTicks();
 
                 // check for uid conflict
-                if (mu->supr_uid > 0 && mu->supr_uid != mu->linux_uid) {
-                    if (conflict_policy == UB_SUPR_WINS) {
-                        mu->linux_uid = mu->supr_uid;
+                if (mu->ken_uid > 0 && mu->ken_uid != mu->linux_uid) {
+                    if (conflict_policy == UB_KEN_WINS) {
+                        mu->linux_uid = mu->ken_uid;
                     } else if (conflict_policy == UB_LINUX_WINS) {
-                        mu->supr_uid = mu->linux_uid;
+                        mu->ken_uid = mu->linux_uid;
                     } else if (conflict_policy == UB_MANUAL) {
                         mu->conflict = true;
                         result.conflicts++;
@@ -278,7 +279,7 @@ UBSyncResult UserBridge::SyncFromLinux() {
 UBSyncResult UserBridge::Sync() {
     UBSyncResult combined = {0, 0, 0, 0, true};
 
-    if (direction == UB_SUPR_TO_LINUX || direction == UB_BIDIRECTIONAL) {
+    if (direction == UB_KEN_TO_LINUX || direction == UB_BIDIRECTIONAL) {
         UBSyncResult r = SyncToLinux();
         combined.users_added += r.users_added;
         combined.users_updated += r.users_updated;
@@ -286,7 +287,7 @@ UBSyncResult UserBridge::Sync() {
         if (!r.success) combined.success = false;
     }
 
-    if (direction == UB_LINUX_TO_SUPR || direction == UB_BIDIRECTIONAL) {
+    if (direction == UB_LINUX_TO_KEN || direction == UB_BIDIRECTIONAL) {
         UBSyncResult r = SyncFromLinux();
         combined.users_added += r.users_added;
         combined.users_updated += r.users_updated;
@@ -300,21 +301,21 @@ UBSyncResult UserBridge::Sync() {
 //  single user operations
 
 bool UserBridge::SyncUser(const char* username) {
-    SUPRUser* su = SUPR::FindUser(username);
+    KENUser* su = KEN::FindUser(username);
     UBMappedUser* mu = FindMapped(username);
 
     if (!su && !mu) return false;
 
     if (su && !mu) {
-        // supr user not yet mapped
+        // ken user not yet mapped
         if (mapped_count >= UB_MAX_MAPPED_USERS) return false;
         mu = &mapped[mapped_count++];
         memset(mu, 0, sizeof(UBMappedUser));
         ub_scpy(mu->username, username, sizeof(mu->username));
-        mu->supr_uid = su->uid > 0 ? su->uid : 1000;
-        mu->linux_uid = mu->supr_uid;
-        mu->supr_gid = su->gid > 0 ? su->gid : 1000;
-        mu->linux_gid = mu->supr_gid;
+        mu->ken_uid = su->uid > 0 ? su->uid : 1000;
+        mu->linux_uid = mu->ken_uid;
+        mu->ken_gid = su->gid > 0 ? su->gid : 1000;
+        mu->linux_gid = mu->ken_gid;
         ub_scpy(mu->home, "/home/", sizeof(mu->home));
         int hl = ub_slen(mu->home);
         ub_scpy(mu->home + hl, username, (int)(sizeof(mu->home) - hl));
@@ -375,9 +376,9 @@ int UserBridge::GetLinuxUID(const char* username) {
     return m ? m->linux_uid : -1;
 }
 
-int UserBridge::GetSUPRUID(int linux_uid) {
+int UserBridge::GetKENUID(int linux_uid) {
     for (int i = 0; i < mapped_count; i++) {
-        if (mapped[i].linux_uid == linux_uid) return mapped[i].supr_uid;
+        if (mapped[i].linux_uid == linux_uid) return mapped[i].ken_uid;
     }
     return -1;
 }
@@ -398,12 +399,12 @@ int UserBridge::ResolveConflict(const char* username, UBSyncDirection winner) {
     UBMappedUser* mu = FindMapped(username);
     if (!mu || !mu->conflict) return -1;
 
-    if (winner == UB_SUPR_TO_LINUX) {
-        mu->linux_uid = mu->supr_uid;
-        mu->linux_gid = mu->supr_gid;
+    if (winner == UB_KEN_TO_LINUX) {
+        mu->linux_uid = mu->ken_uid;
+        mu->linux_gid = mu->ken_gid;
     } else {
-        mu->supr_uid = mu->linux_uid;
-        mu->supr_gid = mu->linux_gid;
+        mu->ken_uid = mu->linux_uid;
+        mu->ken_gid = mu->linux_gid;
     }
     mu->conflict = false;
     mu->last_sync = Time::GetTicks();
@@ -418,13 +419,13 @@ void UserBridge::DumpStatus(char* out, int max_out) {
     p = ub_pa(out, p, max_out, "══════════════════════════════════════\n");
     p = ub_pa(out, p, max_out, "Direction:  ");
     switch (direction) {
-        case UB_SUPR_TO_LINUX: p = ub_pa(out, p, max_out, "SUPR → Linux\n"); break;
-        case UB_LINUX_TO_SUPR: p = ub_pa(out, p, max_out, "Linux → SUPR\n"); break;
+        case UB_KEN_TO_LINUX: p = ub_pa(out, p, max_out, "KEN → Linux\n"); break;
+        case UB_LINUX_TO_KEN: p = ub_pa(out, p, max_out, "Linux → KEN\n"); break;
         case UB_BIDIRECTIONAL: p = ub_pa(out, p, max_out, "Bidirectional\n"); break;
     }
     p = ub_pa(out, p, max_out, "Policy:     ");
     switch (conflict_policy) {
-        case UB_SUPR_WINS:    p = ub_pa(out, p, max_out, "SUPR wins\n"); break;
+        case UB_KEN_WINS:    p = ub_pa(out, p, max_out, "KEN wins\n"); break;
         case UB_LINUX_WINS:   p = ub_pa(out, p, max_out, "Linux wins\n"); break;
         case UB_NEWEST_WINS:  p = ub_pa(out, p, max_out, "Newest wins\n"); break;
         case UB_MANUAL:       p = ub_pa(out, p, max_out, "Manual\n"); break;
@@ -442,8 +443,8 @@ void UserBridge::DumpStatus(char* out, int max_out) {
         p = ub_pa(out, p, max_out, m->username);
         int nm = ub_slen(m->username);
         for (int j = nm; j < 16; j++) p = ub_pa(out, p, max_out, " ");
-        p = ub_pa(out, p, max_out, " SUPR:");
-        p = ub_pad(out, p, max_out, m->supr_uid);
+        p = ub_pa(out, p, max_out, " KEN:");
+        p = ub_pad(out, p, max_out, m->ken_uid);
         p = ub_pa(out, p, max_out, " Linux:");
         p = ub_pad(out, p, max_out, m->linux_uid);
         if (m->conflict) p = ub_pa(out, p, max_out, " [CONFLICT]");

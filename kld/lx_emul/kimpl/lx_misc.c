@@ -196,4 +196,51 @@ unsigned long _copy_to_user(void __user *to, const void *from, unsigned long n)
     return 0;
 }
 
+// ── ptp ─────────────────────────────────────────────────────────────────────
+// there is no PTP clock class in the container (no /dev/ptpN, no consumer).
+// refusing registration is upstream's own "PTP unavailable" path: e1000e logs
+// "ptp_clock_register failed" and carries on without hardware timestamps.
+// (satoru)
+#include <linux/ptp_clock_kernel.h>
+
+struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info, struct device *parent)
+{
+    (void)info; (void)parent;
+    return ERR_PTR(-EOPNOTSUPP);
+}
+
+int ptp_clock_unregister(struct ptp_clock *ptp) { (void)ptp; return 0; }
+int ptp_clock_index(struct ptp_clock *ptp)      { (void)ptp; return -1; }
+
+// ── lib/vsprintf.c number parsing ───────────────────────────────────────────
+unsigned long long simple_strtoull(const char *cp, char **endp, unsigned int base)
+{
+    unsigned long long v = 0;
+    if (!base) {
+        base = 10;
+        if (cp[0] == '0') {
+            base = 8;
+            if ((cp[1] | 0x20) == 'x') { base = 16; cp += 2; }
+        }
+    } else if (base == 16 && cp[0] == '0' && (cp[1] | 0x20) == 'x') {
+        cp += 2;
+    }
+    for (;; cp++) {
+        unsigned int d;
+        char c = *cp;
+        if (c >= '0' && c <= '9') d = (unsigned int)(c - '0');
+        else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') d = (unsigned int)((c | 0x20) - 'a' + 10);
+        else break;
+        if (d >= base) break;
+        v = v * base + d;
+    }
+    if (endp) *endp = (char *)cp;
+    return v;
+}
+
+unsigned long simple_strtoul(const char *cp, char **endp, unsigned int base)
+{
+    return (unsigned long)simple_strtoull(cp, endp, base);
+}
+
 // end (satoru)

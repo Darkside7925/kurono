@@ -16,6 +16,7 @@
 #include "../system/logging.h"
 #include "../ui/notification.h"
 #include "../proc/scheduler.h"    // cooperative yield between dns recv attempts (satoru)
+#include "../proc/spinlock.h"       // wifi state is driven from two processes (satoru)
 #include "tcpip.h"
 
 //  network stack implementation
@@ -25,6 +26,12 @@ int Network::interface_count = 0;
 NetARPEntry Network::arp_table[NET_ARP_TABLE_SIZE];
 Socket Network::sockets[NET_MAX_SOCKETS];
 unsigned short Network::next_port = 49152;
+
+// resolver pair learned from dhcp. the primary is mirrored into TCPStack and
+// eth0; both are kept here so dns can fall over instead of retrying one dead
+// server forever. (satoru)
+static uint32_t g_dns_primary = 0;
+static uint32_t g_dns_secondary = 0;
 
 static int nlen(const char* s) { int n=0; while (s[n]) n++; return n; }
 static void ncpy(char* d, const char* s, int m) { int i=0; while (s[i]&&i<m-1) { d[i]=s[i]; i++; } d[i]=0; }
@@ -364,6 +371,9 @@ void Network::RefreshLink() {
     if (!eth || eth->type != NIC_ETHERNET) return;
     NICState want = E1000::IsLinkUp() ? NIC_UP : NIC_DOWN;
     if (want == eth->state) return;
+    // a backend whose mac is learned after boot (the kld container) - refresh it
+    // on every link-up so arp/ipv6 use the real address. (satoru)
+    if (want == NIC_UP) E1000::GetMAC(eth->mac.bytes);
     eth->state = want;
     SerialLogger::Log(want == NIC_UP ? "Network: eth0 link came up\r\n" : "Network: eth0 link went down\r\n");
     RuntimeLog::LogNetwork(want == NIC_UP ? "link up" : "link down", "eth0");
@@ -486,6 +496,16 @@ static uint16_t ndns_read_u16(const uint8_t* in) {
 
 static uint32_t ndns_ip_to_u32(IPv4Address ip) {
     return TCPStack::MakeIP(ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
+}
+
+void Network::SetDNSServers(uint32_t primary, uint32_t secondary) {
+    g_dns_primary = primary;
+    g_dns_secondary = secondary;
+}
+
+void Network::GetDNSServers(uint32_t* primary, uint32_t* secondary) {
+    if (primary) *primary = g_dns_primary;
+    if (secondary) *secondary = g_dns_secondary;
 }
 
 static bool ndns_append_name(const char* hostname, uint8_t* out, int max_len, int& pos) {
@@ -626,7 +646,9 @@ static int ndns_query_once(const char* hostname, uint32_t dns_ip,
     ndns_write_u16(query + query_len, 1);
     query_len += 2;
 
-    for (int attempt = 0; attempt < 3; attempt++) {
+    // two quick attempts per server: retrying a single dead resolver three
+    // times used to eat the whole lookup budget before any fallback ran. (satoru)
+    for (int attempt = 0; attempt < 2; attempt++) {
         if (TCPStack::SendTo(sock, query, query_len, dns_ip, 53) != query_len) {
             continue;
         }
@@ -635,7 +657,7 @@ static int ndns_query_once(const char* hostname, uint32_t dns_ip,
            depended on CPU speed and could spin forever if PumpUI rendering
            was busy enough. */
         uint32_t attempt_start_ms = Timer::GetTicks();
-        const uint32_t attempt_timeout_ms = 1000u;
+        const uint32_t attempt_timeout_ms = 750u;
         while ((uint32_t)(Timer::GetTicks() - attempt_start_ms) < attempt_timeout_ms) {
             if (KuronoShell::IsCommandCancelRequested()) {
                 TCPStack::Close(sock);
@@ -741,8 +763,27 @@ static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
         if (wlan && wlan->state == NIC_UP) iface = wlan;
     }
 
-    uint32_t dns_ip = iface ? ndns_ip_to_u32(iface->dns) : 0;
-    if (dns_ip == 0) dns_ip = TCPStack::MakeIP(10, 0, 2, 3);
+    // ordered resolver list: the interface lease first, then the dhcp pair,
+    // then two public resolvers as a last resort. deduplicated so the common
+    // case (eth0 dns == dhcp primary) does not query the same server twice.
+    // (satoru)
+    uint32_t servers[5];
+    int server_count = 0;
+    auto add_server = [&](uint32_t ip) {
+        if (!ip) return;
+        for (int i = 0; i < server_count; i++) if (servers[i] == ip) return;
+        if (server_count < (int)(sizeof(servers) / sizeof(servers[0]))) servers[server_count++] = ip;
+    };
+    if (iface) add_server(ndns_ip_to_u32(iface->dns));
+    add_server(g_dns_primary);
+    add_server(g_dns_secondary);
+    add_server(TCPStack::MakeIP(1, 1, 1, 1));
+    add_server(TCPStack::MakeIP(8, 8, 8, 8));
+    if (server_count == 0) return false;
+
+    // start with the resolver that answered last, then rotate on failure. (satoru)
+    static int last_good = 0;
+    if (last_good < 0 || last_good >= server_count) last_good = 0;
 
     // Follow a CNAME chain, issuing a fresh A query for each canonical name.
     // Bounded to 5 hops so a misconfigured/looping zone can't spin us. (satoru)
@@ -751,9 +792,22 @@ static bool ndns_resolve_live(const char* hostname, IPv4Address* out) {
     const int MAX_CNAME_HOPS = 5;
     for (int hop = 0; hop < MAX_CNAME_HOPS; hop++) {
         char cname[256];
-        int r = ndns_query_once(name, dns_ip, out, cname, (int)sizeof(cname));
-        if (r == 1) return true;            // resolved to an A record
-        if (r < 0) return false;            // timeout / error / NXDOMAIN
+        bool followed = false;
+        for (int i = 0; i < server_count; i++) {
+            int idx = (last_good + i) % server_count;
+            int r = ndns_query_once(name, servers[idx], out, cname, (int)sizeof(cname));
+            if (r == 1) {                   // resolved to an A record
+                last_good = idx;
+                return true;
+            }
+            if (r == 0) {                   // usable CNAME answer from this server
+                followed = true;
+                last_good = idx;
+                break;
+            }
+            // timeout / malformed / server error: fall through to the next one
+        }
+        if (!followed) return false;
         if (!cname[0]) return false;        // CNAME with no usable target
         if (neq(name, cname)) return false; // self-referential CNAME loop (satoru)
         ndns_log("dns cname", name, nullptr);
@@ -817,6 +871,19 @@ int WiFi::connected_index = -1;
 WiFi::LinkKind WiFi::detected_link = WiFi::LINK_NONE;
 char WiFi::wireless_chip[64] = {0};
 bool WiFi::link_probed = false;
+
+// auto-reconnect: remember the last successful credentials and retry the join
+// with capped backoff when the radio loses its association. (satoru)
+bool WiFi::auto_reconnect = true;
+char WiFi::saved_ssid[NET_MAX_SSID] = {0};
+char WiFi::saved_pass[64] = {0};
+bool WiFi::have_saved = false;
+uint32_t WiFi::reconnect_at_ms = 0;
+uint32_t WiFi::reconnect_backoff_ms = 2000;
+uint8_t  WiFi::reconnect_tries = 0;
+// the network process and the gui watchdog both call Tick; settings can call
+// Connect/Scan/Disconnect from another cpu. one lock serialises the state. (satoru)
+static Spinlock g_wifi_lock;
 
 // Real PCI bus walk to identify wireless network controllers.
 // Subclass 0x80 of class 0x02 = "Other network controller", which is
@@ -889,7 +956,8 @@ bool WiFi::IsLinkUp() {
     // so with ethernet the taskbar + settings showed DISCONNECTED even though
     // networking fully worked, and SignalBars() returned 0 (its ethernet=4
     // path was unreachable behind this check). (satoru)
-    if (detected_link == LINK_ETHERNET) return E1000::IsDetected();
+    // a detected nic whose cable is unplugged is not a live link. (satoru)
+    if (detected_link == LINK_ETHERNET) return E1000::IsDetected() && E1000::IsLinkUp();
     return false;
 }
 
@@ -913,6 +981,11 @@ void WiFi::Init() {
     state = WIFI_DISCONNECTED;
     network_count = 0;
     connected_index = -1;
+    have_saved = false;
+    saved_ssid[0] = saved_pass[0] = 0;
+    reconnect_at_ms = 0;
+    reconnect_backoff_ms = 2000;
+    reconnect_tries = 0;
     ProbePCIWireless();
 
     if (detected_link == LINK_WIFI) {
@@ -939,19 +1012,42 @@ void WiFi::Init() {
 }
 
 bool WiFi::Enable() {
+    SpinLockCpuGuard wifi_guard(g_wifi_lock);
     if (DetectedLink() != LINK_WIFI) return false;
-    if (state == WIFI_OFF) state = WIFI_DISCONNECTED;
+    if (state == WIFI_OFF) {
+        state = WIFI_DISCONNECTED;
+        reconnect_at_ms = 0;         // let the tick rejoin a saved network (satoru)
+        reconnect_backoff_ms = 2000;
+        reconnect_tries = 0;
+    }
     return true;
 }
 
 bool WiFi::Disable() {
-    if (connected_index >= 0) Disconnect();
+    SpinLockCpuGuard wifi_guard(g_wifi_lock);
+    // powering the radio off keeps the saved credentials: turning wifi back on
+    // rejoins the same network. an explicit Disconnect() forgets them. (satoru)
+    if (Ieee80211::HasRadio()) Ieee80211::Disconnect();
+    NetworkInterface* wlan = Network::GetInterface("wlan0");
+    if (wlan) wlan->state = NIC_DOWN;
+    if (connected_index >= 0) {
+        networks[connected_index].connected = false;
+        connected_index = -1;
+    }
     state = WIFI_OFF;
     return true;
 }
 
 bool WiFi::Scan() {
+    SpinLockCpuGuard wifi_guard(g_wifi_lock);
     if (state == WIFI_OFF || DetectedLink() != LINK_WIFI) return false;
+    // a scan must not drop a live association: keep the connected ssid across
+    // the list rebuild and re-find it afterwards. (satoru)
+    bool was_connected = (state == WIFI_CONNECTED && connected_index >= 0 &&
+                          Ieee80211::HasRadio() &&
+                          Ieee80211::State() == Ieee80211::SUPP_HANDSHAKE_DONE);
+    char keep_ssid[NET_MAX_SSID];
+    ncpy(keep_ssid, was_connected ? networks[connected_index].ssid : "", (int)sizeof(keep_ssid));
     state = WIFI_SCANNING;
 
     // drive the real 802.11 stack if a vendor radio driver has registered. it
@@ -963,13 +1059,28 @@ bool WiFi::Scan() {
     } else {
         network_count = 0;
     }
-    connected_index = -1;   // a fresh scan replaces the list; re-connect to relink (satoru)
+    connected_index = -1;
 
+    if (was_connected && Ieee80211::State() == Ieee80211::SUPP_HANDSHAKE_DONE) {
+        for (int i = 0; i < network_count; i++) {
+            if (neq(networks[i].ssid, keep_ssid)) {
+                connected_index = i;
+                networks[i].connected = true;
+                networks[i].signal_strength = Ieee80211::GetSignal();
+                break;
+            }
+        }
+    }
     state = connected_index >= 0 ? WIFI_CONNECTED : WIFI_DISCONNECTED;
     return true;
 }
 
 bool WiFi::Connect(const char* ssid, const char* password) {
+    SpinLockCpuGuard wifi_guard(g_wifi_lock);
+    return ConnectInternal(ssid, password, true);
+}
+
+bool WiFi::ConnectInternal(const char* ssid, const char* password, bool notify) {
     if (state == WIFI_OFF || DetectedLink() != LINK_WIFI) return false;
 
     // real path: drive the 802.11 stack (auth -> assoc -> wpa2 4-way handshake)
@@ -981,8 +1092,10 @@ bool WiFi::Connect(const char* ssid, const char* password) {
         bool ok = Ieee80211::Connect(ssid, password ? password : "", bssid);
         if (!ok) {
             state = WIFI_DISCONNECTED;
-            NotificationManager::Post("Network", "wifi connect failed",
-                                      NotificationManager::ICON_WARNING, 3000);
+            if (notify) {
+                NotificationManager::Post("Network", "wifi connect failed",
+                                          NotificationManager::ICON_WARNING, 3000);
+            }
             return false;
         }
 
@@ -1005,6 +1118,15 @@ bool WiFi::Connect(const char* ssid, const char* password) {
         }
         state = WIFI_CONNECTED;
 
+        // remember the credentials so the network process can rejoin this ap
+        // after a deauth, roam or radio reset. (satoru)
+        ncpy(saved_ssid, ssid, (int)sizeof(saved_ssid));
+        ncpy(saved_pass, password ? password : "", (int)sizeof(saved_pass));
+        have_saved = true;
+        reconnect_tries = 0;
+        reconnect_backoff_ms = 2000;
+        reconnect_at_ms = 0;
+
         // bring the wlan0 interface up so the ip stack will route over it. the
         // link-layer + ccmp keys are established here; obtaining an ip address is
         // the dhcp client's job (the tcpip stack exposes the address setters but
@@ -1024,6 +1146,7 @@ bool WiFi::Connect(const char* ssid, const char* password) {
 }
 
 bool WiFi::Disconnect() {
+    SpinLockCpuGuard wifi_guard(g_wifi_lock);
     // tear the real link down (deauth + stop the radio) if one is up. (satoru)
     if (Ieee80211::HasRadio()) Ieee80211::Disconnect();
     NetworkInterface* wlan = Network::GetInterface("wlan0");
@@ -1034,10 +1157,94 @@ bool WiFi::Disconnect() {
         connected_index = -1;
     }
     state = WIFI_DISCONNECTED;
+    // user asked to leave: forget the credentials so the auto-reconnect tick
+    // does not immediately join it again. (satoru)
+    have_saved = false;
+    saved_ssid[0] = saved_pass[0] = 0;
+    reconnect_at_ms = 0;
+    reconnect_tries = 0;
     // wifi link went down. (satoru)
     NotificationManager::Post("Network", "wifi disconnected",
                               NotificationManager::ICON_WARNING, 3000);
     return true;
+}
+
+// a live association disappeared (deauth, beacon loss, radio reset). tear the
+// local state down but keep the credentials, then let Tick rejoin with backoff.
+// (satoru)
+void WiFi::DropLink(const char* why) {
+    bool was_up = (state == WIFI_CONNECTED || connected_index >= 0);
+    if (Ieee80211::HasRadio()) Ieee80211::Disconnect();
+    NetworkInterface* wlan = Network::GetInterface("wlan0");
+    if (wlan) wlan->state = NIC_DOWN;
+    if (connected_index >= 0) {
+        networks[connected_index].connected = false;
+        connected_index = -1;
+    }
+    state = WIFI_DISCONNECTED;
+    reconnect_tries = 0;
+    reconnect_backoff_ms = 2000;
+    reconnect_at_ms = Timer::GetTicks() + reconnect_backoff_ms;
+    SerialLogger::Log("[wifi] link lost: ");
+    SerialLogger::Log(why);
+    SerialLogger::Log("\r\n");
+    if (was_up) {
+        NotificationManager::Post("Network", "wifi connection lost",
+                                  NotificationManager::ICON_WARNING, 3000);
+    }
+}
+
+void WiFi::SetAutoReconnect(bool on) {
+    auto_reconnect = on;
+    if (on) reconnect_at_ms = 0;
+}
+
+bool WiFi::AutoReconnect() { return auto_reconnect; }
+
+void WiFi::Tick() {
+    SpinLockCpuGuard wifi_guard(g_wifi_lock);
+    if (DetectedLink() != LINK_WIFI) return;
+    uint32_t now = Timer::GetTicks();
+
+    if (state == WIFI_OFF) return;
+    if (state == WIFI_CONNECTING || state == WIFI_SCANNING) return;
+
+    if (state == WIFI_CONNECTED) {
+        if (!Ieee80211::HasRadio() ||
+            Ieee80211::State() != Ieee80211::SUPP_HANDSHAKE_DONE) {
+            DropLink("association lost");
+            return;
+        }
+        // keep the cached rssi fresh for the status page and signal bars. (satoru)
+        if (connected_index >= 0) {
+            networks[connected_index].signal_strength = Ieee80211::GetSignal();
+        }
+        return;
+    }
+
+    if (!auto_reconnect || !have_saved || !saved_ssid[0]) return;
+    if ((int32_t)(now - reconnect_at_ms) < 0) return;
+
+    reconnect_tries++;
+    SerialLogger::Log("[wifi] reconnect attempt ");
+    SerialLogger::LogDec((int)reconnect_tries);
+    SerialLogger::Log(" ssid ");
+    SerialLogger::Log(saved_ssid);
+    SerialLogger::Log("\r\n");
+    if (ConnectInternal(saved_ssid, saved_pass, false)) {
+        reconnect_tries = 0;
+        reconnect_backoff_ms = 2000;
+        reconnect_at_ms = 0;
+        SerialLogger::Log("[wifi] reconnected\r\n");
+        return;
+    }
+    // capped exponential backoff: 2, 4, 8, 16, 32, 60 seconds. (satoru)
+    if (reconnect_backoff_ms < 60000) reconnect_backoff_ms *= 2;
+    if (reconnect_backoff_ms > 60000) reconnect_backoff_ms = 60000;
+    reconnect_at_ms = Timer::GetTicks() + reconnect_backoff_ms;
+    SerialLogger::Log("[wifi] reconnect failed, next in ");
+    SerialLogger::LogDec((int)(reconnect_backoff_ms / 1000));
+    SerialLogger::Log("s\r\n");
 }
 
 WiFiState WiFi::GetState() { return state; }

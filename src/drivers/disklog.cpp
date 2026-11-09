@@ -76,6 +76,13 @@ namespace {
 
     // the kfs backing file, found by Init (device lba, bytes, whole lbas). (satoru)
     uint64_t  g_kfs_lba    = 0;
+    // guest vm disk images (ALPINE.IMG, DEBIAN.IMG) found by Init: extent or
+    // 0, plus why not (1 missing, 2 fragmented, 3 misaligned) (satoru)
+    struct GuestImg { char name83[11]; uint64_t lba, len; int why; };
+    GuestImg  g_guest_img[2] = {
+        { { 'A','L','P','I','N','E',' ',' ','I','M','G' }, 0, 0, 1 },
+        { { 'D','E','B','I','A','N',' ',' ','I','M','G' }, 0, 0, 1 },
+    };
     uint64_t  g_kfs_len    = 0;
     const char* g_kfs_status = "KURONO partition not opened";
 
@@ -278,6 +285,27 @@ bool DiskLog::Init() {
         }
     }
 
+    // guest vm disks: preallocated contiguous files in the partition root. they
+    // are found here (the root walk shares the log buffer) but stay read-only
+    // until a vm that uses one starts (ArmGuestImage, a third guard window). (satoru)
+    NVMe::SetWriteWindow3(0, 0);
+    for (int gi = 0; gi < 2; gi++) {
+        GuestImg& im = g_guest_img[gi];
+        im.lba = im.len = 0;
+        uint64_t dlba = 0, dlen = 0;
+        im.why = find_root_file(im.name83, &dlba, &dlen);
+        if (im.why == 0) {
+            im.lba = dlba; im.len = dlen;
+            SerialLogger::Log("[disklog] guest disk ");
+            for (int k = 0; k < 8 && im.name83[k] != ' '; k++) { char cc[2] = { im.name83[k], 0 }; SerialLogger::Log(cc); }
+            SerialLogger::Log(".IMG extent lba ");
+            SerialLogger::LogHex64(dlba); SerialLogger::Log(" size ");
+            SerialLogger::LogDec((int)(dlen >> 20)); SerialLogger::Log(" MB\r\n");
+        } else if (im.why == 2) {
+            SerialLogger::Log("[disklog] a guest disk image is fragmented, not usable\r\n");
+        }
+    }
+
     static const char name83[11] = { 'K','U','R','O','N','O',' ',' ','L','O','G' };
     uint64_t flba = 0, flen = 0;
     int lr = find_root_file(name83, &flba, &flen);
@@ -371,7 +399,11 @@ namespace {
                 if (!m) continue;
                 *first = ((uint32_t)rd16(ent + 20) << 16) | rd16(ent + 26);
                 *size  = rd32(ent + 28);
-                if (*first < 2 || *size == 0) return 2;
+                // an empty file is present (size 0, fat32 gives it no cluster):
+                // the KUROMODE.OFF kill switch is a zero byte file and used to
+                // read as missing. only a non empty file needs a real chain. (satoru)
+                if (*size == 0) { *first = 0; return 0; }
+                if (*first < 2) return 2;
                 return 0;
             }
             c = rr_next(r, c);
@@ -433,6 +465,8 @@ int DiskLog::ReadRootFile(const char* name83, void* dst, uint64_t cap, RootFileP
     int rc = rr_find(r, name83, &first, &sz);
     if (rc != 0) { rr_close(r); return rc; }
     if ((uint64_t)sz > cap) { rr_close(r); return 3; }
+    // empty file: nothing to read, no chain to follow. (satoru)
+    if (sz == 0) { if (prog) prog(0, 0); rr_close(r); return 0; }
     uint8_t* out = (uint8_t*)dst;
     uint64_t done = 0, next_report = 0;
     uint32_t c = first;
@@ -475,6 +509,31 @@ int DiskLog::ReadRootFile(const char* name83, void* dst, uint64_t cap, RootFileP
     rr_close(r);
     return rc;
 }
+
+int DiskLog::GuestImage(const char* name83, uint64_t* lba, uint64_t* bytes) {
+    for (int gi = 0; gi < 2; gi++) {
+        GuestImg& im = g_guest_img[gi];
+        bool m = true;
+        for (int k = 0; k < 11; k++) if (im.name83[k] != name83[k]) { m = false; break; }
+        if (!m) continue;
+        if (im.why != 0) return im.why;
+        if (lba) *lba = im.lba;
+        if (bytes) *bytes = im.len;
+        return 0;
+    }
+    return 1;
+}
+
+bool DiskLog::ArmGuestImage(const char* name83, uint64_t* lba, uint64_t* bytes) {
+    uint64_t l = 0, b = 0;
+    if (GuestImage(name83, &l, &b) != 0) { NVMe::SetWriteWindow3(0, 0); return false; }
+    NVMe::SetWriteWindow3(l, l + b / g_lbasz);
+    if (lba) *lba = l;
+    if (bytes) *bytes = b;
+    return true;
+}
+
+void DiskLog::DisarmGuestImage() { NVMe::SetWriteWindow3(0, 0); }
 
 bool DiskLog::KfsFile(uint64_t* lba, uint64_t* bytes) {
     if (g_kfs_len == 0) return false;

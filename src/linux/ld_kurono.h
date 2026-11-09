@@ -67,6 +67,9 @@ struct Process;
 
 namespace LdKurono {
 
+    // free a dead process's linker state and libraries (call after its address space is gone) (satoru)
+    void ReleaseProcess(Process* p);
+
     // ---- public flag bits used by Dlopen / search ------------------
 
     enum DlOpenFlags : uint32_t {
@@ -135,7 +138,8 @@ namespace LdKurono {
                  const char* const* envp,
                  uint32_t uid, uint32_t gid,
                  uint64_t* out_entry,
-                 uint64_t* out_rsp);
+                 uint64_t* out_rsp,
+                 bool borrow_image = false);
 
     // ---- runtime API ----------------------------------------------
     // dlopen - returns an opaque handle (>0) or 0 on error.  Call

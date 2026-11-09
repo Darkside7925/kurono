@@ -31,6 +31,18 @@ void lx_log_u(unsigned long v) {
     (void)!write(2, b, (size_t)n);
 }
 
+// hex, full width: at least 8 nibbles, 16 when the value needs them. the old
+// printer truncated to 4 nibbles and made a real BAR look unassigned. (satoru)
+void lx_log_hex(unsigned long v) {
+    static const char d[] = "0123456789abcdef";
+    char b[20];
+    int n = 0;
+    int top = (v >> 32) ? 60 : 28;
+    b[n++] = '0'; b[n++] = 'x';
+    for (int i = top; i >= 0; i -= 4) b[n++] = d[(v >> i) & 0xF];
+    (void)!write(2, b, (size_t)n);
+}
+
 void lx_log_line(const char* s) {
     lx_log(s);
     lx_log("\n");

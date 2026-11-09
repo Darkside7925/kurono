@@ -1,4 +1,5 @@
 #include "wayland_server.h"
+#include "../proc/spinlock.h"   // frame-callback ring lock (satoru)
 #include "../net/unix_socket.h"
 #include "xkb_keymap_us.h"        // compiled us keymap for wl_keyboard.keymap (satoru)
 #include "../drivers/serial.h"
@@ -6,6 +7,7 @@
 #include "../fs/kvfs.h"
 #include "../kernel/time.h"
 #include "../drivers/graphics.h"     // framebuffer blit target (satoru)
+#include "../drivers/outputs.h"      // wl_output reports the primary output (satoru)
 #include "../kernel/heap.h"          // per-surface shadow buffers (satoru)
 #include "../kernel/pmm.h"           // page-aligned keymap backing
 #include "../drivers/timer.h"        // pit-tick ms timestamps for frame cbs (satoru)
@@ -13,6 +15,7 @@
 #include "app_icons.h"               // per-app window logo ids (satoru)
 #include "../drivers/keyboard.h"     // Key enum -> linux evdev keycode map (satoru)
 #include "../drivers/mouse.h"        // live pointer pos for the scroll thunk (satoru)
+#include "../system/clipboard.h"     // system clipboard store + history (satoru)
 
 // the client mmaps the keymap fd from offset 0, and a memfd maps whole pages
 // from its base, so the backing must start on a page. the embedded array does
@@ -29,6 +32,7 @@ static const uint8_t* keymap_backing() {
     return page;
 }
 
+extern volatile bool g_wltrace;   // kurono.wltrace=1 (satoru)
 namespace {
 
 using namespace WaylandServer;
@@ -70,16 +74,43 @@ Client* client_for_sd(int sd) {
     return nullptr;
 }
 
+// client-controlled sizes are bounded here. a surface or buffer edge longer
+// than WL_MAX_EDGE, a buffer above WL_MAX_BUF_PX pixels (a 64 MiB shadow) or
+// all shadows together above WL_MAX_SHADOW_TOTAL bytes is refused, so a client
+// cannot exhaust the kernel heap with 1 GiB shadows. (satoru)
+constexpr int32_t  WL_MAX_EDGE         = 16384;
+constexpr uint64_t WL_MAX_BUF_PX       = 16ull * 1024 * 1024;
+constexpr uint64_t WL_MAX_SHADOW_TOTAL = 512ull * 1024 * 1024;
+uint64_t g_shadow_bytes = 0;
+
+// free a surface shadow and give its bytes back to the global budget. (satoru)
+inline void shadow_release(Object& o) {
+    if (o.shadow) {
+        KernelHeap::Free(o.shadow);
+        uint64_t b = (uint64_t)o.shadow_w * (uint64_t)o.shadow_h * 4u;
+        g_shadow_bytes = (g_shadow_bytes > b) ? g_shadow_bytes - b : 0;
+    }
+    o.shadow = nullptr;
+    o.shadow_w = 0; o.shadow_h = 0;
+}
+
+// clamp a client int32 into [lo, hi]. (satoru)
+inline int32_t wl_clamp(int64_t v, int32_t lo, int32_t hi) {
+    return v < lo ? lo : (v > hi ? hi : (int32_t)v);
+}
+
 // Zero the extended (phase-3) bookkeeping on a fresh object slot so a
 // reused slot never inherits a stale pool pointer / buffer geometry. (satoru)
 inline void clear_obj_ext(Object& o) {
     o.pool_base         = nullptr;
     o.pool_size         = 0;
+    o.pool_map_size     = 0;
     o.buf_pool_id       = 0;
     o.buf_offset        = 0;
     o.buf_stride        = 0;
     o.buf_format        = 0;
     o.pending_buffer_id = 0;
+    o.attach_pending    = false;
     o.attach_x          = 0;
     o.attach_y          = 0;
     o.surf_alpha        = 255;
@@ -89,10 +120,7 @@ inline void clear_obj_ext(Object& o) {
     o.subsurface_y      = 0;
     // free a stale shadow from a recycled slot (fresh g_clients are bss-zero,
     // so a garbage pointer is impossible on first use). (satoru)
-    if (o.shadow) KernelHeap::Free(o.shadow);
-    o.shadow        = nullptr;
-    o.shadow_w      = 0;
-    o.shadow_h      = 0;
+    shadow_release(o);
     o.shadow_fmt    = 0;
     o.shadow_filled = false;
     o.title[0]      = 0;
@@ -101,7 +129,18 @@ inline void clear_obj_ext(Object& o) {
     o.geo_w = 0; o.geo_h = 0;
     o.input_none      = false;
     o.region_has_rect = false;
+    o.popup_obj = 0; o.popup_parent_sid = 0;
+    o.popup_x = 0; o.popup_y = 0; o.popup_w = 0; o.popup_h = 0;
+    o.popup_xs = 0; o.popup_seq = 0; o.popup_grab = false;
+    o.pos_w = 0; o.pos_h = 0;
+    o.pos_ax = 0; o.pos_ay = 0; o.pos_aw = 0; o.pos_ah = 0;
+    o.pos_ox = 0; o.pos_oy = 0;
+    o.pos_anchor = 0; o.pos_gravity = 0; o.pos_cadj = 0;
+    o.tl_parent_sid = 0; o.tl_last_w = 0; o.tl_last_h = 0;
+    o.tl_cfg_w = 0; o.tl_cfg_h = 0; o.tl_close_ms = 0;
 }
+
+void clip_client_dropped(int sd);   // selection / offer cleanup, defined below (satoru)
 
 void reset_client_state(Client* c, int sd) {
     c->in_use         = true;
@@ -125,8 +164,22 @@ void reset_client_state(Client* c, int sd) {
     }
     c->pointer_focus_sid   = 0;
     c->keyboard_focus_sid  = 0;
-    // Object id 1 = wl_display, always live.
-    for (int i = 0; i < WL_MAX_OBJECTS; i++) c->objects[i].in_use = false;
+    c->data_device_count   = 0;
+    c->primary_device_count = 0;
+    for (int i = 0; i < Client::WL_MAX_DATA_DEV; i++) {
+        c->data_device_ids[i] = 0;
+        c->primary_device_ids[i] = 0;
+    }
+    c->clip_offer_id       = 0;
+    c->primary_offer_id    = 0;
+    c->clip_server_id_next = 0;
+    // Object id 1 = wl_display, always live. the previous client's shadows
+    // are freed here: slots past the new object_high would otherwise keep
+    // them forever. (satoru)
+    for (int i = 0; i < WL_MAX_OBJECTS; i++) {
+        c->objects[i].in_use = false;
+        shadow_release(c->objects[i]);
+    }
     Object& d = c->objects[0];
     d.id      = 1;
     d.iface   = WL_DISPLAY;
@@ -145,6 +198,7 @@ Client* alloc_client(int sd) {
     // layer recycles sd numbers when a client disconnects.
     for (int i = 0; i < WL_MAX_CLIENTS; i++) {
         if (g_clients[i].in_use && g_clients[i].sd == sd) {
+            clip_client_dropped(sd);   // stale connection's clipboard objects (satoru)
             reset_client_state(&g_clients[i], sd);
             return &g_clients[i];
         }
@@ -163,6 +217,9 @@ void drop_client(Client* c) {
     int sd = c->sd;
     c->in_use = false;
     c->sd = -1;
+    clip_client_dropped(sd);   // sources/offers/pulls/writes of this connection (satoru)
+    // a dropped client's shadows went unfreed until its slot was reused. (satoru)
+    for (int i = 0; i < WL_MAX_OBJECTS; i++) shadow_release(c->objects[i]);
     c->tx_len = 0;
     c->rx_partial_len = 0;
     UnixSocket::Close(sd);
@@ -218,18 +275,62 @@ bool register_obj(Client* c, uint32_t id, uint16_t iface, uint16_t version) {
 // blit helpers further down. (satoru)
 void winmap_clear(int win_id);
 
+void send_event(Client* c, uint32_t object_id, uint16_t opcode, const uint8_t* payload, uint16_t payload_len);   // defined below (satoru)
+// kurono.wltrace=1: protocol trace kept in RAM. printing each message live
+// changed the timing enough to hide the black-window race (6/6 good boots with
+// it vs ~50% black without), so record now and print on demand. (satoru)
+struct WltEnt { uint32_t ms; uint8_t dir; uint8_t sd; uint16_t iface; uint32_t id; uint16_t op; uint32_t a0, a1; };
+constexpr uint32_t WLT_SLOTS = 4096;
+WltEnt g_wlt[WLT_SLOTS];
+uint32_t g_wlt_n = 0;
+inline uint32_t get32(const uint8_t* p);
+void wlt_note(int dir, int sd, uint32_t id, uint16_t iface, uint16_t op, uint32_t a0, uint32_t a1) {
+    if (g_wlt_n >= WLT_SLOTS) return;   // keep the first window of the session (satoru)
+    WltEnt* e = &g_wlt[g_wlt_n++];
+    e->ms = Timer::GetRealMs(); e->dir = (uint8_t)dir; e->sd = (uint8_t)sd; e->iface = iface;
+    e->id = id; e->op = op; e->a0 = a0; e->a1 = a1;
+}
+void mark_tree_root_dirty(Client* c, Object* surf);   // defined with the surface-tree helpers (satoru)
 void destroy_obj(Client* c, uint32_t id) {
     int slot = find_obj_slot(c, id);
     if (slot < 0) return;
     Object& o = c->objects[slot];
+    // a subsurface or popup leaving the tree: repaint the window it was
+    // composited onto, or a hidden tooltip / closed menu stays on screen. (satoru)
+    if (o.iface == WL_SUBSURFACE) {
+        Object* wrapped = find_obj(c, o.parent_surface_id);
+        if (wrapped) mark_tree_root_dirty(c, wrapped);
+    } else if (o.iface == XDG_POPUP) {
+        Object* ps = find_obj(c, o.parent_surface_id);
+        if (ps && ps->iface == WL_SURFACE && ps->popup_obj == id) {
+            mark_tree_root_dirty(c, ps);
+            ps->popup_obj = 0;
+            ps->popup_grab = false;
+        }
+    }
     // Cascade: children whose parent is this surface get unparented.
     if (o.iface == WL_SURFACE) {
+        if (!o.wm_window) mark_tree_root_dirty(c, &o);
         for (int i = 0; i < c->object_high; i++) {
             if (c->objects[i].in_use &&
                 c->objects[i].parent_surface_id == id) {
                 c->objects[i].parent_surface_id = 0;
             }
+            // a recycled id must not inherit this surface's subsurfaces or
+            // popups. (satoru)
+            if (c->objects[i].in_use && c->objects[i].iface == WL_SUBSURFACE &&
+                c->objects[i].subsurface_parent == id)
+                c->objects[i].subsurface_parent = 0;
+            if (c->objects[i].in_use && c->objects[i].iface == WL_SURFACE &&
+                c->objects[i].popup_parent_sid == id) {
+                c->objects[i].popup_obj = 0;
+                c->objects[i].popup_parent_sid = 0;
+            }
         }
+        // drop focus references BEFORE closing the window: the close refocuses
+        // another window, which reaches set_keyboard_focus. (satoru)
+        if (c->pointer_focus_sid  == id) c->pointer_focus_sid  = 0;
+        if (c->keyboard_focus_sid == id) c->keyboard_focus_sid = 0;
         // tear down the bridged wm window so the on-screen rect goes
         // away with the surface. wm_window holds the window id. (satoru)
         if (o.wm_window) {
@@ -258,14 +359,21 @@ void destroy_obj(Client* c, uint32_t id) {
         c->keyboard_id_count = w;
         c->keyboard_id = (w > 0) ? c->keyboard_ids[0] : 0;
     }
+    // wl_display.delete_id: the client keeps a client-made id as a zombie until it
+    // gets this, and only then may reuse it. without it every late request on the
+    // id looked like a protocol error. server-made ids (>= 0xff000000) never get one. (satoru)
+    if (id < 0xFF000000u && !c->fatal) {
+        uint8_t did[4]; put32(did, id);
+        send_event(c, 1, 1, did, 4);
+    }
     o.in_use = false;
     o.wm_window = nullptr;
     o.pending_frame_cb = 0;
     o.damage.valid = false;
     // release the shadow with the surface (a dead slot may never be reused,
     // so waiting for clear_obj_ext would leak). (satoru)
-    if (o.shadow) { KernelHeap::Free(o.shadow); o.shadow = nullptr; }
-    o.shadow_w = 0; o.shadow_h = 0; o.shadow_filled = false;
+    shadow_release(o);
+    o.shadow_filled = false;
     // Tighten object_high if we just freed the topmost slot.
     while (c->object_high > 1 && !c->objects[c->object_high - 1].in_use) {
         c->object_high--;
@@ -296,6 +404,11 @@ void tx_flush(Client* c) {
 // object_id(u32) | opcode(u16) | total_size(u16).
 void send_event(Client* c, uint32_t object_id, uint16_t opcode,
                 const uint8_t* payload, uint16_t payload_len) {
+    if (g_wltrace) {   // kurono.wltrace=1: silent ring, dumped later (satoru)
+        Object* eo = find_obj(c, object_id);
+        wlt_note(1, c->sd, object_id, eo ? eo->iface : 0xFFFF, opcode,
+                 payload_len >= 4 ? get32(payload) : 0, payload_len >= 8 ? get32(payload + 4) : 0);
+    }
     int needed = 8 + (int)payload_len;
     if (needed > WL_TX_SCRATCH) return;        // pathological
     if (c->tx_len + needed > WL_TX_SCRATCH) tx_flush(c);
@@ -336,8 +449,25 @@ void send_display_error(Client* c, uint32_t object_id, uint32_t code,
 
 // Push a frame-callback id onto this client's pending ring.  Drops the
 // oldest if full - better than allocating.
+// the frame-callback ring is touched from the client's sendmsg (on_data, any
+// cpu) and from the bsp desktop render (DispatchPendingFrames), so it gets its
+// own lock. leaf lock: nothing called under it takes another. (satoru)
+Spinlock g_fcb_lock;
+
 void push_frame_cb(Client* c, uint32_t cb_id) {
+    SpinLockGuard g(g_fcb_lock);
     int next = (c->frame_cb_head + 1) % WL_MAX_FRAME_CB;
+    if (next == c->frame_cb_tail) {
+        // full: squeeze out the zeroed holes commit-time delivery leaves before
+        // dropping anything - a still-pending callback (gecko's ReadyToDraw on
+        // the toplevel) must not be the one thrown away. (satoru)
+        uint32_t keep[WL_MAX_FRAME_CB]; int nk = 0;
+        for (int i = c->frame_cb_tail; i != c->frame_cb_head; i = (i + 1) % WL_MAX_FRAME_CB)
+            if (c->frame_cb[i]) keep[nk++] = c->frame_cb[i];
+        c->frame_cb_tail = 0; c->frame_cb_head = 0;
+        for (int k = 0; k < nk; k++) c->frame_cb[c->frame_cb_head++] = keep[k];
+        next = (c->frame_cb_head + 1) % WL_MAX_FRAME_CB;
+    }
     if (next == c->frame_cb_tail) {
         // Ring full - drop the oldest by advancing tail.  The callback
         // object id stays in the client's object table; we just won't
@@ -364,6 +494,7 @@ const Global g_globals[] = {
     { 7, "xdg_wm_base",                    3 },
     { 8, "zwp_linux_dmabuf_v1",            3 },
     { 9, "zxdg_decoration_manager_v1",     1 },
+    { 10, "zwp_primary_selection_device_manager_v1", 1 },
     { 0, nullptr, 0 }
 };
 
@@ -396,6 +527,7 @@ uint16_t iface_id_of(const char* name, int max_len) {
         { "xdg_wm_base",                XDG_WM_BASE },
         { "zwp_linux_dmabuf_v1",        ZWP_LINUX_DMABUF },
         { "zxdg_decoration_manager_v1", ZXDG_DECORATION_MGR },
+        { "zwp_primary_selection_device_manager_v1", ZWP_PRIMARY_MGR },
         { nullptr, 0 }
     };
     for (int i = 0; table[i].n; i++) {
@@ -413,6 +545,18 @@ uint16_t iface_id_of(const char* name, int max_len) {
 
 inline void accum_damage(Object* surf, int32_t x, int32_t y, int32_t w, int32_t h) {
     if (w <= 0 || h <= 0) return;
+    // clamp with 64-bit math into [0, WL_MAX_EDGE]: raw client values made
+    // dx + dw overflow in the shadow copy and blit, skipping their clamps and
+    // turning a damage rect into a kernel heap write ~8 GB past the shadow.
+    // gdk's "everything" damage (0,0,INT32_MAX,INT32_MAX) stays full. (satoru)
+    {
+        int32_t x0 = wl_clamp(x, 0, WL_MAX_EDGE);
+        int32_t y0 = wl_clamp(y, 0, WL_MAX_EDGE);
+        int32_t x1 = wl_clamp((int64_t)x + w, 0, WL_MAX_EDGE);
+        int32_t y1 = wl_clamp((int64_t)y + h, 0, WL_MAX_EDGE);
+        if (x1 <= x0 || y1 <= y0) return;
+        x = x0; y = y0; w = x1 - x0; h = y1 - y0;
+    }
     if (!surf->damage.valid) {
         surf->damage.x = x; surf->damage.y = y;
         surf->damage.w = w; surf->damage.h = h;
@@ -496,6 +640,8 @@ void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin);
 void keyboard_enter(Client* c, uint32_t kbd, uint32_t surf);
 void keyboard_leave(Client* c, uint32_t kbd, uint32_t surf);
 Object* find_subsurface_role(Client* c, uint32_t surf_id);   // (satoru)
+void set_keyboard_focus(Client* c, uint32_t sid);           // (satoru)
+bool has_toplevel_role(Client* c, uint32_t sid);            // (satoru)
 
 // wm render callback for bridged wayland windows: repaint the full client
 // buffer into the (already chrome-drawn) content rect so the surface
@@ -510,6 +656,30 @@ void wl_render_thunk(Window* win, int x, int y, int w, int h) {
     if (!c) return;
     Object* surf = find_obj(c, sid);
     if (!surf || surf->iface != WL_SURFACE) return;
+    // the wm resized the window (drag, maximize, snap, full screen): tell the
+    // client its new content size (audit P3). not when the change is just the
+    // wm following the client's own size (tl_last), so this cannot loop. states
+    // stay ACTIVATED only: advertising MAXIMIZED once broke firefox's bridge. (satoru)
+    if (surf->tl_cfg_w > 0 && win->content_w > 0 && win->content_h > 0 &&
+        (win->content_w != surf->tl_cfg_w || win->content_h != surf->tl_cfg_h) &&
+        (win->content_w != surf->tl_last_w || win->content_h != surf->tl_last_h)) {
+        surf->tl_cfg_w = win->content_w; surf->tl_cfg_h = win->content_h;
+        for (int i = 0; i < c->object_high; i++) {
+            Object& t = c->objects[i];
+            if (!t.in_use || t.iface != XDG_TOPLEVEL || t.parent_surface_id != surf->id) continue;
+            uint8_t cfg[16];
+            put32(cfg + 0, (uint32_t)win->content_w);
+            put32(cfg + 4, (uint32_t)win->content_h);
+            put32(cfg + 8, 4); put32(cfg + 12, 4);   // states: ACTIVATED
+            send_event(c, t.id, 0, cfg, 16);
+            if (t.popup_xs && find_obj(c, t.popup_xs)) {
+                uint8_t srl[4]; put32(srl, c->serial_next++);
+                send_event(c, t.popup_xs, 0, srl, 4);
+            }
+            tx_flush(c);   // a fatal flush is dropped by the dispatch loop (satoru)
+            break;
+        }
+    }
     blit_surface_region(c, surf, win, /*use_damage=*/false,
                         -surf->geo_x, -surf->geo_y);
     // a wm repaint refills the whole content rect from the parent buffer, which
@@ -594,6 +764,24 @@ void apply_toplevel_meta(Object* surf, const char* str, int len, bool is_app_id)
     if (n <= 0) return;
     // icon hint from either request: any mention of firefox pins the logo. (satoru)
     if (str_has_ci(buf, "firefox")) surf->app_icon_hint = (uint8_t)AppIcons::FIREFOX;
+    if (is_app_id && surf->app_icon_hint == 0xFF) {
+        // kurono's own ring-3 apps (kui) name themselves by app id: give them
+        // their dock/titlebar logo. exact names only - a guest app id such as
+        // "foot" would hit IdForName's one-letter fallbacks. (satoru)
+        static const char* const kKuiIds[] = { "calculator", "texteditor", "files", "terminal",
+                                               "taskmgr", "taskmanager", "settings", "mediaplayer" };
+        for (unsigned k = 0; k < sizeof(kKuiIds) / sizeof(kKuiIds[0]); k++) {
+            const char* a = kKuiIds[k]; int q = 0;
+            while (a[q] && buf[q] == a[q]) q++;
+            if (a[q] || buf[q]) continue;
+            char cap[16]; int m = 0;
+            for (; a[m] && m < 15; m++) cap[m] = a[m];
+            cap[m] = 0;
+            cap[0] = (char)(cap[0] - 'a' + 'A');
+            surf->app_icon_hint = (uint8_t)AppIcons::IdForName(cap);
+            break;
+        }
+    }
     if (is_app_id) {
         // display-name fallback only; a set_title wins. (satoru)
         if (!surf->title[0] && surf->app_icon_hint == (uint8_t)AppIcons::FIREFOX) {
@@ -611,7 +799,8 @@ void apply_toplevel_meta(Object* surf, const char* str, int len, bool is_app_id)
         Window* win = WindowManager::GetWindow(wid);
         if (win) {
             if (surf->title[0]) WindowManager::SetTitle(wid, surf->title);
-            if (surf->app_icon_hint != 0xFF) win->app_icon = (int)surf->app_icon_hint;
+            if (surf->app_icon_hint != 0xFF)
+                WindowManager::SetAppIcon(wid, (int)surf->app_icon_hint);
             WindowManager::MarkDirty(wid);
         }
     }
@@ -647,8 +836,50 @@ int bridge_surface_window(Client* c, Object* surf, int w, int h) {
         for (int i = 0; i < n && t < 47; i++) title[t++] = num[i];
     }
     title[t] = 0;
-    // -1,-1 lets the wm centre the window in the desktop area. (satoru)
-    Window* win = WindowManager::CreateWindow(title, -1, -1, w, h);
+    // the wm size is the OUTER size: titlebar and border come on top of the
+    // client's content, else they ate its bottom 37 px (a gtk dialog lost its
+    // buttons, firefox its status line). capped to the desktop. -1,-1 lets the
+    // wm centre the window; a dialog (set_parent) is centred over its parent. (satoru)
+    int ow = w + 2 * WM_BORDER_W, oh = h + WM_TITLEBAR_H + WM_BORDER_W;
+    int sw = WindowManager::GetScreenWidth(), dh = WindowManager::GetDesktopH();
+    if (sw > 0 && ow > sw) ow = sw;
+    if (dh > 0 && oh > dh) oh = dh;
+    int ox = -1, oy = -1;
+    if (surf->tl_parent_sid) {
+        Object* ps = find_obj(c, surf->tl_parent_sid);
+        Window* pw = (ps && ps->wm_window) ? WindowManager::GetWindow((int)(intptr_t)ps->wm_window) : nullptr;
+        if (pw) {
+            ox = pw->x + (pw->w - ow) / 2;
+            oy = pw->y + (pw->h - oh) / 2;
+            if (ox < 0) ox = 0;
+            if (oy < WindowManager::GetDesktopY()) oy = WindowManager::GetDesktopY();
+        }
+    }
+    surf->tl_last_w = w; surf->tl_last_h = h;
+    // a dialog that sized itself (0x0 configure) bigger than the desktop - gtk's
+    // file chooser picked 1124x859 on a 1024x768 screen - gets one configure
+    // capped to the desktop content area and re-lays out to fit. (satoru)
+    {
+        int maxw = (sw > 0 ? sw : ow) - 2 * WM_BORDER_W;
+        int maxh = (dh > 0 ? dh : oh) - WM_TITLEBAR_H - WM_BORDER_W;
+        if (surf->tl_parent_sid && (w > maxw || h > maxh) && maxw > 0 && maxh > 0) {   // dialogs only (satoru)
+            for (int i = 0; i < c->object_high; i++) {
+                Object& t = c->objects[i];
+                if (!t.in_use || t.iface != XDG_TOPLEVEL || t.parent_surface_id != surf->id) continue;
+                uint8_t cfg[16];
+                put32(cfg + 0, (uint32_t)(w > maxw ? maxw : w));
+                put32(cfg + 4, (uint32_t)(h > maxh ? maxh : h));
+                put32(cfg + 8, 4); put32(cfg + 12, 4);   // states: ACTIVATED
+                send_event(c, t.id, 0, cfg, 16);
+                if (t.popup_xs && find_obj(c, t.popup_xs)) {
+                    uint8_t srl[4]; put32(srl, c->serial_next++);
+                    send_event(c, t.popup_xs, 0, srl, 4);
+                }
+                break;
+            }
+        }
+    }
+    Window* win = WindowManager::CreateWindow(title, ox, oy, ow, oh);
     if (!win) return -1;
     SerialLogger::Log("[wl] window "); SerialLogger::LogDec(win->id);
     SerialLogger::Log(" '"); SerialLogger::Log(title); SerialLogger::Log("' ");
@@ -656,7 +887,8 @@ int bridge_surface_window(Client* c, Object* surf, int w, int h) {
     SerialLogger::Log("\r\n");
     // pin the app logo resolved from set_app_id/set_title so later title
     // changes keep it. (satoru)
-    if (surf->app_icon_hint != 0xFF) win->app_icon = (int)surf->app_icon_hint;
+    if (surf->app_icon_hint != 0xFF)
+        WindowManager::SetAppIcon(win->id, (int)surf->app_icon_hint);
     // install the content render callback so wm repaints keep the client
     // pixels, and remember which surface owns this window. (satoru)
     win->render = wl_render_thunk;
@@ -664,6 +896,9 @@ int bridge_surface_window(Client* c, Object* surf, int w, int h) {
     surf->wm_window = (void*)(intptr_t)win->id;
     surf->mapped = true;
     winmap_set(win->id, c->sd, surf->id);
+    // the content rect the window starts with: only a later wm resize (drag,
+    // maximize, snap, full screen) sends a configure, see wl_render_thunk. (satoru)
+    surf->tl_cfg_w = win->content_w; surf->tl_cfg_h = win->content_h;
     return win->id;
 }
 
@@ -829,20 +1064,251 @@ Object* find_subsurface_role(Client* c, uint32_t surf_id) {
 // parent already painted), each at its set_position offset, on top. called
 // after a parent's own blit so the parent's (often black csd) buffer never
 // covers the real content the client drew into its child surface. (satoru)
-void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin) {
-    if (!parent_surf || !pwin) return;
-    for (int i = 0; i < WL_MAX_OBJECTS; i++) {
+// true while `surf` holds a live xdg_popup role. (satoru)
+bool popup_live(Client* c, Object* surf) {
+    if (!surf || !surf->popup_obj) return false;
+    Object* po = find_obj(c, surf->popup_obj);
+    return po && po->iface == XDG_POPUP;
+}
+
+// true when an xdg_toplevel gives `sid` the toplevel role. only such surfaces
+// own a wm window; a role-less surface (a gtk cursor surface, a dnd icon) has
+// nothing to show. (satoru)
+bool has_toplevel_role(Client* c, uint32_t sid) {
+    if (sid == 0) return false;
+    for (int i = 0; i < c->object_high; i++) {
+        Object& o = c->objects[i];
+        if (o.in_use && o.iface == XDG_TOPLEVEL && o.parent_surface_id == sid) return true;
+    }
+    return false;
+}
+
+// one step up the surface tree: the parent wl_surface of a subsurface or a
+// popup, and this surface's BUFFER origin in the parent's buffer coords. a
+// popup's configured x/y is relative to the parent's window geometry and its
+// own buffer starts geo_x/geo_y before its geometry. (satoru)
+Object* surface_tree_parent(Client* c, Object* surf, int& bx, int& by, bool& is_popup) {
+    is_popup = false;
+    Object* role = find_subsurface_role(c, surf->id);
+    if (role) {
+        Object* p = find_obj(c, role->subsurface_parent);
+        if (!p || p->iface != WL_SURFACE || p == surf) return nullptr;
+        bx = role->subsurface_x; by = role->subsurface_y;
+        return p;
+    }
+    if (popup_live(c, surf)) {
+        Object* p = find_obj(c, surf->popup_parent_sid);
+        if (!p || p->iface != WL_SURFACE || p == surf) return nullptr;
+        bx = p->geo_x + surf->popup_x - surf->geo_x;
+        by = p->geo_y + surf->popup_y - surf->geo_y;
+        is_popup = true;
+        return p;
+    }
+    return nullptr;
+}
+
+// walk up to the surface that owns the wm window. ox/oy = content coords of
+// surf's buffer origin in that window; in_popup = the chain crosses a popup.
+// null when the chain is not (yet) mapped. tooltips are a subsurface of the
+// toplevel with gecko's own subsurface inside, so the walk must be deeper than
+// one level - the old one-level lookup gave that inner surface a stray window
+// of its own (the laptop's "random extra window", 288x58 'wayland sd N'). (satoru)
+Object* surface_tree_root(Client* c, Object* surf, int& ox, int& oy, bool& in_popup) {
+    int ax = 0, ay = 0;
+    in_popup = false;
+    Object* s = surf;
+    for (int d = 0; d < 8 && s; d++) {
+        if (s->wm_window) { ox = ax - s->geo_x; oy = ay - s->geo_y; return s; }
+        int bx = 0, by = 0; bool pp = false;
+        Object* p = surface_tree_parent(c, s, bx, by, pp);
+        if (!p) return nullptr;
+        if (pp) in_popup = true;
+        ax += bx; ay += by;
+        s = p;
+    }
+    return nullptr;
+}
+
+// the tree changed shape (a popup or subsurface went away): repaint the window
+// it was composited onto, or its pixels stay on screen. (satoru)
+void mark_tree_root_dirty(Client* c, Object* surf) {
+    if (!surf) return;
+    int ox, oy; bool ip;
+    Object* root = surface_tree_root(c, surf, ox, oy, ip);
+    if (root && root->wm_window) WindowManager::MarkDirty((int)(intptr_t)root->wm_window);
+}
+
+// composite everything stacked on `parent` (whose buffer origin sits at content
+// coords pox/poy): its subsurfaces, each with its own subtree, then its live
+// popups oldest first, so a popup is above the whole tree it belongs to. (satoru)
+void blit_surface_children(Client* c, Object* parent, Window* win, int pox, int poy, int depth) {
+    if (depth > 6) return;
+    for (int i = 0; i < c->object_high; i++) {
         Object& ss = c->objects[i];
         if (!ss.in_use || ss.iface != WL_SUBSURFACE) continue;
-        if (ss.subsurface_parent != parent_surf->id) continue;
+        if (ss.subsurface_parent != parent->id) continue;
         Object* child = find_obj(c, ss.parent_surface_id);
+        if (!child || child == parent) continue;
+        int ox = pox + ss.subsurface_x, oy = poy + ss.subsurface_y;
         // a filled shadow is displayable even when the client has since detached
         // or DESTROYED the committed wl_buffer (gtk destroys released buffers). (satoru)
-        if (!child) continue;
-        if (child->pending_buffer_id == 0 && !(child->shadow && child->shadow_filled)) continue;
-        blit_surface_region(c, child, pwin, /*use_damage=*/false,
-                            ss.subsurface_x - parent_surf->geo_x,
-                            ss.subsurface_y - parent_surf->geo_y);
+        if (child->pending_buffer_id != 0 || (child->shadow && child->shadow_filled))
+            blit_surface_region(c, child, win, /*use_damage=*/false, ox, oy);
+        blit_surface_children(c, child, win, ox, oy, depth + 1);
+    }
+    uint32_t last = 0;
+    for (int guard = 0; guard < 16; guard++) {
+        Object* best = nullptr;
+        for (int i = 0; i < c->object_high; i++) {
+            Object& o = c->objects[i];
+            if (!o.in_use || o.iface != WL_SURFACE || !o.popup_obj) continue;
+            if (o.popup_parent_sid != parent->id || o.popup_seq <= last) continue;
+            if (best && o.popup_seq >= best->popup_seq) continue;
+            if (!popup_live(c, &o)) continue;
+            if (find_subsurface_role(c, o.id)) continue;   // drawn as a subsurface already (satoru)
+            best = &o;
+        }
+        if (!best) break;
+        last = best->popup_seq;
+        int ox = pox + parent->geo_x + best->popup_x - best->geo_x;
+        int oy = poy + parent->geo_y + best->popup_y - best->geo_y;
+        if (best->shadow && best->shadow_filled)
+            blit_surface_region(c, best, win, /*use_damage=*/false, ox, oy);
+        blit_surface_children(c, best, win, ox, oy, depth + 1);
+    }
+}
+
+void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin) {
+    if (!parent_surf || !pwin) return;
+    blit_surface_children(c, parent_surf, pwin, -parent_surf->geo_x, -parent_surf->geo_y, 0);
+}
+
+// a child surface that committed before its parent mapped got a temporary
+// own-window. until now it re-homed only on the child's NEXT commit; a child
+// that never commits again (a static tooltip or a content surface waiting for
+// a frame callback) kept a stray 'wayland sd N' window. now that the parent is
+// mapped, close every temp window whose tree root is this surface; the render
+// pass composites those children onto the parent. (satoru)
+void rehome_temp_children(Client* c, Object* root_surf) {
+    if (!c || !root_surf || !root_surf->wm_window) return;
+    int closed = 0;
+    for (int i = 0; i < c->object_high; i++) {
+        Object& ch = c->objects[i];
+        if (!ch.in_use || ch.iface != WL_SURFACE || ch.id == root_surf->id || !ch.wm_window)
+            continue;
+        int ox = 0, oy = 0; bool ip = false;
+        if (surface_tree_root(c, &ch, ox, oy, ip) != root_surf) continue;
+        int wid = (int)(intptr_t)ch.wm_window;
+        WindowManager::CloseWindow(wid);
+        winmap_clear(wid);
+        ch.wm_window = nullptr;
+        closed++;
+        static int s_logs = 0;
+        if (s_logs < 8) {
+            s_logs++;
+            SerialLogger::Log("[wl] rehome child sid="); SerialLogger::LogDec((int)ch.id);
+            SerialLogger::Log(" into window "); SerialLogger::LogDec((int)(intptr_t)root_surf->wm_window);
+            SerialLogger::Log("\r\n");
+        }
+    }
+    if (closed) WindowManager::MarkDirty((int)(intptr_t)root_surf->wm_window);
+}
+
+// xdg_positioner placement on one axis. side -1 = left/top, 1 = right/bottom,
+// 0 = centre, for both the anchor point on the anchor rect and the direction
+// the popup grows from it (gravity). (satoru)
+int popup_axis_pos(int a0, int alen, int aside, int gside, int off, int len) {
+    int pt = aside < 0 ? a0 : (aside > 0 ? a0 + alen : a0 + alen / 2);
+    int p  = gside < 0 ? pt - len : (gside > 0 ? pt : pt - len / 2);
+    return p + off;
+}
+
+// place, then apply the constraint adjustments in the order the protocol
+// gives them (flip, slide, resize) against [lo, hi). hi <= lo = no bounds. (satoru)
+void popup_axis(int a0, int alen, int aside, int gside, int off, int lo, int hi,
+                bool flip, bool slide, bool resize, int& pos, int& len) {
+    pos = popup_axis_pos(a0, alen, aside, gside, off, len);
+    if (hi <= lo) return;
+    if (pos >= lo && pos + len <= hi) return;
+    if (flip) {
+        int fp = popup_axis_pos(a0, alen, -aside, -gside, -off, len);
+        if (fp >= lo && fp + len <= hi) { pos = fp; return; }
+    }
+    if (slide) {
+        if (pos + len > hi) pos = hi - len;
+        if (pos < lo) pos = lo;
+    }
+    if (resize) {
+        if (pos < lo) { len -= lo - pos; pos = lo; }
+        if (pos + len > hi) len = hi - pos;
+        if (len < 1) len = 1;
+    }
+}
+
+// anchor / gravity enum -> per-axis side: none 0, top 1, bottom 2, left 3,
+// right 4, top_left 5, bottom_left 6, top_right 7, bottom_right 8. (satoru)
+inline int xdg_side_x(uint32_t e) { return (e == 3 || e == 5 || e == 6) ? -1 : (e == 4 || e == 7 || e == 8) ? 1 : 0; }
+inline int xdg_side_y(uint32_t e) { return (e == 1 || e == 5 || e == 7) ? -1 : (e == 2 || e == 6 || e == 8) ? 1 : 0; }
+
+void wlpop_log(const char* what, Object* s, int a, int b, int c2, int d);   // (satoru)
+
+// compute the popup's geometry from a positioner. the compositor's
+// constraint area is the root window's content: a popup is composited onto
+// that window, so anything outside it would be clipped away. (satoru)
+void popup_place(Client* c, Object* psurf, Object* pos, Object* parent) {
+    int w = pos->pos_w > 0 ? pos->pos_w : 1;
+    int h = pos->pos_h > 0 ? pos->pos_h : 1;
+    int lox = 0, hix = 0, loy = 0, hiy = 0;
+    int pox = 0, poy = 0; bool ip = false;
+    Object* root = surface_tree_root(c, parent, pox, poy, ip);
+    if (root && root->wm_window) {
+        Window* rw = WindowManager::GetWindow((int)(intptr_t)root->wm_window);
+        int W = root->geo_w > 0 ? root->geo_w : (rw ? rw->content_w : 0);
+        int H = root->geo_h > 0 ? root->geo_h : (rw ? rw->content_h : 0);
+        // the parent's window-geometry origin in root content coords. (satoru)
+        int gx = pox + parent->geo_x, gy = poy + parent->geo_y;
+        lox = -gx; hix = W - gx; loy = -gy; hiy = H - gy;
+    }
+    uint32_t ca = pos->pos_cadj;
+    int x = 0, y = 0;
+    popup_axis(pos->pos_ax, pos->pos_aw, xdg_side_x(pos->pos_anchor), xdg_side_x(pos->pos_gravity),
+               pos->pos_ox, lox, hix, (ca & 4) != 0, (ca & 1) != 0, (ca & 16) != 0, x, w);
+    popup_axis(pos->pos_ay, pos->pos_ah, xdg_side_y(pos->pos_anchor), xdg_side_y(pos->pos_gravity),
+               pos->pos_oy, loy, hiy, (ca & 8) != 0, (ca & 2) != 0, (ca & 32) != 0, y, h);
+    psurf->popup_x = x; psurf->popup_y = y;
+    psurf->popup_w = w; psurf->popup_h = h;
+    wlpop_log("place", psurf, x, y, w, h);
+}
+
+// bounded popup log: where each popup was placed, first 32 a boot. (satoru)
+int g_wlpop_logs = 0;
+void wlpop_log(const char* what, Object* s, int a, int b, int c2, int d) {
+    if (g_wlpop_logs >= 32 || !s) return;
+    g_wlpop_logs++;
+    SerialLogger::Log("[wlpop] "); SerialLogger::Log(what);
+    SerialLogger::Log(" sid="); SerialLogger::LogDec((int)s->id);
+    SerialLogger::Log(" "); SerialLogger::LogDec(a); SerialLogger::Log(",");
+    SerialLogger::LogDec(b); SerialLogger::Log(" "); SerialLogger::LogDec(c2);
+    SerialLogger::Log("x"); SerialLogger::LogDec(d);
+    SerialLogger::Log(" geo="); SerialLogger::LogDec(s->geo_x); SerialLogger::Log(",");
+    SerialLogger::LogDec(s->geo_y); SerialLogger::Log(" ");
+    SerialLogger::LogDec(s->geo_w); SerialLogger::Log("x"); SerialLogger::LogDec(s->geo_h);
+    SerialLogger::Log("\r\n");
+}
+
+// xdg_popup.configure (+ repositioned for a reposition request) and the
+// closing xdg_surface.configure. (satoru)
+void popup_send_configure(Client* c, Object* popup, Object* psurf, bool repos, uint32_t token) {
+    if (repos) { uint8_t tk[4]; put32(tk, token); send_event(c, popup->id, 2, tk, 4); }
+    uint8_t pc[16];
+    put32(pc + 0,  (uint32_t)psurf->popup_x);
+    put32(pc + 4,  (uint32_t)psurf->popup_y);
+    put32(pc + 8,  (uint32_t)psurf->popup_w);
+    put32(pc + 12, (uint32_t)psurf->popup_h);
+    send_event(c, popup->id, 0, pc, 16);
+    if (popup->popup_xs && find_obj(c, popup->popup_xs)) {
+        uint8_t srl[4]; put32(srl, c->serial_next++);
+        send_event(c, popup->popup_xs, 0, srl, 4);
     }
 }
 
@@ -862,11 +1328,22 @@ void update_surface_shadow(Client* c, Object* surf, Object* buf) {
 
     // (re)allocate on first use or resize; a resize invalidates old content. (satoru)
     if (!surf->shadow || surf->shadow_w != bw || surf->shadow_h != bh) {
-        if (surf->shadow) KernelHeap::Free(surf->shadow);
-        surf->shadow = (uint8_t*)KernelHeap::Alloc((size_t)bw * bh * 4u);
-        surf->shadow_w = bw; surf->shadow_h = bh;
+        shadow_release(*surf);
         surf->shadow_filled = false;
-        if (!surf->shadow) { surf->shadow_w = surf->shadow_h = 0; return; }
+        uint64_t need = (uint64_t)bw * (uint64_t)bh * 4u;
+        if ((uint64_t)bw * (uint64_t)bh > WL_MAX_BUF_PX) return;
+        if (g_shadow_bytes + need > WL_MAX_SHADOW_TOTAL) {
+            static int s_budget_logs = 0;
+            if (s_budget_logs < 4) {
+                s_budget_logs++;
+                SerialLogger::Log("[wl] shadow budget full, surface not shown\r\n");
+            }
+            return;
+        }
+        surf->shadow = (uint8_t*)KernelHeap::Alloc((size_t)need);
+        if (!surf->shadow) return;
+        surf->shadow_w = bw; surf->shadow_h = bh;
+        g_shadow_bytes += need;
     }
 
     // region to copy: full buffer until the shadow is filled once; after that
@@ -904,7 +1381,39 @@ void update_surface_shadow(Client* c, Object* surf, Object* buf) {
 // painted. (satoru)
 void commit_surface(Client* c, Object* surf) {
     uint32_t bid = surf->pending_buffer_id;
-    if (bid == 0) return;                       // nothing attached yet
+    bool fresh = surf->attach_pending;
+    surf->attach_pending = false;
+    if (!fresh) {
+        // no attach since the last commit: the content did not change, and the
+        // released buffer is the client's again. nothing to read. a temporary
+        // own-window still re-homes once its parent has mapped. (satoru)
+        if (surf->wm_window) {
+            Object* hr = find_subsurface_role(c, surf->id);
+            Object* hp = hr ? find_obj(c, hr->subsurface_parent) : nullptr;
+            if (hp && hp != surf && hp->wm_window) {
+                int twid = (int)(intptr_t)surf->wm_window;
+                WindowManager::CloseWindow(twid);
+                winmap_clear(twid);
+                surf->wm_window = nullptr;
+                WindowManager::MarkDirty((int)(intptr_t)hp->wm_window);
+            }
+        }
+        surf->damage.valid = false;
+        return;
+    }
+    if (bid == 0) {
+        // attach(null) + commit unmaps the surface. for a subsurface or popup
+        // drop its picture and repaint what it covered; a toplevel keeps the
+        // old behaviour (its window goes with the xdg_toplevel). (satoru)
+        if (!surf->wm_window && surf->shadow) {
+            mark_tree_root_dirty(c, surf);
+            shadow_release(*surf);
+            surf->shadow_filled = false;
+            mark_tree_root_dirty(c, surf);
+        }
+        surf->damage.valid = false;
+        return;
+    }
     Object* buf = find_obj(c, bid);
     if (!buf || buf->iface != WL_BUFFER) return;
     int bw = buf->width;
@@ -946,21 +1455,87 @@ void commit_surface(Client* c, Object* surf) {
                 blit_surface_region(c, surf, pwin, /*use_damage=*/true,
                                     role->subsurface_x - psurf->geo_x,
                                     role->subsurface_y - psurf->geo_y);
+                {   // census marker: the first real content commit (gecko's content
+                    // subsurface composited onto its toplevel). KWPAINT alone also fires
+                    // for the empty csd frame of a window that stays black. (satoru)
+                    static int s_kwcontent = 0;
+                    static Client* s_kwc_client = nullptr;
+                    if (s_kwc_client != c) { s_kwc_client = c; s_kwcontent = 0; }
+                    if (s_kwcontent < 2 && surf->shadow_filled) {
+                        s_kwcontent++;
+                        SerialLogger::Log("[KWCONTENT] sid="); SerialLogger::LogDec((int)surf->id);
+                        SerialLogger::Log(" "); SerialLogger::LogDec(bw);
+                        SerialLogger::Log("x"); SerialLogger::LogDec(bh);
+                        SerialLogger::Log("\r\n");
+                    }
+                }
                 WindowManager::MarkDirty(pwid);
                 surf->damage.valid = false;
                 return;
             }
         }
-        // parent not mapped yet - fall through to a temporary own-window so the
-        // content isn't lost; it re-homes onto the parent on the next commit.
-        // (satoru)
+        // unreachable: a subsurface/popup commit never bridges a window, the
+        // role/popup block below keeps its shadow until the tree has a root. (satoru)
+    }
+    // deeper trees (gecko's surface inside a tooltip subsurface) and popups
+    // (menus): the shadow already holds the pixels, so repaint the window the
+    // tree is composited onto; the render thunk walks the whole tree. never a
+    // window of their own - that was the stray 'wayland sd N' window, and the
+    // old direct-child temporary window left one behind when the child never
+    // committed again. an unmapped tree keeps its shadows and waits. (satoru)
+    if (role || popup_live(c, surf)) {
+        int tox = 0, toy = 0; bool tip = false;
+        Object* troot = surface_tree_root(c, surf, tox, toy, tip);
+        if (troot && troot != surf && troot->wm_window) {
+            WindowManager::MarkDirty((int)(intptr_t)troot->wm_window);
+            surf->damage.valid = false;
+            return;
+        }
+        // no window in the tree yet (the parent toplevel has not mapped):
+        // keep the shadow and wait for the parent's commit to composite the
+        // whole tree. the old fallback gave this child a temporary own-window,
+        // which is exactly the stray 'wayland sd N' window when the child
+        // never committed again. never create one for a subsurface/popup. (satoru)
+        surf->damage.valid = false;
+        return;
+    } else if (!surf->wm_window && !has_toplevel_role(c, surf->id)) {
+        // a role-less surface (gtk's cursor surface, a drag icon) is never
+        // shown as a window. (satoru)
+        surf->damage.valid = false;
+        return;
     }
 
     // ensure the surface owns an on-screen rect. (satoru)
+    bool newly_bridged = (surf->wm_window == nullptr);
     int wid = bridge_surface_window(c, surf, bw, bh);
     if (wid < 0) return;
     Window* win = WindowManager::GetWindow(wid);
     if (!win) { surf->wm_window = nullptr; return; }
+    // the client resized itself (a gtk dialog settling on its natural size):
+    // follow it. only on a CHANGE of the client's size, so a wm maximize of a
+    // client that keeps its size is not undone on the next frame. (satoru)
+    if (!newly_bridged && win->state == WIN_NORMAL) {
+        int cw = surf->geo_w > 0 ? surf->geo_w : bw;
+        int ch = surf->geo_h > 0 ? surf->geo_h : bh;
+        if (cw != surf->tl_last_w || ch != surf->tl_last_h) {
+            surf->tl_last_w = cw; surf->tl_last_h = ch;
+            surf->tl_cfg_w = cw; surf->tl_cfg_h = ch;
+            int ow = cw + 2 * WM_BORDER_W, oh = ch + WM_TITLEBAR_H + WM_BORDER_W;
+            int sw = WindowManager::GetScreenWidth(), dh = WindowManager::GetDesktopH();
+            if (sw > 0 && ow > sw) ow = sw;
+            if (dh > 0 && oh > dh) oh = dh;
+            WindowManager::ResizeWindow(wid, ow, oh);
+            int dy = WindowManager::GetDesktopY();
+            if (dh > 0 && win->y + win->h > dy + dh) {
+                int ny = dy + dh - win->h;
+                WindowManager::MoveWindow(wid, win->x, ny < dy ? dy : ny);
+            }
+        }
+    }
+
+    // the parent is mapped now: fold any child that committed early (and got a
+    // temporary own-window) back into this window instead of leaving a stray. (satoru)
+    rehome_temp_children(c, surf);
 
     // first-paint serial marker: until now a paint was only provable by a qmp
     // screenshot (KW:NativeShow comes from the firefox image and fires before
@@ -991,14 +1566,14 @@ void commit_surface(Client* c, Object* surf) {
     // bc->IsActive()) - when the window is FOCUSED. a headless boot has no
     // pointer click to focus it, so grant keyboard focus here (paired with the
     // xdg_toplevel ACTIVATED state). without it the chrome paints but the web
-    // content viewport stays firefox's blank canvas. gated to real toplevels
-    // (skip the tiny transient own-windows) and fired once per surface. (satoru)
-    if (c->keyboard_id != 0 && c->keyboard_focus_sid != surf->id &&
-        bw > 200 && bh > 200) {
-        if (c->keyboard_focus_sid != 0 && find_obj(c, c->keyboard_focus_sid))
-            keyboard_leave(c, c->keyboard_id, c->keyboard_focus_sid);
-        c->keyboard_focus_sid = surf->id;
-        keyboard_enter(c, c->keyboard_id, surf->id);
+    // content viewport stays firefox's blank canvas. fired once per surface,
+    // when it is first bridged (newly_bridged): doing it on every commit stole
+    // focus back from any other client on each frame and churned leave/enter
+    // after every click. every toplevel gets it, including tiny 1x1 helper
+    // surfaces: wl-copy creates one and only calls set_selection after its
+    // keyboard enter, so skipping small windows broke the guest clipboard. (satoru)
+    if (newly_bridged && has_toplevel_role(c, surf->id)) {
+        set_keyboard_focus(c, surf->id);
     }
 
     // incremental blit of the damaged region. if no pool mapping exists yet
@@ -1021,21 +1596,31 @@ void commit_surface(Client* c, Object* surf) {
 // ms (Timer::GetRealMs). the callback id is also scrubbed from the
 // per-client ring so DispatchPendingFrames doesn't fire it twice. (satoru)
 void deliver_surface_frame(Client* c, Object* surf) {
-    uint32_t cb = surf->pending_frame_cb;
-    if (cb == 0) return;
+    // deliver every frame callback this surface requested before this commit,
+    // in request order - not just the last one. the old code fired only the
+    // newest (pending_frame_cb) and left older ones to the render-loop drain,
+    // which fired them later, out of order, with a different clock - and even
+    // for surfaces that had not committed. gtk and gecko both hang callbacks on
+    // the toplevel: gdk's frame-clock callback and gecko's ReadyToDraw callback
+    // (WaylandSurface::MapLocked asks wl_surface_frame(parent)). when gecko's
+    // landed late and out of order, its initial-draw handshake never finished
+    // and the window stayed black (~50% of boots). (satoru)
     surf->pending_frame_cb = 0;
-    Object* o = find_obj(c, cb);
-    if (!o) return;
-    // scrub the queued id so the vsync drain skips it. (satoru)
-    for (int i = c->frame_cb_tail; i != c->frame_cb_head;
-         i = (i + 1) % WL_MAX_FRAME_CB) {
-        if (c->frame_cb[i] == cb) { c->frame_cb[i] = 0; break; }
-    }
     uint32_t now = Timer::GetRealMs();
     g_now_ms = now;
     uint8_t pl[4]; put32(pl, now);
-    send_event(c, cb, 0, pl, 4);          // wl_callback::done
-    destroy_obj(c, cb);                    // one-shot
+    SpinLockGuard g(g_fcb_lock);   // (satoru)
+    for (int i = c->frame_cb_tail; i != c->frame_cb_head;
+         i = (i + 1) % WL_MAX_FRAME_CB) {
+        uint32_t cb = c->frame_cb[i];
+        if (cb == 0) continue;
+        Object* o = find_obj(c, cb);
+        if (!o || o->iface != WL_CALLBACK) { c->frame_cb[i] = 0; continue; }
+        if (o->parent_surface_id != surf->id) continue;
+        c->frame_cb[i] = 0;
+        send_event(c, cb, 0, pl, 4);          // wl_callback::done
+        destroy_obj(c, cb);                    // one-shot
+    }
 }
 
 // ── phase 3: input forwarding helpers ────────────────────────────────
@@ -1162,6 +1747,43 @@ Object* input_target_at(Client** out_client, int gx, int gy, int& lx, int& ly) {
     int tx, ty;
     global_to_surface(top, gx, gy, tx, ty);
     lx = tx; ly = ty;
+    // an open popup (menu) of this window is on top of everything in it: the
+    // newest popup whose geometry holds the point takes the event, or a
+    // subsurface inside it that accepts input. (satoru)
+    {
+        int cpx = tx - top->geo_x, cpy = ty - top->geo_y;   // root content coords
+        Object* hit = nullptr; int hox = 0, hoy = 0;
+        for (int i = 0; i < fc->object_high; i++) {
+            Object& p = fc->objects[i];
+            if (!p.in_use || p.iface != WL_SURFACE || !p.popup_obj) continue;
+            if (hit && p.popup_seq < hit->popup_seq) continue;
+            if (!popup_live(fc, &p)) continue;
+            if (!(p.shadow && p.shadow_filled)) continue;   // not drawn, takes no input (satoru)
+            int ox = 0, oy = 0; bool ip = false;
+            if (surface_tree_root(fc, &p, ox, oy, ip) != top) continue;
+            int rx = cpx - (ox + p.geo_x), ry = cpy - (oy + p.geo_y);
+            if (rx < 0 || ry < 0 || rx >= p.popup_w || ry >= p.popup_h) continue;
+            hit = &p; hox = ox; hoy = oy;
+        }
+        if (hit) {
+            int bx = cpx - hox, by = cpy - hoy;   // popup buffer coords (satoru)
+            lx = bx; ly = by;
+            for (int i = 0; i < fc->object_high; i++) {
+                Object& ss = fc->objects[i];
+                if (!ss.in_use || ss.iface != WL_SUBSURFACE || ss.subsurface_parent != hit->id) continue;
+                Object* child = find_obj(fc, ss.parent_surface_id);
+                if (!child || child->input_none) continue;
+                int cw = 0, ch = 0;
+                if (child->shadow && child->shadow_filled) { cw = child->shadow_w; ch = child->shadow_h; }
+                else if (child->width > 0)                 { cw = child->width;    ch = child->height;   }
+                int rx = bx - ss.subsurface_x, ry = by - ss.subsurface_y;
+                if (cw <= 0 || ch <= 0 || rx < 0 || ry < 0 || rx >= cw || ry >= ch) continue;
+                lx = rx; ly = ry;
+                return child;
+            }
+            return hit;
+        }
+    }
     for (int i = 0; i < WL_MAX_OBJECTS; i++) {
         Object& ss = fc->objects[i];
         if (!ss.in_use || ss.iface != WL_SUBSURFACE) continue;
@@ -1352,6 +1974,30 @@ void kbds_leave(Client* c, uint32_t surf) {
     for (int i = 0; i < c->keyboard_id_count; i++)
         keyboard_leave(c, c->keyboard_ids[i], surf);
 }
+
+// the one keyboard focus: (client, toplevel surface). every change sends leave
+// to the previous owner first, so keys never reach two clients at once (map
+// auto-focus used to grab focus without telling the other client, and
+// ForwardKey fed both). focus always names a TOPLEVEL: gdk ignores enter on a
+// surface that is not one of its windows (gecko's content subsurface), so a
+// leave/enter pair onto such a surface would leave gdk with no focus. (satoru)
+void set_keyboard_focus(Client* c, uint32_t sid) {
+    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
+        Client* o = &g_clients[i];
+        if (!o->in_use || o == c || o->keyboard_focus_sid == 0) continue;
+        if (find_obj(o, o->keyboard_focus_sid)) kbds_leave(o, o->keyboard_focus_sid);
+        o->keyboard_focus_sid = 0;
+        // flush only: a failed flush marks it fatal and the dispatch loop drops
+        // it. dropping here could free a client whose request is mid-dispatch
+        // (a destroy closes its window, the wm refocuses, we land here). (satoru)
+        tx_flush(o);
+    }
+    if (!c || c->keyboard_focus_sid == sid) return;
+    if (c->keyboard_focus_sid != 0 && find_obj(c, c->keyboard_focus_sid))
+        kbds_leave(c, c->keyboard_focus_sid);
+    c->keyboard_focus_sid = sid;
+    if (sid) kbds_enter(c, sid);   // a keyboard bound later gets its enter at bind (satoru)
+}
 void kbds_key(Client* c, uint32_t time, uint32_t key, bool pressed) {
     for (int i = 0; i < c->keyboard_id_count; i++)
         keyboard_key(c, c->keyboard_ids[i], time, key, pressed);
@@ -1407,9 +2053,16 @@ static void send_initial_global_events(Client* c, uint32_t id, uint16_t iface,
         int sh = Graphics::GetHeight();
         if (sw <= 0) sw = 1280;
         if (sh <= 0) sh = 800;
+        // multi-monitor: the one wl_output is the primary screen, not the whole
+        // virtual desktop, so clients size/maximize to a real screen. (satoru)
+        int ox = 0, oy = 0;
+        if (Outputs::Multi()) {
+            const Output* po = Outputs::Get(0);
+            if (po && po->connected && po->w > 0 && po->h > 0) { sw = po->w; sh = po->h; ox = po->x; oy = po->y; }
+        }
         uint8_t g[80]; int p = 0;
-        put32(g + p, 0);   p += 4;                 // x
-        put32(g + p, 0);   p += 4;                 // y
+        put32(g + p, (uint32_t)ox);   p += 4;      // x
+        put32(g + p, (uint32_t)oy);   p += 4;      // y
         put32(g + p, 300); p += 4;                 // physical_width (mm)
         put32(g + p, 200); p += 4;                 // physical_height (mm)
         put32(g + p, 0);   p += 4;                 // subpixel unknown
@@ -1428,13 +2081,565 @@ static void send_initial_global_events(Client* c, uint32_t id, uint16_t iface,
     }
 }
 
+// ── data device / primary selection ──────────────────────────────────
+// a selection owner is asked to write every supported mime into a pipe as
+// soon as it takes the selection; the compositor keeps that snapshot in the
+// system clipboard and serves every consumer from there. this makes native
+// apps, wayland clients and the alpine bridge share one store, and keeps a
+// copy alive when its owner exits. (satoru)
+
+constexpr int CLIP_MAX_MIMES    = 8;
+constexpr int CLIP_MIME_NAME    = 48;
+constexpr int CLIP_MAX_SOURCES  = 64;
+constexpr int CLIP_MAX_OFFERS   = 128;
+constexpr int CLIP_MAX_PULLS    = 16;
+constexpr int CLIP_MAX_WRITES   = 16;
+constexpr uint32_t CLIP_PULL_MS = 3000;
+constexpr uint32_t CLIP_WRITE_MS = 5000;
+
+struct ClipMimeList {
+    int  count;
+    char name[CLIP_MAX_MIMES][CLIP_MIME_NAME];
+};
+
+struct ClipSourceInfo {
+    bool     used;
+    int      sd;
+    uint32_t id;
+    uint16_t iface;
+    bool     primary;
+    ClipMimeList mimes;
+};
+
+struct ClipOfferInfo {
+    bool     used;
+    int      sd;
+    uint32_t id;
+    bool     primary;
+    uint32_t serial;
+    ClipMimeList mimes;
+};
+
+struct ClipSelection {
+    bool     active;
+    bool     system;
+    int      sd;
+    uint32_t source_id;
+    uint16_t source_iface;
+    uint32_t serial;
+    ClipMimeList mimes;
+};
+
+struct ClipPull {
+    bool     used;
+    int      owner_sd;
+    uint32_t source_id;
+    uint16_t source_iface;
+    bool     primary;
+    uint32_t serial;
+    char     mime[CLIP_MIME_NAME];
+    int      read_sd;
+    uint8_t* buf;
+    uint32_t len, cap;
+    uint32_t deadline;
+};
+
+struct ClipWrite {
+    bool     used;
+    int      sd;
+    uint8_t* data;
+    uint32_t len, off;
+    uint32_t deadline;
+};
+
+ClipSourceInfo g_csources[CLIP_MAX_SOURCES];
+ClipOfferInfo  g_coffers[CLIP_MAX_OFFERS];
+ClipSelection  g_csel, g_psel;
+ClipPull       g_pulls[CLIP_MAX_PULLS];
+ClipWrite      g_writes[CLIP_MAX_WRITES];
+int            g_pulls_left[2] = { 0, 0 };
+uint32_t       g_csel_serial = 1;
+uint32_t       g_psel_serial = 1;
+Spinlock       g_clip_lock;
+
+bool cstr_eq(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) { if (*a != *b) return false; a++; b++; }
+    return *a == 0 && *b == 0;
+}
+
+bool clip_is_text_mime(const char* m) {
+    return cstr_eq(m, "text/plain") || cstr_eq(m, "text/plain;charset=utf-8") ||
+           cstr_eq(m, "UTF8_STRING");
+}
+
+bool clip_supported_mime(const char* m) {
+    return clip_is_text_mime(m) || cstr_eq(m, "text/html") || cstr_eq(m, "image/png");
+}
+
+void clip_mimes_clear(ClipMimeList& l) { l.count = 0; }
+
+bool clip_mimes_add(ClipMimeList& l, const char* m) {
+    if (!m || !m[0]) return false;
+    for (int i = 0; i < l.count; i++) if (cstr_eq(l.name[i], m)) return false;
+    if (l.count >= CLIP_MAX_MIMES) return false;
+    int n = 0;
+    while (m[n] && n < CLIP_MIME_NAME - 1) { l.name[l.count][n] = m[n]; n++; }
+    l.name[l.count][n] = 0;
+    l.count++;
+    return true;
+}
+
+ClipSelection& clip_sel(bool primary) { return primary ? g_psel : g_csel; }
+uint32_t& clip_serial(bool primary) { return primary ? g_psel_serial : g_csel_serial; }
+int clip_sel_index(bool primary) { return primary ? 1 : 0; }
+
+ClipSourceInfo* clip_find_source(int sd, uint32_t id) {
+    for (int i = 0; i < CLIP_MAX_SOURCES; i++)
+        if (g_csources[i].used && g_csources[i].sd == sd && g_csources[i].id == id)
+            return &g_csources[i];
+    return nullptr;
+}
+
+ClipOfferInfo* clip_find_offer(int sd, uint32_t id) {
+    for (int i = 0; i < CLIP_MAX_OFFERS; i++)
+        if (g_coffers[i].used && g_coffers[i].sd == sd && g_coffers[i].id == id)
+            return &g_coffers[i];
+    return nullptr;
+}
+
+void clip_remove_source(int sd, uint32_t id) {
+    ClipSourceInfo* s = clip_find_source(sd, id);
+    if (s) { s->used = false; s->sd = -1; s->id = 0; }
+}
+
+void clip_remove_offer(int sd, uint32_t id) {
+    ClipOfferInfo* o = clip_find_offer(sd, id);
+    if (o) { o->used = false; o->sd = -1; o->id = 0; }
+}
+
+void clip_free_pull(ClipPull& p) {
+    if (p.read_sd >= 0) UnixSocket::Close(p.read_sd);
+    if (p.buf) KernelHeap::Free(p.buf);
+    p.buf = nullptr;
+    p.len = p.cap = 0;
+    p.read_sd = -1;
+    p.used = false;
+}
+
+void clip_cancel_pulls(bool primary, uint32_t serial) {
+    for (int i = 0; i < CLIP_MAX_PULLS; i++) {
+        ClipPull& p = g_pulls[i];
+        if (!p.used || p.primary != primary) continue;
+        if (serial && p.serial != serial) continue;
+        clip_free_pull(p);
+    }
+    g_pulls_left[clip_sel_index(primary)] = 0;
+}
+
+void clip_pump_writes();
+
+void clip_finish_pull(ClipPull& p) {
+    ClipSelection& sel = clip_sel(p.primary);
+    bool current = sel.active && !sel.system && sel.serial == p.serial;
+    SerialLogger::Log("[clip] pull done mime="); SerialLogger::Log(p.mime);
+    SerialLogger::Log(" len="); SerialLogger::LogDec((int)p.len);
+    SerialLogger::Log(" current="); SerialLogger::LogDec(current ? 1 : 0);
+    SerialLogger::Log("\r\n");
+    if (current && p.len > 0)
+        ClipboardManager::AddMimeFor(p.primary, p.mime, p.buf, p.len);
+    clip_free_pull(p);
+    if (!current) return;
+    int idx = clip_sel_index(p.primary);
+    if (g_pulls_left[idx] > 0) g_pulls_left[idx]--;
+    if (g_pulls_left[idx] == 0)
+        ClipboardManager::CommitReplace(p.primary, false);
+}
+
+void clip_pump_pulls() {
+    uint32_t now = Timer::GetRealMs();
+    for (int i = 0; i < CLIP_MAX_PULLS; i++) {
+        ClipPull& p = g_pulls[i];
+        if (!p.used) continue;
+        bool done = false;
+        for (int guard = 0; guard < 8 && !done; guard++) {
+            uint8_t tmp[4096];
+            int n = UnixSocket::Recv(p.read_sd, tmp, (int)sizeof(tmp), 0);
+            if (n > 0) {
+                if (p.len + (uint32_t)n > ClipboardManager::MAX_BLOB) { done = true; break; }
+                if (p.len + (uint32_t)n > p.cap) {
+                    uint32_t ncap = p.cap ? p.cap : 65536;
+                    while (ncap < p.len + (uint32_t)n) ncap *= 2;
+                    if (ncap > ClipboardManager::MAX_BLOB) ncap = ClipboardManager::MAX_BLOB;
+                    uint8_t* nb = (uint8_t*)KernelHeap::Alloc(ncap);
+                    if (!nb) { done = true; break; }
+                    for (uint32_t k = 0; k < p.len; k++) nb[k] = p.buf[k];
+                    if (p.buf) KernelHeap::Free(p.buf);
+                    p.buf = nb;
+                    p.cap = ncap;
+                }
+                for (int k = 0; k < n; k++) p.buf[p.len + k] = tmp[k];
+                p.len += (uint32_t)n;
+                continue;
+            }
+            if (n == -11) break;             // EAGAIN: owner still writing (satoru)
+            done = true;                     // EOF (0) or error
+        }
+        if (!done && now > p.deadline) done = true;
+        if (done) clip_finish_pull(p);
+    }
+}
+
+void clip_queue_write(int dest_sd, uint8_t* data, uint32_t len) {
+    if (dest_sd < 0) { if (data) KernelHeap::Free(data); return; }
+    if (!data || len == 0) {
+        if (data) KernelHeap::Free(data);
+        UnixSocket::Close(dest_sd);
+        return;
+    }
+    for (int i = 0; i < CLIP_MAX_WRITES; i++) {
+        ClipWrite& w = g_writes[i];
+        if (w.used) continue;
+        w.used = true;
+        w.sd = dest_sd;
+        w.data = data;
+        w.len = len;
+        w.off = 0;
+        w.deadline = Timer::GetRealMs() + CLIP_WRITE_MS;
+        return;
+    }
+    KernelHeap::Free(data);
+    UnixSocket::Close(dest_sd);
+}
+
+void clip_pump_writes() {
+    uint32_t now = Timer::GetRealMs();
+    for (int i = 0; i < CLIP_MAX_WRITES; i++) {
+        ClipWrite& w = g_writes[i];
+        if (!w.used) continue;
+        bool done = false;
+        for (int guard = 0; guard < 8 && !done; guard++) {
+            int n = UnixSocket::Send(w.sd, w.data + w.off, (int)(w.len - w.off), 0);
+            if (n > 0) {
+                w.off += (uint32_t)n;
+                if (w.off >= w.len) done = true;
+                continue;
+            }
+            if (n == -11) break;             // ring full: next frame (satoru)
+            done = true;                     // EPIPE / closed
+        }
+        if (!done && now > w.deadline) done = true;
+        if (done) {
+            UnixSocket::Close(w.sd);
+            KernelHeap::Free(w.data);
+            w.data = nullptr;
+            w.used = false;
+        }
+    }
+}
+
+void clip_mimes_from_system(bool primary, ClipMimeList& out) {
+    clip_mimes_clear(out);
+    if (primary) {
+        if (ClipboardManager::HasPrimaryText()) clip_mimes_add(out, "text/plain;charset=utf-8");
+        return;
+    }
+    if (ClipboardManager::HasText()) clip_mimes_add(out, "text/plain;charset=utf-8");
+    uint32_t n = 0;
+    if (ClipboardManager::GetData("text/html", &n) && n) clip_mimes_add(out, "text/html");
+    if (ClipboardManager::GetData("image/png", &n) && n) clip_mimes_add(out, "image/png");
+}
+
+void clip_send_device_selection(Client* c, bool primary, uint32_t offer_id) {
+    uint8_t pl[4];
+    put32(pl, offer_id);
+    if (primary) {
+        for (int i = 0; i < c->primary_device_count; i++)
+            send_event(c, c->primary_device_ids[i], 1, pl, 4);   // selection
+    } else {
+        for (int i = 0; i < c->data_device_count; i++)
+            send_event(c, c->data_device_ids[i], 5, pl, 4);      // selection
+    }
+}
+
+void clip_broadcast_locked(bool primary) {
+    ClipSelection& sel = clip_sel(primary);
+    for (int ci = 0; ci < WL_MAX_CLIENTS; ci++) {
+        Client* c = &g_clients[ci];
+        if (!c->in_use) continue;
+        uint32_t old = primary ? c->primary_offer_id : c->clip_offer_id;
+        if (old) {
+            clip_remove_offer(c->sd, old);
+            destroy_obj(c, old);
+            if (primary) c->primary_offer_id = 0; else c->clip_offer_id = 0;
+        }
+        if (!sel.active) {
+            clip_send_device_selection(c, primary, 0);
+            tx_flush(c);
+            continue;
+        }
+        // the owner already knows what it copied; it gets no offer. (satoru)
+        if (!sel.system && sel.sd == c->sd) continue;
+        int dev_count = primary ? c->primary_device_count : c->data_device_count;
+        if (dev_count <= 0) continue;
+        uint32_t dev = primary ? c->primary_device_ids[0] : c->data_device_ids[0];
+        uint32_t oid = 0xFF000000u | (c->clip_server_id_next++ & 0x00FFFFFFu);
+        uint16_t iface = primary ? ZWP_PRIMARY_OFFER : WL_DATA_OFFER;
+        if (!register_obj(c, oid, iface, 3)) continue;
+        ClipOfferInfo* oi = nullptr;
+        for (int i = 0; i < CLIP_MAX_OFFERS; i++) {
+            if (!g_coffers[i].used) { oi = &g_coffers[i]; break; }
+        }
+        if (!oi) { destroy_obj(c, oid); continue; }
+        oi->used = true;
+        oi->sd = c->sd;
+        oi->id = oid;
+        oi->primary = primary;
+        oi->serial = sel.serial;
+        oi->mimes = sel.mimes;
+        if (primary) c->primary_offer_id = oid; else c->clip_offer_id = oid;
+
+        uint8_t ev[128];
+        put32(ev, oid);
+        send_event(c, dev, 0, ev, 4);           // data_offer
+        for (int i = 0; i < sel.mimes.count; i++) {
+            int p = 0;
+            put_wl_string(ev, &p, sel.mimes.name[i]);
+            send_event(c, oid, 0, ev, (uint16_t)p);   // offer(mime)
+        }
+        clip_send_device_selection(c, primary, oid);
+        tx_flush(c);
+    }
+}
+
+void clip_promote_system_locked(bool primary) {
+    ClipSelection& sel = clip_sel(primary);
+    clip_cancel_pulls(primary, 0);
+    ClipboardManager::CommitReplace(primary, false);
+    ClipMimeList mimes;
+    clip_mimes_from_system(primary, mimes);
+    sel.active = mimes.count > 0;
+    sel.system = true;
+    sel.sd = 0;
+    sel.source_id = 0;
+    sel.source_iface = 0;
+    sel.serial = ++clip_serial(primary);
+    sel.mimes = mimes;
+    clip_broadcast_locked(primary);
+}
+
+// ask the owner for one mime over a fresh socketpair; the other end rides
+// wl_data_source.send so the owner's write lands back in the pull buffer. (satoru)
+bool clip_start_pull_locked(bool primary, const char* mime) {
+    ClipSelection& sel = clip_sel(primary);
+    int slot = -1;
+    for (int i = 0; i < CLIP_MAX_PULLS; i++) if (!g_pulls[i].used) { slot = i; break; }
+    if (slot < 0) return false;
+    int ra = -1, wb = -1;
+    if (UnixSocket::Pair(UnixSocket::UNIX_SOCK_STREAM, &ra, &wb) < 0) return false;
+
+    uint8_t ev[128];
+    put32(ev, sel.source_id);
+    uint16_t op = primary ? 0 : 1;              // primary source send / data source send
+    put16(ev + 4, op);
+    int p = 8;
+    put_wl_string(ev, &p, mime);
+    put16(ev + 6, (uint16_t)p);
+
+    UnixSocket::ControlMsg cm = {};
+    cm.passed_fd_count = 1;
+    cm.passed_fds[0] = -1;
+    cm.passed_is_socket[0] = true;
+    cm.passed_sd[0] = wb;
+    UnixSocket::Retain(wb);   // the ref that rides the SCM_RIGHTS message (satoru)
+    int r = UnixSocket::KernelInjectMsg(sel.sd, ev, (uint16_t)p, &cm);
+    // the pair's own ref is the kernel's, not the client's: drop it now that
+    // the message carries the retained one. on failure nothing was delivered,
+    // so drop the in-flight ref as well. leaking it held the socket slot open
+    // forever, one per clipboard pull. (satoru)
+    UnixSocket::Close(wb);
+    if (r <= 0) {
+        UnixSocket::Close(wb);
+        UnixSocket::Close(ra);
+        return false;
+    }
+    ClipPull& pull = g_pulls[slot];
+    pull.used = true;
+    pull.owner_sd = sel.sd;
+    pull.source_id = sel.source_id;
+    pull.source_iface = sel.source_iface;
+    pull.primary = primary;
+    pull.serial = sel.serial;
+    int mn = 0;
+    while (mime[mn] && mn < CLIP_MIME_NAME - 1) { pull.mime[mn] = mime[mn]; mn++; }
+    pull.mime[mn] = 0;
+    pull.read_sd = ra;
+    pull.buf = nullptr;
+    pull.len = pull.cap = 0;
+    pull.deadline = Timer::GetRealMs() + CLIP_PULL_MS;
+    SerialLogger::Log("[clip] pull start src="); SerialLogger::LogDec((int)sel.source_id);
+    SerialLogger::Log(" mime="); SerialLogger::Log(mime);
+    SerialLogger::Log("\r\n");
+    return true;
+}
+
+// pick at most one text spelling plus html and png. (satoru)
+int clip_pick_mimes(const ClipMimeList& in, char out[3][CLIP_MIME_NAME]) {
+    int n = 0;
+    const char* text = nullptr;
+    bool html = false, png = false;
+    for (int i = 0; i < in.count; i++) {
+        const char* m = in.name[i];
+        if (clip_is_text_mime(m)) {
+            if (!text || cstr_eq(m, "text/plain;charset=utf-8")) text = m;
+        } else if (cstr_eq(m, "text/html")) html = true;
+        else if (cstr_eq(m, "image/png")) png = true;
+    }
+    if (text) {
+        int k = 0; while (text[k] && k < CLIP_MIME_NAME - 1) { out[n][k] = text[k]; k++; }
+        out[n][k] = 0; n++;
+    }
+    if (html) { const char* m = "text/html"; int k = 0; while (m[k]) { out[n][k] = m[k]; k++; } out[n][k] = 0; n++; }
+    if (png)  { const char* m = "image/png"; int k = 0; while (m[k]) { out[n][k] = m[k]; k++; } out[n][k] = 0; n++; }
+    return n;
+}
+
+void clip_set_selection_locked(Client* c, bool primary, uint32_t source_id) {
+    ClipSelection& sel = clip_sel(primary);
+    uint32_t& serial = clip_serial(primary);
+    ClipSourceInfo* src = source_id ? clip_find_source(c->sd, source_id) : nullptr;
+    if (source_id && (!src || src->primary != primary)) return;
+
+    // the old owner is cancelled; it may still hold a source object. (satoru)
+    if (sel.active && !sel.system && (sel.sd != c->sd || sel.source_id != source_id)) {
+        Client* oc = client_for_sd(sel.sd);
+        if (oc) {
+            uint16_t op = primary ? 1 : 2;       // primary source cancelled / data source cancelled
+            send_event(oc, sel.source_id, op, nullptr, 0);
+            tx_flush(oc);
+        }
+    }
+    clip_cancel_pulls(primary, 0);
+    ClipboardManager::BeginReplace(primary);
+
+    serial++;
+    sel.serial = serial;
+    sel.sd = c->sd;
+    sel.source_id = source_id;
+    sel.source_iface = src ? src->iface : 0;
+    sel.system = false;
+    sel.active = source_id != 0;
+    clip_mimes_clear(sel.mimes);
+    if (src) sel.mimes = src->mimes;
+
+    char picked[3][CLIP_MIME_NAME];
+    int np = sel.active ? clip_pick_mimes(sel.mimes, picked) : 0;
+    int idx = clip_sel_index(primary);
+    g_pulls_left[idx] = np;
+    for (int i = 0; i < np; i++) {
+        if (!clip_start_pull_locked(primary, picked[i])) g_pulls_left[idx]--;
+    }
+    SerialLogger::Log("[clip] selection sd="); SerialLogger::LogDec(c->sd);
+    SerialLogger::Log(" src="); SerialLogger::LogDec((int)source_id);
+    SerialLogger::Log(" mimes="); SerialLogger::LogDec(sel.mimes.count);
+    SerialLogger::Log(" primary="); SerialLogger::LogDec(primary ? 1 : 0);
+    SerialLogger::Log("\r\n");
+    if (g_pulls_left[idx] <= 0) ClipboardManager::CommitReplace(primary, false);
+    clip_broadcast_locked(primary);
+}
+
+void clip_offer_receive(Client* c, uint32_t offer_id, const uint8_t* args, int args_len, bool primary) {
+    char mime[CLIP_MIME_NAME];
+    mime[0] = 0;
+    if (args_len >= 4) {
+        uint32_t sl = get32(args);
+        if (sl > 0 && sl <= (uint32_t)args_len - 4 && sl < CLIP_MIME_NAME) {
+            uint32_t n = sl - 1;
+            for (uint32_t i = 0; i < n; i++) mime[i] = (char)args[4 + i];
+            mime[n] = 0;
+        }
+    }
+    UnixSocket::ControlMsg cm = {};
+    bool got = UnixSocket::TakePendingControl(c->sd, &cm);
+
+    uint8_t* data = nullptr;
+    uint32_t len = 0;
+    {
+        SpinLockGuard g(g_clip_lock);
+        ClipOfferInfo* oi = clip_find_offer(c->sd, offer_id);
+        ClipSelection& sel = clip_sel(primary);
+        if (oi && oi->primary == primary && sel.active && oi->serial == sel.serial && mime[0])
+            ClipboardManager::CopyData(mime, &data, &len);
+        SerialLogger::Log("[clip] recv offer="); SerialLogger::LogDec((int)offer_id);
+        SerialLogger::Log(" mime="); SerialLogger::Log(mime);
+        SerialLogger::Log(" len="); SerialLogger::LogDec((int)len);
+        SerialLogger::Log("\r\n");
+    }
+
+    if (!got || cm.passed_fd_count <= 0) {
+        if (data) KernelHeap::Free(data);
+        return;
+    }
+    if (cm.passed_shm_base[0]) {
+        uint8_t* base = (uint8_t*)(uintptr_t)cm.passed_shm_base[0];
+        uint32_t cap = (uint32_t)cm.passed_shm_size[0];
+        uint32_t n = (data && len < cap) ? len : (data ? cap : 0);
+        for (uint32_t i = 0; i < n; i++) base[i] = data[i];
+        if (data) KernelHeap::Free(data);
+        return;
+    }
+    if (cm.passed_is_socket[0]) {
+        int dest = cm.passed_sd[0];
+        UnixSocket::Retain(dest);   // the sender's in-flight ref is dropped when sendmsg returns (satoru)
+        SpinLockGuard g(g_clip_lock);
+        clip_queue_write(dest, data, len);
+        return;
+    }
+    if (data) KernelHeap::Free(data);
+}
+
+void clip_client_dropped(int sd) {
+    SpinLockGuard g(g_clip_lock);
+    for (int i = 0; i < CLIP_MAX_PULLS; i++)
+        if (g_pulls[i].used && g_pulls[i].owner_sd == sd) clip_free_pull(g_pulls[i]);
+    for (int i = 0; i < CLIP_MAX_SOURCES; i++)
+        if (g_csources[i].used && g_csources[i].sd == sd) g_csources[i].used = false;
+    for (int i = 0; i < CLIP_MAX_OFFERS; i++)
+        if (g_coffers[i].used && g_coffers[i].sd == sd) g_coffers[i].used = false;
+    // the copy survives its owner: the eager pull left a snapshot in the
+    // system clipboard, so promote it instead of clearing. (satoru)
+    if (g_csel.active && !g_csel.system && g_csel.sd == sd) clip_promote_system_locked(false);
+    if (g_psel.active && !g_psel.system && g_psel.sd == sd) clip_promote_system_locked(true);
+}
+
+void clip_pump_all() {
+    SpinLockGuard g(g_clip_lock);
+    clip_pump_pulls();
+    clip_pump_writes();
+}
+
 void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     const uint8_t* args, int args_len) {
     if (c->fatal) return;
     Object* obj = find_obj(c, object_id);
     if (!obj) {
-        send_display_error(c, object_id, 0, "invalid object");
+        // no delete_id exists here, and the server can drop an object before the client
+        // sees it (cascades, window close), so a late request is a race, not a client bug.
+        // a protocol error makes firefox crash on purpose: log and ignore instead. (satoru)
+        static int s_bad_obj_logs = 0;
+        if (s_bad_obj_logs < 16) {
+            s_bad_obj_logs++;
+            SerialLogger::Log("[wl] ignored request on unknown object ");
+            SerialLogger::LogDec((int)object_id);
+            SerialLogger::Log(" op ");
+            SerialLogger::LogDec((int)opcode);
+            SerialLogger::Log("\r\n");
+        }
         return;
+    }
+    if (g_wltrace) {   // kurono.wltrace=1: silent ring, dumped later (satoru)
+        wlt_note(0, c->sd, object_id, obj->iface, opcode,
+                 args_len >= 4 ? get32(args) : 0, args_len >= 8 ? get32(args + 4) : 0);
     }
     switch (obj->iface) {
         case WL_DISPLAY: {
@@ -1535,6 +2740,13 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 uint32_t new_id  = get32(args);
                 uint32_t surf_id = get32(args + 4);
                 uint32_t parent  = get32(args + 8);
+                // both must be live wl_surfaces and different; no self-parent. (satoru)
+                {
+                    Object* s0 = find_obj(c, surf_id);
+                    Object* p0 = find_obj(c, parent);
+                    if (!s0 || !p0 || s0->iface != WL_SURFACE || p0->iface != WL_SURFACE ||
+                        surf_id == parent) return;
+                }
                 if (!register_obj(c, new_id, WL_SUBSURFACE, obj->version)) return;
                 Object* so = find_obj(c, new_id);
                 if (so) {
@@ -1558,8 +2770,8 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
             if (opcode == 1 && args_len >= 8) {
                 Object* ss = find_obj(c, object_id);
                 if (ss) {
-                    ss->subsurface_x = (int32_t)get32(args);
-                    ss->subsurface_y = (int32_t)get32(args + 4);
+                    ss->subsurface_x = wl_clamp((int32_t)get32(args), -WL_MAX_EDGE, WL_MAX_EDGE);
+                    ss->subsurface_y = wl_clamp((int32_t)get32(args + 4), -WL_MAX_EDGE, WL_MAX_EDGE);
                 }
             }
             break;
@@ -1583,8 +2795,10 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     for (int i = 0; i < cm.passed_fd_count; i++) {
                         if (!cm.passed_shm_base[i]) continue;
                         po->pool_base = (const uint8_t*)(uintptr_t)cm.passed_shm_base[i];
-                        uint32_t msz = (uint32_t)cm.passed_shm_size[i];
+                        uint64_t msz64 = (uint64_t)cm.passed_shm_size[i];
+                        uint32_t msz = msz64 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)msz64;
                         po->pool_size = (size && size <= msz) ? size : msz;
+                        po->pool_map_size = msz;   // the real backing (satoru)
                         break;
                     }
                 }
@@ -1605,6 +2819,16 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 uint32_t format = get32(args + 20);
                 if (bw < 0 || bh < 0) return;
                 if (bw > 16384 || bh > 16384) return;   // sanity bound
+                // a shadow per buffer size is kernel heap: cap the pixel count,
+                // and reject a stride shorter than a row or a buffer that ends
+                // past the pool's real backing (64-bit math). (satoru)
+                if ((uint64_t)bw * (uint64_t)bh > WL_MAX_BUF_PX) return;
+                if (stride != 0 && (uint64_t)stride < (uint64_t)bw * 4u) return;
+                {
+                    uint64_t st  = stride ? stride : (uint64_t)bw * 4u;
+                    uint64_t end = (uint64_t)offset + st * (uint64_t)bh;
+                    if (obj->pool_base && end > obj->pool_map_size) return;
+                }
                 if (!register_obj(c, bid, WL_BUFFER, 1)) return;
                 Object* bo = find_obj(c, bid);
                 if (bo) {
@@ -1619,8 +2843,11 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 destroy_obj(c, object_id);
             } else if (opcode == 2) {             // resize
                 // resize(size): grow the pool hint. (satoru)
+                // never past the mapped backing: pool_base was bound at create
+                // and does not grow, and every bounds check reads pool_size. (satoru)
                 if (args_len >= 4) {
                     uint32_t nsize = get32(args);
+                    if (obj->pool_base && nsize > obj->pool_map_size) nsize = obj->pool_map_size;
                     if (nsize > obj->pool_size) obj->pool_size = nsize;
                 }
             }
@@ -1628,6 +2855,166 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
         }
         case WL_BUFFER: {
             if (opcode == 0) {                    // destroy
+                // no surface may keep naming a dead buffer: libwayland reuses the
+                // id for the next new object. (satoru)
+                for (int i = 0; i < c->object_high; i++) {
+                    Object& so = c->objects[i];
+                    if (so.in_use && so.iface == WL_SURFACE && so.pending_buffer_id == object_id) {
+                        so.pending_buffer_id = 0;
+                        so.attach_pending = false;
+                    }
+                }
+                destroy_obj(c, object_id);
+            }
+            break;
+        }
+        case WL_DATA_DEVICE_MGR: {
+            if (opcode == 0) {                    // create_data_source(new_id)
+                if (args_len < 4) return;
+                uint32_t sid = get32(args);
+                if (!register_obj(c, sid, WL_DATA_SOURCE, obj->version)) return;
+                ClipSourceInfo* si = nullptr;
+                for (int i = 0; i < CLIP_MAX_SOURCES; i++)
+                    if (!g_csources[i].used) { si = &g_csources[i]; break; }
+                if (!si) { destroy_obj(c, sid); return; }
+                si->used = true; si->sd = c->sd; si->id = sid;
+                si->iface = WL_DATA_SOURCE; si->primary = false;
+                clip_mimes_clear(si->mimes);
+            } else if (opcode == 1) {             // get_data_device(new_id, seat)
+                if (args_len < 8) return;
+                uint32_t did = get32(args);
+                if (!register_obj(c, did, WL_DATA_DEVICE, obj->version)) return;
+                if (c->data_device_count < Client::WL_MAX_DATA_DEV)
+                    c->data_device_ids[c->data_device_count++] = did;
+                SpinLockGuard g(g_clip_lock);
+                clip_broadcast_locked(false);   // a new device learns the current selection (satoru)
+            }
+            break;
+        }
+        case WL_DATA_DEVICE: {
+            if (opcode == 0) {                    // start_drag: no dnd in this compositor
+                break;
+            } else if (opcode == 1) {             // set_selection(source, serial)
+                if (args_len < 8) return;
+                uint32_t sid = get32(args);
+                SerialLogger::Log("[clip] set_selection src="); SerialLogger::LogDec((int)sid);
+                SerialLogger::Log(" sd="); SerialLogger::LogDec(c->sd); SerialLogger::Log("\r\n");
+                SpinLockGuard g(g_clip_lock);
+                clip_set_selection_locked(c, false, sid);
+            } else if (opcode == 2) {             // release
+                int w = 0;
+                for (int i = 0; i < c->data_device_count; i++)
+                    if (c->data_device_ids[i] != object_id) c->data_device_ids[w++] = c->data_device_ids[i];
+                c->data_device_count = w;
+                destroy_obj(c, object_id);
+            }
+            break;
+        }
+        case WL_DATA_SOURCE: {
+            if (opcode == 0 && args_len >= 4) {   // offer(mime)
+                uint32_t sl = get32(args);
+                if (sl == 0 || sl > (uint32_t)args_len - 4) return;
+                char mime[CLIP_MIME_NAME];
+                uint32_t n = sl - 1;
+                if (n >= CLIP_MIME_NAME) n = CLIP_MIME_NAME - 1;
+                for (uint32_t i = 0; i < n; i++) mime[i] = (char)args[4 + i];
+                mime[n] = 0;
+                SpinLockGuard g(g_clip_lock);
+                ClipSourceInfo* si = clip_find_source(c->sd, object_id);
+                if (si) clip_mimes_add(si->mimes, mime);
+            } else if (opcode == 1) {             // destroy
+                SpinLockGuard g(g_clip_lock);
+                ClipSelection& sel = g_csel;
+                if (sel.active && !sel.system && sel.sd == c->sd && sel.source_id == object_id)
+                    clip_set_selection_locked(c, false, 0);
+                clip_remove_source(c->sd, object_id);
+                destroy_obj(c, object_id);
+            } else if (opcode == 2 && args_len >= 4) {   // set_actions
+                // drag actions only; no-op for selections. (satoru)
+            }
+            break;
+        }
+        case WL_DATA_OFFER: {
+            if (opcode == 1) {                    // receive(mime, fd)
+                clip_offer_receive(c, object_id, args, args_len, false);
+            } else if (opcode == 2) {             // destroy
+                SpinLockGuard g(g_clip_lock);
+                clip_remove_offer(c->sd, object_id);
+                if (c->clip_offer_id == object_id) c->clip_offer_id = 0;
+                destroy_obj(c, object_id);
+            }
+            // accept=0, finish=3, set_actions=4: dnd only. (satoru)
+            break;
+        }
+        case ZWP_PRIMARY_MGR: {
+            if (opcode == 0) {                    // create_source(new_id)
+                if (args_len < 4) return;
+                uint32_t sid = get32(args);
+                if (!register_obj(c, sid, ZWP_PRIMARY_SOURCE, obj->version)) return;
+                ClipSourceInfo* si = nullptr;
+                for (int i = 0; i < CLIP_MAX_SOURCES; i++)
+                    if (!g_csources[i].used) { si = &g_csources[i]; break; }
+                if (!si) { destroy_obj(c, sid); return; }
+                si->used = true; si->sd = c->sd; si->id = sid;
+                si->iface = ZWP_PRIMARY_SOURCE; si->primary = true;
+                clip_mimes_clear(si->mimes);
+            } else if (opcode == 1) {             // get_device(new_id, seat)
+                if (args_len < 8) return;
+                uint32_t did = get32(args);
+                if (!register_obj(c, did, ZWP_PRIMARY_DEVICE, obj->version)) return;
+                if (c->primary_device_count < Client::WL_MAX_DATA_DEV)
+                    c->primary_device_ids[c->primary_device_count++] = did;
+                SpinLockGuard g(g_clip_lock);
+                clip_broadcast_locked(true);
+            } else if (opcode == 2) {             // destroy
+                destroy_obj(c, object_id);
+            }
+            break;
+        }
+        case ZWP_PRIMARY_DEVICE: {
+            if (opcode == 0) {                    // set_selection(source, serial)
+                if (args_len < 8) return;
+                uint32_t sid = get32(args);
+                SpinLockGuard g(g_clip_lock);
+                clip_set_selection_locked(c, true, sid);
+            } else if (opcode == 1) {             // destroy
+                int w = 0;
+                for (int i = 0; i < c->primary_device_count; i++)
+                    if (c->primary_device_ids[i] != object_id) c->primary_device_ids[w++] = c->primary_device_ids[i];
+                c->primary_device_count = w;
+                destroy_obj(c, object_id);
+            }
+            break;
+        }
+        case ZWP_PRIMARY_SOURCE: {
+            if (opcode == 0 && args_len >= 4) {   // offer(mime)
+                uint32_t sl = get32(args);
+                if (sl == 0 || sl > (uint32_t)args_len - 4) return;
+                char mime[CLIP_MIME_NAME];
+                uint32_t n = sl - 1;
+                if (n >= CLIP_MIME_NAME) n = CLIP_MIME_NAME - 1;
+                for (uint32_t i = 0; i < n; i++) mime[i] = (char)args[4 + i];
+                mime[n] = 0;
+                SpinLockGuard g(g_clip_lock);
+                ClipSourceInfo* si = clip_find_source(c->sd, object_id);
+                if (si) clip_mimes_add(si->mimes, mime);
+            } else if (opcode == 1) {             // destroy
+                SpinLockGuard g(g_clip_lock);
+                ClipSelection& sel = g_psel;
+                if (sel.active && !sel.system && sel.sd == c->sd && sel.source_id == object_id)
+                    clip_set_selection_locked(c, true, 0);
+                clip_remove_source(c->sd, object_id);
+                destroy_obj(c, object_id);
+            }
+            break;
+        }
+        case ZWP_PRIMARY_OFFER: {
+            if (opcode == 0) {                    // receive(mime, fd)
+                clip_offer_receive(c, object_id, args, args_len, true);
+            } else if (opcode == 1) {             // destroy
+                SpinLockGuard g(g_clip_lock);
+                clip_remove_offer(c->sd, object_id);
+                if (c->primary_offer_id == object_id) c->primary_offer_id = 0;
                 destroy_obj(c, object_id);
             }
             break;
@@ -1643,8 +3030,58 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 register_obj(c, xs, XDG_SURFACE, obj->version);
                 Object* o = find_obj(c, xs);
                 if (o) o->parent_surface_id = surf;
+            } else if (opcode == 1) {             // create_positioner(new_id)
+                if (args_len < 4) return;
+                register_obj(c, get32(args), XDG_POSITIONER, obj->version);
             } else if (opcode == 3) {             // pong
                 // no-op
+            }
+            break;
+        }
+        case XDG_POSITIONER: {
+            // placement rules only; read at get_popup / reposition time. (satoru)
+            if (opcode == 0) { destroy_obj(c, object_id); break; }
+            if (opcode == 1 && args_len >= 8) {            // set_size(w, h)
+                obj->pos_w = wl_clamp((int32_t)get32(args), 1, WL_MAX_EDGE);
+                obj->pos_h = wl_clamp((int32_t)get32(args + 4), 1, WL_MAX_EDGE);
+            } else if (opcode == 2 && args_len >= 16) {    // set_anchor_rect(x, y, w, h)
+                obj->pos_ax = wl_clamp((int32_t)get32(args), -WL_MAX_EDGE, WL_MAX_EDGE);
+                obj->pos_ay = wl_clamp((int32_t)get32(args + 4), -WL_MAX_EDGE, WL_MAX_EDGE);
+                obj->pos_aw = wl_clamp((int32_t)get32(args + 8), 0, WL_MAX_EDGE);
+                obj->pos_ah = wl_clamp((int32_t)get32(args + 12), 0, WL_MAX_EDGE);
+            } else if (opcode == 3 && args_len >= 4) {     // set_anchor
+                obj->pos_anchor = get32(args);
+            } else if (opcode == 4 && args_len >= 4) {     // set_gravity
+                obj->pos_gravity = get32(args);
+            } else if (opcode == 5 && args_len >= 4) {     // set_constraint_adjustment
+                obj->pos_cadj = get32(args);
+            } else if (opcode == 6 && args_len >= 8) {     // set_offset(x, y)
+                obj->pos_ox = wl_clamp((int32_t)get32(args), -WL_MAX_EDGE, WL_MAX_EDGE);
+                obj->pos_oy = wl_clamp((int32_t)get32(args + 4), -WL_MAX_EDGE, WL_MAX_EDGE);
+            }
+            // 7 set_reactive, 8 set_parent_size, 9 set_parent_configure: no-ops. (satoru)
+            break;
+        }
+        case XDG_POPUP: {
+            Object* psurf = find_obj(c, obj->parent_surface_id);
+            if (opcode == 0) {                    // destroy: unmap the popup (satoru)
+                if (psurf && psurf->iface == WL_SURFACE && psurf->popup_obj == object_id) {
+                    mark_tree_root_dirty(c, psurf);
+                    psurf->popup_obj = 0;
+                    psurf->popup_grab = false;
+                }
+                destroy_obj(c, object_id);
+            } else if (opcode == 1) {             // grab(seat, serial)
+                if (psurf && psurf->iface == WL_SURFACE) psurf->popup_grab = true;
+            } else if (opcode == 2 && args_len >= 8) {   // reposition(positioner, token)
+                Object* pos = find_obj(c, get32(args));
+                Object* par = psurf ? find_obj(c, psurf->popup_parent_sid) : nullptr;
+                if (pos && pos->iface == XDG_POSITIONER && psurf && par && par->iface == WL_SURFACE) {
+                    mark_tree_root_dirty(c, psurf);
+                    popup_place(c, psurf, pos, par);
+                    popup_send_configure(c, obj, psurf, true, get32(args + 4));
+                    mark_tree_root_dirty(c, psurf);
+                }
             }
             break;
         }
@@ -1658,7 +3095,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 SerialLogger::Log("[wl] get_toplevel sd="); SerialLogger::LogDec(c->sd);
                 SerialLogger::Log("\r\n");
                 Object* tl = find_obj(c, tid);
-                if (tl) tl->parent_surface_id = obj->parent_surface_id;
+                if (tl) { tl->parent_surface_id = obj->parent_surface_id; tl->popup_xs = object_id; }
                 // xdg_toplevel::configure (opcode 0): width, height, states.
                 // advertise XDG_TOPLEVEL_STATE_ACTIVATED (4) so firefox treats the
                 // window as FOCUSED/ACTIVE. without it the top-level CONTENT
@@ -1683,6 +3120,35 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 // xdg_surface::configure (opcode 0): serial.
                 uint8_t srl[4]; put32(srl, c->serial_next++);
                 send_event(c, object_id, 0, srl, 4);
+            } else if (opcode == 2) {             // get_popup(new_id, parent xdg_surface, positioner)
+                // menus and dropdowns. the popup is composited onto the window of
+                // the tree it belongs to (see surface_tree_root), placed by the
+                // positioner and constrained to that window. (satoru)
+                if (args_len < 12) return;
+                uint32_t pid = get32(args);
+                Object* pxs  = find_obj(c, get32(args + 4));
+                Object* pos  = find_obj(c, get32(args + 8));
+                Object* surf = find_obj(c, obj->parent_surface_id);
+                if (!register_obj(c, pid, XDG_POPUP, obj->version)) return;
+                Object* po = find_obj(c, pid);
+                if (!po || !surf || surf->iface != WL_SURFACE) return;
+                po->parent_surface_id = surf->id;
+                po->popup_xs = object_id;
+                Object* par = (pxs && pxs->iface == XDG_SURFACE) ? find_obj(c, pxs->parent_surface_id) : nullptr;
+                if (!par || par->iface != WL_SURFACE || par == surf) {
+                    // no parent (allowed by the protocol only with another
+                    // role mechanism): tell the client it is dismissed. (satoru)
+                    send_event(c, pid, 1, nullptr, 0);
+                    return;
+                }
+                static uint32_t s_popup_seq = 0;
+                surf->popup_obj = pid;
+                surf->popup_parent_sid = par->id;
+                surf->popup_seq = ++s_popup_seq;
+                surf->popup_grab = false;
+                if (pos && pos->iface == XDG_POSITIONER) popup_place(c, surf, pos, par);
+                else { surf->popup_x = 0; surf->popup_y = 0; surf->popup_w = 1; surf->popup_h = 1; }
+                popup_send_configure(c, po, surf, false, 0);
             } else if (opcode == 3) {             // set_window_geometry(x,y,w,h)
                 // the visible window rect inside the surface, excluding csd
                 // shadow margins - store on the surface so blits crop to it
@@ -1690,12 +3156,12 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 if (args_len < 16) return;
                 Object* gsurf = find_obj(c, obj->parent_surface_id);
                 if (gsurf && gsurf->iface == WL_SURFACE) {
-                    gsurf->geo_x = (int32_t)get32(args);
-                    gsurf->geo_y = (int32_t)get32(args + 4);
-                    gsurf->geo_w = (int32_t)get32(args + 8);
-                    gsurf->geo_h = (int32_t)get32(args + 12);
-                    if (gsurf->geo_w < 0) gsurf->geo_w = 0;
-                    if (gsurf->geo_h < 0) gsurf->geo_h = 0;
+                    // clamped: geo_w/h size the wm window and geo_x/y feed
+                    // signed blit coordinates. (satoru)
+                    gsurf->geo_x = wl_clamp((int32_t)get32(args), 0, WL_MAX_EDGE);
+                    gsurf->geo_y = wl_clamp((int32_t)get32(args + 4), 0, WL_MAX_EDGE);
+                    gsurf->geo_w = wl_clamp((int32_t)get32(args + 8), 0, WL_MAX_EDGE);
+                    gsurf->geo_h = wl_clamp((int32_t)get32(args + 12), 0, WL_MAX_EDGE);
                 }
             } else if (opcode == 4) {             // ack_configure
                 // no-op
@@ -1705,6 +3171,33 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
         case XDG_TOPLEVEL: {
             if (opcode == 0) {                    // destroy
                 destroy_obj(c, object_id);
+            } else if (opcode == 1 || opcode == 7) {   // set_parent(parent) / set_max_size(w, h)
+                // a dialog (set_parent) or a window that caps its own size is
+                // sized by the client: re-configure it 0x0 before it maps, instead
+                // of the 1024x768 every toplevel gets (a gtk "save changes?" dialog
+                // was handed 1024x768 and never showed). (satoru)
+                Object* ts = find_obj(c, obj->parent_surface_id);
+                if (!ts || ts->iface != WL_SURFACE) break;
+                bool own_size = false;
+                if (opcode == 1 && args_len >= 4) {
+                    Object* ptl = find_obj(c, get32(args));
+                    Object* psurf = (ptl && ptl->iface == XDG_TOPLEVEL) ? find_obj(c, ptl->parent_surface_id) : nullptr;
+                    ts->tl_parent_sid = (psurf && psurf != ts) ? psurf->id : 0;
+                    own_size = ts->tl_parent_sid != 0;
+                } else if (opcode == 7 && args_len >= 8) {
+                    int32_t mw = (int32_t)get32(args), mh = (int32_t)get32(args + 4);
+                    own_size = (mw > 0 && mw < 1024) || (mh > 0 && mh < 768);
+                }
+                if (own_size && !ts->wm_window) {
+                    uint8_t cfg[16];
+                    put32(cfg + 0, 0); put32(cfg + 4, 0);
+                    put32(cfg + 8, 4); put32(cfg + 12, 4);   // states: ACTIVATED
+                    send_event(c, object_id, 0, cfg, 16);
+                    if (obj->popup_xs && find_obj(c, obj->popup_xs)) {
+                        uint8_t srl[4]; put32(srl, c->serial_next++);
+                        send_event(c, obj->popup_xs, 0, srl, 4);
+                    }
+                }
             } else if (opcode == 2 || opcode == 3) {  // set_title / set_app_id
                 // wire string arg: uint32 length (includes the nul) then the
                 // bytes, padded to 4. route to the toplevel's parent surface,
@@ -1734,6 +3227,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     obj->attach_x = (int32_t)get32(args + 4);
                     obj->attach_y = (int32_t)get32(args + 8);
                     obj->pending_buffer_id = bufid;
+                    obj->attach_pending = true;
                     break;
                 }
                 case 2: {                          // damage(x, y, w, h)
@@ -1749,6 +3243,9 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     if (args_len < 4) return;
                     uint32_t cb = get32(args);
                     if (!register_obj(c, cb, WL_CALLBACK, 1)) return;
+                    // remember which surface asked: the callback belongs to that
+                    // surface's next commit (wayland spec), see deliver_surface_frame. (satoru)
+                    if (Object* cbo = find_obj(c, cb)) cbo->parent_surface_id = object_id;
                     obj->pending_frame_cb = cb;
                     push_frame_cb(c, cb);
                     break;
@@ -1810,6 +3307,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 if (c->keyboard_id_count < Client::WL_MAX_INPUT_RES)
                     c->keyboard_ids[c->keyboard_id_count++] = kid;
                 if (c->keyboard_id == 0) c->keyboard_id = kid;
+                bool kb_enter_after = (c->keyboard_focus_sid != 0);   // focus came first (satoru)
                 // wl_keyboard.keymap (opcode 0): format=1 (XKB_V1) + an fd +
                 // size. gdk/firefox mmap the fd and compile the keymap to
                 // translate the evdev codes wl_keyboard.key carries - without
@@ -1842,6 +3340,8 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     put32(ri + 4, 400);           // 400 ms delay
                     send_event(c, kid, 5, ri, 8); // wl_keyboard.repeat_info=5
                 }
+                if (kb_enter_after && find_obj(c, c->keyboard_focus_sid))
+                    keyboard_enter(c, kid, c->keyboard_focus_sid);   // (satoru)
             } else if (opcode == 2) {             // get_touch(new_id)
                 if (args_len < 4) return;
                 uint32_t tid = get32(args);
@@ -1876,7 +3376,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
 void on_data(int sd, const uint8_t* data, int len, void* user) {
     (void)user;
     if (len <= 0) return;
-    g_now_ms = Time::GetTicks();
+    g_now_ms = Timer::GetRealMs();   // one clock for every frame-callback path (satoru)
     Client* c = client_for_sd(sd);
     if (!c) return;
 
@@ -1966,6 +3466,9 @@ void Init() {
     }
     UnixSocket::Listen(g_listen_sd, 16);
     UnixSocket::RegisterServer(g_listen_sd, on_connect, on_data, nullptr);
+    ClipboardManager::SetChangeHook([](bool primary) {
+        WaylandServer::NotifySystemClipboardChanged(primary);
+    });
 
     KVFS::WriteString("/system/run/user/1000/wayland-0.info",
         "kurono wayland compositor v1\n"
@@ -1982,7 +3485,10 @@ int  ListenSd() { return g_listen_sd; }
 // land closest to vsync, which is what GTK/Qt clients use to throttle
 // their next frame.
 void DispatchPendingFrames() {
-    g_now_ms = Time::GetTicks();
+    // same clock as the commit-time delivery: Time::GetTicks() is not ms since
+    // boot, so callbacks fired here carried a wildly different timestamp. (satoru)
+    g_now_ms = Timer::GetRealMs();
+    clip_pump_all();   // drain selection pulls / pending offer writes (satoru)
     uint8_t pl[4];
     put32(pl, g_now_ms);                         // monotonic ms timestamp
     for (int i = 0; i < WL_MAX_CLIENTS; i++) {
@@ -1994,16 +3500,31 @@ void DispatchPendingFrames() {
             c->in_use = false; c->sd = -1; c->tx_len = 0;
             continue;
         }
-        while (c->frame_cb_tail != c->frame_cb_head) {
-            uint32_t cb = c->frame_cb[c->frame_cb_tail];
-            c->frame_cb_tail = (c->frame_cb_tail + 1) % WL_MAX_FRAME_CB;
-            if (cb == 0) continue;
-            // The callback may have been destroyed via parent surface
-            // destruction since it was queued.
-            Object* o = find_obj(c, cb);
-            if (!o) continue;
-            send_event(c, cb, 0, pl, 4);
-            destroy_obj(c, cb);
+        // a frame callback fires after its surface's commit (delivered there,
+        // in order). what is still queued belongs to a surface that has not
+        // committed since asking, so it stays queued (spec: it must not fire
+        // yet). only drop dead entries. callbacks with no recorded surface keep
+        // the old behaviour. (satoru)
+        {
+            SpinLockGuard g(g_fcb_lock);   // (satoru)
+            uint32_t keep[WL_MAX_FRAME_CB]; int nk = 0;
+            while (c->frame_cb_tail != c->frame_cb_head) {
+                uint32_t cb = c->frame_cb[c->frame_cb_tail];
+                c->frame_cb_tail = (c->frame_cb_tail + 1) % WL_MAX_FRAME_CB;
+                if (cb == 0) continue;
+                Object* o = find_obj(c, cb);
+                if (!o || o->iface != WL_CALLBACK) continue;
+                Object* so = o->parent_surface_id ? find_obj(c, o->parent_surface_id) : nullptr;
+                if (so && so->iface == WL_SURFACE) { if (nk < WL_MAX_FRAME_CB - 1) keep[nk++] = cb; continue; }
+                if (o->parent_surface_id) continue;   // its surface is gone: never fires (satoru)
+                send_event(c, cb, 0, pl, 4);
+                destroy_obj(c, cb);
+            }
+            // re-queue in order (lock already held; nk < ring size). (satoru)
+            for (int k = 0; k < nk; k++) {
+                c->frame_cb[c->frame_cb_head] = keep[k];
+                c->frame_cb_head = (c->frame_cb_head + 1) % WL_MAX_FRAME_CB;
+            }
         }
         // Clear pending_frame_cb refs that pointed into the drained ring.
         for (int j = 0; j < c->object_high; j++) {
@@ -2017,6 +3538,44 @@ void DispatchPendingFrames() {
         tx_flush(c);
         if (c->fatal) drop_client(c);
     }
+}
+
+void NotifySystemClipboardChanged(bool primary) {
+    SpinLockGuard g(g_clip_lock);
+    SerialLogger::Log("[clip] system changed primary="); SerialLogger::LogDec(primary ? 1 : 0);
+    SerialLogger::Log("\r\n");
+    ClipSelection& sel = clip_sel(primary);
+    if (sel.active && !sel.system) {
+        Client* oc = client_for_sd(sel.sd);
+        if (oc) {
+            uint16_t op = primary ? 1 : 2;
+            send_event(oc, sel.source_id, op, nullptr, 0);
+            tx_flush(oc);
+        }
+    }
+    clip_cancel_pulls(primary, 0);
+    ClipMimeList mimes;
+    clip_mimes_from_system(primary, mimes);
+    sel.active = mimes.count > 0;
+    sel.system = true;
+    sel.sd = 0;
+    sel.source_id = 0;
+    sel.source_iface = 0;
+    sel.serial = ++clip_serial(primary);
+    sel.mimes = mimes;
+    clip_broadcast_locked(primary);
+}
+
+bool ClipboardGetForOffer(int sd, uint32_t offer_id, const char* mime,
+                          uint8_t** out, uint32_t* out_len) {
+    if (out) *out = nullptr;
+    if (out_len) *out_len = 0;
+    SpinLockGuard g(g_clip_lock);
+    ClipOfferInfo* oi = clip_find_offer(sd, offer_id);
+    if (!oi || !mime) return false;
+    ClipSelection& sel = clip_sel(oi->primary);
+    if (!sel.active || oi->serial != sel.serial) return false;
+    return ClipboardManager::CopyData(mime, out, out_len);
 }
 
 void DamageAll() {
@@ -2119,6 +3678,31 @@ void ForwardPointerButton(int gx, int gy, int evdev_button, bool pressed) {
     Client* fc = nullptr;
     int lx, ly;
     Object* surf = input_target_at(&fc, gx, gy, lx, ly);
+    // a press outside a client with a grabbing popup (another app or the
+    // desktop) dismisses its popups, newest first, like any wayland
+    // compositor; presses inside the same client are left to the client,
+    // which rolls its own menus up. (satoru)
+    if (pressed) {
+        for (int ci = 0; ci < WL_MAX_CLIENTS; ci++) {
+            Client* c = &g_clients[ci];
+            if (!c->in_use || c == fc) continue;
+            bool sent = false;
+            for (int guard = 0; guard < 16; guard++) {
+                Object* top = nullptr;
+                for (int i = 0; i < c->object_high; i++) {
+                    Object& p = c->objects[i];
+                    if (!p.in_use || p.iface != WL_SURFACE || !p.popup_grab) continue;
+                    if (!popup_live(c, &p)) { p.popup_grab = false; continue; }
+                    if (!top || p.popup_seq > top->popup_seq) top = &p;
+                }
+                if (!top) break;
+                top->popup_grab = false;
+                send_event(c, top->popup_obj, 1, nullptr, 0);   // xdg_popup.popup_done
+                sent = true;
+            }
+            if (sent) { tx_flush(c); if (c->fatal) drop_client(c); }
+        }
+    }
     if (!surf || !fc || fc->pointer_id_count == 0) return;
     uint32_t time = Timer::GetRealMs();
     g_now_ms = time;
@@ -2137,22 +3721,13 @@ void ForwardPointerButton(int gx, int gy, int evdev_button, bool pressed) {
     // a press also moves keyboard focus to this surface's client, mirroring
     // click-to-focus. emit keyboard leave/enter as focus moves. (satoru)
     if (pressed) {
-        for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-            Client* c = &g_clients[i];
-            if (!c->in_use || c->keyboard_id_count == 0) continue;
-            if (c == fc) continue;
-            if (c->keyboard_focus_sid != 0) {
-                if (find_obj(c, c->keyboard_focus_sid))
-                    kbds_leave(c, c->keyboard_focus_sid);
-                c->keyboard_focus_sid = 0;
-                tx_flush(c);
-                if (c->fatal) drop_client(c);
-            }
-        }
-        if (fc->keyboard_id_count != 0 && fc->keyboard_focus_sid != surf->id) {
-            fc->keyboard_focus_sid = surf->id;
-            kbds_enter(fc, surf->id);
-        }
+        // focus goes to the clicked surface's TOPLEVEL (see set_keyboard_focus);
+        // a click in a subsurface, tooltip or popup of the focused window
+        // therefore changes nothing - firefox drives its menus from the
+        // window's own key events. (satoru)
+        int pox = 0, poy = 0; bool in_popup = false;
+        Object* froot = surface_tree_root(fc, surf, pox, poy, in_popup);
+        if (froot) set_keyboard_focus(fc, froot->id);
     }
     tx_flush(fc);
     if (fc->fatal) drop_client(fc);
@@ -2186,9 +3761,65 @@ void ForwardPointerAxis(int gx, int gy, int axis, int value) {
     if (fc->fatal) drop_client(fc);
 }
 
+bool RequestClose(int win_id) {
+    int sd; uint32_t sid;
+    if (!winmap_get(win_id, sd, sid)) return false;
+    Client* c = client_for_sd(sd);
+    if (!c) return false;
+    Object* s = find_obj(c, sid);
+    if (!s || s->iface != WL_SURFACE || (int)(intptr_t)s->wm_window != win_id) return false;
+    uint32_t now = Timer::GetRealMs();
+    if (s->tl_close_ms && now - s->tl_close_ms < 5000) return false;   // asked already: force (satoru)
+    for (int i = 0; i < c->object_high; i++) {
+        Object& t = c->objects[i];
+        if (!t.in_use || t.iface != XDG_TOPLEVEL || t.parent_surface_id != sid) continue;
+        send_event(c, t.id, 1, nullptr, 0);   // xdg_toplevel.close (satoru)
+        SerialLogger::Log("[wl] close requested, window "); SerialLogger::LogDec(win_id);
+        SerialLogger::Log("\r\n");
+        tx_flush(c);
+        s->tl_close_ms = now ? now : 1;
+        return true;
+    }
+    return false;
+}
+
+void NotifyWmFocus(int win_id) {
+    int sd; uint32_t sid;
+    // a native window: nothing to do - keys only reach ForwardKey while a
+    // wayland window has the wm focus. (satoru)
+    if (!winmap_get(win_id, sd, sid)) return;
+    Client* c = client_for_sd(sd);
+    if (!c) return;
+    Object* s = find_obj(c, sid);
+    // the surface must still own this window: a dead client's sd can be reused
+    // by a new connection with an unrelated surface under the same id. (satoru)
+    if (!s || s->iface != WL_SURFACE || (int)(intptr_t)s->wm_window != win_id) return;
+    set_keyboard_focus(c, sid);
+    tx_flush(c);   // a fatal flush is dropped by the dispatch loop (satoru)
+}
+
 bool IsWaylandWindow(int win_id) {
     int sd; uint32_t sid;
     return winmap_get(win_id, sd, sid);
+}
+
+// one connection by its server-side sd: the vm bridge's guest clients all
+// share the vm host's pid, so they close one by one when a guest app goes. (satoru)
+int DropClientOfSd(int sd) {
+    if (sd < 0) return 0;
+    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
+        Client* c = &g_clients[i];
+        if (!c->in_use || c->sd != sd) continue;
+        int high = c->object_high;
+        for (int j = 0; j < high; j++) {
+            Object& o = c->objects[j];
+            if (o.in_use && o.iface == WL_SURFACE && o.wm_window)
+                destroy_obj(c, o.id);
+        }
+        drop_client(c);
+        return 1;
+    }
+    return 0;
 }
 
 int DropClientsOfPid(uint32_t pid) {
@@ -2234,4 +3865,32 @@ void ForwardKey(int key, bool pressed, uint32_t mods) {
     }
 }
 
+void DumpProtocolTrace() {   // (satoru)
+    static bool s_done = false;
+    if (s_done) return;
+    s_done = true;
+    for (int i = 0; i < WL_MAX_CLIENTS; i++) {   // unread bytes on each client socket (satoru)
+        Client* c = &g_clients[i];
+        if (!c->in_use) continue;
+        SerialLogger::Log("[wlpend] sd="); SerialLogger::LogDec(c->sd);
+        SerialLogger::Log(" client_unread="); SerialLogger::LogDec(UnixSocket::PeerPendingBytes(c->sd));
+        SerialLogger::Log(" server_unread="); SerialLogger::LogDec(UnixSocket::PendingBytes(c->sd));
+        SerialLogger::Log(" tx_len="); SerialLogger::LogDec(c->tx_len);
+        SerialLogger::Log("\r\n");
+    }
+    UnixSocket::DumpPending();
+    uint32_t n = g_wlt_n;
+    for (uint32_t i = 0; i < n; i++) {
+        const WltEnt* e = &g_wlt[i];
+        SerialLogger::Log(e->dir ? "[wle] t=" : "[wlr] t="); SerialLogger::LogDec((int)e->ms);
+        SerialLogger::Log(" sd="); SerialLogger::LogDec((int)e->sd);
+        SerialLogger::Log(" id="); SerialLogger::LogDec((int)e->id);
+        SerialLogger::Log(" if="); SerialLogger::LogDec(e->iface == 0xFFFF ? -1 : (int)e->iface);
+        SerialLogger::Log(" op="); SerialLogger::LogDec((int)e->op);
+        SerialLogger::Log(" a0="); SerialLogger::LogDec((int)e->a0);
+        SerialLogger::Log(" a1="); SerialLogger::LogDec((int)e->a1);
+        SerialLogger::Log("\r\n");
+    }
+    g_wlt_n = WLT_SLOTS;   // dump once (satoru)
+}
 }  // namespace WaylandServer

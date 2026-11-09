@@ -1,4 +1,5 @@
 #include "runtime_layout.h"
+#include "../kernel/memacct.h"   // real meminfo (satoru)
 #include "../fs/kvfs.h"
 #include "../drivers/serial.h"
 #include "../kernel/buddy.h"
@@ -290,21 +291,11 @@ void Init() {
        "procs_running 1\n"
        "procs_blocked 0\n"
        "softirq 0\n");
-    wr("/system/proc/meminfo",
-       "MemTotal:        2097152 kB\n"
-       "MemFree:         1572864 kB\n"
-       "MemAvailable:    1835008 kB\n"
-       "Buffers:           65536 kB\n"
-       "Cached:           131072 kB\n"
-       "SwapTotal:             0 kB\n"
-       "SwapFree:              0 kB\n"
-       "AnonPages:        262144 kB\n"
-       "Shmem:             16384 kB\n"
-       "Slab:              32768 kB\n"
-       "PageTables:         8192 kB\n"
-       "VmallocTotal:   34359738367 kB\n"
-       "VmallocUsed:       16384 kB\n"
-       "Hugepagesize:       2048 kB\n");
+    {   // boot-time snapshot of the real pmm numbers; the linux abi regenerates /proc/meminfo live on every read (this was a fixed 2 gb literal). (satoru)
+        static char mi[512];
+        MemAcct::FormatMeminfo(mi, (int)sizeof(mi));
+        wr("/system/proc/meminfo", mi);
+    }
     wr("/system/proc/cpuinfo",
        "processor\t: 0\n"
        "vendor_id\t: GenuineIntel\n"

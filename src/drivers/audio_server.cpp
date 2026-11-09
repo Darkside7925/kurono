@@ -102,6 +102,11 @@ bool UseBackend(const char* name) {
     return true;
 }
 const char* ActiveBackendName() { return g_active ? g_active->Name() : "(none)"; }
+int BackendCount() { return g_backend_count; }
+AudioBackend* BackendAt(int index) {
+    if (index < 0 || index >= g_backend_count) return nullptr;
+    return g_backends[index];
+}
 
 void Init() {
     // Allocator and mixer first.  Both are idempotent.
@@ -363,6 +368,10 @@ void CloseStream(AudioMixer::StreamID id) {
 void DrainStream(AudioMixer::StreamID id) {
     SpinLockCpuGuard guard(g_pump_lock);
     AudioMixer::Drain(id);
+}
+int ReleaseStreamsOf(uint32_t pid) {
+    SpinLockCpuGuard guard(g_pump_lock);
+    return AudioMixer::CloseOwnedBy(pid);
 }
 
 ServerStatus GetStatus() {

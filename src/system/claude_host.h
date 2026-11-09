@@ -7,13 +7,18 @@
 // NOT embedded in the kernel image (grub load time scales with image size).
 // instead it lives as a root file named CLAUDE on the fat32 partition labelled
 // KURONO. EnsureLoaded() streams it read-only into physical memory at first use
-// and exposes it in the vfs as /usr/bin/claude, borrowed (no heap copy).
+// and exposes it in the vfs as /system/bin/claude (guest /usr/bin/claude), borrowed (no heap copy).
 // nothing here ever writes to the disk. (satoru)
 namespace ClaudeHost {
-    // load CLAUDE from the KURONO partition if /usr/bin/claude is not present
-    // yet. returns true when /usr/bin/claude is ready. msg gets a one line
+    // load CLAUDE from the KURONO partition if /system/bin/claude is not present
+    // yet. returns true when /system/bin/claude is ready. msg gets a one line
     // reason on failure (never a crash on a missing or damaged file). (satoru)
     bool EnsureLoaded(char* msg, int msgmax);
+
+    // `kpkg install claude` hands over the verified image it just registered at
+    // /system/bin/claude so EnsureLoaded treats it as loaded. buf is a pmm
+    // block that stays allocated for the boot; nullptr forgets it. (satoru)
+    void AdoptImage(uint8_t* buf, uint64_t len);
 
     // run claude to completion with the given argument line (argv[0] is added).
     // env_extra is an optional space separated list of NAME=value pairs that

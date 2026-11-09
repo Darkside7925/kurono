@@ -896,7 +896,7 @@ int VirtualDevices::GetPendingIRQ() {
             if (slave_irq >= 0) {
                 slave_pic.AcknowledgeIRQ(slave_irq);
                 master_pic.AcknowledgeIRQ(2);
-                return 8 + slave_irq; // slave irq 0-7 → system irq 8-15
+                return slave_pic.vector_base + slave_irq; // icw2 base of the slave, not 8 (satoru)
             }
         }
         master_pic.AcknowledgeIRQ(pic_irq);

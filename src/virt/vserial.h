@@ -139,6 +139,7 @@ public:
     uint8_t  ReadPort(uint16_t port);
 
     void     InjectRxByte(uint8_t byte);
+    int      RxSpace() const { return UART_FIFO_SIZE - rx_fifo.Count(); }
     void     InjectRxString(const char* str);
 
     int      ReadOutput(char* buf, int max_len);

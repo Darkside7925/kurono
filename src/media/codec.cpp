@@ -1,7 +1,11 @@
 #include "codec.h"
 #include "mp3_decoder.h"
 #include "../kernel/heap.h"
+// the alpine vm probe is kernel only; ring 3 uses the decoders built in. (satoru)
+#ifndef KUI_BACKEND_WAYLAND
 #include "../virt/hypervisor.h"
+#include "../virt/vm_host.h"   // the background alpine vm (satoru)
+#endif
 
 //  kurono os - unified codec registry implementation
 //  wav, mp3, aac, flac decoders + mp4 container + h.264 nal parser
@@ -90,16 +94,20 @@ void CodecRegistry::Init() {
 
     // if alpine vm is booted and has ffmpeg, enable hevc/vp9/av1 decode,
     // ogg/opus decode, mkv/webm containers, and video encoding via hw accel.
-    if (Hypervisor::IsAlpineBooted()) {
+    // runs only when the background alpine vm is already up (its agent answers);
+    // nothing starts a vm from here (satoru)
+#ifndef KUI_BACKEND_WAYLAND
+    if (VMHost::AgentReady()) {
         // probe for ffmpeg in alpine
         char probe[256];
-        int n = Hypervisor::AlpineExec("which ffmpeg 2>/dev/null && echo OK", probe, 255);
-        bool has_ffmpeg = (n > 0 && probe[0] != 0);
+        int rc = -1;
+        int n = VMHost::Exec("which ffmpeg 2>/dev/null && echo OK", probe, (int)sizeof(probe), 10000, &rc);
+        bool has_ffmpeg = (n > 0 && rc == 0);
         if (!has_ffmpeg) {
             // try installing ffmpeg
-            Hypervisor::AlpineExec("apk add --no-cache ffmpeg 2>/dev/null", probe, 255);
-            n = Hypervisor::AlpineExec("which ffmpeg 2>/dev/null && echo OK", probe, 255);
-            has_ffmpeg = (n > 0 && probe[0] != 0);
+            VMHost::Exec("apk add --no-cache ffmpeg 2>/dev/null", probe, (int)sizeof(probe), 600000);
+            n = VMHost::Exec("which ffmpeg 2>/dev/null && echo OK", probe, (int)sizeof(probe), 10000, &rc);
+            has_ffmpeg = (n > 0 && rc == 0);
         }
 
         if (has_ffmpeg) {
@@ -128,6 +136,7 @@ void CodecRegistry::Init() {
             }
         }
     }
+#endif
 }
 
 //  codec detection - magic bytes

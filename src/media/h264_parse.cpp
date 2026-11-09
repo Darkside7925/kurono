@@ -11,7 +11,7 @@
 //
 // freestanding, integer-only.
 #include "h264_parse.h"
-#include "../kernel/heap.h"
+#include "mplat.h"
 
 namespace H264 {
 
@@ -22,7 +22,7 @@ namespace H264 {
 // so the same length is a safe upper bound.
 // ----------------------------------------------------------------------
 static uint8_t* StripEPB(const uint8_t* ebsp, uint32_t in_len, uint32_t* out_len) {
-    uint8_t* out = (uint8_t*)KernelHeap::Alloc(in_len ? in_len : 1);
+    uint8_t* out = (uint8_t*)MPlat::Alloc(in_len ? in_len : 1);
     if (!out) { *out_len = 0; return nullptr; }
     uint32_t j = 0;
     for (uint32_t i = 0; i < in_len; ) {
@@ -122,7 +122,7 @@ uint32_t WalkAnnexB(const uint8_t* data, uint32_t size,
         bool keep_going = true;
         if (rbsp) {
             keep_going = cb(type, rbsp, rbsp_len, user);
-            KernelHeap::Free(rbsp);
+            MPlat::Free(rbsp);
         }
         emitted++;
         if (!keep_going) return emitted;
@@ -156,7 +156,7 @@ uint32_t WalkLengthPrefixed(const uint8_t* data, uint32_t size,
         bool keep_going = true;
         if (rbsp) {
             keep_going = cb(type, rbsp, rbsp_len, user);
-            KernelHeap::Free(rbsp);
+            MPlat::Free(rbsp);
         }
         emitted++;
         if (!keep_going) return emitted;
@@ -294,7 +294,7 @@ bool ParseAvcC(const uint8_t* avcC, uint32_t avcC_len,
                         info.fps_den = 2u * info.sps.num_units_in_tick;
                     }
                 }
-                KernelHeap::Free(rbsp);
+                MPlat::Free(rbsp);
             }
         }
         i += sps_len;

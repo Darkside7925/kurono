@@ -259,7 +259,10 @@ static void ld_render_surface(Window* win, int cx, int cy, int cw, int ch) {
         const uint32_t* src_row = (const uint32_t*)(g_linux_display.pixels + src_y * g_linux_display.pitch);
         for (int x = 0; x < draw_w; x++) {
             uint32_t src_x = (uint32_t)(((uint64_t)x * g_linux_display.width) / (uint32_t)draw_w);
-            Graphics::DrawPixel(draw_x + x, draw_y + y, src_row[src_x]);
+            // virtio-gpu scanouts are x8r8g8b8: the x byte is 0, which
+            // DrawPixel treated as fully transparent, so the guest frame never
+            // showed. force it opaque (satoru)
+            Graphics::DrawPixel(draw_x + x, draw_y + y, src_row[src_x] | 0xFF000000u);
         }
     }
 }

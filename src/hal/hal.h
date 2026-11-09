@@ -88,3 +88,13 @@ private:
     static void InitIDT();
     static void InitPIC();
 };
+
+// per-cpu scheduler accounting: busy and total milliseconds, split by the
+// ring the timer interrupted. read by /proc/stat and /proc/<pid>/stat. (satoru)
+extern volatile uint64_t g_cpu_busy_ticks[16];
+extern volatile uint64_t g_cpu_total_ms[16];
+extern volatile uint64_t g_cpu_user_ms[16];
+extern volatile uint64_t g_cpu_sys_ms[16];
+uint64_t hal_pid_busy_ms(uint32_t pid);
+void     hal_pid_cpu_ms(uint32_t pid, uint64_t* user_ms, uint64_t* sys_ms, uint64_t* total_ms);
+// end (satoru)

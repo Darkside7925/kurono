@@ -75,6 +75,12 @@ fi
 # driver sources we build
 mkdir -p "$DST/drivers/net/ethernet/intel"
 cp -r drivers/net/ethernet/intel/e1000e "$DST/drivers/net/ethernet/intel/" 2>/dev/null || true
+# imported upstream cores the families link in unmodified (kld/Makefile
+# CORES_<driver>). (satoru)
+for f in lib/dynamic_queue_limits.c; do
+  mkdir -p "$DST/$(dirname "$f")"
+  cp "$f" "$DST/$f"
+done
 cp COPYING Makefile "$DST/" 2>/dev/null || true
 
 echo "[fetch] vendored size: $(du -sh "$DST" | awk '{print $1}')"

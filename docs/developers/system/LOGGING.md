@@ -32,7 +32,7 @@ through KVFS. The API is the `RuntimeLog` namespace:
 | `LogSystem(component, msg)` | `system.log` | general system events |
 | `MirrorSerial` | `serial.log` | mirror of the serial console, deferred |
 | `LogNetwork(event, detail)` | `network.log` | TCP connect, disconnect, RST, errors |
-| `LogSecurity(event, detail)` | `security.log` | SUPR escalations, KSA prompts, grants, denials |
+| `LogSecurity(event, detail)` | `security.log` | KEN escalations, KSA prompts, grants, denials |
 | `LogCrash(summary, detail)` | `crash/<n>.log` | kernel panics and minidumps |
 | `LogAppEvent` | `apps/<app>` | per-app logs |
 | `LogProcessEvent` | `processes/<name>` | per-kernel-process logs |
@@ -60,7 +60,7 @@ deferral.
 
 - network: `src/net/tcpip.cpp` calls `LogNetwork` when a TCP connection reaches ESTABLISHED,
   and when it sees a RST
-- security: `SUPR::Log` mirrors every privilege decision into `LogSecurity`, with the
+- security: `KEN::Log` mirrors every privilege decision into `LogSecurity`, with the
   requesting username
 - crash: the panic and crash-recovery path writes a `LogCrash` record and drops an
   `emergency.txt` under `KP_LOG_DIR`
@@ -76,4 +76,4 @@ the user-data subtrees get mirrored to disk.
 
 - `src/system/kpaths.h` the path layout, authoritative
 - `src/system/logging.cpp` / `.h` the implementation
-- `src/net/tcpip.cpp`, `src/security/supr.cpp`, `src/kernel/kurono_kernel.cpp` the log producers
+- `src/net/tcpip.cpp`, `src/security/ken.cpp`, `src/kernel/kurono_kernel.cpp` the log producers

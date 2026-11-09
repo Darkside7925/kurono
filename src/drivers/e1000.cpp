@@ -4,6 +4,7 @@
 #include "e1000.h"
 #include "serial.h"
 #include "igc.h"   // fallback backend: i225/i226/82576 behind the same E1000:: api (satoru)
+#include "../kernel/kld_broker.h"   // kld backend: eth0 served by a linux driver container (satoru)
 #include "../kernel/heap.h"
 
 // static member definitions
@@ -31,6 +32,9 @@ static const uint16_t E1000_MAX_TX_FRAME = 1518;
 // true when no e1000 exists but an igc/igb nic is bound; every public E1000::
 // call then forwards to Igc so tcpip/network keep one nic api. (satoru)
 static bool g_use_igc = false;
+// true when kurono.kld=1 hands eth0 to the KLD container (an unmodified linux
+// driver in ring 3). the native driver then never touches the nic. (satoru)
+static bool g_use_kld = false;
 
 static inline void outl(uint16_t port, uint32_t val) {
     __asm__ __volatile__("outl %0, %1" : : "a"(val), "Nd"(port));
@@ -252,6 +256,14 @@ bool E1000::Init() {
     packet_handler = nullptr;
 
     g_use_igc = false;
+    g_use_kld = false;
+    if (KldNet::Wanted()) {
+        // do not scan, reset or program anything: the device belongs to the
+        // container. link stays down until its driver reports carrier. (satoru)
+        g_use_kld = true;
+        SerialLogger::Log("[E1000] eth0 deferred to the KLD linux driver container (native driver not bound)\r\n");
+        return true;
+    }
     SerialLogger::Log("[E1000] Scanning PCI bus...\r\n");
     if (!ScanPCI()) {
         SerialLogger::Log("[E1000] No E1000 NIC found\r\n");
@@ -309,15 +321,57 @@ bool E1000::Init() {
     return true;
 }
 
-bool E1000::IsDetected() { return g_use_igc ? Igc::IsDetected() : detected; }
+// quiesce by clearing `detected` (Poll and Send both bail on it), let any cpu
+// already inside the data path drain, then redo the hardware bring-up from Init
+// without the pci scan so mmio_base, the handler and the counters survive.
+// nothing here touches the eeprom or flash. (satoru)
+bool E1000::Restart() {
+    if (g_use_kld) return false;
+    if (g_use_igc) return Igc::Restart();
+    if (mmio_base == 0) return false;
+    SerialLogger::Log("[E1000] restart: quiescing\r\n");
+    detected = false;
+    for (volatile int i = 0; i < 3000000; i++) {}
+    WriteReg(E1000_CTRL, E1000_CTRL_RST);
+    for (volatile int i = 0; i < 100000; i++) {}
+    ReadReg(E1000_STATUS);
+    for (int i = 0; i < 128; i++) WriteReg(E1000_MTA + i * 4, 0);
+    ReadMAC();
+    uint32_t ral = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+                   ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+    uint32_t rah = (uint32_t)mac[4] | ((uint32_t)mac[5] << 8) | (1u << 31);
+    WriteReg(E1000_RAL, ral);
+    WriteReg(E1000_RAH, rah);
+    LinkUp();
+    InitRX();
+    InitTX();
+    EnableInterrupts();
+    detected = true;
+    SerialLogger::Log("[E1000] restart: done\r\n");
+    return true;
+}
+
+bool E1000::Stop() {
+    if (g_use_kld || g_use_igc || !detected) return false;
+    SerialLogger::Log("[E1000] stop: receiver and transmitter off\r\n");
+    detected = false;
+    for (volatile int i = 0; i < 3000000; i++) {}
+    WriteReg(E1000_RCTL, 0);
+    WriteReg(E1000_TCTL, 0);
+    return true;
+}
+
+bool E1000::IsDetected() { if (g_use_kld) return true; return g_use_igc ? Igc::IsDetected() : detected; }
 
 bool E1000::IsLinkUp() {
+    if (g_use_kld) return KldNet::LinkUp();
     if (g_use_igc) return Igc::IsLinkUp();
     if (!detected) return false;
     return (ReadReg(E1000_STATUS) & (1 << 1)) != 0;
 }
 
 void E1000::GetMAC(uint8_t out[6]) {
+    if (g_use_kld) { KldNet::GetMAC(out); return; }
     if (g_use_igc) { Igc::GetMAC(out); return; }
     for (int i = 0; i < 6; i++) out[i] = mac[i];
 }
@@ -337,6 +391,7 @@ void E1000::ReclaimTx() {
 }
 
 bool E1000::Send(const uint8_t* data, uint16_t length) {
+    if (g_use_kld) return KldNet::Send(data, length);
     if (g_use_igc) return Igc::Send(data, length);
     if (!detected || !data || length == 0 || length > E1000_MAX_TX_FRAME) {
         SerialLogger::Log("[E1000:TX] reject: bad params or no NIC\r\n");
@@ -421,6 +476,7 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
 }
 
 void E1000::Poll() {
+    if (g_use_kld) { KldNet::Poll(); return; }
     if (g_use_igc) { Igc::Poll(); return; }
     if (!detected) return;
 
@@ -491,12 +547,13 @@ void E1000::Poll() {
 }
 
 void E1000::SetPacketHandler(E1000_PacketHandler handler) {
+    KldNet::SetPacketHandler(handler);   // (satoru)
     Igc::SetPacketHandler(handler);   // same signature; harmless when igc is unused (satoru)
     packet_handler = handler;
 }
 
-uint32_t E1000::GetTxCount() { return g_use_igc ? Igc::GetTxCount() : tx_count; }
-uint32_t E1000::GetRxCount() { return g_use_igc ? Igc::GetRxCount() : rx_count; }
-uint32_t E1000::GetTxBytes() { return g_use_igc ? Igc::GetTxBytes() : tx_bytes; }
-uint32_t E1000::GetRxBytes() { return g_use_igc ? Igc::GetRxBytes() : rx_bytes; }
-uint32_t E1000::GetRxMissed() { return g_use_igc ? Igc::GetRxMissed() : rx_missed; }
+uint32_t E1000::GetTxCount() { if (g_use_kld) return KldNet::TxCount(); return g_use_igc ? Igc::GetTxCount() : tx_count; }
+uint32_t E1000::GetRxCount() { if (g_use_kld) return KldNet::RxCount(); return g_use_igc ? Igc::GetRxCount() : rx_count; }
+uint32_t E1000::GetTxBytes() { if (g_use_kld) return KldNet::TxBytes(); return g_use_igc ? Igc::GetTxBytes() : tx_bytes; }
+uint32_t E1000::GetRxBytes() { if (g_use_kld) return KldNet::RxBytes(); return g_use_igc ? Igc::GetRxBytes() : rx_bytes; }
+uint32_t E1000::GetRxMissed() { if (g_use_kld) return KldNet::RxDrops(); return g_use_igc ? Igc::GetRxMissed() : rx_missed; }

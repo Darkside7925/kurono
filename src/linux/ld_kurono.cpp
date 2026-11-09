@@ -13,6 +13,7 @@
 #include "../kernel/pmm.h"
 #include "../kernel/vmm.h"
 #include "../proc/scheduler.h"
+#include "linux_syscall.h"     // census module map (satoru)
 #include "../drivers/serial.h"
 #include "../kernel/time.h"
 extern bool g_fftrace;   // linux_syscall.cpp (satoru)
@@ -234,9 +235,13 @@ struct Lib {
 
     // Pointers into the kernel-side scratch image (we keep the original
     // file in heap memory for the lifetime of the lib; cheap because
-    // libraries are <16 MB each).
+    // libraries are <16 MB each). image_owned is false when the image is a
+    // persistent vfs blob borrowed for the process lifetime (claude's 300 mb
+    // static binary): release must not free it, and relocations must not
+    // write through it because every exec of that path shares the bytes.
     uint8_t*  image;
     uint64_t  image_size;
+    bool      image_owned;
     Phdr*     phdrs;
 
     // Dynamic info (kernel pointers into the in-image .dynamic).
@@ -386,7 +391,30 @@ ProcLinkerState* find_pls_by_proc(Process* p) {
         if (g_procs[i].in_use && g_procs[i].proc == p) return &g_procs[i];
     return nullptr;
 }
+// free one linker-state slot and every library it loaded. the slot table and the
+// global lib table were never released, so after 64 dynamic execs every later
+// exec failed ("ld-kurono failed to load dynamic image", exit 127) and each lib
+// kept its kernel-heap image copy forever. (satoru)
+void release_pls(ProcLinkerState* pls) {
+    if (!pls || !pls->in_use) return;
+    for (int i = 0; i < pls->lib_count && i < LdKurono::LDK_MAX_LIBS_PER_PROC; i++) {
+        int idx = pls->libs[i];
+        if (idx < 0 || idx >= LdKurono::LDK_MAX_LIBS_GLOBAL) continue;
+        Lib* l = &g_libs[idx];
+        if (!l->in_use) continue;
+        if (l->image && l->image_owned) KernelHeap::Free(l->image);
+        l->image = nullptr;
+        l->in_use = false;
+    }
+    pls->lib_count = 0;
+    pls->proc = nullptr;
+    pls->in_use = false;
+}
+
 ProcLinkerState* alloc_pls(Process* p) {
+    // an execve over an image that already had linker state replaces it (satoru)
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (g_procs[i].in_use && g_procs[i].proc == p) release_pls(&g_procs[i]);
     for (int i = 0; i < MAX_PROCS; i++)
         if (!g_procs[i].in_use) {
             g_procs[i] = ProcLinkerState{};
@@ -434,6 +462,7 @@ Lib* alloc_lib() {
         if (!g_libs[i].in_use) {
             g_libs[i] = Lib{};
             g_libs[i].in_use = true;
+            g_libs[i].image_owned = true;
             g_libs[i].refcount = 1;
             return &g_libs[i];
         }
@@ -754,6 +783,26 @@ bool map_user_page(Process* proc, uint64_t va, const uint8_t* src,
     return true;
 }
 
+// map one whole file-backed page of a borrowed image straight onto the image's
+// physical frame, read-only + COW. every exec of the same vfs blob (claude
+// re-exec'ing itself as its embedded ripgrep for each Glob/Grep) then shares the
+// text/rodata/bunfs pages instead of copying 300 mb per search. the frame is
+// retained per mapping; a write faults into handle_cow_fault and gets a private
+// copy, exactly like a MAP_PRIVATE file page on linux. (satoru)
+bool map_shared_image_page(Process* proc, uint64_t va, const uint8_t* src,
+                           uint64_t pte_flags) {
+    uint64_t va_src = (uint64_t)(uintptr_t)src;
+    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, va_src);
+    // only a page whose kernel va is the identity map of itself can be handed
+    // out this way (the pmm block and kernel image blobs are identity mapped).
+    if (!phys || phys != (va_src & ~(uint64_t)(PAGE_SIZE - 1))) return false;
+    uint64_t flags = (pte_flags & ~PTE_WRITABLE) | PTE_USER | PTE_COW;
+    if (!KernelVMM::MapPageInAddressSpace(proc->address_space, va, phys, flags))
+        return false;
+    PMM::RetainFrame(phys);
+    return true;
+}
+
 bool map_lib_segments(Process* proc, Lib* l, ProcLinkerState* pls) {
     for (int i = 0; i < l->phnum; i++) {
         const Phdr& p = l->phdrs[i];
@@ -779,11 +828,18 @@ bool map_lib_segments(Process* proc, Lib* l, ProcLinkerState* pls) {
                 copy_len    = hi - lo;
                 src         = l->image + p.p_offset + (lo - file_lo);
             }
+            // a full file-backed page of a borrowed image is shared COW with
+            // the persistent blob; partial pages and bss tails stay private. the
+            // flags passed are the segment's initial writable mapping, so strip
+            // WRITABLE and add COW for the shared case. (satoru)
+            uint64_t mapf = PTE_USER | PTE_WRITABLE | (flags & PTE_NX);
+            if (!l->image_owned && src && lo == page_lo && hi == page_hi &&
+                map_shared_image_page(proc, va, src, mapf)) {
+                continue;
+            }
             // Map all segments writable initially so reloc can patch
             // them; we re-protect after relocations (PT_GNU_RELRO).
-            if (!map_user_page(proc, va, src, copy_len, in_page_off,
-                               PTE_USER | PTE_WRITABLE |
-                               (flags & PTE_NX))) {
+            if (!map_user_page(proc, va, src, copy_len, in_page_off, mapf)) {
                 set_error(pls, "map_user_page failed");
                 return false;
             }
@@ -813,10 +869,42 @@ void apply_relro(Process* proc, Lib* l) {
 // pointer to the in-heap image we can write to it AND propagate to the
 // already-mapped user page (the page was copied from the image).
 // ============================================================
+// a relocation is about to patch a user page that may be a shared COW mapping of
+// the borrowed image. give it a private frame first so the shared blob (and any
+// concurrently running exec of it) is never modified. (satoru)
+void cow_user_image_page(Process* proc, Lib* l, uint64_t va) {
+    if (!l || l->image_owned) return;
+    uint64_t page = va & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, page);
+    if (!phys) return;
+    uint64_t img_lo = (uint64_t)(uintptr_t)l->image;
+    uint64_t img_hi = img_lo + l->image_size;
+    if (phys < img_lo || phys >= img_hi) return;         // already private
+    uint64_t flags = KernelVMM::QueryPageFlagsInAddressSpace(proc->address_space, page);
+    if (flags & PTE_WRITABLE) return;
+    void* pg = PMM::AllocBytes(PAGE_SIZE);
+    if (!pg) return;
+    memcpy(pg, (const void*)(uintptr_t)phys, PAGE_SIZE);
+    uint64_t nf = (flags | PTE_WRITABLE | PTE_USER) & ~PTE_COW;
+    if (!KernelVMM::MapPageInAddressSpace(proc->address_space, page,
+                                          (uint64_t)(uintptr_t)pg, nf)) {
+        PMM::FreeBytes(pg, PAGE_SIZE);
+        return;
+    }
+    if (Scheduler::GetCurrentProcess() == proc) KernelVMM::InvalidatePage(page);
+    PMM::FreeFrame(phys);        // drop this mapping's share reference (satoru)
+}
+
 void patch_image_u64(Process* proc, Lib* l, uint64_t va, uint64_t val) {
-    // 1. Patch the heap copy (so dlopen-after-fork sees the same data).
-    uint8_t* p = vaddr_to_image(l, va - l->load_base);
-    if (p) *(uint64_t*)p = val;
+    // 1. Patch the heap copy (so dlopen-after-fork sees the same data). a
+    // borrowed image is shared by every exec of the same vfs blob and must stay
+    // read-only; the live user page below is what the process actually runs. (satoru)
+    if (l->image_owned) {
+        uint8_t* p = vaddr_to_image(l, va - l->load_base);
+        if (p) *(uint64_t*)p = val;
+    } else {
+        cow_user_image_page(proc, l, va);
+    }
 
     // 2. Patch the user-mode page.
     uint64_t page = va & ~(uint64_t)(PAGE_SIZE - 1);
@@ -826,8 +914,12 @@ void patch_image_u64(Process* proc, Lib* l, uint64_t va, uint64_t val) {
     *(uint64_t*)(uintptr_t)(phys + (va & (PAGE_SIZE - 1))) = val;
 }
 void patch_image_u32(Process* proc, Lib* l, uint64_t va, uint32_t val) {
-    uint8_t* p = vaddr_to_image(l, va - l->load_base);
-    if (p) *(uint32_t*)p = val;
+    if (l->image_owned) {
+        uint8_t* p = vaddr_to_image(l, va - l->load_base);
+        if (p) *(uint32_t*)p = val;
+    } else {
+        cow_user_image_page(proc, l, va);
+    }
     uint64_t page = va & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t phys = KernelVMM::QueryMappingInAddressSpace(
         proc->address_space, page);
@@ -1855,7 +1947,8 @@ bool ExecPIE(Process* proc,
              const char* const* envp,
              uint32_t uid, uint32_t gid,
              uint64_t* out_entry,
-             uint64_t* out_rsp) {
+             uint64_t* out_rsp,
+             bool borrow_image) {
     ProcLinkerState* pls = alloc_pls(proc);
     if (!pls) return false;
     pls->secure = (uid == 0 || gid == 0) && (uid != 0 || gid != 0);
@@ -1908,21 +2001,35 @@ bool ExecPIE(Process* proc,
 
     // ---- Stash main image and load it as the first library --------
     constexpr uint32_t MAX = 32u * 1024u * 1024u;
-    uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)image_size);
-    if (!buf) { set_error(pls, "OOM main image"); return false; }
-    for (uint64_t i = 0; i < image_size; i++) buf[i] = image[i];
+    // a persistent vfs image (claude's 300 mb static blob re-exec'd as its own
+    // embedded ripgrep) is used in place. the old unconditional copy made a
+    // 300 mb kernel heap block and copied it byte by byte on EVERY tool search
+    // subprocess; six concurrent globs/greps needed ~3.6 gb and OOM'd, and on
+    // a big-ram machine the copies still burned seconds of cpu under the kls.
+    // borrowed images are marked so release never frees them and relocations
+    // patch only the user pages, leaving the shared blob immutable. (satoru)
+    uint8_t* buf = nullptr;
+    bool owned = !borrow_image;
+    if (borrow_image) {
+        buf = const_cast<uint8_t*>(image);
+    } else {
+        buf = (uint8_t*)KernelHeap::Alloc((uint32_t)image_size);
+        if (!buf) { set_error(pls, "OOM main image"); return false; }
+        for (uint64_t i = 0; i < image_size; i++) buf[i] = image[i];
+    }
 
     if (!valid_elf64(buf, image_size)) {
-        KernelHeap::Free(buf);
+        if (owned) KernelHeap::Free(buf);
         set_error(pls, "main exec invalid");
         return false;
     }
     Ehdr* eh = (Ehdr*)buf;
 
     Lib* main_l = alloc_lib();
-    if (!main_l) { KernelHeap::Free(buf); set_error(pls, "lib table full"); return false; }
+    if (!main_l) { if (owned) KernelHeap::Free(buf); set_error(pls, "lib table full"); return false; }
     main_l->image = buf;
     main_l->image_size = image_size;
+    main_l->image_owned = owned;
     main_l->phdrs = (Phdr*)(buf + eh->e_phoff);
     main_l->phnum = eh->e_phnum;
     main_l->phentsize = eh->e_phentsize;
@@ -2026,6 +2133,8 @@ bool ExecPIE(Process* proc,
     // lookup while the dynamic path is being brought up. (satoru)
     for (int i = 0; i < pls->lib_count; i++) {
         Lib* l = &g_libs[pls->libs[i]];
+        LinuxSyscall::NoteModule(proc->address_space, l->load_base, l->load_size,
+                                 l->soname[0] ? l->soname : l->path);   // census map (satoru)
         SerialLogger::Log("[ldso] module ");
         SerialLogger::Log(l->soname[0] ? l->soname : l->path);
         SerialLogger::Log(" base=");
@@ -2147,4 +2256,12 @@ bool ExecPIE(Process* proc,
     return true;
 }
 
-}  // namespace LdKurono
+}  // namespace LdKurono// called once a process's address space is torn down (nothing can run its code any
+// more): drop its linker state and loaded libraries. (satoru)
+void LdKurono::ReleaseProcess(Process* p) {
+    if (!p) return;
+    for (int i = 0; i < MAX_PROCS; i++)
+        if (g_procs[i].in_use && g_procs[i].proc == p) release_pls(&g_procs[i]);
+}
+
+

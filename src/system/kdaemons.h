@@ -12,8 +12,8 @@
 //                pending (a real PackageManager::GetPendingUpdateCount query)
 //                and publishes the count; raises a toast when updates appear.
 //
-//    ksecurity = periodically re-runs the supr + ksa policy self-tests
-//                (SUPR::PolicySelfTest / KSA::SelfTest) so a corrupted security
+//    ksecurity = periodically re-runs the ken + ksa policy self-tests
+//                (KEN::PolicySelfTest / KSA::SelfTest) so a corrupted security
 //                policy is caught early, and exposes the last result as the
 //                unit's health. (satoru)
 

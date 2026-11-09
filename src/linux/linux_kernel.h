@@ -15,7 +15,7 @@
 //  │   │ layer    │ manager  │ driver   │ virtual  │ virtual          │ │
 //  │   └──────────┴──────────┴──────────┴──────────┴──────────────────┘ │
 //  ├─────────────────────────────────────────────────────────────────────┤
-//  │  kurono native kernel (scheduler, kvfs, supr, hal, drivers)       │
+//  │  kurono native kernel (scheduler, kvfs, ken, hal, drivers)       │
 //  └─────────────────────────────────────────────────────────────────────┘
 
 #include "../kernel/types.h"

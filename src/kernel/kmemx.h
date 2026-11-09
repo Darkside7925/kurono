@@ -77,9 +77,11 @@ struct Stats {
 };
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
-// reserve the pool (pct of total ram, clamped 10..40) + allocate the metadata
-// table + the compress/decompress scratch buffers. idempotent. does NOT start
-// the kernel process. returns false if the pmm could not satisfy the pool. (satoru)
+// allocate the metadata table (sized to the pool cap, pct of total ram clamped
+// 10..40) + the compress/decompress scratch buffers. reserves NO pool: the pool
+// grows on demand (MaintainPool). idempotent; also re-allocates after a
+// ReleaseResources. does NOT start the kernel process. returns false below the
+// ram floor or if the tables could not be allocated. (satoru)
 bool Init(int pool_pct);
 
 // true once Init() has reserved the pool. (satoru)
@@ -156,9 +158,30 @@ bool ShouldShedServices();
 
 // ── pool sizing (settings slider 10..40%) ───────────────────────────────────
 int  PoolPct();
-// resize the pool to a new pct. only grows/shrinks when safe (no live pages in
-// the shrunk-away tail); returns true on success. (satoru)
+// set the pool CAP to a pct of ram. the pool itself is adaptive: it starts
+// empty, grows in 2mb chunks under memory pressure (MaintainPool) up to this
+// cap, and gives empty chunks back once pressure clears. lowering the cap
+// releases empty chunks above it right away. returns true. (satoru)
 bool SetPoolPct(int pct);
+
+// the byte ceiling the pool may grow to right now: pct of ram, bounded by
+// free-memory headroom, half of free memory and the metadata table. (satoru)
+uint64_t PoolCapBytes();
+
+// the adaptive pool policy, called by the worker once per tick with the live
+// pressure: grow by a chunk (or four at red+) when the pool is near full under
+// yellow+, release wholly empty chunks after pressure has stayed green for a
+// while, and reclaim entries orphaned by exited processes. (satoru)
+void MaintainPool(Pressure p);
+
+// give back everything the engine holds (empty pool chunks, then the metadata
+// table + scratch once no page is compressed). used when the engine is off.
+// safe to call anytime; a later Enable() re-allocates. (satoru)
+void ReleaseResources();
+
+// true when the machine is below the ram floor (~256mb) and kmemx stays fully
+// off: Init reserves nothing and Enable refuses. (satoru)
+bool IsLowRamOff();
 
 // ── stats ────────────────────────────────────────────────────────────────────
 const Stats& GetStats();

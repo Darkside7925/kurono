@@ -126,7 +126,7 @@ instead of pretending to run.
   for the CLI.
 - kupdate (`kdaemons.cpp`), polls `PackageManager::GetPendingUpdateCount` every 60s and toasts
   when updates appear. `kupdate check` forces a sync.
-- ksecurity (`kdaemons.cpp`), re-runs `SUPR::PolicySelfTest` and `KSA::SelfTest` every 30s. A
+- ksecurity (`kdaemons.cpp`), re-runs `KEN::PolicySelfTest` and `KSA::SelfTest` every 30s. A
   self-test failure alerts, logs to `security.log`, and drives the unit's health probe.
 
 All three run as worker kernel-processes and never block the GUI. kpkg-daemon's worker is what the
@@ -136,7 +136,7 @@ GUI talks to, and the matching process-unit declaration is for the future isolat
 
 The `[Capabilities]` section (`Network`, `Filesystem`, `GUI`) is enforced for process and oneshot
 units in `capability_gate()`: a unit that asks for a privileged capability (network or filesystem)
-needs at least a logged-in SUPR user session (`SUPR::GetCurrentSession`, `GetLevel`). A guest or
+needs at least a logged-in KEN user session (`KEN::GetCurrentSession`, `GetLevel`). A guest or
 disabled session is denied. Every decision goes to `services.log` and `security.log`. For in-kernel
 units the grants are recorded but not enforced, since those already run privileged inside the
 kernel.

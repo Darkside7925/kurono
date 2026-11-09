@@ -19,10 +19,15 @@
 // wayland object ids we hand out (1 = wl_display, fixed). (satoru)
 enum { ID_DISPLAY = 1, ID_REGISTRY = 2, ID_SYNC = 3, ID_COMPOSITOR = 4,
        ID_XDGBASE = 5, ID_SHM = 6, ID_SURFACE = 7, ID_XDGSURF = 8,
-       ID_TOPLEVEL = 9, ID_POOL = 10, ID_BUFFER = 11 };
+       ID_TOPLEVEL = 9, ID_POOL = 10, ID_BUFFER = 11,
+       ID_SUBCOMP = 12, ID_SURF2 = 13, ID_SUBSUF = 14, ID_POOL2 = 15,
+       ID_BUFFER2 = 16 };
+#define CW 160
+#define CH 120
+#define CPOOL (CW * CH * 4)
 
 static int g_fd;
-static uint32_t g_name_compositor, g_name_xdgbase, g_name_shm;
+static uint32_t g_name_compositor, g_name_xdgbase, g_name_shm, g_name_subcomp;
 
 static void logs(const char* s) { write(2, s, strlen(s)); }
 
@@ -60,12 +65,12 @@ static void wl_bind(uint32_t name, const char* iface, uint32_t version, uint32_t
 }
 
 // send wl_shm.create_pool(new_id, fd, size) with the fd in SCM_RIGHTS. (satoru)
-static void shm_create_pool(int memfd) {
+static void shm_create_pool_ex(int memfd, uint32_t pool_id, uint32_t bytes) {
     uint32_t body[4];
     body[0] = ID_SHM;
     body[1] = ((uint32_t)(8 + 8) << 16) | 0;   // op 0, size 16: new_id + size
-    body[2] = ID_POOL;
-    body[3] = POOL;
+    body[2] = pool_id;
+    body[3] = bytes;
 
     struct iovec iov = { body, sizeof(body) };
     char cbuf[CMSG_SPACE(sizeof(int))];
@@ -79,6 +84,7 @@ static void shm_create_pool(int memfd) {
     memcpy(CMSG_DATA(cm), &memfd, sizeof(int));
     sendmsg(g_fd, &msg, 0);
 }
+static void shm_create_pool(int memfd) { shm_create_pool_ex(memfd, ID_POOL, POOL); }
 
 int main(void) {
     // 1) connect to the compositor socket. (satoru)
@@ -116,6 +122,7 @@ int main(void) {
                     if (!strcmp(iface, "wl_compositor")) g_name_compositor = name;
                     else if (!strcmp(iface, "xdg_wm_base")) g_name_xdgbase = name;
                     else if (!strcmp(iface, "wl_shm")) g_name_shm = name;
+                    else if (!strcmp(iface, "wl_subcompositor")) g_name_subcomp = name;
                 }
             } else if (obj == ID_SYNC && op == 0) {         // wl_callback.done
                 synced = 1;
@@ -130,6 +137,7 @@ int main(void) {
     wl_bind(g_name_compositor, "wl_compositor", 4, ID_COMPOSITOR);
     wl_bind(g_name_xdgbase,    "xdg_wm_base",   1, ID_XDGBASE);
     wl_bind(g_name_shm,        "wl_shm",        1, ID_SHM);
+    wl_bind(g_name_subcomp,    "wl_subcompositor", 1, ID_SUBCOMP);
 
     // 4) surface -> xdg_surface -> xdg_toplevel, initial commit. (satoru)
     uint32_t a1 = ID_SURFACE; wl_send(ID_COMPOSITOR, 0, &a1, 1);   // create_surface
@@ -146,6 +154,30 @@ int main(void) {
     if (px == MAP_FAILED) { logs("wl_shm_test: mmap failed\n"); return 1; }
     for (int i = 0; i < W * H; i++) px[i] = 0xFF1E90FF;   // opaque dodger blue
     logs("wl_shm_test: painted buffer\n");
+
+    // 5b) child surface committed BEFORE the parent maps: exercises the temp
+    // own-window re-home path (a stray window here was the firefox tooltip bug). (satoru)
+    uint32_t s2 = ID_SURF2; wl_send(ID_COMPOSITOR, 0, &s2, 1);      // create_surface
+    uint32_t sub[3] = { ID_SUBSUF, ID_SURF2, ID_SURFACE };
+    wl_send(ID_SUBCOMP, 1, sub, 3);                                  // create_subsurface
+    uint32_t spos[2] = { 40, 40 };
+    wl_send(ID_SUBSUF, 1, spos, 2);                                  // set_position
+    int cfd = syscall(SYS_memfd_create, "wl_shm_c", 0);
+    if (cfd >= 0 && ftruncate(cfd, CPOOL) >= 0) {
+        uint32_t* cp = mmap(0, CPOOL, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+        if (cp != MAP_FAILED) {
+            for (int i = 0; i < CW * CH; i++) cp[i] = 0xFF32CD32;   // lime green
+            shm_create_pool_ex(cfd, ID_POOL2, CPOOL);
+            uint32_t cb2[6] = { ID_BUFFER2, 0, CW, CH, CW * 4, 1 };
+            wl_send(ID_POOL2, 0, cb2, 6);
+            uint32_t cat[3] = { ID_BUFFER2, 0, 0 };
+            wl_send(ID_SURF2, 1, cat, 3);                            // attach
+            uint32_t cdm[4] = { 0, 0, CW, CH };
+            wl_send(ID_SURF2, 2, cdm, 4);                            // damage
+            wl_send(ID_SURF2, 6, 0, 0);                              // commit (before parent map)
+            logs("wl_shm_test: child committed before parent map\n");
+        }
+    }
 
     // 6) create_pool (fd via SCM_RIGHTS) -> create_buffer -> attach -> commit.
     shm_create_pool(memfd);

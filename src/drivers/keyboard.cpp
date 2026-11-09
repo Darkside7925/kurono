@@ -142,6 +142,14 @@ static Key usb_hid_usage_to_key(uint8_t usage) {
         case 0x37: return KEY_PERIOD;
         case 0x38: return KEY_SLASH;
         case 0x39: return KEY_CAPSLOCK;
+        // navigation / editing cluster: the boot keyboard reports these usages too, and (satoru)
+        // without them page up/down never reached the terminal on a usb keyboard. (satoru)
+        case 0x49: return KEY_INSERT;
+        case 0x4A: return KEY_HOME;
+        case 0x4B: return KEY_PAGEUP;
+        case 0x4C: return KEY_DELETE;
+        case 0x4D: return KEY_END;
+        case 0x4E: return KEY_PAGEDOWN;
         case 0x4F: return KEY_RIGHT;
         case 0x50: return KEY_LEFT;
         case 0x51: return KEY_DOWN;
@@ -529,9 +537,13 @@ void Keyboard::Poll() {
     {   // gap between polls: a long gap lets the 8042/qemu queue (16 bytes) overflow (satoru)
         static uint32_t s_last_poll_ms = 0;
         uint32_t nowp = (uint32_t)Timer::GetRealMs();
-        uint32_t gap = nowp - s_last_poll_ms;
+        // the first poll has no previous timestamp; counting from the epoch
+        // printed the boot time itself as a maxgap (15900ms on the laptop). (satoru)
+        if (s_last_poll_ms) {
+            uint32_t gap = nowp - s_last_poll_ms;
+            if (gap < 100000 && gap > g_kbdbg[1]) g_kbdbg[1] = gap;
+        }
         s_last_poll_ms = nowp;
-        if (gap < 100000 && gap > g_kbdbg[1]) g_kbdbg[1] = gap;
     }
     // pull whatever the 8042 holds into the scancode ring (irqs off so the irq1 handler on
     // this cpu cannot interleave), then run the ring - which also holds every byte the irq1

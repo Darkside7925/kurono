@@ -20,6 +20,77 @@
 #include "../kernel/types.h"
 #include "../kernel/heap.h"
 #include "../drivers/serial.h"
+#include "../kernel/kexec.h"
+
+// guest ram must be page aligned and physically contiguous: ept maps guest
+// pages to (host & ~0xfff) + n*4k (sdm 29.3.2 leaf entries hold a 4 kb frame
+// address), so a heap block that starts mid-page shifted every guest byte and
+// the cpu executed the kernel image off by the heap header. use identity-mapped
+// contiguous pages, falling back to an aligned heap block (satoru)
+struct GMBlock { void* raw; uint64_t pages; };
+static GMBlock g_gm_low, g_gm_vga, g_gm_rom;
+
+static uint8_t* GMAlloc(uint32_t size, GMBlock& blk) {
+    blk.raw = nullptr;
+    blk.pages = ((uint64_t)size + 0xFFF) >> 12;
+    void* p = KExec::Memory::AllocPages(blk.pages);
+    if (p) return (uint8_t*)p;
+    blk.pages = 0;
+    void* raw = KernelHeap::Alloc(size + 4096);
+    if (!raw) return nullptr;
+    blk.raw = raw;
+    return (uint8_t*)(((uintptr_t)raw + 0xFFF) & ~(uintptr_t)0xFFF);
+}
+
+static void GMFree(uint8_t* p, GMBlock& blk) {
+    if (!p) return;
+    if (blk.pages) KExec::Memory::FreePages(p, blk.pages);
+    else if (blk.raw) KernelHeap::Free(blk.raw);
+    blk.raw = nullptr;
+    blk.pages = 0;
+}
+
+
+// high ram chunk table, see AllocateGuestRAM (satoru)
+static uint8_t*  g_hi_chunk[GUEST_MAX_HI_CHUNKS];
+static uint32_t  g_hi_pages[GUEST_MAX_HI_CHUNKS];
+static uint32_t  g_hi_count = 0;
+
+static void FreeHighChunks() {
+    for (uint32_t i = 0; i < g_hi_count; i++) {
+        if (g_hi_chunk[i]) KExec::Memory::FreePages(g_hi_chunk[i], g_hi_pages[i]);
+        g_hi_chunk[i] = nullptr; g_hi_pages[i] = 0;
+    }
+    g_hi_count = 0;
+}
+
+uint32_t GuestMemoryManager::GetHighChunkCount() { return g_hi_count; }
+
+bool GuestMemoryManager::GetHighChunk(uint32_t i, uint64_t* gpa, uint8_t** host, uint32_t* size) {
+    if (i >= g_hi_count) return false;
+    uint32_t sz = high_ram_size - i * GUEST_HI_CHUNK;
+    if (sz > GUEST_HI_CHUNK) sz = GUEST_HI_CHUNK;
+    if (gpa) *gpa = GUEST_HIGH_RAM_START + (uint64_t)i * GUEST_HI_CHUNK;
+    if (host) *host = g_hi_chunk[i];
+    if (size) *size = sz;
+    return true;
+}
+
+// bytes from guest_phys to the end of the host-contiguous piece holding it (satoru)
+uint32_t GuestMemoryManager::ContigBytes(uint64_t guest_phys) {
+    if (guest_phys >= GUEST_HIGH_RAM_START && guest_phys < GUEST_HIGH_RAM_START + high_ram_size) {
+        uint64_t off = guest_phys - GUEST_HIGH_RAM_START;
+        uint64_t end = (off / GUEST_HI_CHUNK + 1) * GUEST_HI_CHUNK;
+        if (end > high_ram_size) end = high_ram_size;
+        return (uint32_t)(end - off);
+    }
+    for (int i = 0; i < phys_map_count; i++) {
+        const GuestPhysMap& m = phys_maps[i];
+        if (guest_phys >= m.guest_phys && guest_phys < m.guest_phys + m.size)
+            return (uint32_t)(m.guest_phys + m.size - guest_phys);
+    }
+    return 0;
+}
 
 uint8_t*     GuestMemoryManager::low_ram          = nullptr;
 uint32_t     GuestMemoryManager::low_ram_size     = 0;
@@ -67,46 +138,57 @@ bool GuestMemoryManager::AllocateGuestRAM(uint32_t ram_mb) {
 
     // low ram: 640 kb (conventional memory)
     low_ram_size = (uint32_t)GUEST_LOW_RAM_END; // 0xa0000 = 640 kb
-    low_ram = (uint8_t*)KernelHeap::Alloc(low_ram_size);
+    low_ram = GMAlloc(low_ram_size, g_gm_low); // (satoru)
     if (!low_ram) {
         SerialLogger::Log("GuestMem: Failed to alloc low RAM\r\n");
         return false;
     }
     memset(low_ram, 0, low_ram_size);
 
-    // high ram: from 1 mb to (ram_mb * 1024 * 1024)
+    // high ram: from 1 mb to (ram_mb * 1024 * 1024), as physically contiguous
+    // 4 mb chunks. one contiguous block of a gigabyte or more often does not
+    // exist once the desktop has run a while; ept maps each chunk on its own
+    // and GuestPhysToHost indexes the chunk table. (satoru)
     uint32_t total_bytes = ram_mb * 1024 * 1024;
     high_ram_size = total_bytes - (uint32_t)GUEST_HIGH_RAM_START;
-    high_ram = (uint8_t*)KernelHeap::Alloc(high_ram_size);
-    if (!high_ram) {
-        SerialLogger::Log("GuestMem: Failed to alloc high RAM (");
-        SerialLogger::LogDec(high_ram_size / 1024);
-        SerialLogger::Log(" KB), trying smaller...\r\n");
-
-        // try with half
-        ram_mb /= 2;
-        if (ram_mb < GUEST_MIN_RAM_MB) ram_mb = GUEST_MIN_RAM_MB;
-        total_bytes = ram_mb * 1024 * 1024;
-        high_ram_size = total_bytes - (uint32_t)GUEST_HIGH_RAM_START;
-        high_ram = (uint8_t*)KernelHeap::Alloc(high_ram_size);
-        if (!high_ram) {
-            KernelHeap::Free(low_ram);
+    {
+        uint32_t n = (high_ram_size + GUEST_HI_CHUNK - 1) / GUEST_HI_CHUNK;
+        bool ok = n <= GUEST_MAX_HI_CHUNKS;
+        g_hi_count = 0;
+        for (uint32_t i = 0; ok && i < n; i++) {
+            uint32_t sz = high_ram_size - i * GUEST_HI_CHUNK;
+            if (sz > GUEST_HI_CHUNK) sz = GUEST_HI_CHUNK;
+            uint64_t pages = (sz + 0xFFFu) >> 12;
+            void* c = KExec::Memory::AllocPages(pages);
+            if (!c) { ok = false; break; }
+            g_hi_chunk[i] = (uint8_t*)c;
+            g_hi_pages[i] = (uint32_t)pages;
+            g_hi_count = i + 1;
+            memset(c, 0, sz);
+        }
+        if (!ok) {
+            SerialLogger::Log("GuestMem: Failed to alloc high RAM (");
+            SerialLogger::LogDec(high_ram_size / 1024);
+            SerialLogger::Log(" KB in 4 MB chunks)\r\n");
+            FreeHighChunks();
+            GMFree(low_ram, g_gm_low); // (satoru)
             low_ram = nullptr;
+            high_ram_size = 0;
             return false;
         }
+        high_ram = g_hi_chunk[0];
     }
-    memset(high_ram, 0, high_ram_size);
 
     total_ram_bytes = low_ram_size + high_ram_size;
 
     // vga buffer: 128 kb
-    vga_buffer = (uint8_t*)KernelHeap::Alloc((uint32_t)GUEST_VGA_SIZE);
+    vga_buffer = GMAlloc((uint32_t)GUEST_VGA_SIZE, g_gm_vga); // (satoru)
     if (vga_buffer) {
         memset(vga_buffer, 0, (uint32_t)GUEST_VGA_SIZE);
     }
 
     // rom area: 256 kb (for bios rom, video rom, etc.)
-    rom_area = (uint8_t*)KernelHeap::Alloc((uint32_t)GUEST_ROM_SIZE);
+    rom_area = GMAlloc((uint32_t)GUEST_ROM_SIZE, g_gm_rom); // (satoru)
     if (rom_area) {
         memset(rom_area, 0xFF, (uint32_t)GUEST_ROM_SIZE); // roms default to 0xff
     }
@@ -119,7 +201,6 @@ bool GuestMemoryManager::AllocateGuestRAM(uint32_t ram_mb) {
     if (rom_area)
         AddPhysMap(GUEST_ROM_BASE, rom_area, (uint32_t)GUEST_ROM_SIZE,
                    E820_TYPE_RESERVED);
-    AddPhysMap(GUEST_HIGH_RAM_START, high_ram, high_ram_size, E820_TYPE_RAM);
 
     SerialLogger::Log("GuestMem: Allocated ");
     SerialLogger::LogDec(total_ram_bytes / 1024);
@@ -128,15 +209,21 @@ bool GuestMemoryManager::AllocateGuestRAM(uint32_t ram_mb) {
     SerialLogger::Log("K high=");
     SerialLogger::LogDec(high_ram_size / 1024);
     SerialLogger::Log("K)\r\n");
+    // ept hands these addresses to the cpu as host physical (satoru)
+    SerialLogger::Log("GuestMem: high va=0x");
+    SerialLogger::LogHex((uint64_t)(uintptr_t)high_ram);
+    SerialLogger::Log(" pa=0x");
+    SerialLogger::LogHex(KExec::Memory::PhysOf(high_ram));
+    SerialLogger::Log(" (4 MB chunks: "); SerialLogger::LogDec((int)g_hi_count); SerialLogger::Log(")\r\n"); // (satoru)
 
     return true;
 }
 
 void GuestMemoryManager::FreeGuestRAM() {
-    if (low_ram) { KernelHeap::Free(low_ram); low_ram = nullptr; }
-    if (high_ram) { KernelHeap::Free(high_ram); high_ram = nullptr; }
-    if (vga_buffer) { KernelHeap::Free(vga_buffer); vga_buffer = nullptr; }
-    if (rom_area) { KernelHeap::Free(rom_area); rom_area = nullptr; }
+    if (low_ram) { GMFree(low_ram, g_gm_low); low_ram = nullptr; } // (satoru)
+    FreeHighChunks(); high_ram = nullptr; // (satoru)
+    if (vga_buffer) { GMFree(vga_buffer, g_gm_vga); vga_buffer = nullptr; }
+    if (rom_area) { GMFree(rom_area, g_gm_rom); rom_area = nullptr; }
     low_ram_size = high_ram_size = total_ram_bytes = 0;
     phys_map_count = 0;
     initialized = false;
@@ -158,6 +245,11 @@ void GuestMemoryManager::AddPhysMap(uint64_t guest, uint8_t* host,
 //  guest physical address translation
 
 uint8_t* GuestMemoryManager::GuestPhysToHost(uint64_t guest_phys) {
+    if (guest_phys >= GUEST_HIGH_RAM_START && guest_phys < GUEST_HIGH_RAM_START + high_ram_size) {
+        uint64_t off = guest_phys - GUEST_HIGH_RAM_START;
+        uint8_t* c = g_hi_chunk[off / GUEST_HI_CHUNK];
+        return c ? c + (off % GUEST_HI_CHUNK) : nullptr;
+    }
     for (int i = 0; i < phys_map_count; i++) {
         const GuestPhysMap& m = phys_maps[i];
         if (guest_phys >= m.guest_phys &&
@@ -181,16 +273,7 @@ bool GuestMemoryManager::WriteGuestPhys(uint64_t guest_phys, const void* data,
 
         // find how much contiguous we can write
         uint32_t chunk = size - written;
-        // limit to remaining region
-        for (int i = 0; i < phys_map_count; i++) {
-            const GuestPhysMap& m = phys_maps[i];
-            uint64_t addr = guest_phys + written;
-            if (addr >= m.guest_phys && addr < m.guest_phys + m.size) {
-                uint32_t remaining = (uint32_t)(m.guest_phys + m.size - addr);
-                if (chunk > remaining) chunk = remaining;
-                break;
-            }
-        }
+        { uint32_t rem = ContigBytes(guest_phys + written); if (chunk > rem) chunk = rem; } // (satoru)
 
         memcpy(host, src + written, chunk);
         written += chunk;
@@ -208,15 +291,7 @@ bool GuestMemoryManager::ReadGuestPhys(uint64_t guest_phys, void* buf,
         if (!host) return false;
 
         uint32_t chunk = size - read;
-        for (int i = 0; i < phys_map_count; i++) {
-            const GuestPhysMap& m = phys_maps[i];
-            uint64_t addr = guest_phys + read;
-            if (addr >= m.guest_phys && addr < m.guest_phys + m.size) {
-                uint32_t remaining = (uint32_t)(m.guest_phys + m.size - addr);
-                if (chunk > remaining) chunk = remaining;
-                break;
-            }
-        }
+        { uint32_t rem = ContigBytes(guest_phys + read); if (chunk > rem) chunk = rem; } // (satoru)
 
         memcpy(dst + read, host, chunk);
         read += chunk;
@@ -231,15 +306,7 @@ bool GuestMemoryManager::ZeroGuestPhys(uint64_t guest_phys, uint32_t size) {
         if (!host) return false;
 
         uint32_t chunk = size - zeroed;
-        for (int i = 0; i < phys_map_count; i++) {
-            const GuestPhysMap& m = phys_maps[i];
-            uint64_t addr = guest_phys + zeroed;
-            if (addr >= m.guest_phys && addr < m.guest_phys + m.size) {
-                uint32_t remaining = (uint32_t)(m.guest_phys + m.size - addr);
-                if (chunk > remaining) chunk = remaining;
-                break;
-            }
-        }
+        { uint32_t rem = ContigBytes(guest_phys + zeroed); if (chunk > rem) chunk = rem; } // (satoru)
 
         memset(host, 0, chunk);
         zeroed += chunk;

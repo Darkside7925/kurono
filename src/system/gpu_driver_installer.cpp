@@ -5,6 +5,7 @@
 #include "../drivers/intel_gpu.h"
 #include "../drivers/serial.h"
 #include "../virt/hypervisor.h"
+#include "../virt/vm_host.h"   // the background alpine vm (satoru)
 #include "../net/network.h"
 #include "../fs/kvfs.h"
 
@@ -80,39 +81,40 @@ bool GpuDriverInstaller::RunAlpineNvidia(char* log, int max) {
     int p = 0;
     char res[2048];
 
-    if (!Hypervisor::IsAlpineBooted()) {
+    // the background vm with its guest agent replaced the synchronous boot (satoru)
+    if (!VMHost::AgentReady()) {
         SetStatus(DRV_RUNNING, 5, "Booting Alpine guest...");
-        Hypervisor::BootAlpineWithExtraction(50000);
-        if (!Hypervisor::IsAlpineBooted()) {
+        VMHost::Start(VMHost::DISTRO_ALPINE, 0);
+        if (!VMHost::WaitAgent(120000)) {
             SetStatus(DRV_ERROR_EXEC, 0, "Alpine guest failed to boot");
             return false;
         }
     }
 
     SetStatus(DRV_RUNNING, 15, "Adding Alpine community + testing repos");
-    Hypervisor::AlpineExec(
+    VMHost::Exec(
         "grep -q 'edge/community' /etc/apk/repositories || "
         "echo 'http://dl-cdn.alpinelinux.org/alpine/edge/community' >> /etc/apk/repositories",
-        res, (int)sizeof(res) - 1);
-    Hypervisor::AlpineExec(
+        res, (int)sizeof(res), 900000);
+    VMHost::Exec(
         "grep -q 'edge/main' /etc/apk/repositories || "
         "echo 'http://dl-cdn.alpinelinux.org/alpine/edge/main' >> /etc/apk/repositories",
-        res, (int)sizeof(res) - 1);
+        res, (int)sizeof(res), 900000);
 
     SetStatus(DRV_RUNNING, 30, "apk update");
-    int n = Hypervisor::AlpineExec("apk update 2>&1", res, (int)sizeof(res) - 1);
+    int n = VMHost::Exec("apk update 2>&1", res, (int)sizeof(res), 900000);
     if (n > 0) { res[n] = 0; p = gd_cat(log, p, max, res); p = gd_cat(log, p, max, "\n"); }
 
     SetStatus(DRV_RUNNING, 55, "Installing nvidia-drivers-open + linux-firmware-nvidia");
-    n = Hypervisor::AlpineExec(
+    n = VMHost::Exec(
         "apk add --no-cache nvidia-drivers-open nvidia-libgl linux-firmware-nvidia "
         "mesa-dri-gallium mesa-vulkan-nvidia 2>&1 || "
         "apk add --no-cache nvidia-drivers linux-firmware-nvidia mesa-dri-gallium 2>&1",
-        res, (int)sizeof(res) - 1);
+        res, (int)sizeof(res), 900000);
     if (n > 0) { res[n] = 0; p = gd_cat(log, p, max, res); p = gd_cat(log, p, max, "\n"); }
 
     SetStatus(DRV_RUNNING, 80, "Loading nvidia kernel module");
-    n = Hypervisor::AlpineExec("modprobe nvidia 2>&1; lsmod | grep -i nvidia", res, (int)sizeof(res) - 1);
+    n = VMHost::Exec("modprobe nvidia 2>&1; lsmod | grep -i nvidia", res, (int)sizeof(res), 900000);
     if (n > 0) { res[n] = 0; p = gd_cat(log, p, max, res); p = gd_cat(log, p, max, "\n"); }
 
     // mark provisioned so the desktop knows drivers are ready
@@ -127,34 +129,35 @@ bool GpuDriverInstaller::RunAlpineAmd(char* log, int max) {
     int p = 0;
     char res[2048];
 
-    if (!Hypervisor::IsAlpineBooted()) {
+    // the background vm with its guest agent replaced the synchronous boot (satoru)
+    if (!VMHost::AgentReady()) {
         SetStatus(DRV_RUNNING, 5, "Booting Alpine guest...");
-        Hypervisor::BootAlpineWithExtraction(50000);
-        if (!Hypervisor::IsAlpineBooted()) {
+        VMHost::Start(VMHost::DISTRO_ALPINE, 0);
+        if (!VMHost::WaitAgent(120000)) {
             SetStatus(DRV_ERROR_EXEC, 0, "Alpine guest failed to boot");
             return false;
         }
     }
 
     SetStatus(DRV_RUNNING, 20, "Enabling Alpine main + community repos");
-    Hypervisor::AlpineExec(
+    VMHost::Exec(
         "grep -q 'edge/community' /etc/apk/repositories || "
         "echo 'http://dl-cdn.alpinelinux.org/alpine/edge/community' >> /etc/apk/repositories",
-        res, (int)sizeof(res) - 1);
+        res, (int)sizeof(res), 900000);
 
     SetStatus(DRV_RUNNING, 35, "apk update");
-    int n = Hypervisor::AlpineExec("apk update 2>&1", res, (int)sizeof(res) - 1);
+    int n = VMHost::Exec("apk update 2>&1", res, (int)sizeof(res), 900000);
     if (n > 0) { res[n] = 0; p = gd_cat(log, p, max, res); p = gd_cat(log, p, max, "\n"); }
 
     SetStatus(DRV_RUNNING, 60, "Installing mesa amdgpu + linux-firmware-amdgpu");
-    n = Hypervisor::AlpineExec(
+    n = VMHost::Exec(
         "apk add --no-cache mesa-dri-gallium mesa-vulkan-ati mesa-va-gallium "
         "linux-firmware-amdgpu xf86-video-amdgpu 2>&1",
-        res, (int)sizeof(res) - 1);
+        res, (int)sizeof(res), 900000);
     if (n > 0) { res[n] = 0; p = gd_cat(log, p, max, res); p = gd_cat(log, p, max, "\n"); }
 
     SetStatus(DRV_RUNNING, 85, "Loading amdgpu kernel module");
-    n = Hypervisor::AlpineExec("modprobe amdgpu 2>&1; lsmod | grep -i amdgpu", res, (int)sizeof(res) - 1);
+    n = VMHost::Exec("modprobe amdgpu 2>&1; lsmod | grep -i amdgpu", res, (int)sizeof(res), 900000);
     if (n > 0) { res[n] = 0; p = gd_cat(log, p, max, res); p = gd_cat(log, p, max, "\n"); }
 
     KVFS::Mkdirs("/var/lib/kurono");

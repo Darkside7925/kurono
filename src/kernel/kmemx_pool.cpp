@@ -30,7 +30,8 @@ struct Chunk {
 };
 
 Chunk    g_chunks[MAX_CHUNKS];
-uint32_t g_chunk_count = 0;
+uint32_t g_chunk_count = 0;      // slot high-water mark; a slot with base 0 is a hole (satoru)
+uint32_t g_present     = 0;      // chunks currently reserved (satoru)
 uint64_t g_total_bytes = 0;
 uint64_t g_used_bytes  = 0;
 Spinlock g_lock;
@@ -56,55 +57,97 @@ static void chunk_init(Chunk& c, uint64_t base) {
     h->size = (uint32_t)CHUNK_BYTES;
 }
 
+// mark a slot as a hole: unreachable by Alloc (no free bytes), Ptr and Free
+// (base 0). (satoru)
+static void chunk_clear(Chunk& c) {
+    c.base = 0;
+    c.free_head = NIL;
+    c.free_bytes = 0;
+}
+
 }  // namespace
 
 uint64_t Reserve(uint64_t want_bytes) {
-    uint64_t f;
-    g_lock.LockIrqSave(&f);
-    if (g_chunk_count == 0) {
-        // first reservation - allocate chunks. (satoru)
-        uint32_t want_chunks = (uint32_t)((want_bytes + CHUNK_BYTES - 1) / CHUNK_BYTES);
-        if (want_chunks == 0) want_chunks = 1;
-        if (want_chunks > MAX_CHUNKS) want_chunks = MAX_CHUNKS;
-        for (uint32_t i = 0; i < want_chunks; i++) {
-            // 512 frames == 2mb, contiguous + identity-mapped. (satoru)
-            uint64_t base = PMM::AllocContiguous(CHUNK_BYTES / 4096);
-            if (base == 0) break;   // pmm exhausted; keep what we got (satoru)
-            chunk_init(g_chunks[g_chunk_count], base);
-            g_chunk_count++;
-            g_total_bytes += CHUNK_BYTES;
-        }
-        SerialLogger::Log("[kmemx-pool] reserved chunks=");
-        SerialLogger::LogDec((int)g_chunk_count);
-        SerialLogger::Log(" bytes=");
-        SerialLogger::LogDec((int)(g_total_bytes / (1024 * 1024)));
-        SerialLogger::Log("MB\r\n");
-    }
-    uint64_t total = g_total_bytes;
-    g_lock.UnlockIrqRestore(f);
+    // kept for the api. the boot path no longer reserves a pool (the engine
+    // grows it under pressure), so this is a logged GrowTo. (satoru)
+    uint64_t total = GrowTo(want_bytes);
+    SerialLogger::Log("[kmemx-pool] reserved chunks=");
+    SerialLogger::LogDec((int)g_present);
+    SerialLogger::Log(" bytes=");
+    SerialLogger::LogDec((int)(total / (1024 * 1024)));
+    SerialLogger::Log("MB\r\n");
     return total;
 }
 
 uint64_t GrowTo(uint64_t want_bytes) {
-    uint64_t f;
-    g_lock.LockIrqSave(&f);
     uint32_t want_chunks = (uint32_t)((want_bytes + CHUNK_BYTES - 1) / CHUNK_BYTES);
     if (want_chunks > MAX_CHUNKS) want_chunks = MAX_CHUNKS;
-    while (g_chunk_count < want_chunks) {
+    for (;;) {
+        uint64_t f;
+        g_lock.LockIrqSave(&f);
+        bool more = g_present < want_chunks;
+        g_lock.UnlockIrqRestore(f);
+        if (!more) break;
+        // 512 frames == 2mb, contiguous + identity-mapped. the pmm scan and its
+        // 2mb zero fill run with the pool lock dropped, so a fault-path Free or
+        // a compress never waits behind a grow. (satoru)
         uint64_t base = PMM::AllocContiguous(CHUNK_BYTES / 4096);
-        if (base == 0) break;
-        chunk_init(g_chunks[g_chunk_count], base);
-        g_chunk_count++;
-        g_total_bytes += CHUNK_BYTES;
+        if (base == 0) break;   // pmm exhausted; keep what we got (satoru)
+        g_lock.LockIrqSave(&f);
+        // refill the lowest hole first, else append a slot. (satoru)
+        uint32_t slot = MAX_CHUNKS;
+        for (uint32_t i = 0; i < g_chunk_count; i++) {
+            if (g_chunks[i].base == 0) { slot = i; break; }
+        }
+        if (slot == MAX_CHUNKS && g_chunk_count < MAX_CHUNKS) slot = g_chunk_count;
+        bool placed = (slot != MAX_CHUNKS) && (g_present < want_chunks);
+        if (placed) {
+            chunk_init(g_chunks[slot], base);
+            if (slot == g_chunk_count) g_chunk_count++;
+            g_present++;
+            g_total_bytes += CHUNK_BYTES;
+        }
+        g_lock.UnlockIrqRestore(f);
+        if (!placed) { PMM::FreeContiguous(base, CHUNK_BYTES / 4096); break; }
     }
-    uint64_t total = g_total_bytes;
+    return g_total_bytes;
+}
+
+int ReleaseEmpty(int max_chunks, uint64_t keep_bytes, uint64_t* bases_out) {
+    if (max_chunks <= 0 || !bases_out) return 0;
+    int n = 0;
+    uint64_t f;
+    g_lock.LockIrqSave(&f);
+    // highest slots first: Alloc fills the lowest chunk that fits, so the top
+    // of the arena is the part that empties first. (satoru)
+    for (uint32_t i = g_chunk_count; i > 0 && n < max_chunks; i--) {
+        Chunk& c = g_chunks[i - 1];
+        if (c.base == 0) continue;
+        if (c.free_bytes != (uint32_t)CHUNK_BYTES) continue;   // still holds a blob (satoru)
+        if (g_total_bytes < keep_bytes + CHUNK_BYTES) break;
+        bases_out[n++] = c.base;
+        chunk_clear(c);
+        g_present--;
+        g_total_bytes -= CHUNK_BYTES;
+    }
+    while (g_chunk_count > 0 && g_chunks[g_chunk_count - 1].base == 0) g_chunk_count--;
     g_lock.UnlockIrqRestore(f);
-    return total;
+    return n;
+}
+
+bool Contains(uint64_t phys) {
+    uint32_t n = g_chunk_count;
+    if (n > MAX_CHUNKS) n = MAX_CHUNKS;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t b = g_chunks[i].base;
+        if (b != 0 && phys >= b && phys < b + CHUNK_BYTES) return true;
+    }
+    return false;
 }
 
 uint64_t TotalBytes() { return g_total_bytes; }
 uint64_t UsedBytes()  { return g_used_bytes; }
-uint32_t ChunkCount() { return g_chunk_count; }
+uint32_t ChunkCount() { return g_present; }
 
 // best-fit within one chunk: walk its free-list, pick the smallest block that
 // fits, split the remainder back into the list. (satoru)
@@ -167,7 +210,7 @@ void Free(uint32_t pool_off, uint32_t n) {
     g_lock.LockIrqSave(&f);
     uint32_t chunk_idx = pool_off / (uint32_t)CHUNK_BYTES;
     uint32_t intra     = pool_off % (uint32_t)CHUNK_BYTES;
-    if (chunk_idx >= g_chunk_count) { g_lock.UnlockIrqRestore(f); return; }
+    if (chunk_idx >= g_chunk_count || g_chunks[chunk_idx].base == 0) { g_lock.UnlockIrqRestore(f); return; }
     Chunk& c = g_chunks[chunk_idx];
 
     // the actual block size: if Alloc consumed a whole block (slack < header),
@@ -209,7 +252,9 @@ void* Ptr(uint32_t pool_off) {
     uint32_t chunk_idx = pool_off / (uint32_t)CHUNK_BYTES;
     uint32_t intra     = pool_off % (uint32_t)CHUNK_BYTES;
     if (chunk_idx >= g_chunk_count) return nullptr;
-    return (void*)(uintptr_t)(g_chunks[chunk_idx].base + intra);
+    uint64_t base = g_chunks[chunk_idx].base;
+    if (base == 0) return nullptr;   // a released hole (satoru)
+    return (void*)(uintptr_t)(base + intra);
 }
 
 uint32_t LargestFree() {
@@ -217,6 +262,7 @@ uint32_t LargestFree() {
     g_lock.LockIrqSave(&f);
     uint32_t largest = 0;
     for (uint32_t i = 0; i < g_chunk_count; i++) {
+        if (g_chunks[i].base == 0) continue;
         uint32_t cur = g_chunks[i].free_head;
         while (cur != NIL) {
             FreeHdr* h = hdr_at(g_chunks[i], cur);
@@ -232,6 +278,7 @@ void ResetForTest() {
     uint64_t f;
     g_lock.LockIrqSave(&f);
     for (uint32_t i = 0; i < g_chunk_count; i++) {
+        if (g_chunks[i].base == 0) continue;
         chunk_init(g_chunks[i], g_chunks[i].base);
     }
     g_used_bytes = 0;

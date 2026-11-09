@@ -1,455 +1,268 @@
 //  kurono os - settings module: network (satoru)
-//  detailed network & bluetooth page: live ethernet interface stats, a wi-fi
-//  enable toggle + scan affordance + scanned ssid list, bluetooth controller
-//  binding state + enable toggle, and a small lo/eth0 interface table. radio
-//  toggles persist to net.wifi_enabled / net.bt_enabled via uiconfig. (satoru)
+//  wi-fi (on/off, scan, join open networks, join secured networks with an
+//  inline password field) when a wireless adapter exists, the ethernet link
+//  (status, addresses, traffic), and the bluetooth adapter state. every control
+//  drives the real WiFi / Network api. (satoru)
 #include "system_settings.h"
-#include "../drivers/graphics.h"
 #include "../net/network.h"
+#include "../net/dhcp.h"
+#include "../drivers/e1000.h"
 #include "../linux/linux_drivers.h"
 #include "../system/ui_config.h"
 
-// ── module state (constant-initialised statics - ctor-free) ─────────────────
-static bool s_wifi_enabled = false;   // persisted to net.wifi_enabled (satoru)
-static bool s_bt_enabled   = false;   // persisted to net.bt_enabled (satoru)
+using namespace SettingsUI;
 
-// ── tiny libc-free local string helpers (mirror the shell's SettingsUI) ─────
-static void net_strcpy(char* d, const char* s, int mx){ SettingsUI::StrCpy(d, s, mx); }
-static void net_strapp(char* d, const char* s, int mx){ SettingsUI::StrApp(d, s, mx); }
-static void net_intstr(int v, char* b, int mx){ SettingsUI::IntToStr(v, b, mx); }
+static char s_pass[64];
+static int  s_expand = -1;       // secured network row showing the password field (satoru)
+static char s_last_error[64];
 
-// ── driver-binding probes (same prefix sets the legacy settings.cpp used) ───
-static bool net_starts_with(const char* s, const char* prefix){
-    if(!s || !prefix) return false;
-    int i = 0; while(prefix[i]){ if(s[i] != prefix[i]) return false; i++; }
+// ── helpers ─────────────────────────────────────────────────────────────────
+static bool starts_with(const char* s, const char* p){
+    if(!s || !p) return false;
+    int i = 0; while(p[i]){ if(s[i] != p[i]) return false; i++; }
     return true;
 }
-static const LinuxDriver* net_find_driver(const char* const* prefixes, int count){
-    LinuxDriver* drivers = LinuxDriverFramework::GetDrivers();
-    int driver_count = LinuxDriverFramework::GetDriverCount();
-    for(int i = 0; i < driver_count; i++){
-        if(!(drivers[i].bound || drivers[i].state == LDRV_ACTIVE)) continue;
-        for(int p = 0; p < count; p++){
-            if(net_starts_with(drivers[i].name, prefixes[p])) return &drivers[i];
-        }
+static const LinuxDriver* find_driver(const char* const* prefixes, int count){
+    LinuxDriver* d = LinuxDriverFramework::GetDrivers();
+    int n = LinuxDriverFramework::GetDriverCount();
+    for(int i = 0; i < n; i++){
+        if(!(d[i].bound || d[i].state == LDRV_ACTIVE)) continue;
+        for(int p = 0; p < count; p++) if(starts_with(d[i].name, prefixes[p])) return &d[i];
     }
     return nullptr;
 }
-static const LinuxDriver* net_find_wifi_driver(){
-    static const char* prefixes[] = {
-        "wifi_", "iwl", "ath", "rtw", "rtl", "brcm", "mt76", "cfg80211", "mac80211"
-    };
-    return net_find_driver(prefixes, (int)(sizeof(prefixes) / sizeof(prefixes[0])));
+static const LinuxDriver* bt_driver(){
+    static const char* pfx[] = { "bluetooth_", "bluetooth", "bt", "hci" };
+    return find_driver(pfx, 4);
 }
-static const LinuxDriver* net_find_bt_driver(){
-    static const char* prefixes[] = {
-        "bluetooth_", "bluetooth", "bt", "hci"
-    };
-    return net_find_driver(prefixes, (int)(sizeof(prefixes) / sizeof(prefixes[0])));
-}
-
-// ── formatting helpers ──────────────────────────────────────────────────────
-// "a.b.c.d" into buf via the network stack's own formatter. (satoru)
-static void net_ip_str(IPv4Address ip, char* buf, int mx){
-    Network::IPToString(ip, buf, mx);
-}
-// canonical xx:xx:xx:xx:xx:xx mac. (satoru)
-static void net_mac_str(const MACAddress& m, char* buf, int mx){
+static void mac_str(const MACAddress& m, char* b, int mx){
     static const char hex[] = "0123456789ABCDEF";
     int p = 0;
-    for(int i = 0; i < 6 && p < mx - 1; i++){
-        if(p < mx - 1) buf[p++] = hex[(m.bytes[i] >> 4) & 0xF];
-        if(p < mx - 1) buf[p++] = hex[m.bytes[i] & 0xF];
-        if(i < 5 && p < mx - 1) buf[p++] = ':';
+    for(int i = 0; i < 6 && p < mx - 3; i++){
+        b[p++] = hex[(m.bytes[i] >> 4) & 0xF];
+        b[p++] = hex[m.bytes[i] & 0xF];
+        if(i < 5) b[p++] = ':';
     }
-    buf[p] = 0;
+    b[p] = 0;
 }
-// short label for a wi-fi security mode. (satoru)
-static const char* net_sec_str(WiFiSecurity s){
+static void bytes_str(uint64_t v, char* b, int mx){
+    const char* unit = " B";
+    uint64_t whole = v, frac = 0;
+    if(v >= 1024ull * 1024 * 1024){ whole = v / (1024ull * 1024 * 1024); frac = (v % (1024ull * 1024 * 1024)) * 10 / (1024ull * 1024 * 1024); unit = " GB"; }
+    else if(v >= 1024ull * 1024){ whole = v / (1024ull * 1024); frac = (v % (1024ull * 1024)) * 10 / (1024ull * 1024); unit = " MB"; }
+    else if(v >= 1024){ whole = v / 1024; frac = (v % 1024) * 10 / 1024; unit = " KB"; }
+    IntToStr((int)whole, b, mx);
+    if(unit[1] != 'B'){ char f[4]; StrApp(b, ".", mx); IntToStr((int)frac, f, 4); StrApp(b, f, mx); }
+    StrApp(b, unit, mx);
+}
+static const char* sec_str(WiFiSecurity s){
     switch(s){
         case WIFI_OPEN: return "Open";
         case WIFI_WEP:  return "WEP";
         case WIFI_WPA:  return "WPA";
         case WIFI_WPA2: return "WPA2";
         case WIFI_WPA3: return "WPA3";
-        default:        return "?";
+        default:        return "Secured";
     }
 }
-// rough 0..4 bar count from a dbm reading (-100..0). (satoru)
-static int net_bars_from_dbm(int dbm){
-    if(dbm >= -55) return 4;
-    if(dbm >= -65) return 3;
-    if(dbm >= -75) return 2;
-    if(dbm >= -85) return 1;
-    return 0;
+static const char* signal_word(int dbm){
+    if(dbm >= -55) return "Excellent";
+    if(dbm >= -65) return "Good";
+    if(dbm >= -75) return "Fair";
+    return "Weak";
 }
 
-// ── on_show: load persisted radio toggles + detect live state ───────────────
+static uint32_t ip_u32(const IPv4Address& a){
+    return ((uint32_t)a.bytes[0] << 24) | ((uint32_t)a.bytes[1] << 16) |
+           ((uint32_t)a.bytes[2] << 8) | (uint32_t)a.bytes[3];
+}
+static void ip_u32_str(uint32_t v, char* b, int mx){
+    IPv4Address a = Network::MakeIP((uint8_t)(v >> 24), (uint8_t)(v >> 16),
+                                    (uint8_t)(v >> 8), (uint8_t)v);
+    Network::IPToString(a, b, mx);
+}
+
+// one glance at the live link: carrier, signal, address, resolver and traffic.
+// reads the driver counters (not the interface bookkeeping, which never saw the
+// tcp tx path) and the dhcp lease state. (satoru)
+static void status_section(){
+    Group("Status");
+    NetworkInterface* eth = Network::GetInterface("eth0");
+    NetworkInterface* wlan = Network::GetInterface("wlan0");
+    bool wifi_up = (WiFi::DetectedLink() == WiFi::LINK_WIFI &&
+                    WiFi::GetState() == WIFI_CONNECTED);
+    bool eth_up = (eth && eth->state == NIC_UP);
+    const char* link = "Offline";
+    const char* sub = "no active link";
+    if(wifi_up){ link = "Wi-Fi"; sub = "associated"; }
+    else if(eth_up){ link = "Ethernet"; sub = "carrier up"; }
+    Info("Link", link, sub, (wifi_up || eth_up) ? T().success : T().text3);
+
+    NetworkInterface* active = wifi_up ? wlan : eth;
+    if(wifi_up){
+        WiFiNetwork* w = WiFi::GetConnectedNetwork();
+        Info("Network", (w && w->ssid[0]) ? w->ssid : "joined");
+        int dbm = WiFi::GetSignalStrength();
+        char sig[64];
+        StrCpy(sig, signal_word(dbm), (int)sizeof(sig));
+        StrApp(sig, " (", (int)sizeof(sig));
+        char num[16]; IntToStr(dbm, num, (int)sizeof(num)); StrApp(sig, num, (int)sizeof(sig));
+        StrApp(sig, " dBm)", (int)sizeof(sig));
+        Info("Signal", sig,
+             WiFi::AutoReconnect() ? "auto-reconnect on" : "auto-reconnect off",
+             WiFi::SignalBars() > 0 ? T().success : T().warn);
+    } else {
+        Info("Signal", eth_up ? "Wired" : "None",
+             eth_up ? "full, no radio needed" : "no carrier",
+             eth_up ? T().success : T().text3);
+    }
+
+    char ip[32] = "0.0.0.0";
+    if(active) Network::IPToString(active->ip, ip, (int)sizeof(ip));
+    Info("IP address", ip);
+
+    uint32_t dp = 0, ds = 0;
+    Network::GetDNSServers(&dp, &ds);
+    if(!dp && active) dp = ip_u32(active->dns);
+    char dns[80];
+    if(dp){
+        ip_u32_str(dp, dns, (int)sizeof(dns));
+        if(ds){
+            StrApp(dns, ", ", (int)sizeof(dns));
+            char t[24]; ip_u32_str(ds, t, (int)sizeof(t));
+            StrApp(dns, t, (int)sizeof(dns));
+        }
+    } else {
+        StrCpy(dns, "none", (int)sizeof(dns));
+    }
+    Info("DNS server", dns);
+
+    uint64_t rxb = E1000::IsDetected() ? E1000::GetRxBytes() : (active ? active->rx_bytes : 0);
+    uint64_t txb = E1000::IsDetected() ? E1000::GetTxBytes() : (active ? active->tx_bytes : 0);
+    uint32_t rxp = E1000::IsDetected() ? E1000::GetRxCount() : (active ? active->rx_packets : 0);
+    uint32_t txp = E1000::IsDetected() ? E1000::GetTxCount() : (active ? active->tx_packets : 0);
+    char val[80], pk[24];
+    bytes_str(rxb, val, (int)sizeof(val));
+    StrApp(val, " (", (int)sizeof(val)); IntToStr((int)rxp, pk, (int)sizeof(pk));
+    StrApp(val, pk, (int)sizeof(val)); StrApp(val, " packets)", (int)sizeof(val));
+    Info("Received", val);
+    bytes_str(txb, val, (int)sizeof(val));
+    StrApp(val, " (", (int)sizeof(val)); IntToStr((int)txp, pk, (int)sizeof(pk));
+    StrApp(val, pk, (int)sizeof(val)); StrApp(val, " packets)", (int)sizeof(val));
+    Info("Sent", val);
+
+    if(Dhcp::IsBound()){
+        char lease[64];
+        StrCpy(lease, Dhcp::StateString(), (int)sizeof(lease));
+        StrApp(lease, " ", (int)sizeof(lease));
+        char sec[16]; IntToStr((int)Dhcp::LeaseRemainingSeconds(), sec, (int)sizeof(sec));
+        StrApp(lease, sec, (int)sizeof(lease)); StrApp(lease, "s left", (int)sizeof(lease));
+        char srv[24]; ip_u32_str(Dhcp::GetServer(), srv, (int)sizeof(srv));
+        Info("DHCP lease", lease, srv);
+    } else {
+        Info("DHCP", Dhcp::StateString(), "no lease");
+    }
+    EndGroup();
+}
+
 static void network_on_show(){
-    s_wifi_enabled = UIConfig::Int("net.wifi_enabled", (WiFi::GetState() != WIFI_OFF) ? 1 : 0) != 0;
-    s_bt_enabled   = UIConfig::Int("net.bt_enabled", net_find_bt_driver() ? 1 : 0) != 0;
+    s_expand = -1;
+    s_pass[0] = 0;
+    s_last_error[0] = 0;
 }
 
-// ── layout constants shared by render + input so hit-testing matches exactly.
-//    the input() signature carries no pane width, so we fix the controls column
-//    here (pane-local x). (satoru)
-static const int CTRL_X_OFF  = 200;   // toggle column relative to pane left (satoru)
-static const int SCAN_W      = 90;    // "scan" pill width in px (satoru)
-static const int WIFI_LIST_MAX = 6;   // ssid rows we render at most (satoru)
+static void wifi_section(){
+    Group("Wi-Fi");
+    if(WiFi::DetectedLink() != WiFi::LINK_WIFI){
+        Info("Wi-Fi", "Not available", "No wireless adapter was found");
+        EndGroup();
+        return;
+    }
+    bool on = WiFi::GetState() != WIFI_OFF;
+    const char* chip = WiFi::WirelessChipName();
+    if(Toggle("Wi-Fi", &on, (chip && chip[0]) ? chip : WiFi::StateString())){
+        UIConfig::SetInt("net.wifi_enabled", on ? 1 : 0, true);
+        UIConfig::Save();
+        if(on){ WiFi::Enable(); WiFi::Scan(); } else { WiFi::Disable(); s_expand = -1; }
+    }
+    if(!on){ EndGroup(); return; }
 
-// how many scanned networks we will actually draw. (satoru)
-static int net_wifi_rows(){
     int n = WiFi::GetNetworkCount();
-    if(n < 0) n = 0;
-    if(n > WIFI_LIST_MAX) n = WIFI_LIST_MAX;
-    return n;
+    WiFiNetwork* nets = WiFi::GetNetworks();
+    if(n > 12) n = 12;
+    if(n <= 0 || !nets){
+        Info("Networks", WiFi::GetState() == WIFI_SCANNING ? "Searching..." : "None found");
+    }
+    for(int i = 0; i < n && nets; i++){
+        const WiFiNetwork& w = nets[i];
+        PushId(i);
+        char val[48];
+        if(w.connected) StrCpy(val, "Connected", 48);
+        else { StrCpy(val, sec_str(w.security), 48); StrApp(val, ", ", 48); StrApp(val, signal_word(w.signal_strength), 48); }
+        if(Nav(w.ssid[0] ? w.ssid : "Hidden network", val)){
+            if(w.connected){ WiFi::Disconnect(); s_expand = -1; }
+            else if(w.security == WIFI_OPEN){
+                s_last_error[0] = 0;
+                if(!WiFi::Connect(w.ssid, "")) StrCpy(s_last_error, "Could not join this network", 64);
+            } else {
+                s_expand = (s_expand == i) ? -1 : i;
+                s_pass[0] = 0;
+            }
+        }
+        if(s_expand == i && !w.connected){
+            bool go = false;
+            if(TextField("Password", s_pass, 64, "Network password", FIELD_PASSWORD) && Submitted()) go = true;
+            if(Button("", "Join", BTN_PRIMARY)) go = true;
+            if(go){
+                s_last_error[0] = 0;
+                if(WiFi::Connect(w.ssid, s_pass)){ s_expand = -1; s_pass[0] = 0; }
+                else StrCpy(s_last_error, "Could not join: check the password", 64);
+            }
+        }
+        PopId();
+    }
+    if(s_last_error[0]) Info("Status", s_last_error, nullptr, T().danger);
+    if(Button("Find networks", "Scan", BTN_SECONDARY)) WiFi::Scan();
+    EndGroup();
 }
 
-static void network_render(int x, int y, int w, int h, int scroll){
-    (void)h;
-    int ctrl_x = x + CTRL_X_OFF;
-    int ly = y - scroll + 8;
+static void network_build(){
+    status_section();
+    wifi_section();
+
+    NetworkInterface* eth = Network::GetInterface("eth0");
     char buf[64];
-
-    const LinuxDriver* wifi_drv = net_find_wifi_driver();
-    const LinuxDriver* bt_drv   = net_find_bt_driver();
-    NetworkInterface*  eth      = Network::GetInterface("eth0");
-
-    // ── ethernet ─────────────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "Ethernet");
-    ly += 26;
-
-    bool eth_up = eth && eth->state == NIC_UP;
-    SettingsUI::Row(x, ly, "Link:", eth ? (eth_up ? "Connected" : "Down") : "No adapter");
-    ly += 22;
+    Group("Ethernet");
+    if(!eth){
+        Info("Status", "No adapter", "No wired network adapter was found");
+    } else {
+        bool up = eth->state == NIC_UP;
+        Info("Status", up ? "Connected" : "Disconnected", nullptr, up ? T().success : T().text3);
+        Network::IPToString(eth->ip, buf, 64);      Info("IP address", buf);
+        Network::IPToString(eth->gateway, buf, 64); Info("Router", buf);
+        Network::IPToString(eth->dns, buf, 64);     Info("DNS server", buf);
+        mac_str(eth->mac, buf, 64);                  Info("Hardware address", buf);
+    }
+    EndGroup();
 
     if(eth){
-        net_ip_str(eth->ip, buf, 64);
-        SettingsUI::Row(x, ly, "IPv4:", buf);
-        ly += 22;
-
-        net_mac_str(eth->mac, buf, 64);
-        SettingsUI::Row(x, ly, "MAC:", buf);
-        ly += 22;
-
-        net_ip_str(eth->gateway, buf, 64);
-        SettingsUI::Row(x, ly, "Gateway:", buf);
-        ly += 22;
-
-        net_ip_str(eth->dns, buf, 64);
-        SettingsUI::Row(x, ly, "DNS:", buf);
-        ly += 22;
-
-        // rx packets / bytes. (satoru)
-        net_intstr((int)eth->rx_packets, buf, 64);
-        net_strapp(buf, " pkts / ", 64);
-        { char nb[24]; net_intstr((int)eth->rx_bytes, nb, 24); net_strapp(buf, nb, 64); }
-        net_strapp(buf, " B", 64);
-        SettingsUI::Row(x, ly, "RX:", buf);
-        ly += 22;
-
-        // tx packets / bytes. (satoru)
-        net_intstr((int)eth->tx_packets, buf, 64);
-        net_strapp(buf, " pkts / ", 64);
-        { char nb[24]; net_intstr((int)eth->tx_bytes, nb, 24); net_strapp(buf, nb, 64); }
-        net_strapp(buf, " B", 64);
-        SettingsUI::Row(x, ly, "TX:", buf);
-        ly += 22;
-
-        SettingsUI::Row(x, ly, "Driver:", "E1000 (Intel 82540EM)");
-        ly += 30;
-    } else {
-        SettingsUI::Row(x, ly, "Detected:", "No Ethernet adapter");
-        ly += 30;
+        Group("Activity");
+        char pk[24];
+        bytes_str(eth->rx_bytes, buf, 64); StrApp(buf, "  (", 64); IntToStr((int)eth->rx_packets, pk, 24); StrApp(buf, pk, 64); StrApp(buf, " packets)", 64);
+        Info("Received", buf);
+        bytes_str(eth->tx_bytes, buf, 64); StrApp(buf, "  (", 64); IntToStr((int)eth->tx_packets, pk, 24); StrApp(buf, pk, 64); StrApp(buf, " packets)", 64);
+        Info("Sent", buf);
+        EndGroup();
     }
 
-    // ── wi-fi ────────────────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "Wi-Fi");
-    ly += 26;
-
-    // enable toggle + a scan pill alongside it. (satoru)
-    Graphics::DrawString(x, ly + 2, "Wi-Fi:", SettingsUI::COL_TEXT, 0xFF000000);
-    SettingsUI::Toggle(ctrl_x, ly, s_wifi_enabled);
-    SettingsUI::Dropdown(ctrl_x + SettingsUI::TOGGLE_W + 12, ly - 1, SCAN_W, "Scan");
-    ly += 30;
-
-    SettingsUI::Row(x, ly, "Status:", WiFi::StateString());
-    ly += 22;
-
-    SettingsUI::Row(x, ly, "Adapter:",
-        wifi_drv ? (wifi_drv->description[0] ? wifi_drv->description : wifi_drv->name)
-                 : "No native Wi-Fi binding");
-    ly += 22;
-
-    // connected network summary, if any. (satoru)
-    {
-        WiFiNetwork* cw = WiFi::GetConnectedNetwork();
-        if(WiFi::GetState() == WIFI_CONNECTED && cw){
-            SettingsUI::Row(x, ly, "Connected:", cw->ssid[0] ? cw->ssid : "(hidden)");
-            ly += 22;
-            net_intstr(WiFi::SignalBars(), buf, 64);
-            net_strapp(buf, " / 4 bars", 64);
-            SettingsUI::Row(x, ly, "Signal:", buf);
-            ly += 22;
-        }
-    }
-
-    // scanned network list - each row is tappable to connect (open networks) or
-    // disconnect (the connected one). (satoru)
-    Graphics::DrawString(x, ly, "Available networks:", SettingsUI::COL_HEADING, 0xFF000000);
-    ly += 22;
-    {
-        int rows = net_wifi_rows();
-        WiFiNetwork* nets = WiFi::GetNetworks();
-        if(rows > 0 && nets){
-            for(int i = 0; i < rows; i++){
-                const WiFiNetwork& n = nets[i];
-                const char* ssid = n.ssid[0] ? n.ssid : "(hidden)";
-                // ssid on the left. (satoru)
-                Graphics::DrawString(x + 12, ly,
-                                     ssid,
-                                     n.connected ? SettingsUI::Accent() : SettingsUI::COL_TEXT,
-                                     0xFF000000);
-                // security label in the middle. (satoru)
-                Graphics::DrawString(ctrl_x, ly, net_sec_str(n.security),
-                                     SettingsUI::COL_DIM, 0xFF000000);
-                // signal bars on the right. (satoru)
-                net_intstr(net_bars_from_dbm(n.signal_strength), buf, 64);
-                net_strapp(buf, "/4", 64);
-                Graphics::DrawString(ctrl_x + 70, ly, buf, SettingsUI::COL_DIM, 0xFF000000);
-                // per-row action hint at the far right. (satoru)
-                const char* act = n.connected ? "Disconnect"
-                                : (n.security == WIFI_OPEN ? "Connect" : "Locked");
-                Graphics::DrawString(ctrl_x + 110, ly, act,
-                                     n.connected ? SettingsUI::Accent()
-                                                 : (n.security == WIFI_OPEN ? SettingsUI::COL_ON
-                                                                            : SettingsUI::COL_DIM),
-                                     0xFF000000);
-                ly += 20;
-            }
-        } else {
-            Graphics::DrawString(x + 12, ly,
-                                 s_wifi_enabled ? "No networks found - tap Scan."
-                                                : "Enable Wi-Fi to scan.",
-                                 SettingsUI::COL_DIM, 0xFF000000);
-            ly += 20;
-        }
-    }
-    // honest guidance: open networks connect on tap; secured ones need a
-    // passphrase, which this panel has no text-entry field for. (satoru)
-    Graphics::DrawString(x + 12, ly, "Tap an open network to connect. WPA needs a password.",
-                         SettingsUI::COL_DIM, 0xFF000000);
-    ly += 28;
-
-    // ── bluetooth ────────────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "Bluetooth");
-    ly += 26;
-
-    Graphics::DrawString(x, ly + 2, "Bluetooth:", SettingsUI::COL_TEXT, 0xFF000000);
-    SettingsUI::Toggle(ctrl_x, ly, s_bt_enabled);
-    ly += 30;
-
-    SettingsUI::Row(x, ly, "Controller:", bt_drv ? "Bound" : "No adapter");
-    ly += 22;
-
-    SettingsUI::Row(x, ly, "Driver:",
-        bt_drv ? (bt_drv->description[0] ? bt_drv->description : bt_drv->name)
-               : "No controller metadata");
-    ly += 22;
-
-    if(bt_drv){
-        SettingsUI::Row(x, ly, "Binding:", bt_drv->name);
-        ly += 22;
-    }
-    // paired/discoverable state - no pairing api in this kernel yet. (satoru)
-    SettingsUI::Row(x, ly, "Paired:", "0 devices");
-    ly += 22;
-    SettingsUI::Row(x, ly, "Discoverable:", s_bt_enabled ? "While panel open" : "Off");
-    ly += 30;
-
-    // ── interfaces table ─────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "Interfaces");
-    ly += 26;
-
-    // header row. (satoru)
-    Graphics::DrawString(x,       ly, "Iface",  SettingsUI::COL_DIM, 0xFF000000);
-    Graphics::DrawString(x + 70,  ly, "IPv4",   SettingsUI::COL_DIM, 0xFF000000);
-    Graphics::DrawString(x + 220, ly, "Status", SettingsUI::COL_DIM, 0xFF000000);
-    ly += 20;
-
-    // loopback is always up. (satoru)
-    Graphics::DrawString(x,       ly, "lo",        SettingsUI::COL_TEXT, 0xFF000000);
-    Graphics::DrawString(x + 70,  ly, "127.0.0.1", SettingsUI::COL_TEXT, 0xFF000000);
-    Graphics::DrawString(x + 220, ly, "UP",        SettingsUI::COL_ON,   0xFF000000);
-    ly += 20;
-
-    // eth0 reflects the live interface. (satoru)
-    {
-        const char* ipv = " - ";
-        if(eth){ net_ip_str(eth->ip, buf, 64); ipv = buf; }
-        Graphics::DrawString(x,       ly, "eth0", SettingsUI::COL_TEXT, 0xFF000000);
-        Graphics::DrawString(x + 70,  ly, ipv,    SettingsUI::COL_TEXT, 0xFF000000);
-        Graphics::DrawString(x + 220, ly, eth_up ? "UP" : "DOWN",
-                             eth_up ? SettingsUI::COL_ON : SettingsUI::COL_OFF, 0xFF000000);
-        ly += 20;
-    }
+    Group("Bluetooth");
+    const LinuxDriver* bt = bt_driver();
+    if(bt) Info("Adapter", bt->description[0] ? bt->description : bt->name, "Pairing is not supported yet");
+    else   Info("Bluetooth", "Not available", "No Bluetooth adapter was found");
+    EndGroup();
 }
 
-// ── input: pane-local mx,my. we replay the SAME running-y layout used by
-//    render (already offset by -scroll) so the hit rects line up. only the
-//    interactive rows (wi-fi toggle/scan, bluetooth toggle) need tracking;
-//    everything else just advances the cursor. (satoru)
-static bool network_input(int mx, int my, bool click, char key, int scroll){
-    (void)key;
-    if(!click) return false;
-
-    int ctrl_x = CTRL_X_OFF;
-    int ly = -scroll + 8;
-
-    NetworkInterface* eth = Network::GetInterface("eth0");
-    const LinuxDriver* bt_drv = net_find_bt_driver();
-
-    // ── ethernet block (read-only): mirror render's advances exactly. ────
-    ly += 26;                               // "Ethernet" header (satoru)
-    ly += 22;                               // link row (satoru)
-    if(eth){
-        ly += 22;   // ipv4 (satoru)
-        ly += 22;   // mac (satoru)
-        ly += 22;   // gateway (satoru)
-        ly += 22;   // dns (satoru)
-        ly += 22;   // rx (satoru)
-        ly += 22;   // tx (satoru)
-        ly += 30;   // driver (satoru)
-    } else {
-        ly += 30;   // detected row (satoru)
-    }
-
-    // ── wi-fi block ──────────────────────────────────────────────────────
-    ly += 26;                               // "Wi-Fi" header (satoru)
-
-    // wi-fi enable toggle. (satoru)
-    if(SettingsUI::ToggleHit(ctrl_x, ly, mx, my)){
-        s_wifi_enabled = !s_wifi_enabled;
-        UIConfig::SetInt("net.wifi_enabled", s_wifi_enabled ? 1 : 0, true);
-        UIConfig::Save();
-        if(s_wifi_enabled){ WiFi::Enable(); WiFi::Scan(); }
-        else               WiFi::Disable();
-        return true;
-    }
-    // scan pill (a dropdown widget reused as a button - either arrow rescans). (satoru)
-    {
-        int hit = SettingsUI::DropdownHit(ctrl_x + SettingsUI::TOGGLE_W + 12, ly - 1, SCAN_W, mx, my);
-        if(hit >= 0){
-            if(s_wifi_enabled) WiFi::Scan();
-            return true;
-        }
-    }
-    ly += 30;                               // toggle/scan row (satoru)
-    ly += 22;                               // status row (satoru)
-    ly += 22;                               // adapter row (satoru)
-
-    // connected summary occupies two rows when present (matches render). (satoru)
-    {
-        WiFiNetwork* cw = WiFi::GetConnectedNetwork();
-        if(WiFi::GetState() == WIFI_CONNECTED && cw){
-            ly += 22;   // connected ssid (satoru)
-            ly += 22;   // signal (satoru)
-        }
-    }
-
-    ly += 22;                               // "Available networks:" label (satoru)
-    {
-        int rows = net_wifi_rows();
-        if(rows > 0){
-            WiFiNetwork* nets = WiFi::GetNetworks();
-            // each scanned row is a 20px-tall click target spanning the pane. tapping
-            // toggles connect/disconnect; open networks join with an empty key, the
-            // connected one disconnects, secured ones can't join without a password
-            // (no text field here) so we just report the click. (satoru)
-            for(int i = 0; i < rows && nets; i++){
-                if(my >= ly && my < ly + 20){
-                    const WiFiNetwork& n = nets[i];
-                    if(n.connected){
-                        WiFi::Disconnect();
-                    } else if(n.security == WIFI_OPEN && n.ssid[0]){
-                        WiFi::Connect(n.ssid, "");
-                    }
-                    // secured + no-ssid rows: nothing to do but repaint. (satoru)
-                    return true;
-                }
-                ly += 20;
-            }
-        } else {
-            ly += 20;                       // the empty-state line (satoru)
-        }
-    }
-    ly += 28;                               // connect-guidance line (satoru)
-
-    // ── bluetooth block ──────────────────────────────────────────────────
-    ly += 26;                               // "Bluetooth" header (satoru)
-
-    // bluetooth enable toggle. (satoru)
-    if(SettingsUI::ToggleHit(ctrl_x, ly, mx, my)){
-        s_bt_enabled = !s_bt_enabled;
-        UIConfig::SetInt("net.bt_enabled", s_bt_enabled ? 1 : 0, true);
-        UIConfig::Save();
-        return true;
-    }
-    ly += 30;                               // toggle row (satoru)
-    ly += 22;                               // controller row (satoru)
-    ly += 22;                               // driver row (satoru)
-    if(bt_drv) ly += 22;                    // binding row (satoru)
-    ly += 22;                               // paired row (satoru)
-    ly += 30;                               // discoverable row (satoru)
-
-    // interfaces table is read-only; no hit-testing needed past here. (satoru)
-    return false;
-}
-
-// total content height for the scrollbar. it mirrors the conditional advances in
-// render so the scroll range tracks what is actually drawn. (satoru)
-static int network_content_height(){
-    int h = 8;
-
-    NetworkInterface* eth = Network::GetInterface("eth0");
-    const LinuxDriver* bt_drv = net_find_bt_driver();
-
-    // ethernet (satoru)
-    h += 26 + 22;
-    if(eth) h += 22 + 22 + 22 + 22 + 22 + 22 + 30;  // ipv4,mac,gw,dns,rx,tx,driver (satoru)
-    else    h += 30;
-
-    // wi-fi (satoru)
-    h += 26;            // header (satoru)
-    h += 30 + 22 + 22;  // toggle/scan, status, adapter (satoru)
-    {
-        WiFiNetwork* cw = WiFi::GetConnectedNetwork();
-        if(WiFi::GetState() == WIFI_CONNECTED && cw) h += 22 + 22;
-    }
-    h += 22;            // "available networks:" label (satoru)
-    {
-        int rows = net_wifi_rows();
-        h += (rows > 0) ? (20 * rows) : 20;
-    }
-    h += 28;            // connect-stub line (satoru)
-
-    // bluetooth (satoru)
-    h += 26;                  // header (satoru)
-    h += 30 + 22 + 22;        // toggle, controller, driver (satoru)
-    if(bt_drv) h += 22;       // binding (satoru)
-    h += 22 + 30;             // paired, discoverable (satoru)
-
-    // interfaces table (satoru)
-    h += 26 + 20 + 20 + 20;   // header + lo + eth0 (satoru)
-
-    h += 16;                  // tail padding (satoru)
-    return h;
-}
-
-// `extern` forces EXTERNAL linkage on this const definition so the shell's
-// `extern const SettingsModule g_network_module;` resolves at link time. (satoru)
 extern const SettingsModule g_network_module = {
-    "network", "Network", "\x0b",
-    network_on_show, network_render, network_input, network_content_height
+    "network", "Network", "", network_on_show, nullptr, nullptr, nullptr, network_build
 };
 // end (satoru)

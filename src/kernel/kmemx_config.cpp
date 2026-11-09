@@ -69,21 +69,35 @@ void ApplyConfig() {
 
     bool want = UIConfig::Bool("kmemx.enabled", true);
     if (g_cmdline_forced_off) want = false;   // cmdline a/b override (satoru)
+    if (IsLowRamOff()) want = false;          // below the ram floor: fully off (satoru)
     SetEnabled(want);
 
-    if (want) {
+    if (want && IsInitialized()) {
         uint64_t mb = KMemXPool::TotalBytes() / (1024 * 1024);
         SerialLogger::Log("[KMemX] starting compression engine... pool=");
         SerialLogger::LogDec((int)mb);
-        SerialLogger::Log("MB\r\n");
+        SerialLogger::Log("MB (adaptive, cap=");
+        SerialLogger::LogDec((int)(PoolCapBytes() / (1024 * 1024)));
+        SerialLogger::Log("MB)\r\n");
         StartProcess();
     } else {
-        SerialLogger::Log("[KMemX] disabled by user configuration\r\n");
+        SetEnabled(false);
+        // off: hand back the table + scratch Init took at boot, so a disabled
+        // engine costs no memory at all. (satoru)
+        ReleaseResources();
+        if (IsLowRamOff()) SerialLogger::Log("[KMemX] off: RAM below 256 MB (nothing reserved)\r\n");
+        else SerialLogger::Log("[KMemX] disabled by user configuration (nothing reserved)\r\n");
     }
     WriteConfFile();
 }
 
 bool Enable() {
+    // the tables are released while the engine is off; take them back now.
+    // below the ram floor (or if the pmm cannot give them) stay off. (satoru)
+    if (!IsInitialized() && !Init(PoolPct())) {
+        SerialLogger::Log("[KMemX] enable refused: could not allocate tables (or RAM below 256 MB)\r\n");
+        return false;
+    }
     UIConfig::SetInt("kmemx.enabled", 1, true);
     UIConfig::Save();
     SetEnabled(true);
@@ -97,6 +111,7 @@ int Disable() {
     // stop scanning first so the worker does not re-compress while we drain. (satoru)
     SetEnabled(false);
     int restored = DecompressAll();   // pull every pooled page back into ram (satoru)
+    ReleaseResources();               // empty chunks + tables back to the pmm (satoru)
     UIConfig::SetInt("kmemx.enabled", 0, true);
     UIConfig::Save();
     WriteConfFile();
@@ -159,14 +174,17 @@ int StatusText(char* out, int mx) {
     int p = 0;
     p = sappend(out, p, mx, "KMemX (Kurono Memory Compression Engine)\n");
     p = sappend(out, p, mx, "  status:        ");
-    p = sappend(out, p, mx, IsInitialized() ? (IsEnabled() ? "ENABLED\n" : "disabled\n") : "not initialized\n");
+    p = sappend(out, p, mx, IsInitialized() ? (IsEnabled() ? "ENABLED\n" : "disabled\n")
+                                            : (IsLowRamOff() ? "off (RAM below 256 MB)\n" : "off (nothing reserved)\n"));
     p = sappend(out, p, mx, "  worker:        ");
     p = sappend(out, p, mx, ProcessRunning() ? "running\n" : "stopped\n");
     p = sappend(out, p, mx, "  pool size:     ");
     p = sappend_u(out, p, mx, st.pool_bytes / (1024 * 1024));
-    p = sappend(out, p, mx, " MB (");
+    p = sappend(out, p, mx, " MB (adaptive, cap ");
+    p = sappend_u(out, p, mx, PoolCapBytes() / (1024 * 1024));
+    p = sappend(out, p, mx, " MB = ");
     p = sappend_u(out, p, mx, (uint64_t)PoolPct());
-    p = sappend(out, p, mx, "% of RAM)\n");
+    p = sappend(out, p, mx, "% of RAM max)\n");
     p = sappend(out, p, mx, "  pool used:     ");
     p = sappend_u(out, p, mx, st.pool_used / 1024);
     p = sappend(out, p, mx, " KB\n");
@@ -309,10 +327,13 @@ static bool arg_is(const char* a, const char* b) {
 }  // namespace
 
 int CmdKmemx(void* /*sh*/, int argc, const char** argv, char* out, int mx) {
-    if (!IsInitialized()) {
-        return sappend(out, 0, mx, "kmemx: engine not initialized\n");
-    }
     const char* sub = (argc >= 2) ? argv[1] : "status";
+    // an engine that is off holds no tables (nothing reserved), so only
+    // status and enable make sense until Enable() re-allocates them. (satoru)
+    if (!IsInitialized() && !arg_is(sub, "enable") && !arg_is(sub, "status")) {
+        return sappend(out, 0, mx, IsLowRamOff() ? "kmemx: off (RAM below 256 MB)\n"
+                                                 : "kmemx: engine off, nothing reserved (kmemx enable)\n");
+    }
 
     if (arg_is(sub, "status")) {
         return StatusText(out, mx);

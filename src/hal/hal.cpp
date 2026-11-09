@@ -9,6 +9,72 @@
 #include "../kernel/vmm.h"         // resolve user va->phys to dump the tls/tcb at a fault (satoru)
 #include "../kernel/kdf.h"         // kdf guard-page fault isolation (catches driver oob -> no panic) (satoru)
 #include "../kernel/kmemx.h"        // kmemx compressed-page fault decompression path (satoru)
+#include "../drivers/timer.h"       // Timer::GetRealMs64 for the busy sampler (satoru)
+#include "../kernel/kld_broker.h"   // kld msi vectors 0x50..0x57 -> broker doorbell (satoru)
+#include "../kernel/taskmem.h"      // kurono.taskmem=1 interrupt marks (satoru)
+// busy MILLISECONDS per cpu (64-bit, no wrap), read by the task manager. charged
+// by hal_sample_busy from each core's own timer irq using real elapsed time, so
+// the bsp 1 kHz pit and the ap 100 Hz lapic timers need no shared rate. (satoru)
+volatile uint64_t g_cpu_busy_ticks[16];
+// the same per-cpu interval split by the ring the timer interrupted, plus the
+// total sampled wall time: /proc/stat derives user/system/idle from these. (satoru)
+volatile uint64_t g_cpu_total_ms[16];
+volatile uint64_t g_cpu_user_ms[16];
+volatile uint64_t g_cpu_sys_ms[16];
+// per-pid busy milliseconds side table (struct Process stays untouched); a slot
+// is re-tagged when another pid hashes onto it. read by Scheduler::GetProcessSnapshot. (satoru)
+struct HalPidBusy { volatile uint32_t pid; volatile uint32_t ms; volatile uint32_t user_ms; volatile uint32_t sys_ms; };
+static HalPidBusy g_pid_busy[256];
+static uint64_t   g_busy_last_ms[16];
+uint64_t hal_pid_busy_ms(uint32_t pid) {
+    HalPidBusy& s = g_pid_busy[pid & 255u];
+    return s.pid == pid ? (uint64_t)s.ms : 0ull;
+}
+void hal_pid_cpu_ms(uint32_t pid, uint64_t* user_ms, uint64_t* sys_ms, uint64_t* total_ms) {
+    HalPidBusy& s = g_pid_busy[pid & 255u];
+    bool hit = (s.pid == pid);
+    if (user_ms)  *user_ms  = hit ? (uint64_t)s.user_ms : 0ull;
+    if (sys_ms)   *sys_ms   = hit ? (uint64_t)s.sys_ms : 0ull;
+    if (total_ms) *total_ms = hit ? (uint64_t)s.ms : 0ull;
+}
+// timer-irq sampler: this core was busy for the real time since its last tick if
+// it was in ring 3, or in ring 0 running a non-idle task that is not parked on
+// hlt. idle (pid 0 / hlt) is never counted. (satoru)
+static void hal_sample_busy(InterruptFrame* frame, uint32_t cpu) {
+    cpu &= 15u;
+    uint64_t now = Timer::GetRealMs64();
+    uint64_t last = g_busy_last_ms[cpu];
+    if (now == last) return;
+    g_busy_last_ms[cpu] = now;
+    if (last == 0) return;
+    uint64_t dt = now - last;
+    if (dt > 200) dt = 200;
+    g_cpu_total_ms[cpu] += dt;
+    Process* cur = Scheduler::GetCurrentProcess();
+    bool user = ((frame->cs & 3) == 3);
+    bool busy;
+    if (user) {
+        busy = true;
+    } else {
+        busy = cur && cur->pid != 0 && cur->state == Process_Running &&
+               frame->rip > 0x1000 && *(volatile uint8_t*)(frame->rip - 1) != 0xF4;
+    }
+    if (!busy) return;
+    g_cpu_busy_ticks[cpu] += dt;
+    if (user) g_cpu_user_ms[cpu] += dt; else g_cpu_sys_ms[cpu] += dt;
+    if (cur && cur->pid != 0) {
+        HalPidBusy& s = g_pid_busy[cur->pid & 255u];
+        if (s.pid != cur->pid) { s.pid = cur->pid; s.ms = 0; s.user_ms = 0; s.sys_ms = 0; }
+        s.ms += (uint32_t)dt;
+        if (user) s.user_ms += (uint32_t)dt; else s.sys_ms += (uint32_t)dt;
+    }
+}
+// test rig (kurono.ffcrash=S): crash firefox once, S s after exec, by pointing a
+// ring-3 bsp thread of its address space at rip 0 on a timer tick. (satoru)
+volatile uint64_t g_ffcrash_as = 0;
+volatile uint64_t g_ffcrash_at = 0;
+volatile uint32_t g_ffcrash_secs = 0;
+volatile int      g_ffreopen_left = 0;
 
 //  x86_64 idt, pic 8259a, and isr implementation
 //  isr stubs live in isr_stubs.asm - this file builds the idt from the
@@ -71,6 +137,10 @@ extern "C" {
     extern void isr_stub_128();
     extern void isr_stub_64();            // per-AP LAPIC timer (smp phase 4) (satoru)
     extern void isr_stub_65();            // tlb-shootdown ipi (smp thread dispatch) (satoru)
+    extern void isr_stub_66();            // sched=2 resched ipi (satoru)
+    // kld broker msi vectors 0x50..0x57 (satoru)
+    extern void isr_stub_80(); extern void isr_stub_81(); extern void isr_stub_82(); extern void isr_stub_83();
+    extern void isr_stub_84(); extern void isr_stub_85(); extern void isr_stub_86(); extern void isr_stub_87();
 }
 
 static const char* exception_names[32] = {
@@ -317,8 +387,49 @@ static void log_hex(const char* prefix, uint64_t val) {
     SerialLogger::Log(buf);
 }
 
+// sched=2 ring-3 fault containment on an application processor: kill the
+// faulting address-space group and iret this cpu back into its dispatch loop,
+// instead of parking the core for the rest of the session. the frame lives on
+// the dead task's kernel stack; the cpu leaves that stack at the iretq, and the
+// deferred release (ReleaseOnCpu -> FinishSwitch in the dispatch loop) only then
+// lets a reaper free it. returns true if it rewrote the frame. (satoru)
+static bool sched2_contain_ap_fault(InterruptFrame* frame) {
+    if (!Scheduler::SchedV2() || SMP::CpuIndex() == 0) return false;
+    Process* dead = Scheduler::GetCurrentProcess();
+    // leave the dead group's cr3 BEFORE this cpu stops looking busy: once
+    // current is null a launcher may tear the address space down, and this cpu
+    // still has to run the rest of this handler. (satoru)
+    SMP::LoadKernelCr3();
+    if (dead && dead->is_user()) {
+        Process* grp[256];   // firefox runs ~50+ threads; 64 left a tail alive (satoru)
+        int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, 256);
+        for (int i = 0; i < gn; i++) Scheduler::MarkProcessExited(grp[i], 139);
+        if (gn == 0) Scheduler::MarkProcessExited(dead, 139);
+        Scheduler::ReleaseOnCpu(dead);
+    }
+    Scheduler::SetCurrentForThisCpu(nullptr);
+    SerialLogger::Log("[sched2] ring-3 fault contained: group killed, cpu back to dispatch\r\n");
+    SMP::ApIdleFrame(frame);
+    return true;
+}
+
+// kurono.taskmem=1: heap allocations made while this mark is up are interrupt
+// work and go to "kernel", not to the interrupted task. restores the outer
+// mark on every return path. (satoru)
+struct TmIrqMark {
+    bool on; uint32_t cpu; uint64_t prev;
+    explicit TmIrqMark(const void* f) : on(TaskMem::g_on), cpu(0), prev(on ? TaskMem::IrqEnter(f, &cpu) : 0) {}
+    ~TmIrqMark() { if (on) TaskMem::IrqLeave(cpu, prev); }
+};
+
 extern "C" void isr_common_handler(InterruptFrame* frame) {
     uint64_t vec = frame->vector;
+
+    // sched=2 stack hand-off: publish on_cpu=0 for a task this cpu switched away
+    // from, once rsp is off its kernel stack (FinishSwitch checks rsp itself, so
+    // a nested interrupt still on that stack is a no-op). interrupts and ring-3
+    // faults only; a ring-0 fault path is left untouched. (satoru)
+    if (vec >= 32 || (frame->cs & 3) == 3) Scheduler::FinishSwitch();
 
     if (vec == 0x80) {
         if (syscall_handler) {
@@ -329,10 +440,24 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         return;
     }
 
+    if (vec == 32 && g_ffcrash_as && (frame->cs & 3) == 3 && Scheduler::NowMs() >= g_ffcrash_at) {
+        Process* fc = Scheduler::GetCurrentProcess();
+        if (fc && fc->address_space == g_ffcrash_as) {
+            g_ffcrash_as = 0;
+            SerialLogger::Log("[ffcrash] injected rip=0 into pid ");
+            SerialLogger::LogDec((int)fc->pid);
+            SerialLogger::Log("\r\n");
+            frame->rip = 0;
+        }
+    }
+
     // per-AP LAPIC timer (smp phase 4): preempt the user thread this ap is running,
     // then signal end-of-interrupt to the local apic. fires only while ring-3 user
     // code runs (ApTimerPreempt no-ops otherwise). (satoru)
     if (vec == 0x40) {
+        // per-core load side table for the task manager: busy ms from real
+        // elapsed time on this cpu. no effect on scheduling. (satoru)
+        hal_sample_busy(frame, SMP::Current()->cpu_index);
         Scheduler::ApTimerPreempt(frame);
         SMP::LapicWrite(0xB0, 0);   // lapic EOI register (satoru)
         return;
@@ -347,7 +472,29 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         return;
     }
 
+    // sched=2 resched ipi: the wake already happened in memory; the interrupt
+    // only exists to break the target out of hlt. eoi and return. (satoru)
+    if (vec == 0x42) {
+        SMP::LapicWrite(0xB0, 0);
+        // from ring 3: a kick for a pending signal or a kill - act on it at
+        // this return to user mode. (satoru)
+        if ((frame->cs & 3) == 3) Scheduler::ApUserIrqCheck(frame);
+        return;
+    }
+
+    // kld broker msi (vectors 0x50..0x57): doorbell + wake only, then lapic eoi.
+    // msi goes straight to the lapic, never through the 8259. (satoru)
+    if (vec >= 0x50 && vec < 0x58) {
+        TmIrqMark _tm(frame);   // (satoru)
+        KldBroker::OnVector((uint32_t)vec);
+        SMP::LapicWrite(0xB0, 0);   // lapic EOI register (satoru)
+        return;
+    }
+
     if (vec < 32) {
+        // guarded kernel stacks: an overflow where the #pf frame push itself hit
+        // the guard comes in as #DF (ist2) with cr2 still naming the guard. (satoru)
+        if (vec == 8 && Scheduler::KstackGuardHit(frame->cr2)) return;
         if (vec == 14) {
             // 1) Adaptive kernel-stack growth: if CR2 falls in any kernel
             //    process's guard page, allocate a fresh page and resume.
@@ -491,8 +638,40 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                     raw_str(" r13="); raw_hex(frame->r13);
                     raw_str(" r14="); raw_hex(frame->r14);
                     raw_str("\r\n");
+                    raw_str("[RAWEXC2] rdi="); raw_hex(frame->rdi);
+                    raw_str(" rsi="); raw_hex(frame->rsi);
+                    raw_str(" rdx="); raw_hex(frame->rdx);
+                    raw_str(" rcx="); raw_hex(frame->rcx);
+                    raw_str(" r8="); raw_hex(frame->r8);
+                    raw_str(" r9="); raw_hex(frame->r9);
+                    raw_str(" r10="); raw_hex(frame->r10);
+                    raw_str(" r11="); raw_hex(frame->r11);
+                    raw_str("\r\n");
                     Process* ft = Scheduler::GetCurrentProcess();
                     if (ft && ft->is_user()) {
+                        // a ring-3 hlt is musl's a_crash assert. dump the words
+                        // around the likely offending pointer (rdi) and the two
+                        // callee-saved pointers so a corrupted header can be read
+                        // back through the page tables on the next boot. (satoru)
+                        if (vec == 13) {
+                            uint64_t spin[3] = { frame->rdi, frame->rbx, frame->r12 };
+                            for (int si = 0; si < 3; si++) {
+                                uint64_t c = spin[si];
+                                if (c < 0x10000ull || c >= 0x800000000000ull) continue;
+                                raw_str("[RAWEXC2] ptr"); raw_hex((uint64_t)si);
+                                raw_str("="); raw_hex(c); raw_str(":");
+                                for (int wi = -4; wi <= 4; wi++) {
+                                    uint64_t va = (c & ~7ULL) + (uint64_t)(wi * 8);
+                                    uint64_t ph = KernelVMM::QueryMappingInAddressSpace(
+                                        ft->address_space, va & ~0xFFFULL);
+                                    raw_str(" ");
+                                    if (ph) raw_hex(*(volatile uint64_t*)(uintptr_t)
+                                                    ((ph & ~0xFFFULL) | (va & 0xFFFULL)));
+                                    else raw_str("unmapped");
+                                }
+                                raw_str("\r\n");
+                            }
+                        }
                         raw_str("[RAWEXC2] savesite="); raw_hex(ft->last_save_site);
                         raw_str(" saveseq="); raw_hex(ft->save_seq);
                         raw_str(" oncpu="); raw_hex(ft->on_cpu);
@@ -553,8 +732,22 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         if ((frame->cs & 3) == 3) {
             { uint32_t mc = SMP::CpuIndex(); if (mc >= SMP_MAX_CPUS) mc = 0; s_exc_in_dump[mc] = 0; }
             SerialLogger::Log("[usrflt] ring-3 fault contained (no os panic)\r\n");
+            // the raw line above only reaches the uart: put the essentials in the disk log too (satoru)
+            SerialLogger::Log("[usrflt] vec="); SerialLogger::LogHex64(vec);
+            SerialLogger::Log(" rip="); SerialLogger::LogHex64(frame->rip);
+            SerialLogger::Log(" cr2="); SerialLogger::LogHex64(frame->cr2);
+            SerialLogger::Log(" err="); SerialLogger::LogHex64(frame->error_code);
+            SerialLogger::Log("\r\n");
+            // symbolized census line (thread, module+offset, stack, MOZ_CRASH
+            // reason). kernel tables + phys reads only, no user deref. (satoru)
+            LinuxSyscall::DumpUserFault(Scheduler::GetCurrentProcess(), frame->rip, frame->rsp,
+                                        vec == 14 ? frame->cr2 : ~0ull);
             // bsp: longjmp back to the RunProcessWithArgs launcher (SIGSEGV
             // semantics). no-op + returns on an ap (no launcher context). (satoru)
+            // sched=2 first: on an ap HandleProcessExit would mark the cpu's
+            // dispatch-time active_process exited, which after a preempt switch
+            // can be a different (or already reaped) task. (satoru)
+            if (sched2_contain_ap_fault(frame)) return;   // sched=2: no core lost (satoru)
             Userspace::HandleProcessExit(139);
             // ap fell through: kill the WHOLE faulting address-space group so no
             // sibling resumes the bad jit code on another core, then PARK this
@@ -566,8 +759,8 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             {
                 Process* dead = Scheduler::GetCurrentProcess();
                 if (dead && dead->is_user()) {
-                    Process* grp[64];
-                    int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, 64);
+                    Process* grp[SCHED_GROUP_MAX];   // was 64: firefox runs ~80 threads (satoru)
+                    int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, SCHED_GROUP_MAX);
                     for (int i = 0; i < gn; i++) Scheduler::MarkProcessExited(grp[i], 139);
                     if (gn == 0) { Scheduler::MarkProcessExited(dead, 139); grp[0] = dead; gn = 1; }
                     Scheduler::SetCurrentForThisCpu(nullptr);
@@ -763,6 +956,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             // normal buffered serial. (satoru)
             { uint32_t mc = SMP::CpuIndex(); if (mc >= SMP_MAX_CPUS) mc = 0; s_exc_in_dump[mc] = 0; }
             SerialLogger::SetPanicRaw(false);
+            if (sched2_contain_ap_fault(frame)) return;   // sched=2 first, see above (satoru)
             Userspace::HandleProcessExit(139);  // 128 + SIGSEGV; longjmps on the bsp launcher
             // still here = an AP-DISPATCHED user thread faulted: this cpu has no
             // launcher longjmp context. a ring-3 fault must NEVER panic the whole
@@ -781,8 +975,8 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             {
                 Process* dead = Scheduler::GetCurrentProcess();
                 if (dead && dead->is_user()) {
-                    Process* grp[64];
-                    int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, 64);
+                    Process* grp[SCHED_GROUP_MAX];   // was 64: firefox runs ~80 threads (satoru)
+                    int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, SCHED_GROUP_MAX);
                     for (int i = 0; i < gn; i++) Scheduler::MarkProcessExited(grp[i], 139);
                     if (gn == 0) { Scheduler::MarkProcessExited(dead, 139); grp[0] = dead; gn = 1; }
                     Scheduler::SetCurrentForThisCpu(nullptr);
@@ -836,6 +1030,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
     }
 
     if (vec >= 32 && vec < 48) {
+        TmIrqMark _tm(frame);   // taskmem: interrupt work is kernel's (satoru)
         uint8_t irq = (uint8_t)(vec - 32);
 
         // spurious irq detection: check pic isr register
@@ -864,6 +1059,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             // per tick. A fine tick keeps SleepMs wakeups (input/cursor) timely
             // for smooth 60fps; sleep deadlines + the ms clock are TSC-based and
             // independent of this rate. (satoru)
+            hal_sample_busy(frame, 0);   // bsp busy-time sample for the task manager (satoru)
             Scheduler::OnTimerTick(1);
         }
 
@@ -906,6 +1102,19 @@ void HAL::InitIDT() {
     // tlb-shootdown ipi (vector 0x41): another core changed page tables in an
     // address space this cpu may be running threads of - reload cr3. (satoru)
     idt_set(0x41, (uint64_t)(uintptr_t)&isr_stub_65, 0, 0);
+
+    // sched=2 resched ipi (vector 0x42): only wakes a halted ap out of hlt so
+    // its dispatch loop claims the task that just became runnable. (satoru)
+    idt_set(0x42, (uint64_t)(uintptr_t)&isr_stub_66, 0, 0);
+
+    // kld broker msi vectors 0x50..0x57, kernel-only (dpl 0). a device granted
+    // to a linux-driver container signals here; the broker bumps a doorbell
+    // counter and wakes the container. (satoru)
+    {
+        void (*kld_stubs[8])() = { isr_stub_80, isr_stub_81, isr_stub_82, isr_stub_83,
+                                   isr_stub_84, isr_stub_85, isr_stub_86, isr_stub_87 };
+        for (int i = 0; i < 8; i++) idt_set(0x50 + i, (uint64_t)(uintptr_t)kld_stubs[i], 0, 0);
+    }
 
     // vectors 48-255: leave as not-present (type_attr = 0).
     // if hardware triggers one, the cpu will fire a #gp which we handle above.

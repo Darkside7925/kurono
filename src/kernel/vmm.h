@@ -9,9 +9,9 @@
 //  when the kernel needs to map new physical memory (e.g., mmio, heap
 //  expansion, framebuffer at different virtual addresses).
 //
-//  currently all physical memory 0..16gb is identity-mapped via 2mb pages
-//  in boot. the vmm can overlay 4kb mappings on top of that for precise
-//  control.
+//  all physical memory 0..512gb is identity-mapped via 2mb pages in boot
+//  (the pmm manages ram up to that bound). the vmm can overlay 4kb mappings
+//  on top of that for precise control.
 
 constexpr uint64_t USERSPACE_BASE = 0x0000000040000000ULL;  // 1 GB low-half userspace window
 
@@ -34,6 +34,12 @@ constexpr uint64_t TASK_SIZE      = USER_SPACE_TOP + 1;  // 0x0000_8000_0000_000
 #define PTE_HUGE       (1ULL << 7)   // 2mb page (in pd), 1gb page (in pdpt)
 #define PTE_GLOBAL     (1ULL << 8)
 #define PTE_COW        (1ULL << 9)   // software-defined copy-on-write marker
+// software bit: a MAP_SHARED page (memfd / shm object). fork must not turn it
+// copy-on-write: the object's frames carry an extra ref per mapping, so the cow
+// handler always copied them and the parent's first write after any fork split
+// the page away from every other view of the object (gecko ipc shmem, wl_shm
+// pools the compositor reads). (satoru)
+#define PTE_SHARED     (1ULL << 10)
 #define PTE_NX         (1ULL << 63)  // no-execute (requires efer.nxe = 1)
 
 // ── kmemx page-aging software bits ──────────────────────────────────────────
@@ -65,6 +71,11 @@ public:
 
     // create a fresh address space that shares the kernel mappings but has
     // an independent user region starting at USERSPACE_BASE.
+    // kurono.memcensus=1: mark every frame reachable from a live user address
+    // space (leaves and tables) in bits; returns the live address-space count. (satoru)
+    static uint32_t CensusMarkUser(uint8_t* bits, uint64_t nframes, uint64_t* leaves,
+                                   uint64_t* tables, uint64_t* created, uint64_t* destroyed);
+    static void SetAddressSpaceDestroyHook(void (*hook)(uint64_t root));   // called first in DestroyAddressSpace (satoru)
     static uint64_t CreateAddressSpace();
 
     // clone an existing address space, duplicating user-owned pages while

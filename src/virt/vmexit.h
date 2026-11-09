@@ -44,6 +44,11 @@ struct IOAccessInfo {
 class VMExitHandler {
 public:
     static void Init();
+    // kvm-clock state for a new guest (tsc base, scale) (satoru)
+    static void ResetGuestClock();
+    // nanoseconds of guest system time (the kvm-clock the guest sees) (satoru)
+    static uint64_t GuestClockNs();
+    static void ResetLogBudget();
 
     static VMExitAction HandleExit(vCPU* cpu);
     static VMExitAction HandleSVMExit(vCPU* cpu);  // amd-specific

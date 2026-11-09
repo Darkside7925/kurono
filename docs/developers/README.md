@@ -3,11 +3,19 @@
 For anyone touching the kernel, the desktop, the shell, the VM stack, the installer or
 the drivers.
 
+## Start here
+
+- `build.md` how to build, the ISO, the EFI loaders, QEMU test tips
+- `architecture.md` the whole system on one page
+- `boot-flags.md` the `kurono.*` boot options and their defaults
+- `kui.md` the app toolkit and ring-3 apps
+
 ## Short version
 
-Single address space, poll-heavy, bare metal. Starts from Multiboot or EFI, brings up
-a framebuffer desktop, exposes a mixed shell, then layers a Linux personality and a
-type-1 hypervisor on top.
+Bare metal x86_64. Starts from Multiboot2 or my EFI loader, brings up a framebuffer
+desktop, exposes a mixed shell, then layers a Linux ABI layer, a Wayland server, a
+security model (ken, KSA), a hypervisor and sandboxed Linux drivers (KLD) on top. Apps
+are moving out of the kernel into ring 3 through the kui toolkit.
 
 Broad project, but the top-level shape fits in your head once the routes are clear:
 
@@ -15,8 +23,8 @@ Broad project, but the top-level shape fits in your head once the routes are cle
 2. `src/kernel/kurono_kernel.cpp` runs the long boot sequence
 3. `src/hal` owns interrupts, reboot, low-level port access, exception dispatch
 4. `src/drivers` talks to hardware and firmware-provided framebuffers
-5. `src/ui` owns the desktop, taskbar, window manager and presentation path
-6. `src/apps` has the built-in programs
+5. `src/ui` owns the desktop, dock, window manager, Wayland server and presentation path
+6. `src/apps` has the built-in programs, and `src/kui` is the toolkit they use
 7. `src/shell` owns parsing, command lookup, environment switching, cross-env execution
 8. `src/fs`, `src/system`, `src/packages`, `src/security`, `src/kcl`, `src/net`, `src/linux` and `src/virt` are the services layered above bring-up
 
@@ -75,6 +83,9 @@ Broad project, but the top-level shape fits in your head once the routes are cle
 - `drivers/GPU_PROBE.md` PCI GPU detection and hybrid topology
 - `drivers/AUDIO.md` audio services (AC97 / HDA)
 - `drivers/NVME.md` NVMe storage driver
+- also in `src/drivers` without a page yet: AHCI/SATA, xHCI USB (with hubs), igc NIC,
+  Wi-Fi, Intel display and modeset, USB audio, `intel_accel` (experimental, see
+  `boot-flags.md`)
 - `drivers/CPU_DETECT.md` CPUID and feature detection
 
 ### UI (`ui/`)
@@ -86,6 +97,7 @@ Broad project, but the top-level shape fits in your head once the routes are cle
 
 ### Apps (`apps/`)
 
+- `kui.md` how apps run as ring-3 programs (one source, two backends)
 - `apps/TASK_MANAGER.md` task manager with kill/restart
 - `apps/SETTINGS.md` settings application
 - `apps/TERMINAL.md` terminal emulator
@@ -129,7 +141,7 @@ Broad project, but the top-level shape fits in your head once the routes are cle
 
 ### Security (`security/`)
 
-- `security/SUPR.md` privilege system (Guest/User/Admin/Root/Sovereign roles)
+- `security/KEN.md` privilege system (Guest/User/Admin/Root/Sovereign roles)
 - `security/KSA.md` Kurono Secure Authorization (hypervisor-backed privilege prompts)
 
 ### Packages (`packages/`)

@@ -1,7 +1,7 @@
 #pragma once
 //  kurono os - media player application
 //  supports wav/mp3/aac/flac/mp4 via codecregistry + sb16/ac97/hda output
-#include "../ui/window_manager.h"
+#include "../kui/kui.h"
 #include "../kernel/types.h"
 #include "../media/codec.h"
 
@@ -47,13 +47,23 @@ public:
     static void SetVolume(int vol_pct);      // 0-100
     static int  GetVolume();
 
+    // now-playing snapshot for shell surfaces (control center). title is the
+    // current playlist file name, empty when nothing is loaded. (satoru)
+    static bool NowPlayingActive();
+    static const char* NowPlayingTitle();
+    static int  NowPlayingProgress();        // 0-100
+    static bool IsPlayingNow();
+    static bool IsPausedNow();
+    static void TogglePlayback();
+
     // playlist
     static void AddToPlaylist(const char* path);
     static void ClearPlaylist();
 
     // window callbacks
-    static void OnRender(Window* w);
-    static void OnInput(Window* w, int event, int a, int b);
+    static void OnFrame(kui::Window& w, kui::Canvas& c, uint32_t now_ms);
+    static bool OnEvent(kui::Window& w, const kui::Event& e);
+    static void WindowGone(kui::Window* who);    // the kui window was destroyed (satoru)
 
     // exposed state for render
     static int  win_id;
@@ -92,13 +102,13 @@ private:
     static int      fps_display;       // frames-per-second from the last window
     static uint32_t fps_window_start_ms;
 
-    static void RenderPlayerUI(Window* w);
-    static void RenderPlaylist(Window* w);
-    static void RenderControls(Window* w);
-    static void RenderProgressBar(Window* w);
-    static void RenderVideoPreview(Window* w);
-    static void RenderVolumeBar(Window* w);
-    static void RenderCodecInfo(Window* w);
+    static void RenderPlayerUI(kui::Canvas& c);
+    static void RenderPlaylist(kui::Canvas& c);
+    static void RenderControls(kui::Canvas& c);
+    static void RenderProgressBar(kui::Canvas& c);
+    static void RenderVideoPreview(kui::Canvas& c);
+    static void RenderVolumeBar(kui::Canvas& c);
+    static void RenderCodecInfo(kui::Canvas& c);
     static void CacheVideoInfo(int track_idx);
     static void LoadFile(const char* path);
     static MediaType DetectMediaType(const char* path);

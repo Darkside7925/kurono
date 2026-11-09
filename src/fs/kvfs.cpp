@@ -2,6 +2,16 @@
 #include "../drivers/serial.h"
 #include "../kernel/time.h"
 #include "../proc/kernel_locks.h"   // g_vfs_lock, SpinLockCpuGuard
+#include "../kernel/pmm.h"          // ram top bounds the node-pointer sanity check (satoru)
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 (satoru)
+
+// file nodes and contents are shared filesystem data: with kurono.taskmem=1
+// they are charged to the "File cache (KVFS)" bucket, not to whichever task
+// happened to write the file (the shell restoring /apps held ~360 mb). (satoru)
+static void* kvfs_heap_alloc(size_t n) {
+    TaskMem::AppScope s(TaskMem::APP_FILECACHE);
+    return KernelHeap::Alloc(n);
+}
 
 KVFSNode* KVFS::root = nullptr;
 KVFSNode* KVFS::cwd = nullptr;
@@ -102,7 +112,7 @@ static void PathCacheInvalidate() {
 }
 
 KVFSNode* KVFS::AllocNode(const char* name, KVFSNodeType type, uint16_t mode) {
-    KVFSNode* n = (KVFSNode*)KernelHeap::Alloc(sizeof(KVFSNode));
+    KVFSNode* n = (KVFSNode*)kvfs_heap_alloc(sizeof(KVFSNode));
     if (!n) return nullptr;
     kmemset(n, 0, sizeof(KVFSNode));
     kstrcpy(n->name, name, KVFS_MAX_NAME);
@@ -539,7 +549,7 @@ int KVFS::WriteFile_nolock(const char* path, const void* data, uint32_t len) {
     if (!node->content || node->content_capacity < len) {
         uint32_t new_cap = (len + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
         if (new_cap < KVFS_BLOCK_SIZE) new_cap = KVFS_BLOCK_SIZE;
-        uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
+        uint8_t* new_buf = (uint8_t*)kvfs_heap_alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
         // only free a LIVE heap block - node->content may be a stale/non-heap
         // pointer (deserialized image / freed elsewhere); a stray Free() trips
@@ -587,7 +597,7 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
     if (node->content && node->content_capacity == 0 && node->size > 0 &&
         !KernelHeap::IsValidBlock(node->content)) {
         uint32_t cap = kvfs_grow_cap(0, node->size + len);
-        uint8_t* own = (uint8_t*)KernelHeap::Alloc(cap);
+        uint8_t* own = (uint8_t*)kvfs_heap_alloc(cap);
         if (!own) return KVFS_ERR_NO_MEM;
         kmemcpy(own, node->content, node->size);
         node->content = own;
@@ -604,7 +614,7 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
         // grow geometrically so repeated small appends amortize to O(n) total
         // copying instead of re-copying on every 4 kb boundary. (satoru)
         uint32_t new_cap = kvfs_grow_cap(node->content_capacity, new_size);
-        uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
+        uint8_t* new_buf = (uint8_t*)kvfs_heap_alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
         if (node->content) {
             kmemcpy(new_buf, node->content, node->size);
@@ -725,7 +735,7 @@ int KVFS::Write(int fd, const void* buf, uint32_t len) {
         // write past the end keeps hole-fill semantics without re-zeroing bytes
         // we already hold. (satoru)
         uint32_t new_cap = kvfs_grow_cap(node->content_capacity, write_end);
-        uint8_t* new_buf = (uint8_t*)KernelHeap::Alloc(new_cap);
+        uint8_t* new_buf = (uint8_t*)kvfs_heap_alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
         if (node->content) {
             kmemcpy(new_buf, node->content, node->size);
@@ -961,12 +971,14 @@ uint32_t KVFS::DiskUsage(const char* path) {
         KVFSNode* n = stack[--sp];
         if (n->is_file()) total += n->size;
         // bound the child scan to the real children[] array and skip null or
-        // implausible child pointers (non-canonical / outside the 16gb identity
-        // map). without this, a corrupt child_count or a dangling tree node
-        // pushes a wild pointer that later faults the traversal with a #gp. (satoru)
+        // implausible child pointers (non-canonical / outside managed ram, which
+        // is no longer capped at 16 gb: heap regions can sit above it). without
+        // this, a corrupt child_count or a dangling tree node pushes a wild
+        // pointer that later faults the traversal with a #gp. (satoru)
+        const uintptr_t ram_top = (uintptr_t)PMM::GetPhysTop();
         for (int i = 0; i < n->child_count && i < KVFS_MAX_CHILDREN && sp < 256; i++) {
             KVFSNode* c = n->children[i];
-            if (c && (uintptr_t)c < 0x400000000ULL) stack[sp++] = c;
+            if (c && (uintptr_t)c < ram_top) stack[sp++] = c;
         }
     }
     return total;
@@ -1203,7 +1215,7 @@ static KVFSNode* kvfs_deser_node(const uint8_t* b, size_t size, size_t* pos,
     if (content_len) {
         uint32_t cap = (content_len + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
         if (cap < KVFS_BLOCK_SIZE) cap = KVFS_BLOCK_SIZE;
-        n->content = (uint8_t*)KernelHeap::Alloc(cap);
+        n->content = (uint8_t*)kvfs_heap_alloc(cap);
         if (!n->content) return nullptr;
         kmemcpy(n->content, b + *pos, content_len);
         n->content_capacity = cap;

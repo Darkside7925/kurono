@@ -8,10 +8,12 @@
 #include "browser.h"
 #include "../drivers/graphics.h"
 #include "../system/logging.h"
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
 
 int KBrowse::win_id = -1;
 
 void KBrowse::Open() {
+    TaskMem::AppScope _tms(TaskMem::APP_BROWSER);   // kurono.taskmem=1: charge to the app (satoru)
     if (win_id >= 0) return;
     RuntimeLog::LogAppEvent("browser", "open");
     win_id = WindowManager::CreateWindow("Browser (Removed)", 120, 80, 420, 260,

@@ -311,6 +311,61 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         Print(L"WARN: No GOP framebuffer\r\n");
     }
 
+    /* ── 5b. enumerate EVERY gop handle (multi-monitor facts) ──────────
+     * each handle is logged and passed to the kernel as an MB2 tag 0x4B52
+     * (kernel logs it into KURONO.LOG). flags: bit0 has a device path, bit1 is
+     * the primary framebuffer, bit2 = distinct, usable extra output. read-only:
+     * nothing is drawn or reconfigured here. (satoru) */
+    struct gop_x {
+        UINT64 base, size;
+        UINT32 w, h, pitch;
+        UINT8  fmt, flags, idx, pad;
+    } gopx[6];
+    int ngopx = 0;
+    {
+        EFI_HANDLE *hbuf = NULL;
+        UINTN hcount = 0;
+        EFI_STATUS ls = uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol,
+                                          &gop_guid, NULL, &hcount, &hbuf);
+        if (EFI_ERROR(ls) || !hbuf) {
+            Print(L"GOP enum: LocateHandleBuffer failed (%d)\r\n", (int)(ls & 0xFFFF));
+            hcount = 0;
+        }
+        Print(L"GOP enum: %d handle(s)\r\n", (int)hcount);
+        for (UINTN hi = 0; hi < hcount && ngopx < 6; hi++) {
+            EFI_GRAPHICS_OUTPUT_PROTOCOL *g = NULL;
+            EFI_STATUS hs = uefi_call_wrapper(BS->HandleProtocol, 3, hbuf[hi],
+                                              &gop_guid, (void **)&g);
+            if (EFI_ERROR(hs) || !g || !g->Mode || !g->Mode->Info) continue;
+            void *dp = NULL;
+            EFI_STATUS ds = uefi_call_wrapper(BS->HandleProtocol, 3, hbuf[hi],
+                                              &DevicePathProtocol, &dp);
+            struct gop_x *e = &gopx[ngopx];
+            e->base  = g->Mode->FrameBufferBase;
+            e->size  = g->Mode->FrameBufferSize;
+            e->w     = g->Mode->Info->HorizontalResolution;
+            e->h     = g->Mode->Info->VerticalResolution;
+            e->pitch = g->Mode->Info->PixelsPerScanLine * 4;
+            e->fmt   = (UINT8)g->Mode->Info->PixelFormat;
+            e->idx   = (UINT8)hi;
+            e->pad   = 0;
+            e->flags = (UINT8)((!EFI_ERROR(ds) && dp) ? 1 : 0);
+            if (e->base && e->base == fb_addr) e->flags |= 2;
+            /* usable extra: has a linear framebuffer in a known 32-bit format and
+             * its base differs from every output already accepted */
+            int dup = 0;
+            for (int k = 0; k < ngopx; k++) if (gopx[k].base == e->base) dup = 1;
+            if (!dup && e->base && !(e->flags & 2) && e->fmt <= 1 && e->w >= 640 && e->h >= 480 &&
+                e->pitch >= e->w * 4)
+                e->flags |= 4;
+            Print(L"GOP[%d]: base=0x%lx %dx%d pitch=%d fmt=%d devpath=%d %s%s\r\n",
+                  (int)hi, e->base, (int)e->w, (int)e->h, (int)e->pitch, (int)e->fmt,
+                  (int)(e->flags & 1), (e->flags & 2) ? L"PRIMARY " : L"",
+                  (e->flags & 4) ? L"EXTRA" : L"");
+            ngopx++;
+        }
+    }
+
     /* ── 6. Build Multiboot2-compatible info structure ─────────────── */
     {
         UINT8 *p = boot_info_buf;
@@ -398,6 +453,23 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
             t_fb->green_pos = 8; t_fb->green_mask = 8;
             t_fb->blue_pos = 0; t_fb->blue_mask = 8;
             p += (t_fb->size + 7) & ~(UINTN)7;
+        }
+
+        /* Tag 0x4B52: one per gop handle (see 5b). 40 bytes each. (satoru) */
+        for (int gi = 0; gi < ngopx; gi++) {
+            UINT32 *t = (UINT32 *)p;
+            t[0] = 0x4B52;
+            t[1] = 40;
+            *(UINT64 *)(p + 8)  = gopx[gi].base;
+            *(UINT64 *)(p + 16) = gopx[gi].size;
+            *(UINT32 *)(p + 24) = gopx[gi].w;
+            *(UINT32 *)(p + 28) = gopx[gi].h;
+            *(UINT32 *)(p + 32) = gopx[gi].pitch;
+            p[36] = gopx[gi].fmt;
+            p[37] = gopx[gi].flags;
+            p[38] = gopx[gi].idx;
+            p[39] = 0;
+            p += 40;
         }
 
         /* Tag 6: memory map - convert EFI memory map to MB2 format */

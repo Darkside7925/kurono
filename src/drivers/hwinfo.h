@@ -16,6 +16,10 @@ namespace HwInfo {
     void NoteUsbMouse();
     void NotePoll();                   // desktop input loop polled the keyboard (satoru)
     void DumpAll();
+    // read-only dump of the Intel display engine (pipes, planes, transcoder DDI
+    // function, DDI buffers, power wells) for 8086:7D67. maps BAR0 uncached through
+    // kdf and only ever READS; nothing is written. grep "[idisp]". (satoru)
+    void DumpIntelDisplay();
     void Heartbeat();
     // one-shot log of every keyboard candidate: i8042 state + what the ps/2 keyboard
     // answered at init, usb keyboards bound, interrupt transfers completed per device.

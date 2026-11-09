@@ -355,6 +355,8 @@ int fill_sink_record(uint8_t* buf, bool is_source) {
     return p;
 }
 
+void reap_dead_clients();
+
 void handle_request(Client* c, uint32_t cmd, uint32_t tag, const uint8_t* args,
                     int args_len) {
     uint8_t buf[1024];
@@ -440,6 +442,9 @@ void handle_request(Client* c, uint32_t cmd, uint32_t tag, const uint8_t* args,
                 send_error(c->sd, tag, PA_ERR_NORESOURCE);
                 break;
             }
+            // a dead client may still hold mixer slots if the audio process
+            // has not run since it went away: reap before taking one. (satoru)
+            reap_dead_clients();
             Stream* s = &c->streams[slot];
             s->in_use      = true;
             s->channel     = g_next_channel++;
@@ -629,9 +634,59 @@ void on_data(int sd, const uint8_t* data, int len, void* user) {
     }
 }
 
+// release everything a client holds: its mixer streams, then its client
+// record and the accepted (server-side) socket. (satoru)
+void drop_client(Client* c, const char* why) {
+    if (!c || !c->in_use) return;
+    int nstreams = 0;
+    for (int j = 0; j < PulseServer::PA_MAX_STREAMS_PER_CLIENT; j++) {
+        Stream* s = &c->streams[j];
+        if (!s->in_use) continue;
+        if (s->mixer_id >= 0) AudioServer::CloseStream(s->mixer_id);
+        s->mixer_id = -1;
+        s->in_use = false;
+        nstreams++;
+    }
+    int sd = c->sd;
+    c->rx_len = 0;
+    c->sd = -1;
+    c->in_use = false;
+    UnixSocket::Close(sd);
+    SerialLogger::Log("Pulse: client gone sd=");
+    SerialLogger::LogDec(sd);
+    SerialLogger::Log(" streams=");
+    SerialLogger::LogDec(nstreams);
+    SerialLogger::Log(" (");
+    SerialLogger::Log(why);
+    SerialLogger::Log(")\r\n");
+}
+
+// a client that disconnected or died (process exit closes its fds) was never
+// noticed: the server has no close callback, so its record, its accepted
+// socket and every mixer slot its streams held stayed taken for good. poll
+// the server-side end for a hung-up peer instead. (satoru)
+// reaping runs from the audio process (Pace) and from client syscalls (a new
+// connect, a stream create), so it is serialized on its own lock; it is never
+// held across on_data. (satoru)
+Spinlock g_reap_lock;
+void reap_dead_clients() {
+    SpinLockCpuGuard guard(g_reap_lock);
+    for (int i = 0; i < PulseServer::PA_MAX_CLIENTS; i++) {
+        Client* c = &g_clients[i];
+        if (!c->in_use) continue;
+        UnixSocket::Credentials cr;
+        if (UnixSocket::GetPeerCred(c->sd, &cr) != 0) drop_client(c, "socket gone");
+        else if (UnixSocket::PeerClosed(c->sd))     drop_client(c, "peer closed");
+    }
+}
+
 void on_connect(int server_sd, int new_sd, void* user) {
     (void)server_sd; (void)user;
+    reap_dead_clients();   // frees records of clients that died since the last pace (satoru)
     if (!alloc_client(new_sd)) {
+        SerialLogger::Log("Pulse: client table full, refusing sd=");
+        SerialLogger::LogDec(new_sd);
+        SerialLogger::Log("\r\n");
         UnixSocket::Close(new_sd);
         return;
     }
@@ -671,6 +726,7 @@ void Init() {
 }
 
 void Pace() {
+    reap_dead_clients();
     // for each live stream: how many client bytes has the mixer consumed
     // beyond what we already granted? request them in minreq-sized bites so
     // the client keeps ~tlength queued - this is real pulseaudio's pacing

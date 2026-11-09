@@ -19,6 +19,8 @@
 #include "../hal/hal.h"
 #include "../kernel/userspace.h"
 #include "../proc/scheduler.h"   // full Process def for LinuxProcess::task->exe_path (satoru)
+#include "../kernel/vmm.h"     // user-page check before the sctrace.fail path print (satoru)
+#include "../kernel/memcensus.h"   // lowmem trigger (satoru)
 #include "../proc/smp.h"         // cpu index in the [ff] trace (satoru)
 #include "../kernel/udf.h"       // SYS_UDF_CALL -> user driver framework proxy (satoru)
 #include "../kernel/kld_broker.h" // SYS_KLD_CALL -> linux-driver container pci broker (satoru)
@@ -26,6 +28,7 @@
 #include "../kernel/time.h"      // RealtimeBaseSeconds for REALTIME abs targets (satoru)
 #include "../kernel/pmm.h"       // sysinfo ram totals (satoru)
 #include "uaccess.h"             // AccessOk for sysinfo (satoru)
+extern uint64_t linux_shm_total_bytes();   // linux_syscall.cpp (satoru)
 
 // Globals shared with syscall_entry.asm: the kernel stack the fast-path stub
 // switches to, and a one-slot stash for the user rsp across that switch (every
@@ -203,10 +206,12 @@ constexpr NrMap kNrMap[] = {
     { 247, LSYS_WAITID },        // waitid (satoru)
     {  61, LSYS_WAITPID },       // wait4 -> sys_waitpid (rusage ignored; parent reaps children) (satoru)
     {  97, LSYS_GETRLIMIT },     // getrlimit -> existing rlimit handler (satoru)
+    { 160, LSYS_SETRLIMIT },     // setrlimit -> shared rlimit handler (satoru)
     { 302, LSYS_PRLIMIT64 },     // prlimit64 -> existing rlimit handler (satoru)
     {  72, LSYS_FCNTL },         // fcntl
     {  74, LSYS_FSYNC },         // fsync
     {  75, LSYS_FDATASYNC },     // fdatasync
+    { 162, LSYS_SYNC },          // sync is a no-op success (satoru)
     {  77, LSYS_FTRUNCATE },     // ftruncate
     {  99, LSYS_SYSINFO },       // sysinfo
     { 186, LSYS_GETTID },        // gettid
@@ -333,6 +338,8 @@ constexpr NrMap kNrMap[] = {
     { 166, LSYS_UMOUNT2 },
     { 167, LSYS_SWAPON },
     { 168, LSYS_SWAPOFF },
+    { 170, LSYS_SETHOSTNAME },   // sethostname (satoru)
+    { 171, LSYS_SETDOMAINNAME }, // setdomainname (satoru)
     { 179, LSYS_QUOTACTL },
     { 188, LSYS_SETXATTR },
     { 189, LSYS_LSETXATTR },
@@ -363,7 +370,9 @@ constexpr NrMap kNrMap[] = {
     { 252, LSYS_IOPRIO_GET },
     { 253, LSYS_INOTIFY_INIT1 },   // inotify_init -> init1 with flags 0
     { 256, LSYS_MIGRATE_PAGES },
+    { 258, LSYS_MKDIRAT },         // mkdirat (satoru)
     { 261, LSYS_FUTIMESAT },
+    { 263, LSYS_UNLINKAT },        // unlinkat, honours at_removedir (satoru)
     { 265, LSYS_LINKAT },
     { 266, LSYS_SYMLINKAT },
     { 268, LSYS_FCHMODAT },
@@ -391,6 +400,7 @@ constexpr NrMap kNrMap[] = {
     { 303, LSYS_NAME_TO_HANDLE_AT },
     { 304, LSYS_OPEN_BY_HANDLE_AT },
     { 305, LSYS_CLOCK_ADJTIME },
+    { 306, LSYS_SYNC },            // syncfs routes to the no-op sync (satoru)
     { 307, LSYS_SENDMMSG },
     { 308, LSYS_SETNS },
     { 310, LSYS_PROCESS_VM_READV },
@@ -521,6 +531,7 @@ static uint64_t g_sc_cyc[512];
 uint64_t g_sctrace_after_ms = 0;  // kurono.sctrace.ms=N: with sctrace=2, only after N ms uptime (satoru)
 int g_sctrace_minpid = 0;      // kurono.sctrace.pid=N: with sctrace=2, only pids >= N (satoru)
 bool g_sctrace_all = false;   // kurono.sctrace=2: log EVERY syscall on entry (capped) (satoru)
+bool g_sctrace_fail = false;  // kurono.sctrace.fail=1: failing syscall returns (satoru)
 extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                                           uint64_t a0, uint64_t a1,
                                           uint64_t a2, uint64_t a3,
@@ -572,7 +583,35 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
             for (int i = 0; i < 512; i++) { hot[i] = 0; hot_cyc[i] = 0; }
         }
     }
+    if (MemCensus::Enabled()) MemCensus::CheckLow();   // census builds only: catch a transient pmm drain (satoru)
     int64_t r = SyscallEntryX64Inner(nr, a0, a1, a2, a3, a4, a5);
+    // kurono.sctrace.fail=1: every failing syscall return (capped), pid/nr/ret/a0 and the path
+    // for path syscalls - finds what a spawned child trips over before its execve (claude's
+    // ripgrep exit 127 was a chdir). honours kurono.sctrace.pid / kurono.sctrace.ms. (satoru)
+    if (g_sctrace_fail && r < 0 && (r != -11 || nr == 56 || nr == 57 || nr == 58 || nr == 59 || nr == 435) &&
+        (g_sctrace_after_ms == 0 || Timer::GetRealMs64() >= g_sctrace_after_ms)) {
+        static int nf = 0;
+        LinuxProcess* lf = LinuxSyscall::Current();
+        if (nf < 4000 && lf && (int)lf->pid >= g_sctrace_minpid) {
+            nf++;
+            SerialLogger::Log("[sx] pid="); SerialLogger::LogDec((int)lf->pid);
+            SerialLogger::Log(" nr="); SerialLogger::LogDec((int)nr);
+            SerialLogger::Log(" r="); SerialLogger::LogDec((int)r);
+            SerialLogger::Log(" a0="); SerialLogger::LogHex64(a0);
+            uint64_t pp = 0;
+            if (nr == 59 || nr == 2 || nr == 4 || nr == 6 || nr == 21 || nr == 80) pp = a0;
+            if (nr == 257 || nr == 262 || nr == 332 || nr == 269) pp = a1;
+            // print the path only if both pages it may span are mapped USER pages: the failing
+            // call may well be an EFAULT on a bad pointer. (satoru)
+            if (pp > 0x1000 && pp < 0x0000800000000000ULL &&
+                (KernelVMM::QueryPageFlags(pp) & PTE_USER) && (KernelVMM::QueryPageFlags(pp + 80) & PTE_USER)) {
+                SerialLogger::Log(" ");
+                const char* sp = (const char*)(uintptr_t)pp;
+                for (int k = 0; k < 80 && sp[k]; k++) { char c[2] = { sp[k], 0 }; SerialLogger::Log(c); }
+            }
+            SerialLogger::Log("\r\n");
+        }
+    }
     if (g_sctrace && nr < 512 && g_sc_t0) { g_sc_cyc[nr] += __builtin_ia32_rdtsc() - g_sc_t0; g_sc_t0 = 0; }
     // [op] every open/openat result (capped), with the path - one line per file the runtime
     // touches. (satoru)
@@ -731,8 +770,8 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
     // user path is copied with the uaccess primitive so a bad pointer is EFAULT, not a
     // kernel fault. (satoru)
     char at_final[320];
-    if ((nr == 257 || nr == 258 || nr == 259 || nr == 262 || nr == 263 || nr == 267 || nr == 268 ||
-         nr == 269 || nr == 280 || nr == 332 || nr == 437) && (int)a0 != -100 && a1 > 0x1000) {
+    if ((nr == 257 || nr == 258 || nr == 259 || nr == 260 || nr == 262 || nr == 263 || nr == 267 ||
+         nr == 268 || nr == 269 || nr == 280 || nr == 332 || nr == 437) && (int)a0 != -100 && a1 > 0x1000) {
         LinuxProcess* ld = LinuxSyscall::Current();
         int dfd = (int)a0;
         if (ld && dfd >= 0 && dfd < LINUX_MAX_FDS && ld->fds[dfd].open && ld->fds[dfd].path[0]) {
@@ -1079,16 +1118,40 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
             uint64_t* si = (uint64_t*)(uintptr_t)a0;
             if (!si || !UAccess::AccessOk(a0, 112)) return -14;
             for (int i = 0; i < 14; i++) si[i] = 0;
-            uint64_t total = PMM::GetPhysTop();
+            uint64_t total = PMM::GetTotalMemory();   // usable ram, the same figure /proc/meminfo reports (GetPhysTop included the pci hole) (satoru)
             uint64_t freeb = PMM::GetFreeMemory();
             if (total > 0x4000000000ull) total = 0x4000000000ull;
             if (freeb > total) freeb = total;
             si[0] = Timer::GetRealMs64() / 1000;      // uptime (satoru)
             si[4] = total;                            // totalram, mem_unit = 1 (satoru)
             si[5] = freeb;                            // freeram (satoru)
+            si[6] = linux_shm_total_bytes();          // sharedram: live memfd objects (satoru)
             *(uint16_t*)&si[10] = (uint16_t)LinuxSyscall::ActiveProcessCount();   // procs (satoru)
             *(uint32_t*)&si[13] = 1;                  // mem_unit (satoru)
             return 0;
+        }
+        // small wrappers over existing handlers (satoru)
+        case 213: {  // epoll_create(size): size is not flags, so create1 gets flags 0 (satoru)
+            if ((int)a0 <= 0) return -22;  // -EINVAL
+            return LinuxSyscall::Dispatch(LSYS_EPOLL_CREATE1, 0, 0, 0, 0, 0);
+        }
+        case 76: {  // truncate(path, length): open o_wronly, ftruncate the full 64-bit length, close (satoru)
+            int fd = (int)LinuxSyscall::Dispatch(LSYS_OPEN, a0, 1 /* O_WRONLY */, 0, 0, 0);
+            if (fd < 0) return fd;
+            int64_t r = LinuxSyscall::Dispatch(LSYS_FTRUNCATE, (uint64_t)fd, a1, 0, 0, 0);
+            LinuxSyscall::Dispatch(LSYS_CLOSE, (uint64_t)fd, 0, 0, 0, 0);
+            return r;
+        }
+        case 81: {  // fchdir(fd): chdir through the fd's stored path (satoru)
+            LinuxProcess* lp = LinuxSyscall::Current();
+            int fd = (int)a0;
+            if (!lp || fd < 0 || fd >= LINUX_MAX_FDS || !lp->fds[fd].open) return -9;  // -EBADF
+            if (lp->fds[fd].type != LFD_KVFS && lp->fds[fd].type != LFD_EXT4) return -20;  // -ENOTDIR
+            if (!lp->fds[fd].path[0]) return -20;  // -ENOTDIR
+            return LinuxSyscall::Dispatch(LSYS_CHDIR, (uint64_t)(uintptr_t)lp->fds[fd].path, 0, 0, 0, 0);
+        }
+        case 260: {  // fchownat(dirfd, path, uid, gid, flags): chown logic on the path arg (satoru)
+            return LinuxSyscall::Dispatch(LSYS_CHOWN_PATH, a1, 0, 0, 0, 0);
         }
         // ── KDF/UDF hybrid-kernel addition (satoru) ─────────────────────────────
         // SYS_UDF_CALL: the user driver framework entry. a ring-3 udf driver
@@ -1107,15 +1170,13 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
         // SYS_KLD_CALL ("KLDB"): the kernel half of the linux-driver
         // compatibility layer. An UNTRUSTED ring-3 container running unmodified
         // upstream driver code reaches hardware only through here. The ABI is
-        // scalars-only on purpose - no user pointer crosses this boundary,
-        // because the syscall layer has no copy_from_user/access_ok yet and a
-        // pointer-taking broker op would be a privilege-escalation surface.
-        // Access is per-container grant-gated; see kld_broker.h. (satoru)
+        // scalars-only on purpose - no user pointer is dereferenced; data moves
+        // through broker-owned frames. Access is per-container (address space)
+        // grant-gated; see kld_broker.h. (satoru)
         case 0x4B4C4442: {
             HAL::EnableInterrupts();
             Process* cur = Scheduler::GetCurrentProcess();
-            int64_t r = KldBroker::Call(cur ? (int)cur->pid : -1,
-                                        (uint32_t)a0, a1, a2, a3, a4);
+            int64_t r = KldBroker::Call(cur, (uint32_t)a0, a1, a2, a3, a4);
             HAL::DisableInterrupts();
             return r;
         }

@@ -48,6 +48,7 @@ static uint8_t  g_sta_mac[6]  = {0};   // our station mac (satoru)
 static uint8_t  g_bssid[6]    = {0};   // the ap we're joining (satoru)
 static char     g_ssid[33]    = {0};
 static uint16_t g_seq         = 0;     // outgoing sequence-number counter (satoru)
+static int      g_conn_channel = 0;    // channel of the associated ap, restored after a scan (satoru)
 
 // pmk + handshake material (satoru)
 static uint8_t  g_pmk[32]     = {0};
@@ -273,6 +274,7 @@ bool HasRadio() { return g_ops != nullptr; }
 void UnregisterRadio() {
     if (g_ops && g_ops->stop) g_ops->stop(g_ctx);
     g_ops = nullptr; g_ctx = nullptr; g_dev = nullptr;
+    g_conn_channel = 0;
     g_state = SUPP_IDLE;
 }
 
@@ -287,6 +289,11 @@ int GetSignal() {
 // draining rx for beacons/probe-resps, dedup by bssid into out[]. (satoru)
 int Scan(WiFiNetwork* out, int max) {
     if (!g_ops || max <= 0) return 0;
+    // a scan started while associated must not leave the supplicant looking
+    // disconnected (that made the wifi state machine drop a healthy link). the
+    // old channel is restored after the sweep. (satoru)
+    SupplicantState prior = g_state;
+    bool keep_link = (prior == SUPP_HANDSHAKE_DONE && g_conn_channel > 0);
     if (g_ops->start && !g_ops->start(g_ctx)) { log2("[80211] scan: radio start failed", nullptr); return 0; }
     g_state = SUPP_SCANNING;
 
@@ -326,7 +333,12 @@ int Scan(WiFiNetwork* out, int max) {
         }
     }
 
-    g_state = SUPP_IDLE;
+    if (keep_link) {
+        if (g_ops->set_channel) g_ops->set_channel(g_ctx, g_conn_channel);
+        g_state = prior;
+    } else {
+        g_state = SUPP_IDLE;
+    }
     {
         char nb[8]; int p = 0, v = found;
         if (v == 0) nb[p++] = '0';
@@ -601,6 +613,7 @@ bool Connect(const char* ssid, const char* pass, uint8_t bssid_out[6]) {
     if (target < 0) { log2("[80211] connect: ssid not found in scan: ", ssid); return false; }
 
     i_memcpy(g_bssid, found[target].bssid.bytes, 6);
+    g_conn_channel = found[target].channel;
     if (bssid_out) i_memcpy(bssid_out, g_bssid, 6);
     int n2 = i_strlen(ssid); if (n2 > 32) n2 = 32;
     i_memcpy(g_ssid, ssid, n2); g_ssid[n2] = 0;
@@ -667,6 +680,7 @@ void Disconnect() {
     if (g_ops->tx_frame) g_ops->tx_frame(g_ctx, frame, pos);
     if (g_ops->stop) g_ops->stop(g_ctx);
     g_have_ptk = false; g_have_pmk = false; g_gtk_len = 0;
+    g_conn_channel = 0;
     g_state = SUPP_IDLE;
     log2("[80211] disconnected", nullptr);
 }

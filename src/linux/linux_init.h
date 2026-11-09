@@ -7,7 +7,7 @@
 //  1. mount virtual filesystems (/proc, /sys, /dev, /tmp)
 //  2. configure hostname, networking
 //  3. start essential services
-//  4. sync users from supr
+//  4. sync users from ken
 //  5. start default shell or login
 //
 //  services are managed similar to systemd targets:

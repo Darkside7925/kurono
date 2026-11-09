@@ -6,6 +6,7 @@
 #include "../drivers/serial.h"
 #include "../hal/hal.h"
 #include "../linux/linux_syscall.h"
+#include "../drivers/timer.h"   // sched=2 detached wait bounds (satoru)
 
 bool Userspace::initialized = false;
 UserspaceCpuState Userspace::cpu_state[SMP_MAX_CPUS] = {};
@@ -36,12 +37,31 @@ bool Userspace::IsActive() {
     return cpu().active_process != nullptr;
 }
 
+uint64_t Userspace::SessionIdleRsp(uint32_t cpu) {
+    if (cpu >= SMP_MAX_CPUS || !cpu_state[cpu].return_context_valid) return 0;
+    uint64_t r = cpu_state[cpu].return_context.kernel_rsp;
+    if (!r) return 0;
+    return (r - 1024) & ~0xFULL;   // a margin below the saved frame, 16-aligned (satoru)
+}
+
+int Userspace::SessionCpuOf(const Process* p) {
+    if (!p) return -1;
+    for (int i = 0; i < SMP_MAX_CPUS; i++) {
+        if (cpu_state[i].active_process == p && cpu_state[i].return_context_valid) return i;
+    }
+    return -1;
+}
+
 // smp thread dispatch: an ap resumes claimed sibling threads directly (no
 // RunProcessWithArgs session), so it must mark its per-cpu active process
 // explicitly or every IsActive() gate on that cpu stays false and the linux
 // syscall layer silently no-ops there. (satoru)
 void Userspace::SetActiveForThisCpu(Process* p) {
     cpu().active_process = p;
+}
+
+Process* Userspace::ActiveProcess() {
+    return cpu().active_process;
 }
 
 bool Userspace::MapUserPage(Process* proc, uint64_t virt_addr, const void* data,
@@ -282,10 +302,171 @@ static uint64_t build_initial_stack(uint64_t stack_top,
 
 }  // namespace
 
+// ── sched=2 detached launch ─────────────────────────────────────────────────
+// the old launcher entered ring 3 ON THE CALLING CPU and only came back when the
+// program exited, so the calling kernel proc (the shell, which serves every
+// terminal and every desktop launch) was frozen for the program's whole life,
+// and ring 3 owned the bsp the kernel services need. under sched=2 a call from a
+// kernel proc instead builds the program's first user frame, marks it
+// ap-resumable and lets the application processors run it like any other task,
+// while the caller waits cooperatively (SleepMs keeps every other kernel proc on
+// the bsp running). same contract for the caller: blocks until exit, returns the
+// exit code, the caller still owns proc. (satoru)
+static Process* g_cancel_owner = nullptr;
+static bool (*g_cancel_probe)() = nullptr;
+void Userspace::SetCancelProbe(Process* owner, bool (*probe)()) {
+    g_cancel_owner = owner;
+    g_cancel_probe = probe;
+}
+
+static bool detached_eligible() {
+    if (!Scheduler::DetachedLaunch() || !SMP::ApThreadSched()) return false;
+    if (SMP::OnlineCount() < 2 || SMP::CpuIndex() != 0) return false;
+    if (!Scheduler::IsPreemptiveKernelSchedulerActive()) return false;
+    Process* me = Scheduler::GetCurrentProcess();
+    return me && me->is_kernel_proc;
+}
+
+// true while `p` still has a cpu under it: running somewhere, or its last cpu
+// has not yet left its kernel stack (on_cpu, published by FinishSwitch). (satoru)
+static bool task_on_some_cpu(Process* p) {
+    if (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) return true;
+    for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+        PerCpu* pc = SMP::ByIndex(ci);
+        if (pc && pc->current == p) return true;
+    }
+    return false;
+}
+
+int Userspace::RunDetached(Process* proc, const char* const* argv,
+                           const char* const* envp, uint32_t uid, uint32_t gid) {
+    Process* waiter = Scheduler::GetCurrentProcess();
+    LinuxSyscall::LayerLock();
+    int slot = LinuxSyscall::CreateProcess(proc->name, uid, gid);
+    LinuxProcess* lp = (slot >= 0) ? LinuxSyscall::GetProcess(slot) : nullptr;
+    uint32_t lpid = 0;
+    if (lp) {
+        lp->task = proc;
+        lpid = lp->pid;
+        // same high brk window as the bsp launcher below (see its comment). (satoru)
+        constexpr uint64_t HIGH_BRK_BASE = 0x0000180000000000ULL;
+        constexpr uint64_t HIGH_BRK_SIZE = 0x0000000010000000ULL;
+        lp->brk_base    = HIGH_BRK_BASE;
+        lp->brk_current = HIGH_BRK_BASE;
+        lp->brk_max     = HIGH_BRK_BASE + HIGH_BRK_SIZE;
+    }
+    LinuxSyscall::LayerUnlock();
+    if (!lp) return -3;
+
+    // build the sysv stack with the program's address space active on this
+    // cpu (the writes go through its user va), then return to ours. a dynamic
+    // pie came with its stack already built by ld-kurono. (satoru)
+    uint64_t entry_rsp;
+    {
+        uint64_t kas = KernelVMM::GetCurrentAddressSpace();
+        KernelVMM::ActivateAddressSpace(proc->address_space);
+        if (proc->flags & PROCESS_FLAG_STACK_READY) {
+            entry_rsp = proc->rsp;
+        } else {
+            entry_rsp = build_initial_stack(proc->user_stack_top, argv, envp, proc);
+            if (!entry_rsp) entry_rsp = proc->user_stack_top;
+        }
+        KernelVMM::ActivateAddressSpace(kas);
+    }
+
+    // the first user frame: every gpr zero (the sysv entry contract, and glibc
+    // reads rdx as rtld_fini), user selectors, IF on. fs base and the fxsave
+    // image are already in proc (ld-kurono's install_main_tls / the seeded
+    // default) and LoadUserFrame installs them. (satoru)
+    memset(&proc->user_frame, 0, sizeof(proc->user_frame));
+    proc->user_frame.rip    = proc->rip;
+    proc->user_frame.rsp    = entry_rsp;
+    proc->user_frame.cs     = (uint64_t)(GDT_USER_CODE_SELECTOR | 3);
+    proc->user_frame.ss     = (uint64_t)(GDT_USER_DATA_SELECTOR | 3);
+    proc->user_frame.rflags = 0x202ULL;
+    proc->rsp = entry_rsp;
+    proc->has_user_frame = true;
+    proc->on_cpu = 0;
+    proc->state = Process_Ready;
+    Scheduler::MarkApResumable(proc);   // from here an ap may claim it (satoru)
+    Scheduler::KickIdleCpu();
+
+    SerialLogger::Log("[sched2] spawned pid=");
+    SerialLogger::LogDec((int)lpid);
+    SerialLogger::Log(" ");
+    SerialLogger::Log(proc->name);
+    SerialLogger::Log(" on the aps, launcher waits\r\n");
+
+    // wait for the leader, cooperatively. ctrl+c from the owning terminal kills
+    // the whole group. (satoru)
+    bool cancelled = false;
+    while (__atomic_load_n((int*)&proc->state, __ATOMIC_ACQUIRE) != (int)Process_Terminated) {
+        if (!cancelled && g_cancel_probe && (waiter == g_cancel_owner || !g_cancel_owner) && g_cancel_probe()) {
+            cancelled = true;
+            SerialLogger::Log("[sched2] cancel: killing the program's group\r\n");
+            Scheduler::KillProcessGroupAsync(proc->pid, nullptr);
+        }
+        Scheduler::SleepMs(5);
+    }
+    int exit_code = proc->exit_code;
+
+    // the leader is dead. give siblings that did not go down with it (a leader
+    // that ended with a plain exit, e.g. firefox's exit_group exemption) a
+    // moment, then kill what is left so nothing keeps running in the address
+    // space the caller is about to release. (satoru)
+    uint64_t as = proc->address_space;
+    uint64_t t0 = Timer::GetRealMs64();
+    bool killed_rest = false;
+    for (;;) {
+        uint32_t live = Scheduler::FindLivePidInAddressSpace(as);
+        bool busy = task_on_some_cpu(proc) ||
+                    (as && Scheduler::AddressSpaceLiveElsewhere(as, proc));
+        if (!live && !busy) break;
+        uint64_t el = Timer::GetRealMs64() - t0;
+        if (live && !killed_rest && el > 300) {
+            killed_rest = true;
+            Scheduler::KillProcessGroupAsync(live, nullptr);
+        }
+        if (el > 3000) {
+            SerialLogger::Log("[sched2] group did not drain in 3s, leaving it to the reaper\r\n");
+            break;
+        }
+        Scheduler::SleepMs(5);
+    }
+
+    // release the linux record exactly once: the task manager may already have
+    // destroyed (and an exec reused) this slot, so revalidate by pid. (satoru)
+    LinuxSyscall::LayerLock();
+    // members killed with the group never ran sys_exit, so their records would
+    // stay active and leak LINUX_MAX_PROCS slots (fix agent's note). (satoru)
+    LinuxSyscall::ReleaseDeadGroupRecords(proc, as);
+    LinuxProcess* lp2 = LinuxSyscall::GetProcess(slot);
+    if (lp2 && lp2->pid == lpid && (lp2->task == proc || lp2->task == nullptr))
+        LinuxSyscall::DestroyProcess(slot);
+    LinuxSyscall::LayerUnlock();
+
+    SerialLogger::Log("[sched2] pid=");
+    SerialLogger::LogDec((int)lpid);
+    SerialLogger::Log(" exited code=");
+    SerialLogger::LogDec(exit_code);
+    {
+        uint64_t fr = 0, lk = 0; int pe = 0;
+        Scheduler::ReapStats(&fr, &pe, &lk);
+        SerialLogger::Log(" | reaped="); SerialLogger::LogDec((int)fr);
+        SerialLogger::Log(" pending="); SerialLogger::LogDec(pe);
+        SerialLogger::Log(" leaked="); SerialLogger::LogDec((int)lk);
+        SerialLogger::Log(" heap_kb="); SerialLogger::LogDec((int)(KernelHeap::GetUsed() / 1024));
+        SerialLogger::Log(" pmm_free_mb="); SerialLogger::LogDec((int)(PMM::GetFreeMemory() / (1024 * 1024)));
+    }
+    SerialLogger::Log("\r\n");
+    return exit_code;
+}
+
 int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
-                                  const char* const* envp) {
+                                  const char* const* envp, uint32_t uid, uint32_t gid) {
     if (!initialized) Init();
     if (!proc || !proc->is_user()) return -1;
+    if (detached_eligible()) return RunDetached(proc, argv, envp, uid, gid);
     // per-cpu context: this cpu runs its own active user process. another core
     // can be running a different one at the same time. (satoru)
     UserspaceCpuState& u = cpu();
@@ -295,7 +476,7 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     u.previous_process = Scheduler::GetCurrentProcess();
     u.kernel_address_space = KernelVMM::GetCurrentAddressSpace();
     u.previous_linux_process = LinuxSyscall::GetCurrentIndex();
-    u.active_linux_process = LinuxSyscall::CreateProcess(proc->name, 0, 0);
+    u.active_linux_process = LinuxSyscall::CreateProcess(proc->name, uid, gid);
     if (u.active_linux_process < 0) {
         u.active_process = nullptr;
         u.previous_process = nullptr;
@@ -358,6 +539,13 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
     u.return_context_valid = true;
     int exit_code = UserspaceEnter(proc->rip, entry_rsp, &u.return_context, proc->fs_base);
     u.return_context_valid = false;
+    // sched=2: we are back on the launcher's stack, so the leader's frame is
+    // done with - publish on_cpu=0, or DestroyProcess would treat the dead
+    // leader as still live and leak it. (satoru)
+    if (Scheduler::SchedV2()) {
+        Scheduler::ReleaseOnCpu(proc);
+        Scheduler::FinishSwitch();
+    }
 
     KernelVMM::ActivateAddressSpace(u.kernel_address_space);
     if (u.previous_process && u.previous_process->is_user()) {

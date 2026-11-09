@@ -866,6 +866,10 @@ namespace {
 }
 
 namespace KernelPanic {
+    // display driver restore hook, see panic.h. nullptr = none. (satoru)
+    static DisplayRestoreHook g_display_restore = nullptr;
+    void SetDisplayRestoreHook(DisplayRestoreHook fn) { g_display_restore = fn; }
+
     void Initialize(multiboot_info_t* mbi) {
         g_fb = {};
         if (!mbi) {
@@ -945,6 +949,15 @@ namespace KernelPanic {
                                    const char* file,
                                    uint32_t line) {
         asm volatile("cli");
+
+        // put the original scanned-out surfaces back before any panic output
+        // is drawn, so the screen shows the dump even when a driver redirected
+        // the display engine to a compositor buffer. mmio only. (satoru)
+        if (g_display_restore) {
+            DisplayRestoreHook fn = g_display_restore;
+            g_display_restore = nullptr;   // one shot: never recurse on a fault
+            fn();
+        }
 
         g_dump.stop_code = stop_code;
         g_dump.param1 = param1;

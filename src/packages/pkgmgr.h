@@ -39,6 +39,13 @@ public:
     static bool Remove(const char* name);
     static bool Update(const char* name);
     static bool UpdateAll();
+
+    // claude code straight from anthropic's release storage over https (kfetch),
+    // sha256-verified against the release manifest, kept in /opt/claude and
+    // persisted. channel is latest, stable or X.Y.Z; only_if_newer is `update`. (satoru)
+    static bool InstallClaude(const char* channel, bool only_if_newer);
+    static bool RemoveClaude();
+    static void RefreshClaudeState();
     static bool SyncRepository();
 
     static Package* Find(const char* name);

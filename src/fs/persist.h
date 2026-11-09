@@ -50,5 +50,13 @@ public:
     // never touches KFS/nvme itself - the probe is seeded once at boot, right
     // after LoadTree, on the single-threaded init path. (satoru)
     static bool HasPersistedFirefoxCached();
+
+    // the claude code binary installed by `kpkg install claude` (about 330 mb,
+    // /opt/claude/claude). SaveTree saves it with the other roots but nothing
+    // restores it into the heap: this brings it into ONE pmm block, read
+    // straight off the volume, and registers it in the vfs (borrowed, no copy).
+    // buf/len may be null. load=false only answers "is there one" without
+    // reading it. false when there is none. (satoru)
+    static bool ClaudeImage(const uint8_t** buf, uint64_t* len, bool load);
 };
 // end (satoru)

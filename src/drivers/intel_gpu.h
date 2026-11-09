@@ -60,6 +60,13 @@ public:
 
     static bool IsPowerWellEnabled();
 
+    // best-effort panel backlight (0..100). finds an enabled legacy/PCH pwm
+    // register pair and rewrites only its duty cycle, preserving the frequency.
+    // returns false when no known backlight register is lit, so the caller can
+    // fall back to the compositor's software dim. (satoru)
+    static bool SetBacklightPercent(int pct);
+    static int  GetBacklightPercent();
+
     // accel capability flags for the compositor
     static bool HasHardwareAccel();
     // best-effort hardware fill into the active scanout - returns false if unsupported.

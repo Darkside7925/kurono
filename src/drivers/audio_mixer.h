@@ -54,7 +54,9 @@ struct StreamStats {
 // (24-bit, INTERNAL_RATE, INTERNAL_CHANNELS) format on the fly.
 //
 // `name` is for diagnostics only and may be nullptr.
-// Returns INVALID_STREAM if no slots are free.
+// Returns INVALID_STREAM if no slots are free.  ids carry a generation, so
+// an id kept after its stream was freed and the slot reused is ignored by
+// every call below instead of hitting the new stream. (satoru)
 StreamID Open(const char* name,
               AudioFormat::SampleFormat fmt,
               uint32_t sample_rate,
@@ -63,6 +65,11 @@ StreamID Open(const char* name,
 // Close the stream.  Any unplayed samples in the ring are discarded
 // after a 5 ms fade-out.  Safe to call on INVALID_STREAM.
 void Close(StreamID id);
+
+// free every stream opened by scheduler task `pid` at once (no fade). used
+// when the owner is gone (a task manager kill). returns the number of slots
+// freed. (satoru)
+int  CloseOwnedBy(uint32_t pid);
 
 // Tell the mixer "this is the last batch of samples - when the ring
 // drains, free the stream automatically".  Useful for one-shot sounds.

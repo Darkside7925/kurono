@@ -43,7 +43,10 @@ constexpr uint64_t GUEST_LOW_RAM_END  = 0x000A0000ULL; // 640 kb
 constexpr uint64_t GUEST_HIGH_RAM_START = 0x00100000ULL; // 1 mb
 
 constexpr uint32_t GUEST_DEFAULT_RAM_MB = 64;
-constexpr uint32_t GUEST_MAX_RAM_MB     = 128; // stay within our 64mb heap budget
+constexpr uint32_t GUEST_MAX_RAM_MB     = 3008; // stays below the 0xC0000000 vpci window (satoru)
+// high ram is allocated as physically contiguous chunks of this size (satoru)
+constexpr uint32_t GUEST_HI_CHUNK       = 4u * 1024 * 1024;
+constexpr uint32_t GUEST_MAX_HI_CHUNKS  = 768;
 constexpr uint32_t GUEST_MIN_RAM_MB     = 4;
 
 //  guestphysmap - a region of guest physical memory backed by host memory
@@ -95,6 +98,12 @@ public:
     // for the guest's real-mode environment.
     static void      SetupBDA();
     static void      SetupIVT();
+
+    // high ram is a list of host-contiguous chunks (see GUEST_HI_CHUNK) (satoru)
+    static uint32_t  GetHighChunkCount();
+    static bool      GetHighChunk(uint32_t i, uint64_t* gpa, uint8_t** host, uint32_t* size);
+    // bytes from guest_phys to the end of its host-contiguous piece, 0 if unmapped (satoru)
+    static uint32_t  ContigBytes(uint64_t guest_phys);
 
     static uint8_t*  GetLowRAM()       { return low_ram; }
     static uint8_t*  GetHighRAM()      { return high_ram; }

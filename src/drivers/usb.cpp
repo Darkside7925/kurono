@@ -96,6 +96,21 @@ static inline void usb_spin(int loops) {
     for (volatile int d = 0; d < loops; d++);
 }
 
+// millisecond delay that also works before the scheduler has processes: spin
+// on the wall clock the timer irq keeps advancing, and cap the spin so a dead
+// clock cannot hang enumeration. (satoru)
+static void usb_delay_ms(uint32_t ms) {
+    if (!ms) return;
+    uint64_t t0 = Scheduler::NowMs();
+    uint64_t guard = (uint64_t)ms * 2000000ull;
+    while (Scheduler::NowMs() - t0 < ms && guard--) __asm__ __volatile__("pause");
+}
+
+static inline uint16_t usb_le16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint32_t usb_le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 uint32_t USB::ReadCap(uint32_t offset) {
     return *(volatile uint32_t*)(bar0 + offset);
 }
@@ -239,6 +254,7 @@ bool USB::SubmitCommand(xHCI_TRB* cmd_trb, xHCI_TRB* result) {
             // never drop these: each hid endpoint has one trb queued, so a report eaten here
             // left that device silent for the whole boot (the laptop's mouse). (satoru)
             if (type == TRB_TRANSFER_EVT) ForeignEvent(ev);
+            else if (type == TRB_PORT_STATUS) NotePortStatus(ev);
             continue;
         }
         if ((ev.parameter & ~0xFULL) != my_trb) {
@@ -662,11 +678,6 @@ int USB::FindDeviceBySlot(uint8_t slot) {
         if (runtime[i].in_use && runtime[i].slot == slot) return i;
     return -1;
 }
-int USB::FindDeviceByPort(uint8_t port) {
-    for (int i = 0; i < USB_MAX_DEVICES; i++)
-        if (runtime[i].in_use && runtime[i].port == port) return i;
-    return -1;
-}
 
 // allocate device + input contexts and the ep0 transfer ring, then issue
 // Address Device so the slot leaves the "default" state and ep0 can carry
@@ -696,11 +707,18 @@ bool USB::AddressDevice(int idx) {
     icc[0] = 0;                 // drop flags
     icc[1] = (1u << 0) | (1u << 1); // add slot + ep0 (satoru)
 
-    // slot context: route string 0, speed, one context entry (ep0), root hub
-    // port = our 1-based port number (satoru).
+    // slot context: route string (hub path), speed, one context entry (ep0),
+    // root hub port = the root port the chain starts at (1-based). a ls/fs
+    // device behind a high-speed hub also carries the transaction translator
+    // hub slot id + port and, for multi-tt hubs, the mtt bit. (satoru)
     uint32_t* slot_ctx = SlotCtx(idx);
-    slot_ctx[0] = ((uint32_t)1 << 27) | ((uint32_t)rt.speed << 20); // ctx entries=1, speed
+    slot_ctx[0] = ((uint32_t)1 << 27) | ((uint32_t)rt.speed << 20)   // ctx entries=1, speed
+                | (rt.route & 0xFFFFFu);
+    if (rt.tt_mtt) slot_ctx[0] |= (1u << 25);
     slot_ctx[1] = ((uint32_t)(rt.port + 1) << 16);                  // root hub port number (1-based)
+    if (rt.tt_hub_slot) {
+        slot_ctx[2] = (uint32_t)rt.tt_hub_slot | ((uint32_t)rt.tt_port << 8);
+    }
 
     // ep0 context (dci 1): control endpoint (type 4), max packet by speed,
     // CErr=3, TR dequeue = ep0 ring base with DCS=1 (satoru).
@@ -724,22 +742,56 @@ bool USB::AddressDevice(int idx) {
     return cc == TRB_CC_SUCCESS;
 }
 
-// parse the configuration descriptor, locate the first HID interface and its
-// interrupt-IN endpoint, then SET_CONFIGURATION + Configure Endpoint so the
-// interrupt endpoint becomes usable (satoru).
+// scratch for one configuration parse. enumeration is serialized (boot, or
+// PollHID under the input lock) and a hub only enumerates its children after
+// its own ConfigureDevice returned, so these cannot be re-entered. (satoru)
+struct UsbHidCand {
+    uint8_t  iface, subclass, proto;
+    uint8_t  ep_addr, ep_interval;
+    uint16_t ep_mps, report_len;
+    uint8_t  kind;          // 1 keyboard, 2 mouse, 0 not a usable hid input (satoru)
+    int      lay_n;
+    UsbHidLayout lay[4];
+};
+static uint8_t    s_cfg[1024];
+static uint8_t    s_rpt[512];
+static UsbHidCand s_cands[8];
+
+// xhci interval field from a usb bInterval, as linux xhci_get_endpoint_interval:
+// full/low speed interrupt bInterval is in frames (ms), high/super in microframes
+// already encoded as an exponent. (satoru)
+static uint32_t usb_xhci_interval(uint8_t speed, uint8_t interval) {
+    if (speed == USB_SPEED_FULL || speed == USB_SPEED_LOW) {
+        uint32_t frames = interval ? interval : 1;
+        uint32_t v = frames * 8, fls = 0;
+        while (v) { fls++; v >>= 1; }
+        uint32_t xint = fls - 1;
+        if (xint < 3) xint = 3;
+        if (xint > 10) xint = 10;
+        return xint;
+    }
+    uint32_t xint = interval ? (uint32_t)interval - 1 : 0;
+    if (xint > 15) xint = 15;
+    return xint;
+}
+
+// allocate the transfer ring + completion buffer of one interrupt endpoint and
+// fill its endpoint context. returns the dci. (satoru)
 bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
     USBDeviceRuntime& rt = runtime[idx];
-    (void)dev_desc;
+    const USBDeviceDescriptor* dd = (const USBDeviceDescriptor*)dev_desc;
 
-    // pull the 9-byte config header to learn the total length, then the whole
-    // configuration block (descriptors are concatenated) (satoru).
-    uint8_t cfg[256];
-    usb_memset(cfg, 0, sizeof(cfg));
+    uint8_t* cfg = s_cfg;
+    usb_memset(cfg, 0, sizeof(s_cfg));
     if (!ControlTransferEP(idx, 0x80, USB_REQ_GET_DESCRIPTOR,
                            (uint16_t)(USB_DESC_CONFIG << 8), 0, 9, cfg))
         return false;
-    uint16_t total_len = (uint16_t)(cfg[2] | (cfg[3] << 8));
-    if (total_len > sizeof(cfg)) total_len = sizeof(cfg);
+    uint16_t total_len = usb_le16(cfg + 2);
+    if (total_len > sizeof(s_cfg)) {
+        usb_log("USB: slot %d config %d bytes, scanning the first %d\n",
+                (int)rt.slot, (int)total_len, (int)sizeof(s_cfg));
+        total_len = sizeof(s_cfg);
+    }
     if (total_len < 9) return false;
     if (!ControlTransferEP(idx, 0x80, USB_REQ_GET_DESCRIPTOR,
                            (uint16_t)(USB_DESC_CONFIG << 8), 0, total_len, cfg))
@@ -747,19 +799,17 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
 
     uint8_t config_value = cfg[5];
 
-    // walk the concatenated descriptors (satoru).
-    bool     in_hid_iface = false;
-    uint8_t  hid_iface_num = 0;
-    bool     hid_boot = false;
-    uint8_t  ep_addr = 0;
-    uint8_t  ep_interval = 0;
-    uint16_t ep_mps = 0;
-    bool     found_ep = false;
-    uint16_t report_desc_len = 0;
-    // mass-storage (bot) scan state: first class-08/protocol-50 interface and
-    // its bulk in/out endpoint pair (satoru)
-    bool     in_msd_iface = false;
-    uint8_t  bin_addr = 0, bout_addr = 0;
+    // walk the concatenated descriptors. collect every hid interface with an
+    // interrupt-in endpoint as a candidate, plus the hub class endpoint, the
+    // first bulk-only mass storage pair and the audio flag. (satoru)
+    int     ncand = 0;
+    int     cur_hid = -1;
+    bool    in_msd_iface = false;
+    bool    in_hub_iface = false;
+    bool    found_hub_iface = false;
+    uint8_t hub_ep_addr = 0, hub_ep_interval = 0;
+    uint16_t hub_ep_mps = 0;
+    uint8_t bin_addr = 0, bout_addr = 0;
     uint16_t bin_mps = 0, bout_mps = 0;
 
     int p = 0;
@@ -773,48 +823,45 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
             uint8_t isub   = cfg[p + 6];
             uint8_t iproto = cfg[p + 7];
             if (iclass == 0x01) rt.has_audio = true;               // audio class: the audio driver takes it from here (satoru)
-            // lock onto the FIRST hid interface that has an interrupt-in
-            // endpoint. later hid interfaces used to overwrite the interface
-            // number + report length while the endpoint stayed the first one,
-            // so a combo device (logitech g502: iface 0 mouse, iface 1 macro
-            // keyboard) read the keyboard's report layout and decoded mouse
-            // packets as key presses. (satoru)
-            if (iclass == 0x03 && !found_ep) {                     // HID class (satoru)
-                in_hid_iface = true;
-                in_msd_iface = false;
-                hid_iface_num = cfg[p + 2];
-                hid_boot = (isub == 0x01);                         // boot subclass (satoru)
-                rt.hid_type = USB_HID_NONE;
-            } else if (iclass == USB_MSC_CLASS && iproto == USB_MSC_PROTO_BOT &&
-                       !(bin_addr && bout_addr)) {
-                // bulk-only mass storage (any scsi-ish subclass; 0x06 is the
-                // usual transparent-scsi) (satoru)
-                in_msd_iface = true;
-                in_hid_iface = false;
-            } else {
-                in_hid_iface = false;
-                in_msd_iface = false;
+            cur_hid = -1;
+            if (iclass == 0x03 && ncand < (int)(sizeof(s_cands)/sizeof(s_cands[0]))) {
+                UsbHidCand& c = s_cands[ncand];
+                usb_memset(&c, 0, sizeof(c));
+                c.iface = cfg[p + 2];
+                c.subclass = isub;
+                c.proto = iproto;
+                cur_hid = ncand++;
             }
-        } else if (type == USB_DESC_HID && in_hid_iface && p + 9 <= (int)total_len) {
+            in_hub_iface = (iclass == USB_CLASS_HUB);
+            if (in_hub_iface) found_hub_iface = true;
+            in_msd_iface = (iclass == USB_MSC_CLASS && iproto == USB_MSC_PROTO_BOT &&
+                            !(bin_addr && bout_addr));
+        } else if (type == USB_DESC_HID && cur_hid >= 0 && p + 9 <= (int)total_len) {
             // hid descriptor: bNumDescriptors at +5, then [type,len16] pairs.
-            // the first class descriptor is the report descriptor (satoru).
+            // the first class descriptor is the report descriptor. (satoru)
             if (cfg[p + 6] == USB_DESC_REPORT)
-                report_desc_len = (uint16_t)(cfg[p + 7] | (cfg[p + 8] << 8));
-        } else if (type == 0x05 && in_hid_iface && !found_ep && p + 7 <= (int)total_len) {
+                s_cands[cur_hid].report_len = usb_le16(cfg + p + 7);
+        } else if (type == 0x05 && cur_hid >= 0 && p + 7 <= (int)total_len) {
             uint8_t addr = cfg[p + 2];
             uint8_t attr = cfg[p + 3];
-            // interrupt (attr & 3 == 3) and IN (addr & 0x80) (satoru)
-            if ((attr & 0x03) == 0x03 && (addr & 0x80)) {
-                ep_addr = addr;
-                ep_mps = (uint16_t)((cfg[p + 4] | (cfg[p + 5] << 8)) & 0x07FF);
-                ep_interval = cfg[p + 6];
-                found_ep = true;
+            if ((attr & 0x03) == 0x03 && (addr & 0x80) && !s_cands[cur_hid].ep_addr) {
+                s_cands[cur_hid].ep_addr = addr;
+                s_cands[cur_hid].ep_mps = (uint16_t)(usb_le16(cfg + p + 4) & 0x07FF);
+                s_cands[cur_hid].ep_interval = cfg[p + 6];
+            }
+        } else if (type == 0x05 && in_hub_iface && p + 7 <= (int)total_len) {
+            uint8_t addr = cfg[p + 2];
+            uint8_t attr = cfg[p + 3];
+            if ((attr & 0x03) == 0x03 && (addr & 0x80) && !hub_ep_addr) {
+                hub_ep_addr = addr;
+                hub_ep_mps = (uint16_t)(usb_le16(cfg + p + 4) & 0x07FF);
+                hub_ep_interval = cfg[p + 6];
             }
         } else if (type == 0x05 && in_msd_iface && p + 7 <= (int)total_len) {
             uint8_t addr = cfg[p + 2];
             uint8_t attr = cfg[p + 3];
             if ((attr & 0x03) == 0x02) {                           // bulk (satoru)
-                uint16_t mps = (uint16_t)((cfg[p + 4] | (cfg[p + 5] << 8)) & 0x07FF);
+                uint16_t mps = (uint16_t)(usb_le16(cfg + p + 4) & 0x07FF);
                 if ((addr & 0x80) && !bin_addr)   { bin_addr = addr;  bin_mps = mps; }
                 if (!(addr & 0x80) && !bout_addr) { bout_addr = addr; bout_mps = mps; }
             }
@@ -823,45 +870,61 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
     }
 
     bool found_bulk = (bin_addr != 0 && bout_addr != 0);
-    if (!found_ep && !found_bulk) return false;
+    bool class_hub  = dd && dd->bDeviceClass == USB_CLASS_HUB;
+    bool is_hub     = class_hub || (found_hub_iface && hub_ep_addr);
+    if (!is_hub && !found_bulk && ncand == 0) return false;
 
-    if (found_ep) {
-        rt.intr_ep_addr = ep_addr;
-        rt.intr_interval = ep_interval;
-        // dci for an IN endpoint N: (N*2)+1; ep_addr low nibble is the number (satoru)
-        rt.intr_ep_id = (uint8_t)(((ep_addr & 0x0F) * 2) + 1);
-
-        // optionally read the report descriptor to confirm device type / report
-        // length. boot protocol still drives the actual dispatch (satoru).
-        if (report_desc_len) {
-            uint8_t rpt[256];
-            uint16_t rlen = report_desc_len > sizeof(rpt) ? (uint16_t)sizeof(rpt) : report_desc_len;
-            usb_memset(rpt, 0, sizeof(rpt));
-            // GET_DESCRIPTOR(report) is directed at the interface (satoru).
+    // read and parse each hid report descriptor, then classify the interface
+    // as keyboard / mouse. boot subclasses are trusted even when the report
+    // descriptor is unusual (the fixed boot layout still decodes). (satoru)
+    int selected[USB_MAX_INTR_EPS];
+    int nsel = 0;
+    if (!is_hub) {
+        for (int c = 0; c < ncand; c++) {
+            UsbHidCand& cd = s_cands[c];
+            if (!cd.ep_addr) continue;
+            uint16_t rlen = cd.report_len ? cd.report_len : 256;
+            if (rlen > sizeof(s_rpt)) rlen = sizeof(s_rpt);
+            usb_memset(s_rpt, 0, sizeof(s_rpt));
             if (ControlTransferEP(idx, 0x81, USB_REQ_GET_DESCRIPTOR,
-                                  (uint16_t)(USB_DESC_REPORT << 8), hid_iface_num, rlen, rpt)) {
-                ParseReportDescriptor(idx, rpt, rlen);
+                                  (uint16_t)(USB_DESC_REPORT << 8), cd.iface, rlen, s_rpt))
+                ParseHidLayout(s_rpt, rlen, cd.lay, &cd.lay_n);
+            for (int i = 0; i < cd.lay_n; i++) {
+                if (cd.lay[i].has_kbd)   cd.kind = 1;
+                if (cd.lay[i].has_mouse && cd.kind == 0) cd.kind = 2;
             }
-        }
-
-        // fall back to interface protocol if the report descriptor parse did not
-        // settle a type: HID protocol 1 = keyboard, 2 = mouse (boot) (satoru).
-        if (rt.hid_type == USB_HID_NONE) {
             // re-scan for the interface protocol byte (bInterfaceProtocol @ +7).
-            p = 0;
-            while (p + 2 <= (int)total_len) {
-                uint8_t len = cfg[p];
-                uint8_t type = cfg[p + 1];
-                if (len == 0) break;
-                if (type == 0x04 && cfg[p + 2] == hid_iface_num && p + 9 <= (int)total_len) {
-                    uint8_t proto = cfg[p + 7];
-                    if (proto == 1) rt.hid_type = USB_HID_KEYBOARD;
-                    else if (proto == 2) rt.hid_type = USB_HID_MOUSE;
-                    break;
-                }
-                p += len;
+            if (cd.kind == 0) {
+                if (cd.subclass == 0x01 && cd.proto == 1) cd.kind = 1;
+                else if (cd.subclass == 0x01 && cd.proto == 2) cd.kind = 2;
             }
+            usb_log("USB: slot %d hid iface %d proto %d ep %x mps %d -> %s (%d report layout%s)\n",
+                    (int)rt.slot, (int)cd.iface, (int)cd.proto, (uint32_t)cd.ep_addr,
+                    (int)cd.ep_mps, cd.kind == 1 ? "keyboard" : (cd.kind == 2 ? "mouse" : "other"),
+                    cd.lay_n, cd.lay_n == 1 ? "" : "s");
         }
+        // bind one keyboard interface (the one with the most key fields) and
+        // every mouse interface. the keyboard driver keeps one previous-report
+        // history per device, so two keyboard interfaces on the same device
+        // would overwrite each other's state. (satoru)
+        int bestk = -1, bestks = -1;
+        for (int c = 0; c < ncand; c++) {
+            if (s_cands[c].kind != 1 || !s_cands[c].ep_addr) continue;
+            int score = 0;
+            for (int i = 0; i < s_cands[c].lay_n; i++)
+                score += s_cands[c].lay[i].key_count + (s_cands[c].lay[i].mod_count ? 8 : 0);
+            if (score > bestks) { bestks = score; bestk = c; }
+        }
+        if (bestk >= 0) selected[nsel++] = bestk;
+        for (int c = 0; c < ncand && nsel < USB_MAX_INTR_EPS; c++)
+            if (s_cands[c].kind == 2 && s_cands[c].ep_addr)
+                selected[nsel++] = c;
+        bool any_kbd = false, any_mouse = false;
+        for (int i = 0; i < nsel; i++) {
+            if (s_cands[selected[i]].kind == 1) any_kbd = true;
+            else any_mouse = true;
+        }
+        rt.hid_type = any_kbd ? USB_HID_KEYBOARD : (any_mouse ? USB_HID_MOUSE : USB_HID_NONE);
     }
 
     // SET_CONFIGURATION(config_value) - no data stage (satoru).
@@ -869,68 +932,122 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         return false;
     rt.cfg_value = config_value;
 
+    // hub class descriptor (usb 2.0 11.23 / usb 3.0 10.15). read after set
+    // configuration, as linux hub_configure does. it tells us the port count,
+    // power-on delay, tt think time and multi-tt capability. (satoru)
+    if (is_hub) {
+        if (!HubReadDescriptor(idx, dd)) {
+            usb_log("USB: slot %d hub descriptor read FAILED, not walking it\n", (int)rt.slot);
+            is_hub = false;
+        }
+    }
+
     // build ONE input control context adding every endpoint this device gets
-    // (interrupt for hid, bulk in+out for mass storage), then issue a single
-    // Configure Endpoint. a pure-hid device produces exactly the same context
-    // this function always built. (satoru)
+    // (interrupt endpoints for hid/hub, bulk in+out for mass storage), then
+    // issue a single Configure Endpoint. (satoru)
     uint32_t* icc = InputControlCtx(idx);
     icc[0] = 0;
     icc[1] = (1u << 0);
     uint8_t max_dci = 1;
 
-    if (found_ep) {
-        // allocate the interrupt transfer ring + report buffer (satoru).
-        rt.intr_ring = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
-        rt.intr_buf  = (uint8_t*)usb_alloc_aligned(4096, 4096);
-        if (!rt.intr_ring || !rt.intr_buf) return false;
-        usb_memset(rt.intr_ring, 0, USB_RING_TRBS * sizeof(xHCI_TRB));
-        usb_memset(rt.intr_buf, 0, 4096);
-        rt.intr_idx = 0;
-        rt.intr_cycle = true;
-        rt.intr_buf_len = ep_mps ? (int)ep_mps : 8;
-        if (rt.intr_buf_len > USB_HID_REPORT_MAX) rt.intr_buf_len = USB_HID_REPORT_MAX;
-        rt.intr_ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)rt.intr_ring;
-        rt.intr_ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
+    for (int s = 0; s < nsel && rt.n_intr < USB_MAX_INTR_EPS; s++) {
+        UsbHidCand& cd = s_cands[selected[s]];
+        UsbIntrEp& ep = rt.intr[rt.n_intr];
+        usb_memset(&ep, 0, sizeof(ep));
+        ep.used     = true;
+        ep.role     = (cd.kind == 1) ? USB_HID_KEYBOARD : USB_HID_MOUSE;
+        ep.iface    = cd.iface;
+        ep.ep_addr  = cd.ep_addr;
+        ep.interval = cd.ep_interval;
+        ep.boot     = (cd.subclass == 0x01 &&
+                       ((cd.kind == 1 && cd.proto == 1) || (cd.kind == 2 && cd.proto == 2)));
+        // a report-protocol mouse is decoded from its parsed fields; a boot
+        // mouse without usable fields falls back to the fixed boot report. (satoru)
+        bool has_fields = false;
+        for (int i = 0; i < cd.lay_n; i++)
+            if (cd.lay[i].has_mouse || cd.lay[i].has_kbd) has_fields = true;
+        if (cd.kind == 2 && has_fields) ep.boot = false;
+        ep.ep_id = (uint8_t)(((cd.ep_addr & 0x0F) * 2) + 1);
+        for (int i = 0; i < cd.lay_n && i < 4; i++) ep.hid[i] = cd.lay[i];
+        ep.hid_n = cd.lay_n > 4 ? 4 : cd.lay_n;
 
-        icc[1] |= (1u << rt.intr_ep_id);
-        if (rt.intr_ep_id > max_dci) max_dci = rt.intr_ep_id;
-
-        // interrupt-IN endpoint context: EPType 7 (interrupt-in), CErr=3,
-        // interval copied from the descriptor, max packet, TR dequeue = intr ring
-        // with DCS=1, plus a sane max-burst/ESIT hint (satoru).
-        uint32_t* epc = EndpointCtx(idx, rt.intr_ep_id);
-        usb_memset(epc, 0, ctx_stride);
-        // interval as linux xhci_get_endpoint_interval: the xhci field is an
-        // exponent (period = 2^n * 125 us). full/low speed bInterval is in
-        // FRAMES (ms): xhci_parse_frame_interval = fls(8 * bInterval) - 1,
-        // clamped 3..10. high/super speed bInterval is already an exponent
-        // + 1: xhci_parse_exponent_interval = bInterval - 1, clamped 0..15.
-        // copying bInterval raw gave a full-speed mouse with bInterval 1 an
-        // illegal interval of 1. (satoru)
-        uint32_t xint;
-        if (rt.speed == USB_SPEED_FULL || rt.speed == USB_SPEED_LOW) {
-            uint32_t frames = ep_interval ? ep_interval : 1;
-            uint32_t v = frames * 8, fls = 0;
-            while (v) { fls++; v >>= 1; }
-            xint = fls - 1;
-            if (xint < 3) xint = 3;
-            if (xint > 10) xint = 10;
-        } else {
-            xint = ep_interval ? (uint32_t)ep_interval - 1 : 0;
-            if (xint > 15) xint = 15;
+        ep.ring = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
+        ep.buf  = (uint8_t*)usb_alloc_aligned(4096, 4096);
+        if (!ep.ring || !ep.buf) {
+            if (ep.ring) KernelHeap::Free(ep.ring);
+            if (ep.buf)  KernelHeap::Free(ep.buf);
+            usb_memset(&ep, 0, sizeof(ep));
+            return false;
         }
-        epc[0] = (xint << 16);                                       // Interval (satoru)
-        epc[1] = (3u << 1) | (7u << 3) | ((uint32_t)ep_mps << 16);    // CErr=3, EPType=IntrIn, MPS
-        uint64_t intr_deq = (uint64_t)(uintptr_t)rt.intr_ring | 1;    // DCS=1 (satoru)
-        epc[2] = (uint32_t)(intr_deq & 0xFFFFFFFF);
-        epc[3] = (uint32_t)(intr_deq >> 32);
-        // avg trb length AND max esit payload (bits 31:16), as linux:
-        // max_esit_payload = mps * (burst + 1). leaving the payload 0 lets an
-        // intel controller budget zero bandwidth for the endpoint. (satoru)
-        epc[4] = (uint32_t)ep_mps | ((uint32_t)ep_mps << 16);
+        usb_memset(ep.ring, 0, USB_RING_TRBS * sizeof(xHCI_TRB));
+        usb_memset(ep.buf, 0, 4096);
+        ep.idx = 0;
+        ep.cycle = true;
+        ep.buf_len = cd.ep_mps ? (int)cd.ep_mps : 8;
+        if (ep.buf_len > USB_HID_REPORT_MAX) ep.buf_len = USB_HID_REPORT_MAX;
+        ep.ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ep.ring;
+        ep.ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
+
+        icc[1] |= (1u << ep.ep_id);
+        if (ep.ep_id > max_dci) max_dci = ep.ep_id;
+        rt.n_intr++;
+
+        uint32_t xint = usb_xhci_interval(rt.speed, cd.ep_interval);
+        uint32_t* epc = EndpointCtx(idx, ep.ep_id);
+        usb_memset(epc, 0, ctx_stride);
+        epc[0] = (xint << 16);
+        epc[1] = (3u << 1) | (7u << 3) | ((uint32_t)cd.ep_mps << 16);    // CErr=3, EPType=IntrIn, MPS
+        uint64_t deq = (uint64_t)(uintptr_t)ep.ring | 1;
+        epc[2] = (uint32_t)deq;
+        epc[3] = (uint32_t)(deq >> 32);
+        epc[4] = (uint32_t)cd.ep_mps | ((uint32_t)cd.ep_mps << 16);
         usb_log("USB: slot %d hid iface %d boot=%d ep %x mps %d bInterval %d -> xhci interval %d\n",
-                (int)rt.slot, (int)hid_iface_num, hid_boot ? 1 : 0, (uint32_t)ep_addr,
-                (int)ep_mps, (int)ep_interval, (int)xint);
+                (int)rt.slot, (int)cd.iface, ep.boot ? 1 : 0, (uint32_t)cd.ep_addr,
+                (int)cd.ep_mps, (int)cd.ep_interval, (int)xint);
+    }
+
+    if (is_hub && hub_ep_addr && rt.n_intr < USB_MAX_INTR_EPS) {
+        UsbIntrEp& ep = rt.intr[rt.n_intr];
+        usb_memset(&ep, 0, sizeof(ep));
+        ep.used = true;
+        ep.role = USB_HID_HUB;
+        ep.ep_addr = hub_ep_addr;
+        ep.interval = hub_ep_interval;
+        ep.ep_id = (uint8_t)(((hub_ep_addr & 0x0F) * 2) + 1);
+        ep.ring = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
+        ep.buf  = (uint8_t*)usb_alloc_aligned(4096, 4096);
+        if (!ep.ring || !ep.buf) {
+            if (ep.ring) KernelHeap::Free(ep.ring);
+            if (ep.buf)  KernelHeap::Free(ep.buf);
+            usb_memset(&ep, 0, sizeof(ep));
+            return false;
+        }
+        usb_memset(ep.ring, 0, USB_RING_TRBS * sizeof(xHCI_TRB));
+        usb_memset(ep.buf, 0, 4096);
+        ep.idx = 0;
+        ep.cycle = true;
+        // the bitmap carries one hub status bit plus one bit per port. (satoru)
+        int need = 1 + (rt.hub_ports + 7) / 8;
+        ep.buf_len = hub_ep_mps > (uint16_t)need ? (int)hub_ep_mps : need;
+        if (ep.buf_len > USB_HID_REPORT_MAX) ep.buf_len = USB_HID_REPORT_MAX;
+        ep.ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ep.ring;
+        ep.ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
+        icc[1] |= (1u << ep.ep_id);
+        if (ep.ep_id > max_dci) max_dci = ep.ep_id;
+        rt.n_intr++;
+
+        uint32_t xint = usb_xhci_interval(rt.speed, hub_ep_interval);
+        uint32_t* epc = EndpointCtx(idx, ep.ep_id);
+        usb_memset(epc, 0, ctx_stride);
+        epc[0] = (xint << 16);
+        epc[1] = (3u << 1) | (7u << 3) | ((uint32_t)hub_ep_mps << 16);    // CErr=3, EPType=IntrIn, MPS
+        uint64_t deq = (uint64_t)(uintptr_t)ep.ring | 1;
+        epc[2] = (uint32_t)deq;
+        epc[3] = (uint32_t)(deq >> 32);
+        epc[4] = (uint32_t)hub_ep_mps | ((uint32_t)hub_ep_mps << 16);
+        usb_log("USB: slot %d hub status endpoint %x mps %d bInterval %d -> xhci interval %d\n",
+                (int)rt.slot, (uint32_t)hub_ep_addr, (int)hub_ep_mps,
+                (int)hub_ep_interval, (int)xint);
     }
 
     if (found_bulk) {
@@ -984,6 +1101,16 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
     uint32_t* slot_ctx = SlotCtx(idx);
     // context entries must be the highest valid dci (satoru).
     slot_ctx[0] = (slot_ctx[0] & ~((uint32_t)0x1F << 27)) | ((uint32_t)max_dci << 27);
+    // a hub advertises hub=1, its port count and the tt think time. a full
+    // speed hub must clear mtt; a multi-tt high speed hub sets it. (satoru)
+    if (is_hub) {
+        slot_ctx[0] |= (1u << 26);
+        if (rt.hub_multi_tt) slot_ctx[0] |= (1u << 25);
+        else if (rt.speed == USB_SPEED_FULL) slot_ctx[0] &= ~(1u << 25);
+        slot_ctx[1] = (slot_ctx[1] & 0x00FFFFFFu) | ((uint32_t)rt.hub_ports << 24);
+        if (rt.speed == USB_SPEED_HIGH)
+            slot_ctx[2] = (slot_ctx[2] & ~(0x3u << 16)) | ((uint32_t)rt.hub_ttt << 16);
+    }
 
     xHCI_TRB cmd = {};
     cmd.parameter = (uint64_t)(uintptr_t)rt.input_ctx;
@@ -992,12 +1119,29 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
     if (!SubmitCommand(&cmd, &result)) return false;
     if (((result.status >> 24) & 0xFF) != TRB_CC_SUCCESS) return false;
 
-    // for boot-capable HID, ask the device to speak the fixed boot report
-    // layout so our byte0/byte1/byte2 decode is valid (satoru).
-    if (found_ep && hid_boot) {
-        // SET_PROTOCOL(boot) - class request to the interface, no data (satoru).
+    // a boot keyboard / boot fallback mouse is switched to the fixed boot
+    // layout. report protocol is the hid power-on default, so non-boot
+    // interfaces need no class request (and some devices stall on it). (satoru)
+    for (int e = 0; e < rt.n_intr; e++) {
+        UsbIntrEp& ep = rt.intr[e];
+        if ((ep.role != USB_HID_KEYBOARD && ep.role != USB_HID_MOUSE) || !ep.boot) continue;
         ControlTransferEP(idx, 0x21, HID_REQ_SET_PROTOCOL, HID_PROTO_BOOT,
-                          hid_iface_num, 0, nullptr);
+                          ep.iface, 0, nullptr);
+    }
+
+    if (is_hub) {
+        rt.is_hub = true;
+        usb_log("USB: slot %d is a %s hub, %d ports, tt=%s%s, power-on %d ms\n",
+                (int)rt.slot, rt.hub_ss ? "SuperSpeed" : (rt.speed == USB_SPEED_HIGH ? "high-speed" : "full-speed"),
+                (int)rt.hub_ports,
+                rt.speed == USB_SPEED_HIGH ? (rt.hub_multi_tt ? "multi" : "single") : "none",
+                rt.hub_ttt ? " (ttt)" : "", (int)rt.hub_pwr_good * 2);
+        // usb 3 hubs need the tier depth before they forward packets. (satoru)
+        if (rt.hub_ss) {
+            uint8_t depth = rt.depth ? (uint8_t)(rt.depth - 1) : 0;
+            if (!ControlTransferEP(idx, 0x20, USB_HUB_REQ_SET_DEPTH, depth, 0, 0, nullptr))
+                usb_log("USB: slot %d SET_HUB_DEPTH(%d) failed\n", (int)rt.slot, (int)depth);
+        }
     }
 
     // bring the mass-storage side up: inquiry + capacity. a failure leaves
@@ -1016,9 +1160,8 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         }
     }
 
-    return true;
+    return (rt.n_intr > 0 || found_bulk);
 }
-
 // run one complete control transfer on a slot's ep0 ring: setup stage, optional
 // data stage, status stage; ring the slot's ep0 doorbell (dci 1) and wait for
 // the transfer-event completion (satoru).
@@ -1083,7 +1226,10 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
         xHCI_TRB ev = {};
         if (!PollEventRing(&ev, 50)) continue;
         uint8_t type = (ev.control >> 10) & 0x3F;
-        if (type != TRB_TRANSFER_EVT) continue;   // port status / command noise (satoru)
+        if (type != TRB_TRANSFER_EVT) {           // port status / command noise (satoru)
+            if (type == TRB_PORT_STATUS) NotePortStatus(ev);
+            continue;
+        }
         uint8_t ev_slot = (ev.control >> 24) & 0xFF;
         uint8_t ev_ep   = (ev.control >> 16) & 0x1F;
         if (ev_slot != rt.slot || ev_ep != 1) {
@@ -1096,6 +1242,7 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
             // a stall halts ep0 (xhci 4.10.2.1). recover here, or each later request on this
             // device waits out its full 5 s: that was the boot freeze on the laptop. (satoru)
             RecoverEp(idx, 1, rt.ep0_ring, rt.ep0_idx, rt.ep0_cycle);
+            HubClearTt(idx, 0, 0);   // control split state on the parent tt (satoru)
             return false;
         }
         return true;
@@ -1104,29 +1251,78 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
     return false;
 }
 
-// queue one Normal trb on the interrupt ring pointing at the report buffer and
-// ring the endpoint doorbell so the controller delivers the next report (satoru).
-void USB::ArmInterrupt(int idx) {
+// endpoints that errored while something else was waiting on the event ring:
+// one bit per interrupt endpoint. the next poll recovers them. (satoru)
+static uint8_t g_halt_mask[USB_MAX_CTL][USB_MAX_DEVICES];
+static uint8_t g_intr_errlog[USB_MAX_CTL][USB_MAX_DEVICES][USB_MAX_INTR_EPS];
+static uint8_t g_intr_resets[USB_MAX_CTL][USB_MAX_DEVICES][USB_MAX_INTR_EPS];
+
+// queue one Normal trb on an interrupt endpoint ring pointing at its report
+// buffer and ring the doorbell so the controller delivers the next report. (satoru)
+void USB::ArmIntrEp(int idx, int epi) {
     USBDeviceRuntime& rt = runtime[idx];
-    if (!rt.intr_ring || !rt.intr_buf) return;
+    if (epi < 0 || epi >= rt.n_intr) return;
+    UsbIntrEp& ep = rt.intr[epi];
+    if (!ep.used || !ep.ring || !ep.buf) return;
 
-    xHCI_TRB* t = &rt.intr_ring[rt.intr_idx];
-    t->parameter = (uint64_t)(uintptr_t)rt.intr_buf;
-    t->status = (uint32_t)rt.intr_buf_len; // TRB transfer length (satoru)
+    xHCI_TRB* t = &ep.ring[ep.idx];
+    t->parameter = (uint64_t)(uintptr_t)ep.buf;
+    t->status = (uint32_t)ep.buf_len;
     t->control = (TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP)
-               | (rt.intr_cycle ? TRB_CYCLE : 0);
+               | (ep.cycle ? TRB_CYCLE : 0);
 
-    rt.intr_idx++;
-    if (rt.intr_idx >= USB_RING_TRBS - 1) {
-        rt.intr_ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)rt.intr_ring;
-        rt.intr_ring[USB_RING_TRBS - 1].control =
-            TRB_TYPE(TRB_LINK) | TRB_ENT | (rt.intr_cycle ? TRB_CYCLE : 0);
-        rt.intr_idx = 0;
-        rt.intr_cycle = !rt.intr_cycle;
+    ep.idx++;
+    if (ep.idx >= USB_RING_TRBS - 1) {
+        ep.ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ep.ring;
+        ep.ring[USB_RING_TRBS - 1].control =
+            TRB_TYPE(TRB_LINK) | TRB_ENT | (ep.cycle ? TRB_CYCLE : 0);
+        ep.idx = 0;
+        ep.cycle = !ep.cycle;
     }
 
-    rt.intr_armed = true;
-    WriteDoorbell(rt.slot, rt.intr_ep_id);
+    ep.armed = true;
+    WriteDoorbell(rt.slot, ep.ep_id);
+}
+
+void USB::ArmAllInterrupts(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    for (int e = 0; e < rt.n_intr; e++) ArmIntrEp(idx, e);
+}
+
+int USB::FindIntrEp(int idx, uint8_t ep_id) {
+    USBDeviceRuntime& rt = runtime[idx];
+    for (int e = 0; e < rt.n_intr; e++)
+        if (rt.intr[e].used && rt.intr[e].ep_id == ep_id) return e;
+    return -1;
+}
+
+// finish one interrupt completion: dispatch the report (hid) or latch the port
+// change bitmap (hub), then re-arm the endpoint. errors halt the endpoint, so
+// they are recorded for the next poll to reset it. (satoru)
+void USB::HandleIntrCompletion(int idx, int epi, uint8_t cc, uint32_t residual) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (epi < 0 || epi >= rt.n_intr) return;
+    UsbIntrEp& ep = rt.intr[epi];
+    if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PKT) {
+        S->intr_done[idx]++;
+        g_intr_resets[(int)(S - g_xs)][idx][epi] = 0;
+        int got = ep.buf_len - (int)residual;
+        if (got < 0) got = 0;
+        if (ep.role == USB_HID_HUB) DispatchHubReport(idx, epi, ep.buf, got);
+        else if (got > 0 && ep.role != USB_HID_NONE) DispatchHidReport(idx, epi, ep.buf, got);
+        ep.armed = false;
+        ArmIntrEp(idx, epi);
+        return;
+    }
+    S->intr_err[idx]++;
+    ep.armed = false;
+    int ctl = (int)(S - g_xs);
+    if (g_intr_errlog[ctl][idx][epi] < 8) {
+        g_intr_errlog[ctl][idx][epi]++;
+        usb_log("USB: slot %d interrupt ep %d (port %d) error code %d\n",
+                (int)rt.slot, (int)ep.ep_id, (int)rt.port, (int)cc);
+    }
+    g_halt_mask[ctl][idx] |= (uint8_t)(1u << epi);
 }
 
 // ---- bulk transport + mass-storage bot (satoru) ------------------------------
@@ -1200,19 +1396,19 @@ bool USB::BulkTransferEP(int idx, bool dir_in, void* data, int len,
         xHCI_TRB ev = {};
         if (!PollEventRing(&ev, 5000)) break;
         uint8_t type = (ev.control >> 10) & 0x3F;
-        if (type != TRB_TRANSFER_EVT) continue;   // port/cmd noise: keep waiting (satoru)
+        if (type != TRB_TRANSFER_EVT) {           // port/cmd noise: keep waiting (satoru)
+            if (type == TRB_PORT_STATUS) NotePortStatus(ev);
+            continue;
+        }
         uint8_t ev_slot = (ev.control >> 24) & 0xFF;
         uint8_t ev_ep   = (ev.control >> 16) & 0x1F;
         if (ev_slot != rt.slot) continue;
-        if (ev_ep == rt.intr_ep_id && rt.intr_ring) {
-            // a hid report completed while we owned the ring: dispatch + re-arm
-            // so input is not lost during long disk i/o. (satoru)
-            uint8_t hc = (ev.status >> 24) & 0xFF;
-            uint32_t hres = ev.status & 0x00FFFFFF;
-            int got = rt.intr_buf_len - (int)hres;
-            if ((hc == TRB_CC_SUCCESS || hc == TRB_CC_SHORT_PKT) && got > 0)
-                DispatchReport(idx, rt.intr_buf, got);
-            ArmInterrupt(idx);
+        int iep = FindIntrEp(idx, ev_ep);
+        if (iep >= 0) {
+            // a hid/hub report completed while we owned the ring: dispatch +
+            // re-arm so input is not lost during long disk i/o. (satoru)
+            HandleIntrCompletion(idx, iep, (uint8_t)((ev.status >> 24) & 0xFF),
+                                 ev.status & 0x00FFFFFF);
             continue;
         }
         if (ev_ep != dci) continue;
@@ -1228,6 +1424,7 @@ bool USB::BulkTransferEP(int idx, bool dir_in, void* data, int len,
     }
     g_usb_sync_claim = was_claimed;
 
+    if (!ok) HubClearTt(idx, dir_in ? rt.bulk_in_ep : rt.bulk_out_ep, 2);
     if (ok && dir_in && data) {
         uint8_t* d = (uint8_t*)data;
         int got = out_transferred ? *out_transferred : len;
@@ -1416,14 +1613,76 @@ bool USB::MsdWrite(int device, uint64_t lba, uint32_t count, const void* buf) {
 }
 // ---- end bulk transport + bot (satoru) ---------------------------------------
 
-// minimal hid report-descriptor walk: track the current Usage Page + Usage to
-// confirm keyboard vs mouse and remember nothing more than the device type;
-// the boot-protocol fixed layout is what DispatchReport actually decodes
-// (satoru).
-void USB::ParseReportDescriptor(int idx, const uint8_t* rpt, int len) {
-    USBDeviceRuntime& rt = runtime[idx];
-    uint16_t usage_page = 0;
-    uint16_t usage = 0;
+// extract up to 32 bits from a hid report at a bit offset (hid packs fields
+// lsb first). bytes past the received report read as zero. (satoru)
+static uint32_t hid_bits(const uint8_t* d, int dlen, uint32_t off, uint32_t n) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < n && i < 32; i++) {
+        uint32_t b = off + i;
+        if ((int)(b >> 3) < dlen && ((d[b >> 3] >> (b & 7)) & 1)) v |= 1ull << i;
+    }
+    return (uint32_t)v;
+}
+
+static int32_t hid_svalue(const uint8_t* d, int dlen, const UsbHidField& f) {
+    if (!f.valid || f.size == 0) return 0;
+    uint32_t v = hid_bits(d, dlen, f.off, f.size);
+    if (f.size < 32 && f.lmin < 0 && (v & (1u << (f.size - 1)))) v |= ~0u << f.size;
+    return (int32_t)v;
+}
+
+// parse a hid report descriptor into the report layouts we can decode. this is
+// a focused parser, not a full hid stack: it records x/y/wheel, buttons,
+// keyboard modifiers and the key array, per report id. it is what makes
+// report-protocol keyboards and high-dpi gaming mice work. (satoru)
+bool USB::ParseHidLayout(const uint8_t* rpt, int len, UsbHidLayout* out, int* out_n) {
+    if (out_n) *out_n = 0;
+    if (!rpt || len <= 0 || !out || !out_n) return false;
+
+    struct Glob {
+        uint32_t page;
+        int32_t  lmin, lmax;
+        uint32_t rsize, rcount;
+        uint8_t  rid;
+    };
+    struct Acc {
+        bool        used;
+        uint8_t     id;
+        uint32_t    bits;
+        UsbHidLayout lay;
+    };
+    Glob g;
+    usb_memset(&g, 0, sizeof(g));
+    Glob gstack[4];
+    int sp = 0;
+    Acc acc[4];
+    usb_memset(acc, 0, sizeof(acc));
+    uint32_t local[32];
+    int nlocal = 0;
+    bool have_umin = false;
+    uint32_t umin = 0, umax = 0;
+
+    auto acc_for = [&](uint8_t id) -> Acc* {
+        for (int a = 0; a < 4; a++) if (acc[a].used && acc[a].id == id) return &acc[a];
+        for (int a = 0; a < 4; a++) if (!acc[a].used) {
+            acc[a].used = true; acc[a].id = id;
+            acc[a].lay.used = true; acc[a].lay.id = id;
+            return &acc[a];
+        }
+        return nullptr;
+    };
+    auto add_usage = [&](uint32_t u) {
+        if (nlocal < (int)(sizeof(local)/sizeof(local[0]))) local[nlocal++] = u;
+    };
+    auto resolved_usage = [&](uint32_t i) -> uint32_t {
+        if ((int)i < nlocal) return local[i];
+        if (have_umin) {
+            uint32_t base = umin & 0xFFFFu;
+            uint32_t u = base + i;
+            if (u <= (umax & 0xFFFFu)) return (umin & 0xFFFF0000u) | u;
+        }
+        return 0;
+    };
 
     int i = 0;
     while (i < len) {
@@ -1437,66 +1696,239 @@ void USB::ParseReportDescriptor(int idx, const uint8_t* rpt, int len) {
         uint8_t tag  = (item >> 4) & 0x0F;
         uint8_t type = (item >> 2) & 0x03;
         uint8_t size = item & 0x03;
-        uint8_t bytes = (size == 3) ? 4 : size;   // 0,1,2,4 byte data (satoru)
+        uint8_t bytes = (size == 3) ? 4 : size;
         uint32_t data = 0;
         for (uint8_t b = 0; b < bytes && i < len; b++) data |= ((uint32_t)rpt[i++]) << (8 * b);
 
-        if (type == 1 && tag == 0x0) usage_page = (uint16_t)data;       // Global: Usage Page
-        else if (type == 2 && tag == 0x0) usage = (uint16_t)data;       // Local: Usage
-        else if (type == 0 && tag == 0xA) {                             // Main: Collection
-            // Generic Desktop (0x01): Mouse=0x02, Keyboard=0x06; Keyboard page
-            // 0x07 is also a strong keyboard signal (satoru).
-            if (usage_page == 0x01 && usage == 0x02 && rt.hid_type == USB_HID_NONE)
-                rt.hid_type = USB_HID_MOUSE;
-            else if (usage_page == 0x01 && usage == 0x06 && rt.hid_type == USB_HID_NONE)
-                rt.hid_type = USB_HID_KEYBOARD;
-            usage = 0;
+        if (type == 1) {                                   // global (satoru)
+            if (tag == 0x0) g.page = data & 0xFFFFu;       // Global: Usage Page
+            else if (tag == 0x1) g.lmin = (bytes == 4) ? (int32_t)data :
+                                  (bytes == 2) ? (int16_t)(data & 0xFFFF) : (int8_t)(data & 0xFF);
+            else if (tag == 0x2) g.lmax = (bytes == 4) ? (int32_t)data :
+                                  (bytes == 2) ? (int16_t)(data & 0xFFFF) : (int8_t)(data & 0xFF);
+            else if (tag == 0x7) g.rsize = data;
+            else if (tag == 0x8) g.rid = (uint8_t)data;    // report id (satoru)
+            else if (tag == 0x9) g.rcount = data;
+            else if (tag == 0xA && sp < 4) gstack[sp++] = g;   // push (satoru)
+            else if (tag == 0xB && sp > 0) g = gstack[--sp];   // pop (satoru)
+        } else if (type == 2) {                            // local (satoru)
+            if (tag == 0x0) {                              // Local: Usage
+                uint32_t u = (bytes == 4) ? data : ((g.page << 16) | (data & 0xFFFFu));
+                add_usage(u);
+            } else if (tag == 0x1) {
+                umin = (bytes == 4) ? data : ((g.page << 16) | (data & 0xFFFFu));
+                have_umin = true;
+            } else if (tag == 0x2) {
+                umax = (bytes == 4) ? data : ((g.page << 16) | (data & 0xFFFFu));
+            }
+        } else if (type == 0) {                            // main (satoru)
+            Acc* a = acc_for(g.rid);
+            if (tag == 0xA) {                              // Main: Collection
+                uint32_t u = nlocal ? local[0] : 0;
+                if ((u >> 16) == 0x01 && (u & 0xFFFF) == 0x06) a->lay.kind = 1;
+                else if ((u >> 16) == 0x01 && (u & 0xFFFF) == 0x02 && a->lay.kind == 0) a->lay.kind = 2;
+                nlocal = 0; have_umin = false;
+            } else if (tag == 0x8) {                       // input (satoru)
+                uint32_t n = g.rcount > 64 ? 64 : g.rcount;
+                if (!(data & 1u)) {
+                    for (uint32_t k = 0; k < n; k++) {
+                        uint32_t usage = resolved_usage(k);
+                        if (!usage) continue;
+                        uint32_t page = usage >> 16, use = usage & 0xFFFFu;
+                        uint32_t off = a->bits + k * g.rsize;
+                        if (off > 0xFFFFu || g.rsize == 0 || g.rsize > 32) continue;
+                        UsbHidLayout& L = a->lay;
+                        if (page == 0x01) {
+                            bool rel = (data & 0x04u) != 0;
+                            if (use == 0x30 && !L.x.valid) {
+                                L.x = { true, rel, (uint16_t)off, (uint8_t)g.rsize, g.lmin, g.lmax };
+                            } else if (use == 0x31 && !L.y.valid) {
+                                L.y = { true, rel, (uint16_t)off, (uint8_t)g.rsize, g.lmin, g.lmax };
+                            } else if (use == 0x38 && !L.wheel.valid) {
+                                L.wheel = { true, rel, (uint16_t)off, (uint8_t)g.rsize, g.lmin, g.lmax };
+                            }
+                        } else if (page == 0x09) {
+                            if (use >= 1 && L.btn_count == 0) {
+                                L.btn_off = (uint16_t)off;
+                                L.btn_count = (uint8_t)(n > 16 ? 16 : n);
+                            }
+                        } else if (page == 0x07) {
+                            if (use >= 0xE0 && use <= 0xE7 && L.mod_count == 0 &&
+                                off >= (use - 0xE0) * g.rsize) {
+                                uint32_t base = off - (use - 0xE0) * g.rsize;
+                                L.mod_off = (uint16_t)base;
+                                L.mod_count = 8;
+                            } else if (use == 0 && (data & 0x02u) == 0 && L.key_count == 0) {
+                                L.key_off = (uint16_t)off;
+                                L.key_count = (uint16_t)(n > 64 ? 64 : n);
+                                L.key_size = (uint8_t)g.rsize;
+                            }
+                        }
+                    }
+                }
+                a->bits += n * g.rsize;
+                if (a->bits > 0xFFFFu) a->bits = 0xFFFFu;
+                nlocal = 0; have_umin = false;
+            } else {
+                // output/feature items do not consume bits of an input report. (satoru)
+                nlocal = 0; have_umin = false;
+            }
         }
-        if (usage_page == 0x07 && rt.hid_type == USB_HID_NONE)
-            rt.hid_type = USB_HID_KEYBOARD;
     }
+
+    int n = 0, nkind = 0;
+    UsbHidLayout kind_only[4];
+    usb_memset(kind_only, 0, sizeof(kind_only));
+    for (int a = 0; a < 4; a++) {
+        if (!acc[a].used) continue;
+        UsbHidLayout& L = acc[a].lay;
+        L.has_mouse = L.x.valid || L.y.valid;
+        L.has_kbd = L.key_count > 0 || L.mod_count > 0;
+        if (L.has_kbd && L.kind == 0) L.kind = 1;
+        if (L.has_mouse && L.kind == 0) L.kind = 2;
+        if (L.has_mouse || L.has_kbd) {
+            if (n < 4) out[n++] = L;
+        } else if (L.kind != 0 && nkind < 4) {
+            kind_only[nkind++] = L;
+        }
+    }
+    // a descriptor whose collection starts before its report id leaves a
+    // field-less layout at id 0. only fall back to kind-only layouts when no
+    // report has usable fields, otherwise the id 0 entry would shadow the
+    // real one. (satoru)
+    if (n == 0)
+        for (int k = 0; k < nkind && n < 4; k++) out[n++] = kind_only[k];
+    *out_n = n;
+    return n > 0;
 }
 
-// dispatch a completed boot-protocol report to the right driver (satoru).
 // native usb hid input enable (settings -> devices). default on. (satoru)
 static bool g_usb_hid_input = true;
 void USB::SetHIDInputEnabled(bool on) { g_usb_hid_input = on; }
 bool USB::IsHIDInputEnabled() { return g_usb_hid_input; }
 
-void USB::DispatchReport(int idx, const uint8_t* report, int len) {
-    const int kid = (int)(S - g_xs) * USB_MAX_DEVICES + idx;   // controller 0: same as idx (satoru)
+// decode one completed interrupt report with the layout parsed for its
+// interface. boot keyboards keep their fixed layout; everything else uses the
+// report-protocol fields, falling back to the old raw boot decode. (satoru)
+void USB::DispatchHidReport(int idx, int epi, const uint8_t* report, int len) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (epi < 0 || epi >= rt.n_intr || !report || len <= 0) return;
+    UsbIntrEp& ep = rt.intr[epi];
+    const int kid = (int)(S - g_xs) * USB_MAX_DEVICES + idx;
     {
-        static uint8_t seen[USB_MAX_CTL * USB_MAX_DEVICES];
-        if (idx >= 0 && idx < USB_MAX_DEVICES && seen[kid] < 3 && report && len > 0) {
-            seen[kid]++;
-            const USBDeviceRuntime& r0 = runtime[idx];
-            usb_log("USB: slot %d (hid %d) report len %d: %x %x\n", (int)r0.slot, (int)r0.hid_type, len,
+        static uint8_t seen[USB_MAX_CTL * USB_MAX_DEVICES * USB_MAX_INTR_EPS];
+        int si = kid * USB_MAX_INTR_EPS + epi;
+        if (si >= 0 && si < (int)sizeof(seen) && seen[si] < 3) {
+            seen[si]++;
+            usb_log("USB: slot %d ep %d (%s) report len %d: %x %x\n", (int)rt.slot,
+                    (int)ep.ep_id, ep.role == USB_HID_KEYBOARD ? "kbd" : "mouse", len,
                     (uint32_t)(report[0] | (len > 1 ? report[1] << 8 : 0) | (len > 2 ? report[2] << 16 : 0) | (len > 3 ? (uint32_t)report[3] << 24 : 0)),
                     (uint32_t)(len > 4 ? (report[4] | (len > 5 ? report[5] << 8 : 0) | (len > 6 ? report[6] << 16 : 0) | (len > 7 ? (uint32_t)report[7] << 24 : 0)) : 0));
         }
     }
     if (!g_usb_hid_input) return;   // usb input disabled -> ps/2 takes over (satoru)
-    USBDeviceRuntime& rt = runtime[idx];
-    if (rt.hid_type == USB_HID_KEYBOARD) {
-        // boot keyboard report is 8 bytes; the keyboard decoder requires >= 8
-        // and indexes by device id (we use the devices[] index) (satoru).
+
+    // boot protocol devices speak the fixed layout we always decoded. (satoru)
+    if (ep.boot) {
+        if (ep.role == USB_HID_KEYBOARD) {
+            Keyboard::ProcessUSBReport((uint8_t)kid, report, (size_t)len);
+        } else if (ep.role == USB_HID_MOUSE) {
+            if (len >= 6) Mouse::ProcessUSBAbsReport(report, len);
+            else          Mouse::ProcessUSBReport(report, len);
+        }
+        return;
+    }
+
+    // pick the layout for this report id (a report with ids prefixes the id
+    // byte, which is not part of the field offsets). (satoru)
+    const uint8_t* data = report;
+    int dlen = len;
+    UsbHidLayout* lay = nullptr;
+    if (ep.hid_n > 0) {
+        bool any_id = false;
+        for (int h = 0; h < ep.hid_n; h++) if (ep.hid[h].id) any_id = true;
+        if (any_id) {
+            if (dlen < 1) return;
+            uint8_t rid = data[0];
+            data++; dlen--;
+            for (int h = 0; h < ep.hid_n; h++) if (ep.hid[h].id == rid) lay = &ep.hid[h];
+            if (!lay) return;             // an output/vendor report id (satoru)
+        } else {
+            for (int h = 0; h < ep.hid_n; h++) if (ep.hid[h].id == 0) { lay = &ep.hid[h]; break; }
+        }
+    }
+
+    if (lay && lay->has_mouse) {
+        uint32_t btns = lay->btn_count ? hid_bits(data, dlen, lay->btn_off, lay->btn_count) : 0;
+        int dx = (int)hid_svalue(data, dlen, lay->x);
+        int dy = (int)hid_svalue(data, dlen, lay->y);
+        int wh = (int)hid_svalue(data, dlen, lay->wheel);
+        bool absolute = lay->x.valid && lay->y.valid &&
+                        !lay->x.relative && !lay->y.relative;
+        if (absolute) {
+            int ax = dx, ay = dy;
+            if (lay->x.lmax > lay->x.lmin) ax = (int)((int64_t)(dx - lay->x.lmin) * 32767 / (lay->x.lmax - lay->x.lmin));
+            if (lay->y.lmax > lay->y.lmin) ay = (int)((int64_t)(dy - lay->y.lmin) * 32767 / (lay->y.lmax - lay->y.lmin));
+            if (ax < 0) ax = 0;
+            if (ax > 32767) ax = 32767;
+            if (ay < 0) ay = 0;
+            if (ay > 32767) ay = 32767;
+            uint8_t r[6] = { (uint8_t)(btns & 0x1F),
+                             (uint8_t)(ax & 0xFF), (uint8_t)((ax >> 8) & 0xFF),
+                             (uint8_t)(ay & 0xFF), (uint8_t)((ay >> 8) & 0xFF),
+                             (uint8_t)(int8_t)wh };
+            Mouse::ProcessUSBAbsReport(r, 6);
+        } else {
+            if (dx < -127) dx = -127;
+            if (dx > 127) dx = 127;
+            if (dy < -127) dy = -127;
+            if (dy > 127) dy = 127;
+            if (wh < -127) wh = -127;
+            if (wh > 127) wh = 127;
+            uint8_t r[4] = { (uint8_t)(btns & 0x1F),
+                             (uint8_t)(int8_t)dx, (uint8_t)(int8_t)dy, (uint8_t)(int8_t)wh };
+            Mouse::ProcessUSBReport(r, 4);
+        }
+        return;
+    }
+
+    if (lay && lay->has_kbd) {
+        // synthesize the 8 byte boot report the keyboard decoder expects:
+        // modifiers in byte 0, up to six key usages in bytes 2..7. (satoru)
+        uint8_t r[8] = {0};
+        r[0] = (uint8_t)hid_bits(data, dlen, lay->mod_off, lay->mod_count ? lay->mod_count : 8);
+        int k = 2;
+        for (uint32_t u = 0; u < lay->key_count && k < 8; u++) {
+            uint32_t usage = hid_bits(data, dlen, lay->key_off + u * lay->key_size,
+                                      lay->key_size ? lay->key_size : 8);
+            if (usage != 0 && usage != 1) r[k++] = (uint8_t)usage;
+        }
+        Keyboard::ProcessUSBReport((uint8_t)kid, r, 8);
+        return;
+    }
+
+    // no usable parsed layout: old raw behaviour (satoru)
+    if (ep.role == USB_HID_KEYBOARD) {
         Keyboard::ProcessUSBReport((uint8_t)kid, report, (size_t)len);
-    } else if (rt.hid_type == USB_HID_MOUSE) {
-        // a 6+ byte pointer report is qemu's usb-tablet (and HID digitizers):
-        // [buttons, X16, Y16, wheel] absolute. boot mice are 3-4 bytes relative.
-        // route absolute pointers to the absolute handler so the tablet places
-        // the cursor at a position instead of being decoded as relative deltas.
-        // (satoru)
+    } else if (ep.role == USB_HID_MOUSE) {
         if (len >= 6) Mouse::ProcessUSBAbsReport(report, len);
         else          Mouse::ProcessUSBReport(report, len);
     }
 }
 
-// tear down a slot's resources on disconnect. heap has no Free-by-region quirk
-// here; KernelHeap::Free coalesces, so returning the pages is safe (satoru).
+// tear down a slot's resources on disconnect. children of a hub go first so
+// their slots are released while the hub is still addressable. heap has no
+// Free-by-region quirk here; KernelHeap::Free coalesces, so returning the
+// pages is safe. (satoru)
 void USB::TeardownDevice(int idx) {
     USBDeviceRuntime& rt = runtime[idx];
     if (!rt.in_use) return;
+
+    // a hub takes its whole subtree with it (nested hubs, their children). (satoru)
+    for (int j = 0; j < USB_MAX_DEVICES; j++) {
+        if (j != idx && runtime[j].in_use && runtime[j].parent == (uint8_t)idx)
+            TeardownDevice(j);
+    }
 
     // the audio driver must stop streaming before the slot goes away (satoru)
     if (rt.has_audio && g_audio_attach_fn)
@@ -1510,76 +1942,122 @@ void USB::TeardownDevice(int idx) {
         SubmitCommand(&cmd, &result);
         dcbaa[rt.slot] = 0;
     }
+    bool had_kbd = false;
+    for (int e = 0; e < rt.n_intr; e++) {
+        if (rt.intr[e].role == USB_HID_KEYBOARD) had_kbd = true;
+        if (rt.intr[e].ring) KernelHeap::Free(rt.intr[e].ring);
+        if (rt.intr[e].buf)  KernelHeap::Free(rt.intr[e].buf);
+    }
+    if (had_kbd)
+        Keyboard::RemoveUSBDevice((uint8_t)((int)(S - g_xs) * USB_MAX_DEVICES + idx));
     if (rt.device_ctx) KernelHeap::Free(rt.device_ctx);
     if (rt.input_ctx)  KernelHeap::Free(rt.input_ctx);
     if (rt.ep0_ring)   KernelHeap::Free(rt.ep0_ring);
-    if (rt.intr_ring)  KernelHeap::Free(rt.intr_ring);
-    if (rt.intr_buf)   KernelHeap::Free(rt.intr_buf);
     if (rt.bulk_in_ring)  KernelHeap::Free(rt.bulk_in_ring);   // msd teardown (satoru)
     if (rt.bulk_out_ring) KernelHeap::Free(rt.bulk_out_ring);
     if (rt.bulk_bounce)   KernelHeap::Free(rt.bulk_bounce);
     if (rt.iso_ring)      PMM::FreeBytes(rt.iso_ring, 4096);   // pmm page, not a heap block (satoru)
 
-    uint8_t port = rt.port;
+    int ctl = (int)(S - g_xs);
+    g_halt_mask[ctl][idx] = 0;
+    usb_memset(g_intr_errlog[ctl][idx], 0, sizeof(g_intr_errlog[ctl][idx]));
+    usb_memset(&devices[idx], 0, sizeof(devices[idx]));
     usb_memset(&rt, 0, sizeof(rt));
-
-    // remove from the public devices[] table by compaction, keeping indices
-    // stable for the runtime[] entries that remain (satoru).
-    for (int i = 0; i < device_count; i++) {
-        if (devices[i].port == port && devices[i].connected) {
-            devices[i].connected = false;
-        }
-    }
 }
 
-// full per-port bring-up: reset, enable slot, address device, read descriptors,
-// configure the interrupt endpoint, and arm the first interrupt transfer. used
-// at boot by EnumerateDevices and on hot-plug by PollHID (satoru).
-bool USB::EnumeratePort(int port) {
-    if (!IsPortConnected(port)) return false;
-    uint8_t speed = GetPortSpeed(port);
+// printable device path: root port, then each hub port on the chain. (satoru)
+static int usb_rt_path(const USBDeviceRuntime* rtbase, int idx, char* out, int cap) {
+    if (idx < 0 || idx >= USB_MAX_DEVICES || cap <= 0) return 0;
+    const USBDeviceRuntime& rt = rtbase[idx];
+    int p = 0;
+    if (rt.parent != 0xFF && rt.depth > 1)
+        p = usb_rt_path(rtbase, rt.parent, out, cap);
+    char num[8]; int n = 0;
+    uint32_t v = (uint32_t)rt.port;             // root port is 0 based in logs (satoru)
+    if (rt.parent != 0xFF) v = rt.parent_port;
+    char rev[8]; int r = 0;
+    while (v) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+    while (r) num[n++] = rev[--r];
+    if (p && p < cap - 1) out[p++] = '.';
+    for (int i = 0; i < n && p < cap - 1; i++) out[p++] = num[i];
+    out[p] = 0;
+    return p;
+}
 
-    // reset port and re-read the (now valid) speed (satoru).
-    ResetPort(port);
-    usb_spin(20000);
-    if (!IsPortConnected(port)) return false;
-    speed = GetPortSpeed(port);
+// address one device at the given topology position (root port or hub port),
+// read its descriptors, configure it, and arm every interrupt endpoint. the
+// caller has already reset the port and learned the speed. (satoru)
+bool USB::EnumerateDeviceAt(int root_port, uint32_t route, uint8_t depth,
+                            uint8_t parent, uint8_t parent_port, uint8_t speed) {
     if (speed == 0) return false;
+    if (depth > USB_MAX_HUB_DEPTH) {
+        usb_log("USB: refusing device at depth %d (xhci route limit)\n", (int)depth);
+        return false;
+    }
+    if (parent != 0xFF && parent_port > USB_HUB_MAX_ROUTE_PORTS) {
+        usb_log("USB: hub port %d is beyond the 15-port route limit\n", (int)parent_port);
+        return false;
+    }
 
     // find a free runtime/devices slot (satoru).
     int idx = -1;
     for (int i = 0; i < USB_MAX_DEVICES; i++) {
         if (!runtime[i].in_use) { idx = i; break; }
     }
-    if (idx < 0) return false;
+    if (idx < 0) {
+        usb_log("USB: no free device slot for port %d\n", (int)root_port);
+        return false;
+    }
 
     // enable slot (satoru).
     xHCI_TRB enable_cmd = {};
     enable_cmd.control = TRB_TYPE(TRB_ENABLE_SLOT);
     xHCI_TRB result = {};
-    if (!SubmitCommand(&enable_cmd, &result)) { usb_log("USB: port %d enable-slot cmd failed\n", port); return false; }
+    if (!SubmitCommand(&enable_cmd, &result)) {
+        usb_log("USB: port %d enable-slot cmd failed\n", (int)root_port);
+        return false;
+    }
     uint8_t slot = (result.control >> 24) & 0xFF;
-    if (slot == 0) { usb_log("USB: port %d enable-slot returned slot 0\n", port); return false; }
+    if (slot == 0) {
+        usb_log("USB: port %d enable-slot returned slot 0\n", (int)root_port);
+        return false;
+    }
 
     USBDeviceRuntime& rt = runtime[idx];
     usb_memset(&rt, 0, sizeof(rt));
     rt.in_use = true;
     rt.slot = slot;
-    rt.port = (uint8_t)port;
+    rt.port = (uint8_t)root_port;
     rt.speed = speed;
     rt.hid_type = USB_HID_NONE;
+    rt.depth = depth;
+    rt.parent = parent;
+    rt.parent_port = parent_port;
+    rt.route = route & 0xFFFFFu;
+
+    // ls/fs behind a high-speed hub needs the parent's transaction translator:
+    // the hub slot id, the 1-based port, and mtt for multi-tt hubs. a fs hub
+    // has no tt, and hs/ss devices do not use one. (satoru)
+    if (parent != 0xFF && (speed == USB_SPEED_FULL || speed == USB_SPEED_LOW)) {
+        USBDeviceRuntime& ph = runtime[parent];
+        if (ph.in_use && ph.speed == USB_SPEED_HIGH) {
+            rt.tt_hub_slot = ph.slot;
+            rt.tt_port = parent_port;
+            rt.tt_mtt = ph.hub_multi_tt;
+        }
+    }
 
     USBDeviceInfo& dev = devices[idx];
     usb_memset(&dev, 0, sizeof(dev));
     dev.connected = true;
-    dev.port = (uint8_t)port;
+    dev.port = (uint8_t)root_port;
     dev.slot = slot;
     dev.speed = speed;
 
     if (idx >= device_count) device_count = idx + 1;
 
     if (!AddressDevice(idx)) {
-        usb_log("USB: Address Device failed\n");
+        usb_log("USB: Address Device failed on port %d slot %d\n", (int)root_port, (int)slot);
         TeardownDevice(idx);
         return false;
     }
@@ -1590,9 +2068,6 @@ bool USB::EnumeratePort(int port) {
     if ((speed == USB_SPEED_FULL || speed == USB_SPEED_LOW) &&
         ControlTransferEP(idx, 0x80, USB_REQ_GET_DESCRIPTOR,
                           (uint16_t)(USB_DESC_DEVICE << 8), 0, 8, &desc)) {
-        // byte 7 = bMaxPacketSize0. if it differs from the context, tell the
-        // controller with Evaluate Context (trb type 13, only A1 = ep0), as
-        // linux does after its first 64-byte read. (satoru)
         uint8_t real = ((const uint8_t*)&desc)[7];
         uint16_t cur = default_max_packet(speed);
         if ((real == 8 || real == 16 || real == 32 || real == 64) && real != cur) {
@@ -1607,7 +2082,7 @@ bool USB::EnumeratePort(int port) {
             xHCI_TRB er = {};
             bool ok = SubmitCommand(&ev, &er) && ((er.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
             usb_log("USB: port %d ep0 max packet %d -> %d (evaluate context %s)\n",
-                    port, (int)cur, (int)real, ok ? "ok" : "FAILED");
+                    (int)root_port, (int)cur, (int)real, ok ? "ok" : "FAILED");
         }
     }
     if (ControlTransferEP(idx, 0x80, USB_REQ_GET_DESCRIPTOR,
@@ -1641,25 +2116,49 @@ bool USB::EnumeratePort(int port) {
     dev.product[j] = 0;
     dev.manufacturer[0] = 0;
 
-    // configure the interrupt endpoint; if this device is not a usable HID we
-    // still keep it enumerated for DumpInfo, just without interrupt polling
-    // (satoru).
+    // configure the interrupt endpoints (or bulk pair). if this device is not
+    // a usable HID/hub we still keep it enumerated for DumpInfo. (satoru)
     if (ConfigureDevice(idx, (const uint8_t*)&desc)) {
-        // register keyboards with the keyboard driver so its per-device report
-        // history is cleared (satoru).
-        if (rt.hid_type == USB_HID_KEYBOARD) Keyboard::AddUSBDevice((uint8_t)((int)(S - g_xs) * USB_MAX_DEVICES + idx));
-        ArmInterrupt(idx);
+        if (rt.hid_type == USB_HID_KEYBOARD)
+            Keyboard::AddUSBDevice((uint8_t)((int)(S - g_xs) * USB_MAX_DEVICES + idx));
+        ArmAllInterrupts(idx);
     }
-    usb_log("USB: enumerated port %d -> slot %d hid_type=%d (0=none 1=kbd 2=mouse)\n",
-            port, idx, (int)rt.hid_type);
-    if (dev.dev_class == 0x09)
-        usb_log("USB: HUB found on ctl %d port %d (vid %x pid %x) - hubs are NOT walked, nothing behind it is enumerated\n",
-                (int)(S - g_xs), port, (uint32_t)dev.vendor_id, (uint32_t)dev.product_id);
+
+    char path[32];
+    usb_rt_path(runtime, idx, path, sizeof(path));
+    if (parent == 0xFF) {
+        usb_log("USB: enumerated port %d -> slot %d hid_type=%d (0=none 1=kbd 2=mouse)\n",
+                (int)root_port, (int)idx, (int)rt.hid_type);
+    } else {
+        usb_log("USB: enumerated hub port %s -> slot %d hid_type=%d\n",
+                path, (int)idx, (int)rt.hid_type);
+    }
+    if (rt.tt_hub_slot) {
+        usb_log("USB: slot %d routed through tt hub slot %d port %d%s\n",
+                (int)rt.slot, (int)rt.tt_hub_slot, (int)rt.tt_port,
+                rt.tt_mtt ? " (mtt)" : "");
+    }
+
+    // a hub brings its own ports up now, after its endpoint is armed so a
+    // connect change that happens during the scan is latched too. (satoru)
+    if (rt.is_hub) HubStart(idx);
+
     // usb audio: hand a device with an audio-class interface to the audio driver (satoru)
     if (rt.has_audio && g_audio_attach_fn)
         g_audio_attach_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, true);
 
     return true;
+}
+
+// full per-port bring-up for a root hub port: reset, learn the speed, address. (satoru)
+bool USB::EnumeratePort(int port) {
+    if (!IsPortConnected(port)) return false;
+    ResetPort(port);
+    usb_spin(20000);
+    if (!IsPortConnected(port)) return false;
+    uint8_t speed = GetPortSpeed(port);
+    if (speed == 0) return false;
+    return EnumerateDeviceAt(port, 0, 1, 0xFF, 0, speed);
 }
 
 bool USB::EnumerateDevices() {
@@ -1673,7 +2172,397 @@ bool USB::EnumerateDevices() {
     for (int port = 0; port < (int)max_ports; port++) {
         EnumeratePort(port);
     }
+    // process status changes latched while the tree was being brought up (satoru)
+    ServiceHubs();
+    ServiceRootPorts();
     return true;
+}
+
+// ---- usb hub class (usb 2.0 chapter 11) -------------------------------------- (satoru)
+
+int USB::FindHubChild(int hubidx, uint8_t port) {
+    for (int i = 0; i < USB_MAX_DEVICES; i++)
+        if (runtime[i].in_use && runtime[i].parent == (uint8_t)hubidx &&
+            runtime[i].parent_port == port)
+            return i;
+    return -1;
+}
+
+int USB::FindRootDeviceByPort(uint8_t port) {
+    for (int i = 0; i < USB_MAX_DEVICES; i++)
+        if (runtime[i].in_use && runtime[i].parent == 0xFF && runtime[i].port == port)
+            return i;
+    return -1;
+}
+
+bool USB::HubReadDescriptor(int idx, const USBDeviceDescriptor* dd) {
+    USBDeviceRuntime& rt = runtime[idx];
+    bool ss = dd && dd->bDeviceProtocol == USB_HUB_PROTO_SS &&
+              rt.speed == USB_SPEED_SUPER;
+    uint8_t buf[16];
+    usb_memset(buf, 0, sizeof(buf));
+    uint8_t type = ss ? USB_DESC_HUB_SS : USB_DESC_HUB;
+    if (!ControlTransferEP(idx, 0xA0, USB_REQ_GET_DESCRIPTOR,
+                           (uint16_t)(type << 8), 0, sizeof(buf), buf)) {
+        // some hubs answer the class descriptor with the usb2 type even when
+        // they advertise superspeed; try the other one before giving up. (satoru)
+        usb_memset(buf, 0, sizeof(buf));
+        type = ss ? USB_DESC_HUB : USB_DESC_HUB_SS;
+        if (!ControlTransferEP(idx, 0xA0, USB_REQ_GET_DESCRIPTOR,
+                               (uint16_t)(type << 8), 0, sizeof(buf), buf))
+            return false;
+    }
+    // some hubs answer a superspeed descriptor request with the usb2 type
+    // byte; the first fields are identical, so accept either. (satoru)
+    if (buf[0] < 7 || (buf[1] != USB_DESC_HUB && buf[1] != USB_DESC_HUB_SS)) return false;
+    uint8_t ports = buf[2];
+    if (ports == 0) return false;
+    rt.hub_ss = ss;
+    rt.hub_ports = ports > 31 ? 31 : ports;
+    rt.hub_chars = usb_le16(buf + 3);
+    rt.hub_pwr_good = buf[5];
+    rt.hub_multi_tt = (dd && dd->bDeviceProtocol == USB_HUB_PROTO_HS_MULTI);
+    rt.hub_ttt = (uint8_t)((rt.hub_chars >> 5) & 0x3);
+    rt.hub_pending = 0;
+    rt.hub_hub_status = false;
+    rt.hub_dirty = false;
+    usb_log("USB: hub descriptor type %x: %d ports chars %x power-good %d ms\n",
+            (uint32_t)buf[1], (int)ports, (uint32_t)rt.hub_chars, (int)rt.hub_pwr_good * 2);
+    return true;
+}
+
+bool USB::HubGetPortStatus(int idx, uint8_t port, uint16_t* status, uint16_t* change) {
+    uint8_t b[4];
+    usb_memset(b, 0, sizeof(b));
+    if (!ControlTransferEP(idx, 0xA3, 0x00, 0, port, 4, b)) return false;
+    if (status) *status = usb_le16(b);
+    if (change) *change = usb_le16(b + 2);
+    return true;
+}
+
+bool USB::HubSetPortFeature(int idx, uint8_t port, uint16_t feature) {
+    return ControlTransferEP(idx, 0x23, 0x03, feature, port, 0, nullptr);
+}
+
+bool USB::HubClearPortFeature(int idx, uint8_t port, uint16_t feature) {
+    return ControlTransferEP(idx, 0x23, 0x01, feature, port, 0, nullptr);
+}
+
+// tell the transaction translator to drop its state for an endpoint after a
+// failed split transfer (usb 2.0 11.24.2.8, linux usb_hub_clear_tt_buffer).
+// without this a single error can wedge one TT buffer for good. (satoru)
+void USB::HubClearTt(int idx, uint8_t ep_addr, uint8_t xfer_type) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (!rt.tt_hub_slot) return;
+    int hub = FindDeviceBySlot(rt.tt_hub_slot);
+    if (hub < 0) return;
+    static bool in_clear = false;
+    if (in_clear) return;
+    in_clear = true;
+    bool in = (ep_addr & 0x80) != 0;
+    uint16_t devinfo = (uint16_t)(ep_addr & 0x0F);
+    devinfo |= (uint16_t)((uint16_t)rt.slot << 4);
+    devinfo |= (uint16_t)((uint16_t)xfer_type << 11);
+    if (in) devinfo |= 0x8000;
+    uint16_t ttport = rt.tt_mtt ? rt.tt_port : 1;
+    ControlTransferEP(hub, 0x23, USB_HUB_REQ_CLEAR_TT, devinfo, ttport, 0, nullptr);
+    in_clear = false;
+}
+
+// set PORT_RESET, wait for the hub to finish, clear the change bits and report
+// the negotiated speed. usb 2 waits for reset to drop with the connection
+// still up; usb 3 waits for link state U0. (satoru)
+bool USB::HubResetPort(int idx, uint8_t port, uint8_t* out_speed) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (out_speed) *out_speed = 0;
+    if (!HubSetPortFeature(idx, port, USB_HUB_FEAT_PORT_RESET)) return false;
+
+    uint16_t st = 0, ch = 0;
+    bool done = false;
+    uint64_t t0 = Scheduler::NowMs();
+    for (int it = 0; it < 100 && Scheduler::NowMs() - t0 < 1000; it++) {
+        usb_delay_ms(10);
+        if (!HubGetPortStatus(idx, port, &st, &ch)) return false;
+        if (rt.hub_ss) {
+            uint16_t ls = (uint16_t)(st & USB_HUB_PORT_LINK_STATE);
+            if ((ls == USB_HUB_SS_LS_U0) && (st & USB_HUB_PORT_ENABLE)) { done = true; break; }
+        } else {
+            if (!(st & USB_HUB_PORT_RESET) && (st & USB_HUB_PORT_CONNECTION)) { done = true; break; }
+        }
+    }
+    if (!done) {
+        usb_log("USB: hub %d port %d reset timeout (status %x change %x)\n",
+                (int)rt.slot, (int)port, (uint32_t)st, (uint32_t)ch);
+        return false;
+    }
+    if (!(st & USB_HUB_PORT_ENABLE)) {
+        usb_delay_ms(20);
+        HubGetPortStatus(idx, port, &st, &ch);
+    }
+    if (!(st & USB_HUB_PORT_ENABLE)) {
+        usb_log("USB: hub %d port %d is not enabled after reset (status %x)\n",
+                (int)rt.slot, (int)port, (uint32_t)st);
+        return false;
+    }
+
+    // consume the change bits this reset produced. only clear the ones the
+    // hub actually reports, so a hub that does not implement a selector is
+    // never sent an unsupported clear request. (satoru)
+    if (ch & USB_HUB_PORT_C_RESET || !rt.hub_ss)
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_RESET);
+    if (rt.hub_ss) {
+        if (ch & USB_HUB_PORT_C_BH_RESET)
+            HubClearPortFeature(idx, port, USB_HUB_FEAT_C_BH_PORT_RESET);
+        if (ch & USB_HUB_PORT_C_LINK_STATE)
+            HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_LINK_STATE);
+        if (ch & USB_HUB_PORT_C_CONFIG_ERROR)
+            HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_CONFIG_ERROR);
+    }
+    if (ch & USB_HUB_PORT_C_CONNECTION || !rt.hub_ss)
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_CONNECTION);
+    if (ch & USB_HUB_PORT_C_ENABLE || !rt.hub_ss)
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_ENABLE);
+
+    // TRSTRCY is 10 ms; linux adds 40 ms before addressing the device. (satoru)
+    usb_delay_ms(50);
+
+    uint8_t speed;
+    if (rt.hub_ss) speed = USB_SPEED_SUPER;
+    else if (st & USB_HUB_PORT_HIGH_SPEED) speed = USB_SPEED_HIGH;
+    else if (st & USB_HUB_PORT_LOW_SPEED)  speed = USB_SPEED_LOW;
+    else                                   speed = USB_SPEED_FULL;
+    if (out_speed) *out_speed = speed;
+    return true;
+}
+
+bool USB::HubPortBringup(int idx, uint8_t port, uint16_t status) {
+    USBDeviceRuntime& rt = runtime[idx];
+    (void)status;
+    if (rt.depth >= USB_MAX_HUB_DEPTH) {
+        usb_log("USB: hub %d port %d not walked (max depth %d)\n",
+                (int)rt.slot, (int)port, (int)USB_MAX_HUB_DEPTH);
+        return false;
+    }
+    uint8_t speed = 0;
+    if (!HubResetPort(idx, port, &speed)) return false;
+    uint32_t child_route = rt.route |
+        ((uint32_t)port << (4 * (rt.depth ? (rt.depth - 1) : 0)));
+    bool ok = EnumerateDeviceAt(rt.port, child_route, (uint8_t)(rt.depth + 1),
+                                (uint8_t)idx, port, speed);
+    if (!ok) {
+        usb_log("USB: hub %d port %d reset ok but enumeration failed\n", (int)rt.slot, (int)port);
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_PORT_ENABLE);
+    }
+    return ok;
+}
+
+void USB::HubPortChanged(int idx, uint8_t port) {
+    USBDeviceRuntime& rt = runtime[idx];
+    uint16_t st = 0, ch = 0;
+    if (!HubGetPortStatus(idx, port, &st, &ch)) return;
+
+    bool connected = (st & USB_HUB_PORT_CONNECTION) != 0;
+    int child = FindHubChild(idx, port);
+
+    if (!connected) {
+        if (child >= 0) {
+            char path[32];
+            usb_rt_path(runtime, child, path, sizeof(path));
+            usb_log("USB: hub port %s disconnected\n", path);
+            TeardownDevice(child);
+        }
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_CONNECTION);
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_ENABLE);
+        if (ch & USB_HUB_PORT_C_RESET || !rt.hub_ss)
+            HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_RESET);
+        if (rt.hub_ss && (ch & USB_HUB_PORT_C_LINK_STATE))
+            HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_LINK_STATE);
+        return;
+    }
+
+    if (child >= 0) {
+        // already enumerated: consume the change bits. a real connect change
+        // (fast replug) or a port that lost enable means the old device is
+        // gone, so tear its subtree down and address the port again. (satoru)
+        bool redo = (ch & USB_HUB_PORT_C_CONNECTION) ||
+                    ((ch & USB_HUB_PORT_C_ENABLE) && !(st & USB_HUB_PORT_ENABLE));
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_CONNECTION);
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_ENABLE);
+        if (ch & USB_HUB_PORT_C_RESET || !rt.hub_ss)
+            HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_RESET);
+        HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_OVER_CURRENT);
+        if (rt.hub_ss) {
+            if (ch & USB_HUB_PORT_C_LINK_STATE)
+                HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_LINK_STATE);
+            if (ch & USB_HUB_PORT_C_CONFIG_ERROR)
+                HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_CONFIG_ERROR);
+        }
+        if (redo) {
+            usb_log("USB: hub %d port %d re-connected, re-enumerating\n", (int)rt.slot, (int)port);
+            TeardownDevice(child);
+            usb_delay_ms(20);
+            HubPortBringup(idx, port, st);
+        }
+        return;
+    }
+
+    // a new device appeared. debounce briefly, then reset and address it. (satoru)
+    HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_CONNECTION);
+    HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_ENABLE);
+    if (ch & USB_HUB_PORT_C_OVER_CURRENT) HubClearPortFeature(idx, port, USB_HUB_FEAT_C_PORT_OVER_CURRENT);
+    usb_delay_ms(20);
+    if (!HubGetPortStatus(idx, port, &st, &ch) || !(st & USB_HUB_PORT_CONNECTION)) return;
+
+    char path[32];
+    int plen = usb_rt_path(runtime, idx, path, sizeof(path));
+    if (plen < (int)sizeof(path) - 4) {
+        path[plen++] = '.';
+        if (port >= 10) path[plen++] = (char)('0' + port / 10);
+        path[plen++] = (char)('0' + port % 10);
+        path[plen] = 0;
+    }
+    usb_log("USB: hub port %s connected, resetting\n", path);
+    HubPortBringup(idx, port, st);
+}
+
+void USB::DispatchHubReport(int idx, int epi, const uint8_t* report, int len) {
+    USBDeviceRuntime& rt = runtime[idx];
+    (void)epi;
+    rt.hub_dirty = true;
+    if (!report || len < 1) return;
+    // bit 0 is the hub itself; bit n is port n. (satoru)
+    if (report[0] & 0x01) rt.hub_hub_status = true;
+    for (uint8_t p = 1; p <= rt.hub_ports && p < 32; p++) {
+        int byte = p >> 3;
+        if (byte < len && ((report[byte] >> (p & 7)) & 1))
+            rt.hub_pending |= (uint32_t)1u << p;
+    }
+}
+
+void USB::HubServiceOne(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (!rt.in_use || !rt.is_hub) return;
+    rt.hub_dirty = false;
+
+    if (rt.hub_hub_status) {
+        rt.hub_hub_status = false;
+        uint8_t st[4];
+        usb_memset(st, 0, sizeof(st));
+        if (ControlTransferEP(idx, 0xA0, 0x00, 0, 0, 4, st)) {
+            uint16_t change = usb_le16(st + 2);
+            if (change & 0x0001) ControlTransferEP(idx, 0x20, 0x01, USB_HUB_FEAT_C_HUB_LOCAL_POWER, 0, 0, nullptr);
+            if (change & 0x0002) ControlTransferEP(idx, 0x20, 0x01, USB_HUB_FEAT_C_HUB_OVERCURRENT, 0, 0, nullptr);
+            usb_log("USB: hub %d status change %x\n", (int)rt.slot, (uint32_t)change);
+        }
+    }
+
+    uint32_t pending = rt.hub_pending;
+    rt.hub_pending = 0;
+    for (uint8_t p = 1; p <= rt.hub_ports && p < 32; p++)
+        if (pending & ((uint32_t)1u << p)) HubPortChanged(idx, p);
+}
+
+// service hub status changes after the event ring drain. never runs inside a
+// control-transfer wait: syncing ports there could eat the outer completion. (satoru)
+void USB::ServiceHubs() {
+    uint32_t now = Scheduler::NowMs();
+    for (int pass = 0; pass < 3; pass++) {
+        bool any = false;
+        for (int i = 0; i < USB_MAX_DEVICES; i++) {
+            USBDeviceRuntime& rt = runtime[i];
+            if (!rt.in_use || !rt.is_hub) continue;
+            if (rt.hub_dirty) {
+                any = true;
+                HubServiceOne(i);
+            } else if (pass == 0 && (int32_t)(now - rt.hub_next_poll) >= 0) {
+                // fallback scan: an interrupt can be lost (or a hub may not
+                // implement the status endpoint well), and a missed connect
+                // would leave the port dead forever. (satoru)
+                rt.hub_next_poll = now + 1000;
+                for (uint8_t p = 1; p <= rt.hub_ports && p < 32; p++) {
+                    uint16_t st = 0, ch = 0;
+                    if (!HubGetPortStatus(i, p, &st, &ch)) continue;
+                    int child = FindHubChild(i, p);
+                    bool conn = (st & USB_HUB_PORT_CONNECTION) != 0;
+                    if (ch || (conn && child < 0) || (!conn && child >= 0)) {
+                        HubPortChanged(i, p);
+                        any = true;
+                    }
+                }
+            }
+        }
+        if (!any) break;
+    }
+}
+
+// power the hub ports on and enumerate what is already plugged in. ports are
+// always powered on a superspeed hub; usb 2 hubs follow the logical power
+// switching mode and wait bPwrOn2PwrGood. (satoru)
+bool USB::HubStart(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (!rt.is_hub) return false;
+
+    char hpath[32];
+    usb_rt_path(runtime, idx, hpath, sizeof(hpath));
+    usb_log("USB: HUB found on ctl %d port %s (vid %x pid %x): %d ports, %s%s, power-on %d ms\n",
+            (int)(S - g_xs), hpath, (uint32_t)devices[idx].vendor_id,
+            (uint32_t)devices[idx].product_id, (int)rt.hub_ports,
+            rt.hub_ss ? "SuperSpeed" : "USB 2.0",
+            rt.hub_ss ? "" : (rt.hub_multi_tt ? " multi-TT" : (rt.speed == USB_SPEED_HIGH ? " single-TT" : "")),
+            (int)rt.hub_pwr_good * 2);
+
+    if (!rt.hub_ss) {
+        uint16_t lpsm = rt.hub_chars & 0x3;
+        for (uint8_t p = 1; p <= rt.hub_ports; p++) {
+            if (lpsm == 0 && p != 1) continue;   // ganged power: port 1 controls all (satoru)
+            HubSetPortFeature(idx, p, USB_HUB_FEAT_PORT_POWER);
+        }
+        uint32_t delay = (uint32_t)rt.hub_pwr_good * 2;
+        if (delay < 100) delay = 100;            // power stable time for an external hub (satoru)
+        usb_delay_ms(delay);
+    } else {
+        usb_delay_ms(100);
+    }
+    usb_log("USB: hub %d ports powered, scanning\n", (int)rt.slot);
+
+    for (uint8_t p = 1; p <= rt.hub_ports && p < 32; p++) {
+        if (p > USB_HUB_MAX_ROUTE_PORTS) break;  // route string limit (satoru)
+        uint16_t st = 0, ch = 0;
+        if (!HubGetPortStatus(idx, p, &st, &ch)) {
+            usb_log("USB: hub %d port %d status read FAILED\n", (int)rt.slot, (int)p);
+            continue;
+        }
+        if (ch) HubPortChanged(idx, p);
+        else if (st & USB_HUB_PORT_CONNECTION) HubPortBringup(idx, p, st);
+    }
+    rt.hub_next_poll = Scheduler::NowMs() + 1000;
+    return true;
+}
+
+// a port status change event seen while a control/bulk wait owned the event
+// ring is latched here and serviced after the wait. dropping it used to lose a
+// hot plug that happened during a hub child enumeration. (satoru)
+void USB::NotePortStatus(const xHCI_TRB& ev) {
+    uint8_t port_id = (uint8_t)((ev.parameter >> 24) & 0xFF);
+    if (port_id >= 1 && port_id <= 32)
+        S->root_pending |= (uint32_t)1u << (port_id - 1);
+}
+
+void USB::ServiceRootPorts() {
+    uint32_t pending = S->root_pending;
+    S->root_pending = 0;
+    for (int port = 0; port < (int)max_ports && port < 32; port++) {
+        if (!(pending & ((uint32_t)1u << port))) continue;
+        uint32_t portsc = ReadPort(port);
+        WritePort(port, (portsc & 0x0E00C3E0) | (portsc & 0x00FE0000));
+        bool connected = (portsc & XHCI_PORTSC_CCS) != 0;
+        int existing = FindRootDeviceByPort((uint8_t)port);
+        if (connected && existing < 0) {
+            EnumeratePort(port);
+        } else if (!connected && existing >= 0) {
+            TeardownDevice(existing);
+        }
+    }
 }
 
 // drain the event ring once per call: re-arm interrupt endpoints whose
@@ -1693,10 +2582,6 @@ void USB::PollHID() {
     if (g_audio_service_fn && !g_usb_sync_claim) g_audio_service_fn();
 }
 
-// interrupt endpoints that errored while something else was waiting on the event ring. the
-// next poll recovers them the normal way. (satoru)
-static bool g_foreign_halt[USB_MAX_CTL][USB_MAX_DEVICES];
-
 void USB::PollOne(int ctl) {
     if (!detected) return;
 
@@ -1704,15 +2589,6 @@ void USB::PollOne(int ctl) {
     // out so we do not swallow its completion event. it re-arms + dispatches
     // hid reports it drains itself, so input stays alive. (satoru)
     if (g_usb_sync_claim) return;
-
-    // endpoints that halted during this drain; recovered after it, because
-    // SubmitCommand reads the same event ring and must not run mid-drain.
-    // (satoru)
-    int halted[8]; int nhalted = 0;
-    for (int f = 0; f < USB_MAX_DEVICES && nhalted < 8; f++) {
-        if (g_foreign_halt[ctl][f]) { g_foreign_halt[ctl][f] = false; halted[nhalted++] = f; }
-    }
-    static uint8_t errlog[USB_MAX_DEVICES];
 
     // bounded drain so a misbehaving controller cannot wedge the input loop
     // (satoru).
@@ -1735,42 +2611,16 @@ void USB::PollOne(int ctl) {
             uint8_t slot = (ev.control >> 24) & 0xFF;
             uint8_t ep_id = (ev.control >> 16) & 0x1F;
             int idx = FindDeviceBySlot(slot);
-            if (idx >= 0 && runtime[idx].iso_dci && runtime[idx].iso_dci == ep_id &&
-                runtime[idx].intr_ep_id != ep_id) {
+            if (idx < 0) continue;
+            int iep = FindIntrEp(idx, ep_id);
+            if (iep >= 0) {
+                HandleIntrCompletion(idx, iep, (uint8_t)((ev.status >> 24) & 0xFF),
+                                     ev.status & 0x00FFFFFF);
+            } else if (runtime[idx].iso_dci && runtime[idx].iso_dci == ep_id) {
                 // isoch audio transfer event: hand it to the audio driver (satoru)
                 if (g_iso_event_fn)
                     g_iso_event_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, ev.parameter,
                                    (uint8_t)((ev.status >> 24) & 0xFF), ev.status & 0x00FFFFFF);
-            } else if (idx >= 0 && runtime[idx].intr_ep_id == ep_id) {
-                USBDeviceRuntime& rt = runtime[idx];
-                uint8_t cc = (ev.status >> 24) & 0xFF;
-                if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PKT) S->intr_done[idx]++;
-                else S->intr_err[idx]++;
-                // residual = bytes NOT transferred; report length = requested -
-                // residual (satoru).
-                uint32_t residual = ev.status & 0x00FFFFFF;
-                int got = rt.intr_buf_len - (int)residual;
-                if (got < 0) got = 0;
-                if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PKT) {
-                    if (got > 0) DispatchReport(idx, rt.intr_buf, got);
-                    rt.intr_armed = false;
-                    ArmInterrupt(idx);   // re-arm for the next report (satoru)
-                } else {
-                    // an error HALTS the endpoint (xhci 4.10.2.1): re-arming a
-                    // halted endpoint does nothing, so one bad first transfer
-                    // used to leave a device (the g502) silent for the whole
-                    // boot. log it and recover after the drain, as linux does
-                    // (xhci-ring.c: reset endpoint + set tr dequeue). (satoru)
-                    if (errlog[idx] < 8) {
-                        errlog[idx]++;
-                        usb_log("USB: slot %d interrupt transfer error code %d (port %d)\n",
-                                (int)slot, (int)cc, (int)rt.port);
-                    }
-                    rt.intr_armed = false;
-                    bool dup = false;
-                    for (int h = 0; h < nhalted; h++) if (halted[h] == idx) dup = true;
-                    if (!dup && nhalted < 8) halted[nhalted++] = idx;
-                }
             }
         } else if (type == TRB_PORT_STATUS) {
             // parameter[31:24] holds the 1-based port id (satoru).
@@ -1783,12 +2633,11 @@ void USB::PollOne(int ctl) {
                 WritePort(port, (portsc & 0x0E00C3E0) | (portsc & 0x00FE0000));
 
                 bool connected = (portsc & XHCI_PORTSC_CCS) != 0;
-                int existing = FindDeviceByPort((uint8_t)port);
+                int existing = FindRootDeviceByPort((uint8_t)port);
                 if (connected && existing < 0) {
                     EnumeratePort(port);            // hot-plug attach (satoru)
                 } else if (!connected && existing >= 0) {
-                    Keyboard::RemoveUSBDevice((uint8_t)((int)(S - g_xs) * USB_MAX_DEVICES + existing));
-                    TeardownDevice(existing);       // hot-unplug detach (satoru)
+                    TeardownDevice(existing);       // hot-unplug detach, hub subtree follows (satoru)
                 }
             }
         }
@@ -1801,27 +2650,42 @@ void USB::PollOne(int ctl) {
 
     // recover halted interrupt endpoints: Reset Endpoint (trb 14), then Set TR
     // Dequeue Pointer (trb 16) to our current enqueue slot with its cycle bit,
-    // dropping the failed td, then queue a fresh transfer. (satoru)
-    for (int h = 0; h < nhalted; h++) {
-        int idx = halted[h];
+    // dropping the failed td, then queue a fresh transfer. a device that keeps
+    // failing is given up on after 50 tries. (satoru)
+    for (int idx = 0; idx < USB_MAX_DEVICES; idx++) {
+        uint8_t mask = g_halt_mask[ctl][idx];
+        if (!mask) continue;
         USBDeviceRuntime& rt = runtime[idx];
-        if (!rt.in_use || !rt.intr_ring) continue;
-        static uint8_t resets[USB_MAX_DEVICES];
-        if (resets[idx] >= 50) continue;   // give up on a device that keeps failing (satoru)
-        resets[idx]++;
-        xHCI_TRB c = {};
-        c.control = TRB_TYPE(14) | ((uint32_t)rt.slot << 24) | ((uint32_t)rt.intr_ep_id << 16);
-        xHCI_TRB r = {};
-        bool ok1 = SubmitCommand(&c, &r) && ((r.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
-        xHCI_TRB d = {};
-        d.parameter = (uint64_t)(uintptr_t)&rt.intr_ring[rt.intr_idx] | (rt.intr_cycle ? 1u : 0u);
-        d.control = TRB_TYPE(16) | ((uint32_t)rt.slot << 24) | ((uint32_t)rt.intr_ep_id << 16);
-        bool ok2 = SubmitCommand(&d, &r) && ((r.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
-        if (resets[idx] <= 4)
-            usb_log("USB: slot %d endpoint reset %s, dequeue %s\n",
-                    (int)rt.slot, ok1 ? "ok" : "FAILED", ok2 ? "ok" : "FAILED");
-        ArmInterrupt(idx);
+        if (!rt.in_use) { g_halt_mask[ctl][idx] = 0; continue; }
+        for (int e = 0; e < rt.n_intr && e < USB_MAX_INTR_EPS; e++) {
+            if (!(mask & (1u << e))) continue;
+            g_halt_mask[ctl][idx] &= (uint8_t)~(1u << e);
+            UsbIntrEp& ep = rt.intr[e];
+            if (!ep.used || !ep.ring) continue;
+            if (g_intr_resets[ctl][idx][e] >= 50) continue;
+            g_intr_resets[ctl][idx][e]++;
+            HubClearTt(idx, ep.ep_addr, 3);   // interrupt split state on the parent tt (satoru)
+            xHCI_TRB c = {};
+            c.control = TRB_TYPE(14) | ((uint32_t)rt.slot << 24) | ((uint32_t)ep.ep_id << 16);
+            xHCI_TRB r = {};
+            bool ok1 = SubmitCommand(&c, &r) && ((r.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
+            xHCI_TRB d = {};
+            d.parameter = (uint64_t)(uintptr_t)&ep.ring[ep.idx] | (ep.cycle ? 1u : 0u);
+            d.control = TRB_TYPE(16) | ((uint32_t)rt.slot << 24) | ((uint32_t)ep.ep_id << 16);
+            bool ok2 = SubmitCommand(&d, &r) && ((r.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
+            if (g_intr_resets[ctl][idx][e] <= 4)
+                usb_log("USB: slot %d ep %d reset %s, dequeue %s\n",
+                        (int)rt.slot, (int)ep.ep_id, ok1 ? "ok" : "FAILED", ok2 ? "ok" : "FAILED");
+            ArmIntrEp(idx, e);
+        }
     }
+
+    // hub port changes and the periodic hub scan run outside the drain so a
+    // control transfer cannot consume this loop's next event. children are
+    // enumerated here, after every hid endpoint has been re-armed. (satoru)
+    ServiceHubs();
+    // root port changes that arrived during those (nested) control transfers (satoru)
+    ServiceRootPorts();
 }
 
 const USBDeviceInfo* USB::GetDevice(int index) {
@@ -1899,8 +2763,10 @@ void USB::DumpInfo(char* out, int max_len) {
     for (int i = 0; i < device_count; i++) {
         const USBDeviceInfo& d = devices[i];
         if (!d.connected) continue; // skip torn-down / gap slots (satoru)
+        char dpath[32];
+        usb_rt_path(runtime, i, dpath, sizeof(dpath));
         append("  Device "); append_num(i);
-        append(": Port "); append_num(d.port);
+        append(": Port "); append(dpath);
         append(", Speed="); append(SpeedName(d.speed));
         append(", VID:PID="); append_hex(d.vendor_id, 4);
         append(":"); append_hex(d.product_id, 4);
@@ -1934,8 +2800,10 @@ void USB::DumpInfo(char* out, int max_len) {
         for (int i = 0; i < device_count; i++) {
             const USBDeviceInfo& d = devices[i];
             if (!d.connected) continue;
+            char dpath[32];
+            usb_rt_path(runtime, i, dpath, sizeof(dpath));
             append("  Device "); append_num(i);
-            append(": Port "); append_num(d.port);
+            append(": Port "); append(dpath);
             append(", Speed="); append(SpeedName(d.speed));
             append(", VID:PID="); append_hex(d.vendor_id, 4);
             append(":"); append_hex(d.product_id, 4);
@@ -2059,23 +2927,14 @@ void USB::ForeignEvent(const xHCI_TRB& ev) {
     if (idx < 0) return;
     USBDeviceRuntime& rt = runtime[idx];
     uint8_t cc = (ev.status >> 24) & 0xFF;
-    if (rt.iso_dci && rt.iso_dci == ep_id && rt.intr_ep_id != ep_id) {
-        if (g_iso_event_fn)
-            g_iso_event_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, ev.parameter, cc, ev.status & 0x00FFFFFF);
+    int iep = FindIntrEp(idx, ep_id);
+    if (iep >= 0) {
+        HandleIntrCompletion(idx, iep, cc, ev.status & 0x00FFFFFF);
         return;
     }
-    if (rt.intr_ring && rt.intr_ep_id == ep_id) {
-        if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PKT) {
-            int got = rt.intr_buf_len - (int)(ev.status & 0x00FFFFFF);
-            S->intr_done[idx]++;
-            if (got > 0) DispatchReport(idx, rt.intr_buf, got);
-            rt.intr_armed = false;
-            ArmInterrupt(idx);
-        } else {
-            S->intr_err[idx]++;
-            rt.intr_armed = false;
-            g_foreign_halt[S - g_xs][idx] = true;
-        }
+    if (rt.iso_dci && rt.iso_dci == ep_id) {
+        if (g_iso_event_fn)
+            g_iso_event_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, ev.parameter, cc, ev.status & 0x00FFFFFF);
     }
 }
 
@@ -2133,7 +2992,17 @@ bool USB::GidSetConfig(int gid, uint8_t config_value) {
             SubmitCommand(&cmd, &res);
             usb_log("USB: slot %d deconfigure cc %d (config %d -> %d)\n", (int)rt.slot,
                     (int)((res.status >> 24) & 0xFF), (int)rt.cfg_value, (int)config_value);
-            rt.intr_ep_id = 0; rt.intr_armed = false; rt.hid_type = USB_HID_NONE;
+            bool had_kbd = false;
+            for (int e = 0; e < rt.n_intr; e++) {
+                if (rt.intr[e].role == USB_HID_KEYBOARD) had_kbd = true;
+                if (rt.intr[e].ring) KernelHeap::Free(rt.intr[e].ring);
+                if (rt.intr[e].buf)  KernelHeap::Free(rt.intr[e].buf);
+            }
+            if (had_kbd) Keyboard::RemoveUSBDevice((uint8_t)((int)(S - g_xs) * USB_MAX_DEVICES + idx));
+            usb_memset(rt.intr, 0, sizeof(rt.intr));
+            rt.n_intr = 0;
+            rt.hid_type = USB_HID_NONE;
+            g_halt_mask[(int)(S - g_xs)][idx] = 0;
             rt.iso_dci = 0;
         }
         ok = ControlTransferEP(idx, 0x00, USB_REQ_SET_CONFIG, config_value, 0, 0, nullptr);
@@ -2294,7 +3163,90 @@ bool USB::IsoRecover(int gid) {
     return ok;
 }
 
-// [kbdiag] usb half: every hid device that got an interrupt endpoint, whether
+// self test for the hid report parser (kurono.usbtest=1). the descriptors are
+// the qemu keyboard/tablet ones plus a synthetic report-id gaming mouse with
+// 16 bit signed relative axes. (satoru)
+bool USB::SelfTest() {
+    static const uint8_t kbd[] = {
+        0x05,0x01, 0x09,0x06, 0xA1,0x01, 0x75,0x01, 0x95,0x08, 0x05,0x07,
+        0x19,0xE0, 0x29,0xE7, 0x15,0x00, 0x25,0x01, 0x81,0x02,
+        0x95,0x01, 0x75,0x08, 0x81,0x01,
+        0x95,0x06, 0x75,0x08, 0x15,0x00, 0x25,0xFF, 0x05,0x07,
+        0x19,0x00, 0x29,0xFF, 0x81,0x00, 0xC0
+    };
+    static const uint8_t tablet[] = {
+        0x05,0x01, 0x09,0x02, 0xA1,0x01, 0x09,0x01, 0xA1,0x00,
+        0x05,0x09, 0x19,0x01, 0x29,0x05, 0x15,0x00, 0x25,0x01,
+        0x95,0x05, 0x75,0x01, 0x81,0x02, 0x95,0x01, 0x75,0x03, 0x81,0x01,
+        0x05,0x01, 0x09,0x30, 0x09,0x31, 0x15,0x00, 0x26,0xFF,0x7F,
+        0x75,0x10, 0x95,0x02, 0x81,0x02,
+        0x05,0x01, 0x09,0x38, 0x15,0x81, 0x25,0x7F, 0x75,0x08, 0x95,0x01, 0x81,0x06,
+        0xC0,0xC0
+    };
+    static const uint8_t gmouse[] = {
+        0x05,0x01, 0x09,0x02, 0xA1,0x01, 0x85,0x01, 0x09,0x01, 0xA1,0x00,
+        0x05,0x09, 0x19,0x01, 0x29,0x05, 0x15,0x00, 0x25,0x01,
+        0x95,0x05, 0x75,0x01, 0x81,0x02, 0x95,0x01, 0x75,0x03, 0x81,0x01,
+        0x05,0x01, 0x09,0x30, 0x09,0x31, 0x16,0x01,0x80, 0x26,0xFF,0x7F,
+        0x75,0x10, 0x95,0x02, 0x81,0x06,
+        0x09,0x38, 0x15,0x81, 0x25,0x7F, 0x75,0x08, 0x95,0x01, 0x81,0x06,
+        0xC0,0xC0,
+        0x85,0x02, 0x09,0x03, 0xA1,0x00, 0x05,0x0B, 0x09,0x01,
+        0x15,0x00, 0x25,0x01, 0x75,0x01, 0x95,0x01, 0x81,0x02, 0xC0
+    };
+
+    int fails = 0;
+    auto check = [&](const char* what, bool ok) {
+        usb_log("[usbtest] %s: %s\n", what, ok ? "ok" : "FAIL");
+        if (!ok) fails++;
+    };
+
+    UsbHidLayout lay[4];
+    int n = 0;
+    usb_memset(lay, 0, sizeof(lay));
+    ParseHidLayout(kbd, (int)sizeof(kbd), lay, &n);
+    check("keyboard parsed", n == 1);
+    if (n >= 1) {
+        check("keyboard modifiers", lay[0].has_kbd && lay[0].mod_off == 0 && lay[0].mod_count == 8);
+        check("keyboard key array", lay[0].key_off == 16 && lay[0].key_count == 6 && lay[0].key_size == 8);
+    }
+
+    n = 0;
+    usb_memset(lay, 0, sizeof(lay));
+    ParseHidLayout(tablet, (int)sizeof(tablet), lay, &n);
+    check("tablet parsed", n == 1);
+    if (n >= 1) {
+        check("tablet absolute x/y", lay[0].has_mouse && !lay[0].x.relative &&
+              !lay[0].y.relative && lay[0].x.size == 16 && lay[0].y.off == 24);
+        check("tablet buttons", lay[0].btn_off == 0 && lay[0].btn_count == 5);
+    }
+
+    n = 0;
+    usb_memset(lay, 0, sizeof(lay));
+    ParseHidLayout(gmouse, (int)sizeof(gmouse), lay, &n);
+    usb_log("[usbtest] gmouse n=%d id=%d xoff=%d xsize=%d rel=%d yoff=%d woff=%d mouse=%d kbd=%d\n",
+            n, n ? (int)lay[0].id : -1, n ? (int)lay[0].x.off : -1, n ? (int)lay[0].x.size : -1,
+            n ? (lay[0].x.relative ? 1 : 0) : -1, n ? (int)lay[0].y.off : -1,
+            n ? (int)lay[0].wheel.off : -1, n ? (lay[0].has_mouse ? 1 : 0) : -1,
+            n ? (lay[0].has_kbd ? 1 : 0) : -1);
+    check("gaming mouse parsed", n == 1 && lay[0].id == 1);
+    if (n >= 1) {
+        check("gaming mouse report id", lay[0].id == 1);
+        check("gaming mouse 16 bit axes", lay[0].x.valid && lay[0].x.size == 16 &&
+              lay[0].x.relative && lay[0].y.off == 24 && lay[0].wheel.off == 40);
+        uint8_t rpt[7] = { 0x01, 0x05, 0x10, 0xF0, 0x40, 0x00, 0xFF };
+        // layout offsets start after the report id byte. (satoru)
+        const uint8_t* d = rpt + 1;
+        check("gaming mouse buttons", hid_bits(d, 6, lay[0].btn_off, lay[0].btn_count) == 5);
+        check("gaming mouse signed x", hid_svalue(d, 6, lay[0].x) == -4080);
+        check("gaming mouse y", hid_svalue(d, 6, lay[0].y) == 64);
+        check("gaming mouse wheel", hid_svalue(d, 6, lay[0].wheel) == -1);
+    }
+
+    usb_log("[usbtest] hid layout parser %s (%d failures)\n", fails ? "FAILED" : "PASSED", fails);
+    return fails == 0;
+}
+
 // it is bound as a keyboard, and how many interrupt transfers ever completed.
 // zero completions on a keyboard that was typed on = the endpoint never ran. (satoru)
 void USB::LogKbDiag() {
@@ -2303,13 +3255,16 @@ void USB::LogKbDiag() {
         XhciState* st = &g_xs[c];
         for (int i = 0; i < USB_MAX_DEVICES; i++) {
             USBDeviceRuntime& rt = st->x_runtime[i];
-            if (!rt.in_use || !rt.intr_ep_id) continue;
+            if (!rt.in_use || rt.n_intr == 0) continue;
             if (rt.hid_type == USB_HID_KEYBOARD) nkb++;
-            usb_log("[kbdiag] usb ctl %d dev %d port %d slot %d vid:pid %x:%x hid=%s intr_done %d intr_err %d armed %d\n",
-                    c, i, (int)rt.port, (int)rt.slot,
-                    (uint32_t)st->x_devices[i].vendor_id, (uint32_t)st->x_devices[i].product_id,
-                    rt.hid_type == USB_HID_KEYBOARD ? "keyboard" : (rt.hid_type == USB_HID_MOUSE ? "mouse" : "other"),
-                    (int)st->intr_done[i], (int)st->intr_err[i], rt.intr_armed ? 1 : 0);
+            for (int e = 0; e < rt.n_intr; e++) {
+                const UsbIntrEp& ep = rt.intr[e];
+                usb_log("[kbdiag] usb ctl %d dev %d port %d slot %d ep %d vid:pid %x:%x role %s intr_done %d intr_err %d armed %d\n",
+                        c, i, (int)rt.port, (int)rt.slot, (int)ep.ep_id,
+                        (uint32_t)st->x_devices[i].vendor_id, (uint32_t)st->x_devices[i].product_id,
+                        ep.role == USB_HID_KEYBOARD ? "keyboard" : (ep.role == USB_HID_MOUSE ? "mouse" : "hub"),
+                        (int)st->intr_done[i], (int)st->intr_err[i], ep.armed ? 1 : 0);
+            }
         }
     }
     usb_log("[kbdiag] usb keyboards bound: %d (controllers %d)\n", nkb, g_nctl);

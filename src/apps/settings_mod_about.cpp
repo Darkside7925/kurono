@@ -1,142 +1,89 @@
-//  kurono os - settings module: about / system (reference module #2) (satoru)
-//  read-only info rows: cpu, gpu, memory, display backend + resolution, and the
-//  kurono version string. no persisted state - purely informational. (satoru)
+//  kurono os - settings module: about (satoru)
+//  a hero with the kurono mark and version, the machine (processor, graphics,
+//  memory, display), the software, and links to the devices and storage pages. (satoru)
 #include "system_settings.h"
 #include "../drivers/graphics.h"
 #include "../drivers/display_mgr.h"
 #include "../drivers/cpu_detect.h"
 #include "../drivers/gpu_probe.h"
-#include "../kernel/heap.h"
+#include "../kernel/pmm.h"
+#include "../linux/kls.h"
+#include "../linux/linux_kernel.h"
 
-static const char* KURONO_VERSION = "Kurono OS 1.0.0";
+using namespace SettingsUI;
 
-// ── gpu description: primary probe entry, with a per-vendor label. (satoru)
-static const char* gpu_primary_desc(){
+static const char* KURONO_NAME    = "Kurono OS";
+static const char* KURONO_VERSION = "Version 1.0.0";
+
+static const char* gpu_desc(){
     const GpuProbeResult& r = GpuProbe::GetResult();
-    if(r.count <= 0) return "No GPU detected";
+    if(r.count <= 0) return "Framebuffer";
     int idx = (r.primary_idx >= 0 && r.primary_idx < r.count) ? r.primary_idx : 0;
-    if(r.gpus[idx].desc[0]) return r.gpus[idx].desc;
-    return "Display controller";
-}
-static const char* gpu_vendor_label(){
-    const GpuProbeResult& r = GpuProbe::GetResult();
-    if(r.count <= 0) return "framebuffer backend";
-    int idx = (r.primary_idx >= 0 && r.primary_idx < r.count) ? r.primary_idx : 0;
-    switch(r.gpus[idx].vendor_id){
-        case GPU_VENDOR_INTEL:  return "Intel";
-        case GPU_VENDOR_NVIDIA: return "NVIDIA";
-        case GPU_VENDOR_AMD:    return "AMD";
-        case GPU_VENDOR_VMWARE: return "VMware SVGA";
-        case GPU_VENDOR_QEMU:   return "QEMU / Bochs";
-        case GPU_VENDOR_VIRTIO: return "VirtIO GPU";
-        case GPU_VENDOR_REDHAT: return "Red Hat QXL";
-        default:                return "Generic";
-    }
+    return r.gpus[idx].desc[0] ? r.gpus[idx].desc : "Display controller";
 }
 
-// on_show has nothing to load - the probes/detect ran at boot. (satoru)
 static void about_on_show(){}
 
-static void about_render(int x, int y, int w, int h, int scroll){
-    (void)w; (void)h;
-    int ly = y - scroll + 8;
-    char buf[64];
+static void about_build(){
+    char buf[96], nb[16];
 
-    // ── identity banner ──────────────────────────────────────────────────
-    Graphics::FillRoundedRect(x, ly, 40, 40, 10, SettingsUI::Accent());
-    Graphics::DrawString(x + 14, ly + 13, "K", SettingsUI::COL_WHITE, 0xFF000000);
-    Graphics::DrawString(x + 52, ly + 6,  KURONO_VERSION, SettingsUI::COL_WHITE, 0xFF000000);
-    Graphics::DrawString(x + 52, ly + 24, "Hybrid bare-metal x86_64", SettingsUI::COL_DIM, 0xFF000000);
-    ly += 56;
+    Group(nullptr);
+    Rect r = Custom(176, false);
+    if(r.w){
+        // the mark: an accent squircle with a soft sheen and the K (satoru)
+        int s = 76, x = r.x + (r.w - s) / 2, y = r.y + 22;
+        uint32_t a = Accent();
+        FillRound(x, y + 3, s, s, 20, 0xFF000000u, 40);
+        FillRound(x, y, s, s, 20, a);
+        StrokeRound(x, y, s, s, 20, 0xFFFFFFFFu, 46);
+        int kw = TextWidth(44.0f, "K", true);
+        Text(x + (s - kw) / 2, y + 12, 44.0f, "K", 0xFFFFFFFFu, true);
+        int tw = TextWidth(22.0f, KURONO_NAME, true);
+        Text(r.x + (r.w - tw) / 2, y + s + 16, 22.0f, KURONO_NAME, T().text, true);
+        int vw = TextWidth(13.5f, KURONO_VERSION);
+        Text(r.x + (r.w - vw) / 2, y + s + 46, 13.5f, KURONO_VERSION, T().text2);
+    }
+    EndGroup();
 
-    // ── processor ────────────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "Processor");
-    ly += 26;
+    Group("This computer");
     {
         const char* brand = CPUDetect::GetBrandString();
-        SettingsUI::Row(x, ly, "CPU:", (brand && brand[0]) ? brand : CPUDetect::GetVendorName());
-        ly += 22;
-
-        SettingsUI::IntToStr(CPUDetect::GetCoreCount(), buf, 64);
-        SettingsUI::StrApp(buf, " cores / ", 64);
-        char tb[16]; SettingsUI::IntToStr(CPUDetect::GetThreadCount(), tb, 16);
-        SettingsUI::StrApp(buf, tb, 64);
-        SettingsUI::StrApp(buf, " threads", 64);
-        SettingsUI::Row(x, ly, "Topology:", buf);
-        ly += 22;
-
-        int mhz = CPUDetect::GetBaseMHz();
-        if(mhz > 0){ SettingsUI::IntToStr(mhz, buf, 64); SettingsUI::StrApp(buf, " MHz base", 64); }
-        else SettingsUI::StrCpy(buf, "Unknown", 64);
-        SettingsUI::Row(x, ly, "Clock:", buf);
-        ly += 30;
+        Info("Processor", (brand && brand[0]) ? brand : CPUDetect::GetVendorName());
+        IntToStr(CPUDetect::GetCoreCount(), buf, 96); StrApp(buf, " cores, ", 96);
+        IntToStr(CPUDetect::GetThreadCount(), nb, 16); StrApp(buf, nb, 96); StrApp(buf, " threads", 96);
+        Info("Cores", buf);
+        Info("Graphics", gpu_desc());
+        uint64_t mb = PMM::GetTotalMemory() / (1024ull * 1024ull);
+        if(mb >= 1024){
+            IntToStr((int)(mb / 1024), buf, 96);
+            if((mb % 1024) * 10 / 1024){ StrApp(buf, ".", 96); IntToStr((int)((mb % 1024) * 10 / 1024), nb, 16); StrApp(buf, nb, 96); }
+            StrApp(buf, " GB", 96);
+        } else { IntToStr((int)mb, buf, 96); StrApp(buf, " MB", 96); }
+        Info("Memory", buf);
+        IntToStr(Graphics::GetWidth(), buf, 96); StrApp(buf, " x ", 96);
+        IntToStr(Graphics::GetHeight(), nb, 16); StrApp(buf, nb, 96);
+        StrApp(buf, ", ", 96); StrApp(buf, DisplayManager::GetBackendName(), 96);
+        Info("Display", buf);
     }
+    EndGroup();
 
-    // ── graphics ─────────────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "Graphics");
-    ly += 26;
-    SettingsUI::Row(x, ly, "GPU:", gpu_primary_desc());
-    ly += 22;
-    SettingsUI::Row(x, ly, "Vendor:", gpu_vendor_label());
-    ly += 22;
-    SettingsUI::Row(x, ly, "Backend:", DisplayManager::GetBackendName());
-    ly += 22;
+    Group("Software");
     {
-        SettingsUI::IntToStr((int)Graphics::GetWidth(), buf, 64);
-        SettingsUI::StrApp(buf, " x ", 64);
-        char hb[16]; SettingsUI::IntToStr((int)Graphics::GetHeight(), hb, 16);
-        SettingsUI::StrApp(buf, hb, 64);
-        SettingsUI::StrApp(buf, " x ", 64);
-        char bb[8]; SettingsUI::IntToStr((int)Graphics::GetBpp(), bb, 8);
-        SettingsUI::StrApp(buf, bb, 64);
-        SettingsUI::StrApp(buf, "bpp", 64);
-        SettingsUI::Row(x, ly, "Resolution:", buf);
-        ly += 30;
+        KLSConfig* c = KLS::GetConfig();
+        Info("Computer name", (c && c->hostname[0]) ? c->hostname : "kurono");
+        StrCpy(buf, "Kurono, Linux ABI ", 96); StrApp(buf, LinuxKernel::GetVersion(), 96);
+        Info("Kernel", buf);
+        Info("Architecture", "x86-64");
     }
+    EndGroup();
 
-    // ── memory ───────────────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "Memory");
-    ly += 26;
-    {
-        // kernel heap usage in kb. (satoru)
-        size_t used = KernelHeap::GetUsed();
-        SettingsUI::IntToStr((int)(used / 1024), buf, 64);
-        SettingsUI::StrApp(buf, " KB heap used", 64);
-        SettingsUI::Row(x, ly, "Kernel Heap:", buf);
-        ly += 30;
-    }
-
-    // ── system ───────────────────────────────────────────────────────────
-    SettingsUI::SectionHeader(x, ly, "System");
-    ly += 26;
-    SettingsUI::Row(x, ly, "Kernel:", "Kurono Microkernel");
-    ly += 22;
-    SettingsUI::Row(x, ly, "Filesystem:", "KVFS");
-    ly += 22;
-    SettingsUI::Row(x, ly, "Architecture:", "x86_64");
-    ly += 22;
+    Group(nullptr);
+    if(Nav("Devices", nullptr, "Hardware and drivers")) GoTo("devices");
+    if(Nav("Storage", nullptr, "Memory, disks and files")) GoTo("storage");
+    EndGroup();
 }
 
-// about is read-only: no interactive controls. (satoru)
-static bool about_input(int mx, int my, bool click, char key, int scroll){
-    (void)mx; (void)my; (void)click; (void)key; (void)scroll;
-    return false;
-}
-
-static int about_content_height(){
-    // banner + 4 sections; matches the row advances in about_render. (satoru)
-    return 8 + 56
-         + 26 + 22 + 22 + 30           // processor (satoru)
-         + 26 + 22 + 22 + 22 + 30      // graphics (satoru)
-         + 26 + 30                     // memory (satoru)
-         + 26 + 22 + 22 + 22           // system (satoru)
-         + 16;
-}
-
-// `extern` forces EXTERNAL linkage on this const definition so the shell's
-// `extern const SettingsModule g_about_module;` resolves at link time. (satoru)
 extern const SettingsModule g_about_module = {
-    "about", "About", "\x69",
-    about_on_show, about_render, about_input, about_content_height
+    "about", "About", "", about_on_show, nullptr, nullptr, nullptr, about_build
 };
 // end (satoru)

@@ -1,4 +1,5 @@
 #include "hwinfo.h"
+#include "../kernel/pmm.h"
 #include "serial.h"
 #include "usb.h"
 #include "blockdev.h"
@@ -8,6 +9,7 @@
 #include "../proc/scheduler.h"
 #include "../net/tcpip.h"
 #include "../fs/persist.h"
+#include "../kernel/kdf.h"
 
 // see hwinfo.h. everything here only reads hardware state; nothing is
 // configured or written. (satoru)
@@ -179,6 +181,124 @@ void HwInfo::NoteUsbMouse() {
         SerialLogger::Log("[input] usb mouse report\r\n");
 }
 
+// ---- Intel display engine, read only (8086:7D67, Meteor Lake class, display ver 14) ----
+// every offset below is checked against sources/linux-ref/drivers/gpu/drm/i915/display:
+//   power wells  HSW_PWR_WELL_CTL1..4 0x45400.. (REQ = 2<<(idx*2), STATE = 1<<(idx*2)),
+//                PW_2 idx 1, XELPD PW_A..D idx 5..8, DC_STATE_EN 0x45504
+//   per pipe n (stride 0x1000): HTOTAL 0x60000 HBLANK 0x60004 HSYNC 0x60008 VTOTAL
+//                0x6000c VBLANK 0x60010 VSYNC 0x60014 PIPESRC 0x6001c, TRANS_DDI_FUNC_CTL
+//                0x60400, TRANSCONF 0x70008, PLANE_CTL_1 0x70180 STRIDE 0x70188 POS
+//                0x7018c SIZE 0x70190 SURF 0x7019c
+//   DDI_BUF_CTL(port) 0x64000 + 0x100*port
+// a pipe's registers are only read while its power well reports STATE, so an
+// unpowered block is never touched. no register is ever written. (satoru)
+namespace {
+    volatile uint8_t* g_idisp = nullptr;
+    uint64_t g_idisp_bar = 0;
+    inline uint32_t idr(uint32_t off) { return *(volatile uint32_t*)(g_idisp + off); }
+
+    void idisp_hex(const char* name, uint32_t v) {
+        SerialLogger::Log(name); SerialLogger::Log("=0x"); log_hex(v, 8); SerialLogger::Log(" ");
+    }
+
+    bool idisp_kdf_init() {
+        if (!g_idisp_bar) return false;
+        if (!g_idisp) {   // map once; the inventory runs twice per boot (satoru)
+            void* win = KDF::MapMMIO(g_idisp_bar, 0x80000ULL);   // 512 KB: display regs live below 0x7c000
+            if (!win) { SerialLogger::Log("[idisp] MapMMIO failed\r\n"); return false; }
+            g_idisp = (volatile uint8_t*)win;
+        }
+        const uint32_t ctl1 = idr(0x45400), ctl2 = idr(0x45404), ctl3 = idr(0x45408), ctl4 = idr(0x4540C);
+        const uint32_t dc = idr(0x45504);
+        SerialLogger::Log("[idisp] power wells: ");
+        idisp_hex("CTL1", ctl1); idisp_hex("CTL2", ctl2); idisp_hex("CTL3", ctl3); idisp_hex("CTL4", ctl4);
+        idisp_hex("DC_STATE_EN", dc);
+        SerialLogger::Log("\r\n");
+        const bool pw2 = (ctl2 & (1u << (1 * 2))) != 0;   // PW_2 state
+        SerialLogger::Log("[idisp] PW_2 state="); log_u(pw2 ? 1 : 0);
+        for (int p = 0; p < 4; p++) {
+            SerialLogger::Log(" PW_"); SerialLogger::Log(p == 0 ? "A" : p == 1 ? "B" : p == 2 ? "C" : "D");
+            SerialLogger::Log("="); log_u((ctl2 & (1u << ((5 + p) * 2))) ? 1 : 0);
+        }
+        SerialLogger::Log("\r\n");
+        for (int p = 0; p < 4; p++) {
+            const char pn = (char)('A' + p);
+            bool pw = pw2 && (ctl2 & (1u << ((5 + p) * 2)));
+            if (!pw) {
+                SerialLogger::Log("[idisp] pipe "); char s[2] = { pn, 0 }; SerialLogger::Log(s);
+                SerialLogger::Log(": power well off, registers not read\r\n");
+                continue;
+            }
+            const uint32_t b = (uint32_t)p * 0x1000u;
+            uint32_t conf = idr(0x70008 + b), htot = idr(0x60000 + b), vtot = idr(0x6000c + b);
+            uint32_t src = idr(0x6001c + b), pctl = idr(0x70180 + b), surf = idr(0x7019c + b);
+            uint32_t strd = idr(0x70188 + b), psz = idr(0x70190 + b), ppos = idr(0x7018c + b);
+            uint32_t ddif = idr(0x60400 + b);
+            char s[2] = { pn, 0 };
+            SerialLogger::Log("[idisp] pipe "); SerialLogger::Log(s);
+            SerialLogger::Log(": active="); log_u(((conf >> 30) & 1) && ((conf >> 31) & 1) ? 1 : 0);
+            SerialLogger::Log(" hactive="); log_u((htot & 0xFFFF) + 1);
+            SerialLogger::Log(" htotal="); log_u(((htot >> 16) & 0xFFFF) + 1);
+            SerialLogger::Log(" vactive="); log_u((vtot & 0xFFFF) + 1);
+            SerialLogger::Log(" vtotal="); log_u(((vtot >> 16) & 0xFFFF) + 1);
+            SerialLogger::Log(" pipesrc="); log_u(((src >> 16) & 0xFFFF) + 1);
+            SerialLogger::Log("x"); log_u((src & 0xFFFF) + 1);
+            SerialLogger::Log(" "); idisp_hex("TRANSCONF", conf);
+            SerialLogger::Log("\r\n[idisp]   plane1: enabled="); log_u((pctl >> 31) & 1);
+            SerialLogger::Log(" "); idisp_hex("CTL", pctl); idisp_hex("SURF", surf);
+            SerialLogger::Log("stride_x64="); log_u(strd & 0xFFF);
+            SerialLogger::Log(" size="); log_u((psz & 0xFFFF) + 1);
+            SerialLogger::Log("x"); log_u(((psz >> 16) & 0xFFFF) + 1);
+            SerialLogger::Log(" pos="); log_u(ppos & 0xFFFF); SerialLogger::Log(","); log_u((ppos >> 16) & 0xFFFF);
+            SerialLogger::Log("\r\n[idisp]   transcoder ddi: enabled="); log_u((ddif >> 31) & 1);
+            SerialLogger::Log(" port="); log_u(((ddif >> 27) & 0xF) ? ((ddif >> 27) & 0xF) - 1 : 0);
+            SerialLogger::Log(" mode="); log_u((ddif >> 24) & 7);
+            SerialLogger::Log("(0=hdmi 1=dvi 2=dp-sst 3=dp-mst) "); idisp_hex("FUNC_CTL", ddif);
+            SerialLogger::Log("\r\n");
+        }
+        if (pw2) {
+            for (int d = 0; d < 5; d++) {
+                uint32_t bc = idr(0x64000 + (uint32_t)d * 0x100u);
+                SerialLogger::Log("[idisp] ddi "); log_u((uint64_t)d);
+                SerialLogger::Log(": enabled="); log_u((bc >> 31) & 1);
+                SerialLogger::Log(" idle="); log_u((bc >> 7) & 1);
+                SerialLogger::Log(" "); idisp_hex("BUF_CTL", bc);
+                SerialLogger::Log("\r\n");
+            }
+        }
+        return true;
+    }
+}
+
+void HwInfo::DumpIntelDisplay() {
+    // find 8086:7d67 on the first few buses (the igpu is 00:02.0 on every client part) (satoru)
+    for (int bus = 0; bus < 4; bus++) {
+        for (int dev = 0; dev < 32; dev++) {
+            uint32_t id = PCI::Read32((uint8_t)bus, (uint8_t)dev, 0, 0x00);
+            if ((id & 0xFFFF) != 0x8086 || (id >> 16) != 0x7D67) continue;
+            uint32_t bar0 = PCI::Read32((uint8_t)bus, (uint8_t)dev, 0, 0x10);
+            uint32_t bar1 = PCI::Read32((uint8_t)bus, (uint8_t)dev, 0, 0x14);
+            uint16_t cmd = PCI::Read16((uint8_t)bus, (uint8_t)dev, 0, 0x04);
+            SerialLogger::Log("[idisp] intel 8086:7d67 at "); log_u((uint64_t)bus);
+            SerialLogger::Log(":"); log_u((uint64_t)dev); SerialLogger::Log(".0 cmd=0x"); log_hex(cmd, 4);
+            if ((bar0 & 1) || ((bar0 >> 1) & 3) != 2) {
+                SerialLogger::Log(" BAR0 is not a 64-bit memory bar, skipping\r\n");
+                return;
+            }
+            g_idisp_bar = ((uint64_t)bar1 << 32) | (bar0 & ~0xFULL);
+            SerialLogger::Log(" BAR0=0x"); log_hex(g_idisp_bar, 16);
+            if (!(cmd & 2) || !g_idisp_bar) { SerialLogger::Log(" memory decode off, skipping\r\n"); return; }
+            SerialLogger::Log("\r\n");
+            static int s_id = -1;
+            if (s_id < 0) s_id = KDF::RegisterDriver("idisp_ro", &idisp_kdf_init);
+            if (s_id < 0) { SerialLogger::Log("[idisp] kdf unavailable, no dump\r\n"); return; }
+            KDF::Start(s_id);
+            return;
+        }
+    }
+    SerialLogger::Log("[idisp] no 8086:7d67 present (nothing to dump)\r\n");
+}
+
 void HwInfo::DumpAll() {
     SerialLogger::Log("[hw] ================ hardware inventory ================\r\n");
     dump_cpu();
@@ -191,6 +311,7 @@ void HwInfo::DumpAll() {
     SerialLogger::Log(USB::IsHIDInputEnabled() ? "[hw] usb hid input forwarding: ON\r\n"
                                                : "[hw] usb hid input forwarding: OFF (usb kbd/mouse ignored)\r\n");
     buf[0] = 0; DisplayManager::DumpInfo(buf, sizeof(buf)); log_block("[hw] display: ", buf);
+    DumpIntelDisplay();   // read-only intel display engine state (satoru)
     for (int i = 0; i < BlockDev::Count(); i++) {
         buf[0] = 0; BlockDev::Describe(i, buf, 512);        log_block("[hw] disk: ", buf);
     }
@@ -224,6 +345,7 @@ void HwInfo::KbDiag(int sample) {
 extern volatile uint32_t g_kbdbg[8];
 extern volatile uint32_t g_imdbg[4];
 extern volatile uint32_t g_termdbg[4];
+namespace Kpty { extern volatile uint32_t g_ptydbg[8]; }
 
 void HwInfo::Heartbeat() {
     // key path: scancodes -> chars -> terminal; any drop shows here (satoru)
@@ -238,12 +360,22 @@ void HwInfo::Heartbeat() {
     SerialLogger::Log("ms maxdrain "); log_u(g_kbdbg[2]);
     SerialLogger::Log(" term in "); log_u(g_termdbg[0]);
     SerialLogger::Log(" typed "); log_u(g_termdbg[1]);
+    SerialLogger::Log(" pty in "); log_u(Kpty::g_ptydbg[0]);
+    SerialLogger::Log(" rd "); log_u(Kpty::g_ptydbg[1]);
+    SerialLogger::Log(" got "); log_u(Kpty::g_ptydbg[2]);
+    SerialLogger::Log(" eagain "); log_u(Kpty::g_ptydbg[3]);
+    SerialLogger::Log(" wr "); log_u(Kpty::g_ptydbg[4]);
+    SerialLogger::Log(" wbytes "); log_u(Kpty::g_ptydbg[5]);
+    SerialLogger::Log(" wblock "); log_u(Kpty::g_ptydbg[6]);
+    SerialLogger::Log(" peak "); log_u(Kpty::g_ptydbg[7]);
     SerialLogger::Log(" ahead "); log_u(g_termdbg[2]);
     SerialLogger::Log(" enterlost "); log_u(g_termdbg[3]);
     SerialLogger::Log("\r\n");
     g_kbdbg[1] = 0;
     SerialLogger::Log("[hb] up ");
     log_u(Scheduler::NowMs() / 1000);
+    // free physical memory in the heartbeat: read-only pmm query, to spot leaks over a session (satoru)
+    SerialLogger::Log("s | free mb "); log_u((uint32_t)(PMM::GetFreeMemory() / (1024 * 1024)));
     SerialLogger::Log("s | ps2 keys "); log_u(g_kbd_ps2);
     SerialLogger::Log(" usb kbd "); log_u(g_kbd_usb);
     SerialLogger::Log(" | mouse events "); log_u(g_mouse_ev);

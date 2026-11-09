@@ -1,29 +1,28 @@
 // kurono os - native video player
 // =================================================================
-// industrial-grade video player capable of two playback paths:
+// video player engine with two playback paths:
 //
-//   1. KVID native - guaranteed-to-work (mjpeg + s16 pcm).  the player
-//      decodes one jpeg frame per video tick via stb_image and pushes
-//      audio samples to AudioServer's mixer for proper sync.
+//   1. KVID native - mjpeg + s16 pcm.  the player decodes one jpeg frame
+//      per video frame via stb_image and feeds the pcm to AudioServer's
+//      mixer from its own cursor, so audio is independent of paint rate.
 //
 //   2. MP4 inspect - full demux, h.264/aac metadata extraction; if the
-//      mp4 happens to contain mjpeg or kvid tracks we play those, else
-//      we display the parsed structure so the user knows exactly
-//      what's in the file.
+//      mp4 happens to contain mjpeg tracks we play those, else we
+//      display the parsed structure so the user knows what is in the file.
 //
-// the player exposes a small wm-friendly api:
-//   * Open() / Close() - load buffer
-//   * Tick()           - call once per frame from the main loop
-//   * Render()         - paint into the window
-//   * Input()          - handle clicks / keys
-//
-// integrates with the new AudioServer + AudioMixer for sound output.
+// the engine has no ui of its own: apps/denji_app.cpp owns the window,
+// the control bar and the input handling and calls into this api.  all
+// timing comes from the real clock (Timer::GetRealMs64), never from
+// frame counts, so playback speed is independent of the desktop refresh
+// rate (60 to 240 hz).
 #pragma once
-#include "../kernel/types.h"
+#include <stdint.h>
+#include <stddef.h>
 #include "kvid.h"
 #include "mp4_demux.h"
 #include "h264_parse.h"
 #include "aac_parse.h"
+#include "../kui/kui.h"
 
 namespace VideoPlayer {
 
@@ -49,12 +48,13 @@ struct State {
     int              mp4_video_track;
     int              mp4_audio_track;
 
-    // shared playback state
-    bool     playing;
+    // transport.  the clock is origin based: position = now - clock_origin_ms
+    // while running, pos_ms while paused / stopped / ended. (satoru)
+    bool     playing;                  // clock started (stays true while paused)
     bool     paused;
-    uint32_t play_started_ms;          // wall ms at play start
-    uint32_t pause_remainder_ms;       // when paused, where we were
-    uint32_t pos_ms;                   // last known position (also used while paused)
+    bool     ended;                    // reached the end; Play() restarts
+    uint64_t clock_origin_ms;          // Timer::GetRealMs64() value at position 0
+    uint32_t pos_ms;                   // position while not running
 
     // last decoded RGBA frame (for redraw without re-decoding jpeg)
     uint8_t* rgba_frame;
@@ -68,11 +68,8 @@ struct State {
     uint8_t* decode_buf;
     uint32_t decode_cap;                // capacity in bytes
 
-    // decode-ahead: on a compositor frame where the displayed video frame hasn't
-    // advanced (display caught up to the clock), we decode the NEXT video frame
-    // into this second buffer. when the clock then crosses into it, advancing is
-    // a cheap pointer swap instead of an inline jpeg decode that stalls the
-    // compositor - so frames land on time. (satoru)
+    // decode-ahead: while the displayed frame is current we decode the NEXT
+    // frame into this second buffer, so advancing is a pointer swap. (satoru)
     uint8_t* decode_buf2;
     uint32_t decode_cap2;
     int      prefetch_frame;            // frame index held in decode_buf2, -1 = none
@@ -80,8 +77,7 @@ struct State {
     int      prefetch_h;
 
     // scaled-output cache: the letterboxed bgra result for the current
-    // (frame,dst) blitted straight via row memcpy on a static frame so the
-    // per-pixel scale runs only when the frame or window size changes. (satoru)
+    // (frame,dst) so a static frame re-blits with row memcpy. (satoru)
     uint8_t* scaled_buf;                // owned, cap == scaled_cap bytes
     uint32_t scaled_cap;
     int      scaled_w;                  // pixel dims of cached scaled image
@@ -91,43 +87,64 @@ struct State {
     int      scaled_key_dh;             // dst_h the cache was built for
     bool     scaled_valid;
 
-    // audio mixer stream id (kvid only)
-    int audio_stream_id;
+    // audio (kvid only).  audio_cursor is the next frame whose pcm has not
+    // been handed to the mixer; audio_part is how many sample frames of that
+    // chunk the ring already accepted. (satoru)
+    int      audio_stream_id;
+    uint32_t audio_cursor;
+    uint32_t audio_part;
+    uint32_t audio_underruns_seen;
+    uint64_t audio_last_resync_ms;
+    uint32_t audio_resyncs;
+    uint32_t audio_base_ms;             // media time of the first sample written to the current stream
+    uint64_t audio_written;             // frames handed to the current stream, for the heard position (satoru)
+    int      volume;                    // 0..100 stream volume
+    bool     muted;
 };
 
 // open a buffer; auto-detects KVID magic vs MP4 ftyp box.  returns
 // false if neither.  buffer is borrowed.
 bool Open(const uint8_t* data, uint32_t size, State& st);
 
+// stops audio, frees every buffer and zeroes the state.
 void Close(State& st);
 
-void Play(State& st);
+void Play(State& st);              // resume / start; restarts from 0 after the end
 void Pause(State& st);
 void TogglePause(State& st);
-void SeekMs(State& st, uint32_t ms);
+void SeekMs(State& st, uint32_t ms);    // also valid while paused / ended
+void SeekRelativeMs(State& st, int32_t delta_ms);
 
-// progress query in 0..1000 (per mil) for ui scrub bar
-uint32_t ProgressPermil(const State& st);
+// transport queries
+bool     IsPlaying(const State& st);    // clock running (not paused, not ended)
+bool     IsEnded(const State& st);
 uint32_t PositionMs(const State& st);
 uint32_t DurationMs(const State& st);
+uint32_t ProgressPermil(const State& st);
+bool     HasAudio(const State& st);
+bool     HasPicture(const State& st);   // a frame has been decoded and can be drawn
+int      FrameWidth(const State& st);
+int      FrameHeight(const State& st);
 
-// pump time-driven decoding; safe to call every main-loop iteration.
-void Tick(State& st);
+// volume 0..100 and mute, applied to the player's own mixer stream.
+void SetVolume(State& st, int vol);
+void SetMuted(State& st, bool muted);
 
-// decode-only pump: advances to the frame due at "now" and decodes it,
-// WITHOUT any drawing. this is the heavy half of Tick split out so a
-// caller can run the decode on its own cadence (e.g. a scheduler step)
-// separate from the gui blit. Tick() forwards to this. returns true if a
-// new frame was decoded this call (i.e. the displayed frame changed). a
-// cooperative scheduler has no background thread, so "decouple" means
-// calling this from a lighter cadence than the compositor, not real
-// concurrency. (satoru)
+// feed the mixer from the audio cursor.  cheap; safe to call every loop
+// iteration whether or not the window is being painted. (satoru)
+void PumpAudio(State& st);
+
+// advance to the frame due at "now" and decode it, without drawing.
+// returns true if the displayed frame changed.  works while paused too, so
+// a seek on a paused video shows the new frame. (satoru)
 bool PumpDecode(State& st);
 
-// blit current frame + overlay HUD into pixel rectangle (x,y,w,h).
-// non-const: maintains an internal scaled-output cache so a static frame
-// re-blits without re-running the per-pixel scale. (satoru)
-void Render(State& st, int x, int y, int w, int h);
+// legacy forwarder
+void Tick(State& st);
+
+// draw the picture (or the metadata view when there is no picture) into the
+// pixel rectangle on a black background.  no controls: the app draws those.
+void DrawVideo(State& st, kui::Canvas& c, int x, int y, int w, int h);
 
 // produce a one-line summary like "h264 high 1280x720 24fps + aac lc"
 void DescribeShort(const State& st, char* out, int max);

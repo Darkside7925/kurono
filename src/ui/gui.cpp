@@ -17,6 +17,7 @@ size_t   GUI::buffer_size = 0;
 extern "C" void* memset(void* dst, int v, size_t n);
 
 #include "../drivers/serial.h"
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 frame charges (satoru)
 
 // fast 32-bit dword copy. handles non-aligned tails. n is dword count.
 static inline void dword_copy(uint32_t* __restrict dst, const uint32_t* __restrict src, size_t n) {
@@ -56,18 +57,18 @@ void GUI::UpdateBackbuffer() {
     // an old-size image into the larger framebuffer and the unwritten remainder
     // shows uninitialized vram -- the "colors everywhere" corruption. (satoru)
     if (backbuffer && buffer_size != sz) {
-        PMM::FreeBytes(backbuffer, buffer_size);
+        TaskMem::UnchargeFrames(backbuffer); PMM::FreeBytes(backbuffer, buffer_size);
         backbuffer = nullptr;
-        if (wallpaper_buffer) { PMM::FreeBytes(wallpaper_buffer, buffer_size); wallpaper_buffer = nullptr; }
+        if (wallpaper_buffer) { TaskMem::UnchargeFrames(wallpaper_buffer); PMM::FreeBytes(wallpaper_buffer, buffer_size); wallpaper_buffer = nullptr; }
         buffer_size = 0;
     }
 
     if (!backbuffer) {
-        backbuffer = (uint8_t*)PMM::AllocBytes(sz);
+        backbuffer = (uint8_t*)PMM::AllocBytes(sz); TaskMem::ChargeFrames(backbuffer, sz);
         buffer_size = sz;
     }
     if (!wallpaper_buffer) {
-        wallpaper_buffer = (uint8_t*)PMM::AllocBytes(sz);
+        wallpaper_buffer = (uint8_t*)PMM::AllocBytes(sz); TaskMem::ChargeFrames(wallpaper_buffer, sz);
 
         if (!wallpaper_buffer) return;
 
@@ -136,8 +137,8 @@ void GUI::UpdateBackbuffer() {
 }
 
 void GUI::ReinitBuffers() {
-    if (backbuffer)        { PMM::FreeBytes(backbuffer, buffer_size);        backbuffer = nullptr; }
-    if (wallpaper_buffer)  { PMM::FreeBytes(wallpaper_buffer, buffer_size); wallpaper_buffer = nullptr; }
+    if (backbuffer)        { TaskMem::UnchargeFrames(backbuffer); PMM::FreeBytes(backbuffer, buffer_size);        backbuffer = nullptr; }
+    if (wallpaper_buffer)  { TaskMem::UnchargeFrames(wallpaper_buffer); PMM::FreeBytes(wallpaper_buffer, buffer_size); wallpaper_buffer = nullptr; }
     buffer_size = 0;
     UpdateBackbuffer();
 }

@@ -253,9 +253,19 @@ bool LinuxBootLoader::LoadInitrd(const uint8_t* initrd_data,
         return true; // not an error - initrd is optional
     }
 
-    // place initrd at linux_initrd_addr
+    // place initrd at the top of guest ram, below initrd_addr_max, like
+    // grub/qemu do. the fixed 8 mb slot sat inside the 12 mb protected-mode
+    // image (0x100000..0xd00000) and overwrote its gdt, stack and
+    // verify_cpu, so startup_32 ran into garbage. the kernel also
+    // decompresses to 16 mb + init_size, so keep clear of that too (satoru)
+    uint64_t top = GuestMemoryManager::GetTotalRAM();
+    if (image_info.initrd_addr_max && top > (uint64_t)image_info.initrd_addr_max + 1)
+        top = (uint64_t)image_info.initrd_addr_max + 1;
+    uint64_t keep_clear = 0x1000000ULL + image_info.init_size;
     uint32_t addr = LINUX_INITRD_ADDR;
-    if (addr + initrd_sz > GuestMemoryManager::GetTotalRAM()) {
+    if (top > initrd_sz && ((top - initrd_sz) & ~0xFFFULL) >= keep_clear) {
+        addr = (uint32_t)((top - initrd_sz) & ~0xFFFULL);
+    } else if (addr + initrd_sz > GuestMemoryManager::GetTotalRAM()) {
         // if it doesn't fit at 8 mb, try right after kernel
         addr = LINUX_KERNEL_ADDR + image_info.kernel_size;
         addr = (addr + 0xFFF) & ~0xFFF; // page-align

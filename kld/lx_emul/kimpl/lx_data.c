@@ -22,6 +22,8 @@
 #include <asm/processor.h>
 #include <asm/current.h>
 #include <linux/jump_label.h>
+#include <linux/sched.h>
+#include <linux/suspend.h>
 
 // ── time base ───────────────────────────────────────────────────────────────
 // the real jiffies counter. lx_time.c advances it from the monotonic clock;
@@ -66,12 +68,24 @@ unsigned long this_cpu_off = 0;
 // Leaving it as a generated stub meant the driver read a FUNCTION's code bytes
 // as this struct and dereferenced current -> instant SIGSEGV inside probe().
 // That was the data-symbol hole biting for real, exactly as predicted. (satoru)
+// current_task points at a zeroed dummy so header-inline `current->...` reads
+// and writes have somewhere harmless to go; the shim's per-thread task state is
+// lx_current() (lx_sched.c). (satoru)
+static struct task_struct lx_shared_current;
 struct pcpu_hot pcpu_hot = {
-    .current_task    = NULL,
+    .current_task    = &lx_shared_current,
     .preempt_count   = 0,
     .cpu_number      = 0,
     .top_of_stack    = NULL,
 };
+
+// const_pcpu_hot: the const alias of pcpu_hot that vmlinux's linker script
+// provides; 6.12's get_current() reads through it. DATA, so a generated stub
+// would be read as code bytes. its declared type is __seg_gs qualified, so C
+// cannot spell the alias; an assembler .set can, but only in the object that
+// DEFINES pcpu_hot (a .set to an external symbol silently loses to the stub,
+// which is what the first attempt in lx_sc.c did). (satoru)
+__asm__(".globl const_pcpu_hot\n.set const_pcpu_hot, pcpu_hot\n");
 
 // softnet_data is per-cpu NAPI/backlog state. Real storage so napi_schedule and
 // friends have something valid to touch. (satoru)
@@ -83,13 +97,13 @@ struct softnet_data softnet_data;
 struct static_key_false hugetlb_optimize_vmemmap_key;
 
 // ── workqueues ──────────────────────────────────────────────────────────────
-// struct workqueue_struct is OPAQUE in the headers (defined in workqueue.c), so
-// we cannot declare storage for it. A non-NULL token is all the driver needs -
-// it only ever passes system_wq back to queue_work_on(), which lx_work.c
-// implements by running the work inline and ignoring the queue. (satoru)
-static unsigned long lx_system_wq_storage[8];
-struct workqueue_struct *system_wq =
-    (struct workqueue_struct *)lx_system_wq_storage;
+// system_wq and friends now live in lx_work.c next to the real workqueue
+// implementation they point at. (satoru)
+
+// ── power management ────────────────────────────────────────────────────────
+// DATA: pm_suspend_global_flags is read by drivers' suspend paths. zero = no
+// suspend-to-idle / no firmware-assisted suspend, which is the truth here.
+unsigned int pm_suspend_global_flags;
 
 // ── slab ────────────────────────────────────────────────────────────────────
 // kmalloc_caches is indexed by kmalloc's inlined size lookup. All-NULL is safe

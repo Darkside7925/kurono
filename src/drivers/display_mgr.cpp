@@ -3,6 +3,7 @@
 #include "display_mgr.h"
 #include "bga.h"
 #include "graphics.h"
+#include "outputs.h"
 #include "virtio_gpu.h"
 #include "gpu_probe.h"
 #include "nvidia_gpu.h"
@@ -47,7 +48,7 @@ bool DisplayManager::Init() {
     backend = DISPLAY_BACKEND_NONE;
 
     // try virtio gpu first (highest quality in vm)
-    if (VirtIOGPU::IsDetected()) {
+    if (VirtIOGPU::IsDetected() && !Graphics::MultiActive()) {
         backend = DISPLAY_BACKEND_VIRTIO_GPU;
         if (InitVirtIOGPU()) {
             initialized = true;
@@ -496,37 +497,28 @@ int DisplayManager::DetectDisplays() {
     // additional usable display controllers become extra outputs. "usable"
     // means a distinct controller (not the primary) that exposes a linear
     // framebuffer aperture via one of its bars. (satoru)
-    for (int i = 0; i < gpr.count && monitor_count < DISPLAY_MAX_MONITORS; i++) {
-        if (i == gpr.primary_idx) continue;
-        const GpuInfo& g = gpr.gpus[i];
-        if (!g.present) continue;
-        // bar2 is the vram/framebuffer aperture on every vendor we classify
-        // (intel gmadr, nvidia bar1, amd vram); bar0 is the mmio aperture.
-        // require at least one nonzero aperture so the output is real. (satoru)
-        if (g.bar2 == 0 && g.bar0 == 0) continue;
-
+    // a pci display controller is NOT an output: the old code listed every extra
+    // gpu as a monitor, which on a single-screen hybrid laptop invented a second
+    // screen with no scanout. only real framebuffers (Outputs, from the efi gop
+    // handles) become monitors now. (satoru)
+    (void)next_origin_x; (void)gpr;
+    for (int i = 1; i < Outputs::Total() && monitor_count < DISPLAY_MAX_MONITORS; i++) {
+        const Output* o = Outputs::Get(i);
+        if (!o || !o->connected) continue;
         MonitorInfo& m = monitors[monitor_count];
         m.connected     = true;
-        m.native_width  = fb_info.width;   // unknown without per-vendor edid/modeset
-        m.native_height = fb_info.height;
-        m.max_width     = 3840;
-        m.max_height    = 2160;
+        m.native_width  = (uint32_t)o->w;
+        m.native_height = (uint32_t)o->h;
+        m.max_width     = (uint32_t)o->w;
+        m.max_height    = (uint32_t)o->h;
         m.max_refresh   = 60;
         m.physical_width_cm  = 60.0f;
         m.physical_height_cm = 34.0f;
-        m.origin_x      = next_origin_x;
-        m.origin_y      = 0;
-        m.pci_bus       = g.bus;
-        m.pci_device    = g.device;
-        m.pci_function  = g.function;
-        m.vendor_id     = g.vendor_id;
-
-        // short label from the probe description (MonitorInfo.name is 14b).
+        m.origin_x      = o->x;
+        m.origin_y      = o->y;
         int n = 0;
-        while (g.desc[n] && n < 13) { m.name[n] = g.desc[n]; n++; }
+        while (o->name[n] && n < 13) { m.name[n] = o->name[n]; n++; }
         m.name[n] = 0;
-
-        next_origin_x += (int32_t)m.native_width;
         monitor_count++;
     }
 
@@ -534,7 +526,7 @@ int DisplayManager::DetectDisplays() {
     // for it at the primary resolution. scanning this out to the secondary
     // controller's physical display needs per-vendor modeset code, so the
     // compositor can render into it but presentation is a follow-up. (satoru)
-    if (monitor_count >= 2 && fb_info.width > 0 && fb_info.height > 0) {
+    if (monitor_count >= 2 && !Graphics::MultiActive() && fb_info.width > 0 && fb_info.height > 0) {
         fb_secondary.width  = fb_info.width;
         fb_secondary.height = fb_info.height;
         fb_secondary.bpp    = fb_info.bpp ? fb_info.bpp : 32;

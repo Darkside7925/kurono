@@ -27,6 +27,7 @@ extern "C" {
 void lx_log(const char* s);
 void lx_log_u(unsigned long v);
 void lx_log_line(const char* s);
+void lx_log_hex(unsigned long v);
 
 // ── the unimplemented trap ──────────────────────────────────────────────────
 // aborts the container with the symbol name. this is a SUCCESS signal during

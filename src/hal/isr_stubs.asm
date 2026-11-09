@@ -94,6 +94,15 @@ ISR_NOERR 47   ; IRQ15 Secondary ATA / Spurious
 ISR_NOERR 128  ; User syscall gate
 ISR_NOERR 64   ; per-AP LAPIC timer (smp phase 4)
 ISR_NOERR 65   ; tlb-shootdown ipi (smp thread dispatch) (satoru)
+ISR_NOERR 66   ; sched=2 resched ipi: wakes a halted ap (satoru)
+ISR_NOERR 80   ; kld broker msi vector 0x50 (satoru)
+ISR_NOERR 81   ; kld broker msi vector 0x51 (satoru)
+ISR_NOERR 82   ; kld broker msi vector 0x52 (satoru)
+ISR_NOERR 83   ; kld broker msi vector 0x53 (satoru)
+ISR_NOERR 84   ; kld broker msi vector 0x54 (satoru)
+ISR_NOERR 85   ; kld broker msi vector 0x55 (satoru)
+ISR_NOERR 86   ; kld broker msi vector 0x56 (satoru)
+ISR_NOERR 87   ; kld broker msi vector 0x57 (satoru)
 
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  Common handler - saves all GPRs, calls C, restores, iretq

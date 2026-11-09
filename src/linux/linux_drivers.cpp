@@ -6,6 +6,7 @@
 #include "../kernel/types.h"
 #include "../kernel/time.h"
 #include "../kernel/heap.h"
+#include "../kernel/memacct.h"   // real meminfo (satoru)
 #include "../shell/shell.h"
 #include "../drivers/serial.h"
 #include "../drivers/graphics.h"
@@ -1082,16 +1083,9 @@ void ProcFS::UpdateCPUInfo() {
 }
 
 void ProcFS::UpdateMemInfo() {
-    // 10gb ram configured
-    char buf[512];
-    int p = 0;
-    p = lf_a(buf, p, 512, "MemTotal:       10485760 kB\n");
-    p = lf_a(buf, p, 512, "MemFree:         8388608 kB\n");
-    p = lf_a(buf, p, 512, "MemAvailable:    9437184 kB\n");
-    p = lf_a(buf, p, 512, "Buffers:          262144 kB\n");
-    p = lf_a(buf, p, 512, "Cached:           786432 kB\n");
-    p = lf_a(buf, p, 512, "SwapTotal:        32768 kB\n");
-    p = lf_a(buf, p, 512, "SwapFree:         32768 kB\n");
+    // real pmm numbers (was a fixed 10 gb literal); a boot snapshot, the linux abi path is live per read (satoru)
+    static char buf[512];
+    MemAcct::FormatMeminfo(buf, (int)sizeof(buf));
     KVFS::WriteString("/proc/meminfo", buf);
 }
 

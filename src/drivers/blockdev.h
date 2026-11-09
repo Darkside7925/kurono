@@ -68,6 +68,9 @@ public:
 
     // one line per disk, for `lsblk`-style output. (satoru)
     static void Describe(int idx, char* out, int max_len);
+    // i/o counters for /proc/diskstats, in operations and 512-byte sectors. (satoru)
+    static void GetStats(int idx, uint64_t* reads, uint64_t* sectors_read,
+                         uint64_t* writes, uint64_t* sectors_written);
 
 private:
     static BlockDevice s_devs[BLOCKDEV_MAX];

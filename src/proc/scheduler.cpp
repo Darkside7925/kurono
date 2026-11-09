@@ -6,6 +6,7 @@
 #include "../kernel/heap.h"
 #include "../kernel/vmm.h"
 #include "../kernel/pmm.h"
+#include "../linux/ld_kurono.h"   // LdKurono::ReleaseProcess (satoru)
 #include "../kernel/hrtimer.h"
 #include "../kernel/kvdso.h"    // userspace vdso time page tick (satoru)
 #include "../kernel/panic.h"
@@ -14,6 +15,7 @@
 #include "../drivers/timer.h"   // TSC ms clock for sleep deadlines (satoru)
 #include "../hal/hal.h"
 #include "../system/logging.h"
+#include "../kernel/userspace.h"   // sched=2 partition: session cpu of a leader (satoru)
 
 // ── Global kernel locks (declared in proc/kernel_locks.h) ──
 Spinlock g_net_lock;
@@ -34,6 +36,7 @@ Spinlock g_log_lock;
 static Spinlock g_sched_lock;
 
 // switch_to.asm helpers
+extern uint64_t hal_pid_busy_ms(uint32_t pid);   // per-pid busy ms side table, hal.cpp (satoru)
 extern "C" void scheduler_switch_to(uint64_t* prev_saved_rsp,
                                     uint64_t  next_saved_rsp);
 extern "C" [[noreturn]] void scheduler_jump_to(uint64_t saved_rsp);
@@ -460,6 +463,12 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
 
     init_process_common(proc, parent->name, parent->priority);
     proc->flags = parent->flags;
+    // sched=2: a fork child owns a copied address space and is NOT claimable
+    // until sys_fork finished building it (slot, fds, rax=0) and marks it AP_OK
+    // itself. inheriting the parent's AP_OK, or THREAD when a thread forks, let
+    // an idle ap resume it half-built as a second copy of the parent (review
+    // finding). old mode keeps the inherited flags. (satoru)
+    if (Scheduler::SchedV2()) proc->flags &= ~(PROCESS_FLAG_AP_OK | PROCESS_FLAG_THREAD);
     proc->rip = parent->rip;
     proc->rbp = parent->rbp;
     proc->rsp = parent->rsp;
@@ -564,6 +573,13 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
     for (int b = 0; b < 512; b++) proc->fpu_state[b] = parent->fpu_state[b];
 
     link_child(parent, proc);
+    // sched=2: the thread must not be claimable before clone has built its
+    // linux record and written settid - the picker used to grab it in this
+    // window (the stranded-task half of the phase-A stall, reviewer finding).
+    // bit 0 = bsp only, and the bsp runs no thread under sched=2, so nobody
+    // can pick it until clone releases the affinity. the old mode sets the
+    // same pin, just after this returns. (satoru)
+    if (Scheduler::SchedV2()) proc->cpu_affinity = 1;
     enqueue_process(proc);
     sched_log_process_event(proc, "created", "native user thread");
     return proc;
@@ -574,10 +590,21 @@ void Scheduler::MarkProcessExited(Process* proc, int exit_code) {
     // DEFERRED (queued, still valid): the drain re-asserts Terminated on these
     // if a member re-blocked from its own kernel path, so allow the re-mark -
     // guarding on the truthy `reaped` blocked it and could leak the group. (satoru)
-    if (!proc || proc->reaped == 1) return;
+    if (!proc || proc->reaped == 1 || proc->reaped == 3) return;   // 3 = being destroyed (satoru)
 
     proc->exit_code = exit_code;
-    proc->state = Process_Terminated;
+    // in one g_sched_lock hold with the dequeue below: the pickers' locked
+    // check-then-store sequences (ScheduleNextUser Running->Ready / Ready->Running) could
+    // overwrite an unlocked Terminated store (audit 11-07 #2). (satoru)
+    {
+        uint64_t lf; g_sched_lock.LockIrqSave(&lf);
+        __atomic_store_n((int*)&proc->state, (int)Process_Terminated, __ATOMIC_RELEASE);
+        remove_from_ready_queue_nolock(proc);
+        g_sched_lock.UnlockIrqRestore(lf);
+    }
+    // sched=2: a member running in ring 3 on another cpu stops now, not at its
+    // next tick. (satoru)
+    if (Scheduler::SchedV2() && proc->is_user()) KickTaskCpu(proc);
     proc->sleep_ticks = 0;
     remove_from_ready_queue(proc);
     sched_log_exit(proc, exit_code);
@@ -871,6 +898,13 @@ void Scheduler::CaptureStackCanary(Process* proc) {
     proc->stk_canary_valid = proc->stk_canary_len ? 1 : 0;
 }
 
+// sched=2 globals (the functions live beside cross_run_grace_ok). (satoru)
+static bool g_sched_v2 = false;
+static bool g_sched_defer_rel = true;   // kurono.schedrel=0 turns the hand-off off (a/b) (satoru)
+static volatile uint64_t g_hazard_hits = 0;
+static Process* g_release_pending[SMP_MAX_CPUS][2];
+static void hazard_check(Process* proc);
+
 // per-cpu start of the running user thread's slice; set on every load. (satoru)
 static uint64_t g_slice_start_ms[SMP_MAX_CPUS];
 static constexpr uint64_t USER_SLICE_MS = 10;
@@ -1021,6 +1055,25 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
                 bool nv_small  = nv < 0x1000ull;
                 bool halfstomp = (ov & 0xFFFFFFFFull) == (nv & 0xFFFFFFFFull) &&
                                  (ov >> 32) != (nv >> 32);
+                // two legit sibling writes matched these arms (agent_stkcorrupt.md).
+                // (1) a musl condvar waiter node {state, barrier} lives on the
+                // waiter's stack: {WAITING=0, barrier=2} reads as the "pointer"
+                // 0x0000000200000000, and the signaler's a_cas(state, 0, 1) plus
+                // unlock(&barrier) make it {1, 0} = 0x1. caught with the waiter
+                // parked at the ret after musl's __syscall_cp_asm syscall. a qword
+                // whose low dword is 0 is a packed int pair, not a pointer.
+                // (2) a change made only of 0x00 -> 0x01 bytes is a flag store
+                // (bool/AtomicBool/Option<()>), e.g. rust's zero-capacity channel
+                // Packet<()> on a receiver yielding in wait_ready while the
+                // sender sets ready + msg; it flips high bytes of stale stack
+                // data and looked like a halfstomp. (satoru)
+                if ((ov & 0xFFFFFFFFull) == 0) ov_ptr = false;
+                bool flagstore = true;
+                for (int b = 0; b < 8; b++) {
+                    uint8_t ob = (uint8_t)(ov >> (b * 8)), nb = (uint8_t)(nv >> (b * 8));
+                    if (ob != nb && !(ob == 0 && nb == 1)) { flagstore = false; break; }
+                }
+                if (flagstore) halfstomp = false;
                 if (!((ov_ptr && nv_small) || halfstomp)) continue; // filter legit writes (satoru)
                 if (!corrupt) {
                     corrupt = true; s_canary_dumps++;
@@ -1032,6 +1085,8 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
                     SerialLogger::LogDec((int)proc->last_save_site);
                     SerialLogger::Log(" saveseq=");
                     SerialLogger::LogHex((uint32_t)proc->save_seq);
+                    SerialLogger::Log(" urip=");
+                    SerialLogger::LogHex64(proc->user_frame.rip);
                     SerialLogger::Log("\r\n");
                 }
                 SerialLogger::Log("[STKCORRUPT] +");
@@ -1051,8 +1106,18 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     // frame is now live on THIS cpu - mark on_cpu so no other cpu resumes it
     // until we save + release it. plain store: this cpu is the sole writer, and
     // the picker's ACQUIRE-load pairs with our later RELEASE-store to 0. (satoru)
+    if (g_sched_v2) hazard_check(proc);   // sched=2 hand-off diagnostic (satoru)
     proc->on_cpu = 1;
-    proc->state = Process_Running;
+    // never resurrect a kill: a claim drops g_sched_lock before this load, and a
+    // MarkProcessExited in that gap wrote Terminated, which a blind Running store undid
+    // (audit 11-07 #1). Running only from a live state; a Terminated task keeps its mark
+    // and the next tick / kick switches it away. (satoru)
+    {
+        int st = __atomic_load_n((int*)&proc->state, __ATOMIC_ACQUIRE);
+        while (st != (int)Process_Terminated &&
+               !__atomic_compare_exchange_n((int*)&proc->state, &st, (int)Process_Running, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+    }
     HAL::SetKernelStack(proc->kernel_stack_top);
     KernelVMM::ActivateAddressSpace(proc->address_space);
 
@@ -1080,7 +1145,13 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
 // affinity gate: a thread with cpu_affinity 0 may run on any cpu; otherwise bit
 // n must be set to run on cpu n. (satoru)
 static inline bool cpu_allowed(const Process* p, uint32_t cpu) {
-    return p->cpu_affinity == 0 || (p->cpu_affinity & (1u << cpu)) != 0;
+    if (p->cpu_affinity == 0) return true;
+    // cpu_affinity is 8 bits and struct Process must not grow. old mode: a
+    // nonzero mask never allows cpu 8+ (unchanged). sched=2: a mask that allows
+    // every one of cpus 0..7 is read as "any cpu", which is what a full linux
+    // mask stored through SetAffinity means. (satoru)
+    if (cpu >= 8) return g_sched_v2 && p->cpu_affinity == 0xFF;
+    return (p->cpu_affinity & (1u << cpu)) != 0;
 }
 
 // cross-cpu resume grace: after a cpu switches away from a task, its kernel
@@ -1099,6 +1170,180 @@ static inline bool cpu_allowed(const Process* p, uint32_t cpu) {
 // (SaveUserFrame/LoadUserFrame completeness audit). (satoru)
 static bool g_pin_cpu = true;
 void Scheduler::SetPinCpu(bool on) { g_pin_cpu = on; }
+
+// ── sched=2 state (see scheduler.h) ──────────────────────────────────────────
+void Scheduler::SetSchedMode(int mode) {
+    g_sched_v2 = (mode == 2);
+    // the stack hand-off below makes cross-cpu resume safe, so sched=2 runs
+    // unpinned with no migration grace. (satoru)
+    if (g_sched_v2) g_pin_cpu = false;
+}
+bool Scheduler::SchedV2() { return g_sched_v2; }
+void Scheduler::SetDeferredRelease(bool on) { g_sched_defer_rel = on; }
+static bool g_sched_detached = true;
+static bool g_sched_allcpus = true;   // kurono.schedcpus=0 keeps the old 1-cpu affinity report (satoru)
+void Scheduler::SetReportAllCpus(bool on) { g_sched_allcpus = on; }
+bool Scheduler::ReportAllCpus() { return g_sched_v2 && g_sched_allcpus && SMP::OnlineCount() > 1; }
+void Scheduler::SetDetachedLaunch(bool on) { g_sched_detached = on; }
+bool Scheduler::DetachedLaunch() { return g_sched_v2 && g_sched_detached; }
+
+bool Scheduler::ApResumable(const Process* p) {
+    if (!p) return false;
+    if (p->is_thread()) return true;
+    return g_sched_v2 && (p->flags & PROCESS_FLAG_AP_OK) != 0;
+}
+
+// two pending slots per cpu: a task is queued when this cpu stops running it
+// and stays queued until this cpu is provably off its kernel stack. two, not
+// one, so a second release while the first is still unpublishable (we are
+// still on its stack) never has to drop either. (satoru)
+static volatile uint64_t g_release_forced = 0;   // overflow counter, expected 0 (satoru)
+
+static inline bool rsp_in_task_kstack(const Process* p) {
+    uint64_t top = p->kernel_stack_top;
+    if (!top) return false;
+    uint64_t rsp;
+    __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp));
+    return rsp < top && rsp >= top - KERNEL_STACK_BYTES;
+}
+
+// hazard diagnostic: in the kurono.schedrel=0 a/b arm the slots below still
+// record "this cpu has not left the task's stack yet" (without holding on_cpu),
+// and LoadUserFrame counts every resume of a task another cpu is still
+// unwinding on - the exact window section 1.5 of the design describes. in the
+// deferred arm the count must stay 0 by construction. (satoru)
+
+void Scheduler::ReleaseOnCpu(Process* p) {
+    if (!p) return;
+    if (!g_sched_v2) {
+        __atomic_store_n(&p->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+        return;
+    }
+    if (!g_sched_defer_rel) {
+        __atomic_store_n(&p->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+        IrqGuard g;
+        uint32_t c = SMP::CpuIndex() % SMP_MAX_CPUS;
+        Process** slot = g_release_pending[c];
+        if (slot[0] != p && slot[1] != p) { slot[1] = slot[0]; slot[0] = p; }
+        return;
+    }
+    IrqGuard g;
+    uint32_t c = SMP::CpuIndex() % SMP_MAX_CPUS;
+    Process** slot = g_release_pending[c];
+    if (slot[0] == p || slot[1] == p) return;   // already queued (satoru)
+    for (int i = 0; i < 2; i++) {
+        // publish whatever is already safe first, freeing its slot. (satoru)
+        Process* q = slot[i];
+        if (q && !rsp_in_task_kstack(q)) {
+            slot[i] = nullptr;
+            __atomic_store_n(&q->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (!slot[i]) { slot[i] = p; return; }
+    }
+    // both slots hold tasks whose stack we are on - cannot happen (a cpu is on
+    // one stack at a time). publish the older one rather than lose p. (satoru)
+    __atomic_add_fetch(&g_release_forced, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&slot[0]->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+    slot[0] = slot[1];
+    slot[1] = p;
+}
+
+void Scheduler::FinishSwitch() {
+    if (!g_sched_v2) return;
+    IrqGuard g;
+    uint32_t c = SMP::CpuIndex() % SMP_MAX_CPUS;
+    Process** slot = g_release_pending[c];
+    if (!slot[0] && !slot[1]) return;
+    Process* me = GetCurrentProcess();
+    for (int i = 0; i < 2; i++) {
+        Process* q = slot[i];
+        if (!q) continue;
+        // still on its stack, or it is running here again (LoadUserFrame set
+        // on_cpu=1 for its new run): keep it queued. (satoru)
+        if (q == me || rsp_in_task_kstack(q)) continue;
+        slot[i] = nullptr;
+        if (g_sched_defer_rel) {
+            __atomic_store_n(&q->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+            // store->load: x86 may let the state load pass the on_cpu store. a waker that
+            // stored Ready and kicked an ap which still saw on_cpu==1, while we read the
+            // old Blocked here, lost the wake until a 10 ms tick (audit 11-07 #4). the full
+            // fence pairs with the waker's locked cas. (satoru)
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            if (__atomic_load_n((int*)&q->state, __ATOMIC_ACQUIRE) == (int)Process_Ready)
+                SMP::KickIdleFor(q);
+        }
+    }
+}
+
+static void hazard_check(Process* proc) {
+    uint32_t me = SMP::CpuIndex();
+    uint32_t n = SMP::CpuCount();
+    for (uint32_t c = 0; c < n && c < SMP_MAX_CPUS; c++) {
+        if (c == me) continue;
+        if (g_release_pending[c][0] != proc && g_release_pending[c][1] != proc) continue;
+        uint64_t h = __atomic_add_fetch(&g_hazard_hits, 1u, __ATOMIC_RELAXED);
+        if (h == 1 || h == 10 || h == 100 || h == 1000 || h == 10000 || h == 100000) {
+            SerialLogger::Log("[sched2] HAZARD resume of a task cpu");
+            SerialLogger::LogDec((int)c);
+            SerialLogger::Log(" is still unwinding on, count=");
+            SerialLogger::LogDec((int)h);
+            SerialLogger::Log("\r\n");
+        }
+        return;
+    }
+}
+
+// sched=2 cpu partition for the user picker. a non-resumable task (a leader
+// started by the old launcher) runs only on the cpu that holds its
+// RunProcessWithArgs frame - resumed anywhere else its exit would iret into
+// that cpu's dispatch loop and the launcher would wait forever - or on the bsp
+// while it has no frame yet (the old default). old mode: no restriction. (satoru)
+static inline bool sched2_cpu_may_run(const Process* c, uint32_t cpu) {
+    if (!g_sched_v2) return true;
+    // the bsp is the kernel-services cpu: with aps online it runs no thread and
+    // no detached program, so ring 3 can never starve input, audio, the gui,
+    // the network or the shell again. (satoru)
+    if (Scheduler::ApResumable(c)) return cpu != 0 || SMP::OnlineCount() < 2;
+    int sc = Userspace::SessionCpuOf(c);
+    return (sc < 0) ? (cpu == 0) : ((uint32_t)sc == cpu);
+}
+
+int Scheduler::DebugReleasePendingCpu(const Process* p) {
+    for (uint32_t c = 0; c < SMP_MAX_CPUS; c++)
+        if (g_release_pending[c][0] == p || g_release_pending[c][1] == p) return (int)c;
+    return -1;
+}
+
+void Scheduler::KickIdleCpu() {
+    if (g_sched_v2) SMP::KickOneIdle();   // halted aps + resched ipi (satoru)
+}
+
+// may `cpu` run this user task right now (affinity incl. the clone pin, and the sched=2
+// cpu partition)? lets a wake kick an idle cpu that can actually take the task (audit
+// 11-07 #5). (satoru)
+// is p the current task of any cpu (or the bsp's tracked current)? (satoru)
+bool Scheduler::IsCurrentAnywhere(const Process* p) {
+    if (!p) return false;
+    if (current_process == p) return true;
+    for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+        PerCpu* pc = SMP::ByIndex(ci);
+        if (pc && pc->current == p) return true;
+    }
+    return false;
+}
+
+bool Scheduler::CpuMayRun(const Process* p, uint32_t cpu) {
+    return p && cpu_allowed(p, cpu) && sched2_cpu_may_run(p, cpu);
+}
+
+void Scheduler::MarkApResumable(Process* p) {
+    if (!p) return;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    p->flags |= PROCESS_FLAG_AP_OK;
+    g_sched_lock.UnlockIrqRestore(f);
+}
 
 // cached pack-min vruntime, refreshed by every pick scan (racy by design -
 // a tick-stale min only loosens the vruntime clamps slightly). task 22b. (satoru)
@@ -1122,6 +1367,10 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     // once its owning cpu RELEASE-stored on_cpu=0 (frame fully saved). ACQUIRE-load
     // pairs with that release -> never a half-saved user_frame -> no RIP=0x3/#PF. (satoru)
     if (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE) != 0) return false;
+    // sched=2: on_cpu is published only after the releasing cpu left the task's
+    // kernel stack (FinishSwitch), which is the whole hazard the pin and the
+    // grace below were standing in for. no pin, no time grace. (satoru)
+    if (g_sched_v2 && g_sched_defer_rel) return true;
     // HARD PINNING (task 22c): never resume on a different cpu. soft pinning (a
     // 40ms migration window for aged-Ready threads, to rebalance the render
     // handshake) was tried and REOPENED the glib mutex wedge (soft1 batch:
@@ -1199,6 +1448,9 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
 static Process* g_wake_next[SMP_MAX_CPUS] = {};
 void Scheduler::NoteWakeNext(Process* woken) {
     if (!woken) return;
+    // sched=2: every wake site comes through here, so this is where a halted ap
+    // gets woken to pick the task up. (satoru)
+    if (g_sched_v2) SMP::KickIdleFor(woken);   // an idle cpu that may run it (satoru)
     uint32_t c = SMP::CpuIndex();
     if (c < SMP_MAX_CPUS) g_wake_next[c] = woken;
 }
@@ -1223,7 +1475,7 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
             if (wn != after && wn->is_user() && wn->state == Process_Ready &&
                 wn->has_user_frame && cpu_allowed(wn, cpu) &&
                 cross_run_grace_ok(wn, cpu) && !cg_throttled(wn) &&
-                wn->sched_class != 3) {
+                sched2_cpu_may_run(wn, cpu) && wn->sched_class != 3) {
                 return wn;
             }
         }
@@ -1248,6 +1500,7 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
             c->sched_class == 0 && c->vruntime < scan_min) scan_min = c->vruntime;
         if (c->state != Process_Ready || !c->has_user_frame) continue;
         if (!cpu_allowed(c, cpu)) continue;
+        if (!sched2_cpu_may_run(c, cpu)) continue;   // sched=2 bsp/ap partition (satoru)
         if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
         if (cg_throttled(c)) continue;               // cpu.max pool dry (satoru)
         if (c->sched_class == 1 || c->sched_class == 2) {       // FIFO/RR
@@ -1273,12 +1526,14 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     for (Process* cursor = start; cursor; cursor = cursor->next)
         if (cursor->is_user() && cursor->state == Process_Ready &&
             cursor->has_user_frame && cpu_allowed(cursor, cpu) &&
-            cross_run_grace_ok(cursor, cpu) && !cg_throttled(cursor))
+            cross_run_grace_ok(cursor, cpu) && !cg_throttled(cursor) &&
+            sched2_cpu_may_run(cursor, cpu))
             return cursor;
     for (Process* cursor = Scheduler::ready_queue; cursor && cursor != start; cursor = cursor->next)
         if (cursor->is_user() && cursor->state == Process_Ready &&
             cursor->has_user_frame && cpu_allowed(cursor, cpu) &&
-            cross_run_grace_ok(cursor, cpu) && !cg_throttled(cursor))
+            cross_run_grace_ok(cursor, cpu) && !cg_throttled(cursor) &&
+            sched2_cpu_may_run(cursor, cpu))
             return cursor;
     return nullptr;
 }
@@ -1335,8 +1590,9 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
             // syscall saved at entry + set its result). RELEASE-store on_cpu=0 so
             // another cpu that ACQUIRE-loads 0 is guaranteed to observe the complete
             // frame - never a half-saved one. only clear when actually leaving cur. (satoru)
-            if (cur && cur->is_user())
-                __atomic_store_n(&cur->on_cpu, (uint8_t)0, __ATOMIC_RELEASE);
+            // sched=2 defers the publish until this cpu is off cur's kernel
+            // stack (see ReleaseOnCpu); old mode stores it right here. (satoru)
+            if (cur && cur->is_user()) ReleaseOnCpu(cur);
         } else if (cur && cur->is_user() && cur->state == Process_Ready) {
             // keep running cur - but ONLY if it was Ready because WE released it
             // above. resurrecting a Blocked/Terminated cur to Running here let a
@@ -1368,6 +1624,24 @@ Process* Scheduler::ClaimNextUserForCpu(uint32_t cpu) {
 // marks it Running under the lock so the bsp / another ap can't also grab it.
 // the smp phase 3d AP dispatch loop uses this to run independent user processes
 // on the secondary cores in parallel with the bsp. (satoru)
+// agent_sched_10: the leader each ap LAUNCHED (RunProcessWithArgs from its dispatch
+// loop). side table - struct Process must not grow. a preempted launched leader is
+// Ready with a saved frame; it must be RESUMED on its own cpu, never launched again
+// (a relaunch rebuilds it from scratch: zeroed regs, rip=0x1). (satoru)
+static Process* g_ap_launched[SMP_MAX_CPUS];
+
+static inline bool ap_launched_anywhere(const Process* c) {
+    for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) if (g_ap_launched[i] == c) return true;
+    return false;
+}
+
+void Scheduler::EndApLaunch(uint32_t cpu) {
+    if (cpu >= SMP_MAX_CPUS) return;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    g_ap_launched[cpu] = nullptr;
+    g_sched_lock.UnlockIrqRestore(f);
+}
+
 Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     // require an EXPLICIT affinity pin to this cpu - NOT the "affinity 0 = any cpu"
@@ -1386,6 +1660,7 @@ Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
         // the thread-group process is claimable here. (satoru)
         if (c->is_thread()) continue;
         if ((c->cpu_affinity & (1u << cpu)) == 0) continue;   // explicit pin only (satoru)
+        if (ap_launched_anywhere(c)) continue;   // already launched: resume only (satoru)
         pick = c; break;
     }
     if (pick) {
@@ -1396,6 +1671,7 @@ Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
         // see the released leader and launch a second copy. pinned to the owner,
         // only the owner (busy in RunProcessWithArgs) can re-pick it. (satoru)
         pick->cpu_affinity = (uint8_t)(1u << cpu);
+        if (cpu < SMP_MAX_CPUS) g_ap_launched[cpu] = pick;
     }
     g_sched_lock.UnlockIrqRestore(f);
     return pick;
@@ -1412,7 +1688,11 @@ Process* Scheduler::ClaimReadyThreadForCpu(uint32_t cpu) {
     Process* idle_pick = nullptr;   // task 20: SCHED_IDLE fallback (satoru)
     uint64_t cg_now = 0;   // lazy cpu.max clock, same pattern as the user pick (satoru)
     for (Process* c = ready_queue; c; c = c->next) {
-        if (!c->is_user() || !c->is_thread()) continue;
+        // threads, plus sched=2 AP_OK leaders/fork children (ApResumable is
+        // exactly is_thread() in the old mode). (satoru)
+        // ...and the leader THIS cpu launched, once it was preempted (agent_sched_10). (satoru)
+        if (!c->is_user()) continue;
+        if (!Scheduler::ApResumable(c) && !(cpu < SMP_MAX_CPUS && g_ap_launched[cpu] == c)) continue;
         if (c->state != Process_Ready || !c->has_user_frame) continue;
         if (!cpu_allowed(c, cpu)) continue;
         if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
@@ -1485,11 +1765,13 @@ void Scheduler::NormalizeWakeVruntime(Process* p) {
 }
 
 void Scheduler::PromoteDeferredWakes() {
+    bool promoted = false;   // sched=2: kick a halted ap after the walk (satoru)
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     for (Process* p = ready_queue; p; p = p->next) {
         if (p->state == Process_Blocked && p->sleep_ticks > 0) {
             if (--p->sleep_ticks == 0) {
                 p->state = Process_Ready;
+                promoted = true;
                 if (p->interactive_score < 16) p->interactive_score += 2;
                 // task 23b: a deferred-tick SELF-wake (poll restart repoll,
                 // nanosleep park) prices its cycle - see the futex sweep's
@@ -1503,6 +1785,7 @@ void Scheduler::PromoteDeferredWakes() {
         // scheduler is left as the clean pin1 form.) (satoru)
     }
     g_sched_lock.UnlockIrqRestore(f);
+    if (promoted && g_sched_v2) SMP::KickOneIdle();
 }
 
 // idle-ap maintenance (task 17): the ap dispatch loop calls this (throttled to
@@ -1516,10 +1799,56 @@ void Scheduler::ApIdleMaint() {
     PromoteDeferredWakes();                      // sleep_ticks -> Ready
 }
 
+static bool (*g_irq_sig_pending)(Process*) = nullptr;
+static bool (*g_irq_sig_hook)(InterruptFrame*) = nullptr;
+void Scheduler::SetIrqSignalHook(bool (*pending)(Process*), bool (*deliver)(InterruptFrame*)) {
+    g_irq_sig_pending = pending;
+    g_irq_sig_hook = deliver;
+}
+
+void Scheduler::KickTaskCpu(Process* t) {
+    if (!g_sched_v2 || !t) return;
+    for (uint32_t c = 0; c < SMP::CpuCount(); c++) {
+        PerCpu* pc = SMP::ByIndex(c);
+        if (pc && pc->current == t) { SMP::KickCpu(c); return; }
+    }
+}
+
+// sched=2, at a ring-3 interrupt on an ap (the lapic tick, the resched ipi).
+// returns true if it took this cpu away from the interrupted task. (satoru)
+bool Scheduler::ApUserIrqCheck(InterruptFrame* frame) {
+    if (!g_sched_v2 || !frame || (frame->cs & 3) != 3) return false;
+    Process* cur = GetCurrentProcess();
+    if (!cur || !cur->is_user()) return false;
+    // a pending, unblocked signal with a fatal default (ctrl+c, kill): the
+    // linux layer takes it here, marking the group dead. cheap peek first. (satoru)
+    if (cur->state != Process_Terminated && g_irq_sig_hook && g_irq_sig_pending && g_irq_sig_pending(cur))
+        g_irq_sig_hook(frame);
+    // a task killed while it ran here (group kill, task manager, fatal signal)
+    // has state Terminated but would otherwise keep running in ring 3 forever
+    // when nothing else is runnable on this cpu - ScheduleNextUser returns false
+    // and the tick just resumes it. never resume it: switch to the next task, or
+    // iret into this ap's dispatch loop. the frame is not saved (dead). (satoru)
+    if (cur->state == Process_Terminated) {
+        if (ScheduleNextUser(frame)) {
+            FixupGsAfterIsrSwitch();
+        } else {
+            SMP::LoadKernelCr3();   // off the dead group's cr3 before current goes null (satoru)
+            ReleaseOnCpu(cur);
+            SetCurrentForThisCpu(nullptr);
+            SMP::ApIdleFrame(frame);
+        }
+        return true;
+    }
+    return false;
+}
+
 void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
     if (!frame || (frame->cs & 3) != 3) return;   // ring-3 user code only (satoru)
     Process* cur = GetCurrentProcess();
     if (!cur || !cur->is_user()) return;
+    if (g_sched_v2 && ApUserIrqCheck(frame)) return;
+    cur->cpu_ticks_total++;   // accounting only: an ap-run thread was charged nothing before (task manager cpu%) (satoru)
     // ring-3 only, so this ap holds no kernel lock here -> it is safe to run the
     // futex heal + deferred-wake promotion (same safety argument as the bsp's
     // kls_timer_preempt). doing it on the ap is what keeps AP-parked render/rayon
@@ -1608,17 +1937,174 @@ bool Scheduler::AddressSpaceLiveElsewhere(uint64_t as, Process* exclude) {
     return live;
 }
 
+// ── sched=2 deferred free ───────────────────────────────────────────────────
+// DestroyProcess used to LEAK the kernel stack and the Process struct whenever
+// the task's context might still be live (on_cpu, another cpu's current, our
+// own rsp on its stack). under sched=2 that is the normal state for a moment
+// after every exit - the exiting cpu publishes on_cpu=0 only once it has left
+// the stack - so every reaped fork child and thread leaked ~128 KB of stack and
+// a ~194 KB struct (the memory agent's measurement). park such a task here and
+// free it from the scheduler heartbeat once it is provably off every cpu. (satoru)
+extern Process* g_donor;   // defined with the donation code below (satoru)
+static Spinlock g_free_later_lock;
+static Process* g_free_later[512];
+static uint64_t g_free_later_ms[512];
+static int      g_free_later_n = 0;
+static volatile uint64_t g_free_later_done = 0, g_free_later_leaked = 0;
+// a reaped struct is kept at least this long: a group kill that snapshotted it
+// (CollectAddressSpaceGroup) before it was reaped is done marking within
+// milliseconds; the age makes "a killer still writing into it" impossible in
+// practice on top of the reaped-claim checks (reviewer finding). (satoru)
+constexpr uint64_t FREE_LATER_MIN_AGE_MS = 2000;
+
+static bool in_release_slot(const Process* p) {
+    for (uint32_t c = 0; c < SMP_MAX_CPUS; c++)
+        if (g_release_pending[c][0] == p || g_release_pending[c][1] == p) return true;
+    return false;
+}
+
+static bool task_quiet_everywhere(Process* p) {
+    // old mode: an exited task is never switched away through the normal hand-off, so its
+    // on_cpu stays 1 forever there; the cpu-current / kernel-rsp / own-rsp checks below
+    // plus the ring's minimum age are the proof it is off every cpu. (satoru)
+    if (g_sched_v2 && __atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) return false;
+    if (Scheduler::current_process == p || p == g_donor) return false;
+    // the schedrel=0 a/b arm publishes on_cpu early: the release slot is then the
+    // only proof a cpu has left the stack. (satoru)
+    if (in_release_slot(p)) return false;
+    uint64_t top = p->kernel_stack_top;
+    uint64_t kbase = top ? top - KERNEL_STACK_BYTES : 0;
+    for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+        PerCpu* pc = SMP::ByIndex(ci);
+        if (!pc) continue;
+        if (pc->current == p) return false;
+        // an ap keeps the last task's stack as rsp0 / gs:8 until its dispatch
+        // loop (or the next task) replaces it. (satoru)
+        if (top && pc->kernel_rsp > kbase && pc->kernel_rsp <= top) return false;
+    }
+    if (top) {
+        uint64_t rsp; __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp));
+        if (rsp > kbase && rsp <= top) return false;
+    }
+    return true;
+}
+
+static void (*g_task_free_hook)(Process*) = nullptr;
+static bool (*g_task_ref_hook)(Process*) = nullptr;
+void Scheduler::SetTaskFreeHook(void (*fn)(Process*), bool (*referenced)(Process*)) {
+    g_task_free_hook = fn;
+    g_task_ref_hook = referenced;
+}
+static bool task_freeable(Process* p) {
+    return task_quiet_everywhere(p) && !(g_task_ref_hook && g_task_ref_hook(p));
+}
+
+// runs from the heartbeat only, with no lock held. (satoru)
+static void free_task_memory(Process* p) {
+    // the linux layer drops its raw pointers first: futex waiter slots of a
+    // killed task, its poll registration, signal group, file locks, vfork links. (satoru)
+    if (g_task_free_hook) g_task_free_hook(p);
+    // per-cpu scheduler pointers, under the scheduler lock: the picker reads
+    // g_wake_next under it and dereferences what it loads. (satoru)
+    {
+        uint64_t f; g_sched_lock.LockIrqSave(&f);
+        for (uint32_t wi = 0; wi < SMP_MAX_CPUS; wi++) {
+            if (g_wake_next[wi] == p) g_wake_next[wi] = nullptr;
+            for (int k = 0; k < 2; k++) {
+                Process* expect = p;
+                __atomic_compare_exchange_n(&g_release_pending[wi][k], &expect, (Process*)nullptr,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            }
+        }
+        g_sched_lock.UnlockIrqRestore(f);
+    }
+    if (p->kernel_stack_top) {
+        uint64_t kbase = p->kernel_stack_top - KERNEL_STACK_BYTES;
+        p->kernel_stack_top = 0;
+        PMM::FreeBytes((void*)(uintptr_t)kbase, KERNEL_STACK_BYTES);
+    }
+    KernelHeap::Free(p);
+    __atomic_add_fetch(&g_free_later_done, 1u, __ATOMIC_RELAXED);
+}
+
+void Scheduler::ReapStats(uint64_t* freed, int* pending, uint64_t* leaked) {
+    if (freed) *freed = g_free_later_done;
+    if (pending) *pending = g_free_later_n;
+    if (leaked) *leaked = g_free_later_leaked;
+}
+
+static void free_later_push(Process* p) {
+    uint64_t now = Scheduler::NowMs();
+    uint64_t f; g_free_later_lock.LockIrqSave(&f);
+    bool ok = g_free_later_n < 512;
+    if (ok) { g_free_later_ms[g_free_later_n] = now; g_free_later[g_free_later_n++] = p; }
+    g_free_later_lock.UnlockIrqRestore(f);
+    if (!ok) __atomic_add_fetch(&g_free_later_leaked, 1u, __ATOMIC_RELAXED);   // ring full: old leak (satoru)
+}
+
+// heartbeat drain: copy the old-enough entries out under the lock, test them
+// with no lock held, free the ones that are quiet. the heartbeat is the only
+// consumer, so an entry seen here cannot disappear meanwhile. (satoru)
+static void free_later_drain() {
+    static Process* cand[512];
+    int nc = 0;
+    uint64_t now = Scheduler::NowMs();
+    {
+        uint64_t f; g_free_later_lock.LockIrqSave(&f);
+        for (int i = 0; i < g_free_later_n; i++)
+            if (now - g_free_later_ms[i] >= FREE_LATER_MIN_AGE_MS) cand[nc++] = g_free_later[i];
+        g_free_later_lock.UnlockIrqRestore(f);
+    }
+    int freed = 0;
+    for (int k = 0; k < nc && freed < 64; k++) {
+        Process* p = cand[k];
+        if (!task_freeable(p)) continue;
+        {
+            uint64_t f; g_free_later_lock.LockIrqSave(&f);
+            for (int i = 0; i < g_free_later_n; i++)
+                if (g_free_later[i] == p) {
+                    --g_free_later_n;
+                    g_free_later[i] = g_free_later[g_free_later_n];
+                    g_free_later_ms[i] = g_free_later_ms[g_free_later_n];
+                    break;
+                }
+            g_free_later_lock.UnlockIrqRestore(f);
+        }
+        free_task_memory(p);
+        freed++;
+    }
+}
+
 void Scheduler::ReapProcess(Process* proc) {
     if (!proc || proc->reaped || proc->state != Process_Terminated) return;
     DestroyProcess(proc);
 }
 
 void Scheduler::DestroyProcess(Process* proc) {
-    if (!proc || proc->reaped) return;
+    // claim the reap atomically (0 -> 3 = being destroyed, 1 at the end). two reapers
+    // (RetireExitedThread on one cpu, a waitpid ReapProcess on another) both passed the
+    // old `reaped == 0` test and pushed the same struct to free-later twice (audit
+    // 11-07 #3). a queued group member (reaped 2) stays the deferred reaper's. (satoru)
+    if (!proc) return;
+    {
+        uint8_t z = 0;
+        if (!__atomic_compare_exchange_n(&proc->reaped, &z, (uint8_t)3, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    }
 
     sched_log_process_event(proc, "destroyed", proc->is_user() ? "native user task released" : "native kernel task released");
 
     remove_from_ready_queue(proc);
+
+    // a dying THREAD hands its same-address-space children (threads it created) to its own
+    // parent instead of orphaning them. region_owner() finds a thread group's region table
+    // by walking parent links up to the leader; an orphaned thread (parent = null) became
+    // its own "owner" with an empty table, so its mmaps went into a table nobody else reads
+    // and the leader's regions were invisible to its faults: firefox heavy sites died under
+    // sched=2 (only sched=2 reaps exited threads promptly) on a not-present write 2 pages
+    // into a malloc group with no covering region (ffheavy 11-07). (satoru)
+    Process* adopt = (proc->is_thread() && proc->parent &&
+                      proc->parent->address_space == proc->address_space) ? proc->parent : nullptr;
 
     if (proc->parent) {
         unlink_child(proc->parent, proc);
@@ -1628,10 +2114,14 @@ void Scheduler::DestroyProcess(Process* proc) {
 
     Process* child = proc->first_child;
     while (child) {
-        child->parent = nullptr;
-        child->parent_pid = 0;
         Process* next_child = child->next_sibling;
         child->next_sibling = nullptr;
+        if (adopt && child->address_space == proc->address_space && child->is_thread()) {
+            link_child(adopt, child);
+        } else {
+            child->parent = nullptr;
+            child->parent_pid = 0;
+        }
         child = next_child;
     }
     proc->first_child = nullptr;
@@ -1652,6 +2142,11 @@ void Scheduler::DestroyProcess(Process* proc) {
         if (proc->kernel_stack_top &&
             rsp_now >= kbase && rsp_now < proc->kernel_stack_top) ctx_live = true;
         if (current_process == proc) ctx_live = true;
+        // sched=2: on_cpu stays 1 until the last cpu that ran proc is off its
+        // kernel stack (FinishSwitch). a waitpid reap on another cpu used to
+        // free that stack while the exiting cpu still unwound on it. (satoru)
+        if (g_sched_v2 && proc->is_user() &&
+            __atomic_load_n(&proc->on_cpu, __ATOMIC_ACQUIRE) != 0) ctx_live = true;
         for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
             PerCpu* pc = SMP::ByIndex(ci);
             if (pc && pc->current == proc) ctx_live = true;
@@ -1678,13 +2173,14 @@ void Scheduler::DestroyProcess(Process* proc) {
             }
             if (!as_live_elsewhere(proc)) {
                 KernelVMM::DestroyAddressSpace(proc->address_space);
+                LdKurono::ReleaseProcess(proc);   // its loader slot + lib images (satoru)
             } else {
                 SerialLogger::Log("[asguard] leak: as still live elsewhere pid=");
                 SerialLogger::LogDec((int)proc->pid);
                 SerialLogger::Log("\r\n");
             }
         }
-        if (proc->kernel_stack_top && !ctx_live) {
+        if (proc->kernel_stack_top && !ctx_live && !g_sched_v2) {
             // never free the kernel stack a cpu is still EXECUTING ON (a thread
             // reaped from inside its own exit syscall, or a cross-cpu reap racing
             // the exiting cpu's unwind): with smp another core reuses + zeroes
@@ -1707,6 +2203,20 @@ void Scheduler::DestroyProcess(Process* proc) {
     // that gets recycled instantly (path buffers were observed landing in it) -
     // the cpu then iretq's through ascii garbage (#UD/#GP with string-data
     // registers). leak it in the live cases, same tradeoff as the stack. (satoru)
+    if (g_sched_v2 && proc->is_user()) {
+        // sched=2: stack + struct are never leaked any more. they go through
+        // the free-later ring: freed on the heartbeat, with no lock held, once
+        // quiet on every cpu and past the minimum age. (satoru)
+        (void)ctx_live;
+        free_later_push(proc);
+        return;
+    }
+    // old mode: a struct (and stack) still in use by the cpu reaping it - the child's own
+    // exit syscall reaps itself whenever the parent is already parked in waitpid - was
+    // LEAKED here, ~200 KB per exited child (the inline 4096-slot region table):
+    // kurono.taskmem=1 + churn showed the churn parent holding 95 MB of such structs
+    // after 60 rounds. queue it for the free-later ring instead. (satoru)
+    if (ctx_live && proc->is_user()) { free_later_push(proc); return; }
     if (!ctx_live) KernelHeap::Free(proc);
 }
 
@@ -1737,9 +2247,21 @@ Process* g_donor          = nullptr;
 uint64_t g_donor_until_ms = 0;
 
 static void reap_group_member(Process* m) {
-    if (!m || m->reaped == 1) return;
+    if (!m) return;
+    // claim it (0 or 2 -> 3): a DestroyProcess already running on it (3) or done (1)
+    // owns it. (satoru)
+    {
+        uint8_t cur = __atomic_load_n(&m->reaped, __ATOMIC_ACQUIRE);
+        for (;;) {
+            if (cur == 1 || cur == 3) return;
+            if (__atomic_compare_exchange_n(&m->reaped, &cur, (uint8_t)3, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+        }
+    }
     sched_log_process_event(m, "killed", "thread-group kill (task manager)");
     remove_from_ready_queue(m);
+    Process* adopt = (m->is_thread() && m->parent &&
+                      m->parent->address_space == m->address_space) ? m->parent : nullptr;   // see DestroyProcess (satoru)
     if (m->parent) {
         unlink_child(m->parent, m);
         m->parent = nullptr;
@@ -1747,10 +2269,14 @@ static void reap_group_member(Process* m) {
     }
     Process* child = m->first_child;
     while (child) {
-        child->parent = nullptr;
-        child->parent_pid = 0;
         Process* next_child = child->next_sibling;
         child->next_sibling = nullptr;
+        if (adopt && child->address_space == m->address_space && child->is_thread()) {
+            link_child(adopt, child);
+        } else {
+            child->parent = nullptr;
+            child->parent_pid = 0;
+        }
         child = next_child;
     }
     m->first_child = nullptr;
@@ -1771,6 +2297,7 @@ static void reap_group_member(Process* m) {
         // page tables. (satoru)
         if (!as_live_elsewhere(m)) {
             KernelVMM::DestroyAddressSpace(m->address_space);
+            LdKurono::ReleaseProcess(m);   // its loader slot + lib images (satoru)
         } else {
             SerialLogger::Log("[asguard] group-reap leak: as live elsewhere pid=");
             SerialLogger::LogDec((int)m->pid);
@@ -1781,7 +2308,12 @@ static void reap_group_member(Process* m) {
     m->reaped = 1;
     m->state  = Process_Terminated;
     if (g_live_proc_count > 0) g_live_proc_count--;
-    // struct intentionally not freed - see the block comment above. (satoru)
+    // the struct was intentionally never freed here (a parked donor's frame, a straggler
+    // still resumable): every SIGKILLed group leaked one ~200 KB struct per member
+    // (taskmem: 3 thread structs = 581 KB per killed churn child). the free-later ring
+    // frees it only once it is off every cpu, past the minimum age and unreferenced by any
+    // linux record - the same proof the sched=2 reaper uses. (satoru)
+    if (m->is_user() && m != g_donor) free_later_push(m);
 }
 
 int Scheduler::CollectAddressSpaceGroup(uint32_t pid, Process** out, int max) {
@@ -1797,11 +2329,29 @@ int Scheduler::CollectAddressSpaceGroup(uint32_t pid, Process** out, int max) {
         for (Process* p = ready_queue; p && n < max; p = p->next) {
             if (!p->is_user() || p->reaped) continue;
             if (p->address_space != as) continue;
+            // sched=2: an exited thread is already dead and owned by the
+            // retire/reap path, which may free it - a kill must not hold a
+            // pointer to it (reviewer finding). (satoru)
+            if (g_sched_v2 && p->is_thread() && p->state == Process_Terminated) continue;
             out[n++] = p;
         }
     }
     g_sched_lock.UnlockIrqRestore(f);
     return n;
+}
+
+// the group kill looks its leader up by pid in ready_queue, but a crashed leader
+// was already marked exited and dequeued, so callers holding only the dead
+// leader find the surviving threads through the address space instead. (satoru)
+uint32_t Scheduler::FindLivePidInAddressSpace(uint64_t as) {
+    if (!as) return 0;
+    uint32_t pid = 0;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->is_user() && !p->reaped && p->address_space == as) { pid = p->pid; break; }
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return pid;
 }
 
 int Scheduler::CollectAddressSpacePids(uint32_t pid, uint32_t* out, int max) {
@@ -1837,13 +2387,15 @@ int Scheduler::CollectAddressSpacePids(uint32_t pid, uint32_t* out, int max) {
 // group once every member is observably off every cpu, retrying per call.
 // the same queue also un-leaks the hal fault-containment kills and the sync
 // path's quiesce-timeout groups, which previously leaked forever. (satoru)
-struct DeferredReap { Process* members[64]; int n; uint32_t attempts; bool active; };
+// 256 members: sched=2 tells programs how many cpus there are and firefox sizes
+// its pools up past 64 threads. (satoru)
+struct DeferredReap { Process* members[256]; int n; uint32_t attempts; bool active; };
 static DeferredReap g_deferred_reaps[8];
 static Spinlock g_reap_lock;
 
 void Scheduler::QueueDeferredReap(Process** members, int n) {
     if (!members || n <= 0) return;
-    if (n > 64) n = 64;
+    if (n > 256) n = 256;
     uint64_t f; g_reap_lock.LockIrqSave(&f);
     for (int e = 0; e < 8; e++) {
         DeferredReap* r = &g_deferred_reaps[e];
@@ -1857,7 +2409,11 @@ void Scheduler::QueueDeferredReap(Process** members, int n) {
             // on-cpu) - that was a drain-side uaf write, the exact freelist-
             // corruptor class. reaped=2 makes those paths no-op; only the
             // drain's reap_group_member accepts it. (satoru)
-            if (members[i] && members[i]->reaped == 0) members[i]->reaped = 2;
+            if (members[i]) {   // claim 0 -> 2 by cas: a DestroyProcess that claimed it (3) keeps it (review 11-07) (satoru)
+                uint8_t z = 0;
+                __atomic_compare_exchange_n(&members[i]->reaped, &z, (uint8_t)2, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            }
         }
         r->n = n;
         r->attempts = 0;
@@ -1873,8 +2429,8 @@ void Scheduler::QueueDeferredReap(Process** members, int n) {
 }
 
 bool Scheduler::KillProcessGroupAsync(uint32_t pid, Process* skip) {
-    Process* members[64];
-    int n = CollectAddressSpaceGroup(pid, members, 64);
+    Process* members[256];
+    int n = CollectAddressSpaceGroup(pid, members, 256);
     if (n <= 0) return false;
     Process* self = GetCurrentProcess();
     if (!skip) {
@@ -1895,13 +2451,24 @@ bool Scheduler::KillProcessGroupAsync(uint32_t pid, Process* skip) {
 }
 
 int Scheduler::KillProcessGroup(uint32_t pid) {
-    Process* members[64];
-    int n = CollectAddressSpaceGroup(pid, members, 64);
+    Process* members[256];
+    int n = CollectAddressSpaceGroup(pid, members, 256);
     if (n <= 0) return 0;
 
     Process* self = GetCurrentProcess();
     for (int i = 0; i < n; i++) {
         if (members[i] == self) return 0;   // refuse killing our own group (satoru)
+    }
+
+    // sched=2: callers (the task manager) run inside a kernel proc's kls
+    // section, and members mid-syscall on the aps spin on that kls - a quiesce
+    // sleep here could never succeed and stalled every syscall for 1.6s (review
+    // finding). mark them dead and let the deferred reaper free them once they
+    // are off every cpu; 2 tells the caller not to tear records down. (satoru)
+    if (g_sched_v2) {
+        for (int i = 0; i < n; i++) MarkProcessExited(members[i], -9);
+        QueueDeferredReap(members, n);
+        return 2;
     }
 
     // mark + drain, repeated: a member blocked in a futex when first marked
@@ -1952,8 +2519,18 @@ int Scheduler::KillProcessGroup(uint32_t pid) {
 }
 
 void Scheduler::DrainDeferredReaps() {
+    // single consumer: besides the scheduler kernel process, a waiting parent drains in
+    // the old mode (see sys_waitpid), and the table walk below assumes one drainer. (satoru)
+    static volatile uint32_t s_draining = 0;
+    if (__atomic_exchange_n(&s_draining, 1u, __ATOMIC_ACQUIRE)) return;
+    drain_deferred_reaps_locked();
+    __atomic_store_n(&s_draining, 0u, __ATOMIC_RELEASE);
+}
+
+void Scheduler::drain_deferred_reaps_locked() {
+    free_later_drain();   // both modes now: the old mode queues its live-context reaps too (satoru)
     for (int e = 0; e < 8; e++) {
-        Process* local[64];
+        Process* local[256];
         int n = 0;
         {
             // short bookkeeping hold only: copy the entry out. content is
@@ -2171,6 +2748,92 @@ void Scheduler::Tick() {
     }
 }
 
+uint32_t Scheduler::LiveTaskCount() { return g_live_proc_count; }   // (satoru)
+
+bool Scheduler::RetireExitedThread(Process* t) {   // see scheduler.h (satoru)
+    if (!t || !t->is_thread()) return true;
+    if (t->reaped != 0) return true;
+    if (t->state != Process_Terminated) return true;   // not ours to retire (satoru)
+    // sched=2: a real reap. on_cpu is published correctly here (the exiting
+    // cpu releases the task when it leaves its stack), so DestroyProcess can
+    // unlink it and free its stack + struct, now or from the heartbeat. the
+    // caller has already scrubbed the linux-side tables (futex, poll). (satoru)
+    if (g_sched_v2) {
+        if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) return false;
+        // claim it under the scheduler lock: a group kill or reaper that got
+        // there first (reaped != 0) owns it instead. (satoru)
+        bool mine = false;
+        {
+            uint64_t f; g_sched_lock.LockIrqSave(&f);
+            mine = (t->reaped == 0 && t->state == Process_Terminated);
+            g_sched_lock.UnlockIrqRestore(f);
+        }
+        if (mine) DestroyProcess(t);
+        return true;
+    }
+    // still possibly running its exit path somewhere: an address-space teardown
+    // must keep seeing it as live until it is off every cpu. on_cpu is not
+    // usable here: an exited thread is never switched away from through the
+    // normal handoff, so its on_cpu stays 1 forever (measured: 64/64 exited
+    // threads). the caller adds an age guard instead. (satoru)
+    if (current_process == t) return false;
+    for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+        PerCpu* pc = SMP::ByIndex(ci);
+        if (pc && pc->current == t) return false;
+    }
+    // the struct stays leaked (futex/wake slots may hold raw pointers), so
+    // bound how many retirements may pile up: past this many, fall back to the
+    // old behaviour (the cap fills, clone gets EAGAIN) rather than leak ~200 kb
+    // per thread without limit. the real fix, reaping exited threads, belongs
+    // to the scheduler rewrite. (satoru)
+    static uint32_t s_retired = 0;
+    if (s_retired >= 1024) return true;
+    // the kernel stack can go once no cpu can still land on it: not current
+    // anywhere (checked above), not the donor, and no cpu's rsp0 (PerCpu
+    // kernel_rsp mirrors tss rsp0/ist1) inside it - an idle ap can keep a dead
+    // thread's stack as rsp0 until it switches. (satoru)
+    bool free_stack = t->kernel_stack_top && t != g_donor;
+    if (free_stack) {
+        uint64_t kbase = t->kernel_stack_top - KERNEL_STACK_BYTES;
+        for (uint32_t ci = 0; ci < SMP::CpuCount() && free_stack; ci++) {
+            PerCpu* pc = SMP::ByIndex(ci);
+            if (pc && pc->kernel_rsp > kbase && pc->kernel_rsp <= t->kernel_stack_top) free_stack = false;
+        }
+    }
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    bool did = false;
+    uint8_t z0 = 0;
+    if (__atomic_compare_exchange_n(&t->reaped, &z0, (uint8_t)1, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {   // claim, see DestroyProcess (satoru)
+        if (g_live_proc_count > 0) g_live_proc_count--;
+        s_retired++;
+        did = true;
+    }
+    uint64_t kstack = 0;
+    if (did && free_stack) { kstack = t->kernel_stack_top - KERNEL_STACK_BYTES; t->kernel_stack_top = 0; }
+    g_sched_lock.UnlockIrqRestore(f);
+    if (kstack) PMM::FreeBytes((void*)(uintptr_t)kstack, KERNEL_STACK_BYTES);
+    if (did) {
+        // the struct used to stay leaked (~200 kb per exited thread). now: off the family
+        // lists (child threads go to its parent, see DestroyProcess) and into the free-later
+        // ring, which scrubs the futex / poll / wake slots through the linux hook before the
+        // free and waits until it is off every cpu and unreferenced. (satoru)
+        Process* adopt = (t->parent && t->parent->address_space == t->address_space) ? t->parent : nullptr;
+        if (t->parent) { unlink_child(t->parent, t); t->parent = nullptr; t->parent_pid = 0; }
+        Process* c = t->first_child;
+        while (c) {
+            Process* nx = c->next_sibling;
+            c->next_sibling = nullptr;
+            if (adopt && c->is_thread() && c->address_space == t->address_space) link_child(adopt, c);
+            else { c->parent = nullptr; c->parent_pid = 0; }
+            c = nx;
+        }
+        t->first_child = nullptr;
+        free_later_push(t);
+    }
+    return true;
+}
+
 uint32_t Scheduler::GetProcessCount() {
     uint32_t c = 0;
     Process* p = ready_queue;
@@ -2204,41 +2867,82 @@ Process* Scheduler::FindProcessByPid(uint32_t pid) {
     return nullptr;
 }
 
+// copy one live task into the public snapshot shape. callers hold g_sched_lock
+// (or accept a tearing read, as the task manager always has). (satoru)
+static void sched_fill_snapshot(Process* proc, SchedulerProcessSnapshot& snap) {
+    memset(&snap, 0, sizeof(snap));
+    snap.pid = proc->pid;
+    memcpy(snap.name, proc->name, sizeof(snap.name));
+    snap.state = proc->state;
+    snap.priority = proc->priority;
+    snap.flags = proc->flags;
+    snap.cpu_ticks_total = hal_pid_busy_ms(proc->pid);   // busy ms sampled by the timer irqs, not loop iterations (satoru)
+    snap.memory_kb = estimate_process_memory_kb(proc);
+    snap.address_space = proc->is_user() ? proc->address_space : 0;
+    snap.nice = proc->nice;
+    snap.sched_class = proc->sched_class;
+    snap.prio_tier = proc->prio_tier;
+    snap.stack_kb = (uint32_t)(proc->kstack.bytes / 1024);
+    snap.stack_cap_kb = (uint32_t)(proc->kstack.cap_bytes / 1024);
+    snap.cpu_ms_total = (uint32_t)proc->cpu_ms_total;
+    snap.parent_pid = proc->parent_pid;
+    snap.stack_grow_count = proc->kstack.grow_count;
+    snap.is_kernel_proc = proc->is_kernel_proc;
+}
+
+// backstop against a corrupt/cyclic ready_queue: a bad `next` (e.g. a
+// freed-then-reused node, or memory clobbered by an out-of-bounds write) would
+// otherwise be dereferenced and #gp on a non-canonical address. (satoru)
+static bool sched_proc_plausible(Process* proc) {
+    uintptr_t pa = (uintptr_t)proc;
+    if ((pa & 0x7u) || pa < 0x100000ULL || pa >= PMM::GetPhysTop()) return false;
+    return true;
+}
+
 int Scheduler::GetProcessSnapshot(SchedulerProcessSnapshot* out, int max_count) {
     if (!out || max_count <= 0) return 0;
 
     int count = 0;
     int guard = 0;
     for (Process* proc = ready_queue; proc && count < max_count; proc = proc->next) {
-        // backstop against a corrupt/cyclic ready_queue: a bad `next` (e.g.
-        // a freed-then-reused node, or memory clobbered by an out-of-bounds
-        // write) would otherwise be dereferenced and #gp on a non-canonical
-        // address. validate the pointer is plausible (kernel-heap range, in
-        // physical ram, 8-aligned) and cap the walk. (satoru)
-        uintptr_t pa = (uintptr_t)proc;
-        if ((pa & 0x7u) || pa < 0x100000ULL || pa >= 0x400000000ULL) break;
+        if (!sched_proc_plausible(proc)) break;
         if (++guard > 4096) break;
-        SchedulerProcessSnapshot& snap = out[count++];
-        memset(&snap, 0, sizeof(snap));
-
-        snap.pid = proc->pid;
-        memcpy(snap.name, proc->name, sizeof(snap.name));
-        snap.state = proc->state;
-        snap.priority = proc->priority;
-        snap.flags = proc->flags;
-        snap.cpu_ticks_total = proc->cpu_ticks_total;
-        snap.memory_kb = estimate_process_memory_kb(proc);
-        snap.nice = proc->nice;
-        snap.sched_class = proc->sched_class;
-        snap.prio_tier = proc->prio_tier;
-        snap.stack_kb = (uint32_t)(proc->kstack.bytes / 1024);
-        snap.stack_cap_kb = (uint32_t)(proc->kstack.cap_bytes / 1024);
-        snap.cpu_ms_total = (uint32_t)proc->cpu_ms_total;
-        snap.stack_grow_count = proc->kstack.grow_count;
-        snap.is_kernel_proc = proc->is_kernel_proc;
+        sched_fill_snapshot(proc, out[count++]);
     }
 
     return count;
+}
+
+int Scheduler::GetProcessSnapshotByPid(uint32_t pid, SchedulerProcessSnapshot* out) {
+    if (!out || pid == 0) return 0;
+    int found = 0;
+    int guard = 0;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    for (Process* proc = ready_queue; proc; proc = proc->next) {
+        if (!sched_proc_plausible(proc)) break;
+        if (++guard > 4096) break;
+        if (proc->pid != pid) continue;
+        sched_fill_snapshot(proc, *out);
+        found = 1;
+        break;
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return found;
+}
+
+int Scheduler::CollectKernelTaskPids(uint32_t* out, int max) {
+    if (!out || max <= 0) return 0;
+    int n = 0;
+    int guard = 0;
+    uint64_t f; g_sched_lock.LockIrqSave(&f);
+    for (Process* proc = ready_queue; proc && n < max; proc = proc->next) {
+        if (!sched_proc_plausible(proc)) break;
+        if (++guard > 4096) break;
+        if (proc->pid == 0 || proc->reaped || proc->is_user()) continue;
+        out[n++] = proc->pid;
+    }
+    g_sched_lock.UnlockIrqRestore(f);
+    return n;
 }
 
 void Scheduler::Exit() {
@@ -2414,6 +3118,21 @@ inline uint64_t round_up_page(uint64_t bytes) {
 //
 // On growth, guard_page is decremented by one page, the previously-
 // guard page becomes mapped, and a fresh guard page sits below.
+// ── kernel-stack guard (kurono.kstackguard=1, default on under sched=2) ───────
+// the page below `low` used to be the ordinary identity page of whatever frame
+// sat below the stack, so an overflow silently wrote into a neighbour's frame
+// and TryGrowGuardPage's remap (identity va -> fresh page in the kernel root)
+// almost never ran and was itself unsafe (memory agent, item 8.2). guarded
+// mode: one extra frame is allocated below the stack and its identity mapping
+// is removed from the kernel root (2 mb page demoted, every cpu flushed), so an
+// overflow faults at once and is reported as a stack overflow naming the
+// kernel proc - no remap, no growth. the stack itself stays identity-backed:
+// drivers DMA from stack buffers by their identity address. every kernel proc
+// runs on the kernel root (the bsp runs no user task under sched=2). the stack
+// is painted so the heartbeat can report each proc's high-water mark. (satoru)
+static bool g_kstack_guard = false;
+constexpr uint8_t KSTACK_PAINT = 0xA5;
+
 static bool alloc_adaptive_stack(KernelStackInfo* k,
                                  uint64_t init_bytes,
                                  uint64_t cap_bytes) {
@@ -2421,6 +3140,44 @@ static bool alloc_adaptive_stack(KernelStackInfo* k,
     cap_bytes  = round_up_page(cap_bytes);
     if (init_bytes < KP_PAGE_SIZE) init_bytes = KP_PAGE_SIZE;
     if (cap_bytes < init_bytes) cap_bytes = init_bytes;
+
+    if (g_kstack_guard) {
+        // no growth in guarded mode: a fixed size - the initial size, at least
+        // 128 kb, never more than the cap. the [kstack] census measured the
+        // deepest kernel-proc stack at 19 kb across firefox, churn and terminal
+        // runs (the whole cap would be ~120 mb of stacks). (satoru)
+        uint64_t want = init_bytes;
+        if (want < 128 * 1024) want = 128 * 1024;
+        if (want > cap_bytes) want = cap_bytes;
+        init_bytes = round_up_page(want);
+        void* mem = PMM::AllocBytes(init_bytes + KP_PAGE_SIZE);
+        if (!mem) {
+            kp_serial_log("[Sched] FATAL: PMM out of memory for kernel stack\r\n");
+            return false;
+        }
+        uint64_t gp = (uint64_t)(uintptr_t)mem;
+        // MapPage over an identity huge page demotes it to 4 kb ptes (same
+        // phys), then the guard pte alone is removed. (satoru)
+        bool demoted = KernelVMM::MapPage(gp, gp, PTE_PRESENT | PTE_WRITABLE);
+        KernelVMM::UnmapPage(gp, false);
+        KernelVMM::InvalidatePage(gp);
+        SMP::BroadcastTlbFlush();
+        if (!demoted || KernelVMM::QueryMapping(gp)) {
+            // still mapped: say so - a guard that is not there must not look
+            // like one. the stack itself is fine. (satoru)
+            kp_serial_log("[Sched] kernel stack guard NOT installed (page still mapped)\r\n");
+        }
+        k->low        = gp + KP_PAGE_SIZE;
+        k->high       = k->low + init_bytes;
+        k->guard_page = gp;
+        k->init_bytes = init_bytes;
+        k->cap_bytes  = cap_bytes;
+        k->bytes      = init_bytes;
+        k->grow_count = 0;
+        for (uint64_t* a = (uint64_t*)(uintptr_t)k->low; a < (uint64_t*)(uintptr_t)k->high; a++)
+            *a = 0xA5A5A5A5A5A5A5A5ull;   // the paint the census reads (satoru)
+        return true;
+    }
 
     void* mem = PMM::AllocBytes(init_bytes);
     if (!mem) {
@@ -3110,6 +3867,7 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
         // dispatch an ap may be claiming/removing queue nodes at this exact
         // moment (the documented -smp 4 re-ready race). LockIrqSave is safe
         // here (irq context, cli while held, aps hold it only briefly). (satoru)
+        bool tick_promoted = false;
         uint64_t lf; g_sched_lock.LockIrqSave(&lf);
         for (Process* q = ready_queue; q; q = q->next) {
             if (q->is_user() && q->state == Process_Blocked && q->sleep_ticks > 0) {
@@ -3119,10 +3877,12 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
                     q->sleep_ticks = 0;
                     q->state = Process_Ready;
                     if (q->interactive_score < 16) q->interactive_score += 2;
+                    tick_promoted = true;
                 }
             }
         }
         g_sched_lock.UnlockIrqRestore(lf);
+        if (tick_promoted && g_sched_v2) SMP::KickOneIdle();   // sched=2 (satoru)
     }
 
     Process* p = current_process;
@@ -3168,6 +3928,53 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     }
 }
 
+// heartbeat census (guarded mode): the deepest point each kernel proc's stack
+// ever reached, from the paint. one [kstack] line listing procs above half of
+// their stack, at most every 30 s, only when a high-water mark moved. (satoru)
+void Scheduler::SetKstackGuard(bool on) { g_kstack_guard = on; }
+
+void Scheduler::KstackCensus() {
+    if (!g_kstack_guard) return;
+    // one walk every 30 s (first at 20 s), whether or not it prints (reviewer
+    // finding: the old gate re-walked every stack on every 50 ms heartbeat). (satoru)
+    static uint64_t s_next_ms = 20000, s_last_sum = 0;
+    uint64_t now = NowMs();
+    if (now < s_next_ms) return;
+    s_next_ms = now + 30000;
+    uint64_t sum = 0, mx = 0, tot = 0;
+    char line[512]; int n = 0;
+    auto put = [&](const char* s) { while (*s && n < (int)sizeof(line) - 1) line[n++] = *s++; };
+    auto putu = [&](uint64_t v) { char t[24]; int k = 0; if (!v) t[k++] = '0'; while (v) { t[k++] = (char)('0' + v % 10); v /= 10; } while (k && n < (int)sizeof(line) - 1) line[n++] = t[--k]; };
+    put("[kstack] used_kb/size_kb:");
+    for (int i = 0; i < g_kernel_proc_count; i++) {
+        Process* p = g_kernel_procs[i];
+        if (!p) continue;
+        KernelStackInfo* k = &p->kstack;
+        // up from low to the first word the stack ever wrote. (satoru)
+        uint64_t* a = (uint64_t*)(uintptr_t)k->low;
+        uint64_t* top = (uint64_t*)(uintptr_t)k->high;
+        while (a < top && *(volatile uint64_t*)a == 0xA5A5A5A5A5A5A5A5ull) a++;
+        uint64_t used = k->high - (uint64_t)(uintptr_t)a;
+        sum += used; tot += k->bytes + KP_PAGE_SIZE;
+        if (used > mx) mx = used;
+        if (used * 4 >= k->bytes || used >= 64 * 1024) {   // a quarter or more: worth watching (satoru)
+            put(" "); put(p->name); put("="); putu(used / 1024); put("/"); putu(k->bytes / 1024);
+        }
+    }
+    put(" | deepest_kb="); putu(mx / 1024); put(" procs="); putu((uint64_t)g_kernel_proc_count);
+    put(" total_kb="); putu(tot / 1024);
+    line[n] = 0;
+    if (sum == s_last_sum) return;
+    s_last_sum = sum;
+    kp_serial_log(line);
+    kp_serial_log("\r\n");
+}
+
+bool Scheduler::KstackGuardHit(uint64_t cr2) {
+    if (!g_kstack_guard) return false;
+    return TryGrowGuardPage(cr2);   // guarded mode: a hit panics with the proc's name (satoru)
+}
+
 bool Scheduler::TryGrowGuardPage(uint64_t cr2) {
     uint64_t fault_page = cr2 & ~(KP_PAGE_SIZE - 1ULL);
     for (int i = 0; i < g_kernel_proc_count; i++) {
@@ -3175,6 +3982,17 @@ bool Scheduler::TryGrowGuardPage(uint64_t cr2) {
         if (!p) continue;
         KernelStackInfo* k = &p->kstack;
         if (fault_page != k->guard_page) continue;
+        if (g_kstack_guard) {
+            // a real overflow: the guard is genuinely unmapped. never remap. (satoru)
+            kp_serial_log("[Sched] KERNEL STACK OVERFLOW (guard page hit) in process: ");
+            kp_serial_log(p->name);
+            kp_serial_log("\r\n");
+            KernelPanic::KeBugCheckEx(StopCode::STACK_OVERFLOW_FAULT,
+                                       (uint64_t)(uintptr_t)p->name, cr2, k->bytes, 0,
+                                       "kernel stack overflow (guard page)",
+                                       __FILE__, (uint32_t)__LINE__);
+            return false;
+        }
 
         // Detect cap exhaustion.
         if (k->bytes + KP_PAGE_SIZE > k->cap_bytes) {

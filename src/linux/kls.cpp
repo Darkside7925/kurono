@@ -8,7 +8,7 @@
 #include "../kernel/heap.h"
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
-#include "../security/supr.h"
+#include "../security/ken.h"
 #include "../shell/shell.h"
 
 KLSState    KLS::state = KLS_STOPPED;
@@ -497,7 +497,7 @@ void KLS::SyncFilesystems() {
     }
 }
 
-//  user synchronization (supr ↔ linux)
+//  user synchronization (ken ↔ linux)
 
 void KLS::GeneratePasswd(char* buf, int max_len) {
     int p = 0;
@@ -509,11 +509,11 @@ void KLS::GeneratePasswd(char* buf, int max_len) {
     p = kls_pa(buf, p, max_len, "sys:x:3:3:sys:/dev:/usr/sbin/nologin\n");
     p = kls_pa(buf, p, max_len, "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n");
 
-    // supr users → linux users (uid starting at 1000)
-    SUPRUser* users = SUPR::GetUsers();
-    int ucount = SUPR::GetUserCount();
+    // ken users → linux users (uid starting at 1000)
+    KENUser* users = KEN::GetUsers();
+    int ucount = KEN::GetUserCount();
     for (int i = 0; i < ucount; i++) {
-        SUPRUser* u = &users[i];
+        KENUser* u = &users[i];
         if (kls_seq(u->username, "root")) continue;  // already added
 
         p = kls_pa(buf, p, max_len, u->username);
@@ -542,11 +542,11 @@ void KLS::GenerateGroup(char* buf, int max_len) {
     p = kls_pa(buf, p, max_len, "users:x:100:\n");
     p = kls_pa(buf, p, max_len, "nogroup:x:65534:\n");
 
-    // create groups for supr users
-    SUPRUser* users = SUPR::GetUsers();
-    int ucount = SUPR::GetUserCount();
+    // create groups for ken users
+    KENUser* users = KEN::GetUsers();
+    int ucount = KEN::GetUserCount();
     for (int i = 0; i < ucount; i++) {
-        SUPRUser* u = &users[i];
+        KENUser* u = &users[i];
         if (kls_seq(u->username, "root")) continue;
         p = kls_pa(buf, p, max_len, u->username);
         p = kls_pa(buf, p, max_len, ":x:");
@@ -562,19 +562,19 @@ void KLS::GenerateShadow(char* buf, int max_len) {
     p = kls_pa(buf, p, max_len, "bin:*:19723:0:99999:7:::\n");
     p = kls_pa(buf, p, max_len, "nobody:*:19723:0:99999:7:::\n");
 
-    SUPRUser* users = SUPR::GetUsers();
-    int ucount = SUPR::GetUserCount();
+    KENUser* users = KEN::GetUsers();
+    int ucount = KEN::GetUserCount();
     for (int i = 0; i < ucount; i++) {
-        SUPRUser* u = &users[i];
+        KENUser* u = &users[i];
         if (kls_seq(u->username, "root")) continue;
         p = kls_pa(buf, p, max_len, u->username);
-        // hash from supr - represent as locked (!) for shadow
+        // hash from ken - represent as locked (!) for shadow
         p = kls_pa(buf, p, max_len, ":$6$kurono$locked:19723:0:99999:7:::\n");
     }
 }
 
 void KLS::SyncUsersToLinux() {
-    SerialLogger::Log("[KLS] Syncing SUPR users → Linux...\r\n");
+    SerialLogger::Log("[KLS] Syncing KEN users → Linux...\r\n");
 
     char buf[4096];
 
@@ -588,8 +588,8 @@ void KLS::SyncUsersToLinux() {
     KVFS::WriteString("/linux/etc/shadow", buf);
 
     // ensure home directories exist for each user
-    SUPRUser* users = SUPR::GetUsers();
-    int ucount = SUPR::GetUserCount();
+    KENUser* users = KEN::GetUsers();
+    int ucount = KEN::GetUserCount();
     for (int i = 0; i < ucount; i++) {
         char homedir[128];
         kls_scpy(homedir, "/home/", sizeof(homedir));
@@ -622,12 +622,12 @@ void KLS::SyncUsersToLinux() {
 }
 
 void KLS::SyncUsersFromLinux() {
-    // read /linux/etc/passwd and create missing supr users
+    // read /linux/etc/passwd and create missing ken users
     char buf[4096];
     if (KVFS::ReadString("/linux/etc/passwd", buf, sizeof(buf)) <= 0) return;
 
-    SerialLogger::Log("[KLS] Syncing Linux users → SUPR\r\n");
-    // parse passwd lines and create supr users for uid >= 1000
+    SerialLogger::Log("[KLS] Syncing Linux users → KEN\r\n");
+    // parse passwd lines and create ken users for uid >= 1000
     // format: username:x:uid:gid:gecos:home:shell
     const char* p = buf;
     while (*p) {
@@ -651,8 +651,8 @@ void KLS::SyncUsersFromLinux() {
         if (*p == '\n') p++;
 
         // only import regular users (uid >= 1000)
-        if (uid >= 1000 && !SUPR::FindUser(username)) {
-            SUPR::CreateUser(username, "kurono", SUPR_USER);
+        if (uid >= 1000 && !KEN::FindUser(username)) {
+            KEN::CreateUser(username, "kurono", KEN_USER);
             SerialLogger::Log("[KLS]   Imported user: ");
             SerialLogger::Log(username);
             SerialLogger::Log("\r\n");
@@ -661,7 +661,7 @@ void KLS::SyncUsersFromLinux() {
 }
 
 void KLS::SyncSingleUser(const char* username) {
-    SUPRUser* u = SUPR::FindUser(username);
+    KENUser* u = KEN::FindUser(username);
     if (!u) return;
 
     // ensure home directory exists
@@ -889,9 +889,9 @@ int KLS::RunCommand(const char* cmd, char* output, int max_output) {
         p = kls_pa(output, p, max_output, config.hostname);
         p = kls_pa(output, p, max_output, "\n");
     } else if (kls_seq(cmd, "whoami")) {
-        SUPRSession* sess = SUPR::GetSession(SUPR::GetCurrentSession());
+        KENSession* sess = KEN::GetSession(KEN::GetCurrentSession());
         if (sess && sess->active) {
-            SUPRUser* users = SUPR::GetUsers();
+            KENUser* users = KEN::GetUsers();
             p = kls_pa(output, p, max_output, users[sess->user_index].username);
         } else {
             p = kls_pa(output, p, max_output, "root");

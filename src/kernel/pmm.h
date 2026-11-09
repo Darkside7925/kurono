@@ -55,6 +55,40 @@ public:
     // free a contiguous range of frames previously obtained via AllocContiguous.
     static void  FreeContiguous(uint64_t phys_addr, uint64_t count);
 
+    // contiguous frames that all lie below max_phys, for devices with a narrow
+    // dma address width (iwlwifi rings take 36-bit addresses). first-fit from
+    // frame 0. free with FreeContiguous / FreeBytes as usual. (satoru)
+    static uint64_t AllocContiguousBelow(uint64_t count, uint64_t max_phys);
+    static void*    AllocBytesBelow(size_t bytes, uint64_t max_phys);
+
+    // ── managed range above the old 16 gb cap ───────────────────────────────
+    // the pmm used to stop at 16 gb. it now manages ram up to the top of the
+    // boot identity map (512 gb of 2 mb pages, kurono_boot.asm NUM_PDS), or to
+    // kurono.memcap=N gb when that is set (kurono.memcap=16 = the old cap).
+    // every user address space still carries the identity map in pml4[0], so a
+    // user va inside [16 gb, ram top) would shadow a frame the kernel can now
+    // own; the vmm refuses those maps unless the va is a fixed overlay window
+    // whose frames are reserved here. (satoru)
+    static constexpr uint64_t LEGACY_CAP_BYTES     = 16ULL << 30;
+    static constexpr uint64_t IDENTITY_CEIL_BYTES  = 512ULL << 30;
+    static uint64_t LegacyCapBytes()  { return LEGACY_CAP_BYTES; }
+    // true if [lo, hi) sits inside one fixed user overlay window (main stack,
+    // ld-kurono init trampoline). those frames are never handed out. (satoru)
+    static bool     IsUserOverlayRange(uint64_t lo, uint64_t hi);
+    // used bitmap frames at or above phys (holes count as used: compare deltas). (satoru)
+    static uint64_t CountUsedFramesFrom(uint64_t phys);
+    // frames at or above 16 gb handed out right now / peak since ResetHighPeak.
+    // 0 on a machine whose ram ends at or below 16 gb. test reporting. (satoru)
+    // kurono.memcensus=1 leak census: per-frame allocation-site tags (the
+    // allocator caller's return address). CensusSite is 0 when off or untagged;
+    // reads are unlocked (the census tolerates a racy snapshot). (satoru)
+    static bool     CensusOn();
+    static uint32_t CensusSite(uint64_t idx);
+    static bool     CensusFrameUsed(uint64_t idx);
+    static uint64_t HighFramesInUse();
+    static uint64_t HighFramesPeak();
+    static void     ResetHighPeak();
+
     // statistics
     // total/used count usable ram only. the bitmap also spans the holes
     // between usable regions (pci hole, acpi, bios); those frames are pinned

@@ -1,4 +1,5 @@
 #pragma once
+#include "../system/kasset.h"   // big payloads load on demand (satoru)
 //  Embedded user-mode test program(s).  Linked into the kernel image via
 //  objcopy from src/userprogs/<name>.asm \u2192 elf64 \u2192 binary blob.
 
@@ -27,6 +28,8 @@ extern "C" {
     extern const uint8_t _binary_kld_e1000e_elf_start[]    __attribute__((weak));
     extern const uint8_t _binary_kld_e1000e_elf_end[]      __attribute__((weak));
     extern const uint8_t _binary_uatest_elf_start[]        __attribute__((weak));
+    extern const uint8_t _binary_kentest_elf_start[]      __attribute__((weak));
+    extern const uint8_t _binary_kentest_elf_end[]        __attribute__((weak));
     // /dev/kshell gate blob (kurono.kshtest=1) (satoru)
     extern const uint8_t _binary_kshtest_elf_start[]       __attribute__((weak));
     // prebuilt static busybox - third-party linux binary smoke test (satoru)
@@ -37,6 +40,9 @@ extern "C" {
     extern const uint8_t _binary_dsai_elf_end[]            __attribute__((weak));
     extern const uint8_t _binary_dsai_key_bin_start[]      __attribute__((weak));
     extern const uint8_t _binary_dsai_key_bin_end[]        __attribute__((weak));
+    // https downloader for kpkg (kpkg install claude) (satoru)
+    extern const uint8_t _binary_kfetch_elf_start[]        __attribute__((weak));
+    extern const uint8_t _binary_kfetch_elf_end[]          __attribute__((weak));
     // recovery toolbox: a ustar of musl-static rescue tools (satoru)
     extern const uint8_t _binary_recovery_tools_tar_start[] __attribute__((weak));
     extern const uint8_t _binary_recovery_tools_tar_end[]   __attribute__((weak));
@@ -44,8 +50,15 @@ extern "C" {
     extern const uint8_t _binary_uatest_elf_end[]          __attribute__((weak));
     extern const uint8_t _binary_irqlat_elf_start[]        __attribute__((weak));
     extern const uint8_t _binary_irqlat_elf_end[]          __attribute__((weak));
+    extern const uint8_t _binary_kldnetbench_elf_start[]   __attribute__((weak));   // (satoru)
+    extern const uint8_t _binary_kldnetbench_elf_end[]     __attribute__((weak));   // (satoru)
+    extern const uint8_t _binary_kld_acpi_elf_start[]      __attribute__((weak));   // (satoru)
+    extern const uint8_t _binary_kld_acpi_elf_end[]        __attribute__((weak));   // (satoru)
     extern const uint8_t _binary_signal_test_elf_start[]   __attribute__((weak));
     extern const uint8_t _binary_signal_test_elf_end[]     __attribute__((weak));
+    // parallel tree-walk test blob (kurono.findtest=1) (satoru)
+    extern const uint8_t _binary_findtest_elf_start[]      __attribute__((weak));
+    extern const uint8_t _binary_findtest_elf_end[]        __attribute__((weak));
     // dynamic musl pie blob - first ld-kurono dynamic-load test (satoru)
     extern const uint8_t _binary_dyntest_elf_start[]       __attribute__((weak));
     extern const uint8_t _binary_dyntest_elf_end[]         __attribute__((weak));
@@ -90,14 +103,11 @@ inline uint32_t HelloX64Size() {
 }
 
 inline bool HasKpython() {
-    return _binary_kpython_elf_bin_start != nullptr &&
-           _binary_kpython_elf_bin_end   != nullptr &&
-           +_binary_kpython_elf_bin_end > +_binary_kpython_elf_bin_start;
+    return KAsset::Has("KPYTHON ELF", _binary_kpython_elf_bin_start, _binary_kpython_elf_bin_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
-inline const uint8_t* KpythonData() { return _binary_kpython_elf_bin_start; }
+inline const uint8_t* KpythonData() { return KAsset::Data("KPYTHON ELF", _binary_kpython_elf_bin_start, _binary_kpython_elf_bin_end); }   // on-demand asset (satoru)
 inline uint32_t KpythonSize() {
-    return (uint32_t)((uintptr_t)_binary_kpython_elf_bin_end -
-                      (uintptr_t)_binary_kpython_elf_bin_start);
+    return KAsset::Size("KPYTHON ELF", _binary_kpython_elf_bin_start, _binary_kpython_elf_bin_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 // musl-static hello accessors (satoru)
@@ -113,15 +123,15 @@ inline uint32_t MuslHelloSize() {
 }
 
 // musl-static ffmpeg accessors (satoru)
+inline bool FfmpegLinked() { return KAsset::Linked(_binary_ffmpeg_elf_start, _binary_ffmpeg_elf_end); }   // (satoru)
+inline bool KldE1000eLinked() { return KAsset::Linked(_binary_kld_e1000e_elf_start, _binary_kld_e1000e_elf_end); }   // (satoru)
+inline bool KpythonLinked() { return KAsset::Linked(_binary_kpython_elf_bin_start, _binary_kpython_elf_bin_end); }   // (satoru)
 inline bool HasFfmpeg() {
-    return _binary_ffmpeg_elf_start != nullptr &&
-           _binary_ffmpeg_elf_end   != nullptr &&
-           +_binary_ffmpeg_elf_end > +_binary_ffmpeg_elf_start;
+    return KAsset::Has("FFMPEG  ELF", _binary_ffmpeg_elf_start, _binary_ffmpeg_elf_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
-inline const uint8_t* FfmpegData() { return _binary_ffmpeg_elf_start; }
+inline const uint8_t* FfmpegData() { return KAsset::Data("FFMPEG  ELF", _binary_ffmpeg_elf_start, _binary_ffmpeg_elf_end); }   // on-demand asset (satoru)
 inline uint32_t FfmpegSize() {
-    return (uint32_t)((uintptr_t)_binary_ffmpeg_elf_end -
-                      (uintptr_t)_binary_ffmpeg_elf_start);
+    return KAsset::Size("FFMPEG  ELF", _binary_ffmpeg_elf_start, _binary_ffmpeg_elf_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 // raw-protocol wl_shm wayland test client accessors (satoru)
@@ -160,6 +170,26 @@ inline uint32_t SignalTestSize() {
                       (uintptr_t)_binary_signal_test_elf_start);
 }
 
+// kld acpica container accessors (kurono.kld.acpi=1) (satoru)
+inline bool HasKldAcpi() {
+    return _binary_kld_acpi_elf_start != nullptr && _binary_kld_acpi_elf_end != nullptr &&
+           +_binary_kld_acpi_elf_end > +_binary_kld_acpi_elf_start;
+}
+inline const uint8_t* KldAcpiData() { return _binary_kld_acpi_elf_start; }
+inline uint32_t KldAcpiSize() {
+    return (uint32_t)((uintptr_t)_binary_kld_acpi_elf_end - (uintptr_t)_binary_kld_acpi_elf_start);
+}
+
+// kld network a/b instrument accessors (kurono.kld.bench=1) (satoru)
+inline bool HasKldBench() {
+    return _binary_kldnetbench_elf_start != nullptr && _binary_kldnetbench_elf_end != nullptr &&
+           +_binary_kldnetbench_elf_end > +_binary_kldnetbench_elf_start;
+}
+inline const uint8_t* KldBenchData() { return _binary_kldnetbench_elf_start; }
+inline uint32_t KldBenchSize() {
+    return (uint32_t)((uintptr_t)_binary_kldnetbench_elf_end - (uintptr_t)_binary_kldnetbench_elf_start);
+}
+
 // userspace wake-latency probe accessors (kurono.irqlat) (satoru)
 inline bool HasIrqLat() {
     return _binary_irqlat_elf_start != nullptr &&
@@ -174,17 +204,25 @@ inline uint32_t IrqLatSize() {
 
 // KLD driver-container accessors (kurono.kld=1) (satoru)
 inline bool HasKldE1000e() {
-    return _binary_kld_e1000e_elf_start != nullptr &&
-           _binary_kld_e1000e_elf_end   != nullptr &&
-           +_binary_kld_e1000e_elf_end > +_binary_kld_e1000e_elf_start;
+    return KAsset::Has("KLDE1K  ELF", _binary_kld_e1000e_elf_start, _binary_kld_e1000e_elf_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
-inline const uint8_t* KldE1000eData() { return _binary_kld_e1000e_elf_start; }
+inline const uint8_t* KldE1000eData() { return KAsset::Data("KLDE1K  ELF", _binary_kld_e1000e_elf_start, _binary_kld_e1000e_elf_end); }   // on-demand asset (satoru)
 inline uint32_t KldE1000eSize() {
-    return (uint32_t)((uintptr_t)_binary_kld_e1000e_elf_end -
-                      (uintptr_t)_binary_kld_e1000e_elf_start);
+    return KAsset::Size("KLDE1K  ELF", _binary_kld_e1000e_elf_start, _binary_kld_e1000e_elf_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
 
 // user-pointer validation test accessors (kurono.uatest=1) (satoru)
+inline bool HasKenTest() {
+    return _binary_kentest_elf_start != nullptr &&
+           _binary_kentest_elf_end   != nullptr &&
+           +_binary_kentest_elf_end > +_binary_kentest_elf_start;
+}
+inline const uint8_t* KenTestData() { return _binary_kentest_elf_start; }
+inline uint32_t KenTestSize() {
+    return (uint32_t)((uintptr_t)_binary_kentest_elf_end -
+                      (uintptr_t)_binary_kentest_elf_start);
+}
+
 inline bool HasUaTest() {
     return _binary_uatest_elf_start != nullptr &&
            _binary_uatest_elf_end   != nullptr &&
@@ -226,6 +264,16 @@ inline bool HasDsai() {
            _binary_dsai_elf_end   != nullptr &&
            +_binary_dsai_elf_end > +_binary_dsai_elf_start;
 }
+inline bool HasKfetch() {
+    return _binary_kfetch_elf_start != nullptr &&
+           _binary_kfetch_elf_end   != nullptr &&
+           +_binary_kfetch_elf_end > +_binary_kfetch_elf_start;
+}
+inline const uint8_t* KfetchData() { return _binary_kfetch_elf_start; }
+inline uint32_t KfetchSize() {
+    return (uint32_t)((uintptr_t)_binary_kfetch_elf_end -
+                      (uintptr_t)_binary_kfetch_elf_start);
+}
 inline const uint8_t* DsaiData() { return _binary_dsai_elf_start; }
 inline uint32_t DsaiSize() {
     return (uint32_t)((uintptr_t)_binary_dsai_elf_end -
@@ -246,14 +294,23 @@ inline uint32_t DsaiKeySize() {
 
 // recovery toolbox accessors - absent unless the tar was staged at build (satoru)
 inline bool HasRecoveryTools() {
-    return _binary_recovery_tools_tar_start != nullptr &&
-           _binary_recovery_tools_tar_end   != nullptr &&
-           +_binary_recovery_tools_tar_end > +_binary_recovery_tools_tar_start;
+    return KAsset::Has("RTOOLS  TAR", _binary_recovery_tools_tar_start, _binary_recovery_tools_tar_end);   // embedded or on-demand from the KURONO partition (satoru)
 }
-inline const uint8_t* RecoveryToolsData() { return _binary_recovery_tools_tar_start; }
+inline const uint8_t* RecoveryToolsData() { return KAsset::Data("RTOOLS  TAR", _binary_recovery_tools_tar_start, _binary_recovery_tools_tar_end); }   // on-demand asset (satoru)
 inline uint32_t RecoveryToolsSize() {
-    return (uint32_t)((uintptr_t)_binary_recovery_tools_tar_end -
-                      (uintptr_t)_binary_recovery_tools_tar_start);
+    return KAsset::Size("RTOOLS  TAR", _binary_recovery_tools_tar_start, _binary_recovery_tools_tar_end);   // embedded or on-demand from the KURONO partition (satoru)
+}
+
+// parallel tree-walk test accessors (kurono.findtest=1) (satoru)
+inline bool HasFindtest() {
+    return _binary_findtest_elf_start != nullptr &&
+           _binary_findtest_elf_end   != nullptr &&
+           +_binary_findtest_elf_end > +_binary_findtest_elf_start;
+}
+inline const uint8_t* FindtestData() { return _binary_findtest_elf_start; }
+inline uint32_t FindtestSize() {
+    return (uint32_t)((uintptr_t)_binary_findtest_elf_end -
+                      (uintptr_t)_binary_findtest_elf_start);
 }
 
 // dynamic musl pie accessors (satoru)

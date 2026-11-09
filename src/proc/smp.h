@@ -131,5 +131,20 @@ public:
     // records the highest start-seq whose acks all arrived. (satoru)
     static uint64_t TlbFlushStartSeq();
     static uint64_t TlbFlushFullSeq();
+
+    // sched=2 cpu scaling (no-ops in the old mode). an idle ap halts instead of
+    // polling the scheduler lock every 50us; KickOneIdle wakes one halted ap
+    // with the resched ipi (vector 0x42). (satoru)
+    static void KickOneIdle();
+    static void KickIdleFor(const Process* p);   // wake an idle ap that may run p (satoru)
+    // sched=2: interrupt one cpu with the resched ipi (vector 0x42), so a pending
+    // signal or kill is taken at its ring-3 return now. (satoru)
+    static void KickCpu(uint32_t idx);
+    // sched=2: CpuIndex() reads IA32_TSC_AUX (index+1, via rdtscp) instead of
+    // the lapic id register, which is an mmio read (a vm exit under kvm) on
+    // every call - and CpuIndex sits on every syscall and lock path. call on
+    // the bsp after Init; aps program their own in ap_entry. (satoru)
+    static void EnableFastCpuIndex();
+    static bool DebugIdle(uint32_t idx);   // sched=2 halted-idle flag, diagnostics (satoru)
 };
 // end (satoru)

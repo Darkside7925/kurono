@@ -29,7 +29,7 @@
 //  isolation invariants above hold in BOTH cases; only the cpu-mode boundary
 //  differs, and that difference is reported, not hidden.
 #include "ksa.h"
-#include "supr.h"
+#include "ken.h"
 #include "../kernel/vmm.h"
 #include "../kernel/pmm.h"
 #include "../kernel/types.h"
@@ -42,6 +42,12 @@
 #include "../virt/hypervisor.h"
 #include "../virt/ept.h"
 #include "../system/logging.h"
+#include "../proc/scheduler.h"
+#include "../proc/smp.h"
+#include "../proc/spinlock.h"
+#include "../proc/kernel_locks.h"
+#include "../drivers/usb.h"
+#include "../shell/shell.h"
 
 bool KSA::available    = false;
 bool KSA::real_nested  = false;
@@ -66,6 +72,12 @@ static uint64_t   g_region_phys = 0;
 static EPT_PML4*  g_ksa_ept     = nullptr;
 static bool       g_isolated    = false;
 static uint32_t   g_channel_rev = 1;
+// true when the region is ordinary kernel memory (the no-hypervisor secure
+// desktop fallback) rather than an ept-isolated region. (satoru)
+static bool       g_fallback    = false;
+// set for the lifetime of a prompt so the gui/input loops stand down. (satoru)
+static volatile bool g_secure_desktop = false;
+static uint32_t   g_prompt_timeout_ms = 60000;
 
 // a verdict latched after a prompt completes - what the channel returns. the
 // host copy lives in normal kernel memory (NOT in the isolated region); it is
@@ -73,16 +85,47 @@ static uint32_t   g_channel_rev = 1;
 // through the ephemeral mapping. (satoru)
 static KSAVerdict g_last_verdict;
 
-// salted credential hash, identical scheme to supr's. we recompute here so the
+// ── modal state shared with the ui pumps ───────────────────────────────
+// the compositor owns the prompt while it is up: the gui loop when the caller
+// yielded to the kernel procs, the syscall pump when a bsp syscall is waiting.
+// both poll usb hid every frame - exactly what the old ps/2-only busy-wait
+// could not provide on a usb-only machine. only one prompt runs at a time; the
+// claimant is the only writer of the verdict. (satoru)
+struct KSAModalState {
+    bool     decided;
+    bool     approved;
+    bool     timed_out;
+    bool     want_cred;
+    bool     show_risk;
+    uint32_t started_ms;
+    uint32_t timeout_ms;
+    char     title[96];
+    char     detail[160];
+    char     username[40];
+    char     typed[64];
+    int      typed_len;
+    int      mx, my;
+    uint8_t* fb;
+};
+static KSAModalState g_modal;
+static volatile bool g_modal_busy      = false;  // claim: one prompt at a time (satoru)
+static volatile bool g_modal_live      = false;  // published: ui may draw + read input (satoru)
+static volatile int  g_modal_rendering = 0;      // ui is inside the overlay blit (satoru)
+// true when the gui process hosts the modal (the caller yielded to the kernel
+// procs). false means the bsp syscall waiter pumps the ui itself, because a
+// ring-0 syscall cannot run the gui kernel process any other way. (satoru)
+static volatile bool g_modal_gui_host = false;
+
+// salted credential hash, identical scheme to ken's. we recompute here so the
 // cleartext credential never leaves the isolated region - only the hash does.
-// the salt comes from supr's root/sovereign record via HashPassword. (satoru)
+// the salt comes from ken's root/sovereign record via HashPassword. (satoru)
 static void ksa_hash_credential(const char* cred, const char* username,
                                 unsigned char* out, bool& ok) {
     ok = false;
-    SUPRUser* u = SUPR::FindUser(username && *username ? username : "root");
-    if (!u) u = SUPR::FindUser("root");
+    KENUser* u = KEN::FindUser(username && *username ? username : "root");
+    if (!u) u = KEN::FindUser("root");
     if (!u) return;
-    SUPR::HashPassword(cred, u->salt, out);
+    KEN::HashPassword(cred, u->salt, out);
     ok = true;
 }
 
@@ -91,6 +134,7 @@ static void ksa_hash_credential(const char* cred, const char* username,
 // (satoru)
 static uint8_t* ksa_open_window() {
     if (!g_region_phys) return nullptr;
+    if (g_fallback) return (uint8_t*)(uintptr_t)g_region_phys;
     if (g_isolated) {
         // re-establish identity mapping for the region (read/write, NX). this is
         // the arbiter temporarily lifting its own isolation; the main os still
@@ -104,7 +148,7 @@ static uint8_t* ksa_open_window() {
 
 // re-isolate: drop the main-os mapping again so the region is unreachable.
 static void ksa_close_window() {
-    if (!g_region_phys || g_isolated) return;
+    if (!g_region_phys || g_isolated || g_fallback) return;
     KernelVMM::IsolateFrames(g_region_phys, KSA_REGION_SZ / PAGE_SIZE);
     g_isolated = true;
 }
@@ -140,6 +184,9 @@ void KSA::Init() {
 bool KSA::IsAvailable()   { return available; }
 bool KSA::IsRealNestedVM(){ return real_nested; }
 uint32_t KSA::ChannelRevision() { return g_channel_rev; }
+bool KSA::PromptUsable()  { return true; }   // hypervisor path or secure desktop fallback (satoru)
+bool KSA::SecureDesktopActive() { return g_secure_desktop; }
+void KSA::SetPromptTimeoutMs(uint32_t ms) { g_prompt_timeout_ms = ms ? ms : 60000; }
 
 bool KSA::SpawnContext() {
     if (g_region_phys) return true;   // already spawned (satoru)
@@ -194,9 +241,11 @@ void KSA::TeardownContext() {
     if (!g_region_phys) return;
 
     // re-reveal so we can wipe the region, then free. wiping the scratch +
-    // verdict ensures no credential residue survives the prompt. (satoru)
-    KernelVMM::RevealFrames(g_region_phys, KSA_REGION_SZ / PAGE_SIZE,
-                            PTE_WRITABLE | PTE_NX);
+    // verdict ensures no credential residue survives the prompt. the fallback
+    // region was never isolated, so it is already mapped. (satoru)
+    if (!g_fallback)
+        KernelVMM::RevealFrames(g_region_phys, KSA_REGION_SZ / PAGE_SIZE,
+                                PTE_WRITABLE | PTE_NX);
     memset((void*)(uintptr_t)g_region_phys, 0, KSA_REGION_SZ);
 
     if (g_ksa_ept) {
@@ -204,10 +253,13 @@ void KSA::TeardownContext() {
         g_ksa_ept = nullptr;
     }
 
+    bool was_fallback = g_fallback;
     PMM::FreeContiguous(g_region_phys, KSA_REGION_SZ / PAGE_SIZE);
     g_region_phys = 0;
     g_isolated = false;
-    SerialLogger::Log("KSA: torn down isolated context\r\n");
+    g_fallback = false;
+    SerialLogger::Log(was_fallback ? "KSA: torn down secure desktop context\r\n"
+                                   : "KSA: torn down isolated context\r\n");
 }
 
 // ── prompt rendering (into the isolated framebuffer) ────────────────────
@@ -257,14 +309,47 @@ static inline bool ksa_hit(int px, int py, int x, int y, int w, int h) {
 static void ksa_blit_panel(uint8_t* fb, const KSALayout& L) {
     int sw = Graphics::GetWidth();
     int sh = Graphics::GetHeight();
-    // dim the backdrop so the prompt reads as a modal security surface. (satoru)
-    Graphics::FillRectAlpha(0, 0, sw, sh, 170, 0x000000);
-    for (int y = 0; y < KSA_H; y++) {
-        for (int x = 0; x < KSA_W; x++) {
-            uint32_t px = ((uint32_t*)fb)[y * KSA_W + x];
-            Graphics::DrawPixel(L.ox + x, L.oy + y, px);
+    int x0 = L.ox, y0 = L.oy, w = KSA_W, h = KSA_H;
+    if (x0 < 0) { w += x0; x0 = 0; }
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (x0 + w > sw) w = sw - x0;
+    if (y0 + h > sh) h = sh - y0;
+    if (w <= 0 || h <= 0) return;
+    // the gui redraws the panel every frame now, so a row copy instead of a
+    // per-pixel DrawPixel keeps the modal cheap enough for 60fps. (satoru)
+    uint8_t* dst = Graphics::GetBackBuffer();
+    if (dst && Graphics::GetBpp() == 32) {
+        uint32_t pitch = Graphics::GetPitch();
+        int sx = x0 - L.ox, sy = y0 - L.oy;
+        for (int y = 0; y < h; y++) {
+            memcpy(dst + (size_t)(y0 + y) * pitch + (size_t)x0 * 4,
+                   fb + ((size_t)(sy + y) * KSA_W + (size_t)sx) * 4,
+                   (size_t)w * 4);
         }
+        return;
     }
+    int sx = x0 - L.ox, sy = y0 - L.oy;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            Graphics::DrawPixel(x0 + x, y0 + y, ((uint32_t*)fb)[(sy + y) * KSA_W + sx + x]);
+}
+
+// dim only the area behind the panel. a full-screen blend + full-screen copy
+// every frame would cost tens of ms on a 5k laptop panel; the desktop outside
+// the modal stays live and undimmed, which is the point of not freezing it.
+// (satoru)
+static void ksa_dim_backdrop(const KSALayout& L) {
+    int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
+    const int pad = 26;
+    int x = L.ox - pad, y = L.oy - pad;
+    int w = KSA_W + pad * 2, h = KSA_H + pad * 2;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
+    if (w <= 0 || h <= 0) return;
+    Graphics::FillRectAlpha(x, y, w, h, 170, 0x000000);
+    Graphics::MarkDirty(x, y, w, h);
 }
 // push the composed back buffer to the real framebuffer + the host gpu.
 // SwapBuffers only copies the dirty-region list, and the dim + panel blit go
@@ -290,18 +375,11 @@ static void ksa_button(int x, int y, int w, int h, const char* label,
     Graphics::DrawString(x + (w - tw) / 2, y + (h - 16) / 2, label, 0xFFFFFFFF, fill);
 }
 
-static void ksa_render(uint8_t* fb, const KSARequest& req, const char* typed,
-                       int typed_len, bool show_risk, int mouse_x, int mouse_y) {
-    // the main-os compositor leaves a clip rect set from its last frame; our
-    // per-pixel panel/dim blit goes through DrawPixel which honours the clip and
-    // would otherwise be silently dropped outside it (that left the buttons
-    // visible - FillRect clamps instead of dropping - but the panel/backdrop
-    // missing). reset to full-screen so ksa owns the whole surface. (satoru)
-    Graphics::ClearClipRect();
-
-    // chrome: dark panel, accent header, title + detail + masked credential.
-    // composed entirely into the isolated framebuffer first (the security-
-    // relevant pixels originate in the unmapped region). (satoru)
+// paint the static chrome into the isolated framebuffer once per prompt. the
+// gui blits it every frame; only the text/buttons/hover change after this.
+// (satoru)
+static void ksa_paint_chrome(uint8_t* fb, const KSARequest& req) {
+    if (!fb) return;
     ksa_fb_rect(fb, 0, 0, KSA_W, KSA_H, 0xFF1C1F26);       // panel bg
     ksa_fb_rect(fb, 0, 0, KSA_W, 40, 0xFF2D6CDF);          // header accent
     ksa_fb_rect(fb, 0, KSA_H - 2, KSA_W, 2, 0xFF2D6CDF);   // footer line
@@ -310,14 +388,27 @@ static void ksa_render(uint8_t* fb, const KSARequest& req, const char* typed,
         ksa_fb_rect(fb, 110, 124, KSA_W - 126, 26, 0xFF0E1014);
         ksa_fb_rect(fb, 110, 124, KSA_W - 126, 1, 0xFF3A4250);
     }
+}
+
+// compose the modal over whatever the compositor just drew. no present here:
+// the gui loop owns the swap, and this runs inside its back-buffer lock.
+// (satoru)
+static void ksa_draw_prompt(uint8_t* fb, const KSARequest& req, const char* typed,
+                            int typed_len, bool show_risk, int mouse_x, int mouse_y) {
+    if (!fb) return;
+    // the main-os compositor leaves a clip rect set from its last frame; our
+    // panel blit would otherwise be silently dropped outside it. reset to full
+    // screen so ksa owns the surface it draws on. (satoru)
+    Graphics::ClearClipRect();
 
     KSALayout L = ksa_layout();
     int ox = L.ox, oy = L.oy;
 
-    // blit the isolated panel into the back buffer, then draw text + buttons
-    // over it, THEN present once. text rendering needs the font engine, which
-    // targets the main back buffer; doing it before the present is what makes
-    // the labels visible (the old code presented first and lost the text). (satoru)
+    // dim the backdrop behind the panel, then blit the isolated chrome over it.
+    // the text is drawn straight into the main back buffer with the font
+    // engine; composing it before the swap is what makes the labels visible.
+    // (satoru)
+    ksa_dim_backdrop(L);
     ksa_blit_panel(fb, L);
 
     (void)typed;   // credential is echoed masked via typed_len, not the chars (satoru)
@@ -362,141 +453,318 @@ static void ksa_render(uint8_t* fb, const KSARequest& req, const char* typed,
     Graphics::DrawString(ox + 14, oy + KSA_H - 56,
         "[Enter] Approve    [Esc] Deny", 0xFF8892A4, 0xFF1C1F26);
 
-    // hand the composed frame to the screen + host gpu in one present. (satoru)
+    // the gui only blits damaged rects; the panel + dim must reach the front
+    // buffer even when the desktop underneath did not change. (satoru)
+    Graphics::MarkDirty(ox - 26, oy - 26, KSA_W + 52, KSA_H + 52);
+}
+
+// direct-mode present: used only when the caller is the gui process itself
+// (the kurono.ksa.prompt demo), because there is no compositor frame to ride
+// on in that case. (satoru)
+static void ksa_render_now(uint8_t* fb, const KSARequest& req, const char* typed,
+                           int typed_len, bool show_risk, int mouse_x, int mouse_y) {
+    ksa_draw_prompt(fb, req, typed, typed_len, show_risk, mouse_x, mouse_y);
     ksa_present();
 }
 
-// drain any keystrokes / mouse events the main os queued BEFORE the secure
-// prompt took over, so a key already sitting in the ps/2 ring can't be consumed
-// as a credential char or counted as an Enter/Esc. nothing the main os queued
-// can drive the verdict. (satoru)
+// ── modal helpers shared by the waiter and the gui loop ────────────────
+static void ksa_copy_str(char* dst, int cap, const char* src) {
+    int i = 0;
+    if (cap <= 0) return;
+    while (src && src[i] && i < cap - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+// the caller is the compositor itself (PromptDemo from the gui loop). it
+// cannot wait for a gui frame that it is blocking, so it drives the modal
+// inline instead. (satoru)
+static bool ksa_caller_is_gui() {
+    Process* p = Scheduler::GetCurrentProcess();
+    if (!p || !p->is_kernel_proc) return false;
+    const char* n = p->name;
+    return n[0] == 'g' && n[1] == 'u' && n[2] == 'i' && n[3] == 0;
+}
+
+// publish a decision exactly once. release ordering makes the typed buffer
+// visible to the waiter before it reads the verdict. (satoru)
+static void ksa_modal_decide(bool approved) {
+    if (__atomic_load_n(&g_modal.decided, __ATOMIC_ACQUIRE)) return;
+    g_modal.approved = approved;
+    __atomic_store_n(&g_modal.decided, true, __ATOMIC_RELEASE);
+}
+
+// yield the caller for one slice while the modal is up. a kernel process
+// sleeps normally (the scheduler runs the gui); a syscall waiter on an ap just
+// halts until the next irq, because the gui lives on the bsp. a bsp syscall
+// never reaches here - it self-pumps instead. (satoru)
+static void ksa_wait_slice(uint32_t ms) {
+    Scheduler::SleepMs(ms);
+}
+
+bool KSA::ModalActive() { return __atomic_load_n(&g_modal_live, __ATOMIC_ACQUIRE); }
+bool KSA::ModalGuiHosted() { return __atomic_load_n(&g_modal_gui_host, __ATOMIC_ACQUIRE); }
+
+void KSA::RenderPromptOverlay() {
+    if (!ModalActive()) return;
+    __atomic_add_fetch(&g_modal_rendering, 1, __ATOMIC_ACQ_REL);
+    // re-check after publishing that we are inside: the waiter clears live
+    // first and then spins on this counter before it touches the region. (satoru)
+    if (ModalActive() && g_modal.fb) {
+        KSARequest req;
+        req.title     = g_modal.title;
+        req.detail    = g_modal.detail;
+        req.username  = g_modal.username;
+        req.want_cred = g_modal.want_cred;
+        ksa_draw_prompt(g_modal.fb, req, g_modal.typed, g_modal.typed_len,
+                        g_modal.show_risk, g_modal.mx, g_modal.my);
+    }
+    __atomic_sub_fetch(&g_modal_rendering, 1, __ATOMIC_ACQ_REL);
+}
+
+void KSA::PumpPromptInput() {
+    if (!ModalActive()) return;
+    uint32_t now = (uint32_t)Timer::GetRealMs64();
+    if (!__atomic_load_n(&g_modal.decided, __ATOMIC_ACQUIRE) &&
+        (uint32_t)(now - g_modal.started_ms) >= g_modal.timeout_ms) {
+        g_modal.timed_out = true;
+        ksa_modal_decide(false);
+        return;
+    }
+
+    // keyboard: type the credential, Enter approves, Esc denies. (satoru)
+    while (Keyboard::HasChar()) {
+        char c = Keyboard::GetChar();
+        if (c == '\r' || c == '\n') { ksa_modal_decide(true); break; }
+        if (c == 27)                { ksa_modal_decide(false); break; }
+        if (c == 8 || c == 127) {
+            if (g_modal.typed_len > 0) g_modal.typed[--g_modal.typed_len] = 0;
+            continue;
+        }
+        if (c >= 32 && c < 127 && g_modal.typed_len < 62) {
+            g_modal.typed[g_modal.typed_len++] = c;
+            g_modal.typed[g_modal.typed_len] = 0;
+        }
+    }
+    if (__atomic_load_n(&g_modal.decided, __ATOMIC_ACQUIRE)) return;
+
+    // esc is a control key, not a character: KeyToChar has no mapping for it,
+    // so it never reaches the char ring. read the raw press edge instead. (satoru)
+    if (Keyboard::IsKeyPressed(KEY_ESC)) ksa_modal_decide(false);
+    if (__atomic_load_n(&g_modal.decided, __ATOMIC_ACQUIRE)) return;
+
+    // mouse: motion drives button hover, a click on a rect decides. the gui
+    // has already polled the devices (usb included) into these same rings.
+    // (satoru)
+    while (Mouse::HasEvent()) {
+        Mouse::Event m = Mouse::GetEvent();
+        if (m.x != g_modal.mx || m.y != g_modal.my) { g_modal.mx = m.x; g_modal.my = m.y; }
+    }
+    int cur_mx, cur_my;
+    Mouse::GetPosition(cur_mx, cur_my);
+    if (cur_mx != g_modal.mx || cur_my != g_modal.my) { g_modal.mx = cur_mx; g_modal.my = cur_my; }
+    if (Mouse::LeftClicked()) {
+        KSALayout L = ksa_layout();
+        if (ksa_hit(g_modal.mx, g_modal.my, L.approve_x, L.approve_y, L.approve_w, L.approve_h)) {
+            ksa_modal_decide(true);
+        } else if (ksa_hit(g_modal.mx, g_modal.my, L.deny_x, L.deny_y, L.deny_w, L.deny_h)) {
+            ksa_modal_decide(false);
+        }
+    }
+}
+
+// drain any keystrokes / mouse events the main os queued BEFORE the modal took
+// over, so a key already sitting in a ring can't be consumed as a credential
+// char or counted as an Enter/Esc. usb hid is drained into those rings first:
+// on a usb-only machine the old flush never saw the keyboard at all. (satoru)
 static void ksa_flush_input() {
+    SpinLockCpuGuard guard(g_input_lock);
     Keyboard::Poll();
-    while (Keyboard::HasChar()) Keyboard::GetChar();
     Mouse::Poll();
+    USB::PollHID();
+    while (Keyboard::HasChar()) Keyboard::GetChar();
     while (Mouse::HasEvent()) Mouse::GetEvent();
     (void)Mouse::LeftClicked();   // clear a pending click edge (satoru)
 }
 
 bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
     memset(&out, 0, sizeof(out));
-    if (!available) {
-        SerialLogger::Log("KSA: Prompt requested but ksa unavailable\r\n");
+    if (available) {
+        if (!SpawnContext()) return false;
+    } else {
+        // no hypervisor on this machine: draw the same modal from ordinary
+        // kernel memory. it is not memory-isolated, but the verdict still only
+        // crosses through ksa's own channel. (satoru)
+        if (!g_region_phys) {
+            uint64_t pages = KSA_REGION_SZ / PAGE_SIZE;
+            uint64_t phys = PMM::AllocContiguous(pages);
+            if (!phys) {
+                SerialLogger::Log("KSA: fallback prompt failed - no memory\r\n");
+                return false;
+            }
+            g_region_phys = phys;
+            g_fallback = true;
+            g_isolated = false;
+            memset((void*)(uintptr_t)g_region_phys, 0, KSA_REGION_SZ);
+            SerialLogger::Log("KSA: no hypervisor - secure desktop fallback prompt\r\n");
+        }
+    }
+
+    // one prompt at a time: a second gated action waits in its syscall, not in
+    // ksa's shared modal state. deny it rather than corrupt the live prompt.
+    // (satoru)
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&g_modal_busy, &expected, true,
+                                     false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        SerialLogger::Log("KSA: prompt already active - denying concurrent request\r\n");
         return false;
     }
-    if (!SpawnContext()) return false;
 
-    RuntimeLog::LogSecurity("ksa prompt shown", req.detail ? req.detail : req.title);
-    SUPR::Log(ACT_KSA_PROMPT, req.username ? req.username : "root",
-              req.detail ? req.detail : "ksa prompt");
-    SerialLogger::Log("KSA: prompt up - secure desktop owns the screen + input\r\n");
+    // which engine runs the modal:
+    //   direct    - the caller IS the gui process (prompt demo);
+    //   self_pump - a ring-0 syscall on the bsp. it cannot run the gui kernel
+    //               process (SleepMs early-returns for non-kernel callers), so
+    //               the waiter drives PumpUI itself and the gui stands down;
+    //   gui host  - a kernel-proc caller (shell) or a syscall on an ap: the
+    //               bsp is free, so the gui loop composites normally. (satoru)
+    bool direct = ksa_caller_is_gui();
+    Process* me = Scheduler::GetCurrentProcess();
+    bool self_pump = !direct && !(me && me->is_kernel_proc) && SMP::CpuIndex() == 0;
+    __atomic_store_n(&g_modal_gui_host, !direct && !self_pump, __ATOMIC_RELEASE);
 
-    // ── DISPLAY OWNERSHIP / SECURE DESKTOP ─────────────────────────────────
-    // the cooperative scheduler is the lever here. this loop never calls
-    // Scheduler::Yield/SleepMs, so while it runs the gui compositor process and
-    // the input process are BOTH starved - the main os cannot draw over the
-    // prompt, cannot read the framebuffer that ksa is presenting to, and cannot
-    // pull the keystrokes/clicks (this loop is the only code polling the 8042).
-    // ksa is therefore the sole owner of the screen and of input for the prompt's
-    // lifetime. we snapshot the back buffer up front and restore it on the way
-    // out so the desktop the main os left behind is put back exactly, then a
-    // MarkUIDirty() lets the resumed compositor repaint normally. (satoru)
-    int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
-    int pitch = Graphics::GetPitch();
-    uint8_t* back = Graphics::GetBackBuffer();
-    uint8_t* saved = nullptr;
-    uint64_t saved_bytes = (uint64_t)sh * (uint64_t)pitch;
-    if (back && saved_bytes) {
-        saved = (uint8_t*)PMM::AllocBytes(saved_bytes);
-        if (saved) memcpy(saved, back, saved_bytes);
-    }
-
-    // drop any pre-queued main-os input before we start reading for real. (satoru)
+    g_secure_desktop = true;
     ksa_flush_input();
 
-    bool show_risk = SUPR::BothAuthDisabled();
-    char typed[64]; int typed_len = 0; typed[0] = 0;
-    bool decided = false, approved = false;
-    int mx = sw / 2, my = sh / 2;
-    Mouse::GetPosition(mx, my);
+    memset(&g_modal, 0, sizeof(g_modal));
+    ksa_copy_str(g_modal.title, sizeof(g_modal.title),
+                 req.title ? req.title : "Privilege Escalation");
+    ksa_copy_str(g_modal.detail, sizeof(g_modal.detail),
+                 req.detail ? req.detail : "An action requires elevated rights.");
+    ksa_copy_str(g_modal.username, sizeof(g_modal.username),
+                 req.username && *req.username ? req.username : "root");
+    g_modal.want_cred  = req.want_cred;
+    g_modal.show_risk  = KEN::BothAuthDisabled();
+    g_modal.started_ms = (uint32_t)Timer::GetRealMs64();
+    g_modal.timeout_ms = g_prompt_timeout_ms;
+    g_modal.mx = Graphics::GetWidth() / 2;
+    g_modal.my = Graphics::GetHeight() / 2;
+    Mouse::GetPosition(g_modal.mx, g_modal.my);
 
-    // arbiter render/input loop. open the ephemeral window to render into the
-    // isolated fb, then re-isolate between frames so the region spends most of
-    // its life unmapped from the main os. cooperative; ~60s timeout. (satoru)
-    uint32_t waited_ms = 0;
-    Timer::ElapsedSinceLast();   // reset baseline
+    // keep the ephemeral window open for the whole modal. the gui re-blits the
+    // panel every frame, and reopening it per frame would run two 512-page
+    // isolation walks per frame on the laptop. (satoru)
+    g_modal.fb = ksa_open_window();
     {
-        uint8_t* fb = ksa_open_window();
-        if (fb) ksa_render(fb, req, typed, typed_len, show_risk, mx, my);
-        ksa_close_window();
+        KSARequest local;
+        local.title     = g_modal.title;
+        local.detail    = g_modal.detail;
+        local.username  = g_modal.username;
+        local.want_cred = g_modal.want_cred;
+        ksa_paint_chrome(g_modal.fb, local);
+    }
+    __atomic_store_n(&g_modal.decided, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_modal_live, true, __ATOMIC_RELEASE);
+
+    RuntimeLog::LogSecurity("ksa prompt shown", g_modal.detail);
+    KEN::Log(ACT_KSA_PROMPT, g_modal.username, g_modal.detail);
+    SerialLogger::Log(direct
+        ? "KSA: prompt up - caller is gui, inline modal\r\n"
+        : self_pump
+            ? "KSA: prompt up - waiter pumps the ui, gui stands down\r\n"
+            : "KSA: prompt up - gui composites, caller waits cooperatively\r\n");
+
+    if (direct) {
+        // the caller is the compositor: render the first frame ourselves.
+        KSARequest local;
+        local.title     = g_modal.title;
+        local.detail    = g_modal.detail;
+        local.username  = g_modal.username;
+        local.want_cred = g_modal.want_cred;
+        if (g_modal.fb)
+            ksa_render_now(g_modal.fb, local, g_modal.typed, g_modal.typed_len,
+                           g_modal.show_risk, g_modal.mx, g_modal.my);
+    } else {
+        // wake the gui loop onto the modal for this frame. (satoru)
+        Graphics::MarkUIDirty();
     }
 
-    while (!decided && waited_ms < 60000) {
-        uint32_t e = Timer::ElapsedSinceLast();
-        if (e > 0) { TimeManager::AdvanceByMs(e); waited_ms += e; }
-        bool dirty = false;
-
-        // keyboard: type the credential, Enter approves, Esc denies. (satoru)
-        Keyboard::Poll();
-        while (Keyboard::HasChar()) {
-            char c = Keyboard::GetChar();
-            if (c == '\r' || c == '\n') { decided = true; approved = true; break; }
-            else if (c == 27)           { decided = true; approved = false; break; } // esc
-            else if (c == 8 || c == 127) { if (typed_len > 0) { typed[--typed_len] = 0; dirty = true; } }
-            else if (c >= 32 && c < 127 && typed_len < 62) { typed[typed_len++] = c; typed[typed_len] = 0; dirty = true; }
+    bool timed_out = false;
+    for (;;) {
+        if (__atomic_load_n(&g_modal.decided, __ATOMIC_ACQUIRE)) break;
+        uint32_t now = (uint32_t)Timer::GetRealMs64();
+        if ((uint32_t)(now - g_modal.started_ms) >= g_modal.timeout_ms) {
+            timed_out = true;
+            g_modal.timed_out = true;
+            ksa_modal_decide(false);
+            break;
         }
-
-        // mouse: drain motion (for button hover) and detect a click on the
-        // Approve/Deny rects. ksa polls the mouse itself - the paused input
-        // process is not feeding it. (satoru)
-        if (!decided) {
-            Mouse::Poll();
-            while (Mouse::HasEvent()) {
-                Mouse::Event m = Mouse::GetEvent();
-                if (m.x != mx || m.y != my) { mx = m.x; my = m.y; dirty = true; }
+        if (direct) {
+            // no gui loop can pump this frame, so poll the devices (usb hid
+            // included) and redraw inline. this path is only the demo/self
+            // test, where blocking the compositor is expected. (satoru)
+            {
+                SpinLockCpuGuard guard(g_input_lock);
+                Keyboard::Poll();
+                Mouse::Poll();
+                USB::PollHID();
             }
-            int cur_mx, cur_my; Mouse::GetPosition(cur_mx, cur_my);
-            if (cur_mx != mx || cur_my != my) { mx = cur_mx; my = cur_my; dirty = true; }
-            if (Mouse::LeftClicked()) {
-                KSALayout L = ksa_layout();
-                if (ksa_hit(mx, my, L.approve_x, L.approve_y, L.approve_w, L.approve_h)) {
-                    decided = true; approved = true;
-                } else if (ksa_hit(mx, my, L.deny_x, L.deny_y, L.deny_w, L.deny_h)) {
-                    decided = true; approved = false;
-                }
+            PumpPromptInput();
+            if (!__atomic_load_n(&g_modal.decided, __ATOMIC_ACQUIRE) && g_modal.fb) {
+                KSARequest local;
+                local.title     = g_modal.title;
+                local.detail    = g_modal.detail;
+                local.username  = g_modal.username;
+                local.want_cred = g_modal.want_cred;
+                ksa_render_now(g_modal.fb, local, g_modal.typed, g_modal.typed_len,
+                               g_modal.show_risk, g_modal.mx, g_modal.my);
             }
-        }
-
-        if (dirty && !decided) {
-            uint8_t* fb = ksa_open_window();
-            if (fb) ksa_render(fb, req, typed, typed_len, show_risk, mx, my);
-            ksa_close_window();
+            Scheduler::SleepMs(8);
+        } else if (self_pump) {
+            // bsp syscall context: composite the desktop + the modal and poll
+            // usb/ps2 from the syscall pump, then hlt one tick. (satoru)
+            KuronoShell::PumpModalUI();
+            Scheduler::SleepMs(1);
+        } else {
+            ksa_wait_slice(10);
         }
     }
 
-    if (!decided) {
+    bool approved = __atomic_load_n(&g_modal.approved, __ATOMIC_ACQUIRE);
+    if (timed_out || g_modal.timed_out) {
         // timed out with no answer - fail closed (treated as a deny). (satoru)
         approved = false;
         SerialLogger::Log("KSA: prompt timed out - failing closed (deny)\r\n");
+    }
+
+    // stop the compositor before touching the region: clear live, then wait out
+    // any overlay blit already in flight. (satoru)
+    __atomic_store_n(&g_modal_live, false, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&g_modal_rendering, __ATOMIC_ACQUIRE) != 0) {
+        Process* me = Scheduler::GetCurrentProcess();
+        if (me && me->is_kernel_proc) Scheduler::SleepMs(1);
+        else {
+            uint64_t until = Timer::GetRealMs64() + 1;
+            while (Timer::GetRealMs64() < until) __asm__ __volatile__("pause" ::: "memory");
+        }
     }
 
     // write the verdict INTO the isolated region (the in-vm result), then read
     // it back through the channel accessor. this models the result crossing the
     // vmcall boundary: ksa's arbiter is the only writer; the host reads a copy.
     {
-        uint8_t* fb = ksa_open_window();
+        uint8_t* fb = g_modal.fb;
         if (fb) {
             KSAVerdict* in = (KSAVerdict*)(fb + KSA_VERDICT_OFF);
             memset(in, 0, sizeof(*in));
             in->approved  = approved;
             in->completed = true;
-            if (req.want_cred && approved && typed_len > 0) {
+            if (g_modal.want_cred && approved && g_modal.typed_len > 0) {
                 bool ok = false;
                 // hash inside the isolated region; cleartext stays here and is
                 // wiped on teardown. (satoru)
                 char* scratch = (char*)(fb + KSA_SCRATCH_OFF);
-                for (int i = 0; i <= typed_len && i < 63; i++) scratch[i] = typed[i];
-                ksa_hash_credential(scratch, req.username, in->cred_hash, ok);
+                for (int i = 0; i <= g_modal.typed_len && i < 63; i++)
+                    scratch[i] = g_modal.typed[i];
+                ksa_hash_credential(scratch, g_modal.username, in->cred_hash, ok);
                 in->have_cred_hash = ok;
                 // wipe scratch immediately. (satoru)
                 for (int i = 0; i < 63; i++) scratch[i] = 0;
@@ -505,37 +773,33 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
             g_last_verdict = *in;
         }
         ksa_close_window();
+        g_modal.fb = nullptr;
     }
 
-    // wipe local typed buffer - the cleartext credential must not linger in
+    // wipe the typed buffer - the cleartext credential must not linger in
     // main-os memory. (satoru)
-    for (int i = 0; i < 64; i++) typed[i] = 0;
+    memset(g_modal.typed, 0, sizeof(g_modal.typed));
+    g_modal.typed_len = 0;
 
-    // restore the desktop pixels the main os had before the modal, then release
-    // the secure desktop: a final present puts the saved frame on screen and
-    // MarkUIDirty() tells the resumed compositor to repaint. (satoru)
-    if (saved && back && saved_bytes) {
-        memcpy(back, saved, saved_bytes);
-        Graphics::MarkDirty(0, 0, sw, sh);   // full flush so the panel is wiped (satoru)
-        Graphics::SwapBuffers();
-        Graphics::PresentVirtioIfActive();
-    }
-    if (saved) PMM::FreeBytes(saved, saved_bytes);
+    // repaint the desktop that the modal sat over. the compositor is already
+    // live, so a dirty mark is enough (no saved-frame restore is needed). (satoru)
     Graphics::MarkUIDirty();
 
     bool got = ReadVerdictForChannel(out);
-    SUPR::Log(approved ? ACT_KSA_APPROVE : ACT_KSA_DENY,
-              req.username ? req.username : "root",
-              approved ? "ksa approved" : "ksa denied");
+    KEN::Log(approved ? ACT_KSA_APPROVE : ACT_KSA_DENY,
+              g_modal.username, approved ? "ksa approved" : "ksa denied");
     RuntimeLog::LogSecurity(approved ? "ksa approved" : "ksa denied",
-                            req.detail ? req.detail : req.title);
+                            g_modal.detail);
 
-    // anti-replay: clear the latched verdict once supr has consumed it via the
+    // anti-replay: clear the latched verdict once ken has consumed it via the
     // out-param, so a later VMCALL on the channel cannot re-read a stale
     // "approved" after the prompt has ended. (satoru)
     memset(&g_last_verdict, 0, sizeof(g_last_verdict));
 
+    g_secure_desktop = false;
+    __atomic_store_n(&g_modal_gui_host, false, __ATOMIC_RELEASE);
     TeardownContext();
+    __atomic_store_n(&g_modal_busy, false, __ATOMIC_RELEASE);
     return got;
 }
 
@@ -550,6 +814,15 @@ bool KSA::ReadVerdictForChannel(KSAVerdict& out) {
 // ── self-test (kurono.ksa.test) ─────────────────────────────────────────
 bool KSA::SelfTest() {
     SerialLogger::Log("KSA-SELFTEST: begin\r\n");
+    // the ksecurity daemon runs this periodically. it must never touch the
+    // isolated region while a prompt owns it: SpawnContext returns the live
+    // region and TeardownContext would free it under the waiting modal. (satoru)
+    if (__atomic_load_n(&g_modal_busy, __ATOMIC_ACQUIRE) || ModalActive()) {
+        SerialLogger::Log("KSA-SELFTEST: skipped - prompt active\r\n");
+        SerialLogger::Log("KSA-SELFTEST: PASS (skipped)\r\n");
+        RuntimeLog::LogSecurity("ksa selftest", "skipped (prompt active)");
+        return true;
+    }
     if (!available) {
         SerialLogger::Log("KSA-SELFTEST: hypervisor unavailable - ksa is a no-op on this host\r\n");
         SerialLogger::Log("KSA-SELFTEST: PASS (unavailable-and-honest)\r\n");

@@ -4,10 +4,7 @@
 // OBSERVABLE behaviour: __GFP_ZERO must zero, and an atomic allocation must not
 // sleep (malloc does not sleep, so that holds trivially).
 //
-// DMA-capable memory is deliberately NOT provided here. dma_alloc_* must go
-// through the kernel broker so the buffer is physically contiguous and
-// IOMMU-mapped; handing back malloc memory would appear to work and then
-// corrupt at the first device access. Those stay stubbed until the broker exists.
+// DMA-capable memory is NOT provided here: lx_dma.c gets it from the broker.
 //
 // end (satoru)
 
@@ -69,41 +66,9 @@ void vfree(const void *p)
 }
 
 // ── pages ───────────────────────────────────────────────────────────────────
-// The driver uses alloc_pages for RX buffers. Returning a real struct page is
-// awkward without a mem_map, so hand back a small allocated descriptor whose
-// virtual address is recoverable. This is enough for the non-DMA paths; the
-// moment a page is handed to the device it must come from the broker instead.
-// (satoru)
-struct page *alloc_pages_noprof(gfp_t gfp, unsigned int order)
-{
-    unsigned long bytes = PAGE_SIZE << order;
-    struct page *pg = (struct page *)calloc(1, sizeof(struct page));
-    void *mem;
-
-    if (!pg)
-        return NULL;
-    mem = malloc(bytes);
-    if (!mem) {
-        free(pg);
-        return NULL;
-    }
-    if (gfp & __GFP_ZERO)
-        memset(mem, 0, bytes);
-    // stash the backing pointer where page_address() style helpers can find it.
-    // virtual is only present with CONFIG_HIGHMEM-ish configs, so use private.
-    pg->private = (unsigned long)mem;
-    return pg;
-}
-
-void __folio_put(struct folio *folio)
-{
-    struct page *pg = (struct page *)folio;
-    if (!pg)
-        return;
-    if (pg->private)
-        free((void *)pg->private);
-    free(pg);
-}
+// alloc_pages / __free_pages / __folio_put moved to lx_dma.c: pages now come
+// from a broker-backed arena with a real struct page array, so page_address()
+// and dma_map_page() agree. (satoru)
 
 bool is_vmalloc_addr(const void *x)
 {
@@ -112,22 +77,7 @@ bool is_vmalloc_addr(const void *x)
 }
 
 // ── MMIO ────────────────────────────────────────────────────────────────────
-// A container cannot map device MMIO itself - that is the kernel broker's job
-// (BAR mapping IPC). Refusing loudly is the only honest answer: returning a
-// malloc'd buffer would make every register read return garbage that looks like
-// a dead device. (satoru)
-void __iomem *ioremap(phys_addr_t offset, size_t size)
-{
-    (void)size;
-    lx_log("[lx_emul] ioremap(");
-    lx_log_u((unsigned long)offset);
-    lx_log(") - needs the kernel BAR-mapping broker (phase 2)\n");
-    lx_unimpl("ioremap");
-}
-
-void iounmap(volatile void __iomem *addr)
-{
-    (void)addr;
-}
+// ioremap/iounmap moved to lx_pci.c: they map a granted BAR through the
+// broker. (satoru)
 
 // end (satoru)

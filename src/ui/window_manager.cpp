@@ -4,9 +4,12 @@
 #include "../drivers/timer.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/display_mgr.h"
+#include "../drivers/outputs.h"   // multi-monitor outputs (satoru)
 #include "../drivers/mouse.h"   // cursor pos for fast-path damage (satoru)
 #include "../system/ui_config.h"
 #include "../kernel/pmm.h"   // drag-backdrop buffer alloc/free (satoru)
+#include "../kernel/heap.h"  // alt-tab thumbnail buffers (satoru)
+#include "../fs/kvfs.h"      // per-app window geometry memory (satoru)
 #include "kss.h"             // motion tokens + live (scriptable) accent (satoru)
 #include "ui_elements.h"     // Animation::LerpColor for the traffic-light ease (satoru)
 #include "wm_motion.h"       // spring/bezier curves + snapshot blitter (satoru)
@@ -15,6 +18,11 @@
 #include "modern_draw.h"     // anti-aliased modern window chrome (satoru)
 #include "font.h"
 #include "app_icons.h"       // per-window app logo in the titlebar (satoru)
+#include "wayland_server.h"   // keyboard focus follows the wm focus (satoru)
+#include "frame_pacer.h"     // refresh cap for pacing + the drag throttle (satoru)
+#include "../drivers/cpu_detect.h"   // tsc rate for the motion frame-cost probe (satoru)
+#include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
+#include "ui_diag.h"   // kurono.uidiag=1 pointer/drag counters (satoru)
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define WM_LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -48,6 +56,22 @@ static const int WM_MIN_MS   = 560;   // 198 ms row stagger + 360 ms pour
 static const int WM_UNMIN_MS = 900;   // 80 ms press + 198 ms stagger + 620 ms spring
 static unsigned short wm_motion_dur(int design_ms);
 static void wm_snap_release(Window* win);
+// spring motion (compositor.motion = spring | classic), see "spring motion"
+// below. helpers are defined with the motion renderers. (satoru)
+static bool wm_spring = true;
+enum { FX_NONE = 0, FX_OPEN = 1, FX_CLOSE = 2, FX_MIN = 3, FX_UNMIN = 4, FX_MORPH = 5 };
+static bool wm_spring_on();
+static void wm_fx_init(Window* w);
+static void wm_fx_old_release(Window* w);
+static void wm_fx_morph(Window* w, int ox, int oy, int ow, int oh, bool old_tb);
+static int  wm_next_focus(const Window* wins, int leaving);
+static unsigned long long wm_now_us();
+static bool wm_anim_on();
+static int  wm_radius(const Window* w);
+static void wm_fx_damage(Window* w, int x0, int y0, int x1, int y1);
+static void wm_tab_thumb_grab(Window* win);
+static void wm_tab_thumb_free_all();
+static void wm_snap_preview_clear();
 
 // Drag throttle. Updated by ReloadFromConfig() from display.refresh_hz.
 // 0 means "no throttle"; otherwise per-frame minimum gap in ms.
@@ -100,9 +124,11 @@ static int  wm_ctx_win_id = -1;       // window the menu acts on
 static int  wm_ctx_x      = 0;        // top-left of the popup
 static int  wm_ctx_y      = 0;
 static unsigned int wm_ctx_open_ms = 0;   // drives the fade+unfold on open (satoru)
-#define WM_CTX_W        180
-#define WM_CTX_ITEM_H    24
-#define WM_CTX_ITEMS      1           // entries: 0 = "Move to other monitor"
+#define WM_CTX_W        210
+#define WM_CTX_ITEM_H    28
+// entries: 0 move to other monitor, 1 full screen, 2 maximize/restore,
+// 3 minimize, 4 close (satoru)
+#define WM_CTX_ITEMS      5
 
 Window WindowManager::windows[WM_MAX_WINDOWS];
 int WindowManager::window_count = 0;
@@ -172,8 +198,59 @@ static inline void wm_damage_window(const Window* w) {
     // (satoru)
     if (!wm_in_fast_render) WindowManager::InvalidateDragBackdrop();
 }
+// multi-monitor work area of output i: output 0 keeps the menu bar / dock
+// reservation (wm_desktop_*), every other output is used whole. with a single
+// output this is exactly wm_desktop_*, so one-screen behaviour is unchanged. (satoru)
+static void wm_area_of(int i, int* ax, int* ay, int* aw, int* ah) {
+    const Output* o = (Outputs::Multi() && i > 0) ? Outputs::Get(i) : nullptr;
+    if (o && o->connected) {
+        *ax = o->x; *ay = o->y; *aw = o->w; *ah = o->h;
+        return;
+    }
+    *ax = wm_desktop_x; *ay = wm_desktop_y; *aw = wm_desktop_w; *ah = wm_desktop_h;
+}
+// work area of the output holding point (px,py), nearest one if it is in a gap.
+static void wm_area_at(int px, int py, int* ax, int* ay, int* aw, int* ah) {
+    int i = 0;
+    if (Outputs::Multi()) {
+        i = Outputs::At(px, py);
+        if (i < 0) i = Outputs::Nearest(px, py);
+    }
+    wm_area_of(i, ax, ay, aw, ah);
+}
+// work area for something new: the output under the cursor.
+static void wm_area_cursor(int* ax, int* ay, int* aw, int* ah) {
+    wm_area_at(Mouse::mx, Mouse::my, ax, ay, aw, ah);
+}
+
 static void wm_clamp_drag_bounds(Window* win) {
     if (!win) return;
+    if (Outputs::Multi()) {
+        // the window may straddle a seam while dragged: clamp to the whole virtual
+        // desktop, then make sure its titlebar centre sits on a live output (not
+        // in the dead zone beside a shorter screen) and below that output's menu
+        // bar. (satoru)
+        int ww = win->w > 0 ? win->w : 1, wh = win->h > 0 ? win->h : 1;
+        int vw = WindowManager::GetScreenWidth(), vh = WindowManager::GetScreenHeight();
+        int max_x = vw - ww, max_y = vh - wh;
+        if (max_x < 0) max_x = 0;
+        if (max_y < 0) max_y = 0;
+        if (win->x < 0) win->x = 0;
+        if (win->x > max_x) win->x = max_x;
+        if (win->y < 0) win->y = 0;
+        if (win->y > max_y) win->y = max_y;
+        int tx = win->x + ww / 2, ty = win->y + 12;
+        int px = tx, py = ty;
+        Outputs::Constrain(&px, &py);
+        win->x += px - tx;
+        win->y += py - ty;
+        int ax, ay, aw, ah;
+        wm_area_at(win->x + ww / 2, win->y + 12, &ax, &ay, &aw, &ah);
+        if (win->y < ay) win->y = ay;
+        int low = ay + ah - (wh < 48 ? wh : 48);
+        if (win->y > low) win->y = low;
+        return;
+    }
     int visible_w = win->w < 96 ? win->w : 96;
     int visible_h = win->has_titlebar ? WM_TITLEBAR_H : 24;
     if (visible_h < 16) visible_h = 16;
@@ -197,8 +274,10 @@ static void wm_clamp_drag_bounds(Window* win) {
 }
 static void wm_clamp_resize_bounds(Window* win) {
     if (!win) return;
-    int max_w = wm_desktop_x + wm_desktop_w - win->x;
-    int max_h = wm_desktop_y + wm_desktop_h - win->y;
+    int rax, ray, raw_, rah;
+    wm_area_at(win->x + win->w / 2, win->y + 12, &rax, &ray, &raw_, &rah);
+    int max_w = rax + raw_ - win->x;
+    int max_h = ray + rah - win->y;
     if (max_w < WM_MIN_WIDTH) max_w = WM_MIN_WIDTH;
     if (max_h < WM_MIN_HEIGHT) max_h = WM_MIN_HEIGHT;
     if (win->w < WM_MIN_WIDTH) win->w = WM_MIN_WIDTH;
@@ -206,6 +285,448 @@ static void wm_clamp_resize_bounds(Window* win) {
     if (win->w > max_w) win->w = max_w;
     if (win->h > max_h) win->h = max_h;
 }
+
+// work area of the output a window lives on (its monitor id, not the pointer
+// position), so maximize and snap follow the window across outputs. (satoru)
+static void wm_window_area(Window* win, int* ax, int* ay, int* aw, int* ah) {
+    int m = win ? win->monitor_id : 0;
+    if (!Outputs::Multi() || m < 0 || m >= OUTPUT_MAX || !Outputs::IsLive(m)) m = 0;
+    wm_area_of(m, ax, ay, aw, ah);
+}
+
+// full rect of output `i` (menu bar and dock included). falls back to the whole
+// virtual desktop when there is no output table. (satoru)
+static void wm_output_rect(int i, int* ox, int* oy, int* ow, int* oh) {
+    if (Outputs::Multi()) {
+        const Output* o = Outputs::Get(i);
+        if (o && o->connected && o->w > 0 && o->h > 0) {
+            *ox = o->x; *oy = o->y; *ow = o->w; *oh = o->h;
+            return;
+        }
+    }
+    *ox = 0; *oy = 0;
+    *ow = WindowManager::GetScreenWidth();
+    *oh = WindowManager::GetScreenHeight();
+}
+
+// target rect of a snap edge inside a work area. (satoru)
+static void wm_snap_rect(int edge, int ax, int ay, int aw, int ah,
+                         int* nx, int* ny, int* nw, int* nh) {
+    int halfw = aw / 2;
+    int halfh = ah / 2;
+    *nx = ax; *ny = ay; *nw = aw; *nh = ah;
+    switch (edge) {
+        case 0: *nx = ax;         *ny = ay;          *nw = halfw;      *nh = ah;          break;
+        case 1: *nx = ax + halfw; *ny = ay;          *nw = aw - halfw; *nh = ah;          break;
+        case 2: break;
+        case 4: *nx = ax;         *ny = ay;          *nw = halfw;      *nh = halfh;       break;
+        case 5: *nx = ax + halfw; *ny = ay;          *nw = aw - halfw; *nh = halfh;       break;
+        case 6: *nx = ax;         *ny = ay + halfh;  *nw = halfw;      *nh = ah - halfh;  break;
+        case 7: *nx = ax + halfw; *ny = ay + halfh;  *nw = aw - halfw; *nh = ah - halfh;  break;
+        default: break;
+    }
+    if (*nw < WM_MIN_WIDTH)  *nw = WM_MIN_WIDTH;
+    if (*nh < WM_MIN_HEIGHT) *nh = WM_MIN_HEIGHT;
+}
+
+// which snap region the window's current rect matches, or -1. (satoru)
+static int wm_snap_edge_current(const Window* win, int ax, int ay, int aw, int ah) {
+    if (!win) return -1;
+    int nx, ny, nw, nh;
+    for (int e = 0; e <= 7; e++) {
+        if (e == 3) continue;
+        wm_snap_rect(e, ax, ay, aw, ah, &nx, &ny, &nw, &nh);
+        if (win->x == nx && win->y == ny && win->w == nw && win->h == nh) return e;
+    }
+    return -1;
+}
+
+// edge under a dragged pointer, inside the output it points at. quarters win
+// over a single edge when the pointer is in a corner. (satoru)
+static int wm_snap_edge_at(int mx, int my, int* ax, int* ay, int* aw, int* ah) {
+    int oi = 0;
+    if (Outputs::Multi()) {
+        oi = Outputs::At(mx, my);
+        if (oi < 0) oi = Outputs::Nearest(mx, my);
+    }
+    wm_area_of(oi, ax, ay, aw, ah);
+    int ox, oy, ow, oh;
+    wm_output_rect(oi, &ox, &oy, &ow, &oh);
+    const int EDGE = 14;
+    bool left   = mx <= ox + EDGE;
+    bool right  = mx >= ox + ow - 1 - EDGE;
+    bool top    = my <= oy + EDGE;
+    bool bottom = my >= oy + oh - 1 - EDGE;
+    if (top && left)     return 4;
+    if (top && right)    return 5;
+    if (bottom && left)  return 6;
+    if (bottom && right) return 7;
+    if (top)    return 2;
+    if (left)   return 0;
+    if (right)  return 1;
+    return -1;
+}
+
+// ── per-app window geometry memory ───────────────────────────────────
+// a small side table keyed by a normalized app name (or "app:<icon>" once a
+// client reports a stable id), persisted to /etc/kurono/wm_geometry.conf. the
+// window struct is not enlarged for this. (satoru)
+#define WM_GEOM_MAX 32
+#define WM_GEOM_KEY 40
+struct WMGeomEntry {
+    char key[WM_GEOM_KEY];
+    int x, y, w, h;
+    bool used;
+};
+static WMGeomEntry wm_geoms[WM_GEOM_MAX];
+static char        wm_win_key[WM_MAX_WINDOWS][WM_GEOM_KEY];
+static bool        wm_geom_loaded = false;
+static bool        wm_geom_dirty = false;
+static unsigned int wm_geom_saved_ms = 0;
+static const char* wm_geom_path = "/etc/kurono/wm_geometry.conf";
+
+static void wm_geom_key_norm(const char* s, char* out, int max) {
+    int n = 0;
+    if (!s) s = "";
+    while (*s && n < max - 1) {
+        char c = *s++;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        bool keep = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                    c == '.' || c == '-' || c == '_';
+        if (!keep) {
+            if (c == ' ' || c == '/' || c == '\\' || c == ':' || c == '(' ||
+                c == ')' || c == '[' || c == ']') {
+                if (n > 0 && out[n - 1] != '_') out[n++] = '_';
+            }
+            continue;
+        }
+        out[n++] = c;
+    }
+    while (n > 0 && out[n - 1] == '_') n--;
+    if (n == 0) {
+        const char* d = "window";
+        for (int i = 0; d[i] && n < max - 1; i++) out[n++] = d[i];
+    }
+    out[n] = 0;
+}
+
+static void wm_geom_key_icon(int icon, char* out, int max) {
+    const char* pfx = "app:";
+    int n = 0;
+    for (int i = 0; pfx[i] && n < max - 1; i++) out[n++] = pfx[i];
+    char rev[12]; int r = 0;
+    int v = icon;
+    if (v < 0) v = 0;
+    if (v == 0) rev[r++] = '0';
+    while (v > 0 && r < 11) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+    while (r > 0 && n < max - 1) out[n++] = rev[--r];
+    out[n] = 0;
+}
+
+static bool wm_geom_streq(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) { if (*a != *b) return false; a++; b++; }
+    return *a == 0 && *b == 0;
+}
+
+static int wm_geom_find(const char* key) {
+    if (!key || !key[0]) return -1;
+    for (int i = 0; i < WM_GEOM_MAX; i++) {
+        if (wm_geoms[i].used && wm_geom_streq(wm_geoms[i].key, key)) return i;
+    }
+    return -1;
+}
+
+static void wm_geom_store(const char* key, int x, int y, int w, int h) {
+    if (!key || !key[0]) return;
+    if (w < WM_MIN_WIDTH)  w = WM_MIN_WIDTH;
+    if (h < WM_MIN_HEIGHT) h = WM_MIN_HEIGHT;
+    int idx = wm_geom_find(key);
+    if (idx < 0) {
+        for (int i = 0; i < WM_GEOM_MAX; i++) {
+            if (!wm_geoms[i].used) { idx = i; wm_geoms[i].used = true; break; }
+        }
+    }
+    if (idx < 0) return;
+    WMGeomEntry& e = wm_geoms[idx];
+    if (e.used && e.x == x && e.y == y && e.w == w && e.h == h) return;
+    int kn = 0;
+    while (key[kn] && kn < WM_GEOM_KEY - 1) { e.key[kn] = key[kn]; kn++; }
+    e.key[kn] = 0;
+    e.x = x; e.y = y; e.w = w; e.h = h;
+    e.used = true;
+    wm_geom_dirty = true;
+}
+
+static int wm_geom_read_int(const char* b, int& i, int n) {
+    while (i < n && (b[i] == ' ' || b[i] == '\t')) i++;
+    bool neg = false;
+    if (i < n && (b[i] == '-' || b[i] == '+')) { neg = b[i] == '-'; i++; }
+    int v = 0;
+    while (i < n && b[i] >= '0' && b[i] <= '9') { v = v * 10 + (b[i] - '0'); i++; }
+    return neg ? -v : v;
+}
+
+static void wm_geom_load() {
+    if (wm_geom_loaded) return;
+    wm_geom_loaded = true;
+    static char buf[4096];
+    int n = KVFS::ReadFile(wm_geom_path, buf, (uint32_t)sizeof(buf) - 1);
+    if (n <= 0) return;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    buf[n] = 0;
+    int i = 0;
+    while (i < n) {
+        while (i < n && (buf[i] == '\r' || buf[i] == '\n' || buf[i] == ' ' || buf[i] == '\t')) i++;
+        if (i >= n) break;
+        if (buf[i] == '#') { while (i < n && buf[i] != '\n') i++; continue; }
+        char key[WM_GEOM_KEY]; int k = 0;
+        while (i < n && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\r' && buf[i] != '\n' &&
+               k < WM_GEOM_KEY - 1) key[k++] = buf[i++];
+        key[k] = 0;
+        int x = wm_geom_read_int(buf, i, n);
+        int y = wm_geom_read_int(buf, i, n);
+        int w = wm_geom_read_int(buf, i, n);
+        int h = wm_geom_read_int(buf, i, n);
+        if (k > 0 && w >= WM_MIN_WIDTH && h >= WM_MIN_HEIGHT && w < 100000 && h < 100000)
+            wm_geom_store(key, x, y, w, h);
+        while (i < n && buf[i] != '\n') i++;
+    }
+    wm_geom_dirty = false;
+}
+
+static void wm_geom_append_int(char*& p, char* end, int v) {
+    if (p >= end - 1) return;
+    if (v < 0) { *p++ = '-'; v = -v; }
+    char rev[12]; int r = 0;
+    if (v == 0) rev[r++] = '0';
+    while (v > 0 && r < 11) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+    while (r > 0 && p < end - 1) *p++ = rev[--r];
+    *p = 0;
+}
+
+static void wm_geom_save() {
+    static char out[4096];
+    char* p = out;
+    char* end = out + sizeof(out);
+    const char* hdr = "# kurono window geometry: key x y w h\n";
+    for (int i = 0; hdr[i] && p < end - 1; i++) *p++ = hdr[i];
+    *p = 0;
+    for (int i = 0; i < WM_GEOM_MAX; i++) {
+        if (!wm_geoms[i].used) continue;
+        const char* k = wm_geoms[i].key;
+        while (*k && p < end - 2) *p++ = *k++;
+        if (p < end - 1) *p++ = ' ';
+        wm_geom_append_int(p, end, wm_geoms[i].x);
+        if (p < end - 1) *p++ = ' ';
+        wm_geom_append_int(p, end, wm_geoms[i].y);
+        if (p < end - 1) *p++ = ' ';
+        wm_geom_append_int(p, end, wm_geoms[i].w);
+        if (p < end - 1) *p++ = ' ';
+        wm_geom_append_int(p, end, wm_geoms[i].h);
+        if (p < end - 1) *p++ = '\n';
+    }
+    *p = 0;
+    KVFS::WriteString(wm_geom_path, out);
+    wm_geom_dirty = false;
+    wm_geom_saved_ms = Timer::GetRealMs();
+}
+
+static void wm_geom_flush(unsigned int now) {
+    if (!wm_geom_dirty) return;
+    if (wm_geom_saved_ms && now - wm_geom_saved_ms < 1500u) return;
+    wm_geom_save();
+}
+
+// remember the window's normal (pre-snap / pre-maximize) rect so the next
+// launch of the same app opens there. (satoru)
+static void wm_geom_remember(Window* win, bool use_current = false) {
+    if (!win) return;
+    int slot = (int)(win - WindowManager::GetWindows());
+    if (slot < 0 || slot >= WM_MAX_WINDOWS || !wm_win_key[slot][0]) return;
+    int x = win->x, y = win->y, w = win->w, h = win->h;
+    if (use_current) {
+        // a drag or resize that left a snap keeps its new free rect. (satoru)
+    } else if (win->state == WIN_FULLSCREEN) {
+        x = win->fs_x; y = win->fs_y; w = win->fs_w; h = win->fs_h;
+    } else if (win->state == WIN_MAXIMIZED) {
+        x = win->saved_x; y = win->saved_y; w = win->saved_w; h = win->saved_h;
+    } else if (win->snap_saved) {
+        x = win->snap_saved_x; y = win->snap_saved_y;
+        w = win->snap_saved_w; h = win->snap_saved_h;
+    }
+    if (w < WM_MIN_WIDTH || h < WM_MIN_HEIGHT || w > 100000 || h > 100000) return;
+    wm_geom_store(wm_win_key[slot], x, y, w, h);
+}
+
+// apply a saved rect, clamped to the work area of its own center. used at
+// create time and when a wayland app id arrives before the first frame. (satoru)
+bool WindowManager::ApplySavedGeometry(Window* win, const char* key) {
+    if (!win || !key) return false;
+    int idx = wm_geom_find(key);
+    if (idx < 0) return false;
+    int x = wm_geoms[idx].x, y = wm_geoms[idx].y;
+    int w = wm_geoms[idx].w, h = wm_geoms[idx].h;
+    int ax, ay, aw, ah;
+    wm_area_at(x + w / 2, y + h / 2, &ax, &ay, &aw, &ah);
+    if (w > aw) w = aw;
+    if (h > ah) h = ah;
+    if (w < WM_MIN_WIDTH)  w = WM_MIN_WIDTH;
+    if (h < WM_MIN_HEIGHT) h = WM_MIN_HEIGHT;
+    if (x < ax) x = ax;
+    if (y < ay) y = ay;
+    if (x + w > ax + aw) x = ax + aw - w;
+    if (y + h > ay + ah) y = ay + ah - h;
+    wm_damage_window(win);
+    win->x = x; win->y = y; win->w = w; win->h = h;
+    win->saved_x = x; win->saved_y = y; win->saved_w = w; win->saved_h = h;
+    if (!win->snap_saved) {
+        win->snap_saved_x = x; win->snap_saved_y = y;
+        win->snap_saved_w = w; win->snap_saved_h = h;
+    }
+    WindowManager::UpdateContentArea(win);
+    WindowManager::UpdateWindowMonitor(win);
+    win->dirty = true;
+    wm_damage(win->x, win->y, win->w, win->h);
+    return true;
+}
+
+// ── alt-tab live thumbnails ──────────────────────────────────────────
+// one downscaled argb buffer per window, refreshed while the switcher is up.
+// grabs happen right after a window is composited, before any window above it
+// is drawn, so a covered window still gets a clean thumbnail. (satoru)
+struct WMTabThumb {
+    uint32_t* px;
+    int w, h;
+    int id;
+    bool valid;
+};
+static WMTabThumb wm_tab_thumbs[WM_MAX_WINDOWS];
+static bool wm_tab_open = false;
+static int  wm_tab_ids[WM_MAX_WINDOWS];
+static int  wm_tab_count = 0;
+static int  wm_tab_sel = 0;
+static int  wm_tab_monitor = 0;
+static unsigned int wm_tab_open_ms = 0;
+static unsigned int wm_tab_sel_ms = 0;
+static int  wm_tab_ax = 0, wm_tab_ay = 0, wm_tab_aw = 0, wm_tab_ah = 0;
+
+static void wm_tab_thumb_free_all() {
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        if (wm_tab_thumbs[i].px) KernelHeap::Free(wm_tab_thumbs[i].px);
+        wm_tab_thumbs[i].px = nullptr;
+        wm_tab_thumbs[i].w = wm_tab_thumbs[i].h = 0;
+        wm_tab_thumbs[i].id = -1;
+        wm_tab_thumbs[i].valid = false;
+    }
+}
+
+static void wm_tab_thumb_forget() {
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        wm_tab_thumbs[i].id = -1;
+        wm_tab_thumbs[i].valid = false;
+    }
+}
+
+static void wm_tab_thumb_grab(Window* win) {
+    if (!wm_tab_open || !win) return;
+    if (win->state == WIN_CLOSED || win->state == WIN_MINIMIZED || !win->visible) return;
+    if (win->fx_mode != FX_NONE) return;   // mid-motion, keep the last clean grab (satoru)
+    int slot = (int)(win - WindowManager::GetWindows());
+    if (slot < 0 || slot >= WM_MAX_WINDOWS || win->w <= 0 || win->h <= 0) return;
+    if (Graphics::GetBpp() != 32 || !Graphics::GetBuffer()) return;
+
+    const int maxw = 256, maxh = 160;
+    int tw, th;
+    if ((long long)win->w * maxh >= (long long)win->h * maxw) {
+        tw = maxw;
+        th = (int)(((long long)win->h * maxw) / win->w);
+    } else {
+        th = maxh;
+        tw = (int)(((long long)win->w * maxh) / win->h);
+    }
+    if (tw < 8) tw = 8;
+    if (th < 8) th = 8;
+    WMTabThumb& t = wm_tab_thumbs[slot];
+    if (t.w != tw || t.h != th || !t.px) {
+        if (t.px) KernelHeap::Free(t.px);
+        t.px = (uint32_t*)KernelHeap::Alloc((size_t)tw * (size_t)th * 4u);
+        t.w = t.px ? tw : 0;
+        t.h = t.px ? th : 0;
+        t.valid = false;
+    }
+    if (!t.px) return;
+    uint32_t* src = (uint32_t*)Graphics::GetBuffer();
+    int pitch = (int)(Graphics::GetPitch() / 4u);
+    int scrw = Graphics::GetWidth(), scrh = Graphics::GetHeight();
+    uint32_t* dst = t.px;
+    for (int j = 0; j < th; j++) {
+        int sy = win->y + (int)(((long long)j * win->h) / th);
+        uint32_t* row = dst + (size_t)j * (size_t)tw;
+        for (int i = 0; i < tw; i++) {
+            int sx = win->x + (int)(((long long)i * win->w) / tw);
+            row[i] = ((unsigned)sx < (unsigned)scrw && (unsigned)sy < (unsigned)scrh)
+                     ? (src[(size_t)sy * pitch + sx] | 0xFF000000u) : 0xFF101018u;
+        }
+    }
+    t.id = win->id;
+    t.valid = true;
+}
+
+static int wm_tab_gather(int* ids) {
+    int n = 0;
+    Window* ws = WindowManager::GetWindows();
+    for (int i = 0; i < WM_MAX_WINDOWS && n < 16; i++) {
+        if (ws[i].state == WIN_CLOSED) continue;
+        ids[n++] = ws[i].id;
+    }
+    for (int i = 1; i < n; i++) {
+        int id = ids[i];
+        Window* w = WindowManager::GetWindow(id);
+        int z = w ? w->z_order : -1;
+        int j = i - 1;
+        while (j >= 0) {
+            Window* o = WindowManager::GetWindow(ids[j]);
+            int oz = o ? o->z_order : -1;
+            if (oz >= z) break;
+            ids[j + 1] = ids[j];
+            j--;
+        }
+        ids[j + 1] = id;
+    }
+    return n;
+}
+
+static int wm_tab_index_of(const int* ids, int n, int id) {
+    for (int i = 0; i < n; i++) if (ids[i] == id) return i;
+    return -1;
+}
+
+static void wm_tab_fit_text(const char* src, float pxh, int maxw, char* out, int maxn) {
+    if (!src) src = "";
+    int n = 0;
+    while (src[n] && n < maxn - 1) { out[n] = src[n]; n++; }
+    out[n] = 0;
+    if (FontTTF::MeasureText(pxh, out, false) <= maxw) return;
+    while (n > 0) {
+        out[n--] = 0;
+        if (n > 3) {
+            out[n] = 0;
+            if (FontTTF::MeasureText(pxh, out, false) + 18 <= maxw) break;
+        }
+    }
+    if (n > maxn - 4) n = maxn - 4;
+    if (n < 0) n = 0;
+    out[n++] = '.';
+    out[n++] = '.';
+    out[n++] = '.';
+    out[n] = 0;
+}
+
+// ── show-desktop state ───────────────────────────────────────────────
+static bool wm_show_desktop = false;
+static unsigned int wm_sd_mask = 0;
+static int wm_sd_focus = -1;
 
 // kurono ui color scheme - modern glassmorphism
 // Static fallbacks used when UIConfig is not yet available.
@@ -250,6 +771,8 @@ void WindowManager::Init(int sw, int sh) {
         windows[i].anim_kind = 0;
         windows[i].snap_px = nullptr;
         windows[i].catch_kind = 0;
+        windows[i].fx_old_px = nullptr;
+        wm_fx_init(&windows[i]);
         windows[i].had_last = false;
         windows[i].visible = false;
         windows[i].focused = false;
@@ -262,6 +785,19 @@ void WindowManager::Init(int sw, int sh) {
     // reset drag-snapshot state; the buffer (if any) is re-sized on next use
     // via its geometry check, so we just drop readiness here. (satoru)
     InvalidateDragBackdrop();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) wm_win_key[i][0] = 0;
+    wm_tab_open = false;
+    wm_tab_count = 0;
+    wm_tab_sel = 0;
+    wm_tab_monitor = 0;
+    wm_tab_thumb_free_all();
+    wm_snap_preview_clear();
+    wm_show_desktop = false;
+    wm_sd_mask = 0;
+    wm_sd_focus = -1;
+    wm_geom_dirty = false;
+    wm_geom_saved_ms = 0;
+    wm_geom_load();
 
     SerialLogger::Log("WindowManager: Initialized\r\n");
 }
@@ -277,17 +813,39 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     Window* win = &windows[slot];
     win->id = next_id++;
     if (next_id < 1) next_id = 1;     // wrap guard
+    TaskMem::BindWindow(win->id);   // a window opened inside an app scope belongs to that app (satoru)
     wmcpy(win->title, title, 64);
     if (w < WM_MIN_WIDTH)  w = WM_MIN_WIDTH;
     if (h < WM_MIN_HEIGHT) h = WM_MIN_HEIGHT;
-    if (w > screen_width)   w = screen_width;
-    if (h > wm_desktop_h)   h = wm_desktop_h;
-    if (x < 0) x = wm_desktop_x + (wm_desktop_w - w) / 2;
-    if (y < 0) y = wm_desktop_y + (wm_desktop_h - h) / 2;
-    if (x < wm_desktop_x) x = wm_desktop_x;
-    if (y < wm_desktop_y) y = wm_desktop_y;
-    if (x + w > wm_desktop_x + wm_desktop_w) x = wm_desktop_x + wm_desktop_w - w;
-    if (y + h > wm_desktop_y + wm_desktop_h) y = wm_desktop_y + wm_desktop_h - h;
+    // a window that asked to be centred remembers its app's last position. a
+    // dialog or explicitly placed window keeps the caller's rect. (satoru)
+    wm_geom_key_norm(title, wm_win_key[slot], WM_GEOM_KEY);
+    bool restored = false;
+    if (x < 0 && y < 0) {
+        int gi = wm_geom_find(wm_win_key[slot]);
+        if (gi >= 0) {
+            x = wm_geoms[gi].x; y = wm_geoms[gi].y;
+            w = wm_geoms[gi].w; h = wm_geoms[gi].h;
+            restored = true;
+        }
+    }
+    // new windows open on the output under the cursor (the primary's work area
+    // on a single screen). (satoru)
+    int nax, nay, naw, nah;
+    if (restored) wm_area_at(x + w / 2, y + h / 2, &nax, &nay, &naw, &nah);
+    else          wm_area_cursor(&nax, &nay, &naw, &nah);
+    if (w > naw)   w = naw;
+    if (h > nah)   h = nah;
+    if (w < WM_MIN_WIDTH)  w = WM_MIN_WIDTH;
+    if (h < WM_MIN_HEIGHT) h = WM_MIN_HEIGHT;
+    if (!restored) {
+        if (x < 0) x = nax + (naw - w) / 2;
+        if (y < 0) y = nay + (nah - h) / 2;
+    }
+    if (x < nax) x = nax;
+    if (y < nay) y = nay;
+    if (x + w > nax + naw) x = nax + naw - w;
+    if (y + h > nay + nah) y = nay + nah - h;
     win->x = x; win->y = y;
     win->w = w; win->h = h;
     win->saved_x = x; win->saved_y = y;
@@ -330,6 +888,22 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
     win->had_last = false;
     win->monitor_id = 0;
     win->app_icon = -1;               // derive from title unless pinned (satoru)
+    win->fs_prev_state = WIN_NORMAL;
+    win->fs_prev_tb = true;
+    win->fs_x = x; win->fs_y = y; win->fs_w = w; win->fs_h = h;
+    wm_fx_old_release(win);
+    wm_fx_init(win);
+    if (wm_spring && win->anim_kind == 1) {
+        // spring open: rise out of a slightly smaller, transparent copy of
+        // itself, drawn from a capture taken on its first frame. (satoru)
+        win->anim_kind = 0;
+        win->fx_mode = FX_OPEN;
+        win->fx_cap = true;
+        WMMotion::SpringSet(win->fx_sc, 0.90f); win->fx_sc.t = 1.0f;
+        WMMotion::SpringSet(win->fx_op, 0.0f);  win->fx_op.t = 1.0f;
+        WMMotion::SpringSet(win->fx_el, 1.0f);
+        win->fx_us = wm_now_us();
+    }
 
     UpdateContentArea(win);
     UpdateWindowMonitor(win);   // assign to the output under its center (satoru)
@@ -344,6 +918,31 @@ Window* WindowManager::CreateWindow(const char* title, int x, int y, int w, int 
 void WindowManager::CloseWindow(int id) {
     Window* win = GetWindow(id);
     if (!win) return;
+    int slot = (int)(win - windows);
+    if (slot >= 0 && slot < WM_MAX_WINDOWS) wm_sd_mask &= ~(1u << slot);
+    if (wm_spring && wm_anim_on()) {
+        if (win->fx_mode == FX_CLOSE) return;
+        // spring close: shrink a little and fade from a capture. the window
+        // stops taking input and hands focus on at once. (satoru)
+        if (win->fx_mode == FX_MIN || win->fx_mode == FX_UNMIN || !win->snap_px) win->fx_cap = true;
+        if (win->fx_mode == FX_MORPH) win->fx_cap = true;
+        win->fx_mode = FX_CLOSE;
+        win->anim_kind = 2;
+        win->anim_duration_ms = 0;
+        win->fx_sc.t = 0.92f;
+        win->fx_op.t = 0.0f;
+        if (!win->fx_us) win->fx_us = wm_now_us();
+        if (focused_id == id) {
+            win->focused = false;
+            focused_id = -1;
+            int nf = wm_next_focus(windows, id);
+            if (nf > 0) Focus(nf);
+        }
+        if (wm_input_capture_id == id) wm_input_capture_id = -1;
+        if (action_window_id == id) { action_window_id = -1; current_action = WM_NONE; }
+        Graphics::MarkUIDirty();
+        return;
+    }
     // Defer the actual transition to CLOSED until the close animation
     // finishes; TickAnimations() will retire the window then.  Skip
     // the defer if animations are off, otherwise the user sees no
@@ -377,12 +976,28 @@ void WindowManager::CloseAll() {
             windows[i].had_last = false;
             windows[i].anim_kind = 0;
             wm_snap_release(&windows[i]);
+            wm_fx_old_release(&windows[i]);
+            windows[i].fx_mode = 0;
         }
     }
     focused_id = -1;
     wm_input_capture_id = -1;
     action_window_id = -1;
     current_action = WM_NONE;
+    wm_tab_open = false;
+    wm_tab_thumb_free_all();
+    wm_snap_preview_clear();
+    wm_show_desktop = false;
+    wm_sd_mask = 0;
+    wm_sd_focus = -1;
+}
+
+// a close the USER asked for (titlebar button, window menu): a wayland window
+// asks its client first (xdg_toplevel.close) and goes when the client does - an
+// app closed only on the wm side kept running windowless. (satoru)
+void WindowManager::UserCloseWindow(int id) {
+    if (WaylandServer::RequestClose(id)) return;
+    CloseWindow(id);
 }
 
 void WindowManager::DestroyWindow(int id) {
@@ -404,6 +1019,34 @@ Window* WindowManager::GetFocusedWindow() {
 void WindowManager::Minimize(int id) {
     Window* win = GetWindow(id);
     if (!win) return;
+    if (wm_spring && wm_anim_on()) {
+        if (win->state == WIN_MINIMIZED || win->fx_mode == FX_MIN || win->fx_mode == FX_CLOSE) return;
+        // spring minimize: the genie drains the window into its dock tile.
+        // a restore mid-flight just retargets the same spring. (satoru)
+        if (win->fx_mode != FX_UNMIN || !win->snap_px) win->fx_cap = true;
+        if (win->fx_mode == FX_OPEN || win->fx_mode == FX_MORPH || win->fx_mode == FX_NONE) {
+            WMMotion::SpringSet(win->fx_gn, 0.0f);
+            WMMotion::SpringSet(win->fx_sc, 1.0f);
+            WMMotion::SpringSet(win->fx_op, 1.0f);
+        }
+        win->fx_rect = false;
+        wm_fx_old_release(win);
+        win->fx_mode = FX_MIN;
+        win->fx_gn.t = 1.0f;
+        win->fx_caught = false;
+        win->anim_kind = 3;
+        win->anim_duration_ms = 0;
+        if (!win->fx_us) win->fx_us = wm_now_us();
+        if (focused_id == id) {
+            win->focused = false;
+            focused_id = -1;
+            int nf = wm_next_focus(windows, id);
+            if (nf > 0) Focus(nf);
+        }
+        if (action_window_id == id) { action_window_id = -1; current_action = WM_NONE; }
+        wm_damage_window(win);
+        return;
+    }
     if (comp_animations_enabled && !comp_reduced_motion &&
         comp_anim_duration_ms > 0 && win->anim_kind != 3) {
         // defer hide until the pour into the taskbar tile completes; the tile
@@ -425,8 +1068,38 @@ void WindowManager::Minimize(int id) {
 void WindowManager::Unminimize(int id) {
     Window* win = GetWindow(id);
     if (!win) return;
+    if (wm_show_desktop) {
+        int slot = (int)(win - windows);
+        if (slot >= 0 && slot < WM_MAX_WINDOWS) wm_sd_mask &= ~(1u << slot);
+    }
     bool animate = comp_animations_enabled && !comp_reduced_motion && comp_anim_duration_ms > 0;
     unsigned int now = Timer::GetRealMs();
+    if (wm_spring && animate) {
+        // spring restore: the genie runs backwards from wherever it is. (satoru)
+        bool was_min = win->state == WIN_MINIMIZED;
+        win->state   = WIN_NORMAL;
+        win->visible = true;
+        win->dirty   = true;
+        win->had_last = false;
+        if (was_min) {
+            WMMotion::SpringSet(win->fx_gn, 1.0f);
+            if (!win->snap_px) win->fx_cap = true;
+        } else if (win->fx_mode != FX_MIN && win->fx_mode != FX_UNMIN) {
+            return;   // not minimized, nothing to restore (satoru)
+        }
+        win->fx_mode = FX_UNMIN;
+        win->fx_gn.t = 0.0f;
+        win->fx_rect = false;
+        win->anim_kind = 5;
+        win->anim_duration_ms = 0;
+        win->catch_kind = 2;
+        win->catch_ms = now;
+        if (!win->fx_us) win->fx_us = wm_now_us();
+        UpdateContentArea(win);
+        Focus(id);
+        wm_damage_window(win);
+        return;
+    }
     win->state   = WIN_NORMAL;
     win->visible = true;
     win->dirty   = true;
@@ -459,35 +1132,53 @@ void WindowManager::Maximize(int id) {
         win->saved_x = win->x; win->saved_y = win->y;
         win->saved_w = win->w; win->saved_h = win->h;
     }
+    const int mox = win->x, moy = win->y, mow = win->w, moh = win->h;   // morph origin (satoru)
     wm_damage_window(win);
-    win->x = 0; win->y = GetDesktopY();
-    win->w = screen_width; win->h = GetDesktopH();
+    // maximize on the output the window is on (work area of that output).
+    // the monitor id, not the titlebar point, decides, so a window straddling
+    // a seam still fills the screen it belongs to. (satoru)
+    int max_ax, max_ay, max_aw, max_ah;
+    wm_window_area(win, &max_ax, &max_ay, &max_aw, &max_ah);
+    win->x = max_ax; win->y = max_ay;
+    win->w = max_aw; win->h = max_ah;
     win->state = WIN_MAXIMIZED;
     win->visible = true;
     win->dirty = true;
     UpdateContentArea(win);
     wm_damage(win->x, win->y, win->w, win->h);
+    wm_geom_remember(win);
+    wm_fx_morph(win, mox, moy, mow, moh, win->has_titlebar);
 }
 
 void WindowManager::Restore(int id) {
     Window* win = GetWindow(id);
     if (!win) return;
+    const int mox = win->x, moy = win->y, mow = win->w, moh = win->h;   // morph origin (satoru)
     wm_damage_window(win);
     int rx = win->saved_x, ry = win->saved_y;
     int rw = win->saved_w, rh = win->saved_h;
     if (rw < WM_MIN_WIDTH)  rw = WM_MIN_WIDTH;
     if (rh < WM_MIN_HEIGHT) rh = WM_MIN_HEIGHT;
-    if (rw > screen_width)  rw = screen_width;
-    if (rh > wm_desktop_h)  rh = wm_desktop_h;
-    if (rx < wm_desktop_x) rx = wm_desktop_x;
-    if (ry < wm_desktop_y) ry = wm_desktop_y;
-    if (rx + rw > wm_desktop_x + wm_desktop_w) rx = wm_desktop_x + wm_desktop_w - rw;
-    if (ry + rh > wm_desktop_y + wm_desktop_h) ry = wm_desktop_y + wm_desktop_h - rh;
+    int rax, ray, raw_, rah;
+    wm_window_area(win, &rax, &ray, &raw_, &rah);   // restore on the output it is on (satoru)
+    if (rw > raw_)  rw = raw_;
+    if (rh > rah)   rh = rah;
+    if (rx < rax) rx = rax;
+    if (ry < ray) ry = ray;
+    if (rx + rw > rax + raw_) rx = rax + raw_ - rw;
+    if (ry + rh > ray + rah) ry = ray + rah - rh;
     win->x = rx; win->y = ry;
     win->w = rw; win->h = rh;
     win->state = WIN_NORMAL;
     win->visible = true;
     win->dirty = true;
+    wm_geom_remember(win);
+    if (wm_spring) {
+        UpdateContentArea(win);
+        wm_damage(win->x, win->y, win->w, win->h);
+        wm_fx_morph(win, mox, moy, mow, moh, win->has_titlebar);
+        return;
+    }
     if (comp_animations_enabled && !comp_reduced_motion &&
         comp_anim_duration_ms > 0) {
         win->anim_kind        = 4;            // restore
@@ -501,28 +1192,60 @@ void WindowManager::Restore(int id) {
 void WindowManager::ToggleMaximize(int id) {
     Window* win = GetWindow(id);
     if (!win) return;
+    if (win->state == WIN_FULLSCREEN) { ToggleFullscreen(id); return; }
     if (win->state == WIN_MAXIMIZED) Restore(id);
     else Maximize(id);
 }
 
-// snap a window to a region of the desktop. reuses the same desktop bounds
-// the maximize path uses (x=0, y=GetDesktopY(), w=screen_width,
-// h=GetDesktopH()) so snapping never overlaps the taskbar. (satoru)
-void WindowManager::SnapWindow(int win_id, int edge) {
-    Window* win = GetWindow(win_id);
-    if (!win) return;
+void WindowManager::ToggleFullscreen(int id) {
+    Window* win = GetWindow(id);
+    if (!win || win->state == WIN_MINIMIZED) return;
+    const int ox = win->x, oy = win->y, ow = win->w, oh = win->h;
+    const bool otb = win->has_titlebar;
+    wm_damage_window(win);
+    if (win->state != WIN_FULLSCREEN) {
+        win->fs_x = win->x; win->fs_y = win->y; win->fs_w = win->w; win->fs_h = win->h;
+        win->fs_prev_state = (unsigned char)win->state;
+        win->fs_prev_tb = win->has_titlebar;
+        // the whole output the window is on, over the menu bar and the dock (satoru)
+        int mx = 0, my = 0, mw = screen_width, mh = screen_height;
+        int oi = win->monitor_id;
+        if (!Outputs::Multi() || oi < 0 || oi >= OUTPUT_MAX || !Outputs::IsLive(oi)) oi = 0;
+        wm_output_rect(oi, &mx, &my, &mw, &mh);
+        win->x = mx; win->y = my; win->w = mw; win->h = mh;
+        win->has_titlebar = false;
+        win->state = WIN_FULLSCREEN;
+    } else {
+        win->x = win->fs_x; win->y = win->fs_y; win->w = win->fs_w; win->h = win->fs_h;
+        win->has_titlebar = win->fs_prev_tb;
+        win->state = win->fs_prev_state == WIN_MAXIMIZED ? WIN_MAXIMIZED : WIN_NORMAL;
+    }
+    win->visible = true;
+    win->dirty = true;
+    UpdateContentArea(win);
+    UpdateWindowMonitor(win);
+    wm_damage(win->x, win->y, win->w, win->h);
+    wm_geom_remember(win);
+    wm_fx_morph(win, ox, oy, ow, oh, otb);
+}
 
-    // desktop rect - same area maximize occupies. (satoru)
-    int dx = 0;
-    int dy = GetDesktopY();
-    int dw = screen_width;
-    int dh = GetDesktopH();
+void WindowManager::AnimateGeometry(int id, int ox, int oy, int ow, int oh, bool old_titlebar) {
+    Window* win = GetWindow(id);
+    if (!win) return;
+    wm_fx_morph(win, ox, oy, ow, oh, old_titlebar);
+}
+
+// apply a snap edge inside an explicit work area. used by the keyboard path
+// and by drag release, which snaps into the output under the pointer. (satoru)
+void WindowManager::ApplySnap(Window* win, int edge, int dx, int dy, int dw, int dh) {
+    if (!win) return;
     if (dw < WM_MIN_WIDTH)  dw = WM_MIN_WIDTH;
     if (dh < WM_MIN_HEIGHT) dh = WM_MIN_HEIGHT;
 
     // edge 3 = restore the pre-snap rect, then clear the snap save. (satoru)
     if (edge == 3) {
         if (!win->snap_saved) return;
+        const int sox = win->x, soy = win->y, sow = win->w, soh = win->h;   // morph origin (satoru)
         wm_damage_window(win);
         int rx = win->snap_saved_x, ry = win->snap_saved_y;
         int rw = win->snap_saved_w, rh = win->snap_saved_h;
@@ -543,36 +1266,32 @@ void WindowManager::SnapWindow(int win_id, int edge) {
         UpdateContentArea(win);
         UpdateWindowMonitor(win);
         wm_damage(win->x, win->y, win->w, win->h);
+        wm_geom_remember(win);
+        wm_fx_morph(win, sox, soy, sow, soh, win->has_titlebar);
         return;
     }
 
-    // save the pre-snap rect once, before the first snap of a run. only
-    // capture from a non-snapped / normal window so repeated snaps don't
-    // overwrite the original geometry. (satoru)
-    if (!win->snap_saved && win->state != WIN_MAXIMIZED) {
-        win->snap_saved_x = win->x; win->snap_saved_y = win->y;
-        win->snap_saved_w = win->w; win->snap_saved_h = win->h;
+    // save the pre-snap rect once, before the first snap of a run. a maximized
+    // or full screen window falls back to its own restore rect so super+down
+    // still finds the normal size. (satoru)
+    if (!win->snap_saved) {
+        if (win->state == WIN_MAXIMIZED) {
+            win->snap_saved_x = win->saved_x; win->snap_saved_y = win->saved_y;
+            win->snap_saved_w = win->saved_w; win->snap_saved_h = win->saved_h;
+        } else if (win->state == WIN_FULLSCREEN) {
+            win->snap_saved_x = win->fs_x; win->snap_saved_y = win->fs_y;
+            win->snap_saved_w = win->fs_w; win->snap_saved_h = win->fs_h;
+        } else {
+            win->snap_saved_x = win->x; win->snap_saved_y = win->y;
+            win->snap_saved_w = win->w; win->snap_saved_h = win->h;
+        }
         win->snap_saved = true;
     }
 
-    int halfw = dw / 2;
-    int halfh = dh / 2;
-    int nx = dx, ny = dy, nw = dw, nh = dh;
+    int nx, ny, nw, nh;
+    wm_snap_rect(edge, dx, dy, dw, dh, &nx, &ny, &nw, &nh);
 
-    switch (edge) {
-        case 0: nx = dx;          ny = dy; nw = halfw;      nh = dh;    break; // left half (satoru)
-        case 1: nx = dx + halfw;  ny = dy; nw = dw - halfw; nh = dh;    break; // right half (satoru)
-        case 2: nx = dx;          ny = dy; nw = dw;         nh = dh;    break; // maximize (satoru)
-        case 4: nx = dx;          ny = dy;          nw = halfw;      nh = halfh;      break; // top-left (satoru)
-        case 5: nx = dx + halfw;  ny = dy;          nw = dw - halfw; nh = halfh;      break; // top-right (satoru)
-        case 6: nx = dx;          ny = dy + halfh;  nw = halfw;      nh = dh - halfh; break; // bottom-left (satoru)
-        case 7: nx = dx + halfw;  ny = dy + halfh;  nw = dw - halfw; nh = dh - halfh; break; // bottom-right (satoru)
-        default: return; // unknown edge (satoru)
-    }
-
-    if (nw < WM_MIN_WIDTH)  nw = WM_MIN_WIDTH;
-    if (nh < WM_MIN_HEIGHT) nh = WM_MIN_HEIGHT;
-
+    const int sox = win->x, soy = win->y, sow = win->w, soh = win->h;   // morph origin (satoru)
     wm_damage_window(win);
     win->x = nx; win->y = ny;
     win->w = nw; win->h = nh;
@@ -583,10 +1302,362 @@ void WindowManager::SnapWindow(int win_id, int edge) {
     UpdateContentArea(win);
     UpdateWindowMonitor(win);
     wm_damage(win->x, win->y, win->w, win->h);
+    wm_geom_remember(win);
+    wm_fx_morph(win, sox, soy, sow, soh, win->has_titlebar);
+}
+
+// snap a window to a region of the desktop. reuses the same desktop bounds
+// the maximize path uses (x=0, y=GetDesktopY(), w=screen_width,
+// h=GetDesktopH()) so snapping never overlaps the taskbar. super+up on a
+// vertical half goes to the top quarter, super+down on a half or top quarter
+// to the bottom quarter; otherwise those keys keep maximize / restore. (satoru)
+void WindowManager::SnapWindow(int win_id, int edge) {
+    Window* win = GetWindow(win_id);
+    if (!win) return;
+
+    // desktop rect - same area maximize occupies. (satoru)
+    int dx, dy, dw, dh;
+    wm_window_area(win, &dx, &dy, &dw, &dh);   // snap within its own output (satoru)
+    if (dw < WM_MIN_WIDTH)  dw = WM_MIN_WIDTH;
+    if (dh < WM_MIN_HEIGHT) dh = WM_MIN_HEIGHT;
+
+    int cur = wm_snap_edge_current(win, dx, dy, dw, dh);
+    if (edge == 2) {
+        if (cur == 0) edge = 4;
+        else if (cur == 1) edge = 5;
+    } else if (edge == 3) {
+        if (cur == 4 || cur == 0)       edge = 6;
+        else if (cur == 5 || cur == 1)  edge = 7;
+    }
+    ApplySnap(win, edge, dx, dy, dw, dh);
+}
+
+// ── drag-to-edge snap preview ────────────────────────────────────────
+static int  wm_sp_edge = -1;
+static int  wm_sp_win = -1;
+static int  wm_sp_x = 0, wm_sp_y = 0, wm_sp_w = 0, wm_sp_h = 0;
+static int  wm_sp_ax = 0, wm_sp_ay = 0, wm_sp_aw = 0, wm_sp_ah = 0;
+
+static void wm_snap_preview_clear() {
+    if (wm_sp_edge >= 0 && wm_sp_w > 0 && wm_sp_h > 0)
+        wm_damage(wm_sp_x - 4, wm_sp_y - 4, wm_sp_w + 8, wm_sp_h + 8);
+    wm_sp_edge = -1;
+    wm_sp_win = -1;
+    wm_sp_w = wm_sp_h = 0;
+}
+
+static void wm_snap_preview_update(Window* win, WMAction act, int mx, int my) {
+    if (!win || act != WM_DRAG) { wm_snap_preview_clear(); return; }
+    int ax, ay, aw, ah;
+    int edge = wm_snap_edge_at(mx, my, &ax, &ay, &aw, &ah);
+    if (edge < 0) { wm_snap_preview_clear(); return; }
+    int nx, ny, nw, nh;
+    wm_snap_rect(edge, ax, ay, aw, ah, &nx, &ny, &nw, &nh);
+    if (wm_sp_edge == edge && wm_sp_win == win->id &&
+        wm_sp_x == nx && wm_sp_y == ny && wm_sp_w == nw && wm_sp_h == nh)
+        return;
+    if (wm_sp_edge >= 0 && wm_sp_w > 0)
+        wm_damage(wm_sp_x - 4, wm_sp_y - 4, wm_sp_w + 8, wm_sp_h + 8);
+    wm_sp_edge = edge;
+    wm_sp_win = win->id;
+    wm_sp_x = nx; wm_sp_y = ny; wm_sp_w = nw; wm_sp_h = nh;
+    wm_sp_ax = ax; wm_sp_ay = ay; wm_sp_aw = aw; wm_sp_ah = ah;
+    wm_damage(nx - 4, ny - 4, nw + 8, nh + 8);
+    Graphics::MarkUIDirty();
+}
+
+static const char* wm_snap_edge_name(int edge) {
+    switch (edge) {
+        case 0: return "Left half";
+        case 1: return "Right half";
+        case 2: return "Maximize";
+        case 4: return "Top left";
+        case 5: return "Top right";
+        case 6: return "Bottom left";
+        case 7: return "Bottom right";
+        default: return "";
+    }
+}
+
+void WindowManager::RenderSnapPreview() {
+    if (wm_sp_edge < 0 || wm_sp_win <= 0) return;
+    if (current_action != WM_DRAG || action_window_id != wm_sp_win) {
+        wm_snap_preview_clear();
+        return;
+    }
+    // the wallpaper repaints the target every frame before this overlay draws,
+    // so the translucent fill never accumulates. (satoru)
+    wm_damage(wm_sp_x - 4, wm_sp_y - 4, wm_sp_w + 8, wm_sp_h + 8);
+    uint32_t accent = wm_get_accent();
+    MDraw::RoundRect(wm_sp_x + 1, wm_sp_y + 1, wm_sp_w - 2, wm_sp_h - 2, 14,
+                     accent, accent, 46);
+    MDraw::RoundOutline(wm_sp_x + 1, wm_sp_y + 1, wm_sp_w - 2, wm_sp_h - 2, 14,
+                        accent, 165);
+    const char* label = wm_snap_edge_name(wm_sp_edge);
+    if (label[0]) {
+        int tw = FontTTF::MeasureText(13.0f, label, false);
+        if (tw < 0) tw = 0;
+        int lx = wm_sp_x + 14, ly = wm_sp_y + 14;
+        MDraw::RoundRect(lx, ly, tw + 20, 26, 8, accent, accent, 210);
+        FontTTF::DrawText(lx + 10, ly + 5, 13.0f, label, 0xFFFFFFFFu, true);
+    }
 }
 
 void WindowManager::SnapFocused(int edge) {
     SnapWindow(focused_id, edge);
+}
+
+// ── alt-tab switcher ─────────────────────────────────────────────────
+void WindowManager::AltTabStep(bool backward) {
+    int ids[WM_MAX_WINDOWS];
+    int n = wm_tab_gather(ids);
+    if (n <= 1) {
+        if (wm_tab_open) AltTabCancel();
+        return;
+    }
+    int anchor = wm_tab_open && wm_tab_sel >= 0 && wm_tab_sel < wm_tab_count
+                 ? wm_tab_ids[wm_tab_sel] : focused_id;
+    int idx = wm_tab_index_of(ids, n, anchor);
+    int sel;
+    if (idx < 0) sel = backward ? n - 1 : 0;
+    else         sel = backward ? (idx + n - 1) % n : (idx + 1) % n;
+
+    for (int i = 0; i < n; i++) wm_tab_ids[i] = ids[i];
+    wm_tab_count = n;
+    wm_tab_sel = sel;
+    wm_tab_sel_ms = Timer::GetRealMs();
+    if (!wm_tab_open) {
+        wm_tab_open = true;
+        wm_tab_open_ms = wm_tab_sel_ms;
+        wm_tab_thumb_forget();
+        Window* fw = GetFocusedWindow();
+        wm_tab_monitor = fw ? fw->monitor_id : 0;
+        if (!Outputs::Multi()) wm_tab_monitor = 0;
+        else if (wm_tab_monitor < 0 || wm_tab_monitor >= OUTPUT_MAX ||
+                 !Outputs::IsLive(wm_tab_monitor)) wm_tab_monitor = 0;
+        wm_output_rect(wm_tab_monitor, &wm_tab_ax, &wm_tab_ay, &wm_tab_aw, &wm_tab_ah);
+        if (wm_tab_aw <= 0 || wm_tab_ah <= 0) {
+            wm_tab_ax = 0; wm_tab_ay = 0;
+            wm_tab_aw = screen_width; wm_tab_ah = screen_height;
+        }
+    }
+    Graphics::MarkUIDirty();
+}
+
+void WindowManager::AltTabFinish() {
+    if (!wm_tab_open) return;
+    int id = (wm_tab_sel >= 0 && wm_tab_sel < wm_tab_count) ? wm_tab_ids[wm_tab_sel] : -1;
+    wm_tab_open = false;
+    wm_tab_thumb_free_all();
+    Window* win = GetWindow(id);
+    if (win) {
+        if (win->state == WIN_MINIMIZED) Unminimize(id);
+        else Focus(id);
+    }
+    wm_damage(wm_tab_ax, wm_tab_ay, wm_tab_aw, wm_tab_ah);
+    Graphics::MarkUIDirty();
+}
+
+void WindowManager::AltTabCancel() {
+    if (!wm_tab_open) return;
+    wm_tab_open = false;
+    wm_tab_thumb_free_all();
+    wm_damage(wm_tab_ax, wm_tab_ay, wm_tab_aw, wm_tab_ah);
+    Graphics::MarkUIDirty();
+}
+
+bool WindowManager::IsTabSwitcherOpen() {
+    return wm_tab_open;
+}
+
+static void wm_tab_int_str(int v, char* out) {
+    if (v < 0) v = 0;
+    char rev[12]; int r = 0;
+    if (v == 0) rev[r++] = '0';
+    while (v > 0 && r < 11) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+    int n = 0;
+    while (r > 0) out[n++] = rev[--r];
+    out[n] = 0;
+}
+
+void WindowManager::RenderTabSwitcher() {
+    if (!wm_tab_open) return;
+    int ids[WM_MAX_WINDOWS];
+    int n = 0;
+    int sel_local = 0;
+    int want = (wm_tab_sel >= 0 && wm_tab_sel < wm_tab_count) ? wm_tab_ids[wm_tab_sel] : -1;
+    for (int i = 0; i < wm_tab_count && n < 16; i++) {
+        Window* w = GetWindow(wm_tab_ids[i]);
+        if (!w) continue;
+        if (wm_tab_ids[i] == want) sel_local = n;
+        ids[n++] = wm_tab_ids[i];
+    }
+    if (n <= 0) {
+        wm_tab_open = false;
+        wm_tab_thumb_free_all();
+        wm_damage(wm_tab_ax, wm_tab_ay, wm_tab_aw, wm_tab_ah);
+        return;
+    }
+    if (sel_local >= n) sel_local = n - 1;
+
+    unsigned int now = Timer::GetRealMs();
+    float t = Animation::EaseMs(now - wm_tab_open_ms, KSS::Motion::Window, Animation::EaseOutCubic);
+    if (!wm_anim_on()) t = 1.0f;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    int fade = (int)(255.0f * t);
+    int dim = (int)(96.0f * t);
+
+    const MDraw::Palette& P = MDraw::Pal();
+    uint32_t accent = wm_get_accent();
+    int ax = wm_tab_ax, ay = wm_tab_ay, aw = wm_tab_aw, ah = wm_tab_ah;
+    if (aw <= 0 || ah <= 0) { ax = 0; ay = 0; aw = screen_width; ah = screen_height; }
+
+    if (dim > 0) Graphics::FillRectAlpha(ax, ay, aw, ah, (uint8_t)dim, 0xFF000000u);
+
+    int cols = n <= 4 ? n : (n <= 6 ? 3 : 4);
+    if (cols < 1) cols = 1;
+    int rows = (n + cols - 1) / cols;
+    int gap = 14, pad = 20, title_h = 40, label_h = 24;
+    int availw = aw - 80;
+    if (availw < 360) { gap = 10; pad = 14; availw = aw - 40; }
+    if (availw < 240) availw = aw - 20;
+    int cardw = (availw - pad * 2 - gap * (cols - 1)) / cols;
+    if (cardw < 120) cardw = 120;
+    int thumbh = cardw * 9 / 16;
+    if (thumbh > 170) thumbh = 170;
+    if (thumbh < 70) thumbh = 70;
+    int cardh = thumbh + label_h + 16;
+    int panelw = pad * 2 + cols * cardw + gap * (cols - 1);
+    int panelh = title_h + rows * cardh + gap * (rows - 1) + pad;
+    int maxh = ah - 80;
+    if (panelh > maxh) {
+        int over = panelh - maxh;
+        thumbh -= (over + rows - 1) / rows;
+        if (thumbh < 56) thumbh = 56;
+        cardh = thumbh + label_h + 16;
+        panelh = title_h + rows * cardh + gap * (rows - 1) + pad;
+    }
+    if (panelw > aw - 20) panelw = aw - 20;
+    int px = ax + (aw - panelw) / 2;
+    int py = ay + (ah - panelh) / 2 + (int)((1.0f - t) * 10.0f);
+
+    WMMotion::SoftShadow((float)px, (float)py, (float)panelw, (float)panelh, 18.0f,
+                         24.0f, 10.0f, (P.dark ? 135 : 70) * fade / 255, false);
+    MDraw::RoundRect(px, py, panelw, panelh, 18, P.panel, P.panel2,
+                     (P.dark ? 242 : 250) * fade / 255);
+    MDraw::RoundOutline(px, py, panelw, panelh, 18, P.line,
+                        (P.dark ? 36 : 22) * fade / 255);
+
+    uint32_t title_col = MDraw::Mix(P.panel, P.text, fade);
+    uint32_t dim_col = MDraw::Mix(P.panel, P.text2, fade);
+    FontTTF::DrawText(px + pad, py + 11, 16.0f, "Switch windows", title_col, true);
+    char count[32];
+    wm_tab_int_str(n, count);
+    int cl = 0; while (count[cl]) cl++;
+    count[cl++] = ' '; count[cl++] = 'w'; count[cl++] = 'i'; count[cl++] = 'n';
+    count[cl++] = 'd'; count[cl++] = 'o'; count[cl++] = 'w'; count[cl++] = 's';
+    count[cl] = 0;
+    int cw = FontTTF::MeasureText(13.0f, count, false);
+    FontTTF::DrawText(px + panelw - pad - cw, py + 14, 13.0f, count, dim_col, false);
+
+    unsigned int since = now - wm_tab_sel_ms;
+    float st = Animation::EaseMs(since, 110, Animation::EaseOutCubic);
+    if (!wm_anim_on()) st = 1.0f;
+    if (st < 0) st = 0;
+    if (st > 1) st = 1;
+
+    for (int k = 0; k < n; k++) {
+        Window* win = GetWindow(ids[k]);
+        if (!win) continue;
+        int row = k / cols, col = k % cols;
+        int cx = px + pad + col * (cardw + gap);
+        int cy = py + title_h + row * (cardh + gap);
+        bool selected = (k == sel_local);
+        int sa = selected ? (int)(210.0f * st) : 0;
+        uint32_t card_top = selected ? MDraw::Mix(P.panel2, accent, sa)
+                                     : (P.dark ? 0xFF202128u : 0xFFE6E6EAu);
+        uint32_t card_bot = selected ? MDraw::Mix(P.panel2, accent, sa / 2)
+                                     : (P.dark ? 0xFF1B1C22u : 0xFFDFDFE5u);
+        MDraw::RoundRect(cx, cy, cardw, cardh, 12, card_top, card_bot,
+                         (P.dark ? 210 : 225) * fade / 255);
+        if (selected)
+            MDraw::RoundOutline(cx - 1, cy - 1, cardw + 2, cardh + 2, 13,
+                                accent, 235 * fade / 255);
+
+        int tx = cx + 8, ty = cy + 8;
+        int tw = cardw - 16, th = thumbh;
+        MDraw::RoundRect(tx, ty, tw, th, 8, 0xFF0B0C10u, 0xFF0B0C10u, fade);
+        int slot = (int)(win - windows);
+        WMTabThumb* bt = (slot >= 0 && slot < WM_MAX_WINDOWS) ? &wm_tab_thumbs[slot] : nullptr;
+        if (bt && bt->valid && bt->px && bt->id == win->id && bt->w > 0 && bt->h > 0) {
+            int dw = tw, dh = th;
+            if ((long long)bt->w * th >= (long long)bt->h * tw) {
+                dh = (int)(((long long)bt->h * tw) / bt->w);
+                if (dh < 1) dh = 1;
+            } else {
+                dw = (int)(((long long)bt->w * th) / bt->h);
+                if (dw < 1) dw = 1;
+            }
+            WMMotion::Snapshot sn;
+            sn.px = bt->px; sn.w = bt->w; sn.h = bt->h;
+            int dx = tx + (tw - dw) / 2, dy = ty + (th - dh) / 2;
+            WMMotion::Blit(sn, 0, 0, bt->w, bt->h, dx, dy, dw, dh, fade);
+        } else {
+            int icon = win->app_icon >= 0 ? win->app_icon : AppIcons::IdForName(win->title);
+            int isz = th / 2;
+            if (isz < 24) isz = 24;
+            if (isz > 56) isz = 56;
+            if (isz > tw - 12) isz = tw - 12;
+            MDraw::AppTile(icon, tx + (tw - isz) / 2, ty + (th - isz) / 2, isz);
+        }
+
+        char label[64];
+        wm_tab_fit_text(win->title, 13.0f, cardw - 20, label, (int)sizeof(label));
+        uint32_t lc = selected ? 0xFFFFFFFFu : MDraw::Mix(P.panel2, P.text, fade);
+        FontTTF::DrawText(cx + 10, ty + th + 5, 13.0f, label, lc, false);
+    }
+
+    wm_damage(ax, ay, aw, ah);
+    Graphics::MarkUIDirty();
+}
+
+// ── show desktop ────────────────────────────────────────────────────
+void WindowManager::ToggleShowDesktop() {
+    if (!wm_show_desktop) {
+        unsigned int mask = 0;
+        int any = 0;
+        wm_sd_focus = focused_id;
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            Window* w = &windows[i];
+            if (w->state == WIN_CLOSED || w->state == WIN_MINIMIZED || !w->visible) continue;
+            mask |= (1u << i);
+            any++;
+        }
+        if (!any) return;
+        wm_sd_mask = mask;
+        wm_show_desktop = true;
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            if (mask & (1u << i)) Minimize(windows[i].id);
+        }
+    } else {
+        unsigned int mask = wm_sd_mask;
+        wm_show_desktop = false;
+        wm_sd_mask = 0;
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            if (!(mask & (1u << i))) continue;
+            Window* w = &windows[i];
+            if (w->state == WIN_CLOSED) continue;
+            if (w->state == WIN_MINIMIZED) Unminimize(w->id);
+        }
+        if (wm_sd_focus > 0 && GetWindow(wm_sd_focus)) Focus(wm_sd_focus);
+        wm_sd_focus = -1;
+    }
+    Graphics::MarkUIDirty();
+}
+
+bool WindowManager::IsShowDesktop() {
+    return wm_show_desktop;
 }
 
 void WindowManager::BringToFront(int id) {
@@ -647,6 +1718,9 @@ void WindowManager::Focus(int id) {
         wm_damage_window(win);
         focused_id = id;
         BringToFront(id);
+        // a wayland window's client gets the keyboard with the wm focus (dock,
+        // alt-tab, titlebar click), not only on a click in its content. (satoru)
+        WaylandServer::NotifyWmFocus(id);
         if (Keyboard::GetScreenReader()) {
             Keyboard::Announce(win->title);
         }
@@ -664,6 +1738,27 @@ void WindowManager::SetTitle(int id, const char* title) {
     // a background window's titlebar text changed - invalidate the snapshot
     // so it isn't shown with the old title behind a drag. (satoru)
     if (!wm_in_fast_render) InvalidateDragBackdrop();
+}
+
+// a client reported a stable app id: switch the geometry key from the initial
+// title to the icon id. before the first frame this also applies a remembered
+// rect, so firefox and other wayland apps reopen where they were left. (satoru)
+void WindowManager::SetAppIcon(int id, int icon) {
+    Window* win = GetWindow(id);
+    if (!win) return;
+    win->app_icon = icon;
+    int slot = (int)(win - windows);
+    if (icon < 0 || slot < 0 || slot >= WM_MAX_WINDOWS) return;
+    char key[WM_GEOM_KEY];
+    wm_geom_key_icon(icon, key, WM_GEOM_KEY);
+    if (wm_geom_streq(key, wm_win_key[slot])) return;
+    int n = 0;
+    while (key[n] && n < WM_GEOM_KEY - 1) { wm_win_key[slot][n] = key[n]; n++; }
+    wm_win_key[slot][n] = 0;
+    if (!win->had_last) {
+        if (!ApplySavedGeometry(win, key))
+            wm_geom_store(key, win->x, win->y, win->w, win->h);
+    }
 }
 
 void WindowManager::MoveWindow(int id, int x, int y) {
@@ -699,6 +1794,27 @@ void WindowManager::SetVisible(int id, bool visible) {
     win->visible = visible;
     win->dirty = true;
     if (!visible) win->had_last = false;
+}
+
+void WindowManager::CollectLastPaintedDamage() {
+    const int m = WM_SHADOW_SIZE + 2;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        Window* w = &windows[i];
+        if (!w->had_last && w->fx_bx1 <= w->fx_bx0) continue;
+        bool moved = w->had_last && (w->last_x != w->x || w->last_y != w->y ||
+                                     w->last_w != w->w || w->last_h != w->h);
+        if (moved) {
+            wm_damage(w->last_x - m, w->last_y - m, w->last_w + 2*m, w->last_h + 2*m);
+            wm_damage(w->x - m, w->y - m, w->w + 2*m, w->h + 2*m);
+        }
+        // spring motion paints at the eased rect, not the real geometry, so
+        // damage what it actually painted last frame while it is still moving. (satoru)
+        if (w->fx_mode) {
+            if (w->fx_bx1 > w->fx_bx0 && w->fx_by1 > w->fx_by0)
+                wm_damage(w->fx_bx0 - m, w->fx_by0 - m,
+                          w->fx_bx1 - w->fx_bx0 + 2*m, w->fx_by1 - w->fx_by0 + 2*m);
+        }
+    }
 }
 
 void WindowManager::MarkDirty(int id) {
@@ -745,6 +1861,8 @@ void WindowManager::SetDesktopArea(int x, int y, int w, int h) {
 
 bool WindowManager::IsPointInWindow(Window* win, int px, int py) {
     if (!win || !win->visible || win->state == WIN_MINIMIZED) return false;
+    // a window on its way out (closing, draining into the dock) takes no input (satoru)
+    if (win->fx_mode == FX_CLOSE || win->fx_mode == FX_MIN) return false;
     return px >= win->x && px < win->x + win->w &&
            py >= win->y && py < win->y + win->h;
 }
@@ -897,6 +2015,7 @@ static bool wm_apply_action(Window* win, WMAction act, int mx, int my,
         default: return false;
     }
     if (win->x == ox && win->y == oy && win->w == ow && win->h == oh) return false;
+    UiDiag::NoteWindowMove();
     return true;
 }
 
@@ -905,6 +2024,7 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
     if (current_action != WM_NONE && mouse_down) {
         Window* win = GetWindow(action_window_id);
         if (WM_LIKELY(win != nullptr)) {
+            if (current_action == WM_DRAG) wm_snap_preview_update(win, current_action, mouse_x, mouse_y);
             unsigned int now = Timer::GetRealMs();
             bool throttle = (current_action == WM_DRAG) && wm_drag_min_gap_ms > 0
                             && (now - wm_last_drag_ms) < wm_drag_min_gap_ms;
@@ -928,7 +2048,12 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
     }
 
     if (!mouse_down) {
-        if (current_action != WM_NONE) InvalidateDragBackdrop(); // drag ended (satoru)
+        if (current_action != WM_NONE) {
+            Window* w = GetWindow(action_window_id);
+            if (w) wm_geom_remember(w, true);
+            InvalidateDragBackdrop(); // drag ended (satoru)
+        }
+        wm_snap_preview_clear();
         current_action = WM_NONE;
         action_window_id = -1;
     }
@@ -952,7 +2077,7 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
                     int dy = mouse_y - btn_cy;
                     if (dx*dx + dy*dy <= btn_r2) {
                         win->tb_press_ms = Timer::GetRealMs();
-                        CloseWindow(top_id);
+                        UserCloseWindow(top_id);
                         return;
                     }
                 }
@@ -997,7 +2122,7 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
                     mouse_y <  win->content_y + win->content_h) {
                     int local_x = mouse_x - win->content_x;
                     int local_y = mouse_y - win->content_y;
-                    win->input(win, 1, local_x, local_y); // event 1 = click
+                    { TaskMem::WindowScope _tms(win->id); win->input(win, 1, local_x, local_y); } // event 1 = click
                 }
             }
         }
@@ -1008,7 +2133,25 @@ void WindowManager::Update(int mouse_x, int mouse_y, bool mouse_down, bool mouse
 
 void WindowManager::RenderShadow(Window* win) {
     if (!comp_shadow_enabled) return;
-    if (win->state == WIN_FULLSCREEN || win->state == WIN_MAXIMIZED) return;
+    if (win->state == WIN_FULLSCREEN) return;
+    if (UIStyle::Modern()) {
+        // layered soft shadow: a wide ambient shadow plus a tight contact one.
+        // focus raises the window (deeper, longer shadow), eased by the
+        // elevation spring. (satoru)
+        float e = win->fx_el.x;
+        if (e < 0.0f) e = 0.0f;
+        if (e > 1.0f) e = 1.0f;
+        int op = comp_shadow_opacity_pct;
+        float k = (float)op / 60.0f;
+        float rad = (float)wm_radius(win);
+        float fx = (float)win->x, fy = (float)win->y, fw = (float)win->w, fh = (float)win->h;
+        WMMotion::SoftShadow(fx, fy, fw, fh, rad + 6.0f, 22.0f + 16.0f * e, 8.0f + 8.0f * e,
+                             (int)((70.0f + 40.0f * e) * k), true);
+        WMMotion::SoftShadow(fx, fy, fw, fh, rad, 3.0f + 2.0f * e, 1.0f + 1.0f * e,
+                             (int)((60.0f + 20.0f * e) * k), true);
+        return;
+    }
+    if (win->state == WIN_MAXIMIZED) return;
     int sz = comp_shadow_radius;
     if (win->focused) sz += 3;
     if (sz < 1) return;
@@ -1034,6 +2177,12 @@ void WindowManager::RenderShadow(Window* win) {
     }
 }
 
+// true when a window body colour is light enough to need dark chrome on top. (satoru)
+static bool wm_is_light(uint32_t c) {
+    uint32_t l = (((c >> 16) & 0xFF) * 299 + ((c >> 8) & 0xFF) * 587 + (c & 0xFF) * 114) / 1000;
+    return l > 150;
+}
+
 void WindowManager::RenderTitlebar(Window* win) {
     bool focused = win->focused;
     // ease the titlebar color across focus changes instead of snapping - the
@@ -1046,6 +2195,10 @@ void WindowManager::RenderTitlebar(Window* win) {
         wm_damage(win->x, win->y, win->w, WM_TITLEBAR_H + 1);
     uint32_t text_col = focused ? COL_TITLE_TEXT    : COL_TITLE_TEXT_DIM;
     int wx = win->x, wy = win->y, ww = win->w;
+    // a light window body (settings in the light appearance) gets dark title
+    // text and a dark hairline so the unified titlebar stays readable. (satoru)
+    const bool light_body = wm_is_light(win->bg_color);
+    if (light_body) text_col = focused ? 0xFF1C1C1E : 0xFF8A8A92;
 
     // modern: a unified titlebar - same surface as the body (already drawn by
     // RenderWindowBody), set off by a hairline instead of a darker strip.
@@ -1066,7 +2219,8 @@ void WindowManager::RenderTitlebar(Window* win) {
         }
     }
 
-    if (modern) Graphics::FillRectAlpha(wx + 1, wy + WM_TITLEBAR_H, ww - 2, 1, 22, 0xFFFFFFFFu);
+    if (modern) Graphics::FillRectAlpha(wx + 1, wy + WM_TITLEBAR_H, ww - 2, 1, light_body ? 16 : 22,
+                                        light_body ? 0xFF000000u : 0xFFFFFFFFu);
     else        Graphics::FillRect(wx, wy + WM_TITLEBAR_H, ww, 1, COL_SEPARATOR);
 
     int btn_y = wy + WM_TITLEBAR_H / 2;
@@ -1095,8 +2249,17 @@ void WindowManager::RenderTitlebar(Window* win) {
                                                  : base[i], KSS::Motion::Micro, KSS::Motion::Std);
             int r = btn_r + (int)(lift * 2.0f + 0.5f);
             if (pressing && hov) r -= 1;            // tactile press-dip (satoru)
-            if (modern) MDraw::Circle(cx[i], btn_y, r, fill, focused ? 255 : 110);
-            else        Graphics::FillCircle(cx[i], btn_y, r, fill);
+            if (modern) {
+                // unfocused windows show quiet grey lights; pointing at the
+                // cluster brings the colour back (as on macos) (satoru)
+                bool cluster = win->tb_hover_btn >= 0;
+                if (!focused && !cluster) fill = light_body ? 0xFFD0D0D6 : 0xFF4A4B55;
+                MDraw::Circle(cx[i], btn_y, modern ? btn_r : r, fill, 255);
+                if (pressing && hov) MDraw::Circle(cx[i], btn_y, btn_r, 0xFF000000u, 50);
+                (void)lift;
+            } else {
+                Graphics::FillCircle(cx[i], btn_y, r, fill);
+            }
             // a button is still in motion until its lift settles to fully on/off;
             // that's the cheap per-frame "is the hover ease running" signal. (satoru)
             if ((hov && lift < 0.999f) || (!hov && lift > 0.001f)) moving = true;
@@ -1112,11 +2275,30 @@ void WindowManager::RenderTitlebar(Window* win) {
                       (44 + 16), (btn_r + 3) * 2 + 2);
     }
 
-    if (win->closable && focused) {
+    if (modern) {
+        // glyphs only while the pointer is on the cluster: x, minus, and the
+        // two full-screen wedges, anti-aliased dark ink (satoru)
+        if (win->tb_hover_btn >= 0) {
+            const uint32_t gi = 0xFF4A1A14, gm = 0xFF5A3A08, gx = 0xFF0E4A16;
+            int c0 = btn_start_x, c1 = btn_start_x + 22, c2 = btn_start_x + 44;
+            if (win->closable)
+                for (int k = -3; k <= 3; k++) {
+                    MDraw::RoundRect(c0 + k, btn_y + k, 1, 1, 0, gi, 230);
+                    MDraw::RoundRect(c0 + k, btn_y - k, 1, 1, 0, gi, 230);
+                    MDraw::RoundRect(c0 + k + 1, btn_y + k, 1, 1, 0, gi, 90);
+                    MDraw::RoundRect(c0 + k + 1, btn_y - k, 1, 1, 0, gi, 90);
+                }
+            MDraw::RoundRect(c1 - 4, btn_y - 1, 8, 2, 1, gm, 230);
+            for (int k = 0; k < 4; k++) {
+                MDraw::RoundRect(c2 - 3, btn_y - 3 + k, 4 - k, 1, 0, gx, 230);   // upper left wedge (satoru)
+                MDraw::RoundRect(c2 + k, btn_y + 3 - k, 4 - k, 1, 0, gx, 230);   // lower right wedge (satoru)
+            }
+        }
+    } else if (win->closable && focused) {
         Graphics::DrawLine(btn_start_x - 2, btn_y - 2, btn_start_x + 2, btn_y + 2, 0xFF401010);
         Graphics::DrawLine(btn_start_x + 2, btn_y - 2, btn_start_x - 2, btn_y + 2, 0xFF401010);
     }
-    if (focused) {
+    if (focused && !modern) {
         Graphics::FillRect(btn_start_x + 19, btn_y, 6, 1, 0xFF403010);
         Graphics::DrawLine(btn_start_x + 42, btn_y - 2, btn_start_x + 46, btn_y + 2, 0xFF103010);
         Graphics::DrawLine(btn_start_x + 46, btn_y - 2, btn_start_x + 42, btn_y + 2, 0xFF103010);
@@ -1160,7 +2342,7 @@ void WindowManager::RenderTitlebar(Window* win) {
         Graphics::PopClipRect();
     }
 
-    if (focused && ww > 2 * WM_CORNER_RADIUS) {
+    if (focused && !modern && ww > 2 * WM_CORNER_RADIUS) {
         Graphics::FillRect(wx + WM_CORNER_RADIUS, wy, ww - 2 * WM_CORNER_RADIUS, 1, wm_get_accent());
     }
 }
@@ -1247,11 +2429,158 @@ static int wm_ease_q8(int p_q8) {
     return v;
 }
 
+// ── spring motion (compositor.motion = spring) ─────────────────────────────
+// every animated window is drawn from a clean premultiplied snapshot at an
+// eased visual rect, scale and opacity, while its real geometry has already
+// changed, so hit-testing and input never wait for an animation. springs are
+// solved in closed form against the microsecond clock: the same curve at 60,
+// 144 or 240 hz. (satoru)
+static bool wm_spring_on() { return wm_spring; }
+
+static unsigned long long wm_now_us() { return FramePacer::NowNs() / 1000ull; }
+static bool wm_anim_on() {
+    return comp_animations_enabled && !comp_reduced_motion && comp_anim_duration_ms > 0;
+}
+// spring response scaled by compositor.animation_speed_ms (180 = as designed). (satoru)
+static float wm_resp(float r) { return r * (float)wm_speed_q8() / 256.0f; }
+
+static int wm_radius(const Window* w) {
+    return w->state == WIN_FULLSCREEN ? 0 : WM_CORNER_RADIUS;
+}
+
+static void wm_fx_old_release(Window* w) {
+    WMMotion::Snapshot s; s.px = w->fx_old_px; s.w = w->fx_old_w; s.h = w->fx_old_h;
+    WMMotion::Release(s);
+    w->fx_old_px = nullptr; w->fx_old_w = w->fx_old_h = 0;
+}
+
+static void wm_fx_init(Window* w) {
+    WMMotion::SpringSet(w->fx_sc, 1.0f);
+    WMMotion::SpringSet(w->fx_op, 1.0f);
+    WMMotion::SpringSet(w->fx_gn, 0.0f);
+    WMMotion::SpringSet(w->fx_el, w->focused ? 1.0f : 0.0f);
+    for (int k = 0; k < 4; k++) WMMotion::SpringSet(w->fx_r[k], 0.0f);
+    w->fx_us = 0;
+    w->fx_mode = FX_NONE;
+    w->fx_rect = false;
+    w->fx_cap = false;
+    w->fx_need_old = false;
+    w->fx_caught = false;
+    w->fx_o_tb = true;
+    w->fx_ox = w->fx_oy = w->fx_ow = w->fx_oh = 0;
+    w->fx_d0 = 1.0f;
+    w->fx_bx0 = w->fx_by0 = w->fx_bx1 = w->fx_by1 = 0;
+}
+
+// the drawn rect of a window right now (before scale), in float. (satoru)
+static void wm_fx_rect(const Window* w, float& x, float& y, float& ww, float& hh) {
+    if (w->fx_rect) { x = w->fx_r[0].x; y = w->fx_r[1].x; ww = w->fx_r[2].x; hh = w->fx_r[3].x; }
+    else { x = (float)w->x; y = (float)w->y; ww = (float)w->w; hh = (float)w->h; }
+    if (ww < 1.0f) ww = 1.0f;
+    if (hh < 1.0f) hh = 1.0f;
+}
+
+// start (or retarget) a geometry morph from the rect the window is drawn at
+// now. the real geometry must already be the new one. (satoru)
+static void wm_fx_morph(Window* w, int ox, int oy, int ow, int oh, bool old_tb) {
+    if (!wm_spring || !wm_anim_on() || ow <= 0 || oh <= 0) return;
+    if (w->fx_mode == FX_CLOSE || w->fx_mode == FX_MIN || w->fx_mode == FX_UNMIN) return;
+    if (ox == w->x && oy == w->y && ow == w->w && oh == w->h) return;
+    if (w->fx_mode == FX_MORPH && w->snap_px) {
+        // interrupted mid-morph: what we were heading to becomes the old
+        // picture, the springs keep their position and velocity. (satoru)
+        wm_fx_old_release(w);
+        w->fx_old_px = w->snap_px; w->fx_old_w = w->snap_w; w->fx_old_h = w->snap_h;
+        w->snap_px = nullptr; w->snap_w = w->snap_h = 0;
+        w->fx_need_old = false;
+    } else {
+        float fx, fy, fw, fh;
+        fx = (float)ox; fy = (float)oy; fw = (float)ow; fh = (float)oh;
+        WMMotion::SpringSet(w->fx_r[0], fx); WMMotion::SpringSet(w->fx_r[1], fy);
+        WMMotion::SpringSet(w->fx_r[2], fw); WMMotion::SpringSet(w->fx_r[3], fh);
+        wm_fx_old_release(w);
+        w->fx_need_old = true;
+        w->fx_ox = ox; w->fx_oy = oy; w->fx_ow = ow; w->fx_oh = oh; w->fx_o_tb = old_tb;
+        if (w->fx_mode == FX_OPEN) { WMMotion::SpringSet(w->fx_sc, 1.0f); WMMotion::SpringSet(w->fx_op, 1.0f); }
+    }
+    w->fx_r[0].t = (float)w->x; w->fx_r[1].t = (float)w->y;
+    w->fx_r[2].t = (float)w->w; w->fx_r[3].t = (float)w->h;
+    float d = 0.0f;
+    for (int k = 0; k < 4; k++) { float e = w->fx_r[k].x - w->fx_r[k].t; d += e < 0 ? -e : e; }
+    w->fx_d0 = d > 1.0f ? d : 1.0f;
+    w->fx_rect = true;
+    w->fx_cap = true;
+    w->fx_mode = FX_MORPH;
+    w->anim_kind = 0;
+    if (!w->fx_us) w->fx_us = wm_now_us();
+    Graphics::MarkUIDirty();
+}
+
+// pick the window that should take focus when `leaving` goes away. (satoru)
+static int wm_next_focus(const Window* wins, int leaving) {
+    int best = -1, bz = -1;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        const Window& o = wins[i];
+        if (o.state == WIN_CLOSED || o.state == WIN_MINIMIZED || !o.visible || o.id == leaving) continue;
+        if (o.fx_mode == FX_CLOSE || o.fx_mode == FX_MIN) continue;
+        if (o.z_order > bz) { bz = o.z_order; best = o.id; }
+    }
+    return best;
+}
+
+// frame-cost probe for spring motion: wm render + overlay time of every frame
+// with a motion in flight, logged once per motion as
+// "[wmfx] kinds=... frames=N avg_us=A max_us=M res=WxH". (satoru)
+static unsigned long long wm_fx_c0 = 0, wm_fx_sum = 0, wm_fx_max = 0;
+static unsigned int wm_fx_n = 0, wm_fx_kinds = 0;
+static unsigned long long wm_fx_cap_c = 0, wm_fx_sh_c = 0, wm_fx_bl_c = 0, wm_fx_gn_c = 0;   // per-part cycles (satoru)
+static bool wm_fx_frame = false;
+static inline unsigned long long wm_rdtsc() { unsigned int lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((unsigned long long)hi << 32) | lo; }
+static void wm_fx_probe_end(unsigned long long add) {
+    if (!wm_fx_frame) return;
+    unsigned long long c = (wm_rdtsc() - wm_fx_c0) + add;
+    wm_fx_sh_c += WMMotion::ProfTake(0);
+    wm_fx_bl_c += WMMotion::ProfTake(1);
+    wm_fx_gn_c += WMMotion::ProfTake(2);
+    wm_fx_sum += c; if (c > wm_fx_max) wm_fx_max = c; wm_fx_n++;
+}
+static void wm_fx_probe_flush(int sw, int sh) {
+    if (!wm_fx_n) return;
+    unsigned long long f = CPUDetect::GetInfo().frequency.tsc_frequency / 1000000ull;
+    if (!f) f = 2000;
+    SerialLogger::Log("[wmfx] kinds=");
+    SerialLogger::LogHex(wm_fx_kinds);
+    SerialLogger::Log(" frames="); SerialLogger::LogDec((int)wm_fx_n);
+    SerialLogger::Log(" avg_us="); SerialLogger::LogDec((int)(wm_fx_sum / wm_fx_n / f));
+    SerialLogger::Log(" max_us="); SerialLogger::LogDec((int)(wm_fx_max / f));
+    SerialLogger::Log(" res="); SerialLogger::LogDec(sw); SerialLogger::Log("x"); SerialLogger::LogDec(sh);
+    // per frame averages of the parts: capture, shadows, scaled blits, genie (satoru)
+    SerialLogger::Log(" cap="); SerialLogger::LogDec((int)(wm_fx_cap_c / wm_fx_n / f));
+    SerialLogger::Log(" shadow="); SerialLogger::LogDec((int)(wm_fx_sh_c / wm_fx_n / f));
+    SerialLogger::Log(" blit="); SerialLogger::LogDec((int)(wm_fx_bl_c / wm_fx_n / f));
+    SerialLogger::Log(" genie="); SerialLogger::LogDec((int)(wm_fx_gn_c / wm_fx_n / f));
+    SerialLogger::Log("\r\n");
+    wm_fx_cap_c = wm_fx_sh_c = wm_fx_bl_c = wm_fx_gn_c = 0;
+    wm_fx_n = 0; wm_fx_sum = wm_fx_max = 0; wm_fx_kinds = 0;
+}
+static unsigned long long wm_fx_render_c = 0;   // this frame's Render() share (satoru)
+
 void WindowManager::Render() {
     // First retire any animations that have completed since the last
     // tick so windows in their final CLOSE/MINIMIZE phase are dropped
     // before we build the visibility list.
     TickAnimations();
+    wm_fx_frame = false;
+    if (wm_spring) {
+        for (int i = 0; i < WM_MAX_WINDOWS; i++)
+            if (windows[i].state != WIN_CLOSED && windows[i].fx_mode) {
+                wm_fx_frame = true;
+                wm_fx_kinds |= 1u << windows[i].fx_mode;
+            }
+        if (!wm_fx_frame) wm_fx_probe_flush(screen_width, screen_height);
+        if (!wm_fx_frame) { WMMotion::ProfTake(0); WMMotion::ProfTake(1); WMMotion::ProfTake(2); }
+    }
+    wm_fx_c0 = wm_rdtsc();
 
     // render windows in z-order (lowest first)
     // build sorted index
@@ -1285,6 +2614,7 @@ void WindowManager::Render() {
         for (int j = i + 1; j < count; j++) {
             const Window* o = &windows[indices[j]];
             if (o->anim_kind != 0 || o->alpha < 255 || o->state == WIN_FULLSCREEN) continue;
+            if (o->fx_mode != 0) continue;   // drawn eased, may not cover its real rect (satoru)
             // when capturing the drag backdrop the dragged window is NOT drawn,
             // so it must not occlude windows behind it - otherwise they'd be
             // missing from the backdrop and vanish once the window slides off
@@ -1327,6 +2657,22 @@ void WindowManager::Render() {
             continue;
         }
 
+        // spring motion: genie windows draw in the overlay pass (after the
+        // dock); open/close/morph draw from their snapshots here. (satoru)
+        if (wm_spring && win->fx_mode != FX_NONE) {
+            if (win->fx_mode == FX_MIN || win->fx_mode == FX_UNMIN) {
+                if (win->fx_cap) {
+                    FxCapture(win, win->x, win->y, win->w, win->h, win->has_titlebar,
+                              &win->snap_px, &win->snap_w, &win->snap_h);
+                    win->fx_cap = false;
+                }
+            } else {
+                RenderFxWindow(win);
+            }
+            win->dirty = false;
+            continue;
+        }
+
         // ── animation phase (Q8 fixed-point, eased) ──────────────────
         int p_raw = wm_anim_phase_q8(win, now);
         int p     = wm_ease_q8(p_raw);
@@ -1346,6 +2692,7 @@ void WindowManager::Render() {
         if (WM_UNLIKELY((kind == 3 || kind == 5) && p_raw < 256)) {
             if (kind == 3 && !win->snap_px) {
                 RenderWindowBody(win, (!dragging || comp_shadow_during_drag));
+                wm_tab_thumb_grab(win);
                 wm_snap_capture(win);
             }
             wm_damage(win->x - WM_SHADOW_SIZE, win->y - WM_SHADOW_SIZE,
@@ -1391,6 +2738,7 @@ void WindowManager::Render() {
         // during drag/resize unless the user opted in. shared helper keeps the
         // dragged-only fast path pixel-identical to this loop. (satoru)
         RenderWindowBody(win, (!dragging || comp_shadow_during_drag));
+        wm_tab_thumb_grab(win);
 
         // ── post-pass: per-window opacity overlay (animation done) ──
         int combined = (int)win->alpha * p_vis / 256;
@@ -1410,6 +2758,7 @@ void WindowManager::Render() {
 
     // window context menu draws on top of everything (satoru)
     RenderContextMenu();
+    wm_fx_render_c = wm_fx_frame ? wm_rdtsc() - wm_fx_c0 : 0;
 }
 
 // draw one settled window: shadow (optional) + rounded body + titlebar +
@@ -1438,10 +2787,11 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
     }
 
     // full body background with rounded corners (anti-aliased in modern)
+    const int wrad = wm_radius(win);   // full screen windows are square (satoru)
     if (UIStyle::Modern())
-        MDraw::RoundRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color, 255);
+        MDraw::RoundRect(win->x, win->y, win->w, win->h, wrad, win->bg_color, 255);
     else
-        Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, win->bg_color);
+        Graphics::FillRoundedRect(win->x, win->y, win->w, win->h, wrad, win->bg_color);
 
     // titlebar (draws over the top portion)
     if (win->has_titlebar) RenderTitlebar(win);
@@ -1449,7 +2799,8 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
     // border: a faint hairline in modern (focus reads from the traffic lights
     // and shadow), the accent outline in classic.
     if (UIStyle::Modern())
-        MDraw::RoundOutline(win->x, win->y, win->w, win->h, WM_CORNER_RADIUS, 0xFFFFFFFFu, win->focused ? 46 : 26);
+        { if (wrad > 0) MDraw::RoundOutline(win->x, win->y, win->w, win->h, wrad,
+                            wm_is_light(win->bg_color) ? 0xFF000000u : 0xFFFFFFFFu, win->focused ? 46 : 26); }
     else
         Graphics::DrawRect(win->x, win->y, win->w, win->h, border);
 
@@ -1458,7 +2809,7 @@ void WindowManager::RenderWindowBody(Window* win, bool with_shadow) {
     if (win->render && win->content_w > 0 && win->content_h > 0) {
         Graphics::PushClipRect(win->content_x, win->content_y,
                               win->content_w, win->content_h);
-        win->render(win, win->content_x, win->content_y, win->content_w, win->content_h);
+        { TaskMem::WindowScope _tms(win->id); win->render(win, win->content_x, win->content_y, win->content_w, win->content_h); }
         Graphics::PopClipRect();
     }
 }
@@ -1512,12 +2863,12 @@ static bool wm_backdrop_alloc() {
     if (w <= 0 || h <= 0 || pitch == 0) return false;
     size_t need = (size_t)pitch * (size_t)h;
     if (wm_backdrop && (wm_backdrop_bytes != need)) {
-        PMM::FreeBytes(wm_backdrop, wm_backdrop_bytes);
+        TaskMem::UnchargeFrames(wm_backdrop); PMM::FreeBytes(wm_backdrop, wm_backdrop_bytes);
         wm_backdrop = nullptr;
         wm_backdrop_bytes = 0;
     }
     if (!wm_backdrop) {
-        wm_backdrop = (uint8_t*)PMM::AllocBytes(need);
+        wm_backdrop = (uint8_t*)PMM::AllocBytes(need); TaskMem::ChargeFrames(wm_backdrop, need);
         if (!wm_backdrop) { wm_backdrop_bytes = 0; return false; }
         wm_backdrop_bytes = need;
     }
@@ -1696,7 +3047,7 @@ bool WindowManager::HandleMouseDown(int mx, int my) {
         if (win->closable) {
             int dx = mx - btn_start_x;
             int dy = my - btn_cy;
-            if (dx*dx + dy*dy <= btn_r2) { CloseWindow(top_id); return true; }
+            if (dx*dx + dy*dy <= btn_r2) { UserCloseWindow(top_id); return true; }
         }
         {
             int dx = mx - (btn_start_x + 22);
@@ -1722,7 +3073,7 @@ bool WindowManager::HandleMouseDown(int mx, int my) {
             mx >= win->content_x && mx <  win->content_x + win->content_w &&
             my >= win->content_y && my <  win->content_y + win->content_h) {
             wm_input_capture_id = top_id;
-            win->input(win, 1, mx - win->content_x, my - win->content_y);
+            { TaskMem::WindowScope _tms(win->id); win->input(win, 1, mx - win->content_x, my - win->content_y); }
         }
         return true;
     }
@@ -1733,7 +3084,11 @@ bool WindowManager::HandleMouseDown(int mx, int my) {
 void WindowManager::HandleMouseMove(int mx, int my) {
     if (!mouse_is_down || current_action == WM_NONE) return;
     Window* win = GetWindow(action_window_id);
-    if (!win) { current_action = WM_NONE; action_window_id = -1; return; }
+    if (!win) { current_action = WM_NONE; action_window_id = -1; wm_snap_preview_clear(); return; }
+
+    // the snap target follows the pointer even when the window move itself is
+    // throttled to the refresh interval. (satoru)
+    if (current_action == WM_DRAG) wm_snap_preview_update(win, current_action, mx, my);
 
     unsigned int now = Timer::GetRealMs();
     if (current_action == WM_DRAG && wm_drag_min_gap_ms > 0
@@ -1756,61 +3111,28 @@ void WindowManager::HandleMouseMove(int mx, int my) {
 
 void WindowManager::HandleMouseUp(int mx, int my) {
     // edge-snap: if the user released a drag near a screen edge, snap.
-    if (current_action == WM_DRAG) {
-        Window* win = GetWindow(action_window_id);
-        if (win && win->resizable) {
-            const int EDGE = 8;
-            int sw = screen_width;
-            int dy0 = wm_desktop_y;
-            int dh  = wm_desktop_h;
-            bool snapped = false;
-            if (my <= EDGE) {
-                // top -> maximize
-                wm_damage_window(win);
-                if (win->state != WIN_MAXIMIZED) {
-                    win->saved_x = win->x; win->saved_y = win->y;
-                    win->saved_w = win->w; win->saved_h = win->h;
-                }
-                win->x = 0; win->y = dy0;
-                win->w = sw; win->h = dh;
-                win->state = WIN_MAXIMIZED;
-                snapped = true;
-            } else if (mx <= EDGE) {
-                wm_damage_window(win);
-                if (win->state != WIN_MAXIMIZED) {
-                    win->saved_x = win->x; win->saved_y = win->y;
-                    win->saved_w = win->w; win->saved_h = win->h;
-                }
-                win->x = 0; win->y = dy0;
-                win->w = sw / 2; win->h = dh;
-                win->state = WIN_NORMAL;
-                snapped = true;
-            } else if (mx >= sw - EDGE) {
-                wm_damage_window(win);
-                if (win->state != WIN_MAXIMIZED) {
-                    win->saved_x = win->x; win->saved_y = win->y;
-                    win->saved_w = win->w; win->saved_h = win->h;
-                }
-                win->x = sw / 2; win->y = dy0;
-                win->w = sw - sw / 2; win->h = dh;
-                win->state = WIN_NORMAL;
-                snapped = true;
-            }
-            if (snapped) {
-                UpdateContentArea(win);
-                wm_damage(win->x, win->y, win->w, win->h);
-                win->dirty = true;
-            }
+    Window* acted = (current_action != WM_NONE) ? GetWindow(action_window_id) : nullptr;
+
+    if (current_action == WM_DRAG && acted) {
+        // refresh the target for the release point, then snap into that
+        // output's work area. no edge under the pointer means a plain move.
+        // (satoru)
+        wm_snap_preview_update(acted, current_action, mx, my);
+        if (acted->resizable && wm_sp_edge >= 0 && wm_sp_win == acted->id) {
+            ApplySnap(acted, wm_sp_edge, wm_sp_ax, wm_sp_ay, wm_sp_aw, wm_sp_ah);
+        } else {
+            acted->dirty = true;
+            wm_geom_remember(acted, true);
         }
-    } else if (current_action != WM_NONE) {
-        Window* win = GetWindow(action_window_id);
-        if (win) win->dirty = true;
+    } else if (acted) {
+        acted->dirty = true;
+        wm_geom_remember(acted, true);
     }
+    wm_snap_preview_clear();
+
     // a finished drag/resize may have moved the window onto another output (satoru)
-    if (current_action != WM_NONE) {
-        Window* moved = GetWindow(action_window_id);
-        if (moved) UpdateWindowMonitor(moved);
-    }
+    if (acted) UpdateWindowMonitor(acted);
+
     mouse_is_down = false;
     current_action = WM_NONE;
     action_window_id = -1;
@@ -1882,7 +3204,7 @@ void WindowManager::HandlePointerMove(int mx, int my) {
         return;
     }
 
-    win->input(win, 5, mx - win->content_x, my - win->content_y);
+    { TaskMem::WindowScope _tms(win->id); win->input(win, 5, mx - win->content_x, my - win->content_y); }
 }
 
 void WindowManager::HandlePointerButton(int mx, int my, int button, bool pressed) {
@@ -1914,7 +3236,7 @@ void WindowManager::HandlePointerButton(int mx, int my, int button, bool pressed
         wm_input_capture_id = win->id;
     }
 
-    win->input(win, 6, button, pressed ? 1 : 0);
+    { TaskMem::WindowScope _tms(win->id); win->input(win, 6, button, pressed ? 1 : 0); }
 
     if (!pressed && wm_input_capture_id == win->id) {
         wm_input_capture_id = -1;
@@ -1930,7 +3252,18 @@ bool WindowManager::IsDragging() {
 }
 
 bool WindowManager::HasActiveAnimations() {
+    if (wm_tab_open || wm_sp_edge >= 0) return true;
     unsigned int now = Timer::GetRealMs();
+    if (wm_spring) {
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            const Window* w = &windows[i];
+            if (w->state == WIN_CLOSED) continue;
+            if (w->catch_kind && (int)(now - w->catch_ms) < (int)wm_motion_dur(520)) return true;
+            if (w->fx_mode != FX_NONE) return true;
+            if (w->state != WIN_MINIMIZED && !WMMotion::SpringRest(w->fx_el, 0.002f)) return true;
+        }
+        return false;
+    }
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         const Window* w = &windows[i];
         if (w->state == WIN_CLOSED) continue;
@@ -2012,7 +3345,7 @@ void WindowManager::RenderOpenMotion(Window* win, int t) {
             int cy1 = win->content_y + win->content_h < iy1 ? win->content_y + win->content_h : iy1;
             if (cx1 > cx0 && cy1 > cy0) {
                 Graphics::PushClipRect(cx0, cy0, cx1 - cx0, cy1 - cy0);
-                win->render(win, win->content_x, win->content_y, win->content_w, win->content_h);
+                { TaskMem::WindowScope _tms(win->id); win->render(win, win->content_x, win->content_y, win->content_w, win->content_h); }
                 Graphics::PopClipRect();
                 if (veil > 0) Graphics::FillRectAlpha(cx0, cy0, cx1 - cx0, cy1 - cy0, (uint8_t)veil, win->bg_color);
             }
@@ -2154,6 +3487,41 @@ void WindowManager::RenderPourMotion(Window* win, int t, bool rising) {
 
 void WindowManager::RenderMotionOverlay() {
     unsigned int now = Timer::GetRealMs();
+    if (wm_spring) {
+        wm_fx_c0 = wm_rdtsc();
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            Window* w = &windows[i];
+            if (w->state == WIN_CLOSED || !w->snap_px) continue;
+            if (w->fx_mode != FX_MIN && w->fx_mode != FX_UNMIN) continue;
+            int tcx, tcy, tw, th;
+            wm_tile_target(w, screen_height, tcx, tcy, tw, th);
+            float p = w->fx_gn.x;
+            if (p < 0.0f) p = 0.0f;
+            if (p > 1.0f) p = 1.0f;
+            WMMotion::Snapshot snap = wm_snap(w);
+            // the window keeps a faint shadow while it is still mostly itself (satoru)
+            if (p < 0.35f && comp_shadow_enabled) {
+                float k = 1.0f - p / 0.35f;
+                WMMotion::SoftShadow((float)w->x, (float)w->y, (float)w->w, (float)w->h,
+                                     (float)WM_CORNER_RADIUS + 6.0f, 30.0f, 12.0f, (int)(90.0f * k * k), false);
+            }
+            WMMotion::Genie(snap, w->x, w->y, w->w, w->h,
+                            (float)(tcx - tw / 2), (float)(tcy - th / 2), (float)tw, (float)th, p);
+            int gx0, gy0, gx1, gy1;
+            WMMotion::LastGenieBounds(gx0, gy0, gx1, gy1);
+            if (p < 0.35f) {
+                if (gx0 > w->x - WM_SHADOW_SIZE) gx0 = w->x - WM_SHADOW_SIZE;
+                if (gy0 > w->y - WM_SHADOW_SIZE) gy0 = w->y - WM_SHADOW_SIZE;
+                if (gx1 < w->x + w->w + WM_SHADOW_SIZE) gx1 = w->x + w->w + WM_SHADOW_SIZE;
+                if (gy1 < w->y + w->h + WM_SHADOW_SIZE) gy1 = w->y + w->h + WM_SHADOW_SIZE;
+            }
+            wm_fx_damage(w, gx0, gy0, gx1, gy1);
+            // the dock tile region too, so its catch is repainted (satoru)
+            wm_damage(tcx - tw, tcy - th, tw * 2, th * 2);
+        }
+        wm_fx_probe_end(wm_fx_render_c);
+        return;
+    }
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         Window* w = &windows[i];
         if (w->state == WIN_CLOSED || !w->snap_px) continue;
@@ -2161,6 +3529,106 @@ void WindowManager::RenderMotionOverlay() {
         if ((now - w->anim_start_ms) >= w->anim_duration_ms) continue;
         RenderPourMotion(w, wm_motion_t(w, now), w->anim_kind == 5);
     }
+}
+
+// shared soft shadow for a window drawn at a float rect, elevation 0..1. (satoru)
+static void wm_fx_shadow(const Window* w, float x, float y, float ww, float hh, float rad, float alpha, bool hole) {
+    if (!comp_shadow_enabled || w->state == WIN_FULLSCREEN || alpha <= 0.01f) return;
+    float e = w->fx_el.x;
+    if (e < 0.0f) e = 0.0f;
+    if (e > 1.0f) e = 1.0f;
+    float k = (float)comp_shadow_opacity_pct / 60.0f * alpha;
+    WMMotion::SoftShadow(x, y, ww, hh, rad + 6.0f, 22.0f + 16.0f * e, 8.0f + 8.0f * e,
+                         (int)((70.0f + 40.0f * e) * k), hole);
+    WMMotion::SoftShadow(x, y, ww, hh, rad, 3.0f + 2.0f * e, 1.0f + 1.0f * e,
+                         (int)((60.0f + 20.0f * e) * k), hole);
+}
+
+bool WindowManager::FxCapture(Window* win, int x, int y, int w, int h, bool titlebar,
+                              unsigned int** px, int* pw, int* ph) {
+    if (!win || w <= 0 || h <= 0) return false;
+    unsigned long long cap_c0 = wm_rdtsc();
+    // a picture of the other side of a full screen toggle: a titlebar means a
+    // normal (rounded) window, none at full output size means full screen. (satoru)
+    const WindowState sst = win->state;
+    if (sst == WIN_FULLSCREEN && titlebar) win->state = WIN_NORMAL;
+    else if (sst != WIN_FULLSCREEN && !titlebar && w >= screen_width && h >= screen_height) win->state = WIN_FULLSCREEN;
+    // draw the window at the requested geometry over black, copy it out with
+    // real corner coverage, then put back what was under it. (satoru)
+    const int sx = win->x, sy = win->y, sw = win->w, sh = win->h;
+    const bool stb = win->has_titlebar;
+    win->x = x; win->y = y; win->w = w; win->h = h; win->has_titlebar = titlebar;
+    UpdateContentArea(win);
+    bool ok = false;
+    if (WMMotion::SaveUnder(x, y, w, h)) {
+        Graphics::FillRect(x, y, w, h, 0xFF000000u);
+        bool saved_fast = wm_in_fast_render;
+        wm_in_fast_render = true;           // no drag-backdrop invalidation from inside (satoru)
+        RenderWindowBody(win, false);
+        wm_in_fast_render = saved_fast;
+        WMMotion::Snapshot s; s.px = (uint32_t*)*px; s.w = *pw; s.h = *ph;
+        ok = WMMotion::CapturePremul(s, x, y, w, h, wm_radius(win));
+        *px = (unsigned int*)s.px; *pw = s.w; *ph = s.h;
+        WMMotion::RestoreUnder();
+    }
+    win->x = sx; win->y = sy; win->w = sw; win->h = sh; win->has_titlebar = stb;
+    win->state = sst;
+    UpdateContentArea(win);
+    wm_fx_cap_c += wm_rdtsc() - cap_c0;
+    return ok;
+}
+
+void WindowManager::RenderFxWindow(Window* win) {
+    bool old_only = false;
+    if (win->fx_mode == FX_MORPH && win->fx_need_old) {
+        FxCapture(win, win->fx_ox, win->fx_oy, win->fx_ow, win->fx_oh, win->fx_o_tb,
+                  &win->fx_old_px, &win->fx_old_w, &win->fx_old_h);
+        win->fx_need_old = false;
+        // spread the two captures over two frames: this one shows the old
+        // picture only (the springs have barely moved yet) (satoru)
+        old_only = win->fx_old_px != nullptr;
+    }
+    if (!old_only && (win->fx_cap || !win->snap_px)) {
+        FxCapture(win, win->x, win->y, win->w, win->h, win->has_titlebar,
+                  &win->snap_px, &win->snap_w, &win->snap_h);
+        win->fx_cap = false;
+    }
+    if (!win->snap_px && !old_only) { RenderWindowBody(win, true); return; }
+    float rx, ry, rw, rh;
+    wm_fx_rect(win, rx, ry, rw, rh);
+    float sc = win->fx_sc.x;
+    float op = win->fx_op.x;
+    if (op < 0.0f) op = 0.0f;
+    if (op > 1.0f) op = 1.0f;
+    float vw = rw * sc, vh = rh * sc;
+    float vx = rx + (rw - vw) * 0.5f, vy = ry + (rh - vh) * 0.5f;
+    if (win->fx_mode == FX_OPEN)  vy += (1.0f - sc) * 60.0f;   // rises into place (satoru)
+    if (win->fx_mode == FX_CLOSE) vy += (1.0f - sc) * 40.0f;   // sinks a touch as it goes (satoru)
+    float rad = (float)wm_radius(win) * sc;
+    // morph: the old picture crossfades out early in the travel (satoru)
+    int old_a = 0;
+    if (win->fx_mode == FX_MORPH && win->fx_old_px) {
+        float d = 0.0f;
+        for (int k = 0; k < 4; k++) { float e = win->fx_r[k].x - win->fx_r[k].t; d += e < 0 ? -e : e; }
+        float k = 1.0f - d / win->fx_d0;
+        if (k < 0.0f) k = 0.0f;
+        // quick handover early in the travel, while the motion hides it (satoru)
+        float q = (k - 0.08f) / 0.30f;
+        if (q < 0.0f) q = 0.0f;
+        if (q > 1.0f) q = 1.0f;
+        q = q * q * (3.0f - 2.0f * q);
+        old_a = (int)(256.0f * (1.0f - q));
+    }
+    wm_fx_shadow(win, vx, vy, vw, vh, rad, op * op, op >= 0.999f);
+    if (old_only) old_a = 256;
+    WMMotion::Snapshot snap = wm_snap(win);
+    if (!old_only) WMMotion::BlitSmooth(snap, vx, vy, vw, vh, (int)(op * 256.0f));
+    if (old_a > 0) {
+        WMMotion::Snapshot os; os.px = (uint32_t*)win->fx_old_px; os.w = win->fx_old_w; os.h = win->fx_old_h;
+        WMMotion::BlitSmooth(os, vx, vy, vw, vh, (old_a * (int)(op * 256.0f)) >> 8);
+    }
+    const int m = WM_SHADOW_SIZE;
+    wm_fx_damage(win, (int)vx - m, (int)vy - m, (int)(vx + vw) + m + 1, (int)(vy + vh) + m + 1);
 }
 
 bool WindowManager::TaskbarCatch(int win_id, int tx, int ty, int tw, int th,
@@ -2206,31 +3674,35 @@ WMAction WindowManager::GetCurrentAction() {
 // fetch monitor `idx` rect from DisplayManager; returns false if it has no
 // usable geometry. falls back to the primary screen for index 0. (satoru)
 static bool wm_monitor_rect(int idx, int* ox, int* oy, int* ow, int* oh) {
-    const MonitorInfo* m = DisplayManager::GetMonitor(idx);
-    if (!m) {
-        if (idx == 0) {
-            // single-monitor fallback: the whole primary screen.
-            *ox = 0; *oy = 0;
-            *ow = WindowManager::GetScreenWidth();
-            *oh = WindowManager::GetScreenHeight();
-            return true;
-        }
-        return false;
+    // real outputs only (see outputs.h); a single screen is the whole desktop. (satoru)
+    if (!Outputs::Multi()) {
+        if (idx != 0) return false;
+        *ox = 0; *oy = 0;
+        *ow = WindowManager::GetScreenWidth();
+        *oh = WindowManager::GetScreenHeight();
+        return true;
     }
-    int w = (int)m->native_width;
-    int h = (int)m->native_height;
-    if (w <= 0) w = WindowManager::GetScreenWidth();
-    if (h <= 0) h = WindowManager::GetScreenHeight();
-    *ox = (int)m->origin_x;
-    *oy = (int)m->origin_y;
-    *ow = w;
-    *oh = h;
+    const Output* o = Outputs::Get(idx);
+    if (!o || !o->connected) return false;
+    *ox = o->x; *oy = o->y; *ow = o->w; *oh = o->h;
     return true;
+}
+// number of output slots to scan (1 on a single screen); dead ones fail wm_monitor_rect.
+static int wm_out_count() { return Outputs::Multi() ? Outputs::Total() : 1; }
+// the next live output after `cur`, wrapping; cur itself when there is no other.
+static int wm_next_live(int cur) {
+    int n = wm_out_count();
+    for (int k = 1; k <= n; k++) {
+        int c = (cur + k) % n;
+        int a, b, w, h;
+        if (wm_monitor_rect(c, &a, &b, &w, &h)) return c;
+    }
+    return cur;
 }
 
 void WindowManager::UpdateWindowMonitor(Window* win) {
     if (!win) return;
-    int count = DisplayManager::GetMonitorCount();
+    int count = wm_out_count();
     if (count <= 1) { win->monitor_id = 0; return; }
 
     int cx = win->x + win->w / 2;
@@ -2254,13 +3726,17 @@ int WindowManager::GetWindowMonitor(int id) {
 void WindowManager::MoveWindowToMonitor(int win_id, int monitor_index) {
     Window* win = GetWindow(win_id);
     if (!win) return;
-    int count = DisplayManager::GetMonitorCount();
+    int count = wm_out_count();
     if (count <= 1) return;                       // nowhere else to go
     if (monitor_index < 0 || monitor_index >= count) return;
     if (monitor_index == win->monitor_id) return;
 
-    int dox, doy, dow, doh;                        // destination monitor rect
-    if (!wm_monitor_rect(monitor_index, &dox, &doy, &dow, &doh)) return;
+    int dox, doy, dow, doh;                        // destination monitor work area
+    {
+        int fx, fy, fw, fh;
+        if (!wm_monitor_rect(monitor_index, &fx, &fy, &fw, &fh)) return;
+        wm_area_of(monitor_index, &dox, &doy, &dow, &doh);   // keep clear of the menu bar / dock (satoru)
+    }
 
     // preserve the window's relative offset within its current monitor so it
     // lands in roughly the same spot on the destination. (satoru)
@@ -2295,7 +3771,80 @@ void WindowManager::MoveWindowToMonitor(int win_id, int monitor_index) {
     UpdateContentArea(win);
     wm_damage(win->x - WM_SHADOW_SIZE, win->y - WM_SHADOW_SIZE,
               win->w + 2*WM_SHADOW_SIZE, win->h + 2*WM_SHADOW_SIZE);
+    wm_geom_remember(win);
     SerialLogger::Log("WindowManager: moved window to another monitor\r\n");
+}
+
+void WindowManager::SetScreenSize(int w, int h) {
+    if (w > 0) screen_width = w;
+    if (h > 0) screen_height = h;
+    InvalidateDragBackdrop();
+}
+
+void WindowManager::ClampAllToDesktop() {
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        Window* win = &windows[i];
+        if (win->state == WIN_CLOSED) continue;
+        int m = win->monitor_id;
+        if (!Outputs::Multi() || m < 0 || m >= OUTPUT_MAX || !Outputs::IsLive(m)) m = 0;
+        int ax, ay, aw, ah;
+        wm_area_of(m, &ax, &ay, &aw, &ah);
+        wm_damage_window(win);
+        if (win->state == WIN_MAXIMIZED) {
+            win->x = ax; win->y = ay; win->w = aw; win->h = ah;
+        } else {
+            if (win->w > aw) win->w = aw;
+            if (win->h > ah) win->h = ah;
+            if (win->x + win->w > ax + aw) win->x = ax + aw - win->w;
+            if (win->y + win->h > ay + ah) win->y = ay + ah - win->h;
+            if (win->x < ax) win->x = ax;
+            if (win->y < ay) win->y = ay;
+        }
+        win->dirty = true;
+        UpdateContentArea(win);
+        wm_damage_window(win);
+    }
+    InvalidateDragBackdrop();
+}
+
+void WindowManager::RelocateForOutputs(const int* old_x, const int* old_y, int swap_a, int swap_b) {
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        Window* win = &windows[i];
+        if (win->state == WIN_CLOSED) continue;
+        int m = win->monitor_id;
+        if (m < 0 || m >= OUTPUT_MAX) m = 0;
+        // slots exchanged identity: the window stays on the same physical screen
+        if (swap_a >= 0 && swap_b >= 0) {
+            if (m == swap_a) m = swap_b; else if (m == swap_b) m = swap_a;
+        }
+        const Output* o = Outputs::Get(m);
+        wm_damage_window(win);
+        if (o && o->connected) {
+            // old origin belongs to the pre-swap slot
+            int os = m;
+            if (swap_a >= 0 && swap_b >= 0) {
+                if (m == swap_a) os = swap_b; else if (m == swap_b) os = swap_a;
+            }
+            win->x += o->x - old_x[os];
+            win->y += o->y - old_y[os];
+            win->monitor_id = m;
+        } else {
+            // its output was switched off: land on the primary work area
+            int ax, ay, aw, ah;
+            wm_area_of(0, &ax, &ay, &aw, &ah);
+            if (win->w > aw) win->w = aw;
+            if (win->h > ah) win->h = ah;
+            if (win->state == WIN_MAXIMIZED) { win->x = ax; win->y = ay; win->w = aw; win->h = ah; }
+            else {
+                win->x = ax + (aw - win->w) / 2;
+                win->y = ay + (ah - win->h) / 2;
+            }
+            win->monitor_id = 0;
+        }
+        win->dirty = true;
+        UpdateContentArea(win);
+        wm_damage_window(win);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2355,13 +3904,17 @@ bool WindowManager::HandleContextMenuClick(int mx, int my) {
     int target = wm_ctx_win_id;
     CloseContextMenu();
 
+    if (item == 1 && target > 0) { ToggleFullscreen(target); return true; }
+    if (item == 2 && target > 0) { ToggleMaximize(target); return true; }
+    if (item == 3 && target > 0) { Minimize(target); return true; }
+    if (item == 4 && target > 0) { UserCloseWindow(target); return true; }
     if (item == 0 && target > 0) {
         // "Move to other monitor": pick the next output after the window's
         // current one, wrapping. with two monitors this is the other one. (satoru)
-        int count = DisplayManager::GetMonitorCount();
+        int count = wm_out_count();
         if (count >= 2) {
             int cur = GetWindowMonitor(target);
-            int next = (cur + 1) % count;
+            int next = wm_next_live(cur);
             MoveWindowToMonitor(target, next);
         }
     }
@@ -2379,13 +3932,32 @@ void WindowManager::RenderContextMenu() {
     unsigned int e = Timer::GetRealMs() - wm_ctx_open_ms;
     float t = (e >= KSS::Motion::Window) ? 1.0f
                                          : Animation::EaseMs(e, KSS::Motion::Window, Animation::EaseOutCubic);
+    if (UIStyle::Modern()) {
+        // the shared shell menu (same look as the desktop menu) (satoru)
+        Window* tw = GetWindow(wm_ctx_win_id);
+        const char* items[WM_CTX_ITEMS] = {
+            Outputs::Connected() >= 2 ? "Move to Other Display" : "~Move to Other Display",
+            tw->state == WIN_FULLSCREEN ? "Exit Full Screen" : "Enter Full Screen",
+            tw->state == WIN_MAXIMIZED ? "Restore" : "Maximize",
+            "Minimize",
+            "!Close",
+        };
+        int hv = -1;
+        if (Mouse::mx >= wm_ctx_x && Mouse::mx < wm_ctx_x + WM_CTX_W && Mouse::my >= wm_ctx_y + 4) {
+            hv = (Mouse::my - (wm_ctx_y + 4)) / WM_CTX_ITEM_H;
+            if (hv >= WM_CTX_ITEMS) hv = -1;
+        }
+        MDraw::Menu(wm_ctx_x, wm_ctx_y, WM_CTX_W, 4, WM_CTX_ITEM_H, items, WM_CTX_ITEMS, hv, t);
+        wm_damage(wm_ctx_x - 30, wm_ctx_y - 30, WM_CTX_W + 60, menu_h + 70);
+        return;
+    }
     int draw_h = (int)(menu_h * (0.62f + 0.38f * t) + 0.5f);
     if (draw_h < 6) draw_h = 6;
     // panel background + border (reuse the titlebar palette). (satoru)
     Graphics::FillRoundedRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h, 6, COL_TITLE_FOCUSED);
     Graphics::DrawRect(wm_ctx_x, wm_ctx_y, WM_CTX_W, draw_h, COL_BORDER);
 
-    int count = DisplayManager::GetMonitorCount();
+    int count = Outputs::Connected();
     // entry 0 - "Move to other monitor" (dimmed when only one output). (satoru)
     int iy = wm_ctx_y + 4;
     uint32_t txt = (count >= 2) ? COL_TITLE_TEXT : COL_TITLE_TEXT_DIM;
@@ -2413,7 +3985,139 @@ int WindowManager::CreateWindow(const char* title, int x, int y, int w, int h,
 //  Compositor-side public API: animation tick, config reload, alpha,
 //  taskbar anchor.  See window_manager.h.
 // ─────────────────────────────────────────────────────────────────────
+// damage the union of what a spring-animated window painted last frame and
+// this frame (shadow included), then remember this frame's bounds. (satoru)
+static void wm_fx_damage(Window* w, int x0, int y0, int x1, int y1) {
+    int ax0 = x0, ay0 = y0, ax1 = x1, ay1 = y1;
+    if (w->fx_bx1 > w->fx_bx0 && w->fx_by1 > w->fx_by0) {
+        if (w->fx_bx0 < ax0) ax0 = w->fx_bx0;
+        if (w->fx_by0 < ay0) ay0 = w->fx_by0;
+        if (w->fx_bx1 > ax1) ax1 = w->fx_bx1;
+        if (w->fx_by1 > ay1) ay1 = w->fx_by1;
+    }
+    if (ax1 > ax0 && ay1 > ay0) wm_damage(ax0, ay0, ax1 - ax0, ay1 - ay0);
+    w->fx_bx0 = x0; w->fx_by0 = y0; w->fx_bx1 = x1; w->fx_by1 = y1;
+}
+
+// spring step for one window; returns after retiring a finished motion. (satoru)
+static void wm_fx_tick(Window* w, unsigned long long now, int& focused,
+                           int& capture_id, int& action_id, WMAction& action) {
+    if (!w->fx_us) w->fx_us = now;
+    float dt = (float)(now - w->fx_us) / 1000000.0f;
+    if (dt > 0.5f) dt = 0.5f;
+    w->fx_us = now;
+    w->fx_el.t = w->focused ? 1.0f : 0.0f;
+    WMMotion::SpringStep(w->fx_el, wm_resp(0.30f), 1.0f, dt);
+    switch (w->fx_mode) {
+        case FX_OPEN:
+            WMMotion::SpringStep(w->fx_sc, wm_resp(0.36f), 0.80f, dt);
+            WMMotion::SpringStep(w->fx_op, wm_resp(0.20f), 1.0f, dt);
+            if (WMMotion::SpringRest(w->fx_sc, 0.0015f) && WMMotion::SpringRest(w->fx_op, 0.004f)) {
+                WMMotion::SpringSet(w->fx_sc, 1.0f); WMMotion::SpringSet(w->fx_op, 1.0f);
+                w->fx_mode = FX_NONE;
+                wm_snap_release(w);
+                wm_fx_damage(w, w->x - WM_SHADOW_SIZE, w->y - WM_SHADOW_SIZE,
+                             w->x + w->w + WM_SHADOW_SIZE, w->y + w->h + WM_SHADOW_SIZE);
+                w->fx_bx0 = w->fx_bx1 = 0;
+            }
+            break;
+        case FX_CLOSE:
+            WMMotion::SpringStep(w->fx_sc, wm_resp(0.30f), 1.0f, dt);
+            WMMotion::SpringStep(w->fx_op, wm_resp(0.19f), 1.0f, dt);
+            if (w->fx_rect)   // a morph in flight keeps travelling while it fades (satoru)
+                for (int k = 0; k < 4; k++) WMMotion::SpringStep(w->fx_r[k], wm_resp(0.42f), 0.86f, dt);
+            if (w->fx_op.x < 0.015f) {
+                wm_fx_damage(w, 0, 0, 0, 0);
+                w->fx_bx0 = w->fx_bx1 = 0;
+                wm_damage_window(w);
+                wm_snap_release(w);
+                wm_fx_old_release(w);
+                w->fx_mode = FX_NONE;
+                w->fx_rect = false;
+                w->anim_kind = 0;
+                w->state = WIN_CLOSED;
+                w->visible = false;
+                w->had_last = false;
+                if (focused == w->id) focused = -1;
+                if (capture_id == w->id) capture_id = -1;
+                if (action_id == w->id) { action_id = -1; action = WM_NONE; }
+            }
+            break;
+        case FX_MIN:
+            WMMotion::SpringStep(w->fx_gn, wm_resp(0.56f), 1.0f, dt);
+            if (w->fx_gn.x > 0.86f && !w->fx_caught) {
+                // the dock tile takes the landing (squash + flash) (satoru)
+                w->fx_caught = true;
+                w->catch_kind = 1;
+                w->catch_ms = Timer::GetRealMs();
+            }
+            if (w->fx_gn.x > 0.985f) {
+                WMMotion::SpringSet(w->fx_gn, 1.0f);
+                wm_fx_damage(w, 0, 0, 0, 0);
+                w->fx_bx0 = w->fx_bx1 = 0;
+                wm_damage_window(w);
+                w->fx_mode = FX_NONE;
+                w->anim_kind = 0;
+                w->state = WIN_MINIMIZED;
+                w->visible = false;
+                w->had_last = false;
+            }
+            break;
+        case FX_UNMIN:
+            WMMotion::SpringStep(w->fx_gn, wm_resp(0.50f), 1.0f, dt);
+            if (w->fx_gn.x < 0.004f && WMMotion::SpringRest(w->fx_gn, 0.004f)) {
+                WMMotion::SpringSet(w->fx_gn, 0.0f);
+                wm_fx_damage(w, 0, 0, 0, 0);
+                w->fx_bx0 = w->fx_bx1 = 0;
+                wm_damage_window(w);
+                wm_snap_release(w);
+                w->fx_mode = FX_NONE;
+                w->anim_kind = 0;
+            }
+            break;
+        case FX_MORPH: {
+            w->fx_r[0].t = (float)w->x; w->fx_r[1].t = (float)w->y;
+            w->fx_r[2].t = (float)w->w; w->fx_r[3].t = (float)w->h;
+            bool rest = true;
+            for (int k = 0; k < 4; k++) {
+                WMMotion::SpringStep(w->fx_r[k], wm_resp(0.42f), 0.86f, dt);
+                if (!WMMotion::SpringRest(w->fx_r[k], 0.35f)) rest = false;
+            }
+            if (rest) {
+                wm_fx_damage(w, w->x - WM_SHADOW_SIZE, w->y - WM_SHADOW_SIZE,
+                             w->x + w->w + WM_SHADOW_SIZE, w->y + w->h + WM_SHADOW_SIZE);
+                w->fx_bx0 = w->fx_bx1 = 0;
+                w->fx_mode = FX_NONE;
+                w->fx_rect = false;
+                wm_snap_release(w);
+                wm_fx_old_release(w);
+            }
+            break;
+        }
+        default: break;
+    }
+    if (w->fx_mode == FX_NONE && WMMotion::SpringRest(w->fx_el, 0.002f)) {
+        w->fx_el.x = w->fx_el.t; w->fx_el.v = 0.0f;
+        w->fx_us = 0;   // idle: the next motion starts its clock fresh (satoru)
+    } else if (w->fx_mode == FX_NONE && w->visible && w->state != WIN_MINIMIZED) {
+        // the focus elevation is still easing: keep its shadow band painted (satoru)
+        wm_damage(w->x - WM_SHADOW_SIZE, w->y - WM_SHADOW_SIZE,
+                  w->w + 2 * WM_SHADOW_SIZE, w->h + 2 * WM_SHADOW_SIZE);
+    }
+}
+
 void WindowManager::TickAnimations() {
+    wm_geom_flush(Timer::GetRealMs());
+    if (wm_spring) {
+        unsigned long long now_us = wm_now_us();
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            Window* w = &windows[i];
+            if (w->state == WIN_CLOSED) continue;
+            wm_fx_tick(w, now_us, focused_id, wm_input_capture_id,
+                                  action_window_id, current_action);
+        }
+        return;
+    }
     unsigned int now = Timer::GetRealMs();
     for (int i = 0; i < WM_MAX_WINDOWS; i++) {
         Window* w = &windows[i];
@@ -2467,6 +4171,10 @@ void WindowManager::ReloadFromConfig() {
     comp_default_alpha        = UIConfig::Int ("compositor.window_alpha",         255);
     comp_frosted_titlebar     = UIConfig::Bool("compositor.frosted_titlebar",     true);
     comp_reduced_motion       = UIConfig::Bool("compositor.reduced_motion",       false);
+    {   // spring (default) or the classic timed motion drafts (satoru)
+        const char* m = UIConfig::Str("compositor.motion", "spring");
+        wm_spring = !(m && m[0] == 'c');
+    }
 
     // sanity-clamp
     if (comp_shadow_radius      < 0)   comp_shadow_radius = 0;
@@ -2479,15 +4187,12 @@ void WindowManager::ReloadFromConfig() {
     if (comp_default_alpha      > 255) comp_default_alpha = 255;
 
     // Display: refresh-rate driven frame pacing.
-    int refresh_hz = UIConfig::Int("display.refresh_hz", 60);
-    bool vsync     = UIConfig::Bool("display.vsync",     true);
-    if (refresh_hz < 24)  refresh_hz = 24;
-    if (refresh_hz > 360) refresh_hz = 360;
-    if (vsync) {
-        Graphics::SetTargetFPS((uint32_t)refresh_hz);
-    } else {
-        Graphics::SetTargetFPS(360);
-    }
+    // the frame pacer owns the rate now (display.refresh_mode auto/fixed,
+    // kurono.hz, the detected panel rate, the adaptive step). the old
+    // display.refresh_hz key defaulted to 60 in every ui.conf and silently
+    // pinned the desktop to 60 whatever the panel could do. (satoru)
+    FramePacer::ReloadConfig();
+    int refresh_hz = (int)FramePacer::CapHz();
     // Drag throttle: 1 frame interval - coalesces multi-event-per-frame
     // pointer storms into a single window move so we never repaint twice
     // for the same monitor scan-out.

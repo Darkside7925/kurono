@@ -3,6 +3,10 @@
 #include "../drivers/graphics.h"
 #include "../kernel/heap.h"
 #include "style.h"
+#include "font.h"
+#include "wm_motion.h"
+#include "../system/ui_config.h"
+#include "../drivers/timer.h"
 
 // the modern icon artwork: 128x128 premultiplied argb bitmaps, one per
 // AppIcons::Id (Makefile objcopy of assets/icons/modern_icons.bin, built from
@@ -374,4 +378,113 @@ void AppTile(int id, int x, int y, int size) {
     AppIcons::Draw(id, x + pad, y + pad, size - pad * 2);
 }
 
+// ── shared shell surfaces (satoru) ───────────────────────────────────────
+static Palette g_pal;
+static uint32_t g_pal_ms = 0;
+static bool g_pal_ok = false;
+
+const Palette& Pal() {
+    uint32_t now = Timer::GetRealMs();
+    if (!g_pal_ok || now - g_pal_ms > 250u) {
+        g_pal_ms = now;
+        g_pal_ok = true;
+        const char* ap = UIConfig::Str("ui.appearance", "dark");
+        bool light = ap && (ap[0] == 'l' || ap[0] == 'L');
+        g_pal.dark = !light;
+        g_pal.accent = UIConfig::Color("theme.accent", 0xFF0A84FF) | 0xFF000000u;
+        if (light) {
+            g_pal.panel = 0xFFF6F6F8; g_pal.panel2 = 0xFFECECF0; g_pal.line = 0xFF000000u;
+            g_pal.text = 0xFF1C1C1E; g_pal.text2 = 0xFF6E6E76; g_pal.hover = g_pal.accent;
+            g_pal.danger = 0xFFE5342B;
+        } else {
+            g_pal.panel = 0xFF2A2B33; g_pal.panel2 = 0xFF22232A; g_pal.line = 0xFFFFFFFFu;
+            g_pal.text = 0xFFF2F3F8; g_pal.text2 = 0xFF9A9CA8; g_pal.hover = g_pal.accent;
+            g_pal.danger = 0xFFFF6B61;
+        }
+    }
+    return g_pal;
 }
+
+void Menu(int x, int y, int w, int top, int item_h, const char* const* items, int n, int hover, float t) {
+    const Palette& P = Pal();
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    int h = top * 2 + n * item_h;
+    for (int i = 0; i < n; i++) if (items[i][0] == '-' && items[i][1] == 0) h -= item_h - 9;
+    // grows from its anchor corner: 94% -> 100% with the fade (satoru)
+    float sc = 0.94f + 0.06f * t;
+    int dw = (int)(w * sc + 0.5f), dh = (int)(h * sc + 0.5f);
+    int a = (int)(255.0f * t);
+    if (a <= 0) return;
+    WMMotion::SoftShadow((float)x, (float)y, (float)dw, (float)dh, 10.0f, 18.0f, 8.0f, (P.dark ? 110 : 60) * a / 255, false);
+    RoundRect(x, y, dw, dh, 10, P.panel, P.panel2, (P.dark ? 238 : 245) * a / 255);
+    RoundOutline(x, y, dw, dh, 10, P.line, (P.dark ? 34 : 22) * a / 255);
+    if (t < 0.55f) return;   // rows appear once the panel has nearly opened (satoru)
+    int ta = (int)(255.0f * (t - 0.55f) / 0.45f);
+    int iy = y + top;
+    for (int i = 0; i < n; i++) {
+        const char* it = items[i];
+        if (it[0] == '-' && it[1] == 0) {
+            Graphics::FillRectAlpha(x + 10, iy + 4, dw - 20, 1, (uint8_t)((P.dark ? 30 : 24) * ta / 255),
+                                    P.dark ? 0xFFFFFFFFu : 0xFF000000u);
+            iy += 9;
+            continue;
+        }
+        bool danger = it[0] == '!', dis = it[0] == '~';
+        const char* label = (danger || dis) ? it + 1 : it;
+        uint32_t col = dis ? P.text2 : (danger ? P.danger : P.text);
+        if (i == hover && !dis) {
+            RoundRect(x + 5, iy + 1, dw - 10, item_h - 2, 6, P.hover, P.hover, 235 * ta / 255);
+            col = 0xFFFFFFFFu;
+        }
+        col = Mix(P.panel, col, ta);
+        FontTTF::DrawText(x + 14, iy + (item_h - 17) / 2, 14.5f, label, col);
+        iy += item_h;
+    }
+}
+
+// small vector badge glyphs for toasts (satoru)
+static void badge(int cx, int cy, int r, int kind, uint32_t c, int alpha) {
+    Circle(cx, cy, r, c, alpha);
+    uint32_t w = 0xFFFFFFFFu;
+    if (kind == 1) {          // check (satoru)
+        for (int k = 0; k < 4; k++) RoundRect(cx - 5 + k, cy + k - 1, 2, 2, 1, w, alpha);
+        for (int k = 0; k < 7; k++) RoundRect(cx - 1 + k, cy + 2 - k, 2, 2, 1, w, alpha);
+    } else if (kind == 2 || kind == 3) {   // exclamation / cross as a bar + dot (satoru)
+        if (kind == 2) {
+            RoundRect(cx - 1, cy - 6, 3, 8, 1, w, alpha);
+            RoundRect(cx - 1, cy + 4, 3, 3, 1, w, alpha);
+        } else {
+            for (int k = -4; k <= 4; k++) {
+                RoundRect(cx + k - 1, cy + k - 1, 3, 3, 1, w, alpha);
+                RoundRect(cx + k - 1, cy - k - 1, 3, 3, 1, w, alpha);
+            }
+        }
+    } else {                  // info (satoru)
+        RoundRect(cx - 1, cy - 6, 3, 3, 1, w, alpha);
+        RoundRect(cx - 1, cy - 2, 3, 9, 1, w, alpha);
+    }
+}
+
+void Toast(int x, int y, int w, int h, int kind, const char* title, const char* body, int alpha) {
+    if (alpha <= 0) return;
+    const Palette& P = Pal();
+    static const uint32_t kc[4] = { 0xFF0A84FF, 0xFF30C85A, 0xFFFFB020, 0xFFFF453A };
+    uint32_t c = kc[(kind < 0 || kind > 3) ? 0 : kind];
+    WMMotion::SoftShadow((float)x, (float)y, (float)w, (float)h, 16.0f, 22.0f, 10.0f, (P.dark ? 120 : 70) * alpha / 255, false);
+    RoundRect(x, y, w, h, 16, P.panel, P.panel2, (P.dark ? 240 : 248) * alpha / 255);
+    RoundOutline(x, y, w, h, 16, P.line, (P.dark ? 32 : 20) * alpha / 255);
+    badge(x + 30, y + h / 2, 13, kind, c, alpha);
+    uint32_t tc = Mix(P.panel, P.text, alpha), bc = Mix(P.panel, P.text2, alpha);
+    int tx = x + 54;
+    if (body && body[0]) {
+        FontTTF::DrawText(tx, y + h / 2 - 20, 15.0f, title, tc, true);
+        FontTTF::DrawText(tx, y + h / 2 + 1, 14.0f, body, bc);
+    } else {
+        FontTTF::DrawText(tx, y + (h - 18) / 2, 15.0f, title, tc, true);
+    }
+}
+
+}
+
+// end (satoru)

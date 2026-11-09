@@ -67,7 +67,7 @@ void LinuxInit::Init() {
         LSVC_TYPE_ONESHOT, LTGT_BASIC, svc_hostname, nullptr, "mount-proc", false);
     RegisterService("shared-mounts", "Mount shared Kurono directories",
         LSVC_TYPE_ONESHOT, LTGT_BASIC, svc_shared_mounts, nullptr, "mount-dev", true);
-    RegisterService("user-sync",     "Synchronize SUPR users to /etc/passwd",
+    RegisterService("user-sync",     "Synchronize KEN users to /etc/passwd",
         LSVC_TYPE_ONESHOT, LTGT_BASIC, svc_user_sync, nullptr, "shared-mounts", true);
 
     RegisterService("networking",    "Network configuration",
@@ -396,7 +396,7 @@ void LinuxInit::svc_shared_mounts() {
 void LinuxInit::svc_user_sync() {
     UserBridge::Init();
     UserBridge::SetDirection(UB_BIDIRECTIONAL);
-    UserBridge::SetConflictPolicy(UB_SUPR_WINS);
+    UserBridge::SetConflictPolicy(UB_KEN_WINS);
     UserBridge::Sync();
 }
 

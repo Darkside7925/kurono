@@ -6,6 +6,7 @@
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
 #include "../linux/linux_devices.h"
+#include "vdevices.h"
 
 // ----------------------------------------------------------------- statics
 VPCIDevice    VirtIOGPUHost::dev;
@@ -346,6 +347,8 @@ bool VirtIOGPUHost::BarRead(VPCIDevice*, int bar, uint32_t off,
     if (off >= BAR_ISR_OFF && off < BAR_ISR_OFF + BAR_ISR_LEN) {
         value = isr_status;
         isr_status = 0; // read-clear
+        // reading the isr deasserts intx (virtio 1.x 4.1.4.5) (satoru)
+        VirtualDevices::GetSlavePIC().SetIRQ(dev.irq_line - 8, false);
         return true;
     }
     if (off >= BAR_DEVCFG_OFF && off < BAR_DEVCFG_OFF + BAR_DEVCFG_LEN) {
@@ -561,6 +564,9 @@ void VirtIOGPUHost::NotifyQueue(int qid) {
 
     // raise virtio isr (used buffer notification = bit 0)
     isr_status |= 0x01;
+    // and actually assert intx: irq 11 = slave pic pin 3. without it the
+    // guest driver slept forever waiting for its first response (satoru)
+    VirtualDevices::GetSlavePIC().SetIRQ(dev.irq_line - 8, true);
 }
 
 // ----------------------------------------------------------------- cmd dispatch

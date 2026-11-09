@@ -14,6 +14,8 @@
 #include "../linux/linux_devices.h"
 #include "v9fs.h"
 #include "../security/ksa.h"   // ksa restricted result channel (vmcall 0x4b) (satoru)
+#include "../drivers/cpu_detect.h"
+#include "../kernel/time.h"
 
 CPUIDOverride VMExitHandler::cpuid_overrides[MAX_CPUID_OVERRIDES];
 int           VMExitHandler::cpuid_override_count = 0;
@@ -25,6 +27,29 @@ static inline void do_cpuid(uint32_t leaf, uint32_t& eax, uint32_t& ebx,
     asm volatile("cpuid"
         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
         : "a"(leaf), "c"(0));
+}
+
+// features the guest must not see because this vmm cannot back them (satoru):
+//  - xsave/osxsave/avx/fma/f16c: xcr0 is not switched and xsetbv is only
+//    skipped, so the guest would run avx with the host's xcr0 and #ud
+//  - tsc-deadline, x2apic: the lapic is emulated in xapic mmio mode only
+//  - leaf 7 invpcid: needs secondary control "enable invpcid" (sdm 25.3),
+//    otherwise invpcid is #ud in non-root mode. linux 6.18 hit exactly that
+//    in native_flush_tlb_global and panicked in setup_arch
+//  - leaf 7 waitpkg: needs "enable user wait and pause"
+//  - leaf 1 edx.apic: lapic mmio would need instruction decode, which the
+//    ept-violation path does not do (it advanced rip by an undefined
+//    instruction length and linux oopsed in native_apic_mem_read)
+static void MaskGuestCPUID(uint32_t leaf, uint32_t subleaf,
+                           uint32_t& ebx, uint32_t& ecx, uint32_t& edx) {
+    if (leaf == 1) {
+        edx &= ~(1u << 9);
+        ecx &= ~((1u << 12) | (1u << 21) | (1u << 24) | (1u << 26) |
+                 (1u << 27) | (1u << 28) | (1u << 29));
+    } else if (leaf == 7 && subleaf == 0) {
+        ebx &= ~(1u << 10);
+        ecx &= ~(1u << 5);
+    }
 }
 
 //  init
@@ -40,10 +65,40 @@ void VMExitHandler::Init() {
     uint32_t eax, ebx, ecx, edx;
     do_cpuid(1, eax, ebx, ecx, edx);
     ecx &= ~CPUID_VMX_BIT;       // hide vmx from guest
-    ecx &= ~CPUID_HYPERVISOR_BIT; // don't expose hypervisor
+    // the hypervisor bit stays set: linux only looks at the 0x40000000 leaves
+    // (kvm-clock, see below) when it is (satoru)
+    ecx |= CPUID_HYPERVISOR_BIT;
+    MaskGuestCPUID(1, 0, ebx, ecx, edx); // (satoru)
     AddCPUIDOverride(1, 0, eax, ebx, ecx, edx);
 
     SerialLogger::Log("VMExit: Handler initialized with default CPUID overrides\r\n");
+}
+
+// mov dr exits (proc control bit 23): keep dr0-3/dr6 virtual and route dr7
+// to the vmcs guest field, which "load debug controls" puts in place on entry.
+// the handler was missing, so linux's first __show_regs / hw_breakpoint init
+// made the vm fatal (satoru)
+static uint64_t g_guest_dr[8] = { 0, 0, 0, 0, 0, 0, 0xFFFF0FF0ULL, 0x400ULL };
+
+static VMExitAction HandleMovDR(vCPU* cpu) {
+    uint64_t q = cpu->exit_qualification;
+    uint32_t dr = (uint32_t)(q & 7);
+    bool from_dr = (q >> 4) & 1;
+    uint32_t reg = (uint32_t)((q >> 8) & 0xF);
+    if (from_dr) {
+        uint64_t v = (dr == 7) ? VMM::VMRead(0x681A) : g_guest_dr[dr];
+        if (dr == 4) v = g_guest_dr[6];
+        if (dr == 5) v = VMM::VMRead(0x681A);
+        if (reg == 4) VMM::VMWrite(VMCS_GUEST_RSP, v);
+        else cpu->regs[reg] = v;
+    } else {
+        uint64_t v = (reg == 4) ? VMM::VMRead(VMCS_GUEST_RSP) : cpu->regs[reg];
+        if (dr == 7 || dr == 5) VMM::VMWrite(0x681A, (v & 0xFFFFFFFFULL) | 0x400ULL);
+        else if (dr == 4 || dr == 6) g_guest_dr[6] = v;
+        else g_guest_dr[dr] = v;
+    }
+    VMExitHandler::AdvanceGuestRIP(cpu);
+    return VMEXIT_HANDLED;
 }
 
 //  main dispatch - intel vt-x
@@ -130,6 +185,14 @@ VMExitAction VMExitHandler::HandleExit(vCPU* cpu) {
 
         case EXIT_REASON_XSETBV:
             return HandleXSETBV(cpu);
+
+        case EXIT_REASON_MOV_DR: // (satoru)
+            return HandleMovDR(cpu);
+
+        case EXIT_REASON_INT_WINDOW: // guest can take an irq now (satoru)
+            VMM::VMWrite(VMCS_PROC_BASED_CONTROLS,
+                         VMM::VMRead(VMCS_PROC_BASED_CONTROLS) & ~(uint64_t)PROC_INT_WINDOW_EXIT);
+            return VMEXIT_HANDLED;
 
         case EXIT_REASON_INVALID_GUEST:
             SerialLogger::Log("VMExit: INVALID GUEST STATE - fatal\r\n");
@@ -338,11 +401,20 @@ VMExitAction VMExitHandler::HandleCPUID(vCPU* cpu) {
     asm volatile("cpuid"
         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
         : "a"(leaf), "c"(subleaf));
+    // the 0x40000000 range belongs to the outer kvm when nested; passing it
+    // through advertises kvmclock msrs we do not emulate (satoru)
+    if (leaf >= 0x40000000 && leaf <= 0x4FFFFFFF) eax = ebx = ecx = edx = 0;
+    // our own kvm leaves: the signature plus kvm-clock (clocksource2 + the
+    // stable bit) and nothing else, so the guest gets an exact clock and tsc
+    // frequency without calibrating against the emulated pit (satoru)
+    if (leaf == 0x40000000) { eax = 0x40000001; ebx = 0x4B4D564B; ecx = 0x564B4D56; edx = 0x4D; }
+    else if (leaf == 0x40000001) { eax = (1u << 3) | (1u << 24); ebx = ecx = edx = 0; }
+    MaskGuestCPUID(leaf, subleaf, ebx, ecx, edx);
 
     // always hide vmx/svm capability from guest
     if (leaf == 1) {
         ecx &= ~CPUID_VMX_BIT;
-        ecx &= ~CPUID_HYPERVISOR_BIT;
+        ecx |= CPUID_HYPERVISOR_BIT; // (satoru)
     }
 
     cpu->regs[0] = eax; // eax
@@ -357,9 +429,12 @@ VMExitAction VMExitHandler::HandleCPUID(vCPU* cpu) {
 //  hlt exit - guest executed hlt
 
 VMExitAction VMExitHandler::HandleHLT(vCPU* cpu) {
-    SerialLogger::Log("VMExit: Guest HLT\r\n");
-    // in a real hypervisor, we'd yield this vcpu until next interrupt
-    // for now, advance past hlt and re-enter
+    // an idle guest halts thousands of times a second; logging each one
+    // flooded the host serial log and slowed the guest (satoru)
+    if (stats.hlt_exits <= 4) SerialLogger::Log("VMExit: Guest HLT\r\n");
+    // advance past the hlt; the run loop sleeps the host thread until an
+    // interrupt is pending instead of spinning the cpu (satoru)
+    Hypervisor::NoteHalt();
     AdvanceGuestRIP(cpu);
     return VMEXIT_HANDLED;
 }
@@ -416,13 +491,18 @@ VMExitAction VMExitHandler::HandleIO(vCPU* cpu) {
     }
 
     if (!handled) {
-        // unhandled port - log it for debugging
-        SerialLogger::Log("VMExit: Unhandled I/O port=0x");
-        SerialLogger::LogHex(io.port);
-        SerialLogger::Log(io.is_out ? " OUT" : " IN");
-        SerialLogger::Log(" size=");
-        SerialLogger::LogDec(io.size);
-        SerialLogger::Log("\r\n");
+        // unhandled port - log it for debugging (the first few: linux probes
+        // every legacy port at boot) (satoru)
+        static uint32_t s_unh_budget = 64;
+        if (s_unh_budget) {
+            s_unh_budget--;
+            SerialLogger::Log("VMExit: Unhandled I/O port=0x");
+            SerialLogger::LogHex(io.port);
+            SerialLogger::Log(io.is_out ? " OUT" : " IN");
+            SerialLogger::Log(" size=");
+            SerialLogger::LogDec(io.size);
+            SerialLogger::Log("\r\n");
+        }
         // return 0xff for in from unhandled port
         if (!io.is_out) {
             if (io.size == 1) cpu->regs[0] = (cpu->regs[0] & 0xFFFFFF00) | 0xFF;
@@ -448,12 +528,169 @@ IOAccessInfo VMExitHandler::DecodeIOAccess(uint64_t qualification) {
 
 //  msr read/write exits
 
+// plain store for msrs the guest writes and reads back (pat, misc_enable,
+// mtrrs ...). unknown msrs used to read 0 whatever was written (satoru)
+struct GuestMSRSlot { uint32_t msr; bool used; uint64_t val; };
+static GuestMSRSlot g_guest_msr_store[48];
+
+static bool GuestMSRStoreGet(uint32_t msr, uint64_t& out) {
+    for (auto& s : g_guest_msr_store) {
+        if (s.used && s.msr == msr) { out = s.val; return true; }
+    }
+    return false;
+}
+
+static void GuestMSRStoreSet(uint32_t msr, uint64_t val) {
+    for (auto& s : g_guest_msr_store) {
+        if (s.used && s.msr == msr) { s.val = val; return; }
+    }
+    for (auto& s : g_guest_msr_store) {
+        if (!s.used) { s.used = true; s.msr = msr; s.val = val; return; }
+    }
+}
+
+// returns true when the msr lives in the vmcs or the vmm swap table (satoru)
+static bool GuestMSRRead(uint32_t msr, uint64_t& value) {
+    if (msr == 0xC0000080) { value = VMM::VMRead(VMCS_GUEST_IA32_EFER); return true; }
+    if (msr == 0xC0000100) { value = VMM::VMRead(VMCS_GUEST_FS_BASE); return true; }
+    if (msr == 0xC0000101) { value = VMM::VMRead(VMCS_GUEST_GS_BASE); return true; }
+    if (uint64_t* p = VMM::GuestSwitchedMSR(msr)) { value = *p; return true; }
+    return false;
+}
+
+static bool GuestMSRWrite(uint32_t msr, uint64_t value) {
+    if (msr == 0xC0000080) {
+        // lma (bit 10) is read-only and tracks cr0.pg && lme (satoru)
+        uint64_t cur = VMM::VMRead(VMCS_GUEST_IA32_EFER);
+        VMM::VMWrite(VMCS_GUEST_IA32_EFER, (value & ~(1ULL << 10)) | (cur & (1ULL << 10)));
+        return true;
+    }
+    if (msr == 0xC0000100) { VMM::VMWrite(VMCS_GUEST_FS_BASE, value); return true; }
+    if (msr == 0xC0000101) { VMM::VMWrite(VMCS_GUEST_GS_BASE, value); return true; }
+    if (uint64_t* p = VMM::GuestSwitchedMSR(msr)) { *p = value; return true; }
+    return false;
+}
+
+//  kvm-clock (pvclock) for the guest (satoru)
+//
+// the guest reads the host tsc directly (no rdtsc exiting, no offset), so one
+// pvclock record written when the guest enables it stays valid: system time =
+// (tsc - tsc_timestamp) scaled by mul/shift. the record is rewritten on every
+// enable. the wall clock record holds the utc time at guest system time 0.
+static uint64_t g_kvmclock_tsc0 = 0;      // tsc at guest system time 0
+static uint64_t g_kvmclock_hz = 0;
+static uint32_t g_kvmclock_mul = 0;
+static int8_t   g_kvmclock_shift = 0;
+static uint32_t g_kvmclock_ver = 0;
+static uint64_t g_msr_kvm_systime = 0, g_msr_kvm_wall = 0;
+
+static inline uint64_t kc_rdtsc() { uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+
+// kvm_get_time_scale(): ns = ((tsc << shift) * mul) >> 32
+static void kc_scale(uint64_t scaled_hz, uint64_t base_hz, int8_t* pshift, uint32_t* pmul) {
+    uint64_t tps64 = base_hz, scaled64 = scaled_hz;
+    int32_t shift = 0;
+    while (tps64 > scaled64 * 2 || (tps64 & 0xFFFFFFFF00000000ULL)) { tps64 >>= 1; shift--; }
+    uint32_t tps32 = (uint32_t)tps64;
+    while (tps32 <= scaled64 || (scaled64 & 0xFFFFFFFF00000000ULL)) {
+        if ((scaled64 & 0xFFFFFFFF00000000ULL) || (tps32 & 0x80000000u)) scaled64 >>= 1;
+        else tps32 <<= 1;
+        shift++;
+    }
+    *pshift = (int8_t)shift;
+    *pmul = (uint32_t)((scaled64 << 32) / tps32);
+}
+
+static uint64_t kc_tsc_to_ns(uint64_t delta) {
+    if (g_kvmclock_shift < 0) delta >>= -g_kvmclock_shift; else delta <<= g_kvmclock_shift;
+    return (uint64_t)(((unsigned __int128)delta * g_kvmclock_mul) >> 32);
+}
+
+void VMExitHandler::ResetGuestClock() {
+    g_kvmclock_hz = CPUDetect::GetInfo().frequency.tsc_frequency;
+    if (g_kvmclock_hz < 1000000ULL) g_kvmclock_hz = 2000000000ULL;
+    kc_scale(1000000000ULL, g_kvmclock_hz, &g_kvmclock_shift, &g_kvmclock_mul);
+    g_kvmclock_tsc0 = kc_rdtsc();
+    g_msr_kvm_systime = g_msr_kvm_wall = 0;
+}
+
+uint64_t VMExitHandler::GuestClockNs() {
+    if (!g_kvmclock_tsc0) return 0;
+    return kc_tsc_to_ns(kc_rdtsc() - g_kvmclock_tsc0);
+}
+
+static void kc_write_systime(uint64_t gpa) {
+    struct __attribute__((packed)) PV {
+        uint32_t version, pad0; uint64_t tsc_timestamp, system_time;
+        uint32_t mul; int8_t shift; uint8_t flags; uint8_t pad[2];
+    } pv;
+    uint8_t* h = GuestMemoryManager::GuestPhysToHost(gpa);
+    if (!h || GuestMemoryManager::ContigBytes(gpa) < sizeof(pv)) return;
+    volatile PV* g = (volatile PV*)h;
+    g_kvmclock_ver += 2;
+    g->version = g_kvmclock_ver | 1;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    uint64_t t = kc_rdtsc();
+    g->tsc_timestamp = t;
+    g->system_time = kc_tsc_to_ns(t - g_kvmclock_tsc0);
+    g->mul = g_kvmclock_mul;
+    g->shift = g_kvmclock_shift;
+    g->flags = 1;                            // PVCLOCK_TSC_STABLE_BIT
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    g->version = g_kvmclock_ver + 2;
+    g_kvmclock_ver += 2;
+    (void)pv;
+}
+
+static void kc_write_wall(uint64_t gpa) {
+    uint8_t* h = GuestMemoryManager::GuestPhysToHost(gpa);
+    if (!h || GuestMemoryManager::ContigBytes(gpa) < 12) return;
+    uint64_t now_ns = TimeManager::NowUTC().us * 1000ULL;
+    uint64_t up_ns = VMExitHandler::GuestClockNs();
+    uint64_t boot_ns = now_ns > up_ns ? now_ns - up_ns : 0;   // a broken rtc must not wrap (satoru)
+    volatile uint32_t* w = (volatile uint32_t*)h;
+    w[0] = 1;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    w[1] = (uint32_t)(boot_ns / 1000000000ULL);
+    w[2] = (uint32_t)(boot_ns % 1000000000ULL);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    w[0] = 2;
+}
+
+static bool KvmClockMSRWrite(uint32_t msr, uint64_t value) {
+    if (msr == 0x4B564D01) {                 // MSR_KVM_SYSTEM_TIME_NEW
+        g_msr_kvm_systime = value;
+        if (value & 1) kc_write_systime(value & ~0x1FULL);
+        return true;
+    }
+    if (msr == 0x4B564D00) {                 // MSR_KVM_WALL_CLOCK_NEW
+        g_msr_kvm_wall = value;
+        kc_write_wall(value);
+        return true;
+    }
+    return false;
+}
+
+static bool KvmClockMSRRead(uint32_t msr, uint64_t& value) {
+    if (msr == 0x4B564D01) { value = g_msr_kvm_systime; return true; }
+    if (msr == 0x4B564D00) { value = g_msr_kvm_wall; return true; }
+    return false;
+}
+
+// rdmsr/wrmsr/cr exits are routine for a running linux; log only the first
+// few of each so the host serial log stays usable (satoru)
+static uint32_t g_msr_log_budget = 96, g_cr_log_budget = 48;
+void VMExitHandler::ResetLogBudget() { g_msr_log_budget = 96; g_cr_log_budget = 48; }
+
 VMExitAction VMExitHandler::HandleMSRRead(vCPU* cpu) {
     uint32_t msr = cpu->regs[1]; // ecx = msr address
 
-    SerialLogger::Log("VMExit: RDMSR ");
-    SerialLogger::LogHex(msr);
-    SerialLogger::Log("\r\n");
+    if (g_msr_log_budget) {
+        g_msr_log_budget--;
+        SerialLogger::Log("VMExit: RDMSR ");
+        SerialLogger::LogHex(msr);
+        SerialLogger::Log("\r\n");
+    }
 
     // emulate common msrs
     uint64_t value = 0;
@@ -476,11 +713,21 @@ VMExitAction VMExitHandler::HandleMSRRead(vCPU* cpu) {
         case 0x176: // ia32_sysenter_eip
             value = 0; // not configured
             break;
+        case 0x1A0: // ia32_misc_enable: fast strings on, bts/pebs unavailable.
+                    // 0 made linux turn rep movs/stos fast strings off (satoru)
+            value = (1ULL << 0) | (1ULL << 11) | (1ULL << 12);
+            break;
+        case 0x277: // ia32_pat power-on default (satoru)
+            value = 0x0007040600070406ULL;
+            break;
         default:
             // return 0 for unknown msrs rather than #gp
             value = 0;
             break;
     }
+    GuestMSRRead(msr, value);
+    GuestMSRStoreGet(msr, value);
+    KvmClockMSRRead(msr, value); // (satoru)
 
     cpu->regs[0] = (uint32_t)(value & 0xFFFFFFFF);  // eax = low 32
     cpu->regs[2] = (uint32_t)(value >> 32);           // edx = high 32
@@ -493,12 +740,19 @@ VMExitAction VMExitHandler::HandleMSRWrite(vCPU* cpu) {
     uint32_t msr = cpu->regs[1]; // ecx
     uint64_t value = ((uint64_t)cpu->regs[2] << 32) | cpu->regs[0]; // edx:eax
 
-    SerialLogger::Log("VMExit: WRMSR ");
-    SerialLogger::LogHex(msr);
-    SerialLogger::Log(" = ");
-    SerialLogger::LogHex((uint32_t)(value >> 32));
-    SerialLogger::LogHex((uint32_t)value);
-    SerialLogger::Log("\r\n");
+    if (g_msr_log_budget) {
+        g_msr_log_budget--;
+        SerialLogger::Log("VMExit: WRMSR ");
+        SerialLogger::LogHex(msr);
+        SerialLogger::Log(" = ");
+        SerialLogger::LogHex((uint32_t)(value >> 32));
+        SerialLogger::LogHex((uint32_t)value);
+        SerialLogger::Log("\r\n");
+    }
+
+    // efer, fs/gs base and the syscall msrs must reach the real guest state;
+    // everything else is remembered so a read returns it (satoru)
+    if (!KvmClockMSRWrite(msr, value) && !GuestMSRWrite(msr, value)) GuestMSRStoreSet(msr, value);
 
     // silently absorb most msr writes (they affect virtual state only)
     switch (msr) {
@@ -522,12 +776,15 @@ VMExitAction VMExitHandler::HandleCRAccess(vCPU* cpu) {
     uint32_t access_type = (uint32_t)((qual >> 4) & 0x03); // 0=mov to, 1=mov from, 2=clts, 3=lmsw
     uint32_t reg = (uint32_t)((qual >> 8) & 0x0F);
 
-    SerialLogger::Log("VMExit: CR");
-    SerialLogger::LogDec(cr_num);
-    SerialLogger::Log(access_type == 0 ? " write" : " read");
-    SerialLogger::Log(" reg=");
-    SerialLogger::LogDec(reg);
-    SerialLogger::Log("\r\n");
+    if (g_cr_log_budget) {
+        g_cr_log_budget--;
+        SerialLogger::Log("VMExit: CR");
+        SerialLogger::LogDec(cr_num);
+        SerialLogger::Log(access_type == 0 ? " write" : " read");
+        SerialLogger::Log(" reg=");
+        SerialLogger::LogDec(reg);
+        SerialLogger::Log("\r\n");
+    }
 
     // map register index to vcpu regs array
     // intel sdm: 0=rax,1=rcx,2=rdx,3=rbx,4=rsp,5=rbp,6=rsi,7=rdi,8-15=r8-r15
@@ -549,18 +806,42 @@ VMExitAction VMExitHandler::HandleCRAccess(vCPU* cpu) {
             case 0: {
                 // cr0 write: update guest cr0 and its shadow
                 // preserve host-required bits (ne must stay set for vmcs validity)
+                VMM::VMWrite(VMCS_CR0_READ_SHADOW, val);
                 val |= 0x20;  // ne must be set
                 VMM::VMWrite(VMCS_GUEST_CR0, val);
-                VMM::VMWrite(VMCS_CR0_READ_SHADOW, val);
+                // a trapped mov cr0 is not executed by the cpu, so the
+                // efer.lma / ia-32e entry control update of sdm 26.3.2.1 has
+                // to be done here when pg turns on with lme set (satoru)
+                {
+                    uint64_t efer = VMM::VMRead(VMCS_GUEST_IA32_EFER);
+                    uint64_t ent = VMM::VMRead(VMCS_ENTRY_CONTROLS);
+                    if ((val & (1ULL << 31)) && (efer & (1ULL << 8))) {
+                        efer |= (1ULL << 10);
+                        ent |= VM_ENTRY_IA32E_MODE;
+                    } else if (!(val & (1ULL << 31))) {
+                        efer &= ~(1ULL << 10);
+                        ent &= ~(uint64_t)VM_ENTRY_IA32E_MODE;
+                    }
+                    VMM::VMWrite(VMCS_GUEST_IA32_EFER, efer);
+                    VMM::VMWrite(VMCS_ENTRY_CONTROLS, ent);
+                }
                 break;
             }
             case 3:
-                // cr3 write: page table base change - update and flush guest tlb
-                VMM::VMWrite(VMCS_GUEST_CR3, val);
+                // cr3 write: page table base change - update and flush guest tlb.
+                // with cr4.pcide linux sets bit 63 (no-flush); a real mov cr3
+                // never stores it, and a guest cr3 with bits above maxphyaddr
+                // fails the sdm 26.3.1.1 check on the next entry (satoru)
+                VMM::VMWrite(VMCS_GUEST_CR3, val & ~(1ULL << 63));
                 break;
             case 4:
-                // cr4 write: update and shadow
-                VMM::VMWrite(VMCS_GUEST_CR4, val);
+                // cr4 write: update and shadow. keep the vmx fixed-1 bits
+                // (vmxe) in the real cr4 or the next entry fails (satoru)
+                {
+                    uint64_t f0 = 0;
+                    VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED0, f0);
+                    VMM::VMWrite(VMCS_GUEST_CR4, val | f0);
+                }
                 VMM::VMWrite(VMCS_CR4_READ_SHADOW, val);
                 break;
             default:
@@ -570,9 +851,9 @@ VMExitAction VMExitHandler::HandleCRAccess(vCPU* cpu) {
         // mov from crn - guest is reading
         uint64_t val = 0;
         switch (cr_num) {
-            case 0: val = VMM::VMRead(VMCS_GUEST_CR0); break;
+            case 0: val = VMM::VMRead(VMCS_CR0_READ_SHADOW); break; // (satoru)
             case 3: val = VMM::VMRead(VMCS_GUEST_CR3); break;
-            case 4: val = VMM::VMRead(VMCS_GUEST_CR4); break;
+            case 4: val = VMM::VMRead(VMCS_CR4_READ_SHADOW); break; // (satoru)
             default: break;
         }
         SetGPR(reg, val);
@@ -657,6 +938,193 @@ VMExitAction VMExitHandler::HandleExternalInterrupt(vCPU* cpu) {
     return VMEXIT_CONTINUE;
 }
 
+//  mmio instruction emulation (satoru)
+//
+// an ept violation does not report the instruction length or the register
+// (sdm 28.2.1: the vm-exit instruction-length field is only defined for
+// instruction exits), so the old path advanced rip by a stale length and
+// moved the value through eax whatever the instruction was. linux's
+// ioread8 / readl / writel / apic reads then resumed mid-instruction.
+// fetch the instruction through the guest page tables and decode the mov
+// forms mmio accessors compile to.
+
+// guest linear -> guest physical with the guest's own paging (4-level, pae
+// and 32-bit paging; 1g/2m/4m pages). returns false if not present (satoru)
+static bool GuestLinearToPhys(uint64_t va, uint64_t& pa) {
+    uint64_t cr0 = VMM::VMRead(VMCS_GUEST_CR0);
+    if (!(cr0 & (1ULL << 31))) { pa = va & 0xFFFFFFFFULL; return true; }
+    uint64_t cr3 = VMM::VMRead(VMCS_GUEST_CR3);
+    uint64_t cr4 = VMM::VMRead(VMCS_GUEST_CR4);
+    uint64_t efer = VMM::VMRead(VMCS_GUEST_IA32_EFER);
+    const uint64_t AM = 0x000FFFFFFFFFF000ULL;
+    if (efer & (1ULL << 10)) {
+        uint64_t tbl = cr3 & AM;
+        for (int lvl = 3; lvl >= 0; lvl--) {
+            uint64_t idx = (va >> (12 + 9 * lvl)) & 0x1FF, e = 0;
+            if (!GuestMemoryManager::ReadGuestPhys(tbl + idx * 8, &e, 8)) return false;
+            if (!(e & 1)) return false;
+            if ((lvl == 2 || lvl == 1) && (e & 0x80)) {
+                uint64_t span = 1ULL << (12 + 9 * lvl);
+                pa = (e & AM & ~(span - 1)) | (va & (span - 1));
+                return true;
+            }
+            if (lvl == 0) { pa = (e & AM) | (va & 0xFFF); return true; }
+            tbl = e & AM;
+        }
+        return false;
+    }
+    if (cr4 & (1ULL << 5)) {
+        uint64_t pdpte = 0;
+        if (!GuestMemoryManager::ReadGuestPhys((cr3 & 0xFFFFFFE0ULL) + ((va >> 30) & 3) * 8, &pdpte, 8)) return false;
+        if (!(pdpte & 1)) return false;
+        uint64_t pde = 0;
+        if (!GuestMemoryManager::ReadGuestPhys((pdpte & AM) + ((va >> 21) & 0x1FF) * 8, &pde, 8)) return false;
+        if (!(pde & 1)) return false;
+        if (pde & 0x80) { pa = (pde & AM & ~0x1FFFFFULL) | (va & 0x1FFFFF); return true; }
+        uint64_t pte = 0;
+        if (!GuestMemoryManager::ReadGuestPhys((pde & AM) + ((va >> 12) & 0x1FF) * 8, &pte, 8)) return false;
+        if (!(pte & 1)) return false;
+        pa = (pte & AM) | (va & 0xFFF);
+        return true;
+    }
+    uint32_t pde = 0;
+    if (!GuestMemoryManager::ReadGuestPhys((cr3 & 0xFFFFF000ULL) + ((va >> 22) & 0x3FF) * 4, &pde, 4)) return false;
+    if (!(pde & 1)) return false;
+    if ((pde & 0x80) && (cr4 & (1ULL << 4))) { pa = (pde & 0xFFC00000ULL) | (va & 0x3FFFFF); return true; }
+    uint32_t pte = 0;
+    if (!GuestMemoryManager::ReadGuestPhys((pde & 0xFFFFF000ULL) + ((va >> 12) & 0x3FF) * 4, &pte, 4)) return false;
+    if (!(pte & 1)) return false;
+    pa = (pte & 0xFFFFF000ULL) | (va & 0xFFF);
+    return true;
+}
+
+static bool FetchGuestInstr(uint8_t* buf, int n) {
+    uint64_t rip = VMM::VMRead(VMCS_GUEST_RIP);
+    uint64_t cs_base = VMM::VMRead(VMCS_GUEST_CS_BASE);
+    uint64_t efer = VMM::VMRead(VMCS_GUEST_IA32_EFER);
+    uint64_t lin = (efer & (1ULL << 10)) ? rip : ((cs_base + rip) & 0xFFFFFFFFULL);
+    for (int i = 0; i < n; i++) {
+        uint64_t pa;
+        if (!GuestLinearToPhys(lin + i, pa)) return i > 0;
+        if (!GuestMemoryManager::ReadGuestPhys(pa, buf + i, 1)) return i > 0;
+    }
+    return true;
+}
+
+static uint64_t* GprSlot(vCPU* cpu, int r, uint64_t& rsp_tmp) {
+    if (r == 4) { rsp_tmp = VMM::VMRead(VMCS_GUEST_RSP); return &rsp_tmp; }
+    return &cpu->regs[r & 15];
+}
+
+// returns true when the instruction was decoded and emulated (satoru)
+static bool EmulateMMIO(vCPU* cpu, uint64_t gpa) {
+    uint8_t ib[16] = {0};
+    if (!FetchGuestInstr(ib, 15)) return false;
+    bool long_mode = (VMM::VMRead(VMCS_GUEST_IA32_EFER) >> 10) & 1;
+    bool cs_d = (VMM::VMRead(VMCS_GUEST_CS_AR) >> 14) & 1;
+    int p = 0, rex = 0;
+    bool opsz = false;
+    for (;;) {
+        uint8_t b = ib[p];
+        if (b == 0x66) { opsz = true; p++; continue; }
+        if (b == 0x67 || b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 ||
+            b == 0x64 || b == 0x65 || b == 0xF0) { p++; continue; }
+        break;
+    }
+    if (long_mode && (ib[p] & 0xF0) == 0x40) rex = ib[p++];
+    bool rexw = rex & 8;
+    int osz = rexw ? 8 : ((long_mode || cs_d) ? (opsz ? 2 : 4) : (opsz ? 4 : 2));
+    int op = ib[p++], op2 = -1;
+    if (op == 0x0F) op2 = ib[p++];
+
+    int size = 0;            // memory access size
+    bool is_write = false, has_modrm = true, zext = false;
+    int imm_len = 0;
+    if (op == 0x88) { size = 1; is_write = true; }
+    else if (op == 0x89) { size = osz; is_write = true; }
+    else if (op == 0x8A) { size = 1; }
+    else if (op == 0x8B) { size = osz; }
+    else if (op == 0xC6) { size = 1; is_write = true; imm_len = 1; }
+    else if (op == 0xC7) { size = osz; is_write = true; imm_len = (osz == 2) ? 2 : 4; }
+    else if (op == 0x0F && (op2 == 0xB6 || op2 == 0xB7)) { size = (op2 == 0xB6) ? 1 : 2; zext = true; }
+    else return false;
+    (void)has_modrm;
+
+    uint8_t modrm = ib[p++];
+    int mod = modrm >> 6, reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0), rm = modrm & 7;
+    if (mod == 3) return false;
+    bool a32 = long_mode || cs_d;
+    if (a32) {
+        if (rm == 4) { uint8_t sib = ib[p++]; if (mod == 0 && (sib & 7) == 5) p += 4; }
+        if (mod == 0 && rm == 5) p += 4;
+        else if (mod == 1) p += 1;
+        else if (mod == 2) p += 4;
+    } else {
+        if (mod == 0 && rm == 6) p += 2;
+        else if (mod == 1) p += 1;
+        else if (mod == 2) p += 2;
+    }
+    uint64_t imm = 0;
+    for (int i = 0; i < imm_len; i++) imm |= (uint64_t)ib[p + i] << (8 * i);
+    if (imm_len == 4 && osz == 8 && (imm & 0x80000000ULL)) imm |= 0xFFFFFFFF00000000ULL;
+    p += imm_len;
+    if (p > 15) return false;
+
+    uint64_t rsp_tmp = 0;
+    // 8-bit register operand without rex: 4..7 = ah, ch, dh, bh
+    bool high8 = (size == 1 && !rex && (reg & 7) >= 4 && (op == 0x88 || op == 0x8A));
+    uint64_t* slot = GprSlot(cpu, high8 ? (reg & 3) : reg, rsp_tmp);
+
+    if (is_write) {
+        uint64_t v;
+        if (imm_len) v = imm;
+        else v = high8 ? ((*slot >> 8) & 0xFF) : *slot;
+        for (int off = 0; off < size; off += 4) {
+            int chunk = (size - off) >= 4 ? 4 : (size - off);
+            uint32_t w = (uint32_t)(v >> (8 * off));
+            if (chunk < 4) w &= (1u << (8 * chunk)) - 1;
+            if (!Hypervisor::HandleGuestMMIO(gpa + off, true, (uint8_t)chunk, w)) {
+                // no device behind this address: drop the write (satoru)
+            }
+        }
+    } else {
+        uint64_t v = 0;
+        for (int off = 0; off < size; off += 4) {
+            int chunk = (size - off) >= 4 ? 4 : (size - off);
+            uint32_t w = 0;
+            if (!Hypervisor::HandleGuestMMIO(gpa + off, false, (uint8_t)chunk, w))
+                w = 0xFFFFFFFFu; // open bus reads as all ones (satoru)
+            if (chunk < 4) w &= (1u << (8 * chunk)) - 1;
+            v |= (uint64_t)w << (8 * off);
+        }
+        if (zext) {
+            int dsz = osz;
+            uint64_t cur = *slot;
+            if (dsz == 2) *slot = (cur & ~0xFFFFULL) | (v & 0xFFFF);
+            else *slot = v; // 32/64-bit destination zero-extends
+        } else if (size == 1) {
+            if (high8) *slot = (*slot & ~0xFF00ULL) | ((v & 0xFF) << 8);
+            else *slot = (*slot & ~0xFFULL) | (v & 0xFF);
+        } else if (size == 2) {
+            *slot = (*slot & ~0xFFFFULL) | (v & 0xFFFF);
+        } else if (size == 4) {
+            *slot = v & 0xFFFFFFFFULL;
+        } else {
+            *slot = v;
+        }
+        if (reg == 4 && !high8) VMM::VMWrite(VMCS_GUEST_RSP, rsp_tmp);
+    }
+    VMM::VMWrite(VMCS_GUEST_RIP, VMM::VMRead(VMCS_GUEST_RIP) + (uint64_t)p);
+    return true;
+}
+
+static bool IsEmulatedMMIO(uint64_t gpa) {
+    // vpci bars, rom bars, lapic, ioapic, hpet: everything between the end of
+    // guest ram and 4 gb, which the ept leaves unmapped on purpose (satoru)
+    uint64_t ram_end = GUEST_HIGH_RAM_START + GuestMemoryManager::GetHighRAMSize();
+    return gpa >= ram_end && gpa < 0x100000000ULL;
+}
+
 //  ept violation
 
 VMExitAction VMExitHandler::HandleEPTViolation(vCPU* cpu) {
@@ -668,6 +1136,18 @@ VMExitAction VMExitHandler::HandleEPTViolation(vCPU* cpu) {
     } else if (cpu->type == VIRT_AMD_SVM && cpu->vmcb) {
         guest_phys = cpu->vmcb->exit_info2; // npf stores faulting gpa in exit_info2
         qualification = cpu->vmcb->exit_info1;
+    }
+
+    if (cpu->type == VIRT_INTEL_VTX && IsEmulatedMMIO(guest_phys)) {
+        if (EmulateMMIO(cpu, guest_phys)) return VMEXIT_HANDLED;
+        uint8_t ib[16] = {0};
+        FetchGuestInstr(ib, 15);
+        SerialLogger::Log("VMExit: MMIO decode failed at GPA=0x");
+        SerialLogger::LogHex64(guest_phys);
+        SerialLogger::Log(" bytes:");
+        for (int i = 0; i < 8; i++) { SerialLogger::Log(" "); SerialLogger::LogHex(ib[i]); }
+        SerialLogger::Log("\r\n");
+        return VMEXIT_FATAL;
     }
 
     // check if this is an mmio access - route to hypervisor device layer
@@ -1062,7 +1542,7 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
         //    KSA_SUB_GET_VERDICT(0): returns eax=completed, ebx=approved,
         //                            ecx=have_cred_hash. the credential hash
         //                            itself is never exposed over the channel - 
-        //                            only supr (in-kernel) consumes it. (satoru)
+        //                            only ken (in-kernel) consumes it. (satoru)
         //    KSA_SUB_GET_INFO(1):    returns eax=channel revision.
         case KSA_VMCALL_CHANNEL: {
             uint32_t subfn = cpu->regs[1]; // ecx
@@ -1166,7 +1646,9 @@ void VMExitHandler::AdvanceGuestRIP(vCPU* cpu) {
 
     if (cpu->type == VIRT_INTEL_VTX) {
         uint32_t instr_len = VMM::VMRead(VMCS_EXIT_INSTR_LENGTH);
-        uint32_t rip = VMM::VMRead(VMCS_GUEST_RIP);
+        // rip is natural width: a uint32_t here cut 0xffffffff8128bb65 to
+        // 0x8128bb67 after the first exit in the 64-bit kernel (satoru)
+        uint64_t rip = VMM::VMRead(VMCS_GUEST_RIP);
         VMM::VMWrite(VMCS_GUEST_RIP, rip + instr_len);
     } else if (cpu->type == VIRT_AMD_SVM && cpu->vmcb) {
         // svm gives us next_rip directly

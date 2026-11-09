@@ -492,16 +492,23 @@ static bool hw_rfkill_set() {
 
 static inline uint64_t dma_phys(const void* p) { return (uint64_t)(uintptr_t)p; }
 
+// the fh registers and tfd tbs carry 36-bit addresses (rb_status and kw are
+// programmed as phys >> 4 into a 32-bit register, tb hi_n_len keeps addr[35:32]).
+// the pmm used to stop at 16 gb so any frame fit; with ram above 64 gb managed,
+// a ring must be allocated below 64 gb or the device dmas to the wrong place. (satoru)
+constexpr uint64_t IWL_DMA_LIMIT = 1ULL << 36;
+static inline void* iwl_dma_alloc(size_t bytes) { return PMM::AllocBytesBelow(bytes, IWL_DMA_LIMIT); }
+
 static bool alloc_rings() {
     // tx: 256 tfds (128 bytes each => 32k) + 256 4k staging buffers (1m). (satoru)
-    g_iwl.tx_tfds = (IwlTfd*)PMM::AllocBytes(sizeof(IwlTfd) * IWL_TX_RING_COUNT);
-    g_iwl.tx_bufs = (uint8_t*)PMM::AllocBytes((size_t)IWL_TX_BUF_SIZE * IWL_TX_RING_COUNT);
+    g_iwl.tx_tfds = (IwlTfd*)iwl_dma_alloc(sizeof(IwlTfd) * IWL_TX_RING_COUNT);
+    g_iwl.tx_bufs = (uint8_t*)iwl_dma_alloc((size_t)IWL_TX_BUF_SIZE * IWL_TX_RING_COUNT);
     // rx: 256-entry rbd ring (1k) + status buf + 256 4k rx buffers (1m). (satoru)
-    g_iwl.rbd       = (uint32_t*)PMM::AllocBytes(sizeof(uint32_t) * IWL_RX_RING_COUNT);
-    g_iwl.rb_status = (IwlRbStatus*)PMM::AllocBytes(sizeof(IwlRbStatus));
-    g_iwl.rx_bufs   = (uint8_t*)PMM::AllocBytes((size_t)IWL_RX_BUF_SIZE * IWL_RX_RING_COUNT);
+    g_iwl.rbd       = (uint32_t*)iwl_dma_alloc(sizeof(uint32_t) * IWL_RX_RING_COUNT);
+    g_iwl.rb_status = (IwlRbStatus*)iwl_dma_alloc(sizeof(IwlRbStatus));
+    g_iwl.rx_bufs   = (uint8_t*)iwl_dma_alloc((size_t)IWL_RX_BUF_SIZE * IWL_RX_RING_COUNT);
     // keep-warm 4k. (satoru)
-    g_iwl.kw        = (uint8_t*)PMM::AllocBytes(IWL_RX_BUF_SIZE);
+    g_iwl.kw        = (uint8_t*)iwl_dma_alloc(IWL_RX_BUF_SIZE);
 
     if (!g_iwl.tx_tfds || !g_iwl.tx_bufs || !g_iwl.rbd || !g_iwl.rb_status ||
         !g_iwl.rx_bufs || !g_iwl.kw) {

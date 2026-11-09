@@ -26,6 +26,7 @@
 // bytes inside the kernel without a user-space process.
 
 namespace UnixSocket {
+    void DumpPending();   // census diagnostic (satoru)
 
     enum SockType : uint8_t {
         UNIX_SOCK_STREAM    = 1,
@@ -38,6 +39,14 @@ namespace UnixSocket {
     static const int UNIX_RING_BYTES    = 65536;
     static const int UNIX_MAX_PASSED_FD = 32;
     static const int UNIX_PATH_MAX      = 108;
+
+    // Send() returns this, with nothing queued, when the peer is an in-kernel server and the
+    // calling cpu does not hold the linux layer's global lock (the handler needs it). (satoru)
+    static const int UNIX_NEED_KLS      = -4097;
+    // bits of Readiness() (satoru)
+    static const uint32_t UN_READY_IN   = 1;
+    static const uint32_t UN_READY_OUT  = 2;
+    static const uint32_t UN_READY_HUP  = 4;
 
     struct Credentials {
         uint32_t pid;
@@ -116,6 +125,12 @@ namespace UnixSocket {
     bool Writable(int sd);               // peer ring has room -> POLLOUT (satoru)
     uint32_t EventSeq(int sd);           // activity counter for epollet edges (satoru)
     bool PeerClosed(int sd);             // connected peer has closed -> POLLHUP (satoru)
+    uint32_t Readiness(int sd);          // UN_READY_* bits in one locked pass (satoru)
+    // the connected peer's sd (the in-kernel server side of a kernel client), -1 if none (satoru)
+    int  PeerSd(int sd);
+    bool IsStream(int sd);               // SOCK_STREAM (a pipe is one) (satoru)
+    bool NeedsKlsToSend(int sd);         // peer is an in-kernel server: a send must hold kls (satoru)
+    void SetKlsHeldHook(bool (*cb)());   // does this cpu hold kls? (satoru)
     // task 25: register a callback invoked with a socket sd the instant data
     // lands in its rx ring, so the linux layer can wake a poll waiter parked on
     // it immediately (event-driven fd wakeup) instead of on the ~8ms timer. (satoru)

@@ -23,13 +23,54 @@ static inline uint32_t current_cgroup_id() {
     return cur ? cur->cgroup_id : 0;
 }
 
-// since we're identity-mapped, phys == virt for anything below 16gb
+// since we're identity-mapped, phys == virt for every managed frame (the boot
+// map covers 0..512 gb with 2 mb pages; the pmm never manages ram above it). (satoru)
 static inline uint64_t* phys_to_virt(uint64_t phys) {
     return (uint64_t*)(uintptr_t)phys;
 }
 
 static inline uint64_t virt_to_phys(void* virt) {
     return (uint64_t)(uintptr_t)virt;
+}
+
+// the pmm now manages ram above the old 16 gb cap. every user address space
+// copies the kernel pml4, identity map included, so a USER leaf at a va inside
+// [16 gb, ram top) shadows the frame at that same physical address in that
+// address space: kernel identity writes to the frame (zero-on-alloc, page
+// tables, heap) would land in the user page instead - the main-stack overlay
+// bug, generalised. such a map is refused unless the va is one of the pmm's
+// fixed overlay windows, whose frames are never handed out. this catches
+// MAP_FIXED, elf segments and fixed kernel-chosen va. (satoru)
+// item 8 (the remaining shadow channels below 16 gb): the same holds for every
+// va the boot identity map covers, not only the newly managed range. a user
+// MAP_FIXED (or an elf segment, or a stack grow) over unreserved low ram hid
+// that frame from the kernel in that address space; low 1 mb (the ac97 bdl, the
+// ap trampoline), the kernel image and mmio identity pages above ram are just
+// as live. so the whole identity range [0, 512 gb) is refused except the
+// windows the pmm never hands out: the overlay table (main stack, ld-kurono
+// trampoline) and, with a high-linked kernel, the user image window below it.
+// auto-placed mmaps were never affected (choose_mmap_base already skips every
+// present identity va). (satoru)
+static bool user_va_shadows_managed_ram(uint64_t va, uint64_t bytes) {
+    const uint64_t lo  = 0;
+    const uint64_t top = PMM::IDENTITY_CEIL_BYTES;
+    if (bytes == 0) return false;
+    uint64_t end = va + bytes;
+    if (end < va) end = ~0ULL;
+    if (end <= lo || va >= top) return false;
+    uint64_t a = va < lo ? lo : va;
+    uint64_t b = end > top ? top : end;
+    if (PMM::IsUserOverlayRange(a & ~0xFFFULL, (b + 0xFFFULL) & ~0xFFFULL)) return false;
+    static uint32_t s_logs = 0;
+    if (s_logs < 16) {
+        s_logs++;
+        SerialLogger::Log("[idalias] refused user map va=0x");
+        SerialLogger::LogHex64(va);
+        SerialLogger::Log(" bytes=0x");
+        SerialLogger::LogHex64(bytes);
+        SerialLogger::Log(" (inside the kernel identity map, outside the user windows)\r\n");
+    }
+    return true;
 }
 
 static uint64_t current_cr3() {
@@ -79,13 +120,18 @@ static uint64_t copy_table_page(uint64_t src_phys) {
     return new_table;
 }
 
+// item 7 (frames leaked on every exit): the child address was `entry & ~0xFFF`,
+// which keeps bit 63. every NX leaf (anon heap/stack/data, library data and
+// rodata - most of a process) became an address past ram top, so FreeFrame and
+// MarkFrameMapped silently ignored it and the frame was lost. measured 4.6 mb a
+// round of fork/exec churn. entry_phys keeps only bits 12..51. (satoru)
 static void free_user_tree(uint64_t table_phys, int level) {
     uint64_t* table = phys_to_virt(table_phys);
     for (int index = 0; index < 512; index++) {
         uint64_t entry = table[index];
         if (!(entry & PTE_PRESENT) || !(entry & PTE_USER)) continue;
 
-        uint64_t child_phys = entry & ~0xFFFULL;
+        uint64_t child_phys = entry_phys(entry);
         if (level > 1 && !(entry & PTE_HUGE)) {
             free_user_tree(child_phys, level - 1);
         } else if (!(entry & PTE_HUGE)) {
@@ -132,6 +178,13 @@ static uint64_t clone_user_tree(uint64_t table_phys, int level) {
         uint64_t phys = entry_phys(entry);
         uint64_t flags = entry_flags(entry);
         PMM::RetainFrame(phys);
+
+        // shared mappings stay shared and writable in both: posix fork
+        // semantics for MAP_SHARED. (satoru)
+        if (flags & PTE_SHARED) {
+            dst[index] = phys | flags;
+            continue;
+        }
 
         if (flags & PTE_WRITABLE) {
             flags &= ~PTE_WRITABLE;
@@ -253,21 +306,23 @@ static bool unmap_page_in_root(uint64_t root_phys, uint64_t virt_addr, bool free
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return false;
 
-    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(entry_phys(pml4[p4i]));
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return false;
 
-    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(entry_phys(pdpt[p3i]));
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT) || (pd[p2i] & PTE_HUGE)) return false;
 
-    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(entry_phys(pd[p2i]));
     uint16_t p1i = pt_index(virt_addr);
     if (!(pt[p1i] & PTE_PRESENT)) return false;
 
     bool user_freed = false;
     if (free_frame) {
-        PMM::FreeFrame(pt[p1i] & ~0xFFFULL);
+        // entry_phys: an NX leaf freed nothing with the old ~0xFFF mask (the
+        // single-cpu munmap / madvise path). (satoru)
+        PMM::FreeFrame(entry_phys(pt[p1i]));
         user_freed = (pt[p1i] & PTE_USER) != 0;
     }
     pt[p1i] = 0;
@@ -287,21 +342,24 @@ static bool protect_page_in_root(uint64_t root_phys, uint64_t virt_addr,
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return false;
 
-    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(entry_phys(pml4[p4i]));
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return false;
 
-    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(entry_phys(pdpt[p3i]));
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT) || (pd[p2i] & PTE_HUGE)) return false;
 
-    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(entry_phys(pd[p2i]));
     uint16_t p1i = pt_index(virt_addr);
     if (!(pt[p1i] & PTE_PRESENT)) return false;
 
-    // keep the physical frame, replace every permission/attr bit (satoru)
-    uint64_t phys = pt[p1i] & ~0xFFFULL & ~PTE_NX;
-    pt[p1i] = phys | PTE_PRESENT | new_flags;
+    // keep the physical frame, replace every permission/attr bit except the
+    // shared marker: mprotect on a MAP_SHARED view must not make the next fork
+    // turn it copy-on-write. (satoru)
+    uint64_t phys = entry_phys(pt[p1i]);
+    uint64_t keep = pt[p1i] & PTE_SHARED;
+    pt[p1i] = phys | PTE_PRESENT | new_flags | keep;
     return true;
 }
 
@@ -397,9 +455,80 @@ void KernelVMM::Init() {
     SerialLogger::Log("\r\n");
 }
 
+// kurono.memcensus=1: registry of live user address spaces, so the census can
+// tell which user frames no address space maps any more. lock-free slots; only
+// filled while the census is on. created/destroyed counts are always kept. (satoru)
+static constexpr int AS_REG_MAX = 2048;
+static uint64_t g_as_reg[AS_REG_MAX];
+static uint64_t g_as_created = 0, g_as_destroyed = 0;
+static void as_reg_add(uint64_t root) {
+    __atomic_add_fetch(&g_as_created, 1, __ATOMIC_RELAXED);
+    if (!PMM::CensusOn()) return;
+    for (int i = 0; i < AS_REG_MAX; i++) {
+        uint64_t z = 0;
+        if (__atomic_compare_exchange_n(&g_as_reg[i], &z, root, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) return;
+    }
+}
+static void as_reg_del(uint64_t root) {
+    __atomic_add_fetch(&g_as_destroyed, 1, __ATOMIC_RELAXED);
+    if (!PMM::CensusOn()) return;
+    for (int i = 0; i < AS_REG_MAX; i++) {
+        uint64_t r = root;
+        if (__atomic_compare_exchange_n(&g_as_reg[i], &r, 0, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) return;
+    }
+}
+static void census_mark(uint8_t* bits, uint64_t nframes, uint64_t phys) {
+    uint64_t f = phys / PAGE_SIZE;
+    if (f < nframes) bits[f >> 3] |= (uint8_t)(1u << (f & 7));
+}
+// racy read-only walk of one user subtree (same shape as free_user_tree). every
+// table pointer is bounded by ram top, so a table freed mid-walk reads garbage
+// instead of faulting. (satoru)
+static void census_walk(uint64_t table_phys, int level, uint8_t* bits, uint64_t nframes,
+                        uint64_t* leaves, uint64_t* tables) {
+    census_mark(bits, nframes, table_phys);
+    (*tables)++;
+    const uint64_t* t = phys_to_virt(table_phys);
+    for (int i = 0; i < 512; i++) {
+        uint64_t e = t[i];
+        if (!(e & PTE_PRESENT) || !(e & PTE_USER) || (e & PTE_HUGE)) continue;
+        uint64_t c = entry_phys(e);
+        if (c / PAGE_SIZE >= nframes) continue;
+        if (level > 1) census_walk(c, level - 1, bits, nframes, leaves, tables);
+        else { census_mark(bits, nframes, c); (*leaves)++; }
+    }
+}
+uint32_t KernelVMM::CensusMarkUser(uint8_t* bits, uint64_t nframes,
+                                   uint64_t* leaves, uint64_t* tables,
+                                   uint64_t* created, uint64_t* destroyed) {
+    *leaves = 0; *tables = 0;
+    *created = __atomic_load_n(&g_as_created, __ATOMIC_RELAXED);
+    *destroyed = __atomic_load_n(&g_as_destroyed, __ATOMIC_RELAXED);
+    uint32_t n = 0;
+    for (int i = 0; i < AS_REG_MAX; i++) {
+        uint64_t root = __atomic_load_n(&g_as_reg[i], __ATOMIC_RELAXED);
+        if (!root || root / PAGE_SIZE >= nframes) continue;
+        n++;
+        census_mark(bits, nframes, root);
+        (*tables)++;
+        const uint64_t* pml4 = phys_to_virt(root);
+        for (int k = 0; k < 512; k++) {
+            uint64_t e = pml4[k];
+            if (!(e & PTE_PRESENT) || !(e & PTE_USER)) continue;
+            uint64_t c = entry_phys(e);
+            if (c / PAGE_SIZE >= nframes) continue;
+            census_walk(c, 3, bits, nframes, leaves, tables);
+        }
+    }
+    return n;
+}
+
 uint64_t KernelVMM::CreateAddressSpace() {
     uint64_t new_root = alloc_table_page();
     if (!new_root) return 0;
+    as_reg_add(new_root);
 
     uint64_t* src = phys_to_virt(pml4_phys);
     uint64_t* dst = phys_to_virt(new_root);
@@ -441,15 +570,22 @@ uint64_t KernelVMM::CloneAddressSpace(uint64_t source_root_pml4) {
 }
 
 bool g_cc_noasfree = false;   // kurono.cc.noasfree=1: leak address spaces instead of freeing (a/b diagnostic) (satoru)
+// item 10: the linux layer's region-table extension chunks are keyed by address
+// space; this tells it when one dies. (satoru)
+static void (*g_as_destroy_hook)(uint64_t root) = nullptr;
+void KernelVMM::SetAddressSpaceDestroyHook(void (*hook)(uint64_t root)) { g_as_destroy_hook = hook; }
+
 void KernelVMM::DestroyAddressSpace(uint64_t root_pml4) {
     if (!root_pml4 || root_pml4 == pml4_phys) return;
+    as_reg_del(root_pml4);
+    if (g_as_destroy_hook) g_as_destroy_hook(root_pml4);
     if (g_cc_noasfree) return;
 
     uint64_t* pml4 = phys_to_virt(root_pml4);
     for (int index = 0; index < 512; index++) {
         uint64_t entry = pml4[index];
         if (!(entry & PTE_PRESENT) || !(entry & PTE_USER)) continue;
-        free_user_tree(entry & ~0xFFFULL, 3);
+        free_user_tree(entry_phys(entry), 3);
         pml4[index] = 0;
     }
 
@@ -480,11 +616,11 @@ static uint64_t* leaf_pte_demoting(uint64_t root_phys, uint64_t virt_addr,
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return nullptr;
 
-    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(entry_phys(pml4[p4i]));
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return nullptr;
 
-    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(entry_phys(pdpt[p3i]));
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT)) return nullptr;
 
@@ -504,7 +640,7 @@ static uint64_t* leaf_pte_demoting(uint64_t root_phys, uint64_t virt_addr,
         if (out_demoted) *out_demoted = true;
     }
 
-    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(entry_phys(pd[p2i]));
     return &pt[pt_index(virt_addr)];
 }
 
@@ -547,13 +683,13 @@ static uint64_t* leaf_pte_nodemote(uint64_t root_phys, uint64_t virt_addr) {
     uint64_t* pml4 = phys_to_virt(root_phys);
     uint16_t p4i = pml4_index(virt_addr);
     if (!(pml4[p4i] & PTE_PRESENT)) return nullptr;
-    uint64_t* pdpt = phys_to_virt(pml4[p4i] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(entry_phys(pml4[p4i]));
     uint16_t p3i = pdpt_index(virt_addr);
     if (!(pdpt[p3i] & PTE_PRESENT) || (pdpt[p3i] & PTE_HUGE)) return nullptr;
-    uint64_t* pd = phys_to_virt(pdpt[p3i] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(entry_phys(pdpt[p3i]));
     uint16_t p2i = pd_index(virt_addr);
     if (!(pd[p2i] & PTE_PRESENT) || (pd[p2i] & PTE_HUGE)) return nullptr;
-    uint64_t* pt = phys_to_virt(pd[p2i] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(entry_phys(pd[p2i]));
     return &pt[pt_index(virt_addr)];
 }
 
@@ -641,6 +777,9 @@ bool KernelVMM::MapPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
     // fails the map, which the mmap/demand-zero callers surface as OOM - the
     // enforcement linux delivers via memcg. kernel-root maps are exempt. (satoru)
     bool charged = false;
+    if ((flags & PTE_USER) && root_pml4 != pml4_phys &&
+        user_va_shadows_managed_ram(virt_addr & ~0xFFFULL, PAGE_SIZE))
+        return false;   // see user_va_shadows_managed_ram (satoru)
     if ((flags & PTE_USER) && root_pml4 != pml4_phys) {
         if (!Cgroup::ChargeUserPages(root_pml4, current_cgroup_id(), PAGE_SIZE))
             return false;
@@ -725,6 +864,9 @@ bool KernelVMM::MapRangeInAddressSpace(uint64_t root_pml4, uint64_t virt_base,
     // cgroup memory.max: charge the whole user range up front (one ledger
     // round-trip) and refund it wholesale if the map fails part-way. (satoru)
     bool charged = false;
+    if ((flags & PTE_USER) && root_pml4 != pml4_phys &&
+        user_va_shadows_managed_ram(virt_base, pages * PAGE_SIZE))
+        return false;   // see user_va_shadows_managed_ram (satoru)
     if ((flags & PTE_USER) && root_pml4 != pml4_phys) {
         if (!Cgroup::ChargeUserPages(root_pml4, current_cgroup_id(),
                                      pages * PAGE_SIZE))

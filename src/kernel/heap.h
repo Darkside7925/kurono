@@ -25,9 +25,17 @@ public:
     static void  Init();              // phase 1: bootstrap from bss
     static void  ExpandWithPMM();     // phase 2: allocate big region from pmm
     static void* Alloc(size_t size);
+    static void* AllocFrom(size_t size, void* site);   // Alloc with an explicit census site (operator new) (satoru)
+    // kurono.memcensus=1 live-allocation side table (satoru)
+    static void     CensusEnable();
+    static uint32_t CensusCapacity();
+    static uint32_t CensusOverflow();
+    static bool     CensusEntry(uint32_t i, uint32_t* site, uint32_t* size);
     static void* Realloc(void* ptr, size_t new_size);
     static void  Free(void* ptr);
     static void  Reset();
+    // run fn(arg) under the heap's own lock (taskmem side tables) (satoru)
+    static void  LockedCall(void (*fn)(void*), void* arg);
 
     // true if ptr is the payload of a live (allocated) heap block. lets a
     // caller that may hold a stale/non-heap pointer (e.g. content deserialized

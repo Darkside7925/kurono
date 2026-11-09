@@ -16,7 +16,8 @@
 //
 // integer-only, freestanding-clean.
 #pragma once
-#include "../kernel/types.h"
+#include <stdint.h>
+#include <stddef.h>
 
 namespace H264 {
 
