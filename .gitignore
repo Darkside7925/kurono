@@ -109,3 +109,10 @@ src/userprogs/busybox.elf
 src/userprogs/recovery_tools.tar
 # packet captures written by the qemu test scripts
 *.pcap
+
+# local-only media clips and junk
+src/media/*.kvid
+src/media/*.mp4
+*.orig
+__pycache__/
+*.pyc

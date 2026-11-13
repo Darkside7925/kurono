@@ -172,4 +172,4 @@ On real hardware, Kurono refuses every disk write outside the files on its own `
 
 ## License
 
-GPL v2. See [LICENSE](LICENSE).
+GPL v2. See [LICENSE](LICENSE). Third-party code, programs, fonts and data keep their own licenses, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) with the full texts in `licenses/`.
