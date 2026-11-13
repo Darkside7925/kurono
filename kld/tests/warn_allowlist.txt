@@ -1,0 +1,5 @@
+# One allowlist entry per line: <source-file:line> <reason>. A [kld-warn] line
+# is a FAIL unless one of these keys is a substring of it. Keep this empty
+# except for known upstream self-test warnings. (satoru)
+lib/idr.c:527 upstream test_ida deliberately exercises ida_free() on a free entry
+iwl-trans.c:111 upstream 6.12.99 race, only a refused command: iwl_mvm_tcm_work (via iwl_mvm_recalc_tcm -> iwl_mvm_tcm_results/iwl_mvm_request_statistics) was already past its paused check and blocked on mvm->mutex held by __iwl_mvm_mac_stop; iwl_mvm_pause_tcm(false) in iwl_mvm_stop_device does not cancel it, so it sends once the firmware is stopped and iwl_trans_send_cmd returns -EIO. the wifi connect rig requires the work_fn of the warning to be iwl_mvm_tcm_work

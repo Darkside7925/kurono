@@ -134,6 +134,30 @@ int ScanAndCompress(int budget);
 int Threshold();
 void SetThreshold(int gen);   // settings aggressiveness slider 4..16 (satoru)
 
+// ── background scanning (the kinit-driven path) ─────────────────────────────
+// the dedicated worker is a cooperative kernel process and is starved for
+// long stretches while a user task is running. kinit's monitor process is not,
+// so it calls this every few hundred ms: one bounded scan pass (grow the pool
+// on demand, age anonymous user pages, compress the idle ones). no-op when the
+// engine is disabled or kurono.kmxidle=0. (satoru)
+void BackgroundTick();
+
+// gate the kinit-driven scan (kurono.kmxidle=0 turns it off for an a/b). the
+// worker's own loop is unaffected. (satoru)
+void SetIdleScan(bool on);
+bool IdleScanEnabled();
+
+// kurono.kmxactive=0: restrict compression to address spaces with no running
+// task (default on: idle pages of an active browser are the whole point; the
+// fault path proves any parked snapshot before serving it). (satoru)
+void SetActiveScan(bool on);
+
+// kurono.kmxall=1: compress non-zero pages as well as zero pages. default is
+// zero-only, the proven-safe subset (a zero snapshot cannot be a torn read of
+// live data); the self-test disables the restriction for its synthetic pages.
+// (satoru)
+void SetZeroOnly(bool on);
+
 // ── pressure (stage 8) ──────────────────────────────────────────────────────
 Pressure CurrentPressure();
 const char* PressureName(Pressure p);

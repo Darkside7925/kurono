@@ -4,6 +4,8 @@
 
 #include "installer_gui.h"
 #include "installer.h"
+#include "installer_disk.h"      // other-os detection for the disk and summary screens (satoru)
+#include "../drivers/blockdev.h"
 #include "user_mgmt.h"
 #include "../drivers/graphics.h"
 #include "../drivers/keyboard.h"
@@ -54,6 +56,12 @@ bool g_install_done       = false;
 bool g_install_failed     = false;
 char g_install_log[256]   = {0};
 bool g_chosen_live_boot   = false;
+
+// what the scan found on each listed disk, filled once when the wizard starts,
+// plus the second confirmation for a disk that holds another os. (satoru)
+InstallerDisk::DiskSafety g_sf[4];
+bool g_sf_ok[4]           = {false, false, false, false};
+bool g_os_ack             = false;
 
 // hostname + basic prefs screen (satoru)
 char g_hostname[32]       = "kurono";
@@ -420,6 +428,14 @@ static void scr_disk(){
         for (const char* s = sch; *s; s++) info[p++]=*s;
         info[p++]=' '; info[p++]='-'; info[p++]=' ';
         for (const char* s = drv; *s; s++) info[p++]=*s;
+        // a short tag for what already lives on this disk (satoru)
+        if (i < 4 && g_sf_ok[i]){
+            const char* tag = g_sf[i].running ? " - in use"
+                : (g_sf[i].os_mask & KIN_OS_WINDOWS) ? " - has Windows"
+                : (g_sf[i].os_mask & KIN_OS_MAC) ? " - has Mac"
+                : (g_sf[i].os_mask & KIN_OS_LINUX) ? " - has Linux" : "";
+            for (const char* s = tag; *s && p < 76; s++) info[p++]=*s;
+        }
         info[p]=0;
         FontTTF::DrawString(x + 38, iy + 42, 12.0f, info, 0xC0FFFFFF);
     }
@@ -617,10 +633,26 @@ static void scr_summary(){
             "WARNING: All existing data on this disk will be permanently erased.", 0xFFE74C3C);
     }
 
+    // another os on this disk: say so, and ask for a second confirmation before
+    // the install button works. a disk kurono runs from is refused outright. (satoru)
+    bool sf_ok = (g_disk_idx >= 0 && g_disk_idx < 4 && g_sf_ok[g_disk_idx]);
+    bool blocked = false;
+    if (sf_ok && g_sf[g_disk_idx].running){
+        FontTTF::DrawString(panel_x + 24, py + 332, 13.0f, "Kurono is running from this drive", 0xFFFFB340);
+        blocked = true;
+    } else if (sf_ok && g_sf[g_disk_idx].os_mask){
+        FontTTF::DrawString(panel_x + 24, py + 332, 13.0f, g_sf[g_disk_idx].line, 0xFFFFB340);
+        g_hit.cb_x = panel_x; g_hit.cb_y[0] = py + 392; g_hit.cb_w = panel_w; g_hit.cb_h = 56;
+        draw_checkbox_row(g_hit.cb_x, g_hit.cb_y[0], g_hit.cb_w, g_hit.cb_h, "Write to this disk anyway", nullptr, g_os_ack);
+        blocked = !g_os_ack;
+    } else {
+        g_hit.cb_y[0] = -10000;
+    }
+
     g_hit.back_x = g_w/2 - 220; g_hit.back_y = g_h - 90; g_hit.back_w = 140; g_hit.back_h = 50;
     g_hit.next_x = g_w/2 + 80;  g_hit.next_y = g_h - 90; g_hit.next_w = 200; g_hit.next_h = 50;
     if (draw_button(g_hit.back_x, g_hit.back_y, g_hit.back_w, g_hit.back_h, "Back", 0xFF555570, false)) InstallerGUI::current_screen = InstallerGUI::SCR_GUESTS;
-    if (draw_button(g_hit.next_x, g_hit.next_y, g_hit.next_w, g_hit.next_h, "Install Now", 0xFFE74C3C, true)){
+    if (!blocked && draw_button(g_hit.next_x, g_hit.next_y, g_hit.next_w, g_hit.next_h, "Install Now", 0xFFE74C3C, true)){
         InstallerGUI::current_screen = InstallerGUI::SCR_PROGRESS;
         InstallerGUI::progress_pct = 0;
         scpy(InstallerGUI::progress_status, "Starting installation...", 128);
@@ -843,7 +875,7 @@ static void install_step(){
             // the on-disk deploy and still provision the account/host/guests via
             // KVFS so first-setup is useful without a disk. honest, not a hard
             // failure. (satoru)
-            int p = Installer::FindFirstExt4Partition();
+            int p = Installer::FindFirstExt4PartitionOnDisk(g_disk_idx);
             if (p < 0){
                 scpy(InstallerGUI::progress_status, "No ext4 target - provisioning in memory...", 128);
                 g_install_step = 4;
@@ -855,9 +887,9 @@ static void install_step(){
         case 3: {
             scpy(InstallerGUI::progress_status, "Deploying system image, EFI loaders, and packages...", 128);
             InstallerGUI::progress_pct = 35;
-            int p = Installer::FindFirstExt4Partition();
+            int p = Installer::FindFirstExt4PartitionOnDisk(g_disk_idx);
             char log[512];
-            int rc = Installer::InstallToPartition(p, log, sizeof(log));
+            int rc = Installer::InstallToPartition(p, log, sizeof(log), g_os_ack);
             if (rc != 0){
                 scpy(g_install_log, log[0]?log:"Install failed", 256);
                 g_install_failed = true;
@@ -987,6 +1019,15 @@ bool InstallerGUI::Run(int start_screen){
     InputManager::Init();
     Installer::Init();
     Installer::Rescan();   // populate disks so the disk screen has live data (satoru)
+    for (int i = 0; i < 4; i++) {
+        g_sf_ok[i] = false;
+        InstallerDiskInfo* di = Installer::GetDisk(i);
+        if (!di) continue;
+        BlockDevice* bdv = BlockDev::FindByName(di->name);
+        for (int k = 0; bdv && k < BlockDev::Count(); k++)
+            if (BlockDev::Get(k) == bdv) g_sf_ok[i] = InstallerDisk::Safety(k, &g_sf[i]);
+    }
+    g_os_ack = false;
     // open on the requested screen (defaults to welcome). out-of-range falls
     // back to welcome so a bad cmdline can't break the wizard. capped at the
     // summary screen - the progress/success screens must be reached via the
@@ -1053,8 +1094,10 @@ bool InstallerGUI::Run(int start_screen){
                 case SCR_DISK: {
                     int dc = Installer::GetDiskCount();
                     for (int i = 0; i < dc && i < 4; i++){
-                        if (point_in(mx, my, g_hit.radio_x, g_hit.radio_y[i], g_hit.radio_w, g_hit.radio_h - 8))
+                        if (point_in(mx, my, g_hit.radio_x, g_hit.radio_y[i], g_hit.radio_w, g_hit.radio_h - 8)){
+                            if (g_disk_idx != i) g_os_ack = false;
                             g_disk_idx = i;
+                        }
                     }
                     break;
                 }
@@ -1090,6 +1133,9 @@ bool InstallerGUI::Run(int start_screen){
                     if (point_in(mx, my, g_hit.alt_x, g_hit.alt_y,   g_hit.alt_w, g_hit.alt_h - 6)) g_pref_24h  = !g_pref_24h;
                     // kmemx full-width checkbox (cb_y[2], full width from cb_x). (satoru)
                     if (point_in(mx, my, g_hit.cb_x,  g_hit.cb_y[2], g_hit.cb_w,  g_hit.cb_h - 6)) g_pref_kmemx = !g_pref_kmemx;
+                    break;
+                case SCR_SUMMARY:
+                    if (point_in(mx, my, g_hit.cb_x, g_hit.cb_y[0], g_hit.cb_w, g_hit.cb_h - 6)) g_os_ack = !g_os_ack;
                     break;
                 case SCR_GUESTS:
                     for (int i = 0; i < g_guest_count; i++){

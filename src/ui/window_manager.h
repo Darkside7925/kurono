@@ -2,7 +2,7 @@
 //  kurono os - window manager
 //  compositing window manager with z-ordering, drag, resize, close
 
-#define WM_MAX_WINDOWS    32
+#define WM_MAX_WINDOWS    128
 #define WM_TITLEBAR_H     36
 #define WM_BORDER_W        1
 #define WM_MIN_WIDTH      140
@@ -63,6 +63,10 @@ struct Window {
     // callbacks
     WindowRenderFunc render;
     WindowInputFunc  input;
+    // optional: called once when the window is really gone (after the close
+    // animation). lets an app free per-window state (the alpine terminal's
+    // 1.7 mb vt grid) without the wm knowing about it. (satoru)
+    void (*on_close)(Window*);
     void* user_data;
 
     // dirty tracking
@@ -327,6 +331,10 @@ public:
     // drop the backdrop so the next frame falls back to a full render. called
     // on drag end and by structural changes (open/close/focus/z-order). (satoru)
     static void InvalidateDragBackdrop();
+    // kurono.gfx.scissor=1: move the dragged window's pixels instead of
+    // repainting both footprints. true when it did; the new rect must then be
+    // marked for the present after the frame is drawn. (satoru)
+    static bool DragMoveByCopy(int* x, int* y, int* w, int* h);
 
     // create window with render/input callbacks, returns window id
     static int CreateWindow(const char* title, int x, int y, int w, int h,

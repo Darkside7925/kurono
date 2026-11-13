@@ -1,4 +1,5 @@
 #include "hal.h"
+#include "../kernel/dbgwatch.h"   // kurono.dbgwatch (satoru)
 #include "../drivers/serial.h"
 #include "../proc/smp.h"          // per-cpu kernel-stack (gs:8) for the syscall path (satoru)
 #include "../proc/spinlock.h"     // serialize cross-core exception dumps (satoru)
@@ -12,36 +13,154 @@
 #include "../drivers/timer.h"       // Timer::GetRealMs64 for the busy sampler (satoru)
 #include "../kernel/kld_broker.h"   // kld msi vectors 0x50..0x57 -> broker doorbell (satoru)
 #include "../kernel/taskmem.h"      // kurono.taskmem=1 interrupt marks (satoru)
+#include "../drivers/disklog.h"      // flush the boot log before a reset (satoru)
+#include "../kernel/pmm.h"          // per-ap kernel stacks on demand (satoru)
 // busy MILLISECONDS per cpu (64-bit, no wrap), read by the task manager. charged
 // by hal_sample_busy from each core's own timer irq using real elapsed time, so
 // the bsp 1 kHz pit and the ap 100 Hz lapic timers need no shared rate. (satoru)
-volatile uint64_t g_cpu_busy_ticks[16];
+volatile uint64_t g_cpu_busy_ticks[HAL_CPU_SLOTS];
 // the same per-cpu interval split by the ring the timer interrupted, plus the
 // total sampled wall time: /proc/stat derives user/system/idle from these. (satoru)
-volatile uint64_t g_cpu_total_ms[16];
-volatile uint64_t g_cpu_user_ms[16];
-volatile uint64_t g_cpu_sys_ms[16];
-// per-pid busy milliseconds side table (struct Process stays untouched); a slot
-// is re-tagged when another pid hashes onto it. read by Scheduler::GetProcessSnapshot. (satoru)
-struct HalPidBusy { volatile uint32_t pid; volatile uint32_t ms; volatile uint32_t user_ms; volatile uint32_t sys_ms; };
-static HalPidBusy g_pid_busy[256];
-static uint64_t   g_busy_last_ms[16];
+volatile uint64_t g_cpu_total_ms[HAL_CPU_SLOTS];
+volatile uint64_t g_cpu_user_ms[HAL_CPU_SLOTS];
+volatile uint64_t g_cpu_sys_ms[HAL_CPU_SLOTS];
+// busy time no task owns (interrupt work, early boot): the kernel's own share.
+volatile uint64_t g_cpu_kernel_ms[HAL_CPU_SLOTS];
+// per-pid busy milliseconds side table (struct Process stays untouched). 1024
+// slots, open addressing, keyed by pid and validated against the process's
+// kernel stack top so a recycled pid never inherits old counters. the old
+// 256-slot pid & 255 table re-tagged on every collision, so with firefox's ~45
+// threads plus the kernel tasks it lost most of the per-process cpu time. (satoru)
+struct HalPidBusy {
+    volatile uint32_t pid;
+    volatile uint32_t stamp;     // low 32 bits of kernel_stack_top (satoru)
+    volatile uint8_t  dead;      // tombstone: keep probing past it, reusable (satoru)
+    volatile uint64_t ms;
+    volatile uint64_t user_ms;
+    volatile uint64_t sys_ms;
+};
+static const uint32_t HAL_PID_SLOTS = 1024;
+static HalPidBusy g_pid_busy[HAL_PID_SLOTS];
+static uint64_t   g_busy_last_ms[HAL_CPU_SLOTS];
+static inline uint32_t hal_slot(uint32_t pid) {
+    return (pid * 2654435761u) & (HAL_PID_SLOTS - 1u);
+}
+// open addressing with tombstones: a forget must not punch a hole that hides
+// entries inserted after it. dead 2 = a writer is claiming the slot. (satoru)
+static HalPidBusy* hal_pid_find(uint32_t pid, uint32_t stamp, bool create) {
+    uint32_t i = hal_slot(pid);
+    for (uint32_t n = 0; n < HAL_PID_SLOTS; n++) {
+        HalPidBusy& s = g_pid_busy[i];
+        uint32_t cur = __atomic_load_n(&s.pid, __ATOMIC_ACQUIRE);
+        uint8_t dead = __atomic_load_n(&s.dead, __ATOMIC_ACQUIRE);
+        if (cur == 0) {
+            if (!create) return nullptr;
+            uint32_t zero = 0;
+            if (!__atomic_compare_exchange_n(&s.pid, &zero, pid, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                continue;
+            __atomic_store_n(&s.dead, (uint8_t)1, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.user_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.sys_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.stamp, stamp, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.dead, (uint8_t)0, __ATOMIC_RELEASE);
+            return &s;
+        }
+        if (dead) {
+            if (!create) { i = (i + 1u) & (HAL_PID_SLOTS - 1u); continue; }
+            uint8_t one = 1;
+            if (!__atomic_compare_exchange_n(&s.dead, &one, (uint8_t)2, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                i = (i + 1u) & (HAL_PID_SLOTS - 1u);
+                continue;
+            }
+            __atomic_store_n(&s.pid, pid, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.stamp, stamp, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.user_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.sys_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.dead, (uint8_t)0, __ATOMIC_RELEASE);
+            return &s;
+        }
+        if (cur == pid) {
+            uint32_t have = __atomic_load_n(&s.stamp, __ATOMIC_ACQUIRE);
+            if (have == stamp) return &s;
+            if (!create) return nullptr;
+            __atomic_store_n(&s.ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.user_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.sys_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&s.stamp, stamp, __ATOMIC_RELEASE);
+            return &s;
+        }
+        i = (i + 1u) & (HAL_PID_SLOTS - 1u);
+    }
+    return nullptr;   // full: drop the sample rather than corrupt another pid's row (satoru)
+}
+static inline uint32_t hal_stamp(const Process* p) {
+    return p ? (uint32_t)(p->kernel_stack_top >> 12) : 0u;
+}
 uint64_t hal_pid_busy_ms(uint32_t pid) {
-    HalPidBusy& s = g_pid_busy[pid & 255u];
-    return s.pid == pid ? (uint64_t)s.ms : 0ull;
+    uint32_t i = hal_slot(pid);
+    for (uint32_t n = 0; n < HAL_PID_SLOTS; n++) {
+        HalPidBusy& e = g_pid_busy[i];
+        uint32_t cur = __atomic_load_n(&e.pid, __ATOMIC_ACQUIRE);
+        if (cur == 0) break;
+        if (cur == pid && !__atomic_load_n(&e.dead, __ATOMIC_ACQUIRE))
+            return __atomic_load_n(&e.ms, __ATOMIC_RELAXED);
+        i = (i + 1u) & (HAL_PID_SLOTS - 1u);
+    }
+    return 0ull;
 }
 void hal_pid_cpu_ms(uint32_t pid, uint64_t* user_ms, uint64_t* sys_ms, uint64_t* total_ms) {
-    HalPidBusy& s = g_pid_busy[pid & 255u];
-    bool hit = (s.pid == pid);
-    if (user_ms)  *user_ms  = hit ? (uint64_t)s.user_ms : 0ull;
-    if (sys_ms)   *sys_ms   = hit ? (uint64_t)s.sys_ms : 0ull;
-    if (total_ms) *total_ms = hit ? (uint64_t)s.ms : 0ull;
+    uint64_t u = 0, sy = 0, t = 0;
+    uint32_t i = hal_slot(pid);
+    for (uint32_t n = 0; n < HAL_PID_SLOTS; n++) {
+        HalPidBusy& e = g_pid_busy[i];
+        uint32_t cur = __atomic_load_n(&e.pid, __ATOMIC_ACQUIRE);
+        if (cur == 0) break;
+        if (cur == pid && !__atomic_load_n(&e.dead, __ATOMIC_ACQUIRE)) {
+            u = __atomic_load_n(&e.user_ms, __ATOMIC_RELAXED);
+            sy = __atomic_load_n(&e.sys_ms, __ATOMIC_RELAXED);
+            t = __atomic_load_n(&e.ms, __ATOMIC_RELAXED);
+            break;
+        }
+        i = (i + 1u) & (HAL_PID_SLOTS - 1u);
+    }
+    if (user_ms)  *user_ms  = u;
+    if (sys_ms)   *sys_ms   = sy;
+    if (total_ms) *total_ms = t;
+}
+// drop a pid's counters when its task is reaped, so a recycled pid starts at
+// zero even if the destroy path races a sampler. (satoru)
+void hal_pid_cpu_forget(uint32_t pid) {
+    uint32_t i = hal_slot(pid);
+    for (uint32_t n = 0; n < HAL_PID_SLOTS; n++) {
+        HalPidBusy& e = g_pid_busy[i];
+        uint32_t cur = __atomic_load_n(&e.pid, __ATOMIC_ACQUIRE);
+        if (cur == pid) {
+            __atomic_store_n(&e.ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&e.user_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&e.sys_ms, 0ull, __ATOMIC_RELEASE);
+            __atomic_store_n(&e.stamp, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&e.dead, (uint8_t)1, __ATOMIC_RELEASE);
+            return;
+        }
+        if (cur == 0) return;
+        i = (i + 1u) & (HAL_PID_SLOTS - 1u);
+    }
+}
+// kernel time no task row owns, in milliseconds over all cpus. (satoru)
+uint64_t hal_kernel_cpu_ms() {
+    uint64_t sum = 0;
+    for (int c = 0; c < HAL_CPU_SLOTS; c++) sum += g_cpu_kernel_ms[c];
+    return sum;
 }
 // timer-irq sampler: this core was busy for the real time since its last tick if
 // it was in ring 3, or in ring 0 running a non-idle task that is not parked on
 // hlt. idle (pid 0 / hlt) is never counted. (satoru)
 static void hal_sample_busy(InterruptFrame* frame, uint32_t cpu) {
-    cpu &= 15u;
+    if (cpu >= HAL_CPU_SLOTS) return;   // was cpu & 15: cpus 16-19 counted as 0-3 (satoru)
     uint64_t now = Timer::GetRealMs64();
     uint64_t last = g_busy_last_ms[cpu];
     if (now == last) return;
@@ -52,21 +171,24 @@ static void hal_sample_busy(InterruptFrame* frame, uint32_t cpu) {
     g_cpu_total_ms[cpu] += dt;
     Process* cur = Scheduler::GetCurrentProcess();
     bool user = ((frame->cs & 3) == 3);
-    bool busy;
-    if (user) {
-        busy = true;
-    } else {
-        busy = cur && cur->pid != 0 && cur->state == Process_Running &&
-               frame->rip > 0x1000 && *(volatile uint8_t*)(frame->rip - 1) != 0xF4;
-    }
-    if (!busy) return;
+    // a user frame can never be hlt (cpl3 hlt faults), and its code page at
+    // rip-1 may be an unmapped guard page (llvmpipe jit regions): reading it
+    // from the timer irq panicked the kernel. (satoru)
+    bool hlt = !user && frame->rip > 0x1000 && *(volatile uint8_t*)(frame->rip - 1) == 0xF4;
+    // kernel work with no task of its own (early boot, scheduler idle paths) is
+    // the kernel's own usage; idle hlt is never counted. (satoru)
+    bool kernel_own = !user && !hlt && (!cur || cur->pid == 0);
+    bool busy = user || (cur && cur->pid != 0 && cur->state == Process_Running && !hlt);
+    if (!busy && !kernel_own) return;
     g_cpu_busy_ticks[cpu] += dt;
     if (user) g_cpu_user_ms[cpu] += dt; else g_cpu_sys_ms[cpu] += dt;
+    if (kernel_own) { g_cpu_kernel_ms[cpu] += dt; return; }
     if (cur && cur->pid != 0) {
-        HalPidBusy& s = g_pid_busy[cur->pid & 255u];
-        if (s.pid != cur->pid) { s.pid = cur->pid; s.ms = 0; s.user_ms = 0; s.sys_ms = 0; }
-        s.ms += (uint32_t)dt;
-        if (user) s.user_ms += (uint32_t)dt; else s.sys_ms += (uint32_t)dt;
+        HalPidBusy* s = hal_pid_find(cur->pid, hal_stamp(cur), true);
+        if (!s) return;   // table full: skip, never charge another pid (satoru)
+        __atomic_add_fetch(&s->ms, dt, __ATOMIC_RELAXED);
+        if (user) __atomic_add_fetch(&s->user_ms, dt, __ATOMIC_RELAXED);
+        else      __atomic_add_fetch(&s->sys_ms, dt, __ATOMIC_RELAXED);
     }
 }
 // test rig (kurono.ffcrash=S): crash firefox once, S s after exec, by pointing a
@@ -141,6 +263,7 @@ extern "C" {
     // kld broker msi vectors 0x50..0x57 (satoru)
     extern void isr_stub_80(); extern void isr_stub_81(); extern void isr_stub_82(); extern void isr_stub_83();
     extern void isr_stub_84(); extern void isr_stub_85(); extern void isr_stub_86(); extern void isr_stub_87();
+    extern char isr_stray_base[];         // 256 stray-vector stubs, 16 bytes apart (satoru)
 }
 
 static const char* exception_names[32] = {
@@ -253,9 +376,11 @@ void HAL::InitGDT() {
 //  descriptor differs per core. (satoru)
 alignas(16) static GDTDescriptor ap_gdt[SMP_MAX_CPUS][GDT_ENTRY_COUNT];
 static TSS64 ap_tss[SMP_MAX_CPUS];
-alignas(16) static uint8_t ap_priv_stack[SMP_MAX_CPUS][16384];
-// per-ap double-fault stacks (ist2), mirroring the bsp's - see InitGDT. (satoru)
-alignas(16) static uint8_t ap_df_stack[SMP_MAX_CPUS][8192];
+// per-ap kernel entry + double-fault stacks. only the cpus this machine
+// actually brought up need them, so each is taken from the pmm when that ap
+// starts instead of reserving 24 kb for all 32 possible cpus. (satoru)
+static uint8_t* ap_priv_stack[SMP_MAX_CPUS];
+static uint8_t* ap_df_stack[SMP_MAX_CPUS];
 
 void HAL::SetupAPCpuState() {
     uint32_t cpu = SMP::CpuIndex();
@@ -263,11 +388,21 @@ void HAL::SetupAPCpuState() {
 
     for (int i = 0; i < 5; i++) ap_gdt[cpu][i].value = gdt_entries[i].value;
 
+    if (!ap_priv_stack[cpu]) {
+        ap_priv_stack[cpu] = (uint8_t*)PMM::AllocBytes(16384);
+        if (!ap_priv_stack[cpu]) KernelPanic::KeBugCheckEx(StopCode::OUT_OF_MEMORY,
+            cpu, 0, 0, 0, "ap kernel stack alloc failed", __FILE__, (uint32_t)__LINE__);
+    }
+    if (!ap_df_stack[cpu]) {
+        ap_df_stack[cpu] = (uint8_t*)PMM::AllocBytes(8192);
+        if (!ap_df_stack[cpu]) KernelPanic::KeBugCheckEx(StopCode::OUT_OF_MEMORY,
+            cpu, 0, 0, 0, "ap double-fault stack alloc failed", __FILE__, (uint32_t)__LINE__);
+    }
     TSS64* t = &ap_tss[cpu];
     for (size_t i = 0; i < sizeof(TSS64); i++) ((uint8_t*)t)[i] = 0;
-    t->rsp0 = (uint64_t)(uintptr_t)(ap_priv_stack[cpu] + sizeof(ap_priv_stack[cpu]));
+    t->rsp0 = (uint64_t)(uintptr_t)(ap_priv_stack[cpu] + 16384);
     t->ist1 = t->rsp0;
-    t->ist2 = (uint64_t)(uintptr_t)(ap_df_stack[cpu] + sizeof(ap_df_stack[cpu]));
+    t->ist2 = (uint64_t)(uintptr_t)(ap_df_stack[cpu] + 8192);
     t->iomap_base = sizeof(TSS64);
 
     // 16-byte tss descriptor into gdt slots 5,6 (same layout as BuildTSSDescriptor). (satoru)
@@ -375,10 +510,13 @@ void HAL::RegisterIRQHandler(uint8_t irq, IRQHandler handler) {
 
 //  common c interrupt handler - called from isr_stubs.asm
 static void log_hex(const char* prefix, uint64_t val) {
-    char buf[32];
+    // room for a long descriptive prefix: the old 32-byte buffer let a prefix
+    // past ~11 chars overwrite the return address (the acpi power-button line
+    // crashed the worker on the first real boot). (satoru)
+    char buf[128];
     const char* hex = "0123456789ABCDEF";
     int len = 0;
-    while (prefix[len]) { buf[len] = prefix[len]; len++; }
+    while (prefix[len] && len < 100) { buf[len] = prefix[len]; len++; }
     buf[len++] = '0'; buf[len++] = 'x';
     for (int i = 60; i >= 0; i -= 4) {
         buf[len++] = hex[(val >> i) & 0xF];
@@ -404,7 +542,13 @@ static bool sched2_contain_ap_fault(InterruptFrame* frame) {
         Process* grp[256];   // firefox runs ~50+ threads; 64 left a tail alive (satoru)
         int gn = Scheduler::CollectAddressSpaceGroup(dead->pid, grp, 256);
         for (int i = 0; i < gn; i++) Scheduler::MarkProcessExited(grp[i], 139);
-        if (gn == 0) Scheduler::MarkProcessExited(dead, 139);
+        if (gn == 0) { Scheduler::MarkProcessExited(dead, 139); grp[0] = dead; gn = 1; }
+        // the fault kill used to mark the group but never queue it for a reap,
+        // so its address space (and every frame of a static low image) stayed
+        // owned until reboot. queue it now: the drain keeps the members on
+        // reaped=2 until they are all off every cpu, then tears the space down.
+        // (satoru)
+        Scheduler::QueueDeferredReap(grp, gn);
         Scheduler::ReleaseOnCpu(dead);
     }
     Scheduler::SetCurrentForThisCpu(nullptr);
@@ -422,14 +566,224 @@ struct TmIrqMark {
     ~TmIrqMark() { if (on) TaskMem::IrqLeave(cpu, prev); }
 };
 
+// ── vector 0 that is not a divide (the laptop's kurono.sched=2 panic) ────────
+// the 1110 laptop boot died with "#DE on cpu0" at the instruction right after the
+// popf in VMM::RunVCPU, with the alpine vcpu loop on cpu0. that popf is where
+// every host interrupt is taken while a guest runs (an external interrupt only
+// causes the exit; the host takes it when IF comes back), so the rip says the
+// event was an INTERRUPT on vector 0, not a division. a real #DE is a fault:
+// its rip names the div / idiv itself. on real hardware the lapic never
+// delivers vectors 0-15 (sdm "illegal vector"), so the candidates are an 8259
+// whose vector base was reprogrammed (extint through lint0 carries the pic's
+// own vector) or a corrupted idt entry. this reports both, repairs the pic and
+// carries on; the same rip again and again is a real fault after all. (satoru)
+static bool insn_is_divide(uint64_t rip) {
+    if (rip < 0x100000ULL) return true;   // cannot read it safely: treat as a real fault (satoru)
+    const volatile uint8_t* b = (const volatile uint8_t*)(uintptr_t)rip;
+    int i = 0;
+    for (; i < 6; i++) {
+        uint8_t x = b[i];
+        bool pfx = (x >= 0x40 && x <= 0x4F) || x == 0x66 || x == 0x67 || x == 0xF0 ||
+                   x == 0xF2 || x == 0xF3 || x == 0x2E || x == 0x3E || x == 0x26 ||
+                   x == 0x36 || x == 0x64 || x == 0x65;
+        if (!pfx) break;
+    }
+    uint8_t op = b[i];
+    if (op != 0xF6 && op != 0xF7) return false;
+    uint8_t reg = (uint8_t)((b[i + 1] >> 3) & 7);
+    return reg == 6 || reg == 7;   // div, idiv (satoru)
+}
+
+static uint64_t g_vec0_hits = 0, g_vec0_last_rip = 0, g_vec0_same = 0, g_vec0_last_ms = 0;
+static uint64_t g_vec0_win_ms = 0, g_vec0_win_n = 0;   // storm cap (satoru)
+
+// the same event on another exception vector (the 1112 laptop boot: #OF at the
+// instruction after `sti; hlt` with cpu0 idle). a vector that pushes no error code,
+// taken in ring 0 right after a hlt, cannot be its exception: hlt raises none and
+// the next instruction has not run. #OF and #BR cannot happen at all in long mode
+// (into / bound are #UD there). nmi, #MC and the error-code vectors are never
+// claimed (an interrupt there would leave a shifted frame). (satoru)
+static bool stray_exception_vector(uint64_t vec, const InterruptFrame* frame) {
+    if ((frame->cs & 3) != 0) return false;
+    if (vec == 0) return !insn_is_divide(frame->rip);
+    if (vec == 2 || vec == 8 || vec == 18) return false;
+    if ((vec >= 10 && vec <= 14) || vec == 17 || vec == 21 || vec == 29 || vec == 30) return false;
+    if (vec >= 32) return false;
+    if (vec == 4 || vec == 5) return true;
+    if (frame->rip < 0x100001ULL) return false;
+    if ((frame->rip & 0xFFF) == 0) return false;   // rip-1 is on another page, maybe unmapped (satoru)
+    return *(const volatile uint8_t*)(uintptr_t)(frame->rip - 1) == 0xF4;   // hlt (satoru)
+}
+
+static bool vec0_interrupt_recover(InterruptFrame* frame) {
+    if (!stray_exception_vector(frame->vector, frame)) return false;
+    uint64_t now = Timer::GetRealMs64();
+    if (frame->rip == g_vec0_last_rip && now - g_vec0_last_ms < 10) {
+        if (++g_vec0_same >= 8) return false;   // a fault loop at one rip: let it panic (satoru)
+    } else {
+        g_vec0_same = 0;
+    }
+    g_vec0_last_rip = frame->rip; g_vec0_last_ms = now;
+    // a stuck source re-firing after every iretq lands at a new rip each time:
+    // more than 500 in one second is a storm, not a stray event - panic. (satoru)
+    if (now - g_vec0_win_ms >= 1000) { g_vec0_win_ms = now; g_vec0_win_n = 0; }
+    if (++g_vec0_win_n > 500) return false;
+    uint64_t n = ++g_vec0_hits;
+    // the 8259 state, read before anything acks it. ocw3 0x0a = irr, 0x0b = isr. (satoru)
+    HAL::OutByte(0x20, 0x0A); uint8_t m_irr = HAL::InByte(0x20);
+    HAL::OutByte(0x20, 0x0B); uint8_t m_isr = HAL::InByte(0x20);
+    HAL::OutByte(0xA0, 0x0A); uint8_t s_irr = HAL::InByte(0xA0);
+    HAL::OutByte(0xA0, 0x0B); uint8_t s_isr = HAL::InByte(0xA0);
+    uint8_t m_mask = HAL::InByte(0x21), s_mask = HAL::InByte(0xA1);
+    bool pic_irq = (m_isr | s_isr) != 0;
+    if (n <= 8 || (n & 1023) == 0) {
+        SerialLogger::Log("[vec0] vector "); SerialLogger::LogDec((int)frame->vector);
+        SerialLogger::Log(" delivered at a non-faulting rip=0x"); SerialLogger::LogHex64(frame->rip);
+        SerialLogger::Log(" cpu="); SerialLogger::LogDec((int)SMP::CpuIndex());
+        SerialLogger::Log(" n="); SerialLogger::LogDec((int)n);
+        SerialLogger::Log(" pic isr="); SerialLogger::LogHex(m_isr); SerialLogger::Log("/"); SerialLogger::LogHex(s_isr);
+        SerialLogger::Log(" irr="); SerialLogger::LogHex(m_irr); SerialLogger::Log("/"); SerialLogger::LogHex(s_irr);
+        SerialLogger::Log(" mask="); SerialLogger::LogHex(m_mask); SerialLogger::Log("/"); SerialLogger::LogHex(s_mask);
+        // lapic in-service / requested vectors and the lvt entries: a vector-0
+        // lvt or an ipi with vector 0 would show up here. (satoru)
+        SerialLogger::Log(" lapic isr:");
+        for (uint32_t r = 0; r < 8; r++) {
+            uint32_t v = SMP::LapicRead(0x100 + r * 0x10);
+            for (uint32_t b = 0; b < 32; b++) if (v & (1u << b)) { SerialLogger::Log(" "); SerialLogger::LogHex(r * 32 + b); }
+        }
+        SerialLogger::Log(" irr:");
+        for (uint32_t r = 0; r < 8; r++) {
+            uint32_t v = SMP::LapicRead(0x200 + r * 0x10);
+            for (uint32_t b = 0; b < 32; b++) if (v & (1u << b)) { SerialLogger::Log(" "); SerialLogger::LogHex(r * 32 + b); }
+        }
+        SMP::LapicWrite(0x280, 0);
+        SerialLogger::Log(" esr="); SerialLogger::LogHex(SMP::LapicRead(0x280));
+        SerialLogger::Log(" lvt t/th/pc/l0/l1/err=");
+        static const uint32_t lvt[6] = { 0x320, 0x330, 0x340, 0x350, 0x360, 0x370 };
+        for (int k = 0; k < 6; k++) { SerialLogger::LogHex(SMP::LapicRead(lvt[k])); SerialLogger::Log(k < 5 ? "/" : ""); }
+        uint64_t h0 = (uint64_t)idt_entries[0].offset_low | ((uint64_t)idt_entries[0].offset_mid << 16) |
+                      ((uint64_t)idt_entries[0].offset_high << 32);
+        uint64_t h32 = (uint64_t)idt_entries[32].offset_low | ((uint64_t)idt_entries[32].offset_mid << 16) |
+                       ((uint64_t)idt_entries[32].offset_high << 32);
+        SerialLogger::Log(" idt0="); SerialLogger::LogHex64(h0);
+        SerialLogger::Log(h0 == isr_stub_table[0] ? "(ok)" : "(CHANGED)");
+        SerialLogger::Log(" idt32="); SerialLogger::LogHex64(h32);
+        SerialLogger::Log(h32 == isr_stub_table[32] ? "(ok)" : "(CHANGED)");
+        SerialLogger::Log("\r\n");
+    }
+    // repair what can be repaired: an idt entry that no longer names its stub,
+    // and an 8259 that delivered an irq on vector 0 (its base was rewritten):
+    // re-initialize it with the masks it had and end the interrupt. (satoru)
+    for (int v = 0; v < 48; v++) {
+        uint64_t h = (uint64_t)idt_entries[v].offset_low | ((uint64_t)idt_entries[v].offset_mid << 16) |
+                     ((uint64_t)idt_entries[v].offset_high << 32);
+        if (h != isr_stub_table[v]) idt_set(v, isr_stub_table[v], v == 8 ? 2 : 0, 0);
+    }
+    if (pic_irq) {
+        HAL::OutByte(0x20, 0x11); HAL::OutByte(0xA0, 0x11);
+        HAL::OutByte(0x21, 0x20); HAL::OutByte(0xA1, 0x28);
+        HAL::OutByte(0x21, 0x04); HAL::OutByte(0xA1, 0x02);
+        HAL::OutByte(0x21, 0x01); HAL::OutByte(0xA1, 0x01);
+        HAL::OutByte(0x21, m_mask); HAL::OutByte(0xA1, s_mask);
+        if (n <= 8) SerialLogger::Log("[vec0] 8259 re-initialized (base 0x20/0x28, masks kept)\r\n");
+    }
+    return true;
+}
+
+// an interrupt on a vector nothing set up (see InitIDT). end it where it is in
+// service: the lapic when its isr bit is set (a missing eoi would block every
+// vector of that priority class on this cpu), the 8259 when it has an irq in
+// service (its inta came back with a wrong vector, so the irq handler never ran
+// and never sent the eoi: the pit tick would stop for good). the spurious vector
+// 0xff is never in service and gets no eoi. (satoru)
+static uint64_t g_stray_hits = 0;
+static void hal_stray_vector(InterruptFrame* frame) {
+    uint32_t vec = (uint32_t)frame->vector;
+    bool lapic_isr = false;
+    if (vec >= 16 && vec < 256)
+        lapic_isr = (SMP::LapicRead(0x100 + (vec >> 5) * 0x10) >> (vec & 31)) & 1;
+    if (lapic_isr) SMP::LapicWrite(0xB0, 0);
+    HAL::OutByte(0x20, 0x0B); uint8_t m_isr = HAL::InByte(0x20);
+    HAL::OutByte(0xA0, 0x0B); uint8_t s_isr = HAL::InByte(0xA0);
+    if (s_isr) HAL::OutByte(0xA0, 0x20);
+    if (m_isr) HAL::OutByte(0x20, 0x20);
+    uint64_t n = __atomic_add_fetch(&g_stray_hits, 1, __ATOMIC_RELAXED);
+    if (n <= 16 || (n & 1023) == 0) {
+        SerialLogger::Log("[stray] vector 0x"); SerialLogger::LogHex(vec);
+        SerialLogger::Log(" cpu="); SerialLogger::LogDec((int)SMP::CpuIndex());
+        SerialLogger::Log(" rip=0x"); SerialLogger::LogHex64(frame->rip);
+        SerialLogger::Log(" n="); SerialLogger::LogDec((int)n);
+        SerialLogger::Log(lapic_isr ? " lapic-eoi" : "");
+        SerialLogger::Log(" pic isr="); SerialLogger::LogHex(m_isr); SerialLogger::Log("/"); SerialLogger::LogHex(s_isr);
+        SerialLogger::Log("\r\n");
+    }
+}
+
+void HAL::StrayVectorSelfTest() {
+    auto ticks = []() { return HAL::pit_ticks; };
+    SerialLogger::Log("[straytest] start cpu="); SerialLogger::LogDec((int)SMP::CpuIndex());
+    SerialLogger::Log(SMP::BspLapicTickActive() ? " tick=lapic\r\n" : " tick=pit\r\n");
+    uint64_t t0 = ticks();
+    Scheduler::SleepMs(20);
+    uint64_t t1 = ticks();
+    __asm__ volatile("int $0xA9");                  // software stray: stub, no eoi (satoru)
+    SMP::TestSelfIpi(0xA9);                         // hardware stray: lapic isr bit, needs the eoi (satoru)
+    Scheduler::SleepMs(20);
+    uint64_t t2 = ticks();
+    __asm__ volatile("int $4");                     // #OF vector, impossible as a fault in long mode (satoru)
+    Scheduler::SleepMs(20);
+    uint64_t t3 = ticks();
+    // the laptop's case: the 8259 hands out vector 0 for irq0. (satoru)
+    __asm__ volatile("cli");
+    uint8_t m = HAL::InByte(0x21), sm = HAL::InByte(0xA1);
+    HAL::OutByte(0x20, 0x11); HAL::OutByte(0x21, 0x00); HAL::OutByte(0x21, 0x04); HAL::OutByte(0x21, 0x01);
+    HAL::OutByte(0x21, (uint8_t)(m & ~1u));
+    __asm__ volatile("sti");
+    Scheduler::SleepMs(20);
+    __asm__ volatile("cli");
+    if (SMP::BspLapicTickActive()) HAL::DisableIRQ(0);
+    else HAL::OutByte(0x21, m);
+    HAL::OutByte(0xA1, sm);
+    __asm__ volatile("sti");
+    Scheduler::SleepMs(20);
+    uint64_t t4 = ticks();
+    SerialLogger::Log("[straytest] ticks per 20 ms: base="); SerialLogger::LogDec((int)(t1 - t0));
+    SerialLogger::Log(" after-0xa9="); SerialLogger::LogDec((int)(t2 - t1));
+    SerialLogger::Log(" after-int4="); SerialLogger::LogDec((int)(t3 - t2));
+    SerialLogger::Log(" after-pic0(40ms)="); SerialLogger::LogDec((int)(t4 - t3));
+    SerialLogger::Log(" strays="); SerialLogger::LogDec((int)g_stray_hits);
+    SerialLogger::Log(" vec0="); SerialLogger::LogDec((int)g_vec0_hits);
+    SerialLogger::Log((t2 > t1 && t3 > t2 && t4 > t3 && g_stray_hits >= 2 && g_vec0_hits >= 1) ? " PASS\r\n" : " FAIL\r\n");
+}
+
+void UbTraceIsrIn(InterruptFrame* f);   // [ubchk], end of file (satoru)
 extern "C" void isr_common_handler(InterruptFrame* frame) {
     uint64_t vec = frame->vector;
+    UbTraceIsrIn(frame);   // [ubchk] (satoru)
+
+    // the panicking cpu's halt request (try_halt_other_cpus): park at once. the
+    // full exception dump this nmi used to get read past its stack top into a
+    // guard page and re-entered the panic from this cpu (1112 laptop). (satoru)
+    // a real nmi on the panicking cpu itself is ignored: parking it would stop
+    // the countdown and the reset. (satoru)
+    if (vec == 2 && KernelPanic::Panicking()) {
+        if (SMP::CpuIndex() == KernelPanic::PanicCpu()) return;
+        for (;;) asm volatile("cli; hlt");
+    }
 
     // sched=2 stack hand-off: publish on_cpu=0 for a task this cpu switched away
     // from, once rsp is off its kernel stack (FinishSwitch checks rsp itself, so
     // a nested interrupt still on that stack is a no-op). interrupts and ring-3
     // faults only; a ring-0 fault path is left untouched. (satoru)
     if (vec >= 32 || (frame->cs & 3) == 3) Scheduler::FinishSwitch();
+
+    // kurono.wp: re-arm CR0.WP if a read-only kernel store suspended it on this
+    // cpu (SMP::WpKernelWriteFallback), once past that store. one load when
+    // nothing is suspended. (satoru)
+    SMP::WpRearm(frame->rip);
+
+    // kurono.dbgwatch: a hardware write watchpoint hit (#DB trap) (satoru)
+    if (vec == 1 && DbgWatch::OnDebugTrap(frame)) return;
 
     if (vec == 0x80) {
         if (syscall_handler) {
@@ -458,6 +812,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         // per-core load side table for the task manager: busy ms from real
         // elapsed time on this cpu. no effect on scheduling. (satoru)
         hal_sample_busy(frame, SMP::Current()->cpu_index);
+        Scheduler::ServiceCpuTick();   // kurono.svccpu: a service cpu's kernel procs (satoru)
         Scheduler::ApTimerPreempt(frame);
         SMP::LapicWrite(0xB0, 0);   // lapic EOI register (satoru)
         return;
@@ -569,8 +924,22 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                 if (LinuxSyscall::HandlePageFault(frame)) {
                     return;
                 }
+                // ring-0 write fault on a present user page nothing resolved:
+                // with CR0.WP on, run it the WP=0 way and log it instead of
+                // panicking (no uaccess fixup to return -EFAULT through). (satoru)
+                if ((frame->error_code & 0x3) == 0x3 && frame->cr2 <= USER_SPACE_TOP) {
+                    Process* wt = Scheduler::GetCurrentProcess();
+                    uint64_t wpf = (wt && wt->is_user())
+                        ? KernelVMM::QueryPageFlagsInAddressSpace(wt->address_space, frame->cr2 & ~0xFFFULL)
+                        : KernelVMM::QueryPageFlagsInAddressSpace(KernelVMM::GetCurrentAddressSpace(), frame->cr2 & ~0xFFFULL);
+                    if (SMP::WpKernelWriteFallback(frame->cr2, frame->rip, wpf)) return;
+                }
             }
         }
+
+        // vector 0 at an instruction that is not a divide: an interrupt, see
+        // vec0_interrupt_recover. (satoru)
+        if (vec0_interrupt_recover(frame)) return;   // any no-error-code vector, see stray_exception_vector (satoru)
 
         // ---- raw fatal-fault dump, BEFORE any lock/buffer/mirror. ----
         // the pretty dump below goes through SerialLogger (per-cpu line buffer +
@@ -665,8 +1034,8 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                                     uint64_t ph = KernelVMM::QueryMappingInAddressSpace(
                                         ft->address_space, va & ~0xFFFULL);
                                     raw_str(" ");
-                                    if (ph) raw_hex(*(volatile uint64_t*)(uintptr_t)
-                                                    ((ph & ~0xFFFULL) | (va & 0xFFFULL)));
+                                    if (ph) raw_hex(*(volatile uint64_t*)
+                                                    ((uintptr_t)PMM::PhysToVirt(ph & ~0xFFFULL) | (va & 0xFFFULL)));
                                     else raw_str("unmapped");
                                 }
                                 raw_str("\r\n");
@@ -840,7 +1209,13 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
         if ((frame->cs & 3) == 0 && frame->rsp &&
             ((frame->rsp >> 47) == 0 || (frame->rsp >> 47) == 0x1FFFFULL)) {
             const uint64_t* sp = (const uint64_t*)(uintptr_t)frame->rsp;
-            for (int i = 0; i < 32; i++) {
+            // stay on rsp's own page: past it can be the guard page of the next
+            // kernel stack up. reading it faulted inside this dump and turned the
+            // laptop's #gp into a bogus "kernel stack overflow" panic naming the
+            // proc that owns that guard. (satoru)
+            int words = (int)((0x1000 - (frame->rsp & 0xFFF)) / 8);
+            if (words > 32 || words <= 0) words = 32;
+            for (int i = 0; i < words; i++) {
                 if ((i & 3) == 0) { SerialLogger::Log("\r\n  S+"); SerialLogger::LogDec(i * 8); SerialLogger::Log(": "); }
                 SerialLogger::Log("0x");
                 SerialLogger::LogHex((uint32_t)(sp[i] >> 32)); SerialLogger::LogHex((uint32_t)sp[i]);
@@ -876,7 +1251,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                     p[n++] = '+'; const char* hx = "0123456789ABCDEF";
                     p[n++] = hx[(off >> 4) & 0xF]; p[n++] = hx[off & 0xF];
                     p[n] = 0;
-                    uint64_t v = ph ? *(volatile uint64_t*)(uintptr_t)(ph + ((va + off) & 0xFFF)) : 0xDEADULL;
+                    uint64_t v = ph ? *(volatile uint64_t*)((uintptr_t)PMM::PhysToVirt(ph) + ((va + off) & 0xFFF)) : 0xDEADULL;
                     log_hex(p, v);
                 }
             };
@@ -897,7 +1272,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                     const char* hx = "0123456789ABCDEF";
                     p[n++] = hx[(off >> 4) & 0xF]; p[n++] = hx[off & 0xF];
                     p[n] = 0;
-                    uint64_t v = *(volatile uint64_t*)(uintptr_t)(ph + (va & 0xFFF));
+                    uint64_t v = *(volatile uint64_t*)((uintptr_t)PMM::PhysToVirt(ph) + (va & 0xFFF));
                     log_hex(p, v);
                 }
             }
@@ -915,7 +1290,7 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
                     uint64_t a = va + i;
                     uint64_t ph = KernelVMM::QueryMappingInAddressSpace(fp->address_space, a & ~0xFFFULL);
                     if (!ph) return false;
-                    o[i] = *(volatile uint8_t*)(uintptr_t)(ph + (a & 0xFFF));
+                    o[i] = *(volatile uint8_t*)((uintptr_t)PMM::PhysToVirt(ph) + (a & 0xFFF));
                 }
                 return true;
             };
@@ -1068,12 +1443,20 @@ extern "C" void isr_common_handler(InterruptFrame* frame) {
             HAL::irq_handlers[irq](frame);
         }
 
+        // the bsp tick from its own lapic timer (SMP::StartBspLapicTick) arrives on
+        // vector 32 too: end it at the lapic only (a non-specific 8259 eoi would end
+        // whatever the 8259 has in service). a pit irq0 still in flight from the
+        // 8259 has no lapic isr bit and gets the 8259 eoi as before. (satoru)
+        if (irq == 0 && SMP::BspLapicTickActive() && (SMP::LapicRead(0x110) & 1u)) {
+            SMP::LapicWrite(0xB0, 0);
+            return;
+        }
         // send eoi
         HAL::SendEOI(irq);
         return;
     }
 
-    log_hex("HAL: unhandled interrupt vector ", vec);
+    hal_stray_vector(frame);
 }
 
 //  idt initialization - populate all 256 entries from the nasm stub table
@@ -1118,6 +1501,14 @@ void HAL::InitIDT() {
 
     // vectors 48-255: leave as not-present (type_attr = 0).
     // if hardware triggers one, the cpu will fire a #gp which we handle above.
+    // (satoru) not any more: the 1112 laptop boot died on exactly that #gp (error
+    // code 0x54b = idt vector 0xa9, external event) with cpu0 halted. every vector
+    // nothing claimed now gets a stray stub; isr_common_handler logs it, ends it at
+    // the lapic / 8259 when it is in service there, and returns. (satoru)
+    for (int i = 48; i < 256; i++) {
+        if (idt_entries[i].type_attr == 0)
+            idt_set(i, (uint64_t)(uintptr_t)(isr_stray_base + 16 * i));
+    }
 
     // load the idt register
     idt_ptr.limit = sizeof(idt_entries) - 1;
@@ -1287,7 +1678,28 @@ void HAL::Reboot() {
     DisableInterrupts();
 
     SerialLogger::Log("HAL: Reboot requested\r\n");
+    // push the tail of the boot log out before the machine loses ram. the 1 s
+    // worker may own the log right now, so retry instead of dropping the tail. (satoru)
+    {
+        uint64_t t0 = Timer::GetRealMs64();
+        while (!DiskLog::Flush() && Timer::GetRealMs64() - t0 < 3000u)
+            for (volatile uint32_t d = 0; d < 200000; d++) asm volatile("pause");
+    }
     while (true) {
+        // 0. the acpi fadt reset register. this is the reset linux uses first
+        // on modern intel laptops; 0xcf9 alone is not decoded by every
+        // chipset when the firmware leaves its reset control locked. (satoru)
+        SerialLogger::Log("HAL: trying the ACPI FADT reset register\r\n");
+        AcpiReset();
+        SerialLogger::Log("HAL: ACPI FADT reset register did not take\r\n");
+        // 0b. the efi runtime reset service, when the firmware handed us a
+        // system table. a reset that returns is unsupported. (satoru)
+        if (BootAcpi::IsEfiBoot()) {
+            SerialLogger::Log("HAL: trying EFI ResetSystem\r\n");
+            EfiReset(1);   // warm reset (satoru)
+            SerialLogger::Log("HAL: EFI ResetSystem did not take\r\n");
+        }
+
         // 1. classic keyboard controller cpu reset pulse.
         for (int tries = 0; tries < 8; tries++) {
             uint32_t spin = 0;
@@ -1320,14 +1732,86 @@ void HAL::Reboot() {
     }
 }
 
+static uint32_t g_panic_reset_skip = 0;
+void HAL::SetPanicResetSkip(uint32_t mask) { g_panic_reset_skip = mask; }
+
+// a real-time pause with interrupts off: the tsc ms clock, bounded by an
+// iteration cap in case the tsc is not running. (satoru)
+static void panic_reset_delay_ms(uint32_t ms) {
+    uint64_t t0 = Timer::GetRealMs64();
+    for (uint64_t n = 0; Timer::GetRealMs64() - t0 < ms && n < (uint64_t)ms * 200000ull; n++)
+        asm volatile("pause");
+}
+
+// a method that faults (an acpi reset register in unmapped mmio) re-enters the
+// panic, which calls this again: g_panic_reset_stage skips what was tried. (satoru)
+static volatile uint32_t g_panic_reset_stage = 0;
+
+[[noreturn]] void HAL::PanicReset() {
+    DisableInterrupts();
+    auto step = [](const char* m) {
+        SerialLogger::Log(m);
+        DiskLog::PanicFlush();   // the last line on disk names the step that hung (satoru)
+    };
+    if (!(g_panic_reset_skip & 1) && g_panic_reset_stage < 1) {
+        g_panic_reset_stage = 1;
+        step("HAL: panic reset 1/4: ACPI FADT reset register\r\n");
+        AcpiReset();
+        panic_reset_delay_ms(500);
+        step("HAL: ACPI FADT reset did not take\r\n");
+    }
+    if (!(g_panic_reset_skip & 2) && g_panic_reset_stage < 2) {
+        g_panic_reset_stage = 2;
+        step("HAL: panic reset 2/4: 0xCF9 = 0x02 then 0x06\r\n");
+        OutByte(0xCF9, 0x02);
+        panic_reset_delay_ms(1);
+        OutByte(0xCF9, 0x06);
+        panic_reset_delay_ms(500);
+        step("HAL: 0xCF9 reset did not take\r\n");
+    }
+    if (!(g_panic_reset_skip & 4) && g_panic_reset_stage < 3) {
+        g_panic_reset_stage = 3;
+        step("HAL: panic reset 3/4: keyboard controller 0x64 <- 0xFE\r\n");
+        for (int tries = 0; tries < 4; tries++) {
+            for (uint32_t spin = 0; (InByte(0x64) & 0x02) && spin < 100000; spin++) asm volatile("pause");
+            OutByte(0x64, 0xFE);
+            panic_reset_delay_ms(100);
+        }
+        panic_reset_delay_ms(400);
+        step("HAL: keyboard controller reset did not take\r\n");
+    }
+    step("HAL: panic reset 4/4: triple fault\r\n");
+    struct {
+        uint16_t limit;
+        uint64_t base;
+    } __attribute__((packed)) null_idt = {0, 0};
+    asm volatile("lidt %0" : : "m"(null_idt));
+    asm volatile("int3");
+    for (;;) asm volatile("cli; hlt");
+}
+
 void HAL::PowerOff() {
     DisableInterrupts();
     SerialLogger::Log("HAL: PowerOff requested\r\n");
+    {
+        uint64_t t0 = Timer::GetRealMs64();
+        while (!DiskLog::Flush() && Timer::GetRealMs64() - t0 < 3000u)
+            for (volatile uint32_t d = 0; d < 200000; d++) asm volatile("pause");
+    }
 
-    // try the common emulator/acpi poweroff ports in order. each is a
+    // 1. acpi s5 soft off via the fadt pm1 control block and the \_S5 sleep
+    // type. this is the real-hardware power-off path; the emulator ports
+    // below exist for machines whose tables are missing. (satoru)
+    if (AcpiPowerOff()) {
+        SerialLogger::Log("HAL: ACPI S5 write did not take\r\n");
+    } else {
+        SerialLogger::Log("HAL: ACPI S5 unavailable, trying the emulator ports\r\n");
+    }
+
+    // 2. try the common emulator/acpi poweroff ports in order. each is a
     // 16-bit write of the sleep value to a hardware-reduced acpi pm1a-style
     // control port that the hypervisor watches. on real hardware these
-    // usually do nothing, so we fall through to a halt. (satoru)
+    // usually do nothing, so we fall through to the halt. (satoru)
     for (int attempt = 0; attempt < 4; attempt++) {
         // qemu (>= 2.0) acpi pm control register.
         OutWord(0x604, 0x2000);
@@ -1479,11 +1963,11 @@ static uint8_t aml_read_small_int(const uint8_t** pp) {
     return v;
 }
 
-// scan the dsdt aml for Name(_S3, Package(){SLP_TYPa, SLP_TYPb, ...}) and extract
+// scan the dsdt aml for Name(_Sx, Package(){SLP_TYPa, SLP_TYPb, ...}) and extract
 // the two sleep-type values. this is the ACPICA-free pattern hobby kernels use:
-// no full aml interpreter, just a byte scan for the "_S3_" NameOp package. returns
+// no full aml interpreter, just a byte scan for the "_Sx_" NameOp package. returns
 // true and fills *a/*b on success. (satoru)
-static bool acpi_parse_s3(uintptr_t dsdt, uint8_t* a, uint8_t* b) {
+static bool acpi_parse_sleep_pkg(uintptr_t dsdt, char which, uint8_t* a, uint8_t* b) {
     if (!dsdt) return false;
     const AcpiSDTHeader* dh = (const AcpiSDTHeader*)dsdt;
     if (!acpi_sig_eq(dh->signature, "DSDT")) return false;
@@ -1492,7 +1976,7 @@ static bool acpi_parse_s3(uintptr_t dsdt, uint8_t* a, uint8_t* b) {
     const uint8_t* start = (const uint8_t*)(dsdt + sizeof(AcpiSDTHeader));
     const uint8_t* end   = (const uint8_t*)(dsdt + len);
     for (const uint8_t* p = start; p + 8 < end; p++) {
-        if (!(p[0] == '_' && p[1] == 'S' && p[2] == '3' && p[3] == '_')) continue;
+        if (!(p[0] == '_' && p[1] == 'S' && p[2] == which && p[3] == '_')) continue;
         // must be a NameOp (0x08), optionally with a RootChar '\' before the name.
         // (satoru)
         bool is_name = (p > start && p[-1] == 0x08) ||
@@ -1515,6 +1999,89 @@ static bool acpi_parse_s3(uintptr_t dsdt, uint8_t* a, uint8_t* b) {
     }
     return false;
 }
+
+// generic address structure (acpi 2.0+): where a register lives and how wide
+// it is. (satoru)
+struct AcpiGas {
+    uint8_t  space;        // 0 memory, 1 io, 2 pci config (satoru)
+    uint8_t  bit_width;
+    uint8_t  bit_offset;
+    uint8_t  access;       // 1 byte, 2 word, 3 dword, 4 qword (satoru)
+    uint64_t address;
+} __attribute__((packed));
+
+// the 32-bit pm1a/b control blocks are at fadt+64/68; when both are zero the
+// x_ variants at fadt+168/180 carry the io ports on a long fadt. (satoru)
+static void acpi_pm1_cnt_ports(uintptr_t fadt, uint16_t* a, uint16_t* b) {
+    *a = 0; *b = 0;
+    if (!fadt) return;
+    const AcpiSDTHeader* fh = (const AcpiSDTHeader*)fadt;
+    uint32_t a32 = *(const uint32_t*)(fadt + 64);
+    uint32_t b32 = *(const uint32_t*)(fadt + 68);
+    if (a32) *a = (uint16_t)a32;
+    if (b32) *b = (uint16_t)b32;
+    if (!*a && fh->length >= 180) {
+        const AcpiGas* ga = (const AcpiGas*)(fadt + 168);
+        const AcpiGas* gb = (const AcpiGas*)(fadt + 180);
+        if (ga->space == 1 && ga->address && ga->address <= 0xFFFF) *a = (uint16_t)ga->address;
+        if (gb->space == 1 && gb->address && gb->address <= 0xFFFF) *b = (uint16_t)gb->address;
+    }
+}
+
+// pm1 event block: status at port, enable at port+len/2. the 32-bit port is at
+// fadt+56; x_pm1a_evt_blk (fadt+144) is the fallback. (satoru)
+static uint16_t acpi_pm1_evt_port(uintptr_t fadt, uint8_t* evt_len) {
+    if (evt_len) *evt_len = 4;
+    if (!fadt) return 0;
+    const AcpiSDTHeader* fh = (const AcpiSDTHeader*)fadt;
+    uint32_t p32 = *(const uint32_t*)(fadt + 56);
+    uint16_t port = p32 ? (uint16_t)p32 : 0;
+    if (!port && fh->length >= 156) {
+        const AcpiGas* g = (const AcpiGas*)(fadt + 144);
+        if (g->space == 1 && g->address && g->address <= 0xFFFF) port = (uint16_t)g->address;
+    }
+    uint8_t len = *(const uint8_t*)(fadt + 88);
+    if (evt_len && len) *evt_len = len;
+    return port;
+}
+
+// the fadt reset register (gas at 112) + reset value (byte at 124). only
+// present on a fadt long enough to carry both. (satoru)
+static bool acpi_reset_register(uintptr_t fadt, AcpiGas* gas, uint8_t* value) {
+    if (!fadt) return false;
+    const AcpiSDTHeader* fh = (const AcpiSDTHeader*)fadt;
+    // RESET_REG is the 12-byte gas at offset 116 and RESET_VALUE the byte at 128
+    // (acpi 2.0+, table 5-34). offset 112 is the 32-bit Flags field: read as a
+    // gas it never looked valid, so every panic reset skipped the acpi reset and
+    // the laptop log ended at "no ACPI reset register in the FADT". (satoru)
+    if (fh->length < 129) return false;
+    const AcpiGas* g = (const AcpiGas*)(fadt + 116);
+    if (!g->address || (g->space != 0 && g->space != 1)) return false;
+    if (gas) *gas = *g;
+    if (value) *value = *(const uint8_t*)(fadt + 128);
+    return true;
+}
+
+// write one register through a gas descriptor. (satoru)
+static bool acpi_gas_write(const AcpiGas& g, uint8_t value) {
+    uint8_t width = g.access;
+    if (!width) width = (g.bit_width ? (uint8_t)((g.bit_width + 7) / 8) : 1);
+    if (g.space == 1) {
+        if (g.address > 0xFFFF) return false;
+        if (width >= 4)      HAL::OutLong((uint16_t)g.address, value);
+        else if (width == 2) HAL::OutWord((uint16_t)g.address, (uint16_t)value);
+        else                 HAL::OutByte((uint16_t)g.address, value);
+        return true;
+    }
+    if (g.space == 0) {
+        volatile uint8_t* p = (volatile uint8_t*)(uintptr_t)g.address;
+        if (width >= 4)      *(volatile uint32_t*)p = value;
+        else if (width == 2) *(volatile uint16_t*)p = (uint16_t)value;
+        else                 *p = value;
+        return true;
+    }
+    return false;
+}
 }  // namespace
 
 bool HAL::Suspend() {
@@ -1528,8 +2095,8 @@ bool HAL::Suspend() {
         SerialLogger::Log("HAL: Suspend aborted - no ACPI RSDP/FADT found\r\n");
         return false;
     }
-    uint32_t pm1a_cnt = *(const uint32_t*)(fadt + 64);
-    uint32_t pm1b_cnt = *(const uint32_t*)(fadt + 68);   // 0 if the platform has no PM1b (satoru)
+    uint16_t pm1a_cnt = 0, pm1b_cnt = 0;   // 0 if the platform has no PM1b (satoru)
+    acpi_pm1_cnt_ports(fadt, &pm1a_cnt, &pm1b_cnt);
     log_hex("HAL: FADT located, PM1a_CNT_BLK = ", pm1a_cnt);
 
     // step 2 (implemented): the s3 sleep type (slp_typa/b, bits 10-12 of the pm1
@@ -1544,7 +2111,7 @@ bool HAL::Suspend() {
         return false;
     }
     uint8_t slp_typa = 0, slp_typb = 0;
-    if (!acpi_parse_s3(dsdt, &slp_typa, &slp_typb)) {
+    if (!acpi_parse_sleep_pkg(dsdt, '3', &slp_typa, &slp_typb)) {
         SerialLogger::Log("HAL: Suspend aborted - no \\_S3 package found in the DSDT\r\n");
         return false;
     }
@@ -1576,6 +2143,110 @@ bool HAL::Suspend() {
     EnableInterrupts();
     SerialLogger::Log("HAL: Suspend - S3 transition did not take (platform rejected SLP_EN)\r\n");
     return false;
+}
+
+bool HAL::AcpiReset() {
+    AcpiGas gas;
+    uint8_t value = 0;
+    if (!acpi_reset_register(acpi_find_fadt(), &gas, &value)) {
+        SerialLogger::Log("HAL: no ACPI reset register in the FADT\r\n");
+        return false;
+    }
+    log_hex("HAL: ACPI reset register ", gas.address);
+    log_hex("HAL: ACPI reset value ", value);
+    if (!acpi_gas_write(gas, value)) {
+        SerialLogger::Log("HAL: ACPI reset register space is unsupported\r\n");
+        return false;
+    }
+    // give the chipset time to reset; if we are still executing it did not. (satoru)
+    for (volatile uint32_t d = 0; d < 2000000; d++) asm volatile("pause");
+    return false;
+}
+
+bool HAL::AcpiPowerOff() {
+    uintptr_t fadt = acpi_find_fadt();
+    if (!fadt) return false;
+    uint16_t pm1a = 0, pm1b = 0;
+    acpi_pm1_cnt_ports(fadt, &pm1a, &pm1b);
+    if (!pm1a) {
+        SerialLogger::Log("HAL: PowerOff - FADT has no PM1a_CNT_BLK\r\n");
+        return false;
+    }
+    uintptr_t dsdt = acpi_find_dsdt(fadt);
+    uint8_t slp_typa = 0, slp_typb = 0;
+    if (!acpi_parse_sleep_pkg(dsdt, '5', &slp_typa, &slp_typb)) {
+        SerialLogger::Log("HAL: PowerOff - no \\_S5 package found in the DSDT\r\n");
+        return false;
+    }
+    const uint16_t SLP_EN = (uint16_t)(1u << 13);
+    log_hex("HAL: S5 SLP_TYPa = ", slp_typa);
+    SerialLogger::Log("HAL: entering ACPI S5\r\n");
+    OutWord(pm1a, (uint16_t)(((uint32_t)(slp_typa & 0x7) << 10) | SLP_EN));
+    if (pm1b) OutWord(pm1b, (uint16_t)(((uint32_t)(slp_typb & 0x7) << 10) | SLP_EN));
+    for (volatile uint32_t d = 0; d < 2000000; d++) asm volatile("pause");
+    return true;
+}
+
+// the efi runtime reset entry takes the microsoft x64 calling convention, not
+// the sysv one this kernel is built with. (satoru)
+typedef void (__attribute__((ms_abi)) *EfiResetSystemFn)(uint32_t, uint64_t, uint64_t, void*);
+
+bool HAL::EfiReset(uint32_t type) {
+    if (!BootAcpi::IsEfiBoot()) return false;
+    uint64_t st = BootAcpi::SystemTable();
+    if (!st || (st & 7) || st >= (512ull << 30)) return false;
+    if (*(const uint64_t*)(uintptr_t)st != 0x5453595320494249ull) return false;   // "IBI SYST"
+    uint64_t rt = *(const uint64_t*)(uintptr_t)(st + 0x58);
+    if (!rt || (rt & 7) || rt >= (512ull << 30)) return false;
+    if (*(const uint64_t*)(uintptr_t)rt != 0x56524553544E5552ull) return false;   // "RUNTSERV"
+    uint64_t fn = *(const uint64_t*)(uintptr_t)(rt + 0x68);
+    if (!fn || (fn & 7) || fn >= (512ull << 30)) return false;
+    log_hex("HAL: EFI ResetSystem type ", type);
+    ((EfiResetSystemFn)(uintptr_t)fn)(type, 0, 0, nullptr);
+    return false;   // a reset that returns is unsupported
+}
+
+// pm1 status/enable port remembered by the power button poller. (satoru)
+static uint16_t g_pwrbtn_port = 0;
+static uint8_t  g_pwrbtn_len  = 0;
+
+bool HAL::AcpiPowerButtonInit() {
+    uintptr_t fadt = acpi_find_fadt();
+    if (!fadt) {
+        SerialLogger::Log("HAL: power button - no ACPI FADT\r\n");
+        return false;
+    }
+    uint8_t len = 0;
+    uint16_t port = acpi_pm1_evt_port(fadt, &len);
+    if (!port || len < 4) {
+        SerialLogger::Log("HAL: power button - FADT has no PM1 event block\r\n");
+        return false;
+    }
+    uint16_t en_port = (uint16_t)(port + len / 2);
+    uint16_t en = InWord(en_port);
+    en |= (uint16_t)(1u << 8);          // PWRBTN_EN (satoru)
+    OutWord(en_port, en);
+    uint16_t st = InWord(port);
+    if (st & (1u << 8)) OutWord(port, (uint16_t)(1u << 8));   // clear a stale press (satoru)
+    g_pwrbtn_port = port;
+    g_pwrbtn_len = len;
+    log_hex("HAL: ACPI power button armed, PM1_EVT_BLK = ", port);
+    log_hex("HAL: pwrbtn enable = ", InWord(en_port));
+    log_hex("HAL: pwrbtn status = ", InWord(port));
+    return true;
+}
+
+bool HAL::AcpiPowerButtonPressed() {
+    if (!g_pwrbtn_port) return false;
+    uint16_t st = InWord(g_pwrbtn_port);
+    if (!(st & (1u << 8))) return false;
+    OutWord(g_pwrbtn_port, (uint16_t)(1u << 8));   // write 1 to clear (satoru)
+    (void)g_pwrbtn_len;
+    return true;
+}
+
+uint16_t HAL::AcpiPowerButtonStatus() {
+    return g_pwrbtn_port ? InWord(g_pwrbtn_port) : 0;
 }
 
 void HAL::OutByte(uint16_t port, uint8_t value) {
@@ -1611,3 +2282,143 @@ void HAL::IOWait() {
 void HAL::MemoryBarrier() {
     asm volatile("mfence" : : : "memory");
 }
+
+// ── [ubchk] user-boundary trace (corruptor hunt) ─────────────────────────────
+// a per-thread ring of every ring-3 entry/exit the kernel sees (interrupt or
+// exception in/out, syscall in/out, SaveUserFrame, LoadUserFrame) with rip and
+// rsp, in a side table keyed by the Process pointer (struct Process must not
+// grow). the check: an exit that resumes a thread at the SAME rip it entered at
+// must also resume it with the same rsp and callee-saved registers; nothing
+// legitimate changes rsp without changing rip (signal delivery, sigreturn,
+// restart and execve all move rip). a mismatch means the kernel handed the
+// thread a register state it did not save. kurono.ubtrace=1. (satoru)
+bool g_ubtrace_on = false;
+namespace {
+constexpr int UB_SLOTS = 4096;
+constexpr int UB_EV = 24;
+struct UbEv { uint64_t rip, rsp; uint32_t tsc; uint8_t kind, cpu; uint16_t code; };
+struct UbSlot {
+    const Process* owner; uint32_t pid; uint32_t head;
+    uint64_t in_rip, in_rsp, in_csum; uint8_t in_valid, in_kind; uint16_t in_code;
+    UbEv ev[UB_EV];
+};
+UbSlot g_ub[UB_SLOTS];
+volatile uint32_t g_ub_alerts = 0;
+inline uint64_t ub_csum(const InterruptFrame* f) {
+    return f->rbx ^ (f->rbp * 0x9E3779B97F4A7C15ull) ^ (f->r12 << 1) ^ (f->r13 >> 1)
+         ^ (f->r14 * 3) ^ (f->r15 + 0xD1B54A32D192ED03ull);
+}
+// Process objects are page-granular heap blocks, so the low pointer bits are
+// nearly constant: mix the whole pointer (a plain >>4 put most threads in a
+// few slots and turned the [ubchk] check into cross-thread noise). (satoru)
+inline uint32_t ub_hash(const Process* p) {
+    uint64_t x = (uint64_t)(uintptr_t)p * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(x >> 52) % UB_SLOTS;
+}
+inline UbSlot* ub_slot(const Process* p) {
+    if (!p) return nullptr;
+    UbSlot* s = &g_ub[ub_hash(p)];
+    if (s->owner != p || s->pid != p->pid) {
+        s->owner = p; s->pid = p->pid; s->head = 0; s->in_valid = 0;
+        for (int i = 0; i < UB_EV; i++) s->ev[i].kind = 0;
+    }
+    return s;
+}
+inline void ub_push(UbSlot* s, uint8_t kind, uint16_t code, uint64_t rip, uint64_t rsp) {
+    uint32_t lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    UbEv& e = s->ev[s->head % UB_EV];
+    e.rip = rip; e.rsp = rsp; e.tsc = (uint32_t)((((uint64_t)hi << 32) | lo) >> 10);
+    e.kind = kind; e.cpu = (uint8_t)SMP::CpuIndex(); e.code = code;
+    s->head++;
+}
+const char* const ub_kn[] = { "-", "IN", "OUT", "SYS", "SRET", "SAVE", "LOAD", "SIG" };
+}  // namespace
+
+void UbDump(const Process* p) {
+    if (!g_ubtrace_on || !p) return;
+    UbSlot* s = &g_ub[ub_hash(p)];
+    if (s->owner != p) { SerialLogger::Log("[ubtr] no trace for this thread\r\n"); return; }
+    SerialLogger::Log("[ubtr] pid="); SerialLogger::LogDec((int)p->pid);
+    SerialLogger::Log(" last events, oldest first (kind code cpu tsc/1k rip rsp):\r\n");
+    uint32_t n = s->head < (uint32_t)UB_EV ? s->head : (uint32_t)UB_EV;
+    for (uint32_t i = s->head - n; i != s->head; i++) {
+        const UbEv& e = s->ev[i % UB_EV];
+        if (!e.kind) continue;
+        SerialLogger::Log("[ubtr]  "); SerialLogger::Log(e.kind < 8 ? ub_kn[e.kind] : "?");
+        SerialLogger::Log(" "); SerialLogger::LogHex64(e.code);
+        SerialLogger::Log(" c"); SerialLogger::LogDec(e.cpu);
+        SerialLogger::Log(" t"); SerialLogger::LogDec((int)e.tsc);
+        SerialLogger::Log(" rip="); SerialLogger::LogHex64(e.rip);
+        SerialLogger::Log(" rsp="); SerialLogger::LogHex64(e.rsp);
+        SerialLogger::Log("\r\n");
+    }
+}
+
+static void ub_in(const InterruptFrame* f, uint8_t kind, uint16_t code) {
+    if ((f->cs & 3) != 3) return;
+    Process* p = Scheduler::GetCurrentProcess();
+    if (!p || !p->is_user()) return;
+    UbSlot* s = ub_slot(p);
+    ub_push(s, kind, code, f->rip, f->rsp);
+    s->in_rip = f->rip; s->in_rsp = f->rsp; s->in_csum = ub_csum(f);
+    s->in_valid = 1; s->in_kind = kind; s->in_code = code;
+}
+
+static void ub_out(const InterruptFrame* f, uint8_t kind) {
+    if ((f->cs & 3) != 3) return;
+    Process* p = Scheduler::GetCurrentProcess();
+    if (!p || !p->is_user()) return;
+    UbSlot* s = ub_slot(p);
+    ub_push(s, kind, 0, f->rip, f->rsp);
+    if (s->in_valid && f->rip == s->in_rip &&
+        (f->rsp != s->in_rsp || ub_csum(f) != s->in_csum)) {
+        uint32_t k = __atomic_fetch_add(&g_ub_alerts, 1, __ATOMIC_RELAXED);
+        if (k < 6) {
+            SerialLogger::Log("[ubchk] MISMATCH pid="); SerialLogger::LogDec((int)p->pid);
+            SerialLogger::Log(" thr="); SerialLogger::Log(p->name);
+            SerialLogger::Log(" cpu="); SerialLogger::LogDec((int)SMP::CpuIndex());
+            SerialLogger::Log(" rip="); SerialLogger::LogHex64(f->rip);
+            SerialLogger::Log(" in_rsp="); SerialLogger::LogHex64(s->in_rsp);
+            SerialLogger::Log(" out_rsp="); SerialLogger::LogHex64(f->rsp);
+            SerialLogger::Log(" csum="); SerialLogger::Log(ub_csum(f) == s->in_csum ? "same" : "DIFF");
+            SerialLogger::Log(" in="); SerialLogger::Log(ub_kn[s->in_kind]);
+            SerialLogger::Log("/"); SerialLogger::LogHex64(s->in_code);
+            SerialLogger::Log(" rbx="); SerialLogger::LogHex64(f->rbx);
+            SerialLogger::Log(" rbp="); SerialLogger::LogHex64(f->rbp);
+            SerialLogger::Log("\r\n");
+            UbDump(p);
+        }
+    }
+    s->in_valid = 0;
+}
+
+void UbNoteSave(const Process* p, const InterruptFrame* f, uint8_t site) {
+    if (!g_ubtrace_on || !p || !f) return;
+    UbSlot* s = ub_slot(p);
+    ub_push(s, 5, site, f->rip, f->rsp);
+}
+void UbNoteLoad(const Process* p, const InterruptFrame* f) {
+    if (!g_ubtrace_on || !p || !f) return;
+    UbSlot* s = ub_slot(p);
+    ub_push(s, 6, 0, f->rip, f->rsp);
+}
+void UbNoteSignal(const Process* p, uint64_t rip, uint64_t rsp, int sig) {
+    if (!g_ubtrace_on || !p) return;
+    UbSlot* s = ub_slot(p);
+    ub_push(s, 7, (uint16_t)sig, rip, rsp);
+    s->in_valid = 0;
+}
+
+extern "C" void ub_trace_isr_exit(InterruptFrame* f) {
+    if (g_ubtrace_on) ub_out(f, 2);
+}
+extern "C" void ub_trace_sys_in(InterruptFrame* f) {
+    if (g_ubtrace_on) ub_in(f, 3, (uint16_t)f->rax);
+}
+extern "C" void ub_trace_sys_out(InterruptFrame* f) {
+    if (g_ubtrace_on) ub_out(f, 4);
+}
+void UbTraceIsrIn(InterruptFrame* f) {
+    if (g_ubtrace_on) ub_in(f, 1, (uint16_t)f->vector);
+}
+// end [ubchk] (satoru)

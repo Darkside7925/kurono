@@ -117,8 +117,29 @@ static bool valid_elf64(const uint8_t* d, uint64_t sz) {
 static bool map_one_page(Process* proc, uint64_t va,
                          const uint8_t* src, uint64_t copy_len,
                          uint64_t in_page_off) {
-    void* pg = PMM::AllocBytes(PAGE_SIZE);
-    if (!pg) return false;
+    // inside the fixed low window the page must own the frame at its own
+    // physical address: the kernel's identity view of ordinary ram there is the
+    // same page, so nothing else may live in that slot. outside it any frame
+    // works (userspace_base and up are not identity mapped). (satoru)
+    void* pg;
+    if (!PMM::ImageWindowFullyReserved() && !PMM::DirectMapOn() &&
+        PMM::IsInImageWindow(va & ~(uint64_t)(PAGE_SIZE - 1))) {
+        // demand mode only: the page must own the frame at its own va. in
+        // reserved mode the whole window is pinned, exactly like main, so an
+        // ordinary frame can back the va and two low images can coexist. (satoru)
+        uint64_t pa = va & ~(uint64_t)(PAGE_SIZE - 1);
+        if (PMM::AllocFrameAt(pa)) {
+            pg = (void*)(uintptr_t)pa;          // identity backed (satoru)
+        } else if (PMM::ImageSafePhys(pa)) {
+            pg = PMM::AllocBytes(PAGE_SIZE);    // shadow a fixed kernel range (satoru)
+            if (!pg) return false;
+        } else {
+            return false;                       // somebody else owns that frame (satoru)
+        }
+    } else {
+        pg = PMM::AllocBytes(PAGE_SIZE);
+        if (!pg) return false;
+    }
     memset(pg, 0, PAGE_SIZE);
     if (copy_len > 0 && src) {
         memcpy((uint8_t*)pg + in_page_off, src, (size_t)copy_len);
@@ -392,17 +413,35 @@ Process* ElfLoader::LoadELF64(const uint8_t* data, uint64_t size, const char* na
 Process* ElfLoader::LoadELF64FromVFS(const char* path, const char* name) {
     if (!path) return nullptr;
     constexpr uint32_t MAX_USER_ELF = 64u * 1024u * 1024u;  // 64 mb cap (large static binaries e.g. ffmpeg) (satoru)
-    uint8_t* buf = (uint8_t*)KernelHeap::Alloc(MAX_USER_ELF);
+    // size the read buffer to the file, not the 64 mb cap: a 64 mb heap block per
+    // launch grew the kernel heap by a region every time (regions are not given
+    // back while small objects live in them), so restart loops and a busy
+    // desktop ran the heap out. take it from the pmm (returned whole on free),
+    // fall back to the heap, and to the cap only if the size is unknown. (satoru)
+    int fsz = KVFS::GetFileSize(path);
+    uint32_t cap = (fsz > 0 && (uint32_t)fsz <= MAX_USER_ELF) ? (uint32_t)fsz : MAX_USER_ELF;
+    size_t bytes = ((size_t)cap + 4095u) & ~(size_t)4095u;
+    bool from_pmm = true;
+    uint8_t* buf = (uint8_t*)PMM::AllocBytes(bytes);
+    if (!buf) { from_pmm = false; buf = (uint8_t*)KernelHeap::Alloc(bytes); }
     if (!buf) return nullptr;
-    int got = KVFS::ReadFile(path, buf, MAX_USER_ELF);
+    int got = KVFS::ReadFile(path, buf, cap);
     if (got <= 0) {
         log("[ELF] KVFS::ReadFile failed for ");
         log(path);
         log("\r\n");
-        KernelHeap::Free(buf);
+        if (from_pmm) PMM::FreeBytes(buf, bytes); else KernelHeap::Free(buf);
         return nullptr;
     }
     Process* proc = LoadELF64(buf, (uint64_t)got, name);
-    KernelHeap::Free(buf);
+    if (from_pmm) PMM::FreeBytes(buf, bytes); else KernelHeap::Free(buf);
+    // /proc/self/exe falls back to the process name when exe_path is empty, and
+    // glibc's _dl_get_origin aborts (exit 134) on a link that is not absolute:
+    // every kinit service (kurono-systemd-probe's /bin/true) died that way. (satoru)
+    if (proc && !proc->exe_path[0] && path[0] == '/') {
+        int i = 0;
+        while (path[i] && i < (int)sizeof(proc->exe_path) - 1) { proc->exe_path[i] = path[i]; i++; }
+        proc->exe_path[i] = 0;
+    }
     return proc;
 }

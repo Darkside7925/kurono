@@ -52,6 +52,7 @@ constexpr uint32_t V9FS_ORDWR   = 2;
 constexpr uint32_t V9FS_OTRUNC  = 0x10;
 constexpr uint32_t V9FS_OAPPEND = 0x20;
 
+#define V9FS_ROOT "/home/user/vmshare"   // the only host directory a guest sees (satoru)
 constexpr int V9FS_MAX_FIDS     = 64;
 constexpr int V9FS_MAX_PATH     = 256;
 constexpr int V9FS_MAX_IOSIZE   = 4096;  // max single i/o transfer

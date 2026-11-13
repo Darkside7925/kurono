@@ -1,21 +1,31 @@
+#include "../system/kernel_slots.h"   // kslot command (satoru)
+#include "../system/error_screen.h"   // errscreen command (satoru)
+#include "../kernel/panic.h"   // the panic framebuffer for kscreen (satoru)
+#include "../kernel/kscreen.h"   // the kscreen preview command (satoru)
+#include "../apps/system_settings.h"   // the settings command (satoru)
 #include "shell.h"
 #include "../system/kasset.h"   // on-demand assets (satoru)
 #include "linux_cmds.h"
 #include "windows_cmds.h"
 #include "../system/conduit.h"
+#include "../system/power.h"
 #include "../system/ui_config.h"
 #include "../ui/desktop.h"
 #include "../ui/boot_anim.h"
+#include "../fs/kfs.h"
 #include "../fs/kvfs.h"
 #include "../fs/persist.h"
 #include "../linux/ext4.h"
 #include "../kernel/heap.h"
+#include "../kernel/memboot.h"   // memboot: boot ram census (satoru)
 #include "../kernel/userspace.h"
 #include "../kernel/elf_loader.h"
 #include "../linux/linux_syscall.h"
 #include "../apps/denji_app.h"
+#include "../kui/kui_kernel.h"   // ring-3 kui apps (satoru)
 #include "../apps/firefox_launcher.h"
 #include "../system/claude_host.h"
+#include "../system/opencode_host.h"   // (satoru)
 #include "../drivers/disklog.h"
 #include "../drivers/usb.h"
 #include "../drivers/hwinfo.h"
@@ -28,6 +38,9 @@
 #include "../proc/kernel_processes.h"
 #include "../proc/kernel_locks.h"   // g_input_lock: shared with the input/gui pollers (satoru)
 #include "../proc/spinlock.h"
+#include "../kernel/dbgwatch.h"   // kurono.envwatch (satoru)
+#include "../kernel/vmm.h"   // kurono.envwatch: stack-top frame (satoru)
+extern bool g_envwatch;   // kurono.envwatch=1, kurono_kernel.cpp (satoru)
 #include "../media/embedded_media.h"
 #include "../userprogs/embedded_userprogs.h"   // ffmpeg on-demand symbols (satoru)
 #include "../drivers/serial.h"
@@ -40,13 +53,17 @@
 #include "../drivers/intel_display_probe.h"   // `gpuprobe` (satoru)
 #include "../drivers/intel_dp_aux.h"          // `gpuaux` (satoru)
 #include "../drivers/intel_modeset.h"         // `gpumode` (satoru)
+#include "../ui/frame_pacer.h"                // pacer cap follows a live rate switch (satoru)
 #include "../drivers/intel_accel.h"           // `gpuaccel` + hardware cursor pump hook (satoru)
+#include "../drivers/intel_gt.h"              // `gpuaccel gttest` (satoru)
+#include "../ui/gfx_bench.h"                 // `gfxbench` (satoru)
 #include "../drivers/nvidia_gpu.h"
 #include "../drivers/amd_gpu.h"
 #include "../drivers/intel_gpu.h"
 #include "../drivers/display_mgr.h"
 #include "../hal/hal.h"
 #include "../hal/cpufreq.h"
+#include "../drivers/cpu_detect.h"   // IsHypervisor: firefox default url (satoru)
 #include "../system/screenshot.h"
 #include "../ui/notification.h"
 #include "../kernel/time.h"
@@ -128,7 +145,7 @@ static bool should_show_guest_command(const char* name) {
     LinuxGuestProfile profile = Hypervisor::GetLinuxGuestProfile();
 
     // ken's aliases stay callable but are not advertised in the help list. (satoru)
-    if (seq(name, "supr") || seq(name, "sudo")) return false;
+    if (seq(name, "supr") || seq(name, "sudo") || seq(name, "ken")) return false;   // ken: old name of amdo (satoru)
 
     if (seq(name, "alpine") || seq(name, "apk") || seq(name, "ffmpeg") ||
         seq(name, "ffprobe") || seq(name, "pwsh-setup")) {
@@ -492,6 +509,15 @@ void KuronoShell::PumpUI() {
     // gui process - racing the wayland tx stream (duplicate serials, torn
     // events gtk silently drops = input dead in firefox) and the damage/swap
     // machinery (stale partial swaps = window-drag ghosts). (satoru)
+    // kurono.svccpu: the gui and input procs live on a cpu of their own, which
+    // nothing on cpu 0 can starve, so this stopgap pump would only be a second
+    // ui pipeline running beside them. a long loop on the desktop cpu that pumps
+    // the ui (a download, a connect wait, shell output) instead lets the gui have
+    // that cpu once its slice is over. (satoru)
+    if (Scheduler::UiCpu() != 0 && !g_pump_modal) {
+        if (SMP::CpuIndex() == Scheduler::UiCpu()) Scheduler::CondResched();
+        return;
+    }
     if (SMP::CpuIndex() != 0) return;
     // a modal normally stands the generic pump down; the modal's own waiter
     // uses PumpModalUI() to opt back in, and a starved gui lets this shared
@@ -656,15 +682,37 @@ void KuronoShell::PumpUI() {
             s_pump_mx = Mouse::mx; s_pump_my = Mouse::my;
         }
         uint32_t fb = s_pump_cost_ms * 8 > 1000u ? s_pump_cost_ms * 8 : 1000u;
-        if (want || (uint32_t)(t - s_pump_last_ms) >= fb) {
+        // the gui loop renders under g_fb_lock. under kurono.sched=2 it runs
+        // on another cpu and can be mid-frame (or preempted holding the lock)
+        // when its heartbeat looks stale here: drawing and presenting from the
+        // same back buffer at the same time tore frames and lost damage. this
+        // pump now skips the frame while the lock is held. it does not take
+        // the lock itself: it runs inside other threads' syscalls, and one of
+        // those blocking with the lock held would stall the gui loop. (satoru)
+        // a two-flag handshake with the gui loop (Graphics::PumpEnter): the
+        // pump announces itself, then backs off if the gui is in a frame; the
+        // gui waits (bounded) for a pump that got in first. two renders never
+        // share the scissor, clip and damage state. (satoru)
+        bool may_draw = Graphics::PumpEnter();
+        if (may_draw && (want || (uint32_t)(t - s_pump_last_ms) >= fb)) {
             s_pump_last_ms = t;
-            DesktopEnvironment::Render();
+            // the same damage scissor passes as the gui loop (kurono.gfx.scissor=1) (satoru)
+            if (Graphics::ScissorEnabled() && !BootAnim::Active() && !BootAnim::CoversScreen() && !KSA::ModalActive())
+                DesktopEnvironment::RenderScissored();
+            else
+                DesktopEnvironment::Render();
             if (KSA::ModalActive()) KSA::RenderPromptOverlay();   // modal over the live desktop (satoru)
             Mouse::DrawAt(Mouse::mx, Mouse::my);
             BootAnim::Composite();   // boot animation overlay, no-op when done (satoru)
             Graphics::SwapBuffers();
             s_pump_cost_ms = Timer::GetRealMs() - t;
+        } else if (!may_draw && want) {
+            Graphics::MarkUIDirty();   // the gui loop draws it instead (satoru)
         }
+        // land page flips the slower pipe deferred (kurono.igpu.flip=1); this
+        // pump is the only compositor that runs while an app owns the bsp. (satoru)
+        if (may_draw && IntelAccel::FlipBusy()) IntelAccel::FlipService();
+        Graphics::PumpLeave();
     }
 
     reentrant = false;
@@ -1137,8 +1185,10 @@ namespace ShellBuiltins {
     int cmd_gpuaux(KuronoShell*, int, const char**, char*, int);
     int cmd_gpumode(KuronoShell*, int, const char**, char*, int);
     int cmd_gpuaccel(KuronoShell*, int, const char**, char*, int);
+    int cmd_gfxbench(KuronoShell*, int, const char**, char*, int);
     int cmd_display(KuronoShell*, int, const char**, char*, int);
     int cmd_kurono(KuronoShell*, int, const char**, char*, int);
+    int cmd_memboot(KuronoShell*, int, const char**, char*, int);
     int cmd_screenshot(KuronoShell*, int, const char**, char*, int);
     int cmd_cpufreq(KuronoShell*, int, const char**, char*, int);
     int cmd_poweroff(KuronoShell*, int, const char**, char*, int);
@@ -1150,11 +1200,21 @@ namespace ShellBuiltins {
     int cmd_wltest(KuronoShell*, int, const char**, char*, int);
     int cmd_kapp(KuronoShell*, int, const char**, char*, int);   // kui/kui_launch.cpp (satoru)
     int cmd_pthtest(KuronoShell*, int, const char**, char*, int);
+    int cmd_mmapreuse(KuronoShell*, int, const char**, char*, int);
+    int cmd_mmapholetest(KuronoShell*, int, const char**, char*, int);
+    int cmd_sleeptest(KuronoShell*, int, const char**, char*, int);
+    int cmd_sigtest(KuronoShell*, int, const char**, char*, int);
+    int cmd_settings_open(KuronoShell*, int, const char**, char*, int);
+    int cmd_kscreen(KuronoShell*, int, const char**, char*, int);
+    int cmd_errscreen(KuronoShell*, int, const char**, char*, int);
+    int cmd_kslot(KuronoShell*, int, const char**, char*, int);
+    int cmd_fdtest(KuronoShell*, int, const char**, char*, int);
     int cmd_playvideo(KuronoShell*, int, const char**, char*, int);
     int cmd_persisttest(KuronoShell*, int, const char**, char*, int);
     int cmd_ken(KuronoShell*, int, const char**, char*, int);
     int cmd_firefox(KuronoShell*, int, const char**, char*, int);
     int cmd_claude(KuronoShell*, int, const char**, char*, int);
+    int cmd_opencode(KuronoShell*, int, const char**, char*, int);
 }
 
 void KuronoShell::RegisterBuiltins() {
@@ -1163,14 +1223,24 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("denji",    "Open Denji video player",     ENV_KURONO, "media",   cmd_denji);
     RegisterCommand("ffmpeg",   "Run embedded ffmpeg transcoder", ENV_AUTO, "media",   cmd_ffmpeg);
     RegisterCommand("recovery", "Rescue entry point: drives, toolbox, ai", ENV_AUTO, "recovery", cmd_recovery);
-    RegisterCommand("audio",    "Audio status / restart / test tone", ENV_AUTO, "system", cmd_audio);
+    RegisterCommand("audio",    "Audio status / restart / stop / test tone", ENV_AUTO, "system", cmd_audio);
     for (int i = 0; RTOOL_NAMES[i]; i++)
         RegisterCommand(RTOOL_NAMES[i], "Recovery toolbox (static linux binary)", ENV_AUTO, "recovery", cmd_rtool);
     RegisterCommand("wltest",   "Run the wl_shm wayland render test", ENV_AUTO, "media", cmd_wltest);
     RegisterCommand("kapp",     "Run a ring-3 kui app from /system/apps", ENV_AUTO, "media", cmd_kapp);   // (satoru)
     RegisterCommand("pthtest",  "Run the pthreads (clone+futex) smoke test", ENV_AUTO, "media", cmd_pthtest);
+    RegisterCommand("mmapreuse","Run the mmap hole reuse tests (t1|t2|t3|all)", ENV_AUTO, "system", cmd_mmapreuse);
+    RegisterCommand("mmapholetest","Run the mmap hole cache self-test", ENV_AUTO, "system", cmd_mmapholetest);
+    RegisterCommand("sleeptest","Run the interruptible-sleep timing/signal test", ENV_AUTO, "system", cmd_sleeptest);
+    RegisterCommand("sigtest",  "Run the signal delivery + sigaltstack test", ENV_AUTO, "system", cmd_sigtest);   // (satoru)
+    RegisterCommand("settings", "Open Settings, optionally on a page (settings network)", ENV_AUTO, "system", cmd_settings_open);   // (satoru)
+    RegisterCommand("kscreen",  "Draw an error screen preview: kscreen blue|choices|red", ENV_AUTO, "system", cmd_kscreen);   // (satoru)
+    RegisterCommand("errscreen","Inject a driver failure: errscreen display|second|wifi|disk|iommu ok|ok2|fail", ENV_AUTO, "system", cmd_errscreen);   // (satoru)
+    RegisterCommand("kslot",    "Kurono versions: kslot status|stage <file>|previous|recovery", ENV_AUTO, "system", cmd_kslot);   // (satoru)
+    RegisterCommand("fdtest",   "Run the close-on-exec + unix socket table test", ENV_AUTO, "system", cmd_fdtest);
     RegisterCommand("firefox",  "Launch Firefox (installs it first if needed)", ENV_AUTO, "apps", cmd_firefox);
     RegisterCommand("claude",   "Run Claude Code (loads the CLAUDE file from the KURONO partition)", ENV_AUTO, "apps", cmd_claude);
+    RegisterCommand("opencode", "Run OpenCode (loads the OPENCODE file from the KURONO partition)", ENV_AUTO, "apps", cmd_opencode);
     RegisterCommand("persisttest","Test kvfs persistence across reboot", ENV_AUTO, "system", cmd_persisttest);
     RegisterCommand("playvideo","Play the imported video (ssstik)", ENV_AUTO, "media",  cmd_playvideo);
     RegisterCommand("vgpu",     "VirtIO-GPU host status",      ENV_KURONO, "virt",    cmd_vgpu);
@@ -1191,8 +1261,9 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("gpu",      "Show GPU information",        ENV_KURONO, "system",  cmd_gpu);
     RegisterCommand("gpuprobe", "Read-only Intel display register report", ENV_AUTO, "system", cmd_gpuprobe);
     RegisterCommand("gpuaux",   "Intel DP AUX report: DPCD + EDID of attached sinks", ENV_AUTO, "system", cmd_gpuaux);
-    RegisterCommand("gpumode",  "Intel external DP on pipe B: status | light [hz] | off", ENV_AUTO, "system", cmd_gpumode);
+    RegisterCommand("gpumode",  "Intel external DP on pipe B: status | light [hz] | rate HZ | off", ENV_AUTO, "system", cmd_gpumode);
     RegisterCommand("gpuaccel", "Intel display acceleration: status | on | off | test", ENV_AUTO, "system", cmd_gpuaccel);
+    RegisterCommand("gfxbench", "compositor cursor/drag benchmark: run | last | scissor on|off", ENV_AUTO, "system", cmd_gfxbench);
     RegisterCommand("display",  "List / arrange display outputs", ENV_KURONO, "system",  cmd_display);
     RegisterCommand("sysinfo",  "System information",           ENV_KURONO, "builtin", cmd_sysinfo);
 
@@ -1216,12 +1287,14 @@ void KuronoShell::RegisterBuiltins() {
     RegisterCommand("usermode",  "Run ring-3 demo process",      ENV_KURONO, "system",  cmd_usermode);
 
     // ksa / ken - hypervisor-backed privilege prompts + auth policy. (satoru)
-    RegisterCommand("ken",      "Privilege & auth policy (KSA)", ENV_KURONO, "security", cmd_ken);
+    // amdo is the command name (renamed from ken on the owner's request); ken stays a hidden alias. (satoru)
+    RegisterCommand("amdo",     "Privilege & auth policy (KSA)", ENV_KURONO, "security", cmd_ken);
+    RegisterCommand("ken",      "Hidden alias for amdo", ENV_KURONO, "security", cmd_ken);
     // sudo-style aliases: `sudo <command>` and the superseded `supr <command>`
     // run it through the ken approval gate. ENV_AUTO so the terminal's bridge
     // stubs exist. help hides both alias spellings. (satoru)
     RegisterCommand("sudo",      "Run a command with administrator approval", ENV_AUTO, "security", cmd_ken);
-    RegisterCommand("supr",      "Hidden alias for ken", ENV_AUTO, "security", cmd_ken);
+    RegisterCommand("supr",      "Hidden alias for amdo", ENV_AUTO, "security", cmd_ken);
 
     // alpine vm bridge commands - embed alpine into shell
     RegisterCommand("alpine",   "Run command in Alpine VM",     ENV_KURONO, "system",  cmd_alpine);
@@ -1232,6 +1305,7 @@ void KuronoShell::RegisterBuiltins() {
 
     // kurono system command - reload config, show info
     RegisterCommand("kurono",  "Kurono system control",        ENV_KURONO, "system",  cmd_kurono);
+    RegisterCommand("memboot", "Boot-time ram census by subsystem", ENV_AUTO, "system", cmd_memboot);
 
     // phase 8: screenshots, cpu frequency, power management. (satoru)
     RegisterCommand("screenshot","Capture screen to a BMP",      ENV_KURONO, "system",  cmd_screenshot);
@@ -1290,6 +1364,8 @@ int cmd_version(KuronoShell* sh, int argc, const char** argv, char* out, int max
 
 int cmd_denji(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
+    if (KuiKernel::LaunchRing3("denji"))   // ring 3 by default, the kernel build is the fallback (satoru)
+        return sappend(out, 0, maxo, "Opened the media player.\n");
     DenjiApp::Open();
     if (DenjiApp::IsOpen()) {
         return sappend(out, 0, maxo, "Opened Denji video player.\n");
@@ -1622,8 +1698,9 @@ int cmd_gpuaux(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
 
 // stage 2: `gpumode status`, `gpumode light [hz]` (light the external dp
 // sink stage 1 found, edid timing nearest hz at the native resolution,
-// default 60), `gpumode off`. [igpu-mode] lines go to the serial log and
-// the terminal. (satoru)
+// default 60), `gpumode off`, `gpumode rate HZ` (live re-light, same path
+// as Settings > Display). [igpu-mode] lines go to the serial log and the
+// terminal. (satoru)
 int cmd_gpumode(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh;
     const char* sub = argc >= 2 ? argv[1] : "status";
@@ -1635,8 +1712,21 @@ int cmd_gpumode(KuronoShell* sh, int argc, const char** argv, char* out, int max
         return IntelModeset::Light(out, maxo, hz);
     }
     if (eq(sub, "off")) return IntelModeset::Off(out, maxo);
+    if (eq(sub, "rate")) {
+        // live switch of the lit pipe b timing, same path as Settings. (satoru)
+        uint32_t hz = 0;
+        if (argc >= 3) for (const char* c = argv[2]; *c >= '0' && *c <= '9'; c++) hz = hz * 10 + (uint32_t)(*c - '0');
+        if (!hz) return sappend(out, 0, maxo, "usage: gpumode rate HZ\n");
+        int r = IntelModeset::SetRate(out, maxo, hz);
+        if (r) {
+            UIConfig::SetInt("display.dp_hz", (int)IntelModeset::CurrentHz(), true);
+            UIConfig::Save();
+            FramePacer::OutputsChanged();
+        }
+        return r;
+    }
     if (eq(sub, "status")) return IntelModeset::Status(out, maxo);
-    int p = sappend(out, 0, maxo, "usage: gpumode status | light [hz] | off\n");
+    int p = sappend(out, 0, maxo, "usage: gpumode status | light [hz] | off | rate HZ\n");
     return p;
 }
 
@@ -1644,6 +1734,32 @@ int cmd_gpumode(KuronoShell* sh, int argc, const char** argv, char* out, int max
 // and `test` subcommands run the same self-test the boot flag does, with the
 // same rollback, and log [igpu-accel] lines to serial and to the terminal.
 // (satoru)
+// gfxbench: the self-driving cursor and drag benchmark (results in the log,
+// one [gfxbench] line per phase), and the damage scissor switch. (satoru)
+int cmd_gfxbench(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
+    (void)sh;
+    const char* sub = argc >= 2 ? argv[1] : "run";
+    auto eq = [](const char* a, const char* b) { while (*a && *a == *b) { a++; b++; } return *a == *b; };
+    out[0] = 0;
+    if (eq(sub, "last")) {
+        const char* s = GfxBench::LastSummary();
+        scat(out, s[0] ? s : "no finished run yet", maxo);
+        scat(out, "\n", maxo);
+    } else if (eq(sub, "scissor")) {
+        bool on = argc >= 3 && eq(argv[2], "on");
+        Graphics::SetScissorEnabled(on);
+        Graphics::MarkFullScreenDirty();
+        Graphics::MarkUIDirty();
+        scat(out, on ? "damage scissor rendering on\n" : "damage scissor rendering off\n", maxo);
+    } else if (GfxBench::Start()) {
+        scat(out, "gfxbench started: cursor 4 s, drag 4 s, idle 2 s. hands off the mouse; results in the log ([gfxbench]), then `gfxbench last`\n", maxo);
+    } else {
+        scat(out, "gfxbench is already running\n", maxo);
+    }
+    int n = 0; while (out[n]) n++;
+    return n;
+}
+
 int cmd_gpuaccel(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh;
     const char* sub = argc >= 2 ? argv[1] : "status";
@@ -1653,8 +1769,24 @@ int cmd_gpuaccel(KuronoShell* sh, int argc, const char** argv, char* out, int ma
         return p;
     }
     if (eq(sub, "off")) return IntelAccel::Off(out, maxo);
-    if (eq(sub, "status")) return IntelAccel::Status(out, maxo);
-    return sappend(out, 0, maxo, "usage: gpuaccel status | on | off | test\n");
+    if (eq(sub, "status")) {
+        int p = IntelAccel::Status(out, maxo);
+        if (p < maxo - 1) p += IntelGt::Status(out + p, maxo - p);
+        return p;
+    }
+    // the blitter self-tests again (fill, copy, coherency, resubmit, throughput) (satoru)
+    if (eq(sub, "gttest")) return IntelGt::SelfTest(out, maxo);
+    if (eq(sub, "gtoff")) {
+        IntelGt::Off("gpuaccel gtoff");
+        return sappend(out, 0, maxo, "gt off\n");
+    }
+    // stage 2b page flip on its own, without re-running the cursor self-test (satoru)
+    if (eq(sub, "flipon")) return IntelAccel::FlipEnable(out, maxo);
+    if (eq(sub, "flipoff")) {
+        IntelAccel::FlipDisable("gpuaccel flipoff");
+        return sappend(out, 0, maxo, "page flip off, cpu present back\n");
+    }
+    return sappend(out, 0, maxo, "usage: gpuaccel status | on | off | test | flipon | flipoff | gttest | gtoff\n");
 }
 
 int cmd_gpu(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
@@ -1833,33 +1965,19 @@ static void persist_kvfs() {
     PersistStore::SaveTree();
 }
 
-// shutdown film (ui/boot_anim): the gui loop plays the boot animation in
-// reverse while this command waits, bounded so a stuck display can never
-// block the power-off. a no-op when animations are off. (satoru)
-static void play_shutdown_film() {
-    if (!BootAnim::StartShutdown(0)) return;
-    uint64_t t0 = Timer::GetRealMs64();
-    while (!BootAnim::ShutdownDone() && Timer::GetRealMs64() - t0 < 9000u) {
-        KuronoShell::PumpUI();
-        Scheduler::SleepMs(10);
-    }
-}
-
 int cmd_reboot(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Rebooting...\n");
-    play_shutdown_film();
-    persist_kvfs();   // save desktop fs before reboot (satoru)
-    HAL::Reboot();
+    if (!PowerManager::Request(PowerManager::ACTION_RESTART, "shell reboot"))
+        p = sappend(out, p, maxo, "reboot: another power action is already running\n");
     return p;
 }
 
 int cmd_shutdown(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Shutting down...\n");
-    play_shutdown_film();
-    persist_kvfs();   // save desktop fs before power-off (satoru)
-    HAL::PowerOff();          // acpi/emulator soft power-off; does not return (satoru)
+    if (!PowerManager::Request(PowerManager::ACTION_SHUTDOWN, "shell shutdown"))
+        p = sappend(out, p, maxo, "shutdown: another power action is already running\n");
     return p;
 }
 
@@ -1956,21 +2074,18 @@ int cmd_cpufreq(KuronoShell* sh, int argc, const char** argv, char* out, int max
 int cmd_poweroff(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
     int p = sappend(out, 0, maxo, "Powering off...\n");
-    play_shutdown_film();
-    persist_kvfs();
-    HAL::PowerOff();
+    if (!PowerManager::Request(PowerManager::ACTION_SHUTDOWN, "shell poweroff"))
+        p = sappend(out, p, maxo, "poweroff: another power action is already running\n");
     return p;
 }
 
-// acpi s3 suspend-to-ram; reports if the platform cannot enter s3. (satoru)
+// acpi s3 suspend-to-ram; the power worker saves first and reports if the
+// platform cannot enter s3. (satoru)
 int cmd_suspend(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     (void)sh; (void)argc; (void)argv;
-    int p = 0;
-    if (!HAL::Suspend()) {
-        p = sappend(out, p, maxo, "suspend unsupported (acpi s3 unavailable)\n");
-    } else {
-        p = sappend(out, p, maxo, "resumed from suspend\n");
-    }
+    int p = sappend(out, 0, maxo, "Suspending...\n");
+    if (!PowerManager::Request(PowerManager::ACTION_SLEEP, "shell suspend"))
+        p = sappend(out, p, maxo, "suspend: another power action is already running\n");
     return p;
 }
 
@@ -2215,8 +2330,10 @@ int cmd_rtool(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     return p;
 }
 
-// `audio [status|restart|tone]` - hd audio diagnostics. restart re-runs the
-// controller + codec bring-up without a reboot. (satoru)
+// `audio [status|restart|stop|tone]` - audio diagnostics and recovery.
+// restart reopens the active backend (usb audio included) without a reboot;
+// stop force-frees every mixer stream so a stuck playback ends. both are also
+// the backend of the /dev/kaudio command channel. (satoru)
 int cmd_audio(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     int p = 0;
@@ -2235,21 +2352,23 @@ int cmd_audio(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
         p = sappend(out, p, mx, ok ? "\n" : " (not present or failed, see serial)\n");
         usb_active = ok && be[0] == 'u';
     } else if (sub[0] == 'r') {
-        bool ok;
-        if (usb_active) {
-            ok = UsbAudio::Restart();
-            p = sappend(out, p, mx, ok ? "audio: usb audio restarted\n" : "audio: usb audio restart FAILED (see serial [usbaudio] log)\n");
-        } else {
-            ok = HDAudio::Restart();
-            p = sappend(out, p, mx, ok ? "audio: hd audio restarted\n" : "audio: restart FAILED (see serial [hda] log)\n");
-        }
+        const char* was = AudioServer::ActiveBackendName();
+        bool ok = AudioServer::RestartActive();
+        p = sappend(out, p, mx, ok ? "audio: restarted " : "audio: restart FAILED on ");
+        p = sappend(out, p, mx, was ? was : "(none)");
+        p = sappend(out, p, mx, ok ? "\n" : " (see serial [usbaudio]/[hda] log)\n");
+    } else if (sub[0] == 's' && sub[1] == 't' && sub[2] == 'o') {
+        int n = AudioServer::StopAllStreams();
+        p = sappend(out, p, mx, "audio: stopped ");
+        p = sappend_int(out, p, mx, n);
+        p = sappend(out, p, mx, n == 1 ? " stream\n" : " streams\n");
     } else if (sub[0] == 't') {
         // short on purpose: PlayTone does not pace itself against the mixer
         // stream ring, so anything much past ~0.3 s is truncated (satoru)
         AudioServer::PlayTone(440, 300, 70);
         p = sappend(out, p, mx, "audio: played 440 Hz 300 ms tone\n");
     } else if (sub[0] != 's') {
-        return sappend(out, p, mx, "usage: audio [status|restart|tone|use hda|usb]\n");
+        return sappend(out, p, mx, "usage: audio [status|restart|stop|tone|use hda|usb]\n");
     }
     static char buf[1536];
     p = sappend(out, p, mx, "backend: ");
@@ -2441,11 +2560,70 @@ int cmd_claude(KuronoShell* sh, int argc, const char** argv, char* out, int mx) 
     // trees (/home, /etc, /root) to the persistent KFS volume now, not only at shutdown. no-op
     // without a writable KURONO.KFS; only that file is ever written. (satoru)
     if (rc >= 0 && PersistStore::Available()) PersistStore::SaveTree();
+    ClaudeHost::ReleaseImage();   // give the 300 mb image back while claude is not running (satoru)
     int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
     if (p < 0) p = 0;
     out[p] = 0;
     if (rc < 0 || (msg[0] && msg[0] != 'o')) {
         p = sappend(out, p, mx, msg[0] ? msg : "claude: could not start");
+        p = sappend(out, p, mx, "\n");
+    }
+    return p;
+}
+
+// `opencode [args]` - runs the unmodified opencode cli (linux-x64-musl) from the OPENCODE root
+// file. no args opens its tui on a pty in this terminal; `opencode run <prompt>` answers once.
+// provider keys: exported variables below, then /etc/opencode.env and the OPENCODE.ENV root
+// file (OpenCodeHost::AugmentExecEnv). values are never logged. ~/.local/share/opencode
+// (sessions, auth) is saved to the persistent store after the run. (satoru)
+int cmd_opencode(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    static char args[2048];
+    static char env[1024];
+    int n = 0;
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        bool sp = false;
+        for (int k = 0; a[k]; k++) if (a[k] == ' ') sp = true;
+        if (n + 3 + (int)__builtin_strlen(a) >= (int)sizeof(args)) break;
+        if (n) args[n++] = ' ';
+        if (sp) args[n++] = '\'';
+        for (int k = 0; a[k]; k++) args[n++] = (a[k] == '\'') ? '"' : a[k];
+        if (sp) args[n++] = '\'';
+    }
+    args[n] = 0;
+    int e = 0;
+    static const char* const NAMES[] = { "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY",
+                                         "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
+                                         "GOOGLE_GENERATIVE_AI_API_KEY", "GROQ_API_KEY", "XAI_API_KEY",
+                                         "OPENCODE_API_KEY", "OPENCODE_CONFIG", "HTTPS_PROXY", "HTTP_PROXY", nullptr };
+    for (int i = 0; NAMES[i]; i++) {
+        const char* v = KuronoShell::GetVar(NAMES[i]);
+        if (!v || !*v) continue;
+        int nl = (int)__builtin_strlen(NAMES[i]), vl = (int)__builtin_strlen(v);
+        bool sp = false;
+        for (int k = 0; k < vl; k++) if (v[k] == ' ') sp = true;
+        if (sp || e + nl + vl + 2 >= (int)sizeof(env)) continue;
+        for (int k = 0; k < nl; k++) env[e++] = NAMES[i][k];
+        env[e++] = '=';
+        for (int k = 0; k < vl; k++) env[e++] = v[k];
+        env[e++] = ' ';
+    }
+    env[e] = 0;
+    char msg[320];
+    msg[0] = 0;
+    LinuxSyscall::ClearConsoleOutput();
+    bool pty = TerminalApp::PtyBegin();
+    int rc = OpenCodeHost::Run(args, env, msg, sizeof(msg));
+    if (pty) TerminalApp::PtyEnd();
+    for (int i = 0; i < e; i++) env[i] = 0;   // no key copy left in the static buffer (satoru)
+    if (rc >= 0 && PersistStore::Available()) PersistStore::SaveTree();
+    OpenCodeHost::ReleaseImage();   // give the ~210 mb image back while opencode is not running (satoru)
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    if (rc < 0 || (msg[0] && msg[0] != 'o')) {
+        p = sappend(out, p, mx, msg[0] ? msg : "opencode: could not start");
         p = sappend(out, p, mx, "\n");
     }
     return p;
@@ -2501,9 +2679,208 @@ int cmd_pthtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
     if (p < 0) p = 0;
     out[p] = 0;
+    // echo the test's own output to serial for the gate logs. (satoru)
+    SerialLogger::Log("[pthtest] out begin\r\n");
+    if (out[0]) SerialLogger::Log(out);
+    SerialLogger::Log("\r\n[pthtest] out end\r\n");
     p = sappend(out, p, mx, "\npthtest: exited (code ");
     p = sappend_int(out, p, mx, rc);
     p = sappend(out, p, mx, ")\n");
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// L2 hole-cache self-test: 1e6 random insert/take/forget ops against a page
+// bitmap model; no workload needed. (satoru)
+int cmd_mmapholetest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (!LinuxSyscall::MmapReuseEnabled())
+        return sappend(out, 0, mx, "mmapholetest: needs kurono.mmap.reuse=1\n");
+    uint64_t ops = 1000000;
+    if (argc > 1 && argv[1]) {
+        uint64_t v = 0; bool any = false;
+        for (const char* q = argv[1]; *q >= '0' && *q <= '9'; q++) { v = v * 10 + (uint64_t)(*q - '0'); any = true; }
+        if (any && v) ops = v;
+    }
+    uint64_t done = 0, fails = 0;
+    bool ok = LinuxSyscall::MmapHoleSelfTest(ops, &done, &fails);
+    int p = sappend(out, 0, mx, "[mmrt2] ops=");
+    p = sappend_int(out, p, mx, (int)done);
+    p = sappend(out, p, mx, " fails=");
+    p = sappend_int(out, p, mx, (int)fails);
+    p = sappend(out, p, mx, ok ? " PASS\n" : " FAIL\n");
+    SerialLogger::Log("[mmapholetest] out begin\r\n");
+    SerialLogger::Log(out);
+    SerialLogger::Log("[mmapholetest] out end\r\n");
+    return p;
+}
+
+// L2 mmap hole reuse test. echoes the program output to serial so the result
+// reaches the log (the terminal's text buffer is not serialized). (satoru)
+int cmd_mmapreuse(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/usr/bin/mmap_reuse_test")) {
+        return sappend(out, 0, mx, "mmapreuse: /usr/bin/mmap_reuse_test not present in this build\n");
+    }
+    Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/mmap_reuse_test", "mmap_reuse_test");
+    if (!proc) {
+        return sappend(out, 0, mx, "mmapreuse: failed to load binary (out of memory?)\n");
+    }
+    const char* sel = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "all";
+    const char* exp = LinuxSyscall::MmapReuseEnabled() ? "expect=1" : "expect=0";
+    const char* av[] = { "mmap_reuse_test", sel, exp, nullptr };
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    SerialLogger::Log("[mmapreuse] out begin\r\n");
+    if (out[0]) SerialLogger::Log(out);
+    SerialLogger::Log("\r\n[mmapreuse] out end rc=");
+    SerialLogger::LogDec(rc);
+    SerialLogger::Log("\r\n");
+    LinuxSyscall::MmapAuditDump();
+    LinuxSyscall::MmapReuseDump();   // flush timeouts / unproven holes for the gate logs (satoru)
+    p = sappend(out, p, mx, "\nmmapreuse: exited (code ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, ")\n");
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// run the embedded interruptible-sleep self-test. prints "[sleeptest] ..." and
+// a final "SLEEPTEST PASS"/"SLEEPTEST FAIL n"; the runner logs the captured
+// output to com1. (satoru)
+int cmd_sleeptest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/usr/bin/sleeptest")) {
+        return sappend(out, 0, mx, "sleeptest: /usr/bin/sleeptest not present in this build\n");
+    }
+    Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/sleeptest", "sleeptest");
+    if (!proc) {
+        return sappend(out, 0, mx, "sleeptest: failed to load binary (out of memory?)\n");
+    }
+    const char* av[] = { "sleeptest", nullptr };
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    p = sappend(out, p, mx, "\nsleeptest: exited (code ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, ")\n");
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// draw an error screen preview straight to the framebuffer (testing the
+// renderer outside a real failure). the desktop repaints over it. (satoru)
+int cmd_kscreen(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    KScreen::Fb fb;
+    if (!KernelPanic::GetFramebuffer(&fb.addr, &fb.pitch, &fb.width, &fb.height, &fb.bpp))
+        return sappend(out, 0, mx, "kscreen: no framebuffer\n");
+    KScreen::Screen s;
+    KScreen::InitScreen(s);
+    const char* mode = argc >= 2 ? argv[1] : "blue";
+    char code[16];
+    static const char* const kChoices[] = { "Use basic display", "Restart into Recovery", "Open terminal", "Restart" };
+    if (mode[0] == 'r') {
+        s.tone = KScreen::TONE_RED;
+        s.headline = "Kurono ran into a problem it couldn't recover from and needs to restart.";
+        s.body = "A crash report was saved. When Kurono starts again it will show what happened.";
+        KScreen::PanicStopCode(0x0E, code);
+        s.tech = "PAGE_FAULT_IN_KERNEL  rip=scheduler_switch_to+0x3a  cr2=0x3  cpu=4";
+        s.countdown = 10;
+    } else if (mode[0] == 'c') {
+        s.headline = "Your display driver couldn't be restarted.";
+        s.body = "Your apps are still paused and safe. You can switch to the basic display driver and keep working, or restart.";
+        KScreen::FormatStopCode(code, "DSP", 0x0201);
+        s.tech = "i915  0000:00:02.0  8086:7d67  hang: no heartbeat for 5 s  (2 reloads failed)";
+        s.choices = kChoices; s.nchoices = 4; s.selected = 0;
+    } else {
+        s.headline = "Your display driver stopped responding.";
+        s.body = "Kurono paused your apps so nothing is lost and is restarting the driver.";
+        KScreen::FormatStopCode(code, "DSP", 0x0201);
+        s.tech = "i915  0000:00:02.0  8086:7d67  hang: no heartbeat for 5 s";
+        s.progress = 0; s.progress_text = "Restarting, attempt 1 of 2";
+    }
+    s.code = code;
+    SerialLogger::Log("[kscreen] drawing\r\n");
+    KScreen::Draw(fb, s);
+    SerialLogger::Log("[kscreen] drawn\r\n");
+    return sappend(out, 0, mx, "kscreen: drawn\n");
+}
+
+// fault injection for the driver error flow (recovery R4/R5). (satoru)
+int cmd_errscreen(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    return ErrorScreen::TestCommand(argc, argv, out, mx);
+}
+
+// A/B kernel slots (platform 3a). (satoru)
+int cmd_kslot(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    return KernelSlots::Command(argc, argv, out, mx);
+}
+
+// open the settings window, on a page when one is named. (satoru)
+int cmd_settings_open(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh;
+    if (argc >= 2 && argv[1] && argv[1][0]) SystemSettings::OpenPage(argv[1]);
+    else SystemSettings::Open();
+    return sappend(out, 0, mx, "settings: opened\n");
+}
+
+// run /usr/bin/signal_test (handlers, masks, sigaltstack) like sleeptest. (satoru)
+int cmd_sigtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/usr/bin/signal_test"))
+        return sappend(out, 0, mx, "sigtest: /usr/bin/signal_test not present in this build\n");
+    Process* proc = ElfLoader::LoadELF64FromVFS("/usr/bin/signal_test", "signal_test");
+    if (!proc) return sappend(out, 0, mx, "sigtest: failed to load binary\n");
+    const char* av[] = { "signal_test", nullptr };
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    p = sappend(out, p, mx, "\nsigtest: exited (code ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, ")\n");
+    SerialLogger::Log(out);
+    Scheduler::DestroyProcess(proc);
+    return p;
+}
+
+// run the embedded close-on-exec / unix socket self-test; the output is
+// mirrored to the serial log for headless rigs. (satoru)
+int cmd_fdtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    (void)sh; (void)argc; (void)argv;
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/usr/bin/fdtest"))
+        return sappend(out, 0, mx, "fdtest: /usr/bin/fdtest not present in this build\n");
+    // straight from the embedded blob: LoadELF64FromVFS wants a 64 mb heap
+    // bounce buffer, which a busy desktop may not have. (satoru)
+    Process* proc = ElfLoader::LoadELF64(EmbeddedUserprogs::FdTestData(), EmbeddedUserprogs::FdTestSize(), "fdtest");
+    if (!proc) return sappend(out, 0, mx, "fdtest: failed to load binary\n");
+    const char* av[] = { "/usr/bin/fdtest", nullptr };
+    const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);
+    int p = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (p < 0) p = 0;
+    out[p] = 0;
+    p = sappend(out, p, mx, "fdtest: exited (code ");
+    p = sappend_int(out, p, mx, rc);
+    p = sappend(out, p, mx, ")\n");
+    SerialLogger::Log(out);
     Scheduler::DestroyProcess(proc);
     return p;
 }
@@ -2516,8 +2893,8 @@ int cmd_pthtest(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
 // embedded xkeyboard-config ustar tree (Makefile objcopy of assets_xkb.tar);
 // unpacked to kvfs at firefox launch so gtk/gecko can build an xkb keymap. (satoru)
 extern "C" {
-    extern const unsigned char _binary_kurono_xkb_start[];
-    extern const unsigned char _binary_kurono_xkb_end[];
+    extern const unsigned char _binary_kurono_xkb_start[] __attribute__((weak));
+    extern const unsigned char _binary_kurono_xkb_end[]   __attribute__((weak));
 }
 // embedded DejaVu TTFs (Makefile objcopy of assets_fonts.tar); unpacked to
 // /system/fonts at firefox launch. without a real text font fontconfig returns
@@ -2537,8 +2914,8 @@ extern "C" {
 // Manager" error before cert9.db was even opened. a musl-built libsqlite3.so.0
 // satisfies the dep; extraction at launch also heals persisted installs. (satoru)
 extern "C" {
-    extern const unsigned char _binary_kurono_nsslibs_start[];
-    extern const unsigned char _binary_kurono_nsslibs_end[];
+    extern const unsigned char _binary_kurono_nsslibs_start[] __attribute__((weak));
+    extern const unsigned char _binary_kurono_nsslibs_end[]   __attribute__((weak));
 }
 
 // embedded icu common data (Makefile objcopy of assets/icu/icudt78l.dat).
@@ -2552,6 +2929,34 @@ extern "C" {
 extern "C" {
     extern const unsigned char _binary_kurono_pixbuf_start[] __attribute__((weak));
     extern const unsigned char _binary_kurono_pixbuf_end[]   __attribute__((weak));
+}
+
+// the firefox runtime assets are linked in by default; a KURONO_PACK_FFRT=1 build
+// loads them from the KURONO partition root the first time firefox starts
+// (8.3 names, see KAsset). (satoru)
+static const uint8_t* ff_asset(const char* name83, const uint8_t* s, const uint8_t* e, uint32_t* len) {
+    if (KAsset::Linked(s, e)) { *len = (uint32_t)(e - s); return s; }
+    const uint8_t* d = KAsset::Data(name83, s, e);
+    *len = d ? KAsset::Size(name83, s, e) : 0;
+    return *len ? d : nullptr;
+}
+
+// delivery: a default build links the five firefox runtime assets. on the first
+// launch where the KURONO root does not have one, write the linked copy out
+// (8.3 name) so a later KURONO_PACK_FFRT build finds it. this is what lets an
+// unmodified gold disk (FIREFOX.TAR only) become self-sufficient after one boot.
+// a pack-only build has no linked copy and simply uses what is on the volume. (satoru)
+static void ff_deliver(const char* name83, const uint8_t* s, const uint8_t* e) {
+    if (!KAsset::Linked(s, e)) return;
+    uint64_t have = 0;
+    if (DiskLog::StatRootFile(name83, &have) == 0) return;
+    uint32_t len = (uint32_t)(e - s);
+    int rc = DiskLog::WriteRootFile(name83, s, len);
+    SerialLogger::Log("[ffseed] ");
+    for (int i = 0; i < 8 && name83[i] != ' '; i++) { char c[2] = { name83[i], 0 }; SerialLogger::Log(c); }
+    SerialLogger::Log(" len="); SerialLogger::LogDec((int)(len >> 10));
+    SerialLogger::Log(" kB rc="); SerialLogger::LogDec(rc);
+    SerialLogger::Log("\r\n");
 }
 
 // a minimal shared-mime-info database: gio's g_content_type_guess, which
@@ -2713,6 +3118,13 @@ struct FfInstanceGuard {
 };
 
 int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
+    // seed the partition with the linked firefox assets once, before anything
+    // tries to read them (must run before RestoreApps/extract below). (satoru)
+    ff_deliver("XKB     TAR", _binary_kurono_xkb_start, _binary_kurono_xkb_end);
+    ff_deliver("FONTS   TAR", _binary_kurono_fonts_start, _binary_kurono_fonts_end);
+    ff_deliver("NSSLIB  TAR", _binary_kurono_nsslibs_start, _binary_kurono_nsslibs_end);
+    ff_deliver("ICUDT   DAT", _binary_kurono_icudt_start, _binary_kurono_icudt_end);
+    ff_deliver("PIXBUF  SO ", _binary_kurono_pixbuf_start, _binary_kurono_pixbuf_end);
     (void)sh;
     FfInstanceGuard ff_one;
     if (!ff_one.take()) {
@@ -2840,13 +3252,15 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     // /usr/share/X11 (whose canonical-layout symlinks resolve differently for a
     // linux process than for the kernel's kvfs); XKB_CONFIG_ROOT points here. (satoru)
     {
-        int xkb_len = (int)(_binary_kurono_xkb_end - _binary_kurono_xkb_start);
-        bool xok = PackageManager::ExtractTar((const char*)_binary_kurono_xkb_start, xkb_len, "/apps/firefox");
+        uint32_t xkb_len = 0;
+        const uint8_t* xkb = ff_asset("XKB     TAR", _binary_kurono_xkb_start, _binary_kurono_xkb_end, &xkb_len);
+        bool xok = xkb && PackageManager::ExtractTar((const char*)xkb, (int)xkb_len, "/apps/firefox");
         SerialLogger::Log("[ffxkb] len="); SerialLogger::LogDec(xkb_len);
         SerialLogger::Log(" extract="); SerialLogger::LogDec(xok ? 1 : 0);
         SerialLogger::Log(" evdev="); SerialLogger::LogDec(KVFS::Exists("/apps/firefox/xkb/rules/evdev") ? 1 : 0);
         SerialLogger::Log("\r\n");
         if (xok) p = sappend(out, p, mx, "firefox: unpacked xkeyboard-config data.\n");
+        KAsset::Release("XKB     TAR");
     }
 
     // unpack the embedded DejaVu TTFs into /system/fonts (fontconfig's primary
@@ -2854,26 +3268,28 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     // does not abort with zero font families. mirrors the xkb unpack above. (satoru)
     // assets_fonts.tar is gitignored, so a clean clone links without the blob;
     // the weak symbols are then null and there is nothing to unpack.
-    if (_binary_kurono_fonts_start && _binary_kurono_fonts_end) {
-        int fonts_len = (int)(_binary_kurono_fonts_end - _binary_kurono_fonts_start);
-        bool fok = PackageManager::ExtractTar((const char*)_binary_kurono_fonts_start, fonts_len, "/system/fonts");
+    {
+        uint32_t fonts_len = 0;
+        const uint8_t* fonts = ff_asset("FONTS   TAR", _binary_kurono_fonts_start, _binary_kurono_fonts_end, &fonts_len);
+        bool fok = fonts && PackageManager::ExtractTar((const char*)fonts, (int)fonts_len, "/system/fonts");
         SerialLogger::Log("[fffont] len="); SerialLogger::LogDec(fonts_len);
         SerialLogger::Log(" extract="); SerialLogger::LogDec(fok ? 1 : 0);
         SerialLogger::Log(" dejavu="); SerialLogger::LogDec(KVFS::Exists("/system/fonts/DejaVuSans.ttf") ? 1 : 0);
         SerialLogger::Log("\r\n");
         if (fok) p = sappend(out, p, mx, "firefox: unpacked DejaVu fonts.\n");
+        KAsset::Release("FONTS   TAR");
     }
 
     // write the icu data where ICU_DATA (envp below) points. the package ships
     // only alpine's stub libicudata, so without this u_init fails and gecko
     // MOZ_CRASHes in JS init ("ICU4CLibrary::Initialize() failed"). the file
     // borrows the embedded bytes rather than copying 3 MB.
-    if (_binary_kurono_icudt_start && _binary_kurono_icudt_end &&
-        !KVFS::Exists("/apps/firefox/icudt78l.dat")) {
-        uint32_t icu_len = (uint32_t)(_binary_kurono_icudt_end - _binary_kurono_icudt_start);
-        int r = KVFS::WriteFileStatic("/apps/firefox/icudt78l.dat", _binary_kurono_icudt_start, icu_len);
-        SerialLogger::Log("[fficu] len="); SerialLogger::LogDec((int)icu_len);
-        SerialLogger::Log(" ok="); SerialLogger::LogDec(r == 0 ? 1 : 0);
+    {
+        bool iok = KAsset::EnsureVfsFile("/apps/firefox/icudt78l.dat", "ICUDT   DAT",
+                                         _binary_kurono_icudt_start, _binary_kurono_icudt_end);
+        SerialLogger::Log("[fficu] len=");
+        SerialLogger::LogDec((int)KAsset::Size("ICUDT   DAT", _binary_kurono_icudt_start, _binary_kurono_icudt_end));
+        SerialLogger::Log(" ok="); SerialLogger::LogDec(iok ? 1 : 0);
         SerialLogger::Log("\r\n");
     }
 
@@ -2882,11 +3298,10 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     // loads and gtk aborts on its first icon ("Unrecognized image file
     // format"). 2.42 decodes png/jpeg itself. done every launch, since a
     // reinstall or restore brings the package copy back.
-    if (_binary_kurono_pixbuf_start && _binary_kurono_pixbuf_end &&
-        KVFS::Exists("/apps/firefox/lib/libgdk_pixbuf-2.0.so.0")) {
-        uint32_t pb_len = (uint32_t)(_binary_kurono_pixbuf_end - _binary_kurono_pixbuf_start);
-        int r = KVFS::WriteFileStatic("/apps/firefox/lib/libgdk_pixbuf-2.0.so.0",
-                                      _binary_kurono_pixbuf_start, pb_len);
+    if (KVFS::Exists("/apps/firefox/lib/libgdk_pixbuf-2.0.so.0")) {
+        uint32_t pb_len = 0;
+        const uint8_t* pb = ff_asset("PIXBUF  SO ", _binary_kurono_pixbuf_start, _binary_kurono_pixbuf_end, &pb_len);
+        int r = pb ? KVFS::WriteFileStatic("/apps/firefox/lib/libgdk_pixbuf-2.0.so.0", pb, pb_len) : -1;
         SerialLogger::Log("[ffpixbuf] len="); SerialLogger::LogDec((int)pb_len);
         SerialLogger::Log(" ok="); SerialLogger::LogDec(r == 0 ? 1 : 0);
         SerialLogger::Log("\r\n");
@@ -2916,13 +3331,15 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     // initialize (the https "Personal Security Manager" fix). runs every launch
     // so a persisted install from before this fix heals itself. (satoru)
     {
-        int nl_len = (int)(_binary_kurono_nsslibs_end - _binary_kurono_nsslibs_start);
-        bool nok = PackageManager::ExtractTar((const char*)_binary_kurono_nsslibs_start, nl_len, "/apps/firefox");
+        uint32_t nl_len = 0;
+        const uint8_t* nl = ff_asset("NSSLIB  TAR", _binary_kurono_nsslibs_start, _binary_kurono_nsslibs_end, &nl_len);
+        bool nok = nl && PackageManager::ExtractTar((const char*)nl, (int)nl_len, "/apps/firefox");
         SerialLogger::Log("[ffnss] len="); SerialLogger::LogDec(nl_len);
         SerialLogger::Log(" extract="); SerialLogger::LogDec(nok ? 1 : 0);
         SerialLogger::Log(" sqlite="); SerialLogger::LogDec(KVFS::Exists("/apps/firefox/lib/libsqlite3.so.0") ? 1 : 0);
         SerialLogger::Log("\r\n");
         if (nok) p = sappend(out, p, mx, "firefox: unpacked NSS runtime libs.\n");
+        KAsset::Release("NSSLIB  TAR");
     }
 
     // pin gecko's compositor into the parent process (software webrender) and
@@ -3326,6 +3743,15 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
                     "lockPref(\"javascript.options.native_regexp\", true);\n";
                 for (const char* s = j2; *s && o < (int)sizeof(cfgbuf) - 1; s++) cfgbuf[o++] = *s;
             }
+            // bare metal: the mirror homepage above (http://10.0.2.2/kurono/) only exists
+            // behind qemu's user net. on the laptop its syn went to the real router and
+            // was never answered (retransmits 1/2/4 s in klog240_1112b), so the window
+            // sat on a page that never loads. a later lockPref wins: point the homepage
+            // at firefox's own start page when not under a hypervisor. (satoru)
+            if (!CPUDetect::IsHypervisor()) {
+                const char* hm = "lockPref(\"browser.startup.homepage\", \"about:home\");\n";
+                for (const char* s = hm; *s && o < (int)sizeof(cfgbuf) - 1; s++) cfgbuf[o++] = *s;
+            }
             cfgbuf[o] = 0;
             KVFS::WriteFile("/apps/firefox/firefox.cfg", cfgbuf, (uint32_t)o);
             if (jl > 0) {
@@ -3516,7 +3942,8 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     }
     // default to the kurono page when launched with no url, so firefox opens a real
     // (blank) browser window that proves the full chrome + content paint path. (satoru)
-    const char* real_url = url ? url : "http://10.0.2.2/kurono/";
+    // 10.0.2.2 is the qemu host; on bare metal open firefox's own start page. (satoru)
+    const char* real_url = url ? url : (CPUDetect::IsHypervisor() ? "http://10.0.2.2/kurono/" : "about:home");
 
     const char* av[] = { "/apps/firefox/firefox", "-no-remote",
                          real_url, nullptr };
@@ -3635,6 +4062,19 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     proc->rip = entry; proc->rsp = rsp;
     proc->user_frame.rip = entry; proc->user_frame.rsp = rsp;
     proc->flags |= PROCESS_FLAG_STACK_READY;
+    {   // kurono.envwatch=1 (corruptor hunt): the top page of firefox's main stack
+        // (its env strings) is found overwritten when ICU_DATA goes missing. arm
+        // the hardware write watch on the HOME= string's tail twice: by user va
+        // (any process, any cr3) and by the identity address of the frame behind
+        // it (a kernel write through the identity map). (satoru)
+        if (::g_envwatch) {
+            uint64_t ph = KernelVMM::QueryMappingInAddressSpace(proc->address_space, 0x401FF000ULL) & 0x000FFFFFFFFFF000ULL;
+            SerialLogger::Log("[envwatch] stack top frame phys=");
+            SerialLogger::LogHex64(ph);
+            SerialLogger::Log("\r\n");
+            DbgWatch::Arm(0x401FFC98ULL, ph ? ph + 0xC98 : 0);
+        }
+    }
 
     LinuxSyscall::ClearConsoleOutput();
     {   // test rig: arm the one-shot crash (kurono.ffcrash=S) (satoru)
@@ -3668,6 +4108,25 @@ int cmd_firefox(KuronoShell* sh, int argc, const char** argv, char* out, int mx)
     }
     Scheduler::DestroyProcess(proc);
     LinuxSyscall::ResetFirefoxCache();   // the next launch is a new address space (satoru)
+    // firefox is gone: drop the lazily restored /apps tree and the kfs metadata
+    // caches it needed, so an idle desktop is back at the boot baseline. the
+    // next launch restores /apps from the volume again. (satoru)
+    if (KVFS::Exists("/apps/firefox")) {
+        KVFS::RmTree("/apps/firefox");
+        SerialLogger::Log("[ffexit] dropped the restored /apps/firefox tree\r\n");
+        // the icu and pixbuf files borrowed the on-demand asset buffers; the
+        // nodes are gone, so hand those pmm blocks back too. (satoru)
+        KAsset::Release("ICUDT   DAT");
+        KAsset::Release("PIXBUF  SO ");
+    }
+    // mozilla's startup/script cache is regenerable and was ~66 mb of kvfs heap
+    // after one browse; drop it too so an idle desktop really is back at the
+    // boot baseline. the profile (.mozilla) is kept. (satoru)
+    if (KVFS::Exists("/home/user/.cache/mozilla")) {
+        KVFS::RmTree("/home/user/.cache/mozilla");
+        SerialLogger::Log("[ffexit] dropped the mozilla startup cache\r\n");
+    }
+    if (KFS::IsMounted()) KFS::Unmount();
     return p;
 }
 
@@ -3933,6 +4392,13 @@ int cmd_codecs(KuronoShell* sh, int argc, const char** argv, char* out, int maxo
 //  kurono info      print os and config summary
 //  kurono config    dump current config key=value pairs
 //
+int cmd_memboot(KuronoShell*, int argc, const char** argv, char* out, int maxo) {
+    (void)argc; (void)argv;
+    int n = MemBoot::Report(out, maxo - 1, true);   // mirror to serial for remote tests (satoru)
+    if (n < maxo - 1) { out[n++] = '\n'; out[n] = 0; }
+    return n;
+}
+
 int cmd_kurono(KuronoShell*, int argc, const char** argv, char* out, int maxo) {
     int p = 0;
     if (argc < 2) {
@@ -4007,6 +4473,7 @@ static const char* ken_auth_value(int argc, const char** argv) {
 //    ken policy --auth=passwd|kvault|both [--sovereign-override]
 //    ken policy kvault disable --force --acknowledge-risk [--sovereign-override]
 //    ken policy kvault enable
+//    ken policy ksa on|off          (off from the shell: amdo ken policy ksa off)
 //    ken policy --auth=kvault --disable-passwd --acknowledge-risk
 //    ken policy passwd enable
 //    ken passwd                     change password (no ksa; normal flow)
@@ -4018,7 +4485,7 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     int sid = KEN::GetCurrentSession();
 
     if (argc < 2) {
-        p = sappend(out, p, maxo, "usage: ken policy | ken passwd | ken selftest\n");
+        p = sappend(out, p, maxo, "usage: amdo policy | amdo passwd | amdo selftest\n");
         return p;
     }
 
@@ -4034,7 +4501,7 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
 
     if (seq(sub, "passwd")) {
         // normal password-change flow - NO ksa involvement, per spec. (satoru)
-        p = sappend(out, p, maxo, "ken passwd: interactive password change is GUI/login-driven.\n");
+        p = sappend(out, p, maxo, "amdo passwd: interactive password change is GUI/login-driven.\n");
         p = sappend(out, p, maxo, "(no ksa involved; uses the standard password flow)\n");
         return p;
     }
@@ -4044,6 +4511,25 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
         bool force = ken_has_flag(argc, argv, "--force");
         bool ack   = ken_has_flag(argc, argv, "--acknowledge-risk");
         char err[160]; err[0] = 0;
+
+        // the ksa on/off switch (same policy call Settings uses). off needs an amdo
+        // approval from the shell: `amdo ken policy ksa off`. (satoru)
+        if (argc >= 3 && seq(argv[2], "ksa")) {
+            if (argc >= 4 && (seq(argv[3], "off") || seq(argv[3], "on"))) {
+                bool want = seq(argv[3], "on");
+                bool ok = KEN::SetKsaEnabled(sid, want, nullptr, err, sizeof(err));
+                if (ok) p = sappend(out, p, maxo, want ? "ksa is on.\n" : "ksa is off - amdo is password-only.\n");
+                else {
+                    p = sappend(out, p, maxo, "refused: ");
+                    p = sappend(out, p, maxo, err);
+                    p = sappend_char(out, p, maxo, '\n');
+                    if (!want) p = sappend(out, p, maxo, "(from the shell, run it as: amdo ken policy ksa off)\n");
+                }
+                return p;
+            }
+            p = sappend(out, p, maxo, "usage: ken policy ksa on|off\n");
+            return p;
+        }
 
         // kvault enable/disable subforms. (satoru)
         if (argc >= 3 && seq(argv[2], "kvault")) {
@@ -4091,7 +4577,7 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
             if (seq(mode, "passwd")) m = AUTH_PASSWD;
             else if (seq(mode, "kvault")) m = AUTH_KVAULT;
             else if (seq(mode, "both")) m = AUTH_BOTH;
-            else { p = sappend(out, p, maxo, "ken: --auth must be passwd|kvault|both\n"); return p; }
+            else { p = sappend(out, p, maxo, "amdo: --auth must be passwd|kvault|both\n"); return p; }
             bool ok = KEN::SetAuthMode(sid, m, sov, err, sizeof(err));
             p = sappend(out, p, maxo, ok ? "auth policy set.\n" : "refused: ");
             if (!ok) { p = sappend(out, p, maxo, err); p = sappend_char(out, p, maxo, '\n'); }
@@ -4102,6 +4588,8 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
 
         // no mutation → show status. (satoru)
         p = sappend(out, p, maxo, "KSA / KEN auth policy\n");
+        p = sappend(out, p, maxo, "  ksa switch     : ");
+        p = sappend(out, p, maxo, KEN::IsKsaEnabled() ? "on\n" : "OFF (amdo is password-only)\n");
         p = sappend(out, p, maxo, "  password factor: ");
         p = sappend(out, p, maxo, KEN::IsPasswdEnabled() ? "ENABLED\n" : "disabled\n");
         p = sappend(out, p, maxo, "  kvault (ksa)   : ");
@@ -4126,7 +4614,7 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     // and whoami is informational; everything else goes through the auth gate.
     if (seq(sub, "cd") || seq(sub, "clear") || seq(sub, "history") ||
         seq(sub, "linux") || seq(sub, "cmd") || seq(sub, "exit")) {
-        p = sappend(out, p, maxo, "ken: '");
+        p = sappend(out, p, maxo, "amdo: '");
         p = sappend(out, p, maxo, sub);
         p = sappend(out, p, maxo, "' is a shell builtin - run it directly (elevation doesn't apply).\n");
         return p;
@@ -4138,13 +4626,13 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     }
     // a guest may not escalate. (satoru)
     if (KEN::GetLevel(sid) <= KEN_GUEST) {
-        p = sappend(out, p, maxo, "ken: permission denied - your role may not escalate.\n");
+        p = sappend(out, p, maxo, "amdo: permission denied - your role may not escalate.\n");
         return p;
     }
     // the target must exist before we bother prompting. (satoru)
     ShellCommand* target = KuronoShell::FindCommand(sub);
     if (!target || !target->handler) {
-        p = sappend(out, p, maxo, "ken: command not found: ");
+        p = sappend(out, p, maxo, "amdo: command not found: ");
         p = sappend(out, p, maxo, sub);
         p = sappend_char(out, p, maxo, '\n');
         return p;
@@ -4157,7 +4645,7 @@ int cmd_ken(KuronoShell* sh, int argc, const char** argv, char* out, int maxo) {
     rp = sappend(reason, rp, (int)sizeof(reason), "' as root");
     int saved_user = -1;
     if (!KEN::SudoBegin(sid, reason, &saved_user)) {
-        p = sappend(out, p, maxo, "ken: authentication failed - not running '");
+        p = sappend(out, p, maxo, "amdo: authentication failed - not running '");
         p = sappend(out, p, maxo, sub);
         p = sappend(out, p, maxo, "'.\n");
         return p;

@@ -18,12 +18,14 @@ extern "C" {
 
 namespace MDraw {
 
+// the drawable box is [g_bx0, sw) x [g_by0, sh): the screen, or the damage
+// scissor while a compositor pass runs (kurono.gfx.scissor=1). (satoru)
+static int g_bx0 = 0, g_by0 = 0;
 static inline bool target(uint32_t*& buf, int& pitch, int& sw, int& sh) {
     if (Graphics::GetBpp() != 32 || !Graphics::GetBuffer()) return false;
     buf = (uint32_t*)Graphics::GetBuffer();
     pitch = (int)(Graphics::GetPitch() / 4);
-    sw = Graphics::GetWidth();
-    sh = Graphics::GetHeight();
+    Graphics::ScissorBounds(g_bx0, g_by0, sw, sh);
     return true;
 }
 
@@ -88,7 +90,7 @@ static int corner_cov(int i, int j, int r) {
 }
 
 static void put(uint32_t* buf, int pitch, int sw, int sh, int px, int py, uint32_t c, int a256) {
-    if ((unsigned)px >= (unsigned)sw || (unsigned)py >= (unsigned)sh || a256 <= 0) return;
+    if ((unsigned)(px - g_bx0) >= (unsigned)(sw - g_bx0) || (unsigned)(py - g_by0) >= (unsigned)(sh - g_by0) || a256 <= 0) return;
     uint32_t* d = buf + (size_t)py * pitch + px;
     *d = blend(c, *d, a256);
 }
@@ -108,7 +110,7 @@ static void round_rect(int x, int y, int w, int h, int r, uint32_t top, uint32_t
     int a256 = alpha >= 255 ? 256 : alpha;
     for (int j = 0; j < h; j++) {
         int py = y + j;
-        if ((unsigned)py >= (unsigned)sh) continue;
+        if ((unsigned)(py - g_by0) >= (unsigned)(sh - g_by0)) continue;
         uint32_t c = (top == bottom || h < 2) ? top : mix(top, bottom, (j * 256) / (h - 1));
         bool top_band = j < r, bot_band = j >= h - r;
         int x0 = x, x1 = x + w;
@@ -123,7 +125,7 @@ static void round_rect(int x, int y, int w, int h, int r, uint32_t top, uint32_t
             }
             x0 = x + r; x1 = x + w - r;
         }
-        if (x0 < 0) x0 = 0;
+        if (x0 < g_bx0) x0 = g_bx0;
         if (x1 > sw) x1 = sw;
         uint32_t* row = buf + (size_t)py * pitch;
         int hx0 = x1, hx1 = x1;   // span skipped on this row, if any
@@ -132,6 +134,7 @@ static void round_rect(int x, int y, int w, int h, int r, uint32_t top, uint32_t
             hx0 = mid ? hole.x0 : hole.x0 + hole.r;
             hx1 = mid ? hole.x1 : hole.x1 - hole.r;
             if (hx0 < x0) hx0 = x0;
+            if (hx0 > x1) hx0 = x1;   // a hole starting past the right edge (the scissor box, or the screen) must not extend the first span (satoru)
             if (hx1 > x1) hx1 = x1;
             if (hx1 < hx0) hx1 = hx0;
         }
@@ -202,10 +205,10 @@ void Shadow(int x, int y, int w, int h, int r, int spread, int dy, int alpha) {
     // skipped, so the layers already drew them.
     for (int j = 0; j < h; j++) {
         int py = y + dy + j;
-        if ((unsigned)py >= (unsigned)sh) continue;
+        if ((unsigned)(py - g_by0) >= (unsigned)(sh - g_by0)) continue;
         bool mid = j >= r && j < h - r;
         int x0 = mid ? x : x + r, x1 = mid ? x + w : x + w - r;
-        if (x0 < 0) x0 = 0;
+        if (x0 < g_bx0) x0 = g_bx0;
         if (x1 > sw) x1 = sw;
         uint32_t* row = buf + (size_t)py * pitch;
         for (int px = x0; px < x1; px++) row[px] = blend(0xFF000000u, row[px], a);
@@ -335,12 +338,12 @@ static void blit_premul(const uint32_t* px, int s, int x, int y, int alpha) {
     int ga = alpha >= 255 ? 256 : alpha;
     for (int j = 0; j < s; j++) {
         int py = y + j;
-        if ((unsigned)py >= (unsigned)sh) continue;
+        if ((unsigned)(py - g_by0) >= (unsigned)(sh - g_by0)) continue;
         uint32_t* drow = buf + (size_t)py * pitch;
         const uint32_t* srow = px + (size_t)j * s;
         for (int i = 0; i < s; i++) {
             int qx = x + i;
-            if ((unsigned)qx >= (unsigned)sw) continue;
+            if ((unsigned)(qx - g_bx0) >= (unsigned)(sw - g_bx0)) continue;
             uint32_t p = srow[i];
             uint32_t a = p >> 24;
             if (!a) continue;

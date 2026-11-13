@@ -152,27 +152,69 @@ namespace {
 #include "../proc/smp.h"
 static volatile uint32_t g_rtlog_word  = 0;
 static volatile int      g_rtlog_owner = -1;
+// returns false when this cpu already owns it (nested: nothing to release). (satoru)
+static bool rtlog_acquire() {
+    int cpu = (int)SMP::CpuIndex();
+    if (g_rtlog_owner == cpu) return false;
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&g_rtlog_word, &expected, 1u, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+        do { __asm__ __volatile__("pause" ::: "memory"); }
+        while (__atomic_load_n(&g_rtlog_word, __ATOMIC_RELAXED) != 0);
+    }
+    g_rtlog_owner = cpu;
+    return true;
+}
+static void rtlog_release() {
+    g_rtlog_owner = -1;
+    __atomic_store_n(&g_rtlog_word, 0u, __ATOMIC_RELEASE);
+}
 struct RtLogGuard {
     bool nested;
-    RtLogGuard() {
-        int cpu = (int)SMP::CpuIndex();
-        if (g_rtlog_owner == cpu) { nested = true; return; }
-        nested = false;
-        for (;;) {
-            uint32_t expected = 0;
-            if (__atomic_compare_exchange_n(&g_rtlog_word, &expected, 1u, false,
-                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
-            do { __asm__ __volatile__("pause" ::: "memory"); }
-            while (__atomic_load_n(&g_rtlog_word, __ATOMIC_RELAXED) != 0);
-        }
-        g_rtlog_owner = cpu;
-    }
-    ~RtLogGuard() {
-        if (nested) return;
-        g_rtlog_owner = -1;
-        __atomic_store_n(&g_rtlog_word, 0u, __ATOMIC_RELEASE);
-    }
+    RtLogGuard() { nested = !rtlog_acquire(); }
+    ~RtLogGuard() { if (!nested) rtlog_release(); }
 };
+
+// the rtlog guard is a LEAF lock: it covers only the static staging buffers and
+// never wraps kvfs or heap work. the old log functions held it across
+// append_file_text (vfs lock, kernel heap, lazy kfs reads), while heap_grow's
+// "Heap: grew by" and every other line printed under the vfs or heap lock takes
+// it through MirrorSerial: an ab-ba between the rtlog guard and the vfs/heap
+// locks. two sampled 20-cpu wedges (qemu, kvm): one cpu spinning on the vfs
+// lock in KVFS::Exists (append_file_text's ensure_file, right after the tcp rx
+// path's "got RST" LogNetwork), up to seven cpus parked in MirrorSerial on
+// rtlog (some with IF=0 = inside the heap guard), the bsp on the heap lock, the
+// rest on kls (after hard steals) and the net lock - the "[kls] HARD steal"
+// then silence class. kvfs serializes itself with g_vfs_lock; the guard only has to
+// protect the pending buffers. kurono.rtlogleaf=0 restores the old held-across
+// behaviour for A/B. (satoru)
+static bool g_rtlog_hold_across_kvfs = false;
+void RuntimeLog::SetHoldGuardAcrossKvfs(bool on) { g_rtlog_hold_across_kvfs = on; }
+
+// takes the guard only in the reverted (kurono.rtlogleaf=0) mode, for the whole
+// log call as before; otherwise a no-op. (satoru)
+struct RtLogLegacyGuard {
+    bool held;
+    RtLogLegacyGuard() : held(g_rtlog_hold_across_kvfs && rtlog_acquire()) {}
+    ~RtLogLegacyGuard() { if (held) rtlog_release(); }
+};
+
+namespace {
+    // before kvfs is up, stage the line under the guard and return true; once
+    // it is up, return false WITHOUT holding anything so the caller writes kvfs
+    // lock-free of rtlog. (satoru)
+    bool stage_unless_fs_ready(char* buf, int& len, int cap, const char* line) {
+        RtLogGuard _rtg;
+        if (g_fs_ready) return false;
+        append_buffer(buf, len, cap, line);
+        return true;
+    }
+    bool fs_ready_now() {
+        RtLogGuard _rtg;
+        return g_fs_ready;
+    }
+}
 
 void RuntimeLog::InitFilesystem() {
     if (g_fs_ready) return;
@@ -183,7 +225,7 @@ void RuntimeLog::InitFilesystem() {
         "  system.log   - general runtime events\n"
         "  serial.log   - mirrored serial/driver/kernel console\n"
         "  network.log  - connect/disconnect/link/errors\n"
-        "  security.log - ken escalations, ksa prompts, grants/denials\n"
+        "  security.log - amdo escalations, ksa prompts, grants/denials\n"
         "  crash/       - kernel panics + minidumps\n"
         "  apps/<app>.log         - per-app activity\n"
         "  processes/<pid>_<name>.log - per-process lifecycle\n");
@@ -233,7 +275,7 @@ void RuntimeLog::FlushSerialMirror() {
 }
 
 void RuntimeLog::LogSystem(const char* component, const char* message) {
-    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
+    RtLogLegacyGuard _lg;   // kurono.rtlogleaf=0 only (satoru)
     char line[512];
     char prefix[96];
     prefix[0] = 0;
@@ -241,51 +283,48 @@ void RuntimeLog::LogSystem(const char* component, const char* message) {
     str_cat(prefix, component ? component : "system", 96);
     str_cat(prefix, "] ", 96);
     format_line(line, sizeof(line), prefix, message, nullptr);
-    if (g_fs_ready) { ensure_core_layout(); append_file_text(KP_LOG_SYSTEM, line); return; }
-    append_buffer(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line);
+    if (stage_unless_fs_ready(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line)) return;
+    ensure_core_layout(); append_file_text(KP_LOG_SYSTEM, line);
 }
 
 void RuntimeLog::LogBoot(const char* message) {
-    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
+    RtLogLegacyGuard _lg;   // kurono.rtlogleaf=0 only (satoru)
     char line[512];
     format_line(line, sizeof(line), "[boot] ", message, nullptr);
-    if (g_fs_ready) { ensure_core_layout(); append_file_text(KP_LOG_BOOT, line); return; }
-    append_buffer(g_boot_pending, g_boot_pending_len, sizeof(g_boot_pending), line);
+    if (stage_unless_fs_ready(g_boot_pending, g_boot_pending_len, sizeof(g_boot_pending), line)) return;
+    ensure_core_layout(); append_file_text(KP_LOG_BOOT, line);
 }
 
 void RuntimeLog::LogNetwork(const char* event, const char* detail) {
-    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
+    RtLogLegacyGuard _lg;   // kurono.rtlogleaf=0 only (satoru)
     if (!event || !*event) return;
     char line[512];
     format_line(line, sizeof(line), "[net] ", event, detail);
-    if (g_fs_ready) { ensure_core_layout(); append_file_text(KP_LOG_NETWORK, line); return; }
-    append_buffer(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line);
+    if (stage_unless_fs_ready(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line)) return;
+    ensure_core_layout(); append_file_text(KP_LOG_NETWORK, line);
 }
 
 void RuntimeLog::LogSecurity(const char* event, const char* detail) {
-    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
+    RtLogLegacyGuard _lg;   // kurono.rtlogleaf=0 only (satoru)
     if (!event || !*event) return;
     char line[512];
     format_line(line, sizeof(line), "[sec] ", event, detail);
-    if (g_fs_ready) { ensure_core_layout(); append_file_text(KP_LOG_SECURITY, line); return; }
-    append_buffer(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line);
+    if (stage_unless_fs_ready(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line)) return;
+    ensure_core_layout(); append_file_text(KP_LOG_SECURITY, line);
 }
 
 void RuntimeLog::LogCrash(const char* summary, const char* detail) {
-    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
+    RtLogLegacyGuard _lg;   // kurono.rtlogleaf=0 only (satoru)
     if (!summary || !*summary) return;
     char line[512];
     format_line(line, sizeof(line), "[crash] ", summary, detail);
-    if (g_fs_ready) {
-        ensure_core_layout();
-        append_file_text(KP_LOG_CRASH_DIR "/crash.log", line);
-        return;
-    }
-    append_buffer(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line);
+    if (stage_unless_fs_ready(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line)) return;
+    ensure_core_layout();
+    append_file_text(KP_LOG_CRASH_DIR "/crash.log", line);
 }
 
 void RuntimeLog::LogAppEvent(const char* app, const char* event, const char* detail) {
-    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
+    RtLogLegacyGuard _lg;   // kurono.rtlogleaf=0 only (satoru)
     if (!app || !*app || !event || !*event) return;
     char path[192];
     char line[512];
@@ -301,12 +340,12 @@ void RuntimeLog::LogAppEvent(const char* app, const char* event, const char* det
     str_cat(prefix, app, 96);
     str_cat(prefix, "] ", 96);
     format_line(line, sizeof(line), prefix, event, detail);
-    if (g_fs_ready) { ensure_core_layout(); append_file_text(path, line); return; }
-    RuntimeLog::LogSystem("apps", line);
+    if (!fs_ready_now()) { RuntimeLog::LogSystem("apps", line); return; }
+    ensure_core_layout(); append_file_text(path, line);
 }
 
 void RuntimeLog::LogProcessEvent(const char* process_name, int pid, const char* event, const char* detail) {
-    RtLogGuard _rtg;   // cross-core kvfs/log serialization (satoru)
+    RtLogLegacyGuard _lg;   // kurono.rtlogleaf=0 only (satoru)
     if (!process_name || !*process_name || !event || !*event) return;
     char path[224];
     char line[512];
@@ -321,6 +360,6 @@ void RuntimeLog::LogProcessEvent(const char* process_name, int pid, const char* 
     str_cat(prefix, process_name, sizeof(prefix));
     str_cat(prefix, "] ", sizeof(prefix));
     format_line(line, sizeof(line), prefix, event, detail);
-    if (g_fs_ready) { ensure_core_layout(); append_file_text(path, line); return; }
-    append_buffer(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line);
+    if (stage_unless_fs_ready(g_system_pending, g_system_pending_len, sizeof(g_system_pending), line)) return;
+    ensure_core_layout(); append_file_text(path, line);
 }

@@ -1,0 +1,9 @@
+# the real laptop touchpad family (i2c-hid over LPSS + PCH GPIO irq). no table
+# blob and no hardware models: ACPICA runs in the container over the kernel's
+# real ACPI provider, and every register access is real. (satoru)
+name i2chid
+needs_msix_table_page 0
+# the GpioInt line and the platform gpio mmio ranges come from ACPI. (satoru)
+line_irq acpi
+platform_mmio acpi
+# end (satoru)

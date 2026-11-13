@@ -1,8 +1,12 @@
 #include "vconsole.h"
 #include "../drivers/serial.h"
+#include "../kernel/heap.h"
 
 namespace {
-    VConsole::Console g_consoles[VConsole::VC_COUNT];
+    // each console carries 72 kb of scrollback. allocated on first use (text
+    // mode or a ctrl-alt-fN switch), so a gui boot pays for none of the six
+    // text consoles. (satoru)
+    VConsole::Console* g_consoles[VConsole::VC_COUNT];
     int g_active = VConsole::VC_GUI;        // boot into GUI
 
     inline void wipe_cell(VConsole::Cell& c) {
@@ -27,20 +31,8 @@ namespace {
 
 namespace VConsole {
 
-void Init(int initial_active) {
-    for (int i = 0; i < VC_COUNT; i++) {
-        Console& vc = g_consoles[i];
-        for (int r = 0; r < VC_SCROLLBACK; r++)
-            for (int c = 0; c < VC_COLS; c++) wipe_cell(vc.rows[r][c]);
-        vc.top = 0; vc.bottom = 0;
-        vc.cur_row = 0; vc.cur_col = 0;
-        vc.fg = 7; vc.bg = 0;
-    }
-    if (initial_active < 0 || initial_active >= VC_COUNT) initial_active = VC_GUI;
-    g_active = initial_active;
-
-    // Welcome banner on each tty.
-    const char* greet[] = {
+static const char* vc_greet(int idx) {
+    static const char* greet[] = {
         "Kurono OS tty1 - System log\r\n",
         "Kurono OS tty2 - Secondary console\r\n",
         "Kurono OS tty3 - Free console\r\n",
@@ -49,7 +41,30 @@ void Init(int initial_active) {
         "Kurono OS tty6 - Free console\r\n",
         "Kurono OS tty7 - Graphical session (Ctrl+Alt+F1..F6 to switch)\r\n",
     };
-    for (int i = 0; i < VC_COUNT; i++) WriteStr(i, greet[i]);
+    if (idx < 0 || idx >= VC_COUNT) idx = 0;
+    return greet[idx];
+}
+
+// create (and wipe) one console on demand. (satoru)
+static Console* ensure_console(int idx) {
+    if (idx < 0 || idx >= VC_COUNT) return nullptr;
+    if (g_consoles[idx]) return g_consoles[idx];
+    Console* vc = (Console*)KernelHeap::Alloc(sizeof(Console));
+    if (!vc) return nullptr;
+    for (int r = 0; r < VC_SCROLLBACK; r++)
+        for (int c = 0; c < VC_COLS; c++) wipe_cell(vc->rows[r][c]);
+    vc->top = 0; vc->bottom = 0;
+    vc->cur_row = 0; vc->cur_col = 0;
+    vc->fg = 7; vc->bg = 0;
+    g_consoles[idx] = vc;
+    return vc;
+}
+
+void Init(int initial_active) {
+    if (initial_active < 0 || initial_active >= VC_COUNT) initial_active = VC_GUI;
+    g_active = initial_active;
+    // only the console that is actually showing gets memory at boot. (satoru)
+    if (ensure_console(g_active)) WriteStr(g_active, vc_greet(g_active));
     if (g_active == VC_GUI) {
         SerialLogger::Log("VConsole: 7 virtual consoles ready (active=tty7/GUI)\r\n");
     } else {
@@ -70,7 +85,10 @@ int Active() { return g_active; }
 bool Switch(int idx) {
     if (idx < 0 || idx >= VC_COUNT) return false;
     if (idx == g_active) return true;
+    if (!ensure_console(idx)) return false;
+    bool fresh = (g_consoles[idx]->bottom == 0 && g_consoles[idx]->top == 0);
     g_active = idx;
+    if (fresh) WriteStr(idx, vc_greet(idx));
     char log[40] = "VConsole: switched to tty";
     int li = 25;
     log[li++] = (char)('1' + idx);
@@ -81,7 +99,7 @@ bool Switch(int idx) {
 
 Console* Get(int idx) {
     if (idx < 0 || idx >= VC_COUNT) return nullptr;
-    return &g_consoles[idx];
+    return ensure_console(idx);
 }
 
 void WriteChar(int idx, char c) {

@@ -39,6 +39,9 @@ static_assert(__builtin_offsetof(PerCpu, kernel_rsp) == 8,
 namespace BootAcpi {
     void     SetRsdp(const uint8_t* src, uint32_t avail);  // validates + copies (satoru)
     void     SetEfiBoot();                                 // mb2 tag 12 seen (satoru)
+    // the efi system table pointer, so hal can call the runtime reset service. (satoru)
+    void     SetSystemTable(uint64_t st);
+    uint64_t SystemTable();
     uint64_t Rsdp();
     bool     IsEfiBoot();
 }
@@ -61,6 +64,8 @@ public:
 
     static uint32_t CpuCount();        // logical cpus discovered (satoru)
     static uint32_t OnlineCount();     // cpus that have marked themselves online (satoru)
+    // kernel stack bytes handed to the application processors at bring-up (boot census). (satoru)
+    static uint64_t KernelStackBytes();
     // containment park: a cli-hlt'ed cpu can never ack a tlb ipi again, but it
     // still counted as online - so EVERY later BroadcastTlbFlush burned its full
     // 20ms timeout (under kls_lock for mprotect/munmap) and the flush epoch
@@ -136,6 +141,15 @@ public:
     // polling the scheduler lock every 50us; KickOneIdle wakes one halted ap
     // with the resched ipi (vector 0x42). (satoru)
     static void KickOneIdle();
+    // retune the calling ap's lapic tick (kurono.svccpu service cpus run 1 khz). (satoru)
+    static void SetLapicTickHz(uint32_t hz);
+    // the bsp's 1 khz scheduler tick from its own lapic timer on vector 32 instead
+    // of the pit through the 8259 (extint on lint0). mode 0 = auto (2+ cpus online
+    // and an always-running lapic timer), 1 = force, -1 = keep the pit
+    // (kurono.bsptick=pit). call once after StartAPs, interrupts off. (satoru)
+    static void StartBspLapicTick(int mode);
+    static bool BspLapicTickActive();
+    static void TestSelfIpi(uint8_t vec);   // kurono.straytest: fixed ipi to this cpu (satoru)
     static void KickIdleFor(const Process* p);   // wake an idle ap that may run p (satoru)
     // sched=2: interrupt one cpu with the resched ipi (vector 0x42), so a pending
     // signal or kill is taken at its ring-3 return now. (satoru)
@@ -146,5 +160,36 @@ public:
     // the bsp after Init; aps program their own in ap_entry. (satoru)
     static void EnableFastCpuIndex();
     static bool DebugIdle(uint32_t idx);   // sched=2 halted-idle flag, diagnostics (satoru)
+
+    // firmware IA32_TSC_ADJUST sanitize (see smp.cpp). the bsp calls this once,
+    // before anything keeps a tsc base; every ap does its own in ap_entry.
+    // fix=false (kurono.tscadjust=0) only records and logs the values.
+    // inject_test (kurono.tscadjust.test=1) first writes the laptop's firmware
+    // value on the bsp, for qemu. (satoru)
+    static void TscAdjustBoot(bool fix, bool inject_test);
+    static int64_t TscAdjustFirmware(uint32_t idx);   // what the firmware left on that cpu (satoru)
+    static bool TscAdjustKept();                      // nonzero values were left in place (satoru)
+
+    // cr0/cr4 policy, the same on the bsp and every ap. CR0.WP (bit 16) makes a
+    // ring-0 store into a read-only user page fault, so a copy-out into a COW page
+    // after fork goes through the cow fault path instead of writing the frame the
+    // other process still shares. wp_on (kurono.wp=1) sets WP on every cpu; off,
+    // each cpu keeps the WP bit it booted with (the grub path never set it, an efi
+    // bsp inherits the firmware's). CR0.NE and the bsp's cr4 security bits
+    // (cr4_set: smep/umip) are copied to the aps either way. the bsp calls this in
+    // kernel_main, before smp; ap_entry calls ApplyCrPolicyAp. (satoru)
+    static void CrPolicyBsp(bool wp_on, uint64_t cr4_set);
+    static void ApplyCrPolicyAp();
+    static bool WpOn();
+    // a ring-0 write fault on a present user page that no handler resolved
+    // (read-only, not cow, or no user task to own it). there is no uaccess fixup
+    // table to return -EFAULT through, so with WP on this logs the site and runs
+    // the store the way WP=0 does: WP is suspended on this cpu and re-armed by the
+    // first interrupt that did not land on that store (WpRearm, isr_common_handler).
+    // a stale read-only tlb entry for a pte that is writable now is just flushed
+    // and retried. returns false when
+    // WP is off (the fault is not ours). (satoru)
+    static bool WpKernelWriteFallback(uint64_t cr2, uint64_t rip, uint64_t pte_flags);
+    static void WpRearm(uint64_t interrupted_rip);
 };
 // end (satoru)

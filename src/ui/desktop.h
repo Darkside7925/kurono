@@ -62,6 +62,7 @@ public:
     // reserves (0 in classic); ApplyDesktopArea() hands the free area between
     // bar and dock to the window manager. (satoru)
     static int  TopInset();
+    static bool StartMenuOpen() { return start_menu_open; }   // move by copy checks it (satoru)
     static void ApplyDesktopArea();
     static int  ClockHour24() { return clock_h; }
     static int  ClockHour12() { int h = clock_h % 12; return h ? h : 12; }
@@ -208,6 +209,7 @@ public:
 private:
     static int screen_width, screen_height;
     static unsigned int wallpaper_color;
+    static void DamageIcon(int i);   // the icon's whole footprint, for scissor damage (satoru)
     static DesktopIcon icons[DESKTOP_MAX_ICONS];
     static int icon_count;
     static int selected_icon;
@@ -292,6 +294,17 @@ public:
     // windows follow their screen across an arrangement change. (satoru)
     static void Relayout(int screen_w, int screen_h, const int* old_x, const int* old_y, int swap_a, int swap_b);
     static void Render();
+    // kurono.gfx.scissor=1: render the frame as damage scissor passes (each a
+    // damaged region repainted from the wallpaper up, nothing drawn outside
+    // it). returns the number of passes. (satoru)
+    static int RenderScissored();
+    static void SetScissorGuard(bool on);   // debug: log draws outside a pass box (satoru)
+    // the gfx oracle: a whole-screen render with the default (unscissored) renderer
+    // into the back buffer, the truth the partial paths are compared to. (satoru)
+    static void RenderReference();
+    // what the last RenderScissored repainted: pixels, and whether a pass was
+    // the whole screen. (satoru)
+    static void LastScissorStats(uint64_t* area_px, bool* full);
     static void HandleInput(int mx, int my, bool mouse_down, bool clicked, char key);
     static void Update();
     static void ReloadFromConfig();          // called by `kurono reload`
@@ -306,6 +319,7 @@ public:
     static void LaunchTaskManager();
     static void LaunchBrowser();
     static void LaunchMediaPlayer();
+    static void LaunchInstaller();   // the graphical installer app (satoru)
     // firefox: runs the `firefox` shell command detached on the shell
     // kernel-process (restore/install/exec), so no terminal window opens;
     // feedback is a toast + the firefox window itself. (satoru)

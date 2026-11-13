@@ -36,9 +36,10 @@ detail here disagrees with the source, trust the source.
   (`vmm`). Boots to a desktop on 512 MB and manages large RAM sizes. `kmemx` (memory
   compression) is present but does not compress pages in a real boot yet.
 - Scheduling: kernel processes are cooperative; ring-3 tasks are preemptive.
-  `kurono.sched=2` is the full-SMP mode where user tasks run on all online CPUs. The
-  default mode is the older one with fewer cores in play. See `proc/SCHEDULER.md` and
-  `proc/SMP.md`.
+  `kurono.sched=2` is the default: user tasks run on all online CPUs. `kurono.sched=1` is the
+  old mode. See `proc/SCHEDULER.md` and `proc/SMP.md`.
+- Memory also covers kernel heap blocks of 256 KB and up, which come straight from page
+  frames. See `kernel/HEAP.md`.
 - `/proc`: real per-task directories for user and kernel tasks (status, stat, task/<tid>),
   `/proc/stat` and `/proc/uptime`, so `ps` and `top` work and the Task Manager reads them.
 - Rule I follow: changes to `struct Process` are dangerous (adding fields once broke
@@ -55,6 +56,9 @@ anonymous, `memfd`), unix sockets with `SCM_RIGHTS`, pipes, ptys, signals, and A
 sockets bridged into Kurono's TCP/IP stack. Devices appear as nodes (`/dev/sd*` with
 partition windows, `/dev/kshell`, `/dev/kexec`). Linux paths map onto KVFS (`/etc/x` is
 `/system/etc/x`). See `linux/LINUX_SYSCALL.md`, `linux/LD_KURONO.md`, `linux/SYSCALLS.md`.
+
+OpenCode runs the same way, from the `OPENCODE` file on the KURONO partition. See
+`linux/OPENCODE.md`.
 
 Lessons that shaped it: sockets are non-blocking (EINPROGRESS/EAGAIN must work), and the
 kernel must be event-driven about wakeups, not timer-driven.
@@ -88,13 +92,13 @@ by the kernel, or as a ring-3 musl-static program that is a Wayland client. See 
 
 `src/security`.
 
-- **KEN** is the privilege engine and the `ken <cmd>` command (sudo-like; `sudo` and
-  `supr` are hidden aliases). Roles: Guest, User, Admin, Root, Sovereign.
+- **KEN** is the privilege engine. `amdo <cmd>` is the privilege command (sudo-like). `ken`,
+  `sudo` and `supr` are hidden aliases. Roles: Guest, User, Admin, Root, Sovereign.
 - **KSA** is the approval prompt. It is rendered and decided inside an isolated
   hypervisor context (EPT-isolated), and only a verdict comes back over a read-only
   channel. The point: a compromised main kernel can't forge a click. The prompt keeps the
   compositor alive, polls USB HID, and can be answered on a machine that only has USB
-  input.
+  input. A switch in Settings turns it off; off needs the password or an amdo approval.
 - **Admin gate** is where the policy is enforced. Ring-3 programs run as uid 1000, not
   root. These need approval (cached for 15 seconds after): writes to system paths,
   opening raw block devices, signalling another user's process, `setuid`-style identity
@@ -107,15 +111,18 @@ See `security/KEN.md` and `security/KSA.md`.
 ## Hypervisor
 
 `src/virt`. Intel VT-x (EPT), with AMD paths written. It runs an **Alpine Linux** guest
-with virtio devices (network, block, console, 9p, audio, GPU host). A Wayland bridge
+with virtio devices (network, block, console, 9p, audio, GPU host). On machines with 12 or
+more CPUs Alpine runs up to 4 vCPUs in parallel. Guest RAM is backed on first touch, and
+guest disks grow on demand. A Wayland bridge
 (`wlbridge`) carries guest Wayland over console channels so guest apps show up as
-windows on the Kurono desktop, and carries clipboard and audio. Debian is still being
-tested. Needs VT-x, so under QEMU it needs nested virtualization. See `virt/`.
+windows on the Kurono desktop, and carries clipboard and audio. A Debian 13 guest also boots,
+on one vCPU. Needs VT-x, so under QEMU it needs nested virtualization. See `virt/`.
 
 ## KLD: Linux drivers in a sandbox
 
-`src/kernel/kld_broker.cpp`. KLD loads unmodified upstream Linux driver code (e1000e
-today) in an untrusted ring-3 container. The container can't touch hardware directly.
+`src/kernel/kld_broker.cpp`. KLD loads unmodified upstream Linux driver code (e1000e,
+Intel Wi-Fi, and a HID-over-I2C touchpad stack) in an untrusted ring-3 container. An i915
+display container exists too, off by default. The container can't touch hardware directly.
 Every PCI, BAR, DMA, MSI and ACPI operation goes through the kernel broker, which grants
 access per device and per address space, and refuses config writes that would move a BAR
 or reprogram MSI. The kernel links no Linux code. Honest limit: without an IOMMU a
@@ -132,7 +139,8 @@ experimental Intel acceleration module (`intel_accel`, flags in `boot-flags.md`)
 
 ## Filesystems and persistence
 
-KVFS is the in-memory runtime filesystem. KFS is the on-disk persistence layer. FAT32
+KVFS is the in-memory runtime filesystem. Directories grow on demand, up to 65,536 entries.
+KFS is the on-disk persistence layer. FAT32
 and ext4 read paths exist for installing and for guest images. See `fs/`.
 
 ## Networking

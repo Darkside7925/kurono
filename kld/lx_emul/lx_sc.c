@@ -13,6 +13,8 @@
 // end (satoru)
 
 void __SCT__might_resched(void)            { }
+void __SCT__preempt_schedule(void)         { }
+void __SCT__cond_resched(void)             { }
 void __SCT__preempt_schedule_notrace(void) { }
 
 // end (satoru)

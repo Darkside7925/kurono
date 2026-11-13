@@ -68,6 +68,18 @@ Some builds embed binary assets (`src/assets_fonts.tar`, `src/assets_xkb.tar`,
 build treats missing ones as weak symbols. Without the NSS libs, for example, Firefox
 can't do HTTPS.
 
+## Files on the KURONO partition
+
+Some programs are not built into the kernel. They are root files on the KURONO partition,
+read at boot or on first use:
+
+- `OPENCODE`, `LIBSTDC.SO`, `LIBGCCS.SO` and `OPENCODE.ENV` for OpenCode, see `linux/OPENCODE.md`
+- `CLAUDE` for Claude Code, and `CLAUDE.ENV` for its login
+- `ALPINE.IMG` and `DEBIAN.IMG` for the VM guests, `DEBKERN.BIN` and `DEBINIT.BIN` for the Debian
+  kernel and initramfs. `DEBIAN.IMG` must be one contiguous file
+
+The build does not produce these. Copy them onto the partition yourself.
+
 ## Testing in QEMU
 
 ```bash

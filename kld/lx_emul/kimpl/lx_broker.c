@@ -17,12 +17,17 @@
 #include "lx_kshim.h"
 #include "lx_broker.h"
 
+// every broker call passes through here; --kld-ids proves it made none.
+// (satoru)
+unsigned long lx_broker_call_count;
+
 // raw syscall: musl's syscall() wrapper is not reachable from kernel-context
 // code (header collision), so issue it directly. (satoru)
 long lx_broker_call(unsigned int op, unsigned long a0, unsigned long a1,
                     unsigned long a2, unsigned long a3)
 {
     long ret;
+    lx_broker_call_count++;
     register unsigned long r10 __asm__("r10") = a2;
     register unsigned long r8  __asm__("r8")  = a3;
     __asm__ __volatile__("syscall"
@@ -84,6 +89,13 @@ long lx_broker_disable(unsigned int bdf)
 long lx_broker_bar_size(unsigned int bdf, unsigned int idx)
 {
     return lx_broker_call(LX_KLD_OP_PCI_BAR_SIZE, bdf, idx, 0, 0);
+}
+
+// test-only (kurono.kld.iommutest=1): the kernel's canary physical address.
+// (satoru)
+long lx_broker_test_canary(void)
+{
+    return lx_broker_call(LX_KLD_OP_TEST_CANARY, 0, 0, 0, 0);
 }
 
 // end (satoru)

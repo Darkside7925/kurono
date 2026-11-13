@@ -84,6 +84,14 @@ static inline bool AccessOkT(uint64_t ptr) { return AccessOk(ptr, sizeof(T)); }
 // below already do it. (satoru)
 bool RangeOk(uint64_t ptr, uint64_t len, bool need_write);
 
+// an OUTPUT buffer the kernel will write for the caller (review g1): the
+// AccessOk gate for everyone, plus, for a kld container only, every page
+// present and writable in its own page tables. a container's read-only broker
+// pages (a bar under kurono.kld.bar=ro|window, the copy-protected pages) can
+// then not be written by the kernel on its behalf. ordinary processes pay one
+// container-table lookup. (satoru)
+bool OutOk(uint64_t ptr, uint64_t len);
+
 // ── the copy helpers ────────────────────────────────────────────────────────
 // Linux convention: return the number of bytes NOT copied (0 == full success),
 // so callers can do `if (copy_from_user(...)) return -EFAULT;`. Both validate

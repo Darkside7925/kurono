@@ -2,6 +2,7 @@
 //  power mode mapped onto the cpufreq governors (applied live on every managed
 //  cpu, persisted, restored at boot), live processor clocks, and the power
 //  source. (satoru)
+#include "../system/battery.h"   // battery level (satoru)
 #include "system_settings.h"
 #include "../system/ui_config.h"
 #include "../hal/cpufreq.h"
@@ -68,7 +69,15 @@ static void power_build(){
     }
 
     Group("Battery");
-    Info("Power source", "AC power", "No battery was detected");
+    if(Battery::Present()){
+        char d[64], pc[16];
+        Battery::Describe(d, (int)sizeof(d));
+        IntToStr(Battery::Percent(), pc, 16); StrApp(pc, "%", 16);
+        Info("Battery", pc, d, Battery::Percent() > 20 ? T().success : T().danger);
+        Info("Power source", Battery::GetState() == Battery::S_DISCHARGING ? "Battery" : "Power adapter");
+    } else {
+        Info("Power source", "AC power", "No battery was detected");
+    }
     EndGroup();
 }
 

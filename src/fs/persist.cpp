@@ -7,6 +7,7 @@
 #include "../drivers/serial.h"
 #include "kfs.h"
 #include "kvfs.h"
+#include "../proc/scheduler.h"   // CondResched in the restore walk (satoru)
 
 //  raw-sector persistence - see persist.h. all i/o goes through a single page
 //  aligned bounce buffer (PMM::AllocBytes hands out page-aligned, identity-mapped
@@ -343,6 +344,9 @@ namespace {
         Collected c; c.names = nullptr; c.isdir = nullptr; c.count = 0; c.cap = 0;
         KFS::List(path, collect_cb, &c);
         for (int i = 0; i < c.count; i++) {
+            // per file: the /apps restore (288 mb) runs on the firefox launcher proc
+            // and held the bsp for ~440 ms at a time (kplat). (satoru)
+            Scheduler::CondResched();
             char* child = (char*)KernelHeap::Alloc(4096);
             if (!child) continue;
             path_join(child, 4096, path, c.names[i]);
@@ -364,6 +368,14 @@ namespace {
                     SerialLogger::Log(child);
                     SerialLogger::Log(" sz="); SerialLogger::LogDec((int)(sz >> 20)); SerialLogger::Log("MB\r\n");
                     KernelHeap::Free(child); continue;
+                }
+                // lazy: keep the bytes on the KFS volume, the node only records
+                // size + backing path. the reader materializes or streams them.
+                // long paths that do not fit the node backing slot take the old
+                // eager path. (satoru)
+                if (KVFS::WriteLazyFile(child, (uint32_t)sz) == KVFS_OK) {
+                    KernelHeap::Free(child);
+                    continue;
                 }
                 uint8_t* buf = (uint8_t*)KernelHeap::Alloc((uint32_t)sz);
                 if (!buf) {   // a silent skip here leaves a restored install incomplete (satoru)
@@ -421,8 +433,49 @@ namespace {
 }
 
 
+// set while RestoreApps walks /apps. the walk yields (Scheduler::CondResched) per
+// file now, so a save (format / unmount of the KFS caches) or a second restore must
+// wait for it instead of running in the middle (review finding). (satoru)
+static volatile bool g_restoring = false;
+static void wait_restore_done() {
+    while (__atomic_load_n(&g_restoring, __ATOMIC_ACQUIRE)) Scheduler::SleepMs(5);
+}
+
+// one snapshot writer at a time. the power action, the autosave worker and
+// claude's shell exit can all reach SaveTree from different kernel processes;
+// KFS's format/mount caches are process-global, so overlapping writers would
+// corrupt the volume. the loser waits instead of skipping the save. (satoru)
+static volatile uint32_t g_save_busy = 0;
+static bool save_lock_acquire() {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(&g_save_busy, &expected, 1u, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return true;
+    SerialLogger::Log("[persist] another save is running, waiting\r\n");
+    uint64_t t0 = Timer::GetRealMs64();
+    while (__atomic_load_n(&g_save_busy, __ATOMIC_ACQUIRE)) {
+        if (Timer::GetRealMs64() - t0 > 120000u) {
+            SerialLogger::Log("[persist] gave up waiting for the running save\r\n");
+            return false;
+        }
+        Scheduler::SleepMs(10);
+    }
+    expected = 0;
+    return __atomic_compare_exchange_n(&g_save_busy, &expected, 1u, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+struct SaveLockRelease {
+    ~SaveLockRelease() { __atomic_store_n(&g_save_busy, 0u, __ATOMIC_RELEASE); }
+};
+
+static void materialize_subtree(const char* path);
+
 bool PersistStore::SaveTree() {
     if (!PersistStore::Available()) return false;
+    uint64_t save_t0 = Timer::GetRealMs64();
+    if (!save_lock_acquire()) return false;
+    SaveLockRelease save_lock;
+    wait_restore_done();   // (satoru)
     KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
 
     // layer 6 - INCREMENTAL save. fingerprint the current user-data set; if a
@@ -432,10 +485,12 @@ bool PersistStore::SaveTree() {
     // format + rewrite. on a real change (or a fresh/foreign disk) we fall through
     // to the full snapshot. (satoru)
     uint64_t cur_fp = fingerprint_userdata();
-    if (KFS::Mount()) {
+    if (KFS::IsMounted() || KFS::Mount()) {
         uint64_t prev_fp = KFS::MountedFingerprint();
         if (prev_fp != 0 && prev_fp == cur_fp) {
-            SerialLogger::Log("[persist] incremental save: user data unchanged, skipped full rewrite\r\n");
+            SerialLogger::Log("[persist] save ok in ");
+            SerialLogger::LogDec((int)(Timer::GetRealMs64() - save_t0));
+            SerialLogger::Log(" ms (user data unchanged, full rewrite skipped)\r\n");
             return true;
         }
     }
@@ -452,7 +507,23 @@ bool PersistStore::SaveTree() {
     }
 
     uint32_t blocks = kfs_disk_blocks();
-    if (!blocks || !KFS::Format(blocks)) return false;
+    if (!blocks) {
+        SerialLogger::Log("[persist] save FAILED: no usable KFS volume blocks in ");
+        SerialLogger::LogDec((int)(Timer::GetRealMs64() - save_t0));
+        SerialLogger::Log(" ms\r\n");
+        return false;
+    }
+    // lazy nodes still point at the volume the format is about to erase. (satoru)
+    {
+        const char* mroots[5] = { "/home", "/etc", "/root", "/apps", "/opt" };
+        for (int i = 0; i < 5; i++) if (KVFS::Exists(mroots[i])) materialize_subtree(mroots[i]);
+    }
+    if (!KFS::Format(blocks)) {
+        SerialLogger::Log("[persist] save FAILED: KFS format error in ");
+        SerialLogger::LogDec((int)(Timer::GetRealMs64() - save_t0));
+        SerialLogger::Log(" ms\r\n");
+        return false;
+    }
     // /apps persists too so a large installed package (e.g. firefox in
     // /apps/firefox) survives reboot and isn't re-downloaded every boot. /opt
     // carries claude code (kpkg install claude), saved from its borrowed
@@ -461,17 +532,76 @@ bool PersistStore::SaveTree() {
     for (int i = 0; i < 5; i++) if (KVFS::Exists(roots[i])) save_subtree(roots[i]);
     KFS::SetFingerprint(cur_fp);   // stamp so the next save can short-circuit (satoru)
     bool ok = KFS::Sync();
-    if (ok) SerialLogger::Log("[persist] saved kvfs user data to KFS volume (full snapshot)\r\n");
+    KFSStats st = KFS::Stats();
+    if (ok) {
+        SerialLogger::Log("[persist] save ok in ");
+        SerialLogger::LogDec((int)(Timer::GetRealMs64() - save_t0));
+        SerialLogger::Log(" ms (full snapshot, ");
+        SerialLogger::LogDec((int)st.files_written);
+        SerialLogger::Log(" files, ");
+        SerialLogger::LogDec((int)(st.bytes_written >> 20));
+        SerialLogger::Log(" MB)\r\n");
+    } else {
+        SerialLogger::Log("[persist] save FAILED: KFS sync error in ");
+        SerialLogger::LogDec((int)(Timer::GetRealMs64() - save_t0));
+        SerialLogger::Log(" ms\r\n");
+    }
     // the save is on disk - drop the ~36 mb of in-ram kfs metadata. the next
     // persist op remounts on demand (kfs_ensure_mounted). (satoru)
     KFS::Unmount();
     return ok;
 }
 
+// cheap-ish watch on claude's own directory only: the autosave worker hashes
+// this every few seconds to notice a session/history write without reading the
+// whole user-data set. (satoru)
+uint64_t PersistStore::ClaudeFingerprint() {
+    uint64_t h = 1469598103934665603ull;   // fnv offset basis (satoru)
+    if (KVFS::Exists("/home/user/.claude")) fingerprint_subtree("/home/user/.claude", &h);
+    if (h == 0) h = 1;
+    return h;
+}
+
+static bool kfs_ensure_mounted();
+
+// lazy kvfs backing: file bytes stay in the KFS volume until something reads
+// them, so a restore only builds the tree (no 26 mb of /home or 288 mb of /apps
+// heap copies at boot). a read remounts the volume if the idle trim dropped the
+// metadata caches. (satoru)
+static bool lazy_ensure_cb() { return kfs_ensure_mounted(); }
+static int64_t lazy_read_cb(const char* path, uint64_t off, void* buf, uint64_t len) {
+    if (!kfs_ensure_mounted()) return -1;
+    return KFS::ReadFileAt(path, off, buf, len);
+}
+
+// bring every lazy file in a subtree into ram. SaveTree formats the volume, so
+// any node still backed by the old volume must be read before the format. (satoru)
+static void materialize_subtree(const char* path) {
+    KVFSNode* node = KVFS::Resolve(path);
+    if (!node) return;
+    if (node->type == KVFS_FILE) { if (node->lazy_kfs) KVFS::Materialize(node); return; }
+    if (!node->is_dir()) return;
+    int cap = node->child_count;
+    if (cap <= 0) return;
+    KVFSNode** kids = (KVFSNode**)KernelHeap::Alloc((uint32_t)cap * sizeof(KVFSNode*));
+    if (!kids) return;
+    int n = KVFS::Listdir(path, kids, cap);
+    for (int i = 0; i < n; i++) {
+        if (!kids[i]) continue;
+        char* child = (char*)KernelHeap::Alloc(4096);
+        if (!child) continue;
+        path_join(child, 4096, path, kids[i]->name);
+        materialize_subtree(child);
+        KernelHeap::Free(child);
+    }
+    KernelHeap::Free(kids);
+}
+
 bool PersistStore::LoadTree() {
     if (!PersistStore::Available()) return false;
     KFS::SetBackend(kfs_rd, kfs_wr, nullptr);
     if (!KFS::Mount()) return false;
+    KVFS::SetLazyBackend(lazy_ensure_cb, lazy_read_cb);
     // restore the small user-data subtrees at boot. /apps is DELIBERATELY skipped
     // here: a large installed package (firefox is ~288 mb) bulk-read into the heap
     // this early (before the desktop is up) recreated the heap+timing state that
@@ -495,6 +625,8 @@ static bool kfs_ensure_mounted() {
     return KFS::Mount();
 }
 
+bool PersistStore::IsRestoring() { return __atomic_load_n(&g_restoring, __ATOMIC_ACQUIRE); }
+
 bool PersistStore::RestoreApps() {
     if (!PersistStore::Available()) return false;
     SerialLogger::Log("[fftl] RestoreApps: available\r\n");   // launch timeline (satoru)
@@ -504,10 +636,15 @@ bool PersistStore::RestoreApps() {
     SerialLogger::Log("[fftl] RestoreApps: /apps exists\r\n");
     // already restored this boot? a populated /apps/firefox means RestoreApps ran
     // (or the install path created it), so don't re-read 288 mb. (satoru)
+    // a restore already running (it yields per file): wait for it, then this one is
+    // satisfied by the populated tree. (satoru)
+    if (__atomic_load_n(&g_restoring, __ATOMIC_ACQUIRE)) { wait_restore_done(); return true; }
     if (KVFS::IsDir("/apps") && KVFS::Exists("/apps/firefox/firefox")) return true;
+    __atomic_store_n(&g_restoring, true, __ATOMIC_RELEASE);
     uint64_t t0 = Timer::GetRealMs64();
     restore_subtree("/apps");
     uint64_t t1 = Timer::GetRealMs64();
+    __atomic_store_n(&g_restoring, false, __ATOMIC_RELEASE);
     SerialLogger::Log("[persist] restored /apps from KFS volume in ");
     SerialLogger::LogDec((int)(t1 - t0)); SerialLogger::Log(" ms\r\n");
     // NOTE: no KFS::Unmount() here - RestoreApps runs on the firefox LAUNCH

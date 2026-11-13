@@ -117,7 +117,10 @@ enum TCPState {
 // tls handshakes + necko keep-alive pool); 16 starved that instantly and every
 // connection past the cap silently failed. 48 covers a real page. each socket's
 // 256kb rx ring dominates - 48*~260kb ~= 12mb static, fine on the 4gb vm. (satoru)
-#define MAX_SOCKETS    48
+#define MAX_SOCKETS    4096
+// the socket table now grows on demand in chunks of SOCK_CHUNK entries (never moved,
+// never freed), so pointers and indices into it stay valid; MAX_SOCKETS is only the cap. (satoru)
+#define SOCK_CHUNK     64
 // 256 kb rx ring (was 64 kb, was 8 kb). a 16-bit tcp window field tops out at
 // 64 kb, which caps a bulk download at 64kb/rtt with no window scaling; a real
 // (non-zero-rtt) link then sits idle most of each round trip. with rfc 1323
@@ -244,7 +247,10 @@ struct NetSocket {
     // keepalive) never carry data here, so the two paths don't overlap. a
     // segment is freed when a cumulative ack reaches seq+len (ApplyAck), and
     // retransmitted per-segment on rto from TCPTick. (satoru)
-    TxDataSeg tx_segs[TCP_SND_WND_SEGS];
+    // the send scoreboard and the out-of-order pen are large (12 kb + 47 kb)
+    // and only stream sockets under load need them: allocated on first use and
+    // freed when the slot goes idle, instead of 60 kb resident per slot. (satoru)
+    TxDataSeg* tx_segs;
     int       tx_seg_inflight;   // count of in_use scoreboard slots (satoru)
 
     // fast-retransmit (rfc 5681): the peer re-acks the same seq on every
@@ -258,8 +264,8 @@ struct NetSocket {
     // out-of-order reassembly holding pen: segments received ahead of tcp_ack
     // are parked here and spliced into the rx ring as the preceding gap fills.
     // (satoru)
-    TcpOooSeg ooo_segs[TCP_OOO_SEGS];
-    int       ooo_count;         // count of in_use ooo slots (satoru)
+    TcpOooSeg* ooo_segs;
+    int        ooo_count;        // count of in_use ooo slots (satoru)
 
     // non-blocking connect: when set, Connect() returns EINPROGRESS after
     // sending SYN and the 3-way handshake completes from TCPTick/RX (satoru)
@@ -398,7 +404,16 @@ private:
     static uint8_t  mac[6];
 
     static ARPEntry arp_cache[ARP_CACHE_SIZE];
-    static NetSocket sockets[MAX_SOCKETS];
+    struct SockChunk { NetSocket s[SOCK_CHUNK]; uint8_t* rx[SOCK_CHUNK]; };
+    struct SockTable {
+        SockChunk* ch[MAX_SOCKETS / SOCK_CHUNK];
+        int nch;
+        int Count() const { return __atomic_load_n(&nch, __ATOMIC_ACQUIRE) * SOCK_CHUNK; }
+        NetSocket& operator[](int i) { return ch[i / SOCK_CHUNK]->s[i % SOCK_CHUNK]; }
+        uint8_t*& Rx(int i) { return ch[i / SOCK_CHUNK]->rx[i % SOCK_CHUNK]; }
+        bool Grow();
+    };
+    static SockTable sockets;
     static NetStats stats;
     static PendingIPv4Frame pending_ipv4[PENDING_IPV4_TX];
 

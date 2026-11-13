@@ -40,6 +40,26 @@ int Off(char* out, int maxo);
 // `gpumode status` (satoru)
 int Status(char* out, int maxo);
 
+// ---- live refresh switching on the lit pipe b sink (satoru) ----
+// the integer refresh rates the sink's edid offers at the current resolution,
+// ascending. 0 while nothing is lit or no edid was decoded. (satoru)
+int Rates(uint32_t* hz, int max);
+// the rate pipe b scans out now (0 while off). (satoru)
+uint32_t CurrentHz();
+uint32_t CurrentMilliHz();
+// `gpumode rate HZ` / Settings > Display: turn pipe b off and light it again
+// at the edid timing closest to hz at the current resolution. the accelerated
+// present paths are suspended first and re-arm on the new mode. on failure the
+// previous timing is restored and 0 is returned. (satoru)
+int SetRate(char* out, int maxo, uint32_t hz);
+// boot: re-light pipe b at UIConfig display.dp_hz after the config store is
+// up (the early Boot() call runs before KVFS). 0 when nothing changed. (satoru)
+int ApplySavedRate();
+// push the lit pipe's current rate into the registered compositor output so
+// the pacer ceiling and the settings page see it. no-op before registration.
+// (satoru)
+void PublishOutputRate();
+
 // the lit output for the outputs layer: framebuffer physical address
 // (identity mapped, 2 mb aligned, size a 2 mb multiple), mode and pitch.
 // false while nothing is lit. (satoru)
@@ -49,6 +69,11 @@ bool GetOutput(uint64_t* phys, int* w, int* h, uint32_t* pitch);
 // programmed), for stage 3 acceleration which reuses that mapping. false
 // while nothing is lit. (satoru)
 bool GetOutputGgtt(uint32_t* ggtt);
+
+// kurono.igpu.legacytc=1: true when pipe b is lit on a legacy type-c port
+// and the sink reported lock after enable, i.e. the external screen should
+// carry the menu bar and dock (the boot code makes it the primary). (satoru)
+bool LegacyTcLit();
 
 }
 

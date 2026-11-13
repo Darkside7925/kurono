@@ -7,6 +7,7 @@
 #include "../drivers/timer.h"
 #include "../proc/spinlock.h"
 #include "../kernel/types.h"
+#include "../kernel/pmm.h"
 
 namespace {
     // the private guest link (host order) (satoru)
@@ -41,7 +42,7 @@ namespace {
     volatile bool g_active = false;
     Spinlock  g_lock;                    // nat table + rx ring
     Nat       g_nat[NAT_MAX];
-    Frame     g_rx[RXQ];
+    Frame*    g_rx = nullptr;           // 256 frames (~388 kb), vm lifetime (satoru)
     volatile uint32_t g_rx_w = 0, g_rx_r = 0;
     uint16_t  g_next_port = PORT_LO;
     uint8_t   g_guest_mac[6];
@@ -116,6 +117,7 @@ namespace {
     // take it here (satoru)
     bool to_guest_locked(const uint8_t* eth, int len) {
         if (len > FRAME_MAX || len < 14) return false;
+        if (!g_rx) return false;
         if (g_rx_w - g_rx_r >= (uint32_t)RXQ) { st_full++; return false; }
         Frame& f = g_rx[g_rx_w % RXQ];
         memcpy(f.data, eth, len);
@@ -434,7 +436,7 @@ namespace {
         if (!VirtioDriverOk(&g_dev)) return;
         static uint8_t buf[VHDR + FRAME_MAX];
         int n = 0;
-        while (g_rx_r != g_rx_w && VirtioHasAvail(&g_dev, 0)) {
+        while (g_rx && g_rx_r != g_rx_w && VirtioHasAvail(&g_dev, 0)) {
             Frame& fr = g_rx[g_rx_r % RXQ];
             VirtioChain c;
             if (!VirtioPop(&g_dev, 0, &c)) break;
@@ -459,6 +461,11 @@ namespace {
 }
 
 bool VNet::Init(uint8_t irq) {
+    if (!g_rx) {
+        g_rx = (Frame*)PMM::AllocBytes(sizeof(Frame) * RXQ);
+        if (!g_rx) return false;
+        memset(g_rx, 0, sizeof(Frame) * RXQ);
+    }
     {
         SpinLockGuard g(g_lock);
         g_active = false;
@@ -489,9 +496,12 @@ bool VNet::Init(uint8_t irq) {
 
 void VNet::Shutdown() {
     g_active = false;
-    SpinLockGuard g(g_lock);
-    for (int i = 0; i < NAT_MAX; i++) g_nat[i].used = false;
-    g_rx_r = g_rx_w = 0;
+    {
+        SpinLockGuard g(g_lock);
+        for (int i = 0; i < NAT_MAX; i++) g_nat[i].used = false;
+        g_rx_r = g_rx_w = 0;
+    }
+    if (g_rx) { PMM::FreeBytes(g_rx, sizeof(Frame) * RXQ); g_rx = nullptr; }
 }
 
 void VNet::Poll() {

@@ -30,6 +30,10 @@ public:
 
     // allocate a single 4 kb physical frame. returns physical address, or 0 on failure.
     static uint64_t AllocFrame();
+    // claim one specific free frame (the fixed user image backs page va with the
+    // frame at the same physical address, so the identity alias in that process
+    // is the page itself). false if the frame is taken. (satoru)
+    static bool AllocFrameAt(uint64_t phys_addr);
 
     // increment the reference count of an allocated frame.
     static void RetainFrame(uint64_t phys_addr);
@@ -51,6 +55,18 @@ public:
     // uses identity mapping (phys == virt) so the returned pointer is directly usable.
     static void* AllocBytes(size_t bytes);
     static void  FreeBytes(void* addr, size_t bytes);
+
+    // ── high-half direct map (kurono.directmap=1) ───────────────────────────
+    // when enabled, AllocBytes/AllocBytesBelow return DIRECT_BASE + phys and
+    // the kernel no longer dereferences ordinary frames through the low
+    // identity map (page tables, zero-on-alloc and the heap all translate).
+    // AllocFrame/AllocContiguous still return physical frame numbers.
+    static bool     DirectMapRequested();
+    static bool     DirectMapOn();
+    static void     EnableDirectMap();
+    static void*    PhysToVirt(uint64_t phys);
+    static uint64_t VirtToPhys(uint64_t addr);
+    static uint64_t VirtToPhys(const void* ptr) { return VirtToPhys((uint64_t)(uintptr_t)ptr); }
 
     // free a contiguous range of frames previously obtained via AllocContiguous.
     static void  FreeContiguous(uint64_t phys_addr, uint64_t count);
@@ -83,6 +99,11 @@ public:
     // allocator caller's return address). CensusSite is 0 when off or untagged;
     // reads are unlocked (the census tolerates a racy snapshot). (satoru)
     static bool     CensusOn();
+    // kurono.ptaudit=1: paging-structure frame lifetime audit (debug). (satoru)
+    static bool     PtAudit();
+    static bool     PtTrace();   // per-frame leaf/table event history (debug) (satoru)
+    static void     SetFreeGuard(bool (*fn)(uint64_t phys, uint64_t ra));
+    static void     SetBulkFreeGuard(bool (*fn)(uint64_t phys));   // kurono.ptaudit (satoru)
     static uint32_t CensusSite(uint64_t idx);
     static bool     CensusFrameUsed(uint64_t idx);
     static uint64_t HighFramesInUse();
@@ -101,9 +122,47 @@ public:
     // top of ram (bitmap range). bound for identity-mapped frames, not GetTotalMemory. (satoru)
     static uint64_t GetPhysTop()      { return total_frames * PAGE_SIZE; }
     static uint64_t GetFreeMemory()   { return GetFreeFrames() * PAGE_SIZE; }
+    // boot reservations the census reports: the mbi framebuffer span, the fixed
+    // user-image window below a high-linked kernel, and the overlay windows. all
+    // accounting only. (satoru)
+    static uint64_t GetReservedFramebufferBytes();
+    static uint64_t GetImageWindowBytes();
+    static uint64_t GetOverlayBytes();
+    // a fixed-address user image (claude) can be launched at any time only if
+    // the whole low window is reserved. when no such image is installed on the
+    // disk, boot releases the part above 64 mb (busybox/musl tools need only
+    // 1..64 mb) so the frames are usable ram. these two calls are the only way
+    // the window changes after Init; both refuse to touch a frame that is
+    // already allocated. (satoru)
+    static bool ReleaseImageWindowAbove(uint64_t keep_bytes);
+    // drop the boot-time physical reservation of the window. pages are claimed
+    // one at a time by AllocFrameAt when a fixed image is mapped. (satoru)
+    static bool ReleaseImageWindow();
+    // fixed identity page(s) the panic minidump is written to. chosen once in
+    // Init from the managed memory map; panic.h and the reservation both use
+    // this so they can never disagree. (satoru)
+    static uint64_t MinidumpSlot();
+    // end-of-boot policy: keep the boot reservation or release it to demand
+    // backing. claude_present is ClaudeHost::Installed(). returns true if the
+    // window stayed reserved. (satoru)
+    static bool FinalizeImageWindow(bool claude_present);
+    static bool TryReserveImageWindow();
+    static bool ImageWindowFullyReserved();
+    static bool IsInImageWindow(uint64_t va);
+    static uint64_t ImageWindowHi();
+    // a frame whose identity range the kernel reads for its whole life (kernel
+    // image, boot stub, panic dump). a user mapping may shadow it. (satoru)
+    static bool ImageSafePhys(uint64_t pa);
 
     // test whether a frame is allocated
     static bool IsFrameUsed(uint64_t phys_addr);
+
+    // helpers for the contiguous-run scan (kept public so the file-static scan
+    // can share the bitmap without duplicating allocator state). (satoru)
+    static uint64_t GetTotalFrameCount();
+    static uint64_t GetBitmapQwords();
+    static uint64_t GetBitmapQword(uint64_t i);
+    static void CommitContiguous(uint64_t run_start, uint64_t count);
 
 private:
     static void SetFrame(uint64_t frame_index);

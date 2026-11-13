@@ -554,6 +554,7 @@ void poll_notify_socket() {
     for (int guard = 0; guard < 32; guard++) {
         if (UnixSocket::PendingBytes(g_notify_sd) <= 0) break;
         char buf[256];
+        // ControlMsg grew (pin fields): this file must be recompiled with unix_socket.h (satoru)
         UnixSocket::ControlMsg cm;
         int n = UnixSocket::Recv(g_notify_sd, buf, (int)sizeof(buf) - 1, 0, &cm);
         if (n <= 0) break;
@@ -1465,6 +1466,12 @@ void Tick() {
     enforce_memory_limits();
     PollSocketActivation();
 
+    // kmemx idle compression fallback driver: the bsp syscall exit is the
+    // primary one, but when this monitor does run it contributes a bounded scan
+    // pass (BackgroundTick self-throttles to ~4hz and no-ops when disabled).
+    // (satoru)
+    KMemX::BackgroundTick();
+
     // kmemx memory-pressure monitor, throttled to ~1hz (Tick runs ~4hz). kmemx
     // recomputes pressure + compresses guests at Orange+; here kinit applies the
     // pressure-driven service policy: at Critical, gracefully terminate the
@@ -1806,7 +1813,7 @@ void register_builtins() {
     RegisterInkernel("kupdate", "Update checker", KTGT_USER,
                      start_kupd, noop_stop, health_kupd, "kpkg-daemon",
                      KRESTART_ON_FAILURE, 5000, false);
-    RegisterInkernel("ksecurity", "KSA + ken policy watch", KTGT_USER,
+    RegisterInkernel("ksecurity", "KSA + amdo policy watch", KTGT_USER,
                      start_ksec, noop_stop, health_ksec, "kdbus",
                      KRESTART_ON_FAILURE, 2000, false);
 }

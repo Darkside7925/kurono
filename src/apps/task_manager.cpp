@@ -124,8 +124,86 @@ static bool tm_starts_with(const char* s,const char* prefix){
     int i=0; while(prefix[i]){ if(s[i]!=prefix[i]) return false; i++; }
     return true;
 }
+// the shell launcher tasks exist only to host one ring-3 app; the app itself
+// is the row the user cares about, so the launcher plumbing stays hidden. (satoru)
+static bool tm_is_hidden_task(const char* n){
+    if(tm_starts_with(n, "r3launch")) return true;
+    if(tm_starts_with(n, "launcher") && n[8] >= '0' && n[8] <= '9') return true;
+    return false;
+}
 static int tm_max(int a,int b){ return a > b ? a : b; }
 static int tm_clamp(int v,int lo,int hi){ return v < lo ? lo : (v > hi ? hi : v); }
+
+// AppIcons::Id values, duplicated so the ring 3 build needs no kernel header. (satoru)
+enum { TM_ICON_TERMINAL = 0, TM_ICON_FILES = 1, TM_ICON_CALCULATOR = 2, TM_ICON_EDITOR = 3,
+       TM_ICON_SETTINGS = 4, TM_ICON_BROWSER = 5, TM_ICON_TASKS = 6, TM_ICON_MEDIA = 7,
+       TM_ICON_HOME = 8, TM_ICON_FIREFOX = 9, TM_ICON_GENERIC = 10 };
+
+// friendly process names for the rows: a ring-3 app is named after its binary
+// (denji, taskmgr), which is not what the user opened. the table also gives
+// each row its app tile and the few kernel tasks that belong with the apps
+// (a guest vm). unknown names keep their own name and a generic tile. (satoru)
+struct TmNameMap { const char* proc; const char* label; int icon; int group; };
+static const TmNameMap kTmNames[] = {
+    { "calculator",  "Calculator",       TM_ICON_CALCULATOR, 0 },
+    { "texteditor",  "Text Editor",      TM_ICON_EDITOR,     0 },
+    { "files",       "Files",            TM_ICON_FILES,      0 },
+    { "taskmgr",     "Task Manager",     TM_ICON_TASKS,      0 },
+    { "mediaplayer", "Media Player",     TM_ICON_MEDIA,      0 },
+    { "denji",       "Media Player",     TM_ICON_MEDIA,      0 },
+    { "terminal",    "Terminal",         TM_ICON_TERMINAL,   0 },
+    { "settings",    "Settings",         TM_ICON_SETTINGS,   0 },
+    { "installer",   "Installer",        TM_ICON_GENERIC,    0 },
+    { "firefox",     "Firefox",          TM_ICON_FIREFOX,    0 },
+    { "claude",      "Claude Code",      TM_ICON_GENERIC,    0 },
+    { "vmhost",      "Virtual Machine",  TM_ICON_GENERIC,    0 },
+    { "bash",        "Shell",            TM_ICON_TERMINAL,   0 },
+    { "sh",          "Shell",            TM_ICON_TERMINAL,   0 },
+    { "busybox",     "Shell",            TM_ICON_TERMINAL,   0 },
+    { "timekeeper",  "Timekeeper",       TM_ICON_GENERIC,    1 },
+    { "scheduler",   "Scheduler",        TM_ICON_GENERIC,    1 },
+    { "network",     "Network",          TM_ICON_BROWSER,    1 },
+    { "input",       "Input",            TM_ICON_GENERIC,    1 },
+    { "audio",       "Audio",            TM_ICON_MEDIA,      1 },
+    { "gui",         "GUI / compositor", TM_ICON_SETTINGS,   1 },
+    { "shell",       "Shell service",    TM_ICON_TERMINAL,   1 },
+    { "logging",     "Logging",          TM_ICON_GENERIC,    1 },
+    { "watchdog",    "Watchdog",         TM_ICON_GENERIC,    1 },
+    { "disklog",     "Disk log",         TM_ICON_GENERIC,    1 },
+    { "installer-job","Installer job",   TM_ICON_GENERIC,    1 },
+};
+// icon for an in-kernel window title, -1 when the title is not a built-in app. (satoru)
+static int tm_icon_for_title(const char* t){
+    if(!t || !t[0]) return -1;
+    if(tm_starts_with(t, "Calculator")) return TM_ICON_CALCULATOR;
+    if(tm_starts_with(t, "Text Editor")) return TM_ICON_EDITOR;
+    if(tm_starts_with(t, "Files")) return TM_ICON_FILES;
+    if(tm_starts_with(t, "Media")) return TM_ICON_MEDIA;
+    if(tm_starts_with(t, "Settings")) return TM_ICON_SETTINGS;
+    if(tm_starts_with(t, "Task Manager")) return TM_ICON_TASKS;
+    if(tm_starts_with(t, "Terminal")) return TM_ICON_TERMINAL;
+    if(tm_starts_with(t, "Kurono Installer") || tm_starts_with(t, "Install")) return TM_ICON_GENERIC;
+    return -1;
+}
+
+// apply the map to one row name. returns the group when the name is known. (satoru)
+static bool tm_name_map(const char* raw, char* out, int mx, int* icon, int* group){
+    *icon = TM_ICON_GENERIC;
+    *group = -1;
+    if(!raw || !raw[0]) return false;
+    for(int i=0;i<(int)(sizeof(kTmNames)/sizeof(kTmNames[0]));i++){
+        const char* a = kTmNames[i].proc;
+        int k = 0;
+        while(a[k] && raw[k] == a[k]) k++;
+        if(a[k] || raw[k]) continue;
+        scpy(out, kTmNames[i].label, mx);
+        *icon = kTmNames[i].icon;
+        *group = kTmNames[i].group;
+        return true;
+    }
+    scpy(out, raw, mx);
+    return false;
+}
 
 
 struct TMThread { uint32_t leader; uint32_t pid; int cpu_pct; char state[12]; };
@@ -133,8 +211,11 @@ static TMThread g_threads[192];
 static int      g_thread_count = 0;
 static uint32_t g_expanded[8];
 static int      g_expanded_n = 0;
-static int      g_core_pct[16];
+// 32: the laptop has 20 cpus, the old 16 hid cpus 16-19 (satoru)
+static int      g_core_pct[32];
 static int      g_core_n = 1;
+static int      g_core_hist[32][60];   // per-cpu usage history for the performance graphs (satoru)
+static int      g_core_hist_idx = 0;
 static int      g_net_rx_hist[60], g_net_tx_hist[60], g_dsk_rd_hist[60], g_dsk_wr_hist[60];   // kb/s (satoru)
 static int      g_io_idx = 0;
 static int      g_net_rx_rate = 0, g_net_tx_rate = 0, g_dsk_rd_rate = 0, g_dsk_wr_rate = 0;
@@ -271,7 +352,8 @@ static int tm_cpu_pct_from_ticks(uint64_t delta_ticks,uint32_t elapsed_ms){
 }
 
 
-extern volatile uint64_t g_cpu_busy_ticks[16];   // per-cpu busy ms, charged from the timer irqs in hal.cpp (satoru)
+extern volatile uint64_t g_cpu_busy_ticks[32];   // per-cpu busy ms, charged from the timer irqs in hal.cpp (satoru)
+extern uint64_t hal_kernel_cpu_ms();             // busy kernel time no task owns, hal.cpp (satoru)
 
 static void tm_store_cpu_samples(const SchedulerProcessSnapshot* snapshots,const int* pcts,int count){
     if(!snapshots || count <= 0){
@@ -834,6 +916,14 @@ void TaskManagerApp::InitServices(){
 void TaskManagerApp::RefreshWindows(){ window_count = 0; selected_window = -1; }
 
 void TaskManagerApp::RefreshProcesses(){
+    // keep the selected row across the rebuild: the list is re-sorted every
+    // refresh, so an index would drift to whatever process took that slot and
+    // End Task would end the wrong one. match by pid (synthetic rows by name). (satoru)
+    int keep_pid = -2; char keep_name[32] = {0};
+    if(selected_proc >= 0 && selected_proc < proc_count){
+        keep_pid = procs[selected_proc].pid;
+        scpy(keep_name, procs[selected_proc].name, 32);
+    }
     proc_count = 0;
     g_thread_count = 0;
     uint64_t now_ms = tm_now64();
@@ -872,6 +962,15 @@ void TaskManagerApp::RefreshProcesses(){
         p->pid = pids[i];
         const char* v = tm_key(buf, "Name");
         { int k = 0; if(v) while(v[k] && v[k] != '\n' && k < 31){ p->name[k] = v[k]; k++; } p->name[k] = 0; if(!k) scpy(p->name, "process", 32); }
+        {
+            bool kern0 = tm_num(tm_key(buf, "KuronoKernelTask")) != 0;
+            if(kern0 && tm_is_hidden_task(p->name)){ proc_count--; continue; }
+            char disp[32]; int icon = TM_ICON_GENERIC, grp = -1;
+            tm_name_map(p->name, disp, 32, &icon, &grp);
+            scpy(p->name, disp, 32);
+            p->icon = icon;
+            p->group = (uint8_t)(grp >= 0 ? grp : (kern0 ? 1 : 0));
+        }
         v = tm_key(buf, "State");
         const char sc = v ? *v : 'S';
         scpy(p->state, sc=='R' ? "RUNNING" : (sc=='Z' ? "ZOMBIE" : (sc=='T' ? "STOPPED" : "SLEEPING")), 12);
@@ -973,25 +1072,31 @@ void TaskManagerApp::RefreshProcesses(){
 
     // whole-system cpu and the per-core bars from /proc/stat deltas. (satoru)
     {
-        static uint64_t pb[17], pt[17];
-        char buf[2048];
+        static uint64_t pb[33], pt[33];
+        static uint64_t pkern = 0;
+        uint64_t kticks = 0;
+        char buf[4096];
         int n = 0;
         if(tm_read_file("/proc/stat", buf, sizeof(buf))){
             for(const char* l = buf; *l; ){
                 if(l[0]=='c' && l[1]=='p' && l[2]=='u'){
                     int idx = (l[3] == ' ') ? -1 : atoi(l + 3);
-                    const char* q = l + 3; while(*q == ' ' || (*q >= '0' && *q <= '9')) q++;
+                    const char* q = l + 3;
+                    while(*q >= '0' && *q <= '9') q++;   // the cpu index of "cpuN", none for the aggregate (satoru)
+                    while(*q == ' ') q++;
                     uint64_t v[8] = {0}; const char* e = q;
                     for(int k=0;k<8;k++){ v[k] = (uint64_t)strtoull(e, (char**)&e, 10); }
                     uint64_t tot = 0; for(int k=0;k<8;k++) tot += v[k];
                     uint64_t idle = v[3] + v[4], busy = tot - idle;
-                    int slot = idx < 0 ? 16 : (idx < 16 ? idx : -1);
+                    int slot = idx < 0 ? 32 : (idx < 32 ? idx : -1);
                     if(slot >= 0){
                         int pct = 0;
                         if(fresh && tot > pt[slot]) pct = (int)(((busy - pb[slot]) * 100ULL) / (tot - pt[slot]));
-                        if(fresh){ pb[slot] = busy; pt[slot] = tot; if(slot == 16) cpu_usage = tm_clamp(pct, 0, 100); else g_core_pct[slot] = tm_clamp(pct, 0, 100); }
-                        if(slot < 16 && slot + 1 > n) n = slot + 1;
+                        if(fresh){ pb[slot] = busy; pt[slot] = tot; if(slot == 32) cpu_usage = tm_clamp(pct, 0, 100); else g_core_pct[slot] = tm_clamp(pct, 0, 100); }
+                        if(slot < 32 && slot + 1 > n) n = slot + 1;
                     }
+                } else if(tm_starts_with(l, "kurono_kernel ")){
+                    kticks = (uint64_t)strtoull(l + 14, nullptr, 10);
                 }
                 while(*l && *l != '\n') l++;
                 if(*l == '\n') l++;
@@ -1000,6 +1105,32 @@ void TaskManagerApp::RefreshProcesses(){
         g_core_n = n > 0 ? n : 1;
         cpu_cores = g_core_n;
         if(cpu_usage == 0 && total_busy > 0 && !g_tm_cpu_samples_ready) cpu_usage = tm_clamp(total_busy, 0, 100);
+        // kernel time no task row owns: its own System row. (satoru)
+        {
+            uint64_t d = kticks >= pkern ? kticks - pkern : 0;
+            int kpct = 0;
+            if(fresh && g_tm_cpu_samples_ready && elapsed_ms > 0 && g_core_n > 0)
+                kpct = tm_clamp((int)((d * 10ull * 100ull) / ((uint64_t)elapsed_ms * (uint64_t)g_core_n)), 0, 100);
+            if(fresh) pkern = kticks;
+            if(proc_count < TM_MAX_PROCS-1){
+                TMProcess* p = &procs[proc_count++];
+                scpy(p->name, "Kernel (unowned)", 32);
+                p->pid = 0; p->cpu_pct = kpct; p->mem_kb = 0; p->shared_kb = 0; p->threads = 0;
+                scpy(p->state, kpct > 0 ? "RUNNING" : "IDLE", 12);
+                scpy(p->user, "kernel", 16);
+                p->priority = 0; p->io_read_kb = 0; p->io_write_kb = 0; p->flags = 0;
+                p->source_kind = TM_PROC_SYNTH;
+                p->stack_kb = 0; p->stack_cap_kb = 0;
+                p->cpu_ms_total = (uint32_t)(kticks * 10ull > 0xFFFFFFFFull ? 0xFFFFFFFFu : kticks * 10ull);
+                p->stack_grow_count = 0; p->prio_tier = 0; p->is_kernel_proc = true;
+                p->icon = TM_ICON_GENERIC; p->group = 1;
+            }
+        }
+        // per-cpu history for the performance graphs. (satoru)
+        if(fresh){
+            for(int c=0;c<g_core_n && c<32;c++) g_core_hist[c][g_core_hist_idx % 60] = g_core_pct[c];
+            g_core_hist_idx++;
+        }
     }
     // network and disk rates from /proc/net/dev and /proc/diskstats. (satoru)
     {
@@ -1051,7 +1182,15 @@ void TaskManagerApp::RefreshProcesses(){
     if(hist_idx == 0){ for(int i=1;i<60;i++) mem_history[i] = mem_history[0]; }
     hist_idx++;
 
-    if(selected_proc >= proc_count) selected_proc = proc_count - 1;
+    if(keep_pid != -2){
+        selected_proc = -1;
+        for(int i=0;i<proc_count;i++){
+            bool match = (keep_pid == 0) ? (procs[i].pid == 0 && scmp(procs[i].name, keep_name) == 0)
+                                         : (procs[i].pid == keep_pid);
+            if(match){ selected_proc = i; break; }
+        }
+    }
+    if(selected_proc >= proc_count) selected_proc = -1;
     if(selected_proc < -1) selected_proc = -1;
 }
 
@@ -1252,6 +1391,12 @@ void TaskManagerApp::Scroll(int delta){
 
 #if !defined(KUI_BACKEND_WAYLAND)
 void TaskManagerApp::RefreshProcesses(){
+    // keep the selected row across the rebuild (see the ring 3 twin). (satoru)
+    int keep_pid = -2; char keep_name[32] = {0};
+    if(selected_proc >= 0 && selected_proc < proc_count){
+        keep_pid = procs[selected_proc].pid;
+        scpy(keep_name, procs[selected_proc].name, 32);
+    }
     proc_count=0;
     g_thread_count=0;
     // monotonic boot clock (pit-driven) for cpu% sampling + uptime. Time::GetTicks
@@ -1321,11 +1466,19 @@ void TaskManagerApp::RefreshProcesses(){
         // tagged via PROCESS_FLAG_USER; everything else is a kernel task. (satoru)
         bool is_user = (snap.flags & PROCESS_FLAG_USER) != 0;
         const LinuxProcess* lp = is_user ? tm_find_live_linux_proc((int)snap.pid) : nullptr;
+        if(!is_user && tm_is_hidden_task(lp && lp->name[0] ? lp->name : snap.name)) continue;
 
         TMProcess* p = &procs[proc_count++];
         p->pid = (int)snap.pid;
         if(lp && lp->name[0]) scpy(p->name, lp->name, 32);
         else                  scpy(p->name, snap.name[0] ? snap.name : "process", 32);
+        {
+            char disp[32]; int icon = TM_ICON_GENERIC, grp = -1;
+            tm_name_map(p->name, disp, 32, &icon, &grp);
+            scpy(p->name, disp, 32);
+            p->icon = icon;
+            p->group = (uint8_t)(grp >= 0 ? grp : (is_user ? 0 : 1));
+        }
         // per-process memory: the scheduler snapshot already accounts kernel
         // stack + user stack + mapped regions (rss-style). for user processes
         // fold in the heap (brk) so the figure is meaningful, not just the
@@ -1417,6 +1570,30 @@ void TaskManagerApp::RefreshProcesses(){
     // (RenderWindows). just refresh that list; don't blend it into procs. (satoru)
     RefreshWindows();
 
+    // in-kernel app windows have no task of their own, so the fallback build
+    // (kurono.r3apps=0) would show no row for them. list each as an app row;
+    // ring-3 windows are skipped because their process is already a row. (satoru)
+    for(int wi=0; wi<window_count && proc_count<TM_MAX_PROCS-2; wi++){
+        if(WaylandServer::IsWaylandWindow(window_rows[wi].id)) continue;
+        const char* t = window_rows[wi].title;
+        int icon = tm_icon_for_title(t);
+        if(icon < 0) continue;
+        bool dup = false;
+        for(int j=0;j<proc_count;j++)
+            if(procs[j].group == 0 && scmp(procs[j].name, t) == 0){ dup = true; break; }
+        if(dup) continue;
+        TMProcess* p = &procs[proc_count++];
+        scpy(p->name, t, 32);
+        p->pid = 0; p->cpu_pct = 0; p->mem_kb = 0; p->shared_kb = 0; p->threads = 0;
+        scpy(p->state, "IN DESKTOP", 12);
+        scpy(p->user, "app", 16);
+        p->priority = 0; p->io_read_kb = 0; p->io_write_kb = 0; p->flags = 0;
+        p->source_kind = TM_PROC_SYNTH;
+        p->stack_kb = 0; p->stack_cap_kb = 0; p->cpu_ms_total = 0; p->stack_grow_count = 0;
+        p->prio_tier = 0; p->is_kernel_proc = false;
+        p->icon = icon; p->group = 0;
+    }
+
     // built-in app rows (kurono.taskmem=1): the heap allocated while the app's
     // code ran inside its host task. synthetic: pid 0, never killable. (satoru)
     int tm_synth_kb = 0;
@@ -1441,6 +1618,9 @@ void TaskManagerApp::RefreshProcesses(){
                 p->source_kind = TM_PROC_SYNTH;
                 p->stack_kb = 0; p->stack_cap_kb = 0; p->cpu_ms_total = 0; p->stack_grow_count = 0;
                 p->prio_tier = 0; p->is_kernel_proc = false;
+                p->icon = TM_ICON_GENERIC; p->group = fc ? 1 : 0;
+                { char disp[32]; int icon = TM_ICON_GENERIC, grp = -1;
+                  if(tm_name_map(p->name, disp, 32, &icon, &grp)){ scpy(p->name, disp, 32); p->icon = icon; if(grp >= 0) p->group = (uint8_t)grp; } }
             }
             p->mem_kb += kb;
             tm_synth_kb += kb;
@@ -1454,8 +1634,8 @@ void TaskManagerApp::RefreshProcesses(){
     // per-core load from the per-cpu busy-tick side table (one tick ~1ms); the
     // overall figure is the mean over cores so it matches the bars. (satoru)
     {
-        static uint64_t prev_busy[16];
-        int n = (int)SMP::CpuCount(); if(n < 1) n = 1; if(n > 16) n = 16;
+        static uint64_t prev_busy[32];
+        int n = (int)SMP::CpuCount(); if(n < 1) n = 1; if(n > 32) n = 32;
         g_core_n = n;
         int sum = 0;
         for(int c=0;c<n;c++){
@@ -1468,6 +1648,37 @@ void TaskManagerApp::RefreshProcesses(){
             sum += g_core_pct[c];
         }
         cpu_usage = tm_clamp(sum / n, 0, 100);
+    }
+    // kernel time no task row owns: its own System row, so the kernel reports
+    // its own usage next to the service tasks. (satoru)
+    {
+        static uint64_t prev_kms = 0;
+        uint64_t kms = hal_kernel_cpu_ms();
+        uint64_t d = kms >= prev_kms ? kms - prev_kms : 0;
+        int kpct = 0;
+        if(fresh && g_tm_cpu_samples_ready && elapsed_ms > 0 && g_core_n > 0){
+            uint64_t pct = (d * 100ull) / ((uint64_t)elapsed_ms * (uint64_t)g_core_n);
+            kpct = tm_clamp((int)pct, 0, 100);
+        }
+        if(fresh) prev_kms = kms;
+        if(proc_count < TM_MAX_PROCS-1){
+            TMProcess* p = &procs[proc_count++];
+            scpy(p->name, "Kernel (unowned)", 32);
+            p->pid = 0; p->cpu_pct = kpct; p->mem_kb = 0; p->shared_kb = 0; p->threads = 0;
+            scpy(p->state, kpct > 0 ? "RUNNING" : "IDLE", 12);
+            scpy(p->user, "kernel", 16);
+            p->priority = 0; p->io_read_kb = 0; p->io_write_kb = 0; p->flags = 0;
+            p->source_kind = TM_PROC_SYNTH;
+            p->stack_kb = 0; p->stack_cap_kb = 0;
+            p->cpu_ms_total = (uint32_t)(kms > 0xFFFFFFFFull ? 0xFFFFFFFFu : kms);
+            p->stack_grow_count = 0; p->prio_tier = 0; p->is_kernel_proc = true;
+            p->icon = TM_ICON_GENERIC; p->group = 1;
+        }
+    }
+    // per-cpu history for the performance graphs. (satoru)
+    if(fresh){
+        for(int c=0;c<g_core_n && c<32;c++) g_core_hist[c][g_core_hist_idx % 60] = g_core_pct[c];
+        g_core_hist_idx++;
     }
     // disk + network rates (kb/s) from the real nvme / nic byte counters (satoru)
     {
@@ -1531,6 +1742,7 @@ void TaskManagerApp::RefreshProcesses(){
             p->source_kind = TM_PROC_SYNTH;
             p->stack_kb = 0; p->stack_cap_kb = 0; p->cpu_ms_total = 0; p->stack_grow_count = 0;
             p->prio_tier = 0; p->is_kernel_proc = true;
+            p->icon = TM_ICON_GENERIC; p->group = 1;
         }
         SortProcesses();
     }
@@ -1545,7 +1757,15 @@ void TaskManagerApp::RefreshProcesses(){
     if(hist_idx == 0){ for(int i=1;i<60;i++) mem_history[i] = mem_history[0]; }   // no fake ramp from zero (satoru)
     hist_idx++;
 
-    if(selected_proc >= proc_count) selected_proc = proc_count - 1;
+    if(keep_pid != -2){
+        selected_proc = -1;
+        for(int i=0;i<proc_count;i++){
+            bool match = (keep_pid == 0) ? (procs[i].pid == 0 && scmp(procs[i].name, keep_name) == 0)
+                                         : (procs[i].pid == keep_pid);
+            if(match){ selected_proc = i; break; }
+        }
+    }
+    if(selected_proc >= proc_count) selected_proc = -1;
     if(selected_proc < -1) selected_proc = -1;
 }
 
@@ -1578,14 +1798,21 @@ void TaskManagerApp::RefreshWindows(){
 
 void TaskManagerApp::SortProcesses(){
     // simple bubble sort
+    // apps first, then the system services; the chosen column orders each
+    // group, so the two blocks stay readable while cpu still sorts hottest
+    // first inside them. (satoru)
     for(int i=0;i<proc_count-1;i++){
         for(int j=0;j<proc_count-1-i;j++){
             bool swap=false;
-            switch(sort_col){
-                case TM_SORT_NAME: swap = (scmp(procs[j].name,procs[j+1].name) > 0) != sort_asc; break;
-                case TM_SORT_PID:  swap = (procs[j].pid > procs[j+1].pid) != sort_asc; break;
-                case TM_SORT_CPU:  swap = (procs[j].cpu_pct < procs[j+1].cpu_pct) != sort_asc; break;
-                case TM_SORT_MEM:  swap = (procs[j].mem_kb < procs[j+1].mem_kb) != sort_asc; break;
+            if(procs[j].group != procs[j+1].group){
+                swap = procs[j].group > procs[j+1].group;
+            } else {
+                switch(sort_col){
+                    case TM_SORT_NAME: swap = (scmp(procs[j].name,procs[j+1].name) > 0) != sort_asc; break;
+                    case TM_SORT_PID:  swap = (procs[j].pid > procs[j+1].pid) != sort_asc; break;
+                    case TM_SORT_CPU:  swap = (procs[j].cpu_pct < procs[j+1].cpu_pct) != sort_asc; break;
+                    case TM_SORT_MEM:  swap = (procs[j].mem_kb < procs[j+1].mem_kb) != sort_asc; break;
+                }
             }
             if(swap){
                 TMProcess tmp = procs[j];
@@ -1600,7 +1827,7 @@ void TaskManagerApp::SortProcesses(){
 //  ---- modern redesign: tabs, smooth graphs, overview cards, grouped process list (satoru) ----
 
 // new column geometry for the grouped process list (content-relative x) (satoru)
-static const int NC_CHEV = 8, NC_PID = 34, NC_NAME = 92, NC_CPUBAR = 330, NC_CPUNUM = 402,
+static const int NC_ICON = 8, NC_CHEV = 28, NC_PID = 46, NC_NAME = 100, NC_CPUBAR = 330, NC_CPUNUM = 402,
                  NC_MEM = 462, NC_THR = 560, NC_STATE = 606;
 static const int SB_H = 30;     // bottom bar height (status text + End Task) (satoru)
 
@@ -1614,8 +1841,9 @@ static int tm_ease_x100(uint32_t key, int target_pct){
     // integer ease-out cubic over 350ms (this file is built without sse, so no
     // floats); re-marks the ui dirty only while a value is still moving (satoru)
     if(!tm_anim_on()) return target_pct * 100;
-    static int from[32], tgt[32], cur[32]; static uint32_t t0[32]; static bool seeded[32];
-    int i = key < 0x100u ? (int)(key & 15u) : 16 + (int)(key & 15u);
+    // 16 metric slots + 32 per-core slots: cores 16-19 had shared cores 0-3's (satoru)
+    static int from[48], tgt[48], cur[48]; static uint32_t t0[48]; static bool seeded[48];
+    int i = key < 0x100u ? (int)(key & 15u) : 16 + (int)(key & 31u);
     uint32_t now = kui::NowMs();
     if(!seeded[i]){ seeded[i] = true; from[i] = tgt[i] = cur[i] = target_pct * 100; t0[i] = now; }
     if(tgt[i] != target_pct * 100){ from[i] = cur[i]; tgt[i] = target_pct * 100; t0[i] = now; }
@@ -1640,10 +1868,21 @@ static void tm_toggle_expand(uint32_t pid){
     if(g_expanded_n < 8) g_expanded[g_expanded_n++] = pid;
 }
 
-// flat visible rows: each process, then its threads when expanded (satoru)
+// flat visible rows: group headers, each process, then its threads when
+// expanded. kind 0 process, 1 thread, 2 group header (idx = group). (satoru)
 static void tm_build_rows(const TMProcess* procs_, int proc_count_){
     g_row_count = 0;
+    int last_group = -1;
     for(int i=0;i<proc_count_ && g_row_count < TM_MAX_PROCS+190;i++){
+        if((int)procs_[i].group != last_group){
+            last_group = (int)procs_[i].group;
+            if(g_row_count < TM_MAX_PROCS+192){
+                g_rows[g_row_count].kind = 2;
+                g_rows[g_row_count].idx = (int16_t)last_group;
+                g_rows[g_row_count].proc = -1;
+                g_row_count++;
+            }
+        }
         g_rows[g_row_count].kind = 0; g_rows[g_row_count].idx = (int16_t)i; g_rows[g_row_count].proc = (int16_t)i; g_row_count++;
         if(procs_[i].threads > 1 && tm_is_expanded((uint32_t)procs_[i].pid)){
             for(int t=0;t<g_thread_count && g_row_count < TM_MAX_PROCS+190;t++){
@@ -1737,6 +1976,19 @@ void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
         const TMRow& rw = g_rows[i+scroll_offset];
         int ry=y+i*ROW_H;
         char num[12];
+        if(rw.kind == 2){
+            // group header: Apps first, then the System services. quiet, one
+            // accent bar and a count instead of a boxed table. (satoru)
+            bool sys = rw.idx == 1;
+            g_cv->FillRect(x, ry, w, ROW_H, TM_HEAD_BG);
+            g_cv->FillRoundedRect(x+NC_ICON, ry+7, 3, 9, 1, sys ? TM_DIM : TM_BLUE);
+            tm_ds(x+NC_ICON+10, ry+3, sys ? "System" : "Apps", sys ? TM_DIM : TM_BLUE);
+            int cnt = 0;
+            for(int k=0;k<proc_count;k++) if((int)procs[k].group == rw.idx) cnt++;
+            int_to_str(cnt, num, 12);
+            tm_ds(x+NC_ICON+10+slen(sys ? "System" : "Apps")*8+8, ry+3, num, TM_DIM);
+            continue;
+        }
         if(rw.kind == 1){
             // thread row: indented, dim, tree guide
             const TMThread& th = g_threads[rw.idx];
@@ -1755,6 +2007,9 @@ void TaskManagerApp::RenderProcessList(int x,int y,int w,int h){
         TMProcess* p=&procs[idx];
         if(idx==selected_proc) g_cv->RoundRect(x+4,ry,w-8,ROW_H,6,TM_SEL_BG,255);
         else if(i%2) g_cv->FillRect(x,ry,w,ROW_H,TM_ROW_ALT);
+        // the app tile makes a row readable at a glance; services get the same
+        // generic tile so the two groups stay visually even. (satoru)
+        g_cv->AppTile(p->icon, x+NC_ICON, ry+3, 16);
         if(p->threads > 1){
             // expand chevron
             bool ex = tm_is_expanded((uint32_t)p->pid);
@@ -1842,25 +2097,23 @@ void TaskManagerApp::RenderPerformance(int x,int y,int w,int h){
     }
     ly += 150 + gap;
 
-    // --- per-core load (real busy-tick counters per cpu) ---
+    // --- per-core load: real busy-tick counters per cpu, each with its own
+    // usage graph so every online cpu is visible, not only the bars. (satoru)
     {
         int rows = (g_core_n + 3) / 4;
-        int ch = 34 + rows * 24 + 6;
+        int ch = 34 + rows * 28 + 6;
         tm_card(x+pad, ly, w-2*pad, ch, "Cores", TM_CYAN);
         int cw4 = (w - 2*pad - 24) / 4;
         for(int c=0;c<g_core_n;c++){
             int cx = x + pad + 12 + (c % 4) * cw4;
-            int cy = ly + 34 + (c / 4) * 24;
+            int cy = ly + 34 + (c / 4) * 28;
             char lb[8]="C"; int_to_str(c, t, 16); sapp(lb, t, 8);
             tm_ds(cx, cy+2, lb, TM_DIM);
-            int bw_full = cw4 - 80;
-            g_cv->FillRoundedRect(cx+26, cy+5, bw_full, 8, 4, TM_GRAPH_BG);
             int e = tm_ease_x100(0x100u + (uint32_t)c, g_core_pct[c]);
-            int bw = (e * bw_full) / 10000; if(e > 0 && bw < 3) bw = 3;
-            unsigned int bc = e > 5000 ? TM_RED : (e > 2000 ? TM_ORANGE : TM_CYAN);
-            if(bw > 0) g_cv->FillRoundedRect(cx+26, cy+5, bw, 8, 4, bc);
             int_to_str(e/100, t, 16); sapp(t, "%", 16);
-            tm_ds(cx+30+bw_full, cy+2, t, TM_TEXT);
+            tm_ds(cx+22, cy+2, t, e > 5000 ? TM_RED : (e > 2000 ? TM_ORANGE : TM_TEXT));
+            int gw = cw4 - 92; if(gw < 40) gw = 40;
+            tm_graph(cx+70, cy+2, gw, 16, g_core_hist[c], g_core_hist_idx, 100, TM_CYAN, e);
         }
         ly += ch + gap;
     }

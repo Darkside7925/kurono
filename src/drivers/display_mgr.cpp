@@ -1,6 +1,7 @@
 //  kurono os - display resolution manager implementation
 //  detects display backend, provides unified resolution switching
 #include "display_mgr.h"
+#include "../kernel/kld_display.h"
 #include "bga.h"
 #include "graphics.h"
 #include "outputs.h"
@@ -203,6 +204,11 @@ bool DisplayManager::SetResolution(uint32_t width, uint32_t height, uint8_t bpp)
             break;
         case DISPLAY_BACKEND_VIRTIO_GPU:
             result = SetModeVirtIOGPU(width, height, bpp);
+            break;
+        case DISPLAY_BACKEND_KLD:
+            // queued to the container; the bridge re-creates the dumb buffer and
+            // applies the geometry when DISPLAY_DONE arrives. (satoru)
+            result = KldDisplay::RequestMode(width, height);
             break;
         default:
             return false;
@@ -564,6 +570,11 @@ const FramebufferInfo* DisplayManager::GetFramebuffer(int index) {
 }
 
 DisplayBackend DisplayManager::GetBackend() { return backend; }
+DisplayBackend DisplayManager::SetBackend(DisplayBackend b) {
+    DisplayBackend old = backend;
+    backend = b;
+    return old;
+}
 
 const char* DisplayManager::GetBackendName() {
     switch (backend) {

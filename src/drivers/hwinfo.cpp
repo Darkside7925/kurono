@@ -5,11 +5,13 @@
 #include "blockdev.h"
 #include "display_mgr.h"
 #include "../kernel/pci.h"
+#include "../kernel/kld_broker.h"   // serialized pci config reads (satoru)
 #include "../proc/smp.h"
 #include "../proc/scheduler.h"
 #include "../net/tcpip.h"
 #include "../fs/persist.h"
 #include "../kernel/kdf.h"
+#include "../kernel/kld_auto.h"   // KldAuto::TakesDevice: a device taken for a kld container is left alone (satoru)
 
 // see hwinfo.h. everything here only reads hardware state; nothing is
 // configured or written. (satoru)
@@ -107,20 +109,27 @@ namespace {
         SerialLogger::Log("\r\n");
     }
 
+    // every config read takes the kld broker's cf8/cfc lock: this scan runs
+    // from the disklog worker while a kld container may be probing, and the
+    // unlocked two-step port protocol corrupted both sides. (satoru)
+    uint32_t cfg32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
+        return KldBroker::CfgRead32Locked(bus, dev, fn, off);
+    }
+
     void dump_pci() {
         int n = 0;
         for (int bus = 0; bus < 256; bus++) {
             for (int dev = 0; dev < 32; dev++) {
-                uint8_t hdr0 = PCI::Read8((uint8_t)bus, (uint8_t)dev, 0, 0x0E);
+                uint8_t hdr0 = (uint8_t)(cfg32((uint8_t)bus, (uint8_t)dev, 0, 0x0C) >> 16);
                 int fns = (hdr0 & 0x80) ? 8 : 1;
                 for (int fn = 0; fn < fns; fn++) {
-                    uint16_t ven = PCI::GetVendor((uint8_t)bus, (uint8_t)dev, (uint8_t)fn);
+                    uint16_t ven = (uint16_t)cfg32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x00);
                     if (ven == 0xFFFF || ven == 0x0000) { if (fn == 0) break; continue; }
-                    uint16_t did = PCI::GetDevice((uint8_t)bus, (uint8_t)dev, (uint8_t)fn);
-                    uint32_t cc  = PCI::Read32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x08);
+                    uint16_t did = (uint16_t)(cfg32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x00) >> 16);
+                    uint32_t cc  = cfg32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x08);
                     uint8_t cls = (uint8_t)(cc >> 24), sub = (uint8_t)(cc >> 16), pif = (uint8_t)(cc >> 8);
-                    uint8_t hdr = PCI::Read8((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x0E) & 0x7F;
-                    uint16_t cmd = PCI::Read16((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x04);
+                    uint8_t hdr = (uint8_t)(cfg32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x0C) >> 16) & 0x7F;
+                    uint16_t cmd = (uint16_t)cfg32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, 0x04);
                     SerialLogger::Log("[hw] pci ");
                     log_hex((uint64_t)bus, 2); SerialLogger::Log(":"); log_hex((uint64_t)dev, 2);
                     SerialLogger::Log("."); log_hex((uint64_t)fn, 1);
@@ -131,13 +140,13 @@ namespace {
                     SerialLogger::Log("\r\n");
                     if (hdr == 0) {
                         for (int b = 0; b < 6; b++) {
-                            uint32_t lo = PCI::Read32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, (uint8_t)(0x10 + b * 4));
+                            uint32_t lo = cfg32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, (uint8_t)(0x10 + b * 4));
                             if (lo == 0) continue;
                             bool io = lo & 1;
                             bool is64 = !io && ((lo >> 1) & 3) == 2;
                             uint64_t addr = io ? (lo & ~3u) : (lo & ~0xFu);
                             if (is64 && b < 5) {
-                                uint32_t hi = PCI::Read32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, (uint8_t)(0x10 + (b + 1) * 4));
+                                uint32_t hi = cfg32((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, (uint8_t)(0x10 + (b + 1) * 4));
                                 addr |= (uint64_t)hi << 32;
                             }
                             SerialLogger::Log("[hw]      bar"); log_u((uint64_t)b);
@@ -272,13 +281,15 @@ namespace {
 
 void HwInfo::DumpIntelDisplay() {
     // find 8086:7d67 on the first few buses (the igpu is 00:02.0 on every client part) (satoru)
+    // config reads go through the kld broker lock, like dump_pci. (satoru)
     for (int bus = 0; bus < 4; bus++) {
         for (int dev = 0; dev < 32; dev++) {
-            uint32_t id = PCI::Read32((uint8_t)bus, (uint8_t)dev, 0, 0x00);
+            uint32_t id = cfg32((uint8_t)bus, (uint8_t)dev, 0, 0x00);
             if ((id & 0xFFFF) != 0x8086 || (id >> 16) != 0x7D67) continue;
-            uint32_t bar0 = PCI::Read32((uint8_t)bus, (uint8_t)dev, 0, 0x10);
-            uint32_t bar1 = PCI::Read32((uint8_t)bus, (uint8_t)dev, 0, 0x14);
-            uint16_t cmd = PCI::Read16((uint8_t)bus, (uint8_t)dev, 0, 0x04);
+            if (KldAuto::TakesDevice((uint8_t)bus, (uint8_t)dev, 0, 0x8086, 0x7D67)) continue;   // kld owns it (satoru)
+            uint32_t bar0 = cfg32((uint8_t)bus, (uint8_t)dev, 0, 0x10);
+            uint32_t bar1 = cfg32((uint8_t)bus, (uint8_t)dev, 0, 0x14);
+            uint16_t cmd = (uint16_t)cfg32((uint8_t)bus, (uint8_t)dev, 0, 0x04);
             SerialLogger::Log("[idisp] intel 8086:7d67 at "); log_u((uint64_t)bus);
             SerialLogger::Log(":"); log_u((uint64_t)dev); SerialLogger::Log(".0 cmd=0x"); log_hex(cmd, 4);
             if ((bar0 & 1) || ((bar0 >> 1) & 3) != 2) {
@@ -301,9 +312,14 @@ void HwInfo::DumpIntelDisplay() {
 
 void HwInfo::DumpAll() {
     SerialLogger::Log("[hw] ================ hardware inventory ================\r\n");
+    // the inventory is a long uart busy-wait (kplat: disklog held the bsp ~200 ms
+    // here): voluntary preemption points between sections. (satoru)
     dump_cpu();
+    Scheduler::CondResched();
     dump_pci();
+    Scheduler::CondResched();
     dump_ps2();
+    Scheduler::CondResched();
 
     static char buf[8192];
     buf[0] = 0; USB::DumpInfo(buf, sizeof(buf));            log_block("[hw] usb: ", buf);
@@ -312,6 +328,7 @@ void HwInfo::DumpAll() {
                                                : "[hw] usb hid input forwarding: OFF (usb kbd/mouse ignored)\r\n");
     buf[0] = 0; DisplayManager::DumpInfo(buf, sizeof(buf)); log_block("[hw] display: ", buf);
     DumpIntelDisplay();   // read-only intel display engine state (satoru)
+    Scheduler::CondResched();   // (satoru)
     for (int i = 0; i < BlockDev::Count(); i++) {
         buf[0] = 0; BlockDev::Describe(i, buf, 512);        log_block("[hw] disk: ", buf);
     }

@@ -31,10 +31,14 @@ public:
     // drop every active toast immediately. (satoru)
     static void Clear();
 
-    // focus / do-not-disturb gate: while on, new posts are dropped (a toast
-    // already on screen keeps its timer). the control center drives this. (satoru)
+    // focus / do-not-disturb gate: while on, new posts are held instead of
+    // shown (a toast already on screen keeps its timer). turning it off shows
+    // the most recent held ones again. the control center drives this. (satoru)
     static void SetDoNotDisturb(bool on);
     static bool DoNotDisturb();
+    // posts held since do not disturb was turned on (all of them, even past
+    // the replay buffer). (satoru)
+    static int  HeldCount();
 
     // number of currently-live toasts (for tests/diagnostics). (satoru)
     static int ActiveCount();

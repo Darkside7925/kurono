@@ -1,4 +1,5 @@
 #include "pmm.h"
+#include "kmap.h"   // KERNEL_DIRECT_BASE for kurono.directmap (satoru)
 #include "../drivers/serial.h"
 #include "../proc/smp.h"   // cpu index for the cross-core pmm lock (satoru)
 
@@ -41,14 +42,92 @@ static inline void hi_sub(uint64_t n) { g_hi_used = g_hi_used > n ? g_hi_used - 
 // stale tag; the census only counts frames whose used bit is set. (satoru)
 static uint32_t* g_site = nullptr;
 static bool      g_census_req = false;
+
+// kurono.directmap=1: AllocBytes returns KERNEL_DIRECT_BASE + phys once the
+// high-half map is installed by KernelVMM::InitDirectMap. AllocFrame and
+// AllocContiguous keep returning physical frame numbers. (satoru)
+static bool g_direct_req = false;
+static bool g_direct_on  = false;
+// kurono.ptaudit=1: paging-structure lifetime audit, see kernel/vmm.cpp. (satoru)
+static bool g_ptaudit = false;
+static bool g_pttrace = false;
+bool PMM::PtAudit() { return g_ptaudit; }
+bool PMM::PtTrace() { return g_pttrace; }
+static bool (*g_free_guard)(uint64_t phys, uint64_t ra) = nullptr;
+void PMM::SetFreeGuard(bool (*fn)(uint64_t phys, uint64_t ra)) { g_free_guard = fn; }
+static bool (*g_bulk_guard)(uint64_t phys) = nullptr;
+void PMM::SetBulkFreeGuard(bool (*fn)(uint64_t phys)) { g_bulk_guard = fn; }
+bool     PMM::DirectMapRequested() { return g_direct_req; }
+bool     PMM::DirectMapOn()        { return g_direct_on; }
+void     PMM::EnableDirectMap()    { if (g_direct_req) g_direct_on = true; }
+void*    PMM::PhysToVirt(uint64_t phys) {
+    return (void*)(uintptr_t)(g_direct_on ? KERNEL_DIRECT_BASE + phys : phys);
+}
+uint64_t PMM::VirtToPhys(uint64_t addr) {
+    if (g_direct_on && KernelDirectAddr(addr)) return addr - KERNEL_DIRECT_BASE;
+    return addr;
+}
+// the frame-ownership api takes a physical frame address, but kernel blocks
+// are handed out as direct-map pointers under kurono.directmap=1 and callers
+// routinely feed such a pointer (cast to u64) into RetainFrame/FreeFrame. an
+// address past ram top used to be ignored by RetainFrame, so a user mapping of
+// a kernel block never held its own reference and the unmap/quarantine path
+// dropped the block owner's. normalize once at every entry point. (satoru)
+static inline uint64_t frame_addr(uint64_t a) {
+    if (g_direct_on && KernelDirectAddr(a)) return a - KERNEL_DIRECT_BASE;
+    return a;
+}
 static inline void site_tag(uint64_t start, uint64_t count, void* ra) {
     if (!g_site) return;
     uint32_t v = (uint32_t)(uintptr_t)ra;
     for (uint64_t j = 0; j < count; j++) g_site[start + j] = v;
 }
 
-extern "C" uint8_t kernel_start;
-extern "C" uint8_t kernel_end;       // after .boot_tables - safe to place bitmap here
+extern "C" uint8_t kernel_start;       // link (virtual) range of the kernel (satoru)
+extern "C" uint8_t kernel_end;
+extern "C" uint8_t kernel_phys_start;  // where the loader put it (satoru)
+extern "C" uint8_t kernel_phys_end;
+extern "C" uint8_t kernel_boot_start;  // low stub + boot page tables + boot stack (satoru)
+extern "C" uint8_t kernel_boot_end;
+extern "C" uint8_t user_image_ceiling; // top of the fixed low user image window (satoru)
+
+static uint64_t g_image_lo = 0, g_image_hi = 0;
+static uint64_t g_image_full_hi = 0;       // virtual window top, fixed for the session (satoru)
+static bool     g_image_soft    = false;   // window released: allocators prefer other frames (satoru)
+static bool     g_window_keep   = false;   // kurono.window.keep=1: diagnose by keeping the boot reservation (satoru)
+static int      g_image_force   = 0;       // kurono.imgwin: 0 auto, 1 reserve, 2 demand (satoru)
+static uint64_t g_dump_lo = 0, g_dump_hi = 0;  // reserved panic minidump page (satoru)
+static uint64_t g_meta_lo = 0, g_meta_hi = 0;  // frame metadata (also inside the window on low ram) (satoru)
+static uint64_t g_fb_reserved_bytes = 0;   // mbi framebuffer span pinned in Init (accounting) (satoru)
+
+// the kernel ranges below are resident for the whole session and are read
+// through their identity addresses, so a user mapping over one of them would
+// redirect those reads. everything else inside the low window is fair game for
+// a fixed image once the window has been released. (satoru)
+static bool image_safe_phys(uint64_t pa) {
+    uint64_t bs = (uint64_t)&kernel_boot_start, be = (uint64_t)&kernel_boot_end;
+    uint64_t ks = (uint64_t)&kernel_phys_start, ke = (uint64_t)&kernel_phys_end;
+    if (pa >= bs && pa < be) return true;
+    if (pa >= ks && pa < ke) return true;
+    if (g_dump_hi && pa >= g_dump_lo && pa < g_dump_hi) return true;
+    return false;
+}
+
+// frames the boot window release must keep: the fixed kernel ranges above plus
+// the pmm's own metadata, which can land inside the window on a machine too
+// small to ever run a 300 mb image anyway. (satoru)
+static bool image_release_keep(uint64_t pa) {
+    if (image_safe_phys(pa)) return true;
+    if (g_meta_hi && pa >= g_meta_lo && pa < g_meta_hi) return true;
+    return false;
+}
+
+static inline bool frame_window_protected(uint64_t idx) {
+    if (!g_image_soft || !g_image_full_hi) return false;
+    uint64_t a = idx * PAGE_SIZE;
+    return a >= g_image_lo && a < g_image_full_hi;
+}
+
 
 // interrupt guard for the frame allocator. these mutators are re-entered
 // from the #pf stack-grow handler (Scheduler::TryGrowGuardPage -> AllocBytes),
@@ -120,26 +199,65 @@ static inline int ctz64(uint64_t v) {
 #endif
 }
 
+// qword range that covers the released image window (frame / 64). qwords fully
+// inside it can be skipped in one step instead of walking 64 protected bits
+// with interrupts off. (satoru)
+static inline uint64_t window_qword_lo() { return g_image_lo / (PAGE_SIZE * 64); }
+static inline uint64_t window_qword_hi() {
+    return (g_image_full_hi + PAGE_SIZE * 64 - 1) / (PAGE_SIZE * 64);
+}
+
 uint64_t PMM::FindFreeFrame() {
     uint64_t qwords = bitmap_size;
     if (qwords == 0) return ~0ULL;
 
     uint64_t start_q = search_hint / 64;
     if (start_q >= qwords) start_q = 0;
+    uint64_t win_qlo = 0, win_qhi = 0;
+    if (g_image_soft && g_image_full_hi) {
+        win_qlo = window_qword_lo();
+        win_qhi = window_qword_hi();
+        // do not start the search inside the reserved-for-images window: scan
+        // the range after it first and wrap; the window is still visited last
+        // as the fallback. (satoru)
+        if (start_q >= win_qlo && start_q < win_qhi) start_q = win_qhi % qwords;
+    }
 
+    // after the image window is released, ordinary kernel allocations prefer
+    // frames outside it so the low range stays available for a fixed-address
+    // image; if nothing outside is free the window is used as a fallback. the
+    // search order itself (next-fit from search_hint, wrapping once) is the
+    // same as before. (satoru)
+    uint64_t fallback = ~0ULL;
     for (uint64_t pass = 0; pass < qwords; pass++) {
         uint64_t qi = (start_q + pass) % qwords;
         uint64_t val = bitmap[qi];
         if (val == ~0ULL) continue;
 
-        // ~val: 1 = free. find lowest set bit.
+        if (g_image_soft && qi >= win_qlo && qi < win_qhi) {
+            // whole qword inside the window: remember its first free frame and
+            // move on without walking the other bits. (satoru)
+            if (fallback == ~0ULL) {
+                uint64_t f = qi * 64 + (uint64_t)ctz64(~val);
+                if (f < total_frames) fallback = f;
+            }
+            continue;
+        }
+
         uint64_t inv = ~val;
-        int bit = ctz64(inv);
-        uint64_t frame = qi * 64 + (uint64_t)bit;
-        if (frame >= total_frames) continue;
-        search_hint = frame + 1;
-        return frame;
+        while (inv) {
+            int bit = ctz64(inv);
+            uint64_t frame = qi * 64 + (uint64_t)bit;
+            if (frame >= total_frames) break;
+            if (!frame_window_protected(frame)) {
+                search_hint = frame + 1;
+                return frame;
+            }
+            if (fallback == ~0ULL) fallback = frame;
+            inv &= inv - 1;
+        }
     }
+    if (fallback != ~0ULL) { search_hint = fallback + 1; return fallback; }
     return ~0ULL;
 }
 
@@ -149,6 +267,7 @@ uint64_t PMM::FindFreeFrame() {
 // stack; both push through their own ptes into one page). set/cleared by the
 // vmm leaf writers; checked at alloc. (satoru)
 void PMM::MarkFrameMapped(uint64_t phys_addr, bool m) {
+    phys_addr = frame_addr(phys_addr);
     if (!mapped_bits) return;
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return;
@@ -156,6 +275,7 @@ void PMM::MarkFrameMapped(uint64_t phys_addr, bool m) {
     else   __atomic_fetch_and(&mapped_bits[idx >> 3], (uint8_t)~(1u << (idx & 7)), __ATOMIC_RELAXED);
 }
 bool PMM::IsFrameMapped(uint64_t phys_addr) {
+    phys_addr = frame_addr(phys_addr);
     if (!mapped_bits) return false;
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return false;
@@ -196,13 +316,14 @@ uint64_t PMM::AllocFrame() {
     site_tag(idx, 1, __builtin_return_address(0));
     uint64_t phys = idx * PAGE_SIZE;
     // zero-on-alloc: scrub the frame so we never hand out stale data.
-    uint64_t* p = (uint64_t*)(uintptr_t)phys;
+    uint64_t* p = (uint64_t*)PhysToVirt(phys);
     for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) p[i] = 0;
     return phys;
 }
 
 void PMM::RetainFrame(uint64_t phys_addr) {
     PmmIrqGuard _g;
+    phys_addr = frame_addr(phys_addr);
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return;
     if (!TestFrame(idx)) return;
@@ -211,13 +332,68 @@ void PMM::RetainFrame(uint64_t phys_addr) {
 }
 
 uint32_t PMM::GetFrameRefCount(uint64_t phys_addr) {
+    phys_addr = frame_addr(phys_addr);
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return 0;
     return refs[idx];
 }
 
+bool PMM::AllocFrameAt(uint64_t phys_addr) {
+    if (phys_addr & (PAGE_SIZE - 1)) return false;
+    PmmIrqGuard _g;
+    uint64_t idx = phys_addr / PAGE_SIZE;
+    if (idx >= total_frames) return false;
+    if (TestFrame(idx)) {
+        // in reserved mode the frame at the image va is already ours: it is a
+        // window reservation, not a real owner. hand it to the image page (the
+        // identity alias then IS the page) instead of failing the load. a frame
+        // with a live user pte belongs to someone else and is refused. (satoru)
+        bool window_owned = g_image_full_hi && !g_image_soft &&
+                            phys_addr >= g_image_lo && phys_addr < g_image_full_hi &&
+                            !image_release_keep(phys_addr) &&
+                            !(mapped_bits && ((mapped_bits[idx >> 3] >> (idx & 7)) & 1));
+        if (!window_owned) return false;
+        refs[idx] = 1;
+        uint64_t* p = (uint64_t*)PhysToVirt(phys_addr);
+        for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) p[i] = 0;
+        return true;
+    }
+    // a frame with a live user leaf pte is not free even if the bitmap says so
+    // (see AllocFrame's task 26 guard). (satoru)
+    if (mapped_bits && ((mapped_bits[idx >> 3] >> (idx & 7)) & 1)) return false;
+    SetFrame(idx);
+    refs[idx] = 1;
+    used_frames++;
+    hi_add(hi_count(idx, 1));
+    site_tag(idx, 1, __builtin_return_address(0));
+    uint64_t* p = (uint64_t*)PhysToVirt(phys_addr);
+    for (int i = 0; i < (int)(PAGE_SIZE / 8); i++) p[i] = 0;
+    return true;
+}
+
+// [ovfree] the frames behind the fixed user overlay windows (main stack,
+// ld-kurono trampoline; same table as g_overlay below) are reserved in Init and
+// never handed out, so nothing may ever free one: a freed one re-enters the
+// pool and can become a page table that every user address space shadows with
+// its main stack (the kernel then walks the stack page instead of the table).
+// logged with the caller; the free itself is unchanged. (satoru)
+static inline bool ov_reserved_frame(uint64_t phys) {
+    return (phys >= 0x3FA00000ULL && phys < 0x40200000ULL) ||
+           (phys >= 0x600000000ULL && phys < 0x600001000ULL);
+}
+static void ov_free_note(uint64_t phys, uint16_t r, uint64_t ra, int path) {
+    static volatile uint32_t s_ov = 0;
+    if (__atomic_fetch_add(&s_ov, 1, __ATOMIC_RELAXED) >= 16) return;
+    SerialLogger::Log("[ovfree] overlay frame freed phys=0x"); SerialLogger::LogHex64(phys);
+    SerialLogger::Log(" refs="); SerialLogger::LogDec((int)r);
+    SerialLogger::Log(path == 2 ? " bulk-imgwin" : path ? " bulk" : " single");
+    SerialLogger::Log(" ra=0x"); SerialLogger::LogHex64(ra);
+    SerialLogger::Log("\r\n");
+}
+
 void PMM::FreeFrame(uint64_t phys_addr) {
     PmmIrqGuard _g;
+    phys_addr = frame_addr(phys_addr);
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_frames) return;
     if (!TestFrame(idx)) return;  // double-free guard
@@ -227,6 +403,21 @@ void PMM::FreeFrame(uint64_t phys_addr) {
         return;
     }
 
+    // reserved mode: a fixed-image page comes out of the window reservation, so
+    // dropping it returns it to the reservation, not to the general pool. this
+    // keeps the next claude launch working after firefox grew across the range.
+    // (satoru)
+    if (g_image_full_hi && !g_image_soft && phys_addr >= g_image_lo &&
+        phys_addr < g_image_full_hi && !image_release_keep(phys_addr)) {
+        refs[idx] = 1;
+        return;
+    }
+
+    if (g_free_guard && g_free_guard(phys_addr,
+                                     (uint64_t)(uintptr_t)__builtin_return_address(0)))
+        return;   // audit refused: still a live paging structure. (satoru)
+    if (ov_reserved_frame(phys_addr))
+        ov_free_note(phys_addr, refs[idx], (uint64_t)(uintptr_t)__builtin_return_address(0), 0);   // [ovfree] (satoru)
     refs[idx] = 0;
     ClearFrame(idx);
     used_frames--;
@@ -293,45 +484,44 @@ static void bulk_clear_frames(uint64_t start, uint64_t count,
     }
 }
 
-uint64_t PMM::AllocContiguous(uint64_t count) {
-    if (count == 0) return 0;
-    if (count == 1) {
-        uint64_t f = AllocFrame();
-        if (f) site_tag(f / PAGE_SIZE, 1, __builtin_return_address(0));
-        return f;
-    }
+// one first-fit run scan. protect=true treats the released image window as
+// busy so the caller's block lands outside it; the algorithm and the search
+// order are unchanged, the window is just a reservation the scan honours.
+// (satoru)
+static uint64_t alloc_contig_scan(uint64_t count, bool protect) {
     PmmIrqGuard _g;   // atomic vs the #pf stack-grow path (the run-scan below mutates the bitmap directly) (satoru)
-    // overflow guard
-    if (count > total_frames) return 0;
-
-    uint64_t qwords = bitmap_size;
+    uint64_t qwords = PMM::GetBitmapQwords();
+    uint64_t win_qlo = 0, win_qhi = 0;
+    if (protect) { win_qlo = window_qword_lo(); win_qhi = window_qword_hi(); }
 
     uint64_t run_start = 0;
     uint64_t run_len   = 0;
 
     for (uint64_t qi = 0; qi < qwords; qi++) {
-        uint64_t val = bitmap[qi];
+        uint64_t val = PMM::GetBitmapQword(qi);
         if (val == ~0ULL) {
             run_start = (qi + 1) * 64;
             run_len = 0;
             continue;
         }
-        if (val == 0ULL) {
+        if (protect && qi >= win_qlo && qi < win_qhi) {
+            // the whole qword is image-window reservation: skip it without
+            // walking its 64 protected frames. (satoru)
+            run_start = (qi + 1) * 64;
+            run_len = 0;
+            continue;
+        }
+        if (val == 0ULL && !protect) {
             uint64_t frame_base = qi * 64;
             if (run_len == 0) run_start = frame_base;
             // cap the run to total_frames
             uint64_t add = 64;
-            if (frame_base + add > total_frames) add = total_frames - frame_base;
+            if (frame_base + add > PMM::GetTotalFrameCount()) add = PMM::GetTotalFrameCount() - frame_base;
             run_len += add;
             if (run_len >= count) {
-                bulk_set_frames(run_start, count, bitmap, used_frames, total_frames);
-                for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
-                if (run_start + count >= g_pmm_high_floor) search_hint = run_start + count;
-                hi_add(hi_count(run_start, count));
-                site_tag(run_start, count, __builtin_return_address(0));
+                PMM::CommitContiguous(run_start, count);
                 uint64_t phys = run_start * PAGE_SIZE;
-                // zero the entire region
-                uint64_t* zp = (uint64_t*)(uintptr_t)phys;
+                uint64_t* zp = (uint64_t*)PMM::PhysToVirt(phys);
                 uint64_t qcount = (count * PAGE_SIZE) / 8;
                 for (uint64_t z = 0; z < qcount; z++) zp[z] = 0;
                 return phys;
@@ -340,21 +530,19 @@ uint64_t PMM::AllocContiguous(uint64_t count) {
         }
         for (int bit = 0; bit < 64; bit++) {
             uint64_t fi = qi * 64 + (uint64_t)bit;
-            if (fi >= total_frames) break;
-            if (val & (1ULL << bit)) {
+            if (fi >= PMM::GetTotalFrameCount()) break;
+            bool busy = (val & (1ULL << bit)) != 0;
+            if (!busy && protect && frame_window_protected(fi)) busy = true;
+            if (busy) {
                 run_start = fi + 1;
                 run_len = 0;
             } else {
                 if (run_len == 0) run_start = fi;
                 run_len++;
                 if (run_len >= count) {
-                    bulk_set_frames(run_start, count, bitmap, used_frames, total_frames);
-                    for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
-                    if (run_start + count >= g_pmm_high_floor) search_hint = run_start + count;
-                    hi_add(hi_count(run_start, count));
-                    site_tag(run_start, count, __builtin_return_address(0));
+                    PMM::CommitContiguous(run_start, count);
                     uint64_t phys = run_start * PAGE_SIZE;
-                    uint64_t* zp = (uint64_t*)(uintptr_t)phys;
+                    uint64_t* zp = (uint64_t*)PMM::PhysToVirt(phys);
                     uint64_t qcount = (count * PAGE_SIZE) / 8;
                     for (uint64_t z = 0; z < qcount; z++) zp[z] = 0;
                     return phys;
@@ -362,15 +550,44 @@ uint64_t PMM::AllocContiguous(uint64_t count) {
             }
         }
     }
-    SerialLogger::Log("PMM: AllocContiguous failed (");
-    SerialLogger::LogDec((uint32_t)count);
-    SerialLogger::Log(" frames requested)\r\n");
     return 0;
 }
+
+uint64_t PMM::AllocContiguous(uint64_t count) {
+    if (count == 0) return 0;
+    if (count == 1) {
+        uint64_t f = AllocFrame();
+        if (f) site_tag(f / PAGE_SIZE, 1, __builtin_return_address(0));
+        return f;
+    }
+    if (count > total_frames) return 0;
+    bool protect = g_image_soft && g_image_full_hi != 0;
+    uint64_t phys = alloc_contig_scan(count, protect);
+    if (!phys && protect) phys = alloc_contig_scan(count, false);
+    if (!phys) {
+        SerialLogger::Log("PMM: AllocContiguous failed (");
+        SerialLogger::LogDec((uint32_t)count);
+        SerialLogger::Log(" frames requested)\r\n");
+    }
+    return phys;
+}
+
+void PMM::CommitContiguous(uint64_t run_start, uint64_t count) {
+    bulk_set_frames(run_start, count, bitmap, used_frames, total_frames);
+    for (uint64_t j = 0; j < count; j++) refs[run_start + j] = 1;
+    if (run_start + count >= g_pmm_high_floor) search_hint = run_start + count;
+    hi_add(hi_count(run_start, count));
+    site_tag(run_start, count, __builtin_return_address(0));
+}
+
+uint64_t PMM::GetBitmapQwords() { return bitmap_size; }
+uint64_t PMM::GetBitmapQword(uint64_t i) { return bitmap[i]; }
+uint64_t PMM::GetTotalFrameCount() { return total_frames; }
 
 void PMM::FreeContiguous(uint64_t phys_addr, uint64_t count) {
     if (!phys_addr || count == 0) return;
     PmmIrqGuard _g;
+    phys_addr = frame_addr(phys_addr);
     uint64_t start = phys_addr / PAGE_SIZE;
     if (start >= total_frames) return;
     if (count > total_frames - start) count = total_frames - start;
@@ -378,10 +595,17 @@ void PMM::FreeContiguous(uint64_t phys_addr, uint64_t count) {
     // fast path: if all frames have refcount == 1, do bulk clear
     bool fast = true;
     for (uint64_t j = 0; j < count; j++) {
+        if (g_bulk_guard && g_bulk_guard((start + j) * PAGE_SIZE)) { fast = false; break; }
         if (refs[start + j] != 1) { fast = false; break; }
         if (!TestFrame(start + j))  { fast = false; break; }
     }
     if (fast) {
+        if (ov_reserved_frame(start * PAGE_SIZE) || ov_reserved_frame((start + count - 1) * PAGE_SIZE) ||
+            (start * PAGE_SIZE < 0x3FA00000ULL && (start + count) * PAGE_SIZE > 0x40200000ULL))
+            ov_free_note(start * PAGE_SIZE, refs[start], (uint64_t)(uintptr_t)__builtin_return_address(0), 1);   // [ovfree] (satoru)
+        if (g_image_full_hi && !g_image_soft && start * PAGE_SIZE < g_image_full_hi &&
+            (start + count) * PAGE_SIZE > g_image_lo)
+            ov_free_note(start * PAGE_SIZE, refs[start], (uint64_t)(uintptr_t)__builtin_return_address(0), 2);   // [ovfree] reserved image window, bulk (satoru)
         for (uint64_t j = 0; j < count; j++) refs[start + j] = 0;
         bulk_clear_frames(start, count, bitmap, used_frames, total_frames);
         hi_sub(hi_count(start, count));
@@ -402,12 +626,12 @@ void* PMM::AllocBytes(size_t bytes) {
     if (!phys) return nullptr;
     site_tag(phys / PAGE_SIZE, pages, __builtin_return_address(0));
     // AllocContiguous already zeroed the region
-    return (void*)(uintptr_t)phys;
+    return PhysToVirt(phys);
 }
 
 void PMM::FreeBytes(void* addr, size_t bytes) {
     if (!addr || bytes == 0) return;
-    uint64_t phys = (uint64_t)(uintptr_t)addr;
+    uint64_t phys = VirtToPhys(addr);
     if (bytes > (size_t)-1 - (PAGE_SIZE - 1)) return;
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     FreeContiguous(phys, pages);
@@ -491,14 +715,119 @@ bool pmm_span_is_ram(uint64_t lo, uint64_t hi) {
 // fixed-address user image (claude at 0x200000, static musl at 0x400000). its
 // frames are reserved in Init, so a user page there shadows nothing the kernel
 // owns. empty with the classic low link (the kernel itself sits there). (satoru)
-static uint64_t g_image_lo = 0, g_image_hi = 0;
+bool PMM::ImageSafePhys(uint64_t pa) { return image_safe_phys(pa); }
+bool PMM::IsInImageWindow(uint64_t va) {
+    return g_image_full_hi && va >= g_image_lo && va < g_image_full_hi;
+}
+uint64_t PMM::ImageWindowHi() { return g_image_full_hi; }
+
+
+uint64_t PMM::GetReservedFramebufferBytes() { return g_fb_reserved_bytes; }
+// physical frames the low window currently costs: boot keeps the whole window
+// reserved, once released only the pages backing a running fixed image (and
+// the fixed kernel ranges inside it) are used. (satoru)
+uint64_t PMM::GetImageWindowBytes() {
+    if (!g_image_full_hi) return 0;
+    uint64_t n = 0;
+    PmmIrqGuard _g;
+    for (uint64_t addr = g_image_lo; addr < g_image_full_hi; addr += PAGE_SIZE) {
+        uint64_t idx = addr / PAGE_SIZE;
+        if (idx >= total_frames) break;
+        if (TestFrame(idx) && !image_release_keep(addr)) n++;
+    }
+    return n * PAGE_SIZE;
+}
+uint64_t PMM::GetOverlayBytes() {
+    uint64_t n = 0;
+    for (int i = 0; i < OVERLAY_COUNT; i++) n += g_overlay[i].hi - g_overlay[i].lo;
+    return n;
+}
+
+bool PMM::ImageWindowFullyReserved() {
+    return g_image_hi != 0 && g_image_hi >= g_image_full_hi;
+}
+
+// hand the whole fixed-image window back to the allocator once boot is done.
+// every frame in it is either the window's own reservation or one of the fixed
+// kernel ranges above, so nothing a live kernel object owns can be freed here.
+// after this the window costs no physical memory: pages become image backing
+// one at a time, when a fixed-address program is actually mapped. (satoru)
+uint64_t PMM::MinidumpSlot() {
+    if (g_dump_lo) return g_dump_lo;
+    // before Init ran: same cut-off Init uses for the slot.
+    return (total_frames * PAGE_SIZE) < (2ULL << 30) ? 0xF00000ULL : 0x14000000ULL;
+}
+
+bool PMM::ReleaseImageWindow() {
+    if (g_window_keep) return false;
+    if (!g_image_full_hi || g_image_soft) return true;
+    PmmIrqGuard _g;
+    for (uint64_t addr = g_image_lo; addr < g_image_full_hi; addr += PAGE_SIZE) {
+        uint64_t idx = addr / PAGE_SIZE;
+        if (idx >= total_frames) break;
+        if (!TestFrame(idx)) continue;
+        if (image_release_keep(addr)) continue;   // kernel image / boot stub / dump / metadata (satoru)
+        ClearFrame(idx);
+        if (used_frames) used_frames--;
+        if (idx < search_hint) search_hint = idx;
+    }
+    g_image_hi = g_image_lo;
+    g_image_soft = true;
+    return true;
+}
+
+// kept for the callers that only know the old keep_bytes form. the window is
+// no longer a fixed reservation, so the entire window is released. (satoru)
+bool PMM::ReleaseImageWindowAbove(uint64_t keep_bytes) {
+    (void)keep_bytes;
+    return ReleaseImageWindow();
+}
+
+// end-of-boot policy. a fixed-address image (claude) must always start on a big
+// machine, and by then firefox's heap may have grown across the low window. so
+// above ~1.75 gb of installed ram, when a CLAUDE image is present, keep the
+// whole window reserved exactly like the old layout (300 mb of 32 gb is
+// nothing) and let image pages take frames out of that reservation. below that,
+// or with no image installed, release it: pages are then claimed from the free
+// pool one at a time and a frame someone else owns is refused cleanly.
+// kurono.imgwin=reserve|demand forces either policy for testing. (satoru)
+// claude and opencode load at a fixed address and this window is the only reason they dont stomp the kernel. if claude stops launching after u changed this, put it back
+bool PMM::FinalizeImageWindow(bool claude_present) {
+    (void)claude_present;
+    if (g_window_keep) return true;
+    // default is RESERVED at every ram size. the window is pinned during boot
+    // anyway, and keeping it pinned means low images (static ET_EXECs, claude)
+    // can fork/COW and run several copies at once exactly like main. demand
+    // mode is only entered when explicitly requested (kurono.imgwin=demand)
+    // until the high-half direct map makes arbitrary-frame backing safe.
+    // below ~1.75 gb init only offers the first 64 mb, so the pinned cost is
+    // small there. (satoru)
+    if (g_image_force != 2) {
+        g_image_soft = false;
+        SerialLogger::Log("[pmm] user image window: reserved\r\n");
+        return true;
+    }
+    ReleaseImageWindow();
+    SerialLogger::Log("[pmm] user image window: demand-backed (forced)\r\n");
+    return false;
+}
+
+// a fixed-address image maps its pages one at a time now (see AllocFrameAt), so
+// there is no whole-window reservation to take back. report success as long as
+// the window was configured at all; a page whose identity frame is taken will
+// fail its own AllocFrameAt with a clear oom instead of corrupting anything. (satoru)
+bool PMM::TryReserveImageWindow() {
+    return true;
+}
 
 bool PMM::IsUserOverlayRange(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return true;
     for (int i = 0; i < OVERLAY_COUNT; i++) {
         if (lo >= g_overlay[i].lo && hi <= g_overlay[i].hi) return true;
     }
-    if (g_image_hi && lo >= g_image_lo && hi <= g_image_hi) return true;
+    // the whole virtual window stays legal for a fixed image even after the
+    // physical reservation was released. (satoru)
+    if (g_image_full_hi && lo >= g_image_lo && hi <= g_image_full_hi) return true;
     return false;
 }
 
@@ -527,40 +856,44 @@ bool PMM::CensusFrameUsed(uint64_t idx) {
     return idx < total_frames && TestFrame(idx);
 }
 
-uint64_t PMM::AllocContiguousBelow(uint64_t count, uint64_t max_phys) {
-    if (count == 0) return 0;
+static uint64_t alloc_contig_below_scan(uint64_t count, uint64_t limit, bool protect) {
     PmmIrqGuard _g;
-    uint64_t limit = max_phys / PAGE_SIZE;
-    if (limit > total_frames) limit = total_frames;
-    if (count > limit) return 0;
     uint64_t run_start = 0, run_len = 0;
     for (uint64_t f = 0; f < limit; f++) {
-        if ((f % 64) == 0 && bitmap[f / 64] == ~0ULL) { run_len = 0; f += 63; continue; }
+        if ((f % 64) == 0 && PMM::GetBitmapQword(f / 64) == ~0ULL) { run_len = 0; f += 63; continue; }
         // a free frame that still has a live user pte is treated as used, same
         // rule as AllocFrame's task 26 guard (it is not leaked here). (satoru)
-        bool busy = TestFrame(f) || (mapped_bits && ((mapped_bits[f >> 3] >> (f & 7)) & 1));
+        bool busy = PMM::IsFrameUsed((uint64_t)f * PAGE_SIZE) || PMM::IsFrameMapped((uint64_t)f * PAGE_SIZE);
+        if (!busy && protect && frame_window_protected(f)) busy = true;
         if (busy) { run_len = 0; continue; }
         if (run_len == 0) run_start = f;
         if (++run_len < count) continue;
-        for (uint64_t j = 0; j < count; j++) {
-            SetFrame(run_start + j);
-            refs[run_start + j] = 1;
-        }
-        used_frames += count;
-        hi_add(hi_count(run_start, count));
-        site_tag(run_start, count, __builtin_return_address(0));
+        PMM::CommitContiguous(run_start, count);
         uint64_t phys = run_start * PAGE_SIZE;
-        uint64_t* zp = (uint64_t*)(uintptr_t)phys;
+        uint64_t* zp = (uint64_t*)PMM::PhysToVirt(phys);
         uint64_t qcount = (count * PAGE_SIZE) / 8;
         for (uint64_t z = 0; z < qcount; z++) zp[z] = 0;
         return phys;
     }
-    SerialLogger::Log("PMM: AllocContiguousBelow failed (");
-    SerialLogger::LogDec((uint32_t)count);
-    SerialLogger::Log(" frames below 0x");
-    SerialLogger::LogHex64(max_phys);
-    SerialLogger::Log(")\r\n");
     return 0;
+}
+
+uint64_t PMM::AllocContiguousBelow(uint64_t count, uint64_t max_phys) {
+    if (count == 0) return 0;
+    uint64_t limit = max_phys / PAGE_SIZE;
+    if (limit > total_frames) limit = total_frames;
+    if (count > limit) return 0;
+    bool protect = g_image_soft && g_image_full_hi != 0;
+    uint64_t phys = alloc_contig_below_scan(count, limit, protect);
+    if (!phys && protect) phys = alloc_contig_below_scan(count, limit, false);
+    if (!phys) {
+        SerialLogger::Log("PMM: AllocContiguousBelow failed (");
+        SerialLogger::LogDec((uint32_t)count);
+        SerialLogger::Log(" frames below 0x");
+        SerialLogger::LogHex64(max_phys);
+        SerialLogger::Log(")\r\n");
+    }
+    return phys;
 }
 
 void* PMM::AllocBytesBelow(size_t bytes, uint64_t max_phys) {
@@ -569,7 +902,7 @@ void* PMM::AllocBytesBelow(size_t bytes, uint64_t max_phys) {
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t phys = AllocContiguousBelow(pages, max_phys);
     if (phys) site_tag(phys / PAGE_SIZE, pages, __builtin_return_address(0));
-    return phys ? (void*)(uintptr_t)phys : nullptr;
+    return phys ? PhysToVirt(phys) : nullptr;
 }
 
 // kurono.pmmtest=1: hand out every free frame through AllocFrame, chain them
@@ -590,7 +923,7 @@ static void pmm_self_test() {
     for (uint64_t i = 0; i < free0; i++) {
         uint64_t f = PMM::AllocFrame();
         if (!f) { bad++; break; }
-        uint64_t* p = (uint64_t*)(uintptr_t)f;
+        uint64_t* p = (uint64_t*)PMM::PhysToVirt(f);
         p[0] = head;
         for (int w = 1; w < 512; w++) p[w] = f ^ ((uint64_t)w * K);
         head = f; n++;
@@ -601,7 +934,7 @@ static void pmm_self_test() {
     uint64_t hi_ctr  = PMM::HighFramesInUse();
     uint64_t walked = 0, mism = 0;
     for (uint64_t cur = head; cur && walked <= n; walked++) {
-        const uint64_t* p = (const uint64_t*)(uintptr_t)cur;
+        const uint64_t* p = (const uint64_t*)PMM::PhysToVirt(cur);
         for (int w = 1; w < 512; w++) {
             if (p[w] != (cur ^ ((uint64_t)w * K))) {
                 if (mism < 4) {
@@ -645,6 +978,7 @@ static void pmm_self_test() {
     SerialLogger::Log(pass ? " PASS\r\n" : " FAIL\r\n");
 }
 
+// if u touch this and something crashes in firefox a week later, its this
 void PMM::Init(multiboot_info_t* mbi) {
     SerialLogger::Log("PMM: Initializing physical memory manager...\r\n");
 
@@ -664,6 +998,22 @@ void PMM::Init(multiboot_info_t* mbi) {
     }
     if (const char* v = pmm_find_token(cmdline, "kurono.pmmhigh=1")) {
         if (*v == 0 || *v == ' ' || *v == '\t') g_pmm_high_first = true;
+    }
+    if (const char* v = pmm_find_token(cmdline, "kurono.directmap=1")) {
+        if (*v == 0 || *v == ' ' || *v == '\t') g_direct_req = true;
+    }
+    if (const char* v = pmm_find_token(cmdline, "kurono.ptaudit=1")) {
+        if (*v == 0 || *v == ' ' || *v == '\t') g_ptaudit = true;
+    }
+    if (const char* v = pmm_find_token(cmdline, "kurono.pttrace=1")) {
+        if (*v == 0 || *v == ' ' || *v == '\t') g_pttrace = true;
+    }
+    if (const char* v = pmm_find_token(cmdline, "kurono.window.keep=1")) {
+        if (*v == 0 || *v == ' ' || *v == '\t') g_window_keep = true;
+    }
+    if (const char* v = pmm_find_token(cmdline, "kurono.imgwin=")) {
+        if (v[0] == 'r' && v[1] == 'e' && v[2] == 's') g_image_force = 1;
+        else if (v[0] == 'd' && v[1] == 'e' && v[2] == 'm') g_image_force = 2;
     }
     bool have_fb = (mbi->flags & (1 << 12)) && mbi->framebuffer_addr != 0;
     uint64_t fb_base = 0, fb_end = 0;
@@ -734,14 +1084,43 @@ void PMM::Init(multiboot_info_t* mbi) {
     // managed range, and clear of the kernel, the low 1 mb, the below-kernel user
     // image window, the overlay windows and the framebuffer. otherwise the
     // lowest usable span that is clear of all of those is used. (satoru)
-    uint64_t kern_start_phys = (uint64_t)&kernel_start;
-    uint64_t kern_end_phys   = (uint64_t)&kernel_end;
+    // the kernel image no longer lives at its link address: it is loaded low
+    // and the boot stub maps the link range onto it. reservations, metadata
+    // placement and the zero-on-alloc identity pointers all follow the PHYSICAL
+    // load range now; the link symbols are only used to describe the user
+    // visible image window. (satoru)
+    uint64_t boot_lo = (uint64_t)&kernel_boot_start;
+    uint64_t boot_hi = (uint64_t)&kernel_boot_end;
+    uint64_t kern_start_phys = (uint64_t)&kernel_phys_start;
+    uint64_t kern_end_phys   = (uint64_t)&kernel_phys_end;
+
+    // fixed user image window: everything below the old kernel link base is a
+    // legal va for a low et_exec. below ~1.75 gb only the first 64 mb is
+    // offered: a 300 mb fixed image cannot run there (its buffer plus its
+    // pages do not fit), and the smaller window keeps boot allocations out of
+    // the low static-binary range without reserving half of a small machine.
+    // from 1.75 gb up the whole range is offered, still virtual only. (satoru)
+    uint64_t win_hi = (uint64_t)&user_image_ceiling;
+    if (ram_top < (1792ULL << 20) && win_hi > 0x4000000ULL) win_hi = 0x4000000ULL;
+    if (win_hi <= 0x100000ULL) win_hi = 0;
+
+    // panic minidump slots: below 2 gb the image starts at 16 mb, so use 15 mb;
+    // above 2 gb use the top of the user image window, which is never mapped
+    // by a process and so a panic write there is safe under any cr3. both are
+    // reserved here so the allocator never hands them out. (satoru)
+    uint64_t dump_lo = (ram_top < (2ULL << 30)) ? 0xF00000ULL : win_hi;
+    uint64_t dump_hi = dump_lo ? dump_lo + 4 * PAGE_SIZE : 0;   // struct is ~4.6 kb (satoru)
+    g_dump_lo = dump_lo;
+    g_dump_hi = dump_hi;
+
     uint64_t first = (kern_end_phys + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     auto meta_ok = [&](uint64_t lo) -> bool {
         uint64_t hi = lo + meta_bytes;
         if (lo < 0x100000ULL || hi > max_addr || hi < lo) return false;
         if (span_overlaps(lo, hi, kern_start_phys & ~(PAGE_SIZE - 1), kern_end_phys)) return false;
-        if (kern_start_phys >= 0x4000000ULL && span_overlaps(lo, hi, 0x100000ULL, kern_start_phys)) return false;
+        if (span_overlaps(lo, hi, boot_lo, boot_hi)) return false;
+        if (dump_hi && span_overlaps(lo, hi, dump_lo, dump_hi)) return false;
+        if (win_hi && span_overlaps(lo, hi, 0x100000ULL, win_hi)) return false;
         for (int i = 0; i < OVERLAY_COUNT; i++)
             if (span_overlaps(lo, hi, g_overlay[i].lo, g_overlay[i].hi)) return false;
         if (have_fb && span_overlaps(lo, hi, fb_base, fb_end)) return false;
@@ -766,7 +1145,10 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
         for (int i = 0; i < OVERLAY_COUNT; i++) consider(g_overlay[i].hi);
         if (have_fb) consider(fb_end);
-        consider(kern_start_phys >= 0x4000000ULL ? first : 0x100000ULL);
+        if (dump_hi) consider(dump_hi);
+        if (win_hi) consider(win_hi);
+        consider(first);
+        consider(boot_hi);
         uint64_t pick = best_hi != ~0ULL ? best_hi : best_lo;
         if (pick != ~0ULL) {
             meta_base = pick;
@@ -778,6 +1160,8 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
     }
 
+    g_meta_lo = meta_base;
+    g_meta_hi = meta_base + meta_bytes;
     bitmap = (uint64_t*)(uintptr_t)meta_base;
     refs = (uint16_t*)(uintptr_t)(bitmap + bitmap_size);
 
@@ -877,6 +1261,26 @@ void PMM::Init(multiboot_info_t* mbi) {
         }
     }
 
+    // the low boot stub, its page tables and the boot stack are live for the
+    // whole session (the vmm walks the boot-built tables through their identity
+    // addresses). (satoru)
+    for (uint64_t addr = boot_lo & ~(PAGE_SIZE - 1); addr < boot_hi; addr += PAGE_SIZE) {
+        uint64_t idx = addr / PAGE_SIZE;
+        if (idx < total_frames && !TestFrame(idx)) {
+            SetFrame(idx);
+            used_frames++;
+        }
+    }
+    if (dump_hi && dump_lo < max_addr) {
+        for (uint64_t addr = dump_lo; addr < dump_hi && addr < max_addr; addr += PAGE_SIZE) {
+            uint64_t idx = addr / PAGE_SIZE;
+            if (idx < total_frames && !TestFrame(idx)) {
+                SetFrame(idx);
+                used_frames++;
+            }
+        }
+    }
+
     for (uint64_t addr = kern_start_phys & ~(PAGE_SIZE - 1);
          addr < kern_end_phys; addr += PAGE_SIZE) {
         uint64_t idx = addr / PAGE_SIZE;
@@ -898,14 +1302,13 @@ void PMM::Init(multiboot_info_t* mbi) {
     // enough for the static musl tools (busybox, recovery tools, ffmpeg at
     // 0x400000). item 8's map guard follows g_image_hi, so a user image past it is
     // refused instead of shadowing a frame the pmm hands out. (satoru)
-    if (kern_start_phys >= 0x4000000ULL) {
-        uint64_t win_hi = kern_start_phys & ~(PAGE_SIZE - 1);
-        if (g_installed_ram_bytes < (2ULL << 30) && win_hi > 0x4000000ULL) {
-            win_hi = 0x4000000ULL;
-            SerialLogger::Log("[pmm] under 2 gb: user image window 1..64 mb (full window needs 2 gb+)\r\n");
-        }
+    if (win_hi) {
+        SerialLogger::Log("[pmm] user image window 1 mb..0x");
+        SerialLogger::LogHex64(win_hi);
+        SerialLogger::Log(" virtual only, demand-backed after boot\r\n");
         g_image_lo = 0x100000;
         g_image_hi = win_hi;
+        g_image_full_hi = win_hi;   // virtual capacity for Release/TryReserve (satoru)
         for (uint64_t addr = 0x100000; addr < win_hi; addr += PAGE_SIZE) {
             uint64_t idx = addr / PAGE_SIZE;
             if (idx < total_frames && !TestFrame(idx)) {
@@ -954,6 +1357,7 @@ void PMM::Init(multiboot_info_t* mbi) {
     }
 
     if (have_fb) {
+        g_fb_reserved_bytes = (fb_end - fb_base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
         for (uint64_t addr = fb_base; addr < fb_end; addr += PAGE_SIZE) {
             uint64_t idx = addr / PAGE_SIZE;
             if (idx < total_frames && !TestFrame(idx)) {
@@ -992,7 +1396,7 @@ void PMM::Init(multiboot_info_t* mbi) {
         uint64_t bytes = total_frames * sizeof(uint32_t);
         uint64_t phys = AllocContiguous((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
         if (phys) {
-            g_site = (uint32_t*)(uintptr_t)phys;   // zeroed by AllocContiguous (satoru)
+            g_site = (uint32_t*)PMM::PhysToVirt(phys);   // zeroed by AllocContiguous (satoru)
             SerialLogger::Log("[memcensus] site tags on, kb=");
             SerialLogger::LogDec((uint32_t)(bytes >> 10));
             SerialLogger::Log("\r\n");

@@ -1,0 +1,12 @@
+# drmcirrus family properties, read by kld/tools/gen_match_table.sh and baked
+# into the generated match table the kernel embeds. (satoru)
+name drmcirrus
+# cirrus keeps its registers and vram in BAR0; there is no MSI-X table at all,
+# so the dangerous-page exception does not apply. (satoru)
+needs_msix_table_page 0
+# this family drives a display adapter through the kld bridge. (satoru)
+display 1
+# this family may use the legacy VGA ports (0x3b0..0x3df) through the broker,
+# but only when its granted display device owns legacy VGA decoding. (satoru)
+legacy_vga 1
+# end (satoru)

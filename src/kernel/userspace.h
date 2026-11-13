@@ -45,8 +45,29 @@ extern "C" int UserspaceEnter(uint64_t rip, uint64_t rsp, UserspaceReturnContext
                               uint64_t fs_base);
 extern "C" void UserspaceResume(UserspaceReturnContext* ctx, int exit_code);
 
+// a program started with Userspace::SpawnDetached (no launcher frame). (satoru)
+struct DetachedHandle {
+    Process* proc = nullptr;
+    int      slot = -1;      // its LinuxProcess slot
+    uint32_t lpid = 0;
+    uint64_t as   = 0;
+    uint32_t kpid = 0;       // scheduler pid: liveness is checked by pid, never through proc (satoru)
+    int      exit_code = -1; // copied the first time DetachedAlive sees the leader Terminated (satoru)
+    bool     exit_known = false;
+};
+
 class Userspace {
 public:
+    // async ring-3 spawn (phase3 finding 1): start proc on the application processors
+    // and return at once. sched=2: any ap; old mode: pinned to one ap, never the bsp.
+    // CanSpawnDetached() says whether this boot can (apthreads + an ap online). the
+    // caller polls DetachedAlive and calls ReapDetached (kernel proc, sleeps) once the
+    // leader is dead or it wants the program gone. (satoru)
+    static bool CanSpawnDetached();
+    static int  SpawnDetached(Process* proc, const char* const* argv, const char* const* envp,
+                              uint32_t uid, uint32_t gid, DetachedHandle* h);
+    static bool DetachedAlive(DetachedHandle& h);
+    static int  ReapDetached(DetachedHandle& h);
     static void Init();
     static bool IsReady();
     static bool IsActive();

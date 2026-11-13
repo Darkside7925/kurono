@@ -35,3 +35,14 @@ bitmap and inode, around 36MB) live in the PMM on purpose, not here.
 
 - `src/kernel/pmm.cpp` where the pages come from
 - `src/kernel/memory_mgr.h` higher level memory declarations
+
+## Big blocks
+
+Allocations of 256 KB and up come straight from PMM frames. Each one is its own block with the
+normal header and footer, so `Realloc` and the census treat it like any other block. `Free`
+gives the frames back to the PMM. Up to 4096 big blocks can be live at once. When that table is
+full, the region heap takes the allocation.
+
+The region heap used to keep big blocks in its arenas. A growing kvfs file reallocates
+geometrically, and small long-lived blocks pinned every region, so the reserve kept climbing
+during long sessions. `kurono.heapdirect=0` keeps big blocks in the regions, the old way.

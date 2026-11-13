@@ -120,6 +120,7 @@ struct Process;
 #define LSYS_KCMP           312
 #define LSYS_USERFAULTFD    516
 #define LSYS_PIVOT_ROOT     519
+#define LSYS_SIGALTSTACK    520   // i386=186, x64=131 (satoru)
 #define LSYS_CHROOT          61
 #define LSYS_SETHOSTNAME     74
 #define LSYS_SETDOMAINNAME  121
@@ -167,6 +168,7 @@ struct Process;
 #define LSYS_PWRITEV2          609
 #define LSYS_SCHED_SETAFFINITY 610
 #define LSYS_SCHED_GETAFFINITY 611
+#define LSYS_GETCPU           8001
 #define LSYS_SCHED_SETATTR     612
 #define LSYS_SCHED_GETATTR     613
 #define LSYS_SCHED_SETPARAM    614
@@ -465,6 +467,8 @@ enum LinuxFdType {
     LFD_PTY_MASTER,  // /dev/ptmx - backend_fd = kpty pair index (satoru)
     LFD_DEVKEXEC,    // /dev/kexec - the terminal exec bridge, backend_fd = launcher slot + 1 (satoru)
     LFD_PTY_SLAVE,   // /dev/pts/N and a terminal's stdio - backend_fd = kpty pair index (satoru)
+    LFD_DRM,         // /dev/dri/cardN served by the drm container - backend_fd = kernel file id (kurono.kld.dri) (satoru)
+    LFD_DMABUF,      // a dma-buf (prime) fd - backend_fd = kernel dma-buf id (kurono.kld.dri) (satoru)
 };
 
 // memfd seal bits live alongside the LinuxFd so fcntl can interrogate.
@@ -539,9 +543,13 @@ public:
     // create a new linux process context
     static int  CreateProcess(const char* name, uint32_t uid, uint32_t gid);
     static void DestroyProcess(int pid_idx);
+    // record the argv vector for /proc/<pid>/cmdline. kernel copies it; pass
+    // nullptr for an empty cmdline (a kernel task). (satoru)
+    static void SetProcessCmdline(int pid_idx, const char* const* argv);
     // free slots of terminated + reaped tasks (killed groups never exit). (satoru)
     static int  ReapDeadSlots();
     static LinuxProcess* GetProcess(int pid_idx);
+    static int SlotOf(const LinuxProcess* p);   // table slot of a record, -1 if none (satoru)
     static void PostSignalIdx(int pid_idx, int sig);   // set a pending signal (task manager foreground end-task) (satoru)
     static LinuxProcess* Current();
     static int  GetCurrentIndex();
@@ -558,6 +566,11 @@ public:
     // that walk the same table. never sleep while holding it. (satoru)
     // kurono.klsprof=1: per-syscall kls hold/contention profile, [klsprof] every 10 s. (satoru)
     static void SetKlsProf(bool on);
+    static bool KlsProfOn();   // kurono.klsprof=1 is on (the [guihold] probe reads it) (satoru)
+    static void SetWritePrefetch(bool on);   // kurono.wrprefetch=0 reverts (satoru)
+    static void SetReadUnlock(bool on);      // kurono.rdunlock=0 reverts (satoru)
+    static void SetMmapPrefetch(bool on);   // kurono.mmapprefetch=0: lazy-file mmap reads under the kls again (satoru)
+    static void SetMmapPrefetchVerify(bool on);   // test only: compare every prefetched page with an inline read (satoru)
     static void SetKlsGlobal(bool on);    // kurono.kls=global: no kls elision, the old single lock (a/b) (satoru)
     static void SetSchedTrace(bool on);   // kurono.schedtrace=1 [stasks]/[swait] dumps (satoru)
     // sched=2: a parked waiter whose whole fd set is producer-woken gets a long timer
@@ -572,6 +585,13 @@ public:
     // prompt. returns the depth released so it can be restored exactly. used
     // only from the admin gate, which runs inside a syscall body. (satoru)
     static int  KlsDropAll();
+    // kurono.kld.dri: helpers for src/linux/dri_dev.cpp, defined at the end of linux_syscall.cpp (satoru)
+    static bool DriUserOk(LinuxProcess* p, uint64_t ptr, uint64_t len, bool write);
+    static bool DriFatalPending(LinuxProcess* p);
+    static int64_t DriPark(uint32_t slot, bool (*ready)(uint32_t));
+    static int64_t MapForeignFrames(Process* task, uint64_t addr, uint64_t len, uint32_t prot,
+                                    uint32_t flags, const uint64_t* frames, uint64_t n);
+    static bool KlsHeldHere();   // this cpu holds kls (Scheduler::CondResched must not switch then) (satoru)
     static void KlsRestore(int depth);
     // sched=2: release the LinuxProcess records of a dead group's members that
     // never ran their own sys_exit (group kill, fault containment). caller holds
@@ -591,6 +611,7 @@ public:
     static void DumpUserFault(Process* task, uint64_t rip, uint64_t rsp, uint64_t cr2);
     // every thread of an address space: name, state, rip + stack, symbolized. (satoru)
     static void DumpThreadsSymbolized(uint64_t as, const char* why);
+    static void DumpAllUserThreads(const char* why);   // kurono.usnap=N, all address spaces (satoru)
 
     // real signal delivery, called by BOTH syscall entry paths (int 0x80 and the
     // x86_64 SYSCALL fast path) right before returning to ring-3. if a handled,
@@ -634,6 +655,8 @@ public:
     // an amd64 binary gets the struct it expects; the int 0x80 path keeps the
     // 32-bit layout via sys_stat/sys_fstat. (satoru)
     static int32_t sys_stat64(uintptr_t pathname, uintptr_t statbuf);
+    static int32_t sys_lstat64(uintptr_t pathname, uintptr_t statbuf);   // (satoru)
+    static const char* LinuxPathOfLinkTarget(const char* t, char* out, int mx);   // (satoru)
     static int32_t sys_fstat64(int fd, uintptr_t statbuf);
     static int32_t sys_fstatat64(int dirfd, uintptr_t pathname,
                                  uintptr_t statbuf, int flags);
@@ -646,6 +669,7 @@ public:
     // -profile path). writes up to bufsiz bytes (no nul); returns count or -errno.
     // (satoru)
     static int ReadlinkResolve(const char* path, char* buf, int bufsiz);
+    static int ReadlinkUser(const char* path, char* buf, int bufsiz);   // readlink(2) entry: dst checked before the copy (satoru)
 
     // readv (x86_64 nr 19) - the read counterpart of writev. there is no i386
     // dispatch entry for it, so the SYSCALL fast path (linux_syscall_x64.cpp)
@@ -658,16 +682,46 @@ public:
     // binary shows exactly which numbers it still needs. rate-limited so a busy
     // poll loop on a missing nr cannot flood COM1. (satoru)
     static void LogEnosys(uint64_t nr, const char* name);
-    // x64 sleep: correct 64-bit timespec semantics + a real deschedule (Blocked
-    // + sleep_ticks promotion, ap park). called from the x64 dispatcher (case
-    // 35/230); kls-exempt path only - see task 17. (satoru)
-    static int32_t SleepMs64(uint64_t ms);
+    // x64 sleep: correct 64-bit timespec semantics + a real deschedule (Blocked,
+    // wall-clock deadline, ap park). called from the x64 dispatcher (case 35/230);
+    // kls-exempt path only - see task 17. rem/rem_width carry the caller's
+    // remaining-time timespec (0/0 for TIMER_ABSTIME, 8 for an i386-style
+    // timespec, 16 for x86_64) and are written on a signal wake only. (satoru)
+    static int32_t SleepMs64(uint64_t ms, uintptr_t rem = 0, uint8_t rem_width = 0);
+    // timespec64_valid + saturating ms conversion shared with the x64 direct
+    // nanosleep cases. returns 0 or -EINVAL. (satoru)
+    static int TimespecToMs(int64_t sec, int64_t nsec, uint64_t* out_ms);
 
     // stats
     static int  ActiveProcessCount();
     static int  ActiveRegionCount(Process* p);   // inline + extension regions (item 10) (satoru)
     static void CensusCounts(int* recs_active, int* recs_exited,
                              int* shm_slots, uint64_t* shm_bytes);   // kurono.memcensus=1 (satoru)
+    // memfd reference kinds for the wl_shm leak census: slots/bytes pinned by an
+    // SCM_RIGHTS pass (the receiver holds the bare base) and slots that are only
+    // borrowed re-wraps of a sender's object. (satoru)
+    static void ShmKinds(int* pinned_slots, uint64_t* pinned_bytes, int* borrowed_slots);
+    // drop one SCM_RIGHTS pass pin (slot + the pass id captured at receive).
+    // releases only the object's own frame refs when it was the last pin;
+    // mapped frames and open fds keep theirs. kurono.wl.poolfree=1 path. (satoru)
+    static void ShmUnpinPin(uint32_t slot, uint32_t pin);
+    // kurono.vmatrace=1 L1 map instrumentation: mmap/munmap counters + size
+    // histograms, printed by the memcensus beside the page-table trace. (satoru)
+    static void SetMapTrace(bool on);
+    static void MapStatsDump();
+    // L2 mmap hole reuse (kurono.mmap.reuse=1, default off). (satoru)
+    static void SetMmapReuse(bool on);
+    static void SetGroupBump(bool on);     // kurono.mmap.groupbump=0 reverts (satoru)
+    static void SetCtidBelt(bool on);      // TEST-ONLY kurono.mmap.ctidbelt=0 (satoru)
+    static void SetMmapAudit(bool on);     // kurono.mmap.audit=1 (satoru)
+    static void MmapAuditDump();
+    static void SetMmapNoCtid(bool on);    // TEST-ONLY kurono.mmap.reuse.noctid=1 (satoru)
+    static void SetPoolFree(bool on);      // kurono.wl.poolfree=1: enables the pass unpin paths (satoru)
+    static uint32_t ShmUntracked();        // passes beyond the 16 tracked pin ids (satoru)
+    static void SetMmapNoFlush(bool on);   // TEST-ONLY kurono.mmap.reuse.noflush=1 (satoru)
+    static bool MmapReuseEnabled();
+    static void MmapReuseDump();
+    static bool MmapHoleSelfTest(uint64_t ops, uint64_t* done_out, uint64_t* fail_out);
 
     static bool HasConsoleOutput();
     static int  ReadConsoleOutput(char* buf, int max_len);

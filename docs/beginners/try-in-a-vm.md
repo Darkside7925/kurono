@@ -53,6 +53,8 @@ Notes from experience:
 - Kurono boots with 512 MB RAM. Give it 2 to 4 GB if you want Firefox or Alpine.
 - Alpine in the hypervisor needs VT-x. Inside a VM that means nested virtualization has
   to be on for the outer VM.
+- On a machine with 12 or more CPUs, Alpine gets up to four parallel vCPUs by itself.
+  `kurono.vm.smp=1` turns that off.
 
 ## The GRUB menu
 
@@ -67,7 +69,7 @@ To add a boot flag, press `e` on the entry in GRUB and append it to the `multibo
 All the flags are in `../developers/boot-flags.md`. Two you probably want:
 
 - `kurono.autologin=1` skip the login screen
-- `kurono.sched=2` use every CPU core
+- `kurono.maxcpus=2` use only two CPUs (the default is every CPU the firmware lists)
 
 ## Things to try
 
@@ -75,8 +77,11 @@ All the flags are in `../developers/boot-flags.md`. Two you probably want:
 - Super+V (clipboard history), Alt+Tab, Super+Left/Right (snap).
 - Open the control center from the menu bar tray.
 - Open the browser. It starts Firefox. The first launch downloads and installs it.
-- In the terminal, `help` lists commands. `ken <cmd>` runs something elevated and shows
+- In the terminal, `help` lists commands. `amdo <cmd>` runs something elevated and shows
   the approval prompt.
+- `opencode` and Claude Code need their files on the KURONO partition (see
+  `boot-on-hardware.md`). The `start.sh` data disk is an ext4 image, so it does not
+  carry those files.
 
 ## If something goes wrong
 

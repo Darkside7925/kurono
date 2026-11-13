@@ -34,7 +34,11 @@ namespace UnixSocket {
         UNIX_SOCK_SEQPACKET = 5,
     };
 
-    static const int UNIX_MAX_SOCKETS   = 64;
+    // the table starts at 64 slots and grows in chunks on demand up to this cap. (satoru)
+    static const int UNIX_MAX_SOCKETS   = 1024;
+    // per-sd request buffers of the small in-kernel services (kss, kin, kui launch)
+    // cover this many low slots; sds are handed out lowest-first. (satoru)
+    static const int UNIX_SVC_SLOTS     = 256;
     static const int UNIX_MAX_BACKLOG   = 16;
     static const int UNIX_RING_BYTES    = 65536;
     static const int UNIX_MAX_PASSED_FD = 32;
@@ -62,6 +66,10 @@ namespace UnixSocket {
         // directly - a raw client fd number is meaningless to the kernel. (satoru)
         uint64_t passed_shm_base[UNIX_MAX_PASSED_FD];
         uint64_t passed_shm_size[UNIX_MAX_PASSED_FD];
+        // the sender's memfd slot and the per-pass pin id: the receiver drops
+        // exactly this pass, never "the slot by base". (satoru)
+        uint32_t passed_shm_slot[UNIX_MAX_PASSED_FD];
+        uint32_t passed_shm_pin[UNIX_MAX_PASSED_FD];
         // when a passed fd is an AF_UNIX socket (firefox's e10s ipc channel sent
         // to the fork server via SCM_RIGHTS), the sender records its global socket
         // sd here so the receiver installs a real refcounted alias of the SAME

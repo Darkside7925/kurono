@@ -79,11 +79,27 @@ void lx_jiffies_update(void)
 // (satoru)
 #define LX_UDELAY_MULT 0x10c7ul
 
+void lx_cpu_relax_tick(void)
+{
+    // keep jiffies fresh inside cpu_relax/udelay busy loops without a syscall
+    // per iteration: refresh at most every ~200k cycles (tens of us). (satoru)
+    static u64 last;
+    u32 lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    u64 now = ((u64)hi << 32) | lo;
+    if (now - last > 200000ull) {
+        last = now;
+        lx_jiffies_update();
+    }
+}
+
 static void lx_busy_wait_ns(u64 ns)
 {
     u64 end = lx_uptime_ns() + ns;
-    while (lx_uptime_ns() < end)
+    while (lx_uptime_ns() < end) {
+        lx_cpu_relax_tick();
         __asm__ __volatile__("pause" ::: "memory");
+    }
 }
 
 void __const_udelay(unsigned long xloops)
@@ -111,23 +127,47 @@ void __ndelay(unsigned long nsecs)
 // asked for usleep_range(50, 100) after poking a register must not get 0 us,
 // so: sleep the whole milliseconds, then yield-spin out the remainder against
 // the clock. Never shorter than asked. (satoru)
+static u64 g_lx_spin_max_ns;
+u64 lx_time_spin_max_ns(void) { return g_lx_spin_max_ns; }
+
 static void lx_nanosleep_ns(u64 ns)
 {
     u64 end = lx_uptime_ns() + ns;
-    if (ns >= 1000000ull) {
-        struct lx_timespec req;
-        long ret;
-        u64 ms_part = ns - (ns % 1000000ull);
-        req.tv_sec  = (long)(ms_part / 1000000000ull);
-        req.tv_nsec = (long)(ms_part % 1000000000ull);
-        __asm__ __volatile__("syscall"
-                             : "=a"(ret)
-                             : "a"(35L) /* SYS_nanosleep */, "D"(&req), "S"(0L)
-                             : "rcx", "r11", "memory");
-        (void)ret;
+    for (;;) {
+        u64 now = lx_uptime_ns();
+        if (now >= end)
+            break;
+        u64 rem = end - now;
+        if (rem >= 1000000ull) {
+            // Sleep in <=1 s chunks: the kernel's x64 nanosleep truncates and
+            // caps around 5 s, and a long yield-spin is a real CPU bug. Only
+            // the final sub-millisecond tail is spun. (satoru)
+            u64 chunk = rem > 1000000000ull ? 1000000000ull : rem;
+            u64 ms_part = chunk - (chunk % 1000000ull);
+            struct lx_timespec req;
+            long ret;
+            req.tv_sec  = (long)(ms_part / 1000000000ull);
+            req.tv_nsec = (long)(ms_part % 1000000000ull);
+            __asm__ __volatile__("syscall"
+                                 : "=a"(ret)
+                                 : "a"(35L) /* SYS_nanosleep */, "D"(&req), "S"(0L)
+                                 : "rcx", "r11", "memory");
+            (void)ret;
+        } else {
+            // sub-millisecond remainder: BLOCK for one poll tick instead of a
+            // yield-spin. a yield loop here burns the shared app cpu and
+            // starves the very threads a driver sleep is waiting for (N2); the
+            // oversleep is bounded by the 1 ms poll tick and never returns
+            // early. (satoru)
+            u64 spin0 = lx_uptime_ns();
+            lx_os_idle_ms(1);
+            u64 spun = lx_uptime_ns() - spin0;
+            if (spun > g_lx_spin_max_ns)
+                g_lx_spin_max_ns = spun;
+            break;
+        }
     }
-    while (lx_uptime_ns() < end)
-        lx_os_yield();
+    lx_jiffies_update();
 }
 
 void msleep(unsigned int msecs)
@@ -170,6 +210,16 @@ void ktime_get_real_ts64(struct timespec64 *ts)
     ktime_get_ts64(ts);
 }
 
+time64_t ktime_get_seconds(void)
+{
+    return (time64_t)(lx_uptime_ns() / 1000000000ull);
+}
+
+time64_t ktime_get_real_seconds(void)
+{
+    return ktime_get_seconds();
+}
+
 ktime_t ktime_get_with_offset(enum tk_offsets offs)
 {
     (void)offs;
@@ -192,6 +242,34 @@ struct timespec64 ns_to_timespec64(s64 nsec)
 unsigned long round_jiffies(unsigned long j)
 {
     return j;   // rounding is a power-saving hint, not semantics
+}
+
+unsigned long round_jiffies_up(unsigned long j)
+{
+    unsigned long r = j % HZ;
+    return r ? j + (HZ - r) : j;
+}
+
+unsigned long round_jiffies_relative(unsigned long j)
+{
+    unsigned long now = jiffies;
+    return round_jiffies(now + j) - now;
+}
+
+ktime_t ktime_get(void)
+{
+    return (ktime_t)lx_uptime_ns();
+}
+
+u64 ktime_get_mono_fast_ns(void)
+{
+    return lx_uptime_ns();
+}
+
+ktime_t ktime_mono_to_any(ktime_t tmono, enum tk_offsets offs)
+{
+    (void)offs;
+    return tmono;
 }
 
 // ── timecounter (used by e1000e's PTP path) ─────────────────────────────────
@@ -233,6 +311,11 @@ int get_device_system_crosststamp(int (*get_time_fn)(ktime_t *, struct system_co
 
 // ── jiffies conversions (kernel/time/time.c) ────────────────────────────────
 // HZ is 1000 in the pinned config, so these are exact. (satoru)
+unsigned int jiffies_to_msecs(const unsigned long j)
+{
+    return (unsigned int)(j * (MSEC_PER_SEC / HZ));
+}
+
 unsigned int jiffies_to_usecs(const unsigned long j)
 {
     return (unsigned int)(j * (USEC_PER_SEC / HZ));

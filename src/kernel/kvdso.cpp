@@ -28,7 +28,11 @@ void Init() {
     void* pg = PMM::AllocBytes(PAGE_SIZE);
     if (!pg) return;
     memset(pg, 0, PAGE_SIZE);
-    g_phys = (uint64_t)(uintptr_t)pg;   // low ram is identity-mapped: ptr == phys (satoru)
+    // g_page keeps the direct-map pointer the clock writes go through; g_phys
+    // must be the frame number even when AllocBytes returns a direct-map
+    // address, or RetainFrame ignores it and the first process teardown frees
+    // the global clock page while Tick keeps writing into whoever reuses it. (satoru)
+    g_phys = PMM::VirtToPhys(pg);
     g_page = (VdsoTime*)pg;
     PMM::RetainFrame(g_phys);   // one permanent extra reference: process teardown must never free it (satoru)
     Tick();

@@ -64,10 +64,35 @@ constexpr uint64_t TASK_SIZE      = USER_SPACE_TOP + 1;  // 0x0000_8000_0000_000
 //   [20:12]    pt   index  (9 bits)
 //   [11:0]     offset      (12 bits)
 
+extern bool g_kvmm_vmtrace;   // kurono.vmatrace=1 (hot-path checked inline) (satoru)
+
 class KernelVMM {
 public:
     // initialize: reads current cr3, makes it available for further mapping
     static void Init();
+    // build the high-half linear map of managed ram when kurono.directmap=1.
+    // call after pmm init and before the heap expands. returns true when the
+    // map is active. (satoru)
+    static bool InitDirectMap();
+
+    // deep-copy the live kernel page tables into ordinary pmm frames and load
+    // the copy into cr3. the boot stub's tables live inside the low boot
+    // segment, which a fixed-address user image may shadow; after this every
+    // table the kernel walks is outside that window. call once, early, before
+    // smp and before the pmm releases the image window. (satoru)
+    static void RelocateKernelRoot();
+    // make sure the kernel root itself is below 4 gb: the AP trampoline loads
+    // cr3 in 32-bit mode. deep-copies and switches if needed; returns the live
+    // root physical address. (satoru)
+    static uint64_t EnsureRootBelow4GB();
+    // set the write-combining pat attribute on the LIVE identity mapping of
+    // [phys, phys+bytes). handles 1 gb / 2 mb / 4 kb leaves and creates a 2 mb
+    // identity mapping in the live root where none exists (the old extra_pd
+    // bootstrap fallback). returns the number of 2 mb chunks handled. (satoru)
+    static uint64_t SetIdentityWriteCombining(uint64_t phys, size_t bytes);
+    // raw present entry that translates va in the live kernel root, plus the
+    // level's PS bit; 0 when absent. diagnostic for the wc proof. (satoru)
+    static uint64_t QueryRawEntry(uint64_t va, bool* huge);
 
     // create a fresh address space that shares the kernel mappings but has
     // an independent user region starting at USERSPACE_BASE.
@@ -76,6 +101,9 @@ public:
     static uint32_t CensusMarkUser(uint8_t* bits, uint64_t nframes, uint64_t* leaves,
                                    uint64_t* tables, uint64_t* created, uint64_t* destroyed);
     static void SetAddressSpaceDestroyHook(void (*hook)(uint64_t root));   // called first in DestroyAddressSpace (satoru)
+    // a second listener, so the kld display bridge can stamp its instance
+    // "address space dead" at the only point that really knows (satoru)
+    static void SetAddressSpaceDestroyHook2(void (*hook)(uint64_t root));
     static uint64_t CreateAddressSpace();
 
     // clone an existing address space, duplicating user-owned pages while
@@ -85,6 +113,26 @@ public:
     // destroy an address space created by CreateAddressSpace(), freeing
     // user-owned page tables and frames.
     static void DestroyAddressSpace(uint64_t root_pml4);
+
+    // ── kmemx lifecycle hooks ─────────────────────────────────────────────
+    // kmemx stores a compressed 4kb user page as a not-present leaf carrying
+    // PTE_KMEMX_COMPRESSED. the vmm owns every operation that can retire or
+    // move that leaf, so it reports those to the engine through these hooks;
+    // otherwise metadata would outlive its mapping (a later fork or drain
+    // could restore stale bytes over a reused va). all are optional. (satoru)
+    // a mapping over / unmap of a compressed leaf: the page is gone, drop the
+    // engine's copy (no decompression needed). (satoru)
+    typedef void (*KmemxForgetHook)(uint64_t root_pml4, uint64_t virt_addr);
+    // mprotect on a compressed leaf: keep the new permission bits in the
+    // metadata so the fault path restores the page with the current prot.
+    typedef void (*KmemxProtHook)(uint64_t root_pml4, uint64_t virt_addr,
+                                  uint64_t new_flags);
+    // fork is about to copy this address space: restore every compressed page
+    // first so the child inherits the contents, not an empty leaf. returns
+    // false if a page could not be restored (the fork is then refused). (satoru)
+    typedef bool (*KmemxPreCloneHook)(uint64_t source_root_pml4);
+    static void SetKmemxHooks(KmemxForgetHook forget, KmemxProtHook prot,
+                              KmemxPreCloneHook preclone);
 
     // map a single 4kb page: virt_addr → phys_addr with given flags.
     // allocates intermediate page tables from pmm as needed.
@@ -109,6 +157,21 @@ public:
     // the page is not currently mapped (caller can skip it - demand-zero will
     // map it on first touch with the updated region flags). does NOT flush the
     // tlb; the caller must InvalidatePage when root is the active cr3. (satoru)
+    static bool IsTableFrame(uint64_t phys);   // kurono.ptaudit (satoru)
+    static void PtHistory(uint64_t phys);      // kurono.pttrace (satoru)
+    // kurono.vmatrace=1 L1 page-table growth trace: the per-cpu map origin is
+    // read by VmTableNote when a user paging structure is allocated. (satoru)
+    enum VmOrigin { VMO_OTHER = 0, VMO_ANON, VMO_FD, VMO_FAULT, VMO_BRK, VMO_MREMAP, VMO_STACK, VMO_KIND };
+    static void SetVmTrace(bool on);
+    static inline bool VmTraceOn() { return g_kvmm_vmtrace; }
+    static void VmOriginSet(uint8_t o);
+    static uint8_t VmOriginGet();
+    static void VmTableNote(uint64_t virt_addr, int level);
+    static void VmTraceDump();
+    static void DebugWalkDump(uint64_t root, uint64_t va);   // [pfloop] (satoru)
+    static void PtQuarantineEvent(uint64_t phys, uint64_t caller);   // kurono.pttrace (satoru)
+    static void PtQuarantineRelease(uint64_t phys);   // debug, kurono.pttrace (satoru)
+    static void PtQuarantineDone(uint64_t phys);      // debug, kurono.pttrace (satoru)
     static bool ProtectPageInAddressSpace(uint64_t root_pml4, uint64_t virt_addr,
                                           uint64_t new_flags);
 
@@ -128,6 +191,7 @@ public:
 
     // switch the active CR3 to a different page-table root.
     static void ActivateAddressSpace(uint64_t root_pml4);
+    static void NoteCr3(uint64_t root);   // [asdead] (satoru)
 
     // flush tlb for a single page
     static void InvalidatePage(uint64_t virt_addr);

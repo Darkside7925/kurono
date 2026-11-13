@@ -153,6 +153,8 @@ public:
     // the memory-compression engine read/clear/restore a single guest page's ept
     // entry at the hypervisor level without exposing the private walker. (satoru)
     static uint64_t* KmemxLeafEntry(EPT_PML4* pml4, uint64_t guest_phys);
+    // clear the 4 kb leaves of a range (free page reporting); the caller invalidates (satoru)
+    static void UnmapRange(EPT_PML4* pml4, uint64_t guest_phys, uint64_t size);
 
 private:
     static GuestMemRegion regions[MAX_MEM_REGIONS];

@@ -10,11 +10,17 @@ the drivers.
 - `boot-flags.md` the `kurono.*` boot options and their defaults
 - `kui.md` the app toolkit and ring-3 apps
 
+## This is not the final version
+
+This is part 3 of the major update: the infrastructure and support work that comes before
+Kurono Kintsugi. Kintsugi is still upcoming. Some parts are held back because of bugs and
+issues, so treat the defaults here as the current state, not the finished one.
+
 ## Short version
 
 Bare metal x86_64. Starts from Multiboot2 or my EFI loader, brings up a framebuffer
 desktop, exposes a mixed shell, then layers a Linux ABI layer, a Wayland server, a
-security model (ken, KSA), a hypervisor and sandboxed Linux drivers (KLD) on top. Apps
+security model (amdo, KSA), a hypervisor and sandboxed Linux drivers (KLD) on top. Apps
 are moving out of the kernel into ring 3 through the kui toolkit.
 
 Broad project, but the top-level shape fits in your head once the routes are clear:
@@ -141,8 +147,8 @@ Broad project, but the top-level shape fits in your head once the routes are cle
 
 ### Security (`security/`)
 
-- `security/KEN.md` privilege system (Guest/User/Admin/Root/Sovereign roles)
-- `security/KSA.md` Kurono Secure Authorization (hypervisor-backed privilege prompts)
+- `security/KEN.md` privilege system (Guest/User/Admin/Root/Sovereign roles), the `amdo` command
+- `security/KSA.md` Kurono Secure Authorization (hypervisor-backed privilege prompts), including the switch in Settings
 
 ### Packages (`packages/`)
 
@@ -159,6 +165,7 @@ Broad project, but the top-level shape fits in your head once the routes are cle
 - `linux/KLS.md` Kurono Linux Shell (Trixie personality)
 - `linux/DUAL_BOOT.md` integrated Debian Linux boot
 - `linux/LINUX_NETBRIDGE.md` guest network bridge
+- `linux/OPENCODE.md` running OpenCode on the KURONO partition
 
 ### Virtualization (`virt/`)
 

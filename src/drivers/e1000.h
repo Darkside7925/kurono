@@ -159,8 +159,10 @@ private:
     // descriptor rings
     static E1000_RXDesc rx_descs[E1000_NUM_RX_DESC] __attribute__((aligned(16)));
     static E1000_TXDesc tx_descs[E1000_NUM_TX_DESC] __attribute__((aligned(16)));
-    static uint8_t rx_buffers[E1000_NUM_RX_DESC][E1000_RX_BUFFER_SIZE] __attribute__((aligned(16)));
-    static uint8_t tx_buffers[E1000_NUM_TX_DESC][E1000_TX_BUFFER_SIZE] __attribute__((aligned(16)));
+    // 512 kb of rx + 64 kb of tx buffers: allocated only when an e1000 is
+    // actually found (a machine driven by igc/kld/wifi keeps none of it). (satoru)
+    static uint8_t* rx_buffers;
+    static uint8_t* tx_buffers;
     
     static uint16_t rx_cur;        // current rx descriptor index
     static uint16_t tx_cur;        // current tx descriptor index

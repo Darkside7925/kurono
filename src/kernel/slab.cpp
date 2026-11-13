@@ -392,6 +392,15 @@ int Slab::DumpProcInfo(char* out, int max_len){
     return p;
 }
 
+// live object bytes across every cache: in_use_objs * object_size. the slab
+// pages themselves are in the buddy pool; this is the part handed to callers. (satoru)
+uint64_t Slab::InUseBytes(){
+    uint64_t n = 0;
+    for (int i = 0; i < cache_count; i++)
+        n += (uint64_t)caches[i].in_use_objs * caches[i].object_size;
+    return n;
+}
+
 int Slab::DumpInfo(char* out, int max_len){
     int p = 0;
     auto put = [&](const char* s){ while (*s && p < max_len-1) out[p++] = *s++; };

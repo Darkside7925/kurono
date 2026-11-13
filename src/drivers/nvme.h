@@ -112,6 +112,10 @@ public:
     static bool Read(uint64_t lba, uint32_t count, void* buffer);
     static bool Write(uint64_t lba, uint32_t count, const void* buffer);
     static bool Flush();
+    // panic path: queue locks are taken with a bounded wait and then taken over
+    // (their holder is the interrupted context or a halted cpu), and completion
+    // waits are short, so a panic flush can never hang the reboot. (satoru)
+    static void SetPanicIo(bool on);
 
     // bare-metal write guard. when on, every nvme write is refused unless it
     // falls entirely inside the one allowed lba window (the gpt partition named
@@ -128,6 +132,9 @@ public:
     static void SetWriteWindow2(uint64_t lba_lo, uint64_t lba_end);
     // third writable range: the running vm's disk image (ALPINE.IMG ...). (satoru)
     static void SetWriteWindow3(uint64_t lba_lo, uint64_t lba_end);
+    // fourth range: one kcrash record write at a time (DiskLog::WriteRootExtent), so
+    // it never touches the vm window. (satoru)
+    static void SetWriteWindow4(uint64_t lba_lo, uint64_t lba_end);
     static bool GetWriteWindow(uint64_t* lba_lo, uint64_t* lba_end);
     static uint64_t GuardDenied();
     // true while any read/write is in flight (the boot-log hook backs off). (satoru)

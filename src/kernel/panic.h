@@ -55,7 +55,11 @@ namespace StopCode {
 // address - no heap, no constructors. (satoru)
 namespace MiniDump {
     constexpr uint32_t MAGIC        = 0x4B44554Du;  // 'KDUM' (satoru)
-    constexpr uint64_t PHYS_ADDR    = 0x1000000ull; // 16 mb identity-mapped slot (satoru)
+    // the kernel image is loaded low now, so the dump cannot sit at 16 mb any
+    // more. below 2 gb the image starts at 16 mb and the slot is 15 mb; from
+    // 2 gb up it is the top of the fixed user image window (320 mb), which no
+    // process may map. the pmm picks and reserves the slot; ask it. (satoru)
+    uint64_t PhysAddr();
     constexpr uint32_t MAX_BYTES    = 512u * 1024u;  // hard cap on the dump region (satoru)
     constexpr uint32_t MSG_LEN      = 256u;          // panic message field width (satoru)
     constexpr uint32_t STACK_FRAMES = 32u;           // rbp-chain frames captured (satoru)
@@ -139,6 +143,19 @@ namespace KernelPanic {
     // returns false when no dump is present. safe to call early in boot once
     // KVFS::Init has run. (satoru)
     bool ScanCrashDumpAtBoot();
+
+    // recovery R9: the red ":(" screen (kscreen) is the default; the old
+    // panic screen comes back with kurono.panic.classic=1. (satoru)
+    void SetClassicScreen(bool on);
+    // true once a bugcheck started (an nmi then is the halt request). (satoru)
+    bool Panicking();
+    uint32_t PanicCpu();   // cpu index that started it (satoru)
+    // the stop code (panic.h StopCode) of the dump ScanCrashDumpAtBoot just
+    // recovered, 0xFFFFFFFF when there was none. (satoru)
+    uint32_t LastRecoveredStopCode();
+    // the framebuffer the panic and error screens draw into. false when none
+    // is known. (satoru)
+    bool GetFramebuffer(uint64_t* addr, uint32_t* pitch, uint32_t* width, uint32_t* height, uint8_t* bpp);
 }
 
 // convenience macros

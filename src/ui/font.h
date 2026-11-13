@@ -26,6 +26,12 @@ public:
     // the 8x16 pixel font, regardless of style.
     static int DrawPixel(int x, int y, float pxh, const char* s, uint32_t color);
     static void FlushCache();
+    // the compositor's text target: the 32 bpp buffer (null for any other
+    // depth, then BlendPixel draws) and the visible box, the active clip within
+    // the screen. glyphs outside it are skipped, the rest blended inline. the
+    // kernel registers it; without it text draws as before. (satoru)
+    typedef void (*TargetFn)(uint32_t** buf, size_t* pitch_px, int* x0, int* y0, int* x1, int* y1);
+    static void SetTarget(TargetFn fn);
 
 private:
     struct Glyph {

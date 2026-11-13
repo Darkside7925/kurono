@@ -8,6 +8,8 @@
 #include "../linux/kls.h"
 #include "../packages/pkgmgr.h"
 #include "../kernel/kmemx.h"
+#include "../system/kernel_slots.h"
+#include "../system/recovery_restart.h"
 
 using namespace SettingsUI;
 
@@ -56,6 +58,16 @@ static void system_build(){
             bool ok = PackageManager::SyncRepository();
             StrCpy(s_sync_msg, ok ? "Just now" : "Failed (no connection?)", 64);
         }
+    }
+    EndGroup();
+
+    // kurono versions (A/B) and recovery (platform 3a, R6). (satoru)
+    Group("Recovery", "Hold R at power-on to start Recovery at any time.");
+    {
+        static char slots[120];
+        KernelSlots::Describe(slots, (int)sizeof(slots));
+        Info("Kurono version", slots);
+        if(Button("Restart into Recovery", "Restart", BTN_SECONDARY)) RecoveryRestart();
     }
     EndGroup();
 

@@ -27,9 +27,11 @@
 #include <linux/if_ether.h>
 #include <linux/dynamic_queue_limits.h>
 #include <linux/rtnetlink.h>
+#include <linux/ethtool.h>
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <net/gro.h>
+#include <net/cfg80211.h>
 
 #include "lx_kshim.h"
 #include "lx_broker.h"
@@ -43,7 +45,8 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask, int flags, int no
         return NULL;
     memset(skb, 0, sizeof(*skb));
     size = SKB_DATA_ALIGN(size);
-    u8 *data = kmalloc(size + SKB_DATA_ALIGN(sizeof(struct skb_shared_info)), gfp_mask & ~__GFP_ZERO);
+    u8 *data = kmalloc(size + SKB_DATA_ALIGN(sizeof(struct skb_shared_info)),
+                       gfp_mask & ~__GFP_ZERO);
     if (!data) {
         kfree(skb);
         return NULL;
@@ -80,11 +83,16 @@ void sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb, enum skb_drop_reas
         lx_skb_free(skb);
 }
 
+// with CONFIG_TRACEPOINTS off, skbuff.h defines consume_skb as an inline that
+// calls kfree_skb(); only provide the out-of-line version when the tracepoint
+// header declares it. (satoru)
+#ifdef CONFIG_TRACEPOINTS
 void consume_skb(struct sk_buff *skb)
 {
     if (skb && skb_unref(skb))
         lx_skb_free(skb);
 }
+#endif
 
 void dev_kfree_skb_any_reason(struct sk_buff *skb, enum skb_drop_reason reason)
 {
@@ -229,13 +237,40 @@ int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 
 void *__pskb_pull_tail(struct sk_buff *skb, int delta)
 {
-    if (!skb->data_len)
+    if (delta <= 0)
         return skb_tail_pointer(skb);
-    // pulling paged data into the head: the supported drivers only ever see
-    // linear skbs from this shim's TX path, so this is reported, not faked.
-    lx_log("[lx_net] __pskb_pull_tail on a nonlinear skb: not supported, dropping\n");
-    (void)delta;
-    return NULL;
+    if (delta > (int)skb->data_len)
+        return NULL;
+    if (skb_tailroom(skb) < delta &&
+        pskb_expand_head(skb, 0, delta - skb_tailroom(skb), GFP_ATOMIC))
+        return NULL;
+
+    // copy the needed prefix out of the frag list into the linear tail. (satoru)
+    if (skb_copy_bits(skb, skb_headlen(skb), skb_tail_pointer(skb), delta))
+        return NULL;
+    skb->tail += delta;
+    skb->data_len -= delta;
+
+    struct skb_shared_info *sh = skb_shinfo(skb);
+    int left = delta;
+    int i = 0;
+    while (i < sh->nr_frags && left) {
+        skb_frag_t *f = &sh->frags[i];
+        int sz = skb_frag_size(f);
+        if (left >= sz) {
+            left -= sz;
+            put_page(skb_frag_page(f));
+            for (int j = i; j + 1 < sh->nr_frags; j++)
+                sh->frags[j] = sh->frags[j + 1];
+            sh->nr_frags--;
+        } else {
+            skb_frag_off_add(f, left);
+            skb_frag_size_sub(f, left);
+            left = 0;
+            i++;
+        }
+    }
+    return skb_tail_pointer(skb);
 }
 
 void skb_tstamp_tx(struct sk_buff *orig_skb, struct skb_shared_hwtstamps *hwtstamps)
@@ -262,39 +297,179 @@ struct sk_buff *napi_alloc_skb(struct napi_struct *napi, unsigned int len)
     return skb;
 }
 
-__be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)
-{
-    const struct ethhdr *eth;
-    skb->dev = dev;
-    skb_reset_mac_header(skb);
-    eth = (struct ethhdr *)skb->data;
-    skb_pull_inline(skb, ETH_HLEN);
-    if (unlikely(!ether_addr_equal_64bits(eth->h_dest, dev->dev_addr))) {
-        if (unlikely(is_multicast_ether_addr_64bits(eth->h_dest))) {
-            if (ether_addr_equal_64bits(eth->h_dest, dev->broadcast))
-                skb->pkt_type = PACKET_BROADCAST;
-            else
-                skb->pkt_type = PACKET_MULTICAST;
-        } else {
-            skb->pkt_type = PACKET_OTHERHOST;
-        }
-    }
-    if (likely(eth_proto_is_802_3(eth->h_proto)))
-        return eth->h_proto;
-    return htons(ETH_P_802_2);
-}
-
 // ── the bridge state ────────────────────────────────────────────────────────
 #define LX_MAX_NETDEV 2
 
 static struct net_device *lx_netdevs[LX_MAX_NETDEV];
 static int lx_netdev_count;
+static int lx_next_ifindex = 2;   // lo is 1 (satoru)
+
+// netdevice notifier chain. cfg80211 relies on NETDEV_REGISTER to attach a
+// wiphy to mac80211's wlan0, and on NETDEV_UNREGISTER for teardown. (satoru)
+#define LX_NETDEV_NOTIFIERS 16
+static struct notifier_block *g_netdev_notifiers[LX_NETDEV_NOTIFIERS];
+static int g_netdev_notifier_n;
+
+int register_netdevice_notifier(struct notifier_block *nb)
+{
+    if (!nb || g_netdev_notifier_n >= LX_NETDEV_NOTIFIERS)
+        return -ENOSPC;
+    g_netdev_notifiers[g_netdev_notifier_n++] = nb;
+    return 0;
+}
+
+int unregister_netdevice_notifier(struct notifier_block *nb)
+{
+    for (int i = 0; i < g_netdev_notifier_n; i++) {
+        if (g_netdev_notifiers[i] != nb)
+            continue;
+        for (int j = i; j + 1 < g_netdev_notifier_n; j++)
+            g_netdev_notifiers[j] = g_netdev_notifiers[j + 1];
+        g_netdev_notifier_n--;
+        return 0;
+    }
+    return -ENOENT;
+}
+
+// Linux passes a struct netdev_notifier_info, not the net_device pointer:
+// cfg80211's notifier does netdev_notifier_info_to_dev(ptr). passing dev
+// directly made it read dev->ieee80211_ptr from the wrong offset. (satoru)
+int call_netdevice_notifiers_info(unsigned long val, struct netdev_notifier_info *info)
+{
+    int ret = NOTIFY_DONE;
+    for (int i = 0; i < g_netdev_notifier_n; i++) {
+        struct notifier_block *nb = g_netdev_notifiers[i];
+        if (!nb || !nb->notifier_call)
+            continue;
+        int r = nb->notifier_call(nb, val, info);
+        if (r & NOTIFY_STOP_MASK)
+            return r;
+        if (r != NOTIFY_DONE)
+            ret = r;
+    }
+    return ret;
+}
+
+int call_netdevice_notifiers(unsigned long val, struct net_device *dev)
+{
+    struct netdev_notifier_info info = { .dev = dev };
+    return call_netdevice_notifiers_info(val, &info);
+}
+
+void __hw_addr_init(struct netdev_hw_addr_list *list)
+{
+    INIT_LIST_HEAD(&list->list);
+    list->count = 0;
+}
+
+void synchronize_net(void)
+{
+    // the shim's RCU grace periods are already deferred synchronously. (satoru)
+    synchronize_rcu();
+}
+
+// the shim keeps no secondary address lists; an empty sync/unsync is exact. (satoru)
+int __hw_addr_sync(struct netdev_hw_addr_list *to_list,
+                   struct netdev_hw_addr_list *from_list, int addr_len)
+{
+    (void)to_list; (void)from_list; (void)addr_len;
+    return 0;
+}
+
+void __hw_addr_unsync(struct netdev_hw_addr_list *to_list,
+                      struct netdev_hw_addr_list *from_list, int addr_len)
+{
+    (void)to_list; (void)from_list; (void)addr_len;
+}
+
+int __hw_addr_sync_dev(struct netdev_hw_addr_list *list, struct net_device *dev,
+                       int (*sync)(struct net_device *, const unsigned char *),
+                       int (*unsync)(struct net_device *, const unsigned char *))
+{
+    (void)list; (void)dev; (void)sync; (void)unsync;
+    return 0;
+}
+
+void __hw_addr_unsync_dev(struct netdev_hw_addr_list *list,
+                          struct net_device *dev,
+                          int (*unsync)(struct net_device *, const unsigned char *))
+{
+    (void)list; (void)dev; (void)unsync;
+}
+
+// inet address notifiers: stored, never fired in M2 (no interface up). (satoru)
+#define LX_INET_NOTIFIERS 8
+static struct notifier_block *g_inet_notifiers[LX_INET_NOTIFIERS];
+static int g_inet_notifier_n;
+static struct notifier_block *g_inet6_notifiers[LX_INET_NOTIFIERS];
+static int g_inet6_notifier_n;
+
+static int lx_notifier_add(struct notifier_block **tab, int *n, struct notifier_block *nb)
+{
+    if (!nb || *n >= LX_INET_NOTIFIERS)
+        return -ENOSPC;
+    tab[(*n)++] = nb;
+    return 0;
+}
+
+static int lx_notifier_del(struct notifier_block **tab, int *n, struct notifier_block *nb)
+{
+    for (int i = 0; i < *n; i++) {
+        if (tab[i] != nb)
+            continue;
+        for (int j = i; j + 1 < *n; j++)
+            tab[j] = tab[j + 1];
+        (*n)--;
+        return 0;
+    }
+    return -ENOENT;
+}
+
+int register_inetaddr_notifier(struct notifier_block *nb)
+{
+    return lx_notifier_add(g_inet_notifiers, &g_inet_notifier_n, nb);
+}
+int unregister_inetaddr_notifier(struct notifier_block *nb)
+{
+    return lx_notifier_del(g_inet_notifiers, &g_inet_notifier_n, nb);
+}
+int register_inet6addr_notifier(struct notifier_block *nb)
+{
+    return lx_notifier_add(g_inet6_notifiers, &g_inet6_notifier_n, nb);
+}
+int unregister_inet6addr_notifier(struct notifier_block *nb)
+{
+    return lx_notifier_del(g_inet6_notifiers, &g_inet6_notifier_n, nb);
+}
+
+int dev_alloc_name(struct net_device *dev, const char *name)
+{
+    static int next_index[8];
+    int slot = 0;
+    const char *pct = strchr(name, '%');
+    if (!pct) {
+        strscpy(dev->name, name, IFNAMSIZ);
+        return 0;
+    }
+    if (dev->name[0] == 0)
+        slot = (int)(pct - name) & 7;
+    int idx = next_index[slot]++;
+    char buf[IFNAMSIZ];
+    int n = (int)(pct - name);
+    if (n > IFNAMSIZ - 8) n = IFNAMSIZ - 8;
+    memcpy(buf, name, (size_t)n);
+    buf[n] = 0;
+    snprintf(dev->name, IFNAMSIZ, "%s%d", buf, idx);
+    return idx;
+}
 static struct lx_net_ring *lx_ring;
 static unsigned char *lx_ring_tx, *lx_ring_rx;
 static struct net_device *lx_bridged;
 static volatile int lx_rx_pending;
 static unsigned long lx_rx_frames, lx_rx_dropped, lx_tx_frames, lx_tx_busy;
 static volatile unsigned long lx_xmit_loops, lx_xmit_waits;   // heartbeat (satoru)
+static unsigned long lx_rx_batch_cur, lx_rx_batch_n, lx_rx_batch_sum, lx_rx_batch_max;
+static unsigned long lx_tx_batch_cur, lx_tx_batch_n, lx_tx_batch_sum, lx_tx_batch_max;
 
 static void lx_xmit_kick(void)
 {
@@ -306,6 +481,13 @@ static void lx_xmit_kick(void)
 
 static void lx_rx_kick(void)
 {
+    if (lx_rx_batch_cur) {
+        lx_rx_batch_n++;
+        lx_rx_batch_sum += lx_rx_batch_cur;
+        if (lx_rx_batch_cur > lx_rx_batch_max)
+            lx_rx_batch_max = lx_rx_batch_cur;
+        lx_rx_batch_cur = 0;
+    }
     if (__atomic_exchange_n(&lx_rx_pending, 0, __ATOMIC_ACQ_REL))
         lx_broker_call(LX_KLD_OP_NET_RX_KICK, 0, 0, 0, 0);
 }
@@ -336,8 +518,14 @@ static void lx_rx_deliver(struct sk_buff *skb)
         return;
     }
     lx_ring->rx_len[slot] = (unsigned short)len;
+    // N1b t4: the frame is in the rx ring; the kernel reads this stamp from
+    // the slot and measures its own consume against it. (satoru)
+    unsigned long long t4 = lx_stats_on() ? lx_n1b_tsc() : 0;   // stamps only under KLD_STATS (satoru)
+    lx_ring->rx_tsc[slot] = t4;
     __atomic_store_n(&lx_ring->rx_prod, prod + 1, __ATOMIC_RELEASE);
+    lx_n1b_hop(3, lx_n1b_t3, t4);
     lx_rx_frames++;
+    lx_rx_batch_cur++;
     lx_rx_pending = 1;
     skb->dev->stats.rx_packets++;
     consume_skb(skb);
@@ -481,7 +669,17 @@ static int lx_napi_thread(void *arg)
             lx_os_futex_wait(&lx_napi_kick, kick, -1);
             continue;
         }
+        // N1b t3: the napi thread starts this poll; t2 is the last driver
+        // handler completion. (satoru)
+        unsigned long long t3 = lx_n1b_tsc();
+        lx_n1b_hop(2, lx_n1b_t2, t3);
+        lx_n1b_t3 = t3;
+        lx_n1b_polls++;
+        lx_softirq_enter();
         int work = n->poll(n, n->weight);
+        lx_softirq_exit();
+        if (work == 0)
+            lx_n1b_empty++;
         // upstream __napi_poll: a poll that used its whole budget did NOT
         // complete, so it stays scheduled and is polled again. (satoru)
         if (work >= n->weight && test_bit(NAPI_STATE_SCHED, &n->state)) {
@@ -538,6 +736,13 @@ static int lx_xmit_thread(void *arg)
         if (cons == prod || netif_xmit_frozen_or_stopped(txq) ||
             !test_bit(__LINK_STATE_START, &dev->state)) {
             lx_xmit_waits++;
+            if (lx_tx_batch_cur) {
+                lx_tx_batch_n++;
+                lx_tx_batch_sum += lx_tx_batch_cur;
+                if (lx_tx_batch_cur > lx_tx_batch_max)
+                    lx_tx_batch_max = lx_tx_batch_cur;
+                lx_tx_batch_cur = 0;
+            }
             lx_os_futex_wait(&lx_ring->tx_doorbell, bell, -1);
             continue;
         }
@@ -560,16 +765,19 @@ static int lx_xmit_thread(void *arg)
         skb->ip_summed = CHECKSUM_NONE;   // kurono's stack computed every checksum (satoru)
         skb_set_queue_mapping(skb, 0);
 
+        lx_softirq_enter();
         __netif_tx_lock(txq, 0);
         netdev_tx_t rc = NETDEV_TX_BUSY;
         if (!netif_xmit_frozen_or_stopped(txq))
             rc = dev->netdev_ops->ndo_start_xmit(skb, dev);
         __netif_tx_unlock(txq);
+        lx_softirq_exit();
 
         if (rc == NETDEV_TX_OK) {
             txq_trans_cond_update(txq);
             __atomic_store_n(&lx_ring->tx_cons, cons + 1, __ATOMIC_RELEASE);
             lx_tx_frames++;
+            lx_tx_batch_cur++;
         } else {
             // the driver did not take it: keep the slot and retry once the
             // queue is woken. upstream requeues the skb on the qdisc. (satoru)
@@ -607,12 +815,14 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
     if (!dev)
         return NULL;
     memset(dev, 0, sz);
+    refcount_set(&dev->dev_refcnt, 1);
     dev->priv_len = (u32)sizeof_priv;
     if (!txqs)
         txqs = 1;
     dev->_tx = kzalloc(sizeof(struct netdev_queue) * txqs, GFP_KERNEL);
     dev->dev_addr = kzalloc(MAX_ADDR_LEN, GFP_KERNEL);
-    if (!dev->_tx || !dev->dev_addr)
+    dev->tstats = kzalloc(sizeof(struct pcpu_sw_netstats), GFP_KERNEL);
+    if (!dev->_tx || !dev->dev_addr || !dev->tstats)
         return NULL;
     dev->num_tx_queues = txqs;
     dev->real_num_tx_queues = txqs;
@@ -633,9 +843,9 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
     return dev;
 }
 
-struct net_device *alloc_etherdev_mqs(int sizeof_priv, unsigned int txqs, unsigned int rxqs)
+struct net_device *alloc_netdev_dummy(int sizeof_priv)
 {
-    return alloc_netdev_mqs(sizeof_priv, "eth%d", NET_NAME_ENUM, lx_ether_setup, txqs, rxqs);
+    return alloc_netdev_mqs(sizeof_priv, "dummy%d", NET_NAME_ENUM, NULL, 1, 1);
 }
 
 void free_netdev(struct net_device *dev)
@@ -644,6 +854,7 @@ void free_netdev(struct net_device *dev)
         return;
     kfree(dev->_tx);
     kfree((void *)dev->dev_addr);
+    kfree((void *)dev->tstats);
     lx_os_free(dev);
 }
 
@@ -668,6 +879,7 @@ int register_netdev(struct net_device *dev)
             return r;
     }
     dev->reg_state = NETREG_REGISTERED;
+    dev->ifindex = (int)lx_next_ifindex++;
     lx_netdevs[lx_netdev_count++] = dev;
     lx_log("[lx_net] register_netdev ");
     lx_log(dev->name);
@@ -678,6 +890,33 @@ int register_netdev(struct net_device *dev)
         lx_log(b);
     }
     return 0;
+}
+
+int register_netdevice(struct net_device *dev)
+{
+    if (!dev || lx_netdev_count >= LX_MAX_NETDEV)
+        return -ENOSPC;
+    if (dev->netdev_ops && dev->netdev_ops->ndo_init) {
+        int r = dev->netdev_ops->ndo_init(dev);
+        if (r)
+            return r;
+    }
+    dev->ifindex = (int)lx_next_ifindex++;
+    lx_netdevs[lx_netdev_count++] = dev;
+    call_netdevice_notifiers(NETDEV_POST_INIT, dev);
+    lx_log("[lx_net] register_netdevice ");
+    lx_log_line(dev->name);
+    call_netdevice_notifiers(NETDEV_REGISTER, dev);
+    return 0;
+}
+
+void unregister_netdevice_queue(struct net_device *dev, struct list_head *head)
+{
+    (void)head;
+    if (!dev)
+        return;
+    call_netdevice_notifiers(NETDEV_UNREGISTER, dev);
+    unregister_netdev(dev);
 }
 
 void unregister_netdev(struct net_device *dev)
@@ -719,6 +958,112 @@ void netif_tx_stop_all_queues(struct net_device *dev)
         netif_tx_stop_queue(netdev_get_tx_queue(dev, i));
 }
 
+void skb_queue_tail(struct sk_buff_head *list, struct sk_buff *newsk)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&list->lock, flags);
+    __skb_queue_tail(list, newsk);
+    spin_unlock_irqrestore(&list->lock, flags);
+}
+
+void skb_queue_head(struct sk_buff_head *list, struct sk_buff *newsk)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&list->lock, flags);
+    __skb_queue_head(list, newsk);
+    spin_unlock_irqrestore(&list->lock, flags);
+}
+
+struct sk_buff *skb_dequeue(struct sk_buff_head *list)
+{
+    unsigned long flags;
+    struct sk_buff *skb;
+    spin_lock_irqsave(&list->lock, flags);
+    skb = __skb_dequeue(list);
+    spin_unlock_irqrestore(&list->lock, flags);
+    return skb;
+}
+
+void skb_queue_purge_reason(struct sk_buff_head *list, enum skb_drop_reason reason)
+{
+    struct sk_buff *skb;
+    while ((skb = skb_dequeue(list)) != NULL)
+        kfree_skb_reason(skb, reason);
+}
+
+void kfree_skb_list_reason(struct sk_buff *segs, enum skb_drop_reason reason)
+{
+    while (segs) {
+        struct sk_buff *next = segs->next;
+        kfree_skb_reason(segs, reason);
+        segs = next;
+    }
+}
+
+void skb_add_rx_frag_netmem(struct sk_buff *skb, int i, netmem_ref netmem,
+                            int off, int size, unsigned int truesize)
+{
+    skb_fill_netmem_desc(skb, i, netmem, off, size);
+    skb->len += size;
+    skb->data_len += size;
+    skb->truesize += truesize;
+}
+
+void __skb_get_hash_net(const struct net *net, struct sk_buff *skb)
+{
+    (void)net;
+    if (!skb)
+        return;
+    u32 h = 2166136261u;
+    unsigned int n = skb_headlen(skb);
+    const u8 *p = skb->data;
+    if (n > 64)
+        n = 64;
+    for (unsigned int i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    skb->hash = h ? h : 1;
+    skb->sw_hash = 1;
+}
+
+u32 csum_partial(const void *buff, int len, u32 sum)
+{
+    const u8 *p = (const u8 *)buff;
+    u32 s = sum;
+    while (len > 1) {
+        s += (u32)p[0] | ((u32)p[1] << 8);
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        s += p[0];
+    return s;
+}
+
+struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp)
+{
+    if (!skb)
+        return NULL;
+    unsigned int headroom = skb_headroom(skb);
+    struct sk_buff *n = __alloc_skb(headroom + skb->len + 64, gfp, 0, 0);
+    if (!n)
+        return NULL;
+    skb_reserve(n, (int)headroom);
+    unsigned char *to = skb_put(n, skb->len);
+    if (skb_copy_bits(skb, 0, to, (int)skb->len)) {
+        kfree_skb(n);
+        return NULL;
+    }
+    n->dev = skb->dev;
+    n->protocol = skb->protocol;
+    n->priority = skb->priority;
+    n->mark = skb->mark;
+    n->ip_summed = skb->ip_summed;
+    memcpy(n->cb, skb->cb, sizeof(n->cb));
+    return n;
+}
+
 void netif_device_detach(struct net_device *dev)
 {
     if (test_and_clear_bit(__LINK_STATE_PRESENT, &dev->state) && netif_running(dev))
@@ -741,6 +1086,13 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev, struct rtnl_link
     else
         netdev_stats_to_stats64(storage, &dev->stats);
     return storage;
+}
+
+void netdev_set_default_ethtool_ops(struct net_device *dev,
+                                    const struct ethtool_ops *ops)
+{
+    if (!dev->ethtool_ops)
+        dev->ethtool_ops = ops;
 }
 
 void netdev_stats_to_stats64(struct rtnl_link_stats64 *stats64, const struct net_device_stats *netdev_stats)
@@ -789,12 +1141,57 @@ static int lx_net_open(struct net_device *dev)
     set_bit(__LINK_STATE_START, &dev->state);
     if (dev->netdev_ops->ndo_open)
         rc = dev->netdev_ops->ndo_open(dev);
-    if (rc)
+    if (rc) {
         clear_bit(__LINK_STATE_START, &dev->state);
-    else
+    } else {
         dev->flags |= IFF_UP;
+        if (dev->netdev_ops->ndo_set_rx_mode)
+            dev->netdev_ops->ndo_set_rx_mode(dev);
+    }
     rtnl_unlock();
     return rc;
+}
+
+struct net_device *__dev_get_by_index(struct net *net, int ifindex)
+{
+    (void)net;
+    for (int i = 0; i < lx_netdev_count; i++)
+        if (lx_netdevs[i] && (int)lx_netdevs[i]->ifindex == ifindex)
+            return lx_netdevs[i];
+    return NULL;
+}
+
+struct net_device *dev_get_by_index(struct net *net, int ifindex)
+{
+    return __dev_get_by_index(net, ifindex);
+}
+
+static struct net_device *lx_netdev_by_name(const char *name);
+
+int lx_net_ifindex_name(const char *name)
+{
+    struct net_device *dev = lx_netdev_by_name(name);
+    return dev ? (int)dev->ifindex : -ENODEV;
+}
+
+int lx_net_open_name(const char *name)
+{
+    struct net_device *dev = lx_netdev_by_name(name);
+    return dev ? lx_net_open(dev) : -ENODEV;
+}
+
+int lx_net_close_name(const char *name)
+{
+    struct net_device *dev = lx_netdev_by_name(name);
+    if (!dev)
+        return -ENODEV;
+    rtnl_lock();
+    if (test_and_clear_bit(__LINK_STATE_START, &dev->state) &&
+        dev->netdev_ops && dev->netdev_ops->ndo_stop)
+        dev->netdev_ops->ndo_stop(dev);
+    dev->flags &= ~IFF_UP;
+    rtnl_unlock();
+    return 0;
 }
 
 void lx_net_bringup_all(void)
@@ -804,7 +1201,7 @@ void lx_net_bringup_all(void)
         lx_log("[lx_net] opening ");
         lx_log(dev->name);
         lx_log(" (ndo_open)\n");
-        int rc = lx_net_open(dev);
+        int rc = (dev->flags & IFF_UP) ? 0 : lx_net_open(dev);
         lx_log("[lx_net] ndo_open returned ");
         if (rc < 0) { lx_log("-"); lx_log_u((unsigned long)-rc); } else lx_log_u((unsigned long)rc);
         lx_log("\n");
@@ -837,6 +1234,54 @@ void lx_net_bringup_all(void)
     }
 }
 
+static struct net_device *lx_netdev_by_name(const char *name)
+{
+    for (int i = 0; i < lx_netdev_count; i++)
+        if (lx_netdevs[i] && strcmp(lx_netdevs[i]->name, name) == 0)
+            return lx_netdevs[i];
+    return NULL;
+}
+
+static int lx_wiphy_report_thread(void *arg)
+{
+    (void)arg;
+    for (int guard = 0; guard < 1200; guard++) {
+        struct net_device *dev = lx_netdev_by_name("wlan0");
+        if (dev && dev->ieee80211_ptr) {
+            struct wireless_dev *wdev = dev->ieee80211_ptr;
+            struct wiphy *wiphy = wdev->wiphy;
+            if (wiphy) {
+                int n24 = wiphy->bands[NL80211_BAND_2GHZ] ?
+                          wiphy->bands[NL80211_BAND_2GHZ]->n_channels : 0;
+                int n5 = wiphy->bands[NL80211_BAND_5GHZ] ?
+                         wiphy->bands[NL80211_BAND_5GHZ]->n_channels : 0;
+                int n6 = wiphy->bands[NL80211_BAND_6GHZ] ?
+                         wiphy->bands[NL80211_BAND_6GHZ]->n_channels : 0;
+                lx_log("[kld-iwlwifi] wiphy registered: ");
+                lx_log_line(dev_name(&wiphy->dev) ? dev_name(&wiphy->dev) : "?");
+                lx_log("[kld-iwlwifi] bands: 2.4GHz=");
+                lx_log_u((unsigned long)n24);
+                lx_log(" 5GHz=");
+                lx_log_u((unsigned long)n5);
+                lx_log(" 6GHz=");
+                lx_log_u((unsigned long)n6);
+                lx_log(" irq_deliveries=");
+                lx_log_u(lx_irq_total());
+                lx_log("\n");
+                return 0;
+            }
+        }
+        lx_os_sleep_ns(100000000);
+    }
+    lx_log("[kld-iwlwifi] wiphy NOT registered after 120 s\n");
+    return 1;
+}
+
+void lx_net_wiphy_report(void)
+{
+    lx_task_spawn("kld-wiphy", lx_wiphy_report_thread, NULL);
+}
+
 void lx_net_stats_log(void)
 {
     lx_log("[lx_net] rx frames ");
@@ -867,6 +1312,14 @@ void lx_net_stats_log(void)
         lx_log_u(lx_xmit_loops);
         lx_log(" waits ");
         lx_log_u(lx_xmit_waits);
+        lx_log(" rx batch avg/max ");
+        lx_log_u(lx_rx_batch_n ? lx_rx_batch_sum / lx_rx_batch_n : 0);
+        lx_log("/");
+        lx_log_u(lx_rx_batch_max);
+        lx_log(" tx batch avg/max ");
+        lx_log_u(lx_tx_batch_n ? lx_tx_batch_sum / lx_tx_batch_n : 0);
+        lx_log("/");
+        lx_log_u(lx_tx_batch_max);
     }
     lx_log("\n");
 }

@@ -1,6 +1,7 @@
 //  kurono os - virtio gpu driver implementation
 //  virtio pci modern device with 2d resource management
 #include "virtio_gpu.h"
+#include "../kernel/kimage.h"   // command buffers may be high-linked kernel bss (satoru)
 #include "../kernel/heap.h"
 #include "../kernel/io.h"
 #include "../kernel/vmm.h"   // map the high 64-bit bar before dereferencing it (satoru)
@@ -191,9 +192,9 @@ bool VirtIOGPU::InitVirtQueue(int index, VirtQueue* vq) {
 
         *queue_size    = use_size;
         *queue_msix    = 0xFFFF; // no MSI-X
-        *queue_desc_lo  = (uint64_t)(uintptr_t)vq->desc;
-        *queue_avail_lo = (uint64_t)(uintptr_t)vq->avail;
-        *queue_used_lo  = (uint64_t)(uintptr_t)vq->used;
+        *queue_desc_lo  = KernelPhysOf(vq->desc);
+        *queue_avail_lo = KernelPhysOf(vq->avail);
+        *queue_used_lo  = KernelPhysOf(vq->used);
         __asm__ volatile("mfence" ::: "memory");
 
         uint16_t notify_off = *queue_notify;
@@ -229,16 +230,16 @@ bool VirtIOGPU::SendControlCommand(void* cmd, uint32_t cmd_size,
         vq->free_head = vq->desc[head].next;
         vq->num_free--;
 
-        s_indirect_table[0].addr = (uint64_t)(uintptr_t)cmd;
+        s_indirect_table[0].addr = KernelPhysOf(cmd);
         s_indirect_table[0].len  = cmd_size;
         s_indirect_table[0].flags = VIRTQ_DESC_F_NEXT;
         s_indirect_table[0].next = 1;
-        s_indirect_table[1].addr = (uint64_t)(uintptr_t)resp;
+        s_indirect_table[1].addr = KernelPhysOf(resp);
         s_indirect_table[1].len  = resp_size;
         s_indirect_table[1].flags = VIRTQ_DESC_F_WRITE;
         s_indirect_table[1].next = 0;
 
-        vq->desc[head].addr = (uint64_t)(uintptr_t)s_indirect_table;
+        vq->desc[head].addr = KernelPhysOf(s_indirect_table);
         vq->desc[head].len  = sizeof(VirtQueueDesc) * 2;
         vq->desc[head].flags = VIRTQ_DESC_F_INDIRECT;
         vq->desc[head].next = 0;
@@ -280,12 +281,12 @@ bool VirtIOGPU::SendControlCommand(void* cmd, uint32_t cmd_size,
     vq->free_head = vq->desc[resp_idx].next;
     vq->num_free--;
 
-    vq->desc[cmd_idx].addr  = (uint64_t)(uintptr_t)cmd;
+    vq->desc[cmd_idx].addr  = KernelPhysOf(cmd);
     vq->desc[cmd_idx].len   = cmd_size;
     vq->desc[cmd_idx].flags = VIRTQ_DESC_F_NEXT;
     vq->desc[cmd_idx].next  = resp_idx;
 
-    vq->desc[resp_idx].addr  = (uint64_t)(uintptr_t)resp;
+    vq->desc[resp_idx].addr  = KernelPhysOf(resp);
     vq->desc[resp_idx].len   = resp_size;
     vq->desc[resp_idx].flags = VIRTQ_DESC_F_WRITE;
     vq->desc[resp_idx].next  = 0;
@@ -560,7 +561,7 @@ bool VirtIOGPU::AttachBacking(uint32_t resource_id, void* buffer, uint32_t size)
     request.cmd.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
     request.cmd.resource_id = resource_id;
     request.cmd.nr_entries = 1;
-    request.entry.addr = (uint64_t)(uintptr_t)buffer;
+    request.entry.addr = KernelPhysOf(buffer);
     request.entry.length = size;
 
     VirtGPU_CtrlHdr resp = {};
@@ -822,17 +823,17 @@ bool VirtIOGPU::PresentFramebufferRect(void* pixels, uint32_t width, uint32_t he
         // 2-entry table is out of range and makes qemu reject the chain
         // ("Desc next is 5"), which breaks the virtqueue and freezes the desktop
         // once a real display drains the queue. (satoru)
-        s_indirect_table[0] = { (uint64_t)(uintptr_t)&xfer,       sizeof(xfer),       VIRTQ_DESC_F_NEXT, 1 };
-        s_indirect_table[1] = { (uint64_t)(uintptr_t)&resp_xfer,  sizeof(resp_xfer),  VIRTQ_DESC_F_WRITE, 0 };
-        s_indirect_table[4] = { (uint64_t)(uintptr_t)&flush,      sizeof(flush),      VIRTQ_DESC_F_NEXT, 1 };
-        s_indirect_table[5] = { (uint64_t)(uintptr_t)&resp_flush, sizeof(resp_flush), VIRTQ_DESC_F_WRITE, 0 };
+        s_indirect_table[0] = { KernelPhysOf(&xfer),       sizeof(xfer),       VIRTQ_DESC_F_NEXT, 1 };
+        s_indirect_table[1] = { KernelPhysOf(&resp_xfer),  sizeof(resp_xfer),  VIRTQ_DESC_F_WRITE, 0 };
+        s_indirect_table[4] = { KernelPhysOf(&flush),      sizeof(flush),      VIRTQ_DESC_F_NEXT, 1 };
+        s_indirect_table[5] = { KernelPhysOf(&resp_flush), sizeof(resp_flush), VIRTQ_DESC_F_WRITE, 0 };
 
-        vq->desc[head_a].addr = (uint64_t)(uintptr_t)&s_indirect_table[0];
+        vq->desc[head_a].addr = KernelPhysOf(&s_indirect_table[0]);
         vq->desc[head_a].len  = sizeof(VirtQueueDesc) * 2;
         vq->desc[head_a].flags = VIRTQ_DESC_F_INDIRECT;
         vq->desc[head_a].next = 0;
 
-        vq->desc[head_b].addr = (uint64_t)(uintptr_t)&s_indirect_table[4];
+        vq->desc[head_b].addr = KernelPhysOf(&s_indirect_table[4]);
         vq->desc[head_b].len  = sizeof(VirtQueueDesc) * 2;
         vq->desc[head_b].flags = VIRTQ_DESC_F_INDIRECT;
         vq->desc[head_b].next = 0;

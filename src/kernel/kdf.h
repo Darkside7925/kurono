@@ -166,6 +166,9 @@ bool        GetCrashInfo(int driver_id, KDFCrashInfo* out);
 int         Status(char* out, int mx);
 // total bytes of dma+mmio kdf currently has fenced for a driver. (satoru)
 uint64_t    DriverMappedBytes(int driver_id);
+// pmm-backed bytes (AllocDMA/AllocContiguous only, no mmio windows) across all
+// drivers, for the boot ram census. (satoru)
+uint64_t    DmaBytes();
 
 // mark a driver healthy/crashed from outside (kinit restart bookkeeping). (satoru)
 void        SetRunning(int driver_id);

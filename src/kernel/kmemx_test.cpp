@@ -506,7 +506,7 @@ static bool test_fault_roundtrip() {
         uint64_t frame = PMM::AllocFrame();
         if (!frame) break;
         uint64_t va = TEST_VA_BASE + 0x10000000ULL + (uint64_t)i * 0x2000ULL;   // spaced scratch VAs (satoru)
-        if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE)) { PMM::FreeFrame(frame); fail++; continue; }
+        if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE | PTE_USER)) { PMM::FreeFrame(frame); fail++; continue; }
 
         // fill with a known pattern (kind cycles for variety). (satoru)
         uint8_t* p = (uint8_t*)(uintptr_t)va;
@@ -714,7 +714,7 @@ static bool test_adaptive_cycle() {
         uint64_t frame = PMM::AllocFrame();
         if (!frame) break;
         uint64_t va = TEST_VA_BASE + 0x20000000ULL + (uint64_t)i * 0x1000ULL;
-        if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE)) { PMM::FreeFrame(frame); fail++; continue; }
+        if (!KernelVMM::MapPage(va, frame, PTE_PRESENT | PTE_WRITABLE | PTE_USER)) { PMM::FreeFrame(frame); fail++; continue; }
         mapped[i] = true;
         uint8_t* p = (uint8_t*)(uintptr_t)va;
         make_page(p, i, 0xADA9u + (uint32_t)i * 2654435761u);
@@ -770,6 +770,7 @@ int RunAll() {
     // primitives are live. init with the default 20% pool if not already up. (satoru)
     if (!KMemX::IsInitialized()) KMemX::Init(KMemX::PoolPct());
     KMemX::SetEnabled(true);
+    KMemX::SetZeroOnly(false);   // the suite's synthetic pages are non-zero (satoru)
     // the pool is adaptive and starts empty; the tests need a few chunks to
     // exercise it. the worker's shrink path returns them once the boot runs
     // green. (satoru)

@@ -107,20 +107,27 @@ void CPUDetect::DetectFeatures() {
     info.features_edx = 0;
     info.features_ecx = 0;
     info.features_ebx7 = 0;
+    info.features_ecx7 = 0;
     info.features_amd_edx = 0;
+    info.features_amd_edx7 = 0;
+    info.is_hypervisor = 0;
 
     if (info.max_cpuid >= 1) {
         uint32_t eax, ebx, ecx, edx;
         CPUID(1, 0, &eax, &ebx, &ecx, &edx);
         info.features_edx = edx;
         info.features_ecx = ecx;
+        info.is_hypervisor = (ecx & CPU_EXT_HYPERVISOR) ? 1u : 0u;   // (satoru)
     }
 
-    // extended features (leaf 7)
+    // extended features (leaf 7). only read it when the cpu actually has the
+    // leaf: on older parts an out-of-range cpuid returns the highest basic
+    // leaf's data, which can set bits (smep, rdseed) that do not exist. (satoru)
     if (info.max_cpuid >= 7) {
         uint32_t eax, ebx, ecx, edx;
         CPUID(7, 0, &eax, &ebx, &ecx, &edx);
         info.features_ebx7 = ebx;
+        info.features_ecx7 = ecx;
     }
 
     // amd/extended features
@@ -128,6 +135,12 @@ void CPUDetect::DetectFeatures() {
         uint32_t eax, ebx, ecx, edx;
         CPUID(0x80000001, 0, &eax, &ebx, &ecx, &edx);
         info.features_amd_edx = edx;
+    }
+    // invariant tsc lives in leaf 0x80000007 edx bit 8 (satoru)
+    if (info.max_ext_cpuid >= 0x80000007) {
+        uint32_t eax, ebx, ecx, edx;
+        CPUID(0x80000007, 0, &eax, &ebx, &ecx, &edx);
+        info.features_amd_edx7 = edx;
     }
 }
 
@@ -411,6 +424,11 @@ bool CPUDetect::Init() {
     SerialLogger::Log(" @ ");
     SerialLogger::LogDec(info.frequency.base_mhz);
     SerialLogger::Log(" MHz\r\n");
+    SerialLogger::Log("[CPU] invariant tsc: ");
+    SerialLogger::Log(HasInvariantTSC() ? "yes" : "no");
+    SerialLogger::Log(" hypervisor: ");
+    SerialLogger::Log(IsHypervisor() ? "yes" : "no");
+    SerialLogger::Log("\r\n");
 
     return true;
 }
@@ -421,6 +439,7 @@ CpuInfo CPUDetect::GetInfo() { return info; }
 bool CPUDetect::HasSSE()    { return info.features_edx & CPU_FEAT_SSE; }
 bool CPUDetect::HasSSE2()   { return info.features_edx & CPU_FEAT_SSE2; }
 bool CPUDetect::HasSSE3()   { return info.features_ecx & CPU_EXT_SSE3; }
+bool CPUDetect::HasEIST()   { return info.features_ecx & CPU_EXT_EIST; }
 bool CPUDetect::HasSSSE3()  { return info.features_ecx & CPU_EXT_SSSE3; }
 bool CPUDetect::HasSSE41()  { return info.features_ecx & CPU_EXT_SSE41; }
 bool CPUDetect::HasSSE42()  { return info.features_ecx & CPU_EXT_SSE42; }
@@ -441,6 +460,96 @@ bool CPUDetect::HasLongMode() { return info.features_amd_edx & CPU_AMD_LM; }
 bool CPUDetect::Has1GBPages() { return info.features_amd_edx & CPU_AMD_PAGE1GB; }
 bool CPUDetect::HasHyperThreading() { return info.features_edx & CPU_FEAT_HT; }
 bool CPUDetect::HasXSAVE()  { return info.features_ecx & CPU_EXT_XSAVE; }
+bool CPUDetect::HasXSAVEUsable() { return (info.features_ecx & CPU_EXT_XSAVE) && (info.features_ecx & CPU_EXT_OSXSAVE); }
+bool CPUDetect::HasAVXUsable()   { return (info.features_ecx & CPU_EXT_AVX) && (info.features_ecx & CPU_EXT_OSXSAVE); }
+bool CPUDetect::HasSMEP()   { return info.features_ebx7 & CPU_EXT7_SMEP; }
+bool CPUDetect::HasUMIP()   { return info.features_ecx7 & CPU_EXT7_UMIP; }
+bool CPUDetect::HasCLFLUSHOPT() { return info.features_ebx7 & CPU_EXT7_CLFLUSHOPT; }
+bool CPUDetect::HasCLWB()   { return info.features_ebx7 & CPU_EXT7_CLWB; }
+bool CPUDetect::HasRDTSCP() { return info.features_amd_edx & CPU_AMD_RDTSCP; }
+bool CPUDetect::HasInvariantTSC() { return info.features_amd_edx7 & CPU_AMD7_TSCINV; }
+bool CPUDetect::IsHypervisor() { return info.is_hypervisor != 0; }
+
+// append " name" for each supported feature, /proc/cpuinfo style. returns the
+// number of bytes written (without the nul). (satoru)
+namespace {
+struct FlagOut {
+    char* p; int n; int mx;
+    void add(const char* s) {
+        int l = 0; while (s[l]) l++;
+        if (n + 1 + l >= mx) return;
+        p[n++] = ' ';
+        for (int i = 0; i < l; i++) p[n++] = s[i];
+        p[n] = 0;
+    }
+};
+inline void flag(FlagOut& o, bool on, const char* name) { if (on) o.add(name); }
+}
+
+int CPUDetect::FormatFeatureFlags(char* out, int max) {
+    if (!out || max < 2) return 0;
+    out[0] = 0;
+    FlagOut o{out, 0, max};
+    const uint32_t d1 = info.features_edx, c1 = info.features_ecx;
+    const uint32_t b7 = info.features_ebx7, ad = info.features_amd_edx;
+
+    flag(o, d1 & CPU_FEAT_FPU,   "fpu");
+    flag(o, d1 & CPU_FEAT_VME,   "vme");
+    flag(o, d1 & CPU_FEAT_DE,    "de");
+    flag(o, d1 & CPU_FEAT_PSE,   "pse");
+    flag(o, d1 & CPU_FEAT_TSC,   "tsc");
+    flag(o, d1 & CPU_FEAT_MSR,   "msr");
+    flag(o, d1 & CPU_FEAT_PAE,   "pae");
+    flag(o, d1 & CPU_FEAT_MCE,   "mce");
+    flag(o, d1 & CPU_FEAT_CX8,   "cx8");
+    flag(o, d1 & CPU_FEAT_APIC,  "apic");
+    flag(o, d1 & CPU_FEAT_SEP,   "sep");
+    flag(o, d1 & CPU_FEAT_MTRR,  "mtrr");
+    flag(o, d1 & CPU_FEAT_PGE,   "pge");
+    flag(o, d1 & CPU_FEAT_MCA,   "mca");
+    flag(o, d1 & CPU_FEAT_CMOV,  "cmov");
+    flag(o, d1 & CPU_FEAT_PAT,   "pat");
+    flag(o, d1 & CPU_FEAT_PSE36, "pse36");
+    flag(o, d1 & CPU_FEAT_CLFLUSH, "clflush");
+    flag(o, d1 & CPU_FEAT_MMX,   "mmx");
+    flag(o, d1 & CPU_FEAT_FXSR,  "fxsr");
+    flag(o, d1 & CPU_FEAT_SSE,   "sse");
+    flag(o, d1 & CPU_FEAT_SSE2,  "sse2");
+    flag(o, d1 & CPU_FEAT_HT,    "ht");
+    flag(o, c1 & CPU_EXT_SSE3,   "pni");
+    flag(o, c1 & CPU_EXT_PCLMUL, "pclmulqdq");
+    flag(o, info.features_ecx7 & CPU_EXT7_UMIP, "umip");
+    flag(o, c1 & CPU_EXT_SSSE3,  "ssse3");
+    flag(o, c1 & CPU_EXT_FMA,    "fma");
+    flag(o, c1 & CPU_EXT_CX16,   "cx16");
+    flag(o, c1 & CPU_EXT_SSE41,  "sse4_1");
+    flag(o, c1 & CPU_EXT_SSE42,  "sse4_2");
+    flag(o, c1 & CPU_EXT_MOVBE,  "movbe");
+    flag(o, c1 & CPU_EXT_POPCNT, "popcnt");
+    flag(o, c1 & CPU_EXT_AES,    "aes");
+    flag(o, c1 & CPU_EXT_XSAVE,  "xsave");
+    flag(o, c1 & CPU_EXT_OSXSAVE,"osxsave");
+    // avx/xsave state: the kernel saves fxsave, not xsave, and never sets
+    // cr4.osxsave, so only advertise what userspace can actually execute. (satoru)
+    flag(o, HasAVXUsable(),      "avx");
+    flag(o, c1 & CPU_EXT_F16C,   "f16c");
+    flag(o, c1 & CPU_EXT_RDRAND, "rdrand");
+    flag(o, info.features_ebx7 & CPU_EXT7_BMI1, "bmi1");
+    flag(o, HasAVXUsable() && (b7 & CPU_EXT7_AVX2), "avx2");
+    flag(o, b7 & CPU_EXT7_SMEP,  "smep");
+    flag(o, b7 & CPU_EXT7_BMI2,  "bmi2");
+    flag(o, b7 & CPU_EXT7_RDSEED,"rdseed");
+    flag(o, b7 & CPU_EXT7_CLFLUSHOPT, "clflushopt");
+    flag(o, b7 & CPU_EXT7_CLWB,  "clwb");
+    flag(o, ad & CPU_AMD_NX,     "nx");
+    flag(o, ad & CPU_AMD_MMXEXT, "mmxext");
+    flag(o, ad & CPU_AMD_PAGE1GB,"pdpe1gb");
+    flag(o, ad & CPU_AMD_RDTSCP, "rdtscp");
+    flag(o, ad & CPU_AMD_LM,     "lm");
+    if (HasInvariantTSC()) { o.add("constant_tsc"); o.add("nonstop_tsc"); }
+    if (IsHypervisor()) o.add("hypervisor");
+    return o.n;
+}
 
 const char* CPUDetect::GetVendorName() {
     switch (info.vendor) {

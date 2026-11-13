@@ -3,6 +3,7 @@
 #include "../drivers/serial.h"
 #include "../kernel/pmm.h"
 #include "../fs/kvfs.h"
+#include "../drivers/disklog.h"
 
 // see kasset.h. a small fixed table of named assets; each is looked up on the
 // KURONO partition at most once and loaded at most once. state transitions use
@@ -19,7 +20,7 @@ namespace {
         uint8_t* data;
     };
 
-    const int MAX_ASSETS = 16;
+    const int MAX_ASSETS = 32;
     Entry g_assets[MAX_ASSETS];
     volatile int g_count = 0;
 
@@ -141,6 +142,18 @@ bool EnsureVfsFile(const char* path, const char* name83, const uint8_t* s, const
     if (last > 0) { dir[last] = 0; KVFS::Mkdirs(dir); }
     KVFS::WriteFileStatic(path, data, sz);
     return true;
+}
+
+bool Deliver(const char* name83, const uint8_t* s, const uint8_t* e) {
+    if (!Linked(s, e)) return false;
+    uint64_t have = 0;
+    if (DiskLog::StatRootFile(name83, &have) == 0) return true;
+    uint32_t len = (uint32_t)(e - s);
+    int rc = DiskLog::WriteRootFile(name83, s, len);
+    SerialLogger::Log("[kasset] deliver ");
+    for (int i = 0; i < 11 && name83[i] != ' '; i++) { char c[2] = { name83[i], 0 }; SerialLogger::Log(c); }
+    SerialLogger::Log(" rc="); SerialLogger::LogDec(rc); SerialLogger::Log("\r\n");
+    return rc == 0;
 }
 
 }  // namespace KAsset

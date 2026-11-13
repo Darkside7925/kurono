@@ -49,7 +49,11 @@ struct Ring {
         ControlMsg cmsg;
     };
     static const int FRAME_RING = 64;
-    Frame    frames[FRAME_RING];
+    // the 64-frame metadata ring is ~51 kb (each Frame carries a whole
+    // ControlMsg) and most sockets never touch it. allocated on the first
+    // dgram/seqpacket write or fd-carrying stream write, freed with the slot,
+    // so 64 idle slots no longer pin 3.2 mb at boot. (satoru)
+    Frame*   frames;
     uint32_t frame_head;
     uint32_t frame_tail;
 
@@ -86,7 +90,23 @@ struct Socket {
                                  // arrived -> parent busy-spun. (satoru)
 };
 
-Socket   g_socks[UNIX_MAX_SOCKETS];
+// the socket table grows on demand in chunks of UNIX_CHUNK slots, up to
+// UNIX_MAX_SOCKETS. a chunk is never freed once published, so a slot pointer
+// stays valid for the life of the kernel. g_cap only ever grows and is
+// published after the chunk pointer (release), so a reader that saw sd < cap
+// also sees its chunk. the pending in-kernel-server ancillary data lives in
+// the chunk too instead of three full-size static arrays. (satoru)
+static const int UNIX_CHUNK = 64;
+struct Chunk {
+    Socket     s[UNIX_CHUNK];
+    ControlMsg pcm[UNIX_CHUNK];
+    bool       pcv[UNIX_CHUNK];
+    int        pct[UNIX_CHUNK];
+};
+Chunk* g_chunks[UNIX_MAX_SOCKETS / UNIX_CHUNK];
+int    g_cap = 0;   // published slot count, a multiple of UNIX_CHUNK (satoru)
+inline int cap() { return __atomic_load_n(&g_cap, __ATOMIC_ACQUIRE); }
+inline Socket& SK(int i) { return g_chunks[i / UNIX_CHUNK]->s[i % UNIX_CHUNK]; }
 Spinlock g_glock;                // table lock, see the block comment above (satoru)
 
 // lock one socket, or two in index order. the first lock saves irq state, the second rides on it. (satoru)
@@ -95,9 +115,9 @@ struct PairLock {
     Spinlock* b = nullptr;
     uint64_t  fl = 0;
     void lock(int x, int y) {
-        if (y < 0 || y >= UNIX_MAX_SOCKETS || y == x) { a = &g_socks[x].lk; b = nullptr; }
-        else if (x < y) { a = &g_socks[x].lk; b = &g_socks[y].lk; }
-        else            { a = &g_socks[y].lk; b = &g_socks[x].lk; }
+        if (y < 0 || y >= cap() || y == x) { a = &SK(x).lk; b = nullptr; }
+        else if (x < y) { a = &SK(x).lk; b = &SK(y).lk; }
+        else            { a = &SK(y).lk; b = &SK(x).lk; }
         a->LockIrqSave(&fl);
         if (b) b->Lock();
     }
@@ -107,13 +127,29 @@ struct PairLock {
     }
 };
 
-inline bool in_range(int sd) { return sd >= 0 && sd < UNIX_MAX_SOCKETS; }
+inline bool in_range(int sd) { return sd >= 0 && sd < cap(); }
+
+// publish one more chunk. g_glock held; the chunk was allocated before the
+// (irq-off) table lock was taken. returns false if the table is at its cap. (satoru)
+bool publish_chunk_locked(Chunk* c) {
+    int n = g_cap;
+    if (!c || n >= UNIX_MAX_SOCKETS) return false;
+    g_chunks[n / UNIX_CHUNK] = c;
+    __atomic_store_n(&g_cap, n + UNIX_CHUNK, __ATOMIC_RELEASE);
+    return true;
+}
+
+Chunk* new_chunk() {
+    Chunk* c = (Chunk*)KernelHeap::Alloc(sizeof(Chunk));
+    if (c) memset(c, 0, sizeof(Chunk));   // in_use false, no ring, unlocked (satoru)
+    return c;
+}
 
 // slot allocation. g_glock held. the slot comes back in_use with refs 1 and every field reset. (satoru)
 int alloc_sd_locked() {
-    for (int i = 0; i < UNIX_MAX_SOCKETS; i++) {
-        if (!g_socks[i].in_use) {
-            Socket* s = &g_socks[i];
+    for (int i = 0; i < g_cap; i++) {
+        if (!SK(i).in_use) {
+            Socket* s = &SK(i);
             if (!s->rx.data) {
                 s->rx.data = (uint8_t*)KernelHeap::Alloc(UNIX_RING_BYTES);
                 if (!s->rx.data) return -1;   // out of memory: no socket (satoru)
@@ -179,6 +215,10 @@ int ring_write(Ring& r, const uint8_t* data, int len, const ControlMsg* cm,
     // stream: only fd-carrying writes get a frame, and never drop one. (satoru)
     bool stream_fds = type == UNIX_SOCK_STREAM && cm && cm->passed_fd_count > 0;
     if (stream_fds && r.frame_head - r.frame_tail >= Ring::FRAME_RING) return 0;
+    if ((type != UNIX_SOCK_STREAM || stream_fds) && !r.frames) {
+        r.frames = (Ring::Frame*)KernelHeap::Alloc(sizeof(Ring::Frame) * Ring::FRAME_RING);
+        if (!r.frames) return 0;
+    }
     int can = r.free();
     if (can <= 0) return 0;
     if (len > can) len = can;
@@ -218,7 +258,7 @@ int ring_read(Ring& r, uint8_t* out, int max, ControlMsg* cm, SockType type,
     int n = avail;
     int consume = avail;
     if (type == UNIX_SOCK_DGRAM || type == UNIX_SOCK_SEQPACKET) {
-        if (r.frame_head == r.frame_tail) return 0;
+        if (!r.frames || r.frame_head == r.frame_tail) return 0;
         uint32_t fi = r.frame_tail % Ring::FRAME_RING;
         int frame_len = (int)r.frames[fi].length;
         n = frame_len < max ? frame_len : max;
@@ -230,7 +270,7 @@ int ring_read(Ring& r, uint8_t* out, int max, ControlMsg* cm, SockType type,
         if (cm) *cm = {};
         // linux semantics: fds arrive with the read holding their first byte,
         // and a read never runs into the next fd-carrying write. (satoru)
-        if (r.frame_head != r.frame_tail) {
+        if (r.frames && r.frame_head != r.frame_tail) {
             uint32_t fi = r.frame_tail % Ring::FRAME_RING;
             int lead = (int)(r.frames[fi].offset - r.tail);
             if (lead <= 0) {
@@ -242,7 +282,7 @@ int ring_read(Ring& r, uint8_t* out, int max, ControlMsg* cm, SockType type,
                         if (fc.passed_is_socket[k] && *ndrop < UNIX_MAX_PASSED_FD) drop[(*ndrop)++] = fc.passed_sd[k];
                 }
                 r.frame_tail++;
-                if (r.frame_head != r.frame_tail) {
+                if (r.frames && r.frame_head != r.frame_tail) {
                     int next = (int)(r.frames[r.frame_tail % Ring::FRAME_RING].offset - r.tail);
                     if (next > 0 && n > next) n = next;
                 }
@@ -275,10 +315,17 @@ inline bool ring_room(const Ring& r) {
 namespace UnixSocket {
 
 void Init() {
-    for (int i = 0; i < UNIX_MAX_SOCKETS; i++) g_socks[i].in_use = false;
+    if (cap() == 0) {
+        Chunk* c = new_chunk();
+        SpinLockGuard gg(g_glock);
+        if (!(g_cap == 0 && publish_chunk_locked(c)) && c) KernelHeap::Free(c);
+    }
+    for (int i = 0; i < cap(); i++) SK(i).in_use = false;
     SerialLogger::Log("UnixSocket: AF_UNIX subsystem ready, ");
+    SerialLogger::LogDec(cap());
+    SerialLogger::Log(" sd slots, grows to ");
     SerialLogger::LogDec(UNIX_MAX_SOCKETS);
-    SerialLogger::Log(" sd slots\r\n");
+    SerialLogger::Log("\r\n");
 }
 
 // task 25: expose the setter in the UnixSocket namespace (matches the header
@@ -286,17 +333,42 @@ void Init() {
 void SetDataReadyHook(void (*cb)(int sd)) { g_data_ready_cb = cb; }
 void SetKlsHeldHook(bool (*cb)()) { g_kls_held_cb = cb; }
 
+// make sure at least `want` slots are free, adding chunks while the table is
+// below its cap. runs before g_glock is taken (the heap must not be entered
+// with the irq-off table lock held). (satoru)
+static void ensure_free_slots(int want) {
+    for (int round = 0; round < UNIX_MAX_SOCKETS / UNIX_CHUNK; round++) {
+        int n = cap(), used = 0;
+        for (int i = 0; i < n; i++) if (SK(i).in_use) used++;
+        if (n - used >= want || n >= UNIX_MAX_SOCKETS) return;
+        Chunk* c = new_chunk();
+        if (!c) return;
+        bool ok;
+        {
+            SpinLockGuard gg(g_glock);
+            ok = (g_cap == n) && publish_chunk_locked(c);
+        }
+        if (!ok) KernelHeap::Free(c);   // another cpu grew it first: re-check (satoru)
+        else {
+            SerialLogger::Log("[unixsock] table grown to ");
+            SerialLogger::LogDec(n + UNIX_CHUNK);
+            SerialLogger::Log(" slots\r\n");
+        }
+    }
+}
+
 // the 64 KB ring of the next free slot is allocated here, before the table lock (which is irq-off)
 // is taken; alloc_sd_locked still allocates itself if another cpu took that slot first. (satoru)
 static void prealloc_ring(int nth = 0) {
-    for (int i = 0; i < UNIX_MAX_SOCKETS; i++) {
-        if (g_socks[i].in_use) continue;
+    ensure_free_slots(nth + 1);
+    for (int i = 0; i < cap(); i++) {
+        if (SK(i).in_use) continue;
         if (nth-- > 0) continue;
-        if (g_socks[i].rx.data) return;     // that free slot is ready (satoru)
+        if (SK(i).rx.data) return;     // that free slot is ready (satoru)
         uint8_t* d = (uint8_t*)KernelHeap::Alloc(UNIX_RING_BYTES);
         if (!d) return;
         SpinLockGuard gg(g_glock);
-        if (!g_socks[i].rx.data) g_socks[i].rx.data = d; else KernelHeap::Free(d);
+        if (!SK(i).rx.data) SK(i).rx.data = d; else KernelHeap::Free(d);
         return;
     }
 }
@@ -306,14 +378,14 @@ int Create(SockType type) {
     SpinLockGuard gg(g_glock);
     int sd = alloc_sd_locked();
     if (sd < 0) return -1;
-    g_socks[sd].type = type;
+    SK(sd).type = type;
     return sd;
 }
 
 int Bind(int sd, const char* path) {
     if (!in_range(sd) || !path) return -1;
     SpinLockGuard gg(g_glock);
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     if (!s.in_use) return -1;
     int i = 0;
@@ -331,7 +403,7 @@ int Listen(int sd, int backlog) {
     (void)backlog;
     if (!in_range(sd)) return -1;
     SpinLockGuard gg(g_glock);
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     if (!s.in_use || !s.bound) return -1;
     s.listening = true;
@@ -340,9 +412,9 @@ int Listen(int sd, int backlog) {
 
 // g_glock held. (satoru)
 static int lookup_locked(const char* path) {
-    for (int i = 0; i < UNIX_MAX_SOCKETS; i++) {
-        if (g_socks[i].in_use && g_socks[i].listening &&
-            path_eq(g_socks[i].path, path)) return i;
+    for (int i = 0; i < cap(); i++) {
+        if (SK(i).in_use && SK(i).listening &&
+            path_eq(SK(i).path, path)) return i;
     }
     return -1;
 }
@@ -361,10 +433,10 @@ int Connect(int sd, const char* path) {
         // the whole connect runs under the table lock: the listener cannot be closed and its
         // slot reused between the lookup and the link. (satoru)
         SpinLockGuard gg(g_glock);
-        if (!g_socks[sd].in_use) return -1;
+        if (!SK(sd).in_use) return -1;
         srv = lookup_locked(path);
         if (srv < 0) return -111;          // ECONNREFUSED
-        Socket& server = g_socks[srv];
+        Socket& server = SK(srv);
 
         // an in-kernel server (pulse, dbus, wayland) takes the connection in its
         // on_connect callback and never calls Accept(), so queueing it in the
@@ -377,8 +449,8 @@ int Connect(int sd, const char* path) {
 
         accept_sd = alloc_sd_locked();
         if (accept_sd < 0) return -1;
-        Socket& as = g_socks[accept_sd];
-        Socket& cs = g_socks[sd];
+        Socket& as = SK(accept_sd);
+        Socket& cs = SK(sd);
         // the accepted socket is private until it is linked below; the client end and the
         // listener's backlog change under their locks. (satoru)
         {
@@ -429,7 +501,7 @@ int Connect(int sd, const char* path) {
 
 int Accept(int sd, char* peer_path, int peer_path_len) {
     if (!in_range(sd)) return -1;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     if (!s.in_use || !s.listening) return -1;
     if (s.backlog_head == s.backlog_tail) return -11;   // EAGAIN
@@ -453,17 +525,17 @@ int Pair(SockType type, int* sd0, int* sd1) {
     if (a < 0) return -1;
     int b = alloc_sd_locked();
     if (b < 0) {
-        SpinLockGuard g(g_socks[a].lk);
-        g_socks[a].in_use = false;
+        SpinLockGuard g(SK(a).lk);
+        SK(a).in_use = false;
         return -1;
     }
     PairLock pl; pl.lock(a, b);
-    g_socks[a].type = type; g_socks[b].type = type;
-    g_socks[a].connected = g_socks[b].connected = true;
-    g_socks[a].peer_sd = b;
-    g_socks[b].peer_sd = a;
-    g_socks[a].creds = {0, 0, 0};
-    g_socks[b].creds = {0, 0, 0};
+    SK(a).type = type; SK(b).type = type;
+    SK(a).connected = SK(b).connected = true;
+    SK(a).peer_sd = b;
+    SK(b).peer_sd = a;
+    SK(a).creds = {0, 0, 0};
+    SK(b).creds = {0, 0, 0};
     pl.unlock();
     *sd0 = a; *sd1 = b;
     return 0;
@@ -474,8 +546,8 @@ int Pair(SockType type, int* sd0, int* sd1) {
 // stash the ControlMsg here so the handler can pull it via TakePendingControl()
 // during the synchronous on_data call. only in-kernel servers use these and their
 // sends run under the linux layer's global lock. (satoru)
-static ControlMsg g_pending_ctrl[UNIX_MAX_SOCKETS];
-static bool       g_pending_ctrl_valid[UNIX_MAX_SOCKETS];
+#define PCM(i) (g_chunks[(i) / UNIX_CHUNK]->pcm[(i) % UNIX_CHUNK])   // chunked (satoru)
+#define PCV(i) (g_chunks[(i) / UNIX_CHUNK]->pcv[(i) % UNIX_CHUNK])
 // how many of the pending message's passed fds have already been handed out.
 // one sendmsg can carry MANY SCM_RIGHTS fds (firefox batches several
 // wl_shm.create_pool requests, each with its own memfd, into one send); each
@@ -483,11 +555,11 @@ static bool       g_pending_ctrl_valid[UNIX_MAX_SOCKETS];
 // message on the first TakePendingControl and dropped the rest, so every pool
 // after the first got a null backing -> the browser window's large shm buffer
 // never mapped -> the window painted black. (satoru)
-static int        g_pending_ctrl_taken[UNIX_MAX_SOCKETS];
+#define PCT(i) (g_chunks[(i) / UNIX_CHUNK]->pct[(i) % UNIX_CHUNK])
 
 // hand what a send queued for an in-kernel server to its on_data, outside every socket lock. (satoru)
 static void drain_kernel_server(int peer, const ControlMsg& cm) {
-    Socket& ps = g_socks[peer];
+    Socket& ps = SK(peer);
     DataCallback od; void* user; SockType ty;
     {
         SpinLockGuard g(ps.lk);
@@ -505,9 +577,9 @@ static void drain_kernel_server(int peer, const ControlMsg& cm) {
     }
     // expose ancillary (passed fds / resolved shm) to the handler. (satoru)
     if (cm.passed_fd_count > 0) {
-        g_pending_ctrl[peer]       = cm;
-        g_pending_ctrl_valid[peer] = true;
-        g_pending_ctrl_taken[peer] = 0;   // hand out fds one at a time (satoru)
+        PCM(peer)       = cm;
+        PCV(peer) = true;
+        PCT(peer) = 0;   // hand out fds one at a time (satoru)
     }
     // Drain into the kernel-side handler a span at a time: copy out of the ring under the
     // socket lock, call the handler without it. (satoru)
@@ -521,7 +593,7 @@ static void drain_kernel_server(int peer, const ControlMsg& cm) {
                 n = ps.rx.avail();
                 if (n <= 0) {
                     // Drain stale frame metadata so it doesn't accumulate.
-                    ps.rx.frame_tail = ps.rx.frame_head;
+                    if (ps.rx.frames) ps.rx.frame_tail = ps.rx.frame_head;
                     break;
                 }
                 if (n > CHUNK) n = CHUNK;
@@ -542,7 +614,7 @@ static void drain_kernel_server(int peer, const ControlMsg& cm) {
         }
         if (got > 0) od(peer, scratch, got, user);
     }
-    g_pending_ctrl_valid[peer] = false;
+    PCV(peer) = false;
 }
 
 // shared write core: enqueue to the peer ring and, for an in-kernel server peer, drive its on_data
@@ -550,14 +622,14 @@ static void drain_kernel_server(int peer, const ControlMsg& cm) {
 static int send_core(int sd, const void* buf, int len, const ControlMsg& cm) {
     for (int attempt = 0; attempt < 16; attempt++) {
         if (!in_range(sd)) return -32;   // EPIPE
-        Socket& s = g_socks[sd];
+        Socket& s = SK(sd);
         int hint = __atomic_load_n(&s.peer_sd, __ATOMIC_ACQUIRE);
         PairLock pl; pl.lock(sd, hint);
         if (!s.in_use || !s.connected) { pl.unlock(); return -32; }
         if (s.peer_sd != hint) { pl.unlock(); continue; }   // the link changed under us: look again (satoru)
         if (s.shutdown_wr) { pl.unlock(); return -32; }
-        if (!in_range(hint) || !g_socks[hint].in_use) { pl.unlock(); return -32; }
-        Socket& ps = g_socks[hint];
+        if (!in_range(hint) || !SK(hint).in_use) { pl.unlock(); return -32; }
+        Socket& ps = SK(hint);
         if (ps.shutdown_rd) { pl.unlock(); return -32; }
         const bool ksrv = ps.is_kernel_server;
         if (ksrv && ps.on_data && g_kls_held_cb && !g_kls_held_cb()) { pl.unlock(); return UNIX_NEED_KLS; }
@@ -602,7 +674,7 @@ int Send(int sd, const void* buf, int len, int flags,
         cm.passed_fd_count = n_fds;
     }
     cm.creds_valid = true;
-    cm.peer_creds  = g_socks[sd].creds;
+    cm.peer_creds  = SK(sd).creds;
     return send_core(sd, buf, len, cm);
 }
 
@@ -611,60 +683,62 @@ int SendMsg(int sd, const void* buf, int len, int flags, const ControlMsg* cmin)
     if (!in_range(sd)) return -32;
     ControlMsg cm = cmin ? *cmin : ControlMsg{};
     cm.creds_valid = true;
-    cm.peer_creds  = g_socks[sd].creds;
+    cm.peer_creds  = SK(sd).creds;
     return send_core(sd, buf, len, cm);
 }
 
 int PeerSd(int sd) {
     if (!in_range(sd)) return -1;
-    SpinLockGuard g(g_socks[sd].lk);
-    return g_socks[sd].in_use ? g_socks[sd].peer_sd : -1;   // (satoru)
+    SpinLockGuard g(SK(sd).lk);
+    return SK(sd).in_use ? SK(sd).peer_sd : -1;   // (satoru)
 }
 
 bool IsStream(int sd) {
     if (!in_range(sd)) return true;
-    return g_socks[sd].type == UNIX_SOCK_STREAM;
+    return SK(sd).type == UNIX_SOCK_STREAM;
 }
 
 bool NeedsKlsToSend(int sd) {
     if (!in_range(sd)) return false;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     int hint = __atomic_load_n(&s.peer_sd, __ATOMIC_ACQUIRE);
     if (!in_range(hint)) return false;
     PairLock pl; pl.lock(sd, hint);
-    bool r = s.in_use && s.peer_sd == hint && g_socks[hint].is_kernel_server && g_socks[hint].on_data;
+    bool r = s.in_use && s.peer_sd == hint && SK(hint).is_kernel_server && SK(hint).on_data;
     pl.unlock();
     return r;
 }
 
 bool TakePendingControl(int sd, ControlMsg* out) {
-    if (sd < 0 || sd >= UNIX_MAX_SOCKETS) return false;
-    if (!g_pending_ctrl_valid[sd]) return false;
-    ControlMsg& p = g_pending_ctrl[sd];
-    int t = g_pending_ctrl_taken[sd];
+    if (!in_range(sd)) return false;
+    if (!PCV(sd)) return false;
+    ControlMsg& p = PCM(sd);
+    int t = PCT(sd);
     // a message with fds is consumed one fd per call so consecutive create_pool
     // requests in the same send each get their own memfd. a creds-only message
     // (no fds) is returned once as before. (satoru)
     if (p.passed_fd_count > 0) {
-        if (t >= p.passed_fd_count) { g_pending_ctrl_valid[sd] = false; return false; }
+        if (t >= p.passed_fd_count) { PCV(sd) = false; return false; }
         if (out) {
             ControlMsg one = {};
             one.passed_fd_count     = 1;
             one.passed_fds[0]       = p.passed_fds[t];
             one.passed_shm_base[0]  = p.passed_shm_base[t];
             one.passed_shm_size[0]  = p.passed_shm_size[t];
+            one.passed_shm_slot[0]  = p.passed_shm_slot[t];
+            one.passed_shm_pin[0]   = p.passed_shm_pin[t];
             one.passed_sd[0]        = p.passed_sd[t];
             one.passed_is_socket[0] = p.passed_is_socket[t];
             one.creds_valid         = p.creds_valid;
             one.peer_creds          = p.peer_creds;
             *out = one;
         }
-        g_pending_ctrl_taken[sd] = t + 1;
-        if (g_pending_ctrl_taken[sd] >= p.passed_fd_count) g_pending_ctrl_valid[sd] = false;
+        PCT(sd) = t + 1;
+        if (PCT(sd) >= p.passed_fd_count) PCV(sd) = false;
         return true;
     }
     if (out) *out = p;
-    g_pending_ctrl_valid[sd] = false;
+    PCV(sd) = false;
     return true;
 }
 
@@ -672,7 +746,7 @@ bool TakePendingControl(int sd, ControlMsg* out) {
 int Recv(int sd, void* buf, int len, int flags, ControlMsg* cmsg) {
     (void)flags;
     if (!in_range(sd)) return -1;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     int wake = -1, drop[UNIX_MAX_PASSED_FD], nd = 0, ret;
     {
         SpinLockGuard g(s.lk);
@@ -694,7 +768,7 @@ int Recv(int sd, void* buf, int len, int flags, ControlMsg* cmsg) {
 
 int Shutdown(int sd, int how) {
     if (!in_range(sd)) return -1;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     if (!s.in_use) return -1;
     if (how == 0 || how == 2) s.shutdown_rd = true;
@@ -712,20 +786,20 @@ int Shutdown(int sd, int how) {
 // (the caller keeps POLLIN while bytes remain). (satoru)
 bool PeerClosed(int sd) {
     if (!in_range(sd)) return false;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     return s.in_use && s.connected && s.peer_sd < 0;
 }
 
 int Retain(int sd) {
     if (!in_range(sd)) return -1;
-    __atomic_add_fetch(&g_socks[sd].refs, 1, __ATOMIC_ACQ_REL);   // dup runs without kls: atomic (satoru)
+    __atomic_add_fetch(&SK(sd).refs, 1, __ATOMIC_ACQ_REL);   // dup runs without kls: atomic (satoru)
     return 0;
 }
 
 int Close(int sd) {
     if (!in_range(sd)) return -1;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     // a socketpair end inherited across fork is referenced by both the parent's
     // and the child's fd tables (same global sd). only the LAST close severs the
     // peer + frees the slot; an earlier close just drops this fd's reference, so
@@ -736,6 +810,8 @@ int Close(int sd) {
             if (__atomic_compare_exchange_n(&s.refs, &r, r - 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
     }
     int woke = -1;
+    uint8_t* rxdata = nullptr;
+    Ring::Frame* rxfr = nullptr;
     {
         // the last reference: unlink and free under the table lock plus both socket locks. a
         // concurrent Close of the peer takes the same g_glock first, so the two never cross. (satoru)
@@ -746,8 +822,8 @@ int Close(int sd) {
             if (!s.in_use) { pl.unlock(); return -1; }
             if (s.peer_sd != hint) { pl.unlock(); continue; }
             s.refs = 0;
-            if (hint >= 0 && g_socks[hint].in_use) {
-                Socket& ps = g_socks[hint];
+            if (in_range(hint) && SK(hint).in_use) {
+                Socket& ps = SK(hint);
                 ps.shutdown_wr = true;     // peer's writes will start failing
                 ps.peer_sd = -1;
                 // Leave any buffered RX data on the peer so it can drain after
@@ -756,10 +832,17 @@ int Close(int sd) {
             }
             s.peer_sd = -1;
             s.in_use = false;
+            // give the slot's 64 kb ring and 51 kb frame ring back; the next
+            // user of this sd allocates fresh ones (net memory returns to the
+            // idle baseline when the last socket closes). (satoru)
+            rxdata = s.rx.data;      s.rx.data = nullptr;
+            rxfr   = s.rx.frames;    s.rx.frames = nullptr;
             pl.unlock();
             break;
         }
     }
+    if (rxdata) KernelHeap::Free(rxdata);
+    if (rxfr)   KernelHeap::Free(rxfr);
     // task 28: the peer is now hung up (POLLHUP) - wake its parked
     // poller NOW so a reader polling a dead child's pipe sees the eof
     // immediately instead of burning its full poll timeout (the 4s
@@ -770,7 +853,7 @@ int Close(int sd) {
 
 int GetSockName(int sd, char* path, int path_len) {
     if (!in_range(sd) || !path || path_len <= 0) return -1;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     if (!s.in_use) return -1;
     int i = 0;
@@ -781,16 +864,16 @@ int GetSockName(int sd, char* path, int path_len) {
 
 int GetPeerName(int sd, char* path, int path_len) {
     if (!in_range(sd) || !path) return -1;
-    int peer = __atomic_load_n(&g_socks[sd].peer_sd, __ATOMIC_ACQUIRE);
+    int peer = __atomic_load_n(&SK(sd).peer_sd, __ATOMIC_ACQUIRE);
     if (!in_range(peer)) return -1;
     return GetSockName(peer, path, path_len);
 }
 
 int GetPeerCred(int sd, Credentials* out) {
     if (!in_range(sd) || !out) return -1;
-    SpinLockGuard g(g_socks[sd].lk);
-    if (!g_socks[sd].in_use) return -1;
-    *out = g_socks[sd].creds;
+    SpinLockGuard g(SK(sd).lk);
+    if (!SK(sd).in_use) return -1;
+    *out = SK(sd).creds;
     return 0;
 }
 
@@ -798,7 +881,7 @@ void RegisterServer(int sd, ConnectionCallback on_conn, DataCallback on_data,
                     void* user) {
     if (!in_range(sd)) return;
     SpinLockGuard gg(g_glock);
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     if (!s.in_use) return;
     s.on_connect = on_conn;
@@ -811,8 +894,8 @@ void RegisterServer(int sd, ConnectionCallback on_conn, DataCallback on_data,
 // last wayland event sitting unread in some ring?). diagnostic only, reads
 // without the locks. (satoru)
 void DumpPending() {
-    for (int i = 0; i < UNIX_MAX_SOCKETS; i++) {
-        Socket& s = g_socks[i];
+    for (int i = 0; i < cap(); i++) {
+        Socket& s = SK(i);
         if (!s.in_use) continue;
         SerialLogger::Log("[usock] sd="); SerialLogger::LogDec(i);
         SerialLogger::Log(" peer="); SerialLogger::LogDec(s.peer_sd);
@@ -827,7 +910,7 @@ void DumpPending() {
 
 int PendingBytes(int sd) {
     if (!in_range(sd)) return 0;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     return s.in_use ? s.rx.avail() : 0;
 }
@@ -836,7 +919,7 @@ int PendingBytes(int sd) {
 // to "room to write" lives in the peer's ring. (satoru)
 uint32_t Readiness(int sd) {
     if (!in_range(sd)) return UN_READY_OUT;   // the write itself reports the error (satoru)
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     for (int attempt = 0; attempt < 16; attempt++) {
         int hint = __atomic_load_n(&s.peer_sd, __ATOMIC_ACQUIRE);
         PairLock pl; pl.lock(sd, hint);
@@ -846,8 +929,8 @@ uint32_t Readiness(int sd) {
         // readable when there are bytes OR (for a listen fd) a pending connection. (satoru)
         if (s.rx.avail() > 0 || (s.listening && s.backlog_head != s.backlog_tail)) r |= UN_READY_IN;
         // a full peer ring makes the write eagain: out only with room. (satoru)
-        if (!s.connected || !in_range(hint) || !g_socks[hint].in_use) r |= UN_READY_OUT;
-        else if (g_socks[hint].is_kernel_server || ring_room(g_socks[hint].rx)) r |= UN_READY_OUT;
+        if (!s.connected || !in_range(hint) || !SK(hint).in_use) r |= UN_READY_OUT;
+        else if (SK(hint).is_kernel_server || ring_room(SK(hint).rx)) r |= UN_READY_OUT;
         if (s.connected && s.peer_sd < 0) r |= UN_READY_HUP;
         pl.unlock();
         return r;
@@ -859,14 +942,14 @@ bool Writable(int sd) { return (Readiness(sd) & UN_READY_OUT) != 0; }
 
 uint32_t EventSeq(int sd) {
     if (!in_range(sd)) return 0;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     for (int attempt = 0; attempt < 16; attempt++) {
         int hint = __atomic_load_n(&s.peer_sd, __ATOMIC_ACQUIRE);
         PairLock pl; pl.lock(sd, hint);
         if (!s.in_use) { pl.unlock(); return 0; }
         if (s.peer_sd != hint) { pl.unlock(); continue; }
         uint32_t q = s.rx.head + (uint32_t)s.backlog_head * 0x9E3779B1u;   // data in, connections (satoru)
-        if (in_range(hint) && g_socks[hint].in_use) q += g_socks[hint].rx.tail;   // peer drained: writable (satoru)
+        if (in_range(hint) && SK(hint).in_use) q += SK(hint).rx.tail;   // peer drained: writable (satoru)
         else if (s.connected) q ^= 0x80000000u;                            // peer gone (satoru)
         pl.unlock();
         return q;
@@ -879,10 +962,10 @@ uint32_t EventSeq(int sd) {
 // signaler wrote the read end and it went to the peer" apart from "nobody wrote
 // it". returns -1 if unpaired. remove before commit.
 int PeerPendingBytes(int sd) {
-    if (!in_range(sd) || !g_socks[sd].in_use) return -1;
-    int peer = g_socks[sd].peer_sd;
-    if (peer < 0 || peer >= UNIX_MAX_SOCKETS || !g_socks[peer].in_use) return -1;
-    return g_socks[peer].rx.avail();
+    if (!in_range(sd) || !SK(sd).in_use) return -1;
+    int peer = SK(sd).peer_sd;
+    if (!in_range(peer) || !SK(peer).in_use) return -1;
+    return SK(peer).rx.avail();
 }
 
 // true when a listening socket has a connection waiting in its backlog. poll /
@@ -892,7 +975,7 @@ int PeerPendingBytes(int sd) {
 // so firefox's get_registry is never forwarded to the compositor. (satoru)
 bool HasPendingConnection(int sd) {
     if (!in_range(sd)) return false;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     SpinLockGuard g(s.lk);
     return s.in_use && s.listening && s.backlog_head != s.backlog_tail;
 }
@@ -900,7 +983,7 @@ bool HasPendingConnection(int sd) {
 // kernel->client write core shared by KernelInject and KernelInjectMsg. (satoru)
 static int inject_core(int sd, const void* buf, int len, const ControlMsg* cm) {
     if (!in_range(sd)) return -1;
-    Socket& s = g_socks[sd];
+    Socket& s = SK(sd);
     for (int attempt = 0; attempt < 16; attempt++) {
         int hint = __atomic_load_n(&s.peer_sd, __ATOMIC_ACQUIRE);
         PairLock pl; pl.lock(sd, hint);
@@ -917,8 +1000,8 @@ static int inject_core(int sd, const void* buf, int len, const ControlMsg* cm) {
         // its fd, and gtk stalled waiting for wl_seat.capabilities. route to the peer
         // when one is connected (an unconnected/self-fed socket keeps own.rx). (satoru)
         int target = sd;
-        if (s.connected && in_range(hint) && g_socks[hint].in_use) target = hint;
-        Socket& ts = g_socks[target];
+        if (s.connected && in_range(hint) && SK(hint).in_use) target = hint;
+        Socket& ts = SK(target);
         int w = ring_write(ts.rx, (const uint8_t*)buf, len, cm, ts.type);
         pl.unlock();
         if (w > 0 && g_data_ready_cb) g_data_ready_cb(target);   // wake the client poller (satoru)
@@ -939,7 +1022,7 @@ int KernelInjectMsg(int sd, const void* buf, int len, const ControlMsg* cm) {
 
 int ActiveCount() {
     int n = 0;
-    for (int i = 0; i < UNIX_MAX_SOCKETS; i++) if (g_socks[i].in_use) n++;
+    for (int i = 0; i < cap(); i++) if (SK(i).in_use) n++;
     return n;
 }
 
@@ -947,16 +1030,16 @@ void DumpProcNetUnix(char* buf, int max_len) {
     const char* hdr = "Num       RefCount Protocol Flags    Type St Inode Path\n";
     int p = 0;
     for (int i = 0; hdr[i] && p < max_len - 1; i++) buf[p++] = hdr[i];
-    for (int i = 0; i < UNIX_MAX_SOCKETS && p < max_len - 80; i++) {
-        if (!g_socks[i].in_use) continue;
+    for (int i = 0; i < cap() && p < max_len - 80; i++) {
+        if (!SK(i).in_use) continue;
         // ffffffff: 00000002 00000000 00010000 0001 03 12345 /path
         const char* s = "ffffffff: 00000002 00000000 ";
         for (int k = 0; s[k]; k++) buf[p++] = s[k];
-        const char* fl = g_socks[i].listening ? "00010000 0001 01 " : "00000000 0001 03 ";
+        const char* fl = SK(i).listening ? "00010000 0001 01 " : "00000000 0001 03 ";
         for (int k = 0; fl[k]; k++) buf[p++] = fl[k];
         // skip inode
         buf[p++] = '0'; buf[p++] = ' ';
-        for (int k = 0; g_socks[i].path[k] && p < max_len - 2; k++) buf[p++] = g_socks[i].path[k];
+        for (int k = 0; SK(i).path[k] && p < max_len - 2; k++) buf[p++] = SK(i).path[k];
         buf[p++] = '\n';
     }
     buf[p] = 0;

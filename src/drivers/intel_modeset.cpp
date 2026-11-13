@@ -48,6 +48,9 @@
 #include "serial.h"
 #include "cpu_detect.h"
 #include "disklog.h"
+#include "graphics.h"
+#include "outputs.h"
+#include "../system/ui_config.h"
 #include "../kernel/vmm.h"
 #include "../kernel/pmm.h"
 
@@ -221,6 +224,28 @@ struct Ln {
 
 void say(const char* s) { emit(s); }
 
+// "[igpu-tc]" lines: the legacy type-c milestones the owner's boot log is
+// read for (kurono.igpu.legacytc=1). (satoru)
+void emit_tc(const char* line) {
+    SerialLogger::Log("[igpu-tc] ");
+    SerialLogger::Log(line);
+    SerialLogger::Log("\r\n");
+    if (g_out && g_out_pos < g_out_max - 2) {
+        static const char pre[] = "[igpu-tc] ";
+        for (int i = 0; pre[i] && g_out_pos < g_out_max - 2; i++) g_out[g_out_pos++] = pre[i];
+        for (int i = 0; line[i] && g_out_pos < g_out_max - 2; i++) g_out[g_out_pos++] = line[i];
+        g_out[g_out_pos++] = '\n';
+        g_out[g_out_pos] = 0;
+    }
+}
+
+struct TLn {
+    char b[320];
+    Txt t;
+    TLn() : t(b, sizeof(b)) {}
+    void go() { emit_tc(b); }
+};
+
 // ---- time: same tsc / io-delay clock as stage 1 (satoru) ----
 uint64_t g_tpu = 0;
 bool g_clock_init = false;
@@ -378,6 +403,16 @@ struct State {
     bool enhanced;
     uint8_t train_set[4];
     char last_result[96];
+    // the decoded sink edid, kept so the live rate switch and the settings
+    // page can list the timings it offers without another aux session. (satoru)
+    DpEdid::Edid edid;
+    bool edid_ok;
+    // kurono.igpu.legacytc=1: the port is a type-c port in legacy mode,
+    // connected by IntelDpAux::LegacyTcConnect (4 lanes, both phy lanes, no
+    // fia pin assignment). sink_locked: the sink reported channel eq + lock
+    // after the pipe came up. (satoru)
+    bool legacy;
+    bool sink_locked;
 };
 
 State g_s;
@@ -540,7 +575,9 @@ void set_signal_levels(const uint8_t ts[4], int lanes) {
 }
 
 bool pll_enable(const IgpuCalc::C20Pll& pll, uint32_t rate, int lanes) {
-    // intel_cx0pll_enable for a c20 phy in dp-alt (no lane reversal) (satoru)
+    // intel_cx0pll_enable for a c20 phy in dp-alt or legacy mode (no lane
+    // reversal: the vbt is not read, so legacy assumes the non-reversed
+    // wiring) (satoru)
     const Port& p = g_s.port;
     const uint8_t owned = g_s.owned;
     g_mb_err = false;
@@ -593,6 +630,14 @@ bool pll_enable(const IgpuCalc::C20Pll& pll, uint32_t rate, int lanes) {
     int cntx_raw = mb_read(0, C20_VDR_SERDES);
     if (cntx_raw < 0) return false;
     bool cntx = cntx_raw & C20_CONTEXT_TOGGLE;
+    if (g_s.legacy) {
+        // 2. intel_c20_protocol_switch_valid is true in legacy mode: clear
+        // lane 0 rawlaneaonx_dig_tx_mpllb_cal_done_bank(0..3) (0x303d + i),
+        // then 4 ms (satoru)
+        for (int i = 0; i < 4; i++) c20_sram_write((uint16_t)(0x303D + i), 0);
+        udelay(4000);
+        say("pll: legacy mode, mpllb cal_done banks 0x303d..0x3040 cleared");
+    }
     {
         Ln l; l.t.s("pll: c20 serdes 0xd00 = 0x"); l.t.x((uint32_t)cntx_raw, 2); l.t.s(", context "); l.t.s(cntx ? "a in use, writing a" : "b selected, writing b");
         l.go();
@@ -623,7 +668,7 @@ bool pll_enable(const IgpuCalc::C20Pll& pll, uint32_t rate, int lanes) {
     // 6. intel_cx0_program_phy_lane: disable the tx lanes above lane_count
     // (phy_cx0_tx_control(tx, 2) = 0x400 + (tx - 1) * 0x200 + 2, bit 6) (satoru)
     uint8_t disables = (uint8_t)((0xFu << lanes) & 0xF);
-    if (lanes == 1) disables = (uint8_t)((disables & ~0x3u) | 0x1u);   // dp-alt with one lane (satoru)
+    if (lanes == 1 && !g_s.legacy) disables = (uint8_t)((disables & ~0x3u) | 0x1u);   // dp-alt with one lane (satoru)
     for (int i = 0; i < 4; i++) {
         int tx = i % 2 + 1;
         uint8_t m = i < 2 ? LANE0 : LANE1;
@@ -792,6 +837,17 @@ void fb_pattern() {
     // of the cpu caches (linux flushes scanout buffers the same way) (satoru)
     for (uint64_t o = 0; o < (uint64_t)g_s.pitch * (uint64_t)h; o += 64)
         __asm__ __volatile__("clflush (%0)" : : "r"((uint8_t*)fb + o) : "memory");
+    __asm__ __volatile__("mfence" ::: "memory");
+}
+
+// legacy type-c path: no test pattern on the owner's monitor, the screen is
+// black until the compositor draws the desktop into it. (satoru)
+void fb_black() {
+    uint8_t* fb = (uint8_t*)(uintptr_t)g_s.fb_phys;
+    uint64_t n = (uint64_t)g_s.pitch * (uint64_t)g_s.fb_h;
+    for (uint64_t o = 0; o < n; o += 8) *(volatile uint64_t*)(fb + o) = 0;
+    for (uint64_t o = 0; o < n; o += 64)
+        __asm__ __volatile__("clflush (%0)" : : "r"(fb + o) : "memory");
     __asm__ __volatile__("mfence" ::: "memory");
 }
 
@@ -1366,17 +1422,8 @@ bool power_wells() {
 }
 
 bool pick_mode(const DpEdid::Edid& e, uint32_t target_mhz) {
-    if (e.preferred < 0) { say("edid has no preferred timing"); return false; }
-    const DpEdid::Timing& pt = e.t[e.preferred];
-    int best = -1;
-    uint32_t bestd = 0xFFFFFFFFu;
-    for (int i = 0; i < e.nt; i++) {
-        const DpEdid::Timing& t = e.t[i];
-        if (t.hact != pt.hact || t.vact != pt.vact || t.interlaced) continue;
-        uint32_t d = t.refresh_mhz > target_mhz ? t.refresh_mhz - target_mhz : target_mhz - t.refresh_mhz;
-        if (d < bestd || (d == bestd && best >= 0 && t.pixclk_khz < e.t[best].pixclk_khz)) { bestd = d; best = i; }
-    }
-    if (best < 0) best = e.preferred;
+    int best = DpEdid::PickTimingAtResolution(e, target_mhz);
+    if (best < 0) { say("edid has no preferred timing"); return false; }
     const DpEdid::Timing& t = e.t[best];
     if (!IgpuCalc::ModeFromDtd(t.pixclk_khz, t.hact, t.hblank, t.hfp, t.hsync, t.vact, t.vblank, t.vfp, t.vsync,
                                t.hpos, t.vpos, t.interlaced, &g_s.mode)) { say("edid timing is not usable"); return false; }
@@ -1402,7 +1449,19 @@ void begin_output(char* out, int maxo) {
 
 } // namespace
 
-int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
+namespace {
+
+// PickFittingTiming callback: the mode fits the cdclk (2 px / clk) and at
+// least one 8b/10b link config within the caps carries it (satoru)
+struct FitCtx { uint32_t cdclk_khz, max_rate_khz; int max_lanes; };
+bool timing_fits(const DpEdid::Timing& t, void* c) {
+    const FitCtx& f = *(const FitCtx*)c;
+    if (f.cdclk_khz < (t.pixclk_khz + 1) / 2) return false;
+    IgpuCalc::LinkCfg tmp[12];
+    return IgpuCalc::LinkConfigs(f.max_rate_khz, f.max_lanes, t.pixclk_khz, t.hact, 24, tmp, 12) > 0;
+}
+
+int light_impl(char* out, int maxo, uint32_t target_hz) {
     begin_output(out, maxo);
     if (g_s.lit) { say("already lit, `gpumode off` first"); return finish(0); }
     g_mmio = IntelDisplayProbe::Mmio();
@@ -1413,6 +1472,9 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     uint64_t t0 = now_us();
     g_writes = g_blocked = g_mb_ops = 0;
     g_s.steps = 0;
+    g_s.legacy = false;
+    g_s.sink_locked = false;
+    g_s.last_result[0] = 0;
     say("---- intel display stage 2: modeset of an external dp sink on pipe b ----");
     if (!g_tpu) say("warning: no tsc frequency, waits use the io-delay clock and the run budget is off");
 
@@ -1438,6 +1500,14 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     if (!power_wells()) return finish(0);
     uint32_t dc = rd(R_DC_STATE_EN);
     if (dc & 3) { Ln l; l.t.s("dc_state_en 0x"); l.t.x(dc, 8); l.t.s(" allows dc5/dc6, refusing (cx0 needs dc off)"); l.go(); return finish(0); }
+    // kurono.igpu.legacytc=1: a sink stage 1 read on a legacy type-c port.
+    // a `gpumode off` or rate switch released the port, so connect again
+    // (satoru)
+    bool legacy = si.legacy && IntelDpAux::LegacyTcEnabled();
+    if (legacy && !(rd(p.buf1) & BUF1_TC_OWNED) && !IntelDpAux::LegacyTcConnect(tc)) {
+        TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": legacy connect failed, nothing lit"); l.go();
+        return finish(0);
+    }
     uint32_t b1 = rd(p.buf1), tcss = rd(R_TCSS_DDI_STATUS + 4u * (uint32_t)(tc - 1)), pica = rd(R_PICA_ISR);
     bool dpalt = (pica >> (16 + tc - 1)) & 1;
     {
@@ -1445,6 +1515,18 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
         l.t.d((b1 & BUF1_TCSS_PWR_ST) != 0); l.t.s(" phy_rdy="); l.t.d((b1 & BUF1_SOC_PHY_READY) != 0); l.t.s(" | tcss_ddi_status 0x");
         l.t.x(tcss, 8); l.t.s(" | dp-alt live="); l.t.d(dpalt); l.go();
     }
+    if (legacy && !dpalt) {
+        if (!(b1 & BUF1_TC_OWNED) || !(b1 & BUF1_TCSS_PWR_ST) || !(b1 & BUF1_SOC_PHY_READY)) {
+            say("legacy type-c phy is not owned / powered / ready, refusing"); return finish(0);
+        }
+        // get_max_lane_count: 4 outside dp-alt; intel_cx0_get_owned_lane_mask:
+        // both lanes outside dp-alt. no fia pin assignment in legacy mode (satoru)
+        g_s.legacy = true;
+        g_s.pin = 'L';
+        g_s.max_lanes = 4;
+        g_s.owned = BOTH_LANES;
+        TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": modeset on pipe B, legacy mode, 4 lanes, both phy lanes, no lane reversal"); l.go();
+    } else {
     if (!(b1 & BUF1_TC_OWNED) || !(b1 & BUF1_TCSS_PWR_ST) || !(b1 & BUF1_SOC_PHY_READY) || !dpalt) {
         say("type-c phy is not owned / powered / ready in dp-alt mode, refusing (no tc connect sequence here)"); return finish(0);
     }
@@ -1459,6 +1541,7 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     }
     if (g_s.max_lanes == 0) { say("no dp pin assignment, refusing"); return finish(0); }
     g_s.owned = g_s.max_lanes > 2 ? BOTH_LANES : LANE0;   // intel_cx0_get_owned_lane_mask (satoru)
+    }
     // pipe b / the port must be idle and no other transcoder on this port (satoru)
     uint32_t tconf = rd(P_TRANSCONF), tfunc = rd(T_DDI_FUNC), dbuf = rd(p.ddi_buf), pctl = rd(PL_CTL);
     {
@@ -1500,16 +1583,20 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     if (pa_ddb_max > 2048) { say("pipe a ddb reaches past bank 0, refusing"); return finish(0); }
 
     // ---- mode + link (satoru) ----
-    static DpEdid::Edid e;
-    if (!DpEdid::DecodeEdid(si.edid, si.edid_len, &e)) { say("edid did not decode"); return finish(0); }
-    if (!pick_mode(e, (target_hz ? target_hz : 60) * 1000)) return finish(0);
+    if (!DpEdid::DecodeEdid(si.edid, si.edid_len, &g_s.edid)) {
+        g_s.edid_ok = false;
+        say("edid did not decode");
+        return finish(0);
+    }
+    g_s.edid_ok = true;
+    if (!pick_mode(g_s.edid, (target_hz ? target_hz : 60) * 1000)) return finish(0);
     uint32_t cd = rd(R_CDCLK_CTL);
     uint32_t cdclk = (cd & 0x7FF) * 500 + 1000;
     {
         Ln l; l.t.s("cdclk: ctl 0x"); l.t.x(cd, 8); l.t.s(" -> "); l.t.d(cdclk); l.t.s(" khz, mode needs "); l.t.d((g_s.mode.clock_khz + 1) / 2);
         l.t.s(" (2 px/clk)"); l.go();
     }
-    if (cdclk < (g_s.mode.clock_khz + 1) / 2) { say("cdclk too low for this mode, refusing (a cdclk change would touch pipe a)"); return finish(0); }
+    if (cdclk < (g_s.mode.clock_khz + 1) / 2 && !g_s.legacy) { say("cdclk too low for this mode, refusing (a cdclk change would touch pipe a)"); return finish(0); }
 
     if (!IntelDpAux::BeginSession(tc, 2500000, 4000)) { say("aux session failed"); return finish(0); }
     // keep the aux power (tc-cold block) for as long as we are lit (satoru)
@@ -1530,6 +1617,29 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     }
     LinkCfg cfgs[12];
     int ncfg = IgpuCalc::LinkConfigs(max_rate, max_lanes, g_s.mode.clock_khz, g_s.mode.hdisplay, 24, cfgs, 12);
+    if (g_s.legacy && (!ncfg || cdclk < (g_s.mode.clock_khz + 1) / 2)) {
+        // the edid's mode is more than the link or the cdclk carries (a cdclk
+        // change would touch pipe a): take the largest timing that fits (satoru)
+        FitCtx fc = { cdclk, max_rate, max_lanes };
+        int alt = DpEdid::PickFittingTiming(g_s.edid, (target_hz ? target_hz : 60) * 1000, timing_fits, &fc);
+        const DpEdid::Timing* t = alt >= 0 ? &g_s.edid.t[alt] : nullptr;
+        if (!t || !IgpuCalc::ModeFromDtd(t->pixclk_khz, t->hact, t->hblank, t->hfp, t->hsync, t->vact, t->vblank, t->vfp, t->vsync,
+                                         t->hpos, t->vpos, t->interlaced, &g_s.mode)) {
+            TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": no edid timing fits link "); l.t.d(max_rate / 1000); l.t.s(" mhz x");
+            l.t.d((uint64_t)max_lanes); l.t.s(" / cdclk "); l.t.d(cdclk); l.t.s(" khz"); l.go();
+            rollback("no edid timing fits the link"); return finish(0);
+        }
+        ncfg = IgpuCalc::LinkConfigs(max_rate, max_lanes, g_s.mode.clock_khz, g_s.mode.hdisplay, 24, cfgs, 12);
+        char tb[160];
+        DpEdid::FormatTiming(*t, tb, sizeof(tb));
+        Ln l; l.t.s("mode (capped to the link / cdclk): "); l.t.s(tb); l.go();
+    }
+    if (g_s.legacy) {
+        TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": mode chosen "); l.t.d(g_s.mode.hdisplay); l.t.c('x'); l.t.d(g_s.mode.vdisplay);
+        l.t.c('@'); l.t.hz(g_s.mode.refresh_mhz); l.t.s(" pixclk "); l.t.d(g_s.mode.clock_khz); l.t.s(" khz | sink max ");
+        l.t.d(max_rate / 1000); l.t.s(" mhz x"); l.t.d((uint64_t)max_lanes); l.t.s(" lttprs "); l.t.d((uint64_t)g_s.lttpr_count);
+        l.t.s(" | link candidates "); l.t.d((uint64_t)ncfg); l.go();
+    }
     {
         Ln l; l.t.s("link: max "); l.t.d(max_rate / 1000); l.t.s(" mhz x"); l.t.d((uint64_t)max_lanes); l.t.s(", mode needs ");
         l.t.d(IgpuCalc::ModeDataRate(g_s.mode.clock_khz, 24)); l.t.s(" kB/s, candidates:");
@@ -1539,8 +1649,12 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     if (!ncfg) { rollback("no link config carries this mode"); return finish(0); }
 
     // ---- framebuffer + ggtt (satoru) ----
+    // a live rate switch keeps the same resolution and therefore the same
+    // framebuffer: leave what is on screen instead of flashing the test
+    // pattern while the compositor repaints. (satoru)
+    bool fb_kept = g_s.fb_phys && g_s.fb_w == g_s.mode.hdisplay && g_s.fb_h == g_s.mode.vdisplay;
     if (!fb_alloc(g_s.mode.hdisplay, g_s.mode.vdisplay)) { rollback("framebuffer"); return finish(0); }
-    fb_pattern();
+    if (!fb_kept) { if (g_s.legacy) fb_black(); else fb_pattern(); }
     if (!ggtt_setup()) { rollback("ggtt"); return finish(0); }
 
     // ---- pre plane: pmdemand, dbuf slices (intel_atomic_commit_tail
@@ -1564,7 +1678,14 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     bool up = false;
     for (int i = 0; i < ncfg && i < 3 && !up; i++) {
         if (over_budget()) { say("run budget exceeded before a link attempt"); break; }
-        if (link_up(cfgs[i])) { up = true; break; }
+        g_s.last_result[0] = 0;
+        bool lok = link_up(cfgs[i]);
+        if (g_s.legacy) {
+            TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": link training "); l.t.d(cfgs[i].rate_khz / 1000); l.t.s(" mhz x");
+            l.t.d((uint64_t)cfgs[i].lanes); l.t.s(lok ? " OK" : " FAILED"); l.t.s(" (");
+            l.t.s(g_s.last_result[0] ? g_s.last_result : "failed before training, see the [igpu-mode] lines above"); l.t.c(')'); l.go();
+        }
+        if (lok) { up = true; break; }
         Ln l; l.t.s("link attempt "); l.t.d(cfgs[i].rate_khz / 1000); l.t.c('x'); l.t.d((uint64_t)cfgs[i].lanes); l.t.s(" failed, port down"); l.go();
         if (g_s.steps & S_FUNC_CFG) rmw(T_DDI_FUNC, DDI_FUNC_ENABLE | DDI_FUNC_PORT_MASK | DDI_FUNC_MODE_MASK, 0);
         port_down();
@@ -1572,17 +1693,24 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
     if (!up) { rollback("link training failed on every attempted config"); return finish(0); }
 
     // ---- pipe, transcoder, plane (satoru) ----
-    if (!pipe_up(wms)) { rollback("pipe b did not come up"); return finish(0); }
+    bool pup = pipe_up(wms);
+    if (g_s.legacy) {
+        TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": pipe B enable "); l.t.s(pup ? "OK, scanning" : "FAILED, scanline not moving");
+        l.t.s(" (transconf 0x"); l.t.x(rd(P_TRANSCONF), 8); l.t.s(" surflive 0x"); l.t.x(rd(PL_SURFLIVE), 8); l.t.c(')'); l.go();
+    }
+    if (!pup) { rollback("pipe b did not come up"); return finish(0); }
 
     // ---- verify the sink side (satoru) ----
     uint8_t st[6] = {};
     if (dpcd_rd(0x202, st, 6) == 6) {
         bool okst = DpLt::ChannelEqOk(st, g_s.link.lanes);
+        g_s.sink_locked = okst && (st[3] & 1);
         Ln l; l.t.s("sink after enable: lane status"); for (int i = 0; i < 6; i++) { l.t.c(' '); l.t.x(st[i], 2); }
         l.t.s(okst ? " (locked)" : " (NOT locked)"); l.t.s(" sink_status in_sync="); l.t.d(st[3] & 1); l.go();
     }
     diff_pipe_a("after enable");
     g_s.lit = true;
+    IntelModeset::PublishOutputRate();
     {
         Ln l; l.t.s("summary: LIT TC"); l.t.d((uint64_t)tc); l.t.s(" pipe B "); l.t.d(g_s.mode.hdisplay); l.t.c('x'); l.t.d(g_s.mode.vdisplay);
         l.t.c('@'); l.t.hz(g_s.mode.refresh_mhz); l.t.s(" link "); l.t.d(g_s.link.rate_khz / 1000); l.t.s("x"); l.t.d((uint64_t)g_s.link.lanes);
@@ -1591,8 +1719,34 @@ int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
         l.t.s(" phy ops "); l.t.d((uint64_t)g_mb_ops); l.t.s(" blocked "); l.t.d((uint64_t)g_blocked); l.t.s(" | ");
         l.t.d(g_tpu ? (now_us() - t0) / 1000 : 0); l.t.s(" ms"); l.go();
     }
+    if (g_s.legacy) {
+        TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": LIT "); l.t.d(g_s.mode.hdisplay); l.t.c('x'); l.t.d(g_s.mode.vdisplay);
+        l.t.c('@'); l.t.hz(g_s.mode.refresh_mhz); l.t.s(" on pipe B, link "); l.t.d(g_s.link.rate_khz / 1000); l.t.s(" mhz x");
+        l.t.d((uint64_t)g_s.link.lanes); l.t.s(", sink "); l.t.s(g_s.sink_locked ? "locked" : "NOT locked (link may be marginal)");
+        l.t.s(", internal panel "); l.t.s(g_blocked ? "check the pipe a lines" : "untouched"); l.go();
+    }
     return finish(1);
 }
+
+} // namespace
+
+int IntelModeset::Light(char* out, int maxo, uint32_t target_hz) {
+    int r = light_impl(out, maxo, target_hz);
+    if (!g_s.lit) {
+        // any failure: what this run enabled is rolled back already; drop the
+        // legacy type-c connection too, so the port is left as the firmware
+        // had it. the internal panel was never written (allowlist). (satoru)
+        for (int tc = 1; tc <= 4; tc++) {
+            if (!IntelDpAux::LegacyTcHeld(tc)) continue;
+            TLn l; l.t.s("TC"); l.t.d((uint64_t)tc); l.t.s(": FAILED, external screen not lit ("); l.t.s(g_s.last_result[0] ? g_s.last_result : "see [igpu-mode] lines");
+            l.t.s("); releasing ownership and power, internal panel untouched"); l.go();
+            IntelDpAux::LegacyTcRelease(tc, "modeset failed");
+        }
+    }
+    return r;
+}
+
+bool IntelModeset::LegacyTcLit() { return g_s.lit && g_s.legacy && g_s.sink_locked; }
 
 int IntelModeset::Off(char* out, int maxo) {
     begin_output(out, maxo);
@@ -1603,6 +1757,7 @@ int IntelModeset::Off(char* out, int maxo) {
     g_run_deadline = 0;
     IntelDpAux::BeginSession(g_s.port.tc, 500000, 200);
     rollback("gpumode off");
+    if (g_s.legacy) { IntelDpAux::LegacyTcRelease(g_s.port.tc, "gpumode off"); g_s.legacy = false; }
     say("summary: OFF (framebuffer memory kept)");
     return finish(0);
 }
@@ -1638,13 +1793,17 @@ int IntelModeset::Status(char* out, int maxo) {
 
 int IntelModeset::Boot(bool disabled) {
     begin_output(nullptr, 0);
-    if (disabled) { say("skipped (kurono.igpu.modeset=0)"); return 0; }
+    if (disabled) { say("skipped (kurono.igpu.modeset=0)"); IntelDpAux::LegacyTcReleaseAll("modeset disabled"); return 0; }
     if (!IntelDisplayProbe::Mmio()) { say("no usable intel display ver 14 engine, skipped"); return 0; }
     // file kill switch: KUROMODE.OFF in the KURONO fat root (8.3 name
     // "KUROMODEOFF"), so a fixed efi command line can still turn this off (satoru)
     if (DiskLog::Ready()) {
         uint64_t sz = 0;
-        if (DiskLog::StatRootFile("KUROMODEOFF", &sz) == 0) { say("skipped (KUROMODE.OFF found on the KURONO partition)"); return 0; }
+        if (DiskLog::StatRootFile("KUROMODEOFF", &sz) == 0) {
+            say("skipped (KUROMODE.OFF found on the KURONO partition)");
+            IntelDpAux::LegacyTcReleaseAll("KUROMODE.OFF");
+            return 0;
+        }
     } else {
         say("note: KURONO partition not open, the KUROMODE.OFF kill switch could not be checked");
     }
@@ -1654,6 +1813,83 @@ int IntelModeset::Boot(bool disabled) {
     if (!any) { say("no external dp sink on a type-c port in the stage 1 probe, skipped"); return 0; }
     Light(nullptr, 0, 60);
     return 0;
+}
+
+int IntelModeset::Rates(uint32_t* hz, int max) {
+    if (!g_s.lit || !g_s.edid_ok || !hz || max <= 0) return 0;
+    return DpEdid::RatesAtPreferred(g_s.edid, hz, max);
+}
+
+uint32_t IntelModeset::CurrentMilliHz() {
+    return g_s.lit ? g_s.mode.refresh_mhz : 0;
+}
+
+uint32_t IntelModeset::CurrentHz() {
+    return g_s.lit ? (g_s.mode.refresh_mhz + 500) / 1000 : 0;
+}
+
+int IntelModeset::SetRate(char* out, int maxo, uint32_t hz) {
+    begin_output(out, maxo);
+    if (!g_s.lit) { say("not lit, nothing to switch"); return finish(0); }
+    uint32_t old_mhz = g_s.mode.refresh_mhz;
+    uint32_t old_hz = (old_mhz + 500) / 1000;
+    if (hz == 0) hz = old_hz;
+    if (hz == old_hz) {
+        Ln l; l.t.s("rate: already at "); l.t.d((uint64_t)hz); l.t.s(" Hz"); l.go();
+        return finish(1);
+    }
+    // the plane surface is about to disappear: restore/release the accelerated
+    // present paths first so they re-arm on the new mode instead of scanning a
+    // stale surface (the existing relayout/suspend path). (satoru)
+    Graphics::ZcSuspendIfActive();
+    Off(nullptr, 0);
+    begin_output(out, maxo);
+    {
+        Ln l; l.t.s("rate: switching "); l.t.d((uint64_t)old_hz); l.t.s(" -> "); l.t.d((uint64_t)hz);
+        l.t.s(" Hz (pipe B off, light again)"); l.go();
+    }
+    Light(out, maxo, hz);
+    if (!g_s.lit) {
+        begin_output(out, maxo);
+        Ln l; l.t.s("rate: "); l.t.d((uint64_t)hz); l.t.s(" Hz failed, restoring "); l.t.d((uint64_t)old_hz); l.t.s(" Hz"); l.go();
+        Light(out, maxo, old_hz);
+    }
+    if (g_s.lit) {
+        Ln l; l.t.s("rate: now "); l.t.hz(g_s.mode.refresh_mhz); l.t.s(" Hz on pipe B"); l.go();
+        PublishOutputRate();
+    }
+    return finish(g_s.lit ? 1 : 0);
+}
+
+void IntelModeset::PublishOutputRate() {
+    uint64_t phys = 0;
+    int w = 0, h = 0;
+    uint32_t pitch = 0;
+    if (!GetOutput(&phys, &w, &h, &pitch)) return;
+    for (int i = 0; i < Outputs::Total(); i++) {
+        const Output* o = Outputs::Get(i);
+        if (o && o->phys == phys) Outputs::SetRefreshMilliHz(i, CurrentMilliHz());
+    }
+}
+
+int IntelModeset::ApplySavedRate() {
+    if (!g_s.lit) return 0;
+    int saved = UIConfig::Int("display.dp_hz", 0);
+    if (saved <= 0) return 0;
+    uint32_t now_hz = CurrentHz();
+    if ((uint32_t)saved == now_hz) {
+        Ln l; l.t.s("rate: saved "); l.t.d((uint64_t)saved); l.t.s(" Hz already lit"); l.go();
+        return 0;
+    }
+    char tmp[96];
+    int r = SetRate(tmp, (int)sizeof(tmp), (uint32_t)saved);
+    SerialLogger::Log("[hz] dp saved ");
+    SerialLogger::LogDec(saved);
+    SerialLogger::Log(" Hz -> ");
+    SerialLogger::LogDec((int)CurrentHz());
+    SerialLogger::Log(" Hz (boot) ");
+    SerialLogger::Log(r ? "lit\r\n" : "failed\r\n");
+    return r;
 }
 
 bool IntelModeset::GetOutput(uint64_t* phys, int* w, int* h, uint32_t* pitch) {

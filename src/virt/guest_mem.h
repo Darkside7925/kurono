@@ -46,7 +46,9 @@ constexpr uint32_t GUEST_DEFAULT_RAM_MB = 64;
 constexpr uint32_t GUEST_MAX_RAM_MB     = 3008; // stays below the 0xC0000000 vpci window (satoru)
 // high ram is allocated as physically contiguous chunks of this size (satoru)
 constexpr uint32_t GUEST_HI_CHUNK       = 4u * 1024 * 1024;
-constexpr uint32_t GUEST_MAX_HI_CHUNKS  = 768;
+constexpr uint32_t GUEST_MAX_HI_CHUNKS  = 1536;
+// lazy (dynamic) mode: smaller chunks that are allocated when first touched (satoru)
+constexpr uint32_t GUEST_HI_CHUNK_LAZY  = 2u * 1024 * 1024;
 constexpr uint32_t GUEST_MIN_RAM_MB     = 4;
 
 //  guestphysmap - a region of guest physical memory backed by host memory
@@ -72,6 +74,24 @@ constexpr uint32_t BDA_KBD_FLAGS   = 0x0417;
 class GuestMemoryManager {
 public:
     static void Init(uint32_t ram_mb);
+    // lazy high ram: host frames are allocated when the guest (or a device model) first
+    // touches a 2 mb chunk instead of all at once. set before Init. (satoru)
+    static void SetLazy(bool on);
+    static bool IsLazy();
+    // make sure the chunk holding guest_phys is backed; returns its gpa/host/size.
+    // false if guest_phys is not high ram or the host is out of contiguous memory (satoru)
+    static bool EnsureHighChunk(uint64_t guest_phys, uint64_t* cgpa, uint8_t** host, uint32_t* size);
+    static uint32_t ResidentChunks();              // chunks with host frames now (satoru)
+    static uint32_t ChunkBytes();                  // current high ram chunk size (satoru)
+    static uint32_t ChunkIndex(uint64_t guest_phys);
+    static uint64_t ResidentBytes();
+    static bool     ReleaseHighChunk(uint32_t i, uint64_t* cgpa, uint32_t* size);
+    static bool     HighChunkBacked(uint32_t i);
+    // 4 kb fallback backing for a chunk when no 2 mb contiguous block exists (satoru)
+    static void     SetForceSplit(int mode);       // kurono.vm.splitmem (test) (satoru)
+    static uint32_t SplitChunks();
+    static bool     IsSplit(uint32_t i);
+    static bool     SplitPage(uint32_t i, uint32_t page, uint8_t** host);
 
     // allocates host-backed ram for the guest and sets up the memory map.
     static bool AllocateGuestRAM(uint32_t ram_mb);

@@ -3,6 +3,9 @@
 #include "../drivers/timer.h"
 #include "../fs/kvfs.h"
 #include "../kernel/heap.h"
+#include "../kernel/time.h"
+#include "../ui/window_manager.h"
+#include "png_encode.h"
 
 namespace {
 
@@ -195,6 +198,89 @@ bool Screenshot::CaptureTimestamped() {
     append_str(path, (int)sizeof(path), &pos, num);
     append_str(path, (int)sizeof(path), &pos, ".bmp");
     return CaptureToBMP(path);
+}
+
+bool Screenshot::CaptureRegionPNG(const char* kvfs_path, int x, int y, int w, int h) {
+    if (!kvfs_path) return false;
+    uint8_t* fb = Graphics::GetBackBuffer();
+    int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
+    uint32_t pitch = Graphics::GetPitch();
+    int bpp = Graphics::GetBpp();
+    if (!fb || sw <= 0 || sh <= 0 || pitch == 0) return false;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
+    if (w <= 0 || h <= 0) return false;
+    uint32_t raw_n = PngEncode::RawSize(w, h);
+    uint32_t cap = PngEncode::MaxSize(w, h);
+    uint8_t* raw = (uint8_t*)KernelHeap::Alloc(raw_n);
+    uint8_t* out = raw ? (uint8_t*)KernelHeap::Alloc(cap) : nullptr;
+    if (!raw || !out) {
+        if (raw) KernelHeap::Free(raw);
+        return false;
+    }
+    const uint8_t* src = fb + (size_t)y * pitch + (size_t)x * (size_t)(bpp / 8);
+    uint32_t n = PngEncode::Encode(src, w, h, pitch, bpp, raw, out, cap);
+    KernelHeap::Free(raw);
+    int rc = n ? KVFS::WriteFile(kvfs_path, out, n) : -1;
+    KernelHeap::Free(out);
+    return rc >= 0;
+}
+
+static volatile int g_shot_request = 0;
+
+void Screenshot::Request(bool window_only) {
+    g_shot_request = window_only ? 2 : 1;
+    Graphics::MarkUIDirty();   // an idle desktop loop may be asleep (satoru)
+}
+
+int Screenshot::TakeRequest() { return __atomic_exchange_n(&g_shot_request, 0, __ATOMIC_ACQ_REL); }
+
+static void two_digits(char* d, int v) {
+    d[0] = (char)('0' + (v / 10) % 10);
+    d[1] = (char)('0' + v % 10);
+}
+
+bool Screenshot::CaptureToPictures(bool window_only, char* out_path, int out_cap) {
+    int x = 0, y = 0, w = Graphics::GetWidth(), h = Graphics::GetHeight();
+    if (window_only) {
+        Window* fw = WindowManager::GetFocusedWindow();
+        if (!fw || fw->state == WIN_CLOSED || fw->state == WIN_MINIMIZED || !fw->visible) return false;
+        x = fw->x; y = fw->y; w = fw->w; h = fw->h;
+    }
+    KVFS::Mkdirs("/home/user/Pictures");
+    // Screenshot_YYYY-MM-DD_HH-MM-SS.png in local time, -2, -3 ... on a clash. (satoru)
+    DateTime dt = TimeManager::NowLocalDateTime();
+    char base[64];
+    int pos = 0;
+    append_str(base, (int)sizeof(base), &pos, "/home/user/Pictures/Screenshot_");
+    char num[16];
+    u32_to_str(dt.year, num, (int)sizeof(num));
+    append_str(base, (int)sizeof(base), &pos, num);
+    char part[16] = "-MM-DD_hh-mm-ss";
+    two_digits(part + 1, dt.mon); two_digits(part + 4, dt.dom);
+    two_digits(part + 7, dt.h); two_digits(part + 10, dt.m); two_digits(part + 13, dt.s);
+    append_str(base, (int)sizeof(base), &pos, part);
+    char path[80];
+    for (int k = 1; k < 100; k++) {
+        int pp = 0;
+        path[0] = 0;
+        append_str(path, (int)sizeof(path), &pp, base);
+        if (k > 1) {
+            append_str(path, (int)sizeof(path), &pp, "-");
+            u32_to_str((uint32_t)k, num, (int)sizeof(num));
+            append_str(path, (int)sizeof(path), &pp, num);
+        }
+        append_str(path, (int)sizeof(path), &pp, ".png");
+        if (!KVFS::Resolve(path)) break;
+    }
+    if (out_path && out_cap > 0) {
+        int op = 0;
+        out_path[0] = 0;
+        append_str(out_path, out_cap, &op, path);
+    }
+    return CaptureRegionPNG(path, x, y, w, h);
 }
 
 // end (satoru)

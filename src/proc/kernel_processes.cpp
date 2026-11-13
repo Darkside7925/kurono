@@ -8,10 +8,13 @@
 
 #include "kernel_processes.h"
 #include "scheduler.h"
+#include "smp.h"
+#include "../hal/hal.h"   // per-cpu busy tables for [cpuload] (satoru)
 #include "spinlock.h"
 #include "kernel_locks.h"
 #include "../kernel/types.h"
 #include "../kernel/heap.h"
+#include "../kernel/memboot.h"   // boot ram census (satoru)
 #include "../kernel/hrtimer.h"
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
@@ -21,9 +24,11 @@
 #include "../drivers/audio.h"
 #include "../drivers/audio_server.h"
 #include "../drivers/pulse_server.h"
+#include "../drivers/audio_r3.h"
 #include "../drivers/ac97.h"
 #include "../drivers/graphics.h"
 #include "../drivers/intel_accel.h"   // hardware cursor frame accounting (satoru)
+#include "../kernel/kld_display.h"       // KLD display desktop bridge (satoru)
 #include "../drivers/display_mgr.h"
 #include "../drivers/usb.h"
 #include "../drivers/e1000.h"
@@ -31,6 +36,7 @@
 #include "../net/network.h"
 #include "../net/dhcp.h"
 #include "../net/tcpip.h"
+#include "../net/sntp.h"   // network time service (satoru)
 #include "../linux/linux_netbridge.h"   // task 30: wake inet pollers after the nic drain (satoru)
 #include "../system/input_manager.h"
 #include "../system/logging.h"
@@ -62,11 +68,14 @@
 #include "../apps/denji_app.h"
 #include "../security/ksa.h"   // one-shot interactive prompt demo (kurono.ksa.prompt) (satoru)
 #include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
+#include "../ui/gfx_bench.h"     // kurono.gfxstats / kurono.gfxbench frame stats (satoru)
+#include "../ui/gfx_oracle.h"    // kurono.gfx.oracle damage oracle (satoru)
 // test rig globals, defined in hal/hal.cpp (satoru)
 extern volatile uint32_t g_ffcrash_secs;
 extern volatile uint64_t g_ffcrash_as, g_ffcrash_at;
 extern volatile int g_ffreopen_left;
 int g_gui_extra_terms = 0;   // kurono.guiterms=N: extra terminal windows after the autorun one (satoru)
+uint32_t g_gui_ff_after_s = 0;   // kurono.ffafter=N: firefox N s after the autorun command (satoru)
 static int g_wp_test = 0;    // kurono.wptest=1: deterministic wallpaper damage test (satoru)
 
 namespace KernelProcesses {
@@ -336,12 +345,50 @@ bool RunShellCommandDetached(const char* cmd) {
 // on the bsp), and PumpUI ran this same work INSIDE the syscall under kls. so a
 // kernel proc's work runs under kls too: entered after it wakes, left before it
 // sleeps or yields, never held across a switch. old mode: no-op. (satoru)
+// [guihold]: which part of the gui frame body holds kls for long. a phase is
+// the span between two gh.phase() marks; one line per phase that took >= 50 ms
+// with kls held at both ends, bounded. diagnostic for the "gui bottlenecked
+// when opening an app" hunt; costs one timer read per mark. (satoru)
+struct GuiHoldProbe {
+    const bool* held; const uint32_t* gen; uint32_t t; const char* name; bool was_held; uint32_t g0;
+    GuiHoldProbe(const bool* h, const uint32_t* g) : held(h), gen(g), t(Timer::GetRealMs()), name("top"), was_held(*h), g0(*g) {}
+    void phase(const char* next) {
+        uint32_t now = Timer::GetRealMs();
+        static uint32_t s_logs = 0;
+        if (now - t >= 50 && was_held && *held && *gen == g0 && s_logs < 200 && LinuxSyscall::KlsProfOn()) {   // held the whole span; kurono.klsprof=1 (satoru)
+            s_logs++;
+            SerialLogger::Log("[guihold] "); SerialLogger::Log(name);
+            SerialLogger::Log(" ms="); SerialLogger::LogDec((int)(now - t));
+            SerialLogger::Log(" t="); SerialLogger::LogDec((int)now);
+            SerialLogger::Log("\r\n");
+        }
+        t = now; name = next; was_held = *held; g0 = *gen;
+    }
+};
+
 struct KlsSection {
     bool held = false;
-    void enter() { if (!held && Scheduler::SchedV2()) { LinuxSyscall::LayerLock(); held = true; } }
+    uint32_t gen = 0;   // enters so far: the [guihold] probe skips a phase that re-took kls (satoru)
+    void enter() {
+        if (!held && Scheduler::SchedV2()) {
+            uint32_t w0 = Timer::GetRealMs();
+            LinuxSyscall::LayerLock(); held = true; gen++;
+            uint32_t w = Timer::GetRealMs() - w0;
+            static uint32_t s_wait_logs = 0;
+            if (w >= 50 && s_wait_logs < 100 && LinuxSyscall::KlsProfOn()) {   // waiting for kls, not holding it; kurono.klsprof=1 (satoru)
+                s_wait_logs++;
+                SerialLogger::Log("[guihold] kls-wait ms="); SerialLogger::LogDec((int)w);
+                SerialLogger::Log(" t="); SerialLogger::LogDec((int)Timer::GetRealMs()); SerialLogger::Log("\r\n");
+            }
+        }
+    }
     void leave() { if (held) { LinuxSyscall::LayerUnlock(); held = false; } }
     ~KlsSection() { leave(); }
 };
+
+// kurono.cpuload=N: seconds between [cpuload] lines under sched=2 (30, 0 = off). (satoru)
+static uint32_t g_cpuload_secs = 30;
+void SetCpuLoadSecs(uint32_t s) { g_cpuload_secs = s; }
 
 // sched=2: concurrent terminal commands (kurono.schedterm=0 keeps the single shell). (satoru)
 static bool g_term_workers = true;
@@ -350,6 +397,54 @@ void SetTermWorkers(bool on) { g_term_workers = on; }
 // and run `help` there while the first window's command is still running. (satoru)
 static bool g_term_test = false;
 void SetTermTest(bool on) { g_term_test = on; }
+
+// kurono.appexit=SECS (test rig): close firefox after SECS and census 5 s later. (satoru)
+static uint32_t g_appexit_secs = 0;
+void SetAppExitTest(uint32_t secs) {
+    g_appexit_secs = secs;
+    SerialLogger::Log("[appexit] armed secs=");
+    SerialLogger::LogDec((int)secs);
+    SerialLogger::Log("\r\n");
+}
+
+static void appexit_entry() {
+    SerialLogger::Log("[appexit] waiting for firefox\r\n");
+    {
+        uint64_t t0 = Timer::GetRealMs64(), i0 = Scheduler::NowMs();
+        Scheduler::SleepMs(g_appexit_secs * 1000u);
+        SerialLogger::Log("[appexit] woke tsc_dt_ms=");
+        SerialLogger::LogDec((int)(Timer::GetRealMs64() - t0));
+        SerialLogger::Log(" irq_dt_ms=");
+        SerialLogger::LogDec((int)(Scheduler::NowMs() - i0));
+        SerialLogger::Log("\r\n");
+    }
+    uint32_t pid = 0;
+    for (int tries = 0; tries < 30 && !pid; tries++) {
+        for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+            LinuxProcess* lp = LinuxSyscall::GetProcess(i);
+            Process* p = lp ? lp->task : nullptr;
+            if (!p || p->is_thread()) continue;
+            const char* n = lp->name;   // the linux record keeps the app name (p->name is gmain) (satoru)
+            if (n[0]=='f'&&n[1]=='i'&&n[2]=='r'&&n[3]=='e'&&n[4]=='f'&&n[5]=='o'&&n[6]=='x'&&n[7]==0) {
+                pid = p->pid; break;
+            }
+        }
+        if (!pid) { SerialLogger::Log("[appexit] scan: no firefox yet\r\n"); Scheduler::SleepMs(1000); }
+    }
+    if (pid) {
+        int kr = Scheduler::KillProcessGroupAsync(pid, nullptr);
+        SerialLogger::Log("[appexit] end firefox group pid=");
+        SerialLogger::LogDec((int)pid);
+        SerialLogger::Log(" rc=");
+        SerialLogger::LogDec(kr);
+        SerialLogger::Log("\r\n");
+    } else {
+        SerialLogger::Log("[appexit] no firefox process found\r\n");
+    }
+    Scheduler::SleepMs(6000);
+    MemBoot::Report(nullptr, 0, true);
+    for (;;) Scheduler::SleepMs(60000);
+}
 
 // kurono.kstacktest=1 (test rig): a kernel proc that recurses until it runs off
 // its stack, to prove the guard page faults and names the proc. (satoru)
@@ -381,6 +476,16 @@ void SetAutorunDelayMs(uint32_t ms) { g_autorun_delay_ms = ms; }
 // leaves for everything else. (satoru)
 static int g_fps_bench = 0;
 void SetFpsBench(int mode) { g_fps_bench = mode; }
+// kurono.pacesleep=1 (4e, off by default): while a frame waits for its pace
+// deadline, sleep through all but the last 2 ms instead of yield-spinning the
+// whole gap on the gui cpu. (satoru)
+static bool g_pace_sleep = false;
+void SetPaceSleep(bool on) { g_pace_sleep = on; }
+static uint32_t g_pace_test_secs = 0;   // kurono.pacetest rig, 0 = off (satoru)
+static bool g_pace_test_started = false;
+static uint32_t g_pace_test_until = 0;
+static bool g_pace_test_on = false;
+void SetPaceTest(uint32_t secs) { g_pace_test_secs = secs; }
 
 void SetGuiAutorun(const char* cmd) {
     if (!cmd) {
@@ -451,22 +556,91 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
 }
 
 // ── Audio process: AC97 / mixer pump ──────────────────────────────────
+// the mixer feeds a ~128 ms dma backlog, so the pump must run again within about that.
+// it used to take kls for the whole loop (sched=2), and kls is held for 10 to 100 ms by
+// munmap, page faults and the other kernel processes (klsprof: seconds of waiting per
+// 20 s): a long wait for kls was a gap in the pump, and a gap past the backlog is an
+// audible dropout. the pump itself needs only the audio pump lock, so it now runs in its
+// own process with no kls; the pulse pacing (which injects into client sockets) and the
+// usb drain keep their kls in a second process, "audiopace". kurono.audiosplit=1 enables the split; default keeps
+// the single process that waits for kls. (satoru)
+static bool g_audio_kls_pump = true;   // default: the old single process; kurono.audiosplit=1 splits it (satoru)
+void SetAudioKlsPump(bool on) { g_audio_kls_pump = on; }
+
+// pump cadence, one line every 10 s while a stream plays: pumps run, the longest gap
+// between two, and the longest wait for kls in the pacing step. (satoru)
+static volatile uint32_t g_audio_kls_wait_max = 0;
+static void AudioPumpReport(uint32_t now) {
+    static uint32_t s_t0 = 0;
+    if (!s_t0) { s_t0 = now; return; }
+    if ((uint32_t)(now - s_t0) < 10000u) return;
+    s_t0 = now;
+    uint32_t calls = 0, gap = 0;
+    AudioServer::PumpStats(&calls, &gap);
+    if (!calls) return;   // nothing played in this window (satoru)
+    uint32_t kw = g_audio_kls_wait_max; g_audio_kls_wait_max = 0;
+    SerialLogger::Log("[audiopump] 10s: pumps="); SerialLogger::LogDec((int)calls);
+    SerialLogger::Log(" max_gap_ms="); SerialLogger::LogDec((int)gap);
+    SerialLogger::Log(" pace_kls_wait_max_ms="); SerialLogger::LogDec((int)kw);
+    SerialLogger::Log(g_audio_kls_pump ? " mode=kls\r\n" : " mode=nokls\r\n");
+}
+
+// pulse pacing and the usb drain: these touch client sockets and the hid state, so they
+// stay inside kls. (satoru)
+static void AudioPaceStep() {
+    uint32_t w0 = Timer::GetRealMs();
+    KlsSection ks; ks.enter();   // sched=2: pulse injects into client sockets (satoru)
+    uint32_t w = Timer::GetRealMs() - w0;
+    if (w > g_audio_kls_wait_max) g_audio_kls_wait_max = w;
+    // usb audio completions (data + explicit feedback) are drained by
+    // USB::PollHID. the input process owns that drain, and under a heavy
+    // gui load it starves exactly like the mixer pump used to; this
+    // process re-arms the feedback ring and notices endpoint errors as well.
+    // the shared input lock keeps the 8042/backdoor and the event ring from
+    // being re-entered from two cpus. (satoru)
+    {
+        SpinLockCpuGuard guard(g_input_lock);
+        USB::PollHID();
+    }
+    // pace pulse clients AFTER the pump: send REQUEST for the bytes the
+    // mixer just consumed so firefox keeps streaming (process context
+    // only - it injects into client sockets). (satoru)
+    if (R3Audio::Enabled()) R3Audio::Tick(); else PulseServer::Pace();
+    ks.leave();
+}
+
 [[noreturn]] static void AudioProcessEntry() {
     SerialLogger::Log("[AudioProcess] online\r\n");
     while (true) {
-        // LockedTick owns the audio pump lock (shared with the pit backup
-        // pump + the syscall-context stream writers); the old local
-        // g_audio_lock guarded only this loop and left pulse writes racing
-        // the mixer from other cpus. (satoru)
-        KlsSection ks; ks.enter();   // sched=2: pulse injects into client sockets (satoru)
+        if (g_audio_kls_pump) {
+            // the old shape: the whole loop under one kls hold. (satoru)
+            uint32_t w0 = Timer::GetRealMs();
+            KlsSection ks; ks.enter();
+            uint32_t w = Timer::GetRealMs() - w0;
+            if (w > g_audio_kls_wait_max) g_audio_kls_wait_max = w;
+            AudioServer::LockedTick();
+            {
+                SpinLockCpuGuard guard(g_input_lock);
+                USB::PollHID();
+            }
+            if (R3Audio::Enabled()) R3Audio::Tick(); else PulseServer::Pace();
+            ks.leave();
+            AudioPumpReport(Timer::GetRealMs());
+            Scheduler::SleepMs(10);
+            continue;
+        }
+        // LockedTick owns the audio pump lock (shared with the syscall-context
+        // stream writers) and nothing else. (satoru)
         AudioServer::LockedTick();
-        // pace pulse clients AFTER the pump: send REQUEST for the bytes the
-        // mixer just consumed so firefox keeps streaming (process context
-        // only - it injects into client sockets). (satoru)
-        PulseServer::Pace();
-        ks.leave();
-        // 10ms: the mixer period is ~21ms (1024 frames @ 48kHz); the pit
-        // backup pump covers any gap past ~15ms, so this cadence is ample. (satoru)
+        AudioPumpReport(Timer::GetRealMs());
+        Scheduler::SleepMs(5);
+    }
+}
+
+[[noreturn]] static void AudioPaceEntry() {
+    SerialLogger::Log("[AudioPace] online\r\n");
+    while (true) {
+        AudioPaceStep();
         Scheduler::SleepMs(10);
     }
 }
@@ -519,15 +693,58 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
     while (true) {
         KlsSection ks; ks.enter();   // sched=2: proc refresh writes kvfs, reaps touch ld-kurono (satoru)
         HRTimer::Tick();
+        // kplat: this heartbeat held the bsp 50-100 ms per window, mostly the /proc
+        // refresh above. the steps are independent, so drop kls and take a voluntary
+        // preemption point between them (kls is never held across the yield). (satoru)
+        ks.leave(); Scheduler::CondResched(); ks.enter();
         Scheduler::ServiceSleepQueue();
         // deferred group reaps (sig-9 from the kls syscall body, hal fault
         // containment, sync quiesce timeouts): reap each queued group once its
         // members are all off-cpu. never sleeps - one check per heartbeat. (satoru)
         Scheduler::DrainDeferredReaps();
+        ks.leave(); Scheduler::CondResched(); ks.enter();   // (satoru)
         LinuxSyscall::ReapTick();   // sched=2: exited threads -> real reap (satoru)
         LinuxSyscall::FinishIrqKills();   // sched=2: records of async fatal kills (satoru)
         ks.leave();   // the census line below is a uart busy-wait: never under kls (satoru)
+        Scheduler::CondResched();   // (satoru)
         Scheduler::KstackCensus();   // guarded kernel stacks: high-water marks (satoru)
+        Scheduler::KprocLatReport();  // kurono.kplat=1 (satoru)
+        Scheduler::WakeLatReport();   // kurono.wakelat=1: wake-to-run block every 10 s (satoru)
+        // per-cpu load + service cpus: one [cpuload] line every 30 s under sched=2
+        // (kurono.cpuload=N: every N s, 0 = off), percent busy of each cpu since
+        // the last line, from the per-cpu busy side tables in hal.cpp. the [svc]
+        // line follows it while service cpus are in use. (satoru)
+        if (Scheduler::SchedV2() && g_cpuload_secs) {
+            static uint64_t s_cl_ms = 0;
+            static uint64_t s_cl_busy[HAL_CPU_SLOTS], s_cl_tot[HAL_CPU_SLOTS];
+            uint64_t nw = Timer::GetRealMs64();
+            if (s_cl_ms == 0) s_cl_ms = nw;
+            if (nw - s_cl_ms >= (uint64_t)g_cpuload_secs * 1000u) {
+                s_cl_ms = nw;
+                char line[400]; int lp = 0;
+                auto put = [&](const char* t) { while (*t && lp < (int)sizeof(line) - 1) line[lp++] = *t++; };
+                auto num = [&](uint64_t v) { char b[24]; int k = 0; do { b[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 23); while (k && lp < (int)sizeof(line) - 1) line[lp++] = b[--k]; };
+                put("[cpuload]");
+                uint32_t ncpu = SMP::CpuCount(); if (ncpu > (uint32_t)HAL_CPU_SLOTS) ncpu = HAL_CPU_SLOTS;
+                uint32_t over50 = 0;
+                for (uint32_t c = 0; c < ncpu; c++) {
+                    uint64_t b = g_cpu_busy_ticks[c], t = g_cpu_total_ms[c];
+                    uint64_t db = b - s_cl_busy[c], dt = t - s_cl_tot[c];
+                    s_cl_busy[c] = b; s_cl_tot[c] = t;
+                    uint64_t pct = dt ? (db * 100u) / dt : 0;
+                    if (pct > 100) pct = 100;
+                    if (pct >= 50) over50++;
+                    put(" c"); num(c); put("="); num(pct);
+                }
+                put(" busy50="); num(over50);
+                line[lp] = 0;
+                SerialLogger::Log(line); SerialLogger::Log("\r\n");
+                if (Scheduler::UiCpu() || Scheduler::VmCpu()) {
+                    char sv[300]; Scheduler::ServiceCensus(sv, (int)sizeof(sv));
+                    SerialLogger::Log("[svc] "); SerialLogger::Log(sv); SerialLogger::Log("\r\n");
+                }
+            }
+        }
         if (Scheduler::SchedV2()) {
             // one census line whenever it moved, at most every 10 s. (satoru)
             static uint64_t s_last_fr = ~0ull, s_last_ms = 0;
@@ -566,6 +783,7 @@ const char* GuiAutorun() { return g_gui_autorun_cmd; }
             SpinLockCpuGuard guard(g_log_lock);
             RuntimeLog::FlushSerialMirror();
         }
+        KernelHeap::RefillReserve();   // outside kls: grow the heap here, not inside a syscall (satoru)
         Scheduler::SleepMs(500);
     }
 }
@@ -649,6 +867,10 @@ static inline bool ui_activity_active() {
     SerialLogger::Log("[GUIProcess] online\r\n");
     TaskMem::SetUiTask();   // kurono.taskmem=1: PumpUI work elsewhere is charged here (satoru)
     BootAnim::GuiTakeover();   // the boot animation tail plays over the live desktop (satoru)
+    // no hardware cursor plane survives the hand-off: the next pointer update
+    // shows it on the pipe that is under the pointer. no-op without
+    // kurono.igpu.accel=1. (satoru)
+    IntelAccel::CursorHideAll();
 
     Mouse::SetAutoDraw(false);
 
@@ -674,6 +896,7 @@ static inline bool ui_activity_active() {
             Scheduler::SleepMs(10); continue;
         }
         KlsSection ks; ks.enter();   // sched=2: left before every sleep/yield below (satoru)
+        GuiHoldProbe gh(&ks.held, &ks.gen);   // [guihold]: a phase of this body that held kls >= 50 ms (satoru)
         // stamp the graphics-loop heartbeat for the watchdog before any work,
         // so a hang anywhere in the body is detectable as a stalled tick. (satoru)
         g_last_frame_ms = Timer::GetRealMs();
@@ -695,6 +918,7 @@ static inline bool ui_activity_active() {
         // the desktop for the new logical size. (satoru)
         Graphics::ApplyPendingUIScale();
         Graphics::ApplyPendingOutputOp();
+        KldDisplay::ApplyPendingDesktop();   // mirrors the desktop once the container reports modes (satoru)
         { static int __sw = -1, __sh = -1;
           int cw = Graphics::GetWidth(), ch = Graphics::GetHeight();
           bool soft_relayout = Graphics::TakeMultiRelayout();
@@ -705,7 +929,6 @@ static inline bool ui_activity_active() {
                   Mouse::mx = (int)((long long)Mouse::mx * cw / __sw);
                   Mouse::my = (int)((long long)Mouse::my * ch / __sh);
               }
-              GUI::UpdateBackbuffer();
               if (soft_relayout && __sw > 0) {
                   // scale / output arrangement change: keep the windows (satoru)
                   int ox[OUTPUT_MAX], oy[OUTPUT_MAX], sa = -1, sb = -1;
@@ -736,6 +959,7 @@ static inline bool ui_activity_active() {
         // polling here guarantees device servicing regardless of InputProcess
         // starvation. share g_input_lock so the two pollers never reenter the
         // 8042 / backdoor mid-transaction on different cores. (satoru)
+        gh.phase("input");   // (satoru)
         {
             SpinLockCpuGuard guard(g_input_lock);
             Keyboard::Poll();
@@ -752,7 +976,11 @@ static inline bool ui_activity_active() {
         {
             static uint32_t s_net_svc_ms = 0;
             uint32_t nnow = Timer::GetTicks();
-            if ((uint32_t)(nnow - s_net_svc_ms) >= 100u) {
+            // sched=2: the network kernel proc runs this same service every 10 ms
+            // on its own; the gui's copy waited for g_net_lock while holding kls
+            // (56-190 ms holds during firefox's network traffic) for no gain. the
+            // one-cpu mode keeps it. (satoru)
+            if (!Scheduler::SchedV2() && (uint32_t)(nnow - s_net_svc_ms) >= 100u) {
                 s_net_svc_ms = nnow;
                 if (TCPStack::IsUp()) {
                     SpinLockCpuGuard guard(g_net_lock);
@@ -777,7 +1005,10 @@ static inline bool ui_activity_active() {
         // intel hardware cursor plane takes the move (kurono.igpu.accel=1) no
         // frame is needed at all; hover/button/scroll still mark dirty below.
         // (satoru)
+        GfxBench::Tick();   // kurono.gfxbench / shell gfxbench: synthetic pointer (satoru)
+        GfxOracle::Tick();  // kurono.gfx.oracle=1: the scripted damage scenario (satoru)
         static int last_mx = -1, last_my = -1;
+        gh.phase("mouse");   // (satoru)
         if (Mouse::mx != last_mx || Mouse::my != last_my) {
             if (!IntelAccel::CursorUpdate(Mouse::mx, Mouse::my)) {
                 Graphics::MarkUIDirty();
@@ -843,6 +1074,7 @@ static inline bool ui_activity_active() {
             }
         }
 
+        gh.phase("autorun");   // (satoru)
         if (g_gui_autorun_armed && (int32_t)(Timer::GetTicks() - autorun_target_ms) >= 0) {
             g_gui_autorun_armed = false;
             // sentinel "@taskmgr": open the task manager instead of the terminal
@@ -872,12 +1104,25 @@ static inline bool ui_activity_active() {
                 SerialLogger::Log("[gui-autorun] launching terminal + queuing: ");
                 SerialLogger::Log(g_gui_autorun_cmd);
                 SerialLogger::Log("\r\n");
-                TerminalApp::Open();
+                // the boot hook owns a kernel terminal: the ring-3 terminal is a
+                // separate process and has no in-kernel command queue. (satoru)
+                TerminalApp::OpenKernel();
                 TerminalApp::EnqueueCommand(g_gui_autorun_cmd);
             }
             // test hook: kurono.guiterms=N opens N more terminal windows (the last one focused),
             // in every autorun mode so a detached firefox run can still get a shell. (satoru)
             for (int ti = 0; ti < g_gui_extra_terms; ti++) TerminalApp::Open();
+        }
+        {   // kurono.ffafter=N (test hook, see kurono_kernel.cpp). (satoru)
+            static uint32_t s_ff_at = 0;
+            if (g_gui_ff_after_s && !g_gui_autorun_armed) {
+                if (!s_ff_at) s_ff_at = Timer::GetTicks() + g_gui_ff_after_s * 1000u;
+                if ((int32_t)(Timer::GetTicks() - s_ff_at) >= 0) {
+                    g_gui_ff_after_s = 0;
+                    SerialLogger::Log("[gui-autorun] launching firefox (kurono.ffafter)\r\n");
+                    DesktopEnvironment::LaunchFirefox();
+                }
+            }
         }
 
         if (g_term_test && !g_gui_autorun_armed) {
@@ -904,9 +1149,11 @@ static inline bool ui_activity_active() {
                 }
             }
         }
+        gh.phase("de-update");   // (satoru)
         DesktopEnvironment::Update();
         wp_test_tick();
 
+        gh.phase("post-update");   // (satoru)
         if (DesktopEnvironment::ConsumeLogoutRequest()) {
             SerialLogger::Log("[Session] Logout requested\r\n");
             WindowManager::CloseAll();
@@ -974,7 +1221,25 @@ static inline bool ui_activity_active() {
                 TaskManagerApp::RefreshProcesses();
             }
         }
-        if (frame_counter == 300) KernelHeap::LogMemReport("desktop");
+        // boot ram census once the desktop has settled: wall-clock based, not
+        // frame-count based (a damage-gated idle desktop can render very few
+        // frames, and a firefox autorun boot never reaches frame 300 before the
+        // rig stops). also releases the kfs metadata caches. (satoru)
+        {
+            static bool s_memboot_done = false;
+            static uint32_t s_memboot_ms = 0;
+            uint32_t nowm = Timer::GetRealMs();
+            if (!s_memboot_done) {
+                if (s_memboot_ms == 0) s_memboot_ms = nowm + 8000u;
+                else if ((int32_t)(nowm - s_memboot_ms) >= 0 && !BootAnim::CoversScreen()) {
+                    s_memboot_done = true;
+                    MemBoot::OnDesktopIdle();
+                }
+            }
+        }
+        // the report walks heap/pmm stats and prints through the uart busy-wait:
+        // none of it needs kls, and it held kls 80-120 ms once per boot. (satoru)
+        if (frame_counter == 300) { ks.leave(); KernelHeap::LogMemReport("desktop"); ks.enter(); }
 
         // Frame pacing to ~60fps. Timer::GetRealMs() is now sourced from the
         // PIT-IRQ scheduler clock (see timer.cpp GetRealMs), so it advances
@@ -1004,6 +1269,7 @@ static inline bool ui_activity_active() {
         // advance the kss tween engine first so animated values progress and the
         // Active() check inside ui_activity_active() reflects in-flight tweens. then
         // advance the stylesheet keyframe layer against that same clock. (satoru)
+        gh.phase("ticks");   // (satoru)
         KSS::Anim::Tick(Timer::GetRealMs());
         KSS::Sheet::Tick();
         DenjiApp::BackgroundTick();   // media player: closed-window cleanup, audio feed, next frame (satoru)
@@ -1021,9 +1287,21 @@ static inline bool ui_activity_active() {
         // (the 250ms fallback) and any rendering change looks like noise. bench
         // only - it deliberately pegs a core. (satoru)
         if (g_fps_bench) { dirty = true; active = true; }
+        // kurono.pacetest=SECS: after the boot film, force full-rate frames for
+        // SECS so the synthetic slow-frame injection has a window to fill. (satoru)
+        if (g_pace_test_secs) {
+            uint32_t pt_now = Timer::GetRealMs();
+            if (!g_pace_test_started && !BootAnim::Active() && !BootAnim::CoversScreen()) {
+                g_pace_test_started = true;
+                g_pace_test_until = pt_now + g_pace_test_secs * 1000u;
+            }
+            g_pace_test_on = g_pace_test_started && (int32_t)(g_pace_test_until - pt_now) > 0;
+            if (g_pace_test_on) { dirty = true; active = true; }
+        }
         // every 60 rendered frames, say what drove them: how many were dirty,
         // animation-driven (and by what), or the 250ms fallback. a desktop that
         // should be idle but renders flat out shows up here.
+        gh.phase("dirty");   // (satoru)
         {
             static uint32_t n_dirty = 0, n_active = 0, n_fallback = 0, t0 = 0;
             if (dirty || active || fallback) {
@@ -1039,6 +1317,11 @@ static inline bool ui_activity_active() {
                     SerialLogger::Log(" frames in "); SerialLogger::LogDec((int)(now - t0));
                     SerialLogger::Log("ms last_cost="); SerialLogger::LogDec((int)s_frame_cost_ms);
                     {
+                        // an idle window (fallback only, nothing damaged)
+                        // reports zero: the fallback now skips the render, and
+                        // the last real frame's cost is not this desktop's
+                        // idle cost. (satoru)
+                        if (n_dirty == 0 && n_active == 0) { s_prof_render = s_prof_swap = 0; s_prof_frames = 0; }
                         uint64_t tsc_now = __builtin_ia32_rdtsc();
                         uint64_t span_ms = (uint64_t)(now - t0);
                         uint64_t cyc_us = (span_ms && s_prof_tsc0) ? (tsc_now - s_prof_tsc0) / (span_ms * 1000u) : 0;
@@ -1065,6 +1348,20 @@ static inline bool ui_activity_active() {
                             SerialLogger::Log(" zc=on commits="); SerialLogger::LogDec((int)zc_commits);
                             SerialLogger::Log(" zcfail="); SerialLogger::LogDec((int)zc_fails);
                         }
+                        // stage 2b counters, only while the page flip is live:
+                        // flips and deferred flips (a pipe still showing its
+                        // last flip), the damage copied, the copy cost per
+                        // frame and the worst vblank latch. (satoru)
+                        if (IntelAccel::FlipActive()) {
+                            uint32_t fl_n = 0, fl_def = 0, fl_fail = 0, fl_lat = 0;
+                            uint64_t fl_kb = 0, fl_cyc = 0;
+                            IntelAccel::TakeFlipStats(&fl_n, &fl_def, &fl_fail, &fl_kb, &fl_cyc, &fl_lat);
+                            SerialLogger::Log(" flip=on flips="); SerialLogger::LogDec((int)fl_n);
+                            SerialLogger::Log(" defers="); SerialLogger::LogDec((int)fl_def);
+                            SerialLogger::Log(" copy_kb="); SerialLogger::LogDec((int)fl_kb);
+                            SerialLogger::Log(" copy_us="); SerialLogger::LogDec(cyc_us ? (int)(fl_cyc / cyc_us / nf) : 0);
+                            SerialLogger::Log(" latch_max_us="); SerialLogger::LogDec((int)fl_lat);
+                        }
                     }
                     SerialLogger::Log(" dirty="); SerialLogger::LogDec((int)n_dirty);
                     SerialLogger::Log(" active="); SerialLogger::LogDec((int)n_active);
@@ -1079,6 +1376,36 @@ static inline bool ui_activity_active() {
             }
         }
         if (dirty || active) last_activity_ms = Timer::GetRealMs();
+        // page flip (kurono.igpu.flip=1): a pipe whose previous flip had not
+        // latched yet kept its damage queued; land it between frames so an
+        // idle desktop never leaves the slower screen one frame behind. (satoru)
+        if (IntelAccel::FlipBusy()) {
+            SpinLockCpuGuard guard(g_fb_lock);
+            IntelAccel::FlipService();
+        }
+        // the 250ms safety fallback used to recompose the whole desktop even
+        // when nothing had been damaged since the last present. an idle
+        // desktop then paid a full wallpaper/window pass several times a
+        // second. if there is no pending damage, skip the render, keep the
+        // fallback timer armed, and still feed one idle sample to the pacer so
+        // the rate can recover. (satoru)
+        if (!dirty && !active && fallback) {
+            Graphics::Rect pending[1];
+            if (Graphics::GetDirtyRects(pending, 1) == 0) {
+                last_render_ms = Timer::GetRealMs();
+                s_frame_cost_ms = 0;
+                // no render happened this window: report a zero cost instead of
+                // the last real frame's numbers. (satoru)
+                s_prof_render = s_prof_swap = 0; s_prof_frames = 0;
+                s_prof_tsc0 = __builtin_ia32_rdtsc();
+                bool idle_real = !BootAnim::Active() && !BootAnim::CoversScreen();
+                FramePacer::OnFrame(0, 0, false, idle_real, false);
+                g_pace_streak = false;
+                ks.leave();
+                Scheduler::SleepMs(16u);
+                continue;
+            }
+        }
         if (!dirty && !active && !fallback) {
             // Nothing to draw. The old code BUSY-YIELDED here while "recently
             // active" to dodge WHPX/VMware timer coalescing (which made SleepMs
@@ -1125,13 +1452,23 @@ static inline bool ui_activity_active() {
                 g_pace_due_ns = (g_pace_last_start_ns && earliest > now_ns) ? earliest : now_ns;
             }
             ks.leave();
-            while (period_ns && FramePacer::NowNs() < g_pace_due_ns) Scheduler::YieldNow();
+            while (period_ns && FramePacer::NowNs() < g_pace_due_ns) {
+                uint64_t left = g_pace_due_ns - FramePacer::NowNs();
+                if (g_pace_sleep && left > 3000000ull) Scheduler::SleepMs((uint32_t)(left / 1000000ull) - 2u);
+                else Scheduler::YieldNow();
+            }
             ks.enter();
         }
         uint64_t frame_start_ns = FramePacer::NowNs();
         g_pace_last_start_ns = frame_start_ns;
         uint64_t frame_late_ns = (pace_continuous && frame_start_ns > g_pace_due_ns)
                                      ? frame_start_ns - g_pace_due_ns : 0;
+        // frames that are not a real desktop (the boot animation covers the
+        // screen or its tail plays over it) must not steer the pacer: their
+        // cost is the film, not the desktop. an idle fallback frame also has
+        // no work, so it can never count as load. (satoru)
+        bool pace_real = !BootAnim::Active() && !BootAnim::CoversScreen();
+        bool pace_work = dirty || active;
         // next deadline: one period on from this one, or from now if this
         // frame was already more than a period late. (satoru)
         if (frame_late_ns > period_ns) g_pace_due_ns = frame_start_ns + period_ns;
@@ -1145,12 +1482,29 @@ static inline bool ui_activity_active() {
         // Framebuffer access - protected so any concurrent E1000 RX
         // path or audio mixer scratch doesn't interleave a SwapBuffers
         // mid-DrawPixel.
+        gh.phase("render");   // (satoru)
         {
             SpinLockCpuGuard guard(g_fb_lock);
+            Graphics::GuiFrameEnter();   // the shell pump stands down for this frame (satoru)
+            uint64_t gb_r0 = FramePacer::NowNs();   // gfx stats: render start (satoru)
             uint64_t prof_a = __builtin_ia32_rdtsc();
             // while the boot scene covers the screen the desktop is not
             // composed; it is back before the reveal needs it (satoru)
-            if (!BootAnim::CoversScreen()) DesktopEnvironment::Render();
+            int gb_passes = 1;
+            if (!BootAnim::CoversScreen()) {
+                // kurono.gfx.scissor=1: damaged regions only, never while the
+                // boot film or a modal draws over the desktop. (satoru)
+                // the fps pill and the perf hud draw over the scene every
+                // frame; with them on (and once after) the frame is full. (satoru)
+                static bool s_ovl_prev = false;
+                bool ovl = UIConfig::Bool("ui.fps", false) || PerfHUD::IsVisible();
+                if (Graphics::ScissorEnabled() && (ovl || s_ovl_prev)) Graphics::MarkFullScreenDirty();
+                s_ovl_prev = ovl;
+                if (Graphics::ScissorEnabled() && !BootAnim::Active() && !KSA::ModalActive())
+                    gb_passes = DesktopEnvironment::RenderScissored();
+                else
+                    DesktopEnvironment::Render();
+            }
             // modal on top of the live desktop, before the cursor + swap. (satoru)
             if (KSA::ModalActive()) KSA::RenderPromptOverlay();
             s_prof_render += __builtin_ia32_rdtsc() - prof_a;
@@ -1212,6 +1566,7 @@ static inline bool ui_activity_active() {
             DisplaySettings::Overlay();
 
             uint64_t prof_b = __builtin_ia32_rdtsc();
+            uint64_t gb_p0 = FramePacer::NowNs();   // gfx stats: present start (satoru)
             Mouse::DrawAt(Mouse::mx, Mouse::my);
             BootAnim::Composite();   // no-op once the boot animation is done (satoru)
             Graphics::SwapBuffers();
@@ -1219,10 +1574,28 @@ static inline bool ui_activity_active() {
             UiDiag::NotePresent();
             s_prof_swap += __builtin_ia32_rdtsc() - prof_b;
             s_prof_frames++;
+            uint64_t gb_p1 = FramePacer::NowNs();
+            GfxOracle::AfterPresent();   // kurono.gfx.oracle=1: checkpoint compare (satoru)
+            Graphics::GuiFrameLeave();
+            GfxBench::FrameDone(gb_p0 - gb_r0, gb_p1 - gb_p0, gb_passes, period_ns, pace_continuous, frame_late_ns);
         }
         s_frame_cost_ms = Timer::GetRealMs() - last_render_ms;
         UiDiag::MaybeLog(WindowManager::IsDragging());
-        if (period_ns) FramePacer::OnFrame(FramePacer::NowNs() - frame_start_ns, frame_late_ns, pace_continuous);
+        if (period_ns) {
+            // kurono.pacetest=SECS rig: inject a slow frame into the pacer for
+            // SECS seconds, then let the real idle desktop recover. proves the
+            // ladder on qemu, where no output runs above 60 hz. no hardware
+            // effect. (satoru)
+            uint64_t pace_cost = FramePacer::NowNs() - frame_start_ns;
+            bool pace_cont = pace_continuous, pace_is_real = pace_real, pace_had_work = pace_work;
+            if (g_pace_test_on) {
+                pace_cost = 15000000ull;
+                frame_late_ns = 10000000ull;
+                pace_cont = true;
+                pace_had_work = true;
+            }
+            FramePacer::OnFrame(pace_cost, frame_late_ns, pace_cont, pace_is_real, pace_had_work);
+        }
         g_pace_streak = true;
         // animation wall-clock probe: how long a window-manager animation
         // (open/close/minimize springs) stayed active and how many frames it
@@ -1251,6 +1624,7 @@ static inline bool ui_activity_active() {
         }
 
         // Hand the CPU back so the other tiers progress.
+        gh.phase("end");   // (satoru)
         ks.leave();
         Scheduler::YieldNow();
     }
@@ -1304,6 +1678,9 @@ int SpawnAll() {
                                       PRIO_HIGH,   64,  2048)) created++;
     if (Scheduler::SpawnKernelProcess("audio",     AudioProcessEntry,
                                       PRIO_HIGH,   128, 4096)) created++;
+    if (!g_audio_kls_pump &&
+        Scheduler::SpawnKernelProcess("audiopace", AudioPaceEntry,
+                                      PRIO_HIGH,   128, 4096)) created++;   // (satoru)
     if (Scheduler::SpawnKernelProcess("gui",       GUIProcessEntry,
                                       PRIO_NORMAL, 1024, 32 * 1024)) created++;
     if (Scheduler::SpawnKernelProcess("shell",     ShellProcessEntry,
@@ -1312,6 +1689,9 @@ int SpawnAll() {
                                       PRIO_LOW,    64,  2048)) created++;
     if (Scheduler::SpawnKernelProcess("watchdog",  WatchdogProcessEntry,
                                       PRIO_LOW,    64,  2048)) created++;
+    // network time: blocks in dns/udp waits, so it gets its own low-priority proc. (satoru)
+    if (Scheduler::SpawnKernelProcess("timesync",  Sntp::ProcessEntry,
+                                      PRIO_LOW,    64,  8192)) created++;
     if (Scheduler::DetachedLaunch()) {
         // same stack budget as the shell: these run KuronoShell::Execute. (satoru)
         if (Scheduler::SpawnKernelProcess("launcher0", LauncherProcessEntry<0>, PRIO_NORMAL, 512, 8192)) created++;
@@ -1328,6 +1708,8 @@ int SpawnAll() {
             if (Scheduler::SpawnKernelProcess("termworker3", TermWorkerEntry<3>, PRIO_NORMAL, 512, 8192)) created++;
         }
     }
+    if (g_appexit_secs)
+        Scheduler::SpawnKernelProcess("appexit", appexit_entry, PRIO_HIGH, 64, 8192);
     return created;
 }
 

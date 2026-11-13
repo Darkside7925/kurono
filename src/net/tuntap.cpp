@@ -1,10 +1,15 @@
 #include "tuntap.h"
 #include "../drivers/serial.h"
+#include "../kernel/pmm.h"
 
 namespace TunTap {
 
-    static Device  g_devs[TUNTAP_MAX_DEVS];
+    // each device carries two 32-slot 1518-byte rings (~97 kb); the 8-device
+    // table is only needed once something opens /dev/net/tun, so it is taken
+    // from the pmm on the first open. (satoru)
+    static Device* g_devs = nullptr;
     static int     g_count = 0;
+
 
     // ---- inline helpers (no libc) ----
     static void mzero(void* p, unsigned int n) {
@@ -16,6 +21,16 @@ namespace TunTap {
         const unsigned char* ss = (const unsigned char*)s;
         for (unsigned int i = 0; i < n; i++) dd[i] = ss[i];
     }
+
+    static Device* ensure_devs() {
+        if (!g_devs) {
+            g_devs = (Device*)PMM::AllocBytes(sizeof(Device) * TUNTAP_MAX_DEVS);
+            if (!g_devs) return nullptr;
+            mzero(g_devs, sizeof(Device) * TUNTAP_MAX_DEVS);
+        }
+        return g_devs;
+    }
+
     static unsigned int slen(const char* s) {
         unsigned int n = 0; while (s && s[n]) n++; return n;
     }
@@ -38,7 +53,6 @@ namespace TunTap {
     }
 
     void Init() {
-        mzero(g_devs, sizeof(g_devs));
         g_count = 0;
         SerialLogger::Log("TunTap: subsystem initialized\r\n");
     }
@@ -46,13 +60,13 @@ namespace TunTap {
     int Count() { return g_count; }
 
     Device* Get(int dev_id) {
-        if (dev_id < 0 || dev_id >= TUNTAP_MAX_DEVS) return nullptr;
+        if (!g_devs || dev_id < 0 || dev_id >= TUNTAP_MAX_DEVS) return nullptr;
         if (!g_devs[dev_id].in_use) return nullptr;
         return &g_devs[dev_id];
     }
 
     static int find_by_name(const char* name) {
-        if (!name || !name[0]) return -1;
+        if (!g_devs || !name || !name[0]) return -1;
         for (int i = 0; i < TUNTAP_MAX_DEVS; i++) {
             if (g_devs[i].in_use && seq(g_devs[i].name, name)) return i;
         }
@@ -60,6 +74,7 @@ namespace TunTap {
     }
 
     static int alloc_slot() {
+        if (!g_devs) return -1;
         for (int i = 0; i < TUNTAP_MAX_DEVS; i++) {
             if (!g_devs[i].in_use) return i;
         }
@@ -67,6 +82,7 @@ namespace TunTap {
     }
 
     int Open(const char* req_name, bool tap, bool persist, unsigned int flags) {
+        if (!ensure_devs()) return -1;
         // Reuse persistent device if name matches.
         int existing = find_by_name(req_name);
         if (existing >= 0) {
@@ -200,6 +216,7 @@ namespace TunTap {
         // Write() real backpressure: tx_ring fills up and Write() then
         // returns -1 instead of silently dropping.
         const int kTickBudget = TUNTAP_RING_SLOTS;
+        if (!g_devs) return;
         for (int i = 0; i < TUNTAP_MAX_DEVS; i++) {
             Device& d = g_devs[i];
             if (!d.in_use || !d.up) continue;

@@ -405,7 +405,7 @@ void* AllocDMA(uint64_t size) {
     if (!phys) return nullptr;
     // zero the payload via its identity alias (phys==identity-va below 16gb). (satoru)
     for (uint64_t i = 0; i < pages * KDF_PAGE_SIZE; i++)
-        ((volatile uint8_t*)(uintptr_t)phys)[i] = 0;
+        ((volatile uint8_t*)PMM::PhysToVirt(phys))[i] = 0;
     void* va = register_region(KDF_REGION_DMA, phys, pages, pages * KDF_PAGE_SIZE);
     if (!va) { PMM::FreeContiguous(phys, pages); return nullptr; }
     return va;
@@ -416,7 +416,7 @@ void* AllocContiguous(uint64_t size) {
     uint64_t phys = PMM::AllocContiguous(pages);
     if (!phys) return nullptr;
     for (uint64_t i = 0; i < pages * KDF_PAGE_SIZE; i++)
-        ((volatile uint8_t*)(uintptr_t)phys)[i] = 0;
+        ((volatile uint8_t*)PMM::PhysToVirt(phys))[i] = 0;
     void* va = register_region(KDF_REGION_CONTIGUOUS, phys, pages, pages * KDF_PAGE_SIZE);
     if (!va) { PMM::FreeContiguous(phys, pages); return nullptr; }
     return va;
@@ -675,6 +675,19 @@ uint64_t DriverMappedBytes(int id) {
     uint64_t total = 0;
     for (int r = 0; r < d->region_count; r++)
         if (!d->regions[r].quarantined) total += d->regions[r].bytes;
+    return total;
+}
+
+uint64_t DmaBytes() {
+    uint64_t total = 0;
+    for (int i = 0; i < g_drv_count; i++) {
+        KDFDriver* d = &g_drv[i];
+        for (int r = 0; r < d->region_count; r++) {
+            const KDFRegion& rg = d->regions[r];
+            if (rg.kind != KDF_REGION_DMA && rg.kind != KDF_REGION_CONTIGUOUS) continue;
+            if (!rg.quarantined) total += rg.bytes;
+        }
+    }
     return total;
 }
 

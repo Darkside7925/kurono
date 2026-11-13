@@ -4,6 +4,8 @@
 #include "outputs.h"   // multi-monitor cursor travel (satoru)
 #include "intel_accel.h"   // hardware cursor plane, kurono.igpu.accel=1 (satoru)
 #include "serial.h"
+#include "../proc/spinlock.h"
+#include "../proc/scheduler.h"
 #include "../ui/gui.h"
 #include "../kernel/pci.h"
 #include "../kernel/time.h"
@@ -862,7 +864,30 @@ void Mouse::EmitHostAbsoluteSample(int new_x, int new_y, uint8_t hw_buttons, int
 // We translate into the same relative motion/button/wheel events the PS/2 path
 // emits, keeping the codebase convention of "dy positive = up" in events and
 // moving the cursor with down-positive screen coordinates (satoru).
+// the kld pointer bridge (a touchpad in a ring-3 container) is a second
+// producer next to the usb hid driver. the lock below exists only once an
+// injection has happened (g_inject_active), so a boot with a real usb mouse
+// and no kld touchpad runs exactly the old code with no lock. it covers the
+// shared state update and the event pushes, never the cursor redraw. it
+// serializes injection against the USB HID producers only: the ps/2 irq
+// handler takes no lock and is NOT serialized against either (it was not
+// before; the laptop has no ps/2 mouse, its touchpad is i2c). (satoru)
+static Spinlock g_usb_report_lock;
+static volatile bool g_inject_active;
+
+void Mouse::ProcessInjectedReport(const uint8_t* report, int len) {
+    g_inject_active = true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    ProcessUSBReport(report, len, true);
+}
+
 void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
+    ProcessUSBReport(report, len, false);
+}
+
+void Mouse::ProcessUSBReport(const uint8_t* report, int len, bool injected) {
+    uint64_t lock_flags = 0;
+    bool locked = false;
     HwInfo::NoteUsbMouse();   // bare-metal input diagnostics (satoru)
     if (!report || len < 3) return;
 
@@ -895,9 +920,19 @@ void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
     uint8_t new_buttons = MapButtons(hw_buttons);
     bool left = (new_buttons & 0x01) != 0;
     bool right = (new_buttons & 0x02) != 0;
-    if (left && !left_down) { left_clicked = true; SerialLogger::Log("Mouse: Left Click\r\n"); }
+    if (g_inject_active) { g_usb_report_lock.LockIrqSave(&lock_flags); locked = true; }
+    // click lines as on main for a real mouse; an injected producer is
+    // untrusted, so its lines are cut to one per 100 ms. (satoru)
+    bool log_clicks = true;
+    if (injected) {
+        static uint64_t last_ms;
+        uint64_t nowc = Scheduler::NowMs();
+        log_clicks = (nowc - last_ms >= 100);
+        if (log_clicks) last_ms = nowc;
+    }
+    if (left && !left_down) { left_clicked = true; if (log_clicks) SerialLogger::Log("Mouse: Left Click\r\n"); }
     static bool usb_right_down = false;
-    if (right && !usb_right_down) { right_clicked = true; SerialLogger::Log("Mouse: Right Click\r\n"); }
+    if (right && !usb_right_down) { right_clicked = true; if (log_clicks) SerialLogger::Log("Mouse: Right Click\r\n"); }
     usb_right_down = right;
     left_down = left;
     buttons = new_buttons;
@@ -914,6 +949,8 @@ void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
     int delivered_dx = new_mx - mx;
     int delivered_dy_up = my - new_my;         // event convention: + = up (satoru)
     mx = new_mx; my = new_my;
+    // the redraw runs outside the lock, with interrupts as before. (satoru)
+    if (locked) { g_usb_report_lock.UnlockIrqRestore(lock_flags); locked = false; }
     if (cursor_visible && IntelAccel::Enabled()) IntelAccel::CursorUpdate(mx, my);
     if (cursor_visible && auto_draw && (delivered_dx || delivered_dy_up)) {
         ClearAt(lastx, lasty);
@@ -925,6 +962,7 @@ void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
         UiDiag::NoteMotion();
     }
     uint64_t ts = TimeManager::NowUTC().us;
+    if (g_inject_active) { g_usb_report_lock.LockIrqSave(&lock_flags); locked = true; }
     if (delivered_dx || delivered_dy_up) {
         Event e{};
         e.type = 0; e.x = mx; e.y = my;
@@ -955,6 +993,7 @@ void Mouse::ProcessUSBReport(const uint8_t* report, int len) {
         e.buttons = new_buttons; e.time_us = ts;
         RingPush(e);
     }
+    if (locked) g_usb_report_lock.UnlockIrqRestore(lock_flags);
 }
 
 bool Mouse::PollVirtualBoxAbsolute() {
@@ -1788,8 +1827,17 @@ void Mouse::DamageCursor(int x, int y) {
     UiDiag::NoteCursorDamage();
 }
 
+bool Mouse::LastSoftwarePos(int& x, int& y) {
+    if (g_sw_cur_x < 0) return false;
+    x = g_sw_cur_x; y = g_sw_cur_y;
+    return true;
+}
+
 void Mouse::DamageLastSoftware() {
     if (g_sw_cur_x < 0) return;
+    // a stationary arrow sits on top of the frame and needs no wallpaper
+    // repaint under it; only a moved one can leave a stale copy behind. (satoru)
+    if (g_sw_cur_x == mx && g_sw_cur_y == my) return;
     DamageCursor(g_sw_cur_x, g_sw_cur_y);
 }
 
@@ -1840,15 +1888,33 @@ void Mouse::DrawAt(int x, int y) {
         }
     }
     UiDiag::NoteCursorDraw();
+    // only the vacated pixels need a repaint: the arrow itself is drawn on
+    // top of the new frame. damaging the current spot on every frame kept an
+    // idle desktop producing damage with the pointer at rest. (satoru)
     if (g_sw_cur_x >= 0 && (g_sw_cur_x != x || g_sw_cur_y != y)) DamageCursor(g_sw_cur_x, g_sw_cur_y);
-    DamageCursor(x, y);
     g_sw_cur_x = x;
     g_sw_cur_y = y;
 }
 
-bool Mouse::LeftClicked() { bool r = left_clicked; left_clicked = false; return r; }
+// gfx bench (kurono.gfxbench=1 / shell gfxbench): a synthetic left button so
+// the bench can drive a real titlebar drag through the normal input path.
+// off unless the bench is running. (satoru)
+static bool g_bench_btn_on = false, g_bench_btn_left = false, g_bench_btn_click = false;
+void Mouse::BenchButton(bool on, bool left, bool click) {
+    g_bench_btn_on = on;
+    g_bench_btn_left = left;
+    if (click) g_bench_btn_click = true;
+    if (!on) g_bench_btn_click = false;
+}
+
+void Mouse::BenchRightClick() { right_clicked = true; }
+
+bool Mouse::LeftClicked() {
+    if (g_bench_btn_on) { bool r = g_bench_btn_click; g_bench_btn_click = false; left_clicked = false; return r; }
+    bool r = left_clicked; left_clicked = false; return r;
+}
 bool Mouse::RightClicked() { bool r = right_clicked; right_clicked = false; return r; }
-bool Mouse::IsLeftDown() { return left_down; }
+bool Mouse::IsLeftDown() { return g_bench_btn_on ? g_bench_btn_left : left_down; }
 bool Mouse::IsOperational() { return ps2_poll_enabled || vbox_vmmdev_available || vmware_available; }
 void Mouse::ForceRedraw() { if(auto_draw) DrawAt(mx, my); }
 bool Mouse::HasEvent() {

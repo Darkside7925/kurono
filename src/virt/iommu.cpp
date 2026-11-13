@@ -1,6 +1,7 @@
 //  kurono os - intel vt-d / iommu implementation
 //  dma remapping for pci device passthrough (gpu passthrough to linux guests)
 #include "iommu.h"
+#include "../kernel/kimage.h"   // heap direct-map pointers -> phys (satoru)
 #include "vmm.h"
 #include "../drivers/nvidia_gpu.h"
 #include "../drivers/serial.h"
@@ -207,12 +208,12 @@ void IOMMU::SetupRootTable(uint64_t reg_base) {
     }
 
     // point root table entry 0 (bus 0) to our context table
-    uint64_t ct_phys = (uint64_t)context_tables; // identity mapped
+    uint64_t ct_phys = KernelPhysOf(context_tables);
     root_table[0].lo = ct_phys | 0x01; // present
     root_table[0].hi = 0;
 
     // set root table address in iommu
-    uint64_t rt_phys = (uint64_t)root_table; // identity mapped
+    uint64_t rt_phys = KernelPhysOf(root_table);
     WriteReg64(reg_base, VTD_RTADDR_REG, rt_phys);
 
     // command: set root table pointer

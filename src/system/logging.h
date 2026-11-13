@@ -20,4 +20,7 @@ namespace RuntimeLog {
     void LogCrash(const char* summary, const char* detail = nullptr);
     void LogAppEvent(const char* app, const char* event, const char* detail = nullptr);
     void LogProcessEvent(const char* process_name, int pid, const char* event, const char* detail = nullptr);
+    // kurono.rtlogleaf=0: hold the log guard across the kvfs append again (the
+    // pre-fix lock order, for A/B only). (satoru)
+    void SetHoldGuardAcrossKvfs(bool on);
 }

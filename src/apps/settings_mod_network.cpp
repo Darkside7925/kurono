@@ -165,11 +165,36 @@ static void status_section(){
     EndGroup();
 }
 
+static void wipe_pass();
+static bool s_other_reset();
 static void network_on_show(){
     s_expand = -1;
-    s_pass[0] = 0;
+    wipe_pass();
     s_last_error[0] = 0;
+    s_other_reset();
 }
+
+static int dbm_bars(int dbm){
+    if(dbm >= -55) return 4;
+    if(dbm >= -65) return 3;
+    if(dbm >= -75) return 2;
+    if(dbm >= -85) return 1;
+    return 0;
+}
+static bool is_saved(const char* ssid){
+    int n = WiFi::SavedCount();
+    char nm[40];
+    for(int i = 0; i < n; i++) if(WiFi::SavedAt(i, nm, (int)sizeof(nm), nullptr, nullptr)){
+        int k = 0; while(nm[k] && ssid[k] && nm[k] == ssid[k]) k++;
+        if(!nm[k] && !ssid[k]) return true;
+    }
+    return false;
+}
+static void wipe_pass(){ volatile char* p = s_pass; for(int i = 0; i < (int)sizeof(s_pass); i++) p[i] = 0; }
+
+static char s_other_ssid[33];
+static bool s_other = false;     // "other network" (hidden ssid) fields open (satoru)
+static int  s_saved_open = -1;   // known network row showing its options (satoru)
 
 static void wifi_section(){
     Group("Wi-Fi");
@@ -196,35 +221,80 @@ static void wifi_section(){
     for(int i = 0; i < n && nets; i++){
         const WiFiNetwork& w = nets[i];
         PushId(i);
-        char val[48];
-        if(w.connected) StrCpy(val, "Connected", 48);
-        else { StrCpy(val, sec_str(w.security), 48); StrApp(val, ", ", 48); StrApp(val, signal_word(w.signal_strength), 48); }
-        if(Nav(w.ssid[0] ? w.ssid : "Hidden network", val)){
-            if(w.connected){ WiFi::Disconnect(); s_expand = -1; }
-            else if(w.security == WIFI_OPEN){
-                s_last_error[0] = 0;
-                if(!WiFi::Connect(w.ssid, "")) StrCpy(s_last_error, "Could not join this network", 64);
+        bool known = is_saved(w.ssid);
+        const char* sub = w.connected ? "Connected"
+                        : (WiFi::GetState() == WIFI_CONNECTING && s_expand == i) ? "Joining..."
+                        : known ? "Saved" : nullptr;
+        if(NetRow(w.ssid[0] ? w.ssid : "Hidden network", dbm_bars(w.signal_strength),
+                  w.security != WIFI_OPEN, w.connected, sub)){
+            s_last_error[0] = 0;
+            if(w.connected || known || w.security == WIFI_OPEN){
+                // joined: show its actions. known or open: join right away. (satoru)
+                if(w.connected) s_expand = (s_expand == i) ? -1 : i;
+                else if(!WiFi::Connect(w.ssid, "")) StrCpy(s_last_error, "Could not join this network", 64);
+                else s_expand = i;
             } else {
                 s_expand = (s_expand == i) ? -1 : i;
-                s_pass[0] = 0;
+                wipe_pass();
             }
         }
-        if(s_expand == i && !w.connected){
+        if(s_expand == i && w.connected){
+            if(Button("", "Disconnect", BTN_SECONDARY)){ WiFi::Disconnect(); s_expand = -1; }
+        } else if(s_expand == i && !known && w.security != WIFI_OPEN){
             bool go = false;
             if(TextField("Password", s_pass, 64, "Network password", FIELD_PASSWORD) && Submitted()) go = true;
             if(Button("", "Join", BTN_PRIMARY)) go = true;
             if(go){
-                s_last_error[0] = 0;
-                if(WiFi::Connect(w.ssid, s_pass)){ s_expand = -1; s_pass[0] = 0; }
+                int pl = StrLen(s_pass);
+                if(pl < 8){ StrCpy(s_last_error, "Wi-Fi passwords have at least 8 characters", 64); }
+                else if(WiFi::Connect(w.ssid, s_pass)){ s_expand = -1; }
                 else StrCpy(s_last_error, "Could not join: check the password", 64);
+                wipe_pass();
             }
         }
         PopId();
     }
+    // a network that does not broadcast its name. (satoru)
+    if(!s_other){
+        if(Nav("Other network", nullptr)){ s_other = true; s_other_ssid[0] = 0; wipe_pass(); }
+    } else {
+        TextField("Network name", s_other_ssid, 33, "SSID");
+        bool go = TextField("Password", s_pass, 64, "leave empty for an open network", FIELD_PASSWORD) && Submitted();
+        if(Button("", "Join", BTN_PRIMARY)) go = true;
+        if(Button(" ", "Cancel", BTN_SECONDARY)){ s_other = false; wipe_pass(); }
+        if(go && s_other_ssid[0]){
+            int pl = StrLen(s_pass);
+            if(pl > 0 && pl < 8) StrCpy(s_last_error, "Wi-Fi passwords have at least 8 characters", 64);
+            else if(WiFi::Connect(s_other_ssid, s_pass)){ s_other = false; s_last_error[0] = 0; }
+            else StrCpy(s_last_error, "Could not join this network", 64);
+            wipe_pass();
+        }
+    }
     if(s_last_error[0]) Info("Status", s_last_error, nullptr, T().danger);
     if(Button("Find networks", "Scan", BTN_SECONDARY)) WiFi::Scan();
     EndGroup();
+
+    // the saved networks, encrypted on disk; forget removes the passphrase. (satoru)
+    int sc = WiFi::SavedCount();
+    if(sc > 0){
+        Group("Known networks", "Kurono joins these automatically. Passwords are stored encrypted.");
+        for(int i = 0; i < sc && i < 16; i++){
+            char nm[40]; int sec = 3; bool au = true;
+            if(!WiFi::SavedAt(i, nm, (int)sizeof(nm), &sec, &au)) continue;
+            PushId(100 + i);
+            if(Nav(nm, sec == WIFI_OPEN ? "Open" : sec_str((WiFiSecurity)sec)))
+                s_saved_open = (s_saved_open == i) ? -1 : i;
+            if(s_saved_open == i){
+                if(Toggle("Join automatically", &au)) WiFi::SetAutoJoin(nm, au);
+                if(Button("", "Forget this network", BTN_DESTRUCTIVE)){ WiFi::Forget(nm); s_saved_open = -1; }
+            }
+            PopId();
+        }
+        EndGroup();
+    }
 }
+
+static bool s_other_reset(){ s_other = false; s_saved_open = -1; return true; }
 
 static void network_build(){
     status_section();

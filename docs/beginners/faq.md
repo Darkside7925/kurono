@@ -4,6 +4,10 @@
 No. The kernel is mine. It has a Linux ABI layer so it can run Linux programs, the same
 way Wine runs Windows programs on Linux, except at the kernel level.
 
+**Is this the final version?**
+No. It is part 3 of the major update, the infrastructure and support work before Kurono
+Kintsugi, Version 1. Some parts are still held back because of bugs and issues.
+
 **Why does it run Firefox?**
 Because I wanted a real test. If a modern browser runs, the syscall layer, threading,
 memory management, sockets and the Wayland server are all doing something right. It
@@ -29,22 +33,31 @@ No. Maybe someday (`../roadmap.md`).
 No. x86_64 only. Ports are on the long-term list.
 
 **How much RAM does it need?**
-It boots to the desktop on 512 MB. Firefox and Alpine want a few GB. A long-term goal is
-a lean base system under 50 MB.
+It boots to the desktop on 512 MB. Firefox and Alpine want a few GB. Guest RAM is only
+backed when the guest touches it. A long-term goal is a lean base system under 50 MB.
 
 **What is Alpine doing in there?**
 Kurono has its own hypervisor (Intel VT-x). It boots an Alpine Linux guest and can launch
-Alpine apps whose windows show up on the Kurono desktop. Debian is still being tested.
+Alpine apps whose windows show up on the Kurono desktop. On a machine with 12 or more
+CPUs, Alpine gets up to four parallel vCPUs. Debian 13 also boots as a guest.
 
-**What is `ken`? What is KSA?**
-`ken` is the sudo of Kurono: `ken <command>`. When something needs admin rights, KSA
-shows an approval prompt. The prompt is drawn from an isolated hypervisor context, so
-even a compromised kernel can't click "Allow" for you. `sudo` and `supr` work as aliases.
+**Does it run Claude Code or OpenCode?**
+Yes. Both are Linux programs that run on Kurono. Claude Code is installed with
+`kpkg install claude`, or you can put the CLAUDE file on the KURONO partition. OpenCode
+needs the OPENCODE file on the KURONO partition. The file list is in `boot-on-hardware.md`.
+
+**What is `amdo`? What is KSA?**
+`amdo` is the privilege command of Kurono: `amdo <command>`. It used to be called `ken`,
+and `ken`, `sudo` and `supr` still work as aliases. When something needs admin rights,
+KSA shows an approval prompt. The prompt is drawn from an isolated hypervisor context, so
+even a compromised kernel can't click "Allow" for you. KSA can be turned off for now in
+Settings (Users & Security, Approval). That needs your password, and it is meant to come
+back on.
 
 **What is KLD?**
-Kurono Linux Drivers. It runs unmodified Linux driver code (I've done e1000e) as a
-sandboxed ring-3 process. The kernel doesn't link any Linux code, the driver talks to
-hardware only through a broker in the kernel.
+Kurono Linux Drivers. It runs unmodified Linux driver code (e1000e, and Intel Wi-Fi for
+the BE200) as a sandboxed ring-3 process. The kernel doesn't link any Linux code, the
+driver talks to hardware only through a broker in the kernel.
 
 **What are the `kurono.*` flags?**
 Boot options you add on the GRUB line. See `../developers/boot-flags.md`.

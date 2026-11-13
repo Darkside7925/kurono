@@ -60,7 +60,8 @@ Wayland backend.
 
 The ring-3 Task Manager is a normal program that reads `/proc` like any Linux tool. Each
 task (user or kernel) has a numeric directory with `status`, `stat`, and threads under
-`task/<tid>`. Per-task heap numbers appear when `kurono.taskmem=1`.
+`task/<tid>`. Per-task heap numbers appear when `kurono.taskmem=1`. The Virtual Machine row shows the
+guest's real RAM.
 
 ## Text editor
 

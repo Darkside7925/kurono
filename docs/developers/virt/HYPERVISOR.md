@@ -1,44 +1,78 @@
 # Hypervisor
 
-`src/virt/hypervisor.cpp` and `hypervisor.h`. The Type-1 style hypervisor, on Intel VT-x
-(VMX).
-
-A hardware-accelerated VMM built into the kernel. It uses VMX to create and run guests, and
-the main use case is booting a Debian guest inside Kurono without a reboot.
+`src/virt/hypervisor.cpp` and `hypervisor.h`, and the background VM host in `src/virt/vm_host.cpp`
+and `vm_host.h`. The hypervisor runs guests on Intel VT-x (VMX). The background VM host is the part
+you use day to day: it runs an Alpine or Debian guest, or a Kurono kernel, next to the desktop.
 
 ## What it needs
 
-- Intel VMX (`CPUDetect::HasVMX()`) or AMD-V/SVM. Both detection and enable paths exist,
-  EPT on Intel and NPT on AMD.
-- VMXON permission, CR4.VMXE set, for the VT-x path
-- enough RAM for the guest's physical memory
+- Intel VT-x (`CPUDetect::HasVMX()`). The tests for part 3 of the major update ran Kurono inside QEMU under KVM, with VMX
+  passed down to Kurono.
+- EPT for guest memory (see [EPT.md](EPT.md)).
+- Enough host RAM for the guest. Guest RAM is lazy by default, so the guest only takes host
+  frames as it touches them (see [DYNAMIC_VM.md](DYNAMIC_VM.md)).
+- VT-d for `kurono.vm.pt` device passthrough (see [PCI_PASSTHROUGH.md](PCI_PASSTHROUGH.md)).
 
-> The honest caveat: the VMCS/VMCB and Linux-boot path are implemented, but actually booting
-> an Alpine/Debian guest needs the host to expose **nested** VT-x to Kurono. In the usual dev
-> environment, Kurono itself running as a guest under nested KVM/QEMU, that layer is not
-> available and VM-entry fails with a VMX entry error (`hypervisor.cpp` logs "VM-entry
-> failed ... host likely doesn't support nested virt"). So guest boot is only confirmed where
-> nested VMX exists. `VMM::IsNested()` reports the situation at boot. Same constraint sits
-> behind KSA's nested-VM-vs-EPT-isolated-context fallback, see
-> [../security/KSA.md](../security/KSA.md).
+The AMD-V (SVM) exit path is in `vmexit.cpp`, but the tests for part 3 of the major update only ran on VT-x.
+
+## The background VM host
+
+`vm_host.cpp` runs the guest from its own kernel process. The process owns the VMCS, so every
+VMX operation happens on it. It runs the guest in short real-time slices, yields to the desktop
+between them, and sleeps while the guest is idle in HLT. Guest time keeps going whether or not
+anything is looking at the screen. A guest that crashes or powers off is torn down here, and
+Kurono keeps running.
+
+Three distros are in the table in `vm_host.cpp`:
+
+| Distro | Files on the KURONO partition root | Default RAM |
+| --- | --- | --- |
+| Alpine | `ALPKERN.BIN`, `ALPINIT.BIN`, `ALPINE.IMG` | 1024 MB |
+| Debian 13 | `DEBKERN.BIN`, `DEBINIT.BIN`, `DEBIAN.IMG` | 768 MB in the table |
+| Kurono (nested) | any multiboot2 Kurono kernel, started by `vm kurono` only | 1024 MB |
+
+`DEBIAN.IMG` has to be one contiguous file on the partition. The VM host reports a fragmented
+image as not installed.
+
+`linux.autostart` starts the VM a few seconds after the desktop is up (`AutostartAtBoot()`).
+
+## Commands
+
+The `vm` command is registered in `src/shell/linux_cmds.cpp`, category `virt`. The ones that
+matter day to day:
+
+```
+vm start                 start the background guest (alpine by default)
+vm stop                  clean poweroff through the guest agent, forced after a timeout
+vm kill                  immediate teardown
+vm state                 live status
+vm log                   the guest console
+vm term                  open a Linux terminal on the guest
+vm exec <cmd>            run a guest command and show its output
+vm run <cmd>             start a guest program (GUI apps open as Kurono windows)
+vm snap <png>            save a Kurono guest's screen as a png
+vm kurono <elf> [MB] [cmdline]   boot a Kurono kernel as a guest
+vm kloop [clean] [secs] [MB] [cmdline]   build a kernel in the guest and boot it (see KLOOP.md)
+```
+
+There are also lower-level commands used by the test rig: `vm create`, `vm run`, `vm pause`,
+`vm resume`, `vm destroy`, `vm serial`, `vm regs`, `vm info`, `vm boot-alpine`, `vm boot-debian`
+and `vm boot-test`. `vm` is its own top-level command. There is no `kurono vm start`.
+
+## Kurono as a guest
+
+`vm kurono` boots a multiboot2 Kurono kernel (ELF64) as a guest, for testing a new build
+without rebooting the machine. The source is a path in the VFS, or an 8.3 name in the KURONO
+partition root (`KGUEST.ELF`). The guest has one vCPU, its RAM defaults to 1024 MB and cannot go
+below 256 MB, and it has no guest agent, so `vm stop` forces it off.
+
+The guest's com1 is its whole log. Every line lands in the host kernel's log as `[gs]` lines,
+so they show up in `KURONO.LOG` too. `vm log` and `vm snap` work the same as for Alpine.
 
 ## Init is deferred
 
-Hypervisor init does not run during normal boot. It happens when you explicitly start a VM.
-On purpose: VT-x init is risky on some real laptop hardware, and deferring it keeps boot
-from failing.
-
-Start one with the `vm` command, registered in `linux_cmds.cpp` with category `virt`:
-
-```
-vm create [ram_mb]      # create a VM
-vm run [max_exits]      # enter the VM run loop
-vm boot-alpine          # boot the embedded Alpine guest
-vm boot-test            # minimal guest that prints to serial
-```
-
-There is no `kurono vm start`. `vm` is its own top-level command with `create`, `run`,
-`pause`, `resume`, `destroy`, `serial`, `regs`, `info`, `boot-test` and `boot-alpine`.
+Hypervisor init does not run during normal boot. It runs when a VM is started, so boot does not
+depend on VT-x working on every machine.
 
 ## VMCS
 
@@ -52,20 +86,17 @@ sets up:
 
 ## Exits
 
-Every exit goes to `vmexit.cpp`, which dispatches on the reason:
-
-| Reason | Handler |
-| --- | --- |
-| CPUID | return emulated values |
-| I/O port access | forward to the virtual device |
-| EPT violation | map the missing guest page |
-| RDMSR/WRMSR | return or absorb the MSR value |
-| HLT | guest idled, yield |
+Every exit goes to `vmexit.cpp`. See [VMEXIT.md](VMEXIT.md) for the table.
 
 ## Files
 
+- `src/virt/vm_host.cpp` the background VM host, distro table, boot paths and the `vm` status
+- `src/virt/hypervisor.cpp` VMCS setup, the run loop and the guest boot paths
 - `src/virt/vmexit.cpp` exit dispatch
 - `src/virt/ept.cpp` extended page tables
-- `src/virt/vmm.cpp` backend glue
-- `src/virt/linux_boot.cpp` loads Linux into the guest
+- `src/virt/guest_mem.cpp` guest RAM layout and lazy backing
+- `src/virt/vdisk.cpp` and `src/virt/vblk.cpp` guest disks
+- `src/virt/linux_boot.cpp` Linux boot protocol
+- `src/virt/mb2_boot.cpp` multiboot2 guest loader
+- `src/virt/kloop.cpp` the `vm kloop` dev loop
 - `src/virt/vdevices.cpp` what the guest sees as hardware

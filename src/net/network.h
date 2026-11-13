@@ -217,6 +217,8 @@ public:
     };
 
     static void Init();
+    // the KLD iwlwifi container owns the radio: skip the native probe (satoru)
+    static void SetKldOwned(bool on);
 
     static bool Enable();
     static bool Disable();
@@ -228,6 +230,16 @@ public:
     static void Tick();
     static void SetAutoReconnect(bool on);
     static bool AutoReconnect();
+
+    // saved (known) networks, kept encrypted by net/wifi_store. the settings
+    // page and the control center read them through here, so the ring-3 build
+    // can serve the same calls over the settings service. (satoru)
+    static int  SavedCount();
+    static bool SavedAt(int i, char* ssid, int cap, int* security, bool* autojoin);
+    static bool Forget(const char* ssid);
+    static bool SetAutoJoin(const char* ssid, bool on);
+    // true while the KLD linux driver container owns the radio. (satoru)
+    static bool KldBridge();
 
     static WiFiState GetState();
     static WiFiNetwork* GetNetworks();

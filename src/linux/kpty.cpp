@@ -461,6 +461,16 @@ int SlaveRead(int t, uint8_t* d, int max) {
     return r;
 }
 
+int OutTail(int t, uint8_t* d, int max) {   // (satoru)
+    if (!vt(t) || max <= 0) return 0;
+    Pair& p = g_pair[t];
+    SpinLockGuard g(p.lock);
+    if (max > OUT_SZ - 1) max = OUT_SZ - 1;
+    int h = p.out_h;
+    for (int i = 0; i < max; i++) d[i] = p.r->out[(h - max + i + OUT_SZ) % OUT_SZ];
+    return max;
+}
+
 int SlaveWrite(int t, const uint8_t* d, int n) {
     if (!vt(t)) return -5;
     Pair& p = g_pair[t];

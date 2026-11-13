@@ -37,6 +37,17 @@ public:
     static const char* CaptureData();
     static uint32_t CaptureLen();
     static uint32_t CaptureCap();
+    // enlarge the boot-log capture to 4 mb (kurono.serlog=big). (satoru)
+    static void     SetBigCapture(bool big);
+    // session stream (satoru): StreamTotal counts every byte ever captured;
+    // EnableStreamRing(power of two) keeps the newest bytes in a heap ring so
+    // the disk log can cover a whole session. StreamRead copies bytes by
+    // stream offset and returns 0 once the ring has been lapped past them
+    // (without a ring it reads the linear capture). (satoru)
+    static bool     EnableStreamRing(uint32_t bytes);
+    static uint64_t StreamTotal();
+    static uint32_t StreamRingSize();
+    static uint32_t StreamRead(uint64_t from, char* dst, uint32_t n);
     // per-line hook (cpu 0, outside the serial lock); null to clear. (satoru)
     static void SetLineHook(void (*hook)());
 private:

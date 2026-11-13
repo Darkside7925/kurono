@@ -15,9 +15,13 @@ details on day one. Good. Here is the order I'd go in.
 ## Short version
 
 Kurono is a bare-metal x86_64 OS with its own desktop, its own apps, a shell, a lot of
-drivers, a Linux-compatible syscall layer (it runs unmodified Firefox and BusyBox), and a
-small hypervisor that runs Alpine Linux. It boots on a real laptop, not just in an
-emulator.
+drivers, a Linux-compatible syscall layer (it runs unmodified Firefox, BusyBox, OpenCode
+and Claude Code), and a small hypervisor that runs Alpine Linux and Debian. It boots on a
+real laptop, not just in an emulator.
+
+This is part 3 of the major update, the infrastructure and support work before Kurono
+Kintsugi. It is not the final version, and some parts are still held back because of bugs
+and issues.
 
 It sounds huge. It gets a lot less scary once you cut it into routes:
 

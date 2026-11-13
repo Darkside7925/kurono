@@ -9,6 +9,7 @@ enum InstallerDiskType : uint8_t {
     INST_DISK_NONE = 0,
     INST_DISK_NVME = 1,
     INST_DISK_SATA = 2,   // ahci-attached; enumerated via BlockDev (satoru)
+    INST_DISK_USB  = 3,   // usb mass storage; enumerated via BlockDev (satoru)
 };
 
 enum InstallerPartScheme : uint8_t {
@@ -64,6 +65,7 @@ public:
     static InstallerPartitionInfo* GetPartition(int idx);
     static int  FindESPPartition();
     static int  FindFirstExt4Partition();
+    static int  FindFirstExt4PartitionOnDisk(int disk_index);   // (satoru)
 
     // boot-time persistence: bring up the nvme data disk and mount its raw ext4
     // (whole-disk, offset 0) so kvfs.img save/restore works on a normal boot, not
@@ -72,7 +74,8 @@ public:
     static bool MountDataDisk();
 
     static void RegisterShellCommands(void* shell);
-    static int  InstallToPartition(int partition_index, char* out, int max_out);
+    // confirm must be true when the disk holds another os; see InstallerDisk::Safety (satoru)
+    static int  InstallToPartition(int partition_index, char* out, int max_out, bool confirm = false);
     static void DescribeInstallPlan(int partition_index, char* out, int max_out);
     static void DumpDisks(char* out, int max_out);
     static void DumpPartitions(char* out, int max_out);

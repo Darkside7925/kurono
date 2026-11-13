@@ -348,10 +348,13 @@ struct TermR3 : kui::AppHandler {
             if (sfd > 2) close(sfd);
             for (int fd = 3; fd < 256; fd++) close(fd);
             const char* envp[] = {
-                "PATH=/system/bin:/usr/bin", "HOME=/home/user", "USER=user",
+                "PATH=/system/bin:/usr/bin:/system/kbin", "HOME=/home/user", "USER=user",
                 "TERM=xterm-256color", "SHELL=/bin/ksh", "XDG_RUNTIME_DIR=/system/run/user/1000",
+                // the same prompt as the --ksh shell, so both look like kurono's terminal (satoru)
+                "PS1=\\[\\033[38;5;75m\\][kurono]\\[\\033[0m\\] \\[\\033[92m\\]user@kurono\\[\\033[0m\\]:\\[\\033[96m\\]\\w\\[\\033[0m\\]$ ",
                 nullptr
             };
+            if (chdir("/home/user") != 0) { /* stay in / (satoru) */ }
             const char* av[] = { "sh", "-i", nullptr };
             execve("/system/bin/busybox", (char* const*)av, (char* const*)envp);
             ksh_run();

@@ -3,6 +3,7 @@
 #include "../net/unix_socket.h"
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
+#include "../kernel/pmm.h"
 
 namespace {
 
@@ -23,7 +24,9 @@ struct NameEntry {
     int  owner_sd;
 };
 
-Client    g_clients[DBusServer::DBUS_MAX_CLIENTS];
+// 32 * ~16 kb of session-client records; allocated on the first connection, so
+// a desktop with no dbus client carries none of it. (satoru)
+Client*   g_clients = nullptr;
 NameEntry g_names[DBusServer::DBUS_MAX_NAMES];
 int       g_listen_sd = -1;
 int       g_next_unique = 1;
@@ -54,6 +57,7 @@ void str_cpy(char* d, const char* s, int max) {
 }
 
 Client* find_client(int sd) {
+    if (!g_clients) return nullptr;
     for (int i = 0; i < DBusServer::DBUS_MAX_CLIENTS; i++) {
         if (g_clients[i].in_use && g_clients[i].sd == sd) return &g_clients[i];
     }
@@ -61,6 +65,11 @@ Client* find_client(int sd) {
 }
 
 Client* alloc_client(int sd) {
+    if (!g_clients) {
+        g_clients = (Client*)PMM::AllocBytes(sizeof(Client) * DBusServer::DBUS_MAX_CLIENTS);
+        if (!g_clients) return nullptr;
+        memset(g_clients, 0, sizeof(Client) * DBusServer::DBUS_MAX_CLIENTS);
+    }
     for (int i = 0; i < DBusServer::DBUS_MAX_CLIENTS; i++) {
         if (!g_clients[i].in_use) {
             Client* c = &g_clients[i];
@@ -462,8 +471,27 @@ void on_data(int sd, const uint8_t* data, int len, void* user) {
     }
 }
 
+// a client that exited was never noticed (no close callback): its record, its
+// bus names and the server end of its socket stayed taken, and after 32 runs of
+// a dbus client the table was full. reap hung-up peers before each accept. (satoru)
+void reap_dead_clients() {
+    if (!g_clients) return;
+    for (int i = 0; i < DBusServer::DBUS_MAX_CLIENTS; i++) {
+        Client* c = &g_clients[i];
+        if (!c->in_use || !UnixSocket::PeerClosed(c->sd)) continue;
+        for (int k = 0; k < DBusServer::DBUS_MAX_NAMES; k++)
+            if (g_names[k].in_use && g_names[k].owner_sd == c->sd) g_names[k].in_use = false;
+        int sd = c->sd;
+        c->in_use = false;
+        c->sd = -1;
+        c->rx_len = 0;
+        UnixSocket::Close(sd);
+    }
+}
+
 void on_connect(int server_sd, int new_sd, void* user) {
     (void)server_sd; (void)user;
+    reap_dead_clients();   // (satoru)
     if (!alloc_client(new_sd)) {
         UnixSocket::Close(new_sd);
         return;
@@ -478,7 +506,7 @@ void on_connect(int server_sd, int new_sd, void* user) {
 namespace DBusServer {
 
 void Init() {
-    for (int i = 0; i < DBUS_MAX_CLIENTS; i++) g_clients[i].in_use = false;
+    if (g_clients) for (int i = 0; i < DBUS_MAX_CLIENTS; i++) g_clients[i].in_use = false;
     for (int i = 0; i < DBUS_MAX_NAMES; i++)   g_names[i].in_use   = false;
 
     g_listen_sd = UnixSocket::Create(UnixSocket::UNIX_SOCK_STREAM);
@@ -511,7 +539,7 @@ void Init() {
 int ListenSd() { return g_listen_sd; }
 int ClientCount() {
     int n = 0;
-    for (int i = 0; i < DBUS_MAX_CLIENTS; i++) if (g_clients[i].in_use) n++;
+    if (g_clients) for (int i = 0; i < DBUS_MAX_CLIENTS; i++) if (g_clients[i].in_use) n++;
     return n;
 }
 int RegisteredNameCount() {

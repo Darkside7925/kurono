@@ -38,3 +38,13 @@ It does not zero pages. Want zeroed memory? Do it yourself or go through the hea
 - `src/kernel/heap.cpp` the heap on top of this
 - `src/kernel/vmm.cpp` maps the pages this hands out
 - `src/kernel/kurono_kernel.cpp` init order
+
+## Image window
+
+Programs that link at a fixed address, Claude Code and OpenCode, need a reserved window of user
+address space. At boot the kernel checks for `CLAUDE` or `OPENCODE` on the KURONO partition.
+If either is there, the window stays reserved for the whole session. If neither is there, the
+window is released and its pages are claimed on demand. The decision is made once, after the
+desktop is up. See `PMM::FinalizeImageWindow`.
+
+Large kernel heap blocks (256 KB and up) also take their frames from here, see `HEAP.md`.

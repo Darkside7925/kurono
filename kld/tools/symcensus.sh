@@ -20,6 +20,7 @@
 # end (satoru)
 set -u
 BUILD="${1:-build}"
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
 if [ ! -d "$BUILD" ]; then
   echo "symcensus: no build dir '$BUILD' - run make first" >&2
@@ -33,8 +34,8 @@ CORE_OBJS=$(find "$BUILD/core" -name '*.o' 2>/dev/null || true)
 EMUL_HAND=$(find "$BUILD/emul" -name '*.o' 2>/dev/null | grep -v 'lx_stubs_gen' || true)
 
 if [ -z "$DRV_OBJS" ]; then
-  echo "symcensus: no driver objects in $BUILD/driver - nothing to census" >&2
-  exit 1
+  echo "symcensus: no driver objects in $BUILD/driver - nothing to census"
+  exit 0
 fi
 
 TMP=$(mktemp -d)
@@ -49,7 +50,7 @@ nm --defined-only $DRV_OBJS 2>/dev/null | awk '{print $3}' | sort -u > "$TMP/drv
 
 # libc + compiler builtins (3)
 printf '%s\n' memcpy memset memmove memcmp strlen strcmp strncmp strcpy strncpy \
-              strchr strrchr strstr strnlen snprintf vsnprintf sprintf printf \
+              strcat strchr strrchr strstr strnlen snprintf vsnprintf sprintf printf \
               puts malloc free calloc realloc abort exit _exit write read \
               __stack_chk_fail __stack_chk_guard __memcpy_chk __memset_chk \
               __udivdi3 __umoddi3 __divdi3 __moddi3 \
@@ -94,6 +95,27 @@ CORE=$(wc -l < "$TMP/bycore")
 STUB=$(wc -l < "$TMP/stubbed")
 MISS=$(wc -l < "$TMP/missing")
 
+# a generated stub must never stand in for DATA (the _ctype class): classify
+# each stubbed symbol by its relocation. PLT32 is a call; data relocations
+# without any PLT32 mean the objects read the symbol's bytes. (satoru)
+objdump -r $DRV_OBJS $CORE_OBJS 2>/dev/null | awk '
+  /^[^ \t].*\.o:/ { f = $1; sub(/:$/, "", f); next }
+  NF >= 3 && $2 ~ /^R_X86_64_/ {
+    s = $3; sub(/[-+]0x[0-9a-f]+$/, "", s)
+    print s, $2
+  }
+' > "$TMP/relmap"
+: > "$TMP/stubdata"
+while read -r s; do
+  [ -z "$s" ] && continue
+  types=$(awk -v s="$s" '$1 == s { print $2 }' "$TMP/relmap")
+  if ! echo "$types" | grep -q 'R_X86_64_PLT32' &&
+     echo "$types" | grep -qE 'R_X86_64_(REX_GOTPCRELX|GOTPCRELX|GOTPCREL|PC32|32S|32|64)'; then
+    echo "$s" >> "$TMP/stubdata"
+  fi
+done < "$TMP/stubbed"
+STUBDATA=$(wc -l < "$TMP/stubdata")
+
 echo "======================================================"
 echo " KLD symbol census"
 echo "======================================================"
@@ -101,11 +123,23 @@ echo "  external symbols needed : $NEED"
 echo "  IMPLEMENTED (shim, real): $IMPL"
 echo "  IMPORTED CORE (upstream): $CORE"
 echo "  STUBBED (aborts)        : $STUB   <- phase 2 work queue"
+echo "  STUBBED AS DATA (BUG)   : $STUBDATA   <- data symbol behind a function stub"
+AUXDIR=$ROOT/kld/lx_emul/kimpl
+AUXFN=$(grep -c '^LX_STUB(' "$AUXDIR/lx_aux_fn_stubs.c" 2>/dev/null || echo 0)
+AUXDATA=$(grep -cE '^(struct list_head|int acpi_disabled|DEFINE_MUTEX|struct irq_chip|struct flow_dissector|const struct fwnode_operations|const struct kernel_param_ops|const struct kobj_ns_type_operations|struct static_call_key)' "$AUXDIR/lx_aux_providers.c" 2>/dev/null || echo 0)
+echo "  address-taken fn stubs  : $AUXFN   <- address stored, prints if called"
+echo "  typed data providers    : $AUXDATA (poison 0)"
 echo "  MISSING (no provider)   : $MISS   <- will NOT link"
 if [ "$NEED" -gt 0 ]; then
   echo "  real coverage           : $(( (IMPL + CORE) * 100 / NEED ))%"
 fi
 echo
+
+if [ "$STUBDATA" -gt 0 ]; then
+  echo "  data symbols stubbed as functions (must become real data):"
+  sed 's/^/    /' "$TMP/stubdata"
+  echo
+fi
 
 if [ "$MISS" -gt 0 ]; then
   echo "--- MISSING (link will fail) ---"

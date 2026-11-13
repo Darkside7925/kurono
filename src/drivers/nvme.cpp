@@ -1,11 +1,13 @@
 //  kurono os - nvme block device driver implementation
 //  pcie nvme 1.4 ssd support with admin + i/o queues
 #include "nvme.h"
+#include "../kernel/kimage.h"   // direct-map/heap pointers -> phys (satoru)
 #include "../hal/hal.h"
 #include "../kernel/heap.h"
 #include "../kernel/pmm.h"   // page-aligned dma memory for the admin/io queues (satoru)
 #include "../kernel/vmm.h"   // identity-map the high 64-bit bar before touching it (satoru)
 #include "../kernel/kdf.h"   // kdf-sandboxed dma/mmio: guard-fenced queues + bar (satoru)
+#include "../kernel/kimage.h"  // high-half kernel: a .bss/.data buffer's phys is not its va (satoru)
 #include "../kernel/irp.h"   // register nvme as an irp block device (executive i/o) (satoru)
 #include "../drivers/serial.h"
 #include "../proc/smp.h"     // one i/o queue per cpu core; route by calling cpu (satoru)
@@ -33,7 +35,10 @@ int g_nvme_kdf_id = -1;   // kdf driver id for "nvme", set in NVMe::Init (satoru
 // happen post-migration but keeps a stray caller safe. (satoru)
 inline uint64_t dma_phys(const void* va) {
     uint64_t p = KDF::PhysOf((void*)(uintptr_t)va);
-    return p ? p : (uint64_t)(uintptr_t)va;
+    // a caller buffer inside the kernel image (a static sector cache, a .bss
+    // array) has a high-half va since the kernel moved: translate it; heap and
+    // pmm memory stay identity (KernelPhysOf returns them unchanged). (satoru)
+    return p ? p : KernelPhysOf(va);
 }
 
 //  irp dispatch routine for the "nvme0" block device: routes read/write/flush
@@ -500,7 +505,38 @@ bool NVMe::SubmitAdminCmd(NVMeSQE* cmd, NVMeCQE* result) {
 // spinning here. a completion that arrives after we gave up stays in the cq, and the next
 // command would take it as its own and return before its data landed, leaving the queue off
 // by one for good. so count what we abandoned and consume it before the next submit. (satoru)
-static const int NVME_CQ_SPINS = 50000000;
+static const int NVME_CQ_SPINS_NORMAL = 50000000;
+// NVMe::SetPanicIo: short completion waits on the panic path (about 0.2 s), so a
+// wedged controller cannot keep the machine from rebooting. (satoru)
+static volatile bool g_panic_io = false;
+#define NVME_CQ_SPINS (g_panic_io ? 2000000 : NVME_CQ_SPINS_NORMAL)
+void NVMe::SetPanicIo(bool on) { g_panic_io = on; }
+
+// the i/o queue lock, with the panic exception: a bare Lock() whose holder was
+// the context the panic interrupted (or a cpu the panic halted) spins forever,
+// and the panic never reached its disk log flush or its reboot. on the panic path
+// wait ~250 ms, then take the queue over. (satoru)
+class IoQueueGuard {
+public:
+    explicit IoQueueGuard(Spinlock& l) : l_(&l) {
+        if (!g_panic_io) { l_->Lock(); return; }
+        uint32_t lo, hi;
+        __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t t0 = ((uint64_t)hi << 32) | lo;
+        uint64_t f = 0;
+        for (uint64_t n = 0; !l_->TryLock(); n++) {
+            __asm__ __volatile__("pause; rdtsc" : "=a"(lo), "=d"(hi));
+            uint64_t el = (((uint64_t)hi << 32) | lo) - t0;
+            if (el > 750000000ull || n > 200000000ull) { f = 1; break; }   // ~250 ms at 3 ghz (satoru)
+        }
+        if (f) SerialLogger::Log("[NVMe] panic: queue lock held by a dead context, taking the queue over\r\n");
+    }
+    ~IoQueueGuard() { l_->Unlock(); }
+    IoQueueGuard(const IoQueueGuard&) = delete;
+    IoQueueGuard& operator=(const IoQueueGuard&) = delete;
+private:
+    Spinlock* l_;
+};
 static uint16_t g_q_stale[NVME_MAX_QUEUES + 2];
 
 static bool nvme_drain_stale(NVMeQueuePair* qp, void (*ring)(uint32_t, uint32_t)) {
@@ -533,7 +569,7 @@ bool NVMe::SubmitIOCmd(int qid, NVMeSQE* cmd, NVMeCQE* result) {
     if (!qp->sq || !qp->cq) return false;
 
     // serialize cores that share this sq (cpus > queues). (satoru)
-    SpinLockCpuGuard g(g_io_q_lock[qid]);
+    IoQueueGuard g(g_io_q_lock[qid]);   // bounded on the panic path (satoru)
     if (!nvme_drain_stale(qp, WriteReg)) return false;
 
     uint16_t tail = qp->sq_tail;
@@ -616,6 +652,10 @@ static uint8_t* g_prp_list = nullptr;
 //  (satoru)
 static bool nvme_build_prp_on(uint64_t base, uint32_t bytes, uint64_t* prp1, uint64_t* prp2, uint8_t* list_page) {
     const uint32_t PAGE = 4096;
+    // the caller's buffer may be a pmm/heap direct-map pointer, a kernel image
+    // buffer or a raw physical address. all of them become a physical base
+    // before the prp math (which assumes the buffer is contiguous). (satoru)
+    base = KernelPhysOf((const void*)(uintptr_t)base);
     *prp1 = base;
     // prp1 may carry a byte offset (the transfer starts there); the first page
     // then covers only PAGE-off bytes. prp2 + every list entry must be page
@@ -640,7 +680,7 @@ static bool nvme_build_prp_on(uint64_t base, uint32_t bytes, uint64_t* prp1, uin
     }
     uint64_t* list = (uint64_t*)list_page;
     for (uint32_t i = 0; i < n_list; i++) list[i] = page2 + (uint64_t)i * PAGE;
-    *prp2 = (uint64_t)(uintptr_t)list_page;
+    *prp2 = KernelPhysOf(list_page);
     return true;
 }
 
@@ -733,7 +773,7 @@ bool NVMe::SubmitIOBatch(int qid, uint8_t opcode, uint64_t lba, uint32_t count, 
     // sq ring (sq_tail + doorbell + reap) AND this queue's per-slot prp scratch
     // pages (g_batch_prp[qid][..]), both of which two cores would otherwise
     // corrupt concurrently. uncontended for a core on its own queue. (satoru)
-    SpinLockCpuGuard g(g_io_q_lock[qid]);
+    IoQueueGuard g(g_io_q_lock[qid]);   // bounded on the panic path (satoru)
     if (!nvme_drain_stale(qp, WriteReg)) return false;
     uint32_t lbasz = GetLBASize();
     uint32_t per = MaxTransferBytes() / lbasz; if (!per) per = 1;
@@ -746,7 +786,7 @@ bool NVMe::SubmitIOBatch(int qid, uint8_t opcode, uint64_t lba, uint32_t count, 
         while (count > 0 && in_batch < NVME_IO_BATCH) {
             uint32_t n = count > per ? per : count;
             uint64_t prp1 = 0, prp2 = 0;
-            if (!nvme_build_prp_on((uint64_t)(uintptr_t)p, n * lbasz, &prp1, &prp2, g_batch_prp[qid][in_batch]))
+            if (!nvme_build_prp_on(dma_phys(p), n * lbasz, &prp1, &prp2, g_batch_prp[qid][in_batch]))   // phys, not va (satoru)
                 return false;
             uint16_t tail = qp->sq_tail;
             NVMeSQE* s = &qp->sq[tail];
@@ -801,6 +841,8 @@ static volatile uint64_t g_wwin2_lo   = 0;   // second window, end == 0 means no
 static volatile uint64_t g_wwin2_end  = 0;
 static volatile uint64_t g_wwin3_lo   = 0;   // third window: the running vm's guest disk file (satoru)
 static volatile uint64_t g_wwin3_end  = 0;
+static volatile uint64_t g_wwin4_lo   = 0;   // fourth window: a kcrash record write (satoru)
+static volatile uint64_t g_wwin4_end  = 0;
 
 static volatile int g_wguard_policy = -1;   // -1 auto, 0 forced off, 1 forced on (satoru)
 void NVMe::SetGuardPolicy(int p) { g_wguard_policy = p; }
@@ -819,6 +861,12 @@ void NVMe::SetWriteWindow3(uint64_t lba_lo, uint64_t lba_end) {
     g_wwin3_lo = lba_lo;
     g_wwin3_end = (lba_end > lba_lo) ? lba_end : 0;
 }
+void NVMe::SetWriteWindow4(uint64_t lba_lo, uint64_t lba_end) {
+    // close first, then move: a reader never sees the new end with the old lo. (satoru)
+    __atomic_store_n(&g_wwin4_end, 0ull, __ATOMIC_RELEASE);
+    g_wwin4_lo = lba_lo;
+    __atomic_store_n(&g_wwin4_end, (lba_end > lba_lo) ? lba_end : 0ull, __ATOMIC_RELEASE);
+}
 bool NVMe::GetWriteWindow(uint64_t* lba_lo, uint64_t* lba_end) {
     if (lba_lo) *lba_lo = g_wwin_lo;
     if (lba_end) *lba_end = g_wwin_end;
@@ -835,6 +883,8 @@ bool NVMe::Write(uint64_t lba, uint32_t count, const void* buffer) {
         if (!inside && end2 != 0 && lba >= g_wwin2_lo && lba + count <= end2 && lba + count > lba) inside = true;
         uint64_t end3 = g_wwin3_end;
         if (!inside && end3 != 0 && lba >= g_wwin3_lo && lba + count <= end3 && lba + count > lba) inside = true;
+        uint64_t end4 = __atomic_load_n(&g_wwin4_end, __ATOMIC_ACQUIRE);
+        if (!inside && end4 != 0 && lba >= g_wwin4_lo && lba + count <= end4 && lba + count > lba) inside = true;
         if (!inside) {
             // log the first few refusals so a bare-metal log shows who tried. (satoru)
             uint64_t n = __atomic_add_fetch(&g_wdenied, 1, __ATOMIC_RELAXED);

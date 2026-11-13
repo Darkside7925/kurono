@@ -2,10 +2,13 @@
 //  real pci network card driver - works with qemu -device e1000
 
 #include "e1000.h"
+#include "../virt/pci_passthrough.h"   // reserved functions (satoru)
 #include "serial.h"
 #include "igc.h"   // fallback backend: i225/i226/82576 behind the same E1000:: api (satoru)
 #include "../kernel/kld_broker.h"   // kld backend: eth0 served by a linux driver container (satoru)
 #include "../kernel/heap.h"
+#include "../kernel/pmm.h"
+#include "../kernel/kimage.h"   // high-linked kernel: dma addresses are not kernel vas (satoru)
 
 // static member definitions
 bool E1000::detected = false;
@@ -14,8 +17,8 @@ uint8_t E1000::mac[6] = {0};
 
 E1000_RXDesc E1000::rx_descs[E1000_NUM_RX_DESC] __attribute__((aligned(16)));
 E1000_TXDesc E1000::tx_descs[E1000_NUM_TX_DESC] __attribute__((aligned(16)));
-uint8_t E1000::rx_buffers[E1000_NUM_RX_DESC][E1000_RX_BUFFER_SIZE] __attribute__((aligned(16)));
-uint8_t E1000::tx_buffers[E1000_NUM_TX_DESC][E1000_TX_BUFFER_SIZE] __attribute__((aligned(16)));
+uint8_t* E1000::rx_buffers = nullptr;
+uint8_t* E1000::tx_buffers = nullptr;
 
 uint16_t E1000::rx_cur = 0;
 uint16_t E1000::tx_cur = 0;
@@ -67,6 +70,7 @@ bool E1000::ScanPCI() {
             uint16_t vendor = id & 0xFFFF;
             uint16_t device = (id >> 16) & 0xFFFF;
 
+            if (vendor == E1000_VENDOR_ID && PCIPassthrough::IsReserved((uint8_t)bus, slot, 0)) continue;   // kurono.vm.pt (satoru)
             if (vendor == E1000_VENDOR_ID &&
                 (device == E1000_DEVICE_ID || device == E1000_DEVICE_ID2 || device == E1000_DEVICE_ID3)) {
 
@@ -163,12 +167,12 @@ void E1000::ReadMAC() {
 void E1000::InitRX() {
     // set up rx descriptor ring
     for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
-        rx_descs[i].addr = (uint64_t)(uintptr_t)&rx_buffers[i][0];
+        rx_descs[i].addr = KernelPhysOf(rx_buffers + (size_t)i * E1000_RX_BUFFER_SIZE);
         rx_descs[i].status = 0;
     }
 
     // program rdbal/rdbah
-    uint64_t rx_addr = (uint64_t)(uintptr_t)&rx_descs[0];
+    uint64_t rx_addr = KernelPhysOf(&rx_descs[0]);
     WriteReg(E1000_RDBAL, (uint32_t)(rx_addr & 0xFFFFFFFF));
     WriteReg(E1000_RDBAH, (uint32_t)(rx_addr >> 32));
 
@@ -196,14 +200,14 @@ void E1000::InitRX() {
 void E1000::InitTX() {
     // set up tx descriptor ring
     for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
-        tx_descs[i].addr = (uint64_t)(uintptr_t)&tx_buffers[i][0];
+        tx_descs[i].addr = KernelPhysOf(tx_buffers + (size_t)i * E1000_TX_BUFFER_SIZE);
         tx_descs[i].length = 0;
         tx_descs[i].cmd = 0;
         tx_descs[i].status = E1000_TXD_STAT_DD;  // mark as done
     }
 
     // program tdbal/tdbah
-    uint64_t tx_addr = (uint64_t)(uintptr_t)&tx_descs[0];
+    uint64_t tx_addr = KernelPhysOf(&tx_descs[0]);
     WriteReg(E1000_TDBAL, (uint32_t)(tx_addr & 0xFFFFFFFF));
     WriteReg(E1000_TDBAH, (uint32_t)(tx_addr >> 32));
 
@@ -281,6 +285,17 @@ bool E1000::Init() {
     // clear multicast table array
     for (int i = 0; i < 128; i++) {
         WriteReg(E1000_MTA + i * 4, 0);
+    }
+
+    if (!rx_buffers) {
+        rx_buffers = (uint8_t*)PMM::AllocBytes((size_t)E1000_NUM_RX_DESC * E1000_RX_BUFFER_SIZE);
+        tx_buffers = (uint8_t*)PMM::AllocBytes((size_t)E1000_NUM_TX_DESC * E1000_TX_BUFFER_SIZE);
+        if (!rx_buffers || !tx_buffers) {
+            SerialLogger::Log("[E1000] out of memory for the dma buffers\r\n");
+            return false;
+        }
+        memset(rx_buffers, 0, (size_t)E1000_NUM_RX_DESC * E1000_RX_BUFFER_SIZE);
+        memset(tx_buffers, 0, (size_t)E1000_NUM_TX_DESC * E1000_TX_BUFFER_SIZE);
     }
 
     // read mac address
@@ -424,7 +439,7 @@ bool E1000::Send(const uint8_t* data, uint16_t length) {
     // stack-local buffers, so descriptor pointers must not alias ephemeral
     // memory if we want reliable DNS/TCP traffic.
     for (uint16_t i = 0; i < length; i++) {
-        tx_buffers[tx_cur][i] = data[i];
+        tx_buffers[(size_t)tx_cur * E1000_TX_BUFFER_SIZE + i] = data[i];
     }
 
     // set up the descriptor. clear status (dd) so the nic can re-flag it on
@@ -493,7 +508,7 @@ void E1000::Poll() {
 
     while (rx_descs[rx_cur].status & E1000_RXD_STAT_DD) {
         uint16_t len = rx_descs[rx_cur].length;
-        uint8_t* buf = rx_buffers[rx_cur];
+        uint8_t* buf = rx_buffers + (size_t)rx_cur * E1000_RX_BUFFER_SIZE;
 
         if (len > 0 && len <= E1000_RX_BUFFER_SIZE) {
             rx_count++;

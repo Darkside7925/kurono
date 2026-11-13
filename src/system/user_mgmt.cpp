@@ -2,6 +2,8 @@
 #include "../fs/kvfs.h"
 #include "../drivers/rtc.h"
 #include "../drivers/serial.h"
+#include "../drivers/timer.h"
+#include "../security/kcrypto.h"
 
 User UserManager::users[UserManager::MAX_USERS];
 int  UserManager::user_count = 0;
@@ -98,12 +100,103 @@ static void um_hex(uint8_t* in, int n, char* out){
 }
 
 // --------------------------------------------------------- crypto wrappers
-void UserManager::HashPassword(const char* salt, const char* plaintext, char* out_hex_64){
+// pbkdf2-hmac-sha256, 200000 iterations (about 80 ms under kvm): slow enough
+// that a stolen /etc/shadow is expensive to brute force, fast enough for the
+// autologin boot path. the count is stored with each hash, so it can grow. (satoru)
+static const uint32_t UM_PBKDF2_ITERS = 200000;
+
+static void um_legacy_hash(const char* salt, const char* plaintext, char* out_hex_64){
     um_sha256 c; um_init(&c);
     if (salt) um_update(&c, (const uint8_t*)salt, um_strlen(salt));
     if (plaintext) um_update(&c, (const uint8_t*)plaintext, um_strlen(plaintext));
     uint8_t d[32]; um_final(&c, d);
     um_hex(d, 32, out_hex_64);
+    KCrypto::Wipe(d, sizeof(d));
+}
+
+static void um_pbkdf2(const char* salt, const char* plaintext, uint32_t iters, uint8_t out[32]){
+    KCrypto::Pbkdf2Sha256((const uint8_t*)(plaintext ? plaintext : ""), (uint32_t)um_strlen(plaintext),
+                          (const uint8_t*)(salt ? salt : ""), (uint32_t)um_strlen(salt), iters, out, 32);
+}
+
+// parse "p2$<iters>$<hex>". (satoru)
+static bool um_parse_p2(const char* stored, uint32_t* iters, uint8_t digest[32]){
+    if (!stored || stored[0] != 'p' || stored[1] != '2' || stored[2] != '$') return false;
+    int i = 3; uint32_t it = 0; int nd = 0;
+    while (stored[i] >= '0' && stored[i] <= '9' && nd < 9) { it = it * 10 + (uint32_t)(stored[i] - '0'); i++; nd++; }
+    if (!nd || stored[i] != '$' || it == 0) return false;
+    i++;
+    if (um_strlen(stored + i) != 64) return false;
+    if (!KCrypto::FromHex(stored + i, digest, 32)) return false;
+    *iters = it;
+    return true;
+}
+
+void UserManager::HashPassword(const char* salt, const char* plaintext, char* out_hex_64){
+    // out is a password_hash/pin_hash field (80 bytes): "p2$200000$" + 64 hex. (satoru)
+    uint8_t d[32];
+    um_pbkdf2(salt, plaintext, UM_PBKDF2_ITERS, d);
+    int p = 0;
+    out_hex_64[p++] = 'p'; out_hex_64[p++] = '2'; out_hex_64[p++] = '$';
+    char num[12]; int nn = 0; uint32_t v = UM_PBKDF2_ITERS;
+    while (v) { num[nn++] = (char)('0' + v % 10); v /= 10; }
+    while (nn) out_hex_64[p++] = num[--nn];
+    out_hex_64[p++] = '$';
+    KCrypto::ToHex(d, 32, out_hex_64 + p);
+    KCrypto::Wipe(d, sizeof(d));
+}
+
+bool UserManager::IsLegacyHash(const char* stored){
+    return stored && um_strlen(stored) == 64 && !(stored[0] == 'p' && stored[1] == '2' && stored[2] == '$');
+}
+
+bool UserManager::VerifyPassword(const char* salt, const char* plaintext, const char* stored){
+    if (!stored || !stored[0]) return false;
+    uint32_t iters = 0; uint8_t want[32];
+    if (um_parse_p2(stored, &iters, want)) {
+        uint8_t got[32];
+        um_pbkdf2(salt, plaintext, iters, got);
+        bool ok = KCrypto::Equal(got, want, 32);
+        KCrypto::Wipe(got, sizeof(got)); KCrypto::Wipe(want, sizeof(want));
+        return ok;
+    }
+    if (!IsLegacyHash(stored)) return false;
+    char h[80];
+    um_legacy_hash(salt, plaintext, h);
+    bool ok = KCrypto::Equal(h, stored, 64);
+    KCrypto::Wipe(h, sizeof(h));
+    return ok;
+}
+
+// ------------------------------------------------------------ lockout table
+// failed sign-in bookkeeping lives beside the user table (the User struct is
+// persisted field by field and shared with the ring-3 settings build). (satoru)
+static int      um_fail_count[UserManager::MAX_USERS];
+static uint32_t um_lock_until[UserManager::MAX_USERS];
+
+static void um_note_fail(int idx){
+    if (idx < 0 || idx >= UserManager::MAX_USERS) return;
+    um_fail_count[idx]++;
+    if (um_fail_count[idx] >= 5) {
+        uint32_t ms = 30000u;
+        for (int k = 5; k < um_fail_count[idx] && ms < 960000u; k++) ms *= 2;
+        um_lock_until[idx] = Timer::GetRealMs() + ms;
+        SerialLogger::Log("UserManager: too many failed sign-ins, account waits\r\n");
+    }
+}
+static void um_note_ok(int idx){
+    if (idx < 0 || idx >= UserManager::MAX_USERS) return;
+    um_fail_count[idx] = 0;
+    um_lock_until[idx] = 0;
+}
+
+uint32_t UserManager::LockoutRemainingMs(const char* username){
+    User* u = FindByName(username);
+    if (!u) return 0;
+    int idx = (int)(u - users);
+    uint32_t now = Timer::GetRealMs();
+    if (!um_lock_until[idx] || (int32_t)(um_lock_until[idx] - now) <= 0) return 0;
+    return um_lock_until[idx] - now;
 }
 
 void UserManager::GenerateSalt(char* out_hex_16){
@@ -166,7 +259,9 @@ void UserManager::PersistToDisk(){
         sp = um_puts(sh, sp, 2048, u.salt);
         sp = um_puts(sh, sp, 2048, "$");
         sp = um_puts(sh, sp, 2048, u.password_hash);
-        sp = um_puts(sh, sp, 2048, ":0:0:99999:7:::\n");
+        sp = um_puts(sh, sp, 2048, ":0:0:99999:7:::");
+        if (u.has_pin && u.pin_hash[0]) sp = um_puts(sh, sp, 2048, u.pin_hash);
+        sp = um_puts(sh, sp, 2048, "\n");
 
         kp = um_puts(kc, kp, 2048, "[user.");
         kp = um_puts(kc, kp, 2048, u.username);
@@ -189,7 +284,57 @@ void UserManager::PersistToDisk(){
     }
     KVFS::WriteString("/etc/passwd", pwd);
     KVFS::WriteString("/etc/shadow", sh);
+    KVFS::Chmod("/etc/shadow", 0600);
     KVFS::WriteString("/etc/kurono.conf", kc);
+    KCrypto::Wipe(sh, sizeof(sh));
+}
+
+// /etc/kurono.conf: [user.<name>] sections with key=value lines. restores the
+// fields /etc/shadow does not carry (admin flag, display name, prefs). (satoru)
+static void um_load_conf(){
+    static char buf[4096];
+    int n = KVFS::ReadFile("/etc/kurono.conf", buf, sizeof(buf) - 1);
+    if (n <= 0) return;
+    buf[n] = 0;
+    User* cur = nullptr;
+    bool any_admin_line = false;
+    int i = 0;
+    while (buf[i]) {
+        char line[160]; int lp = 0;
+        while (buf[i] && buf[i] != '\n' && lp < 159) line[lp++] = buf[i++];
+        line[lp] = 0;
+        while (buf[i] && buf[i] != '\n') i++;
+        if (buf[i] == '\n') i++;
+        if (lp && line[lp - 1] == '\r') line[--lp] = 0;
+        if (line[0] == '[') {
+            cur = nullptr;
+            const char* pfx = "[user.";
+            int k = 0; while (pfx[k] && line[k] == pfx[k]) k++;
+            if (pfx[k]) continue;
+            char nm[32]; int np = 0;
+            while (line[k] && line[k] != ']' && np < 31) nm[np++] = line[k++];
+            nm[np] = 0;
+            cur = UserManager::FindByName(nm);
+            continue;
+        }
+        if (!cur) continue;
+        int eq = 0; while (line[eq] && line[eq] != '=') eq++;
+        if (!line[eq]) continue;
+        line[eq] = 0;
+        const char* key = line; const char* val = line + eq + 1;
+        if (um_eq(key, "display_name") && val[0]) um_cpy(cur->display_name, val, 48);
+        else if (um_eq(key, "is_admin")) { cur->is_admin = (val[0] == '1'); any_admin_line = true; }
+        else if (um_eq(key, "auto_login")) cur->auto_login = (val[0] == '1');
+        else if (um_eq(key, "timezone") && val[0]) um_cpy(cur->timezone, val, 32);
+        else if (um_eq(key, "language") && val[0]) um_cpy(cur->language, val, 16);
+        else if (um_eq(key, "avatar_id")) { int v = 0; for (int q = 0; val[q] >= '0' && val[q] <= '9'; q++) v = v * 10 + (val[q] - '0'); cur->avatar_id = v; }
+        else if (um_eq(key, "accent_color")) { uint32_t v = 0; for (int q = 0; val[q] >= '0' && val[q] <= '9'; q++) v = v * 10 + (uint32_t)(val[q] - '0'); if (v) cur->accent_color = v; }
+    }
+    // never leave a machine without an administrator. (satoru)
+    bool have_admin = false;
+    for (int u = 0; u < UserManager::user_count; u++) if (UserManager::users[u].is_admin) have_admin = true;
+    if (!have_admin && UserManager::user_count > 0) UserManager::users[0].is_admin = true;
+    (void)any_admin_line;
 }
 
 // ---------------------------------------------------------------------- API
@@ -215,10 +360,17 @@ void UserManager::Init(){
         char hash[80] = {0}; int hp = 0;
         if (buf[i] == '$') {
             i++;
-            while (buf[i] && buf[i] != ':' && hp < 79) { hash[hp++] = buf[i++]; }
+            // the hash itself may contain '$' (p2$iters$hex): read to the ':' (satoru)
+            while (buf[i] && buf[i] != ':' && buf[i] != '\n' && hp < 79) { hash[hp++] = buf[i++]; }
         }
-        // skip rest of line
-        while (buf[i] && buf[i] != '\n') i++;
+        // fields 3..8, then the reserved field carries the pin hash (satoru)
+        char pin[80] = {0}; int pinp = 0;
+        int colons = 1;
+        while (buf[i] && buf[i] != '\n') {
+            if (buf[i] == ':') { colons++; i++; continue; }
+            if (colons >= 8 && pinp < 79 && buf[i] != '\r') pin[pinp++] = buf[i];
+            i++;
+        }
         if (buf[i] == '\n') i++;
 
         if (uname[0] && hash[0]) {
@@ -228,6 +380,7 @@ void UserManager::Init(){
             um_cpy(u.display_name, uname, 48);
             um_cpy(u.salt, salt, 24);
             um_cpy(u.password_hash, hash, 80);
+            if (pin[0]) { um_cpy(u.pin_hash, pin, 80); u.has_pin = true; }
             u.avatar_id = user_count - 1;
             u.accent_color = 0xFF5C8AFF;
             u.is_admin = (user_count == 1);
@@ -235,6 +388,7 @@ void UserManager::Init(){
             um_cpy(u.language, "en_US", 16);
         }
     }
+    um_load_conf();
     SerialLogger::Log("UserManager: loaded ");
     SerialLogger::LogDec(user_count);
     SerialLogger::Log(" user(s) from /etc/shadow\r\n");
@@ -243,20 +397,95 @@ void UserManager::Init(){
 bool UserManager::Login(const char* username, const char* password){
     User* u = FindByName(username);
     if (!u) return false;
-    char hash[80];
-    HashPassword(u->salt, password, hash);
-    if (!um_eq(hash, u->password_hash)) return false;
-    current_user = (int)(u - users);
+    int idx = (int)(u - users);
+    if (LockoutRemainingMs(username)) return false;
+    if (!VerifyPassword(u->salt, password, u->password_hash)) { um_note_fail(idx); return false; }
+    um_note_ok(idx);
+    // an old sha-256 hash is replaced by the slow kdf now that we know the password. (satoru)
+    if (IsLegacyHash(u->password_hash)) {
+        HashPassword(u->salt, password, u->password_hash);
+        PersistToDisk();
+        SerialLogger::Log("UserManager: upgraded a password hash to pbkdf2\r\n");
+    }
+    current_user = idx;
     return true;
 }
 
 bool UserManager::LoginByPin(const char* username, const char* pin){
     User* u = FindByName(username);
     if (!u || !u->has_pin) return false;
-    char hash[80];
-    HashPassword(u->salt, pin, hash);
-    if (!um_eq(hash, u->pin_hash)) return false;
-    current_user = (int)(u - users);
+    int idx = (int)(u - users);
+    if (LockoutRemainingMs(username)) return false;
+    if (!VerifyPassword(u->salt, pin, u->pin_hash)) { um_note_fail(idx); return false; }
+    um_note_ok(idx);
+    current_user = idx;
+    return true;
+}
+
+bool UserManager::VerifyAdminPassword(const char* password){
+    for (int i = 0; i < user_count; i++) {
+        if (!users[i].is_admin) continue;
+        if (LockoutRemainingMs(users[i].username)) continue;
+        if (VerifyPassword(users[i].salt, password, users[i].password_hash)) { um_note_ok(i); return true; }
+    }
+    return false;
+}
+
+bool UserManager::CredentialDigest(const char* username, const char* plaintext, uint8_t out[32]){
+    User* u = FindByName(username);
+    if (!u) return false;
+    uint32_t iters = 0; uint8_t want[32];
+    if (!um_parse_p2(u->password_hash, &iters, want)) return false;
+    KCrypto::Wipe(want, sizeof(want));
+    um_pbkdf2(u->salt, plaintext, iters, out);
+    return true;
+}
+
+bool UserManager::DigestMatches(const char* username, const uint8_t digest[32]){
+    User* u = FindByName(username);
+    if (!u) return false;
+    uint32_t iters = 0; uint8_t want[32];
+    if (!um_parse_p2(u->password_hash, &iters, want)) return false;
+    bool ok = KCrypto::Equal(want, digest, 32);
+    KCrypto::Wipe(want, sizeof(want));
+    if (!ok) um_note_fail((int)(u - users)); else um_note_ok((int)(u - users));
+    return ok;
+}
+
+const char* UserManager::FirstAdminName(){
+    for (int i = 0; i < user_count; i++) if (users[i].is_admin) return users[i].username;
+    return nullptr;
+}
+
+bool UserManager::CurrentIsAdmin(){
+    return current_user >= 0 && current_user < user_count && users[current_user].is_admin;
+}
+
+bool UserManager::SetAdmin(const char* username, bool admin){
+    User* u = FindByName(username);
+    if (!u) return false;
+    if (!admin && u->is_admin) {
+        int admins = 0;
+        for (int i = 0; i < user_count; i++) if (users[i].is_admin) admins++;
+        if (admins <= 1) return false;   // keep at least one administrator (satoru)
+    }
+    u->is_admin = admin;
+    PersistToDisk();
+    return true;
+}
+
+bool UserManager::ChangePassword(const char* username, const char* old_pw, const char* new_pw){
+    User* u = FindByName(username);
+    if (!u || !new_pw || um_strlen(new_pw) < 4) return false;
+    int idx = (int)(u - users);
+    if (LockoutRemainingMs(username)) return false;
+    if (!VerifyPassword(u->salt, old_pw, u->password_hash)) { um_note_fail(idx); return false; }
+    um_note_ok(idx);
+    GenerateSalt(u->salt);
+    HashPassword(u->salt, new_pw, u->password_hash);
+    // the pin was hashed with the old salt: it has to be set again. (satoru)
+    u->has_pin = false; u->pin_hash[0] = 0;
+    PersistToDisk();
     return true;
 }
 
@@ -285,7 +514,9 @@ bool UserManager::RegisterUser(const User& tmpl, const char* plaintext_password)
     if (IsUsernameTaken(tmpl.username))  return false;
     User& u = users[user_count];
     u = tmpl;
-    GenerateSalt(u.salt);
+    // a caller that hashed a pin already chose the salt for it: keep that salt,
+    // or the pin could never verify again. (satoru)
+    if (!(tmpl.has_pin && tmpl.salt[0])) GenerateSalt(u.salt);
     HashPassword(u.salt, plaintext_password, u.password_hash);
     if (u.display_name[0] == 0) um_cpy(u.display_name, u.username, 48);
     if (u.timezone[0] == 0)     um_cpy(u.timezone, "UTC", 32);

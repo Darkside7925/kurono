@@ -41,6 +41,7 @@ extern const SettingsModule g_a11y_module;
 extern const SettingsModule g_security_module;
 extern const SettingsModule g_system_module;
 extern const SettingsModule g_linux_module;   // (satoru)
+extern const SettingsModule g_language_module;   // (satoru)
 
 static const SettingsModule* g_modules[] = {
     &g_network_module,
@@ -49,6 +50,7 @@ static const SettingsModule* g_modules[] = {
     &g_power_module,
     &g_personalize_module,
     &g_a11y_module,
+    &g_language_module,
     &g_security_module,
     &g_storage_module,
     &g_devices_module,
@@ -57,7 +59,7 @@ static const SettingsModule* g_modules[] = {
     &g_about_module,
 };
 static const int g_module_count = (int)(sizeof(g_modules) / sizeof(g_modules[0]));
-static const bool kGroupBreak[16] = { false, true, false, false, true, false, true, false, false, true, false, false };
+static const bool kGroupBreak[16] = { false, true, false, false, true, false, false, true, false, false, true, false, false };
 
 static int s_eq(const char* a, const char* b){
     if(!a || !b) return 0;
@@ -74,6 +76,7 @@ static const ModMeta kMeta[] = {
     { "power",       IC_POWER,      "battery energy cpu performance balanced power saver governor" },
     { "personalize", IC_APPEARANCE, "appearance theme dark light mode accent colour color wallpaper background desktop icons animations shadows style dock taskbar interface size scale" },
     { "a11y",        IC_A11Y,       "accessibility contrast reduce motion sticky slow bounce keys color filter screen reader" },
+    { "language",    IC_GLOBE,      "language region keyboard layout input source qwerty azerty qwertz clock 24 hour date format week" },
     { "security",    IC_SECURITY,   "users account accounts password privacy sign in login administrator" },
     { "storage",     IC_STORAGE,    "disk disks drive drives memory ram space nvme sata files persistence" },
     { "devices",     IC_DEVICES,    "hardware device manager usb gpu graphics pci drivers keyboard mouse" },

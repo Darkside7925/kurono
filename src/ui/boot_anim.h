@@ -23,6 +23,10 @@ bool Start(int mode);
 // hold loop of a slow boot or the formation warp of a fast one. (satoru)
 void SetTest(int hold_ms, int early_ms);
 
+// kurono.bootbar=live: show the loading bar while loading (the default hides it
+// until the end, then fills and fades it). (satoru)
+void SetLiveBar(bool on);
+
 // bsp: a real boot stage was reached (0..95 %); drives the loading bar. pause,
 // resume and the gui takeover add their own steps, and the bar only completes
 // when the gui is up. (satoru)
@@ -56,6 +60,9 @@ bool CoversScreen();
 // when animations are off, so the caller just proceeds. (satoru)
 bool StartShutdown(int action);
 bool ShutdownDone();
+// abort a shutdown that has not powered off yet, so the desktop can be shown
+// again (a failed user-data save asks before continuing). (satoru)
+void CancelShutdown();
 
 // gui frame: composite the overlay into the back buffer, after the desktop
 // and cursor were drawn and right before the present. no-op when inactive. (satoru)

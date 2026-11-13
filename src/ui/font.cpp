@@ -312,6 +312,9 @@ int FontTTF::MeasureText(float pxh, const char* s, bool bold) {
     return MeasureFace(bold && g_loaded[1] ? 1 : 0, pxh, s);
 }
 
+static FontTTF::TargetFn g_target_fn = nullptr;
+void FontTTF::SetTarget(TargetFn fn) { g_target_fn = fn; }
+
 int FontTTF::DrawFace(int face, int x, int y, float pxh, const char* s, uint32_t color) {
     CacheSlot* cache = GetCache(pxh, face);
     const uint8_t r = (color >> 16) & 0xFF;
@@ -320,6 +323,19 @@ int FontTTF::DrawFace(int face, int x, int y, float pxh, const char* s, uint32_t
     const int startx = x;
     int pen26 = x * 64;
     const int peny = y;
+    // the visible box (the active clip within the screen). a glyph, row or
+    // column outside it was a BlendPixel call per lit pixel that the clip then
+    // threw away: text clipped by a window or by the damage scissor cost as
+    // much as drawn text. now only the visible part is touched, and on a
+    // 32 bpp target it is blended inline with the same BlendColors math, so
+    // the pixels are identical. (satoru)
+    // the kernel compositor registers the target (FontTTF::SetTarget); ring 3
+    // kui programs link this file without it and keep the old path. (satoru)
+    int vx0 = -0x40000000, vy0 = -0x40000000, vx1 = 0x40000000, vy1 = 0x40000000;
+    uint32_t* fbuf = nullptr;
+    size_t fpitch = 0;
+    if (g_target_fn) g_target_fn(&fbuf, &fpitch, &vx0, &vy0, &vx1, &vy1);
+    const uint32_t src_rgb = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 
     unsigned int prev_cp = 0;
     const char* p = s;
@@ -342,8 +358,28 @@ int FontTTF::DrawFace(int face, int x, int y, float pxh, const char* s, uint32_t
             const int gw = gl->w;
             const int gh = gl->h;
             const unsigned char* __restrict bm = gl->bitmap;
-            for (int yy = 0; yy < gh; yy++) {
-                BlitGlyphRow(ox, oy + yy, bm + (size_t)yy * gw, gw, r, g, b);
+            int xs = vx0 - ox, xe = vx1 - ox, ys = vy0 - oy, ye = vy1 - oy;
+            if (xs < 0) xs = 0;
+            if (ys < 0) ys = 0;
+            if (xe > gw) xe = gw;
+            if (ye > gh) ye = gh;
+            if (xs < xe && ys < ye) {
+                for (int yy = ys; yy < ye; yy++) {
+                    const unsigned char* row = bm + (size_t)yy * gw;
+                    if (!fbuf) { BlitGlyphRow(ox + xs, oy + yy, row + xs, xe - xs, r, g, b); continue; }
+                    uint32_t* d = fbuf + (size_t)(oy + yy) * fpitch + (size_t)ox;
+                    for (int xx = xs; xx < xe; xx++) {
+                        uint32_t a = row[xx];
+                        if (!a) continue;
+                        if (a == 255) { d[xx] = 0xFF000000u | src_rgb; continue; }
+                        // Graphics::BlendColors, exactly (satoru)
+                        uint32_t dv = d[xx], inv = 255u - a;
+                        uint32_t rr = (((src_rgb >> 16) & 0xFFu) * a + ((dv >> 16) & 0xFFu) * inv + 127u) / 255u;
+                        uint32_t gg = (((src_rgb >> 8) & 0xFFu) * a + ((dv >> 8) & 0xFFu) * inv + 127u) / 255u;
+                        uint32_t bb = ((src_rgb & 0xFFu) * a + (dv & 0xFFu) * inv + 127u) / 255u;
+                        d[xx] = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
+                    }
+                }
             }
         }
 

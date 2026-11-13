@@ -15,7 +15,7 @@
 
 // implemented in lx_printk.c (userspace context). declared here by hand because
 // including the shim's own header would drag libc types into kernel context.
-int lx_vprintk(const char *fmt, va_list ap);
+int lx_vprintk_nolevel(const char *fmt, va_list ap);
 
 static void lx_devlog(const char *tag, const char *name, const char *fmt, va_list ap)
 {
@@ -26,7 +26,9 @@ static void lx_devlog(const char *tag, const char *name, const char *fmt, va_lis
         lx_log(name);
         lx_log(": ");
     }
-    lx_vprintk(fmt, ap);
+    if (fmt && fmt[0] == '\001' && fmt[1])
+        fmt += 2;
+    lx_vprintk_nolevel(fmt, ap);
 }
 
 // ── struct device ───────────────────────────────────────────────────────────
@@ -95,6 +97,21 @@ void netdev_info(const struct net_device *dev, const char *fmt, ...)
 {
     va_list ap; va_start(ap, fmt);
     lx_devlog("INFO ", dev ? dev->name : NULL, fmt, ap);
+    va_end(ap);
+}
+
+// _dev_printk: the level comes as KERN_SOH + digit. (satoru)
+void _dev_printk(const char *level, const struct device *dev, const char *fmt, ...)
+{
+    va_list ap;
+    const char *tag = "INFO ";
+    if (level && level[0] == '\001' && level[1] >= '0' && level[1] <= '7') {
+        static const char *tags[8] = { "EMERG", "ALERT", "CRIT ", "ERR  ",
+                                       "WARN ", "NOTE ", "INFO ", "DEBUG" };
+        tag = tags[level[1] - '0'];
+    }
+    va_start(ap, fmt);
+    lx_devlog(tag, lx_dev_name(dev), fmt, ap);
     va_end(ap);
 }
 

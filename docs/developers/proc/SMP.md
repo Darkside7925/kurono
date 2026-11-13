@@ -8,6 +8,18 @@ multithreaded browser, using more than one core.
 The work is phased. Every phase is committed and verified to still boot the desktop under `-smp 4`.
 See also [SCHEDULER.md](SCHEDULER.md).
 
+## Default since part 3 of the major update
+
+The scheduler defaults to `kurono.sched=2`, so every CPU the firmware lists runs user tasks.
+The cap of 8 CPUs on EFI boots only applies under `kurono.sched=1`. `kurono.maxcpus=N` still
+sets a cap. The kernel supports up to 32 CPUs (`SMP_MAX_CPUS`).
+
+- Firmware that locks x2APIC on is handled. The APs come up through the MSR interrupt command
+  path and enable x2APIC themselves in `ap_entry`.
+- A wedge seen on 20-CPU machines came from the log lock being taken in the wrong order against
+  the file and heap locks. The log guard is a leaf lock now. `kurono.rtlogleaf=0` restores the
+  old hold-across-append behaviour.
+
 ## What runs where
 
 - the BSP (boot CPU, core 0) runs the kernel processes, the compositor, window manager, drivers and

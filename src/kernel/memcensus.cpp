@@ -7,6 +7,7 @@
 #include "../drivers/serial.h"
 #include "../proc/scheduler.h"
 #include "../linux/linux_syscall.h"
+#include "../ui/wayland_server.h"
 
 // see memcensus.h. one report walks every frame once (2M frames at 8 gb), so
 // it runs from its own low-priority kernel process, never from a hot path. the
@@ -229,7 +230,7 @@ void RegionTableFull(Process* owner) {
 
 void Init() {
     if (g_on || !PMM::CensusOn()) return;
-    g_nframes = PMM::GetPhysTop() / PAGE_SIZE;
+    g_nframes = PMM::GetTotalFrames();   // usable range; GetPhysTop spans the pci hole (satoru)
     g_bits = (uint8_t*)PMM::AllocBytes((size_t)((g_nframes + 7) / 8));
     if (!g_bits) { SerialLogger::Log("[memcensus] no mark bitmap, census off\r\n"); return; }
     g_on = true;
@@ -267,6 +268,13 @@ void Report(const char* why) {
     int ra = 0, re = 0, shm_n = 0;
     uint64_t shm_b = 0;
     LinuxSyscall::CensusCounts(&ra, &re, &shm_n, &shm_b);
+    int shm_pin = 0, shm_borrow = 0;
+    uint64_t shm_pin_b = 0;
+    LinuxSyscall::ShmKinds(&shm_pin, &shm_pin_b, &shm_borrow);
+    int pp_live = 0, pp_made = 0, pb_live = 0, pb_made = 0;
+    uint64_t pp_kb = 0, pb_kb = 0, sh_kb = 0;
+    WaylandServer::PoolCensus(&pp_live, &pp_made, &pp_kb,
+                              &pb_live, &pb_made, &pb_kb, &sh_kb);
     int ns = Scheduler::GetProcessSnapshot(g_snap, 512);
     int user_procs = 0, kprocs = 0, dead = 0;
     for (int i = 0; i < ns; i++) {
@@ -301,11 +309,26 @@ void Report(const char* why) {
     SerialLogger::Log(" exited="); log_u((uint64_t)re);
     SerialLogger::Log(" memfd slots="); log_u((uint64_t)shm_n);
     SerialLogger::Log(" memfd_kb="); log_u(shm_b >> 10);
+    SerialLogger::Log(" pin_slots="); log_u((uint64_t)shm_pin);
+    SerialLogger::Log(" pin_kb="); log_u(shm_pin_b >> 10);
+    SerialLogger::Log(" borrow="); log_u((uint64_t)shm_borrow);
+    SerialLogger::Log(" pin_untracked="); log_u((uint64_t)LinuxSyscall::ShmUntracked());
+    SerialLogger::Log(" | wl pools="); log_u((uint64_t)pp_live);
+    SerialLogger::Log("/"); log_u((uint64_t)pp_made);
+    SerialLogger::Log(" pool_kb="); log_u(pp_kb);
+    SerialLogger::Log(" bufs="); log_u((uint64_t)pb_live);
+    SerialLogger::Log("/"); log_u((uint64_t)pb_made);
+    SerialLogger::Log(" buf_kb="); log_u(pb_kb);
+    SerialLogger::Log(" shadow_kb="); log_u(sh_kb);
     SerialLogger::Log(" | sched user="); log_u((uint64_t)user_procs);
     SerialLogger::Log(" kernel="); log_u((uint64_t)kprocs);
     SerialLogger::Log(" terminated="); log_u((uint64_t)dead);
     SerialLogger::Log(" site_overflow="); log_u(g_overflow);
     SerialLogger::Log("\r\n");
+    KernelVMM::VmTraceDump();
+    LinuxSyscall::MapStatsDump();
+    LinuxSyscall::MmapReuseDump();
+    LinuxSyscall::MmapAuditDump();
 
     // top sites by live frames, then the biggest growers not already shown. (satoru)
     bool shown[SITE_CAP];

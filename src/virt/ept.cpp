@@ -4,7 +4,8 @@
 #include "vmm.h"
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
-#include "../kernel/kmemx.h"   // guest-page decompression on ept violation (satoru)
+#include "../kernel/kmemx.h"
+#include "../kernel/kimage.h"   // heap direct-map pointers -> phys (satoru)   // guest-page decompression on ept violation (satoru)
 
 // helper: allocate page-aligned memory
 static void* HeapAllocAligned(size_t size, size_t align) {
@@ -87,7 +88,7 @@ void EPTManager::DestroyEPT(EPT_PML4* pml4) {
 }
 
 uint64_t EPTManager::BuildEPTP(EPT_PML4* pml4) {
-    uint64_t eptp = (uint64_t)(uintptr_t)pml4;
+    uint64_t eptp = KernelPhysOf(pml4);
     eptp |= EPTP_MT_WB;     // wb memory type for ept structures
     eptp |= EPTP_WALK_4;    // 4-level page walk
     // eptp |= eptp_ad_enable; // enable a/d bits if supported
@@ -115,7 +116,7 @@ void EPTManager::DestroyNPT(NPT_PML4* pml4) {
 
 uint64_t EPTManager::BuildNCR3(NPT_PML4* pml4) {
     // ncr3 is just the physical address of the top-level page table
-    return (uint64_t)(uintptr_t)pml4;
+    return KernelPhysOf(pml4);
 }
 
 //  ept page table walk - allocate intermediate levels on demand
@@ -123,6 +124,14 @@ uint64_t EPTManager::BuildNCR3(NPT_PML4* pml4) {
 // kmemx hook: a no-create leaf walk. returns the existing 4kb leaf entry pointer
 // or nullptr (absent uppers or a large-page mapping). thin wrapper over WalkEPT.
 // (satoru)
+void EPTManager::UnmapRange(EPT_PML4* pml4, uint64_t guest_phys, uint64_t size) {
+    if (!pml4) return;
+    for (uint64_t o = 0; o < size; o += 4096) {
+        uint64_t* e = WalkEPT(pml4, (guest_phys + o) & ~0xFFFULL, false);
+        if (e) *e = 0;
+    }
+}
+
 uint64_t* EPTManager::KmemxLeafEntry(EPT_PML4* pml4, uint64_t guest_phys) {
     if (!pml4) return nullptr;
     return WalkEPT(pml4, guest_phys & ~0xFFFULL, /*create=*/false);
@@ -144,7 +153,7 @@ uint64_t* EPTManager::WalkEPT(EPT_PML4* pml4, uint64_t guest_phys, bool create) 
         if (!create) return nullptr;
         pdpt = (EPT_PDPT*)AllocPage();
         if (!pdpt) return nullptr;
-        *pml4e = (uint64_t)(uintptr_t)pdpt | EPT_READ | EPT_WRITE | EPT_EXECUTE;
+        *pml4e = KernelPhysOf(pdpt) | EPT_READ | EPT_WRITE | EPT_EXECUTE;
     }
 
     // pdpt → pd
@@ -157,7 +166,7 @@ uint64_t* EPTManager::WalkEPT(EPT_PML4* pml4, uint64_t guest_phys, bool create) 
         if (!create) return nullptr;
         pd = (EPT_PD*)AllocPage();
         if (!pd) return nullptr;
-        *pdpte = (uint64_t)(uintptr_t)pd | EPT_READ | EPT_WRITE | EPT_EXECUTE;
+        *pdpte = KernelPhysOf(pd) | EPT_READ | EPT_WRITE | EPT_EXECUTE;
     }
 
     // pd → pt
@@ -170,7 +179,7 @@ uint64_t* EPTManager::WalkEPT(EPT_PML4* pml4, uint64_t guest_phys, bool create) 
         if (!create) return nullptr;
         pt = (EPT_PT*)AllocPage();
         if (!pt) return nullptr;
-        *pde = (uint64_t)(uintptr_t)pt | EPT_READ | EPT_WRITE | EPT_EXECUTE;
+        *pde = KernelPhysOf(pt) | EPT_READ | EPT_WRITE | EPT_EXECUTE;
     }
 
     return &pt->entries[pt_idx];
@@ -191,7 +200,7 @@ uint64_t* EPTManager::WalkNPT(NPT_PML4* pml4, uint64_t guest_phys, bool create) 
         if (!create) return nullptr;
         pdpt = (NPT_PDPT*)AllocPage();
         if (!pdpt) return nullptr;
-        *pml4e = (uint64_t)(uintptr_t)pdpt | NPT_PRESENT | NPT_WRITE | NPT_USER;
+        *pml4e = KernelPhysOf(pdpt) | NPT_PRESENT | NPT_WRITE | NPT_USER;
     }
 
     uint64_t* pdpte = &pdpt->entries[pdpt_idx];
@@ -203,7 +212,7 @@ uint64_t* EPTManager::WalkNPT(NPT_PML4* pml4, uint64_t guest_phys, bool create) 
         if (!create) return nullptr;
         pd = (NPT_PD*)AllocPage();
         if (!pd) return nullptr;
-        *pdpte = (uint64_t)(uintptr_t)pd | NPT_PRESENT | NPT_WRITE | NPT_USER;
+        *pdpte = KernelPhysOf(pd) | NPT_PRESENT | NPT_WRITE | NPT_USER;
     }
 
     uint64_t* pde = &pd->entries[pd_idx];
@@ -215,7 +224,7 @@ uint64_t* EPTManager::WalkNPT(NPT_PML4* pml4, uint64_t guest_phys, bool create) 
         if (!create) return nullptr;
         pt = (NPT_PT*)AllocPage();
         if (!pt) return nullptr;
-        *pde = (uint64_t)(uintptr_t)pt | NPT_PRESENT | NPT_WRITE | NPT_USER;
+        *pde = KernelPhysOf(pt) | NPT_PRESENT | NPT_WRITE | NPT_USER;
     }
 
     return &pt->entries[pt_idx];
@@ -310,7 +319,7 @@ bool EPTManager::MapLargePages(EPT_PML4* pml4, uint64_t guest_phys,
         if (!(pml4->entries[pml4_idx] & (EPT_READ | EPT_WRITE))) {
             void* page = AllocPage();
             if (!page) return false;
-            pml4->entries[pml4_idx] = ((uint64_t)(uintptr_t)page) | EPT_READ | EPT_WRITE | EPT_EXECUTE;
+            pml4->entries[pml4_idx] = (KernelPhysOf(page)) | EPT_READ | EPT_WRITE | EPT_EXECUTE;
         }
         
         EPT_PDPT* pdpt = (EPT_PDPT*)((pml4->entries[pml4_idx]) & ~0xFFFULL);
@@ -319,7 +328,7 @@ bool EPTManager::MapLargePages(EPT_PML4* pml4, uint64_t guest_phys,
         if (!(pdpt->entries[pdpt_idx] & (EPT_READ | EPT_WRITE))) {
             void* page = AllocPage();
             if (!page) return false;
-            pdpt->entries[pdpt_idx] = ((uint64_t)(uintptr_t)page) | EPT_READ | EPT_WRITE | EPT_EXECUTE;
+            pdpt->entries[pdpt_idx] = (KernelPhysOf(page)) | EPT_READ | EPT_WRITE | EPT_EXECUTE;
         }
         
         if (pdpt->entries[pdpt_idx] & EPT_LARGE_PAGE) {
@@ -358,7 +367,7 @@ bool EPTManager::MapLargePagesNPT(NPT_PML4* pml4, uint64_t guest_phys,
         if (!(pml4->entries[pml4_idx] & NPT_PRESENT)) {
             void* page = AllocPage();
             if (!page) return false;
-            pml4->entries[pml4_idx] = ((uint64_t)(uintptr_t)page) | NPT_PRESENT | NPT_WRITE;
+            pml4->entries[pml4_idx] = (KernelPhysOf(page)) | NPT_PRESENT | NPT_WRITE;
         }
         
         NPT_PDPT* pdpt = (NPT_PDPT*)((pml4->entries[pml4_idx]) & ~0xFFFULL);
@@ -366,7 +375,7 @@ bool EPTManager::MapLargePagesNPT(NPT_PML4* pml4, uint64_t guest_phys,
         if (!(pdpt->entries[pdpt_idx] & NPT_PRESENT)) {
             void* page = AllocPage();
             if (!page) return false;
-            pdpt->entries[pdpt_idx] = ((uint64_t)(uintptr_t)page) | NPT_PRESENT | NPT_WRITE;
+            pdpt->entries[pdpt_idx] = (KernelPhysOf(page)) | NPT_PRESENT | NPT_WRITE;
         }
         
         if (pdpt->entries[pdpt_idx] & NPT_LARGE_PAGE) {

@@ -1288,7 +1288,10 @@ bool MediaPlayerApp::OnEvent(kui::Window& w, const kui::Event& e) {
 // player can be opened again. a handler from an older window must not clear a newer one. (satoru)
 void MediaPlayerApp::WindowGone(kui::Window* who) {
     if (g_win != who && g_win != nullptr) return;
-    if (playing || paused) Stop();
+    // always close the kui::Audio stream, even when the state flags say the
+    // player already stopped: a stream left open behind a closed window is
+    // what made the mixer keep playing with no way to stop it. (satoru)
+    Stop();
     g_win = nullptr;
     win_id = -1;
     hover_button = -1;

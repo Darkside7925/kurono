@@ -411,6 +411,10 @@ void LinuxDeviceBridge::RegisterDefaults() {
     // makes it visible to anything that enumerates /dev. (satoru)
     Register("kshell", "/dev/kshell", LDEV_CHAR, LDEV_CLASS_TTY, 5, 200);
 
+    // /dev/kaudio (5, 201) - the same command channel under an audio name, for
+    // `echo "audio restart" > /dev/kaudio` and `audio status` from ring 3. (satoru)
+    Register("kaudio", "/dev/kaudio", LDEV_CHAR, LDEV_CLASS_TTY, 5, 201);
+
     // /dev/tty (5, 0) - current terminal
     Register("tty", "/dev/tty", LDEV_CHAR, LDEV_CLASS_TTY, 5, 0);
 

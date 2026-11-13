@@ -22,6 +22,7 @@
 [BITS 64]
 section .text
 
+; context switch. if u change the order of anything in here, firefox will crash 5% of the time and u will never find out why
 global scheduler_switch_to
 scheduler_switch_to:
     ; rdi = uint64_t* prev_saved_rsp   (where to write our rsp)
@@ -107,6 +108,12 @@ scheduler_jump_to:
 ; ═══════════════════════════════════════════════════════════════════════════
 global ap_enter_user_frame
 ap_enter_user_frame:
+    ; [ubchk] exit trace, hal.cpp (satoru)
+    extern ub_trace_isr_exit
+    mov  rbx, rdi
+    and  rsp, ~0xF
+    call ub_trace_isr_exit
+    mov  rdi, rbx
     cli
     mov  rsp, rdi        ; rsp -> InterruptFrame (cr2 first) (satoru)
     add  rsp, 8          ; skip cr2 (satoru)

@@ -10,7 +10,7 @@
 //  is split down recursively; on free, buddies are coalesced upward.
 //
 //  Memory itself is still owned by PMM; the buddy allocator borrows
-//  ram/32 (8 MB .. `BUDDY_POOL_BYTES` = 256 MB) of contiguous frames at Init()
+//  8 MB of contiguous frames at Init()
 //  and manages them privately.  Frees outside that pool fall back to
 //  PMM::FreeFrame().  This makes it side-by-side with the existing
 //  bitmap allocator instead of replacing it (safer migration path).
@@ -18,7 +18,7 @@
 //  Statistics are exported via DumpInfo() and /proc/buddyinfo.
 
 #define BUDDY_ORDER_MAX     11      // 2^11 pages = 2048 = 8 MB
-#define BUDDY_POOL_BYTES    (256ull * 1024ull * 1024ull)
+#define BUDDY_POOL_BYTES    (8ull * 1024ull * 1024ull)
 #define BUDDY_POOL_MIN_BYTES (8ull * 1024ull * 1024ull)
 #define BUDDY_PAGE_SIZE     4096ull
 
@@ -52,7 +52,7 @@ public:
     static uint64_t GetPoolBase()    { return pool_base; }
     static uint64_t GetPoolBytes()   { return pool_bytes; }
     static uint64_t GetUsedBytes()   { return used_bytes; }
-    static uint64_t GetFreeBytes()   { return pool_bytes - used_bytes; }
+    static uint64_t GetFreeBytes()   { return used_bytes < pool_bytes ? pool_bytes - used_bytes : 0; }
     static uint32_t GetFreeCount(int order);               // # blocks at order
     static uint32_t GetSplitCount()  { return split_count; }
     static uint32_t GetMergeCount()  { return merge_count; }

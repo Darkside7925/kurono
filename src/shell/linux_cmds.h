@@ -84,6 +84,8 @@ namespace LinuxCmds {
 
     // hypervisor / vm management
     int cmd_vm(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
+    // kld reload <family> [new elf]: swap a ring-3 driver container, no reboot (satoru)
+    int cmd_kld(KuronoShell* sh, int argc, const char** argv, char* out, int mx);
 
     // alpine linux guest vm management
     int cmd_alpine(KuronoShell* sh, int argc, const char** argv, char* out, int mx);

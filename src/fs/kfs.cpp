@@ -38,6 +38,9 @@ namespace {
     uint8_t*   g_bounce = nullptr;
     uint32_t   g_bounce_cap = 0;
     static const uint32_t KFS_MAX_RUN_BLOCKS = 512;
+    bool g_kfs_run_reads = true;   // ReadFileAt coalesces contiguous blocks (satoru)
+    bool g_kfs_run_verify = false; // kurono.mmappfverify=1: re-read each run block by block and compare (satoru)
+    uint32_t g_kfs_run_bad = 0, g_kfs_run_checked = 0;
 
     uint32_t crc32(const uint8_t* p, uint32_t n) {
         uint32_t c = 0xFFFFFFFFu;
@@ -608,6 +611,11 @@ bool KFS::Mount() {
     return true;
 }
 
+uint64_t KFS::MetadataBytes() {
+    if (!g_mounted) return 0;
+    return (uint64_t)g_bitmap_bytes + g_inodes_bytes + g_bounce_cap;
+}
+
 void KFS::Unmount() {
     // drop the in-ram metadata caches - the bitmap + inode table together run
     // ~36 mb on the 4 gb data disk and were held for the whole session after a
@@ -662,6 +670,73 @@ int64_t KFS::ReadFile(const char* path, void* buf, uint64_t max) {
     if (n && n->type == KFS_SYMLINK) return -1;  // symlinks read via ReadLink (satoru)
     return read_file(n, buf, max);
 }
+
+// range read: a lazy kvfs file only fetches the blocks a page actually covers.
+// inline files copy out of the inode, extents are read one block at a time. (satoru)
+int64_t KFS::ReadFileAt(const char* path, uint64_t off, void* buf, uint64_t len) {
+    if (!g_mounted || !buf) return -1;
+    KFSInode* n = inode_ptr(resolve(path));
+    if (!n || n->type != KFS_FILE) return -1;
+    if (off >= n->size) return 0;
+    uint64_t avail = n->size - off;
+    if (len > avail) len = avail;
+    if (len == 0) return 0;
+    uint8_t* out = (uint8_t*)buf;
+    if (n->flags & KFS_FLAG_INLINE) {
+        for (uint64_t i = 0; i < len; i++) out[i] = n->inline_data[off + i];
+        return (int64_t)len;
+    }
+    // one command per physically contiguous run (like read_file), not one per
+    // 4 kb block: a lazy library mapped in 256 kb chunks was 64 serial nvme
+    // commands per chunk, ~32 mb/s, all of it under g_vfs_lock. the old
+    // one-block loop stays behind kurono.kfsrun=0 for A/B. (satoru)
+    uint64_t done = 0;
+    while (done < len) {
+        uint64_t pos = off + done;
+        uint32_t lblk = (uint32_t)(pos / KFS_BLOCK_SIZE);
+        uint32_t boff = (uint32_t)(pos % KFS_BLOCK_SIZE);
+        uint32_t pb = logical_to_phys(n, lblk);
+        if (!pb) return -1;
+        uint64_t n2 = len - done;
+        if (g_kfs_run_reads) {
+            uint64_t want_blocks = ((uint64_t)boff + n2 + KFS_BLOCK_SIZE - 1) / KFS_BLOCK_SIZE;
+            uint32_t run = 1;
+            while (run < want_blocks && run < KFS_MAX_RUN_BLOCKS &&
+                   logical_to_phys(n, lblk + run) == pb + run) run++;
+            uint64_t run_bytes = (uint64_t)run * KFS_BLOCK_SIZE;
+            if (!ensure_bounce((uint32_t)run_bytes)) return -1;
+            if (!rd_block(pb, run, g_bounce)) return -1;
+            if (g_kfs_run_verify) {
+                uint8_t vb[KFS_BLOCK_SIZE];
+                for (uint32_t r = 0; r < run; r++) {
+                    if (!rd_block(pb + r, 1, vb)) return -1;
+                    g_kfs_run_checked++;
+                    bool same = true;
+                    for (uint32_t k = 0; k < KFS_BLOCK_SIZE; k++)
+                        if (vb[k] != g_bounce[(uint64_t)r * KFS_BLOCK_SIZE + k]) { same = false; break; }
+                    if (!same && g_kfs_run_bad++ < 8) {
+                        SerialLogger::Log("[kfsrun] MISMATCH pb="); SerialLogger::LogDec((int)(pb + r));
+                        SerialLogger::Log(" run="); SerialLogger::LogDec((int)run);
+                        SerialLogger::Log(" r="); SerialLogger::LogDec((int)r); SerialLogger::Log("\r\n");
+                    }
+                }
+            }
+            if (n2 > run_bytes - boff) n2 = run_bytes - boff;
+            for (uint64_t i = 0; i < n2; i++) out[done + i] = g_bounce[boff + i];
+        } else {
+            uint8_t blk[KFS_BLOCK_SIZE];
+            if (!rd_block(pb, 1, blk)) return -1;
+            if (n2 > KFS_BLOCK_SIZE - boff) n2 = KFS_BLOCK_SIZE - boff;
+            for (uint64_t i = 0; i < n2; i++) out[done + i] = blk[boff + i];
+        }
+        done += n2;
+    }
+    return (int64_t)done;
+}
+
+void KFS::SetRunReads(bool on) { g_kfs_run_reads = on; }   // kurono.kfsrun=0 (satoru)
+void KFS::SetRunVerify(bool on) { g_kfs_run_verify = on; }   // kurono.mmappfverify=1 (satoru)
+void KFS::RunVerifyStats(uint32_t* checked, uint32_t* bad) { if (checked) *checked = g_kfs_run_checked; if (bad) *bad = g_kfs_run_bad; }
 
 bool KFS::Symlink(const char* path, const char* target) {
     if (!g_mounted || !path || !target) return false;

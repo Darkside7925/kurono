@@ -309,6 +309,34 @@ static void RegisterBridgeStubs(){
     SerialLogger::Log("[termsh] bridge stubs written: "); SerialLogger::LogDec(made); SerialLogger::Log("\r\n");
 }
 
+static bool g_kbin_done=false;
+void TerminalApp::InstallCommandStubs(){
+    if(g_kbin_done) return;
+    int n=KuronoShell::GetCommandCount();
+    ShellCommand* cmds=KuronoShell::GetCommands();
+    if(n<=0 || !cmds) return;   // the shell is not up yet: try again on the next open (satoru)
+    g_kbin_done=true;
+    KVFS::Mkdirs("/system/kbin");
+    char path[64], body[200];
+    int made=0;
+    for(int i=0;i<n;i++){
+        const char* nm=cmds[i].name;
+        if(!nm[0]) continue;
+        bool ok=true;   // a name the shell cannot quote safely is skipped (satoru)
+        for(int k=0;nm[k];k++){ char c=nm[k]; if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.')) { ok=false; break; } }
+        if(!ok) continue;
+        scpy(path,"/system/kbin/",sizeof(path)); sapp(path,nm,sizeof(path));
+        if(KVFS::Exists(path)) continue;
+        scpy(body,"#!/bin/sh\nexec 3<>/dev/kexec\ntrap 'echo !cancel >&3; exit 130' INT\necho \"",sizeof(body));
+        // only shell builtins: a stub that forks (cat) failed whenever fork did. (satoru)
+        sapp(body,nm,sizeof(body)); sapp(body," $*\" >&3\nwhile read -r _ <&3; do :; done\n",sizeof(body));
+        KVFS::WriteFile(path,body,(uint32_t)slen(body));
+        KVFS::Chmod(path,0755);
+        made++;
+    }
+    SerialLogger::Log("[terminal] kurono command stubs in /system/kbin: "); SerialLogger::LogDec(made); SerialLogger::Log("\r\n");
+}
+
 //  init / open
 void TerminalApp::Init(){
     // global setup only: theme chrome + grid metrics from kss before anything
@@ -390,6 +418,7 @@ static void PtyScrollInst(TermInst* S,int delta);
 int TerminalApp::Open(){
     // /system/apps/terminal when kurono.r3apps (or ui.conf apps.ring3) asks for it and the
     // ELF is there; the same window callbacks below are the fallback. (satoru)
+    InstallCommandStubs();   // before the ring-3 shell looks up a command (satoru)
     if(KuiKernel::LaunchRing3("terminal")) return 0;
     return OpenKernel();
 }

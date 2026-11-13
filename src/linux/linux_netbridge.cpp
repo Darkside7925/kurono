@@ -2,6 +2,7 @@
 
 #include "linux_netbridge.h"
 #include "../kernel/heap.h"
+#include "../kernel/pmm.h"
 #include "../drivers/timer.h"
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
@@ -18,7 +19,7 @@
 // (Connect/Accept/Send window-full) call PumpUI, which is unsafe off the
 // bsp, so every path here pre-checks state to keep those unreachable. (satoru)
 
-LinuxSocket       LinuxNetBridge::sockets[LNET_MAX_SOCKETS];
+LinuxNetBridge::SockTable LinuxNetBridge::sockets = {};
 int               LinuxNetBridge::socket_count = 0;
 LinuxNetInterface LinuxNetBridge::interfaces[LNET_MAX_INTERFACES];
 int               LinuxNetBridge::iface_count = 0;
@@ -62,7 +63,7 @@ static uint32_t ln_ip_to_u32(IPv4Address ip) {
 //  init
 
 void LinuxNetBridge::Init() {
-    memset(sockets, 0, sizeof(sockets));
+    memset(&sockets, 0, sizeof(sockets));
     memset(interfaces, 0, sizeof(interfaces));
     socket_count = 0;
     iface_count = 0;
@@ -140,16 +141,37 @@ void LinuxNetBridge::InitInterfaces() {
 //  bsd socket api
 
 int LinuxNetBridge::AllocSocket() {
-    for (int i = 0; i < LNET_MAX_SOCKETS; i++) {
-        if (!sockets[i].active) return i;
+    for (int pass = 0; pass < 2; pass++) {
+        int n = sockets.Count();
+        for (int i = 0; i < n; i++) {
+            if (!sockets[i].active) return i;
+        }
+        if (pass) break;
+        // table full: append one zeroed chunk. lock-free publish, the loser of a
+        // race frees its copy. chunks are never moved or freed. (satoru)
+        int c = __atomic_load_n(&sockets.nch, __ATOMIC_ACQUIRE);
+        if (c >= LNET_MAX_SOCKETS / LNET_SOCK_CHUNK) return -1;
+        LinuxSocket* ch = (LinuxSocket*)PMM::AllocBytes(sizeof(LinuxSocket) * LNET_SOCK_CHUNK);
+        if (!ch) return -1;
+        memset(ch, 0, sizeof(LinuxSocket) * LNET_SOCK_CHUNK);
+        LinuxSocket* expect = nullptr;
+        if (!__atomic_compare_exchange_n(&sockets.ch[c], &expect, ch, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            PMM::FreeBytes(ch, sizeof(LinuxSocket) * LNET_SOCK_CHUNK);
+        }
+        __atomic_compare_exchange_n(&sockets.nch, &c, c + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
     return -1;
 }
 
 LinuxSocket* LinuxNetBridge::GetSocket(int fd) {
-    if (fd < 0 || fd >= LNET_MAX_SOCKETS) return nullptr;
+    if (fd < 0 || fd >= sockets.Count()) return nullptr;
     if (!sockets[fd].active) return nullptr;
     return &sockets[fd];
+}
+
+uint32_t LinuxNetBridge::SocketInstance(int sockfd) {
+    LinuxSocket* s = GetSocket(sockfd);
+    return s ? s->instance : 0;
 }
 
 int LinuxNetBridge::Socket(int family, int type, int protocol, int owner_pid) {
@@ -171,6 +193,11 @@ int LinuxNetBridge::Socket(int family, int type, int protocol, int owner_pid) {
 
     LinuxSocket* s = &sockets[idx];
     memset(s, 0, sizeof(LinuxSocket));
+    {   // a fresh socket in this slot is a different instance. (satoru)
+        static uint32_t s_inst = 0;
+        s->instance = __atomic_add_fetch(&s_inst, 1u, __ATOMIC_RELAXED);
+        if (!s->instance) s->instance = __atomic_add_fetch(&s_inst, 1u, __ATOMIC_RELAXED);
+    }
     s->fd = idx;
     s->family = family;
     s->type = type;
@@ -233,6 +260,7 @@ int LinuxNetBridge::Connect(int sockfd, const LinuxSockaddrIn* addr) {
 
     s->remote_addr = ip;
     s->remote_port = port;
+    s->conn_err_notified = 0;   // a new handshake may notify an error once (satoru)
 
     if (s->type == LSOCK_DGRAM) {
         // connected-udp just fixes the default destination. (satoru)
@@ -542,11 +570,24 @@ int LinuxNetBridge::RxAvail(int sockfd) {
 // itself is the same same-cpu Blocked->Ready flip the timer would do. (satoru)
 extern void LinuxSyscallPollWakeInet(int backend_sd);
 void LinuxNetBridge::WakeRxPollers() {
-    for (int i = 0; i < LNET_MAX_SOCKETS; i++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         LinuxSocket* s = &sockets[i];
         if (!s->active) continue;
+        int old_state = (int)s->state;
         lnb_settle(s);
-        if (TCPStack::RxAvailable(s->kurono_socket) > 0 ||
+        // a parked blocking connect must also wake when the handshake settles or
+        // fails (RST): control packets carry no rx data, so the rx check below
+        // would leave it to the timer backstop. (satoru)
+        bool conn_done = (old_state == (int)LSOCK_CONNECTING &&
+                          s->state != (int)LSOCK_CONNECTING);
+        bool conn_err = false;
+        if (s->type == LSOCK_STREAM && s->state == LSOCK_CONNECTING &&
+            !s->conn_err_notified) {
+            int e = TCPStack::GetSockError(s->kurono_socket);
+            if (e != TCP_EINPROGRESS && e != 0) { conn_err = true; s->conn_err_notified = 1; }
+        }
+        if (conn_done || conn_err ||
+            TCPStack::RxAvailable(s->kurono_socket) > 0 ||
             TCPStack::IsPeerClosed(s->kurono_socket)) {
             LinuxSyscallPollWakeInet(i);
         }
@@ -824,7 +865,7 @@ void LinuxNetBridge::Netstat(char* out, int max_out) {
     p = pa(out, p, max_out, "Proto Recv-Q Send-Q Local Address        Foreign Address      State\n");
 
     char ipbuf[16];
-    for (int i = 0; i < LNET_MAX_SOCKETS; i++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         if (!sockets[i].active) continue;
         LinuxSocket* s = &sockets[i];
 

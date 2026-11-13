@@ -1,11 +1,16 @@
 #include "linux_cmds.h"
 #include "../virt/vm_host.h"   // (satoru)
+#include "../virt/vi8042.h"   // vm type / vm key (satoru)
+#include "../virt/kloop.h"    // vm kloop (satoru)
 #include "../apps/alpine_term.h"
 #include "../fs/kvfs.h"
 #include "../kernel/time.h"
 #include "../drivers/timer.h"
 #include "../kernel/heap.h"
 #include "../proc/scheduler.h"
+#include "../proc/smp.h"       // per-cpu busy ticks for top (satoru)
+#include "../hal/hal.h"        // per-pid cpu time for ps/top (satoru)
+#include "../kernel/memacct.h" // resident pages for ps/top (satoru)
 #include "../drivers/serial.h"
 #include "../drivers/audio.h"
 #include "../drivers/cpu_detect.h"
@@ -34,6 +39,11 @@
 #include "../virt/vmm.h"
 #include "../virt/alpine_data.h"
 #include "../virt/debian_data.h"
+#include "../linux/gl_support.h"   // glsetup/glrun software-gl harness (satoru)
+#include "../kernel/kld_supervisor.h"   // kld reload (satoru)
+#include "../drivers/disklog.h"   // root files for kld reload (satoru)
+#include "../drivers/timer.h"
+#include "../proc/scheduler.h"
 
 //  linux bridge - posix-like commands for kurono shell
 
@@ -600,12 +610,15 @@ void LinuxCmds::RegisterAll(KuronoShell* sh) {
 
     // hypervisor / vm management - create, boot, run linux guest vms
     sh->RegisterCommand("vm",         "Manage virtual machines",        ENV_AUTO, "virt",  cmd_vm);
+    sh->RegisterCommand("kld",        "KLD driver containers (reload)", ENV_AUTO, "virt",  cmd_kld);   // (satoru)
 
     // alpine linux vm management
     sh->RegisterCommand("alpine",     "Alpine Linux guest VM",          ENV_AUTO, "system", cmd_alpine);
     sh->RegisterCommand("apk",        "Alpine package manager",         ENV_AUTO, "package", cmd_apk);
     sh->RegisterCommand("debian",     "Debian Linux guest VM",          ENV_AUTO, "system", cmd_debian);
     sh->RegisterCommand("apt",        "Debian package manager",         ENV_AUTO, "package", cmd_apt);
+    sh->RegisterCommand("glsetup",    "Install software GL from GLTAR.TAR", ENV_AUTO, "linux", GlSupport::CmdSetup);
+    sh->RegisterCommand("glrun",      "Run a native EGL/GLES program",       ENV_AUTO, "linux", GlSupport::CmdRun);
 }
 
 //  filesystem commands
@@ -1177,21 +1190,47 @@ int LinuxCmds::cmd_tr(KuronoShell* sh, int argc, const char** argv, char* out, i
 
 //  system commands
 
+// real process list: pids, names, total cpu time (user + system, from the
+// timer-irq accounting) and resident memory, sorted by pid. (satoru)
 int LinuxCmds::cmd_ps(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh; (void)argc; (void)argv;
-    int p = 0;
-    p = _sa(out, p, mx, "  PID TTY      TIME CMD\n");
-    p = _sa(out, p, mx, "    0 ?     00:00:00 kernel\n");
-    p = _sa(out, p, mx, "    1 ?     00:00:00 init\n");
-    p = _sa(out, p, mx, "    2 tty1  00:00:00 ksh\n");
-    p = _sa(out, p, mx, "    3 tty1  00:00:00 desktop\n");
-    // from scheduler
-    for (int i = 0; i < (int)Scheduler::GetProcessCount() && i < 16; i++) {
-        p = _sa(out, p, mx, "    ");
-        p = _sai(out, p, mx, 10 + i);
-        p = _sa(out, p, mx, " ?     00:00:00 task_");
-        p = _sai(out, p, mx, i);
+    SchedulerProcessSnapshot snaps[64];
+    int n = Scheduler::GetProcessSnapshot(snaps, 64);
+    for (int i = 1; i < n; i++) {
+        SchedulerProcessSnapshot k = snaps[i];
+        int j = i - 1;
+        while (j >= 0 && snaps[j].pid > k.pid) { snaps[j + 1] = snaps[j]; j--; }
+        snaps[j + 1] = k;
+    }
+    int p = _sa(out, 0, mx, "  PID TTY          TIME     RSS CMD\n");
+    for (int i = 0; i < n; i++) {
+        const SchedulerProcessSnapshot& s = snaps[i];
+        if (s.pid == 0) continue;
+        if (s.flags & PROCESS_FLAG_THREAD) continue;
+        uint64_t ums = 0, sms = 0, tms = 0;
+        hal_pid_cpu_ms(s.pid, &ums, &sms, &tms);
+        uint32_t rss_kb = s.memory_kb;
+        if ((s.flags & PROCESS_FLAG_USER) && s.address_space) {
+            MemAcct::SpaceMem sm;
+            if (MemAcct::QuerySpace(s.address_space, 900u, &sm, false)) rss_kb = (uint32_t)sm.rss_kb;
+        }
+        p = _sa(out, p, mx, "  ");
+        p = _sai(out, p, mx, (int)s.pid);
+        for (int k = (s.pid < 10 ? 4 : (s.pid < 100 ? 3 : (s.pid < 1000 ? 2 : 1))); k > 0; k--) p = _sac(out, p, mx, ' ');
+        p = _sa(out, p, mx, "?     ");
+        uint32_t secs = (uint32_t)(tms / 1000ull);
+        if (secs >= 3600u) p = _sai(out, p, mx, (int)(secs / 3600u)); else p = _sac(out, p, mx, '0');
+        p = _sac(out, p, mx, ':');
+        { uint32_t m = (secs / 60u) % 60u; if (m < 10) p = _sac(out, p, mx, '0'); p = _sai(out, p, mx, (int)m); }
+        p = _sac(out, p, mx, ':');
+        { uint32_t ss = secs % 60u; if (ss < 10) p = _sac(out, p, mx, '0'); p = _sai(out, p, mx, (int)ss); }
+        p = _sa(out, p, mx, " ");
+        for (int k = (rss_kb < 10 ? 7 : (rss_kb < 100 ? 6 : (rss_kb < 1000 ? 5 : (rss_kb < 10000 ? 4 : 3)))); k > 0; k--) p = _sac(out, p, mx, ' ');
+        p = _sau(out, p, mx, rss_kb);
+        p = _sa(out, p, mx, " ");
+        p = _sa(out, p, mx, s.name[0] ? s.name : "process");
         p = _sac(out, p, mx, '\n');
+        if (p > mx - 160) break;
     }
     return p;
 }
@@ -1549,9 +1588,19 @@ static int lc_bd_write(uint64_t off, uint32_t len, const void* buf, void* ctx) {
     return BlockDev::WriteBytes(g_mnt_bdev, off, len, buf) ? 0 : -1;
 }
 
+// a usb disk can register after the installer's boot scan. refresh the disk
+// and partition lists once whenever the block registry changed. (satoru)
+static uint32_t g_lc_bd_gen = 0;
+static void lc_refresh_disks() {
+    if (BlockDev::Generation() == g_lc_bd_gen) return;
+    Installer::Rescan();
+    g_lc_bd_gen = BlockDev::Generation();
+}
+
 int LinuxCmds::cmd_mount(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh;
     int p = 0;
+    lc_refresh_disks();
 
     // mount <partition>  e.g. `mount sda2` - resolve through the partition scan
     // and dispatch on the detected filesystem. (satoru)
@@ -1735,10 +1784,29 @@ int LinuxCmds::cmd_dmesg(KuronoShell* sh, int argc, const char** argv, char* out
     (void)argc;
     (void)argv;
     uint32_t sec = Time::GetTicks() / 1000u;
-    char banner[144];
-    int bp = _sa(banner, 0, sizeof(banner), "=== mirrored serial (/kurono/var/log/serial.log) - uptime ");
+    char banner[160];
+    int bp = _sa(banner, 0, sizeof(banner), "=== live kernel log (serial capture) - uptime ");
     bp = _sau(banner, bp, sizeof(banner), sec);
     bp = _sa(banner, bp, sizeof(banner), " s ===\n");
+    // the serial capture is the live log: every flushed line, current up to
+    // the call. the mirrored file lags (disklog batches), so prefer the
+    // capture and fall back to the file only when the capture is empty. (satoru)
+    uint32_t len = SerialLogger::CaptureLen();
+    if (len > 0) {
+        int p = 0;
+        p = _sa(out, p, mx, banner);
+        int hint = mx - p - 2;
+        if (hint > 7800) hint = 7800;
+        if (hint < 32) return p;
+        uint32_t start = (uint32_t)hint >= len ? 0u : len - (uint32_t)hint;
+        const char* data = SerialLogger::CaptureData();
+        // start on a line boundary so the first line is not a fragment. (satoru)
+        if (start > 0) while (start < len && data[start] != '\n') start++;
+        if (start < len) start++;
+        for (uint32_t i = start; i < len && p < mx - 1; i++) out[p++] = data[i];
+        out[p] = 0;
+        return p;
+    }
     int hint = mx > 384 ? mx - 256 : 512;
     if (hint > 7800)
         hint = 7800;
@@ -1879,6 +1947,7 @@ static int _pad(char* out, int p, int mx, int from, int width) {
 int LinuxCmds::cmd_lsblk(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh; (void)argc; (void)argv;
     int p = 0;
+    lc_refresh_disks();
 
     // this used to print a HARDCODED partition table - an invented nvme0n1p1
     // mounted at "/", and a fabricated sda1//sda2 at "/" and "/home" whenever no
@@ -1936,6 +2005,7 @@ int LinuxCmds::cmd_lsblk(KuronoShell* sh, int argc, const char** argv, char* out
 int LinuxCmds::cmd_blkid(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh; (void)argc; (void)argv;
     int p = 0;
+    lc_refresh_disks();
     if (Installer::GetPartitionCount() == 0) {
         return _sa(out, p, mx, "no partitions found (run `lsblk` first, or no disks attached)\n");
     }
@@ -2258,32 +2328,84 @@ int LinuxCmds::cmd_hwinfo(KuronoShell* sh, int argc, const char** argv, char* ou
     return p;
 }
 
+// real top: samples the per-pid busy milliseconds over a short window, so the
+// %CPU column is the share of one cpu the process actually used, and RES comes
+// from the page tables. (satoru)
 int LinuxCmds::cmd_top(KuronoShell* sh, int argc, const char** argv, char* out, int mx) {
     (void)sh; (void)argc; (void)argv;
+    SchedulerProcessSnapshot a[64], b[64];
+    int na = Scheduler::GetProcessSnapshot(a, 64);
+    uint32_t ncpu = SMP::CpuCount(); if (ncpu < 1) ncpu = 1; if (ncpu > (uint32_t)HAL_CPU_SLOTS) ncpu = HAL_CPU_SLOTS;
+    uint64_t busy0 = 0;
+    for (uint32_t c = 0; c < ncpu; c++) busy0 += g_cpu_busy_ticks[c];
+    uint32_t t0 = Timer::GetRealMs();
+    Scheduler::SleepMs(200);
+    uint32_t t1 = Timer::GetRealMs();
+    uint64_t busy1 = 0;
+    for (uint32_t c = 0; c < ncpu; c++) busy1 += g_cpu_busy_ticks[c];
+    int nb = Scheduler::GetProcessSnapshot(b, 64);
+    uint32_t elapsed = (t1 > t0) ? (t1 - t0) : 1;
+    int overall = (int)(((busy1 - busy0) * 100ull) / ((uint64_t)elapsed * ncpu));
+    if (overall > 100) overall = 100;
+
     int p = 0;
-    p = _sa(out, p, mx, "top - Kurono OS Process Monitor\n");
-    p = _sa(out, p, mx, "Tasks: ");
+    p = _sa(out, p, mx, "top - up ");
+    p = _sau(out, p, mx, (uint32_t)(Timer::GetRealMs64() / 1000ull));
+    p = _sa(out, p, mx, "s, ");
+    p = _sai(out, p, mx, ncpu);
+    p = _sa(out, p, mx, " cpus, load ");
+    p = _sai(out, p, mx, overall);
+    p = _sa(out, p, mx, "%\nTasks: ");
     p = _sai(out, p, mx, Scheduler::GetProcessCount());
-    p = _sa(out, p, mx, " total, 1 running\n");
-    p = _sa(out, p, mx, "  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM   COMMAND\n");
-    // list scheduler processes by walking the linked list
-    Process* proc = Scheduler::ready_queue;
-    int i = 0;
-    while (proc && i < 16) {
-        const char* name = proc->name;
-        if (!name || !name[0]) { proc = proc->next; i++; continue; }
+    p = _sa(out, p, mx, " total\n");
+    p = _sa(out, p, mx, "  PID USER      S  %CPU    RES   COMMAND\n");
+
+    int order[64], on = 0;
+    for (int i = 0; i < nb; i++) {
+        if (b[i].pid == 0 || (b[i].flags & PROCESS_FLAG_THREAD)) continue;
+        uint64_t prev = b[i].cpu_ticks_total;
+        for (int j = 0; j < na; j++) if (a[j].pid == b[i].pid) { prev = a[j].cpu_ticks_total; break; }
+        int pct = (int)(((b[i].cpu_ticks_total >= prev ? b[i].cpu_ticks_total - prev : 0) * 100ull) / elapsed);
+        if (pct > 100) pct = 100;
+        int at = on;
+        while (at > 0) {
+            const SchedulerProcessSnapshot& q = b[order[at - 1]];
+            uint64_t qp = q.cpu_ticks_total;
+            for (int j = 0; j < na; j++) if (a[j].pid == q.pid) { qp = a[j].cpu_ticks_total; break; }
+            int qpct = (int)(((q.cpu_ticks_total >= qp ? q.cpu_ticks_total - qp : 0) * 100ull) / elapsed);
+            if (qpct >= pct) break;
+            order[at] = order[at - 1]; at--;
+        }
+        order[at] = i;
+        on++;
+        if (on >= 64) break;
+    }
+    for (int k = 0; k < on && k < 16; k++) {
+        const SchedulerProcessSnapshot& s = b[order[k]];
+        uint64_t prev = s.cpu_ticks_total;
+        for (int j = 0; j < na; j++) if (a[j].pid == s.pid) { prev = a[j].cpu_ticks_total; break; }
+        int pct = (int)(((s.cpu_ticks_total >= prev ? s.cpu_ticks_total - prev : 0) * 100ull) / elapsed);
+        if (pct > 100) pct = 100;
+        uint32_t rss_kb = s.memory_kb;
+        if ((s.flags & PROCESS_FLAG_USER) && s.address_space) {
+            MemAcct::SpaceMem sm;
+            if (MemAcct::QuerySpace(s.address_space, 900u, &sm, false)) rss_kb = (uint32_t)sm.rss_kb;
+        }
         p = _sa(out, p, mx, "  ");
-        p = _sai(out, p, mx, proc->pid);
-        // pad pid
-        if (proc->pid < 10) p = _sa(out, p, mx, "   ");
-        else p = _sa(out, p, mx, "  ");
-        p = _sa(out, p, mx, "root       20   0     512    256    128 ");
-        p = _sa(out, p, mx, (proc == Scheduler::current_process) ? "R" : "S");
-        p = _sa(out, p, mx, "   0.0  0.1   ");
-        p = _sa(out, p, mx, name);
+        p = _sai(out, p, mx, (int)s.pid);
+        for (int z = (s.pid < 10 ? 4 : (s.pid < 100 ? 3 : (s.pid < 1000 ? 2 : 1))); z > 0; z--) p = _sac(out, p, mx, ' ');
+        p = _sa(out, p, mx, "root       ");
+        p = _sac(out, p, mx, (s.state == Process_Running || s.state == Process_Ready) ? 'R' : 'S');
+        p = _sa(out, p, mx, "  ");
+        if (pct < 10) p = _sac(out, p, mx, ' ');
+        p = _sai(out, p, mx, pct);
+        p = _sa(out, p, mx, "% ");
+        for (int z = (rss_kb < 10 ? 6 : (rss_kb < 100 ? 5 : (rss_kb < 1000 ? 4 : (rss_kb < 10000 ? 3 : 2)))); z > 0; z--) p = _sac(out, p, mx, ' ');
+        p = _sau(out, p, mx, rss_kb);
+        p = _sa(out, p, mx, "K  ");
+        p = _sa(out, p, mx, s.name[0] ? s.name : "process");
         p = _sac(out, p, mx, '\n');
-        proc = proc->next;
-        i++;
+        if (p > mx - 160) break;
     }
     return p;
 }
@@ -2673,7 +2795,7 @@ int LinuxCmds::cmd_syscall(KuronoShell* sh, int argc, const char** argv,
     if (created) {
         LinuxProcess* cur = LinuxSyscall::Current();
         if (cur) {
-            int idx = (int)(cur->pid - 100);
+            int idx = LinuxSyscall::SlotOf(cur);   // pids are not slot+100 any more (satoru)
             LinuxSyscall::DestroyProcess(idx);
             LinuxSyscall::SetCurrent(-1);
         }
@@ -2724,6 +2846,69 @@ static int _guest_exec(const char* cmd, char* out, int max) {
     return Hypervisor::AlpineExec(cmd, out, max);
 }
 
+// kld reload <family> [/vfs/path | NAME.ELF on the KURONO partition]: copy the
+// new container image over /usr/bin/kld-<family>, stop the running instance,
+// the supervisor loads the new one (needs kurono.kld.sup=1) (satoru)
+int LinuxCmds::cmd_kld(KuronoShell*, int argc, const char** argv, char* out, int mx) {
+    if (argc < 3 || !_seq(argv[1], "reload"))
+        return _sa(out, 0, mx, "usage: kld reload <family> [/path/new.elf | NAME.ELF]\n  family: e1000e iwlwifi drmcirrus bochs i915 (needs kurono.kld.sup=1)\n");
+    const char* fam = argv[2];
+    char dst[64]; int di = 0;
+    for (const char* w = "/usr/bin/kld-"; *w; w++) dst[di++] = *w;
+    for (const char* w = fam; *w && di < 62; w++) dst[di++] = *w;
+    dst[di] = 0;
+    if (!KldSupervisor::Enabled()) return _sa(out, 0, mx, "kld reload: the supervisor is off (boot with kurono.kld.sup=1)\n");
+    if (!KldSupervisor::Running(fam)) return _sa(out, 0, mx, "kld reload: that family has no running container\n");
+    int p = 0;
+    if (argc > 3) {
+        const char* a = argv[3];
+        uint8_t* buf = nullptr; uint64_t sz = 0;
+        if (a[0] == '/') {
+            int fs = KVFS::GetFileSize(a);
+            if (fs > 0 && (buf = (uint8_t*)KernelHeap::Alloc((uint64_t)fs))) {
+                if (KVFS::ReadFile(a, buf, (uint32_t)fs) == fs) sz = (uint64_t)fs;
+            }
+        } else {
+            char n83[12];
+            for (int k = 0; k < 11; k++) n83[k] = ' ';
+            n83[11] = 0;
+            int k = 0, j = 0;
+            while (a[j] && a[j] != '.' && k < 8) { char c = a[j++]; n83[k++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+            while (a[j] && a[j] != '.') j++;
+            if (a[j] == '.') j++;
+            k = 8;
+            while (a[j] && k < 11) { char c = a[j++]; n83[k++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+            uint64_t fsz = 0;
+            if (DiskLog::StatRootFile(n83, &fsz) == 0 && fsz > 0 && fsz < (256ull << 20) &&
+                (buf = (uint8_t*)KernelHeap::Alloc(fsz)) && DiskLog::ReadRootFile(n83, buf, fsz, nullptr) == 0)
+                sz = fsz;
+        }
+        bool elf = sz > 4 && buf[0] == 0x7F && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F';
+        int wr = elf ? KVFS::WriteFile(dst, buf, (uint32_t)sz) : -1;
+        if (buf) KernelHeap::Free(buf);
+        if (wr < 0) return _sa(out, 0, mx, elf ? "kld reload: could not write the new image\n" : "kld reload: the new file is missing or not an ELF\n");
+        KVFS::Chmod(dst, 0755);
+        p = _sa(out, p, mx, "new image: ");
+        p = _sa(out, p, mx, dst);
+        p = _sac(out, p, mx, '\n');
+    }
+    uint32_t before = KldSupervisor::ReloadCount(fam);
+    uint64_t t0 = Timer::GetRealMs64();
+    if (KldSupervisor::RequestReload(fam) != 0) return _sa(out, p, mx, "kld reload: request refused\n");
+    // wait for the old instance to go and the new one to be running (satoru)
+    bool ok = false;
+    while (Timer::GetRealMs64() - t0 < 60000) {
+        if (KldSupervisor::ReloadCount(fam) != before && KldSupervisor::Running(fam)) { ok = true; break; }
+        Scheduler::SleepMs(50);
+    }
+    p = _sa(out, p, mx, ok ? "kld reload: new container running after " : "kld reload: no new container after ");
+    char d[16]; int n = 0; uint64_t ms = Timer::GetRealMs64() - t0;
+    if (!ms) d[n++] = '0';
+    while (ms && n < 15) { d[n++] = (char)('0' + ms % 10); ms /= 10; }
+    while (n) p = _sac(out, p, mx, d[--n]);
+    return _sa(out, p, mx, " ms\n");
+}
+
 int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
                        char* out, int mx) {
     (void)sh;
@@ -2749,16 +2934,96 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
         p = _sa(out, p, mx, "\nBackground Linux VM:\n");
         p = _sa(out, p, mx, "  start [alpine|debian] [MB]  Boot the guest in the background\n");
         p = _sa(out, p, mx, "  stop | kill  Clean poweroff / immediate stop\n");
-        p = _sa(out, p, mx, "  term         Open the Alpine terminal window\n");
+        p = _sa(out, p, mx, "  term         Open the Linux terminal window\n");
         p = _sa(out, p, mx, "  state        Guest state, disk, network counters\n");
         p = _sa(out, p, mx, "  log [bytes]  Tail of the guest console\n");
         p = _sa(out, p, mx, "  send <text>  Type a line into the guest console\n");
         p = _sa(out, p, mx, "  agent <cmd>  Send a command to the guest agent\n");
         p = _sa(out, p, mx, "  run <cmd>    Start a guest program (GUI apps open as Kurono windows)\n");
+        p = _sa(out, p, mx, "  exec <cmd>   Run a guest command and show its output\n");
+        p = _sa(out, p, mx, "\nKurono as the guest (test a new kernel without rebooting):\n");
+        p = _sa(out, p, mx, "  kurono <elf> [MB] [cmdline]  Boot a multiboot2 kurono_base.elf (vfs path or KURONO root name)\n");
+        p = _sa(out, p, mx, "  snap <png>   Save the Kurono guest's screen as a png (/vfs/path, or NAME.PNG in the KURONO root)\n");
+        p = _sa(out, p, mx, "  type <text> | key <name>  Type into the Kurono guest (ps/2)\n");
+        p = _sa(out, p, mx, "  kloop [clean] [secs] [MB] [cmdline]  Build vmshare/src.tar in Alpine (incremental), boot it as a guest, log + snap, kill\n");
         return p;
     }
 
     const char* sub = argv[1];
+
+    // the whole kernel dev loop: vm kloop [clean] [boot secs] [guest MB] [guest cmdline...] (satoru)
+    if (_seq(sub, "kloop")) {
+        uint32_t secs = 60, mb = 0;
+        int ai = 2;
+        bool clean = argc > ai && _seq(argv[ai], "clean");
+        if (clean) ai++;
+        if (argc > ai && argv[ai][0] >= '0' && argv[ai][0] <= '9') secs = (uint32_t)_atoi(argv[ai++]);
+        if (argc > ai && argv[ai][0] >= '0' && argv[ai][0] <= '9') mb = (uint32_t)_atoi(argv[ai++]);
+        static char kcmd[256]; int ci = 0;
+        for (; ai < argc && ci < 250; ai++) {
+            if (ci) kcmd[ci++] = ' ';
+            for (const char* w = argv[ai]; *w && ci < 254; w++) kcmd[ci++] = *w;
+        }
+        kcmd[ci] = 0;
+        return KLoop::Run(secs, mb, clean, kcmd, out, mx);
+    }
+    // kurono guest: vm kurono /home/user/k.elf 1024 kurono.autologin=1 ... (satoru)
+    if (_seq(sub, "kurono")) {
+        if (argc < 3) return _sa(out, 0, mx, "usage: vm kurono <elf: /vfs/path or KGUEST.ELF> [MB] [kernel cmdline]\n");
+        char src[128]; int si = 0;
+        const char* a2 = argv[2];
+        if (a2[0] == '/') {
+            while (a2[si] && si < 127) { src[si] = a2[si]; si++; }
+            src[si] = 0;
+        } else {   // KURONO root file: NAME.EXT -> 11 char 8.3, upper case (satoru)
+            for (int k = 0; k < 11; k++) src[k] = ' ';
+            src[11] = 0;
+            int k = 0, j = 0;
+            while (a2[j] && a2[j] != '.' && k < 8) { char c = a2[j++]; src[k++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+            while (a2[j] && a2[j] != '.') j++;
+            if (a2[j] == '.') j++;
+            k = 8;
+            while (a2[j] && k < 11) { char c = a2[j++]; src[k++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+        }
+        uint32_t mb = 0;
+        int ai = 3;
+        if (argc > 3 && argv[3][0] >= '0' && argv[3][0] <= '9') { mb = (uint32_t)_atoi(argv[3]); ai = 4; }
+        char cmd[256]; int ci = 0;
+        for (; ai < argc && ci < 250; ai++) {
+            if (ci) cmd[ci++] = ' ';
+            for (const char* w = argv[ai]; *w && ci < 254; w++) cmd[ci++] = *w;
+        }
+        cmd[ci] = 0;
+        if (!VMHost::StartKurono(src, mb, cmd)) {
+            int p = _sa(out, 0, mx, "vm kurono: ");
+            p = _sa(out, p, mx, VMHost::LastError());
+            return _sac(out, p, mx, '\n');
+        }
+        return _sa(out, 0, mx, "vm kurono: starting; its log is 'vm log', its screen 'vm snap <png>', stop with 'vm kill'\n");
+    }
+    // type into the kurono guest: vm type <text...> ; vm key enter|esc|tab|backspace|up|down|left|right (satoru)
+    if (_seq(sub, "type") || _seq(sub, "key")) {
+        if (argc < 3) return _sa(out, 0, mx, "usage: vm type <text> | vm key <enter|esc|tab|backspace|up|down|left|right|space>\n");
+        if (VMHost::GetState() != VMHost::VMH_RUNNING) return _sa(out, 0, mx, "vm: no guest running\n");
+        if (_seq(sub, "key")) {
+            for (int a = 2; a < argc; a++)
+                if (!VI8042::InjectKeyName(argv[a])) return _sa(out, 0, mx, "vm key: unknown key\n");
+            return _sa(out, 0, mx, "vm key: sent\n");
+        }
+        for (int a = 2; a < argc; a++) {
+            if (a > 2) VI8042::InjectText(" ");
+            VI8042::InjectText(argv[a]);
+        }
+        return _sa(out, 0, mx, "vm type: sent\n");
+    }
+    if (_seq(sub, "snap")) {
+        if (argc < 3) return _sa(out, 0, mx, "usage: vm snap <png path>\n");
+        char msg[96];
+        int n = VMHost::SnapKurono(argv[2], msg, sizeof(msg));
+        int p = _sa(out, 0, mx, n > 0 ? "vm snap: wrote " : "vm snap: ");
+        p = _sa(out, p, mx, n > 0 ? argv[2] : msg);
+        return _sac(out, p, mx, '\n');
+    }
 
     if (_seq(sub, "status")) {
         if (Hypervisor::IsOwned()) return VMHost::Status(out, mx);   // the background vm (satoru)
@@ -2819,6 +3084,31 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
         if (!VMHost::AgentReady()) return _sa(out, 0, mx, "vm: guest agent not connected (vm start first)\n");
         VMHost::AgentSend(line);
         return _sa(out, 0, mx, "vm: started in the guest\n");
+    }
+    if (_seq(sub, "exec")) {      // run a guest command, show its output (satoru)
+        if (argc < 3) return _sa(out, 0, mx, "usage: vm exec <command>\n");
+        if (!VMHost::AgentReady()) return _sa(out, 0, mx, "vm: guest agent not connected (vm start first)\n");
+        char cmd_buf[512]; int ci = 0;
+        for (int a = 2; a < argc && ci < 500; a++) {
+            if (a > 2) cmd_buf[ci++] = ' ';
+            const char* w = argv[a];
+            while (*w && ci < 500) cmd_buf[ci++] = *w++;
+        }
+        cmd_buf[ci] = 0;
+        static char result[16384];
+        int rc = -1;
+        int n = VMHost::Exec(cmd_buf, result, (int)sizeof(result), 600000, &rc);
+        int p = 0;
+        if (n < 0) return _sa(out, 0, mx, "vm: the guest command timed out\n");
+        p = _sa(out, p, mx, "guest $ ");
+        p = _sa(out, p, mx, cmd_buf);
+        p = _sac(out, p, mx, '\n');
+        int copy = n; if (p + copy >= mx - 24) copy = mx - p - 24;
+        for (int i = 0; i < copy; i++) out[p++] = result[i];
+        if (p > 0 && out[p - 1] != '\n') p = _sac(out, p, mx, '\n');
+        p = _sa(out, p, mx, "guest exit ");
+        p = _sai(out, p, mx, rc);
+        return _sac(out, p, mx, '\n');
     }
     if (_seq(sub, "create")) {
         if (Hypervisor::IsOwned()) return _sa(out, 0, mx, "vm: the background vm owns the hypervisor (vm stop first)\n");   // (satoru)
@@ -3014,10 +3304,10 @@ int LinuxCmds::cmd_vm(KuronoShell* sh, int argc, const char** argv,
         }
         int p = _sa(out, 0, mx, ok ? "vm: starting " : "vm: already running: ");
         p = _sa(out, p, mx, distro == VMHost::DISTRO_DEBIAN ? "debian" : "alpine");
-        return _sa(out, p, mx, ok ? " in the background (vm status, vm log, open the Alpine terminal)\n" : "\n");
+        return _sa(out, p, mx, ok ? " in the background (vm status, vm log, vm term, vm run <app>)\n" : "\n");
     }
     if (_seq(sub, "stop")) { VMHost::Stop(); return _sa(out, 0, mx, "vm: shutting the guest down\n"); }
-    if (_seq(sub, "term")) { AlpineTerminal::Open(); return _sa(out, 0, mx, "vm: Alpine terminal opened\n"); }
+    if (_seq(sub, "term")) { AlpineTerminal::Open(); return _sa(out, 0, mx, "vm: Linux terminal opened\n"); }
     if (_seq(sub, "kill")) { VMHost::Kill(); return _sa(out, 0, mx, "vm: guest killed\n"); }
     if (_seq(sub, "state")) { return VMHost::Status(out, mx); }
     if (_seq(sub, "log")) {

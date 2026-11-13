@@ -17,6 +17,7 @@
 #include "../kcl/kcl.h"
 #include "../ui/kss.h"            // classic chrome tokens (satoru)
 #include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
+#include "../kernel/pmm.h"      // lazy files-window tables (satoru)
 #include "../media/mediadecoder.h"   // png/jpeg thumbnails (satoru)
 #include "../fs/fat32.h"         // mounted removable volume in the drives group (satoru)
 #include "../linux/ext4.h"       // mounted linux partition in the drives group (satoru)
@@ -41,6 +42,16 @@
 #define STBI_FREE free
 #define STB_IMAGE_IMPLEMENTATION
 #include "../third_party/stb_image.h"
+#endif
+
+// the files window tables are pmm-backed in the kernel build and malloc-backed
+// in the ring 3 build. (satoru)
+#if defined(KUI_BACKEND_WAYLAND)
+#define FM_TABLE_ALLOC(n) malloc(n)
+#define FM_TABLE_FREE(p,n) free(p)
+#else
+#define FM_TABLE_ALLOC(n) PMM::AllocBytes(n)
+#define FM_TABLE_FREE(p,n) PMM::FreeBytes(p,n)
 #endif
 
 // ── color palette ──────────────────────────────────────────────────────
@@ -561,7 +572,9 @@ struct FmThumb {
     uint32_t px[FM_THUMB_SZ*FM_THUMB_SZ];
     bool ok;
 };
-static FmThumb g_thumbs[FM_THUMB_MAX];
+// 32 thumbnails, ~9 kb each; only a Files window that shows images needs
+// them. allocated on the first thumbnail and freed with the last window. (satoru)
+static FmThumb* g_thumbs = nullptr;
 static int  g_thumb_next = 0;
 static int  g_thumb_budget = 0;
 static bool g_thumb_pending = false;
@@ -662,6 +675,11 @@ static bool fm_decode_thumb_px(const char* path, uint32_t* dst){
 
 // find or build the thumbnail of one entry. (satoru)
 static const uint32_t* fm_thumb_get(const char* full,int stamp){
+    if(!g_thumbs){
+        g_thumbs = (FmThumb*)FM_TABLE_ALLOC(sizeof(FmThumb)*FM_THUMB_MAX);
+        if(!g_thumbs) return nullptr;
+        for(unsigned char* p=(unsigned char*)g_thumbs,*e=p+sizeof(FmThumb)*FM_THUMB_MAX;p<e;p++) *p=0;
+    }
     for(int i=0;i<FM_THUMB_MAX;i++){
         FmThumb* t = &g_thumbs[i];
         if(t->ok && t->stamp==(unsigned int)stamp && seq(t->path,full)) return t->px;
@@ -796,7 +814,9 @@ struct FMInst {
     bool used;     // slot is live (satoru)
 };
 
-static FMInst g_fm[FM_MAX_INST];
+// the per-window Files state is ~82 kb each; the 8-slot table exists only
+// while a Files window is open. (satoru)
+static FMInst* g_fm = nullptr;
 
 // ── copy / move jobs ──────────────────────────────────────────────────
 // a paste or a trash expands into a flat list of directory creations and
@@ -1035,6 +1055,7 @@ void FileManagerApp::NotifyFilesystemChanged(const char* path){
     // refresh every open Files window; this can be called from inside one window's
     // own input handler, so put the current instance back afterwards. (satoru)
     FMInst* saved=cur;
+    if(!g_fm) return;
     for(int i=0;i<FM_MAX_INST;i++){
         if(!g_fm[i].used || g_fm[i].tab_count<=0) continue;
         cur=&g_fm[i];
@@ -1700,7 +1721,21 @@ static void fm_drag_drop(FMInst* in,const char* dest,bool copy){
 class FMApp : public kui::AppHandler {
 public:
     explicit FMApp(FMInst* i) : inst(i) {}
-    ~FMApp() override { if(inst){ if(g_jobs.owner==inst) fm_jobs_reset(); inst->used=false; } }
+    ~FMApp() override {
+        if(inst){
+            if(g_jobs.owner==inst) fm_jobs_reset();
+            inst->used=false;
+            // last Files window gone: give its state and thumbnail cache back.
+            bool any=false;
+            if(g_fm) for(int i=0;i<FM_MAX_INST;i++) if(g_fm[i].used){ any=true; break; }
+            if(!any){
+                if(FileManagerApp::cur && FileManagerApp::cur>=g_fm && FileManagerApp::cur<g_fm+FM_MAX_INST) FileManagerApp::cur=nullptr;
+                if(g_fm){ FM_TABLE_FREE(g_fm,sizeof(FMInst)*FM_MAX_INST); g_fm=nullptr; }
+                if(g_thumbs){ FM_TABLE_FREE(g_thumbs,sizeof(FmThumb)*FM_THUMB_MAX); g_thumbs=nullptr; }
+                g_thumb_next=0;
+            }
+        }
+    }
     void OnFrame(kui::Window& w, kui::Canvas& c, uint32_t now_ms) override;
     bool OnEvent(kui::Window& w, const kui::Event& e) override;
     void OnTick(kui::Window& w, uint32_t now_ms) override;
@@ -1712,6 +1747,11 @@ static const kui::WindowSpec kFilesSpec = { "Files", "files", 918, 523, 480, 320
 
 // a fresh window state in a free slot, nullptr when all slots are taken. (satoru)
 kui::AppHandler* FileManagerApp::Make(const char* nav){
+    if(!g_fm){
+        g_fm = (FMInst*)FM_TABLE_ALLOC(sizeof(FMInst)*FM_MAX_INST);
+        if(!g_fm){ kui::Log("files","no memory for a window"); return nullptr; }
+        for(unsigned char* p=(unsigned char*)g_fm,*e=p+sizeof(FMInst)*FM_MAX_INST;p<e;p++) *p=0;
+    }
     FMInst* f=nullptr;
     for(int i=0;i<FM_MAX_INST;i++) if(!g_fm[i].used){ f=&g_fm[i]; break; }
     if(!f){

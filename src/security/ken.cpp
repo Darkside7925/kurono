@@ -1,9 +1,12 @@
 #include "ken.h"
 #include "ksa.h"                  // hypervisor-backed auth factor (satoru)
 #include "../kernel/time.h"
+#include "../drivers/timer.h"      // lockout clock for the ksa switch (satoru)
 #include "../drivers/serial.h"
 #include "../fs/kvfs.h"
 #include "../system/logging.h"   // mirror the audit trail to /kurono/var/log/security.log (satoru)
+#include "../system/user_mgmt.h"   // desktop accounts carry the escalation password (satoru)
+#include "../system/ui_config.h"    // the persisted ksa switch (security.ksa) (satoru)
 
 //  ken security engine implementation
 
@@ -16,7 +19,7 @@ int KEN::audit_count = 0;
 unsigned int KEN::rng_state = 0x12345678;
 // default policy: password prompt only (--auth=passwd), per spec. the ksa
 // factor is opt-in via `ken policy --auth=kvault|both`. (satoru)
-KENAuthPolicy KEN::policy = { /*passwd*/ true, /*kvault*/ false };
+KENAuthPolicy KEN::policy = { /*passwd*/ true, /*kvault*/ false, /*ksa switch*/ true };
 
 static int slen(const char* s) { int n=0; while (s[n]) n++; return n; }
 static void scpy(char* d, const char* s, int m) {
@@ -83,6 +86,20 @@ static void simple_hash(const unsigned char* data, int len, const unsigned char*
     }
 }
 
+// which account's password unlocks an escalation: a desktop administrator
+// (pbkdf2, set by the person at registration) whenever desktop accounts exist,
+// else ken's own built-in root (cli-only boots with no account yet). (satoru)
+static const char* esc_account() {
+    const char* a = UserManager::FirstAdminName();
+    return (UserManager::GetUserCount() > 0 && a) ? a : "root";
+}
+static bool esc_digest_ok(const char* acct, const unsigned char* h) {
+    if (UserManager::GetUserCount() > 0 && UserManager::FindByName(acct))
+        return UserManager::DigestMatches(acct, h);
+    KENUser* root_u = KEN::FindUser("root");
+    return root_u && smemeq(h, root_u->pwd_hash, KEN_HASH_LEN);
+}
+
 void KEN::Init() {
     user_count = 0;
     audit_count = 0;
@@ -123,6 +140,7 @@ void KEN::Init() {
     // password factor. default policy stays passwd-only until the user opts
     // into kvault via `ken policy`. (satoru)
     KSA::Init();
+    ApplyPersistedKsa();   // the "KSA off for now" switch survives a reboot (satoru)
 
     Log(ACT_LOGIN, "system", "KEN security engine initialized");
     SerialLogger::Log("KEN: Security engine initialized\r\n");
@@ -350,9 +368,9 @@ bool KEN::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
     bool authed = false;
     if (BothAuthDisabled()) {
         // no factor required - proceed, but warn + audit loudly. (satoru)
-        Log(ACT_RISK_WARNING, actor, "ken escalation with both auth factors disabled");
-        RuntimeLog::LogSecurity("RISK: ken escalation, no auth factor", reason);
-        SerialLogger::Log("KEN: WARNING - ken escalation with BOTH auth factors disabled\r\n");
+        Log(ACT_RISK_WARNING, actor, "amdo escalation with both auth factors disabled");
+        RuntimeLog::LogSecurity("RISK: amdo escalation, no auth factor", reason);
+        SerialLogger::Log("KEN: WARNING - amdo escalation with BOTH auth factors disabled\r\n");
         authed = true;
     } else {
         bool need_pw  = policy.passwd_enabled;
@@ -369,25 +387,23 @@ bool KEN::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
         // hypervisor is, even if kvault is policy-off. want_cred when a password
         // factor is required. (satoru)
         if (!KSA::PromptUsable()) {
-            Log(ACT_PERMISSION_DENIED, actor, "no interactive auth path for ken");
+            Log(ACT_PERMISSION_DENIED, actor, "no interactive auth path for amdo");
             return false;
         }
         KSARequest req;
-        req.title    = "Privilege Escalation (ken)";
+        req.title    = "Privilege Escalation (amdo)";
         req.detail   = reason ? reason : "An action requires elevated rights.";
-        req.username = "root";
+        req.username = esc_account();
         req.want_cred = need_pw;
         KSAVerdict v;
         if (!KSA::Prompt(req, v) || !v.approved) {
-            Log(ACT_KSA_DENY, actor, "ken escalation denied at prompt");
+            Log(ACT_KSA_DENY, actor, "amdo escalation denied at prompt");
             return false;
         }
         bool ok = true;
         if (need_pw) {
-            KENUser* root_u = FindUser("root");
-            ok = root_u && v.have_cred_hash &&
-                 smemeq(v.cred_hash, root_u->pwd_hash, KEN_HASH_LEN);
-            if (!ok) Log(ACT_PERMISSION_DENIED, actor, "ken password factor failed");
+            ok = v.have_cred_hash && esc_digest_ok(req.username, v.cred_hash);
+            if (!ok) Log(ACT_PERMISSION_DENIED, actor, "amdo password factor failed");
         }
         (void)need_ksa;   // the ksa factor IS the approval, already required above (satoru)
         authed = ok;
@@ -399,7 +415,7 @@ bool KEN::SudoBegin(int session_id, const char* reason, int* out_saved_user) {
     if (!root) return false;
     if (out_saved_user) *out_saved_user = sessions[session_id].user_index;
     sessions[session_id].user_index = (int)(root - users);
-    Log(ACT_ESCALATE, actor, reason ? reason : "ken escalation");
+    Log(ACT_ESCALATE, actor, reason ? reason : "amdo escalation");
     return true;
 }
 
@@ -428,6 +444,8 @@ KENAuthMode KEN::GetAuthMode() {
 }
 
 bool KEN::VerifyEscalationPassword(const char* password) {
+    if (UserManager::GetUserCount() > 0)
+        return UserManager::VerifyAdminPassword(password ? password : "");
     // accept the credential of any root/sovereign account. (satoru)
     for (int i = 0; i < user_count; i++) {
         if (users[i].level < KEN_ROOT) continue;
@@ -478,7 +496,7 @@ bool KEN::RunEscalationGate(int session_id, const char* password, const char* re
         KSARequest req;
         req.title    = "Privilege Escalation";
         req.detail   = reason ? reason : "An action requires elevated rights.";
-        req.username = "root";
+        req.username = esc_account();
         // if password is NOT a separate factor, ksa collects the credential too.
         req.want_cred = !need_pw;
         KSAVerdict v;
@@ -490,9 +508,7 @@ bool KEN::RunEscalationGate(int session_id, const char* password, const char* re
             ksa_ok = v.approved;
             // when ksa is the sole credential collector, verify its hash too.
             if (ksa_ok && req.want_cred) {
-                KENUser* root = FindUser("root");
-                ksa_ok = root && v.have_cred_hash &&
-                         smemeq(v.cred_hash, root->pwd_hash, KEN_HASH_LEN);
+                ksa_ok = v.have_cred_hash && esc_digest_ok(req.username, v.cred_hash);
                 if (!ksa_ok) Log(ACT_PERMISSION_DENIED, actor, "ksa credential mismatch");
             }
         }
@@ -548,6 +564,71 @@ bool KEN::SetAuthMode(int session_id, KENAuthMode mode, bool sovereign_override,
     RuntimeLog::LogSecurity("auth policy changed",
         mode == AUTH_BOTH ? "auth=both" : (mode == AUTH_KVAULT ? "auth=kvault" : "auth=passwd"));
     return true;
+}
+
+// ── the "KSA off for now" switch ────────────────────────────────────────
+static bool g_ksa_no_persist = false;   // the policy self-test must not write ui.conf (satoru)
+static int  g_ksa_fail = 0;             // consecutive wrong passwords on the off path (satoru)
+static uint64_t g_ksa_lock_until = 0;
+
+const char* KEN::EscalationAccount() { return esc_account(); }
+bool KEN::EscalationDigestOk(const unsigned char* digest) { return esc_digest_ok(esc_account(), digest); }
+
+bool KEN::IsKsaEnabled() { return policy.ksa_enabled; }
+
+// off switch for ksa. turn it back on later fr
+bool KEN::SetKsaEnabled(int session_id, bool enable, const char* password,
+                         char* err, int err_max) {
+    if (!ValidateSession(session_id)) { set_err(err, err_max, "invalid session"); return false; }
+    const char* actor = users[sessions[session_id].user_index].username;
+    if (enable == policy.ksa_enabled) return true;   // already there (satoru)
+
+    if (!enable) {
+        // turning it off weakens the arbiter, so it needs proof: an amdo
+        // approval (this session is already root) or the account password. (satoru)
+        bool proof = GetLevel(session_id) >= KEN_ROOT;
+        if (!proof) {
+            uint64_t now = Timer::GetRealMs64();
+            if (g_ksa_lock_until && now < g_ksa_lock_until) {
+                set_err(err, err_max, "too many wrong passwords, wait a moment");
+                return false;
+            }
+            proof = password && password[0] && VerifyEscalationPassword(password);
+            if (!proof) {
+                if (++g_ksa_fail >= 5) { g_ksa_fail = 0; g_ksa_lock_until = now + 30000; }
+                Log(ACT_PERMISSION_DENIED, actor, "ksa off refused: password factor failed");
+                set_err(err, err_max, "the password is not right");
+                return false;
+            }
+        }
+        g_ksa_fail = 0;
+        // password must stay a factor: with it off there would be nothing left. (satoru)
+        if (!policy.passwd_enabled) {
+            set_err(err, err_max, "turn the password factor on before switching ksa off");
+            return false;
+        }
+    }
+
+    policy.ksa_enabled = enable;
+    KSA::SetSuspended(!enable);
+    Log(ACT_POLICY_CHANGE, actor, enable ? "ksa switched on" : "ksa switched off (password-only)");
+    RuntimeLog::LogSecurity(enable ? "ksa switched on" : "ksa switched off", "settings");
+    SerialLogger::Log(enable ? "KEN: ksa switched ON\r\n" : "KEN: ksa switched OFF - amdo is password-only\r\n");
+    if (!g_ksa_no_persist) {
+        UIConfig::SetInt("security.ksa", enable ? 1 : 0, true);
+        UIConfig::Save();
+    }
+    return true;
+}
+
+void KEN::ApplyPersistedKsa() {
+    bool on = UIConfig::Int("security.ksa", 1) != 0;
+    policy.ksa_enabled = on;
+    KSA::SetSuspended(!on);
+    if (!on) {
+        SerialLogger::Log("KEN: ksa is OFF (persisted setting) - amdo is password-only\r\n");
+        RuntimeLog::LogSecurity("ksa off at boot", "persisted setting");
+    }
 }
 
 bool KEN::EnableKvault(int session_id, char* err, int err_max) {
@@ -709,10 +790,45 @@ bool KEN::PolicySelfTest() {
     bool r7 = SetAuthMode(sid, AUTH_BOTH, /*sov*/false, err, sizeof(err));
     pst_check("auth=both gated on ksa availability", r7 == KSA::IsAvailable(), all);
 
-    // 8. password factor actually verifies: the default root password "root"
-    //    must pass, a wrong one must fail. (satoru)
-    pst_check("root password verifies", VerifyEscalationPassword("root"), all);
+    // 8. password factor actually verifies. with desktop accounts the
+    //    administrator's own password is the factor, so the built-in "root"
+    //    must not unlock (unless an admin really chose it); without accounts
+    //    the built-in root password still does. a wrong one always fails. (satoru)
+    if (UserManager::GetUserCount() > 0)
+        pst_check("built-in root password does not unlock",
+                  !VerifyEscalationPassword("root") || UserManager::VerifyAdminPassword("root"), all);
+    else
+        pst_check("root password verifies", VerifyEscalationPassword("root"), all);
     pst_check("wrong password rejected", !VerifyEscalationPassword("nope-xyz"), all);
+
+    // 9. the ksa switch: off needs proof (wrong password refused, right one or
+    //    an amdo-level session accepted), refused while the password factor is
+    //    off, and on again needs nothing. (satoru)
+    {
+        g_ksa_no_persist = true;
+        bool saved_suspended = KSA::IsSuspended();
+        policy.ksa_enabled = true; KSA::SetSuspended(false);
+        policy.passwd_enabled = true; policy.kvault_enabled = false;
+        users[ui].level = KEN_USER;
+        err[0]=0;
+        pst_check("ksa off refused with a wrong password", !SetKsaEnabled(sid, false, "nope-xyz", err, sizeof(err)) && policy.ksa_enabled, all);
+        err[0]=0;
+        pst_check("ksa off refused with no proof", !SetKsaEnabled(sid, false, nullptr, err, sizeof(err)) && policy.ksa_enabled, all);
+        g_ksa_fail = 0; g_ksa_lock_until = 0;
+        users[ui].level = KEN_ROOT;   // an amdo approval (satoru)
+        policy.passwd_enabled = false;
+        err[0]=0;
+        pst_check("ksa off refused while password factor off", !SetKsaEnabled(sid, false, nullptr, err, sizeof(err)) && policy.ksa_enabled, all);
+        policy.passwd_enabled = true;
+        err[0]=0;
+        pst_check("ksa off accepted with amdo approval", SetKsaEnabled(sid, false, nullptr, err, sizeof(err)) && !policy.ksa_enabled && KSA::IsSuspended(), all);
+        pst_check("amdo gate stays password-only while ksa off", !KSA::IsAvailable() && GetAuthMode() == AUTH_PASSWD, all);
+        users[ui].level = KEN_USER;
+        err[0]=0;
+        pst_check("ksa on needs no proof", SetKsaEnabled(sid, true, nullptr, err, sizeof(err)) && policy.ksa_enabled && !KSA::IsSuspended(), all);
+        KSA::SetSuspended(saved_suspended);
+        g_ksa_no_persist = false;
+    }
 
     // restore everything. (satoru)
     policy = saved;

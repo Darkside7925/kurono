@@ -169,6 +169,212 @@ static const char *build_cmdline(EFI_HANDLE image) {
     return efi_cmdline;
 }
 
+/* ── recovery R6 + A/B kernels (platform, satoru) ──────────────────────
+ * before anything else the loader looks at KBOOT.CFG (512 bytes, layout in
+ * src/system/bootcfg.h) on whichever volume has one (the KURONO partition;
+ * the read-only opencore disk never has it and is never opened for write
+ * successfully). it decides: recovery (asked once, two boots in a row that
+ * never reached the desktop, or R / F8 held at power-on), a safe start, or
+ * which kernel slot to run (a staged trial once, the default, or the
+ * previous one once). a slot is another kurono EFI in the KURONO root,
+ * chainloaded with "kurono.boot.chained=1" so it skips all of this. with no
+ * KBOOT.CFG only the key check runs. (satoru) */
+static EFI_FILE_HANDLE kb_file = NULL;
+static EFI_HANDLE      kb_dev = NULL;
+static UINT8           kb_buf[512];
+static EFI_FILE_HANDLE kb_root = NULL;
+
+static UINT32 kb_rd32(const UINT8 *p) { return (UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24); }
+static void kb_wr32(UINT8 *p, UINT32 v) { p[0] = (UINT8)v; p[1] = (UINT8)(v >> 8); p[2] = (UINT8)(v >> 16); p[3] = (UINT8)(v >> 24); }
+static UINT32 kb_fnv(const UINT8 *p, UINTN n) {
+    UINT32 h = 2166136261u;
+    for (UINTN i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static int cmd_has(const char *tok) {
+    UINTN tl = ascii_len(tok);
+    for (UINTN i = 0; efi_cmdline[i]; i++) {
+        if (i && efi_cmdline[i - 1] != ' ') continue;
+        UINTN k = 0;
+        while (k < tl && efi_cmdline[i + k] == tok[k]) k++;
+        if (k == tl && (efi_cmdline[i + k] == ' ' || efi_cmdline[i + k] == 0)) return 1;
+    }
+    return 0;
+}
+
+static void cmd_append(const char *tok) {
+    UINTN n = ascii_len(efi_cmdline), tl = ascii_len(tok);
+    if (n + 1 + tl >= sizeof(efi_cmdline)) return;
+    efi_cmdline[n++] = ' ';
+    for (UINTN i = 0; i < tl; i++) efi_cmdline[n++] = tok[i];
+    efi_cmdline[n] = 0;
+}
+
+/* R or F8 held at power-on: the firmware repeats a held key, so a few polls
+ * over ~300 ms see it without blocking a normal boot. (satoru) */
+static int recovery_key_held(void) {
+    for (int t = 0; t < 30; t++) {
+        EFI_INPUT_KEY key;
+        EFI_STATUS st = uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
+        if (!EFI_ERROR(st)) {
+            if (key.UnicodeChar == L'r' || key.UnicodeChar == L'R' || key.ScanCode == SCAN_F8) return 1;
+        }
+        uefi_call_wrapper(BS->Stall, 1, 10000);
+    }
+    return 0;
+}
+
+static int kboot_open(void) {
+    EFI_HANDLE *hs = NULL;
+    UINTN count = 0;
+    EFI_STATUS st = uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol, &FileSystemProtocol,
+                                      NULL, &count, &hs);
+    if (EFI_ERROR(st) || !hs) return 0;
+    for (UINTN i = 0; i < count && !kb_file; i++) {
+        EFI_FILE_IO_INTERFACE *fs = NULL;
+        EFI_FILE_HANDLE root = NULL, f = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, hs[i], &FileSystemProtocol, (void **)&fs)) || !fs) continue;
+        if (EFI_ERROR(uefi_call_wrapper(fs->OpenVolume, 2, fs, &root)) || !root) continue;
+        /* open for read only first: a volume without the file is never asked for write access. (satoru) */
+        if (EFI_ERROR(uefi_call_wrapper(root->Open, 5, root, &f, L"KBOOT.CFG", EFI_FILE_MODE_READ, 0)) || !f) {
+            uefi_call_wrapper(root->Close, 1, root);
+            continue;
+        }
+        UINTN sz = sizeof(kb_buf);
+        st = uefi_call_wrapper(f->Read, 3, f, &sz, kb_buf);
+        uefi_call_wrapper(f->Close, 1, f);
+        if (EFI_ERROR(st) || sz != sizeof(kb_buf) || kb_rd32(kb_buf) != 0x544F424Bu ||
+            kb_rd32(kb_buf + 508) != kb_fnv(kb_buf, 508)) {
+            uefi_call_wrapper(root->Close, 1, root);
+            continue;
+        }
+        if (EFI_ERROR(uefi_call_wrapper(root->Open, 5, root, &f, L"KBOOT.CFG",
+                                        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) || !f) {
+            uefi_call_wrapper(root->Close, 1, root);
+            continue;
+        }
+        kb_file = f;
+        kb_dev = hs[i];
+        /* keep root open: chainloading reads a slot file from it. (satoru) */
+        kb_root = root;
+    }
+    uefi_call_wrapper(BS->FreePool, 1, hs);
+    return kb_file != NULL;
+}
+static void kboot_write(void) {
+    if (!kb_file) return;
+    kb_wr32(kb_buf + 508, kb_fnv(kb_buf, 508));
+    UINTN sz = sizeof(kb_buf);
+    uefi_call_wrapper(kb_file->SetPosition, 2, kb_file, 0);
+    EFI_STATUS st = uefi_call_wrapper(kb_file->Write, 3, kb_file, &sz, kb_buf);
+    uefi_call_wrapper(kb_file->Flush, 1, kb_file);
+    serial_str(EFI_ERROR(st) ? "EFI_LOADER: KBOOT.CFG write FAILED\r\n" : "EFI_LOADER: KBOOT.CFG updated\r\n");
+}
+
+/* load a kurono EFI from the KURONO root and start it with our options plus
+ * the chained marker and its slot name. returns only when that failed. (satoru) */
+static void chainload_slot(EFI_HANDLE image, const char *slot) {
+    if (!kb_root || !slot || !slot[0]) return;
+    CHAR16 wname[40];
+    UINTN n = 0;
+    while (slot[n] && n < 32) { wname[n] = (CHAR16)slot[n]; n++; }
+    wname[n] = 0;
+    EFI_FILE_HANDLE f = NULL;
+    if (EFI_ERROR(uefi_call_wrapper(kb_root->Open, 5, kb_root, &f, wname, EFI_FILE_MODE_READ, 0)) || !f) {
+        serial_str("EFI_LOADER: slot file missing\r\n");
+        return;
+    }
+    EFI_FILE_INFO *info = LibFileInfo(f);
+    UINTN size = info ? (UINTN)info->FileSize : 0;
+    if (info) uefi_call_wrapper(BS->FreePool, 1, info);
+    void *buf = NULL;
+    if (!size || EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, size, &buf)) || !buf) {
+        uefi_call_wrapper(f->Close, 1, f);
+        return;
+    }
+    UINTN got = size;
+    EFI_STATUS st = uefi_call_wrapper(f->Read, 3, f, &got, buf);
+    uefi_call_wrapper(f->Close, 1, f);
+    if (EFI_ERROR(st) || got != size) { uefi_call_wrapper(BS->FreePool, 1, buf); return; }
+    CHAR16 path[44];
+    path[0] = L'\\';
+    for (UINTN i = 0; i <= n; i++) path[i + 1] = wname[i];
+    EFI_DEVICE_PATH *dp = FileDevicePath(kb_dev, path);
+    EFI_HANDLE child = NULL;
+    st = uefi_call_wrapper(BS->LoadImage, 6, FALSE, image, dp, buf, size, &child);
+    if (EFI_ERROR(st) || !child) { serial_str("EFI_LOADER: slot LoadImage failed\r\n"); return; }
+    /* the child's options: ours (minus the loader's own fixed prefix, which it
+     * adds itself) plus the markers. (satoru) */
+    static CHAR16 opts[300];
+    UINTN o = 0;
+    const char *base = KURONO_EFI_CMDLINE;
+    UINTN bl = ascii_len(base);
+    const char *rest = efi_cmdline;
+    if (ascii_len(efi_cmdline) >= bl) { rest = efi_cmdline + bl; while (*rest == ' ') rest++; }
+    for (UINTN i = 0; rest[i] && o < 200; i++) opts[o++] = (CHAR16)rest[i];
+    const char *mark = " kurono.boot.chained=1 kurono.boot.slot=";
+    for (UINTN i = 0; mark[i] && o < 260; i++) opts[o++] = (CHAR16)mark[i];
+    for (UINTN i = 0; slot[i] && o < 296; i++) opts[o++] = (CHAR16)slot[i];
+    opts[o] = 0;
+    EFI_LOADED_IMAGE *cli = NULL;
+    if (!EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, child, &LoadedImageProtocol, (void **)&cli)) && cli) {
+        cli->LoadOptions = opts;
+        cli->LoadOptionsSize = (UINT32)((o + 1) * sizeof(CHAR16));
+    }
+    serial_str("EFI_LOADER: starting slot ");
+    serial_str(slot);
+    serial_str("\r\n");
+    uefi_call_wrapper(BS->StartImage, 3, child, NULL, NULL);
+    serial_str("EFI_LOADER: slot returned, booting the embedded kernel\r\n");
+}
+
+static void kboot_decide(EFI_HANDLE image) {
+    if (cmd_has("kurono.boot.chained=1")) return;   /* a slot we started: no second decision (satoru) */
+    int have = kboot_open();
+    int key = recovery_key_held();
+    if (!have) {
+        if (key) { cmd_append("kurono.mode=recovery"); cmd_append("kurono.recovery.reason=3"); }
+        return;
+    }
+    UINT32 flags = kb_rd32(kb_buf + 12);
+    UINT32 tries = kb_rd32(kb_buf + 48);
+    UINT32 streak = kb_rd32(kb_buf + 120);
+    char trial[32], current[32], previous[32];
+    for (int i = 0; i < 31; i++) { trial[i] = (char)kb_buf[52 + i]; current[i] = (char)kb_buf[84 + i]; previous[i] = (char)kb_buf[128 + i]; }
+    trial[31] = current[31] = previous[31] = 0;
+    UINT32 reason = 0;
+    if (flags & 1u) reason = 1;
+    else if (streak >= 2) reason = 2;
+    else if (key) reason = 3;
+    if (reason) {
+        flags &= ~1u;
+        kb_wr32(kb_buf + 12, flags);
+        kb_wr32(kb_buf + 120, 0);
+        kb_wr32(kb_buf + 124, reason);
+        kboot_write();
+        cmd_append("kurono.mode=recovery");
+        cmd_append(reason == 1 ? "kurono.recovery.reason=1" : reason == 2 ? "kurono.recovery.reason=2" : "kurono.recovery.reason=3");
+        return;
+    }
+    if (flags & 4u) { flags &= ~4u; cmd_append("kurono.safe=1"); }
+    kb_wr32(kb_buf + 120, streak + 1);   /* the desktop clears it again (satoru) */
+    const char *slot = current[0] ? current : 0;
+    if (trial[0] && tries > 0) {
+        kb_wr32(kb_buf + 48, tries - 1);
+        slot = trial;
+    } else if (trial[0]) {
+        /* the trial had its boot and never confirmed: drop it. (satoru) */
+        flags |= 8u;
+        for (int i = 0; i < 32; i++) kb_buf[52 + i] = 0;
+    }
+    if (flags & 2u) { flags &= ~2u; slot = previous[0] ? previous : 0; }
+    kb_wr32(kb_buf + 12, flags);
+    kboot_write();
+    if (slot && slot[0] && !(slot[0] == 'E' && slot[1] == 'M' && slot[2] == 'B')) chainload_slot(image, slot);
+    cmd_append("kurono.boot.slot=EMBEDDED");
+}
+
 /* copy a cmdline for DISPLAY with the value of kurono.claude.env replaced by <redacted>:
  * that value carries credentials and must not reach the screen or serial. the real tag
  * given to the kernel is never touched. (satoru) */
@@ -220,6 +426,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     /* ── 0. Initialise gnu-efi library ──────────────────────────────── */
     InitializeLib(ImageHandle, SystemTable);
     mb2_cmdline = build_cmdline(ImageHandle);
+    kboot_decide(ImageHandle);   /* recovery R6 + A/B slots, may not return (satoru) */
 
     Print(L"\r\n=== Kurono OS EFI Loader ===\r\n");
     Print(L"Cmdline: %a\r\n", redact_cmdline(mb2_cmdline));
@@ -491,48 +698,82 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
                               &map_size2, mmap2, &map_key2,
                               &desc_size2, &desc_ver);
 
-            /* a kernel linked high lands wherever that address falls on this
-             * machine. refuse before ExitBootServices if the span is not plain
-             * ram or would overwrite this loader or its stack, so the failure
-             * is a message and a way back to the boot menu, not corruption.
-             * a low kernel only warns: 0x100000 is known good. (satoru) */
+            /* the kernel ELF has two load segments now: the low 1 mb boot stub
+             * (.boot) and the kernel image itself at its p_paddr (16 mb). each
+             * segment must lie, on its own, in conventional / boot-services /
+             * loader memory; the unused gap between them is only warned about.
+             * a segment that overlaps this loader, its boot info buffer or its
+             * stack is always refused: that would corrupt the copy. a failure
+             * here is a message and a way back to the boot menu, never a copy
+             * into firmware memory. (satoru) */
             {
-                UINT64 ks = ~0ULL, ke = 0, covered = 0;
                 Elf64_Phdr *gp = (Elf64_Phdr *)(elf_buf + ehdr->e_phoff);
-                for (int g = 0; g < ehdr->e_phnum; g++, gp++) {
-                    if (gp->p_type != PT_LOAD) continue;
-                    if (gp->p_paddr < ks) ks = gp->p_paddr;
-                    if (gp->p_paddr + gp->p_memsz > ke) ke = gp->p_paddr + gp->p_memsz;
-                }
-                for (UINTN j = 0; j < map_size2 / desc_size2; j++) {
-                    EFI_MEMORY_DESCRIPTOR *d =
-                        (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mmap2 + j * desc_size2);
-                    UINT64 ds = d->PhysicalStart, de = ds + d->NumberOfPages * 4096ULL;
-                    if (d->Type != EfiConventionalMemory && d->Type != EfiBootServicesCode &&
-                        d->Type != EfiBootServicesData && d->Type != EfiLoaderCode &&
-                        d->Type != EfiLoaderData)
-                        continue;
-                    if (de > ks && ds < ke)
-                        covered += (de < ke ? de : ke) - (ds > ks ? ds : ks);
-                }
+                UINT64 ks = ~0ULL, ke = 0;
                 UINT64 ls = (UINT64)(UINTN)elf_buf, le = ls + elf_size, here;
                 UINT64 bi = (UINT64)(UINTN)boot_info_buf;
                 if (bi < ls) ls = bi;
                 if (bi + sizeof(boot_info_buf) > le) le = bi + sizeof(boot_info_buf);
                 __asm__ volatile("mov %%rsp, %0" : "=r"(here));
-                int bad_ram = covered != ke - ks;
-                int bad_self = (le > ks && ls < ke) || (here >= ks && here < ke);
-                if (bad_ram || bad_self) {
-                    Print(L"Kernel span %lx-%lx: %a\r\n", ks, ke,
-                          bad_ram ? "not all usable ram" : "overlaps the loader or its stack");
-                    /* overlapping the copy source (kernel image in this loader), the boot
-                     * info buffer or the stack would corrupt the copy no matter where the
-                     * kernel is linked, so that always refuses; "not all usable ram" stays
-                     * a warning for a low kernel (0x100000 is known good). (satoru) */
-                    if (bad_self || ks >= 0x1000000ULL) {
-                        Print(L"Refusing to load this build here.\r\n");
-                        goto hang;
+                int bad = 0;
+                UINT64 gap_lo = 0, gap_hi = 0;
+                for (int g = 0; g < ehdr->e_phnum; g++, gp++) {
+                    if (gp->p_type != PT_LOAD) continue;
+                    UINT64 seg_lo = gp->p_paddr;
+                    UINT64 seg_hi = gp->p_paddr + gp->p_memsz;
+                    if (seg_lo < ks) ks = seg_lo;
+                    if (seg_hi > ke) ke = seg_hi;
+                    /* self overlap: the copy source, the info buffer, the stack. */
+                    if ((le > seg_lo && ls < seg_hi) || (here >= seg_lo && here < seg_hi)) {
+                        Print(L"Kernel segment %d [%lx-%lx] overlaps the loader, its "
+                              L"boot info or its stack.\r\n", g, seg_lo, seg_hi);
+                        bad = 1;
+                        continue;
                     }
+                    /* first uncovered physical range inside this segment */
+                    UINT64 cur = seg_lo, miss_lo = 0, miss_hi = 0;
+                    for (UINTN j = 0; j < map_size2 / desc_size2; j++) {
+                        EFI_MEMORY_DESCRIPTOR *d =
+                            (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mmap2 + j * desc_size2);
+                        UINT64 ds = d->PhysicalStart, de = ds + d->NumberOfPages * 4096ULL;
+                        if (d->Type != EfiConventionalMemory && d->Type != EfiBootServicesCode &&
+                            d->Type != EfiBootServicesData && d->Type != EfiLoaderCode &&
+                            d->Type != EfiLoaderData)
+                            continue;
+                        if (de <= cur || ds >= seg_hi) continue;
+                        if (ds > cur && !miss_lo) { miss_lo = cur; miss_hi = ds < seg_hi ? ds : seg_hi; break; }
+                        if (de > cur) cur = de < seg_hi ? de : seg_hi;
+                        if (cur >= seg_hi) break;
+                    }
+                    if (cur < seg_hi && !miss_lo) { miss_lo = cur; miss_hi = seg_hi; }
+                    if (miss_lo) {
+                        Print(L"Kernel segment %d [%lx-%lx]: physical %lx-%lx is not "
+                              L"usable ram.\r\n", g, seg_lo, seg_hi, miss_lo, miss_hi);
+                        bad = 1;
+                    }
+                }
+                /* the gap between the low stub and the image is not loaded: warn,
+                 * do not refuse (a reserved range in the gap is harmless). */
+                if (!bad) {
+                    UINT64 cur = ks;
+                    for (UINTN j = 0; j < map_size2 / desc_size2; j++) {
+                        EFI_MEMORY_DESCRIPTOR *d =
+                            (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mmap2 + j * desc_size2);
+                        UINT64 ds = d->PhysicalStart, de = ds + d->NumberOfPages * 4096ULL;
+                        if (d->Type != EfiConventionalMemory && d->Type != EfiBootServicesCode &&
+                            d->Type != EfiBootServicesData && d->Type != EfiLoaderCode &&
+                            d->Type != EfiLoaderData)
+                            continue;
+                        if (de <= cur || ds >= ke) continue;
+                        if (ds > cur && !gap_lo) { gap_lo = cur; gap_hi = ds < ke ? ds : ke; }
+                        if (de > cur) cur = de;
+                    }
+                    if (gap_lo)
+                        Print(L"note: kernel span gap %lx-%lx is not usable ram (not loaded).\r\n",
+                              gap_lo, gap_hi);
+                }
+                if (bad) {
+                    Print(L"Refusing to load this build here.\r\n");
+                    goto hang;
                 }
             }
 

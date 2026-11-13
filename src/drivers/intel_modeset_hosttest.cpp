@@ -1,7 +1,7 @@
 // host unit test for the stage 2 maths and the dp link training state
 // machine. not part of the kernel build. run from src/drivers:
 //   g++ -std=c++17 -O1 -Wall -o /tmp/igpu2_test intel_modeset_hosttest.cpp
-//       intel_modeset_calc.cpp intel_dp_lt.cpp && /tmp/igpu2_test
+//       intel_modeset_calc.cpp intel_dp_lt.cpp dp_edid_decode.cpp && /tmp/igpu2_test
 // expected values are recomputed here straight from the linux formulas
 // (or worked by hand in the comments), not copied from the code under
 // test. (satoru)
@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include "intel_modeset_calc.h"
 #include "intel_dp_lt.h"
+#include "dp_edid_decode.h"
 
 static int g_fail = 0, g_pass = 0;
 #define CHECK(c, ...) do { if (c) g_pass++; else { g_fail++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -322,10 +323,98 @@ static void test_lt() {
     CHECK(strstr(g_k.trace, "w 00102: 21 00 00\n") != nullptr, "only 2 lane sets written");
 }
 
+static void timing(uint32_t hz_milli, uint32_t pixclk, uint16_t h, uint16_t v, DpEdid::Timing* t) {
+    *t = DpEdid::Timing();
+    t->refresh_mhz = hz_milli;
+    t->pixclk_khz = pixclk;
+    t->hact = h; t->vact = v;
+    t->hblank = 160; t->hfp = 48; t->hsync = 32;
+    t->vblank = 40; t->vfp = 3; t->vsync = 5;
+    t->hpos = t->vpos = true;
+}
+
+static void test_timing_pick() {
+    // a 2560x1440 monitor whose edid offers 60, 143.912 and 165 hz, plus a
+    // 1080p 240 hz entry that must never be picked at the native size. (satoru)
+    DpEdid::Edid e;
+    e.preferred = 0;
+    e.nt = 4;
+    timing(60001, 262430, 2560, 1440, &e.t[0]);   e.t[0].preferred = true;
+    timing(143912, 586590, 2560, 1440, &e.t[1]);
+    timing(165000, 674500, 2560, 1440, &e.t[2]);
+    timing(240000, 610000, 1920, 1080, &e.t[3]);
+
+    CHECK(DpEdid::PickTimingAtResolution(e, 165000) == 2, "exact 165 hz timing");
+    CHECK(DpEdid::PickTimingAtResolution(e, 60001) == 0, "exact 60 hz timing");
+    CHECK(DpEdid::PickTimingAtResolution(e, 120000) == 1, "120 asks for the closest (144)");
+    CHECK(DpEdid::PickTimingAtResolution(e, 200000) == 2, "200 asks for the closest (165)");
+    CHECK(DpEdid::PickTimingAtResolution(e, 1000000) == 2, "above every timing picks the fastest at this size");
+    CHECK(DpEdid::PickTimingAtResolution(e, 1) == 0, "below every timing picks the slowest at this size");
+
+    uint32_t rates[8] = {};
+    int n = DpEdid::RatesAtPreferred(e, rates, 8);
+    CHECK(n == 3, "three rates at 2560x1440, got %d", n);
+    CHECK(n == 3 && rates[0] == 60 && rates[1] == 144 && rates[2] == 165, "rates ascending: %u %u %u",
+          n > 0 ? rates[0] : 0, n > 1 ? rates[1] : 0, n > 2 ? rates[2] : 0);
+
+    // only the native 60 and a 1080p 240: an unavailable 165 falls back to 60.
+    DpEdid::Edid f;
+    f.preferred = 0;
+    f.nt = 2;
+    timing(60001, 262430, 2560, 1440, &f.t[0]); f.t[0].preferred = true;
+    timing(240000, 610000, 1920, 1080, &f.t[1]);
+    CHECK(DpEdid::PickTimingAtResolution(f, 165000) == 0, "falls back to the preferred 60 hz timing");
+    n = DpEdid::RatesAtPreferred(f, rates, 8);
+    CHECK(n == 1 && rates[0] == 60, "only the native rate is offered, got %d", n);
+
+    // a 59.94 hz edn rate rounds to 60 in the human list. (satoru)
+    DpEdid::Edid g;
+    g.preferred = 0;
+    g.nt = 1;
+    timing(59940, 262430, 2560, 1440, &g.t[0]); g.t[0].preferred = true;
+    n = DpEdid::RatesAtPreferred(g, rates, 8);
+    CHECK(n == 1 && rates[0] == 60, "59.94 rounds to 60, got %u", n ? rates[0] : 0);
+}
+
+// PickFittingTiming: the preferred 4k60 does not fit a 300 mhz pixel clock
+// cap, so the largest fitting timing wins, refresh nearest 60 among equal
+// sizes, lower clock on a tie; nothing fits -> -1. (satoru)
+static bool fits_300mhz(const DpEdid::Timing& t, void* ctx) { return t.pixclk_khz <= *(uint32_t*)ctx; }
+
+static void test_fitting_pick() {
+    DpEdid::Edid e;
+    memset(&e, 0, sizeof(e));
+    e.preferred = 0;
+    e.nt = 5;
+    timing(60000, 594000, 3840, 2160, &e.t[0]); e.t[0].preferred = true;
+    timing(30000, 297000, 3840, 2160, &e.t[1]);
+    timing(60000, 148500, 1920, 1080, &e.t[2]);
+    timing(144000, 325000, 1920, 1080, &e.t[3]);
+    timing(60000, 241500, 2560, 1440, &e.t[4]);
+    uint32_t cap = 300000;
+    int i = DpEdid::PickFittingTiming(e, 60000, fits_300mhz, &cap);
+    CHECK(i == 1, "4k30 (297 mhz) is the largest that fits 300 mhz, got %d", i);
+    cap = 250000;
+    i = DpEdid::PickFittingTiming(e, 60000, fits_300mhz, &cap);
+    CHECK(i == 4, "1440p60 is the largest under 250 mhz, got %d", i);
+    cap = 600000;
+    i = DpEdid::PickFittingTiming(e, 60000, fits_300mhz, &cap);
+    CHECK(i == 0, "everything fits: 4k60 beats 4k30 on refresh, got %d", i);
+    cap = 100000;
+    i = DpEdid::PickFittingTiming(e, 60000, fits_300mhz, &cap);
+    CHECK(i == -1, "nothing fits 100 mhz, got %d", i);
+    e.t[1].interlaced = true;
+    cap = 300000;
+    i = DpEdid::PickFittingTiming(e, 60000, fits_300mhz, &cap);
+    CHECK(i == 4, "interlaced 4k30 skipped, got %d", i);
+}
+
 int main() {
     test_c20();
+    test_fitting_pick();
     test_mode_and_link();
     test_levels_ggtt_misc();
+    test_timing_pick();
     test_wm();
     test_lt();
     printf("%s: %d passed, %d failed\n", g_fail ? "FAILED" : "ALL PASS", g_pass, g_fail);

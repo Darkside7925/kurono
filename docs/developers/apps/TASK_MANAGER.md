@@ -43,6 +43,14 @@ header to flip direction. Column geometry got reworked to fix the old column
 collisions, and the window is taller now (560x500) so the Performance panes and process
 rows fit without clipping.
 
+## Virtual Machine row
+
+The background guest shows up as a row named "Virtual Machine" (process `vmhost`). Its memory
+is the guest's real RAM: the low RAM it has backed, plus the lazy high RAM chunks that are
+resident now. The row used to show the VM host task's own heap, about 128 KB. The guest's
+figure comes from the `KuronoGuestRam` line in `/proc/<pid>/status`. `KuronoTaskFrames` is the
+task's total, which includes the guest RAM. In one test a booted Alpine guest showed 349 MB.
+
 ## Kill and restart
 
 Click a row to select, click the same row again for the action menu:

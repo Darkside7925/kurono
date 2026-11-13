@@ -1,10 +1,13 @@
 //  kurono os - taskbar & desktop environment implementation
+#include "../system/battery.h"   // menu bar battery (satoru)
 #include "desktop.h"
 #include "boot_anim.h"
 #include "../../logo.h"
 #include "control_center.h"
 #include "notification.h"
 #include "../system/screenshot.h"
+#include "night_light.h"   // schedule tick (satoru)
+#include "../system/power.h"
 #include "wayland_server.h"
 #include "perf_hud.h"
 #include "gui.h"   // GUI::UpdateBackbuffer for the resize self-heal relayout (satoru)
@@ -12,6 +15,7 @@
 #include "../drivers/outputs.h"   // multi-monitor: menu bar/dock/icons live on the primary output (satoru)
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
+#include "gfx_bench.h"   // scissor debug lines only while the bench runs (satoru)
 #include "../drivers/keyboard.h"
 #include "../drivers/timer.h"
 #include "../kernel/time.h"
@@ -44,6 +48,8 @@
 #include "../apps/browser.h"
 #include "../apps/media_player.h"
 #include "../apps/firefox_launcher.h"   // install-state gate for the firefox icon (satoru)
+#include "../system/installer_gui.h"   // live-medium install state for the desktop icon (satoru)
+#include "../system/installer_service.h"   // payload availability for the installer icon (satoru)
 #include "../fs/persist.h"              // persisted-install gate for the firefox icon (satoru)
 #include "../proc/kernel_processes.h"   // detached shell launch (no terminal) (satoru)
 #include "../proc/scheduler.h"
@@ -635,7 +641,28 @@ static void m_arc(int cx, int cy, float r, float thick, uint32_t c, int alpha){
 // menu bar layout, right to left: clock, control center, battery, volume,
 // network. shared by render and hit-test.
 struct MBarLayout { int clock_x, clock_w, cc_x, bat_x, vol_x, net_x; };
+// clock.24h (settings: language & region), read at most once a second. (satoru)
+static bool mbar_24h(){
+    static bool v = false;
+    static uint32_t at = 0;
+    uint32_t now = Timer::GetRealMs();
+    if(at == 0 || now - at > 1000u){ at = now ? now : 1; v = UIConfig::Bool("clock.24h", false); }
+    return v;
+}
 static void mbar_clock_text(char* out, int mx){
+    if(mbar_24h()){
+        int h = Taskbar::ClockHour24();
+        char hh[4]; hh[0] = (char)('0' + h / 10); hh[1] = (char)('0' + h % 10); hh[2] = 0;
+        char m2[4]; m2[0] = (char)('0' + Taskbar::ClockMinute() / 10); m2[1] = (char)('0' + Taskbar::ClockMinute() % 10); m2[2] = 0;
+        char d2[4]; int_to_str(Taskbar::ClockDom(), d2, 4);
+        out[0] = 0;
+        int dw2 = Taskbar::ClockDow(); if (dw2 < 0 || dw2 > 6) dw2 = 0;
+        int mo2 = Taskbar::ClockMon() - 1; if (mo2 < 0 || mo2 > 11) mo2 = 0;
+        sapp(out, k_dow[dw2], mx); sapp(out, " ", mx); sapp(out, d2, mx); sapp(out, " ", mx);
+        sapp(out, k_mon[mo2], mx); sapp(out, "   ", mx); sapp(out, hh, mx); sapp(out, ":", mx);
+        sapp(out, m2, mx);
+        return;
+    }
     int h12 = Taskbar::ClockHour12();
     char tb[8]; int_to_str(h12, tb, 8);
     char mm[4]; mm[0] = (char)('0' + Taskbar::ClockMinute() / 10); mm[1] = (char)('0' + Taskbar::ClockMinute() % 10); mm[2] = 0;
@@ -654,7 +681,8 @@ static MBarLayout mbar_layout(){
     L.clock_x = Taskbar::screen_width - 14 - L.clock_w;
     L.cc_x    = L.clock_x - 14 - 18;
     L.bat_x   = L.cc_x - 14 - 25;
-    L.vol_x   = L.bat_x - 12 - 20;
+    // no battery source: no battery icon, the volume moves up (satoru)
+    L.vol_x   = Battery::Present() ? L.bat_x - 12 - 20 : L.cc_x - 14 - 20;
     L.net_x   = L.vol_x - 12 - 18;
     return L;
 }
@@ -745,13 +773,19 @@ void Taskbar::RenderMenuBar(){
         if (!muted) { m_arc(vx + 9, cy, 4.0f, 1.4f, ink, 255); m_arc(vx + 9, cy, 7.5f, 1.4f, ink, 200); }
         else Graphics::DrawLine(vx + 11, cy - 4, vx + 18, cy + 4, 0xFFFF6B6B);
     }
-    // battery
-    {
+    // battery (only when a battery source reports one) (satoru)
+    if (Battery::Present()) {
         int bx = L.bat_x, by = cy - 6;
         MDraw::RoundOutline(bx, by, 22, 12, 3, ink, 170);
         MDraw::RoundRect(bx + 23, by + 4, 2, 4, 1, ink, 170);
         int fill = (battery_pct * 18) / 100; if (fill < 2) fill = 2;
         MDraw::RoundRect(bx + 2, by + 2, fill, 8, 2, battery_pct > 20 ? ink : 0xFFFF6B6B, 255);
+        if (Battery::GetState() == Battery::S_CHARGING) {
+            // a small bolt over the fill (satoru)
+            Graphics::DrawLine(bx + 12, by + 1, bx + 8, by + 6, 0xFF1C1C1E);
+            Graphics::DrawLine(bx + 8, by + 6, bx + 13, by + 6, 0xFF1C1C1E);
+            Graphics::DrawLine(bx + 13, by + 6, bx + 9, by + 11, 0xFF1C1C1E);
+        }
     }
     // control center: two stacked toggles
     {
@@ -761,6 +795,21 @@ void Taskbar::RenderMenuBar(){
     }
     char clk[40]; mbar_clock_text(clk, 40);
     FontTTF::DrawText(L.clock_x, 5, MBAR_TEXT_PX, clk, 0xFFF2F3F8);
+    // the bar never damaged itself: a new minute, app name, battery or link
+    // state reached the screen only when something else damaged the bar (the
+    // default path presents the full screen every frame, so it never showed).
+    // with damage-only rendering (kurono.gfx.scissor=1, kurono.wpdamage=1)
+    // the bar damages itself when what it shows changed. (satoru)
+    if (Graphics::ScissorEnabled() || Graphics::WallpaperDamageOnly()) {
+        static uint32_t s_sig = 0;
+        uint32_t sig = 2166136261u;
+        for (const char* p = clk; *p; p++) sig = (sig ^ (uint8_t)*p) * 16777619u;
+        for (const char* p = app; *p; p++) sig = (sig ^ (uint8_t)*p) * 16777619u;
+        sig = (sig ^ (uint32_t)battery_pct) * 16777619u;
+        sig = (sig ^ (uint32_t)(WiFi::IsLinkUp() ? 1 : 0) ^ ((uint32_t)WiFi::SignalBars() << 1)) * 16777619u;
+        sig = (sig ^ (uint32_t)(Audio::IsAvailable() && Audio::IsMuted() ? 1 : 0) ^ (start_menu_open ? 2u : 0u)) * 16777619u;
+        if (sig != s_sig) { s_sig = sig; Graphics::MarkDirty(0, 0, sw, MBAR_H); }
+    }
 }
 
 void Taskbar::RenderDock(){
@@ -832,6 +881,34 @@ void Taskbar::RenderDock(){
         MDraw::RoundRect(cx - tw / 2 - 10, ty, tw + 20, 24, 8, 0xFF2C2D3A, 235);
         MDraw::RoundOutline(cx - tw / 2 - 10, ty, tw + 20, 24, 8, 0xFFFFFFFF, 30);
         FontTTF::DrawText(cx - tw / 2, ty + 4, 14.0f, label, 0xFFF2F3F8);
+    }
+    // the dock used to damage itself on every frame. that only cost a small
+    // present before; under the damage scissor (kurono.gfx.scissor=1) it is
+    // an extra render pass per frame, so there it damages itself only when
+    // what it shows changed: item layout, hover, running dots, a bounce or a
+    // catch. (satoru)
+    if (Graphics::ScissorEnabled()) {
+        static uint32_t s_sig = 0;
+        static int s_rx = 0, s_ry = 0, s_rw = 0, s_rh = 0;
+        uint32_t sig = 0x811C9DC5u ^ (uint32_t)n ^ ((uint32_t)bg_x << 8) ^ ((uint32_t)bg_w << 20) ^ ((uint32_t)(hover + 1) << 3);
+        for (int i = 0; i < n; i++) {
+            sig = sig * 16777619u ^ (uint32_t)it[i].x;
+            sig = sig * 16777619u ^ (uint32_t)(it[i].size * 7 + it[i].kind * 131 + it[i].icon * 977);
+            sig = sig * 16777619u ^ (uint32_t)it[i].win_id;
+        }
+        for (int w = 0; w < WM_MAX_WINDOWS; w++) sig = sig * 31u + (uint32_t)(wl[w].state != WIN_CLOSED) + (uint32_t)wl[w].state * 3u;
+        bool moving = false;
+        for (int i = 0; i < n && !moving; i++) {
+            if (it[i].kind == 0) { uint32_t lms = PinnedLaunchMs(it[i].pin); if (lms && now - lms < 900) moving = true; }
+            if (it[i].kind == 1) { int e = 0, f = 0, g = 0; if (WindowManager::TaskbarCatch(it[i].win_id, it[i].x, y_pos, it[i].size, it[i].size, e, f, g)) moving = true; }
+        }
+        int rx = bg_x - 40, ry = dock_y - 60, rw = bg_w + 80, rh = MDOCK_H + 70;
+        if (moving || sig != s_sig || rx != s_rx || rw != s_rw || ry != s_ry || rh != s_rh) {
+            Graphics::MarkDirty(rx, ry, rw, rh);
+            if (s_rw > 0) Graphics::MarkDirty(s_rx, s_ry, s_rw, s_rh);
+        }
+        s_sig = sig; s_rx = rx; s_ry = ry; s_rw = rw; s_rh = rh;
+        return;
     }
     Graphics::MarkDirty(bg_x - 40, dock_y - 60, bg_w + 80, MDOCK_H + 70);
 }
@@ -1355,10 +1432,9 @@ bool Taskbar::HandleClick(int mx,int my){
                             case 9: KuronoShell::Init(); TerminalApp::Init();
                                     DesktopEnvironment::LaunchTerminal(); break;
                             case 10: DesktopEnvironment::RequestLogout(); break;
-                            // shutdown: halt the machine like the shell's
-                            // `shutdown` builtin (no acpi power-off here). (satoru)
-                            // the shutdown film plays first and halts at its end (satoru)
-                            case 11: if (!BootAnim::StartShutdown(1)) { HAL::DisableInterrupts(); HAL::Halt(); } break;
+                            // shutdown: the one power sequence saves, stops
+                            // services and power-offs (acpi s5). (satoru)
+                            case 11: PowerManager::Request(PowerManager::ACTION_SHUTDOWN, "start menu"); break;
                         }
                         return true;
                     }
@@ -1554,6 +1630,8 @@ void Taskbar::Update(){
     uint32_t now = Timer::GetRealMs();
     if (clock_last_update_ms != 0 && (now - clock_last_update_ms) < 1000) return;
     clock_last_update_ms = now;
+    Battery::Tick();   // (satoru)
+    if (Battery::Present()) battery_pct = Battery::Percent();
     DateTime dt = TimeManager::NowLocalDateTime();
     clock_h = dt.h;
     clock_m = dt.m;
@@ -1661,6 +1739,9 @@ int           Desktop::gradient_cache_h = 0;
 size_t        Desktop::gradient_cache_bytes = 0;
 bool          Desktop::have_image_wallpaper = false;
 uint8_t*      Desktop::wallpaper_src       = nullptr;
+// a builtin wallpaper already lives in rodata for the whole boot; point the
+// scaler straight at it instead of copying 2 mb into the pmm. (satoru)
+static bool   g_wallpaper_src_borrowed     = false;
 int           Desktop::wallpaper_src_w     = 0;
 int           Desktop::wallpaper_src_h     = 0;
 int           Desktop::wallpaper_src_order = 0;
@@ -1730,6 +1811,8 @@ void Desktop::Init(int sw,int sh){
     AddIcon("Browser",     "/usr/bin/browser",       2);
     AddIcon("Home",        "/home/user",             1);
     AddIcon("Media",       "/usr/bin/mediaplayer",   2);
+    if (!InstallerGUI::IsInstalled() && InstallerService::PayloadAvailable())
+        AddIcon("Install Kurono", "/usr/bin/installer", 2);
 
     ArrangeIcons();
     RefreshFiles();
@@ -1821,6 +1904,20 @@ void Desktop::AddOrUpdateDesktopFile(KVFSNode* node){
 
 void Desktop::RefreshFiles(){
     KVFS::Mkdirs("/home/user/Desktop");
+    // the icon set changes here without any damage (only the ui dirty flag):
+    // under the damage scissor the added or dropped icon never reached the
+    // screen. a signature of the set before and after, a full repaint when it
+    // differs. (satoru)
+    auto icon_sig = [&]() {
+        uint32_t h = 2166136261u + (uint32_t)icon_count;
+        for (int i = 0; i < icon_count; i++) {
+            h = (h ^ (uint32_t)icons[i].x) * 16777619u;
+            h = (h ^ (uint32_t)icons[i].y) * 16777619u;
+            for (const char* c = icons[i].name; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+        }
+        return h;
+    };
+    const uint32_t sig_before = icon_sig();
 
     for(int icon_index=0;icon_index<icon_count;){
         if(IsDesktopFileIcon(&icons[icon_index]) && !KVFS::Exists(icons[icon_index].path)){
@@ -1852,6 +1949,7 @@ void Desktop::RefreshFiles(){
     }
     SyncFirefoxIcon();
     last_file_sync_ms = Timer::GetRealMs();
+    if (Graphics::ScissorEnabled() && icon_sig() != sig_before) Graphics::MarkFullScreenDirty();   // (satoru)
 }
 
 void Desktop::SyncFirefoxIcon(){
@@ -2022,9 +2120,12 @@ void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
     if (!img.valid || !img.data || img.width <= 0 || img.height <= 0) {
         have_image_wallpaper = false;
         if (wallpaper_src) {
-            TaskMem::UnchargeFrames(wallpaper_src); PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes);
+            if (!g_wallpaper_src_borrowed) {
+                TaskMem::UnchargeFrames(wallpaper_src); PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes);
+            }
             wallpaper_src = nullptr; wallpaper_src_bytes = 0;
             wallpaper_src_w = 0; wallpaper_src_h = 0;
+            g_wallpaper_src_borrowed = false;
         }
         if (gradient_cache) {
             TaskMem::UnchargeFrames(gradient_cache); PMM::FreeBytes(gradient_cache, gradient_cache_bytes);
@@ -2040,10 +2141,22 @@ void Desktop::SetWallpaperImage(const MediaDecoder::Image& img){
     // later resolution change (the display backend may finalize a different mode
     // after boot, e.g. virtio-gpu coming up at 1080p). (satoru)
     size_t src_bytes = (size_t)img.width * (size_t)img.height * 4u;
-    if (wallpaper_src) { TaskMem::UnchargeFrames(wallpaper_src); PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes); wallpaper_src = nullptr; }
-    wallpaper_src = (uint8_t*)PMM::AllocBytes(src_bytes); TaskMem::ChargeFrames(wallpaper_src, src_bytes);
-    if (!wallpaper_src) { wallpaper_src_bytes = 0; have_image_wallpaper = false; return; }
-    memcpy(wallpaper_src, img.data, src_bytes);
+    if (wallpaper_src) {
+        if (!g_wallpaper_src_borrowed) {
+            TaskMem::UnchargeFrames(wallpaper_src); PMM::FreeBytes(wallpaper_src, wallpaper_src_bytes);
+        }
+        wallpaper_src = nullptr;
+    }
+    if (!img.owns) {
+        // embedded builtin: the rodata never goes away, use it in place. (satoru)
+        wallpaper_src = (uint8_t*)img.data;
+        g_wallpaper_src_borrowed = true;
+    } else {
+        wallpaper_src = (uint8_t*)PMM::AllocBytes(src_bytes); TaskMem::ChargeFrames(wallpaper_src, src_bytes);
+        if (!wallpaper_src) { wallpaper_src_bytes = 0; have_image_wallpaper = false; return; }
+        memcpy(wallpaper_src, img.data, src_bytes);
+        g_wallpaper_src_borrowed = false;
+    }
     wallpaper_src_bytes = src_bytes;
     wallpaper_src_w     = img.width;
     wallpaper_src_h     = img.height;
@@ -2101,10 +2214,19 @@ static const uint32_t* g_wp_painted_cache = nullptr;
 static int g_wp_painted_w = 0, g_wp_painted_h = 0;
 
 static bool desk_wallpaper_needs_full(int w, int h, uint32_t color, bool img, const uint32_t* cache) {
+    bool changed = !g_wp_painted || g_wp_painted_w != w || g_wp_painted_h != h ||
+                   g_wp_painted_gen != g_wp_gen || g_wp_painted_color != color ||
+                   g_wp_painted_img != img || g_wp_painted_cache != cache;
+    // a damage scissor pass paints only its region: a changed cache asks the
+    // compositor for one full pass (which then paints everything). (satoru)
+    int sx, sy, sw, sh;
+    if (Graphics::GetScissor(sx, sy, sw, sh)) {
+        bool whole = sx == 0 && sy == 0 && sw >= w && sh >= h;
+        if (changed && !whole) Graphics::MarkFullScreenDirty();
+        return false;
+    }
     if (!Graphics::WallpaperDamageOnly()) return true;
-    return !g_wp_painted || g_wp_painted_w != w || g_wp_painted_h != h ||
-           g_wp_painted_gen != g_wp_gen || g_wp_painted_color != color ||
-           g_wp_painted_img != img || g_wp_painted_cache != cache;
+    return changed;
 }
 
 static void desk_wallpaper_mark_painted(int w, int h, uint32_t color, bool img, const uint32_t* cache) {
@@ -2115,6 +2237,19 @@ static void desk_wallpaper_mark_painted(int w, int h, uint32_t color, bool img, 
     g_wp_painted_color = color;
     g_wp_painted_img = img;
     g_wp_painted_cache = cache;
+}
+
+// the rects the wallpaper repaints: the frame's damage, or exactly the region
+// of the damage scissor pass that is running (kurono.gfx.scissor=1), which is
+// repainted from the wallpaper up. (satoru)
+static int desk_damage_rects(Graphics::Rect* rr, int max) {
+    int sx, sy, sw, sh;
+    if (Graphics::GetScissor(sx, sy, sw, sh)) {
+        if (sw <= 0 || sh <= 0 || max < 1) return 0;
+        rr[0].x = sx; rr[0].y = sy; rr[0].w = sw; rr[0].h = sh;
+        return 1;
+    }
+    return Graphics::GetDirtyRects(rr, max);
 }
 
 // blit the cached wallpaper into the render target: the whole screen after a
@@ -2134,7 +2269,7 @@ static void desk_wallpaper_primary(const uint32_t* cache, int w, int h, bool ful
         return;
     }
     Graphics::Rect rr[32];
-    int n = Graphics::GetDirtyRects(rr, 32);
+    int n = desk_damage_rects(rr, 32);
     for (int i = 0; i < n; i++) {
         int x0 = rr[i].x, y0 = rr[i].y;
         int x1 = x0 + rr[i].w, y1 = y0 + rr[i].h;
@@ -2164,10 +2299,19 @@ static void desk_wallpaper_secondary(const uint32_t* cache, int cw, int ch, uint
         sig = sig * 31u + (uint32_t)(o->connected ? (o->x + 7 * o->y + 13 * o->w + 17 * o->h) : 0);
     }
     bool force = full || !Graphics::WallpaperDamageOnly() || sig != last_sig;
+    // a scissor pass repaints only its region; a changed wallpaper or output
+    // set asks the compositor for a full pass instead. (satoru)
+    {
+        int sx, sy, sw, sh;
+        if (Graphics::GetScissor(sx, sy, sw, sh)) {
+            if (full || sig != last_sig) Graphics::MarkFullScreenDirty();
+            force = false;
+        }
+    }
     last_sig = sig;
     if (!force) {
         Graphics::Rect rr[32];
-        int n = Graphics::GetDirtyRects(rr, 32);
+        int n = desk_damage_rects(rr, 32);
         if (!n) return;
         for (int i = 1; i < Outputs::Total(); i++) {
             const Output* o = Outputs::Get(i);
@@ -2178,12 +2322,28 @@ static void desk_wallpaper_secondary(const uint32_t* cache, int cw, int ch, uint
                 int x1 = rr[r].x + rr[r].w < o->x + o->w ? rr[r].x + rr[r].w : o->x + o->w;
                 int y1 = rr[r].y + rr[r].h < o->y + o->h ? rr[r].y + rr[r].h : o->y + o->h;
                 if (x1 <= x0 || y1 <= y0) continue;
+                // same nearest mapping as before, src x = (x - o->x) * cw / o->w,
+                // but stepped with a running remainder instead of a 64-bit
+                // divide per pixel (the laptop panel is the secondary output,
+                // so every damaged pixel there paid one), and a straight row
+                // copy when the widths match. pixel for pixel identical. (satoru)
+                const int dx0 = x0 - o->x;
+                const long long num0 = (long long)dx0 * cw;
                 for (int y = y0; y < y1; y++) {
                     int sy = (int)(((long long)(y - o->y) * ch) / o->h);
                     const uint32_t* src = cache + (size_t)sy * cw;
                     uint32_t* dst = (uint32_t*)(buf + (size_t)y * pitch) + x0;
-                    for (int x = x0; x < x1; x++)
-                        dst[x - x0] = src[(int)(((long long)(x - o->x) * cw) / o->w)];
+                    if (o->w == cw) {
+                        memcpy(dst, src + dx0, (size_t)(x1 - x0) * 4u);
+                        continue;
+                    }
+                    int sx = (int)(num0 / o->w);
+                    int rem = (int)(num0 % o->w);
+                    for (int x = x0; x < x1; x++) {
+                        dst[x - x0] = src[sx];
+                        rem += cw;
+                        while (rem >= o->w) { rem -= o->w; sx++; }
+                    }
                 }
             }
         }
@@ -2197,7 +2357,13 @@ static void desk_wallpaper_secondary(const uint32_t* cache, int cw, int ch, uint
             int sy = (int)(((long long)y * ch) / o->h);
             const uint32_t* src = cache + (size_t)sy * cw;
             if (o->w == cw) { memcpy(d, src, (size_t)cw * 4); continue; }
-            for (int x = 0; x < o->w; x++) d[x] = src[(int)(((long long)x * cw) / o->w)];
+            // stepped nearest mapping, identical to x * cw / o->w (satoru)
+            int sx = 0, rem = 0;
+            for (int x = 0; x < o->w; x++) {
+                d[x] = src[sx];
+                rem += cw;
+                while (rem >= o->w) { rem -= o->w; sx++; }
+            }
         }
         Graphics::MarkDirty(o->x, o->y, o->w, o->h);
     }
@@ -2231,12 +2397,18 @@ void Desktop::RenderWallpaper(){
     // a moving/animated window marks its old footprint while it renders, which
     // is after this wallpaper pass: damage the last painted rects here too so
     // the old pixels are repainted in the frame they moved. (satoru)
-    if (Graphics::WallpaperDamageOnly()) WindowManager::CollectLastPaintedDamage();
+    {
+        int sx_, sy_, sw_, sh_;
+        // a damage scissor pass collected these before its first pass. (satoru)
+        if (Graphics::WallpaperDamageOnly() && !Graphics::GetScissor(sx_, sy_, sw_, sh_))
+            WindowManager::CollectLastPaintedDamage();
+    }
     // arm the scanned-vs-back crc check once the damage-only path is really
     // exercised, so a missed damage case disables it instead of corrupting the
     // screen. skipped while zero-copy owns the present path. (satoru)
     static bool s_wp_check_armed = false;
-    if (Graphics::WallpaperDamageOnly() && !Graphics::ZeroCopyActive() && !s_wp_check_armed) {
+    if (Graphics::WallpaperDamageOnly() && !Graphics::ZeroCopyActive() && !s_wp_check_armed &&
+        !Graphics::ScissorEnabled()) {   // the scissor arms its own check (satoru)
         s_wp_check_armed = true;
         Graphics::ArmSelfCheck(Graphics::SELFCHECK_WPDAMAGE, 24);
     }
@@ -2360,6 +2532,7 @@ void Desktop::RenderWallpaper(){
     desk_wallpaper_mark_painted(w, h, wallpaper_color, have_image_wallpaper, gradient_cache);
 }
 
+static void guard_section(const char* what);
 void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
     int ix=ic->x, iy=ic->y;
     int icon_sz = cfg_icon_size;
@@ -2378,9 +2551,12 @@ void Desktop::RenderIcon(DesktopIcon* ic, float hover_t){
         int label_y = ic->y + icon_sz + 6;
         int lw = FontTTF::MeasureText(14.0f, ic->name);
         int span = lw > icon_sz + 20 ? icon_sz + 20 : lw;
+        guard_section("icon-start");
         if (ic->selected)
             MDraw::RoundRect(ix - 8, iy - 6, icon_sz + 16, icon_sz + 32, 10, 0xFFFFFFFF, 46);
+        guard_section("icon-plate");
         MDraw::AppTile(gid, ix, iy, icon_sz);
+        guard_section("icon-tile");
         char lbl[24]; scpy(lbl, ic->name, 20);
         int tx = ix + icon_sz / 2 - span / 2;
         if (ic->selected)
@@ -2535,12 +2711,23 @@ void Desktop::RenderContextMenu(){
 
 void Desktop::Render(){
     RenderWallpaper();
+    guard_section("wallpaper");
     for(int i=0;i<icon_count;i++){
         float ht = (i < DESKTOP_MAX_ICONS) ? ease_out_cubic(icon_hover_phase[i]) : 0.0f;
         RenderIcon(&icons[i], ht);
     }
     RenderContextMenu();
     last_render_ms = Timer::GetRealMs();
+}
+
+// an icon's whole footprint: the selection plate, the lifted tile and the label
+// pill, which is wider than the tile for a long name. a selection or hover change
+// marked nothing, so under kurono.gfx.scissor=1 the old plate stayed on screen. (satoru)
+void Desktop::DamageIcon(int i){
+    if(i<0 || i>=icon_count) return;
+    int sz=cfg_icon_size;
+    const DesktopIcon& ic=icons[i];
+    Graphics::MarkDirty(ic.x + sz/2 - 70, ic.y - 14, 140, sz + 50);
 }
 
 void Desktop::Tick(uint32_t delta_ms, int mx, int my){
@@ -2555,8 +2742,10 @@ void Desktop::Tick(uint32_t delta_ms, int mx, int my){
     // Per-icon: ease toward 1 if hovered, 0 otherwise (160 ms full).
     for (int i = 0; i < icon_count && i < DESKTOP_MAX_ICONS; i++) {
         float target = (i == hover) ? 1.0f : 0.0f;
+        float before = icon_hover_phase[i];
         icon_hover_phase[i] = approach(icon_hover_phase[i], target,
                                       1.0f / 160.0f, delta_ms);
+        if (icon_hover_phase[i] != before) DamageIcon(i);   // (satoru)
     }
 }
 
@@ -2634,12 +2823,13 @@ bool Desktop::HandleClick(int mx,int my){
     }
 
     // deselect all
-    for(int i=0;i<icon_count;i++) icons[i].selected=false;
+    for(int i=0;i<icon_count;i++){ if(icons[i].selected) DamageIcon(i); icons[i].selected=false; }   // (satoru)
     selected_icon=-1;
 
     int idx=IconAt(mx,my);
     if(idx>=0){
         icons[idx].selected=true;
+        DamageIcon(idx);   // (satoru)
         selected_icon=idx;
         icon_dragging=true;
         icon_drag_moved=false;
@@ -2669,14 +2859,16 @@ void Desktop::HandleDoubleClick(int mx,int my){
         return;
     }
     if(icons[idx].icon_type==1){
-        FileManagerApp::OpenAt(icons[idx].path);
+        // ring 3 when files is enabled, else the same source in the kernel. (satoru)
+        KuiKernel::OpenArg("files", icons[idx].path);
         return;
     }
 
     // launch app based on icon name (prefix matching)
     const char* nm = icons[idx].name;
     // firefox before the broad 'F' files test. (satoru)
-    if(nm[0]=='F' && nm[1]=='i' && nm[2]=='r') DesktopEnvironment::LaunchFirefox();
+    if(nm[0]=='I' && nm[1]=='n' && nm[2]=='s') DesktopEnvironment::LaunchInstaller();
+    else if(nm[0]=='F' && nm[1]=='i' && nm[2]=='r') DesktopEnvironment::LaunchFirefox();
     else if(nm[0]=='T' && nm[1]=='e' && nm[2]=='r') DesktopEnvironment::LaunchTerminal();
     else if(nm[0]=='T' && nm[1]=='a') DesktopEnvironment::LaunchTaskManager();
     else if(nm[0]=='T' && nm[1]=='e' && nm[2]=='x') DesktopEnvironment::LaunchTextEditor();
@@ -2723,13 +2915,17 @@ void Desktop::Update(int mx,int my,bool mouse_down,bool clicked){
             if(delta_y<0) delta_y=-delta_y;
             if(delta_x>3 || delta_y>3) icon_drag_moved=true;
             if(icon_drag_moved){
+                DamageIcon(drag_icon);   // the old place; the scissor repaints only damage (satoru)
                 icons[drag_icon].x = mx - drag_offset_x;
                 icons[drag_icon].y = my - drag_offset_y;
                 ClampIcon(drag_icon);
+                DamageIcon(drag_icon);
             }
             return;
         }
+        DamageIcon(drag_icon);
         ClampIcon(drag_icon);
+        DamageIcon(drag_icon);
         icon_dragging=false;
         icon_drag_moved=false;
         drag_icon=-1;
@@ -2740,6 +2936,9 @@ void Desktop::Update(int mx,int my,bool mouse_down,bool clicked){
         RefreshFiles();
     }
 }
+
+// set by a whole-scene render while the damage scissor is enabled (satoru)
+static bool g_scis_need_full = true;
 
 //  desktopenvironment
 void DesktopEnvironment::Init(int sw,int sh){
@@ -2804,6 +3003,41 @@ static bool de_fullscreen_front(){
            fw->y <= 0 && fw->h >= Graphics::GetHeight();   // only when it covers the output (satoru)
 }
 
+// kurono.gfx.scissorguard=1 (debug): after every section of a scissored pass, check that
+// no pixel outside the pass box changed and say which section wrote it. (satoru)
+static bool g_guard_on = false;
+static uint8_t* g_guard_snap = nullptr;
+static size_t g_guard_cap = 0;
+static int g_gb[4] = {0, 0, 0, 0};
+static int g_guard_logs = 0;
+static void guard_section(const char* what) {
+    if (!g_guard_on || !g_guard_snap) return;
+    uint8_t* bb = Graphics::GetBackBuffer();
+    if (!bb) return;
+    const int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
+    const uint32_t pitch = Graphics::GetPitch();
+    uint64_t n = 0; int x0 = sw, y0 = sh, x1 = -1, y1 = -1;
+    for (int y = 0; y < sh; y++) {
+        const uint32_t* a = (const uint32_t*)(g_guard_snap + (size_t)y * pitch);
+        const uint32_t* b = (const uint32_t*)(bb + (size_t)y * pitch);
+        bool row_in = y >= g_gb[1] && y < g_gb[3];
+        for (int x = 0; x < sw; x++) {
+            if (a[x] == b[x]) continue;
+            if (row_in && x >= g_gb[0] && x < g_gb[2]) continue;
+            n++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        }
+    }
+    if (n && g_guard_logs < 24) {
+        g_guard_logs++;
+        SerialLogger::Log("[guard] section "); SerialLogger::Log(what); SerialLogger::Log(" wrote "); SerialLogger::LogDec((int)n);
+        SerialLogger::Log(" px outside the pass box ("); SerialLogger::LogDec(g_gb[0]); SerialLogger::Log(","); SerialLogger::LogDec(g_gb[1]);
+        SerialLogger::Log(")-("); SerialLogger::LogDec(g_gb[2]); SerialLogger::Log(","); SerialLogger::LogDec(g_gb[3]);
+        SerialLogger::Log("), changed bbox ("); SerialLogger::LogDec(x0); SerialLogger::Log(","); SerialLogger::LogDec(y0);
+        SerialLogger::Log(")-("); SerialLogger::LogDec(x1 + 1); SerialLogger::Log(","); SerialLogger::LogDec(y1 + 1); SerialLogger::Log(")\r\n");
+    }
+    memcpy(g_guard_snap, bb, (size_t)pitch * (size_t)sh);   // later sections are judged on their own (satoru)
+}
+
 static void de_render_full(){
     // resize self-heal FIRST, before any drawing: if the host resized the
     // qemu window the bga changed mode but a starved gui res-sync may not
@@ -2811,12 +3045,15 @@ static void de_render_full(){
     // diagonal-tear garbage). resync here on whatever process is rendering,
     // and relayout the desktop to the new size so this frame is correct. (satoru)
     if (Graphics::SyncToHardwareGeometry()) {
-        GUI::UpdateBackbuffer();
+        // the legacy GUI buffers (lockscreen/software cursor) rebuild on first
+        // use; the desktop itself draws through Graphics' own back buffer. (satoru)
         DesktopEnvironment::Init(Graphics::GetWidth(), Graphics::GetHeight());
         Graphics::MarkUIDirty();
     }
     Desktop::Render();
+    guard_section("desktop");
     WindowManager::RenderAll();
+    guard_section("windows");
     // the drag snap target tints the target region over the windows, as the
     // common desktop shells do, so it stays visible under the dragged card. (satoru)
     WindowManager::RenderSnapPreview();
@@ -2824,6 +3061,7 @@ static void de_render_full(){
     // are released to submit their next buffer. (satoru)
     WaylandServer::DispatchPendingFrames();
     if (!de_fullscreen_front()) Taskbar::Render();
+    guard_section("taskbar");
     // minimize/restore pour into and out of the taskbar tile, so it draws
     // over the taskbar rather than sliding under it. (satoru)
     WindowManager::RenderMotionOverlay();
@@ -2864,6 +3102,253 @@ void DesktopEnvironment::Render(){
     }
 
     de_render_full();
+    // a whole-scene render (boot film, a modal, the shell pump without the
+    // scissor) leaves translucent layers blended over themselves outside the
+    // damage: the next scissored frame starts from a full repaint. (satoru)
+    if (Graphics::ScissorEnabled()) g_scis_need_full = true;
+}
+
+// ── damage scissor rendering (kurono.gfx.scissor=1) ─────────────────
+// the old frame drew the whole scene and presented only the damage, and the
+// wallpaper damage-only pass (kurono.wpdamage=1) repainted the wallpaper only
+// there, so translucent layers (menu bar, dock, shadows) were blended again
+// over themselves everywhere else: the back buffer drifted away from what was
+// presented, and any later copy of those pixels (a full present, the page
+// flip's repair copy) showed the drift. here a frame is drawn in passes. a
+// round takes the damage not yet repainted this frame, groups it into a few
+// boxes (rects whose common box wastes little area are merged) and repaints
+// each box from the wallpaper up with every draw confined to it, marking the
+// box for the present. damage a round adds outside what is already repainted
+// (an animation, a hover) gets the next round; after 3 rounds, or when the
+// boxes cover most of the screen, the pass is the whole screen. a frame with
+// no damage at all gets a probe pass with an empty box, which draws nothing
+// but lets the scene mark what it wants to change. a dragged window is moved
+// by copy first (WindowManager::DragMoveByCopy). (satoru)
+namespace {
+struct DeBox { int x0, y0, x1, y1; };
+inline bool de_box_has(const DeBox& b, const Graphics::Rect& r) {
+    return r.x >= b.x0 && r.y >= b.y0 && r.x + r.w <= b.x1 && r.y + r.h <= b.y1;
+}
+inline uint64_t de_area(const DeBox& b) { return (uint64_t)(b.x1 - b.x0) * (uint64_t)(b.y1 - b.y0); }
+inline DeBox de_union(const DeBox& a, const DeBox& b) {
+    return DeBox{ a.x0 < b.x0 ? a.x0 : b.x0, a.y0 < b.y0 ? a.y0 : b.y0,
+                  a.x1 > b.x1 ? a.x1 : b.x1, a.y1 > b.y1 ? a.y1 : b.y1 };
+}
+constexpr int DE_MAX_BOXES = 4;     // passes per round: each one walks the whole scene (satoru)
+constexpr int DE_MAX_DONE = 16;
+
+// group rects into at most DE_MAX_BOXES boxes: merge the pair whose common
+// box adds the least area, while that is small or there are too many. (satoru)
+int de_cluster(DeBox* bx, int n) {
+    for (;;) {
+        if (n <= 1) return n;
+        int bi = 0, bj = 1;
+        uint64_t best = ~0ull;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) {
+                uint64_t u = de_area(de_union(bx[i], bx[j]));
+                uint64_t s = de_area(bx[i]) + de_area(bx[j]);
+                uint64_t waste = u > s ? u - s : 0;
+                if (waste < best) { best = waste; bi = i; bj = j; }
+            }
+        if (n <= DE_MAX_BOXES && best > 16384) return n;
+        bx[bi] = de_union(bx[bi], bx[bj]);
+        bx[bj] = bx[n - 1];
+        n--;
+    }
+}
+}
+
+static uint64_t g_scis_area = 0;     // pixels the last frame's passes repainted (satoru)
+static bool g_scis_full = false;
+static bool g_scis_copied = false;
+void DesktopEnvironment::LastScissorStats(uint64_t* area_px, bool* full) {
+    if (area_px) *area_px = g_scis_area;
+    if (full) *full = g_scis_full;
+}
+
+// the gfx oracle's reference frame: the whole scene drawn by the default
+// renderer (the scissor flag is off while it runs), nothing presented. (satoru)
+void DesktopEnvironment::RenderReference() {
+    bool was = Graphics::ScissorEnabled();
+    Graphics::SetScissorEnabled(false);
+    bool gg = g_guard_on; g_guard_on = false;
+    de_render_full();
+    g_guard_on = gg;
+    Graphics::SetScissorEnabled(was);
+}
+
+void DesktopEnvironment::SetScissorGuard(bool on) { g_guard_on = on; }
+
+int DesktopEnvironment::RenderScissored() {
+    const int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
+    g_scis_area = 0;
+    g_scis_full = false;
+    // damage the scene would only add while drawing: the vacated software
+    // cursor and the old footprint of a moved window. (satoru)
+    Mouse::DamageLastSoftware();
+    WindowManager::CollectLastPaintedDamage();
+    // what overlays drew over the scene last frame (a menu, the control center,
+    // a toast, a dock tooltip) is repainted from below this frame: when one closes
+    // or moves nothing else marks the place it vacated, and it stayed on screen. (satoru)
+    static Graphics::Rect s_self_prev[32];
+    static int s_self_prev_n = 0;
+    (void)Graphics::TakeScissorSelfDamage(nullptr, 0);
+    if (Graphics::ScissorSelfCarry())
+    for (int i = 0; i < s_self_prev_n; i++)
+        Graphics::MarkDirty(s_self_prev[i].x, s_self_prev[i].y, s_self_prev[i].w, s_self_prev[i].h);
+    if (g_scis_need_full) { g_scis_need_full = false; Graphics::MarkFullScreenDirty(); }
+    int cx = 0, cy = 0, cw = 0, ch = 0;
+    g_scis_copied = WindowManager::DragMoveByCopy(&cx, &cy, &cw, &ch);
+    DeBox done[DE_MAX_DONE];
+    int ndone = 0, passes = 0, rounds = 0;
+    bool probed = false, full = false;
+    while (!full) {
+        Graphics::Rect rr[32];
+        int n = Graphics::GetFrameDamage(rr, 32);
+        DeBox bx[32];
+        int nb = 0;
+        for (int i = 0; i < n; i++) {
+            Graphics::Rect r = rr[i];
+            if (r.x < 0) { r.w += r.x; r.x = 0; }
+            if (r.y < 0) { r.h += r.y; r.y = 0; }
+            if (r.x + r.w > sw) r.w = sw - r.x;
+            if (r.y + r.h > sh) r.h = sh - r.y;
+            if (r.w <= 0 || r.h <= 0) continue;
+            bool covered = false;
+            for (int k = 0; k < ndone && !covered; k++) covered = de_box_has(done[k], r);
+            if (!covered) bx[nb++] = DeBox{ r.x, r.y, r.x + r.w, r.y + r.h };
+        }
+        if (nb == 0) {
+            if (passes > 0 || probed) break;
+            probed = true;
+            passes++;
+            Graphics::SetScissor(0, 0, 0, 0);
+            de_render_full();
+            Graphics::ClearScissor();
+            continue;
+        }
+        if (Graphics::ScissorDebug() && GfxBench::Running()) {
+            static int s_raw = 0;
+            if (rounds > 0 && s_raw < 48) {
+                for (int i = 0; i < nb && i < 6; i++, s_raw++) {
+                    SerialLogger::Log("[scissor] round ");
+                    SerialLogger::LogDec(rounds);
+                    SerialLogger::Log(" new damage (");
+                    SerialLogger::LogDec(bx[i].x0); SerialLogger::Log(","); SerialLogger::LogDec(bx[i].y0);
+                    SerialLogger::Log(")-(");
+                    SerialLogger::LogDec(bx[i].x1); SerialLogger::Log(","); SerialLogger::LogDec(bx[i].y1);
+                    SerialLogger::Log(rounds == 1 && g_scis_copied ? ") after a copy\r\n" : ")\r\n");
+                }
+            }
+        }
+        nb = de_cluster(bx, nb);
+        uint64_t tot = 0;
+        for (int i = 0; i < nb; i++) tot += de_area(bx[i]);
+        full = rounds >= 3 || ndone + nb > DE_MAX_DONE || tot * 5 >= (uint64_t)sw * (uint64_t)sh * 3;
+        if (full) { nb = 1; bx[0] = DeBox{ 0, 0, sw, sh }; Graphics::MarkFullScreenDirty(); }
+        if (rounds > 0 && Graphics::ScissorDebug() && GfxBench::Running()) {
+            static int s_dbg = 0;
+            for (int i = 0; i < nb && s_dbg < 64; i++, s_dbg++) {
+                SerialLogger::Log("[scissor] round ");
+                SerialLogger::LogDec(rounds);
+                SerialLogger::Log(" box (");
+                SerialLogger::LogDec(bx[i].x0); SerialLogger::Log(","); SerialLogger::LogDec(bx[i].y0);
+                SerialLogger::Log(")-(");
+                SerialLogger::LogDec(bx[i].x1); SerialLogger::Log(","); SerialLogger::LogDec(bx[i].y1);
+                SerialLogger::Log(full ? ") full\r\n" : ")\r\n");
+            }
+        }
+        // mark every box of the round first: the boxes of this round count as
+        // repainted for the marks the scene makes while drawing them. (satoru)
+        if (!full) for (int i = 0; i < nb; i++) Graphics::MarkDirty(bx[i].x0, bx[i].y0, bx[i].x1 - bx[i].x0, bx[i].y1 - bx[i].y0);
+        for (int i = 0; i < nb; i++) {
+            Graphics::SetScissor(bx[i].x0, bx[i].y0, bx[i].x1 - bx[i].x0, bx[i].y1 - bx[i].y0);
+            if (g_guard_on) {
+                size_t need = (size_t)Graphics::GetPitch() * (size_t)sh;
+                if (g_guard_cap < need) { g_guard_snap = (uint8_t*)PMM::AllocBytes(need); g_guard_cap = g_guard_snap ? need : 0; }
+                if (g_guard_snap && Graphics::GetBackBuffer()) memcpy(g_guard_snap, Graphics::GetBackBuffer(), need);
+                g_gb[0] = bx[i].x0; g_gb[1] = bx[i].y0; g_gb[2] = bx[i].x1; g_gb[3] = bx[i].y1;
+            }
+            de_render_full();
+            Graphics::ClearScissor();
+            passes++;
+            g_scis_area += de_area(bx[i]);
+            if (ndone < DE_MAX_DONE) done[ndone++] = bx[i];
+        }
+        rounds++;
+    }
+    g_scis_full = full;
+    s_self_prev_n = Graphics::TakeScissorSelfDamage(s_self_prev, 32);   // (satoru)
+    // the moved window's new place goes to the present; it was not repainted. (satoru)
+    if (g_scis_copied && !full) Graphics::MarkDirty(cx, cy, cw, ch);
+    // kurono.gfx.scissorverify=N: every Nth frame, keep what the passes (and a
+    // move by copy) produced, repaint the whole frame from scratch and compare.
+    // a difference means the partial frame was wrong, not just unpresented;
+    // the box is logged. the full frame is what gets presented. (satoru)
+    int every = Graphics::ScissorVerifyEvery();
+    if (every > 0 && !full) {
+        static uint32_t s_n = 0, s_ok = 0, s_bad = 0;
+        static uint8_t* s_ref = nullptr;
+        static size_t s_ref_bytes = 0;
+        uint8_t* bb = Graphics::GetBackBuffer();
+        size_t need = (size_t)Graphics::GetPitch() * (size_t)sh;
+        // time driven animations would differ between the two renders, and a
+        // resting software arrow stays in the back buffer on purpose (it is
+        // drawn over every frame): those are not checked. (satoru)
+        bool moving = WindowManager::HasActiveAnimations() || Taskbar::IsAnimating() || Desktop::IsAnimating() ||
+                      ControlCenter::IsAnimating() || NotificationManager::ActiveCount() > 0 || KSS::Anim::Active();
+        if (bb && !moving && (++s_n % (uint32_t)every) == 0 && Graphics::GetBpp() == 32) {
+            if (s_ref_bytes < need) {
+                if (s_ref) PMM::FreeBytes(s_ref, s_ref_bytes);
+                s_ref = (uint8_t*)PMM::AllocBytes(need);
+                s_ref_bytes = s_ref ? need : 0;
+            }
+            if (s_ref) {
+                memcpy(s_ref, bb, need);
+                Graphics::MarkFullScreenDirty();
+                Graphics::SetScissor(0, 0, sw, sh);
+                de_render_full();
+                Graphics::ClearScissor();
+                uint32_t pitch = Graphics::GetPitch();
+                uint32_t nd = 0;
+                int x0 = sw, y0 = sh, x1 = -1, y1 = -1;
+                int ax = -100, ay = -100;
+                if (!Mouse::LastSoftwarePos(ax, ay)) { ax = -100; ay = -100; }
+                for (int y = 0; y < sh; y++) {
+                    const uint32_t* a = (const uint32_t*)(s_ref + (size_t)y * pitch);
+                    const uint32_t* b = (const uint32_t*)(bb + (size_t)y * pitch);
+                    for (int x = 0; x < sw; x++) {
+                        if (a[x] == b[x]) continue;
+                        if (x >= ax - 1 && x < ax + 13 && y >= ay - 1 && y < ay + 17) continue;
+                        nd++;
+                        if (x < x0) x0 = x;
+                        if (x > x1) x1 = x;
+                        if (y < y0) y0 = y;
+                        if (y > y1) y1 = y;
+                    }
+                }
+                if (nd) s_bad++; else s_ok++;
+                if (nd && s_bad <= 24) {
+                    SerialLogger::Log("[scissor] verify MISMATCH ");
+                    SerialLogger::LogDec((int)nd);
+                    SerialLogger::Log(" px in (");
+                    SerialLogger::LogDec(x0); SerialLogger::Log(","); SerialLogger::LogDec(y0);
+                    SerialLogger::Log(")-(");
+                    SerialLogger::LogDec(x1 + 1); SerialLogger::Log(","); SerialLogger::LogDec(y1 + 1);
+                    SerialLogger::Log(g_scis_copied ? ") on a move-by-copy frame\r\n" : ")\r\n");
+                }
+                if (((s_ok + s_bad) % 50) == 0) {
+                    SerialLogger::Log("[scissor] verify: ");
+                    SerialLogger::LogDec((int)s_ok);
+                    SerialLogger::Log(" frames equal to a full repaint, ");
+                    SerialLogger::LogDec((int)s_bad);
+                    SerialLogger::Log(" differ\r\n");
+                }
+            }
+        }
+    }
+    return passes;
 }
 
 // double-click tracking state
@@ -2903,17 +3388,26 @@ void DesktopEnvironment::HandleInput(int mx,int my,bool mouse_down,bool clicked,
     // closed slots can sit between live windows.
     // the live switcher now steps these from InputManager::Poll. (satoru)
 
-    // printscreen: capture a timestamped screenshot on the press edge only so a
-    // held key fires once. (satoru)
+    NightLight::Tick();   // the night light schedule (satoru)
+
+    // print screen: a png of the screen (shift: the focused window) in
+    // ~/Pictures. the key press is recorded by InputManager::Poll. (satoru)
     {
-        static bool printscreen_was_down = false;
-        bool printscreen_down = Keyboard::IsKeyPressed(KEY_PRINTSCREEN);
-        if (printscreen_down && !printscreen_was_down) {
-            Screenshot::CaptureTimestamped();
-            NotificationManager::Post("Screenshot", "saved to /home/user",
-                                      NotificationManager::ICON_SUCCESS, 3000);
+        int shot = Screenshot::TakeRequest();
+        if (shot) {
+            char path[96];
+            path[0] = 0;
+            bool ok = Screenshot::CaptureToPictures(shot == 2, path, (int)sizeof(path));
+            SerialLogger::Log(ok ? "[screenshot] saved " : "[screenshot] FAILED ");
+            SerialLogger::Log(path);
+            SerialLogger::Log("\r\n");
+            const char* name = path;
+            for (const char* q = path; *q; q++) if (*q == '/') name = q + 1;
+            if (ok) NotificationManager::Post(shot == 2 ? "Window screenshot saved" : "Screenshot saved",
+                                              name, NotificationManager::ICON_SUCCESS, 3000);
+            else    NotificationManager::Post("Screenshot", shot == 2 ? "No window to capture" : "Could not save the screenshot",
+                                              NotificationManager::ICON_WARNING, 3000);
         }
-        printscreen_was_down = printscreen_down;
     }
 
     // perf hud toggle (f12) + window snapping (super+arrows), press-edge only. (satoru)
@@ -3160,6 +3654,10 @@ void DesktopEnvironment::LaunchBrowser(){
 void DesktopEnvironment::LaunchMediaPlayer(){
     // ring 3 (/system/apps/denji) when wanted, else the in-kernel video library. (satoru)
     KuiKernel::Open("denji");
+}
+void DesktopEnvironment::LaunchInstaller(){
+    // ring 3 (/system/apps/installer) when wanted, else the in-kernel kui build. (satoru)
+    KuiKernel::Open("installer");
 }
 void DesktopEnvironment::LaunchFirefox(){
     // run the full `firefox` shell flow (lazy restore / install / exec) on the

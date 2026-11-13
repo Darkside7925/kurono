@@ -21,6 +21,7 @@
 //     is present (hotplug switches to it, unplug falls back). (satoru)
 #include "usb_audio.h"
 #include "usb.h"
+#include "usb_audio_fb.h"
 #include "audio_backend.h"
 #include "audio_mixer.h"
 #include "audio_server.h"
@@ -45,6 +46,22 @@ void ua_log(const char* fmt, ...) {
         }
         ++p;
         flush();
+        // "%02d" (the fb Hz fraction): this formatter knew no width, so "%0" ate
+        // nothing, the next %s got the int and dereferenced it as a string, and
+        // every later field shifted by one. the laptop's stats line printed
+        // "48000.2d Hz<junk> ok <a string pointer> bad <the real ok count>". (satoru)
+        if (*p == '0' && p[1] >= '1' && p[1] <= '9' && p[2] == 'd') {
+            int wdt = p[1] - '0';
+            int v = va_arg(ap, int);
+            unsigned int u = v < 0 ? (unsigned int)(-(int64_t)v) : (unsigned int)v;
+            char nb[12]; int nd = 0;
+            do { nb[nd++] = (char)('0' + u % 10u); u /= 10u; } while (u && nd < 11);
+            if (v < 0) run[ri++] = '-';
+            for (int k = nd; k < wdt && ri < (int)sizeof(run) - 2; k++) run[ri++] = '0';
+            while (nd && ri < (int)sizeof(run) - 1) run[ri++] = nb[--nd];
+            p += 2;
+            continue;
+        }
         if      (*p == 'd') SerialLogger::LogDec(va_arg(ap, int));
         else if (*p == 'x') SerialLogger::LogHex((uint32_t)va_arg(ap, unsigned int));
         else if (*p == 's') SerialLogger::Log(va_arg(ap, const char*));
@@ -297,7 +314,6 @@ uint32_t g_rd = 0, g_wr = 0, g_cnt = 0;
 uint8_t* g_slots = nullptr; uint32_t g_slot_size = 0; uint32_t g_slots_bytes = 0;
 uint64_t g_q_total = 0, g_q_base = 0;
 uint32_t g_t_base = 0;
-uint64_t g_acc = 0;                                 // fractional frames, units of 1e-6 (satoru)
 uint32_t g_lead_tds = 0, g_frame_bytes = 0, g_nominal_frames = 0;
 uint32_t g_rs_pos = 0; int16_t g_rs_hist[2] = {0, 0};   // resampler state (satoru)
 volatile uint64_t g_compl_total = 0; volatile uint32_t g_last_k = 0;
@@ -305,6 +321,38 @@ volatile uint32_t g_ev_ok = 0, g_ev_underrun = 0, g_ev_overrun = 0, g_ev_missed 
 volatile uint32_t g_resyncs = 0, g_recoveries = 0, g_ev_last_cc = 0;
 volatile bool g_need_recover = false;
 uint32_t g_ring_max = 0;
+
+// ---- explicit feedback endpoint (async sink) ----
+// the device sends its clock as samples per 1 ms frame (full speed, 10.14 in
+// 3 bytes) or per 125 us microframe (high speed, 16.16 in 4 bytes). we read it
+// with an isoch IN td ring and drive the packet pacer from the smoothed value.
+// when the endpoint is missing or silent we fall back to the nominal rate (old
+// open-loop behaviour). (satoru)
+constexpr uint32_t FB_BUFS = 128;
+// tds over 12 ms at the fastest feedback interval (125 us); enough that a
+// starved input process does not leave the feedback ring empty. (satoru)
+constexpr uint32_t FB_LEAD = 96;
+uint8_t* g_fb_bufs = nullptr;                       // one page, 8 bytes per packet (satoru)
+uint32_t g_fb_len = 4;
+uint32_t g_fb_slot = 0;
+volatile uint32_t g_fb_inflight = 0;
+Spinlock g_fb_lock;
+volatile bool g_fb_open = false;
+uint32_t g_fb_period_us = 0;
+uint32_t g_fb_unit_us = 1000;                       // 1000 fs, 125 hs (satoru)
+uint32_t g_fb_freqn = 0;                            // nominal, q16.16 per unit (satoru)
+volatile uint32_t g_fb_freqm = 0;                   // smoothed, q16.16 per unit (satoru)
+int32_t  g_fb_shift = UsbAudioFb::kShiftAuto;
+volatile uint32_t g_fb_ok = 0, g_fb_bad = 0;
+volatile uint32_t g_fb_last_ms = 0;
+UsbAudioFb::Smooth g_fb_smooth;
+UsbAudioFb::Pacer  g_pacer;
+uint32_t g_unit_shift = 0;
+uint32_t g_max_frames = 0;
+uint32_t g_stats_ms = 0, g_fb_log_ms = 0;
+volatile uint64_t g_compl_seen = 0;
+volatile uint32_t g_compl_ms = 0;
+uint32_t g_stall_recoveries = 0;
 
 // service() flags, set from hooks / other contexts (satoru)
 volatile bool g_pending_attach = false, g_pending_detach = false, g_pending_restart = false;
@@ -462,18 +510,85 @@ public:
     bool Start();
     void Close();
     void Pump();
-    void OnEvent(uint64_t ptr, uint8_t cc);
+    void OnEvent(uint64_t ptr, uint8_t cc, uint32_t residual);
     bool ready_ = false;
     uint32_t queued_ = 0;
 };
 UsbAudioBackend g_be;
 
-// number of frames the next packet carries, without committing the accumulator (satoru)
-uint32_t next_packet_frames(uint64_t* acc_out) {
-    uint64_t acc = g_acc + (uint64_t)g_dev.rate * g_dev.period_us;
-    uint32_t fr = (uint32_t)(acc / 1000000u);
-    *acc_out = acc % 1000000u;
-    return fr;
+// is a recent feedback value driving the pacer? a silent or failed feedback
+// endpoint must not pin the stream to a stale rate. (satoru)
+bool feedback_fresh(uint32_t now) {
+    return g_fb_open && g_fb_smooth.Valid() && g_fb_last_ms &&
+           (uint32_t)(now - g_fb_last_ms) < 250u;
+}
+
+// the frequency in q16.16 samples per feedback frame: measured when fresh,
+// nominal otherwise (open loop). (satoru)
+uint32_t packet_freq(uint32_t now) {
+    if (feedback_fresh(now)) {
+        uint32_t f = g_fb_freqm;
+        if (f) return f;
+    }
+    return g_fb_freqn;
+}
+
+// frames the next packet would carry; the pump commits the fraction itself. (satoru)
+uint32_t next_packet_frames() {
+    uint32_t now = Timer::GetRealMs();
+    return g_pacer.Peek(packet_freq(now), g_unit_shift, g_max_frames);
+}
+
+// keep the feedback td ring topped up. every completion re-arms its own td;
+// this covers a starved input process (the events are drained there). (satoru)
+bool pump_feedback() {
+    if (!g_fb_open || !g_fb_bufs) return false;
+    bool any = false;
+    {
+        SpinLockCpuGuard guard(g_fb_lock);
+        int n = 0;
+        while (g_fb_inflight < FB_LEAD && n++ < 64) {
+            uint32_t slot = g_fb_slot % FB_BUFS;
+            uint8_t* b = g_fb_bufs + slot * 8u;
+            if (!USB::IsoQueueFb(g_dev.gid, b, g_fb_len, true)) break;
+            g_fb_slot++;
+            g_fb_inflight++;
+            any = true;
+        }
+    }
+    return any;
+}
+
+void log_usb_audio_stats(uint32_t now, uint32_t inflight, uint32_t queued_src) {
+    if (!g_stats_ms) { g_stats_ms = now; g_fb_log_ms = now; }
+    if ((uint32_t)(now - g_stats_ms) < 30000u) return;
+    g_stats_ms = now;
+    uint32_t hz100 = 0;
+    if (g_fb_open && g_fb_freqn) {
+        hz100 = (uint32_t)(((uint64_t)g_fb_freqm *
+                            (uint64_t)(1000000u / g_fb_unit_us) * 100u) >> 16);
+    }
+    ua_log("[usbaudio] stats: queued %d tds %d inflight %d underruns %d overruns %d missed %d errors %d resync %d recover %d stall %d",
+           (int)queued_src, (int)(g_q_total & 0x7FFFFFFF), (int)inflight,
+           (int)g_ev_underrun, (int)g_ev_overrun, (int)g_ev_missed, (int)g_ev_err,
+           (int)g_resyncs, (int)g_recoveries, (int)g_stall_recoveries);
+    if (g_fb_open && g_fb_smooth.Valid()) {
+        ua_log(" fb %d.%02d Hz%s ok %d bad %d", (int)(hz100 / 100), (int)(hz100 % 100),
+               feedback_fresh(now) ? "" : " (stale)", (int)g_fb_ok, (int)g_fb_bad);
+    } else if (g_fb_open) {
+        ua_log(" fb waiting ok %d bad %d", (int)g_fb_ok, (int)g_fb_bad);
+    } else if (g_dev.alt.fb_ep) {
+        ua_log(" fb open loop");
+    }
+    ua_log("\n");
+    if (g_fb_open && (uint32_t)(now - g_fb_log_ms) >= 60000u) {
+        g_fb_log_ms = now;
+        ua_log("[usbaudio] fb %d.%02d Hz (shift %d, nominal %d.%02d, ok %d bad %d)\n",
+               (int)(hz100 / 100), (int)(hz100 % 100), (int)g_fb_shift,
+               (int)(((uint64_t)g_fb_freqn * (1000000u / g_fb_unit_us) * 100u) >> 16) / 100,
+               (int)(((uint64_t)g_fb_freqn * (1000000u / g_fb_unit_us) * 100u) >> 16) % 100,
+               (int)g_fb_ok, (int)g_fb_bad);
+    }
 }
 
 bool UsbAudioBackend::Start() {
@@ -493,6 +608,17 @@ bool UsbAudioBackend::Start() {
     ip.b_interval = a.b_interval;
     if (g_dev.speed == USB_SPEED_SUPER) { ip.burst = a.burst; ip.mult = a.mult; ip.bytes_per_interval = a.bytes_per_interval; }
     else if (g_dev.speed == USB_SPEED_HIGH) { ip.burst = (uint8_t)((a.wmps >> 11) & 3); }
+    // an asynchronous sink names its explicit feedback endpoint; ask the usb
+    // driver to open it with the data endpoint (5.12.4.2). a synchronous or
+    // adaptive endpoint has no use for one. (satoru)
+    if (((a.ep_attr >> 2) & 3) == 1 && a.fb_ep && (a.fb_ep & 0x80)) {
+        ip.fb_ep_addr = a.fb_ep;
+        uint16_t fm = (uint16_t)(a.fb_wmps & 0x7FF);
+        if (fm < 3) fm = 4;
+        if (fm > 4) fm = 4;
+        ip.fb_max_packet = fm;
+        ip.fb_b_interval = a.fb_interval;
+    }
     g_dev.period_us = 0;
     // the nominal packet size tells the controller how much bandwidth to reserve (satoru)
     uint32_t fb = (uint32_t)a.nch * a.subslot;
@@ -513,6 +639,13 @@ bool UsbAudioBackend::Start() {
                (int)(nom * fb), (int)maxpay, (int)g_dev.rate, (int)period);
         return false;
     }
+    // feedback frames are 1 ms at full speed and 125 us at high speed; a data
+    // service interval covers 1 << g_unit_shift of them. (satoru)
+    g_fb_unit_us = (g_dev.speed == USB_SPEED_FULL) ? 1000u : 125u;
+    g_unit_shift = 0;
+    while ((g_fb_unit_us << g_unit_shift) < period) g_unit_shift++;
+    g_fb_freqn = UsbAudioFb::Nominal(g_dev.rate, g_dev.speed != USB_SPEED_FULL);
+    g_max_frames = fb ? (maxpay / fb) : 0;
     if (!USB::IsoOpen(g_dev.gid, ip, &g_dev.period_us)) { ua_log("[usbaudio] iso endpoint open failed\n"); return false; }
 
     bool si = ctl_out(0x01, 0x0B, a.alt, a.iface, nullptr, 0);
@@ -536,7 +669,9 @@ bool UsbAudioBackend::Start() {
 
     uint32_t lead = (uint32_t)((uint64_t)LEAD_MS * 1000u / g_dev.period_us);
     if (lead < 8) lead = 8;
-    if (lead > 400) lead = 400;
+    // the trb ring has USB_ISO_RING_TRBS - 1 usable slots; queueing past it
+    // would overwrite tds the controller still owns. (satoru)
+    if (lead > USB_ISO_RING_TRBS - 16) lead = USB_ISO_RING_TRBS - 16;
     g_lead_tds = lead;
 
     // volume / mute: pick the feature unit that feeds this stream
@@ -563,21 +698,73 @@ bool UsbAudioBackend::Start() {
         ua_log("[usbaudio] no feature unit for terminal %d: device volume not controllable\n", (int)a.term_link);
     }
 
+    // feedback endpoint: the usb driver may have refused it (bandwidth, a
+    // picky controller); IsoOpen then configured the data endpoint alone and
+    // we stay open loop. (satoru)
+    uint32_t now0 = Timer::GetRealMs();
+    bool fb_active = false;
+    {
+        SpinLockCpuGuard guard(g_fb_lock);
+        g_fb_open = false;
+        g_fb_ok = 0; g_fb_bad = 0;
+        g_fb_shift = UsbAudioFb::kShiftAuto;
+        g_fb_smooth.Reset();
+        g_fb_freqm = 0; g_fb_last_ms = 0;
+        g_fb_inflight = 0; g_fb_slot = 0;
+        g_pacer.Reset();
+        g_stats_ms = now0; g_fb_log_ms = now0;
+        g_compl_seen = 0; g_compl_ms = now0; g_stall_recoveries = 0;
+        const USBDeviceRuntime* rt = USB::GidRuntime(g_dev.gid);
+        if (rt && rt->iso_fb_dci) {
+            if (!g_fb_bufs) g_fb_bufs = (uint8_t*)PMM::AllocBytes(4096);
+            if (g_fb_bufs) {
+                for (uint32_t i = 0; i < 4096; i++) g_fb_bufs[i] = 0;
+                g_fb_len = ip.fb_max_packet ? ip.fb_max_packet : 4;
+                if (g_fb_len < 3) g_fb_len = 3;
+                if (g_fb_len > 4) g_fb_len = 4;
+                g_fb_period_us = 125u << ((a.fb_interval > 16 ? 16 : (a.fb_interval ? a.fb_interval : 1)) - 1);
+                if (g_dev.speed == USB_SPEED_FULL) g_fb_period_us = 1000u;
+                g_fb_open = true;
+                fb_active = true;
+            }
+        }
+    }
+    if (fb_active && pump_feedback()) USB::IsoKickFb(g_dev.gid);
     {
         SpinLockCpuGuard guard(AudioServer::PumpLock());
-        g_rd = g_wr = g_cnt = 0; g_acc = 0; g_q_total = g_q_base = 0; g_t_base = Timer::GetRealMs();
+        g_rd = g_wr = g_cnt = 0; g_q_total = g_q_base = 0; g_t_base = now0;
         g_compl_total = 0; g_last_k = 0; g_rs_pos = 0; g_rs_hist[0] = g_rs_hist[1] = 0;
         g_dev.open = true; ready_ = true; queued_ = 0;
+    }
+    char ext[80]; int ei = 0; ext[0] = 0;
+    if (((a.ep_attr >> 2) & 3) == 1) {
+        const char* pre = fb_active ? " (feedback endpoint read, fb interval "
+                       : (a.fb_ep ? " (feedback endpoint failed: open loop)"
+                                  : " (no feedback ep: open loop)");
+        while (*pre && ei < 70) ext[ei++] = *pre++;
+        if (fb_active) {
+            char num[8]; int ni = 0; uint32_t v = g_fb_period_us;
+            if (!v) num[ni++] = '0';
+            while (v) { num[ni++] = (char)('0' + (v % 10)); v /= 10; }
+            while (ni) ext[ei++] = num[--ni];
+            const char* suf = " us)";
+            while (*suf && ei < 78) ext[ei++] = *suf++;
+        }
+        ext[ei] = 0;
     }
     ua_log("[usbaudio] streaming ready: %d Hz, %d ch, %d bit in %d byte slots, %s endpoint, %d us interval, lead %d tds%s\n",
            (int)g_dev.rate, (int)a.nch, (int)a.bits, (int)a.subslot,
            ((a.ep_attr >> 2) & 3) == 1 ? "asynchronous" : (((a.ep_attr >> 2) & 3) == 2 ? "adaptive" : "synchronous"),
-           (int)g_dev.period_us, (int)g_lead_tds,
-           (((a.ep_attr >> 2) & 3) == 1) ? (a.fb_ep ? " (feedback ep present but NOT read: open loop)" : " (no feedback ep: open loop)") : "");
+           (int)g_dev.period_us, (int)g_lead_tds, ext);
     return true;
 }
 
 void UsbAudioBackend::Close() {
+    {
+        SpinLockCpuGuard guard(g_fb_lock);
+        g_fb_open = false;                 // completions racing the teardown are ignored (satoru)
+        g_fb_inflight = 0;
+    }
     {
         SpinLockCpuGuard guard(AudioServer::PumpLock());
         ready_ = false; g_dev.open = false;
@@ -599,6 +786,8 @@ void UsbAudioBackend::Stop() { Close(); }
 // build and queue as many tds as the lead allows (pump lock held) (satoru)
 void UsbAudioBackend::Pump() {
     if (!ready_ || !g_dev.open || !g_slots) return;
+    // feedback first: a starved input process may not have re-armed its tds.
+    if (pump_feedback()) USB::IsoKickFb(g_dev.gid);
     uint32_t now = Timer::GetRealMs();
     uint64_t est = g_q_base + ((uint64_t)(now - g_t_base) * 1000u) / g_dev.period_us;
     if (g_need_recover) { g_need_recover = false; est = g_q_total + 1; g_resyncs++; }
@@ -609,9 +798,12 @@ void UsbAudioBackend::Pump() {
     bool any = false;
     int guard = 0;
     while (inflight < g_lead_tds && guard++ < 600) {
-        uint64_t nacc;
-        uint32_t fr = next_packet_frames(&nacc);
-        if (g_cnt < fr) break;
+        // one frequency for the peek and the commit: the feedback may update
+        // on another cpu in between, and committing a larger packet than the
+        // one checked against the ring would underflow g_cnt. (satoru)
+        uint32_t freq = packet_freq(now);
+        uint32_t fr = g_pacer.Peek(freq, g_unit_shift, g_max_frames);
+        if (fr == 0 || g_cnt < fr) break;    // nothing to send: leave the phase alone (satoru)
         const UacAlt& a = g_dev.alt;
         uint8_t* slot = g_slots + (uint32_t)(g_q_total % NSLOTS) * g_slot_size;
         uint32_t o = 0;
@@ -626,12 +818,39 @@ void UsbAudioBackend::Pump() {
             }
         }
         g_cnt -= fr;
-        g_acc = nacc;
+        g_pacer.Commit(freq, g_unit_shift, g_max_frames);   // consume the fraction only now (satoru)
         bool ioc = ((g_q_total & 15) == 15);
-        if (!USB::IsoQueue(g_dev.gid, slot, o, ioc)) { g_ev_err++; break; }
+        if (!USB::IsoQueue(g_dev.gid, slot, o, ioc)) {
+            g_ev_err++;
+            g_need_recover = true;
+            break;
+        }
         g_q_total++; inflight++; any = true;
     }
     if (any) USB::IsoKick(g_dev.gid);
+
+    // endpoint wedge detector: tds are in flight but no completion event has
+    // arrived for 2.5 s (a hub TT hiccup can leave the endpoint running with
+    // a dead ring). reset it and rebaseline the pacer. (satoru)
+    if (inflight >= 2) {
+        if (g_compl_total != g_compl_seen) { g_compl_seen = g_compl_total; g_compl_ms = now; }
+        else if (g_compl_ms && (uint32_t)(now - g_compl_ms) > 2500u) {
+            ua_log("[usbaudio] no completions for 2.5 s with %d tds in flight, recovering\n", (int)inflight);
+            USB::IsoRecover(g_dev.gid);
+            if (g_fb_open) USB::IsoRecoverFb(g_dev.gid);
+            g_stall_recoveries++;
+            g_compl_ms = now;
+            g_compl_seen = g_compl_total;
+            g_need_recover = true;
+        }
+    } else {
+        g_compl_seen = g_compl_total;
+        g_compl_ms = now;
+    }
+
+    uint64_t qfr = g_cnt + inflight * g_nominal_frames;
+    qfr = qfr * AudioMixer::INTERNAL_RATE / (g_dev.rate ? g_dev.rate : 48000);
+    log_usb_audio_stats(now, (uint32_t)inflight, (uint32_t)qfr);
 }
 
 void UsbAudioBackend::Tick() {
@@ -640,7 +859,9 @@ void UsbAudioBackend::Tick() {
     uint32_t now = Timer::GetRealMs();
     uint64_t est = g_q_base + ((uint64_t)(now - g_t_base) * 1000u) / g_dev.period_us;
     uint64_t inflight = (est >= g_q_total) ? 0 : g_q_total - est;
-    uint64_t fr = g_cnt + inflight * g_nominal_frames;      // device-rate frames (satoru)
+    uint32_t per = (uint32_t)(((uint64_t)packet_freq(now) << g_unit_shift) >> 16);
+    if (!per) per = g_nominal_frames;
+    uint64_t fr = g_cnt + inflight * per;                   // device-rate frames (satoru)
     fr = fr * AudioMixer::INTERNAL_RATE / (g_dev.rate ? g_dev.rate : 48000);
     queued_ = (uint32_t)fr;
 }
@@ -649,7 +870,7 @@ bool UsbAudioBackend::Idle(bool first) {
     (void)first;
     if (!ready_) return false;
     Pump();
-    uint64_t acc; uint32_t need = next_packet_frames(&acc);
+    uint32_t need = next_packet_frames();
     if (g_cnt < need) { g_cnt = 0; g_rd = g_wr; g_rs_pos = 0; return false; }   // tail shorter than a packet: drop (satoru)
     return true;
 }
@@ -691,17 +912,51 @@ uint32_t UsbAudioBackend::Submit(const int16_t* pcm, uint32_t frames) {
     return frames;
 }
 
-void UsbAudioBackend::OnEvent(uint64_t ptr, uint8_t cc) {
+void UsbAudioBackend::OnEvent(uint64_t ptr, uint8_t cc, uint32_t residual) {
+    const USBDeviceRuntime* rt = USB::GidRuntime(g_dev.gid);
+    // feedback completion: the event names the trb, whose parameter is the
+    // packet buffer (see IsoQueueFb). parse the value, smooth it into the
+    // pacer input and re-arm the td. (satoru)
+    {
+        SpinLockCpuGuard guard(g_fb_lock);
+        if (g_fb_open && rt && rt->iso_fb_ring) {
+            uint64_t fb_base = (uint64_t)(uintptr_t)rt->iso_fb_ring;
+            if (ptr >= fb_base && ptr < fb_base + 4096ull) {
+                const xHCI_TRB* trb = (const xHCI_TRB*)(uintptr_t)ptr;
+                uint8_t* buf = (uint8_t*)(uintptr_t)trb->parameter;
+                bool ok = (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PKT);
+                uint32_t got = 0;
+                if (ok && buf && g_fb_len > residual) got = g_fb_len - residual;
+                uint32_t f = (got >= 3 && buf)
+                           ? UsbAudioFb::Parse(buf, got, g_fb_freqn, &g_fb_shift) : 0;
+                bool requeue = false;
+                if (g_fb_inflight) g_fb_inflight--;
+                if (f) {
+                    g_fb_freqm = g_fb_smooth.Update(f);
+                    g_fb_last_ms = Timer::GetRealMs();
+                    g_fb_ok++;
+                } else {
+                    g_fb_bad++;
+                }
+                if (buf && g_fb_inflight < FB_LEAD &&
+                    USB::IsoQueueFb(g_dev.gid, buf, g_fb_len, true)) {
+                    g_fb_inflight++;
+                    requeue = true;
+                }
+                if (requeue) USB::IsoKickFb(g_dev.gid);
+                return;
+            }
+        }
+    }
     g_ev_last_cc = cc;
     if (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PKT) g_ev_ok++;
     else if (cc == 14) { g_ev_underrun++; g_need_recover = true; }
     else if (cc == 15) { g_ev_overrun++; g_need_recover = true; }
     else if (cc == 23) { g_ev_missed++; g_need_recover = true; }
     else { g_ev_err++; g_need_recover = true; }
-    const USBDeviceRuntime* rt = USB::GidRuntime(g_dev.gid);
     if (rt && rt->iso_ring) {
         uint64_t base = (uint64_t)(uintptr_t)rt->iso_ring;
-        if (ptr >= base && ptr < base + 4096ull * 2) {
+        if (ptr >= base && ptr < base + 4096ull) {
             uint32_t k = (uint32_t)((ptr - base) / 16);
             uint32_t last = g_last_k;
             uint32_t delta = (k + (USB_ISO_RING_TRBS - 1) - last) % (USB_ISO_RING_TRBS - 1);
@@ -760,7 +1015,22 @@ void UsbAudioBackend::Describe(char* out, int max_len) const {
     app_str(out, p, max_len, " other "); app_num(out, p, max_len, g_ev_err);
     app_str(out, p, max_len, " resync "); app_num(out, p, max_len, g_resyncs);
     app_str(out, p, max_len, " recover "); app_num(out, p, max_len, g_recoveries);
+    app_str(out, p, max_len, " stall "); app_num(out, p, max_len, g_stall_recoveries);
     app_str(out, p, max_len, "\n");
+    if (g_fb_open) {
+        uint32_t hz100 = (uint32_t)(((uint64_t)g_fb_freqm *
+                                     (uint64_t)(1000000u / g_fb_unit_us) * 100u) >> 16);
+        app_str(out, p, max_len, "  feedback: ");
+        app_num(out, p, max_len, hz100 / 100);
+        app_str(out, p, max_len, ".");
+        { uint32_t f = hz100 % 100; if (f < 10) app_str(out, p, max_len, "0"); }
+        app_num(out, p, max_len, hz100 % 100);
+        app_str(out, p, max_len, " Hz (ok "); app_num(out, p, max_len, g_fb_ok);
+        app_str(out, p, max_len, " bad "); app_num(out, p, max_len, g_fb_bad);
+        app_str(out, p, max_len, ")\n");
+    } else if (a.fb_ep) {
+        app_str(out, p, max_len, "  feedback: open loop (endpoint not active)\n");
+    }
 }
 
 // ---- probe on attach ----
@@ -781,9 +1051,25 @@ bool read_name(int gid, uint8_t istr, char* out, int cap) {
 uint8_t g_cfgbuf[2048];
 UacCfg  g_parsed;
 
+// a second playback device we are not driving, kept so an unplug of the active
+// one can fall back to it. -1 when there is none. (satoru)
+int g_spare_gid = -1;
+
+// a device with a microphone input terminal (0x02xx) is a microphone with a
+// monitor output: it ranks below a plain playback device. (satoru)
+int dev_rank(const UacCfg& c) {
+    for (int i = 0; i < c.nit; i++) if ((c.it[i].type & 0xFF00) == 0x0200) return 1;
+    return 2;
+}
+
 void on_attach(int gid, bool attach) {
     if (!attach) {
+        if (gid == g_spare_gid) g_spare_gid = -1;
         if (g_dev.have && gid == g_dev.gid) {
+            {
+                SpinLockCpuGuard guard(g_fb_lock);
+                g_fb_open = false; g_fb_inflight = 0;
+            }
             {
                 SpinLockCpuGuard guard(AudioServer::PumpLock());
                 g_be.ready_ = false; g_dev.open = false; g_dev.have = false;
@@ -793,7 +1079,7 @@ void on_attach(int gid, bool attach) {
         }
         return;
     }
-    if (g_dev.have) { ua_log("[usbaudio] second audio device ignored (gid %d)\n", gid); return; }
+    if (g_dev.have && gid == g_dev.gid) return;
     const USBDeviceInfo* info = USB::GidInfo(gid);
     if (!info) return;
     ua_log("[usbaudio] audio interface on gid %d (ctl %d port %d, %x:%x)\n", gid, gid / USB_MAX_DEVICES,
@@ -834,6 +1120,26 @@ void on_attach(int gid, bool attach) {
     }
     if (best_cfg < 0) { ua_log("[usbaudio] no usable playback configuration on this device\n"); return; }
 
+    // a second device. plugged in while the system is up, it takes over: the
+    // user just connected it and expects to hear it (headphones plugged in next
+    // to a usb microphone used to stay silent forever). the one exception is a
+    // microphone arriving next to a real playback device. during boot the first
+    // device keeps the stream unless the new one is a better class. (satoru)
+    if (g_dev.have) {
+        int rn = dev_rank(chosen), rc = dev_rank(g_dev.cfg);
+        bool take = g_audio_up ? (rn >= rc) : (rn > rc);
+        if (!take) {
+            ua_log("[usbaudio] second audio device kept as a spare (gid %d, class %d, active class %d)\n", gid, rn, rc);
+            g_spare_gid = gid;
+            return;
+        }
+        ua_log("[usbaudio] switching from %s (gid %d) to the new device (gid %d)\n", g_dev.name, g_dev.gid, gid);
+        g_spare_gid = g_dev.gid;
+        g_be.Close();
+        SpinLockCpuGuard guard(AudioServer::PumpLock());
+        g_dev.have = false;
+    }
+
     // the hid/bulk code configured configuration 0 already; switching drops those endpoints (satoru)
     if (!USB::GidSetConfig(gid, chosen.cfg_value)) { ua_log("[usbaudio] SET_CONFIGURATION %d failed\n", (int)chosen.cfg_value); return; }
 
@@ -855,9 +1161,8 @@ void on_attach(int gid, bool attach) {
 }
 
 void on_iso_event(int gid, uint64_t ptr, uint8_t cc, uint32_t residual) {
-    (void)residual;
     if (!g_dev.have || gid != g_dev.gid) return;
-    g_be.OnEvent(ptr, cc);
+    g_be.OnEvent(ptr, cc, residual);
 }
 
 void on_service() {
@@ -871,17 +1176,45 @@ void on_service() {
             g_recoveries++;
             g_need_recover = true;
         }
+        if (g_fb_open) {
+            uint32_t fst = USB::IsoEpStateFb(g_dev.gid);
+            if (fst == 2 || fst == 3 || fst == 4) {
+                ua_log("[usbaudio] feedback endpoint state %d, recovering\n", (int)fst);
+                USB::IsoRecoverFb(g_dev.gid);
+                g_recoveries++;
+            }
+        }
     }
     if (g_pending_attach && g_audio_up) {
         g_pending_attach = false;
-        if (!g_user_pref_set && AudioServer::ActiveBackend() != &g_be) {
-            ua_log("[usbaudio] device present: switching the mixer to it\n");
-            AudioServer::UseBackend("usbaudio");
+        // when usb audio is already the active backend the stream has to be
+        // opened on the new device too: after a device switch, or a replug
+        // with no other backend to fall back to. (satoru)
+        bool active = AudioServer::ActiveBackend() == &g_be;
+        if (active || !g_user_pref_set) {
+            ua_log(active ? "[usbaudio] new device: opening the stream on it\n"
+                          : "[usbaudio] device present: switching the mixer to it\n");
+            if (!AudioServer::UseBackend("usbaudio") && g_spare_gid >= 0 && USB::GidValid(g_spare_gid)) {
+                int sp = g_spare_gid;
+                g_spare_gid = -1;
+                ua_log("[usbaudio] the new device did not start, back to gid %d\n", sp);
+                {
+                    SpinLockCpuGuard guard(AudioServer::PumpLock());
+                    g_be.ready_ = false; g_dev.open = false; g_dev.have = false;
+                }
+                on_attach(sp, true);
+            }
         }
     }
     if (g_pending_detach) {
         g_pending_detach = false;
-        if (AudioServer::ActiveBackend() == &g_be) {
+        if (!g_dev.have && g_spare_gid >= 0 && USB::GidValid(g_spare_gid)) {
+            int sp = g_spare_gid;
+            g_spare_gid = -1;
+            ua_log("[usbaudio] falling back to the other usb audio device (gid %d)\n", sp);
+            on_attach(sp, true);
+        }
+        if (!g_dev.have && AudioServer::ActiveBackend() == &g_be) {
             ua_log("[usbaudio] falling back to another backend\n");
             static const char* const fb[] = { "hda", "ac97", "sb16", "pcspk" };
             for (unsigned i = 0; i < sizeof(fb) / sizeof(fb[0]); i++) if (AudioServer::UseBackend(fb[i])) break;
@@ -1028,6 +1361,27 @@ bool SelfTest() {
     expect(!ok3 && c3.ver == 3 && c3.best < 0, "uac3 recognised and rejected");
     // a device with a uac3 config and a uac2 config must resolve to the uac2 one
     expect(c2.best_score > c3.best_score, "uac2 config outranks uac3 config");
+
+    // feedback math: 10.14 in 3 bytes and 16.16 in 4 bytes must both land on
+    // the nominal value, and the pacer must produce the right long-run count.
+    {
+        uint8_t b3[3] = { 0x00, 0x00, 0x0C };             // 48.0 in 10.14 (satoru)
+        int32_t sh = UsbAudioFb::kShiftAuto;
+        uint32_t f = UsbAudioFb::Parse(b3, 3, UsbAudioFb::Nominal(48000, false), &sh);
+        expect(f == 0x300000u && sh == 2, "feedback 10.14 parsed to 48.0");
+        uint8_t b4[4] = { 0x00, 0x00, 0x06, 0x00 };       // 6.0 per uframe, 16.16 (satoru)
+        sh = UsbAudioFb::kShiftAuto;
+        f = UsbAudioFb::Parse(b4, 4, UsbAudioFb::Nominal(48000, true), &sh);
+        expect(f == 0x60000u && sh == 0, "feedback 16.16 parsed to 6.0 per uframe");
+        UsbAudioFb::Pacer pace;
+        uint32_t total = 0;
+        uint32_t fr = UsbAudioFb::Nominal(48000, false);
+        for (int i = 0; i < 60000; i++) {
+            total += pace.Peek(fr, 0, 0xFFFF);
+            pace.Commit(fr, 0, 0xFFFF);
+        }
+        expect(total == 2880000u, "feedback pacer 48 kHz for 60 s");
+    }
     ua_log("[uactest] %s (%d failures)\n", g_fails ? "FAILED" : "PASSED", g_fails);
     return g_fails == 0;
 }

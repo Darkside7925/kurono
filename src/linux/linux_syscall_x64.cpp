@@ -15,6 +15,7 @@
 
 #include "linux_syscall.h"
 #include "../drivers/serial.h"
+#include "../drivers/cpu_detect.h"   // bounded cpuid feature checks (satoru)
 #include "../drivers/timer.h"
 #include "../hal/hal.h"
 #include "../kernel/userspace.h"
@@ -24,6 +25,7 @@
 #include "../proc/smp.h"         // cpu index in the [ff] trace (satoru)
 #include "../kernel/udf.h"       // SYS_UDF_CALL -> user driver framework proxy (satoru)
 #include "../kernel/kld_broker.h" // SYS_KLD_CALL -> linux-driver container pci broker (satoru)
+#include "../drivers/audio_r3.h" // SYS_KAUD_CALL -> ring-3 audio daemon broker (satoru)
 #include "../drivers/timer.h"    // GetRealMs64 for clock_nanosleep ABSTIME (satoru)
 #include "../kernel/time.h"      // RealtimeBaseSeconds for REALTIME abs targets (satoru)
 #include "../kernel/pmm.h"       // sysinfo ram totals (satoru)
@@ -73,11 +75,7 @@ static void chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out
 // hardware entropy, cpuid-gated. cf=1 means the value is valid. (satoru)
 static bool cpu_rdseed64(uint64_t* v) {
     static int has = -1;
-    if (has < 0) {
-        uint32_t a, b, c, d;
-        asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7u), "c"(0u));
-        has = (b >> 18) & 1u;   // ebx bit 18 = rdseed (satoru)
-    }
+    if (has < 0) has = CPUDetect::HasRDSEED() ? 1 : 0;   // leaf 7 is bounds-checked there (satoru)
     if (!has) return false;
     for (int t = 0; t < 32; t++) {
         uint64_t r; uint8_t ok;
@@ -201,7 +199,7 @@ constexpr NrMap kNrMap[] = {
     {  40, LSYS_SENDFILE },      // sendfile
     {  56, LSYS_CLONE },         // clone (thread flags fail soft -> single threaded)
     {  57, LSYS_FORK },          // fork -> COW CloneUserProcess (firefox spawns content procs) (satoru)
-    {  58, LSYS_FORK },          // vfork -> aliased to fork (no parent-suspend yet) (satoru)
+    {  58, LSYS_FORK },          // vfork -> fork: shared-stack vfork broke posix_spawn (satoru)
     {  59, LSYS_EXECVE },        // execve -> sys_execve (firefox child re-execs) (satoru)
     { 247, LSYS_WAITID },        // waitid (satoru)
     {  61, LSYS_WAITPID },       // wait4 -> sys_waitpid (rusage ignored; parent reaps children) (satoru)
@@ -223,6 +221,7 @@ constexpr NrMap kNrMap[] = {
     { 13, LSYS_RT_SIGACTION },   // rt_sigaction (stores the handler table) (satoru)
     { 14, LSYS_RT_SIGPROCMASK }, // rt_sigprocmask (honours block/unblock/setmask) (satoru)
     { 15, LSYS_RT_SIGRETURN },   // rt_sigreturn (restores the sigframe) (satoru)
+    { 131, LSYS_SIGALTSTACK },   // sigaltstack (real alternate signal stacks) (satoru)
     { 24, LSYS_SCHED_YIELD },    // sched_yield -> real sibling-thread yield (satoru)
     { 73, LSYS_FLOCK },          // flock -> real whole-file advisory lock (satoru)
     { 324, LSYS_MEMBARRIER },    // membarrier -> real cross-core barrier (satoru)
@@ -354,6 +353,7 @@ constexpr NrMap kNrMap[] = {
     { 198, LSYS_LREMOVEXATTR },
     { 199, LSYS_FREMOVEXATTR },
     { 200, LSYS_TKILL },
+    { 309, LSYS_GETCPU },   // sched_getcpu() (satoru)
     { 203, LSYS_SCHED_SETAFFINITY },
     { 204, LSYS_SCHED_GETAFFINITY },
     { 212, LSYS_LOOKUP_DCOOKIE },
@@ -441,9 +441,6 @@ constexpr int kNrMapCount = sizeof(kNrMap) / sizeof(kNrMap[0]);
 // stub entry here was dead. what remains below is genuinely a correct no-op, with
 // a per-entry justification. Listed by x86_64 nr. (satoru)
 constexpr uint32_t kStubOk[] = {
-    131,  // sigaltstack - we deliver rt sigframes on the MAIN stack (no alternate
-          // signal stack); accepting the registration is correct because we simply
-          // ignore SS_ONSTACK. the caller keeps working. (satoru)
     273,  // set_robust_list - the robust-futex list is a crash-cleanup optimization
           // (the kernel walks it to release locks held by a thread that died). our
           // futex owners are dropped on thread exit anyway, so recording the list is
@@ -686,6 +683,83 @@ extern "C" int64_t SyscallEntryX64Handler(uint64_t nr,
                     SerialLogger::Log(" timeout="); SerialLogger::LogHex64(nr == 441 ? 0 : a3);
                     SerialLogger::Log("\r\n");
                 }
+            }
+        }
+    }
+    // [icuopen] corruptor hunt: every stat/lstat/newfstatat/access/open/openat
+    // whose path mentions "icu", any result, with the path (and st_size/st_mode
+    // after a successful stat). the failing ICU init stat()s the data file and
+    // gives up without ever opening it; the [fficu] probe below never saw that.
+    // (satoru)
+    if (nr == 2 || nr == 257 || nr == 4 || nr == 6 || nr == 262 || nr == 21) {
+        static int s_io_logs = 0;
+        uint64_t pp = (nr == 257 || nr == 262) ? a1 : a0;
+        if (s_io_logs < 48 && pp > 0x1000 && pp < 0x0000800000000000ULL && r != -14) {
+            const char* ps = (const char*)(uintptr_t)pp;
+            bool icu = false;
+            for (int k = 0; k < 250 && ps[k]; k++)
+                if ((ps[k] == 'i' || ps[k] == 'I') && (ps[k+1] == 'c' || ps[k+1] == 'C') && (ps[k+2] == 'u' || ps[k+2] == 'U')) { icu = true; break; }
+            if (icu) {
+                s_io_logs++;
+                LinuxProcess* lpi = LinuxSyscall::Current();
+                SerialLogger::Log("[icuopen] pid="); SerialLogger::LogDec(lpi ? (int)lpi->pid : -1);
+                SerialLogger::Log(" nr="); SerialLogger::LogDec((int)nr);
+                SerialLogger::Log(" ret="); SerialLogger::LogDec((int)r);
+                SerialLogger::Log(" path="); SerialLogger::Log(ps);
+                uint64_t sb = (nr == 4 || nr == 6) ? a1 : (nr == 262 ? a2 : 0);
+                if (r == 0 && sb > 0x1000 && sb < 0x0000800000000000ULL) {
+                    SerialLogger::Log(" st_mode=0x"); SerialLogger::LogHex(*(const uint32_t*)(uintptr_t)(sb + 24));
+                    SerialLogger::Log(" st_size="); SerialLogger::LogHex64(*(const uint64_t*)(uintptr_t)(sb + 48));
+                }
+                SerialLogger::Log("\r\n");
+            }
+        }
+    }
+    // firefox's rare early MOZ_CRASH "ICU4CLibrary::Initialize() failed": log
+    // every open/fstat/mmap/read of the icu data file (icudt*.dat) with its
+    // result, bounded, so the next occurrence shows which step failed. (satoru)
+    if (nr == 2 || nr == 257 || nr == 5 || nr == 9 || nr == 0 || nr == 17) {
+        static int s_icu_logs = 0;
+        if (s_icu_logs < 60) {
+            auto has_icudt = [](const char* s) -> bool {
+                if (!s) return false;
+                for (int k = 0; k < 250 && s[k]; k++)
+                    if (s[k] == 'i' && s[k+1] == 'c' && s[k+2] == 'u' && s[k+3] == 'd' && s[k+4] == 't') return true;
+                return false;
+            };
+            const char* hit = nullptr;
+            int fdn = -1;
+            if (nr == 2 || nr == 257) {
+                uint64_t pp = nr == 2 ? a0 : a1;
+                if (pp > 0x1000 && pp < 0x0000800000000000ULL && r != -14 && has_icudt((const char*)(uintptr_t)pp)) hit = "open";
+            } else {
+                fdn = (nr == 9) ? (int)a4 : (int)a0;
+                LinuxProcess* lpi = LinuxSyscall::Current();
+                if (lpi && fdn >= 0 && fdn < LINUX_MAX_FDS && lpi->fds[fdn].open && has_icudt(lpi->fds[fdn].path))
+                    hit = nr == 5 ? "fstat" : nr == 9 ? "mmap" : "read";
+            }
+            if (hit) {
+                s_icu_logs++;
+                LinuxProcess* lpi = LinuxSyscall::Current();
+                SerialLogger::Log("[fficu] "); SerialLogger::Log(hit);
+                SerialLogger::Log(" pid="); SerialLogger::LogDec(lpi ? (int)lpi->pid : -1);
+                SerialLogger::Log(" ret="); SerialLogger::LogHex64((uint64_t)r);
+                if (nr == 9) {
+                    SerialLogger::Log(" len="); SerialLogger::LogHex64(a1);
+                    SerialLogger::Log(" prot="); SerialLogger::LogHex((uint32_t)a2);
+                    SerialLogger::Log(" flags="); SerialLogger::LogHex((uint32_t)a3);
+                    SerialLogger::Log(" off="); SerialLogger::LogHex64(a5);
+                    if ((int64_t)r > 0 && (r & 0xFFF) == 0) {   // first 16 bytes of the mapping: the icu data header (satoru)
+                        const uint32_t* w = (const uint32_t*)(uintptr_t)r;
+                        SerialLogger::Log(" head="); SerialLogger::LogHex(w[0]); SerialLogger::Log(":"); SerialLogger::LogHex(w[1]);
+                        SerialLogger::Log(":"); SerialLogger::LogHex(w[2]); SerialLogger::Log(":"); SerialLogger::LogHex(w[3]);
+                    }
+                } else if (nr == 5 && r == 0 && a1) {
+                    SerialLogger::Log(" st_size="); SerialLogger::LogHex64(*(const uint64_t*)(uintptr_t)(a1 + 48));
+                } else if (nr == 0 || nr == 17) {
+                    SerialLogger::Log(" count="); SerialLogger::LogHex64(a2);
+                }
+                SerialLogger::Log("\r\n");
             }
         }
     }
@@ -967,7 +1041,7 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
             char*       buf  = (char*)(uintptr_t)a1;
             int         bufsiz = (int)a2;
             if (!path || !buf || bufsiz <= 0) return -22;  // -EINVAL
-            return (int64_t)LinuxSyscall::ReadlinkResolve(path, buf, bufsiz);
+            return (int64_t)LinuxSyscall::ReadlinkUser(path, buf, bufsiz);   // dst checked (satoru)
         }
         case 267: {  // readlinkat(dirfd, path, buf, bufsiz)
             // musl's readlink() routes here (dirfd=AT_FDCWD); resolve identically. (satoru)
@@ -975,7 +1049,7 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
             char*       buf  = (char*)(uintptr_t)a2;
             int         bufsiz = (int)a3;
             if (!path || !buf || bufsiz <= 0) return -22;  // -EINVAL
-            return (int64_t)LinuxSyscall::ReadlinkResolve(path, buf, bufsiz);
+            return (int64_t)LinuxSyscall::ReadlinkUser(path, buf, bufsiz);   // dst checked (satoru)
         }
         case 257: {  // openat: ignore dirfd if AT_FDCWD, route to open.
             if ((int)a0 == -100 /* AT_FDCWD */) {
@@ -1038,21 +1112,28 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
             // immediately otherwise - never oversleep a spin-backoff on the
             // 1ms promotion granularity); ms-scale sleeps truly DESCHEDULE
             // via SleepMs64 (Blocked + sleep_ticks promotion + ap park). (satoru)
-            struct Ts64 { uint64_t sec; uint64_t nsec; };
-            const Ts64* ts = (const Ts64*)a0;
-            if (!ts) return 0;
-            uint64_t ms = ts->sec * 1000ull + ts->nsec / 1000000ull;
+            struct Ts64 { int64_t sec; int64_t nsec; };
+            Ts64 ts;
+            // copy the timespec with uaccess: an unmapped pointer is EFAULT, not
+            // a kernel #PF, and the second 64-bit field is no longer misread. (satoru)
+            if (!a0 || UAccess::CopyFromUser(&ts, a0, sizeof(ts)) != 0) return -14;
+            uint64_t ms = 0;
+            int verr = LinuxSyscall::TimespecToMs(ts.sec, ts.nsec, &ms);
+            if (verr) return verr;   // -EINVAL for a bad tv_nsec / negative tv_sec (satoru)
             if (ms == 0) return LinuxSyscall::Dispatch(LSYS_SCHED_YIELD, 0, 0, 0, 0, 0);
-            return LinuxSyscall::SleepMs64(ms);
+            return LinuxSyscall::SleepMs64(ms, a1, 16);   // rem is a timespec64 (satoru)
         }
         case 230: {  // clock_nanosleep(clockid, flags, req, rem): ABSTIME
             // converts to relative, then the same yield/park split as 35. (satoru)
-            struct Ts64c { uint64_t sec; uint64_t nsec; };
-            const Ts64c* ts = (const Ts64c*)a2;
-            if (!ts) return 0;
-            uint64_t want_ms = ts->sec * 1000ull + ts->nsec / 1000000ull;
+            struct Ts64c { int64_t sec; int64_t nsec; };
+            Ts64c ts;
+            if (!a2 || UAccess::CopyFromUser(&ts, a2, sizeof(ts)) != 0) return -14;
+            uint64_t want_ms = 0;
+            int verr = LinuxSyscall::TimespecToMs(ts.sec, ts.nsec, &want_ms);
+            if (verr) return verr;
             uint64_t ms;
-            if (a1 & 1) {   // TIMER_ABSTIME (satoru)
+            bool abstime = (a1 & 1) != 0;   // TIMER_ABSTIME (satoru)
+            if (abstime) {
                 // task 22: the "now" must match the clock userspace computed the
                 // absolute target from - REALTIME (clockid 0) targets are epoch
                 // ms (vdso base + tsc), monotonic targets are GetRealMs64. (satoru)
@@ -1064,7 +1145,9 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
                 ms = want_ms;
             }
             if (ms == 0) return LinuxSyscall::Dispatch(LSYS_SCHED_YIELD, 0, 0, 0, 0, 0);
-            return LinuxSyscall::SleepMs64(ms);
+            // ABSTIME leaves rem untouched, relative mode reports the remaining
+            // time there on a signal wake. (satoru)
+            return LinuxSyscall::SleepMs64(ms, abstime ? 0 : a3, abstime ? 0 : 16);
         }
         // stat/fstat/lstat/newfstatat must NOT route through the i386 LSYS_*
         // handlers: those fill the 32-bit `struct LinuxStat`, but an x86_64
@@ -1085,9 +1168,9 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
             return r;
         }
         case 6: {    // lstat(const char* path, struct stat* statbuf)
-            // no symlinks in kvfs → identical to stat
+            // kvfs has symlinks: report the link itself (satoru)
             HAL::EnableInterrupts();
-            int64_t r = LinuxSyscall::sys_stat64(a0, a1);
+            int64_t r = LinuxSyscall::sys_lstat64(a0, a1);
             HAL::DisableInterrupts();
             return r;
         }
@@ -1110,6 +1193,29 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
                 if (UAccess::CopyToUser(a0 + __builtin_offsetof(LinuxUtsname, machine), m, sizeof(m)) != 0) return -14;
             }
             return r;
+        }
+        // time(2) and gettimeofday(2) were unmapped (ENOSYS): a static glibc program
+        // started without a vdso (busybox sh from the kurono terminal, and every
+        // applet it forks) read the clock through them, so `date` said 1970-01-01
+        // 00:00:01 and timeout/sleep deadlines broke. same source as clock_gettime
+        // REALTIME (satoru)
+        case 201: {  // time(time_t* tloc)
+            uint64_t ms = TimeManager::RealtimeBaseSeconds() * 1000ull + Timer::GetRealMs64();
+            int64_t t = (int64_t)(ms / 1000ull);
+            if (a0 && UAccess::CopyToUser(a0, &t, sizeof(t)) != 0) return -14;
+            return t;
+        }
+        case 96: {   // gettimeofday(struct timeval* tv, struct timezone* tz)
+            uint64_t ms = TimeManager::RealtimeBaseSeconds() * 1000ull + Timer::GetRealMs64();
+            if (a0) {
+                int64_t tv[2] = { (int64_t)(ms / 1000ull), (int64_t)((ms % 1000ull) * 1000ull) };
+                if (UAccess::CopyToUser(a0, tv, sizeof(tv)) != 0) return -14;
+            }
+            if (a1) {
+                int32_t tz[2] = { 0, 0 };
+                if (UAccess::CopyToUser(a1, tz, sizeof(tz)) != 0) return -14;
+            }
+            return 0;
         }
         case 99: {   // sysinfo(struct sysinfo*): the LP64 layout has 8-byte fields; the shared i386
             // handler wrote 4-byte fields so totalram read back as 0 and every runtime that sizes
@@ -1167,6 +1273,16 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
             HAL::DisableInterrupts();
             return r;
         }
+        // SYS_KAUD_CALL ("KAUD"): the ring-3 audio daemon (kurono.r3audio=1)
+        // hands its mixed output to the kernel mixer through here. Only the pid
+        // the boot runner spawned is accepted; see drivers/audio_r3.h. (satoru)
+        case 0x4B415544: {
+            HAL::EnableInterrupts();
+            Process* cur = Scheduler::GetCurrentProcess();
+            int64_t r = R3Audio::Call(cur ? cur->address_space : 0, (uint32_t)a0, a1, a2);
+            HAL::DisableInterrupts();
+            return r;
+        }
         // SYS_KLD_CALL ("KLDB"): the kernel half of the linux-driver
         // compatibility layer. An UNTRUSTED ring-3 container running unmodified
         // upstream driver code reaches hardware only through here. The ABI is
@@ -1185,6 +1301,12 @@ static int64_t SyscallEntryX64Inner(uint64_t nr,
     if (find_stub_ok(nr)) {
         return 0;
     }
+
+    // eventfd(initval) and signalfd(fd, mask, size) have no flags word: the
+    // register the shared *2/*4 handler reads as flags is leftover junk that
+    // could set O_CLOEXEC / O_NONBLOCK by accident. (satoru)
+    if (nr == 284) a1 = 0;
+    if (nr == 282) a3 = 0;
 
     uint32_t i386_nr = 0;
     if (!translate_nr(nr, &i386_nr)) {

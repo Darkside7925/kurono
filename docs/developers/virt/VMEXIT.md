@@ -11,7 +11,7 @@ The reason comes out of the VMCS `VM_EXIT_REASON` field, and a table maps it to 
 | Reason | Name | Handler |
 | --- | --- | --- |
 | 10 | CPUID | return emulated CPU info |
-| 12 | HLT | guest halted, yield to host |
+| 12 | HLT | guest halted; the vCPU's host thread sleeps until an interrupt is pending |
 | 18 | VMCALL | hypercall processing |
 | 28 | control register access | emulate CR0/CR3/CR4 writes |
 | 30 | I/O instruction | forward to virtual devices |

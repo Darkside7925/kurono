@@ -1,4 +1,7 @@
+#include "../drivers/cpu_detect.h"   // tsc rate for the countdown (satoru)
+#include "kscreen.h"   // recovery R9 red screen (satoru)
 #include "panic.h"
+#include "pmm.h"
 #include "multiboot.h"
 #include "../hal/hal.h"
 #include "../drivers/serial.h"
@@ -6,10 +9,16 @@
 #include "../fs/kvfs.h"
 #include "../proc/kernel_locks.h"   // g_vfs_lock - panic-path deadlock guard
 #include "../drivers/disklog.h"    // save the log to KURONO.LOG before the reboot (satoru)
+#include "../proc/smp.h"           // the panicking cpu for the nmi park (satoru)
 #include "../../logo.h"
+
+namespace MiniDump {
+    uint64_t PhysAddr() { return PMM::MinidumpSlot(); }
+}
 
 namespace {
     volatile bool g_panicking = false;
+    volatile uint32_t g_panic_cpu = 0xFFFFFFFFu;   // who set g_panicking (satoru)
 
     struct PanicFramebuffer {
         uint64_t addr;
@@ -60,6 +69,64 @@ namespace {
 
     PanicFramebuffer g_fb = {};
     PanicDump g_dump = {};
+    bool g_classic = false;                       // kurono.panic.classic=1 (satoru)
+    uint32_t g_recovered_stop = 0xFFFFFFFFu;     // LastRecoveredStopCode (satoru)
+
+    // recovery R9: the red ":(" screen. details=false is the instant first
+    // frame (before the dump work), true adds the technical line. (satoru)
+    // one real second for the countdown: the tsc rate the boot calibrated,
+    // else the old pause loop. (satoru)
+    static void panic_wait_1s() {
+        uint64_t f = CPUDetect::GetInfo().frequency.tsc_frequency;
+        if (f < 1000000ull || f > 20000000000ull) {
+            for (volatile uint32_t i = 0; i < 32000000u; i++) asm volatile("pause");
+            return;
+        }
+        uint32_t lo, hi;
+        __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t t0 = ((uint64_t)hi << 32) | lo;
+        for (;;) {
+            __asm__ __volatile__("pause; rdtsc" : "=a"(lo), "=d"(hi));
+            if ((((uint64_t)hi << 32) | lo) - t0 >= f) return;
+        }
+    }
+
+    __attribute__((force_align_arg_pointer))
+    static void kscreen_panic(bool details, int countdown) {
+        if (!g_fb.valid) return;
+        KScreen::Fb fb;
+        fb.addr = g_fb.addr; fb.pitch = g_fb.pitch; fb.width = g_fb.width;
+        fb.height = g_fb.height; fb.bpp = g_fb.bpp;
+        KScreen::Screen s;
+        KScreen::InitScreen(s);
+        s.tone = KScreen::TONE_RED;
+        s.headline = "Kurono ran into a problem it couldn't recover from and needs to restart.";
+        s.body = "A crash report was saved. When Kurono starts again it will show what happened.";
+        char code[16];
+        KScreen::PanicStopCode(g_dump.stop_code, code);
+        s.code = code;
+        static char tech[200];
+        int p = 0;
+        auto put = [&](const char* t) { while (t && *t && p < 190) tech[p++] = *t++; };
+        auto hex = [&](uint64_t v) {
+            static const char* h = "0123456789abcdef";
+            put("0x");
+            bool lead = true;
+            for (int i = 15; i >= 0; i--) {
+                int d = (int)((v >> (i * 4)) & 0xF);
+                if (d || !lead || i == 0) { lead = false; if (p < 190) tech[p++] = h[d]; }
+            }
+        };
+        if (details) {
+            put(g_dump.reason ? g_dump.reason : "kernel error");
+            put("  rip="); hex(g_dump.rip);
+            if (g_dump.vector == 14) { put("  cr2="); hex(g_dump.cr2); }
+        }
+        tech[p] = 0;
+        s.tech = tech;
+        s.countdown = countdown;
+        KScreen::Draw(fb, s);
+    }
 
     static inline void outb(uint16_t port, uint8_t value) {
         asm volatile("outb %0, %1" : : "a"(value), "Nd"(port));
@@ -590,7 +657,7 @@ namespace {
         __asm__ __volatile__("movq %%cr4, %0" : "=r"(l_cr4));
 
         // the dump lives at a fixed identity-mapped physical address. (satoru)
-        KuronoMiniDump* d = (KuronoMiniDump*)(uintptr_t)MiniDump::PHYS_ADDR;
+        KuronoMiniDump* d = (KuronoMiniDump*)(uintptr_t)MiniDump::PhysAddr();
         dump_memset(d, 0, sizeof(KuronoMiniDump));
 
         d->version   = 1;
@@ -659,7 +726,7 @@ namespace {
         d->magic = MiniDump::MAGIC;
         __asm__ __volatile__("sfence; wbinvd" ::: "memory");
 
-        SerialLogger::Log("KeBugCheckEx: minidump written to phys 0x1000000 (frames=");
+        SerialLogger::Log("KeBugCheckEx: minidump written (frames=");
         SerialLogger::LogDec((int)d->frame_count);
         SerialLogger::Log(", serial=");
         SerialLogger::LogDec((int)d->serial_len);
@@ -841,13 +908,42 @@ namespace {
         __asm__ __volatile__("wbinvd" ::: "memory");
     }
 
+    // wait until `secs` real seconds after t0 (tsc, interrupts off), so a slow
+    // full-screen redraw does not stretch the countdown. (satoru)
+    static void panic_wait_until(uint64_t t0, uint32_t secs) {
+        uint64_t f = CPUDetect::GetInfo().frequency.tsc_frequency;
+        if (f < 1000000ull || f > 20000000000ull) { panic_wait_1s(); return; }
+        uint32_t lo, hi;
+        for (;;) {
+            __asm__ __volatile__("pause; rdtsc" : "=a"(lo), "=d"(hi));
+            if ((((uint64_t)hi << 32) | lo) - t0 >= f * secs) return;
+        }
+    }
+
     [[noreturn]] static void reboot_or_halt() {
+        asm volatile("cli");
+        // a fault during the countdown or a reset method re-enters here: go on
+        // with the next reset method, no second countdown. (satoru)
+        static volatile uint32_t s_entered = 0;
+        if (__atomic_exchange_n(&s_entered, 1u, __ATOMIC_ACQ_REL)) HAL::PanicReset();
         // bare metal has no serial port: get the log (panic dump included) onto
         // the kurono partition before the auto reboot wipes the screen. (satoru)
         DiskLog::PanicFlush();
+        if (!g_classic && g_fb.valid) {
+            // the red screen counts down 10 real seconds, then restarts. (satoru)
+            uint32_t lo, hi;
+            __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+            uint64_t t0 = ((uint64_t)hi << 32) | lo;
+            for (int secs = 10; secs > 0; secs--) {
+                kscreen_panic(true, secs);
+                panic_wait_until(t0, (uint32_t)(11 - secs));
+            }
+            SerialLogger::Log("KeBugCheckEx: rebooting now\r\n");
+            HAL::PanicReset();
+        }
         for (uint32_t secs = 5; secs > 0; secs--) {
             render_panic_status(secs);
-            busy_delay(32000000);
+            panic_wait_1s();   // real seconds, was busy_delay(32000000) (satoru)
         }
 
         render_panic_status(0);
@@ -855,13 +951,7 @@ namespace {
         busy_delay(4000000);
 
         SerialLogger::Log("KeBugCheckEx: rebooting now\r\n");
-        HAL::Reboot();
-        while (true) {
-            vga_panic_fallback();
-            render_evacuation_screen();
-            HAL::Reboot();
-            asm volatile("pause");
-        }
+        HAL::PanicReset();   // was HAL::Reboot (efi call, no per-step log) (satoru)
     }
 }
 
@@ -869,6 +959,15 @@ namespace KernelPanic {
     // display driver restore hook, see panic.h. nullptr = none. (satoru)
     static DisplayRestoreHook g_display_restore = nullptr;
     void SetDisplayRestoreHook(DisplayRestoreHook fn) { g_display_restore = fn; }
+    void SetClassicScreen(bool on) { g_classic = on; }
+    bool Panicking() { return g_panicking; }   // (satoru)
+    uint32_t PanicCpu() { return g_panic_cpu; }   // (satoru)
+    uint32_t LastRecoveredStopCode() { return g_recovered_stop; }
+    bool GetFramebuffer(uint64_t* addr, uint32_t* pitch, uint32_t* width, uint32_t* height, uint8_t* bpp) {
+        if (!g_fb.valid) return false;
+        *addr = g_fb.addr; *pitch = g_fb.pitch; *width = g_fb.width; *height = g_fb.height; *bpp = g_fb.bpp;
+        return true;
+    }
 
     void Initialize(multiboot_info_t* mbi) {
         g_fb = {};
@@ -969,26 +1068,39 @@ namespace KernelPanic {
         g_dump.line = line;
 
         if (g_panicking) {
+            // say where the nested fault was before the dump is overwritten. (satoru)
+            SerialLogger::Log("KeBugCheckEx: reentry vector=");
+            SerialLogger::LogDec((int)g_dump.vector);
+            SerialLogger::Log(" rip=0x");
+            serial_log_hex64(g_dump.rip);
+            SerialLogger::Log("\r\n");
             g_dump.stop_code = StopCode::TRIPLE_FAULT_IMMINENT;
             g_dump.reason = "PANIC REENTRY - EMERGENCY EVACUATION";
             vga_panic_fallback();
             render_evacuation_screen();
             reboot_or_halt();
         }
+        g_panic_cpu = SMP::CpuIndex();   // before g_panicking: the nmi park reads both (satoru)
         g_panicking = true;
 
         SerialLogger::Log("KeBugCheckEx: entered, stop=0x");
         SerialLogger::LogHex(stop_code);
         SerialLogger::Log("\r\n");
 
+        // stop the other cpus, then put what is known on disk before any drawing:
+        // a draw that hangs (or a reset that never comes) must not cost the log. (satoru)
+        try_halt_other_cpus();
+        DiskLog::PanicFlush();
+
         // evacuation marker: get a bsod on screen immediately, before any
         // slower logging or secondary panic work begins.
         vga_panic_fallback();
-        render_evacuation_screen();
+        if (g_classic) render_evacuation_screen();
+        else kscreen_panic(false, -1);   // R9: red ":(" right away (satoru)
 
-        try_halt_other_cpus();
         SerialLogger::Log("KeBugCheckEx: serial_dump\r\n");
         serial_dump();
+        DiskLog::PanicFlush();   // the dump reaches KURONO.LOG before the detail screen (satoru)
 
         // always write to vga text buffer as a fallback (visible in text mode)
         vga_panic_fallback();
@@ -996,7 +1108,8 @@ namespace KernelPanic {
         SerialLogger::Log("KeBugCheckEx: render_panic_screen (fb.valid=");
         SerialLogger::Log(g_fb.valid ? "YES" : "NO");
         SerialLogger::Log(")\r\n");
-        render_panic_screen();
+        if (g_classic) render_panic_screen();
+        else kscreen_panic(true, -1);   // (satoru)
 
         // persist a full minidump to the reserved physical page so the next
         // boot can recover it after kvfs (and this panic's reboot) wipe ram. (satoru)
@@ -1027,6 +1140,12 @@ namespace KernelPanic {
 
     [[noreturn]] void BugCheckFromInterrupt(InterruptFrame* frame, const char* exception_name) {
         uint32_t code = StopCode::KERNEL_FATAL;
+        // an nmi while a panic is in progress is the panicking cpu's halt
+        // request (try_halt_other_cpus): park here, and never overwrite the
+        // dump of the real failure with this cpu's frame. (satoru)
+        if (frame && frame->vector == 2 && g_panicking) {
+            for (;;) asm volatile("cli; hlt");
+        }
         if (!frame) {
             KeBugCheckEx(code, 0, 0, 0, 0, "UNKNOWN EXCEPTION", __FILE__, (uint32_t)__LINE__);
         }
@@ -1095,13 +1214,14 @@ namespace KernelPanic {
     bool ScanCrashDumpAtBoot() {
         // the dump (if any) survives at this fixed identity-mapped physical
         // address across the panic-triggered reboot. (satoru)
-        volatile KuronoMiniDump* d = (volatile KuronoMiniDump*)(uintptr_t)MiniDump::PHYS_ADDR;
+        volatile KuronoMiniDump* d = (volatile KuronoMiniDump*)(uintptr_t)MiniDump::PhysAddr();
 
         // make sure we observe whatever the crashing kernel flushed. (satoru)
         __asm__ __volatile__("mfence" ::: "memory");
         if (d->magic != MiniDump::MAGIC) {
             return false;  // no prior crash to recover (satoru)
         }
+        g_recovered_stop = d->stop_code;
 
         // sanity-clamp the recorded size so a corrupt header can't make us copy
         // past the reserved region. (satoru)
@@ -1133,7 +1253,7 @@ namespace KernelPanic {
             KVFS::Mkdirs("/var/log");
             // KuronoMiniDump is a flat pod - cast away volatile for the copy; the
             // crashing kernel has long since finished writing it. (satoru)
-            int r = KVFS::WriteFile(path, (const void*)(uintptr_t)MiniDump::PHYS_ADDR, copy_len);
+            int r = KVFS::WriteFile(path, (const void*)(uintptr_t)MiniDump::PhysAddr(), copy_len);
             written = (r >= 0);
             if (written) {
                 SerialLogger::Log("ScanCrashDumpAtBoot: recovered crash dump to ");

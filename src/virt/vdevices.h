@@ -33,6 +33,7 @@ struct VirtualPIC {
     void WritePort(uint16_t port, uint8_t value);
     uint8_t ReadPort(uint16_t port);
     int GetHighestPriorityIRQ();      // returns irq# or -1
+    int HighestInService();           // isr line a non-specific eoi ends (satoru)
     void SetIRQ(int irq, bool level); // assert/deassert irq line
     void AcknowledgeIRQ(int irq);     // eoi
 };

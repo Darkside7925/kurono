@@ -24,7 +24,9 @@ int LoadEnvironment(char** out_envp, char* out_buf, int buf_size) {
     if (!n || n->type != KVFS_FILE || n->size == 0) return 0;
     int copy = (int)n->size;
     if (copy > buf_size - 1) copy = buf_size - 1;
-    for (int i = 0; i < copy; i++) out_buf[i] = (char)n->content[i];
+    int got = KVFS::ReadFile("/home/user/.config/kurono/firefox.env", out_buf, (uint32_t)copy);
+    if (got < 0) return 0;
+    copy = got;
     out_buf[copy] = 0;
 
     int count = 0;

@@ -15,6 +15,7 @@
 #include "v9fs.h"
 #include "../security/ksa.h"   // ksa restricted result channel (vmcall 0x4b) (satoru)
 #include "../drivers/cpu_detect.h"
+#include "../proc/smp.h"
 #include "../kernel/time.h"
 
 CPUIDOverride VMExitHandler::cpuid_overrides[MAX_CPUID_OVERRIDES];
@@ -36,6 +37,9 @@ static inline void do_cpuid(uint32_t leaf, uint32_t& eax, uint32_t& ebx,
 //  - leaf 7 invpcid: needs secondary control "enable invpcid" (sdm 25.3),
 //    otherwise invpcid is #ud in non-root mode. linux 6.18 hit exactly that
 //    in native_flush_tlb_global and panicked in setup_arch
+//  - leaf 1 ecx.monitor, leaf 5: with mwait advertised linux idles in mwait and
+//    never executes hlt; an mwait that returns at once kept the host cpu at 100%
+//    on idle (the idle loop spun through exits). hidden, the guest uses hlt (satoru)
 //  - leaf 7 waitpkg: needs "enable user wait and pause"
 //  - leaf 1 edx.apic: lapic mmio would need instruction decode, which the
 //    ept-violation path does not do (it advanced rip by an undefined
@@ -43,7 +47,9 @@ static inline void do_cpuid(uint32_t leaf, uint32_t& eax, uint32_t& ebx,
 static void MaskGuestCPUID(uint32_t leaf, uint32_t subleaf,
                            uint32_t& ebx, uint32_t& ecx, uint32_t& edx) {
     if (leaf == 1) {
-        edx &= ~(1u << 9);
+        if (Hypervisor::GuestCpus() <= 1) edx &= ~(1u << 9);     // smp guest: the lapic is emulated (satoru)
+        edx &= ~(1u << 28);                                      // no hyperthreading bit (satoru)
+        ecx &= ~(1u << 3);           // monitor/mwait (satoru)
         ecx &= ~((1u << 12) | (1u << 21) | (1u << 24) | (1u << 26) |
                  (1u << 27) | (1u << 28) | (1u << 29));
     } else if (leaf == 7 && subleaf == 0) {
@@ -79,6 +85,7 @@ void VMExitHandler::Init() {
 // the handler was missing, so linux's first __show_regs / hw_breakpoint init
 // made the vm fatal (satoru)
 static uint64_t g_guest_dr[8] = { 0, 0, 0, 0, 0, 0, 0xFFFF0FF0ULL, 0x400ULL };
+uint64_t* VMExitHandler::GuestDRs() { vCPU* c = VMM::Current(); return c ? c->dr : g_guest_dr; }
 
 static VMExitAction HandleMovDR(vCPU* cpu) {
     uint64_t q = cpu->exit_qualification;
@@ -86,16 +93,16 @@ static VMExitAction HandleMovDR(vCPU* cpu) {
     bool from_dr = (q >> 4) & 1;
     uint32_t reg = (uint32_t)((q >> 8) & 0xF);
     if (from_dr) {
-        uint64_t v = (dr == 7) ? VMM::VMRead(0x681A) : g_guest_dr[dr];
-        if (dr == 4) v = g_guest_dr[6];
+        uint64_t v = (dr == 7) ? VMM::VMRead(0x681A) : VMExitHandler::GuestDRs()[dr];
+        if (dr == 4) v = VMExitHandler::GuestDRs()[6];
         if (dr == 5) v = VMM::VMRead(0x681A);
         if (reg == 4) VMM::VMWrite(VMCS_GUEST_RSP, v);
         else cpu->regs[reg] = v;
     } else {
         uint64_t v = (reg == 4) ? VMM::VMRead(VMCS_GUEST_RSP) : cpu->regs[reg];
         if (dr == 7 || dr == 5) VMM::VMWrite(0x681A, (v & 0xFFFFFFFFULL) | 0x400ULL);
-        else if (dr == 4 || dr == 6) g_guest_dr[6] = v;
-        else g_guest_dr[dr] = v;
+        else if (dr == 4 || dr == 6) VMExitHandler::GuestDRs()[6] = v;
+        else VMExitHandler::GuestDRs()[dr] = v;
     }
     VMExitHandler::AdvanceGuestRIP(cpu);
     return VMEXIT_HANDLED;
@@ -391,6 +398,8 @@ VMExitAction VMExitHandler::HandleCPUID(vCPU* cpu) {
             cpu->regs[1] = cpuid_overrides[i].ecx;
             cpu->regs[2] = cpuid_overrides[i].edx;
             cpu->regs[3] = cpuid_overrides[i].ebx;
+            if (leaf == 1 && Hypervisor::GuestCpus() > 1) cpu->regs[2] |= (1u << 9);   // lapic present (satoru)
+            if (leaf == 1) cpu->regs[3] = (cpu->regs[3] & 0x0000FFFF) | ((uint64_t)Hypervisor::CurrentVcpu() << 24) | (1u << 16);   // apic id, 1 logical cpu (satoru)
             AdvanceGuestRIP(cpu);
             return VMEXIT_HANDLED;
         }
@@ -410,10 +419,22 @@ VMExitAction VMExitHandler::HandleCPUID(vCPU* cpu) {
     if (leaf == 0x40000000) { eax = 0x40000001; ebx = 0x4B4D564B; ecx = 0x564B4D56; edx = 0x4D; }
     else if (leaf == 0x40000001) { eax = (1u << 3) | (1u << 24); ebx = ecx = edx = 0; }
     MaskGuestCPUID(leaf, subleaf, ebx, ecx, edx);
+    if (leaf == 5 || leaf == 0xB || leaf == 0x1F) eax = ebx = ecx = edx = 0;   // flat topology from the mp table (satoru)
+    if ((leaf == 0xB || leaf == 0x1F) && Hypervisor::GuestCpus() > 1) {
+        // smp: the (x2)apic id linux reads in secondary_startup_64 to find its cpu number;
+        // one thread per core, all cores in one package (satoru)
+        uint32_t id = (uint32_t)Hypervisor::CurrentVcpu(), n = (uint32_t)Hypervisor::GuestCpus();
+        uint32_t bits = 0; while ((1u << bits) < n) bits++;
+        if (subleaf == 0) { eax = 0; ebx = 1; ecx = 0x100; }
+        else if (subleaf == 1) { eax = bits; ebx = n; ecx = 0x201; }
+        else { eax = 0; ebx = 0; ecx = subleaf; }
+        edx = id;
+    }   // no monitor/mwait leaf (satoru)
 
     // always hide vmx/svm capability from guest
     if (leaf == 1) {
         ecx &= ~CPUID_VMX_BIT;
+        ecx &= ~(1u << 3);           // monitor/mwait (satoru)
         ecx |= CPUID_HYPERVISOR_BIT; // (satoru)
     }
 
@@ -584,7 +605,15 @@ static int8_t   g_kvmclock_shift = 0;
 static uint32_t g_kvmclock_ver = 0;
 static uint64_t g_msr_kvm_systime = 0, g_msr_kvm_wall = 0;
 
-static inline uint64_t kc_rdtsc() { uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+// the guest's tsc: the host's plus the offset of the host cpu this runs on, so every vcpu sees one
+// timeline although the laptop's cpus disagree on the tsc (satoru)
+static int64_t g_tsc_off[SMP_MAX_CPUS];
+void VMExitHandler::SetTscOffset(uint32_t cpu, int64_t off) { if (cpu < SMP_MAX_CPUS) g_tsc_off[cpu] = off; }
+static inline uint64_t kc_rdtsc() {
+    uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint32_t ci = SMP::CpuIndex();
+    return (((uint64_t)hi << 32) | lo) + (uint64_t)(ci < SMP_MAX_CPUS ? g_tsc_off[ci] : 0);
+}
 
 // kvm_get_time_scale(): ns = ((tsc << shift) * mul) >> 32
 static void kc_scale(uint64_t scaled_hz, uint64_t base_hz, int8_t* pshift, uint32_t* pmul) {
@@ -703,7 +732,7 @@ VMExitAction VMExitHandler::HandleMSRRead(vCPU* cpu) {
             break;
         }
         case 0x1B:  // ia32_apic_base
-            value = 0xFEE00900; // default apic base, bsp, enabled
+            value = (Hypervisor::CurrentVcpu() == 0) ? 0xFEE00900 : 0xFEE00800; // default apic base, bsp only on cpu 0
             break;
         case 0xC0000080: // ia32_efer
             value = 0; // guest in 32-bit mode, no long mode
@@ -1037,6 +1066,43 @@ static bool EmulateMMIO(vCPU* cpu, uint64_t gpa) {
     int op = ib[p++], op2 = -1;
     if (op == 0x0F) op2 = ib[p++];
 
+    // mov al/eax/rax <-> [moffs] (A0..A3): no modrm, the absolute address
+    // follows (8 bytes in long mode). a Kurono guest's TPM probe reads the TIS
+    // registers this way and the decode failure used to kill the vm. (satoru)
+    if (op >= 0xA0 && op <= 0xA3) {
+        bool a67 = false;
+        for (int q = 0; q < p; q++) if (ib[q] == 0x67) a67 = true;
+        int alen = long_mode ? (a67 ? 4 : 8) : ((cs_d != a67) ? 4 : 2);
+        int msz = (op & 1) ? osz : 1;
+        p += alen;
+        if (p > 15) return false;
+        uint64_t* ax = &cpu->regs[0];
+        if (op >= 0xA2) {
+            uint64_t v = *ax;
+            for (int off = 0; off < msz; off += 4) {
+                int chunk = (msz - off) >= 4 ? 4 : (msz - off);
+                uint32_t w = (uint32_t)(v >> (8 * off));
+                if (chunk < 4) w &= (1u << (8 * chunk)) - 1;
+                Hypervisor::HandleGuestMMIO(gpa + off, true, (uint8_t)chunk, w);
+            }
+        } else {
+            uint64_t v = 0;
+            for (int off = 0; off < msz; off += 4) {
+                int chunk = (msz - off) >= 4 ? 4 : (msz - off);
+                uint32_t w = 0;
+                if (!Hypervisor::HandleGuestMMIO(gpa + off, false, (uint8_t)chunk, w)) w = 0xFFFFFFFFu;
+                if (chunk < 4) w &= (1u << (8 * chunk)) - 1;
+                v |= (uint64_t)w << (8 * off);
+            }
+            if (msz == 1) *ax = (*ax & ~0xFFULL) | (v & 0xFF);
+            else if (msz == 2) *ax = (*ax & ~0xFFFFULL) | (v & 0xFFFF);
+            else if (msz == 4) *ax = v & 0xFFFFFFFFULL;
+            else *ax = v;
+        }
+        VMM::VMWrite(VMCS_GUEST_RIP, VMM::VMRead(VMCS_GUEST_RIP) + (uint64_t)p);
+        return true;
+    }
+
     int size = 0;            // memory access size
     bool is_write = false, has_modrm = true, zext = false;
     int imm_len = 0;
@@ -1138,6 +1204,12 @@ VMExitAction VMExitHandler::HandleEPTViolation(vCPU* cpu) {
         qualification = cpu->vmcb->exit_info1;
     }
 
+    // lazy guest ram: first touch of a chunk (satoru)
+    if (guest_phys >= GUEST_HIGH_RAM_START &&
+        guest_phys < GUEST_HIGH_RAM_START + GuestMemoryManager::GetHighRAMSize() &&
+        Hypervisor::LazyMapRAM(guest_phys))
+        return VMEXIT_HANDLED;
+
     if (cpu->type == VIRT_INTEL_VTX && IsEmulatedMMIO(guest_phys)) {
         if (EmulateMMIO(cpu, guest_phys)) return VMEXIT_HANDLED;
         uint8_t ib[16] = {0};
@@ -1209,11 +1281,14 @@ VMExitAction VMExitHandler::HandleVMCall(vCPU* cpu) {
     uint32_t call_num = cpu->regs[0]; // eax = hypercall number
     uint32_t arg2 = cpu->regs[1];     // ecx = arg2 / sub-function
 
-    SerialLogger::Log("VMExit: VMCALL #");
-    SerialLogger::LogDec(call_num);
-    SerialLogger::Log(" sub=");
-    SerialLogger::LogHex(arg2);
-    SerialLogger::Log("\r\n");
+    // v9fs (0x20) is a bulk path, one call per 4 KB: not logged (satoru)
+    if (call_num != 0x20) {
+        SerialLogger::Log("VMExit: VMCALL #");
+        SerialLogger::LogDec(call_num);
+        SerialLogger::Log(" sub=");
+        SerialLogger::LogHex(arg2);
+        SerialLogger::Log("\r\n");
+    }
 
     // hypercall dispatch
     switch (call_num) {
@@ -1618,11 +1693,15 @@ VMExitAction VMExitHandler::HandleMonitor(vCPU* cpu) {
 }
 
 VMExitAction VMExitHandler::HandleMWait(vCPU* cpu) {
+    // a guest that mwaits anyway idles like a hlt: the host thread sleeps until an
+    // interrupt is pending instead of looping through exits (satoru)
+    Hypervisor::NoteHalt();
     AdvanceGuestRIP(cpu);
     return VMEXIT_HANDLED;
 }
 
 VMExitAction VMExitHandler::HandlePause(vCPU* cpu) {
+    Hypervisor::NoteYield();      // smp: end this vcpu's turn (satoru)
     AdvanceGuestRIP(cpu);
     return VMEXIT_CONTINUE;
 }

@@ -2,9 +2,9 @@
 
 An x86_64 operating system I'm writing from scratch in freestanding C++17 and assembly. It has its own kernel, drivers, filesystem, TCP/IP stack, compositing desktop and scripting language, plus a Linux syscall layer good enough to run real, unmodified Linux programs. There's no Linux kernel underneath and no libc in the kernel.
 
-The two programs I judge it by are Firefox 140 and the Claude Code CLI. Both are the stock binaries, and both run on it in QEMU. On my actual laptop (Legion Pro 7, Core Ultra 7 255HX) both start, but they're slow and they stall, and I'm working on that.
+The programs I judge it by are Firefox 140, the Claude Code CLI and now OpenCode. All three are the stock binaries, and all three run on it, in QEMU and on my laptop (Legion Pro 7, Core Ultra 7 255HX).
 
-> **Status:** this is part 2 of the Kurono Kintsugi update, and it isn't the last part. I'm pushing what works now. Some of it is held back because it didn't go as planned, mainly GPU acceleration, which is still off by default while I test it on real hardware. It's only been tested on one real machine. Don't run it on a computer you care about without reading [the write guard](#the-write-guard).
+> **Status:** this is part 3 of the major update: the infrastructure and support work that comes before Kurono Kintsugi. It's still not the final version. Some parts are held back because of bugs and issues I'm still working through. It's only been tested on one real machine. Don't run it on a computer you care about without reading [the write guard](#the-write-guard).
 
 ---
 
@@ -13,18 +13,32 @@ The two programs I judge it by are Firefox 140 and the Claude Code CLI. Both are
 | | In QEMU | On my laptop |
 | --- | --- | --- |
 | UEFI boot to desktop | yes | yes |
-| SMP | up to 20 CPUs tested | 8 cores by default, all 20 with `kurono.sched=2` |
+| SMP | up to 20 CPUs tested | all 20 cores by default |
 | USB keyboard and mouse | yes, also behind hubs | yes (hub support is new, still testing) |
 | NVMe | yes | yes |
 | Ethernet | e1000, 82576, I225/I226 | I226-V at 1 Gbps with DHCP |
 | Intel HD Audio | yes | ALC287, but the speakers need an amp driver Kurono doesn't have |
 | USB audio | UAC1 | AirPods Max over USB-C (UAC2) |
 | Files that survive a reboot | yes | yes |
-| Claude Code, full interface | yes | answers, but stalls for minutes |
-| Firefox 140 | painted in every recent test boot | works, loads sites, still slow on heavy ones |
+| Claude Code, full interface | yes, a 3 hour session with no freeze | runs |
+| Firefox 140 | yes, also next to Claude now | opens and loads sites |
+| OpenCode | yes, TUI and tools | not tried yet |
+| Alpine / Debian guests | yes, Alpine on 4 vCPUs | Alpine yes, Debian not tried yet |
 | Multiple monitors | yes | internal panel + DP monitor on the Intel GPU |
-| Wi-Fi | no | no |
-| GPU acceleration | flag only, off by default | held back, still testing |
+| Wi-Fi | no | BE200 through KLD |
+| GPU acceleration | flag only, off by default | flag only, off by default |
+
+### New in part 3
+
+- **OpenCode runs on Kurono.** The stock `linux-x64-musl` build, TUI and all, with its tools working. Type `opencode`. It needs musl's C++ runtime, which Kurono loads from two files on the KURONO partition.
+- **The Claude freeze is fixed.** Claude's garbage collector stops its other threads with a signal, and Kurono never woke a thread that was waiting in a futex for anything but a fatal signal. So the collector waited forever. A 3 hour Claude session full of tool calls ran with no freeze.
+- **Firefox and Claude can run at the same time.** vfork copied part of a stack back from the wrong memory, which garbled Firefox's environment whenever Claude had fragmented RAM first. 4 crashes in 12 boots before, 0 in 13 after.
+- **A pile of everyday Linux bugs.** `cat` printed nothing, `cp` made empty files, pipes dropped everything past 64 KB, symlinks didn't resolve, every file was dated 1970, `ls -a` had no `.` or `..`, `cmd & wait` hung, a folder couldn't hold more than 512 files, and `kill` on a finished job could hit a different program. All fixed.
+- **VMs got real.** Alpine runs on up to 4 parallel cores, guest RAM and disks grow as they're used, and Debian boots. Task Manager shows how much RAM the VM really uses.
+- **Building Kurono inside Kurono.** `vm kloop` builds a kernel inside the Alpine guest and boots it as a nested Kurono, with its log on the host. A PCI device can be passed through to that guest, and `kld reload` swaps a ring-3 driver without a reboot.
+- **Memory.** Big kernel allocations come straight from page frames now, so a long session keeps about 170 MB more free and Firefox gets back around 470 MB.
+- **`amdo`** is the new name for `ken` (the old names still work), and KSA has an off switch in Settings for now.
+- **GPU work on the Intel path:** fixed wrong pixels on the real iGPU, window drags copy a quarter of what they did, and there's an automated test that compares partial redraws with full ones.
 
 ### New in Kintsugi part 2
 
@@ -54,14 +68,14 @@ Getting there is mostly finding everything your kernel gets subtly wrong. See [b
 
 ### Everything else in the box
 
-- **Kernel:** hybrid design, a driver framework (KDF), an SMP scheduler (8 cores by default, all of them with `kurono.sched=2`) with per-CPU timers, and KMemX, a memory compressor (built and tested, but real boots don't compress anything yet).
+- **Kernel:** hybrid design, a driver framework (KDF), an SMP scheduler that uses every core with per-CPU timers, and KMemX, a memory compressor (built and tested, but real boots don't compress anything yet).
 - **Storage:** KFS, my own on-disk filesystem, plus ext4 and FAT32 support, NVMe, AHCI and USB mass storage.
 - **Networking:** a from-scratch TCP/IP stack with DHCP, window scaling and out-of-order reassembly.
 - **Audio:** a mixer and audio server, a PulseAudio-compatible server for Linux apps, HD Audio, USB audio.
 - **Languages:** KCL, Kurono's scripting language, plus small built-in Python and JavaScript interpreters.
 - **Shell:** 150+ commands across Kurono, Linux and Windows-flavored environments.
 - **Packages:** `kpkg`, with a boot-time update flow.
-- **Hypervisor:** a Type 1 stack with VT-x and AMD-V support. It boots Alpine Linux, and Alpine apps can show up on Kurono's desktop. Debian is still being tested. Inside most VMs it needs nested virtualization.
+- **Hypervisor:** a Type 1 stack with VT-x and AMD-V support. It boots Alpine Linux and Debian 13, and their apps can show up on Kurono's desktop. Inside most VMs it needs nested virtualization.
 
 ---
 
@@ -103,8 +117,12 @@ This isn't an installer. It's how I run it, and it assumes you're comfortable wi
 | `FIREFOX.TAR` | optional, the Firefox package, so it installs with no network | about 350 MB |
 | `CLAUDE` | optional, `package/claude` from `@anthropic-ai/claude-code-linux-x64-musl` | about 300 MB |
 | `CLAUDE.ENV` | optional, `CLAUDE_CODE_OAUTH_TOKEN=...` or `ANTHROPIC_API_KEY=...` | small |
+| `OPENCODE` | optional, the `opencode-linux-x64-musl` binary | about 210 MB |
+| `LIBSTDC.SO`, `LIBGCCS.SO` | needed by OpenCode: musl `libstdc++.so.6` and `libgcc_s.so.1` (the Firefox package has both in `firefox/lib`) | 3 MB |
+| `OPENCODE.ENV` | optional, provider keys like `ANTHROPIC_API_KEY=...` | small |
+| `ALPINE.IMG`, `DEBIAN.IMG` | optional, the Linux guests; each must be one contiguous file | 3 to 4 GB |
 
-`CLAUDE.ENV` is plain text, and anything that can read that partition can read it. You can `export` the variable in Kurono's terminal instead.
+`CLAUDE.ENV` and `OPENCODE.ENV` are plain text, and anything that can read that partition can read them. You can `export` the variable in Kurono's terminal instead.
 
 Boot it from your firmware's menu or a boot manager. If something breaks, the log is sitting in `KURONO.LOG`, and you can read it from any other OS.
 
@@ -124,17 +142,20 @@ On real hardware, Kurono refuses every disk write outside the files on its own `
 - **A kernel pointer leaked in `%rdx`.** The SysV ABI says that register is the exit handler, so every glibc binary called into kernel memory on exit.
 - **`socketpair()` gave both ends the same fd,** which is why Firefox's content process kept dying after navigation.
 - **A missing `volatile` meant no NVMe command ever completed.** The compiler hoisted the completion check out of the polling loop.
+- **One `uint32` broke SQLite.** `fcntl` kept its argument in a 32-bit variable, so every file lock read its `struct flock` from a chopped-off address. OpenCode died with "locking protocol" until that became a `uint64`.
+- **Claude learned to avoid pipes.** A blocking write into a full pipe returned "try again" instead of waiting, so anything past 64 KB got lost. Claude noticed during a long test and started working around it before I did.
+- **Every nested Kurono froze 10 seconds in.** My virtual timer chip lost its mode whenever the guest latched the counter, which Kurono does on every poll, and the virtual interrupt controller cleared the wrong interrupt. Linux guests never hit either one.
 
 ---
 
 ## What's next
 
-- GPU acceleration on Intel. It's in this push behind flags (`kurono.igpu.accel=1`, `kurono.igpu.zerocopy=1`, `kurono.wpdamage=1`), but it's off by default until it's solid on real hardware
+- GPU acceleration on Intel turned on by default
+- Hardware video decode
 - Moving more of the system out of the kernel: audio and networking next
 - KLD, so more unmodified Linux drivers run in sandboxes
 - KMemX actually compressing memory in real boots, and a much lower idle RAM use
 - Faster Firefox startup. It's about 30 s in a VM, and most of that is Firefox waiting on something
-- Wi-Fi. The BE200 needs firmware and a huge stack, so this is a long way off
 
 ## Layout
 

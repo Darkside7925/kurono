@@ -15,6 +15,7 @@
 #include "slab.h"
 #include "hrtimer.h"
 #include "panic.h"
+#include "kimage.h"   // high-linked image: mb1 32-bit pointer fields need phys (satoru)
 #include "../drivers/serial.h"
 #include "../drivers/display.h"
 #include "../drivers/graphics.h"
@@ -28,10 +29,16 @@
 #include "../ui/lockscreen.h"
 #include "../system/user_mgmt.h"
 #include "../system/claude_host.h"
+#include "../system/opencode_host.h"   // (satoru)
+#include "dbgwatch.h"   // kurono.dbgwatch (satoru)
+#include "../virt/pci_passthrough.h"   // kurono.vm.pt (satoru)
 #include "../system/installer_gui.h"
+#include "../system/installer_service.h"
 #include "../ui/font.h"
 #include "../ui/window_manager.h"
 #include "../ui/desktop.h"
+#include "../ui/gfx_bench.h"   // kurono.gfxstats / kurono.gfxbench (satoru)
+#include "../ui/gfx_oracle.h"   // kurono.gfx.oracle (satoru)
 #include "../ui/notification.h"
 #include "../apps/calculator.h"
 #include "../kui/kui_kernel.h"   // kurono.r3apps (satoru)
@@ -62,9 +69,24 @@
 #include "../system/vconsole.h"
 #include "../system/logging.h"
 #include "../system/kinit.h"          // service + init manager (satoru)
+#include "../system/power.h"           // one reboot/shutdown/sleep sequence + autosave (satoru)
 #include "kdf.h"                       // kernel driver framework (hybrid-kernel ring-0+ sandbox) (satoru)
 #include "udf.h"                       // user driver framework (ring-3 drivers via SYS_UDF_CALL) (satoru)
-#include "kld_broker.h"                // kld: pci broker for ring-3 linux driver containers (satoru)
+#include "kld_broker.h"
+#include "kld_ioapic.h"
+#include "kld_input.h"                // kld: pci broker for ring-3 linux driver containers (satoru)
+#include "kld_broker.h"                  // kld: pci broker for ring-3 linux driver containers (satoru)
+#include "../system/platform_test.h"   // kurono.platformtest (satoru)
+#include "kscreen.h"                    // stop codes for the restart notice (satoru)
+#include "../system/recovery.h"         // kurono.mode=recovery (satoru)
+#include "../system/bootcfg.h"          // boot watch + KBOOT.CFG (satoru)
+#include "../system/backlight.h"        // panel backlight probe (satoru)
+#include "../system/idle_sleep.h"       // kurono.sleep=idle (satoru)
+#include "kld_fwcfg.h"                // kld: QEMU fw_cfg wifi.conf delivery (satoru)
+#include "kld_auto.h"                     // kld: driver matched by its own pci id table (satoru)
+#include "kld_display.h"                  // kld display bridge: mode table, scanout, damage (satoru)
+#include "../linux/dri_dev.h"             // kurono.kld.dri (satoru)
+#include "memboot.h"                   // kurono.memboot=1 (satoru)
 #include "../linux/uaccess.h"          // uaccess reject counters for the uatest gate (satoru)
 #include "irp.h"                       // i/o request packet executive (stackable async i/o) (satoru)
 #include "kexec.h"                     // kernel executive (NT-style Mm/Ps/Io/Se/Cm facade) (satoru)
@@ -100,6 +122,7 @@
 #include "../proc/kernel_processes.h"
 #include "../net/network.h"
 #include "../net/tcpip.h"
+#include "../net/sntp.h"   // kurono.ntp=0 (satoru)
 #include "../net/dhcp.h"
 #include "../net/tuntap.h"
 #include "../net/ipv6.h"
@@ -108,6 +131,7 @@
 #include "../proc/cgroup.h"
 #include "../drivers/tpm.h"
 #include "../drivers/pulse_server.h"
+#include "../drivers/audio_r3.h"      // kurono.r3audio=1 ring-3 audio daemon broker (satoru)
 #include "../hal/cpufreq.h"
 #include "../system/runtime_layout.h"
 #include "../system/dbus_server.h"
@@ -121,6 +145,7 @@
 #include "../drivers/e1000.h"
 #include "../drivers/igc.h"
 #include "../system/ktools.h"      // kdrv + ksys driver control and diagnostics (satoru)
+#include "../system/agent_tools.h" // busybox applets + ksh-run on the linux PATH (satoru)
 #include "../linux/dual_boot.h"
 #include "../linux/linux_init.h"
 #include "../linux/linux_netbridge.h"
@@ -143,11 +168,13 @@
 #include "../drivers/intel_dp_aux.h"          // stage 1 dp aux dpcd/edid reads (satoru)
 #include "../drivers/intel_modeset.h"         // stage 2 external dp on pipe b (satoru)
 #include "../drivers/intel_accel.h"           // stage 3a hardware cursor, kurono.igpu.accel=1 (satoru)
+#include "../drivers/intel_gt.h"              // gt bring-up and blitter, kurono.igpu.gt=1 (satoru)
 #include "../ui/frame_pacer.h"   // panel rate + kurono.hz for the gui pacer (satoru)
 #include "../ui/ui_diag.h"   // kurono.uidiag=1 pointer/drag counters (satoru)
 #include "../../logo.h"
 #include "../media/embedded_media.h"
 #include "../virt/vm_host.h"   // background linux vm boot options (satoru)
+#include "../virt/guest_mem.h"   // kurono.vm.splitmem (satoru)
 // test rig globals, defined in hal/hal.cpp (satoru)
 extern volatile uint32_t g_ffcrash_secs;
 extern volatile uint64_t g_ffcrash_as, g_ffcrash_at;
@@ -155,6 +182,10 @@ extern volatile int g_ffreopen_left;
 // kurono.hz=N, parsed with the early flags, applied once the pacer has the
 // panel rate. 0 = not given. (satoru)
 static uint32_t g_boot_hz = 0;
+// kurono.panelhz=N: test-rig override of the detected panel/lit-output rate
+// (qemu has no panel and always reports 60, so the pacer ladder could not be
+// exercised there). 0 = not given. (satoru)
+static uint32_t g_boot_panel_hz = 0;
 
 // embedded inter ui faces (Makefile objcopy of assets/fonts). (satoru)
 extern "C" {
@@ -242,6 +273,31 @@ static bool boot_has_token(const char* cmdline, const char* token) {
         while (*p && !stspace(*p)) p++;
     }
     return false;
+}
+
+// value of a "prefix<digits>" boot token, or nullptr. (satoru)
+static const char* boot_value(const char* cmdline, const char* prefix) {
+    if (!cmdline || !prefix) return nullptr;
+    size_t pl = 0;
+    while (prefix[pl]) pl++;
+    for (const char* p = cmdline; *p; p++) {
+        if (p != cmdline && p[-1] != ' ') continue;
+        bool hit = true;
+        for (size_t i = 0; i < pl; i++)
+            if (!p[i] || p[i] != prefix[i]) { hit = false; break; }
+        if (hit) return p + pl;
+    }
+    return nullptr;
+}
+
+// tiny builders for the bench env/commands (no snprintf in this TU). (satoru)
+static char* kld_append_str(char* d, const char* s) { while (*s) *d++ = *s++; return d; }
+static char* kld_append_int(char* d, int v) {
+    char t[12]; int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v > 0) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) *d++ = t[--n];
+    return d;
 }
 
 static bool boot_get_value(const char* cmdline, const char* key, char* out, int max_out) {
@@ -932,11 +988,12 @@ static void convert_mb2_to_mb1(uint64_t mb_addr) {
                 }
                 mb2_cmdline_buf[cn] = 0;
                 mb2_compat_info.flags |= (1u << 2);
-                mb2_compat_info.cmdline = (uint32_t)(uintptr_t)mb2_cmdline_buf;
+                mb2_compat_info.cmdline = (uint32_t)KernelPhysOf(mb2_cmdline_buf);
                 break;
             }
             case 12: // efi64 system table pointer: this is a uefi boot (satoru)
                 BootAcpi::SetEfiBoot();
+                if (size >= 16) BootAcpi::SetSystemTable(*(uint64_t*)(tag + 8));
                 break;
             case 14:  // acpi 1.0 rsdp copy (satoru)
             case 15:  // acpi 2.0+ rsdp copy (satoru)
@@ -971,7 +1028,7 @@ static void convert_mb2_to_mb1(uint64_t mb_addr) {
                     dst += 24;
                 }
                 mb2_compat_info.flags |= (1u << 6);
-                mb2_compat_info.mmap_addr = (uint32_t)(uintptr_t)mb2_mmap_buf;
+                mb2_compat_info.mmap_addr = (uint32_t)KernelPhysOf(mb2_mmap_buf);
                 mb2_compat_info.mmap_length = (uint32_t)(dst - mb2_mmap_buf);
                 break;
             }
@@ -1024,16 +1081,105 @@ static volatile bool g_kinit_test_poweroff = false;
     for (;;) Scheduler::SleepMs(60000);
 }
 
+// ring-3 audio daemon supervisor (kurono.r3audio=1). spawns /usr/bin/audiod and
+// restarts it if it ever exits - a crash in the daemon costs the pulse clients
+// their connection, never the kernel. (satoru)
+static bool g_r3audiotest = false;   // kurono.r3audiotest=1: audiod plays a tone through its own socket (pulsetest.c)
+[[noreturn]] static void r3audio_runner_entry() {
+    // launched from a sleeping kernel proc, never at boot: a ring-3 process started before the
+    // gui has run starves the kernel procs that have not run yet (launching at 0.5 s and at the
+    // first gui frame both stalled the whole boot, see phase3_report.md). while firefox boots
+    // this proc wakes late (measured up to 12 s); audio is simply unavailable until it does.
+    // async spawn (agent_sched_23): with an ap online the daemon runs on the aps via
+    // Userspace::SpawnDetached - no RunProcessWithArgs frame for firefox to clobber,
+    // nothing of it on the bsp - so it can start right away instead of after a sleep
+    // this proc wakes from late. supervised by the broker heartbeat as before. (satoru)
+    if (Userspace::CanSpawnDetached()) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/audiod", "audiod");
+            if (!p) { SerialLogger::Log("[r3audio] load FAILED\r\n"); break; }
+            R3Audio::SetOwner(p->address_space);
+            const char* av[] = { "audiod", g_r3audiotest ? "selftest" : nullptr, nullptr };
+            const char* envp[] = { "PATH=/usr/bin", nullptr };
+            DetachedHandle h;
+            int sr = Userspace::SpawnDetached(p, av, envp, 0, 0, &h);
+            SerialLogger::Log("[r3audio] spawned detached rc=");
+            SerialLogger::LogDec(sr);
+            SerialLogger::Log(" t=");
+            SerialLogger::LogDec((int)Timer::GetRealMs64());
+            SerialLogger::Log("\r\n");
+            if (sr < 0) break;
+            // the leader may end on its own thread while a worker serves: the daemon
+            // counts as up while its heartbeat reaches the broker. (satoru)
+            Scheduler::SleepMs(3500);
+            while (Userspace::DetachedAlive(h) || R3Audio::DaemonAlive()) Scheduler::SleepMs(2000);
+            SerialLogger::Log("[r3audio] daemon stopped answering, restarting\r\n");
+            int rc = Userspace::ReapDetached(h);
+            SerialLogger::Log("[r3audio] audiod exited rc=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+            Scheduler::SleepMs(1000);
+        }
+        for (;;) Scheduler::SleepMs(60000);
+    }
+    Scheduler::SleepMs(1500);
+    for (int attempt = 0; attempt < 8; attempt++) {
+        SerialLogger::Log("[r3audio] launching /usr/bin/audiod\r\n");
+        Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/audiod", "audiod");
+        if (!p) { SerialLogger::Log("[r3audio] load FAILED\r\n"); break; }
+        R3Audio::SetOwner(p->address_space);
+        const char* av[] = { "audiod", g_r3audiotest ? "selftest" : nullptr, nullptr };
+        const char* envp[] = { "PATH=/usr/bin", nullptr };
+        int rc = Userspace::RunProcessWithArgs(p, av, envp);
+        SerialLogger::Log("[r3audio] audiod exited rc=");
+        SerialLogger::LogDec(rc);
+        SerialLogger::Log("\r\n");
+        // RunProcessWithArgs frames are per-cpu: another ring-3 launcher (firefox) on the same
+        // cpu can longjmp back here while the daemon is still running. only restart a dead one.
+        Scheduler::SleepMs(3500);
+        if (R3Audio::DaemonAlive()) {
+            SerialLogger::Log("[r3audio] daemon still alive, supervising\r\n");
+            while (R3Audio::DaemonAlive()) Scheduler::SleepMs(2000);
+            SerialLogger::Log("[r3audio] daemon stopped answering, restarting\r\n");
+        }
+        Scheduler::SleepMs(1000);
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
 // ring-3 wake-latency probe runner (kurono.irqlat=1). the KLD phase-0 gate:
 // "an interrupt must be able to wake a userspace thread with bounded latency".
 // RunProcessWithArgs blocks until the program exits, which is exactly why this
 // lives in its own kernel-process instead of on the gui loop. let the desktop
-// settle first so the numbers reflect a normally-loaded system, not boot. (satoru)
+// settle first so the numbers reflect a normally-loaded system, not boot.
+// kurono.irqlat.busy=N runs the contention mode: N busy ring-3 threads while a
+// thread blocks on a futex / pipe / timer (the KLD-free 2-cpu reproducer). (satoru)
+static int g_irqlat_busy = -1;   // -1 = the old single-thread probe (satoru)
+static int g_irqlat_secs = 8;
+static int g_irqlat_mode = 0;
 [[noreturn]] static void irqlat_runner_entry() {
     Scheduler::SleepMs(3000);
     Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/irqlat", "irqlat");
     if (!p) {
         SerialLogger::Log("[irqlat] load FAILED\r\n");
+    } else if (g_irqlat_busy >= 0) {
+        char b1[8], b2[8], b3[8];
+        int v = g_irqlat_busy, k = 0;
+        if (!v) b1[k++] = '0';
+        while (v) { b1[k++] = (char)('0' + v % 10); v /= 10; }
+        char a1[8]; int n1 = 0; while (k) a1[n1++] = b1[--k]; a1[n1] = 0;
+        v = g_irqlat_secs; k = 0; if (!v) b2[k++] = '0';
+        while (v) { b2[k++] = (char)('0' + v % 10); v /= 10; }
+        char a2[8]; int n2 = 0; while (k) a2[n2++] = b2[--k]; a2[n2] = 0;
+        v = g_irqlat_mode; k = 0; if (!v) b3[k++] = '0';
+        while (v) { b3[k++] = (char)('0' + v % 10); v /= 10; }
+        char a3[8]; int n3 = 0; while (k) a3[n3++] = b3[--k]; a3[n3] = 0;
+        const char* av[] = { "irqlat", a1, a2, a3, nullptr };
+        const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
+        int rc = Userspace::RunProcessWithArgs(p, av, envp);
+        SerialLogger::Log("[irqlat] contention runner finished rc=");
+        SerialLogger::LogDec(rc);
+        SerialLogger::Log("\r\n");
     } else {
         const char* av[] = { "irqlat", nullptr };
         const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
@@ -1044,6 +1190,60 @@ static volatile bool g_kinit_test_poweroff = false;
     }
     for (;;) Scheduler::SleepMs(60000);
 }
+
+// cpu scaling probe runner (kurono.smpscale=N, N = max threads, 1 = the cpu
+// count the program is told). runs /usr/bin/smpscale once, a few seconds after
+// boot so the desktop has settled; it prints SMPSCALE lines to com1. (satoru)
+static int g_smpscale_threads = 0;
+[[noreturn]] static void straytest_entry() {   // kurono.straytest=1 (satoru)
+    Scheduler::SleepMs(3000);
+    HAL::StrayVectorSelfTest();
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+[[noreturn]] static void smpscale_runner_entry() {
+    Scheduler::SleepMs(4000);
+    Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/smpscale", "smpscale");
+    if (!p) {
+        SerialLogger::Log("[smpscale] load FAILED\r\n");
+    } else {
+        char nb[8]; int k = 0; int v = g_smpscale_threads;
+        if (v > 1) { char t[8]; int m = 0; while (v && m < 7) { t[m++] = (char)('0' + v % 10); v /= 10; } while (m) nb[k++] = t[--m]; }
+        nb[k] = 0;
+        const char* av[] = { "smpscale", k ? nb : nullptr, nullptr };
+        const char* envp[] = { "PATH=/usr/bin", "HOME=/home/user", nullptr };
+        int rc = Userspace::RunProcessWithArgs(p, av, envp);
+        SerialLogger::Log("[smpscale] runner finished rc=");
+        SerialLogger::LogDec(rc);
+        SerialLogger::Log("\r\n");
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// posix_spawn of a static elf64 runner (kurono.spawntest=1). runs the ring-3
+// repro once in its own kernel process and logs its exit code; the repro itself
+// prints the [spawntest] case/DONE lines to stderr. (satoru)
+[[noreturn]] static void spawntest_runner_entry() {
+    Scheduler::SleepMs(3000);
+    Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/spawntest", "spawntest");
+    if (!p) {
+        SerialLogger::Log("[spawntest] load FAILED\r\n");
+    } else {
+        const char* av[] = { "spawntest", nullptr };
+        const char* envp[] = { "PATH=/system/bin", "HOME=/home/user", nullptr };
+        int rc = Userspace::RunProcessWithArgs(p, av, envp);
+        SerialLogger::Log("[spawntest] runner finished rc=");
+        SerialLogger::LogDec(rc);
+        SerialLogger::Log("\r\n");
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// kurono.kld.yieldfair=1: pass the N1 yield-fairness reproducer argument to
+// the apitest container. kurono.kld.stats=1: pass KLD_STATS=1 so the shim
+// dumps its per-thread wait/yield table. (satoru)
+static bool g_kldyieldfair;
+static bool g_kldstats;
 
 // KLD driver-container runner (kurono.kld=1). runs the unmodified upstream
 // linux e1000e driver, linked against the lx_emul shim, as a ring-3 Kurono
@@ -1059,17 +1259,223 @@ static volatile bool g_kinit_test_poweroff = false;
         SerialLogger::Log("[kld] load FAILED\r\n");
     } else {
         const char* av[] = { "kld-e1000e", nullptr };
+        const char* envp_stats[] = { "PATH=/usr/bin", "KLD_STATS=1", nullptr };
         const char* envp[] = { "PATH=/usr/bin", nullptr };
+        const char** env = g_kldstats ? envp_stats : envp;
         // the address space value is the broker's grant key; capture it now,
         // the process object is gone once the run returns. (satoru)
         uint64_t kld_as = p->address_space;
-        int rc = Userspace::RunProcessWithArgs(p, av, envp);
+        // named registration: 64 MiB for e1000e, 256 MiB for the iwlwifi
+        // container M2 will add (same helper, different name). (satoru)
+        KldBroker::SetDmaBudgetForName(kld_as, "/usr/bin/kld-e1000e", (int)p->pid);
+        int rc = Userspace::RunProcessWithArgs(p, av, env);
         SerialLogger::Log("[kld] container exited rc=");
         SerialLogger::LogDec(rc);
         SerialLogger::Log(" (42 = hit an unimplemented shim symbol)\r\n");
         // bus master off, msi off, frames back, grants dropped - a crashed
         // driver must not leave a device dma-ing into freed memory. (satoru)
         KldBroker::ReleaseAddressSpace(kld_as);
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// kurono.kld.stats=1: print the line-irq/ioapic counters once, after boot, so
+// the default-boot proof can assert the I/O APIC was never touched. (satoru)
+[[noreturn]] static void kld_stats_entry() {
+    Scheduler::SleepMs(5000);
+    SerialLogger::Log("[kld-ioapic] stats: accesses=");
+    SerialLogger::LogDec((int)KldIoApic::Accesses());
+    SerialLogger::Log(" reads=");
+    SerialLogger::LogDec((int)KldIoApic::RegReads());
+    SerialLogger::Log(" writes=");
+    SerialLogger::LogDec((int)KldIoApic::RegWrites());
+    SerialLogger::Log(" ioapics=");
+    SerialLogger::LogDec((int)KldIoApic::IoApicCount());
+    SerialLogger::Log(" (0 accesses = no container attached a line)\r\n");
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// optional KURONO_KLD_FW=1 blob: unpack the ustar to /system/lib/firmware so
+// request_firmware() finds it through the ordinary path. weak = default builds
+// and command lines are unchanged. (satoru)
+static void kld_firmware_init_once() {
+    extern const uint8_t _binary_kld_firmware_tar_start[] __attribute__((weak));
+    extern const uint8_t _binary_kld_firmware_tar_end[]   __attribute__((weak));
+    static bool done;
+    if (done)
+        return;
+    done = true;
+    if (!_binary_kld_firmware_tar_start || !_binary_kld_firmware_tar_end ||
+        +_binary_kld_firmware_tar_end <= +_binary_kld_firmware_tar_start)
+        return;
+    KVFS::Mkdirs("/system/lib/firmware");
+    bool ok = PackageManager::ExtractTar((const char *)_binary_kld_firmware_tar_start,
+                                         (int)(_binary_kld_firmware_tar_end -
+                                               _binary_kld_firmware_tar_start),
+                                         "/system/lib/firmware");
+    SerialLogger::Log(ok ? "[kld] firmware unpacked to /system/lib/firmware\r\n"
+                         : "[kld] firmware unpack FAILED\r\n");
+}
+
+static char g_kld_family_override[16];   // test-only family tag for the apitest embed slot (satoru)
+static bool g_kld_i2chid_hostile;        // kurono.kld.i2chid.hostile=1: C5.8 fault test (satoru)
+static int g_kld_loop;                   // kurono.kld.loop=N: run the apitest-slot / i2chid container N times in a row (satoru)
+
+// one line per finished iteration of the loop: the frames in use after the
+// release has settled, against the count before the first start. the point is
+// a teardown that leaks nothing, so the delta must stay flat. (satoru)
+static void kld_loop_note(int it, int n, uint64_t used0) {
+    Scheduler::SleepMs(500);   // proven frees land after a tlb flush round (satoru)
+    SerialLogger::Log("[kld-loop] ");
+    SerialLogger::LogDec(it);
+    SerialLogger::Log("/");
+    SerialLogger::LogDec(n);
+    SerialLogger::Log(" used frames now ");
+    SerialLogger::LogDec((int)PMM::GetUsedFrames());
+    SerialLogger::Log(" before the first start ");
+    SerialLogger::LogDec((int)used0);
+    SerialLogger::Log("\r\n");
+}
+
+// KLD shim self-test runner (kurono.kld=apitest): no device. the container
+// runs [apitest] checks against the real shim primitives and prints one line
+// per test plus the final N/N. (satoru)
+[[noreturn]] static void kld_apitest_runner_entry() {
+    Scheduler::SleepMs(3500);
+    SerialLogger::Log("[apitest] launching /usr/bin/kld-apitest\r\n");
+    if (!EmbeddedUserprogs::HasKldApitest()) {
+        SerialLogger::Log("[apitest] container not embedded\r\n");
+        for (;;) Scheduler::SleepMs(60000);
+    }
+    KVFS::Mkdirs("/usr/bin");
+    KVFS::WriteFile("/usr/bin/kld-apitest", EmbeddedUserprogs::KldApitestData(),
+                    EmbeddedUserprogs::KldApitestSize());
+    KVFS::Chmod("/usr/bin/kld-apitest", 0755);
+    int iters = g_kld_loop > 0 ? g_kld_loop : 1;
+    uint64_t used0 = PMM::GetUsedFrames();
+    for (int it = 0; it < iters; it++) {
+        Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/kld-apitest", "kld-apitest");
+        if (!p) {
+            SerialLogger::Log("[apitest] load FAILED\r\n");
+        } else {
+            const char* av_yf[] = { "kld-apitest", "yieldfair", nullptr };
+            const char* av[] = { "kld-apitest", nullptr };
+            const char** argv = g_kldyieldfair ? av_yf : av;
+            const char* envp_stats[] = { "PATH=/usr/bin", "KLD_STATS=1", nullptr };
+            const char* envp[] = { "PATH=/usr/bin", nullptr };
+            const char** env = g_kldstats ? envp_stats : envp;
+            uint64_t as = p->address_space;
+            if (g_kld_family_override[0]) {
+                char path[32];
+                int n = 0;
+                const char* pre = "kld-";
+                while (pre[n]) { path[n] = pre[n]; n++; }
+                for (int i = 0; g_kld_family_override[i] && n < 30; i++)
+                    path[n++] = g_kld_family_override[i];
+                path[n] = 0;
+                KldBroker::SetDmaBudgetForName(as, path, (int)p->pid);
+            }
+            int rc = Userspace::RunProcessWithArgs(p, argv, env);
+            SerialLogger::Log("[apitest] container exited rc=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+            KldBroker::ReleaseAddressSpace(as);
+        }
+        if (g_kld_loop > 0) kld_loop_note(it + 1, iters, used0);
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// real touchpad family runner (kurono.kld=i2chid): ACPICA inside the container
+// over the kernel's real tables, then the upstream lpss/designware/pinctrl/
+// i2c-hid stack. it lives by itself here (no net bench parent) so the broker
+// records its family from the runner path. (satoru)
+[[noreturn]] static void kld_i2chid_runner_entry() {
+    Scheduler::SleepMs(3500);
+    SerialLogger::Log("[i2chid] launching /usr/bin/kld-i2chid\r\n");
+    if (!EmbeddedUserprogs::HasKldI2chid()) {
+        SerialLogger::Log("[i2chid] container not embedded\r\n");
+        for (;;) Scheduler::SleepMs(60000);
+    }
+    KVFS::Mkdirs("/usr/bin");
+    KVFS::WriteFile("/usr/bin/kld-i2chid", EmbeddedUserprogs::KldI2chidData(),
+                    EmbeddedUserprogs::KldI2chidSize());
+    KVFS::Chmod("/usr/bin/kld-i2chid", 0755);
+    int iters = g_kld_loop > 0 ? g_kld_loop : 1;
+    uint64_t used0 = PMM::GetUsedFrames();
+    for (int it = 0; it < iters; it++) {
+        Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/kld-i2chid", "kld-i2chid");
+        if (!p) {
+            SerialLogger::Log("[i2chid] load FAILED\r\n");
+        } else {
+            const char* av_hostile[] = { "kld-i2chid", "--hostile", nullptr };
+            const char* av[] = { "kld-i2chid", nullptr };
+            const char* envp[] = { "PATH=/usr/bin", nullptr };
+            bool hostile = g_kld_i2chid_hostile;   // kurono.kld.i2chid.hostile=1 (satoru)
+            uint64_t as = p->address_space;
+            KldBroker::SetDmaBudgetForName(as, "/usr/bin/kld-i2chid", (int)p->pid);
+            int rc = Userspace::RunProcessWithArgs(p, hostile ? av_hostile : av, envp);
+            SerialLogger::Log("[i2chid] container exited rc=");
+            SerialLogger::LogDec(rc);
+            SerialLogger::Log("\r\n");
+            KldBroker::ReleaseAddressSpace(as);
+        }
+        if (g_kld_loop > 0) kld_loop_note(it + 1, iters, used0);
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+static bool g_kldwifi_scan;      // kurono.kldwifi=scan passes "scan" to the container (satoru)
+static bool g_kldwifi_connect;   // kurono.kldwifi=connect reads fw_cfg and associates (satoru)
+static bool g_kldbench_tls;       // kurono.kldbench.tls=1: bench the same HTTPS range over e1000e (satoru)
+static int  g_kldbench_port = 8000;   // kurono.kldbench.port=N: kldbench/nettest host port (satoru)
+static bool g_kldwifi_band24;     // kurono.kldwifi.band=2.4 diagnostic override (satoru)
+static bool g_kldwifi_soak;       // kurono.kldwifi.soak=1 30-minute link soak (satoru)
+static bool g_kldwifi_reconnect;  // kurono.kldwifi.reconnect=1 disconnect/reconnect (satoru)
+
+// KLD iwlwifi container runner (kurono.kld=iwlwifi): the real BE200 through
+// VFIO. the container runs unmodified iwlwifi/mac80211/cfg80211 and the runner
+// only registers the 256 MiB DMA budget and tears the address space down. (satoru)
+[[noreturn]] static void kld_iwlwifi_runner_entry() {
+    Scheduler::SleepMs(3500);
+    SerialLogger::Log("[kld-iwlwifi] launching /usr/bin/kld-iwlwifi\r\n");
+    if (!EmbeddedUserprogs::HasKldIwlwifi()) {
+        SerialLogger::Log("[kld-iwlwifi] container not embedded\r\n");
+        for (;;) Scheduler::SleepMs(60000);
+    }
+    KVFS::Mkdirs("/usr/bin");
+    KVFS::WriteFile("/usr/bin/kld-iwlwifi", EmbeddedUserprogs::KldIwlwifiData(),
+                    EmbeddedUserprogs::KldIwlwifiSize());
+    KVFS::Chmod("/usr/bin/kld-iwlwifi", 0755);
+    Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/kld-iwlwifi", "kld-iwlwifi");
+    if (!p) {
+        SerialLogger::Log("[kld-iwlwifi] load FAILED\r\n");
+    } else {
+        if (g_kldwifi_connect)
+            KldFwcfg::LoadWifiConf();
+        const char* av_scan[] = { "kld-iwlwifi", "scan", nullptr };
+        const char* av_connect[6];
+        int ac = 0;
+        av_connect[ac++] = "kld-iwlwifi";
+        av_connect[ac++] = "connect";
+        if (g_kldwifi_band24) av_connect[ac++] = "band24";
+        if (g_kldwifi_soak) av_connect[ac++] = "soak";
+        if (g_kldwifi_reconnect) av_connect[ac++] = "reconnect";
+        av_connect[ac] = nullptr;
+        const char* av_plain[] = { "kld-iwlwifi", nullptr };
+        const char** av = g_kldwifi_connect ? av_connect :
+                          (g_kldwifi_scan ? av_scan : av_plain);
+        const char* envp[] = { "PATH=/usr/bin", nullptr };
+        const char* envp_stats[] = { "PATH=/usr/bin", "KLD_STATS=1", nullptr };
+        uint64_t as = p->address_space;
+        KldBroker::SetDmaBudgetForName(as, "/usr/bin/kld-iwlwifi", (int)p->pid);
+        int rc = Userspace::RunProcessWithArgs(p, av, g_kldstats ? envp_stats : envp);
+        SerialLogger::Log("[kld-iwlwifi] container exited rc=");
+        SerialLogger::LogDec(rc);
+        SerialLogger::Log("\r\n");
+        if (g_kldwifi_connect)
+            KldFwcfg::RemoveWifiConf();
+        KldBroker::ReleaseAddressSpace(as);
     }
     for (;;) Scheduler::SleepMs(60000);
 }
@@ -1091,12 +1497,13 @@ static volatile bool g_kinit_test_poweroff = false;
         SerialLogger::Log("[kld-acpi] load FAILED\r\n");
     } else {
         KldBroker::GrantAcpi(p->address_space);
-        const char* av[] = { "kld-acpi", "--broker", "--devices",
+        const char* av[] = { "kld-acpi", "--broker", "--shadowtest", "--devices",
                              "--eval", "\\_SB.PCI0._HID", "--crs", "\\_SB.PCI0",
                              "--eval", "\\_SB.PCI0._PRT", "--crs", "\\_SB.LNKA",
                              "--eval", "\\_S5", "--eval", "\\_SB.PCI0.ISA._ADR", nullptr };
         const char* envp[] = { "PATH=/usr/bin", nullptr };
         uint64_t as = p->address_space;
+
         int rc = Userspace::RunProcessWithArgs(p, av, envp);
         KldBroker::GrantAcpi(0);
         KldBroker::ReleaseAddressSpace(as);
@@ -1115,7 +1522,7 @@ static volatile bool g_kinit_test_poweroff = false;
 // uses the shell's kernel ping, which ring 3 cannot reach. (satoru)
 [[noreturn]] static void kldbench_runner_entry() {
     Scheduler::SleepMs(3500);
-    bool kld = KldNet::Wanted();
+    bool kld = KldNet::Wanted() && !g_kldwifi_connect;
     // linux processes see guest /usr/bin/X as kvfs /system/bin/X (ResolvePath), so the
     // bench's execve("/usr/bin/kld-e1000e") needs the container THERE. (satoru)
     if (kld && EmbeddedUserprogs::HasKldE1000e()) {
@@ -1130,8 +1537,64 @@ static volatile bool g_kinit_test_poweroff = false;
     } else {
         const char* av_kld[] = { "kldnetbench", "--spawn", "/usr/bin/kld-e1000e", nullptr };
         const char* av_nat[] = { "kldnetbench", nullptr };
-        const char* envp[] = { "PATH=/usr/bin:/system/bin", "HOME=/root", nullptr };
-        int rc = Userspace::RunProcessWithArgs(p, kld ? av_kld : av_nat, envp);
+        const char* envp_nat[] = { "PATH=/usr/bin:/system/bin", "HOME=/root",
+                                    "KLD_BENCH_LINK=eth0", nullptr };
+        const char* envp_wifi[] = {
+            "PATH=/usr/bin:/system/bin", "HOME=/root",
+            "KLD_BENCH_TLS=1",
+            "KLD_BENCH_HOST=kurono.satorut.com",
+            "KLD_BENCH_PATH=/",
+            "KLD_BENCH_BIG=/packages/firefox/firefox-140.11.0esr-full2.tar",
+            "KLD_BENCH_LINK=wlan0",
+            nullptr
+        };
+        const char* envp_wifi_eth[] = {
+            "PATH=/usr/bin:/system/bin", "HOME=/root",
+            "KLD_BENCH_TLS=1",
+            "KLD_BENCH_HOST=kurono.satorut.com",
+            "KLD_BENCH_PATH=/",
+            "KLD_BENCH_BIG=/packages/firefox/firefox-140.11.0esr-full2.tar",
+            "KLD_BENCH_LINK=eth0",
+            nullptr
+        };
+        const char* envp_wifi_reconnect[] = {
+            "PATH=/usr/bin:/system/bin", "HOME=/root",
+            "KLD_BENCH_TLS=1",
+            "KLD_BENCH_RECONNECT=1",
+            "KLD_BENCH_HOST=kurono.satorut.com",
+            "KLD_BENCH_PATH=/",
+            "KLD_BENCH_LINK=wlan0",
+            nullptr
+        };
+        const char* envp_stats[] = { "PATH=/usr/bin:/system/bin", "HOME=/root",
+                                     "KLD_STATS=1", nullptr };
+        const char* envp_wifi_soak[] = {
+            "PATH=/usr/bin:/system/bin", "HOME=/root",
+            "KLD_BENCH_TLS=1",
+            "KLD_BENCH_SOAK=1",
+            "KLD_BENCH_HOST=kurono.satorut.com",
+            "KLD_BENCH_PATH=/",
+            "KLD_BENCH_BIG=/packages/firefox/firefox-140.11.0esr-full2.tar",
+            "KLD_BENCH_LINK=wlan0",
+            nullptr
+        };
+        const char** envp = g_kldwifi_soak ? envp_wifi_soak :
+                            (g_kldwifi_reconnect ? envp_wifi_reconnect :
+                             (g_kldwifi_connect ? envp_wifi :
+                              (g_kldbench_tls ? envp_wifi_eth : envp_nat)));
+        // the host http port is a boot parameter (KLD_HTTP_PORT in the rigs). (satoru)
+        static char bench_port_env[32];
+        {
+            char* q = kld_append_str(bench_port_env, "KLD_BENCH_PORT=");
+            q = kld_append_int(q, g_kldbench_port);
+            *q = 0;
+        }
+        const char* envp_final[20];
+        int ne = 0;
+        while (envp[ne] && ne < 18) { envp_final[ne] = envp[ne]; ne++; }
+        envp_final[ne++] = bench_port_env;
+        envp_final[ne] = nullptr;
+        int rc = Userspace::RunProcessWithArgs(p, kld ? av_kld : av_nat, envp_final);
         SerialLogger::Log("[kldbench] bench exited rc=");
         SerialLogger::LogDec(rc);
         SerialLogger::Log("\r\n");
@@ -1235,6 +1698,8 @@ static volatile bool g_kinit_test_poweroff = false;
 extern "C" const uint8_t _binary_churn_elf_start[] __attribute__((weak));
 extern "C" const uint8_t _binary_churn_elf_end[]   __attribute__((weak));
 static char g_churn_rounds[24] = {0};   // kurono.churn.rounds=N (default 200, 0 = forever) (satoru)
+static int  g_mmapchurn_delay_s = -1;   // kurono.mmapchurn=<s>: run churn pairs after s (satoru)
+static int  g_kldperm_delay_s = -1;     // kurono.kldperm=<s>: run churn kldop after s (satoru)
 // leak census workload runner (kurono.churn=1): /usr/bin/churn forks, execs,
 // maps and spawns threads in a loop; a census report brackets it. (satoru)
 [[noreturn]] static void churn_runner_entry() {
@@ -1256,6 +1721,112 @@ static char g_churn_rounds[24] = {0};   // kurono.churn.rounds=N (default 200, 0
         MemCensus::Report("churn-end");
         TaskMem::LogTop("churn-end");   // kurono.taskmem=1: who still holds kernel heap (satoru)
     }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// kurono.mmapchurn=<s>: run the churn program's 10000 mmap/munmap pairs as an
+// ordinary process after s seconds (D2.12: broker records must not outlive
+// their address space and poison a later process's munmap). (satoru)
+[[noreturn]] static void mmapchurn_runner_entry() {
+    if (g_mmapchurn_delay_s > 0)
+        Scheduler::SleepMs((uint32_t)g_mmapchurn_delay_s * 1000);
+    SerialLogger::Log("[mmapchurn] launching /usr/bin/churn pairs\r\n");
+    Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/churn", "mmapchurn");
+    if (!p) {
+        SerialLogger::Log("[mmapchurn] load FAILED\r\n");
+    } else {
+        const char* av[] = { "churn", "pairs", nullptr };
+        const char* envp[] = { "PATH=/usr/bin:/system/bin", nullptr };
+        int rc = Userspace::RunProcessWithArgs(p, av, envp);
+        SerialLogger::Log("[mmapchurn] runner rc=");
+        SerialLogger::LogDec(rc);
+        SerialLogger::Log("\r\n");
+    }
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// kurono.kldperm=<s>: after s seconds run one kld broker op as an ordinary
+// process, 60 times, 1 s apart (each run is a new address space, so with
+// kurono.directmap=1 and a display kill loop some land on a dead container's
+// freed PML4 frame). every run must get EPERM; the broker logs the runs that
+// hit a dead container's address space. (satoru)
+[[noreturn]] static void kldperm_runner_entry() {
+    if (g_kldperm_delay_s > 0)
+        Scheduler::SleepMs((uint32_t)g_kldperm_delay_s * 1000);
+    int ok = 0, bad = 0;
+    for (int i = 0; i < 60; i++) {
+        Process* p = ElfLoader::LoadELF64FromVFS("/usr/bin/churn", "kldperm");
+        if (!p) {
+            SerialLogger::Log("[kldperm] load FAILED\r\n");
+            break;
+        }
+        SerialLogger::Log("[kldperm] run as=0x");
+        SerialLogger::LogHex64(p->address_space);
+        SerialLogger::Log("\r\n");
+        const char* av[] = { "churn", "kldop", nullptr };
+        const char* envp[] = { "PATH=/usr/bin:/system/bin", nullptr };
+        int rc = Userspace::RunProcessWithArgs(p, av, envp);
+        if (rc == 0) ok++; else bad++;
+        Scheduler::SleepMs(1000);
+    }
+    SerialLogger::Log("[kldperm] done eperm=");
+    SerialLogger::LogDec(ok);
+    SerialLogger::Log(" other=");
+    SerialLogger::LogDec(bad);
+    SerialLogger::Log("\r\n");
+    for (;;) Scheduler::SleepMs(60000);
+}
+
+// kurono.elfreloadtest=1: a ring-3 fault kill must free the killed static
+// image's low-va frames, so the same binary can be loaded again immediately.
+// the first process is dispatched on an AP (sched=2 containment) and gets an
+// unmapped entry rip; the second load must succeed. in demand mode the frames
+// are identity backed, so a leaked group owns 0x400000 and the reload fails
+// with "[ELF] map_one_page failed". (satoru)
+[[noreturn]] static void elfreload_runner_entry() {
+    Scheduler::SleepMs(2500);
+    const uint8_t* img = EmbeddedUserprogs::MuslHelloData();
+    uint32_t sz = EmbeddedUserprogs::MuslHelloSize();
+    int pass = 0, fail = 0;
+    for (int round = 1; round <= 3; round++) {
+        SerialLogger::Log("[elfreload] round ");
+        SerialLogger::LogDec(round);
+        SerialLogger::Log("\r\n");
+        Process* p = ElfLoader::LoadELF64(img, sz, "elfreload");
+        if (!p) { SerialLogger::Log("[elfreload] initial load FAILED\r\n"); fail++; break; }
+        p->rip = 0xDEAD0000ULL;
+        p->user_frame.rip = 0xDEAD0000ULL;
+        const char* av[] = { "elfreload", nullptr };
+        const char* ev[] = { "PATH=/system/bin", nullptr };
+        DetachedHandle h;
+        if (Userspace::SpawnDetached(p, av, ev, 0, 0, &h) != 0) {
+            SerialLogger::Log("[elfreload] spawn FAILED\r\n");
+            Scheduler::DestroyProcess(p);
+            fail++;
+            continue;
+        }
+        for (int i = 0; i < 200 && Userspace::DetachedAlive(h); i++) Scheduler::SleepMs(25);
+        Userspace::ReapDetached(h);
+        Scheduler::SleepMs(800);   // let the deferred group reap free the space
+        Process* q = ElfLoader::LoadELF64(img, sz, "elfreload2");
+        if (q) {
+            SerialLogger::Log("[elfreload] round ");
+            SerialLogger::LogDec(round);
+            SerialLogger::Log(" reload OK\r\n");
+            Scheduler::DestroyProcess(q);
+            pass++;
+        } else {
+            SerialLogger::Log("[elfreload] round ");
+            SerialLogger::LogDec(round);
+            SerialLogger::Log(" reload FAILED (low image frames still owned)\r\n");
+            fail++;
+        }
+    }
+    SerialLogger::Log("[elfreload] RESULT pass=");
+    SerialLogger::LogDec(pass);
+    SerialLogger::Log(" fail=");
+    SerialLogger::LogDec(fail);
+    SerialLogger::Log("\r\n");
     for (;;) Scheduler::SleepMs(60000);
 }
 
@@ -1531,15 +2102,134 @@ namespace AudioServer { void PumpStats(uint32_t* calls, uint32_t* max_gap_ms); }
     for (;;) Scheduler::SleepMs(1000);
 }
 
+// usb audio soak gate (kurono.usbaudiotest=1): a few minutes of tone through
+// the usb audio backend, with the recovery paths exercised mid-stream. each
+// segment runs a command at a checkpoint: `audio restart` from the shell,
+// `audio stop` from the shell, and the same two through /system/bin/kaudio
+// (the ring-3 tool that writes /dev/kaudio). the 30 s [usbaudio] stats lines
+// are the health record. powers off when done. (satoru)
+static int run_kaudio_tool(const char* sub, char* out, int mx) {
+    if (!Userspace::IsReady()) Userspace::Init();
+    if (!KVFS::Exists("/system/bin/kaudio")) { out[0] = 0; return -2; }
+    Process* proc = ElfLoader::LoadELF64FromVFS("/system/bin/kaudio", "kaudio");
+    if (!proc) { out[0] = 0; return -3; }
+    const char* av[] = { "kaudio", sub, nullptr };
+    const char* envp[] = { "PATH=/system/bin:/usr/bin", "HOME=/root", "TMPDIR=/tmp", nullptr };
+    LinuxSyscall::ClearConsoleOutput();
+    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);
+    int n = LinuxSyscall::ReadConsoleOutput(out, mx - 1);
+    if (n < 0) n = 0;
+    out[n] = 0;
+    Scheduler::DestroyProcess(proc);
+    return rc;
+}
+
+static bool usbaudiotest_tone(int hz, int ms, int action_ms, const char* action, bool via_tool) {
+    AudioMixer::StreamID id = AudioServer::OpenStream("usbaudio-soak", AudioFormat::FMT_S16_LE, 48000, 2);
+    if (id == AudioMixer::INVALID_STREAM) {
+        SerialLogger::Log("[usbaudio-soak] open failed\r\n");
+        return false;
+    }
+    AudioMixer::SetVolume(id, 100);
+    static int16_t chunk[1024 * 2];
+    uint32_t total = (uint32_t)(48 * ms), done = 0, phase = 0;
+    uint32_t inc = (uint32_t)(((uint64_t)hz << 16) / 48000);
+    uint32_t t0 = Timer::GetRealMs();
+    bool acted = false, ended = false;
+    while (done < total) {
+        if (!acted && (int)(Timer::GetRealMs() - t0) >= action_ms) {
+            acted = true;
+            static char sbuf[4096];
+            if (via_tool) {
+                int rc = run_kaudio_tool(action, sbuf, (int)sizeof(sbuf));
+                SerialLogger::Log("[usbaudio-soak] kaudio "); SerialLogger::Log(action);
+                SerialLogger::Log(" rc="); SerialLogger::LogDec(rc);
+                SerialLogger::Log(": "); SerialLogger::Log(sbuf);
+                SerialLogger::Log("\r\n");
+            } else {
+                int n = KuronoShell::Execute(action, sbuf, (int)sizeof(sbuf) - 1);
+                if (n > 0) { sbuf[n] = 0; SerialLogger::Log("[usbaudio-soak] $ "); SerialLogger::Log(action);
+                             SerialLogger::Log("\r\n"); SerialLogger::Log(sbuf); SerialLogger::Log("\r\n"); }
+            }
+        }
+        uint32_t n = total - done;
+        if (n > 1024) n = 1024;
+        for (uint32_t i = 0; i < n; i++) {
+            int32_t x = (int32_t)(phase & 0x7FFF);
+            int32_t y = (x * (32768 - x)) >> 13;
+            if (phase & 0x8000) y = -y;
+            chunk[2 * i] = chunk[2 * i + 1] = (int16_t)(y * 3 / 4);
+            phase = (phase + inc) & 0xFFFF;
+        }
+        uint32_t off = 0;
+        long spins = 0;
+        while (off < n && spins < 400000L) {
+            uint32_t w = AudioServer::WriteStream(id, chunk + off * 2, n - off);
+            off += w;
+            AudioServer::LockedTick(); USB::PollHID();
+            if (w == 0) { __asm__ __volatile__("pause"); spins++; }
+        }
+        if (off < n) {
+            // the stream was force-freed by `audio stop`, or the backend is gone. (satoru)
+            ended = true;
+            break;
+        }
+        done += n;
+    }
+    SerialLogger::Log("[usbaudio-soak] tone "); SerialLogger::LogDec(hz);
+    SerialLogger::Log(" ms="); SerialLogger::LogDec(ms);
+    SerialLogger::Log(" wrote="); SerialLogger::LogDec((int)done);
+    SerialLogger::Log(ended ? " (ended by action)\r\n" : " (complete)\r\n");
+    AudioServer::DrainStream(id);
+    for (long i = 0; i < 20000; i++) { AudioServer::LockedTick(); USB::PollHID(); __asm__ __volatile__("pause"); }
+    AudioServer::CloseStream(id);
+    return true;
+}
+
+[[noreturn]] static void usbaudiotest_runner_entry() {
+    static char buf[8192];
+    Scheduler::SleepMs(8000);
+    SerialLogger::Log("[usbaudio-soak] begin\r\n");
+    int n = KuronoShell::Execute("audio status", buf, (int)sizeof(buf) - 1);
+    if (n > 0) { buf[n] = 0; SerialLogger::Log(buf); SerialLogger::Log("\r\n"); }
+    // 120 s with a shell restart at 30 s (the stream must keep going) (satoru)
+    usbaudiotest_tone(440, 120000, 30000, "audio restart", false);
+    // 60 s with a shell stop at 20 s (the stream must end) (satoru)
+    usbaudiotest_tone(660, 60000, 20000, "audio stop", false);
+    // the ring-3 tool: status, then a restart, then 90 s stopped mid-way by it (satoru)
+    if (run_kaudio_tool("status", buf, (int)sizeof(buf)) >= 0) {
+        SerialLogger::Log("[usbaudio-soak] kaudio status: "); SerialLogger::Log(buf); SerialLogger::Log("\r\n");
+    } else {
+        SerialLogger::Log("[usbaudio-soak] kaudio tool missing\r\n");
+    }
+    if (run_kaudio_tool("restart", buf, (int)sizeof(buf)) >= 0) {
+        SerialLogger::Log("[usbaudio-soak] kaudio restart: "); SerialLogger::Log(buf); SerialLogger::Log("\r\n");
+    }
+    usbaudiotest_tone(880, 90000, 30000, "stop", true);
+    run_kaudio_tool("status", buf, (int)sizeof(buf));
+    SerialLogger::Log("[usbaudio-soak] final status: "); SerialLogger::Log(buf); SerialLogger::Log("\r\n");
+    SerialLogger::Log("[usbaudio-soak] DONE\r\n");
+    HAL::PowerOff();
+    for (;;) Scheduler::SleepMs(1000);
+}
+
 // headless nic gate (kurono.nettest=1): drives real traffic through eth0 (ping,
 // dns, an http fetch from the qemu host at 10.0.2.2:8000), restarts the nic
 // driver with `nic restart`, then repeats the traffic to prove the data path
 // survived. output goes to com1. (satoru)
 [[noreturn]] static void nettest_runner_entry() {
-    Scheduler::SleepMs(9000);
-    static const char* const CMDS[] = {
-        "nic", "ping 10.0.2.2", "ping example.com", "curl http://10.0.2.2:8000/hello.txt",
-        "nic restart", "ping 10.0.2.2", "curl http://10.0.2.2:8000/hello.txt", "nic", nullptr
+    SerialLogger::Log("[r3audiotest] runner up\r\n");
+    Scheduler::SleepMs(7000);
+    static char curl_cmd[96];
+    {
+        char* q = kld_append_str(curl_cmd, "curl http://10.0.2.2:");
+        q = kld_append_int(q, g_kldbench_port);
+        q = kld_append_str(q, "/hello.txt");
+        *q = 0;
+    }
+    const char* const CMDS[] = {
+        "nic", "ping 10.0.2.2", "ping example.com", curl_cmd,
+        "nic restart", "ping 10.0.2.2", curl_cmd, "nic", nullptr
     };
     static char buf[8192];
     for (int i = 0; CMDS[i]; i++) {
@@ -1616,6 +2306,8 @@ namespace AudioServer { void PumpStats(uint32_t* calls, uint32_t* max_gap_ms); }
     for (;;) Scheduler::SleepMs(60000);
 }
 
+bool g_envwatch = false;     // kurono.envwatch=1, shell.cpp (satoru)
+bool g_pflooptest = false;   // kurono.pflooptest=1: [pfloop] self-test, linux_syscall.cpp (satoru)
 extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Init();
     SerialLogger::Log("Kurono OS Starting...\r\n");
@@ -1639,8 +2331,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (magic == 0x2BADB002) {
         KernelPanic::Initialize(mbi_early);
     }
+    // kurono.bootdebug=1: the early green bar + debug text below and the dark
+    // blue test fill after Graphics::Init. default off, so the first thing on
+    // screen after the firmware is the boot animation. (satoru)
+    const bool boot_debug = magic == 0x2BADB002 && (mbi_early->flags & (1u << 2)) && mbi_early->cmdline != 0 &&
+                            boot_has_token((const char*)(uintptr_t)mbi_early->cmdline, "kurono.bootdebug=1");
+    if (!boot_debug) SerialLogger::Log("Early FB: debug screen off (kurono.bootdebug=1 shows it)\r\n");
     bool has_early_fb = false;
-    if (magic == 0x2BADB002 && (mbi_early->flags & (1u << 12)) && mbi_early->framebuffer_addr != 0
+    if (boot_debug && magic == 0x2BADB002 && (mbi_early->flags & (1u << 12)) && mbi_early->framebuffer_addr != 0
         && mbi_early->framebuffer_width > 0 && mbi_early->framebuffer_height > 0
         && mbi_early->framebuffer_type != 2) {
         uint64_t fb = mbi_early->framebuffer_addr;
@@ -1702,11 +2400,20 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     bool boot_console_realtime = false;
     bool boot_emergency = false;
     bool boot_cli = false;
+    // kurono.mode=recovery (the EFI loader decides, see system/bootcfg.h):
+    // the cli boot path, then Kurono Recovery instead of the cli prompt. (satoru)
+    bool boot_recovery = false;
+    int  boot_recovery_reason = 0;
+    // kurono.safe=1 or recovery: no KLD linux drivers this boot. (satoru)
+    bool boot_safe = false;
+    static char boot_slot[32];
+    boot_slot[0] = 0;
     bool boot_cli_poweroff = false;
     // autologin: skip the lockscreen/first-boot wizard and drop straight to
     // the desktop with a default user. used by the bootable iso "straight to
     // desktop" entry so a fresh vm boots to a usable desktop with no typing. (satoru)
     bool boot_autologin = false;
+    bool boot_media_seed = false;   // kurono.media.seed=1: copy the on-demand demo clips into /home/user/Videos (satoru)
     // ffmpeg on-device smoke test, parsed early into a bool: the grub cmdline
     // string lives in low memory that the (now large) kernel image/heap can
     // clobber before the test runs deep in boot, so we must latch it now. (satoru)
@@ -1739,6 +2446,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // ccmp/...) against published vectors headless at boot. gated by
     // kurono.wifitest. proves the security core even with no radio. (satoru)
     bool boot_wifi_test = false;
+    // platform self-test (kurono.platformtest=1): crypto vectors, password
+    // hashing and the other platform modules' offline checks. (satoru)
+    bool boot_platform_test = false;
     // kj language self-test: run the kj (kurono javascript) suite + kss-binding
     // checks headless at boot. gated by kurono.kjtest. (satoru)
     bool boot_kj_test = false;
@@ -1774,23 +2484,37 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // (kurono.setup=1). the main entry stays autologin -> desktop. (satoru)
     bool boot_setup = false;
     bool boot_kmemx_off = false;  // kurono.kmemx=0 a/b kill switch (task 20) (satoru)
+    bool boot_kmx_idle_off = false; // kurono.kmxidle=0 disables the kinit-driven idle scan (satoru)
+    bool boot_kmx_active_off = false; // kurono.kmxactive=0 restricts scanning to fully idle spaces (satoru)
+    bool boot_kmx_all = false;        // kurono.kmxall=1 compresses non-zero pages too (satoru)
     bool boot_fftrace = false;    // kurono.fftrace=1 re-enables the ff debug probes (task 29) (satoru)
     bool boot_pincpu_off = false; // kurono.pincpu=0 disables the default pinning (task 21) (satoru)
     bool boot_madvlazy = false;   // kurono.madvlazy=1 lazy-madvise + thread spread a/b (task 23f) (satoru)
     bool boot_fastrun = true;     // short autorun grace is DEFAULT; kurono.fastrun=0 restores the old 4s/2s (satoru)
     int  boot_fpsbench = 0;       // kurono.fpsbench=1 uncapped / =2 capped-but-forced (satoru)
+    uint32_t boot_pacetest = 0;   // kurono.pacetest=SECS synthetic slow frames, qemu rig (satoru)
     bool boot_vgsync = false;     // kurono.vgsync=1 restores the BLOCKING virtio present (a/b) (satoru)
     bool boot_irqlat = false;     // kurono.irqlat=1 runs the userspace wake-latency probe (satoru)
+    bool boot_spawntest = false;  // kurono.spawntest=1 runs the posix_spawn static-elf64 repro (satoru)
     bool boot_vmtest = false;     // kurono.vmtest=1 headless hypervisor vmcs/ept gate (satoru)
     bool boot_kld = false;
+    bool boot_kldapitest = false;   // kurono.kld=apitest shim self-test (satoru)
+    bool boot_kldi2chid = false;    // kurono.kld=i2chid real touchpad family (satoru)
+    bool boot_kldiwlwifi = false;   // kurono.kld=iwlwifi real BE200 (satoru)
     bool boot_kldbench = false;   // kurono.kld.bench=1 network a/b instrument (satoru)
     bool boot_kldacpi = false;    // kurono.kld.acpi=1 acpica container (satoru)        // kurono.kld=1 runs the KLD driver container (satoru)
+    bool boot_kldauto = false;    // kurono.kld=auto match pci devices to driver id tables (satoru)
+    bool boot_kldmsixcheck = false; // kurono.kld.msixcheck=1 kernel msi-x table page self check (satoru)
+    bool boot_kldstats = false;   // kurono.kld.stats=1 print ioapic access counters once after boot (satoru)
     bool boot_uatest = false;     // kurono.uatest=1 user-pointer validation gate (satoru)
     bool boot_findtest = false;   // kurono.findtest=1 parallel find/Glob/Grep tree walk (satoru)
     bool boot_kentest = false;   // kurono.kentest=1 privilege-gate regression (satoru)
     bool boot_kshtest = false;    // kurono.kshtest=1 /dev/kshell rescue-channel gate (satoru)
     bool boot_memtest = false;    // kurono.memtest=1 ring-3 fill + verify of most of free ram (satoru)
     bool boot_churn = false;      // kurono.churn=1 fork/exec/mmap churn for the leak census (satoru)
+    bool boot_mmapchurn = false;  // kurono.mmapchurn=<s>: 10000 mmap/munmap pairs after s (satoru)
+    bool boot_kldperm = false;    // kurono.kldperm=<s>: one broker op from an ordinary process (satoru)
+    bool boot_elfreload = false;  // kurono.elfreloadtest=1 fault-kill then reload a static image (satoru)
     uint32_t boot_census_s = 0;   // kurono.memcensus=1: report period (kurono.memcensus.s=N, default 30) (satoru)
     uint32_t boot_taskmem_log_s = 0;   // kurono.taskmem.log=N: [taskmem] report every N s (satoru)
     bool boot_dsai = false;       // kurono.dsai=1 ai recovery client end-to-end gate (satoru)
@@ -1799,7 +2523,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     bool boot_audiotest = false;  // kurono.audiotest=1 hd audio tone + restart gate (satoru)
     bool boot_uactest = false;    // kurono.uactest=1 usb audio descriptor parser self test (satoru)
     bool boot_usbtest = false;    // kurono.usbtest=1 usb hid report parser self test (satoru)
+    bool boot_usbmsdtest = false; // kurono.usbmsdtest=1 usb mass storage end to end self test (satoru)
     bool boot_audiotest2 = false; // kurono.audiotest=2 streaming-client pump gate (satoru)
+    bool boot_usbaudiotest = false; // kurono.usbaudiotest=1 usb audio soak + recovery gate (satoru)
     bool boot_nettest = false;    // kurono.nettest=1 nic traffic + `nic restart` gate (satoru)
     bool boot_bbtest = false;     // kurono.bbtest=1 third-party linux binary gate (satoru)
     int  boot_setup_screen = 0;   // optional start screen for the setup wizard (satoru)
@@ -1808,6 +2534,19 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     static char boot_gui_run[256];
     boot_gui_run[0] = 0;
     const char* boot_cmdline = nullptr;
+    // firmware IA32_TSC_ADJUST sanitize on the bsp, before anything keeps a tsc
+    // base (CPUDetect calibrates and Timer::GetRealMs64 latches its base much
+    // later). the laptop's firmware leaves a different value per cpu, which made
+    // rdtsc disagree by 0.6 to 0.9 s between the bsp and the aps. on by default
+    // (a no-op when the values are already 0, as in every vm);
+    // kurono.tscadjust=0 keeps the firmware values, kurono.tscadjust.test=1
+    // injects the laptop's value first (qemu). (satoru)
+    {
+        const char* tc = (mbi_early && (mbi_early->flags & (1u << 2)) && mbi_early->cmdline != 0)
+                             ? (const char*)(uintptr_t)mbi_early->cmdline : nullptr;
+        SMP::TscAdjustBoot(!boot_has_token(tc, "kurono.tscadjust=0"),
+                           boot_has_token(tc, "kurono.tscadjust.test=1"));
+    }
     if (mbi_early && (mbi_early->flags & (1u << 2)) && mbi_early->cmdline != 0) {
         boot_cmdline = (const char*)(uintptr_t)mbi_early->cmdline;
         if (boot_has_token(boot_cmdline, "kurono_mode=text") || boot_has_token(boot_cmdline, "kurono.text=1")) {
@@ -1823,6 +2562,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             boot_has_token(boot_cmdline, "kurono.cli=1")) {
             boot_cli = true;
         }
+        if (boot_has_token(boot_cmdline, "kurono.mode=recovery")) {
+            boot_recovery = true;
+            boot_cli = true;
+            boot_safe = true;
+            for (int r = 1; r <= 3; r++) {
+                char tok[32] = "kurono.recovery.reason=0";
+                tok[23] = (char)('0' + r);
+                if (boot_has_token(boot_cmdline, tok)) boot_recovery_reason = r;
+            }
+        }
+        if (boot_has_token(boot_cmdline, "kurono.safe=1")) boot_safe = true;
+        boot_get_value(boot_cmdline, "kurono.boot.slot", boot_slot, (int)sizeof(boot_slot));
         if (boot_has_token(boot_cmdline, "kurono.cli.poweroff=1")) {
             boot_cli_poweroff = true;
         }
@@ -1830,11 +2581,32 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.autologin=1") || boot_has_token(boot_cmdline, "kurono.autologin")) {
             boot_autologin = true;
         }
+        if (boot_has_token(boot_cmdline, "kurono.media.seed=1")) boot_media_seed = true;
+        // full-session serial capture only on request (4 mb instead of 256 kb). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.serlog=big")) SerialLogger::SetBigCapture(true);
         // kmemx a/b kill switch - parsed HERE with the other early flags: the
         // multiboot cmdline string can be reclaimed/clobbered by the allocator
         // inits, so a late boot_has_token on it silently fails (task 20). (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kmemx=0")) {
             boot_kmemx_off = true;
+        }
+        // kurono.kmxidle=0: keep the engine but turn off kinit's background
+        // scan pass (a/b for the idle-compression path). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kmxidle=0")) {
+            boot_kmx_idle_off = true;
+        }
+        // default OFF now (kurono.kmxidle=1 turns it back on): with the idle
+        // scan compressing claude's zero pages, Claude Code's threads found
+        // small integers in pointer fields and segfaulted (QEMU, fixed vfork
+        // kernel: 4 of 8 sessions; with kmxidle=0 or kmemx=0: 0 of 8), and the
+        // laptop's fs.watch thread wrote to a not-present heap page with KMemX
+        // holding 2110 pages. the mechanism inside KMemX is not found yet. (satoru)
+        if (!boot_has_token(boot_cmdline, "kurono.kmxidle=1")) boot_kmx_idle_off = true;
+        if (boot_has_token(boot_cmdline, "kurono.kmxactive=0")) {
+            boot_kmx_active_off = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kmxall=1") || boot_has_token(boot_cmdline, "kurono.kmxall")) {
+            boot_kmx_all = true;
         }
         // startup latency: the autorun grace (was 4s here, 2s in the gui
         // process) is dead time on the boot-to-paint clock. measured a/b over
@@ -1873,24 +2645,196 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.vgsync=1")) {
             boot_vgsync = true;
         }
+        // kurono.smpscale=N: run the cpu scaling probe at boot (N max threads, 1 = auto). (satoru)
+        {
+            char v[8] = {0};
+            if (boot_get_value(boot_cmdline, "kurono.smpscale", v, (int)sizeof(v))) {
+                int n = 0;
+                for (int i = 0; v[i] >= '0' && v[i] <= '9'; i++) n = n * 10 + (v[i] - '0');
+                g_smpscale_threads = n > 0 ? n : 1;
+            }
+        }
         // kurono.irqlat=1: run the ring-3 wake-latency probe at boot. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.irqlat=1")) {
             boot_irqlat = true;
+        }
+        // kurono.irqlat.busy=N [.secs=S] [.mode=M]: the contention reproducer. (satoru)
+        {
+            char v[8] = {0};
+            if (boot_get_value(boot_cmdline, "kurono.irqlat.busy", v, (int)sizeof(v))) {
+                int n = 0;
+                for (int i = 0; v[i] >= '0' && v[i] <= '9'; i++) n = n * 10 + (v[i] - '0');
+                g_irqlat_busy = n;
+                boot_irqlat = true;
+            }
+            if (boot_get_value(boot_cmdline, "kurono.irqlat.secs", v, (int)sizeof(v))) {
+                int n = 0;
+                for (int i = 0; v[i] >= '0' && v[i] <= '9'; i++) n = n * 10 + (v[i] - '0');
+                if (n > 0) g_irqlat_secs = n;
+            }
+            if (boot_get_value(boot_cmdline, "kurono.irqlat.mode", v, (int)sizeof(v))) {
+                int n = 0;
+                for (int i = 0; v[i] >= '0' && v[i] <= '9'; i++) n = n * 10 + (v[i] - '0');
+                g_irqlat_mode = n;
+            }
+        }
+        // kurono.wakelat=1: permanent wake-to-run accounting (stage f0b). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.wakelat=1")) {
+            Scheduler::SetWakeLat(true);
+        }
+        // kurono.vrblock=1: charge the real stint, including a block (default off). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.vrblock=1")) {
+            Scheduler::SetVrBlock(true);
+        }
+        // the non-connect parks are gated OFF by default in this job. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.lockpark=1")) { extern bool g_lock_park; g_lock_park = true; }
+        if (boot_has_token(boot_cmdline, "kurono.ptypark=1"))  { extern bool g_pty_park;  g_pty_park  = true; }
+        if (boot_has_token(boot_cmdline, "kurono.jobpark=1"))  { extern bool g_job_park;  g_job_park  = true; }
+        if (boot_has_token(boot_cmdline, "kurono.sigsus=1"))   { extern bool g_sigsus_park; g_sigsus_park = true; }
+        // kurono.claimage=1: the claim picker's ready_since override (default off). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.claimage=1")) {
+            Scheduler::SetClaimAge(true);
+        }
+        // kurono.spawntest=1: run the posix_spawn static-elf64 repro at boot. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.spawntest=1")) {
+            boot_spawntest = true;
         }
         // kurono.vmtest=1: headless hypervisor gate. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.vmtest=1")) {
             boot_vmtest = true;
         }
         // kurono.kld=1: run the KLD linux-driver container. (satoru)
-        if (boot_has_token(boot_cmdline, "kurono.kld=1")) {
+        if (boot_has_token(boot_cmdline, "kurono.kld=apitest")) {
+            boot_kldapitest = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kld.yieldfair=1")) g_kldyieldfair = true;
+        if (boot_has_token(boot_cmdline, "kurono.kld.stats=1")) g_kldstats = true;
+        KldBroker::SetStats(g_kldstats);
+        if (boot_has_token(boot_cmdline, "kurono.kld=i2chid")) {
+            boot_kldi2chid = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kld.i2chid.hostile=1"))
+            g_kld_i2chid_hostile = true;
+        boot_get_value(boot_cmdline, "kurono.kld.family",
+                       g_kld_family_override, (int)sizeof(g_kld_family_override));
+        {
+            char lp[8] = { 0 };
+            boot_get_value(boot_cmdline, "kurono.kld.loop", lp, (int)sizeof(lp));
+            int n = 0;
+            for (int i = 0; lp[i] >= '0' && lp[i] <= '9'; i++) n = n * 10 + (lp[i] - '0');
+            g_kld_loop = n > 100 ? 100 : n;   // test only, off by default (satoru)
+        }
+        KldInput::SetVerbose(boot_has_token(boot_cmdline, "kurono.kld.inputlog=1"));
+        if (boot_has_token(boot_cmdline, "kurono.kld=iwlwifi")) {
+            boot_kldiwlwifi = true;
+            WiFi::SetKldOwned(true);
+            if (boot_has_token(boot_cmdline, "kurono.kldwifi=scan")) g_kldwifi_scan = true;
+            if (boot_has_token(boot_cmdline, "kurono.kldbench.tls=1"))
+                g_kldbench_tls = true;
+            if (boot_has_token(boot_cmdline, "kurono.kldwifi.band=2.4"))
+                g_kldwifi_band24 = true;
+            if (boot_has_token(boot_cmdline, "kurono.kldwifi.soak=1"))
+                g_kldwifi_soak = true;
+            if (boot_has_token(boot_cmdline, "kurono.kldwifi.reconnect=1"))
+                g_kldwifi_reconnect = true;
+            if (boot_has_token(boot_cmdline, "kurono.kldwifi=connect")) {
+                g_kldwifi_connect = true;
+                KldNet::SetWanted(true);   // wlan0 via the same KLD bridge as eth0 (satoru)
+            }
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kld=1") ||
+            boot_has_token(boot_cmdline, "kurono.kld=e1000e")) {
             boot_kld = true;
+            if (boot_has_token(boot_cmdline, "kurono.kldbench.tls=1"))
+                g_kldbench_tls = true;
             // eth0 is served by the container's linux driver unless
             // kurono.kld.net=0 keeps the native driver. (satoru)
             if (!boot_has_token(boot_cmdline, "kurono.kld.net=0")) KldNet::SetWanted(true);
             if (boot_has_token(boot_cmdline, "kurono.kld.irqwake=0")) KldBroker::SetIrqWake(false);
         }
+        // kurono.r3audio=1: the pulse server + mixing run in the ring-3 audiod;
+        // the in-kernel PulseServer stays off. default off. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.r3audio=1")) {
+            R3Audio::SetEnabled(true);
+        }
+        if (boot_has_token(boot_cmdline, "kurono.r3audiotest=1")) g_r3audiotest = true;
         if (boot_has_token(boot_cmdline, "kurono.kld.bench=1")) boot_kldbench = true;   // (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kldbench.tls=1")) g_kldbench_tls = true; // native TLS A0 (satoru)
+        {
+            const char* bp = boot_value(boot_cmdline, "kurono.kldbench.port=");
+            if (bp && bp[0] >= '1' && bp[0] <= '9') {
+                int v = 0;
+                for (int i = 0; i < 5 && bp[i] >= '0' && bp[i] <= '9'; i++)
+                    v = v * 10 + (bp[i] - '0');
+                if (v > 0 && v < 65536) g_kldbench_port = v;
+            }
+        }
         if (boot_has_token(boot_cmdline, "kurono.kld.acpi=1")) boot_kldacpi = true;     // (satoru)
+        // kurono.kld=auto: pick the container from the driver's own pci id table.
+        // parsed here so the native nic drivers can stand down before
+        // Network::Init runs. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kld=auto") && !boot_safe) {   // safe start: no kld (satoru)
+            boot_kldauto = true;
+            KldAuto::BootInit(boot_cmdline);
+        }
+        // kurono.kld.display=pattern|mirror|extend|primary: the display bridge.
+        // off by default; BootInit leaves MODE_OFF without the flag. (satoru)
+        KldDisplay::BootInit(boot_cmdline);
+        DriDev::BootInit(boot_cmdline);   // kurono.kld.dri=1 (satoru)
+        // kurono.kld.msixcheck=1: kernel self check of the msi-x table rule.
+        if (boot_has_token(boot_cmdline, "kurono.kld.msixcheck=1")) boot_kldmsixcheck = true;
+        // vt-d flags apply to every kld boot, including the legacy bench path.
+        KldAuto::ParseIommuFlags(boot_cmdline);
+        // kurono.wl.childalpha=1: per-pixel alpha for wayland child subsurfaces (libdecor) (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.wl.childalpha=1")) WaylandServer::SetChildAlpha(true);
+        if (boot_has_token(boot_cmdline, "kurono.wl.scdirect=1")) WaylandServer::SetScissorDirectBlit(true);   // (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.gfx.dirtymerge=0")) Graphics::SetDirtyMerge(false);   // old full-screen collapse (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.flip.emptyskip=0")) Graphics::SetFlipEmptySkip(false);   // undamaged frames flip again (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.gfx.selfcarry=0")) Graphics::SetScissorSelfCarry(false);   // (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.wl.deco=1")) WaylandServer::SetDecoration(true);
+        if (boot_has_token(boot_cmdline, "kurono.wl.fullsize=1")) WaylandServer::SetFullsize(true);
+        // wl shm pools are unpinned when their client goes, default on now: with it off
+        // every app run left ~1.8 mb of memfd pinned for good (memcensus: 23 slots,
+        // 41 mb after 24 app runs; 0 with it on). kurono.wl.poolfree=0 = old pinning. (satoru)
+        { bool pf = !boot_has_token(boot_cmdline, "kurono.wl.poolfree=0");
+          WaylandServer::SetPoolFree(pf); LinuxSyscall::SetPoolFree(pf); }
+        // kurono.vmatrace=1: L1 page-table growth trace (map origin + census). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.vmatrace=1")) {
+            KernelVMM::SetVmTrace(true);
+            LinuxSyscall::SetMapTrace(true);
+        }
+        // kurono.mmap.reuse=1: L2 freed-VA hole reuse for auto mmap. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.mmap.reuse=1")) LinuxSyscall::SetMmapReuse(true);
+        // TEST-ONLY: cache the hole AND skip the munmap shootdown; T2 must fail.
+        if (boot_has_token(boot_cmdline, "kurono.mmap.reuse.noflush=1")) {
+            LinuxSyscall::SetMmapNoFlush(true);
+            LinuxSyscall::SetMmapReuse(true);
+        }
+        // L3: one bump pointer per address space (default on); =0 reverts; ctidbelt=0 and audit=1 are measurement flags. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.mmap.groupbump=0")) LinuxSyscall::SetGroupBump(false);
+        if (boot_has_token(boot_cmdline, "kurono.mmap.ctidbelt=0")) LinuxSyscall::SetCtidBelt(false);
+        if (boot_has_token(boot_cmdline, "kurono.mmap.audit=1")) LinuxSyscall::SetMmapAudit(true);
+        // TEST-ONLY: reuse without the clear_child_tid belt; T4 must fail. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.mmap.reuse.noctid=1")) {
+            LinuxSyscall::SetMmapNoCtid(true);
+            LinuxSyscall::SetMmapReuse(true);
+        }
+        if (boot_has_token(boot_cmdline, "kurono.kld.stats=1")) boot_kldstats = true;
+        if (boot_has_token(boot_cmdline, "kurono.kld.nomsi=1")) KldBroker::SetNoMsi(true);
+        KldIoApic::SetAudit(boot_has_token(boot_cmdline, "kurono.kld.ioapic.audit=1"));
+        {
+            char la[24] = { 0 };
+            boot_get_value(boot_cmdline, "kurono.kld.line.allow", la, (int)sizeof(la));
+            if (la[0]) KldBroker::SetLineAllow(la);
+        }
+        // kurono.kld.acpi.allow=...: the owner's writable acpi registers (the
+        // kernel's allowlist starts empty). (satoru)
+        {
+            char acpi_allow[192];
+            boot_get_value(boot_cmdline, "kurono.kld.acpi.allow",
+                           acpi_allow, (int)sizeof(acpi_allow));
+            if (acpi_allow[0]) KldBroker::SetAcpiAllow(acpi_allow);
+        }
         // kurono.sctrace=1: log first use + first failure of every syscall (satoru)
         if (boot_has_token(boot_cmdline, "kurono.sctrace=1")) {
             extern bool g_sctrace;
@@ -1898,7 +2842,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         }
         if (boot_has_token(boot_cmdline, "kurono.tmkill=1")) { extern bool g_tmkill_test; g_tmkill_test = true; }   // task manager kill rehearsal (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kbtest=1")) { extern bool g_kbtest; g_kbtest = true; }   // terminal [kbt] serial mirror for kbrun.sh (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.ntp=0")) Sntp::g_enabled = false;   // no network time sync (satoru)
         if (boot_has_token(boot_cmdline, "kurono.nocloexec=1")) { extern bool g_nocloexec; g_nocloexec = true; }   // escape hatch: exec keeps every fd (satoru)
+        // kurono.connpark=0: the old ring-0 blocking-connect busy-wait (a/b arm). (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.connpark=0")) { extern bool g_conn_park; g_conn_park = false; }
         if (boot_has_token(boot_cmdline, "kurono.ffnolocal=1")) { extern bool g_ff_nolocal; g_ff_nolocal = true; }   // skip FIREFOX.TAR on the partition (satoru)
         {   // kurono.hz=N: fixed compositor refresh cap (60..360), overrides the
             // Settings > Display choice. software pacing only. (satoru)
@@ -1909,11 +2856,31 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 g_boot_hz = n;
             }
         }
+        {   // kurono.panelhz=N: qemu/test override of the lit output's rate, so
+            // the pacer ceiling and ladder can be exercised without a real
+            // panel. no hardware is touched. (satoru)
+            char pv[12];
+            if (boot_get_value(boot_cmdline, "kurono.panelhz", pv, sizeof(pv))) {
+                uint32_t n = 0;
+                for (int k = 0; pv[k] >= '0' && pv[k] <= '9' && k < 6; k++) n = n * 10 + (uint32_t)(pv[k] - '0');
+                g_boot_panel_hz = n;
+            }
+            if (boot_get_value(boot_cmdline, "kurono.pacetest", pv, sizeof(pv))) {
+                uint32_t n = 0;
+                for (int k = 0; pv[k] >= '0' && pv[k] <= '9' && k < 5; k++) n = n * 10 + (uint32_t)(pv[k] - '0');
+                boot_pacetest = n;
+            }
+        }
         {   // test rig: kurono.ffcrash=S and kurono.ffreopen=N (satoru)
             char tv[12]; int n;
             if (boot_get_value(boot_cmdline, "kurono.ffcrash", tv, sizeof(tv))) {
                 n = 0; for (int k = 0; tv[k] >= '0' && tv[k] <= '9'; k++) n = n * 10 + (tv[k] - '0');
                 g_ffcrash_secs = (uint32_t)n;
+            }
+            if (boot_get_value(boot_cmdline, "kurono.usnap", tv, sizeof(tv))) {   // all-thread snapshots from the disklog worker (satoru)
+                extern volatile uint32_t g_usnap_secs;
+                n = 0; for (int k = 0; tv[k] >= '0' && tv[k] <= '9'; k++) n = n * 10 + (tv[k] - '0');
+                g_usnap_secs = (uint32_t)n;
             }
             if (boot_get_value(boot_cmdline, "kurono.ffsnap", tv, sizeof(tv))) {   // census snapshots (satoru)
                 extern volatile uint32_t g_ffsnap_secs;
@@ -1977,14 +2944,36 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             boot_churn = true;
             boot_get_value(boot_cmdline, "kurono.churn.rounds", g_churn_rounds, (int)sizeof(g_churn_rounds));
         }
+        {
+            char mb[12] = {0};
+            if (boot_get_value(boot_cmdline, "kurono.mmapchurn", mb, (int)sizeof(mb))) {
+                int v = 0;
+                for (int i = 0; mb[i] >= '0' && mb[i] <= '9'; i++) v = v * 10 + (mb[i] - '0');
+                if (v >= 0) { g_mmapchurn_delay_s = v; boot_mmapchurn = true; }
+            }
+        }
+        {
+            char kb[12] = {0};
+            if (boot_get_value(boot_cmdline, "kurono.kldperm", kb, (int)sizeof(kb))) {
+                int v = 0;
+                for (int i = 0; kb[i] >= '0' && kb[i] <= '9'; i++) v = v * 10 + (kb[i] - '0');
+                if (v >= 0) { g_kldperm_delay_s = v; boot_kldperm = true; }
+            }
+        }
+        if (boot_has_token(boot_cmdline, "kurono.elfreloadtest=1")) boot_elfreload = true;
         // kurono.r3apps=calculator (or 1 / all): kui apps run as ring-3 programs; (satoru)
         // kurono.kui.open=<name>: the test harness opens that kui app once the desktop is up (satoru)
         {
-            char r3[48] = {0};
+            char r3[96] = {0};
             if (boot_get_value(boot_cmdline, "kurono.r3apps", r3, (int)sizeof(r3))) KuiKernel::SetRing3Apps(r3);
-            char ko[24] = {0};
+            char ko[128] = {0};
             if (boot_get_value(boot_cmdline, "kurono.kui.open", ko, (int)sizeof(ko))) KuiKernel::SetTestOpen(ko);
         }
+        // the installer app: kurono.installer=1 opens it once the desktop is up
+        // (the "Kurono Setup" grub entry uses this), and kurono.installer.auto=1
+        // drives its screens itself for a headless end-to-end test. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.installer=1")) KuiKernel::SetTestOpen("installer");
+        if (boot_has_token(boot_cmdline, "kurono.installer.auto=1")) InstallerService::SetAuto(true);
         // kurono.taskmem=1: per-task kernel heap accounting, off by default (satoru)
         if (boot_has_token(boot_cmdline, "kurono.taskmem=1")) {
             TaskMem::Request();
@@ -2033,6 +3022,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             // the env also feeds the `claude` shell command when no variables are exported (satoru)
             if (cl_args[0] || cl_env[0]) ClaudeHost::SetBootArgs(cl_args, cl_env);
             if (boot_has_token(boot_cmdline, "kurono.claude=1")) boot_claude = true;
+            if (boot_has_token(boot_cmdline, "kurono.window.test=1")) ClaudeHost::SetWindowTest(true);
         }
         if (boot_has_token(boot_cmdline, "kurono.audiotest=1")) {
             boot_audiotest = true;
@@ -2043,8 +3033,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.usbtest=1")) {
             boot_usbtest = true;
         }
+        if (boot_has_token(boot_cmdline, "kurono.usbmsdtest=1")) {
+            boot_usbmsdtest = true;
+        }
         if (boot_has_token(boot_cmdline, "kurono.audiotest=2")) {
             boot_audiotest2 = true;
+        }
+        if (boot_has_token(boot_cmdline, "kurono.usbaudiotest=1")) {
+            boot_usbaudiotest = true;
         }
         if (boot_has_token(boot_cmdline, "kurono.nettest=1")) {
             boot_nettest = true;
@@ -2080,6 +3076,28 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // log, kurono.vmram=N is the default guest ram in mb (satoru)
         if (boot_has_token(boot_cmdline, "kurono.vmlog=1")) VMHost::SetLogMirror(true);
         if (boot_has_token(boot_cmdline, "kurono.vmdebug=1")) VMHost::SetDebug(true);
+        if (boot_has_token(boot_cmdline, "kurono.vm.par=1")) VMHost::SetPar(true);   // parallel vcpus (satoru)
+        {   // kurono.vm.smp=N: N vcpus for the alpine guest (satoru)
+            char sv[8];
+            if (boot_get_value(boot_cmdline, "kurono.vm.smp", sv, (int)sizeof(sv))) VMHost::SetSmp(sv[0] - '0');
+        }
+        {   // kurono.vmdisk=N: virtual guest disk size in gb, 0 = just the image (satoru)
+            char dv[8];
+            if (boot_get_value(boot_cmdline, "kurono.vmdisk", dv, (int)sizeof(dv))) {
+                int gb = 0; for (int i = 0; dv[i] >= '0' && dv[i] <= '9'; i++) gb = gb * 10 + (dv[i] - '0');
+                VMHost::SetDiskGb(gb);
+            }
+        }
+        if (boot_has_token(boot_cmdline, "kurono.vm.fixed=1")) VMHost::SetFixedMode(true);   // old fixed mode, for a/b (satoru)
+        {   // test: back lazy guest chunks with 4 kb pages (1 = all, 2 = odd chunks) (satoru)
+            char sv[8];
+            if (boot_get_value(boot_cmdline, "kurono.vm.splitmem", sv, (int)sizeof(sv))) GuestMemoryManager::SetForceSplit(sv[0] - '0');
+        }
+        if (boot_has_token(boot_cmdline, "kurono.vmboot=1")) VMHost::SetForceAutostart(true);   // test rig (satoru)
+        {
+            static char tc[900];
+            if (boot_get_value(boot_cmdline, "kurono.vmtest", tc, (int)sizeof(tc))) VMHost::SetTestCmds(tc);   // test rig (satoru)
+        }
         {
             char v[16];
             if (boot_get_value(boot_cmdline, "kurono.vmram", v, (int)sizeof(v))) {
@@ -2123,6 +3141,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.wifitest=1") || boot_has_token(boot_cmdline, "kurono.wifitest")) {
             boot_wifi_test = true;
         }
+        if (boot_has_token(boot_cmdline, "kurono.platformtest=1")) boot_platform_test = true;   // (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.panic.classic=1")) KernelPanic::SetClassicScreen(true);   // (satoru)
+        // skip panic reset methods to watch the fallbacks (qemu emulates all). (satoru)
+        HAL::SetPanicResetSkip((boot_has_token(boot_cmdline, "kurono.panic.noacpi=1") ? 1u : 0u) |
+                               (boot_has_token(boot_cmdline, "kurono.panic.nocf9=1") ? 2u : 0u) |
+                               (boot_has_token(boot_cmdline, "kurono.panic.nokbd=1") ? 4u : 0u));
+        if (boot_has_token(boot_cmdline, "kurono.backlight=1")) Backlight::SetWritesAllowed(true);   // 4a (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.sleep=idle")) IdleSleep::SetEnabled(true);   // 4d (satoru)
         // latch the kj self-test flag. (satoru)
         if (boot_has_token(boot_cmdline, "kurono.kjtest=1") || boot_has_token(boot_cmdline, "kurono.kjtest")) {
             boot_kj_test = true;
@@ -2242,11 +3268,34 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // optional GUI autorun: open Terminal and queue a command. Used purely
         // for headless QEMU debug runs where we cannot type interactively.
         boot_get_value(boot_cmdline, "kurono.gui.run", boot_gui_run, (int)sizeof(boot_gui_run));
+        {   // power test hook: kurono.power.test=restart|shutdown|sleep|cc-restart|
+            // cc-shutdown|button|autosave, with kurono.power.test.delay=MS. (satoru)
+            char pt[48] = {0}, pd[16] = {0};
+            if (boot_get_value(boot_cmdline, "kurono.power.test", pt, (int)sizeof(pt)) && pt[0]) {
+                uint32_t delay = 15000;
+                if (boot_get_value(boot_cmdline, "kurono.power.test.delay", pd, (int)sizeof(pd))) {
+                    uint32_t v = 0;
+                    for (int ci = 0; pd[ci] >= '0' && pd[ci] <= '9'; ci++) v = v * 10 + (uint32_t)(pd[ci] - '0');
+                    if (v) delay = v;
+                }
+                PowerManager::SetTest(pt, delay);
+            }
+        }
         {   // test hook: extra terminal windows after the autorun one (satoru)
             char gt[8] = {0};
             boot_get_value(boot_cmdline, "kurono.guiterms", gt, (int)sizeof(gt));
             extern int g_gui_extra_terms;
             g_gui_extra_terms = (gt[0] >= '0' && gt[0] <= '9') ? gt[0] - '0' : 0;
+        }
+        {   // test hook: kurono.ffafter=N launches firefox N s after the autorun
+            // command, so a qemu run can have claude (or anything) going first,
+            // like the laptop session where firefox never started. (satoru)
+            char fa[8] = {0};
+            boot_get_value(boot_cmdline, "kurono.ffafter", fa, (int)sizeof(fa));
+            extern uint32_t g_gui_ff_after_s;
+            uint32_t v = 0;
+            for (int i = 0; fa[i] >= '0' && fa[i] <= '9'; i++) v = v * 10 + (uint32_t)(fa[i] - '0');
+            g_gui_ff_after_s = v;
         }
     }
     bool force_text_mode = boot_text_only || boot_console_realtime || boot_emergency || boot_cli;
@@ -2290,20 +3339,30 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // SMAP (bit 21), UMIP (bit 11), OSXSAVE (bit 18) - gated by CPUID
     // capability bits to avoid #UD on older hardware.
     {
-        uint32_t eax, ebx, ecx, edx;
-        __asm__ __volatile__("cpuid"
-                             : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                             : "a"(7), "c"(0));
+        // bound leaf 7 by the maximum basic leaf: an old part returns the
+        // highest basic leaf's data for an out-of-range request, which could
+        // report smep/umip bits this cpu does not have. (satoru)
+        uint32_t a = 0, b = 0, c = 0, d = 0;
+        uint32_t ebx7 = 0, ecx7 = 0;
+        __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0), "c"(0));
+        if (a >= 7)
+            __asm__ __volatile__("cpuid" : "=a"(a), "=b"(ebx7), "=c"(ecx7), "=d"(d) : "a"(7), "c"(0));
         uint64_t cr4;
         __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
         uint64_t set = 0;
-        if (ebx & (1u << 7))  set |= (1ULL << 20);  // SMEP
+        if (ebx7 & (1u << 7)) set |= (1ULL << 20);  // SMEP
         // SMAP intentionally NOT enabled: the kernel currently performs
         // direct supervisor-mode access to user pointers in the syscall
         // dispatch path.  Turning SMAP on without STAC/CLAC wrappers
         // around every copy_to_user would #PF instantly.  Re-enable once
         // every user-pointer touch is funnelled through a proper helper.
-        if (ecx & (1u << 2))  set |= (1ULL << 11);  // UMIP
+        if (ecx7 & (1u << 2)) set |= (1ULL << 11);  // UMIP
+        { extern bool g_ubtrace_on; g_ubtrace_on = boot_has_token(boot_cmdline, "kurono.ubtrace=1"); }   // [ubchk] (satoru)
+        { extern bool g_vfork_copyfix; if (boot_has_token(boot_cmdline, "kurono.vfcopyfix=0")) g_vfork_copyfix = false; }   // (satoru)
+        { g_envwatch = boot_has_token(boot_cmdline, "kurono.envwatch=1"); }   // (satoru)
+        { g_pflooptest = boot_has_token(boot_cmdline, "kurono.pflooptest=1"); }   // [pfloop] self-test (satoru)
+        // cr0.wp on the bsp now, and the policy every ap copies in ap_entry. (satoru)
+        SMP::CrPolicyBsp(boot_has_token(boot_cmdline, "kurono.wp=1"), set);
         if (set) {
             cr4 |= set;
             __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4));
@@ -2315,6 +3374,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (has_early_fb) { early_fb_puts("[..] Memory ", 0xFFFF00); early_fb_flush(); }
     SerialLogger::Log("[2] MemoryManager::Init\r\n");
     MemoryManager::Init(mb_addr);
+    // the boot stub built its page tables inside the low boot segment, which a
+    // fixed-address image may shadow later. deep-copy the live kernel address
+    // space into pmm frames now (outside the still-reserved image window) and
+    // switch cr3, so every table the vmm walks afterwards lives in ordinary ram.
+    // this must happen before smp and before the window is released. (satoru)
+    if (!boot_has_token(boot_cmdline, "kurono.root.keep=1")) KernelVMM::RelocateKernelRoot();
     MemCensus::Init();   // no-op unless kurono.memcensus=1 turned the pmm tags on (satoru)
     TaskMem::Init();     // no-op unless kurono.taskmem=1 (satoru)
     if (has_early_fb) { early_fb_puts("OK\n", 0x00FF00); early_fb_flush(); }
@@ -2349,8 +3414,24 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::Log("[2c] KMemX::Init\r\n");
         KMemX::Init(20);
     }
+    if (boot_kmx_idle_off) {
+        KMemX::SetIdleScan(false);
+        SerialLogger::Log("[2c] KMemX idle scan OFF (kurono.kmxidle=0)\r\n");
+    }
+    if (boot_kmx_active_off) {
+        KMemX::SetActiveScan(false);
+        SerialLogger::Log("[2c] KMemX active-space scan OFF (kurono.kmxactive=0)\r\n");
+    }
+    if (boot_kmx_all) {
+        KMemX::SetZeroOnly(false);
+        SerialLogger::Log("[2c] KMemX non-zero page scan ON (kurono.kmxall=1)\r\n");
+    }
     // task 29: the firefox debug probes are OFF by default (the uart busy-waits
     // ~23.6us/byte, so their ~70KB cost ~1.5s of every boot). (satoru)
+    if (boot_has_token(boot_cmdline, "kurono.lktrace=1")) {
+        extern bool g_lktrace;   // linux_syscall.cpp (satoru)
+        g_lktrace = true;
+    }
     if (boot_fftrace) {
         extern bool g_fftrace;   // linux_syscall.cpp (satoru)
         g_fftrace = true;
@@ -2433,7 +3514,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (boot_has_token(boot_cmdline, "kurono.termsh=1")) TerminalApp::SetShellMode(true);   // a real shell on every terminal pty (satoru)
     if (boot_has_token(boot_cmdline, "kurono.pty=0")) LinuxSyscall::SetPtyLegacy(true);   // old single-session console, a/b (satoru)
     if (boot_has_token(boot_cmdline, "kurono.kls=global")) LinuxSyscall::SetKlsGlobal(true);   // keep the old single syscall lock, both sched modes (satoru)
-    if (boot_has_token(boot_cmdline, "kurono.sched=2")) {
+    if (boot_has_token(boot_cmdline, "kurono.powertrace=1")) Scheduler::SetPickTrace(true);
+    // sched=2 is the default since the smp job (agent_smp_results.md): every core
+    // runs programs, the desktop and the services have cores of their own.
+    // kurono.sched=1 (or =0) boots the old scheduler: kernel procs and the
+    // programs' leaders on cpu 0, threads pinned, 8 cpus on efi. (satoru)
+    bool sched_old = boot_has_token(boot_cmdline, "kurono.sched=1") ||
+                     boot_has_token(boot_cmdline, "kurono.sched=0");
+    if (sched_old) SerialLogger::Log("[sched] old scheduler (kurono.sched=1)\r\n");
+    if (!sched_old) {
         Scheduler::SetSchedMode(2);
         // the aps run every user task in sched=2, so their dispatch loops must
         // claim (the old apthreads gate). (satoru)
@@ -2442,26 +3531,72 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         if (boot_has_token(boot_cmdline, "kurono.schedlaunch=0")) Scheduler::SetDetachedLaunch(false);
         if (boot_has_token(boot_cmdline, "kurono.schedcpus=0")) Scheduler::SetReportAllCpus(false);
         if (boot_has_token(boot_cmdline, "kurono.klsprof=1")) LinuxSyscall::SetKlsProf(true);   // per-syscall kls profile (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.wrprefetch=0")) LinuxSyscall::SetWritePrefetch(false);   // write-path lazy materialize under kls (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.heapreserve=0")) KernelHeap::SetReserve(false);   // background heap growth (satoru)
+        { extern bool g_heap_direct; if (boot_has_token(boot_cmdline, "kurono.heapdirect=0")) g_heap_direct = false; }   // big blocks stay in the regions (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.rdunlock=0")) LinuxSyscall::SetReadUnlock(false);   // lazy file reads with kls released (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.memboot=1")) MemBoot::SetBootReport(true);   // boot memory report on serial (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.mmapprefetch=0")) LinuxSyscall::SetMmapPrefetch(false);   // (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.kfsrun=0")) KFS::SetRunReads(false);   // (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.mmappfverify=1")) { KFS::SetRunVerify(true); LinuxSyscall::SetMmapPrefetchVerify(true); }   // test only (satoru)
         if (boot_has_token(boot_cmdline, "kurono.schedpoll=0")) LinuxSyscall::SetPollLongWait(false);
         if (boot_has_token(boot_cmdline, "kurono.schedtrace=1")) LinuxSyscall::SetSchedTrace(true);
+        if (boot_has_token(boot_cmdline, "kurono.audiosplit=1")) KernelProcesses::SetAudioKlsPump(false);   // (satoru)
         if (boot_has_token(boot_cmdline, "kurono.schedterm=0")) KernelProcesses::SetTermWorkers(false);   // lost in the 6-8 merge (satoru)
         if (!boot_has_token(boot_cmdline, "kurono.kstackguard=0")) Scheduler::SetKstackGuard(true);
         SerialLogger::Log(boot_has_token(boot_cmdline, "kurono.schedrel=0")
             ? "[sched2] mode 2 on, deferred release OFF (a/b arm)\r\n"
-            : "[sched2] mode 2 on: deferred on_cpu release, unpinned\r\n");
+            : "[sched2] mode 2 on: deferred on_cpu release, unpinned (kurono.sched=1 = old scheduler)\r\n");
     }
     if (boot_has_token(boot_cmdline, "kurono.termtest=1")) KernelProcesses::SetTermTest(true);   // test rig, lost in the 6-8 merge (satoru)
+    {   // kurono.appexit=SECS: test rig, close firefox + census afterwards (satoru)
+        char ae[8] = {0};
+        if (boot_get_value(boot_cmdline, "kurono.appexit", ae, (int)sizeof(ae))) {
+            int s = 0;
+            for (int i = 0; ae[i] >= '0' && ae[i] <= '9'; i++) s = s * 10 + (ae[i] - '0');
+            if (s > 0) KernelProcesses::SetAppExitTest((uint32_t)s);
+        }
+    }
     if (boot_has_token(boot_cmdline, "kurono.kstacktest=1")) KernelProcesses::SetKstackTest(true);   // test rig (satoru)
     if (boot_has_token(boot_cmdline, "kurono.kstackguard=1")) Scheduler::SetKstackGuard(true);   // also outside sched=2 (satoru)
+    if (boot_has_token(boot_cmdline, "kurono.kplat=1")) Scheduler::SetKprocLatProbe(true);   // kernel-proc latency probe (satoru)
     if (boot_has_token(boot_cmdline, "kurono.madttest=1")) SMP::SelfTestMadt();
     if (boot_has_token(boot_cmdline, "kurono.x2apictest=1")) SMP::SetX2apicTest(1);
     if (boot_has_token(boot_cmdline, "kurono.x2apictest=2")) SMP::SetX2apicTest(2);
+    // kurono.forcex2apic=1: qemu stand-in for the laptop's firmware-locked x2apic: the
+    // bsp is forced into x2apic and treated as locked, the aps enable x2apic themselves. (satoru)
+    if (boot_has_token(boot_cmdline, "kurono.forcex2apic=1")) SMP::SetX2apicTest(2);
     SMP::Init();
     SMP::EnableFastCpuIndex();   // sched=2 only: CpuIndex via tsc_aux (satoru)
     // smp phase 2: bring up the application processors (INIT-SIPI-SIPI). each ap
     // reaches ap_entry, marks itself online, then idles until the scheduler hands
     // it work (phase 3). a failed ap is non-fatal - the bsp carries on. (satoru)
     SMP::StartAPs();
+    // bsp tick from its lapic timer once other cpus exist (see StartBspLapicTick).
+    // kurono.bsptick=pit keeps the 8259 pit tick, =lapic forces it on one cpu. (satoru)
+    SMP::StartBspLapicTick(boot_has_token(boot_cmdline, "kurono.bsptick=pit") ? -1 :
+                           boot_has_token(boot_cmdline, "kurono.bsptick=lapic") ? 1 : 0);
+    // kurono.svccpu (sched=2, default on): the desktop, the media/network services
+    // and the vm host get aps of their own. decided here, before any kernel proc
+    // is spawned and before the boot animation can claim an ap. kurono.svccpu=0
+    // keeps every kernel proc on cpu 0; kurono.svc.ui / .io / .vm=N move one by
+    // hand (0 = keep it on cpu 0). (satoru)
+    {
+        if (boot_has_token(boot_cmdline, "kurono.svccpu=0")) Scheduler::SetServiceCpus(false);
+        auto svc_num = [&](const char* key) -> int {
+            char v[8] = {0};
+            if (!boot_get_value(boot_cmdline, key, v, (int)sizeof(v))) return -1;
+            int n = 0, k = 0;
+            for (; v[k] >= '0' && v[k] <= '9'; k++) n = n * 10 + (v[k] - '0');
+            return k ? n : -1;
+        };
+        VMHost::AutoSmp((int)SMP::OnlineCount());
+        { int nv = VMHost::ParCpus(); if (nv > 1) Scheduler::SetVcpuCpus(nv - 1); }   // kurono.vm.par (satoru)
+        Scheduler::SetServiceCpuRequest(svc_num("kurono.svc.ui"), svc_num("kurono.svc.io"), svc_num("kurono.svc.vm"));
+        Scheduler::PlanServiceCpus();
+        int cl = svc_num("kurono.cpuload");
+        if (cl >= 0) KernelProcesses::SetCpuLoadSecs((uint32_t)cl);
+    }
 
     // note: interrupts stay disabled. the kernel is fully polling-based
     // (pit counter read, keyboard/mouse i/o ports). this avoids whpx
@@ -2480,10 +3615,20 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     KExec::Init();
     {
         bool nv = NVMe::Init();
+        {   // kurono.logname=NAME: a test boot writes NAME.LOG instead of KURONO.LOG (satoru)
+            char ln[16];
+            if (boot_get_value(boot_cmdline, "kurono.logname", ln, sizeof(ln))) DiskLog::SetLogName(ln);
+        }
         bool win = nv && NVMe::WriteGuardOn() && DiskLog::FindKuronoWindow();
         if (win && DiskLog::Init()) {
             DiskLog::SetEager(true);
             if (has_early_fb) { early_fb_puts("[OK] Boot log -> KURONO.LOG\n", 0x00FF00); early_fb_flush(); }
+        } else if (nv && !NVMe::WriteGuardOn()) {
+            // no write guard means no writable window was ever offered: this is
+            // the normal qemu/bios boot, not a failure, so do not stop on the
+            // photo screen (that hold used to burn minutes here because the
+            // scheduler ms clock has not started ticking yet). (satoru)
+            SerialLogger::Log("[disklog] disk write guard off: boot log stays serial-only\r\n");
         } else if (has_early_fb) {
             // say exactly which step failed, on screen, and HOLD it for 20 s:
             // there is no log to read and the lines otherwise scroll past
@@ -2525,9 +3670,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             }
             early_fb_puts("     (holding this screen for 20 seconds - take a photo)\n", 0xFFFF00);
             early_fb_flush();
-            uint64_t t0 = Scheduler::NowMs();
-            for (uint64_t spin = 0; spin < 4000000000ull; spin++) {
-                if (Scheduler::NowMs() - t0 >= 20000) break;
+            // the scheduler ms clock only advances once the timer irq runs, and
+            // this point is before the scheduler starts with interrupts off, so
+            // NowMs never moved and the old 4e9-iteration bound became the real
+            // wait on some machines. use the tsc clock and keep a hard cap.
+            // (satoru)
+            uint64_t t0 = Timer::GetRealMs64();
+            for (uint64_t spin = 0; spin < 1000000000ull; spin++) {
+                if (Timer::GetRealMs64() - t0 >= 20000) break;
                 __asm__ __volatile__("pause");
             }
         }
@@ -2571,8 +3721,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // without a usable intel display engine it logs one line. (satoru)
     if (boot_has_token(boot_cmdline, "kurono.igpu.aux=0"))
         SerialLogger::Log("[igpu-aux] skipped (kurono.igpu.aux=0)\r\n");
-    else
+    else {
+        IntelDpAux::SetTcLegacyProbe(boot_has_token(boot_cmdline, "kurono.igpu.tclegacy=1"));   // fix 6 (satoru)
+        // legacy type-c connect + modeset of its dp sink (default off) (satoru)
+        IntelDpAux::SetLegacyTc(boot_has_token(boot_cmdline, "kurono.igpu.legacytc=1"));
         IntelDpAux::Run(nullptr, 0);
+    }
     // stage 2: light the external dp sink stage 1 found on a type-c port,
     // on pipe b. runs only with such a sink; kurono.igpu.modeset=0 or a
     // KUROMODE.OFF file in the KURONO partition root skips it. without an
@@ -2706,6 +3860,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             uint8_t* fb = (uint8_t*)fb_phys;
             uint32_t fb_total = mbi->framebuffer_pitch * mbi->framebuffer_height;
             // fill a temp scanline with dark blue, then nt-copy each row
+            if (boot_debug)   // kurono.bootdebug=1 only (satoru)
             {
                 uint32_t bytes_pp = mbi->framebuffer_bpp / 8;
                 uint32_t row_bytes = mbi->framebuffer_width * bytes_pp;
@@ -2852,6 +4007,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // before the multi-monitor output setup because it only needs the boot
     // framebuffer and the stage 2 pipe b result. (satoru)
     if (has_display) {
+        IntelAccel::SetWmCalc(boot_has_token(boot_cmdline, "kurono.igpu.accel.wmcalc=1"));
         IntelAccel::Boot(boot_has_token(boot_cmdline, "kurono.igpu.accel=1"),
                          !boot_has_token(boot_cmdline, "kurono.igpu.accel.noptefb=1"),
                          (uint64_t)(uintptr_t)Graphics::GetBuffer(),
@@ -2932,6 +4088,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 SerialLogger::Log("[outputs] multi-monitor ACTIVE with the intel pipe b screen: ");
                 SerialLogger::LogDec(im_w); SerialLogger::Log("x"); SerialLogger::LogDec(im_h);
                 SerialLogger::Log("\r\n");
+                // a locked legacy type-c screen (kurono.igpu.legacytc=1) is the
+                // one the owner reads: it takes the menu bar and dock, the
+                // laptop panel becomes the second screen. queued like the
+                // settings page's "make primary", applied by the compositor.
+                // kurono.igpu.tcprimary=0 keeps the laptop panel primary. (satoru)
+                if (IntelModeset::LegacyTcLit() && !boot_has_token(boot_cmdline, "kurono.igpu.tcprimary=0")) {
+                    Graphics::RequestOutputOp(3, 1, 0);
+                    SerialLogger::Log("[igpu-tc] external screen made the primary output (menu bar + dock)\r\n");
+                }
             } else {
                 Outputs::Reset();
                 SerialLogger::Log("[outputs] intel pipe b screen lit but not usable as an output, test pattern stays\r\n");
@@ -2955,12 +4120,32 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         {
             uint32_t igpu_mhz = IntelDisplayProbe::RefreshMilliHz((uint32_t)Graphics::GetWidth(),
                                                                   (uint32_t)Graphics::GetHeight());
-            if (igpu_mhz >= 24000 && igpu_mhz <= 400000) FramePacer::SetPanelMilliHz(igpu_mhz, "igpu");
+            if (g_boot_panel_hz) FramePacer::SetPanelMilliHz(g_boot_panel_hz * 1000u, "cmdline");
+            else if (igpu_mhz >= 24000 && igpu_mhz <= 400000) FramePacer::SetPanelMilliHz(igpu_mhz, "igpu");
             else if (Graphics::RefreshWasMeasured()) FramePacer::SetPanelMilliHz(detected_hz * 1000u, "vga");
             else FramePacer::SetPanelMilliHz(60000u, "default");
             if (g_boot_hz) FramePacer::SetCmdlineHz(g_boot_hz);
         }
         Graphics::SetRenderMode(Graphics::DOUBLE_BUFFER);
+
+        // tell the pacer which rate every lit output really scans out. the
+        // primary inherits the detected panel rate, the intel pipe b output
+        // its lit edid timing, anything else the measured vga rate. the pacer
+        // never caps above the highest of them. (satoru)
+        {
+            uint64_t dp_phys = 0; int dp_w = 0, dp_h = 0; uint32_t dp_pitch = 0;
+            bool have_dp = IntelModeset::GetOutput(&dp_phys, &dp_w, &dp_h, &dp_pitch);
+            uint32_t panel_mhz = FramePacer::PanelHz() * 1000u;
+            for (int i = 0; i < Outputs::Total(); i++) {
+                const Output* o = Outputs::Get(i);
+                if (!o) continue;
+                uint32_t r = (i == 0) ? panel_mhz
+                            : (have_dp && o->phys == dp_phys) ? IntelModeset::CurrentMilliHz()
+                            : detected_hz * 1000u;
+                Outputs::SetRefreshMilliHz(i, r);
+            }
+            FramePacer::OutputsChanged();
+        }
 
         // wallpaper damage-only (kurono.wpdamage=1, default off). the desktop
         // repaints only the damaged rows of its cached wallpaper; a crc
@@ -2970,6 +4155,47 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             Graphics::SetWallpaperDamageOnly(true);
             SerialLogger::Log("[wpdamage] wallpaper damage-only enabled (kurono.wpdamage=1)\r\n");
         }
+        // damage scissor rendering (kurono.gfx.scissor=1, default off): the
+        // compositor repaints only damaged regions, every draw confined to
+        // them. kurono.gfx.scissorcheck=N compares the scanned and the back
+        // buffer on N presents (default 24) and turns it off on a mismatch.
+        // frame stats and the bench (kurono.gfxstats=1, kurono.gfxbench=1)
+        // only log. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.gfx.scissor=1")) {
+            int chk = 24;
+            char cv[8];
+            if (boot_get_value(boot_cmdline, "kurono.gfx.scissorcheck", cv, sizeof(cv))) {
+                chk = 0;
+                for (int k = 0; cv[k] >= '0' && cv[k] <= '9'; k++) chk = chk * 10 + (cv[k] - '0');
+            }
+            Graphics::SetScissorEnabled(true);
+            Graphics::SetScissorCheckFrames(chk);
+            Graphics::SetScissorDebug(boot_has_token(boot_cmdline, "kurono.gfx.scissordebug=1"));
+            DesktopEnvironment::SetScissorGuard(boot_has_token(boot_cmdline, "kurono.gfx.scissorguard=1"));   // (satoru)
+            if (boot_get_value(boot_cmdline, "kurono.gfx.scissorverify", cv, sizeof(cv))) {
+                int ve = 0;
+                for (int k = 0; cv[k] >= '0' && cv[k] <= '9'; k++) ve = ve * 10 + (cv[k] - '0');
+                Graphics::SetScissorVerifyEvery(ve);
+            }
+            SerialLogger::Log("[scissor] damage scissor rendering enabled (kurono.gfx.scissor=1), check frames ");
+            SerialLogger::LogDec(chk);
+            SerialLogger::Log("\r\n");
+        }
+        // clipped text skips its hidden glyphs and blends inline (identical
+        // pixels): with the scissor, or alone with kurono.gfx.fasttext=1. (satoru)
+        if (boot_has_token(boot_cmdline, "kurono.gfx.scissor=1") || boot_has_token(boot_cmdline, "kurono.gfx.fasttext=1")) {
+            Graphics::RegisterFontTarget();
+            SerialLogger::Log("[scissor] fast clipped text on\r\n");
+        }
+        {
+            int soak = 0; char sv[12];
+            if (boot_get_value(boot_cmdline, "kurono.gfx.oracle.soak", sv, sizeof(sv)))
+                for (int k = 0; sv[k] >= '0' && sv[k] <= '9'; k++) soak = soak * 10 + (sv[k] - '0');
+            GfxOracle::Configure(boot_has_token(boot_cmdline, "kurono.gfx.oracle=1"), boot_has_token(boot_cmdline, "kurono.gfx.oracle.shots=1"), soak);
+        }   // (satoru)
+        GfxBench::Configure(boot_has_token(boot_cmdline, "kurono.gfxstats=1"),
+                            boot_has_token(boot_cmdline, "kurono.gfxbench=1") &&
+                            !KldDisplay::DisplayBenchRequested());
 
         // verify display works - write directly to framebuffer
         SerialLogger::Log("Display: RenderMode=");
@@ -3019,6 +4245,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                 for (int k = 0; tv[k] >= '0' && tv[k] <= '9'; k++) te = te * 10 + (tv[k] - '0');
             BootAnim::SetTest(th, te);
         }
+        if (boot_has_token(boot_cmdline, "kurono.bootbar=live")) BootAnim::SetLiveBar(true);   // (satoru)
         boot_anim_on = BootAnim::Start(bam);
     }
     if (has_display && !boot_anim_on) {
@@ -3247,6 +4474,63 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // bringup once firefox is actually using the persist volume - the ram
         // is still reclaimed, just not during bringup. (satoru)
     }
+    // decide the window policy once, with the desktop up and the disk readable.
+    // a big machine with a CLAUDE image keeps the old reservation (claude must
+    // always start there even after firefox grew the heap); otherwise the
+    // window is released and its pages are claimed on demand. (satoru)
+    // opencode is the same kind of fixed-address image and needs the same window (satoru)
+    bool have_claude = ClaudeHost::Installed() || OpenCodeHost::Installed();
+    if (!have_claude && !DiskLog::Ready()) {
+        // a plain bios boot has no guard, so DiskLog was never opened. the
+        // partition lookup itself is read only: use it, without Init (which
+        // would blank KURONO.LOG), so an installed CLAUDE still selects the
+        // reserved window on such a boot. (satoru)
+        if (DiskLog::FindKuronoWindow()) have_claude = ClaudeHost::ProbeInstalled() || OpenCodeHost::ProbeInstalled();
+    }
+    PMM::FinalizeImageWindow(have_claude);
+
+    // kurono.wctest=1: prove the live-table write-combining helper on addresses
+    // a high GOP framebuffer would use. qemu's display devices hand out their
+    // legacy aperture below 4 gb, so >4 gb and >2 tb (the old extra_pd range)
+    // are forced here and only the page-table entry is inspected. (satoru)
+    if (boot_has_token(boot_cmdline, "kurono.wctest=1")) {
+        const uint64_t hi4g = 0x100000000ULL;          // ram above 4 gb
+        const uint64_t hi3t = 0x30040000000ULL;        // beyond the 2 tb boot map
+        uint64_t c1 = KernelVMM::SetIdentityWriteCombining(hi4g, 2ULL << 20);
+        bool h1 = false;
+        uint64_t e1 = KernelVMM::QueryRawEntry(hi4g, &h1);
+        SerialLogger::Log("[wctest] 4gb chunks=");
+        SerialLogger::LogDec((uint32_t)c1);
+        SerialLogger::Log(" entry=0x");
+        SerialLogger::LogHex((uint32_t)(e1 >> 32));
+        SerialLogger::LogHex((uint32_t)e1);
+        SerialLogger::Log(" ps=");
+        SerialLogger::LogDec(h1 ? 1 : 0);
+        SerialLogger::Log(" pwt=");
+        SerialLogger::LogDec((int)((e1 >> 3) & 1));
+        SerialLogger::Log(" pcd=");
+        SerialLogger::LogDec((int)((e1 >> 4) & 1));
+        SerialLogger::Log(" pat12=");
+        SerialLogger::LogDec((int)((e1 >> 12) & 1));
+        SerialLogger::Log("\r\n");
+        uint64_t c2 = KernelVMM::SetIdentityWriteCombining(hi3t, 2ULL << 20);
+        bool h2 = false;
+        uint64_t e2 = KernelVMM::QueryRawEntry(hi3t, &h2);
+        SerialLogger::Log("[wctest] 3tb chunks=");
+        SerialLogger::LogDec((uint32_t)c2);
+        SerialLogger::Log(" entry=0x");
+        SerialLogger::LogHex((uint32_t)(e2 >> 32));
+        SerialLogger::LogHex((uint32_t)e2);
+        SerialLogger::Log(" ps=");
+        SerialLogger::LogDec(h2 ? 1 : 0);
+        SerialLogger::Log(" pwt=");
+        SerialLogger::LogDec((int)((e2 >> 3) & 1));
+        SerialLogger::Log(" pcd=");
+        SerialLogger::LogDec((int)((e2 >> 4) & 1));
+        SerialLogger::Log(" pat12=");
+        SerialLogger::LogDec((int)((e2 >> 12) & 1));
+        SerialLogger::Log("\r\n");
+    }
     // headless two-boot kfs persistence test (gated by cmdline kurono.kfstest):
     // boot 1 - no marker present after restore - writes a small user-data tree
     // under /home/user/.kfstest, times PersistStore::SaveTree() (the KFS format +
@@ -3297,11 +4581,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             int bsz = KVFS::GetFileSize(big);
             if (bsz != 256 * 1024) { pass = false; SerialLogger::Log("[KFSTEST] big size wrong: "); SerialLogger::LogDec(bsz); SerialLogger::Log("\r\n"); }
             else {
-                static uint8_t vbuf[256 * 1024];
-                int got = KVFS::ReadFile(big, vbuf, sizeof(vbuf));
-                bool content_ok = (got == 256 * 1024);
+                uint8_t* vbuf = (uint8_t*)PMM::AllocBytes(256 * 1024);
+                int got = vbuf ? KVFS::ReadFile(big, vbuf, 256 * 1024) : -1;
+                bool content_ok = vbuf && (got == 256 * 1024);
                 if (content_ok) for (int i = 0; i < 256 * 1024; i++) if (vbuf[i] != (uint8_t)(1 + (i & 0xff))) { content_ok = false; SerialLogger::Log("[KFSTEST] big content mismatch at "); SerialLogger::LogDec(i); SerialLogger::Log("\r\n"); break; }
                 if (!content_ok) pass = false;
+                if (vbuf) PMM::FreeBytes(vbuf, 256 * 1024);
             }
             SerialLogger::Log(pass ? "[KFSTEST] PASS: user data restored from KFS volume across reboot\r\n"
                                    : "[KFSTEST] FAIL: restored data did not match\r\n");
@@ -3311,9 +4596,12 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             KVFS::Mkdirs("/etc/kfstest/deep/nested");
             KVFS::WriteString(marker, MVAL);
             KVFS::WriteString(deep, DVAL);
-            static uint8_t pat[256 * 1024];
-            for (int i = 0; i < 256 * 1024; i++) pat[i] = (uint8_t)(1 + (i & 0xff));
-            KVFS::WriteFile(big, pat, sizeof(pat));
+            uint8_t* pat = (uint8_t*)PMM::AllocBytes(256 * 1024);
+            if (pat) {
+                for (int i = 0; i < 256 * 1024; i++) pat[i] = (uint8_t)(1 + (i & 0xff));
+                KVFS::WriteFile(big, pat, 256 * 1024);
+                PMM::FreeBytes(pat, 256 * 1024);
+            }
             SerialLogger::Log("[KFSTEST] boot1 wrote marker + deep + 256KB big.bin\r\n");
             if (PersistStore::Available()) {
                 // snapshot the nvme write counters around SaveTree so we can show the
@@ -3355,6 +4643,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[USB] Init...\r\n");
     USB::Init();
     if (boot_usbtest) USB::SelfTest();
+    if (boot_usbmsdtest) USB::MsdSelfTest();
+    RuntimeLog::SetHoldGuardAcrossKvfs(boot_has_token(boot_cmdline, "kurono.rtlogleaf=0"));   // (satoru)
     RuntimeLog::InitFilesystem();
     RuntimeLog::LogBoot("kvfs online");
     RuntimeLog::LogSystem("kernel", "runtime filesystem layout created");
@@ -3365,15 +4655,31 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     if (KernelPanic::ScanCrashDumpAtBoot()) {
         RuntimeLog::LogCrash("recovered minidump from previous boot panic",
                              "see " KP_LOG_CRASH_DIR);
-        NotificationManager::Post("System recovered",
-                                  "recovered from a previous crash; logged to " KP_LOG_CRASH_DIR,
-                                  NotificationManager::ICON_WARNING, 6000);
+        // R9: name the stop code; Recovery's "Fix last issue" has the rest. (satoru)
+        static char rec_msg[96];
+        {
+            char code[16];
+            KScreen::PanicStopCode(KernelPanic::LastRecoveredStopCode(), code);
+            int p = 0;
+            const char* a = "Stop code ";
+            while (*a) rec_msg[p++] = *a++;
+            for (int i = 0; code[i]; i++) rec_msg[p++] = code[i];
+            a = ". Details: Settings > System > Recovery.";
+            while (*a && p < 94) rec_msg[p++] = *a++;
+            rec_msg[p] = 0;
+        }
+        NotificationManager::Post("Kurono restarted after a problem", rec_msg,
+                                  NotificationManager::ICON_WARNING, 8000);
     }
 
     // uiconfig must be initialized before any ui subsystem reads colors/sizes.
     // it writes /etc/kurono/ui.conf with defaults on first boot.
     SerialLogger::Log("[UIConfig] Init...\r\n");
     UIConfig::Init();
+    // the saved external panel timing lives in ui.conf, which is only readable
+    // after KVFS + the data disk are up; relight pipe b now (still before the
+    // desktop starts). IntelModeset::Boot lit the default 60 hz. (satoru)
+    if (IntelModeset::ApplySavedRate()) FramePacer::OutputsChanged();
     // seed the kss theme tokens from ui.conf (defaults to the black/grey palette). (satoru)
     KSS::Init();
     // build the kss stylesheet layer (named rules + transitions + keyframes) from
@@ -3466,6 +4772,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // SYS_UDF_CALL can route into the kernel UDFProxy. (satoru)
     UDF::Init();
     KldBroker::Init();
+    // kurono.kld.asgonetest=1: dead-container address space refusal self-test. (satoru)
+    if (boot_has_token(boot_cmdline, "kurono.kld.asgonetest=1")) KldBroker::AsGoneSelfTest();
     if (EmbeddedUserprogs::HasHello()) {
         KVFS::Mkdirs("/usr/bin");
         KVFS::WriteFile("/usr/bin/hello",
@@ -3526,6 +4834,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec((int)EmbeddedUserprogs::PthreadTestSize());
         SerialLogger::Log(" bytes)\r\n");
     }
+    // L2 mmap hole reuse test: `mmapreuse [t1|t2|t3|all]` from the shell. (satoru)
+    if (EmbeddedUserprogs::HasMmapReuseTest()) {
+        KVFS::Mkdirs("/usr/bin");
+        // registered silently: the dev test must not add a line to the default
+        // boot log (the L2 gate compares it byte for byte with main). (satoru)
+        KVFS::WriteFile("/usr/bin/mmap_reuse_test",
+                        EmbeddedUserprogs::MmapReuseTestData(),
+                        EmbeddedUserprogs::MmapReuseTestSize());
+    }
     // register the signal-delivery self-test so it can prove real syscall-boundary
     // signal delivery (rt_sigaction/procmask/sigreturn + kill). runs from the shell
     // or an [aptest]-style launch; prints "SIGTEST PASS" to com1 on success. (satoru)
@@ -3538,6 +4855,25 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec((int)EmbeddedUserprogs::SignalTestSize());
         SerialLogger::Log(" bytes)\r\n");
     }
+    // interruptible-sleep self-test (nanosleep/usleep/clock_nanosleep timing,
+    // SIGALRM EINTR + rem, ignored alarm, EINVAL, and 3 concurrent threads). (satoru)
+    if (EmbeddedUserprogs::HasSleepTest()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/sleeptest",
+                        EmbeddedUserprogs::SleepTestData(),
+                        EmbeddedUserprogs::SleepTestSize());
+        SerialLogger::Log("[Userspace] /usr/bin/sleeptest registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::SleepTestSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    // close-on-exec + unix socket table self-test, run by `fdtest`. (satoru)
+    if (EmbeddedUserprogs::HasFdTest()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/fdtest", EmbeddedUserprogs::FdTestData(), EmbeddedUserprogs::FdTestSize());
+        // a linux execve of /usr/bin/x resolves to the kvfs /system/bin/x. (satoru)
+        KVFS::Mkdirs("/system/bin");
+        KVFS::WriteFile("/system/bin/fdtest", EmbeddedUserprogs::FdTestData(), EmbeddedUserprogs::FdTestSize());
+    }
     // register the KLD driver container. this is an UNMODIFIED upstream linux
     // e1000e driver linked against the lx_emul shim, running as an ordinary
     // Kurono userspace process. the kernel links none of it. (satoru)
@@ -3548,6 +4884,29 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
                         EmbeddedUserprogs::KldE1000eSize());
         SerialLogger::Log("[Userspace] /usr/bin/kld-e1000e registered (");
         SerialLogger::LogDec((int)EmbeddedUserprogs::KldE1000eSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    // ring-3 audio daemon binary (only run with kurono.r3audio=1). (satoru)
+    if (EmbeddedUserprogs::HasAudiod()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/audiod",
+                        EmbeddedUserprogs::AudiodData(),
+                        EmbeddedUserprogs::AudiodSize());
+        SerialLogger::Log("[Userspace] /usr/bin/audiod registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::AudiodSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
+    // audio control tool: kaudio restart|stop|status writes the command to
+    // /dev/kaudio, the audio-named kshell channel. /system/bin is the PATH
+    // entry a ring-3 shell and claude's bash already have. (satoru)
+    if (EmbeddedUserprogs::HasKaudio()) {
+        KVFS::Mkdirs("/system/bin");
+        KVFS::WriteFile("/system/bin/kaudio",
+                        EmbeddedUserprogs::KaudioData(),
+                        EmbeddedUserprogs::KaudioSize());
+        KVFS::Chmod("/system/bin/kaudio", 0755);
+        SerialLogger::Log("[Userspace] /system/bin/kaudio registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::KaudioSize());
         SerialLogger::Log(" bytes)\r\n");
     }
     // register the user-pointer validation regression test. kurono.uatest=1 runs
@@ -3706,11 +5065,51 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         KVFS::Chmod("/system/bin/busybox", 0755);
         SerialLogger::Log("[Userspace] no recovery toolbox: built-in busybox at /system/bin/busybox\r\n");
     }
+    // every busybox applet plus the kurono built-ins (ksys/kdrv/kinit/audio...)
+    // become names in /system/bin, which linux sees as /bin and /usr/bin. (satoru)
+    AgentTools::Install();
+    ClaudeHost::CacheEnvFile();   // CLAUDE.ENV for claude started from any terminal (satoru)
+    OpenCodeHost::CacheEnvFile();   // OPENCODE.ENV provider keys (satoru)
+    { extern bool g_vfork_fix; if (boot_has_token(boot_cmdline, "kurono.vforkfix=0")) g_vfork_fix = false; }   // (satoru)
+    { extern bool g_exit_wait; if (boot_has_token(boot_cmdline, "kurono.exitwait=0")) g_exit_wait = false; }   // (satoru)
+    { extern bool g_futex_sig; if (boot_has_token(boot_cmdline, "kurono.futexsig=0")) g_futex_sig = false; }   // (satoru)
+    { extern bool g_zcopy_einval; if (boot_has_token(boot_cmdline, "kurono.zcopy=old")) g_zcopy_einval = false; }   // (satoru)
+    { extern bool g_symlink_old; if (boot_has_token(boot_cmdline, "kurono.symlinks=old")) g_symlink_old = true; }   // (satoru)
+    { extern bool g_getdents_nodots; if (boot_has_token(boot_cmdline, "kurono.getdents=nodots")) g_getdents_nodots = true; }   // (satoru)
+    { extern bool g_sigchld; if (boot_has_token(boot_cmdline, "kurono.sigchld=0")) g_sigchld = false; }   // (satoru)
+    { extern bool g_sigsus_yield; if (boot_has_token(boot_cmdline, "kurono.sigsusyield=0")) g_sigsus_yield = false; }   // (satoru)
+    { extern bool g_pipe_block; if (boot_has_token(boot_cmdline, "kurono.pipeblock=0")) g_pipe_block = false; }   // (satoru)
+    { extern bool g_pgrp_zombies; if (boot_has_token(boot_cmdline, "kurono.pgrpzombie=0")) g_pgrp_zombies = false; }   // (satoru)
+    { extern bool g_pid_mono; if (boot_has_token(boot_cmdline, "kurono.pidmono=0")) g_pid_mono = false; }   // (satoru)
+    { extern bool g_exit_pending_sig; if (boot_has_token(boot_cmdline, "kurono.exitsig=0")) g_exit_pending_sig = false; }   // (satoru)
+    {   // kurono.vm.pt=BB:DD.F[,...]: pci functions kept for vm kurono guests (satoru)
+        char pt[64];
+        if (boot_get_value(boot_cmdline, "kurono.vm.pt", pt, sizeof(pt))) PCIPassthrough::ParseReserveList(pt);
+    }
+    {   // kurono.dbgwatch=<hex va>[,<hex va>]: hardware write watchpoints (satoru)
+        char dw[48];
+        if (boot_get_value(boot_cmdline, "kurono.dbgwatch", dw, sizeof(dw))) {
+            uint64_t v[2] = { 0, 0 }; int k = 0;
+            for (int i = 0; dw[i] && k < 2; i++) {
+                char c = dw[i];
+                if (c == ',') { k++; continue; }
+                if (c == 'x' || c == 'X') { v[k] = 0; continue; }
+                int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+                if (d >= 0) v[k] = v[k] * 16 + (uint64_t)d;
+            }
+            DbgWatch::Arm(v[0], v[1]);
+        }
+    }
     // (see irqlat_runner_entry above for the launcher.)
     // register the kld network a/b bench (kurono.kld.bench=1). (satoru)
     if (EmbeddedUserprogs::HasKldBench()) {
         KVFS::Mkdirs("/usr/bin");
         KVFS::WriteFile("/usr/bin/kldnetbench", EmbeddedUserprogs::KldBenchData(), EmbeddedUserprogs::KldBenchSize());
+    }
+    // register the cpu scaling probe (kurono.smpscale). (satoru)
+    if (EmbeddedUserprogs::HasSmpScale()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/smpscale", EmbeddedUserprogs::SmpScaleData(), EmbeddedUserprogs::SmpScaleSize());
     }
     // register the userspace wake-latency probe. kurono.irqlat runs it headless
     // and it prints [irqlat] lines to com1 - the KLD phase-0 instrument. (satoru)
@@ -3723,14 +5122,26 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec((int)EmbeddedUserprogs::IrqLatSize());
         SerialLogger::Log(" bytes)\r\n");
     }
+    // register the posix_spawn static-elf64 repro. kurono.spawntest=1 runs it
+    // headless; it prints [spawntest] lines to com1. (satoru)
+    if (EmbeddedUserprogs::HasSpawnTest()) {
+        KVFS::Mkdirs("/usr/bin");
+        KVFS::WriteFile("/usr/bin/spawntest",
+                        EmbeddedUserprogs::SpawnTestData(),
+                        EmbeddedUserprogs::SpawnTestSize());
+        SerialLogger::Log("[Userspace] /usr/bin/spawntest registered (");
+        SerialLogger::LogDec((int)EmbeddedUserprogs::SpawnTestSize());
+        SerialLogger::Log(" bytes)\r\n");
+    }
     // register the dynamic musl pie + its libc.so. this is the first real
     // exercise of ld-kurono's dynamic-load path (load a pie at the 64tb aslr
     // base, recurse into DT_NEEDED, relocate, run). the .so lands in a default
     // ld-kurono search path so the pie's DT_NEEDED (libc.musl-x86_64.so.1)
     // resolves. `dyntest` runs it from the shell. (satoru)
     if (EmbeddedUserprogs::HasMuslLibc()) {
+        KAsset::Deliver("MUSLLIBC SO ", _binary_musl_libc_so_start, _binary_musl_libc_so_end);
         KVFS::Mkdirs("/system/lib");
-        KVFS::WriteFile("/system/lib/libc.musl-x86_64.so.1",
+        KVFS::WriteFileStatic("/system/lib/libc.musl-x86_64.so.1",
                         EmbeddedUserprogs::MuslLibcData(),
                         EmbeddedUserprogs::MuslLibcSize());
         // also seed it at the PT_INTERP path so ld-kurono resolves the exe's
@@ -3743,6 +5154,21 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::Log("[Userspace] musl libc.so registered at /system/lib + /lib (");
         SerialLogger::LogDec((int)EmbeddedUserprogs::MuslLibcSize());
         SerialLogger::Log(" bytes)\r\n");
+    }
+    // the musl c++ runtime (alpine's libstdc++ + libgcc_s, the same files the
+    // firefox package ships) for musl programs that link it dynamically, e.g.
+    // opencode. root files LIBSTDC.SO and LIBGCCS.SO on the KURONO partition;
+    // absent files are a no-op. (satoru)
+    {
+        bool a = KAsset::EnsureVfsFile("/system/lib/libstdc++.so.6", "LIBSTDC SO ", nullptr, nullptr);
+        bool b = KAsset::EnsureVfsFile("/system/lib/libgcc_s.so.1", "LIBGCCS SO ", nullptr, nullptr);
+        if (a || b) {
+            SerialLogger::Log("[Userspace] musl c++ runtime: libstdc++=");
+            SerialLogger::LogDec(a ? 1 : 0);
+            SerialLogger::Log(" libgcc_s=");
+            SerialLogger::LogDec(b ? 1 : 0);
+            SerialLogger::Log("\r\n");
+        }
     }
     if (EmbeddedUserprogs::HasLibfoo()) {
         // dyntest's extra dependency. seeded in a default musl search dir
@@ -4129,6 +5555,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     SerialLogger::Log("[Installer] Init...\r\n");
     Installer::Init();
     Installer::RegisterShellCommands(&shell_instance);
+    InstallerService::RegisterShellCommands(&shell_instance);
 
     SerialLogger::Log("[Network] Init...\r\n");
     Network::Init();
@@ -4277,6 +5704,15 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::LogDec(EmbeddedMedia::DenjiKVIDSize());
         SerialLogger::Log(" bytes\r\n");
     }
+    // test hook (kurono.media.seed=1): the ring-3 media player only sees /home, so copy the
+    // on-demand demo clips from the KURONO partition into /home/user/Videos. (satoru)
+    if (boot_media_seed && !EmbeddedMedia::VideosLinked()) {
+        if (EmbeddedMedia::HasDenjiKVID())
+            KVFS::WriteFileStatic("/home/user/Videos/denji.kvid", EmbeddedMedia::DenjiKVIDData(), EmbeddedMedia::DenjiKVIDSize());
+        if (EmbeddedMedia::HasSsstikKVID())
+            KVFS::WriteFileStatic("/home/user/Videos/ssstik.kvid", EmbeddedMedia::SsstikKVIDData(), EmbeddedMedia::SsstikKVIDSize());
+        SerialLogger::Log("[KVFS] media seed: demo clips copied into /home/user/Videos\r\n");
+    }
     // user-imported video: original mp4 + playable kvid (satoru)
     if (EmbeddedMedia::VideosLinked() && EmbeddedMedia::HasSsstikMP4()) {
         KVFS::WriteFileStatic("/home/user/Videos/ssstik.mp4",
@@ -4311,7 +5747,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     KVFS::WriteString("/home/user/Desktop/README.txt", "Your Kurono desktop.\n\nApps can be launched from the Start Menu (bottom-left).\nRight-click the desktop for wallpaper & display settings.\n");
     KVFS::WriteString("/home/user/Pictures/screenshot.bmp", "[BMP 1024x768 24-bit placeholder]");
     KVFS::WriteString("/home/user/Projects/kurono/main.kcl", "# kurono project\nset project_name = \"MyApp\"\nprint(\"Building\", project_name, \"...\")\nprint(\"Done!\")\n");
-    KVFS::WriteString("/home/user/.bashrc", "alias ls='ls -l'\nalias ll='ls -la'\nalias cls='clear'\necho \"Welcome back to Kurono!\"\n");
+    // the banner only for an interactive shell: claude code sources ~/.bashrc
+    // for its tool shells, and the line ended up in every command's output. (satoru)
+    KVFS::WriteString("/home/user/.bashrc", "alias ls='ls -l'\nalias ll='ls -la'\nalias cls='clear'\ncase $- in *i*) echo \"Welcome back to Kurono!\";; esac\n");
     KVFS::WriteString("/home/user/.profile", "export PATH=/usr/bin:/usr/local/bin:/home/user/bin\nexport HOME=/home/user\nexport USER=user\n");
     KVFS::WriteString("/home/user/notes.txt", "Kurono OS Notes\n==============\n\nThings to try:\n- Open Terminal and type 'help'\n- Run 'kurono log' to see system logs\n- Open Task Manager to see processes\n- Browse files in File Manager\n- Try the Calculator app\n- Run 'neofetch' for system info\n");
     KVFS::WriteString("/home/user/welcome.html", "<html><body><h1>Welcome to Kurono</h1><p>A bare-metal operating system.</p><p>Try the browser app to view this.</p></body></html>");
@@ -4335,6 +5773,8 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         SerialLogger::Log("[80211] running wpa2 security self-test\r\n");
         Ieee80211Test::RunAll();
     }
+
+    if (boot_platform_test) PlatformTest::Run();   // (satoru)
 
     // kj language self-test (gated by cmdline kurono.kjtest): kss sheet layer is
     // initialized above, so the kss host-binding checks have a live sheet. (satoru)
@@ -4432,6 +5872,14 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // the desktop layout below may resize the back buffer (ui scale): keep the
     // boot animation's ap away from it until the display manager is up. (satoru)
     BootAnim::Pause();
+    // the crash store (KBOOT.CFG / KDRIVERS.CFG / KCRASH.LOG with kurono.kcrash=1)
+    // opens in the boot watch process, before it reads KBOOT.CFG (its writes may
+    // sleep, which needs a kernel process). it used to open only from a kld
+    // family runner (fix 4). (satoru)
+    BootCfg::SetCrashStoreDisk(boot_has_token(boot_cmdline, "kurono.kcrash=1"));
+    // 3a: confirm or roll back this boot. recovery boots are never counted
+    // (the loader already reset the streak); a cli boot counts as started. (satoru)
+    if (!boot_recovery) BootCfg::StartWatch(boot_slot);
     if (has_display && !boot_cli) {
         SerialLogger::Log("[Desktop] Init...\r\n");
         RuntimeLog::LogBoot("desktop initialization started");
@@ -4459,6 +5907,59 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // silent and inert when the flag is absent. (satoru)
         UiDiag::Enable(boot_has_token(boot_cmdline, "kurono.uidiag=1"));
         IntelAccel::ZeroCopyBoot(boot_has_token(boot_cmdline, "kurono.igpu.zerocopy=1"));
+        // stage 2b: double-buffered page flip (kurono.igpu.flip=1), the
+        // replacement for direct zero-copy. kurono.igpu.fliptest=1 runs the
+        // same flip bookkeeping in qemu against a stand-in scanout. silent
+        // when neither flag is present. (satoru)
+        // gt stages, each with its own flag, all default off: kurono.igpu.gt=1
+        // brings the blitter engine up without guc and proves a no-op batch
+        // ran; kurono.igpu.blt=1 adds the fill/copy tests with cpu readback.
+        // kurono.igpu.gttest=1 runs both in qemu against the software model
+        // of the engine. before FlipBoot, so the flip's ggtt windows are
+        // picked with the gt's entries already owned. (satoru)
+        {
+            bool gt_sim = boot_has_token(boot_cmdline, "kurono.igpu.gttest=1");
+            int st_n = 0;
+            {
+                char sv[12];
+                if (boot_get_value(boot_cmdline, "kurono.igpu.selftest", sv, sizeof(sv))) {
+                    for (int k = 0; sv[k] >= '0' && sv[k] <= '9'; k++) st_n = st_n * 10 + (sv[k] - '0');
+                    if (st_n == 1) st_n = 10240;          // =1 means the default run (satoru)
+                }
+            }
+            int st_ops = 0;
+            {
+                char ov[8];
+                if (boot_get_value(boot_cmdline, "kurono.igpu.selftest.jobops", ov, sizeof(ov)))
+                    for (int k = 0; ov[k] >= '0' && ov[k] <= '9'; k++) st_ops = st_ops * 10 + (ov[k] - '0');
+            }
+            int st_mode = 0, st_flush = 1;
+            {
+                char mv[8];
+                if (boot_get_value(boot_cmdline, "kurono.igpu.selftest.mode", mv, sizeof(mv))) st_mode = mv[0] - '0';
+                if (boot_get_value(boot_cmdline, "kurono.igpu.gt.flush", mv, sizeof(mv))) st_flush = mv[0] - '0';
+            }
+            IntelGt::SetSelftest(st_n, st_ops, st_mode, st_flush);
+            bool gt_blt = boot_has_token(boot_cmdline, "kurono.igpu.blt=1") || st_n > 0;
+            bool gt_on = boot_has_token(boot_cmdline, "kurono.igpu.gt=1") || gt_blt;
+            IntelGt::Boot(gt_on, gt_blt, gt_sim);
+        }
+        // test rig: kurono.testdim=N sets every output's software dim to N%
+        // right here, like a saved display.brightness restored by the control
+        // center before the flip starts (the laptop's flip refusal). (satoru)
+        {
+            char dv[8];
+            if (boot_get_value(boot_cmdline, "kurono.testdim", dv, sizeof(dv))) {
+                int pct = 0;
+                for (int k = 0; dv[k] >= '0' && dv[k] <= '9'; k++) pct = pct * 10 + (dv[k] - '0');
+                for (int o = 0; o < OUTPUT_MAX; o++) Graphics::SetOutputBrightness(o, pct);
+                SerialLogger::Log("[testdim] software dim of every output set to ");
+                SerialLogger::LogDec(pct);
+                SerialLogger::Log("%\r\n");
+            }
+        }
+        IntelAccel::FlipBoot(boot_has_token(boot_cmdline, "kurono.igpu.flip=1"),
+                             boot_has_token(boot_cmdline, "kurono.igpu.fliptest=1"));
 
         // qemu test hook: run the zero-copy present machinery without an intel
         // display. 1 = write-back ram scanout with a cpu damage copy; wc =
@@ -4538,9 +6039,13 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             UserManager::Login("user", "user");
             SerialLogger::Log("[gui-autorun] auto-logged in, skipping lockscreen\r\n");
         } else {
+            // the sign-in screen is up: the system started. a slow sign-in must
+            // not count as a failed boot (or end a trial). (satoru)
+            BootCfg::NoteDesktop();
             LockScreen::Show();
         }
         RuntimeLog::LogBoot("desktop ready");
+        BootCfg::NoteDesktop();   // the boot watch confirms this boot 60 s later (satoru)
     }
 
     // calculator is now launched via start menu → wm, no standalone init
@@ -4660,6 +6165,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
             SerialLogger::Log(" (");
             SerialLogger::Log(IntelGPU::GetGenName());
             SerialLogger::Log(")\r\n");
+            Backlight::Probe();   // read only (satoru)
         }
     } else {
         SerialLogger::Log("[GPU] Intel iGPU driver skipped (no Intel iGPU present)\r\n");
@@ -4722,11 +6228,19 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // just print the detected info here. (satoru)
     CPUDetect::PrintInfo();
 
+    if (boot_recovery) {
+        RuntimeLog::LogBoot("recovery");
+        Recovery::Run(boot_recovery_reason);   // never returns (satoru)
+    }
     if (boot_cli) {
         cli_decode_command(boot_cli_run);
         SerialLogger::Log("[CLI] Entering CLI boot shell\r\n");
         RuntimeLog::LogBoot("cli shell ready");
         RuntimeLog::LogSystem("kernel", "entered cli boot mode");
+        // a cli boot that reached its prompt started fine. confirmed here and
+        // now: kernel processes may not run before the cli loop does. (satoru)
+        BootCfg::NoteDesktop();
+        BootCfg::ConfirmDesktop(boot_slot);
         cli_run_shell(boot_cli_run[0] ? boot_cli_run : nullptr, boot_cli_poweroff);
     }
 
@@ -4755,15 +6269,32 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     // kernel-process so the (deliberately sleepy) probe never blocks the gui
     // loop, and so it is scheduled like any other task. it prints [irqlat]
     // lines to com1 and exits. (satoru)
+    if (g_smpscale_threads > 0 && EmbeddedUserprogs::HasSmpScale()) {
+        SerialLogger::Log("[smpscale] launching /usr/bin/smpscale\r\n");
+        Scheduler::SpawnKernelProcess("smpscale-run", smpscale_runner_entry, PRIO_NORMAL, 64, 32 * 1024);
+    }
     if (boot_irqlat && EmbeddedUserprogs::HasIrqLat()) {
         SerialLogger::Log("[irqlat] launching /usr/bin/irqlat (ring-3 wake latency)\r\n");
         Scheduler::SpawnKernelProcess("irqlat-run", irqlat_runner_entry,
                                       PRIO_NORMAL, 64, 32 * 1024);
     }
+    // kurono.spawntest=1: run the posix_spawn static-elf64 repro once at boot. (satoru)
+    if (boot_spawntest && EmbeddedUserprogs::HasSpawnTest()) {
+        SerialLogger::Log("[spawntest] launching /usr/bin/spawntest (posix_spawn static elf)\r\n");
+        Scheduler::SpawnKernelProcess("spawntest-run", spawntest_runner_entry,
+                                      PRIO_NORMAL, 64, 32 * 1024);
+    }
 
+    if (boot_has_token(boot_cmdline, "kurono.straytest=1")) {   // stray-vector self test (satoru)
+        Scheduler::SpawnKernelProcess("straytest", straytest_entry, PRIO_NORMAL, 64, 32 * 1024);
+    }
     if (boot_vmtest) {
         Scheduler::SpawnKernelProcess("vmtest", vmtest_runner_entry,
                                       PRIO_LOW, 64, 32 * 1024);
+    }
+    if (R3Audio::Enabled() && EmbeddedUserprogs::HasAudiod()) {
+        Scheduler::SpawnKernelProcess("r3audio", r3audio_runner_entry,
+                                      PRIO_HIGH  , 64, 64 * 1024);
     }
     if (boot_uatest && EmbeddedUserprogs::HasUaTest()) {
         Scheduler::SpawnKernelProcess("uatest", uatest_runner_entry,
@@ -4786,6 +6317,18 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         Scheduler::SpawnKernelProcess("churn", churn_runner_entry,
                                       PRIO_NORMAL, 64, 32 * 1024);
     }
+    if (boot_mmapchurn && _binary_churn_elf_start) {
+        Scheduler::SpawnKernelProcess("mmapchurn", mmapchurn_runner_entry,
+                                      PRIO_NORMAL, 64, 32 * 1024);
+    }
+    if (boot_kldperm && _binary_churn_elf_start) {
+        Scheduler::SpawnKernelProcess("kldperm", kldperm_runner_entry,
+                                      PRIO_NORMAL, 64, 32 * 1024);
+    }
+    if (boot_elfreload && EmbeddedUserprogs::HasMuslHello()) {
+        Scheduler::SpawnKernelProcess("elfreload", elfreload_runner_entry,
+                                      PRIO_NORMAL, 64, 48 * 1024);
+    }
     if (boot_memtest && _binary_memtest_elf_start) {
         Scheduler::SpawnKernelProcess("memtest", memtest_runner_entry,
                                       PRIO_NORMAL, 64, 32 * 1024);
@@ -4806,6 +6349,7 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         Scheduler::SpawnKernelProcess("disklog", DiskLog::WorkerEntry,
                                       PRIO_NORMAL, 64, 64 * 1024);
     }
+    PowerManager::Start();   // one worker for power actions + the autosave cadence (satoru)
     if (boot_claude) {
         Scheduler::SpawnKernelProcess("claude", ClaudeHost::BootRunnerEntry,
                                       PRIO_NORMAL, 64, 64 * 1024);
@@ -4822,6 +6366,10 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         Scheduler::SpawnKernelProcess("audiotest2", audiotest2_entry,
                                       PRIO_NORMAL, 64, 64 * 1024);
     }
+    if (boot_usbaudiotest) {
+        Scheduler::SpawnKernelProcess("usbaudiotest", usbaudiotest_runner_entry,
+                                      PRIO_NORMAL, 64, 64 * 1024);
+    }
     if (boot_nettest) {
         Scheduler::SpawnKernelProcess("nettest", nettest_runner_entry,
                                       PRIO_NORMAL, 64, 64 * 1024);
@@ -4830,8 +6378,21 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         Scheduler::SpawnKernelProcess("bbtest", bbtest_runner_entry,
                                       PRIO_NORMAL, 64, 64 * 1024);
     }
+    kld_firmware_init_once();
     if (boot_kldacpi) {
         Scheduler::SpawnKernelProcess("kld-acpi", kldacpi_runner_entry,
+                                      PRIO_NORMAL, 64, 64 * 1024);
+    }
+    if (boot_kldapitest) {
+        Scheduler::SpawnKernelProcess("kld-apitest", kld_apitest_runner_entry,
+                                      PRIO_NORMAL, 64, 64 * 1024);
+    }
+    if (boot_kldi2chid) {
+        Scheduler::SpawnKernelProcess("kld-i2chid", kld_i2chid_runner_entry,
+                                      PRIO_NORMAL, 64, 64 * 1024);
+    }
+    if (boot_kldiwlwifi) {
+        Scheduler::SpawnKernelProcess("kld-iwlwifi", kld_iwlwifi_runner_entry,
                                       PRIO_NORMAL, 64, 64 * 1024);
     }
     if (boot_kldbench && EmbeddedUserprogs::HasKldBench()) {
@@ -4841,6 +6402,22 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
     } else if (boot_kld && EmbeddedUserprogs::HasKldE1000e()) {
         Scheduler::SpawnKernelProcess("kld-run", kld_runner_entry,
                                       PRIO_NORMAL, 64, 64 * 1024);
+    }
+    if (boot_kldauto) {
+        Scheduler::SpawnKernelProcess("kld-auto", KldAuto::RunnerEntry,
+                                      PRIO_NORMAL, 64, 64 * 1024);
+    }
+    if (boot_kldstats) {
+        Scheduler::SpawnKernelProcess("kld-stats", kld_stats_entry,
+                                      PRIO_LOW, 64, 8 * 1024);
+    }
+    if (KldDisplay::Wanted() && KldDisplay::GetMode() == KldDisplay::MODE_PATTERN) {
+        Scheduler::SpawnKernelProcess("kld-display-pattern", KldDisplay::PatternEntry,
+                                      PRIO_NORMAL, 64, 64 * 1024);
+    }
+    if (boot_kldmsixcheck) {
+        Scheduler::SpawnKernelProcess("kld-msixcheck", KldAuto::MsixCheckEntry,
+                                      PRIO_NORMAL, 64, 16 * 1024);
     }
 
     SerialLogger::Log("Entering main loop\r\n");
@@ -4899,7 +6476,9 @@ extern "C" void kernel_main(uint64_t magic, uint64_t mb_addr) {
         // must precede SpawnAll: the gui process samples the grace at entry. (satoru)
         if (boot_fastrun) KernelProcesses::SetAutorunDelayMs(250u);
         if (boot_fpsbench) KernelProcesses::SetFpsBench(boot_fpsbench);
+        if (boot_has_token(boot_cmdline, "kurono.pacesleep=1")) KernelProcesses::SetPaceSleep(true);   // 4e (satoru)
         if (boot_fpsbench == 3) Graphics::SetForceFullPresent(true);
+        if (boot_pacetest) KernelProcesses::SetPaceTest(boot_pacetest);
         int spawned = KernelProcesses::SpawnAll();
         SerialLogger::Log("[Kernel] Kernel processes spawned: ");
         SerialLogger::LogDec(spawned);

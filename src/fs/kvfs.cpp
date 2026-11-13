@@ -4,6 +4,7 @@
 #include "../proc/kernel_locks.h"   // g_vfs_lock, SpinLockCpuGuard
 #include "../kernel/pmm.h"          // ram top bounds the node-pointer sanity check (satoru)
 #include "../kernel/taskmem.h"   // kurono.taskmem=1 (satoru)
+#include "../drivers/timer.h"   // [kvfsgrow] timing (satoru)
 
 // file nodes and contents are shared filesystem data: with kurono.taskmem=1
 // they are charged to the "File cache (KVFS)" bucket, not to whichever task
@@ -11,6 +12,57 @@
 static void* kvfs_heap_alloc(size_t n) {
     TaskMem::AppScope s(TaskMem::APP_FILECACHE);
     return KernelHeap::Alloc(n);
+}
+
+// ---- KVFSNode children (satoru) ----
+void KVFSNode::rebuild_hash() {
+    if (!hash_table || hash_size == 0) return;
+    for (int i = 0; i < hash_size; i++) hash_table[i] = -1;
+    for (int i = 0; i < child_count; i++) {
+        if (!children[i]) continue;
+        uint32_t h = hash_name(children[i]->name) & (uint32_t)(hash_size - 1);
+        for (int probe = 0; probe < hash_size; probe++) {
+            int slot = (int)((h + (uint32_t)probe) & (uint32_t)(hash_size - 1));
+            if (hash_table[slot] < 0) { hash_table[slot] = i; break; }
+        }
+    }
+}
+
+bool KVFSNode::add_child(KVFSNode* c) {
+    if (child_count >= KVFS_DIR_LIMIT) return false;
+    if (child_count >= child_cap) {
+        int ncap = child_cap ? child_cap * 2 : 8;
+        if (ncap > KVFS_DIR_LIMIT) ncap = KVFS_DIR_LIMIT;
+        KVFSNode** nc = (KVFSNode**)kvfs_heap_alloc(sizeof(KVFSNode*) * (size_t)ncap);
+        if (!nc) return false;
+        for (int i = 0; i < child_count; i++) nc[i] = children[i];
+        for (int i = child_count; i < ncap; i++) nc[i] = nullptr;
+        int nhs = 16;
+        while (nhs < ncap * 2) nhs <<= 1;
+        int32_t* nh = (int32_t*)kvfs_heap_alloc(sizeof(int32_t) * (size_t)nhs);
+        if (!nh) { KernelHeap::Free(nc); return false; }
+        if (children) KernelHeap::Free(children);
+        if (hash_table) KernelHeap::Free(hash_table);
+        children = nc; child_cap = ncap;
+        hash_table = nh; hash_size = nhs;
+        rebuild_hash();
+    }
+    c->parent = this;
+    children[child_count] = c;
+    uint32_t h = hash_name(c->name) & (uint32_t)(hash_size - 1);
+    for (int probe = 0; probe < hash_size; probe++) {
+        int slot = (int)((h + (uint32_t)probe) & (uint32_t)(hash_size - 1));
+        if (hash_table[slot] < 0) { hash_table[slot] = child_count; break; }
+    }
+    child_count++;
+    return true;
+}
+
+void KVFSNode::free_child_arrays() {
+    if (children) KernelHeap::Free(children);
+    if (hash_table) KernelHeap::Free(hash_table);
+    children = nullptr; hash_table = nullptr;
+    child_cap = 0; hash_size = 0;
 }
 
 KVFSNode* KVFS::root = nullptr;
@@ -50,8 +102,11 @@ static void kmemcpy(void* dst, const void* src, uint32_t n) {
 }
 
 static void kmemset(void* dst, uint8_t v, uint32_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    for (uint32_t i = 0; i < n; i++) d[i] = v;
+    // the kernel's word-wise memset (kernel/types.cpp), like kmemcpy: a file
+    // write that grows the content zeroes the whole new tail here (doubling: up
+    // to tens of mb for a sqlite db), and the byte loop held kls 50-150 ms in
+    // firefox's pwritev2/write of places/indexeddb/scriptCache files. (satoru)
+    memset(dst, (int)v, (size_t)n);
 }
 
 // choose a new content_capacity for a buffer that must hold at least `need`
@@ -73,6 +128,35 @@ static uint32_t kvfs_grow_cap(uint32_t old_cap, uint32_t need) {
     if (cap < KVFS_BLOCK_SIZE) cap = KVFS_BLOCK_SIZE;
     if (cap < need) cap = (need + KVFS_BLOCK_SIZE - 1) & ~((uint32_t)KVFS_BLOCK_SIZE - 1);
     return cap;
+}
+
+// lazy KFS-backed file bytes: installed by PersistStore when the volume is up. (satoru)
+static KVFS::LazyEnsureFn g_lazy_ensure = nullptr;
+static KVFS::LazyReadFn   g_lazy_read   = nullptr;
+void KVFS::SetLazyBackend(LazyEnsureFn ensure, LazyReadFn read) {
+    g_lazy_ensure = ensure;
+    g_lazy_read = read;
+}
+static bool lazy_backend_ready() {
+    return g_lazy_ensure && g_lazy_read && g_lazy_ensure();
+}
+// caller holds g_vfs_lock. reads the whole file into owned heap content. (satoru)
+static uint8_t* materialize_nolock(KVFSNode* n) {
+    if (!n) return nullptr;
+    if (!n->lazy_kfs) return n->content;
+    if (n->content) { n->lazy_kfs = false; return n->content; }
+    if (n->size == 0) { n->lazy_kfs = false; return nullptr; }
+    uint32_t cap = kvfs_grow_cap(0, n->size);
+    uint8_t* buf = (uint8_t*)kvfs_heap_alloc(cap);
+    if (!buf) return nullptr;
+    bool ok = lazy_backend_ready() &&
+              g_lazy_read(n->link_target, 0, buf, n->size) == (int64_t)n->size;
+    if (!ok) { KernelHeap::Free(buf); return nullptr; }
+    n->content = buf;
+    n->content_capacity = cap;
+    n->lazy_kfs = false;
+    n->link_target[0] = 0;
+    return buf;
 }
 
 // small recently-resolved-path cache so repeated Open of the same path
@@ -111,6 +195,14 @@ static void PathCacheInvalidate() {
     path_cache_clock = 0;
 }
 
+// file times are wall-clock unix seconds (rtc/ntp base + uptime). they were never
+// set (0 = 1970) except by utimensat, so make and git's racy-clean check could
+// not see an edit that kept the size (satoru)
+// every file was from 1970 lmao. git hated me
+static inline uint32_t kvfs_now() {
+    return (uint32_t)(TimeManager::RealtimeBaseSeconds() + Timer::GetRealMs64() / 1000);
+}
+
 KVFSNode* KVFS::AllocNode(const char* name, KVFSNodeType type, uint16_t mode) {
     KVFSNode* n = (KVFSNode*)kvfs_heap_alloc(sizeof(KVFSNode));
     if (!n) return nullptr;
@@ -128,13 +220,16 @@ KVFSNode* KVFS::AllocNode(const char* name, KVFSNodeType type, uint16_t mode) {
     n->dev_read = nullptr;
     n->dev_write = nullptr;
     n->link_target[0] = 0;
-    for (int i = 0; i < KVFSNode::HASH_SIZE; i++) n->hash_table[i] = -1;
+    n->created = n->modified = n->accessed = kvfs_now();   // (satoru)
+    n->children = nullptr; n->child_cap = 0;   // grown on the first add_child (satoru)
+    n->hash_table = nullptr; n->hash_size = 0;
     return n;
 }
 
 void KVFS::FreeNode(KVFSNode* node) {
     if (!node) return;
     if (node->content) KernelHeap::Free(node->content);
+    node->free_child_arrays();   // (satoru)
     KernelHeap::Free(node);
 }
 
@@ -229,6 +324,27 @@ KVFSNode* KVFS::Resolve_nolock(const char* path) {
     return n;
 }
 
+// the node AT path without following a final symlink (lstat, readlink): the
+// parent is resolved normally, the last component is looked up as is (satoru)
+KVFSNode* KVFS::ResolveNoFollow(const char* path) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    char norm[KVFS_MAX_PATH];
+    NormalizePath(path, norm, KVFS_MAX_PATH);
+    int len = kstrlen(norm);
+    while (len > 1 && norm[len - 1] == '/') norm[--len] = 0;
+    int last = -1;
+    for (int i = len - 1; i >= 0; i--) if (norm[i] == '/') { last = i; break; }
+    if (last < 0 || len <= 1) return ResolvePath_nolock(norm, nullptr);
+    const char* name = norm + last + 1;
+    if (kstreq(name, ".") || kstreq(name, "..")) return ResolvePath_nolock(norm, nullptr);
+    char parent[KVFS_MAX_PATH];
+    if (last == 0) { parent[0] = '/'; parent[1] = 0; }
+    else { for (int i = 0; i < last; i++) parent[i] = norm[i]; parent[last] = 0; }
+    KVFSNode* dir = ResolvePath_nolock(parent, nullptr);
+    if (!dir || !dir->is_dir()) return nullptr;
+    return dir->find_child(name);
+}
+
 KVFSNode* KVFS::ResolvePath(const char* path, KVFSNode* from) {
     SpinLockCpuGuard guard(g_vfs_lock);
     return ResolvePath_nolock(path, from);
@@ -275,13 +391,34 @@ KVFSNode* KVFS::ResolvePath_nolock(const char* path, KVFSNode* from) {
                         char comp2[KVFS_MAX_NAME];
                         int cci = 0;
                         bool fail = false;
+                        if (child->link_target[0] != '/' && child->link_target[0] != 0) {
+                            // a relative target ("c", "../lib/x") resolves from the
+                            // directory that holds the link, like linux; it used to
+                            // fail outright, so every relative symlink (node_modules
+                            // .bin links, `ln -s c d`) was ENOENT (satoru)
+                            KVFSNode* rel = ResolvePath_nolock(child->link_target, cur);
+                            if (!rel) return nullptr;
+                            child = rel;
+                            hops++;
+                            continue;
+                        }
                         if (ntmp[0] != '/' || ntmp[1] == 0) { tgt = ntmp[0] == '/' ? root : nullptr; }
                         while (tgt && ntmp[ii]) {
                             if (ntmp[ii] == '/' || ntmp[ii + 1] == 0) {
                                 if (ntmp[ii] != '/') { if (cci < KVFS_MAX_NAME - 1) comp2[cci++] = ntmp[ii]; ii++; }
                                 if (cci > 0) {
                                     comp2[cci] = 0;
-                                    tgt = tgt->find_child(comp2);
+                                    KVFSNode* nx = tgt->find_child(comp2);
+                                    // an intermediate component may itself be a
+                                    // symlink (every /system/bin/applet link
+                                    // targets /system/bin/busybox, and /system is
+                                    // a symlink too). the old walk looked "bin" up
+                                    // on the /system symlink node and failed, so
+                                    // no applet symlink ever resolved. (satoru)
+                                    int th = 0;
+                                    while (nx && nx->type == KVFS_SYMLINK && th++ < 16)
+                                        nx = ResolvePath_nolock(nx->link_target);
+                                    tgt = nx;
                                     cci = 0;
                                     if (!tgt) { fail = true; break; }
                                 }
@@ -545,6 +682,9 @@ int KVFS::WriteFile_nolock(const char* path, const void* data, uint32_t len) {
         if (!node) return KVFS_ERR_NOT_FOUND;
     }
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    // a full overwrite replaces the volume-backed copy with heap content. (satoru)
+    node->lazy_kfs = false;
+    node->link_target[0] = 0;
 
     if (!node->content || node->content_capacity < len) {
         uint32_t new_cap = (len + KVFS_BLOCK_SIZE - 1) & ~(KVFS_BLOCK_SIZE - 1);
@@ -561,6 +701,7 @@ int KVFS::WriteFile_nolock(const char* path, const void* data, uint32_t len) {
 
     if (len > 0 && data) kmemcpy(node->content, data, len);
     node->size = len;
+    node->modified = kvfs_now();   // (satoru)
     return KVFS_OK;
 }
 
@@ -575,10 +716,13 @@ int KVFS::WriteFileStatic(const char* path, const void* data, uint32_t len) {
         if (!node) return KVFS_ERR_NOT_FOUND;
     }
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    node->lazy_kfs = false;
+    node->link_target[0] = 0;
     if (node->content && KernelHeap::IsValidBlock(node->content)) KernelHeap::Free(node->content);
     node->content = (uint8_t*)data;
     node->content_capacity = 0;
     node->size = len;
+    node->modified = kvfs_now();   // (satoru)
     return KVFS_OK;
 }
 
@@ -587,6 +731,7 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
     KVFSNode* node = Resolve_nolock(path);
     if (!node) return WriteFile_nolock(path, data, len);
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    if (node->lazy_kfs) materialize_nolock(node);
 
     // if content is a stale/non-heap pointer (from a deserialized image, or a
     // region freed elsewhere), reading or Free()ing it would feed garbage and
@@ -626,7 +771,119 @@ int KVFS::AppendFile(const char* path, const void* data, uint32_t len) {
 
     if (len > 0 && data) kmemcpy(node->content + node->size, data, len);
     node->size = new_size;
+    node->modified = kvfs_now();   // (satoru)
     return KVFS_OK;
+}
+
+int KVFS::ReadAt(KVFSNode* node, uint32_t off, uint32_t len, void* buf) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    if (!node || !buf || len == 0) return 0;
+    if (off >= node->size) return 0;
+    uint32_t avail = node->size - off;
+    if (len > avail) len = avail;
+    if (node->lazy_kfs && !node->content) {
+        if (!lazy_backend_ready()) return -1;
+        int64_t got = g_lazy_read(node->link_target, off, buf, len);
+        return got < 0 ? -1 : (int)got;
+    }
+    if (node->content) kmemcpy(buf, node->content + off, len);
+    return (int)len;
+}
+
+int KVFS::ReadLazyPath(const char* kfs_path, uint32_t off, uint32_t len, void* buf) {
+    SpinLockCpuGuard guard(g_vfs_lock);   // the kfs reader keeps its old serialization (satoru)
+    if (!kfs_path || !kfs_path[0] || !buf || len == 0) return 0;
+    if (!lazy_backend_ready()) return -1;
+    int64_t got = g_lazy_read(kfs_path, off, buf, len);
+    return got < 0 ? -1 : (int)got;
+}
+
+bool KVFS::FdIsLazy(int fd) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    if (fd < 0 || fd >= KVFS_MAX_FDS || !fds[fd].open) return false;
+    KVFSNode* node = fds[fd].node;
+    return node && !node->dev_read && node->lazy_kfs && !node->content;
+}
+
+void* KVFS::AllocLazyContent(uint32_t size, uint32_t* cap_out) {
+    uint32_t cap = kvfs_grow_cap(0, size);
+    void* b = kvfs_heap_alloc(cap);
+    if (cap_out) *cap_out = b ? cap : 0;
+    return b;
+}
+
+bool KVFS::AdoptLazyContent(KVFSNode* node, const char* kfs_path, uint32_t size, void* buf, uint32_t cap) {
+    if (!buf) return false;
+    SpinLockCpuGuard guard(g_vfs_lock);
+    bool same = node && !node->is_dir() && node->lazy_kfs && !node->content &&
+                node->size == size && cap >= size && kfs_path;
+    for (int i = 0; same && i < KVFS_MAX_PATH; i++) {
+        if (node->link_target[i] != kfs_path[i]) same = false;
+        if (!kfs_path[i]) break;
+    }
+    if (!same) { KernelHeap::Free(buf); return false; }
+    node->content = (uint8_t*)buf;
+    node->content_capacity = cap;
+    node->lazy_kfs = false;
+    node->link_target[0] = 0;
+    return true;
+}
+
+uint8_t* KVFS::Materialize(KVFSNode* node) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    return materialize_nolock(node);
+}
+
+int KVFS::WriteLazyFile(const char* path, uint32_t size) {
+    SpinLockCpuGuard guard(g_vfs_lock);
+    if (!path) return KVFS_ERR_INVALID;
+    if (kstrlen(path) >= KVFS_MAX_PATH) return KVFS_ERR_INVALID;
+    KVFSNode* node = Resolve_nolock(path);
+    if (!node) {
+        int r = CreateFile_nolock(path);
+        if (r != KVFS_OK) return r;
+        node = Resolve_nolock(path);
+        if (!node) return KVFS_ERR_NOT_FOUND;
+    }
+    if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    if (node->content && KernelHeap::IsValidBlock(node->content)) KernelHeap::Free(node->content);
+    node->content = nullptr;
+    node->content_capacity = 0;
+    node->size = size;
+    node->lazy_kfs = size > 0;
+    kstrcpy(node->link_target, path, KVFS_MAX_PATH);
+    return KVFS_OK;
+}
+
+int KVFS::ReadFileAt(const char* path, uint32_t offset, void* buf, uint32_t len) {   // (satoru)
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
+    if (!node) return KVFS_ERR_NOT_FOUND;
+    if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    if (offset >= node->size || !buf || !len) return 0;
+    uint32_t n = node->size - offset < len ? node->size - offset : len;
+    if (node->lazy_kfs && !node->content) {
+        if (!lazy_backend_ready()) return -1;
+        int64_t got = g_lazy_read(node->link_target, offset, buf, n);
+        return got < 0 ? -1 : (int)got;
+    }
+    if (!node->content) return 0;
+    kmemcpy(buf, node->content + offset, n);
+    return (int)n;
+}
+
+int KVFS::WriteFileAt(const char* path, uint32_t offset, const void* data, uint32_t len) {   // (satoru)
+    SpinLockCpuGuard guard(g_vfs_lock);
+    KVFSNode* node = Resolve_nolock(path);
+    if (!node) return KVFS_ERR_NOT_FOUND;
+    if (node->is_dir()) return KVFS_ERR_IS_DIR;
+    if (node->lazy_kfs) materialize_nolock(node);
+    // only an owned heap copy is written in place; borrowed images stay read-only (satoru)
+    if (!node->content || node->content_capacity == 0 || !KernelHeap::IsValidBlock(node->content)) return -1;
+    if (offset > node->size || len > node->size - offset) return -1;
+    kmemcpy(node->content + offset, data, len);
+    node->modified = kvfs_now();   // (satoru)
+    return (int)len;
 }
 
 int KVFS::ReadFile(const char* path, void* buf, uint32_t max_len) {
@@ -639,6 +896,11 @@ int KVFS::ReadFile_nolock(const char* path, void* buf, uint32_t max_len) {
     if (!node) return KVFS_ERR_NOT_FOUND;
     if (node->is_dir()) return KVFS_ERR_IS_DIR;
     uint32_t to_read = node->size < max_len ? node->size : max_len;
+    if (node->lazy_kfs && !node->content && to_read > 0 && buf) {
+        if (!lazy_backend_ready()) return -1;
+        int64_t got = g_lazy_read(node->link_target, 0, buf, to_read);
+        return got < 0 ? -1 : (int)got;
+    }
     if (node->content && to_read > 0 && buf)
         kmemcpy(buf, node->content, to_read);
     return (int)to_read;
@@ -705,10 +967,16 @@ int KVFS::Read(int fd, void* buf, uint32_t len) {
         if (r > 0) fds[fd].offset += (uint32_t)r;
         return r;
     }
-    if (!node->content) return 0;
-
     uint32_t avail = node->size > fds[fd].offset ? node->size - fds[fd].offset : 0;
     uint32_t to_read = len < avail ? len : avail;
+    if (node->lazy_kfs && !node->content && to_read > 0 && buf) {
+        if (!lazy_backend_ready()) return -1;
+        int64_t got = g_lazy_read(node->link_target, fds[fd].offset, buf, to_read);
+        if (got < 0) return -1;
+        fds[fd].offset += (uint32_t)got;
+        return (int)got;
+    }
+    if (!node->content) return 0;
     if (to_read > 0 && buf) kmemcpy(buf, node->content + fds[fd].offset, to_read);
     fds[fd].offset += to_read;
     return (int)to_read;
@@ -726,6 +994,7 @@ int KVFS::Write(int fd, const void* buf, uint32_t len) {
         if (r > 0) fds[fd].offset += (uint32_t)r;
         return r;
     }
+    if (node->lazy_kfs) materialize_nolock(node);
 
     uint32_t write_end = fds[fd].offset + len;
     if (!node->content || node->content_capacity < write_end) {
@@ -735,8 +1004,11 @@ int KVFS::Write(int fd, const void* buf, uint32_t len) {
         // write past the end keeps hole-fill semantics without re-zeroing bytes
         // we already hold. (satoru)
         uint32_t new_cap = kvfs_grow_cap(node->content_capacity, write_end);
+        uint64_t gt0 = Timer::GetRealMs64();   // [kvfsgrow] (satoru)
         uint8_t* new_buf = (uint8_t*)kvfs_heap_alloc(new_cap);
         if (!new_buf) return KVFS_ERR_NO_MEM;
+        uint64_t gt1 = Timer::GetRealMs64();
+        uint32_t old_size = node->size, old_cap = node->content_capacity;
         if (node->content) {
             kmemcpy(new_buf, node->content, node->size);
             KernelHeap::Free(node->content);
@@ -746,10 +1018,25 @@ int KVFS::Write(int fd, const void* buf, uint32_t len) {
         }
         node->content = new_buf;
         node->content_capacity = new_cap;
+        uint64_t gt2 = Timer::GetRealMs64();
+        // [kvfsgrow]: a content grow that took >= 10 ms (alloc vs copy+free+zero),
+        // bounded. diagnostic for the kls-held file writes that stall the gui. (satoru)
+        static uint32_t s_grow_logs = 0;
+        if (gt2 - gt0 >= 10 && s_grow_logs < 60) {
+            s_grow_logs++;
+            SerialLogger::Log("[kvfsgrow] alloc_ms="); SerialLogger::LogDec((int)(gt1 - gt0));
+            SerialLogger::Log(" copy_ms="); SerialLogger::LogDec((int)(gt2 - gt1));
+            SerialLogger::Log(" old_size="); SerialLogger::LogDec((int)old_size);
+            SerialLogger::Log(" old_cap="); SerialLogger::LogDec((int)old_cap);
+            SerialLogger::Log(" new_cap="); SerialLogger::LogDec((int)new_cap);
+            SerialLogger::Log(" name="); SerialLogger::Log(node->name);
+            SerialLogger::Log("\r\n");
+        }
     }
     if (len > 0 && buf) kmemcpy(node->content + fds[fd].offset, buf, len);
     fds[fd].offset += len;
     if (fds[fd].offset > node->size) node->size = fds[fd].offset;
+    if (len) node->modified = kvfs_now();   // (satoru)
     return (int)len;
 }
 
@@ -790,6 +1077,9 @@ int KVFS::Copy_nolock(const char* src, const char* dst) {
     // if dst is the same node (cp x x), WriteFile_nolock would free node->content
     // and then copy from that just-freed pointer -> use-after-free. no-op. (satoru)
     if (Resolve_nolock(dst) == s) return 0;
+    if (s->lazy_kfs) {
+        if (!materialize_nolock(s)) return KVFS_ERR_NO_MEM;
+    }
     return WriteFile_nolock(dst, s->content, s->size);
 }
 
@@ -888,6 +1178,10 @@ int KVFS::Find(const char* path, const char* pattern, KVFSNode** results, int ma
 int KVFS::Grep(const char* path, const char* pattern, char* output, int max_output) {
     SpinLockCpuGuard guard(g_vfs_lock);
     KVFSNode* node = Resolve_nolock(path);
+    if (node && node->lazy_kfs && !materialize_nolock(node)) {
+        if (output && max_output > 0) output[0] = 0;
+        return 0;
+    }
     if (!node || !node->content) { if (output && max_output > 0) output[0] = 0; return 0; }
 
     int plen = kstrlen(pattern);
@@ -976,7 +1270,7 @@ uint32_t KVFS::DiskUsage(const char* path) {
         // this, a corrupt child_count or a dangling tree node pushes a wild
         // pointer that later faults the traversal with a #gp. (satoru)
         const uintptr_t ram_top = (uintptr_t)PMM::GetPhysTop();
-        for (int i = 0; i < n->child_count && i < KVFS_MAX_CHILDREN && sp < 256; i++) {
+        for (int i = 0; i < n->child_count && i < KVFS_DIR_LIMIT && sp < 256; i++) {
             KVFSNode* c = n->children[i];
             if (c && (uintptr_t)c < ram_top) stack[sp++] = c;
         }
@@ -1225,7 +1519,7 @@ static KVFSNode* kvfs_deser_node(const uint8_t* b, size_t size, size_t* pos,
 
     uint32_t nchild;
     if (!kget32(b, size, pos, &nchild)) return nullptr;
-    if (nchild > KVFS_MAX_CHILDREN) return nullptr;
+    if (nchild > KVFS_DIR_LIMIT) return nullptr;
     for (uint32_t i = 0; i < nchild; i++) {
         KVFSNode* c = kvfs_deser_node(b, size, pos, alloc);
         if (!c) return nullptr;             // child malformed (satoru)

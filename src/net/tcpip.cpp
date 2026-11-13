@@ -132,10 +132,21 @@ uint32_t TCPStack::dns_server = 0;
 uint8_t TCPStack::mac[6] = {};
 
 ARPEntry TCPStack::arp_cache[ARP_CACHE_SIZE] = {};
-NetSocket TCPStack::sockets[MAX_SOCKETS] = {};
-// per-slot receive rings, allocated lazily in Socket() and never freed: the slot
-// struct is wiped with {} on reuse, so the buffer lives here instead. (satoru)
-static uint8_t* g_rx_slot_buf[MAX_SOCKETS] = {};
+TCPStack::SockTable TCPStack::sockets = {};
+// per-slot receive rings live in SockChunk::rx, allocated lazily in Socket() and never freed:
+// the slot struct is wiped with {} on reuse, so the buffer lives there instead. (satoru)
+
+// free the lazily allocated per-socket stream buffers. the pointer is claimed
+// atomically first so a slot-reuse path and the tick sweep can never free the
+// same block twice. (satoru)
+static void tcp_free_lazy_bufs(NetSocket* s) {
+    TxDataSeg* ts = __atomic_exchange_n(&s->tx_segs, (TxDataSeg*)nullptr, __ATOMIC_ACQ_REL);
+    if (ts) KernelHeap::Free(ts);
+    TcpOooSeg* os = __atomic_exchange_n(&s->ooo_segs, (TcpOooSeg*)nullptr, __ATOMIC_ACQ_REL);
+    if (os) KernelHeap::Free(os);
+    s->tx_seg_inflight = 0;
+    s->ooo_count = 0;
+}
 NetStats TCPStack::stats = {};
 PendingIPv4Frame TCPStack::pending_ipv4[PENDING_IPV4_TX] = {};
 
@@ -240,7 +251,7 @@ void ApplyAck(NetSocket* sock, uint32_t ack_seq) {
             // (SendTCPPacket is a private TCPStack member; ApplyAck is a free
             // helper, so we signal via the scoreboard the tick already scans.) (satoru)
             TxDataSeg* oldest = nullptr;
-            for (int i = 0; i < TCP_SND_WND_SEGS; i++) {
+            for (int i = 0; sock->tx_segs && i < TCP_SND_WND_SEGS; i++) {
                 TxDataSeg* s = &sock->tx_segs[i];
                 if (!s->in_use) continue;
                 if (!oldest || SeqBefore(s->seq, oldest->seq)) oldest = s;
@@ -276,7 +287,7 @@ void ApplyAck(NetSocket* sock, uint32_t ack_seq) {
     // segment is fully acked once ack_seq has advanced to or past its last
     // byte (seq + len). this opens slots for Send to keep the pipe full and
     // stops TCPTick retransmitting acked data. (satoru)
-    for (int i = 0; i < TCP_SND_WND_SEGS; i++) {
+    for (int i = 0; sock->tx_segs && i < TCP_SND_WND_SEGS; i++) {
         TxDataSeg* seg = &sock->tx_segs[i];
         if (!seg->in_use) continue;
         if (!SeqBefore(ack_seq, seg->seq + (uint32_t)seg->len)) {
@@ -366,10 +377,28 @@ uint16_t TCPStack::TCPChecksum(const IPv4Header* ip, const TCPHeader* tcp,
     return ChecksumFinish(sum);
 }
 
+// append one zeroed chunk. lock-free publish: the loser of a race frees its copy. (satoru)
+bool TCPStack::SockTable::Grow() {
+    int n = __atomic_load_n(&nch, __ATOMIC_ACQUIRE);
+    if (n >= MAX_SOCKETS / SOCK_CHUNK) return false;
+    SockChunk* c = (SockChunk*)KernelHeap::Alloc(sizeof(SockChunk));
+    if (!c) return false;
+    memset(c, 0, sizeof(SockChunk));
+    SockChunk* expect = nullptr;
+    if (__atomic_compare_exchange_n(&ch[n], &expect, c, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        __atomic_compare_exchange_n(&nch, &n, n + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    } else {
+        KernelHeap::Free(c);
+        // someone published ch[n]; make sure nch covers it. (satoru)
+        __atomic_compare_exchange_n(&nch, &n, n + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    return true;
+}
+
 bool TCPStack::Init() {
     initialized = false;
 
-    for (int i = 0; i < MAX_SOCKETS; i++) sockets[i].active = false;
+    for (int i = 0; i < sockets.Count(); i++) sockets[i].active = false;
     for (int i = 0; i < ARP_CACHE_SIZE; i++) arp_cache[i].valid = false;
     for (int i = 0; i < PENDING_IPV4_TX; i++) pending_ipv4[i].active = false;
 
@@ -937,6 +966,11 @@ static void tcp_park_ooo(NetSocket* s, uint32_t seq, const uint8_t* payload, int
     // must stay within the receive window ahead of tcp_ack, else drop. (satoru)
     uint32_t ahead = seq - s->tcp_ack;
     if (ahead >= (uint32_t)TCP_RX_BUFSIZE) return;
+    if (!s->ooo_segs) {
+        s->ooo_segs = (TcpOooSeg*)KernelHeap::Alloc(sizeof(TcpOooSeg) * TCP_OOO_SEGS);
+        if (!s->ooo_segs) return;
+        memset(s->ooo_segs, 0, sizeof(TcpOooSeg) * TCP_OOO_SEGS);
+    }
     for (int i = 0; i < TCP_OOO_SEGS; i++) {
         if (s->ooo_segs[i].in_use && s->ooo_segs[i].seq == seq) return;  // already held (satoru)
     }
@@ -955,6 +989,7 @@ static void tcp_park_ooo(NetSocket* s, uint32_t seq, const uint8_t* payload, int
 // after tcp_ack advances, splice any parked segments that now start at (or
 // straddle) tcp_ack, looping until nothing contiguous remains. (satoru)
 static void tcp_drain_ooo(NetSocket* s) {
+    if (!s->ooo_segs) { s->ooo_count = 0; return; }
     bool progress = true;
     while (progress && s->ooo_count > 0) {
         progress = false;
@@ -1066,7 +1101,7 @@ void TCPStack::ProcessTCP(const IPv4Header* ip_hdr, const void* data, int len) {
     // into the listener that shares the same local port.
     NetSocket* sock = nullptr;
     NetSocket* listener = nullptr;
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_STREAM) continue;
         if (sockets[i].local_port != dst_port) continue;
 
@@ -1347,7 +1382,7 @@ bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, i
     if (!sock) return false;
     // room for the fixed header + a 4-byte window-scale option (only on syn) +
     // a full mss of payload. (satoru)
-    uint8_t buf[sizeof(TCPHeader) + 4 + TCP_MSS];
+    uint8_t buf[sizeof(TCPHeader) + 8 + TCP_MSS];
     TCPHeader* tcp = (TCPHeader*)buf;
 
     tcp->src_port = htons(sock->local_port);
@@ -1364,14 +1399,24 @@ bool TCPStack::SendTCPPacket(NetSocket* sock, uint8_t flags, const void* data, i
     int opt_len = 0;
     bool emit_wscale = (flags & TCP_FLAG_SYN) &&
                        (sock->tcp_state == TCP_SYN_SENT || sock->wscale_ok);
-    if (emit_wscale) {
+    // MSS belongs on every SYN (client SYN and SYN-ACK); only window scaling
+    // is conditional on the peer having offered it. MSS alone is 4 bytes,
+    // MSS + NOP + WSCALE is 8, so the header stays 4-byte aligned. (satoru)
+    if (flags & TCP_FLAG_SYN) {
         uint8_t* opt = buf + sizeof(TCPHeader);
-        opt[0] = TCP_OPT_NOP;
-        opt[1] = TCP_OPT_WSCALE;
-        opt[2] = 3;
-        opt[3] = TCP_RCV_WSCALE;
+        opt[0] = TCP_OPT_MSS;
+        opt[1] = 4;
+        opt[2] = (uint8_t)(TCP_MSS >> 8);
+        opt[3] = (uint8_t)(TCP_MSS & 0xFF);
         opt_len = 4;
-        sock->rcv_wscale = TCP_RCV_WSCALE;   // we have committed to scaling our rx window (satoru)
+        if (emit_wscale) {
+            opt[4] = TCP_OPT_NOP;
+            opt[5] = TCP_OPT_WSCALE;
+            opt[6] = 3;
+            opt[7] = TCP_RCV_WSCALE;
+            opt_len = 8;
+            sock->rcv_wscale = TCP_RCV_WSCALE;   // we have committed to scaling our rx window (satoru)
+        }
     }
     int hdr_words = (int)(sizeof(TCPHeader) + opt_len) / 4;
     tcp->data_offset = (uint8_t)(hdr_words << 4);
@@ -1488,7 +1533,7 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
     int payload_len = (int)udp_len_field - (int)sizeof(UDPHeader);
 
     // find matching socket
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_DGRAM) continue;
         if (sockets[i].local_port != dst_port) continue;
 
@@ -1525,14 +1570,16 @@ void TCPStack::ProcessUDP(const IPv4Header* ip_hdr, const void* data, int len) {
 }
 
 int TCPStack::Socket(int type) {
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int pass = 0; pass < 2; pass++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         if (!sockets[i].active) {
-            if (!g_rx_slot_buf[i]) {
-                g_rx_slot_buf[i] = (uint8_t*)KernelHeap::Alloc(TCP_RX_BUFSIZE);
-                if (!g_rx_slot_buf[i]) return -1;   // out of memory: no socket (satoru)
+            if (!sockets.Rx(i)) {
+                sockets.Rx(i) = (uint8_t*)KernelHeap::Alloc(TCP_RX_BUFSIZE);
+                if (!sockets.Rx(i)) return -1;   // out of memory: no socket (satoru)
             }
+            tcp_free_lazy_bufs(&sockets[i]);
             sockets[i] = {};
-            sockets[i].rx_buf = g_rx_slot_buf[i];
+            sockets[i].rx_buf = sockets.Rx(i);
             sockets[i].active = true;
             sockets[i].type = type;
             sockets[i].local_ip = local_ip;
@@ -1546,17 +1593,19 @@ int TCPStack::Socket(int type) {
             return i;
         }
     }
+    if (pass == 0 && !sockets.Grow()) return -1;   // cap reached or out of memory (satoru)
+    }
     return -1;
 }
 
 bool TCPStack::Bind(int sock, uint16_t port) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return false;
     sockets[sock].local_port = port;
     return true;
 }
 
 bool TCPStack::Connect(int sock, uint32_t ip, uint16_t port) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return false;
 
     NetSocket* s = &sockets[sock];
     s->remote_ip = ip;
@@ -1633,14 +1682,14 @@ bool TCPStack::Connect(int sock, uint32_t ip, uint16_t port) {
 }
 
 bool TCPStack::Listen(int sock, int backlog) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return false;
     (void)backlog;
     sockets[sock].tcp_state = TCP_LISTEN;
     return true;
 }
 
 int TCPStack::Accept(int sock) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return -1;
     if (sockets[sock].tcp_state != TCP_LISTEN) return -1;
 
     // Poll for incoming SYN with a real-time bound (~10s) plus user
@@ -1657,9 +1706,12 @@ int TCPStack::Accept(int sock) {
             sockets[new_sock] = sockets[sock];
             sockets[new_sock].tx_pending = false;
             // the accepted socket starts with an empty send window - a listener
-            // never queued data, but make the invariant explicit. (satoru)
-            for (int k = 0; k < TCP_SND_WND_SEGS; k++) sockets[new_sock].tx_segs[k].in_use = false;
+            // never queued data, but make the invariant explicit. the lazy
+            // buffers are not copied: both sockets would own the same block. (satoru)
+            sockets[new_sock].tx_segs = nullptr;
+            sockets[new_sock].ooo_segs = nullptr;
             sockets[new_sock].tx_seg_inflight = 0;
+            sockets[new_sock].ooo_count = 0;
             sockets[sock].tcp_state = TCP_LISTEN;
             sockets[sock].remote_ip = 0;
             sockets[sock].remote_port = 0;
@@ -1672,12 +1724,17 @@ int TCPStack::Accept(int sock) {
 }
 
 int TCPStack::Send(int sock, const void* data, int len) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return -1;
 
     NetSocket* s = &sockets[sock];
 
     if (s->type == SOCK_STREAM) {
         if (s->tcp_state != TCP_ESTABLISHED) return -1;
+        if (!s->tx_segs) {
+            s->tx_segs = (TxDataSeg*)KernelHeap::Alloc(sizeof(TxDataSeg) * TCP_SND_WND_SEGS);
+            if (!s->tx_segs) return -1;
+            memset(s->tx_segs, 0, sizeof(TxDataSeg) * TCP_SND_WND_SEGS);
+        }
         int sent = 0;
         const uint8_t* ptr = (const uint8_t*)data;
         while (sent < len) {
@@ -1755,7 +1812,7 @@ int TCPStack::Send(int sock, const void* data, int len) {
 }
 
 int TCPStack::Recv(int sock, void* buf, int max_len) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return -1;
 
     NetSocket* s = &sockets[sock];
 
@@ -1821,19 +1878,19 @@ int TCPStack::Recv(int sock, void* buf, int max_len) {
 }
 
 bool TCPStack::IsPeerClosed(int sock) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return true;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return true;
     TCPState state = sockets[sock].tcp_state;
     return state == TCP_CLOSE_WAIT || state == TCP_LAST_ACK ||
            state == TCP_TIME_WAIT || state == TCP_CLOSED;
 }
 
 void TCPStack::SetNonblocking(int sock, bool nonblocking) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return;
     sockets[sock].nonblocking = nonblocking;
 }
 
 bool TCPStack::IsNonblocking(int sock) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return false;
     return sockets[sock].nonblocking;
 }
 
@@ -1841,26 +1898,26 @@ bool TCPStack::IsWritable(int sock) {
     // A stream socket is writable for poll/select once the handshake
     // completed (ESTABLISHED) - this is how a background non-blocking
     // connect signals success. UDP sockets are always writable. (satoru)
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return false;
     NetSocket* s = &sockets[sock];
     if (s->type != SOCK_STREAM) return true;
     return s->tcp_state == TCP_ESTABLISHED;
 }
 
 int TCPStack::GetSockError(int sock) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return 0;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return 0;
     return sockets[sock].sock_errno;
 }
 
 // lock-free single-word getters for the linux af_inet bridge (see tcpip.h);
 // staleness is bounded by the caller's next poll pass. (satoru)
 int TCPStack::RxAvailable(int sock) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return 0;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return 0;
     return sockets[sock].rx_count;
 }
 
 int TCPStack::TxFreeSegs(int sock) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return 0;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return 0;
     NetSocket* s = &sockets[sock];
     if (s->type != SOCK_STREAM) return TCP_SND_WND_SEGS;   // udp never queues (satoru)
     if (s->tcp_state != TCP_ESTABLISHED) return 0;
@@ -1870,7 +1927,7 @@ int TCPStack::TxFreeSegs(int sock) {
 
 bool TCPStack::GetAddrInfo(int sock, uint32_t* lip, uint16_t* lport,
                            uint32_t* rip, uint16_t* rport) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return false;
     NetSocket* s = &sockets[sock];
     if (lip)   *lip   = s->local_ip ? s->local_ip : local_ip;
     if (lport) *lport = s->local_port;
@@ -1880,7 +1937,7 @@ bool TCPStack::GetAddrInfo(int sock, uint32_t* lip, uint16_t* lport,
 }
 
 bool TCPStack::Close(int sock) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return false;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return false;
 
     NetSocket* s = &sockets[sock];
     if (s->type == SOCK_STREAM && s->tcp_state == TCP_ESTABLISHED) {
@@ -1912,7 +1969,7 @@ bool TCPStack::Close(int sock) {
 }
 
 int TCPStack::SendTo(int sock, const void* data, int len, uint32_t ip, uint16_t port) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return -1;
     if (sockets[sock].type != SOCK_DGRAM) return -1;
     if (len < 0) return -1;
     const int max_payload = (int)ETH_MTU - (int)sizeof(IPv4Header) - (int)sizeof(UDPHeader);
@@ -1940,7 +1997,7 @@ int TCPStack::SendTo(int sock, const void* data, int len, uint32_t ip, uint16_t 
 }
 
 int TCPStack::RecvFrom(int sock, void* buf, int max_len, uint32_t* from_ip, uint16_t* from_port) {
-    if (sock < 0 || sock >= MAX_SOCKETS || !sockets[sock].active) return -1;
+    if (sock < 0 || sock >= sockets.Count() || !sockets[sock].active) return -1;
 
     NetSocket* s = &sockets[sock];
 
@@ -2045,7 +2102,7 @@ void TCPStack::Tick() {
 void TCPStack::TCPTick() {
     // handle retransmissions, time_wait cleanup, etc.
     uint32_t now_ms = Timer::GetTicks();
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         if (!sockets[i].active || sockets[i].type != SOCK_STREAM) continue;
         if (sockets[i].tx_pending) {
             // smoothed rto from the rtt estimator, exponentially backed off per
@@ -2084,7 +2141,7 @@ void TCPStack::TCPTick() {
         // payload was buffered in the scoreboard so we resend without the
         // caller. (satoru)
         bool conn_dead = false;
-        for (int k = 0; k < TCP_SND_WND_SEGS; k++) {
+        for (int k = 0; sockets[i].tx_segs && k < TCP_SND_WND_SEGS; k++) {
             TxDataSeg* seg = &sockets[i].tx_segs[k];
             if (!seg->in_use) continue;
             uint32_t rto_ms = TcpRtoFor(&sockets[i], seg->retries);
@@ -2115,7 +2172,8 @@ void TCPStack::TCPTick() {
         }
         if (conn_dead) {
             sockets[i].tx_pending = false;
-            for (int k = 0; k < TCP_SND_WND_SEGS; k++) sockets[i].tx_segs[k].in_use = false;
+            if (sockets[i].tx_segs)
+                for (int k = 0; k < TCP_SND_WND_SEGS; k++) sockets[i].tx_segs[k].in_use = false;
             sockets[i].tx_seg_inflight = 0;
             sockets[i].tcp_state = TCP_CLOSED;
             sockets[i].active = false;
@@ -2160,6 +2218,12 @@ void TCPStack::TCPTick() {
             sockets[i].tcp_state = TCP_CLOSED;
         }
     }
+    // return a closed socket's lazy stream buffers to the heap promptly, so a
+    // finished download does not leave 60 kb per slot resident. (satoru)
+    for (int i = 0; i < sockets.Count(); i++) {
+        if (!sockets[i].active && (sockets[i].tx_segs || sockets[i].ooo_segs))
+            tcp_free_lazy_bufs(&sockets[i]);
+    }
 }
 
 uint16_t TCPStack::AllocatePort() {
@@ -2169,7 +2233,7 @@ uint16_t TCPStack::AllocatePort() {
             next_ephemeral_port = 49152;
         uint16_t p = next_ephemeral_port++;
         bool used = false;
-        for (int i = 0; i < MAX_SOCKETS; i++) {
+        for (int i = 0; i < sockets.Count(); i++) {
             if (sockets[i].active && sockets[i].local_port == p) { used = true; break; }
         }
         if (!used) return p;
@@ -2234,12 +2298,12 @@ void TCPStack::DumpInfo(char* out, int max_len) {
 
     // active sockets
     int active_count = 0;
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         if (sockets[i].active) active_count++;
     }
     append("  Active Sockets: "); append_num(active_count); append("\n");
 
-    for (int i = 0; i < MAX_SOCKETS; i++) {
+    for (int i = 0; i < sockets.Count(); i++) {
         if (!sockets[i].active) continue;
         append("    ["); append_num(i); append("] ");
         append(sockets[i].type == SOCK_STREAM ? "TCP" : "UDP");

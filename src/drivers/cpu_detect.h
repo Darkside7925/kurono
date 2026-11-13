@@ -33,6 +33,7 @@
 // extended feature flags (ecx from cpuid eax=1)
 #define CPU_EXT_SSE3        (1 << 0)
 #define CPU_EXT_PCLMUL      (1 << 1)
+#define CPU_EXT_EIST        (1 << 7)
 #define CPU_EXT_SSSE3       (1 << 9)
 #define CPU_EXT_FMA         (1 << 12)
 #define CPU_EXT_CX16        (1 << 13)
@@ -47,14 +48,19 @@
 #define CPU_EXT_AVX         (1 << 28)
 #define CPU_EXT_F16C        (1 << 29)
 #define CPU_EXT_RDRAND      (1 << 30)
+#define CPU_EXT_HYPERVISOR  (1u << 31)
 
 // extended features (ebx from cpuid eax=7, ecx=0)
 #define CPU_EXT7_BMI1       (1 << 3)
 #define CPU_EXT7_AVX2       (1 << 5)
+#define CPU_EXT7_UMIP       (1 << 2)
+#define CPU_EXT7_SMEP       (1 << 7)
 #define CPU_EXT7_BMI2       (1 << 8)
 #define CPU_EXT7_AVX512F    (1 << 16)
 #define CPU_EXT7_AVX512DQ   (1 << 17)
 #define CPU_EXT7_RDSEED     (1 << 18)
+#define CPU_EXT7_CLFLUSHOPT (1 << 23)
+#define CPU_EXT7_CLWB       (1 << 24)
 #define CPU_EXT7_AVX512CD   (1 << 28)
 #define CPU_EXT7_AVX512BW   (1 << 30)
 #define CPU_EXT7_AVX512VL   (1u << 31)
@@ -68,6 +74,9 @@
 #define CPU_AMD_LM          (1 << 29)
 #define CPU_AMD_3DNOWEXT    (1 << 30)
 #define CPU_AMD_3DNOW       (1u << 31)
+
+// extended feature flags (edx from cpuid eax=0x80000007) (satoru)
+#define CPU_AMD7_TSCINV     (1 << 8)
 
 // cpu vendors
 enum CpuVendor {
@@ -122,7 +131,10 @@ struct CpuInfo {
     uint32_t features_edx;     // cpuid eax=1 edx
     uint32_t features_ecx;     // cpuid eax=1 ecx
     uint32_t features_ebx7;    // cpuid eax=7 ebx
+    uint32_t features_ecx7;    // cpuid eax=7 ecx (satoru)
     uint32_t features_amd_edx; // cpuid eax=0x80000001 edx
+    uint32_t features_amd_edx7;// cpuid eax=0x80000007 edx (satoru)
+    uint32_t is_hypervisor;    // cpuid.1.ecx[31] (satoru)
 
     // cache
     CpuCacheInfo cache[8];
@@ -154,6 +166,7 @@ public:
     static bool HasSSE();
     static bool HasSSE2();
     static bool HasSSE3();
+    static bool HasEIST();
     static bool HasSSSE3();
     static bool HasSSE41();
     static bool HasSSE42();
@@ -174,6 +187,18 @@ public:
     static bool Has1GBPages();
     static bool HasHyperThreading();
     static bool HasXSAVE();
+    static bool HasXSAVEUsable();   // xsave + osxsave (satoru)
+    static bool HasAVXUsable();     // avx + osxsave (satoru)
+    static bool HasSMEP();
+    static bool HasUMIP();
+    static bool HasCLFLUSHOPT();
+    static bool HasCLWB();
+    static bool HasRDTSCP();
+    static bool HasInvariantTSC();
+    static bool IsHypervisor();
+
+    // /proc/cpuinfo style space separated feature list (satoru)
+    static int FormatFeatureFlags(char* out, int max);
 
     // summary
     static const char* GetVendorName();

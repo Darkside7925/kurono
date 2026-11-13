@@ -55,34 +55,167 @@ static void GMFree(uint8_t* p, GMBlock& blk) {
 static uint8_t*  g_hi_chunk[GUEST_MAX_HI_CHUNKS];
 static uint32_t  g_hi_pages[GUEST_MAX_HI_CHUNKS];
 static uint32_t  g_hi_count = 0;
+static uint32_t  g_hi_chunk_sz = GUEST_HI_CHUNK;   // 4 mb fixed, 2 mb lazy (satoru)
+static bool      g_hi_lazy = false;
+static bool      g_hi_lazy_req = false;
+static uint32_t  g_hi_resident = 0;
+static uint64_t  g_hi_resident_bytes = 0;
+
+// chunk geometry. fixed: 4 mb pieces from 1 mb. lazy: pieces aligned to 2 mb (the first
+// one is 1 mb..2 mb), so a free page report (2 mb aligned blocks) is whole chunks (satoru)
+static inline uint32_t hi_index(uint64_t gpa) {
+    return g_hi_lazy ? (uint32_t)(gpa >> 21) : (uint32_t)((gpa - GUEST_HIGH_RAM_START) / g_hi_chunk_sz);
+}
+static inline uint64_t hi_base(uint32_t i) {
+    if (g_hi_lazy) return i ? ((uint64_t)i << 21) : GUEST_HIGH_RAM_START;
+    return GUEST_HIGH_RAM_START + (uint64_t)i * g_hi_chunk_sz;
+}
+static inline uint32_t hi_count(uint32_t ram_size) {
+    uint64_t end = GUEST_HIGH_RAM_START + ram_size;
+    return hi_index(end - 1) + 1;
+}
+static inline uint32_t hi_size(uint32_t i, uint32_t ram_size) {
+    uint64_t end = GUEST_HIGH_RAM_START + ram_size, b = hi_base(i), nb = hi_base(i + 1);
+    if (nb > end) nb = end;
+    return (uint32_t)(nb - b);
+}
+
+uint32_t GuestMemoryManager::ChunkIndex(uint64_t gpa) { return hi_index(gpa); }
+uint64_t GuestMemoryManager::ResidentBytes() { return g_hi_resident_bytes; }
+
+void GuestMemoryManager::SetLazy(bool on) { g_hi_lazy_req = on; }
+bool GuestMemoryManager::IsLazy() { return g_hi_lazy; }
+uint32_t GuestMemoryManager::ResidentChunks() { return g_hi_resident; }
+uint32_t GuestMemoryManager::ChunkBytes() { return g_hi_chunk_sz; }
+
+// fallback when no 2 mb host-contiguous block exists: the chunk is 512 separate 4 kb host
+// pages. GuestPhysToHost / ContigBytes follow the page table; adjacent pages still read as one
+// run. kurono.vm.splitmem=1 forces it for every lazy chunk, =2 for odd chunks only (test). (satoru)
+static uint8_t** g_hi_split[GUEST_MAX_HI_CHUNKS];
+static int       g_force_split = 0;
+static uint32_t  g_split_chunks = 0;
+void GuestMemoryManager::SetForceSplit(int mode) { g_force_split = mode; }
+uint32_t GuestMemoryManager::SplitChunks() { return g_split_chunks; }
+bool GuestMemoryManager::IsSplit(uint32_t i) { return i < GUEST_MAX_HI_CHUNKS && g_hi_split[i]; }
+bool GuestMemoryManager::SplitPage(uint32_t i, uint32_t pg, uint8_t** host) {
+    if (!IsSplit(i) || pg >= 512) return false;
+    if (host) *host = g_hi_split[i][pg];
+    return true;
+}
+
+static void FreeSplit(uint32_t i) {
+    if (!g_hi_split[i]) return;
+    for (int k = 0; k < 512; k++) if (g_hi_split[i][k]) KExec::Memory::FreePages(g_hi_split[i][k], 1);
+    KernelHeap::Free(g_hi_split[i]);
+    g_hi_split[i] = nullptr;
+    g_split_chunks--;
+}
 
 static void FreeHighChunks() {
     for (uint32_t i = 0; i < g_hi_count; i++) {
         if (g_hi_chunk[i]) KExec::Memory::FreePages(g_hi_chunk[i], g_hi_pages[i]);
+        FreeSplit(i);
         g_hi_chunk[i] = nullptr; g_hi_pages[i] = 0;
     }
     g_hi_count = 0;
+    g_hi_resident = 0;
+    g_hi_resident_bytes = 0;
 }
 
 uint32_t GuestMemoryManager::GetHighChunkCount() { return g_hi_count; }
 
 bool GuestMemoryManager::GetHighChunk(uint32_t i, uint64_t* gpa, uint8_t** host, uint32_t* size) {
     if (i >= g_hi_count) return false;
-    uint32_t sz = high_ram_size - i * GUEST_HI_CHUNK;
-    if (sz > GUEST_HI_CHUNK) sz = GUEST_HI_CHUNK;
-    if (gpa) *gpa = GUEST_HIGH_RAM_START + (uint64_t)i * GUEST_HI_CHUNK;
+    uint32_t sz = hi_size(i, high_ram_size);
+    if (gpa) *gpa = hi_base(i);
     if (host) *host = g_hi_chunk[i];
     if (size) *size = sz;
     return true;
 }
 
+// back one high ram chunk with host frames (zeroed). vm thread only (satoru)
+static uint8_t* AllocHiChunk(uint32_t i) {
+    uint32_t sz = 0;
+    if (!GuestMemoryManager::GetHighChunk(i, nullptr, nullptr, &sz) || !sz) return nullptr;
+    uint64_t pages = (sz + 0xFFFu) >> 12;
+    bool force = g_hi_lazy && i > 0 && (g_force_split == 1 || (g_force_split == 2 && (i & 1)));
+    void* c = force ? nullptr : KExec::Memory::AllocPages(pages);
+    if (!c) {
+        if (!g_hi_lazy || i == 0) return nullptr;
+        // no contiguous block: back the range page by page (satoru)
+        uint8_t** t = (uint8_t**)KernelHeap::Alloc(512 * sizeof(uint8_t*));
+        if (!t) return nullptr;
+        for (int k = 0; k < 512; k++) t[k] = nullptr;
+        for (uint64_t k = 0; k < pages; k++) {
+            void* pg = KExec::Memory::AllocPages(1);
+            if (!pg) {
+                for (int j = 0; j < 512; j++) if (t[j]) KExec::Memory::FreePages(t[j], 1);
+                KernelHeap::Free(t);
+                return nullptr;
+            }
+            memset(pg, 0, 4096);
+            t[k] = (uint8_t*)pg;
+        }
+        g_hi_split[i] = t;
+        g_split_chunks++;
+        g_hi_resident++;
+        g_hi_resident_bytes += sz;
+        static uint32_t said = 0;
+        if (said++ < 4) { SerialLogger::Log("GuestMem: chunk "); SerialLogger::LogDec((int)i); SerialLogger::Log(" backed by 4 kb pages (no contiguous 2 MB)\r\n"); }
+        return t[0];
+    }
+    memset(c, 0, sz);
+    g_hi_chunk[i] = (uint8_t*)c;
+    g_hi_pages[i] = (uint32_t)pages;
+    g_hi_resident++;
+    g_hi_resident_bytes += sz;
+    return (uint8_t*)c;
+}
+
+bool GuestMemoryManager::EnsureHighChunk(uint64_t guest_phys, uint64_t* cgpa, uint8_t** host, uint32_t* size) {
+    if (guest_phys < GUEST_HIGH_RAM_START || guest_phys >= GUEST_HIGH_RAM_START + high_ram_size) return false;
+    uint32_t i = hi_index(guest_phys);
+    if (i >= g_hi_count) return false;
+    if (!g_hi_chunk[i] && !g_hi_split[i] && !AllocHiChunk(i)) {
+        SerialLogger::Log("GuestMem: no contiguous host memory for a guest chunk (resident ");
+        SerialLogger::LogDec((int)g_hi_resident); SerialLogger::Log(")\r\n");
+        return false;
+    }
+    return GetHighChunk(i, cgpa, host, size);
+}
+
+// give a backed lazy chunk back to the host (free page report). the caller unmaps its
+// ept leaves first. chunk 0 (kernel image, boot structures) is never released (satoru)
+bool GuestMemoryManager::ReleaseHighChunk(uint32_t i, uint64_t* cgpa, uint32_t* size) {
+    if (!g_hi_lazy || i == 0 || i >= g_hi_count || (!g_hi_chunk[i] && !g_hi_split[i])) return false;
+    uint32_t sz = hi_size(i, high_ram_size);
+    if (cgpa) *cgpa = hi_base(i);
+    if (size) *size = sz;
+    if (g_hi_chunk[i]) KExec::Memory::FreePages(g_hi_chunk[i], g_hi_pages[i]);
+    FreeSplit(i);
+    g_hi_chunk[i] = nullptr; g_hi_pages[i] = 0;
+    g_hi_resident--;
+    g_hi_resident_bytes -= sz;
+    return true;
+}
+bool GuestMemoryManager::HighChunkBacked(uint32_t i) { return i < g_hi_count && (g_hi_chunk[i] || g_hi_split[i]); }
+
 // bytes from guest_phys to the end of the host-contiguous piece holding it (satoru)
 uint32_t GuestMemoryManager::ContigBytes(uint64_t guest_phys) {
     if (guest_phys >= GUEST_HIGH_RAM_START && guest_phys < GUEST_HIGH_RAM_START + high_ram_size) {
-        uint64_t off = guest_phys - GUEST_HIGH_RAM_START;
-        uint64_t end = (off / GUEST_HI_CHUNK + 1) * GUEST_HI_CHUNK;
-        if (end > high_ram_size) end = high_ram_size;
-        return (uint32_t)(end - off);
+        uint32_t ci = hi_index(guest_phys);
+        uint64_t end = hi_base(ci + 1);
+        if (end > GUEST_HIGH_RAM_START + high_ram_size) end = GUEST_HIGH_RAM_START + high_ram_size;
+        if (ci < GUEST_MAX_HI_CHUNKS && g_hi_split[ci]) {
+            // pages that happen to be adjacent on the host still count as one run (satoru)
+            uint64_t b = hi_base(ci);
+            uint32_t pg = (uint32_t)((guest_phys - b) >> 12);
+            uint64_t stop = ((guest_phys >> 12) + 1) << 12;
+            while (stop < end && pg + 1 < 512 && g_hi_split[ci][pg + 1] == g_hi_split[ci][pg] + 4096) { pg++; stop += 4096; }
+            if (stop > end) stop = end;
+            return (uint32_t)(stop - guest_phys);
+        }
+        return (uint32_t)(end - guest_phys);
     }
     for (int i = 0; i < phys_map_count; i++) {
         const GuestPhysMap& m = phys_maps[i];
@@ -117,6 +250,8 @@ void GuestMemoryManager::Init(uint32_t ram_mb) {
     phys_map_count = 0;
     e820_count = 0;
 
+    g_hi_lazy = g_hi_lazy_req;
+    g_hi_chunk_sz = g_hi_lazy ? GUEST_HI_CHUNK_LAZY : GUEST_HI_CHUNK;
     if (!AllocateGuestRAM(ram_mb)) {
         SerialLogger::Log("GuestMem: FAILED to allocate guest RAM!\r\n");
         return;
@@ -152,19 +287,15 @@ bool GuestMemoryManager::AllocateGuestRAM(uint32_t ram_mb) {
     uint32_t total_bytes = ram_mb * 1024 * 1024;
     high_ram_size = total_bytes - (uint32_t)GUEST_HIGH_RAM_START;
     {
-        uint32_t n = (high_ram_size + GUEST_HI_CHUNK - 1) / GUEST_HI_CHUNK;
+        uint32_t n = hi_count(high_ram_size);
         bool ok = n <= GUEST_MAX_HI_CHUNKS;
         g_hi_count = 0;
-        for (uint32_t i = 0; ok && i < n; i++) {
-            uint32_t sz = high_ram_size - i * GUEST_HI_CHUNK;
-            if (sz > GUEST_HI_CHUNK) sz = GUEST_HI_CHUNK;
-            uint64_t pages = (sz + 0xFFFu) >> 12;
-            void* c = KExec::Memory::AllocPages(pages);
-            if (!c) { ok = false; break; }
-            g_hi_chunk[i] = (uint8_t*)c;
-            g_hi_pages[i] = (uint32_t)pages;
-            g_hi_count = i + 1;
-            memset(c, 0, sz);
+        g_hi_resident = 0;
+        if (ok) { for (uint32_t i = 0; i < n; i++) { g_hi_chunk[i] = nullptr; g_hi_pages[i] = 0; } g_hi_count = n; }
+        // lazy: only chunk 0 is backed now (high_ram points at it); the rest on first touch.
+        // fixed: every chunk, as before (satoru)
+        for (uint32_t i = 0; ok && i < (g_hi_lazy ? 1u : n); i++) {
+            if (!AllocHiChunk(i)) { ok = false; break; }
         }
         if (!ok) {
             SerialLogger::Log("GuestMem: Failed to alloc high RAM (");
@@ -178,6 +309,7 @@ bool GuestMemoryManager::AllocateGuestRAM(uint32_t ram_mb) {
         }
         high_ram = g_hi_chunk[0];
     }
+    if (g_hi_lazy) SerialLogger::Log("GuestMem: lazy high ram (2 MB chunks backed on first touch)\r\n");
 
     total_ram_bytes = low_ram_size + high_ram_size;
 
@@ -246,9 +378,14 @@ void GuestMemoryManager::AddPhysMap(uint64_t guest, uint8_t* host,
 
 uint8_t* GuestMemoryManager::GuestPhysToHost(uint64_t guest_phys) {
     if (guest_phys >= GUEST_HIGH_RAM_START && guest_phys < GUEST_HIGH_RAM_START + high_ram_size) {
-        uint64_t off = guest_phys - GUEST_HIGH_RAM_START;
-        uint8_t* c = g_hi_chunk[off / GUEST_HI_CHUNK];
-        return c ? c + (off % GUEST_HI_CHUNK) : nullptr;
+        uint32_t ci = hi_index(guest_phys);
+        uint8_t* c = g_hi_chunk[ci];
+        if (!c && !g_hi_split[ci] && g_hi_lazy) c = AllocHiChunk(ci);       // a device model touched it first (satoru)
+        if (g_hi_split[ci]) {
+            uint64_t o = guest_phys - hi_base(ci);
+            return g_hi_split[ci][o >> 12] + (o & 0xFFF);
+        }
+        return c ? c + (guest_phys - hi_base(ci)) : nullptr;
     }
     for (int i = 0; i < phys_map_count; i++) {
         const GuestPhysMap& m = phys_maps[i];

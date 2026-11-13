@@ -24,6 +24,9 @@ public:
     // sub-second PIT port read - cheap + irq-safe for the vdso time-page tick.
     // callers add the monotonic uptime seconds. (satoru)
     static uint64_t RealtimeBaseSeconds();
+    // network time: move the realtime base by delta_s (the monotonic clock is
+    // untouched). (satoru)
+    static void StepRealtimeSeconds(int32_t delta_s);
 private:
     static uint32_t boot_utc_s;
     static uint32_t monotonic_ms;

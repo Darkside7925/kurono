@@ -8,6 +8,7 @@
 #include "../kernel/time.h"
 #include "../proc/scheduler.h"
 #include "../drivers/serial.h"
+#include "../drivers/cpu_detect.h"   // real /proc/cpuinfo contents (satoru)
 #include "../fs/kvfs.h"
 
 bool         LinuxKernel::running = false;
@@ -298,21 +299,34 @@ int LinuxKernel::GenMeminfo(char* buf, int mx, void*) {
 }
 
 int LinuxKernel::GenCpuinfo(char* buf, int mx, void*) {
+    // this was a fixed "KuronoVirt" / sse2-only identity. report the real cpu
+    // so a linux app that parses flags (and then picks an isa path) sees the
+    // same capabilities cpuid gives it. (satoru)
+    CpuInfo cpu = CPUDetect::GetInfo();
+    const char* vendor = cpu.vendor_string[0] ? cpu.vendor_string : "unknown";
+    const char* brand = cpu.brand_string[0] ? cpu.brand_string : vendor;
+    int mhz = cpu.frequency.base_mhz > 0 ? cpu.frequency.base_mhz : 1000;
+    int cache_kb = 0;
+    for (int i = 0; i < cpu.num_caches; i++)
+        if (cpu.cache[i].size_kb > cache_kb) cache_kb = cpu.cache[i].size_kb;
+
     int p = 0;
     p = PutLine(buf, p, mx, "processor",  "0");
-    p = PutLine(buf, p, mx, "vendor_id",  "KuronoVirt");
-    p = PutLine(buf, p, mx, "cpu family", "6");
-    p = PutLine(buf, p, mx, "model",      "1");
-    p = PutLine(buf, p, mx, "model name", "Kurono Virtual CPU @ 1.00GHz");
-    p = PutLine(buf, p, mx, "stepping",   "0");
-    p = PutLine(buf, p, mx, "cpu MHz",    "1000.000");
-    p = PutLine(buf, p, mx, "cache size", "4096 KB");
+    p = PutLine(buf, p, mx, "vendor_id",  vendor);
+    p = PutStr(buf, p, mx, "cpu family\t: "); p = PutDec(buf, p, mx, cpu.family); p = PutStr(buf, p, mx, "\n");
+    p = PutStr(buf, p, mx, "model\t\t: "); p = PutDec(buf, p, mx, cpu.model); p = PutStr(buf, p, mx, "\n");
+    p = PutLine(buf, p, mx, "model name", brand);
+    p = PutStr(buf, p, mx, "stepping\t: "); p = PutDec(buf, p, mx, cpu.stepping); p = PutStr(buf, p, mx, "\n");
+    p = PutStr(buf, p, mx, "cpu MHz\t\t: "); p = PutDec(buf, p, mx, mhz); p = PutStr(buf, p, mx, ".000\n");
+    p = PutStr(buf, p, mx, "cache size\t: "); p = PutDec(buf, p, mx, cache_kb); p = PutStr(buf, p, mx, " KB\n");
     p = PutLine(buf, p, mx, "fpu",        "yes");
     p = PutLine(buf, p, mx, "fpu_exception", "yes");
-    p = PutLine(buf, p, mx, "cpuid level", "13");
+    p = PutStr(buf, p, mx, "cpuid level\t: "); p = PutDec(buf, p, mx, (int)cpu.max_cpuid); p = PutStr(buf, p, mx, "\n");
     p = PutLine(buf, p, mx, "wp",          "yes");
-    p = PutLine(buf, p, mx, "flags",       "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat clflush mmx fxsr sse sse2");
-    p = PutLine(buf, p, mx, "bogomips",    "2000.00");
+    p = PutStr(buf, p, mx, "flags\t\t:");
+    p += CPUDetect::FormatFeatureFlags(buf + p, mx - 1 - p);
+    p = PutStr(buf, p, mx, "\n");
+    p = PutStr(buf, p, mx, "bogomips\t: "); p = PutDec(buf, p, mx, mhz * 2); p = PutStr(buf, p, mx, ".00\n");
     p = PutStr(buf, p, mx, "\n");
     return p;
 }

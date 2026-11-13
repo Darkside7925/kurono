@@ -27,6 +27,7 @@
 #include "../drivers/serial.h"
 #include "../system/ui_config.h"
 #include "../ui/frame_pacer.h"
+#include "../ui/night_light.h"   // night light card (satoru)
 #include "../ui/modern_draw.h"
 #include "../ui/font.h"
 
@@ -45,7 +46,7 @@ enum { MODE_JOIN = 0, MODE_MIRROR = 1, MODE_SINGLE = 2 };
 
 // ── session model (constant-initialised statics, ctor-free) (satoru) ──────
 struct Disp { char name[16]; int num; int pw, ph; bool intel; };
-struct Cfg  { bool on[OUTPUT_MAX]; int ax[OUTPUT_MAX], ay[OUTPUT_MAX]; int primary; int res; int rw, rh; int scale; };
+struct Cfg  { bool on[OUTPUT_MAX]; int ax[OUTPUT_MAX], ay[OUTPUT_MAX]; int primary; int res; int rw, rh; int scale; int hz; };
 
 static Disp s_d[OUTPUT_MAX];
 static int  s_n = 0;              // displays this session (satoru)
@@ -93,7 +94,8 @@ static int      s_last_h = 480, s_last_w = 540;
 enum {
     H_IDENT = 1, H_MODE0, H_MODE1, H_MODE2, H_PRIMARY, H_PILL0, H_PILL1, H_PILL2, H_PILL3,
     H_ENABLE, H_RES, H_SCALE, H_RATE, H_VSYNC, H_BRIGHT, H_APPLY, H_REVERT, H_KEEP, H_UNDO,
-    H_TILE0, H_TILE1, H_TILE2, H_TILE3
+    H_NIGHT, H_NSCHED, H_NSTR,   // night light card (satoru)
+    H_DPRATE, H_TILE0, H_TILE1, H_TILE2, H_TILE3
 };
 struct Hot { int id, x, y, w, h; };
 static Hot s_hot[40];
@@ -265,10 +267,12 @@ static void read_live(Cfg& c){
     c.rw = s_multi ? 0 : (int)DisplayManager::GetWidth();
     c.rh = s_multi ? 0 : (int)DisplayManager::GetHeight();
     c.scale = Graphics::GetUIScale();
+    // the external pipe b monitor's hardware rate, when one is lit. (satoru)
+    c.hz = (int)IntelModeset::CurrentHz();
 }
 
 static bool cfg_same(const Cfg& a, const Cfg& b){
-    if(a.primary != b.primary || a.rw != b.rw || a.rh != b.rh || a.scale != b.scale) return false;
+    if(a.primary != b.primary || a.rw != b.rw || a.rh != b.rh || a.scale != b.scale || a.hz != b.hz) return false;
     for(int d = 0; d < s_n; d++){
         if(a.on[d] != b.on[d]) return false;
         if(a.on[d] && (a.ax[d] != b.ax[d] || a.ay[d] != b.ay[d])) return false;
@@ -478,6 +482,21 @@ static void set_enabled(int d, bool on){
 // returns false when the backend refused the mode change (nothing else is
 // committed then). (satoru)
 static bool commit(const Cfg& c){
+    // the external monitor's hardware refresh: a real pipe b off/on through
+    // intel_modeset, before the layout is touched. a refused timing leaves
+    // the previous one lit and nothing else is committed. (satoru)
+    if(c.hz > 0 && c.hz != s_live.hz){
+        char msg[128];
+        if(!IntelModeset::SetRate(msg, (int)sizeof(msg), (uint32_t)c.hz)){
+            Graphics::MarkUIDirty();
+            SerialLogger::Log("[displays] the monitor refused the staged refresh rate\r\n");
+            return false;
+        }
+        FramePacer::OutputsChanged();
+        SerialLogger::Log("[displays] monitor refresh now ");
+        SerialLogger::LogDec((int)IntelModeset::CurrentHz());
+        SerialLogger::Log(" Hz\r\n");
+    }
     if(s_multi){
         bool on[OUTPUT_MAX] = {false, false, false, false};
         int ax[OUTPUT_MAX] = {0, 0, 0, 0}, ay[OUTPUT_MAX] = {0, 0, 0, 0};
@@ -514,6 +533,12 @@ static void app_int(char* b, int v, int mx){ char t[12]; SettingsUI::IntToStr(v,
 
 static void persist(const Cfg& c){
     UIConfig::SetInt("display.ui_scale", c.scale, true);
+    if(c.hz > 0){
+        // save what the pipe really locked, not the staged value: a timing the
+        // monitor refused falls back to the previous one. (satoru)
+        int now_hz = (int)IntelModeset::CurrentHz();
+        UIConfig::SetInt("display.dp_hz", now_hz > 0 ? now_hz : c.hz, true);
+    }
     if(s_multi){
         // slot order after the apply: the primary first, then the rest. (satoru)
         UIConfig::SetInt("display.outputs", s_n, true);
@@ -544,7 +569,9 @@ static bool geometry_changed(const Cfg& a, const Cfg& b){ return !cfg_same(a, b)
 static void do_apply(){
     if(cfg_same(s_st, s_live)) return;
     s_prev = s_live;
-    bool geo = geometry_changed(s_st, s_live);
+    // a hardware refresh change is a visible, revertable change like a mode
+    // switch: show the keep dialog and time it out back to the old rate. (satoru)
+    bool geo = geometry_changed(s_st, s_live) || s_st.hz != s_live.hz;
     if(!commit(s_st)){
         s_st.rw = s_live.rw; s_st.rh = s_live.rh; s_st.res = s_live.res;
         if(s_st.rw > 0){ s_d[0].pw = s_st.rw; s_d[0].ph = s_st.rh; }
@@ -911,6 +938,7 @@ static void render_keep_dialog(int x, int y, int w, int h){
 // `display` shell command, personalize's scale) re-reads the page. (satoru)
 static uint32_t live_sig(){
     uint32_t h = 2166136261u ^ (uint32_t)Graphics::GetUIScale() ^ ((uint32_t)Graphics::GetWidth() << 7) ^ (uint32_t)Graphics::GetHeight();
+    h = (h ^ IntelModeset::CurrentHz()) * 16777619u;
     for(int i = 0; i < Outputs::Total(); i++){
         const Output* o = Outputs::Get(i);
         if(!o) continue;
@@ -1034,24 +1062,22 @@ static void display_render(int x, int y, int w, int h, int scroll){
         }
         ry += rh;
 
-        // refresh rate: read-only, what the hardware really runs at (satoru)
+        // monitor refresh: the hardware timing of this output. the external
+        // pipe b monitor offers its edid rates and switches live through the
+        // apply/keep/revert flow; the internal panel is firmware-owned and
+        // read-only (kurono never modesets pipe a). (satoru)
         row_sep(x, ry, cw);
-        {
-            const char* sub = nullptr;
-            if(d == s_live.primary || !s_multi){
-                uint32_t mhz = FramePacer::PanelHz();
-                if(mhz){
-                    SettingsUI::IntToStr((int)mhz, buf, 64); SettingsUI::StrApp(buf, " Hz", 64);
-                    sub = FramePacer::PanelSource();
-                    if(!sub || s_eq(sub, "default")) sub = "Not reported by the display, assumed";
-                }
-                else SettingsUI::StrCpy(buf, "Unknown", 64);
-            } else if(s_d[d].intel){
-                SettingsUI::StrCpy(buf, "From the lit mode", 64); sub = "gpumode light HZ picks the timing";
-            } else {
-                SettingsUI::StrCpy(buf, "Firmware mode", 64); sub = "Not reported by the firmware";
-            }
-            row_label(x, ry, rh, "Refresh Rate", sub);
+        if(s_d[d].intel){
+            int hz = s_st.hz > 0 ? s_st.hz : (int)IntelModeset::CurrentHz();
+            SettingsUI::IntToStr(hz, buf, 64); SettingsUI::StrApp(buf, " Hz", 64);
+            row_label(x, ry, rh, "Monitor Refresh", "Hardware timing on the external port");
+            dropdown_row(H_DPRATE, x, ry, cw, rh, buf);
+        } else {
+            bool panel = d == s_st.primary || !s_multi;
+            uint32_t mhz = panel ? FramePacer::PanelHz() : 0;
+            if(mhz){ SettingsUI::IntToStr((int)mhz, buf, 64); SettingsUI::StrApp(buf, " Hz", 64); }
+            else SettingsUI::StrCpy(buf, "Firmware mode", 64);
+            row_label(x, ry, rh, "Monitor Refresh", panel ? "Panel runs the firmware mode" : "Firmware mode");
             row_value(x, ry, cw, rh, buf);
         }
         ry += rh;
@@ -1065,9 +1091,9 @@ static void display_render(int x, int y, int w, int h, int scroll){
         ly += ch + 22;
     }
 
-    // frame pacing + sync, live like before (satoru)
+    // compositor frame pacing (not the monitor's hardware timing), live (satoru)
     {
-        card_title(x + 4, ly, "REFRESH & SYNC");
+        card_title(x + 4, ly, "FRAME RATE");
         ly += 22;
         int rh = 50;
         card(x, ly, cw, rh * 2);
@@ -1078,9 +1104,10 @@ static void display_render(int x, int y, int w, int h, int scroll){
         } else {
             SettingsUI::IntToStr(s_refresh_mode, buf, 64); SettingsUI::StrApp(buf, " Hz", 64);
         }
-        char sub[48] = "Pacing ";
-        app_int(sub, (int)FramePacer::CurrentHz(), 48); SettingsUI::StrApp(sub, " Hz", 48);
-        if(FramePacer::CurrentHz() < FramePacer::CapHz()) SettingsUI::StrApp(sub, " (stepped down)", 48);
+        char sub[64] = "Compositor ";
+        app_int(sub, (int)FramePacer::CurrentHz(), 64); SettingsUI::StrApp(sub, " Hz", 64);
+        if(FramePacer::CurrentHz() < FramePacer::CapHz()) SettingsUI::StrApp(sub, " (stepped down)", 64);
+        else if(s_refresh_mode > (int)FramePacer::CapHz()) SettingsUI::StrApp(sub, " (output capped)", 64);
         row_label(x, ly, rh, "Frame Rate Limit", sub);
         dropdown_row(H_RATE, x, ly, cw, rh, buf);
         row_sep(x, ly + rh, cw);
@@ -1104,7 +1131,41 @@ static void display_render(int x, int y, int w, int h, int scroll){
         hot(H_BRIGHT, sx, sy - 4, sl_w, SettingsUI::SLIDER_H + 12);
         SettingsUI::IntToStr(s_brightness, buf, 64); SettingsUI::StrApp(buf, "%", 64);
         txt(sx + sl_w + 12, ly + (rh - (int)body_px()) / 2 - 1, body_px(), buf, SettingsUI::COL_DIM);
-        ly += rh;
+        ly += rh + 22;
+    }
+
+    // night light: on/off, the daily schedule and the warmth, all live (satoru)
+    {
+        card_title(x + 4, ly, "NIGHT LIGHT");
+        ly += 22;
+        int rh = 50;
+        card(x, ly, cw, rh * 3);
+        int tx = x + cw - 16 - SettingsUI::TOGGLE_W;
+        row_label(x, ly, rh, "Night Light", "A warmer screen that is easier on the eyes at night");
+        int ty = ly + (rh - SettingsUI::TOGGLE_H) / 2;
+        SettingsUI::Toggle(tx, ty, NightLight::IsOn());
+        hot(H_NIGHT, tx, ty, SettingsUI::TOGGLE_W, SettingsUI::TOGGLE_H);
+        row_sep(x, ly + rh, cw);
+        char sched[64];
+        int fm = NightLight::FromMinutes(), tm = NightLight::ToMinutes();
+        char a[8] = "00:00", b[8] = "00:00";
+        a[0] = (char)('0' + fm / 600); a[1] = (char)('0' + (fm / 60) % 10); a[3] = (char)('0' + (fm % 60) / 10); a[4] = (char)('0' + fm % 10);
+        b[0] = (char)('0' + tm / 600); b[1] = (char)('0' + (tm / 60) % 10); b[3] = (char)('0' + (tm % 60) / 10); b[4] = (char)('0' + tm % 10);
+        SettingsUI::StrCpy(sched, "Turns on at ", 64); SettingsUI::StrApp(sched, a, 64);
+        SettingsUI::StrApp(sched, ", off at ", 64); SettingsUI::StrApp(sched, b, 64);
+        row_label(x, ly + rh, rh, "Schedule", sched);
+        ty = ly + rh + (rh - SettingsUI::TOGGLE_H) / 2;
+        SettingsUI::Toggle(tx, ty, NightLight::ScheduleOn());
+        hot(H_NSCHED, tx, ty, SettingsUI::TOGGLE_W, SettingsUI::TOGGLE_H);
+        row_sep(x, ly + rh * 2, cw);
+        row_label(x, ly + rh * 2, rh, "Warmth", nullptr);
+        int sl_w = cw / 3;
+        int sx = x + cw - 16 - 44 - sl_w, sy = ly + rh * 2 + rh / 2 - 8;
+        SettingsUI::Slider(sx, sy, sl_w, NightLight::Strength());
+        hot(H_NSTR, sx, sy - 4, sl_w, SettingsUI::SLIDER_H + 12);
+        SettingsUI::IntToStr(NightLight::Strength(), buf, 64); SettingsUI::StrApp(buf, "%", 64);
+        txt(sx + sl_w + 12, ly + rh * 2 + (rh - (int)body_px()) / 2 - 1, body_px(), buf, SettingsUI::COL_DIM);
+        ly += rh * 3;
     }
     ly += 84;     // room for the action bar (satoru)
     s_content_h = ly - (y - scroll);
@@ -1151,6 +1212,18 @@ static void step_dropdown(int id, int dir){
         if(nxt < 0) nxt = 0;
         if(nxt >= kRateCount) nxt = kRateCount - 1;
         if(nxt != cur){ s_refresh_mode = kRates[nxt]; FramePacer::SetMode((uint32_t)s_refresh_mode); }
+    } else if(id == H_DPRATE){
+        // the monitor's own timings, not the pacer ladder. (satoru)
+        uint32_t rates[8];
+        int n = IntelModeset::Rates(rates, 8);
+        if(n <= 0) return;
+        int cur = s_st.hz > 0 ? s_st.hz : (int)IntelModeset::CurrentHz();
+        int idx = 0;
+        for(int i = 0; i < n; i++) if((int)rates[i] <= cur) idx = i;
+        idx += dir;
+        if(idx < 0) idx = 0;
+        if(idx >= n) idx = n - 1;
+        s_st.hz = (int)rates[idx];
     }
 }
 
@@ -1206,7 +1279,7 @@ static bool display_input(int mx, int my, bool click, char key, int scroll){
             return true;
         }
         case H_ENABLE: set_enabled(s_sel, !s_st.on[s_sel]); return true;
-        case H_PRIMARY: case H_RES: case H_SCALE: case H_RATE: {
+        case H_PRIMARY: case H_RES: case H_SCALE: case H_RATE: case H_DPRATE: {
             int dir = SettingsUI::DropdownHit(h->x, h->y, h->w, mx, my);
             if(dir < 0){
                 // a click on the value pill steps forward (satoru)
@@ -1220,6 +1293,13 @@ static bool display_input(int mx, int my, bool click, char key, int scroll){
         case H_BRIGHT: {
             int p = SettingsUI::SliderHit(h->x, h->y + 4, h->w, mx, my);
             if(p >= 0){ s_brightness = p; persist_brightness(); }
+            return true;
+        }
+        case H_NIGHT: NightLight::Toggle(); return true;
+        case H_NSCHED: NightLight::SetSchedule(!NightLight::ScheduleOn()); return true;
+        case H_NSTR: {
+            int p = SettingsUI::SliderHit(h->x, h->y + 4, h->w, mx, my);
+            if(p >= 0) NightLight::SetStrength(p);
             return true;
         }
         case H_APPLY: do_apply(); return true;

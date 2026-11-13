@@ -4,8 +4,28 @@
 #include "linux_syscall.h"
 #include "../kernel/time.h"
 #include "../drivers/serial.h"
+#include "../kernel/pmm.h"
 
-ProcessSignalState LinuxSignals::states[256];   // matches LINUX_MAX_PROCS (satoru)
+// 256 * ~1.8 kb of per-process signal state. most boots never take a signal
+// through this table; allocate it on first use rather than carrying 464 kb of
+// bss. (satoru)
+ProcessSignalState* LinuxSignals::states = nullptr;
+
+static const size_t LSIG_STATES_BYTES = sizeof(ProcessSignalState) * 256;
+
+bool LinuxSignals::EnsureStateTable() {
+    if (states) return true;
+    states = (ProcessSignalState*)PMM::AllocBytes(LSIG_STATES_BYTES);
+    if (!states) return false;
+    memset(states, 0, LSIG_STATES_BYTES);
+    return true;
+}
+
+static ProcessSignalState* state_at(int idx) {
+    if (idx < 0 || idx >= 256) return nullptr;
+    if (!LinuxSignals::EnsureStateTable()) return nullptr;
+    return &LinuxSignals::states[idx];
+}
 LinuxSignals::AlarmEntry LinuxSignals::alarms[64];
 
 void LinuxSignals::SetBit(LinuxSigset* set, int signo) {
@@ -34,14 +54,15 @@ bool LinuxSignals::IsValid(int signo) {
 //  init
 
 void LinuxSignals::Init() {
-    memset(states, 0, sizeof(states));
+    if (states) { PMM::FreeBytes(states, LSIG_STATES_BYTES); states = nullptr; }
     memset(alarms, 0, sizeof(alarms));
     SerialLogger::Log("[LinuxSignals] Signal system initialized\r\n");
 }
 
 void LinuxSignals::InitProcess(int pid_idx) {
     if (pid_idx < 0 || pid_idx >= 64) return;
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return;
     memset(s, 0, sizeof(ProcessSignalState));
 
     // set default handlers
@@ -55,7 +76,7 @@ void LinuxSignals::InitProcess(int pid_idx) {
 
 ProcessSignalState* LinuxSignals::GetState(int pid_idx) {
     if (pid_idx < 0 || pid_idx >= 64) return nullptr;
-    return &states[pid_idx];
+    return state_at(pid_idx);
 }
 
 //  signal delivery
@@ -81,7 +102,8 @@ int LinuxSignals::TKill(int tid, int signo) {
 
 int LinuxSignals::SendSignal(int pid_idx, int signo, uint32_t sender_pid) {
     if (pid_idx < 0 || pid_idx >= 64) return -1;
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return -1;
 
     // sigkill and sigstop cannot be caught or ignored
     if (signo == LSIG_KILL) {
@@ -150,7 +172,8 @@ int LinuxSignals::Sigaction(int pid_idx, int signo,
     if (signo == LSIG_KILL || signo == LSIG_STOP) return -1;  // can't change
     if (pid_idx < 0 || pid_idx >= 64) return -1;
 
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return -1;
 
     if (oldact) {
         memcpy(oldact, &s->handlers[signo], sizeof(LinuxSigaction));
@@ -165,7 +188,8 @@ int LinuxSignals::Sigprocmask(int pid_idx, int how,
                                 const LinuxSigset* set,
                                 LinuxSigset* oldset) {
     if (pid_idx < 0 || pid_idx >= 64) return -1;
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return -1;
 
     if (oldset) {
         oldset->bits = s->blocked.bits;
@@ -194,14 +218,17 @@ int LinuxSignals::Sigprocmask(int pid_idx, int how,
 
 int LinuxSignals::SigPending(int pid_idx, LinuxSigset* set) {
     if (pid_idx < 0 || pid_idx >= 64 || !set) return -1;
-    set->bits = states[pid_idx].pending.bits;
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) { set->bits = 0; return 0; }
+    set->bits = s->pending.bits;
     return 0;
 }
 
 int LinuxSignals::SigSuspend(int pid_idx, const LinuxSigset* mask) {
     if (pid_idx < 0 || pid_idx >= 64 || !mask) return -1;
     // temporarily replace signal mask and sleep until a signal arrives
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return -1;
     LinuxSigset old = s->blocked;
     s->blocked.bits = mask->bits;
     ClearBit(&s->blocked, LSIG_KILL);
@@ -214,7 +241,8 @@ int LinuxSignals::SigSuspend(int pid_idx, const LinuxSigset* mask) {
 
 bool LinuxSignals::HasPendingSignal(int pid_idx) {
     if (pid_idx < 0 || pid_idx >= 64) return false;
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return false;
 
     // check if any pending signal is not blocked
     uint64_t deliverable = s->pending.bits & ~s->blocked.bits;
@@ -223,7 +251,8 @@ bool LinuxSignals::HasPendingSignal(int pid_idx) {
 
 int LinuxSignals::DeliverPending(int pid_idx) {
     if (pid_idx < 0 || pid_idx >= 64) return 0;
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return 0;
 
     int signo = DequeueSignal(s);
     if (signo == 0) return 0;
@@ -275,7 +304,8 @@ int LinuxSignals::DeliverPending(int pid_idx) {
 
 void LinuxSignals::Sigreturn(int pid_idx) {
     if (pid_idx < 0 || pid_idx >= 64) return;
-    ProcessSignalState* s = &states[pid_idx];
+    ProcessSignalState* s = state_at(pid_idx);
+    if (!s) return;
     s->in_handler = false;
     s->current_signal = 0;
     // restore any blocked signals that were temporarily added

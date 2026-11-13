@@ -1053,32 +1053,40 @@ void ProcFS::UpdateCPUInfo() {
     }
     if (cache_kb <= 0) cache_kb = 8192;
 
-    char buf[512];
+    // the flags used to be a fixed modern-intel list, so a core2 or k10 boot
+    // advertised sse4/avx to every app that parses procfs. derive them from the
+    // detected cpuid bits instead; the buffer grew to fit a modern list. (satoru)
+    char buf[2048];
+    const int mx = (int)sizeof(buf);
     int p = 0;
-    p = lf_a(buf, p, 512, "processor\t: 0\n");
-    p = lf_a(buf, p, 512, "vendor_id\t: ");
-    p = lf_a(buf, p, 512, vendor);
-    p = lf_a(buf, p, 512, "\nmodel name\t: ");
-    p = lf_a(buf, p, 512, brand);
-    p = lf_a(buf, p, 512, "\ncpu MHz\t\t: ");
-    p = lf_ai(buf, p, 512, cpu_mhz);
-    p = lf_a(buf, p, 512, ".000\n");
-    p = lf_a(buf, p, 512, "cache size\t: ");
-    p = lf_ai(buf, p, 512, cache_kb);
-    p = lf_a(buf, p, 512, " KB\n");
-    p = lf_a(buf, p, 512, "physical id\t: 0\n");
-    p = lf_a(buf, p, 512, "siblings\t: ");
-    p = lf_ai(buf, p, 512, siblings);
-    p = lf_a(buf, p, 512, "\n");
-    p = lf_a(buf, p, 512, "cpu cores\t: ");
-    p = lf_ai(buf, p, 512, cores);
-    p = lf_a(buf, p, 512, "\n");
-    p = lf_a(buf, p, 512, "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat "
-                          "pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc rep_good nopl "
-                          "cpuid tsc_known_freq pni ssse3 cx16 sse4_1 sse4_2 x2apic popcnt aes xsave "
-                          "avx hypervisor lahf_lm svm\n");
-    p = lf_a(buf, p, 512, "bogomips\t: 7200.00\n");
-    
+    p = lf_a(buf, p, mx, "processor\t: 0\n");
+    p = lf_a(buf, p, mx, "vendor_id\t: ");
+    p = lf_a(buf, p, mx, vendor);
+    p = lf_a(buf, p, mx, "\nmodel name\t: ");
+    p = lf_a(buf, p, mx, brand);
+    p = lf_a(buf, p, mx, "\ncpu MHz\t\t: ");
+    p = lf_ai(buf, p, mx, cpu_mhz);
+    p = lf_a(buf, p, mx, ".000\n");
+    p = lf_a(buf, p, mx, "cache size\t: ");
+    p = lf_ai(buf, p, mx, cache_kb);
+    p = lf_a(buf, p, mx, " KB\n");
+    p = lf_a(buf, p, mx, "physical id\t: 0\n");
+    p = lf_a(buf, p, mx, "siblings\t: ");
+    p = lf_ai(buf, p, mx, siblings);
+    p = lf_a(buf, p, mx, "\n");
+    p = lf_a(buf, p, mx, "cpu cores\t: ");
+    p = lf_ai(buf, p, mx, cores);
+    p = lf_a(buf, p, mx, "\n");
+    p = lf_a(buf, p, mx, "cpuid level\t: ");
+    p = lf_ai(buf, p, mx, (int)cpu.max_cpuid);
+    p = lf_a(buf, p, mx, "\n");
+    p = lf_a(buf, p, mx, "flags\t\t:");
+    p += CPUDetect::FormatFeatureFlags(buf + p, mx - 1 - p);
+    p = lf_a(buf, p, mx, "\n");
+    p = lf_a(buf, p, mx, "bogomips\t: ");
+    p = lf_ai(buf, p, mx, cpu_mhz * 2);
+    p = lf_a(buf, p, mx, ".00\n");
+
     KVFS::WriteString("/proc/cpuinfo", buf);
 }
 

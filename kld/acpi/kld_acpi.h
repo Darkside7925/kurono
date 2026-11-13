@@ -5,6 +5,7 @@
 #define KLD_ACPI_H
 
 void kld_phys_add(acpi_physical_address base, void *host, acpi_size len);
+int kld_acpi_hid_i2c_scan(void);
 
 extern int kld_osl_broker_mode;
 extern acpi_physical_address kld_osl_rsdp;

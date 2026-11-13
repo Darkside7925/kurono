@@ -254,12 +254,24 @@ static void linux_build(){
         for(int i = 0; i < VMHost::DistroCount(); i++){
             const VMHost::DistroDesc* d = VMHost::GetDistro(i);
             PushId(i);
+            // a distro only counts as installed when its disk image (and, for
+            // debian, its kernel files) are on the KURONO partition; "In use"
+            // is the running one, "Selected" the one the next start uses. (satoru)
+            int inst = VMHost::DistroInstalled(i);
+            bool active = vi.state != VMHost::VMH_OFF && vi.state != VMHost::VMH_FAILED;
             if(d->status != VMHost::DS_READY){
                 StrCpy(sub, d->version, 128); StrApp(sub, ". ", 128); StrApp(sub, d->note, 128);
                 Info(d->name, "Coming soon", sub);
+            } else if(inst != 0){
+                StrCpy(sub, inst == 4 ? "Its kernel files are missing from" : (inst == 2 ? "Its disk image is fragmented on" : "Its disk image is not on"), 128);
+                StrApp(sub, " the KURONO partition (", 128); StrApp(sub, d->image_name, 128); StrApp(sub, ")", 128);
+                Info(d->name, "Not installed", sub, T().warn);
             } else if(i == sel){
-                Info(d->name, "In use", d->version, T().success);
-            } else if(Button(d->name, "Use", BTN_SECONDARY, d->version)){
+                if(active && vi.distro != i)
+                    Info(d->name, "Selected", "Restart Linux to switch to it", T().warn);
+                else
+                    Info(d->name, active ? "In use" : "Selected", active ? d->version : "Used from the next start", T().success);
+            } else if(Button(d->name, "Use", BTN_SECONDARY, active && vi.distro == i ? "Running now" : d->version)){
                 UIConfig::Set("linux.distro", d->id, true);
                 UIConfig::Save();
                 linux_on_show();

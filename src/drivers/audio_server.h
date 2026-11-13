@@ -80,9 +80,20 @@ int      ReleaseStreamsOf(uint32_t pid);
 // Per-tick pump.  Called from the kernel main loop.
 void Tick();
 
+// reopen the active backend (usb audio re-runs its iso/rate/volume bring-up,
+// hd audio re-runs controller + codec init; other backends stop + init). this
+// is what `audio restart` and the settings/control center buttons call. (satoru)
+bool RestartActive();
+
+// hard stop every mixer stream (no fade, no drain). the current period still
+// drains, then the backend goes idle. returns how many streams were dropped. (satoru)
+int StopAllStreams();
+
 // preferred pump entry: takes the audio lock, pumps, and (optionally) runs
 // the pulse pacing pass. the dedicated audio kernel process calls this. (satoru)
 void LockedTick();
+// pump cadence since the last call (read and reset): pumps run and the longest gap in ms. (satoru)
+void PumpStats(uint32_t* calls, uint32_t* max_gap_ms);
 
 // starvation-proof backup pump for the pit timer path (Scheduler::Tick on
 // the bsp): if the audio process has not pumped recently AND the lock is

@@ -1,0 +1,4 @@
+# Kconfig-forced exceptions to the y/not-set snapshot check.
+# CONFIG_CRYPTO_ARC4 is not exposed by this fragment's crypto menu; the WPA
+# library links lib/crypto/arc4.c directly, so no generated define is expected.
+CONFIG_CRYPTO_ARC4

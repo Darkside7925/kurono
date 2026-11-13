@@ -3,6 +3,7 @@
 // at /system/run/user/1000/pulse/native. interleaved s16, paced from the sink's own queue depth,
 // CORK for pause, DELETE on close and GET_PLAYBACK_LATENCY for Queued. (satoru)
 #include "../kui.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -168,6 +169,33 @@ void apply_gain(int16_t* s, int n, int vol) {
 
 void service(Stream& s);
 
+// [kuiaudio]: how long this app's own thread sits blocked on the kernel's pulse server. the
+// latency poll below is a synchronous request/reply in the app's render loop, so a slow audio
+// process shows up as late video frames. one line every 10 s while a stream plays. (satoru)
+struct WaitStat { uint64_t t0_us, n, total_us, max_us, timeouts, over5ms; };
+WaitStat g_ws = {};
+inline uint64_t mono_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+}
+void waitstat_note(uint64_t t0, bool ok) {
+    uint64_t now = mono_us();
+    uint64_t d = now - t0;
+    g_ws.n++; g_ws.total_us += d;
+    if (d > g_ws.max_us) g_ws.max_us = d;
+    if (d > 5000) g_ws.over5ms++;
+    if (!ok) g_ws.timeouts++;
+    if (!g_ws.t0_us) g_ws.t0_us = t0;
+    if (now - g_ws.t0_us >= 10000000ull) {
+        fprintf(stderr, "[kuiaudio] 10s: latency_polls=%llu avg_wait_us=%llu max_wait_us=%llu over5ms=%llu timeouts=%llu\n",
+                (unsigned long long)g_ws.n, (unsigned long long)(g_ws.n ? g_ws.total_us / g_ws.n : 0),
+                (unsigned long long)g_ws.max_us, (unsigned long long)g_ws.over5ms, (unsigned long long)g_ws.timeouts);
+        g_ws = WaitStat{};
+        g_ws.t0_us = now;
+    }
+}
+
 void handle_command(uint32_t cmd, uint32_t tag, const uint8_t* a, int n) {
     if (cmd == CMD_REQUEST) return;   // we pace from the sink queue, not the server's requests (satoru)
     if (g_wait_tag && tag == g_wait_tag) {
@@ -283,7 +311,11 @@ void poll_latency(Stream& s) {
     int n = put_u32(a, s.channel);
     n += put_timeval(a + n, (uint32_t)ts.tv_sec, (uint32_t)(ts.tv_nsec / 1000));
     uint32_t tag = g_next_tag++;
-    if (send_cmd(CMD_LATENCY, tag, a, n) && wait_reply(tag, 60)) {
+    uint64_t wt0 = mono_us();
+    bool sent = send_cmd(CMD_LATENCY, tag, a, n);
+    bool got = sent && wait_reply(tag, 60);
+    if (sent) waitstat_note(wt0, got);
+    if (got) {
         // the reply's write and read indices are this stream's own client bytes; the
         // sink usec also counts the backend's always-full silence ring, which is not
         // ours and never drains, so pace from wr - rd instead. (satoru)

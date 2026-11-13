@@ -964,6 +964,7 @@ static bool ustar_extract(const char* archive, int archive_len, const char* base
     bool any = false;
     while (pos + 512 <= archive_len) {
         if (!g_kpkg_bg_install) KuronoShell::PumpUI();
+        Scheduler::CondResched();   // per tar entry: the firefox launch unpacks several (satoru)
         const char* hdr = archive + pos;
         // empty block = end
         bool empty = true;
@@ -2220,6 +2221,8 @@ bool PackageManager::InstallClaude(const char* channel, bool only_if_newer) {
     }
 
     // 4. one physical buffer for the whole binary, filled range by range. (satoru)
+    if (!PMM::ImageWindowFullyReserved() && !PMM::TryReserveImageWindow())
+        cl_say("note: the fixed-image memory window is busy; reboot before running claude");
     uint64_t alloc = (want_size + 4095) & ~4095ull;
     uint8_t* buf = (uint8_t*)PMM::AllocBytes((size_t)alloc); TaskMem::ChargeFrames(buf, (size_t)alloc);
     if (!buf) { pset_sync_message("Not enough free memory for the Claude Code binary."); return false; }

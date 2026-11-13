@@ -60,6 +60,7 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 | `userspace_entry.asm` | ring-3 entry / IRETQ stubs |
 | `vmm.cpp` | virtual memory or mapping support at kernel layer |
 | `vmm.h` | VMM declarations |
+| `dbgwatch.cpp` / `dbgwatch.h` | hardware write watchpoints (`kurono.dbgwatch=`) |
 
 ## `src/hal`
 
@@ -126,6 +127,10 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 | `usb.h` | USB interface |
 | `virtio_gpu.cpp` | VirtIO GPU path |
 | `virtio_gpu.h` | VirtIO GPU interface |
+| `intel_gt.cpp` / `intel_gt.h` | Intel render engine and blit batches |
+| `intel_gt_calc.cpp` / `intel_gt_calc.h` | Intel GT calculations |
+| `intel_dp_aux.cpp` / `intel_dp_aux.h` | DP AUX channel probe, legacy Type-C option |
+| `intel_modeset.cpp` / `intel_modeset.h` | Intel pipe and external sink modeset |
 
 ## `src/ui`
 
@@ -157,6 +162,7 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 | `wayland_server.h` | Wayland compositor interface |
 | `window_manager.cpp` | window manager implementation |
 | `window_manager.h` | window manager interface |
+| `gfx_oracle.cpp` / `gfx_oracle.h` | damage oracle: partial redraw checked against full redraw |
 
 ## `src/apps`
 
@@ -232,6 +238,7 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 | `tuntap.h` | Tun/Tap declarations |
 | `unix_socket.cpp` | AF_UNIX sockets + `SCM_RIGHTS` fd-passing |
 | `unix_socket.h` | AF_UNIX declarations |
+| `sntp.cpp` / `sntp.h` | network time (SNTP) |
 
 ## `src/proc`
 
@@ -296,6 +303,7 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 | `user_mgmt.cpp` | user management |
 | `user_mgmt.h` | user management declarations |
 | `vconsole.cpp` / `vconsole.h` | virtual consoles |
+| `opencode_host.cpp` / `opencode_host.h` | OpenCode loader, launch environment, OPENCODE.ENV keys |
 
 ## `src/linux`
 
@@ -360,6 +368,15 @@ Most of it is tables, and they're deliberately boring: path on the left, what it
 | `vmm.h` | backend declarations |
 | `vserial.cpp` | virtual serial |
 | `vserial.h` | virtual serial declarations |
+| `kloop.cpp` / `kloop.h` | `vm kloop` dev loop: build a kernel in the Alpine guest, boot it as a guest |
+| `vm_host.cpp` / `vm_host.h` | background VM host: distro table, dynamic RAM, disk and vCPU choices |
+| `vballoon.cpp` / `vballoon.h` | virtio-balloon, free page reporting only |
+| `vblk.cpp` / `vblk.h` | virtio-blk guest disk with 64 MB chunk files |
+| `vlapic.cpp` / `vlapic.h` | per vCPU local APIC for SMP guests |
+| `virtio_dev.cpp` / `virtio_dev.h` | shared virtqueue code for the virtio devices |
+| `vi8042.cpp` / `vi8042.h` | virtual i8042 (ps/2 keyboard controller) |
+| `vcon.cpp` / `vcon.h` | virtio-console (hvc0, hvc1) |
+| `mb2_boot.cpp` / `mb2_boot.h` | multiboot2 guest loader for `vm kurono` |
 
 ## `src/media`
 

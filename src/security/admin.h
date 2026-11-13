@@ -25,6 +25,12 @@ bool IsPrivileged();
 // returns true when the operation may proceed. (satoru)
 bool Authorize(const char* action, const char* detail);
 
+// the same gate for a ring-3 client of a kernel service. pid and uid are the
+// peer credentials the unix socket stamped at connect time; the grant follows
+// that client's linux process slot, not the kernel process dispatching it.
+// (satoru)
+bool AuthorizeForPid(uint32_t pid, uint32_t uid, const char* action, const char* detail);
+
 // path policy: writes to system paths and raw devices need elevation. (satoru)
 bool PathNeedsElevation(const char* resolved_path);
 bool AuthorizePathWrite(const char* resolved_path, const char* how);

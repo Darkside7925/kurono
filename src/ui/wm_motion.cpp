@@ -117,6 +117,16 @@ static inline bool screen32(uint32_t*& buf, int& pitch_px, int& sw, int& sh) {
     return true;
 }
 
+// writers: the drawable box is [g_wx0, sw) x [g_wy0, sh), the screen or the
+// damage scissor while a compositor pass runs (kurono.gfx.scissor=1).
+// readers (captures) keep screen32 and see the whole screen. (satoru)
+static int g_wx0 = 0, g_wy0 = 0;
+static inline bool screen32w(uint32_t*& buf, int& pitch_px, int& sw, int& sh) {
+    if (!screen32(buf, pitch_px, sw, sh)) return false;
+    Graphics::ScissorBounds(g_wx0, g_wy0, sw, sh);
+    return true;
+}
+
 bool Capture(Snapshot& s, int x, int y, int w, int h, int radius) {
     Release(s);
     uint32_t* buf; int pitch, sw, sh;
@@ -165,10 +175,10 @@ void Blit(const Snapshot& s, int sx, int sy, int sw_, int sh_,
           int dx, int dy, int dw, int dh, int alpha) {
     if (!s.px || dw <= 0 || dh <= 0 || sw_ <= 0 || sh_ <= 0 || alpha <= 0) return;
     uint32_t* buf; int pitch, scr_w, scr_h;
-    if (!screen32(buf, pitch, scr_w, scr_h)) return;
+    if (!screen32w(buf, pitch, scr_w, scr_h)) return;
     int a256 = alpha >= 255 ? 256 : alpha;
-    int x0 = dx < 0 ? 0 : dx, x1 = dx + dw > scr_w ? scr_w : dx + dw;
-    int y0 = dy < 0 ? 0 : dy, y1 = dy + dh > scr_h ? scr_h : dy + dh;
+    int x0 = dx < g_wx0 ? g_wx0 : dx, x1 = dx + dw > scr_w ? scr_w : dx + dw;
+    int y0 = dy < g_wy0 ? g_wy0 : dy, y1 = dy + dh > scr_h ? scr_h : dy + dh;
     if (x0 >= x1 || y0 >= y1) return;
     uint32_t step = (uint32_t)(((uint64_t)sw_ << 16) / (uint64_t)dw);
     for (int y = y0; y < y1; y++) {
@@ -202,7 +212,7 @@ static int isqrt(int v) {
 void FillRoundAlpha(int x, int y, int w, int h, int r, uint32_t color, int alpha) {
     if (w <= 0 || h <= 0 || alpha <= 0) return;
     uint32_t* buf; int pitch, scr_w, scr_h;
-    if (!screen32(buf, pitch, scr_w, scr_h)) return;
+    if (!screen32w(buf, pitch, scr_w, scr_h)) return;
     if (r * 2 > w) r = w / 2;
     if (r * 2 > h) r = h / 2;
     if (r < 0) r = 0;
@@ -210,12 +220,12 @@ void FillRoundAlpha(int x, int y, int w, int h, int r, uint32_t color, int alpha
     uint32_t c = color | 0xFF000000u;
     for (int j = 0; j < h; j++) {
         int yy = y + j;
-        if ((unsigned)yy >= (unsigned)scr_h) continue;
+        if ((unsigned)(yy - g_wy0) >= (unsigned)(scr_h - g_wy0)) continue;
         int inset = 0;
         int dyc = j < r ? r - j : (j >= h - r ? j - (h - 1 - r) : 0);
         if (dyc > 0) inset = r - isqrt(r * r - dyc * dyc);
         int xa = x + inset, xb = x + w - inset;
-        if (xa < 0) xa = 0;
+        if (xa < g_wx0) xa = g_wx0;
         if (xb > scr_w) xb = scr_w;
         uint32_t* drow = buf + (size_t)yy * pitch;
         for (int xx = xa; xx < xb; xx++)
@@ -387,9 +397,13 @@ bool SaveUnder(int x, int y, int w, int h) {
 void RestoreUnder() {
     if (!g_under_ok) return;
     uint32_t* buf; int pitch, sw, sh;
-    if (!screen32(buf, pitch, sw, sh)) return;
-    for (int j = 0; j < g_uh; j++)
-        __builtin_memcpy(buf + (size_t)(g_uy + j) * pitch + g_ux, g_under + (size_t)j * g_uw, (size_t)g_uw * 4);
+    if (!screen32w(buf, pitch, sw, sh)) return;
+    // only the part inside the drawable box goes back (all of it without a scissor). (satoru)
+    int x0 = g_ux > g_wx0 ? g_ux : g_wx0, x1 = g_ux + g_uw < sw ? g_ux + g_uw : sw;
+    int y0 = g_uy > g_wy0 ? g_uy : g_wy0, y1 = g_uy + g_uh < sh ? g_uy + g_uh : sh;
+    for (int yy = y0; yy < y1 && x1 > x0; yy++)
+        __builtin_memcpy(buf + (size_t)yy * pitch + x0, g_under + (size_t)(yy - g_uy) * g_uw + (x0 - g_ux),
+                         (size_t)(x1 - x0) * 4);
     g_under_ok = false;
 }
 
@@ -536,12 +550,12 @@ void BlitSmooth(const Snapshot& s, float dx, float dy, float dw, float dh, int a
     ProfScope ps(1);
     if (!s.px || s.w <= 0 || s.h <= 0 || s.w > ROWMAX || dw < 0.5f || dh < 0.5f || alpha256 <= 0) return;
     uint32_t* buf; int pitch, scr_w, scr_h;
-    if (!screen32(buf, pitch, scr_w, scr_h)) return;
+    if (!screen32w(buf, pitch, scr_w, scr_h)) return;
     if (alpha256 > 256) alpha256 = 256;
     int x0 = ifloor_(dx), x1 = ifloor_(dx + dw) + 1;
     int y0 = ifloor_(dy), y1 = ifloor_(dy + dh) + 1;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
+    if (x0 < g_wx0) x0 = g_wx0;
+    if (y0 < g_wy0) y0 = g_wy0;
     if (x1 > scr_w) x1 = scr_w;
     if (y1 > scr_h) y1 = scr_h;
     if (x0 >= x1 || y0 >= y1) return;
@@ -588,7 +602,7 @@ void Genie(const Snapshot& s, int wx, int wy, int ww, int wh,
     g_gx0 = g_gy0 = 0; g_gx1 = g_gy1 = 0;
     if (!s.px || s.w <= 0 || s.h <= 0 || s.w > ROWMAX) return;
     uint32_t* buf; int pitch, scr_w, scr_h;
-    if (!screen32(buf, pitch, scr_w, scr_h)) return;
+    if (!screen32w(buf, pitch, scr_w, scr_h)) return;
     p = sat_(p);
     const float D = ty + th;                       // bottom of the tube (satoru)
     float span = D - (float)wy;
@@ -616,7 +630,7 @@ void Genie(const Snapshot& s, int wx, int wy, int ww, int wh,
     int alpha = (int)(256.0f * (1.0f - 0.85f * smooth_((p - 0.72f) / 0.28f)));
     if (alpha <= 0) return;
     int y0 = ifloor_(top), y1 = ifloor_(bot) + 1;
-    if (y0 < 0) y0 = 0;
+    if (y0 < g_wy0) y0 = g_wy0;
     if (y1 > scr_h) y1 = scr_h;
     const float ky = (float)s.h / hgt;
     const float L0 = (float)wx, R0 = (float)(wx + ww), L1 = tx, R1 = tx + tw;
@@ -642,12 +656,12 @@ void Genie(const Snapshot& s, int wx, int wy, int ww, int wh,
         // with their coverage (the funnel walls stay smooth) (satoru)
         int ia = ifloor_(L) + 1, ib = ifloor_(R);
         int xa = ia - 1, xb = ib + 1;
-        if (xa < 0) xa = 0;
+        if (xa < g_wx0) xa = g_wx0;
         if (xb > scr_w) xb = scr_w;
         if (xa < bx0) bx0 = xa;
         if (xb > bx1) bx1 = xb;
         uint32_t* dr = buf + (size_t)y * pitch;
-        int ca = ia < 0 ? 0 : ia, cb = ib > scr_w ? scr_w : ib;
+        int ca = ia < g_wx0 ? g_wx0 : ia, cb = ib > scr_w ? scr_w : ib;
         if (cb > ca) {
             float u0 = ((float)ca + 0.5f - L) * kx - 0.5f;
             xtab(cb - ca, s.w, (int32_t)(u0 * 65536.0f), (int32_t)(kx * 65536.0f));
@@ -656,7 +670,7 @@ void Genie(const Snapshot& s, int wx, int wy, int ww, int wh,
         const uint32_t* T = g_trow + 1;
         for (int e = 0; e < 2; e++) {
             int x = e ? ib : ia - 1;
-            if (x < 0 || x >= scr_w || (e && ib < ia - 1)) continue;
+            if (x < g_wx0 || x >= scr_w || (e && ib < ia - 1)) continue;
             if (e && x == ia - 1) continue;
             float hc = 1.0f;
             if ((float)x < L) hc = (float)(x + 1) - L;
@@ -693,7 +707,7 @@ void SoftShadow(float x, float y, float w, float h, float r, float blur, float d
     ProfScope ps(0);
     if (alpha <= 0 || w < 1.0f || h < 1.0f) return;
     uint32_t* buf; int pitch, scr_w, scr_h;
-    if (!screen32(buf, pitch, scr_w, scr_h)) return;
+    if (!screen32w(buf, pitch, scr_w, scr_h)) return;
     if (!g_fall_ok) fall_init();
     if (alpha > 255) alpha = 255;
     if (blur < 1.0f) blur = 1.0f;
@@ -703,8 +717,8 @@ void SoftShadow(float x, float y, float w, float h, float r, float blur, float d
     const float hx = w * 0.5f - r, hy = h * 0.5f - r;
     int X0 = ifloor_(x - blur), X1 = ifloor_(x + w + blur) + 1;
     int Y0 = ifloor_(y + dy - blur), Y1 = ifloor_(y + dy + h + blur) + 1;
-    if (X0 < 0) X0 = 0;
-    if (Y0 < 0) Y0 = 0;
+    if (X0 < g_wx0) X0 = g_wx0;
+    if (Y0 < g_wy0) Y0 = g_wy0;
     if (X1 > scr_w) X1 = scr_w;
     if (Y1 > scr_h) Y1 = scr_h;
     if (X0 >= X1 || Y0 >= Y1) return;

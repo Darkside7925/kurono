@@ -383,6 +383,10 @@ void LinuxInit::svc_hostname() {
     KLSConfig* cfg = KLS::GetConfig();
     KVFS::WriteString("/linux/etc/hostname", cfg->hostname);
     KVFS::WriteString("/proc/sys/kernel/hostname", cfg->hostname);
+    // the kernel overflow ids (linux: 65534); Claude Code compares its uid
+    // with them before trusting file ownership (satoru)
+    KVFS::WriteString("/proc/sys/kernel/overflowuid", "65534\n");
+    KVFS::WriteString("/proc/sys/kernel/overflowgid", "65534\n");
 
     // also write to /sys
     LinuxKernel::WriteSys("/sys/kernel/hostname", cfg->hostname, li_slen(cfg->hostname));

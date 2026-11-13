@@ -27,6 +27,16 @@ and seek by clicking the progress bar.
 A simple waveform or spectrum thing drawn from the current audio buffer, updated every
 frame.
 
+## Playback stats
+
+Two serial log lines, every 10 seconds, show what the video and audio paths are doing:
+
+- `[kuiloop]` from the desktop's frame loop (`kui/ring3/kui_wayland.cpp`), while a window paces
+  itself with `RequestFrameAt`, as a playing video does. It logs the passes, frames, the longest
+  poll lateness and the callback drops.
+- `[audiopump]` from the kernel audio pump (`proc/kernel_processes.cpp`), with the number of pumps.
+
+
 ## Files
 
 - `src/media/mp3_decoder.cpp` audio decode

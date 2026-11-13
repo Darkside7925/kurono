@@ -32,6 +32,7 @@ namespace GuestConsole {
     uint64_t BytesOut(int idx);
     uint64_t BytesIn(int idx);
     void ResetRings(int idx);
+    void ReleaseAll();                                   // vm teardown (satoru)
 }
 
 // end (satoru)

@@ -1,5 +1,6 @@
 #include "serial.h"
 #include "../system/logging.h"
+#include "../kernel/heap.h"
 #include "../proc/smp.h"   // per-cpu line buffers for cross-core logging (satoru)
 
 static bool g_serial_quiet = false;
@@ -65,14 +66,49 @@ void SerialLogger::SetTimestampSource(uint64_t (*now_ms)()) { g_ser_now_ms = now
 // get the whole boot log out: disklog.cpp copies it into KURONO.LOG on the
 // kurono partition. appends happen under the serial lock or in panic-raw
 // mode, so a plain length store is enough. (satoru)
-static const uint32_t SER_CAP_SIZE = 4u * 1024u * 1024u;
-static char              g_ser_cap[SER_CAP_SIZE];
+// the ring is 256 kb by default (enough for the boot log and the panic tail);
+// kurono.serlog=big moves it to 4 mb for a full session capture. (satoru)
+static const uint32_t SER_CAP_SMALL = 256u * 1024u;
+static const uint32_t SER_CAP_BIG   = 4u * 1024u * 1024u;
+static char              g_ser_cap_small[SER_CAP_SMALL];
+static char*             g_ser_cap = g_ser_cap_small;
+static uint32_t          g_ser_cap_size = SER_CAP_SMALL;
 static volatile uint32_t g_ser_cap_len = 0;
+
+// session stream: every captured byte also gets a running stream offset, and
+// once EnableStreamRing has run it lands in a power-of-two ring too, so the
+// disk log can follow a whole session instead of stopping where the linear
+// buffer above fills. same writers as the linear buffer (serial lock or
+// panic-raw), so plain stores plus one release store of the total. (satoru)
+static char*             g_ser_ring = nullptr;
+static uint32_t          g_ser_ring_size = 0;
+static volatile uint64_t g_ser_total = 0;
 
 static void ser_cap_put(const char* p, int n) {
     uint32_t l = g_ser_cap_len;
-    for (int i = 0; i < n && l < SER_CAP_SIZE; i++) g_ser_cap[l++] = p[i];
+    for (int i = 0; i < n && l < g_ser_cap_size; i++) g_ser_cap[l++] = p[i];
     __atomic_store_n(&g_ser_cap_len, l, __ATOMIC_RELEASE);
+    uint64_t t = g_ser_total;
+    char* r = g_ser_ring;
+    if (r) {
+        uint32_t m = g_ser_ring_size - 1;
+        for (int i = 0; i < n; i++) r[(uint32_t)(t + (uint64_t)i) & m] = p[i];
+    }
+    __atomic_store_n(&g_ser_total, t + (uint64_t)(n > 0 ? n : 0), __ATOMIC_RELEASE);
+}
+
+// opt-in big capture (kurono.serlog=big). copies what was captured so far so
+// the log stays continuous. failure just leaves the small ring in place. (satoru)
+void SerialLogger::SetBigCapture(bool big) {
+    if (!big || g_ser_cap != g_ser_cap_small) return;
+    char* b = (char*)KernelHeap::Alloc(SER_CAP_BIG);
+    if (!b) return;
+    uint32_t n = __atomic_load_n(&g_ser_cap_len, __ATOMIC_ACQUIRE);
+    if (n > SER_CAP_BIG) n = SER_CAP_BIG;
+    for (uint32_t i = 0; i < n; i++) b[i] = g_ser_cap_small[i];
+    __atomic_store_n(&g_ser_cap_len, n, __ATOMIC_RELEASE);
+    g_ser_cap = b;
+    g_ser_cap_size = SER_CAP_BIG;
 }
 
 // called after each completed line, outside the serial lock. disklog uses it
@@ -82,8 +118,65 @@ static void (*volatile g_ser_line_hook)() = nullptr;
 void SerialLogger::SetLineHook(void (*hook)()) { g_ser_line_hook = hook; }
 
 const char* SerialLogger::CaptureData() { return g_ser_cap; }
+
+// allocate the session ring and seed it from the linear capture, under the
+// serial lock so no line lands half in each. bytes the linear buffer already
+// dropped (it filled before this ran) stay zero in the ring. (satoru)
+bool SerialLogger::EnableStreamRing(uint32_t bytes) {
+    if (g_ser_ring) return true;
+    if (bytes < 65536u || (bytes & (bytes - 1)) != 0) return false;
+    char* r = (char*)KernelHeap::Alloc(bytes);
+    if (!r) return false;
+    for (uint32_t i = 0; i < bytes; i++) r[i] = 0;
+    uint32_t me = SMP::CpuIndex();
+    if (me >= SMP_MAX_CPUS) me = 0;
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&g_ser_lock_word, &expected, 1u, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+        do { __asm__ __volatile__("pause" ::: "memory"); }
+        while (__atomic_load_n(&g_ser_lock_word, __ATOMIC_RELAXED) != 0);
+    }
+    g_ser_lock_owner = (int)me;   // a log line from an irq here takes the nested path (satoru)
+    uint64_t t = g_ser_total;
+    uint32_t l = g_ser_cap_len;
+    // linear byte i is stream byte i; keep the newest ring-full of them (satoru)
+    uint32_t from = (l > bytes) ? l - bytes : 0;
+    for (uint32_t i = from; i < l && (uint64_t)i < t; i++) r[i & (bytes - 1)] = g_ser_cap[i];
+    g_ser_ring_size = bytes;
+    __atomic_store_n(&g_ser_ring, r, __ATOMIC_RELEASE);
+    g_ser_lock_owner = -1;
+    __atomic_store_n(&g_ser_lock_word, 0u, __ATOMIC_RELEASE);
+    return true;
+}
+uint64_t SerialLogger::StreamTotal() { return __atomic_load_n(&g_ser_total, __ATOMIC_ACQUIRE); }
+uint32_t SerialLogger::StreamRingSize() { return g_ser_ring_size; }
+
+// copy stream bytes [from, from+n) out. returns how many are still valid:
+// from the ring when there is one (0 when the writers already lapped it, so
+// the caller skips ahead), else from the linear buffer. the lap check runs
+// AFTER the copy, so a byte overwritten mid-copy is never reported. (satoru)
+uint32_t SerialLogger::StreamRead(uint64_t from, char* dst, uint32_t n) {
+    uint64_t t = __atomic_load_n(&g_ser_total, __ATOMIC_ACQUIRE);
+    if (from >= t) return 0;
+    if ((uint64_t)n > t - from) n = (uint32_t)(t - from);
+    char* r = __atomic_load_n(&g_ser_ring, __ATOMIC_ACQUIRE);
+    if (!r) {
+        uint32_t l = __atomic_load_n(&g_ser_cap_len, __ATOMIC_ACQUIRE);
+        if (from >= l) return 0;
+        if ((uint64_t)n > l - from) n = (uint32_t)(l - from);
+        for (uint32_t i = 0; i < n; i++) dst[i] = g_ser_cap[from + i];
+        return n;
+    }
+    uint32_t sz = g_ser_ring_size, m = sz - 1;
+    if (t - from > sz) return 0;
+    for (uint32_t i = 0; i < n; i++) dst[i] = r[(uint32_t)(from + i) & m];
+    uint64_t t2 = __atomic_load_n(&g_ser_total, __ATOMIC_ACQUIRE);
+    if (t2 - from > sz) return 0;
+    return n;
+}
 uint32_t SerialLogger::CaptureLen() { return __atomic_load_n(&g_ser_cap_len, __ATOMIC_ACQUIRE); }
-uint32_t SerialLogger::CaptureCap() { return SER_CAP_SIZE; }
+uint32_t SerialLogger::CaptureCap() { return g_ser_cap_size; }
 
 static void serial_flush_line(uint32_t cpu) {
     int n = g_ser_linelen[cpu];

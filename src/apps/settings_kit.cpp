@@ -142,9 +142,11 @@ static bool target(uint32_t*& buf, int& pitch){
 }
 static ClipR eff_clip(){
     ClipR c = g_clip;
-    int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
-    if(c.x0 < 0) c.x0 = 0;
-    if(c.y0 < 0) c.y0 = 0;
+    // the screen, or the damage scissor while a compositor pass runs (satoru)
+    int bx0, by0, sw, sh;
+    Graphics::ScissorBounds(bx0, by0, sw, sh);
+    if(c.x0 < bx0) c.x0 = bx0;
+    if(c.y0 < by0) c.y0 = by0;
     if(c.x1 > sw) c.x1 = sw;
     if(c.y1 > sh) c.y1 = sh;
     return c;
@@ -445,6 +447,13 @@ static float icon_sd(int id, float x, float y){
             d = f_min(d, sd_box(u, v, 7.9f, 0, 1.9f, 1.55f, 0.55f));
         }
         d = f_max(d, -sd_disc(x, y, 12, 12, 2.7f));
+        return d;
+    }
+    case IC_GLOBE: {
+        // a ring, the equator and one meridian (a squeezed ring). (satoru)
+        float d = sd_ring(x, y, 12, 12, 8.6f, S);
+        d = f_min(d, sd_seg(x, y, 3.6f, 12, 20.4f, 12, S * 0.9f));
+        d = f_min(d, sd_ring(12 + (x - 12) * 2.2f, y, 12, 12, 8.6f, S * 2.0f) / 2.2f);
         return d;
     }
     case IC_ABOUT: {
@@ -1195,6 +1204,39 @@ bool Nav(const char* label, const char* value, const char* sub){
     int vw = value ? k_min(TextWidth(FS_VALUE, value), r.w / 2) : 0;
     if(value) TextFit(r.x + r.w - 38 - vw, r.dyy + (r.h - 18) / 2, FS_VALUE, value, g_theme.text2, vw);
     row_label(r, label, sub, r.w - 70 - vw);
+    return false;
+}
+
+// ── network row: a nav row with signal bars, a lock and a check ────────────
+// bars 0..4. clicking anywhere on the row returns true. (satoru)
+bool NetRow(const char* label, int bars, bool locked, bool connected, const char* sub){
+    KRow r = row_begin(label, sub, true, 0);
+    if(C.pass == P_EVENT){
+        if(C.ev == EV_DOWN && pt_in(C.ev_x, C.ev_y, r.x, r.sy, r.w, r.h)) C.active = r.id;
+        if(ev_click_in(r.x, r.sy, r.w, r.h) || (ev_key_for(r) && (C.ev_key == K_ENTER || C.ev_key == K_SPACE || C.ev_key == K_RIGHT))){
+            mark(true); return true;
+        }
+        return false;
+    }
+    if(C.pass != P_DRAW || !visible(r)) return false;
+    row_chrome(r, true, r.x + 4, r.dyy + 4, r.w - 8, r.h - 8, 9);
+    float hv = Spring(r.id ^ 9u, r.hover ? 1.0f : 0.0f, 1);
+    int cy = r.dyy + r.h / 2;
+    int cx = r.x + r.w - 30 + (int)(hv * 3.0f);
+    Icon(IC_CHEV_R, cx, cy - 8, 16, g_theme.text3, 255);
+    // four rising bars, bottom aligned; the unlit ones stay faint. (satoru)
+    int bx = r.x + r.w - 62;
+    if(bars < 0) bars = 0;
+    if(bars > 4) bars = 4;
+    for(int i = 0; i < 4; i++){
+        int bh = 5 + i * 3;
+        bool lit = i < bars;
+        fill_round(bx + i * 5, cy + 7 - bh, 3, bh, 1, lit ? g_theme.text : g_theme.text3, lit ? 255 : 90);
+    }
+    int x = bx - 22;
+    if(locked){ Icon(IC_LOCK, x, cy - 8, 16, g_theme.text2, 255); x -= 22; }
+    if(connected) Icon(IC_CHECK, x, cy - 8, 16, g_theme.accent, 255);
+    row_label(r, label, sub, (x - r.x) - 30);
     return false;
 }
 

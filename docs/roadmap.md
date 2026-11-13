@@ -6,37 +6,52 @@ The order is priority, not a schedule. I work on this alone, around other things
 Status tags: **[done]** shipped and tested, **[wip]** being worked on, **[next]**
 queued, **[later]** wanted but not started.
 
-## Where it is right now: Kurono Kintsugi, Version 1 (part 2)
+## Where it is right now: part 3 of the major update
 
-Kintsugi is the release where I go back and fix what was cracked. It's in progress. This
-push is part 2. What has landed so far:
+Part 3 of the major update is the infrastructure and support work that comes before
+Kurono Kintsugi, Version 1. It is not the final version, and some parts are held back
+because of bugs and issues. What has landed so far:
 
 - **[done] Boots on real hardware.** Lenovo Legion Pro 7 (Arrow Lake-HX) via EFI, with a
   disk guard so it only writes to the `KURONO` partition. GRUB ISO for VMs.
-- **[done] Full-SMP scheduler mode** (`kurono.sched=2`, up to all cores) and a real
-  per-task `/proc`, so `ps`, `top` and the Task Manager show real data.
+- **[done] All cores by default.** Scheduler mode 2 (`kurono.sched=2`) is the default
+  now. On EFI boots every CPU the firmware lists comes online. A real per-task `/proc`
+  means `ps`, `top` and the Task Manager show real data.
 - **[done] Linux ABI layer.** Runs unmodified Firefox (real sites load), BusyBox and the
   recovery tools. Wayland server with a system clipboard shared across native apps,
   Wayland clients and the Alpine guest, plus Super+V history.
+- **[done] OpenCode and Claude Code run natively.** The unmodified OpenCode build runs
+  its TUI and `opencode run`, with tools working. Claude Code's freeze under long sessions
+  is fixed. A 2 h 50 min soak with heavy tool use had no faults.
+- **[done] Everyday Linux fixes.** Found by long Claude Code soaks: `cat` and `cp` work
+  again, pipes carry more than 64 KB, symlinks resolve, file times are real, directory
+  listings include `.` and `..`, process IDs count up, and fcntl locks work for SQLite
+  in WAL mode.
 - **[done] Apps as ring-3 programs** through kui: calculator, text editor (tabs, syntax
   highlighting, regex find), files, task manager, media player, video player, terminal,
   settings (via a settings service). In-kernel fallbacks stay.
 - **[done] New desktop pieces.** Control center, window snapping, Alt+Tab, show desktop,
   per-app window memory, files app polish (thumbnails, drives, multi-select, drag and
   drop, trash restore, search, open-with).
-- **[done] Security.** KSA approval prompt in an isolated hypervisor context, `ken`
-  (sudo-like) with `sudo`/`supr` aliases, and an admin gate on system paths, raw disks,
-  cross-user signals, the driver broker and more. Ring-3 programs run as a normal user.
+- **[done] Security.** KSA approval prompt in an isolated hypervisor context. `amdo` is
+  the privilege command (it was `ken`). `ken`, `sudo` and `supr` still work as hidden
+  aliases. There is an admin gate on system paths, raw disks, cross-user signals, the
+  driver broker and more. Ring-3 programs run as a normal user. KSA can be switched off
+  for now, see Near term.
 - **[done] Networking reliability.** Proper DHCP renew/rebind/expiry, DNS fallback, TCP
   retransmit timing, Wi-Fi reconnect.
 - **[done] Drivers.** NVMe, AHCI/SATA, xHCI USB, Intel/igc/e1000 NICs, Intel display with
   multi-monitor, HDA and USB audio. KLD runs unmodified Linux drivers (e1000e) in a ring-3
   sandbox.
 - **[done] Alpine Linux in my own hypervisor**, launching apps onto the desktop, with
-  clipboard and audio bridged.
+  clipboard and audio bridged. On machines with 12 or more CPUs, Alpine gets up to four
+  parallel vCPUs (four jobs ran about three times faster than on one). Guest RAM is backed
+  when the guest touches it, and guest disks grow on demand.
+- **[done] Debian 13 guest.** Boots and works end to end.
+- **[wip] Wi-Fi through KLD.** The Intel BE200 works through the iwlwifi driver in a
+  sandbox with VT-d isolation.
 - **[wip] USB hubs.** Hub and transaction-translator support is written. Hardware test
   is pending.
-- **[wip] Debian guest.** Still being tested.
 - **[wip] Firefox on heavy sites.** Works, but slow and flaky on heavy pages.
 - **[wip] Intel GPU acceleration.** Hardware cursor plane, zero-copy present, damage-only
   wallpaper. Behind `kurono.igpu.accel`, `kurono.igpu.zerocopy` and `kurono.wpdamage`,
@@ -50,13 +65,13 @@ push is part 2. What has landed so far:
 Goal: something I can use every day without it surprising me.
 
 - **[next] Daily-driver stability.** Fewer hangs and crashes on real hardware, the
-  remaining scheduler and memory races, Firefox reliability on heavy sites, less CPU
-  burn when idle.
+  remaining scheduler and memory races, and less CPU burn when idle.
 - **[next] Finish and ship Kintsugi V1.** Remaining parts, final testing on the laptop,
   release notes.
 - **[next] GPU acceleration, for real.** Get the hardware cursor and zero-copy path
-  solid on the laptop, make them safe to enable by default, then look past it
-  (plane composition, eventually command submission).
+  solid on the laptop, make them safe to enable by default, then look past it: the partial
+  redraw path (behind its flag), the i915 KLD translator, and eventually command
+  submission.
 - **[next] Installer.** A proper install-to-disk flow: partitioning, the `KURONO`
   partition, EFI boot entry, first-run setup. Today you run it from an ISO or USB.
 - **[next] Hardware coverage.** Test USB hubs on real hardware, more Wi-Fi chips, more
@@ -66,8 +81,8 @@ Goal: something I can use every day without it surprising me.
 
 - **[later] Package store.** `kpkg` works, but it's basic. I want a proper store with a
   signed index, versions, dependencies and a GUI.
-- **[later] KLD expansion.** More Linux drivers running in the sandbox (Wi-Fi, GPU
-  pieces, audio), and an IOMMU-backed isolation story so a driver can't DMA anywhere.
+- **[later] KLD expansion.** More Linux drivers running in the sandbox (GPU pieces, audio),
+  and an IOMMU-backed isolation story so a driver can't DMA anywhere.
 - **[later] Move services out of the kernel.** The settings service, audio server,
   clipboard and compositor pieces are still in ring 0. The kui apps are already out. The
   plan is to push more of these into ring-3 services with narrow interfaces.

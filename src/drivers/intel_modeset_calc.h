@@ -119,6 +119,18 @@ int LttprCount(uint8_t repeater_cnt);              // drm_dp_lttpr_count (satoru
 uint32_t CrDelayUs(uint8_t dpcd_rev, uint8_t rd_interval_dprx, bool lttpr);   // __read_delay cr, 8b/10b (satoru)
 uint32_t EqDelayUs(uint8_t rd_interval);           // __8b10b_channel_eq_delay_us (satoru)
 
+// ---- hardware cursor plane position (i9xx_cursor_update_arm / intel_cursor.c) (satoru) ----
+// CUR_POS: bit 15 x sign, bits 14:0 |x|, bit 31 y sign, bits 30:16 |y|, as linux writes it,
+// a partly off-screen cursor keeps its magnitude. the sprite's hotspot is its top-left
+// pixel: the plane position is the pointer position. (satoru)
+uint32_t CursorPosVal(int x, int y);
+// where the plane goes for a pointer at (px, py) on an output at (out_x, out_y) of out_w x
+// out_h compositor pixels whose panel is phys_w x phys_h: false = do not use the plane (the
+// arrow stays software). refused at a ui scale other than 100 on a single output, when the
+// compositor size differs from the panel size (a scaled output) and outside the output. (satoru)
+bool CursorLocal(int ui_scale, bool multi, int out_x, int out_y, int out_w, int out_h,
+                 int phys_w, int phys_h, int px, int py, int* lx, int* ly);
+
 }
 
 // end (satoru)

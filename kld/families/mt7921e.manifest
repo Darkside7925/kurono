@@ -1,0 +1,8 @@
+# mt7921e family properties, read by kld/tools/gen_match_table.sh. (satoru)
+name mt7921e
+# link-only family: no mt7921 hardware or emulation was available, so the
+# MSI-X table page need could not be observed. 0 keeps the broker's safe
+# refusal (a BAR that overlaps the table is refused) until a card proves the
+# family needs the shared page. (satoru)
+needs_msix_table_page 0
+# end (satoru)

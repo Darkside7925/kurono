@@ -25,7 +25,13 @@ public:
     // cursor path never needs this. (satoru)
     static void DamageCursor(int x, int y);
     static void DamageLastSoftware();
+    // where the software arrow was last drawn; false when none is drawn. (satoru)
+    static bool LastSoftwarePos(int& x, int& y);
     static void SetRawMode(bool enable);  // 1:1 pointer, no accel (satoru)
+    // gfx bench only: on = the left button state comes from `left` and a
+    // pending press edge from `click`, not from the device. (satoru)
+    static void BenchButton(bool on, bool left, bool click);
+    static void BenchRightClick();   // one injected right click, for the gfx oracle (satoru)
     static int mx, my;
     
     // touchpad/scroll configuration
@@ -83,6 +89,8 @@ public:
     // usb hid: decode a boot-protocol mouse report and inject motion/button
     // events through the same ring as the ps/2 path (satoru).
     static void ProcessUSBReport(const uint8_t* report, int len);
+    static void ProcessUSBReport(const uint8_t* report, int len, bool injected);   // (satoru)
+    static void ProcessInjectedReport(const uint8_t* report, int len);   // kld pointer bridge (satoru)
     static void ProcessUSBAbsReport(const uint8_t* report, int len);  // usb tablet (absolute) (satoru)
 private:
     static void Out(uint16_t p, uint8_t v);

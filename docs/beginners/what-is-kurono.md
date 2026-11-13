@@ -5,8 +5,10 @@ distro and it is not based on Linux code. The kernel, the desktop, the apps, the
 stack and most of the drivers are my own. Where it needs Linux software, it pretends to be
 Linux well enough that real Linux programs run on it.
 
-The release I'm working toward is **Kurono Kintsugi, Version 1**. It is in progress. The
-current state is "part 2": a big chunk of the work is in, the final polish is not.
+The release I'm working toward is **Kurono Kintsugi, Version 1**. It isn't out yet. What
+you get today is part 3 of the major update: the infrastructure and support work that
+comes before it. It is not the final version, and some features stay behind flags until
+they stop breaking things.
 
 ## What works today
 
@@ -26,25 +28,30 @@ direction everything is going. There are also in-kernel fallback versions.
 
 **It runs Linux programs.** The Linux ABI layer runs unmodified Firefox (it loads real
 websites, but heavy sites are slow and sometimes flaky), BusyBox, and a set of recovery
-tools like `ntfsfix` and `e2fsck`. Linux apps talk to Kurono through a built-in Wayland
-server.
+tools like `ntfsfix` and `e2fsck`. It also runs OpenCode, a terminal coding tool, and
+Claude Code. A freeze that used to hit Claude Code in long sessions is fixed, and a
+2 h 50 min session with heavy tool use had no faults. Linux apps talk to Kurono through a
+built-in Wayland server.
 
 **It has its own hypervisor.** Alpine Linux runs inside it and can launch apps that show
-up on the Kurono desktop. Debian is still being tested.
+up on the Kurono desktop. On machines with 12 or more CPUs, Alpine gets up to four vCPUs
+that run in parallel. Debian 13 also runs as a guest.
 
 **It has a real security model.** Programs run as a normal user. Anything that touches
 system paths, raw disks, other users' processes or the driver broker asks for approval.
 The approval prompt (KSA) is drawn from inside an isolated hypervisor context so a
-compromised kernel can't fake a click. `ken` is the sudo of Kurono.
+compromised kernel can't fake a click. `amdo` is the privilege command. It used to be
+`ken`, and `ken`, `sudo` and `supr` still work as aliases.
 
 **It has real drivers.** NVMe, SATA/AHCI, USB (xHCI, including hubs), Intel and igc and
-e1000 network cards, Wi-Fi, Intel display with multiple monitors, HDA and USB audio.
+e1000 network cards, Intel display with multiple monitors, HDA and USB audio.
 
-**It can run unmodified Linux drivers.** KLD loads a Linux driver (I've done e1000e) as an
-untrusted ring-3 process that talks to the hardware only through a kernel broker.
+**It can run unmodified Linux drivers.** KLD loads a Linux driver as an untrusted ring-3
+process that talks to the hardware only through a kernel broker. I've done e1000e. Intel
+Wi-Fi (iwlwifi, for the BE200 card) runs the same way now.
 
-**It uses all the cores if you ask.** The new scheduler mode (`kurono.sched=2`) spreads
-tasks over all your CPU cores. `/proc` is real now, so `ps` and `top` work.
+**It uses all the cores by default.** Scheduler mode 2 is the default. On EFI boots every
+CPU the firmware lists comes online. `/proc` is real now, so `ps` and `top` work.
 
 ## What is not ready
 
@@ -60,7 +67,6 @@ I'm listing these so nobody is surprised.
   a real boot yet.
 - **Firefox** is the heaviest thing I run. It works, but it is slow under software
   rendering and some heavy pages hang or stutter.
-- **Debian** in the hypervisor is still being tested. Alpine is the one that works.
 - **ARM and 32-bit** are not supported. This is x86_64 only for now.
 - **Installer:** there is a setup entry in the boot menu, but a polished "install to disk
   and boot from it" story is still on the roadmap.

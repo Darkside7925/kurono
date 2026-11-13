@@ -48,6 +48,8 @@ public:
     static void ResetGuestClock();
     // nanoseconds of guest system time (the kvm-clock the guest sees) (satoru)
     static uint64_t GuestClockNs();
+    static uint64_t* GuestDRs();
+    static void SetTscOffset(uint32_t cpu, int64_t off);   // guest tsc = host tsc + off on that host cpu (satoru)               // guest dr0-7 shadow, swapped per vcpu (satoru)
     static void ResetLogBudget();
 
     static VMExitAction HandleExit(vCPU* cpu);

@@ -1286,6 +1286,12 @@ bool geometry_ok() {
 volatile float g_prog_target = 0.04f;
 volatile uint64_t g_prog_ms = 0;
 uint64_t g_bar_ms = 0, g_bar_done = 0;
+// default: the bar stays hidden while loading and only shows at the end (fades
+// in, fills to the end, fades out), the look the owner liked. kurono.bootbar=live
+// shows it during loading as before. the progress still runs hidden, so the
+// final fill starts from the real position. (satoru)
+bool g_bar_live = false;
+uint64_t g_bar_show = 0;
 
 bool system_ready(uint64_t now) {
     return g_ready && (float)(now - g_t0) >= g_ready_r;
@@ -1314,6 +1320,14 @@ void bar_update(uint64_t now, float a) {
         }
     }
     float al = smooth((a - FILL1) / 300.0f);
+    if (!g_bar_live) {
+        // hidden until the system is ready, then a short fade in; the fade out
+        // waits until the bar has been visible long enough to read the fill. (satoru)
+        if (!ready || a < FILL1) { g_bar_alpha = 0.0f; return; }
+        if (!g_bar_show) g_bar_show = now;
+        al = smooth((float)(now - g_bar_show) / 220.0f);
+        if (g_bar_done && now < g_bar_show + 420u) g_bar_done = now;
+    }
     if (g_bar_done) al *= 1.0f - smooth((float)(now - g_bar_done) / 240.0f);
     g_bar_alpha = al;
 }
@@ -1423,6 +1437,8 @@ void spin_until(volatile int* flag, int want_clear, uint32_t max_ms) {
 } // namespace (satoru)
 
 // public (satoru)
+void SetLiveBar(bool on) { g_bar_live = on; }
+
 bool Start(int mode) {
     if (mode <= 0) return false;
     int W = Graphics::GetWidth(), H = Graphics::GetHeight();
@@ -1597,6 +1613,22 @@ bool StartShutdown(int action) {
 }
 
 bool ShutdownDone() { return g_rev_done != 0; }
+
+void CancelShutdown() {
+    if (!g_rev && !g_rev_pending && !g_rev_done) return;
+    g_rev_pending = 0;
+    g_rev = 0;
+    // tsc/pause spin, not SleepMs: the caller is the power worker, which may be
+    // running on a donated slice and cannot rely on another scheduler wake. (satoru)
+    uint64_t cancel_t0 = Timer::GetRealMs64();
+    while (g_busy && Timer::GetRealMs64() - cancel_t0 < 2000u)
+        for (volatile uint32_t d = 0; d < 10000; d++) asm volatile("pause");
+    g_rev_done = 0;
+    g_rev_action = 0;
+    if (!g_busy) finish();          // frees the film buffers, safe off the gui (satoru)
+    else { g_mode = M_DONE; Graphics::MarkUIDirty(); }
+    SerialLogger::Log("[bootanim] shutdown film cancelled\r\n");
+}
 
 bool CoversScreen() {
     if (g_mode != M_GUI || !g_ready) return false;

@@ -11,15 +11,34 @@
 #include "../drivers/serial.h"
 #include "../system/clipboard.h"
 #include "../kernel/types.h"
+#include "../kernel/heap.h"
 #include "../kernel/taskmem.h"   // kurono.taskmem=1 app scopes (satoru)
 
 namespace {
-    Vt       g_vt;
+    // the vt grid is ~1.7 mb (two screens + 400 lines of scrollback). it is
+    // allocated with the terminal window and freed when the window is really
+    // gone, so a desktop with no linux terminal keeps none of it. (satoru)
+    Vt*      g_vt = nullptr;
     int      g_wid = -1;
     uint64_t g_cursor = 0;
     uint32_t g_gen = 0;
     int      g_off = 0;                 // lines scrolled back
     bool     g_inited = false;
+
+    Vt* ensure_vt() {
+        if (!g_vt) {
+            g_vt = (Vt*)KernelHeap::Alloc(sizeof(Vt));
+            if (g_vt) memset(g_vt, 0, sizeof(Vt));
+        }
+        return g_vt;
+    }
+
+    void release_vt(Window* w) {
+        (void)w;
+        if (g_vt) { KernelHeap::Free(g_vt); g_vt = nullptr; }
+        g_inited = false;
+        g_wid = -1;
+    }
 
     // the same monospace grid as the Terminal app (satoru)
     float cell_pxh = 16.0f;
@@ -31,6 +50,14 @@ namespace {
     void sync_theme() {
         const KSS::Theme& t = KSS::T();
         T_BG = t.bg; T_FG = t.text; T_CURSOR = KSS::Accent(); T_DIM = t.text_dim;
+    }
+
+    // the distro the terminal would start: the one that ran last, else the
+    // settings choice before the first boot (satoru)
+    int target_distro() {
+        VMHost::Info vi; VMHost::GetInfo(&vi);
+        if (vi.boots || vi.state != VMHost::VMH_OFF) return vi.distro;
+        return VMHost::SelectedDistro();
     }
 
     void ensure_metrics() {
@@ -114,11 +141,11 @@ namespace {
     }
 
     const VtCell* row_ptr(int r) {
-        int hn = g_vt.HistCount();
+        int hn = g_vt->HistCount();
         int off = g_off > hn ? hn : g_off;
         int v = hn - off + r;
-        if (v < hn) return g_vt.HistLine(hn - 1 - v);
-        return &g_vt.Cell(v - hn, 0);
+        if (v < hn) return g_vt->HistLine(hn - 1 - v);
+        return &g_vt->Cell(v - hn, 0);
     }
 
     void send(const uint8_t* b, int n) { VMHost::ConsoleWrite((const char*)b, n); }
@@ -126,7 +153,7 @@ namespace {
     // paste text into the guest console, bracketed when the guest asked. (satoru)
     void paste_text(const char* s) {
         if (!s) return;
-        if (g_vt.BracketedPaste()) send((const uint8_t*)"\x1b[200~", 6);
+        if (g_vt->BracketedPaste()) send((const uint8_t*)"\x1b[200~", 6);
         uint8_t cb[256]; int cn = 0, total = 0;
         for (int i = 0; s[i] && total < 65536; i++, total++) {
             uint8_t c = (uint8_t)s[i];
@@ -136,7 +163,7 @@ namespace {
             if (cn == (int)sizeof(cb)) { send(cb, cn); cn = 0; }
         }
         if (cn) send(cb, cn);
-        if (g_vt.BracketedPaste()) send((const uint8_t*)"\x1b[201~", 6);
+        if (g_vt->BracketedPaste()) send((const uint8_t*)"\x1b[201~", 6);
         g_off = 0;
     }
 
@@ -144,40 +171,49 @@ namespace {
         if (ClipboardManager::HasPrimaryText()) paste_text(ClipboardManager::GetPrimaryText());
     }
 
-    void pump() {
+    // true when the screen contents changed (satoru)
+    bool pump() {
+        bool changed = false;
         // a new boot starts on a clean screen (satoru)
         if (VMHost::Generation() != g_gen) {
+            changed = true;
             g_gen = VMHost::Generation();
-            g_vt.Init(g_vt.Cols(), g_vt.Rows(), T_FG, T_BG);
+            g_vt->Init(g_vt->Cols(), g_vt->Rows(), T_FG, T_BG);
             g_off = 0;
         }
         static char buf[4096];
         int total = 0, n;
         while (total < (1 << 18) && (n = VMHost::ConsoleRead(&g_cursor, buf, sizeof(buf))) > 0) {
-            g_vt.Feed((const uint8_t*)buf, n);
+            g_vt->Feed((const uint8_t*)buf, n);
             total += n;
         }
+        if (total) changed = true;
         uint8_t rep[256];
         int rn;
-        while ((rn = g_vt.TakeReply(rep, sizeof(rep))) > 0) send(rep, rn);
+        while ((rn = g_vt->TakeReply(rep, sizeof(rep))) > 0) send(rep, rn);
         if (VMHost::ConsoleHead() != g_cursor) Graphics::MarkUIDirty();
+        return changed;
     }
 
     void render(Window* w, int cx, int cy, int cw, int ch) {
+    if (!g_vt) return;
         sync_theme();
         ensure_metrics();
-        g_vt.SetDefaults(T_FG, T_BG);
+        g_vt->SetDefaults(T_FG, T_BG);
         int ox = cx + PAD_X, oy = cy + PAD_Y;
         int cols = (cw - 2 * PAD_X) / CELL_W, rows = (ch - 2 * PAD_Y) / CELL_H;
         if (cols < 20) cols = 20;
         if (cols > VT_MAXC) cols = VT_MAXC;
         if (rows < 4) rows = 4;
         if (rows > VT_MAXR) rows = VT_MAXR;
-        if (cols != g_vt.Cols() || rows != g_vt.Rows()) g_vt.Resize(cols, rows);
+        if (cols != g_vt->Cols() || rows != g_vt->Rows()) g_vt->Resize(cols, rows);
         VMHost::ConsoleResize(cols, rows);          // no-op unless it changed (satoru)
-        pump();
+        // under kurono.gfx.scissor=1 this runs under an empty clip when the window
+        // is outside the frame's damage; new guest output has to damage the
+        // window itself or it only showed up once the window moved. (satoru)
+        if (pump()) Graphics::MarkDirty(cx, cy, cw, ch);
         Graphics::FillRect(cx, cy, cw, ch, T_BG);
-        int hn = g_vt.HistCount();
+        int hn = g_vt->HistCount();
         if (g_off > hn) g_off = hn;
         for (int r = 0; r < rows; r++) {
             const VtCell* row = row_ptr(r);
@@ -215,13 +251,13 @@ namespace {
             }
         }
         VMHost::State st = VMHost::GetState();
-        if (g_vt.CursorVisible() && g_off == 0 && st == VMHost::VMH_RUNNING) {
-            int r = g_vt.CurRow(), c = g_vt.CurCol();
+        if (g_vt->CursorVisible() && g_off == 0 && st == VMHost::VMH_RUNNING) {
+            int r = g_vt->CurRow(), c = g_vt->CurCol();
             if (r >= 0 && r < rows && c >= 0 && c < cols) {
                 int x = ox + c * CELL_W, y = oy + r * CELL_H;
                 if (w && w->focused) {
                     Graphics::FillRect(x, y, CELL_W, CELL_H, T_CURSOR);
-                    const VtCell& k = g_vt.Cell(r, c);
+                    const VtCell& k = g_vt->Cell(r, c);
                     if (k.cp > ' ' && k.cp < 0x80) { char s[2] = { (char)k.cp, 0 }; draw_run(x, y, s, T_BG, false); }
                 } else {
                     Graphics::FillRect(x, y, CELL_W, 1, T_CURSOR); Graphics::FillRect(x, y + CELL_H - 1, CELL_W, 1, T_CURSOR);
@@ -232,19 +268,35 @@ namespace {
         // vm state line when it is not simply running (satoru)
         if (st != VMHost::VMH_RUNNING) {
             const char* msg = "";
-            char eb[160];
+            char eb[192];
+            const char* dn = VMHost::GetDistro(target_distro())->name;
             switch (st) {
-                case VMHost::VMH_STARTING: msg = "Starting Alpine Linux..."; break;
-                case VMHost::VMH_STOPPING: msg = "Alpine is shutting down..."; break;
+                case VMHost::VMH_STARTING: {
+                    int p = 0; const char* a = "Starting "; while (*a) eb[p++] = *a++;
+                    a = dn; while (*a && p < 180) eb[p++] = *a++;
+                    a = "..."; while (*a && p < 186) eb[p++] = *a++;
+                    eb[p] = 0; msg = eb; break;
+                }
+                case VMHost::VMH_STOPPING: {
+                    int p = 0; const char* a = dn; while (*a && p < 160) eb[p++] = *a++;
+                    a = " is shutting down..."; while (*a && p < 184) eb[p++] = *a++;
+                    eb[p] = 0; msg = eb; break;
+                }
                 case VMHost::VMH_FAILED: {
-                    int p = 0; const char* a = "Alpine failed: "; while (*a && p < 150) eb[p++] = *a++;
+                    int p = 0; const char* a = dn; while (*a && p < 60) eb[p++] = *a++;
+                    a = " failed: "; while (*a && p < 150) eb[p++] = *a++;
                     a = VMHost::LastError(); while (*a && p < 150) eb[p++] = *a++;
-                    a = "  (Enter: retry)"; while (*a && p < 158) eb[p++] = *a++;
+                    a = "  (Enter: retry)"; while (*a && p < 188) eb[p++] = *a++;
                     eb[p] = 0; msg = eb; break;
                 }
                 default:
-                    msg = VMHost::Enabled() ? "Alpine is stopped. Press Enter to start it."
-                                            : "Linux is turned off. Turn it on in Settings > Linux.";   // (satoru)
+                    if (VMHost::Enabled()) {
+                        int p = 0; const char* a = dn; while (*a && p < 140) eb[p++] = *a++;
+                        a = " is stopped. Press Enter to start it."; while (*a && p < 188) eb[p++] = *a++;
+                        eb[p] = 0; msg = eb;
+                    } else {
+                        msg = "Linux is turned off. Turn it on in Settings > Linux.";   // (satoru)
+                    }
                     break;
             }
             int bh = CELL_H + 8;
@@ -284,37 +336,42 @@ int AlpineTerminal::Open() {
         if (w && w->state == WIN_MINIMIZED) WindowManager::Unminimize(g_wid);
         WindowManager::BringToFront(g_wid);
         WindowManager::Focus(g_wid);      // raised but unfocused took no keys (satoru)
-        if (VMHost::GetState() == VMHost::VMH_OFF) VMHost::Start(VMHost::DISTRO_ALPINE, 0);
+        if (VMHost::GetState() == VMHost::VMH_OFF) VMHost::Start(target_distro(), 0);
         return g_wid;
     }
     sync_theme();
     ensure_metrics();
-    if (!g_inited) { g_vt.Init(100, 30, T_FG, T_BG); g_inited = true; }
+    if (!ensure_vt()) return -1;
+    if (!g_inited) { g_vt->Init(100, 30, T_FG, T_BG); g_inited = true; }
     // show what the guest printed so far: replay the scrollback from the start
     // of the current boot (the ring keeps the last 256 kb) (satoru)
     g_cursor = 0;
     g_gen = VMHost::Generation();
-    g_vt.Init(g_vt.Cols(), g_vt.Rows(), T_FG, T_BG);
+    g_vt->Init(g_vt->Cols(), g_vt->Rows(), T_FG, T_BG);
     g_off = 0;
     int sw = Graphics::GetWidth(), sh = Graphics::GetHeight();
     int ww = 100 * CELL_W + 2 * PAD_X + 2, wh = 30 * CELL_H + 2 * PAD_Y + 34;
     if (ww > sw - 40) ww = sw - 40;
     if (wh > sh - 120) wh = sh - 120;
-    g_wid = WindowManager::CreateWindow("Alpine", -1, -1, ww, wh,
+    g_wid = WindowManager::CreateWindow(VMHost::GetDistro(target_distro())->name, -1, -1, ww, wh,
         (WindowRenderFunc)[](Window* w, int cx, int cy, int cw, int ch) { render(w, cx, cy, cw, ch); },
         (WindowInputFunc)[](Window* w, int ev, int p1, int p2) {
             (void)w; (void)p2;
             if (ev == 3) {                          // wheel: scrollback (satoru)
                 g_off += (p1 > 0) ? 3 : (p1 < 0 ? -3 : 0);
                 if (g_off < 0) g_off = 0;
-                if (g_off > g_vt.HistCount()) g_off = g_vt.HistCount();
+                if (g_off > g_vt->HistCount()) g_off = g_vt->HistCount();
                 Graphics::MarkUIDirty();
             }
             else if (ev == 6 && p2 && p1 == 2) paste_primary();   // middle click (satoru)
             // characters come through KeyEvent as raw keys, not here (satoru)
         });
+    {
+        Window* w = WindowManager::GetWindow(g_wid);
+        if (w) w->on_close = release_vt;
+    }
     if (VMHost::GetState() == VMHost::VMH_OFF || VMHost::GetState() == VMHost::VMH_FAILED)
-        VMHost::Start(VMHost::DISTRO_ALPINE, 0);
+        VMHost::Start(target_distro(), 0);
     Graphics::MarkUIDirty();
     return g_wid;
 }
@@ -331,7 +388,7 @@ void AlpineTerminal::KeyEvent(int key, bool shift, bool ctrl, bool alt) {
     VMHost::State st = VMHost::GetState();
     if (st != VMHost::VMH_RUNNING) {
         if ((k == KEY_ENTER || k == KEY_KP_ENTER) && (st == VMHost::VMH_OFF || st == VMHost::VMH_FAILED)) {
-            VMHost::Start(VMHost::DISTRO_ALPINE, 0);
+            VMHost::Start(target_distro(), 0);
             Graphics::MarkUIDirty();
         }
         return;
@@ -339,7 +396,7 @@ void AlpineTerminal::KeyEvent(int key, bool shift, bool ctrl, bool alt) {
     if (shift && !ctrl && !alt && (k == KEY_PAGEUP || k == KEY_PAGEDOWN)) {
         g_off += (k == KEY_PAGEUP) ? 10 : -10;
         if (g_off < 0) g_off = 0;
-        if (g_off > g_vt.HistCount()) g_off = g_vt.HistCount();
+        if (g_off > g_vt->HistCount()) g_off = g_vt->HistCount();
         Graphics::MarkUIDirty();
         return;
     }
@@ -352,7 +409,7 @@ void AlpineTerminal::KeyEvent(int key, bool shift, bool ctrl, bool alt) {
     g_off = 0;
     uint8_t o[64]; int n = 0;
     int mod = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
-    bool app = g_vt.AppCursorKeys();
+    bool app = g_vt->AppCursorKeys();
     switch (k) {
         case KEY_UP:    n = csi(o, n, 0, 'A', mod, app); break;
         case KEY_DOWN:  n = csi(o, n, 0, 'B', mod, app); break;

@@ -12,6 +12,7 @@
 #include "../drivers/serial.h"
 #include "../system/logging.h"
 #include "../fs/kvfs.h"
+#include "../system/user_mgmt.h"   // standard vs administrator accounts (satoru)
 
 namespace {
 
@@ -217,8 +218,27 @@ bool run_prompt(const char* detail) {
     req.detail    = detail ? detail : "An application wants to make a privileged change.";
     req.username  = "root";
     req.want_cred = false;   // consent prompt; sudo-style commands verify a credential (satoru)
+    // a standard account cannot approve on its own: the prompt asks for an
+    // administrator's password and the digest must match that account. (satoru)
+    const char* admin = UserManager::FirstAdminName();
+    bool standard = UserManager::GetUserCount() > 0 && admin && !UserManager::CurrentIsAdmin();
+    if (standard) {
+        req.title     = "Enter an administrator password";
+        req.username  = admin;
+        req.want_cred = true;
+    }
+    // ksa switched off in Settings: a bare click is not enough, the prompt asks
+    // for the administrator password (password-only approval). (satoru)
+    bool pw_only = KSA::IsSuspended() && !standard;
+    if (pw_only) {
+        req.title     = "Enter the administrator password";
+        req.username  = KEN::EscalationAccount();
+        req.want_cred = true;
+    }
     KSAVerdict v;
     bool ok = KSA::Prompt(req, v) && v.approved;
+    if (ok && standard) ok = v.have_cred_hash && UserManager::DigestMatches(admin, v.cred_hash);
+    else if (ok && pw_only) ok = v.have_cred_hash && KEN::EscalationDigestOk(v.cred_hash);
     return ok;
 }
 
@@ -230,6 +250,46 @@ void copy_detail(char* d, int mx, const char* a, const char* b) {
     s = b;
     while (s && *s && p < mx - 1) d[p++] = *s++;
     d[p] = 0;
+}
+
+// a kernel service acting for a ring-3 client runs on a kernel process, so
+// IsPrivileged() would always say yes. resolve the CLIENT task back to its
+// linux process slot instead, and gate (and grant) that slot. (satoru)
+int index_for_task_pid(uint32_t pid) {
+    Process* t = Scheduler::FindProcessByPid(pid);
+    if (!t) return -1;
+    for (int i = 0; i < LINUX_MAX_PROCS; i++) {
+        LinuxProcess* lp = LinuxSyscall::GetProcess(i);
+        if (lp && lp->active && lp->task == t) return i;
+    }
+    return -1;
+}
+
+bool prompt_and_grant(int idx, const char* action, const char* detail) {
+    char d[160];
+    copy_detail(d, sizeof(d), action, detail);
+    SerialLogger::Log("[admin] prompt: ");
+    SerialLogger::Log(d);
+    SerialLogger::Log("\r\n");
+
+    bool ok;
+    {
+        KlsRelax relax;
+        ok = run_prompt(d);
+    }
+    if (ok) {
+        grant_index(idx, ADMIN_GRANT_MS);
+        RuntimeLog::LogSecurity("admin approved", d);
+        SerialLogger::Log("[admin] approved: ");
+        SerialLogger::Log(d);
+        SerialLogger::Log("\r\n");
+    } else {
+        RuntimeLog::LogSecurity("admin denied", d);
+        SerialLogger::Log("[admin] denied: ");
+        SerialLogger::Log(d);
+        SerialLogger::Log("\r\n");
+    }
+    return ok;
 }
 
 }  // namespace (satoru)
@@ -257,32 +317,18 @@ bool IsPrivileged() {
 bool Authorize(const char* action, const char* detail) {
     if (IsPrivileged()) return true;
     if (!g_enforce) return true;
+    return prompt_and_grant(cur_index(), action, detail);
+}
 
-    char d[160];
-    copy_detail(d, sizeof(d), action, detail);
-    SerialLogger::Log("[admin] prompt: ");
-    SerialLogger::Log(d);
-    SerialLogger::Log("\r\n");
-
-    bool ok;
-    {
-        KlsRelax relax;
-        ok = run_prompt(d);
-    }
-    if (ok) {
-        int i = cur_index();
-        grant_index(i, ADMIN_GRANT_MS);
-        RuntimeLog::LogSecurity("admin approved", d);
-        SerialLogger::Log("[admin] approved: ");
-        SerialLogger::Log(d);
-        SerialLogger::Log("\r\n");
-    } else {
-        RuntimeLog::LogSecurity("admin denied", d);
-        SerialLogger::Log("[admin] denied: ");
-        SerialLogger::Log(d);
-        SerialLogger::Log("\r\n");
-    }
-    return ok;
+// authorize an action requested by a ring-3 client over a kernel service
+// socket. pid/uid come from the socket's stamped peer credentials, not from
+// the kernel process that happens to dispatch the request. (satoru)
+bool AuthorizeForPid(uint32_t pid, uint32_t uid, const char* action, const char* detail) {
+    if (!g_enforce) return true;
+    if (uid == 0) return true;
+    int idx = index_for_task_pid(pid);
+    if (idx >= 0 && g_grants[idx].until_ms > now_ms()) return true;
+    return prompt_and_grant(idx, action, detail);
 }
 
 bool PathNeedsElevation(const char* resolved_path) {
@@ -325,6 +371,7 @@ bool ShellCommandNeedsElevation(const char* cmdline) {
     // go through this gate. exact names only, so "kenfoo" cannot inherit the
     // exemption. (satoru)
     if ((same_str(name, "sudo") && !name[4]) || (same_str(name, "ken") && !name[3]) ||
+        (same_str(name, "amdo") && !name[4]) ||   // amdo = ken renamed (satoru)
         (same_str(name, "supr") && !name[4])) {
         const char* sub = cmdline + n;
         while (*sub == ' ' || *sub == '\t') sub++;
@@ -339,6 +386,45 @@ bool ShellCommandNeedsElevation(const char* cmdline) {
             !same_str(subn, "selftest")) return false;
     }
 
+    // read-only subcommands of commands that also change state. status is what
+    // diagnosis needs; light/rate/off/on/test still prompt. (satoru)
+    if ((same_str(name, "gpumode") && !name[7]) || (same_str(name, "gpuaccel") && !name[8])) {
+        const char* sub = cmdline + n;
+        while (*sub == ' ' || *sub == '\t') sub++;
+        char subn[32];
+        int sn = 0;
+        while (sub[sn] && sub[sn] != ' ' && sub[sn] != '\t' && sn < 31) {
+            subn[sn] = sub[sn];
+            sn++;
+        }
+        subn[sn] = 0;
+        if (!subn[0] || same_str(subn, "status") || same_str(subn, "show"))
+            return false;
+        return true;
+    }
+
+    // kinit (and the kctl spelling the agent's bash uses) is readable without
+    // approval; start/stop/restart/enable/disable change the machine and go
+    // through the prompt. list/status are what ps/top-style diagnosis needs. (satoru)
+    // kdrv the same way: list/info only look, reload/unload/start change a
+    // running driver and go through the approval prompt. (satoru)
+    if ((same_str(name, "kinit") && !name[5]) || (same_str(name, "kctl") && !name[4]) ||
+        (same_str(name, "kdrv") && !name[4])) {
+        const char* sub = cmdline + n;
+        while (*sub == ' ' || *sub == '\t') sub++;
+        char subn[32];
+        int sn = 0;
+        while (sub[sn] && sub[sn] != ' ' && sub[sn] != '\t' && sn < 31) {
+            subn[sn] = sub[sn];
+            sn++;
+        }
+        subn[sn] = 0;
+        if (!subn[0] || same_str(subn, "status") || same_str(subn, "list") ||
+            same_str(subn, "logs") || same_str(subn, "analyze") || same_str(subn, "info"))
+            return false;
+        return true;
+    }
+
     // allowlist: read-only, informational, media and app launchers. anything
     // not listed is treated as privileged, which is the safe default for a
     // channel that can run kernel builtins. (satoru)
@@ -350,12 +436,12 @@ bool ShellCommandNeedsElevation(const char* cmdline) {
         "hwfw", "dmesg", "journal", "journalctl", "cpufreq", "display", "gpu",
         "gpuprobe", "gpuaux", "codecs", "netstat_l", "ping", "ping_l",
         "nslookup", "ifconfig", "ifconfig_l", "ip", "ip_l", "iwconfig",
-        "nmcli", "wifi", "nic", "tree", "which", "kj", "python",
+        "nmcli", "wifi", "nic", "ksys", "kctl", "drivers", "ss", "iotop", "tree", "which", "kj", "python",
         "python3", "node", "kpy", "firefox", "claude", "kapp", "ffmpeg",
         "wltest", "pthtest", "usermode", "audio", "denji",
-        "playvideo", "vgpu", "blkid", "lsb_release", "cat", "head", "tail",
+        "playvideo", "vgpu", "blkid", "lsb_release", "persisttest", "cat", "head", "tail",
         "wc", "sort", "uniq", "cut", "tr", "grep", "find", "xargs",
-        "lsmod", "modinfo", "tasklist", "version", "ver", "type", "dir",
+        "lsmod", "modinfo", "tasklist", "version", "ver", "type", "dir", "list", "pkginfo",
         "findstr", "search", "systeminfo", "nic", nullptr
     };
     for (int i = 0; safe[i]; i++) {

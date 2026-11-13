@@ -104,6 +104,23 @@ ISR_NOERR 85   ; kld broker msi vector 0x55 (satoru)
 ISR_NOERR 86   ; kld broker msi vector 0x56 (satoru)
 ISR_NOERR 87   ; kld broker msi vector 0x57 (satoru)
 
+; stray-vector stubs, one per vector 0..255, 16 bytes apart (isr_stray_base +
+; 16*v). hal.cpp points every idt entry nothing else claimed at its stub, so an
+; interrupt on a vector the kernel never set up (the laptop's 0xa9) reaches the
+; c handler as a normal frame instead of a #gp on an empty gate. no error code:
+; a hardware interrupt never pushes one. (satoru)
+align 16
+global isr_stray_base
+isr_stray_base:
+%assign v 0
+%rep 256
+    push qword 0
+    push qword v
+    jmp  isr_common
+    align 16
+%assign v v+1
+%endrep
+
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  Common handler - saves all GPRs, calls C, restores, iretq
 ;
@@ -146,6 +163,10 @@ isr_common:
     cld                         ; SysV ABI requires DF=0
 
     call isr_common_handler
+    ; [ubchk] exit trace: rsp is &frame again, same alignment as the call above (satoru)
+    mov  rdi, rsp
+    extern ub_trace_isr_exit
+    call ub_trace_isr_exit
 
     ; Pop CR2 (we don't write it back - it's read-only effectively)
     add  rsp, 8

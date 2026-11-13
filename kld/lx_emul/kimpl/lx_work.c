@@ -34,6 +34,16 @@ static volatile unsigned int lx_tmr_done;     // futex: a callback finished (sat
 static struct lx_task *lx_tmr_task;
 
 static int lx_timer_thread(void *arg);
+static void lx_timer_start_once(void);
+
+// the timer thread is also the jiffies refresh; start it at container init so
+// the first driver that computes "jiffies + 100 ms" does so on a current value
+// (a stale jiffies made hid-multitouch's sticky-finger timer fire at once). (satoru)
+void lx_timers_start(void)
+{
+    lx_jiffies_update();
+    lx_timer_start_once();
+}
 
 static void lx_timer_start_once(void)
 {
@@ -135,15 +145,17 @@ static int lx_timer_thread(void *arg)
         lx_jiffies_update();
         struct timer_list *due = NULL, *t;
         unsigned long now = jiffies;
-        long next = 2;   // jiffies; the 2 ms jiffies-refresh ceiling (satoru)
+        long next = 0;   // jiffies to the earliest pending timer; 0 = none (satoru)
+        bool have = false;
         lx_flock(&lx_tmr_lock);
         hlist_for_each_entry(t, &lx_tmr_list, entry) {
             if (time_after_eq(now, t->expires)) {
                 due = t;
                 break;
             }
+            have = true;
             long d = (long)(t->expires - now);
-            if (d < next)
+            if (next == 0 || d < next)
                 next = d;
         }
         if (due) {
@@ -153,16 +165,48 @@ static int lx_timer_thread(void *arg)
         lx_funlock(&lx_tmr_lock);
         if (due) {
             void (*fn)(struct timer_list *) = due->function;
-            if (fn)
+            if (fn) {
+                if (lx_stats_on()) {
+                    unsigned long long now_ns = lx_uptime_ns();
+                    unsigned long long exp_ns =
+                        (unsigned long long)(due->expires - INITIAL_JIFFIES) *
+                        (1000000000ull / HZ);
+                    unsigned long long late = now_ns > exp_ns ? now_ns - exp_ns : 0;
+                    lx_stats_timer(late, (unsigned long)(uintptr_t)fn);
+                }
+                lx_softirq_enter();
                 fn(due);
+                lx_softirq_exit();
+            }
             __atomic_store_n(&lx_tmr_running, NULL, __ATOMIC_RELEASE);
             __atomic_fetch_add(&lx_tmr_done, 1, __ATOMIC_RELEASE);
             lx_os_futex_wake(&lx_tmr_done, 0x7fffffff);
             continue;
         }
+        if (!have) {
+            // nothing pending: block until a re-arm kicks this futex. jiffies
+            // stays current because every blocking primitive and every
+            // cpu_relax/udelay path refreshes it (N2 jiffies work), so this
+            // wake is not needed as a refresh timer. (satoru)
+            lx_os_futex_wait(&lx_tmr_kick, kick, -1);
+            continue;
+        }
         if (next < 1)
             next = 1;
-        lx_os_futex_wait(&lx_tmr_kick, kick, (long long)next * 1000000ll);
+        // block until five jiffies before the deadline, then spin that margin
+        // so a real timer fires on time: the kernel's futex wake was measured up
+        // to ~5 ms late under load, and a 5 ms spin per pending timer costs
+        // 0.25% on the 2 s driver watchdog. only a real timer spins; an empty
+        // list blocks forever. (satoru)
+        if (next <= 5) {
+            unsigned long target = now + (unsigned long)next;
+            while (time_before(jiffies, target)) {
+                lx_jiffies_update();
+                __builtin_ia32_pause();
+            }
+            continue;
+        }
+        lx_os_futex_wait(&lx_tmr_kick, kick, (long long)(next - 5) * 1000000ll);
     }
     return 0;
 }
@@ -193,6 +237,27 @@ struct workqueue_struct *system_bh_wq         = &lx_system_wq;
 
 static struct workqueue_struct *volatile lx_all_wqs = &lx_system_wq;
 static volatile unsigned int lx_wq_global;
+static __thread struct work_struct *lx_running_work;
+
+struct work_struct *lx_work_running(void) { return lx_running_work; }
+
+// set while cancel_work_sync/cancel_delayed_work_sync is in progress. a work
+// callback that requeues itself must not come back after the cancel returned.
+#define LX_WORK_CANCELED (1ul << 62)
+static inline bool lx_work_canceled(struct work_struct *w)
+{
+    return (__atomic_load_n((unsigned long *)work_data_bits(w), __ATOMIC_ACQUIRE) &
+            LX_WORK_CANCELED) != 0;
+}
+static inline void lx_work_set_canceled(struct work_struct *w, bool on)
+{
+    if (on)
+        __atomic_fetch_or((unsigned long *)work_data_bits(w), LX_WORK_CANCELED,
+                          __ATOMIC_ACQ_REL);
+    else
+        __atomic_fetch_and((unsigned long *)work_data_bits(w), ~LX_WORK_CANCELED,
+                           __ATOMIC_ACQ_REL);
+}
 
 static int lx_wq_thread(void *arg)
 {
@@ -213,7 +278,9 @@ static int lx_wq_thread(void *arg)
             lx_os_futex_wait(&wq->kick, kick, -1);
             continue;
         }
+        lx_running_work = w;
         w->func(w);
+        lx_running_work = NULL;
         lx_flock(&wq->lock);
         wq->running = NULL;
         lx_funlock(&wq->lock);
@@ -236,6 +303,8 @@ static void lx_wq_start(struct workqueue_struct *wq)
 // enqueue without the pending test (the caller already owns PENDING). (satoru)
 static void lx_wq_insert(struct workqueue_struct *wq, struct work_struct *work)
 {
+    if (lx_work_canceled(work))
+        return;
     if (!wq)
         wq = system_wq;
     lx_wq_start(wq);
@@ -248,11 +317,21 @@ static void lx_wq_insert(struct workqueue_struct *wq, struct work_struct *work)
 
 bool queue_work_on(int cpu, struct workqueue_struct *wq, struct work_struct *work)
 {
+    if (lx_work_canceled(work))
+        return false;
     (void)cpu;
     if (test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)))
         return false;
     lx_wq_insert(wq, work);
     return true;
+}
+
+// ttm's delayed BO deletion asks for a cpu near a numa node; the container has
+// one node and one worker per queue, so queue on the shim's queue. (satoru)
+bool queue_work_node(int node, struct workqueue_struct *wq, struct work_struct *work)
+{
+    (void)node;
+    return queue_work_on(0, wq, work);
 }
 
 void delayed_work_timer_fn(struct timer_list *t)
@@ -278,6 +357,8 @@ bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
                            struct delayed_work *dwork, unsigned long delay)
 {
     (void)cpu;
+    if (lx_work_canceled(&dwork->work))
+        return false;
     if (test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(&dwork->work)))
         return false;
     lx_queue_dwork(wq, dwork, delay);
@@ -335,9 +416,11 @@ bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
 bool cancel_work_sync(struct work_struct *work)
 {
     struct workqueue_struct *wq;
+    lx_work_set_canceled(work, true);
     int removed = lx_work_unqueue(work, &wq);
     bool pending = test_and_clear_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work));
     lx_work_wait_idle(wq, work);
+    lx_work_set_canceled(work, false);
     return removed || pending;
 }
 
@@ -351,9 +434,15 @@ bool cancel_work(struct work_struct *work)
 
 bool cancel_delayed_work_sync(struct delayed_work *dwork)
 {
+    lx_work_set_canceled(&dwork->work, true);
     int t = timer_delete_sync(&dwork->timer);
-    bool w = cancel_work_sync(&dwork->work);
-    return t || w;
+    struct workqueue_struct *wq;
+    int removed = lx_work_unqueue(&dwork->work, &wq);
+    bool pending = test_and_clear_bit(WORK_STRUCT_PENDING_BIT,
+                                      work_data_bits(&dwork->work));
+    lx_work_wait_idle(wq, &dwork->work);
+    lx_work_set_canceled(&dwork->work, false);
+    return t || removed || pending;
 }
 
 bool cancel_delayed_work(struct delayed_work *dwork)

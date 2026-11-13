@@ -66,6 +66,8 @@ public:
     static int DumpInfo(char* out, int max_len);
 
     static int CacheCount() { return cache_count; }
+    // live object bytes across all caches (accounting for the boot census). (satoru)
+    static uint64_t InUseBytes();
 
 private:
     friend struct kmem_cache;

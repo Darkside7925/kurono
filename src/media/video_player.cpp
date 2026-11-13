@@ -181,12 +181,27 @@ static void AudioClose(State& st) {
 static void AudioResync(State& st, uint32_t pos_ms) {
     if (st.kind != SRC_KVID || !(st.kvid.hdr.flags & KVID::kFlagHasAudio)) return;
     AudioClose(st);
+    AudioOpen(st);
+    // opening the stream is a synchronous round trip to the audio server (tens of ms; a
+    // second if it is busy) and the picture clock kept running through it. aim the pcm at
+    // where the clock is NOW: aiming at the position the caller saw made every start and
+    // every seek begin 100 to 600 ms late, which the lag check then "fixed" with a second
+    // close/open, an audible gap about a second in. (satoru)
+    uint32_t fresh = PositionMs(st);
+    if (fresh > pos_ms && fresh - pos_ms < 3000) pos_ms = fresh;
     st.audio_cursor = KVID::FrameAtMs(st.kvid, pos_ms);
     st.audio_part = 0;
     st.audio_written = 0;
     st.audio_base_ms = (uint32_t)(st.kvid.index[st.audio_cursor].dts_us / 1000ull);
+    // start inside the chunk, at the clock, not at its first sample (up to one video frame early). (satoru)
+    if (pos_ms > st.audio_base_ms && st.kvid.hdr.audio_sample_rate) {
+        uint32_t skip = (uint32_t)(((uint64_t)(pos_ms - st.audio_base_ms) * st.kvid.hdr.audio_sample_rate) / 1000ull);
+        uint32_t a_size = 0;
+        const uint8_t* a = KVID::GetFrameAudio(st.kvid, st.audio_cursor, &a_size);
+        uint32_t bpf = (uint32_t)st.kvid.hdr.audio_channels * (uint32_t)(st.kvid.hdr.audio_bits_per_sample / 8);
+        if (a && bpf && skip < a_size / bpf) { st.audio_part = skip; st.audio_base_ms = pos_ms; }
+    }
     st.audio_last_resync_ms = NowMs();
-    AudioOpen(st);
 }
 
 // ----------------------------------------------------------------------

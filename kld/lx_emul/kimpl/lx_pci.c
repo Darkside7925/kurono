@@ -20,15 +20,83 @@
 #include "lx_broker.h"
 
 #define LX_MAX_PCI_DRIVERS 8
+#define LX_SIM_BAR_PHYS 0xF0000000ul
+#define LX_SIM_BDF      0x00801501u
+
+static struct lx_pci_sim_dev g_sim;
+static int g_sim_present;
+// the single shimmed pci function's legacy line and whether it came from
+// config space (an 8259 source) or from acpi _prt (already a gsi). (satoru)
+static int lx_pci_irq_line;
+static int lx_pci_irq_isa;
+static void *g_sim_bar;
+static unsigned long g_sim_bar_len;
+static int g_sim_irq = -1;
+
+
+void *lx_pci_sim_bar0(void) { return g_sim_bar; }
+int lx_pci_sim_irq(void) { return g_sim_irq; }
+unsigned long lx_pci_sim_bar0_len(void) { return g_sim_bar_len; }
 
 static struct pci_driver *lx_drivers[LX_MAX_PCI_DRIVERS];
 static int lx_driver_count;
+
+int lx_pci_sim_add(const struct lx_pci_sim_dev *d)
+{
+    if (!d)
+        return -EINVAL;
+    if (g_sim_bar)
+        kfree(g_sim_bar);
+    g_sim = *d;
+    g_sim_bar_len = d->bar0_len ? (d->bar0_len + 0xFFF) & ~0xFFFul : 0x1000;
+    g_sim_bar = kzalloc(g_sim_bar_len, GFP_KERNEL);
+    if (!g_sim_bar)
+        return -ENOMEM;
+    g_sim_present = 1;
+    lx_log("[lx_pci] simulated device ");
+    lx_log_hex(d->vendor);
+    lx_log(":");
+    lx_log_hex(d->device);
+    lx_log(" bar0 ");
+    lx_log_hex((unsigned long)g_sim_bar);
+    lx_log(" size ");
+    lx_log_hex(g_sim_bar_len);
+    lx_log("\n");
+    // a driver registered before the device still gets the normal match. (satoru)
+    for (int i = 0; i < lx_driver_count; i++)
+        lx_pci_probe_matching(lx_drivers[i]);
+    return 0;
+}
+
 
 void lx_pci_probe_matching(struct pci_driver *drv);
 void lx_pci_bind(struct pci_driver *drv, const struct pci_device_id *id,
                  unsigned int bdf);
 
 // ── driver registration ─────────────────────────────────────────────────────
+static bool g_defer_probe;
+void lx_pci_defer_probe(bool on) { g_defer_probe = on; }
+
+// --kld-ids runs on the host, where there is no broker: registration must not
+// even ask for it. the flag is container-side only and never reaches a boot
+// with a real device. (satoru)
+static bool g_bus_disabled;
+void lx_pci_set_bus_disabled(bool on) { g_bus_disabled = on; }
+
+struct pci_driver *lx_pci_driver_at(int idx)
+{
+    return (idx >= 0 && idx < lx_driver_count) ? lx_drivers[idx] : NULL;
+}
+
+void lx_pci_probe_deferred(void)
+{
+    g_defer_probe = false;
+    if (g_bus_disabled)
+        return;
+    for (int i = 0; i < lx_driver_count; i++)
+        lx_pci_probe_matching(lx_drivers[i]);
+}
+
 int __pci_register_driver(struct pci_driver *drv, struct module *owner,
                           const char *mod_name)
 {
@@ -54,11 +122,14 @@ int __pci_register_driver(struct pci_driver *drv, struct module *owner,
     lx_log_u((unsigned long)n);
     lx_log("\n");
 
-    if (!lx_broker_available()) {
+    if (g_bus_disabled)
+        return 0;
+    if (!g_sim_present && !lx_broker_available()) {
         lx_log("[lx_pci] kernel broker not reachable - no devices bound\n");
         return 0;
     }
-    lx_pci_probe_matching(drv);
+    if (!g_defer_probe)
+        lx_pci_probe_matching(drv);
     return 0;   // registration succeeded regardless of whether a device bound
 }
 
@@ -67,6 +138,22 @@ int __pci_register_driver(struct pci_driver *drv, struct module *owner,
 void lx_pci_probe_matching(struct pci_driver *drv)
 {
     const struct pci_device_id *id;
+
+    if (g_sim_present) {
+        for (id = drv->id_table; id && id->vendor; id++) {
+            if ((id->vendor == PCI_ANY_ID || id->vendor == g_sim.vendor) &&
+                (id->device == PCI_ANY_ID || id->device == g_sim.device) &&
+                (id->subvendor == PCI_ANY_ID || id->subvendor == g_sim.subvendor) &&
+                (id->subdevice == PCI_ANY_ID || id->subdevice == g_sim.subdevice)) {
+                lx_log("[lx_pci] SIM MATCH ");
+                lx_log(drv->name ? drv->name : "?");
+                lx_log("\n");
+                lx_pci_bind(drv, id, LX_SIM_BDF);
+                return;
+            }
+        }
+        return;
+    }
 
     for (id = drv->id_table; id && id->vendor; id++) {
         // PCI_ANY_ID entries would need a class match; none of the supported
@@ -94,6 +181,9 @@ void lx_pci_probe_matching(struct pci_driver *drv)
     }
     lx_log("[lx_pci] no matching device present on this machine\n");
 }
+
+void lx_acpi_attach_pci_companion(struct pci_dev *pdev) __attribute__((weak));
+int lx_acpi_pci_power_on(struct pci_dev *pdev) __attribute__((weak));
 
 static struct pci_dev lx_pdev;
 static struct pci_bus lx_pbus;
@@ -127,10 +217,24 @@ void pci_unregister_driver(struct pci_driver *drv)
 int lx_pci_driver_count(void) { return lx_driver_count; }
 struct pci_dev *lx_pci_bound_dev(void) { return lx_bound_drv ? &lx_pdev : NULL; }
 
+// iwlwifi calls device_release_driver() from its async firmware failure path.
+// the container has no bus to unbind, so mark the device released and let
+// lx_main leave the serving loop with a nonzero status. (satoru)
+static int lx_pci_released;
+void lx_pci_mark_released(void) { lx_pci_released = 1; }
+int lx_pci_was_released(void) { return lx_pci_released; }
+
 unsigned int lx_pci_bdf_of(const struct pci_dev *dev)
 {
     return (dev == &lx_pdev) ? lx_pdev_bdf : 0xFFFFFFFFu;
 }
+
+// the host bridge 00:00.0 as a read-only device (pci_get_domain_bus_and_slot
+// below): its config reads go through the broker's HOST_CFG_READ op, which
+// only a family with manifest host_bridge_read 1 gets; writes are refused.
+// (satoru)
+static struct pci_dev lx_host_bridge;
+static bool lx_host_bridge_ready;
 
 // ── config space, via the broker ────────────────────────────────────────────
 // a failed read returns all-ones, as a real bus does for an absent register,
@@ -139,6 +243,25 @@ static int lx_cfg_read(const struct pci_dev *dev, int where, int width, u32 *val
 {
     unsigned int bdf = lx_pci_bdf_of(dev);
     long v;
+    if (g_sim_present && bdf == LX_SIM_BDF) {
+        u32 r = 0;
+        if (where < 0 || where + width > 256)
+            return PCIBIOS_BAD_REGISTER_NUMBER;
+        for (int i = 0; i < width; i++)
+            r |= (u32)g_sim.config[where + i] << (8 * i);
+        *val = r;
+        return PCIBIOS_SUCCESSFUL;
+    }
+    if (dev == &lx_host_bridge && lx_host_bridge_ready) {
+        v = lx_broker_call(LX_KLD_OP_HOST_CFG_READ, (unsigned long)where,
+                           (unsigned long)width, 0, 0);
+        if (v < 0) {
+            *val = ~0u;
+            return PCIBIOS_BAD_REGISTER_NUMBER;
+        }
+        *val = (u32)v;
+        return PCIBIOS_SUCCESSFUL;
+    }
     if (bdf == 0xFFFFFFFFu) {
         *val = ~0u;
         return PCIBIOS_DEVICE_NOT_FOUND;
@@ -155,6 +278,17 @@ static int lx_cfg_read(const struct pci_dev *dev, int where, int width, u32 *val
 static int lx_cfg_write(const struct pci_dev *dev, int where, int width, u32 val)
 {
     unsigned int bdf = lx_pci_bdf_of(dev);
+    if (g_sim_present && bdf == LX_SIM_BDF) {
+        if (where < 0 || where + width > 256)
+            return PCIBIOS_BAD_REGISTER_NUMBER;
+        for (int i = 0; i < width; i++)
+            g_sim.config[where + i] = (u8)(val >> (8 * i));
+        return PCIBIOS_SUCCESSFUL;
+    }
+    if (dev == &lx_host_bridge) {
+        lx_log("[lx_pci] host bridge config write refused (read-only)\n");
+        return PCIBIOS_SET_FAILED;
+    }
     if (bdf == 0xFFFFFFFFu)
         return PCIBIOS_DEVICE_NOT_FOUND;
     long r = lx_broker_cfg_write(bdf, (unsigned int)where, (unsigned int)width, val);
@@ -295,17 +429,112 @@ int pci_disable_link_state(struct pci_dev *pdev, int state)        { return lx_d
 int pci_disable_link_state_locked(struct pci_dev *pdev, int state) { return lx_disable_link_state(pdev, state); }
 
 // ── enable / master / regions ───────────────────────────────────────────────
+// upstream pci_enable_device -> do_pci_enable_device -> pci_set_power_state(D0):
+// PMCSR's state field goes to D0 and, on ACPI systems, the companion's _PS0
+// runs (acpi_pci_set_power_state). both happen on the first enable only. (satoru)
+static void lx_pci_power_on(struct pci_dev *dev)
+{
+    if (dev->pm_cap) {
+        u16 pmcsr = 0;
+
+        pci_read_config_word(dev, dev->pm_cap + PCI_PM_CTRL, &pmcsr);
+        pmcsr &= ~PCI_PM_CTRL_STATE_MASK;
+        pci_write_config_word(dev, dev->pm_cap + PCI_PM_CTRL, pmcsr);
+        lx_log("[lx_pci] PMCSR -> D0 at cap ");
+        lx_log_hex(dev->pm_cap);
+        lx_log("\n");
+    }
+    if (lx_acpi_pci_power_on)
+        lx_acpi_pci_power_on(dev);
+}
+
 int pci_enable_device_mem(struct pci_dev *dev)
 {
+    int first = atomic_read(&dev->enable_cnt) == 0;
+
+    if (g_sim_present && lx_pci_bdf_of(dev) == LX_SIM_BDF) {
+        dev->current_state = PCI_D0;
+        atomic_inc(&dev->enable_cnt);
+        if (first)
+            lx_pci_power_on(dev);
+        return 0;
+    }
     long r = lx_broker_enable(lx_pci_bdf_of(dev));
     if (r < 0)
         return -EIO;
     dev->current_state = PCI_D0;
     atomic_inc(&dev->enable_cnt);
+    if (first)
+        lx_pci_power_on(dev);
     return 0;
 }
 
 int pci_enable_device(struct pci_dev *dev) { return pci_enable_device_mem(dev); }
+
+// pcim_* is the devres-managed wrapper. the container's device teardown already
+// releases the broker grant, so enable is the real operation and the mapping
+// table is per-pdev bookkeeping. (satoru)
+int pcim_enable_device(struct pci_dev *pdev)
+{
+    return pci_enable_device(pdev);
+}
+
+struct lx_pcim_table {
+    struct pci_dev *pdev;
+    void __iomem *bar[6];
+};
+static struct lx_pcim_table g_pcim[8];
+
+static struct lx_pcim_table *lx_pcim_slot(struct pci_dev *pdev, bool create)
+{
+    for (int i = 0; i < 8; i++)
+        if (g_pcim[i].pdev == pdev)
+            return &g_pcim[i];
+    if (!create)
+        return NULL;
+    for (int i = 0; i < 8; i++) {
+        if (!g_pcim[i].pdev) {
+            memset(&g_pcim[i], 0, sizeof(g_pcim[i]));
+            g_pcim[i].pdev = pdev;
+            return &g_pcim[i];
+        }
+    }
+    return NULL;
+}
+
+int pcim_iomap_regions_request_all(struct pci_dev *pdev, int mask, const char *name)
+{
+    (void)name;
+    struct lx_pcim_table *t = lx_pcim_slot(pdev, true);
+    if (!t)
+        return -ENOMEM;
+    for (int b = 0; b < 6; b++) {
+        if (!(mask & (1 << b)))
+            continue;
+        if (t->bar[b])
+            continue;
+        t->bar[b] = pci_iomap(pdev, b, 0);
+        if (!t->bar[b])
+            return -ENOMEM;
+    }
+    return 0;
+}
+
+void __iomem * const *pcim_iomap_table(struct pci_dev *pdev)
+{
+    struct lx_pcim_table *t = lx_pcim_slot(pdev, true);
+    return t ? t->bar : NULL;
+}
+
+void __iomem *pcim_iomap(struct pci_dev *pdev, int bar, unsigned long maxlen)
+{
+    struct lx_pcim_table *t = lx_pcim_slot(pdev, true);
+    if (!t || bar < 0 || bar > 5)
+        return NULL;
+    if (!t->bar[bar])
+        t->bar[bar] = pci_iomap(pdev, bar, maxlen);
+    return t->bar[bar];
+}
 
 void pci_disable_device(struct pci_dev *dev)
 {
@@ -316,8 +545,77 @@ void pci_disable_device(struct pci_dev *dev)
 
 // the broker's ENABLE op turns bus mastering on together with memory decode;
 // set_master records it. (satoru)
-void pci_set_master(struct pci_dev *dev)  { lx_broker_enable(lx_pci_bdf_of(dev)); dev->is_busmaster = 1; }
-void pci_clear_master(struct pci_dev *dev) { lx_broker_disable(lx_pci_bdf_of(dev)); dev->is_busmaster = 0; }
+void pci_set_master(struct pci_dev *dev)
+{
+    if (!(g_sim_present && lx_pci_bdf_of(dev) == LX_SIM_BDF))
+        lx_broker_enable(lx_pci_bdf_of(dev));
+    dev->is_busmaster = 1;
+}
+void pci_clear_master(struct pci_dev *dev) { if (!(g_sim_present && lx_pci_bdf_of(dev) == LX_SIM_BDF)) lx_broker_disable(lx_pci_bdf_of(dev)); dev->is_busmaster = 0; }
+
+int lx_pci_irq_is_isa(unsigned int irq)
+{
+    return lx_pci_irq_isa && lx_pci_irq_line != 0 && (int)irq == lx_pci_irq_line;
+}
+
+int lx_pci_legacy_line(void)
+{
+    return lx_pci_irq_line;
+}
+
+// acpi _prt fills in the gsi for a function whose config line is unassigned;
+// that number is already an ioapic gsi, not an 8259 source. (satoru)
+void lx_pci_set_acpi_irq(struct pci_dev *dev, unsigned int gsi)
+{
+    lx_pci_irq_line = (int)gsi;
+    lx_pci_irq_isa = 0;
+    dev->irq = (int)gsi;
+}
+
+int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int minvec,
+                          unsigned int maxvec, unsigned int flags)
+{
+    (void)maxvec;
+    if (minvec > 1)
+        return -EINVAL;
+    if (g_sim_present) {
+        unsigned int irq;
+        if (lx_irq_alloc_soft(&irq))
+            return -ENOSPC;
+        dev->irq = (int)irq;
+        g_sim_irq = (int)irq;
+        return 1;
+    }
+    // try msi first unless the caller only asked for intx; a container whose
+    // broker refuses msi (kurono.kld.nomsi=1, or no capability) falls back to
+    // the legacy line the same way upstream does. (satoru)
+    if (!(flags & PCI_IRQ_INTX) && pci_enable_msi(dev) == 0)
+        return 1;
+    int irq = lx_pci_irq_line ? lx_pci_irq_line : dev->irq;
+    if (irq > 0 && irq < 256) {
+        dev->irq = irq;
+        return 1;
+    }
+    return -ENOSPC;
+}
+int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+    return nr ? -EINVAL : dev->irq;
+}
+void pci_free_irq_vectors(struct pci_dev *dev) { (void)dev; }
+int pci_try_set_mwi(struct pci_dev *dev) { (void)dev; return 0; }
+const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
+                                         struct pci_dev *dev)
+{
+    for (; ids && ids->vendor; ids++)
+        if ((ids->vendor == PCI_ANY_ID || ids->vendor == dev->vendor) &&
+            (ids->device == PCI_ANY_ID || ids->device == dev->device) &&
+            (ids->subvendor == PCI_ANY_ID || ids->subvendor == dev->subsystem_vendor) &&
+            (ids->subdevice == PCI_ANY_ID || ids->subdevice == dev->subsystem_device) &&
+            ((ids->class ^ dev->class) & ids->class_mask) == 0)
+            return ids;
+    return NULL;
+}
 
 int pci_select_bars(struct pci_dev *dev, unsigned long flags)
 {
@@ -386,9 +684,13 @@ int device_set_wakeup_enable(struct device *dev, bool enable) { (void)dev; (void
 int device_wakeup_enable(struct device *dev) { (void)dev; return 0; }
 
 // cpu latency qos: no cpuidle governor in the container to constrain. (satoru)
-void cpu_latency_qos_add_request(struct pm_qos_request *req, s32 value) { (void)req; (void)value; }
+// no cpu idle states to constrain in a container; the request is still
+// tracked so _request_active tells added from never added. (satoru)
+static struct pm_qos_constraints lx_cpu_latency_qos;
+void cpu_latency_qos_add_request(struct pm_qos_request *req, s32 value) { (void)value; req->qos = &lx_cpu_latency_qos; }
 void cpu_latency_qos_update_request(struct pm_qos_request *req, s32 new_value) { (void)req; (void)new_value; }
-void cpu_latency_qos_remove_request(struct pm_qos_request *req) { (void)req; }
+void cpu_latency_qos_remove_request(struct pm_qos_request *req) { req->qos = NULL; }
+bool cpu_latency_qos_request_active(struct pm_qos_request *req) { return req->qos == &lx_cpu_latency_qos; }
 
 // ── MMIO: BAR mapping through the broker ────────────────────────────────────
 struct lx_bar_map {
@@ -403,6 +705,20 @@ static struct lx_bar_map lx_bars[6];
 // physical memory it was not granted. (satoru)
 void __iomem *ioremap(resource_size_t offset, unsigned long size)
 {
+    lx_log("[lx_pci] ioremap off=");
+    lx_log_hex((unsigned int)offset);
+    lx_log(" size=");
+    lx_log_u(size);
+    lx_log("\n");
+#ifdef KLD_MMIO_SIM
+    // a register model claimed this range: the model lives at the physical
+    // address and the MMIO accessors dispatch there. (satoru)
+    if (lx_mmio_sim_claimed((unsigned long)offset, (unsigned long)size))
+        return (void __iomem *)(unsigned long)offset;
+#endif
+    if (g_sim_present && offset >= LX_SIM_BAR_PHYS &&
+        offset + size <= LX_SIM_BAR_PHYS + g_sim_bar_len)
+        return (void __iomem *)((char *)g_sim_bar + (offset - LX_SIM_BAR_PHYS));
     for (int b = 0; b < 6; b++) {
         struct resource *r = &lx_pdev.resource[b];
         if (!(r->flags & IORESOURCE_MEM) || !r->start)
@@ -425,11 +741,29 @@ void __iomem *ioremap(resource_size_t offset, unsigned long size)
             lx_bars[b].start = r->start;
             lx_bars[b].len = len;
             lx_bars[b].va = va;
+            lx_log("[lx_pci] bar mapped bar=");
+            lx_log_u((unsigned long)b);
+            lx_log(" rel=");
+            lx_log_hex((unsigned int)(offset - r->start));
+            lx_log(" va=");
+            lx_log_hex((unsigned int)(unsigned long)va);
+            lx_log("\n");
         }
         return (void __iomem *)((char *)lx_bars[b].va + (offset - r->start));
     }
     lx_log("[lx_pci] ioremap of a physical address outside every granted BAR: refused\n");
     return NULL;
+}
+
+// the container va of a mapped bar (0 when that bar is not mapped yet): the
+// i915 register model asks which accesses are its own. (satoru)
+int lx_pci_bar_range(int bar, unsigned long *va, unsigned long *len)
+{
+    if (bar < 0 || bar > 5 || !lx_bars[bar].va)
+        return -1;
+    *va = (unsigned long)lx_bars[bar].va;
+    *len = (unsigned long)lx_bars[bar].len;
+    return 0;
 }
 
 void __iomem *ioremap_uc(resource_size_t offset, unsigned long size) { return ioremap(offset, size); }
@@ -454,6 +788,19 @@ void pci_iounmap(struct pci_dev *dev, void __iomem *addr) { (void)dev; (void)add
 // ── binding a real device ───────────────────────────────────────────────────
 static void lx_fill_resources(struct pci_dev *pdev, unsigned int bdf)
 {
+    if (g_sim_present && bdf == LX_SIM_BDF) {
+        struct resource *r = &pdev->resource[0];
+        r->start = LX_SIM_BAR_PHYS;
+        r->end = LX_SIM_BAR_PHYS + g_sim_bar_len - 1;
+        r->flags = IORESOURCE_MEM;
+        r->name = lx_pdev_name;
+        lx_log("[lx_pci]   SIM BAR0 = ");
+        lx_log_hex((unsigned long)r->start);
+        lx_log(" size ");
+        lx_log_hex(g_sim_bar_len);
+        lx_log("\n");
+        return;
+    }
     for (int b = 0; b < 6; b++) {
         long raw = lx_broker_bar(bdf, (unsigned int)b);
         long size = lx_broker_bar_size(bdf, (unsigned int)b);
@@ -512,6 +859,37 @@ void lx_pci_bind(struct pci_driver *drv, const struct pci_device_id *id,
     lx_pdev_bdf = bdf;
     lx_fmt_name(lx_pdev_name, bdf);
 
+    // the Linux device core requires device_initialize before devres/devm_*
+    // can use dev->devres_head; iwlwifi's probe starts with pcim_enable_device
+    // and devm_kmalloc on &pdev->dev. the root "pci0000:00" parent needs the
+    // same one-time setup. (satoru)
+    static bool root_inited;
+    if (!root_inited) {
+        root_inited = true;
+        device_initialize(&lx_pci_root_dev);
+    }
+    device_initialize(&lx_pdev.dev);
+#ifdef CONFIG_PM
+    // upstream pci_pm_init(): a PCI device is active and runtime-PM enabled,
+    // with autosuspend forbidden, before its driver's probe runs. (satoru)
+    pm_runtime_forbid(&lx_pdev.dev);
+    pm_runtime_set_active(&lx_pdev.dev);
+    pm_runtime_enable(&lx_pdev.dev);
+#ifdef KLD_PM_DEBUG
+    lx_log("[lx_pci] pm state at probe: enabled=");
+    lx_log_u(pm_runtime_enabled(&lx_pdev.dev) ? 1 : 0);
+    lx_log(" active=");
+    lx_log_u(pm_runtime_active(&lx_pdev.dev) ? 1 : 0);
+    lx_log(" suspended=");
+    lx_log_u(pm_runtime_suspended(&lx_pdev.dev) ? 1 : 0);
+    lx_log(" runtime_auto=");
+    lx_log_u(lx_pdev.dev.power.runtime_auto ? 1 : 0);
+    lx_log("\n");
+#endif
+#endif
+    lx_pdev.dev.parent = &lx_pci_root_dev;
+    dev_set_name(&lx_pdev.dev, "%s", lx_pdev_name);
+
     lx_pdev.vendor = (u16)id->vendor;
     lx_pdev.device = (u16)id->device;
     lx_pdev.devfn  = (unsigned int)(((bdf >> 8) & 0xFF) << 3) | (bdf & 0x7);
@@ -530,6 +908,15 @@ void lx_pci_bind(struct pci_driver *drv, const struct pci_device_id *id,
     lx_pbus.number = (unsigned char)((bdf >> 16) & 0xFF);
     lx_pbus.self   = NULL;
     lx_pdev.bus    = &lx_pbus;
+    // pci_domain_nr() reads the bus sysdata (CONFIG_PCI_DOMAINS): domain 0.
+    // (satoru)
+    {
+        static struct pci_sysdata lx_sysdata;
+        lx_pbus.sysdata = &lx_sysdata;
+    }
+    // dev_is_pci() compares dev->bus with &pci_bus_type; the drm core uses it
+    // to tell a real pci device from a platform one. (satoru)
+    lx_pdev.dev.bus = &pci_bus_type;
 
     lx_pdev.pcie_cap = lx_find_cap(&lx_pdev, PCI_CAP_ID_EXP);
     if (lx_pdev.pcie_cap) {
@@ -545,10 +932,16 @@ void lx_pci_bind(struct pci_driver *drv, const struct pci_device_id *id,
     lx_pdev.dma_mask = DMA_BIT_MASK(32);
     lx_pdev.dev.dma_mask = &lx_pdev.dma_mask;
     lx_pdev.dev.coherent_dma_mask = DMA_BIT_MASK(32);
+    // like the pci core: the segment limits live in the pci_dev. (satoru)
+    lx_pdev.dev.dma_parms = &lx_pdev.dma_parms;
 
-    // legacy line from config space; not brokered, kept for the record. (satoru)
+    // legacy line from config space. the value is an 8259 source irq (or 0xff
+    // = no line); request_irq() attaches it through the broker's line ops,
+    // and the broker resolves the MADT source override. (satoru)
     lx_cfg_read(&lx_pdev, PCI_INTERRUPT_LINE, 1, &v);
-    lx_pdev.irq = 0;
+    lx_pdev.irq = g_sim_present ? 0 : ((v & 0xFF) == 0xFF ? 0 : (int)(v & 0xFF));
+    lx_pci_irq_line = lx_pdev.irq;
+    lx_pci_irq_isa = 1;
 
     lx_pdev.dev.init_name = lx_pdev_name;
     lx_pdev.dev.parent = &lx_pci_root_dev;
@@ -571,6 +964,11 @@ void lx_pci_bind(struct pci_driver *drv, const struct pci_device_id *id,
 
     lx_fill_resources(&lx_pdev, bdf);
 
+    // the ACPICA family binds the device to its ACPI namespace node by _ADR
+    // under the _BBN/_SEG bridge; other families do not link this. (satoru)
+    if (lx_acpi_attach_pci_companion)
+        lx_acpi_attach_pci_companion(&lx_pdev);
+
     if (!drv->probe) {
         lx_log("[lx_pci] driver has no probe()\n");
         return;
@@ -586,6 +984,148 @@ void lx_pci_bind(struct pci_driver *drv, const struct pci_device_id *id,
     lx_log("\n");
     if (rc != 0)
         lx_bound_drv = NULL;
+}
+
+
+// ── region claims ───────────────────────────────────────────────────────────
+// the broker already owns the BAR grants and the BAR page mapping; a container
+// cannot race another owner for the device. the claim is bookkeeping only.
+// (satoru)
+int pci_request_region(struct pci_dev *pdev, int bar, const char *res_name)
+{
+    (void)pdev; (void)bar; (void)res_name;
+    return 0;
+}
+
+void pci_release_region(struct pci_dev *pdev, int bar)
+{
+    (void)pdev; (void)bar;
+}
+
+
+// ── host bridge, pci_iomap_range, the graphics opregion (d4) ────────────────
+static void lx_host_bridge_release(struct device *dev) { (void)dev; }
+
+struct pci_dev *pci_get_domain_bus_and_slot(int domain, unsigned int bus,
+                                            unsigned int devfn)
+{
+    long v;
+    if (domain != 0 || bus != 0 || devfn != 0) {
+        lx_log("[lx_pci] pci_get_domain_bus_and_slot: only the host bridge 00:00.0 is reachable\n");
+        return NULL;
+    }
+    if (!lx_host_bridge_ready) {
+        v = lx_broker_call(LX_KLD_OP_HOST_CFG_READ, PCI_VENDOR_ID, 4, 0, 0);
+        if (v < 0 || (u32)v == 0xFFFFFFFFu) {
+            lx_log("[lx_pci] host bridge not readable (broker refused)\n");
+            return NULL;
+        }
+        device_initialize(&lx_host_bridge.dev);
+        lx_host_bridge.dev.release = lx_host_bridge_release;
+        dev_set_name(&lx_host_bridge.dev, "0000:00:00.0");
+        lx_host_bridge.vendor = (u16)v;
+        lx_host_bridge.device = (u16)((u32)v >> 16);
+        lx_host_bridge.devfn = 0;
+        lx_host_bridge.bus = lx_pdev.bus;
+        lx_host_bridge.cfg_size = PCI_CFG_SPACE_SIZE;
+        lx_host_bridge_ready = true;
+        lx_log("[lx_pci] host bridge 00:00.0 vendor=");
+        lx_log_hex(lx_host_bridge.vendor);
+        lx_log(" device=");
+        lx_log_hex(lx_host_bridge.device);
+        lx_log(" (read-only)\n");
+    }
+    get_device(&lx_host_bridge.dev);
+    return &lx_host_bridge;
+}
+
+// references handed out by pci_get_* on the bound device; a put without a
+// matching get (iwlwifi's removal path) must not drop the device's own
+// reference (review f7). (satoru)
+static int lx_pdev_got;
+
+void pci_dev_put(struct pci_dev *dev)
+{
+    if (!dev)
+        return;
+    if (dev == &lx_pdev) {
+        if (lx_pdev_got <= 0) {
+            lx_log("[lx_pci] pci_dev_put without a matching get: ignored\n");
+            return;
+        }
+        lx_pdev_got--;
+    }
+    put_device(&dev->dev);
+}
+
+void __iomem *pci_iomap_range(struct pci_dev *dev, int bar, unsigned long offset,
+                              unsigned long maxlen)
+{
+    resource_size_t len = pci_resource_len(dev, bar);
+    void __iomem *base;
+    if (!len || offset >= len)
+        return NULL;
+    base = pci_iomap(dev, bar, 0);
+    return base ? (void __iomem *)((char __iomem *)base + offset) : NULL;
+}
+
+// memremap serves exactly one thing: the bound display device's graphics
+// opregion (config 0xFC) and its rvda vbt, as the broker's private copy
+// (manifest opregion 1). any other physical address is refused with NULL,
+// which every caller handles. (satoru)
+#define LX_OPREGION_VA_PAGES 20
+static void *lx_opregion_va;
+static unsigned long lx_opregion_phys;
+static unsigned long lx_opregion_bytes;
+
+void *memremap(resource_size_t offset, size_t size, unsigned long flags)
+{
+    u32 asls = 0;
+    (void)flags;
+    if (!lx_bound_drv || pci_read_config_dword(&lx_pdev, 0xFC, &asls) != 0 || !asls)
+        goto refuse;
+    if (!lx_opregion_va) {
+        void *va = lx_os_reserve(LX_OPREGION_VA_PAGES * PAGE_SIZE);
+        long rc;
+        if (!va)
+            return NULL;
+        rc = lx_broker_call(LX_KLD_OP_OPREGION_MAP, (unsigned long)va,
+                            lx_pdev_bdf, 0, 0);
+        if (rc < 0) {
+            lx_log("[lx_pci] opregion copy refused by the broker\n");
+            lx_os_unreserve(va, LX_OPREGION_VA_PAGES * PAGE_SIZE);
+            return NULL;
+        }
+        lx_opregion_va = (char *)va + (rc & 0xFFF);
+        lx_opregion_phys = asls;
+        lx_opregion_bytes = (unsigned long)rc >> 12;
+        lx_log("[lx_pci] opregion private copy mapped, bytes=");
+        lx_log_u(lx_opregion_bytes);
+        lx_log("\n");
+    }
+    if (offset >= lx_opregion_phys && size <= lx_opregion_bytes &&
+        offset - lx_opregion_phys <= lx_opregion_bytes - size)
+        return (char *)lx_opregion_va + (offset - lx_opregion_phys);
+refuse:
+    lx_log("[lx_pci] memremap of a physical address that is not the device opregion: refused\n");
+    return NULL;
+}
+
+// the opregion mapping lives as long as the container (like bar maps). (satoru)
+void memunmap(void *addr) { (void)addr; }
+
+// pci_get_class: the container sees exactly one device, its own. (satoru)
+struct pci_dev *pci_get_class(unsigned int class, struct pci_dev *from)
+{
+    struct pci_dev *dev = NULL;
+    if (!from && lx_bound_drv && lx_pdev.class == class) {
+        get_device(&lx_pdev.dev);
+        lx_pdev_got++;
+        dev = &lx_pdev;
+    }
+    if (from)
+        pci_dev_put(from);
+    return dev;
 }
 
 // end (satoru)

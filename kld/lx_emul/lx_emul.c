@@ -10,14 +10,33 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 // ── logging ─────────────────────────────────────────────────────────────────
 // fd 2 is com1 under Kurono. write() directly - no stdio, because a driver can
 // abort from a context where buffered output would be lost. (satoru)
+// one lock for all logging: multi-chunk driver printk lines must not interleave
+// with another thread's line, or a fault dump becomes unreadable. (satoru)
+static pthread_mutex_t g_log_lock;
+static pthread_once_t g_log_once = PTHREAD_ONCE_INIT;
+static void lx_log_lock_init(void)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_log_lock, &a);
+    pthread_mutexattr_destroy(&a);
+}
+void lx_log_lock(void) { pthread_once(&g_log_once, lx_log_lock_init); pthread_mutex_lock(&g_log_lock); }
+void lx_log_unlock(void) { pthread_mutex_unlock(&g_log_lock); }
+
 void lx_log(const char* s) {
     if (!s) return;
     size_t n = strlen(s);
-    if (n) (void)!write(2, s, n);
+    if (!n) return;
+    lx_log_lock();
+    (void)!write(2, s, n);
+    lx_log_unlock();
 }
 
 void lx_log_u(unsigned long v) {
@@ -46,6 +65,22 @@ void lx_log_hex(unsigned long v) {
 void lx_log_line(const char* s) {
     lx_log(s);
     lx_log("\n");
+}
+
+// ── generated-stub visibility ───────────────────────────────────────────────
+// one [kld-stub] line per symbol, not per call. this is the probe M2 follows
+// through the real card's init path. (satoru)
+void lx_stub_note(const char* sym) {
+    static const char* seen[512];
+    static int n;
+    if (!sym) return;
+    for (int i = 0; i < n; i++)
+        if (seen[i] == sym || (seen[i] && strcmp(seen[i], sym) == 0))
+            return;
+    if (n < (int)(sizeof(seen) / sizeof(seen[0])))
+        seen[n++] = sym;
+    lx_log("[kld-stub] ");
+    lx_log_line(sym);
 }
 
 // ── the unimplemented trap ──────────────────────────────────────────────────

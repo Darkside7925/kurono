@@ -42,12 +42,14 @@
 #include "../virt/hypervisor.h"
 #include "../virt/ept.h"
 #include "../system/logging.h"
+#include "../system/user_mgmt.h"   // desktop account credential digests (satoru)
 #include "../proc/scheduler.h"
 #include "../proc/smp.h"
 #include "../proc/spinlock.h"
 #include "../proc/kernel_locks.h"
 #include "../drivers/usb.h"
 #include "../shell/shell.h"
+#include "../linux/linux_syscall.h"   // KlsDropAll around the modal wait (satoru)
 
 bool KSA::available    = false;
 bool KSA::real_nested  = false;
@@ -122,6 +124,11 @@ static volatile bool g_modal_gui_host = false;
 static void ksa_hash_credential(const char* cred, const char* username,
                                 unsigned char* out, bool& ok) {
     ok = false;
+    // a desktop account: the same pbkdf2 digest UserManager stores. (satoru)
+    if (username && *username && UserManager::CredentialDigest(username, cred, out)) {
+        ok = true;
+        return;
+    }
     KENUser* u = KEN::FindUser(username && *username ? username : "root");
     if (!u) u = KEN::FindUser("root");
     if (!u) return;
@@ -181,7 +188,10 @@ void KSA::Init() {
                             available ? "hypervisor-backed" : "unavailable");
 }
 
-bool KSA::IsAvailable()   { return available; }
+static volatile bool g_ksa_suspended = false;   // the settings switch (satoru)
+void KSA::SetSuspended(bool off) { g_ksa_suspended = off; }
+bool KSA::IsSuspended() { return g_ksa_suspended; }
+bool KSA::IsAvailable()   { return available && !g_ksa_suspended; }
 bool KSA::IsRealNestedVM(){ return real_nested; }
 uint32_t KSA::ChannelRevision() { return g_channel_rev; }
 bool KSA::PromptUsable()  { return true; }   // hypervisor path or secure desktop fallback (satoru)
@@ -450,7 +460,8 @@ static void ksa_draw_prompt(uint8_t* fb, const KSARequest& req, const char* type
                0xFF3A2226, 0xFF5A2A30, hot_deny);
     ksa_button(L.approve_x, L.approve_y, L.approve_w, L.approve_h, "Approve",
                0xFF1E3A28, 0xFF276B43, hot_approve);
-    Graphics::DrawString(ox + 14, oy + KSA_H - 56,
+    // the hint sits a line above the buttons; at KSA_H - 56 it ran into them (satoru)
+    Graphics::DrawString(ox + 14, L.deny_y - 26,
         "[Enter] Approve    [Esc] Deny", 0xFF8892A4, 0xFF1C1F26);
 
     // the gui only blits damaged rects; the panel + dim must reach the front
@@ -588,7 +599,7 @@ static void ksa_flush_input() {
 
 bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
     memset(&out, 0, sizeof(out));
-    if (available) {
+    if (available && !g_ksa_suspended) {
         if (!SpawnContext()) return false;
     } else {
         // no hypervisor on this machine: draw the same modal from ordinary
@@ -605,7 +616,8 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
             g_fallback = true;
             g_isolated = false;
             memset((void*)(uintptr_t)g_region_phys, 0, KSA_REGION_SZ);
-            SerialLogger::Log("KSA: no hypervisor - secure desktop fallback prompt\r\n");
+            SerialLogger::Log(available ? "KSA: switched off - plain secure desktop prompt\r\n"
+                                        : "KSA: no hypervisor - secure desktop fallback prompt\r\n");
         }
     }
 
@@ -687,6 +699,12 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
         Graphics::MarkUIDirty();
     }
 
+    // gui-hosted modal (a syscall on an ap, ken's own path among them): the caller
+    // may hold kls, and a human decision takes seconds. ken called KSA::Prompt
+    // without the admin gate's KlsRelax, so the 3 s hold ended in a HARD steal
+    // and two cpus inside the kls body (laptop panic 1112b). release it for the
+    // wait and take it back after; the modal state has its own atomics. (satoru)
+    int kls_depth = (!direct && !self_pump) ? LinuxSyscall::KlsDropAll() : 0;
     bool timed_out = false;
     for (;;) {
         if (__atomic_load_n(&g_modal.decided, __ATOMIC_ACQUIRE)) break;
@@ -728,6 +746,7 @@ bool KSA::Prompt(const KSARequest& req, KSAVerdict& out) {
         }
     }
 
+    LinuxSyscall::KlsRestore(kls_depth);   // (satoru)
     bool approved = __atomic_load_n(&g_modal.approved, __ATOMIC_ACQUIRE);
     if (timed_out || g_modal.timed_out) {
         // timed out with no answer - fail closed (treated as a deny). (satoru)

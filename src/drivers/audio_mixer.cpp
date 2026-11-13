@@ -5,6 +5,7 @@
 #include "serial.h"
 #include "timer.h"
 #include "../kernel/types.h"
+#include "../kernel/heap.h"
 #include "../proc/scheduler.h"
 
 namespace AudioMixer {
@@ -51,8 +52,35 @@ struct Stream {
     StreamStats stats;
 };
 
-static Stream g_streams[MAX_STREAMS];
+// the 16 stream slots carry a 683 ms ring each (~4 mb total). nothing is
+// allocated until the first stream is opened, and the table is returned to the
+// heap once the last stream is gone; an idle desktop pays nothing for audio. (satoru)
+static Stream* g_streams = nullptr;
 static int    g_active_count = 0;
+
+static Stream* EnsureStreams() {
+    if (g_streams) return g_streams;
+    Stream* t = (Stream*)KernelHeap::Alloc(sizeof(Stream) * MAX_STREAMS);
+    if (!t) return nullptr;
+    memset(t, 0, sizeof(Stream) * MAX_STREAMS);
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        t[i].state = STREAM_FREE;
+        t[i].volume_pct = 100;
+        t[i].cur_lg_q15 = 32768;
+        t[i].cur_rg_q15 = 32768;
+        t[i].fade_gain = 32768;
+    }
+    g_streams = t;
+    return g_streams;
+}
+
+// last stream closed: give the stream table back. only called from the entry
+// points below, never from inside a loop over the table. (satoru)
+static void ReleaseStreamsIfIdle() {
+    if (!g_streams || g_active_count > 0) return;
+    KernelHeap::Free(g_streams);
+    g_streams = nullptr;
+}
 
 static int     g_master_volume = 80;
 static bool    g_master_mute   = false;
@@ -104,23 +132,6 @@ static inline MixSample LimiterProcess(MixSample s) {
 
 void Init() {
     if (g_initialised) return;
-    for (int i = 0; i < MAX_STREAMS; i++) {
-        g_streams[i].state = STREAM_FREE;
-        g_streams[i].name[0] = '\0';
-        g_streams[i].rd = g_streams[i].wr = g_streams[i].count = 0;
-        g_streams[i].volume_pct = 100;
-        g_streams[i].pan = 0;
-        g_streams[i].muted = false;
-        g_streams[i].cur_lg_q15 = 32768;
-        g_streams[i].cur_rg_q15 = 32768;
-        g_streams[i].fade_gain = 32768;
-        g_streams[i].fade_total = 0;
-        g_streams[i].fade_remaining = 0;
-        g_streams[i].stats = {};
-        g_streams[i].owner_pid = 0;
-        g_streams[i].open_ms = 0;
-        g_streams[i].gen = 0;
-    }
     for (int c = 0; c < INTERNAL_CHANNELS; c++) {
         g_lp_state_low[c]  = 0;
         g_lp_state_high[c] = 0;
@@ -140,7 +151,7 @@ void Init() {
 // resolve a StreamID to its live slot, or nullptr if the id is invalid or
 // stale (its slot was freed and handed to another opener since). (satoru)
 static Stream* Lookup(StreamID id) {
-    if (id < 0) return nullptr;
+    if (id < 0 || !g_streams) return nullptr;
     int slot = id % MAX_STREAMS;
     Stream* s = &g_streams[slot];
     if ((uint32_t)(id / MAX_STREAMS) != s->gen) return nullptr;
@@ -156,6 +167,7 @@ static void FreeSlot(Stream* s) {
 }
 
 static int FindFreeSlot() {
+    if (!g_streams) return -1;
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (g_streams[i].state == STREAM_FREE) return i;
     }
@@ -218,6 +230,7 @@ static void CopyName(Stream* s, const char* name) {
 StreamID Open(const char* name, AudioFormat::SampleFormat fmt,
               uint32_t sample_rate, int channels) {
     if (!g_initialised) Init();
+    if (!EnsureStreams()) return INVALID_STREAM;
     if (channels < 1 || channels > 6 || sample_rate < 4000 || sample_rate > 192000) {
         return INVALID_STREAM;
     }
@@ -275,7 +288,7 @@ void Close(StreamID id) {
     // down only by frames actually played, so closing a stream whose ring was
     // empty (paused, underrun under load, a seek drag) left it FADING forever
     // and leaked the slot - 16 of those and every open failed. (satoru)
-    if (s->count == 0) { FreeSlot(s); return; }
+    if (s->count == 0) { FreeSlot(s); ReleaseStreamsIfIdle(); return; }
     int32_t fade_frames = static_cast<int32_t>((INTERNAL_RATE * 5) / 1000);
     s->state          = STREAM_FADING;
     s->fade_total     = fade_frames;
@@ -283,13 +296,26 @@ void Close(StreamID id) {
     s->fade_gain      = 32768;
 }
 
+int StopAll() {
+    int n = 0;
+    if (!g_streams) return 0;
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (g_streams[i].state == STREAM_FREE) continue;
+        FreeSlot(&g_streams[i]);
+        n++;
+    }
+    ReleaseStreamsIfIdle();
+    return n;
+}
+
 int CloseOwnedBy(uint32_t pid) {
-    if (pid == 0) return 0;
+    if (pid == 0 || !g_streams) return 0;
     int n = 0;
     for (int i = 0; i < MAX_STREAMS; i++) {
         Stream* s = &g_streams[i];
         if (s->state != STREAM_FREE && s->owner_pid == pid) { FreeSlot(s); n++; }
     }
+    ReleaseStreamsIfIdle();
     return n;
 }
 
@@ -454,6 +480,7 @@ bool IsLimiterEnabled()         { return g_limiter_on; }
 
 int  ActiveStreamCount() {
     int n = 0;
+    if (!g_streams) return 0;
     for (int i = 0; i < MAX_STREAMS; i++) if (g_streams[i].state != STREAM_FREE) n++;
     return n;
 }
@@ -464,7 +491,7 @@ const char* StreamName(StreamID id) {
 }
 
 uint32_t Tick() {
-    if (!g_initialised) return 0;
+    if (!g_initialised || !g_streams) return 0;
     AudioBackend* be = AudioServer::ActiveBackend();
     if (!be || !be->IsReady()) return 0;
 
@@ -594,10 +621,19 @@ uint32_t Tick() {
         if (g_streams[i].state != STREAM_FREE) g_streams[i].stats.peak_level = period_peak;
     }
 
-    return be->Submit(output, PERIOD_FRAMES);
+    uint32_t done = be->Submit(output, PERIOD_FRAMES);
+    ReleaseStreamsIfIdle();
+    return done;
 }
 
 void Dump() {
+    if (!g_streams) {
+        SerialLogger::Log("[AudioMixer] active=0 master=");
+        SerialLogger::LogDec(g_master_volume);
+        SerialLogger::Log(g_master_mute ? " (muted)" : "");
+        SerialLogger::Log("\r\n");
+        return;
+    }
     SerialLogger::Log("[AudioMixer] active=");
     SerialLogger::LogDec(ActiveStreamCount());
     SerialLogger::Log(" master=");

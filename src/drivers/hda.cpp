@@ -1,6 +1,7 @@
 //  kurono os - intel hd audio (hda) controller driver implementation
 //  pci class 04:03:00 (multimedia audio controller)
 #include "hda.h"
+#include "../kernel/kimage.h"   // heap direct-map buffers -> phys (satoru)
 #include "timer.h"
 #include "../kernel/pci.h"
 #include "../kernel/heap.h"
@@ -706,7 +707,7 @@ struct HdaImpl {
         }
         uint8_t* buf_ptr = (uint8_t*)HDAudio::dma_buffer;
         for (int i = 0; i < HDA_BDL_ENTRIES; i++) {
-            HDAudio::bdl[i].address = (uint64_t)(uintptr_t)(buf_ptr + i * 4096);
+            HDAudio::bdl[i].address = KernelPhysOf(buf_ptr + i * 4096);
             HDAudio::bdl[i].length = 4096;
             HDAudio::bdl[i].ioc = (i == HDA_BDL_ENTRIES - 1) ? 1 : 0;
         }
@@ -779,7 +780,7 @@ bool HDAudio::InitCorbRirb() {
     DelayUs(100);
 
     // full 64-bit bases (heap can sit above 4 GB) (satoru)
-    uint64_t corb_phys = (uint64_t)(uintptr_t)corb;
+    uint64_t corb_phys = KernelPhysOf(corb);
     Write32(HDA_CORBLBASE, (uint32_t)(corb_phys & 0xFFFFFFFFu));
     Write32(HDA_CORBUBASE, (uint32_t)(corb_phys >> 32));
 
@@ -796,7 +797,7 @@ bool HDAudio::InitCorbRirb() {
     }
     Write16(HDA_CORBWP, 0);
 
-    uint64_t rirb_phys = (uint64_t)(uintptr_t)rirb;
+    uint64_t rirb_phys = KernelPhysOf(rirb);
     Write32(HDA_RIRBLBASE, (uint32_t)(rirb_phys & 0xFFFFFFFFu));
     Write32(HDA_RIRBUBASE, (uint32_t)(rirb_phys >> 32));
 
@@ -925,7 +926,7 @@ bool HDAudio::SetupOutputStream() {
     uint16_t fmt = EncodeFormat(current_format.sample_rate, current_format.bits, current_format.channels);
     Write16(stream_base + HDA_SD_FMT, fmt);
 
-    uint64_t bdl_phys = (uint64_t)(uintptr_t)bdl;
+    uint64_t bdl_phys = KernelPhysOf(bdl);
     Write32(stream_base + HDA_SD_BDPL, (uint32_t)(bdl_phys & 0xFFFFFFFFu));
     Write32(stream_base + HDA_SD_BDPU, (uint32_t)(bdl_phys >> 32));
     Write32(stream_base + HDA_SD_CBL, HDA_BUFFER_SIZE);

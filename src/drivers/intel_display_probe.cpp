@@ -16,6 +16,7 @@
 #include "intel_display_probe.h"
 #include "serial.h"
 #include "../kernel/vmm.h"
+#include "../kernel/kld_auto.h"   // KldAuto::TakesDevice: a device taken for a kld container is left alone (satoru)
 
 namespace {
 
@@ -313,6 +314,10 @@ int IntelDisplayProbe::Run(char* out, int maxo) {
 
     uint8_t dv = (uint8_t)fdev, fn = (uint8_t)ffn;
     uint32_t id   = cfg_rd(0, dv, fn, 0x00);
+    if (KldAuto::TakesDevice(0, dv, fn, (uint16_t)(id & 0xFFFF), (uint16_t)(id >> 16))) {
+        say("[igpu] taken by kld (kurono.kld.take), not touched");   // aux/modeset/accel stay off: g_mmio_ok=false (satoru)
+        return g_out_pos;
+    }
     uint32_t cls  = cfg_rd(0, dv, fn, 0x08);
     uint32_t cmd  = cfg_rd(0, dv, fn, 0x04);
     uint32_t b0lo = cfg_rd(0, dv, fn, 0x10), b0hi = cfg_rd(0, dv, fn, 0x14);

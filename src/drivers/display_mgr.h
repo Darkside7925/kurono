@@ -31,7 +31,8 @@ enum DisplayBackend {
     DISPLAY_BACKEND_VIRTIO_GPU, // virtio gpu
     DISPLAY_BACKEND_NVIDIA,     // nvidia discrete gpu
     DISPLAY_BACKEND_INTEL,      // intel integrated
-    DISPLAY_BACKEND_AMD         // amd discrete gpu
+    DISPLAY_BACKEND_AMD,        // amd discrete gpu
+    DISPLAY_BACKEND_KLD         // the KLD display container (D2)
 };
 
 enum VSyncMode {
@@ -129,6 +130,9 @@ public:
 
     // backend info
     static DisplayBackend GetBackend();
+    // the KLD bridge owns the backend while its output is primary; returns the
+    // previous backend so the caller can restore it. (satoru)
+    static DisplayBackend SetBackend(DisplayBackend b);
     static const char* GetBackendName();
 
     // gamma/brightness

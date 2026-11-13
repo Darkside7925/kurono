@@ -349,15 +349,49 @@ static int kld_locate_field(const char *name, struct kld_poke *out)
 
 int kld_acpi_broker_init(void) __attribute__((weak));
 
+// the broker refuses writes to registers the kernel owns but returns the written
+// value on the next read, so acpica's write-then-verify pattern works while the
+// kernel's pic/pit/cmos state and a device's bars are untouched. this self test
+// is the C5.4 proof for that contract. (satoru)
+extern acpi_status acpi_os_read_port(acpi_io_address addr, u32 *value, u32 width);
+extern acpi_status acpi_os_write_port(acpi_io_address addr, u32 value, u32 width);
+extern acpi_status acpi_os_read_pci_configuration(struct acpi_pci_id *id, u32 reg,
+                                                  u64 *value, u32 width);
+extern acpi_status acpi_os_write_pci_configuration(struct acpi_pci_id *id, u32 reg,
+                                                   u64 value, u32 width);
+
+static int kld_shadow_self_test(void)
+{
+    u32 pv = 0;
+    acpi_os_write_port(0x70, 0xA5, 8);
+    acpi_os_read_port(0x70, &pv, 8);
+    int okp = (pv & 0xFF) == 0xA5;
+
+    struct acpi_pci_id id;
+    memset(&id, 0, sizeof(id));
+    id.device = 2;
+    u64 cv = 0;
+    acpi_os_write_pci_configuration(&id, 0x10, 0x11223344, 32);
+    acpi_os_read_pci_configuration(&id, 0x10, &cv, 32);
+    int okc = cv == 0x11223344;
+
+    fprintf(stderr, "[kld-acpi-shadow] cmos port 0x70 write/read: %s (0x%x)\n",
+            okp ? "PASS" : "FAIL", pv & 0xFF);
+    fprintf(stderr, "[kld-acpi-shadow] pci 0:2.0 bar0 write/read: %s (0x%llx)\n",
+            okc ? "PASS" : "FAIL", (unsigned long long)cv);
+    return okp && okc ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = NULL;
-    int devices = 0;
+    int devices = 0, hid_i2c = 0, shadowtest = 0;
     setvbuf(stdout, NULL, _IOLBF, 0);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--tables") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--broker")) kld_osl_broker_mode = 1;
         else if (!strcmp(argv[i], "--quiet")) kld_acpi_quiet = 1;
+        else if (!strcmp(argv[i], "--shadowtest")) shadowtest = 1;
         else if (!strcmp(argv[i], "--poke") && i + 1 < argc && kld_npokes < 64) {
             struct kld_poke *p = &kld_pokes[kld_npokes];
             if (sscanf(argv[++i], "%llx:%u:%u=%llx", (unsigned long long *)&p->addr, &p->bit, &p->len,
@@ -371,6 +405,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "[kld-acpi] broker backend unavailable\n");
             return 2;
         }
+        if (shadowtest && kld_shadow_self_test() != 0)
+            fprintf(stderr, "[kld-acpi-shadow] SELF TEST FAILED\n");
     } else {
         if (!dir) { fprintf(stderr, "usage: kld-acpi --tables DIR | --broker ...\n"); return 2; }
         if (kld_load_dir(dir) <= 0 || kld_build_root()) return 2;
@@ -424,10 +460,13 @@ int main(int argc, char **argv)
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--devices")) devices = 1;
+        else if (!strcmp(argv[i], "--hid-i2c")) hid_i2c = 1;
         else if (!strcmp(argv[i], "--eval") && i + 1 < argc) kld_eval(argv[++i]);
         else if (!strcmp(argv[i], "--crs") && i + 1 < argc) kld_crs(argv[++i]);
         else if (!strcmp(argv[i], "--i2chid") && i + 1 < argc) kld_i2chid(argv[++i]);
     }
+    if (hid_i2c)
+        kld_acpi_hid_i2c_scan();
     acpi_get_devices(NULL, kld_dev_cb, devices ? (void *)1 : NULL, NULL);
     printf("[kld-acpi] devices in namespace: %d (present per _STA: %d)\n", kld_ndev, kld_ndev_present);
     if (!kld_osl_broker_mode)

@@ -156,7 +156,7 @@ int Cmd(void* sh, int argc, const char** argv, char* out, int mx) {
     int p = 0;
     auto cat = [&](const char* s){ while (*s && p < mx-1) out[p++]=*s++; out[p]=0; };
     cat("ksecurity policy watch:\n");
-    cat("  ken policy self-test: "); cat(g_ken_ok ? "ok\n" : "FAILED\n");
+    cat("  amdo policy self-test: "); cat(g_ken_ok ? "ok\n" : "FAILED\n");
     cat("  ksa  self-test:        ");
     if (!KSA::IsAvailable()) cat("n/a (no nested-vm secure path)\n");
     else cat(g_ksa_ok ? "ok\n" : "FAILED\n");
@@ -165,7 +165,7 @@ int Cmd(void* sh, int argc, const char** argv, char* out, int mx) {
 
 void RegisterShellCommands(void* shell) {
     Shell* sh = (Shell*)shell;
-    if (sh) sh->RegisterCommand("ksecurity", Cmd, "KSA + ken policy watch");
+    if (sh) sh->RegisterCommand("ksecurity", Cmd, "KSA + amdo policy watch");
 }
 }  // namespace KSecurity
 

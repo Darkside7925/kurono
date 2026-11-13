@@ -51,6 +51,10 @@ public:
     // after LoadTree, on the single-threaded init path. (satoru)
     static bool HasPersistedFirefoxCached();
 
+    // content fingerprint of just /home/user/.claude, for the autosave worker's
+    // cheap "a claude session file changed" check. 0 when the tree is absent. (satoru)
+    static uint64_t ClaudeFingerprint();
+
     // the claude code binary installed by `kpkg install claude` (about 330 mb,
     // /opt/claude/claude). SaveTree saves it with the other roots but nothing
     // restores it into the heap: this brings it into ONE pmm block, read
@@ -58,5 +62,9 @@ public:
     // buf/len may be null. load=false only answers "is there one" without
     // reading it. false when there is none. (satoru)
     static bool ClaudeImage(const uint8_t** buf, uint64_t* len, bool load);
+
+    // true while RestoreApps() is walking the /apps subtree: a caller that
+    // wants to drop the KFS metadata caches (boot idle trim) must wait. (satoru)
+    static bool IsRestoring();
 };
 // end (satoru)

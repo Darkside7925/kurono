@@ -79,10 +79,12 @@
 #define USB_REQ_GET_DESCRIPTOR  0x06
 #define USB_REQ_SET_CONFIG      0x09
 #define USB_REQ_SET_INTERFACE   0x0B
+#define USB_REQ_CLEAR_FEATURE   0x01
 #define USB_DESC_DEVICE         0x01
 #define USB_DESC_CONFIG         0x02
 #define USB_DESC_HID            0x21
 #define USB_DESC_REPORT         0x22
+#define USB_DESC_SS_EP_COMP     0x30   // superspeed endpoint companion (satoru)
 // hid class-specific requests on the interface (satoru)
 #define HID_REQ_SET_PROTOCOL    0x0B
 #define HID_PROTO_BOOT          0
@@ -316,15 +318,23 @@ struct USBDeviceRuntime {
     uint8_t     bulk_out_dci;      // xhci dci: out ep N -> 2N (satoru)
     uint16_t    bulk_in_mps;
     uint16_t    bulk_out_mps;
+    uint8_t     bulk_in_burst;     // superspeed bMaxBurst from the ep companion (satoru)
+    uint8_t     bulk_out_burst;
     uint8_t*    bulk_bounce;       // 32kb/32kb-aligned dma bounce buffer (satoru)
 
     // bot / scsi state (valid when is_msd) (satoru)
     bool        is_msd;
     bool        msd_ready;         // inquiry + read-capacity succeeded (satoru)
+    uint8_t     msd_iface;         // interface number for the bot class requests (satoru)
     uint8_t     msd_lun;
     uint32_t    msd_tag;           // cbw tag counter (satoru)
     uint64_t    msd_blocks;        // total lba count from read capacity (satoru)
     uint32_t    msd_block_size;    // bytes per lba (satoru)
+    // some bridges answer with a csw signature that is not "USBS"; linux learns
+    // the first one and only checks consistency afterwards. (satoru)
+    uint32_t    msd_csw_sig;
+    bool        msd_csw_sig_ok;
+    char        bd_name[8];        // block registry name ("sda") when registered (satoru)
 
     // usb audio: set while parsing the first 256 bytes of the config when an
     // audio-class interface is seen (the audio driver then does its own full
@@ -335,6 +345,13 @@ struct USBDeviceRuntime {
     bool        iso_cycle;
     uint8_t     iso_dci;           // 0 = no isoch endpoint configured (satoru)
     uint8_t     iso_ep_addr;
+    // explicit feedback endpoint of an asynchronous sink (uac2 5.12.4.2). it is
+    // a second isoch endpoint, IN, with its own ring and buffers. (satoru)
+    xHCI_TRB*   iso_fb_ring;       // kept across close, freed with the device (satoru)
+    int         iso_fb_idx;
+    bool        iso_fb_cycle;
+    uint8_t     iso_fb_dci;        // 0 = no feedback endpoint configured (satoru)
+    uint8_t     iso_fb_ep_addr;
     uint8_t     cfg_value;         // configuration last selected with SET_CONFIGURATION, 0 = none (satoru)
 };
 
@@ -375,6 +392,13 @@ struct XhciState {
     uint32_t root_pending;                 // root ports with a status change seen inside a wait (satoru)
 };
 
+// one gpt entry read off a usb disk, for the write guard and the self test (satoru)
+struct UsbMsdPart {
+    uint64_t start_lba;
+    uint64_t end_lba;      // inclusive (satoru)
+    char     name[37];     // gpt utf-16le name as ascii, empty when unnamed (satoru)
+};
+
 // what the usb audio class driver needs to know about one isoch endpoint (satoru)
 struct UsbIsoParams {
     uint8_t  ep_addr;          // 0x0N = out (satoru)
@@ -384,6 +408,11 @@ struct UsbIsoParams {
     uint8_t  b_interval;       // raw bInterval
     uint32_t bytes_per_interval; // max esit payload
     uint32_t avg_bytes;        // typical td length
+    // optional explicit feedback endpoint (isoch IN); 0 = none. the driver
+    // falls back to open loop when the controller refuses it. (satoru)
+    uint8_t  fb_ep_addr;
+    uint16_t fb_max_packet;
+    uint8_t  fb_b_interval;
 };
 
 class USB {
@@ -464,6 +493,11 @@ public:
     static void IsoKick(int gid);                       // ring the endpoint doorbell
     static uint32_t IsoEpState(int gid);                // endpoint context state 0..4
     static bool IsoRecover(int gid);                    // reset + set tr dequeue after an error
+    // the feedback endpoint (opened by IsoOpen when p.fb_ep_addr is set) (satoru)
+    static bool IsoQueueFb(int gid, const void* data, uint32_t len, bool ioc);
+    static void IsoKickFb(int gid);
+    static uint32_t IsoEpStateFb(int gid);
+    static bool IsoRecoverFb(int gid);
     // callbacks into the audio driver: isoch transfer events (from PollHID) and
     // attach/detach of a device that has an audio interface.
     typedef void (*IsoEventFn)(int gid, uint64_t trb_ptr, uint8_t cc, uint32_t residual);
@@ -474,6 +508,10 @@ public:
     // hid report-layout parser self test (kurono.usbtest=1): boot keyboard,
     // absolute tablet and a report-id high-dpi mouse. (satoru)
     static bool SelfTest();
+
+    // mass-storage end to end self test (kurono.usbmsdtest=1): gpt scan, both
+    // fat32 partitions, and the write guard on the kurono window. (satoru)
+    static bool MsdSelfTest();
 
     // one-shot [kbdiag] line group: usb keyboards bound + interrupt completions (satoru)
     static void LogKbDiag();
@@ -554,6 +592,14 @@ private:
     static bool MsdCommand(int idx, const uint8_t* cb, int cb_len, bool dir_in,
                            void* data, uint32_t data_len, uint32_t* out_residue);
     static bool MsdInit(int idx);
+    static bool MsdRecover(int idx);            // bot reset + clear bulk halts (satoru)
+    static bool MsdReadCapacity(int idx);       // read capacity(10), fall back to (16) (satoru)
+    static bool MsdRequestSense(int idx, uint8_t* key, uint8_t* asc, uint8_t* ascq);
+    static bool MsdReadBytes(int idx, uint64_t off, uint32_t len, void* buf);
+    static int  MsdGptScan(int idx, UsbMsdPart* out, int max);
+    static bool MsdFindKuronoWindow(int idx);   // usb write guard window (satoru)
+    static void MsdRegisterBlockDev(int idx);
+    static void MsdUnregisterBlockDev(int idx);
 
     // input-context accessors: stride-correct pointers into input_ctx (satoru)
     static uint32_t* InputControlCtx(int idx);   // input control context (satoru)

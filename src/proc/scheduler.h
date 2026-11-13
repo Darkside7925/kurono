@@ -109,7 +109,15 @@ constexpr uint32_t PROCESS_FLAG_STACK_READY = 1 << 2;
 // processor, exactly like a clone thread. a bit in the existing flags word, so
 // struct Process keeps its size and layout. (satoru)
 constexpr uint32_t PROCESS_FLAG_AP_OK = 1 << 3;
+// the task is parked in an interruptible nanosleep/clock_nanosleep. its absolute
+// wake deadline is sleep_until_ms and only the linux sleeper side table owns it,
+// so sleep_ticks promotion must not re-ready it before that wall-clock deadline
+// and a signal post can end the sleep with -EINTR. cleared by the promotion path
+// (deadline reached) or by the sleeper/wake paths. never set for poll/futex
+// waits, whose sleep_ticks cadence is unchanged. (satoru)
+constexpr uint32_t PROCESS_FLAG_SLEEPING = 1 << 4;
 
+// DO NOT add fields to this struct. last time i did, the APs started crashing 1 in 5 boots and firefox stopped painting. use a side table
 struct Process {
     uint32_t pid;
     uint32_t parent_pid;
@@ -435,6 +443,34 @@ public:
     // timeslice without any sleep deadline.
     static void SleepMs(uint32_t ms);
     static void YieldNow();
+    // voluntary preemption point (linux's cond_resched) for long kernel-proc work:
+    // yields only when the timer asked for a resched (slice used up, or a higher tier
+    // is ready), only from a kernel proc on the bsp with IF on and no kls held. a
+    // no-op anywhere else, so it is safe to call from code shared with syscalls.
+    // shared-points step 5 stage 1. (satoru)
+    static void CondResched();
+    // service cpus (kurono.svccpu, sched=2): kernel procs homed on aps of their
+    // own (the desktop, audio + network, the vm host), each such ap running its
+    // own cooperative kernel-proc loop. see scheduler.cpp. (satoru)
+    static void SetServiceCpus(bool on);
+    static void SetServiceCpuRequest(int ui, int io, int vm);   // -1 = default (satoru)
+    static void PlanServiceCpus();            // after SMP::StartAPs, before SpawnAll (satoru)
+    static bool IsServiceCpu(uint32_t cpu);
+    static uint32_t UiCpu();                  // 0 = the desktop stays on cpu 0 (satoru)
+    static uint32_t VmCpu();
+    // parallel vm vcpus: kurono.vm.par asks for n extra service cpus (cpu of vcpu k+1 = VcpuCpu(k+1)),
+    // 0 = none was planned. call before PlanServiceCpus (satoru)
+    static void SetVcpuCpus(int n);
+    static uint32_t VcpuCpu(int k);
+    static bool KernelProcCpu(uint32_t cpu);  // cpu 0 or a service cpu (satoru)
+    static uint32_t FirstProgramCpu();        // lowest cpu that runs programs (satoru)
+    [[noreturn]] static void ServiceCpuLoop();
+    static void ServiceCpuTick();             // lapic tick of a service cpu (satoru)
+    static void ServiceCensus(char* out, int max);
+    // is the task with this scheduler pid still in the task list (and, if expect is
+    // set, the same struct)? copies its state / exit code under the scheduler lock, so
+    // a supervisor never reads a reaped struct the free-later ring may recycle. (satoru)
+    static bool TaskStateByPid(uint32_t pid, const Process* expect, int* state, int* exit_code);
 
     // donate a slice from a USER task (ring-0 syscall context, bsp only) to the
     // cooperative kernel processes. SleepMs/YieldNow both early-return for a
@@ -443,6 +479,10 @@ public:
     // boots. CALLER MUST HAVE RELEASED THE KLS LOCK. Returns true if a slice
     // was actually donated. See the block comment in scheduler.cpp. (satoru)
     static bool DonateToKernelProcs(uint32_t ms);
+    // targeted version for the power worker: same user-task bracket and donor
+    // slot, but the caller names the kernel proc. a power request must not
+    // depend on the general picker's starvation heuristics. (satoru)
+    static bool DonateToKernelProc(Process* target, uint32_t ms);
     // donation telemetry: (valve fired, slice handed over, nothing runnable).
     // a null stall result with ok==0 means the trigger never tripped, which is
     // a different bug from "donated and it did not help". (satoru)
@@ -468,6 +508,34 @@ public:
     // high-water marks from the heartbeat. (satoru)
     static void SetKstackGuard(bool on);
     static void KstackCensus();
+    // kurono.kplat=1: kernel-proc wake-to-run latency + longest-run probe, one
+    // [kplat] line per proc every 10 s from the heartbeat (step 5 measurement). (satoru)
+    static void SetKprocLatProbe(bool on);
+    // diagnostic: log why the "power" kernel proc is or is not picked. (satoru)
+    static void SetPickTrace(bool on);
+    static void KprocLatReport();
+    // kurono.wakelat=1: permanent wake-to-run accounting in side tables, per task
+    // and per cpu, with the Ready-vs-Blocked attribution. one [wakelat] block
+    // every 10 s from the heartbeat. clock = Scheduler::NowMs (cpu 0 advances it,
+    // every cpu reads the same word; no cross-cpu tsc subtraction). (satoru)
+    static void SetWakeLat(bool on);
+    static void WakeLatReport();
+    // kurono.vrblock=1: charge the real time a task ran at every deschedule,
+    // including a block (default off: it changes pick order at every cpu count
+    // and needs a real firefox batch before it ships). (satoru)
+    static void SetVrBlock(bool on);
+    // kurono.claimage=1: the claim picker's ready_since override (default off;
+    // also gates the eager Ready stamps and the claim pack-min refresh). (satoru)
+    static void SetClaimAge(bool on);
+    // the kld broker's isr futex wake (LinuxSyscallFutexWakePhys) counts here. (satoru)
+    static void WakeLatNotePhysIrq(bool woke);
+    // kurono.wakelat: a blocking connect took the park instead of a ring0 spin. (satoru)
+    static void WakeLatNoteConnPark();
+    // ... and the gated lock(1)/pty(2)/job(3)/sigsuspend(4) parks. (satoru)
+    static void WakeLatNoteWaitPark(uint32_t kind);
+    // kurono.wakelat: record the caller of a ring-0 wait loop (kls_relax_sleep_ms),
+    // so a busy ap's spin names its syscall. (satoru)
+    static void WakeLatNoteRing0(uint64_t caller);
     // #DF path: an overflow whose #PF push itself faulted arrives as a double
     // fault with cr2 = the guard; name the proc there too. (satoru)
     static bool KstackGuardHit(uint64_t cr2);
@@ -531,6 +599,9 @@ public:
     // unwinnable wait). `skip` is exempted (a fatal-signal self-exit whose own
     // exit path handles it). (satoru)
     static bool KillProcessGroupAsync(uint32_t pid, Process* skip);
+    // true while a task of address space `as` other than `self` is current on
+    // some other cpu (a killed sibling still running its last slice) (satoru)
+    static bool AsRunningOnOtherCpu(uint64_t as, Process* self);
     // bookkeeping-only enqueue of already-Terminated members for a later reap;
     // isr-safe (the hal fault containment queues from the #pf handler). (satoru)
     // pid of any live (unreaped) user task in this address space, or 0. (satoru)
@@ -566,8 +637,9 @@ public:
     // task 21 a/b: hard-pin threads to their last cpu (kurono.pincpu=1). (satoru)
     static void SetPinCpu(bool on);
     // ── sched=2 (kurono.sched=2) ───────────────────────────────────────────
-    // the new smp scheduling mode. everything below is a no-op / old behavior
-    // when it is off, which is the default. call before SMP::Init. (satoru)
+    // the smp scheduling mode, the default since the smp job; kurono.sched=1
+    // boots the old one. everything below is a no-op / old behavior when it is
+    // off. call before SMP::Init. (satoru)
     static void SetSchedMode(int mode);
     static bool SchedV2();
     // kurono.schedrel=0 (a/b only): keep sched=2 but publish on_cpu=0 at the

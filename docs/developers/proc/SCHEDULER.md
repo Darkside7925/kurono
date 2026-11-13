@@ -49,8 +49,7 @@ puts user threads on the secondary cores has landed: a cross-core ready-queue sp
 syscall state, all verified non-regressing under `-smp 4`. With the opt-in gate on
 (`./start.sh --apsched`), an application processor was shown launching and running a ring-3
 Linux program to exit 0 in parallel with the desktop, and each AP arms a per-CPU LAPIC timer
-so those threads are time-sliced rather than purely cooperative. Default boot still parks the
-APs. Left to do: `clone`-sibling placement across cores, and load balancing. Full phased state
+so those threads are time-sliced rather than purely cooperative. Left to do: `clone`-sibling placement across cores, and load balancing. Full phased state
 in [SMP.md](SMP.md).
 
 ## Files
@@ -59,3 +58,17 @@ in [SMP.md](SMP.md).
 - `src/apps/task_manager.cpp` renders the process table
 - `src/drivers/timer.cpp` the interrupt that triggers the tick
 - `src/kernel/kurono_kernel.cpp` calls `Scheduler::Tick()` in the main loop
+
+## Default mode and fixes (part 3 of the major update)
+
+- `kurono.sched=2` is the default. User tasks run on every online CPU, not pinned to one. The
+  old scheduler is `kurono.sched=1` (or `=0`), where kernel processes and program leaders stay on
+  CPU 0.
+- The APs run user tasks in this mode, so the old `kurono.apsched` gate is not needed.
+- A caught signal ends a `FUTEX_WAIT` with EINTR. A thread parked in a condvar used to miss the
+  handler, which froze the JavaScriptCore garbage collector in Claude Code. `kurono.futexsig=0`
+  reverts.
+- `rt_sigsuspend` parks the task instead of spinning, so `sleep 1 & wait` returns. See
+  `linux/LINUX_SYSCALL.md`.
+- Linux pids count up from 100 and do not reuse a pid still in the table, see
+  `linux/LINUX_SYSCALL.md`. `kurono.pidmono=0` reverts.

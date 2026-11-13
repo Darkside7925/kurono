@@ -380,6 +380,57 @@ int MaxRefreshAtPreferred(const Edid& e) {
     return best;
 }
 
+int PickTimingAtResolution(const Edid& e, uint32_t target_mhz) {
+    if (e.preferred < 0) return -1;
+    const Timing& pt = e.t[e.preferred];
+    int best = -1;
+    uint32_t bestd = 0xFFFFFFFFu;
+    for (int i = 0; i < e.nt; i++) {
+        const Timing& t = e.t[i];
+        if (t.hact != pt.hact || t.vact != pt.vact || t.interlaced) continue;
+        uint32_t d = t.refresh_mhz > target_mhz ? t.refresh_mhz - target_mhz : target_mhz - t.refresh_mhz;
+        if (d < bestd || (d == bestd && best >= 0 && t.pixclk_khz < e.t[best].pixclk_khz)) { bestd = d; best = i; }
+    }
+    return best < 0 ? e.preferred : best;
+}
+
+int RatesAtPreferred(const Edid& e, uint32_t* hz, int max) {
+    if (e.preferred < 0 || !hz || max <= 0) return 0;
+    const Timing& pt = e.t[e.preferred];
+    int n = 0;
+    for (int i = 0; i < e.nt && n < max; i++) {
+        const Timing& t = e.t[i];
+        if (t.hact != pt.hact || t.vact != pt.vact || t.interlaced) continue;
+        uint32_t r = (t.refresh_mhz + 500) / 1000;
+        if (r < 1) continue;
+        int at = 0;
+        while (at < n && hz[at] < r) at++;
+        if (at < n && hz[at] == r) continue;
+        if (n == max) continue;
+        for (int k = n; k > at; k--) hz[k] = hz[k - 1];
+        hz[at] = r;
+        n++;
+    }
+    return n;
+}
+
+int PickFittingTiming(const Edid& e, uint32_t target_mhz, bool (*fits)(const Timing& t, void* ctx), void* ctx) {
+    int best = -1;
+    uint64_t best_area = 0;
+    uint32_t best_d = 0xFFFFFFFFu;
+    for (int i = 0; i < e.nt; i++) {
+        const Timing& t = e.t[i];
+        if (t.interlaced || !t.hact || !t.vact || !t.pixclk_khz) continue;
+        if (fits && !fits(t, ctx)) continue;
+        uint64_t area = (uint64_t)t.hact * t.vact;
+        uint32_t d = t.refresh_mhz > target_mhz ? t.refresh_mhz - target_mhz : target_mhz - t.refresh_mhz;
+        bool better = best < 0 || area > best_area ||
+                      (area == best_area && (d < best_d || (d == best_d && t.pixclk_khz < e.t[best].pixclk_khz)));
+        if (better) { best = i; best_area = area; best_d = d; }
+    }
+    return best;
+}
+
 void FormatTiming(const Timing& t, char* buf, int max) {
     Txt s(buf, max);
     s.d(t.hact); s.c('x'); s.d(t.vact); if (t.interlaced) s.c('i');

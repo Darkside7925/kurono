@@ -15,7 +15,7 @@ CC      := musl-gcc
 OBJS_UP := $(shell python3 -I ../tools/kbuild2mk.py $(ACPICA)/Makefile acpi $(LINUX)/include/generated/autoconf.h)
 BUILD   := ../build/acpi
 UP_OBJS := $(addprefix $(BUILD)/acpica/,$(OBJS_UP))
-OWN     := kld_acpi_osl.c kld_acpi_main.c kld_acpi_broker.c
+OWN     := kld_acpi_osl.c kld_acpi_main.c kld_acpi_broker.c kld_acpi_i2chid.c
 OWN_OBJS:= $(patsubst %.c,$(BUILD)/%.o,$(OWN))
 
 # ACPI_PCI_CONFIGURED: the kernel-mode aclinux.h derives it from CONFIG_PCI=y

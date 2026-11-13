@@ -1,0 +1,27 @@
+# i915 family properties (d4, display only), read by tools/gen_match_table.sh.
+# (satoru)
+name i915
+# the iGPU has no MSI-X table in a BAR. (satoru)
+needs_msix_table_page 0
+legacy_vga 0
+# this family drives a display adapter through the kld bridge. (satoru)
+display 1
+# the broker may map the device's graphics opregion (config 0xFC) read-only.
+# (satoru)
+opregion 1
+# i915 reads the host bridge's mchbar register (cfg 0x48), read-only. (satoru)
+host_bridge_read 1
+# kurono.kld.bar=ro|window applies to this family's bars. (satoru)
+bar_policy 1
+# the display block of gttmmadr (display ver 14, PCH_MTL): north display
+# 0x40000-0x7ffff, dmc program 0x80000-0x9ffff (mtl_dmc.bin v2.23 writes
+# 0x90000-0x9adb0 and 0x52000/0x59000, model run 2026-11-12), south display / gmbus / pps
+# 0xc0000-0xcffff, pica / type-c / aux usbc 0x160000-0x16ffff. survey:
+# scratch/kld/gfx/survey_regs.md section 9. (satoru)
+bar_window 0 40000-7ffff 80000-9ffff c0000-cffff 160000-16ffff
+# stolen memory (dsm) behind lmembar from 8 MiB: cpu clears and fills it;
+# lmembar below 8 MiB aliases the ggtt and stays read-only. the ggtt half of
+# bar0 is writable only for a dma-isolated grant (broker rule, not here).
+# (satoru)
+bar_window 2 800000-fffffff
+# end (satoru)

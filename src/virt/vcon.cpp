@@ -5,6 +5,7 @@
 #include "../drivers/serial.h"
 #include "../proc/spinlock.h"
 #include "../kernel/types.h"
+#include "../kernel/heap.h"
 
 namespace {
     const uint32_t IN_RING = 262144;          // host -> guest, bytes waiting for rx buffers (bridge frames, keymaps) (satoru)
@@ -12,7 +13,7 @@ namespace {
     struct Con {
         VirtioDev dev;
         bool      up;
-        uint8_t   in[IN_RING];
+        uint8_t*  in;                          // 256 kb, allocated with the vm (satoru)
         volatile uint32_t in_w, in_r;         // in_w: writers (locked), in_r: vm thread
         Spinlock  in_lock;
         uint16_t  cols, rows;
@@ -112,6 +113,11 @@ namespace {
 bool GuestConsole::Init(int idx, uint8_t irq, const char* name) {
     if (idx < 0 || idx >= MAX_CONSOLES) return false;
     Con& c = g_con[idx];
+    if (!c.in) {
+        c.in = (uint8_t*)KernelHeap::Alloc(IN_RING);
+        if (!c.in) return false;
+        for (uint32_t i = 0; i < IN_RING; i++) c.in[i] = 0;
+    }
     void (*sink)(int, const uint8_t*, int) = c.sink;
     bool (*flow)(int) = c.flow;
     uint16_t cols = c.cols ? c.cols : 80, rows = c.rows ? c.rows : 25;
@@ -153,6 +159,7 @@ void GuestConsole::Poll(int idx) {
 int GuestConsole::Write(int idx, const void* data, int n) {
     if (idx < 0 || idx >= MAX_CONSOLES || n <= 0) return 0;
     Con& c = g_con[idx];
+    if (!c.in) return 0;
     const uint8_t* s = (const uint8_t*)data;
     SpinLockGuard g(c.in_lock);
     int k = 0;
@@ -168,7 +175,7 @@ int GuestConsole::Write(int idx, const void* data, int n) {
 int GuestConsole::InputSpace(int idx) {
     if (idx < 0 || idx >= MAX_CONSOLES) return 0;
     Con& c = g_con[idx];
-    return (int)(IN_RING - (c.in_w - c.in_r));
+    return c.in ? (int)(IN_RING - (c.in_w - c.in_r)) : 0;
 }
 
 bool GuestConsole::DriverReady(int idx) {
@@ -189,6 +196,18 @@ void GuestConsole::ResetRings(int idx) {
     Con& c = g_con[idx];
     SpinLockGuard g(c.in_lock);
     c.in_r = c.in_w = 0;
+}
+
+// the vm is gone: hand the four 256 kb input rings back. Init allocates them
+// again on the next start. (satoru)
+void GuestConsole::ReleaseAll() {
+    for (int i = 0; i < MAX_CONSOLES; i++) {
+        Con& c = g_con[i];
+        if (c.in) { KernelHeap::Free(c.in); c.in = nullptr; }
+        c.in_w = c.in_r = 0;
+        c.dev = {};
+        c.up = false;
+    }
 }
 
 uint64_t GuestConsole::BytesOut(int idx) { return (idx >= 0 && idx < MAX_CONSOLES) ? g_con[idx].bytes_out : 0; }

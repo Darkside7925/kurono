@@ -21,6 +21,25 @@ guards real (non-emulated) controllers on its own.
 Kurono saves its own files into that `KURONO` partition. If there isn't one, nothing gets
 persisted and it just runs from RAM.
 
+## Root files on the KURONO partition
+
+Some programs and VM images are not in the ISO. Kurono reads them from root files on the
+`KURONO` partition, which is FAT32. Use these names exactly, 8.3 style:
+
+- `CLAUDE` the Claude Code program, and `CLAUDE.ENV` with NAME=value lines for its login.
+  You can also install Claude Code with `kpkg install claude` instead.
+- `OPENCODE` the OpenCode program (the linux-x64-musl build, about 210 MB).
+- `LIBSTDC.SO` and `LIBGCCS.SO`, the musl libstdc++.so.6 and libgcc_s.so.1 that OpenCode
+  needs. You can take them from an Alpine install or from the `firefox/lib` folder of the
+  Firefox package.
+- `OPENCODE.ENV` with NAME=value lines, for example `ANTHROPIC_API_KEY=...`. It is plain
+  text, so anything that can read the partition can read your keys. Keep that in mind
+  before you put a real key on a shared disk.
+- `ALPKERN.BIN`, `ALPINIT.BIN` and `ALPINE.IMG` for the Alpine guest.
+- `DEBKERN.BIN`, `DEBINIT.BIN` and `DEBIAN.IMG` for the Debian 13 guest.
+
+`DEBIAN.IMG` and `ALPINE.IMG` must each be one contiguous file on the partition.
+
 ## Safest way to try it
 
 Use a **USB stick** and don't install anything.
@@ -50,10 +69,11 @@ mode with a minimal setup.
 - **Graphics:** the framebuffer from the firmware is used. Intel display works,
   including more than one monitor. Hybrid laptops (Intel + NVIDIA) show output through
   the Intel GPU first. There's a long write-up on that in `../HYBRID_GPU_OPTIMUS_GUIDE.md`.
-- **Network:** Intel/igc/e1000 wired cards and several Wi-Fi chips are supported to
-  different degrees. Wi-Fi is the least reliable part. Wired is the safe bet.
-- **Cores:** on EFI boots Kurono caps the online CPUs at 8 by default (`kurono.maxcpus` changes that). For the new all-cores scheduler add
-  `kurono.sched=2`.
+- **Network:** Intel, igc and e1000 wired cards work. Intel Wi-Fi on the BE200 works
+  through KLD.
+- **Cores:** scheduler mode 2 is the default, and on EFI boots every CPU the firmware
+  lists comes online. `kurono.sched=1` goes back to the old scheduler, which uses 8 CPUs
+  on EFI. `kurono.maxcpus=N` caps the count in either mode.
 
 ## GPU acceleration test build
 

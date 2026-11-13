@@ -139,16 +139,43 @@ public:
     // console and net) and set up its first entry; does not run it. must be
     // called on the thread that will run the vm. (satoru)
     static bool PrepareLinuxGuest(const struct LinuxGuestSpec& spec);
+    // a multiboot2 ELF64 kernel (a Kurono build) as the guest: com1 only, no
+    // virtio devices, a framebuffer in guest RAM (see mb2_boot.h). (satoru)
+    static bool PrepareMultiboot2Guest(const uint8_t* elf, uint64_t size, const char* cmdline, uint32_t ram_mb);
     // the debian guest spec (DEBKERN.BIN / DEBINIT.BIN / DEBIAN.IMG) (satoru)
-    static bool DebianPrepare();
+    static bool DebianPrepare(uint32_t ram_mb = 768, bool debug = false);
     // run the guest for about budget_us of real time. time passes inside the
     // guest as it does outside (devices tick by elapsed host time); an idle
     // (hlt, nothing pending) guest returns early with *idle set so the host
     // thread can sleep. a guest that halts with interrupts off has powered
     // off: the state becomes VM_STATE_HALTED. (satoru)
     static VMState RunSlice(uint32_t budget_us, bool* idle);
+    // lazy guest ram: back and map the 2 mb chunk holding gpa. false if gpa is not
+    // unmapped high ram (already mapped, mmio, out of range) or the host has no memory (satoru)
+    static bool LazyMapRAM(uint64_t gpa);
+    // free page report: give every lazy chunk wholly inside [gpa, gpa+len) back to the host.
+    // returns the bytes released (satoru)
+    static uint64_t ReleaseGuestRam(uint64_t gpa, uint64_t len);
+    // smp guest (kurono.vm.smp=N): number of vcpus for the next vm, the one running now (satoru)
+    static void SetGuestCpus(int n);
+    // virtual guest disk size in gb for the next vm: image + chunk files (0 = just the image) (satoru)
+    static void SetDiskVirtualGb(uint32_t gb);
+    static int  GuestCpus();
+    static int  CurrentVcpu();
     // hlt exit hook
-    static void NoteHalt() { guest_halted = true; }
+    static void NoteHalt() { guest_halted = true; vhalted[cur_vcpu] = true; }
+    static bool IsGuestHalted() { return guest_halted; }   // (satoru)
+    // lapic ipi delivery for init / sipi (called from the lapic emulation) (satoru)
+    static void NoteYield() { yield_req = true; }
+    // parallel vcpus (kurono.vm.par=1): one kernel thread per vcpu on its own host cpu, a big vm lock
+    // around every exit handler and device pump, the guest runs outside it (satoru)
+    static void ApMain(int k);
+    static bool ParActive();
+    static void ParLock();
+    static void ParUnlock();
+    static void KickVcpu(int c);
+    static void DumpSmp();                 // per vcpu rip / mode, for kurono.vmdebug (satoru)
+    static void LapicIpi(int target, int mode, uint8_t vector);
     // reboot request from the guest (keyboard controller / port 0xcf9) (satoru)
     static void NoteRebootRequest() { reboot_requested = true; }
     // the background vm host owns the vm: legacy synchronous entry points
@@ -203,6 +230,12 @@ public:
     static VirtualDisk&   GetDisk()    { return disk; }
 
     static bool InjectInterrupt(uint8_t vector);
+    // a multiboot2 (kurono) guest is running: its lapic is the full VLapic
+    // model even on one vcpu (satoru)
+    static bool Mb2Guest();
+    // vm debug: guest rflags, interruptibility, pending entry injection and
+    // the procbased controls, read on the vm host thread (satoru)
+    static void GuestIrqState(uint64_t* rflags, uint64_t* intr, uint64_t* inj, uint64_t* proc);
     static bool InjectException(uint8_t vector, bool has_error, uint32_t error);
     static void CheckAndInjectPendingIRQs();
 
@@ -244,6 +277,20 @@ private:
     static VMStats   stats;
 
     static bool      guest_halted;
+    static vCPU*     vcpus[8];
+    static int       nvcpus, cur_vcpu, want_cpus;
+    static uint8_t   ap_state[8];            // 0 = not started (wait for sipi), 1 = running
+    static bool      vhalted[8];
+    static bool      yield_req;
+    static void SwitchVcpu(int k);
+    static void SetupAPs();
+    static void StartAP(int k, uint8_t vector);
+    static void BuildMpTable(int n);
+    static VMState RunSliceSmp(uint32_t budget_us, bool* idle);
+    static VMState RunSlicePar(uint32_t budget_us, bool* idle);
+    static void ParSetCtx(int k);
+    static void ParStart();
+    static void ParStop();
     static bool      reboot_requested;
     static void*     owner_proc;
     static bool      alpine_booted;
@@ -253,6 +300,9 @@ private:
     static char      debian_boot_log[8192];
     static int       debian_boot_log_len;
     static bool      linux_guest_enabled;
+    static bool      mb2_mode;        // next first entry is a multiboot2 one (satoru)
+    static bool      i8042_on;        // the virtual 8042 answers ports 0x60/0x64 (satoru)
+    static uint32_t  mb2_entry, mb2_info;
     static LinuxGuestProfile linux_guest_profile;
 
     static bool SetupIOBitmap();

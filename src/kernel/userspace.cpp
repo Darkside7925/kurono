@@ -321,7 +321,10 @@ void Userspace::SetCancelProbe(Process* owner, bool (*probe)()) {
 
 static bool detached_eligible() {
     if (!Scheduler::DetachedLaunch() || !SMP::ApThreadSched()) return false;
-    if (SMP::OnlineCount() < 2 || SMP::CpuIndex() != 0) return false;
+    // cpu 0, or a service cpu (kurono.svccpu): the launchers and the shell live
+    // on the desktop cpu there, and the old in-place launch would run the
+    // program on that cpu, under the gui. (satoru)
+    if (SMP::OnlineCount() < 2 || !Scheduler::KernelProcCpu(SMP::CpuIndex())) return false;
     if (!Scheduler::IsPreemptiveKernelSchedulerActive()) return false;
     Process* me = Scheduler::GetCurrentProcess();
     return me && me->is_kernel_proc;
@@ -338,9 +341,37 @@ static bool task_on_some_cpu(Process* p) {
     return false;
 }
 
-int Userspace::RunDetached(Process* proc, const char* const* argv,
-                           const char* const* envp, uint32_t uid, uint32_t gid) {
-    Process* waiter = Scheduler::GetCurrentProcess();
+// async ring-3 spawn (phase3 finding 1). builds the program's linux record and first
+// user frame and hands it to the application processors, then returns at once: no
+// launcher frame, no per-cpu return context, nothing for a second runner (firefox's
+// cmd_firefox) to clobber, and the caller is free. sched=2: any ap may run it, as for
+// RunDetached. old mode: the leader and the threads it creates are pinned to one ap
+// (the highest online one) and never run on the bsp, so the daemon can neither starve
+// the cooperative kernel procs there nor busy-wait in their place (findings 2/3).
+// returns 0 and fills *h, or <0. (satoru)
+static int spawn_ap_cpu() {
+    // the highest ap that is really online: a contained-fault ap parks itself and
+    // lowers OnlineCount, so count-1 can name a dead cpu (review). (satoru)
+    uint32_t n = SMP::CpuCount();
+    if (n > 8) n = 8;   // cpu_affinity is 8 bits (satoru)
+    for (int c = (int)n - 1; c >= 1; c--) {
+        PerCpu* pc = SMP::ByIndex((uint32_t)c);
+        if (pc && pc->online) return c;
+    }
+    return -1;
+}
+
+bool Userspace::CanSpawnDetached() {
+    if (!SMP::ApThreadSched() || SMP::OnlineCount() < 2) return false;
+    return Scheduler::SchedV2() || spawn_ap_cpu() > 0;
+}
+
+int Userspace::SpawnDetached(Process* proc, const char* const* argv, const char* const* envp,
+                             uint32_t uid, uint32_t gid, DetachedHandle* h) {
+    if (!initialized) Init();
+    if (!proc || !proc->is_user() || !h) return -1;
+    if (!CanSpawnDetached()) return -2;
+    int pin = Scheduler::SchedV2() ? -1 : spawn_ap_cpu();
     LinuxSyscall::LayerLock();
     int slot = LinuxSyscall::CreateProcess(proc->name, uid, gid);
     LinuxProcess* lp = (slot >= 0) ? LinuxSyscall::GetProcess(slot) : nullptr;
@@ -357,6 +388,8 @@ int Userspace::RunDetached(Process* proc, const char* const* argv,
     }
     LinuxSyscall::LayerUnlock();
     if (!lp) return -3;
+    LinuxSyscall::SetProcessCmdline(slot, argv);   // /proc/<pid>/cmdline (satoru)
+    h->proc = proc; h->slot = slot; h->lpid = lpid; h->as = proc->address_space; h->kpid = proc->pid;
 
     // build the sysv stack with the program's address space active on this
     // cpu (the writes go through its user va), then return to ours. a dynamic
@@ -387,40 +420,95 @@ int Userspace::RunDetached(Process* proc, const char* const* argv,
     proc->rsp = entry_rsp;
     proc->has_user_frame = true;
     proc->on_cpu = 0;
+    if (pin > 0) {
+        // old mode: one ap only. migrating between aps is the old mode's unsafe hand-off,
+        // and the bsp must stay with the kernel procs. (satoru)
+        proc->cpu_affinity = (uint8_t)(1u << pin);
+        proc->last_run_cpu = (uint8_t)pin;
+    }
     proc->state = Process_Ready;
     Scheduler::MarkApResumable(proc);   // from here an ap may claim it (satoru)
     Scheduler::KickIdleCpu();
 
-    SerialLogger::Log("[sched2] spawned pid=");
+    SerialLogger::Log(Scheduler::SchedV2() ? "[sched2] spawned pid=" : "[spawn] detached pid=");
     SerialLogger::LogDec((int)lpid);
     SerialLogger::Log(" ");
     SerialLogger::Log(proc->name);
-    SerialLogger::Log(" on the aps, launcher waits\r\n");
+    if (pin > 0) { SerialLogger::Log(" on cpu"); SerialLogger::LogDec(pin); }
+    else SerialLogger::Log(" on the aps");
+    SerialLogger::Log("\r\n");
+    return 0;
+}
+
+bool Userspace::DetachedAlive(DetachedHandle& h) {
+    // by pid under the scheduler lock: a group kill can reap the leader and the
+    // free-later ring free it while a slow supervisor still holds h (review). the
+    // exit code is copied the first time the leader is seen Terminated. (satoru)
+    int st = 0, code = -1;
+    if (!h.proc || !Scheduler::TaskStateByPid(h.kpid, h.proc, &st, &code)) return false;
+    if (st == (int)Process_Terminated) {
+        if (!h.exit_known) { h.exit_code = code; h.exit_known = true; }
+        return false;
+    }
+    return true;
+}
+
+int Userspace::RunDetached(Process* proc, const char* const* argv,
+                           const char* const* envp, uint32_t uid, uint32_t gid) {
+    Process* waiter = Scheduler::GetCurrentProcess();
+    DetachedHandle h;
+    int sr = SpawnDetached(proc, argv, envp, uid, gid, &h);
+    if (sr < 0) return sr == -3 ? -3 : -1;
 
     // wait for the leader, cooperatively. ctrl+c from the owning terminal kills
     // the whole group. (satoru)
     bool cancelled = false;
-    while (__atomic_load_n((int*)&proc->state, __ATOMIC_ACQUIRE) != (int)Process_Terminated) {
+    while (DetachedAlive(h)) {
         if (!cancelled && g_cancel_probe && (waiter == g_cancel_owner || !g_cancel_owner) && g_cancel_probe()) {
             cancelled = true;
             SerialLogger::Log("[sched2] cancel: killing the program's group\r\n");
-            Scheduler::KillProcessGroupAsync(proc->pid, nullptr);
+            Scheduler::KillProcessGroupAsync(h.kpid, nullptr);
         }
         Scheduler::SleepMs(5);
     }
-    int exit_code = proc->exit_code;
+    // a leader reaped within one 5 ms poll was never seen Terminated: read its code
+    // the old way, the free-later ring keeps the struct >= 2 s (and the caller owns
+    // proc). only this 5 ms waiter may do that, not a slow supervisor. (satoru)
+    if (!h.exit_known) { h.exit_code = proc->exit_code; h.exit_known = true; }
+    return ReapDetached(h);
+}
+
+// the leader is dead (DetachedAlive false), or the caller gave up on it: kill what is
+// left of the group, wait for it to drain, release the linux record. callable from a
+// kernel proc only (it sleeps). returns the leader's exit code. (satoru)
+int Userspace::ReapDetached(DetachedHandle& h) {
+    Process* proc = h.proc;
+    if (!proc) return -1;
+    int slot = h.slot;
+    uint32_t lpid = h.lpid;
+    if (DetachedAlive(h)) Scheduler::KillProcessGroupAsync(h.kpid, nullptr);
+    {
+        uint64_t t0w = Timer::GetRealMs64();
+        while (DetachedAlive(h) && Timer::GetRealMs64() - t0w < 3000) Scheduler::SleepMs(5);
+    }
+    // the struct is only touched while it is still in the task list (then the
+    // free-later ring keeps it for >= 2 s); a reaped leader is just "gone". (satoru)
+    int exit_code = h.exit_known ? h.exit_code : -1;
+    if (!Scheduler::TaskStateByPid(h.kpid, proc, nullptr, h.exit_known ? nullptr : &exit_code)) proc = nullptr;
 
     // the leader is dead. give siblings that did not go down with it (a leader
     // that ended with a plain exit, e.g. firefox's exit_group exemption) a
     // moment, then kill what is left so nothing keeps running in the address
     // space the caller is about to release. (satoru)
-    uint64_t as = proc->address_space;
+    uint64_t as = h.as;
     uint64_t t0 = Timer::GetRealMs64();
     bool killed_rest = false;
     for (;;) {
         uint32_t live = Scheduler::FindLivePidInAddressSpace(as);
-        bool busy = task_on_some_cpu(proc) ||
-                    (as && Scheduler::AddressSpaceLiveElsewhere(as, proc));
+        // old mode: an exited task's on_cpu stays 1, so "current on no cpu" is the proof. (satoru)
+        if (proc && !Scheduler::TaskStateByPid(h.kpid, proc, nullptr, nullptr)) proc = nullptr;
+        bool on = proc && (Scheduler::SchedV2() ? task_on_some_cpu(proc) : Scheduler::IsCurrentAnywhere(proc));
+        bool busy = on || (as && Scheduler::AddressSpaceLiveElsewhere(as, proc));
         if (!live && !busy) break;
         uint64_t el = Timer::GetRealMs64() - t0;
         if (live && !killed_rest && el > 300) {
@@ -439,11 +527,27 @@ int Userspace::RunDetached(Process* proc, const char* const* argv,
     LinuxSyscall::LayerLock();
     // members killed with the group never ran sys_exit, so their records would
     // stay active and leak LINUX_MAX_PROCS slots (fix agent's note). (satoru)
-    LinuxSyscall::ReleaseDeadGroupRecords(proc, as);
+    LinuxSyscall::ReleaseDeadGroupRecords(h.proc, as);   // compared, never dereferenced (satoru)
     LinuxProcess* lp2 = LinuxSyscall::GetProcess(slot);
-    if (lp2 && lp2->pid == lpid && (lp2->task == proc || lp2->task == nullptr))
+    if (lp2 && lp2->pid == lpid && (lp2->task == h.proc || lp2->task == nullptr))
         LinuxSyscall::DestroyProcess(slot);
     LinuxSyscall::LayerUnlock();
+
+    // a leader that ended with a normal exit is Terminated but never reaped:
+    // MarkProcessExited took it off the task list, its parent is the kernel
+    // runner that loaded it (this caller), which never waitpid()s, and the group
+    // drain above only kills what is still live. its address space (~2100 frames
+    // per churn/audiod run) stayed allocated forever. reap it like a waitpid
+    // would: WaitForChild finds it under the tree lock only while it is still an
+    // unreaped child (so the pointer is live), DestroyProcess claims it
+    // atomically (a concurrent reaper wins harmlessly), refuses to free page
+    // tables still live elsewhere, and parks the struct in the free-later ring.
+    // a caller that is not the leader's parent finds nothing and changes nothing. (satoru)
+    {
+        Process* self = Scheduler::GetCurrentProcess();
+        Process* z = self ? Scheduler::WaitForChild(self, h.kpid, nullptr) : nullptr;
+        if (z && z == h.proc) Scheduler::ReapProcess(z);
+    }
 
     SerialLogger::Log("[sched2] pid=");
     SerialLogger::LogDec((int)lpid);
@@ -459,6 +563,7 @@ int Userspace::RunDetached(Process* proc, const char* const* argv,
         SerialLogger::Log(" pmm_free_mb="); SerialLogger::LogDec((int)(PMM::GetFreeMemory() / (1024 * 1024)));
     }
     SerialLogger::Log("\r\n");
+    h.proc = nullptr;
     return exit_code;
 }
 
@@ -506,6 +611,7 @@ int Userspace::RunProcessWithArgs(Process* proc, const char* const* argv,
         linux_proc->brk_max     = HIGH_BRK_BASE + HIGH_BRK_SIZE;
     }
 
+    LinuxSyscall::SetProcessCmdline(u.active_linux_process, argv);   // /proc/<pid>/cmdline (satoru)
     LinuxSyscall::SetCurrent(u.active_linux_process);
 
     Scheduler::SetCurrentForThisCpu(proc);

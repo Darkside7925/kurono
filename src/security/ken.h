@@ -39,6 +39,7 @@ enum KENAuthMode {
 struct KENAuthPolicy {
     bool passwd_enabled;   // password factor required for escalation
     bool kvault_enabled;   // ksa hypervisor factor required for escalation
+    bool ksa_enabled;      // the settings switch: false = ksa is off for now (satoru)
 };
 
 struct KENUser {
@@ -138,6 +139,22 @@ public:
                               bool sovereign_override, char* err, int err_max);
     static bool EnableKvault(int session_id, char* err, int err_max);
     static bool EnablePasswd(int session_id, char* err, int err_max);
+
+    // the "KSA off for now" switch (Settings > Users & Security). turning it OFF
+    // needs proof: the account password, or an amdo approval (a session already
+    // elevated to root). turning it back ON needs nothing. while off, the
+    // hypervisor prompt is not used and every approval is password-only. refused
+    // when the password factor is off (that would leave no factor). audited and
+    // persisted (security.ksa in ui.conf). (satoru)
+    static bool IsKsaEnabled();
+    static bool SetKsaEnabled(int session_id, bool enable, const char* password,
+                              char* err, int err_max);
+    // boot: re-apply the persisted switch. (satoru)
+    static void ApplyPersistedKsa();
+    // the account whose password unlocks an escalation, and the check of a
+    // credential digest the prompt returned against it (admin gate, password-only). (satoru)
+    static const char* EscalationAccount();
+    static bool EscalationDigestOk(const unsigned char* digest);
 
     // true if both factors are off - every escalation must then show a risk
     // warning before proceeding. (satoru)

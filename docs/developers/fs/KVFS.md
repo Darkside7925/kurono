@@ -76,6 +76,22 @@ max. So a later `Mkdirs("/system/lib/x")` or `WriteFile("/etc/hostname")` lands 
 Shell commands, the desktop icons, the config system, ld-kurono (it searches `/system/lib`)
 and logging (`/kurono/var/log`) all lean on this layout.
 
+## Directories, times and links
+
+- A directory holds up to 65,536 entries (`KVFS_DIR_LIMIT`). The child array and its hash grow
+  on demand. Before, every directory had a 512-slot array. `KVFS_MAX_CHILDREN` is still 512, but
+  that is only the buffer size callers pass to `KVFS::Listdir`. A directory itself is not limited
+  by it.
+- Nodes no longer carry the fixed child arrays, so a file node is about 6 KB smaller.
+- File times are wall-clock unix seconds: the realtime base plus uptime. Before, every file read
+  as 1970 unless `utimensat` had set it. `utimensat`, `touch`, `tar` and `cp -p` keep the times
+  they are given.
+- Symlinks are followed in intermediate components and in the final component for opens. A
+  relative target resolves from the directory the link is in. A chain stops after 16 hops.
+  `lstat` and `readlink` see the link itself.
+- Paths may use `.` and `..`. A Linux program's `getdents` listing includes `.` and `..` as
+  well. `kurono.getdents=nodots` leaves them out.
+
 ## Persistence
 
 Across reboots it goes through KFS (see [KFS.md](KFS.md)), via `PersistStore::SaveTree` and

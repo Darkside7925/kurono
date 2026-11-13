@@ -60,8 +60,9 @@ its chrome through the subsurface path.
 
 ## Limits
 
-- up to 16 clients
-- up to 256 objects per client
+- up to 256 clients. Client records live in chunks (`g_cl_chunks` in `wayland_server.cpp`),
+  not in one fixed array.
+- up to 512 objects per client
 - 8KB receive buffer per client
 
 ## What's still missing

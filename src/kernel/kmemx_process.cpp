@@ -30,6 +30,7 @@ namespace KMemX {
 
 namespace {
 bool g_proc_started = false;
+bool g_idle_scan = true;   // kinit-driven scan (kurono.kmxidle=0 disables) (satoru)
 
 // per-tick page budget by pressure. green is gentle (compress only the oldest),
 // red/critical push the 16-page batch. (satoru)
@@ -208,9 +209,10 @@ void log_stats(uint32_t tick) {
         // orphans. (satoru)
         MaintainPool(p);
 
-        // compress only under pressure. at green the pool is meant to drain
-        // and go back to the pmm, so no new pages are taken into it. (satoru)
-        if (p == PRESS_GREEN) continue;
+        // the old loop stopped at green entirely, so an idle desktop (the
+        // common case) never compressed anything. keep scanning at green but
+        // leave the selection to the generation threshold: only pages that
+        // stayed untouched across a full scan interval are taken. (satoru)
 
         // (3) never compete with a render: if frames are pending, skip this tick.
         // under green/yellow we are extra polite; under red/critical memory
@@ -233,6 +235,67 @@ void log_stats(uint32_t tick) {
 }  // namespace
 
 int TokenBudget() { return budget_for_pressure(CurrentPressure()); }
+
+void SetIdleScan(bool on) { g_idle_scan = on; }
+bool IdleScanEnabled()    { return g_idle_scan; }
+
+// driven from the bsp syscall exit (the reliable execution point while a user
+// workload runs), with fallbacks from kinit's monitor and the log worker. the
+// dedicated worker above is a cooperative kernel process and can go seconds
+// between slices under firefox, but a bsp syscall exit always happens. the work
+// per call is bounded (one scan pass, same cursor + threshold as the worker),
+// self-throttled to ~4hz, and a disabled engine is a single bool test. (satoru)
+void BackgroundTick() {
+    if (!g_idle_scan || !IsInitialized() || !IsEnabled()) return;
+    static uint32_t s_last_tick_ms = 0;
+    uint32_t now = Timer::GetRealMs();
+    if ((uint32_t)(now - s_last_tick_ms) < 250u) return;   // ~4hz (satoru)
+    s_last_tick_ms = now;
+    Pressure p = UpdatePressure();
+    MaintainPool(p);
+    int budget;
+    switch (p) {
+        case PRESS_GREEN:    budget = 2048; break;  // idle: one sweep per second (satoru)
+        case PRESS_YELLOW:   budget = 2048; break;
+        case PRESS_ORANGE:   budget = 4096; break;
+        case PRESS_RED:      budget = 4096; break;
+        case PRESS_CRITICAL: budget = 4096; break;
+        default:             budget = 2048; break;
+    }
+
+    // one status line every 10s of wall time, independent of how often the
+    // worker gets a slice: live pages, pool occupancy, ratio and the pmm free
+    // figure are the whole measurement. log before the scan so a slow pass
+    // cannot hide the trend. (satoru)
+    static uint32_t s_last_bg_log = 0;
+    if ((uint32_t)(now - s_last_bg_log) >= 10000u) {
+        s_last_bg_log = now;
+        const Stats& s = GetStats();
+        SerialLogger::Log("[kmxbg] live=");
+        SerialLogger::LogDec((int)s.live_pages);
+        SerialLogger::Log(" poolkb=");
+        SerialLogger::LogDec((int)(s.pool_used / 1024));
+        SerialLogger::Log("/");
+        SerialLogger::LogDec((int)(KMemXPool::TotalBytes() / 1024));
+        SerialLogger::Log(" ratiox100=");
+        SerialLogger::LogDec(RatioX100());
+        SerialLogger::Log(" saved_kb=");
+        SerialLogger::LogDec((int)(s.bytes_saved / 1024));
+        SerialLogger::Log(" in=");
+        SerialLogger::LogDec((int)s.pages_in);
+        SerialLogger::Log(" out=");
+        SerialLogger::LogDec((int)s.pages_out);
+        SerialLogger::Log(" flt=");
+        SerialLogger::LogDec((int)s.faults_served);
+        SerialLogger::Log(" press=");
+        SerialLogger::Log(PressureName(p));
+        SerialLogger::Log(" pmm_free_mb=");
+        SerialLogger::LogDec((int)((PMM::GetFreeFrames() * 4096ULL) / (1024 * 1024)));
+        SerialLogger::Log("\r\n");
+    }
+
+    ScanAndCompress(budget);
+}
 
 bool ProcessRunning() { return g_proc_started; }
 

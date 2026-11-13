@@ -4,6 +4,7 @@
 #include "audio_mixer.h"
 #include "audio_backend.h"
 #include "usb_audio.h"
+#include "hda.h"
 #include "serial.h"
 #include "timer.h"
 #include "../kernel/types.h"
@@ -203,6 +204,31 @@ void Tick() {
 void LockedTick() {
     SpinLockCpuGuard guard(g_pump_lock);
     Tick();
+}
+
+bool RestartActive() {
+    AudioBackend* be = g_active;
+    if (!be) {
+        Init();
+        return g_active != nullptr;
+    }
+    if (name_eq(be->Name(), "usbaudio")) {
+        if (UsbAudio::Restart()) return true;
+        // the device may have gone away: probe the rest so a restart still
+        // brings sound back on the built-in codec. (satoru)
+        static const char* const fb[] = { "hda", "ac97", "sb16", "pcspk" };
+        for (unsigned i = 0; i < sizeof(fb) / sizeof(fb[0]); i++)
+            if (UseBackend(fb[i])) return true;
+        return false;
+    }
+    if (name_eq(be->Name(), "hda")) return HDAudio::Restart();
+    be->Stop();
+    return be->Init() && be->IsReady();
+}
+
+int StopAllStreams() {
+    SpinLockCpuGuard guard(g_pump_lock);
+    return AudioMixer::StopAll();
 }
 
 // expose the pump lock so pulse's pacing pass (bsp audio process) can make

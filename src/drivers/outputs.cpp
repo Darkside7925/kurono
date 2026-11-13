@@ -57,6 +57,73 @@ bool Outputs::IsLive(int i) {
     return i >= 0 && i < total && list[i].present && list[i].connected;
 }
 
+void Outputs::SetAuxPresent(int i, void (*fn)(int, int, int, int)) {
+    if (i < 0 || i >= total) return;
+    list[i].aux_present = fn;
+}
+
+void Outputs::SetRam(int i, bool on) {
+    if (i < 0 || i >= total) return;
+    list[i].ram = on;
+}
+
+void Outputs::SetList(const Output* src, int n) {
+    for (int i = 0; i < OUTPUT_MAX; i++) list[i] = {};
+    total = 0;
+    if (!src) return;
+    if (n > OUTPUT_MAX) n = OUTPUT_MAX;
+    for (int i = 0; i < n; i++)
+        list[i] = src[i];
+    total = n;
+}
+
+bool Outputs::Remove(int i) {
+    if (i < 0 || i >= total) return false;
+    for (int j = i; j < total - 1; j++) list[j] = list[j + 1];
+    list[total - 1] = {};
+    total--;
+    Layout(vertical);
+    return true;
+}
+
+void Outputs::PlaceCustom(int i, int ax, int ay) {
+    if (i < 0 || i >= total) return;
+    // the other slots already have ax/ay from the last layout; enable custom
+    // and move only this one. (satoru)
+    custom = true;
+    list[i].ax = ax;
+    list[i].ay = ay;
+    LayoutCustom();
+}
+
+void Outputs::SetGeometry(int i, int w, int h, uint32_t pitch) {
+    if (i < 0 || i >= total || w <= 0 || h <= 0) return;
+    int pct = scale_pct < 100 ? 100 : scale_pct;
+    list[i].pw = w;
+    list[i].ph = h;
+    list[i].w = (int)((long long)w * 100 / pct);
+    list[i].h = (int)((long long)h * 100 / pct);
+    list[i].pitch = pitch;
+}
+
+void Outputs::SetRefreshMilliHz(int i, uint32_t mhz) {
+    if (i < 0 || i >= total) return;
+    list[i].refresh_mhz = mhz;
+}
+
+uint32_t Outputs::RefreshMilliHz(int i) {
+    if (i < 0 || i >= total) return 0;
+    return list[i].refresh_mhz;
+}
+
+uint32_t Outputs::MaxRefreshMilliHz() {
+    uint32_t m = 0;
+    for (int i = 0; i < total; i++)
+        if (list[i].present && list[i].connected && list[i].refresh_mhz > m)
+            m = list[i].refresh_mhz;
+    return m;
+}
+
 bool Outputs::Vertical() { return vertical; }
 
 void Outputs::SetScale(int pct) {

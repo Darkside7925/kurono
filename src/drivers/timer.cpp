@@ -1,5 +1,6 @@
 #include "timer.h"
 #include "../proc/scheduler.h"
+#include "../proc/smp.h"
 #include "cpu_detect.h"   // TSC frequency for a VMware-robust ms clock (satoru)
 
 uint16_t Timer::pit_div;
@@ -51,7 +52,20 @@ void Timer::PollUpdate() {
     }
 }
 
-uint32_t Timer::GetRealMs() { return (uint32_t)GetRealMs64(); }
+// the damage oracle holds the ui clock while it renders its reference frame: on the one
+// cpu that renders, GetRealMs returns the held value, so animations step by the same
+// dt as in the frame being checked. every other cpu and GetRealMs64 (the scheduler
+// timebase) are untouched. (satoru)
+static volatile uint32_t g_ui_hold_cpu = 0xFFFFFFFFu;
+static volatile uint32_t g_ui_hold_ms = 0;
+void Timer::HoldUiMs(bool on, uint32_t ms) {
+    if (on) { g_ui_hold_ms = ms; g_ui_hold_cpu = SMP::CpuIndex(); }
+    else g_ui_hold_cpu = 0xFFFFFFFFu;
+}
+uint32_t Timer::GetRealMs() {
+    if (__builtin_expect(g_ui_hold_cpu != 0xFFFFFFFFu, 0) && SMP::CpuIndex() == g_ui_hold_cpu) return g_ui_hold_ms;
+    return (uint32_t)GetRealMs64();
+}
 
 uint64_t Timer::GetRealMs64() {
     // once the preemptive scheduler is running, source the millisecond clock
@@ -75,7 +89,12 @@ uint64_t Timer::GetRealMs64() {
     static bool     tsc_ready  = false;
     if (!tsc_ready) {
         uint64_t f = CPUDetect::GetInfo().frequency.tsc_frequency;
-        if (f >= 1000000ull) {            // sane (>= 1 MHz)
+        // a tsc that changes rate with the p-state (core 2, k8/k10 and other
+        // pre-invariant parts) cannot be a wall clock: boot calibration would
+        // go wrong on the first downclock. hypervisors present a constant-rate
+        // virtual tsc even when they hide cpuid.80000007. (satoru)
+        bool steady = CPUDetect::HasInvariantTSC() || CPUDetect::IsHypervisor();
+        if (steady && f >= 1000000ull) {            // sane (>= 1 MHz)
             tsc_per_ms = f / 1000ull;
             uint32_t lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
             tsc_base = ((uint64_t)hi << 32) | lo;

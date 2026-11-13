@@ -42,6 +42,9 @@ bool      g_pool_starved = false;
 uint32_t  g_last_press_ms = 0;      // last tick that saw yellow or worse (satoru)
 uint32_t  g_last_grow_ms  = 0;
 uint32_t  g_last_gc_ms    = 0;
+uint32_t  g_last_scan_taken_ms = 0; // last scan that took at least one page (satoru)
+bool      g_scan_active_as = true;   // kurono.kmxactive=0: only fully idle address spaces (satoru)
+bool      g_zero_only = true;        // kurono.kmxall=1: allow non-zero pages too (satoru)
 constexpr uint64_t KMEMX_MIN_RAM = 240ULL * 1024 * 1024;   // ~256mb floor, minus firmware holes (satoru)
 // an entry whose address space looked dead at one gc pass; freed if it still
 // looks dead at the next one. (satoru)
@@ -204,6 +207,11 @@ static inline uint64_t tsc_to_ns(uint64_t cycles) {
 
 }  // namespace
 
+// a page whose whole snapshot is zero. declared here for IsCompressible (which
+// lets a zero page through even inside a live stack window: an all-zero stack
+// page holds no live frame, and a later push faults it back as zeros). (satoru)
+static bool page_is_zero(const uint8_t* p);
+
 // ── store / retrieve primitives (the pool round-trip core) ──────────────────
 // compress `src` (4kb) and store the blob + a metadata entry keyed (as,vaddr).
 // returns the slot index, or -1 on failure (table/pool full). crc32 of the
@@ -317,11 +325,76 @@ static void free_slot_locked(int idx) {
     g_stats.pool_used = KMemXPool::UsedBytes();
 }
 
+// ── vmm lifecycle hooks ─────────────────────────────────────────────────────
+// the vmm tells us when a compressed leaf is mapped over / unmapped / its
+// permissions change, and (critically) right before fork copies a space. the
+// compressed page is not-present, so without these the metadata can outlive
+// its mapping and a later restore would write stale bytes over a reused va, or
+// a fork child would inherit an empty page instead of its parent's contents.
+// (satoru)
+static int DecompressMatching(uint64_t as, bool all);   // defined below (satoru)
+
+static void kmemx_forget_page(uint64_t as, uint64_t vaddr) {
+    if (!g_meta) return;
+    vaddr &= ~0xFFFULL;
+    uint64_t f; g_lock.LockIrqSave(&f);
+    if (g_meta) {
+        int idx = meta_find(as, vaddr);
+        if (idx >= 0) free_slot_locked(idx);
+    }
+    g_lock.UnlockIrqRestore(f);
+}
+
+static void kmemx_update_page_flags(uint64_t as, uint64_t vaddr, uint64_t new_flags) {
+    if (!g_meta) return;
+    vaddr &= ~0xFFFULL;
+    uint64_t f; g_lock.LockIrqSave(&f);
+    if (g_meta) {
+        int idx = meta_find(as, vaddr);
+        if (idx >= 0)
+            g_meta[idx].orig_pte_flags = (uint32_t)(new_flags &
+                (PTE_WRITABLE | PTE_USER | PTE_PWT | PTE_PCD | PTE_GLOBAL | PTE_NX));
+    }
+    g_lock.UnlockIrqRestore(f);
+}
+
+// restore every compressed page of `as` and report whether any entry that
+// still belongs to a compressed leaf remains. entries whose leaf was replaced
+// (the mapping was retired or reused) are dropped, not restored. (satoru)
+static int count_live_entries_for(uint64_t as) {
+    if (!g_meta) return 0;
+    int n = 0;
+    uint64_t f; g_lock.LockIrqSave(&f);
+    if (g_meta) {
+        for (uint32_t i = 0; i < g_meta_cap; i++) {
+            if (g_meta[i].pool_off != KMEMX_POOL_NULL && g_meta[i].address_space == as)
+                n++;
+        }
+    }
+    g_lock.UnlockIrqRestore(f);
+    return n;
+}
+
+static bool kmemx_preclone(uint64_t source_root) {
+    if (!g_meta || g_meta_live == 0) return true;
+    // the background scanner can compress a page of this space again between the
+    // drain and the check (the forking shell is runnable, its pages age): one pass
+    // and a refusal turned that into a fork ENOMEM ('sh: can't fork') in a shell
+    // loop, and on the laptop. drain until nothing is left, a few rounds. (satoru)
+    for (int round = 0; round < 8; round++) {
+        DecompressMatching(source_root, /*all=*/false);
+        // pages faulted back in concurrently are no longer entries; anything left
+        // still points at a compressed leaf the child would copy as a hole. (satoru)
+        if (count_live_entries_for(source_root) == 0) return true;
+    }
+    return false;
+}
+
 // ── public lifecycle ─────────────────────────────────────────────────────────
 // the table is capped so it never needs a giant contiguous allocation, and the
 // pool is sized against *current free* memory with headroom so it can never
 // starve the heap/buddy/the rest of the kernel of contiguous frames. (satoru)
-constexpr uint32_t META_MAX_ENTRIES = 256 * 1024;   // 256k entries (~10mb @ 40b) (satoru)
+constexpr uint32_t META_MAX_ENTRIES = 16 * 1024;    // 16k entries (~640kb @ 40b) (satoru)
 
 // the pool is no longer reserved at boot. the table is sized to the pool CAP
 // (pct of ram) and the pool grows toward that cap only under pressure. the
@@ -347,9 +420,10 @@ static bool alloc_tables(int pool_pct) {
 
     // metadata table: ~1 entry per 2kb of the pool CAP, rounded DOWN to a power
     // of two (rounding up doubled it on most machines), hard-capped at
-    // META_MAX_ENTRIES so the contiguous allocation stays small. the table can
-    // index cap/2kb blobs; at the ~1.5kb mean blob it is the soft limit on live
-    // pages, never a crash. (satoru)
+    // META_MAX_ENTRIES so the contiguous allocation stays small. the old 256k
+    // cap cost 10mb just for the table on a 4gb machine, more than idle
+    // compression saves; 16k entries (640kb) still cover ~32mb of non-zero
+    // blobs and over a gigabyte of zero pages. (satoru)
     uint64_t total_ram = PMM::GetTotalMemory();
     uint64_t intended_pool = (total_ram / 100) * (uint64_t)pool_pct;
     uint32_t entries = (uint32_t)(intended_pool / 2048);
@@ -402,6 +476,11 @@ bool Init(int pool_pct) {
     }
     g_stats.pool_bytes = KMemXPool::TotalBytes();
 
+    // compressed pages are not-present leaves in user page tables: the vmm
+    // must tell us when a mapping is retired/reused/protected, and restore
+    // them before a fork copies the tree. (satoru)
+    KernelVMM::SetKmemxHooks(kmemx_forget_page, kmemx_update_page_flags, kmemx_preclone);
+
     // kmemx's own memory (pool chunks, table, scratch) is excluded from
     // compression by a dynamic check in IsCompressible, not by never-list
     // entries: chunks come and go at runtime and the 64-slot list must stay
@@ -446,6 +525,8 @@ static bool engine_owns(uint64_t phys) {
 bool IsInitialized() { return g_inited; }
 bool IsEnabled()     { return g_enabled; }
 void SetEnabled(bool on) { g_enabled = on; }
+void SetActiveScan(bool on) { g_scan_active_as = on; }
+void SetZeroOnly(bool on) { g_zero_only = on; }
 
 // ── never-compress list ──────────────────────────────────────────────────────
 void ReserveNeverCompress(uint64_t phys_base, uint64_t bytes, const char* who) {
@@ -469,6 +550,13 @@ bool IsCompressible(uint64_t as, uint64_t vaddr) {
     uint64_t phys = KernelVMM::QueryMappingInAddressSpace(as, vaddr);
     if (phys == 0) return false;
     phys &= ~0xFFFULL;
+    // the leaf must be an ordinary present user page. mmio / device memory
+    // (pcd/pwt), a shared mapping (PTE_SHARED: memfd/shm, fork must keep it
+    // shared) and supervisor-only leaves are never compression candidates even
+    // if some region snapshot pointed here. (satoru)
+    uint64_t pflags = KernelVMM::QueryPageFlagsInAddressSpace(as, vaddr);
+    if (!(pflags & PTE_PRESENT) || !(pflags & PTE_USER)) return false;
+    if (pflags & (PTE_PCD | PTE_PWT | PTE_SHARED)) return false;
     // never-compress physical ranges (dma rings, framebuffer, ept). (satoru)
     for (int i = 0; i < g_never_count; i++) {
         if (phys >= g_never[i].base && phys < g_never[i].end) return false;
@@ -487,6 +575,9 @@ bool IsCompressible(uint64_t as, uint64_t vaddr) {
     // already compressed? (a not-present pte would already have failed the query,
     // but guard anyway against a double-take.) (satoru)
     if (meta_find(as, vaddr) >= 0) return false;
+    // an all-zero page is always safe to take, including inside a stack window:
+    // it holds no live frame, and the next push faults it back as zeros. (satoru)
+    if (g_zero_only && page_is_zero((const uint8_t*)PMM::PhysToVirt(phys))) return true;
     // task 26 (the PROVEN crossbeam ret-through-stale-slot crash): never
     // compress a page inside a LIVE thread's stack window. the compressor
     // snapshots content with no owner-cpu shootdown; a parked owner that
@@ -494,8 +585,27 @@ bool IsCompressible(uint64_t as, uint64_t vaddr) {
     // eventual refault serves the park-era snapshot back - the thread's ret
     // then pops a previous cycle's return address (lost stores; the rip=0x3 /
     // cr2=0xA class). stacks are the hottest victims (the recv spin yield
-    // parks with the stack page idle-looking) and cheap to skip. (satoru)
-    if (Scheduler::PageIsLiveStack(as, nullptr, vaddr, 64ull << 10)) return false;
+    // parks with the stack page idle-looking) and cheap to skip. a 1mb window
+    // covers a deep on-cpu stack whose saved rsp predates the current frame;
+    // the kernel-proc driver runs while user threads execute on other cores.
+    // (satoru)
+    if (Scheduler::PageIsLiveStack(as, nullptr, vaddr, 1ull << 20)) return false;
+    // PageIsLiveStack walks the scheduler list only. a thread running on an ap
+    // may not be in that list (this branch's scheduler keeps only some nodes
+    // queued), so cover every cpu's CURRENT task here as well; otherwise an
+    // active stack frame of a running thread can be taken, and its next return
+    // direction comes back from the older snapshot. (satoru)
+    {
+        const uint64_t W = 1ull << 20;
+        for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+            PerCpu* pc = SMP::ByIndex(ci);
+            Process* cur = pc ? pc->current : nullptr;
+            if (!cur || cur->reaped || !cur->is_user() || cur->address_space != as) continue;
+            uint64_t rsp = cur->user_frame.rsp & ~0xFFFULL;
+            uint64_t lo = (rsp > W) ? (rsp - W) : 0;
+            if (vaddr >= lo && vaddr < rsp + W) return false;
+        }
+    }
     return true;
 }
 
@@ -774,8 +884,11 @@ void MaintainPool(Pressure p) {
     uint64_t total = KMemXPool::TotalBytes();
     uint64_t used  = KMemXPool::UsedBytes();
     bool near_full = (total == 0) || (total - used < GROW_SLACK) || g_pool_starved;
-    if (g_enabled && p >= PRESS_YELLOW && near_full &&
+    if (g_enabled && (p >= PRESS_YELLOW || g_pool_starved) && near_full &&
         (uint32_t)(now - g_last_grow_ms) >= GROW_GAP_MS) {
+        // the scan path grows the pool on demand at any pressure (an idle
+        // desktop is green but still has idle pages worth compressing); this
+        // tick only has to catch a store that just found the pool full. (satoru)
         g_last_grow_ms = now;
         g_pool_starved = false;
         grow_pool(p >= PRESS_RED ? 4u : 1u, PressureName(p));
@@ -790,7 +903,8 @@ void MaintainPool(Pressure p) {
     // some chunks are empty. no page is decompressed to make room; chunks drain
     // naturally as pages fault back in or their processes exit. (satoru)
     if (total > 0 && (!g_enabled ||
-        (p == PRESS_GREEN && (uint32_t)(now - g_last_press_ms) >= SHRINK_AFTER_MS))) {
+        (p == PRESS_GREEN && (uint32_t)(now - g_last_press_ms) >= SHRINK_AFTER_MS &&
+         (uint32_t)(now - g_last_scan_taken_ms) >= SHRINK_AFTER_MS))) {
         release_empty_chunks(0, g_enabled ? "pressure cleared" : "engine off");
     }
     (void)CHUNK;
@@ -947,7 +1061,7 @@ bool HandleGuestFault(uint64_t ept_root, uint64_t guest_phys) {
     uint64_t t0 = rdtsc();
     uint64_t frame = PMM::AllocFrame();
     if (frame == 0) return false;
-    uint8_t* dst = (uint8_t*)(uintptr_t)frame;
+    uint8_t* dst = (uint8_t*)PMM::PhysToVirt(frame);
 
     g_lock.LockIrqSave(&f);
     idx = meta_find(ept_root, gpa);
@@ -1005,10 +1119,29 @@ struct CFreeEnt {
     uint64_t as, va;      // for the verify-or-undo pass; va=0 -> free-only (satoru)
     int      slot;        // meta slot at queue time (re-verified at flush) (satoru)
 };
-static CFreeEnt g_cfree[64];
+static CFreeEnt g_cfree[512];
 static int g_cfree_n = 0;
+static Spinlock g_cfree_lock;
+
+// a page is about to be decompressed by its owner while the frame the snapshot
+// came from is still parked for proof. the owner may have written through a
+// stale translation after the snapshot; prove the frame first so the flush
+// either accepts the snapshot (crc equal) or undoes the compression and keeps
+// the newer bytes. otherwise the fault would install the older copy and lose
+// the owner's stores. (satoru)
+static bool cfree_pending_for(uint64_t as, uint64_t va) {
+    bool hit = false;
+    uint64_t f; g_cfree_lock.LockIrqSave(&f);
+    for (int i = 0; i < g_cfree_n; i++) {
+        if (g_cfree[i].as == as && g_cfree[i].va == va) { hit = true; break; }
+    }
+    g_cfree_lock.UnlockIrqRestore(f);
+    return hit;
+}
+
 void FlushPendingCompressFrees() {
-    if (g_cfree_n <= 0) return;
+    uint64_t cf; g_cfree_lock.LockIrqSave(&cf);
+    if (g_cfree_n <= 0) { g_cfree_lock.UnlockIrqRestore(cf); return; }
     if (SMP::OnlineCount() <= 1) {
         for (int i = 0; i < g_cfree_n; i++) PMM::FreeFrame(g_cfree[i].phys);
         g_cfree_n = 0;
@@ -1067,11 +1200,17 @@ void FlushPendingCompressFrees() {
         }
     }
     g_cfree_n = keep;
+    g_cfree_lock.UnlockIrqRestore(cf);
 }
 static void queue_compress_free(uint64_t phys, uint64_t as, uint64_t va, int slot) {
+    constexpr int CAP = (int)(sizeof(g_cfree) / sizeof(g_cfree[0]));
     if (SMP::OnlineCount() <= 1) { PMM::FreeFrame(phys); return; }
-    if (g_cfree_n >= 64) FlushPendingCompressFrees();
-    if (g_cfree_n >= 64) {
+    uint64_t cf; g_cfree_lock.LockIrqSave(&cf);
+    bool full = (g_cfree_n >= CAP);
+    g_cfree_lock.UnlockIrqRestore(cf);
+    if (full) FlushPendingCompressFrees();
+    g_cfree_lock.LockIrqSave(&cf);
+    if (g_cfree_n >= CAP) {
         // still full after a failed broadcast: leak one frame rather than
         // free unproven - 4k lost beats a stray write into a recycled frame.
         // (the dropped entry also skips its verify; the leaked frame stays
@@ -1085,6 +1224,17 @@ static void queue_compress_free(uint64_t phys, uint64_t as, uint64_t va, int slo
     g_cfree[g_cfree_n].va   = va;
     g_cfree[g_cfree_n].slot = slot;
     g_cfree_n++;
+    g_cfree_lock.UnlockIrqRestore(cf);
+}
+
+// a page whose whole snapshot is zero. taking only these is the safe default:
+// a zero snapshot can never be a torn read of live data (a concurrent writer
+// that leaves non-zero bytes is caught by the proof-time crc and undone), and
+// most idle anonymous memory in a browser is untouched zero pages. (satoru)
+static bool page_is_zero(const uint8_t* p) {
+    const uint64_t* q = (const uint64_t*)p;
+    for (int i = 0; i < PAGE / 8; i++) if (q[i] != 0) return false;
+    return true;
 }
 
 // ── stage 5/6: compress one page ─────────────────────────────────────────────
@@ -1101,7 +1251,8 @@ bool CompressPage(uint64_t as, uint64_t vaddr) {
     uint64_t phys = KernelVMM::QueryMappingInAddressSpace(as, vaddr);
     if (phys == 0) return false;
     phys &= ~0xFFFULL;
-    const uint8_t* page = (const uint8_t*)(uintptr_t)phys;   // identity-mapped (satoru)
+    const uint8_t* page = (const uint8_t*)PMM::PhysToVirt(phys);   // direct-mapped when enabled (satoru)
+    if (g_zero_only && !page_is_zero(page)) return false;
 
     uint64_t t0 = rdtsc();
     uint64_t f; g_lock.LockIrqSave(&f);
@@ -1154,6 +1305,15 @@ bool HandleFault(uint64_t fault_vaddr) {
     // the overwhelmingly-common non-kmemx fault.) (satoru)
     if (!KernelVMM::KmemxIsCompressed(as, va)) return false;
 
+    // if this page's original frame is still parked waiting for shootdown
+    // proof, prove it now: a stale-tlb store after our snapshot must win over
+    // the older copy (crc mismatch -> undo), not be silently replaced by it.
+    // (satoru)
+    if (cfree_pending_for(as, va)) {
+        FlushPendingCompressFrees();
+        if (!KernelVMM::KmemxIsCompressed(as, va)) return false;
+    }
+
     uint64_t t0 = rdtsc();
 
     // a fresh frame to decompress into. allocate BEFORE taking the lock (PMM has
@@ -1164,7 +1324,7 @@ bool HandleFault(uint64_t fault_vaddr) {
         // generic handler will then terminate the process / panic). (satoru)
         return false;
     }
-    uint8_t* dst = (uint8_t*)(uintptr_t)frame;   // identity-mapped (satoru)
+    uint8_t* dst = (uint8_t*)PMM::PhysToVirt(frame);   // direct-mapped when enabled (satoru)
 
     uint64_t f; g_lock.LockIrqSave(&f);
     int idx = meta_find(as, va);
@@ -1214,57 +1374,227 @@ bool HandleFault(uint64_t fault_vaddr) {
 
 // ── stage 5: scan candidate address spaces and compress aged pages ──────────
 namespace {
-// per-scan cursor so we round-robin across processes + their regions without
-// rescanning the same hot range every tick. (satoru)
+// the scan cursor is (pid, region index, next va). it survives calls so a big
+// region is aged in bounded slices and every process is reached in turn.
+// (satoru)
 uint32_t g_scan_pid_cursor = 0;
+uint32_t g_scan_reg_cursor = 0;
 uint64_t g_scan_va_cursor  = 0;
+// one scanner at a time: the worker and kinit's background tick both call in,
+// and a single cursor/scratch array keeps the two from interleaving. (satoru)
+Spinlock g_scan_run;
+struct ScanCand { uint64_t as; uint64_t va; };
+constexpr int SCAN_MAX_CANDS = 32768;
+// 512 kb of candidate slots used only while the engine is enabled. allocated
+// from the pmm on the first scan, never from the kernel heap: a late 512 kb
+// heap request would make the heap grow a whole 16 mb region. (satoru)
+ScanCand* g_scan_cands = nullptr;
+
+static ScanCand* EnsureScanCands() {
+    if (!g_scan_cands) {
+        g_scan_cands = (ScanCand*)PMM::AllocBytes(sizeof(ScanCand) * SCAN_MAX_CANDS);
+    }
+    return g_scan_cands;
 }
+int g_dbg_scan_procs = 0;   // user processes seen by the last collection (satoru)
+int g_dbg_scan_anon  = 0;   // anonymous regions seen by the last collection (satoru)
+
+// only anonymous private user memory is safe to take: file-backed pages have
+// no writeback path here, and shared mappings (memfd/shm) are not exclusive
+// to the faulting process. demand-zero covers heap + anon mmap; STACK is the
+// eagerly mapped initial user stack (anonymous). (satoru)
+bool region_is_anonymous(const UserMemoryRegion& reg) {
+    if (reg.file_node != nullptr || reg.file_off_base != ~0ull) return false;
+    return (reg.flags & (USER_REGION_DEMAND_ZERO | USER_REGION_STACK)) != 0;
+}
+
+// copy up to `max` (as,va) candidates out of the live process list under the
+// scheduler lock, then release it. only a snapshot is taken: the pages are
+// aged/compressed after the lock drops, so a long scan never blocks a wake or
+// a pick. membership can change in that window, so every page is re-verified
+// (leaf still present, still user) before it is touched. (satoru)
+int collect_scan_candidates(int max) {
+    if (max > SCAN_MAX_CANDS) max = SCAN_MAX_CANDS;
+    if (!EnsureScanCands()) return 0;
+    g_dbg_scan_procs = 0;
+    g_dbg_scan_anon = 0;
+    uint64_t f; Scheduler::StateLock(&f);
+    Process* p = nullptr;
+    if (g_scan_pid_cursor) {
+        for (Process* q = Scheduler::ready_queue; q; q = q->next) {
+            if (q->pid == g_scan_pid_cursor && q->is_user() && !q->reaped &&
+                q->address_space != 0) { p = q; break; }
+        }
+    }
+    if (!p) {
+        p = Scheduler::ready_queue;
+        g_scan_pid_cursor = 0;
+        g_scan_reg_cursor = 0;
+        g_scan_va_cursor  = 0;
+    }
+    int n = 0;
+    while (p && n < max) {
+        if (!p->is_user() || p->reaped || p->state == Process_Terminated ||
+            p->address_space == 0) {
+            p = p->next;
+            g_scan_pid_cursor = 0; g_scan_reg_cursor = 0; g_scan_va_cursor = 0;
+            continue;
+        }
+        g_dbg_scan_procs++;
+        uint32_t r  = (p->pid == g_scan_pid_cursor) ? g_scan_reg_cursor : 0;
+        uint64_t va = (p->pid == g_scan_pid_cursor) ? g_scan_va_cursor : 0;
+        while (r < PROCESS_MAX_USER_REGIONS && n < max) {
+            const UserMemoryRegion& reg = p->regions[r];
+            if (!reg.active || reg.end <= reg.start || !region_is_anonymous(reg)) {
+                r++; va = 0; continue;
+            }
+            g_dbg_scan_anon++;
+            if (va < reg.start || va >= reg.end) va = reg.start;
+            va &= ~0xFFFULL;
+            while (va < reg.end && n < max) {
+                g_scan_cands[n].as = p->address_space;
+                g_scan_cands[n].va = va;
+                n++;
+                va += PAGE;
+            }
+            g_scan_pid_cursor = p->pid;
+            g_scan_reg_cursor = r;
+            g_scan_va_cursor  = va;
+            if (va >= reg.end) { r++; va = 0; g_scan_reg_cursor = r; g_scan_va_cursor = 0; }
+        }
+        if (n >= max) break;
+        p = p->next;
+        g_scan_pid_cursor = 0; g_scan_reg_cursor = 0; g_scan_va_cursor = 0;
+    }
+    Scheduler::StateUnlock(f);
+    return n;
+}
+// 0 = dead, 1 = live but quiescent, 2 = live with a task Running (or current
+// on some cpu). only state Running is used: old mode leaves on_cpu set on
+// parked threads, and Ready tasks are parked (they fault before touching a
+// compressed page). (satoru)
+int as_scan_state(uint64_t as) {
+    bool live = false, active = false;
+    uint64_t f; Scheduler::StateLock(&f);
+    for (Process* p = Scheduler::ready_queue; p; p = p->next) {
+        if (!p->is_user() || p->reaped || p->address_space != as) continue;
+        if (p->state == Process_Terminated) continue;
+        live = true;
+        // state Running is authoritative (old mode leaves on_cpu set on parked
+        // threads, so it cannot be used as the activity test). a Ready task is
+        // parked and will fault before touching a compressed page. (satoru)
+        if (p->state == Process_Running) { active = true; break; }
+    }
+    Scheduler::StateUnlock(f);
+    if (!active) {
+        for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+            PerCpu* pc = SMP::ByIndex(ci);
+            Process* cur = pc ? pc->current : nullptr;
+            if (cur && cur->is_user() && !cur->reaped && cur->address_space == as) {
+                live = true; active = true; break;
+            }
+        }
+    }
+    return active ? 2 : (live ? 1 : 0);
+}
+}  // namespace
 
 int ScanAndCompress(int budget) {
     if (!g_inited || !g_enabled || budget <= 0) return 0;
-    if (KMemXPool::TotalBytes() == 0) return 0;   // no pool reserved (satoru)
+    if (!g_scan_run.TryLock()) return 0;   // another scanner is mid-pass (satoru)
     int threshold = Threshold();
     int taken = 0;
     int aged = 0;
-    const int AGE_LIMIT = budget * 64;   // bound the per-call work (satoru)
+    int maxgen = 0;
+    int age_limit = budget * 32;
+    if (age_limit < 1024) age_limit = 1024;
+    if (age_limit > SCAN_MAX_CANDS) age_limit = SCAN_MAX_CANDS;
 
-    // walk the process list. we hold no scheduler lock (the list is append-mostly
-    // and we tolerate a transient miss), and we only read each Process' regions +
-    // address_space, which are stable while the process lives. (satoru)
-    for (Process* p = Scheduler::ready_queue; p && (taken < budget) && (aged < AGE_LIMIT); p = p->next) {
-        if (!p->is_user()) continue;          // native+linux user processes are eligible (satoru)
-        uint64_t as = p->address_space;
-        if (as == 0) continue;
+    int n = collect_scan_candidates(age_limit);
 
-        for (int r = 0; r < PROCESS_MAX_USER_REGIONS && (taken < budget) && (aged < AGE_LIMIT); r++) {
-            const UserMemoryRegion& reg = p->regions[r];
-            if (!reg.active || reg.end <= reg.start) continue;
-            // start at the cursor if it falls in this region, else the region top. (satoru)
-            uint64_t va = reg.start;
-            if (g_scan_pid_cursor == p->pid && g_scan_va_cursor >= reg.start &&
-                g_scan_va_cursor < reg.end) {
-                va = g_scan_va_cursor & ~0xFFFULL;
-            }
-            for (; va < reg.end && (taken < budget) && (aged < AGE_LIMIT); va += PAGE) {
-                if (!KernelVMM::KmemxIsLeafPresent(as, va)) continue;
-                aged++;
-                int gen = KernelVMM::KmemxAgeLeaf(as, va);
-                if (gen < 0) continue;
-                if (gen >= threshold) {
-                    if (CompressPage(as, va)) taken++;
-                }
-            }
-            g_scan_pid_cursor = p->pid;
-            g_scan_va_cursor  = va;
+    // liveness + quiescence cache: one scheduler lock round-trip per distinct
+    // space instead of one per page. by default an active space (a task in
+    // state Running or current on a cpu) is still eligible: the default
+    // zero-only policy makes that safe, since a zero snapshot cannot be a torn
+    // read and a concurrent write is caught at proof time. kurono.kmxactive=0
+    // is the conservative a/b (only fully parked spaces). (satoru)
+    struct AsState { uint64_t as; int state; };
+    AsState live[64];
+    int nlive = 0;
+
+    for (int i = 0; i < n; i++) {
+        uint64_t as = g_scan_cands[i].as;
+        uint64_t va = g_scan_cands[i].va;
+        int st = 0;
+        int c = 0;
+        for (; c < nlive; c++) if (live[c].as == as) { st = live[c].state; break; }
+        if (c == nlive) {
+            st = as_scan_state(as);
+            if (nlive < 64) { live[nlive].as = as; live[nlive].state = st; nlive++; }
+        }
+        if (st == 0) continue;                                    // dead space (satoru)
+        if (st == 2 && !g_scan_active_as) continue;               // has a live task (satoru)
+
+        if (!KernelVMM::KmemxIsLeafPresent(as, va)) continue;
+        aged++;
+        int gen = KernelVMM::KmemxAgeLeaf(as, va);
+        if (gen > maxgen) maxgen = gen;
+        if (gen < 0 || gen < threshold) continue;
+
+        if (taken >= budget) break;
+        if (CompressPage(as, va)) { taken++; continue; }
+        if (g_pool_starved) {
+            // the adaptive pool starts empty and grows only when a real
+            // candidate needs room; this is the on-demand reserve the engine
+            // is supposed to do (and a disabled engine never reaches here).
+            // (satoru)
+            g_pool_starved = false;
+            if (grow_pool(1u, "scan") == 0) break;
+            if (CompressPage(as, va)) taken++;
         }
     }
-    // a full flush of the cleared-accessed-bit pages: a single FlushTLB is cheaper
-    // than thousands of INVLPGs and the aged pages span many ranges. only needed
-    // when we actually aged pages in the active address space. cheap + safe. (satoru)
-    if (aged > 0) KernelVMM::FlushTLB();
-    // one shootdown covers every page this batch compressed; frames free only
-    // on proof. (satoru)
-    FlushPendingCompressFrees();
+
+    // low-volume scan telemetry: a boot log must answer "did it look at pages
+    // at all, and is the generation climbing to the threshold". (satoru)
+    {
+        static uint32_t s_dbg_ms = 0;
+        uint32_t now = Timer::GetRealMs();
+        if ((uint32_t)(now - s_dbg_ms) >= 10000u) {
+            s_dbg_ms = now;
+            SerialLogger::Log("[kmxscan] cand=");
+            SerialLogger::LogDec(n);
+            SerialLogger::Log(" procs=");
+            SerialLogger::LogDec(g_dbg_scan_procs);
+            SerialLogger::Log(" anonreg=");
+            SerialLogger::LogDec(g_dbg_scan_anon);
+            SerialLogger::Log(" aged=");
+            SerialLogger::LogDec(aged);
+            SerialLogger::Log(" taken=");
+            SerialLogger::LogDec(taken);
+            SerialLogger::Log(" maxgen=");
+            SerialLogger::LogDec(maxgen);
+            SerialLogger::Log(" thr=");
+            SerialLogger::LogDec(threshold);
+            SerialLogger::Log(" live=");
+            SerialLogger::LogDec((int)g_meta_live);
+            SerialLogger::Log("\r\n");
+        }
+    }
+
+    if (taken > 0) {
+        g_last_scan_taken_ms = Timer::GetRealMs();
+        // one shootdown covers every page this batch compressed; frames free
+        // only on proof (FlushPendingCompressFrees also invalidates the aged
+        // pages' stale translations, since it is a full broadcast). (satoru)
+        FlushPendingCompressFrees();
+    } else if (aged > 0) {
+        // aging cleared A bits in page tables of address spaces whose threads
+        // run on other cores; only a broadcast makes the next access set A
+        // again (a local cr3 reload leaves their stale tlb entries alone).
+        // (satoru)
+        SMP::BroadcastTlbFlush();
+    }
+    g_scan_run.Unlock();
     return taken;
 }
 
@@ -1285,6 +1615,15 @@ static int DecompressMatching(uint64_t as, bool all) {
         PageMeta& m = g_meta[i];
         if (m.pool_off == KMEMX_POOL_NULL) { g_lock.UnlockIrqRestore(f); continue; }
         if (!all && m.address_space != as) { g_lock.UnlockIrqRestore(f); continue; }
+        // the mapping may have been retired or reused since compression (the
+        // vmm hooks normally drop the entry, but a racy path may not have run
+        // yet). never restore over a leaf that is not ours any more. (satoru)
+        if (m.address_space != 0 && !(m.flags & KMETA_GUEST) &&
+            !KernelVMM::KmemxIsCompressed(m.address_space, m.vaddr)) {
+            free_slot_locked((int)i);
+            g_lock.UnlockIrqRestore(f);
+            continue;
+        }
         uint64_t page_as = m.address_space;
         uint64_t va = m.vaddr;
         uint32_t saved_flags = m.orig_pte_flags;
@@ -1294,11 +1633,18 @@ static int DecompressMatching(uint64_t as, bool all) {
         // in + freed in the gap). (satoru)
         uint64_t frame = PMM::AllocFrame();
         if (frame == 0) break;   // out of memory; stop draining (satoru)
-        uint8_t* dst = (uint8_t*)(uintptr_t)frame;
+        uint8_t* dst = (uint8_t*)PMM::PhysToVirt(frame);
 
         g_lock.LockIrqSave(&f);
         int idx = meta_find(page_as, va);
         if (idx < 0) { g_lock.UnlockIrqRestore(f); PMM::FreeFrame(frame); continue; }
+        if (!(g_meta[idx].flags & KMETA_GUEST) &&
+            !KernelVMM::KmemxIsCompressed(page_as, va)) {
+            free_slot_locked(idx);
+            g_lock.UnlockIrqRestore(f);
+            PMM::FreeFrame(frame);
+            continue;
+        }
         if (!retrieve_compressed_locked(idx, dst)) {
             uint32_t want_crc = g_meta[idx].crc32;
             g_lock.UnlockIrqRestore(f);

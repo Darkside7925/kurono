@@ -1,4 +1,7 @@
 #include "smp.h"
+#include "../kernel/dbgwatch.h"   // (satoru)
+#include "../kernel/kimage.h"   // the trampoline lgdt is 32-bit: gdt base must be physical (satoru)
+#include "../kernel/vmm.h"       // cr3 must fit in 32 bits for the AP trampoline (satoru)
 #include "../ui/boot_anim.h"
 #include "../drivers/serial.h"
 #include "../drivers/cpu_detect.h"
@@ -30,6 +33,7 @@ namespace {
     PerCpu   g_cpus[SMP_MAX_CPUS];
     int      g_apicid_to_index[256];
     uint32_t g_cpu_count = 0;
+    uint64_t g_ap_stack_bytes = 0;   // stack frames handed to the aps (census) (satoru)
     uint64_t g_lapic_base = 0;     // identity-mapped xapic mmio window (satoru)
     bool     g_inited = false;
 
@@ -44,6 +48,9 @@ namespace {
     //  sched=2: per-cpu "halted in the dispatch loop" flags, set under cli right
     //  before sti;hlt and claimed (cas 1->0) by the waker that sends the ipi. (satoru)
     volatile uint8_t g_cpu_idle[SMP_MAX_CPUS] = {};
+    // each ap's calibrated lapic count for 10 ms (ap_entry), so a service cpu can
+    // retune its tick later (SetLapicTickHz). (satoru)
+    uint32_t g_lapic_10ms[SMP_MAX_CPUS] = {};
     //  sched=2: CpuIndex via IA32_TSC_AUX (rdtscp). (satoru)
     volatile bool g_tscaux = false;
     //  sched=2 tlb acks: each cpu records the broadcast round it flushed for
@@ -143,6 +150,92 @@ namespace {
         while (rdtsc() - start < ticks && cap--) __asm__ volatile("pause");
     }
 
+    //  firmware IA32_TSC_ADJUST (msr 0x3b) sanitize, modelled on linux
+    //  arch/x86/kernel/tsc_sync.c (tsc_sanitize_first_cpu / tsc_store_and_check_tsc_adjust).
+    //  rdtsc returns the core's counter plus this msr. the owner's arrow lake laptop
+    //  hands over with a different value per cpu (linux logs "[Firmware Bug]: TSC
+    //  ADJUST: CPU0: -1797404919 force to 0" and "differs within socket(s)" on every
+    //  boot), so the bsp's rdtsc was 0.6 to 0.9 s behind the aps'. every tsc clock in
+    //  the kernel (Timer::GetRealMs64, the display drivers' timeouts) then jumped by
+    //  that much whenever a timestamp taken on one cpu was compared on another: the
+    //  page flip driver saw "250 ms without a latch" a few ms after the boot
+    //  animation's ap handed the screen to the gui on the bsp. the counters under the
+    //  msr are synchronous from reset, so writing 0 on every cpu makes rdtsc agree
+    //  everywhere. it runs before anything keeps a tsc base (bsp: early in
+    //  kernel_main, aps: first thing in ap_entry). kurono.tscadjust=0 keeps the
+    //  firmware values. (satoru)
+    const uint32_t MSR_IA32_TSC_ADJUST = 0x3Bu;
+    bool    g_tscadj_fix = true;
+    bool    g_tscadj_have = false;                 // cpuid.7.0:ebx[1] on the bsp (satoru)
+    int64_t g_tscadj_boot[SMP_MAX_CPUS] = {};      // firmware value per dense cpu index (satoru)
+    uint32_t g_tscadj_nonzero = 0;
+
+    //  cr0/cr4 policy (kurono.wp, see SMP::CrPolicyBsp). the values each cpu came
+    //  in with and left with, so the bsp can log the aps (no serial on an ap). (satoru)
+    const uint64_t CR0_WP_BIT = 1ULL << 16;
+    const uint64_t CR0_NE_BIT = 1ULL << 5;
+    const uint64_t CR4_POLICY_MASK = (1ULL << 20) | (1ULL << 11);   // smep, umip (satoru)
+    volatile bool g_wp_on = false;
+    uint64_t g_cr4_bsp_set = 0;
+    uint64_t g_cr0_in[SMP_MAX_CPUS] = {}, g_cr0_out[SMP_MAX_CPUS] = {};
+    uint64_t g_cr4_in[SMP_MAX_CPUS] = {}, g_cr4_out[SMP_MAX_CPUS] = {};
+    volatile uint8_t g_wp_suspended[SMP_MAX_CPUS] = {};
+    volatile uint32_t g_wp_suspended_any = 0;   // fast path for WpRearm (satoru)
+    uint64_t g_wp_fault_rip[SMP_MAX_CPUS] = {};  // the store WP was suspended for (satoru)
+    uint64_t g_wp_last_va[SMP_MAX_CPUS] = {};
+    volatile uint32_t g_wp_fallback_logs = 0;
+    volatile uint64_t g_wp_fallback_count = 0;
+    uint64_t g_wp_stale_va[SMP_MAX_CPUS] = {};
+    uint32_t g_wp_stale_n[SMP_MAX_CPUS] = {};
+
+    inline uint64_t read_cr0() { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
+    inline uint64_t read_cr4() { uint64_t v; __asm__ volatile("mov %%cr4, %0" : "=r"(v)); return v; }
+    inline void write_cr0(uint64_t v) { __asm__ volatile("mov %0, %%cr0" :: "r"(v) : "memory"); }
+    inline void write_cr4(uint64_t v) { __asm__ volatile("mov %0, %%cr4" :: "r"(v) : "memory"); }
+
+    void cr_log(uint32_t idx) {
+        SerialLogger::Log("[cr] cpu"); SerialLogger::LogDec((int)idx);
+        SerialLogger::Log(" cr0 in="); SerialLogger::LogHex64(g_cr0_in[idx]);
+        SerialLogger::Log(" out="); SerialLogger::LogHex64(g_cr0_out[idx]);
+        SerialLogger::Log(" wp "); SerialLogger::LogDec((g_cr0_in[idx] & CR0_WP_BIT) ? 1 : 0);
+        SerialLogger::Log("->"); SerialLogger::LogDec((g_cr0_out[idx] & CR0_WP_BIT) ? 1 : 0);
+        SerialLogger::Log(" cd "); SerialLogger::LogDec((g_cr0_out[idx] >> 30) & 1 ? 1 : 0);
+        SerialLogger::Log(" | cr4 in="); SerialLogger::LogHex64(g_cr4_in[idx]);
+        SerialLogger::Log(" out="); SerialLogger::LogHex64(g_cr4_out[idx]);
+        SerialLogger::Log(" smep "); SerialLogger::LogDec((g_cr4_out[idx] >> 20) & 1 ? 1 : 0);
+        SerialLogger::Log(" smap "); SerialLogger::LogDec((g_cr4_out[idx] >> 21) & 1 ? 1 : 0);
+        SerialLogger::Log(" umip "); SerialLogger::LogDec((g_cr4_out[idx] >> 11) & 1 ? 1 : 0);
+        SerialLogger::Log("\r\n");
+    }
+
+    bool tsc_adjust_supported() {
+        uint32_t a, b, c, d;
+        cpuid_ex(0, 0, &a, &b, &c, &d);
+        if (a < 7) return false;
+        cpuid_ex(7, 0, &a, &b, &c, &d);
+        return (b & (1u << 1)) != 0;
+    }
+
+    //  returns what the firmware left on the calling cpu; writes 0 over a nonzero
+    //  value unless the kill switch is set. no serial (an ap calls it). (satoru)
+    int64_t tsc_adjust_sanitize_this_cpu() {
+        if (!g_tscadj_have || !tsc_adjust_supported()) return 0;
+        int64_t v = (int64_t)rdmsr(MSR_IA32_TSC_ADJUST);
+        if (v != 0 && g_tscadj_fix) wrmsr(MSR_IA32_TSC_ADJUST, 0);
+        return v;
+    }
+
+    void tsc_adjust_log(uint32_t idx, int64_t v) {
+        SerialLogger::Log("[tsc] cpu"); SerialLogger::LogDec((int)idx);
+        SerialLogger::Log(" firmware tsc_adjust 0x"); SerialLogger::LogHex64((uint64_t)v);
+        // ticks do not fit LogDec; the ms figure is what matters (2.88 ghz laptop
+        // tsc: 2880000 ticks per ms, the calibrated rate is not known this early
+        // on the bsp, so the line gives mega-ticks). (satoru)
+        int64_t mt = v / 1000000;
+        SerialLogger::Log(" ("); SerialLogger::LogDec((int)mt); SerialLogger::Log(" M ticks)");
+        SerialLogger::Log(g_tscadj_fix ? ", forced to 0\r\n" : ", KEPT (kurono.tscadjust=0)\r\n");
+    }
+
     //  wait (bounded) for the previous ipi to leave the icr (delivery status, bit 12). (satoru)
     void icr_idle() {
         for (int i = 0; i < 100000 && (SMP::LapicRead(0x300) & (1u << 12)); i++)
@@ -154,6 +247,23 @@ namespace {
     }
     inline void mmio_w32(uint64_t addr, uint32_t val) {
         *(volatile uint32_t*)(uintptr_t)addr = val;
+    }
+    //  one ipi, atomically: x2apic takes the full 32-bit destination and the low
+    //  half in ONE write to msr 0x830 (the old split 0x310/0x300 emulation kept
+    //  the high half in a global, so two cpus sending at once could swap
+    //  destinations, and it kept only 8 id bits). wrmsr to the x2apic block is not
+    //  serializing: fence first like linux weak_wrmsr_fence, so the stores the
+    //  target will look at are visible before the ipi lands. xapic: the two mmio
+    //  writes as before. (satoru)
+    void icr_send(uint32_t dest, uint32_t low) {
+        if (g_lapic_dead) return;
+        if (g_x2apic) {
+            __asm__ volatile("mfence; lfence" ::: "memory");
+            wrmsr(0x830, ((uint64_t)dest << 32) | low);
+            return;
+        }
+        mmio_w32(g_lapic_base + 0x310, dest << 24);
+        mmio_w32(g_lapic_base + 0x300, low);
     }
 
     bool sig4(const uint8_t* p, const char* s) {
@@ -205,6 +315,7 @@ namespace {
     uint8_t  g_boot_rsdp[64];
     uint32_t g_boot_rsdp_len = 0;
     bool     g_boot_efi = false;
+    uint64_t g_boot_systab = 0;
     uint32_t g_max_cpus_req = 0;
 
     //  the kernel identity map covers 0..512 GiB (kurono_boot.asm, 2 MiB pages), so
@@ -267,9 +378,18 @@ namespace {
         if (g_cand_n < 256) g_cand[g_cand_n++] = id;
     }
 
+    //  apic id -> dense index. x2apic ids can be >= 256 (the 256-entry map only
+    //  covers xapic ids), so larger ones fall back to a scan of the registered
+    //  cpus. -1 = unknown. (satoru)
+    int apicid_index(uint32_t apic_id) {
+        if (apic_id < 256) return g_apicid_to_index[apic_id];
+        for (uint32_t i = 0; i < g_cpu_count; i++) if (g_cpus[i].apic_id == apic_id) return (int)i;
+        return -1;
+    }
+
     void register_cpu(uint32_t apic_id) {
         if (g_cpu_count >= SMP_MAX_CPUS) return;
-        if (apic_id < 256 && g_apicid_to_index[apic_id] >= 0) return;  // dup (satoru)
+        if (apicid_index(apic_id) >= 0) return;  // dup (satoru)
         uint32_t idx = g_cpu_count++;
         g_cpus[idx].user_rsp_save = 0;
         g_cpus[idx].kernel_rsp = 0;
@@ -309,7 +429,9 @@ namespace {
             }
             if (have && id != 0xFFFFFFFFu) {
                 if (flags & 1) {
-                    if (id >= 255) { big++; g_cand_skipped++; }   // xapic cannot address it (satoru)
+                    // the x2apic icr carries a 32-bit destination, so with the lapic in
+                    // x2apic mode every enabled id is reachable. (satoru)
+                    if (id >= 255 && !g_x2apic) { big++; g_cand_skipped++; }   // xapic cannot address it (satoru)
                     else add_candidate(id);
                 } else if (flags & 2) { hot++; g_cand_skipped++; }
             }
@@ -341,6 +463,8 @@ void BootAcpi::SetRsdp(const uint8_t* src, uint32_t avail) {
     g_boot_rsdp_len = len;
 }
 void     BootAcpi::SetEfiBoot() { g_boot_efi = true; }
+void     BootAcpi::SetSystemTable(uint64_t st) { g_boot_systab = st; }
+uint64_t BootAcpi::SystemTable() { return g_boot_systab; }
 uint64_t BootAcpi::Rsdp()       { return g_boot_rsdp_len ? (uint64_t)(uintptr_t)g_boot_rsdp : 0; }
 bool     BootAcpi::IsEfiBoot()  { return g_boot_efi; }
 void     SMP::SetMaxCpus(uint32_t n) { g_max_cpus_req = n; }
@@ -406,8 +530,9 @@ void SMP::Init() {
             SerialLogger::LogHex64(apic_base_msr); SerialLogger::Log("\r\n");
         } else if (xr == 2) {
             g_x2apic = true;
-            SerialLogger::Log("[SMP] !!! x2apic is LOCKED on (legacy xapic disabled by hardware): "
-                              "driving the lapic through msrs, single cpu only\r\n");
+            SerialLogger::Log(g_x2apic_test == 2
+                ? "[SMP] x2apic treated as LOCKED on (kurono.forcex2apic / x2apictest=2): driving the lapic through msrs, aps started via the x2apic icr\r\n"
+                : "[SMP] x2apic is LOCKED on (legacy xapic disabled by hardware): driving the lapic through msrs, aps started via the x2apic icr\r\n");
         } else {
             g_lapic_dead = true;
             SerialLogger::Log("[SMP] !!! x2apic disable did not take, apic_base "); SerialLogger::LogHex64(apic_base_msr);
@@ -460,7 +585,10 @@ void SMP::Init() {
     else if (BootAcpi::IsEfiBoot() && !Scheduler::SchedV2()) { cap = 8; cap_default = true; }
     if (cap > SMP_MAX_CPUS) cap = SMP_MAX_CPUS;
     if (cap < 1) cap = 1;
-    if (g_x2apic || g_lapic_dead) cap = 1;   // aps cannot be brought up without a usable xapic path (satoru)
+    // x2apic locked on: the aps come up through the msr icr (icr_send) and enable
+    // x2apic themselves in ap_entry, so the cap no longer applies. a dead lapic
+    // still means one cpu. (satoru)
+    if (g_lapic_dead) cap = 1;
 
     uint32_t available = 0;
     if (madt) {
@@ -513,6 +641,7 @@ void SMP::Init() {
 }
 
 uint32_t SMP::CpuCount() { return g_cpu_count ? g_cpu_count : 1; }
+uint64_t SMP::KernelStackBytes() { return g_ap_stack_bytes; }
 
 uint32_t SMP::OnlineCount() {
     uint32_t n = 0;
@@ -542,8 +671,8 @@ uint32_t SMP::CpuIndex() {
         (void)lo; (void)hi;
         if (aux && aux <= g_cpu_count) return aux - 1;
     }
-    uint32_t id = ApicId();
-    if (id < 256 && g_apicid_to_index[id] >= 0) return (uint32_t)g_apicid_to_index[id];
+    int ix = apicid_index(ApicId());
+    if (ix >= 0) return (uint32_t)ix;
     return 0;  // unknown -> treat as bsp (satoru)
 }
 
@@ -593,22 +722,48 @@ void SMP::LapicEnable() {
 //  no shared serial here - the bsp logs each core after its online flag flips,
 //  so there is no cross-core console race. (satoru)
 extern "C" void ap_entry() {
+    // before this cpu reads time: make its rdtsc agree with the bsp's (see
+    // tsc_adjust_sanitize_this_cpu). the value is logged by the bsp. (satoru)
+    int64_t fw_tsc_adjust = tsc_adjust_sanitize_this_cpu();
     // match the bsp's mode before the first lapic mmio access: an ap that comes out of
     // INIT-SIPI with x2apic still on (firmware left it) would hit the dead window. no
     // serial here (shared console); the bsp reports the outcome via the online flag. (satoru)
-    (void)x2apic_to_xapic();
+    // with the bsp in x2apic mode (locked by firmware, or kurono.forcex2apic) the ap
+    // must be in x2apic mode too: the msr block is the only lapic interface then, and
+    // a locked x2apic cannot be turned off anyway. the firmware usually hands the aps
+    // over in x2apic already (INIT keeps the mode); otherwise enable it here, EN
+    // before EXTD (xapic -> x2apic is the legal transition), before any lapic access. (satoru)
+    if (g_x2apic) {
+        uint64_t ab = rdmsr(0x1B);
+        if (!(ab & (1ULL << 11))) { ab |= (1ULL << 11); wrmsr(0x1B, ab); }
+        if (!(ab & (1ULL << 10))) wrmsr(0x1B, ab | (1ULL << 10));
+    } else {
+        (void)x2apic_to_xapic();
+    }
+    // same pat as the bsp (kurono_boot.asm): pat1 = write-combining, so a wc
+    // framebuffer mapping is wc on this cpu too, not the reset default (write-
+    // through). before any framebuffer access from this cpu. (satoru)
+    {
+        uint64_t pat = rdmsr(0x277);
+        pat = (pat & ~0xFF00ULL) | 0x0100ULL;
+        wrmsr(0x277, pat);
+    }
     SMP::LapicEnable();
     // sched=2 fast CpuIndex: program this cpu's tsc_aux = index+1 BEFORE anything
     // calls CpuIndex (SetupAPCpuState does, right below). the index comes from
     // the lapic map directly. (satoru)
     if (g_tscaux) {
-        uint32_t aid = SMP::ApicId();
-        int ix = (aid < 256) ? g_apicid_to_index[aid] : -1;
+        int ix = apicid_index(SMP::ApicId());
         wrmsr(MSR_TSC_AUX, ix >= 0 ? (uint64_t)(ix + 1) : 0);
     }
     HAL::SetupAPCpuState();  // own gdt+tss, shared idt, per-core syscall msrs (satoru)
     SMP::SetupGsBase();      // KERNEL_GS_BASE -> this ap's PerCpu (after the gs reload) (satoru)
     PerCpu* me = SMP::Current();
+    {
+        uint32_t ix = SMP::CpuIndex();
+        if (ix < SMP_MAX_CPUS) g_tscadj_boot[ix] = fw_tsc_adjust;   // before online: the bsp reads it then (satoru)
+    }
+    SMP::ApplyCrPolicyAp();   // same cr0.wp/ne + cr4 smep/umip as the bsp, before online: the bsp logs it (satoru)
     if (me) me->online = 1;
 
     //  phase 4 - arm a per-ap LAPIC timer (vector 0x40, periodic) so user threads
@@ -628,6 +783,7 @@ extern "C" void ap_entry() {
         // widened a save/resume race window. back to the proven 10 ms grain.)
         // (satoru)
         uint32_t period = ticks_10ms ? ticks_10ms : 1000000u;   // ticks in 10 ms (satoru)
+        { uint32_t ix = SMP::CpuIndex(); if (ix < SMP_MAX_CPUS) g_lapic_10ms[ix] = period; }
         SMP::LapicWrite(0x320, 0x40u | (1u << 17));   // LVT timer: vector 0x40, periodic (satoru)
         SMP::LapicWrite(0x380, period);                // arm (satoru)
         __asm__ volatile("sti");                       // let the timer fire on this ap (satoru)
@@ -673,6 +829,11 @@ extern "C" [[noreturn]] void ap_dispatch_reenter() {
         // ran, which kept a reaped task's stack from ever being freed - and an
         // interrupt through ist1 would have landed on a freed stack. (satoru)
         if (Scheduler::SchedV2()) { PerCpu* mc = SMP::Current(); if (mc && mc->kernel_stack_top && !Userspace::SessionIdleRsp(idx)) HAL::SetKernelStack(mc->kernel_stack_top); }
+        // kurono.svccpu: this ap hosts kernel procs (the desktop, the media and
+        // network services, the vm host) and never a user task. it leaves the
+        // dispatch loop for good, before it could claim the boot animation job:
+        // the gui ends that job, and the gui may live right here. (satoru)
+        if (Scheduler::IsServiceCpu(idx)) Scheduler::ServiceCpuLoop();
         // boot animation job: one ap draws the emblem while the bsp boots; it
         // returns here once the gui process takes the screen over. (satoru)
         if (BootAnim::ApPending()) BootAnim::ApService();
@@ -828,8 +989,7 @@ static void send_fixed_ipi(uint32_t idx, uint8_t vec) {
     uint64_t fl;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
     icr_idle();
-    SMP::LapicWrite(0x310, g_cpus[idx].apic_id << 24);
-    SMP::LapicWrite(0x300, (1u << 14) | vec);   // fixed, assert, physical (satoru)
+    icr_send(g_cpus[idx].apic_id, (1u << 14) | vec);   // fixed, assert, physical (satoru)
     icr_idle();
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
@@ -849,12 +1009,89 @@ void SMP::KickOneIdle() {
     for (uint32_t k = 0; k < g_cpu_count; k++) {
         uint32_t c = 1u + (start + k) % (g_cpu_count - 1u);   // aps only (satoru)
         if (c == me || !g_cpus[c].online) continue;
+        if (Scheduler::IsServiceCpu(c)) continue;   // runs no user task (satoru)
         uint8_t one = 1;
         if (!__atomic_compare_exchange_n(&g_cpu_idle[c], &one, (uint8_t)0, false,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
         send_fixed_ipi(c, 0x42);
         return;
     }
+}
+
+// retune the calling ap's periodic lapic timer (vector 0x40) from the 10 ms
+// calibration ap_entry made. a service cpu runs at 1 khz so its kernel procs'
+// SleepMs(1) means 1 ms, as on cpu 0's pit. (satoru)
+void SMP::SetLapicTickHz(uint32_t hz) {
+    uint32_t ix = CpuIndex();
+    if (ix == 0 || ix >= SMP_MAX_CPUS || !hz || !g_lapic_10ms[ix]) return;
+    uint64_t c = (uint64_t)g_lapic_10ms[ix] * 100u / hz;
+    if (c < 16) c = 16;
+    LapicWrite(0x320, 0x40u | (1u << 17));   // vector 0x40, periodic (satoru)
+    LapicWrite(0x380, (uint32_t)c);
+}
+
+// bsp tick from the lapic timer (1112 laptop panic). with 20 cpus online cpu0 took
+// interrupts on vectors nothing sends: 0 (eight times in the first 10 s, each with
+// the 8259's irq0 in service), then 0xa9 (#gp on the empty gate) or 4 (#OF), always
+// halted in SleepMs. with one cpu online, on the same machine, never. the pit tick
+// reached cpu0 as extint through lint0, the only extint user, and with other cpus
+// sending ipis that legacy inta path returns a wrong vector. no mainstream kernel
+// drives a modern machine like that (linux masks the 8259 and ticks from the lapic
+// timer). so with 2+ cpus the bsp ticks from its own lapic timer on vector 32, the
+// pit irq0 is masked at the 8259, and the vector 32 path is unchanged (pit_ticks,
+// OnTimerTick, the kls preempt hook) apart from the lapic eoi. the pit still counts
+// for Timer::ReadCounter. needs arat (the timer runs in every c-state) or a
+// hypervisor, else the pit stays. (satoru)
+static volatile bool g_bsp_lapic_tick = false;
+bool SMP::BspLapicTickActive() { return g_bsp_lapic_tick; }
+void SMP::TestSelfIpi(uint8_t vec) {
+    uint32_t me = CpuIndex();
+    if (g_lapic_dead || me >= g_cpu_count) return;
+    icr_send(g_cpus[me].apic_id, (1u << 14) | vec);   // fixed, assert, physical (satoru)
+}
+
+void SMP::StartBspLapicTick(int mode) {
+    if (mode < 0) {
+        SerialLogger::Log("[tick] bsp: pit through the 8259 (kurono.bsptick=pit)\r\n");
+        return;
+    }
+    if (g_lapic_dead || g_lapic_base == 0) return;
+    if (mode == 0 && OnlineCount() < 2) return;   // one cpu: no ipis, the pit as before (satoru)
+    uint32_t a, b, c, d;
+    cpuid_ex(6, 0, &a, &b, &c, &d);
+    bool arat = (a >> 2) & 1;
+    if (!arat && !CPUDetect::IsHypervisor()) {
+        SerialLogger::Log("[tick] bsp: no arat, the lapic timer may stop when idle: keeping the pit\r\n");
+        return;
+    }
+    uint32_t tpr = LapicRead(0x80);
+    if ((tpr & 0xF0) >= 0x20) {
+        // a task priority at or above class 2 would hold vector 32 back. (satoru)
+        SerialLogger::Log("[tick] bsp: tpr was 0x"); SerialLogger::LogHex(tpr); SerialLogger::Log(", now 0\r\n");
+        LapicWrite(0x80, 0);
+    }
+    // calibrate as ap_entry does: divide by 16, masked one-shot from the top, 10 ms. (satoru)
+    LapicWrite(0x3E0, 0x3);
+    LapicWrite(0x320, (1u << 16));
+    LapicWrite(0x380, 0xFFFFFFFFu);
+    busy_us(10000);
+    uint32_t t10 = 0xFFFFFFFFu - LapicRead(0x390);
+    LapicWrite(0x380, 0);
+    if (t10 < 1000u) {   // under 100 khz: not believable, keep the pit (satoru)
+        SerialLogger::Log("[tick] bsp: lapic timer calibration failed (");
+        SerialLogger::LogDec((int)t10); SerialLogger::Log(" in 10 ms): keeping the pit\r\n");
+        return;
+    }
+    uint32_t per_ms = t10 / 10u;
+    g_bsp_lapic_tick = true;                     // before the first tick: it needs the lapic eoi (satoru)
+    LapicWrite(0x320, 0x20u | (1u << 17));       // vector 32, periodic (satoru)
+    LapicWrite(0x380, per_ms);
+    HAL::DisableIRQ(0);                          // pit irq0 off at the 8259 (satoru)
+    SerialLogger::Log("[tick] bsp: 1 khz from the lapic timer on vector 32 (");
+    SerialLogger::LogDec((int)per_ms);
+    SerialLogger::Log(" counts/ms), pit irq0 masked at the 8259");
+    SerialLogger::Log(arat ? "" : " (no arat, hypervisor)");
+    SerialLogger::Log("\r\n");
 }
 
 // like KickOneIdle, but only an idle ap that may run `p` (affinity, the clone pin, a
@@ -918,15 +1155,42 @@ void SMP::ApIdleFrame(InterruptFrame* f) {
 // ack was the main cost of every munmap/mprotect once idle aps halt (sampled:
 // the kls holder in BroadcastTlbFlush while every other cpu spun on kls). a cpu
 // counts as done when it acked this round OR is observed halted. (satoru)
+// a cpu waiting for the broadcast lock may have IF=0 (cow / demand-zero quarantine
+// flushes from #PF, the kstack guard install), so it cannot take the holder's 0x41
+// ipi and, not being idle, held that round up for the whole 20 ms timeout - and a
+// timed-out round never advances the full-flush epoch, so quarantined frames piled
+// up (audit 11-07 #10). the waiter services a pending round itself: reload cr3 and
+// ack it, with IF off so the real ipi cannot interleave on this cpu. sched=2 only:
+// its acks are per-cpu round numbers read before the reload, so a late or repeated
+// ack can never count toward a newer round. the old mode's shared ack COUNTER cannot
+// tell rounds apart - an inline ack read for round N could land after the next
+// holder's reset and count for N+1 (review finding) - so it keeps the old spin. (satoru)
+static void tlb_service_pending_inline_v2() {
+    uint32_t me = SMP::CpuIndex();
+    if (me >= SMP_MAX_CPUS) return;
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) : : "memory");
+    uint64_t s = __atomic_load_n(&g_tlb_flush_start_seq, __ATOMIC_ACQUIRE);
+    if (s > __atomic_load_n(&g_tlb_acked_seq[me], __ATOMIC_RELAXED)) {
+        uint64_t c3v;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(c3v));
+        __asm__ volatile("mov %0, %%cr3" : : "r"(c3v) : "memory");
+        __atomic_store_n(&g_tlb_acked_seq[me], s, __ATOMIC_RELEASE);
+    }
+    if (fl & 0x200) __asm__ volatile("sti" : : : "memory");
+}
+
 static void broadcast_tlb_flush_v2() {
     static volatile uint32_t s_bcast_lock2 = 0;
-    while (__atomic_exchange_n(&s_bcast_lock2, 1u, __ATOMIC_ACQUIRE))
+    while (__atomic_exchange_n(&s_bcast_lock2, 1u, __ATOMIC_ACQUIRE)) {
+        tlb_service_pending_inline_v2();   // audit 11-07 #10 (satoru)
         __asm__ volatile("pause");
+    }
     uint64_t seq = __atomic_add_fetch(&g_tlb_flush_start_seq, 1u, __ATOMIC_SEQ_CST);
     uint32_t me = SMP::CpuIndex();
     for (int i = 0; i < 100000 && (SMP::LapicRead(0x300) & (1u << 12)); i++)
         __asm__ volatile("pause");
-    SMP::LapicWrite(0x300, (3u << 18) | (1u << 14) | 0x41u);
+    icr_send(0, (3u << 18) | (1u << 14) | 0x41u);   // shorthand: dest unused (satoru)
     uint64_t t0 = Timer::GetRealMs64();
     for (;;) {
         bool all = true;
@@ -974,7 +1238,7 @@ void SMP::BroadcastTlbFlush() {
     for (int i = 0; i < 100000 && (LapicRead(0x300) & (1u << 12)); i++)
         __asm__ volatile("pause");
     //  fixed delivery, assert, destination shorthand 11 = all excluding self. (satoru)
-    LapicWrite(0x300, (3u << 18) | (1u << 14) | 0x41u);
+    icr_send(0, (3u << 18) | (1u << 14) | 0x41u);   // shorthand: dest unused (satoru)
     //  ack wait: the old ~sub-ms pause bound silently missed any peer holding
     //  IF=0 longer than that - and a single serial line is an ~8.7ms ring-0
     //  uart busy-wait. a peer that misses the ipi keeps a STALE translation
@@ -1020,6 +1284,7 @@ uint32_t SMP::TlbFlushTimeouts() {
 }
 
 void SMP::HandleTlbIpi() {
+    DbgWatch::ApplyThisCpu();   // kurono.dbgwatch rides the shootdown ipi (satoru)
     if (Scheduler::SchedV2()) {
         uint64_t s = __atomic_load_n(&g_tlb_flush_start_seq, __ATOMIC_ACQUIRE);
         uint64_t c3v;
@@ -1043,8 +1308,9 @@ void SMP::LoadKernelCr3() {
     if (!k) return;
     uint64_t c3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(c3));
-    if (c3 == k) return;
+    if (c3 == k) { KernelVMM::NoteCr3(k); return; }
     __asm__ volatile("mov %0, %%cr3" : : "r"(k) : "memory");
+    KernelVMM::NoteCr3(k);   // [asdead] (satoru)
 }
 
 uint64_t SMP::TlbFlushStartSeq() {
@@ -1062,6 +1328,11 @@ void SMP::StartAPs() {
     {
         uint64_t kc3;
         __asm__ volatile("mov %%cr3, %0" : "=r"(kc3));
+        // the ap trampoline loads cr3 with a 32-bit `mov cr3,eax` before it
+        // enables long mode, so the kernel root itself must live below 4 gb.
+        // RelocateKernelRoot copies the tables wherever the pmm likes; move
+        // the root again (the tables under it may stay high) if needed. (satoru)
+        kc3 = KernelVMM::EnsureRootBelow4GB();
         g_kernel_cr3 = kc3;
     }
     if (g_cpu_count <= 1) {
@@ -1084,10 +1355,24 @@ void SMP::StartAPs() {
 
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    if (cr3 >> 32) {
+        // no below-4gb root could be allocated: do not hand the trampoline a
+        // truncated cr3 (that would walk random tables). boot uniprocessor.
+        SerialLogger::Log("[SMP] kernel root 0x");
+        SerialLogger::LogHex64(cr3);
+        SerialLogger::Log(" is above 4 gb, AP trampoline disabled\r\n");
+        return;
+    }
     *p_cr3 = cr3;
 
     struct __attribute__((packed)) { uint16_t limit; uint64_t base; } gdtr;
     __asm__ volatile("sgdt %0" : "=m"(gdtr));
+    // the trampoline does lgdt in 32-bit mode before the far jump, so the base
+    // field must be the physical address of the gdt. the gdt lives in the
+    // high-linked kernel image now, so it needs the image translation. the
+    // identity map still maps that physical page, which is what makes the
+    // truncated 32-bit lgdt operand valid. (satoru)
+    gdtr.base = KernelPhysOf((const void*)(uintptr_t)gdtr.base);
     const uint8_t* g = (const uint8_t*)&gdtr;
     for (int k = 0; k < 10; k++) p_gdt[k] = g[k];
 
@@ -1105,6 +1390,7 @@ void SMP::StartAPs() {
             continue;
         }
         *p_stack = (uint64_t)(uintptr_t)stk + STACK_SZ;   // top, grows down (satoru)
+        g_ap_stack_bytes += STACK_SZ;
         g_cpus[i].kernel_stack_top = *p_stack;
         g_cpus[i].online = 0;
 
@@ -1114,16 +1400,14 @@ void SMP::StartAPs() {
         // icr idle, 10ms, level INIT deassert, icr idle, then two STARTUPs (300us
         // then 200us after each, icr idle between). every wait is bounded by a
         // pause-iteration cap as well as the tsc. (satoru)
-        LapicWrite(0x310, apic << 24);
-        LapicWrite(0x300, 0xC500);          // INIT, level, assert (satoru)
+        // icr_send: msr 0x830 with the full 32-bit id in x2apic mode. (satoru)
+        icr_send(apic, 0xC500);             // INIT, level, assert (satoru)
         icr_idle();
         busy_us(10000);
-        LapicWrite(0x310, apic << 24);
-        LapicWrite(0x300, 0x8500);          // INIT, level, deassert (satoru)
+        icr_send(apic, 0x8500);             // INIT, level, deassert (satoru)
         icr_idle();
         for (int s = 0; s < 2; s++) {
-            LapicWrite(0x310, apic << 24);
-            LapicWrite(0x300, 0x4600 | vector);  // STARTUP + trampoline vector (satoru)
+            icr_send(apic, 0x4600 | vector);     // STARTUP + trampoline vector (satoru)
             busy_us(300);
             icr_idle();
             busy_us(200);
@@ -1140,8 +1424,13 @@ void SMP::StartAPs() {
         SerialLogger::Log(g_cpus[i].online ? " online (apic " : " FAILED to start (apic ");
         SerialLogger::LogDec((int)apic);
         SerialLogger::Log(", type ");
-        SerialLogger::Log(apic < 255 ? "lapic" : "x2apic");
+        SerialLogger::Log(g_x2apic ? "x2apic" : (apic < 255 ? "lapic" : "x2apic"));
         SerialLogger::Log(")\r\n");
+        if (g_cpus[i].online && i < SMP_MAX_CPUS) cr_log(i);   // (satoru)
+        if (g_cpus[i].online && i < SMP_MAX_CPUS && g_tscadj_boot[i] != 0) {
+            g_tscadj_nonzero++;
+            tsc_adjust_log(i, g_tscadj_boot[i]);
+        }
         // a dead madt or a dead trampoline fails every ap the same way: stop after
         // a few in a row instead of burning 500ms each. (satoru)
         if (g_cpus[i].online) consecutive_fail = 0;
@@ -1154,5 +1443,125 @@ void SMP::StartAPs() {
     SerialLogger::Log("[SMP] "); SerialLogger::LogDec((int)OnlineCount());
     SerialLogger::Log("/"); SerialLogger::LogDec((int)g_cpu_count);
     SerialLogger::Log(" cpus online\r\n");
+    if (g_tscadj_have) {
+        SerialLogger::Log("[tsc] tsc_adjust checked on "); SerialLogger::LogDec((int)OnlineCount());
+        SerialLogger::Log(" cpus: "); SerialLogger::LogDec((int)g_tscadj_nonzero);
+        SerialLogger::Log(g_tscadj_nonzero == 0 ? " nonzero, rdtsc already agreed\r\n"
+                          : (g_tscadj_fix ? " nonzero, all forced to 0 (rdtsc now agrees across cpus)\r\n"
+                                          : " nonzero and KEPT, rdtsc differs across cpus (kurono.tscadjust=0)\r\n"));
+    }
 }
+
+void SMP::TscAdjustBoot(bool fix, bool inject_test) {
+    g_tscadj_fix = fix;
+    g_tscadj_have = tsc_adjust_supported();
+    if (!g_tscadj_have) return;   // older cpu or a hypervisor without the msr: nothing to do, nothing logged (satoru)
+    if (inject_test) {
+        // kurono.tscadjust.test=1: put the laptop's firmware value on the bsp
+        // so the sanitize (or, with kurono.tscadjust=0, the skew itself) can be
+        // exercised under kvm. (satoru)
+        wrmsr(MSR_IA32_TSC_ADJUST, (uint64_t)(int64_t)-1797404919LL);
+        SerialLogger::Log("[tsc] test: bsp tsc_adjust set to the laptop's firmware value (kurono.tscadjust.test=1)\r\n");
+    }
+    int64_t v = tsc_adjust_sanitize_this_cpu();
+    g_tscadj_boot[0] = v;
+    if (v != 0) {
+        g_tscadj_nonzero++;
+        tsc_adjust_log(0, v);
+    }
+}
+
+void SMP::CrPolicyBsp(bool wp_on, uint64_t cr4_set) {
+    g_wp_on = wp_on;
+    g_cr4_bsp_set = cr4_set & CR4_POLICY_MASK;
+    g_cr0_in[0] = read_cr0();
+    g_cr4_in[0] = read_cr4();
+    uint64_t cr0 = g_cr0_in[0] | CR0_NE_BIT;
+    // flag off: keep the WP bit this cpu came in with (an efi bsp keeps the
+    // firmware's WP=1 as before; the default flips only after a laptop test). (satoru)
+    if (wp_on) cr0 |= CR0_WP_BIT;
+    if (cr0 != g_cr0_in[0]) write_cr0(cr0);
+    // the caller writes the bsp's cr4 bits itself, right after this. (satoru)
+    g_cr0_out[0] = read_cr0();
+    g_cr4_out[0] = g_cr4_in[0] | g_cr4_bsp_set;
+    SerialLogger::Log(wp_on ? "[cr] kurono.wp=1: CR0.WP set on every cpu\r\n"
+                            : "[cr] CR0.WP left as each cpu booted (kurono.wp=1 sets it everywhere)\r\n");
+    cr_log(0);
+}
+
+void SMP::ApplyCrPolicyAp() {
+    uint32_t ix = CpuIndex();
+    if (ix >= SMP_MAX_CPUS) return;
+    uint64_t c0 = read_cr0(), c4 = read_cr4();
+    g_cr0_in[ix] = c0;
+    g_cr4_in[ix] = c4;
+    uint64_t n0 = c0 | CR0_NE_BIT;
+    if (g_wp_on) n0 |= CR0_WP_BIT;   // flag off: the trampoline's value, as before (satoru)
+    if (n0 != c0) write_cr0(n0);
+    // only bits this cpu reports itself (a hybrid part's cores agree, but a
+    // bit the ap lacks would #GP the cr4 write). (satoru)
+    uint32_t a = 0, b = 0, c = 0, d = 0, b7 = 0, c7 = 0;
+    cpuid_ex(0, 0, &a, &b, &c, &d);
+    if (a >= 7) cpuid_ex(7, 0, &a, &b7, &c7, &d);
+    uint64_t want = g_cr4_bsp_set;
+    if (!(b7 & (1u << 7))) want &= ~(1ULL << 20);
+    if (!(c7 & (1u << 2))) want &= ~(1ULL << 11);
+    if ((c4 | want) != c4) write_cr4(c4 | want);
+    g_cr0_out[ix] = read_cr0();
+    g_cr4_out[ix] = read_cr4();
+}
+
+bool SMP::WpOn() { return g_wp_on; }
+
+bool SMP::WpKernelWriteFallback(uint64_t cr2, uint64_t rip, uint64_t pte_flags) {
+    if (!(read_cr0() & CR0_WP_BIT)) return false;
+    uint32_t ix = CpuIndex();
+    if (ix >= SMP_MAX_CPUS) ix = 0;
+    uint64_t pg = cr2 & ~0xFFFULL;
+    // the live pte already allows the write: this cpu's tlb is stale (a sibling
+    // privatised the page). flush and retry, bounded per cpu. (satoru)
+    if ((pte_flags & PTE_PRESENT) && (pte_flags & PTE_WRITABLE) && (pte_flags & PTE_USER)) {
+        if (g_wp_stale_va[ix] != pg) { g_wp_stale_va[ix] = pg; g_wp_stale_n[ix] = 0; }
+        if (g_wp_stale_n[ix]++ < 8) {
+            KernelVMM::InvalidatePage(pg);
+            return true;
+        }
+    }
+    __atomic_add_fetch(&g_wp_fallback_count, 1, __ATOMIC_RELAXED);
+    // one line per site: a retry of the same store on this cpu is not logged again. (satoru)
+    bool same_site = (g_wp_fault_rip[ix] == rip && g_wp_last_va[ix] == pg);
+    g_wp_fault_rip[ix] = rip;
+    g_wp_last_va[ix] = pg;
+    if (!same_site && __atomic_add_fetch(&g_wp_fallback_logs, 1, __ATOMIC_RELAXED) <= 32) {
+        SerialLogger::Log("[wpro] ring-0 write to a read-only user page va=");
+        SerialLogger::LogHex64(cr2);
+        SerialLogger::Log(" rip="); SerialLogger::LogHex64(rip);
+        SerialLogger::Log(" pte="); SerialLogger::LogHex64(pte_flags);
+        SerialLogger::Log((pte_flags & PTE_COW) ? " COW-unresolved" : " ro");
+        SerialLogger::Log(" cpu"); SerialLogger::LogDec((int)ix);
+        SerialLogger::Log(" (no uaccess fixup: store runs with WP suspended)\r\n");
+    }
+    if (!g_wp_suspended[ix]) {
+        g_wp_suspended[ix] = 1;
+        __atomic_add_fetch(&g_wp_suspended_any, 1, __ATOMIC_RELEASE);
+    }
+    write_cr0(read_cr0() & ~CR0_WP_BIT);
+    return true;
+}
+
+void SMP::WpRearm(uint64_t rip) {
+    if (!__atomic_load_n(&g_wp_suspended_any, __ATOMIC_ACQUIRE)) return;
+    uint32_t ix = CpuIndex();
+    if (ix >= SMP_MAX_CPUS || !g_wp_suspended[ix]) return;
+    // an interrupt taken AT the suspended store (pending when the fault
+    // returned, or mid rep-movs) must not re-arm yet, or the store faults again
+    // forever under a steady interrupt load. re-arm once this cpu got past it. (satoru)
+    if (rip == g_wp_fault_rip[ix]) return;
+    g_wp_suspended[ix] = 0;
+    __atomic_sub_fetch(&g_wp_suspended_any, 1, __ATOMIC_RELEASE);
+    write_cr0(read_cr0() | CR0_WP_BIT);
+}
+
+int64_t SMP::TscAdjustFirmware(uint32_t idx) { return idx < SMP_MAX_CPUS ? g_tscadj_boot[idx] : 0; }
+bool SMP::TscAdjustKept() { return g_tscadj_have && !g_tscadj_fix && g_tscadj_nonzero != 0; }
 // end (satoru)

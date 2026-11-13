@@ -1,3 +1,4 @@
+#include "laptop_keys.h"   // system keys (satoru)
 #include "input_manager.h"
 #include "../ui/control_center.h"   // shell keyboard owner (satoru)
 #include "../kui/kui_kernel.h"   // kui key edges (satoru)
@@ -11,6 +12,7 @@
 #include "../drivers/mouse.h"
 #include "../drivers/usb.h"
 #include "../fs/vfs.h"
+#include "../system/screenshot.h"   // print screen key (satoru)
 #include "../apps/alpine_term.h"   // the alpine vm terminal takes raw keys (satoru)
 
 KeyboardDevice InputManager::devices[8];
@@ -185,6 +187,8 @@ void InputManager::Poll() {
         last_key = ev.key;
         last_key_pressed = ev.pressed;
         last_device_id = ev.device_id;
+        // mute / volume / brightness / wi-fi keys belong to the system. (satoru)
+        if (LaptopKeys::Handle(ev.key, ev.pressed)) continue;
         if (ev.pressed) OnKeyDown(ev.device_id, ev.key);
         else            OnKeyUp(ev.device_id, ev.key);
         // modifiers from the event stream itself, not the driver's latest state,
@@ -216,6 +220,19 @@ void InputManager::Poll() {
         if (ev.pressed && !was_held && k == (int)KEY_D &&
             (s_held[KEY_LSUPER] || s_held[KEY_RSUPER])) {
             WindowManager::ToggleShowDesktop();
+            continue;
+        }
+        // print screen belongs to the desktop: the whole screen, shift+print the
+        // focused window. the capture itself runs on the desktop frame. (satoru)
+        if (k == (int)KEY_PRINTSCREEN) {
+            if (ev.pressed && !was_held)
+                Screenshot::Request(s_held[KEY_LSHIFT] || s_held[KEY_RSHIFT]);
+            continue;
+        }
+        // arrows step an open switcher too, like tab and shift+tab. (satoru)
+        if (ev.pressed && WindowManager::IsTabSwitcherOpen() &&
+            (k == (int)KEY_LEFT || k == (int)KEY_RIGHT)) {
+            WindowManager::AltTabStep(k == (int)KEY_LEFT);
             continue;
         }
         // alt+tab drives the live switcher. tab steps are consumed; releasing

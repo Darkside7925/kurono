@@ -5,6 +5,7 @@
 #include "../drivers/serial.h"
 #include "../drivers/timer.h"
 #include "../kernel/types.h"
+#include "../kernel/heap.h"
 
 namespace {
     // about four seconds of 48 khz stereo s16: enough headroom for a host
@@ -13,7 +14,7 @@ namespace {
     const uint32_t HDR_BYTES  = 16;
     const char     HDR_MAGIC[4] = { 'K', 'W', 'A', 'U' };
 
-    uint8_t  g_buf[RING_BYTES];
+    uint8_t* g_buf = nullptr;       // 768 kb ring, first guest audio byte (satoru)
     uint32_t g_rd = 0, g_wr = 0, g_count = 0;
 
     bool     g_have_fmt = false;
@@ -29,6 +30,15 @@ namespace {
     bool     g_bad_hdr_logged = false;
     bool     g_open_fail_logged = false;
 
+    bool EnsureBuf() {
+        if (!g_buf) {
+            g_buf = (uint8_t*)KernelHeap::Alloc(RING_BYTES);
+            if (!g_buf) return false;
+            g_rd = g_wr = g_count = 0;
+        }
+        return true;
+    }
+
     void Advance(uint32_t n) {
         if (n > g_count) n = g_count;
         g_rd = (g_rd + n) % RING_BYTES;
@@ -36,6 +46,7 @@ namespace {
     }
 
     void Peek(uint8_t* dst, uint32_t n) {
+        if (!g_buf) return;
         uint32_t first = RING_BYTES - g_rd;
         if (first > n) first = n;
         for (uint32_t i = 0; i < first; i++) dst[i] = g_buf[g_rd + i];
@@ -43,7 +54,7 @@ namespace {
     }
 
     void Append(const uint8_t* p, uint32_t n) {
-        if (n == 0) return;
+        if (n == 0 || !EnsureBuf()) return;
         g_bytes_in += n;
         if (n > RING_BYTES) { p += n - RING_BYTES; n = RING_BYTES; }
         if (g_count + n > RING_BYTES) {
@@ -186,6 +197,7 @@ void VAudio::Pump() {
 
 void VAudio::Reset() {
     CloseStream();
+    if (g_buf) { KernelHeap::Free(g_buf); g_buf = nullptr; }
     g_rd = g_wr = g_count = 0;
     g_have_fmt = false;
     g_bad_hdr_logged = false;

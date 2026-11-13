@@ -70,6 +70,23 @@ public:
     static const PCIPassthroughEntry* Get(int slot);
     static void DumpStatus(char* out, int maxo);
 
+    // ---- generic passthrough into a `vm kurono` guest (satoru) ----
+    // kurono.vm.pt=BB:DD.F[,BB:DD.F] reserves devices at boot: host drivers
+    // skip them and the next kurono guest gets them. never a gpu, storage,
+    // or the laptop's 02:00.0 / 81:00.0 / 80:14.0. (satoru)
+    static void ParseReserveList(const char* s);
+    static bool IsReserved(uint8_t bus, uint8_t dev, uint8_t func);
+    static int  ReservedCount();
+    // after CreateVM: expose each reserved device on vpci, map its bars in
+    // ept, put it in a vt-d domain whose iova = guest physical. returns the
+    // number attached (needs vt-d; refuses otherwise). (satoru)
+    static int  AttachReserved(void* ept_root);
+    // before guest ram is freed: bus master off, domain released (satoru)
+    static void DetachGuest();
+    // hypervisor tick: the real device's INTx status -> a guest irq edge
+    // (INTx stays disabled on the host side) (satoru)
+    static void TickIntx();
+
     // delivered by hal when a passthrough device's real irq fires
     // - forwards to hypervisor as guest interrupt injection
     static void OnHostIRQ(uint8_t host_irq);

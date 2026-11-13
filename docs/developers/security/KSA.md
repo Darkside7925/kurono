@@ -73,6 +73,22 @@ inner `VMLAUNCH` would also put a CPU privilege boundary between the main OS and
 the prompt's *execution*, not just its memory. On bare metal with nested VMX (or
 on the host hypervisor), KSA takes the `nested-vm` path automatically.
 
+## The KSA switch
+
+Settings > Users & Security > Approval has a KSA toggle. It turns the whole KSA prompt off
+and on, on top of the per-factor policy below. KSA is meant to stay on.
+
+- Turning it on needs nothing.
+- Turning it off needs proof. Either the session is already root (an amdo approval), or the
+  account password is given. Five wrong passwords lock the off path for 30 seconds.
+- The password factor has to be on. The switch refuses to turn KSA off while it is not.
+- While KSA is off, amdo asks for the password only. The security log records
+  `ksa switched off (password-only)`.
+- The choice is saved as `security.ksa` in the UI config and read again at boot. It is on by
+  default.
+- The shell does the same with `ken policy ksa on|off`. Turning it off from the shell is
+  `amdo ken policy ksa off`.
+
 ## Auth policy (`ken policy`)
 
 The policy tracks two independent factors (`KENAuthPolicy`): `passwd_enabled`
@@ -88,7 +104,7 @@ and `kvault_enabled`. The effective mode is derived from them.
 | `ken passwd` | change password, **no KSA involved**, normal flow |
 | `ken selftest` | run the KSA isolation self-test (logs to serial) |
 
-Disabling KSA:
+Disabling the KSA factor (the `kvault` part of the policy, not the switch above):
 ```
 ken policy kvault disable --force --acknowledge-risk
 ```

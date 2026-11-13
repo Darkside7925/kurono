@@ -91,6 +91,10 @@ void TimeManager::ApplyNTPSeconds(uint32_t utc_s) {
     ntp_offset_s = diff;
 }
 
+void TimeManager::StepRealtimeSeconds(int32_t delta_s) {
+    __atomic_add_fetch(&ntp_offset_s, delta_s, __ATOMIC_RELEASE);   // read lock-free by the vdso tick (satoru)
+}
+
 void TimeManager::SetAllowAdjust(bool en) { allow_adjust = en; }
 
 static inline bool leap(uint16_t y) { return ((y % 4) == 0 && (y % 100) != 0) || ((y % 400) == 0); }

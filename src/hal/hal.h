@@ -40,6 +40,10 @@ public:
     static void EnableIRQ(uint8_t irq);   // unmask a specific irq line (0-15)
     static void DisableIRQ(uint8_t irq);  // mask a specific irq line
     static void SendEOI(uint8_t irq);     // send end-of-interrupt
+    // kurono.straytest=1: raise each stray-vector case once on this cpu (int 0xa9,
+    // a self ipi on 0xa9, int 4, the 8259 on vector base 0) and check the tick
+    // survives. needs interrupts on (a kernel proc). (satoru)
+    static void StrayVectorSelfTest();
 
     typedef void (*IRQHandler)(InterruptFrame*);
     static void RegisterIRQHandler(uint8_t irq, IRQHandler handler);  // irq 0-15
@@ -59,8 +63,8 @@ public:
 
     static void Reboot();
 
-    // soft power-off: try emulator/acpi poweroff ports, then fall back to
-    // halt. does not return on success. (satoru)
+    // soft power-off: acpi s5, then emulator/acpi poweroff ports, then the efi
+    // runtime reset service, then halt. does not return on success. (satoru)
     [[noreturn]] static void PowerOff();
 
     // acpi s3 suspend-to-ram. attempts to locate pm1a_cnt_blk + the \_s3
@@ -68,6 +72,35 @@ public:
     // false (and stays running) when the acpi tables cannot be parsed
     // safely. (satoru)
     static bool Suspend();
+
+    // acpi fadt reset register (the method linux tries first on modern intel
+    // laptops). returns false when the fadt has no usable reset register or
+    // the write did not take. (satoru)
+    static bool AcpiReset();
+
+    // acpi s5 soft off through pm1a_cnt_blk + \_S5. returns false when the
+    // tables cannot be parsed or the write did not take. (satoru)
+    static bool AcpiPowerOff();
+
+    // the panic path's reset: acpi fadt reset register, 0xcf9 (0x02 then 0x06),
+    // 8042 pulse (0xfe), triple fault. each step is logged and flushed to the
+    // disk log first, with ~0.5 s between steps. no efi runtime call: from a
+    // dying kernel it can fault or hang. interrupts off, never returns. skip
+    // mask (kurono.panic.noacpi / nocf9 / nokbd = 1 / 2 / 4) lets qemu show the
+    // fallbacks. (satoru)
+    [[noreturn]] static void PanicReset();
+    static void SetPanicResetSkip(uint32_t mask);
+
+    // efi runtime ResetSystem (type: 1 warm reset, 2 cold reset, 3 shutdown).
+    // returns false when the boot did not hand us a system table. (satoru)
+    static bool EfiReset(uint32_t type);
+
+    // arm the acpi power button fixed event and poll its status. the button
+    // must be serviced even on machines whose sci line this kernel does not
+    // route, so callers poll instead of relying on an irq. (satoru)
+    static bool AcpiPowerButtonInit();
+    static bool AcpiPowerButtonPressed();
+    static uint16_t AcpiPowerButtonStatus();
 
     static void    OutByte(uint16_t port, uint8_t  value);
     static uint8_t InByte(uint16_t port);
@@ -91,10 +124,15 @@ private:
 
 // per-cpu scheduler accounting: busy and total milliseconds, split by the
 // ring the timer interrupted. read by /proc/stat and /proc/<pid>/stat. (satoru)
-extern volatile uint64_t g_cpu_busy_ticks[16];
-extern volatile uint64_t g_cpu_total_ms[16];
-extern volatile uint64_t g_cpu_user_ms[16];
-extern volatile uint64_t g_cpu_sys_ms[16];
+// per-cpu accounting slots: every cpu Kurono brings up (SMP_MAX_CPUS). (satoru)
+constexpr int HAL_CPU_SLOTS = 32;
+extern volatile uint64_t g_cpu_busy_ticks[HAL_CPU_SLOTS];
+extern volatile uint64_t g_cpu_total_ms[HAL_CPU_SLOTS];
+extern volatile uint64_t g_cpu_user_ms[HAL_CPU_SLOTS];
+extern volatile uint64_t g_cpu_sys_ms[HAL_CPU_SLOTS];
+extern volatile uint64_t g_cpu_kernel_ms[HAL_CPU_SLOTS];
 uint64_t hal_pid_busy_ms(uint32_t pid);
 void     hal_pid_cpu_ms(uint32_t pid, uint64_t* user_ms, uint64_t* sys_ms, uint64_t* total_ms);
+void     hal_pid_cpu_forget(uint32_t pid);
+uint64_t hal_kernel_cpu_ms();
 // end (satoru)

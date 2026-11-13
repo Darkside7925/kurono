@@ -1,6 +1,8 @@
 //  kurono os - virtual device emulation implementation
 //  full emulation of pic, apic, pit, hpet for vm guests
 #include "vdevices.h"
+#include "vlapic.h"
+#include "hypervisor.h"
 #include "../drivers/serial.h"
 
 VirtualPIC  VirtualDevices::master_pic;
@@ -56,7 +58,13 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
             switch (eoi_type) {
                 case 1: // non-specific eoi
                 {
-                    int highest = GetHighestPriorityIRQ();
+                    // ends the highest-priority irq IN SERVICE. it used
+                    // GetHighestPriorityIRQ(), the highest PENDING one, which
+                    // skips an in-service line: with the next pit tick already
+                    // in irr nothing was cleared, isr stayed set and irq0 never
+                    // came again (a kurono guest eois 0x20; linux uses specific
+                    // eois and never hit it) (satoru)
+                    int highest = HighestInService();
                     if (highest >= 0) {
                         isr &= ~(1 << highest);
                     }
@@ -70,7 +78,7 @@ void VirtualPIC::WritePort(uint16_t port, uint8_t value) {
                 }
                 case 5: // rotate on non-specific eoi
                 {
-                    int highest = GetHighestPriorityIRQ();
+                    int highest = HighestInService();   // (satoru)
                     if (highest >= 0) {
                         isr &= ~(1 << highest);
                         priority = (highest + 1) & 7;
@@ -148,6 +156,15 @@ uint8_t VirtualPIC::ReadPort(uint16_t port) {
     } else {
         return imr; // data port reads imr
     }
+}
+
+// the in-service line a non-specific eoi ends: highest priority first (satoru)
+int VirtualPIC::HighestInService() {
+    for (int i = 0; i < 8; i++) {
+        int irq = (priority + i) & 7;
+        if (isr & (1 << irq)) return irq;
+    }
+    return -1;
 }
 
 int VirtualPIC::GetHighestPriorityIRQ() {
@@ -455,15 +472,22 @@ void VirtualPIT::WritePort(uint16_t port, uint8_t value) {
         }
 
         PITChannel& c = channels[sel];
+        if (((value >> 4) & 0x03) == 0) {
+            // counter latch command: it latches the count and changes nothing
+            // else. it used to overwrite mode and access with 0, so a guest
+            // that reads the counter (kurono's Timer::ReadCounter latches ch0
+            // every poll) turned the mode-2 rate generator into a one-shot:
+            // irq0 stopped, the guest's clock froze and it slept forever at its
+            // first idle hlt, ~10 s into boot (satoru)
+            c.latch_value = c.counter;
+            c.latched = true;
+            c.flip_flop = false;
+            return;
+        }
         c.access = (value >> 4) & 0x03;
         c.mode = (value >> 1) & 0x07;
         c.bcd = value & 0x01;
-
-        if (c.access == 0) {
-            // latch command
-            c.latch_value = c.counter;
-            c.latched = true;
-        } else {
+        {
             c.flip_flop = false;
             c.null_count = true;
         }
@@ -854,6 +878,13 @@ bool VirtualDevices::HandleMMIO(uint64_t phys_addr, bool is_write,
     if (phys_addr >= VAPIC_BASE_ADDR && phys_addr < VAPIC_BASE_ADDR + 0x1000) {
         uint32_t offset = (uint32_t)(phys_addr - VAPIC_BASE_ADDR);
         offset &= ~0x0F; // align to 16 bytes
+        // smp guests and kurono guests (one vcpu, but they tick from the
+        // lapic timer) get the full VLapic model (satoru)
+        if (Hypervisor::GuestCpus() > 1 || Hypervisor::Mb2Guest()) {
+            if (is_write) VLapic::Write(Hypervisor::CurrentVcpu(), offset, value);
+            else value = VLapic::Read(Hypervisor::CurrentVcpu(), offset);
+            return true;
+        }
         if (is_write) apic.WriteReg(offset, value);
         else value = apic.ReadReg(offset);
         return true;

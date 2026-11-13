@@ -50,16 +50,8 @@ static void emit_d(long long v) {
 // the printf subset kernel code uses in practice: %s %d %i %u %x %X %p %lu %ld
 // %llu %lld %zu %c %%. width/precision/flags are parsed and ignored - they only
 // affect cosmetics, never correctness of the message. (satoru)
-int lx_vprintk(const char* fmt, va_list ap) {
+static int lx_vprintk_body(const char* fmt, va_list ap) {
     if (!fmt) return 0;
-    // leading level marker
-    if (fmt[0] == '\001' && fmt[1]) {
-        emit(level_tag(fmt[1]), strlen(level_tag(fmt[1])));
-        fmt += 2;
-    } else {
-        emit("[INFO ] ", 8);
-    }
-
     const char* p = fmt;
     while (*p) {
         if (*p != '%') {
@@ -100,12 +92,33 @@ int lx_vprintk(const char* fmt, va_list ap) {
                 break;
             }
             case 'p': {
+                if (p[1] == 'V') {
+                    // %pV: a struct va_format { const char *fmt; va_list *va; }
+                    // iwlwifi wraps every IWL_INFO/IWL_ERR in this. (satoru)
+                    struct { const char* fmt; va_list* va; } *vaf = va_arg(ap, void*);
+                    if (vaf && vaf->fmt && vaf->va)
+                        lx_vprintk_body(vaf->fmt, *vaf->va);
+                    p++;
+                    break;
+                }
+                if (p[1] == 'M') {
+                    const unsigned char* m = va_arg(ap, const unsigned char*);
+                    static const char hexd[] = "0123456789abcdef";
+                    for (int i = 0; i < 6; i++) {
+                        char b[3] = { hexd[m ? (m[i] >> 4) : 0],
+                                       hexd[m ? (m[i] & 15) : 0], 0 };
+                        emit(b, 2);
+                        if (i != 5) emit(":", 1);
+                    }
+                    p++;
+                    break;
+                }
                 void* v = va_arg(ap, void*);
                 emit("0x", 2);
                 emit_u((unsigned long long)(uintptr_t)v, 16, 0);
-                // %pM (mac), %pI4 (ip) etc take a trailing spec char; consume it
-                // so it is not printed as literal text. (satoru)
-                if (p[1] && strchr("MmI4i6bBhHRrSsFfVaExXdDgGOoNnCcUuTtLl", p[1])) {
+                // %pI4 (ip) etc take a trailing spec char; consume it so it is
+                // not printed as literal text. (satoru)
+                if (p[1] && strchr("I4i6bBhHRrSsFfVaExXdDgGOoNnCcUuTtLl", p[1])) {
                     p++;
                     if (p[1] == '4' || p[1] == '6') p++;
                 }
@@ -134,6 +147,27 @@ int lx_vprintk(const char* fmt, va_list ap) {
         if (*p) p++;
     }
     return 0;
+}
+
+int lx_vprintk_nolevel(const char* fmt, va_list ap) {
+    lx_log_lock();
+    int r = lx_vprintk_body(fmt, ap);
+    lx_log_unlock();
+    return r;
+}
+
+int lx_vprintk(const char* fmt, va_list ap) {
+    if (!fmt) return 0;
+    lx_log_lock();
+    if (fmt[0] == '\001' && fmt[1]) {
+        emit(level_tag(fmt[1]), strlen(level_tag(fmt[1])));
+        fmt += 2;
+    } else {
+        emit("[INFO ] ", 8);
+    }
+    int r = lx_vprintk_body(fmt, ap);
+    lx_log_unlock();
+    return r;
 }
 
 // the symbol the driver actually calls. Linux's printk is a variadic macro in

@@ -43,6 +43,27 @@ public:
     // Real password hashing (SHA-256 of salt||password, hex)
     static void HashPassword(const char* salt, const char* plaintext, char* out_hex_64);
     static void GenerateSalt(char* out_hex_16);
+    // stored hashes are "p2$<iterations>$<64 hex>" (pbkdf2-hmac-sha256 over the
+    // salt) since 2026-11; a plain 64 hex value is the old sha-256 form, still
+    // accepted and upgraded at the next successful sign-in. (satoru)
+    static bool VerifyPassword(const char* salt, const char* plaintext, const char* stored);
+    static bool IsLegacyHash(const char* stored);
+    // ken / the admin gate: true when `password` is the password of any
+    // administrator account. (satoru)
+    static bool VerifyAdminPassword(const char* password);
+    // ksa hashes a typed credential inside its isolated region and hands back
+    // only a 32 byte digest; these two let it compare that digest against an
+    // account without the plaintext ever leaving the region. (satoru)
+    static bool CredentialDigest(const char* username, const char* plaintext, uint8_t out[32]);
+    static bool DigestMatches(const char* username, const uint8_t digest[32]);
+    static const char* FirstAdminName();
+    static bool CurrentIsAdmin();
+    // account changes. SetAdmin refuses to demote the last administrator;
+    // ChangePassword needs the old password. both persist. (satoru)
+    static bool SetAdmin(const char* username, bool admin);
+    static bool ChangePassword(const char* username, const char* old_pw, const char* new_pw);
+    // failed sign-ins: after 5 in a row an account waits 30 s, doubling. (satoru)
+    static uint32_t LockoutRemainingMs(const char* username);
 
     // Convenience accessors
     static const char* GetCurrentUsername();

@@ -1025,10 +1025,31 @@ void Quit(int code) { g_exit = code; g_quit = true; }
 
 bool WatchFd(int fd, bool on) { return on ? watch_add(fd) : (watch_del(fd), true); }
 
+// [kuiloop]: while a window paces itself with RequestFrameAt (a playing video,
+// an animation), one line every 10 s: loop passes, frames committed, the worst
+// lateness of a poll() past its own timeout, how many woke > 20 ms late, and
+// frame callbacks given up after 250 ms. the laptop's media player stalled at
+// ~5 composited frames a second 39 min into a session (klog240_1112b) with no
+// way to tell a late kernel wakeup from a client that stopped drawing. (satoru)
+extern "C" char* __progname;
+struct LoopStat { uint32_t t0, passes, renders, late_max, late_n, cb_drops; bool paced; };
+LoopStat g_ls = {};
+void loopstat_tick(uint32_t now) {
+    if (!g_ls.t0) { g_ls.t0 = now; return; }
+    if ((uint32_t)(now - g_ls.t0) < 10000u) return;
+    if (g_ls.paced)
+        fprintf(stderr, "[kuiloop] %s 10s: passes=%u frames=%u poll_late_max_ms=%u late20=%u cb_drops=%u\n",
+                __progname ? __progname : "?", g_ls.passes, g_ls.renders, g_ls.late_max, g_ls.late_n, g_ls.cb_drops);
+    g_ls = LoopStat{};
+    g_ls.t0 = now;
+}
+
 int RunLoop() {
     while (!g_quit && !g_dead) {
         uint32_t now = NowMs();
         int live = 0;
+        g_ls.passes++;
+        loopstat_tick(now);
         // timers and frame deadlines that are due (satoru)
         for (int i = 0; i < 32; i++) {
             Timer1& t = g_timers[i];
@@ -1043,9 +1064,12 @@ int RunLoop() {
             if (!s->used) continue;
             live++;
             if (s->frame_at && (int32_t)(now - s->frame_at) >= 0) { s->frame_at = 0; damage_all(s); }
-            if (s->frame_cb && now - s->frame_ms > 250) s->frame_cb = 0;   // a dropped callback (satoru)
+            if (s->frame_cb && now - s->frame_ms > 250) { s->frame_cb = 0; g_ls.cb_drops++; }   // a dropped callback (satoru)
             s->pub.handler->OnTick(s->pub, now);
+            if (s->frame_at) g_ls.paced = true;
+            uint32_t fms = s->frame_ms;
             if (s->used) render(s);
+            if (s->used && s->frame_ms != fms) g_ls.renders++;   // render() committed a frame (satoru)
         }
         if (!live) break;
         // sleep until the socket talks or the next deadline (satoru)
@@ -1083,7 +1107,14 @@ int RunLoop() {
             pfds[nfds].fd = g_watch[i]; pfds[nfds].events = POLLIN; pfds[nfds].revents = 0;
             nfds++;
         }
+        uint32_t pt0 = NowMs();
         int r = poll(pfds, (nfds_t)nfds, timeout);
+        if (r == 0) {   // a pure timeout: how far past it did we wake (satoru)
+            uint32_t el = NowMs() - pt0;
+            uint32_t late = el > (uint32_t)timeout ? el - (uint32_t)timeout : 0;
+            if (late > g_ls.late_max) g_ls.late_max = late;
+            if (late > 20) g_ls.late_n++;
+        }
         if (r < 0 && errno != EINTR) break;
         if (r > 0) {
             if (pfds[0].revents & (POLLERR | POLLNVAL)) break;

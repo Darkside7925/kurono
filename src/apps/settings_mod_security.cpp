@@ -14,6 +14,22 @@ static char s_new_pass[48];
 static char s_msg[64];
 static bool s_msg_ok = false;
 static bool s_adding = false;
+static int  s_open_user = -1;     // account row showing its options (satoru)
+static bool s_pw_change = false;  // the change password fields are open (satoru)
+static char s_pw_old[48], s_pw_new[48], s_pw_again[48];
+static char s_pw_msg[64];
+static bool s_pw_ok = false;
+
+// the KSA switch (satoru)
+static bool s_ksa_on = true;
+static bool s_ksa_asking = false;   // the password row for switching it off is open
+static char s_ksa_pw[48];
+static char s_ksa_msg[72];
+static bool s_ksa_ok = false;
+
+static void pw_clear(){
+    for(int i = 0; i < 48; i++){ s_pw_old[i] = 0; s_pw_new[i] = 0; s_pw_again[i] = 0; }
+}
 
 static const char* ken_level_label(KENLevel lvl){
     switch(lvl){
@@ -29,6 +45,14 @@ static void security_on_show(){
     s_new_user[0] = s_new_pass[0] = 0;
     s_msg[0] = 0;
     s_adding = false;
+    s_open_user = -1;
+    s_pw_change = false;
+    s_pw_msg[0] = 0;
+    pw_clear();
+    s_ksa_on = KEN::IsKsaEnabled();
+    s_ksa_asking = false;
+    s_ksa_pw[0] = 0;
+    s_ksa_msg[0] = 0;
 }
 
 static void avatar(int cx, int cy, int r, const char* name, uint32_t col){
@@ -70,7 +94,21 @@ static void security_build(){
         if(i == ci) StrApp(buf, ", signed in", 64);
         bool same = !u.display_name[0];
         if(!same){ int k = 0; while(u.display_name[k] && u.display_name[k] == u.username[k]) k++; same = !u.display_name[k] && !u.username[k]; }
-        Info(u.display_name[0] ? u.display_name : u.username, buf, same ? nullptr : u.username);
+        // an administrator can open another account to change its kind. (satoru)
+        if(admin && i != ci){
+            if(Nav(u.display_name[0] ? u.display_name : u.username, buf, same ? nullptr : u.username))
+                s_open_user = (s_open_user == i) ? -1 : i;
+            if(s_open_user == i){
+                bool adm = u.is_admin;
+                if(Toggle("Administrator", &adm, "Can approve changes for everyone")){
+                    if(!UserManager::SetAdmin(u.username, adm)){
+                        StrCpy(s_msg, "Kurono needs at least one administrator", 64); s_msg_ok = false;
+                    }
+                }
+            }
+        } else {
+            Info(u.display_name[0] ? u.display_name : u.username, buf, same ? nullptr : u.username);
+        }
         PopId();
     }
     if(!s_adding){
@@ -91,6 +129,66 @@ static void security_build(){
         }
     }
     if(s_msg[0]) Info(s_msg_ok ? "Done" : "Problem", s_msg, nullptr, s_msg_ok ? T().success : T().danger);
+    EndGroup();
+
+    // password of the signed-in account. (satoru)
+    if(ci >= 0 && ci < n){
+        Group("Password");
+        if(!s_pw_change){
+            if(Button("Password", "Change", BTN_SECONDARY)){ s_pw_change = true; s_pw_msg[0] = 0; pw_clear(); }
+        } else {
+            TextField("Current", s_pw_old, 48, "current password", FIELD_PASSWORD);
+            TextField("New", s_pw_new, 48, "at least 4 characters", FIELD_PASSWORD);
+            bool go = TextField("Again", s_pw_again, 48, "new password again", FIELD_PASSWORD) && Submitted();
+            if(Button("", "Change password", BTN_PRIMARY)) go = true;
+            if(Button(" ", "Cancel", BTN_SECONDARY)){ s_pw_change = false; pw_clear(); s_pw_msg[0] = 0; }
+            if(go){
+                bool same_pw = true;
+                for(int k = 0; k < 48; k++){ if(s_pw_new[k] != s_pw_again[k]){ same_pw = false; break; } if(!s_pw_new[k]) break; }
+                if(!same_pw){ StrCpy(s_pw_msg, "The new passwords do not match", 64); s_pw_ok = false; }
+                else if(StrLen(s_pw_new) < 4){ StrCpy(s_pw_msg, "The new password is too short", 64); s_pw_ok = false; }
+                else if(UserManager::ChangePassword(uname, s_pw_old, s_pw_new)){
+                    StrCpy(s_pw_msg, "Password changed", 64); s_pw_ok = true; s_pw_change = false;
+                } else { StrCpy(s_pw_msg, "The current password is not right", 64); s_pw_ok = false; }
+                pw_clear();
+            }
+        }
+        if(s_pw_msg[0]) Info(s_pw_ok ? "Done" : "Problem", s_pw_msg, nullptr, s_pw_ok ? T().success : T().danger);
+        EndGroup();
+    }
+
+    // KSA, the second approval behind amdo. off needs the password (the service
+    // checks it through the KEN policy call); on again needs nothing. (satoru)
+    Group("Approval");
+    {
+        bool on = s_ksa_on;
+        if(Toggle("KSA", &on, s_ksa_on ? "Approvals use the secure KSA prompt"
+                                       : "Off for now: amdo and approvals use your password only")){
+            if(on){
+                char e[72]; e[0] = 0;
+                if(KEN::SetKsaEnabled(KEN::GetCurrentSession(), true, nullptr, e, 72)){
+                    s_ksa_on = true; s_ksa_asking = false; s_ksa_pw[0] = 0;
+                    StrCpy(s_ksa_msg, "KSA is on", 72); s_ksa_ok = true;
+                } else { StrCpy(s_ksa_msg, e[0] ? e : "Could not turn KSA on", 72); s_ksa_ok = false; }
+            } else {
+                s_ksa_asking = true; s_ksa_pw[0] = 0; s_ksa_msg[0] = 0;
+            }
+        }
+        if(s_ksa_asking && s_ksa_on){
+            bool go = TextField("Password", s_ksa_pw, 48, "your password turns KSA off", FIELD_PASSWORD) && Submitted();
+            if(Button("", "Turn KSA off", BTN_PRIMARY)) go = true;
+            if(Button(" ", "Cancel", BTN_SECONDARY)){ s_ksa_asking = false; s_ksa_pw[0] = 0; s_ksa_msg[0] = 0; }
+            if(go){
+                char e[72]; e[0] = 0;
+                if(KEN::SetKsaEnabled(KEN::GetCurrentSession(), false, s_ksa_pw, e, 72)){
+                    s_ksa_on = false; s_ksa_asking = false;
+                    StrCpy(s_ksa_msg, "KSA is off. amdo asks for your password", 72); s_ksa_ok = true;
+                } else { StrCpy(s_ksa_msg, e[0] ? e : "Could not turn KSA off", 72); s_ksa_ok = false; }
+                for(int k = 0; k < 48; k++) s_ksa_pw[k] = 0;
+            }
+        }
+        if(s_ksa_msg[0]) Info(s_ksa_ok ? "Done" : "Problem", s_ksa_msg, nullptr, s_ksa_ok ? T().success : T().danger);
+    }
     EndGroup();
 
     Group("Security");

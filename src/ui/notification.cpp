@@ -71,12 +71,53 @@ const char* NotificationManager::GlyphFor(IconType t) {
 
 static bool g_dnd = false;
 
-void NotificationManager::SetDoNotDisturb(bool on) { g_dnd = on; }
+// posts held while do not disturb is on: a small ring of the latest ones plus
+// the total count. (satoru)
+struct HeldPost {
+    char     title[48];
+    char     body[96];
+    int      icon;
+    uint32_t duration_ms;
+};
+static const int HELD_RING = 16;
+static HeldPost g_held[HELD_RING];
+static int      g_held_total = 0;
+
+static const int REPLAY_MAX = 3;   // turning dnd off shows at most this many again (satoru)
+
+void NotificationManager::SetDoNotDisturb(bool on) {
+    if (on == g_dnd) return;
+    if (on) {
+        g_held_total = 0;
+        g_dnd = true;
+        return;
+    }
+    g_dnd = false;
+    int n = g_held_total;
+    g_held_total = 0;
+    int stored = n < HELD_RING ? n : HELD_RING;
+    int replay = stored < REPLAY_MAX ? stored : REPLAY_MAX;
+    // oldest of the replayed ones first, so the newest ends on top. (satoru)
+    for (int k = replay; k >= 1; k--) {
+        const HeldPost& h = g_held[(n - k) % HELD_RING];
+        Post(h.title, h.body, h.icon, h.duration_ms);
+    }
+}
 bool NotificationManager::DoNotDisturb() { return g_dnd; }
+int  NotificationManager::HeldCount() { return g_dnd ? g_held_total : 0; }
 
 void NotificationManager::Post(const char* title, const char* body, int icon_type, uint32_t duration_ms) {
     EnsureInit();
-    if (g_dnd) return;   // focus mode: silent, nothing stacks up. (satoru)
+    if (g_dnd) {   // focus mode: hold it quietly, shown again when dnd ends. (satoru)
+        HeldPost& h = g_held[g_held_total % HELD_RING];
+        copy_str(h.title, title, (int)sizeof(h.title));
+        copy_str(h.body, body, (int)sizeof(h.body));
+        h.icon = icon_type;
+        h.duration_ms = duration_ms;
+        g_held_total++;
+        Graphics::MarkUIDirty();   // the control center shows the held count (satoru)
+        return;
+    }
 
     IconType icon = ICON_INFO;
     if (icon_type >= ICON_INFO && icon_type <= ICON_ERROR) icon = (IconType)icon_type;

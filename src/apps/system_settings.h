@@ -134,6 +134,9 @@ namespace SettingsUI {
                 const char* sub = nullptr);
     // list row with a value and a chevron; returns true when clicked. (satoru)
     bool Nav(const char* label, const char* value = nullptr, const char* sub = nullptr);
+    // a wi-fi network row: signal bars (0..4), a lock when secured, a check
+    // when joined, and a chevron; returns true when clicked. (satoru)
+    bool NetRow(const char* label, int bars, bool locked, bool connected, const char* sub = nullptr);
     // single line text field. returns true when the text changed or Enter was
     // pressed; Submitted() tells the two apart. (satoru)
     bool TextField(const char* label, char* buf, int cap, const char* placeholder, int flags = 0);

@@ -32,6 +32,7 @@ bool           KernelHeap::expanded      = false;
 struct FreeLink {
     FreeLink* next;
     FreeLink* prev;
+    uint64_t  list;   // FREELIST_TAG | which list it was pushed on (satoru)
 };
 
 // header is 16 bytes; minimum free-block payload must fit FreeLink (16) and
@@ -39,7 +40,17 @@ struct FreeLink {
 #define HEAP_MIN_PAYLOAD  32
 #define HEAP_FOOTER_SIZE  8
 
-static FreeLink* g_free_head = nullptr;
+static FreeLink* g_free_head = nullptr;   // free blocks with payload < HEAP_BIG_BLOCK (satoru)
+// two size-segregated freelists. the single first-fit list made a large request
+// walk every small free block first: with the heap fragmented by firefox, a 256
+// kb kvfs content grow took 89 ms and an 8 mb one 134 ms inside KernelHeap::
+// Alloc, all under kls (the gui stalled ~100 ms behind those file writes). a big
+// request now walks only big blocks; a small one tries small blocks, then big.
+// the list a block sits on is tagged in its link (stale writers can trample a
+// free payload, so an unreadable tag falls back to the validated walk). (satoru)
+static FreeLink* g_free_big = nullptr;
+#define HEAP_BIG_BLOCK  (64ULL * 1024)
+#define FREELIST_TAG    0x4B46524545000000ULL   // "KFREE" + list bit (satoru)
 
 // rate-limit heap diagnostic warnings. a single bad/double free that gets
 // logged travels serial -> runtimelog -> kvfs, which itself churns the heap
@@ -155,12 +166,37 @@ static bool link_ok(FreeLink* l) {
     return true;
 }
 
+static FreeLink** freelist_head(uint64_t which) { return which ? &g_free_big : &g_free_head; }
+
 static void freelist_push(HeapBlock* b) {
     FreeLink* l = (FreeLink*)((uint8_t*)b + HEAP_HEADER_SIZE);
+    uint64_t which = b->size >= HEAP_BIG_BLOCK ? 1 : 0;
+    FreeLink** head = freelist_head(which);
     l->prev = nullptr;
-    l->next = g_free_head;
-    if (g_free_head) g_free_head->prev = l;
-    g_free_head = l;
+    l->list = FREELIST_TAG | which;
+    l->next = *head;
+    if (*head) (*head)->prev = l;
+    *head = l;
+}
+
+// the validated walk of one list, unlinking l if found. a corrupt entry truncates
+// the list there (leak, contained). returns true when l was found. (satoru)
+static bool freelist_heal_remove(FreeLink** head, FreeLink* l) {
+    FreeLink* prev = nullptr;
+    for (FreeLink* it = *head; it; it = it->next) {
+        if (!link_ok(it)) {   // corrupt tail: truncate the list here (leak) (satoru)
+            if (prev) prev->next = nullptr; else *head = nullptr;
+            return false;
+        }
+        if (it == l) {
+            FreeLink* nx = (l->next && link_ok(l->next)) ? l->next : nullptr;
+            if (prev) prev->next = nx; else *head = nx;
+            if (nx) nx->prev = prev;
+            return true;
+        }
+        prev = it;
+    }
+    return false;
 }
 
 static void freelist_remove(HeapBlock* b) {
@@ -171,28 +207,16 @@ static void freelist_remove(HeapBlock* b) {
     // safely unlinked are leaked (contained), never written through. (satoru)
     bool pv = (l->prev == nullptr) || link_ok(l->prev);
     bool nv = (l->next == nullptr) || link_ok(l->next);
-    if (pv && nv) {
+    bool tag_ok = (l->list & ~1ULL) == FREELIST_TAG;
+    if (pv && nv && tag_ok) {
         if (l->prev) l->prev->next = l->next;
-        else         g_free_head   = l->next;
+        else         *freelist_head(l->list & 1) = l->next;
         if (l->next) l->next->prev = l->prev;
         l->next = l->prev = nullptr;
         return;
     }
     heap_warn("Heap: freelist corrupt link in remove (healed)\r\n");
-    FreeLink* prev = nullptr;
-    for (FreeLink* it = g_free_head; it; it = it->next) {
-        if (!link_ok(it)) {   // corrupt tail: truncate the list here (leak) (satoru)
-            if (prev) prev->next = nullptr; else g_free_head = nullptr;
-            break;
-        }
-        if (it == l) {
-            FreeLink* nx = (l->next && link_ok(l->next)) ? l->next : nullptr;
-            if (prev) prev->next = nx; else g_free_head = nx;
-            if (nx) nx->prev = prev;
-            break;
-        }
-        prev = it;
-    }
+    if (!freelist_heal_remove(&g_free_head, l)) freelist_heal_remove(&g_free_big, l);
     l->next = l->prev = nullptr;
 }
 
@@ -208,6 +232,28 @@ static void mark_free(HeapBlock* b) {
 static void mark_used(HeapBlock* b) {
     b->flags = HEAP_MAGIC_USED;
     *footer_of(b) = b->size | (1ULL << 63);
+}
+
+// large allocations go straight to pmm frames, each its own block with the
+// normal header/footer (so Realloc, IsValidBlock and the census see an
+// ordinary used block) and back to the pmm on Free. the region heap kept them
+// in its arenas: a growing kvfs file reallocates geometrically, every copy
+// landed in fresh space, and the reserve climbed 110 -> 550 MB over a long
+// claude session while live use stayed ~75 MB, because small long-lived
+// blocks pinned every region. kurono.heapdirect=0 keeps them in the regions
+// (satoru)
+#define HEAP_DIRECT_MIN  (256ULL * 1024)
+#define HEAP_DIRECT_MAX  4096
+struct DirectAlloc { uint8_t* base; size_t bytes; };
+static DirectAlloc g_direct[HEAP_DIRECT_MAX];
+static int         g_direct_n = 0;
+static size_t      g_direct_bytes = 0;
+// heap kept grabbing new regions and never giving them back. typical
+bool g_heap_direct = true;
+static int direct_find(const uint8_t* payload) {
+    for (int i = 0; i < g_direct_n; i++)
+        if (g_direct[i].base + HEAP_HEADER_SIZE == payload) return i;
+    return -1;
 }
 
 static HeapBlock* prev_block(uint8_t* heap_base_ptr, HeapBlock* b) {
@@ -242,6 +288,7 @@ void KernelHeap::Init() {
     first->size  = heap_capacity - HEAP_HEADER_SIZE;
     mark_free(first);
     g_free_head = nullptr;
+    g_free_big = nullptr;   // (satoru)
     freelist_push(first);
 
     // seed the link-validation bounds (see link_ok). (satoru)
@@ -259,14 +306,14 @@ void KernelHeap::ExpandWithPMM() {
 
     uint64_t total_phys = PMM::GetTotalMemory();
 
-    // start at a quarter of ram and grow on demand (heap_grow). this used to
-    // grab half of ram up front, with no way to grow, so it had to be sized for
-    // the firefox closure (~235 mb in kvfs, libxul alone a 174 mb block) on every
-    // boot. the desktop needs ~40 mb of heap, so on a 512 mb machine the eager
-    // half starved everything else. (satoru)
-    uint64_t target = total_phys / 4;
+    // start small and grow on demand (heap_grow). the heap used to grab a
+    // quarter of ram up front (2 gb on a 32 gb machine) whether or not anything
+    // ever used it; the idle desktop needs ~15 mb and firefox's closure grows
+    // the arena in a few steps when it is actually launched. the half-of-ram
+    // variant starved a 512 mb machine too. (satoru)
     const uint64_t MAX_HEAP = 2ULL * 1024 * 1024 * 1024;
-    const uint64_t MIN_HEAP = 32ULL * 1024 * 1024;
+    const uint64_t MIN_HEAP = 16ULL * 1024 * 1024;
+    uint64_t target = MIN_HEAP;
     if (target > MAX_HEAP) target = MAX_HEAP;
     if (target < MIN_HEAP) target = MIN_HEAP;
 
@@ -298,6 +345,7 @@ void KernelHeap::ExpandWithPMM() {
     // abandon the bootstrap freelist; allocations in bss remain valid because
     // their headers don't move. New allocations come from the expanded pool.
     g_free_head = nullptr;
+    g_free_big = nullptr;   // (satoru)
     freelist_push(first);
 
     uint32_t mb = (uint32_t)(target / (1024 * 1024));
@@ -314,6 +362,18 @@ void KernelHeap::ExpandWithPMM() {
 // falls back to just what the request needs when ram is tight. called with the
 // heap lock held; the lock order heap -> pmm matches the existing heap ->
 // serial warning path, and pmm never calls back into the heap. (satoru)
+// install a fresh pmm chunk as a heap region (heap lock held). (satoru)
+static void heap_add_region(void* mem, size_t chunk) {
+    HeapBlock* first = (HeapBlock*)mem;
+    first->size = chunk - HEAP_HEADER_SIZE;
+    mark_free(first);
+    g_reg_base[g_reg_count] = (uint8_t*)mem;
+    g_reg_cap[g_reg_count]  = chunk;
+    g_reg_count++;
+    g_total_cap += chunk;
+    freelist_push(first);
+}
+
 static bool heap_grow(size_t need) {
     if (g_growing || g_reg_count >= HEAP_MAX_REGIONS) return false;
     const size_t ALIGN = 2ULL * 1024 * 1024;
@@ -334,14 +394,7 @@ static bool heap_grow(size_t need) {
         if (chunk < min_chunk) chunk = min_chunk;
     }
     if (mem) {
-        HeapBlock* first = (HeapBlock*)mem;
-        first->size = chunk - HEAP_HEADER_SIZE;
-        mark_free(first);
-        g_reg_base[g_reg_count] = (uint8_t*)mem;
-        g_reg_cap[g_reg_count]  = chunk;
-        g_reg_count++;
-        g_total_cap += chunk;
-        freelist_push(first);
+        heap_add_region(mem, chunk);
         SerialLogger::Log("Heap: grew by ");
         SerialLogger::LogDec((uint32_t)(chunk / (1024 * 1024)));
         SerialLogger::Log(" MB (total ");
@@ -357,16 +410,21 @@ HeapBlock* KernelHeap::FindFree(size_t size) {
     // prior O(n) over every block. every hop is validated (link_ok) so a
     // trampled link is detected + truncated instead of dereferenced - the
     // unvalidated walk here was the rip=0x3 wild-jump crash vector. (satoru)
-    FreeLink* prev = nullptr;
-    for (FreeLink* l = g_free_head; l; l = l->next) {
-        if (!link_ok(l)) {
-            heap_warn("Heap: freelist corrupt link in find (truncated)\r\n");
-            if (prev) prev->next = nullptr; else g_free_head = nullptr;
-            return nullptr;
+    // a big request walks only the big list; a small one the small list, then
+    // the big one (any big block fits it). (satoru)
+    for (uint64_t which = (size >= HEAP_BIG_BLOCK) ? 1 : 0; which < 2; which++) {
+        FreeLink** head = freelist_head(which);
+        FreeLink* prev = nullptr;
+        for (FreeLink* l = *head; l; l = l->next) {
+            if (!link_ok(l)) {
+                heap_warn("Heap: freelist corrupt link in find (truncated)\r\n");
+                if (prev) prev->next = nullptr; else *head = nullptr;
+                break;
+            }
+            HeapBlock* b = block_from_link(l);
+            if (b->size >= size) return b;
+            prev = l;
         }
-        HeapBlock* b = block_from_link(l);
-        if (b->size >= size) return b;
-        prev = l;
     }
     return nullptr;
 }
@@ -419,11 +477,79 @@ bool KernelHeap::CensusEntry(uint32_t i, uint32_t* site, uint32_t* size) {
     return true;
 }
 
+// the synchronous heap_grow runs inside whatever allocation hit the end: the
+// pmm's contiguous scan + zero of a 16-54 mb chunk took 40-130 ms there, inside
+// kls-held syscalls (firefox's sqlite/indexeddb writes growing kvfs content),
+// and the gui waited ~100 ms behind them. this refill does the same growth from
+// the logging kernel process with NO lock held across the pmm call: it peeks
+// under the heap guard, takes the chunk from the pmm unlocked, installs it under
+// the guard. kurono.heapreserve=0 turns it off. (satoru)
+static bool g_reserve_on = true;
+void KernelHeap::RefillReserve() {
+    if (!g_reserve_on || !expanded) return;
+    size_t largest = 0, total = 0;
+    {
+        HeapIrqGuard _g;
+        if (g_growing || g_reg_count >= HEAP_MAX_REGIONS - 1) return;
+        total = g_total_cap;
+        int hops = 0;
+        for (FreeLink* l = g_free_big; l && hops < 4096; l = l->next, hops++) {
+            if (!link_ok(l)) break;
+            HeapBlock* b = block_from_link(l);
+            if (b->size > largest) largest = b->size;
+        }
+    }
+    const size_t ALIGN = 2ULL * 1024 * 1024;
+    size_t want = total / 8;
+    if (want < 16ULL * 1024 * 1024) want = 16ULL * 1024 * 1024;
+    if (largest >= want) return;
+    size_t chunk = total / 2;
+    if (chunk < 16ULL * 1024 * 1024) chunk = 16ULL * 1024 * 1024;
+    chunk = (chunk + ALIGN - 1) & ~(ALIGN - 1);
+    void* mem = PMM::AllocBytes(chunk);   // no heap guard held (satoru)
+    if (!mem) return;
+    bool added = false;
+    {
+        HeapIrqGuard _g;
+        if (g_reg_count < HEAP_MAX_REGIONS) { heap_add_region(mem, chunk); added = true; }
+    }
+    if (!added) { PMM::FreeBytes(mem, chunk); return; }
+    SerialLogger::Log("Heap: reserve grew by ");
+    SerialLogger::LogDec((uint32_t)(chunk / (1024 * 1024)));
+    SerialLogger::Log(" MB (total ");
+    SerialLogger::LogDec((uint32_t)(g_total_cap / (1024 * 1024)));
+    SerialLogger::Log(" MB)\r\n");
+}
+void KernelHeap::SetReserve(bool on) { g_reserve_on = on; }
+
 void* KernelHeap::Alloc(size_t size) {
     return AllocFrom(size, __builtin_return_address(0));
 }
 
 void* KernelHeap::AllocFrom(size_t size, void* site) {
+    if (g_heap_direct && expanded && size >= HEAP_DIRECT_MIN && size < (1ULL << 40)) {
+        // the pmm call (and its zeroing) runs without the heap lock (satoru)
+        size_t payload = (size + HEAP_FOOTER_SIZE + 15) & ~(size_t)15;
+        size_t bytes = (HEAP_HEADER_SIZE + payload + 4095) & ~(size_t)4095;
+        uint8_t* mem = (uint8_t*)PMM::AllocBytes(bytes);
+        if (mem) {
+            HeapIrqGuard _g;
+            if (g_direct_n < HEAP_DIRECT_MAX) {
+                g_direct[g_direct_n].base = mem;
+                g_direct[g_direct_n].bytes = bytes;
+                g_direct_n++;
+                g_direct_bytes += bytes;
+                HeapBlock* b = (HeapBlock*)mem;
+                b->size = bytes - HEAP_HEADER_SIZE;
+                mark_used(b);
+                void* out = mem + HEAP_HEADER_SIZE;
+                hc_add(out, size, site);
+                if (TaskMem::g_on) TaskMem::OnHeapAlloc(out, b->size, (uint32_t)_g.cpu);
+                return out;
+            }
+            PMM::FreeBytes(mem, bytes);   // table full: the region heap takes it (satoru)
+        }
+    }
     HeapIrqGuard _g;   // interrupt-safe: blocks IRQ-context re-entry (satoru)
     size_t asked = size;
     if (!initialized) Init();
@@ -466,6 +592,7 @@ void* KernelHeap::AllocFrom(size_t size, void* site) {
     return out;
 }
 
+// if u break this nothing crashes right away, it just slowly corrupts everything
 void KernelHeap::Free(void* ptr) {
     if (!ptr) return;
     HeapIrqGuard _g;   // interrupt-safe: blocks IRQ-context re-entry (satoru)
@@ -476,7 +603,22 @@ void KernelHeap::Free(void* ptr) {
     bool in_active = region >= 0;
     bool in_boot   = expanded &&
                      (data >= boot_buffer && data < boot_buffer + BOOT_CAPACITY);
-    if (!in_active && !in_boot) return;
+    if (!in_active && !in_boot) {
+        int di = direct_find(data);   // a direct (pmm-backed) block (satoru)
+        if (di < 0) return;
+        HeapBlock* db = (HeapBlock*)(data - HEAP_HEADER_SIZE);
+        if (!valid_magic(db->flags) || !block_used(db)) { heap_warn("Heap: direct Free() bad block (ignored)\r\n"); return; }
+        hc_del(ptr);
+        if (TaskMem::g_on) TaskMem::OnHeapFree(ptr, db->size);
+        uint8_t* base = g_direct[di].base;
+        size_t bytes = g_direct[di].bytes;
+        db->flags = 0;
+        g_direct[di] = g_direct[g_direct_n - 1];
+        g_direct_n--;
+        g_direct_bytes -= bytes;
+        PMM::FreeBytes(base, bytes);
+        return;
+    }
 
     HeapBlock* block = (HeapBlock*)(data - HEAP_HEADER_SIZE);
 
@@ -537,6 +679,22 @@ void KernelHeap::Free(void* ptr) {
         mark_free(block);
     }
 
+    // an extra region that is now one free block goes back to the pmm, so a
+    // launched app's arena is reclaimed when it exits instead of staying
+    // reserved for the rest of the boot. the first region stays as the floor. (satoru)
+    if (g_reg_count > 1 && block == (HeapBlock*)region_base &&
+        block->size == g_reg_cap[region] - HEAP_HEADER_SIZE) {
+        size_t cap = g_reg_cap[region];
+        g_reg_count--;
+        if (region != g_reg_count) {
+            g_reg_base[region] = g_reg_base[g_reg_count];
+            g_reg_cap[region]  = g_reg_cap[g_reg_count];
+        }
+        g_total_cap -= cap;
+        PMM::FreeBytes(region_base, cap);
+        return;
+    }
+
     freelist_push(block);
 }
 
@@ -582,11 +740,12 @@ void KernelHeap::LockedCall(void (*fn)(void*), void* arg) {
 void KernelHeap::Reset() {
     initialized = false;
     g_free_head = nullptr;
+    g_free_big = nullptr;   // (satoru)
     Init();
 }
 
 size_t KernelHeap::GetTotal() {
-    return g_total_cap;
+    return g_total_cap + g_direct_bytes;   // regions + direct blocks (satoru)
 }
 
 size_t KernelHeap::GetUsed() {
@@ -603,7 +762,7 @@ size_t KernelHeap::GetUsed() {
             if (block->size == 0) break;
         }
     }
-    return used;
+    return used + g_direct_bytes;   // direct blocks are all in use (satoru)
 }
 
 size_t KernelHeap::GetFree() {
@@ -617,6 +776,10 @@ bool KernelHeap::IsValidBlock(void* ptr) {
     HeapIrqGuard _g;
     uint8_t* data = (uint8_t*)ptr;
     int r = region_of(data);
+    if (r < 0 && direct_find(data) >= 0) {   // a direct block (satoru)
+        HeapBlock* db = (HeapBlock*)(data - HEAP_HEADER_SIZE);
+        return valid_magic(db->flags) && block_used(db);
+    }
     if (r < 0 || data < g_reg_base[r] + HEAP_HEADER_SIZE) return false;
     HeapBlock* block = (HeapBlock*)(data - HEAP_HEADER_SIZE);
     return valid_magic(block->flags) && block_used(block);

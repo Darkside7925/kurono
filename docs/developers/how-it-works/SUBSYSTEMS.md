@@ -203,7 +203,7 @@ Binds subsystems together into usable OS services.
 ## Security (`src/security`)
 
 Privilege management and escalation policy: `ken.*` (the KEN engine, roles, auth policy, the
-`ken <cmd>` sudo-style reroute) and `ksa.*` (hypervisor-backed authorization prompts in an
+`amdo <cmd>` sudo-style reroute; `ken` is an alias) and `ksa.*` (hypervisor-backed authorization prompts in an
 EPT-isolated region, see `security/KSA.md`).
 
 ## Packages (`src/packages`)

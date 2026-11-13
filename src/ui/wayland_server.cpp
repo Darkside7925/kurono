@@ -1,6 +1,18 @@
 #include "wayland_server.h"
 #include "../proc/spinlock.h"   // frame-callback ring lock (satoru)
+static bool g_wl_childalpha = false;   // kurono.wl.childalpha=1 (satoru)
+static bool g_wl_deco = false;         // kurono.wl.deco=1 (satoru)
+static bool g_wl_fullsize = false;     // kurono.wl.fullsize=1 (satoru)
+// wl_shm reference census (memcensus line): pool/buffer objects and bytes. the
+// memfd-side counts come from LinuxSyscall::ShmKinds. (satoru)
+static uint32_t g_pp_pools_live = 0, g_pp_pools_made = 0;
+static uint32_t g_pp_bufs_live = 0,  g_pp_bufs_made = 0;
+static uint64_t g_pp_pool_kb = 0, g_pp_buf_kb = 0;
+static bool g_wl_poolfree = false;   // kurono.wl.poolfree=1 (satoru)
+static bool g_wl_scdirect = false;   // kurono.wl.scdirect=1: blit commits straight into the back buffer under gfx.scissor, as before (satoru)
 #include "../net/unix_socket.h"
+#include "../linux/linux_syscall.h"   // ShmUnpinPin, wl_shm pin release (satoru)
+#include "../system/key_layouts.h"   // settings keyboard layout keymaps (satoru)
 #include "xkb_keymap_us.h"        // compiled us keymap for wl_keyboard.keymap (satoru)
 #include "../drivers/serial.h"
 #include "../drivers/disklog.h"       // eager log off at first paint (satoru)
@@ -11,6 +23,7 @@
 #include "../kernel/heap.h"          // per-surface shadow buffers (satoru)
 #include "../kernel/pmm.h"           // page-aligned keymap backing
 #include "../drivers/timer.h"        // pit-tick ms timestamps for frame cbs (satoru)
+extern volatile bool g_wltrace;      // kurono.wltrace=1 (linux_syscall.cpp) (satoru)
 #include "window_manager.h"          // bridge surfaces to wm windows (satoru)
 #include "app_icons.h"               // per-app window logo ids (satoru)
 #include "../drivers/keyboard.h"     // Key enum -> linux evdev keycode map (satoru)
@@ -21,7 +34,10 @@
 // from its base, so the backing must start on a page. the embedded array does
 // not, and clients read the bytes in front of it ("unexpected non-ASCII
 // character"). copy it once into page-aligned memory shared by every client.
-static const uint8_t* keymap_backing() {
+static const uint8_t* keymap_backing(uint32_t* len) {
+    // the layout picked in settings: a page-aligned compiled keymap. (satoru)
+    if (const uint8_t* k = KeyLayouts::WaylandKeymap(len)) return k;
+    *len = g_xkb_keymap_us_len;
     static uint8_t* page = nullptr;
     if (!page) {
         uint8_t* p = (uint8_t*)PMM::AllocBytes(g_xkb_keymap_us_len);
@@ -37,7 +53,29 @@ namespace {
 
 using namespace WaylandServer;
 
-Client g_clients[WL_MAX_CLIENTS];
+// per-connection state is ~96 kb (the object table dominates). clients come
+// and go with apps, so the slots are pointers allocated on connect and freed
+// on disconnect; an idle compositor keeps only the 16-entry pointer array. (satoru)
+// the client table is chunked: 16-slot pointer chunks allocated on demand and never moved,
+// so a Client* and its slot index stay valid; g_ncap is the slot count of the allocated chunks (satoru)
+constexpr int CL_CHUNK = 16;
+Client** g_cl_chunks[WL_MAX_CLIENTS / CL_CHUNK];
+int      g_ncap = 0;
+Client*  g_cl_null = nullptr;
+inline Client** cl_ref(int i) {
+    if (i < 0 || i >= g_ncap) { g_cl_null = nullptr; return &g_cl_null; }
+    return &g_cl_chunks[i / CL_CHUNK][i % CL_CHUNK];
+}
+bool cl_grow() {
+    int n = g_ncap / CL_CHUNK;
+    if (n >= WL_MAX_CLIENTS / CL_CHUNK) return false;
+    Client** ch = (Client**)KernelHeap::Alloc(sizeof(Client*) * CL_CHUNK);
+    if (!ch) return false;
+    memset(ch, 0, sizeof(Client*) * CL_CHUNK);
+    g_cl_chunks[n] = ch;
+    g_ncap += CL_CHUNK;
+    return true;
+}
 int    g_listen_sd = -1;
 
 // Coarse mono-clock cache, refreshed on each on_data / DispatchPendingFrames
@@ -68,8 +106,9 @@ inline int str_len(const char* s) { int n = 0; while (s[n]) n++; return n; }
 
 Client* client_for_sd(int sd) {
     if (sd < 0) return nullptr;
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        if (g_clients[i].in_use && g_clients[i].sd == sd) return &g_clients[i];
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (c && c->in_use && c->sd == sd) return c;
     }
     return nullptr;
 }
@@ -109,6 +148,14 @@ inline void clear_obj_ext(Object& o) {
     o.buf_offset        = 0;
     o.buf_stride        = 0;
     o.buf_format        = 0;
+    o.buf_base          = nullptr;
+    o.buf_base_size     = 0;
+    o.pin_slot = 0; o.pin_pin = 0;
+    o.opq_valid         = false;
+    o.opq_x = 0; o.opq_y = 0; o.opq_w = 0; o.opq_h = 0;
+    o.reg_x0 = 0; o.reg_y0 = 0; o.reg_x1 = 0; o.reg_y1 = 0;
+    o.reg_adds = 0; o.reg_subs = 0;
+    o.commit_n = 0; o.commit_first_ms = 0; o.commit_last_ms = 0;
     o.pending_buffer_id = 0;
     o.attach_pending    = false;
     o.attach_x          = 0;
@@ -153,6 +200,7 @@ void reset_client_state(Client* c, int sd) {
     c->frame_cb_tail  = 0;
     c->serial_next    = 1;
     c->fatal          = false;
+    c->commit_n = 0; c->commit_first_ms = 0; c->commit_last_ms = 0;
     // input resources / focus start empty. (satoru)
     c->pointer_id          = 0;
     c->keyboard_id         = 0;
@@ -196,26 +244,121 @@ void reset_client_state(Client* c, int sd) {
 Client* alloc_client(int sd) {
     // First, evict any stale entry holding this sd.  The listening socket
     // layer recycles sd numbers when a client disconnects.
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        if (g_clients[i].in_use && g_clients[i].sd == sd) {
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (c && c->in_use && c->sd == sd) {
             clip_client_dropped(sd);   // stale connection's clipboard objects (satoru)
-            reset_client_state(&g_clients[i], sd);
-            return &g_clients[i];
+            reset_client_state(c, sd);
+            return c;
         }
     }
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        if (!g_clients[i].in_use) {
-            reset_client_state(&g_clients[i], sd);
-            return &g_clients[i];
+    for (int i = 0; i < g_ncap; i++) {
+        if (!(*cl_ref(i))) {
+            Client* c = (Client*)KernelHeap::Alloc(sizeof(Client));
+            if (!c) return nullptr;
+            memset(c, 0, sizeof(Client));
+            c->sd = -1;
+            (*cl_ref(i)) = c;
+        }
+        Client* c = (*cl_ref(i));
+        if (!c->in_use) {
+            reset_client_state(c, sd);
+            return c;
         }
     }
-    return nullptr;
+    // table full: add a chunk and take its first slot (satoru)
+    int first = g_ncap;
+    if (!cl_grow()) return nullptr;
+    Client* c = (Client*)KernelHeap::Alloc(sizeof(Client));
+    if (!c) return nullptr;
+    memset(c, 0, sizeof(Client));
+    c->sd = -1;
+    (*cl_ref(first)) = c;
+    reset_client_state(c, sd);
+    return c;
+}
+
+void log_commit_census(Client* c) {
+    if (!c || !g_wltrace) return;
+    if (c->commit_n >= 2) {
+        uint32_t span = c->commit_last_ms - c->commit_first_ms;
+        SerialLogger::Log("Wayland: client commits="); SerialLogger::LogDec((int)c->commit_n);
+        SerialLogger::Log(" span_ms="); SerialLogger::LogDec((int)span);
+        SerialLogger::Log(" fps="); SerialLogger::LogDec(span ? (int)(((uint64_t)(c->commit_n - 1) * 1000ull) / span) : 0);
+        SerialLogger::Log("\r\n");
+    }
+    for (int i = 0; i < c->object_high; i++) {
+        Object& o = c->objects[i];
+        if (!o.in_use || o.iface != WL_SURFACE || o.commit_n < 2) continue;
+        uint32_t span = o.commit_last_ms - o.commit_first_ms;
+        SerialLogger::Log("Wayland: surf="); SerialLogger::LogDec((int)o.id);
+        SerialLogger::Log(" commits="); SerialLogger::LogDec((int)o.commit_n);
+        SerialLogger::Log(" span_ms="); SerialLogger::LogDec((int)span);
+        SerialLogger::Log(" fps="); SerialLogger::LogDec(span ? (int)(((uint64_t)(o.commit_n - 1) * 1000ull) / span) : 0);
+        SerialLogger::Log("\r\n");
+    }
+}
+
+// true while any live client still names this exact SCM_RIGHTS pass (a pool or
+// one of its buffers carries the token). the last object drops the pass pin;
+// slot reuse cannot alias because the pin id is unique per pass. (satoru)
+bool pin_token_refed(uint32_t slot, uint32_t pin) {
+    if (!pin) return false;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use) continue;
+        for (int j = 0; j < c->object_high; j++) {
+            Object& o = c->objects[j];
+            if (!o.in_use) continue;
+            if ((o.iface == WL_SHM_POOL || o.iface == WL_BUFFER) &&
+                o.pin_slot == slot && o.pin_pin == pin) return true;
+        }
+    }
+    return false;
+}
+void pool_unpin_token(uint32_t slot, uint32_t pin) {
+    if (!g_wl_poolfree || !pin) return;
+    if (pin_token_refed(slot, pin)) return;
+    LinuxSyscall::ShmUnpinPin(slot, pin);
+}
+// a dropped client names no more pools: release every pass it held. its own
+// objects are skipped because c->in_use is already false. (satoru)
+void pool_release_client(Client* c) {
+    if (!g_wl_poolfree || !c) return;
+    for (int i = 0; i < c->object_high; i++) {
+        Object& o = c->objects[i];
+        if (!o.in_use) continue;
+        if (o.iface == WL_SHM_POOL || o.iface == WL_BUFFER)
+            pool_unpin_token(o.pin_slot, o.pin_pin);
+    }
+}
+
+// subtract a closing client's live shm objects from the census. called once at
+// each drop path; protocol destroys already decremented their own objects. (satoru)
+void pool_account_client(Client* c) {
+    if (!c) return;
+    for (int i = 0; i < c->object_high; i++) {
+        Object& o = c->objects[i];
+        if (!o.in_use) continue;
+        if (o.iface == WL_SHM_POOL) {
+            uint64_t b = o.pool_map_size ? o.pool_map_size : o.pool_size;
+            if (g_pp_pools_live) g_pp_pools_live--;
+            g_pp_pool_kb = (g_pp_pool_kb > (b >> 10)) ? g_pp_pool_kb - (b >> 10) : 0;
+        } else if (o.iface == WL_BUFFER) {
+            uint64_t b = (uint64_t)o.buf_stride * (uint64_t)(o.height > 0 ? o.height : 0);
+            if (g_pp_bufs_live) g_pp_bufs_live--;
+            g_pp_buf_kb = (g_pp_buf_kb > (b >> 10)) ? g_pp_buf_kb - (b >> 10) : 0;
+        }
+    }
 }
 
 void drop_client(Client* c) {
+    log_commit_census(c);
     if (!c || !c->in_use) return;
+    pool_account_client(c);
     int sd = c->sd;
     c->in_use = false;
+    pool_release_client(c);
     c->sd = -1;
     clip_client_dropped(sd);   // sources/offers/pulls/writes of this connection (satoru)
     // a dropped client's shadows went unfreed until its slot was reused. (satoru)
@@ -223,6 +366,11 @@ void drop_client(Client* c) {
     c->tx_len = 0;
     c->rx_partial_len = 0;
     UnixSocket::Close(sd);
+    // the slot's 96 kb goes back to the heap; the next client allocates its own.
+    for (int i = 0; i < g_ncap; i++) {
+        if ((*cl_ref(i)) == c) { (*cl_ref(i)) = nullptr; break; }
+    }
+    KernelHeap::Free(c);
 }
 
 Object* find_obj(Client* c, uint32_t id) {
@@ -596,7 +744,7 @@ inline uint32_t shm_px_to_native(uint32_t src, uint32_t fmt) {
 // window body (which happens every frame and would otherwise erase the
 // committed client pixels). small fixed table keyed by window id. (satoru)
 struct WlWinMap { int win_id; int sd; uint32_t surf_id; bool used; };
-WlWinMap g_winmap[WL_MAX_CLIENTS * 8];
+WlWinMap g_winmap[WL_MAX_CLIENTS * 4];
 
 void winmap_set(int win_id, int sd, uint32_t surf_id) {
     int free_slot = -1;
@@ -633,7 +781,7 @@ void winmap_clear(int win_id) {
 // rect. if use_damage is true only the accumulated damage rect is painted;
 // otherwise the whole buffer is painted (used for full wm repaints). (satoru)
 void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
-                         int ox = 0, int oy = 0);
+                         int ox = 0, int oy = 0, bool src_alpha = false);
 void blit_child_subsurfaces(Client* c, Object* parent_surf, Window* pwin);
 // forward decls: keyboard focus emitters (defined below) so a toplevel can be
 // auto-focused on map - see the note in commit_surface. (satoru)
@@ -681,7 +829,7 @@ void wl_render_thunk(Window* win, int x, int y, int w, int h) {
         }
     }
     blit_surface_region(c, surf, win, /*use_damage=*/false,
-                        -surf->geo_x, -surf->geo_y);
+                        -surf->geo_x, -surf->geo_y, g_wl_childalpha);
     // a wm repaint refills the whole content rect from the parent buffer, which
     // would re-cover any subsurface content - re-composite children on top.
     // forward-declared below; defined with commit_surface. (satoru)
@@ -907,11 +1055,45 @@ int bridge_surface_window(Client* c, Object* surf, int w, int h) {
 // intersection with the damage rect is touched. alpha is the per-surface
 // alpha (255 = use source as-is). writes into the graphics back buffer in
 // its native layout, then marks the touched region dirty. (satoru)
+// premultiplied ARGB over an opaque destination: the wayland spec says shm
+// argb8888 pixels are premultiplied, so out = src + dst*(1-a) (NOT src*a). (satoru)
+static inline uint32_t premul_over(uint32_t s, uint32_t d, uint32_t a) {
+    uint32_t inv = 255u - a;
+    uint32_t r = ((s >> 16) & 0xFFu) + ((((d >> 16) & 0xFFu) * inv + 127u) / 255u);
+    uint32_t g = ((s >> 8)  & 0xFFu) + ((((d >> 8)  & 0xFFu) * inv + 127u) / 255u);
+    uint32_t b = ( s        & 0xFFu) + ((( d        & 0xFFu) * inv + 127u) / 255u);
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+// blit `bw x bh` argb pixels from `src` (row stride `stride` bytes) into
+// the window content rect at (dst_x,dst_y), clipped to (clip_*). only the
+// intersection with the damage rect is touched. alpha is the per-surface
+// alpha (255 = use source as-is). src_premul enables the wayland ARGB rules
+// (premultiplied per-pixel alpha; the (opx,opy,opw,oph) rect in source coords
+// is fully opaque and skips the blend). xrgb8888 is always opaque. (satoru)
 void blit_argb(const uint8_t* src, uint32_t stride, int bw, int bh,
                uint32_t fmt, int dst_x, int dst_y,
                int clip_x, int clip_y, int clip_w, int clip_h,
-               uint8_t surf_alpha) {
+               uint8_t surf_alpha, bool src_premul,
+               int opx, int opy, int opw, int oph) {
     if (!src || bw <= 0 || bh <= 0) return;
+    // the damage scissor (kurono.gfx.scissor=1) bounds the clip too; without a
+    // compositor pass this is the whole screen and changes nothing. (satoru)
+    {
+        int bx0, by0, bx1, by1;
+        Graphics::ScissorBounds(bx0, by0, bx1, by1);
+        int cx1 = clip_x + clip_w, cy1 = clip_y + clip_h;
+        if (clip_x < bx0) clip_x = bx0;
+        if (clip_y < by0) clip_y = by0;
+        if (cx1 > bx1) cx1 = bx1;
+        if (cy1 > by1) cy1 = by1;
+        clip_w = cx1 - clip_x;
+        clip_h = cy1 - clip_y;
+        if (clip_w <= 0 || clip_h <= 0) return;
+    }
     uint8_t* fb   = Graphics::GetBackBuffer();
     if (!fb) fb   = Graphics::GetActiveBuffer();
     if (!fb) return;
@@ -930,11 +1112,30 @@ void blit_argb(const uint8_t* src, uint32_t stride, int bw, int bh,
                 int px = dst_x + col;
                 if (px < clip_x || px >= clip_x + clip_w || px < 0 || px >= sw) continue;
                 uint32_t native = shm_px_to_native(s[col], fmt);
-                if (surf_alpha < 255) {
-                    uint32_t bg  = Graphics::ReadPixel(px, py);
-                    native = Graphics::BlendColors(native, bg, surf_alpha);
+                if (!src_premul) {
+                    if (surf_alpha < 255) native = Graphics::BlendColors(native, Graphics::ReadPixel(px, py), surf_alpha);
+                    Graphics::DrawPixel(px, py, native);
+                    continue;
                 }
-                Graphics::DrawPixel(px, py, native);
+                if (fmt != WL_SHM_ARGB8888) {
+                    if (surf_alpha < 255) native = Graphics::BlendColors(native, Graphics::ReadPixel(px, py), surf_alpha);
+                    Graphics::DrawPixel(px, py, native);
+                    continue;
+                }
+                bool opaque = (opw > 0 && oph > 0 &&
+                               col >= opx && col < opx + opw && row >= opy && row < opy + oph);
+                uint32_t a = (native >> 24) & 0xFFu;
+                if (surf_alpha < 255) {
+                    uint32_t sa = surf_alpha;
+                    native = ((a * sa / 255u) << 24) |
+                             ((((native >> 16) & 0xFFu) * sa / 255u) << 16) |
+                             ((((native >> 8) & 0xFFu) * sa / 255u) << 8) |
+                             ((native & 0xFFu) * sa / 255u);
+                    a = a * sa / 255u;
+                }
+                if (opaque || a == 255) { Graphics::DrawPixel(px, py, native); continue; }
+                if (a == 0) continue;
+                Graphics::DrawPixel(px, py, premul_over(native, Graphics::ReadPixel(px, py), a));
             }
         }
         return;
@@ -952,13 +1153,34 @@ void blit_argb(const uint8_t* src, uint32_t stride, int bw, int bh,
             if (px < 0 || px >= sw) continue;
             uint32_t native = shm_px_to_native(s[col], fmt);
             uint32_t* d = (uint32_t*)(dst_row + (size_t)px * 4);
-            if (surf_alpha < 255) {
-                uint32_t bg = *d;
-                uint32_t out = Graphics::BlendColors(native, bg, surf_alpha);
-                *d = out;
-            } else {
-                *d = native;
+            if (!src_premul) {
+                // default path: per-window opacity modulates the client pixels
+                // exactly like the per-pixel path below does. (satoru)
+                if (surf_alpha < 255) *d = Graphics::BlendColors(native, *d, surf_alpha);
+                else                  *d = native;
+                continue;
             }
+            if (fmt != WL_SHM_ARGB8888) {
+                // childalpha flag on, opaque format: still honour the window
+                // opacity (parity with the per-pixel path). (satoru)
+                if (surf_alpha < 255) *d = Graphics::BlendColors(native, *d, surf_alpha);
+                else                  *d = native;
+                continue;
+            }
+            bool opaque = (opw > 0 && oph > 0 &&
+                           col >= opx && col < opx + opw && row >= opy && row < opy + oph);
+            uint32_t a = (native >> 24) & 0xFFu;
+            if (surf_alpha < 255) {
+                uint32_t sa = surf_alpha;
+                native = ((a * sa / 255u) << 24) |
+                         ((((native >> 16) & 0xFFu) * sa / 255u) << 16) |
+                         ((((native >> 8) & 0xFFu) * sa / 255u) << 8) |
+                         ((native & 0xFFu) * sa / 255u);
+                a = a * sa / 255u;
+            }
+            if (opaque || a == 255) { *d = native; continue; }
+            if (a == 0) continue;
+            *d = premul_over(native, *d, a);
         }
     }
 }
@@ -968,7 +1190,7 @@ void blit_argb(const uint8_t* src, uint32_t stride, int bw, int bh,
 // painted (incremental commit path); otherwise the whole buffer is painted
 // (full wm repaint path). returns true if any pixels were written. (satoru)
 void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
-                         int ox, int oy) {
+                         int ox, int oy, bool src_alpha) {
     if (!surf || !win) return;
     // source = the surface's SHADOW when it has one (the accumulated committed
     // pixels - see update_surface_shadow); the raw pool only as a fallback for
@@ -991,6 +1213,10 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
         if (bid == 0) return;                   // nothing attached
         Object* buf = find_obj(c, bid);
         if (!buf || buf->iface != WL_BUFFER) return;
+        // F6: a dropped client's pools are unpinned (kurono.wl.poolfree), so its backing
+        // may be gone. with no filled shadow there is nothing safe to read: skip it.
+        // (this runs on the pump thread, the same one that drops clients.) (satoru)
+        if (g_wl_poolfree && !c->in_use) return;
         bw = buf->width; bh = buf->height;
         Object* pool = find_obj(c, buf->buf_pool_id);
         base  = (pool && pool->iface == WL_SHM_POOL) ? pool->pool_base : nullptr;
@@ -1008,6 +1234,20 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
     int cw = win->content_w;
     int ch = win->content_h;
     if (cw <= 0 || ch <= 0) return;
+    if (g_wltrace) {
+        static int s_bl = 0;
+        if (s_bl < 24) {
+            s_bl++;
+            SerialLogger::Log("[wld] win="); SerialLogger::LogDec(win->id);
+            SerialLogger::Log(" surf="); SerialLogger::LogDec((int)surf->id);
+            SerialLogger::Log(" cr="); SerialLogger::LogDec(cx); SerialLogger::Log(","); SerialLogger::LogDec(cy);
+            SerialLogger::Log(","); SerialLogger::LogDec(cw); SerialLogger::Log(","); SerialLogger::LogDec(ch);
+            SerialLogger::Log(" bw="); SerialLogger::LogDec(bw); SerialLogger::Log("x"); SerialLogger::LogDec(bh);
+            SerialLogger::Log(" sh="); SerialLogger::LogDec(surf->shadow_filled ? 1 : 0);
+            SerialLogger::Log(" dam="); SerialLogger::LogDec(use_damage ? 1 : 0);
+            SerialLogger::Log("\r\n");
+        }
+    }
 
     // region in surface-local coords; default to the full buffer. (satoru)
     int dx = 0, dy = 0, dw = bw, dh = bh;
@@ -1020,6 +1260,23 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
         if (dy + dh > bh) dh = bh - dy;
     }
     if (dw <= 0 || dh <= 0) return;
+    // kurono.gfx.scissor=1, outside a compositor pass (a commit): mark the damage and
+    // let the window's render thunk blit it inside the pass, in stacking order. a blit
+    // here went straight into the back buffer over any window stacked above this one;
+    // a frame repaints that, but a move-by-copy of the window on top first carried the
+    // foreign pixels to its new place, where nothing repaints them. (satoru)
+    if (Graphics::ScissorEnabled() && !g_wl_scdirect) {
+        int gx, gy, gw, gh;
+        if (!Graphics::GetScissor(gx, gy, gw, gh)) {
+            int x0 = cx + ox + dx, y0 = cy + oy + dy, x1 = x0 + dw, y1 = y0 + dh;
+            if (x0 < cx) x0 = cx;
+            if (y0 < cy) y0 = cy;
+            if (x1 > cx + cw) x1 = cx + cw;
+            if (y1 > cy + ch) y1 = cy + ch;
+            if (x1 > x0 && y1 > y0) Graphics::MarkDirty(x0, y0, x1 - x0, y1 - y0);
+            return;
+        }
+    }
 
     // bound the last byte we would touch against the source size so a short /
     // malformed pool (or a stale shadow) can never read out of bounds. (satoru)
@@ -1041,9 +1298,17 @@ void blit_surface_region(Client* c, Object* surf, Window* win, bool use_damage,
     // ox/oy shift the destination for a subsurface composited onto its parent
     // window (0,0 for a normal toplevel). the clip stays the window content rect
     // so a subsurface can't paint outside its parent. (satoru)
+    // the opaque region is in buffer coords; shift it into the blit's source
+    // coords (the src already starts at the damage rect's dx,dy). only argb
+    // surfaces use it. (satoru)
+    int opx = 0, opy = 0, opw = 0, oph = 0;
+    if (src_alpha && sfmt == WL_SHM_ARGB8888 && surf->opq_valid) {
+        opx = surf->opq_x - dx; opy = surf->opq_y - dy;
+        opw = surf->opq_w; oph = surf->opq_h;
+    }
     blit_argb(src, sstride, dw, dh, sfmt,
               cx + ox + dx, cy + oy + dy,
-              cx, cy, cw, ch, (uint8_t)eff);
+              cx, cy, cw, ch, (uint8_t)eff, src_alpha, opx, opy, opw, oph);
     if (use_damage) Graphics::MarkDirty(cx + ox + dx, cy + oy + dy, dw, dh);
 }
 
@@ -1153,7 +1418,7 @@ void blit_surface_children(Client* c, Object* parent, Window* win, int pox, int 
         // a filled shadow is displayable even when the client has since detached
         // or DESTROYED the committed wl_buffer (gtk destroys released buffers). (satoru)
         if (child->pending_buffer_id != 0 || (child->shadow && child->shadow_filled))
-            blit_surface_region(c, child, win, /*use_damage=*/false, ox, oy);
+            blit_surface_region(c, child, win, /*use_damage=*/false, ox, oy, g_wl_childalpha);
         blit_surface_children(c, child, win, ox, oy, depth + 1);
     }
     uint32_t last = 0;
@@ -1173,7 +1438,7 @@ void blit_surface_children(Client* c, Object* parent, Window* win, int pox, int 
         int ox = pox + parent->geo_x + best->popup_x - best->geo_x;
         int oy = poy + parent->geo_y + best->popup_y - best->geo_y;
         if (best->shadow && best->shadow_filled)
-            blit_surface_region(c, best, win, /*use_damage=*/false, ox, oy);
+            blit_surface_region(c, best, win, /*use_damage=*/false, ox, oy, g_wl_childalpha);
         blit_surface_children(c, best, win, ox, oy, depth + 1);
     }
 }
@@ -1321,9 +1586,13 @@ void popup_send_configure(Client* c, Object* popup, Object* psurf, bool repos, u
 void update_surface_shadow(Client* c, Object* surf, Object* buf) {
     int bw = buf->width, bh = buf->height;
     if (bw <= 0 || bh <= 0) return;
-    Object* pool = find_obj(c, buf->buf_pool_id);
-    const uint8_t* base = (pool && pool->iface == WL_SHM_POOL) ? pool->pool_base : nullptr;
-    uint32_t psize = pool ? pool->pool_size : 0;
+    const uint8_t* base = buf->buf_base;
+    uint32_t psize = buf->buf_base_size;
+    if (!base) {
+        Object* pool = find_obj(c, buf->buf_pool_id);   // pre-create_buffer path (satoru)
+        base = (pool && pool->iface == WL_SHM_POOL) ? pool->pool_base : nullptr;
+        psize = pool ? pool->pool_size : 0;
+    }
     if (!base) return;                          // no mapping yet - nothing to copy (satoru)
 
     // (re)allocate on first use or resize; a resize invalidates old content. (satoru)
@@ -1422,6 +1691,31 @@ void commit_surface(Client* c, Object* surf) {
     // accumulate this commit's pixels into the shadow BEFORE any blit - all
     // blits below (and later wm repaints) read the shadow. (satoru)
     update_surface_shadow(c, surf, buf);
+    if (g_wltrace) {
+        static int s_cm = 0;
+        if (s_cm < 24) {
+            s_cm++;
+            uint32_t px0 = 0xFFFFFFFFu, pxc = 0xFFFFFFFFu;
+            const uint8_t* b0 = buf->buf_base ? buf->buf_base + buf->buf_offset : nullptr;
+            if (b0) { px0 = *(const uint32_t*)b0;
+                      pxc = *(const uint32_t*)(b0 + (uint64_t)(buf->height / 2) * buf->buf_stride + (uint64_t)(buf->width / 2) * 4u); }
+            SerialLogger::Log("[wlc] surf="); SerialLogger::LogDec((int)surf->id);
+            SerialLogger::Log(" buf="); SerialLogger::LogDec((int)buf->id);
+            SerialLogger::Log(" dam="); SerialLogger::LogDec(surf->damage.valid ? 1 : 0);
+            SerialLogger::Log(" filled="); SerialLogger::LogDec(surf->shadow_filled ? 1 : 0);
+            SerialLogger::Log(" px0="); SerialLogger::LogHex(px0);
+            SerialLogger::Log(" pxc="); SerialLogger::LogHex(pxc);
+            if (surf->shadow && surf->shadow_w > 1 && surf->shadow_h > 1) {
+                const uint32_t* sh = (const uint32_t*)surf->shadow;
+                SerialLogger::Log(" shc="); SerialLogger::LogHex(sh[(surf->shadow_h/2)*(surf->shadow_w) + surf->shadow_w/2]);
+                SerialLogger::Log(" shw="); SerialLogger::LogDec(surf->shadow_w);
+                SerialLogger::Log(" shh="); SerialLogger::LogDec(surf->shadow_h);
+            }
+            SerialLogger::Log(" geo="); SerialLogger::LogDec(surf->geo_x); SerialLogger::Log(","); SerialLogger::LogDec(surf->geo_y);
+            SerialLogger::Log(","); SerialLogger::LogDec(surf->geo_w); SerialLogger::Log(","); SerialLogger::LogDec(surf->geo_h);
+            SerialLogger::Log("\r\n");
+        }
+    }
     // wl_buffer::release (event opcode 0): the shadow now owns the pixels, so the
     // client may reuse this buffer immediately. WITHOUT this firefox exhausts its
     // small buffer pool after the FIRST frame and blocks forever waiting for a
@@ -1454,7 +1748,7 @@ void commit_surface(Client* c, Object* surf) {
                 // geometry crop shifts them into content coords. (satoru)
                 blit_surface_region(c, surf, pwin, /*use_damage=*/true,
                                     role->subsurface_x - psurf->geo_x,
-                                    role->subsurface_y - psurf->geo_y);
+                                    role->subsurface_y - psurf->geo_y, g_wl_childalpha);
                 {   // census marker: the first real content commit (gecko's content
                     // subsurface composited onto its toplevel). KWPAINT alone also fires
                     // for the empty csd frame of a window that stays black. (satoru)
@@ -1583,11 +1877,21 @@ void commit_surface(Client* c, Object* surf) {
     // -geo shift crops the csd margins: buffer pixel (geo_x,geo_y) lands at
     // content (0,0). (satoru)
     blit_surface_region(c, surf, win, /*use_damage=*/true,
-                        -surf->geo_x, -surf->geo_y);
+                        -surf->geo_x, -surf->geo_y, g_wl_childalpha);
     // re-composite any child subsurfaces on top so the parent's fresh (black)
     // buffer doesn't cover content the client committed into a child. (satoru)
-    blit_child_subsurfaces(c, surf, win);
-    WindowManager::MarkDirty(wid);
+    // under kurono.gfx.scissor=1 the blit above only marked the committed damage, and
+    // the pass repaints the window (children included) inside it. marking the whole
+    // window on every commit made a hover in a big window a full-screen frame (the
+    // files window is 65% of a 1024x768 screen) and a 16 mb flip. a first commit, or
+    // one without damage, still marks the window. (satoru)
+    bool precise = Graphics::ScissorEnabled() && !g_wl_scdirect && !newly_bridged && surf->damage.valid;
+    if (precise) {
+        WindowManager::InvalidateDragBackdrop();
+    } else {
+        blit_child_subsurfaces(c, surf, win);
+        WindowManager::MarkDirty(wid);
+    }
     surf->damage.valid = false;
 }
 
@@ -1689,9 +1993,9 @@ Object* surface_at_global(Client** out_client, int gx, int gy) {
     Object* best = nullptr;
     Client* best_c = nullptr;
     int best_z = -0x7FFFFFFF;
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use) continue;
         for (int j = 0; j < c->object_high; j++) {
             Object& o = c->objects[j];
             if (!o.in_use || o.iface != WL_SURFACE || !o.wm_window) continue;
@@ -1982,9 +2286,9 @@ void kbds_leave(Client* c, uint32_t surf) {
 // surface that is not one of its windows (gecko's content subsurface), so a
 // leave/enter pair onto such a surface would leave gdk with no focus. (satoru)
 void set_keyboard_focus(Client* c, uint32_t sid) {
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* o = &g_clients[i];
-        if (!o->in_use || o == c || o->keyboard_focus_sid == 0) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* o = (*cl_ref(i));
+        if (!o || !o->in_use || o == c || o->keyboard_focus_sid == 0) continue;
         if (find_obj(o, o->keyboard_focus_sid)) kbds_leave(o, o->keyboard_focus_sid);
         o->keyboard_focus_sid = 0;
         // flush only: a failed flush marks it fatal and the dispatch loop drops
@@ -2364,9 +2668,9 @@ void clip_send_device_selection(Client* c, bool primary, uint32_t offer_id) {
 
 void clip_broadcast_locked(bool primary) {
     ClipSelection& sel = clip_sel(primary);
-    for (int ci = 0; ci < WL_MAX_CLIENTS; ci++) {
-        Client* c = &g_clients[ci];
-        if (!c->in_use) continue;
+    for (int ci = 0; ci < g_ncap; ci++) {
+        Client* c = (*cl_ref(ci));
+        if (!c || !c->in_use) continue;
         uint32_t old = primary ? c->primary_offer_id : c->clip_offer_id;
         if (old) {
             clip_remove_offer(c->sd, old);
@@ -2715,13 +3019,38 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
             break;
         }
         case WL_REGION: {
-            // destroy=0, add=1 (x,y,w,h), subtract=2. only emptiness matters:
-            // an input region with at least one added rect accepts input. (satoru)
+            // destroy=0, add=1 (x,y,w,h), subtract=2. emptiness drives the
+            // input-region rule; the bbox + add/sub counts let set_opaque_region
+            // snapshot a single-rect opaque area for the ARGB blend. (satoru)
             if (opcode == 0) { destroy_obj(c, object_id); break; }
             if (opcode == 1 && args_len >= 16) {
+                int32_t rx = (int32_t)get32(args);
+                int32_t ry = (int32_t)get32(args + 4);
                 int32_t rw = (int32_t)get32(args + 8);
                 int32_t rh = (int32_t)get32(args + 12);
-                if (rw > 0 && rh > 0) obj->region_has_rect = true;
+                if (rw > 0 && rh > 0) {
+                    // w/h are int32 and the sum can wrap: compute the far edge
+                    // in 64 bits, then clamp into the bbox field range. (satoru)
+                    int64_t rx1 = (int64_t)rx + rw;
+                    int64_t ry1 = (int64_t)ry + rh;
+                    if (rx1 > INT32_MAX) rx1 = INT32_MAX;
+                    if (rx1 < INT32_MIN) rx1 = INT32_MIN;
+                    if (ry1 > INT32_MAX) ry1 = INT32_MAX;
+                    if (ry1 < INT32_MIN) ry1 = INT32_MIN;
+                    obj->region_has_rect = true;
+                    if (obj->reg_adds == 0) {
+                        obj->reg_x0 = rx; obj->reg_y0 = ry;
+                        obj->reg_x1 = (int32_t)rx1; obj->reg_y1 = (int32_t)ry1;
+                    } else {
+                        if (rx < obj->reg_x0) obj->reg_x0 = rx;
+                        if (ry < obj->reg_y0) obj->reg_y0 = ry;
+                        if (rx1 > obj->reg_x1) obj->reg_x1 = (int32_t)rx1;
+                        if (ry1 > obj->reg_y1) obj->reg_y1 = (int32_t)ry1;
+                    }
+                    obj->reg_adds++;
+                }
+            } else if (opcode == 2 && args_len >= 16) {
+                obj->reg_subs++;
             }
             break;
         }
@@ -2791,6 +3120,12 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 // read the client's real pixels instead of a null pool. (satoru)
                 UnixSocket::ControlMsg cm;
                 bool gotcm = po && UnixSocket::TakePendingControl(c->sd, &cm);
+                if (g_wltrace) {
+                    SerialLogger::Log("[wlp] create_pool sd="); SerialLogger::LogDec(c->sd);
+                    SerialLogger::Log(" id="); SerialLogger::LogDec((int)pid);
+                    SerialLogger::Log(" sz="); SerialLogger::LogDec((int)size);
+                    SerialLogger::Log(" cm="); SerialLogger::LogDec(gotcm ? 1 : 0); SerialLogger::Log("\r\n");
+                }
                 if (gotcm) {
                     for (int i = 0; i < cm.passed_fd_count; i++) {
                         if (!cm.passed_shm_base[i]) continue;
@@ -2799,8 +3134,15 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                         uint32_t msz = msz64 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)msz64;
                         po->pool_size = (size && size <= msz) ? size : msz;
                         po->pool_map_size = msz;   // the real backing (satoru)
+                        po->pin_slot = cm.passed_shm_slot[i];
+                        po->pin_pin  = cm.passed_shm_pin[i];
                         break;
                     }
+                }
+                if (po) {
+                    g_pp_pools_live++; g_pp_pools_made++;
+                    uint64_t b = po->pool_map_size ? po->pool_map_size : po->pool_size;
+                    g_pp_pool_kb += b >> 10;
                 }
             }
             break;
@@ -2838,9 +3180,34 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     bo->height      = bh;
                     bo->buf_stride  = stride ? stride : (uint32_t)bw * 4u;
                     bo->buf_format  = format;
+                    // keep the pool mapping alive with the buffer: mesa destroys
+                    // the wl_shm_pool immediately after create_buffer. (satoru)
+                    bo->buf_base      = obj->pool_base;
+                    bo->buf_base_size = obj->pool_map_size;
+                    bo->pin_slot      = obj->pin_slot;   // the pool's pass
+                    bo->pin_pin       = obj->pin_pin;
+                    g_pp_bufs_live++; g_pp_bufs_made++;
+                    g_pp_buf_kb += ((uint64_t)bo->buf_stride * (uint64_t)bh) >> 10;
+                    if (g_wltrace) {
+                        SerialLogger::Log("[wlb] buf="); SerialLogger::LogDec((int)bid);
+                        SerialLogger::Log(" "); SerialLogger::LogDec(bw); SerialLogger::Log("x"); SerialLogger::LogDec(bh);
+                        SerialLogger::Log(" st="); SerialLogger::LogDec((int)bo->buf_stride);
+                        SerialLogger::Log(" fmt="); SerialLogger::LogDec((int)format);
+                        SerialLogger::Log(" base="); SerialLogger::LogHex64((uint64_t)(uintptr_t)bo->buf_base);
+                        SerialLogger::Log(" psz="); SerialLogger::LogDec((int)bo->buf_base_size); SerialLogger::Log("\r\n");
+                    }
                 }
             } else if (opcode == 1) {             // destroy
-                destroy_obj(c, object_id);
+                {
+                    uint64_t b = obj->pool_map_size ? obj->pool_map_size : obj->pool_size;
+                    if (g_pp_pools_live) g_pp_pools_live--;
+                    g_pp_pool_kb = (g_pp_pool_kb > (b >> 10)) ? g_pp_pool_kb - (b >> 10) : 0;
+                }
+                {
+                    uint32_t pslot = obj->pin_slot, ppin = obj->pin_pin;
+                    destroy_obj(c, object_id);
+                    pool_unpin_token(pslot, ppin);
+                }
             } else if (opcode == 2) {             // resize
                 // resize(size): grow the pool hint. (satoru)
                 // never past the mapped backing: pool_base was bound at create
@@ -2855,6 +3222,12 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
         }
         case WL_BUFFER: {
             if (opcode == 0) {                    // destroy
+                {
+                    uint64_t b = (uint64_t)obj->buf_stride * (uint64_t)(obj->height > 0 ? obj->height : 0);
+                    if (g_pp_bufs_live) g_pp_bufs_live--;
+                    g_pp_buf_kb = (g_pp_buf_kb > (b >> 10)) ? g_pp_buf_kb - (b >> 10) : 0;
+                }
+                uint32_t bslot = obj->pin_slot, bpin = obj->pin_pin;
                 // no surface may keep naming a dead buffer: libwayland reuses the
                 // id for the next new object. (satoru)
                 for (int i = 0; i < c->object_high; i++) {
@@ -2865,6 +3238,7 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     }
                 }
                 destroy_obj(c, object_id);
+                pool_unpin_token(bslot, bpin);
             }
             break;
         }
@@ -2944,6 +3318,36 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 destroy_obj(c, object_id);
             }
             // accept=0, finish=3, set_actions=4: dnd only. (satoru)
+            break;
+        }
+        case ZXDG_DECORATION_MGR: {
+            if (!g_wl_deco) break;   // default: same as the old unimplemented global (satoru)
+            // xdg-decoration v1: kurono's wm draws the titlebar and border for
+            // every bridged toplevel, so tell clients the decorations are
+            // server-side. without the configure event libdecor waits for a
+            // mode that never arrives. (satoru)
+            if (opcode == 0) {                    // destroy
+                destroy_obj(c, object_id);
+            } else if (opcode == 1) {             // get_toplevel_decoration(new_id, toplevel)
+                if (args_len < 8) return;
+                uint32_t did = get32(args);
+                uint32_t tid = get32(args + 4);
+                if (!register_obj(c, did, ZXDG_TOPLEVEL_DECORATION, 1)) return;
+                Object* d = find_obj(c, did);
+                if (d) d->parent_surface_id = tid;
+                uint8_t mode[4]; put32(mode, 1);  // mode_server_side
+                send_event(c, did, 0, mode, 4);
+            }
+            break;
+        }
+        case ZXDG_TOPLEVEL_DECORATION: {
+            // destroy=0, set_mode=1, unset_mode=2. the mode is fixed to
+            // server-side; answer every request with that mode. (satoru)
+            if (opcode == 0) { destroy_obj(c, object_id); break; }
+            if (opcode == 1 || opcode == 2) {
+                uint8_t mode[4]; put32(mode, 1);
+                send_event(c, object_id, 0, mode, 4);
+            }
             break;
         }
         case ZWP_PRIMARY_MGR: {
@@ -3112,8 +3516,13 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 // ran headless-invisible. the csd margins are removed by the
                 // set_window_geometry crop instead. (satoru)
                 uint8_t cfg[16];
-                put32(cfg + 0, 1024);
-                put32(cfg + 4, 768);
+                uint32_t cfgw = 1024, cfgh = 768;
+                if (g_wl_fullsize) {
+                    int sw0 = Graphics::GetWidth(), sh0 = Graphics::GetHeight();
+                    if (sw0 > 0 && sh0 > 0) { cfgw = (uint32_t)sw0; cfgh = (uint32_t)sh0; }
+                }
+                put32(cfg + 0, cfgw);
+                put32(cfg + 4, cfgh);
                 put32(cfg + 8, 4);                // states array = 4 bytes (1 entry)
                 put32(cfg + 12, 4);               // XDG_TOPLEVEL_STATE_ACTIVATED
                 send_event(c, tid, 0, cfg, 16);
@@ -3250,6 +3659,26 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     push_frame_cb(c, cb);
                     break;
                 }
+                case 4: {                          // set_opaque_region(region)
+                    // snapshot a single-add region: the blit may skip per-pixel
+                    // blending there (firefox/gtk mark the whole toplevel opaque).
+                    // a multi-rect or subtractive region just disables the
+                    // shortcut; the alpha channel still decides. (satoru)
+                    if (args_len < 4) return;
+                    uint32_t rid = get32(args);
+                    obj->opq_valid = false;
+                    if (rid == 0) break;
+                    Object* reg = find_obj(c, rid);
+                    if (reg && reg->iface == WL_REGION && reg->reg_adds == 1 &&
+                        reg->reg_subs == 0 && reg->reg_x1 > reg->reg_x0 &&
+                        reg->reg_y1 > reg->reg_y0) {
+                        obj->opq_x = reg->reg_x0; obj->opq_y = reg->reg_y0;
+                        obj->opq_w = reg->reg_x1 - reg->reg_x0;
+                        obj->opq_h = reg->reg_y1 - reg->reg_y0;
+                        obj->opq_valid = true;
+                    }
+                    break;
+                }
                 case 5: {                          // set_input_region(region)
                     // region id 0 (null) = whole surface takes input (the
                     // default). an EMPTY region = input passes through this
@@ -3265,6 +3694,15 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                     break;
                 }
                 case 6: {                          // commit
+                    if (g_wltrace) {
+                        uint32_t cnow = Timer::GetRealMs();
+                        if (obj->commit_n == 0) obj->commit_first_ms = cnow;
+                        obj->commit_last_ms = cnow;
+                        obj->commit_n++;
+                        if (c->commit_n == 0) c->commit_first_ms = cnow;
+                        c->commit_last_ms = cnow;
+                        c->commit_n++;
+                    }
                     // apply the attached buffer: blit damaged region into
                     // the bridged window's content rect (consumes damage).
                     // (satoru)
@@ -3319,16 +3757,18 @@ void handle_request(Client* c, uint32_t object_id, uint16_t opcode,
                 {
                     tx_flush(c);
                     uint8_t km[16];
+                    uint32_t km_len = 0;
+                    const uint8_t* km_base = keymap_backing(&km_len);
                     put32(km + 0, kid);
                     put16(km + 4, 0);                       // wl_keyboard.keymap
                     put16(km + 6, 16);                      // header+8 payload
                     put32(km + 8, 1);                       // format XKB_V1
-                    put32(km + 12, g_xkb_keymap_us_len);    // size incl. nul
+                    put32(km + 12, km_len);                 // size incl. nul
                     UnixSocket::ControlMsg kcm = {};
                     kcm.passed_fd_count   = 1;
                     kcm.passed_fds[0]     = 1;              // sender-fd slot, unused (satoru)
-                    kcm.passed_shm_base[0] = (uint64_t)(uintptr_t)keymap_backing();
-                    kcm.passed_shm_size[0] = g_xkb_keymap_us_len;
+                    kcm.passed_shm_base[0] = (uint64_t)(uintptr_t)km_base;
+                    kcm.passed_shm_size[0] = km_len;
                     if (UnixSocket::KernelInjectMsg(c->sd, km, 16, &kcm) < 0)
                         c->fatal = true;
                 }
@@ -3444,15 +3884,26 @@ void on_connect(int server_sd, int new_client_sd, void* user) {
 }  // namespace
 
 namespace WaylandServer {
+    void SetChildAlpha(bool on) { g_wl_childalpha = on; }
+    void SetScissorDirectBlit(bool on) { g_wl_scdirect = on; }
+    void SetDecoration(bool on) { g_wl_deco = on; }
+    void SetFullsize(bool on) { g_wl_fullsize = on; }
+    void SetPoolFree(bool on) { g_wl_poolfree = on; }
+    void PoolCensus(int* pools_live, int* pools_made, uint64_t* pool_kb,
+                    int* bufs_live, int* bufs_made, uint64_t* buf_kb,
+                    uint64_t* shadow_kb) {
+        if (pools_live) *pools_live = (int)g_pp_pools_live;
+        if (pools_made) *pools_made = (int)g_pp_pools_made;
+        if (pool_kb)    *pool_kb = g_pp_pool_kb;
+        if (bufs_live)  *bufs_live = (int)g_pp_bufs_live;
+        if (bufs_made)  *bufs_made = (int)g_pp_bufs_made;
+        if (buf_kb)     *buf_kb = g_pp_buf_kb;
+        if (shadow_kb)  *shadow_kb = g_shadow_bytes >> 10;
+    }
 
 void Init() {
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        g_clients[i].in_use     = false;
-        g_clients[i].sd         = -1;
-        g_clients[i].generation = 0;
-        g_clients[i].tx_len     = 0;
-        g_clients[i].rx_partial_len = 0;
-    }
+    if (g_ncap == 0) cl_grow();   // first chunk up front (satoru)
+    for (int i = 0; i < g_ncap; i++) (*cl_ref(i)) = nullptr;
 
     g_listen_sd = UnixSocket::Create(UnixSocket::UNIX_SOCK_STREAM);
     if (g_listen_sd < 0) {
@@ -3491,13 +3942,18 @@ void DispatchPendingFrames() {
     clip_pump_all();   // drain selection pulls / pending offer writes (satoru)
     uint8_t pl[4];
     put32(pl, g_now_ms);                         // monotonic ms timestamp
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use) continue;
         // Liveness probe - KernelInject returns -1 if the sd has been
         // closed beneath us (no on_disconnect callback exists).
-        if (UnixSocket::KernelInject(c->sd, "", 0) < 0) {
-            c->in_use = false; c->sd = -1; c->tx_len = 0;
+        // a zero-length inject succeeds even after the peer closed, so ask the
+        // socket layer directly: a dead client must drop its surfaces here. (satoru)
+        if (UnixSocket::PeerClosed(c->sd) || UnixSocket::KernelInject(c->sd, "", 0) < 0) {
+            // drop_client also closes the server end of the connection and frees the
+            // slot: clearing in_use alone left that socket in use forever, one per
+            // app run, until the unix table and its 256 service slots ran out. (satoru)
+            drop_client(c);
             continue;
         }
         // a frame callback fires after its surface's commit (delivered there,
@@ -3579,9 +4035,9 @@ bool ClipboardGetForOffer(int sd, uint32_t offer_id, const char* mime,
 }
 
 void DamageAll() {
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use) continue;
         for (int j = 0; j < c->object_high; j++) {
             Object& o = c->objects[j];
             if (!o.in_use || o.iface != WL_SURFACE) continue;
@@ -3595,17 +4051,18 @@ void DamageAll() {
 
 int ClientCount() {
     int n = 0;
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) if (g_clients[i].in_use) n++;
+    for (int i = 0; i < g_ncap; i++) if ((*cl_ref(i)) && (*cl_ref(i))->in_use) n++;
     return n;
 }
 
 int SurfaceCount() {
     int n = 0;
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        if (!g_clients[i].in_use) continue;
-        for (int j = 0; j < g_clients[i].object_high; j++) {
-            if (g_clients[i].objects[j].in_use &&
-                g_clients[i].objects[j].iface == WL_SURFACE) n++;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use) continue;
+        for (int j = 0; j < c->object_high; j++) {
+            if (c->objects[j].in_use &&
+                c->objects[j].iface == WL_SURFACE) n++;
         }
     }
     return n;
@@ -3635,9 +4092,9 @@ void ForwardPointerMotion(int gx, int gy) {
     // first, send leave to any client that previously had pointer focus on
     // a different surface (focus crossed out - including crossing between a
     // toplevel and its own subsurface). (satoru)
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use || c->pointer_id_count == 0) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use || c->pointer_id_count == 0) continue;
         uint32_t prev = c->pointer_focus_sid;
         bool still = (c == fc && surf && surf->id == prev);
         if (prev != 0 && !still) {
@@ -3683,9 +4140,9 @@ void ForwardPointerButton(int gx, int gy, int evdev_button, bool pressed) {
     // compositor; presses inside the same client are left to the client,
     // which rolls its own menus up. (satoru)
     if (pressed) {
-        for (int ci = 0; ci < WL_MAX_CLIENTS; ci++) {
-            Client* c = &g_clients[ci];
-            if (!c->in_use || c == fc) continue;
+        for (int ci = 0; ci < g_ncap; ci++) {
+            Client* c = (*cl_ref(ci));
+            if (!c || !c->in_use || c == fc) continue;
             bool sent = false;
             for (int guard = 0; guard < 16; guard++) {
                 Object* top = nullptr;
@@ -3807,9 +4264,9 @@ bool IsWaylandWindow(int win_id) {
 // share the vm host's pid, so they close one by one when a guest app goes. (satoru)
 int DropClientOfSd(int sd) {
     if (sd < 0) return 0;
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use || c->sd != sd) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use || c->sd != sd) continue;
         int high = c->object_high;
         for (int j = 0; j < high; j++) {
             Object& o = c->objects[j];
@@ -3825,9 +4282,9 @@ int DropClientOfSd(int sd) {
 int DropClientsOfPid(uint32_t pid) {
     if (pid == 0) return 0;
     int dropped = 0;
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use || c->sd < 0) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use || c->sd < 0) continue;
         UnixSocket::Credentials cr;
         if (UnixSocket::GetPeerCred(c->sd, &cr) != 0) continue;
         if (cr.pid != pid) continue;
@@ -3852,9 +4309,9 @@ void ForwardKey(int key, bool pressed, uint32_t mods) {
     g_now_ms = time;
     // route to whichever client currently holds keyboard focus, on EVERY
     // wl_keyboard resource it created. (satoru)
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use || c->keyboard_id_count == 0) continue;
+    for (int i = 0; i < g_ncap; i++) {
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use || c->keyboard_id_count == 0) continue;
         if (c->keyboard_focus_sid == 0) continue;
         if (!find_obj(c, c->keyboard_focus_sid)) { c->keyboard_focus_sid = 0; continue; }
         kbds_modifiers(c, mods);
@@ -3869,9 +4326,9 @@ void DumpProtocolTrace() {   // (satoru)
     static bool s_done = false;
     if (s_done) return;
     s_done = true;
-    for (int i = 0; i < WL_MAX_CLIENTS; i++) {   // unread bytes on each client socket (satoru)
-        Client* c = &g_clients[i];
-        if (!c->in_use) continue;
+    for (int i = 0; i < g_ncap; i++) {   // unread bytes on each client socket (satoru)
+        Client* c = (*cl_ref(i));
+        if (!c || !c->in_use) continue;
         SerialLogger::Log("[wlpend] sd="); SerialLogger::LogDec(c->sd);
         SerialLogger::Log(" client_unread="); SerialLogger::LogDec(UnixSocket::PeerPendingBytes(c->sd));
         SerialLogger::Log(" server_unread="); SerialLogger::LogDec(UnixSocket::PendingBytes(c->sd));

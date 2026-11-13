@@ -59,6 +59,9 @@ namespace Kpty {
 
     // slave side -------------------------------------------------------------
     int  SlaveRead(int t, uint8_t* d, int max);         // >0 bytes, 0 eof, -11 would block (satoru)
+    // the last `max` bytes the slave side wrote (still in the output ring even
+    // after the terminal read them), for the exit log. (satoru)
+    int  OutTail(int t, uint8_t* d, int max);
     int  SlaveWrite(int t, const uint8_t* d, int n);    // bytes taken, -11 ring full, -5 hung up (satoru)
     bool SlaveReadable(int t);
     bool SlaveWritable(int t);

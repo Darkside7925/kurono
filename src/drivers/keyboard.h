@@ -35,7 +35,12 @@ enum Key {
     KEY_KP_DECIMAL, KEY_KP_DIVIDE, KEY_KP_MULTIPLY, KEY_KP_SUBTRACT, KEY_KP_ADD, KEY_KP_ENTER,
     
     // media/power
-    KEY_PRINTSCREEN, KEY_PAUSE, KEY_MENU, KEY_POWER, KEY_SLEEP, KEY_WAKE
+    KEY_PRINTSCREEN, KEY_PAUSE, KEY_MENU, KEY_POWER, KEY_SLEEP, KEY_WAKE,
+
+    // laptop / multimedia keys: system keys handled by InputManager, never
+    // forwarded to apps. kept after KEY_WAKE so every table sized by it stays. (satoru)
+    KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_PLAYPAUSE,
+    KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP, KEY_WLAN
 };
 
 struct KeyboardState {

@@ -52,6 +52,13 @@ public:
     // find by kernel name ("sda"), or null. (satoru)
     static BlockDevice* FindByName(const char* name);
 
+    // drop one entry (usb hot-unplug). later entries move down one slot. (satoru)
+    static void Unregister(const char* name);
+
+    // bumped on every register/unregister/init so a caller can tell when the
+    // table changed and its cached disk/partition scan is stale. (satoru)
+    static uint32_t Generation();
+
     // convenience wrappers that bounds-check against capacity before touching
     // the driver - a gpt scanner reading past the end of a disk should get a
     // clean false, not whatever the controller decides to do. (satoru)
@@ -75,6 +82,7 @@ public:
 private:
     static BlockDevice s_devs[BLOCKDEV_MAX];
     static int         s_count;
+    static uint32_t    s_gen;
 };
 
 // end (satoru)

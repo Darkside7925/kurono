@@ -13,7 +13,10 @@
 
 #include "../kernel/types.h"
 
-#define LNET_MAX_SOCKETS   16
+#define LNET_MAX_SOCKETS   4096
+// the bridge socket table grows on demand in chunks that are never moved or freed,
+// so a LinuxSocket* and an fd index stay valid for the life of the system. (satoru)
+#define LNET_SOCK_CHUNK    32
 #define LNET_MAX_BACKLOG    8
 #define LNET_BUF_SIZE     4096
 
@@ -123,6 +126,10 @@ struct LinuxSocket {
     // dup/fork refcount: Close() releases the kurono socket only when the
     // last linux fd referencing this slot closes. (satoru)
     int              refs;
+    // instance id: a slot reused by a new socket gets a new id, so a parked
+    // connect record can prove the fd/backend still names the same socket. (satoru)
+    uint32_t         instance;
+    uint8_t          conn_err_notified;   // WakeRxPollers wakes an error once (satoru)
 };
 
 #define LNET_MAX_INTERFACES  4
@@ -175,7 +182,9 @@ public:
 
     // af_inet bridge over the kurono TCPStack (real backend, non-blocking
     // primitives only - the syscall layer owns all waiting). (satoru)
-    static int  ConnectPoll(int sockfd);       // 0 / -EINPROGRESS / -ECONNREFUSED / -ETIMEDOUT
+    static int  ConnectPoll(int sockfd);
+    // 0 if the slot is not an active bridge socket. (satoru)
+    static uint32_t SocketInstance(int sockfd);       // 0 / -EINPROGRESS / -ECONNREFUSED / -ETIMEDOUT
     static uint32_t Readiness(int sockfd);     // LNET_POLL* bitmask, lock-free reads
     static int  SockError(int sockfd);         // getsockopt(SO_ERROR) value, clears on read
     static void Retain(int sockfd);            // dup/fork refcount bump
@@ -213,7 +222,13 @@ public:
     static void RegisterShellCommands(void* shell);
 
 private:
-    static LinuxSocket       sockets[LNET_MAX_SOCKETS];
+    struct SockTable {   // chunked, grown by AllocSocket (satoru)
+        LinuxSocket* ch[LNET_MAX_SOCKETS / LNET_SOCK_CHUNK];
+        int nch;
+        int Count() const { return __atomic_load_n(&nch, __ATOMIC_ACQUIRE) * LNET_SOCK_CHUNK; }
+        LinuxSocket& operator[](int i) { return ch[i / LNET_SOCK_CHUNK][i % LNET_SOCK_CHUNK]; }
+    };
+    static SockTable         sockets;
     static int               socket_count;
     static LinuxNetInterface interfaces[LNET_MAX_INTERFACES];
     static int               iface_count;

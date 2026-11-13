@@ -1,23 +1,23 @@
 //  kurono os - virtual machine monitor implementation
 //  intel vt-x / amd-v detection, vmcs/vmcb setup, vmx lifecycle
 #include "vmm.h"
+#include "../kernel/kimage.h"   // heap direct-map pointers -> phys (satoru)
 #include "../drivers/serial.h"
 #include "../kernel/heap.h"
+#include "../proc/smp.h"
 
 // global: pointer to current vcpu's register save area for vm-exit handler.
 // set by runvcpu before vm entry so the inline vm-exit handler can save
 // guest gprs without needing a register to hold the pointer.
 // must be extern "c" so the inline asm 'movabs $g_vmx_guest_regs' finds
 // the unmangled symbol name, and non-static so the linker can resolve it.
-extern "C" uint64_t* volatile g_vmx_guest_regs = nullptr;
 // guest x87/sse state. vm entry and exit do not switch it, and every host
 // function that runs between exits (memcpy, the scheduler's fxrstor on a
 // switch) clobbers xmm registers, so linux userspace in the guest saw its
 // vector registers change under it. the entry asm fxrstors this image right
 // before vmresume and fxsaves it right after the exit; the host image is
 // saved and restored around that. (satoru)
-extern "C" { alignas(16) uint8_t g_vmx_guest_fx[512]; }
-alignas(16) static uint8_t g_vmx_host_fx[512];
+extern "C" { alignas(16) uint8_t g_vmx_guest_fx[512]; }     // power-on image: the template each vcpu copies (satoru)
 void VMM::ResetGuestFPU() {
     for (int i = 0; i < 512; i++) g_vmx_guest_fx[i] = 0;
     *(uint16_t*)(g_vmx_guest_fx + 0) = 0x037F;      // fcw: all exceptions masked
@@ -55,6 +55,14 @@ static void FreeAligned(void* aligned) {
 VirtType VMM::virt_type       = VIRT_NONE;
 bool     VMM::initialized     = false;
 bool     VMM::vmx_on          = false;
+// vmx root mode is per logical processor: every cpu that runs a vcpu does its own vmxon (satoru)
+static bool g_vmx_cpu[SMP_MAX_CPUS];
+static vCPU* g_cur_vcpu[SMP_MAX_CPUS];             // the vcpu last entered on each cpu (satoru)
+static inline uint32_t vcpu_cpu() { uint32_t i = SMP::CpuIndex(); return i < SMP_MAX_CPUS ? i : 0; }
+static inline bool vmx_here() { return g_vmx_cpu[vcpu_cpu()]; }
+static inline void vmx_set(bool on) { g_vmx_cpu[vcpu_cpu()] = on; }
+vCPU* VMM::Current() { return g_cur_vcpu[vcpu_cpu()]; }
+void VMM::SetCurrent(vCPU* c) { g_cur_vcpu[vcpu_cpu()] = c; }
 bool     VMM::svm_enabled     = false;
 bool     VMM::nested          = false;
 bool     VMM::whpx_detected   = false;
@@ -344,7 +352,7 @@ void VMM::Init() {
     if (initialized) return;
     initialized = true;
     vcpu_count = 0;
-    vmx_on = false;
+    for (int i = 0; i < SMP_MAX_CPUS; i++) { g_vmx_cpu[i] = false; g_cur_vcpu[i] = nullptr; }
     svm_enabled = false;
     nested = false;
     whpx_detected = false;
@@ -525,11 +533,11 @@ uint64_t VMM::GetLastVMEntryGuestRip() { return last_vm_entry_guest_rip; }
 static const uint32_t g_switched_msr_ids[5] = {
     0xC0000102, 0xC0000081, 0xC0000082, 0xC0000083, 0xC0000084
 };
-static uint64_t g_guest_switched_msr[5] = { 0, 0, 0, 0, 0 };
+static uint64_t g_guest_switched_dummy[5] = { 0, 0, 0, 0, 0 };   // before any vcpu ran (satoru)
 
 uint64_t* VMM::GuestSwitchedMSR(uint32_t msr) {
     for (int i = 0; i < 5; i++) {
-        if (g_switched_msr_ids[i] == msr) return &g_guest_switched_msr[i];
+        if (g_switched_msr_ids[i] == msr) { vCPU* c = Current(); return c ? &c->sw_msr[i] : &g_guest_switched_dummy[i]; }
     }
     return nullptr;
 }
@@ -629,7 +637,7 @@ uint32_t VMM::GetVMXRevisionId() { return vmx_revision_id; }
 
 bool VMM::VMXOn() {
     if (virt_type != VIRT_INTEL_VTX) return false;
-    if (vmx_on) return true;
+    if (vmx_here()) return true;
 
     SerialLogger::Log("VMM: Entering VMX root mode...");
     if (nested) SerialLogger::Log(" (nested)");
@@ -692,7 +700,7 @@ bool VMM::VMXOn() {
     vmxon_region->revision_id = vmx_revision_id;
 
     // vmxon instruction
-    uint64_t phys_addr = (uint64_t)(uintptr_t)vmxon_region;
+    uint64_t phys_addr = KernelPhysOf(vmxon_region);
     uint8_t  error = 0;
     asm volatile(
         "vmxon %[addr]\n\t"
@@ -710,15 +718,15 @@ bool VMM::VMXOn() {
         return false;
     }
 
-    vmx_on = true;
+    vmx_set(true);
     SerialLogger::Log("VMM: VMX root mode active\r\n");
     return true;
 }
 
 void VMM::VMXOff() {
-    if (!vmx_on) return;
+    if (!vmx_here()) return;
     asm volatile("vmxoff" ::: "cc");
-    vmx_on = false;
+    vmx_set(false);
 
     // clear vmxe in cr4
     uint32_t cr4 = ReadCR4();
@@ -729,8 +737,8 @@ void VMM::VMXOff() {
 }
 
 bool VMM::VMClear(VMCSRegion* region) {
-    if (!vmx_on || !region) return false;
-    uint64_t phys = (uint64_t)(uintptr_t)region;
+    if (!vmx_here() || !region) return false;
+    uint64_t phys = KernelPhysOf(region);
     uint8_t error = 0;
     asm volatile(
         "vmclear %[addr]\n\t"
@@ -743,8 +751,8 @@ bool VMM::VMClear(VMCSRegion* region) {
 }
 
 bool VMM::VMPtrLoad(VMCSRegion* region) {
-    if (!vmx_on || !region) return false;
-    uint64_t phys = (uint64_t)(uintptr_t)region;
+    if (!vmx_here() || !region) return false;
+    uint64_t phys = KernelPhysOf(region);
     uint8_t error = 0;
     asm volatile(
         "vmptrld %[addr]\n\t"
@@ -757,7 +765,7 @@ bool VMM::VMPtrLoad(VMCSRegion* region) {
 }
 
 void VMM::VMWrite(uint32_t field, uint64_t value) {
-    if (virt_type != VIRT_INTEL_VTX || !vmx_on) {
+    if (virt_type != VIRT_INTEL_VTX || !vmx_here()) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -772,7 +780,7 @@ void VMM::VMWrite(uint32_t field, uint64_t value) {
 }
 
 uint64_t VMM::VMRead(uint32_t field) {
-    if (virt_type != VIRT_INTEL_VTX || !vmx_on) {
+    if (virt_type != VIRT_INTEL_VTX || !vmx_here()) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -788,7 +796,7 @@ uint64_t VMM::VMRead(uint32_t field) {
 }
 
 bool VMM::VMLaunch() {
-    if (virt_type != VIRT_INTEL_VTX || !vmx_on) {
+    if (virt_type != VIRT_INTEL_VTX || !vmx_here()) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -837,7 +845,7 @@ bool VMM::VMLaunch() {
 }
 
 bool VMM::VMResume() {
-    if (virt_type != VIRT_INTEL_VTX || !vmx_on) {
+    if (virt_type != VIRT_INTEL_VTX || !vmx_here()) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -932,7 +940,7 @@ bool VMM::SVMEnable() {
         //  on a real amd host under whpx, this will succeed.)
         SerialLogger::Log("VMM: Writing VM_HSAVE_PA under WHPX - may fault on Intel\r\n");
     }
-    WriteMSR(MSR_VM_HSAVE_PA, (uint64_t)(uintptr_t)hsave);
+    WriteMSR(MSR_VM_HSAVE_PA, KernelPhysOf(hsave));
 
     svm_enabled = true;
     SerialLogger::Log("VMM: SVM enabled, host save area at ");
@@ -952,7 +960,7 @@ void VMM::SVMDisable() {
 
 void VMM::VMRun(VMCB* vmcb) {
     if (!svm_enabled || !vmcb) return;
-    uint64_t phys = (uint64_t)(uintptr_t)vmcb;
+    uint64_t phys = KernelPhysOf(vmcb);
     // save all host gprs, load rax with vmcb physical addr, vmrun
     // after #vmexit the guest state is saved to vmcb automatically
     asm volatile(
@@ -1000,6 +1008,11 @@ vCPU* VMM::CreateVCPU() {
 
     for (unsigned i = 0; i < sizeof(vCPU); i++) ((uint8_t*)cpu)[i] = 0;
     cpu->vcpu_id = vcpu_count++;
+    cpu->fx = (uint8_t*)AllocAligned(512, 16);
+    if (!cpu->fx) { KernelHeap::Free(cpu); vcpu_count--; return nullptr; }
+    for (int i = 0; i < 512; i++) cpu->fx[i] = g_vmx_guest_fx[i];
+    for (int i = 0; i < 8; i++) cpu->dr[i] = 0;
+    cpu->dr[6] = 0xFFFF0FF0ULL; cpu->dr[7] = 0x400ULL;
     cpu->type = virt_type;
     cpu->launched = false;
 
@@ -1025,10 +1038,12 @@ vCPU* VMM::CreateVCPU() {
 void VMM::DestroyVCPU(vCPU* cpu) {
     if (!cpu) return;
     if (cpu->vmcs) {
-        if (vmx_on) VMClear(cpu->vmcs);
+        if (vmx_here()) VMClear(cpu->vmcs);
         FreeAligned(cpu->vmcs);
     }
     if (cpu->vmcb) FreeAligned(cpu->vmcb);
+    if (cpu->fx) FreeAligned(cpu->fx);
+    for (int i = 0; i < SMP_MAX_CPUS; i++) if (g_cur_vcpu[i] == cpu) g_cur_vcpu[i] = nullptr;
     vcpu_count--;
     KernelHeap::Free(cpu);
 }
@@ -1037,7 +1052,7 @@ bool VMM::SetupVCPU(vCPU* cpu) {
     if (!cpu) return false;
 
     if (cpu->type == VIRT_INTEL_VTX) {
-        if (!vmx_on && !VMXOn()) return false;
+        if (!vmx_here() && !VMXOn()) return false;
         if (!VMClear(cpu->vmcs)) return false;
         if (!VMPtrLoad(cpu->vmcs)) return false;
         SetupVMCSControls(cpu);
@@ -1080,15 +1095,19 @@ int VMM::RunVCPU(vCPU* cpu) {
         uint64_t host_flags;
         asm volatile("pushfq; popq %0; cli" : "=r"(host_flags) : : "memory");
         uint64_t host_msr[5];
+        SetCurrent(cpu);
         for (int i = 0; i < 5; i++) {
             host_msr[i] = ReadMSR(g_switched_msr_ids[i]);
-            WriteMSR(g_switched_msr_ids[i], g_guest_switched_msr[i]);
+            WriteMSR(g_switched_msr_ids[i], cpu->sw_msr[i]);
         }
 
-        // set up the global pointer so the vm-exit handler (label 3 in the
-        // inline asm below) can save guest gprs back to cpu->regs[].
-        g_vmx_guest_regs = regs;
-        asm volatile("fxsave %0" : "=m"(g_vmx_host_fx) : : "memory"); // (satoru)
+        // the vm-exit handler (label 3 in the inline asm below) finds regs[] and the guest
+        // fx image through this block, which sits on the host stack: no globals, so
+        // several cpus can run vcpus at once (satoru)
+        alignas(16) uint8_t host_fx[512];
+        cpu->ctx[0] = (uint64_t)regs; cpu->ctx[1] = (uint64_t)cpu->fx;
+        uint64_t* ctxp = cpu->ctx;       // heap, not a stack local: gcc would hand the asm %rsp itself
+        asm volatile("fxsave %0" : "=m"(host_fx) : : "memory"); // (satoru)
 
         // register layout in regs[] - intel standard (modrm) ordering:
         //   0=rax, 1=rcx, 2=rdx, 3=rbx, 4=(rsp - in vmcs), 5=rbp,
@@ -1103,6 +1122,7 @@ int VMM::RunVCPU(vCPU* cpu) {
             "push %%r14\n\t"
             "push %%r15\n\t"
 
+            "push %[ctx]\n\t"
             // on vm-exit the cpu restores rsp from this value, so we
             // land back on our stack with callee-saved regs below us.
             "mov %%rsp, %%rax\n\t"
@@ -1120,7 +1140,8 @@ int VMM::RunVCPU(vCPU* cpu) {
             "test %[launch], %[launch]\n\t"
 
             // guest fpu/sse in place last, so no host code runs on it (satoru)
-            "movabs $g_vmx_guest_fx, %%rax\n\t"
+            "mov (%%rsp), %%rax\n\t"
+            "mov 8(%%rax), %%rax\n\t"
             "fxrstor (%%rax)\n\t"
 
             // %[regs] is in a callee-saved register chosen by gcc.
@@ -1163,9 +1184,8 @@ int VMM::RunVCPU(vCPU* cpu) {
             // save guest rax to stack; we need a scratch register.
             "push %%rax\n\t"
 
-            // load pointer to regs[] from the global.
-            // mcmodel=large → use movabs for a 64-bit absolute address.
-            "movabs $g_vmx_guest_regs, %%rax\n\t"
+            // regs[] through the context block on the stack (one push below the saved rax)
+            "mov 8(%%rsp), %%rax\n\t"
             "mov (%%rax), %%rax\n\t"
 
             // save guest gprs - intel standard (modrm) order
@@ -1188,13 +1208,15 @@ int VMM::RunVCPU(vCPU* cpu) {
             // recover guest rax from the stack and save it
             "pop %%rcx\n\t"                 // guest rax
             "mov %%rcx, 0(%%rax)\n\t"       // regs[0]  = rax
-            "movabs $g_vmx_guest_fx, %%rcx\n\t"   // guest fpu/sse out (satoru)
+            "mov (%%rsp), %%rax\n\t"             // guest fpu/sse out (satoru)
+            "mov 8(%%rax), %%rcx\n\t"
             "fxsave (%%rcx)\n\t"
 
             "xor %%eax, %%eax\n\t"          // rax = 0 (success)
             // fall through to label 4
 
             "4:\n\t"
+            "add $8, %%rsp\n\t"
             "pop %%r15\n\t"
             "pop %%r14\n\t"
             "pop %%r13\n\t"
@@ -1206,14 +1228,14 @@ int VMM::RunVCPU(vCPU* cpu) {
             // asm overwrites with the host_rip label before the test, so
             // every entry was a vmlaunch and the second one failed (satoru)
             : "=&a"(result)
-            : [regs] "r"(regs), [launch] "r"(launch_val)
+            : [regs] "r"(regs), [launch] "r"(launch_val), [ctx] "r"(ctxp)
             : "rcx", "rdx", "rdi", "rsi",
               "r8", "r9", "r10", "r11", "cc", "memory"
         );
 
-        asm volatile("fxrstor %0" : : "m"(g_vmx_host_fx) : "memory"); // (satoru)
+        asm volatile("fxrstor %0" : : "m"(host_fx) : "memory"); // (satoru)
         for (int i = 0; i < 5; i++) {
-            g_guest_switched_msr[i] = ReadMSR(g_switched_msr_ids[i]);
+            cpu->sw_msr[i] = ReadMSR(g_switched_msr_ids[i]);
             WriteMSR(g_switched_msr_ids[i], host_msr[i]);
         }
         asm volatile("pushq %0; popfq" : : "r"(host_flags) : "memory", "cc");
@@ -1280,7 +1302,7 @@ int VMM::RunVCPU(vCPU* cpu) {
         // amd-v: must manually save/restore guest gprs around vmrun
         // vmcb auto-saves/restores rax only. all other gprs must be
         // loaded from cpu->regs[] before vmrun and saved back after.
-        uint64_t phys = (uint64_t)(uintptr_t)cpu->vmcb;
+        uint64_t phys = KernelPhysOf(cpu->vmcb);
         uint64_t* regs = cpu->regs;
 
         // write guest rax to vmcb (hardware loads it from there)
@@ -1409,6 +1431,12 @@ void VMM::SetupVMCSControls(vCPU* cpu) {
                                 | PROC2_UNRESTRICTED_GUEST;
         proc2_controls |= proc2_allowed0;
         proc2_controls &= proc2_allowed1;
+        // pause-loop exiting: a vcpu spinning on a lock another vcpu holds gives its turn up (satoru)
+        if (proc2_allowed1 & (1u << 10)) {
+            proc2_controls |= (1u << 10);
+            VMWrite(0x4020, 128);      // ple gap
+            VMWrite(0x4022, 4096);     // ple window
+        }
         VMWrite(VMCS_PROC_BASED_CONTROLS2, proc2_controls);
     }
 
@@ -1682,7 +1710,7 @@ void VMM::DumpVCPUState(vCPU* cpu) {
     SerialLogger::LogHex((uint32_t)cpu->exit_qualification);
     SerialLogger::Log("\r\n");
 
-    if (cpu->type == VIRT_INTEL_VTX && vmx_on && cpu->vmcs) {
+    if (cpu->type == VIRT_INTEL_VTX && vmx_here() && cpu->vmcs) {
         VMPtrLoad(cpu->vmcs);
         SerialLogger::Log("  Guest RIP: ");
         SerialLogger::LogHex(VMRead(VMCS_GUEST_RIP));

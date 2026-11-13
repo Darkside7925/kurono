@@ -70,8 +70,22 @@ namespace {
     uint32_t   g_clip_xid = 1;
 
     Client  g_cl[MAX_CLIENTS];
-    uint8_t g_in[IN_MAX]; uint32_t g_in_len = 0;
-    uint8_t g_out[OUT_MAX]; uint32_t g_out_len = 0;
+    // 512 kb + 1 mb of bridge rings, only while a guest windows session is
+    // actually talking to this compositor. (satoru)
+    uint8_t* g_in = nullptr; uint32_t g_in_len = 0;
+    uint8_t* g_out = nullptr; uint32_t g_out_len = 0;
+
+    bool EnsureBuffers() {
+        if (!g_in) {
+            g_in = (uint8_t*)KernelHeap::Alloc(IN_MAX);
+            if (!g_in) return false;
+        }
+        if (!g_out) {
+            g_out = (uint8_t*)KernelHeap::Alloc(OUT_MAX);
+            if (!g_out) return false;
+        }
+        return true;
+    }
     uint8_t g_rx[32768];
     Dead    g_dead[1024];
     uint64_t g_pool_bytes = 0;
@@ -103,6 +117,7 @@ namespace {
     // channel is a byte stream (satoru)
     bool frame(uint8_t type, uint8_t nfd, uint16_t cid, const void* a, uint32_t alen, const void* b = nullptr, uint32_t blen = 0) {
         uint32_t len = alen + blen;
+        if (!EnsureBuffers()) return false;
         if (g_out_len + 8 + len > OUT_MAX) return false;
         uint8_t* o = g_out + g_out_len;
         o[0] = type; o[1] = nfd; o[2] = (uint8_t)cid; o[3] = (uint8_t)(cid >> 8);
@@ -114,7 +129,7 @@ namespace {
     }
 
     void flush_out() {
-        if (!g_out_len) return;
+        if (!g_out_len || !g_out) return;
         int k = GuestConsole::Write(CON, g_out, (int)g_out_len);
         if (k <= 0) return;
         memmove(g_out, g_out + k, g_out_len - (uint32_t)k);
@@ -403,6 +418,7 @@ namespace {
         if (!fn && !nfd) return;
         int r;
         if (nfd) {
+            // ControlMsg grew (pin fields): this file must be recompiled with unix_socket.h (satoru)
             UnixSocket::ControlMsg cm = {};
             int k = 0;
             while (k < nfd && k < c->npend && k < UnixSocket::UNIX_MAX_PASSED_FD) {
@@ -538,6 +554,8 @@ namespace {
 
 void WLBridge::Reset() {
     for (auto& c : g_cl) if (c.used) drop(&c, false);
+    if (g_in) { KernelHeap::Free(g_in); g_in = nullptr; }
+    if (g_out) { KernelHeap::Free(g_out); g_out = nullptr; }
     g_in_len = 0;
     g_out_len = 0;
     g_hello = false;
@@ -546,6 +564,7 @@ void WLBridge::Reset() {
 
 void WLBridge::OnGuestBytes(int idx, const uint8_t* data, int n) {
     (void)idx;
+    if (!EnsureBuffers()) return;
     while (n > 0) {
         uint32_t k = (uint32_t)n;
         if (k > IN_MAX - g_in_len) k = IN_MAX - g_in_len;

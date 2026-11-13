@@ -9,11 +9,15 @@
 #include "../drivers/audio_backend.h"
 #include "../drivers/hda.h"
 #include "../system/ui_config.h"
+#include "../system/audio_devices.h"
 
 using namespace SettingsUI;
 
 static int  s_master = 75;
 static bool s_muted  = false;
+static bool s_restart_done = false, s_restart_ok = false;
+static bool s_stop_done = false;
+static int  s_stopped = 0;
 
 static const char* hda_vendor_name(uint16_t vid){
     switch(vid){
@@ -40,7 +44,10 @@ static void audio_on_show(){
 static void apply_volume(bool persist){
     AudioMixer::SetMasterVolume(s_master);
     if(Audio::IsAvailable()) Audio::SetMasterVolume(s_master);
-    if(persist){ UIConfig::SetInt("audio.master_volume", s_master, true); UIConfig::Save(); }
+    if(persist){
+        AudioDevices::RememberVolume(s_master);   // each output keeps its own level (satoru)
+        UIConfig::SetInt("audio.master_volume", s_master, true); UIConfig::Save();
+    }
 }
 static void apply_mute(){
     AudioMixer::SetMasterMute(s_muted);
@@ -53,6 +60,27 @@ static void audio_build(){
     AudioServer::ServerStatus st = AudioServer::GetStatus();
     char buf[64];
 
+    // output picker: one row per device, a check on the active one. (satoru)
+    {
+        int n = AudioDevices::OutputCount();
+        if(n > 1){
+            Group("Output device");
+            for(int i = 0; i < n && i < 6; i++){
+                char nm[24], lb[48]; bool act = false, rdy = false;
+                if(!AudioDevices::OutputInfo(i, nm, (int)sizeof(nm), lb, (int)sizeof(lb), &act, &rdy)) continue;
+                PushId(i);
+                bool on = act;
+                if(Toggle(lb, &on, act ? "In use" : nullptr)){
+                    if(!act && AudioDevices::SelectOutput(nm)){
+                        s_master = AudioMixer::GetMasterVolume();
+                    }
+                }
+                PopId();
+            }
+            EndGroup();
+        }
+    }
+
     Group("Output");
     IntToStr(s_master, buf, 64); StrApp(buf, "%", 64);
     if(Slider("Volume", &s_master, 0, 100, 1, s_muted ? "Muted" : buf)){
@@ -62,6 +90,20 @@ static void audio_build(){
     if(Button("Test sound", "Play", BTN_SECONDARY, "Plays a short tone at the current volume")){
         AudioServer::PlayTone(660, 140, 70);
     }
+    if(Button("Restart audio", "Restart", BTN_SECONDARY,
+              "Reopens the active output, including USB audio, without a reboot")){
+        s_restart_ok = AudioServer::RestartActive();
+        s_restart_done = true;
+    }
+    if(Button("Stop all audio", "Stop", BTN_SECONDARY,
+              "Ends every playing stream (fixes a stuck or looping playback)")){
+        s_stopped = AudioServer::StopAllStreams();
+        s_stop_done = true;
+    }
+    EndGroup();
+
+    Group("Input");
+    if(AudioDevices::InputCount() == 0) Info("Microphone", "None", "No input device is supported yet");
     EndGroup();
 
     Group("Device");
@@ -72,6 +114,15 @@ static void audio_build(){
     }
     Info("Driver", (st.backend_name && st.backend_name[0]) ? st.backend_name : "None");
     Info("Status", st.backend_ready ? "Ready" : "Not ready", nullptr, st.backend_ready ? T().success : T().text3);
+    if(s_restart_done)
+        Info("Last restart", s_restart_ok ? "OK" : "FAILED (see serial log)", nullptr,
+             s_restart_ok ? T().success : T().danger);
+    if(s_stop_done){
+        char sbuf[32];
+        IntToStr(s_stopped, sbuf, 32);
+        StrApp(sbuf, s_stopped == 1 ? " stream stopped" : " streams stopped", 32);
+        Info("Last stop", sbuf);
+    }
     {
         uint32_t rate = st.backend_rate ? st.backend_rate : AudioMixer::INTERNAL_RATE;
         IntToStr((int)rate, buf, 64); StrApp(buf, " Hz, 16-bit, stereo", 64);

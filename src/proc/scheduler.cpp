@@ -7,12 +7,14 @@
 #include "../kernel/vmm.h"
 #include "../kernel/pmm.h"
 #include "../linux/ld_kurono.h"   // LdKurono::ReleaseProcess (satoru)
+#include "../linux/linux_syscall.h"   // KlsHeldHere for CondResched (satoru)
 #include "../kernel/hrtimer.h"
 #include "../kernel/kvdso.h"    // userspace vdso time page tick (satoru)
 #include "../kernel/panic.h"
 #include "../drivers/serial.h"
 #include "../drivers/audio_server.h"
 #include "../drivers/timer.h"   // TSC ms clock for sleep deadlines (satoru)
+#include "../drivers/cpu_detect.h"   // tsc frequency for the vrblock stint charge (satoru)
 #include "../hal/hal.h"
 #include "../system/logging.h"
 #include "../kernel/userspace.h"   // sched=2 partition: session cpu of a leader (satoru)
@@ -35,8 +37,16 @@ Spinlock g_log_lock;
 // this is the "_nolock discipline" smp phase 3d needs. (satoru)
 static Spinlock g_sched_lock;
 
+// another cpu's current task, loaded once. PerCpu::current is a plain pointer that
+// the owning cpu nulls / retargets at any time, so a null check followed by a second
+// read could dereference null or a different task (audit 11-07 #9). (satoru)
+static inline Process* cpu_current(PerCpu* pc) {
+    return pc ? __atomic_load_n(&pc->current, __ATOMIC_ACQUIRE) : nullptr;
+}
+
 // switch_to.asm helpers
 extern uint64_t hal_pid_busy_ms(uint32_t pid);   // per-pid busy ms side table, hal.cpp (satoru)
+extern void     hal_pid_cpu_forget(uint32_t pid);   // drop the pid's counters at reap (satoru)
 extern "C" void scheduler_switch_to(uint64_t* prev_saved_rsp,
                                     uint64_t  next_saved_rsp);
 extern "C" [[noreturn]] void scheduler_jump_to(uint64_t saved_rsp);
@@ -148,6 +158,13 @@ static bool alloc_kernel_stack(Process* proc) {
 // threads than that). gating on the live count lets thread create/exit cycles
 // reuse capacity, which firefox 140 (heavily multithreaded) needs. (satoru)
 static uint32_t g_live_proc_count = 0;
+// creators run on aps (clone), the bsp and the heartbeat at once, so the cap check
+// and the increment are one CAS reservation, undone on every alloc-failure return,
+// and the decrement is atomic too (audit 11-07 #8: an unlocked check-then-++ let the
+// count drift, and a create that failed after init_process_common never gave its
+// slot back). (satoru)
+static bool live_reserve(uint32_t cap);
+static void live_release();
 // ceiling on simultaneously-live tasks. kept at/below the linux process table
 // size (LINUX_MAX_PROCS=64) since every schedulable user task pairs with a
 // LinuxProcess slot. (satoru)
@@ -157,11 +174,26 @@ static constexpr uint32_t MAX_LIVE_PROCS = 256;  // 64->256 to match LINUX_MAX_P
 // clamps and the task-28 clone debt cap. (satoru)
 static volatile uint64_t g_pack_min_vr = 0;
 
+static bool live_reserve(uint32_t cap) {
+    uint32_t cur = __atomic_load_n(&g_live_proc_count, __ATOMIC_RELAXED);
+    for (;;) {
+        if (cur >= cap) return false;
+        if (__atomic_compare_exchange_n(&g_live_proc_count, &cur, cur + 1, true,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return true;
+    }
+}
+
+static void live_release() {
+    uint32_t cur = __atomic_load_n(&g_live_proc_count, __ATOMIC_RELAXED);
+    while (cur > 0 && !__atomic_compare_exchange_n(&g_live_proc_count, &cur, cur - 1, true,
+                                                   __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {}
+}
+
 static void init_process_common(Process* proc, const char* name, uint32_t priority) {
     memset(proc, 0, sizeof(Process));
-    proc->pid = Scheduler::next_pid++;
+    proc->pid = __atomic_fetch_add(&Scheduler::next_pid, 1u, __ATOMIC_RELAXED);   // audit 11-07 #8 (satoru)
     proc->parent_pid = 0;
-    g_live_proc_count++;
+    // the live-task slot was reserved by the caller (live_reserve). (satoru)
 
     int i = 0;
     while (name[i] && i < 31) {
@@ -260,7 +292,14 @@ static void remove_from_ready_queue(Process* proc) {
     g_sched_lock.UnlockIrqRestore(f);
 }
 
-static void link_child(Process* parent, Process* child) {
+// family lists (parent / first_child / next_sibling) are changed by the cloning cpu
+// and by any reaper (heartbeat, another thread's waitpid, a group kill) at the same
+// time under sched=2, so they get their own lock (audit 11-07 #7). a leaf lock: no
+// other lock is taken while it is held, so it nests inside g_sched_lock. the _nolock
+// forms assume it is held. (satoru)
+static Spinlock g_tree_lock;
+
+static void link_child_nolock(Process* parent, Process* child) {
     if (!parent || !child) return;
     child->parent = parent;
     child->parent_pid = parent->pid;
@@ -268,7 +307,14 @@ static void link_child(Process* parent, Process* child) {
     parent->first_child = child;
 }
 
-static void unlink_child(Process* parent, Process* child) {
+static void link_child(Process* parent, Process* child) {
+    if (!parent || !child) return;
+    uint64_t f; g_tree_lock.LockIrqSave(&f);
+    link_child_nolock(parent, child);
+    g_tree_lock.UnlockIrqRestore(f);
+}
+
+static void unlink_child_nolock(Process* parent, Process* child) {
     if (!parent || !child) return;
 
     if (parent->first_child == child) {
@@ -283,6 +329,35 @@ static void unlink_child(Process* parent, Process* child) {
         cursor->next_sibling = child->next_sibling;
     }
     child->next_sibling = nullptr;
+}
+
+// take a dying task off the family lists in one tree-lock hold: unlink it from its
+// parent; its child threads that share its address space move to that parent (see
+// DestroyProcess, sched_17), every other child is orphaned. (satoru)
+static void detach_from_family(Process* proc) {
+    if (!proc) return;
+    uint64_t f; g_tree_lock.LockIrqSave(&f);
+    Process* adopt = (proc->is_thread() && proc->parent &&
+                      proc->parent->address_space == proc->address_space) ? proc->parent : nullptr;
+    if (proc->parent) {
+        unlink_child_nolock(proc->parent, proc);
+        proc->parent = nullptr;
+        proc->parent_pid = 0;
+    }
+    Process* child = proc->first_child;
+    while (child) {
+        Process* next_child = child->next_sibling;
+        child->next_sibling = nullptr;
+        if (adopt && child->address_space == proc->address_space && child->is_thread()) {
+            link_child_nolock(adopt, child);
+        } else {
+            child->parent = nullptr;
+            child->parent_pid = 0;
+        }
+        child = next_child;
+    }
+    proc->first_child = nullptr;
+    g_tree_lock.UnlockIrqRestore(f);
 }
 
 static void sched_int_to_str(int value, char* out, int out_len) {
@@ -353,13 +428,15 @@ void Scheduler::Init() {
 
 Process* Scheduler::CreateProcess(const char* name, void (*entry_point)(), uint32_t priority) {
     (void)entry_point;
-    if (g_live_proc_count >= MAX_LIVE_PROCS) return nullptr; // live-task cap (satoru)
+    if (!live_reserve(MAX_LIVE_PROCS)) return nullptr; // live-task cap (satoru)
     Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
-    if (!proc) return nullptr;
+    if (!proc) { live_release(); return nullptr; }
 
     init_process_common(proc, name, priority);
-    if (current_process) {
-        link_child(current_process, proc);
+    // the creating task of this cpu (a launcher on the desktop cpu under
+    // kurono.svccpu; the global names cpu 0's proc). (satoru)
+    if (Process* cp = GetCurrentProcess()) {
+        link_child(cp, proc);
     }
     
     // stack setup would happen here (allocating stack page, pushing initial context)
@@ -373,10 +450,10 @@ Process* Scheduler::CreateProcess(const char* name, void (*entry_point)(), uint3
 }
 
 Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, uint32_t priority) {
-    if (g_live_proc_count >= MAX_LIVE_PROCS) return nullptr;  // live-task cap (satoru)
+    if (!live_reserve(MAX_LIVE_PROCS)) return nullptr;  // live-task cap (satoru)
 
     Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
-    if (!proc) return nullptr;
+    if (!proc) { live_release(); return nullptr; }
     init_process_common(proc, name, priority);
     proc->flags = PROCESS_FLAG_USER;
     proc->rip = (uintptr_t)entry_point;
@@ -384,12 +461,14 @@ Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, ui
     proc->address_space = KernelVMM::CreateAddressSpace();
     if (!proc->address_space) {
         KernelHeap::Free(proc);
+        live_release();
         return nullptr;
     }
 
     if (!alloc_kernel_stack(proc)) {
         KernelVMM::DestroyAddressSpace(proc->address_space);
         KernelHeap::Free(proc);
+        live_release();
         return nullptr;
     }
 
@@ -398,6 +477,7 @@ Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, ui
         PMM::FreeBytes((void*)(uintptr_t)(proc->kernel_stack_top - KERNEL_STACK_BYTES), KERNEL_STACK_BYTES);
         KernelVMM::DestroyAddressSpace(proc->address_space);
         KernelHeap::Free(proc);
+        live_release();
         return nullptr;
     }
 
@@ -417,6 +497,7 @@ Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, ui
             PMM::FreeBytes((void*)(uintptr_t)(proc->kernel_stack_top - KERNEL_STACK_BYTES), KERNEL_STACK_BYTES);
             KernelVMM::DestroyAddressSpace(proc->address_space);
             KernelHeap::Free(proc);
+            live_release();
             return nullptr;
         }
     }
@@ -424,8 +505,10 @@ Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, ui
     proc->user_stack_top = USER_STACK_TOP - 16;
     proc->rsp = (uintptr_t)proc->user_stack_top;
     init_user_frame(proc, entry_point, proc->user_stack_top);
-    if (current_process) {
-        link_child(current_process, proc);
+    // the creating task of this cpu (a launcher on the desktop cpu under
+    // kurono.svccpu; the global names cpu 0's proc). (satoru)
+    if (Process* cp = GetCurrentProcess()) {
+        link_child(cp, proc);
     }
     enqueue_process(proc);
     sched_log_process_event(proc, "created", "native user task");
@@ -434,12 +517,12 @@ Process* Scheduler::CreateUserProcess(const char* name, uint64_t entry_point, ui
 
 Process* Scheduler::CloneUserProcess(Process* parent) {
     if (!parent || !parent->is_user() || !parent->has_user_frame ||
-        g_live_proc_count >= MAX_LIVE_PROCS) {
+        !live_reserve(MAX_LIVE_PROCS)) {
         return nullptr;
     }
 
     Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
-    if (!proc) return nullptr;
+    if (!proc) { live_release(); return nullptr; }
 
     {
         char detail[64];
@@ -469,6 +552,10 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
     // an idle ap resume it half-built as a second copy of the parent (review
     // finding). old mode keeps the inherited flags. (satoru)
     if (Scheduler::SchedV2()) proc->flags &= ~(PROCESS_FLAG_AP_OK | PROCESS_FLAG_THREAD);
+    // old mode: never inherit AP_OK either - a fork child of a SpawnDetached leader would
+    // be claimable by an ap before sys_fork has built it. it runs like any old-mode fork
+    // child. (satoru)
+    else proc->flags &= ~PROCESS_FLAG_AP_OK;
     proc->rip = parent->rip;
     proc->rbp = parent->rbp;
     proc->rsp = parent->rsp;
@@ -481,12 +568,14 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
     proc->address_space = KernelVMM::CloneAddressSpace(parent->address_space);
     if (!proc->address_space) {
         KernelHeap::Free(proc);
+        live_release();
         return nullptr;
     }
 
     if (!alloc_kernel_stack(proc)) {
         KernelVMM::DestroyAddressSpace(proc->address_space);
         KernelHeap::Free(proc);
+        live_release();
         return nullptr;
     }
 
@@ -512,14 +601,13 @@ Process* Scheduler::CloneUserProcess(Process* parent) {
 // DestroyProcess from tearing the address space down on thread exit. (satoru)
 Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
                                      uint64_t tls_base, bool set_tls) {
-    if (!parent || !parent->is_user() || !parent->has_user_frame ||
-        g_live_proc_count >= MAX_LIVE_PROCS) {
+    if (!parent || !parent->is_user() || !parent->has_user_frame || !child_stack ||
+        !live_reserve(MAX_LIVE_PROCS)) {
         return nullptr;
     }
-    if (!child_stack) return nullptr;
 
     Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
-    if (!proc) return nullptr;
+    if (!proc) { live_release(); return nullptr; }
 
     init_process_common(proc, parent->name, parent->priority);
     // user + thread: shares the address space, must not free it on exit (satoru)
@@ -534,6 +622,7 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
 
     if (!alloc_kernel_stack(proc)) {
         KernelHeap::Free(proc);
+        live_release();
         return nullptr;
     }
 
@@ -580,6 +669,13 @@ Process* Scheduler::CreateUserThread(Process* parent, uint64_t child_stack,
     // can pick it until clone releases the affinity. the old mode sets the
     // same pin, just after this returns. (satoru)
     if (Scheduler::SchedV2()) proc->cpu_affinity = 1;
+    // old mode, creator on an ap (a SpawnDetached daemon): the bsp DOES run ring 3
+    // there, so pin the half-built thread to the creating ap instead - that cpu is busy
+    // in this clone syscall and cannot pick it either (review finding). (satoru)
+    else if (SMP::CpuIndex() != 0 && SMP::CpuIndex() < 8) {
+        proc->cpu_affinity = (uint8_t)(1u << SMP::CpuIndex());
+        proc->last_run_cpu = (uint8_t)SMP::CpuIndex();
+    }
     enqueue_process(proc);
     sched_log_process_event(proc, "created", "native user thread");
     return proc;
@@ -617,6 +713,7 @@ void Scheduler::MarkProcessExited(Process* proc, int exit_code) {
 Process* Scheduler::WaitForChild(Process* parent, uint32_t child_pid, int* exit_code) {
     if (!parent) return nullptr;
 
+    SpinLockGuard lg(g_tree_lock);   // audit 11-07 #7 (satoru)
     Process* child = parent->first_child;
     while (child) {
         bool pid_match = child_pid == 0 || child->pid == child_pid;
@@ -649,12 +746,15 @@ extern "C" void* sched_current_task_raw() {
     return (void*)Scheduler::GetCurrentProcess();
 }
 
+void UbNoteSave(const Process* p, const InterruptFrame* f, uint8_t site);   // hal.cpp [ubchk] (satoru)
+void UbNoteLoad(const Process* p, const InterruptFrame* f);
 void Scheduler::SaveUserFrame(Process* proc, const InterruptFrame* frame,
                               uint8_t save_site) {
     if (!proc || !frame || !proc->is_user()) return;
 
     proc->user_frame = *frame;
     proc->has_user_frame = true;
+    UbNoteSave(proc, frame, save_site);   // [ubchk] (satoru)
     proc->last_save_site = save_site;   // torn-frame forensics (satoru)
     proc->save_seq++;
     proc->rip = (uintptr_t)frame->rip;
@@ -905,6 +1005,675 @@ static volatile uint64_t g_hazard_hits = 0;
 static Process* g_release_pending[SMP_MAX_CPUS][2];
 static void hazard_check(Process* proc);
 
+// ── kurono.vrblock: charge what a task actually ran ────────────────────────
+// cfs accounting used to charge a fixed 1 ms slice only when a task was
+// switched away while state==Running. a park sets Blocked BEFORE the switch,
+// so every thread that ends its run by blocking (all i/o threads, every kld
+// container thread, most of firefox) ran for free: its vruntime froze and the
+// pick order among such threads was decided by stale numbers (measured at
+// -smp 2: a kld irq thread ready 7-10 s while the pack sat frozen at
+// 425985..433160). charge the real stint instead: start stamped at dispatch,
+// charge at every deschedule (preempt, yield, block, donation). per-cpu side
+// tables (a cpu's current task is its stint owner; struct Process does not
+// grow). both ends are read on the SAME cpu, so a cpu-local tsc delta is safe
+// even where cpus disagree on tsc. kurono.vrblock=0 restores the old fixed
+// per-switch charge, only when Running. DEFAULT OFF: it changes pick order at
+// every cpu count and its firefox effect must be judged by a real batch, not
+// this job; kurono.vrblock=1 enables it. (satoru)
+static bool g_vr_block = false;
+void Scheduler::SetVrBlock(bool on) { g_vr_block = on; }
+// kurono.claimage=1: the claim picker's 64 ms ready_since override. DEFAULT OFF
+// (main's pick order unchanged); the eager ready_since stamps it feeds are gated
+// by the same flag. (satoru)
+static bool g_claim_age = false;
+void Scheduler::SetClaimAge(bool on) { g_claim_age = on; }
+
+static inline uint64_t vr_rdtsc() {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint32_t vr_weight(const Process* p) {
+    static const uint32_t kNiceW[40] = {
+        88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+         9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
+         1024,   820,   655,   526,   423,   335,   272,   215,   172,   137,
+          110,    87,    70,    56,    45,    36,    29,    23,    18,    15 };
+    int nn = p ? p->nice : 0;
+    if (nn < -20) nn = -20;
+    if (nn > 19) nn = 19;
+    return kNiceW[nn + 20];
+}
+
+// one 1 ms stint at this task's weight, on today's vruntime scale. (satoru)
+static inline uint64_t vr_slice(const Process* p) {
+    uint32_t w = vr_weight(p);
+    return (1024ull * 1024ull) / (w ? w : 1);
+}
+
+static uint64_t g_vr_tsc_per_ms = 0;
+static uint64_t g_vr_start[SMP_MAX_CPUS];
+static Process* g_vr_owner[SMP_MAX_CPUS];
+
+static void vr_stint_start(Process* p, uint32_t cpu) {
+    if (!g_vr_block || !p || cpu >= SMP_MAX_CPUS) return;
+    g_vr_owner[cpu] = p;
+    g_vr_start[cpu] = vr_rdtsc();
+}
+
+static void vr_stint_charge(Process* p, uint32_t cpu) {
+    if (!g_vr_block || !p) return;
+    if (cpu >= SMP_MAX_CPUS || g_vr_owner[cpu] != p) {
+        // no stint recorded here: the old launcher's first entry has none. a
+        // Running task costs one slice, as before; a Blocked one was not
+        // running on this cpu. (satoru)
+        if (p->state == Process_Running) p->vruntime += vr_slice(p);
+        return;
+    }
+    uint64_t st = g_vr_start[cpu];
+    g_vr_owner[cpu] = nullptr;
+    if (!st) return;
+    uint64_t now = vr_rdtsc();
+    if (now <= st) return;
+    uint64_t per_ms = g_vr_tsc_per_ms;
+    if (!per_ms) {
+        uint64_t f = CPUDetect::GetInfo().frequency.tsc_frequency;
+        if (f >= 1000000ull) per_ms = f / 1000ull;
+        g_vr_tsc_per_ms = per_ms;   // racy by design: every cpu writes the same value (satoru)
+    }
+    uint64_t slice = vr_slice(p);
+    uint64_t charge;
+    if (per_ms) {
+        uint64_t d = now - st;
+        charge = (d / per_ms) * slice + ((d % per_ms) * slice) / per_ms;
+    } else {
+        charge = slice;   // no steady tsc: keep the old one-slice charge (satoru)
+    }
+    if (!charge) charge = 1;   // every deschedule costs something (satoru)
+    p->vruntime += charge;
+}
+
+// ── kurono.wakelat: permanent wake-to-run accounting ────────────────────────
+// stage f0b of FLOW.md. side tables only (struct Process must not grow): one
+// entry per live task, open-addressed by pid, one per cpu. every stamp comes
+// from Scheduler::NowMs: cpu 0 advances that one word from the pit irq and all
+// cpus read the same cache-coherent copy, so a wake stamped on one cpu and a
+// dispatch stamped on another subtract one clock - never one cpu's tsc from
+// another's (the laptop's cpus disagree by up to 0.9 s). off by default. (satoru)
+static bool g_wakelat = false;
+static uint32_t g_wl_wake_note = 0;
+static uint32_t g_wl_wake_not_ready = 0;      // state was not Ready at the note (satoru)
+static uint32_t g_wl_wake_still_blocked = 0;  // ... and it was Blocked (late or lost) (satoru)
+static uint32_t g_wl_wake_already_run = 0;    // ... and it was Running (benign) (satoru)
+static constexpr int WL_SLOTS = 1024;   // open addressing; 256 live tasks max (satoru)
+static constexpr int WL_PROBE = 8;
+static constexpr int WL_BUCKETS = 64;   // 0..31 exact ms, 32+ doubling (satoru)
+
+struct WakeLatTask {
+    uint32_t pid;
+    uint8_t  used;
+    uint8_t  pending;      // a wake is stamped and no dispatch has taken it yet (satoru)
+    uint8_t  wait_cpu;     // p->last_run_cpu when the wake was stamped (satoru)
+    uint8_t  waker_cpu;    // the cpu that issued the wake (satoru)
+    uint8_t  seen;         // reclaim pass: task still live in this window (satoru)
+    char     name[32];
+    uint64_t wake_ms;
+    uint64_t last_ms;      // last dispatch seen (satoru)
+    uint32_t wakes;        // wake stamps in this window (satoru)
+    uint32_t runs;         // dispatches that consumed a wake stamp (satoru)
+    uint32_t hist[WL_BUCKETS];
+    uint32_t max_ms;
+    uint8_t  max_wait_cpu;
+    uint8_t  max_run_cpu;
+    uint32_t wake_pick_seq;       // total picks on the expected cpu at the wake (satoru)
+    uint32_t max_picks;           // picks on that cpu during the worst wait (satoru)
+    uint64_t wake_vr;             // the task's vruntime at the wake (satoru)
+    uint64_t max_vr;
+    char     cur_wait_name[32];   // what the waited-for cpu ran at the last wake (satoru)
+    char     max_wait_name[32];   // ... at the worst wake-to-run so far (satoru)
+};
+
+static WakeLatTask g_wl_tasks[WL_SLOTS];
+static uint32_t   g_wl_used = 0;
+static Spinlock   g_wl_lock;   // serializes slot lookup/create (several cpus wake at once) (satoru)
+
+struct WakeLatCpu {
+    uint32_t ticks;        // timer entries on this cpu (satoru)
+    uint32_t preempts;     // timer entries that saw ring-3 user code (satoru)
+    uint32_t picks;        // ScheduleNextUser calls in this window (satoru)
+    uint32_t picks_total;  // ... since boot, never reset (satoru)
+    uint32_t switches;     // ... that changed the running task (satoru)
+    uint32_t runs;         // dispatches that consumed a wake stamp (satoru)
+    uint32_t hist[WL_BUCKETS];
+    uint32_t max_ms;
+    uint64_t last_rip;     // last timer-frame rip on this cpu (satoru)
+    uint64_t last_cs;
+    uint64_t ring0_caller; // caller of the last kls_relax_sleep_ms on this cpu (satoru)
+    // ring-0 hold detector (satoru): the longest stretch this cpu stayed in ring 0
+    // without reaching a scheduling point. sampled by the timer (10 ms grain, so a
+    // hold under one tick is invisible) and closed at every pick/dispatch/park and
+    // the first ring-3 tick. target: 5 ms. (satoru)
+    uint64_t ring0_since_ms;
+    uint32_t hold_win_max;
+    uint32_t hold_boot_max;
+    uint64_t hold_rip;
+    uint32_t hold_pid;
+};
+static WakeLatCpu g_wl_cpu[SMP_MAX_CPUS];
+
+// close the current ring-0 hold of this cpu, if any, and fold it into the maxes. (satoru)
+static void wl_hold_close(uint32_t cpu, uint64_t now) {
+    if (cpu >= SMP_MAX_CPUS) return;
+    WakeLatCpu* c = &g_wl_cpu[cpu];
+    if (!c->ring0_since_ms) return;
+    uint64_t d = now > c->ring0_since_ms ? now - c->ring0_since_ms : 0;
+    c->ring0_since_ms = 0;
+    if (d > 0xFFFFFFFFull) d = 0xFFFFFFFFull;
+    if ((uint32_t)d > c->hold_win_max) c->hold_win_max = (uint32_t)d;
+    if ((uint32_t)d > c->hold_boot_max) {
+        c->hold_boot_max = (uint32_t)d;
+        c->hold_rip = c->last_rip;
+        Process* cur = cpu_current(SMP::ByIndex(cpu));
+        c->hold_pid = cur ? cur->pid : 0;
+    }
+}
+
+static void wl_note_pick(uint32_t cpu, bool switched) {
+    if (!g_wakelat || cpu >= SMP_MAX_CPUS) return;
+    wl_hold_close(cpu, Scheduler::NowMs());
+    g_wl_cpu[cpu].picks++;
+    g_wl_cpu[cpu].picks_total++;
+    if (switched) g_wl_cpu[cpu].switches++;
+}
+
+static void wl_note_tick(uint32_t cpu, bool ring3) {
+    if (!g_wakelat || cpu >= SMP_MAX_CPUS) return;
+    WakeLatCpu* c = &g_wl_cpu[cpu];
+    if (cpu == 0) {   // cpu0 is the kernel-services cpu; ring0 holds are its job (satoru)
+        if (ring3) c->preempts++; else c->ticks++;
+        return;
+    }
+    uint64_t now = Scheduler::NowMs();
+    if (ring3) {
+        c->preempts++;
+        wl_hold_close(cpu, now);
+        return;
+    }
+    c->ticks++;
+    // the ap timer only calls this from ApTimerPreempt with the frame; cpu0's
+    // irq0 path does not sample cs, so ring0_since stays 0 there. (satoru)
+    if (c->last_cs & 3) { wl_hold_close(cpu, now); return; }
+    if (!c->ring0_since_ms) c->ring0_since_ms = now;
+}
+
+// attribution counters for this window (satoru)
+static uint32_t g_wl_phys_calls = 0;          // isr phys futex wake calls (satoru)
+static uint32_t g_wl_phys_empty = 0;          // ... that found no waiter (satoru)
+// a Ready task older than 200 ms that the picker saw but did not choose: the
+// direct "who was ahead of it" record. (satoru)
+static uint32_t g_wl_pick_skip = 0;
+static uint32_t g_wl_claim_starved = 0;   // claim picker took the ready_since override (satoru)
+static uint32_t g_wl_conn_parks = 0;      // blocking connects parked instead of ring0 spinning (satoru)
+static uint32_t g_wl_wait_parks[5];       // 1 lock, 2 pty, 3 job, 4 sigsuspend (satoru)
+// why the claim picker did not see an old pending Ready task (satoru)
+static uint32_t g_wl_claim_calls = 0;
+static uint32_t g_wl_cl_elig = 0, g_wl_cl_resum = 0, g_wl_cl_frame = 0;
+static uint32_t g_wl_cl_aff = 0, g_wl_cl_grace = 0, g_wl_cl_class = 0;
+static uint64_t g_wl_skip_winvr = 0, g_wl_skip_vicvr = 0;
+static uint32_t g_wl_skip_vicage = 0;
+static char g_wl_skip_win[32], g_wl_skip_vic[32];
+// why an old pending Ready task was not scanned as eligible on this cpu (satoru)
+static uint32_t g_wl_old_aff = 0, g_wl_old_sched2 = 0, g_wl_old_grace = 0;
+static uint32_t g_wl_old_elig = 0, g_wl_old_chosen = 0;
+static uint32_t g_wl_runs = 0;
+static uint32_t g_wl_late16 = 0;
+static uint64_t g_wl_next_report = 0;
+
+static int wl_bucket(uint32_t ms) {
+    if (ms < 32u) return (int)ms;
+    int b = 32;
+    uint32_t v = 32;
+    while (v < ms && b < WL_BUCKETS - 1) { v <<= 1; b++; }
+    return b;
+}
+
+static uint32_t wl_bucket_ms(int b) {
+    return (b < 32) ? (uint32_t)b : (32u << (b - 32));
+}
+
+static uint32_t wl_pct(const uint32_t* hist, uint32_t total, uint32_t pct) {
+    uint32_t want = (uint32_t)(((uint64_t)total * pct) / 100ull);
+    if (!want) want = 1;
+    uint32_t acc = 0;
+    for (int i = 0; i < WL_BUCKETS; i++) {
+        acc += hist[i];
+        if (acc >= want) return wl_bucket_ms(i);
+    }
+    return 0;
+}
+
+static WakeLatTask* wl_task_nolock(Process* p, bool create) {
+    if (!p) return nullptr;
+    uint32_t pid = p->pid;
+    uint32_t base = pid % (uint32_t)WL_SLOTS;
+    for (int i = 0; i < WL_PROBE; i++) {
+        WakeLatTask* e = &g_wl_tasks[(base + (uint32_t)i) % (uint32_t)WL_SLOTS];
+        if (e->used && e->pid == pid) return e;
+    }
+    if (!create) return nullptr;
+    for (int i = 0; i < WL_PROBE; i++) {
+        WakeLatTask* e = &g_wl_tasks[(base + (uint32_t)i) % (uint32_t)WL_SLOTS];
+        if (!e->used) {
+            memset(e, 0, sizeof(*e));
+            e->used = 1;
+            e->pid = pid;
+            int k = 0;
+            for (; k < 31 && p->name[k]; k++) e->name[k] = p->name[k];
+            e->name[k] = 0;
+            __atomic_add_fetch(&g_wl_used, 1u, __ATOMIC_RELAXED);
+            return e;
+        }
+    }
+    return nullptr;   // table full: this task is not accounted (satoru)
+}
+static WakeLatTask* wl_task(Process* p, bool create) {
+    SpinLockGuard g(g_wl_lock);
+    return wl_task_nolock(p, create);
+}
+
+// a task became Ready (user wake, kernel-proc sleep expiry). record when and
+// what the cpu we expect to run it was doing at that moment. (satoru)
+static void wl_stamp_wake(Process* p) {
+    if (!g_wakelat || !p) return;
+    SpinLockGuard g(g_wl_lock);
+    WakeLatTask* e = wl_task_nolock(p, true);
+    if (!e) return;
+    uint64_t now = Scheduler::NowMs();
+    __atomic_add_fetch(&g_wl_wake_note, 1u, __ATOMIC_RELAXED);
+    e->wakes++;
+    // keep the EARLIEST unserved wake: a second wake before the dispatch must not
+    // hide how long the task has been ready. (satoru)
+    if (e->pending) return;
+    e->pending = 1;
+    e->wake_ms = now;
+    e->wait_cpu = p->last_run_cpu;
+    e->waker_cpu = (uint8_t)SMP::CpuIndex();
+    e->wake_vr = p->vruntime;
+    e->wake_pick_seq = (e->wait_cpu < SMP_MAX_CPUS) ? g_wl_cpu[e->wait_cpu].picks_total : 0;
+    PerCpu* wc = SMP::ByIndex(e->wait_cpu);
+    Process* cur = wc ? cpu_current(wc) : nullptr;
+    int k = 0;
+    if (cur && cur != p) {
+        for (; k < 24 && cur->name[k]; k++) e->cur_wait_name[k] = cur->name[k];
+        e->cur_wait_name[k++] = '/';
+        uint32_t cp = cur->pid, d[10], nd = 0;
+        do { d[nd++] = cp % 10; cp /= 10; } while (cp && nd < 10);
+        while (nd && k < 31) e->cur_wait_name[k++] = (char)('0' + d[--nd]);
+    }
+    e->cur_wait_name[k] = 0;
+}
+
+// a task was dispatched (LoadUserFrame on an ap/bsp pick, perform_switch for a
+// kernel proc). consume its wake stamp and charge the latency. (satoru)
+static void wl_note_run(Process* p, uint32_t cpu) {
+    if (!g_wakelat || !p) return;
+    wl_hold_close(cpu, Scheduler::NowMs());
+    SpinLockGuard g(g_wl_lock);
+    WakeLatTask* e = wl_task_nolock(p, true);
+    if (!e) return;
+    uint64_t now = Scheduler::NowMs();
+    e->last_ms = now;
+    if (!e->pending) return;
+    e->pending = 0;
+    if (now < e->wake_ms) return;   // clock went backwards: not a latency (satoru)
+    uint32_t lat = (uint32_t)(now - e->wake_ms);
+    int b = wl_bucket(lat);
+    e->hist[b]++;
+    e->runs++;
+    WakeLatCpu* c = (cpu < SMP_MAX_CPUS) ? &g_wl_cpu[cpu] : nullptr;
+    if (c) {
+        c->runs++;
+        c->hist[b]++;
+        if (lat > c->max_ms) c->max_ms = lat;
+    }
+    __atomic_add_fetch(&g_wl_runs, 1u, __ATOMIC_RELAXED);
+    if (lat > 16) __atomic_add_fetch(&g_wl_late16, 1u, __ATOMIC_RELAXED);
+    if (lat > e->max_ms) {
+        e->max_ms = lat;
+        e->max_wait_cpu = e->wait_cpu;
+        e->max_run_cpu = (uint8_t)cpu;
+        e->max_vr = e->wake_vr;
+        uint32_t now_picks = (cpu < SMP_MAX_CPUS) ? g_wl_cpu[cpu].picks_total : 0;
+        e->max_picks = (e->max_run_cpu == e->max_wait_cpu && now_picks >= e->wake_pick_seq)
+                       ? now_picks - e->wake_pick_seq : 0;
+        memcpy(e->max_wait_name, e->cur_wait_name, sizeof(e->max_wait_name));
+    }
+}
+
+void Scheduler::SetWakeLat(bool on) {
+    g_wakelat = on;
+    if (!on) return;
+    for (int i = 0; i < WL_SLOTS; i++) memset(&g_wl_tasks[i], 0, sizeof(g_wl_tasks[i]));
+    for (int i = 0; i < SMP_MAX_CPUS; i++) memset(&g_wl_cpu[i], 0, sizeof(g_wl_cpu[i]));
+    g_wl_used = 0;
+    g_wl_wake_note = g_wl_wake_not_ready = g_wl_wake_still_blocked = g_wl_wake_already_run = 0;
+    g_wl_phys_calls = g_wl_phys_empty = 0;
+    g_wl_runs = g_wl_late16 = 0;
+    g_wl_pick_skip = 0;
+    g_wl_next_report = Scheduler::NowMs() + 10000;
+    SerialLogger::Log("[wakelat] on: wake-to-run side tables, clock Scheduler::NowMs (cpu0 pit)\r\n");
+}
+
+void Scheduler::WakeLatNoteConnPark() {
+    if (!g_wakelat) return;
+    __atomic_add_fetch(&g_wl_conn_parks, 1u, __ATOMIC_RELAXED);
+}
+
+void Scheduler::WakeLatNoteWaitPark(uint32_t kind) {
+    if (!g_wakelat || kind == 0 || kind >= 5) return;
+    __atomic_add_fetch(&g_wl_wait_parks[kind], 1u, __ATOMIC_RELAXED);
+}
+
+void Scheduler::WakeLatNoteRing0(uint64_t caller) {
+    if (!g_wakelat) return;
+    uint32_t c = SMP::CpuIndex();
+    if (c < SMP_MAX_CPUS) g_wl_cpu[c].ring0_caller = caller;
+}
+
+void Scheduler::WakeLatNotePhysIrq(bool woke) {
+    if (!g_wakelat) return;
+    __atomic_add_fetch(&g_wl_phys_calls, 1u, __ATOMIC_RELAXED);
+    if (!woke) __atomic_add_fetch(&g_wl_phys_empty, 1u, __ATOMIC_RELAXED);
+}
+
+static void wl_put(char* out, int max, int& pos, const char* t) {
+    while (*t && pos < max - 1) out[pos++] = *t++;
+}
+static void wl_put_num(char* out, int max, int& pos, uint64_t v) {
+    char b[24]; int k = 0;
+    do { b[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 23);
+    while (k && pos < max - 1) out[pos++] = b[--k];
+}
+
+// one [wakelat] block every 10 s from the heartbeat, then reset the window. the
+// reads race live updates by design (stats only). (satoru)
+void Scheduler::WakeLatReport() {
+    if (!g_wakelat) return;
+    uint64_t now = Scheduler::NowMs();
+    if (now < g_wl_next_report) return;
+    g_wl_next_report = now + 10000;
+
+    // Ready-but-unpicked snapshot: live tasks in the ready queue whose wake
+    // stamp is older than 20 ms. this is the direct Ready-vs-Blocked answer; the
+    // oldest one carries the state the picker is filtering on. (satoru)
+    uint32_t ready20 = 0, ready_max = 0;
+    uint32_t old_pid = 0, old_age = 0, old_oncpu = 0, old_last = 0, old_aff = 0, old_cls = 0;
+    uint64_t old_vr = 0, old_minvr = ~0ull;
+    char old_name[32]; old_name[0] = 0;
+    {
+        uint64_t f; g_sched_lock.LockIrqSave(&f);
+        for (Process* p = ready_queue; p; p = p->next) {
+            WakeLatTask* se = wl_task(p, false);
+            if (se) se->seen = 1;   // live this window (kernel procs too); reclaim keeps it (satoru)
+            if (!p->is_user()) continue;
+            if (p->state != Process_Ready) continue;
+            if (p->sched_class == 0 && p->vruntime < old_minvr) old_minvr = p->vruntime;
+            WakeLatTask* e = se;
+            if (!e || !e->pending || now < e->wake_ms) continue;
+            uint32_t age = (uint32_t)(now - e->wake_ms);
+            if (age > 20) {
+                ready20++;
+                if (age > ready_max) ready_max = age;
+                if (age > old_age) {
+                    old_age = age;
+                    old_pid = p->pid;
+                    old_oncpu = p->on_cpu;
+                    old_last = p->last_run_cpu;
+                    old_aff = p->cpu_affinity;
+                    old_cls = p->sched_class;
+                    old_vr = p->vruntime;
+                    int k = 0;
+                    for (; k < 31 && p->name[k]; k++) old_name[k] = p->name[k];
+                    old_name[k] = 0;
+                }
+            }
+        }
+        // reclaim: slots of pids no longer in the live task list are free again,
+        // so a long run reuses them instead of exhausting the table. (satoru)
+        {
+            SpinLockGuard g(g_wl_lock);
+            for (int i = 0; i < WL_SLOTS; i++) {
+                WakeLatTask* e = &g_wl_tasks[i];
+                if (!e->used) continue;
+                if (e->seen) { e->seen = 0; continue; }
+                e->used = 0;
+                e->pid = 0;
+                e->pending = 0;
+            }
+        }
+        g_sched_lock.UnlockIrqRestore(f);
+    }
+
+    char line[512];
+    int pos = 0;
+    wl_put(line, (int)sizeof(line), pos, "[wakelat] wakes=");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_wake_note);
+    wl_put(line, (int)sizeof(line), pos, " runs=");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_runs);
+    wl_put(line, (int)sizeof(line), pos, " late16=");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_late16);
+    wl_put(line, (int)sizeof(line), pos, " not_ready=");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_wake_not_ready);
+    wl_put(line, (int)sizeof(line), pos, " still_blocked=");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_wake_still_blocked);
+    wl_put(line, (int)sizeof(line), pos, " already_run=");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_wake_already_run);
+    wl_put(line, (int)sizeof(line), pos, " phys_irq=");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_phys_calls);
+    wl_put(line, (int)sizeof(line), pos, "/");
+    wl_put_num(line, (int)sizeof(line), pos, g_wl_phys_empty);
+    wl_put(line, (int)sizeof(line), pos, " ready20=");
+    wl_put_num(line, (int)sizeof(line), pos, ready20);
+    wl_put(line, (int)sizeof(line), pos, " ready_max=");
+    wl_put_num(line, (int)sizeof(line), pos, ready_max);
+    if (old_age) {
+        wl_put(line, (int)sizeof(line), pos, " oldest=");
+        wl_put_num(line, (int)sizeof(line), pos, old_pid);
+        wl_put(line, (int)sizeof(line), pos, ":");
+        wl_put(line, (int)sizeof(line), pos, old_name);
+        wl_put(line, (int)sizeof(line), pos, " age=");
+        wl_put_num(line, (int)sizeof(line), pos, old_age);
+        wl_put(line, (int)sizeof(line), pos, " oncpu=");
+        wl_put_num(line, (int)sizeof(line), pos, old_oncpu);
+        wl_put(line, (int)sizeof(line), pos, " last=");
+        wl_put_num(line, (int)sizeof(line), pos, old_last);
+        wl_put(line, (int)sizeof(line), pos, " aff=");
+        wl_put_num(line, (int)sizeof(line), pos, old_aff);
+        wl_put(line, (int)sizeof(line), pos, " cls=");
+        wl_put_num(line, (int)sizeof(line), pos, old_cls);
+        wl_put(line, (int)sizeof(line), pos, " vr=");
+        wl_put_num(line, (int)sizeof(line), pos, old_vr);
+        wl_put(line, (int)sizeof(line), pos, " minvr=");
+        wl_put_num(line, (int)sizeof(line), pos, old_minvr == ~0ull ? 0 : old_minvr);
+    }
+    line[pos] = 0;
+    SerialLogger::Log(line);
+    SerialLogger::Log("\r\n");
+    // the picker's own view: an old Ready task it saw but did not choose. (satoru)
+    {
+        pos = 0;
+        wl_put(line, (int)sizeof(line), pos, "[wakelat] pick_skip=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_pick_skip);
+        wl_put(line, (int)sizeof(line), pos, " win=");
+        wl_put(line, (int)sizeof(line), pos, g_wl_skip_win);
+        wl_put(line, (int)sizeof(line), pos, " vr=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_skip_winvr);
+        wl_put(line, (int)sizeof(line), pos, " victim=");
+        wl_put(line, (int)sizeof(line), pos, g_wl_skip_vic);
+        wl_put(line, (int)sizeof(line), pos, " vr=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_skip_vicvr);
+        wl_put(line, (int)sizeof(line), pos, " age=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_skip_vicage);
+        wl_put(line, (int)sizeof(line), pos, " old_elig=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_old_elig);
+        wl_put(line, (int)sizeof(line), pos, " chosen=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_old_chosen);
+        wl_put(line, (int)sizeof(line), pos, " aff=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_old_aff);
+        wl_put(line, (int)sizeof(line), pos, " sched2=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_old_sched2);
+        wl_put(line, (int)sizeof(line), pos, " grace=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_old_grace);
+        wl_put(line, (int)sizeof(line), pos, " claim_age=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_claim_starved);
+        wl_put(line, (int)sizeof(line), pos, " conn_parks=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_conn_parks);
+        wl_put(line, (int)sizeof(line), pos, " wait_parks=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_wait_parks[1]);
+        wl_put(line, (int)sizeof(line), pos, "/");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_wait_parks[2]);
+        wl_put(line, (int)sizeof(line), pos, "/");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_wait_parks[3]);
+        wl_put(line, (int)sizeof(line), pos, "/");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_wait_parks[4]);
+        wl_put(line, (int)sizeof(line), pos, " claim_calls=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_claim_calls);
+        wl_put(line, (int)sizeof(line), pos, " cl_elig=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_cl_elig);
+        wl_put(line, (int)sizeof(line), pos, " cl_resum=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_cl_resum);
+        wl_put(line, (int)sizeof(line), pos, " cl_frame=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_cl_frame);
+        wl_put(line, (int)sizeof(line), pos, " cl_aff=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_cl_aff);
+        wl_put(line, (int)sizeof(line), pos, " cl_grace=");
+        wl_put_num(line, (int)sizeof(line), pos, g_wl_cl_grace);
+        line[pos] = 0;
+        SerialLogger::Log(line);
+        SerialLogger::Log("\r\n");
+    }
+
+    uint32_t ncpu = SMP::CpuCount();
+    if (ncpu > SMP_MAX_CPUS) ncpu = SMP_MAX_CPUS;
+    for (uint32_t c = 0; c < ncpu; c++) {
+        WakeLatCpu* cc = &g_wl_cpu[c];
+        if (!cc->ticks && !cc->runs && !cc->picks) continue;
+        pos = 0;
+        wl_put(line, (int)sizeof(line), pos, "[wakelat] cpu");
+        wl_put_num(line, (int)sizeof(line), pos, c);
+        wl_put(line, (int)sizeof(line), pos, " ticks=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->ticks);
+        wl_put(line, (int)sizeof(line), pos, " preempts=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->preempts);
+        wl_put(line, (int)sizeof(line), pos, " picks=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->picks);
+        wl_put(line, (int)sizeof(line), pos, " sw=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->switches);
+        wl_put(line, (int)sizeof(line), pos, " run=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->runs);
+        wl_put(line, (int)sizeof(line), pos, " p50=");
+        wl_put_num(line, (int)sizeof(line), pos, wl_pct(cc->hist, cc->runs, 50));
+        wl_put(line, (int)sizeof(line), pos, " p99=");
+        wl_put_num(line, (int)sizeof(line), pos, wl_pct(cc->hist, cc->runs, 99));
+        wl_put(line, (int)sizeof(line), pos, " max=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->max_ms);
+        wl_put(line, (int)sizeof(line), pos, " rip=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->last_rip);
+        wl_put(line, (int)sizeof(line), pos, " cs=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->last_cs);
+        wl_put(line, (int)sizeof(line), pos, " r0ret=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->ring0_caller);
+        wl_put(line, (int)sizeof(line), pos, " ring0_win=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->hold_win_max);
+        wl_put(line, (int)sizeof(line), pos, " ring0_boot=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->hold_boot_max);
+        wl_put(line, (int)sizeof(line), pos, " hold_rip=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->hold_rip);
+        wl_put(line, (int)sizeof(line), pos, " hold_pid=");
+        wl_put_num(line, (int)sizeof(line), pos, cc->hold_pid);
+        line[pos] = 0;
+        SerialLogger::Log(line);
+        SerialLogger::Log("\r\n");
+    }
+
+    // top 5 tasks by max wake-to-run latency in this window. (satoru)
+    for (int rank = 0; rank < 5; rank++) {
+        WakeLatTask* best = nullptr;
+        for (int i = 0; i < WL_SLOTS; i++) {
+            WakeLatTask* e = &g_wl_tasks[i];
+            if (!e->used || !e->runs || e->max_ms == 0 || e->max_ms == ~0u) continue;
+            if (best && e->max_ms <= best->max_ms) continue;
+            best = e;
+        }
+        if (!best) break;
+        pos = 0;
+        wl_put(line, (int)sizeof(line), pos, "[wakelat] top pid=");
+        wl_put_num(line, (int)sizeof(line), pos, best->pid);
+        wl_put(line, (int)sizeof(line), pos, " ");
+        wl_put(line, (int)sizeof(line), pos, best->name);
+        wl_put(line, (int)sizeof(line), pos, " max=");
+        wl_put_num(line, (int)sizeof(line), pos, best->max_ms);
+        wl_put(line, (int)sizeof(line), pos, " wait_cpu=");
+        wl_put_num(line, (int)sizeof(line), pos, best->max_wait_cpu);
+        wl_put(line, (int)sizeof(line), pos, "(");
+        wl_put(line, (int)sizeof(line), pos, best->max_wait_name);
+        wl_put(line, (int)sizeof(line), pos, ") run_cpu=");
+        wl_put_num(line, (int)sizeof(line), pos, best->max_run_cpu);
+        wl_put(line, (int)sizeof(line), pos, " vr=");
+        wl_put_num(line, (int)sizeof(line), pos, best->max_vr);
+        wl_put(line, (int)sizeof(line), pos, " picks_in_between=");
+        wl_put_num(line, (int)sizeof(line), pos, best->max_picks);
+        line[pos] = 0;
+        SerialLogger::Log(line);
+        SerialLogger::Log("\r\n");
+        best->max_ms = ~0u;   // mark listed for this report (satoru)
+    }
+    for (int i = 0; i < WL_SLOTS; i++) {
+        WakeLatTask* e = &g_wl_tasks[i];
+        e->max_ms = 0;
+        e->wakes = 0;
+        e->runs = 0;
+        memset(e->hist, 0, sizeof(e->hist));
+    }
+    for (uint32_t c = 0; c < SMP_MAX_CPUS; c++) {
+        WakeLatCpu* cc = &g_wl_cpu[c];
+        cc->ticks = cc->preempts = cc->picks = cc->switches = cc->runs = 0;
+        cc->max_ms = 0;
+        cc->hold_win_max = 0;
+        memset(cc->hist, 0, sizeof(cc->hist));
+    }
+    g_wl_wake_note = g_wl_wake_not_ready = g_wl_wake_still_blocked = g_wl_wake_already_run = 0;
+    g_wl_phys_calls = g_wl_phys_empty = 0;
+    g_wl_runs = g_wl_late16 = 0;
+    g_wl_pick_skip = 0;
+    g_wl_old_aff = g_wl_old_sched2 = g_wl_old_grace = 0;
+    g_wl_old_elig = g_wl_old_chosen = 0;
+    g_wl_claim_starved = 0;
+    g_wl_conn_parks = 0;
+    for (int i = 0; i < 5; i++) g_wl_wait_parks[i] = 0;
+    g_wl_claim_calls = 0;
+    g_wl_cl_elig = g_wl_cl_resum = g_wl_cl_frame = g_wl_cl_aff = g_wl_cl_grace = 0;
+}
+
+
+
+// ── service cpus (kurono.svccpu, sched=2 only) ───────────────────────────────
+// sched=2 used to run every kernel proc on cpu 0: the desktop, input, audio, the
+// network, the vm vcpu loop and the shell all shared one core. the plan gives the
+// desktop domain (the gui, input, the shell, the launchers, see kp_home_for) an
+// ap of its own, audio + network another and the vm host a third once there are
+// enough cpus; those aps run kernel procs only and never a user task. the plan is
+// fixed at boot, right after the aps come up, from the online count
+// (PlanServiceCpus). (satoru)
+static bool g_svc_enabled = true;                 // kurono.svccpu=0 keeps the old layout (satoru)
+static volatile uint8_t g_svc_cpu[SMP_MAX_CPUS];  // 1 = this ap hosts kernel procs only (satoru)
+static uint32_t g_svc_ui = 0, g_svc_io = 0, g_svc_vm = 0;   // 0 = the proc stays on cpu 0 (satoru)
+static uint32_t g_svc_vcpu[8] = {};          // service cpu of vcpu k (1..7), 0 = none (satoru)
+static int g_vcpu_cpus_req = 0;
+static int g_svc_ui_req = -1, g_svc_io_req = -1, g_svc_vm_req = -1;   // kurono.svc.ui/io/vm=N (satoru)
+static inline bool svc_cpu(uint32_t cpu) { return cpu < SMP_MAX_CPUS && g_svc_cpu[cpu]; }
+
 // per-cpu start of the running user thread's slice; set on every load. (satoru)
 static uint64_t g_slice_start_ms[SMP_MAX_CPUS];
 static constexpr uint64_t USER_SLICE_MS = 10;
@@ -1138,7 +1907,9 @@ bool Scheduler::LoadUserFrame(Process* proc, InterruptFrame* frame) {
     uint32_t glo = (uint32_t)proc->gs_base, ghi = (uint32_t)(proc->gs_base >> 32);
     __asm__ __volatile__("wrmsr" : : "c"(MSR_KERNEL_GS_BASE_), "a"(glo), "d"(ghi));
 
+    if (g_wakelat) wl_note_run(proc, SMP::CpuIndex());   // kurono.wakelat (satoru)
     *frame = proc->user_frame;
+    UbNoteLoad(proc, frame);   // [ubchk] (satoru)
     return true;
 }
 
@@ -1190,7 +1961,9 @@ bool Scheduler::DetachedLaunch() { return g_sched_v2 && g_sched_detached; }
 bool Scheduler::ApResumable(const Process* p) {
     if (!p) return false;
     if (p->is_thread()) return true;
-    return g_sched_v2 && (p->flags & PROCESS_FLAG_AP_OK) != 0;
+    // old mode too since the async spawn: AP_OK is set there only by
+    // Userspace::SpawnDetached, on a leader pinned to one ap. (satoru)
+    return (p->flags & PROCESS_FLAG_AP_OK) != 0;
 }
 
 // two pending slots per cpu: a task is queued when this cpu stops running it
@@ -1305,7 +2078,8 @@ static inline bool sched2_cpu_may_run(const Process* c, uint32_t cpu) {
     // the bsp is the kernel-services cpu: with aps online it runs no thread and
     // no detached program, so ring 3 can never starve input, audio, the gui,
     // the network or the shell again. (satoru)
-    if (Scheduler::ApResumable(c)) return cpu != 0 || SMP::OnlineCount() < 2;
+    // a service cpu (kurono.svccpu) hosts kernel procs only. (satoru)
+    if (Scheduler::ApResumable(c)) return (cpu != 0 && !svc_cpu(cpu)) || SMP::OnlineCount() < 2;
     int sc = Userspace::SessionCpuOf(c);
     return (sc < 0) ? (cpu == 0) : ((uint32_t)sc == cpu);
 }
@@ -1329,7 +2103,7 @@ bool Scheduler::IsCurrentAnywhere(const Process* p) {
     if (current_process == p) return true;
     for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
         PerCpu* pc = SMP::ByIndex(ci);
-        if (pc && pc->current == p) return true;
+        if (cpu_current(pc) == p) return true;
     }
     return false;
 }
@@ -1424,7 +2198,7 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
     uint64_t g = 2;
     {
         PerCpu* home = SMP::ByIndex((uint32_t)p->last_run_cpu);
-        Process* home_cur = home ? home->current : nullptr;
+        Process* home_cur = cpu_current(home);
         bool home_busy_elsewhere = home_cur && home_cur != p;
         if (!home_busy_elsewhere) g = 50;
     }
@@ -1448,6 +2222,24 @@ static inline bool cross_run_grace_ok(const Process* p, uint32_t cpu) {
 static Process* g_wake_next[SMP_MAX_CPUS] = {};
 void Scheduler::NoteWakeNext(Process* woken) {
     if (!woken) return;
+    // wakelat: attribute the wake before any picker can consume it. a state of
+    // Running means a cpu already picked it between publish and this line (a
+    // wake that was not needed), Blocked means it re-blocked (late or lost). (satoru)
+    if (g_wakelat) {
+        int st = __atomic_load_n((int*)&woken->state, __ATOMIC_ACQUIRE);
+        if (st != (int)Process_Ready) {
+            // a wake that found the task Running (already picked) or still
+            // Blocked did not make it Ready; stamping it would inflate every
+            // later latency for that task. count it, do not stamp. (satoru)
+            __atomic_add_fetch(&g_wl_wake_not_ready, 1u, __ATOMIC_RELAXED);
+            if (st == (int)Process_Blocked) __atomic_add_fetch(&g_wl_wake_still_blocked, 1u, __ATOMIC_RELAXED);
+            else if (st == (int)Process_Running) __atomic_add_fetch(&g_wl_wake_already_run, 1u, __ATOMIC_RELAXED);
+        } else {
+            wl_stamp_wake(woken);
+        }
+    }
+    if (g_claim_age && woken->is_user())
+        woken->ready_since_ms = Scheduler::NowMs();   // task-28 age from the WAKE (claimage a/b) (satoru)
     // sched=2: every wake site comes through here, so this is where a halted ap
     // gets woken to pick the task up. (satoru)
     if (g_sched_v2) SMP::KickIdleFor(woken);   // an idle cpu that may run it (satoru)
@@ -1490,7 +2282,9 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
     // ready_since_ms is stamped lazily right here and cleared by the caller on
     // every successful pick. (satoru)
     Process* starved = nullptr;
+    Process* victim = nullptr;   // kurono.wakelat: old Ready CFS task passed over (satoru)
     uint64_t now_ms = 0;
+    uint64_t wl_now = g_wakelat ? Scheduler::NowMs() : 0;   // (satoru)
     uint64_t scan_min = ~0ull;   // pack-min refresh (task 22b) (satoru)
     for (Process* c = Scheduler::ready_queue; c; c = c->next) {
         if (!c->is_user()) continue;
@@ -1499,6 +2293,15 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
         if ((c->state == Process_Ready || c->state == Process_Running) &&
             c->sched_class == 0 && c->vruntime < scan_min) scan_min = c->vruntime;
         if (c->state != Process_Ready || !c->has_user_frame) continue;
+        if (g_wakelat && c->sched_class == 0) {
+            WakeLatTask* we = wl_task(c, false);
+            if (we && we->pending && wl_now > we->wake_ms && wl_now - we->wake_ms > 200) {
+                if (!cpu_allowed(c, cpu)) g_wl_old_aff++;
+                else if (!sched2_cpu_may_run(c, cpu)) g_wl_old_sched2++;
+                else if (!cross_run_grace_ok(c, cpu)) g_wl_old_grace++;
+                else g_wl_old_elig++;
+            }
+        }
         if (!cpu_allowed(c, cpu)) continue;
         if (!sched2_cpu_may_run(c, cpu)) continue;   // sched=2 bsp/ap partition (satoru)
         if (!cross_run_grace_ok(c, cpu)) continue;   // old cpu may still be unwinding (satoru)
@@ -1513,10 +2316,30 @@ static Process* pick_next_user_nolock(Process* after, uint32_t cpu) {
         else if (now_ms - c->ready_since_ms > 64 &&
                  (!starved || c->ready_since_ms < starved->ready_since_ms))
             starved = c;
+        if (g_wakelat && c->sched_class == 0 && now_ms - c->ready_since_ms > 200 &&
+            (!victim || c->ready_since_ms < victim->ready_since_ms))
+            victim = c;
         if (!best || c->vruntime < best->vruntime) best = c;
     }
     if (scan_min != ~0ull)
         __atomic_store_n(&g_pack_min_vr, scan_min, __ATOMIC_RELAXED);
+    if (g_wakelat && victim) {
+        Process* win = fifo ? fifo : (starved ? starved : best);
+        if (win == victim) g_wl_old_chosen++;
+        if (win != victim) {
+            g_wl_pick_skip++;
+            g_wl_skip_winvr = win ? win->vruntime : 0;
+            g_wl_skip_vicvr = victim->vruntime;
+            g_wl_skip_vicage = (uint32_t)(now_ms - victim->ready_since_ms);
+            int k = 0;
+            if (win) { for (; k < 31 && win->name[k]; k++) g_wl_skip_win[k] = win->name[k]; }
+            else { const char* z = "-"; for (; k < 31 && z[k]; k++) g_wl_skip_win[k] = z[k]; }
+            g_wl_skip_win[k] = 0;
+            k = 0;
+            for (; k < 31 && victim->name[k]; k++) g_wl_skip_vic[k] = victim->name[k];
+            g_wl_skip_vic[k] = 0;
+        }
+    }
     if (fifo) return fifo;
     if (starved) return starved;   // oldest neglected first (task 28) (satoru)
     if (best) return best;
@@ -1570,15 +2393,13 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
             // spins without blocking kept the LOWEST vruntime and was re-picked forever,
             // starving the ready chrome main (the "main st=0 Ready but never runs, one
             // worker always Running" stall). mirror Tick's nice-weighted charge. (satoru)
-            static const uint32_t kNiceW[40] = {
-                88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
-                 9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
-                 1024,   820,   655,   526,   423,   335,   272,   215,   172,   137,
-                  110,    87,    70,    56,    45,    36,    29,    23,    18,    15 };
-            int nn = cur->nice; if (nn < -20) nn = -20; if (nn > 19) nn = 19;
-            uint32_t ww = kNiceW[nn + 20];
-            cur->vruntime += (1024u * 1024u) / (ww ? ww : 1);
+            // kurono.vrblock=1 charges the REAL stint for any deschedule instead. (satoru)
+            if (g_vr_block) vr_stint_charge(cur, cpu);
+            else cur->vruntime += vr_slice(cur);
             cur->state = Process_Ready;   // (task 22c: runner cap reverted, see NormalizeWakeVruntime) (satoru)
+        } else if (g_vr_block && cur && cur->is_user() && cur->state == Process_Blocked) {
+            // the block path (park set Blocked before the switch) is charged too (satoru)
+            vr_stint_charge(cur, cpu);
         }
         Process* cand = pick_next_user_nolock(cur, cpu);
         if (cand && cand != cur) {
@@ -1599,9 +2420,13 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
             // thread that just exited on an ap live forever (and hid it from the
             // pickers). the block-undo paths set Running themselves. (satoru)
             cur->state = Process_Running;
+            // kurono.vrblock: the charge above ended the stint; this cpu keeps the
+            // same task, so start a fresh stint or its next block would be free. (satoru)
+            if (g_vr_block) vr_stint_start(cur, cpu);
         }
         g_sched_lock.UnlockIrqRestore(f);
     }
+    if (g_wakelat) wl_note_pick(cpu, next != nullptr);   // kurono.wakelat (satoru)
     if (!next) return false;
     SetCurrentForThisCpu(next);
     return LoadUserFrame(next, frame);
@@ -1613,7 +2438,10 @@ bool Scheduler::ScheduleNextUser(InterruptFrame* frame) {
 Process* Scheduler::ClaimNextUserForCpu(uint32_t cpu) {
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     Process* next = pick_next_user_nolock(nullptr, cpu);
-    if (next) next->state = Process_Running;
+    if (next) {
+        next->state = Process_Running;
+        if (g_claim_age) next->ready_since_ms = 0;   // new clear, gated (satoru)
+    }
     g_sched_lock.UnlockIrqRestore(f);
     return next;
 }
@@ -1665,6 +2493,7 @@ Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
     }
     if (pick) {
         pick->state = Process_Running;
+        if (g_claim_age) pick->ready_since_ms = 0;   // new clear, gated (satoru)
         // narrow the pin to THIS cpu. while the launching cpu runs this process it
         // time-shares the process's threads via the timer preempt, which releases
         // the leader back to Ready between slices - without this, ANOTHER ap would
@@ -1683,15 +2512,37 @@ Process* Scheduler::ClaimFreshUserForCpu(uint32_t cpu) {
 // userspace session), and a fresh process without a saved frame must be
 // LAUNCHED (ClaimFreshUserForCpu), not resumed. (satoru)
 Process* Scheduler::ClaimReadyThreadForCpu(uint32_t cpu) {
+    if (svc_cpu(cpu)) return nullptr;   // kernel procs only there (satoru)
+    // the idle dispatch loop is not a ring-0 hold: it is a scheduling point, and
+    // it runs every timer tick while idle. close the detector here so halt time
+    // is not counted as a hold. (satoru)
+    if (g_wakelat) wl_hold_close(cpu, Scheduler::NowMs());
     uint64_t f; g_sched_lock.LockIrqSave(&f);
+    if (g_wakelat) g_wl_claim_calls++;
+    uint64_t wl_now = g_wakelat ? Scheduler::NowMs() : 0;
     Process* pick = nullptr;
     Process* idle_pick = nullptr;   // task 20: SCHED_IDLE fallback (satoru)
     uint64_t cg_now = 0;   // lazy cpu.max clock, same pattern as the user pick (satoru)
+    uint64_t scan_min = ~0ull;   // kurono.vrblock: keep the wake clamp's min fresh (satoru)
+    Process* starved = nullptr;   // task-28 bound for this picker too (satoru)
+    uint64_t now_ms = Scheduler::NowMs();
     for (Process* c = ready_queue; c; c = c->next) {
         // threads, plus sched=2 AP_OK leaders/fork children (ApResumable is
         // exactly is_thread() in the old mode). (satoru)
         // ...and the leader THIS cpu launched, once it was preempted (agent_sched_10). (satoru)
         if (!c->is_user()) continue;
+        if ((c->state == Process_Ready || c->state == Process_Running) &&
+            c->sched_class == 0 && c->vruntime < scan_min) scan_min = c->vruntime;
+        if (g_wakelat && c->state == Process_Ready && c->sched_class == 0) {
+            WakeLatTask* we = wl_task(c, false);
+            if (we && we->pending && wl_now > we->wake_ms && wl_now - we->wake_ms > 200) {
+                if (!Scheduler::ApResumable(c) && !(cpu < SMP_MAX_CPUS && g_ap_launched[cpu] == c)) g_wl_cl_resum++;
+                else if (!c->has_user_frame) g_wl_cl_frame++;
+                else if (!cpu_allowed(c, cpu)) g_wl_cl_aff++;
+                else if (!cross_run_grace_ok(c, cpu)) g_wl_cl_grace++;
+                else g_wl_cl_elig++;
+            }
+        }
         if (!Scheduler::ApResumable(c) && !(cpu < SMP_MAX_CPUS && g_ap_launched[cpu] == c)) continue;
         if (c->state != Process_Ready || !c->has_user_frame) continue;
         if (!cpu_allowed(c, cpu)) continue;
@@ -1709,11 +2560,30 @@ Process* Scheduler::ClaimReadyThreadForCpu(uint32_t cpu) {
             continue;
         }
         if (!pick || c->vruntime < pick->vruntime) pick = c;
+        // the timer picker's task-28 bound, here too: a Ready cfs task that has
+        // been passed over for >64 ms wins this pick. this picker is the only
+        // scheduling decision while an ap idles, and it used raw vruntime: a
+        // frozen or just-plain-higher value stranded a woken thread for seconds.
+        // it must fire rarely once vrblock accounting is honest; wakelat prints
+        // the rate. (satoru)
+        if (g_claim_age && c->sched_class == 0) {
+            if (c->ready_since_ms == 0) c->ready_since_ms = now_ms;
+            else if (now_ms > c->ready_since_ms + 64 &&
+                     (!starved || c->ready_since_ms < starved->ready_since_ms))
+                starved = c;
+        }
     }
-    if (!pick) pick = idle_pick;   // an idle cpu runs SCHED_IDLE work (satoru)
+    if (starved) {
+        pick = starved;
+        if (g_wakelat) __atomic_add_fetch(&g_wl_claim_starved, 1u, __ATOMIC_RELAXED);
+    } else if (!pick) {
+        pick = idle_pick;   // an idle cpu runs SCHED_IDLE work (satoru)
+    }
+    if (g_claim_age && scan_min != ~0ull)
+        __atomic_store_n(&g_pack_min_vr, scan_min, __ATOMIC_RELAXED);
     if (pick) {
         pick->state = Process_Running;
-        pick->ready_since_ms = 0;   // task 28: picked - clear the starvation stamp (satoru)
+        pick->ready_since_ms = 0;   // task 28: picked - clear (main's unconditional clear) (satoru)
     }
     g_sched_lock.UnlockIrqRestore(f);
     return pick;
@@ -1769,8 +2639,25 @@ void Scheduler::PromoteDeferredWakes() {
     uint64_t f; g_sched_lock.LockIrqSave(&f);
     for (Process* p = ready_queue; p; p = p->next) {
         if (p->state == Process_Blocked && p->sleep_ticks > 0) {
+            // a nanosleep/clock_nanosleep park wakes on its own wall-clock
+            // deadline, not on the shared sleep_ticks cadence: several promotion
+            // callers decrement that counter, so it can expire early. only the
+            // linux sleeper side table sets this flag (poll/futex/epoll waits
+            // are untouched). (satoru)
+            if (__atomic_load_n(&p->flags, __ATOMIC_ACQUIRE) & PROCESS_FLAG_SLEEPING) {
+                if (Timer::GetRealMs64() < p->sleep_until_ms) continue;
+                __atomic_and_fetch(&p->flags, ~PROCESS_FLAG_SLEEPING, __ATOMIC_RELEASE);
+                p->sleep_ticks = 0;
+                p->state = Process_Ready;
+                if (g_claim_age && p->is_user()) p->ready_since_ms = Scheduler::NowMs();   // (satoru)
+                promoted = true;
+                if (p->interactive_score < 16) p->interactive_score += 2;
+                if (p->is_user() && p->sched_class == 0) p->vruntime += 1;
+                continue;
+            }
             if (--p->sleep_ticks == 0) {
                 p->state = Process_Ready;
+                if (g_claim_age && p->is_user()) p->ready_since_ms = Scheduler::NowMs();   // (satoru)
                 promoted = true;
                 if (p->interactive_score < 16) p->interactive_score += 2;
                 // task 23b: a deferred-tick SELF-wake (poll restart repoll,
@@ -1810,7 +2697,7 @@ void Scheduler::KickTaskCpu(Process* t) {
     if (!g_sched_v2 || !t) return;
     for (uint32_t c = 0; c < SMP::CpuCount(); c++) {
         PerCpu* pc = SMP::ByIndex(c);
-        if (pc && pc->current == t) { SMP::KickCpu(c); return; }
+        if (cpu_current(pc) == t) { SMP::KickCpu(c); return; }
     }
 }
 
@@ -1844,6 +2731,14 @@ bool Scheduler::ApUserIrqCheck(InterruptFrame* frame) {
 }
 
 void Scheduler::ApTimerPreempt(InterruptFrame* frame) {
+    if (g_wakelat && frame) {
+        uint32_t wc = SMP::CpuIndex();
+        if (wc < SMP_MAX_CPUS) {
+            g_wl_cpu[wc].last_rip = frame->rip;
+            g_wl_cpu[wc].last_cs = frame->cs;
+            wl_note_tick(wc, (frame->cs & 3) == 3);   // tick + ring0 hold sample (satoru)
+        }
+    }
     if (!frame || (frame->cs & 3) != 3) return;   // ring-3 user code only (satoru)
     Process* cur = GetCurrentProcess();
     if (!cur || !cur->is_user()) return;
@@ -1890,23 +2785,35 @@ uint64_t Scheduler::LastScheduleMs() { return g_last_schedule_ms; }
 // allocator its page tables + frames while a core can still walk them = the
 // wild-rip / zeroed-frame corruption class. a false positive just leaks one
 // address space - always the safe direction. (satoru)
+bool Scheduler::AsRunningOnOtherCpu(uint64_t as, Process* self) {   // (satoru)
+    if (!as) return false;
+    uint32_t me = SMP::CpuIndex();
+    for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
+        if (ci == me) continue;
+        Process* c = cpu_current(SMP::ByIndex(ci));
+        if (c && c != self && c->address_space == as) return true;
+    }
+    return false;
+}
+
 static bool as_live_elsewhere(Process* proc) {
     if (!proc || !proc->address_space) return false;
     uint64_t as = proc->address_space;
     uint32_t me = SMP::CpuIndex();
     for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
         PerCpu* pc = SMP::ByIndex(ci);
-        if (!pc || !pc->current) continue;
+        Process* c = cpu_current(pc);   // read once (audit 11-07 #9) (satoru)
+        if (!c) continue;
         // any task of this address space live on another cpu blocks the
         // destroy - INCLUDING proc itself still current on a different cpu
         // (mid-exit pre-iretq, its cr3 loaded there). only this cpu's own
         // ownership of proc is fine (the self-reap path switches to the
         // kernel root before destroying). (satoru)
-        if (pc->current == proc) {
+        if (c == proc) {
             if (ci != me) return true;
             continue;
         }
-        if (pc->current->address_space == as) return true;
+        if (c->address_space == as) return true;
     }
     bool live = false;
     uint64_t f; g_sched_lock.LockIrqSave(&f);
@@ -1923,8 +2830,8 @@ bool Scheduler::AddressSpaceLiveElsewhere(uint64_t as, Process* exclude) {
     if (!as) return false;
     for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
         PerCpu* pc = SMP::ByIndex(ci);
-        if (pc && pc->current && pc->current != exclude &&
-            pc->current->address_space == as) return true;
+        Process* c = cpu_current(pc);   // read once (audit 11-07 #9) (satoru)
+        if (c && c != exclude && c->address_space == as) return true;
     }
     bool live = false;
     uint64_t f; g_sched_lock.LockIrqSave(&f);
@@ -1977,7 +2884,7 @@ static bool task_quiet_everywhere(Process* p) {
     for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
         PerCpu* pc = SMP::ByIndex(ci);
         if (!pc) continue;
-        if (pc->current == p) return false;
+        if (cpu_current(pc) == p) return false;
         // an ap keeps the last task's stack as rsp0 / gs:8 until its dispatch
         // loop (or the next task) replaces it. (satoru)
         if (top && pc->kernel_rsp > kbase && pc->kernel_rsp <= top) return false;
@@ -2094,6 +3001,8 @@ void Scheduler::DestroyProcess(Process* proc) {
 
     sched_log_process_event(proc, "destroyed", proc->is_user() ? "native user task released" : "native kernel task released");
 
+    hal_pid_cpu_forget(proc->pid);   // a recycled pid must not inherit this task's cpu time (satoru)
+
     remove_from_ready_queue(proc);
 
     // a dying THREAD hands its same-address-space children (threads it created) to its own
@@ -2103,28 +3012,7 @@ void Scheduler::DestroyProcess(Process* proc) {
     // and the leader's regions were invisible to its faults: firefox heavy sites died under
     // sched=2 (only sched=2 reaps exited threads promptly) on a not-present write 2 pages
     // into a malloc group with no covering region (ffheavy 11-07). (satoru)
-    Process* adopt = (proc->is_thread() && proc->parent &&
-                      proc->parent->address_space == proc->address_space) ? proc->parent : nullptr;
-
-    if (proc->parent) {
-        unlink_child(proc->parent, proc);
-        proc->parent = nullptr;
-        proc->parent_pid = 0;
-    }
-
-    Process* child = proc->first_child;
-    while (child) {
-        Process* next_child = child->next_sibling;
-        child->next_sibling = nullptr;
-        if (adopt && child->address_space == proc->address_space && child->is_thread()) {
-            link_child(adopt, child);
-        } else {
-            child->parent = nullptr;
-            child->parent_pid = 0;
-        }
-        child = next_child;
-    }
-    proc->first_child = nullptr;
+    detach_from_family(proc);   // one tree-lock hold (audit 11-07 #7) (satoru)
 
     if (current_process == proc) current_process = nullptr;
 
@@ -2149,7 +3037,7 @@ void Scheduler::DestroyProcess(Process* proc) {
             __atomic_load_n(&proc->on_cpu, __ATOMIC_ACQUIRE) != 0) ctx_live = true;
         for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
             PerCpu* pc = SMP::ByIndex(ci);
-            if (pc && pc->current == proc) ctx_live = true;
+            if (cpu_current(pc) == proc) ctx_live = true;
         }
     }
 
@@ -2193,7 +3081,7 @@ void Scheduler::DestroyProcess(Process* proc) {
 
     proc->reaped = 1;
     proc->state  = Process_Terminated;
-    if (g_live_proc_count > 0) g_live_proc_count--;   // free a live-task slot (satoru)
+    live_release();   // free a live-task slot (satoru)
     // task 25 reviewer finding 1: a wake-next slot may still hold this proc (an
     // idle ap stashed it, never picked). clear every match BEFORE the free or
     // the fast path derefs recycled heap (the documented rip=0x3 seed). (satoru)
@@ -2260,26 +3148,7 @@ static void reap_group_member(Process* m) {
     }
     sched_log_process_event(m, "killed", "thread-group kill (task manager)");
     remove_from_ready_queue(m);
-    Process* adopt = (m->is_thread() && m->parent &&
-                      m->parent->address_space == m->address_space) ? m->parent : nullptr;   // see DestroyProcess (satoru)
-    if (m->parent) {
-        unlink_child(m->parent, m);
-        m->parent = nullptr;
-        m->parent_pid = 0;
-    }
-    Process* child = m->first_child;
-    while (child) {
-        Process* next_child = child->next_sibling;
-        child->next_sibling = nullptr;
-        if (adopt && child->address_space == m->address_space && child->is_thread()) {
-            link_child(adopt, child);
-        } else {
-            child->parent = nullptr;
-            child->parent_pid = 0;
-        }
-        child = next_child;
-    }
-    m->first_child = nullptr;
+    detach_from_family(m);   // see DestroyProcess (satoru)
     // NEVER free the kernel stack of the task parked in a slice donation: its
     // suspended perform_switch frame lives on that stack and it will be resumed
     // from it. Freeing it hands the pages to PMM, another allocation overwrites
@@ -2307,7 +3176,7 @@ static void reap_group_member(Process* m) {
     m->address_space = 0;
     m->reaped = 1;
     m->state  = Process_Terminated;
-    if (g_live_proc_count > 0) g_live_proc_count--;
+    live_release();
     // the struct was intentionally never freed here (a parked donor's frame, a straggler
     // still resumable): every SIGKILLed group leaked one ~200 KB struct per member
     // (taskmem: 3 thread structs = 581 KB per killed churn child). the free-later ring
@@ -2400,8 +3269,9 @@ void Scheduler::QueueDeferredReap(Process** members, int n) {
     for (int e = 0; e < 8; e++) {
         DeferredReap* r = &g_deferred_reaps[e];
         if (r->active) continue;
+        int kept = 0;
         for (int i = 0; i < n; i++) {
-            r->members[i] = members[i];
+            if (!members[i]) continue;
             // deferred sentinel (see reap_group_member): a waitpid /
             // wake_waiting_parent ReapProcess on a queued member must not
             // heap-free the struct or destroy the shared address space while
@@ -2409,13 +3279,17 @@ void Scheduler::QueueDeferredReap(Process** members, int n) {
             // on-cpu) - that was a drain-side uaf write, the exact freelist-
             // corruptor class. reaped=2 makes those paths no-op; only the
             // drain's reap_group_member accepts it. (satoru)
-            if (members[i]) {   // claim 0 -> 2 by cas: a DestroyProcess that claimed it (3) keeps it (review 11-07) (satoru)
-                uint8_t z = 0;
-                __atomic_compare_exchange_n(&members[i]->reaped, &z, (uint8_t)2, false,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-            }
+            // claim 0 -> 2 by cas. a member already claimed by DestroyProcess
+            // (3) or fully reaped (1) is NOT kept: storing it would leave a
+            // dangling pointer in the drain's snapshot. (satoru)
+            uint8_t z = 0;
+            if (!__atomic_compare_exchange_n(&members[i]->reaped, &z, (uint8_t)2, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                continue;
+            r->members[kept++] = members[i];
         }
-        r->n = n;
+        if (kept == 0) { g_reap_lock.UnlockIrqRestore(f); return; }
+        r->n = kept;
         r->attempts = 0;
         r->active = true;
         g_reap_lock.UnlockIrqRestore(f);
@@ -2489,7 +3363,7 @@ int Scheduler::KillProcessGroup(uint32_t pid) {
                 if (current_process == m) off = false;   // bsp current is tracked separately (satoru)
                 for (uint32_t ci = 0; ci < SMP::CpuCount() && off; ci++) {
                     PerCpu* pc = SMP::ByIndex(ci);
-                    if (pc && pc->current == m) off = false;
+                    if (cpu_current(pc) == m) off = false;
                 }
             }
             if (off) { quiesced = true; break; }
@@ -2562,7 +3436,7 @@ void Scheduler::drain_deferred_reaps_locked() {
             if (current_process == m) off = false;
             for (uint32_t ci = 0; ci < SMP::CpuCount() && off; ci++) {
                 PerCpu* pc = SMP::ByIndex(ci);
-                if (pc && pc->current == m) off = false;
+                if (cpu_current(pc) == m) off = false;
             }
         }
         if (!off) {
@@ -2729,12 +3603,14 @@ void Scheduler::Tick() {
     if (g_load_tick_acc >= 500) {
         g_load_tick_acc = 0;
         // active = ready + running
+        // walked under g_sched_lock: a concurrent remove nulls `next` and the old
+        // mode frees a destroyed struct at once (audit 11-07 #6). (satoru)
         uint32_t active = 0;
-        Process* it = ready_queue;
-        while (it) {
-            if (it->state == Process_Ready || it->state == Process_Running)
-                active++;
-            it = it->next;
+        {
+            SpinLockGuard lg(g_sched_lock);
+            for (Process* it = ready_queue; it; it = it->next)
+                if (it->state == Process_Ready || it->state == Process_Running)
+                    active++;
         }
         // sample in fixed-point
         uint32_t sample = active << 11;
@@ -2779,7 +3655,7 @@ bool Scheduler::RetireExitedThread(Process* t) {   // see scheduler.h (satoru)
     if (current_process == t) return false;
     for (uint32_t ci = 0; ci < SMP::CpuCount(); ci++) {
         PerCpu* pc = SMP::ByIndex(ci);
-        if (pc && pc->current == t) return false;
+        if (cpu_current(pc) == t) return false;
     }
     // the struct stays leaked (futex/wake slots may hold raw pointers), so
     // bound how many retirements may pile up: past this many, fall back to the
@@ -2805,7 +3681,7 @@ bool Scheduler::RetireExitedThread(Process* t) {   // see scheduler.h (satoru)
     uint8_t z0 = 0;
     if (__atomic_compare_exchange_n(&t->reaped, &z0, (uint8_t)1, false,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {   // claim, see DestroyProcess (satoru)
-        if (g_live_proc_count > 0) g_live_proc_count--;
+        live_release();
         s_retired++;
         did = true;
     }
@@ -2818,17 +3694,7 @@ bool Scheduler::RetireExitedThread(Process* t) {   // see scheduler.h (satoru)
         // lists (child threads go to its parent, see DestroyProcess) and into the free-later
         // ring, which scrubs the futex / poll / wake slots through the linux hook before the
         // free and waits until it is off every cpu and unreferenced. (satoru)
-        Process* adopt = (t->parent && t->parent->address_space == t->address_space) ? t->parent : nullptr;
-        if (t->parent) { unlink_child(t->parent, t); t->parent = nullptr; t->parent_pid = 0; }
-        Process* c = t->first_child;
-        while (c) {
-            Process* nx = c->next_sibling;
-            c->next_sibling = nullptr;
-            if (adopt && c->is_thread() && c->address_space == t->address_space) link_child(adopt, c);
-            else { c->parent = nullptr; c->parent_pid = 0; }
-            c = nx;
-        }
-        t->first_child = nullptr;
+        detach_from_family(t);   // t->is_thread() holds here (checked at the top) (satoru)
         free_later_push(t);
     }
     return true;
@@ -2836,13 +3702,14 @@ bool Scheduler::RetireExitedThread(Process* t) {   // see scheduler.h (satoru)
 
 uint32_t Scheduler::GetProcessCount() {
     uint32_t c = 0;
-    Process* p = ready_queue;
-    while(p) { c++; p = p->next; }
+    SpinLockGuard lg(g_sched_lock);   // audit 11-07 #6 (satoru)
+    for (Process* p = ready_queue; p; p = p->next) c++;
     return c;
 }
 
 const char* Scheduler::GetCurrentProcessName() {
-    if (current_process) return current_process->name;
+    Process* cp = GetCurrentProcess();   // per cpu (satoru)
+    if (cp) return cp->name;
     return "None";
 }
 
@@ -2858,9 +3725,16 @@ Process* Scheduler::GetCurrentProcess() {
 void Scheduler::SetCurrentForThisCpu(Process* p) {
     if (SMP::CpuIndex() != 0) SMP::Current()->current = p;
     else current_process = p;
+    // kurono.vrblock: a user task starts its stint when this cpu takes it. both
+    // the pick and the iret dispatch pass here, so the stamp is never missed. (satoru)
+    if (p && p->is_user()) vr_stint_start(p, SMP::CpuIndex() % SMP_MAX_CPUS);
 }
 
 Process* Scheduler::FindProcessByPid(uint32_t pid) {
+    // the walk is locked (an unlocked walker stopped early at a node a concurrent
+    // remove had just cut loose, so a live pid looked gone - audit 11-07 #6). the
+    // returned pointer is still unreferenced: callers must not keep it. (satoru)
+    SpinLockGuard lg(g_sched_lock);
     for (Process* proc = ready_queue; proc; proc = proc->next) {
         if (proc->pid == pid) return proc;
     }
@@ -2869,7 +3743,7 @@ Process* Scheduler::FindProcessByPid(uint32_t pid) {
 
 // copy one live task into the public snapshot shape. callers hold g_sched_lock
 // (or accept a tearing read, as the task manager always has). (satoru)
-static void sched_fill_snapshot(Process* proc, SchedulerProcessSnapshot& snap) {
+static void sched_fill_snapshot(Process* proc, SchedulerProcessSnapshot& snap, bool with_mem = true) {
     memset(&snap, 0, sizeof(snap));
     snap.pid = proc->pid;
     memcpy(snap.name, proc->name, sizeof(snap.name));
@@ -2877,7 +3751,7 @@ static void sched_fill_snapshot(Process* proc, SchedulerProcessSnapshot& snap) {
     snap.priority = proc->priority;
     snap.flags = proc->flags;
     snap.cpu_ticks_total = hal_pid_busy_ms(proc->pid);   // busy ms sampled by the timer irqs, not loop iterations (satoru)
-    snap.memory_kb = estimate_process_memory_kb(proc);
+    snap.memory_kb = with_mem ? estimate_process_memory_kb(proc) : 0;
     snap.address_space = proc->is_user() ? proc->address_space : 0;
     snap.nice = proc->nice;
     snap.sched_class = proc->sched_class;
@@ -2902,13 +3776,33 @@ static bool sched_proc_plausible(Process* proc) {
 int Scheduler::GetProcessSnapshot(SchedulerProcessSnapshot* out, int max_count) {
     if (!out || max_count <= 0) return 0;
 
+    // copy under g_sched_lock (audit 11-07 #6), except memory_kb: that walks the
+    // 4096-slot region table of every task, too long to hold the lock for. it is
+    // read afterwards, unlocked as it always was, and only while the pointer still
+    // carries the pid copied under the lock. (satoru)
+    // s_ptr is shared by concurrent callers. a plain spin with IF left as the caller
+    // had it: the memory walk below is long, and an irq-off window that long held up
+    // tlb shootdown acks (review finding). no irq path calls this. (satoru)
+    static Process* s_ptr[512];
+    static Spinlock s_snap_lock;
+    s_snap_lock.Lock();
     int count = 0;
     int guard = 0;
-    for (Process* proc = ready_queue; proc && count < max_count; proc = proc->next) {
-        if (!sched_proc_plausible(proc)) break;
-        if (++guard > 4096) break;
-        sched_fill_snapshot(proc, out[count++]);
+    {
+        SpinLockGuard lg(g_sched_lock);
+        for (Process* proc = ready_queue; proc && count < max_count; proc = proc->next) {
+            if (!sched_proc_plausible(proc)) break;
+            if (++guard > 4096) break;
+            sched_fill_snapshot(proc, out[count], false);
+            s_ptr[count < 512 ? count : 511] = (count < 512) ? proc : nullptr;
+            count++;
+        }
     }
+    for (int i = 0; i < count && i < 512; i++) {
+        Process* proc = s_ptr[i];
+        if (proc && proc->pid == out[i].pid) out[i].memory_kb = estimate_process_memory_kb(proc);
+    }
+    s_snap_lock.Unlock();
 
     return count;
 }
@@ -2984,11 +3878,12 @@ void Scheduler::GetLoadAverageStr(char* out, int max_len) {
     put_load(g_load_avg_fixed[2]); put(' ');
     // running/total + last_pid
     uint32_t total = 0, running = 0;
-    Process* it = ready_queue;
-    while (it) {
-        total++;
-        if (it->state == Process_Running || it->state == Process_Ready) running++;
-        it = it->next;
+    {
+        SpinLockGuard lg(g_sched_lock);   // audit 11-07 #6 (satoru)
+        for (Process* it = ready_queue; it; it = it->next) {
+            total++;
+            if (it->state == Process_Running || it->state == Process_Ready) running++;
+        }
     }
     char tmp[12]; int ti = 0;
     if (running == 0) tmp[ti++] = '0';
@@ -3007,26 +3902,29 @@ void Scheduler::GetLoadAverageStr(char* out, int max_len) {
 
 int Scheduler::SetAffinity(uint32_t pid, uint8_t mask) {
     if (mask == 0) return -1;                  // EINVAL: empty mask
-    Process* p = ready_queue;
-    while (p) {
-        if (p->pid == pid) {
-            p->cpu_affinity = mask;
-            return 0;
-        }
-        p = p->next;
+    // locked walk (audit 11-07 #6). under sched=2 an affinity of exactly 1 (bsp
+    // only) on a user thread is the clone pin - the syscall never stores 1 there -
+    // and the thread is still half built: overwriting the pin would let an ap claim
+    // it before clone has made its linux record, so refuse it like a missing pid
+    // until clone releases the pin. (satoru)
+    SpinLockGuard lg(g_sched_lock);
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->pid != pid) continue;
+        if (g_sched_v2 && p->is_user() && p->cpu_affinity == 1) return -1;
+        p->cpu_affinity = mask;
+        return 0;
     }
     return -1;                                 // ESRCH
 }
 
 int Scheduler::GetAffinity(uint32_t pid, uint8_t* out_mask) {
     if (!out_mask) return -1;
-    Process* p = ready_queue;
-    while (p) {
+    SpinLockGuard lg(g_sched_lock);   // audit 11-07 #6 (satoru)
+    for (Process* p = ready_queue; p; p = p->next) {
         if (p->pid == pid) {
             *out_mask = p->cpu_affinity;
             return 0;
         }
-        p = p->next;
     }
     return -1;
 }
@@ -3048,12 +3946,24 @@ namespace {
 
 constexpr uint64_t KP_PAGE_SIZE   = 4096ULL;
 constexpr uint64_t KP_GUARD_PAGES = 1;     // single guard page per process
-constexpr int      KP_MAX         = 32;    // soft cap on tracked kernel procs
+// soft cap on tracked kernel procs
+constexpr int      KP_MAX         = 64;    // 64: the kui launcher pool adds 12 (satoru)
 
 // Tracking table for kernel processes (those with adaptive stacks).
 // Used by Scheduler::TryGrowGuardPage() when handling #PF faults.
 Process* g_kernel_procs[KP_MAX] = {};
 int      g_kernel_proc_count    = 0;
+
+// service cpus (kurono.svccpu, sched=2): a kernel proc lives on one cpu, its
+// "home". every cpu that hosts kernel procs runs its own cooperative loop over
+// the procs homed there; a proc never moves. side table indexed like
+// g_kernel_procs, so struct Process does not grow. home 0 everywhere = the old
+// single-cpu behaviour. (satoru)
+uint8_t  g_kp_home[KP_MAX] = {};
+Spinlock g_kp_track_lock;
+// per-ap resched request for the kernel procs of a service cpu (cpu 0 keeps
+// g_need_resched below). (satoru)
+volatile bool g_need_resched_ap[SMP_MAX_CPUS] = {};
 
 // Cumulative milliseconds of wall time the scheduler has observed.
 volatile uint64_t g_sched_now_ms = 0;
@@ -3093,10 +4003,58 @@ inline uint32_t timeslice_for(Process* p) {
     return PROCESS_TIMESLICE_MS[prio_tier_for(p)];
 }
 
+static bool kp_name_is(const char* n, const char* w) {
+    if (!n || !w) return false;
+    while (*n && *w && *n == *w) { n++; w++; }
+    return *n == 0 && *w == 0;
+}
+
+// the kernel services that touch no window, desktop or terminal state (or touch
+// it only under kls) and may run in parallel with the desktop. (satoru)
+static bool kp_is_service(const char* n) {
+    static const char* const svc[] = {
+        "audio", "network", "timekeeper", "scheduler", "logging", "disklog",
+        "kmemx", "vmhost", "r3audio", nullptr };
+    for (int i = 0; svc[i]; i++) if (kp_name_is(n, svc[i])) return true;
+    return false;
+}
+
+// which cpu a kernel proc lives on, from its name, so no spawn site changes.
+// the window manager, the desktop, the terminals and the rest of the ui were
+// written for one cpu: the gui loop and the shell, the launchers, power, kinit
+// and the rest never ran at the same time because they shared cpu 0
+// cooperatively. so that whole desktop domain moves to the ui cpu together and
+// keeps exactly that guarantee there, and cpu 0 keeps only the services listed
+// above, which now run beside it: the clock, the heartbeat / reaper, the log
+// writers, kmemx (and audio + network, and the vm host, while they have no cpu
+// of their own). everything not listed, including procs drivers and apps spawn
+// later, is desktop domain: the safe default. (an experiment kept gui + input
+// alone on the ui cpu behind a lock word shared with cpu 0's desktop procs;
+// ~650 hand-offs a second made the firefox launch 40% slower, see
+// agent_smp_results.md.) (satoru)
+static uint8_t kp_home_for(const char* n) {
+    if (g_svc_io && (kp_name_is(n, "audio") || kp_name_is(n, "network") || kp_name_is(n, "timekeeper")))
+        return (uint8_t)g_svc_io;
+    if (g_svc_vm && kp_name_is(n, "vmhost")) return (uint8_t)g_svc_vm;
+    if (n && n[0] == 'v' && n[1] == 'm' && n[2] == 'c' && n[3] == 'p' && n[4] == 'u' && n[5] >= '1' && n[5] <= '7' && !n[6])
+        return (uint8_t)g_svc_vcpu[n[5] - '0'];      // a vcpu thread, on a cpu of its own (satoru)
+    if (kp_is_service(n)) return 0;
+    return (uint8_t)g_svc_ui;   // 0 when the desktop stays on cpu 0 (satoru)
+}
+
 static void kp_track(Process* p) {
     if (!p) return;
-    if (g_kernel_proc_count >= KP_MAX) return;
-    g_kernel_procs[g_kernel_proc_count++] = p;
+    // spawns can come from kernel procs on more than one cpu now. the home and
+    // domain are written before the count publishes the slot, so no picker ever
+    // sees the proc with a stale home. (satoru)
+    uint64_t f; g_kp_track_lock.LockIrqSave(&f);
+    if (g_kernel_proc_count < KP_MAX) {
+        int i = g_kernel_proc_count;
+        g_kp_home[i] = kp_home_for(p->name);
+        g_kernel_procs[i] = p;
+        __atomic_store_n(&g_kernel_proc_count, i + 1, __ATOMIC_RELEASE);
+    }
+    g_kp_track_lock.UnlockIrqRestore(f);
 }
 
 // Round up to whole pages.
@@ -3304,12 +4262,19 @@ static uint64_t g_donate_gated    = 0;
 // `kurono.donate=1` enables it. (satoru)
 static bool     g_donate_enabled  = false;
 
+static bool g_picktrace = false;
+static uint64_t g_picktrace_next = 0;
+
+// a kernel proc runs only on its home cpu. (satoru)
+static inline bool kp_here(int idx, uint32_t cpu) { return g_kp_home[idx] == cpu; }
+
 static Process* pick_next_kernel(Process* after) {
+    uint32_t pcpu = SMP::CpuIndex();
     // hand the slice back as soon as the donation deadline passes - FIRST, not
     // as a fallback: a busy kernel-proc set would otherwise never return to the
     // user task and the syscall would hang. this bounds the donation to `ms`
     // plus one kernel-proc slice. (satoru)
-    if (g_donor && g_donor != after && !g_donor->reaped &&
+    if (pcpu == 0 && g_donor && g_donor != after && !g_donor->reaped &&
         g_donor->state == Process_Sleeping && g_donor_until_ms <= now_ms()) {
         return g_donor;
     }
@@ -3317,10 +4282,12 @@ static Process* pick_next_kernel(Process* after) {
     if (g_kernel_proc_count == 0) return nullptr;
 
     int start = 0;
+    int after_idx = -1;
     if (after) {
         for (int i = 0; i < g_kernel_proc_count; i++) {
             if (g_kernel_procs[i] == after) {
                 start = i + 1;
+                after_idx = i;
                 break;
             }
         }
@@ -3338,17 +4305,39 @@ static Process* pick_next_kernel(Process* after) {
             int idx = (start + step) % g_kernel_proc_count;
             Process* cand = g_kernel_procs[idx];
             if (!cand || cand == after || cand->reaped) continue;
+            if (!kp_here(idx, pcpu)) continue;   // another cpu's proc (satoru)
             if (cand->prio_tier != tier) continue;
             if (cand->state != Process_Ready &&
                 cand->state != Process_Running) continue;
             if (cand->cgroup_throttle_until_ms > t) continue;
+            if (g_picktrace && cand->name[0] == 'p' && cand->name[1] == 'o' &&
+                cand->name[2] == 'w' && cand->name[3] == 'e' && cand->name[4] == 'r' &&
+                t >= g_picktrace_next) {
+                g_picktrace_next = t + 1000;
+                SerialLogger::Log("[picktrace] power candidate tier=");
+                SerialLogger::LogDec((int)cand->prio_tier);
+                SerialLogger::Log(" state=");
+                SerialLogger::LogDec((int)cand->state);
+                SerialLogger::Log(" score=");
+                SerialLogger::LogDec((int)cand->interactive_score);
+                SerialLogger::Log(" cg=");
+                SerialLogger::LogDec((int)cand->cgroup_throttle_until_ms);
+                SerialLogger::Log(" after=");
+                SerialLogger::Log(after ? after->name : "none");
+                SerialLogger::Log("\r\n");
+            }
             int score = (int)cand->interactive_score;
             if (score > best_score) {
                 best = cand;
                 best_score = score;
             }
         }
-        if (best) return best;
+        if (best) {
+            if (g_picktrace && best->name[0] == 'p' && best->name[1] == 'o' &&
+                best->name[2] == 'w' && best->name[3] == 'e' && best->name[4] == 'r')
+                SerialLogger::Log("[picktrace] picked power\r\n");
+            return best;
+        }
     }
 
     // Pass 2: relax cgroup throttling - would-be-throttled tasks may run
@@ -3358,6 +4347,7 @@ static Process* pick_next_kernel(Process* after) {
             int idx = (start + step) % g_kernel_proc_count;
             Process* cand = g_kernel_procs[idx];
             if (!cand || cand == after || cand->reaped) continue;
+            if (!kp_here(idx, pcpu)) continue;   // (satoru)
             if (cand->prio_tier != tier) continue;
             if (cand->state != Process_Ready &&
                 cand->state != Process_Running) continue;
@@ -3366,7 +4356,8 @@ static Process* pick_next_kernel(Process* after) {
     }
 
     if (after && !after->reaped &&
-        (after->state == Process_Ready || after->state == Process_Running)) {
+        (after->state == Process_Ready || after->state == Process_Running) &&
+        (after_idx < 0 || kp_here(after_idx, pcpu))) {
         return after;
     }
     return nullptr;
@@ -3383,18 +4374,64 @@ static void wake_due_processes() {
     // nests harmlessly when already called from IRQ context. (satoru)
     IrqGuard _g;
     uint64_t t = now_ms();
+    // only this cpu's own procs: a proc's state is written by its home cpu alone
+    // (the ap service ticks wake theirs). (satoru)
+    uint32_t wcpu = SMP::CpuIndex();
     for (int i = 0; i < g_kernel_proc_count; i++) {
         Process* p = g_kernel_procs[i];
         if (!p || p->reaped) continue;
+        if (g_kp_home[i] != wcpu) continue;
         if (p->state == Process_Sleeping && p->sleep_until_ms <= t) {
             p->state = Process_Ready;
             p->last_wake_ms = t;
+            if (g_wakelat) wl_stamp_wake(p);   // kurono.wakelat (satoru)
             uint64_t slept = (p->sleep_start_ms && t > p->sleep_start_ms)
                              ? (t - p->sleep_start_ms) : 0;
             uint8_t bump = (slept <= 4) ? 4 : (slept <= 16 ? 2 : 1);
             uint32_t s = (uint32_t)p->interactive_score + bump;
             p->interactive_score = (uint8_t)(s > 16 ? 16 : s);
         }
+    }
+}
+
+// kurono.kplat=1: kernel-proc latency probe, the "measure first" part of step 5 of
+// shared_points_plan.md (preemptible service threads). per kernel-proc slot: how long
+// it waited from its wake (wake_due_processes sets last_wake_ms) to running, and the
+// longest stretch it held the cpu before switching away - the hog that made the others
+// wait. side tables indexed by g_kernel_procs slot, struct Process does not grow.
+// reported from the scheduler heartbeat every 10 s, then reset. off by default. (satoru)
+static bool     g_kplat = false;
+static uint64_t g_kplat_in_ms[KP_MAX];     // when the slot last switched in
+static uint64_t g_kplat_seen_wake[KP_MAX]; // last_wake_ms already counted
+static uint32_t g_kplat_wakes[KP_MAX];
+static uint64_t g_kplat_wait_sum[KP_MAX];
+static uint32_t g_kplat_wait_max[KP_MAX];
+static uint32_t g_kplat_wait_16[KP_MAX];   // waits over 16 ms
+static uint32_t g_kplat_run_max[KP_MAX];
+
+static int kplat_slot(const Process* p) {
+    for (int i = 0; i < g_kernel_proc_count; i++) if (g_kernel_procs[i] == p) return i;
+    return -1;
+}
+
+static void kplat_switch(Process* prev, Process* next) {
+    uint64_t t = now_ms();
+    int ps = prev ? kplat_slot(prev) : -1;
+    if (ps >= 0) {
+        uint64_t ran = t - g_kplat_in_ms[ps];
+        if (g_kplat_in_ms[ps] && ran > g_kplat_run_max[ps]) g_kplat_run_max[ps] = (uint32_t)ran;
+    }
+    int ns = next ? kplat_slot(next) : -1;
+    if (ns < 0) return;
+    g_kplat_in_ms[ns] = t;
+    uint64_t w = next->last_wake_ms;
+    if (w && w != g_kplat_seen_wake[ns] && t >= w) {
+        g_kplat_seen_wake[ns] = w;
+        uint32_t d = (uint32_t)(t - w);
+        g_kplat_wakes[ns]++;
+        g_kplat_wait_sum[ns] += d;
+        if (d > g_kplat_wait_max[ns]) g_kplat_wait_max[ns] = d;
+        if (d > 16) g_kplat_wait_16[ns]++;
     }
 }
 
@@ -3408,7 +4445,7 @@ static void perform_switch(Process* prev, Process* next) {
     // the kernel-proc heartbeat. only stamp for a real kernel proc: switching
     // BACK to a donation donor is a user task and must not look like the
     // cooperative kernel having run. (satoru)
-    if (next->is_kernel_proc) g_last_kswitch_ms = now_ms();
+    if (next->is_kernel_proc && SMP::CpuIndex() == 0) g_last_kswitch_ms = now_ms();
 
     // ── seeded-frame guard (the ring-0 RIP=0x3 corruptor) ───────────────────
     // Only meaningful before the task's first run, when we know exactly what
@@ -3432,11 +4469,22 @@ static void perform_switch(Process* prev, Process* next) {
     // access to any of this) can name the victim if the return slot goes bad in
     // the window between here and its `ret`. (satoru)
     g_switch_victim = next;
+    if (g_kplat) kplat_switch(prev, next);   // kurono.kplat=1 (satoru)
+    // kurono.vrblock: a donation switches a running USER task to a kernel proc
+    // without ScheduleNextUser; end its stint. the way back (next is user) is
+    // stamped by SetCurrentForThisCpu below. (satoru)
+    if (prev && prev->is_user()) vr_stint_charge(prev, SMP::CpuIndex() % SMP_MAX_CPUS);
+    if (g_wakelat) wl_note_run(next, SMP::CpuIndex());   // kurono.wakelat (satoru)
 
-    Scheduler::current_process = next;
+    // per cpu: the global on cpu 0, PerCpu.current on a service cpu. (satoru)
+    Scheduler::SetCurrentForThisCpu(next);
     next->state = Process_Running;
     next->timeslice_ms_left = timeslice_for(next);
-    g_need_resched = false;
+    {
+        uint32_t c = SMP::CpuIndex();
+        if (c == 0) g_need_resched = false;
+        else if (c < SMP_MAX_CPUS) g_need_resched_ap[c] = false;
+    }
     // TSS.RSP0 must be the stack that task's next ring-3 -> ring-0 entry will
     // land on. kernel procs run on kstack.high; a USER task (only ever seen here
     // as a donation donor) runs on kernel_stack_top, and its kstack is the
@@ -3566,6 +4614,7 @@ Process* Scheduler::SpawnKernelProcess(const char* name,
     if (!entry) return nullptr;
     Process* proc = (Process*)KernelHeap::Alloc(sizeof(Process));
     if (!proc) return nullptr;
+    __atomic_add_fetch(&g_live_proc_count, 1u, __ATOMIC_ACQ_REL);   // kernel procs are not capped (satoru)
 
     init_process_common(proc, name ? name : "kproc", (uint32_t)tier);
     proc->prio_tier         = (uint8_t)tier;
@@ -3577,6 +4626,7 @@ Process* Scheduler::SpawnKernelProcess(const char* name,
                               (uint64_t)init_stack_kb * 1024ULL,
                               (uint64_t)cap_stack_kb  * 1024ULL)) {
         KernelHeap::Free(proc);
+        live_release();
         return nullptr;
     }
     proc->kernel_stack_top = proc->kstack.high;
@@ -3621,7 +4671,10 @@ Process* Scheduler::SpawnKernelProcess(const char* name,
 }
 
 void Scheduler::SleepMs(uint32_t ms) {
-    if (!g_preemptive_active || !current_process || !current_process->is_kernel_proc) {
+    // the calling cpu's current task: kernel procs run on service aps too now.
+    // (the global alone named cpu 0's proc on every cpu.) (satoru)
+    Process* cur = GetCurrentProcess();
+    if (!g_preemptive_active || !cur || !cur->is_kernel_proc) {
         // Pre-Start() fallback: HLT until the next IRQ, never busy spin.
         uint64_t target = now_ms() + ms;
         while (now_ms() < target) {
@@ -3630,7 +4683,8 @@ void Scheduler::SleepMs(uint32_t ms) {
         return;
     }
 
-    Process* prev = current_process;
+    uint32_t cpu = SMP::CpuIndex();
+    Process* prev = cur;
     Process* next = nullptr;
     {
         IrqGuard g;
@@ -3655,6 +4709,15 @@ void Scheduler::SleepMs(uint32_t ms) {
                 Process* n2 = pick_next_kernel(prev);
                 if (n2) { perform_switch(prev, n2); return; }
             }
+        }
+        // our own deadline just passed: if a lower-tier or same-tier proc is
+        // already Ready, run it before returning, otherwise a chain of HLT
+        // sleepers that wake themselves starves every other kernel proc (the
+        // power worker never ran again once firefox loaded the bsp). (satoru)
+        {
+            IrqGuard g3;
+            Process* n3 = pick_next_kernel(prev);
+            if (n3 && n3 != prev) { perform_switch(prev, n3); return; }
         }
         prev->state = Process_Running;
         return;
@@ -3812,15 +4875,86 @@ bool Scheduler::DonateToKernelProcs(uint32_t ms) {
     return true;
 }
 
+bool Scheduler::DonateToKernelProc(Process* target, uint32_t ms) {
+    if (!g_preemptive_active) return false;
+    Process* me = current_process;
+    if (!me || me->is_kernel_proc || me->reaped) return false;
+    if (!me->kernel_stack_top) return false;
+    if (!target || target->reaped || target->is_user()) return false;
+    if (g_donor) return false;
+    // only a proc that lives on cpu 0 can take a slice here (kurono.svccpu). (satoru)
+    for (int i = 0; i < g_kernel_proc_count; i++)
+        if (g_kernel_procs[i] == target && g_kp_home[i] != 0) return false;
+    {
+        IrqGuard g;
+        if (target->state != Process_Sleeping && target->state != Process_Ready) return false;
+        uint64_t t = now_ms();
+        me->sleep_start_ms = t;
+        me->sleep_until_ms = t + (ms ? ms : 1);
+        me->state          = Process_Sleeping;
+        target->sleep_until_ms = t;      // wake now (satoru)
+        target->interactive_score = 16;  // win the tier scan until it runs (satoru)
+        target->state = Process_Ready;
+        g_donor           = me;
+        g_donor_until_ms  = me->sleep_until_ms;
+    }
+    constexpr uint32_t MSR_FS_BASE_DON = 0xC0000100;
+    uint32_t fs_lo, fs_hi;
+    __asm__ __volatile__("rdmsr" : "=a"(fs_lo), "=d"(fs_hi) : "c"(MSR_FS_BASE_DON));
+    __asm__ __volatile__("fxsave %0" : "=m"(me->fpu_state));
+    {
+        IrqGuard g;
+        perform_switch(me, target);
+    }
+    __asm__ __volatile__("fxrstor %0" : : "m"(me->fpu_state));
+    __asm__ __volatile__("wrmsr" : : "a"(fs_lo), "d"(fs_hi), "c"(MSR_FS_BASE_DON));
+    {
+        IrqGuard g;
+        g_donor   = nullptr;
+        me->state = Process_Running;
+    }
+    g_donate_ok++;
+    return true;
+}
+
 void Scheduler::YieldNow() {
-    if (!g_preemptive_active || !current_process || !current_process->is_kernel_proc) {
+    Process* prev = GetCurrentProcess();   // per cpu (kurono.svccpu) (satoru)
+    if (!g_preemptive_active || !prev || !prev->is_kernel_proc) {
         return;
     }
     IrqGuard g;
-    Process* prev = current_process;
     Process* next = pick_next_kernel(prev);
     if (!next || next == prev) return;
     perform_switch(prev, next);
+}
+
+bool Scheduler::TaskStateByPid(uint32_t pid, const Process* expect, int* state, int* exit_code) {
+    SpinLockGuard lg(g_sched_lock);
+    for (Process* p = ready_queue; p; p = p->next) {
+        if (p->pid != pid) continue;
+        if (expect && p != expect) return false;
+        if (state) *state = (int)p->state;
+        if (exit_code) *exit_code = p->exit_code;
+        return true;
+    }
+    return false;
+}
+
+static uint32_t g_cond_resched_count = 0;   // yields taken, for the kplat line (satoru)
+void Scheduler::CondResched() {
+    if (!g_preemptive_active) return;
+    uint32_t cpu = SMP::CpuIndex();
+    // cpu 0 or a service cpu (kurono.svccpu). (satoru)
+    bool want = (cpu == 0) ? g_need_resched : (svc_cpu(cpu) && g_need_resched_ap[cpu]);
+    if (!want) return;
+    Process* cur = GetCurrentProcess();
+    if (!cur || !cur->is_kernel_proc) return;
+    if (cpu != 0 && !svc_cpu(cpu)) return;
+    uint64_t fl; __asm__ __volatile__("pushfq; popq %0" : "=r"(fl));
+    if (!(fl & 0x200)) return;                 // an irq-off section (satoru)
+    if (LinuxSyscall::KlsHeldHere()) return;   // never switch holding kls (satoru)
+    if (g_cond_resched_count < 0xFFFFFFFFu) g_cond_resched_count++;
+    YieldNow();
 }
 
 void Scheduler::ServiceSleepQueue() {
@@ -3828,6 +4962,7 @@ void Scheduler::ServiceSleepQueue() {
 }
 
 void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
+    if (g_wakelat) wl_note_tick(0, false);   // cpu0's irq0 entries (satoru)
     g_sched_now_ms += ms_elapsed;
     // refresh the userspace vdso time page (seqlock write, no heap/kvfs/port-io
     // -> irq-safe, same discipline as the g_sched_now_ms bump above). this is
@@ -3871,11 +5006,24 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
         uint64_t lf; g_sched_lock.LockIrqSave(&lf);
         for (Process* q = ready_queue; q; q = q->next) {
             if (q->is_user() && q->state == Process_Blocked && q->sleep_ticks > 0) {
+                // a nanosleep park is wall-clock scheduled (see PromoteDeferredWakes);
+                // leave its counter alone until sleep_until_ms has passed. (satoru)
+                if (__atomic_load_n(&q->flags, __ATOMIC_ACQUIRE) & PROCESS_FLAG_SLEEPING) {
+                    if (Timer::GetRealMs64() < q->sleep_until_ms) continue;
+                    __atomic_and_fetch(&q->flags, ~PROCESS_FLAG_SLEEPING, __ATOMIC_RELEASE);
+                    q->sleep_ticks = 0;
+                    q->state = Process_Ready;
+                    if (g_claim_age && q->is_user()) q->ready_since_ms = Scheduler::NowMs();   // (satoru)
+                    if (q->interactive_score < 16) q->interactive_score += 2;
+                    tick_promoted = true;
+                    continue;
+                }
                 if (q->sleep_ticks > ms_elapsed) {
                     q->sleep_ticks -= ms_elapsed;
                 } else {
                     q->sleep_ticks = 0;
                     q->state = Process_Ready;
+                    if (g_claim_age && q->is_user()) q->ready_since_ms = Scheduler::NowMs();   // (satoru)
                     if (q->interactive_score < 16) q->interactive_score += 2;
                     tick_promoted = true;
                 }
@@ -3920,6 +5068,7 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     for (int i = 0; i < g_kernel_proc_count; i++) {
         Process* cand = g_kernel_procs[i];
         if (!cand || cand == p || cand->reaped) continue;
+        if (g_kp_home[i] != 0) continue;   // a service cpu's proc (satoru)
         if (cand->state != Process_Ready) continue;
         if (cand->prio_tier < p->prio_tier) {
             g_need_resched = true;
@@ -3928,10 +5077,246 @@ void Scheduler::OnTimerTick(uint32_t ms_elapsed) {
     }
 }
 
+// ── service cpus (kurono.svccpu) ─────────────────────────────────────────────
+void Scheduler::SetServiceCpus(bool on) { g_svc_enabled = on; }
+void Scheduler::SetServiceCpuRequest(int ui, int io, int vm) {
+    if (ui >= 0) g_svc_ui_req = ui;
+    if (io >= 0) g_svc_io_req = io;
+    if (vm >= 0) g_svc_vm_req = vm;
+}
+bool Scheduler::IsServiceCpu(uint32_t cpu) { return svc_cpu(cpu); }
+uint32_t Scheduler::UiCpu() { return g_svc_ui; }
+uint32_t Scheduler::VmCpu() { return g_svc_vm; }
+void Scheduler::SetVcpuCpus(int n) { g_vcpu_cpus_req = n < 0 ? 0 : (n > 7 ? 7 : n); }
+uint32_t Scheduler::VcpuCpu(int k) { return (k >= 1 && k < 8) ? g_svc_vcpu[k] : 0; }
+bool Scheduler::KernelProcCpu(uint32_t cpu) { return cpu == 0 || svc_cpu(cpu); }
+uint32_t Scheduler::FirstProgramCpu() {
+    uint32_t n = SMP::OnlineCount();
+    for (uint32_t c = 1; c < n && c < SMP_MAX_CPUS; c++) if (!svc_cpu(c)) return c;
+    return 1;
+}
+
+// the layout, from the cpus online after StartAPs. 20 cpus (the laptop): cpu 0 the
+// kernel services, 1 the desktop domain, 2 audio + network, 3 the vm, 4-19
+// programs. 4-11 cpus: only the desktop moves (an idle vm cpu would cost an
+// 8-cpu machine a sixth of its program cpus). fewer than 4: everything stays on
+// cpu 0 as before. kurono.svc.ui/io/vm=N picks a cpu by hand, 0 turns that one off.
+// must run before the kernel procs are spawned and before the boot animation can
+// claim an ap. (satoru)
+void Scheduler::PlanServiceCpus() {
+    g_svc_ui = g_svc_io = g_svc_vm = 0;
+    for (uint32_t c = 0; c < SMP_MAX_CPUS; c++) g_svc_cpu[c] = 0;
+    uint32_t n = SMP::OnlineCount();
+    // the detached launch is what keeps a program off the cpu its launcher runs
+    // on (kurono.schedlaunch=0 runs it in place, which would put it on the
+    // desktop cpu), so service cpus need it. (satoru)
+    if (!g_sched_v2 || !g_svc_enabled || !DetachedLaunch()) {
+        if (g_sched_v2) SerialLogger::Log("[svc] service cpus off (kurono.svccpu=0 or schedlaunch=0): kernel procs on cpu 0\r\n");
+        return;
+    }
+    uint32_t ui = 0, io = 0, vm = 0;
+    if (n >= 4) ui = 1;
+    if (n >= 12) { io = 2; vm = 3; }
+    auto pick = [&](int req, uint32_t def) -> uint32_t {
+        if (req < 0) return def;
+        if (req == 0) return 0;
+        PerCpu* pc = SMP::ByIndex((uint32_t)req);
+        return (pc && pc->online && (uint32_t)req < n) ? (uint32_t)req : def;
+    };
+    ui = pick(g_svc_ui_req, ui); io = pick(g_svc_io_req, io); vm = pick(g_svc_vm_req, vm);
+    // at least one cpu must stay free for programs. (satoru)
+    uint32_t used = 0;
+    for (uint32_t c = 1; c < n && c < SMP_MAX_CPUS; c++) if (c == ui || c == io || c == vm) used++;
+    if (n < 2 || used + 1 >= n) { ui = io = vm = 0; }
+    g_svc_ui = ui; g_svc_io = io; g_svc_vm = vm;
+    for (int k = 0; k < 8; k++) g_svc_vcpu[k] = 0;
+    {   // extra cpus for parallel vcpus: the next free cpus, always leaving two program cpus (satoru)
+        uint32_t c = 1;
+        for (int k = 1; k <= g_vcpu_cpus_req && k < 8; k++) {
+            while (c < n && (c == ui || c == io || c == vm)) c++;
+            uint32_t taken = 0; for (uint32_t x = 1; x < n; x++) if (x == ui || x == io || x == vm) taken++;
+            for (int j = 1; j < k; j++) taken++;
+            if (c >= n || n - 1 - taken < 3) break;
+            g_svc_vcpu[k] = c; c++;
+        }
+    }
+    for (int k = 1; k < 8; k++) if (g_svc_vcpu[k]) g_svc_cpu[g_svc_vcpu[k]] = 1;
+    if (ui) g_svc_cpu[ui] = 1;
+    if (io) g_svc_cpu[io] = 1;
+    if (vm) g_svc_cpu[vm] = 1;
+    SerialLogger::Log("[svc] plan: cpus="); SerialLogger::LogDec((int)n);
+    SerialLogger::Log(" ui=cpu"); SerialLogger::LogDec((int)ui);
+    SerialLogger::Log(" io=cpu"); SerialLogger::LogDec((int)io);
+    SerialLogger::Log(" vm=cpu"); SerialLogger::LogDec((int)vm);
+    uint32_t progs = 0;
+    for (uint32_t c = 1; c < n; c++) if (!svc_cpu(c)) progs++;
+    SerialLogger::Log(" program cpus="); SerialLogger::LogDec((int)progs);
+    SerialLogger::Log("\r\n");
+}
+
+// the lapic tick of a service cpu (1 khz there): wake this cpu's sleepers and
+// keep the slice / tier bookkeeping OnTimerTick keeps for cpu 0. irq context.
+// (satoru)
+void Scheduler::ServiceCpuTick() {
+    uint32_t cpu = SMP::CpuIndex();
+    if (!svc_cpu(cpu) || !g_preemptive_active) return;
+    wake_due_processes();
+    Process* p = GetCurrentProcess();
+    if (!p || !p->is_kernel_proc || p->state != Process_Running) return;
+    p->cpu_ms_total += 1;
+    if (p->timeslice_ms_left <= 1) { p->timeslice_ms_left = 0; g_need_resched_ap[cpu] = true; }
+    else p->timeslice_ms_left -= 1;
+    for (int i = 0; i < g_kernel_proc_count; i++) {
+        Process* cand = g_kernel_procs[i];
+        if (!cand || cand == p || cand->reaped || g_kp_home[i] != cpu) continue;
+        if (cand->state == Process_Ready && cand->prio_tier < p->prio_tier) {
+            g_need_resched_ap[cpu] = true;
+            break;
+        }
+    }
+}
+
+// a service ap leaves its dispatch loop for good: it waits (hlt) until the
+// cooperative kernel scheduler is live, then switches into the first of its procs
+// and from then on runs only kernel procs, like cpu 0 since Start(). (satoru)
+[[noreturn]] void Scheduler::ServiceCpuLoop() {
+    uint32_t cpu = SMP::CpuIndex();
+    SMP::SetLapicTickHz(1000);   // SleepMs granularity: 1 ms, as on cpu 0 (satoru)
+    SetCurrentForThisCpu(nullptr);
+    bool said = false;
+    for (;;) {
+        __asm__ __volatile__("cli" ::: "memory");
+        if (g_preemptive_active) {
+            if (!said) {
+                said = true;
+                SerialLogger::Log("[svc] cpu"); SerialLogger::LogDec((int)cpu);
+                SerialLogger::Log(" runs its kernel procs\r\n");
+            }
+            wake_due_processes();
+            Process* first = pick_next_kernel(nullptr);
+            if (first) perform_switch(nullptr, first);   // does not return (satoru)
+        }
+        __asm__ __volatile__("sti; hlt" ::: "memory");
+    }
+}
+
+// one [svc] line: per service cpu its procs, plus the desktop-domain census. (satoru)
+void Scheduler::ServiceCensus(char* out, int max) {
+    if (!out || max <= 0) return;
+    int p = 0;
+    auto put = [&](const char* t) { while (*t && p < max - 1) out[p++] = *t++; };
+    auto num = [&](uint64_t v) { char b[24]; int k = 0; do { b[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 23); while (k) { if (p < max - 1) out[p++] = b[--k]; else k--; } };
+    // per cpu that hosts kernel procs: how many live there, then the cpu-0
+    // services by name (the rest of a service cpu's list is the desktop's). (satoru)
+    for (uint32_t c = 0; c < SMP_MAX_CPUS; c++) {
+        if (c != 0 && !svc_cpu(c)) continue;
+        int k = 0;
+        for (int i = 0; i < g_kernel_proc_count; i++) if (g_kp_home[i] == c && g_kernel_procs[i]) k++;
+        if (p) put(" ");
+        put("cpu"); num(c); put("="); num((uint64_t)k);
+        if (c == g_svc_ui && c) put("(desktop)");
+        if (c == g_svc_io && c) put("(io)");
+        if (c == g_svc_vm && c) put("(vm)");
+    }
+    put(" cpu0:");
+    for (int i = 0; i < g_kernel_proc_count; i++) {
+        if (g_kp_home[i] || !g_kernel_procs[i]) continue;
+        put(" "); put(g_kernel_procs[i]->name);
+    }
+    // the busiest kernel procs since the last census, from the per-pid busy
+    // table of the timer samplers (hal.cpp: hlt and sleeping time excluded). (satoru)
+    static uint64_t s_last_ms[KP_MAX];
+    int top[4] = { -1, -1, -1, -1 }; uint64_t topv[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < g_kernel_proc_count; i++) {
+        Process* q = g_kernel_procs[i];
+        if (!q) continue;
+        uint64_t b = hal_pid_busy_ms(q->pid);
+        uint64_t d = b >= s_last_ms[i] ? b - s_last_ms[i] : 0;
+        s_last_ms[i] = b;
+        for (int k = 0; k < 4; k++) {
+            if (d > topv[k]) {
+                for (int m = 3; m > k; m--) { top[m] = top[m - 1]; topv[m] = topv[m - 1]; }
+                top[k] = i; topv[k] = d;
+                break;
+            }
+        }
+    }
+    put(" busiest:");
+    for (int k = 0; k < 4; k++) {
+        if (top[k] < 0) break;
+        put(" "); put(g_kernel_procs[top[k]]->name); put("@"); num(g_kp_home[top[k]]);
+        put("="); num(topv[k]); put("ms");
+    }
+    for (uint32_t c = 1; c < SMP_MAX_CPUS; c++) {
+        if (!svc_cpu(c)) continue;
+        PerCpu* pc = SMP::ByIndex(c);
+        Process* cur = pc ? cpu_current(pc) : nullptr;
+        put(" cur"); num(c); put("="); put(cur ? cur->name : "-");
+    }
+    out[p] = 0;
+}
+
 // heartbeat census (guarded mode): the deepest point each kernel proc's stack
 // ever reached, from the paint. one [kstack] line listing procs above half of
 // their stack, at most every 30 s, only when a high-water mark moved. (satoru)
 void Scheduler::SetKstackGuard(bool on) { g_kstack_guard = on; }
+
+void Scheduler::SetKprocLatProbe(bool on) { g_kplat = on; }
+
+void Scheduler::SetPickTrace(bool on) { g_picktrace = on; }
+
+// one [kplat] line per kernel proc that woke or ran in the window: wakes, mean / max
+// wake-to-run ms, waits over 16 ms, longest run without switching away. heartbeat
+// context, no lock held; the counters are read and reset with IF off so a switch
+// from this cpu cannot interleave (all kernel procs run on the bsp). (satoru)
+void Scheduler::KprocLatReport() {
+    if (!g_kplat) return;
+    static uint64_t s_next = 10000;
+    uint64_t now = now_ms();
+    if (now < s_next) return;
+    // two reporters (the heartbeat, the bsp syscall exit): one claims the window. (satoru)
+    static volatile uint32_t s_rep = 0;
+    if (__atomic_exchange_n(&s_rep, 1u, __ATOMIC_ACQUIRE)) return;
+    if (now < s_next) { __atomic_store_n(&s_rep, 0u, __ATOMIC_RELEASE); return; }
+    s_next = now + 10000;
+    // pend = a wake not served yet (Ready, never switched in since): a proc that
+    // starves completely leaves no wait sample, only this. (satoru)
+    struct Row { char name[20]; uint32_t wakes, mean, wmax, w16, rmax, pend; };
+    static Row rows[KP_MAX];
+    int n = 0;
+    {
+        IrqGuard g;
+        for (int i = 0; i < g_kernel_proc_count && i < KP_MAX; i++) {
+            Process* k = g_kernel_procs[i];
+            if (!k) continue;
+            uint32_t pend = 0;
+            if (k->state == Process_Ready && k->last_wake_ms && k->last_wake_ms != g_kplat_seen_wake[i] &&
+                now > k->last_wake_ms) pend = (uint32_t)(now - k->last_wake_ms);
+            if (!g_kplat_wakes[i] && !g_kplat_run_max[i] && !pend) continue;
+            Row& r = rows[n++];
+            r.pend = pend;
+            int j = 0; while (k->name[j] && j < 19) { r.name[j] = k->name[j]; j++; } r.name[j] = 0;
+            r.wakes = g_kplat_wakes[i];
+            r.mean = g_kplat_wakes[i] ? (uint32_t)(g_kplat_wait_sum[i] / g_kplat_wakes[i]) : 0;
+            r.wmax = g_kplat_wait_max[i]; r.w16 = g_kplat_wait_16[i]; r.rmax = g_kplat_run_max[i];
+            g_kplat_wakes[i] = 0; g_kplat_wait_sum[i] = 0; g_kplat_wait_max[i] = 0;
+            g_kplat_wait_16[i] = 0; g_kplat_run_max[i] = 0;
+        }
+    }
+    SerialLogger::Log("[kplat] cond_resched yields="); SerialLogger::LogDec((int)g_cond_resched_count);
+    SerialLogger::Log("\r\n");
+    for (int i = 0; i < n; i++) {
+        SerialLogger::Log("[kplat] "); SerialLogger::Log(rows[i].name);
+        SerialLogger::Log(" wakes="); SerialLogger::LogDec((int)rows[i].wakes);
+        SerialLogger::Log(" wait_mean="); SerialLogger::LogDec((int)rows[i].mean);
+        SerialLogger::Log(" wait_max="); SerialLogger::LogDec((int)rows[i].wmax);
+        SerialLogger::Log(" over16="); SerialLogger::LogDec((int)rows[i].w16);
+        SerialLogger::Log(" run_max="); SerialLogger::LogDec((int)rows[i].rmax);
+        SerialLogger::Log(" pend="); SerialLogger::LogDec((int)rows[i].pend);
+        SerialLogger::Log("\r\n");
+    }
+    __atomic_store_n(&s_rep, 0u, __ATOMIC_RELEASE);
+}
 
 void Scheduler::KstackCensus() {
     if (!g_kstack_guard) return;

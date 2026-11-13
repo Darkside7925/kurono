@@ -51,6 +51,10 @@ public:
     // one-line "[memrep] <tag> ..." serial summary of pmm + heap use, for
     // tracking boot-time memory cost at fixed milestones. (satoru)
     static void LogMemReport(const char* tag);
+    // background heap reserve (the logging kernel process, every 500 ms, no kls):
+    // keep one big free block so a syscall rarely has to grow the heap itself. (satoru)
+    static void RefillReserve();
+    static void SetReserve(bool on);   // kurono.heapreserve=0 (satoru)
 
 private:
     static void Coalesce(HeapBlock* block);

@@ -3,7 +3,10 @@
 //  network list, per-display brightness, sound output picker, now playing,
 //  battery/power mode and the session buttons. every control is wired to the
 //  real subsystem and reads its live state each frame. (satoru)
+#include "../system/backlight.h"   // panel backlight (satoru)
+#include "../system/audio_devices.h"   // per-device volume (satoru)
 #include "control_center.h"
+#include "night_light.h"   // warm tint state, strength, schedule (satoru)
 #include "../drivers/graphics.h"
 #include "../drivers/audio.h"
 #include "../drivers/audio_mixer.h"
@@ -23,6 +26,7 @@
 #include "../system/ui_config.h"
 #include "../system/screenshot.h"
 #include "../security/admin.h"
+#include "../system/power.h"
 #include "../fs/kvfs.h"
 #include "../fs/persist.h"
 #include "../apps/media_player.h"
@@ -95,6 +99,7 @@ struct Layout {
     Rect popup_toggle, popup_scan, popup_pass, popup_connect, popup_cancel;
     Rect popup_rows[6];
     int  popup_row_count;
+    Rect popup_restart, popup_stop;
     Rect confirm_no, confirm_yes;
 };
 
@@ -109,7 +114,7 @@ enum FocusId {
     F_SETTINGS = 80, F_LOCK, F_SLEEP, F_RESTART, F_SHUTDOWN,
     F_POP_TOGGLE = 100, F_POP_SCAN, F_POP_ROW = 110, F_POP_PASS = 120,
     F_POP_CONNECT, F_POP_CANCEL,
-    F_AUDIO_ROW = 140,
+    F_AUDIO_ROW = 140, F_AUDIO_RESTART = 150, F_AUDIO_STOP,
     F_CONFIRM_NO = 160, F_CONFIRM_YES,
 };
 
@@ -720,7 +725,7 @@ static void set_brightness(int slot, int pct) {
     Graphics::SetOutputBrightness(slot, pct);
     if (slot == 0) {
         DisplayManager::SetBrightness((uint8_t)((pct * 255) / 100));
-        if (IntelGPU::IsDetected()) IntelGPU::SetBacklightPercent(pct);
+        Backlight::Set(pct);   // legacy pair, or the bxt layout with kurono.backlight=1 (satoru)
     }
 }
 static void persist_volume() {
@@ -798,28 +803,21 @@ static void request_power_confirm(int action) {
     Graphics::RequestFrameAt(NowMs() + 1);
 }
 
+// the panel already asked the user to confirm, so this is the user's own
+// request. hand it to the one power worker instead of saving/rebooting on the
+// compositor thread: a full snapshot used to freeze the desktop here, which
+// looked like a hang and invited a hard power-off. (satoru)
 static void execute_power_action(int action) {
     if (action == PA_NONE) return;
-    const char* what = action == PA_SLEEP ? "sleep the system"
-                     : action == PA_RESTART ? "restart the system" : "shut down the system";
-    if (!AdminGate::Authorize("system power", what)) {
-        NotificationManager::Post("Permission needed", "Power action was not approved",
-                                  NotificationManager::ICON_WARNING, 3200);
-        return;
-    }
     ControlCenter::Close();
-    PersistStore::SaveTree();
-    if (action == PA_SLEEP) {
-        if (!HAL::Suspend()) {
-            NotificationManager::Post("Sleep", "ACPI S3 is not available on this platform",
-                                      NotificationManager::ICON_WARNING, 3200);
-            Graphics::MarkUIDirty();
-        }
-    } else if (action == PA_RESTART) {
-        HAL::Reboot();
-    } else {
-        HAL::PowerOff();
+    PowerManager::Action a = action == PA_SLEEP ? PowerManager::ACTION_SLEEP
+                           : action == PA_RESTART ? PowerManager::ACTION_RESTART
+                                                  : PowerManager::ACTION_SHUTDOWN;
+    if (!PowerManager::Request(a, "control center")) {
+        NotificationManager::Post("Power", "Another power action is already running",
+                                  NotificationManager::ICON_WARNING, 3200);
     }
+    Graphics::MarkUIDirty();
 }
 
 static void record_stop();
@@ -892,23 +890,30 @@ static void toggle_dark() {
     Graphics::RequestFrameAt(NowMs() + 1);
 }
 static void toggle_night() {
-    g_night_light = !g_night_light;
-    Graphics::SetNightLight(g_night_light ? 70 : 0);
-    UIConfig::SetInt("display.night_light", g_night_light ? 1 : 0, true);
-    UIConfig::Save();
+    NightLight::Toggle();   // strength + schedule live in ui/night_light (satoru)
+    g_night_light = NightLight::IsOn();
     Graphics::MarkUIDirty();
 }
 static void toggle_focus_mode() {
     g_focus_mode = !g_focus_mode;
-    NotificationManager::SetDoNotDisturb(g_focus_mode);
     if (g_focus_mode) {
-        NotificationManager::Post("Focus", "Notifications are muted",
+        // post before the gate closes, or the toast itself would be held. (satoru)
+        NotificationManager::Post("Do Not Disturb", "Notifications are held",
                                   NotificationManager::ICON_INFO, 2200);
         NotificationManager::SetDoNotDisturb(true);
     } else {
+        int held = NotificationManager::HeldCount();
         NotificationManager::SetDoNotDisturb(false);
-        NotificationManager::Post("Focus", "Notifications are back",
-                                  NotificationManager::ICON_SUCCESS, 2200);
+        char body[64];
+        if (held > 0) {
+            char n[16]; intstr(held, n, sizeof(n));
+            scpy(body, n, sizeof(body));
+            sapp(body, held == 1 ? " notification was held" : " notifications were held", sizeof(body));
+        } else {
+            scpy(body, "Notifications are back", sizeof(body));
+        }
+        NotificationManager::Post("Do Not Disturb off", body,
+                                  NotificationManager::ICON_SUCCESS, 3000);
     }
     UIConfig::SetInt("ui.dnd", g_focus_mode ? 1 : 0, true);
     UIConfig::Save();
@@ -931,9 +936,21 @@ static void toggle_airplane() {
     UIConfig::Save();
 }
 
+// a network the store already knows joins with its saved passphrase. (satoru)
+static bool wifi_is_saved(const char* ssid) {
+    int n = WiFi::SavedCount();
+    char nm[40];
+    for (int i = 0; i < n; i++) {
+        if (!WiFi::SavedAt(i, nm, (int)sizeof(nm), nullptr, nullptr)) continue;
+        int k = 0; while (nm[k] && ssid[k] && nm[k] == ssid[k]) k++;
+        if (!nm[k] && !ssid[k]) return true;
+    }
+    return false;
+}
+
 static void wifi_begin_connect(const WiFiNetwork& net) {
     scpy(g_wifi_ssid, net.ssid, sizeof(g_wifi_ssid));
-    g_wifi_secure_wait = (net.security != WIFI_OPEN);
+    g_wifi_secure_wait = (net.security != WIFI_OPEN) && !wifi_is_saved(net.ssid);
     g_wifi_pass[0] = 0;
     g_wifi_pass_len = 0;
     if (!g_wifi_secure_wait) {
@@ -958,6 +975,9 @@ static void wifi_submit_password() {
         NotificationManager::Post("Wi-Fi", g_wifi_ssid, NotificationManager::ICON_SUCCESS, 2400);
         g_popup = POP_NONE;
     }
+    // the typed passphrase is not kept here (the store has its own copy). (satoru)
+    for (int i = 0; i < (int)sizeof(g_wifi_pass); i++) ((volatile char*)g_wifi_pass)[i] = 0;
+    g_wifi_pass_len = 0;
     g_wifi_pass_focus = false;
     g_layout_valid = false;
     Graphics::MarkUIDirty();
@@ -1163,7 +1183,7 @@ static void build_layout() {
         int n = AudioServer::BackendCount();
         if (n > 6) n = 6;
         int popw = 300;
-        int poph = 40 + n * 32 + 10;
+        int poph = 40 + n * 32 + 40;
         int popx = L.out_btn.x + L.out_btn.w - popw;
         int popy = L.out_btn.y + L.out_btn.h + 6;
         if (popx < panel_x + 8) popx = panel_x + 8;
@@ -1172,7 +1192,13 @@ static void build_layout() {
         L.popup_row_count = n;
         for (int i = 0; i < n; i++)
             L.popup_rows[i] = { popx + 8, popy + 36 + i * 32, popw - 16, 30 };
+        int by = popy + 36 + n * 32 + 4;
+        int bw = (popw - 24) / 2;
+        L.popup_restart = { popx + 8, by, bw, 28 };
+        L.popup_stop    = { popx + 16 + bw, by, bw, 28 };
         for (int i = 0; i < n; i++) AddFocus(F_AUDIO_ROW + i, L.popup_rows[i]);
+        AddFocus(F_AUDIO_RESTART, L.popup_restart);
+        AddFocus(F_AUDIO_STOP, L.popup_stop);
     } else if (g_popup == POP_CONFIRM) {
         int w = 360, h = 158;
         int px = panel_x + (panel_w - w) / 2;
@@ -1287,11 +1313,29 @@ static void activate(int id) {
     }
     if (id == F_POP_CONNECT) { wifi_submit_password(); return; }
     if (id == F_POP_CANCEL)  { g_popup = POP_NONE; g_wifi_pass_focus = false; g_layout_valid = false; Graphics::MarkUIDirty(); return; }
+    if (id == F_AUDIO_RESTART || id == F_AUDIO_STOP) {
+        if (id == F_AUDIO_RESTART) {
+            bool ok = AudioServer::RestartActive();
+            NotificationManager::Post("Sound", ok ? "Audio restarted" : "Audio restart failed",
+                                      ok ? NotificationManager::ICON_SUCCESS : NotificationManager::ICON_WARNING, 2200);
+        } else {
+            int n = AudioServer::StopAllStreams();
+            char msg[48]; char num[8];
+            intstr(n, num, sizeof(num));
+            scpy(msg, num, sizeof(msg));
+            sapp(msg, n == 1 ? " stream stopped" : " streams stopped", sizeof(msg));
+            NotificationManager::Post("Sound", msg, NotificationManager::ICON_SUCCESS, 2200);
+        }
+        g_popup = POP_NONE;
+        g_layout_valid = false;
+        Graphics::MarkUIDirty();
+        return;
+    }
     if (id >= F_AUDIO_ROW && id < F_AUDIO_ROW + 6) {
         int idx = id - F_AUDIO_ROW;
         AudioBackend* be = AudioServer::BackendAt(idx);
         if (be) {
-            if (!AudioServer::UseBackend(be->Name())) {
+            if (!AudioDevices::SelectOutput(be->Name())) {   // applies its remembered volume (satoru)
                 NotificationManager::Post("Sound", "That output is not available",
                                           NotificationManager::ICON_WARNING, 2400);
             } else {
@@ -1383,6 +1427,10 @@ static void adjust_focus(int id, int dir) {
 }
 
 }  // namespace
+
+void ControlCenter::ExecutePowerActionForTest(int action) {
+    execute_power_action(action);
+}
 
 bool ControlCenter::CapturesKeyboard() {
     return open;
@@ -1626,6 +1674,16 @@ static void draw_audio_popup(const Theme& t, int a) {
         txt(r.x + 34, r.y + 6, 13.0f, nm, sel ? t.accent : t.text, sel);
         if (sel) DrawIcon(IC_CHECK, r.x + r.w - 28, r.y + 6, 18, t.accent, t.card_hi, 255);
     }
+    // recovery actions: reopen the live output, or end every stream. both are
+    // the same calls the shell `audio` command and /dev/kaudio use. (satoru)
+    {
+        Rect rr = L.popup_restart, rs = L.popup_stop;
+        bool hr = rr.hit(Mouse::mx, Mouse::my), hs = rs.hit(Mouse::mx, Mouse::my);
+        MDraw::RoundRect(rr.x, rr.y, rr.w, rr.h, 8, hr ? t.card_hi : t.field, 240);
+        MDraw::RoundRect(rs.x, rs.y, rs.w, rs.h, 8, hs ? t.card_hi : t.field, 240);
+        txt_center(rr.x + rr.w / 2, rr.y + 7, 12.5f, "Restart audio", t.text, true);
+        txt_center(rs.x + rs.w / 2, rs.y + 7, 12.5f, "Stop all", t.text, true);
+    }
 }
 
 static void draw_confirm(const Theme& t, int a) {
@@ -1715,15 +1773,29 @@ static void draw_left_column(const Theme& t, int a) {
     bool states[6];
     states[0] = g_focus_mode;
     states[1] = t.dark;
+    g_night_light = NightLight::IsOn();   // the schedule may have flipped it (satoru)
     states[2] = g_night_light;
     states[3] = false;
     states[4] = g_recording;
     states[5] = PerfHUD::IsVisible();
     static const char* labels[6] = { "Focus", "Dark Mode", "Night Light", "Screenshot", "Record", "Performance" };
     char subs[6][48];
-    scpy(subs[0], states[0] ? "Do not disturb" : "Notifications on", 48);
+    if (states[0] && NotificationManager::HeldCount() > 0) {
+        char n[16]; intstr(NotificationManager::HeldCount(), n, sizeof(n));
+        scpy(subs[0], "On, ", 48); sapp(subs[0], n, 48); sapp(subs[0], " held", 48);
+    } else {
+        scpy(subs[0], states[0] ? "Do not disturb" : "Notifications on", 48);
+    }
     scpy(subs[1], states[1] ? "Dark appearance" : "Light appearance", 48);
-    scpy(subs[2], states[2] ? "Warm tint" : "Standard color", 48);
+    if (NightLight::ScheduleOn()) {
+        int mm = states[2] ? NightLight::ToMinutes() : NightLight::FromMinutes();
+        char hm[8] = "00:00";
+        hm[0] = (char)('0' + (mm / 60) / 10); hm[1] = (char)('0' + (mm / 60) % 10);
+        hm[3] = (char)('0' + (mm % 60) / 10); hm[4] = (char)('0' + (mm % 60) % 10);
+        scpy(subs[2], states[2] ? "On until " : "From ", 48);
+        sapp(subs[2], hm, 48);
+    } else
+        scpy(subs[2], states[2] ? "Warm tint" : "Standard color", 48);
     scpy(subs[3], "Save a frame", 48);
     if (g_recording) {
         char n[16]; intstr(g_rec_frames, n, sizeof(n));
@@ -1900,8 +1972,8 @@ void ControlCenter::Init(int sw, int sh) {
             }
             Graphics::SetOutputBrightness(i, clampi(v, 10, 100));
         }
-        g_night_light = UIConfig::Int("display.night_light", 0) != 0;
-        Graphics::SetNightLight(g_night_light ? 70 : 0);
+        NightLight::Init();
+        g_night_light = NightLight::IsOn();
         g_focus_mode = UIConfig::Int("ui.dnd", 0) != 0;
         NotificationManager::SetDoNotDisturb(g_focus_mode);
         g_airplane = UIConfig::Int("network.airplane", 0) != 0;
@@ -2030,6 +2102,13 @@ void ControlCenter::Render() {
     Theme t = ThemeNow();
     Layout& L = g_L;
 
+    // the panel draws through the direct-buffer helpers, which mark nothing:
+    // under the damage scissor no frame ever covered it, so it opened as the
+    // first animation step only and never repainted. mark its box (shadow
+    // included) every time it is drawn; closing is repainted by the overlay
+    // carry. (satoru)
+    if (Graphics::ScissorEnabled()) Graphics::MarkDirty(L.panel.x - 48, L.panel.y - 32, L.panel.w + 96, L.panel.h + 96);
+
     WMMotion::SoftShadow((float)L.panel.x, (float)L.panel.y + 8.0f,
                          (float)L.panel.w, (float)L.panel.h, 18.0f, 22.0f, 10.0f,
                          (t.dark ? 150 : 90) * tq / 255, false);
@@ -2126,6 +2205,8 @@ bool ControlCenter::HandleClick(int mx, int my) {
         for (int i = 0; i < L.popup_row_count; i++) {
             if (L.popup_rows[i].hit(mx, my)) { activate(F_AUDIO_ROW + i); return true; }
         }
+        if (L.popup_restart.hit(mx, my)) { activate(F_AUDIO_RESTART); return true; }
+        if (L.popup_stop.hit(mx, my))    { activate(F_AUDIO_STOP); return true; }
         return true;
     }
 

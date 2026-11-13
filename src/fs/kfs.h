@@ -156,6 +156,8 @@ public:
     //  unmounted. writers must Sync() first; a later Mount() re-reads from
     //  disk. (satoru)
     static void Unmount();
+    // bytes the mounted metadata caches hold right now (boot census). (satoru)
+    static uint64_t MetadataBytes();
     //  flush all dirty metadata to disk (call after a batch of writes). (satoru)
     static bool Sync();
 
@@ -163,6 +165,12 @@ public:
     static bool Mkdirs(const char* path);                       // create dir + parents (satoru)
     static bool WriteFile(const char* path, const void* data, uint64_t len);
     static int64_t ReadFile(const char* path, void* buf, uint64_t max);   // bytes read, -1 on error
+    // read [off, off+len) without touching the rest of the file: backs lazy kvfs
+    // nodes page by page. returns bytes read (0 at/after EOF), -1 on error. (satoru)
+    static int64_t ReadFileAt(const char* path, uint64_t off, void* buf, uint64_t len);
+    static void SetRunReads(bool on);   // kurono.kfsrun=0: ReadFileAt back to one block per command (satoru)
+    static void SetRunVerify(bool on);  // test only: compare every run read against block reads (satoru)
+    static void RunVerifyStats(uint32_t* checked, uint32_t* bad);
     static bool Symlink(const char* path, const char* target);  // create a symlink node (satoru)
     static int  ReadLink(const char* path, char* buf, int max); // target len, -1 if not a symlink (satoru)
     static bool Exists(const char* path);

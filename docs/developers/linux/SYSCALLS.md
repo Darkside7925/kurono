@@ -66,7 +66,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 424 | pidfd_send_signal       | real   | resolves the pidfd's pid and posts the signal bit |
 | 438 | pidfd_getfd             | real   | dup of the target fd in this single-table build |
 | 437 | openat2                 | real   | pulls flags+mode out of `struct open_how`, routes to open |
-| 326 | copy_file_range         | real   | bounded read/write copy loop, advances both offsets |
+| 326 | copy_file_range         | real   | answers EINVAL so callers fall back to read/write (`kurono.zcopy=old` restores the copy loop, which advanced both offsets) |
 | 300 | fanotify_init           | stub   | real `LFD_FANOTIFY` fd; no event backend |
 | 301 | fanotify_mark           | stub   | accepted, marks recorded as no-ops |
 | 253 | inotify_init            | real   | routed to inotify_init1(flags=0) |
@@ -80,7 +80,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 275 | splice                  | stub   | returns 0 (no pipe page-move); callers fall back to read/write |
 | 276 | tee                     | stub   | returns 0 |
 | 278 | vmsplice                | stub   | returns 0 (consumed 0); callers fall back to write |
-| 40  | sendfile                | real   | bounded read/write loop with optional in-offset seek |
+| 40  | sendfile                | real   | answers EINVAL so callers fall back to read/write (`kurono.zcopy=old` restores the bounded copy loop with in-offset seek) |
 | 310 | process_vm_readv        | real   | iovec-to-iovec memcpy (single address space) |
 | 311 | process_vm_writev       | real   | iovec-to-iovec memcpy |
 
@@ -100,7 +100,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 334 | rseq              | stub   | no-op success |
 | 436 | close_range       | real   | closes every open fd in [first,last] |
 | 292 | dup3              | real   | dup2 + the oldfd==newfd → EINVAL rule |
-| 293 | pipe2             | real   | unix-socketpair-backed pipe |
+| 293 | pipe2             | real   | unix-socketpair-backed pipe; a full pipe blocks, a write with no reader raises SIGPIPE (`kurono.pipeblock=0`) |
 | 284 | eventfd           | real   | real `LFD_EVENTFD` with a counter |
 | 290 | eventfd2          | real   | real `LFD_EVENTFD` |
 | 282 | signalfd          | stub   | real fd, never fires (no async signal delivery) |
@@ -219,7 +219,7 @@ mask read-back, and the `ENOSYS` logger firing exactly once per number.
 | 129 | rt_sigqueueinfo   | real   | posts the signal bit to the target process |
 | 297 | rt_tgsigqueueinfo | real   | posts the signal bit to the target thread |
 | 131 | sigaltstack       | stub   | accepted (stub-ok) |
-| 62  | kill              | real   | posts the signal bit (pid<=0 → self) |
+| 62  | kill              | real   | posts the signal bit (pid<=0 → self). A program killed by a signal reports death by that signal (`kurono.exitsig`) |
 | 200 | tkill             | real   | posts the signal bit to the tid |
 | 234 | tgkill            | real   | maps to kill(tid, sig) |
 | 34  | pause             | stub   | yields once, returns `-EINTR` (no async delivery) |

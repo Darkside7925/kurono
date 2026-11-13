@@ -35,6 +35,10 @@ public:
     // per-frame housekeeping: spring, recording capture, live refresh. (satoru)
     static void Tick();
 
+    // test hook: run the exact same power action the confirm button runs.
+    // action is the internal PA_* value (1 sleep, 2 restart, 3 shutdown). (satoru)
+    static void ExecutePowerActionForTest(int action);
+
     // pixel rect of the panel (for hit-testing externally if needed)
     static int GetX();
     static int GetY();

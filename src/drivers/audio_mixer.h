@@ -65,6 +65,9 @@ StreamID Open(const char* name,
 // Close the stream.  Any unplayed samples in the ring are discarded
 // after a 5 ms fade-out.  Safe to call on INVALID_STREAM.
 void Close(StreamID id);
+// hard stop: free every slot immediately (no fade, no drain). used by
+// `audio stop` to end a stuck playback and by restart paths. (satoru)
+int  StopAll();
 
 // free every stream opened by scheduler task `pid` at once (no fade). used
 // when the owner is gone (a task manager kill). returns the number of slots

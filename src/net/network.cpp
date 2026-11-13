@@ -18,6 +18,8 @@
 #include "../proc/scheduler.h"    // cooperative yield between dns recv attempts (satoru)
 #include "../proc/spinlock.h"       // wifi state is driven from two processes (satoru)
 #include "tcpip.h"
+#include "wifi_store.h"             // saved networks, encrypted at rest (satoru)
+#include "../fs/kvfs.h"             // the KLD container's /run/kld files (satoru)
 
 //  network stack implementation
 
@@ -890,7 +892,101 @@ static Spinlock g_wifi_lock;
 // what every IEEE 802.11 NIC reports.  Some Intel cards also use 0x02:0x80
 // with prog_if 0x00.  We additionally check known wireless vendor/device
 // IDs to be safe.
+static bool g_kld_owned = false;
+
+// ---- KLD bridge: the linux driver container owns the radio. the picker talks
+// to it through the /run/kld files documented in wifi_store.cpp. (satoru)
+static char     g_kld_target[NET_MAX_SSID];
+static uint32_t g_kld_connect_ms = 0;
+static uint32_t g_kld_scan_ms = 0;
+static uint32_t g_kld_poll_ms = 0;
+static bool     g_kld_autojoin_tried = false;
+
+static void kld_write_ctl(const char* cmd) {
+    KVFS::Mkdirs("/system/run/kld");
+    int n = 0; while (cmd[n]) n++;
+    KVFS::WriteFile("/system/run/kld/wifi_ctl", cmd, (uint32_t)n);
+}
+
+static int kld_atoi(const char* s, int* used) {
+    int i = 0, sign = 1, v = 0;
+    if (s[i] == '-') { sign = -1; i++; }
+    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+    if (used) *used = i;
+    return v * sign;
+}
+
+// wifi_scan: "<ssid>\t<dbm>\t<sec>\t<chan>\t<bssid>\n" per line. (satoru)
+static int kld_read_scan(WiFiNetwork* out, int max, const char* connected_ssid) {
+    static char buf[4096];
+    int n = KVFS::ReadFile("/system/run/kld/wifi_scan", buf, sizeof(buf) - 1);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    int cnt = 0, i = 0;
+    while (buf[i] && cnt < max) {
+        WiFiNetwork& w = out[cnt];
+        for (int k = 0; k < (int)sizeof(w); k++) ((char*)&w)[k] = 0;
+        int sp = 0;
+        while (buf[i] && buf[i] != '\t' && buf[i] != '\n' && sp < NET_MAX_SSID - 1) w.ssid[sp++] = buf[i++];
+        w.ssid[sp] = 0;
+        while (buf[i] && buf[i] != '\t' && buf[i] != '\n') i++;
+        int used = 0;
+        if (buf[i] == '\t') { i++; w.signal_strength = kld_atoi(buf + i, &used); i += used; }
+        if (buf[i] == '\t') { i++; int sec = kld_atoi(buf + i, &used); i += used;
+                               w.security = (sec >= 0 && sec <= 4) ? (WiFiSecurity)sec : WIFI_WPA2; }
+        if (buf[i] == '\t') { i++; w.channel = kld_atoi(buf + i, &used); i += used; }
+        while (buf[i] && buf[i] != '\n') i++;
+        if (buf[i] == '\n') i++;
+        if (!w.ssid[0]) continue;
+        bool dup = false;
+        for (int d = 0; d < cnt; d++) {
+            if (neq(out[d].ssid, w.ssid)) {
+                if (w.signal_strength > out[d].signal_strength) out[d].signal_strength = w.signal_strength;
+                dup = true; break;
+            }
+        }
+        if (dup) continue;
+        w.connected = connected_ssid && connected_ssid[0] && neq(w.ssid, connected_ssid);
+        cnt++;
+    }
+    // strongest first, the way every picker lists them. (satoru)
+    for (int a = 1; a < cnt; a++)
+        for (int b = a; b > 0 && out[b].signal_strength > out[b - 1].signal_strength; b--) {
+            WiFiNetwork t = out[b]; out[b] = out[b - 1]; out[b - 1] = t;
+        }
+    return cnt;
+}
+
+bool WiFi::KldBridge() { return g_kld_owned; }
+
+int WiFi::SavedCount() { return WifiStore::Count(); }
+bool WiFi::SavedAt(int i, char* ssid, int cap, int* security, bool* autojoin) {
+    WifiStore::Info inf;
+    if (!WifiStore::Get(i, &inf)) return false;
+    ncpy(ssid, inf.ssid, cap);
+    if (security) *security = inf.security;
+    if (autojoin) *autojoin = (inf.flags & WifiStore::F_AUTOJOIN) != 0;
+    return true;
+}
+bool WiFi::Forget(const char* ssid) {
+    SpinLockCpuGuard wifi_guard(g_wifi_lock);
+    if (have_saved && neq(saved_ssid, ssid)) {
+        have_saved = false;
+        for (int i = 0; i < (int)sizeof(saved_pass); i++) ((volatile char*)saved_pass)[i] = 0;
+        saved_ssid[0] = 0;
+    }
+    return WifiStore::Forget(ssid);
+}
+bool WiFi::SetAutoJoin(const char* ssid, bool on) { return WifiStore::SetAutoJoin(ssid, on); }
+
 void WiFi::ProbePCIWireless() {
+    if (g_kld_owned) {
+        // the container drives the radio; the picker still shows wi-fi. (satoru)
+        link_probed = true;
+        detected_link = LINK_WIFI;
+        ncpy(wireless_chip, "Intel Wi-Fi (Linux driver)", (int)sizeof(wireless_chip));
+        return;
+    }
     if (link_probed) return;
     link_probed = true;
     detected_link = LINK_NONE;
@@ -977,6 +1073,8 @@ void WiFi::SimulateNetworks() {
     connected_index = -1;
 }
 
+void WiFi::SetKldOwned(bool on) { g_kld_owned = on; }
+
 void WiFi::Init() {
     state = WIFI_DISCONNECTED;
     network_count = 0;
@@ -986,6 +1084,13 @@ void WiFi::Init() {
     reconnect_at_ms = 0;
     reconnect_backoff_ms = 2000;
     reconnect_tries = 0;
+    WifiStore::Init();
+    if (g_kld_owned) {
+        link_probed = false;
+        ProbePCIWireless();
+        SerialLogger::Log("WiFi: radio deferred to the KLD iwlwifi container\r\n");
+        return;
+    }
     ProbePCIWireless();
 
     if (detected_link == LINK_WIFI) {
@@ -1000,6 +1105,14 @@ void WiFi::Init() {
         if (WifiIwl::TryRegister()  || WifiAth::TryRegister() ||
             WifiRtw::TryRegister()  || WifiBrcm::TryRegister()) {
             SerialLogger::Log("WiFi: radio driver registered; 802.11 stack ready\r\n");
+            // rejoin the most recent saved network once the radio is up. (satoru)
+            char best[NET_MAX_SSID];
+            if (WifiStore::BestAutoJoin(nullptr, 0, best) &&
+                WifiStore::Passphrase(best, saved_pass, (int)sizeof(saved_pass))) {
+                ncpy(saved_ssid, best, (int)sizeof(saved_ssid));
+                have_saved = true;
+                reconnect_at_ms = 0;
+            }
         } else {
             SerialLogger::Log("WiFi: no vendor radio claimed the chip "
                               "(driver needs its firmware blob / real hardware)\r\n");
@@ -1028,6 +1141,7 @@ bool WiFi::Disable() {
     // powering the radio off keeps the saved credentials: turning wifi back on
     // rejoins the same network. an explicit Disconnect() forgets them. (satoru)
     if (Ieee80211::HasRadio()) Ieee80211::Disconnect();
+    if (g_kld_owned) { kld_write_ctl("disconnect\n"); WifiStore::ClearHandoff(); g_kld_autojoin_tried = false; }
     NetworkInterface* wlan = Network::GetInterface("wlan0");
     if (wlan) wlan->state = NIC_DOWN;
     if (connected_index >= 0) {
@@ -1041,6 +1155,20 @@ bool WiFi::Disable() {
 bool WiFi::Scan() {
     SpinLockCpuGuard wifi_guard(g_wifi_lock);
     if (state == WIFI_OFF || DetectedLink() != LINK_WIFI) return false;
+    if (g_kld_owned) {
+        // ask the container; the list fills in from wifi_scan on the next ticks. (satoru)
+        kld_write_ctl("scan\n");
+        g_kld_scan_ms = Timer::GetRealMs();
+        const char* cur = (connected_index >= 0) ? networks[connected_index].ssid : nullptr;
+        char keep[NET_MAX_SSID]; ncpy(keep, cur ? cur : "", (int)sizeof(keep));
+        int n = kld_read_scan(networks, NET_MAX_WIFI_NETS, keep);
+        if (n >= 0) {
+            network_count = n;
+            connected_index = -1;
+            for (int i = 0; i < n; i++) if (networks[i].connected) connected_index = i;
+        }
+        return true;
+    }
     // a scan must not drop a live association: keep the connected ssid across
     // the list rebuild and re-find it afterwards. (satoru)
     bool was_connected = (state == WIFI_CONNECTED && connected_index >= 0 &&
@@ -1082,6 +1210,31 @@ bool WiFi::Connect(const char* ssid, const char* password) {
 
 bool WiFi::ConnectInternal(const char* ssid, const char* password, bool notify) {
     if (state == WIFI_OFF || DetectedLink() != LINK_WIFI) return false;
+    if (!ssid || !ssid[0]) return false;
+    WiFiSecurity sec = WIFI_WPA2;
+    for (int i = 0; i < network_count; i++) if (neq(networks[i].ssid, ssid)) { sec = networks[i].security; break; }
+
+    if (g_kld_owned) {
+        // a typed passphrase is saved first (encrypted); a known network uses
+        // its saved one. then the container gets the RAM-only handoff. (satoru)
+        if (password && password[0]) {
+            if (!WifiStore::Save(ssid, password, (uint8_t)sec)) return false;
+        } else if (!WifiStore::Has(ssid)) {
+            if (sec != WIFI_OPEN || !WifiStore::Save(ssid, "", (uint8_t)WIFI_OPEN)) return false;
+        }
+        if (!WifiStore::HandoffToKld(ssid)) return false;
+        kld_write_ctl("connect\n");
+        ncpy(g_kld_target, ssid, (int)sizeof(g_kld_target));
+        g_kld_connect_ms = Timer::GetRealMs();
+        state = WIFI_CONNECTING;
+        (void)notify;
+        return true;
+    }
+    // a known network without a typed passphrase: use the saved one. (satoru)
+    char stored[64];
+    stored[0] = 0;
+    if ((!password || !password[0]) && WifiStore::Passphrase(ssid, stored, (int)sizeof(stored)))
+        password = stored;
 
     // real path: drive the 802.11 stack (auth -> assoc -> wpa2 4-way handshake)
     // through the registered vendor radio. only succeeds with a registered radio
@@ -1091,6 +1244,7 @@ bool WiFi::ConnectInternal(const char* ssid, const char* password, bool notify) 
         uint8_t bssid[6] = {0};
         bool ok = Ieee80211::Connect(ssid, password ? password : "", bssid);
         if (!ok) {
+            for (int i = 0; i < (int)sizeof(stored); i++) ((volatile char*)stored)[i] = 0;
             state = WIFI_DISCONNECTED;
             if (notify) {
                 NotificationManager::Post("Network", "wifi connect failed",
@@ -1137,8 +1291,12 @@ bool WiFi::ConnectInternal(const char* ssid, const char* password, bool notify) 
         NotificationManager::Post("Network", ssid,
                                   NotificationManager::ICON_SUCCESS, 3000);
         SerialLogger::Log("WiFi: associated + 4-way handshake complete on wlan0\r\n");
+        // a network that worked is remembered (encrypted). (satoru)
+        WifiStore::Save(ssid, password ? password : "", (uint8_t)sec);
+        for (int i = 0; i < (int)sizeof(stored); i++) ((volatile char*)stored)[i] = 0;
         return true;
     }
+    for (int i = 0; i < (int)sizeof(stored); i++) ((volatile char*)stored)[i] = 0;
 
     // no registered radio -> cannot associate. honest failure. (satoru)
     SerialLogger::Log("WiFi: no 802.11 radio registered; cannot connect\r\n");
@@ -1147,6 +1305,14 @@ bool WiFi::ConnectInternal(const char* ssid, const char* password, bool notify) 
 
 bool WiFi::Disconnect() {
     SpinLockCpuGuard wifi_guard(g_wifi_lock);
+    if (g_kld_owned) {
+        kld_write_ctl("disconnect\n");
+        WifiStore::ClearHandoff();
+        if (connected_index >= 0) { networks[connected_index].connected = false; connected_index = -1; }
+        state = WIFI_DISCONNECTED;
+        g_kld_target[0] = 0;
+        return true;
+    }
     // tear the real link down (deauth + stop the radio) if one is up. (satoru)
     if (Ieee80211::HasRadio()) Ieee80211::Disconnect();
     NetworkInterface* wlan = Network::GetInterface("wlan0");
@@ -1203,8 +1369,90 @@ bool WiFi::AutoReconnect() { return auto_reconnect; }
 
 void WiFi::Tick() {
     SpinLockCpuGuard wifi_guard(g_wifi_lock);
+    WifiStore::Tick();
     if (DetectedLink() != LINK_WIFI) return;
     uint32_t now = Timer::GetTicks();
+
+    if (g_kld_owned) {
+        uint32_t ms = Timer::GetRealMs();
+        if (ms - g_kld_poll_ms < 500u) return;
+        g_kld_poll_ms = ms;
+        if (state == WIFI_OFF) return;
+        // fresh scan results (the container rewrites wifi_scan). (satoru)
+        char keep[NET_MAX_SSID];
+        ncpy(keep, connected_index >= 0 ? networks[connected_index].ssid : "", (int)sizeof(keep));
+        int n = kld_read_scan(networks, NET_MAX_WIFI_NETS, keep);
+        if (n >= 0) {
+            network_count = n;
+            connected_index = -1;
+            for (int i = 0; i < n; i++) if (networks[i].connected) connected_index = i;
+        }
+        // the container's verdict. (satoru)
+        char st[96];
+        int sn = KVFS::ReadFile("/system/run/kld/wifi_state", st, sizeof(st) - 1);
+        if (sn > 0) {
+            st[sn] = 0;
+            for (int i = 0; i < sn; i++) if (st[i] == '\n') { st[i] = 0; break; }
+            const char* tab = st; while (*tab && *tab != '\t') tab++;
+            char word[16]; int wl = 0;
+            for (const char* q = st; q < tab && wl < 15; q++) word[wl++] = *q;
+            word[wl] = 0;
+            if (neq(word, "connected")) {
+                char nm[NET_MAX_SSID]; int nl = 0;
+                const char* q = *tab ? tab + 1 : tab;
+                while (*q && *q != '\t' && nl < NET_MAX_SSID - 1) nm[nl++] = *q++;
+                nm[nl] = 0;
+                int dbm = (*q == '\t') ? kld_atoi(q + 1, nullptr) : -60;
+                if (state != WIFI_CONNECTED) {
+                    WifiStore::ClearHandoff();
+                    if (nm[0]) WifiStore::Touch(nm);
+                    NotificationManager::Post("Network", nm[0] ? nm : "Wi-Fi connected",
+                                              NotificationManager::ICON_SUCCESS, 3000);
+                }
+                state = WIFI_CONNECTED;
+                connected_index = -1;
+                for (int i = 0; i < network_count; i++) {
+                    networks[i].connected = neq(networks[i].ssid, nm);
+                    if (networks[i].connected) { connected_index = i; networks[i].signal_strength = dbm; }
+                }
+                if (connected_index < 0 && network_count < NET_MAX_WIFI_NETS && nm[0]) {
+                    connected_index = network_count++;
+                    WiFiNetwork& w = networks[connected_index];
+                    for (int k = 0; k < (int)sizeof(w); k++) ((char*)&w)[k] = 0;
+                    ncpy(w.ssid, nm, NET_MAX_SSID);
+                    w.signal_strength = dbm; w.security = WIFI_WPA2; w.connected = true;
+                }
+            } else if (neq(word, "failed") && state == WIFI_CONNECTING) {
+                WifiStore::ClearHandoff();
+                state = WIFI_DISCONNECTED;
+                NotificationManager::Post("Network", "Could not join the network",
+                                          NotificationManager::ICON_WARNING, 3000);
+            } else if (neq(word, "disconnected") && state == WIFI_CONNECTED) {
+                if (connected_index >= 0) networks[connected_index].connected = false;
+                connected_index = -1;
+                state = WIFI_DISCONNECTED;
+            }
+        }
+        if (state == WIFI_CONNECTING && ms - g_kld_connect_ms > 45000u) {
+            WifiStore::ClearHandoff();
+            state = WIFI_DISCONNECTED;
+        }
+        // auto-join a saved network once, when it shows up in a scan. (satoru)
+        if (state == WIFI_DISCONNECTED && auto_reconnect && !g_kld_autojoin_tried && network_count > 0) {
+            const char* vis[NET_MAX_WIFI_NETS];
+            for (int i = 0; i < network_count; i++) vis[i] = networks[i].ssid;
+            char best[NET_MAX_SSID];
+            if (WifiStore::BestAutoJoin(vis, network_count, best)) {
+                g_kld_autojoin_tried = true;
+                ConnectInternal(best, nullptr, false);
+            }
+        }
+        if (ms - g_kld_scan_ms > 30000u && state != WIFI_CONNECTING) {
+            kld_write_ctl("scan\n");
+            g_kld_scan_ms = ms;
+        }
+        return;
+    }
 
     if (state == WIFI_OFF) return;
     if (state == WIFI_CONNECTING || state == WIFI_SCANNING) return;

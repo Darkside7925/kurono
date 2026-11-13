@@ -26,6 +26,10 @@
 #include "../drivers/nvidia_gpu.h"
 #include "../drivers/amd_gpu.h"
 #include "../drivers/audio.h"
+#include "audio_devices.h"
+#include "kernel_slots.h"
+#include "battery.h"
+#include "recovery_restart.h"
 #include "../drivers/audio_server.h"
 #include "../drivers/audio_mixer.h"
 #include "../drivers/hda.h"
@@ -33,6 +37,7 @@
 #include "../drivers/usb.h"
 #include "../drivers/disklog.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/intel_modeset.h"
 #include "../hal/cpufreq.h"
 #include "../ui/desktop.h"
 #include "../ui/window_manager.h"
@@ -50,6 +55,7 @@
 #include "../virt/hypervisor.h"
 #include "../apps/alpine_term.h"
 #include "../proc/spinlock.h"
+#include "../ui/night_light.h"   // nightlight.* actions (satoru)
 
 namespace {
 
@@ -193,6 +199,11 @@ const KeyRule kRules[] = {
     { "a11y.bounce_keys",         V_BOOL,  0, 1, nullptr },
     { "a11y.screen_reader",       V_BOOL,  0, 1, nullptr },
     { "a11y.color_filter",        V_INT,   0, 4, nullptr },
+    { "kbd.layout",               V_ENUM,  0, 0, "us,gb,de,fr,es,it" },
+    { "locale.region",            V_ENUM,  0, 0, "us,gb,de,fr,es,it,jp,ca,au" },
+    { "clock.24h",                V_BOOL,  0, 1, nullptr },
+    { "locale.datefmt",           V_INT,   0, 2, nullptr },
+    { "locale.weekstart",         V_INT,   0, 1, nullptr },
     { "audio.master_volume",      V_INT,   0, 100, nullptr },
     { "audio.muted",              V_BOOL,  0, 1, nullptr },
     { "power.plan",               V_INT,   0, 2, nullptr },
@@ -291,10 +302,14 @@ void queue_action(const KssReq& r) {
 }
 
 bool action_wants_gate(const char* a) {
-    return s_eq(a, "user.add") || s_eq(a, "kls.start") || s_eq(a, "kls.stop") ||
+    return s_eq(a, "user.add") || s_eq(a, "user.setadmin") || s_eq(a, "boot.recovery") || s_eq(a, "kls.start") || s_eq(a, "kls.stop") ||
            s_eq(a, "pkg.sync") || s_prefix(a, "kmemx.") || s_prefix(a, "vm.") ||
-           s_prefix(a, "display.") || s_eq(a, "open.alpine");
+           s_prefix(a, "display.") || s_prefix(a, "intelmodeset.") || s_eq(a, "open.alpine");
 }
+
+// results of the last audio recovery action, exposed as info keys (satoru)
+static volatile int g_audio_restart_ok = 0;
+static volatile int g_audio_stopped = 0;
 
 void apply_action(const KssReq& r) {
     const char* a = r.action;
@@ -332,11 +347,18 @@ void apply_action(const KssReq& r) {
     } else if (s_eq(a, "audio.volume")) {
         AudioMixer::SetMasterVolume(r.ival);
         if (Audio::IsAvailable()) Audio::SetMasterVolume(r.ival);
+        if (r.uval) AudioDevices::RememberVolume(r.ival);   // uval=1: the drag ended (satoru)
+    } else if (s_eq(a, "audio.output")) {
+        AudioDevices::SelectOutput(r.key);
     } else if (s_eq(a, "audio.mute")) {
         AudioMixer::SetMasterMute(r.uval != 0);
         if (Audio::IsAvailable()) Audio::SetMuted(r.uval != 0);
     } else if (s_eq(a, "audio.tone")) {
         AudioServer::PlayTone(660, 140, 70);
+    } else if (s_eq(a, "audio.restart")) {
+        g_audio_restart_ok = AudioServer::RestartActive() ? 1 : 0;
+    } else if (s_eq(a, "audio.stop")) {
+        g_audio_stopped = AudioServer::StopAllStreams();
     } else if (s_eq(a, "cpufreq.plan")) {
         int n = CPUFreq::CPUCount();
         CPUFreq::Governor g = r.ival == 0 ? CPUFreq::GOV_PERFORMANCE
@@ -371,6 +393,12 @@ void apply_action(const KssReq& r) {
     } else if (s_eq(a, "display.brightness")) {
         DisplayManager::SetBrightness((uint8_t)((r.ival * 255) / 100));
         Graphics::SetBrightness(r.ival);
+    } else if (s_eq(a, "nightlight.on")) {
+        NightLight::Set(r.uval != 0);
+    } else if (s_eq(a, "nightlight.schedule")) {
+        NightLight::SetSchedule(r.uval != 0);
+    } else if (s_eq(a, "nightlight.strength")) {
+        NightLight::SetStrength(r.ival);
     } else if (s_eq(a, "display.vsync")) {
         DisplayManager::SetVSync(r.uval ? VSYNC_ON : VSYNC_OFF);
         FramePacer::ReloadConfig();
@@ -387,6 +415,14 @@ void apply_action(const KssReq& r) {
         Graphics::RequestOutputConfig(r.ival, on, ax, ay);
     } else if (s_eq(a, "framepacer.mode")) {
         FramePacer::SetMode(r.uval);
+    } else if (s_eq(a, "intelmodeset.rate")) {
+        char msg[96];
+        int ok = IntelModeset::SetRate(msg, (int)sizeof(msg), r.uval);
+        FramePacer::OutputsChanged();
+        if (ok && IntelModeset::CurrentHz()) {
+            UIConfig::SetInt("display.dp_hz", (int)IntelModeset::CurrentHz(), true);
+            UIConfig::Save();
+        }
     } else if (s_eq(a, "open.alpine")) {
         AlpineTerminal::Open();
     }
@@ -470,8 +506,23 @@ void build_info() {
     tbl_int(&g_info_all, "audio.streams", st.active_streams);
     tbl_int(&g_info_all, "audio.volume", AudioMixer::GetMasterVolume());
     tbl_int(&g_info_all, "audio.muted", AudioMixer::GetMasterMute() ? 1 : 0);
+    tbl_int(&g_info_all, "audio.restart_ok", g_audio_restart_ok);
+    tbl_int(&g_info_all, "audio.stopped", g_audio_stopped);
     tbl_int(&g_info_all, "audio.hda", HDAudio::IsDetected() ? 1 : 0);
     tbl_int(&g_info_all, "audio.codecs", HDAudio::GetCodecCount());
+    {
+        int on = AudioDevices::OutputCount();
+        if (on > 6) on = 6;
+        tbl_int(&g_info_all, "audio.out.count", on);
+        for (int i = 0; i < on; i++) {
+            char nm[24], lb[48]; bool act = false, rdy = false;
+            if (!AudioDevices::OutputInfo(i, nm, (int)sizeof(nm), lb, (int)sizeof(lb), &act, &rdy)) continue;
+            tbl_key_str(&g_info_all, "audio.out.", i, ".name", nm);
+            tbl_key_str(&g_info_all, "audio.out.", i, ".label", lb);
+            tbl_key_int(&g_info_all, "audio.out.", i, ".active", act ? 1 : 0);
+            tbl_key_int(&g_info_all, "audio.out.", i, ".ready", rdy ? 1 : 0);
+        }
+    }
     {
         char vend[96] = "";
         int cc = HDAudio::GetCodecCount();
@@ -602,6 +653,36 @@ void build_info() {
         tbl_key_int(&g_info_all, "wifi.", i, ".conn", wl[i].connected ? 1 : 0);
     }
 
+    {
+        Battery::Tick();
+        tbl_int(&g_info_all, "bat.present", Battery::Present() ? 1 : 0);
+        tbl_int(&g_info_all, "bat.pct", Battery::Percent());
+        tbl_int(&g_info_all, "bat.state", Battery::GetState());
+        tbl_int(&g_info_all, "bat.min", Battery::Minutes());
+        static char bd[64];
+        Battery::Describe(bd, (int)sizeof(bd));
+        tbl_add(&g_info_all, "bat.desc", bd);
+    }
+    {
+        static char slots[120];
+        KernelSlots::Describe(slots, (int)sizeof(slots));
+        tbl_add(&g_info_all, "boot.slots", slots);
+    }
+    // saved networks: names and flags only, never a passphrase. (satoru)
+    tbl_int(&g_info_all, "wifi.kld", WiFi::KldBridge() ? 1 : 0);
+    {
+        int sc = WiFi::SavedCount();
+        if (sc > 16) sc = 16;
+        tbl_int(&g_info_all, "wifi.saved.count", sc);
+        for (int i = 0; i < sc; i++) {
+            char nm[40]; int sec = 0; bool au = true;
+            if (!WiFi::SavedAt(i, nm, (int)sizeof(nm), &sec, &au)) continue;
+            tbl_key_str(&g_info_all, "wifi.saved.", i, ".ssid", nm);
+            tbl_key_int(&g_info_all, "wifi.saved.", i, ".sec", sec);
+            tbl_key_int(&g_info_all, "wifi.saved.", i, ".auto", au ? 1 : 0);
+        }
+    }
+
     // users and sessions (satoru)
     int uc = UserManager::GetUserCount();
     if (uc > UserManager::MAX_USERS) uc = UserManager::MAX_USERS;
@@ -620,6 +701,7 @@ void build_info() {
         if (s && s->active) act++;
     }
     tbl_int(&g_info_all, "ken.sessions", act);
+    tbl_int(&g_info_all, "ksa.on", KEN::IsKsaEnabled() ? 1 : 0);
 
     // linux subsystem and packages (satoru)
     tbl_int(&g_info_all, "kls.state", (int)KLS::GetState());
@@ -659,6 +741,7 @@ void build_info() {
     {
         VMHost::Info vi; VMHost::GetInfo(&vi);
         tbl_int(&g_info_all, "vm.live_state", vi.state);
+        tbl_int(&g_info_all, "vm.live_distro", vi.distro);   // the running (or last) one (satoru)
         tbl_int(&g_info_all, "vm.uptime", vi.uptime_ms);
         tbl_int(&g_info_all, "vm.live_ram", vi.ram_mb);
         tbl_int(&g_info_all, "vm.agent_live", vi.agent ? 1 : 0);
@@ -682,6 +765,11 @@ void build_info() {
             tbl_key_str(&g_info_all, "vmd.", i, ".name", d->name);
             tbl_key_str(&g_info_all, "vmd.", i, ".id", d->id);
             tbl_key_str(&g_info_all, "vmd.", i, ".version", d->version);
+            {   // per distro: can it start (image + kernel files) (satoru)
+                char k[24]; int kp = 0; const char* pre = "vmd."; while (*pre) k[kp++] = *pre++;
+                k[kp++] = (char)('0' + i); const char* suf = ".inst"; while (*suf) k[kp++] = *suf++; k[kp] = 0;
+                tbl_int(&g_info_all, k, VMHost::DistroInstalled(i));
+            }
             tbl_key_str(&g_info_all, "vmd.", i, ".note", d->note ? d->note : "");
             tbl_key_int(&g_info_all, "vmd.", i, ".status", d->status);
         }
@@ -724,6 +812,30 @@ void build_info() {
     tbl_int(&g_info_all, "fpc.cmdline", (int)FramePacer::CmdlineHz());
     tbl_int(&g_info_all, "fpc.panel", (int)FramePacer::PanelHz());
     tbl_add(&g_info_all, "fpc.source", FramePacer::PanelSource());
+    // external pipe b monitor: current hardware rate + the edid rates it
+    // offers at the native resolution (comma separated, ascending). (satoru)
+    {
+        tbl_int(&g_info_all, "dp.hz", (int)IntelModeset::CurrentHz());
+        uint64_t dp_phys = 0; int dp_w = 0, dp_h = 0; uint32_t dp_pitch = 0;
+        bool lit = IntelModeset::GetOutput(&dp_phys, &dp_w, &dp_h, &dp_pitch);
+        tbl_int(&g_info_all, "dp.lit", lit ? 1 : 0);
+        tbl_int(&g_info_all, "dp.phys", (long long)dp_phys);
+        tbl_int(&g_info_all, "dp.w", dp_w);
+        tbl_int(&g_info_all, "dp.h", dp_h);
+        tbl_int(&g_info_all, "dp.pitch", (long long)dp_pitch);
+        uint32_t rates[8];
+        int n = IntelModeset::Rates(rates, 8);
+        char rb[64]; int pos = 0; rb[0] = 0;
+        for (int i = 0; i < n && pos < (int)sizeof(rb) - 8; i++) {
+            char nb[12]; int k = 0;
+            uint32_t v = rates[i];
+            do { nb[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+            if (pos && pos < (int)sizeof(rb) - 1) rb[pos++] = ',';
+            while (k) rb[pos++] = nb[--k];
+        }
+        rb[pos] = 0;
+        tbl_add(&g_info_all, "dp.rates", rb);
+    }
 
     // usb and drivers (satoru)
     tbl_int(&g_info_all, "usb.detected", USB::IsDetected() ? 1 : 0);
@@ -753,8 +865,8 @@ void build_info() {
 }
 
 // ---- socket server (satoru)
-uint8_t g_rx[UnixSocket::UNIX_MAX_SOCKETS][sizeof(KssReq)];
-int g_rx_len[UnixSocket::UNIX_MAX_SOCKETS];
+uint8_t g_rx[UnixSocket::UNIX_SVC_SLOTS][sizeof(KssReq)];
+int g_rx_len[UnixSocket::UNIX_SVC_SLOTS];
 bool g_init = false;
 
 void send_reply(int sd, bool ok, const char* why) {
@@ -779,7 +891,14 @@ bool wifi_action_sync(const KssReq& r) {
     if (s_eq(r.action, "wifi.disable")) return WiFi::Disable();
     if (s_eq(r.action, "wifi.scan")) return WiFi::Scan();
     if (s_eq(r.action, "wifi.disconnect")) return WiFi::Disconnect();
-    if (s_eq(r.action, "wifi.connect")) return WiFi::Connect(r.key, r.val);
+    if (s_eq(r.action, "wifi.connect")) {
+        bool ok = WiFi::Connect(r.key, r.val);
+        volatile char* v = (volatile char*)r.val;   // the passphrase is not kept (satoru)
+        for (int i = 0; i < KSS_VAL_MAX; i++) v[i] = 0;
+        return ok;
+    }
+    if (s_eq(r.action, "wifi.forget")) return WiFi::Forget(r.key);
+    if (s_eq(r.action, "wifi.autojoin")) return WiFi::SetAutoJoin(r.key, r.uval != 0);
     return false;
 }
 
@@ -830,6 +949,50 @@ void handle(int sd, const KssReq& r) {
             send_reply(sd, ok, ok ? "ok" : "could not create the account");
             return;
         }
+        if (s_eq(a, "boot.recovery")) {
+            send_reply(sd, true, "ok");
+            RecoveryRestart();
+            return;
+        }
+        if (s_eq(a, "user.setadmin")) {
+            bool ok = UserManager::SetAdmin(r.key, r.uval != 0);
+            send_reply(sd, ok, ok ? "ok" : "refused");
+            return;
+        }
+        // the old password proves it is the account owner; no gate needed. the
+        // request buffer is wiped once it is used. (satoru)
+        if (s_eq(a, "user.passwd")) {
+            char v[KSS_VAL_MAX];
+            s_copy(v, r.val, sizeof(v));
+            int nl = 0;
+            while (v[nl] && v[nl] != '\n') nl++;
+            bool ok = false;
+            if (v[nl] == '\n') {
+                v[nl] = 0;
+                ok = UserManager::ChangePassword(r.key, v, v + nl + 1);
+            }
+            volatile char* w = v;
+            for (int i = 0; i < KSS_VAL_MAX; i++) w[i] = 0;
+            volatile char* rv = (volatile char*)r.val;
+            for (int i = 0; i < KSS_VAL_MAX; i++) rv[i] = 0;
+            send_reply(sd, ok, ok ? "ok" : "refused");
+            return;
+        }
+        // the "KSA off for now" switch: goes through the KEN policy call, which
+        // wants the password for OFF (never the admin prompt, which would be the
+        // very thing being switched). the request buffer is wiped afterwards. (satoru)
+        if (s_eq(a, "ksa.set")) {
+            char pw[KSS_VAL_MAX];
+            s_copy(pw, r.val, sizeof(pw));
+            char why[64]; why[0] = 0;
+            bool ok = KEN::SetKsaEnabled(KEN::GetCurrentSession(), r.uval != 0, pw, why, sizeof(why));
+            volatile char* w = pw;
+            for (int i = 0; i < KSS_VAL_MAX; i++) w[i] = 0;
+            volatile char* rv = (volatile char*)r.val;
+            for (int i = 0; i < KSS_VAL_MAX; i++) rv[i] = 0;
+            send_reply(sd, ok, ok ? "ok" : (why[0] ? why : "refused"));
+            return;
+        }
         if (s_eq(a, "pkg.sync")) {
             queue_action(r);
             send_reply(sd, true, "queued");
@@ -852,14 +1015,19 @@ void handle(int sd, const KssReq& r) {
     send_reply(sd, false, "bad kind");
 }
 
+// connections the service accepted, so Pump can close the ones whose client hung up:
+// nothing else ever closed them, one leaked socket (and its 64 kb ring) per request
+// connection until new sds passed UNIX_SVC_SLOTS and every request was dropped. (satoru)
+volatile uint8_t g_live[UnixSocket::UNIX_SVC_SLOTS];
+
 void svc_on_connect(int server_sd, int new_sd, void* user) {
     (void)server_sd; (void)user;
-    if (new_sd >= 0 && new_sd < UnixSocket::UNIX_MAX_SOCKETS) g_rx_len[new_sd] = 0;
+    if (new_sd >= 0 && new_sd < UnixSocket::UNIX_SVC_SLOTS) { g_rx_len[new_sd] = 0; g_live[new_sd] = 1; }
 }
 
 void svc_on_data(int sd, const uint8_t* data, int len, void* user) {
     (void)user;
-    if (sd < 0 || sd >= UnixSocket::UNIX_MAX_SOCKETS || !data || len <= 0) return;
+    if (sd < 0 || sd >= UnixSocket::UNIX_SVC_SLOTS || !data || len <= 0) return;
     int have = g_rx_len[sd];
     if (have < 0 || have > (int)sizeof(KssReq)) have = 0;
     for (int i = 0; i < len && have < (int)sizeof(KssReq); i++) g_rx[sd][have++] = data[i];
@@ -909,6 +1077,12 @@ void Init() {
 
 void Pump() {
     Init();
+    for (int sd = 0; sd < UnixSocket::UNIX_SVC_SLOTS; sd++) {
+        if (!g_live[sd] || !UnixSocket::PeerClosed(sd)) continue;
+        g_live[sd] = 0;
+        g_rx_len[sd] = 0;
+        UnixSocket::Close(sd);
+    }
     for (;;) {
         KssReq r;
         {

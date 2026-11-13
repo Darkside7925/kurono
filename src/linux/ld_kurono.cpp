@@ -11,6 +11,7 @@
 #include "../fs/kvfs.h"
 #include "../kernel/heap.h"
 #include "../kernel/pmm.h"
+#include "../kernel/kimage.h"   // direct-map/heap pointer -> phys (satoru)
 #include "../kernel/vmm.h"
 #include "../proc/scheduler.h"
 #include "linux_syscall.h"     // census module map (satoru)
@@ -338,8 +339,42 @@ struct ProcLinkerState {
 // Globals
 // ============================================================
 constexpr int MAX_PROCS = 64;
-Lib              g_libs [LdKurono::LDK_MAX_LIBS_GLOBAL];
-ProcLinkerState  g_procs[MAX_PROCS];
+// the global library table is ~950 kb and the per-process table ~850 kb. they
+// exist only while something is running a dynamic ELF, so they are allocated
+// on the first load and handed back when the last library/process goes. (satoru)
+Lib*             g_libs  = nullptr;
+ProcLinkerState* g_procs = nullptr;
+constexpr size_t LDK_LIBS_BYTES  = sizeof(Lib) * LdKurono::LDK_MAX_LIBS_GLOBAL;
+constexpr size_t LDK_PROCS_BYTES = sizeof(ProcLinkerState) * MAX_PROCS;
+
+static bool ensure_tables() {
+    if (!g_libs) {
+        g_libs = (Lib*)PMM::AllocBytes(LDK_LIBS_BYTES);
+        if (!g_libs) return false;
+        memset(g_libs, 0, LDK_LIBS_BYTES);
+    }
+    if (!g_procs) {
+        g_procs = (ProcLinkerState*)PMM::AllocBytes(LDK_PROCS_BYTES);
+        if (!g_procs) return false;
+        memset(g_procs, 0, LDK_PROCS_BYTES);
+    }
+    return true;
+}
+
+// nothing owns a linker slot or a library any more: give the two tables back.
+// called at the end of a process teardown, never from inside a table walk. (satoru)
+static void maybe_release_tables() {
+    if (g_libs) {
+        for (int i = 0; i < LdKurono::LDK_MAX_LIBS_GLOBAL; i++)
+            if (g_libs[i].in_use) return;
+    }
+    if (g_procs) {
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (g_procs[i].in_use) return;
+    }
+    if (g_libs)  { PMM::FreeBytes(g_libs, LDK_LIBS_BYTES);  g_libs = nullptr; }
+    if (g_procs) { PMM::FreeBytes(g_procs, LDK_PROCS_BYTES); g_procs = nullptr; }
+}
 
 uint64_t         g_aslr_state = 0xC0FFEE5A4B3C2D1EULL;
 
@@ -387,6 +422,7 @@ bool s_starts(const char* a, const char* p) {
 // Logging.  Writes to /system/log/ldso.log when LD_DEBUG is on.
 // ============================================================
 ProcLinkerState* find_pls_by_proc(Process* p) {
+    if (!g_procs) return nullptr;
     for (int i = 0; i < MAX_PROCS; i++)
         if (g_procs[i].in_use && g_procs[i].proc == p) return &g_procs[i];
     return nullptr;
@@ -399,6 +435,7 @@ void release_pls(ProcLinkerState* pls) {
     if (!pls || !pls->in_use) return;
     for (int i = 0; i < pls->lib_count && i < LdKurono::LDK_MAX_LIBS_PER_PROC; i++) {
         int idx = pls->libs[i];
+        if (!g_libs) break;
         if (idx < 0 || idx >= LdKurono::LDK_MAX_LIBS_GLOBAL) continue;
         Lib* l = &g_libs[idx];
         if (!l->in_use) continue;
@@ -413,8 +450,10 @@ void release_pls(ProcLinkerState* pls) {
 
 ProcLinkerState* alloc_pls(Process* p) {
     // an execve over an image that already had linker state replaces it (satoru)
-    for (int i = 0; i < MAX_PROCS; i++)
-        if (g_procs[i].in_use && g_procs[i].proc == p) release_pls(&g_procs[i]);
+    if (g_procs)
+        for (int i = 0; i < MAX_PROCS; i++)
+            if (g_procs[i].in_use && g_procs[i].proc == p) release_pls(&g_procs[i]);
+    if (!ensure_tables()) return nullptr;
     for (int i = 0; i < MAX_PROCS; i++)
         if (!g_procs[i].in_use) {
             g_procs[i] = ProcLinkerState{};
@@ -458,6 +497,7 @@ void set_error(ProcLinkerState* pls, const char* msg) {
 // Library table accessors.
 // ============================================================
 Lib* alloc_lib() {
+    if (!ensure_tables()) return nullptr;
     for (int i = 0; i < LdKurono::LDK_MAX_LIBS_GLOBAL; i++) {
         if (!g_libs[i].in_use) {
             g_libs[i] = Lib{};
@@ -770,8 +810,28 @@ SymHit lookup_global(ProcLinkerState* pls, const char* name,
 bool map_user_page(Process* proc, uint64_t va, const uint8_t* src,
                    uint64_t copy_len, uint64_t in_page_off,
                    uint64_t pte_flags) {
-    void* pg = PMM::AllocBytes(PAGE_SIZE);
-    if (!pg) return false;
+    // a page in the fixed low window is identity backed: it must claim the
+    // frame at its own va so the kernel's identity view of ordinary ram in that
+    // process is the page itself. see vmm.cpp's window guard. (satoru)
+    void* pg;
+    if (!PMM::ImageWindowFullyReserved() && !PMM::DirectMapOn() &&
+        PMM::IsInImageWindow(va & ~(uint64_t)(PAGE_SIZE - 1))) {
+        // demand mode only: the page must own the frame at its own va. in
+        // reserved mode the whole window is pinned, exactly like main, so an
+        // ordinary frame can back the va and two low images can coexist. (satoru)
+        uint64_t pa = va & ~(uint64_t)(PAGE_SIZE - 1);
+        if (PMM::AllocFrameAt(pa)) {
+            pg = (void*)(uintptr_t)pa;          // identity backed (satoru)
+        } else if (PMM::ImageSafePhys(pa)) {
+            pg = PMM::AllocBytes(PAGE_SIZE);    // shadow a fixed kernel range (satoru)
+            if (!pg) return false;
+        } else {
+            return false;                       // somebody else owns that frame (satoru)
+        }
+    } else {
+        pg = PMM::AllocBytes(PAGE_SIZE);
+        if (!pg) return false;
+    }
     memset(pg, 0, PAGE_SIZE);
     if (src && copy_len)
         memcpy((uint8_t*)pg + in_page_off, src, (size_t)copy_len);
@@ -791,11 +851,22 @@ bool map_user_page(Process* proc, uint64_t va, const uint8_t* src,
 // copy, exactly like a MAP_PRIVATE file page on linux. (satoru)
 bool map_shared_image_page(Process* proc, uint64_t va, const uint8_t* src,
                            uint64_t pte_flags) {
+    // demand mode: a shared (non-identity) page inside the low window is only
+    // legal over a fixed resident kernel range; anywhere else the page must be
+    // identity backed, so let the caller take the copy path. in reserved mode
+    // the window's frames are pinned and shared COW pages are safe (main's
+    // behaviour for the claude image). (satoru)
+    if (!PMM::ImageWindowFullyReserved() && !PMM::DirectMapOn() &&
+        PMM::IsInImageWindow(va & ~(uint64_t)(PAGE_SIZE - 1)) &&
+        !PMM::ImageSafePhys(va & ~(uint64_t)(PAGE_SIZE - 1)))
+        return false;
     uint64_t va_src = (uint64_t)(uintptr_t)src;
-    uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, va_src);
-    // only a page whose kernel va is the identity map of itself can be handed
-    // out this way (the pmm block and kernel image blobs are identity mapped).
-    if (!phys || phys != (va_src & ~(uint64_t)(PAGE_SIZE - 1))) return false;
+    // a high-linked kernel image blob cannot be shared (its va is not its
+    // frame); the pmm/heap blocks can, and under the direct map their pointer
+    // is direct_base + phys. (satoru)
+    if (KernelImageAddr((const void*)va_src)) return false;
+    uint64_t phys = PMM::VirtToPhys(va_src);
+    if (!phys || (phys & (PAGE_SIZE - 1))) return false;
     uint64_t flags = (pte_flags & ~PTE_WRITABLE) | PTE_USER | PTE_COW;
     if (!KernelVMM::MapPageInAddressSpace(proc->address_space, va, phys, flags))
         return false;
@@ -877,14 +948,14 @@ void cow_user_image_page(Process* proc, Lib* l, uint64_t va) {
     uint64_t page = va & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t phys = KernelVMM::QueryMappingInAddressSpace(proc->address_space, page);
     if (!phys) return;
-    uint64_t img_lo = (uint64_t)(uintptr_t)l->image;
+    uint64_t img_lo = PMM::VirtToPhys(l->image);
     uint64_t img_hi = img_lo + l->image_size;
     if (phys < img_lo || phys >= img_hi) return;         // already private
     uint64_t flags = KernelVMM::QueryPageFlagsInAddressSpace(proc->address_space, page);
     if (flags & PTE_WRITABLE) return;
     void* pg = PMM::AllocBytes(PAGE_SIZE);
     if (!pg) return;
-    memcpy(pg, (const void*)(uintptr_t)phys, PAGE_SIZE);
+    memcpy(pg, PMM::PhysToVirt(phys), PAGE_SIZE);
     uint64_t nf = (flags | PTE_WRITABLE | PTE_USER) & ~PTE_COW;
     if (!KernelVMM::MapPageInAddressSpace(proc->address_space, page,
                                           (uint64_t)(uintptr_t)pg, nf)) {
@@ -1031,7 +1102,7 @@ bool apply_one_reloc(Process* proc, ProcLinkerState* pls, Lib* l,
                         proc->address_space, page);
                     if (phys) {
                         for (uint64_t b = 0; b < take; b++)
-                            ((uint8_t*)(uintptr_t)phys)[((P + k + b) &
+                            ((uint8_t*)PMM::PhysToVirt(phys))[((P + k + b) &
                                 (PAGE_SIZE - 1))] = sp[k + b];
                     }
                 }
@@ -1129,9 +1200,19 @@ Lib* do_load(Process* proc, ProcLinkerState* pls,
     // Check for soname-based dedup AFTER reading the header (so we
     // honour the file's actual SONAME).
     constexpr uint32_t MAX = 16u * 1024u * 1024u;
-    uint8_t* buf = (uint8_t*)KernelHeap::Alloc(MAX);
+    // the image buffer lives as long as the lib does, and it used to be a fixed
+    // 16 MB block for every lib whatever its size. a few dynamic programs alive
+    // at once pinned 16 MB each, and every load needed a fresh 16 MB contiguous
+    // hole: the 512 MB churn grew the heap 127 -> 257 MB in three steps
+    // (64/48/18 MB, every grow requested by this line) that are never given
+    // back - the "free ram drift" of sched_14/18. size it to the file instead;
+    // files over the cap keep the old truncating read. (satoru)
+    int fsz = KVFS::GetFileSize(path);
+    bool exact = fsz > 0 && (uint32_t)fsz <= MAX;
+    uint32_t cap = exact ? (uint32_t)fsz : MAX;
+    uint8_t* buf = (uint8_t*)KernelHeap::Alloc(cap);
     if (!buf) { set_error(pls, "out of memory"); return nullptr; }
-    int got = KVFS::ReadFile(path, buf, MAX);
+    int got = KVFS::ReadFile(path, buf, cap);
     if (got <= 0) {
         KernelHeap::Free(buf);
         set_error(pls, "library file not found");
@@ -1141,6 +1222,20 @@ Lib* do_load(Process* proc, ProcLinkerState* pls,
         KernelHeap::Free(buf);
         set_error(pls, "invalid ELF64");
         return nullptr;
+    }
+    if (exact) {
+        // with a tight buffer a segment past the end of the file would be read
+        // out of bounds (the 16 MB slack used to hide it): refuse such a file. (satoru)
+        const Ehdr* ceh = (const Ehdr*)buf;
+        const Phdr* cph = (const Phdr*)(buf + ceh->e_phoff);
+        for (int i = 0; i < ceh->e_phnum; i++) {
+            if (cph[i].p_type != PT_LOAD && cph[i].p_type != PT_DYNAMIC && cph[i].p_type != PT_TLS) continue;
+            if (cph[i].p_offset > (uint64_t)got || cph[i].p_filesz > (uint64_t)got - cph[i].p_offset) {
+                KernelHeap::Free(buf);
+                set_error(pls, "invalid ELF64");
+                return nullptr;
+            }
+        }
     }
 
     Lib* l = alloc_lib();
@@ -1733,8 +1828,8 @@ uint64_t build_init_trampoline(Process* proc, ProcLinkerState* pls,
 namespace LdKurono {
 
 void Init() {
-    for (int i = 0; i < LDK_MAX_LIBS_GLOBAL; i++) g_libs[i].in_use = false;
-    for (int i = 0; i < MAX_PROCS; i++) g_procs[i].in_use = false;
+    if (g_libs)  for (int i = 0; i < LDK_MAX_LIBS_GLOBAL; i++) g_libs[i].in_use = false;
+    if (g_procs) for (int i = 0; i < MAX_PROCS; i++) g_procs[i].in_use = false;
     SerialLogger::Log("[ldso] ld-kurono dynamic linker initialised\r\n");
     // Drop a stub at /system/lib/ld-kurono.so so user-space tools see
     // the file when scanning.  The real linker runs in the kernel; this
@@ -2259,9 +2354,10 @@ bool ExecPIE(Process* proc,
 }  // namespace LdKurono// called once a process's address space is torn down (nothing can run its code any
 // more): drop its linker state and loaded libraries. (satoru)
 void LdKurono::ReleaseProcess(Process* p) {
-    if (!p) return;
+    if (!p || !g_procs) return;
     for (int i = 0; i < MAX_PROCS; i++)
         if (g_procs[i].in_use && g_procs[i].proc == p) release_pls(&g_procs[i]);
+    maybe_release_tables();
 }
 
 

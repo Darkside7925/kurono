@@ -151,7 +151,7 @@ mb1_header:
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  64-bit GDT (placed in .rodata so it's always accessible)
 ; ═══════════════════════════════════════════════════════════════════════════
-section .rodata
+section .rodata.boot
 align 16
 gdt64:
     dq  0                               ; 0x00 - null descriptor
@@ -191,6 +191,16 @@ alignb 4096
 global efi_hi_pdpts                      ; exported so graphics.cpp can set WC on the 1 GiB FB page
 efi_hi_pdpts:   resb 4096 * 3
 
+; high-half mapping of the kernel image: one pml4 entry -> one pdpt -> up to
+; four page directories (4 gb of image). the stub fills these in right before
+; it jumps to the high-linked kernel. (satoru)
+align 4096
+global kern_pdpt
+kern_pdpt:      resb 4096
+align 4096
+global kern_pd
+kern_pd:        resb 4096 * 4
+
 ; ═══════════════════════════════════════════════════════════════════════════
 ;  Stack - in .stk (zeroed with BSS, that's fine)
 ; ═══════════════════════════════════════════════════════════════════════════
@@ -205,11 +215,14 @@ stack_top:
 ;  State: 32-bit PM, flat 4 GB segments, paging OFF, A20 enabled,
 ;         EAX = magic, EBX = info pointer, IF=0 (interrupts disabled)
 ; ═══════════════════════════════════════════════════════════════════════════
-section .text
+section .text.boot
 global _start
 extern kernel_main
 extern kernel_bss_start
 extern kernel_bss_end
+extern kernel_start
+extern kernel_end
+extern kernel_phys_start
 
 [BITS 32]
 _start:
@@ -574,6 +587,59 @@ long_mode_entry:
     mov r8d, esi                        ; r8  = magic       (zero-extended)
     mov r9d, edi                        ; r9  = mb_info_ptr (zero-extended)
 
+    ; ── Map the kernel's link range onto its low physical load range ──
+    ;    the identity map (pml4[0], all of managed ram) stays exactly as the
+    ;    boot built it: firmware tables, mmio and every frame the pmm uses are
+    ;    still reached at their physical addresses. only the kernel image gets
+    ;    a second, high-half mapping. kernel_start may be anywhere in the
+    ;    canonical high half; the pml4/pdpt indices are computed, and up to
+    ;    4 gb of image fits in the four page directories below. (satoru)
+    lea rdi, [kern_pdpt]
+    xor eax, eax
+    mov ecx, 4096 / 8
+    rep stosq
+    lea rdi, [kern_pd]
+    mov ecx, (4096 * 4) / 8
+    rep stosq
+
+    mov rbx, kernel_start               ; high link va of the image
+    mov r12, kernel_phys_start          ; low physical load address
+    mov r13, kernel_end
+    lea r14, [pml4]
+    lea r15, [kern_pdpt]
+    lea rbp, [kern_pd]
+
+    mov rax, rbx
+    shr rax, 39
+    and eax, 0x1FF                      ; pml4 index
+    mov rdx, r15
+    or  rdx, 0x03
+    mov [r14 + rax*8], rdx
+
+    mov rax, rbx
+    shr rax, 30
+    and eax, 0x1FF                      ; pdpt index
+    mov rdx, rbp
+    or  rdx, 0x03
+    mov [r15 + rax*8], rdx
+
+    mov rbx, r12                        ; pa cursor
+    mov rax, kernel_start
+.kmap_loop:
+    mov rdx, rax
+    shr rdx, 21
+    and edx, 0x1FF                      ; pd index inside the 1 gb table
+    mov rcx, rbx
+    or  rcx, 0x83                       ; present | write | 2 mb page
+    mov [rbp + rdx*8], rcx
+    add rax, 0x200000
+    add rbx, 0x200000
+    cmp rax, r13
+    jb  .kmap_loop
+
+    mov rax, cr3                        ; drop stale identity translations of
+    mov cr3, rax                        ; the kernel va range
+
     ; ── Zero BSS (kernel_bss_start → kernel_bss_end only, NOT boot_tables) ──
     mov rdi, kernel_bss_start
     mov rcx, kernel_bss_end
@@ -594,7 +660,8 @@ long_mode_entry:
     ; ── Call kernel_main(magic, mb_addr) - System V AMD64 ABI ──
     mov rdi, r8                         ; arg1 = magic
     mov rsi, r9                         ; arg2 = mb_addr
-    call kernel_main
+    mov rax, kernel_main                ; high-half link address: not PC32
+    call rax
 
     ; ── Halt forever if kernel returns ──
     cli

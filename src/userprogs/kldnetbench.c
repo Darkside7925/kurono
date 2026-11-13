@@ -149,15 +149,23 @@ static pid_t spawn(char *const argv[])
 
 // ── https: bearssl with full chain validation (the dsai client's setup) ─────
 static int bs_fd;
+// what the last failing socket call returned, printed with a lost GET so the
+// failure reads as EOF vs error vs timeout. (satoru)
+static long bs_rd_bytes;
+static int bs_rd_last, bs_rd_errno, bs_wr_errno, bs_wait_to;
 static int bs_read(void *ctx, unsigned char *b, size_t len)
 {
     int fd = *(int *)ctx;
     for (;;) {
         ssize_t n = read(fd, b, len);
-        if (n > 0) return (int)n;
-        if (n == 0) return -1;
+        if (n > 0) { bs_rd_bytes += n; return (int)n; }
+        if (n == 0) { bs_rd_last = 0; return -1; }
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) { if (wait_fd(fd, POLLIN, 20000) <= 0) return -1; continue; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (wait_fd(fd, POLLIN, 20000) <= 0) { bs_wait_to = 1; bs_rd_last = -1; bs_rd_errno = EAGAIN; return -1; }
+            continue;
+        }
+        bs_rd_last = -1; bs_rd_errno = errno;
         return -1;
     }
 }
@@ -169,13 +177,15 @@ static int bs_write(void *ctx, const unsigned char *b, size_t len)
         if (n > 0) return (int)n;
         if (n == 0) return -1;
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN) { if (wait_fd(fd, POLLOUT, 20000) <= 0) return -1; continue; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN) { if (wait_fd(fd, POLLOUT, 20000) <= 0) { bs_wait_to = 1; return -1; } continue; }
+        bs_wr_errno = errno;
         return -1;
     }
 }
 
 // returns body+header bytes read, sets *status. -1 on failure, -2 tls error. (satoru)
-static long https_get(const char *host, const char *path, int *status, int *tls_err, double *t_dns)
+static long https_get_range(const char *host, const char *path, const char *range,
+                            int *status, int *tls_err, double *t_dns)
 {
     struct addrinfo hints, *ai = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -206,9 +216,18 @@ static long https_get(const char *host, const char *path, int *status, int *tls_
     br_ssl_engine_set_buffer(&sc.eng, iobuf, sizeof(iobuf), 1);
     br_ssl_client_reset(&sc, host, 0);
     bs_fd = fd;
+    bs_rd_bytes = 0; bs_rd_last = 1; bs_rd_errno = 0; bs_wr_errno = 0; bs_wait_to = 0;
     br_sslio_init(&ioc, &sc.eng, bs_read, &bs_fd, bs_write, &bs_fd);
-    char req[256];
-    int rl = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: kurono-kldnetbench\r\nConnection: close\r\n\r\n", path, host);
+    char req[384];
+    int rl;
+    if (range)
+        rl = snprintf(req, sizeof(req),
+                      "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: kurono-kldnetbench\r\nRange: bytes=%s\r\nConnection: close\r\n\r\n",
+                      path, host, range);
+    else
+        rl = snprintf(req, sizeof(req),
+                      "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: kurono-kldnetbench\r\nConnection: close\r\n\r\n",
+                      path, host);
     long total = 0;
     if (br_sslio_write_all(&ioc, req, (size_t)rl) == 0 && br_sslio_flush(&ioc) == 0) {
         static unsigned char buf[16384];
@@ -223,11 +242,26 @@ static long https_get(const char *host, const char *path, int *status, int *tls_
     return total > 0 ? total : -2;
 }
 
+static long https_get(const char *host, const char *path, int *status,
+                      int *tls_err, double *t_dns)
+{
+    return https_get_range(host, path, NULL, status, tls_err, t_dns);
+}
+
 int main(int argc, char **argv)
 {
-    const char *host = "10.0.2.2";
-    int port = 8000;
+    const char *env_host = getenv("KLD_BENCH_HOST");
+    const char *env_path = getenv("KLD_BENCH_PATH");
+    const char *env_big  = getenv("KLD_BENCH_BIG");
+    int tls = getenv("KLD_BENCH_TLS") != NULL;
+    const char *host = env_host ? env_host : "10.0.2.2";
+    const char *path = env_path ? env_path : "/";
+    const char *env_port = getenv("KLD_BENCH_PORT");
+    int port = tls ? 443 : (env_port ? atoi(env_port) : 8000);
+    if (port <= 0 || port > 65535) port = tls ? 443 : 8000;
     const char *mode = "native";
+    const char *netlink = getenv("KLD_BENCH_LINK");
+    if (!netlink) netlink = "eth0";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--spawn") && i + 1 < argc) {
             char *cav[] = { argv[i + 1], NULL };
@@ -241,7 +275,123 @@ int main(int argc, char **argv)
             i++;
         }
     }
-    say("mode=%s target=%s:%d", mode, host, port);
+    say("mode=%s target=%s:%d%s", mode, host, port, tls ? " (TLS)" : "");
+
+    if (tls) {
+        int status = 0, terr = 0;
+        double tdns = 0, t0 = now_ms();
+        long b = -1;
+        while (now_ms() - t0 < 120000.0) {
+            b = https_get(host, path, &status, &terr, &tdns);
+            if (b > 0 && status == 200)
+                break;
+            usleep(500000);
+        }
+        if (b <= 0 || status != 200) {
+            say("FAIL no https after %.0f ms (HTTP %d bearssl %d)",
+                now_ms() - t0, status, terr);
+            return 3;
+        }
+        say("https ok %ld bytes HTTP %d over %s (chain validated, bearssl err %d)",
+            b, status, netlink, terr);
+
+        if (getenv("KLD_BENCH_RECONNECT")) {
+            say("reconnect: waiting for the second association");
+            usleep(300000000);
+            status = 0; terr = 0;
+            long r = https_get(host, path, &status, &terr, &tdns);
+            if (r > 0 && status == 200) {
+                say("reconnect GET ok %ld bytes HTTP %d over %s", r, status, netlink);
+                return 0;
+            }
+            say("reconnect GET FAILED status %d bearssl %d", status, terr);
+            return 7;
+        }
+
+        if (getenv("KLD_BENCH_SOAK")) {
+            long all_ok = 0, all_fail = 0, big_ok = 0, big_fail = 0;
+            for (int minute = 0; minute < 30; minute++) {
+                long ok = 0, fail = 0;
+                for (int i = 0; i < 12; i++) {
+                    status = 0; terr = 0;
+                    long r = https_get(host, path, &status, &terr, &tdns);
+                    if (r > 0 && status == 200)
+                        ok++;
+                    else
+                        fail++;
+                    usleep(5000000);
+                }
+                all_ok += ok;
+                all_fail += fail;
+                if (minute % 5 == 0 && env_big) {
+                    status = 0; terr = 0;
+                    long r = https_get_range(host, env_big, "0-10485759",
+                                             &status, &terr, &tdns);
+                    if (r > 0 && (status == 200 || status == 206))
+                        big_ok++;
+                    else
+                        big_fail++;
+                }
+                say("soak minute=%d ok=%ld fail=%ld big_ok=%ld big_fail=%ld",
+                    minute + 1, ok, fail, big_ok, big_fail);
+            }
+            say("soak DONE ok=%ld fail=%ld big_ok=%ld big_fail=%ld",
+                all_ok, all_fail, big_ok, big_fail);
+            return all_fail || big_fail ? 6 : 0;
+        }
+
+        int ok60 = 0, first60 = 0, retried = 0;
+        double t60 = now_ms();
+        for (int i = 0; i < 60; i++) {
+            status = 0; terr = 0;
+            double s0 = now_ms();
+            long r = https_get(host, path, &status, &terr, &tdns);
+            double e0 = now_ms() - s0;
+            if (r > 0 && status == 200) {
+                ok60++;
+                first60++;
+            } else {
+                say("https GET 60/60 fail i=%d r=%ld status=%d tls=%d dns=%.0f ms=%.0f rd_bytes=%ld rd_last=%d rd_errno=%d wr_errno=%d wait_timeout=%d",
+                    i, r, status, terr, tdns, e0, bs_rd_bytes, bs_rd_last, bs_rd_errno, bs_wr_errno, bs_wait_to);
+                // one retry, counted separately: a single lost connection is not
+                // a driver verdict. (satoru)
+                retried++;
+                status = 0; terr = 0;
+                s0 = now_ms();
+                r = https_get(host, path, &status, &terr, &tdns);
+                e0 = now_ms() - s0;
+                if (r > 0 && status == 200) {
+                    ok60++;
+                    say("https GET 60/60 retry i=%d ok ms=%.0f", i, e0);
+                } else {
+                    say("https GET 60/60 retry i=%d FAILED r=%ld status=%d tls=%d ms=%.0f",
+                        i, r, status, terr, e0);
+                }
+            }
+            usleep(1000000);
+        }
+        say("https GET 60/60 one-per-second: ok=%d/60 first_try=%d retried=%d in %.0f ms over %s",
+            ok60, first60, retried, now_ms() - t60, netlink);
+        int rc_gets = ok60 < 57 ? 4 : 0;
+
+        if (env_big) {
+            status = 0; terr = 0;
+            double s = now_ms();
+            long r = https_get_range(host, env_big, "0-10485759", &status, &terr, &tdns);
+            double e = now_ms() - s;
+            if (r > 0 && (status == 200 || status == 206)) {
+                say("https big %ld bytes HTTP %d in %.0f ms = %.2f MiB/s over %s",
+                    r, status, e, (double)r / 1048576.0 / (e / 1000.0), netlink);
+            } else {
+                say("https big FAILED status %d bearssl %d after %.0f ms", status, terr, e);
+                return 5;
+            }
+        } else {
+            say("https big: no KLD_BENCH_BIG file supplied");
+        }
+        say("DONE mode=%s", mode);
+        return rc_gets;
+    }
 
     // readiness: dhcp + link + first successful http round trip. (satoru)
     double t0 = now_ms();

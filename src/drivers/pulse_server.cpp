@@ -1,4 +1,5 @@
 #include "pulse_server.h"
+#include "../kernel/heap.h"
 #include "../net/unix_socket.h"
 #include "serial.h"
 #include "timer.h"
@@ -8,6 +9,7 @@
 #include "audio_server.h"
 #include "audio_backend.h"
 #include "../proc/spinlock.h"
+#include "audio_r3.h"
 
 // pulseaudio native-protocol server, rewritten against the REAL upstream
 // command numbering and tagstruct layouts (negotiated protocol version 12).
@@ -43,11 +45,13 @@ struct Client {
     bool   authed;
     uint32_t client_index;
     Stream streams[PulseServer::PA_MAX_STREAMS_PER_CLIENT];
-    uint8_t rx[16384];
+    uint8_t rx[65536];   // a stream data packet can be the client tlength (satoru)
     int    rx_len;
 };
 
-Client g_clients[PulseServer::PA_MAX_CLIENTS];
+// ~32 kb per client; allocated when a client connects and freed when it goes,
+// so an idle audio server keeps only the 16 pointers. (satoru)
+Client* g_clients[PulseServer::PA_MAX_CLIENTS];
 int    g_listen_sd = -1;
 uint32_t g_next_client_idx = 100;
 uint32_t g_next_channel    = 1;
@@ -120,15 +124,22 @@ constexpr uint32_t PA_ERR_INVALID      = 2;
 
 Client* find_client(int sd) {
     for (int i = 0; i < PulseServer::PA_MAX_CLIENTS; i++) {
-        if (g_clients[i].in_use && g_clients[i].sd == sd) return &g_clients[i];
+        Client* c = g_clients[i];
+        if (c && c->in_use && c->sd == sd) return c;
     }
     return nullptr;
 }
 
 Client* alloc_client(int sd) {
     for (int i = 0; i < PulseServer::PA_MAX_CLIENTS; i++) {
-        if (!g_clients[i].in_use) {
-            Client* c = &g_clients[i];
+        if (!g_clients[i]) {
+            Client* c = (Client*)KernelHeap::Alloc(sizeof(Client));
+            if (!c) return nullptr;
+            memset(c, 0, sizeof(Client));
+            g_clients[i] = c;
+        }
+        Client* c = g_clients[i];
+        if (!c->in_use) {
             c->in_use = true;
             c->sd = sd;
             c->authed = false;
@@ -160,9 +171,10 @@ static bool pa_fmt_supported(uint8_t pa) {
 
 static Stream* find_stream_by_channel(uint32_t channel) {
     for (int i = 0; i < PulseServer::PA_MAX_CLIENTS; i++) {
-        if (!g_clients[i].in_use) continue;
+        Client* c = g_clients[i];
+        if (!c || !c->in_use) continue;
         for (int j = 0; j < PulseServer::PA_MAX_STREAMS_PER_CLIENT; j++) {
-            Stream* s = &g_clients[i].streams[j];
+            Stream* s = &c->streams[j];
             if (s->in_use && s->channel == channel) return s;
         }
     }
@@ -418,6 +430,13 @@ void handle_request(Client* c, uint32_t cmd, uint32_t tag, const uint8_t* args,
             uint32_t sink_index = 0, maxlength = 0, tlength = 0, prebuf = 0,
                      minreq = 0, syncid = 0;
             bool corked = false;
+            // protocol v12 prefixes the request with the stream/media name
+            // (upstream protocol-native.c: c->version < 13 reads a string
+            // first). openal-soft's libpulse sends it; the in-tree pulsetest
+            // client predates that and starts at the sample_spec, so accept
+            // both shapes. (satoru)
+            if (r.pos < r.len && (r.p[r.pos] == PA_TAG_STRING || r.p[r.pos] == PA_TAG_STRING_NULL))
+                rd_string_skip(r);
             rd_sample_spec(r, &fmt, &ch, &rate);
             rd_channel_map_skip(r);
             rd_u32(r, &sink_index);
@@ -431,6 +450,13 @@ void handle_request(Client* c, uint32_t cmd, uint32_t tag, const uint8_t* args,
             rd_cvolume_skip(r);
             if (!r.ok || !pa_fmt_supported(fmt) || ch < 1 || ch > 6 ||
                 rate < 4000 || rate > 192000) {
+                SerialLogger::Log("Pulse: create stream rejected ok="); SerialLogger::LogDec(r.ok ? 1 : 0);
+                SerialLogger::Log(" fmt="); SerialLogger::LogDec((int)fmt);
+                SerialLogger::Log(" ch="); SerialLogger::LogDec((int)ch);
+                SerialLogger::Log(" rate="); SerialLogger::LogDec((int)rate);
+                SerialLogger::Log(" len="); SerialLogger::LogDec(args_len);
+                SerialLogger::Log(" pos="); SerialLogger::LogDec(r.pos);
+                SerialLogger::Log("\r\n");
                 send_error(c->sd, tag, PA_ERR_INVALID);
                 break;
             }
@@ -589,6 +615,8 @@ void handle_request(Client* c, uint32_t cmd, uint32_t tag, const uint8_t* args,
     }
 }
 
+void drop_client(Client* c, const char* why);
+
 void on_data(int sd, const uint8_t* data, int len, void* user) {
     (void)user;
     Client* c = find_client(sd);
@@ -601,7 +629,17 @@ void on_data(int sd, const uint8_t* data, int len, void* user) {
     int p = 0;
     while (c->rx_len - p >= 20) {
         uint32_t plen = be32(c->rx + p);
-        if (plen > 8192) { c->rx_len = 0; return; }
+        if (plen > sizeof(c->rx) - 20) {
+            // dropping the buffered bytes alone leaves the client connected with
+            // its tag stream desynced: close it instead. (satoru)
+            SerialLogger::Log("Pulse: oversize packet len=");
+            SerialLogger::LogDec((int)plen);
+            SerialLogger::Log(" cap=");
+            SerialLogger::LogDec((int)(sizeof(c->rx) - 20));
+            SerialLogger::Log("\r\n");
+            drop_client(c, "oversize packet");
+            return;
+        }
         if (c->rx_len - p < (int)(20 + plen)) break;
         uint32_t channel = be32(c->rx + p + 4);
         const uint8_t* payload = c->rx + p + 20;
@@ -642,7 +680,17 @@ void drop_client(Client* c, const char* why) {
     for (int j = 0; j < PulseServer::PA_MAX_STREAMS_PER_CLIENT; j++) {
         Stream* s = &c->streams[j];
         if (!s->in_use) continue;
-        if (s->mixer_id >= 0) AudioServer::CloseStream(s->mixer_id);
+        // one summary line per stream at teardown: the proof that the client's
+        // frames reached the mixer (g6). (satoru)
+        if (s->mixer_id >= 0) {
+            AudioMixer::StreamStats sst = AudioMixer::GetStats(s->mixer_id);
+            SerialLogger::Log("Pulse: stream stats ch="); SerialLogger::LogDec((int)s->channel);
+            SerialLogger::Log(" client_bytes="); SerialLogger::LogDec((int)(s->written_bytes & 0x7FFFFFFF));
+            SerialLogger::Log(" frames_written="); SerialLogger::LogDec((int)(sst.frames_written & 0x7FFFFFFF));
+            SerialLogger::Log(" consumed="); SerialLogger::LogDec((int)(sst.frames_consumed & 0x7FFFFFFF));
+            SerialLogger::Log("\r\n");
+            AudioServer::CloseStream(s->mixer_id);
+        }
         s->mixer_id = -1;
         s->in_use = false;
         nstreams++;
@@ -652,6 +700,10 @@ void drop_client(Client* c, const char* why) {
     c->sd = -1;
     c->in_use = false;
     UnixSocket::Close(sd);
+    for (int i = 0; i < PulseServer::PA_MAX_CLIENTS; i++) {
+        if (g_clients[i] == c) { g_clients[i] = nullptr; break; }
+    }
+    KernelHeap::Free(c);
     SerialLogger::Log("Pulse: client gone sd=");
     SerialLogger::LogDec(sd);
     SerialLogger::Log(" streams=");
@@ -672,8 +724,8 @@ Spinlock g_reap_lock;
 void reap_dead_clients() {
     SpinLockCpuGuard guard(g_reap_lock);
     for (int i = 0; i < PulseServer::PA_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use) continue;
+        Client* c = g_clients[i];
+        if (!c || !c->in_use) continue;
         UnixSocket::Credentials cr;
         if (UnixSocket::GetPeerCred(c->sd, &cr) != 0) drop_client(c, "socket gone");
         else if (UnixSocket::PeerClosed(c->sd))     drop_client(c, "peer closed");
@@ -700,20 +752,17 @@ void on_connect(int server_sd, int new_sd, void* user) {
 namespace PulseServer {
 
 void Init() {
-    for (int i = 0; i < PA_MAX_CLIENTS; i++) {
-        g_clients[i].in_use = false;
-        for (int j = 0; j < PA_MAX_STREAMS_PER_CLIENT; j++) {
-            g_clients[i].streams[j].in_use   = false;
-            g_clients[i].streams[j].mixer_id = -1;
-        }
-    }
+    for (int i = 0; i < PA_MAX_CLIENTS; i++) g_clients[i] = nullptr;
 
-    g_listen_sd = UnixSocket::Create(UnixSocket::UNIX_SOCK_STREAM);
-    if (g_listen_sd < 0) return;
-    if (UnixSocket::Bind(g_listen_sd,
-                         "/system/run/user/1000/pulse/native") < 0) return;
-    UnixSocket::Listen(g_listen_sd, 16);
-    UnixSocket::RegisterServer(g_listen_sd, on_connect, on_data, nullptr);
+    // kurono.r3audio=1: the ring-3 audiod owns the socket, not the kernel. (satoru)
+    if (!R3Audio::Enabled()) {
+        g_listen_sd = UnixSocket::Create(UnixSocket::UNIX_SOCK_STREAM);
+        if (g_listen_sd < 0) return;
+        if (UnixSocket::Bind(g_listen_sd,
+                             "/system/run/user/1000/pulse/native") < 0) return;
+        UnixSocket::Listen(g_listen_sd, 16);
+        UnixSocket::RegisterServer(g_listen_sd, on_connect, on_data, nullptr);
+    }
 
     KVFS::WriteString("/system/run/user/1000/pulse/cookie",
         "kurono-pulse-cookie-32bytes-of-padding-data\n");
@@ -722,7 +771,8 @@ void Init() {
         "default sink: alsa_output.kurono\n"
         "default source: alsa_input.kurono\n"
         "sample format: S16LE 48000Hz stereo\n");
-    SerialLogger::Log("Pulse: listening on /system/run/user/1000/pulse/native\r\n");
+    SerialLogger::Log(R3Audio::Enabled() ? "Pulse: in-kernel server OFF (r3audio)\r\n"
+                                         : "Pulse: listening on /system/run/user/1000/pulse/native\r\n");
 }
 
 void Pace() {
@@ -732,8 +782,8 @@ void Pace() {
     // the client keeps ~tlength queued - this is real pulseaudio's pacing
     // model, and without it libpulse writes once and waits forever. (satoru)
     for (int i = 0; i < PA_MAX_CLIENTS; i++) {
-        Client* c = &g_clients[i];
-        if (!c->in_use) continue;
+        Client* c = g_clients[i];
+        if (!c || !c->in_use) continue;
         for (int j = 0; j < PA_MAX_STREAMS_PER_CLIENT; j++) {
             Stream* s = &c->streams[j];
             // hold the audio pump lock across the whole per-stream body:
@@ -763,15 +813,16 @@ int ListenSd() { return g_listen_sd; }
 
 int ClientCount() {
     int n = 0;
-    for (int i = 0; i < PA_MAX_CLIENTS; i++) if (g_clients[i].in_use) n++;
+    for (int i = 0; i < PA_MAX_CLIENTS; i++) if (g_clients[i] && g_clients[i]->in_use) n++;
     return n;
 }
 int StreamCount() {
     int n = 0;
     for (int i = 0; i < PA_MAX_CLIENTS; i++) {
-        if (!g_clients[i].in_use) continue;
+        Client* c = g_clients[i];
+        if (!c || !c->in_use) continue;
         for (int j = 0; j < PA_MAX_STREAMS_PER_CLIENT; j++) {
-            if (g_clients[i].streams[j].in_use) n++;
+            if (c->streams[j].in_use) n++;
         }
     }
     return n;

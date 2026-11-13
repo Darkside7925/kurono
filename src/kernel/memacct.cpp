@@ -23,7 +23,7 @@ struct Slot {
 constexpr int SLOTS = 256;
 Slot g_slots[SLOTS];
 
-inline const uint64_t* tbl(uint64_t phys) { return (const uint64_t*)(uintptr_t)phys; }
+inline const uint64_t* tbl(uint64_t phys) { return (const uint64_t*)PMM::PhysToVirt(phys); }
 inline uint64_t ephys(uint64_t e) { return e & 0x000FFFFFFFFFF000ULL; }
 
 // a table pointer is only followed if it is inside ram and the pmm says the

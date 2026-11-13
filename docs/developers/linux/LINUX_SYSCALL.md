@@ -26,7 +26,7 @@ stubs.
 | Memory | `brk` (lazy), `mmap` (anonymous and file-backed), `munmap` with region split, `mprotect` (W^X plus region split) |
 | Time | `nanosleep`, `clock_gettime`, `clock_nanosleep` |
 | TLS | `arch_prctl(ARCH_SET_FS)`, `set_thread_area`, `set_tid_address` |
-| Identity | `uname`, which reports `Linux 6.8.0-kurono` |
+| Identity | `uname`, which reports `Linux 6.1.0-kurono` |
 
 ## The set a GUI app blocks on
 
@@ -46,7 +46,7 @@ real thing, which is what makes the Wayland render path work:
 
 ## Process and memory model
 
-- up to 16 concurrent Linux processes, 64 fds each
+- up to 256 concurrent Linux processes (`LINUX_MAX_PROCS`), 256 fds each (`LINUX_MAX_FDS`)
 - lazy `brk` heap and anonymous `mmap` regions, with recoverable user page faults and
   copy-on-write address-space cloning behind `fork`
 - full 64-bit user address space. The old sub-4GB pointer ABI cap is gone: `mmap`/`brk` and
@@ -62,6 +62,43 @@ real thing, which is what makes the Wayland render path work:
 and `/lib*` go through the compat symlinks into `/kurono/...`, `/proc`, `/dev`, `/run` and
 `/tmp` map under `/kurono/runtime`, and `/etc` maps to `/kurono/system/config`. See
 [KVFS.md](../fs/KVFS.md) and [../system/LOGGING.md](../system/LOGGING.md).
+
+## Everyday behaviour
+
+Long Claude Code and Firefox sessions turned up a set of small Linux behaviours that
+ordinary programs depend on. Each fix has a switch in `boot-flags.md` that brings back
+the old behaviour.
+
+- **Pipes.** A blocking write into a full pipe waits, as it does on Linux. Pipes used to
+  lose data past 64 KB. A write with no reader raises SIGPIPE. Measured at about 50 MB in
+  0.6 s. (`kurono.pipeblock=0`)
+- **sendfile and copy_file_range.** Both answer EINVAL, so busybox `cat` and `cp` fall
+  back to read and write. Before this, sendfile returned 0 and `cat` printed nothing.
+  (`kurono.zcopy=old`)
+- **Symlinks.** Relative targets resolve. lstat and readlink see the link itself, and
+  absolute links into remapped directories such as `/tmp` work. (`kurono.symlinks=old`)
+- **File times.** Files carry real wall-clock times. They used to read 1970. utimensat,
+  touch, tar and `cp -p` keep the times they are given.
+- **Directory listings.** `.` and `..` come first, as on Linux. (`kurono.getdents=nodots`)
+- **Signals and waiting.** SIGCHLD goes to the parent when a process exits, and
+  `rt_sigsuspend` parks the task instead of spinning. `cmd & wait` in busybox sh returns.
+  A program killed by a signal reports death by that signal, so `kill` and `timeout`
+  report it right. (`kurono.sigchld=0`, `kurono.sigsusyield=0`, `kurono.exitsig=0`)
+- **Process ids.** Pids count up from 100 and wrap below 32768, skipping any pid still in
+  the table. A finished job's pid is not handed to the next process. (`kurono.pidmono=0`)
+- **Process groups.** An exited child stays in its group until it is waited for. This
+  stops `ls | wc -l` in an interactive shell from failing with "can't set tty process
+  group". (`kurono.pgrpzombie=0`)
+- **fcntl locks.** The lock commands read the full 64-bit pointer to `struct flock`. A
+  32-bit read broke SQLite in WAL mode.
+- **/proc identity maps.** `/proc/<pid>/uid_map`, `gid_map` and `setgroups` exist. Claude
+  Code reads `uid_map` before it sets up its messaging.
+
+## Programs that run
+
+Unmodified Linux programs run on this layer. The ones tested so far include Firefox,
+Claude Code (`claude` on the shell), OpenCode (`opencode` on the shell, see
+[OPENCODE.md](OPENCODE.md)), and busybox.
 
 ## Dynamic linking
 

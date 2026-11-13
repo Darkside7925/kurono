@@ -46,6 +46,10 @@ BSD-style: `Socket()`, `Bind()`, `Connect()`, `Listen()`, `Accept()`, `Send()`, 
 Limits: 16 sockets, 8KB RX/TX buffers, 1460-byte MSS. A `NetStats` struct tracks
 per-protocol RX/TX/error/drop counters.
 
+The TCP and UDP table in `tcpip.cpp` is separate. It grows in
+chunks of 64 sockets up to 4096, and each socket has a 256 KB receive ring. The chunks are never
+moved or freed, so indexes stay valid.
+
 ## HTTP
 
 `curl <url>` is the working path end to end, verified fetching real pages off example.com and

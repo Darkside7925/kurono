@@ -1,3 +1,5 @@
+#include "../system/key_layouts.h"   // settings keyboard layout (satoru)
+#include "../system/error_screen.h"   // the error screen takes typed chars (satoru)
 #include "keyboard.h"
 #include "hwinfo.h"   // input event counters for the boot log (satoru)
 #include "serial.h"
@@ -142,6 +144,15 @@ static Key usb_hid_usage_to_key(uint8_t usage) {
         case 0x37: return KEY_PERIOD;
         case 0x38: return KEY_SLASH;
         case 0x39: return KEY_CAPSLOCK;
+        // function row, print screen, scroll lock, pause: a usb keyboard never
+        // produced these, so f12 and print screen did nothing on one. (satoru)
+        case 0x3A: return KEY_F1;  case 0x3B: return KEY_F2;  case 0x3C: return KEY_F3;
+        case 0x3D: return KEY_F4;  case 0x3E: return KEY_F5;  case 0x3F: return KEY_F6;
+        case 0x40: return KEY_F7;  case 0x41: return KEY_F8;  case 0x42: return KEY_F9;
+        case 0x43: return KEY_F10; case 0x44: return KEY_F11; case 0x45: return KEY_F12;
+        case 0x46: return KEY_PRINTSCREEN;
+        case 0x47: return KEY_SCROLLLOCK;
+        case 0x48: return KEY_PAUSE;
         // navigation / editing cluster: the boot keyboard reports these usages too, and (satoru)
         // without them page up/down never reached the terminal on a usb keyboard. (satoru)
         case 0x49: return KEY_INSERT;
@@ -154,6 +165,10 @@ static Key usb_hid_usage_to_key(uint8_t usage) {
         case 0x50: return KEY_LEFT;
         case 0x51: return KEY_DOWN;
         case 0x52: return KEY_UP;
+        // keyboard-page volume usages some usb keyboards send (satoru)
+        case 0x7F: return KEY_MUTE;
+        case 0x80: return KEY_VOLUMEUP;
+        case 0x81: return KEY_VOLUMEDOWN;
         default: return KEY_UNKNOWN;
     }
 }
@@ -614,6 +629,8 @@ uint8_t Keyboard::In(uint16_t p) { uint8_t r; __asm__ __volatile__("inb %1, %0" 
 void Keyboard::Out(uint16_t p, uint8_t v) { __asm__ __volatile__("outb %0, %1" : : "a"(v), "Nd"(p)); }
 void Keyboard::Enqueue(char c) {
     if (!c) return;
+    // the blue error screen owns the keyboard while it is up. (satoru)
+    if (ErrorScreen::Active()) { ErrorScreen::OnChar(c); return; }
     uint8_t h = __atomic_load_n(&head, __ATOMIC_RELAXED);
     uint8_t t = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
     uint8_t next = (uint8_t)(h + 1);
@@ -681,6 +698,11 @@ static Key ScancodeSet2ToKey(uint8_t sc, bool e0) {
         case 0x1F: return KEY_LSUPER;
         case 0x27: return KEY_RSUPER;
         case 0x2F: return KEY_MENU;
+        // set 2 multimedia (e0 prefix): mute, volume down/up, play/pause. (satoru)
+        case 0x23: return KEY_MUTE;
+        case 0x21: return KEY_VOLUMEDOWN;
+        case 0x32: return KEY_VOLUMEUP;
+        case 0x34: return KEY_PLAYPAUSE;
         default: return KEY_UNKNOWN;
     }
 }
@@ -926,6 +948,11 @@ Key Keyboard::ScancodeToKey(uint8_t sc, bool e0) {
             case 0x5B: return KEY_LSUPER;
             case 0x5C: return KEY_RSUPER;
             case 0x5D: return KEY_MENU;
+            // set 1 multimedia: what most laptop fn keys send through the 8042. (satoru)
+            case 0x20: return KEY_MUTE;
+            case 0x2E: return KEY_VOLUMEDOWN;
+            case 0x30: return KEY_VOLUMEUP;
+            case 0x22: return KEY_PLAYPAUSE;
             default: return KEY_UNKNOWN;
         }
     }
@@ -942,6 +969,12 @@ char Keyboard::KeyToChar(Key key, bool shift, bool caps) {
     
     // better: keyboard::keytochar implements the layout logic directly by querying inputmanager for current layout type.
     
+    // the layout chosen in settings (kbd.layout) maps the main key block first. (satoru)
+    {
+        int lc = KeyLayouts::MapChar((int)key, shift, caps, IsKeyDown(KEY_RALT));
+        if (lc >= 0) return (char)lc;
+    }
+
     Key mapped_key = key;
     KeyLayout layout = InputManager::GetLayout();
     

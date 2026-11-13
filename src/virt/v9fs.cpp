@@ -141,10 +141,14 @@ int V9FS::DoAttach(uint64_t* regs) {
     fids[0].mode = V9FS_OREAD;
     fids[0].offset = 0;
     fids[0].dir_offset = 0;
-    kstrcpy(fids[0].path, "/", V9FS_MAX_PATH);
+    // the guest sees ONE host directory, not all of kvfs: a guest that could
+    // walk "/" could rewrite /system/bin. it is also the drop box of the self-
+    // hosting loop (source in, kernel out). (satoru)
+    KVFS::Mkdirs(V9FS_ROOT);
+    kstrcpy(fids[0].path, V9FS_ROOT, V9FS_MAX_PATH);
 
     regs[1] = 0; // ecx = root fid
-    SerialLogger::Log("V9FS: Attached to root '/'\r\n");
+    SerialLogger::Log("V9FS: Attached to root " V9FS_ROOT "\r\n");
     return V9FS_OK;
 }
 
@@ -174,6 +178,10 @@ int V9FS::DoWalk(uint64_t* regs) {
             if (i == 126) element[127] = '\0';
         }
     }
+
+    // one plain name per walk, never above the share root (satoru)
+    for (int i = 0; element[i]; i++) if (element[i] == '/') return V9FS_EINVAL;
+    if (kstreq(element, "..") && kstreq(fids[src_fid].path, V9FS_ROOT)) return V9FS_EINVAL;
 
     // build new path
     char new_path[V9FS_MAX_PATH];
@@ -253,34 +261,24 @@ int V9FS::DoRead(uint64_t* regs) {
 
     if (!ValidFid(fid) || !fids[fid].is_open) return V9FS_EBADF;
     if (fids[fid].is_dir) return V9FS_EISDIR;
-
-    // clamp count
     if (count > V9FS_MAX_IOSIZE) count = V9FS_MAX_IOSIZE;
 
-    // read from kvfs into scratch buffer
-    int file_size = KVFS::GetFileSize(fids[fid].path);
-    if (file_size < 0 || offset >= (uint32_t)file_size) {
-        regs[1] = 0; // ecx = 0 bytes read (eof)
-        return V9FS_OK;
-    }
-
-    uint32_t avail = (uint32_t)file_size - offset;
-    if (count > avail) count = avail;
-    if (count > sizeof(v9fs_iobuf)) count = sizeof(v9fs_iobuf);
-
-    int rd = KVFS::ReadFile(fids[fid].path, v9fs_iobuf, (uint32_t)file_size);
+    // any size: read just [offset, offset+count) of the file. the old path
+    // read the WHOLE file into an 8 KB scratch buffer, so nothing bigger than
+    // 8 KB could cross. (satoru)
+    int rd = KVFS::ReadFileAt(fids[fid].path, offset, v9fs_iobuf, count);
     if (rd < 0) return V9FS_EIO;
-
+    if (rd == 0) { regs[1] = 0; return V9FS_OK; }
     // write to guest memory through the region-clipped helper. GuestPhysToHost
     // only translates the start address; copying `count` bytes past it would
     // overrun into adjacent host heap when guest_buf sits near a region
     // boundary (a guest vm-escape). WriteGuestPhys re-translates every chunk and
     // fails the moment any byte leaves a single backing region. (satoru)
-    if (!GuestMemoryManager::WriteGuestPhys(guest_buf, v9fs_iobuf + offset, count))
+    if (!GuestMemoryManager::WriteGuestPhys(guest_buf, v9fs_iobuf, (uint32_t)rd))
         return V9FS_EIO;
 
-    fids[fid].offset = offset + count;
-    regs[1] = count; // ecx = bytes read
+    fids[fid].offset = offset + (uint32_t)rd;
+    regs[1] = (uint32_t)rd; // ecx = bytes read
     return V9FS_OK;
 }
 
@@ -300,38 +298,21 @@ int V9FS::DoWrite(uint64_t* regs) {
     if (!ValidFid(fid) || !fids[fid].is_open) return V9FS_EBADF;
     if (fids[fid].is_dir) return V9FS_EISDIR;
     if (fids[fid].mode == V9FS_OREAD) return V9FS_EINVAL;
-
     if (count > V9FS_MAX_IOSIZE) count = V9FS_MAX_IOSIZE;
 
-    // read existing file content, extend if necessary
-    int existing_size = KVFS::GetFileSize(fids[fid].path);
-    if (existing_size < 0) existing_size = 0;
-
-    uint32_t new_size = offset + count;
-    if (new_size < (uint32_t)existing_size) new_size = (uint32_t)existing_size;
-
-    // use scratch buffer for read-modify-write
-    if (new_size > sizeof(v9fs_iobuf)) {
-        regs[1] = 0;
-        return V9FS_ENOMEM;
-    }
-
-    // copy existing content
-    for (uint32_t i = 0; i < new_size; i++) v9fs_iobuf[i] = 0;
-    if (existing_size > 0) {
-        KVFS::ReadFile(fids[fid].path, v9fs_iobuf, (uint32_t)existing_size);
-    }
-    // overlay new data pulled from guest via the region-clipped helper.
-    // GuestPhysToHost only translates the start address; reading `count` bytes
-    // past it would overrun adjacent host heap when guest_buf sits near a region
-    // boundary (a guest vm-escape). ReadGuestPhys re-translates every chunk and
-    // fails the moment any byte leaves a single backing region. (satoru)
-    if (!GuestMemoryManager::ReadGuestPhys(guest_buf, v9fs_iobuf + offset, count))
+    // pulled from the guest via the region-clipped helper (see DoRead). (satoru)
+    if (!GuestMemoryManager::ReadGuestPhys(guest_buf, v9fs_iobuf, count))
         return V9FS_EIO;
-
-    if (KVFS::WriteFile(fids[fid].path, v9fs_iobuf, new_size) < 0) {
-        return V9FS_EIO;
-    }
+    // any size: an append at the end (the streaming case) or an in-place
+    // overwrite; the old read-modify-write of the whole file capped files at
+    // 8 KB. a hole past the end is refused. (satoru)
+    int existing = KVFS::GetFileSize(fids[fid].path);
+    if (existing < 0) existing = 0;
+    int r;
+    if (offset == (uint32_t)existing) r = KVFS::AppendFile(fids[fid].path, v9fs_iobuf, count);
+    else if (offset < (uint32_t)existing) r = KVFS::WriteFileAt(fids[fid].path, offset, v9fs_iobuf, count);
+    else return V9FS_EINVAL;
+    if (r < 0) return V9FS_EIO;
 
     fids[fid].offset = offset + count;
     regs[1] = count; // ecx = bytes written
@@ -471,6 +452,8 @@ int V9FS::DoCreate(uint64_t* regs) {
         }
     }
     if (name[0] == '\0') return V9FS_EINVAL;
+    if (kstreq(name, "..") || kstreq(name, ".")) return V9FS_EINVAL;   // (satoru)
+    for (int i = 0; name[i]; i++) if (name[i] == '/') return V9FS_EINVAL;
 
     // build full path
     char path[V9FS_MAX_PATH];

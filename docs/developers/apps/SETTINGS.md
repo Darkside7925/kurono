@@ -26,6 +26,17 @@ applies live, no reboot.
 
 Hardware settings (display mode, audio volume) call the driver directly.
 
+## Security: the KSA switch
+
+Users & Security has an Approval group with one switch, KSA. KSA is the second approval step
+behind `amdo` (see [../security/KEN.md](../security/KEN.md)). The switch is on by default.
+
+- Turning KSA off asks for your password. The check runs in the service through the KEN policy
+  call. Until the password is accepted nothing changes.
+- Turning KSA back on needs no password.
+- The setting persists across reboots. While it is off, `amdo` and approvals use your password
+  only, and the row says so.
+
 ## Deferred changes
 
 Display mode changes and friends go on a deferred work queue instead of being applied

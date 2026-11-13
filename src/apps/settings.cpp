@@ -911,7 +911,7 @@ void SettingsApp::RenderSystem(int x,int y,int w,int h){
 
     Graphics::DrawString(x+12,ly,"Guest Model:",S_TEXT,0xFF000000);
     Graphics::DrawString(x+140,ly,
-        profile == LINUX_GUEST_DEBIAN ? "debootstrap minbase rootfs (planned)"
+        profile == LINUX_GUEST_DEBIAN ? "Debian 13 kernel + ext4 disk image"
                                       : "embedded kernel + initramfs",
         S_DIM,0xFF000000);
     ly += 26;
@@ -919,9 +919,9 @@ void SettingsApp::RenderSystem(int x,int y,int w,int h){
     Graphics::FillRoundedRect(x+12, ly, w-24, 94, 10, S_SIDEBAR);
     Graphics::DrawString(x+24,ly+10,"Linux",S_HEADING,0xFF000000);
     if (profile == LINUX_GUEST_DEBIAN) {
-        Graphics::DrawString(x+24,ly+30,"Debian mode is selection-only for now.",S_TEXT,0xFF000000);
-        Graphics::DrawString(x+24,ly+48,"Boot will stay disabled until a minbase rootfs is embedded.",S_DIM,0xFF000000);
-        Graphics::DrawString(x+24,ly+66,"Planned host step: debootstrap --variant=minbase stable ./debian-root",S_DIM,0xFF000000);
+        Graphics::DrawString(x+24,ly+30,"Debian 13 boots as the guest.",S_TEXT,0xFF000000);
+        Graphics::DrawString(x+24,ly+48,"Needs DEBKERN.BIN, DEBINIT.BIN and DEBIAN.IMG on the KURONO partition.",S_DIM,0xFF000000);
+        Graphics::DrawString(x+24,ly+66,"Packages install with apt. Only one guest profile can be active at a time.",S_DIM,0xFF000000);
     } else {
         Graphics::DrawString(x+24,ly+30,"Alpine mode remains the active bootable guest.",S_TEXT,0xFF000000);
         Graphics::DrawString(x+24,ly+48,"Driver extraction, apk, ffmpeg, and pwsh stay routed here.",S_DIM,0xFF000000);

@@ -1,37 +1,45 @@
 # Dual boot
 
-`src/linux/dual_boot.cpp` and `dual_boot.h`. Kurono's integrated Linux boot coordination.
+`src/linux/dual_boot.cpp` and `dual_boot.h`. This is an older module: the dual-boot
+manager. It's bookkeeping and shell commands, and it does not boot Debian. The Debian
+guest that actually runs is the VM host, see the end of this page.
 
-From the shell or a start menu entry you can switch to a real or embedded Debian install
-without a full hardware reboot.
+## What it does
 
-## How the switch goes
+It tracks a boot mode (`dual_boot.h`):
 
-1. load a Debian root filesystem image, in KVFS or on a partition
-2. set up a minimal boot environment using the hypervisor's guest Linux loader
-3. the Debian kernel is `vmlinuz-6.8.0-kurono`, and GRUB labels the entry "Kurono Linux 6.8"
-4. the guest's apt sources point at `deb.debian.org/debian bookworm main`
-5. the guest boots inside the Kurono hypervisor and shows up in the Conduit app
+| Mode | Meaning |
+| --- | --- |
+| 0 integrated (default) | Kurono boots, Linux programs run through the Linux layer |
+| 1 dual active | Kurono and a Linux install on their own partitions |
+| 2 standalone Linux | plain Linux boot, Kurono not loaded |
+| 3 standalone Kurono | Kurono with no Linux layer |
 
-## Debian version
+Only the integrated mode is what Kurono really runs. The others are just recorded.
 
-Configured for Debian 12 (Bookworm). `dual_boot.cpp` writes `/linux/etc/debian_version` as
-`12.0`:
+It also looks for partitions, can mount a Linux ext4 partition, and generates a GRUB config
+as text (`dualboot grub`). The kernel names in that config (`vmlinuz-6.8.0-kurono`,
+"Kurono Linux 6.8") and the Debian 12 Bookworm apt sources that `dualboot install` writes
+into `/linux/etc` are placeholders. There's no 6.8 kernel or Bookworm install behind them.
 
-- `debian_version = 12.0`
-- apt sources: `deb http://deb.debian.org/debian bookworm main contrib non-free`, plus
-  `bookworm-security` and `bookworm-updates`
-- kernel: `vmlinuz-6.8.0-kurono`
-- initrd: `initrd.img-6.8.0-kurono`
+## Shell commands
 
-## Who actually boots it
+- `dualboot` / `dualboot status`: the current mode
+- `dualboot mode <n>`: set the mode (0 to 3)
+- `dualboot grub`: print the generated GRUB config
+- `dualboot install`: lay the placeholder `/linux` files into KVFS
+- `lsblk`, `fdisk`, `mount-linux`: list partitions, show the table, mount an ext4 partition
 
-`src/virt/linux_boot.cpp` does the boot. This module prepares the metadata and the command
-line, the hypervisor does the loading.
+## The Debian that really boots
+
+Debian 13 runs as a guest in Kurono's hypervisor, from `DEBKERN.BIN`, `DEBINIT.BIN` and
+`DEBIAN.IMG` on the KURONO partition (`DEBIAN.IMG` has to be one contiguous file). Pick
+Debian in Settings > Linux, or use the `vm` commands. Packages install with apt, and guest
+RAM and the disk grow as they're used. See `../virt/HYPERVISOR.md` and
+`../virt/DYNAMIC_VM.md`.
 
 ## Files
 
-- `src/virt/linux_boot.cpp` the real guest kernel loader
-- `src/virt/hypervisor.cpp` VM infrastructure
-- `src/linux/kls.cpp` the Linux personality for the native shell layer
-- `src/system/conduit.cpp` the telemetry bridge and app surface
+- `src/linux/dual_boot.cpp` / `.h`: this module
+- `src/virt/vm_host.cpp`: the VM host that boots the Alpine and Debian guests
+- `src/virt/linux_boot.cpp`: the guest Linux kernel loader

@@ -240,12 +240,200 @@ static int exec_main(void) {
     return ok ? 0 : 1;
 }
 
+// cow torture (churn cowF_T_M): T worker threads hammer shared words on 8
+// pages with atomic add, a CAS-loop add and a pthread-mutex-protected plain
+// add, until the forker thread has done F forks (M: 0 = fork, child _exit at
+// once; 1 = fork, the child writes a shared page then _exit; 2 = posix_spawn
+// of /bin/true). every fork turns the parent's pages copy-on-write, so the
+// workers' next stores race the cow break of the page they share. each worker
+// counts its own iterations; a lost store shows as a total below the sum.
+// one "[cow] ..." line per run. (satoru)
+#include <spawn.h>
+#define COW_PAGES 8
+static volatile uint32_t* g_cw;           // COW_PAGES pages (satoru)
+static pthread_mutex_t g_cmx = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint64_t g_cplain;
+static volatile int g_cstop;
+static unsigned long g_cdone[16];
+static void* cow_worker(void* arg) {
+    unsigned id = (unsigned)(uintptr_t)arg;
+    unsigned long i = 0;
+    while (!__atomic_load_n(&g_cstop, __ATOMIC_RELAXED)) {
+        unsigned pg = (unsigned)((i + id) % COW_PAGES);
+        volatile uint32_t* w = g_cw + pg * 1024;
+        __atomic_fetch_add(&w[0], 1, __ATOMIC_SEQ_CST);                 // lock xadd
+        uint32_t o = __atomic_load_n(&w[16], __ATOMIC_RELAXED);         // cas loop
+        while (!__atomic_compare_exchange_n(&w[16], &o, o + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) { }
+        pthread_mutex_lock(&g_cmx); g_cplain++; pthread_mutex_unlock(&g_cmx);
+        w[32 + id] = (uint32_t)i;                                        // plain own-slot store
+        i++;
+    }
+    g_cdone[id] = i;
+    return 0;
+}
+static int cow_main(const char* spec) {
+    unsigned long f = 200, t = 4, mode = 0;
+    char* e;
+    f = strtoul(spec, &e, 10);
+    if (*e == '_') t = strtoul(e + 1, &e, 10);
+    if (*e == '_') mode = strtoul(e + 1, &e, 10);
+    if (t < 1) t = 1;
+    if (t > 16) t = 16;
+    g_cw = (volatile uint32_t*)mmap(0, COW_PAGES * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((void*)g_cw == MAP_FAILED) { logs("[cow] mmap failed\n"); return 1; }
+    memset((void*)g_cw, 0, COW_PAGES * 4096);
+    g_cplain = 0; g_cstop = 0;
+    pthread_t th[16];
+    for (unsigned long i = 0; i < t; i++) pthread_create(&th[i], 0, cow_worker, (void*)(uintptr_t)i);
+    unsigned long forks = 0, fails = 0;
+    while (forks < f && fails < 1000) {
+        pid_t pid;
+        if (mode == 2) {
+            char* av[] = { (char*)"true", 0 };
+            if (posix_spawn(&pid, "/bin/true", 0, 0, av, environ) != 0) pid = -1;
+        } else {
+            pid = fork();
+            if (pid == 0) {
+                if (mode == 1) g_cw[1] = 1;   // the child writes too (satoru)
+                _exit(0);
+            }
+        }
+        if (pid > 0) { int st; waitpid(pid, &st, 0); forks++; } else fails++;
+    }
+    __atomic_store_n(&g_cstop, 1, __ATOMIC_RELAXED);
+    for (unsigned long i = 0; i < t; i++) pthread_join(th[i], 0);
+    unsigned long exp = 0, got_add = 0, got_cas = 0;
+    for (unsigned long i = 0; i < t; i++) exp += g_cdone[i];
+    for (unsigned p2 = 0; p2 < COW_PAGES; p2++) { got_add += g_cw[p2 * 1024]; got_cas += g_cw[p2 * 1024 + 16]; }
+    logs("[cow] mode="); logu(mode); logs(" threads="); logu(t);
+    logs(" forks="); logu(forks); logs(" forkfail="); logu(fails);
+    logs(" xadd="); logu(got_add); logs("/"); logu(exp);
+    logs(" cas="); logu(got_cas); logs("/"); logu(exp);
+    logs(" mutex="); logu((unsigned long)g_cplain); logs("/"); logu(exp);
+    int bad = got_add != exp || got_cas != exp || g_cplain != exp;
+    logs(bad ? " LOST\n" : " OK\n");
+    munmap((void*)g_cw, COW_PAGES * 4096);
+    return bad ? 2 : 0;
+}
+
+// exit race (churn exitN): N times, fork a child that starts 4 threads which
+// keep allocating and writing heap memory, then calls exit(0) from main while
+// they run (what claude does when it quits). linux kills the siblings before
+// the address space goes; a kernel that tears the leader down first lets them
+// fault ([usrflt] lines) and leaks the address space ([asguard] leak). the
+// parent only counts exit statuses: the kernel log is the verdict. (satoru)
+static void* exitrace_thr(void* a) {
+    (void)a;
+    for (;;) {
+        char* m = malloc(4096 + (rand() & 0xFFFF));
+        if (m) { memset(m, 7, 4096); free(m); }
+    }
+    return 0;
+}
+static int exitrace_main(unsigned long n) {
+    unsigned long ok = 0, bad = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            pthread_t t;
+            for (int k = 0; k < 4; k++) pthread_create(&t, 0, exitrace_thr, 0);
+            usleep(20000);
+            exit(0);
+        }
+        int st = 0;
+        if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok++; else bad++;
+    }
+    logs("[exitrace] runs="); logu(n); logs(" clean="); logu(ok); logs(" other="); logu(bad); logs("\n");
+    return 0;
+}
+
+// suspend handshake (churn sigN): what JSC's garbage collector does to stop a
+// mutator. the target thread sits in pthread_cond_wait (a FUTEX_WAIT that never
+// ends by itself); N times the "collector" thread pthread_kill()s it and
+// sem_timedwait()s 2 s for the handler's sem_post. linux runs the handler in
+// the middle of the futex wait, so every round answers at once; a kernel that
+// leaves the target parked times out every round. (satoru)
+#include <semaphore.h>
+#include <time.h>
+static sem_t g_sus_sem;
+static pthread_mutex_t g_sus_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_sus_cv = PTHREAD_COND_INITIALIZER;
+static volatile int g_sus_done;
+static void sus_handler(int s) { (void)s; sem_post(&g_sus_sem); }
+static void* sus_target(void* a) {
+    (void)a;
+    pthread_mutex_lock(&g_sus_mx);
+    while (!g_sus_done) pthread_cond_wait(&g_sus_cv, &g_sus_mx);
+    pthread_mutex_unlock(&g_sus_mx);
+    return 0;
+}
+static int sigsus_main(unsigned long n) {
+    sem_init(&g_sus_sem, 0, 0);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = sus_handler; sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR2, &sa, 0);
+    pthread_t t; pthread_create(&t, 0, sus_target, 0);
+    usleep(100000);
+    unsigned long ok = 0, tmo = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        pthread_kill(t, SIGUSR2);
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 2;
+        if (sem_timedwait(&g_sus_sem, &ts) == 0) ok++; else tmo++;
+        if (tmo >= 3) break;
+    }
+    pthread_mutex_lock(&g_sus_mx); g_sus_done = 1; pthread_cond_broadcast(&g_sus_cv); pthread_mutex_unlock(&g_sus_mx);
+    pthread_join(t, 0);
+    logs("[sigsus] rounds="); logu(ok + tmo); logs(" answered="); logu(ok); logs(" timedout="); logu(tmo);
+    logs(tmo ? " FROZEN-HANDSHAKE\n" : " OK\n");
+    return tmo ? 2 : 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && strncmp(argv[1], "sig", 3) == 0) return sigsus_main(argv[1][3] ? strtoul(argv[1] + 3, 0, 10) : 200);
+    if (argc > 1 && strncmp(argv[1], "exit", 4) == 0) return exitrace_main(argv[1][4] ? strtoul(argv[1] + 4, 0, 10) : 50);
+    if (argc > 1 && strncmp(argv[1], "cow", 3) == 0) {
+        // several runs, one per mode, so one boot covers fork, fork+child write, spawn (satoru)
+        int r = 0;
+        if (argv[1][3]) r |= cow_main(argv[1] + 3);
+        else {
+            r |= cow_main("300_4_0");
+            r |= cow_main("300_4_1");
+            r |= cow_main("100_4_2");
+            r |= cow_main("300_8_0");
+        }
+        return r;
+    }
     if (argc > 1 && strcmp(argv[1], "child") == 0) return child_main();
     if (argc > 1 && strcmp(argv[1], "exec") == 0) return exec_main();
     if (argc > 1 && strcmp(argv[1], "fixedlow") == 0) return fixedlow_main();
     if (argc > 1 && strncmp(argv[1], "regions", 7) == 0)
         return regions_main(strtoul(argv[1] + 7, 0, 10));
+    // one kld broker op as an ordinary process: a dead container record must
+    // not be inherited through a reused PML4 frame (KLD_EPERM expected).
+    // (satoru)
+    if (argc > 1 && strcmp(argv[1], "kldop") == 0) {
+        errno = 0;
+        long r = syscall(0x4B4C4442UL, 0x0085UL, 0UL, 0UL, 0UL, 0UL, 0UL);
+        int e = errno;
+        logs("[churn] kldop detach="); logu((unsigned long)r);
+        logs(" errno="); logu((unsigned long)e); logs("\n");
+        return (r < 0 && e == 1) ? 0 : 1;
+    }
+    // 10000 mmap/munmap pairs as one ordinary process (D2.12 item 5): a
+    // broker record that outlived its address space would make a later
+    // process's munmap fail here. (satoru)
+    if (argc > 1 && strcmp(argv[1], "pairs") == 0) {
+        unsigned long fails = 0;
+        for (int i = 0; i < 10000; i++) {
+            void* p = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) { fails++; continue; }
+            *(volatile unsigned char*)p = (unsigned char)i;
+            if (munmap(p, 4096) != 0) fails++;
+        }
+        logs("[churn] pairs=10000 fails="); logu(fails); logs("\n");
+        return fails ? 1 : 0;
+    }
     // "nkN": N rounds without the kill step (separates the deferred reap of a
     // killed group from everything else). (satoru)
     int no_kill = argc > 1 && argv[1][0] == 'n' && argv[1][1] == 'k';

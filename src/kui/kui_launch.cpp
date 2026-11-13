@@ -9,6 +9,7 @@
 #include "../kernel/elf_loader.h"
 #include "../linux/linux_syscall.h"
 #include "../proc/scheduler.h"
+#include "../proc/smp.h"
 #include "../proc/kernel_processes.h"
 #include "../proc/spinlock.h"
 #include "../net/unix_socket.h"
@@ -21,6 +22,7 @@
 #include "../system/ui_config.h"
 #include "../security/admin.h"
 #include "../fs/kvfs.h"
+#include "../shell/shell.h"
 #include "../apps/calculator.h"
 #include "../apps/text_editor.h"
 #include "../apps/file_manager.h"
@@ -28,7 +30,10 @@
 #include "../apps/denji_app.h"
 #include "../apps/terminal.h"
 #include "../apps/system_settings.h"
+#include "../apps/installer_app.h"
 #include "../system/settings_service.h"
+#include "../system/installer_service.h"
+#include "../system/kasset.h"
 
 // the in-kernel builds of the ported apps (kui_launch_<name>, KUI_APP in each source) (satoru)
 int kui_launch_texteditor();
@@ -55,6 +60,8 @@ extern "C" {
     extern const uint8_t _binary_kui_terminal_elf_end[]     __attribute__((weak));
     extern const uint8_t _binary_kui_settings_elf_start[]   __attribute__((weak));
     extern const uint8_t _binary_kui_settings_elf_end[]     __attribute__((weak));
+    extern const uint8_t _binary_kui_installer_elf_start[]  __attribute__((weak));
+    extern const uint8_t _binary_kui_installer_elf_end[]    __attribute__((weak));
     // the ui faces and icon art, embedded for the kernel already (satoru)
     extern const uint8_t _binary_inter_regular_otf_start[]  __attribute__((weak));
     extern const uint8_t _binary_inter_regular_otf_end[]    __attribute__((weak));
@@ -78,6 +85,11 @@ namespace {
 int k_editor_arg(const char* path){ return TextEditorApp::OpenFile(path); }
 int k_files_arg(const char* path){ return FileManagerApp::OpenAt(path); }
 int k_media_arg(const char* path){ MediaPlayerApp::Open(path); return 0; }
+int k_denji_arg(const char* path){
+    if (DenjiApp::OpenFile(path)) return 0;
+    MediaPlayerApp::Open(path);   // no kvid: the audio view (satoru)
+    return 0;
+}
 int k_terminal(){ return TerminalApp::OpenKernel(); }   // the in-kernel pty terminal (satoru)
 int k_settings_launch(){ SystemSettings::OpenKernel(); return 0; }
 
@@ -86,6 +98,7 @@ struct KuiApp {
     const char* title;                // the window title, to find a running instance (satoru)
     int (*launch_kernel)();           // the in-kernel build of the same source (satoru)
     int (*launch_kernel_arg)(const char* arg);   // the same with a path, nullptr when it takes none (satoru)
+    const char* pack83;               // 8.3 name of the pack copy (KURONO_PACK_USERPROGS build) (satoru)
     const uint8_t* elf;               // embedded ring-3 build, may be absent (satoru)
     const uint8_t* elf_end;
     uint32_t taskmem_app;             // kurono.taskmem=1 bucket for the in-kernel build (satoru)
@@ -93,32 +106,35 @@ struct KuiApp {
 
 KuiApp g_apps[] = {
     { "calculator", "Calculator", kui_launch_calculator, nullptr,
-      _binary_kui_calculator_elf_start, _binary_kui_calculator_elf_end, TaskMem::APP_CALC },
+      "KUICALC ELF", _binary_kui_calculator_elf_start, _binary_kui_calculator_elf_end, TaskMem::APP_CALC },
     { "texteditor", "Text Editor", kui_launch_texteditor, k_editor_arg,
-      _binary_kui_texteditor_elf_start, _binary_kui_texteditor_elf_end, TaskMem::APP_EDITOR },
+      "KUIEDIT ELF", _binary_kui_texteditor_elf_start, _binary_kui_texteditor_elf_end, TaskMem::APP_EDITOR },
     { "files", "Files", kui_launch_files, k_files_arg,
-      _binary_kui_files_elf_start, _binary_kui_files_elf_end, TaskMem::APP_FILES },
+      "KUIFILE ELF", _binary_kui_files_elf_start, _binary_kui_files_elf_end, TaskMem::APP_FILES },
     { "taskmgr", "Task Manager", kui_launch_taskmgr, nullptr,
-      _binary_kui_taskmgr_elf_start, _binary_kui_taskmgr_elf_end, TaskMem::APP_TASKMGR },
+      "KUITASK ELF", _binary_kui_taskmgr_elf_start, _binary_kui_taskmgr_elf_end, TaskMem::APP_TASKMGR },
     { "mediaplayer", "Media Player", kui_launch_mediaplayer, k_media_arg,
-      _binary_kui_mediaplayer_elf_start, _binary_kui_mediaplayer_elf_end, TaskMem::APP_MEDIA },
-    { "denji", "Media", kui_launch_denji, nullptr,
-      _binary_kui_denji_elf_start, _binary_kui_denji_elf_end, TaskMem::APP_MEDIA },
+      "KUIMEDIA ELF", _binary_kui_mediaplayer_elf_start, _binary_kui_mediaplayer_elf_end, TaskMem::APP_MEDIA },
+    { "denji", "Media", kui_launch_denji, k_denji_arg,
+      "KUIDENJI ELF", _binary_kui_denji_elf_start, _binary_kui_denji_elf_end, TaskMem::APP_MEDIA },
     { "terminal", "Terminal", k_terminal, nullptr,
-      _binary_kui_terminal_elf_start, _binary_kui_terminal_elf_end, TaskMem::APP_TERMINAL },
+      "KUITERM ELF", _binary_kui_terminal_elf_start, _binary_kui_terminal_elf_end, TaskMem::APP_TERMINAL },
     { "settings", "Settings", k_settings_launch, nullptr,
-      _binary_kui_settings_elf_start, _binary_kui_settings_elf_end, TaskMem::APP_SYSSETTINGS },
+      "KUISETT ELF", _binary_kui_settings_elf_start, _binary_kui_settings_elf_end, TaskMem::APP_SYSSETTINGS },
+    { "installer", "Kurono Installer", kui_launch_installer, nullptr,
+      "KUIINST ELF", _binary_kui_installer_elf_start, _binary_kui_installer_elf_end, TaskMem::APP_OTHER },
 };
 const int APP_N = (int)(sizeof(g_apps) / sizeof(g_apps[0]));
 
 char g_boot_list[96];                 // kurono.r3apps=... (satoru)
 bool g_installed = false;
-volatile int g_running[8];            // per app: live ring-3 instances (satoru)
-volatile int g_armed[8];              // per app: launches queued through the desktop, not started yet (satoru)
-volatile int g_fallback[8];           // per app: the ring-3 start failed, open the kernel one (satoru)
-char g_fallback_arg[8][KUI_LAUNCH_ARG_MAX];   // the path that failed launch, for the kernel fallback (satoru)
+const int KUI_APP_MAX = 12;
+volatile int g_running[KUI_APP_MAX];            // per app: live ring-3 instances (satoru)
+volatile int g_armed[KUI_APP_MAX];              // per app: launches queued through the desktop, not started yet (satoru)
+volatile int g_fallback[KUI_APP_MAX];           // per app: the ring-3 start failed, open the kernel one (satoru)
+char g_fallback_arg[KUI_APP_MAX][KUI_LAUNCH_ARG_MAX];   // the path that failed launch, for the kernel fallback (satoru)
 uint32_t g_theme_fp = 0;
-char g_test_open[24];                 // kurono.kui.open=<name>: the harness opens it once (satoru)
+char g_test_open[128];                // kurono.kui.open=<name>[,<name>...]: the harness opens them once (satoru)
 uint32_t g_test_at = 0;
 uint32_t g_theme_check_ms = 0;
 
@@ -170,6 +186,90 @@ bool take_staged_arg(uint32_t token, char* out, int max) {
 
 void KuiLaunchServerInit();
 void KuiLaunchPump();
+
+// ring-3 launcher pool for the default scheduler: one detached shell slot
+// cannot keep two kui apps alive at once (the slot runs the app until it
+// exits), and sched=2 only has six shell launchers, so kui owns a small pool of
+// kernel launcher processes for every scheduler mode. each runs one `kapp`
+// command and sleeps between jobs. (satoru)
+const int R3L_N = 12;
+struct R3LSlot { volatile int state; char cmd[96]; };
+R3LSlot g_r3l[R3L_N];
+volatile bool g_r3l_spawned = false;
+
+void r3_launcher_loop(int s) {
+    SerialLogger::Log("[r3pool] up "); SerialLogger::LogDec(s); SerialLogger::Log("\r\n");
+    for (;;) {
+        if (__atomic_load_n(&g_r3l[s].state, __ATOMIC_ACQUIRE) == 1) {
+            __atomic_store_n(&g_r3l[s].state, 2, __ATOMIC_RELEASE);
+            SerialLogger::Log("[r3pool] slot "); SerialLogger::LogDec(s);
+            SerialLogger::Log(" "); SerialLogger::Log(g_r3l[s].cmd); SerialLogger::Log("\r\n");
+            char out[256];
+            out[0] = 0;
+            KuronoShell::Execute(g_r3l[s].cmd, out, (int)sizeof(out));
+            if (out[0]) {
+                SerialLogger::Log("[r3launch] ");
+                SerialLogger::Log(out);
+                SerialLogger::Log("\r\n");
+            }
+            __atomic_store_n(&g_r3l[s].state, 0, __ATOMIC_RELEASE);
+        }
+        Scheduler::SleepMs(25);
+    }
+}
+#define R3L_ENTRY(N) static void r3_launcher_##N() { r3_launcher_loop(N); }
+R3L_ENTRY(0)
+R3L_ENTRY(1)
+R3L_ENTRY(2)
+R3L_ENTRY(3)
+R3L_ENTRY(4)
+R3L_ENTRY(5)
+R3L_ENTRY(6)
+R3L_ENTRY(7)
+R3L_ENTRY(8)
+R3L_ENTRY(9)
+R3L_ENTRY(10)
+R3L_ENTRY(11)
+#undef R3L_ENTRY
+
+bool r3_launch_cmd(const char* cmd) {
+    if (!cmd || !cmd[0]) return false;
+    // the pool serves every scheduler mode: the sched=2 shell launchers are only
+    // six and a seventh app fell back into the kernel. (satoru)
+    if (!__atomic_load_n(&g_r3l_spawned, __ATOMIC_ACQUIRE)) {
+        static const KernelProcessEntry entries[R3L_N] = {
+            r3_launcher_0, r3_launcher_1, r3_launcher_2, r3_launcher_3,
+            r3_launcher_4, r3_launcher_5, r3_launcher_6, r3_launcher_7,
+            r3_launcher_8, r3_launcher_9, r3_launcher_10, r3_launcher_11
+        };
+        static const char* names[R3L_N] = {
+            "r3launch0", "r3launch1", "r3launch2", "r3launch3",
+            "r3launch4", "r3launch5", "r3launch6", "r3launch7",
+            "r3launch8", "r3launch9", "r3launch10", "r3launch11"
+        };
+        // the default scheduler has no ap user dispatch; turn on the thread
+        // gate so the launchers' apps (pinned to one ap by SpawnDetached) can
+        // run there, time-sliced, while the bsp keeps the desktop. (satoru)
+        if (!Scheduler::DetachedLaunch()) SMP::SetApThreadSched(true);
+        bool all = true;
+        for (int i = 0; i < R3L_N; i++)
+            if (!Scheduler::SpawnKernelProcess(names[i], entries[i], PRIO_NORMAL, 512, 8192)) all = false;
+        SerialLogger::Log("[r3pool] spawned "); SerialLogger::LogDec(all ? R3L_N : -1); SerialLogger::Log("\r\n");
+        __atomic_store_n(&g_r3l_spawned, all, __ATOMIC_RELEASE);
+    }
+    for (int s = 0; s < R3L_N; s++) {
+        int expected = 0;
+        if (!__atomic_compare_exchange_n(&g_r3l[s].state, &expected, 1, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+        int i = 0;
+        while (cmd[i] && i < (int)sizeof(g_r3l[s].cmd) - 1) { g_r3l[s].cmd[i] = cmd[i]; i++; }
+        g_r3l[s].cmd[i] = 0;
+        SerialLogger::Log("[r3pool] arm "); SerialLogger::LogDec(s);
+        SerialLogger::Log(" "); SerialLogger::Log(g_r3l[s].cmd); SerialLogger::Log("\r\n");
+        return true;
+    }
+    return false;
+}
 
 int app_index(const char* name) {
     if (!name) return -1;
@@ -237,9 +337,18 @@ uint32_t write_theme_file() {
     return fp;
 }
 
-void publish(const char* path, const uint8_t* a, const uint8_t* b) {
+// assets that always stay linked (ui fonts/icons): zero copy from the image. (satoru)
+void publish_linked(const char* path, const uint8_t* a, const uint8_t* b) {
     if (!a || !b || b <= a || KVFS::Exists(path)) return;
-    KVFS::WriteFileStatic(path, a, (uint32_t)(b - a));   // zero copy: points at the kernel image (satoru)
+    KVFS::WriteFileStatic(path, a, (uint32_t)(b - a));
+}
+
+void publish(const char* path, const char* name83, const uint8_t* a, const uint8_t* b) {
+    if (KVFS::Exists(path)) return;
+    const uint8_t* d = KAsset::Data(name83, a, b);
+    uint32_t n = KAsset::Size(name83, a, b);
+    if (!d || !n) return;
+    KVFS::WriteFileStatic(path, d, n);   // zero copy: kernel image or the loaded pack block (satoru)
 }
 
 // raise the running ring-3 instance: its bridged wayland window carries the app's title (satoru)
@@ -298,13 +407,13 @@ const char* const k_kvid_ext[] = { "kvid","kvd" };
 // per-app instance bookkeeping. an instance is armed from the desktop and turns running when (satoru)
 // `kapp` has loaded it; the counters are atomic because launchers run on the aps under sched=2. (satoru)
 void launch_started(int ai) {
-    if (ai < 0 || ai >= 8) return;
+    if (ai < 0 || ai >= KUI_APP_MAX) return;
     if (__atomic_load_n(&g_armed[ai], __ATOMIC_ACQUIRE) > 0)
         __atomic_sub_fetch(&g_armed[ai], 1, __ATOMIC_ACQ_REL);
     __atomic_add_fetch(&g_running[ai], 1, __ATOMIC_ACQ_REL);
 }
 void launch_failed(int ai, const char* arg = nullptr) {
-    if (ai < 0 || ai >= 8) return;
+    if (ai < 0 || ai >= KUI_APP_MAX) return;
     if (__atomic_load_n(&g_armed[ai], __ATOMIC_ACQUIRE) > 0)
         __atomic_sub_fetch(&g_armed[ai], 1, __ATOMIC_ACQ_REL);
     else if (__atomic_load_n(&g_running[ai], __ATOMIC_ACQUIRE) > 0)
@@ -315,7 +424,7 @@ void launch_failed(int ai, const char* arg = nullptr) {
     g_fallback[ai] = 1;
 }
 void launch_exited(int ai) {
-    if (ai < 0 || ai >= 8) return;
+    if (ai < 0 || ai >= KUI_APP_MAX) return;
     if (__atomic_load_n(&g_running[ai], __ATOMIC_ACQUIRE) > 0)
         __atomic_sub_fetch(&g_running[ai], 1, __ATOMIC_ACQ_REL);
 }
@@ -330,9 +439,54 @@ void SetRing3Apps(const char* list) {
     g_boot_list[i] = 0;
 }
 
+// "0", "off", "none" or "kernel": every kui app stays in the kernel. (satoru)
+bool list_off(const char* list) {
+    return list_has(list, "0") || list_has(list, "off") || list_has(list, "none") || list_has(list, "kernel");
+}
+
 bool Ring3Wanted(const char* name) {
-    if (list_has(g_boot_list, name)) return true;
-    return list_has(UIConfig::Str("apps.ring3", ""), name);
+    // one cpu (kurono.maxcpus=1, or a machine whose aps did not start): sched=2
+    // has no program cpu, so the detached launch is off and kapp ran the app IN
+    // PLACE: the r3pool launcher entered ring 3 on cpu 0 and only came back when
+    // the app exited. that launch holds cpu 0's only ring-3 session slot (a second
+    // RunProcessWithArgs gets -2) and, with the donation valve off by default,
+    // the other kernel procs (the next r3pool launchers among them) only ran from
+    // the inline ui pump: the laptop's settings launch sat armed 55 s until Files
+    // closed, and the desktop crawled. the in-kernel builds run as part of the
+    // desktop process and never take the cpu away from it, so a 1-cpu machine
+    // opens those. an explicit kurono.r3apps boot list still forces ring 3. (satoru)
+    if (SMP::OnlineCount() < 2 && !g_boot_list[0]) {
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            SerialLogger::Log("[kui] one cpu online: kui apps open in-kernel (a ring-3 app would hold the only cpu)\r\n");
+        }
+        return false;
+    }
+    // every app with a working ring-3 build runs there by default. a boot list
+    // or ui.conf apps.ring3 narrows it: an explicit list means only those apps,
+    // and 0/off/none/kernel is the way back to the in-kernel builds. (satoru)
+    const char* cfg = UIConfig::Str("apps.ring3", "");
+    if (cfg[0]) {
+        if (list_off(cfg)) return false;
+        if (list_has(cfg, "all") || list_has(cfg, "1")) return true;
+        return list_has(cfg, name);
+    }
+    if (g_boot_list[0]) {
+        if (list_off(g_boot_list)) return false;
+        if (list_has(g_boot_list, "all") || list_has(g_boot_list, "1")) return true;
+        return list_has(g_boot_list, name);
+    }
+    // the ring-3 terminal reaches kernel built-ins (claude, firefox, audio...)
+    // only through its --ksh bridge, which needs sched=2. in the default
+    // scheduler it stays the in-kernel terminal so those commands keep working. (satoru)
+    if (!Scheduler::SchedV2()) {
+        const char* t = "terminal";
+        int k = 0;
+        while (t[k] && name[k] == t[k]) k++;
+        if (!t[k] && !name[k]) return false;
+    }
+    return true;
 }
 
 void SetTestOpen(const char* name) {
@@ -361,7 +515,7 @@ void OpenArg(const char* name, const char* arg) {
 bool OpenFile(const char* path) {
     if (!kui_launch_path_ok(path) || !KVFS::Exists(path)) return false;
     if (k_ext_in(path, k_kvid_ext, (int)(sizeof(k_kvid_ext) / sizeof(k_kvid_ext[0])))) {
-        if (!DenjiApp::OpenFile(path)) OpenArg("mediaplayer", path);   // no kvid: the audio view (satoru)
+        OpenArg("denji", path);   // ring 3 when enabled, else the kernel video player (satoru)
     } else if (k_ext_in(path, k_media_ext, (int)(sizeof(k_media_ext) / sizeof(k_media_ext[0]))) ||
                k_ext_in(path, k_image_ext, (int)(sizeof(k_image_ext) / sizeof(k_image_ext[0])))) {
         OpenArg("mediaplayer", path);
@@ -395,14 +549,15 @@ void InstallApps() {
     for (int i = 0; i < APP_N; i++) {
         int p = 0;
         putstr(path, p, "/system/apps/"); putstr(path, p, g_apps[i].name); path[p] = 0;
-        publish(path, g_apps[i].elf, g_apps[i].elf_end);
+        KAsset::Deliver(g_apps[i].pack83, g_apps[i].elf, g_apps[i].elf_end);
+        publish(path, g_apps[i].pack83, g_apps[i].elf, g_apps[i].elf_end);
     }
     KVFS::Mkdirs("/system/share/fonts/kurono");
-    publish("/system/share/fonts/kurono/Inter-Regular.otf", _binary_inter_regular_otf_start, _binary_inter_regular_otf_end);
-    publish("/system/share/fonts/kurono/Inter-SemiBold.otf", _binary_inter_semibold_otf_start, _binary_inter_semibold_otf_end);
-    publish("/system/share/fonts/kurono/DejaVuSansMono.ttf", _binary_dejavu_mono_ttf_start, _binary_dejavu_mono_ttf_end);
+    publish_linked("/system/share/fonts/kurono/Inter-Regular.otf", _binary_inter_regular_otf_start, _binary_inter_regular_otf_end);
+    publish_linked("/system/share/fonts/kurono/Inter-SemiBold.otf", _binary_inter_semibold_otf_start, _binary_inter_semibold_otf_end);
+    publish_linked("/system/share/fonts/kurono/DejaVuSansMono.ttf", _binary_dejavu_mono_ttf_start, _binary_dejavu_mono_ttf_end);
     KVFS::Mkdirs("/system/share/kurono");
-    publish("/system/share/kurono/modern_icons.bin", _binary_modern_icons_bin_start, _binary_modern_icons_bin_end);
+    publish_linked("/system/share/kurono/modern_icons.bin", _binary_modern_icons_bin_start, _binary_modern_icons_bin_end);
     g_theme_fp = write_theme_file();
     SerialLogger::Log("[kui] ring-3 apps published under /system/apps\r\n");
 }
@@ -410,6 +565,7 @@ void InstallApps() {
 void Pump() {
     if (!g_installed) InstallApps();
     SettingsService::Pump();
+    InstallerService::Pump();
     KuiLaunchServerInit();
     kui::PumpWindows();
     KuiLaunchPump();
@@ -417,8 +573,23 @@ void Pump() {
     if (g_test_open[0]) {
         if (!g_test_at) g_test_at = now + 4000;
         else if ((int32_t)(now - g_test_at) >= 0) {
-            SerialLogger::Log("[kui] test open "); SerialLogger::Log(g_test_open); SerialLogger::Log("\r\n");
-            Open(g_test_open);
+            // a comma list opens several apps from one boot, for the ui tests. (satoru)
+            char list[128];
+            int n = 0;
+            while (g_test_open[n] && n < (int)sizeof(list) - 1) { list[n] = g_test_open[n]; n++; }
+            list[n] = 0;
+            for (int i = 0; i < n; ) {
+                while (list[i] == ',' || list[i] == ' ') i++;
+                int s = i;
+                while (list[i] && list[i] != ',' && list[i] != ' ') i++;
+                if (i == s) { i++; continue; }
+                char name[48];
+                int k = 0;
+                while (s + k < i && k < (int)sizeof(name) - 1) { name[k] = list[s + k]; k++; }
+                name[k] = 0;
+                SerialLogger::Log("[kui] test open "); SerialLogger::Log(name); SerialLogger::Log("\r\n");
+                Open(name);
+            }
             g_test_open[0] = 0;
         }
     }
@@ -427,7 +598,7 @@ void Pump() {
         uint32_t fp = write_theme_file();
         if (fp != g_theme_fp) { g_theme_fp = fp; kui::ThemeChangedAll(); }
     }
-    for (int i = 0; i < APP_N && i < 8; i++) {
+    for (int i = 0; i < APP_N && i < KUI_APP_MAX; i++) {
         if (!g_fallback[i]) continue;
         g_fallback[i] = 0;
         SerialLogger::Log("[kui] ring-3 start failed, opening the in-kernel ");
@@ -450,8 +621,10 @@ void KeyEvent(int key, bool pressed, bool shift, bool ctrl, bool alt) {
 
 static bool launch_ring3_impl(const char* name, const char* arg) {
     int ai = app_index(name);
-    if (ai < 0 || ai >= 8 || !Ring3Wanted(name)) return false;
+    if (ai < 0 || ai >= KUI_APP_MAX || !Ring3Wanted(name)) return false;
     if (!g_installed) InstallApps();
+    if (ai == app_index("terminal"))
+        TerminalApp::InstallCommandStubs();   // kurono's built-ins for its busybox shell (satoru)
     char path[64];
     int p = 0;
     putstr(path, p, "/system/apps/"); putstr(path, p, name); path[p] = 0;
@@ -474,7 +647,7 @@ static bool launch_ring3_impl(const char* name, const char* arg) {
         putdec(cmd, p, token);
     }
     cmd[p] = 0;
-    if (!KernelProcesses::RunShellCommandDetached(cmd)) {   // launcher busy: in-kernel (satoru)
+    if (!r3_launch_cmd(cmd)) {   // every launcher busy: in-kernel (satoru)
         if (token) unstage_arg(token);
         return false;
     }
@@ -519,8 +692,8 @@ struct LReq { uint32_t kind; char name[KUI_LAUNCH_NAME_MAX]; char arg[KUI_LAUNCH
 LReq g_lq[LREQ_N];
 volatile int g_lq_head = 0, g_lq_tail = 0;
 Spinlock g_lq_lock;
-uint8_t g_lrx[UnixSocket::UNIX_MAX_SOCKETS][sizeof(KuiLaunchMsg)];
-int g_lrx_len[UnixSocket::UNIX_MAX_SOCKETS];
+uint8_t g_lrx[UnixSocket::UNIX_SVC_SLOTS][sizeof(KuiLaunchMsg)];
+int g_lrx_len[UnixSocket::UNIX_SVC_SLOTS];
 bool g_linit = false;
 
 void launch_reply(int sd, bool ok, const char* why) {
@@ -587,14 +760,19 @@ void launch_handle(int sd, const KuiLaunchMsg& m) {
     launch_reply(sd, ok, ok ? "queued" : why);
 }
 
+// connections the service accepted, so Pump can close the ones whose client hung up:
+// nothing else ever closed them, one leaked socket (and its 64 kb ring) per request
+// connection until new sds passed UNIX_SVC_SLOTS and every request was dropped. (satoru)
+volatile uint8_t g_llive[UnixSocket::UNIX_SVC_SLOTS];
+
 void launch_on_connect(int server_sd, int new_sd, void* user) {
     (void)server_sd; (void)user;
-    if (new_sd >= 0 && new_sd < UnixSocket::UNIX_MAX_SOCKETS) g_lrx_len[new_sd] = 0;
+    if (new_sd >= 0 && new_sd < UnixSocket::UNIX_SVC_SLOTS) { g_lrx_len[new_sd] = 0; g_llive[new_sd] = 1; }
 }
 
 void launch_on_data(int sd, const uint8_t* data, int len, void* user) {
     (void)user;
-    if (sd < 0 || sd >= UnixSocket::UNIX_MAX_SOCKETS || !data || len <= 0) return;
+    if (sd < 0 || sd >= UnixSocket::UNIX_SVC_SLOTS || !data || len <= 0) return;
     int have = g_lrx_len[sd];
     if (have < 0 || have > (int)sizeof(KuiLaunchMsg)) have = 0;
     for (int i = 0; i < len && have < (int)sizeof(KuiLaunchMsg); i++) g_lrx[sd][have++] = data[i];
@@ -610,6 +788,12 @@ void launch_on_data(int sd, const uint8_t* data, int len, void* user) {
 }
 
 void KuiLaunchPump() {
+    for (int sd = 0; sd < UnixSocket::UNIX_SVC_SLOTS; sd++) {
+        if (!g_llive[sd] || !UnixSocket::PeerClosed(sd)) continue;
+        g_llive[sd] = 0;
+        g_lrx_len[sd] = 0;
+        UnixSocket::Close(sd);
+    }
     for (;;) {
         LReq r;
         {
@@ -698,7 +882,7 @@ int ShellBuiltins::cmd_kapp(KuronoShell* sh, int argc, const char** argv, char* 
     int p = 0;
     putstr(path, p, "/system/apps/"); putstr(path, p, name); path[p] = 0;
     if (!KVFS::Exists(path)) {
-        if (ai >= 0 && ai < 8) launch_failed(ai, launch_arg);
+        if (ai >= 0 && ai < KUI_APP_MAX) launch_failed(ai, launch_arg);
         p = k_append(out, 0, mx, "kapp: ");
         p = k_append(out, p, mx, path);
         return k_append(out, p, mx, " is not in this build\n");
@@ -706,10 +890,10 @@ int ShellBuiltins::cmd_kapp(KuronoShell* sh, int argc, const char** argv, char* 
     if (!Userspace::IsReady()) Userspace::Init();
     Process* proc = ElfLoader::LoadELF64FromVFS(path, name);
     if (!proc) {
-        if (ai >= 0 && ai < 8) launch_failed(ai, launch_arg);
+        if (ai >= 0 && ai < KUI_APP_MAX) launch_failed(ai, launch_arg);
         return k_append(out, 0, mx, "kapp: failed to load the binary\n");
     }
-    if (ai >= 0 && ai < 8) launch_started(ai);
+    if (ai >= 0 && ai < KUI_APP_MAX) launch_started(ai);
     // a pending open-with path wins; otherwise extra words after the app name go to the program. (satoru)
     const char* av[6];
     int ac = 0;
@@ -722,9 +906,25 @@ int ShellBuiltins::cmd_kapp(KuronoShell* sh, int argc, const char** argv, char* 
                            "KUI_THEME=/system/run/kui/theme", nullptr };
     LinuxSyscall::ClearConsoleOutput();
     SerialLogger::Log("[kui] ring-3 "); SerialLogger::Log(name); SerialLogger::Log(" start\r\n");
-    int rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);   // kui apps run as the user (satoru)
+    // sched=2 uses its detached launchers; the default scheduler has no user
+    // dispatch, so pin the app to an ap and let the thread gate run it there. (satoru)
+    int rc;
+    if (!Scheduler::DetachedLaunch() && Userspace::CanSpawnDetached()) {
+        // default scheduler: start the app on an ap and wait here. the same
+        // wait/reap loop RunDetached uses, via the public detached api. (satoru)
+        DetachedHandle h;
+        int sr = Userspace::SpawnDetached(proc, av, envp, 1000, 1000, &h);
+        if (sr < 0) {
+            rc = sr;
+        } else {
+            while (Userspace::DetachedAlive(h)) Scheduler::SleepMs(5);
+            rc = Userspace::ReapDetached(h);
+        }
+    } else {
+        rc = Userspace::RunProcessWithArgs(proc, av, envp, 1000, 1000);   // kui apps run as the user (satoru)
+    }
     Scheduler::DestroyProcess(proc);
-    if (ai >= 0 && ai < 8) {
+    if (ai >= 0 && ai < KUI_APP_MAX) {
         launch_exited(ai);
         // -2: this cpu already runs a ring-3 session (the old scheduler mode while firefox is up) (satoru)
         if (rc == -2 || rc == -3) {

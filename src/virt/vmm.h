@@ -389,6 +389,12 @@ struct vCPU {
     uint64_t     exit_qualification;
     // general-purpose registers (not auto-saved by hw)
     uint64_t     regs[16];  // rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8-r15
+    // per vcpu state that vmx does not switch (satoru): the x87/sse image (16 byte aligned),
+    // the guest copies of kernel_gs_base / star / lstar / cstar / sfmask, the debug registers
+    uint8_t*     fx;
+    uint64_t     ctx[2];     // {regs, fx}: the entry asm keeps a pointer to this on the host stack (satoru)
+    uint64_t     sw_msr[5];
+    uint64_t     dr[8];
 };
 
 //  vmm - virtual machine monitor
@@ -441,7 +447,9 @@ public:
     static uint64_t GetLastVMEntryGuestCr4();
     // guest copies of msrs that vmx does not switch (kernel_gs_base, star,
     // lstar, cstar, sfmask). returns nullptr for any other msr (satoru)
-    static uint64_t* GuestSwitchedMSR(uint32_t msr);
+    static uint64_t* GuestSwitchedMSR(uint32_t msr);   // of the vcpu last entered on this cpu
+    static vCPU* Current();                            // the vcpu last entered on this cpu (satoru)
+    static void  SetCurrent(vCPU* c);
     static void   DumpVMXControlDiag();
 
     static bool   IsWHPX();            // running under hyper-v / whpx?

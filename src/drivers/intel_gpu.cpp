@@ -5,6 +5,7 @@
 #include "intel_gpu.h"
 #include "serial.h"
 #include "../kernel/vmm.h"   // map the (possibly high 64-bit) bar before deref (satoru)
+#include "../kernel/kld_auto.h"   // KldAuto::TakesDevice: a device taken for a kld container is left alone (satoru)
 
 // identity-map a bar's register window as uncached mmio before any access.
 // the igpu gttmmaddr bar is 64-bit and can land above the boot identity map,
@@ -227,6 +228,11 @@ void IntelGPU::Init() {
                 uint32_t class_rev = PciRead(bus, dev, func, 0x08);
                 uint8_t base_class = (class_rev >> 24) & 0xFF;
                 if (base_class != 0x03) continue;
+                // a device taken for a kld container is not ours: no bar sizing write. (satoru)
+                if (KldAuto::TakesDevice((uint8_t)bus, (uint8_t)dev, (uint8_t)func, vid, did)) {
+                    SerialLogger::Log("[GPU] Intel: taken by kld, skipped\r\n");
+                    continue;
+                }
 
                 // found intel gpu
                 gpu_info.detected = true;
@@ -385,6 +391,11 @@ bool IntelGPU::SetBacklightPercent(int pct) {
     if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
     if (g_bl_pair < 0) {
         for (int i = 0; i < (int)(sizeof(kBlPairs) / sizeof(kBlPairs[0])); i++) {
+            // ice lake and newer (arrow lake too) reuse 0xC8250/0xC8254 as
+            // BXT_BLC_PWM_CTL/FREQ: reading FREQ as "freq << 16 | duty" and
+            // writing it back would reprogram the pwm frequency. system/backlight
+            // drives that layout instead. (satoru)
+            if (kBlPairs[i].duty_reg == 0xC8254 && gpu_info.gen >= INTEL_GEN_11) continue;
             uint32_t duty = ReadReg(kBlPairs[i].duty_reg);
             uint32_t en   = ReadReg(kBlPairs[i].enable_reg);
             uint32_t freq = (duty >> 16) & 0xFFFF;

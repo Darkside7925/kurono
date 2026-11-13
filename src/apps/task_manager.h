@@ -56,6 +56,8 @@ struct TMProcess {
     uint32_t stack_grow_count;
     uint8_t  prio_tier;       // PRIO_REALTIME..PRIO_LOW
     bool     is_kernel_proc;
+    uint8_t  group;           // 0 apps, 1 system services (satoru)
+    int      icon;            // AppIcons::Id for the row tile (satoru)
 };
 
 struct TMWindowRow {

@@ -1,54 +1,42 @@
-# Browser (the placeholder)
+# Browser
 
-`src/apps/browser.cpp` and `browser.h`. This is the GUI "Browser" tile, and it is a
-deliberate placeholder, not a browser.
+`src/apps/browser.cpp` and `browser.h`. This is the old "Browser" tile, and it's not a
+browser. It opens a small window titled "Browser (Removed)" that says the in-tree browser
+is gone and points you at `curl <url>` in the terminal. It's about 70 lines and stays only so
+old shortcuts don't break.
 
-## What it actually is
+There used to be an in-tree HTML/HTTP client called KBrowse (~1,260 lines). I pulled it out
+once real Firefox started working, because a hand-written engine was never going to catch
+up.
 
-About 70 lines. `Open()` makes a small window titled "Browser (Removed)" and prints
-"Browser Removed" plus "Use terminal: `curl <url>`". No address bar, no fetch path, no
-renderer.
+## The real browser is Firefox
 
-On purpose. There used to be an in-tree HTML/HTTP client called KBrowse (~1,260 lines)
-and I pulled it out. The old argument was "no C++ browser compiles for a freestanding
-OS", which is no longer where this project stands.
+Firefox 140 ESR (musl + Wayland, software WebRender, a ~174 MB `libxul.so`) runs on the
+Linux layer, unmodified. The desktop's Firefox icon and `kurono.gui.run=@firefox` both go
+through `DesktopEnvironment::LaunchFirefox()`, which starts it detached, with no terminal
+window.
 
-## The real browser answer
+- It installs from `FIREFOX.TAR` on the KURONO partition, so no network is needed, or
+  downloads it with `kpkg`.
+- It runs multi-process (e10s). Content processes are real forked processes, talking to the
+  parent over Unix sockets with fd passing.
+- `ld-kurono` resolves libxul's whole `.so` closure and relocates it at a high base.
+- The in-kernel Wayland compositor shows its windows, including the GTK content subsurface
+  inside the client-side-decorated toplevel, popups and menus.
+- HTTPS works through Firefox's own NSS. Real sites load.
+- It can run at the same time as Claude Code. A vfork bug used to corrupt Firefox's
+  environment when Claude had fragmented memory first, and that's fixed in part 3.
 
-Firefox on the Linux runtime. Not a hand-written engine.
+## HTTP from the terminal
 
-- Real Firefox 140.11.0esr built against musl and Wayland (`cairo-gtk3-wayland`,
-  software WebRender, ~174MB `libxul.so`), build rc=0.
-- The Linux runtime already gives it what it wants: pthreads/futex, epoll/poll,
-  `mprotect` W^X, real `fcntl` byte-range locks, AF_UNIX with `SCM_RIGHTS`, and an
-  in-kernel Wayland compositor that composites real `wl_shm` clients. Including
-  `wl_subsurface` compositing, which is how GTK insets Firefox's content into its
-  client-side-decorated toplevel.
-- The launcher (`src/apps/firefox_launcher.cpp`) really `execve`s the rootfs Firefox
-  binary through the Linux syscall layer.
-- Firefox composites its real chrome on the desktop. `ld-kurono` resolves libxul's
-  full `.so` closure and relocates it at a multi-terabyte base. It runs a real profile
-  single-process (e10s off) with threads across the secondary cores
-  (`kurono.apthreads=1`, `-smp 4`), and the compositor puts its 973x743 GTK content
-  subsurface on the 1025x795 CSD toplevel. Tab strip, URL bar, back/forward/reload,
-  bookmark star, menus, window controls, all real pixels. The old sub-4GB pointer ABI
-  cap is gone, so a high PIE base is fine now.
-
-What's left for a page that reliably renders: the socket thread's poll-wakeup delivery
-(NSPR's `PollableEvent`/eventfd against the kernel's fd readiness), plus some multicore
-startup and render-timing flakiness. Not e10s, not address space, not ELF loading. The
-tile stays a placeholder until page render is reliable.
-
-## HTTP today
-
-`curl <url>` in the terminal. Goes end to end through `src/net/tcpip.cpp`: real DNS,
-TCP handshake, recv loop, FIN half-close. Fetched real pages off example.com and
-wikipedia over tap+NAT. HTTPS isn't implemented, `curl` is HTTP only.
+`curl <url>` works for quick fetches. It's a small shim over busybox `wget`, which handles
+HTTPS too.
 
 ## Files
 
-- `src/apps/browser.cpp` / `.h` the placeholder tile
-- `src/apps/firefox_launcher.cpp` / `.h` the real Firefox `execve` launcher
-- `src/linux/ld_kurono.cpp` the dynamic linker that loads libxul's closure
-- `src/net/tcpip.cpp` the TCP/IP stack behind `curl`
-- `src/ui/desktop.cpp` `LaunchBrowser()` entry point
+- `src/apps/browser.cpp` / `.h`: the old tile
+- `src/apps/firefox_launcher.cpp` / `.h`: the Firefox launcher
+- `src/packages/pkgmgr.cpp`: installing Firefox from `FIREFOX.TAR` or the network
+- `src/linux/ld_kurono.cpp`: the dynamic linker that loads libxul's closure
+- `src/ui/wayland_server.cpp`: the compositor side
+- `src/ui/desktop.cpp`: `LaunchBrowser()` and `LaunchFirefox()`

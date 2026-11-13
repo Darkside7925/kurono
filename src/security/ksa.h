@@ -57,6 +57,13 @@ public:
     // ksa as unavailable (the password factor then carries the policy). (satoru)
     static bool IsAvailable();
 
+    // the owner's "KSA off for now" switch. while suspended the hypervisor path is
+    // never used: IsAvailable() reports false (so the policy layer falls back to
+    // the password factor) and Prompt() draws the plain secure-desktop modal.
+    // only KEN::SetKsaEnabled flips this, after its checks and audit. (satoru)
+    static void SetSuspended(bool off);
+    static bool IsSuspended();
+
     // true if the active prompt path is a real nested vm (vmlaunch'd) vs the
     // ept-isolated context fallback. purely informational / for the docs and
     // the `ken policy` status line. (satoru)

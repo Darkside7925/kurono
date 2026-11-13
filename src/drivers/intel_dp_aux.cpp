@@ -72,6 +72,7 @@ inline uint32_t aux_sync(int len) { return (uint32_t)(len - 1) & 0x1F; }
 // port_buf_ctl1 (intel_cx0_phy_regs.h xelpdp_port_buf_ctl1) (satoru)
 constexpr uint32_t BUF1_PHY_READY = 1u << 24;
 constexpr uint32_t BUF1_TC_OWNED = 1u << 6;
+constexpr uint32_t BUF1_TCSS_PWR_REQ = 1u << 5;   // xelpdp_tcss_power_request (satoru)
 constexpr uint32_t BUF1_TCSS_PWR_ST = 1u << 4;
 
 // drm_dp.h request codes and replies (satoru)
@@ -134,13 +135,18 @@ volatile uint8_t* g_mmio = nullptr;
 char* g_out = nullptr;
 int g_out_max = 0;
 int g_out_pos = 0;
+bool g_tclegacy = false;   // kurono.igpu.tclegacy=1 (satoru)
+bool g_legacytc = false;   // kurono.igpu.legacytc=1 (satoru)
 
 #ifdef DPAUX_HOST_MOCK
 inline uint32_t rd(uint32_t off) { return MockMmioRead(off); }
 inline void wr_aux(uint32_t off, uint32_t v) { MockMmioWrite(off, v); }
 #else
 inline uint32_t rd(uint32_t off) { return *(volatile uint32_t*)(g_mmio + off); }
-// the only mmio write in this file. callers pass aux ctl/data offsets only. (satoru)
+// the only mmio write in this file. callers pass aux ctl/data offsets only, except
+// tc_legacy_probe (port_buf_ctl1, kurono.igpu.tclegacy=1 only) and the
+// kurono.igpu.legacytc=1 connect / release / gmbus code (port_buf_ctl1 and
+// gmbus0..5 of the port being connected). (satoru)
 inline void wr_aux(uint32_t off, uint32_t v) {
     *(volatile uint32_t*)(g_mmio + off) = v;
     __asm__ __volatile__("" ::: "memory");
@@ -524,6 +530,7 @@ struct TcSink {
     uint8_t sink_count;
     int edid_len;
     uint8_t edid[128 * DpEdid::MAX_BLOCKS];
+    bool legacy;            // legacy hotplug only, no dp-alt / tbt (satoru)
 };
 TcSink g_tc[5];
 
@@ -750,12 +757,333 @@ void run_port(int idx, bool edp, bool tbt_io) {
 
 } // namespace
 
+// fix 6 diagnostic (kurono.igpu.tclegacy=1, default off): a type-c port with
+// only the legacy hotplug live is never owned by the firmware, so stage 1 never
+// heard its sink. do the xelpdp_tc_phy_connect steps for legacy mode (tc-cold
+// blocked by the aux power request, tcss power request + wait for its state,
+// phy ownership), read dpcd + edid, then undo all three, so the port is left
+// as found and stage 2 (dp-alt only) does not touch it. these are the only
+// port_buf_ctl1 writes in this file. (satoru)
+void tc_legacy_probe(int i) {
+    const AuxPort& p = PORTS[i];
+    uint32_t c0 = rd(p.ctl);
+    bool aux_ours = !(c0 & AUX_PWR_REQ);
+    if (c0 & AUX_SEND_BUSY) { Ln l; l.t.s(p.name); l.t.s(" legacy: aux busy, skipped"); l.go(); return; }
+    if (aux_ours) { wr_aux(p.ctl, (c0 & ~AUX_SEND_BUSY) | AUX_PWR_REQ); udelay(1000); }
+    uint32_t b0 = rd(p.buf1);
+    wr_aux(p.buf1, b0 | BUF1_TCSS_PWR_REQ);
+    uint32_t b1 = rd(p.buf1);
+    for (int k = 0; k < 50 && !(b1 & BUF1_TCSS_PWR_ST); k++) { udelay(100); b1 = rd(p.buf1); }
+    bool pwr = b1 & BUF1_TCSS_PWR_ST;
+    if (pwr) {
+        wr_aux(p.buf1, b1 | BUF1_TC_OWNED);
+        udelay(1000);
+        b1 = rd(p.buf1);
+    }
+    {
+        Ln l; l.t.s(p.name); l.t.s(" legacy: buf_ctl1 0x"); l.t.x(b0, 8); l.t.s(" -> 0x"); l.t.x(b1, 8);
+        l.t.s(" tcss_pwr="); l.t.d(pwr); l.t.s(" owned="); l.t.d((b1 & BUF1_TC_OWNED) != 0);
+        l.t.s(" phy_rdy="); l.t.d((b1 & BUF1_PHY_READY) != 0);
+        l.go();
+    }
+    if (pwr && (b1 & BUF1_TC_OWNED)) run_port(i, false, false);
+    // undo: ownership, tcss power, then the aux request we made. (satoru)
+    uint32_t b2 = rd(p.buf1);
+    if (!(b0 & BUF1_TC_OWNED)) { wr_aux(p.buf1, b2 & ~BUF1_TC_OWNED); udelay(100); b2 = rd(p.buf1); }
+    if (!(b0 & BUF1_TCSS_PWR_REQ)) wr_aux(p.buf1, b2 & ~BUF1_TCSS_PWR_REQ);
+    if (aux_ours) { uint32_t c = rd(p.ctl); wr_aux(p.ctl, c & ~(AUX_SEND_BUSY | AUX_PWR_REQ)); udelay(30); }
+    g_tc[p.tc].valid = false;   // a legacy sink is for the log only, not for stage 2 (satoru)
+    Ln l; l.t.s(p.name); l.t.s(" legacy: released, buf_ctl1 0x"); l.t.x(rd(p.buf1), 8); l.go();
+}
+
+void IntelDpAux::SetTcLegacyProbe(bool on) { g_tclegacy = on; }
+
+// ---- kurono.igpu.legacytc=1: keep a legacy type-c port connected for
+// stage 2. linux 7.1.6 intel_tc.c xelpdp_tc_phy_connect / _disconnect for
+// tc_port_legacy, step by step below. (satoru) ----
+namespace {
+
+void emit_tc(const char* line) {
+    SerialLogger::Log("[igpu-tc] ");
+    SerialLogger::Log(line);
+    SerialLogger::Log("\r\n");
+    if (g_out && g_out_pos < g_out_max - 2) {
+        static const char pre[] = "[igpu-tc] ";
+        for (int i = 0; pre[i] && g_out_pos < g_out_max - 2; i++) g_out[g_out_pos++] = pre[i];
+        for (int i = 0; line[i] && g_out_pos < g_out_max - 2; i++) g_out[g_out_pos++] = line[i];
+        g_out[g_out_pos++] = '\n';
+        g_out[g_out_pos] = 0;
+    }
+}
+
+struct TLn {
+    char b[320];
+    Txt t;
+    TLn() : t(b, sizeof(b)) {}
+    void go() { emit_tc(b); }
+};
+
+struct LegacyHold { bool held; bool aux_ours; };
+LegacyHold g_hold[5];
+
+uint32_t tcss_status(int tc) { return rd(R_TCSS_DDI_STATUS + 4u * (uint32_t)(tc - 1)); }
+
+void legacy_release(int i, const char* why) {
+    const AuxPort& p = PORTS[i];
+    LegacyHold& h = g_hold[p.tc];
+    if (!h.held) return;
+    // xelpdp_tc_phy_disconnect, tc_port_legacy: xelpdp_tc_phy_take_ownership
+    // (false), xelpdp_tc_phy_enable_tcss_power(false) (request off, then
+    // xelpdp_tc_phy_wait_for_tcss_power(false): 200 us polls, 5 ms), then
+    // tc_cold_unblock (the aux power request this module set) (satoru)
+    wr_aux(p.buf1, rd(p.buf1) & ~BUF1_TC_OWNED);
+    wr_aux(p.buf1, rd(p.buf1) & ~BUF1_TCSS_PWR_REQ);
+    uint32_t b = rd(p.buf1);
+    for (int k = 0; k < 25 && (b & BUF1_TCSS_PWR_ST); k++) { udelay(200); b = rd(p.buf1); }
+    bool aux_dropped = false;
+    if (h.aux_ours) {
+        uint32_t c = rd(p.ctl);
+        for (int k = 0; k < 10 && (c & AUX_SEND_BUSY); k++) { udelay(1000); c = rd(p.ctl); }
+        if (!(c & AUX_SEND_BUSY)) { wr_aux(p.ctl, c & ~(AUX_SEND_BUSY | AUX_PWR_REQ)); udelay(30); aux_dropped = true; }
+    }
+    h.held = false;
+    TLn l; l.t.s(p.name); l.t.s(": released ("); l.t.s(why); l.t.s("): ownership off, tcss power off (state ");
+    l.t.d((b & BUF1_TCSS_PWR_ST) != 0); l.t.s("), aux power request ");
+    l.t.s(h.aux_ours ? (aux_dropped ? "dropped" : "STUCK busy, left set") : "left as the firmware had it");
+    l.t.s(" | buf_ctl1 0x"); l.t.x(rd(p.buf1), 8); l.go();
+}
+
+bool legacy_connect(int i) {
+    const AuxPort& p = PORTS[i];
+    LegacyHold& h = g_hold[p.tc];
+    if (h.held) return true;
+    uint32_t c0 = rd(p.ctl), b0 = rd(p.buf1), s0 = tcss_status(p.tc);
+    {
+        TLn l; l.t.s(p.name); l.t.s(": legacy connect: buf_ctl1 0x"); l.t.x(b0, 8); l.t.s(" aux_ctl 0x"); l.t.x(c0, 8);
+        l.t.s(" tcss_ddi_status 0x"); l.t.x(s0, 8); l.go();
+    }
+    if (b0 & (BUF1_TC_OWNED | BUF1_TCSS_PWR_REQ)) {
+        TLn l; l.t.s(p.name); l.t.s(": FAILED: phy already owned / powered by someone else, not touched"); l.go();
+        return false;
+    }
+    if (c0 & AUX_SEND_BUSY) {
+        TLn l; l.t.s(p.name); l.t.s(": FAILED: aux channel busy, not touched"); l.go();
+        return false;
+    }
+    // 1. tc_cold_block: tgl_tc_phy_cold_off_domain gives the legacy aux
+    // domain, i.e. xelpdp_aux_power_well_enable: rmw power_request, then a
+    // fixed 600 us (we wait 1000; the status bit is not used without an lt
+    // phy) (satoru)
+    h.aux_ours = !(c0 & AUX_PWR_REQ);
+    if (h.aux_ours) { wr_aux(p.ctl, (c0 & ~AUX_SEND_BUSY) | AUX_PWR_REQ); udelay(1000); }
+    h.held = true;   // from here every exit goes through legacy_release (satoru)
+    {
+        TLn l; l.t.s(p.name); l.t.s(": step 1 tc-cold blocked (aux power request "); l.t.s(h.aux_ours ? "set" : "already set");
+        l.t.s(", aux_ctl 0x"); l.t.x(rd(p.ctl), 8); l.t.c(')'); l.go();
+    }
+    // 2. xelpdp_tc_phy_enable_tcss_power(true): __xelpdp_tc_phy_enable_tcss_power
+    // sets xelpdp_tcss_power_request (no ver 30 mailbox wa on ver 14), then
+    // tc_phy_wait_for_ready (adlp_tc_phy_is_ready: tcss_ddi_status ready,
+    // 0xffffffff = tc-cold, 1 ms polls up to 500 ms), then
+    // xelpdp_tc_phy_wait_for_tcss_power(true) (200 us polls up to 5 ms) (satoru)
+    wr_aux(p.buf1, rd(p.buf1) | BUF1_TCSS_PWR_REQ);
+    uint32_t st = tcss_status(p.tc);
+    int waited = 0;
+    for (; waited < 500 && (st == 0xFFFFFFFFu || !(st & 4)); waited++) { udelay(1000); st = tcss_status(p.tc); }
+    bool ready = st != 0xFFFFFFFFu && (st & 4);
+    uint32_t b1 = rd(p.buf1);
+    for (int k = 0; k < 25 && !(b1 & BUF1_TCSS_PWR_ST); k++) { udelay(200); b1 = rd(p.buf1); }
+    bool pwr = b1 & BUF1_TCSS_PWR_ST;
+    {
+        TLn l; l.t.s(p.name); l.t.s(": step 2 tcss power: ddi ready="); l.t.d(ready); l.t.s(" (tcss_ddi_status 0x"); l.t.x(st, 8);
+        l.t.s(", "); l.t.d((uint64_t)waited); l.t.s(" ms) power ack="); l.t.d(pwr); l.t.s(" (buf_ctl1 0x"); l.t.x(b1, 8); l.t.c(')'); l.go();
+    }
+    if (!ready || !pwr) {
+        TLn l; l.t.s(p.name); l.t.s(": FAILED: tcss power "); l.t.s(!ready ? "ready never set" : "request not acked"); l.go();
+        legacy_release(i, "tcss power failed");
+        return false;
+    }
+    // 3. xelpdp_tc_phy_take_ownership(true): rmw xelpdp_tc_phy_ownership.
+    // linux does not wait here; the c20 phy then reports soc phy ready
+    // (bit 24), which intel_cx0_phy_lane_reset waits for. we wait for it
+    // now, up to 10 ms, so a dead phy fails before any modeset. (satoru)
+    wr_aux(p.buf1, rd(p.buf1) | BUF1_TC_OWNED);
+    udelay(100);
+    b1 = rd(p.buf1);
+    for (int k = 0; k < 100 && !(b1 & BUF1_PHY_READY); k++) { udelay(100); b1 = rd(p.buf1); }
+    bool own = b1 & BUF1_TC_OWNED, rdy = b1 & BUF1_PHY_READY;
+    {
+        TLn l; l.t.s(p.name); l.t.s(": step 3 phy ownership ack="); l.t.d(own); l.t.s(" phy ready="); l.t.d(rdy);
+        l.t.s(" (buf_ctl1 0x"); l.t.x(b1, 8); l.t.c(')'); l.go();
+    }
+    if (!own || !rdy) {
+        TLn l; l.t.s(p.name); l.t.s(": FAILED: "); l.t.s(!own ? "ownership bit did not stick" : "phy never reported ready"); l.go();
+        legacy_release(i, "ownership / phy ready failed");
+        return false;
+    }
+    // 4. read_pin_configuration + tc_phy_verify_legacy_or_dp_alt_mode:
+    // legacy is always 4 lanes, no live recheck (satoru)
+    TLn l; l.t.s(p.name); l.t.s(": legacy connected: 4 lanes, both phy lanes owned by display"); l.go();
+    return true;
+}
+
+// ---- gmbus (ddc) edid read for a port whose aux stays silent (hdmi).
+// linux 7.1.6 intel_gmbus.c do_gmbus_xfer / gmbus_index_xfer /
+// gmbus_xfer_read_chunk, polled: gmbus base = pch_display_base 0xc0000,
+// pin = gmbus_pin_9_tc1_icp + tc port (gmbus_pins_mtp, icl_port_to_ddc_pin),
+// rate 100 khz. one 128 byte block per call (blocks 0 and 1 need no
+// segment pointer). (satoru) ----
+constexpr uint32_t R_GMBUS0 = 0xc5100, R_GMBUS1 = 0xc5104, R_GMBUS2 = 0xc5108, R_GMBUS3 = 0xc510c, R_GMBUS4 = 0xc5110;
+constexpr uint32_t GMBUS_SW_CLR_INT = 1u << 31, GMBUS_SW_RDY = 1u << 30;
+constexpr uint32_t GMBUS_CYCLE_WAIT = 1u << 25, GMBUS_CYCLE_INDEX = 2u << 25, GMBUS_CYCLE_STOP = 4u << 25;
+constexpr uint32_t GMBUS_HW_WAIT_PHASE = 1u << 14, GMBUS_HW_RDY = 1u << 11, GMBUS_SATOER = 1u << 10, GMBUS_ACTIVE = 1u << 9;
+
+// gmbus_wait: 0 when a status bit is set, E_NACK on satoer, E_TIMEOUT
+// after ms (linux: 50 ms) (satoru)
+int gmbus_wait(uint32_t bits, uint32_t ms) {
+    for (uint32_t k = 0; k < ms * 20; k++) {
+        uint32_t v = rd(R_GMBUS2);
+        if (v & GMBUS_SATOER) return E_NACK;
+        if (v & bits) return 0;
+        udelay(50);
+    }
+    return E_TIMEOUT;
+}
+
+// gmbus_wait_idle: active clear within 10 ms (satoru)
+bool gmbus_idle() {
+    for (int k = 0; k < 200; k++) { if (!(rd(R_GMBUS2) & GMBUS_ACTIVE)) return true; udelay(50); }
+    return false;
+}
+
+int gmbus_edid_block(int tc, int block, uint8_t* out) {
+    if (tc < 1 || tc > 4 || block < 0 || block > 1) return E_2BIG;
+    uint32_t pin = 9u + (uint32_t)(tc - 1);
+    for (int tries = 0; tries < 2; tries++) {
+        // do_gmbus_xfer: gmbus0 = rate | pin; the offset write + read pair is
+        // an index transfer (gmbus_index_xfer: cycle_index with the 1 byte
+        // offset in slave_index), read with cycle_wait (satoru)
+        wr_aux(R_GMBUS4, 0);
+        wr_aux(R_GMBUS0, pin);
+        uint32_t off = block ? 128u : 0u;
+        wr_aux(R_GMBUS1, GMBUS_SW_RDY | GMBUS_CYCLE_INDEX | GMBUS_CYCLE_WAIT | (128u << 16) | (off << 8) | (0x50u << 1) | 1u);
+        int r = 0, got = 0;
+        while (got < 128) {
+            r = gmbus_wait(GMBUS_HW_RDY, 50);
+            if (r) break;
+            uint32_t v = rd(R_GMBUS3);
+            for (int b = 0; b < 4 && got < 128; b++) { out[got++] = (uint8_t)(v & 0xFF); v >>= 8; }
+        }
+        if (!r) r = gmbus_wait(GMBUS_HW_WAIT_PHASE, 50);
+        if (!r) {
+            // stop cycle, wait idle, gmbus0 = 0 (satoru)
+            wr_aux(R_GMBUS1, GMBUS_CYCLE_STOP | GMBUS_SW_RDY);
+            bool idle = gmbus_idle();
+            wr_aux(R_GMBUS0, 0);
+            return idle ? 0 : E_TIMEOUT;
+        }
+        if (r == E_TIMEOUT) { wr_aux(R_GMBUS0, 0); return E_TIMEOUT; }
+        // clear_err: wait idle, toggle sw_clr_int, gmbus0 = 0; linux retries
+        // a nak on the first message once (satoru)
+        (void)gmbus_idle();
+        wr_aux(R_GMBUS1, GMBUS_SW_CLR_INT);
+        wr_aux(R_GMBUS1, 0);
+        wr_aux(R_GMBUS0, 0);
+    }
+    return E_NACK;
+}
+
+// one legacy port: connect, read, decide (dp kept, hdmi / nothing released) (satoru)
+void legacy_tc_port(int i, int* external) {
+    const AuxPort& p = PORTS[i];
+    TcSink& s = g_tc[p.tc];
+    if (!legacy_connect(i)) {
+        TLn l; l.t.s(p.name); l.t.s(": legacy connect failed, external screen stays dark, internal panel untouched"); l.go();
+        return;
+    }
+    run_port(i, false, false);
+    s.legacy = true;
+    const PortResult& R = g_res[i];
+    if (R.dpcd_ok && R.edid_ok && R.sink_count >= 1) {
+        TLn l; l.t.s(p.name); l.t.s(": sink is DP: dpcd "); l.t.d(R.dpcd[0] >> 4); l.t.c('.'); l.t.d(R.dpcd[0] & 0xF);
+        l.t.c(' '); l.t.s(DpEdid::LinkRateName(R.dpcd[1])); l.t.s(" x"); l.t.d(R.dpcd[2] & 0x1F);
+        l.t.s(" | edid "); l.t.s(g_e.mfg); l.t.c(' '); l.t.s(g_e.name[0] ? g_e.name : "(no name)");
+        if (g_e.preferred >= 0) {
+            const DpEdid::Timing& t = g_e.t[g_e.preferred];
+            l.t.s(" preferred "); l.t.d(t.hact); l.t.c('x'); l.t.d(t.vact); l.t.c('@'); l.t.hz(t.refresh_mhz);
+        }
+        l.t.s(" -> kept connected for the modeset"); l.go();
+        *external = i;
+        return;
+    }
+    s.valid = false;
+    if (R.dpcd_ok) {
+        TLn l; l.t.s(p.name); l.t.s(": sink is DP but "); l.t.s(!R.edid_ok ? "no edid answered" : "sink_count is 0"); l.t.s(", not lit"); l.go();
+        legacy_release(i, "dp sink without edid");
+        return;
+    }
+    // aux silent: an hdmi sink answers on the ddc pins instead (satoru)
+    int e = gmbus_edid_block(p.tc, 0, g_edid);
+    int blocks = 0;
+    if (e == 0 && DpEdid::DecodeEdid(g_edid, 128, &g_e)) {
+        blocks = 1;
+        if (g_edid[126] >= 1 && gmbus_edid_block(p.tc, 1, g_edid + 128) == 0) blocks = 2;
+        DpEdid::DecodeEdid(g_edid, blocks * 128, &g_e);
+        char nm[12]; Txt tn(nm, sizeof(nm)); tn.s(p.name); tn.s("-ddc");
+        for (int b = 0; b < blocks; b++) {
+            char w[12]; Txt tw(w, sizeof(w)); tw.s("edid blk"); tw.d((uint64_t)b);
+            hexdump(nm, w, 0, g_edid + b * 128, 128);
+        }
+        TLn l; l.t.s(p.name); l.t.s(": sink is HDMI: aux silent, edid over gmbus pin "); l.t.d((uint64_t)(9 + p.tc - 1));
+        l.t.s(": "); l.t.s(g_e.mfg); l.t.c(' '); l.t.s(g_e.name[0] ? g_e.name : "(no name)");
+        if (g_e.preferred >= 0) {
+            const DpEdid::Timing& t = g_e.t[g_e.preferred];
+            l.t.s(" preferred "); l.t.d(t.hact); l.t.c('x'); l.t.d(t.vact); l.t.c('@'); l.t.hz(t.refresh_mhz);
+            l.t.s(" pixclk "); l.t.d(t.pixclk_khz); l.t.s("khz");
+        }
+        l.t.s(" hdmi_vsdb="); l.t.d(g_e.hdmi_vsdb); l.t.s(" | hdmi (tmds on c20) modeset not implemented yet, not lit"); l.go();
+    } else {
+        TLn l; l.t.s(p.name); l.t.s(": no sink answered: aux dpcd failed and gmbus pin "); l.t.d((uint64_t)(9 + p.tc - 1));
+        l.t.s(" edid "); l.t.s(e == 0 ? "had a bad header" : err_name(e)); l.t.s(", not lit"); l.go();
+    }
+    legacy_release(i, blocks ? "hdmi sink, no hdmi modeset" : "no sink");
+}
+
+} // namespace
+
+void IntelDpAux::SetLegacyTc(bool on) { g_legacytc = on; }
+bool IntelDpAux::LegacyTcEnabled() { return g_legacytc; }
+bool IntelDpAux::LegacyTcHeld(int tc) { return tc >= 1 && tc <= 4 && g_hold[tc].held; }
+
+bool IntelDpAux::LegacyTcConnect(int tc) {
+    if (!g_legacytc || tc < 1 || tc > 4) return false;
+    g_mmio = IntelDisplayProbe::Mmio();
+    if (!g_mmio) return false;
+    clock_init();
+    g_out = nullptr;   // a shell buffer from an earlier Run is gone by now (satoru)
+    for (int i = 0; i < NPORTS; i++) if (PORTS[i].tc == tc) return legacy_connect(i);
+    return false;
+}
+
+void IntelDpAux::LegacyTcRelease(int tc, const char* why) {
+    if (tc < 1 || tc > 4 || !g_hold[tc].held) return;
+    g_mmio = IntelDisplayProbe::Mmio();
+    if (!g_mmio) return;
+    clock_init();
+    g_out = nullptr;
+    for (int i = 0; i < NPORTS; i++) if (PORTS[i].tc == tc) legacy_release(i, why ? why : "release");
+}
+
+void IntelDpAux::LegacyTcReleaseAll(const char* why) {
+    for (int tc = 1; tc <= 4; tc++) LegacyTcRelease(tc, why);
+}
+
 int IntelDpAux::Run(char* out, int maxo) {
     g_out = out;
     g_out_max = maxo;
     g_out_pos = 0;
     if (out && maxo > 0) out[0] = 0;
-    for (int i = 0; i < 5; i++) g_tc[i].valid = false;
+    for (int i = 0; i < 5; i++) { g_tc[i].valid = false; g_tc[i].legacy = false; }
 
     g_mmio = IntelDisplayProbe::Mmio();
     if (!g_mmio) {
@@ -829,6 +1157,19 @@ int IntelDpAux::Run(char* out, int maxo) {
             if (tbt && !dpalt) {
                 l.t.s(" -> skip: tbt-alt only (needs the tc-cold-off domain, out of stage 1 scope)"); l.go(); continue;
             }
+            if (g_legacytc && legacy && !dpalt && !tbt && !owned) {
+                if (external >= 0) {
+                    l.t.s(" -> skip: legacy connect not tried, "); l.t.s(PORTS[external].name); l.t.s(" already holds the external sink"); l.go(); continue;
+                }
+                l.t.s(" -> legacy connect (kurono.igpu.legacytc=1)"); l.go();
+                legacy_tc_port(i, &external);
+                continue;
+            }
+            if (g_tclegacy && legacy && !dpalt && !tbt && !owned) {
+                l.t.s(" -> legacy connect probe (kurono.igpu.tclegacy=1)"); l.go();
+                tc_legacy_probe(i);
+                continue;
+            }
             if (!owned || !tcss || !rdy) {
                 // a legacy or dp-alt connect would need xelpdp_tc_phy_connect
                 // (tcss power request + ownership writes to port_buf_ctl1),
@@ -838,6 +1179,7 @@ int IntelDpAux::Run(char* out, int maxo) {
             }
             l.t.s(dpalt ? " -> read (dp-alt, fw owns + powers the phy)" : " -> read (legacy, fw owns + powers the phy)"); l.go();
             run_port(i, false, false);
+            g_tc[p.tc].legacy = legacy && !dpalt;
             if (external < 0 && g_res[i].dpcd_ok) external = i;
         }
     }
@@ -879,6 +1221,7 @@ bool IntelDpAux::LastSink(int tc, SinkInfo* out) {
     out->sink_count = s.sink_count;
     out->edid_len = s.edid_len;
     out->edid = s.edid;
+    out->legacy = s.legacy;
     return true;
 }
 
@@ -933,5 +1276,45 @@ bool IntelDpAux::AuxPower(int tc, bool on, bool* was_on) {
 }
 
 const char* IntelDpAux::ErrName(int e) { return err_name(e); }
+
+// ---- edp (port a) native dpcd for the panel brightness (fix 7). only while
+// the firmware left port a's aux powered (it is never requested here) and psr
+// / panel replay are off on transcoder a, which shares this channel. one
+// caller at a time; a busy channel is a failed call, not a wait. (satoru) ----
+namespace {
+volatile uint32_t g_edp_busy = 0;
+bool edp_open() {
+    if (__atomic_exchange_n(&g_edp_busy, 1u, __ATOMIC_ACQUIRE)) return false;
+    g_mmio = IntelDisplayProbe::Mmio();
+    if (!g_mmio) { __atomic_store_n(&g_edp_busy, 0u, __ATOMIC_RELEASE); return false; }
+    clock_init();
+    uint32_t c = rd(PORTS[0].ctl);
+    bool psr = (rd(R_SRD_CTL_A) >> 31) || (rd(R_PSR2_CTL_A) >> 31) || ((rd(R_TRANS_DP2_CTL_A) >> 30) & 1);
+    if (!(rd(R_PP_STATUS0) >> 31) || !(c & AUX_PWR_REQ) || !(c & AUX_PWR_ST) || psr) {
+        __atomic_store_n(&g_edp_busy, 0u, __ATOMIC_RELEASE);
+        return false;
+    }
+    g_out = nullptr;
+    g_xfers = 0;
+    g_max_xfers = 64;
+    g_deadline = g_tpu ? now_us() + 50000 : 0;   // 50 ms per call (satoru)
+    return true;
+}
+void edp_close() { __atomic_store_n(&g_edp_busy, 0u, __ATOMIC_RELEASE); }
+}
+
+int IntelDpAux::EdpDpcdRead(uint32_t addr, uint8_t* buf, int n) {
+    if (n <= 0 || n > 16 || !edp_open()) return -1;
+    int r = dpcd_read(PORTS[0], addr, buf, n, false);
+    edp_close();
+    return r == n ? n : (r < 0 ? r : -1);
+}
+
+int IntelDpAux::EdpDpcdWrite(uint32_t addr, const uint8_t* buf, int n) {
+    if (n <= 0 || n > 16 || !edp_open()) return -1;
+    int r = dpcd_write(PORTS[0], addr, buf, n, false);
+    edp_close();
+    return r == n ? n : (r < 0 ? r : -1);
+}
 
 // end (satoru)

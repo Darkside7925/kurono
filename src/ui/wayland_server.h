@@ -38,9 +38,19 @@
 
 namespace WaylandServer {
     void DumpProtocolTrace();   // kurono.wltrace=1 ring dump (satoru)
+    void SetChildAlpha(bool on); // kurono.wl.childalpha=1: blend ARGB child subsurfaces (satoru)
+    void SetScissorDirectBlit(bool on); // kurono.wl.scdirect=1: old commit-time blit under gfx.scissor (satoru)
+    void SetDecoration(bool on); // kurono.wl.deco=1: answer xdg-decoration with server-side (satoru)
+    void SetFullsize(bool on);  // kurono.wl.fullsize=1: new toplevels get the output size (bench) (satoru)
+    void SetPoolFree(bool on);  // kurono.wl.poolfree=1: unpin a wl_shm backing when the last client ref goes (satoru)
+    // wl_shm reference census: live/made pool and buffer objects, their bytes,
+    // and the per-surface shadow budget. for the memcensus leak line. (satoru)
+    void PoolCensus(int* pools_live, int* pools_made, uint64_t* pool_kb,
+                    int* bufs_live, int* bufs_made, uint64_t* buf_kb,
+                    uint64_t* shadow_kb);
 
-    static const int WL_MAX_CLIENTS  = 16;
-    static const int WL_MAX_OBJECTS  = 256;
+    static const int WL_MAX_CLIENTS  = 256;
+    static const int WL_MAX_OBJECTS  = 512;
     static const int WL_MAX_GLOBALS  = 16;
 
     // Outbound TX scratch per client.  Sized so that an entire batch of
@@ -83,6 +93,7 @@ namespace WaylandServer {
         ZWP_PRIMARY_DEVICE    = 29,   // (satoru)
         ZWP_PRIMARY_SOURCE    = 30,   // (satoru)
         ZWP_PRIMARY_OFFER     = 31,   // (satoru)
+        ZXDG_TOPLEVEL_DECORATION = 32,   // (satoru)
     };
 
     struct DamageRect {
@@ -117,9 +128,29 @@ namespace WaylandServer {
         uint32_t buf_offset;
         uint32_t buf_stride;
         uint32_t buf_format;     // wl_shm format code (0 = ARGB8888)
+        // the buffer keeps its own pool mapping: the protocol lets a client
+        // destroy the wl_shm_pool right after create_buffer (mesa does), so a
+        // commit-time lookup of the pool object would lose the pixels. (satoru)
+        const uint8_t* buf_base;
+        uint32_t buf_base_size;
         // for wl_surface: the buffer id attached via wl_surface.attach,
         // applied on the next commit, plus the attach hotspot offset and a
         // per-surface alpha (0..255, 255 = opaque). (satoru)
+        // the SCM_RIGHTS pass this pool/buffer holds (kurono.wl.poolfree=1):
+        // slot + the pass pin id captured at receive. buffers share the pool's
+        // token; the backing unpins after the last object naming it dies. (satoru)
+        uint32_t pin_slot, pin_pin;
+        // wl_surface.set_opaque_region: the part of an ARGB surface that is
+        // fully opaque, in buffer coords. only a single add rect with no
+        // subtract is tracked (firefox/gtk set one rect); anywhere else the
+        // premultiplied per-pixel alpha decides. (satoru)
+        int32_t  opq_x, opq_y, opq_w, opq_h;
+        bool     opq_valid;
+        // wl_region bbox + add/sub counts, snapshotted by set_opaque_region. (satoru)
+        int32_t  reg_x0, reg_y0, reg_x1, reg_y1;
+        int32_t  reg_adds, reg_subs;
+        // commit-rate census for the benchmark harness (kurono.wltrace=1). (satoru)
+        uint32_t commit_n, commit_first_ms, commit_last_ms;
         uint32_t pending_buffer_id;
         // set by wl_surface.attach, consumed by the next commit: only a commit
         // that follows an attach reads a buffer. a commit without one (gecko
@@ -213,6 +244,8 @@ namespace WaylandServer {
         int      frame_cb_tail;
         uint32_t serial_next;
         bool     fatal;          // protocol error - drop on next dispatch
+        // total wl_surface commits and their first/last ms, benchmark census. (satoru)
+        uint32_t commit_n, commit_first_ms, commit_last_ms;
 
         // input: ids of ALL wl_pointer / wl_keyboard resources this client
         // created via wl_seat.get_pointer / get_keyboard. firefox binds the

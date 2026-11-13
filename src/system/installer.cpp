@@ -9,6 +9,7 @@
 #include "../fs/fat32.h"
 #include "../linux/ext4.h"
 #include "../shell/shell.h"
+#include "installer_disk.h"   // os detection + running-disk check for the write window (satoru)
 
 extern "C" {
     extern uint8_t _binary_kurono_installer_kernel_elf_start[] __attribute__((weak));
@@ -229,8 +230,46 @@ static bool nvme_read_bytes(uint64_t byte_offset, uint32_t len, void* buf, void*
     return ok;
 }
 
+// the choke point for the legacy ext4/fat32 writers. every write they send to
+// the nvme disk must lie inside one of these byte extents (the chosen target
+// partition, the esp of that same disk, or a whole data disk that already
+// carries an ext4 superblock). with no extent set nothing is written. (satoru)
+struct WrWindow {
+    uint64_t lo[3], hi[3];
+    int n;
+};
+static WrWindow s_win = {};
+
+static bool win_add(uint64_t lo, uint64_t hi) {
+    if (s_win.n >= 3 || hi <= lo) return false;
+    s_win.lo[s_win.n] = lo;
+    s_win.hi[s_win.n] = hi;
+    s_win.n++;
+    return true;
+}
+
+// restores the previous window when a scope ends (satoru)
+struct WinScope {
+    WrWindow saved;
+    WinScope() : saved(s_win) { s_win.n = 0; }
+    ~WinScope() { s_win = saved; }
+};
+
+static bool win_allows(uint64_t off, uint32_t len) {
+    uint64_t end = off + len;
+    if (end <= off) return false;
+    for (int i = 0; i < s_win.n; i++) if (off >= s_win.lo[i] && end <= s_win.hi[i]) return true;
+    return false;
+}
+
 static bool nvme_write_bytes(uint64_t byte_offset, uint32_t len, const void* buf, void*) {
     if (!buf || len == 0) return false;
+    if (!win_allows(byte_offset, len)) {
+        SerialLogger::Log("[Installer] REFUSED write outside the chosen partition off=");
+        SerialLogger::LogHex64(byte_offset);
+        SerialLogger::Log("\r\n");
+        return false;
+    }
     uint32_t sector_size = NVMe::GetLBASize();
     if (sector_size == 0) sector_size = 512;
     uint64_t first_lba = byte_offset / sector_size;
@@ -348,10 +387,18 @@ bool Installer::MountDataDisk() {
     if (!NVMe::IsDetected()) return false;          // no nvme data disk attached
     // Ext4::Mount validates the superblock magic, so a non-ext4 / partitioned
     // disk fails cleanly here rather than mis-mounting. (satoru)
+    // the whole data disk is the allowed extent, but only once it proved to be an
+    // ext4 filesystem that starts at byte 0. (satoru)
+    {
+        uint32_t ssz = NVMe::GetLBASize() ? NVMe::GetLBASize() : 512;
+        s_win.n = 0;
+        win_add(0, NVMe::GetCapacityLBA() * (uint64_t)ssz);
+    }
     if (Ext4::Mount(ext4_read_cb, ext4_write_cb, nullptr, 0) == 0) {
         SerialLogger::Log("[persist] data disk mounted (raw ext4 @ 0)\r\n");
         return true;
     }
+    s_win.n = 0;
     SerialLogger::Log("[persist] nvme present but no ext4 superblock @ 0\r\n");
     return false;
 }
@@ -405,7 +452,11 @@ void Installer::Rescan() {
     InstallerDiskInfo* d = &disks[disk_count++];
     const int this_disk = disk_count - 1;
     d->present = true;
-    d->type = (bdev->driver[0] == 'n') ? INST_DISK_NVME : INST_DISK_SATA;
+    // the driver string is the only thing that tells the three apart here; a
+    // usb disk must not be listed as a sata one. (satoru)
+    if (bdev->driver[0] == 'n')       d->type = INST_DISK_NVME;
+    else if (bdev->driver[0] == 'u')  d->type = INST_DISK_USB;
+    else                              d->type = INST_DISK_SATA;
     s_cpy(d->name, bdev->name, sizeof(d->name));
     s_cpy(d->driver, bdev->driver, sizeof(d->driver));
     s_cpy(d->model, bdev->model, sizeof(d->model));
@@ -529,6 +580,14 @@ int Installer::FindESPPartition() {
     return -1;
 }
 
+// first ext4 partition on one disk only; the gui used to take the first ext4
+// partition of any disk, which could be another system's root. (satoru)
+int Installer::FindFirstExt4PartitionOnDisk(int disk_index) {
+    for (int i = 0; i < part_count; i++)
+        if (parts[i].present && parts[i].disk_index == disk_index && parts[i].fs_type == INST_FS_EXT4) return i;
+    return -1;
+}
+
 int Installer::FindFirstExt4Partition() {
     for (int i = 0; i < part_count; i++) if (parts[i].present && parts[i].fs_type == INST_FS_EXT4) return i;
     return -1;
@@ -609,13 +668,40 @@ void Installer::DescribeInstallPlan(int partition_index, char* out, int max_out)
     p = out_a(out, p, max_out, "  - embedded EFI + kernel payloads will be deployed during install\n");
 }
 
-int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
+int Installer::InstallToPartition(int partition_index, char* out, int max_out, bool confirm) {
     InstallerPartitionInfo* target = GetPartition(partition_index);
     if (!target || !target->present) return out_a(out, 0, max_out, "Invalid target partition index\n");
     if (target->fs_type != INST_FS_EXT4) return out_a(out, 0, max_out, "Target partition is not ext4\n");
 
     InstallerDiskInfo* disk = GetDisk(target->disk_index);
     if (!disk) return out_a(out, 0, max_out, "Target disk missing\n");
+
+    // the block callbacks above only know the first nvme controller, so any
+    // other disk would silently be written through the wrong device. (satoru)
+    if (disk->type != INST_DISK_NVME || !s_eq(disk->name, "nvme0n1"))
+        return out_a(out, 0, max_out, "This installer path can only write to the first nvme disk\n");
+    BlockDevice* tbd = BlockDev::FindByName(disk->name);
+    int tdev = -1;
+    for (int i = 0; i < BlockDev::Count(); i++) if (BlockDev::Get(i) == tbd) tdev = i;
+    InstallerDisk::DiskSafety sf;
+    if (tdev < 0 || !InstallerDisk::Safety(tdev, &sf))
+        return out_a(out, 0, max_out, "Could not read the target disk\n");
+    if (sf.running) return out_a(out, 0, max_out, "Kurono is running from this drive\n");
+    if (sf.os_mask && !confirm) {
+        int p = out_a(out, 0, max_out, sf.line);
+        p = out_a(out, p, max_out, "\nRun the command again with confirm to write to the chosen partition\n");
+        return p;
+    }
+
+    // from here on only the chosen partition, and the esp of this same disk,
+    // may be written. (satoru)
+    WinScope win_scope;
+    win_add(target->start_lba * disk->sector_size, (target->last_lba + 1) * disk->sector_size);
+    int esp_here = -1;
+    for (int i = 0; i < part_count; i++)
+        if (parts[i].present && parts[i].esp && parts[i].disk_index == target->disk_index) { esp_here = i; break; }
+    if (esp_here >= 0)
+        win_add(parts[esp_here].start_lba * disk->sector_size, (parts[esp_here].last_lba + 1) * disk->sector_size);
 
     if (Ext4::Mount(ext4_read_cb, ext4_write_cb, nullptr, target->start_lba * disk->sector_size) != 0) {
         return out_a(out, 0, max_out, "Failed to mount ext4 target\n");
@@ -716,7 +802,7 @@ int Installer::InstallToPartition(int partition_index, char* out, int max_out) {
         "  chainloader /EFI/KURONO/KEMERG.EFI\n"
         "}\n");
 
-    int esp = FindESPPartition();
+    int esp = esp_here;   // never the esp of another disk (satoru)
     char esp_note[512];
     esp_note[0] = 0;
     s_cat(esp_note, "Detected ESP: ", sizeof(esp_note));
@@ -808,8 +894,8 @@ int Installer::cmd_installer(void*, int argc, const char** argv, char* out, int 
         p = out_a(out, p, mx, "  installer parts             - list partitions\n");
         p = out_a(out, p, mx, "  installer esp               - show detected FAT32 ESP\n");
         p = out_a(out, p, mx, "  installer plan <idx>        - show install plan for partition\n");
-        p = out_a(out, p, mx, "  installer install <idx>     - install layout onto ext4 partition\n");
-        p = out_a(out, p, mx, "  installer auto              - install to first detected ext4 partition\n");
+        p = out_a(out, p, mx, "  installer install <idx> [confirm] - install layout onto ext4 partition\n");
+        p = out_a(out, p, mx, "  installer auto [confirm]    - install to first detected ext4 partition\n");
         return p;
     }
 
@@ -862,13 +948,13 @@ int Installer::cmd_installer(void*, int argc, const char** argv, char* out, int 
             InstallerPartitionInfo* pinfo = find_partition_by_name(argv[2]);
             if (pinfo) idx = pinfo->part_index;
         }
-        return InstallToPartition(idx, out, mx);
+        return InstallToPartition(idx, out, mx, argc >= 4 && s_eq(argv[3], "confirm"));
     }
     if (s_eq(argv[1], "auto")) {
         Rescan();
         int idx = FindFirstExt4Partition();
         if (idx < 0) return out_a(out, 0, mx, "No ext4 partition detected for install\n");
-        return InstallToPartition(idx, out, mx);
+        return InstallToPartition(idx, out, mx, argc >= 3 && s_eq(argv[2], "confirm"));
     }
 
     return out_a(out, 0, mx, "Unknown installer subcommand\n");

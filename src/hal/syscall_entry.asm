@@ -21,6 +21,7 @@
 [BITS 64]
 
 extern SyscallEntryX64FrameHandler       ; void (*)(InterruptFrame*) - fills rax, may switch
+extern ub_trace_sys_in, ub_trace_sys_out        ; [ubchk] hal.cpp (satoru)
 extern sched_current_task_raw            ; void* () - current task ptr, to detect a switch (satoru)
 ; the kernel stack now comes from this cpu's per-cpu block via gs (KERNEL_GS_BASE
 ; = &PerCpu) after swapgs, so two cores can syscall at once without sharing one
@@ -95,7 +96,12 @@ syscall_entry_x64:
     ; call pushes 8 -> the callee sees the abi-required rsp%16==8. (satoru)
     mov     rdi, r12
     cld
+    call    ub_trace_sys_in                     ; [ubchk] (satoru)
+    mov     rdi, r12
+    cld
     call    SyscallEntryX64FrameHandler
+    mov     rdi, r12
+    call    ub_trace_sys_out                    ; [ubchk] (satoru)
 
     ; if the task is unchanged, restore the pristine user fpu state we saved; if
     ; it switched, the new task's fpu is already live (via LoadUserFrame) - skip.

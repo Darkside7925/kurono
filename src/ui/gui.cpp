@@ -145,24 +145,14 @@ void GUI::ReinitBuffers() {
 
 void GUI::SetWallpaper(const MediaDecoder::Image& img) {
     wallpaper = img;
-    if (wallpaper_buffer) {
-        int w = Graphics::GetWidth();
-        int h = Graphics::GetHeight();
-        int pitch = Graphics::GetPitch();
-        if (w <= 0 || h <= 0 || pitch <= 0) return;
-        size_t sz = (size_t)h * (size_t)pitch;
-        memset(wallpaper_buffer, 0, sz);
-
-        uint8_t* old_fb = Graphics::GetBuffer();
-        Graphics::SetBuffer(wallpaper_buffer);
-        if (wallpaper.valid) {
-            MediaDecoder::DrawImageScaled(wallpaper, 0, 0, w, h);
-        } else {
-            Graphics::Clear(0xFF000000);
-        }
-        Graphics::SetBuffer(old_fb);
-    }
-    UpdateBackbuffer();
+    // these two full-screen buffers are only for the legacy lockscreen/cursor
+    // path; the desktop renders through Graphics' own back buffer. drop them
+    // here and let the next legacy draw rebuild them, so an autologin boot
+    // keeps 2 * h * pitch of ram (6 mb at 1024x768) for the desktop instead.
+    // (satoru)
+    if (backbuffer)       { TaskMem::UnchargeFrames(backbuffer); PMM::FreeBytes(backbuffer, buffer_size); backbuffer = nullptr; }
+    if (wallpaper_buffer) { TaskMem::UnchargeFrames(wallpaper_buffer); PMM::FreeBytes(wallpaper_buffer, buffer_size); wallpaper_buffer = nullptr; }
+    buffer_size = 0;
 }
 
 void GUI::DrawTime(int x, int y) {
@@ -201,6 +191,7 @@ void GUI::DrawTaskbar() {
 }
 
 void GUI::BlurWallpaper() {
+    if (!wallpaper_buffer) UpdateBackbuffer();   // lazy legacy buffers (satoru)
     if (!wallpaper_buffer) return;
     int w = Graphics::GetWidth();
     int h = Graphics::GetHeight();
@@ -230,6 +221,7 @@ void GUI::DrawDesktop() {
 }
 
 void GUI::DrawRegion(int x, int y, int w, int h) {
+    if (!backbuffer) UpdateBackbuffer();   // lazy legacy buffers (satoru)
     if (!backbuffer) return;
     int sw = Graphics::GetWidth();
     int sh = Graphics::GetHeight();

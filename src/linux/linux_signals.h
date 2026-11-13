@@ -145,14 +145,17 @@ public:
     static int  Alarm(int pid_idx, uint32_t seconds);
     static void TickAlarms(uint32_t now_ms);
 
+    // table is allocated on first use; public so the free helpers in the .cpp
+    // can reach it (satoru)
+    static ProcessSignalState* states;
+    static bool EnsureStateTable();
+
     // utility
     static SignalAction DefaultAction(int signo);
     static const char*  SignalName(int signo);
     static bool IsValid(int signo);
 
 private:
-    static ProcessSignalState states[256];  // matches LINUX_MAX_PROCS (satoru)
-
     // alarm tracking
     struct AlarmEntry {
         int      pid_idx;

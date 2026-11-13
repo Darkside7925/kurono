@@ -407,4 +407,27 @@ uint32_t EqDelayUs(uint8_t rd_interval) {
 
 }
 
+namespace IgpuCalc {
+
+uint32_t CursorPosVal(int x, int y) {
+    uint32_t v = 0;
+    if (x < 0) { v |= 1u << 15; x = -x; }
+    v |= (uint32_t)x & 0x7FFFu;
+    if (y < 0) { v |= 1u << 31; y = -y; }
+    v |= ((uint32_t)y & 0x7FFFu) << 16;
+    return v;
+}
+
+bool CursorLocal(int ui_scale, bool multi, int out_x, int out_y, int out_w, int out_h,
+                 int phys_w, int phys_h, int px, int py, int* lx, int* ly) {
+    if (ui_scale != 100 && !multi) return false;
+    if (out_w != phys_w || out_h != phys_h) return false;
+    if (px < out_x || px >= out_x + out_w || py < out_y || py >= out_y + out_h) return false;
+    *lx = px - out_x;
+    *ly = py - out_y;
+    return true;
+}
+
+}
+
 // end (satoru)

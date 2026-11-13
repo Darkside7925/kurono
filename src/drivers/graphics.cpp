@@ -5,12 +5,14 @@
 #include "../kernel/time.h"
 #include "../kernel/heap.h"
 #include "../kernel/pmm.h"
+#include "../kernel/vmm.h"
 #include "../kernel/panic.h"
 #include "../ui/font.h"
 #include "virtio_gpu.h"   // accelerated present path (satoru)
 #include "bga.h"          // live hardware geometry for the resize self-heal (satoru)
 #include "outputs.h"      // multi-monitor output list (satoru)
 #include "timer.h"        // Timer::GetRealMs for the scaled-present safety refresh (satoru)
+#include "cpu_detect.h"   // leaf-7 cache flush features, bounded by max_cpuid (satoru)
 #include "../kernel/taskmem.h"   // kurono.taskmem=1 frame charges (satoru)
 
 // when the virtio-gpu backend is active, fb_addr is a guest-ram resource
@@ -24,6 +26,7 @@ static bool g_present_via_virtio = false;
 // overlaps. false (the default) leaves the single-framebuffer path untouched. (satoru)
 static bool    g_multi = false;
 static uint8_t* g_virt_front = nullptr;
+static bool g_fb_is_ram = false;   // external RAM output: no WC remap (satoru)
 static size_t   g_virt_bytes = 0;
 static bool     g_multi_relayout = false;   // set by a runtime relayout, taken by the gui loop
 
@@ -120,17 +123,16 @@ static void fb_copy_nt(void* dst, const void* src, size_t size) {
     while (size > 0) { *d++ = *s++; size--; }
 }
 
-// extra page directories for fb addresses above the boot identity map.
-// each 4 kb page directory covers 1 gb (512 × 2 mb pages).
-// in practice the boot map now covers 512 gb, so this is just a last-resort
-// fallback for truly unusual mmio placements.
-static uint64_t extra_pd[4][512] __attribute__((aligned(4096)));
-static int extra_pd_count = 0;
-
 // pat was programmed in boot asm: pat1 = wc (0x01).
-// to select pat1 for a 2mb page we set pwt=1, pcd=0, pat(bit12)=0.
-// this is critical for bare-metal: wb-cached mmio writes never reach the
-// gpu memory controller on real hardware, causing a permanent black screen.
+// to select pat1: pwt=1, pcd=0 and the pat bit clear (bit 12 on a 2mb/1gb
+// entry, bit 7 on a 4kb leaf). this is critical for bare-metal: wb-cached mmio
+// writes never reach the gpu memory controller on real hardware, causing a
+// permanent black screen.
+// this used to poke the boot pd_tables/efi_hi_pdpts, which kernel_main has
+// already replaced with a pmm-owned copy in cr3 (RelocateKernelRoot), so on
+// bare metal the edits landed in dead tables and the fb stayed wb. the live
+// vmm now does the walk and can also create the mapping the old extra_pd
+// fallback used to wire into the dead boot pdpt. (satoru)
 static bool remap_fb_writecombining(uintptr_t fb_phys, size_t fb_size) {
     if (!fb_phys || !fb_size) {
         SerialLogger::Log("Graphics: WC remap skipped - no FB address\r\n");
@@ -144,86 +146,38 @@ static bool remap_fb_writecombining(uintptr_t fb_phys, size_t fb_size) {
     SerialLogger::LogHex((uint32_t)fb_size);
     SerialLogger::Log("\r\n");
 
-    uint64_t start = fb_phys & ~((uint64_t)0x1FFFFF);            // align down to 2 mb
-    uint64_t end   = (fb_phys + fb_size + 0x1FFFFF) & ~((uint64_t)0x1FFFFF); // align up
-    int pages_remapped = 0;
-    bool had_overflow = false;
+    uint64_t chunks = KernelVMM::SetIdentityWriteCombining(fb_phys, fb_size);
 
-    for (uint64_t addr = start; addr < end; addr += 0x200000) {
-        uint64_t gb_idx = addr >> 30;            // which gb  (pdpt index)
-        uint64_t pd_idx = (addr >> 21) & 0x1FF;  // which 2mb page in that pd
+    // proof on every boot: walk the LIVE root (the one in cr3) and dump the
+    // cache bits of the entry that translates the framebuffer. (satoru)
+    bool huge = false;
+    uint64_t e = KernelVMM::QueryRawEntry(fb_phys & ~(uint64_t)0xFFF, &huge);
+    SerialLogger::Log("Graphics: WC live fb entry=0x");
+    SerialLogger::LogHex((uint32_t)(e >> 32));
+    SerialLogger::LogHex((uint32_t)e);
+    SerialLogger::Log(" ps=");
+    SerialLogger::LogDec(huge ? 1 : 0);
+    SerialLogger::Log(" pwt=");
+    SerialLogger::LogDec((int)((e >> 3) & 1));
+    SerialLogger::Log(" pcd=");
+    SerialLogger::LogDec((int)((e >> 4) & 1));
+    SerialLogger::Log(" pat12=");
+    SerialLogger::LogDec((int)((e >> 12) & 1));
+    SerialLogger::Log(" pat7=");
+    SerialLogger::LogDec((int)((e >> 7) & 1));
+    SerialLogger::Log("\r\n");
 
-        uint64_t* pd = nullptr;
-
-        if (gb_idx < PD_MAP_GB) {
-            // 0..512 gb: 2 mb-page pds built by the boot asm.
-            pd = (uint64_t*)((uintptr_t)pd_tables + gb_idx * 4096);
-        } else if (gb_idx < BOOT_IDENTITY_MAP_GB) {
-            // 512 gb..2 tb: a 1 gib page in efi_hi_pdpts (pml4[1..3]). there is NO pd
-            // here (the old code indexed pd_tables out of bounds → memory corruption →
-            // black screen), so set wc on the 1 gib pdpte directly. one 1 gib page
-            // covers this whole gb, so this is idempotent across the 2 mb steps. (satoru)
-            uint64_t* he = &((uint64_t*)(uintptr_t)efi_hi_pdpts)[gb_idx - PD_MAP_GB];
-            *he &= ~((1ULL << 3) | (1ULL << 4) | (1ULL << 12));
-            *he |=  (1ULL << 3);                 // pwt = 1 → pat entry 1 = wc
-            __asm__ __volatile__("invlpg (%0)" :: "r"(addr) : "memory");
-            pages_remapped++;
-            continue;
-        } else if (gb_idx < (BOOT_IDENTITY_MAP_GB + 4) && extra_pd_count < 4) {
-            // legacy fallback path: dynamically add a page directory.
-            // build a fresh 1 gb identity-mapped pd for this gb region.
-            int epi = -1;
-            // check if we already allocated a pd for this gb_idx
-            // (re-use across 2 mb pages in the same gb)
-            // store gb_idx in entry 511 reserved field (we only need 0-511 entries)
-            for (int i = 0; i < extra_pd_count; i++) {
-                uint64_t tag = extra_pd[i][511] >> 48;
-                if (tag == gb_idx) { epi = i; break; }
-            }
-            if (epi < 0) {
-                // allocate a new extra pd
-                epi = extra_pd_count++;
-                uint64_t base_phys = gb_idx << 30;
-                for (int j = 0; j < 512; j++) {
-                    extra_pd[epi][j] = (base_phys + (uint64_t)j * 0x200000) | 0x83;
-                }
-                // tag entry 511 with gb_idx for re-use detection
-                extra_pd[epi][511] = ((extra_pd[epi][511] & 0x0000FFFFFFFFFFFF) | (gb_idx << 48));
-                // wire this pd into the pdpt
-                uint64_t* pdpt64 = (uint64_t*)(uintptr_t)pdpt;
-                pdpt64[gb_idx] = ((uint64_t)(uintptr_t)&extra_pd[epi][0]) | 0x03;
-                // full tlb flush for new mapping
-                __asm__ __volatile__("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
-                SerialLogger::Log("Graphics: Extended identity map to cover GB ");
-                SerialLogger::LogDec((int)gb_idx);
-                SerialLogger::Log("\r\n");
-            }
-            pd = extra_pd[epi];
-        } else {
-            had_overflow = true;
-            continue;
-        }
-
-        // clear pwt(3), pcd(4), pat-for-2mb(12), then set pwt → pat entry 1 = wc
-        pd[pd_idx] &= ~((1ULL << 3) | (1ULL << 4) | (1ULL << 12));
-        pd[pd_idx] |=  (1ULL << 3);              // pwt = 1
-
-        // invalidate tlb for this virtual address
-        __asm__ __volatile__("invlpg (%0)" :: "r"(addr) : "memory");
-        pages_remapped++;
+    if (chunks == 0) {
+        SerialLogger::Log("Graphics: WC remap failed (no live mapping)\r\n");
+        return false;
     }
 
     // full memory fence - ensures wc attribute is observed before any fb writes
     __asm__ __volatile__("mfence" ::: "memory");
-
-    if (had_overflow) {
-        SerialLogger::Log("Graphics: WARNING - FB region extends beyond mappable range!\r\n");
-    }
-
-    SerialLogger::Log("Graphics: FB remapped ");
-    SerialLogger::LogDec(pages_remapped);
-    SerialLogger::Log(" pages to Write-Combining (PAT1=WC)\r\n");
-    return pages_remapped > 0;
+    SerialLogger::Log("Graphics: FB remapped to Write-Combining (live tables, ");
+    SerialLogger::LogDec((uint32_t)chunks);
+    SerialLogger::Log(" x 2mb)\r\n");
+    return true;
 }
 
 uint8_t* Graphics::fb_addr = 0;
@@ -269,6 +223,22 @@ int Graphics::clip_h = 0;
 bool Graphics::clipping_enabled = false;
 Graphics::ClipSave Graphics::clip_stack[16] = {};
 int Graphics::clip_sp = 0;
+
+// damage scissor (kurono.gfx.scissor=1): while g_sc_on, the effective clip is
+// always inside (g_scx0, g_scy0)-(g_scx1, g_scy1). the region was marked
+// dirty as a whole when the pass began, so marks inside it add nothing. (satoru)
+static bool g_scissor_flag = false;
+static bool g_sc_on = false;
+// dirty list overflow: merge (default) or collapse to full screen, and the per-second counts. (satoru)
+static bool g_dirty_merge = true;
+static bool g_flip_emptyskip = true;      // kurono.flip.emptyskip=0 turns it off (satoru)
+static uint32_t g_flip_empty_skips = 0;   // undamaged gui frames not flipped, for [flipwhy] (satoru)
+static uint32_t g_dirty_overflows = 0, g_dirty_collapses = 0;
+static Graphics::PresentStats g_pst = {};   // cumulative, for the gfx oracle (satoru)
+// marks made while a scissor pass draws (see TakeScissorSelfDamage). (satoru)
+static Graphics::Rect g_scself[32];
+static int g_scself_n = 0;
+static int  g_scx0 = 0, g_scy0 = 0, g_scx1 = 0, g_scy1 = 0;
 
 Graphics::DirtyRegion Graphics::dirty_regions[Graphics::DIRTY_REGION_CAP];
 int Graphics::dirty_count = 0;
@@ -365,9 +335,14 @@ void Graphics::Init(uintptr_t addr, uint32_t width, uint32_t height, uint32_t pi
     }
     dirty_count = 0;
 
-    fb_wc_active = remap_fb_writecombining(addr, (size_t)pitch * height);
-    if (!fb_wc_active) {
-        SerialLogger::Log("Graphics: WARNING - WC remap FAILED, using wbinvd fallback (slower)\r\n");
+    if (g_fb_is_ram) {
+        fb_wc_active = false;   // ordinary ram: leave the mapping write-back (satoru)
+        SerialLogger::Log("Graphics: framebuffer is RAM, WC remap skipped\r\n");
+    } else {
+        fb_wc_active = remap_fb_writecombining(addr, (size_t)pitch * height);
+        if (!fb_wc_active) {
+            SerialLogger::Log("Graphics: WARNING - WC remap FAILED, using wbinvd fallback (slower)\r\n");
+        }
     }
     KernelPanic::UpdateFramebuffer((uint64_t)addr, pitch, width, height, bpp);
 }
@@ -392,6 +367,7 @@ void Graphics::ReinitForResolution(uintptr_t addr, uint32_t width, uint32_t heig
 // the desktop). std-vga/bga only; virtio-gpu owns its own present size. (satoru)
 bool Graphics::SyncToHardwareGeometry() {
     if (g_multi) return false;   // fb_addr is the virtual desktop, not the bga aperture (satoru)
+    if (g_fb_is_ram) return false;   // an external RAM output owns the front buffer (satoru)
     if (!BGA::available || !BGA::framebuffer) return false;
     uint32_t hw_w = BGA::width, hw_h = BGA::height, hw_pitch = BGA::pitch;
     uint8_t  hw_bpp = (uint8_t)BGA::bpp;
@@ -459,6 +435,8 @@ static uint32_t g_zc_frames = 0;
 static uint32_t g_zc_filter_state = 0;
 static Graphics::ZeroCopyHook g_zc_suspend = nullptr;
 static Graphics::ZeroCopyHook g_zc_present = nullptr;
+static Graphics::FlipPresentHook g_flip_present = nullptr;
+static Graphics::ZeroCopyHook g_flip_suspend = nullptr;
 
 bool Graphics::ZeroCopyActive() { return g_zerocopy; }
 bool Graphics::ZeroCopyTestMode() { return g_zc_test_mode != 0; }
@@ -560,9 +538,62 @@ void Graphics::ZeroCopyLeave() {
 }
 
 void Graphics::ZcSuspendIfActive() {
+    // the page flip driver scans copies of the back buffer; it has to put the
+    // original surfaces back before the buffers or the geometry change. (satoru)
+    if (g_flip_present && g_flip_suspend) {
+        g_flip_suspend();
+        MarkFullScreenDirty();
+        MarkUIDirty();
+    }
     if (!g_zerocopy) return;
     ZeroCopyLeave();
     SerialLogger::Log("Graphics: zero-copy suspended (compositor buffer change)\r\n");
+}
+
+// ---- page flip present (satoru) ----
+void Graphics::SetFlipHooks(FlipPresentHook present, ZeroCopyHook suspend) {
+    g_flip_present = present;
+    g_flip_suspend = suspend;
+    // whatever the outputs show now was written by the other path: the next
+    // frame has to be complete on every screen. (satoru)
+    MarkFullScreenDirty();
+    MarkUIDirty();
+}
+static Graphics::AuxPresentHook g_aux_present = nullptr;
+void Graphics::SetAuxPresentHook(AuxPresentHook hook) { g_aux_present = hook; }
+void Graphics::SetFramebufferIsRam(bool on) { g_fb_is_ram = on; }
+
+
+bool Graphics::FlipHooked() { return g_flip_present != nullptr; }
+uint8_t* Graphics::GetFrontBuffer() { return fb_addr; }
+
+bool Graphics::FlipUsable(char* why, int whylen) {
+    if (why && whylen > 0) why[0] = 0;
+    if (render_mode == SINGLE_BUFFER || !back_buffer || !fb_addr) { zc_copy_str(why, whylen, "no compositor back buffer"); return false; }
+    if (fb_bpp != 32) { zc_copy_str(why, whylen, "framebuffer is not 32 bpp"); return false; }
+    if (g_scale != 100) { zc_copy_str(why, whylen, "ui scale is not 100"); return false; }
+    if (g_present_via_virtio) { zc_copy_str(why, whylen, "virtio present is active"); return false; }
+    if (g_zerocopy) { zc_copy_str(why, whylen, "zero-copy (direct) is active"); return false; }
+    // filters, dim and night light no longer refuse: the flip copy applies
+    // them per output (ToneRow). (satoru)
+    for (int i = 0; i < Outputs::Total(); i++) {
+        const Output* o = Outputs::Get(i);
+        if (o && o->connected && o->swap_rb) { zc_copy_str(why, whylen, "an output needs rgb swapping"); return false; }
+    }
+    return true;
+}
+
+// hand the frame to the flip driver. true = presented (or queued for the next
+// vblank), false = the cpu present must run, with full damage because the
+// outputs' own framebuffers are stale while flipping. (satoru)
+static bool flip_try_present(const Graphics::Rect* rects, int count) {
+    if (!g_flip_present) return false;
+    if (!Graphics::FlipUsable(nullptr, 0)) {
+        SerialLogger::Log("[igpu-flip] compositor state changed (scale/filter/buffer), back to the cpu present\r\n");
+        if (g_flip_suspend) g_flip_suspend();
+        return false;
+    }
+    return g_flip_present(rects, count);
 }
 
 // qemu test hook. mode 1 runs the same machinery on a ram target and copies
@@ -605,11 +636,8 @@ bool Graphics::ZeroCopyTestStart(int mode, char* why, int whylen) {
 static int zc_flush_kind() {
     static int k = -1;
     if (k >= 0) return k;
-    uint32_t a = 0, b = 0, c = 0, d = 0;
-    __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7u), "c"(0u));
-    (void)a; (void)c; (void)d;
-    if (b & (1u << 24)) k = 2;        // clwb
-    else if (b & (1u << 23)) k = 1;   // clflushopt
+    if (CPUDetect::HasCLWB()) k = 2;        // clwb
+    else if (CPUDetect::HasCLFLUSHOPT()) k = 1;   // clflushopt
     else k = 0;                       // clflush
     return k;
 }
@@ -622,9 +650,15 @@ static inline void zc_flush_line(const uint8_t* p) {
 }
 static void zc_flush_rect(const uint8_t* base, uint32_t pitch, int x, int y, int w, int h) {
     if (!base || w <= 0 || h <= 0) return;
+    // start on the cache line that holds the first pixel: stepping 64 bytes
+    // from an unaligned start skipped the line holding the last pixels of a
+    // row whenever the rect straddles one more line than its width covers, so
+    // up to 16 pixels per row stayed in the cache and never reached the
+    // panel. (satoru)
     for (int row = 0; row < h; row++) {
-        const uint8_t* p = base + (size_t)(y + row) * pitch + (size_t)x * 4u;
-        const uint8_t* e = p + (size_t)w * 4u;
+        const uint8_t* s0 = base + (size_t)(y + row) * pitch + (size_t)x * 4u;
+        const uint8_t* e = s0 + (size_t)w * 4u;
+        const uint8_t* p = (const uint8_t*)((uintptr_t)s0 & ~(uintptr_t)63);
         for (; p < e; p += 64)
             zc_flush_line(p);
     }
@@ -825,6 +859,79 @@ void Graphics::SelfCheckWpTick() {
     }
 }
 
+// bounding box (in pixels) of every pixel two frames disagree on, so a log
+// line says which part of the screen went wrong, not just the first byte. (satoru)
+static uint32_t frame_diff_box(const uint8_t* a, const uint8_t* b, uint32_t pitch, uint32_t w, uint32_t h,
+                               int* bx0, int* by0, int* bx1, int* by1) {
+    uint32_t n = 0;
+    int x0 = (int)w, y0 = (int)h, x1 = -1, y1 = -1;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint32_t* pa = (const uint32_t*)(a + (size_t)y * pitch);
+        const uint32_t* pb = (const uint32_t*)(b + (size_t)y * pitch);
+        for (uint32_t x = 0; x < w; x++) {
+            if (pa[x] == pb[x]) continue;
+            n++;
+            if ((int)x < x0) x0 = (int)x;
+            if ((int)x > x1) x1 = (int)x;
+            if ((int)y < y0) y0 = (int)y;
+            if ((int)y > y1) y1 = (int)y;
+        }
+    }
+    *bx0 = x0; *by0 = y0; *bx1 = x1 + 1; *by1 = y1 + 1;
+    return n;
+}
+
+static int g_scis_check_frames = 0;     // kurono.gfx.scissorcheck=N (satoru)
+static bool g_scis_check_armed = false;
+static uint32_t g_scis_check_seq = 0;
+void Graphics::SetScissorCheckFrames(int n) { g_scis_check_frames = n > 0 ? n : 0; }
+
+// damage scissor: after a cpu present the scanned buffer must equal the back
+// buffer everywhere, because nothing outside the repainted damage was drawn
+// and everything inside it was presented. checked on every 4th present; a
+// mismatch names the differing box and turns the scissor off. (satoru)
+void Graphics::SelfCheckScissorTick() {
+    if (g_sc_kind != SELFCHECK_SCISSOR || g_sc_frames <= 0) return;
+    if (!g_scissor_flag) { g_sc_kind = SELFCHECK_NONE; g_sc_frames = 0; return; }
+    if ((++g_scis_check_seq & 3) != 0) return;
+    if (g_scale != 100 || g_present_via_virtio || any_tone() || fb_bpp != 32 ||
+        !fb_addr || !back_buffer || back_buffer_size < (size_t)fb_pitch * fb_height) {
+        if (!g_sc_skip_logged) {
+            SerialLogger::Log("[scissor] selfcheck skipped (scaled/filtered present), the scissor stays\r\n");
+            g_sc_skip_logged = true;
+        }
+        g_sc_kind = SELFCHECK_NONE; g_sc_frames = 0;
+        return;
+    }
+    uint32_t row_bytes = fb_width * 4u;
+    if (row_bytes > fb_pitch) row_bytes = fb_pitch;
+    uint64_t ca = frame_hash(fb_addr, fb_pitch, row_bytes, fb_height);
+    uint64_t cb = frame_hash(back_buffer, fb_pitch, row_bytes, fb_height);
+    if (ca != cb) {
+        int x0, y0, x1, y1;
+        uint32_t n = frame_diff_box(fb_addr, back_buffer, fb_pitch, row_bytes / 4u, fb_height, &x0, &y0, &x1, &y1);
+        SerialLogger::Log("[scissor] selfcheck MISMATCH ");
+        SerialLogger::LogDec((int)n);
+        SerialLogger::Log(" px in (");
+        SerialLogger::LogDec(x0); SerialLogger::Log(","); SerialLogger::LogDec(y0);
+        SerialLogger::Log(")-(");
+        SerialLogger::LogDec(x1); SerialLogger::Log(","); SerialLogger::LogDec(y1);
+        SerialLogger::Log(") after ");
+        SerialLogger::LogDec(g_sc_frames_total - g_sc_frames);
+        SerialLogger::Log(" checks, damage scissor off, one full frame\r\n");
+        g_scissor_flag = false;
+        g_sc_kind = SELFCHECK_NONE; g_sc_frames = 0;
+        MarkFullScreenDirty();
+        MarkUIDirty();
+        return;
+    }
+    if (--g_sc_frames == 0) {
+        SerialLogger::Log("[scissor] selfcheck PASS, scanned buffer == back buffer on ");
+        SerialLogger::LogDec(g_sc_frames_total);
+        SerialLogger::Log(" checked presents\r\n");
+    }
+}
+
 static volatile int g_op_kind = 0, g_op_a = 0, g_op_b = 0;
 void Graphics::RequestOutputOp(int op, int a, int b) {
     g_op_a = a; g_op_b = b; g_op_kind = op; MarkUIDirty();
@@ -1005,18 +1112,36 @@ bool Graphics::RelayoutOutputs() {
 bool Graphics::EnableMultiOutput() {
     if (g_multi) return true;
     if (!Outputs::Multi() || g_present_via_virtio) return false;
-    for (int i = 1; i < Outputs::Total(); i++) {
+    bool kld_out = false;
+    for (int i = 0; i < Outputs::Total(); i++) {
         const Output* o = Outputs::Get(i);
-        if (o && o->present && o->connected)
+        if (i > 0 && o && o->present && o->connected && !o->ram)
             remap_fb_writecombining((uintptr_t)o->phys, (size_t)o->pitch * (size_t)o->h);
+        if (o && o->kld) kld_out = true;
     }
-    Outputs::Layout(false);
+    // the kld bridge places its own output and must not have the strip layout
+    // force custom off; without a bridge output the old unconditional layout
+    // stays. (satoru)
+    if (!kld_out || !Outputs::Custom()) Outputs::Layout(false);
     if (!RelayoutOutputs()) return false;
     g_multi = true;
     SerialLogger::Log("Graphics: multi-output ENABLED, outputs=");
     SerialLogger::LogDec(Outputs::Connected());
     SerialLogger::Log("\r\n");
     return true;
+}
+
+void Graphics::LeaveMultiOutput() {
+    if (!g_multi) return;
+    ZcSuspendIfActive();
+    g_multi = false;
+    if (g_virt_front) {
+        TaskMem::UnchargeFrames(g_virt_front);
+        PMM::FreeBytes(g_virt_front, g_virt_bytes);
+        g_virt_front = nullptr;
+        g_virt_bytes = 0;
+    }
+    SerialLogger::Log("Graphics: multi-output left\r\n");
 }
 
 void Graphics::InitAdvanced() {
@@ -1179,6 +1304,11 @@ static bool g_force_full_present = false;
 void Graphics::SetForceFullPresent(bool on) { g_force_full_present = on; }
 void Graphics::SetPresentDamage(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     g_pres_x = x; g_pres_y = y; g_pres_w = w; g_pres_h = h;
+}
+bool Graphics::GetPresentDamage(uint32_t* x, uint32_t* y, uint32_t* w, uint32_t* h) {
+    if (x) *x = g_pres_x; if (y) *y = g_pres_y;
+    if (w) *w = g_pres_w; if (h) *h = g_pres_h;
+    return g_pres_w != 0 && g_pres_h != 0;
 }
 
 // push the just-swapped frame to the host gpu. called by the gui loop right
@@ -1364,6 +1494,67 @@ static inline bool any_tone() {
     return false;
 }
 
+// ---- gui loop / shell pump exclusion (satoru) ----
+static volatile uint32_t g_gui_in_frame = 0, g_pump_in_frame = 0;
+bool Graphics::PumpEnter() {
+    __atomic_store_n(&g_pump_in_frame, 1u, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_gui_in_frame, __ATOMIC_SEQ_CST)) {
+        __atomic_store_n(&g_pump_in_frame, 0u, __ATOMIC_SEQ_CST);
+        return false;
+    }
+    return true;
+}
+void Graphics::PumpLeave() { __atomic_store_n(&g_pump_in_frame, 0u, __ATOMIC_SEQ_CST); }
+void Graphics::GuiFrameEnter() {
+    __atomic_store_n(&g_gui_in_frame, 1u, __ATOMIC_SEQ_CST);
+    // a pump frame that started first finishes (it never blocks); bounded so a
+    // preempted pump cannot hold the gui. (satoru)
+    for (uint32_t i = 0; i < 200000u && __atomic_load_n(&g_pump_in_frame, __ATOMIC_SEQ_CST); i++)
+        __asm__ __volatile__("pause" ::: "memory");
+}
+void Graphics::GuiFrameLeave() { __atomic_store_n(&g_gui_in_frame, 0u, __ATOMIC_SEQ_CST); }
+
+// ---- the same tone for the page flip copy (satoru) ----
+// the flip used to refuse any filter or dim, and ControlCenter::Init restores
+// a saved brightness below 100 (or the night light) before the flip starts,
+// so on such a machine it never ran. it now applies exactly the transform the
+// cpu present applies to that output while it copies. (satoru)
+uint32_t Graphics::ToneSignature() {
+    if (!any_tone()) return 0;
+    uint32_t s = 0x9E3779B9u ^ (uint32_t)g_color_filter ^ ((uint32_t)g_high_contrast << 4) ^
+                 ((uint32_t)g_night_light << 8);
+    for (int i = 0; i < OUTPUT_MAX; i++) s = s * 31u + (uint32_t)out_dim(i);
+    return s | 1u;
+}
+bool Graphics::ToneActive(int out) {
+    return g_color_filter > 0 || g_high_contrast || g_night_light > 0 || out_dim(out) < 100;
+}
+void Graphics::ToneRow(uint32_t* dst, const uint32_t* src, int n, int out) {
+    int dim = out_dim(out), night = g_night_light;
+    // dim and night light alone act on each channel by itself: three 256
+    // entry tables give exactly apply_tone's integer results (the colour
+    // filters mix channels and keep the per-pixel path). a 70 % dim cost a
+    // drag frame several ms of per-pixel divides in the flip copy. (satoru)
+    if (g_color_filter == 0 && !g_high_contrast) {
+        static int s_dim = -1, s_night = -1;
+        static uint8_t lr[256], lg[256], lb[256];
+        if (s_dim != dim || s_night != night) {
+            for (int v = 0; v < 256; v++) {
+                uint32_t t = apply_tone(0xFF000000u | ((uint32_t)v << 16) | ((uint32_t)v << 8) | (uint32_t)v, dim, night);
+                lr[v] = (uint8_t)(t >> 16); lg[v] = (uint8_t)(t >> 8); lb[v] = (uint8_t)t;
+            }
+            s_dim = dim; s_night = night;
+        }
+        for (int i = 0; i < n; i++) {
+            uint32_t c = src[i];
+            dst[i] = (c & 0xFF000000u) | ((uint32_t)lr[(c >> 16) & 0xFF] << 16) |
+                     ((uint32_t)lg[(c >> 8) & 0xFF] << 8) | (uint32_t)lb[c & 0xFF];
+        }
+        return;
+    }
+    for (int i = 0; i < n; i++) dst[i] = apply_tone(apply_color_filter(src[i]), dim, night);
+}
+
 // internal: copy one row of dirty pixels, applying the a11y filter if active.
 // uses 16-pixel SSE-friendly inner loop with NT stores.
 static void blit_filtered_row(uint8_t* dst_row, const uint8_t* src_row, int x, int w) {
@@ -1415,6 +1606,8 @@ static void scatter_rect(const uint8_t* src, uint32_t src_pitch, int rx, int ry,
                 }
             }
         }
+        if (o->aux_present)
+            o->aux_present(x0 - o->x, y0 - o->y, x1 - x0, y1 - y0);
     }
 }
 
@@ -1563,7 +1756,30 @@ static void sc_present_diff(const uint8_t* src, uint32_t sp, int rx, int ry, int
 // present the frame. zero-copy publishes damage with clflush and skips the
 // copy entirely; the normal path is the cpu copy below plus a crc self-check
 // when wallpaper damage-only is under test. (satoru)
+extern volatile bool g_kscreen_hold;   // system/error_screen.cpp (satoru)
 void Graphics::SwapBuffers() {
+    // the blue error screen draws on the scanout: no present may cover it. (satoru)
+    if (g_kscreen_hold) return;
+    // snapshot the frame's damage before any present path clears it, for the
+    // optional aux sink (KLD display output). (satoru)
+    Rect aux_rects[DIRTY_REGION_CAP];
+    int aux_count = 0;
+    bool aux_full = full_screen_dirty;
+    if (g_aux_present && !aux_full) {
+        for (int i = 0; i < dirty_count && aux_count < DIRTY_REGION_CAP; i++) {
+            if (!dirty_regions[i].active) continue;
+            if (dirty_regions[i].w <= 0 || dirty_regions[i].h <= 0) continue;
+            aux_rects[aux_count].x = dirty_regions[i].x;
+            aux_rects[aux_count].y = dirty_regions[i].y;
+            aux_rects[aux_count].w = dirty_regions[i].w;
+            aux_rects[aux_count].h = dirty_regions[i].h;
+            aux_count++;
+        }
+    }
+    auto aux_note = [&]() {
+        if (g_aux_present)
+            g_aux_present(aux_rects, aux_count, aux_full);
+    };
     if (g_zerocopy) {
         uint32_t fstate = (uint32_t)g_color_filter | ((uint32_t)g_high_contrast << 8) |
                           ((uint32_t)g_brightness << 16) | ((uint32_t)g_night_light << 24);
@@ -1576,6 +1792,7 @@ void Graphics::SwapBuffers() {
             ZeroCopyLeave();
             SwapBuffersBody();
             SelfCheckWpTick();
+            aux_note();
             return;
         }
         Rect rr[DIRTY_REGION_CAP];
@@ -1602,14 +1819,55 @@ void Graphics::SwapBuffers() {
         ClearDirtyRegions();
         if (g_zc_present) g_zc_present();
         if (g_sc_kind == SELFCHECK_ZEROCOPY && g_sc_frames > 0) ZcSelfCheckTick();
+        aux_note();
         return;
+    }
+    if (g_flip_present && render_mode != SINGLE_BUFFER) {
+        Rect rr[DIRTY_REGION_CAP];
+        int n = 0;
+        if (!full_screen_dirty) {
+            for (int i = 0; i < dirty_count && n < DIRTY_REGION_CAP; i++) {
+                if (!dirty_regions[i].active) continue;
+                if (dirty_regions[i].w <= 0 || dirty_regions[i].h <= 0) continue;
+                rr[n].x = dirty_regions[i].x;
+                rr[n].y = dirty_regions[i].y;
+                rr[n].w = dirty_regions[i].w;
+                rr[n].h = dirty_regions[i].h;
+                n++;
+            }
+        }
+        // a gui frame that damaged nothing (the hardware cursor moved, an
+        // animation tick with no pixels): with the damage scissor on the dirty
+        // list is the whole truth, so there is nothing to copy. an empty list
+        // reached the flip hook as "no rects" = a full 16 mb slice copy at
+        // 2560x1600: 97-132 of them a second while the mouse moved on the
+        // laptop (klog240_1112b [flipwhy] no-rects=). kurono.flip.emptyskip=0
+        // keeps the old full copy. (satoru)
+        if (n == 0 && !full_screen_dirty && g_scissor_flag && g_flip_emptyskip &&
+            __atomic_load_n(&g_gui_in_frame, __ATOMIC_SEQ_CST)) {
+            g_flip_empty_skips++;
+            SetPresentDamage(0, 0, 0, 0);
+            ClearDirtyRegions();
+            aux_note();
+            return;
+        }
+        if (flip_try_present(rr, n)) {
+            SetPresentDamage(0, 0, 0, 0);
+            ClearDirtyRegions();
+            aux_note();
+            return;
+        }
+        MarkFullScreenDirty();
     }
     SwapBuffersBody();
     SelfCheckWpTick();
+    SelfCheckScissorTick();   // kurono.gfx.scissor=1 (satoru)
+    aux_note();
 }
 
 void Graphics::SwapBuffersBody() {
     if (render_mode == SINGLE_BUFFER) return;
+    g_pst.frames++;
     // the virtio present is ASYNC: it hands the frame to the host and returns
     // without waiting. this is the last safe moment to collect it - everything
     // below writes into fb_addr, which is the very buffer the host reads. the
@@ -1774,11 +2032,36 @@ void Graphics::SwapBuffersBody() {
 
         // multi-monitor always takes the per-rect path: a full-frame copy would
         // push the idle screen too, which is exactly what per-output damage avoids. (satoru)
-        if (active_rects > 0 && (g_multi || dirty_pixels < (total_pixels * 3 / 5))) {
+        // under the damage scissor the frame decides itself when it is full (a whole-screen
+        // damage rect); the list sums overlapping rects again (boxes, footprints, the
+        // moved window), which sent every drag frame down the full copy. (satoru)
+        if (active_rects > 0 && (g_multi || g_scissor_flag || dirty_pixels < (total_pixels * 3 / 5))) {
             // union box of everything we actually copy, for the virtio present
             // that follows (see SetPresentDamage). accumulated from the CLIPPED
             // rects so it can never exceed the screen. (satoru)
             int bx0 = (int)fb_width, by0 = (int)fb_height, bx1 = 0, by1 = 0;
+            // damage scissor: the list holds the same pixels many times over (pass
+            // boxes, footprints, the moved window); merge rects that overlap so each
+            // pixel is copied once. (satoru)
+            if (g_scissor_flag) {
+                for (bool again = true; again;) {
+                    again = false;
+                    for (int i = 0; i < dirty_count; i++) {
+                        if (!dirty_regions[i].active) continue;
+                        for (int j = i + 1; j < dirty_count; j++) {
+                            if (!dirty_regions[j].active) continue;
+                            DirtyRegion& a = dirty_regions[i]; DirtyRegion& b = dirty_regions[j];
+                            if (a.x >= b.x + b.w || b.x >= a.x + a.w || a.y >= b.y + b.h || b.y >= a.y + a.h) continue;
+                            int ux0 = a.x < b.x ? a.x : b.x, uy0 = a.y < b.y ? a.y : b.y;
+                            int ux1 = a.x + a.w > b.x + b.w ? a.x + a.w : b.x + b.w;
+                            int uy1 = a.y + a.h > b.y + b.h ? a.y + a.h : b.y + b.h;
+                            a.x = ux0; a.y = uy0; a.w = ux1 - ux0; a.h = uy1 - uy0;
+                            b.active = false;
+                            again = true;
+                        }
+                    }
+                }
+            }
             for (int i = 0; i < dirty_count; i++) {
                 if (!dirty_regions[i].active) continue;
                 int rx = dirty_regions[i].x;
@@ -1798,6 +2081,8 @@ void Graphics::SwapBuffersBody() {
 
                 size_t region_bytes = (size_t)rw * bytes_per_pixel;
                 size_t col_off = (size_t)rx * bytes_per_pixel;
+                g_pst.rects++;
+                g_pst.bytes += (uint64_t)region_bytes * (uint64_t)rh;
                 for (int y = ry; y < ry + rh; y++) {
                     size_t row_off = (size_t)y * fb_pitch + col_off;
                     fb_copy_nt(fb_addr + row_off, back_buffer + row_off, region_bytes);
@@ -1816,6 +2101,8 @@ void Graphics::SwapBuffersBody() {
     }
 
     // full-frame copy
+    g_pst.full_frames++;
+    g_pst.bytes += (uint64_t)bytes_per_line * fb_height;
     if (pitch_match) {
         fb_copy_nt(fb_addr, back_buffer, (size_t)fb_pitch * fb_height);
     } else {
@@ -1848,6 +2135,16 @@ void Graphics::Present(const Rect* rects, int count) {
         ClearDirtyRegions();
         if (g_zc_present) g_zc_present();
         if (g_sc_kind == SELFCHECK_ZEROCOPY && g_sc_frames > 0) ZcSelfCheckTick();
+        return;
+    }
+    if (g_flip_present) {
+        int fc = (rects && count > 0 && count <= 32) ? count : 0;
+        if (flip_try_present(fc ? rects : nullptr, fc)) {
+            ClearDirtyRegions();
+            return;
+        }
+        MarkFullScreenDirty();
+        SwapBuffers();
         return;
     }
     const uint32_t bytes_per_pixel = fb_bpp / 8;
@@ -2112,8 +2409,26 @@ void Graphics::MarkDirty(int x, int y, int w, int h) {
     if (y + h > (int)fb_height) h = (int)fb_height - y;
     if (w <= 0 || h <= 0) return;
 
+    // inside a scissor pass: remember the footprint for the next frame, whether
+    // or not it is inside this pass's box. a full list folds into its last rect. (satoru)
+    if (g_sc_on) {
+        if (g_scself_n < 32) {
+            g_scself[g_scself_n++] = Rect{ x, y, w, h };
+        } else {
+            Rect& u = g_scself[31];
+            int ux1 = u.x + u.w > x + w ? u.x + u.w : x + w, uy1 = u.y + u.h > y + h ? u.y + u.h : y + h;
+            if (x < u.x) u.x = x;
+            if (y < u.y) u.y = y;
+            u.w = ux1 - u.x; u.h = uy1 - u.y;
+        }
+    }
+
     // already collapsed to full-screen for this frame - nothing more to track. (satoru)
     if (full_screen_dirty) return;
+    // a damage scissor pass marked its whole region when it began; every
+    // FillRect inside it would otherwise fill the list and collapse the
+    // frame to a full-screen present. (satoru)
+    if (g_sc_on && x >= g_scx0 && y >= g_scy0 && x + w <= g_scx1 && y + h <= g_scy1) return;
 
     // fast path: there's still room, just record the rect. o(1) - the running
     // area sum is kept incrementally so small-rect frames stay cheap. (satoru)
@@ -2131,7 +2446,11 @@ void Graphics::MarkDirty(int x, int y, int w, int h) {
         // single full-screen damage now so the decision is deterministic, not an
         // accident of coalescing order. (satoru)
         uint64_t total = (uint64_t)fb_width * (uint64_t)fb_height;
-        if (!g_multi && total > 0 && dirty_area_total >= (total * 3 / 4)) {
+        // the damage scissor decides when a frame is full itself; this sum
+        // counts overlapping rects again (a move marks its footprints, then
+        // the passes mark their boxes) and turned every single-screen drag
+        // frame into a full repaint. (satoru)
+        if (!g_multi && !g_scissor_flag && total > 0 && dirty_area_total >= (total * 3 / 4)) {
             MarkFullScreenDirty();
         }
         return;
@@ -2142,7 +2461,52 @@ void Graphics::MarkDirty(int x, int y, int w, int h) {
     // threshold anyway), deterministically collapse the whole frame to a single
     // full-screen damage rect. this is the cheap, predictable thing to do once
     // the screen is this fragmented. (satoru)
+    // a scissor frame marks one rect per pass box plus every overlay's own
+    // footprint, so 32 can be reached on ordinary frames: the collapse made such
+    // a present (and its page flip, 16 mb at 2560x1600) full screen while only
+    // the boxes had been repainted. fold the new rect into the existing one whose
+    // bounding box grows least; collapse only when the merged damage covers most
+    // of the screen. kurono.gfx.dirtymerge=0 keeps the old collapse. (satoru)
+    g_dirty_overflows++;
+    g_pst.overflows++;
+    if (g_dirty_merge) {
+        int best = -1;
+        uint64_t best_grow = ~0ull;
+        for (int i = 0; i < dirty_count; i++) {
+            const DirtyRegion& r = dirty_regions[i];
+            if (!r.active) continue;
+            int ux0 = r.x < x ? r.x : x, uy0 = r.y < y ? r.y : y;
+            int ux1 = r.x + r.w > x + w ? r.x + r.w : x + w;
+            int uy1 = r.y + r.h > y + h ? r.y + r.h : y + h;
+            uint64_t grow = (uint64_t)(ux1 - ux0) * (uint64_t)(uy1 - uy0) - (uint64_t)r.w * (uint64_t)r.h;
+            if (grow < best_grow) { best_grow = grow; best = i; }
+        }
+        if (best >= 0) {
+            DirtyRegion& r = dirty_regions[best];
+            int ux0 = r.x < x ? r.x : x, uy0 = r.y < y ? r.y : y;
+            int ux1 = r.x + r.w > x + w ? r.x + r.w : x + w;
+            int uy1 = r.y + r.h > y + h ? r.y + r.h : y + h;
+            dirty_area_total += best_grow;
+            r.x = ux0; r.y = uy0; r.w = ux1 - ux0; r.h = uy1 - uy0;
+            uint64_t total = (uint64_t)fb_width * (uint64_t)fb_height;
+            if (!g_multi && !g_scissor_flag && total > 0 && dirty_area_total * 5 >= total * 3) MarkFullScreenDirty();
+            return;
+        }
+    }
+    g_dirty_collapses++;
+    g_pst.collapses++;
     MarkFullScreenDirty();
+}
+
+void Graphics::SetDirtyMerge(bool on) { g_dirty_merge = on; }
+void Graphics::GetPresentStats(PresentStats* out) { if (out) *out = g_pst; }
+void Graphics::SetFlipEmptySkip(bool on) { g_flip_emptyskip = on; }
+uint32_t Graphics::TakeFlipEmptySkips() { uint32_t v = g_flip_empty_skips; g_flip_empty_skips = 0; return v; }
+void Graphics::TakeDirtyOverflowStats(uint32_t* overflows, uint32_t* collapses) {
+    if (overflows) *overflows = g_dirty_overflows;
+    if (collapses) *collapses = g_dirty_collapses;
+    g_dirty_overflows = 0;
+    g_dirty_collapses = 0;
 }
 
 void Graphics::MarkFullScreenDirty() {
@@ -2181,6 +2545,92 @@ int Graphics::GetDirtyRects(Rect* out, int max) {
     return n;
 }
 
+// a full repaint asked for from inside a present (the flip selfcheck repair):
+// it survives this frame's ClearDirtyRegions and makes the next frame full,
+// re-rendered from scratch rather than copied from a back buffer. (satoru)
+static volatile bool g_full_repaint_req = false;
+void Graphics::RequestFullRepaint() { g_full_repaint_req = true; MarkUIDirty(); }
+
+// this frame's damage only (no previous-frame rects): the damage scissor
+// passes repaint exactly it. including last frame's rects would make every
+// continuous frame repaint at least what the one before it did, so the region
+// could only ever grow. (satoru)
+static bool g_scself_carry = true;   // kurono.gfx.selfcarry=0 turns the carry off (satoru)
+void Graphics::SetScissorSelfCarry(bool on) { g_scself_carry = on; }
+bool Graphics::ScissorSelfCarry() { return g_scself_carry; }
+int Graphics::TakeScissorSelfDamage(Rect* out, int max) {
+    int n = 0;
+    for (int i = 0; i < g_scself_n && out && n < max; i++) out[n++] = g_scself[i];
+    g_scself_n = 0;
+    return n;
+}
+
+int Graphics::GetFrameDamage(Rect* out, int max) {
+    if (!out || max <= 0) return 0;
+    int n = 0;
+    for (int i = 0; i < dirty_count && n < max; i++) {
+        if (!dirty_regions[i].active) continue;
+        if (dirty_regions[i].w <= 0 || dirty_regions[i].h <= 0) continue;
+        out[n].x = dirty_regions[i].x;
+        out[n].y = dirty_regions[i].y;
+        out[n].w = dirty_regions[i].w;
+        out[n].h = dirty_regions[i].h;
+        n++;
+    }
+    return n;
+}
+
+// take back exact rects marked this frame (after the same clipping MarkDirty
+// applies). false, and nothing removed, once the frame collapsed to full. (satoru)
+bool Graphics::RemoveFrameDamage(const Rect* rr, int n) {
+    if (full_screen_dirty) return false;
+    for (int k = 0; k < n; k++) {
+        int x = rr[k].x, y = rr[k].y, w = rr[k].w, h = rr[k].h;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > (int)fb_width)  w = (int)fb_width  - x;
+        if (y + h > (int)fb_height) h = (int)fb_height - y;
+        if (w <= 0 || h <= 0) continue;
+        for (int i = 0; i < dirty_count; i++) {
+            DirtyRegion& d = dirty_regions[i];
+            if (d.active && d.x == x && d.y == y && d.w == w && d.h == h) d.active = false;
+        }
+    }
+    // compact, so the freed slots take new marks instead of filling the list
+    // (a full list collapses the frame to full screen). (satoru)
+    int k = 0;
+    for (int i = 0; i < dirty_count; i++) if (dirty_regions[i].active) dirty_regions[k++] = dirty_regions[i];
+    for (int i = k; i < dirty_count; i++) dirty_regions[i].active = false;
+    dirty_count = k;
+    return true;
+}
+
+// move a w x h block of the render target by (dx, dy), overlap safe, clipped
+// to the screen at the destination. (satoru)
+void Graphics::MoveRect(int x, int y, int w, int h, int dx, int dy) {
+    if (!active_buffer || fb_bpp != 32 || w <= 0 || h <= 0) return;
+    int sx0 = x, sy0 = y, sx1 = x + w, sy1 = y + h;
+    if (sx0 + dx < 0) sx0 = -dx;
+    if (sy0 + dy < 0) sy0 = -dy;
+    if (sx1 + dx > (int)fb_width) sx1 = (int)fb_width - dx;
+    if (sy1 + dy > (int)fb_height) sy1 = (int)fb_height - dy;
+    if (sx0 < 0) sx0 = 0;
+    if (sy0 < 0) sy0 = 0;
+    if (sx1 > (int)fb_width) sx1 = (int)fb_width;
+    if (sy1 > (int)fb_height) sy1 = (int)fb_height;
+    if (sx1 <= sx0 || sy1 <= sy0) return;
+    size_t bytes = (size_t)(sx1 - sx0) * 4u;
+    if (dy > 0) {
+        for (int yy = sy1 - 1; yy >= sy0; yy--)
+            memmove(active_buffer + (size_t)(yy + dy) * fb_pitch + (size_t)(sx0 + dx) * 4u,
+                    active_buffer + (size_t)yy * fb_pitch + (size_t)sx0 * 4u, bytes);
+    } else {
+        for (int yy = sy0; yy < sy1; yy++)
+            memmove(active_buffer + (size_t)(yy + dy) * fb_pitch + (size_t)(sx0 + dx) * 4u,
+                    active_buffer + (size_t)yy * fb_pitch + (size_t)sx0 * 4u, bytes);
+    }
+}
+
 void Graphics::ClearDirtyRegions() {
     // remember this frame's damage for the next wallpaper pass. a full-screen
     // latch becomes one full rect. (satoru)
@@ -2196,6 +2646,7 @@ void Graphics::ClearDirtyRegions() {
     for (int i = 0; i < DIRTY_REGION_CAP; i++) {
         dirty_regions[i].active = false;
     }
+    if (g_full_repaint_req) { g_full_repaint_req = false; MarkFullScreenDirty(); }
 }
 
 bool Graphics::IsPointInBounds(int x, int y) {
@@ -2234,10 +2685,86 @@ void Graphics::SetClipRect(int x, int y, int w, int h) {
     clip_w = w;
     clip_h = h;
     clipping_enabled = true;
+    // the damage scissor bounds every clip, including ones set directly. (satoru)
+    if (g_sc_on) {
+        int x0 = x > g_scx0 ? x : g_scx0, y0 = y > g_scy0 ? y : g_scy0;
+        int x1 = x + w < g_scx1 ? x + w : g_scx1, y1 = y + h < g_scy1 ? y + h : g_scy1;
+        clip_x = x0; clip_y = y0;
+        clip_w = x1 > x0 ? x1 - x0 : 0;
+        clip_h = y1 > y0 ? y1 - y0 : 0;
+    }
 }
 
 void Graphics::ClearClipRect() {
     clipping_enabled = false;
+    // no clip under the damage scissor means "the scissor". (satoru)
+    if (g_sc_on) {
+        clip_x = g_scx0; clip_y = g_scy0;
+        clip_w = g_scx1 - g_scx0; clip_h = g_scy1 - g_scy0;
+        clipping_enabled = true;
+    }
+}
+
+// ── damage scissor (satoru) ──────────────────────────────────────────
+void Graphics::SetScissorEnabled(bool on) { g_scissor_flag = on; }
+
+// FontTTF's target: the buffer and the visible box (clip within screen). (satoru)
+static void font_target(uint32_t** buf, size_t* pitch_px, int* x0, int* y0, int* x1, int* y1) {
+    int W, H, vx0 = 0, vy0 = 0;
+    W = Graphics::GetWidth(); H = Graphics::GetHeight();
+    int vx1 = W, vy1 = H, cx, cy, cw, ch;
+    if (Graphics::GetClip(cx, cy, cw, ch)) {
+        if (cx > vx0) vx0 = cx;
+        if (cy > vy0) vy0 = cy;
+        if (cx + cw < vx1) vx1 = cx + cw;
+        if (cy + ch < vy1) vy1 = cy + ch;
+    }
+    *x0 = vx0; *y0 = vy0; *x1 = vx1; *y1 = vy1;
+    *buf = Graphics::GetBpp() == 32 ? (uint32_t*)Graphics::GetBuffer() : nullptr;
+    *pitch_px = (size_t)(Graphics::GetPitch() / 4u);
+}
+void Graphics::RegisterFontTarget() { FontTTF::SetTarget(font_target); }
+static bool g_scissor_debug = false;   // kurono.gfx.scissordebug=1 (satoru)
+static int g_scissor_verify = 0;       // kurono.gfx.scissorverify=N (satoru)
+void Graphics::SetScissorVerifyEvery(int n) { g_scissor_verify = n > 0 ? n : 0; }
+int Graphics::ScissorVerifyEvery() { return g_scissor_verify; }
+void Graphics::SetScissorDebug(bool on) { g_scissor_debug = on; }
+bool Graphics::ScissorDebug() { return g_scissor_debug; }
+bool Graphics::ScissorEnabled() { return g_scissor_flag; }
+
+void Graphics::SetScissor(int x, int y, int w, int h) {
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h;
+    if (x1 > (int)fb_width) x1 = (int)fb_width;
+    if (y1 > (int)fb_height) y1 = (int)fb_height;
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+    g_scx0 = x0; g_scy0 = y0; g_scx1 = x1; g_scy1 = y1;
+    g_sc_on = true;
+    if (!g_scis_check_armed && g_scis_check_frames > 0) {
+        g_scis_check_armed = true;
+        ArmSelfCheck(SELFCHECK_SCISSOR, g_scis_check_frames);
+    }
+    // a pass starts with an empty clip stack: the scissor is the whole clip. (satoru)
+    clip_sp = 0;
+    ClearClipRect();
+}
+
+void Graphics::ClearScissor() {
+    g_sc_on = false;
+    clip_sp = 0;
+    clipping_enabled = false;
+}
+
+bool Graphics::GetScissor(int& x, int& y, int& w, int& h) {
+    if (!g_sc_on) return false;
+    x = g_scx0; y = g_scy0; w = g_scx1 - g_scx0; h = g_scy1 - g_scy0;
+    return true;
+}
+
+void Graphics::ScissorBounds(int& x0, int& y0, int& x1, int& y1) {
+    if (g_sc_on) { x0 = g_scx0; y0 = g_scy0; x1 = g_scx1; y1 = g_scy1; return; }
+    x0 = 0; y0 = 0; x1 = (int)fb_width; y1 = (int)fb_height;
 }
 
 void Graphics::PushClipRect(int x, int y, int w, int h) {
@@ -2270,7 +2797,7 @@ void Graphics::PushClipRect(int x, int y, int w, int h) {
 }
 
 void Graphics::PopClipRect() {
-    if (clip_sp <= 0) { clipping_enabled = false; return; }
+    if (clip_sp <= 0) { ClearClipRect(); return; }
     clip_sp--;
     if (clip_sp < 16) {
         clip_x = clip_stack[clip_sp].x;
@@ -2353,6 +2880,9 @@ void Graphics::FillRectRounded(int x, int y, int w, int h, int r, uint32_t color
             }
         }
     }
+    // under the damage scissor only what was drawn is damage: the whole rect
+    // outside the pass would force another pass for pixels never touched. (satoru)
+    if (g_sc_on) { ClipRect(x, y, w, h); if (w <= 0 || h <= 0) return; }
     MarkDirty(x, y, w, h);
 }
 
@@ -2373,6 +2903,13 @@ void Graphics::FillRectAlpha(int x, int y, int w, int h, uint8_t a, uint32_t col
     if (y < 0) { h += y; y = 0; }
     if (x + w > (int)fb_width)  w = (int)fb_width  - x;
     if (y + h > (int)fb_height) h = (int)fb_height - y;
+    // the damage scissor still bounds it (only while a pass runs). (satoru)
+    if (g_sc_on) {
+        if (x < g_scx0) { w -= g_scx0 - x; x = g_scx0; }
+        if (y < g_scy0) { h -= g_scy0 - y; y = g_scy0; }
+        if (x + w > g_scx1) w = g_scx1 - x;
+        if (y + h > g_scy1) h = g_scy1 - y;
+    }
     if (w <= 0 || h <= 0 || !active_buffer) return;
 
     if (fb_bpp == 32) {
@@ -2466,6 +3003,9 @@ void Graphics::BlurRect(int x, int y, int w, int h, int radius) {
 }
 
 int Graphics::GetWidth() { return fb_width; }
+int Graphics::GetPhysicalWidth() { return (int)g_ph_w; }
+int Graphics::GetPhysicalHeight() { return (int)g_ph_h; }
+uint32_t Graphics::GetPhysicalPitch() { return g_ph_pitch; }
 int Graphics::GetHeight() { return fb_height; }
 uint32_t Graphics::GetPitch() { return fb_pitch; }
 uint8_t Graphics::GetBpp() { return fb_bpp; }

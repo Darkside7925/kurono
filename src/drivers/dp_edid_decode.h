@@ -102,6 +102,18 @@ void FormatTiming(const Timing& t, char* buf, int max);
 // the timing with the highest refresh at the preferred timing's resolution,
 // -1 if there is no preferred timing (satoru)
 int MaxRefreshAtPreferred(const Edid& e);
+// the timing at the preferred timing's resolution whose refresh (millihertz)
+// is closest to target_mhz. ties go to the lower pixel clock. falls back to
+// the preferred timing when that resolution has no other entry. (satoru)
+int PickTimingAtResolution(const Edid& e, uint32_t target_mhz);
+// distinct integer refresh rates the edid offers at the preferred timing's
+// resolution, ascending. returns the count written (<= max). (satoru)
+int RatesAtPreferred(const Edid& e, uint32_t* hz, int max);
+// the largest progressive timing (by active area) that fits(t, ctx)
+// accepts; ties go to the refresh closest to target_mhz, then the lower
+// pixel clock. -1 when none fits. used when the preferred timing is more
+// than the link or cdclk can carry. (satoru)
+int PickFittingTiming(const Edid& e, uint32_t target_mhz, bool (*fits)(const Timing& t, void* ctx), void* ctx);
 // format the decoded edid as lines (satoru)
 void FormatEdid(const Edid& e, LineFn fn, void* ctx);
 

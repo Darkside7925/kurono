@@ -19,6 +19,7 @@
 #include "../../system/user_mgmt.h"
 #include "../../system/system_update.h"
 #include "../../kernel/types.h"
+#include "../../ui/night_light.h"   // r3 night light shims (satoru)
 #include "../../kernel/heap.h"
 #define private public   // the pmm counters are read-only inputs here, never changed (satoru)
 #include "../../kernel/pmm.h"
@@ -229,6 +230,21 @@ void action(const char* name, int32_t ival, uint32_t uval, const char* arg,
     rpc(r, &rep, nullptr);
 }
 
+// the same, but the service's verdict comes back (account changes). (satoru)
+bool action_ok(const char* name, uint32_t uval, const char* key, const char* val) {
+    KssReq r = req_init(KSS_ACTION);
+    req_str(r.action, sizeof(r.action), name);
+    req_str(r.key, sizeof(r.key), key);
+    req_str(r.val, sizeof(r.val), val);
+    r.uval = uval;
+    KssReply rep;
+    rep.ok = 0;
+    if (!rpc(r, &rep, nullptr)) return false;
+    volatile char* v = (volatile char*)r.val;
+    for (unsigned i = 0; i < sizeof(r.val); i++) v[i] = 0;
+    return rep.ok != 0;
+}
+
 // ---- drawing target for the kit (satoru)
 kui::raster::Target* g_target = nullptr;
 kui::Window* g_kwin = nullptr;
@@ -280,6 +296,23 @@ bool Refresh() {
     PMM::usable_frames = (uint64_t)info_ll("mem.total", 0) / PAGE_SIZE;
     PMM::used_frames = (uint64_t)info_ll("mem.used", 0) / PAGE_SIZE;
     PMM::total_frames = PMM::usable_frames;
+    // the account list the users page reads straight from UserManager::users. (satoru)
+    {
+        int un = info_int("user.count", 0);
+        if (un > UserManager::MAX_USERS) un = UserManager::MAX_USERS;
+        for (int i = 0; i < un; i++) {
+            User& u = UserManager::users[i];
+            memset(&u, 0, sizeof(u));
+            char k[32];
+            snprintf(k, sizeof(k), "user.%d.name", i);
+            strncpy(u.username, info_str(k, ""), sizeof(u.username) - 1);
+            snprintf(k, sizeof(k), "user.%d.display", i);
+            strncpy(u.display_name, info_str(k, ""), sizeof(u.display_name) - 1);
+            snprintf(k, sizeof(k), "user.%d.admin", i);
+            u.is_admin = info_int(k, 0) != 0;
+        }
+        UserManager::user_count = un;
+    }
     g_loaded = true;
     FontTTF::SetActive(UIStyle::Modern());
     return true;
@@ -357,6 +390,8 @@ int Graphics::GetWidth() { return info_int("screen.w", 1024); }
 int Graphics::GetHeight() { return info_int("screen.h", 768); }
 uint32_t Graphics::GetPitch() { return g_target ? (uint32_t)(g_target->pitch * 4) : 0; }
 uint8_t Graphics::GetBpp() { return 32; }
+// ring 3 has no damage scissor: the kit clamps to the screen as before (satoru)
+void Graphics::ScissorBounds(int& x0, int& y0, int& x1, int& y1) { x0 = 0; y0 = 0; x1 = GetWidth(); y1 = GetHeight(); }
 int Graphics::GetUIScale() { return cfg_int("display.ui_scale", info_int("screen.scale", 100)); }
 void Graphics::RequestUIScale(int pct) { action("ui.scale", pct, 0, nullptr, nullptr, nullptr); }
 bool Graphics::MultiActive() { return info_int("out.active", 0) != 0; }
@@ -433,6 +468,11 @@ struct SettingsHandler : kui::AppHandler {
         g_focused = true;
     }
     void OnFrame(kui::Window& w, kui::Canvas& c, uint32_t) override {
+        // live pages (wi-fi scan list, devices, battery) read the info
+        // snapshot: renew it at most every 1.5 s while frames are drawn. (satoru)
+        static uint32_t last_refresh = 0;
+        uint32_t now = kui::NowMs();
+        if (now - last_refresh > 1500u) { last_refresh = now; SettingsBridge::Refresh(); }
         kui::Canvas::Impl* ci = c.impl();
         target_reset(&ci->t);
         kui::bk::SetTextTarget(&ci->t);
@@ -594,6 +634,49 @@ const uint8_t* Desktop::BuiltinWallpaperRGBA(int idx, int* w, int* h) {
 void DesktopEnvironment::ReloadFromConfig() { action("deskenv.reload", 0, 0, nullptr, nullptr, nullptr); }
 void Taskbar::ReloadFromConfig() { action("taskbar.reload", 0, 0, nullptr, nullptr, nullptr); }
 
+// ---- battery (satoru)
+#include "../../system/battery.h"
+void Battery::Tick() {}
+bool Battery::Present() { return info_int("bat.present", 0) != 0; }
+int Battery::Percent() { return info_int("bat.pct", -1); }
+Battery::State Battery::GetState() { return (Battery::State)info_int("bat.state", 0); }
+int Battery::Minutes() { return info_int("bat.min", -1); }
+void Battery::Describe(char* out, int cap) { strncpy(out, info_str("bat.desc", ""), (size_t)cap - 1); out[cap - 1] = 0; }
+
+// ---- kernel slots + recovery restart (satoru)
+#include "../../system/kernel_slots.h"
+#include "../../system/recovery_restart.h"
+void KernelSlots::Describe(char* out, int cap) {
+    strncpy(out, info_str("boot.slots", ""), (size_t)cap - 1);
+    out[cap - 1] = 0;
+}
+void RecoveryRestart() { action("boot.recovery", 0, 0, nullptr, nullptr, nullptr); }
+
+// ---- audio devices (satoru)
+#include "../../system/audio_devices.h"
+int AudioDevices::OutputCount() { return info_int("audio.out.count", 0); }
+bool AudioDevices::OutputInfo(int i, char* name, int ncap, char* label, int lcap, bool* active, bool* ready) {
+    if (i < 0 || i >= OutputCount()) return false;
+    char k[40];
+    snprintf(k, sizeof(k), "audio.out.%d.name", i);
+    if (name) { strncpy(name, info_str(k, ""), (size_t)ncap - 1); name[ncap - 1] = 0; }
+    snprintf(k, sizeof(k), "audio.out.%d.label", i);
+    if (label) { strncpy(label, info_str(k, ""), (size_t)lcap - 1); label[lcap - 1] = 0; }
+    snprintf(k, sizeof(k), "audio.out.%d.active", i);
+    if (active) *active = info_int(k, 0) != 0;
+    snprintf(k, sizeof(k), "audio.out.%d.ready", i);
+    if (ready) *ready = info_int(k, 0) != 0;
+    return true;
+}
+bool AudioDevices::SelectOutput(const char* name) {
+    bool ok = action_ok("audio.output", 0, name, nullptr);
+    SettingsBridge::Refresh();
+    return ok;
+}
+// the service remembers the level when the slider commit arrives. (satoru)
+void AudioDevices::RememberVolume(int v) { action("audio.volume", v, 1, nullptr, nullptr, nullptr); }
+int AudioDevices::InputCount() { return 0; }
+
 // ---- audio and power (satoru)
 int AudioMixer::GetMasterVolume() { return info_int("audio.volume", 75); }
 void AudioMixer::SetMasterVolume(int v) { action("audio.volume", v, 0, nullptr, nullptr, nullptr); }
@@ -601,6 +684,16 @@ void AudioMixer::SetMasterMute(bool m) { action("audio.mute", 0, m ? 1 : 0, null
 bool Audio::IsAvailable() { return info_int("audio.available", 0) != 0; }
 void Audio::SetMasterVolume(int v) { (void)v; }
 void Audio::SetMuted(bool m) { (void)m; }
+// recovery actions go to the kernel through the settings service; the page
+// reads the result back from the info snapshot it already refreshes. (satoru)
+bool AudioServer::RestartActive() {
+    action("audio.restart", 0, 0, nullptr, nullptr, nullptr);
+    return info_int("audio.restart_ok", 0) != 0;
+}
+int AudioServer::StopAllStreams() {
+    action("audio.stop", 0, 0, nullptr, nullptr, nullptr);
+    return info_int("audio.stopped", 0);
+}
 AudioServer::ServerStatus AudioServer::GetStatus() {
     static ServerStatus st;
     static char backend[32];
@@ -724,6 +817,32 @@ uint32_t DisplayManager::GetWidth() { return (uint32_t)info_int("display.w", inf
 uint32_t DisplayManager::GetHeight() { return (uint32_t)info_int("display.h", info_int("screen.h", 768)); }
 uint8_t DisplayManager::GetBrightness() { return (uint8_t)info_int("display.brightness", 255); }
 VSyncMode DisplayManager::GetVSync() { return info_int("display.vsync", 1) ? VSYNC_ON : VSYNC_OFF; }
+// night light: the kernel owns the tint and the schedule; the page reads the
+// saved keys and asks the service to change them. (satoru)
+namespace NightLight {
+static void put_int(const char* key, int v) { char b[16]; snprintf(b, sizeof(b), "%d", v); cfg_put(key, b); }
+bool IsOn() { return cfg_int("display.night_light", 0) != 0; }
+void Set(bool on) { action("nightlight.on", 0, on ? 1 : 0, nullptr, nullptr, nullptr); put_int("display.night_light", on ? 1 : 0); }
+void Toggle() { Set(!IsOn()); }
+int  Strength() { return cfg_int("display.night_strength", 70); }
+void SetStrength(int pct) {
+    if (pct < 10) pct = 10;
+    if (pct > 100) pct = 100;
+    action("nightlight.strength", pct, 0, nullptr, nullptr, nullptr);
+    put_int("display.night_strength", pct);
+}
+bool ScheduleOn() { return cfg_int("display.night_schedule", 0) != 0; }
+void SetSchedule(bool on) {
+    action("nightlight.schedule", 0, on ? 1 : 0, nullptr, nullptr, nullptr);
+    put_int("display.night_schedule", on ? 1 : 0);
+    SettingsBridge::Refresh();   // the schedule may have switched the tint (satoru)
+}
+int  FromMinutes() { return cfg_int("display.night_from", 20 * 60); }
+int  ToMinutes() { return cfg_int("display.night_to", 7 * 60); }
+void Init() {}
+void Tick() {}
+}  // namespace NightLight
+
 void DisplayManager::SetBrightness(uint8_t level) { action("display.brightness", (level * 100) / 255, 0, nullptr, nullptr, nullptr); }
 void DisplayManager::SetVSync(VSyncMode mode) { action("display.vsync", 0, mode != VSYNC_OFF ? 1 : 0, nullptr, nullptr, nullptr); }
 bool DisplayManager::SetResolution(uint32_t w, uint32_t h, uint8_t) {
@@ -800,6 +919,31 @@ void FramePacer::SetMode(uint32_t hz) {
     action("framepacer.mode", 0, hz, nullptr, nullptr, nullptr);
 }
 void FramePacer::ReloadConfig() {}
+void FramePacer::OutputsChanged() {}
+
+// ---- external monitor refresh (the service owns the real hardware switch) ----
+int IntelModeset::Rates(uint32_t* hz, int max) {
+    if (!hz || max <= 0) return 0;
+    const char* v = info_str("dp.rates", "");
+    int n = 0;
+    while (*v && n < max) {
+        char* end = nullptr;
+        long r = strtol(v, &end, 10);
+        if (end == v) break;
+        hz[n++] = (uint32_t)r;
+        v = end;
+        while (*v == ',' || *v == ' ') v++;
+    }
+    return n;
+}
+uint32_t IntelModeset::CurrentHz() { return (uint32_t)info_int("dp.hz", 0); }
+uint32_t IntelModeset::CurrentMilliHz() { return CurrentHz() * 1000u; }
+int IntelModeset::SetRate(char*, int, uint32_t hz) {
+    action("intelmodeset.rate", 0, hz, nullptr, nullptr, nullptr);
+    return 1;
+}
+int IntelModeset::ApplySavedRate() { return 0; }
+void IntelModeset::PublishOutputRate() {}
 
 // ---- network (satoru)
 const char* WiFi::WirelessChipName() { return info_str("wifi.chip", ""); }
@@ -813,9 +957,8 @@ const char* WiFi::StateString() {
 int WiFi::GetNetworkCount() { return info_int("wifi.count", 0); }
 WiFiNetwork* WiFi::GetNetworks() {
     static WiFiNetwork n[NET_MAX_WIFI_NETS];
-    static bool done = false;
-    if (!done) {
-        done = true;
+    // rebuilt on every call: the scan list changes while the page is open. (satoru)
+    {
         int c = info_int("wifi.count", 0);
         if (c > NET_MAX_WIFI_NETS) c = NET_MAX_WIFI_NETS;
         for (int i = 0; i < c; i++) {
@@ -847,6 +990,21 @@ int WiFi::SignalBars() { return info_int("wifi.bars", 0); }
 bool WiFi::AutoReconnect() { return info_int("wifi.autoreconnect", 1) != 0; }
 void WiFi::SetAutoReconnect(bool) {}
 void WiFi::Tick() {}
+int WiFi::SavedCount() { return info_int("wifi.saved.count", 0); }
+bool WiFi::SavedAt(int i, char* ssid, int cap, int* security, bool* autojoin) {
+    if (i < 0 || i >= SavedCount() || cap < 1) return false;
+    char k[40];
+    snprintf(k, sizeof(k), "wifi.saved.%d.ssid", i);
+    strncpy(ssid, info_str(k, ""), (size_t)cap - 1); ssid[cap - 1] = 0;
+    snprintf(k, sizeof(k), "wifi.saved.%d.sec", i);
+    if (security) *security = info_int(k, 3);
+    snprintf(k, sizeof(k), "wifi.saved.%d.auto", i);
+    if (autojoin) *autojoin = info_int(k, 1) != 0;
+    return true;
+}
+bool WiFi::Forget(const char* ssid) { return action_ok("wifi.forget", 0, ssid, nullptr); }
+bool WiFi::SetAutoJoin(const char* ssid, bool on) { return action_ok("wifi.autojoin", on ? 1 : 0, ssid, nullptr); }
+bool WiFi::KldBridge() { return info_int("wifi.kld", 0) != 0; }
 int Network::GetInterfaceCount() { return info_int("net.count", 0); }
 NetworkInterface* Network::GetInterfaces() {
     static NetworkInterface n[NET_MAX_INTERFACES];
@@ -1017,6 +1175,44 @@ bool UserManager::AddUser(const char* username, const char* password) {
     action("user.add", 0, 0, nullptr, username, password);
     return true;
 }
+bool UserManager::SetAdmin(const char* username, bool admin) {
+    return action_ok("user.setadmin", admin ? 1 : 0, username, nullptr);
+}
+// old and new travel as "old\nnew" in one value field (128 bytes). (satoru)
+bool UserManager::ChangePassword(const char* username, const char* old_pw, const char* new_pw) {
+    char v[KSS_VAL_MAX];
+    int p = 0;
+    for (int i = 0; old_pw && old_pw[i] && p < KSS_VAL_MAX - 2; i++) v[p++] = old_pw[i];
+    v[p++] = '\n';
+    for (int i = 0; new_pw && new_pw[i] && p < KSS_VAL_MAX - 1; i++) v[p++] = new_pw[i];
+    v[p] = 0;
+    bool ok = action_ok("user.passwd", 0, username, v);
+    volatile char* w = v;
+    for (int i = 0; i < KSS_VAL_MAX; i++) w[i] = 0;
+    return ok;
+}
+// the ksa switch: the kernel service runs the real KEN::SetKsaEnabled; the service's reason
+// text comes back through err. the password rides in the value field and is wiped. (satoru)
+bool KEN::IsKsaEnabled() { return info_int("ksa.on", 1) != 0; }
+bool KEN::SetKsaEnabled(int, bool enable, const char* password, char* err, int err_max) {
+    KssReq r = req_init(KSS_ACTION);
+    req_str(r.action, sizeof(r.action), "ksa.set");
+    req_str(r.val, sizeof(r.val), password);
+    r.uval = enable ? 1 : 0;
+    KssReply rep;
+    rep.ok = 0;
+    rep.why[0] = 0;
+    bool got = rpc(r, &rep, nullptr);
+    volatile char* v = (volatile char*)r.val;
+    for (unsigned i = 0; i < sizeof(r.val); i++) v[i] = 0;
+    if (err && err_max > 0) {
+        const char* m = got ? rep.why : "the settings service did not answer";
+        int i = 0;
+        while (m[i] && i < err_max - 1) { err[i] = m[i]; i++; }
+        err[i] = 0;
+    }
+    return got && rep.ok != 0;
+}
 int KEN::GetCurrentSession() { return info_int("ken.level", -1) >= 0 ? 0 : -1; }
 KENLevel KEN::GetLevel(int) { return (KENLevel)info_int("ken.level", 0); }
 KENSession* KEN::GetSession(int i) {
@@ -1108,6 +1304,11 @@ uint32_t VMHost::ConfiguredRamMb() {
     int v = cfg_int("linux.ram_mb", info_int("vm.ram_mb", 1024));
     return v > 0 ? (uint32_t)v : 1024;
 }
+int VMHost::DistroInstalled(int i) {
+    char k[24];
+    snprintf(k, sizeof(k), "vmd.%d.inst", i);
+    return info_int(k, i == 0 ? 0 : 1);
+}
 bool VMHost::RamFromCmdline() { return info_int("vm.ram_cmdline", 0) != 0; }
 void VMHost::AutostartAtBoot() {}
 void VMHost::GetInfo(Info* out) {
@@ -1115,7 +1316,7 @@ void VMHost::GetInfo(Info* out) {
     static char err[64];
     memset(out, 0, sizeof(*out));
     out->state = info_int("vm.live_state", info_int("vm.state", 0));
-    out->distro = info_int("vm.distro", 0);
+    out->distro = info_int("vm.live_distro", info_int("vm.distro", 0));
     out->uptime_ms = (uint32_t)info_int("vm.uptime", 0);
     out->ram_mb = (uint32_t)info_int("vm.live_ram", 0);
     out->agent = info_int("vm.agent_live", 0) != 0;
@@ -1150,7 +1351,14 @@ int DiskLog::GuestImage(const char*, uint64_t*, uint64_t* bytes) {
 int AlpineTerminal::Open() { action("open.alpine", 0, 0, nullptr, nullptr, nullptr); return 0; }
 
 // ---- scheduler and kernel-only helpers (satoru)
-bool IntelModeset::GetOutput(uint64_t*, int*, int*, uint32_t*) { return false; }
+bool IntelModeset::GetOutput(uint64_t* phys, int* w, int* h, uint32_t* pitch) {
+    if (!info_int("dp.lit", 0)) return false;
+    if (phys) *phys = (uint64_t)info_ll("dp.phys", 0);
+    if (w) *w = info_int("dp.w", 0);
+    if (h) *h = info_int("dp.h", 0);
+    if (pitch) *pitch = (uint32_t)info_int("dp.pitch", 0);
+    return true;
+}
 bool Scheduler::IsPreemptiveKernelSchedulerActive() { return false; }
 Process* Scheduler::SpawnKernelProcess(const char*, KernelProcessEntry, ProcessPriorityTier, uint32_t, uint32_t) { return nullptr; }
 void Scheduler::SleepMs(uint32_t) {}

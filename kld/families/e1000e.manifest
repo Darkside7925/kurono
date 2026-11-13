@@ -1,0 +1,11 @@
+# e1000e family properties, read by kld/tools/gen_match_table.sh and baked
+# into the generated match table the kernel embeds. (satoru)
+name e1000e
+# intel 82574L and friends put their registers in the same 4 KiB BAR page as
+# the MSI-X table? no: e1000e uses MSI, and its BAR has no MSI-X table, so the
+# dangerous-page exception does not apply to this family.
+needs_msix_table_page 0
+# a nic may take a pci INTx line through the broker when MSI is unavailable
+# (kurono.kld.nomsi=1 in the C5.3 test; real machines without an msi cap).
+line_irq pci
+# end (satoru)

@@ -2,6 +2,7 @@
 #include "../kernel/memacct.h"   // real meminfo (satoru)
 #include "../fs/kvfs.h"
 #include "../drivers/serial.h"
+#include "../drivers/cpu_detect.h"   // real /system/proc/cpuinfo (satoru)
 #include "../kernel/buddy.h"
 #include "../kernel/slab.h"
 #include "../kernel/hrtimer.h"
@@ -26,6 +27,52 @@ void mk(const char* path, uint16_t mode) {
 
 void wr(const char* path, const char* contents) {
     KVFS::WriteString(path, contents);
+}
+
+int rl_put(char* b, int p, int mx, const char* s) {
+    while (*s && p < mx - 1) b[p++] = *s++;
+    b[p] = 0;
+    return p;
+}
+int rl_dec(char* b, int p, int mx, int v) {
+    char t[12]; int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v > 0) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n && p < mx - 1) b[p++] = t[--n];
+    b[p] = 0;
+    return p;
+}
+
+// /system/proc/cpuinfo used to be a hardcoded modern-intel snapshot, so an
+// app reading the sysroot saw sse4/avx on a core2. render the detected cpu. (satoru)
+int format_cpuinfo(char* b, int mx) {
+    CpuInfo cpu = CPUDetect::GetInfo();
+    const char* vendor = cpu.vendor_string[0] ? cpu.vendor_string : "unknown";
+    const char* brand = cpu.brand_string[0] ? cpu.brand_string : vendor;
+    int mhz = cpu.frequency.base_mhz > 0 ? cpu.frequency.base_mhz : 1000;
+    int cache_kb = 0;
+    for (int i = 0; i < cpu.num_caches; i++)
+        if (cpu.cache[i].size_kb > cache_kb) cache_kb = cpu.cache[i].size_kb;
+    int p = 0;
+    p = rl_put(b, p, mx, "processor\t: 0\nvendor_id\t: "); p = rl_put(b, p, mx, vendor);
+    p = rl_put(b, p, mx, "\ncpu family\t: "); p = rl_dec(b, p, mx, cpu.family);
+    p = rl_put(b, p, mx, "\nmodel\t\t: "); p = rl_dec(b, p, mx, cpu.model);
+    p = rl_put(b, p, mx, "\nmodel name\t: "); p = rl_put(b, p, mx, brand);
+    p = rl_put(b, p, mx, "\nstepping\t: "); p = rl_dec(b, p, mx, cpu.stepping);
+    p = rl_put(b, p, mx, "\ncpu MHz\t\t: "); p = rl_dec(b, p, mx, mhz);
+    p = rl_put(b, p, mx, ".000\ncache size\t: "); p = rl_dec(b, p, mx, cache_kb);
+    p = rl_put(b, p, mx, " KB\nphysical id\t: 0\nsiblings\t: ");
+    p = rl_dec(b, p, mx, cpu.topology.logical_cores > 0 ? cpu.topology.logical_cores : 1);
+    p = rl_put(b, p, mx, "\ncpu cores\t: ");
+    p = rl_dec(b, p, mx, cpu.topology.physical_cores > 0 ? cpu.topology.physical_cores : 1);
+    p = rl_put(b, p, mx, "\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: ");
+    p = rl_dec(b, p, mx, (int)cpu.max_cpuid);
+    p = rl_put(b, p, mx, "\nwp\t\t: yes\nflags\t\t:");
+    p += CPUDetect::FormatFeatureFlags(b + p, mx - 1 - p);
+    p = rl_put(b, p, mx, "\nbugs\t\t:\nbogomips\t: ");
+    p = rl_dec(b, p, mx, mhz * 2);
+    p = rl_put(b, p, mx, ".00\naddress sizes\t: 39 bits physical, 48 bits virtual\n\n");
+    return p;
 }
 
 }  // namespace
@@ -296,36 +343,11 @@ void Init() {
         MemAcct::FormatMeminfo(mi, (int)sizeof(mi));
         wr("/system/proc/meminfo", mi);
     }
-    wr("/system/proc/cpuinfo",
-       "processor\t: 0\n"
-       "vendor_id\t: GenuineIntel\n"
-       "cpu family\t: 6\n"
-       "model\t\t: 142\n"
-       "model name\t: Intel(R) Kurono CPU @ 2.40GHz\n"
-       "stepping\t: 10\n"
-       "cpu MHz\t\t: 2400.000\n"
-       "cache size\t: 6144 KB\n"
-       "physical id\t: 0\n"
-       "siblings\t: 1\n"
-       "core id\t\t: 0\n"
-       "cpu cores\t: 1\n"
-       "fpu\t\t: yes\n"
-       "fpu_exception\t: yes\n"
-       "cpuid level\t: 22\n"
-       "wp\t\t: yes\n"
-       "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge "
-                  "mca cmov pat pse36 clflush mmx fxsr sse sse2 ht "
-                  "syscall nx pdpe1gb rdtscp lm constant_tsc rep_good "
-                  "nopl xtopology nonstop_tsc pni pclmulqdq monitor "
-                  "ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt tsc_deadline_timer "
-                  "aes xsave avx f16c rdrand hypervisor lahf_lm abm "
-                  "3dnowprefetch fsgsbase bmi1 avx2 smep bmi2 erms "
-                  "invpcid rdseed adx smap clflushopt sha_ni xsaveopt "
-                  "xsavec xgetbv1 arat\n"
-       "bugs\t\t:\n"
-       "bogomips\t: 4800.00\n"
-       "address sizes\t: 39 bits physical, 48 bits virtual\n"
-       "\n");
+    {
+        static char ci[2048];
+        format_cpuinfo(ci, (int)sizeof(ci));
+        wr("/system/proc/cpuinfo", ci);
+    }
     wr("/system/proc/mounts",
        "/dev/root / ext4 rw,relatime 0 0\n"
        "kvfs /system kvfs rw,relatime 0 0\n"

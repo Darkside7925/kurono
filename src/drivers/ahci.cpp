@@ -4,6 +4,7 @@
 #include "nvme.h"   // shared bare-metal write guard switch (satoru)
 #include "../kernel/pci.h"
 #include "../kernel/pmm.h"
+#include "../kernel/kimage.h"   // direct-map buffers -> phys (satoru)
 #include "../kernel/kdf.h"
 #include "../hal/hal.h"
 
@@ -390,8 +391,8 @@ bool Ahci::PortReset(int port) {
 
     // pmm hands back identity-mapped low memory, so the virtual address is the
     // physical address the hba needs. (satoru)
-    uint64_t clb = (uint64_t)(uintptr_t)pm.clist;
-    uint64_t fb  = (uint64_t)(uintptr_t)pm.fis;
+    uint64_t clb = KernelPhysOf(pm.clist);
+    uint64_t fb  = KernelPhysOf(pm.fis);
     pwr(port, P_CLB,  (uint32_t)(clb & 0xFFFFFFFF));
     pwr(port, P_CLBU, (uint32_t)(clb >> 32));
     pwr(port, P_FB,   (uint32_t)(fb & 0xFFFFFFFF));
@@ -399,7 +400,7 @@ bool Ahci::PortReset(int port) {
 
     // point each command header at its own table. (satoru)
     for (int slot = 0; slot < 32; slot++) {
-        uint64_t ct = (uint64_t)(uintptr_t)&pm.ctbl[slot];
+        uint64_t ct = KernelPhysOf(&pm.ctbl[slot]);
         pm.clist[slot].prdtl = 1;
         pm.clist[slot].ctba  = (uint32_t)(ct & 0xFFFFFFFF);
         pm.clist[slot].ctbau = (uint32_t)(ct >> 32);
@@ -465,7 +466,7 @@ bool Ahci::PortIdentify(int port, AhciPortInfo* info) {
     CmdTable* tbl = &pm.ctbl[slot];
     for (uint32_t i = 0; i < sizeof(CmdTable); i++) ((uint8_t*)tbl)[i] = 0;
 
-    uint64_t bph = (uint64_t)(uintptr_t)pm.bounce;
+    uint64_t bph = KernelPhysOf(pm.bounce);
     tbl->prdt[0].dba  = (uint32_t)(bph & 0xFFFFFFFF);
     tbl->prdt[0].dbau = (uint32_t)(bph >> 32);
     tbl->prdt[0].dbc  = 512 - 1;                      // identify returns 512 bytes
@@ -557,7 +558,7 @@ bool ahci_xfer(int port, uint64_t lba, uint32_t count, void* buf, bool write) {
         CmdTable* tbl = &pm.ctbl[slot];
         for (uint32_t i = 0; i < 64 + 16 + 48; i++) ((uint8_t*)tbl)[i] = 0;
 
-        uint64_t bph = (uint64_t)(uintptr_t)pm.bounce;
+        uint64_t bph = KernelPhysOf(pm.bounce);
         tbl->prdt[0].dba  = (uint32_t)(bph & 0xFFFFFFFF);
         tbl->prdt[0].dbau = (uint32_t)(bph >> 32);
         tbl->prdt[0].dbc  = bytes - 1;

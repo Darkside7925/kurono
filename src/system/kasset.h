@@ -27,6 +27,11 @@ namespace KAsset {
     // make sure a vfs path holds the asset, loading it on first use; the file
     // references the loaded buffer (no copy). false if unavailable. (satoru)
     bool EnsureVfsFile(const char* path, const char* name83, const uint8_t* emb_start, const uint8_t* emb_end);
+    // delivery: if the payload is linked but missing from the KURONO root, write
+    // it there (8.3 name) so a later pack-only build finds it. keeps the default
+    // image self-contained and lets a fresh stick become pack-complete after one
+    // boot. a pack-only build has no linked copy and is a no-op here. (satoru)
+    bool Deliver(const char* name83, const uint8_t* emb_start, const uint8_t* emb_end);
 }
 
 // end (satoru)

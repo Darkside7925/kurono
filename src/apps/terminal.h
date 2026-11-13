@@ -30,6 +30,11 @@ public:
     static void Init();
     // kurono.termsh=1: every window starts busybox sh on its pty and reaches kernel built-ins through /dev/kexec (satoru)
     static void SetShellMode(bool on);
+    // /system/kbin/<name> for every KuronoShell built-in: a #!/bin/sh stub that runs it
+    // through /dev/kexec on the caller's terminal. the ring-3 terminal puts /system/kbin
+    // last on its PATH, so its busybox shell has claude, firefox, kpkg, vm... and a real
+    // program of the same name still wins. idempotent. (satoru)
+    static void InstallCommandStubs();
     static int  Open();          // ring 3 when kurono.r3apps asks for it, else the kernel build (satoru)
     static int  OpenKernel();    // the in-kernel build only (scripts, fallback) (satoru)
     static void Tick();

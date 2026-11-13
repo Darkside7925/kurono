@@ -145,17 +145,77 @@ public:
     static void PopClipRect();
     // the active clip, false when clipping is off (kui reads it so its own rasterizer stays inside) (satoru)
     static bool GetClip(int& x, int& y, int& w, int& h) { x = clip_x; y = clip_y; w = clip_w; h = clip_h; return clipping_enabled; }
+
+    // ── damage scissor (kurono.gfx.scissor=1, default off) ─────────────
+    // the compositor draws a frame as one or more passes, each repainting one
+    // damaged region from the wallpaper up. while a pass runs every draw is
+    // confined to its region: the Graphics primitives through the clip (Set,
+    // Clear, Push and Pop all stay inside it) and the direct-buffer drawers
+    // (MDraw, WMMotion, the settings kit, the wayland blit, the wallpaper)
+    // through ScissorBounds(). nothing outside the damage is ever touched, so
+    // the back buffer outside it always equals what was presented. (satoru)
+    static void SetScissorEnabled(bool on);
+    // hand FontTTF the compositor's text target (visible-box culling). (satoru)
+    static void RegisterFontTarget();
+    static bool ScissorEnabled();
+    static void SetScissor(int x, int y, int w, int h);
+    static void ClearScissor();
+    static bool GetScissor(int& x, int& y, int& w, int& h);   // false when no pass runs
+    // the box a direct-buffer drawer may write: the scissor, else the screen. (satoru)
+    static void ScissorBounds(int& x0, int& y0, int& x1, int& y1);
+    // kurono.gfx.scissorcheck=N: compare scanned and back buffer on N cpu
+    // presents after the first pass (0 = never); a mismatch turns it off. (satoru)
+    static void SetScissorCheckFrames(int n);
+    // kurono.gfx.scissordebug=1: log the region of every pass after the first
+    // (the first 64), to find what keeps adding damage during a frame. (satoru)
+    static void SetScissorDebug(bool on);
+    // kurono.gfx.scissorverify=N: every Nth frame compare the partial frame
+    // with a full repaint from scratch (test rig, costs a full frame). (satoru)
+    static void SetScissorVerifyEvery(int n);
+    static int ScissorVerifyEvery();
+    static bool ScissorDebug();
     static void SetBlendMode(BlendMode mode);
     static BlendMode GetBlendMode();
     
     // dirty region tracking for optimized rendering
     static void MarkDirty(int x, int y, int w, int h);
+    // one full-screen damage rect until the next present (public for the
+    // damage scissor passes and the flip repair). (satoru)
+    static void MarkFullScreenDirty();
     static void ClearDirtyRegions();
     static void RenderDirtyRegions();
     // active damage rects of the frame in progress. code that repaints cached
     // content (the desktop wallpaper) uses this to touch only the damaged
     // rows; 0 means nothing changed and the caller can skip entirely. (satoru)
     static int GetDirtyRects(Rect* out, int max);
+    // the damage marked for the frame in progress only, without the previous
+    // frame's rects (the damage scissor passes). (satoru)
+    static int GetFrameDamage(Rect* out, int max);
+    // rects marked from inside damage scissor passes (overlays that mark their own
+    // footprint while drawing: menus, the control center, toasts) since the last
+    // call; the call resets the list. RenderScissored repaints the previous frame's
+    // set so a closed or moved overlay does not stay on screen. (satoru)
+    static int TakeScissorSelfDamage(Rect* out, int max);
+    static void SetScissorSelfCarry(bool on);
+    static bool ScissorSelfCarry();
+    // dirty list overflow (more than DIRTY_REGION_CAP rects in one frame): merge into the
+    // cheapest existing rect (default) or collapse to full screen (kurono.gfx.dirtymerge=0);
+    // the counts since the last call, for the [flipwhy] line. (satoru)
+    static void SetDirtyMerge(bool on);
+    // gui frames with an empty damage list skip the page flip (default on). (satoru)
+    static void SetFlipEmptySkip(bool on);
+    static uint32_t TakeFlipEmptySkips();
+    static void TakeDirtyOverflowStats(uint32_t* overflows, uint32_t* collapses);
+    // cumulative present counters (never reset), read by the gfx oracle: frames
+    // presented by the cpu path, damage rects, bytes copied to the front buffer,
+    // frames that copied the whole screen, dirty list overflows. (satoru)
+    struct PresentStats { uint64_t frames, rects, bytes, full_frames, overflows, collapses; };
+    static void GetPresentStats(PresentStats* out);
+    // take back rects marked this frame (exact match after clipping); false
+    // when the frame is already full screen. (satoru)
+    static bool RemoveFrameDamage(const Rect* rr, int n);
+    // move a block of the render target by (dx, dy), overlap safe. (satoru)
+    static void MoveRect(int x, int y, int w, int h, int dx, int dy);
 
     // ── wallpaper damage-only (kurono.wpdamage=1, default off) ─────────
     // the desktop asks whether it may repaint only the damaged rows of its
@@ -171,7 +231,7 @@ public:
     // missed pixels (wallpaper damage-only) or the scanout alias mapped the
     // wrong memory (zero-copy); the feature is disabled and a log line names
     // the first differing offset. (satoru)
-    enum SelfCheckKind { SELFCHECK_NONE = 0, SELFCHECK_WPDAMAGE = 1, SELFCHECK_ZEROCOPY = 2 };
+    enum SelfCheckKind { SELFCHECK_NONE = 0, SELFCHECK_WPDAMAGE = 1, SELFCHECK_ZEROCOPY = 2, SELFCHECK_SCISSOR = 3 };
     static void ArmSelfCheck(int kind, int frames);
     static int  SelfCheckFramesLeft();
 
@@ -204,6 +264,56 @@ public:
     static bool ZeroCopyTestStart(int mode, char* why, int whylen);
     static bool ZeroCopyTestMode();
 
+    // ── page flip present (kurono.igpu.flip=1, default off) ────────────
+    // the compositor keeps rendering into its own back buffer exactly like
+    // the cpu path; the driver copies the damage into the idle one of two
+    // scanout buffers per pipe and flips PLANE_SURF at vblank. nothing is ever
+    // drawn into memory the display is scanning. the present hook gets the
+    // frame's damage (count 0 = full frame) and returns false to hand this
+    // frame back to the cpu present. the suspend hook runs before any buffer
+    // or geometry change and must put the original surfaces back. (satoru)
+    typedef bool (*FlipPresentHook)(const Rect* rects, int count);
+    static void SetFlipHooks(FlipPresentHook present, ZeroCopyHook suspend);
+    // one optional damage sink called at the end of every present path with the
+    // frame's dirty-rect list (count 0 / full = whole frame). the KLD display
+    // bridge uses it; null (the default) changes nothing. (satoru)
+    typedef void (*AuxPresentHook)(const Rect* rects, int count, bool full);
+    static void SetAuxPresentHook(AuxPresentHook hook);
+    // the KLD primary output scans ordinary PMM RAM: never WC-remap it or
+    // read the BGA geometry (which would switch us back to the native fb).
+    static void SetFramebufferIsRam(bool on);
+    // leave the multi-output virtual desktop (KLD detach restore).
+    static void LeaveMultiOutput();
+    // the clipped physical damage union published by the last present.
+    static bool GetPresentDamage(uint32_t* x, uint32_t* y, uint32_t* w, uint32_t* h);
+    static bool FlipHooked();
+    // why the compositor state cannot feed a flip right now (scale, filters,
+    // single buffer, virtio). false + reason, or true. (satoru)
+    static bool FlipUsable(char* why, int whylen);
+    // the per-output tone (filter, contrast, dim, night light) the cpu present
+    // applies, for a flip copy: a signature that changes with any of it (0 =
+    // none anywhere), whether output `out` has any, and one converted row. (satoru)
+    static uint32_t ToneSignature();
+    static bool ToneActive(int out);
+    static void ToneRow(uint32_t* dst, const uint32_t* src, int n, int out);
+    // make the next frame a full re-render (safe to call inside a present). (satoru)
+    static void RequestFullRepaint();
+    // the gui loop and the shell pump (which renders from inside other
+    // threads' syscalls when the gui looks starved) never draw at the same
+    // time: the gui brackets its frame, the pump asks first and backs off
+    // while the gui is in a frame. (satoru)
+    static void GuiFrameEnter();
+    static void GuiFrameLeave();
+    static bool PumpEnter();
+    static void PumpLeave();
+    // restore/release the accelerated present paths (page flip, zero-copy)
+    // before a scanout buffer or geometry change. a live pipe relight calls
+    // this; the flip driver re-arms itself once the layout settles. (satoru)
+    static void ZcSuspendIfActive();
+    // the framebuffer the cpu present writes (gop, bga or the multi output
+    // virtual desktop). the qemu flip test uses it as its stand-in scanout. (satoru)
+    static uint8_t* GetFrontBuffer();
+
     // ── Global UI dirty signal (damage-gated compositor) ───────────────
     // Distinct from MarkDirty(): MarkDirty feeds the partial-swap region
     // list *during* a render; this counter answers "does the GUI loop need
@@ -222,6 +332,9 @@ public:
 
     // information
     static int GetWidth();
+    static int GetPhysicalWidth();
+    static int GetPhysicalHeight();
+    static uint32_t GetPhysicalPitch();
     static int GetHeight();
     static uint32_t GetPitch();
     static uint8_t GetBpp();
@@ -323,16 +436,15 @@ private:
     static bool full_screen_dirty;
     // running sum of damaged pixels this frame (64-bit, overflow-safe) (satoru)
     static uint64_t dirty_area_total;
-    static void MarkFullScreenDirty();
     
     // internal helpers
     static void SwapBuffersBody();          // cpu present path, wrapped by SwapBuffers (satoru)
     static void SelfCheckWpTick();          // scanned vs back crc after a cpu present (satoru)
+    static void SelfCheckScissorTick();     // the same for the damage scissor (satoru)
     static void ZcFlushRects(const Rect* rects, int count);   // clflush damage (satoru)
     static void ZcMirrorRects(const Rect* rects, int count);  // keep the check reference in sync (satoru)
     static void ZcCopyRects(const Rect* rects, int count);    // qemu test present (satoru)
     static bool ZcSelfCheckTick();          // scanned vs back crc on a zero-copy frame (satoru)
-    static void ZcSuspendIfActive();        // leave before a buffer/geometry change (satoru)
     static bool IsPointInBounds(int x, int y);
     static void ClipRect(int& x, int& y, int& w, int& h);
     static void DrawPixelUnsafe(int x, int y, uint32_t color);

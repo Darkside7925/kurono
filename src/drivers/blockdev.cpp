@@ -6,6 +6,7 @@
 
 BlockDevice BlockDev::s_devs[BLOCKDEV_MAX] = {};
 int         BlockDev::s_count = 0;
+uint32_t    BlockDev::s_gen = 1;
 // statistics side table (BlockDevice layout is unchanged). (satoru)
 static uint64_t s_reads[BLOCKDEV_MAX], s_sectors_read[BLOCKDEV_MAX];
 static uint64_t s_writes[BLOCKDEV_MAX], s_sectors_written[BLOCKDEV_MAX];
@@ -45,6 +46,23 @@ void bd_str(char* out, int* pos, int max, const char* s) {
 void BlockDev::Init() {
     for (int i = 0; i < BLOCKDEV_MAX; i++) s_devs[i].present = false;
     s_count = 0;
+    s_gen++;
+}
+
+uint32_t BlockDev::Generation() { return s_gen; }
+
+void BlockDev::Unregister(const char* name) {
+    for (int i = 0; i < s_count; i++) {
+        if (!s_devs[i].present || !bd_eq(s_devs[i].name, name)) continue;
+        for (int j = i; j + 1 < s_count; j++) s_devs[j] = s_devs[j + 1];
+        s_count--;
+        s_devs[s_count].present = false;
+        s_gen++;
+        SerialLogger::Log("[blockdev] -");
+        SerialLogger::Log(name);
+        SerialLogger::Log("\r\n");
+        return;
+    }
 }
 
 int BlockDev::Register(const BlockDevice& dev) {
@@ -60,6 +78,7 @@ int BlockDev::Register(const BlockDevice& dev) {
     int idx = s_count++;
     s_devs[idx] = dev;
     s_devs[idx].present = true;
+    s_gen++;
 
     SerialLogger::Log("[blockdev] +");
     SerialLogger::LogDec(idx);

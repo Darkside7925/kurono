@@ -25,15 +25,15 @@ single chokepoint `KEN::RunEscalationGate()`. That applies the active auth polic
 factor, a KSA hypervisor-prompt factor, or both. Satisfy every required factor and KEN grants
 the elevated context.
 
-`ken` is the sudo-style entry point. `ken <cmd> [args]` runs any registered command elevated,
-not just KEN's own subcommands (`cmd_ken` in `src/shell/shell.cpp`). The `sudo` spelling and the
-superseded `supr` spelling are kept as hidden aliases, callable but not listed by `help`.
+`amdo` is the privilege command. It was called `ken` until part 3 of the major update. `amdo <cmd> [args]`
+runs any registered command elevated, not just KEN's own subcommands (`cmd_ken` in `src/shell/shell.cpp`).
+`ken`, `sudo` and `supr` are hidden aliases: they still work, but `help` does not list them.
 
 - it looks the target up in the shell registry, then wraps the call in `KEN::SudoBegin()`,
   runs as root, and calls `KEN::SudoEnd()`. `SudoBegin` collects the credential or approval
   through the interactive KSA modal per the active policy and temporarily raises the session's
   user to root. `SudoEnd` restores the pre-elevation user.
-- `ken whoami` reports the elevated identity, `root`
+- `amdo whoami` (or `ken whoami`) reports the elevated identity, `root`
 - a Guest role is denied with "permission denied, your role may not escalate"
 - shell builtins that mutate shell state (`cd`, `clear`, `history`, `linux`, `cmd`, `exit`) are
   refused with a "run it directly" message, since elevating them is meaningless
@@ -44,7 +44,8 @@ superseded `supr` spelling are kept as hidden aliases, callable but not listed b
 The policy (`KENAuthPolicy`) tracks two independent factors, `passwd_enabled` and
 `kvault_enabled`, managed through the `ken policy` command. The KSA factor renders its prompt
 inside a hypervisor-isolated context the main OS can't map into, and can't forge an answer into.
-See `KSA.md` for the design, the loophole-prevention rules and the runtime self-test.
+See `KSA.md` for the design, the loophole-prevention rules and the runtime self-test. The
+KSA switch in Settings turns the whole prompt off and on; `KSA.md` covers it.
 
 Every policy change, prompt, approval, denial, override and risk warning is audited to
 `/kurono/var/log/security.log`, even when KSA is off.
@@ -58,7 +59,7 @@ VMX, the KSA factor upgrades from an EPT-isolated context to a real nested VM au
 ## Files
 
 - `src/security/ksa.{cpp,h}` the KSA auth factor
-- `src/shell/shell.cpp` the `ken` command: `policy`, `passwd`, `selftest`, the `ken <cmd>`
-  reroute, and `ken whoami`
+- `src/shell/shell.cpp` the `amdo` command (`ken` and `sudo` are aliases): `policy`, `passwd`,
+  `selftest`, the `amdo <cmd>` reroute, and `whoami`
 - `src/security/ken.cpp` `SudoBegin` / `SudoEnd` elevate-and-restore helpers
 - `src/system/user_mgmt.cpp` where user credentials are stored and checked

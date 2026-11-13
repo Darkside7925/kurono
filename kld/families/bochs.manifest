@@ -1,0 +1,11 @@
+# bochs family properties, read by kld/tools/gen_match_table.sh and baked
+# into the generated match table the kernel embeds. (satoru)
+name bochs
+# qemu's bochs-display has no MSI-X table. (satoru)
+needs_msix_table_page 0
+# the bochs driver uses the BAR2 mmio window for the dispi registers; no
+# legacy VGA port ops are needed. (satoru)
+legacy_vga 0
+# this family drives a display adapter through the kld bridge. (satoru)
+display 1
+# end (satoru)

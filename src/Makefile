@@ -119,10 +119,15 @@ endif
 # init via xkbcommon, which needs the xkeyboard-config data the firefox tar
 # omits; without it gdk g_error()s and gecko aborts. embedded ustar tree,
 # unpacked to kvfs + pointed at by XKB_CONFIG_ROOT at firefox launch. (satoru)
+# the five firefox runtime assets below (xkb, fonts, nss libs, icu, pixbuf) stay
+# linked by default until the firefox install path delivers them to the KURONO
+# partition; KURONO_PACK_FFRT=1 builds them as pack files only. (satoru)
 XKB_TAR_BIN  = $(SRC)/assets_xkb.tar
 XKB_TAR_OBJ  = $(BUILD)/kurono_xkb.o
 ifneq ($(wildcard $(XKB_TAR_BIN)),)
+ifneq ($(KURONO_PACK_FFRT),1)
 MEDIA_OBJS   += $(XKB_TAR_OBJ)
+endif
 endif
 
 # ─── DejaVu fonts data (embedded via objcopy) ──────────────────────────────
@@ -133,7 +138,9 @@ endif
 FONTS_TAR_BIN = $(SRC)/assets_fonts.tar
 FONTS_TAR_OBJ = $(BUILD)/kurono_fonts.o
 ifneq ($(wildcard $(FONTS_TAR_BIN)),)
+ifneq ($(KURONO_PACK_FFRT),1)
 MEDIA_OBJS   += $(FONTS_TAR_OBJ)
+endif
 endif
 
 # ─── NSS runtime libs (embedded via objcopy) ────────────────────────────────
@@ -145,7 +152,9 @@ endif
 NSSLIBS_TAR_BIN = $(SRC)/assets_nsslibs.tar
 NSSLIBS_TAR_OBJ = $(BUILD)/kurono_nsslibs.o
 ifneq ($(wildcard $(NSSLIBS_TAR_BIN)),)
+ifneq ($(KURONO_PACK_FFRT),1)
 MEDIA_OBJS   += $(NSSLIBS_TAR_OBJ)
+endif
 endif
 
 
@@ -156,7 +165,35 @@ endif
 ICU_DAT_BIN = $(SRC)/assets/icu/icudt78l.dat
 ICU_DAT_OBJ = $(BUILD)/kurono_icudt.o
 ifneq ($(wildcard $(ICU_DAT_BIN)),)
+ifneq ($(KURONO_PACK_FFRT),1)
 MEDIA_OBJS  += $(ICU_DAT_OBJ)
+endif
+endif
+
+# ─── KLD firmware (optional, default off) ──────────────────────────────────
+# fetch_firmware.sh puts the manifest's blobs in kld/firmware/ (gitignored).
+# KURONO_KLD_FW=1 embeds them as a ustar that the kernel unpacks to
+# /system/lib/firmware at boot; default builds and EFI cmdlines are untouched.
+KLD_FW_DIR = $(abspath $(SRC)/../kld/firmware)
+KLD_FW_TAR = $(BUILD)/kld_firmware.tar
+KLD_FW_OBJ = $(BUILD)/kurono_kld_fw.o
+ifeq ($(KURONO_KLD_FW),1)
+ifneq ($(wildcard $(KLD_FW_DIR)/*),)
+MEDIA_OBJS += $(KLD_FW_OBJ)
+endif
+endif
+
+# ─── KLD firmware (optional, default off) ──────────────────────────────────
+# fetch_firmware.sh puts the manifest's blobs in kld/firmware/ (gitignored).
+# KURONO_KLD_FW=1 embeds them as a ustar that the kernel unpacks to
+# /system/lib/firmware at boot; default builds and EFI cmdlines are untouched.
+KLD_FW_DIR = $(abspath $(SRC)/../kld/firmware)
+KLD_FW_TAR = $(BUILD)/kld_firmware.tar
+KLD_FW_OBJ = $(BUILD)/kurono_kld_fw.o
+ifeq ($(KURONO_KLD_FW),1)
+ifneq ($(wildcard $(KLD_FW_DIR)/*),)
+MEDIA_OBJS += $(KLD_FW_OBJ)
+endif
 endif
 
 # ─── gdk-pixbuf 2.42 (embedded via objcopy) ───────────────────────────────
@@ -166,7 +203,9 @@ endif
 PIXBUF_BIN = $(SRC)/assets/gdk-pixbuf/libgdk_pixbuf-2.0.so.0
 PIXBUF_OBJ = $(BUILD)/kurono_pixbuf.o
 ifneq ($(wildcard $(PIXBUF_BIN)),)
+ifneq ($(KURONO_PACK_FFRT),1)
 MEDIA_OBJS += $(PIXBUF_OBJ)
+endif
 endif
 
 # ─── Inter UI typeface (embedded via objcopy) ─────────────────────────────
@@ -188,6 +227,11 @@ MEDIA_OBJS    += $(MONO_OBJ)
 ICONS_BIN      = $(SRC)/assets/icons/modern_icons.bin
 ICONS_OBJ      = $(BUILD)/modern_icons.o
 MEDIA_OBJS    += $(ICONS_OBJ)
+# compiled xkb keymaps for wayland clients, one per settings layout
+# (tools/keymaps/gen_keymaps.py). weak symbols: absent means us only. (satoru)
+KEYMAPS_BIN    = $(SRC)/assets/keymaps/keymaps.bin
+KEYMAPS_OBJ    = $(BUILD)/keymaps.o
+MEDIA_OBJS    += $(KEYMAPS_OBJ)
 
 # ─── User programs (test ELF64 binaries embedded into the kernel) ───────
 USERPROGS_DIR     = $(SRC)/userprogs
@@ -210,14 +254,44 @@ WLSHM_OBJ         = $(BUILD)/userprogs/wl_shm_test_user_embed.o
 # pthreads smoke test (proves CLONE_THREAD + futex) (satoru)
 PTHREAD_ELF       = $(USERPROGS_DIR)/pthread_test.elf
 PTHREAD_OBJ       = $(BUILD)/userprogs/pthread_test_user_embed.o
+# L2 mmap hole reuse test (musl-static, built from source). (satoru)
+MMAPREUSE_SRC     = $(USERPROGS_DIR)/mmap_reuse_test.c
+MMAPREUSE_ELF     = $(BUILD)/userprogs/mmap_reuse_test.elf
+MMAPREUSE_OBJ     = $(BUILD)/userprogs/mmap_reuse_test_user_embed.o
 # signal-delivery self-test (proves rt_sigaction/procmask/sigreturn + kill). built
 # from source with musl-gcc (unlike the prebuilt .elf blobs) then embedded. (satoru)
 MUSLCC            = musl-gcc
 SIGNAL_SRC        = $(USERPROGS_DIR)/signal_test.c
 SIGNAL_ELF        = $(BUILD)/userprogs/signal_test.elf
+# interruptible-sleep self-test: nanosleep/usleep/clock_nanosleep timing +
+# SIGALRM EINTR/rem/ignore + EINVAL, also from 3 pthreads at once. (satoru)
+SLEEPTEST_SRC     = $(USERPROGS_DIR)/sleeptest.c
+SLEEPTEST_ELF     = $(BUILD)/userprogs/sleeptest.elf
+SLEEPTEST_OBJ     = $(BUILD)/userprogs/sleeptest_user_embed.o
+# close-on-exec + unix socket table self-test, `fdtest` (satoru)
+FDTEST_SRC        = $(USERPROGS_DIR)/fdtest.c
+FDTEST_ELF        = $(BUILD)/userprogs/fdtest.elf
+FDTEST_OBJ        = $(BUILD)/userprogs/fdtest_user_embed.o
 IRQLAT_SRC        = $(USERPROGS_DIR)/irqlat.c
 IRQLAT_ELF        = $(BUILD)/userprogs/irqlat.elf
 IRQLAT_OBJ        = $(BUILD)/userprogs/irqlat_user_embed.o
+# cpu-bound scaling probe across cores (kurono.smpscale) (satoru)
+SMPSCALE_SRC      = $(USERPROGS_DIR)/smpscale.c
+SMPSCALE_ELF      = $(BUILD)/userprogs/smpscale.elf
+SMPSCALE_OBJ      = $(BUILD)/userprogs/smpscale_user_embed.o
+# posix_spawn of a static elf64 repro (kurono.spawntest=1) (satoru)
+SPAWNTEST_SRC     = $(USERPROGS_DIR)/spawntest.c
+SPAWNTEST_ELF     = $(BUILD)/userprogs/spawntest.elf
+SPAWNTEST_OBJ     = $(BUILD)/userprogs/spawntest_user_embed.o
+AUDIOD_SRC        = $(USERPROGS_DIR)/audiod.c
+AUDIOD_ELF        = $(BUILD)/userprogs/audiod.elf
+AUDIOD_OBJ        = $(BUILD)/userprogs/audiod_user_embed.o
+# /system/bin/kaudio: writes audio restart/stop/status to /dev/kaudio (satoru)
+KAUDIO_SRC        = $(USERPROGS_DIR)/kaudio.c
+KAUDIO_ELF        = $(BUILD)/userprogs/kaudio.elf
+KAUDIO_OBJ        = $(BUILD)/userprogs/kaudio_user_embed.o
+PULSETEST_SRC     = $(USERPROGS_DIR)/pulsetest.c
+PULSETEST_LIB     = $(BUILD)/userprogs/pulsetest_lib.o
 # kld phase-c network a/b instrument (kurono.kld.bench=1) (satoru)
 KLDBENCH_SRC      = $(USERPROGS_DIR)/kldnetbench.c
 KLDBENCH_ELF      = $(BUILD)/userprogs/kldnetbench.elf
@@ -243,12 +317,25 @@ CHURN_OBJ         = $(BUILD)/userprogs/churn_user_embed.o
 KSHTEST_SRC       = $(USERPROGS_DIR)/kshtest.c
 KSHTEST_ELF       = $(BUILD)/userprogs/kshtest.elf
 KSHTEST_OBJ       = $(BUILD)/userprogs/kshtest_user_embed.o
+# ksh-run: the linux-side client for /dev/kshell, so claude's bash reaches
+# ksys/kdrv/kinit/audio and the rest of the kurono shell. (satoru)
+KSHRUN_SRC        = $(USERPROGS_DIR)/kshrun.c
+KSHRUN_ELF        = $(BUILD)/userprogs/kshrun.elf
+KSHRUN_OBJ        = $(BUILD)/userprogs/kshrun_user_embed.o
 # third-party linux binary smoke test (kurono.bbtest=1). a prebuilt static
 # busybox: the point is that we did NOT compile it, so it exercises the kls
 # syscall surface the way a real recovery tool would. (satoru)
 BBOX_ELF          = $(USERPROGS_DIR)/busybox.elf
 # optional: the blob is not committed, so a fresh clone links without it (satoru)
 BBOX_OBJ          = $(if $(wildcard $(BBOX_ELF)),$(BUILD)/userprogs/busybox_user_embed.o,)
+# a real static bash for claude's bash tool. optional prebuilt blob like
+# busybox; without it claude_host lays its busybox-sh shim named bash. (satoru)
+BASH_ELF          = $(USERPROGS_DIR)/bash.elf
+BASH_OBJ          = $(if $(wildcard $(BASH_ELF)),$(BUILD)/userprogs/bash_user_embed.o,)
+# a static musl git (local clone/status/diff/commit; no https transport). also
+# an optional prebuilt blob so a clone without it still builds. (satoru)
+GIT_ELF           = $(USERPROGS_DIR)/git.elf
+GIT_OBJ           = $(if $(wildcard $(GIT_ELF)),$(BUILD)/userprogs/git_user_embed.o,)
 # ai recovery client. links the vendored musl bearssl; see
 # src/third_party/bearssl/README.md for why debian's copy cannot be used. (satoru)
 BEARSSL_DIR       = $(SRC)/third_party/bearssl
@@ -276,6 +363,23 @@ RTOOLS_OBJ        = $(if $(wildcard $(RTOOLS_TAR)),$(BUILD)/userprogs/recovery_t
 KLDE1K_ELF        = $(USERPROGS_DIR)/kld_e1000e.elf
 # optional: build output of kld/Makefile, only linked when present (satoru)
 KLDE1K_OBJ        = $(if $(wildcard $(KLDE1K_ELF)),$(BUILD)/userprogs/kld_e1000e_user_embed.o,)
+KLDDCIRRUS_ELF     = $(USERPROGS_DIR)/kld_drmcirrus.elf
+KLDDCIRRUS_OBJ     = $(if $(wildcard $(KLDDCIRRUS_ELF)),$(BUILD)/userprogs/kld_drmcirrus_user_embed.o,)
+KLDBOCHS_ELF       = $(USERPROGS_DIR)/kld_bochs.elf
+KLDBOCHS_OBJ       = $(if $(wildcard $(KLDBOCHS_ELF)),$(BUILD)/userprogs/kld_bochs_user_embed.o,)
+# i915 display container (d4): embed builds only, like bochs. (satoru)
+KLDI915_ELF        = $(USERPROGS_DIR)/kld_i915.elf
+KLDI915_OBJ        = $(if $(wildcard $(KLDI915_ELF)),$(BUILD)/userprogs/kld_i915_user_embed.o,)
+# shim self-test container (kurono.kld=apitest); built by kld/Makefile like the
+# e1000e one and optional in the same way. (satoru)
+KLDAPITEST_ELF    = $(USERPROGS_DIR)/kld_apitest.elf
+KLDAPITEST_OBJ    = $(if $(wildcard $(KLDAPITEST_ELF)),$(BUILD)/userprogs/kld_apitest_user_embed.o,)
+# the real touchpad family (kurono.kld=i2chid), embedded like the acpi one. (satoru)
+KLDI2CHID_ELF     = $(USERPROGS_DIR)/kld_i2chid.elf
+KLDI2CHID_OBJ     = $(if $(wildcard $(KLDI2CHID_ELF)),$(BUILD)/userprogs/kld_i2chid_user_embed.o,)
+# iwlwifi hardware container (kurono.kld=iwlwifi). (satoru)
+KLDIWL_ELF        = $(USERPROGS_DIR)/kld_iwlwifi.elf
+KLDIWL_OBJ        = $(if $(wildcard $(KLDIWL_ELF)),$(BUILD)/userprogs/kld_iwlwifi_user_embed.o,)
 SIGNAL_OBJ        = $(BUILD)/userprogs/signal_test_user_embed.o
 # parallel tree-walk regression for the claude find/Glob/Grep freeze (kurono.findtest=1).
 # musl-static like signal_test; walks /system /usr /home with getdents64 + fstatat. (satoru)
@@ -318,6 +422,8 @@ KUI_TERM_ELF      = $(BUILD)/userprogs/kui_terminal.elf
 KUI_TERM_OBJ      = $(BUILD)/userprogs/kui_terminal_user_embed.o
 KUI_SETTINGS_ELF  = $(BUILD)/userprogs/kui_settings.elf
 KUI_SETTINGS_OBJ  = $(BUILD)/userprogs/kui_settings_user_embed.o
+KUI_INSTALLER_ELF = $(BUILD)/userprogs/kui_installer.elf
+KUI_INSTALLER_OBJ = $(BUILD)/userprogs/kui_installer_user_embed.o
 # the audio window needs the codec registry (wav/mp3/aac/flac/mp4); the video player needs the
 # kvid/mp4/h264/aac parsers and stb_image for the jpeg frames. (satoru)
 KUI_R3_MEDIA_SRC  = $(SRC)/apps/media_player.cpp $(SRC)/apps/media_audio.cpp \
@@ -335,8 +441,21 @@ KUI_R3_SETTINGS_SRC = $(SRC)/apps/settings_r3_main.cpp $(SRC)/apps/system_settin
                     $(SRC)/apps/settings_mod_network.cpp $(SRC)/apps/settings_mod_personalize.cpp \
                     $(SRC)/apps/settings_mod_power.cpp \
                     $(SRC)/apps/settings_mod_security.cpp $(SRC)/apps/settings_mod_storage.cpp \
-                    $(SRC)/apps/settings_mod_system.cpp
-USERPROG_OBJS     = $(KUI_CALC_OBJ) $(KUI_EDITOR_OBJ) $(KUI_FILES_OBJ) $(KUI_TASKMGR_OBJ) $(KUI_MEDIA_OBJ) $(KUI_DENJI_OBJ) $(KUI_TERM_OBJ) $(KUI_SETTINGS_OBJ) $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ) $(SIGNAL_OBJ) $(IRQLAT_OBJ) $(KLDBENCH_OBJ) $(KLDACPI_OBJ) $(UATEST_OBJ) $(KENTEST_OBJ) $(MEMTEST_OBJ) $(CHURN_OBJ) $(KSHTEST_OBJ) $(FINDTEST_OBJ) $(BBOX_OBJ) $(DSAI_OBJ) $(DSAI_KEY_OBJ) $(KFETCH_OBJ) $(RTOOLS_OBJ) $(KLDE1K_OBJ) $(DYNTEST_OBJ) $(MUSL_LIBC_OBJ) $(LIBFOO_OBJ)
+                    $(SRC)/apps/settings_mod_system.cpp $(SRC)/apps/settings_mod_language.cpp
+USERPROG_OBJS     = $(KUI_CALC_OBJ) $(KUI_EDITOR_OBJ) $(KUI_FILES_OBJ) $(KUI_TASKMGR_OBJ) $(KUI_MEDIA_OBJ) $(KUI_DENJI_OBJ) $(KUI_TERM_OBJ) $(KUI_SETTINGS_OBJ) $(KUI_INSTALLER_OBJ) $(HELLO_USER_OBJ) $(HELLO_X64_OBJ) $(HELLO_MUSL_OBJ) $(KPY_OBJ) $(FFMPEG_OBJ) $(WLSHM_OBJ) $(PTHREAD_OBJ) $(SIGNAL_OBJ) $(SLEEPTEST_OBJ) $(FDTEST_OBJ) $(IRQLAT_OBJ) $(SMPSCALE_OBJ) $(SPAWNTEST_OBJ) $(MMAPREUSE_OBJ) $(KLDBENCH_OBJ) $(KLDACPI_OBJ) $(KLDI2CHID_OBJ) $(UATEST_OBJ) $(AUDIOD_OBJ) $(KAUDIO_OBJ) $(KENTEST_OBJ) $(MEMTEST_OBJ) $(CHURN_OBJ) $(KSHTEST_OBJ) $(FINDTEST_OBJ) $(KSHRUN_OBJ) $(BBOX_OBJ) $(BASH_OBJ) $(GIT_OBJ) $(DSAI_OBJ) $(DSAI_KEY_OBJ) $(KFETCH_OBJ) $(RTOOLS_OBJ) $(KLDE1K_OBJ) $(KLDDCIRRUS_OBJ) $(KLDBOCHS_OBJ) $(KLDI915_OBJ) $(DYNTEST_OBJ) $(MUSL_LIBC_OBJ) $(LIBFOO_OBJ)
+# KURONO_PACK_USERPROGS=1: keep the big user programs (bash, git, musl libc and
+# the ring-3 kui apps) on the KURONO partition instead of in .rodata. the default
+# build keeps them linked and writes a missing copy out to the partition on
+# first install, so a later pack-only build finds it (same delivery model as the
+# firefox runtime assets). (satoru)
+ifeq ($(KURONO_PACK_USERPROGS),1)
+USERPROG_OBJS := $(filter-out $(BASH_OBJ) $(GIT_OBJ) $(MUSL_LIBC_OBJ) \
+                 $(KUI_CALC_OBJ) $(KUI_EDITOR_OBJ) $(KUI_FILES_OBJ) $(KUI_TASKMGR_OBJ) \
+                 $(KUI_MEDIA_OBJ) $(KUI_DENJI_OBJ) $(KUI_TERM_OBJ) $(KUI_SETTINGS_OBJ) \
+                 $(KUI_INSTALLER_OBJ),$(USERPROG_OBJS))
+endif
+USERPROG_OBJS += $(KLDAPITEST_OBJ)
+USERPROG_OBJS += $(KLDIWL_OBJ)
 
 # ─── KURONO_SLIM=1: drop the big optional blobs from the kernel image ──────
 # MEASURED 2026-07-27: 72% of boot (21.4s of 29.7s wall) is grub loading the
@@ -367,7 +486,7 @@ endif
 ifneq ($(KURONO_EMBED_ALL),1)
 MEDIA_OBJS    := $(filter-out $(DENJI_MP4_OBJ) $(DENJI_KVID_OBJ) $(SSSTIK_MP4_OBJ) $(SSSTIK_KVID_OBJ),$(MEDIA_OBJS))
 ALPINE_OBJS   :=
-USERPROG_OBJS := $(filter-out $(KPY_OBJ) $(FFMPEG_OBJ) $(RTOOLS_OBJ) $(if $(filter 1,$(KURONO_KLD_EMBED)),,$(KLDE1K_OBJ)),$(USERPROG_OBJS))
+USERPROG_OBJS := $(filter-out $(KPY_OBJ) $(FFMPEG_OBJ) $(RTOOLS_OBJ) $(if $(filter 1,$(KURONO_KLD_EMBED)),,$(KLDE1K_OBJ)) $(if $(filter 1,$(KURONO_KLD_EMBED)),,$(KLDAPITEST_OBJ)) $(if $(filter 1,$(KURONO_KLD_EMBED)),,$(KLDIWL_OBJ)) $(if $(filter 1,$(KURONO_KLD_EMBED)),,$(KLDDCIRRUS_OBJ)) $(if $(filter 1,$(KURONO_KLD_EMBED)),,$(KLDBOCHS_OBJ)) $(if $(filter 1,$(KURONO_KLD_EMBED)),,$(KLDI915_OBJ)),$(USERPROG_OBJS))
 endif
 # KURONO_KLD_EMBED=1 keeps the KLD driver container linked in even in the default
 # on-demand build, for vm tests that boot from a cd with no KURONO partition. (satoru)
@@ -406,11 +525,18 @@ CXX_SRCS = \
     $(SRC)/kernel/memcensus.cpp \
     $(SRC)/kernel/taskmem.cpp \
     $(SRC)/kernel/memacct.cpp \
+    $(SRC)/kernel/memboot.cpp \
     $(SRC)/kernel/kdf.cpp \
     $(SRC)/kernel/kdf_test.cpp \
     $(SRC)/kernel/udf.cpp \
     $(SRC)/kernel/kld_broker.cpp \
+    $(SRC)/kernel/kld_ioapic.cpp \
+    $(SRC)/kernel/kld_input.cpp \
     $(SRC)/kernel/kld_net.cpp \
+    $(SRC)/kernel/kld_supervisor.cpp \
+    $(SRC)/kernel/kcrash.cpp \
+    $(SRC)/kernel/dbgwatch.cpp \
+    $(SRC)/kernel/kscreen.cpp \
     $(SRC)/kernel/irp.cpp \
     $(SRC)/kernel/kexec.cpp \
 	$(SRC)/kernel/userspace.cpp \
@@ -447,6 +573,8 @@ CXX_SRCS = \
     $(SRC)/security/ken.cpp \
     $(SRC)/security/ksa.cpp \
     $(SRC)/security/admin.cpp \
+    $(SRC)/security/kcrypto.cpp \
+    $(SRC)/net/wifi_store.cpp \
     $(SRC)/packages/pkgmgr.cpp \
     $(SRC)/net/network.cpp \
     $(SRC)/media/mediadecoder.cpp \
@@ -463,13 +591,19 @@ CXX_SRCS = \
     $(SRC)/ui/style.cpp \
     $(SRC)/ui/modern_draw.cpp \
     $(SRC)/ui/desktop.cpp \
+    $(SRC)/ui/ui_assets.cpp \
+    $(SRC)/kernel/logo_data.cpp \
     $(SRC)/ui/control_center.cpp \
+    $(SRC)/ui/night_light.cpp \
     $(SRC)/ui/file_browser.cpp \
     $(SRC)/ui/notification.cpp \
     $(SRC)/ui/perf_hud.cpp \
     $(SRC)/ui/frame_pacer.cpp \
+    $(SRC)/ui/gfx_bench.cpp \
+    $(SRC)/ui/gfx_oracle.cpp \
     $(SRC)/ui/clipboard_ui.cpp \
     $(SRC)/apps/calculator.cpp \
+    $(SRC)/apps/installer_app.cpp \
     $(SRC)/kui/kui_raster.cpp \
     $(SRC)/kui/kui_canvas.cpp \
     $(SRC)/kui/kui_kernel.cpp \
@@ -485,6 +619,7 @@ CXX_SRCS = \
     $(SRC)/apps/settings_mod_audio.cpp \
     $(SRC)/apps/settings_mod_devices.cpp \
     $(SRC)/apps/settings_mod_network.cpp \
+    $(SRC)/apps/settings_mod_language.cpp \
     $(SRC)/apps/settings_mod_power.cpp \
     $(SRC)/apps/settings_mod_storage.cpp \
     $(SRC)/apps/settings_mod_personalize.cpp \
@@ -506,17 +641,23 @@ CXX_SRCS = \
     $(SRC)/system/input_manager.cpp \
     $(SRC)/system/clipboard.cpp \
     $(SRC)/system/screenshot.cpp \
+    $(SRC)/system/png_encode.cpp \
 	$(SRC)/system/conduit.cpp \
 	$(SRC)/system/logging.cpp \
 	$(SRC)/system/kinit.cpp \
 	$(SRC)/system/kinit_kservice.cpp \
+	$(SRC)/system/power.cpp \
 	$(SRC)/system/systemd_compat.cpp \
 	$(SRC)/system/kpkg_daemon.cpp \
 	$(SRC)/system/claude_host.cpp \
+	$(SRC)/system/opencode_host.cpp \
+	$(SRC)/system/agent_tools.cpp \
 	$(SRC)/system/ktools.cpp \
 	$(SRC)/system/kasset.cpp \
 	$(SRC)/system/kdaemons.cpp \
 	$(SRC)/system/installer.cpp \
+	$(SRC)/system/installer_disk.cpp \
+	$(SRC)/system/installer_service.cpp \
 	$(SRC)/system/installer_gui.cpp \
 	$(SRC)/system/gpu_driver_installer.cpp \
 	$(SRC)/system/system_update.cpp \
@@ -540,6 +681,18 @@ CXX_SRCS = \
     $(SRC)/linux/dual_boot.cpp \
     $(SRC)/linux/linux_netbridge.cpp \
     $(SRC)/system/user_mgmt.cpp \
+    $(SRC)/system/platform_test.cpp \
+    $(SRC)/system/audio_devices.cpp \
+    $(SRC)/system/key_layouts.cpp \
+    $(SRC)/system/freeze.cpp \
+    $(SRC)/system/bootcfg.cpp \
+    $(SRC)/system/error_screen.cpp \
+    $(SRC)/system/recovery.cpp \
+    $(SRC)/system/kernel_slots.cpp \
+    $(SRC)/system/laptop_keys.cpp \
+    $(SRC)/system/backlight.cpp \
+    $(SRC)/system/battery.cpp \
+    $(SRC)/system/idle_sleep.cpp \
     $(SRC)/third_party/stb_image_glue.cpp \
     $(SRC)/third_party/stb_truetype_glue.cpp \
     $(SRC)/virt/vmm.cpp \
@@ -550,6 +703,9 @@ CXX_SRCS = \
     $(SRC)/virt/vdisk.cpp \
     $(SRC)/virt/guest_mem.cpp \
     $(SRC)/virt/linux_boot.cpp \
+    $(SRC)/virt/mb2_boot.cpp \
+    $(SRC)/virt/vi8042.cpp \
+    $(SRC)/virt/kloop.cpp \
     $(SRC)/virt/hypervisor.cpp \
     $(SRC)/virt/iommu.cpp \
     $(SRC)/virt/v9fs.cpp \
@@ -558,6 +714,8 @@ CXX_SRCS = \
     $(SRC)/virt/virtio_gpu_host.cpp \
     $(SRC)/virt/virtio_dev.cpp \
     $(SRC)/virt/vblk.cpp \
+    $(SRC)/virt/vlapic.cpp \
+    $(SRC)/virt/vballoon.cpp \
     $(SRC)/virt/vm_host.cpp \
     $(SRC)/virt/vcon.cpp \
     $(SRC)/virt/vnet.cpp \
@@ -590,6 +748,7 @@ CXX_SRCS = \
     $(SRC)/drivers/audio_format.cpp \
     $(SRC)/drivers/audio_mixer.cpp \
     $(SRC)/drivers/audio_server.cpp \
+    $(SRC)/drivers/audio_r3.cpp \
     $(SRC)/drivers/audio_wav.cpp \
     $(SRC)/drivers/audio_backend_sb16.cpp \
     $(SRC)/drivers/audio_backend_ac97.cpp \
@@ -604,6 +763,8 @@ CXX_SRCS = \
     $(SRC)/drivers/intel_modeset_calc.cpp \
     $(SRC)/drivers/intel_modeset.cpp \
     $(SRC)/drivers/intel_accel.cpp \
+    $(SRC)/drivers/intel_gt_calc.cpp \
+    $(SRC)/drivers/intel_gt.cpp \
     $(SRC)/drivers/cpu_detect.cpp \
     $(SRC)/media/mp3_decoder.cpp \
     $(SRC)/media/codec.cpp \
@@ -614,6 +775,7 @@ CXX_SRCS = \
     $(SRC)/media/video_player.cpp \
     $(SRC)/net/tcpip.cpp \
     $(SRC)/net/dhcp.cpp \
+    $(SRC)/net/sntp.cpp \
     $(SRC)/net/tuntap.cpp \
     $(SRC)/net/ipv6.cpp \
     $(SRC)/net/netfilter.cpp \
@@ -630,8 +792,49 @@ CXX_SRCS = \
     $(SRC)/system/dbus_server.cpp \
     $(SRC)/apps/firefox_launcher.cpp \
     $(SRC)/linux/ld_kurono.cpp \
+    $(SRC)/linux/gl_support.cpp \
     $(SRC)/linux/linux_drivers.cpp \
     $(SRC)/kernel/kurono_kernel.cpp
+
+# --- KLD auto-match table (kurono.kld=auto) -------------------------------
+# kld/tools/gen_match_table.sh writes this from each built family's own pci
+# id table. absent in a default build; kld_auto.cpp then carries an empty
+# table and auto does nothing. (satoru)
+CXX_SRCS += $(SRC)/kernel/kld_auto.cpp
+CXX_SRCS += $(SRC)/kernel/kld_display.cpp
+CXX_SRCS += $(SRC)/kernel/kld_dri.cpp
+CXX_SRCS += $(SRC)/linux/dri_dev.cpp
+CXX_SRCS += $(SRC)/kernel/kld_fwcfg.cpp
+CXX_SRCS += $(SRC)/kernel/kld_iommu.cpp
+CXX_SRCS += $(SRC)/kernel/kld_fw.cpp
+CXX_SRCS += $(SRC)/kernel/kld_model.cpp
+# the match-table rule below would otherwise be the first rule, so a plain
+# `make` in a tree with no kld/build stopped on it (satoru)
+.DEFAULT_GOAL := all
+KLD_MATCH_SRC = $(abspath $(SRC)/../kld/build/kld_match_table.cpp)
+KLD_MATCH_OBJ = $(BUILD)/kld_match_table.o
+# a driver container embedded without its generated match table would boot
+# with an empty family table: no auto match and no msi-x table page exception.
+# fail the build instead. the kld Makefile generates the table in the same
+# "all" step that builds each container. (satoru)
+KLD_EMBED_ELF = $(wildcard $(USERPROGS_DIR)/kld_e1000e.elf) \
+                $(wildcard $(USERPROGS_DIR)/kld_iwlwifi.elf) \
+                $(wildcard $(USERPROGS_DIR)/kld_drmcirrus.elf) \
+                $(wildcard $(USERPROGS_DIR)/kld_bochs.elf) \
+                $(wildcard $(USERPROGS_DIR)/kld_i915.elf)
+ifeq ($(KURONO_KLD_EMBED),1)
+ifneq ($(strip $(KLD_EMBED_ELF)),)
+ifeq ($(wildcard $(KLD_MATCH_SRC)),)
+$(error KURONO_KLD_EMBED=1 with a KLD driver container but no kld/build/kld_match_table.cpp; run "make -C kld driver=<family>" first, its all target generates the table)
+endif
+endif
+endif
+ifneq ($(wildcard $(KLD_MATCH_SRC)),)
+MEDIA_OBJS += $(KLD_MATCH_OBJ)
+endif
+$(KLD_MATCH_OBJ): $(KLD_MATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(SRC)/kernel -c $< -o $@
 
 # ─── Object files ─────────────────────────────────────────────────────────
 ASM_OBJS = $(patsubst $(SRC)/%.asm, $(BUILD)/%.o, $(ASM_SRCS))
@@ -827,6 +1030,14 @@ $(ICONS_OBJ): $(ICONS_BIN)
 	  modern_icons_bin modern_icons.o && \
 	rm -f modern_icons_bin
 
+$(KEYMAPS_OBJ): $(KEYMAPS_BIN)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/keymaps_bin && \
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  keymaps_bin keymaps.o && \
+	rm -f keymaps_bin
+
 # ─── Embed Debian rootfs image via objcopy (binary → ELF .rodata) ───────
 $(DEBIAN_ROOTFS_OBJ): $(DEBIAN_ROOTFS_BIN)
 	@mkdir -p $(dir $@)
@@ -941,6 +1152,16 @@ $(PTHREAD_OBJ): $(PTHREAD_ELF)
 	  pthread_test.elf pthread_test_user_embed.o
 	rm -f $(BUILD)/userprogs/pthread_test.elf
 
+# compile + embed the L2 mmap hole reuse test (static musl, pthreads). (satoru)
+$(MMAPREUSE_ELF): $(MMAPREUSE_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -pthread -o $@ $<
+$(MMAPREUSE_OBJ): $(MMAPREUSE_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  mmap_reuse_test.elf mmap_reuse_test_user_embed.o
+
 # the ring-3 calculator, /system/apps/calculator (kurono.r3apps=calculator). (satoru)
 $(KUI_CALC_ELF): $(SRC)/apps/calculator.cpp $(SRC)/apps/calculator.h $(KUI_R3_DEPS)
 	@mkdir -p $(dir $@)
@@ -1019,6 +1240,15 @@ $(KUI_SETTINGS_OBJ): $(KUI_SETTINGS_ELF)
 	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  kui_settings.elf kui_settings_user_embed.o
+$(KUI_INSTALLER_ELF): $(SRC)/apps/installer_app.cpp $(SRC)/apps/installer_app.h $(SRC)/system/installer_proto.h $(KUI_R3_DEPS)
+	@mkdir -p $(dir $@)
+	$(KUI_R3_CXX) $(KUI_R3_FLAGS) -static -no-pie -o $@ $(SRC)/apps/installer_app.cpp $(KUI_R3_LIB)
+	strip $@
+$(KUI_INSTALLER_OBJ): $(KUI_INSTALLER_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kui_installer.elf kui_installer_user_embed.o
 
 # compile the signal-delivery self-test from source (musl-static, no-pie ET_EXEC)
 # then embed it as a blob, same as the prebuilt userprogs (satoru)
@@ -1030,6 +1260,24 @@ $(SIGNAL_OBJ): $(SIGNAL_ELF)
 	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  signal_test.elf signal_test_user_embed.o
+
+# compile + embed the interruptible-sleep self-test (musl-static, no-pie). (satoru)
+$(SLEEPTEST_ELF): $(SLEEPTEST_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(SLEEPTEST_OBJ): $(SLEEPTEST_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  sleeptest.elf sleeptest_user_embed.o
+$(FDTEST_ELF): $(FDTEST_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(FDTEST_OBJ): $(FDTEST_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  fdtest.elf fdtest_user_embed.o
 
 # compile + embed the parallel tree-walk test (kurono.findtest=1). (satoru)
 $(FINDTEST_ELF): $(FINDTEST_SRC)
@@ -1050,6 +1298,12 @@ $(KLDACPI_OBJ): $(KLDACPI_ELF)
 	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 --rename-section .data=.rodata,alloc,load,readonly,data,contents kld_acpi.elf kld_acpi_user_embed.o
 	rm -f $(BUILD)/userprogs/kld_acpi.elf
 
+$(KLDI2CHID_OBJ): $(KLDI2CHID_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/kld_i2chid.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 --rename-section .data=.rodata,alloc,load,readonly,data,contents kld_i2chid.elf kld_i2chid_user_embed.o
+	rm -f $(BUILD)/userprogs/kld_i2chid.elf
+
 # compile + embed the kld network a/b instrument (kurono.kld.bench=1). (satoru)
 $(KLDBENCH_ELF): $(KLDBENCH_SRC) $(USERPROGS_DIR)/ds_tas.h
 	@mkdir -p $(dir $@)
@@ -1060,10 +1314,38 @@ $(KLDBENCH_OBJ): $(KLDBENCH_ELF)
 
 $(IRQLAT_ELF): $(IRQLAT_SRC)
 	@mkdir -p $(dir $@)
-	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+	$(MUSLCC) -static -no-pie -O2 -Wall -pthread -o $@ $<
 $(IRQLAT_OBJ): $(IRQLAT_ELF)
 	@mkdir -p $(dir $@)
 	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents 	  irqlat.elf irqlat_user_embed.o
+
+# compile + embed the cpu scaling probe (kurono.smpscale=N). (satoru)
+$(SMPSCALE_ELF): $(SMPSCALE_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -pthread -o $@ $<
+$(SMPSCALE_OBJ): $(SMPSCALE_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 --rename-section .data=.rodata,alloc,load,readonly,data,contents smpscale.elf smpscale_user_embed.o
+
+# compile + embed the posix_spawn static-elf64 repro (kurono.spawntest=1). (satoru)
+$(SPAWNTEST_ELF): $(SPAWNTEST_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(SPAWNTEST_OBJ): $(SPAWNTEST_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  spawntest.elf spawntest_user_embed.o
+
+# optional KLD firmware ustar (KURONO_KLD_FW=1). (satoru)
+$(KLD_FW_TAR): $(wildcard $(KLD_FW_DIR)/*)
+	@mkdir -p $(dir $@)
+	cd $(KLD_FW_DIR) && tar -cf $(abspath $(KLD_FW_TAR)) $(notdir $(wildcard $(KLD_FW_DIR)/*))
+$(KLD_FW_OBJ): $(KLD_FW_TAR)
+	@mkdir -p $(dir $@)
+	cd $(BUILD) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kld_firmware.tar kurono_kld_fw.o
 
 # embed the KLD driver container (kurono.kld=1). built separately by kld/Makefile
 # against the pinned linux tree; this only wraps the prebuilt binary. (satoru)
@@ -1072,6 +1354,67 @@ $(KLDE1K_OBJ): $(KLDE1K_ELF)
 	cp $< $(BUILD)/userprogs/kld_e1000e.elf
 	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents 	  kld_e1000e.elf kld_e1000e_user_embed.o
 	rm -f $(BUILD)/userprogs/kld_e1000e.elf
+
+# embed the shim self-test container (kurono.kld=apitest). (satoru)
+$(KLDAPITEST_OBJ): $(KLDAPITEST_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/kld_apitest.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents 	  kld_apitest.elf kld_apitest_user_embed.o
+	rm -f $(BUILD)/userprogs/kld_apitest.elf
+
+# embed the iwlwifi container (kurono.kld=iwlwifi). (satoru)
+$(KLDIWL_OBJ): $(KLDIWL_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/kld_iwlwifi.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents 	  kld_iwlwifi.elf kld_iwlwifi_user_embed.o
+	rm -f $(BUILD)/userprogs/kld_iwlwifi.elf
+
+$(KLDDCIRRUS_OBJ): $(KLDDCIRRUS_ELF)
+	@mkdir -p $(BUILD)/userprogs
+	cp $< $(BUILD)/userprogs/kld_drmcirrus.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kld_drmcirrus.elf kld_drmcirrus_user_embed.o
+	rm -f $(BUILD)/userprogs/kld_drmcirrus.elf
+
+$(KLDBOCHS_OBJ): $(KLDBOCHS_ELF)
+	@mkdir -p $(BUILD)/userprogs
+	cp $< $(BUILD)/userprogs/kld_bochs.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kld_bochs.elf kld_bochs_user_embed.o
+	rm -f $(BUILD)/userprogs/kld_bochs.elf
+
+$(KLDI915_OBJ): $(KLDI915_ELF)
+	@mkdir -p $(BUILD)/userprogs
+	cp $< $(BUILD)/userprogs/kld_i915.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kld_i915.elf kld_i915_user_embed.o
+	rm -f $(BUILD)/userprogs/kld_i915.elf
+
+# ring-3 audio daemon (kurono.r3audio=1): pulse server + mixer, musl static. (satoru)
+# pulsetest.c is the selftest client (kurono.r3audiotest=1); it is linked into audiod as
+# pulsetest_main because posix_spawn of a static elf64 is not supported by the kls execve.
+$(AUDIOD_ELF): $(AUDIOD_SRC) $(PULSETEST_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -Dmain=pulsetest_main -c -o $(PULSETEST_LIB) $(PULSETEST_SRC)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $(AUDIOD_SRC) $(PULSETEST_LIB) -lm -pthread
+$(AUDIOD_OBJ): $(AUDIOD_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  audiod.elf audiod_user_embed.o
+
+# audio control tool for ring 3 (kaudio restart|stop|status -> /dev/kaudio) (satoru)
+$(KAUDIO_ELF): $(KAUDIO_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(KAUDIO_OBJ): $(KAUDIO_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kaudio.elf kaudio_user_embed.o
 
 # compile + embed the user-pointer validation regression test (kurono.uatest=1).
 # proves uaccess actually rejects a kernel pointer rather than dereferencing it. (satoru)
@@ -1125,6 +1468,15 @@ $(KSHTEST_OBJ): $(KSHTEST_ELF)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  kshtest.elf kshtest_user_embed.o
 
+$(KSHRUN_ELF): $(KSHRUN_SRC)
+	@mkdir -p $(dir $@)
+	$(MUSLCC) -static -no-pie -O2 -Wall -o $@ $<
+$(KSHRUN_OBJ): $(KSHRUN_ELF)
+	@mkdir -p $(dir $@)
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  kshrun.elf kshrun_user_embed.o
+
 $(RTOOLS_OBJ): $(RTOOLS_TAR)
 	@mkdir -p $(dir $@)
 	cp $< $(BUILD)/userprogs/recovery_tools.tar
@@ -1132,6 +1484,22 @@ $(RTOOLS_OBJ): $(RTOOLS_TAR)
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  recovery_tools.tar recovery_tools_embed.o
 	rm -f $(BUILD)/userprogs/recovery_tools.tar
+
+$(GIT_OBJ): $(GIT_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/git.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  git.elf git_user_embed.o
+	rm -f $(BUILD)/userprogs/git.elf
+
+$(BASH_OBJ): $(BASH_ELF)
+	@mkdir -p $(dir $@)
+	cp $< $(BUILD)/userprogs/bash.elf
+	cd $(BUILD)/userprogs && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  bash.elf bash_user_embed.o
+	rm -f $(BUILD)/userprogs/bash.elf
 
 $(BBOX_OBJ): $(BBOX_ELF)
 	@mkdir -p $(dir $@)
@@ -1337,7 +1705,7 @@ $(BUILD)/boot/efi_loader_emergency.o: $(SRC)/boot/efi_loader.c
 # line (copy it to EFI/KURONO/GPUTEST.EFI and pick it in the boot menu). (satoru)
 $(BUILD)/boot/efi_loader_gpu.o: $(SRC)/boot/efi_loader.c
 	@mkdir -p $(dir $@)
-	$(EFI_CC) $(EFI_CFLAGS) -DKURONO_EFI_CMDLINE='"efi kurono.autologin=1 kurono.uiscale=100 kurono.wpdamage=1 kurono.igpu.accel=1 kurono.igpu.zerocopy=1"' -c $< -o $@
+	$(EFI_CC) $(EFI_CFLAGS) -DKURONO_EFI_CMDLINE='"efi kurono.autologin=1 kurono.uiscale=100 kurono.wpdamage=1 kurono.igpu.accel=1 kurono.igpu.flip=1"' -c $< -o $@
 
 $(BUILD)/boot/efi_loader_gpu.so: $(BUILD)/boot/efi_loader_gpu.o $(BUILD)/boot/kernel_embed.o
 	$(EFI_LD) $(EFI_LDFLAGS) $(EFI_CRT0) $^ $(EFI_LIBS) -o $@
@@ -1444,7 +1812,7 @@ iso: all efi pack
 	@echo 'menuentry "Kurono Setup" {'                                 >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Loading Kurono Setup (installer / first-setup)..."' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    set gfxpayload=keep'                                     >> $(ISO_DIR)/boot/grub/grub.cfg
-	@echo '    multiboot2 /boot/kurono_base.elf kurono.setup=1 kurono.autologin=1' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kurono.elf kurono.installer=1 kurono.autologin=1' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    echo "Setup kernel loaded OK. Booting..."'              >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot'                                                    >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}'                                                          >> $(ISO_DIR)/boot/grub/grub.cfg
@@ -1508,6 +1876,60 @@ iso: all efi pack
 	@echo "  Bootable ISO: $(ISO)"
 	@echo "  Copy: $(ISO_ALT)"
 	@echo "══════════════════════════════════════════════"
+
+# --- usbimg: a flashable usb stick image, ../build/kurono-usb.img -------------
+# one gpt disk, one fat32 partition named KURONO (efi system type, so every uefi
+# firmware boots it). it holds exactly what the installer writes: the efi
+# loader as EFI/BOOT/BOOTX64.EFI (and EFI/KURONO), the emergency loader, the
+# log and the KURONO.KFS store, plus the asset pack from ../build/pack. the
+# loader embeds the base kernel, so the stick boots the desktop on uefi. the
+# size is computed from the inputs. needs sgdisk, mkfs.fat and mtools (mmd,
+# mcopy); no root, no loop devices.
+#   make usbimg                       (USB_PACK=0 leaves the asset pack out)
+#   sudo dd if=../build/kurono-usb.img of=/dev/sdX bs=4M conv=fsync status=progress
+# WARNING: dd erases everything on /dev/sdX. check the device name with lsblk
+# first, and never point it at a disk you want to keep. (satoru)
+USB_IMG    = $(BUILD)/kurono-usb.img
+USB_DIR    = $(BUILD)/usbimg
+USB_KFS_MB ?= 64
+USB_PACK   ?= 1
+
+.PHONY: usbimg
+usbimg: efi $(if $(filter 0,$(USB_PACK)),,pack)
+	@for t in sgdisk mkfs.fat mmd mcopy truncate dd; do command -v $$t >/dev/null || { echo "usbimg needs $$t"; exit 1; }; done
+	@set -e; \
+	mkdir -p $(USB_DIR); rm -f $(USB_DIR)/part.img; \
+	packdir=""; if [ "$(USB_PACK)" != "0" ] && [ -d $(BUILD)/pack ] && [ -n "$$(ls -A $(BUILD)/pack)" ]; then packdir=$(BUILD)/pack; fi; \
+	log_b=$$((16 * 1048576)); kfs_b=$$(($(USB_KFS_MB) * 1048576)); \
+	efi_b=$$(stat -c %s $(EFI_APP)); emg_b=$$(stat -c %s $(EFI_APP_EMERGENCY)); \
+	pack_b=0; if [ -n "$$packdir" ]; then pack_b=$$(du -sb $$packdir | cut -f1); fi; \
+	need=$$(( 2 * efi_b + emg_b + log_b + kfs_b + pack_b )); \
+	part_mb=$$(( need / 1048576 * 105 / 100 + 8 )); if [ $$part_mb -lt 64 ]; then part_mb=64; fi; \
+	part_sectors=$$(( part_mb * 2048 )); \
+	truncate -s $$(( part_mb * 1048576 )) $(USB_DIR)/part.img; \
+	mkfs.fat -F 32 -n KURONO $(USB_DIR)/part.img >/dev/null; \
+	truncate -s $$log_b $(USB_DIR)/KURONO.LOG; truncate -s $$kfs_b $(USB_DIR)/KURONO.KFS; \
+	printf 'Kurono OS installed by the Kurono installer.\r\nPrimary loader: \\EFI\\KURONO\\KURONO.EFI\r\nFallback loader: \\EFI\\BOOT\\BOOTX64.EFI\r\nBoot log: \\KURONO.LOG\r\nPersistent store: \\KURONO.KFS\r\n' > $(USB_DIR)/README.TXT; \
+	printf 'name=Kurono OS\r\npartition=KURONO\r\nfilesystem=fat32\r\nloader=EFI/BOOT/BOOTX64.EFI\r\nlog=KURONO.LOG\r\nstore=KURONO.KFS\r\n' > $(USB_DIR)/KURONO.INST; \
+	printf 'echo Kurono OS\r\nfs0:\\EFI\\BOOT\\BOOTX64.EFI\r\n' > $(USB_DIR)/STARTUP.NSH; \
+	P=$(USB_DIR)/part.img; export MTOOLS_SKIP_CHECK=1; \
+	mmd -i $$P ::EFI ::EFI/BOOT ::EFI/KURONO; \
+	mcopy -i $$P $(EFI_APP) ::EFI/BOOT/BOOTX64.EFI; \
+	mcopy -i $$P $(EFI_APP) ::EFI/KURONO/KURONO.EFI; \
+	mcopy -i $$P $(EFI_APP_EMERGENCY) ::EFI/KURONO/KEMERG.EFI; \
+	mcopy -i $$P $(USB_DIR)/README.TXT ::EFI/README.TXT; \
+	mcopy -i $$P $(USB_DIR)/KURONO.INST $(USB_DIR)/STARTUP.NSH ::/; \
+	mcopy -i $$P $(USB_DIR)/KURONO.LOG $(USB_DIR)/KURONO.KFS ::/; \
+	python3 ../tools/kboot/mkkboot.py $(USB_DIR)/KBOOT.CFG && mcopy -i $$P $(USB_DIR)/KBOOT.CFG ::/; \
+	if [ -n "$$packdir" ]; then mcopy -i $$P $$packdir/* ::/; fi; \
+	rm -f $(USB_DIR)/KURONO.LOG $(USB_DIR)/KURONO.KFS; \
+	rm -f $(USB_IMG); truncate -s $$(( (2048 + part_sectors + 2048) * 512 )) $(USB_IMG); \
+	sgdisk -o -n 1:2048:+$$part_sectors -t 1:EF00 -c 1:KURONO $(USB_IMG) >/dev/null; \
+	dd if=$$P of=$(USB_IMG) bs=1M seek=1 conv=notrunc status=none; \
+	rm -f $$P $(USB_DIR)/README.TXT $(USB_DIR)/KURONO.INST $(USB_DIR)/STARTUP.NSH; rmdir $(USB_DIR) || true; \
+	echo "  USB image: $(USB_IMG) ($$(du -h $(USB_IMG) | cut -f1))"; \
+	echo "  flash: sudo dd if=$(USB_IMG) of=/dev/sdX bs=4M conv=fsync status=progress"; \
+	echo "  WARNING: this erases /dev/sdX; check it with lsblk first."
 
 # ─── Run in QEMU (accelerated, high refresh) ─────────────────────────────
 run: iso
@@ -1604,7 +2026,16 @@ pack: $(KPY_ELF)
 	@for pair in "$(ALPINE_KERNEL_BIN):ALPKERN.BIN" "$(ALPINE_INITRD_BIN):ALPINIT.BIN" \
 	  "$(RTOOLS_TAR):RTOOLS.TAR" "$(FFMPEG_ELF):FFMPEG.ELF" "$(KPY_ELF):KPYTHON.ELF" \
 	  "$(KLDE1K_ELF):KLDE1K.ELF" "$(DENJI_MP4_BIN):DENJI.MP4" "$(DENJI_KVID_BIN):DENJI.KVD" \
-	  "$(SSSTIK_MP4_BIN):SSSTIK.MP4" "$(SSSTIK_KVID_BIN):SSSTIK.KVD"; do \
+	  "$(SSSTIK_MP4_BIN):SSSTIK.MP4" "$(SSSTIK_KVID_BIN):SSSTIK.KVD" \
+	  "$(XKB_TAR_BIN):XKB.TAR" "$(FONTS_TAR_BIN):FONTS.TAR" \
+	  "$(NSSLIBS_TAR_BIN):NSSLIB.TAR" "$(ICU_DAT_BIN):ICUDT.DAT" \
+	  "$(PIXBUF_BIN):PIXBUF.SO" \
+	  "$(BASH_ELF):BASH.ELF" "$(GIT_ELF):GIT.ELF" "$(MUSL_LIBC_SO):MUSLLIBC.SO" \
+	  "$(KUI_CALC_ELF):KUICALC.ELF" "$(KUI_EDITOR_ELF):KUIEDIT.ELF" \
+	  "$(KUI_FILES_ELF):KUIFILE.ELF" "$(KUI_TASKMGR_ELF):KUITASK.ELF" \
+	  "$(KUI_MEDIA_ELF):KUIMEDIA.ELF" "$(KUI_DENJI_ELF):KUIDENJI.ELF" \
+	  "$(KUI_TERM_ELF):KUITERM.ELF" "$(KUI_SETTINGS_ELF):KUISETT.ELF" \
+	  "$(KUI_INSTALLER_ELF):KUIINST.ELF"; do \
 	  src=$${pair%%:*}; dst=$${pair##*:}; \
 	  if [ -f "$$src" ]; then cmp -s "$$src" $(BUILD)/pack/$$dst || cp "$$src" $(BUILD)/pack/$$dst; fi; \
 	done

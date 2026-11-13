@@ -22,7 +22,11 @@
 //      → inject interrupts when guest is interruptible
 //
 //  reference: intel sdm vol 3c chapters 23-33, amd apm vol 2 chapter 15
+#include "../linux/linux_syscall.h"   // kls released while the guest runs (satoru)
 #include "hypervisor.h"
+#include "mb2_boot.h"   // multiboot2 guests (satoru)
+#include "vi8042.h"     // their ps/2 controller (satoru)
+#include "../kernel/kimage.h"   // heap direct-map pointers -> phys (satoru)
 #include "../system/kasset.h"
 #include "../kernel/types.h"
 #include "../kernel/heap.h"
@@ -34,6 +38,10 @@
 #include "virtio_gpu_host.h"
 #include "virtio_dev.h"
 #include "vblk.h"
+#include "vballoon.h"
+#include "vlapic.h"
+#include "../proc/smp.h"
+#include "../drivers/cpu_detect.h"
 #include "vcon.h"
 #include "vnet.h"
 #include "vm_host.h"
@@ -78,6 +86,13 @@ uint8_t*     Hypervisor::io_bitmap_b   = nullptr;
 uint8_t*     Hypervisor::msr_bitmap    = nullptr;
 VMStats      Hypervisor::stats;
 bool         Hypervisor::guest_halted      = false;
+vCPU*        Hypervisor::vcpus[8]          = {};
+int          Hypervisor::nvcpus            = 1;
+int          Hypervisor::cur_vcpu          = 0;
+int          Hypervisor::want_cpus         = 1;
+uint8_t      Hypervisor::ap_state[8]       = {};
+bool         Hypervisor::vhalted[8]        = {};
+bool         Hypervisor::yield_req         = false;
 bool         Hypervisor::reboot_requested  = false;
 void*        Hypervisor::owner_proc        = nullptr;
 bool         Hypervisor::alpine_booted     = false;
@@ -87,6 +102,12 @@ bool         Hypervisor::debian_booted     = false;
 char         Hypervisor::debian_boot_log[8192];
 int          Hypervisor::debian_boot_log_len = 0;
 bool         Hypervisor::linux_guest_enabled = true;
+bool         Hypervisor::mb2_mode = false;   // (satoru)
+static bool  mb2_guest = false;              // a multiboot2 (kurono) guest is up (satoru)
+bool Hypervisor::Mb2Guest() { return mb2_guest; }
+bool         Hypervisor::i8042_on = false;   // (satoru)
+uint32_t     Hypervisor::mb2_entry = 0;
+uint32_t     Hypervisor::mb2_info = 0;
 LinuxGuestProfile Hypervisor::linux_guest_profile = LINUX_GUEST_ALPINE;
 
 static void AppendDiagText(char* buf, int& len, int max, const char* text) {
@@ -251,6 +272,27 @@ bool Hypervisor::CreateVM(const VMConfig& cfg) {
         }
     }
 
+    nvcpus = 1; cur_vcpu = 0;
+    for (int i = 0; i < 8; i++) { vcpus[i] = nullptr; ap_state[i] = 0; vhalted[i] = false; }
+    vcpus[0] = vcpu;
+    ap_state[0] = 1;
+    if (VMHost::Par() && want_cpus > 1) {      // parallel vcpus need planned service cpus; else fewer (satoru)
+        int ok = 1;
+        while (ok < want_cpus && Scheduler::VcpuCpu(ok)) ok++;
+        if (ok < want_cpus) want_cpus = ok;
+    }
+    if (hw_available && vcpu && vcpu->type == VIRT_INTEL_VTX && want_cpus > 1) {
+        for (int k = 1; k < want_cpus && k < 8; k++) {
+            vcpus[k] = VMM::CreateVCPU();
+            if (!vcpus[k]) break;
+            nvcpus = k + 1;
+        }
+        SerialLogger::Log("Hypervisor: smp guest, "); SerialLogger::LogDec(nvcpus); SerialLogger::Log(" vcpus\r\n");
+    }
+    VLapic::Reset(nvcpus, LapicIpi);
+    if (nvcpus > 1) BuildMpTable(nvcpus);
+    ParStart();
+
     if (hw_available) {
         if (!SetupEPT()) {
             SerialLogger::Log("Hypervisor: EPT setup failed\r\n");
@@ -282,9 +324,14 @@ void Hypervisor::DestroyVM() {
         return;
     }
     SerialLogger::Log("Hypervisor: Destroying VM...\r\n");
+    i8042_on = false;   // (satoru)
+    mb2_guest = false;
     VNet::Shutdown();               // (satoru)
     DiskLog::DisarmGuestImage();
 
+    ParStop();      // the ap threads clear their vmcs on their own cpus first (satoru)
+    for (int k = 1; k < nvcpus; k++) if (vcpus[k]) { VMM::DestroyVCPU(vcpus[k]); vcpus[k] = nullptr; }
+    nvcpus = 1; cur_vcpu = 0;
     if (vcpu) {
         if (hw_available && vcpu->type != VIRT_NONE) {
             VMM::DestroyVCPU(vcpu);
@@ -307,6 +354,7 @@ void Hypervisor::DestroyVM() {
     if (io_bitmap_b)  { HVFreeAligned(io_bitmap_b); io_bitmap_b = nullptr; }
     if (msr_bitmap)   { HVFreeAligned(msr_bitmap); msr_bitmap = nullptr; }
 
+    PCIPassthrough::DetachGuest();   // bus master off before the frames go (satoru)
     GuestMemoryManager::FreeGuestRAM();
 
     alpine_booted = false;
@@ -367,8 +415,8 @@ bool Hypervisor::SetupIOBitmap() {
     // write bitmap addresses to vmcs if intel vmx
     if (VMM::GetType() == VIRT_INTEL_VTX && vcpu && vcpu->vmcs) {
         VMM::VMPtrLoad(vcpu->vmcs);
-        VMM::VMWrite(VMCS_IO_BITMAP_A, (uint64_t)(uintptr_t)io_bitmap_a);
-        VMM::VMWrite(VMCS_IO_BITMAP_B, (uint64_t)(uintptr_t)io_bitmap_b);
+        VMM::VMWrite(VMCS_IO_BITMAP_A, KernelPhysOf(io_bitmap_a));
+        VMM::VMWrite(VMCS_IO_BITMAP_B, KernelPhysOf(io_bitmap_b));
     }
 
     // amd svm: allocate a contiguous 12 kb iopm and set vmcb field
@@ -377,7 +425,7 @@ bool Hypervisor::SetupIOBitmap() {
         uint8_t* svm_iopm = (uint8_t*)HVAllocAligned(12288, 4096);
         if (svm_iopm) {
             memset(svm_iopm, 0xFF, 12288);  // intercept all i/o ports
-            vcpu->vmcb->iopm_base_pa = (uint64_t)(uintptr_t)svm_iopm;
+            vcpu->vmcb->iopm_base_pa = KernelPhysOf(svm_iopm);
             SerialLogger::Log("Hypervisor: SVM IOPM (12KB) at ");
             SerialLogger::LogHex((uint32_t)(uintptr_t)svm_iopm);
             SerialLogger::Log("\r\n");
@@ -419,7 +467,7 @@ bool Hypervisor::SetupMSRBitmap() {
     // write msr bitmap address to vmcs
     if (VMM::GetType() == VIRT_INTEL_VTX && vcpu && vcpu->vmcs) {
         VMM::VMPtrLoad(vcpu->vmcs);
-        VMM::VMWrite(VMCS_MSR_BITMAP_ADDR, (uint64_t)(uintptr_t)msr_bitmap);
+        VMM::VMWrite(VMCS_MSR_BITMAP_ADDR, KernelPhysOf(msr_bitmap));
     }
 
     // amd svm: allocate an 8 kb msrpm and set vmcb field
@@ -428,7 +476,7 @@ bool Hypervisor::SetupMSRBitmap() {
         uint8_t* svm_msrpm = (uint8_t*)HVAllocAligned(8192, 4096);
         if (svm_msrpm) {
             memset(svm_msrpm, 0xFF, 8192);  // intercept all msrs
-            vcpu->vmcb->msrpm_base_pa = (uint64_t)(uintptr_t)svm_msrpm;
+            vcpu->vmcb->msrpm_base_pa = KernelPhysOf(svm_msrpm);
             SerialLogger::Log("Hypervisor: SVM MSRPM (8KB) at ");
             SerialLogger::LogHex((uint32_t)(uintptr_t)svm_msrpm);
             SerialLogger::Log("\r\n");
@@ -441,9 +489,19 @@ bool Hypervisor::SetupMSRBitmap() {
     return true;
 }
 
+static bool g_par_on = false;                 // this vm runs parallel vcpus (satoru)
+static inline uint64_t rdtsc_raw_h() { uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+static volatile uint8_t g_ap_start[8];        // 0 parked, 1 sipi seen (start me), 2 running
+static uint8_t g_ap_vec[8];
+static volatile uint32_t g_ept_gen = 0;       // bumped when ept leaves are removed: other cpus invept
+static volatile uint32_t g_seen_gen[8];       // the gen each vcpu thread flushed its ept tlb for
+static volatile uint8_t  g_in_guest[8];       // vcpu k is inside the guest right now
+static uint32_t g_lazy_mapped[(GUEST_MAX_HI_CHUNKS + 31) / 32];   // chunks with ept leaves (satoru)
+
 //  setupept - create extended page tables mapping guest physical memory
 
 bool Hypervisor::SetupEPT() {
+    for (uint32_t i = 0; i < sizeof(g_lazy_mapped) / sizeof(g_lazy_mapped[0]); i++) g_lazy_mapped[i] = 0;
     if (VMM::GetType() == VIRT_INTEL_VTX) {
         ept_root = EPTManager::CreateEPT();
         if (!ept_root) return false;
@@ -453,7 +511,7 @@ bool Hypervisor::SetupEPT() {
         uint32_t low_size = GuestMemoryManager::GetLowRAMSize();
         if (low_ram && low_size > 0) {
             EPTManager::MapRAM(ept_root, 0x00000000ULL,
-                               (uint64_t)(uintptr_t)low_ram, low_size);
+                               KernelPhysOf(low_ram), low_size);
             EPTManager::AddRegion({0x00000000ULL,
                                    (uint64_t)(uintptr_t)low_ram,
                                    low_size, MEM_RAM, true, true, true});
@@ -463,21 +521,23 @@ bool Hypervisor::SetupEPT() {
         uint8_t* vga = GuestMemoryManager::GetVGABuffer();
         if (vga) {
             EPTManager::MapMMIO(ept_root, GUEST_VGA_BASE,
-                                (uint64_t)(uintptr_t)vga, (uint32_t)GUEST_VGA_SIZE);
+                                KernelPhysOf(vga), (uint32_t)GUEST_VGA_SIZE);
         }
 
         // map rom area (0xc0000 - 0xfffff)
         uint8_t* rom = GuestMemoryManager::GetROMArea();
         if (rom) {
             EPTManager::MapROM(ept_root, GUEST_ROM_BASE,
-                               (uint64_t)(uintptr_t)rom, (uint32_t)GUEST_ROM_SIZE);
+                               KernelPhysOf(rom), (uint32_t)GUEST_ROM_SIZE);
         }
 
         // map high ram (1 mb+), one ept range per host-contiguous chunk (satoru)
         for (uint32_t ci = 0; ci < GuestMemoryManager::GetHighChunkCount(); ci++) {
             uint64_t cgpa = 0; uint8_t* chost = nullptr; uint32_t csz = 0;
             if (!GuestMemoryManager::GetHighChunk(ci, &cgpa, &chost, &csz)) break;
-            EPTManager::MapRAM(ept_root, cgpa, (uint64_t)(uintptr_t)chost, csz);
+            if (!chost) continue;      // lazy ram: mapped on first touch (satoru)
+            EPTManager::MapRAM(ept_root, cgpa, KernelPhysOf(chost), csz);
+            g_lazy_mapped[ci / 32] |= 1u << (ci % 32);
         }
         EPTManager::AddRegion({GUEST_HIGH_RAM_START, 0, GuestMemoryManager::GetHighRAMSize(),
                                MEM_RAM, true, true, true});
@@ -520,8 +580,10 @@ bool Hypervisor::SetupEPT() {
         for (uint32_t ci = 0; ci < GuestMemoryManager::GetHighChunkCount(); ci++) {   // (satoru)
             uint64_t cgpa = 0; uint8_t* chost = nullptr; uint32_t csz = 0;
             if (!GuestMemoryManager::GetHighChunk(ci, &cgpa, &chost, &csz)) break;
-            EPTManager::MapGuestPhysicalNPT(npt_root, cgpa, (uint64_t)(uintptr_t)chost, csz,
+            if (!chost) continue;      // lazy ram (satoru)
+            EPTManager::MapGuestPhysicalNPT(npt_root, cgpa, KernelPhysOf(chost), csz,
                 NPT_PRESENT | NPT_WRITE | NPT_USER);
+            g_lazy_mapped[ci / 32] |= 1u << (ci % 32);
         }
 
         // set ncr3 in vmcb
@@ -838,19 +900,28 @@ VMState Hypervisor::RunVM(uint32_t max_exits) {
         // now-current vmcs (satoru)
         if (vcpu->type == VIRT_INTEL_VTX) {
             if (ept_root) VMM::VMWrite(VMCS_EPT_POINTER, EPTManager::BuildEPTP(ept_root));
-            if (io_bitmap_a) VMM::VMWrite(VMCS_IO_BITMAP_A, (uint64_t)(uintptr_t)io_bitmap_a);
-            if (io_bitmap_b) VMM::VMWrite(VMCS_IO_BITMAP_B, (uint64_t)(uintptr_t)io_bitmap_b);
-            if (msr_bitmap) VMM::VMWrite(VMCS_MSR_BITMAP_ADDR, (uint64_t)(uintptr_t)msr_bitmap);
+            if (io_bitmap_a) VMM::VMWrite(VMCS_IO_BITMAP_A, KernelPhysOf(io_bitmap_a));
+            if (io_bitmap_b) VMM::VMWrite(VMCS_IO_BITMAP_B, KernelPhysOf(io_bitmap_b));
+            if (msr_bitmap) VMM::VMWrite(VMCS_MSR_BITMAP_ADDR, KernelPhysOf(msr_bitmap));
             for (uint32_t m = 0xC0000081; m <= 0xC0000084; m++) *VMM::GuestSwitchedMSR(m) = 0;
             *VMM::GuestSwitchedMSR(0xC0000102) = 0;
         }
     }
 
+    SetupAPs();
+
     // now configure guest state for protected-mode linux entry
     // this must come after setupvcpu because setupvcpu sets real-mode defaults
+    if (mb2_mode) {
+        // multiboot2 entry, as GRUB does it: same flat 32-bit state, eax = the
+        // magic, ebx = the info (regs[] is modrm order: 0 rax, 3 rbx) (satoru)
+        ConfigureGuestProtectedMode(mb2_entry, 0);
+        if (vcpu) { vcpu->regs[0] = 0x36d76289u; vcpu->regs[3] = mb2_info; }
+    } else {
     uint32_t entry = LinuxBootLoader::GetEntryPoint();
     if (entry == 0) entry = LINUX_KERNEL_ADDR;
     ConfigureGuestProtectedMode(entry, LINUX_BOOT_PARAMS_ADDR);
+    }
 
     vm_state = VM_STATE_RUNNING;
     SerialLogger::Log("Hypervisor: Entering VM run loop\r\n");
@@ -921,8 +992,11 @@ VMState Hypervisor::RunOneCycle() {
         return VM_STATE_HALTED;
     }
 
-    // enter guest
+    // enter guest. the guest runs without kls; the exit is handled under it
+    // again (the vm host loop holds it, see HostKls in vm_host.cpp). (satoru)
+    int kls_depth = Scheduler::SchedV2() ? LinuxSyscall::KlsDropAll() : 0;
     int exit_reason = VMM::RunVCPU(vcpu);
+    LinuxSyscall::KlsRestore(kls_depth);
     if (exit_reason < 0) {
         // vm-entry failed - under whpx this can happen if nested virt
         // isn't truly supported despite cpuid detection succeeding
@@ -949,6 +1023,83 @@ VMState Hypervisor::RunOneCycle() {
     }
 
     return ProcessVMExit();
+}
+
+// lazy guest ram: the guest touched a chunk with no ept mapping yet. back it with host
+// frames (it may already be, a device model can touch it first) and map the whole chunk
+// 4 kb leaf by leaf. (satoru)
+bool Hypervisor::LazyMapRAM(uint64_t gpa) {
+    if (!GuestMemoryManager::IsLazy()) return false;
+    uint64_t cgpa = 0; uint8_t* chost = nullptr; uint32_t csz = 0;
+    if (!GuestMemoryManager::EnsureHighChunk(gpa, &cgpa, &chost, &csz)) return false;
+    uint32_t ci = GuestMemoryManager::ChunkIndex(cgpa);
+    bool split = GuestMemoryManager::IsSplit(ci);
+    if (!chost && !split) return false;
+    uint32_t* w = &g_lazy_mapped[ci / 32];
+    uint32_t bit = 1u << (ci % 32);
+    if (*w & bit) {
+        // mapped already. with parallel vcpus another cpu may have just done it: the retry then succeeds;
+        // otherwise this violation is something else (satoru)
+        if (VMM::GetType() != VIRT_AMD_SVM && ept_root) { uint64_t* lf = EPTManager::KmemxLeafEntry(ept_root, gpa & ~0xFFFULL); return lf && (*lf & 7); }
+        return false;
+    }
+    if (VMM::GetType() == VIRT_AMD_SVM) {
+        if (!npt_root) return false;
+        if (split) {
+            for (uint32_t k = 0; k * 4096 < csz; k++) {
+                uint8_t* pg = nullptr; GuestMemoryManager::SplitPage(ci, k, &pg);
+                EPTManager::MapGuestPhysicalNPT(npt_root, cgpa + k * 4096, KernelPhysOf(pg), 4096, NPT_PRESENT | NPT_WRITE | NPT_USER);
+            }
+        } else EPTManager::MapGuestPhysicalNPT(npt_root, cgpa, KernelPhysOf(chost), csz, NPT_PRESENT | NPT_WRITE | NPT_USER);
+    } else {
+        if (!ept_root) return false;
+        if (split) {
+            for (uint32_t k = 0; k * 4096 < csz; k++) {
+                uint8_t* pg = nullptr; GuestMemoryManager::SplitPage(ci, k, &pg);
+                EPTManager::MapRAM(ept_root, cgpa + k * 4096, KernelPhysOf(pg), 4096);
+            }
+        } else EPTManager::MapRAM(ept_root, cgpa, KernelPhysOf(chost), csz);
+    }
+    *w |= bit;
+    return true;
+}
+
+uint64_t Hypervisor::ReleaseGuestRam(uint64_t gpa, uint64_t len) {
+    if (!GuestMemoryManager::IsLazy() || !ept_root || VMM::GetType() != VIRT_INTEL_VTX) return 0;
+    uint64_t freed = 0;
+    uint64_t end = gpa + len;
+    if (end < gpa) return 0;
+    for (uint32_t ci = GuestMemoryManager::ChunkIndex(gpa); ; ci++) {
+        uint64_t b = 0; uint8_t* h = nullptr; uint32_t sz = 0;
+        if (!GuestMemoryManager::GetHighChunk(ci, &b, &h, &sz)) break;
+        if (b >= end) break;
+        if (b < gpa || b + sz > end || !GuestMemoryManager::HighChunkBacked(ci)) continue;       // partly covered or not backed
+        EPTManager::UnmapRange(ept_root, b, sz);
+        EPTManager::InvalidateEPT();
+        if (g_par_on) {
+            // another vcpu may hold a cached translation of the leaves just cleared. the host frames go
+            // back to the pool below, so first make every other vcpu leave the guest and flush: it cannot
+            // re-enter before it saw the new generation (satoru)
+            uint32_t gen = __atomic_add_fetch(&g_ept_gen, 1u, __ATOMIC_SEQ_CST);
+            g_seen_gen[cur_vcpu] = gen;
+            uint64_t guard = rdtsc_raw_h() + 4000000000ULL;
+            for (;;) {
+                bool wait = false;
+                for (int k = 0; k < nvcpus; k++) {
+                    if (k == cur_vcpu) continue;
+                    if (g_in_guest[k] && g_seen_gen[k] != gen) { wait = true; KickVcpu(k); }
+                }
+                if (!wait || rdtsc_raw_h() > guard) break;
+                __asm__ volatile("pause");
+            }
+        }
+        uint64_t rb = 0; uint32_t rs = 0;
+        if (GuestMemoryManager::ReleaseHighChunk(ci, &rb, &rs)) {
+            g_lazy_mapped[ci / 32] &= ~(1u << (ci % 32));
+            freed += rs;
+        }
+    }
+    return freed;
 }
 
 //  processvmexit - dispatch vm-exit to handlers
@@ -981,6 +1132,7 @@ VMState Hypervisor::ProcessVMExit() {
         SerialLogger::LogHex64(VMM::VMRead(VMCS_GUEST_RIP));
         SerialLogger::Log(" rax=0x");
         SerialLogger::LogHex64(vcpu->regs[0]);
+        SerialLogger::Log(" rsi=0x"); SerialLogger::LogHex64(vcpu->regs[6]); SerialLogger::Log(" rbp=0x"); SerialLogger::LogHex64(vcpu->regs[5]);
         SerialLogger::Log(" apic=");
         SerialLogger::LogDec((int)HVApicId());
         SerialLogger::Log("\r\n");
@@ -1081,8 +1233,171 @@ bool Hypervisor::HandleGuestIO(uint16_t port, bool is_out, uint8_t size,
     if (port == 0xCF9 && is_out && (value & 0x04)) { NoteRebootRequest(); return true; }
     if (port == 0xCF9) { if (!is_out) value = 0; return true; }
 
+    // a multiboot2 (kurono) guest probes a real 8042 (satoru)
+    if (i8042_on && VI8042::HandlePort(port, is_out, value)) return true;
+
     // unhandled
     return false;
+}
+
+
+static uint64_t g_disk_virt = 0;
+void Hypervisor::SetDiskVirtualGb(uint32_t gb) { g_disk_virt = (uint64_t)gb << 30; }
+
+//  smp guests: vcpu bookkeeping, mp table, init / sipi (satoru)
+
+extern "C" uint8_t g_vmx_guest_fx[512];
+namespace {
+    // what is left to swap per vcpu when they take turns on one cpu: cr2 (not in the vmcs).
+    // the fx image, the switched msrs and the debug registers live in each vCPU now (satoru)
+    struct VAux { uint64_t cr2; };
+    VAux g_aux[8];
+}
+
+void Hypervisor::SetGuestCpus(int n) { want_cpus = n < 1 ? 1 : (n > 8 ? 8 : n); }
+int  Hypervisor::GuestCpus() { return nvcpus; }
+int  Hypervisor::CurrentVcpu() { return cur_vcpu; }
+
+void Hypervisor::SwitchVcpu(int k) {
+    if (k < 0 || k >= nvcpus || !vcpus[k]) return;
+    if (k != cur_vcpu) {
+        asm volatile("mov %%cr2, %0" : "=r"(g_aux[cur_vcpu].cr2));        // cr2 is not in the vmcs: a guest page fault's address would be lost across a switch (satoru)
+        asm volatile("mov %0, %%cr2" : : "r"(g_aux[k].cr2) : "memory");
+        cur_vcpu = k;
+        vcpu = vcpus[k];
+    }
+    VMM::SetCurrent(vcpu);
+    VMM::VMPtrLoad(vcpu->vmcs);
+}
+
+void Hypervisor::SetupAPs() {
+    if (g_par_on) return;                       // each ap thread builds its vmcs on its own cpu (satoru)
+    for (int i = 0; i < 8; i++) g_aux[i].cr2 = 0;
+    for (int k = 1; k < nvcpus; k++) {
+        if (!VMM::SetupVCPU(vcpus[k])) { SerialLogger::Log("Hypervisor: AP setup failed\r\n"); nvcpus = k; break; }
+        if (ept_root) VMM::VMWrite(VMCS_EPT_POINTER, EPTManager::BuildEPTP(ept_root));
+        if (io_bitmap_a) VMM::VMWrite(VMCS_IO_BITMAP_A, KernelPhysOf(io_bitmap_a));
+        if (io_bitmap_b) VMM::VMWrite(VMCS_IO_BITMAP_B, KernelPhysOf(io_bitmap_b));
+        if (msr_bitmap) VMM::VMWrite(VMCS_MSR_BITMAP_ADDR, KernelPhysOf(msr_bitmap));
+    }
+    if (nvcpus > 1) {
+        // vmx preemption timer: every vcpu exits about every 100 us, so lapic timers fire on
+        // time and a spinning vcpu cannot hold the thread for a whole host tick (satoru)
+        uint64_t basic = VMM::ReadMSR(0x480);
+        uint64_t pin = VMM::ReadMSR(((basic >> 55) & 1) ? 0x48D : 0x481);
+        uint32_t rate = (uint32_t)(VMM::ReadMSR(0x485) & 0x1F);
+        uint64_t tsc = CPUDetect::GetInfo().frequency.tsc_frequency;
+        if (tsc < 1000000ULL) tsc = 2000000000ULL;
+        uint64_t ticks = (tsc / 10000) >> rate;
+        if (ticks < 1) ticks = 1;
+        if ((pin >> 32) & PIN_PREEMPT_TIMER) {
+            for (int k = 0; k < nvcpus; k++) {
+                VMM::VMPtrLoad(vcpus[k]->vmcs);
+                VMM::VMWrite(VMCS_PIN_BASED_CONTROLS, VMM::VMRead(VMCS_PIN_BASED_CONTROLS) | PIN_PREEMPT_TIMER);
+                VMM::VMWrite(0x482E, ticks);
+            }
+            SerialLogger::Log("[smp] preemption timer on\r\n");
+        }
+        VMM::VMPtrLoad(vcpus[0]->vmcs);
+    }
+}
+
+void Hypervisor::StartAP(int k, uint8_t vector) {
+    if (k <= 0 || k >= nvcpus || ap_state[k]) return;
+    int back = cur_vcpu;
+    SwitchVcpu(k);
+    VMM::SetupVMCSGuestState(vcpu);                         // real mode power-on state
+    {   // same cr0 / cr4 ownership as the bsp (sdm 26.3.1.1: guest cr4 must carry vmxe) (satoru)
+        uint64_t f0 = 0, f1 = ~0ULL;
+        VMM::SafeReadMSR(MSR_IA32_VMX_CR0_FIXED0, f0);
+        VMM::VMWrite(VMCS_CR0_GUEST_HOST_MASK, f0 & ~((1ULL << 0) | (1ULL << 31)));
+        VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED0, f0);
+        VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED1, f1);
+        VMM::VMWrite(VMCS_GUEST_CR4, f0 & f1);
+        VMM::VMWrite(VMCS_CR4_GUEST_HOST_MASK, f0 | ~f1);
+        VMM::VMWrite(VMCS_CR4_READ_SHADOW, 0);
+    }
+    uint64_t seg = (uint64_t)vector << 8;
+    VMM::VMWrite(VMCS_GUEST_CS_SEL, seg);
+    VMM::VMWrite(VMCS_GUEST_CS_BASE, seg << 4);
+    VMM::VMWrite(VMCS_GUEST_RIP, 0);
+    for (int i = 0; i < 16; i++) vcpu->regs[i] = 0;
+    for (int i = 0; i < 5; i++) vcpu->sw_msr[i] = 0;
+    for (int i = 0; i < 8; i++) vcpu->dr[i] = 0;
+    vcpu->dr[6] = 0xFFFF0FF0ULL; vcpu->dr[7] = 0x400ULL;
+    for (int i = 0; i < 512; i++) vcpu->fx[i] = g_vmx_guest_fx[i];
+    g_aux[k].cr2 = 0;
+    ap_state[k] = 1; vhalted[k] = false;
+    SerialLogger::Log("[smp] vcpu "); SerialLogger::LogDec(k); SerialLogger::Log(" started at page 0x");
+    SerialLogger::LogHex(vector); SerialLogger::Log("\r\n");
+    SwitchVcpu(back);
+}
+
+void Hypervisor::DumpSmp() {
+    if (nvcpus < 2) return;
+    int back = cur_vcpu;
+    for (int k = 0; k < nvcpus; k++) {
+        SwitchVcpu(k);
+        SerialLogger::Log("[smp] vcpu "); SerialLogger::LogDec(k);
+        SerialLogger::Log(ap_state[k] ? (vhalted[k] ? " halted" : " running") : " parked");
+        SerialLogger::Log(" rip=0x"); SerialLogger::LogHex64(VMM::VMRead(VMCS_GUEST_RIP));
+        SerialLogger::Log(" cs=0x"); SerialLogger::LogHex64(VMM::VMRead(VMCS_GUEST_CS_SEL));
+        SerialLogger::Log(" cr0=0x"); SerialLogger::LogHex64(VMM::VMRead(VMCS_GUEST_CR0));
+        SerialLogger::Log(" rfl=0x"); SerialLogger::LogHex64(VMM::VMRead(VMCS_GUEST_RFLAGS));
+        SerialLogger::Log(" gsb=0x"); SerialLogger::LogHex64(VMM::VMRead(VMCS_GUEST_GS_BASE));
+        SerialLogger::Log(" exit="); SerialLogger::LogDec((int)(vcpu->exit_reason & 0xFFFF));
+        SerialLogger::Log("\r\n");
+    }
+    SwitchVcpu(back);
+    VLapic::DumpCounts();
+}
+
+void Hypervisor::LapicIpi(int target, int mode, uint8_t vector) {
+    if (target <= 0 || target >= nvcpus) return;
+    if (g_par_on) {                                         // the ap thread starts itself (satoru)
+        if (mode == 6 && g_ap_start[target] == 0 && ap_state[target] == 0) { g_ap_vec[target] = vector; __atomic_store_n(&g_ap_start[target], (uint8_t)1, __ATOMIC_RELEASE); KickVcpu(target); }
+        return;
+    }
+    if (mode == 5) {                                        // init: park the cpu until a sipi
+        if (ap_state[target]) SerialLogger::Log("[smp] init ipi\r\n");
+        ap_state[target] = 0; vhalted[target] = false;
+        VLapic::ResetOne(target);
+    } else if (mode == 6) {
+        StartAP(target, vector);
+    }
+}
+
+// intel mp table in the bios area (0xf0000..): lapics only, pic mode (imcr present) (satoru)
+void Hypervisor::BuildMpTable(int n) {
+    uint8_t* rom = GuestMemoryManager::GetROMArea();
+    if (!rom) return;
+    uint8_t* cfg = rom + (0xF0100 - GUEST_ROM_BASE);
+    uint8_t* mpf = rom + (0xF0010 - GUEST_ROM_BASE);
+    uint32_t sig, d0, d1, d2;
+    asm volatile("cpuid" : "=a"(sig), "=b"(d0), "=c"(d1), "=d"(d2) : "a"(1), "c"(0));
+    memset(cfg, 0, 512);
+    memcpy(cfg, "PCMP", 4);
+    cfg[6] = 4;
+    memcpy(cfg + 8, "KURONO  ", 8);
+    memcpy(cfg + 16, "KURONO VM   ", 12);
+    uint32_t lapic = 0xFEE00000; memcpy(cfg + 36, &lapic, 4);
+    uint8_t* e = cfg + 44;
+    for (int c = 0; c < n; c++) {
+        e[0] = 0; e[1] = (uint8_t)c; e[2] = 0x14; e[3] = (uint8_t)(1 | (c == 0 ? 2 : 0));
+        memcpy(e + 4, &sig, 4); memcpy(e + 8, &d2, 4);
+        e += 20;
+    }
+    e[0] = 1; e[1] = 0; memcpy(e + 2, "ISA   ", 6); e += 8;
+    uint16_t cnt = (uint16_t)(n + 1), len = (uint16_t)(e - cfg);
+    memcpy(cfg + 34, &cnt, 2); memcpy(cfg + 4, &len, 2);
+    uint8_t sum = 0; for (int i = 0; i < len; i++) sum = (uint8_t)(sum + cfg[i]);
+    cfg[7] = (uint8_t)(0 - sum);
+    memset(mpf, 0, 16);
+    memcpy(mpf, "_MP_", 4);
+    uint32_t pp = 0xF0100; memcpy(mpf + 4, &pp, 4);
+    mpf[8] = 1; mpf[9] = 4; mpf[11] = 0; mpf[12] = 0x80;     // feature1 0 = table, feature2 bit 7 = imcr
+    sum = 0; for (int i = 0; i < 16; i++) sum = (uint8_t)(sum + mpf[i]);
+    mpf[10] = (uint8_t)(0 - sum);
 }
 
 //  handleguestmmio - route mmio to virtual devices
@@ -1165,12 +1480,22 @@ void Hypervisor::CheckAndInjectPendingIRQs() {
     // cannot take it, ask for an interrupt-window exit (sdm 26.7.5) (satoru)
     if (vcpu && vcpu->type == VIRT_INTEL_VTX) {
         VirtualPIC& m = VirtualDevices::GetMasterPIC();
-        // cascade: a pending slave request drives master line 2, which
-        // nothing did before, so irqs 8-15 were never delivered (satoru)
-        if (VirtualDevices::GetSlavePIC().GetHighestPriorityIRQ() >= 0) m.SetIRQ(2, true);
-        int hi = m.GetHighestPriorityIRQ();
-        bool pending = hi >= 0 && (hi != 2 || VirtualDevices::GetSlavePIC().GetHighestPriorityIRQ() >= 0);
-        if (pending) {
+        // smp: the pic feeds the bsp only (virtual wire); every vcpu has a lapic (satoru)
+        bool bsp = (cur_vcpu == 0);
+        // a one-vcpu kurono guest still runs its tick on the lapic timer
+        // (SMP::StartBspLapicTick): the old single-vcpu VirtualAPIC never
+        // delivered it, so the guest got no timer once the 8259 tick stopped
+        // (satoru)
+        int lv = (nvcpus > 1 || mb2_guest) ? VLapic::Pending(cur_vcpu) : -1;
+        bool pending = false;
+        if (bsp) {
+            // cascade: a pending slave request drives master line 2, which
+            // nothing did before, so irqs 8-15 were never delivered (satoru)
+            if (VirtualDevices::GetSlavePIC().GetHighestPriorityIRQ() >= 0) m.SetIRQ(2, true);
+            int hi = m.GetHighestPriorityIRQ();
+            pending = hi >= 0 && (hi != 2 || VirtualDevices::GetSlavePIC().GetHighestPriorityIRQ() >= 0);
+        }
+        if (pending || lv >= 0) {
             VMM::VMPtrLoad(vcpu->vmcs);
             uint64_t rflags = VMM::VMRead(VMCS_GUEST_RFLAGS);
             uint64_t intr = VMM::VMRead(VMCS_GUEST_INTERRUPTIBILITY);
@@ -1181,8 +1506,9 @@ void Hypervisor::CheckAndInjectPendingIRQs() {
                     VMM::VMWrite(VMCS_PROC_BASED_CONTROLS,
                                  VMM::VMRead(VMCS_PROC_BASED_CONTROLS) | PROC_INT_WINDOW_EXIT);
             } else {
-                int irq = VirtualDevices::GetPendingIRQ();
+                int irq = pending ? VirtualDevices::GetPendingIRQ() : -1;
                 if (irq >= 0) InjectInterrupt((uint8_t)irq);
+                else if (lv >= 0 && InjectInterrupt((uint8_t)lv)) VLapic::Accept(cur_vcpu, lv);
             }
         }
     } else {
@@ -1224,6 +1550,8 @@ void Hypervisor::TickDevices() {
     VirtIOGPUHost::ProcessQueues();
     VirtIOGPUHost::PresentIfDirty();
     VirtioPollAll();    // doorbell-less work from the guest (satoru)
+    if (i8042_on) VI8042::Tick();   // host-typed keys -> irq1 (satoru)
+    if (mb2_guest) PCIPassthrough::TickIntx();   // passed-through INTx -> guest (satoru)
 }
 
 //  pause / resume
@@ -1357,6 +1685,7 @@ bool Hypervisor::BootAlpine() {
 static void DumpGuestPrintkText() {
     uint8_t* ram = GuestMemoryManager::GetHighRAM();
     uint32_t sz = GuestMemoryManager::GetHighRAMSize();
+    if (sz > GuestMemoryManager::ChunkBytes()) sz = GuestMemoryManager::ChunkBytes();   // chunk 0 is all that is contiguous (satoru)
     if (!ram || sz < 64) return;
     static const char pat[] = "Linux version 6";
     const uint32_t pl = sizeof(pat) - 1;
@@ -1588,6 +1917,16 @@ static void PumpGuestConsole(VirtualSerial& ser, char* keep, int& keep_len, int 
 
 void Hypervisor::SetOwner(void* proc) { owner_proc = proc; }
 
+void Hypervisor::GuestIrqState(uint64_t* rf, uint64_t* in, uint64_t* ij, uint64_t* pc) {
+    *rf = *in = *ij = *pc = 0;
+    if (!vcpu || vcpu->type != VIRT_INTEL_VTX || ForeignCaller()) return;
+    if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) return;
+    *rf = VMM::VMRead(VMCS_GUEST_RFLAGS);
+    *in = VMM::VMRead(VMCS_GUEST_INTERRUPTIBILITY);
+    *ij = VMM::VMRead(VMCS_ENTRY_INT_INFO);
+    *pc = VMM::VMRead(VMCS_PROC_BASED_CONTROLS);
+}
+
 uint64_t Hypervisor::GuestRIP() {
     if (!vcpu || vcpu->type != VIRT_INTEL_VTX || ForeignCaller()) return 0;
     if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) return 0;
@@ -1641,8 +1980,15 @@ bool Hypervisor::PrepareLinuxGuest(const LinuxGuestSpec& spec) {
     GuestConsole::Init(1, 3, "virtio-console-agent");
     GuestConsole::Init(2, 11, "virtio-console-wayland");   // wayland bridge channel (satoru)
     GuestConsole::Init(3, 7, "virtio-console-audio");      // guest pulse pcm channel (satoru)
-    if (spec.disk_bytes) VBlk::Init(spec.disk_lba, spec.disk_bytes, 10, spec.disk_id);
+    if (spec.disk_bytes) {
+        // dynamic mode: the guest sees a bigger disk than the image; the rest is chunk files (satoru)
+        bool deb = (linux_guest_profile == LINUX_GUEST_DEBIAN);
+        VBlk::Init(spec.disk_lba, spec.disk_bytes, 10, spec.disk_id,
+                   deb ? "DEBIAN  " : "ALPINE  ",
+                   deb ? "DEBIAN  IMG" : "ALPINE  IMG", g_disk_virt);
+    }
     if (spec.net) VNet::Init(9);
+    if (GuestMemoryManager::IsLazy()) VBalloon::Init(6);     // dynamic mode: free page reporting (satoru)
     if (!LoadLinuxKernel(spec.kernel, spec.kernel_size, spec.cmdline) || !LoadInitrd(spec.initrd, spec.initrd_size)) {
         SerialLogger::Log("Hypervisor: failed to load the guest kernel / initramfs\r\n");
         DestroyVM();
@@ -1654,7 +2000,55 @@ bool Hypervisor::PrepareLinuxGuest(const LinuxGuestSpec& spec) {
     return vm_state == VM_STATE_RUNNING || vm_state == VM_STATE_PAUSED;
 }
 
-bool Hypervisor::DebianPrepare() {
+bool Hypervisor::PrepareMultiboot2Guest(const uint8_t* elf, uint64_t size, const char* cmdline, uint32_t ram_mb) {
+    guest_halted = false;
+    reboot_requested = false;
+    mb2_mode = false;
+    if (vm_state != VM_STATE_UNINITIALIZED && vm_state != VM_STATE_DESTROYED) DestroyVM();
+    Init();
+    hw_available = VMM::IsSupported();
+    if (!hw_available) { SerialLogger::Log("Hypervisor: a multiboot2 guest needs vt-x\r\n"); return false; }
+    VMConfig cfg;
+    cfg.SetDefaults();
+    cfg.ram_mb        = ram_mb ? ram_mb : 1024;
+    cfg.disk_size_mb  = 0;
+    cfg.enable_serial = true;     // the guest's whole log comes out of com1 (satoru)
+    cfg.enable_disk   = false;
+    cfg.enable_apic   = true;
+    cfg.enable_gpu    = false;
+    cfg.timer_tick_us = 1000;
+    cfg.cmdline       = cmdline;
+    if (!CreateVM(cfg)) { SerialLogger::Log("Hypervisor: CreateVM failed\r\n"); return false; }
+    if (GuestMemoryManager::GetTotalRAM() < (cfg.ram_mb - 1) * 1024u * 1024u) {
+        SerialLogger::Log("Hypervisor: not enough host memory for the guest\r\n");
+        DestroyVM();
+        return false;
+    }
+    VI8042::Reset();
+    i8042_on = true;
+    mb2_guest = true;
+    // kurono.vm.pt devices (satoru)
+    if (PCIPassthrough::ReservedCount()) {
+        int n = PCIPassthrough::AttachReserved(ept_root);
+        SerialLogger::Log("Hypervisor: passthrough devices attached: ");
+        SerialLogger::LogDec(n);
+        SerialLogger::Log("\r\n");
+    }
+    uint32_t entry = 0, info = 0;
+    if (!MB2Boot::Load(elf, size, cmdline, &entry, &info)) {
+        SerialLogger::Log("Hypervisor: multiboot2 load failed: ");
+        SerialLogger::Log(MB2Boot::Error());
+        SerialLogger::Log("\r\n");
+        DestroyVM();
+        return false;
+    }
+    mb2_entry = entry; mb2_info = info; mb2_mode = true;
+    RunVM(1);
+    mb2_mode = false;
+    return vm_state == VM_STATE_RUNNING || vm_state == VM_STATE_PAUSED;
+}
+
+bool Hypervisor::DebianPrepare(uint32_t ram_mb, bool debug) {
     // debian's own cloud kernel + a small initramfs (DEBKERN.BIN / DEBINIT.BIN
     // on the kurono partition); the rootfs DEBIAN.IMG behind virtio-blk. (satoru)
     static const char deb83[11] = { 'D','E','B','I','A','N',' ',' ','I','M','G' };
@@ -1664,11 +2058,21 @@ bool Hypervisor::DebianPrepare() {
     sp.kernel_size = KAsset::Size("DEBKERN BIN", nullptr, nullptr);
     sp.initrd = KAsset::Data("DEBINIT BIN", nullptr, nullptr);
     sp.initrd_size = KAsset::Size("DEBINIT BIN", nullptr, nullptr);
-    sp.cmdline = "console=hvc0 rdinit=/init kroot=/dev/vda nokaslr noapic nolapic nosmp acpi=off";
-    sp.ram_mb = 768;
-    DiskLog::ArmGuestImage(deb83, &sp.disk_lba, &sp.disk_bytes);
+    if (!sp.kernel || !sp.kernel_size || !sp.initrd || !sp.initrd_size) {
+        SerialLogger::Log("Hypervisor: DEBKERN.BIN / DEBINIT.BIN missing from the KURONO partition\r\n");
+        return false;
+    }
+    sp.cmdline = debug
+        ? "console=ttyS0 console=hvc0 rdinit=/init kroot=/dev/vda loglevel=7 nokaslr noapic nolapic nosmp acpi=off panic=5"
+        : "console=hvc0 rdinit=/init kroot=/dev/vda loglevel=4 nokaslr noapic nolapic nosmp acpi=off panic=5";
+    sp.ram_mb = ram_mb ? ram_mb : 768;
+    if (!DiskLog::ArmGuestImage(deb83, &sp.disk_lba, &sp.disk_bytes)) {
+        SerialLogger::Log("Hypervisor: DEBIAN.IMG missing or fragmented in the KURONO partition\r\n");
+        return false;
+    }
     sp.disk_id = "kurono-debian";
     sp.net = true;
+    sp.gpu = false;
     debian_boot_log_len = 0;
     debian_boot_log[0] = 0;
     debian_booted = false;
@@ -1691,6 +2095,8 @@ VMState Hypervisor::RunSlice(uint32_t budget_us, bool* idle) {
     vm_state = VM_STATE_RUNNING;
     uint64_t t0 = VMExitHandler::GuestClockNs() / 1000;
     if (g_slice_last_us == 0 || t0 < g_slice_last_us) g_slice_last_us = t0;
+    if (nvcpus > 1 && g_par_on) return RunSlicePar(budget_us, idle);
+    if (nvcpus > 1) return RunSliceSmp(budget_us, idle);
     for (;;) {
         uint64_t now = VMExitHandler::GuestClockNs() / 1000;
         if (now - g_slice_last_us >= 250) {
@@ -1711,8 +2117,11 @@ VMState Hypervisor::RunSlice(uint32_t budget_us, bool* idle) {
             VNet::Poll();
             VirtioPollAll();
         }
+        // a kurono guest ticks from its lapic timer (VLapic, see vdevices
+        // HandleMMIO): fire it here and let it wake a halted guest (satoru)
+        if (mb2_guest) VLapic::Poll(VMExitHandler::GuestClockNs());
         if (guest_halted) {
-            if (!GuestIrqPending()) {
+            if (!GuestIrqPending() && !(mb2_guest && VLapic::Pending(0) >= 0)) {
                 // hlt with interrupts off never wakes: linux's poweroff path
                 // (no acpi here) ends exactly like that (satoru)
                 if (vcpu && vcpu->type == VIRT_INTEL_VTX &&
@@ -1728,6 +2137,331 @@ VMState Hypervisor::RunSlice(uint32_t budget_us, bool* idle) {
         vm_state = RunOneCycle();
         if (reboot_requested) { reboot_requested = false; vm_state = VM_STATE_REBOOTING; }
         if (vm_state != VM_STATE_RUNNING) break;
+        if (VMExitHandler::GuestClockNs() / 1000 - t0 >= budget_us) break;
+    }
+    return vm_state;
+}
+
+// ---- parallel vcpus (satoru)
+// the bsp stays on the vm host thread; every other vcpu gets a kernel thread of its own on a service
+// cpu. one big vm lock (g_vlock) covers every exit handler, interrupt injection and the device pumps;
+// the guest itself runs outside it. lock order: kls (only for exits that reach the device models)
+// first, then g_vlock. the order is never reversed. (satoru)
+static volatile uint32_t g_vlock = 0;
+static inline void vlock() { while (__atomic_exchange_n(&g_vlock, 1u, __ATOMIC_ACQUIRE)) while (g_vlock) __asm__ volatile("pause"); }
+static inline void vunlock() { __atomic_store_n(&g_vlock, 0u, __ATOMIC_RELEASE); }
+static volatile bool g_par_run = false;       // ap threads may run guests
+static uint32_t g_vcpu_cpu[8];
+static uint32_t g_bsp_cpu = 0;
+static volatile bool g_ap_spawned[8];
+static volatile uint32_t g_sync_req = 0, g_sync_ready = 0, g_sync_done = 0, g_sync_ping = 0, g_sync_pong = 0;
+static volatile uint64_t g_sync_t2 = 0;
+static volatile uint32_t g_sync_owner = 0;
+static inline uint64_t rdtsc_raw() { uint32_t lo, hi; asm volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+
+bool Hypervisor::ParActive() { return g_par_on; }
+void Hypervisor::ParLock() { if (g_par_on) vlock(); }
+void Hypervisor::ParUnlock() { if (g_par_on) vunlock(); }
+void Hypervisor::ParSetCtx(int k) { cur_vcpu = k; vcpu = vcpus[k]; VMM::SetCurrent(vcpu); }
+
+void Hypervisor::KickVcpu(int c) {
+    if (!g_par_on || c < 0 || c >= nvcpus) return;
+    uint32_t cpu = c == 0 ? g_bsp_cpu : g_vcpu_cpu[c];
+    if (cpu && cpu != SMP::CpuIndex()) SMP::KickCpu(cpu);
+    else if (!cpu && c == 0 && SMP::CpuIndex() != g_bsp_cpu) SMP::KickCpu(g_bsp_cpu);
+}
+
+// the bsp side of the tsc handshake: answer pings in a tight loop while an ap measures (satoru)
+static void par_serve_sync() {
+    if (!g_sync_req) return;
+    g_sync_ready = 1;
+    uint32_t last = 0;
+    uint64_t guard = rdtsc_raw() + 400000000ULL;
+    while (!g_sync_done && rdtsc_raw() < guard) {
+        uint32_t p = g_sync_ping;
+        if (p != last) { g_sync_t2 = rdtsc_raw(); __atomic_store_n(&g_sync_pong, p, __ATOMIC_RELEASE); last = p; }
+        __asm__ volatile("pause");
+    }
+    g_sync_ready = 0; g_sync_req = 0;
+}
+
+// the ap side: offset so that this cpu's tsc + offset is the bsp cpu's tsc (satoru)
+static int64_t par_tsc_offset() {
+    while (__atomic_exchange_n(&g_sync_owner, 1u, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    g_sync_done = 0; g_sync_ping = 0; g_sync_pong = 0;
+    g_sync_req = 1;
+    uint64_t wait_until = rdtsc_raw() + 2000000000ULL;
+    while (!g_sync_ready && rdtsc_raw() < wait_until) __asm__ volatile("pause");
+    int64_t best_off = 0; uint64_t best_rtt = ~0ULL;
+    if (g_sync_ready) {
+        for (uint32_t i = 1; i <= 64; i++) {
+            uint64_t t1 = rdtsc_raw();
+            __atomic_store_n(&g_sync_ping, i, __ATOMIC_RELEASE);
+            uint64_t to = t1 + 40000000ULL;
+            while (g_sync_pong != i && rdtsc_raw() < to) __asm__ volatile("pause");
+            uint64_t t4 = rdtsc_raw();
+            if (g_sync_pong != i) break;
+            uint64_t t2 = g_sync_t2;
+            uint64_t rtt = t4 - t1;
+            if (rtt < best_rtt) { best_rtt = rtt; best_off = (int64_t)t2 - (int64_t)((t1 >> 1) + (t4 >> 1)); }
+        }
+    }
+    g_sync_done = 1;
+    __atomic_store_n(&g_sync_owner, 0u, __ATOMIC_RELEASE);
+    return best_off;
+}
+
+static bool par_exit_needs_kls(vCPU* c) {
+    uint32_t r = c->exit_reason & 0xFFFF;
+    if (r == 30 || r == 18) return true;                     // port io, vmcall
+    if (r == 48 || r == 49) {
+        uint64_t gpa = VMM::VMRead(VMCS_GUEST_PHYS_ADDR);
+        if (gpa >= GUEST_LAPIC_BASE && gpa < GUEST_LAPIC_BASE + 0x1000) return false;
+        if (gpa < (uint64_t)GUEST_HIGH_RAM_START + GuestMemoryManager::GetHighRAMSize()) return false;   // ram (lazy backing)
+        return true;
+    }
+    return false;
+}
+
+static void par_idle_hlt() { __asm__ volatile("sti; hlt" ::: "memory"); }
+
+void Hypervisor::ApMain(int k) {
+    for (;;) {
+        if (!g_par_run || g_ap_start[k] != 1) { par_idle_hlt(); continue; }
+        vCPU* c = vcpus[k];
+        if (!c || !ept_root) { g_ap_start[k] = 0; continue; }
+        // 1. vmx root + the vmcs on this cpu
+        if (!VMM::SetupVCPU(c)) { SerialLogger::Log("[par] vcpu setup failed\r\n"); g_ap_start[k] = 0; continue; }
+        VMM::VMWrite(VMCS_EPT_POINTER, EPTManager::BuildEPTP(ept_root));
+        if (io_bitmap_a) VMM::VMWrite(VMCS_IO_BITMAP_A, KernelPhysOf(io_bitmap_a));
+        if (io_bitmap_b) VMM::VMWrite(VMCS_IO_BITMAP_B, KernelPhysOf(io_bitmap_b));
+        if (msr_bitmap) VMM::VMWrite(VMCS_MSR_BITMAP_ADDR, KernelPhysOf(msr_bitmap));
+        {   // same cr0 / cr4 ownership as the bsp
+            uint64_t f0 = 0, f1 = ~0ULL;
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR0_FIXED0, f0);
+            VMM::VMWrite(VMCS_CR0_GUEST_HOST_MASK, f0 & ~((1ULL << 0) | (1ULL << 31)));
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED0, f0);
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED1, f1);
+            VMM::VMWrite(VMCS_GUEST_CR4, f0 & f1);
+            VMM::VMWrite(VMCS_CR4_GUEST_HOST_MASK, f0 | ~f1);
+            VMM::VMWrite(VMCS_CR4_READ_SHADOW, 0);
+        }
+        // preemption timer (~100 us) and the tsc offset
+        {
+            uint64_t basic = VMM::ReadMSR(0x480);
+            uint64_t pin = VMM::ReadMSR(((basic >> 55) & 1) ? 0x48D : 0x481);
+            uint32_t rate = (uint32_t)(VMM::ReadMSR(0x485) & 0x1F);
+            uint64_t tsc = CPUDetect::GetInfo().frequency.tsc_frequency;
+            if (tsc < 1000000ULL) tsc = 2000000000ULL;
+            uint64_t ticks = (tsc / 10000) >> rate; if (ticks < 1) ticks = 1;
+            if ((pin >> 32) & PIN_PREEMPT_TIMER) {
+                VMM::VMWrite(VMCS_PIN_BASED_CONTROLS, VMM::VMRead(VMCS_PIN_BASED_CONTROLS) | PIN_PREEMPT_TIMER);
+                VMM::VMWrite(0x482E, ticks);
+            }
+        }
+        int64_t off = par_tsc_offset();
+        VMExitHandler::SetTscOffset(SMP::CpuIndex(), off);
+        VMM::VMWrite(VMCS_PROC_BASED_CONTROLS, VMM::VMRead(VMCS_PROC_BASED_CONTROLS) | PROC_USE_TSC_OFFSET);
+        VMM::VMWrite(0x2010, (uint64_t)off);
+        // 2. real mode start at the sipi page
+        VMM::SetupVMCSGuestState(c);
+        {
+            uint64_t f0 = 0, f1 = ~0ULL;
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED0, f0);
+            VMM::SafeReadMSR(MSR_IA32_VMX_CR4_FIXED1, f1);
+            VMM::VMWrite(VMCS_GUEST_CR4, f0 & f1);
+        }
+        uint64_t seg = (uint64_t)g_ap_vec[k] << 8;
+        VMM::VMWrite(VMCS_GUEST_CS_SEL, seg);
+        VMM::VMWrite(VMCS_GUEST_CS_BASE, seg << 4);
+        VMM::VMWrite(VMCS_GUEST_RIP, 0);
+        for (int i = 0; i < 16; i++) c->regs[i] = 0;
+        for (int i = 0; i < 5; i++) c->sw_msr[i] = 0;
+        for (int i = 0; i < 8; i++) c->dr[i] = 0;
+        c->dr[6] = 0xFFFF0FF0ULL; c->dr[7] = 0x400ULL;
+        for (int i = 0; i < 512; i++) c->fx[i] = g_vmx_guest_fx[i];
+        c->launched = false;
+        uint32_t seen_gen = g_ept_gen;
+        { uint64_t d[2] = { 0, 0 }; (void)d; }
+        g_ap_start[k] = 2; ap_state[k] = 1; vhalted[k] = false;
+        SerialLogger::Log("[par] vcpu "); SerialLogger::LogDec(k); SerialLogger::Log(" runs on cpu ");
+        SerialLogger::LogDec((int)SMP::CpuIndex()); SerialLogger::Log(" tsc offset "); SerialLogger::LogDec((int)(off / 1000)); SerialLogger::Log(" kcycles\r\n");
+        // 3. run
+        while (g_par_run && g_ap_start[k] == 2) {
+            vlock(); ParSetCtx(k);
+            VLapic::Poll(VMExitHandler::GuestClockNs());
+            if (vhalted[k]) {
+                if (VLapic::Pending(k) < 0) { vunlock(); par_idle_hlt(); continue; }
+                vhalted[k] = false;
+            }
+            CheckAndInjectPendingIRQs();
+            vunlock();
+            { uint32_t g = g_ept_gen; if (g != seen_gen || g != g_seen_gen[k]) { seen_gen = g; EPTManager::InvalidateEPT(); g_seen_gen[k] = g; } }
+            __atomic_store_n(&g_in_guest[k], (uint8_t)1, __ATOMIC_SEQ_CST);
+            int er = VMM::RunVCPU(c);
+            __atomic_store_n(&g_in_guest[k], (uint8_t)0, __ATOMIC_SEQ_CST);
+            if (er < 0) { vlock(); if (vm_state == VM_STATE_RUNNING) vm_state = VM_STATE_CRASHED; vunlock(); break; }
+            bool kls = Scheduler::SchedV2() && par_exit_needs_kls(c);
+            if (kls) LinuxSyscall::LayerLock();
+            vlock(); ParSetCtx(k);
+            VMState st = ProcessVMExit();
+            if (reboot_requested) { reboot_requested = false; st = VM_STATE_REBOOTING; }
+            if (st != VM_STATE_RUNNING && vm_state == VM_STATE_RUNNING) vm_state = st;
+            vunlock();
+            if (kls) LinuxSyscall::LayerUnlock();
+            if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) break;
+        }
+        // 4. leave vmx state of this vcpu on this cpu
+        VMM::VMClear(c->vmcs);
+        ap_state[k] = 0; vhalted[k] = false;
+        g_ap_start[k] = 0;
+    }
+}
+
+template<int K> static void ap_tramp() { Hypervisor::ApMain(K); }
+
+void Hypervisor::ParStart() {
+    g_par_on = false;
+    if (nvcpus < 2 || !VMHost::Par()) return;
+    for (int k = 1; k < nvcpus; k++) if (!Scheduler::VcpuCpu(k)) return;      // not planned: time-multiplexed instead
+    static void (*const tr[8])() = { nullptr, ap_tramp<1>, ap_tramp<2>, ap_tramp<3>, ap_tramp<4>, ap_tramp<5>, ap_tramp<6>, ap_tramp<7> };
+    static const char* nm[8] = { "", "vmcpu1", "vmcpu2", "vmcpu3", "vmcpu4", "vmcpu5", "vmcpu6", "vmcpu7" };
+    for (int k = 1; k < nvcpus; k++) {
+        g_vcpu_cpu[k] = Scheduler::VcpuCpu(k);
+        g_ap_start[k] = 0;
+        if (!g_ap_spawned[k]) { g_ap_spawned[k] = true; Scheduler::SpawnKernelProcess(nm[k], tr[k], PRIO_NORMAL, 64, 256); }
+    }
+    g_bsp_cpu = SMP::CpuIndex();
+    g_vlock = 0; g_sync_req = 0; g_sync_owner = 0;
+    g_par_on = true; g_par_run = true;
+    VLapic::SetKick(KickVcpu);
+    SerialLogger::Log("[par] parallel vcpus on\r\n");
+}
+
+void Hypervisor::ParStop() {
+    if (!g_par_on) return;
+    g_par_run = false;
+    for (int k = 1; k < nvcpus; k++) KickVcpu(k);
+    uint64_t t0 = Timer::GetRealMs64();
+    for (;;) {
+        bool any = false;
+        for (int k = 1; k < nvcpus; k++) if (g_ap_start[k] != 0) any = true;
+        if (!any || Timer::GetRealMs64() - t0 > 1500) break;
+        for (int k = 1; k < nvcpus; k++) KickVcpu(k);
+        Scheduler::SleepMs(1);
+    }
+    VLapic::SetKick(nullptr);
+    g_par_on = false;
+}
+
+VMState Hypervisor::RunSlicePar(uint32_t budget_us, bool* idle) {
+    uint64_t t0 = VMExitHandler::GuestClockNs() / 1000;
+    for (;;) {
+        par_serve_sync();
+        vlock();
+        uint64_t nowns = VMExitHandler::GuestClockNs();
+        uint64_t now = nowns / 1000;
+        if (now - g_slice_last_us >= 250) {
+            uint64_t d = now - g_slice_last_us;
+            if (d > 100000) d = 100000;
+            g_slice_last_us = now;
+            stats.tick_count++;
+            VirtualDevices::Tick((uint32_t)d);
+            if (config.enable_serial) serial.Tick((uint32_t)d);
+            GuestConsole::Poll(0); GuestConsole::Poll(1); GuestConsole::Poll(2); GuestConsole::Poll(3);
+            VNet::Poll();
+            VirtioPollAll();
+        }
+        VLapic::Poll(nowns);
+        ParSetCtx(0);
+        if (vm_state != VM_STATE_RUNNING && vm_state != VM_STATE_PAUSED) { VMState st = vm_state; vunlock(); return st; }
+        if (vhalted[0]) {
+            bool pend = VLapic::Pending(0) >= 0 || GuestIrqPending();
+            if (!pend) {
+                bool others = false;
+                for (int k = 1; k < nvcpus; k++) if (g_ap_start[k] == 2 && !vhalted[k]) others = true;
+                bool off = vcpu->type == VIRT_INTEL_VTX && !(VMM::VMRead(VMCS_GUEST_RFLAGS) & (1u << 9));
+                vunlock();
+                if (!others && off) { vm_state = VM_STATE_HALTED; return vm_state; }
+                if (!others && idle) *idle = true;
+                return vm_state;
+            }
+            vhalted[0] = false;
+        }
+        CheckAndInjectPendingIRQs();
+        vunlock();
+        { uint32_t g = g_ept_gen; if (g != g_seen_gen[0]) { EPTManager::InvalidateEPT(); g_seen_gen[0] = g; } }
+        int kls_depth = Scheduler::SchedV2() ? LinuxSyscall::KlsDropAll() : 0;
+        __atomic_store_n(&g_in_guest[0], (uint8_t)1, __ATOMIC_SEQ_CST);
+        int er = VMM::RunVCPU(vcpus[0]);
+        __atomic_store_n(&g_in_guest[0], (uint8_t)0, __ATOMIC_SEQ_CST);
+        LinuxSyscall::KlsRestore(kls_depth);
+        if (er < 0) return VM_STATE_CRASHED;
+        vlock(); ParSetCtx(0);
+        VMState st = ProcessVMExit();
+        if (reboot_requested) { reboot_requested = false; st = VM_STATE_REBOOTING; }
+        vunlock();
+        if (st != VM_STATE_RUNNING) return st;
+        if (VMExitHandler::GuestClockNs() / 1000 - t0 >= budget_us) break;
+    }
+    return vm_state;
+}
+
+// smp: the vcpus take turns on this thread, one vm exit each; a vcpu that halted sleeps until
+// its lapic (or, for the bsp, the pic) has something for it (satoru)
+VMState Hypervisor::RunSliceSmp(uint32_t budget_us, bool* idle) {
+    uint64_t t0 = VMExitHandler::GuestClockNs() / 1000;
+    for (;;) {
+        uint64_t nowns = VMExitHandler::GuestClockNs();
+        uint64_t now = nowns / 1000;
+        if (now - g_slice_last_us >= 250) {
+            uint64_t d = now - g_slice_last_us;
+            if (d > 100000) d = 100000;
+            g_slice_last_us = now;
+            stats.tick_count++;
+            VirtualDevices::Tick((uint32_t)d);
+            if (config.enable_serial) serial.Tick((uint32_t)d);
+            GuestConsole::Poll(0); GuestConsole::Poll(1); GuestConsole::Poll(2); GuestConsole::Poll(3);
+            VNet::Poll();
+            VirtioPollAll();
+        }
+        VLapic::Poll(nowns);
+                bool ran = false;
+        for (int k = 0; k < nvcpus; k++) {
+            if (!ap_state[k]) continue;
+            SwitchVcpu(k);
+            if (vhalted[k]) {
+                bool pend = VLapic::Pending(k) >= 0 || (k == 0 && GuestIrqPending());
+                if (!pend) continue;
+                vhalted[k] = false;
+            }
+            guest_halted = false;
+            // a turn lasts until the vcpu halts, spins in a pause loop, or ~250 us have passed;
+            // one exit per turn starved the bsp behind its own timer interrupts (satoru)
+            uint64_t qs = VMExitHandler::GuestClockNs();
+            for (;;) {
+                yield_req = false;
+                vm_state = RunOneCycle();
+                ran = true;
+                if (reboot_requested) { reboot_requested = false; vm_state = VM_STATE_REBOOTING; }
+                if (vm_state != VM_STATE_RUNNING) return vm_state;
+                if (vhalted[k] || yield_req) break;
+                uint64_t t = VMExitHandler::GuestClockNs();
+                if (t - qs >= 250000) break;
+                VLapic::Poll(t);
+            }
+        }
+        if (!ran) {
+            // every started vcpu is halted with nothing pending. the bsp halting with interrupts
+            // off is the guest's poweroff (satoru)
+            SwitchVcpu(0);
+            if (vcpu->type == VIRT_INTEL_VTX && vhalted[0] && !(VMM::VMRead(VMCS_GUEST_RFLAGS) & (1u << 9))) {
+                vm_state = VM_STATE_HALTED;
+                return vm_state;
+            }
+            if (idle) *idle = true;
+            return vm_state;
+        }
         if (VMExitHandler::GuestClockNs() / 1000 - t0 >= budget_us) break;
     }
     return vm_state;

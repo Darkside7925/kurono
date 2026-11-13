@@ -26,13 +26,25 @@ namespace KernelProcesses {
     // sched=2: run terminal commands on worker kernel procs, concurrently per
     // window (default on); kurono.schedterm=0 keeps the single shell proc. (satoru)
     void SetTermWorkers(bool on);
+    void SetCpuLoadSecs(uint32_t secs);   // kurono.cpuload=N, [cpuload] cadence (satoru)
+    void SetAudioKlsPump(bool on);        // kurono.audiokls=1: the mixer pump waits for kls again (satoru)
     void SetTermTest(bool on);   // kurono.termtest=1 rig (satoru)
     void SetKstackTest(bool on);   // kurono.kstacktest=1 rig (satoru)
+    // kurono.appexit=SECS: test rig only. after SECS from the gui coming up,
+    // end any running firefox process group (as if the user closed it), then
+    // print a [memboot] census 5 s later, to prove app memory is returned. (satoru)
+    void SetAppExitTest(uint32_t secs);
 
     // kurono.fpsbench=1: make the gui loop composite every iteration with no
     // frame pacing, so the [fps] serial line measures the render+present
     // pipeline rather than the damage gate. must be set before SpawnAll(). (satoru)
     void SetFpsBench(int mode);
+    void SetPaceSleep(bool on);   // kurono.pacesleep=1 (satoru)
+    // kurono.pacetest=SECS: test rig only. for SECS seconds the gui loop feeds
+    // the pacer a synthetic slow frame (15 ms, late) so the step-down ladder
+    // and the idle recovery can be observed on qemu, which has no panel above
+    // 60 hz. no hardware is touched and it never runs without the flag. (satoru)
+    void SetPaceTest(uint32_t secs);
 
     // arm a one-shot interactive ksa prompt demo (kurono.ksa.prompt boot gate).
     // once the desktop has presented a few frames the GUI process calls

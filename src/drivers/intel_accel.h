@@ -60,6 +60,44 @@ bool ZeroCopyActive();
 // [gui] report: commits and commit failures since the last call. (satoru)
 void TakeZeroCopyStats(uint32_t* commits, uint32_t* fails);
 
+// ---- stage 2b double-buffered page flip (kurono.igpu.flip=1, default off) ----
+// the compositor keeps its own back buffer; per pipe two scanout buffers with
+// the firmware's exact layout are mapped into reserved ggtt windows (1-3 gb),
+// the damage is copied into the idle one with non-temporal stores and
+// PLANE_SURF flips at vblank. PLANE_SURF is the only register written per
+// frame. needs the kurono.igpu.accel=1 pipe probe (the cursor itself may
+// fail). qemu_test (kurono.igpu.fliptest=1) runs the same bookkeeping against a
+// stand-in scanout that copies the latched buffer onto the real framebuffer
+// after a simulated 240 hz / 60 hz vblank. call after the final layout. (satoru)
+int FlipBoot(bool requested, bool qemu_test);
+int FlipEnable(char* out, int maxo);
+void FlipDisable(const char* why);
+bool FlipActive();
+// a deferred flip or a re-arm is waiting: the gui loop should call
+// FlipService (with the framebuffer lock) instead of sleeping long. (satoru)
+bool FlipBusy();
+void FlipService();
+// cumulative flip counters, never reset: bytes copied into the flip buffers,
+// flips, flips that copied the whole slice, deferred flips, flip list merges.
+// read by the gfx oracle. (satoru)
+struct FlipTotals { uint64_t bytes, flips, full_flips, defers, merges; };
+void GetFlipTotals(FlipTotals* out);
+// [gui] report counters since the last call. (satoru)
+void TakeFlipStats(uint32_t* flips, uint32_t* defers, uint32_t* fails, uint64_t* copy_kb,
+                   uint64_t* copy_cycles, uint32_t* latch_max_us);
+
+// ggtt entries for the gt driver out of the flip driver's reserved region,
+// under the same rules as a flip window (nobody owns it, no enabled plane or
+// cursor references it, old ptes saved, new ptes read back). saved needs npte
+// entries. (satoru)
+bool GgttReserve(uint64_t phys, uint32_t npte, int pat_index, uint32_t* ggtt_out, uint64_t* saved);
+void GgttRelease(uint32_t ggtt, uint32_t npte, const uint64_t* saved);
+
+// kurono.igpu.accel.wmcalc=1: the cursor ddb carve writes computed primary
+// watermarks (all levels) instead of keeping the firmware's levels. call
+// before Boot. (satoru)
+void SetWmCalc(bool on);
+
 // true when at least one lit pipe has a working hardware cursor plane. (satoru)
 bool Enabled();
 
@@ -70,6 +108,10 @@ bool Enabled();
 bool CursorUpdate(int x, int y);
 // show/hide all hardware cursors (Mouse::Show/Hide). (satoru)
 void CursorVisible(bool on);
+// turn every pipe's cursor plane off now (raw mmio, never waits for a lock):
+// the boot animation hand-off, reboot, shutdown and panic paths. the next
+// pointer update shows it again on the pipe under the pointer. (satoru)
+void CursorHideAll();
 
 // gui report support: resets the window counters and returns the tsc cycles
 // spent in CursorUpdate. only meaningful while Enabled(). (satoru)

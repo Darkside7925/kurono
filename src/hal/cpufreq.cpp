@@ -1,5 +1,6 @@
 #include "cpufreq.h"
 #include "../drivers/serial.h"
+#include "../drivers/cpu_detect.h"   // model/eist gate for the platform-info msr (satoru)
 
 namespace {
     CPUFreq::CPUInfo g_cpus[CPUFreq::CPUFREQ_MAX_CPUS];
@@ -71,12 +72,35 @@ void Init() {
     bsp.recent_load_pct = 0;
 
     if (intel) {
-        detect_pstates_intel(bsp);
-        SerialLogger::Log("CPUFreq: Intel BSP, base=");
-        SerialLogger::LogDec(bsp.base_mhz);
-        SerialLogger::Log(" MHz, ");
-        SerialLogger::LogDec(bsp.pstate_count);
-        SerialLogger::Log(" P-states\r\n");
+        // MSR_PLATFORM_INFO (0xce) does not exist before nehalem: core2 and
+        // penryn #GP on the read. they also have no leaf 0xb topology, so use
+        // that plus eist as the presence gate; fall back to the tsc-calibrated
+        // frequency and a single fixed state. qemu/kvm -cpu host clears the
+        // eist bit on hybrid arrow lake (model 0xc6) even though the msr is
+        // there, so parts from tiger lake (0x8c) up skip the eist test. (satoru)
+        CpuInfo ci = CPUDetect::GetInfo();
+        bool has_platform_info = ci.max_cpuid >= 0x0B && ci.family == 6 &&
+                                 ci.model >= 0x1A &&
+                                 (CPUDetect::HasEIST() || ci.model >= 0x8C);
+        if (has_platform_info) {
+            detect_pstates_intel(bsp);
+            SerialLogger::Log("CPUFreq: Intel BSP, base=");
+            SerialLogger::LogDec(bsp.base_mhz);
+            SerialLogger::Log(" MHz, ");
+            SerialLogger::LogDec(bsp.pstate_count);
+            SerialLogger::Log(" P-states\r\n");
+        } else {
+            bsp.base_mhz  = ci.frequency.base_mhz > 0 ? (uint16_t)ci.frequency.base_mhz : 2000;
+            bsp.turbo_mhz = bsp.base_mhz;
+            bsp.cur_mhz   = bsp.base_mhz;
+            bsp.pstate_count = 1;
+            bsp.pstates[0].freq_mhz   = bsp.base_mhz;
+            bsp.pstates[0].voltage_mv = 900;
+            bsp.pstates[0].perf_ctl   = 0;      // 0 = no ratio write (satoru)
+            SerialLogger::Log("CPUFreq: Intel BSP without platform-info, fixed at ");
+            SerialLogger::LogDec(bsp.base_mhz);
+            SerialLogger::Log(" MHz\r\n");
+        }
     } else if (amd) {
         // AMD P-state MSRs 0xC0010064..C001006F encode CpuDid/CpuFid/CpuVid.
         bsp.base_mhz  = 2400;
@@ -142,7 +166,7 @@ bool SetPState(uint32_t cpu_id, uint8_t pstate_idx) {
     if (pstate_idx >= c.pstate_count) return false;
     c.cur_pstate = pstate_idx;
     c.cur_mhz    = c.pstates[pstate_idx].freq_mhz;
-    if (c.vendor == 0) {        // Intel
+    if (c.vendor == 0 && c.pstates[pstate_idx].perf_ctl) {        // Intel with a known ratio
         // PERF_CTL[15:8] = ratio
         wrmsr(MSR_IA32_PERF_CTL, ((uint64_t)c.pstates[pstate_idx].perf_ctl) << 8);
     }

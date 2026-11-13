@@ -22,6 +22,31 @@ namespace IntelDpAux {
 // lines go to the serial log and are appended to out (when non-null).
 // returns the number of bytes written to out. (satoru)
 int Run(char* out, int maxo);
+// kurono.igpu.tclegacy=1: also connect, read and release a type-c port whose
+// only live hotplug is the legacy one (fix 6 diagnostic, writes that port's
+// port_buf_ctl1 for the duration of the read). (satoru)
+void SetTcLegacyProbe(bool on);
+
+// ---- kurono.igpu.legacytc=1 (default off): type-c ports wired in legacy
+// mode (the hx laptop's hdmi / usb-c dp-in paths). Run connects such a port
+// the way xelpdp_tc_phy_connect does for tc_port_legacy (tc-cold block via
+// the aux power request, tcss power request + ready + power ack, phy
+// ownership, phy ready), reads dpcd + edid, and when a dp sink with an edid
+// answers keeps the port connected for stage 2. anything else is released
+// again. if aux stays silent the edid is read over the port's gmbus (ddc)
+// pin to tell an hdmi sink apart. lines are "[igpu-tc]". (satoru)
+void SetLegacyTc(bool on);
+bool LegacyTcEnabled();
+// connect tc (1..4) in legacy mode now; true when this module holds it
+// connected (also when it already did). false leaves the port as found. (satoru)
+bool LegacyTcConnect(int tc);
+// true while this module holds tc connected (satoru)
+bool LegacyTcHeld(int tc);
+// undo LegacyTcConnect (xelpdp_tc_phy_disconnect for legacy): ownership off,
+// tcss power off, then the tc-cold block. no-op when not held. why goes in
+// the log line. (satoru)
+void LegacyTcRelease(int tc, const char* why);
+void LegacyTcReleaseAll(const char* why);
 
 // ---- stage 2 api, used only by intel_modeset.cpp. Run itself still never
 // sends a native aux write; these calls do (dpcd 0x100.., 0x600, 0xf0000..
@@ -35,6 +60,7 @@ struct SinkInfo {
     uint8_t sink_count;
     int edid_len;
     const uint8_t* edid;
+    bool legacy;            // read on a type-c port in legacy mode (no dp-alt / tbt hotplug) (satoru)
 };
 bool LastSink(int tc, SinkInfo* out);
 
@@ -49,6 +75,13 @@ int DpcdWrite(int tc, uint32_t addr, const uint8_t* buf, int n);
 // before the call. false when the channel stays busy. (satoru)
 bool AuxPower(int tc, bool on, bool* was_on);
 const char* ErrName(int e);
+
+// the internal panel (edp, port a): native dpcd read / write of up to 16
+// bytes, for the aux brightness interface (system/backlight.cpp). refused
+// (-1) unless port a's aux is already powered, the panel power sequencer is
+// on and psr / panel replay are off. (satoru)
+int EdpDpcdRead(uint32_t addr, uint8_t* buf, int n);
+int EdpDpcdWrite(uint32_t addr, const uint8_t* buf, int n);
 
 }
 

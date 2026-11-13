@@ -4,6 +4,7 @@
 //  end (satoru)
 
 #include "uaccess.h"
+#include "../kernel/kld_broker.h"   // container output buffers (satoru)
 #include "../drivers/serial.h"
 
 namespace UAccess {
@@ -49,6 +50,26 @@ bool RangeOk(uint64_t ptr, uint64_t len, bool need_write) {
     if (as == 0) return false;
     for (uint64_t va = ptr & ~(PG - 1); va < ptr + len; va += PG) {
         if (!page_ok(as, va, need_write)) { note_unmapped_reject(ptr, len); return false; }
+    }
+    return true;
+}
+
+bool OutOk(uint64_t ptr, uint64_t len) {
+    if (!AccessOk(ptr, len)) { note_range_reject(ptr, len); return false; }
+    if (len == 0) return true;
+    uint64_t as = KernelVMM::GetCurrentAddressSpace();
+    const char* fam = as ? KldBroker::FamilyOfAddressSpace(as) : nullptr;
+    if (!fam || !fam[0]) return true;   // "" (never null) for a non-container: one lookup, no page walk (satoru)
+    // only broker pages are judged: an ordinary page that is not present yet
+    // (demand-zero heap) is the fault handler's business, as for any process.
+    // a broker mapping that is read-only for the container is refused. (satoru)
+    for (uint64_t va = ptr & ~(PG - 1); va < ptr + len; va += PG) {
+        if (!KldBroker::RangeIsBrokerMapping(as, va, PG)) continue;
+        uint64_t fl = KernelVMM::QueryPageFlagsInAddressSpace(as, va);
+        if (!KernelVMM::QueryMappingInAddressSpace(as, va) || !(fl & PTE_WRITABLE)) {
+            note_unmapped_reject(ptr, len);
+            return false;
+        }
     }
     return true;
 }

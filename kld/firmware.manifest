@@ -1,0 +1,9 @@
+# Firmware needed by the BE200 (8086:272b) path in M2.
+# name size sha256
+#
+# fetched by kld/tools/fetch_firmware.sh from the host /lib/firmware into the
+# gitignored kld/firmware/ directory; never commit the blobs. (satoru)
+iwlwifi-gl-c0-fm-c0-92.ucode 1913128 c7092f1f78676f9e9c2c4d12716401db2116b009c5d7c464e8387c5b1c645d6f
+iwlwifi-gl-c0-fm-c0.pnvm 295036 390bbec8f6c65e739adf731c68e88870ff96e6bf4e60a20cdf56dded4d471337
+regulatory.db 6380 2fb33ca0074db573e05ef7dd50bb45b63c0ff98b7e852e1105ebad536fae8e6b
+# end (satoru)

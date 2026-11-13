@@ -3,9 +3,15 @@
 #pragma once
 #include <stdint.h>
 
-static const unsigned int wallpaper_rgba_w = 960;
-static const unsigned int wallpaper_rgba_h = 540;
-static const unsigned char wallpaper_rgba_data[] = {
+extern const unsigned int wallpaper_rgba_w;
+extern const unsigned int wallpaper_rgba_h;
+// one definition for the whole kernel; the headers only declare it, so
+// including this from several files no longer makes a 2 mb copy each. (satoru)
+extern const unsigned char wallpaper_rgba_data[];
+#if defined(KURONO_WP_IMPL)
+const unsigned int wallpaper_rgba_w = 960;
+const unsigned int wallpaper_rgba_h = 540;
+const unsigned char wallpaper_rgba_data[] = {
     54,61,54,255,39,46,39,255,34,41,34,255,39,46,40,255,43,50,43,255,
     41,48,41,255,35,41,38,255,33,39,36,255,39,45,41,255,38,44,40,255,
     29,35,31,255,33,40,34,255,39,45,41,255,34,40,36,255,39,45,41,255,
@@ -103687,3 +103693,6 @@ static const unsigned char wallpaper_rgba_data[] = {
     23,23,11,255,17,17,6,255,19,19,7,255,15,15,4,255,20,22,11,255,
     18,20,7,255,19,21,7,255,19,21,9,255,11,12,8,255,8,8,10,255,
 };
+#else
+extern const unsigned char wallpaper_rgba_data[];
+#endif

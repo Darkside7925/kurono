@@ -24,6 +24,8 @@
 //  end (satoru)
 
 #include "kld_broker.h"
+#include "../drivers/cpu_detect.h"
+#include "pmm.h"   // PhysToVirt for the direct map (satoru)
 #include "../drivers/serial.h"
 #include "../proc/spinlock.h"
 #include "../proc/kernel_locks.h"
@@ -37,6 +39,18 @@ extern int LinuxSyscallFutexWakePhys(uint64_t phys_key, int max);
 namespace KldNet {
 
 namespace {
+
+static inline uint64_t n1b_rdtsc() {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static uint64_t n1b_hz() {
+    uint64_t hz = CPUDetect::GetInfo().frequency.tsc_frequency;
+    return hz ? hz : 1000000000ull;
+}
+static uint64_t g_n1b_t45_n, g_n1b_t45_sum, g_n1b_t45_max;
+static uint64_t g_n1b_print_tsc, g_n1b_loud_tsc;
 
 bool      g_wanted = false;
 volatile bool g_attached = false;
@@ -75,7 +89,7 @@ uint32_t RxDrops() { return g_hdr ? g_hdr->rx_drops : 0; }
 
 int64_t Attach(uint64_t address_space, uint64_t ring_phys, const uint8_t mac[6]) {
     if (g_attached) return KldBroker::KLD_EBUSY;
-    RingHeader* h = (RingHeader*)(uintptr_t)ring_phys;
+    RingHeader* h = (RingHeader*)PMM::PhysToVirt(ring_phys);
     // the broker zeroed these frames; the kernel initializes the header so the
     // container cannot pick the geometry. (satoru)
     h->magic = KLD_NET_MAGIC;
@@ -85,7 +99,7 @@ int64_t Attach(uint64_t address_space, uint64_t ring_phys, const uint8_t mac[6])
     h->tx_prod = h->tx_cons = h->rx_prod = h->rx_cons = 0;
     h->tx_doorbell = 0;
     g_hdr = h;
-    g_tx_base = (uint8_t*)(uintptr_t)(ring_phys + 4096);
+    g_tx_base = (uint8_t*)PMM::PhysToVirt(ring_phys + 4096);
     g_rx_base = g_tx_base + KLD_NET_TX_SLOTS * KLD_NET_SLOT_BYTES;
     g_ring_phys = ring_phys;
     g_as = address_space;
@@ -169,7 +183,46 @@ void Poll() {
             break;
         }
         uint32_t slot = cons % KLD_NET_RX_SLOTS;
+        uint64_t t4 = h->rx_tsc[slot];   // 0 unless kurono.kld.stats=1 (satoru)
         uint32_t len = h->rx_len[slot];
+        uint64_t t5 = t4 ? n1b_rdtsc() : 0;
+        if (t4 && t5 > t4) {
+            uint64_t d = t5 - t4;
+            g_n1b_t45_n++;
+            g_n1b_t45_sum += d;
+            if (d > g_n1b_t45_max) g_n1b_t45_max = d;
+            uint64_t hz = n1b_hz();
+            if (d > hz / 2 && t5 - g_n1b_loud_tsc > hz) {
+                g_n1b_loud_tsc = t5;
+                SerialLogger::Log("[lx_n1b] hop t4-t5 ");
+                SerialLogger::LogDec((int)(d * 1000000ull / hz));
+                SerialLogger::Log("us frame=");
+                SerialLogger::LogDec((int)g_rx_count);
+                SerialLogger::Log("\r\n");
+            }
+            if (t5 - g_n1b_print_tsc > hz * 5) {
+                g_n1b_print_tsc = t5;
+                SerialLogger::Log("[lx_n1b] kernel irqs=");
+                SerialLogger::LogDec((int)KldBroker::N1bIrqs());
+                SerialLogger::Log(" wakes=");
+                SerialLogger::LogDec((int)KldBroker::N1bWakes());
+                SerialLogger::Log(" n1c=");
+                SerialLogger::LogDec((int)KldBroker::N1cCalls());
+                SerialLogger::Log("/");
+                SerialLogger::LogDec((int)KldBroker::N1cFound());
+                SerialLogger::Log("/");
+                SerialLogger::LogDec((int)KldBroker::N1cNone());
+                SerialLogger::Log("/");
+                SerialLogger::LogDec((int)KldBroker::N1cNotRun());
+                SerialLogger::Log(" t4-t5 n=");
+                SerialLogger::LogDec((int)g_n1b_t45_n);
+                SerialLogger::Log(" avg=");
+                SerialLogger::LogDec((int)(g_n1b_t45_n ? g_n1b_t45_sum * 1000000ull / g_n1b_t45_n / hz : 0));
+                SerialLogger::Log("us max=");
+                SerialLogger::LogDec((int)(g_n1b_t45_max * 1000000ull / hz));
+                SerialLogger::Log("us\r\n");
+            }
+        }
         if (len >= 14 && len <= KLD_NET_SLOT_BYTES) {
             const uint8_t* src = g_rx_base + slot * KLD_NET_SLOT_BYTES;
             for (uint32_t i = 0; i < len; i++) g_rx_copy[i] = src[i];

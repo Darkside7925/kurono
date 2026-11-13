@@ -25,9 +25,22 @@ extern "C" {
 // everything the container says goes to fd 2, which Kurono wires to com1, so a
 // headless boot log is the primary debugging surface. (satoru)
 void lx_log(const char* s);
+void lx_log_lock(void);
+extern int lx_main_argc;
+extern char **lx_main_argv;
+void lx_log_unlock(void);
 void lx_log_u(unsigned long v);
 void lx_log_line(const char* s);
+void lx_stub_note(const char* sym);
 void lx_log_hex(unsigned long v);
+
+// test-only: arm the negative iommu test (kurono.kld.iommutest=1). the next
+// RX-direction dma map returns the kernel canary address. (satoru)
+void lx_dma_iommu_test_arm(void);
+
+// KLD_STATS=1: per-shim-thread wait/yield instrumentation (lx_sched.c).
+// (satoru)
+void lx_stats_start(void);
 
 // ── the unimplemented trap ──────────────────────────────────────────────────
 // aborts the container with the symbol name. this is a SUCCESS signal during
@@ -39,7 +52,9 @@ __attribute__((noreturn)) void lx_unimpl(const char* sym);
 
 // a generated stub body. kept as a macro so the generator output stays tiny and
 // greppable. (satoru)
-#define LX_STUB(sym) void sym(void) { lx_unimpl(#sym); }
+// a stub names itself once, then aborts: M2 uses the [kld-stub] lines to see
+// exactly which unimplemented symbol the real card reached, in order. (satoru)
+#define LX_STUB(sym) void sym(void) { lx_stub_note(#sym); lx_unimpl(#sym); }
 
 // ── module registration ─────────────────────────────────────────────────────
 // Linux drivers register their entry points with module_init()/module_exit(),

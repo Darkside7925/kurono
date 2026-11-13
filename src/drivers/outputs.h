@@ -21,7 +21,14 @@ struct Output {
     uint64_t phys;
     uint32_t pitch;       // bytes per scanline of the hardware framebuffer
     uint8_t  bpp;
+    uint32_t refresh_mhz; // what this output scans out, millihertz (0 unknown) (satoru)
     char     name[16];
+    // optional per-output damage sink (the KLD display bridge). called with
+    // the output-local rectangle after each scatter copy. (satoru)
+    void (*aux_present)(int lx, int ly, int lw, int lh);
+    bool     ram;         // PMM ram output: never WC-remap (the KLD scanout) (satoru)
+    bool     kld;         // this slot is the display bridge output (removed on restore) (satoru)
+    bool     bridge_fw;   // the firmware slot setup had to add (removed on restore) (satoru)
 };
 
 class Outputs {
@@ -34,7 +41,24 @@ public:
     static int  Connected();             // outputs currently lit
     static bool Multi();                 // more than one connected output
     static const Output* Get(int i);     // nullptr when out of range
-    static bool IsLive(int i);           // present and connected
+    static bool IsLive(int i);       // present and connected
+    // what this output really scans out, for the frame pacer's ceiling. 0 when
+    // the hardware did not report one. (satoru)
+    static void SetRefreshMilliHz(int i, uint32_t mhz);
+    static void SetAuxPresent(int i, void (*fn)(int, int, int, int));
+    // the KLD output's container changed mode: new physical size + pitch. (satoru)
+    static void SetGeometry(int i, int w, int h, uint32_t pitch);
+    static void SetRam(int i, bool on);
+    // restore a saved output list exactly (KLD setup/restore). (satoru)
+    static void SetList(const Output* src, int n);
+    // remove one output (the KLD bridge on restore); keeps the others and
+    // re-runs the current layout. (satoru)
+    static bool Remove(int i);
+    // place one output in the physical arrangement, preserving the others
+    // (mirror puts the bridge at 0,0; extend to the right of the desktop).
+    static void PlaceCustom(int i, int ax, int ay);
+    static uint32_t RefreshMilliHz(int i);
+    static uint32_t MaxRefreshMilliHz();   // highest among the lit outputs
 
     // lay every connected output out: horizontal = left to right in index order,
     // vertical = top to bottom. output 0 stays at the origin. (satoru)

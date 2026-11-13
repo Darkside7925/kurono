@@ -1,6 +1,7 @@
 //  kurono os - usb (xhci) host controller driver implementation
 //  pci class 0c:03:30 (xhci usb 3.0)
 #include "usb.h"
+#include "../kernel/kimage.h"   // control buffers may live in the high-linked image (satoru)
 #include "../kernel/pci.h"
 #include "../kernel/heap.h"
 #include "../kernel/pmm.h"          // isoch rings are whole pmm pages (satoru)
@@ -11,6 +12,7 @@
 #include "../drivers/mouse.h"      // ProcessUSBReport for mouse hid (satoru)
 #include "../kernel/vmm.h"         // map a high 64-bit xhci bar before touching it (satoru)
 #include "../proc/scheduler.h"     // NowMs for the bios handoff wait (satoru)
+#include "blockdev.h"              // usb mass storage shows up as sda (satoru)
 #include <stdarg.h>
 
 // per-controller state (see XhciState in usb.h). S is the controller the
@@ -212,7 +214,7 @@ bool USB::SubmitCommand(xHCI_TRB* cmd_trb, xHCI_TRB* result) {
     // publish the cycle bit last so the controller never sees a half-written
     // trb with the owning cycle already flipped (satoru).
     xHCI_TRB* slot = &cmd_ring[cmd_ring_idx];
-    const uint64_t my_trb = (uint64_t)(uintptr_t)slot;   // matched against the completion (satoru)
+    const uint64_t my_trb = KernelPhysOf(slot);   // matched against the completion (satoru)
     slot->parameter = cmd_trb->parameter;
     slot->status = cmd_trb->status;
     uint32_t ctrl = cmd_trb->control & ~TRB_CYCLE;
@@ -222,7 +224,7 @@ bool USB::SubmitCommand(xHCI_TRB* cmd_trb, xHCI_TRB* result) {
     if (cmd_ring_idx >= USB_RING_TRBS - 1) {
         // link trb back to the head; toggle-cycle so we flip producer parity on
         // every wrap (satoru).
-        cmd_ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)cmd_ring;
+        cmd_ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(cmd_ring);
         cmd_ring[USB_RING_TRBS - 1].status = 0;
         cmd_ring[USB_RING_TRBS - 1].control =
             TRB_TYPE(TRB_LINK) | TRB_ENT | (cmd_cycle ? TRB_CYCLE : 0);
@@ -278,13 +280,21 @@ bool USB::SubmitCommand(xHCI_TRB* cmd_trb, xHCI_TRB* result) {
 // (but not including) the current event_ring_idx slot. without this the event
 // ring fills and the controller stops posting new events (satoru).
 void USB::UpdateERDP() {
-    uint64_t deq = (uint64_t)(uintptr_t)&event_ring[event_ring_idx];
+    uint64_t deq = KernelPhysOf(&event_ring[event_ring_idx]);
     // interrupter 0 erdp lives at runtime offset 0x38 (satoru).
     WriteRuntime64(0x38, deq | XHCI_ERDP_EHB);
 }
 
 bool USB::PollEventRing(xHCI_TRB* result, int timeout) {
     for (int i = 0; i < timeout * 100; i++) {
+        // touch the controller every so often. an event ring is written by the
+        // host controller (or, under qemu, by the device model's event loop), so
+        // a pure memory spin can wait forever for a completion that is only
+        // delivered on the next mmio exit. usbsts is read only. (satoru)
+        if ((i & 0x7F) == 0) (void)ReadOp(XHCI_OP_USBSTS);
+        // the ring is written by the host controller, not this thread: a
+        // compiler barrier keeps the cycle test inside the spin. (satoru)
+        __asm__ __volatile__("" ::: "memory");
         xHCI_TRB* evt = &event_ring[event_ring_idx];
         bool cycle = (evt->control & TRB_CYCLE) != 0;
 
@@ -534,15 +544,15 @@ bool USB::BringUp(uint8_t found_bus, uint8_t found_dev, uint8_t found_func,
                 uint8_t* pg = (uint8_t*)usb_alloc_aligned(4096, 4096);
                 if (!pg) return false;
                 usb_memset(pg, 0, 4096);
-                spa[i] = (uint64_t)(uintptr_t)pg;
+                spa[i] = KernelPhysOf(pg);
             }
-            dcbaa[0] = (uint64_t)(uintptr_t)spa;
+            dcbaa[0] = KernelPhysOf(spa);
         }
     }
 
     // full 64-bit address: the high dword was hardcoded 0, which breaks the
     // moment the heap hands out memory above 4 gb (32 gb laptop). (satoru)
-    uint64_t dcbaa_phys = (uint64_t)(uintptr_t)dcbaa;
+    uint64_t dcbaa_phys = KernelPhysOf(dcbaa);
     WriteOp(XHCI_OP_DCBAAP, (uint32_t)dcbaa_phys);
     WriteOp(XHCI_OP_DCBAAP + 4, (uint32_t)(dcbaa_phys >> 32));
 
@@ -555,7 +565,7 @@ bool USB::BringUp(uint8_t found_bus, uint8_t found_dev, uint8_t found_func,
 
     // set crcr (command ring control register), rcs=1 matches our initial
     // producer cycle (satoru).
-    uint64_t crcr_val = (uint64_t)(uintptr_t)cmd_ring | 1; // rcs=1
+    uint64_t crcr_val = KernelPhysOf(cmd_ring) | 1; // rcs=1
     WriteOp(XHCI_OP_CRCR, (uint32_t)crcr_val);
     WriteOp(XHCI_OP_CRCR + 4, (uint32_t)(crcr_val >> 32));
 
@@ -571,16 +581,16 @@ bool USB::BringUp(uint8_t found_bus, uint8_t found_dev, uint8_t found_func,
     // erst entry: base address (8 bytes) + ring segment size (4 bytes) + reserved (4 bytes)
     uint64_t* erst = (uint64_t*)usb_alloc_aligned(4096, 4096);
     if (!erst) return false;
-    erst[0] = (uint64_t)(uintptr_t)event_ring;
+    erst[0] = KernelPhysOf(event_ring);
     ((uint32_t*)erst)[2] = USB_RING_TRBS; // segment size
     ((uint32_t*)erst)[3] = 0;             // reserved
 
     // write erstsz and erstba to interrupter 0
     WriteRuntime(0x28, 1);  // erstsz = 1 segment
-    WriteRuntime64(0x30, (uint64_t)(uintptr_t)erst);
+    WriteRuntime64(0x30, KernelPhysOf(erst));
 
     // set erdp (with no EHB bit yet; controller has consumed nothing)
-    WriteRuntime64(0x38, (uint64_t)(uintptr_t)event_ring);
+    WriteRuntime64(0x38, KernelPhysOf(event_ring));
 
     // start the controller
     uint32_t usbcmd = ReadOp(XHCI_OP_USBCMD);
@@ -696,11 +706,11 @@ bool USB::AddressDevice(int idx) {
     rt.ep0_cycle = true;
 
     // link trb at the end of the ep0 ring so it wraps (satoru).
-    rt.ep0_ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)rt.ep0_ring;
+    rt.ep0_ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(rt.ep0_ring);
     rt.ep0_ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
 
     // dcbaa[slot] points at the output device context (satoru).
-    dcbaa[rt.slot] = (uint64_t)(uintptr_t)rt.device_ctx;
+    dcbaa[rt.slot] = KernelPhysOf(rt.device_ctx);
 
     // input control context: add slot context (A0) + ep0 context (A1).
     uint32_t* icc = InputControlCtx(idx);
@@ -726,7 +736,7 @@ bool USB::AddressDevice(int idx) {
     uint32_t* ep0 = EndpointCtx(idx, 1);
     ep0[0] = 0;
     ep0[1] = (3u << 1) | (4u << 3) | ((uint32_t)mps << 16); // CErr=3, EPType=Control, MaxPacketSize
-    uint64_t ep0_deq = (uint64_t)(uintptr_t)rt.ep0_ring | 1; // DCS=1 (satoru)
+    uint64_t ep0_deq = KernelPhysOf(rt.ep0_ring) | 1; // DCS=1 (satoru)
     ep0[2] = (uint32_t)(ep0_deq & 0xFFFFFFFF);
     ep0[3] = (uint32_t)(ep0_deq >> 32);
     ep0[4] = 8;  // average trb length hint (satoru)
@@ -734,7 +744,7 @@ bool USB::AddressDevice(int idx) {
     // Address Device command - input context pointer in parameter, slot in
     // control[31:24] (satoru).
     xHCI_TRB cmd = {};
-    cmd.parameter = (uint64_t)(uintptr_t)rt.input_ctx;
+    cmd.parameter = KernelPhysOf(rt.input_ctx);
     cmd.control = TRB_TYPE(TRB_ADDRESS_DEV) | ((uint32_t)rt.slot << 24);
     xHCI_TRB result = {};
     if (!SubmitCommand(&cmd, &result)) return false;
@@ -811,17 +821,23 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
     uint16_t hub_ep_mps = 0;
     uint8_t bin_addr = 0, bout_addr = 0;
     uint16_t bin_mps = 0, bout_mps = 0;
+    uint8_t bin_burst = 0, bout_burst = 0;
+    uint8_t msd_iface_num = 0;
+    int carried_bulk = 0;   // bulk ep whose ss companion may be the next descriptor (satoru)
 
     int p = 0;
     while (p + 2 <= (int)total_len) {
         uint8_t len = cfg[p];
         uint8_t type = cfg[p + 1];
+        int prev_bulk = carried_bulk;
+        carried_bulk = 0;
         if (len == 0) break; // malformed; bail rather than spin (satoru)
 
         if (type == 0x04 && p + 9 <= (int)total_len) {            // interface
             uint8_t iclass = cfg[p + 5];
             uint8_t isub   = cfg[p + 6];
             uint8_t iproto = cfg[p + 7];
+            uint8_t ialt   = cfg[p + 3];
             if (iclass == 0x01) rt.has_audio = true;               // audio class: the audio driver takes it from here (satoru)
             cur_hid = -1;
             if (iclass == 0x03 && ncand < (int)(sizeof(s_cands)/sizeof(s_cands[0]))) {
@@ -834,8 +850,12 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
             }
             in_hub_iface = (iclass == USB_CLASS_HUB);
             if (in_hub_iface) found_hub_iface = true;
-            in_msd_iface = (iclass == USB_MSC_CLASS && iproto == USB_MSC_PROTO_BOT &&
-                            !(bin_addr && bout_addr));
+            // only the default alternate setting is ever selected (we never
+            // send SET_INTERFACE), so the uas alt 1 must never contribute
+            // endpoints to the bot pair. (satoru)
+            in_msd_iface = (ialt == 0 && iclass == USB_MSC_CLASS &&
+                            iproto == USB_MSC_PROTO_BOT && !(bin_addr && bout_addr));
+            if (in_msd_iface) msd_iface_num = cfg[p + 2];
         } else if (type == USB_DESC_HID && cur_hid >= 0 && p + 9 <= (int)total_len) {
             // hid descriptor: bNumDescriptors at +5, then [type,len16] pairs.
             // the first class descriptor is the report descriptor. (satoru)
@@ -862,9 +882,16 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
             uint8_t attr = cfg[p + 3];
             if ((attr & 0x03) == 0x02) {                           // bulk (satoru)
                 uint16_t mps = (uint16_t)(usb_le16(cfg + p + 4) & 0x07FF);
-                if ((addr & 0x80) && !bin_addr)   { bin_addr = addr;  bin_mps = mps; }
-                if (!(addr & 0x80) && !bout_addr) { bout_addr = addr; bout_mps = mps; }
+                if ((addr & 0x80) && !bin_addr)   { bin_addr = addr;  bin_mps = mps;  carried_bulk = 1; }
+                if (!(addr & 0x80) && !bout_addr) { bout_addr = addr; bout_mps = mps; carried_bulk = 2; }
             }
+        } else if (type == USB_DESC_SS_EP_COMP && prev_bulk && p + 6 <= (int)total_len) {
+            // superspeed endpoint companion: bMaxBurst is what the xhci endpoint
+            // context's max burst size field must carry. the streaming bits are
+            // left alone (maxpstreams stays 0, so no streams are opened). (satoru)
+            uint8_t burst = cfg[p + 2];
+            if (prev_bulk == 1) bin_burst = burst;
+            else                bout_burst = burst;
         }
         p += len;
     }
@@ -985,7 +1012,7 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         ep.cycle = true;
         ep.buf_len = cd.ep_mps ? (int)cd.ep_mps : 8;
         if (ep.buf_len > USB_HID_REPORT_MAX) ep.buf_len = USB_HID_REPORT_MAX;
-        ep.ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ep.ring;
+        ep.ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(ep.ring);
         ep.ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
 
         icc[1] |= (1u << ep.ep_id);
@@ -997,7 +1024,7 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         usb_memset(epc, 0, ctx_stride);
         epc[0] = (xint << 16);
         epc[1] = (3u << 1) | (7u << 3) | ((uint32_t)cd.ep_mps << 16);    // CErr=3, EPType=IntrIn, MPS
-        uint64_t deq = (uint64_t)(uintptr_t)ep.ring | 1;
+        uint64_t deq = KernelPhysOf(ep.ring) | 1;
         epc[2] = (uint32_t)deq;
         epc[3] = (uint32_t)(deq >> 32);
         epc[4] = (uint32_t)cd.ep_mps | ((uint32_t)cd.ep_mps << 16);
@@ -1030,7 +1057,7 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         int need = 1 + (rt.hub_ports + 7) / 8;
         ep.buf_len = hub_ep_mps > (uint16_t)need ? (int)hub_ep_mps : need;
         if (ep.buf_len > USB_HID_REPORT_MAX) ep.buf_len = USB_HID_REPORT_MAX;
-        ep.ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ep.ring;
+        ep.ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(ep.ring);
         ep.ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
         icc[1] |= (1u << ep.ep_id);
         if (ep.ep_id > max_dci) max_dci = ep.ep_id;
@@ -1041,7 +1068,7 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         usb_memset(epc, 0, ctx_stride);
         epc[0] = (xint << 16);
         epc[1] = (3u << 1) | (7u << 3) | ((uint32_t)hub_ep_mps << 16);    // CErr=3, EPType=IntrIn, MPS
-        uint64_t deq = (uint64_t)(uintptr_t)ep.ring | 1;
+        uint64_t deq = KernelPhysOf(ep.ring) | 1;
         epc[2] = (uint32_t)deq;
         epc[3] = (uint32_t)(deq >> 32);
         epc[4] = (uint32_t)hub_ep_mps | ((uint32_t)hub_ep_mps << 16);
@@ -1055,9 +1082,16 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         rt.bulk_out_ep  = bout_addr;
         rt.bulk_in_mps  = bin_mps  ? bin_mps  : 512;
         rt.bulk_out_mps = bout_mps ? bout_mps : 512;
+        rt.bulk_in_burst  = bin_burst;
+        rt.bulk_out_burst = bout_burst;
+        rt.msd_iface    = msd_iface_num;
         // dci: OUT ep N -> 2N, IN ep N -> 2N+1 (satoru)
         rt.bulk_in_dci  = (uint8_t)(((bin_addr & 0x0F) * 2) + 1);
         rt.bulk_out_dci = (uint8_t)((bout_addr & 0x0F) * 2);
+        usb_log("USB: slot %d msd iface %d bulk in %x mps %d burst %d, out %x mps %d burst %d\n",
+                (int)rt.slot, (int)rt.msd_iface, (uint32_t)rt.bulk_in_ep,
+                (int)rt.bulk_in_mps, (int)rt.bulk_in_burst, (uint32_t)rt.bulk_out_ep,
+                (int)rt.bulk_out_mps, (int)rt.bulk_out_burst);
 
         rt.bulk_in_ring  = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
         rt.bulk_out_ring = (xHCI_TRB*)usb_alloc_aligned(4096, 4096);
@@ -1070,9 +1104,9 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         usb_memset(rt.bulk_out_ring, 0, USB_RING_TRBS * sizeof(xHCI_TRB));
         rt.bulk_in_idx = 0;  rt.bulk_in_cycle = true;
         rt.bulk_out_idx = 0; rt.bulk_out_cycle = true;
-        rt.bulk_in_ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)rt.bulk_in_ring;
+        rt.bulk_in_ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(rt.bulk_in_ring);
         rt.bulk_in_ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
-        rt.bulk_out_ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)rt.bulk_out_ring;
+        rt.bulk_out_ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(rt.bulk_out_ring);
         rt.bulk_out_ring[USB_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
 
         icc[1] |= (1u << rt.bulk_in_dci) | (1u << rt.bulk_out_dci);
@@ -1080,22 +1114,26 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
         if (rt.bulk_out_dci > max_dci) max_dci = rt.bulk_out_dci;
 
         // bulk endpoint contexts: EPType 2 = bulk-out, 6 = bulk-in, CErr=3,
-        // TR dequeue = ring base with DCS=1 (satoru).
+        // max burst from the ss companion (0 is legal and means one packet per
+        // burst), TR dequeue = ring base with DCS=1. max esit payload and
+        // average trb length are reserved for bulk, so dword 4 stays 0. (satoru)
         uint32_t* epo = EndpointCtx(idx, rt.bulk_out_dci);
         usb_memset(epo, 0, ctx_stride);
-        epo[1] = (3u << 1) | (2u << 3) | ((uint32_t)rt.bulk_out_mps << 16);
-        uint64_t odeq = (uint64_t)(uintptr_t)rt.bulk_out_ring | 1;
+        epo[1] = (3u << 1) | (2u << 3) | ((uint32_t)rt.bulk_out_burst << 8) |
+                 ((uint32_t)rt.bulk_out_mps << 16);
+        uint64_t odeq = KernelPhysOf(rt.bulk_out_ring) | 1;
         epo[2] = (uint32_t)(odeq & 0xFFFFFFFF);
         epo[3] = (uint32_t)(odeq >> 32);
-        epo[4] = rt.bulk_out_mps;
+        epo[4] = 0;
 
         uint32_t* epi = EndpointCtx(idx, rt.bulk_in_dci);
         usb_memset(epi, 0, ctx_stride);
-        epi[1] = (3u << 1) | (6u << 3) | ((uint32_t)rt.bulk_in_mps << 16);
-        uint64_t ideq = (uint64_t)(uintptr_t)rt.bulk_in_ring | 1;
+        epi[1] = (3u << 1) | (6u << 3) | ((uint32_t)rt.bulk_in_burst << 8) |
+                 ((uint32_t)rt.bulk_in_mps << 16);
+        uint64_t ideq = KernelPhysOf(rt.bulk_in_ring) | 1;
         epi[2] = (uint32_t)(ideq & 0xFFFFFFFF);
         epi[3] = (uint32_t)(ideq >> 32);
-        epi[4] = rt.bulk_in_mps;
+        epi[4] = 0;
     }
 
     uint32_t* slot_ctx = SlotCtx(idx);
@@ -1113,7 +1151,7 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
     }
 
     xHCI_TRB cmd = {};
-    cmd.parameter = (uint64_t)(uintptr_t)rt.input_ctx;
+    cmd.parameter = KernelPhysOf(rt.input_ctx);
     cmd.control = TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)rt.slot << 24);
     xHCI_TRB result = {};
     if (!SubmitCommand(&cmd, &result)) return false;
@@ -1165,11 +1203,36 @@ bool USB::ConfigureDevice(int idx, const uint8_t* dev_desc) {
 // run one complete control transfer on a slot's ep0 ring: setup stage, optional
 // data stage, status stage; ring the slot's ep0 doorbell (dci 1) and wait for
 // the transfer-event completion (satoru).
+// the data stage never points into the caller's buffer: callers pass stack
+// variables (a 4 byte port status), and a transfer that timed out stays queued
+// on ep0. the controller completed it later into a stack frame that was being
+// reused - the laptop panic 1112b: GET_PORT_STATUS (0x0100, port power) landed
+// in the high half of a saved array offset and ControlTransferEP faulted on a
+// garbage runtime pointer. one 4 kb dma buffer per device, never freed; the
+// result is copied out only on success, and a timeout stops ep0 and moves its
+// dequeue pointer past the abandoned td. (satoru)
+static uint8_t* g_ctl_bounce[USB_MAX_CTL][USB_MAX_DEVICES];
+static const uint32_t CTL_BOUNCE_SZ = 4096;
+// kurono: the halt-recovery path in the input poll waits far less than 5 s. (satoru)
+static uint32_t g_ctl_timeout_ms = 5000;
+
 bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
                             uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                             void* data) {
     USBDeviceRuntime& rt = runtime[idx];
     if (!rt.ep0_ring) return false;
+    void* caller_data = data;
+    if (wLength > 0 && data) {
+        int ci = (int)(S - g_xs);
+        if (ci >= 0 && ci < USB_MAX_CTL && idx >= 0 && idx < USB_MAX_DEVICES && wLength <= CTL_BOUNCE_SZ) {
+            if (!g_ctl_bounce[ci][idx]) g_ctl_bounce[ci][idx] = (uint8_t*)PMM::AllocBytes(CTL_BOUNCE_SZ);
+            if (g_ctl_bounce[ci][idx]) {
+                uint8_t* bb = g_ctl_bounce[ci][idx];
+                if (!(bmRequestType & 0x80)) memcpy(bb, caller_data, wLength);
+                data = bb;
+            }
+        }
+    }
 
     bool in = (bmRequestType & 0x80) != 0;
     bool has_data = (wLength > 0);
@@ -1181,7 +1244,7 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
         t->control = (control & ~TRB_CYCLE) | (rt.ep0_cycle ? TRB_CYCLE : 0);
         rt.ep0_idx++;
         if (rt.ep0_idx >= USB_RING_TRBS - 1) {
-            rt.ep0_ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)rt.ep0_ring;
+            rt.ep0_ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(rt.ep0_ring);
             rt.ep0_ring[USB_RING_TRBS - 1].control =
                 TRB_TYPE(TRB_LINK) | TRB_ENT | (rt.ep0_cycle ? TRB_CYCLE : 0);
             rt.ep0_idx = 0;
@@ -1203,7 +1266,7 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
     // also get a completion if no status stage is reached (satoru).
     if (has_data) {
         uint32_t dctrl = TRB_TYPE(TRB_DATA_STAGE) | (in ? TRB_DIR_IN : 0);
-        push((uint64_t)(uintptr_t)data, (uint32_t)wLength, dctrl);
+        push(KernelPhysOf(data), (uint32_t)wLength, dctrl);
     }
 
     // status stage: opposite direction of the data stage (or IN for no-data),
@@ -1222,7 +1285,8 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
     // ~0.1 s, which real devices can exceed. (satoru)
     // iteration cap as the backstop when the clock is not ticking. (satoru)
     uint64_t t0 = Scheduler::NowMs();
-    for (int it = 0; it < 2000 && Scheduler::NowMs() - t0 < 5000; it++) {
+    uint32_t limit_ms = g_ctl_timeout_ms;
+    for (int it = 0; it < 2000 && Scheduler::NowMs() - t0 < limit_ms; it++) {
         xHCI_TRB ev = {};
         if (!PollEventRing(&ev, 50)) continue;
         uint8_t type = (ev.control >> 10) & 0x3F;
@@ -1245,9 +1309,25 @@ bool USB::ControlTransferEP(int idx, uint8_t bmRequestType, uint8_t bRequest,
             HubClearTt(idx, 0, 0);   // control split state on the parent tt (satoru)
             return false;
         }
+        if (data != caller_data && (bmRequestType & 0x80) && caller_data)
+            memcpy(caller_data, data, wLength);   // (satoru)
         return true;
     }
-    usb_log("USB: control transfer slot %d timeout (5 s)\n", (int)rt.slot);
+    usb_log("USB: control transfer slot %d timeout (%d ms)\n", (int)rt.slot, (int)limit_ms);
+    // abandon the td: stop ep0, then point its dequeue at our enqueue slot, so a
+    // late completion cannot land anywhere and the next request does not queue
+    // behind it. (satoru)
+    {
+        xHCI_TRB c = {};
+        c.control = TRB_TYPE(15) | ((uint32_t)rt.slot << 24) | (1u << 16);   // stop endpoint, dci 1
+        xHCI_TRB r = {};
+        SubmitCommand(&c, &r);
+        xHCI_TRB d = {};
+        d.parameter = KernelPhysOf(&rt.ep0_ring[rt.ep0_idx]) | (rt.ep0_cycle ? 1u : 0u);
+        d.control = TRB_TYPE(16) | ((uint32_t)rt.slot << 24) | (1u << 16);
+        xHCI_TRB r2 = {};
+        SubmitCommand(&d, &r2);
+    }
     return false;
 }
 
@@ -1266,14 +1346,14 @@ void USB::ArmIntrEp(int idx, int epi) {
     if (!ep.used || !ep.ring || !ep.buf) return;
 
     xHCI_TRB* t = &ep.ring[ep.idx];
-    t->parameter = (uint64_t)(uintptr_t)ep.buf;
+    t->parameter = KernelPhysOf(ep.buf);
     t->status = (uint32_t)ep.buf_len;
     t->control = (TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP)
                | (ep.cycle ? TRB_CYCLE : 0);
 
     ep.idx++;
     if (ep.idx >= USB_RING_TRBS - 1) {
-        ep.ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ep.ring;
+        ep.ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(ep.ring);
         ep.ring[USB_RING_TRBS - 1].control =
             TRB_TYPE(TRB_LINK) | TRB_ENT | (ep.cycle ? TRB_CYCLE : 0);
         ep.idx = 0;
@@ -1374,13 +1454,14 @@ bool USB::BulkTransferEP(int idx, bool dir_in, void* data, int len,
     uint8_t dci  = dir_in ? rt.bulk_in_dci    : rt.bulk_out_dci;
 
     xHCI_TRB* t = &ring[*pidx];
-    t->parameter = (uint64_t)(uintptr_t)rt.bulk_bounce;
+    const uint64_t my_trb = KernelPhysOf(t);
+    t->parameter = KernelPhysOf(rt.bulk_bounce);
     t->status = (uint32_t)len;                    // trb transfer length (satoru)
     t->control = (TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP)
                | (*pcycle ? TRB_CYCLE : 0);
     (*pidx)++;
     if (*pidx >= USB_RING_TRBS - 1) {
-        ring[USB_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ring;
+        ring[USB_RING_TRBS - 1].parameter = KernelPhysOf(ring);
         ring[USB_RING_TRBS - 1].control =
             TRB_TYPE(TRB_LINK) | TRB_ENT | (*pcycle ? TRB_CYCLE : 0);
         *pidx = 0;
@@ -1392,6 +1473,7 @@ bool USB::BulkTransferEP(int idx, bool dir_in, void* data, int len,
     WriteDoorbell(rt.slot, dci);
 
     bool ok = false;
+    uint8_t last_cc = 0xFF;
     for (int tries = 0; tries < 16; tries++) {
         xHCI_TRB ev = {};
         if (!PollEventRing(&ev, 5000)) break;
@@ -1402,7 +1484,13 @@ bool USB::BulkTransferEP(int idx, bool dir_in, void* data, int len,
         }
         uint8_t ev_slot = (ev.control >> 24) & 0xFF;
         uint8_t ev_ep   = (ev.control >> 16) & 0x1F;
-        if (ev_slot != rt.slot) continue;
+        if (ev_slot != rt.slot) {
+            // another device's report: dispatch + re-arm it. dropping it here
+            // left that endpoint armed with nothing queued, so a mouse moved
+            // during a slow disk init stayed silent for the whole boot. (satoru)
+            ForeignEvent(ev);
+            continue;
+        }
         int iep = FindIntrEp(idx, ev_ep);
         if (iep >= 0) {
             // a hid/hub report completed while we owned the ring: dispatch +
@@ -1412,7 +1500,13 @@ bool USB::BulkTransferEP(int idx, bool dir_in, void* data, int len,
             continue;
         }
         if (ev_ep != dci) continue;
+        if ((ev.parameter & ~0xFULL) != (my_trb & ~0xFULL)) {
+            // a completion from a transfer that a recovery just cancelled;
+            // taking it as ours would pair the wrong data with this trb. (satoru)
+            continue;
+        }
         uint8_t cc = (ev.status >> 24) & 0xFF;
+        last_cc = cc;
         uint32_t residual = ev.status & 0x00FFFFFF;
         int got = len - (int)residual;
         if (got < 0) got = 0;
@@ -1424,112 +1518,575 @@ bool USB::BulkTransferEP(int idx, bool dir_in, void* data, int len,
     }
     g_usb_sync_claim = was_claimed;
 
-    if (!ok) HubClearTt(idx, dir_in ? rt.bulk_in_ep : rt.bulk_out_ep, 2);
+    if (!ok) {
+        usb_log("USB: slot %d bulk %s len %d failed (cc %d)\n", (int)rt.slot,
+                dir_in ? "in" : "out", len, (int)last_cc);
+        HubClearTt(idx, dir_in ? rt.bulk_in_ep : rt.bulk_out_ep, 2);
+    }
     if (ok && dir_in && data) {
         uint8_t* d = (uint8_t*)data;
         int got = out_transferred ? *out_transferred : len;
+        if (got > len) got = len;   // never write past the caller's buffer (satoru)
         for (int i = 0; i < got; i++) d[i] = rt.bulk_bounce[i];
     }
     return ok;
 }
 
+// bulk-only mass storage reset (class request 0xff) plus the clear-halt and
+// endpoint reset that linux does after it, so one stalled command cannot
+// wedge the pipe for the rest of the boot. (satoru)
+bool USB::MsdRecover(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (!rt.is_msd || !rt.bulk_in_ring || !rt.bulk_out_ring) return false;
+
+    // the class reset readies the device for the next cbw; its status stage
+    // is nacked until the reset is complete, so no extra wait is needed. (satoru)
+    bool reset_ok = ControlTransferEP(idx, 0x21, USB_MSC_REQ_RESET, 0,
+                                      rt.msd_iface, 0, nullptr);
+    usb_delay_ms(50);
+
+    // clear the device side halt on both pipes (harmless when not halted),
+    // then reset the controller endpoint state and its dequeue pointer. (satoru)
+    ControlTransferEP(idx, 0x02, USB_REQ_CLEAR_FEATURE, 0, rt.bulk_in_ep, 0, nullptr);
+    ControlTransferEP(idx, 0x02, USB_REQ_CLEAR_FEATURE, 0, rt.bulk_out_ep, 0, nullptr);
+    RecoverEp(idx, rt.bulk_in_dci, rt.bulk_in_ring, rt.bulk_in_idx, rt.bulk_in_cycle);
+    RecoverEp(idx, rt.bulk_out_dci, rt.bulk_out_ring, rt.bulk_out_idx, rt.bulk_out_cycle);
+
+    usb_log("USB: slot %d msd transport reset%s\n", (int)rt.slot,
+            reset_ok ? "" : " (class reset stalled)");
+    return true;
+}
+
 // one full bot round: cbw out, optional data stage, csw in + validation.
-// returns true only when the device reports command PASSED. (satoru)
+// a transport or phase error resets the pipe and retries the command; linux
+// does the same from its scsi error handler. (satoru)
 bool USB::MsdCommand(int idx, const uint8_t* cb, int cb_len, bool dir_in,
                      void* data, uint32_t data_len, uint32_t* out_residue) {
     USBDeviceRuntime& rt = runtime[idx];
     if (!rt.is_msd || !cb || cb_len < 1 || cb_len > 16) return false;
+    if (data_len > USB_BULK_BOUNCE) return false;
     if (out_residue) *out_residue = 0;
 
-    UsbCbw cbw;
-    usb_memset(&cbw, 0, sizeof(cbw));
-    cbw.sig      = USB_CBW_SIG;
-    cbw.tag      = ++rt.msd_tag;
-    cbw.data_len = data_len;
-    cbw.flags    = dir_in ? 0x80 : 0x00;
-    cbw.lun      = rt.msd_lun;
-    cbw.cb_len   = (uint8_t)cb_len;
-    for (int i = 0; i < cb_len; i++) cbw.cb[i] = cb[i];
+    for (int attempt = 0; attempt < 3; attempt++) {
+        UsbCbw cbw;
+        usb_memset(&cbw, 0, sizeof(cbw));
+        cbw.sig      = USB_CBW_SIG;
+        cbw.tag      = ++rt.msd_tag;
+        cbw.data_len = data_len;
+        cbw.flags    = dir_in ? 0x80 : 0x00;
+        cbw.lun      = rt.msd_lun;
+        cbw.cb_len   = (uint8_t)cb_len;
+        for (int i = 0; i < cb_len; i++) cbw.cb[i] = cb[i];
 
-    int got = 0;
-    if (!BulkTransferEP(idx, false, &cbw, (int)sizeof(cbw), &got) ||
-        got != (int)sizeof(cbw)) {
-        return false;
-    }
+        int got = 0;
+        bool phase_ok = true;
+        UsbCsw csw;
+        usb_memset(&csw, 0, sizeof(csw));
+        bool have_csw = false;
 
-    if (data_len > 0) {
-        // data stage is at most one bounce chunk; callers chunk above. a
-        // short bulk-in is fine (csw reports the residue). (satoru)
-        if (data_len > USB_BULK_BOUNCE) return false;
-        if (!BulkTransferEP(idx, dir_in, data, (int)data_len, &got)) return false;
-    }
+        if (!BulkTransferEP(idx, false, &cbw, (int)sizeof(cbw), &got) ||
+            got != (int)sizeof(cbw)) {
+            phase_ok = false;
+        }
 
-    UsbCsw csw;
-    usb_memset(&csw, 0, sizeof(csw));
-    if (!BulkTransferEP(idx, true, &csw, (int)sizeof(csw), &got) ||
-        got != (int)sizeof(csw)) {
-        return false;
+        if (phase_ok && data_len > 0) {
+            // data stage is at most one bounce chunk; callers chunk above. a
+            // short bulk-in is fine (csw reports the residue). (satoru)
+            if (!BulkTransferEP(idx, dir_in, data, (int)data_len, &got)) {
+                phase_ok = false;
+            } else if (dir_in && data_len > (uint32_t)sizeof(UsbCsw) &&
+                       got == (int)sizeof(UsbCsw) && data &&
+                       ((const UsbCsw*)data)->sig == USB_CSW_SIG) {
+                // some devices skip a data phase and put the csw where the
+                // data belonged; linux checks for this exact case. (satoru)
+                csw = *(const UsbCsw*)data;
+                have_csw = true;
+            }
+        }
+
+        if (phase_ok && !have_csw) {
+            // a device that appends a zero length packet shows up as a zero
+            // byte csw read; retry the read like linux does. (satoru)
+            for (int t = 0; t < 3 && !have_csw; t++) {
+                if (!BulkTransferEP(idx, true, &csw, (int)sizeof(csw), &got)) {
+                    phase_ok = false;
+                    break;
+                }
+                if (got == (int)sizeof(csw)) { have_csw = true; break; }
+                usb_delay_ms(1);
+            }
+        }
+
+        if (phase_ok && have_csw) {
+            // some bridges report a csw signature that is not the spec one;
+            // linux learns the first signature and checks consistency after. (satoru)
+            if (!rt.msd_csw_sig_ok) {
+                rt.msd_csw_sig = csw.sig;
+                rt.msd_csw_sig_ok = true;
+                if (csw.sig != USB_CSW_SIG)
+                    usb_log("USB: slot %d msd learned csw signature %x\n",
+                            (int)rt.slot, csw.sig);
+            }
+            if (csw.sig != rt.msd_csw_sig) {
+                usb_log("USB: slot %d msd csw signature %x, expected %x\n",
+                        (int)rt.slot, csw.sig, rt.msd_csw_sig);
+                phase_ok = false;
+            } else if (csw.tag != cbw.tag) {
+                usb_log("USB: slot %d msd csw tag %d, expected %d\n",
+                        (int)rt.slot, (int)csw.tag, (int)cbw.tag);
+                phase_ok = false;
+            } else {
+                if (out_residue) *out_residue = csw.residue;
+                if (csw.status == 0) return true;
+                if (csw.status != 2) return false;   // command failed, pipe is fine (satoru)
+            }
+        }
+
+        if (attempt < 2) MsdRecover(idx);
     }
-    if (csw.sig != USB_CSW_SIG || csw.tag != cbw.tag) return false;
-    if (out_residue) *out_residue = csw.residue;
-    return csw.status == 0;
+    return false;
 }
 
-// scsi bring-up for a freshly configured bot device: inquiry (names the
-// stick), test-unit-ready with request-sense retries (a stick straight out
-// of reset reports unit-attention once), then read-capacity(10). (satoru)
+// request sense (0x03): key/asc/ascq from the fixed format response. (satoru)
+bool USB::MsdRequestSense(int idx, uint8_t* key, uint8_t* asc, uint8_t* ascq) {
+    uint8_t sense[18];
+    usb_memset(sense, 0, sizeof(sense));
+    uint8_t cb[6] = { 0x03, 0, 0, 0, 18, 0 };
+    if (!MsdCommand(idx, cb, 6, true, sense, 18, nullptr)) return false;
+    uint8_t code = sense[0] & 0x7F;
+    if (code != 0x70 && code != 0x71) return false;
+    if (key)  *key  = (uint8_t)(sense[2] & 0x0F);
+    if (asc)  *asc  = sense[12];
+    if (ascq) *ascq = sense[13];
+    return true;
+}
+
+// read capacity(10); when it fails or reports the 10-byte "too big" sentinel,
+// ask with read capacity(16) so a > 2 tib disk still gets the right size. (satoru)
+bool USB::MsdReadCapacity(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    uint64_t last_lba = 0;
+    uint32_t bs = 0;
+
+    uint8_t cap[8];
+    usb_memset(cap, 0, sizeof(cap));
+    uint8_t cb10[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    bool ok10 = MsdCommand(idx, cb10, 10, true, cap, 8, nullptr);
+    if (ok10) {
+        last_lba = ((uint32_t)cap[0] << 24) | ((uint32_t)cap[1] << 16) |
+                   ((uint32_t)cap[2] << 8)  | (uint32_t)cap[3];
+        bs       = ((uint32_t)cap[4] << 24) | ((uint32_t)cap[5] << 16) |
+                   ((uint32_t)cap[6] << 8)  | (uint32_t)cap[7];
+    }
+
+    if (!ok10 || last_lba == 0xFFFFFFFFull || bs == 0 || bs > USB_BULK_BOUNCE) {
+        uint8_t cap16[32];
+        usb_memset(cap16, 0, sizeof(cap16));
+        // service action in(16), service action 0x10 = read capacity(16).
+        uint8_t cb16[16] = { 0x9E, 0x10, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 32, 0, 0 };
+        if (!MsdCommand(idx, cb16, 16, true, cap16, 32, nullptr)) {
+            usb_log("USB: slot %d msd read capacity failed\n", (int)rt.slot);
+            return false;
+        }
+        last_lba = ((uint64_t)cap16[0] << 56) | ((uint64_t)cap16[1] << 48) |
+                   ((uint64_t)cap16[2] << 40) | ((uint64_t)cap16[3] << 32) |
+                   ((uint64_t)cap16[4] << 24) | ((uint64_t)cap16[5] << 16) |
+                   ((uint64_t)cap16[6] << 8)  | (uint64_t)cap16[7];
+        bs       = ((uint32_t)cap16[8] << 24) | ((uint32_t)cap16[9] << 16) |
+                   ((uint32_t)cap16[10] << 8) | (uint32_t)cap16[11];
+        usb_log("USB: slot %d msd read capacity(10)%s, capacity(16) last=%d bs=%d\n",
+                (int)rt.slot, ok10 ? " sentinel" : " failed",
+                (int)last_lba, (int)bs);
+    }
+
+    if (bs == 0 || bs > USB_BULK_BOUNCE) return false;
+    rt.msd_blocks     = last_lba + 1;
+    rt.msd_block_size = bs;
+    return true;
+}
+
+// byte-granular read through the bot block layer, one block bounce at a time. (satoru)
+bool USB::MsdReadBytes(int idx, uint64_t off, uint32_t len, void* buf) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (!MsdIsReady(idx) || !buf || len == 0 || rt.msd_block_size == 0) return false;
+    uint32_t bs = rt.msd_block_size;
+    uint64_t first = off / bs;
+    uint64_t last  = (off + (uint64_t)len - 1) / bs;
+    uint32_t blocks = (uint32_t)(last - first + 1);
+    uint8_t* tmp = (uint8_t*)KernelHeap::Alloc((uint64_t)blocks * bs);
+    if (!tmp) return false;
+    bool ok = MsdRead(idx, first, blocks, tmp);
+    if (ok) {
+        uint32_t skew = (uint32_t)(off % bs);
+        uint8_t* d = (uint8_t*)buf;
+        for (uint32_t i = 0; i < len; i++) d[i] = tmp[skew + i];
+    }
+    KernelHeap::Free(tmp);
+    return ok;
+}
+
+// read the gpt entry table into ascii names/ranges. returns the count, or -1
+// when there is no readable gpt. (satoru)
+int USB::MsdGptScan(int idx, UsbMsdPart* out, int max) {
+    USBDeviceRuntime& rt = runtime[idx];
+    uint32_t bs = rt.msd_block_size ? rt.msd_block_size : 512;
+    uint8_t* hdr = (uint8_t*)KernelHeap::Alloc(bs);
+    if (!hdr) return -1;
+    bool ok = MsdRead(idx, 1, 1, hdr);
+    if (!ok) { KernelHeap::Free(hdr); return -1; }
+    const char sig[8] = { 'E','F','I',' ','P','A','R','T' };
+    bool gpt = true;
+    for (int i = 0; i < 8; i++) if (hdr[i] != (uint8_t)sig[i]) gpt = false;
+    if (!gpt) { KernelHeap::Free(hdr); return -1; }
+
+    uint64_t ent_lba = ((uint64_t)hdr[72]) | ((uint64_t)hdr[73] << 8) |
+                       ((uint64_t)hdr[74] << 16) | ((uint64_t)hdr[75] << 24) |
+                       ((uint64_t)hdr[76] << 32) | ((uint64_t)hdr[77] << 40) |
+                       ((uint64_t)hdr[78] << 48) | ((uint64_t)hdr[79] << 56);
+    uint32_t nent = (uint32_t)hdr[80] | ((uint32_t)hdr[81] << 8) |
+                    ((uint32_t)hdr[82] << 16) | ((uint32_t)hdr[83] << 24);
+    uint32_t esz  = (uint32_t)hdr[84] | ((uint32_t)hdr[85] << 8) |
+                    ((uint32_t)hdr[86] << 16) | ((uint32_t)hdr[87] << 24);
+    KernelHeap::Free(hdr);
+    if (esz < 128 || esz > 1024 || nent == 0 || nent > 256) return -1;
+
+    uint32_t bytes = nent * esz;
+    uint32_t blocks = (bytes + bs - 1) / bs;
+    uint8_t* tab = (uint8_t*)KernelHeap::Alloc((uint64_t)blocks * bs);
+    if (!tab) return -1;
+    if (!MsdRead(idx, ent_lba, blocks, tab)) {
+        KernelHeap::Free(tab);
+        return -1;
+    }
+
+    int n = 0;
+    for (uint32_t i = 0; i < nent && n < max; i++) {
+        const uint8_t* e = tab + (uint64_t)i * esz;
+        bool used = false;
+        for (int k = 0; k < 16; k++) if (e[k]) { used = true; break; }
+        if (!used) continue;
+        UsbMsdPart& p = out[n];
+        usb_memset(&p, 0, sizeof(p));
+        p.start_lba = ((uint64_t)e[32]) | ((uint64_t)e[33] << 8) |
+                      ((uint64_t)e[34] << 16) | ((uint64_t)e[35] << 24) |
+                      ((uint64_t)e[36] << 32) | ((uint64_t)e[37] << 40) |
+                      ((uint64_t)e[38] << 48) | ((uint64_t)e[39] << 56);
+        p.end_lba   = ((uint64_t)e[40]) | ((uint64_t)e[41] << 8) |
+                      ((uint64_t)e[42] << 16) | ((uint64_t)e[43] << 24) |
+                      ((uint64_t)e[44] << 32) | ((uint64_t)e[45] << 40) |
+                      ((uint64_t)e[46] << 48) | ((uint64_t)e[47] << 56);
+        int j = 0;
+        for (int k = 0; k < 36; k++) {
+            uint16_t ch = (uint16_t)(e[56 + k * 2] | (e[57 + k * 2] << 8));
+            if (ch >= 0x20 && ch < 0x7F && j < (int)sizeof(p.name) - 1)
+                p.name[j++] = (char)ch;
+        }
+        p.name[j] = 0;
+        n++;
+    }
+    KernelHeap::Free(tab);
+    return n;
+}
+
+// the usb write guard window, in the owning disk's own lba space. only one
+// usb disk can be the kurono disk, exactly like the nvme window. (satoru)
+static int      g_usb_win_gid = -1;
+static uint64_t g_usb_win_lo  = 0;
+static uint64_t g_usb_win_end = 0;
+
+static inline uint16_t msd_rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint32_t msd_rd32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+// find the single partition named KURONO (or a fat32 volume labelled KURONO)
+// on this usb disk and allow writes only inside it. no match, or more than
+// one, leaves the whole disk read-only. mirrors DiskLog::FindKuronoWindow. (satoru)
+bool USB::MsdFindKuronoWindow(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    int gid = (int)(S - g_xs) * USB_MAX_DEVICES + idx;
+    if (g_usb_win_gid == gid) { g_usb_win_gid = -1; g_usb_win_lo = g_usb_win_end = 0; }
+
+    UsbMsdPart parts[32];
+    int n = MsdGptScan(idx, parts, 32);
+    if (n < 0) {
+        usb_log("USB: slot %d msd no readable gpt, usb disk stays read-only under the guard\n",
+                (int)rt.slot);
+        return false;
+    }
+
+    int hits = 0;
+    uint64_t lo = 0, end = 0;
+    for (int i = 0; i < n; i++) {
+        bool match = false;
+        const char* want = "KURONO";
+        if (parts[i].name[0]) {
+            match = true;
+            for (int k = 0; k < 6; k++) if (parts[i].name[k] != want[k]) { match = false; break; }
+            if (match && parts[i].name[6] != 0) match = false;
+        }
+        if (!match) {
+            // a fat32 volume labelled KURONO counts too, like the nvme path.
+            // windows only stores the real label in the root dir, so check
+            // both the boot sector and the first root cluster. (satoru)
+            uint8_t bs[90];
+            usb_memset(bs, 0, sizeof(bs));
+            if (!MsdReadBytes(idx, parts[i].start_lba * (uint64_t)rt.msd_block_size,
+                              90, bs)) continue;
+            const char fs[8] = { 'F','A','T','3','2',' ',' ',' ' };
+            static const char lab[11] = { 'K','U','R','O','N','O',' ',' ',' ',' ',' ' };
+            bool is32 = true;
+            for (int k = 0; k < 8; k++) if (bs[82 + k] != (uint8_t)fs[k]) is32 = false;
+            if (is32) {
+                bool bpb = true;
+                for (int k = 0; k < 11; k++) if (bs[71 + k] != (uint8_t)lab[k]) { bpb = false; break; }
+                if (bpb) match = true;
+            }
+            if (!match && is32) {
+                uint32_t bps = msd_rd16(bs + 11), spc = bs[13];
+                uint32_t rsvd = msd_rd16(bs + 14), nfats = bs[16];
+                uint32_t fatsz = msd_rd32(bs + 36), root = msd_rd32(bs + 44);
+                uint32_t clus = bps * spc;
+                if (bps >= 512 && bps <= 4096 && spc && nfats && fatsz &&
+                    root >= 2 && clus <= USB_BULK_BOUNCE) {
+                    uint64_t off = parts[i].start_lba * (uint64_t)rt.msd_block_size +
+                                   ((uint64_t)rsvd + (uint64_t)nfats * fatsz) * bps;
+                    uint8_t* dir = (uint8_t*)KernelHeap::Alloc(clus);
+                    if (dir && MsdReadBytes(idx, off + (uint64_t)(root - 2) * clus, clus, dir)) {
+                        for (uint32_t o = 0; o + 32 <= clus; o += 32) {
+                            const uint8_t* ent = dir + o;
+                            if (ent[0] == 0) break;
+                            if (ent[0] == 0xE5 || ent[11] == 0x0F || (ent[11] & 0x08) == 0) continue;
+                            bool m = true;
+                            for (int k = 0; k < 11; k++) if (ent[k] != (uint8_t)lab[k]) { m = false; break; }
+                            if (m) { match = true; break; }
+                        }
+                    }
+                    if (dir) KernelHeap::Free(dir);
+                }
+            }
+        }
+        if (match) {
+            hits++;
+            lo  = parts[i].start_lba;
+            end = parts[i].end_lba + 1;
+        }
+    }
+
+    if (hits != 1 || end <= lo || end > rt.msd_blocks) {
+        usb_log("USB: slot %d msd found %d KURONO partition(s), usb disk stays read-only\n",
+                (int)rt.slot, hits);
+        return false;
+    }
+    g_usb_win_gid = gid;
+    g_usb_win_lo  = lo;
+    g_usb_win_end = end;
+    usb_log("USB: slot %d [diskguard] usb write window = KURONO partition lba ", (int)rt.slot);
+    SerialLogger::LogHex64(lo);
+    SerialLogger::Log(" - ");
+    SerialLogger::LogHex64(end);
+    SerialLogger::Log("\r\n");
+    return true;
+}
+
+void USB::MsdRegisterBlockDev(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    if (!rt.msd_ready || rt.bd_name[0]) return;
+
+    char name[8] = { 's', 'd', 'a', 0, 0, 0, 0, 0 };
+    int c = 0;
+    for (; c < 26; c++) {
+        name[2] = (char)('a' + c);
+        if (!BlockDev::FindByName(name)) break;
+    }
+    if (c >= 26) {
+        usb_log("USB: slot %d msd no free sd name, not registering a block device\n",
+                (int)rt.slot);
+        return;
+    }
+
+    int gid = (int)(S - g_xs) * USB_MAX_DEVICES + idx;
+    USBDeviceInfo& dev = devices[idx];
+    BlockDevice bd = {};
+    for (int i = 0; i < (int)sizeof(bd.name) - 1 && name[i]; i++) bd.name[i] = name[i];
+    const char* drv = "usb";
+    for (int i = 0; i < (int)sizeof(bd.driver) - 1 && drv[i]; i++) bd.driver[i] = drv[i];
+    int m = 0;
+    for (int i = 0; dev.manufacturer[i] && m < (int)sizeof(bd.model) - 2; i++) bd.model[m++] = dev.manufacturer[i];
+    if (m && dev.product[0] && m < (int)sizeof(bd.model) - 2) bd.model[m++] = ' ';
+    for (int i = 0; dev.product[i] && m < (int)sizeof(bd.model) - 1; i++) bd.model[m++] = dev.product[i];
+    bd.model[m] = 0;
+    if (!bd.model[0]) {
+        const char* um = "USB mass storage";
+        for (m = 0; um[m] && m < (int)sizeof(bd.model) - 1; m++) bd.model[m] = um[m];
+        bd.model[m] = 0;
+    }
+    bd.capacity_lba = rt.msd_blocks;
+    bd.sector_size  = rt.msd_block_size;
+    bd.removable    = true;
+    bd.ctx          = (void*)(intptr_t)gid;
+    bd.read = [](void* ctx, uint64_t lba, uint32_t count, void* buf) -> bool {
+        int g = (int)(intptr_t)ctx;
+        int ctl = g / USB_MAX_DEVICES, i = g % USB_MAX_DEVICES;
+        if (ctl < 0 || ctl >= g_nctl) return false;
+        XhciState* sv = S;
+        S = &g_xs[ctl];
+        bool ok = MsdRead(i, lba, count, buf);
+        S = sv;
+        return ok;
+    };
+    bd.write = [](void* ctx, uint64_t lba, uint32_t count, const void* buf) -> bool {
+        int g = (int)(intptr_t)ctx;
+        int ctl = g / USB_MAX_DEVICES, i = g % USB_MAX_DEVICES;
+        if (ctl < 0 || ctl >= g_nctl) return false;
+        XhciState* sv = S;
+        S = &g_xs[ctl];
+        bool ok = MsdWrite(i, lba, count, buf);
+        S = sv;
+        return ok;
+    };
+    bd.flush = [](void* ctx) -> bool {
+        int g = (int)(intptr_t)ctx;
+        int ctl = g / USB_MAX_DEVICES, i = g % USB_MAX_DEVICES;
+        if (ctl < 0 || ctl >= g_nctl) return false;
+        XhciState* sv = S;
+        S = &g_xs[ctl];
+        bool ok = false;
+        if (MsdIsReady(i)) {
+            uint8_t cb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };   // synchronize cache(10) (satoru)
+            ok = MsdCommand(i, cb, 10, false, nullptr, 0, nullptr);
+        }
+        S = sv;
+        return ok;
+    };
+    if (BlockDev::Register(bd) >= 0) {
+        for (int i = 0; i < (int)sizeof(rt.bd_name) - 1 && name[i]; i++) rt.bd_name[i] = name[i];
+        rt.bd_name[sizeof(rt.bd_name) - 1] = 0;
+    }
+}
+
+void USB::MsdUnregisterBlockDev(int idx) {
+    USBDeviceRuntime& rt = runtime[idx];
+    int gid = (int)(S - g_xs) * USB_MAX_DEVICES + idx;
+    if (rt.bd_name[0]) {
+        BlockDev::Unregister(rt.bd_name);
+        rt.bd_name[0] = 0;
+    }
+    if (g_usb_win_gid == gid) {
+        g_usb_win_gid = -1;
+        g_usb_win_lo = g_usb_win_end = 0;
+    }
+}
+
+// scsi bring-up for a freshly configured bot device. the order follows linux
+// usb-storage + sd: get max lun, bulk-only reset, inquiry, then ready polling
+// with request-sense and start-unit, then read capacity. the jms583 and other
+// bridges report unit attention / not-ready for a while after power-on, so a
+// fixed handful of retries without a real delay loses the disk. (satoru)
 bool USB::MsdInit(int idx) {
     USBDeviceRuntime& rt = runtime[idx];
     USBDeviceInfo&    dev = devices[idx];
+    rt.msd_tag = 0;
+    rt.msd_csw_sig_ok = false;
 
-    // inquiry: 36 bytes of standard data (satoru)
+    // get max lun (class interface request, one byte). a stall only means the
+    // device wants lun 0, which is also the bot default. (satoru)
+    uint8_t lun = 0;
+    if (ControlTransferEP(idx, 0xA1, USB_MSC_REQ_GETLUN, 0, rt.msd_iface, 1, &lun) &&
+        lun < 16) {
+        rt.msd_lun = lun;
+        usb_log("USB: slot %d msd max lun %d\n", (int)rt.slot, (int)lun);
+    } else {
+        rt.msd_lun = 0;
+        usb_log("USB: slot %d msd get-max-lun stalled, using lun 0\n", (int)rt.slot);
+    }
+
+    // put the bridge in a known state; a warm reboot from another os can
+    // leave it on the uas alt or mid-command. (satoru)
+    if (ControlTransferEP(idx, 0x21, USB_MSC_REQ_RESET, 0, rt.msd_iface, 0, nullptr))
+        usb_log("USB: slot %d msd bulk-only reset ok\n", (int)rt.slot);
+    else
+        usb_log("USB: slot %d msd bulk-only reset stalled\n", (int)rt.slot);
+    usb_delay_ms(50);
+
+    // inquiry: 36 bytes of standard data, retried on a transient sense (satoru)
     uint8_t inq[36];
-    usb_memset(inq, 0, sizeof(inq));
-    uint8_t cb_inq[6] = { 0x12, 0, 0, 0, 36, 0 };
-    if (MsdCommand(idx, cb_inq, 6, true, inq, 36, nullptr)) {
-        // vendor(8)+product(16) ascii at offsets 8 and 16 (satoru)
-        int j = 0;
-        for (int i = 8; i < 16 && inq[i] >= 0x20 && inq[i] < 0x7F; i++)
-            dev.manufacturer[j++] = (char)inq[i];
-        while (j > 0 && dev.manufacturer[j - 1] == ' ') j--;
-        dev.manufacturer[j] = 0;
-        j = 0;
-        for (int i = 16; i < 32 && inq[i] >= 0x20 && inq[i] < 0x7F; i++)
-            dev.product[j++] = (char)inq[i];
-        while (j > 0 && dev.product[j - 1] == ' ') j--;
-        dev.product[j] = 0;
+    bool inq_ok = false;
+    for (int attempt = 0; attempt < 4 && !inq_ok; attempt++) {
+        usb_memset(inq, 0, sizeof(inq));
+        uint8_t cb_inq[6] = { 0x12, 0, 0, 0, 36, 0 };
+        if (MsdCommand(idx, cb_inq, 6, true, inq, 36, nullptr)) { inq_ok = true; break; }
+        uint8_t key = 0, asc = 0, ascq = 0;
+        if (MsdRequestSense(idx, &key, &asc, &ascq))
+            usb_log("USB: slot %d msd inquiry sense key=%d asc=%x ascq=%x\n",
+                    (int)rt.slot, (int)key, (int)asc, (int)ascq);
+        usb_delay_ms(attempt == 0 ? 100 : 500);
     }
+    if (!inq_ok) {
+        usb_log("USB: slot %d msd inquiry failed\n", (int)rt.slot);
+        return false;
+    }
+    // vendor(8)+product(16) ascii at offsets 8 and 16 (satoru)
+    int j = 0;
+    for (int i = 8; i < 16 && inq[i] >= 0x20 && inq[i] < 0x7F; i++)
+        dev.manufacturer[j++] = (char)inq[i];
+    while (j > 0 && dev.manufacturer[j - 1] == ' ') j--;
+    dev.manufacturer[j] = 0;
+    j = 0;
+    for (int i = 16; i < 32 && inq[i] >= 0x20 && inq[i] < 0x7F; i++)
+        dev.product[j++] = (char)inq[i];
+    while (j > 0 && dev.product[j - 1] == ' ') j--;
+    dev.product[j] = 0;
 
-    // test unit ready, clearing the post-reset unit-attention via request
-    // sense; a real stick needs one or two rounds. (satoru)
+    // test unit ready: unit attention (after reset/power-on) and not-ready
+    // (the bridge still bringing the nvme namespace up) are transient, so
+    // retry with a real delay and send start unit once, as sd.c does. (satoru)
     bool ready = false;
-    for (int attempt = 0; attempt < 4 && !ready; attempt++) {
+    bool start_sent = false;
+    int attempts = 0;
+    uint8_t last_key = 0xFF, last_asc = 0, last_ascq = 0;
+    uint64_t t0 = Scheduler::NowMs();
+    while (attempts < 40) {
+        attempts++;
         uint8_t cb_tur[6] = { 0x00, 0, 0, 0, 0, 0 };
-        if (MsdCommand(idx, cb_tur, 6, false, nullptr, 0, nullptr)) {
-            ready = true;
-            break;
-        }
-        uint8_t sense[18];
-        usb_memset(sense, 0, sizeof(sense));
-        uint8_t cb_sense[6] = { 0x03, 0, 0, 0, 18, 0 };
-        MsdCommand(idx, cb_sense, 6, true, sense, 18, nullptr);
-        usb_spin(50000);
-    }
-    if (!ready) return false;
+        if (MsdCommand(idx, cb_tur, 6, false, nullptr, 0, nullptr)) { ready = true; break; }
 
-    // read capacity(10): big-endian [last lba][block size] (satoru)
-    uint8_t cap[8];
-    usb_memset(cap, 0, sizeof(cap));
-    uint8_t cb_cap[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    if (!MsdCommand(idx, cb_cap, 10, true, cap, 8, nullptr)) return false;
-    uint32_t last_lba = ((uint32_t)cap[0] << 24) | ((uint32_t)cap[1] << 16) |
-                        ((uint32_t)cap[2] << 8)  | (uint32_t)cap[3];
-    uint32_t bs       = ((uint32_t)cap[4] << 24) | ((uint32_t)cap[5] << 16) |
-                        ((uint32_t)cap[6] << 8)  | (uint32_t)cap[7];
-    if (bs == 0 || bs > USB_BULK_BOUNCE) return false;
-    rt.msd_blocks     = (uint64_t)last_lba + 1;
-    rt.msd_block_size = bs;
-    rt.msd_ready      = true;
+        uint8_t key = 0, asc = 0, ascq = 0;
+        if (!MsdRequestSense(idx, &key, &asc, &ascq)) {
+            if (Scheduler::NowMs() - t0 > 15000) break;
+            usb_delay_ms(250);
+            continue;
+        }
+        if (key != last_key || asc != last_asc || ascq != last_ascq) {
+            usb_log("USB: slot %d msd not ready: sense key=%d asc=%x ascq=%x (attempt %d)\n",
+                    (int)rt.slot, (int)key, (int)asc, (int)ascq, attempts);
+            last_key = key; last_asc = asc; last_ascq = ascq;
+        }
+        // anything other than unit attention / not ready is fatal (satoru)
+        if (key != 2 && key != 6) break;
+        if (key == 2 && !start_sent) {
+            uint8_t cb_ss[6] = { 0x1B, 0, 0, 0, 1, 0 };   // start stop unit, start=1 (satoru)
+            MsdCommand(idx, cb_ss, 6, false, nullptr, 0, nullptr);
+            start_sent = true;
+            usb_log("USB: slot %d msd start unit sent\n", (int)rt.slot);
+        }
+        if (Scheduler::NowMs() - t0 > 15000) break;
+        usb_delay_ms(attempts < 2 ? 250 : 1000);
+    }
+    if (!ready) {
+        usb_log("USB: slot %d msd never became ready (%d attempts)\n", (int)rt.slot, attempts);
+        return false;
+    }
+
+    if (!MsdReadCapacity(idx)) return false;
+    rt.msd_ready = true;
+    usb_log("USB: slot %d msd capacity blocks=%d bs=%d\n", (int)rt.slot,
+            (int)rt.msd_blocks, (int)rt.msd_block_size);
+
+    MsdFindKuronoWindow(idx);
+    MsdRegisterBlockDev(idx);
     return true;
 }
 
@@ -1581,13 +2138,26 @@ bool USB::MsdRead(int device, uint64_t lba, uint32_t count, void* buf) {
 
 bool USB::MsdWrite(int device, uint64_t lba, uint32_t count, const void* buf) {
     if (!MsdIsReady(device) || !buf || count == 0) return false;
-    // the bare-metal write guard has no usb window: guarded = read-only. on the
-    // owner's laptop the usb disk holds macOS and their data. (satoru)
+    // the bare-metal write guard allows exactly one usb partition: the one
+    // named (or labelled) KURONO on the disk that carries it. on the owner's
+    // laptop every other usb partition holds macOS and their data. (satoru)
     if (NVMe::WriteGuardOn()) {
-        // once per boot: a retrying caller used to flood serial and the disk log (satoru)
-        static bool s_logged = false;
-        if (!s_logged) { s_logged = true; SerialLogger::Log("[diskguard] REFUSED usb mass-storage write (further refusals not logged)\r\n"); }
-        return false;
+        int gid = (int)(S - g_xs) * USB_MAX_DEVICES + device;
+        bool inside = g_usb_win_end != 0 && g_usb_win_gid == gid &&
+                      lba >= g_usb_win_lo && lba + count <= g_usb_win_end &&
+                      lba + count > lba;
+        if (!inside) {
+            static int s_logged = 0;
+            if (s_logged < 8) {
+                s_logged++;
+                SerialLogger::Log("[diskguard] REFUSED usb write lba=");
+                SerialLogger::LogHex64(lba);
+                SerialLogger::Log(" count=");
+                SerialLogger::LogDec((int)count);
+                SerialLogger::Log("\r\n");
+            }
+            return false;
+        }
     }
     USBDeviceRuntime& rt = runtime[device];
     if (lba + count > rt.msd_blocks) return false;
@@ -1610,6 +2180,78 @@ bool USB::MsdWrite(int device, uint64_t lba, uint32_t count, const void* buf) {
         count -= n;
     }
     return true;
+}
+
+// mass-storage end to end self test (kurono.usbmsdtest=1): gpt scan, a read
+// from both partitions, and the write guard inside/outside the KURONO window.
+// the writes put the sector back exactly as it was read. (satoru)
+bool USB::MsdSelfTest() {
+    int fails = 0;
+    auto check = [&](const char* what, bool ok) {
+        usb_log("[usbmsdtest] %s: %s\n", what, ok ? "PASS" : "FAIL");
+        if (!ok) fails++;
+    };
+    int dev = MsdFirstDevice();
+    if (dev < 0) {
+        usb_log("[usbmsdtest] no ready mass-storage device\n");
+        return false;
+    }
+    USBDeviceRuntime& rt = runtime[dev];
+    usb_log("[usbmsdtest] dev %d blocks=%d bs=%d vendor '%s' product '%s'\n",
+            dev, (int)rt.msd_blocks, (int)rt.msd_block_size,
+            devices[dev].manufacturer, devices[dev].product);
+
+    UsbMsdPart parts[32];
+    int n = MsdGptScan(dev, parts, 32);
+    usb_log("[usbmsdtest] gpt partitions=%d\n", n);
+    int kur = -1, other = -1;
+    for (int i = 0; i < n && i < 32; i++) {
+        usb_log("[usbmsdtest]   part %d lba %d-%d name '%s'\n",
+                i, (int)parts[i].start_lba, (int)parts[i].end_lba, parts[i].name);
+        const char* want = "KURONO";
+        bool match = parts[i].name[0] != 0;
+        for (int k = 0; k < 6 && match; k++) if (parts[i].name[k] != want[k]) match = false;
+        if (match && parts[i].name[6] != 0) match = false;
+        if (match && kur < 0) kur = i;
+        else if (!match && other < 0) other = i;
+    }
+    check("gpt found KURONO and a second partition", n >= 2 && kur >= 0 && other >= 0);
+    if (kur < 0 || other < 0) return false;
+
+    uint32_t bs = rt.msd_block_size;
+    uint8_t* kbuf = (uint8_t*)KernelHeap::Alloc(bs);
+    uint8_t* obuf = (uint8_t*)KernelHeap::Alloc(bs);
+    if (!kbuf || !obuf) {
+        if (kbuf) KernelHeap::Free(kbuf);
+        if (obuf) KernelHeap::Free(obuf);
+        return false;
+    }
+    bool rk = MsdRead(dev, parts[kur].start_lba, 1, kbuf);
+    check("read KURONO partition", rk);
+    bool ok_other = MsdRead(dev, parts[other].start_lba, 1, obuf);
+    check("read second partition", ok_other);
+    if (rk && bs >= 512) {
+        bool fat = kbuf[510] == 0x55 && kbuf[511] == 0xAA;
+        usb_log("[usbmsdtest] KURONO boot sector bytes 0-3 %x %x %x %x fat32sig=%d\n",
+                (uint32_t)kbuf[0], (uint32_t)kbuf[1], (uint32_t)kbuf[2],
+                (uint32_t)kbuf[3], fat ? 1 : 0);
+    }
+
+    if (NVMe::WriteGuardOn()) {
+        bool wk = MsdWrite(dev, parts[kur].start_lba, 1, kbuf);
+        check("write inside KURONO window allowed", wk);
+        bool wo = ok_other ? MsdWrite(dev, parts[other].start_lba, 1, obuf) : true;
+        check("write to the other partition refused", !wo);
+        bool wg = MsdWrite(dev, 0, 1, kbuf);
+        check("write outside every partition refused", !wg);
+    } else {
+        usb_log("[usbmsdtest] write guard off, write checks skipped\n");
+    }
+
+    KernelHeap::Free(kbuf);
+    KernelHeap::Free(obuf);
+    usb_log("[usbmsdtest] %s (%d failures)\n", fails ? "FAILED" : "PASSED", fails);
+    return fails == 0;
 }
 // ---- end bulk transport + bot (satoru) ---------------------------------------
 
@@ -1950,6 +2592,7 @@ void USB::TeardownDevice(int idx) {
     }
     if (had_kbd)
         Keyboard::RemoveUSBDevice((uint8_t)((int)(S - g_xs) * USB_MAX_DEVICES + idx));
+    if (rt.is_msd) MsdUnregisterBlockDev(idx);   // drop the sd node before the rings go (satoru)
     if (rt.device_ctx) KernelHeap::Free(rt.device_ctx);
     if (rt.input_ctx)  KernelHeap::Free(rt.input_ctx);
     if (rt.ep0_ring)   KernelHeap::Free(rt.ep0_ring);
@@ -1957,6 +2600,7 @@ void USB::TeardownDevice(int idx) {
     if (rt.bulk_out_ring) KernelHeap::Free(rt.bulk_out_ring);
     if (rt.bulk_bounce)   KernelHeap::Free(rt.bulk_bounce);
     if (rt.iso_ring)      PMM::FreeBytes(rt.iso_ring, 4096);   // pmm page, not a heap block (satoru)
+    if (rt.iso_fb_ring)   PMM::FreeBytes(rt.iso_fb_ring, 4096);
 
     int ctl = (int)(S - g_xs);
     g_halt_mask[ctl][idx] = 0;
@@ -2077,7 +2721,7 @@ bool USB::EnumerateDeviceAt(int root_port, uint32_t route, uint8_t depth,
             uint32_t* e0 = EndpointCtx(idx, 1);
             e0[1] = (e0[1] & 0x0000FFFFu) | ((uint32_t)real << 16);
             xHCI_TRB ev = {};
-            ev.parameter = (uint64_t)(uintptr_t)rt.input_ctx;
+            ev.parameter = KernelPhysOf(rt.input_ctx);
             ev.control = TRB_TYPE(13) | ((uint32_t)rt.slot << 24);
             xHCI_TRB er = {};
             bool ok = SubmitCommand(&ev, &er) && ((er.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
@@ -2256,16 +2900,26 @@ void USB::HubClearTt(int idx, uint8_t ep_addr, uint8_t xfer_type) {
     if (!rt.tt_hub_slot) return;
     int hub = FindDeviceBySlot(rt.tt_hub_slot);
     if (hub < 0) return;
+    // the request names the usb device address. the controller picks it at
+    // address-device and reports it in the output slot context (dword 3 bits
+    // 7:0); it is not the slot id. (satoru)
+    uint8_t addr = rt.device_ctx ? (uint8_t)(((const uint32_t*)rt.device_ctx)[3] & 0xFF) : 0;
+    if (!addr) return;
     static bool in_clear = false;
     if (in_clear) return;
     in_clear = true;
     bool in = (ep_addr & 0x80) != 0;
     uint16_t devinfo = (uint16_t)(ep_addr & 0x0F);
-    devinfo |= (uint16_t)((uint16_t)rt.slot << 4);
+    devinfo |= (uint16_t)((uint16_t)(addr & 0x7F) << 4);
     devinfo |= (uint16_t)((uint16_t)xfer_type << 11);
     if (in) devinfo |= 0x8000;
     uint16_t ttport = rt.tt_mtt ? rt.tt_port : 1;
+    // called from the hid poll (the gui's Mouse::Poll among others): a dead hub
+    // must not freeze the desktop for 5 s per request. (satoru)
+    uint32_t saved_to = g_ctl_timeout_ms;
+    g_ctl_timeout_ms = 250;
     ControlTransferEP(hub, 0x23, USB_HUB_REQ_CLEAR_TT, devinfo, ttport, 0, nullptr);
+    g_ctl_timeout_ms = saved_to;
     in_clear = false;
 }
 
@@ -2512,11 +3166,13 @@ bool USB::HubStart(int idx) {
             (int)rt.hub_pwr_good * 2);
 
     if (!rt.hub_ss) {
-        uint16_t lpsm = rt.hub_chars & 0x3;
-        for (uint8_t p = 1; p <= rt.hub_ports; p++) {
-            if (lpsm == 0 && p != 1) continue;   // ganged power: port 1 controls all (satoru)
+        // every port gets its own PORT_POWER, ganged hubs included, as linux
+        // hub_power_on does. ganged only means the supply is shared: a port
+        // that never saw the request stays in the powered-off state and never
+        // reports a connection. powering port 1 alone left ports 2-4 of the
+        // laptop's hub (1a40:0101, ganged) dead. (satoru)
+        for (uint8_t p = 1; p <= rt.hub_ports; p++)
             HubSetPortFeature(idx, p, USB_HUB_FEAT_PORT_POWER);
-        }
         uint32_t delay = (uint32_t)rt.hub_pwr_good * 2;
         if (delay < 100) delay = 100;            // power stable time for an external hub (satoru)
         usb_delay_ms(delay);
@@ -2621,6 +3277,12 @@ void USB::PollOne(int ctl) {
                 if (g_iso_event_fn)
                     g_iso_event_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, ev.parameter,
                                    (uint8_t)((ev.status >> 24) & 0xFF), ev.status & 0x00FFFFFF);
+            } else if (runtime[idx].iso_fb_dci && runtime[idx].iso_fb_dci == ep_id) {
+                // feedback endpoint (async sink): same callback, the driver
+                // tells the two rings apart by the trb pointer. (satoru)
+                if (g_iso_event_fn)
+                    g_iso_event_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, ev.parameter,
+                                   (uint8_t)((ev.status >> 24) & 0xFF), ev.status & 0x00FFFFFF);
             }
         } else if (type == TRB_PORT_STATUS) {
             // parameter[31:24] holds the 1-based port id (satoru).
@@ -2670,7 +3332,7 @@ void USB::PollOne(int ctl) {
             xHCI_TRB r = {};
             bool ok1 = SubmitCommand(&c, &r) && ((r.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
             xHCI_TRB d = {};
-            d.parameter = (uint64_t)(uintptr_t)&ep.ring[ep.idx] | (ep.cycle ? 1u : 0u);
+            d.parameter = KernelPhysOf(&ep.ring[ep.idx]) | (ep.cycle ? 1u : 0u);
             d.control = TRB_TYPE(16) | ((uint32_t)rt.slot << 24) | ((uint32_t)ep.ep_id << 16);
             bool ok2 = SubmitCommand(&d, &r) && ((r.status >> 24) & 0xFF) == TRB_CC_SUCCESS;
             if (g_intr_resets[ctl][idx][e] <= 4)
@@ -2909,7 +3571,7 @@ bool USB::RecoverEp(int idx, uint8_t dci, xHCI_TRB* ring, int ring_idx, bool cyc
     bool ok1 = SubmitCommand(&c, &r);
     uint8_t cc1 = (uint8_t)((r.status >> 24) & 0xFF);
     xHCI_TRB d = {};
-    d.parameter = (uint64_t)(uintptr_t)&ring[ring_idx] | (cycle ? 1u : 0u);
+    d.parameter = KernelPhysOf(&ring[ring_idx]) | (cycle ? 1u : 0u);
     d.control = TRB_TYPE(16) | ((uint32_t)rt.slot << 24) | ((uint32_t)dci << 16);
     xHCI_TRB r2 = {};
     bool ok2 = SubmitCommand(&d, &r2);
@@ -2933,6 +3595,9 @@ void USB::ForeignEvent(const xHCI_TRB& ev) {
         return;
     }
     if (rt.iso_dci && rt.iso_dci == ep_id) {
+        if (g_iso_event_fn)
+            g_iso_event_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, ev.parameter, cc, ev.status & 0x00FFFFFF);
+    } else if (rt.iso_fb_dci && rt.iso_fb_dci == ep_id) {
         if (g_iso_event_fn)
             g_iso_event_fn((int)(S - g_xs) * USB_MAX_DEVICES + idx, ev.parameter, cc, ev.status & 0x00FFFFFF);
     }
@@ -3028,7 +3693,7 @@ bool USB::IsoOpen(int gid, const UsbIsoParams& p, uint32_t* out_period_us) {
         xHCI_TRB* ring = (xHCI_TRB*)PMM::AllocBytes(4096);
         if (!ring) break;
         usb_memset(ring, 0, 4096);
-        ring[USB_ISO_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)ring;
+        ring[USB_ISO_RING_TRBS - 1].parameter = KernelPhysOf(ring);
         ring[USB_ISO_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
         // service interval as linux xhci_parse_exponent_interval (+3 on full speed:
         // bInterval counts 1 ms frames there, the field counts 125 us units) (satoru)
@@ -3042,7 +3707,40 @@ bool USB::IsoOpen(int gid, const UsbIsoParams& p, uint32_t* out_period_us) {
         uint32_t burst = (rt.speed == USB_SPEED_FULL) ? 0 : p.burst;
         uint32_t avg = p.avg_bytes ? p.avg_bytes : esit;
 
+        // explicit feedback endpoint: second isoch endpoint, always IN. its
+        // ring is kept across a close so a completion racing the teardown
+        // cannot touch freed memory; the device teardown frees it. (satoru)
+        bool want_fb = p.fb_ep_addr && (p.fb_ep_addr & 0x80) && p.fb_max_packet;
+        uint8_t fb_dci = 0;
+        xHCI_TRB* fb_ring = nullptr;
+        uint32_t fb_xint = 0;
+        if (want_fb) {
+            fb_dci = (uint8_t)(((p.fb_ep_addr & 0x0F) * 2) + 1);
+            if (fb_dci < 2 || fb_dci > 31 || fb_dci == dci) { want_fb = false; fb_dci = 0; }
+        }
+        if (want_fb) {
+            fb_ring = rt.iso_fb_ring;
+            if (!fb_ring) fb_ring = (xHCI_TRB*)PMM::AllocBytes(4096);
+            if (!fb_ring) { want_fb = false; fb_dci = 0; }
+            else {
+                usb_memset(fb_ring, 0, 4096);
+                fb_ring[USB_ISO_RING_TRBS - 1].parameter = KernelPhysOf(fb_ring);
+                fb_ring[USB_ISO_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_ENT;
+                uint32_t fbi = p.fb_b_interval; if (fbi < 1) fbi = 1; if (fbi > 16) fbi = 16;
+                fb_xint = fbi - 1;
+                if (rt.speed == USB_SPEED_FULL) fb_xint += 3;
+                if (fb_xint > 15) fb_xint = 15;
+            }
+        }
+
         uint32_t* icc = InputControlCtx(idx);
+        uint32_t* slot_ctx = SlotCtx(idx);
+        uint32_t ents = (slot_ctx[0] >> 27) & 0x1F;
+        if (ents < dci) ents = dci;
+        if (want_fb && ents < fb_dci) ents = fb_dci;
+        slot_ctx[0] = (slot_ctx[0] & ~((uint32_t)0x1F << 27)) | (ents << 27);
+
+        // fill the data endpoint context (satoru)
         icc[0] = 0;
         icc[1] = (1u << 0) | (1u << dci);
         uint32_t* epc = EndpointCtx(idx, dci);
@@ -3050,17 +3748,25 @@ bool USB::IsoOpen(int gid, const UsbIsoParams& p, uint32_t* out_period_us) {
         epc[0] = (xint << 16) | (mult << 8);
         // CErr 0 for isoch, EPType 1 = isoch out, 5 = isoch in (satoru)
         epc[1] = (0u << 1) | ((in ? 5u : 1u) << 3) | (burst << 8) | ((uint32_t)p.max_packet << 16);
-        uint64_t deq = (uint64_t)(uintptr_t)ring | 1;
+        uint64_t deq = KernelPhysOf(ring) | 1;
         epc[2] = (uint32_t)deq;
         epc[3] = (uint32_t)(deq >> 32);
         epc[4] = (avg & 0xFFFF) | ((esit & 0xFFFF) << 16);
-        uint32_t* slot_ctx = SlotCtx(idx);
-        uint32_t ents = (slot_ctx[0] >> 27) & 0x1F;
-        if (ents < dci) ents = dci;
-        slot_ctx[0] = (slot_ctx[0] & ~((uint32_t)0x1F << 27)) | (ents << 27);
+
+        if (want_fb) {
+            icc[1] |= (1u << fb_dci);
+            uint32_t* fep = EndpointCtx(idx, fb_dci);
+            usb_memset(fep, 0, ctx_stride);
+            fep[0] = (fb_xint << 16);
+            fep[1] = (0u << 1) | (5u << 3) | ((uint32_t)p.fb_max_packet << 16);
+            uint64_t fdeq = KernelPhysOf(fb_ring) | 1;
+            fep[2] = (uint32_t)fdeq;
+            fep[3] = (uint32_t)(fdeq >> 32);
+            fep[4] = (uint32_t)p.fb_max_packet | ((uint32_t)p.fb_max_packet << 16);
+        }
 
         xHCI_TRB cmd = {};
-        cmd.parameter = (uint64_t)(uintptr_t)rt.input_ctx;
+        cmd.parameter = KernelPhysOf(rt.input_ctx);
         cmd.control = TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)rt.slot << 24);
         xHCI_TRB res = {};
         bool sent = SubmitCommand(&cmd, &res);
@@ -3068,11 +3774,43 @@ bool USB::IsoOpen(int gid, const UsbIsoParams& p, uint32_t* out_period_us) {
         usb_log("USB: iso open slot %d ep %x dci %d mps %d burst %d mult %d esit %d interval-field %d (%d us): configure cc %d\n",
                 (int)rt.slot, (uint32_t)p.ep_addr, (int)dci, (int)p.max_packet, (int)burst, (int)mult,
                 (int)esit, (int)xint, (int)period_us, (int)cc);
-        if (!sent || cc != TRB_CC_SUCCESS) { PMM::FreeBytes(ring, 4096); break; }
-        rt.iso_ring = ring; rt.iso_idx = 0; rt.iso_cycle = true;
-        rt.iso_dci = dci; rt.iso_ep_addr = p.ep_addr;
-        if (out_period_us) *out_period_us = period_us;
-        ok = true;
+        if (want_fb) {
+            usb_log("USB: iso feedback slot %d ep %x dci %d mps %d per %d us (%s)\n",
+                    (int)rt.slot, (uint32_t)p.fb_ep_addr, (int)fb_dci, (int)p.fb_max_packet,
+                    (int)(125u << fb_xint), (sent && cc == TRB_CC_SUCCESS) ? "configured" : "refused");
+        }
+        if (sent && cc == TRB_CC_SUCCESS) {
+            rt.iso_ring = ring; rt.iso_idx = 0; rt.iso_cycle = true;
+            rt.iso_dci = dci; rt.iso_ep_addr = p.ep_addr;
+            if (want_fb) {
+                rt.iso_fb_ring = fb_ring; rt.iso_fb_idx = 0; rt.iso_fb_cycle = true;
+                rt.iso_fb_dci = fb_dci; rt.iso_fb_ep_addr = p.fb_ep_addr;
+            }
+            if (out_period_us) *out_period_us = period_us;
+            ok = true;
+            break;
+        }
+        // feedback endpoint refused (bandwidth or a picky controller): drop
+        // it and configure the data endpoint alone, open loop. (satoru)
+        if (want_fb) {
+            usb_log("USB: feedback endpoint refused, falling back to open loop\n");
+            icc[1] = (1u << 0) | (1u << dci);
+            usb_memset(EndpointCtx(idx, fb_dci), 0, ctx_stride);
+            cmd.parameter = KernelPhysOf(rt.input_ctx);
+            cmd.control = TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)rt.slot << 24);
+            res = xHCI_TRB();
+            sent = SubmitCommand(&cmd, &res);
+            cc = (uint8_t)((res.status >> 24) & 0xFF);
+            usb_log("USB: iso open data-only: configure cc %d\n", (int)cc);
+            if (sent && cc == TRB_CC_SUCCESS) {
+                rt.iso_ring = ring; rt.iso_idx = 0; rt.iso_cycle = true;
+                rt.iso_dci = dci; rt.iso_ep_addr = p.ep_addr;
+                if (out_period_us) *out_period_us = period_us;
+                ok = true;
+                break;
+            }
+        }
+        PMM::FreeBytes(ring, 4096);
     } while (0);
     g_dispatch_foreign = svf; S = sv;
     return ok;
@@ -3084,23 +3822,35 @@ void USB::IsoClose(int gid) {
     S = &g_xs[GidCtl(gid)]; g_dispatch_foreign = true;
     int idx = GidIdx(gid);
     USBDeviceRuntime& rt = runtime[idx];
-    if (rt.iso_dci) {
-        uint8_t dci = rt.iso_dci;
-        rt.iso_dci = 0;                                          // events for it are ignored from here (satoru)
-        xHCI_TRB st = {};
-        st.control = TRB_TYPE(15) | ((uint32_t)rt.slot << 24) | ((uint32_t)dci << 16);
+    uint8_t dci = rt.iso_dci, fb_dci = rt.iso_fb_dci;
+    if (dci || fb_dci) {
+        xHCI_TRB* ring = rt.iso_ring;
+        rt.iso_dci = 0; rt.iso_fb_dci = 0;                       // events for them are ignored from here (satoru)
+        rt.iso_ring = nullptr;
+        // the feedback page is kept: isoch is not running while no td is queued
+        // (g_fb_open is false), and the next open reuses it, so a completion
+        // racing a close can never touch a freed page. (satoru)
         xHCI_TRB r = {};
-        SubmitCommand(&st, &r);
+        if (dci) {
+            xHCI_TRB st = {};
+            st.control = TRB_TYPE(15) | ((uint32_t)rt.slot << 24) | ((uint32_t)dci << 16);
+            SubmitCommand(&st, &r);
+        }
+        if (fb_dci) {
+            xHCI_TRB st = {};
+            st.control = TRB_TYPE(15) | ((uint32_t)rt.slot << 24) | ((uint32_t)fb_dci << 16);
+            SubmitCommand(&st, &r);
+        }
         uint32_t* icc = InputControlCtx(idx);
-        icc[0] = (1u << dci);
+        icc[0] = (dci ? (1u << dci) : 0u) | (fb_dci ? (1u << fb_dci) : 0u);
         icc[1] = (1u << 0);
         xHCI_TRB cmd = {};
-        cmd.parameter = (uint64_t)(uintptr_t)rt.input_ctx;
+        cmd.parameter = KernelPhysOf(rt.input_ctx);
         cmd.control = TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)rt.slot << 24);
         SubmitCommand(&cmd, &r);
-        usb_log("USB: iso close slot %d dci %d: drop cc %d\n", (int)rt.slot, (int)dci, (int)((r.status >> 24) & 0xFF));
-        if (rt.iso_ring) PMM::FreeBytes(rt.iso_ring, 4096);
-        rt.iso_ring = nullptr;
+        usb_log("USB: iso close slot %d dci %d fb %d: drop cc %d\n", (int)rt.slot, (int)dci, (int)fb_dci,
+                (int)((r.status >> 24) & 0xFF));
+        if (ring) PMM::FreeBytes(ring, 4096);
     }
     g_dispatch_foreign = svf; S = sv;
 }
@@ -3112,13 +3862,13 @@ bool USB::IsoQueue(int gid, const void* data, uint32_t len, bool ioc) {
     USBDeviceRuntime& rt = g_xs[c].x_runtime[i];
     if (!rt.in_use || !rt.iso_ring || !rt.iso_dci) return false;
     xHCI_TRB* t = &rt.iso_ring[rt.iso_idx];
-    t->parameter = (uint64_t)(uintptr_t)data;
+    t->parameter = KernelPhysOf(data);
     t->status = len & 0x1FFFF;                                   // td size 0, interrupter 0 (satoru)
     __asm__ __volatile__("" ::: "memory");
     t->control = TRB_TYPE(TRB_ISOCH) | TRB_ISO_SIA | (ioc ? TRB_IOC : 0) | (rt.iso_cycle ? TRB_CYCLE : 0);
     rt.iso_idx++;
     if (rt.iso_idx >= USB_ISO_RING_TRBS - 1) {
-        rt.iso_ring[USB_ISO_RING_TRBS - 1].parameter = (uint64_t)(uintptr_t)rt.iso_ring;
+        rt.iso_ring[USB_ISO_RING_TRBS - 1].parameter = KernelPhysOf(rt.iso_ring);
         rt.iso_ring[USB_ISO_RING_TRBS - 1].control =
             TRB_TYPE(TRB_LINK) | TRB_ENT | (rt.iso_cycle ? TRB_CYCLE : 0);
         rt.iso_idx = 0;
@@ -3159,6 +3909,64 @@ bool USB::IsoRecover(int gid) {
     USBDeviceRuntime& rt = runtime[idx];
     bool ok = false;
     if (rt.iso_dci) ok = RecoverEp(idx, rt.iso_dci, rt.iso_ring, rt.iso_idx, rt.iso_cycle);
+    g_dispatch_foreign = svf; S = sv;
+    return ok;
+}
+
+// feedback endpoint queue/kick/state/recover, same shape as the data ones. (satoru)
+bool USB::IsoQueueFb(int gid, const void* data, uint32_t len, bool ioc) {
+    if (gid < 0) return false;
+    int c = gid / USB_MAX_DEVICES, i = gid % USB_MAX_DEVICES;
+    if (c >= g_nctl) return false;
+    USBDeviceRuntime& rt = g_xs[c].x_runtime[i];
+    if (!rt.in_use || !rt.iso_fb_ring || !rt.iso_fb_dci) return false;
+    xHCI_TRB* t = &rt.iso_fb_ring[rt.iso_fb_idx];
+    t->parameter = KernelPhysOf(data);
+    t->status = len & 0x1FFFF;
+    __asm__ __volatile__("" ::: "memory");
+    t->control = TRB_TYPE(TRB_ISOCH) | TRB_ISO_SIA | (ioc ? TRB_IOC : 0) | (rt.iso_fb_cycle ? TRB_CYCLE : 0);
+    rt.iso_fb_idx++;
+    if (rt.iso_fb_idx >= USB_ISO_RING_TRBS - 1) {
+        rt.iso_fb_ring[USB_ISO_RING_TRBS - 1].parameter = KernelPhysOf(rt.iso_fb_ring);
+        rt.iso_fb_ring[USB_ISO_RING_TRBS - 1].control =
+            TRB_TYPE(TRB_LINK) | TRB_ENT | (rt.iso_fb_cycle ? TRB_CYCLE : 0);
+        rt.iso_fb_idx = 0;
+        rt.iso_fb_cycle = !rt.iso_fb_cycle;
+    }
+    return true;
+}
+
+void USB::IsoKickFb(int gid) {
+    if (gid < 0) return;
+    int c = gid / USB_MAX_DEVICES, i = gid % USB_MAX_DEVICES;
+    if (c >= g_nctl) return;
+    XhciState* st = &g_xs[c];
+    USBDeviceRuntime& rt = st->x_runtime[i];
+    if (!rt.in_use || !rt.iso_fb_dci) return;
+    __asm__ __volatile__("mfence" ::: "memory");
+    uint32_t db_off = *(volatile uint32_t*)(st->x_bar0 + XHCI_CAP_DBOFF) & ~0x3u;
+    *(volatile uint32_t*)(st->x_bar0 + db_off + rt.slot * 4) = rt.iso_fb_dci;
+}
+
+uint32_t USB::IsoEpStateFb(int gid) {
+    if (gid < 0) return 7;
+    int c = gid / USB_MAX_DEVICES, i = gid % USB_MAX_DEVICES;
+    if (c >= g_nctl) return 7;
+    XhciState* st = &g_xs[c];
+    USBDeviceRuntime& rt = st->x_runtime[i];
+    if (!rt.in_use || !rt.iso_fb_dci || !rt.device_ctx) return 7;
+    volatile uint32_t* ep = (volatile uint32_t*)(rt.device_ctx + (uint32_t)rt.iso_fb_dci * st->x_ctx_stride);
+    return ep[0] & 7u;
+}
+
+bool USB::IsoRecoverFb(int gid) {
+    if (!GidValid(gid)) return false;
+    XhciState* sv = S; bool svf = g_dispatch_foreign;
+    S = &g_xs[GidCtl(gid)]; g_dispatch_foreign = true;
+    int idx = GidIdx(gid);
+    USBDeviceRuntime& rt = runtime[idx];
+    bool ok = false;
+    if (rt.iso_fb_dci) ok = RecoverEp(idx, rt.iso_fb_dci, rt.iso_fb_ring, rt.iso_fb_idx, rt.iso_fb_cycle);
     g_dispatch_foreign = svf; S = sv;
     return ok;
 }
@@ -3264,6 +4072,22 @@ void USB::LogKbDiag() {
                         (uint32_t)st->x_devices[i].vendor_id, (uint32_t)st->x_devices[i].product_id,
                         ep.role == USB_HID_KEYBOARD ? "keyboard" : (ep.role == USB_HID_MOUSE ? "mouse" : "hub"),
                         (int)st->intr_done[i], (int)st->intr_err[i], ep.armed ? 1 : 0);
+                // what the controller thinks of this endpoint, read from the
+                // output context: state 1 running, 2 halted, 3 stopped, 4 error,
+                // and its dequeue slot next to our enqueue slot. an armed
+                // endpoint that is silent with state 1 is waiting on the
+                // device; any other state means it stopped without an event
+                // reaching us. memory reads only. (satoru)
+                if (rt.device_ctx && ep.ring) {
+                    const uint32_t* oc = (const uint32_t*)(rt.device_ctx + (uint32_t)ep.ep_id * st->x_ctx_stride);
+                    const uint32_t* sc = (const uint32_t*)rt.device_ctx;
+                    uint64_t deq = ((uint64_t)oc[3] << 32) | (oc[2] & ~0xFu);
+                    int deq_i = (int)((deq - KernelPhysOf(ep.ring)) / sizeof(xHCI_TRB));
+                    usb_log("[kbdiag]   slot %d ep %d xhci ep state %d deq slot %d enq slot %d | slot state %d addr %d depth %d hub port %d tt slot %d\n",
+                            (int)rt.slot, (int)ep.ep_id, (int)(oc[0] & 0x7), deq_i, (int)ep.idx,
+                            (int)((sc[3] >> 27) & 0x1F), (int)(sc[3] & 0xFF),
+                            (int)rt.depth, (int)rt.parent_port, (int)rt.tt_hub_slot);
+                }
             }
         }
     }

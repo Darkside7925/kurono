@@ -26,10 +26,11 @@ What you actually need:
 - `src/linux` the Linux personality
 - `src/virt` hypervisor and virtual machines
 - `src/system` glue: input manager, installer logic, runtime logging, clipboard, the
-  settings service
+  settings service, and the OpenCode and Claude Code hosts (`opencode_host.cpp`,
+  `claude_host.cpp`)
 - `src/kui` the app toolkit (kui) and the launcher for ring-3 apps
-- `src/security` ken (privilege engine), KSA (hypervisor-backed approval prompt) and the
-  admin gate
+- `src/security` ken (the privilege engine behind `amdo`), KSA (hypervisor-backed approval
+  prompt) and the admin gate
 - `src/proc` scheduler and SMP
 - `src/packages` the package manager
 - `src/userprogs` small ring-3 test programs and embedded prebuilt tools

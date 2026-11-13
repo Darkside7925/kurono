@@ -1167,7 +1167,16 @@ void BackgroundTick() {
     // so convert the distance, not the absolute time. (satoru)
     if (VideoPlayer::IsPlaying(g_st)) {
         uint32_t pos = VideoPlayer::PositionMs(g_st);
+        // the frame the picture follows NOW, not the one last drawn: once the clock passes a frame's
+        // time the next draw (already asked for) shows it, and aiming at the drawn frame's successor
+        // asked for a second, identical draw 1 ms later every frame (about 60 commits a second for
+        // a 24 fps clip; every one is a window composite). (satoru)
         uint32_t cur = g_st.kvid_cur_frame;
+        if (g_st.kind == VideoPlayer::SRC_KVID && g_st.kvid.hdr.frame_count > 0) {
+            uint32_t tgt = KVID::FrameAtMs(g_st.kvid, pos);
+            if (tgt >= g_st.kvid.hdr.frame_count) tgt = g_st.kvid.hdr.frame_count - 1;
+            if (tgt > cur) cur = tgt;
+        }
         uint32_t wait = 8;
         if (g_st.kind == VideoPlayer::SRC_KVID && cur + 1 < g_st.kvid.hdr.frame_count) {
             uint64_t due_ms = g_st.kvid.index[cur + 1].dts_us / 1000ull;

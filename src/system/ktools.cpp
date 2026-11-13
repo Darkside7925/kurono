@@ -21,6 +21,8 @@
 #include "../net/tcpip.h"
 #include "../net/dhcp.h"
 #include "../proc/smp.h"
+#include "../fs/kvfs.h"
+#include "../fs/persist.h"
 
 // kdrv: list / inspect / reload / unload / start the drivers kurono has.
 // ksys: read-only diagnostics that reuse the existing commands and counters.
@@ -447,6 +449,17 @@ int sys_net(char* out, int mx) {
     return p + run_cmd("ifconfig", nullptr, out + p, mx - p);
 }
 
+int sys_persist(char* out, int mx) {
+    int p = 0;
+    char d[192]; PersistStore::Describe(d, sizeof(d));
+    p = ap(out, p, mx, "== persistence ==\n  store : "); p = ap(out, p, mx, d);
+    p = ap(out, p, mx, "\n  home  : /home/user (saved when the session ends)\n  marker: ");
+    p = ap(out, p, mx, KVFS::Exists("/home/user/.persisttest")
+                             ? "present (run persisttest to verify across a reboot)"
+                             : "none (run persisttest to create one)");
+    return ap(out, p, mx, "\n");
+}
+
 int sys_health(char* out, int mx) {
     int p = 0;
     uint64_t s = Timer::GetRealMs64() / 1000;
@@ -512,7 +525,8 @@ int cmd_ksys(KuronoShell*, int argc, const char** argv, char* out, int mx) {
     if (eq(sub, "procs")) return run_cmd("ps", nullptr, out, mx);
     if (eq(sub, "mem")) return sys_mem(out, mx);
     if (eq(sub, "net")) return sys_net(out, mx);
-    return ap(out, 0, mx, "usage: ksys health | log [N] | hw | procs | mem | net\n");
+    if (eq(sub, "persist")) return sys_persist(out, mx);
+    return ap(out, 0, mx, "usage: ksys health | log [N] | hw | procs | mem | net | persist\n");
 }
 
 }  // namespace
@@ -525,7 +539,7 @@ void SetAgentCaller(bool on) {
 void RegisterShellCommands(void* shell) {
     g_sh = (KuronoShell*)shell;
     KuronoShell::RegisterCommand("kdrv", "kdrv list|info|reload|unload|start <driver>", ENV_AUTO, "system", cmd_kdrv);
-    KuronoShell::RegisterCommand("ksys", "ksys health|log|hw|procs|mem|net", ENV_AUTO, "system", cmd_ksys);
+    KuronoShell::RegisterCommand("ksys", "ksys health|log|hw|procs|mem|net|persist", ENV_AUTO, "system", cmd_ksys);
 }
 
 }  // namespace KTools

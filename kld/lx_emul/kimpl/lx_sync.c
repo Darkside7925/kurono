@@ -31,6 +31,8 @@
 #include <linux/swait.h>
 #include <linux/rtnetlink.h>
 #include <linux/jiffies.h>
+#include <linux/rcupdate.h>
+#include <linux/preempt.h>
 
 #include "lx_kshim.h"
 
@@ -78,16 +80,73 @@ int lx_ftrylock(volatile unsigned int *w)
 #define LX_SPINW(l) ((volatile unsigned int *)&(l)->raw_lock.val.counter)
 
 // ── spinlocks ───────────────────────────────────────────────────────────────
-void _raw_spin_lock(raw_spinlock_t *lock)          { lx_flock(LX_SPINW(lock)); }
-void _raw_spin_unlock(raw_spinlock_t *lock)        { lx_funlock(LX_SPINW(lock)); }
-void _raw_spin_lock_irq(raw_spinlock_t *lock)      { lx_flock(LX_SPINW(lock)); }
-void _raw_spin_unlock_irq(raw_spinlock_t *lock)    { lx_funlock(LX_SPINW(lock)); }
-void _raw_spin_lock_bh(raw_spinlock_t *lock)       { lx_flock(LX_SPINW(lock)); }
-void _raw_spin_unlock_bh(raw_spinlock_t *lock)     { lx_funlock(LX_SPINW(lock)); }
-int  _raw_spin_trylock(raw_spinlock_t *lock)       { return lx_ftrylock(LX_SPINW(lock)); }
+// a held spinlock is an RCU read-side section in Linux: preemption is off and
+// call_rcu() must not free memory the holder can still reach. (satoru)
+// the preempt count is per thread now (see shim-include/asm/preempt.h), so
+// these out-of-line lock paths must maintain it exactly like
+// kernel/locking/spinlock.c does, or a lock/unlock pair leaks count. (satoru)
+void _raw_spin_lock(raw_spinlock_t *lock)
+{
+    preempt_disable();
+    __rcu_read_lock();
+    lx_flock(LX_SPINW(lock));
+}
+void _raw_spin_unlock(raw_spinlock_t *lock)
+{
+    lx_funlock(LX_SPINW(lock));
+    __rcu_read_unlock();
+    preempt_enable();
+}
+void _raw_spin_lock_irq(raw_spinlock_t *lock)
+{
+    preempt_disable();
+    __rcu_read_lock();
+    lx_flock(LX_SPINW(lock));
+}
+void _raw_spin_unlock_irq(raw_spinlock_t *lock)
+{
+    lx_funlock(LX_SPINW(lock));
+    __rcu_read_unlock();
+    preempt_enable();
+}
+void _raw_spin_lock_bh(raw_spinlock_t *lock)
+{
+    preempt_count_add(SOFTIRQ_LOCK_OFFSET);
+    __rcu_read_lock();
+    lx_flock(LX_SPINW(lock));
+}
+void _raw_spin_unlock_bh(raw_spinlock_t *lock)
+{
+    lx_funlock(LX_SPINW(lock));
+    __rcu_read_unlock();
+    preempt_count_sub(SOFTIRQ_LOCK_OFFSET);
+}
+int  _raw_spin_trylock(raw_spinlock_t *lock)
+{
+    preempt_disable();
+    if (!lx_ftrylock(LX_SPINW(lock))) {
+        preempt_enable();
+        return 0;
+    }
+    __rcu_read_lock();
+    return 1;
+}
+
+int _raw_spin_trylock_bh(raw_spinlock_t *lock)
+{
+    preempt_count_add(SOFTIRQ_LOCK_OFFSET);
+    if (!lx_ftrylock(LX_SPINW(lock))) {
+        preempt_count_sub(SOFTIRQ_LOCK_OFFSET);
+        return 0;
+    }
+    __rcu_read_lock();
+    return 1;
+}
 
 unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
+    preempt_disable();
+    __rcu_read_lock();
     lx_flock(LX_SPINW(lock));
     return 0x200;   // "interrupts were on" - the value is only ever handed back (satoru)
 }
@@ -96,6 +155,81 @@ void _raw_spin_unlock_irqrestore(raw_spinlock_t *lock, unsigned long flags)
 {
     (void)flags;
     lx_funlock(LX_SPINW(lock));
+    __rcu_read_unlock();
+    preempt_enable();
+}
+
+// rwlock_t: the qrwlock's cnts word is the futex. readers serialize on it
+// (correct, if not scalable) and the whole acquisition is an RCU read section.
+#define LX_RWW(l) ((volatile unsigned int *)&(l)->raw_lock.cnts.counter)
+
+void _raw_read_lock(rwlock_t *lock)
+{
+    preempt_disable();
+    __rcu_read_lock();
+    lx_flock(LX_RWW(lock));
+}
+void _raw_read_unlock(rwlock_t *lock)
+{
+    lx_funlock(LX_RWW(lock));
+    __rcu_read_unlock();
+    preempt_enable();
+}
+void _raw_write_lock(rwlock_t *lock)
+{
+    preempt_disable();
+    __rcu_read_lock();
+    lx_flock(LX_RWW(lock));
+}
+void _raw_write_unlock(rwlock_t *lock)
+{
+    lx_funlock(LX_RWW(lock));
+    __rcu_read_unlock();
+    preempt_enable();
+}
+void _raw_read_lock_bh(rwlock_t *lock)
+{
+    preempt_count_add(SOFTIRQ_LOCK_OFFSET);
+    __rcu_read_lock();
+    lx_flock(LX_RWW(lock));
+}
+void _raw_read_unlock_bh(rwlock_t *lock)
+{
+    lx_funlock(LX_RWW(lock));
+    __rcu_read_unlock();
+    preempt_count_sub(SOFTIRQ_LOCK_OFFSET);
+}
+void _raw_write_lock_bh(rwlock_t *lock)
+{
+    preempt_count_add(SOFTIRQ_LOCK_OFFSET);
+    __rcu_read_lock();
+    lx_flock(LX_RWW(lock));
+}
+void _raw_write_unlock_bh(rwlock_t *lock)
+{
+    lx_funlock(LX_RWW(lock));
+    __rcu_read_unlock();
+    preempt_count_sub(SOFTIRQ_LOCK_OFFSET);
+}
+int  _raw_read_trylock(rwlock_t *lock)
+{
+    preempt_disable();
+    if (!lx_ftrylock(LX_RWW(lock))) {
+        preempt_enable();
+        return 0;
+    }
+    __rcu_read_lock();
+    return 1;
+}
+int  _raw_write_trylock(rwlock_t *lock)
+{
+    preempt_disable();
+    if (!lx_ftrylock(LX_RWW(lock))) {
+        preempt_enable();
+        return 0;
+    }
+    __rcu_read_lock();
+    return 1;
 }
 
 // ── mutexes ─────────────────────────────────────────────────────────────────
@@ -244,7 +378,10 @@ long prepare_to_wait_event(struct wait_queue_head *wq_head, struct wait_queue_en
 {
     unsigned long flags;
     (void)state;
-    wq_entry->private = lx_task_ts(lx_current());
+    struct task_struct *ts = lx_task_ts(lx_current());
+    wq_entry->private = ts;
+    if (ts)
+        WRITE_ONCE(ts->__state, state);
     spin_lock_irqsave(&wq_head->lock, flags);
     if (list_empty(&wq_entry->entry)) {
         if (wq_entry->flags & WQ_FLAG_EXCLUSIVE)
@@ -272,6 +409,9 @@ bool prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queu
 void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
 {
     unsigned long flags;
+    struct task_struct *ts = lx_task_ts(lx_current());
+    if (ts)
+        WRITE_ONCE(ts->__state, TASK_RUNNING);
     if (!list_empty_careful(&wq_entry->entry)) {
         spin_lock_irqsave(&wq_head->lock, flags);
         list_del_init(&wq_entry->entry);
@@ -336,7 +476,20 @@ void __wake_up_locked(struct wait_queue_head *wq_head, unsigned int mode, int nr
 // condition - the same contract as Linux's TASK_RUNNING race. (satoru)
 asmlinkage __visible void schedule(void)
 {
+    // a bare schedule() with task state TASK_RUNNING is a resched point, not a
+    // sleep. parking forever there stopped test_xarray (M1); a bare yield is
+    // not enough either: in a tight loop it is a yield-spinner for the kernel
+    // picker and starves the woken thread it is waiting for (M9/N1). block for
+    // one poll tick instead: bounded, never early, and other threads RUN.
+    // (satoru)
+    struct task_struct *ts = lx_task_ts(lx_current());
+    if (!ts || READ_ONCE(ts->__state) == TASK_RUNNING) {
+        lx_os_idle_ms(1);
+        lx_jiffies_update();
+        return;
+    }
     lx_task_park(-1);
+    WRITE_ONCE(ts->__state, TASK_RUNNING);
 }
 
 long schedule_timeout(long timeout)
